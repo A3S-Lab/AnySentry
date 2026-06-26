@@ -1,0 +1,27 @@
+{
+  "name": "@anysentry/api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AnySentry backend — security-monitor endpoints, real data from the @a3s-lab/sentry judge.",
+  "scripts": {
+    "dev": "nest start --watch",
+    "start": "node dist/main.js",
+    "build": "nest build"
+  },
+  "dependencies": {
+    "@a3s-lab/sentry": "^0.1.0",
+    "@clickhouse/client": "^1.22.0",
+    "@nestjs/common": "^10.4.0",
+    "@nestjs/core": "^10.4.0",
+    "@nestjs/platform-express": "^10.4.0",
+    "@nestjs/serve-static": "^4.0.2",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^10.4.0",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}

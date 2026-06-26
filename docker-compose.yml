@@ -1,0 +1,42 @@
+# AnySentry — one-command standalone deployment: dashboard + tiered judge + ClickHouse.
+#
+#   docker compose up -d --build      # then open http://localhost:29653
+#
+# Feed it real events by piping an a3s-observer collector into scripts/observer-forward.js
+# (see the README). With no feed the dashboard is empty but live; set ANYSENTRY_SYNTHETIC_FEED=on
+# for a self-driving demo load (every event is still really judged by a3s-sentry).
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-anysentry}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-anysentry}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-anysentry}
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+    restart: unless-stopped
+
+  anysentry:
+    build: .
+    image: ghcr.io/a3s-lab/anysentry:latest
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      PORT: 29653
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-anysentry}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-anysentry}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-anysentry}
+      # ANYSENTRY_SYNTHETIC_FEED: "on"   # uncomment for a self-driving demo load
+    ports:
+      - "29653:29653"
+    restart: unless-stopped
+
+volumes:
+  clickhouse-data:

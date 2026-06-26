@@ -1,0 +1,16 @@
+{
+  "name": "@a3s-lab/anysentry",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AnySentry — universal agent observability / monitoring / intervention, built on a3s-sentry.",
+  "license": "MIT",
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "dev": "pnpm -r --parallel dev",
+    "dev:api": "pnpm --filter @anysentry/api dev",
+    "dev:web": "pnpm --filter @anysentry/web dev",
+    "build": "pnpm -r build",
+    "build:api": "pnpm --filter @anysentry/api build",
+    "build:web": "pnpm --filter @anysentry/web build"
+  }
+}

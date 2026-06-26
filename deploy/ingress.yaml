@@ -1,0 +1,25 @@
+# Optional: expose the AnySentry dashboard outside the cluster via a standard Kubernetes Ingress.
+#   kubectl -n anysentry apply -f deploy/ingress.yaml
+#
+# This is a plain example. Uncomment/replace `ingressClassName` to match your controller (e.g.
+# "nginx", "traefik", "contour"), and set the host to a DNS name that points at your ingress.
+# Without an Ingress controller installed, use `kubectl -n anysentry port-forward svc/anysentry
+# 29653:29653` and browse http://localhost:29653 instead.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: anysentry
+  namespace: anysentry
+spec:
+  # ingressClassName: nginx
+  rules:
+    - host: anysentry.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: anysentry
+                port:
+                  number: 29653

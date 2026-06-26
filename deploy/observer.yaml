@@ -1,0 +1,56 @@
+# a3s-observer — OBSERVE-ONLY DaemonSet that forwards kernel events into AnySentry.
+#   kubectl -n anysentry apply -f deploy/observer.yaml
+#
+# The collector pipes its NDJSON event stream into the forwarder (scripts/observer-forward.js),
+# which POSTs each event to AnySentry's /security-center/ingest seam. No enforce / fileguard
+# binaries are run, so this can never block a process — passive tracepoints only.
+#
+# The image bundles the public a3s-observer with the node forwarder. Build it from this repo
+# (see deploy/observer-forwarder.Dockerfile + deploy/README.md) and push to YOUR registry, then set
+# the `image:` below to that tag.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: a3s-observer
+  namespace: anysentry
+  labels: { app: a3s-observer }
+spec:
+  selector:
+    matchLabels: { app: a3s-observer }
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 1 }
+  template:
+    metadata:
+      labels: { app: a3s-observer }
+    spec:
+      hostPID: true # resolve /proc/<pid> for host-process identity
+      priorityClassName: system-node-critical
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: a3s-observer
+          # Replace with the forwarder image you built + pushed (see deploy/README.md).
+          image: ghcr.io/a3s-lab/anysentry-observer:latest
+          securityContext:
+            privileged: true # eBPF load + tracepoint attach. OBSERVE path only — cannot block.
+          env:
+            - { name: A3S_OBSERVER_JSON, value: "1" }
+            # Full signal set: file writes/deletes (FileAccess/FileDelete) + OpenSSL plaintext
+            # (SslContent → prompt-injection / secret-exfil rules + LlmApi model/token usage).
+            # Set to "0" to reduce footprint on a busy node.
+            - { name: A3S_OBSERVER_FILES, value: "1" }
+            - { name: A3S_OBSERVER_SSL, value: "1" }
+            - { name: ANYSENTRY_INGEST_URL, value: "http://anysentry:29653/security-center/ingest" }
+          command: ["/bin/sh", "-c"]
+          args: ["a3s-observer-collector | node /opt/observer-forward.js"]
+          volumeMounts:
+            - { name: sys, mountPath: /sys, readOnly: true } # tracepoint ids under /sys
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            # 1Gi: full signal set (FILES high-volume + SSL uprobes) tracks more state, plus the
+            # co-located node forwarder. No CPU limit: a tracer shouldn't be throttled into dropping.
+            limits: { memory: 1Gi }
+      volumes:
+        - { name: sys, hostPath: { path: /sys } }
+      tolerations:
+        - operator: Exists # every node, including tainted/control-plane

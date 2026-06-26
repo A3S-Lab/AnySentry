@@ -1,0 +1,186 @@
+# AnySentry — self-contained Kubernetes example.
+#   kubectl create namespace anysentry
+#   kubectl -n anysentry create secret generic anysentry-clickhouse \
+#       --from-literal=CLICKHOUSE_USER=anysentry \
+#       --from-literal=CLICKHOUSE_PASSWORD='<choose-a-password>'
+#   kubectl -n anysentry apply -f deploy/anysentry.yaml
+#
+# This single manifest brings up BOTH a bundled ClickHouse (for durable, restart-surviving event
+# history) AND AnySentry itself, plus a ClusterIP Service on 29653 and an optional ServiceAccount +
+# namespaced Role so AnySentry can resolve observer pod identities (pod-uid → agent name/namespace).
+#
+# Everything is in the `anysentry` namespace. To deploy elsewhere, either change the namespaces
+# below to match or drop the `namespace:` lines and apply with `kubectl -n <your-ns> apply -f ...`.
+# To use an EXTERNAL ClickHouse instead of the bundled one, delete the ClickHouse Deployment/Service/
+# PVC + Secret below and point CLICKHOUSE_URL at your server (see deploy/README.md).
+---
+# ----------------------------------------------------------------------------
+# Bundled ClickHouse: a small single-node instance for durable event storage.
+# ----------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: clickhouse-data
+  namespace: anysentry
+spec:
+  # No storageClassName => the cluster's DEFAULT StorageClass provisions the volume.
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clickhouse
+  namespace: anysentry
+  labels: { app: clickhouse }
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # single PVC, ReadWriteOnce — never run two writers at once
+  selector:
+    matchLabels: { app: clickhouse }
+  template:
+    metadata:
+      labels: { app: clickhouse }
+    spec:
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:24.8
+          ports:
+            - { name: http, containerPort: 8123 }
+            - { name: native, containerPort: 9000 }
+          env:
+            - { name: CLICKHOUSE_DB, value: "anysentry" }
+            - name: CLICKHOUSE_USER
+              valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_USER } }
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_PASSWORD } }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/clickhouse }
+          readinessProbe:
+            httpGet: { path: /ping, port: 8123 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { cpu: "2", memory: 2Gi }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: clickhouse-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse
+  namespace: anysentry
+  labels: { app: clickhouse }
+spec:
+  type: ClusterIP
+  selector: { app: clickhouse }
+  ports:
+    - { name: http, port: 8123, targetPort: 8123 }
+    - { name: native, port: 9000, targetPort: 9000 }
+---
+# ----------------------------------------------------------------------------
+# Optional pod-identity enrichment (set ANYSENTRY_KUBE_ENRICH=on below to use it).
+# A namespaced, read-only pod Role — NOT a cluster-wide ClusterRole. Add more agent namespaces by
+# duplicating the Role/RoleBinding in each namespace and listing them in ANYSENTRY_AGENT_NAMESPACES.
+# ----------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: anysentry
+  namespace: anysentry
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: anysentry-pod-reader
+  namespace: anysentry
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: anysentry-pod-reader
+  namespace: anysentry
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: anysentry-pod-reader
+subjects:
+  - kind: ServiceAccount
+    name: anysentry
+    namespace: anysentry
+---
+# ----------------------------------------------------------------------------
+# AnySentry: serves the dashboard, the API, and the /security-center/ingest seam. Judged events are
+# written to ClickHouse and the in-memory ring is hydrated from it on boot, so date windows survive
+# restarts/rollouts.
+# ----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anysentry
+  namespace: anysentry
+  labels: { app: anysentry }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: anysentry }
+  template:
+    metadata:
+      labels: { app: anysentry }
+    spec:
+      serviceAccountName: anysentry
+      containers:
+        - name: anysentry
+          image: ghcr.io/a3s-lab/anysentry:latest
+          ports:
+            - { containerPort: 29653 }
+          env:
+            - { name: PORT, value: "29653" }
+            # Bundled ClickHouse (namespace-local Service DNS). Point this at an external server to
+            # use your own ClickHouse instead — then delete the ClickHouse objects above.
+            - { name: CLICKHOUSE_URL, value: "http://clickhouse:8123" }
+            - { name: CLICKHOUSE_DB, value: "anysentry" }
+            - name: CLICKHOUSE_USER
+              valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_USER } }
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_PASSWORD } }
+            # Pod-identity enrichment (pod-uid -> agent name via the pod-reader Role above) is
+            # auto-enabled in-cluster. List the agent namespaces to read; set ENRICH=off to disable.
+            - { name: ANYSENTRY_AGENT_NAMESPACES, value: "default" }
+            # - { name: ANYSENTRY_KUBE_ENRICH, value: "off" }
+            # Optional: drive the dashboard with a synthetic event mix for a demo (sentry still
+            # really judges it). Leave unset to show only real ingested events.
+            # - { name: ANYSENTRY_SYNTHETIC_FEED, value: "on" }
+          readinessProbe:
+            httpGet: { path: /, port: 29653 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /, port: 29653 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: anysentry
+  namespace: anysentry
+  labels: { app: anysentry }
+spec:
+  type: ClusterIP
+  selector: { app: anysentry }
+  ports:
+    - { name: http, port: 29653, targetPort: 29653 }

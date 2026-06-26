@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * AnySentry is a dark-only dashboard. The design tokens below are the dark
+ * values applied unconditionally at :root.
+ */
+@layer base {
+  :root {
+    --font-sans: "DM Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    --font-mono: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+      "Courier New", monospace;
+
+    --radius: 8px;
+
+    --background: 222 47% 7%;
+    --foreground: 0 0% 96%;
+    --primary: 220 94% 62%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 215 27% 18%;
+    --secondary-foreground: 0 0% 96%;
+    --muted: 215 25% 15%;
+    --muted-foreground: 217 12% 70%;
+    --destructive: 0 62% 52%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 215 22% 20%;
+    --input: 215 22% 20%;
+    --ring: 220 94% 62%;
+    --col-border-light: #2a2b3a;
+  }
+
+  * {
+    border-color: hsl(var(--border));
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: #0b0f0c;
+    color: hsl(var(--foreground));
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+}
