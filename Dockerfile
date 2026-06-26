@@ -19,6 +19,10 @@ RUN corepack prepare pnpm@9.0.0 --activate && pnpm install --frozen-lockfile
 # Source + build both apps, then emit a self-contained prod bundle for the api (real node_modules,
 # no symlinks into pnpm's store) that the runtime stage can copy verbatim.
 COPY . .
+# Serve the dashboard under a sub-path when behind a gateway that does NOT strip a prefix
+# (e.g. --build-arg PUBLIC_BASE_PATH=/apps/anysentry). Default "" = served at root.
+ARG PUBLIC_BASE_PATH=""
+ENV PUBLIC_BASE_PATH=${PUBLIC_BASE_PATH}
 RUN pnpm --filter @anysentry/web build \
  && pnpm --filter @anysentry/api build \
  && pnpm --filter @anysentry/api --prod deploy /out
