@@ -1,7 +1,8 @@
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { Sentry, dns, egress, fileAccess, securityAction, sslContent, toolExec } from '@a3s-lab/sentry';
 import { ClickHouseStore } from './clickhouse-store';
-import { parseActivations, scoreActivations, severityForHarmful, verdictForHarmful } from './sae';
+import { DEFAULT_POLICY, PolicyConfig, buildAcl, sanitizePolicy, tierStatus } from './policy-config';
+import { configureSae, parseActivations, saeEnabled, scoreActivations, severityForHarmful, verdictForHarmful } from './sae';
 import { EventMeta, JudgedEvent, RiskType, Severity, Tier, Verdict } from './types';
 
 const SEVERITY_SCORE: Record<Severity, number> = { info: 8, low: 28, medium: 52, high: 76, critical: 95 };
@@ -85,12 +86,16 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   private readonly MAX = 100_000;
   private timer?: NodeJS.Timeout;
   private readonly ch = new ClickHouseStore();
+  // The live editable judge policy (the config panels' target). Applied = ACL rebuilt + judge recreated.
+  private policy: PolicyConfig = DEFAULT_POLICY;
 
   async onModuleInit(): Promise<void> {
     // fail_closed=false → judge-only (no kernel enforcement); built-in rule set always applies.
-    this.sentry = Sentry.create('fail_closed = false');
-    // Connect ClickHouse and hydrate the ring with recent history (up to the widest dashboard window).
+    this.applyPolicy(DEFAULT_POLICY);
+    // Connect ClickHouse, restore the saved policy, and hydrate the ring with recent history.
     if (await this.ch.init()) {
+      const saved = await this.ch.loadConfig();
+      if (saved) this.applyPolicy(sanitizePolicy(saved));
       const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
       const hist = await this.ch.hydrate(Date.now() - THIRTY_DAYS, this.MAX);
       this.store.push(...hist); // direct (not push()) so hydrated rows aren't re-written to ClickHouse
@@ -107,6 +112,27 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     await this.ch.close();
   }
 
+  /** Rebuild the sentry ACL from the policy and recreate the judge in place (built-in rules always
+   *  apply underneath the custom ones); reconfigure the AnySentry-side SAE scorer. */
+  private applyPolicy(config: PolicyConfig): void {
+    this.sentry = Sentry.create(buildAcl(config));
+    configureSae(config.sae);
+    this.policy = config;
+  }
+
+  /** The current policy + which tiers are active (the config panel reads this). */
+  getPolicy(): { policy: PolicyConfig; status: ReturnType<typeof tierStatus> } {
+    return { policy: this.policy, status: tierStatus(this.policy) };
+  }
+
+  /** Validate + apply a new policy, then persist it (survives restarts via ClickHouse). */
+  async setPolicy(input: unknown): Promise<{ policy: PolicyConfig; status: ReturnType<typeof tierStatus> }> {
+    const config = sanitizePolicy(input);
+    this.applyPolicy(config);
+    await this.ch.saveConfig(config);
+    return this.getPolicy();
+  }
+
   /** Judge one observer event against the live sentry policy and record it. Kinds sentry doesn't
    *  security-judge (LlmCall/LlmApi/FileDelete/ProcessExit) are still recorded as observed signals,
    *  so the dashboard counts ALL observer features. LlmApi carries real token usage. */
@@ -118,8 +144,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const subject = meta.subject ?? eventKind;
 
     // Model-output activations from a3s-power's in-enclave SAE tap → the mechanistic-interpretability
-    // tier. Scored from features only (no text); produces an explainable Decision for the WHY view.
+    // tier. Only scored when the SAE tier is enabled in the policy; otherwise dropped (the WHY panel
+    // stays hidden — `如果没配置就前端不展示`).
     if (eventKind === 'LlmActivations') {
+      if (!saeEnabled()) return null;
       const ex = scoreActivations(parseActivations(line));
       const verdict = verdictForHarmful(ex.harmful);
       const top = ex.drivers[0];

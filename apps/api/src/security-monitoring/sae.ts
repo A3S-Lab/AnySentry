@@ -4,9 +4,14 @@
 // carrying ONLY sparse (feature_id, activation) pairs — never the prompt/completion text. This scorer
 // turns those features into an explainable safety score against a labeled feature dictionary:
 //   white-box (judges the model's internal concepts) · confidential (no text) · explainable (linear
-//   in named features → ranked drivers). Production: load the offline-trained dict via ANYSENTRY_SAE_DICT.
+//   in named features → ranked drivers).
+//
+// It is config-driven (see policy-config.ts): the SAE tier is OFF until enabled via the config panel,
+// and its dictionary + thresholds are live-tunable. configureSae() is called by SentryJudgeService
+// whenever the policy changes.
 
 import { readFileSync } from 'node:fs';
+import { SaeConfig, SaeDictEntry } from './policy-config';
 import { SaeDriver, SaeExplain, Severity, Verdict } from './types';
 
 interface FeatureLabel {
@@ -15,10 +20,11 @@ interface FeatureLabel {
   weight: number;
   severity: Severity;
 }
+type Dict = Record<number, FeatureLabel>;
 
-// Placeholder labeled dictionary until the offline-trained SAE feature dict is mounted
-// (ANYSENTRY_SAE_DICT=path to a JSON map: { "8801": {concept, category, weight, severity}, ... }).
-const DEFAULT_DICT: Record<number, FeatureLabel> = {
+// A small built-in dictionary, offered as the seed when an operator enables SAE before mounting an
+// offline-trained one. Production: supply the real dict via the config panel (or ANYSENTRY_SAE_DICT).
+const DEFAULT_DICT: Dict = {
   8801: { concept: 'exploit-code-synthesis', category: 'cyber_offense', weight: 0.9, severity: 'high' },
   221: { concept: 'jailbreak-compliance', category: 'jailbreak', weight: 0.6, severity: 'medium' },
   4002: { concept: 'pii-disclosure', category: 'pii_exfil', weight: 0.7, severity: 'high' },
@@ -28,25 +34,45 @@ const DEFAULT_DICT: Record<number, FeatureLabel> = {
   907: { concept: 'malware-payload', category: 'cyber_offense', weight: 0.85, severity: 'high' },
 };
 
-function loadDict(): Record<number, FeatureLabel> {
+function dictFromEnv(): Dict | null {
   const path = process.env.ANYSENTRY_SAE_DICT;
-  if (path) {
-    try {
-      const raw = JSON.parse(readFileSync(path, 'utf8')) as Record<string, FeatureLabel>;
-      const dict: Record<number, FeatureLabel> = {};
-      for (const [k, v] of Object.entries(raw)) {
-        const id = Number(k);
-        if (Number.isInteger(id)) dict[id] = v;
-      }
-      return dict;
-    } catch {
-      // fall back to the default dict on a bad/missing file
+  if (!path) return null;
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf8')) as Record<string, FeatureLabel>;
+    const d: Dict = {};
+    for (const [k, v] of Object.entries(raw)) {
+      const id = Number(k);
+      if (Number.isInteger(id)) d[id] = v;
     }
+    return d;
+  } catch {
+    return null;
   }
-  return DEFAULT_DICT;
 }
 
-const DICT = loadDict();
+// Live config (mutated by configureSae). Disabled by default — SAE is opt-in.
+let enabled = false;
+let activeDict: Dict = dictFromEnv() ?? DEFAULT_DICT;
+let escalateAt = 0.3;
+let blockAt = 0.6;
+
+/** Apply the SAE part of the policy. Null/disabled → the tier is off (LlmActivations are dropped). */
+export function configureSae(cfg: SaeConfig | null): void {
+  enabled = !!cfg?.enabled;
+  if (!cfg) return;
+  escalateAt = cfg.escalateAt;
+  blockAt = cfg.blockAt;
+  activeDict = cfg.dict.length ? Object.fromEntries(cfg.dict.map((e) => [e.id, { concept: e.concept, category: e.category, weight: e.weight, severity: e.severity }])) : dictFromEnv() ?? DEFAULT_DICT;
+}
+
+export function saeEnabled(): boolean {
+  return enabled;
+}
+
+/** The seed dictionary the config panel offers when enabling SAE for the first time. */
+export function defaultSaeDict(): SaeDictEntry[] {
+  return Object.entries(activeDict).map(([id, l]) => ({ id: Number(id), concept: l.concept, category: l.category, weight: l.weight, severity: l.severity }));
+}
 
 /** Parse the sparse SAE features from a power/observer `LlmActivations` NDJSON line. */
 export function parseActivations(line: string): Array<[number, number]> {
@@ -63,7 +89,7 @@ export function scoreActivations(features: Array<[number, number]>): SaeExplain 
   const perCategory: Record<string, number> = {};
   const drivers: SaeDriver[] = [];
   for (const [id, act] of features) {
-    const label = DICT[id];
+    const label = activeDict[id];
     if (!label) continue;
     const contribution = Math.min(1, Math.max(0, label.weight * act));
     if (contribution <= 0) continue;
@@ -76,7 +102,7 @@ export function scoreActivations(features: Array<[number, number]>): SaeExplain 
 }
 
 export function verdictForHarmful(h: number): Verdict {
-  return h >= 0.6 ? 'block' : h >= 0.3 ? 'escalate' : 'allow';
+  return h >= blockAt ? 'block' : h >= escalateAt ? 'escalate' : 'allow';
 }
 
 export function severityForHarmful(h: number): Severity {

@@ -1,8 +1,9 @@
-import { Body, Controller, Get, Post, Query, Sse } from '@nestjs/common';
+import { Body, Controller, Get, Post, Put, Query, Sse } from '@nestjs/common';
 import { Observable, map, timer } from 'rxjs';
 import { SkipWrap } from '../shared/api-response.interceptor';
 import { AggregationService } from './aggregation.service';
 import { KubeIdentityService } from './kube-identity.service';
+import { defaultSaeDict } from './sae';
 import { SentryJudgeService } from './sentry-judge.service';
 import * as T from './types';
 
@@ -138,6 +139,20 @@ export class SecurityMonitoringController {
   @SkipWrap()
   stream(@Query() q: T.SecurityTimeFilter): Observable<{ data: T.AgentObservability }> {
     return timer(0, 3000).pipe(map(() => ({ data: this.agg.agentObservability(q) })));
+  }
+
+  /** The editable judge policy (L1 rules / L2 LLM / L3 a3s-code / SAE) + which tiers are active. The
+   *  config panels read this; the dashboard hides tiers that aren't configured. `saeDictSeed` is the
+   *  built-in dictionary offered when enabling SAE for the first time. */
+  @Get('config')
+  getConfig() {
+    return { ...this.judge.getPolicy(), saeDictSeed: defaultSaeDict() };
+  }
+
+  /** Apply + persist a new policy: rebuilds the sentry ACL and recreates the judge in place. */
+  @Put('config')
+  setConfig(@Body() body: unknown) {
+    return this.judge.setPolicy(body);
   }
 
   /** Store histograms — which signal kinds / verdicts / tiers are flowing (ops + verification). */

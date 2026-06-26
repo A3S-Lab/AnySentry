@@ -9,6 +9,7 @@
 // degrades to in-memory-only (the dashboard keeps working; just no durability) rather than crashing.
 
 import { ClickHouseClient, createClient } from '@clickhouse/client';
+import { PolicyConfig } from './policy-config';
 import { JudgedEvent, SaeExplain } from './types';
 
 const TABLE = 'events';
@@ -38,6 +39,16 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
 ) ENGINE = MergeTree
 ORDER BY at
 TTL ts + INTERVAL 90 DAY`;
+
+// Singleton policy config (the config panels' persistence). ReplacingMergeTree keeps only the latest
+// row per key; `FINAL` collapses to it on read.
+const CONFIG_TABLE = 'config';
+const CONFIG_DDL = `CREATE TABLE IF NOT EXISTS ${CONFIG_TABLE} (
+  key String,
+  value String,
+  updated_at UInt64
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY key`;
 
 type Row = Omit<JudgedEvent, 'explain' | 'actionKind' | 'actionTarget'> & {
   actionKind: string;
@@ -127,6 +138,7 @@ export class ClickHouseStore {
       await boot.close();
       this.client = createClient({ url, database, username: process.env.CLICKHOUSE_USER || 'default', password: process.env.CLICKHOUSE_PASSWORD || '' });
       await this.client.command({ query: DDL(TABLE) });
+      await this.client.command({ query: CONFIG_DDL });
       this.flushTimer = setInterval(() => void this.flush(), 2000);
       this.ready = true;
       return true;
@@ -169,6 +181,36 @@ export class ClickHouseStore {
     } catch (err) {
       console.error('[clickhouse] hydrate failed:', (err as Error).message);
       return [];
+    }
+  }
+
+  /** Load the persisted judge policy (the singleton config row), or null if none/unreachable. */
+  async loadConfig(): Promise<PolicyConfig | null> {
+    if (!this.client) return null;
+    try {
+      const rs = await this.client.query({
+        query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'policy' LIMIT 1`,
+        format: 'JSONEachRow',
+      });
+      const rows = (await rs.json()) as Array<{ value: string }>;
+      return rows.length ? (JSON.parse(rows[0].value) as PolicyConfig) : null;
+    } catch (err) {
+      console.error('[clickhouse] loadConfig failed:', (err as Error).message);
+      return null;
+    }
+  }
+
+  /** Persist the judge policy (survives restarts). No-op if ClickHouse is unconfigured/down. */
+  async saveConfig(config: PolicyConfig): Promise<void> {
+    if (!this.client) return;
+    try {
+      await this.client.insert({
+        table: CONFIG_TABLE,
+        values: [{ key: 'policy', value: JSON.stringify(config), updated_at: Date.now() }],
+        format: 'JSONEachRow',
+      });
+    } catch (err) {
+      console.error('[clickhouse] saveConfig failed:', (err as Error).message);
     }
   }
 
