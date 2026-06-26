@@ -16,6 +16,7 @@ import {
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
+  SlidersHorizontal,
   ShieldQuestion,
   Siren,
   Sparkles,
@@ -23,6 +24,7 @@ import {
   Zap,
 } from "lucide-react";
 import { type ReactNode, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { useVChartTheme } from "@/components/custom/charts/vchart-theme";
 import { type VChartSpec, VChartView } from "@/components/custom/vchart";
 import { Button } from "@/components/ui/button";
@@ -30,6 +32,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   type SecurityDecisionFunnel,
+  type SecurityDecisionTier,
   type SecurityExplainabilityDrivers,
   type SecurityExplainabilityScan,
   type SecurityHealthCard,
@@ -46,6 +49,7 @@ import {
   type SecurityWorkspaceRiskDistribution,
   securityCenterApi,
 } from "@/lib/api/security-center";
+import type { PolicyStatus } from "@/lib/api/security-center";
 import { settleAll } from "@/lib/settle-all";
 import { cn } from "@/lib/utils";
 
@@ -653,6 +657,17 @@ function SecurityHeader({
                 <RefreshCw className="mr-1.5 size-3.5" />
               )}
               刷新
+            </Button>
+            <Button
+              asChild
+              variant="secondary"
+              size="sm"
+              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+            >
+              <Link to="/admin/policy">
+                <SlidersHorizontal className="mr-1.5 size-3.5" />
+                策略配置
+              </Link>
             </Button>
           </div>
 
@@ -1354,7 +1369,22 @@ function InfoRow({ label, value }: { label: string; value?: string }) {
   );
 }
 
-function DecisionFunnelPanel({ funnel }: { funnel?: SecurityDecisionFunnel | null }) {
+// Map a funnel tier to the policy tier it represents (l2/l3), so we can gate it
+// against the configured status. L1 and the final-block row are never gated.
+function funnelTierKey(tier: SecurityDecisionTier): "l2" | "l3" | null {
+  const code = `${tier.tierCode ?? ""} ${tier.tierName ?? ""}`.toLowerCase();
+  if (code.includes("l3")) return "l3";
+  if (code.includes("l2")) return "l2";
+  return null;
+}
+
+function DecisionFunnelPanel({
+  funnel,
+  status,
+}: {
+  funnel?: SecurityDecisionFunnel | null;
+  status?: PolicyStatus | null;
+}) {
   const tiers = funnel?.tiers ?? [];
 
   return (
@@ -1365,6 +1395,25 @@ function DecisionFunnelPanel({ funnel }: { funnel?: SecurityDecisionFunnel | nul
         <div className="space-y-3 p-4">
           {tiers.map((tier, index) => {
             const percent = normalizePercent(tier.percentage);
+            // Gate L2/L3 rows by configured status: hide when status is known and
+            // the tier is off; L1 and unrecognized tiers always render.
+            const tierKey = funnelTierKey(tier);
+            const unconfigured = Boolean(status && tierKey && !status[tierKey]);
+            if (unconfigured) {
+              return (
+                <div key={tier.tierCode} className="space-y-1.5 opacity-60">
+                  <div className="flex items-center justify-between gap-3 text-xs">
+                    <span className="min-w-0 truncate font-semibold text-zinc-400">
+                      {tier.tierCode} · {tier.tierName}
+                    </span>
+                    <span className="shrink-0 rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-zinc-500">
+                      未配置
+                    </span>
+                  </div>
+                  <div className="relative h-8 overflow-hidden rounded-md border border-dashed border-white/10 bg-white/[0.03]" />
+                </div>
+              );
+            }
             return (
               <div key={tier.tierCode} className="space-y-1.5">
                 <div className="flex items-center justify-between gap-3 text-xs">
@@ -1462,6 +1511,13 @@ export default function SecurityMonitorPage() {
     pollingInterval: 10000,
     pollingWhenHidden: false,
   });
+  // Tier status drives conditional rendering: SAE panel + L2/L3 funnel rows are
+  // hidden when not configured. Polled so a Save reflects without a full reload.
+  const { data: policyConfig } = useRequest(() => securityCenterApi.getConfig(), {
+    pollingInterval: 30000,
+    pollingWhenHidden: false,
+  });
+  const status = policyConfig?.status ?? null;
   const lastUpdatedAt =
     data?.scan?.updateTime ||
     data?.drivers?.updateTime ||
@@ -1510,13 +1566,16 @@ export default function SecurityMonitorPage() {
           <DashboardSection title="实时扫描" icon={Radar}>
             <div className="grid gap-4 xl:grid-cols-[minmax(0,1.65fr)_minmax(360px,0.95fr)]">
               <ExplainabilityPanel scan={data?.scan} error={data?.errors.scan} />
-              <DecisionFunnelPanel funnel={data?.decisionFunnel} />
+              <DecisionFunnelPanel funnel={data?.decisionFunnel} status={status} />
             </div>
           </DashboardSection>
 
-          <DashboardSection title="模型输出可解释性" icon={Brain}>
-            <ExplainabilityDriversPanel drivers={data?.drivers} error={data?.errors.drivers} />
-          </DashboardSection>
+          {/* SAE 可解释性面板仅在 SAE 已配置时展示(status.sae)。 */}
+          {status?.sae ? (
+            <DashboardSection title="模型输出可解释性" icon={Brain}>
+              <ExplainabilityDriversPanel drivers={data?.drivers} error={data?.errors.drivers} />
+            </DashboardSection>
+          ) : null}
 
           <DashboardSection title="风险态势" icon={Siren}>
             <div className="space-y-4">

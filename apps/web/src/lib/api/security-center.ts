@@ -209,6 +209,72 @@ export interface SecurityExplainabilityDrivers {
   updateTime: string;
 }
 
+// ── Policy config (L1/L2/L3 + SAE) ──────────────────────────────────────────
+// Mirrors the AnySentry sentry policy surface served by /security-center/config.
+export type RuleKind = "ToolExec" | "Egress" | "Dns" | "FileAccess" | "SslContent" | "SecurityAction";
+export type RuleAction = "" | "deny-exec" | "deny-egress" | "deny-file";
+// Verdict/Severity reuse the existing SecurityVerdict/SecuritySeverity unions.
+
+export interface L1Rule {
+  name: string;
+  on: RuleKind;
+  match: string;
+  verdict: SecurityVerdict;
+  severity: SecuritySeverity;
+  reason: string;
+  action?: RuleAction;
+}
+
+export interface L2Config {
+  url: string;
+  model: string;
+  timeoutS: number;
+}
+
+export interface L3Config {
+  bin: string;
+  skills: string;
+}
+
+export interface SaeDictEntry {
+  id: number;
+  concept: string;
+  category: string;
+  weight: number;
+  severity: SecuritySeverity;
+}
+
+export interface SaeConfig {
+  enabled: boolean;
+  escalateAt: number;
+  blockAt: number;
+  dict: SaeDictEntry[];
+}
+
+export interface PolicyConfig {
+  failClosed: boolean;
+  speculate: "off" | "low" | "medium" | "high";
+  rules: L1Rule[];
+  llm: L2Config | null;
+  agent: L3Config | null;
+  sae: SaeConfig | null;
+}
+
+// A null tier (llm/agent) or sae.enabled=false means "not configured".
+export interface PolicyStatus {
+  l1: boolean;
+  l2: boolean;
+  l3: boolean;
+  sae: boolean;
+}
+
+export interface PolicyConfigResponse {
+  policy: PolicyConfig;
+  status: PolicyStatus;
+  // Seed dictionary returned by the server; used to seed SAE on first enable.
+  saeDictSeed?: SaeDictEntry[];
+}
+
 export const securityCenterApi = {
   healthCard: (filter: SecurityTimeFilter) =>
     apiClient.post<SecurityHealthCard>("/security-center/top/healthCard", filter),
@@ -235,6 +301,12 @@ export const securityCenterApi = {
     apiClient.post<SecurityExplainabilityAuditResult>("/open/security/explainability/audit", body),
   openExplainabilityScan: (filter: SecurityExplainabilityScanRequest) =>
     apiClient.post<SecurityExplainabilityScan>("/open/security/explainability/scan", filter),
+  // Policy config: load current L1/L2/L3 + SAE policy and its tier status.
+  getConfig: () => apiClient.get<PolicyConfigResponse>("/security-center/config"),
+  // Persist a full or partial PolicyConfig; the server sanitizes + applies it
+  // and returns the resulting policy + tier status.
+  setConfig: (policy: Partial<PolicyConfig>) =>
+    apiClient.put<PolicyConfigResponse>("/security-center/config", policy),
 };
 
 /**

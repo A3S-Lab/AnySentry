@@ -121,4 +121,10 @@ export const apiClient = {
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
   },
+  put<T>(endpoint: string, body?: unknown): Promise<T> {
+    return request<T>(endpoint, {
+      method: "PUT",
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  },
 };
