@@ -1371,6 +1371,41 @@ function InfoRow({ label, value }: { label: string; value?: string }) {
 
 // Map a funnel tier to the policy tier it represents (l2/l3), so we can gate it
 // against the configured status. L1 and the final-block row are never gated.
+// Always-on strip showing which judge tiers are configured — makes the config page's effect on the
+// dashboard immediate + obvious (a tier flips 未配置 → 已启用 the moment you save + come back).
+function TierStatusStrip({ status }: { status?: PolicyStatus | null }) {
+  const tiers: Array<{ key: keyof PolicyStatus; label: string }> = [
+    { key: "l1", label: "L1 规则" },
+    { key: "l2", label: "L2 LLM 研判" },
+    { key: "l3", label: "L3 深判" },
+    { key: "sae", label: "SAE 可解释性" },
+  ];
+  return (
+    <div className="flex flex-wrap items-center gap-2 rounded-[10px] border border-white/10 bg-[#111612]/80 px-4 py-2.5">
+      <span className="mr-1 text-xs font-medium text-zinc-400">研判层级</span>
+      {tiers.map(({ key, label }) => {
+        const on = Boolean(status?.[key]);
+        return (
+          <span
+            key={key}
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs",
+              on ? "border-teal-400/30 bg-teal-400/10 text-teal-200" : "border-white/10 bg-white/[0.03] text-zinc-500",
+            )}
+          >
+            <span className={cn("size-1.5 rounded-full", on ? "bg-teal-400" : "bg-zinc-600")} />
+            {label}
+            <span className="text-[10px] opacity-70">{on ? "已启用" : "未配置"}</span>
+          </span>
+        );
+      })}
+      <Link to="/admin/policy" className="ml-auto text-xs text-teal-300 hover:text-teal-200">
+        配置 →
+      </Link>
+    </div>
+  );
+}
+
 function funnelTierKey(tier: SecurityDecisionTier): "l2" | "l3" | null {
   const code = `${tier.tierCode ?? ""} ${tier.tierName ?? ""}`.toLowerCase();
   if (code.includes("l3")) return "l3";
@@ -1516,6 +1551,7 @@ export default function SecurityMonitorPage() {
   const { data: policyConfig } = useRequest(() => securityCenterApi.getConfig(), {
     pollingInterval: 30000,
     pollingWhenHidden: false,
+    refreshOnWindowFocus: true, // returning from the config page reflects immediately
   });
   const status = policyConfig?.status ?? null;
   const lastUpdatedAt =
@@ -1559,6 +1595,8 @@ export default function SecurityMonitorPage() {
 
       <main className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
         <div className="mx-auto flex w-full max-w-[1680px] flex-col gap-4">
+          <TierStatusStrip status={status} />
+
           <DashboardSection title="运行总览" icon={Activity}>
             <TopMetrics data={data} loading={loading && !data} />
           </DashboardSection>
