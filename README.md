@@ -298,6 +298,21 @@ ANYSENTRY_API_BASE=http://127.0.0.1:29653/security-center pnpm perf:anysentry
 See [`docs/performance-testing.md`](docs/performance-testing.md) for local, deployed, Kubernetes,
 smoke, and stress profiles plus report interpretation.
 
+Recent deployed baseline with the default profile, ClickHouse enabled, and Kubernetes pod snapshots
+showed 0 request errors across the dependency chain:
+
+| Scenario | Throughput | p95 latency |
+|---|---:|---:|
+| `progressive.recordSecurityEvents` | 72.93 events/s | 101.01 ms |
+| `ingest.observer.ndjson` | 91.25 events/s | 98.96 ms |
+| `ingest.events.batch` | 216.83 events/s | 118.51 ms |
+| `events.list` | 18.69 req/s | 528.36 ms |
+| `aggregate.dashboard` | 12.70 req/s | 714.49 ms |
+| `evidence.bundle` | 0.30 req/s | 13266.75 ms |
+
+`evidence.bundle` is the current slow path to watch in future baselines; the write paths stayed
+under 120 ms p95 in this run.
+
 For a one-command local run that builds the API and dashboard, starts a temporary server, runs the
 deployment manifest, management-auth, normal and ingress sub-path dashboard, observer, forwarder,
 heterogeneous ingress, Coverage runtime, operations lifecycle, Objective runtime, Maintenance
