@@ -514,31 +514,130 @@ result. Add `shaped=true` to get a tool-friendly envelope with `success`, `modul
 `operation` / `data`, plus compatibility metadata. Legacy `capabilityId` inputs such as
 `security.runtimeGuard` are still accepted as aliases, but they are not the primary protocol.
 
-## Coding-agent skill
+## Coding-agent progressive API Skill
 
-The repo ships an `a3s-box`-style skill for coding agents at
+The repo ships an `a3s-box`-style Skill for coding agents at
 [`integrations/skills/anysentry-progressive-api`](integrations/skills/anysentry-progressive-api).
-It teaches an agent how to deploy-check AnySentry, discover capabilities, call
-`security-center.assessRuntimeAction`, ingest structured evidence, and build evidence bundles
-without falling back to the deprecated ACP-style action set.
+It gives Codex, Claude Code, Cursor/Windsurf, Devin/OpenHands, a3s-code, or any other coding agent
+the same progressive API contract: **discover first, describe exactly, then execute**. Agents should
+use this Skill instead of memorizing concrete REST paths or falling back to the deprecated ACP-style
+`poll` / `subscribe` / `approve` action set.
 
-To install it into a local Codex skills directory:
+### Canonical Skill artifact
+
+The canonical artifact is the directory under `integrations/skills/`. Install or package the whole
+directory when the host supports filesystem Skills; otherwise paste the `SKILL.md` body into that
+host's project/system instructions.
 
 ```bash
 mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
 cp -R integrations/skills/anysentry-progressive-api "${CODEX_HOME:-$HOME/.codex}/skills/"
 ```
 
-Then ask the coding agent to use it explicitly:
+Then invoke it explicitly:
 
 ```text
 Use $anysentry-progressive-api to check http://localhost:29653/security-center and assess this planned shell command before execution.
 ```
 
-For other agent hosts, include the same `SKILL.md` as a system/tool instruction bundle or package
-the whole `integrations/skills/anysentry-progressive-api` directory. The skill assumes the base URL
-is `ANYSENTRY_API_BASE` or `http://127.0.0.1:29653/security-center`, and it keeps the source-verified
-flow strict: `list/search/describe` first, `POST execute` only after the target operation is known.
+### Universal agent instruction block
+
+For agent hosts that do not have a native Skill package format, add this block to the agent's
+system prompt, project rules, or repository instructions:
+
+```markdown
+---
+name: anysentry-progressive-api
+description: "Use AnySentry's ShuanOS-compatible progressive API to deploy-check AnySentry, discover security-center operations, assess runtime actions, ingest evidence, and build evidence bundles."
+parameters:
+  - name: apiBase
+    type: string
+    required: false
+    description: "AnySentry API base without a trailing slash, default http://127.0.0.1:29653/security-center"
+  - name: action
+    type: string
+    required: true
+    description: "list | search | describe | execute"
+  - name: module
+    type: string
+    required: false
+    description: "Module name, normally security-center"
+  - name: operation
+    type: string
+    required: false
+    description: "Operation from describe, such as assessRuntimeAction"
+  - name: params
+    type: object
+    required: false
+    description: "Operation parameters validated against describe"
+---
+
+# AnySentry Progressive API Skill
+
+Use this Skill only when a running AnySentry API is available. Set
+`ANYSENTRY_API_BASE` to the API root without a trailing slash; default to
+`http://127.0.0.1:29653/security-center`.
+
+Flow:
+
+1. Health check: `GET $ANYSENTRY_API_BASE/healthz`.
+2. Discover: `GET $ANYSENTRY_API_BASE/capabilities?action=list`.
+3. Search when unsure: `GET $ANYSENTRY_API_BASE/capabilities?action=search&query=<keywords>`.
+4. Describe before execution:
+   `GET $ANYSENTRY_API_BASE/capabilities?action=describe&module=security-center&operation=<operation>`.
+5. Execute only with `POST $ANYSENTRY_API_BASE/capabilities` and JSON body:
+   `{ "action": "execute", "module": "security-center", "operation": "<operation>", "params": { ... } }`.
+
+Rules:
+
+- Do not guess module names, operation names, parameters, enum values, or response shape. Use
+  `list`, `search`, and `describe` first.
+- Do not use ACP-only actions `poll`, `subscribe`, or `approve`; AnySentry's primary protocol is
+  `list / search / describe / execute`.
+- Prefer `dryRun: true` before enforcing a guard decision on a planned tool command.
+- Use `params.autonomy` or `constraints.autonomy` with ShuanOS vocabulary: `suggest`, `guarded`,
+  or `auto`.
+- Treat guard results as policy signals: `allow` may proceed, `warn` should be surfaced,
+  `require_approval` needs human approval, and `block` must stop the action.
+- Use `recordSecurityEvents` for structured agent evidence and `buildEvidenceBundle` for handoff
+  reports after you have an `eventId`, `runId`, `traceId`, source, incident, objective, or scope.
+- If management auth is enabled, pass `X-AnySentry-Admin-Token` only for control-plane writes.
+  Ingest identity uses Source tokens, not the admin token.
+- When a request fails, re-run `describe` for the target module/operation before changing fields.
+```
+
+### Host adapters
+
+| Agent host | How to attach the Skill |
+|---|---|
+| Codex / OpenAI coding agents | Copy `integrations/skills/anysentry-progressive-api` into `${CODEX_HOME:-$HOME/.codex}/skills/`, then call `Use $anysentry-progressive-api ...`. |
+| Shu'an OS / a3s-code | Publish the same directory as a Skill material or attach it as a built-in `skillDirs` entry. If the runtime exposes a `capabilities` tool, still follow `list -> search/describe -> execute`; otherwise use the HTTP examples in the Skill. |
+| Claude Code | Put the universal block or the canonical `SKILL.md` content in `CLAUDE.md` or project instructions. Use the shell/HTTP tools only when the session allows them. |
+| Cursor / Windsurf | Add the universal block to workspace rules (for example `.cursor/rules/anysentry-progressive-api.mdc`) or global AI rules, and set `ANYSENTRY_API_BASE` in the dev environment. |
+| Devin / OpenHands / remote coding agents | Add the block to repository instructions or the task bootstrap prompt, export `ANYSENTRY_API_BASE`, and run the verifier commands after integration. |
+| Generic SDK agents | Store the block as a system instruction and implement four helper calls: `listCapabilities`, `searchCapabilities`, `describeOperation`, and `executeOperation`. Keep endpoint construction centralized so models never hand-write stale URLs. |
+
+### Minimal helper contract
+
+Any host can implement the Skill with this small tool surface:
+
+```ts
+type ProgressiveAction = "list" | "search" | "describe" | "execute";
+
+interface AnySentryProgressiveCall {
+  action: ProgressiveAction;
+  module?: "security-center" | string;
+  operation?: string;
+  query?: string;
+  params?: Record<string, unknown>;
+  dryRun?: boolean;
+  shaped?: boolean;
+}
+```
+
+Discovery uses `GET /capabilities`; execution uses `POST /capabilities`. The service owns the
+operation schemas, so the agent should cache described schemas within a session but refresh them
+after an error or deployment change.
 
 ## What it shows
 
