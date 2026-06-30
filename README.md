@@ -39,40 +39,120 @@ The platform treats zero-code observation as the product baseline:
 - **Optional enrichment only.** SDKs, framework adapters, LLM gateways, or explicit trace IDs can
   enrich the event stream later, but they are not required to monitor arbitrary agents.
 
-## Quickstart
+## Deployment
+
+Choose Docker for a local workstation or demo, and Kubernetes for a real node/fleet install with
+observe-only `a3s-observer` on every node.
+
+Prerequisites:
+
+- Docker + Compose for local mode.
+- For Kubernetes mode: `kubectl`, a default StorageClass, and amd64 nodes. The bundled
+  `@a3s-lab/sentry` runtime image targets `linux-x64-gnu` on Ubuntu 24.04.
+- Optional but recommended for real signals: `a3s-observer-collector` locally, or the bundled
+  `deploy/observer.yaml` DaemonSet in Kubernetes.
+
+### Docker local stack
+
+Docker mode builds and starts AnySentry plus ClickHouse. The API also serves the dashboard.
 
 ```bash
 deploy/install.sh docker
-# local core stack: AnySentry + ClickHouse; @a3s-lab/sentry is bundled
-
-ANYSENTRY_INSTALL_MODE=kubernetes deploy/install.sh
-# integrated node/fleet stack: AnySentry + ClickHouse + observe-only a3s-observer
+# equivalent: docker compose up -d --build
 ```
 
-Open `http://localhost:29653` for Docker mode, or port-forward the Kubernetes Service:
+Verify the service and open the dashboard:
 
 ```bash
-kubectl -n anysentry port-forward svc/anysentry 29653:29653
+curl -fsS http://localhost:29653/security-center/healthz
+# browse http://localhost:29653
 ```
 
-The dashboard is live but empty until you feed it events. To see it populated immediately with a
-self-driving demo load (every event still really judged by a3s-sentry), set
-`ANYSENTRY_SYNTHETIC_FEED=on` in `docker-compose.yml` and `docker compose up -d`.
+Useful local operations:
 
-To feed it **real** activity, pipe an a3s-observer collector into the forwarder:
+```bash
+docker compose ps
+docker compose logs -f anysentry
+docker compose down                 # stop services, keep ClickHouse volume
+docker compose down -v              # stop and remove stored ClickHouse data
+```
+
+The dashboard is live but empty until events arrive. To see data immediately, enable demo traffic
+and restart:
+
+```bash
+# uncomment ANYSENTRY_SYNTHETIC_FEED under the anysentry service in docker-compose.yml, then:
+docker compose up -d --build
+```
+
+To feed real local activity, pipe an observer collector into the Node forwarder:
 
 ```bash
 A3S_OBSERVER_JSON=1 sudo -E a3s-observer-collector \
   | ANYSENTRY_INGEST_URL=http://localhost:29653/security-center/ingest node scripts/observer-forward.js
 ```
 
-After creating an ingestion source in `/sources`, the same forwarder can identify itself with
-`ANYSENTRY_SOURCE_ID` and `ANYSENTRY_INGEST_TOKEN`; this enrolls the source and token without
-changing the agent workload or the observer. Sources can run in compatibility mode or require the
-current token for every event, so legacy feeds keep working while managed producers get explicit
-ingest authentication. The bundled Node and Python forwarders also emit source-aware Collector
-heartbeats every `ANYSENTRY_HEARTBEAT_SECS` seconds by default, so Collector health and Source
-heartbeat counters stay live even when the observer stream is quiet.
+### Kubernetes integrated stack
+
+Kubernetes mode creates the namespace, ClickHouse Secret, bundled ClickHouse, AnySentry
+Deployment/Service, and the observe-only `a3s-observer` DaemonSet. Choose a real ClickHouse
+password before installing:
+
+```bash
+ANYSENTRY_INSTALL_MODE=kubernetes \
+CLICKHOUSE_PASSWORD="$(openssl rand -hex 16)" \
+deploy/install.sh
+```
+
+Common install-time options:
+
+```bash
+ANYSENTRY_NAMESPACE=security \
+ANYSENTRY_OBSERVER_IMAGE=<registry>/anysentry-observer:latest \
+ANYSENTRY_APPLY_INGRESS=1 \
+ANYSENTRY_INSTALL_MODE=kubernetes \
+CLICKHOUSE_PASSWORD="$(openssl rand -hex 16)" \
+deploy/install.sh
+```
+
+Check rollout and open a local tunnel:
+
+```bash
+kubectl -n anysentry rollout status deploy/clickhouse
+kubectl -n anysentry rollout status deploy/anysentry
+kubectl -n anysentry rollout status daemonset/a3s-observer
+kubectl -n anysentry port-forward svc/anysentry 29653:29653
+curl -fsS http://localhost:29653/security-center/healthz
+```
+
+If your cluster cannot pull the public observer-forwarder image, build and push it, then set
+`ANYSENTRY_OBSERVER_IMAGE`:
+
+```bash
+docker build -f deploy/observer-forwarder.Dockerfile -t <registry>/anysentry-observer:latest .
+docker push <registry>/anysentry-observer:latest
+```
+
+To expose the dashboard through an Ingress, edit `deploy/ingress.yaml` for your
+`ingressClassName` and host, then either set `ANYSENTRY_APPLY_INGRESS=1` during install or run:
+
+```bash
+kubectl -n anysentry apply -f deploy/ingress.yaml
+```
+
+### Production notes
+
+- Set `ANYSENTRY_ADMIN_TOKEN` or `ANYSENTRY_MANAGEMENT_TOKEN` to protect control-plane writes.
+  Producer paths such as `/security-center/ingest`, Collector heartbeat, and Source check-in stay
+  on Source identity and Source ingest tokens.
+- Use `ANYSENTRY_SOURCE_ID` and `ANYSENTRY_INGEST_TOKEN` for managed Sources after creating them in
+  the dashboard's `/sources` view. The Node and Python forwarders also emit Collector heartbeats
+  every `ANYSENTRY_HEARTBEAT_SECS` seconds by default.
+- To use an external ClickHouse, remove the bundled ClickHouse objects from
+  `deploy/anysentry.yaml` and set `CLICKHOUSE_URL`, `CLICKHOUSE_DB`, `CLICKHOUSE_USER`, and
+  `CLICKHOUSE_PASSWORD` on the AnySentry Deployment.
+- See [`deploy/README.md`](deploy/README.md) for the longer Kubernetes runbook and manifest
+  customization notes.
 
 To regression-check the primary observer path against a running API, including raw observer NDJSON,
 Source token rejection, evidence redaction, raw `CollectorHeartbeat`, direct forwarder heartbeat,
@@ -434,6 +514,32 @@ result. Add `shaped=true` to get a tool-friendly envelope with `success`, `modul
 `operation` / `data`, plus compatibility metadata. Legacy `capabilityId` inputs such as
 `security.runtimeGuard` are still accepted as aliases, but they are not the primary protocol.
 
+## Coding-agent skill
+
+The repo ships an `a3s-box`-style skill for coding agents at
+[`integrations/skills/anysentry-progressive-api`](integrations/skills/anysentry-progressive-api).
+It teaches an agent how to deploy-check AnySentry, discover capabilities, call
+`security-center.assessRuntimeAction`, ingest structured evidence, and build evidence bundles
+without falling back to the deprecated ACP-style action set.
+
+To install it into a local Codex skills directory:
+
+```bash
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+cp -R integrations/skills/anysentry-progressive-api "${CODEX_HOME:-$HOME/.codex}/skills/"
+```
+
+Then ask the coding agent to use it explicitly:
+
+```text
+Use $anysentry-progressive-api to check http://localhost:29653/security-center and assess this planned shell command before execution.
+```
+
+For other agent hosts, include the same `SKILL.md` as a system/tool instruction bundle or package
+the whole `integrations/skills/anysentry-progressive-api` directory. The skill assumes the base URL
+is `ANYSENTRY_API_BASE` or `http://127.0.0.1:29653/security-center`, and it keeps the source-verified
+flow strict: `list/search/describe` first, `POST execute` only after the target operation is known.
+
 ## What it shows
 
 The backend holds one `Sentry` judge. Each ingested event is run through `sentry.evaluate()`, the
@@ -730,6 +836,7 @@ apps/api   NestJS — the sentry judge, ClickHouse store, aggregation, endpoints
 apps/web   Rsbuild + React — the security dashboard
 scripts/   a3s-observer → /ingest forwarders (Node + Python)
 deploy/    example Kubernetes manifests + runbook
+integrations/skills/  coding-agent skills, including anysentry-progressive-api
 ```
 
 ## License
