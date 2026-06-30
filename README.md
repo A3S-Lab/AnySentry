@@ -286,6 +286,18 @@ webhook-secret non-leakage:
 ANYSENTRY_API_BASE=http://127.0.0.1:29653/security-center pnpm verify:notification-dispatch
 ```
 
+To performance-test AnySentry and its runtime dependency chain, including dashboard serving,
+progressive API dispatch, `@a3s-lab/sentry` judging, generic ingest, ClickHouse-backed write/read
+paths, dashboard aggregate queries, and Evidence Bundle assembly:
+
+```bash
+pnpm perf:anysentry
+ANYSENTRY_API_BASE=http://127.0.0.1:29653/security-center pnpm perf:anysentry
+```
+
+See [`docs/performance-testing.md`](docs/performance-testing.md) for local, deployed, Kubernetes,
+smoke, and stress profiles plus report interpretation.
+
 For a one-command local run that builds the API and dashboard, starts a temporary server, runs the
 deployment manifest, management-auth, normal and ingress sub-path dashboard, observer, forwarder,
 heterogeneous ingress, Coverage runtime, operations lifecycle, Objective runtime, Maintenance

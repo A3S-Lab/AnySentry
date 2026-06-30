@@ -5,3 +5,4 @@ dist/
 .env
 .env.local
 .a3s/
+perf-results/

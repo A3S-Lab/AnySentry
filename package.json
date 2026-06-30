@@ -12,6 +12,8 @@
     "build": "pnpm -r build",
     "build:api": "pnpm --filter @anysentry/api build",
     "build:web": "pnpm --filter @anysentry/web build",
+    "perf:anysentry": "node scripts/perf-anysentry.mjs",
+    "perf:anysentry:local": "pnpm build && node scripts/verify-deep-links-local.mjs scripts/perf-anysentry.mjs",
     "verify:deployment-manifests": "node scripts/verify-deployment-manifests.mjs",
     "verify:progressive-api": "pnpm verify:ai-native-api",
     "verify:progressive-api:local": "pnpm verify:ai-native-api:local",
