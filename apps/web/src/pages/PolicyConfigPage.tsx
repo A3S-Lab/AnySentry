@@ -2,13 +2,14 @@ import { useRequest } from "ahooks";
 import {
   AlertTriangle,
   ArrowLeft,
+  BarChart3,
   Bot,
-  Brain,
   CheckCircle2,
   LoaderCircle,
   type LucideIcon,
   Plus,
   Save,
+  Search,
   ShieldCheck,
   Sparkles,
   Trash2,
@@ -17,6 +18,7 @@ import {
 } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import { AdminTokenControl } from "@/components/custom/admin-token-control";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -26,13 +28,14 @@ import {
   type L3Config,
   type PolicyConfig,
   type PolicyConfigResponse,
+  type PolicySimulationDiff,
+  type PolicySimulationResult,
   type PolicyStatus,
   type RuleAction,
   type RuleKind,
-  type SaeConfig,
-  type SaeDictEntry,
   securityCenterApi,
   type SecuritySeverity,
+  type SecurityTimeType,
   type SecurityVerdict,
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
@@ -76,6 +79,31 @@ const SPECULATE_OPTIONS: Array<{ value: PolicyConfig["speculate"]; label: string
   { value: "high", label: "高 (high)" },
 ];
 
+const TIME_OPTIONS: Array<{ value: SecurityTimeType; label: string }> = [
+  { value: "last_3h", label: "近3小时" },
+  { value: "last_1d", label: "近一天" },
+  { value: "last_7d", label: "近一周" },
+  { value: "last_30d", label: "近一月" },
+];
+
+const SEVERITY_LABEL: Record<SecuritySeverity, string> = {
+  info: "提示",
+  low: "低",
+  medium: "中",
+  high: "高",
+  critical: "严重",
+};
+
+const CHANGE_LABEL: Record<PolicySimulationDiff["changeType"], string> = {
+  new_block: "新增阻断",
+  removed_block: "移除阻断",
+  new_escalation: "新增升级",
+  removed_escalation: "移除升级",
+  severity_increase: "等级升高",
+  severity_decrease: "等级降低",
+  verdict_changed: "判定变化",
+};
+
 const NEW_RULE: L1Rule = {
   name: "",
   on: "ToolExec",
@@ -88,7 +116,6 @@ const NEW_RULE: L1Rule = {
 
 const DEFAULT_L2: L2Config = { url: "", model: "", timeoutS: 20 };
 const DEFAULT_L3: L3Config = { bin: "a3s-code", skills: "" };
-const DEFAULT_SAE: Omit<SaeConfig, "dict"> = { enabled: true, escalateAt: 0.5, blockAt: 0.8 };
 
 function formatRequestError(error: unknown) {
   if (error instanceof Error) return error.message;
@@ -97,11 +124,6 @@ function formatRequestError(error: unknown) {
     return String((error as { message?: unknown }).message ?? "请求失败");
   }
   return "请求失败";
-}
-
-function clamp01(value: number) {
-  if (!Number.isFinite(value)) return 0;
-  return Math.max(0, Math.min(1, value));
 }
 
 // ── Small layout primitives (mirror the dashboard's Panel/Field styling) ─────
@@ -241,6 +263,37 @@ function Toast({ kind, message, onClose }: { kind: "success" | "error"; message:
       <button type="button" onClick={onClose} className="shrink-0 text-current/70 hover:text-current">
         <X className="size-3.5" />
       </button>
+    </div>
+  );
+}
+
+function toneBySeverity(severity?: SecuritySeverity) {
+  if (severity === "critical" || severity === "high") return "border-rose-400/30 bg-rose-500/10 text-rose-100";
+  if (severity === "medium") return "border-amber-400/30 bg-amber-500/10 text-amber-100";
+  if (severity === "low") return "border-teal-400/30 bg-teal-500/10 text-teal-100";
+  return "border-white/10 bg-white/5 text-zinc-300";
+}
+
+function changeTone(change: PolicySimulationDiff["changeType"]) {
+  if (change === "new_block" || change === "severity_increase") return "border-rose-400/30 bg-rose-500/10 text-rose-100";
+  if (change === "removed_block" || change === "severity_decrease") return "border-teal-400/30 bg-teal-500/10 text-teal-100";
+  if (change === "new_escalation") return "border-amber-400/30 bg-amber-500/10 text-amber-100";
+  return "border-white/10 bg-white/5 text-zinc-300";
+}
+
+function Pill({ children, className }: { children: string; className?: string }) {
+  return (
+    <span className={cn("inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold", className)}>
+      {children}
+    </span>
+  );
+}
+
+function MetricTile({ label, value, tone }: { label: string; value: number | string; tone: string }) {
+  return (
+    <div className={cn("rounded-[8px] border px-3 py-2", tone)}>
+      <p className="text-[11px] opacity-80">{label}</p>
+      <p className="mt-1 truncate font-mono text-xl font-semibold">{value}</p>
     </div>
   );
 }
@@ -477,182 +530,126 @@ function L3Section({ value, onChange }: { value: L3Config | null; onChange: (nex
   );
 }
 
-// ── SAE section ──────────────────────────────────────────────────────────────
-function SaeDictRow({
-  entry,
-  onChange,
-  onRemove,
-}: {
-  entry: SaeDictEntry;
-  onChange: (next: SaeDictEntry) => void;
-  onRemove: () => void;
-}) {
+function SimulationDiffRow({ diff }: { diff: PolicySimulationDiff }) {
+  const eventQs = new URLSearchParams();
+  eventQs.set("eventId", diff.eventId);
+  eventQs.set("agentId", diff.agentId);
+  eventQs.set("workspacePath", diff.workspacePath);
   return (
-    <div className="grid grid-cols-[64px_minmax(0,1.3fr)_minmax(0,1fr)_88px_minmax(120px,0.8fr)_auto] items-center gap-2 rounded-md border border-white/10 bg-white/[0.03] px-2 py-2">
-      <Input
-        type="number"
-        value={entry.id}
-        onChange={(event) => onChange({ ...entry, id: Number(event.target.value) })}
-        className="h-8 border-white/10 bg-white/5 text-xs"
-        aria-label="特征 ID"
-      />
-      <Input
-        value={entry.concept}
-        onChange={(event) => onChange({ ...entry, concept: event.target.value })}
-        placeholder="概念"
-        className="h-8 border-white/10 bg-white/5 text-xs"
-        aria-label="概念"
-      />
-      <Input
-        value={entry.category}
-        onChange={(event) => onChange({ ...entry, category: event.target.value })}
-        placeholder="分类"
-        className="h-8 border-white/10 bg-white/5 text-xs"
-        aria-label="分类"
-      />
-      <Input
-        type="number"
-        step="0.01"
-        value={entry.weight}
-        onChange={(event) => onChange({ ...entry, weight: Number(event.target.value) })}
-        className="h-8 border-white/10 bg-white/5 text-xs"
-        aria-label="权重"
-      />
-      <SelectField
-        value={entry.severity}
-        onChange={(next) => onChange({ ...entry, severity: next })}
-        options={SEVERITY_OPTIONS}
-      />
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon-sm"
-        onClick={onRemove}
-        aria-label="删除特征"
-        className="shrink-0 text-zinc-500 hover:bg-rose-500/10 hover:text-rose-200"
-      >
-        <Trash2 className="size-3.5" />
+    <div className="grid grid-cols-[88px_minmax(0,1fr)_86px_86px_64px] items-center gap-3 border-b border-white/8 px-3 py-3">
+      <span className="font-mono text-xs text-zinc-500">{diff.at.slice(5)}</span>
+      <span className="min-w-0">
+        <span className="block truncate text-sm font-medium text-zinc-100" title={diff.subject}>{diff.subject}</span>
+        <span className="mt-0.5 block truncate font-mono text-[11px] text-zinc-600" title={`${diff.agentId} / ${diff.workspacePath}`}>
+          {diff.agentId} / {diff.eventKind}
+        </span>
+      </span>
+      <span><Pill className={changeTone(diff.changeType)}>{CHANGE_LABEL[diff.changeType]}</Pill></span>
+      <span><Pill className={toneBySeverity(diff.simulated.severity)}>{SEVERITY_LABEL[diff.simulated.severity]}</Pill></span>
+      <Button asChild variant="ghost" size="icon-sm" className="justify-self-end text-zinc-400 hover:bg-white/10 hover:text-zinc-100">
+        <Link to={`/events?${eventQs.toString()}`} aria-label="查看事件">
+          <Search className="size-3.5" />
+        </Link>
       </Button>
     </div>
   );
 }
 
-function SaeSection({
-  value,
-  seed,
-  onChange,
+function SimulationPanel({
+  timeType,
+  result,
+  loading,
+  onTimeTypeChange,
+  onRun,
 }: {
-  value: SaeConfig | null;
-  seed: SaeDictEntry[];
-  onChange: (next: SaeConfig | null) => void;
+  timeType: SecurityTimeType;
+  result: PolicySimulationResult | null;
+  loading: boolean;
+  onTimeTypeChange: (next: SecurityTimeType) => void;
+  onRun: () => void;
 }) {
-  const enabled = Boolean(value?.enabled);
-  const config: SaeConfig = value ?? { ...DEFAULT_SAE, dict: [] };
-
-  // First enable seeds the dictionary from the server-provided seed.
-  const enable = (next: boolean) => {
-    if (!next) {
-      onChange(value ? { ...value, enabled: false } : { ...DEFAULT_SAE, enabled: false, dict: [] });
-      return;
-    }
-    const dict = config.dict.length > 0 ? config.dict : seed.map((entry) => ({ ...entry }));
-    onChange({ ...DEFAULT_SAE, ...config, enabled: true, dict });
-  };
-
-  const nextId = useMemo(() => config.dict.reduce((max, entry) => Math.max(max, entry.id), 0) + 1, [config.dict]);
-
-  const updateEntry = (index: number, entry: SaeDictEntry) => {
-    onChange({ ...config, dict: config.dict.map((item, idx) => (idx === index ? entry : item)) });
-  };
-  const removeEntry = (index: number) => {
-    onChange({ ...config, dict: config.dict.filter((_, idx) => idx !== index) });
-  };
-  const addEntry = () => {
-    onChange({
-      ...config,
-      dict: [...config.dict, { id: nextId, concept: "", category: "", weight: 0.5, severity: "medium" }],
-    });
-  };
-
   return (
     <Panel
-      title="SAE 模型输出可解释性"
-      icon={Brain}
-      description="AnySentry 自有的模型输出评分器:启用开关 + escalateAt/blockAt (0..1) + 特征字典。"
-      action={<Switch checked={enabled} onChange={enable} />}
+      title="策略回放"
+      icon={BarChart3}
+      description="用当前草稿重放历史事件,预估保存后的阻断与升级变化。"
+      action={
+        <div className="flex items-center gap-2">
+          <SelectField value={timeType} onChange={onTimeTypeChange} options={TIME_OPTIONS} className="w-[116px]" />
+          <Button
+            type="button"
+            size="sm"
+            onClick={onRun}
+            disabled={loading}
+            className="h-8 bg-teal-500 text-[#07100c] hover:bg-teal-400"
+          >
+            {loading ? <LoaderCircle className="size-3.5 animate-spin" /> : <BarChart3 className="size-3.5" />}
+            模拟影响
+          </Button>
+        </div>
+      }
     >
-      {enabled ? (
-        <div className="space-y-4 p-4">
-          <div className="grid gap-4 md:grid-cols-2">
-            <Field label="升级阈值 (escalateAt)" hint="0..1,得分 ≥ 该值触发升级研判">
-              <Input
-                type="number"
-                step="0.01"
-                min={0}
-                max={1}
-                value={config.escalateAt}
-                onChange={(event) => onChange({ ...config, escalateAt: clamp01(Number(event.target.value)) })}
-                className="h-8 border-white/10 bg-white/5 text-xs"
-              />
-            </Field>
-            <Field label="阻断阈值 (blockAt)" hint="0..1,得分 ≥ 该值直接阻断">
-              <Input
-                type="number"
-                step="0.01"
-                min={0}
-                max={1}
-                value={config.blockAt}
-                onChange={(event) => onChange({ ...config, blockAt: clamp01(Number(event.target.value)) })}
-                className="h-8 border-white/10 bg-white/5 text-xs"
-              />
-            </Field>
-          </div>
-
-          <div>
-            <div className="mb-2 flex items-center justify-between gap-3">
-              <p className="text-xs font-medium text-zinc-400">特征字典 (feature dictionary)</p>
-              <Button
-                type="button"
-                size="sm"
-                variant="secondary"
-                onClick={addEntry}
-                className="h-7 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-              >
-                <Plus className="size-3.5" />
-                新增特征
-              </Button>
+      <div className="space-y-4 p-4">
+        {result ? (
+          <>
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+              <MetricTile label="已评估" value={result.summary.evaluatedEvents} tone="border-white/10 bg-white/[0.03] text-zinc-100" />
+              <MetricTile label="变化事件" value={result.summary.changedEvents} tone="border-amber-400/25 bg-amber-500/10 text-amber-100" />
+              <MetricTile label="新增阻断" value={result.summary.newBlocks} tone="border-rose-400/25 bg-rose-500/10 text-rose-100" />
+              <MetricTile label="移除阻断" value={result.summary.removedBlocks} tone="border-teal-400/25 bg-teal-500/10 text-teal-100" />
+              <MetricTile label="影响 Agent" value={result.summary.affectedAgents} tone="border-sky-400/25 bg-sky-500/10 text-sky-100" />
+              <MetricTile label="跳过" value={result.summary.skippedEvents} tone="border-white/10 bg-white/5 text-zinc-300" />
             </div>
-            {config.dict.length === 0 ? (
-              <div className="rounded-md border border-dashed border-white/10 px-3 py-6 text-center text-xs text-zinc-500">
-                字典为空 — 点击「新增特征」添加 id/concept/category/weight/severity。
-              </div>
-            ) : (
-              <div className="space-y-2">
-                <div className="grid grid-cols-[64px_minmax(0,1.3fr)_minmax(0,1fr)_88px_minmax(120px,0.8fr)_auto] gap-2 px-2 text-[11px] text-zinc-600">
-                  <span>ID</span>
-                  <span>概念</span>
-                  <span>分类</span>
-                  <span>权重</span>
-                  <span>严重度</span>
-                  <span />
+
+            <div className="grid gap-4 xl:grid-cols-2">
+              <div className="rounded-md border border-white/10 bg-white/[0.03] p-3">
+                <div className="mb-2 text-xs font-semibold text-zinc-100">Top Agents</div>
+                <div className="space-y-2">
+                  {result.byAgent.length ? result.byAgent.slice(0, 6).map((item) => (
+                    <div key={item.key} className="grid grid-cols-[minmax(0,1fr)_58px_58px_58px] gap-2 text-xs">
+                      <span className="truncate text-zinc-400" title={item.key}>{item.key}</span>
+                      <span className="text-right font-mono text-rose-200">{item.newBlocks}</span>
+                      <span className="text-right font-mono text-teal-200">{item.removedBlocks}</span>
+                      <span className="text-right font-mono text-amber-200">{item.newEscalations}</span>
+                    </div>
+                  )) : <p className="text-xs text-zinc-500">无影响</p>}
                 </div>
-                {config.dict.map((entry, index) => (
-                  <SaeDictRow
-                    key={index}
-                    entry={entry}
-                    onChange={(next) => updateEntry(index, next)}
-                    onRemove={() => removeEntry(index)}
-                  />
-                ))}
               </div>
-            )}
+              <div className="rounded-md border border-white/10 bg-white/[0.03] p-3">
+                <div className="mb-2 text-xs font-semibold text-zinc-100">Top Workspaces</div>
+                <div className="space-y-2">
+                  {result.byWorkspace.length ? result.byWorkspace.slice(0, 6).map((item) => (
+                    <div key={item.key} className="grid grid-cols-[minmax(0,1fr)_58px_58px_58px] gap-2 text-xs">
+                      <span className="truncate text-zinc-400" title={item.key}>{item.key}</span>
+                      <span className="text-right font-mono text-rose-200">{item.newBlocks}</span>
+                      <span className="text-right font-mono text-teal-200">{item.removedBlocks}</span>
+                      <span className="text-right font-mono text-amber-200">{item.newEscalations}</span>
+                    </div>
+                  )) : <p className="text-xs text-zinc-500">无影响</p>}
+                </div>
+              </div>
+            </div>
+
+            <div className="overflow-hidden rounded-md border border-white/10 bg-white/[0.03]">
+              <div className="flex min-h-10 items-center justify-between gap-3 border-b border-white/10 px-3">
+                <h3 className="text-xs font-semibold text-zinc-100">事件差异</h3>
+                <span className="text-[11px] text-zinc-500">{result.updateTime}</span>
+              </div>
+              {result.diffs.length ? (
+                <div className="max-h-[360px] overflow-y-auto">
+                  {result.diffs.map((diff) => <SimulationDiffRow key={`${diff.eventId}:${diff.changeType}`} diff={diff} />)}
+                </div>
+              ) : (
+                <div className="px-3 py-8 text-center text-xs text-zinc-500">当前窗口内没有策略差异</div>
+              )}
+            </div>
+          </>
+        ) : (
+          <div className="rounded-md border border-dashed border-white/10 px-3 py-8 text-center text-xs text-zinc-500">
+            修改草稿后运行模拟,保存前查看影响面。
           </div>
-        </div>
-      ) : (
-        <div className="px-4 py-5 text-xs text-zinc-500">
-          未启用 — 不对模型输出评分。开启后将从服务端种子字典自动填充 ({seed.length} 项)。
-        </div>
-      )}
+        )}
+      </div>
     </Panel>
   );
 }
@@ -663,7 +660,6 @@ function StatusStrip({ status }: { status: PolicyStatus }) {
     { key: "l1", label: "L1 规则", icon: ShieldCheck },
     { key: "l2", label: "L2 LLM", icon: Zap },
     { key: "l3", label: "L3 深判", icon: Bot },
-    { key: "sae", label: "SAE", icon: Brain },
   ];
   return (
     <div className="flex flex-wrap items-center gap-2">
@@ -692,14 +688,15 @@ function StatusStrip({ status }: { status: PolicyStatus }) {
 export default function PolicyConfigPage() {
   const [draft, setDraft] = useState<PolicyConfig | null>(null);
   const [status, setStatus] = useState<PolicyStatus | null>(null);
-  const [seed, setSeed] = useState<SaeDictEntry[]>([]);
   const [toast, setToast] = useState<{ kind: "success" | "error"; message: string } | null>(null);
   const [saving, setSaving] = useState(false);
+  const [simulationTimeType, setSimulationTimeType] = useState<SecurityTimeType>("last_3h");
+  const [simulation, setSimulation] = useState<PolicySimulationResult | null>(null);
+  const [simulating, setSimulating] = useState(false);
 
   const applyResponse = useCallback((response: PolicyConfigResponse) => {
     setDraft(response.policy);
     setStatus(response.status);
-    if (response.saeDictSeed) setSeed(response.saeDictSeed);
   }, []);
 
   const { loading, error, refresh } = useRequest(() => securityCenterApi.getConfig(), {
@@ -731,6 +728,24 @@ export default function PolicyConfigPage() {
     }
   };
 
+  const handleSimulate = async () => {
+    if (!draft) return;
+    setSimulating(true);
+    try {
+      const result = await securityCenterApi.simulateConfig({
+        timeType: simulationTimeType,
+        policy: draft,
+        limit: 120,
+      });
+      setSimulation(result);
+      setToast({ kind: "success", message: "策略模拟完成" });
+    } catch (simulateError) {
+      setToast({ kind: "error", message: `模拟失败:${formatRequestError(simulateError)}` });
+    } finally {
+      setSimulating(false);
+    }
+  };
+
   return (
     <div className="flex h-full w-full flex-col overflow-hidden bg-[#0b0f0c] text-zinc-100">
       <header className="shrink-0 border-b border-white/10 bg-[#0b0f0c] px-4 py-3">
@@ -752,11 +767,12 @@ export default function PolicyConfigPage() {
                 <Sparkles className="size-5 shrink-0 text-teal-300" />
                 <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">策略配置</h1>
               </div>
-              <p className="mt-0.5 truncate text-xs text-zinc-500">L1 规则 · L2 LLM 研判 · L3 a3s-code 深判 · SAE 评分</p>
+              <p className="mt-0.5 truncate text-xs text-zinc-500">L1 规则 · L2 LLM 研判 · L3 a3s-code 深判</p>
             </div>
           </div>
           <div className="flex items-center gap-3">
             {status ? <StatusStrip status={status} /> : null}
+            <AdminTokenControl compact />
             <Button
               type="button"
               onClick={handleSave}
@@ -816,10 +832,17 @@ export default function PolicyConfigPage() {
                 </div>
               </Panel>
 
+              <SimulationPanel
+                timeType={simulationTimeType}
+                result={simulation}
+                loading={simulating}
+                onTimeTypeChange={setSimulationTimeType}
+                onRun={handleSimulate}
+              />
+
               <L1RulesSection rules={draft.rules} onChange={(next) => update("rules", next)} />
               <L2Section value={draft.llm} onChange={(next) => update("llm", next)} />
               <L3Section value={draft.agent} onChange={(next) => update("agent", next)} />
-              <SaeSection value={draft.sae} seed={seed} onChange={(next) => update("sae", next)} />
             </>
           ) : null}
         </div>

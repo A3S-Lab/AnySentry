@@ -5,9 +5,6 @@
 // (done in SentryJudgeService.applyPolicy). Verified against the SDK: custom `rules` are ADDITIVE to
 // the built-in protections; `llm`/`agent` blocks must be multi-line HCL; L2/L3 only fire when an L1
 // rule escalates, and degrade gracefully (allow/escalate) when their backend is unreachable.
-//
-// SAE is NOT part of the sentry ACL — it's AnySentry's own model-output scorer (see sae.ts), carried
-// here so the same config surface toggles + tunes it.
 
 import { Severity, Verdict } from './types';
 
@@ -26,8 +23,6 @@ export interface L1Rule {
 }
 export interface L2Config { url: string; model: string; timeoutS: number } // LLM judge endpoint
 export interface L3Config { bin: string; skills: string } // a3s-code agent + skills dir
-export interface SaeDictEntry { id: number; concept: string; category: string; weight: number; severity: Severity }
-export interface SaeConfig { enabled: boolean; escalateAt: number; blockAt: number; dict: SaeDictEntry[] }
 
 /** The whole judge policy. `null` tiers are "not configured" → the dashboard hides them. */
 export interface PolicyConfig {
@@ -36,7 +31,19 @@ export interface PolicyConfig {
   rules: L1Rule[];
   llm: L2Config | null;
   agent: L3Config | null;
-  sae: SaeConfig | null;
+}
+
+export class PolicyConfigError extends Error {
+  constructor(message = 'invalid policy') {
+    super(message);
+    this.name = 'PolicyConfigError';
+  }
+}
+
+export function policyConfigError(error: unknown): PolicyConfigError {
+  if (error instanceof PolicyConfigError) return error;
+  const message = error instanceof Error && error.message ? error.message : String(error || 'invalid policy');
+  return new PolicyConfigError(message);
 }
 
 export const DEFAULT_POLICY: PolicyConfig = {
@@ -45,7 +52,6 @@ export const DEFAULT_POLICY: PolicyConfig = {
   rules: [],
   llm: null,
   agent: null,
-  sae: null,
 };
 
 const KINDS: RuleKind[] = ['ToolExec', 'Egress', 'Dns', 'FileAccess', 'SslContent', 'SecurityAction'];
@@ -84,22 +90,7 @@ export function sanitizePolicy(input: unknown): PolicyConfig {
   const agentIn = o.agent as Record<string, unknown> | null | undefined;
   const agent: L3Config | null = agentIn && str(agentIn.bin) ? { bin: str(agentIn.bin, 500), skills: str(agentIn.skills, 500) } : null;
 
-  const saeIn = o.sae as Record<string, unknown> | null | undefined;
-  const sae: SaeConfig | null = saeIn
-    ? {
-        enabled: saeIn.enabled === true,
-        escalateAt: num(saeIn.escalateAt, 0, 1, 0.3),
-        blockAt: num(saeIn.blockAt, 0, 1, 0.6),
-        dict: Array.isArray(saeIn.dict)
-          ? (saeIn.dict as unknown[]).slice(0, 5000).map((d) => {
-              const x = (d ?? {}) as Record<string, unknown>;
-              return { id: num(x.id, 0, 2 ** 31, 0), concept: str(x.concept, 80), category: str(x.category, 80), weight: num(x.weight, 0, 1, 0.5), severity: pick(x.severity, SEVERITIES, 'medium') };
-            }).filter((d) => d.concept && d.category)
-          : [],
-      }
-    : null;
-
-  return { failClosed: o.failClosed === true, speculate: pick(o.speculate, ['off', 'low', 'medium', 'high'], 'off'), rules, llm, agent, sae };
+  return { failClosed: o.failClosed === true, speculate: pick(o.speculate, ['off', 'low', 'medium', 'high'], 'off'), rules, llm, agent };
 }
 
 /** HCL double-quoted string. */
@@ -126,6 +117,6 @@ export function buildAcl(c: PolicyConfig): string {
 }
 
 /** Which tiers the dashboard should show (`如果没配置就前端不展示`). L1 is always active (built-ins). */
-export function tierStatus(c: PolicyConfig): { l1: boolean; l2: boolean; l3: boolean; sae: boolean } {
-  return { l1: true, l2: !!c.llm, l3: !!c.agent, sae: !!c.sae?.enabled };
+export function tierStatus(c: PolicyConfig): { l1: boolean; l2: boolean; l3: boolean } {
+  return { l1: true, l2: !!c.llm, l3: !!c.agent };
 }

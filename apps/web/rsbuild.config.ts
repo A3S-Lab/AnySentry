@@ -8,6 +8,7 @@ const browserTargets = ["Chrome >= 91", "Edge >= 91", "Firefox >= 90", "Safari >
 
 // AnySentry backend default port. Override with `WEB_PROXY_API_TARGET` when needed.
 const apiProxyTarget = process.env.WEB_PROXY_API_TARGET || "http://127.0.0.1:29653";
+const publicBasePath = process.env.PUBLIC_BASE_PATH || "";
 
 const proxy = (target: string, options: { ws?: boolean } = {}) => ({
   target,
@@ -23,6 +24,9 @@ export default defineConfig({
     entry: {
       index: "./src/main.tsx",
     },
+    define: {
+      __ANYSENTRY_BASE_PATH__: JSON.stringify(publicBasePath),
+    },
   },
   resolve: {
     alias: {
@@ -35,7 +39,7 @@ export default defineConfig({
     },
     // Serve assets under a configurable base path (e.g. behind an ingress at
     // `/apps/anysentry`). Empty => root, so local dev is unaffected.
-    assetPrefix: process.env.PUBLIC_BASE_PATH ? `${process.env.PUBLIC_BASE_PATH}/` : "/",
+    assetPrefix: publicBasePath ? `${publicBasePath}/` : "/",
     overrideBrowserslist: browserTargets,
   },
   server: {

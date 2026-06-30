@@ -23,6 +23,24 @@ and bundle a single-node ClickHouse for durable storage; nothing is tied to a sp
 - `kubectl` configured for your cluster.
 - For the observer step only: a container registry you can push to (or use the public images).
 
+## One-command install
+
+The repo includes `deploy/install.sh` for the integrated middleware stack:
+
+```bash
+deploy/install.sh docker
+
+ANYSENTRY_INSTALL_MODE=kubernetes \
+CLICKHOUSE_PASSWORD="$(openssl rand -hex 16)" \
+deploy/install.sh
+```
+
+Docker mode builds and starts AnySentry + ClickHouse with compose. Kubernetes mode creates the
+namespace, creates the ClickHouse Secret, applies `deploy/anysentry.yaml`, applies the observe-only
+`a3s-observer` DaemonSet, optionally applies Ingress with `ANYSENTRY_APPLY_INGRESS=1`, and waits for
+the AnySentry, ClickHouse, and observer rollouts. The AnySentry image bundles `@a3s-lab/sentry`;
+the observer DaemonSet runs only `a3s-observer-collector` plus the AnySentry forwarder.
+
 ## 1. AnySentry image
 
 Use the public image `ghcr.io/a3s-lab/anysentry:latest` (referenced by `deploy/anysentry.yaml`),
@@ -66,6 +84,22 @@ kubectl -n anysentry port-forward svc/anysentry 29653:29653
 To expose it outside the cluster instead, edit and apply `deploy/ingress.yaml` (set
 `ingressClassName` + a host for your Ingress controller).
 
+### Optional management API auth
+
+Set `ANYSENTRY_ADMIN_TOKEN` to require an operator token for control-plane writes such as Source
+management, policy saves, Maintenance windows, Notifications, Objectives, and Incident / Alert /
+Remediation updates. Keep it in a Kubernetes Secret and inject it into the AnySentry Deployment, for
+example:
+
+```bash
+kubectl -n anysentry create secret generic anysentry-admin \
+  --from-literal=ANYSENTRY_ADMIN_TOKEN='<long-random-token>'
+```
+
+Then add an `env` entry with `valueFrom.secretKeyRef` to the AnySentry container. Read APIs and
+producer paths (`/security-center/ingest`, Collector heartbeat, Source check-in) remain on Source
+identity and Source ingest tokens.
+
 ### Using an external ClickHouse
 
 To use your own ClickHouse instead of the bundled one, delete the ClickHouse `Deployment`,
@@ -95,6 +129,11 @@ kubectl -n anysentry get pods -l app=a3s-observer -o wide
 
 Events appear on the dashboard within seconds as workloads on the nodes run tools, make egress,
 touch files, or escalate privileges.
+
+The DaemonSet sets `A3S_OBSERVER_COLLECTOR_ID` and `A3S_NODE_NAME` from Kubernetes `spec.nodeName`,
+so every node appears as a stable Collector. The bundled forwarder also emits source-aware
+heartbeats every `ANYSENTRY_HEARTBEAT_SECS` seconds; with no explicit `ANYSENTRY_SOURCE_ID`,
+AnySentry discovers one observer Source per node/collector automatically.
 
 ## Safety
 

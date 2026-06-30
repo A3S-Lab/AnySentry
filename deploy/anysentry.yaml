@@ -162,11 +162,11 @@ spec:
             # really judges it). Leave unset to show only real ingested events.
             # - { name: ANYSENTRY_SYNTHETIC_FEED, value: "on" }
           readinessProbe:
-            httpGet: { path: /, port: 29653 }
+            httpGet: { path: /security-center/healthz, port: 29653 }
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
-            httpGet: { path: /, port: 29653 }
+            httpGet: { path: /security-center/healthz, port: 29653 }
             initialDelaySeconds: 15
             periodSeconds: 20
           resources:

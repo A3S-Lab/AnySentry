@@ -40,6 +40,14 @@ spec:
             # Set to "0" to reduce footprint on a busy node.
             - { name: A3S_OBSERVER_FILES, value: "1" }
             - { name: A3S_OBSERVER_SSL, value: "1" }
+            # Stable node-scoped Collector identity for the AnySentry Collector and Source consoles.
+            - name: A3S_OBSERVER_COLLECTOR_ID
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: A3S_NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - { name: ANYSENTRY_SOURCE_TYPE, value: "observer" }
+            - { name: ANYSENTRY_SOURCE_NAME, value: "kubernetes-a3s-observer" }
+            - { name: ANYSENTRY_HEARTBEAT_SECS, value: "30" }
             - { name: ANYSENTRY_INGEST_URL, value: "http://anysentry:29653/security-center/ingest" }
           command: ["/bin/sh", "-c"]
           args: ["a3s-observer-collector | node /opt/observer-forward.js"]

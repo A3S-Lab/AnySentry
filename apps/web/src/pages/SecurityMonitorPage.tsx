@@ -4,36 +4,47 @@ import {
   Activity,
   AlertTriangle,
   BarChart3,
+  BellRing,
   Bot,
-  Brain,
+  CalendarClock,
   Clock3,
+  EyeOff,
+  FileCheck2,
   Gauge,
+  GitBranch,
   Layers3,
   LoaderCircle,
+  Megaphone,
   type LucideIcon,
   Network,
+  PlugZap,
   Radar,
+  RadioTower,
   RefreshCw,
+  Target,
   ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
   ShieldQuestion,
   Siren,
-  Sparkles,
   TerminalSquare,
   Zap,
 } from "lucide-react";
-import { type ReactNode, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import { AdminTokenControl } from "@/components/custom/admin-token-control";
 import { useVChartTheme } from "@/components/custom/charts/vchart-theme";
 import { type VChartSpec, VChartView } from "@/components/custom/vchart";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
+  type AgentEventCategory,
+  type AgentEventList,
+  type AgentEventListItem,
+  type AgentObservability,
   type SecurityDecisionFunnel,
   type SecurityDecisionTier,
-  type SecurityExplainabilityDrivers,
   type SecurityExplainabilityScan,
   type SecurityHealthCard,
   type SecurityHighestRiskSession,
@@ -46,8 +57,10 @@ import {
   type SecuritySeverity,
   type SecurityTimeFilter,
   type SecurityTimeType,
+  type SecurityVerdict,
   type SecurityWorkspaceRiskDistribution,
   securityCenterApi,
+  streamAgentObservability,
 } from "@/lib/api/security-center";
 import type { PolicyStatus } from "@/lib/api/security-center";
 import { settleAll } from "@/lib/settle-all";
@@ -56,24 +69,24 @@ import { cn } from "@/lib/utils";
 type SecuritySectionKey =
   | "health"
   | "scan"
-  | "drivers"
   | "performance"
   | "riskSummary"
   | "riskBreakdown"
   | "highestRisk"
   | "decisionFunnel"
-  | "workspaceRisk";
+  | "workspaceRisk"
+  | "events";
 
 interface SecurityDashboardData {
   health: SecurityHealthCard | null;
   scan: SecurityExplainabilityScan | null;
-  drivers: SecurityExplainabilityDrivers | null;
   performance: SecurityPerformanceCard | null;
   riskSummary: SecurityRiskSummary | null;
   riskBreakdown: SecurityRiskBreakdown | null;
   highestRisk: SecurityHighestRiskSession | null;
   decisionFunnel: SecurityDecisionFunnel | null;
   workspaceRisk: SecurityWorkspaceRiskDistribution | null;
+  events: AgentEventList | null;
   errors: Partial<Record<SecuritySectionKey, string>>;
 }
 
@@ -140,6 +153,21 @@ const RISK_TONE: Record<string, { label: string; text: string; bg: string; borde
 
 const funnelColors = ["#2dd4bf", "#fbbf24", "#fb923c", "#fb7185"];
 const summaryColors = ["#fb7185", "#fbbf24", "#2dd4bf", "#60a5fa"];
+const EVENT_CATEGORY_LABEL: Record<AgentEventCategory, string> = {
+  tool: "工具",
+  network: "网络",
+  file: "文件",
+  llm: "LLM",
+  security: "安全",
+  process: "进程",
+  runtime: "运行时",
+  unknown: "未知",
+};
+const VERDICT_LABEL: Record<SecurityVerdict, string> = {
+  allow: "放行",
+  block: "阻断",
+  escalate: "升级",
+};
 
 const RISK_DIMENSIONS: Array<Pick<SecurityRiskDimension, "dimensionCode" | "dimensionName">> = [
   { dimensionCode: "command_danger", dimensionName: "命令危险" },
@@ -175,7 +203,6 @@ const RISK_EVENT_NAMES: Record<string, string> = {
   secretexposure: "敏感信息暴露",
   secretincontextwindow: "上下文敏感信息",
   sensitivedata: "敏感数据",
-  saeexplainability: "SAE 可解释性风险",
 };
 
 function formatRequestError(error: unknown) {
@@ -193,13 +220,13 @@ async function loadSecurityDashboardData(filter: SecurityTimeFilter): Promise<Se
     {
       health: securityCenterApi.healthCard(filter),
       scan: securityCenterApi.explainabilityScan(scanFilter),
-      drivers: securityCenterApi.explainabilityDrivers(filter),
       performance: securityCenterApi.performanceCard(filter),
       riskSummary: securityCenterApi.riskSummary(filter),
       riskBreakdown: securityCenterApi.riskBreakdown(filter),
       highestRisk: securityCenterApi.highestRiskSession(filter),
       decisionFunnel: securityCenterApi.decisionFunnel(filter),
       workspaceRisk: securityCenterApi.workspaceRiskDistribution(filter),
+      events: securityCenterApi.agentEvents({ ...filter, limit: 36 }),
     },
     formatRequestError,
   );
@@ -211,13 +238,13 @@ function enrichSecurityDashboardData(data: SecurityDashboardData): SecurityDashb
   return {
     health: data.health,
     scan: data.scan,
-    drivers: data.drivers,
     performance: data.performance,
     riskSummary: data.riskSummary,
     riskBreakdown: normalizeRiskBreakdown(data.riskBreakdown),
     highestRisk: normalizeHighestRiskSession(data.highestRisk),
     decisionFunnel: data.decisionFunnel,
     workspaceRisk: data.workspaceRisk,
+    events: data.events,
     errors: data.errors,
   };
 }
@@ -419,36 +446,16 @@ function riskTone(level?: SecurityRiskLevel) {
   return RISK_TONE[String(level || "unknown").toLowerCase()] ?? RISK_TONE.unknown;
 }
 
-const VERDICT_LABEL: Record<string, string> = {
-  allow: "放行",
-  block: "阻断",
-  escalate: "升级研判",
-};
-
-// severity 与 RISK_TONE 同色板;info 归到安全色,其余同名直查。
-function severityTone(severity?: SecuritySeverity) {
-  if (severity === "info") return RISK_TONE.safe;
-  return RISK_TONE[String(severity || "unknown").toLowerCase()] ?? RISK_TONE.unknown;
+function severityLevel(severity?: SecuritySeverity): SecurityRiskLevel {
+  if (severity === "info") return "safe";
+  return severity ?? "unknown";
 }
 
-function verdictLabel(verdict?: string) {
-  return VERDICT_LABEL[String(verdict || "").toLowerCase()] ?? verdict ?? "--";
-}
-
-const HARMFUL_BAR_COLOR: Record<string, string> = {
-  safe: "#2dd4bf",
-  low: "#2dd4bf",
-  medium: "#fbbf24",
-  high: "#fb923c",
-  critical: "#fb7185",
-};
-
-function harmfulTone(value: number) {
-  if (value >= 80) return "critical";
-  if (value >= 60) return "high";
-  if (value >= 35) return "medium";
-  if (value > 0) return "low";
-  return "safe";
+function verdictLevel(verdict?: SecurityVerdict): SecurityRiskLevel {
+  if (verdict === "block") return "critical";
+  if (verdict === "escalate") return "medium";
+  if (verdict === "allow") return "safe";
+  return "unknown";
 }
 
 function activeFilterLabel(filter: SecurityTimeFilter) {
@@ -622,7 +629,7 @@ function SecurityHeader({
                 {activeFilterLabel(filter)}
               </span>
             </div>
-            <p className="mt-0.5 truncate text-xs text-zinc-500">风险监控面板 · SAE 可解释性 · 会话决策漏斗</p>
+            <p className="mt-0.5 truncate text-xs text-zinc-500">风险监控面板 · 会话决策漏斗 · 工作区风险分布</p>
           </div>
         </div>
 
@@ -657,6 +664,150 @@ function SecurityHeader({
                 <RefreshCw className="mr-1.5 size-3.5" />
               )}
               刷新
+            </Button>
+            <AdminTokenControl />
+            <Button
+              asChild
+              variant="secondary"
+              size="sm"
+              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+            >
+              <Link to="/sources">
+                <PlugZap className="mr-1.5 size-3.5" />
+                接入源
+              </Link>
+            </Button>
+            <Button
+              asChild
+              variant="secondary"
+              size="sm"
+              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+            >
+              <Link to="/collectors">
+                <RadioTower className="mr-1.5 size-3.5" />
+                采集链路
+              </Link>
+            </Button>
+            <Button
+              asChild
+              variant="secondary"
+              size="sm"
+              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+            >
+              <Link to="/agents">
+                <Bot className="mr-1.5 size-3.5" />
+                智能体资产
+              </Link>
+            </Button>
+            <Button
+              asChild
+              variant="secondary"
+              size="sm"
+              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+            >
+              <Link to="/workspaces">
+                <Layers3 className="mr-1.5 size-3.5" />
+                Workspace
+              </Link>
+            </Button>
+            <Button
+              asChild
+              variant="secondary"
+              size="sm"
+              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+            >
+              <Link to="/remediation">
+                <FileCheck2 className="mr-1.5 size-3.5" />
+                处置
+              </Link>
+            </Button>
+            <Button
+              asChild
+              variant="secondary"
+              size="sm"
+              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+            >
+              <Link to="/coverage">
+                <EyeOff className="mr-1.5 size-3.5" />
+                覆盖
+              </Link>
+            </Button>
+            <Button
+              asChild
+              variant="secondary"
+              size="sm"
+              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+            >
+              <Link to="/maintenance">
+                <CalendarClock className="mr-1.5 size-3.5" />
+                维护
+              </Link>
+            </Button>
+            <Button
+              asChild
+              variant="secondary"
+              size="sm"
+              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+            >
+              <Link to="/topology">
+                <GitBranch className="mr-1.5 size-3.5" />
+                拓扑
+              </Link>
+            </Button>
+            <Button
+              asChild
+              variant="secondary"
+              size="sm"
+              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+            >
+              <Link to="/objectives">
+                <Target className="mr-1.5 size-3.5" />
+                目标
+              </Link>
+            </Button>
+            <Button
+              asChild
+              variant="secondary"
+              size="sm"
+              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+            >
+              <Link to="/alerts">
+                <BellRing className="mr-1.5 size-3.5" />
+                告警
+              </Link>
+            </Button>
+            <Button
+              asChild
+              variant="secondary"
+              size="sm"
+              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+            >
+              <Link to="/notifications">
+                <Megaphone className="mr-1.5 size-3.5" />
+                通知
+              </Link>
+            </Button>
+            <Button
+              asChild
+              variant="secondary"
+              size="sm"
+              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+            >
+              <Link to="/incidents">
+                <Siren className="mr-1.5 size-3.5" />
+                Incident
+              </Link>
+            </Button>
+            <Button
+              asChild
+              variant="secondary"
+              size="sm"
+              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+            >
+              <Link to="/audit">
+                <Clock3 className="mr-1.5 size-3.5" />
+                审计
+              </Link>
             </Button>
             <Button
               asChild
@@ -866,204 +1017,6 @@ function ExplainabilityPanel({ scan, error }: { scan?: SecurityExplainabilitySca
   );
 }
 
-function ExplainabilityDriversPanel({
-  drivers,
-  error,
-}: {
-  drivers?: SecurityExplainabilityDrivers | null;
-  error?: string;
-}) {
-  const scored = drivers?.scored ?? 0;
-  const flaggedCount = drivers?.flaggedCount ?? 0;
-  const avgHarmful = drivers?.avgHarmful ?? 0;
-  const perCategory = useMemo(
-    () => [...(drivers?.perCategory ?? [])].sort((a, b) => b.total - a.total),
-    [drivers],
-  );
-  const topDrivers = useMemo(
-    () => [...(drivers?.topDrivers ?? [])].sort((a, b) => b.avgContribution - a.avgContribution),
-    [drivers],
-  );
-  const flaggedOutputs = drivers?.flaggedOutputs ?? [];
-  const harmfulKey = harmfulTone(avgHarmful);
-  const headlineTone = riskTone(harmfulKey);
-  const maxCategoryTotal = Math.max(1, ...perCategory.map((item) => item.total));
-  const maxContribution = Math.max(0.0001, ...topDrivers.map((item) => Math.abs(item.avgContribution)));
-
-  return (
-    <Panel
-      title="模型输出可解释性 (SAE)"
-      icon={Brain}
-      action={
-        <span className="text-xs text-zinc-500">{drivers?.updateTime ? formatDate(drivers.updateTime) : "--"}</span>
-      }
-    >
-      {scored === 0 ? (
-        <div className="p-4">
-          <InlineError message={error} />
-          <EmptyState label="无模型输出评分 — 等待 a3s-power SAE 上报" />
-        </div>
-      ) : (
-        <div className="grid gap-4 p-4 xl:grid-cols-[300px_minmax(0,1fr)]">
-          <div className="space-y-4">
-            <div className={cn("rounded-md border p-4", headlineTone.border, headlineTone.bg)}>
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-medium text-zinc-400">平均有害度</span>
-                <Sparkles className={cn("size-4", headlineTone.text)} />
-              </div>
-              <p className={cn("mt-2 font-mono text-5xl font-semibold leading-none", headlineTone.text)}>
-                {formatNumber(avgHarmful, { maximumFractionDigits: 0 })}
-                <span className="ml-1 text-base font-normal text-zinc-500">/100</span>
-              </p>
-              <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/8">
-                <div
-                  className="h-full rounded-full transition-[width] duration-500"
-                  style={{ width: `${normalizePercent(avgHarmful)}%`, backgroundColor: HARMFUL_BAR_COLOR[harmfulKey] }}
-                />
-              </div>
-              <div className="mt-3 grid grid-cols-2 gap-3 text-center">
-                <div>
-                  <p className="text-xs text-zinc-500">已评分输出</p>
-                  <p className="mt-1 text-xl font-semibold text-zinc-100 tabular-nums">{formatNumber(scored)}</p>
-                </div>
-                <div>
-                  <p className="text-xs text-zinc-500">命中标记</p>
-                  <p className="mt-1 text-xl font-semibold text-rose-100 tabular-nums">{formatNumber(flaggedCount)}</p>
-                </div>
-              </div>
-            </div>
-            <div>
-              <p className="mb-2 text-xs font-medium text-zinc-400">分类分布</p>
-              {perCategory.length === 0 ? (
-                <p className="rounded-md border border-white/10 px-3 py-4 text-center text-xs text-zinc-500">暂无分类</p>
-              ) : (
-                <div className="space-y-2">
-                  {perCategory.map((item) => (
-                    <div key={item.category} className="space-y-1">
-                      <div className="flex items-center justify-between gap-3 text-xs">
-                        <span className="min-w-0 truncate text-zinc-300" title={item.category}>
-                          {riskEventName(item.category)}
-                        </span>
-                        <span className="shrink-0 tabular-nums text-zinc-400">{formatNumber(item.total)}</span>
-                      </div>
-                      <MiniGauge value={(item.total / maxCategoryTotal) * 100} color="#a78bfa" />
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-
-          <div className="min-w-0 space-y-4">
-            <InlineError message={error} />
-            <div>
-              <p className="mb-2 text-xs font-medium text-zinc-400">触发的可解释特征 (Top Drivers)</p>
-              {topDrivers.length === 0 ? (
-                <p className="rounded-md border border-white/10 px-3 py-6 text-center text-xs text-zinc-500">
-                  暂无特征触发
-                </p>
-              ) : (
-                <div className="space-y-2">
-                  {topDrivers.map((driver) => (
-                    <div
-                      key={`${driver.concept}-${driver.source}`}
-                      className="rounded-md border border-white/10 bg-white/[0.03] px-3 py-2.5 transition hover:bg-white/[0.06]"
-                    >
-                      <div className="flex items-center justify-between gap-3">
-                        <div className="flex min-w-0 items-center gap-2">
-                          <Sparkles className="size-3.5 shrink-0 text-violet-300" />
-                          <span className="truncate text-sm font-medium text-zinc-100" title={driver.concept}>
-                            {driver.concept}
-                          </span>
-                          <span className="shrink-0 rounded border border-violet-300/25 bg-violet-400/10 px-1.5 py-0.5 font-mono text-[10px] text-violet-200">
-                            {driver.source}
-                          </span>
-                        </div>
-                        <span className="shrink-0 font-mono text-sm font-semibold text-violet-100 tabular-nums">
-                          {formatNumber(driver.avgContribution, { maximumFractionDigits: 3 })}
-                        </span>
-                      </div>
-                      <div className="mt-2 flex items-center gap-2">
-                        <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-white/8">
-                          <div
-                            className="h-full rounded-full bg-violet-400 transition-[width] duration-500"
-                            style={{ width: `${(Math.abs(driver.avgContribution) / maxContribution) * 100}%` }}
-                          />
-                        </div>
-                        <span className="shrink-0 text-[11px] text-zinc-500">
-                          {riskEventName(driver.category)} · {formatNumber(driver.count)}次
-                        </span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            <div>
-              <p className="mb-2 text-xs font-medium text-zinc-400">标记的模型输出</p>
-              {flaggedOutputs.length === 0 ? (
-                <p className="rounded-md border border-white/10 px-3 py-6 text-center text-xs text-zinc-500">
-                  当前窗口无标记输出
-                </p>
-              ) : (
-                <div className="overflow-x-auto rounded-md border border-white/10">
-                  <div className="grid min-w-[560px] grid-cols-[minmax(120px,1fr)_72px_88px_minmax(0,1.4fr)] gap-3 border-b border-white/10 bg-white/[0.03] px-3 py-2 text-[11px] text-zinc-500">
-                    <span>智能体</span>
-                    <span className="text-right">有害度</span>
-                    <span className="text-center">处置</span>
-                    <span>触发特征</span>
-                  </div>
-                  <div className="min-w-[560px] divide-y divide-white/8">
-                    {flaggedOutputs.map((output) => {
-                      const tone = severityTone(output.severity);
-                      const concepts = output.drivers
-                        ?.slice()
-                        .sort((a, b) => Math.abs(b.contribution) - Math.abs(a.contribution))
-                        .slice(0, 2)
-                        .map((driver) => driver.concept)
-                        .join("、");
-                      return (
-                        <div
-                          key={`${output.agentId}-${output.sessionId}-${output.at}`}
-                          className="grid grid-cols-[minmax(120px,1fr)_72px_88px_minmax(0,1.4fr)] items-center gap-3 px-3 py-2.5 text-sm"
-                        >
-                          <span className="truncate font-mono text-xs text-zinc-200" title={output.agentId}>
-                            {output.agentId}
-                          </span>
-                          <span className={cn("text-right tabular-nums font-semibold", tone.text)}>
-                            {formatNumber(output.harmful, { maximumFractionDigits: 0 })}
-                          </span>
-                          <span className="flex justify-center">
-                            <span
-                              className={cn(
-                                "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold",
-                                tone.bg,
-                                tone.border,
-                                tone.text,
-                              )}
-                            >
-                              <span className={cn("size-1.5 rounded-full", tone.dot)} />
-                              {verdictLabel(output.verdict)}
-                            </span>
-                          </span>
-                          <span className="truncate text-xs text-zinc-400" title={concepts}>
-                            {concepts || "--"}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-    </Panel>
-  );
-}
-
 function PerformanceMetricPanel({
   performance,
   loading,
@@ -1136,6 +1089,80 @@ function TopMetrics({ data, loading }: { data?: SecurityDashboardData; loading?:
       />
       <PerformanceMetricPanel performance={data?.performance} loading={loading} />
     </div>
+  );
+}
+
+function LiveObservabilityPanel({
+  observability,
+  connected,
+}: {
+  observability?: AgentObservability | null;
+  connected: boolean;
+}) {
+  const heartbeatLevel: SecurityRiskLevel = observability?.health.heartbeatOk ? "safe" : connected ? "critical" : "unknown";
+  const driftLevel: SecurityRiskLevel = observability?.behavioral.decisionPattern === "drift" ? "medium" : "safe";
+  const statusLabel = connected ? `实时 ${formatTimeLabel(observability?.updateTime)}` : "连接中";
+  const items = [
+    {
+      label: "心跳",
+      value: observability ? (observability.health.heartbeatOk ? "在线" : "异常") : "--",
+      sub: `决策延迟 ${formatNumber(observability?.health.decisionLatencyMs, { maximumFractionDigits: 0 })}ms`,
+      icon: RadioTower,
+      tone: heartbeatLevel,
+    },
+    {
+      label: "错误率",
+      value: formatPercent(observability?.health.errorRate),
+      sub: `资源利用 ${formatPercent(observability?.health.resourceUtil)}`,
+      icon: AlertTriangle,
+      tone: observability && observability.health.errorRate > 10 ? "medium" : "safe",
+    },
+    {
+      label: "吞吐",
+      value: formatNumber(observability?.system.commThroughput, { maximumFractionDigits: 1 }),
+      sub: `智能体 ${formatNumber(observability?.system.agentCount, { maximumFractionDigits: 0 })}`,
+      icon: Network,
+      tone: observability?.system.infraHealthy === false ? "medium" : "safe",
+    },
+    {
+      label: "行为态势",
+      value: observability?.behavioral.decisionPattern === "drift" ? "漂移" : observability ? "基线" : "--",
+      sub: `动作率 ${formatNumber(observability?.behavioral.actionRate, { maximumFractionDigits: 1 })}`,
+      icon: Activity,
+      tone: driftLevel,
+    },
+    {
+      label: "状态迁移",
+      value: formatNumber(observability?.behavioral.stateTransitions, { maximumFractionDigits: 0 }),
+      sub: `目标进度 ${formatPercent(observability?.behavioral.goalProgress)}`,
+      icon: GitBranch,
+      tone: "low",
+    },
+  ];
+
+  return (
+    <Panel title="实时智能体可观测性" icon={RadioTower} action={<StatusPill level={connected ? "safe" : "unknown"} label={statusLabel} />}>
+      <div className="grid gap-3 p-4 md:grid-cols-2 xl:grid-cols-5">
+        {items.map((item) => {
+          const tone = riskTone(item.tone);
+          const Icon = item.icon;
+          return (
+            <div key={item.label} className="min-h-[108px] rounded-[8px] border border-white/10 bg-white/[0.03] p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="truncate text-xs font-medium text-zinc-500">{item.label}</p>
+                  <p className="mt-2 truncate text-2xl font-semibold leading-none tracking-normal text-zinc-50">{item.value}</p>
+                </div>
+                <span className={cn("inline-flex size-9 shrink-0 items-center justify-center rounded-md border", tone.border, tone.bg, tone.text)}>
+                  <Icon className="size-4" />
+                </span>
+              </div>
+              <p className="mt-3 truncate text-xs text-zinc-500">{item.sub}</p>
+            </div>
+          );
+        })}
+      </div>
+    </Panel>
   );
 }
 
@@ -1378,7 +1405,6 @@ function TierStatusStrip({ status }: { status?: PolicyStatus | null }) {
     { key: "l1", label: "L1 规则" },
     { key: "l2", label: "L2 LLM 研判" },
     { key: "l3", label: "L3 深判" },
-    { key: "sae", label: "SAE 可解释性" },
   ];
   return (
     <div className="flex flex-wrap items-center gap-2 rounded-[10px] border border-white/10 bg-[#111612]/80 px-4 py-2.5">
@@ -1487,6 +1513,112 @@ function DecisionFunnelPanel({
   );
 }
 
+function shortId(value?: string) {
+  if (!value) return "--";
+  return value.length > 18 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value;
+}
+
+function eventDetailHref(event: AgentEventListItem) {
+  const qs = new URLSearchParams({
+    eventId: event.eventId,
+    traceId: event.traceId,
+    timeType: "last_3h",
+  });
+  return `/events?${qs.toString()}`;
+}
+
+function EventCellPill({ event }: { event: AgentEventListItem }) {
+  const tone = riskTone(severityLevel(event.severity));
+  return (
+    <span className={cn("inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-semibold", tone.bg, tone.border, tone.text)}>
+      <span className={cn("size-1.5 rounded-full", tone.dot)} />
+      {EVENT_CATEGORY_LABEL[event.eventCategory] ?? event.eventCategory}
+    </span>
+  );
+}
+
+function VerdictPill({ verdict }: { verdict: SecurityVerdict }) {
+  const tone = riskTone(verdictLevel(verdict));
+  return (
+    <span className={cn("inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-semibold", tone.bg, tone.border, tone.text)}>
+      <span className={cn("size-1.5 rounded-full", tone.dot)} />
+      {VERDICT_LABEL[verdict] ?? verdict}
+    </span>
+  );
+}
+
+function AgentEventTimelinePanel({ events, error }: { events?: AgentEventList | null; error?: string }) {
+  const items = events?.items ?? [];
+
+  return (
+    <Panel
+      title="无侵入事件时间线"
+      icon={GitBranch}
+      action={
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-zinc-500">{events ? `${formatNumber(events.total)} 条` : "--"}</span>
+          <Link to="/events" className="text-xs text-teal-300 hover:text-teal-200">查看全部</Link>
+        </div>
+      }
+    >
+      <div className="space-y-3 p-4">
+        <InlineError message={error} />
+        {items.length === 0 ? (
+          <EmptyState label="暂无事件明细" />
+        ) : (
+          <div className="overflow-x-auto">
+            <div className="grid min-w-[980px] grid-cols-[96px_88px_minmax(240px,1.4fr)_minmax(150px,0.9fr)_minmax(150px,0.9fr)_82px_76px] gap-3 border-b border-white/10 pb-2 text-xs text-zinc-500">
+              <span>时间</span>
+              <span>类型</span>
+              <span>事件</span>
+              <span>智能体 / 会话</span>
+              <span>Trace / Span</span>
+              <span className="text-right">风险</span>
+              <span className="text-center">处置</span>
+            </div>
+            <div className="min-w-[980px] divide-y divide-white/8">
+              {items.map((event) => (
+                <Link
+                  key={event.eventId}
+                  to={eventDetailHref(event)}
+                  className="grid grid-cols-[96px_88px_minmax(240px,1.4fr)_minmax(150px,0.9fr)_minmax(150px,0.9fr)_82px_76px] items-center gap-3 py-3 text-sm"
+                >
+                  <span className="font-mono text-xs text-zinc-500">{formatDate(event.at)}</span>
+                  <span className="flex min-w-0">
+                    <EventCellPill event={event} />
+                  </span>
+                  <div className="min-w-0">
+                    <p className="truncate font-medium text-zinc-100" title={event.subject}>
+                      {event.subject}
+                    </p>
+                    <p className="mt-0.5 truncate text-[11px] text-zinc-600" title={event.reason}>
+                      {event.eventKind} · {riskEventName(event.riskCategory)} · {event.source}
+                    </p>
+                  </div>
+                  <div className="min-w-0 font-mono text-xs">
+                    <p className="truncate text-zinc-300" title={event.agentId}>{event.agentId}</p>
+                    <p className="mt-0.5 truncate text-zinc-600" title={event.sessionId}>{event.sessionId}</p>
+                  </div>
+                  <div className="min-w-0 font-mono text-xs">
+                    <p className="truncate text-zinc-300" title={event.traceId}>{shortId(event.traceId)}</p>
+                    <p className="mt-0.5 truncate text-zinc-600" title={event.spanId}>{shortId(event.spanId)}</p>
+                  </div>
+                  <span className="text-right font-mono text-sm font-semibold tabular-nums text-zinc-100">
+                    {formatNumber(event.riskScore, { maximumFractionDigits: 0 })}
+                  </span>
+                  <span className="flex justify-center">
+                    <VerdictPill verdict={event.verdict} />
+                  </span>
+                </Link>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </Panel>
+  );
+}
+
 function WorkspaceRiskPanel({ workspaceRisk }: { workspaceRisk?: SecurityWorkspaceRiskDistribution | null }) {
   const list = workspaceRisk?.list ?? [];
 
@@ -1531,6 +1663,8 @@ export default function SecurityMonitorPage() {
   const [filter, setFilter] = useState<SecurityTimeFilter>(DEFAULT_FILTER);
   const [customStart, setCustomStart] = useState(() => dayjs().subtract(1, "day").format("YYYY-MM-DD"));
   const [customEnd, setCustomEnd] = useState(() => dayjs().format("YYYY-MM-DD"));
+  const [observability, setObservability] = useState<AgentObservability | null>(null);
+  const [observabilityConnected, setObservabilityConnected] = useState(false);
 
   const customError = useMemo(() => {
     if (filter.timeType !== "custom") return undefined;
@@ -1546,8 +1680,22 @@ export default function SecurityMonitorPage() {
     pollingInterval: 10000,
     pollingWhenHidden: false,
   });
-  // Tier status drives conditional rendering: SAE panel + L2/L3 funnel rows are
-  // hidden when not configured. Polled so a Save reflects without a full reload.
+  useEffect(() => {
+    const controller = new AbortController();
+    setObservability(null);
+    setObservabilityConnected(false);
+    streamAgentObservability(
+      requestFilter,
+      (next) => {
+        setObservability(next);
+        setObservabilityConnected(true);
+      },
+      controller.signal,
+    );
+    return () => controller.abort();
+  }, [requestFilter]);
+  // Tier status drives conditional rendering for L2/L3 funnel rows. Polled so a
+  // Save reflects without a full reload.
   const { data: policyConfig } = useRequest(() => securityCenterApi.getConfig(), {
     pollingInterval: 30000,
     pollingWhenHidden: false,
@@ -1555,14 +1703,15 @@ export default function SecurityMonitorPage() {
   });
   const status = policyConfig?.status ?? null;
   const lastUpdatedAt =
+    observability?.updateTime ||
     data?.scan?.updateTime ||
-    data?.drivers?.updateTime ||
     data?.performance?.updateTime ||
     data?.riskSummary?.updateTime ||
     data?.riskBreakdown?.updateTime ||
     data?.highestRisk?.updateTime ||
     data?.decisionFunnel?.updateTime ||
-    data?.workspaceRisk?.updateTime;
+    data?.workspaceRisk?.updateTime ||
+    data?.events?.updateTime;
 
   const handleTimeTypeChange = (value: SecurityTimeType) => {
     if (value === "custom") {
@@ -1598,7 +1747,10 @@ export default function SecurityMonitorPage() {
           <TierStatusStrip status={status} />
 
           <DashboardSection title="运行总览" icon={Activity}>
-            <TopMetrics data={data} loading={loading && !data} />
+            <div className="space-y-3">
+              <TopMetrics data={data} loading={loading && !data} />
+              <LiveObservabilityPanel observability={observability} connected={observabilityConnected} />
+            </div>
           </DashboardSection>
 
           <DashboardSection title="实时扫描" icon={Radar}>
@@ -1608,18 +1760,15 @@ export default function SecurityMonitorPage() {
             </div>
           </DashboardSection>
 
-          {/* SAE 可解释性面板仅在 SAE 已配置时展示(status.sae)。 */}
-          {status?.sae ? (
-            <DashboardSection title="模型输出可解释性" icon={Brain}>
-              <ExplainabilityDriversPanel drivers={data?.drivers} error={data?.errors.drivers} />
-            </DashboardSection>
-          ) : null}
-
           <DashboardSection title="风险态势" icon={Siren}>
             <div className="space-y-4">
               <RiskSummaryPanels summary={data?.riskSummary} />
               <RiskBreakdownPanel breakdown={data?.riskBreakdown} error={data?.errors.riskBreakdown} />
             </div>
+          </DashboardSection>
+
+          <DashboardSection title="运行链路" icon={GitBranch}>
+            <AgentEventTimelinePanel events={data?.events} error={data?.errors.events} />
           </DashboardSection>
 
           <DashboardSection title="会话与工作区" icon={TerminalSquare}>

@@ -28,9 +28,10 @@ RUN pnpm --filter @anysentry/web build \
  && pnpm --filter @anysentry/api --prod deploy /out
 
 FROM ubuntu:24.04 AS runtime
+ARG PUBLIC_BASE_PATH=""
 COPY --from=build /usr/local/bin/node /usr/local/bin/node
 WORKDIR /app
-ENV NODE_ENV=production PORT=29653 ANYSENTRY_WEB_DIR=/app/web
+ENV NODE_ENV=production PORT=29653 ANYSENTRY_WEB_DIR=/app/web PUBLIC_BASE_PATH=${PUBLIC_BASE_PATH}
 COPY --from=build /out/node_modules ./node_modules
 COPY --from=build /out/dist ./dist
 COPY --from=build /src/apps/web/dist ./web
