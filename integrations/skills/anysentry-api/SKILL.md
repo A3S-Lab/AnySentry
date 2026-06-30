@@ -1,6 +1,16 @@
 ---
-name: anysentry-progressive-api
-description: Drive AnySentry deployment checks and the ShuanOS-source-compatible progressive API. Use when the user wants an agent to deploy or verify AnySentry, call /security-center/capabilities, discover security-center operations, assess runtime actions, ingest security evidence, build evidence bundles, or integrate a coding agent with AnySentry without relying on the deprecated ACP-style flow.
+name: anysentry-api
+description: Drive AnySentry deployment checks and the source-compatible progressive API. Use when the user wants an agent to deploy or verify AnySentry, call /security-center/capabilities, discover security-center operations, assess runtime actions, ingest security evidence, build evidence bundles, or integrate a coding agent with AnySentry without relying on the deprecated ACP-style flow.
+allowed-tools: bash(*)
+parameters:
+  - name: apiBase
+    type: string
+    required: false
+    description: AnySentry API base without a trailing slash.
+  - name: task
+    type: string
+    required: false
+    description: Verification or integration task to run through the progressive API.
 ---
 
 # AnySentry progressive API
@@ -180,6 +190,7 @@ From the repo root:
 pnpm verify:progressive-api
 ANYSENTRY_API_BASE="$ANYSENTRY_API_BASE" pnpm verify:progressive-api
 pnpm verify:progressive-api:local
+A3S_TEST_MODEL=openai/glm5.1-w4a8 pnpm verify:a3s-code-skill-api
 ```
 
 Use `pnpm verify:deployment-manifests` after changing manifests and

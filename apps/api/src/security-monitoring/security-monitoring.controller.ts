@@ -1178,7 +1178,7 @@ const SECURITY_PROGRESSIVE_ALIASES: Record<string, { module: string; operation: 
 const SECURITY_PROGRESSIVE_MODULES: T.SecurityApiModule[] = [
   {
     name: SECURITY_PROGRESSIVE_MODULE,
-    description: 'AnySentry security-center progressive API module, modeled after the current ShuanOS kernel capabilities source implementation.',
+    description: 'AnySentry security-center progressive API module, using the source-compatible capabilities pattern.',
     path: '/security-center',
     operations: [
       {

@@ -17,6 +17,7 @@
     "verify:progressive-api:local": "pnpm verify:ai-native-api:local",
     "verify:ai-native-api": "node scripts/verify-ai-native-api.mjs",
     "verify:ai-native-api:local": "pnpm build:api && node scripts/verify-deep-links-local.mjs scripts/verify-ai-native-api.mjs",
+    "verify:a3s-code-skill-api": "node scripts/verify-a3s-code-skill-api.mjs",
     "verify:management-auth": "node scripts/verify-management-auth.mjs",
     "verify:management-auth:local": "pnpm build:api && ANYSENTRY_ADMIN_TOKEN=verify-admin-token node scripts/verify-deep-links-local.mjs scripts/verify-management-auth.mjs",
     "verify:deep-links": "node scripts/verify-deep-links.mjs",

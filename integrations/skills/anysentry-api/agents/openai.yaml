@@ -1,0 +1,4 @@
+interface:
+  display_name: "AnySentry Progressive API"
+  short_description: "Drive AnySentry deployment and capabilities"
+  default_prompt: "Use $anysentry-api to check a running AnySentry deployment and call the security-center progressive API."

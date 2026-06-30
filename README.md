@@ -193,13 +193,29 @@ image assumptions plus the integrated installer:
 pnpm verify:deployment-manifests
 ```
 
-To regression-check the ShuanOS-source-compatible progressive capability API contract, including
+To regression-check the source-compatible progressive capability API contract, including
 `list/search/describe/execute`, module/operation dispatch, shaped responses, and the runtime guard
 operation:
 
 ```bash
 pnpm verify:progressive-api
 ```
+
+To run the real a3s-code Skill integration check, using `glm5.1-w4a8`, load
+`integrations/skills/anysentry-api`, invoke it through the a3s-code `Skill` tool, and have that
+Skill call the progressive API flow (`healthz -> list -> describe -> execute -> events/list`):
+
+```bash
+ANYSENTRY_API_BASE=http://127.0.0.1:29653/security-center \
+A3S_TEST_MODEL=openai/glm5.1-w4a8 \
+A3S_CODE_ACL="$HOME/.a3s/config.acl" \
+A3S_CODE_SDK_BASE=../os/apps/api \
+pnpm verify:a3s-code-skill-api
+```
+
+The verifier creates one unique `LlmCall` evidence event through
+`security-center.recordSecurityEvents`, then queries it back by `runId` and checks the stored
+attributes include `progressive.runner=a3s-code` and `progressive.skill=anysentry-api`.
 
 To regression-check optional management API auth, including admin-token protection for control-plane
 mutations while leaving read APIs, `/ingest`, Collector heartbeat, and Source check-in on their
@@ -462,14 +478,13 @@ short `/ingest/otel` endpoint, Source token rejection, and Source rollups, then 
 pnpm verify:ingest-protocols:local
 ```
 
-## ShuanOS-source-compatible progressive capability API
+## Source-compatible progressive capability API
 
-AnySentry exposes a ShuanOS-source-compatible progressive API at `GET|POST /security-center/capabilities`.
-This follows the current ShuanOS kernel source implementation in
-`apps/api/src/modules/kernel`: `list -> search / describe -> execute`. Callers discover modules
-first, search or describe the exact operation schema only when needed, then call a single `execute`
-action with `module + operation + params`. Like ShuanOS, `describe` can narrow all the way to one
-operation.
+AnySentry exposes a source-compatible progressive API at `GET|POST /security-center/capabilities`.
+It follows the same compact discovery pattern as the platform capabilities API:
+`list -> search / describe -> execute`. Callers discover modules first, search or describe the
+exact operation schema only when needed, then call a single `execute` action with
+`module + operation + params`. `describe` can narrow all the way to one operation.
 
 ```bash
 curl 'http://localhost:29653/security-center/capabilities?action=list'
@@ -485,9 +500,9 @@ The built-in module is `security-center`, with these operations:
 - `buildEvidenceBundle` - assemble governance evidence around an event,
   run, trace, source, incident, objective, or scope.
 
-Runtime guard calls use ShuanOS loop-autonomy vocabulary in `params.autonomy` or
-`constraints.autonomy`: `suggest` only warns, `guarded` returns `require_approval` for block-level
-risk, and `auto` returns a blocking decision.
+Runtime guard calls use loop-autonomy vocabulary in `params.autonomy` or `constraints.autonomy`:
+`suggest` only warns, `guarded` returns `require_approval` for block-level risk, and `auto`
+returns a blocking decision.
 
 ```bash
 curl -X POST http://localhost:29653/security-center/capabilities \
@@ -508,7 +523,7 @@ curl -X POST http://localhost:29653/security-center/capabilities \
   }'
 ```
 
-By default this endpoint follows the ShuanOS raw dispatch contract: `list` returns modules, `search`
+By default this endpoint follows the raw progressive dispatch contract: `list` returns modules, `search`
 returns operations, `describe` returns a module or operation, and `execute` returns the operation
 result. Add `shaped=true` to get a tool-friendly envelope with `success`, `modules` / `operations` /
 `operation` / `data`, plus compatibility metadata. Legacy `capabilityId` inputs such as
@@ -517,7 +532,7 @@ result. Add `shaped=true` to get a tool-friendly envelope with `success`, `modul
 ## Coding-agent progressive API Skill
 
 The repo ships an `a3s-box`-style Skill for coding agents at
-[`integrations/skills/anysentry-progressive-api`](integrations/skills/anysentry-progressive-api).
+[`integrations/skills/anysentry-api`](integrations/skills/anysentry-api).
 It gives Codex, Claude Code, Cursor/Windsurf, Devin/OpenHands, a3s-code, or any other coding agent
 the same progressive API contract: **discover first, describe exactly, then execute**. Agents should
 use this Skill instead of memorizing concrete REST paths or falling back to the deprecated ACP-style
@@ -531,13 +546,13 @@ host's project/system instructions.
 
 ```bash
 mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
-cp -R integrations/skills/anysentry-progressive-api "${CODEX_HOME:-$HOME/.codex}/skills/"
+cp -R integrations/skills/anysentry-api "${CODEX_HOME:-$HOME/.codex}/skills/"
 ```
 
 Then invoke it explicitly:
 
 ```text
-Use $anysentry-progressive-api to check http://localhost:29653/security-center and assess this planned shell command before execution.
+Use $anysentry-api to check http://localhost:29653/security-center and assess this planned shell command before execution.
 ```
 
 ### Universal agent instruction block
@@ -547,8 +562,8 @@ system prompt, project rules, or repository instructions:
 
 ```markdown
 ---
-name: anysentry-progressive-api
-description: "Use AnySentry's ShuanOS-compatible progressive API to deploy-check AnySentry, discover security-center operations, assess runtime actions, ingest evidence, and build evidence bundles."
+name: anysentry-api
+description: "Use AnySentry's progressive API to deploy-check AnySentry, discover security-center operations, assess runtime actions, ingest evidence, and build evidence bundles."
 parameters:
   - name: apiBase
     type: string
@@ -595,8 +610,8 @@ Rules:
 - Do not use ACP-only actions `poll`, `subscribe`, or `approve`; AnySentry's primary protocol is
   `list / search / describe / execute`.
 - Prefer `dryRun: true` before enforcing a guard decision on a planned tool command.
-- Use `params.autonomy` or `constraints.autonomy` with ShuanOS vocabulary: `suggest`, `guarded`,
-  or `auto`.
+- Use `params.autonomy` or `constraints.autonomy` with autonomy modes: `suggest`, `guarded`, or
+  `auto`.
 - Treat guard results as policy signals: `allow` may proceed, `warn` should be surfaced,
   `require_approval` needs human approval, and `block` must stop the action.
 - Use `recordSecurityEvents` for structured agent evidence and `buildEvidenceBundle` for handoff
@@ -610,10 +625,10 @@ Rules:
 
 | Agent host | How to attach the Skill |
 |---|---|
-| Codex / OpenAI coding agents | Copy `integrations/skills/anysentry-progressive-api` into `${CODEX_HOME:-$HOME/.codex}/skills/`, then call `Use $anysentry-progressive-api ...`. |
-| Shu'an OS / a3s-code | Publish the same directory as a Skill material or attach it as a built-in `skillDirs` entry. If the runtime exposes a `capabilities` tool, still follow `list -> search/describe -> execute`; otherwise use the HTTP examples in the Skill. |
+| Codex / OpenAI coding agents | Copy `integrations/skills/anysentry-api` into `${CODEX_HOME:-$HOME/.codex}/skills/`, then call `Use $anysentry-api ...`. |
+| a3s-code / platform runtimes | Attach the parent directory with `skillDirs: ["integrations/skills"]`, then invoke `Skill` with `skill_name: "anysentry-api"`. Use `pnpm verify:a3s-code-skill-api` for the real SDK/model check. |
 | Claude Code | Put the universal block or the canonical `SKILL.md` content in `CLAUDE.md` or project instructions. Use the shell/HTTP tools only when the session allows them. |
-| Cursor / Windsurf | Add the universal block to workspace rules (for example `.cursor/rules/anysentry-progressive-api.mdc`) or global AI rules, and set `ANYSENTRY_API_BASE` in the dev environment. |
+| Cursor / Windsurf | Add the universal block to workspace rules (for example `.cursor/rules/anysentry-api.mdc`) or global AI rules, and set `ANYSENTRY_API_BASE` in the dev environment. |
 | Devin / OpenHands / remote coding agents | Add the block to repository instructions or the task bootstrap prompt, export `ANYSENTRY_API_BASE`, and run the verifier commands after integration. |
 | Generic SDK agents | Store the block as a system instruction and implement four helper calls: `listCapabilities`, `searchCapabilities`, `describeOperation`, and `executeOperation`. Keep endpoint construction centralized so models never hand-write stale URLs. |
 
@@ -935,7 +950,7 @@ apps/api   NestJS — the sentry judge, ClickHouse store, aggregation, endpoints
 apps/web   Rsbuild + React — the security dashboard
 scripts/   a3s-observer → /ingest forwarders (Node + Python)
 deploy/    example Kubernetes manifests + runbook
-integrations/skills/  coding-agent skills, including anysentry-progressive-api
+integrations/skills/  coding-agent skills, including anysentry-api
 ```
 
 ## License

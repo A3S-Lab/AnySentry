@@ -55,18 +55,18 @@ function verifyStaticContract() {
   const actions = ['list', 'search', 'describe', 'execute'];
   assert('controller exposes GET /security-center/capabilities', /@Get\('capabilities'\)/u.test(controller), controller);
   assert('controller exposes POST /security-center/capabilities', /@Post\('capabilities'\)/u.test(controller), controller);
-  assert('controller supports the current ShuanOS source progressive action set', hasAll(controller, actions.map((action) => `'${action}'`)), controller);
+  assert('controller supports the source-compatible progressive action set', hasAll(controller, actions.map((action) => `'${action}'`)), controller);
   assert('controller does not expose ACP-only poll/subscribe/approve actions as the primary protocol', !/['"](poll|subscribe|approve)['"]/u.test(controller), controller);
-  assert('controller publishes ShuanOS-source-compatible protocol metadata', controller.includes("protocol: 'shuanos-progressive-api/source-compatible'"), controller);
+  assert('controller publishes source-compatible protocol metadata', controller.includes("protocol: 'shuanos-progressive-api/source-compatible'"), controller);
   assert('controller defines module/operation progressive entries', hasAll(controller, ['SECURITY_PROGRESSIVE_MODULE', 'assessRuntimeAction', 'recordSecurityEvents', 'buildEvidenceBundle']), controller);
-  assert('controller uses ShuanOS autonomy vocabulary', hasAll(controller, ["'suggest'", "'guarded'", "'auto'", "'require_approval'"]), controller);
+  assert('controller uses loop-autonomy vocabulary', hasAll(controller, ["'suggest'", "'guarded'", "'auto'", "'require_approval'"]), controller);
   assert('legacy ai-native endpoints are not exposed', !/ai-native|AiNative|aiNative|AI_NATIVE/u.test(controller), controller);
 
   assert('API types define SecurityCapabilityAction with all actions', hasAll(apiTypes, ['SecurityCapabilityAction', ...actions.map((action) => `'${action}'`)]), apiTypes);
-  assert('API types define ShuanOS-style ApiModule/ApiOperation shapes', hasAll(apiTypes, ['SecurityApiModule', 'SecurityApiOperation', 'module?: string', 'operation?: string']), apiTypes);
+  assert('API types define progressive ApiModule/ApiOperation shapes', hasAll(apiTypes, ['SecurityApiModule', 'SecurityApiOperation', 'module?: string', 'operation?: string']), apiTypes);
   assert('web client uses the progressive capabilities endpoint', webClient.includes('securityCapabilities') && webClient.includes('/security-center/capabilities'), webClient);
   assert('web client has no legacy AiNative type surface', !/AiNative|aiNative|AI_NATIVE|ai-native/u.test(webClient), webClient);
-  assert('README documents the ShuanOS-source-compatible progressive capability API', readme.includes('ShuanOS-source-compatible progressive capability API') && readme.includes('module + operation + params') && readme.includes('pnpm verify:progressive-api'), readme);
+  assert('README documents the source-compatible progressive capability API', readme.includes('Source-compatible progressive capability API') && readme.includes('module + operation + params') && readme.includes('pnpm verify:progressive-api'), readme);
   assert('deploy README documents one-command integrated install', deployReadme.includes('deploy/install.sh docker') && deployReadme.includes('ANYSENTRY_INSTALL_MODE=kubernetes'), deployReadme);
   assert('package scripts expose progressive API verifier aliases', packageJson.scripts?.['verify:progressive-api'] === 'pnpm verify:ai-native-api' && packageJson.scripts?.['verify:progressive-api:local'] === 'pnpm verify:ai-native-api:local', packageJson.scripts);
 }
@@ -78,7 +78,7 @@ async function verifyRuntimeContract() {
   }
 
   const list = await request('/capabilities?action=list');
-  assert('runtime list returns raw ShuanOS-style modules', Array.isArray(list) && list.some((module) => module.name === 'security-center'), list);
+  assert('runtime list returns raw progressive modules', Array.isArray(list) && list.some((module) => module.name === 'security-center'), list);
 
   const search = await request('/capabilities?action=search&query=runtime%20guard');
   assert('runtime search returns operation matches', Array.isArray(search) && search.some((operation) => operation.name === 'assessRuntimeAction'), search);
@@ -160,7 +160,7 @@ async function verifyRuntimeContract() {
 }
 
 async function main() {
-  console.log('AnySentry ShuanOS-style progressive API verification');
+  console.log('AnySentry progressive API verification');
   verifyStaticContract();
   await verifyRuntimeContract();
 
