@@ -287,8 +287,8 @@ ANYSENTRY_API_BASE=http://127.0.0.1:29653/security-center pnpm verify:notificati
 ```
 
 To performance-test AnySentry and its runtime dependency chain, including dashboard serving,
-progressive API dispatch, `@a3s-lab/sentry` judging, generic ingest, ClickHouse-backed write/read
-paths, dashboard aggregate queries, and Evidence Bundle assembly:
+progressive API dispatch, raw observer NDJSON ingest, `@a3s-lab/sentry` judging, generic ingest,
+ClickHouse-backed write/read paths, dashboard aggregate queries, and Evidence Bundle assembly:
 
 ```bash
 pnpm perf:anysentry

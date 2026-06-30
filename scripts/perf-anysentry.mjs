@@ -33,6 +33,7 @@ const thresholds = {
 };
 
 const capturedEventIds = [];
+let observerAgentIds = [];
 let sequence = 0;
 
 function positiveInt(value, fallback) {
@@ -149,6 +150,29 @@ function nextEvents(count, source) {
       workspacePath: `repo://anysentry/perf/${source}`,
       userId: 'perf-user',
     };
+  });
+}
+
+function observerLine(index) {
+  const eventKinds = ['ToolExec', 'Egress', 'Dns', 'FileAccess'];
+  const kind = eventKinds[index % eventKinds.length];
+  const agentId = observerAgentIds.length ? observerAgentIds[index % observerAgentIds.length] : `${runId}-observer-agent-${index % 16}`;
+  const base = { pid: 1000 + (index % 100), uid: 1000, cwd: '/workspace' };
+  const inner =
+    kind === 'ToolExec'
+      ? { ...base, argv: ['bash', '-lc', `printf anysentry-observer-perf-${index}`] }
+      : kind === 'Egress'
+        ? { ...base, peer: '203.0.113.20', port: 443 }
+        : kind === 'Dns'
+          ? { ...base, query: 'api.openai.com' }
+          : { ...base, path: `/workspace/observer-perf-${index}.txt` };
+  return JSON.stringify({
+    identity: {
+      agent: agentId,
+      session: runId,
+      task: `${index}`,
+    },
+    event: { [kind]: inner },
   });
 }
 
@@ -410,6 +434,30 @@ function scenarioDefinitions(dashboard) {
       },
     },
     {
+      name: 'ingest.observer.ndjson',
+      group: 'write',
+      dependencyCoverage: ['api', 'observer-ndjson-ingest', '@a3s-lab/sentry', 'clickhouse-write', 'source-registry'],
+      durationMs: writeDurationMs,
+      concurrency: writeConcurrency,
+      request: async (index) => {
+        const result = await requestJson('/ingest', {
+          method: 'POST',
+          body: {
+            line: observerLine(index),
+            sourceName: 'anysentry-perf-observer',
+            sourceType: 'observer',
+            collectorId: `${runId}-observer-collector`,
+            workspacePath: 'repo://anysentry/perf/observer',
+          },
+        });
+        if (result.json?.accepted !== true || !result.json?.eventId) {
+          throw new Error(`observer ingest failed: ${JSON.stringify(result.json)}`);
+        }
+        capturedEventIds.push(result.json.eventId);
+        return { ...result, events: 1 };
+      },
+    },
+    {
       name: 'ingest.events.batch',
       group: 'write',
       dependencyCoverage: ['api', 'generic-ingest', '@a3s-lab/sentry', 'clickhouse-write', 'source-registry'],
@@ -545,6 +593,36 @@ async function collectKubernetesSnapshot(label) {
   return snapshot;
 }
 
+async function discoverObserverAgentIds() {
+  const explicit = String(process.env.ANYSENTRY_PERF_OBSERVER_AGENT_ID ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (explicit.length) return explicit;
+
+  const namespaces = String(process.env.ANYSENTRY_PERF_OBSERVER_AGENT_NAMESPACE ?? process.env.ANYSENTRY_AGENT_NAMESPACES ?? 'default')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const ids = [];
+  for (const namespace of namespaces) {
+    try {
+      const { stdout } = await execFileAsync('kubectl', ['-n', namespace, 'get', 'pods', '-o', 'json'], {
+        timeout: 10000,
+        maxBuffer: 5 * 1024 * 1024,
+      });
+      const podList = JSON.parse(stdout);
+      for (const pod of podList.items ?? []) {
+        if (pod.status?.phase !== 'Running' || !pod.metadata?.uid) continue;
+        ids.push(String(pod.metadata.uid));
+      }
+    } catch {
+      // The observer scenario can still pass for non-Kubernetes/local deployments where enrichment is off.
+    }
+  }
+  return ids.slice(0, 64);
+}
+
 function thresholdSummary(results) {
   return results.flatMap((result) =>
     result.thresholds
@@ -612,6 +690,7 @@ async function main() {
   console.log(`Run ID: ${runId}`);
 
   const beforeKubernetes = await collectKubernetesSnapshot('before');
+  observerAgentIds = await discoverObserverAgentIds();
   const health = (await requestJson('/healthz')).json;
   if (health?.status !== 'ok') throw new Error(`healthz failed before load: ${JSON.stringify(health)}`);
   const stats = (await requestJson('/stats')).json;
@@ -653,6 +732,7 @@ async function main() {
       failOnThreshold,
       thresholds,
       scenarios: enabledScenarios ? Array.from(enabledScenarios) : 'all',
+      observerAgentIdsDiscovered: observerAgentIds.length,
     },
     host: {
       hostname: os.hostname(),

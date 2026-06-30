@@ -5,8 +5,8 @@ runtime dependency chain:
 
 - API health and static dashboard serving.
 - Progressive capability discovery and dispatch.
-- `@a3s-lab/sentry` event judging through generic ingest and progressive
-  `recordSecurityEvents`.
+- `@a3s-lab/sentry` event judging through raw observer NDJSON ingest,
+  generic ingest, and progressive `recordSecurityEvents`.
 - Event storage and readback through the hot aggregation ring and ClickHouse
   when ClickHouse is configured.
 - Dashboard aggregate query set.
@@ -61,6 +61,15 @@ pnpm perf:anysentry
 If the cluster does not have metrics-server, the report still includes pod
 phase/readiness/restart/image data and records the `kubectl top` error.
 
+When the deployment has Kubernetes pod-identity enrichment enabled, raw
+observer NDJSON must carry a real agent Pod UID or container ID. The runner
+auto-discovers Running Pod UIDs from `ANYSENTRY_PERF_OBSERVER_AGENT_NAMESPACE`
+when `kubectl` is available. You can also pass one explicitly:
+
+```bash
+ANYSENTRY_PERF_OBSERVER_AGENT_ID=<pod-uid-or-container-id> pnpm perf:anysentry
+```
+
 ## Controls
 
 Use environment variables to scale from smoke to stress:
@@ -76,6 +85,8 @@ Use environment variables to scale from smoke to stress:
 | `ANYSENTRY_PERF_REQUEST_TIMEOUT_MS` | `15000` | Per-request timeout. |
 | `ANYSENTRY_PERF_SCENARIOS` | all | Comma-separated scenario names to run. |
 | `ANYSENTRY_PERF_REPORT_DIR` | `perf-results` | Report output directory. |
+| `ANYSENTRY_PERF_OBSERVER_AGENT_ID` | unset | Comma-separated Pod UID/container IDs for raw observer NDJSON when pod enrichment is enabled. |
+| `ANYSENTRY_PERF_OBSERVER_AGENT_NAMESPACE` | `default` | Namespace(s) used for automatic observer agent Pod UID discovery. |
 | `ANYSENTRY_PERF_FAIL_ON_THRESHOLD` | unset | Set to `1` to fail on p95/error-rate threshold warnings. |
 | `ANYSENTRY_PERF_READ_P95_MS` | `1000` | Read p95 warning/fail threshold. |
 | `ANYSENTRY_PERF_WRITE_P95_MS` | `2000` | Write p95 warning/fail threshold. |
@@ -91,6 +102,7 @@ Scenario names:
 - `capabilities.discovery`
 - `progressive.guard.dryRun`
 - `progressive.recordSecurityEvents`
+- `ingest.observer.ndjson`
 - `ingest.events.batch`
 - `events.list`
 - `aggregate.dashboard`
