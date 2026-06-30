@@ -113,8 +113,9 @@ image assumptions plus the integrated installer:
 pnpm verify:deployment-manifests
 ```
 
-To regression-check the ShuanOS-style progressive capability API contract, including
-`list/search/describe/execute/poll/subscribe/approve` and the runtime guard manifest:
+To regression-check the ShuanOS-source-compatible progressive capability API contract, including
+`list/search/describe/execute`, module/operation dispatch, shaped responses, and the runtime guard
+operation:
 
 ```bash
 pnpm verify:progressive-api
@@ -381,26 +382,27 @@ short `/ingest/otel` endpoint, Source token rejection, and Source rollups, then 
 pnpm verify:ingest-protocols:local
 ```
 
-## ShuanOS-style progressive capability API
+## ShuanOS-source-compatible progressive capability API
 
-AnySentry exposes an ACP-compatible progressive API at `GET|POST /security-center/capabilities`.
-This is the AI Native capability surface for runtime security clients. The flow follows ShuanOS'
-"wide to narrow" contract: `list -> search / describe -> execute -> poll / subscribe / approve`.
-Callers discover capability summaries first, fetch the exact operation schema only when needed, then
-call a single `execute` action with `capabilityId + operation + params`.
+AnySentry exposes a ShuanOS-source-compatible progressive API at `GET|POST /security-center/capabilities`.
+This follows the current ShuanOS kernel source implementation in
+`apps/api/src/modules/kernel`: `list -> search / describe -> execute`. Callers discover modules
+first, search or describe the exact operation schema only when needed, then call a single `execute`
+action with `module + operation + params`. Like ShuanOS, `describe` can narrow all the way to one
+operation.
 
 ```bash
 curl 'http://localhost:29653/security-center/capabilities?action=list'
-curl 'http://localhost:29653/security-center/capabilities?action=describe&capabilityId=security.runtimeGuard'
+curl 'http://localhost:29653/security-center/capabilities?action=describe&module=security-center&operation=assessRuntimeAction'
 ```
 
-The built-in capabilities are:
+The built-in module is `security-center`, with these operations:
 
-- `security.runtimeGuard` (`L2`, `assessAction`) - evaluate one AI runtime action and return
+- `assessRuntimeAction` - evaluate one AI runtime action and return
   `allow`, `warn`, `require_approval`, or `block`.
-- `security.eventIngest` (`L3`, `recordEvents`) - normalize custom/webhook/OTel-shaped evidence into
+- `recordSecurityEvents` - normalize custom/webhook/OTel-shaped evidence into
   the same judged event stream as observer NDJSON.
-- `security.evidenceBundle` (`L1`, `buildBundle`) - assemble governance evidence around an event,
+- `buildEvidenceBundle` - assemble governance evidence around an event,
   run, trace, source, incident, objective, or scope.
 
 Runtime guard calls use ShuanOS loop-autonomy vocabulary in `params.autonomy` or
@@ -412,8 +414,8 @@ curl -X POST http://localhost:29653/security-center/capabilities \
   -H 'Content-Type: application/json' \
   -d '{
     "action": "execute",
-    "capabilityId": "security.runtimeGuard",
-    "operation": "assessAction",
+    "module": "security-center",
+    "operation": "assessRuntimeAction",
     "params": {
       "autonomy": "guarded",
       "stage": "tool",
@@ -426,9 +428,11 @@ curl -X POST http://localhost:29653/security-center/capabilities \
   }'
 ```
 
-The response includes `protocol: "acp/0.1-compatible"`, the supported actions, and the auth split:
-AnySentry source/admin tokens are implemented today; ACP `X-ACP-*` asymmetric request signatures,
-signed engagement approval tokens, and TEE attestation are reserved as planned compatibility work.
+By default this endpoint follows the ShuanOS raw dispatch contract: `list` returns modules, `search`
+returns operations, `describe` returns a module or operation, and `execute` returns the operation
+result. Add `shaped=true` to get a tool-friendly envelope with `success`, `modules` / `operations` /
+`operation` / `data`, plus compatibility metadata. Legacy `capabilityId` inputs such as
+`security.runtimeGuard` are still accepted as aliases, but they are not the primary protocol.
 
 ## What it shows
 

@@ -173,49 +173,64 @@ export interface UniversalIngestResult {
   items: UniversalIngestResultItem[];
 }
 
-export type SecurityCapabilityAction = 'list' | 'search' | 'describe' | 'execute' | 'poll' | 'subscribe' | 'approve';
-export type SecurityCapabilityTier = 'L0' | 'L1' | 'L2' | 'L3' | 'L4' | 'L5';
+export type SecurityCapabilityAction = 'list' | 'search' | 'describe' | 'execute';
 export type SecurityCapabilityAutonomy = 'suggest' | 'guarded' | 'auto';
 export type SecurityCapabilityStage = 'input' | 'plan' | 'tool' | 'retrieval' | 'memory' | 'llm' | 'output' | 'feedback' | 'runtime';
 export type SecurityCapabilityPolicyAction = 'allow' | 'warn' | 'require_approval' | 'block';
-export type SecurityCapabilityRunStatus = 'queued' | 'running' | 'needs_approval' | 'completed' | 'failed' | 'cancelled' | 'expired';
 
-export interface SecurityCapabilitySchemaRef {
-  $id: string;
-  integrity: string;
-}
-export interface SecurityCapabilityOperation {
-  operation: string;
-  summary: string;
-  inputSchemaRef: SecurityCapabilitySchemaRef;
-  outputSchemaRef: SecurityCapabilitySchemaRef;
-  async: boolean;
-}
-export interface SecurityCapabilitySummary {
-  capabilityId: string;
+export type SecurityApiOperationAction =
+  | 'list'
+  | 'get'
+  | 'create'
+  | 'update'
+  | 'delete'
+  | 'execute'
+  | 'download'
+  | 'stream'
+  | 'unknown';
+
+export interface SecurityApiParameter {
   name: string;
-  version: string;
-  tier: SecurityCapabilityTier;
-  category: string;
-  vendorId?: string;
+  in?: 'path' | 'query' | 'header' | 'body';
+  type: string;
+  required: boolean;
+  description: string;
+  enum?: unknown[];
+  default?: unknown;
+  example?: unknown;
 }
-export interface SecurityCapabilityManifest extends SecurityCapabilitySummary {
-  modes: string[];
-  requires: Record<string, boolean>;
-  dataPolicy: Record<string, string | boolean>;
-  executionLocale: 'local-anysentry' | 'customer-vpc' | 'on-prem' | 'vendor-sandbox' | 'tee-enclave';
-  operations: SecurityCapabilityOperation[];
+
+export interface SecurityApiOperation {
+  name: string;
+  description: string;
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+  path: string;
+  operationId?: string;
+  resource?: string;
+  action?: SecurityApiOperationAction;
+  tags?: string[];
+  permissions?: string[];
+  parameters?: SecurityApiParameter[];
+  inputSchema?: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
+  pagination?: Record<string, unknown>;
+  filterFields?: string[];
+  sortFields?: string[];
+  streaming?: Record<string, unknown>;
+  rawResponse?: Record<string, unknown>;
+  relatedOperations?: Array<Pick<SecurityApiOperation, 'name' | 'method' | 'path' | 'action'>>;
+  examples?: unknown[];
 }
-export interface SecurityCapabilityEngagement {
-  engagementId?: string;
-  customerId?: string;
-  tenantId?: string;
-  allowedTargets?: string[];
-  forbiddenTargets?: string[];
-  allowedModes?: string[];
-  expiresAt?: string;
-  approvalToken?: string;
+
+export interface SecurityApiModule {
+  name: string;
+  description: string;
+  path: string;
+  permissions?: string[];
+  submodules?: SecurityApiModule[];
+  operations?: SecurityApiOperation[];
 }
+
 export interface SecurityCapabilityConstraints {
   noNetworkActivity?: boolean;
   noDestructiveActions?: boolean;
@@ -245,24 +260,22 @@ export interface SecurityRuntimeGuardParams extends Partial<EventMeta> {
 export interface SecurityCapabilityRequest {
   action?: SecurityCapabilityAction | string;
   category?: string;
-  tier?: SecurityCapabilityTier | string;
   query?: string;
+  module?: string;
   capabilityId?: string;
   operation?: string;
   params?: Record<string, unknown>;
-  engagement?: SecurityCapabilityEngagement;
   constraints?: SecurityCapabilityConstraints;
   dryRun?: boolean;
-  runId?: string;
-  decision?: 'approve' | 'reject' | string;
-  approver?: string;
-  approvalToken?: string;
-  note?: string;
+  sessionId?: string;
+  shaped?: boolean | string;
 }
 export interface SecurityRuntimeGuardDecision {
-  schemaVersion: 'anysentry.acp.runtime_guard.result.v1';
-  capabilityId: 'security.runtimeGuard';
-  operation: 'assessAction';
+  schemaVersion: 'anysentry.progressive.runtime_guard.result.v1';
+  module: 'security-center';
+  operation: 'assessRuntimeAction';
+  /** Legacy alias for callers that still correlate old capabilityId-shaped decisions. */
+  capabilityId?: 'security.runtimeGuard';
   autonomy: SecurityCapabilityAutonomy;
   stage: SecurityCapabilityStage;
   policyAction: SecurityCapabilityPolicyAction;
@@ -284,27 +297,23 @@ export interface SecurityRuntimeGuardDecision {
   };
 }
 export interface SecurityCapabilityResponse {
-  schemaVersion: 'anysentry.acp.response.v1';
-  protocol: 'acp/0.1-compatible';
+  schemaVersion: 'anysentry.progressive.response.v1';
+  protocol: 'shuanos-progressive-api/source-compatible';
   action: SecurityCapabilityAction;
-  capabilities?: SecurityCapabilitySummary[];
-  capability?: SecurityCapabilityManifest;
-  operations?: SecurityCapabilityOperation[];
+  success?: boolean;
+  modules?: SecurityApiModule[];
+  module?: SecurityApiModule | null;
+  operation?: SecurityApiOperation;
+  operations?: SecurityApiOperation[];
   result?: unknown;
-  runId?: string;
-  status?: SecurityCapabilityRunStatus | 'not_required' | 'available';
-  eventStream?: {
-    endpoint: string;
-    note: string;
-  };
+  data?: unknown;
+  view?: { url: string; width: number; height: number };
   compatibility?: {
-    shuanOsProgressiveApi: string;
+    sourceImplementation: 'os/apps/api/src/modules/kernel';
+    dispatch: 'module + operation + params';
     supportedActions: SecurityCapabilityAction[];
-    riskTiers: SecurityCapabilityTier[];
-    auth: {
-      implemented: string[];
-      planned: string[];
-    };
+    shapedOptIn: boolean;
+    legacyCapabilityAliases: Record<string, { module: string; operation: string }>;
   };
 }
 

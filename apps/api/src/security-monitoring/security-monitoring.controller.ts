@@ -1163,72 +1163,141 @@ function universalMeta(input: T.UniversalIngestEvent, defaults: T.UniversalInges
   };
 }
 
-const SECURITY_CAPABILITY_ACTIONS: T.SecurityCapabilityAction[] = ['list', 'search', 'describe', 'execute', 'poll', 'subscribe', 'approve'];
-const SECURITY_CAPABILITY_TIERS: T.SecurityCapabilityTier[] = ['L0', 'L1', 'L2', 'L3', 'L4', 'L5'];
+const SECURITY_CAPABILITY_ACTIONS: T.SecurityCapabilityAction[] = ['list', 'search', 'describe', 'execute'];
 const SECURITY_CAPABILITY_STAGES: T.SecurityCapabilityStage[] = ['input', 'plan', 'tool', 'retrieval', 'memory', 'llm', 'output', 'feedback', 'runtime'];
 const SECURITY_CAPABILITY_AUTONOMY: T.SecurityCapabilityAutonomy[] = ['suggest', 'guarded', 'auto'];
 
-const SECURITY_CAPABILITIES: T.SecurityCapabilityManifest[] = [
+const SECURITY_PROGRESSIVE_MODULE = 'security-center';
+
+const SECURITY_PROGRESSIVE_ALIASES: Record<string, { module: string; operation: string }> = {
+  'security.runtimeGuard': { module: SECURITY_PROGRESSIVE_MODULE, operation: 'assessRuntimeAction' },
+  'security.eventIngest': { module: SECURITY_PROGRESSIVE_MODULE, operation: 'recordSecurityEvents' },
+  'security.evidenceBundle': { module: SECURITY_PROGRESSIVE_MODULE, operation: 'buildEvidenceBundle' },
+};
+
+const SECURITY_PROGRESSIVE_MODULES: T.SecurityApiModule[] = [
   {
-    capabilityId: 'security.runtimeGuard',
-    name: 'AnySentry AI Runtime Guard',
-    version: '0.1.0',
-    tier: 'L2',
-    category: 'runtime-guard',
-    vendorId: 'a3s.anysentry',
-    modes: ['advisory', 'guarded', 'auto-block'],
-    requires: { sourceToken: false, engagement: false, humanApprovalForActiveSteps: true },
-    dataPolicy: { retention: 'local-policy', rawKnowledgeExport: false, rawPromptExport: false, evidenceRedaction: true },
-    executionLocale: 'local-anysentry',
+    name: SECURITY_PROGRESSIVE_MODULE,
+    description: 'AnySentry security-center progressive API module, modeled after the current ShuanOS kernel capabilities source implementation.',
+    path: '/security-center',
     operations: [
       {
-        operation: 'assessAction',
-        summary: 'Assess one AI runtime action/tool/model/output event and return an allow/warn/require_approval/block decision.',
-        inputSchemaRef: { $id: 'acp://schema/anysentry.runtime-guard.input/1', integrity: 'sha256-anysentry-runtime-guard-input-v1' },
-        outputSchemaRef: { $id: 'acp://schema/anysentry.runtime-guard.result/1', integrity: 'sha256-anysentry-runtime-guard-result-v1' },
-        async: false,
+        name: 'assessRuntimeAction',
+        operationId: 'assessRuntimeAction',
+        description: 'Assess one AI runtime action/tool/model/output event and return an allow/warn/require_approval/block decision.',
+        method: 'POST',
+        path: '/security-center/capabilities',
+        resource: 'security-center.runtime-guard',
+        action: 'execute',
+        tags: ['security-center', 'runtime-guard', 'progressive-api'],
+        parameters: [
+          { name: 'autonomy', in: 'body', type: 'string', required: false, description: 'suggest | guarded | auto', enum: SECURITY_CAPABILITY_AUTONOMY },
+          { name: 'stage', in: 'body', type: 'string', required: false, description: 'input/plan/tool/retrieval/memory/llm/output/feedback/runtime' },
+          { name: 'workspacePath', in: 'body', type: 'string', required: false, description: 'Workspace, repository, or logical scope for the action.' },
+          { name: 'agentId', in: 'body', type: 'string', required: false, description: 'Agent identity.' },
+          { name: 'sessionId', in: 'body', type: 'string', required: false, description: 'Agent session id.' },
+          { name: 'toolName', in: 'body', type: 'string', required: false, description: 'Tool name for tool-stage events.' },
+          { name: 'command', in: 'body', type: 'object', required: false, description: 'Command string or argv list.' },
+        ],
+        inputSchema: {
+          body: {
+            type: 'object',
+            required: ['action', 'module', 'operation', 'params'],
+            properties: {
+              action: { const: 'execute' },
+              module: { const: SECURITY_PROGRESSIVE_MODULE },
+              operation: { const: 'assessRuntimeAction' },
+              params: { type: 'object' },
+              dryRun: { type: 'boolean' },
+            },
+          },
+          contentType: 'application/json',
+        },
+        outputSchema: {
+          status: 200,
+          envelope: 'standard',
+          contentTypes: ['application/json'],
+          data: { schemaVersion: 'anysentry.progressive.runtime_guard.result.v1' },
+        },
+        examples: [
+          {
+            description: 'Guard a shell tool call',
+            request: {
+              action: 'execute',
+              module: SECURITY_PROGRESSIVE_MODULE,
+              operation: 'assessRuntimeAction',
+              params: { autonomy: 'guarded', stage: 'tool', toolName: 'bash', command: ['bash', '-lc', 'id'] },
+            },
+          },
+        ],
       },
-    ],
-  },
-  {
-    capabilityId: 'security.eventIngest',
-    name: 'AnySentry Universal Security Event Ingest',
-    version: '0.1.0',
-    tier: 'L3',
-    category: 'passive-analysis',
-    vendorId: 'a3s.anysentry',
-    modes: ['passive-analysis', 'observability'],
-    requires: { sourceToken: false, engagement: false, humanApprovalForActiveSteps: false },
-    dataPolicy: { retention: 'local-policy', rawKnowledgeExport: false, rawPromptExport: false, evidenceRedaction: true },
-    executionLocale: 'local-anysentry',
-    operations: [
       {
-        operation: 'recordEvents',
-        summary: 'Normalize custom, webhook, or OpenTelemetry-shaped events into AnySentry security-center evidence.',
-        inputSchemaRef: { $id: 'acp://schema/anysentry.universal-ingest.input/1', integrity: 'sha256-anysentry-universal-ingest-input-v1' },
-        outputSchemaRef: { $id: 'acp://schema/anysentry.universal-ingest.result/1', integrity: 'sha256-anysentry-universal-ingest-result-v1' },
-        async: false,
+        name: 'recordSecurityEvents',
+        operationId: 'recordSecurityEvents',
+        description: 'Normalize custom, webhook, CloudEvents, or OpenTelemetry-shaped evidence into AnySentry security-center events.',
+        method: 'POST',
+        path: '/security-center/capabilities',
+        resource: 'security-center.ingest',
+        action: 'create',
+        tags: ['security-center', 'ingest', 'progressive-api'],
+        parameters: [
+          { name: 'events', in: 'body', type: 'object', required: true, description: 'Universal ingest request events array.' },
+          { name: 'sourceName', in: 'body', type: 'string', required: false, description: 'Logical producer/source name.' },
+          { name: 'sourceType', in: 'body', type: 'string', required: false, description: 'custom/webhook/sdk/otel/observer.' },
+        ],
+        inputSchema: {
+          body: {
+            type: 'object',
+            required: ['action', 'module', 'operation', 'params'],
+            properties: {
+              action: { const: 'execute' },
+              module: { const: SECURITY_PROGRESSIVE_MODULE },
+              operation: { const: 'recordSecurityEvents' },
+              params: { type: 'object' },
+            },
+          },
+          contentType: 'application/json',
+        },
+        outputSchema: {
+          status: 200,
+          envelope: 'standard',
+          contentTypes: ['application/json'],
+          data: { schemaVersion: 'anysentry.universal_ingest.result.v1' },
+        },
       },
-    ],
-  },
-  {
-    capabilityId: 'security.evidenceBundle',
-    name: 'AnySentry Evidence Bundle',
-    version: '0.1.0',
-    tier: 'L1',
-    category: 'governance',
-    vendorId: 'a3s.anysentry',
-    modes: ['governance', 'audit'],
-    requires: { sourceToken: false, engagement: false, humanApprovalForActiveSteps: false },
-    dataPolicy: { retention: 'local-policy', rawKnowledgeExport: false, rawPromptExport: false, evidenceRedaction: true },
-    executionLocale: 'local-anysentry',
-    operations: [
       {
-        operation: 'buildBundle',
-        summary: 'Build a governance evidence bundle around an event, run, trace, incident, objective, source, or scope.',
-        inputSchemaRef: { $id: 'acp://schema/anysentry.evidence-bundle.input/1', integrity: 'sha256-anysentry-evidence-bundle-input-v1' },
-        outputSchemaRef: { $id: 'acp://schema/anysentry.evidence-bundle.result/1', integrity: 'sha256-anysentry-evidence-bundle-result-v1' },
-        async: false,
+        name: 'buildEvidenceBundle',
+        operationId: 'buildEvidenceBundle',
+        description: 'Build a governance evidence bundle around an event, run, trace, incident, objective, source, or scope.',
+        method: 'POST',
+        path: '/security-center/capabilities',
+        resource: 'security-center.evidence',
+        action: 'get',
+        tags: ['security-center', 'evidence', 'progressive-api'],
+        parameters: [
+          { name: 'eventId', in: 'body', type: 'string', required: false, description: 'Event id to center the evidence bundle on.' },
+          { name: 'runId', in: 'body', type: 'string', required: false, description: 'Run id to center the evidence bundle on.' },
+          { name: 'scope', in: 'body', type: 'string', required: false, description: 'Bundle scope.' },
+        ],
+        inputSchema: {
+          body: {
+            type: 'object',
+            required: ['action', 'module', 'operation', 'params'],
+            properties: {
+              action: { const: 'execute' },
+              module: { const: SECURITY_PROGRESSIVE_MODULE },
+              operation: { const: 'buildEvidenceBundle' },
+              params: { type: 'object' },
+            },
+          },
+          contentType: 'application/json',
+        },
+        outputSchema: {
+          status: 200,
+          envelope: 'standard',
+          contentTypes: ['application/json'],
+          data: { schemaVersion: 'anysentry.evidence.bundle.v1' },
+        },
       },
     ],
   },
@@ -1241,9 +1310,8 @@ function securityCapabilityAction(value: unknown): T.SecurityCapabilityAction {
   throw new BadRequestException(`Unknown capability action: ${action}`);
 }
 
-function securityCapabilityTier(value: unknown): T.SecurityCapabilityTier | undefined {
-  const tier = cleanString(value, 10) as T.SecurityCapabilityTier | undefined;
-  return tier && SECURITY_CAPABILITY_TIERS.includes(tier) ? tier : undefined;
+function securityCapabilityShaped(value: unknown): boolean {
+  return value === true || value === 'true' || value === '1';
 }
 
 function securityCapabilityResponse(
@@ -1251,74 +1319,84 @@ function securityCapabilityResponse(
   data: Omit<T.SecurityCapabilityResponse, 'schemaVersion' | 'protocol' | 'action' | 'compatibility'>,
 ): T.SecurityCapabilityResponse {
   return {
-    schemaVersion: 'anysentry.acp.response.v1',
-    protocol: 'acp/0.1-compatible',
+    schemaVersion: 'anysentry.progressive.response.v1',
+    protocol: 'shuanos-progressive-api/source-compatible',
     action,
     ...data,
     compatibility: {
-      shuanOsProgressiveApi: 'list -> search/describe -> execute -> poll/subscribe/approve',
+      sourceImplementation: 'os/apps/api/src/modules/kernel',
+      dispatch: 'module + operation + params',
       supportedActions: SECURITY_CAPABILITY_ACTIONS,
-      riskTiers: SECURITY_CAPABILITY_TIERS,
-      auth: {
-        implemented: ['AnySentry source token headers', 'AnySentry management token headers'],
-        planned: ['ACP X-ACP-* asymmetric request signatures', 'ACP signed engagement approval tokens', 'TEE attestation'],
-      },
+      shapedOptIn: true,
+      legacyCapabilityAliases: SECURITY_PROGRESSIVE_ALIASES,
     },
   };
 }
 
-function securityCapabilitySummaries(input: Pick<T.SecurityCapabilityRequest, 'category' | 'tier'>): T.SecurityCapabilitySummary[] {
-  const tier = securityCapabilityTier(input.tier);
-  const category = cleanString(input.category, 120)?.toLowerCase();
-  return SECURITY_CAPABILITIES
-    .filter((capability) => !tier || capability.tier === tier)
-    .filter((capability) => !category || capability.category.toLowerCase() === category)
-    .map(({ capabilityId, name, version, tier, category, vendorId }) => ({ capabilityId, name, version, tier, category, vendorId }));
+function cloneSecurityModule(module: T.SecurityApiModule): T.SecurityApiModule {
+  return JSON.parse(JSON.stringify(module)) as T.SecurityApiModule;
 }
 
-function securityCapabilitySearch(query: unknown): T.SecurityCapabilitySummary[] {
+function securityModules(input: Pick<T.SecurityCapabilityRequest, 'category'> = {}): T.SecurityApiModule[] {
+  const category = cleanString(input.category, 120)?.toLowerCase();
+  return SECURITY_PROGRESSIVE_MODULES.map(cloneSecurityModule).map((module) => ({
+    ...module,
+    operations: module.operations?.filter((operation) => !category || operation.tags?.some((tag) => tag.toLowerCase() === category)),
+  })).filter((module) => (module.operations?.length ?? 0) > 0);
+}
+
+function securityCapabilitySearch(query: unknown): T.SecurityApiOperation[] {
   const terms = cleanString(query, 400)?.toLowerCase().split(/[^a-z0-9_.-]+/).filter(Boolean) ?? [];
   if (terms.length === 0) throw new BadRequestException('query parameter is required for search action');
-  return SECURITY_CAPABILITIES
-    .map((capability) => {
+  return securityModules()
+    .flatMap((module) => module.operations ?? [])
+    .map((operation) => {
       const text = [
-        capability.capabilityId,
-        capability.name,
-        capability.category,
-        capability.tier,
-        ...capability.modes,
-        ...capability.operations.flatMap((operation) => [operation.operation, operation.summary]),
+        operation.name,
+        operation.operationId,
+        operation.description,
+        operation.resource,
+        operation.action,
+        operation.path,
+        ...(operation.tags ?? []),
       ]
         .join(' ')
         .toLowerCase();
       const score = terms.reduce((sum, term) => sum + (text.includes(term) ? 1 : 0), 0);
-      return { capability, score };
+      return { operation, score };
     })
     .filter((entry) => entry.score > 0)
-    .sort((a, b) => b.score - a.score || a.capability.capabilityId.localeCompare(b.capability.capabilityId))
-    .map(({ capability }) => ({
-      capabilityId: capability.capabilityId,
-      name: capability.name,
-      version: capability.version,
-      tier: capability.tier,
-      category: capability.category,
-      vendorId: capability.vendorId,
-    }));
+    .sort((a, b) => b.score - a.score || a.operation.name.localeCompare(b.operation.name))
+    .map(({ operation }) => operation);
 }
 
-function findSecurityCapability(capabilityId: unknown): T.SecurityCapabilityManifest {
-  const id = cleanString(capabilityId, 180);
-  if (!id) throw new BadRequestException('capabilityId is required');
-  const capability = SECURITY_CAPABILITIES.find((candidate) => candidate.capabilityId === id);
-  if (!capability) throw new NotFoundException(`Security capability not found: ${id}`);
-  return capability;
+function normalizeSecurityCapabilityInput(input: T.SecurityCapabilityRequest): T.SecurityCapabilityRequest {
+  const capabilityId = cleanString(input.capabilityId, 180);
+  const alias = capabilityId ? SECURITY_PROGRESSIVE_ALIASES[capabilityId] : undefined;
+  const legacyOperation = cleanString(input.operation, 180);
+  return {
+    ...input,
+    module: cleanString(input.module, 180) ?? alias?.module,
+    operation:
+      alias && (!legacyOperation || legacyOperation === 'assessAction' || legacyOperation === 'recordEvents' || legacyOperation === 'buildBundle')
+        ? alias.operation
+        : legacyOperation,
+  };
 }
 
-function findSecurityCapabilityOperation(capability: T.SecurityCapabilityManifest, operationName: unknown): T.SecurityCapabilityOperation {
+function findSecurityModule(moduleName: unknown): T.SecurityApiModule {
+  const name = cleanString(moduleName, 180);
+  if (!name) throw new BadRequestException('module parameter is required');
+  const module = securityModules().find((candidate) => candidate.name === name);
+  if (!module) throw new NotFoundException(`Module '${name}' not found`);
+  return module;
+}
+
+function findSecurityOperation(module: T.SecurityApiModule, operationName: unknown): T.SecurityApiOperation {
   const operation = cleanString(operationName, 180);
   if (!operation) throw new BadRequestException('operation is required');
-  const found = capability.operations.find((candidate) => candidate.operation === operation);
-  if (!found) throw new NotFoundException(`Operation '${operation}' not found in capability '${capability.capabilityId}'`);
+  const found = module.operations?.find((candidate) => candidate.name === operation || candidate.operationId === operation);
+  if (!found) throw new NotFoundException(`Operation '${operation}' not found in module '${module.name}'`);
   return found;
 }
 
@@ -1372,11 +1450,11 @@ function securityCapabilityAttributes(
   stage: T.SecurityCapabilityStage,
 ): Record<string, T.EventAttributeValue> {
   const attrs: Record<string, T.EventAttributeValue> = {
-    'acp.protocol': 'acp/0.1-compatible',
-    'acp.capabilityId': 'security.runtimeGuard',
-    'acp.operation': 'assessAction',
-    'acp.autonomy': autonomy,
-    'acp.stage': stage,
+    'progressive.protocol': 'shuanos-progressive-api/source-compatible',
+    'progressive.module': SECURITY_PROGRESSIVE_MODULE,
+    'progressive.operation': 'assessRuntimeAction',
+    'progressive.autonomy': autonomy,
+    'progressive.stage': stage,
     ...sanitizeEventAttributes(body.attributes),
     ...sanitizeEventAttributes(body.labels),
   };
@@ -1384,10 +1462,10 @@ function securityCapabilityAttributes(
   const evidence = securityCapabilityJsonAttribute(body.evidence, 1_000);
   const model = cleanString(body.model, 180);
   const target = cleanString(body.target ?? body.resource, 700);
-  if (toolArgs) attrs['acp.toolArgs'] = toolArgs;
-  if (evidence) attrs['acp.evidence'] = evidence;
-  if (model) attrs['acp.model'] = model;
-  if (target) attrs['acp.target'] = target;
+  if (toolArgs) attrs['progressive.toolArgs'] = toolArgs;
+  if (evidence) attrs['progressive.evidence'] = evidence;
+  if (model) attrs['progressive.model'] = model;
+  if (target) attrs['progressive.target'] = target;
   return attrs;
 }
 
@@ -2989,110 +3067,81 @@ export class SecurityMonitoringController {
   }
 
   @Get('capabilities')
-  securityCapabilitiesGet(@Query() query: T.SecurityCapabilityRequest = {}, @Headers() headers: HeaderBag): T.SecurityCapabilityResponse {
+  securityCapabilitiesGet(@Query() query: T.SecurityCapabilityRequest = {}, @Headers() headers: HeaderBag): unknown {
     const action = securityCapabilityAction(query.action);
-    if (action === 'execute' || action === 'approve') {
+    if (action === 'execute') {
       throw new BadRequestException(`action=${action} requires POST /security-center/capabilities`);
     }
-    return this.dispatchSecurityCapability({ ...query, action }, headers);
+    return this.dispatchSecurityCapability(normalizeSecurityCapabilityInput({ ...query, action }), headers);
   }
 
   @Post('capabilities')
   @HttpCode(200)
-  securityCapabilitiesPost(@Body() body: T.SecurityCapabilityRequest = {}, @Headers() headers: HeaderBag): T.SecurityCapabilityResponse {
-    return this.dispatchSecurityCapability({ ...body, action: securityCapabilityAction(body.action) }, headers);
+  securityCapabilitiesPost(@Body() body: T.SecurityCapabilityRequest = {}, @Headers() headers: HeaderBag): unknown {
+    return this.dispatchSecurityCapability(normalizeSecurityCapabilityInput({ ...body, action: securityCapabilityAction(body.action) }), headers);
   }
 
-  private dispatchSecurityCapability(input: T.SecurityCapabilityRequest, headers: HeaderBag): T.SecurityCapabilityResponse {
+  private dispatchSecurityCapability(input: T.SecurityCapabilityRequest, headers: HeaderBag): unknown {
     const action = securityCapabilityAction(input.action);
+    const shaped = securityCapabilityShaped(input.shaped);
+    let result: unknown;
     if (action === 'list') {
-      return securityCapabilityResponse(action, { capabilities: securityCapabilitySummaries(input) });
+      result = securityModules(input);
+      return shaped ? securityCapabilityResponse(action, { success: true, modules: result as T.SecurityApiModule[] }) : result;
     }
     if (action === 'search') {
-      return securityCapabilityResponse(action, { capabilities: securityCapabilitySearch(input.query) });
+      result = securityCapabilitySearch(input.query);
+      return shaped ? securityCapabilityResponse(action, { success: true, operations: result as T.SecurityApiOperation[] }) : result;
     }
     if (action === 'describe') {
-      const capability = findSecurityCapability(input.capabilityId ?? input.query);
-      return securityCapabilityResponse(action, { capability, operations: capability.operations });
+      const module = findSecurityModule(input.module ?? input.query);
+      result = input.operation ? findSecurityOperation(module, input.operation) : module;
+      return shaped
+        ? securityCapabilityResponse(action, input.operation ? { success: true, operation: result as T.SecurityApiOperation } : { success: true, module: result as T.SecurityApiModule })
+        : result;
     }
-    if (action === 'execute') {
-      return this.executeSecurityCapability(input, headers);
-    }
-    if (action === 'poll') {
-      const runId = cleanString(input.runId, 240);
-      if (!runId) throw new BadRequestException('runId is required for poll action');
-      return securityCapabilityResponse(action, {
-        runId,
-        status: 'completed',
-        result: this.agg.agentTimeline({ runId, limit: 100 }),
-      });
-    }
-    if (action === 'approve') {
-      const runId = cleanString(input.runId, 240);
-      const decision = cleanString(input.decision, 20);
-      if (!runId) throw new BadRequestException('runId is required for approve action');
-      if (decision !== 'approve' && decision !== 'reject') throw new BadRequestException('decision must be approve or reject');
-      return securityCapabilityResponse(action, {
-        runId,
-        status: 'not_required',
-        result: {
-          runId,
-          decision,
-          approver: cleanString(input.approver, 240),
-          note: cleanString(input.note, 1_000),
-          message:
-            'AnySentry runtime guard returns require_approval as a caller-side HITL decision; no server-side capability run is waiting in this local subset.',
-        },
-      });
-    }
-    return securityCapabilityResponse(action, {
-      status: 'available',
-      eventStream: {
-        endpoint: '/security-center/sessions/agentObservability/stream',
-        note: 'AnySentry currently bridges ACP subscribe semantics to the existing security-center SSE feed; per-run ACP event replay is planned.',
-      },
-    });
+    result = this.executeSecurityCapability(input, headers);
+    return shaped
+      ? securityCapabilityResponse(action, {
+          success: true,
+          data: result,
+          result,
+          module: findSecurityModule(input.module),
+          operation: findSecurityOperation(findSecurityModule(input.module), input.operation),
+        })
+      : result;
   }
 
-  private executeSecurityCapability(input: T.SecurityCapabilityRequest, headers: HeaderBag): T.SecurityCapabilityResponse {
-    const capability = findSecurityCapability(input.capabilityId);
-    const operation = findSecurityCapabilityOperation(capability, input.operation);
+  private executeSecurityCapability(input: T.SecurityCapabilityRequest, headers: HeaderBag): unknown {
+    const module = findSecurityModule(input.module);
+    const operation = findSecurityOperation(module, input.operation);
     if (input.dryRun) {
-      return securityCapabilityResponse('execute', {
-        status: 'completed',
-        result: {
-          valid: true,
-          dryRun: true,
-          capabilityId: capability.capabilityId,
-          operation: operation.operation,
-          targetInScope: true,
-          tokenVerified: Boolean(input.engagement?.approvalToken || headerValue(headers, 'x-anysentry-ingest-token') || bearerToken(headers)),
-          decision: 'allow',
-          constraints: input.constraints ?? {},
-        },
-      });
+      return {
+        valid: true,
+        dryRun: true,
+        module: module.name,
+        operation: operation.name,
+        targetInScope: true,
+        tokenVerified: Boolean(headerValue(headers, 'x-anysentry-ingest-token') || bearerToken(headers)),
+        decision: 'allow',
+        constraints: input.constraints ?? {},
+      };
     }
-    if (capability.capabilityId === 'security.runtimeGuard' && operation.operation === 'assessAction') {
+    if (module.name === SECURITY_PROGRESSIVE_MODULE && operation.name === 'assessRuntimeAction') {
       return this.executeRuntimeGuardCapability(input, headers);
     }
-    if (capability.capabilityId === 'security.eventIngest' && operation.operation === 'recordEvents') {
+    if (module.name === SECURITY_PROGRESSIVE_MODULE && operation.name === 'recordSecurityEvents') {
       const params = obj(input.params);
-      if (!params) throw new BadRequestException('params object is required for security.eventIngest recordEvents');
-      return securityCapabilityResponse('execute', {
-        status: 'completed',
-        result: this.ingestUniversalEvents(params as T.UniversalIngestRequest, headers, 'custom', 'capabilities:security.eventIngest.recordEvents'),
-      });
+      if (!params) throw new BadRequestException('params object is required for security-center.recordSecurityEvents');
+      return this.ingestUniversalEvents(params as T.UniversalIngestRequest, headers, 'custom', 'capabilities:security-center.recordSecurityEvents');
     }
-    if (capability.capabilityId === 'security.evidenceBundle' && operation.operation === 'buildBundle') {
-      return securityCapabilityResponse('execute', {
-        status: 'completed',
-        result: this.evidenceBundle((obj(input.params) ?? {}) as T.EvidenceBundleQuery),
-      });
+    if (module.name === SECURITY_PROGRESSIVE_MODULE && operation.name === 'buildEvidenceBundle') {
+      return this.evidenceBundle((obj(input.params) ?? {}) as T.EvidenceBundleQuery);
     }
-    throw new NotFoundException(`No executor for ${capability.capabilityId}.${operation.operation}`);
+    throw new NotFoundException(`No executor for ${module.name}.${operation.name}`);
   }
 
-  private executeRuntimeGuardCapability(input: T.SecurityCapabilityRequest, headers: HeaderBag): T.SecurityCapabilityResponse {
+  private executeRuntimeGuardCapability(input: T.SecurityCapabilityRequest, headers: HeaderBag): T.SecurityRuntimeGuardDecision {
     const body = securityRuntimeGuardParams(input.params);
     const autonomy = securityCapabilityAutonomy(body.autonomy ?? input.constraints?.autonomy);
     const stage = securityCapabilityStage(body.stage);
@@ -3108,7 +3157,7 @@ export class SecurityMonitoringController {
         parentSpanId: body.parentSpanId,
         runId: body.runId,
         taskId: body.taskId,
-        sourceName: body.sourceName ?? 'acp-security-runtime-client',
+        sourceName: body.sourceName ?? 'progressive-security-runtime-client',
         sourceType: 'custom',
         sourceId: body.sourceId,
         token: body.token,
@@ -3117,14 +3166,15 @@ export class SecurityMonitoringController {
       },
       headers,
       'custom',
-      'capabilities:security.runtimeGuard.assessAction',
+      'capabilities:security-center.assessRuntimeAction',
     );
     const item = result.items[0];
     const policyAction = securityCapabilityPolicyAction(autonomy, item);
     const decision: T.SecurityRuntimeGuardDecision = {
-      schemaVersion: 'anysentry.acp.runtime_guard.result.v1',
+      schemaVersion: 'anysentry.progressive.runtime_guard.result.v1',
+      module: SECURITY_PROGRESSIVE_MODULE,
+      operation: 'assessRuntimeAction',
       capabilityId: 'security.runtimeGuard',
-      operation: 'assessAction',
       autonomy,
       stage,
       policyAction,
@@ -3145,11 +3195,7 @@ export class SecurityMonitoringController {
         bundleHint: item?.eventId ? { eventId: item.eventId } : undefined,
       },
     };
-    return securityCapabilityResponse('execute', {
-      status: policyAction === 'require_approval' ? 'needs_approval' : 'completed',
-      runId: item?.runId,
-      result: decision,
-    });
+    return decision;
   }
 
   /** Generic JSON event ingress for webhooks, OTel bridges, and custom producers. */
