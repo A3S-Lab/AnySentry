@@ -359,7 +359,10 @@ log lines. Summary validation binds `verifier.commit`, `verifier.schemaVersion`,
 `verifier.model`, timeout settings, near-timeout warning settings, Node.js
 runtime version, and the target `apiBase`/`runId`/`agentId`/`sessionId` to the
 running verifier process, so automation can reject stale, cross-run, or
-cross-config summaries. The warning budget fields also bind to the running
+cross-config summaries. Stored event, warning, and failure audit attributes use
+`progressive.verifier.closeTimeoutMs` for the same session-close timeout value,
+so the audit key stays separate from platform session identity fields. The
+warning budget fields also bind to the running
 verifier config: `warning.required` must match
 `A3S_CODE_REQUIRE_NEAR_TIMEOUT_WARNING`, and `warning.thresholdMs` must match the
 computed timeout threshold. Triggered warnings must also bind to the timing

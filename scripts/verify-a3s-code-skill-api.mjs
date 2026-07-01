@@ -48,7 +48,7 @@ const verifierAttributes = {
   'progressive.verifier.schema': 'anysentry.a3s_code_skill_verifier.v1',
   'progressive.verifier.commit': verifierCommit,
   'progressive.verifier.skillTimeoutMs': skillTimeoutMs,
-  'progressive.verifier.sessionCloseTimeoutMs': sessionCloseTimeoutMs,
+  'progressive.verifier.closeTimeoutMs': sessionCloseTimeoutMs,
   'progressive.verifier.nearTimeoutRatio': nearTimeoutThresholdRatio,
   'progressive.verifier.nearTimeoutThresholdMs': nearTimeoutThresholdMs,
   'progressive.verifier.requireNearTimeoutWarning': requireNearTimeoutWarning,
@@ -3147,6 +3147,12 @@ function runVerifierSelfTest() {
     'verifier self-test keeps all stored event preflight attributes in the inner verifier source',
     missingSourceEventPreflightAttributes.length === 0,
     missingSourceEventPreflightAttributes,
+  );
+  assert(
+    'verifier self-test uses a storage-safe close-timeout audit attribute key',
+    verifierAttributes['progressive.verifier.closeTimeoutMs'] === sessionCloseTimeoutMs &&
+      verifierAttributes['progressive.verifier.sessionCloseTimeoutMs'] === undefined,
+    verifierAttributes,
   );
   const skillCommand = buildSkillCommand();
   const expectedIdentityJson = JSON.stringify({ runId, agentId, sessionId, workspacePath });
