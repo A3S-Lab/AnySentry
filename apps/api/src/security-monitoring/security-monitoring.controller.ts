@@ -1173,6 +1173,394 @@ const SECURITY_PROGRESSIVE_ALIASES: Record<string, { module: string; operation: 
   'security.runtimeGuard': { module: SECURITY_PROGRESSIVE_MODULE, operation: 'assessRuntimeAction' },
   'security.eventIngest': { module: SECURITY_PROGRESSIVE_MODULE, operation: 'recordSecurityEvents' },
   'security.evidenceBundle': { module: SECURITY_PROGRESSIVE_MODULE, operation: 'buildEvidenceBundle' },
+  'security.nextActions': { module: SECURITY_PROGRESSIVE_MODULE, operation: 'planNextActions' },
+};
+
+const SECURITY_TIME_TYPES = ['last_3h', 'last_1d', 'last_7d', 'last_30d', 'custom'];
+const SECURITY_SEVERITIES: T.Severity[] = ['info', 'low', 'medium', 'high', 'critical'];
+const SECURITY_EVENT_CATEGORIES: T.EventCategory[] = ['tool', 'network', 'file', 'llm', 'security', 'process', 'runtime', 'unknown'];
+const SECURITY_VERDICTS: T.Verdict[] = ['allow', 'block', 'escalate'];
+const SECURITY_INGESTION_SOURCE_TYPES: T.IngestionSourceType[] = ['observer', 'forwarder', 'webhook', 'otel', 'custom'];
+const SECURITY_REMEDIATION_STATUSES: Array<T.RemediationStatus | 'all'> = ['open', 'in_progress', 'blocked', 'done', 'dismissed', 'all'];
+const SECURITY_REMEDIATION_SOURCE_TYPES: Array<T.RemediationSourceType | 'all'> = ['incident', 'alert', 'coverage', 'all'];
+const SECURITY_REMEDIATION_ACTION_KINDS: Array<T.RemediationActionKind | 'all'> = [
+  'investigate',
+  'collector',
+  'source',
+  'policy',
+  'credential',
+  'network',
+  'file',
+  'ownership',
+  'all',
+];
+
+const EVENT_ATTRIBUTE_VALUE_SCHEMA = { oneOf: [{ type: 'string' }, { type: 'number' }, { type: 'boolean' }] };
+const STRING_OR_STRING_ARRAY_SCHEMA = { oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }] };
+const TIMESTAMP_SCHEMA = { oneOf: [{ type: 'string', format: 'date-time' }, { type: 'number', description: 'Epoch milliseconds.' }] };
+
+const SECURITY_TIME_FILTER_SCHEMA_PROPERTIES = {
+  timeType: { type: 'string', enum: SECURITY_TIME_TYPES, default: 'last_3h' },
+  startTime: { type: 'string', format: 'date-time', description: 'Required when timeType=custom.' },
+  endTime: { type: 'string', format: 'date-time', description: 'Required when timeType=custom.' },
+};
+
+function progressiveExecuteInputSchema(operation: string, paramsSchema: Record<string, unknown>): Record<string, unknown> {
+  return {
+    body: {
+      type: 'object',
+      required: ['action', 'module', 'operation', 'params'],
+      additionalProperties: false,
+      properties: {
+        action: { const: 'execute' },
+        module: { const: SECURITY_PROGRESSIVE_MODULE },
+        operation: { const: operation },
+        params: paramsSchema,
+        dryRun: { type: 'boolean', description: 'Validate dispatch, scope, and token context without executing side effects.' },
+        shaped: { type: 'boolean', description: 'Wrap the raw result in the source-compatible progressive response envelope.' },
+        sessionId: { type: 'string', description: 'Optional caller session id used for client-side correlation.' },
+        constraints: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            noNetworkActivity: { type: 'boolean' },
+            noDestructiveActions: { type: 'boolean' },
+            maxRiskLevel: { type: 'string', enum: SECURITY_SEVERITIES },
+            autonomy: { type: 'string', enum: SECURITY_CAPABILITY_AUTONOMY },
+          },
+        },
+      },
+    },
+    contentType: 'application/json',
+  };
+}
+
+const SECURITY_RUNTIME_GUARD_PARAMS_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: true,
+  properties: {
+    autonomy: { type: 'string', enum: SECURITY_CAPABILITY_AUTONOMY, default: 'guarded', description: 'suggest warns only, guarded gates risky actions, auto blocks high-risk actions.' },
+    stage: { type: 'string', enum: SECURITY_CAPABILITY_STAGES, default: 'runtime', description: 'Lifecycle stage of the AI action being assessed.' },
+    workspacePath: { type: 'string' },
+    agentId: { type: 'string' },
+    sessionId: { type: 'string' },
+    userId: { type: 'string' },
+    traceId: { type: 'string' },
+    spanId: { type: 'string' },
+    parentSpanId: { type: 'string' },
+    runId: { type: 'string' },
+    taskId: { type: 'string' },
+    collectorId: { type: 'string' },
+    sourceId: { type: 'string' },
+    sourceName: { type: 'string' },
+    token: { type: 'string', description: 'Ingest/source token, when not supplied through headers.' },
+    action: { type: 'string', description: 'Human-readable action summary.' },
+    toolName: { type: 'string' },
+    toolArgs: { oneOf: [{ type: 'object', additionalProperties: true }, { type: 'string' }] },
+    command: STRING_OR_STRING_ARRAY_SCHEMA,
+    target: { type: 'string' },
+    resource: { type: 'string' },
+    input: { type: 'string' },
+    prompt: { type: 'string' },
+    output: { type: 'string' },
+    model: { type: 'string' },
+    subject: { type: 'string' },
+    labels: { type: 'object', additionalProperties: EVENT_ATTRIBUTE_VALUE_SCHEMA },
+    evidence: { type: 'object', additionalProperties: true },
+    tokenCount: { type: 'number' },
+    latencyMs: { type: 'number' },
+  },
+};
+
+const SECURITY_RECORD_EVENT_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: true,
+  properties: {
+    at: TIMESTAMP_SCHEMA,
+    timestamp: TIMESTAMP_SCHEMA,
+    workspacePath: { type: 'string' },
+    agentId: { type: 'string' },
+    sessionId: { type: 'string' },
+    userId: { type: 'string' },
+    traceId: { type: 'string' },
+    spanId: { type: 'string' },
+    parentSpanId: { type: 'string' },
+    runId: { type: 'string' },
+    taskId: { type: 'string' },
+    eventKind: { type: 'string' },
+    kind: { type: 'string' },
+    eventCategory: { type: 'string', enum: SECURITY_EVENT_CATEGORIES },
+    category: { type: 'string', enum: SECURITY_EVENT_CATEGORIES },
+    subject: { type: 'string' },
+    command: STRING_OR_STRING_ARRAY_SCHEMA,
+    argv: STRING_OR_STRING_ARRAY_SCHEMA,
+    peer: { type: 'string' },
+    port: { oneOf: [{ type: 'string' }, { type: 'number' }] },
+    path: { type: 'string' },
+    sni: { type: 'string' },
+    endpoint: { type: 'string' },
+    content: { type: 'string' },
+    data: { type: 'string' },
+    verdict: { type: 'string', enum: SECURITY_VERDICTS },
+    severity: { type: 'string', enum: SECURITY_SEVERITIES },
+    attributes: { type: 'object', additionalProperties: EVENT_ATTRIBUTE_VALUE_SCHEMA },
+    raw: {},
+  },
+};
+
+const SECURITY_RECORD_EVENTS_PARAMS_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: true,
+  anyOf: [{ required: ['events'] }, { required: ['event'] }, { required: ['type', 'data'] }],
+  properties: {
+    workspacePath: { type: 'string' },
+    agentId: { type: 'string' },
+    sessionId: { type: 'string' },
+    userId: { type: 'string' },
+    traceId: { type: 'string' },
+    spanId: { type: 'string' },
+    parentSpanId: { type: 'string' },
+    runId: { type: 'string' },
+    taskId: { type: 'string' },
+    collectorId: { type: 'string' },
+    sourceId: { type: 'string' },
+    sourceName: { type: 'string' },
+    sourceType: { type: 'string', enum: SECURITY_INGESTION_SOURCE_TYPES, default: 'custom' },
+    token: { type: 'string' },
+    event: SECURITY_RECORD_EVENT_SCHEMA,
+    events: { type: 'array', minItems: 1, items: SECURITY_RECORD_EVENT_SCHEMA },
+    specversion: { type: 'string' },
+    specVersion: { type: 'string' },
+    id: { type: 'string' },
+    type: { type: 'string', description: 'CloudEvents type.' },
+    datacontenttype: { type: 'string' },
+    dataschema: { type: 'string' },
+    time: { type: 'string', format: 'date-time' },
+    data_base64: { type: 'string' },
+    data: { oneOf: [{ type: 'object', additionalProperties: true }, { type: 'string' }] },
+  },
+};
+
+const SECURITY_EVIDENCE_BUNDLE_PARAMS_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    ...SECURITY_TIME_FILTER_SCHEMA_PROPERTIES,
+    auditId: { type: 'string' },
+    edgeId: { type: 'string' },
+    eventId: { type: 'string' },
+    incidentId: { type: 'string' },
+    alertId: { type: 'string' },
+    taskId: { type: 'string' },
+    objectiveId: { type: 'string' },
+    issueId: { type: 'string' },
+    deliveryId: { type: 'string' },
+    windowId: { type: 'string' },
+    workspacePath: { type: 'string' },
+    agentId: { type: 'string' },
+    collectorId: { type: 'string' },
+    sourceId: { type: 'string' },
+    traceId: { type: 'string' },
+    runId: { type: 'string' },
+    sessionId: { type: 'string' },
+    limit: { type: 'integer', minimum: 1, maximum: 500, default: 40 },
+  },
+};
+
+const SECURITY_NEXT_ACTION_PLAN_PARAMS_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    ...SECURITY_TIME_FILTER_SCHEMA_PROPERTIES,
+    taskId: { type: 'string' },
+    incidentId: { type: 'string' },
+    alertId: { type: 'string' },
+    eventId: { type: 'string' },
+    objectiveId: { type: 'string' },
+    issueId: { type: 'string' },
+    status: { type: 'string', enum: SECURITY_REMEDIATION_STATUSES, default: 'all' },
+    severity: { type: 'string', enum: [...SECURITY_SEVERITIES, 'all'] },
+    sourceType: { type: 'string', enum: SECURITY_REMEDIATION_SOURCE_TYPES },
+    actionKind: { type: 'string', enum: SECURITY_REMEDIATION_ACTION_KINDS },
+    q: { type: 'string' },
+    workspacePath: { type: 'string' },
+    agentId: { type: 'string' },
+    collectorId: { type: 'string' },
+    sourceId: { type: 'string' },
+    owner: { type: 'string' },
+    limit: { type: 'integer', minimum: 1, maximum: 100 },
+    maxActions: { type: 'integer', minimum: 1, maximum: 20, default: 5 },
+    includeCompletedSteps: { type: 'boolean', default: false },
+  },
+};
+
+const SECURITY_RUNTIME_GUARD_OUTPUT_SCHEMA = {
+  schemaVersion: 'anysentry.progressive.runtime_guard.result.v1',
+  type: 'object',
+  required: ['schemaVersion', 'module', 'operation', 'autonomy', 'stage', 'policyAction', 'recommendedAction', 'accepted'],
+  properties: {
+    schemaVersion: { const: 'anysentry.progressive.runtime_guard.result.v1' },
+    module: { const: SECURITY_PROGRESSIVE_MODULE },
+    operation: { const: 'assessRuntimeAction' },
+    capabilityId: { const: 'security.runtimeGuard' },
+    autonomy: { type: 'string', enum: SECURITY_CAPABILITY_AUTONOMY },
+    stage: { type: 'string', enum: SECURITY_CAPABILITY_STAGES },
+    policyAction: { type: 'string', enum: ['allow', 'warn', 'require_approval', 'block'] },
+    recommendedAction: { type: 'string', enum: ['continue', 'review', 'stop'] },
+    accepted: { type: 'boolean' },
+    sourceId: { type: 'string' },
+    eventId: { type: 'string' },
+    traceId: { type: 'string' },
+    runId: { type: 'string' },
+    verdict: { type: 'string', enum: SECURITY_VERDICTS },
+    tier: { type: 'string', enum: ['Rules', 'Llm', 'Agent'] },
+    severity: { type: 'string', enum: SECURITY_SEVERITIES },
+    riskCategory: { type: 'string' },
+    reason: { type: 'string' },
+    evidence: {
+      type: 'object',
+      properties: {
+        eventId: { type: 'string' },
+        eventsHref: { type: 'string' },
+        bundleHint: SECURITY_EVIDENCE_BUNDLE_PARAMS_SCHEMA,
+      },
+    },
+  },
+};
+
+const SECURITY_UNIVERSAL_INGEST_OUTPUT_SCHEMA = {
+  type: 'object',
+  required: ['accepted', 'acceptedEvents', 'rejectedEvents', 'items'],
+  properties: {
+    accepted: { type: 'boolean' },
+    sourceId: { type: 'string' },
+    acceptedEvents: { type: 'number' },
+    rejectedEvents: { type: 'number' },
+    items: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['index', 'accepted'],
+        properties: {
+          index: { type: 'number' },
+          accepted: { type: 'boolean' },
+          reason: { type: 'string' },
+          eventId: { type: 'string' },
+          traceId: { type: 'string' },
+          spanId: { type: 'string' },
+          runId: { type: 'string' },
+          verdict: { type: 'string', enum: SECURITY_VERDICTS },
+          tier: { type: 'string', enum: ['Rules', 'Llm', 'Agent'] },
+          severity: { type: 'string', enum: SECURITY_SEVERITIES },
+          riskCategory: { type: 'string' },
+        },
+      },
+    },
+  },
+};
+
+const SECURITY_EVIDENCE_BUNDLE_OUTPUT_SCHEMA = {
+  schemaVersion: 'anysentry.evidence_bundle.v1',
+  type: 'object',
+  required: ['schemaVersion', 'bundleId', 'generatedAt', 'scope', 'summary', 'events', 'remediations'],
+  properties: {
+    schemaVersion: { const: 'anysentry.evidence_bundle.v1' },
+    bundleId: { type: 'string' },
+    generatedAt: { type: 'string', format: 'date-time' },
+    scope: { type: 'object' },
+    summary: {
+      type: 'object',
+      required: ['eventCount', 'incidentCount', 'alertCount', 'remediationCount'],
+      properties: {
+        eventCount: { type: 'number' },
+        incidentCount: { type: 'number' },
+        alertCount: { type: 'number' },
+        remediationCount: { type: 'number' },
+        maxSeverity: { type: 'string', enum: SECURITY_SEVERITIES },
+        riskCategories: { type: 'array', items: { type: 'object' } },
+      },
+    },
+    primary: { type: 'object' },
+    timeline: { type: 'object' },
+    events: { type: 'array', items: { type: 'object' } },
+    incidents: { type: 'array', items: { type: 'object' } },
+    alerts: { type: 'array', items: { type: 'object' } },
+    remediations: { type: 'array', items: { type: 'object' } },
+    objectives: { type: 'array', items: { type: 'object' } },
+    notificationDeliveries: { type: 'array', items: { type: 'object' } },
+    maintenanceWindows: { type: 'array', items: { type: 'object' } },
+    coverageIssues: { type: 'array', items: { type: 'object' } },
+    topology: { type: 'object' },
+    agents: { type: 'array', items: { type: 'object' } },
+    workspaces: { type: 'array', items: { type: 'object' } },
+    sources: { type: 'array', items: { type: 'object' } },
+    collectors: { type: 'array', items: { type: 'object' } },
+    audits: { type: 'array', items: { type: 'object' } },
+  },
+};
+
+const SECURITY_NEXT_ACTION_PLAN_OUTPUT_SCHEMA = {
+  schemaVersion: 'anysentry.progressive.next_action_plan.v1',
+  type: 'object',
+  required: ['schemaVersion', 'module', 'operation', 'generatedAt', 'scope', 'summary', 'actions'],
+  properties: {
+    schemaVersion: { const: 'anysentry.progressive.next_action_plan.v1' },
+    module: { const: SECURITY_PROGRESSIVE_MODULE },
+    operation: { const: 'planNextActions' },
+    generatedAt: { type: 'string', format: 'date-time' },
+    scope: { type: 'object' },
+    summary: {
+      type: 'object',
+      required: ['totalCandidates', 'returnedActions', 'criticalActions', 'overdueActions', 'approvalRequiredActions'],
+      properties: {
+        totalCandidates: { type: 'number' },
+        returnedActions: { type: 'number' },
+        criticalActions: { type: 'number' },
+        overdueActions: { type: 'number' },
+        approvalRequiredActions: { type: 'number' },
+      },
+    },
+    actions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['actionId', 'taskId', 'rank', 'priority', 'status', 'severity', 'title', 'recommendedAction', 'evidence', 'nextSteps'],
+        properties: {
+          actionId: { type: 'string' },
+          taskId: { type: 'string' },
+          rank: { type: 'number' },
+          priority: { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
+          status: { type: 'string', enum: SECURITY_REMEDIATION_STATUSES.filter((status) => status !== 'all') },
+          severity: { type: 'string', enum: SECURITY_SEVERITIES },
+          title: { type: 'string' },
+          recommendedAction: { type: 'string' },
+          actionKind: { type: 'string', enum: SECURITY_REMEDIATION_ACTION_KINDS.filter((kind) => kind !== 'all') },
+          sourceType: { type: 'string', enum: SECURITY_REMEDIATION_SOURCE_TYPES.filter((type) => type !== 'all') },
+          sourceId: { type: 'string' },
+          owner: { type: 'string' },
+          dueAt: { type: 'string', format: 'date-time' },
+          overdue: { type: 'boolean' },
+          needsApproval: { type: 'boolean' },
+          evidence: {
+            type: 'object',
+            required: ['primaryType', 'primaryId', 'taskId', 'bundleHint'],
+            properties: {
+              primaryType: { type: 'string' },
+              primaryId: { type: 'string' },
+              eventId: { type: 'string' },
+              incidentId: { type: 'string' },
+              alertId: { type: 'string' },
+              taskId: { type: 'string' },
+              objectiveId: { type: 'string' },
+              issueId: { type: 'string' },
+              bundleHint: SECURITY_EVIDENCE_BUNDLE_PARAMS_SCHEMA,
+            },
+          },
+          nextSteps: { type: 'array', items: { type: 'object' } },
+        },
+      },
+    },
+  },
 };
 
 const SECURITY_PROGRESSIVE_MODULES: T.SecurityApiModule[] = [
@@ -1199,25 +1587,12 @@ const SECURITY_PROGRESSIVE_MODULES: T.SecurityApiModule[] = [
           { name: 'toolName', in: 'body', type: 'string', required: false, description: 'Tool name for tool-stage events.' },
           { name: 'command', in: 'body', type: 'object', required: false, description: 'Command string or argv list.' },
         ],
-        inputSchema: {
-          body: {
-            type: 'object',
-            required: ['action', 'module', 'operation', 'params'],
-            properties: {
-              action: { const: 'execute' },
-              module: { const: SECURITY_PROGRESSIVE_MODULE },
-              operation: { const: 'assessRuntimeAction' },
-              params: { type: 'object' },
-              dryRun: { type: 'boolean' },
-            },
-          },
-          contentType: 'application/json',
-        },
+        inputSchema: progressiveExecuteInputSchema('assessRuntimeAction', SECURITY_RUNTIME_GUARD_PARAMS_SCHEMA),
         outputSchema: {
           status: 200,
           envelope: 'standard',
           contentTypes: ['application/json'],
-          data: { schemaVersion: 'anysentry.progressive.runtime_guard.result.v1' },
+          data: SECURITY_RUNTIME_GUARD_OUTPUT_SCHEMA,
         },
         examples: [
           {
@@ -1245,25 +1620,41 @@ const SECURITY_PROGRESSIVE_MODULES: T.SecurityApiModule[] = [
           { name: 'sourceName', in: 'body', type: 'string', required: false, description: 'Logical producer/source name.' },
           { name: 'sourceType', in: 'body', type: 'string', required: false, description: 'custom/webhook/sdk/otel/observer.' },
         ],
-        inputSchema: {
-          body: {
-            type: 'object',
-            required: ['action', 'module', 'operation', 'params'],
-            properties: {
-              action: { const: 'execute' },
-              module: { const: SECURITY_PROGRESSIVE_MODULE },
-              operation: { const: 'recordSecurityEvents' },
-              params: { type: 'object' },
-            },
-          },
-          contentType: 'application/json',
-        },
+        inputSchema: progressiveExecuteInputSchema('recordSecurityEvents', SECURITY_RECORD_EVENTS_PARAMS_SCHEMA),
         outputSchema: {
           status: 200,
           envelope: 'standard',
           contentTypes: ['application/json'],
-          data: { schemaVersion: 'anysentry.universal_ingest.result.v1' },
+          data: SECURITY_UNIVERSAL_INGEST_OUTPUT_SCHEMA,
         },
+        examples: [
+          {
+            description: 'Record one custom tool execution event',
+            request: {
+              action: 'execute',
+              module: SECURITY_PROGRESSIVE_MODULE,
+              operation: 'recordSecurityEvents',
+              params: {
+                sourceName: 'capability-workbench',
+                sourceType: 'custom',
+                workspacePath: 'repo://payments',
+                agentId: 'capability-agent',
+                sessionId: 'session-1',
+                events: [
+                  {
+                    at: '2026-07-01T00:00:00.000Z',
+                    eventKind: 'ToolExec',
+                    eventCategory: 'tool',
+                    subject: 'capability workbench sample event',
+                    command: ['bash', '-lc', 'id'],
+                    verdict: 'allow',
+                    severity: 'low',
+                  },
+                ],
+              },
+            },
+          },
+        ],
       },
       {
         name: 'buildEvidenceBundle',
@@ -1279,25 +1670,58 @@ const SECURITY_PROGRESSIVE_MODULES: T.SecurityApiModule[] = [
           { name: 'runId', in: 'body', type: 'string', required: false, description: 'Run id to center the evidence bundle on.' },
           { name: 'scope', in: 'body', type: 'string', required: false, description: 'Bundle scope.' },
         ],
-        inputSchema: {
-          body: {
-            type: 'object',
-            required: ['action', 'module', 'operation', 'params'],
-            properties: {
-              action: { const: 'execute' },
-              module: { const: SECURITY_PROGRESSIVE_MODULE },
-              operation: { const: 'buildEvidenceBundle' },
-              params: { type: 'object' },
-            },
-          },
-          contentType: 'application/json',
-        },
+        inputSchema: progressiveExecuteInputSchema('buildEvidenceBundle', SECURITY_EVIDENCE_BUNDLE_PARAMS_SCHEMA),
         outputSchema: {
           status: 200,
           envelope: 'standard',
           contentTypes: ['application/json'],
-          data: { schemaVersion: 'anysentry.evidence.bundle.v1' },
+          data: SECURITY_EVIDENCE_BUNDLE_OUTPUT_SCHEMA,
         },
+        examples: [
+          {
+            description: 'Build a workspace evidence bundle',
+            request: {
+              action: 'execute',
+              module: SECURITY_PROGRESSIVE_MODULE,
+              operation: 'buildEvidenceBundle',
+              params: { timeType: 'last_3h', workspacePath: 'repo://payments', limit: 20 },
+            },
+          },
+        ],
+      },
+      {
+        name: 'planNextActions',
+        operationId: 'planNextActions',
+        description: 'Return a ranked, evidence-linked action plan that an AI operator can execute or hand off.',
+        method: 'POST',
+        path: '/security-center/capabilities',
+        resource: 'security-center.remediation',
+        action: 'execute',
+        tags: ['security-center', 'remediation', 'agent-plan', 'progressive-api'],
+        parameters: [
+          { name: 'timeType', in: 'body', type: 'string', required: false, description: 'last_3h/last_1d/last_7d/last_30d/custom.' },
+          { name: 'workspacePath', in: 'body', type: 'string', required: false, description: 'Limit the plan to one workspace.' },
+          { name: 'agentId', in: 'body', type: 'string', required: false, description: 'Limit the plan to one agent.' },
+          { name: 'maxActions', in: 'body', type: 'number', required: false, description: 'Maximum actions to return; default 5, max 20.' },
+        ],
+        inputSchema: progressiveExecuteInputSchema('planNextActions', SECURITY_NEXT_ACTION_PLAN_PARAMS_SCHEMA),
+        outputSchema: {
+          status: 200,
+          envelope: 'standard',
+          contentTypes: ['application/json'],
+          data: SECURITY_NEXT_ACTION_PLAN_OUTPUT_SCHEMA,
+        },
+        examples: [
+          {
+            description: 'Ask AnySentry for the next three actions in one workspace',
+            request: {
+              action: 'execute',
+              module: SECURITY_PROGRESSIVE_MODULE,
+              operation: 'planNextActions',
+              params: { timeType: 'last_1d', workspacePath: 'prod/payments', maxActions: 3 },
+            },
+          },
+        ],
       },
     ],
   },
@@ -1331,6 +1755,88 @@ function securityCapabilityResponse(
       legacyCapabilityAliases: SECURITY_PROGRESSIVE_ALIASES,
     },
   };
+}
+
+function schemaIssue(path: string, message: string): T.SecurityCapabilitySchemaIssue {
+  return { path, message, severity: 'error' };
+}
+
+function schemaPath(parent: string, key: string | number): string {
+  return typeof key === 'number' ? `${parent}[${key}]` : `${parent}.${key}`;
+}
+
+function schemaTypeName(value: unknown): string {
+  if (Array.isArray(value)) return 'array';
+  if (value === null) return 'null';
+  if (Number.isInteger(value)) return 'integer';
+  return typeof value;
+}
+
+function schemaTypeMatches(expected: unknown, value: unknown): boolean {
+  const expectedTypes = Array.isArray(expected) ? expected : [expected];
+  const actual = schemaTypeName(value);
+  return expectedTypes.some((type) => type === actual || (type === 'number' && actual === 'integer'));
+}
+
+function sameSchemaValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function validateSecurityCapabilitySchema(schema: unknown, value: unknown, path = '$'): T.SecurityCapabilitySchemaIssue[] {
+  const item = obj(schema);
+  if (!item) return [];
+  const oneOf = Array.isArray(item.oneOf) ? item.oneOf : undefined;
+  if (oneOf) {
+    const matches = oneOf.filter((child) => validateSecurityCapabilitySchema(child, value, path).length === 0).length;
+    return matches === 1 ? [] : [schemaIssue(path, 'must match exactly one schema')];
+  }
+  const anyOf = Array.isArray(item.anyOf) ? item.anyOf : undefined;
+  if (anyOf) {
+    const matches = anyOf.filter((child) => validateSecurityCapabilitySchema(child, value, path).length === 0).length;
+    if (matches === 0) return [schemaIssue(path, 'must match at least one schema')];
+  }
+
+  const issues: T.SecurityCapabilitySchemaIssue[] = [];
+  if ('const' in item && !sameSchemaValue(value, item.const)) issues.push(schemaIssue(path, `must equal ${JSON.stringify(item.const)}`));
+  if (Array.isArray(item.enum) && !item.enum.some((entry) => sameSchemaValue(entry, value))) issues.push(schemaIssue(path, `must be one of ${item.enum.join(', ')}`));
+  if (item.type && !schemaTypeMatches(item.type, value)) {
+    issues.push(schemaIssue(path, `must be ${Array.isArray(item.type) ? item.type.join(' or ') : item.type}`));
+    return issues;
+  }
+
+  if (Array.isArray(value)) {
+    if (typeof item.minItems === 'number' && value.length < item.minItems) issues.push(schemaIssue(path, `must contain at least ${item.minItems} items`));
+    if (typeof item.maxItems === 'number' && value.length > item.maxItems) issues.push(schemaIssue(path, `must contain at most ${item.maxItems} items`));
+    value.forEach((child, index) => issues.push(...validateSecurityCapabilitySchema(item.items, child, schemaPath(path, index))));
+  }
+
+  const valueObject = obj(value);
+  if (valueObject) {
+    const properties = obj(item.properties) ?? {};
+    const required = Array.isArray(item.required) ? item.required.filter((key): key is string => typeof key === 'string') : [];
+    for (const key of required) {
+      if (!(key in valueObject)) issues.push(schemaIssue(schemaPath(path, key), 'is required'));
+    }
+    for (const [key, child] of Object.entries(valueObject)) {
+      if (key in properties) {
+        issues.push(...validateSecurityCapabilitySchema(properties[key], child, schemaPath(path, key)));
+      } else if (item.additionalProperties === false) {
+        issues.push(schemaIssue(schemaPath(path, key), 'is not allowed'));
+      } else if (obj(item.additionalProperties)) {
+        issues.push(...validateSecurityCapabilitySchema(item.additionalProperties, child, schemaPath(path, key)));
+      }
+    }
+  }
+
+  if (typeof value === 'number') {
+    if (typeof item.minimum === 'number' && value < item.minimum) issues.push(schemaIssue(path, `must be at least ${item.minimum}`));
+    if (typeof item.maximum === 'number' && value > item.maximum) issues.push(schemaIssue(path, `must be at most ${item.maximum}`));
+  }
+  if (typeof value === 'string') {
+    if (typeof item.minLength === 'number' && value.length < item.minLength) issues.push(schemaIssue(path, `must be at least ${item.minLength} characters`));
+    if (typeof item.maxLength === 'number' && value.length > item.maxLength) issues.push(schemaIssue(path, `must be at most ${item.maxLength} characters`));
+  }
+  return issues;
 }
 
 function cloneSecurityModule(module: T.SecurityApiModule): T.SecurityApiModule {
@@ -1549,6 +2055,121 @@ function securityRuntimeGuardParams(value: unknown): T.SecurityRuntimeGuardParam
   const params = obj(value);
   if (!params) throw new BadRequestException('params object is required for security.runtimeGuard assessAction');
   return params as T.SecurityRuntimeGuardParams;
+}
+
+function securityNextActionPlanParams(value: unknown): T.SecurityNextActionPlanParams {
+  return (obj(value) ?? {}) as T.SecurityNextActionPlanParams;
+}
+
+const NEXT_ACTION_SEVERITY_RANK: Record<T.Severity, number> = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
+const NEXT_ACTION_STATUS_RANK: Record<T.RemediationStatus, number> = {
+  open: 4,
+  blocked: 3,
+  in_progress: 2,
+  done: 1,
+  dismissed: 0,
+};
+
+function actionPriority(severity: T.Severity): T.SecurityNextActionPlanItem['priority'] {
+  if (severity === 'critical') return 'critical';
+  if (severity === 'high') return 'high';
+  if (severity === 'medium') return 'medium';
+  return 'low';
+}
+
+function parseIsoish(value: string | undefined): number | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/u.test(trimmed)
+    ? `${trimmed.replace(' ', 'T')}Z`
+    : trimmed;
+  const parsed = Date.parse(normalized);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function nextActionPrimaryType(task: T.RemediationListItem): T.EvidenceBundlePrimaryType {
+  if (task.incidentId) return 'incident';
+  if (task.alertId) return 'alert';
+  if (task.sourceType === 'coverage') return 'coverage';
+  return 'remediation';
+}
+
+function nextActionPrimaryId(task: T.RemediationListItem, primaryType: T.EvidenceBundlePrimaryType): string {
+  if (primaryType === 'incident') return task.incidentId ?? task.taskId;
+  if (primaryType === 'alert') return task.alertId ?? task.taskId;
+  if (primaryType === 'coverage') return task.labels?.issueId ?? task.sourceId;
+  return task.taskId;
+}
+
+function nextActionBundleHint(task: T.RemediationListItem): T.EvidenceBundleQuery {
+  if (task.eventId) return { eventId: task.eventId };
+  if (task.incidentId) return { incidentId: task.incidentId };
+  if (task.alertId) return { alertId: task.alertId };
+  if (task.labels?.objectiveId) return { objectiveId: task.labels.objectiveId };
+  if (task.sourceType === 'coverage') return { issueId: task.labels?.issueId ?? task.sourceId };
+  return { taskId: task.taskId };
+}
+
+function nextActionNeedsApproval(task: T.RemediationListItem, overdue: boolean): boolean {
+  return (
+    task.severity === 'critical' ||
+    task.actionKind === 'credential' ||
+    task.actionKind === 'policy' ||
+    task.actionKind === 'network' ||
+    (task.status === 'blocked' && (task.severity === 'high' || overdue))
+  );
+}
+
+function nextActionPlanItem(
+  task: T.RemediationListItem,
+  rank: number,
+  includeCompletedSteps: boolean,
+  now = Date.now(),
+): T.SecurityNextActionPlanItem {
+  const dueAt = parseIsoish(task.dueAt);
+  const overdue = Boolean(dueAt && dueAt < now && task.status !== 'done' && task.status !== 'dismissed');
+  const primaryType = nextActionPrimaryType(task);
+  const primaryId = nextActionPrimaryId(task, primaryType);
+  const objectiveId = task.labels?.objectiveId;
+  const issueId = task.sourceType === 'coverage' ? task.labels?.issueId ?? task.sourceId : task.labels?.issueId;
+  const nextSteps = includeCompletedSteps ? task.steps : task.steps.filter((step) => !step.done);
+  return {
+    actionId: `act_${rank}_${task.taskId}`,
+    taskId: task.taskId,
+    rank,
+    priority: actionPriority(task.severity),
+    status: task.status,
+    severity: task.severity,
+    title: task.title,
+    recommendedAction: task.recommendedAction,
+    actionKind: task.actionKind,
+    sourceType: task.sourceType,
+    sourceId: task.sourceId,
+    owner: task.owner,
+    dueAt: task.dueAt,
+    overdue,
+    needsApproval: nextActionNeedsApproval(task, overdue),
+    agentId: task.agentId,
+    workspacePath: task.workspacePath,
+    collectorId: task.collectorId,
+    sourceIdentity: task.ingestionSourceId,
+    eventId: task.eventId,
+    traceId: task.traceId,
+    objectiveId,
+    issueId,
+    evidence: {
+      primaryType,
+      primaryId,
+      eventId: task.eventId,
+      incidentId: task.incidentId,
+      alertId: task.alertId,
+      taskId: task.taskId,
+      objectiveId,
+      issueId,
+      bundleHint: nextActionBundleHint(task),
+    },
+    nextSteps,
+  };
 }
 
 function otlpAnyValue(value: unknown, key?: string): T.EventAttributeValue | undefined {
@@ -3116,16 +3737,32 @@ export class SecurityMonitoringController {
     const module = findSecurityModule(input.module);
     const operation = findSecurityOperation(module, input.operation);
     if (input.dryRun) {
+      const schemaIssues = validateSecurityCapabilitySchema(obj(operation.inputSchema)?.body, input);
+      const schemaValid = schemaIssues.every((issue) => issue.severity !== 'error');
+      const normalizedRequest: T.SecurityCapabilityDryRunResult['normalizedRequest'] = {
+        action: 'execute',
+        module: module.name,
+        operation: operation.name,
+        dryRun: true,
+        params: obj(input.params) ?? {},
+        ...(input.constraints ? { constraints: input.constraints } : {}),
+        ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+        ...(input.shaped !== undefined ? { shaped: input.shaped } : {}),
+      };
       return {
-        valid: true,
+        schemaVersion: 'anysentry.progressive.dry_run.v1',
+        valid: schemaValid,
         dryRun: true,
         module: module.name,
         operation: operation.name,
-        targetInScope: true,
+        targetInScope: schemaValid,
         tokenVerified: Boolean(headerValue(headers, 'x-anysentry-ingest-token') || bearerToken(headers)),
-        decision: 'allow',
+        decision: schemaValid ? 'allow' : 'reject',
         constraints: input.constraints ?? {},
-      };
+        schemaValid,
+        schemaIssues,
+        normalizedRequest,
+      } satisfies T.SecurityCapabilityDryRunResult;
     }
     if (module.name === SECURITY_PROGRESSIVE_MODULE && operation.name === 'assessRuntimeAction') {
       return this.executeRuntimeGuardCapability(input, headers);
@@ -3138,7 +3775,61 @@ export class SecurityMonitoringController {
     if (module.name === SECURITY_PROGRESSIVE_MODULE && operation.name === 'buildEvidenceBundle') {
       return this.evidenceBundle((obj(input.params) ?? {}) as T.EvidenceBundleQuery);
     }
+    if (module.name === SECURITY_PROGRESSIVE_MODULE && operation.name === 'planNextActions') {
+      return this.executeNextActionsCapability(input);
+    }
     throw new NotFoundException(`No executor for ${module.name}.${operation.name}`);
+  }
+
+  private executeNextActionsCapability(input: T.SecurityCapabilityRequest): T.SecurityNextActionPlan {
+    const params = securityNextActionPlanParams(input.params);
+    const maxActions = Math.max(1, Math.min(20, Math.round(finiteNumber(params.maxActions) ?? finiteNumber(params.limit) ?? 5)));
+    const owner = cleanString(params.owner, 120);
+    const list = this.remediation.list({
+      ...params,
+      status: params.status ?? 'all',
+      limit: Math.max(maxActions * 4, 40),
+    });
+    const statusPinned = Boolean(params.status && params.status !== 'all');
+    const candidates = list.items
+      .filter((task) => statusPinned || (task.status !== 'done' && task.status !== 'dismissed'))
+      .filter((task) => !owner || task.owner === owner)
+      .sort((a, b) => {
+        const aDue = parseIsoish(a.dueAt) ?? Number.POSITIVE_INFINITY;
+        const bDue = parseIsoish(b.dueAt) ?? Number.POSITIVE_INFINITY;
+        return (
+          NEXT_ACTION_SEVERITY_RANK[b.severity] - NEXT_ACTION_SEVERITY_RANK[a.severity] ||
+          NEXT_ACTION_STATUS_RANK[b.status] - NEXT_ACTION_STATUS_RANK[a.status] ||
+          aDue - bDue ||
+          a.title.localeCompare(b.title)
+        );
+      });
+    const actions = candidates
+      .slice(0, maxActions)
+      .map((task, index) => nextActionPlanItem(task, index + 1, params.includeCompletedSteps === true));
+    return {
+      schemaVersion: 'anysentry.progressive.next_action_plan.v1',
+      module: SECURITY_PROGRESSIVE_MODULE,
+      operation: 'planNextActions',
+      generatedAt: new Date().toISOString(),
+      scope: {
+        timeType: params.timeType,
+        workspacePath: cleanString(params.workspacePath, 500),
+        agentId: cleanString(params.agentId, 240),
+        collectorId: cleanString(params.collectorId, 180),
+        sourceId: cleanString(params.sourceId, 180),
+        owner,
+        q: cleanString(params.q, 200),
+      },
+      summary: {
+        totalCandidates: candidates.length,
+        returnedActions: actions.length,
+        criticalActions: actions.filter((action) => action.priority === 'critical').length,
+        overdueActions: actions.filter((action) => action.overdue).length,
+        approvalRequiredActions: actions.filter((action) => action.needsApproval).length,
+      },
+      actions,
+    };
   }
 
   private executeRuntimeGuardCapability(input: T.SecurityCapabilityRequest, headers: HeaderBag): T.SecurityRuntimeGuardDecision {

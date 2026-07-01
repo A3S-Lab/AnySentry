@@ -16,6 +16,10 @@ const managementRoutes = [
   '/agents?agentId=dashboard-smoke-agent&workspacePath=repo://dashboard-smoke',
   '/agents?userId=dashboard-smoke-user',
   '/workspaces?workspacePath=repo://dashboard-smoke',
+  '/capabilities',
+  '/capabilities?query=runtime%20guard',
+  '/capabilities?action=search&query=runtime%20guard',
+  '/capabilities?action=describe&module=security-center&operation=planNextActions',
   '/collectors?collectorId=dashboard-smoke-collector',
   '/sources?sourceId=dashboard-smoke-source',
   '/sources?sourceId=dashboard-smoke-source&collectorId=dashboard-smoke-collector&workspacePath=repo://dashboard-smoke',
@@ -59,6 +63,9 @@ const managementRoutes = [
   '/remediation?timeType=last_3h&taskId=dashboard-smoke-remediation&workspacePath=repo://dashboard-smoke&agentId=dashboard-smoke-agent',
   '/remediation?timeType=last_3h&sourceType=coverage&issueId=dashboard-smoke-coverage&sourceId=dashboard-smoke-source',
   '/remediation?timeType=last_3h&objectiveId=dashboard-smoke-objective&sourceId=dashboard-smoke-source',
+  '/operator',
+  '/operator?timeType=last_3h&actionId=dashboard-smoke-action&taskId=dashboard-smoke-remediation&workspacePath=repo://dashboard-smoke&agentId=dashboard-smoke-agent',
+  '/operator?timeType=last_3h&sourceType=coverage&issueId=dashboard-smoke-coverage&sourceId=dashboard-smoke-source&owner=dashboard-smoke-owner',
   '/notifications?sourceId=dashboard-smoke-source&kind=coverage&minSeverity=medium',
   '/notifications?channelId=dashboard-smoke-channel&routeId=dashboard-smoke-route&deliveryId=dashboard-smoke-delivery&alertId=dashboard-smoke-alert&incidentId=dashboard-smoke-incident&eventId=dashboard-smoke-event&taskId=dashboard-smoke-task&objectiveId=dashboard-smoke-objective&issueId=dashboard-smoke-coverage',
   '/objectives?objectiveId=dashboard-smoke-objective',
@@ -183,6 +190,32 @@ async function verifyIndexAndAssets() {
     { jsAssetCount: jsText.length },
   );
   assert(
+    'dashboard bundle exposes AI Operator progressive next-action workbench',
+    jsBundle.includes('/operator') &&
+      jsBundle.includes('AI Operator') &&
+      jsBundle.includes('planNextActions') &&
+      jsBundle.includes('buildEvidenceBundle') &&
+      jsBundle.includes('anysentry.progressive.next_action_plan.v1') &&
+      jsBundle.includes('anysentry.evidence_bundle.v1') &&
+      jsBundle.includes('/security-center/capabilities') &&
+      jsBundle.includes('Next Actions') &&
+      jsBundle.includes('预览证据') &&
+      jsBundle.includes('/remediation?') &&
+      jsBundle.includes('/evidence?'),
+    { jsAssetCount: jsText.length },
+  );
+  assert(
+    'dashboard bundle exposes Progressive API discovery workbench',
+    jsBundle.includes('/capabilities') &&
+      jsBundle.includes('Progressive API') &&
+      jsBundle.includes('Discovery') &&
+      jsBundle.includes('Input Schema') &&
+      jsBundle.includes('securityCapabilities') &&
+      jsBundle.includes('executeSecurityCapability') &&
+      jsBundle.includes('Execute Request'),
+    { jsAssetCount: jsText.length },
+  );
+  assert(
     'dashboard bundle exposes notification delivery Evidence repin action',
     jsBundle.includes('/evidence?') &&
       jsBundle.includes('deliveryId') &&
@@ -219,12 +252,15 @@ async function verifyDashboardSourceContracts() {
   const alertsPage = await readFile('apps/web/src/pages/AlertsPage.tsx', 'utf8');
   const apiClient = await readFile('apps/web/src/lib/api/security-center.ts', 'utf8');
   const auditPage = await readFile('apps/web/src/pages/AuditPage.tsx', 'utf8');
+  const capabilitiesPage = await readFile('apps/web/src/pages/CapabilitiesPage.tsx', 'utf8');
+  const capabilityCurl = await readFile('apps/web/src/lib/api/security-capability-curl.ts', 'utf8');
   const coveragePage = await readFile('apps/web/src/pages/CoveragePage.tsx', 'utf8');
   const evidencePage = await readFile('apps/web/src/pages/EvidenceBundlePage.tsx', 'utf8');
   const maintenancePage = await readFile('apps/web/src/pages/MaintenancePage.tsx', 'utf8');
   const notificationsPage = await readFile('apps/web/src/pages/NotificationsPage.tsx', 'utf8');
   const objectivesPage = await readFile('apps/web/src/pages/ObjectivesPage.tsx', 'utf8');
   const objectiveService = await readFile('apps/api/src/security-monitoring/objective.service.ts', 'utf8');
+  const operatorPage = await readFile('apps/web/src/pages/OperatorPage.tsx', 'utf8');
   const policyPage = await readFile('apps/web/src/pages/PolicyConfigPage.tsx', 'utf8');
   const remediationPage = await readFile('apps/web/src/pages/RemediationPage.tsx', 'utf8');
   const securityController = await readFile('apps/api/src/security-monitoring/security-monitoring.controller.ts', 'utf8');
@@ -348,6 +384,133 @@ async function verifyDashboardSourceContracts() {
     {
       hasBackendRoute: securityController.includes("@Get('agents/metadata')"),
       hasMetadataUpdateUi: agentsPage.includes('securityCenterApi.updateAgentMetadata'),
+    },
+  );
+  assert(
+    'dashboard AI Operator uses progressive planning, progressive evidence, and shared handoffs',
+    operatorPage.includes('securityCenterApi.nextActionPlan(params)') &&
+      operatorPage.includes('securityCenterApi.evidenceBundleCapability(evidenceBundleParams(action.evidence.bundleHint, action, timeType))') &&
+      operatorPage.includes('securityCenterApi.updateRemediation(action.taskId, { status: nextStatus })') &&
+      operatorPage.includes('schemaVersion === "anysentry.progressive.next_action_plan.v1"') &&
+      operatorPage.includes('schemaVersion === "anysentry.evidence_bundle.v1"') &&
+      operatorPage.includes('evidenceQuery(action.evidence.bundleHint, action, timeType)') &&
+      operatorPage.includes('remediationQuery(action, timeType)') &&
+      operatorPage.includes('generatedSecurityCapabilityCurl(planRequest)') &&
+      operatorPage.includes('Canonical planNextActions curl') &&
+      operatorPage.includes('const copyPlanCurl = async () =>') &&
+      operatorPage.includes('navigator.clipboard?.writeText(planCurl)') &&
+      operatorPage.includes('function operatorRouteParams({') &&
+      operatorPage.includes('const routeText = searchParams.toString()') &&
+      operatorPage.includes('setSearchParams(next, { replace: true })') &&
+      operatorPage.includes('setSearchParams(operatorRouteParams({') &&
+      operatorPage.includes('<Link to="/remediation">') &&
+      apiClient.includes('nextActionPlan: (params: SecurityNextActionPlanParams') &&
+      apiClient.includes('operation: "planNextActions"') &&
+      apiClient.includes('evidenceBundleCapability: (params: EvidenceBundleQuery') &&
+      apiClient.includes('operation: "buildEvidenceBundle"') &&
+      securityController.includes("operation.name === 'planNextActions'") &&
+      securityController.includes("operation.name === 'buildEvidenceBundle'") &&
+      securityMonitorPage.includes('<Link to="/operator">'),
+    {
+      hasProgressiveApiCall: operatorPage.includes('securityCenterApi.nextActionPlan(params)'),
+      hasProgressiveEvidenceCall: operatorPage.includes('securityCenterApi.evidenceBundleCapability(evidenceBundleParams(action.evidence.bundleHint, action, timeType))'),
+      hasRemediationMutation: operatorPage.includes('securityCenterApi.updateRemediation(action.taskId, { status: nextStatus })'),
+      hasPlanSchemaGuard: operatorPage.includes('schemaVersion === "anysentry.progressive.next_action_plan.v1"'),
+      hasEvidenceSchemaGuard: operatorPage.includes('schemaVersion === "anysentry.evidence_bundle.v1"'),
+      hasEvidenceHandoff: operatorPage.includes('evidenceQuery(action.evidence.bundleHint, action, timeType)'),
+      hasRemediationHandoff: operatorPage.includes('remediationQuery(action, timeType)'),
+      hasCanonicalPlanCurl:
+        operatorPage.includes('generatedSecurityCapabilityCurl(planRequest)') &&
+        operatorPage.includes('Canonical planNextActions curl') &&
+        operatorPage.includes('const copyPlanCurl = async () =>') &&
+        operatorPage.includes('navigator.clipboard?.writeText(planCurl)'),
+      hasUrlBackedOperatorState:
+        operatorPage.includes('function operatorRouteParams({') &&
+        operatorPage.includes('const routeText = searchParams.toString()') &&
+        operatorPage.includes('setSearchParams(next, { replace: true })') &&
+        operatorPage.includes('setSearchParams(operatorRouteParams({'),
+      hasDashboardEntry: securityMonitorPage.includes('<Link to="/operator">'),
+    },
+  );
+  assert(
+    'dashboard Progressive API workbench follows discover-first source-compatible flow',
+    capabilitiesPage.includes('securityCenterApi.securityCapabilities({ action: "list" })') &&
+      capabilitiesPage.includes('securityCenterApi.securityCapabilities({ action: "search", query: nextQuery })') &&
+      capabilitiesPage.includes('securityCenterApi.securityCapabilities({ action: "describe", module: moduleName, operation: operationName })') &&
+      capabilitiesPage.includes('securityCenterApi.executeSecurityCapability(parsed)') &&
+      capabilitiesPage.includes('const dryRun = async () =>') &&
+      capabilitiesPage.includes('securityCenterApi.executeSecurityCapability({ ...parsed, dryRun: true })') &&
+      capabilitiesPage.includes('onClick={dryRun}') &&
+      capabilitiesPage.includes('function asDryRunResult(value: unknown)') &&
+      capabilitiesPage.includes('schemaVersion === "anysentry.progressive.dry_run.v1"') &&
+      capabilitiesPage.includes('function DryRunSummary({ result }') &&
+      capabilitiesPage.includes('Backend Preflight') &&
+      capabilitiesPage.includes('<DryRunSummary result={dryRunResult} />') &&
+      capabilitiesPage.includes('operationExamples(selectedOperation)') &&
+      capabilitiesPage.includes('operationPayload(selectedOperation, example)') &&
+      capabilitiesPage.includes('validateAgainstSchema(bodySchema, parsed)') &&
+      capabilitiesPage.includes('requestValidationIssues(requestText, selectedOperation)') &&
+      capabilitiesPage.includes('disabled={loading || validationErrors.length > 0}') &&
+      capabilityCurl.includes('function shellQuote(value: string)') &&
+      capabilityCurl.includes('export function securityCapabilitiesEndpoint()') &&
+      capabilityCurl.includes('export function generatedSecurityCapabilityCurl(request: string | unknown)') &&
+      capabilityCurl.includes('curl -fsS -X POST') &&
+      capabilityCurl.includes('/security-center/capabilities') &&
+      capabilitiesPage.includes('generatedSecurityCapabilityCurl(requestText)') &&
+      capabilitiesPage.includes('Canonical curl') &&
+      capabilitiesPage.includes('const copyCanonicalCurl = async () =>') &&
+      capabilitiesPage.includes('navigator.clipboard?.writeText(curlText)') &&
+      capabilitiesPage.includes('const [searchParams, setSearchParams] = useSearchParams()') &&
+      capabilitiesPage.includes('const routeAction = capabilityRouteAction(searchParams.get("action"))') &&
+      capabilitiesPage.includes('const [query, setQuery] = useState(routeQuery)') &&
+      capabilitiesPage.includes('capabilityRouteParams({ action: "search", query: nextQuery, module: "security-center", operation: firstOperation.name })') &&
+      capabilitiesPage.includes('capabilityRouteParams({ action: options.action ?? "describe"') &&
+      capabilitiesPage.includes('void refreshModules(routeModule, routeOperation, false, routeAction)') &&
+      !capabilitiesPage.includes('const SAMPLE_PARAMS') &&
+      capabilitiesPage.includes('schemaConstString(bodyProperties.action, "execute")') &&
+      capabilitiesPage.includes('schemaConstString(bodyProperties.module, "security-center")') &&
+      securityMonitorPage.includes('<Link to="/capabilities">'),
+    {
+      hasList: capabilitiesPage.includes('securityCenterApi.securityCapabilities({ action: "list" })'),
+      hasSearch: capabilitiesPage.includes('securityCenterApi.securityCapabilities({ action: "search", query: nextQuery })'),
+      hasDescribe: capabilitiesPage.includes('securityCenterApi.securityCapabilities({ action: "describe", module: moduleName, operation: operationName })'),
+      hasExecute: capabilitiesPage.includes('securityCenterApi.executeSecurityCapability(parsed)'),
+      hasDryRunPreflight:
+        capabilitiesPage.includes('const dryRun = async () =>') &&
+        capabilitiesPage.includes('securityCenterApi.executeSecurityCapability({ ...parsed, dryRun: true })') &&
+        capabilitiesPage.includes('onClick={dryRun}'),
+      hasBackendPreflightSummary:
+        capabilitiesPage.includes('function asDryRunResult(value: unknown)') &&
+        capabilitiesPage.includes('schemaVersion === "anysentry.progressive.dry_run.v1"') &&
+        capabilitiesPage.includes('function DryRunSummary({ result }') &&
+        capabilitiesPage.includes('Backend Preflight') &&
+        capabilitiesPage.includes('<DryRunSummary result={dryRunResult} />'),
+      hasCanonicalExamples:
+        capabilitiesPage.includes('operationExamples(selectedOperation)') && capabilitiesPage.includes('operationPayload(selectedOperation, example)'),
+      hasSchemaValidation:
+        capabilitiesPage.includes('validateAgainstSchema(bodySchema, parsed)') &&
+        capabilitiesPage.includes('requestValidationIssues(requestText, selectedOperation)') &&
+        capabilitiesPage.includes('disabled={loading || validationErrors.length > 0}'),
+      hasGeneratedCurl:
+        capabilityCurl.includes('function shellQuote(value: string)') &&
+        capabilityCurl.includes('export function securityCapabilitiesEndpoint()') &&
+        capabilityCurl.includes('export function generatedSecurityCapabilityCurl(request: string | unknown)') &&
+        capabilityCurl.includes('curl -fsS -X POST') &&
+        capabilityCurl.includes('/security-center/capabilities') &&
+        capabilitiesPage.includes('generatedSecurityCapabilityCurl(requestText)') &&
+        capabilitiesPage.includes('Canonical curl') &&
+        capabilitiesPage.includes('const copyCanonicalCurl = async () =>') &&
+        capabilitiesPage.includes('navigator.clipboard?.writeText(curlText)'),
+      hasNoHardcodedSamples: !capabilitiesPage.includes('const SAMPLE_PARAMS'),
+      hasSchemaDrivenEnvelope:
+        capabilitiesPage.includes('schemaConstString(bodyProperties.action, "execute")') &&
+        capabilitiesPage.includes('schemaConstString(bodyProperties.module, "security-center")'),
+      hasUrlBackedState:
+        capabilitiesPage.includes('const [searchParams, setSearchParams] = useSearchParams()') &&
+        capabilitiesPage.includes('const routeAction = capabilityRouteAction(searchParams.get("action"))') &&
+        capabilitiesPage.includes('const [query, setQuery] = useState(routeQuery)') &&
+        capabilitiesPage.includes('void refreshModules(routeModule, routeOperation, false, routeAction)'),
+      hasDashboardEntry: securityMonitorPage.includes('<Link to="/capabilities">'),
     },
   );
   assert(

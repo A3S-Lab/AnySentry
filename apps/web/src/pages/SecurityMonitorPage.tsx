@@ -27,6 +27,7 @@ import {
   SlidersHorizontal,
   ShieldQuestion,
   Siren,
+  Sparkles,
   TerminalSquare,
   Zap,
 } from "lucide-react";
@@ -719,6 +720,28 @@ function SecurityHeader({
               <Link to="/remediation">
                 <FileCheck2 className="mr-1.5 size-3.5" />
                 处置
+              </Link>
+            </Button>
+            <Button
+              asChild
+              variant="secondary"
+              size="sm"
+              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+            >
+              <Link to="/operator">
+                <Zap className="mr-1.5 size-3.5" />
+                AI Operator
+              </Link>
+            </Button>
+            <Button
+              asChild
+              variant="secondary"
+              size="sm"
+              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+            >
+              <Link to="/capabilities">
+                <Sparkles className="mr-1.5 size-3.5" />
+                API
               </Link>
             </Button>
             <Button

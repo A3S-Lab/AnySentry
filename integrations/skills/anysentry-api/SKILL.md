@@ -1,6 +1,6 @@
 ---
 name: anysentry-api
-description: Drive AnySentry deployment checks and the source-compatible progressive API. Use when the user wants an agent to deploy or verify AnySentry, call /security-center/capabilities, discover security-center operations, assess runtime actions, ingest security evidence, build evidence bundles, or integrate a coding agent with AnySentry without relying on the deprecated ACP-style flow.
+description: Drive AnySentry deployment checks and the source-compatible progressive API. Use when the user wants an agent to deploy or verify AnySentry, call /security-center/capabilities, discover security-center operations, assess runtime actions, ingest security evidence, build evidence bundles, plan next actions, or integrate a coding agent with AnySentry without relying on the deprecated ACP-style flow.
 allowed-tools: bash(*)
 parameters:
   - name: apiBase
@@ -46,6 +46,9 @@ kubectl -n "${ANYSENTRY_NAMESPACE:-anysentry}" port-forward svc/anysentry 29653:
 - Single endpoint: `GET|POST $ANYSENTRY_API_BASE/capabilities`.
 - Action set: `list`, `search`, `describe`, `execute`.
 - Dispatch shape: `action + module + operation + params`.
+- `describe` returns the executable `inputSchema.body.properties.params` and
+  `outputSchema.data` contract for each operation. Use that schema as the source
+  of truth instead of maintaining a second reference.
 - Default response is raw:
   - `list` -> `ApiModule[]`
   - `search` -> `ApiOperation[]`
@@ -75,11 +78,13 @@ The built-in module is `security-center`:
 | `assessRuntimeAction` | Judge a tool/model/output/runtime action and return `allow`, `warn`, `require_approval`, or `block`. |
 | `recordSecurityEvents` | Normalize custom, webhook, CloudEvents, or OTel-shaped evidence into judged AnySentry events. |
 | `buildEvidenceBundle` | Build a governance evidence bundle around an event, run, trace, source, incident, objective, or scope. |
+| `planNextActions` | Rank active remediation, incident, alert, objective, and coverage-derived work into an evidence-linked action plan for AI operators. |
 
 ## Runtime guard
 
-Use `dryRun: true` for a preflight that validates targeting without writing an
-event:
+Use `dryRun: true` for a schema-aware preflight that validates the same
+`inputSchema.body` returned by `describe`, reports `schemaIssues`, and previews
+the normalized request without writing an event:
 
 ```sh
 curl -fsS -X POST "$ANYSENTRY_API_BASE/capabilities" \
@@ -165,6 +170,25 @@ curl -fsS -X POST "$ANYSENTRY_API_BASE/capabilities" \
     "module": "security-center",
     "operation": "buildEvidenceBundle",
     "params": { "runId": "deploy-42" }
+  }'
+```
+
+Ask for the next actions when an agent needs operational guidance. Each action
+includes `evidence.bundleHint`; pass that hint to `buildEvidenceBundle` for the
+case file before executing a risky fix:
+
+```sh
+curl -fsS -X POST "$ANYSENTRY_API_BASE/capabilities" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "action": "execute",
+    "module": "security-center",
+    "operation": "planNextActions",
+    "params": {
+      "timeType": "last_1d",
+      "workspacePath": "repo://example",
+      "maxActions": 5
+    }
   }'
 ```
 

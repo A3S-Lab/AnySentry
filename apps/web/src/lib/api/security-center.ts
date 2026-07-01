@@ -625,6 +625,36 @@ export interface SecurityCapabilityRequest {
   shaped?: boolean | string;
 }
 
+export interface SecurityCapabilitySchemaIssue {
+  path: string;
+  message: string;
+  severity: "error" | "warning";
+}
+
+export interface SecurityCapabilityDryRunResult {
+  schemaVersion: "anysentry.progressive.dry_run.v1";
+  valid: boolean;
+  dryRun: true;
+  module: string;
+  operation: string;
+  targetInScope: boolean;
+  tokenVerified: boolean;
+  decision: "allow" | "reject";
+  constraints: SecurityCapabilityConstraints;
+  schemaValid: boolean;
+  schemaIssues: SecurityCapabilitySchemaIssue[];
+  normalizedRequest: {
+    action: "execute";
+    module: string;
+    operation: string;
+    dryRun: true;
+    params: Record<string, unknown>;
+    constraints?: SecurityCapabilityConstraints;
+    sessionId?: string;
+    shaped?: boolean | string;
+  };
+}
+
 export interface SecurityRuntimeGuardDecision {
   schemaVersion: "anysentry.progressive.runtime_guard.result.v1";
   module: "security-center";
@@ -649,6 +679,74 @@ export interface SecurityRuntimeGuardDecision {
     eventsHref?: string;
     bundleHint?: EvidenceBundleQuery;
   };
+}
+
+export interface SecurityNextActionPlanParams extends RemediationQuery {
+  maxActions?: number;
+  includeCompletedSteps?: boolean;
+  owner?: string;
+}
+
+export interface SecurityNextActionPlanItem {
+  actionId: string;
+  taskId: string;
+  rank: number;
+  priority: "critical" | "high" | "medium" | "low";
+  status: RemediationStatus;
+  severity: SecuritySeverity;
+  title: string;
+  recommendedAction: string;
+  actionKind: RemediationActionKind;
+  sourceType: RemediationSourceType;
+  sourceId: string;
+  owner?: string;
+  dueAt?: string;
+  overdue: boolean;
+  needsApproval: boolean;
+  agentId?: string;
+  workspacePath?: string;
+  collectorId?: string;
+  sourceIdentity?: string;
+  eventId?: string;
+  traceId?: string;
+  objectiveId?: string;
+  issueId?: string;
+  evidence: {
+    primaryType: EvidenceBundlePrimaryType;
+    primaryId: string;
+    eventId?: string;
+    incidentId?: string;
+    alertId?: string;
+    taskId: string;
+    objectiveId?: string;
+    issueId?: string;
+    bundleHint: EvidenceBundleQuery;
+  };
+  nextSteps: RemediationStep[];
+}
+
+export interface SecurityNextActionPlan {
+  schemaVersion: "anysentry.progressive.next_action_plan.v1";
+  module: "security-center";
+  operation: "planNextActions";
+  generatedAt: string;
+  scope: {
+    timeType?: SecurityTimeType;
+    workspacePath?: string;
+    agentId?: string;
+    collectorId?: string;
+    sourceId?: string;
+    owner?: string;
+    q?: string;
+  };
+  summary: {
+    totalCandidates: number;
+    returnedActions: number;
+    criticalActions: number;
+    overdueActions: number;
+    approvalRequiredActions: number;
+  };
+  actions: SecurityNextActionPlanItem[];
 }
 
 export interface SecurityCapabilityResponse {
@@ -1900,7 +1998,7 @@ export const securityCenterApi = {
   executeSecurityCapability: (body: SecurityCapabilityRequest) =>
     apiClient.post<SecurityCapabilityResponse | unknown>("/security-center/capabilities", body),
   runtimeGuard: (params: SecurityRuntimeGuardParams, body: Omit<SecurityCapabilityRequest, "action" | "module" | "operation" | "params"> = {}) =>
-    apiClient.post<SecurityRuntimeGuardDecision | SecurityCapabilityResponse>("/security-center/capabilities", {
+    apiClient.post<SecurityRuntimeGuardDecision | SecurityCapabilityDryRunResult | SecurityCapabilityResponse>("/security-center/capabilities", {
       ...body,
       action: "execute",
       module: "security-center",
@@ -1912,7 +2010,7 @@ export const securityCenterApi = {
     headers: HeadersInit,
     body: Omit<SecurityCapabilityRequest, "action" | "module" | "operation" | "params"> = {},
   ) =>
-    apiClient.postWithHeaders<SecurityRuntimeGuardDecision | SecurityCapabilityResponse>(
+    apiClient.postWithHeaders<SecurityRuntimeGuardDecision | SecurityCapabilityDryRunResult | SecurityCapabilityResponse>(
       "/security-center/capabilities",
       {
         ...body,
@@ -1923,6 +2021,22 @@ export const securityCenterApi = {
       },
       headers,
     ),
+  nextActionPlan: (params: SecurityNextActionPlanParams, body: Omit<SecurityCapabilityRequest, "action" | "module" | "operation" | "params"> = {}) =>
+    apiClient.post<SecurityNextActionPlan | SecurityCapabilityDryRunResult | SecurityCapabilityResponse>("/security-center/capabilities", {
+      ...body,
+      action: "execute",
+      module: "security-center",
+      operation: "planNextActions",
+      params,
+    }),
+  evidenceBundleCapability: (params: EvidenceBundleQuery, body: Omit<SecurityCapabilityRequest, "action" | "module" | "operation" | "params"> = {}) =>
+    apiClient.post<EvidenceBundle | SecurityCapabilityDryRunResult | SecurityCapabilityResponse>("/security-center/capabilities", {
+      ...body,
+      action: "execute",
+      module: "security-center",
+      operation: "buildEvidenceBundle",
+      params,
+    }),
   incidents: (filter: IncidentQuery) =>
     apiClient.post<IncidentList>("/security-center/incidents/list", filter),
   updateIncident: (incidentId: string, body: IncidentUpdateRequest) =>

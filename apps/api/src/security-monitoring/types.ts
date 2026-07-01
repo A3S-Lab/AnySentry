@@ -270,6 +270,34 @@ export interface SecurityCapabilityRequest {
   sessionId?: string;
   shaped?: boolean | string;
 }
+export interface SecurityCapabilitySchemaIssue {
+  path: string;
+  message: string;
+  severity: 'error' | 'warning';
+}
+export interface SecurityCapabilityDryRunResult {
+  schemaVersion: 'anysentry.progressive.dry_run.v1';
+  valid: boolean;
+  dryRun: true;
+  module: string;
+  operation: string;
+  targetInScope: boolean;
+  tokenVerified: boolean;
+  decision: 'allow' | 'reject';
+  constraints: SecurityCapabilityConstraints;
+  schemaValid: boolean;
+  schemaIssues: SecurityCapabilitySchemaIssue[];
+  normalizedRequest: {
+    action: 'execute';
+    module: string;
+    operation: string;
+    dryRun: true;
+    params: Record<string, unknown>;
+    constraints?: SecurityCapabilityConstraints;
+    sessionId?: string;
+    shaped?: boolean | string;
+  };
+}
 export interface SecurityRuntimeGuardDecision {
   schemaVersion: 'anysentry.progressive.runtime_guard.result.v1';
   module: 'security-center';
@@ -295,6 +323,71 @@ export interface SecurityRuntimeGuardDecision {
     eventsHref?: string;
     bundleHint?: EvidenceBundleQuery;
   };
+}
+export interface SecurityNextActionPlanParams extends RemediationQuery {
+  maxActions?: number;
+  includeCompletedSteps?: boolean;
+  owner?: string;
+}
+export interface SecurityNextActionPlanItem {
+  actionId: string;
+  taskId: string;
+  rank: number;
+  priority: 'critical' | 'high' | 'medium' | 'low';
+  status: RemediationStatus;
+  severity: Severity;
+  title: string;
+  recommendedAction: string;
+  actionKind: RemediationActionKind;
+  sourceType: RemediationSourceType;
+  sourceId: string;
+  owner?: string;
+  dueAt?: string;
+  overdue: boolean;
+  needsApproval: boolean;
+  agentId?: string;
+  workspacePath?: string;
+  collectorId?: string;
+  sourceIdentity?: string;
+  eventId?: string;
+  traceId?: string;
+  objectiveId?: string;
+  issueId?: string;
+  evidence: {
+    primaryType: EvidenceBundlePrimaryType;
+    primaryId: string;
+    eventId?: string;
+    incidentId?: string;
+    alertId?: string;
+    taskId: string;
+    objectiveId?: string;
+    issueId?: string;
+    bundleHint: EvidenceBundleQuery;
+  };
+  nextSteps: RemediationStep[];
+}
+export interface SecurityNextActionPlan {
+  schemaVersion: 'anysentry.progressive.next_action_plan.v1';
+  module: 'security-center';
+  operation: 'planNextActions';
+  generatedAt: string;
+  scope: {
+    timeType?: SecurityTimeFilter['timeType'];
+    workspacePath?: string;
+    agentId?: string;
+    collectorId?: string;
+    sourceId?: string;
+    owner?: string;
+    q?: string;
+  };
+  summary: {
+    totalCandidates: number;
+    returnedActions: number;
+    criticalActions: number;
+    overdueActions: number;
+    approvalRequiredActions: number;
+  };
+  actions: SecurityNextActionPlanItem[];
 }
 export interface SecurityCapabilityResponse {
   schemaVersion: 'anysentry.progressive.response.v1';

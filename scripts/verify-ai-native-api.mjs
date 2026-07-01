@@ -33,9 +33,10 @@ function hasAll(text, values) {
 
 async function request(pathname, init) {
   if (!apiBase) throw new Error('ANYSENTRY_API_BASE is not set');
+  const adminToken = process.env.ANYSENTRY_ADMIN_TOKEN?.trim() || process.env.ANYSENTRY_MANAGEMENT_TOKEN?.trim();
   const response = await fetch(`${apiBase}${pathname}`, {
-    headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
     ...init,
+    headers: { 'Content-Type': 'application/json', ...(adminToken ? { 'X-AnySentry-Admin-Token': adminToken } : {}), ...(init?.headers ?? {}) },
   });
   const text = await response.text();
   let body = text ? JSON.parse(text) : undefined;
@@ -58,15 +59,51 @@ function verifyStaticContract() {
   assert('controller supports the source-compatible progressive action set', hasAll(controller, actions.map((action) => `'${action}'`)), controller);
   assert('controller does not expose ACP-only poll/subscribe/approve actions as the primary protocol', !/['"](poll|subscribe|approve)['"]/u.test(controller), controller);
   assert('controller publishes source-compatible protocol metadata', controller.includes("protocol: 'shuanos-progressive-api/source-compatible'"), controller);
-  assert('controller defines module/operation progressive entries', hasAll(controller, ['SECURITY_PROGRESSIVE_MODULE', 'assessRuntimeAction', 'recordSecurityEvents', 'buildEvidenceBundle']), controller);
+  assert(
+    'controller defines module/operation progressive entries',
+    hasAll(controller, ['SECURITY_PROGRESSIVE_MODULE', 'assessRuntimeAction', 'recordSecurityEvents', 'buildEvidenceBundle', 'planNextActions']),
+    controller,
+  );
+  assert(
+    'progressive operation schemas use canonical result versions',
+    controller.includes("schemaVersion: 'anysentry.evidence_bundle.v1'") &&
+      controller.includes("schemaVersion: 'anysentry.progressive.runtime_guard.result.v1'") &&
+      controller.includes("schemaVersion: 'anysentry.progressive.next_action_plan.v1'") &&
+      controller.includes("schemaVersion: 'anysentry.progressive.dry_run.v1'") &&
+      !controller.includes("schemaVersion: 'anysentry.evidence.bundle.v1'") &&
+      !controller.includes("schemaVersion: 'anysentry.universal_ingest.result.v1'"),
+    controller,
+  );
+  assert(
+    'controller dry-run validates execute requests against the described input schema',
+    controller.includes('function validateSecurityCapabilitySchema(schema: unknown, value: unknown') &&
+      controller.includes('const schemaIssues = validateSecurityCapabilitySchema(obj(operation.inputSchema)?.body, input)') &&
+      controller.includes('schemaValid') &&
+      controller.includes('normalizedRequest'),
+    controller,
+  );
   assert('controller uses loop-autonomy vocabulary', hasAll(controller, ["'suggest'", "'guarded'", "'auto'", "'require_approval'"]), controller);
   assert('legacy ai-native endpoints are not exposed', !/ai-native|AiNative|aiNative|AI_NATIVE/u.test(controller), controller);
 
   assert('API types define SecurityCapabilityAction with all actions', hasAll(apiTypes, ['SecurityCapabilityAction', ...actions.map((action) => `'${action}'`)]), apiTypes);
   assert('API types define progressive ApiModule/ApiOperation shapes', hasAll(apiTypes, ['SecurityApiModule', 'SecurityApiOperation', 'module?: string', 'operation?: string']), apiTypes);
-  assert('web client uses the progressive capabilities endpoint', webClient.includes('securityCapabilities') && webClient.includes('/security-center/capabilities'), webClient);
+  assert(
+    'web client uses the progressive capabilities endpoint',
+    webClient.includes('securityCapabilities') &&
+      webClient.includes('nextActionPlan') &&
+      webClient.includes('evidenceBundleCapability') &&
+      webClient.includes('/security-center/capabilities'),
+    webClient,
+  );
   assert('web client has no legacy AiNative type surface', !/AiNative|aiNative|AI_NATIVE|ai-native/u.test(webClient), webClient);
-  assert('README documents the source-compatible progressive capability API', readme.includes('Source-compatible progressive capability API') && readme.includes('module + operation + params') && readme.includes('pnpm verify:progressive-api'), readme);
+  assert(
+    'README documents the source-compatible progressive capability API',
+    readme.includes('Source-compatible progressive capability API') &&
+      readme.includes('module + operation + params') &&
+      readme.includes('planNextActions') &&
+      readme.includes('pnpm verify:progressive-api'),
+    readme,
+  );
   assert('deploy README documents one-command integrated install', deployReadme.includes('deploy/install.sh docker') && deployReadme.includes('ANYSENTRY_INSTALL_MODE=kubernetes'), deployReadme);
   assert('package scripts expose progressive API verifier aliases', packageJson.scripts?.['verify:progressive-api'] === 'pnpm verify:ai-native-api' && packageJson.scripts?.['verify:progressive-api:local'] === 'pnpm verify:ai-native-api:local', packageJson.scripts);
 }
@@ -88,9 +125,89 @@ async function verifyRuntimeContract() {
 
   const describe = await request('/capabilities?action=describe&module=security-center&operation=assessRuntimeAction');
   assert('runtime describe narrows to one operation schema', describe?.name === 'assessRuntimeAction' && describe?.inputSchema && describe?.outputSchema, describe);
+  assert(
+    'runtime guard describe advertises the actual runtime guard result schema',
+    describe?.outputSchema?.data?.schemaVersion === 'anysentry.progressive.runtime_guard.result.v1',
+    describe,
+  );
+  const guardParamsSchema = describe?.inputSchema?.body?.properties?.params;
+  assert(
+    'runtime guard describe exposes a typed executable params schema',
+    guardParamsSchema?.type === 'object' &&
+      guardParamsSchema?.properties?.autonomy?.enum?.includes('guarded') &&
+      guardParamsSchema?.properties?.stage?.enum?.includes('tool') &&
+      Array.isArray(guardParamsSchema?.properties?.command?.oneOf) &&
+      describe?.outputSchema?.data?.properties?.policyAction?.enum?.includes('require_approval') &&
+      describe?.examples?.some((example) => example?.request?.operation === 'assessRuntimeAction' && example?.request?.module === 'security-center'),
+    describe,
+  );
+
+  const describeRecord = await request('/capabilities?action=describe&module=security-center&operation=recordSecurityEvents');
+  assert(
+    'recordSecurityEvents describe advertises the actual ingest result shape',
+    describeRecord?.name === 'recordSecurityEvents' &&
+      describeRecord?.outputSchema?.data?.type === 'object' &&
+      describeRecord?.outputSchema?.data?.properties?.acceptedEvents?.type === 'number' &&
+      !describeRecord?.outputSchema?.data?.schemaVersion,
+    describeRecord,
+  );
+  const recordParamsSchema = describeRecord?.inputSchema?.body?.properties?.params;
+  assert(
+    'recordSecurityEvents describe exposes structured ingest params schema',
+    recordParamsSchema?.type === 'object' &&
+      Array.isArray(recordParamsSchema?.anyOf) &&
+      recordParamsSchema?.properties?.sourceType?.enum?.includes('custom') &&
+      recordParamsSchema?.properties?.events?.type === 'array' &&
+      recordParamsSchema?.properties?.events?.items?.properties?.eventCategory?.enum?.includes('tool') &&
+      describeRecord?.examples?.some((example) => example?.request?.operation === 'recordSecurityEvents' && Array.isArray(example?.request?.params?.events)),
+    describeRecord,
+  );
+
+  const describeBundle = await request('/capabilities?action=describe&module=security-center&operation=buildEvidenceBundle');
+  assert(
+    'buildEvidenceBundle describe advertises the actual evidence bundle schema',
+    describeBundle?.name === 'buildEvidenceBundle' && describeBundle?.outputSchema?.data?.schemaVersion === 'anysentry.evidence_bundle.v1',
+    describeBundle,
+  );
+  const bundleParamsSchema = describeBundle?.inputSchema?.body?.properties?.params;
+  assert(
+    'buildEvidenceBundle describe exposes primary evidence selector params schema',
+    bundleParamsSchema?.type === 'object' &&
+      bundleParamsSchema?.additionalProperties === false &&
+      bundleParamsSchema?.properties?.eventId?.type === 'string' &&
+      bundleParamsSchema?.properties?.taskId?.type === 'string' &&
+      bundleParamsSchema?.properties?.limit?.maximum === 500 &&
+      describeBundle?.outputSchema?.data?.properties?.summary?.properties?.eventCount?.type === 'number' &&
+      describeBundle?.examples?.some((example) => example?.request?.operation === 'buildEvidenceBundle' && example?.request?.params?.workspacePath),
+    describeBundle,
+  );
+
+  const describePlan = await request('/capabilities?action=describe&module=security-center&operation=planNextActions');
+  assert(
+    'planNextActions describe advertises the actual next-action plan schema',
+    describePlan?.name === 'planNextActions' && describePlan?.outputSchema?.data?.schemaVersion === 'anysentry.progressive.next_action_plan.v1',
+    describePlan,
+  );
+  const planParamsSchema = describePlan?.inputSchema?.body?.properties?.params;
+  assert(
+    'planNextActions describe exposes ranked-action filter params schema',
+    planParamsSchema?.type === 'object' &&
+      planParamsSchema?.additionalProperties === false &&
+      planParamsSchema?.properties?.status?.enum?.includes('in_progress') &&
+      planParamsSchema?.properties?.sourceType?.enum?.includes('coverage') &&
+      planParamsSchema?.properties?.maxActions?.maximum === 20 &&
+      describePlan?.outputSchema?.data?.properties?.actions?.items?.properties?.evidence?.properties?.bundleHint?.properties?.taskId?.type === 'string' &&
+      describePlan?.examples?.some((example) => example?.request?.operation === 'planNextActions' && example?.request?.params?.maxActions),
+    describePlan,
+  );
 
   const shaped = await request('/capabilities?action=list&shaped=true');
   assert('runtime shaped=true returns tool-friendly envelope', shaped?.protocol === 'shuanos-progressive-api/source-compatible' && shaped?.success === true && shaped?.modules?.length, shaped);
+
+  const runId = `verify-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const workspacePath = `repo://${runId}`;
+  const agentId = `${runId}-agent`;
+  const sessionId = `${runId}-session`;
 
   const dryRun = await request('/capabilities', {
     method: 'POST',
@@ -102,15 +219,53 @@ async function verifyRuntimeContract() {
       params: {
         autonomy: 'guarded',
         stage: 'tool',
-        workspacePath: 'repo://verify',
-        agentId: 'verify-agent',
-        sessionId: 'verify-session',
+        workspacePath,
+        agentId,
+        sessionId,
         toolName: 'bash',
         command: ['bash', '-lc', 'id'],
       },
     }),
   });
-  assert('runtime execute dryRun returns a valid preflight decision', dryRun?.valid === true && dryRun?.module === 'security-center' && dryRun?.operation === 'assessRuntimeAction', dryRun);
+  assert(
+    'runtime execute dryRun returns a schema-aware valid preflight decision',
+    dryRun?.schemaVersion === 'anysentry.progressive.dry_run.v1' &&
+      dryRun?.valid === true &&
+      dryRun?.schemaValid === true &&
+      Array.isArray(dryRun?.schemaIssues) &&
+      dryRun.schemaIssues.length === 0 &&
+      dryRun?.module === 'security-center' &&
+      dryRun?.operation === 'assessRuntimeAction' &&
+      dryRun?.normalizedRequest?.operation === 'assessRuntimeAction',
+    dryRun,
+  );
+
+  const invalidDryRun = await request('/capabilities', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'execute',
+      module: 'security-center',
+      operation: 'planNextActions',
+      dryRun: true,
+      params: {
+        status: 'not-a-status',
+        maxActions: 99,
+        unexpected: true,
+      },
+    }),
+  });
+  assert(
+    'runtime execute dryRun reports input schema issues without executing side effects',
+    invalidDryRun?.schemaVersion === 'anysentry.progressive.dry_run.v1' &&
+      invalidDryRun?.valid === false &&
+      invalidDryRun?.schemaValid === false &&
+      invalidDryRun?.decision === 'reject' &&
+      invalidDryRun?.operation === 'planNextActions' &&
+      invalidDryRun?.schemaIssues?.some((issue) => issue.path === '$.params.status') &&
+      invalidDryRun?.schemaIssues?.some((issue) => issue.path === '$.params.maxActions') &&
+      invalidDryRun?.schemaIssues?.some((issue) => issue.path === '$.params.unexpected'),
+    invalidDryRun,
+  );
 
   const guarded = await request('/capabilities', {
     method: 'POST',
@@ -121,9 +276,9 @@ async function verifyRuntimeContract() {
       params: {
         autonomy: 'guarded',
         stage: 'tool',
-        workspacePath: 'repo://verify',
-        agentId: 'verify-agent',
-        sessionId: 'verify-session',
+        workspacePath,
+        agentId,
+        sessionId,
         toolName: 'bash',
         command: ['bash', '-lc', 'curl http://169.254.169.254/latest/meta-data'],
       },
@@ -132,10 +287,127 @@ async function verifyRuntimeContract() {
   assert(
     'runtime execute assesses a real guard event through sentry',
     guarded?.schemaVersion === 'anysentry.progressive.runtime_guard.result.v1' &&
+      guarded?.schemaVersion === describe.outputSchema.data.schemaVersion &&
       guarded?.module === 'security-center' &&
       guarded?.operation === 'assessRuntimeAction' &&
+      guarded?.eventId &&
       ['allow', 'warn', 'require_approval', 'block'].includes(guarded?.policyAction),
     guarded,
+  );
+
+  const plan = await request('/capabilities', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'execute',
+      module: 'security-center',
+      operation: 'planNextActions',
+      params: {
+        timeType: 'last_1d',
+        workspacePath,
+        agentId,
+        maxActions: 3,
+      },
+    }),
+  });
+  assert(
+    'runtime execute returns an evidence-linked AI next-action plan',
+    plan?.schemaVersion === 'anysentry.progressive.next_action_plan.v1' &&
+      plan?.schemaVersion === describePlan.outputSchema.data.schemaVersion &&
+      plan?.module === 'security-center' &&
+      plan?.operation === 'planNextActions' &&
+      Array.isArray(plan?.actions) &&
+      plan.actions.length >= 1 &&
+      plan.actions[0]?.workspacePath === workspacePath &&
+      plan.actions[0]?.agentId === agentId &&
+      plan.actions[0]?.evidence?.bundleHint,
+    plan,
+  );
+  const action = plan.actions[0];
+
+  const bundle = await request('/capabilities', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'execute',
+      module: 'security-center',
+      operation: 'buildEvidenceBundle',
+      params: {
+        timeType: 'last_1d',
+        limit: 40,
+        ...action.evidence.bundleHint,
+        taskId: action.taskId,
+        eventId: action.eventId ?? guarded.eventId,
+        agentId,
+        workspacePath,
+      },
+    }),
+  });
+  assert(
+    'runtime AI Operator evidence hint builds a matching governance bundle',
+    bundle?.schemaVersion === 'anysentry.evidence_bundle.v1' &&
+      bundle?.schemaVersion === describeBundle.outputSchema.data.schemaVersion &&
+      bundle?.summary?.eventCount >= 1 &&
+      bundle?.events?.some((event) => event.eventId === guarded.eventId) &&
+      bundle?.remediations?.some((task) => task.taskId === action.taskId),
+    bundle,
+  );
+
+  const inProgress = await request(`/remediations/${encodeURIComponent(action.taskId)}`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      status: 'in_progress',
+      note: `progressive operator loop ${runId}`,
+    }),
+  });
+  assert('runtime Operator loop can advance the planned action to in_progress', inProgress?.taskId === action.taskId && inProgress?.status === 'in_progress', inProgress);
+
+  const refreshedPlan = await request('/capabilities', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'execute',
+      module: 'security-center',
+      operation: 'planNextActions',
+      params: {
+        timeType: 'last_1d',
+        workspacePath,
+        agentId,
+        maxActions: 5,
+      },
+    }),
+  });
+  assert(
+    'runtime Operator loop refreshes next-action status after Remediation update',
+    refreshedPlan?.schemaVersion === 'anysentry.progressive.next_action_plan.v1' &&
+      refreshedPlan?.actions?.some((item) => item.taskId === action.taskId && item.status === 'in_progress'),
+    refreshedPlan,
+  );
+
+  const completed = await request(`/remediations/${encodeURIComponent(action.taskId)}`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      status: 'done',
+      note: `progressive operator loop completed ${runId}`,
+    }),
+  });
+  assert('runtime Operator loop can complete the planned action', completed?.taskId === action.taskId && completed?.status === 'done', completed);
+
+  const activePlan = await request('/capabilities', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'execute',
+      module: 'security-center',
+      operation: 'planNextActions',
+      params: {
+        timeType: 'last_1d',
+        workspacePath,
+        agentId,
+        maxActions: 5,
+      },
+    }),
+  });
+  assert(
+    'runtime Operator loop removes completed work from default next-action candidates',
+    activePlan?.schemaVersion === 'anysentry.progressive.next_action_plan.v1' && !activePlan?.actions?.some((item) => item.taskId === action.taskId),
+    activePlan,
   );
 
   const legacy = await request('/capabilities', {

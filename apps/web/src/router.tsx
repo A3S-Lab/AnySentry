@@ -3,6 +3,7 @@ import AgentEventsPage from "@/pages/AgentEventsPage";
 import AgentsPage from "@/pages/AgentsPage";
 import AlertsPage from "@/pages/AlertsPage";
 import AuditPage from "@/pages/AuditPage";
+import CapabilitiesPage from "@/pages/CapabilitiesPage";
 import CollectorsPage from "@/pages/CollectorsPage";
 import CoveragePage from "@/pages/CoveragePage";
 import EvidenceBundlePage from "@/pages/EvidenceBundlePage";
@@ -10,6 +11,7 @@ import IncidentsPage from "@/pages/IncidentsPage";
 import MaintenancePage from "@/pages/MaintenancePage";
 import NotificationsPage from "@/pages/NotificationsPage";
 import ObjectivesPage from "@/pages/ObjectivesPage";
+import OperatorPage from "@/pages/OperatorPage";
 import PolicyConfigPage from "@/pages/PolicyConfigPage";
 import RemediationPage from "@/pages/RemediationPage";
 import SecurityMonitorPage from "@/pages/SecurityMonitorPage";
@@ -24,6 +26,7 @@ export const router = createBrowserRouter(
     { path: "/agents", element: <AgentsPage /> },
     { path: "/alerts", element: <AlertsPage /> },
     { path: "/audit", element: <AuditPage /> },
+    { path: "/capabilities", element: <CapabilitiesPage /> },
     { path: "/collectors", element: <CollectorsPage /> },
     { path: "/coverage", element: <CoveragePage /> },
     { path: "/evidence", element: <EvidenceBundlePage /> },
@@ -32,6 +35,7 @@ export const router = createBrowserRouter(
     { path: "/maintenance", element: <MaintenancePage /> },
     { path: "/notifications", element: <NotificationsPage /> },
     { path: "/objectives", element: <ObjectivesPage /> },
+    { path: "/operator", element: <OperatorPage /> },
     { path: "/remediation", element: <RemediationPage /> },
     { path: "/sources", element: <SourcesPage /> },
     { path: "/topology", element: <TopologyPage /> },
