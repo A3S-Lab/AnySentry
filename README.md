@@ -395,7 +395,8 @@ event, proving the shared bundle's primary event is the warning source event.
 The warning bundle scope fields (`bundleScopePrimaryType`,
 `bundleScopePrimaryId`, `bundleScopeEventId`, `bundleScopeWorkspacePath`,
 `bundleScopeRunId`, `bundleScopeAgentId`, and `bundleScopeSessionId`) must match
-the success evidence bundle scope.
+the success evidence bundle scope, and the warning bundle timeline fields must
+prove the same source event appears in the shared case-file timeline.
 Success summaries also include the inner Skill output health/list/describe
 proofs, event, workspace, run, agent, session, bundle IDs, and inner API timing
 fields under `evidence.skillOutput`, and the verifier fails if those proofs do
@@ -432,7 +433,11 @@ can detect bundles whose primary event drifted even when the event is still
 listed. Bundle scope fields are also exposed and must bind to the same
 event/workspace/run/agent/session identity in both the outer evidence and the
 Skill output, so automation can reject bundles built with a stale or cross-run
-scope.
+scope. Bundle timeline fields (`bundleTimelineContainsEvent`,
+`bundleTimelineEventCount`, `bundleTimelineTraceId`, `bundleTimelineRunId`, and
+`bundleTimelineSessionId`) must prove the target event is present in the
+case-file timeline and that the timeline remains bound to the same trace, run,
+and session.
 Failed summaries always include explicit `failure.details` plus a failure
 evidence status, either with the recorded event/bundle IDs or with
 `recorded=false` plus the reason evidence was not written; these states are
@@ -455,7 +460,9 @@ include the failure event, and must report positive Evidence Bundle summary and
 listed event counts, with the listed count not exceeding the summary count. They
 must also expose `bundlePrimaryEventId` matching the recorded failure event and
 bundle scope fields bound to that failure event's workspace, run, agent, and
-session identity.
+session identity. Failure bundle timeline fields must likewise prove the
+failure event is present in the failure case-file timeline and bound to the
+failure trace, run, and session.
 When a required near-timeout warning is missing, the nested
 `warning.failure.evidence` must match the top-level `failure.evidence`,
 including persisted verifier and timing attribute evidence, so automation does

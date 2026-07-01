@@ -105,6 +105,7 @@ const recordedFailureEvidenceFields = [
   'runId',
   'agentId',
   'sessionId',
+  'traceId',
   'eventKind',
   'eventCategory',
   'verdict',
@@ -124,6 +125,11 @@ const recordedFailureEvidenceFields = [
   'bundleScopeRunId',
   'bundleScopeAgentId',
   'bundleScopeSessionId',
+  'bundleTimelineContainsEvent',
+  'bundleTimelineEventCount',
+  'bundleTimelineTraceId',
+  'bundleTimelineRunId',
+  'bundleTimelineSessionId',
 ];
 const failureEvidenceMatchFields = ['recorded', ...recordedFailureEvidenceFields, 'error'];
 const nearTimeoutWarningReason = 'a3s-code Skill verifier completed close to its timeout budget';
@@ -318,6 +324,40 @@ function bundleScopeIssues(evidence, expected, context, expectedContext) {
     if (evidence?.[field] !== expected?.[expectedField]) {
       issues.push(`${context}.${field} must match ${expectedContext}.${expectedField}`);
     }
+  }
+  return issues;
+}
+
+function bundleTimelineEvidence(bundle, eventId) {
+  const timeline = isRecord(bundle?.timeline) ? bundle.timeline : {};
+  const items = Array.isArray(timeline.items) ? timeline.items : [];
+  return {
+    bundleTimelineContainsEvent: items.some((item) => item.eventId === eventId),
+    bundleTimelineEventCount: items.length,
+    bundleTimelineTraceId: timeline.traceId,
+    bundleTimelineRunId: timeline.runId,
+    bundleTimelineSessionId: timeline.sessionId,
+  };
+}
+
+function bundleTimelineIssues(evidence, expected, context, expectedContext) {
+  const issues = [];
+  if (evidence?.bundleTimelineContainsEvent !== true) {
+    issues.push(`${context}.bundleTimelineContainsEvent must be true`);
+  }
+  if (!isPositiveInteger(evidence?.bundleTimelineEventCount)) {
+    issues.push(`${context}.bundleTimelineEventCount must be a positive integer`);
+  }
+  if (!isNonEmptyString(evidence?.bundleTimelineTraceId)) {
+    issues.push(`${context}.bundleTimelineTraceId must be a non-empty string`);
+  } else if (isNonEmptyString(expected?.traceId) && evidence.bundleTimelineTraceId !== expected.traceId) {
+    issues.push(`${context}.bundleTimelineTraceId must match ${expectedContext}.traceId`);
+  }
+  if (evidence?.bundleTimelineRunId !== expected?.runId) {
+    issues.push(`${context}.bundleTimelineRunId must match ${expectedContext}.runId`);
+  }
+  if (evidence?.bundleTimelineSessionId !== expected?.sessionId) {
+    issues.push(`${context}.bundleTimelineSessionId must match ${expectedContext}.sessionId`);
   }
   return issues;
 }
@@ -572,6 +612,9 @@ function skillOutputEvidenceIssues(skillOutput) {
   if (skillOutput.sessionId !== sessionId) {
     issues.push('skillOutput.sessionId must match the verifier sessionId');
   }
+  if (!isNonEmptyString(skillOutput.traceId)) {
+    issues.push('skillOutput.traceId must be a non-empty string');
+  }
   issues.push(...skillOutputPreflightIssues(skillOutput, 'skillOutput'));
   if (skillOutput.eventKind !== 'LlmCall') {
     issues.push('skillOutput.eventKind must be LlmCall');
@@ -608,6 +651,7 @@ function skillOutputEvidenceIssues(skillOutput) {
     ),
   );
   issues.push(...bundleScopeIssues(skillOutput, skillOutput, 'skillOutput', 'skillOutput'));
+  issues.push(...bundleTimelineIssues(skillOutput, skillOutput, 'skillOutput', 'skillOutput'));
   if (skillOutput.queriedBack !== true) {
     issues.push('skillOutput.queriedBack must be true');
   }
@@ -696,6 +740,19 @@ function evidenceBundleBindingIssues(bundle, skillOutput, eventId) {
   ]) {
     if (scopeEvidence[scopeField] !== skillOutput[skillOutputField]) {
       issues.push(`bundle.scope.${scopeField} must match skillOutput.${skillOutputField}`);
+    }
+  }
+  const timelineEvidence = bundleTimelineEvidence(bundle, eventId);
+  issues.push(...bundleTimelineIssues(timelineEvidence, skillOutput, 'bundle.timeline', 'skillOutput'));
+  for (const [timelineField, skillOutputField] of [
+    ['bundleTimelineContainsEvent', 'bundleTimelineContainsEvent'],
+    ['bundleTimelineEventCount', 'bundleTimelineEventCount'],
+    ['bundleTimelineTraceId', 'bundleTimelineTraceId'],
+    ['bundleTimelineRunId', 'bundleTimelineRunId'],
+    ['bundleTimelineSessionId', 'bundleTimelineSessionId'],
+  ]) {
+    if (timelineEvidence[timelineField] !== skillOutput[skillOutputField]) {
+      issues.push(`bundle.timeline.${timelineField} must match skillOutput.${skillOutputField}`);
     }
   }
   return issues;
@@ -836,6 +893,7 @@ function successfulEvidenceIssues(summary, context) {
   if (!isNonEmptyString(summary.evidence?.runId)) issues.push(`${context} evidence.runId must be a non-empty string`);
   if (!isNonEmptyString(summary.evidence?.agentId)) issues.push(`${context} evidence.agentId must be a non-empty string`);
   if (!isNonEmptyString(summary.evidence?.sessionId)) issues.push(`${context} evidence.sessionId must be a non-empty string`);
+  if (!isNonEmptyString(summary.evidence?.traceId)) issues.push(`${context} evidence.traceId must be a non-empty string`);
   if (!isNonEmptyString(summary.evidence?.bundleId)) issues.push(`${context} evidence.bundleId must be a non-empty string`);
   if (summary.evidence?.bundleSchemaVersion !== 'anysentry.evidence_bundle.v1') {
     issues.push(`${context} evidence.bundleSchemaVersion must be anysentry.evidence_bundle.v1`);
@@ -859,6 +917,7 @@ function successfulEvidenceIssues(summary, context) {
     ),
   );
   issues.push(...bundleScopeIssues(summary.evidence, summary.evidence, `${context} evidence`, 'evidence'));
+  issues.push(...bundleTimelineIssues(summary.evidence, summary.evidence, `${context} evidence`, 'evidence'));
   if (summary.evidence?.eventKind !== 'LlmCall') issues.push(`${context} evidence.eventKind must be LlmCall`);
   if (summary.evidence?.eventCategory !== 'llm') issues.push(`${context} evidence.eventCategory must be llm`);
   if (summary.evidence?.verdict !== 'allow') issues.push(`${context} evidence.verdict must be allow`);
@@ -892,6 +951,9 @@ function successfulEvidenceIssues(summary, context) {
   }
   if (!isNonEmptyString(summary.evidence?.skillOutput?.sessionId)) {
     issues.push(`${context} evidence.skillOutput.sessionId must be a non-empty string`);
+  }
+  if (!isNonEmptyString(summary.evidence?.skillOutput?.traceId)) {
+    issues.push(`${context} evidence.skillOutput.traceId must be a non-empty string`);
   }
   if (!isNonEmptyString(summary.evidence?.skillOutput?.bundleId)) {
     issues.push(`${context} evidence.skillOutput.bundleId must be a non-empty string`);
@@ -930,6 +992,14 @@ function successfulEvidenceIssues(summary, context) {
       'evidence.skillOutput',
     ),
   );
+  issues.push(
+    ...bundleTimelineIssues(
+      summary.evidence?.skillOutput,
+      summary.evidence?.skillOutput,
+      `${context} evidence.skillOutput`,
+      'evidence.skillOutput',
+    ),
+  );
   if (summary.evidence?.skillOutput?.eventKind !== 'LlmCall') issues.push(`${context} evidence.skillOutput.eventKind must be LlmCall`);
   if (summary.evidence?.skillOutput?.eventCategory !== 'llm') issues.push(`${context} evidence.skillOutput.eventCategory must be llm`);
   if (summary.evidence?.skillOutput?.verdict !== 'allow') issues.push(`${context} evidence.skillOutput.verdict must be allow`);
@@ -958,6 +1028,9 @@ function successfulEvidenceIssues(summary, context) {
   }
   if (summary.evidence?.sessionId !== summary.evidence?.skillOutput?.sessionId) {
     issues.push(`${context} evidence.sessionId must match skillOutput.sessionId`);
+  }
+  if (summary.evidence?.traceId !== summary.evidence?.skillOutput?.traceId) {
+    issues.push(`${context} evidence.traceId must match skillOutput.traceId`);
   }
   if (summary.evidence?.workspacePath !== summary.evidence?.skillOutput?.workspacePath) {
     issues.push(`${context} evidence.workspacePath must match skillOutput.workspacePath`);
@@ -1000,6 +1073,17 @@ function successfulEvidenceIssues(summary, context) {
     'bundleScopeRunId',
     'bundleScopeAgentId',
     'bundleScopeSessionId',
+  ]) {
+    if (summary.evidence?.[field] !== summary.evidence?.skillOutput?.[field]) {
+      issues.push(`${context} ${field} must match skillOutput.${field}`);
+    }
+  }
+  for (const field of [
+    'bundleTimelineContainsEvent',
+    'bundleTimelineEventCount',
+    'bundleTimelineTraceId',
+    'bundleTimelineRunId',
+    'bundleTimelineSessionId',
   ]) {
     if (summary.evidence?.[field] !== summary.evidence?.skillOutput?.[field]) {
       issues.push(`${context} ${field} must match skillOutput.${field}`);
@@ -1121,6 +1205,7 @@ function verifierSummaryIssues(summary) {
       if (!isNonEmptyString(evidence.runId)) issues.push('recorded failure evidence.runId must be a non-empty string');
       if (!isNonEmptyString(evidence.agentId)) issues.push('recorded failure evidence.agentId must be a non-empty string');
       if (!isNonEmptyString(evidence.sessionId)) issues.push('recorded failure evidence.sessionId must be a non-empty string');
+      if (!isNonEmptyString(evidence.traceId)) issues.push('recorded failure evidence.traceId must be a non-empty string');
       if (!isNonEmptyString(evidence.bundleId)) issues.push('recorded failure evidence.bundleId must be a non-empty string');
       if (evidence.bundleSchemaVersion !== 'anysentry.evidence_bundle.v1') {
         issues.push('recorded failure evidence.bundleSchemaVersion must be anysentry.evidence_bundle.v1');
@@ -1146,6 +1231,7 @@ function verifierSummaryIssues(summary) {
         ),
       );
       issues.push(...bundleScopeIssues(evidence, evidence, 'recorded failure evidence', 'event'));
+      issues.push(...bundleTimelineIssues(evidence, evidence, 'recorded failure evidence', 'event'));
       issues.push(...persistedVerifierAttributeIssues(evidence.persistedVerifierAttributes, 'recorded failure evidence'));
       issues.push(...persistedTimingAttributeIssues(evidence.persistedTimingAttributes, summary.timings, 'recorded failure evidence'));
       if (evidence.workspacePath !== summary.target?.workspacePath) {
@@ -1268,6 +1354,9 @@ function verifierSummaryIssues(summary) {
       if (!isNonEmptyString(summary.warning?.runId)) issues.push('triggered warning.runId must be a non-empty string');
       if (!isNonEmptyString(summary.warning?.agentId)) issues.push('triggered warning.agentId must be a non-empty string');
       if (!isNonEmptyString(summary.warning?.sessionId)) issues.push('triggered warning.sessionId must be a non-empty string');
+      if (!isNonEmptyString(summary.warning?.bundleTimelineTraceId)) {
+        issues.push('triggered warning.bundleTimelineTraceId must be a non-empty string');
+      }
       if (summary.warning?.eventKind !== 'RuntimeEvent') issues.push('triggered warning.eventKind must be RuntimeEvent');
       if (summary.warning?.eventCategory !== 'runtime') issues.push('triggered warning.eventCategory must be runtime');
       if (summary.warning?.verdict !== 'allow') issues.push('triggered warning.verdict must be allow');
@@ -1311,6 +1400,19 @@ function verifierSummaryIssues(summary) {
           'warning',
         ),
       );
+      issues.push(
+        ...bundleTimelineIssues(
+          summary.warning,
+          {
+            eventId: summary.warning?.sourceEventId,
+            traceId: summary.evidence?.traceId,
+            runId: summary.warning?.runId,
+            sessionId: summary.warning?.sessionId,
+          },
+          'triggered warning',
+          'warning',
+        ),
+      );
       if (summary.warning?.failure !== undefined) issues.push('triggered warning.failure must be absent');
       if (isNonEmptyString(summary.evidence?.eventId) && summary.warning?.eventId === summary.evidence.eventId) {
         issues.push('triggered warning.eventId must differ from evidence.eventId');
@@ -1341,6 +1443,17 @@ function verifierSummaryIssues(summary) {
       }
       if (summary.warning?.bundlePrimaryEventId !== summary.evidence?.bundlePrimaryEventId) {
         issues.push('triggered warning.bundlePrimaryEventId must match evidence.bundlePrimaryEventId');
+      }
+      for (const field of [
+        'bundleTimelineContainsEvent',
+        'bundleTimelineEventCount',
+        'bundleTimelineTraceId',
+        'bundleTimelineRunId',
+        'bundleTimelineSessionId',
+      ]) {
+        if (summary.warning?.[field] !== summary.evidence?.[field]) {
+          issues.push(`triggered warning.${field} must match evidence.${field}`);
+        }
       }
       for (const field of [
         'bundleScopePrimaryType',
@@ -1388,6 +1501,17 @@ function verifierSummaryIssues(summary) {
         'bundleScopeRunId',
         'bundleScopeAgentId',
         'bundleScopeSessionId',
+      ]) {
+        if (summary.warning?.[field] !== undefined) {
+          issues.push(`untriggered warning.${field} must be absent`);
+        }
+      }
+      for (const field of [
+        'bundleTimelineContainsEvent',
+        'bundleTimelineEventCount',
+        'bundleTimelineTraceId',
+        'bundleTimelineRunId',
+        'bundleTimelineSessionId',
       ]) {
         if (summary.warning?.[field] !== undefined) {
           issues.push(`untriggered warning.${field} must be absent`);
@@ -1660,6 +1784,15 @@ async function recordFailureEvidence(reason, details, timings) {
     if (failureBundleScopeIssues.length > 0) {
       throw new Error(`failure evidence bundle scope did not match the failure event: ${compact({ failureBundleScopeIssues, bundle })}`);
     }
+    const failureBundleTimelineIssues = bundleTimelineIssues(
+      bundleTimelineEvidence(bundle, failureEvent.eventId),
+      failureEvent,
+      'failure evidence bundle timeline',
+      'failure event',
+    );
+    if (failureBundleTimelineIssues.length > 0) {
+      throw new Error(`failure evidence bundle timeline did not include the failure event: ${compact({ failureBundleTimelineIssues, bundle })}`);
+    }
     if (!isPositiveInteger(bundle.summary?.eventCount)) {
       throw new Error(`failure evidence bundle did not report a positive event count: ${compact(bundle)}`);
     }
@@ -1676,6 +1809,7 @@ async function recordFailureEvidence(reason, details, timings) {
       runId: failureEvent.runId,
       agentId: failureEvent.agentId,
       sessionId: failureEvent.sessionId,
+      traceId: failureEvent.traceId,
       eventKind: failureEvent.eventKind,
       eventCategory: failureEvent.eventCategory,
       verdict: failureEvent.verdict,
@@ -1689,6 +1823,7 @@ async function recordFailureEvidence(reason, details, timings) {
       bundleListedEventCount: Array.isArray(bundle.events) ? bundle.events.length : undefined,
       bundlePrimaryEventId: bundlePrimaryEventId(bundle),
       ...bundleScopeEvidence(bundle),
+      ...bundleTimelineEvidence(bundle, failureEvent.eventId),
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -1889,6 +2024,7 @@ function runVerifierSelfTest() {
       runId,
       agentId,
       sessionId,
+      traceId: 'trace_self_test',
       eventKind: 'LlmCall',
       eventCategory: 'llm',
       verdict: 'allow',
@@ -1905,6 +2041,11 @@ function runVerifierSelfTest() {
       bundleScopeRunId: runId,
       bundleScopeAgentId: agentId,
       bundleScopeSessionId: sessionId,
+      bundleTimelineContainsEvent: true,
+      bundleTimelineEventCount: 1,
+      bundleTimelineTraceId: 'trace_self_test',
+      bundleTimelineRunId: runId,
+      bundleTimelineSessionId: sessionId,
       persistedVerifierAttributes: persistedVerifierAttributeEvidence(verifierAttributes),
       persistedSkillAttributes: {
         runner: 'a3s-code',
@@ -1929,6 +2070,7 @@ function runVerifierSelfTest() {
         runId,
         agentId,
         sessionId,
+        traceId: 'trace_self_test',
         eventKind: 'LlmCall',
         eventCategory: 'llm',
         verdict: 'allow',
@@ -1948,6 +2090,11 @@ function runVerifierSelfTest() {
         bundleScopeRunId: runId,
         bundleScopeAgentId: agentId,
         bundleScopeSessionId: sessionId,
+        bundleTimelineContainsEvent: true,
+        bundleTimelineEventCount: 1,
+        bundleTimelineTraceId: 'trace_self_test',
+        bundleTimelineRunId: runId,
+        bundleTimelineSessionId: sessionId,
         queriedBack: true,
         timings: {
           innerHealthzMs: 1,
@@ -1988,6 +2135,11 @@ function runVerifierSelfTest() {
       bundleScopeRunId: runId,
       bundleScopeAgentId: agentId,
       bundleScopeSessionId: sessionId,
+      bundleTimelineContainsEvent: true,
+      bundleTimelineEventCount: 1,
+      bundleTimelineTraceId: 'trace_self_test',
+      bundleTimelineRunId: runId,
+      bundleTimelineSessionId: sessionId,
       persistedVerifierAttributes: persistedVerifierAttributeEvidence(verifierAttributes),
       persistedTimingAttributes: {
         skill: nearTimeoutThresholdMs + 1,
@@ -2069,6 +2221,15 @@ function runVerifierSelfTest() {
     'verifier self-test rejects Skill outputs with drifted bundle scope',
     skillOutputEvidenceIssues(driftedSkillOutputBundleScope).includes('skillOutput.bundleScopeRunId must match skillOutput.runId'),
     skillOutputEvidenceIssues(driftedSkillOutputBundleScope),
+  );
+  const driftedSkillOutputTimeline = {
+    ...passedSummary.evidence.skillOutput,
+    bundleTimelineRunId: 'other-run',
+  };
+  assert(
+    'verifier self-test rejects Skill outputs with drifted bundle timeline',
+    skillOutputEvidenceIssues(driftedSkillOutputTimeline).includes('skillOutput.bundleTimelineRunId must match skillOutput.runId'),
+    skillOutputEvidenceIssues(driftedSkillOutputTimeline),
   );
   const driftedSkillOutputDescribe = {
     ...passedSummary.evidence.skillOutput,
@@ -2177,6 +2338,12 @@ function runVerifierSelfTest() {
       agentId,
       sessionId,
     },
+    timeline: {
+      traceId: passedSummary.evidence.traceId,
+      runId,
+      sessionId,
+      items: [{ eventId: passedSummary.evidence.eventId }],
+    },
     events: [{ eventId: passedSummary.evidence.eventId }],
     summary: { eventCount: passedSummary.evidence.bundleEventCount },
   };
@@ -2235,6 +2402,20 @@ function runVerifierSelfTest() {
       'bundle.scope.bundleScopeRunId must match skillOutput.runId',
     ),
     evidenceBundleBindingIssues(driftedBundleScope, passedSummary.evidence.skillOutput, passedSummary.evidence.eventId),
+  );
+  const driftedBundleTimeline = {
+    ...passedBundle,
+    timeline: {
+      ...passedBundle.timeline,
+      runId: 'other-run',
+    },
+  };
+  assert(
+    'verifier self-test rejects Evidence Bundle timeline drift',
+    evidenceBundleBindingIssues(driftedBundleTimeline, passedSummary.evidence.skillOutput, passedSummary.evidence.eventId).includes(
+      'bundle.timeline.bundleTimelineRunId must match skillOutput.runId',
+    ),
+    evidenceBundleBindingIssues(driftedBundleTimeline, passedSummary.evidence.skillOutput, passedSummary.evidence.eventId),
   );
   const passedEvent = {
     eventId: passedSummary.evidence.eventId,
@@ -2932,6 +3113,7 @@ function runVerifierSelfTest() {
       runId,
       agentId,
       sessionId,
+      traceId: 'trace_failure_self_test',
       eventKind: 'SecurityAction',
       eventCategory: 'security',
       verdict: 'block',
@@ -2951,6 +3133,11 @@ function runVerifierSelfTest() {
       bundleScopeRunId: runId,
       bundleScopeAgentId: agentId,
       bundleScopeSessionId: sessionId,
+      bundleTimelineContainsEvent: true,
+      bundleTimelineEventCount: 1,
+      bundleTimelineTraceId: 'trace_failure_self_test',
+      bundleTimelineRunId: runId,
+      bundleTimelineSessionId: sessionId,
     },
   );
   assert('verifier self-test accepts the failed summary contract', verifierSummaryIssues(failedSummary).length === 0, verifierSummaryIssues(failedSummary));
@@ -3438,6 +3625,23 @@ function runVerifierSelfTest() {
       'recorded failure evidence.bundleScopeRunId must match event.runId',
     ),
     verifierSummaryIssues(driftedFailureBundleScopeSummary),
+  );
+  const driftedFailureBundleTimelineSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      bundleTimelineRunId: 'other-run',
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence with drifted bundle timeline',
+    verifierSummaryIssues(driftedFailureBundleTimelineSummary).includes(
+      'recorded failure evidence.bundleTimelineRunId must match event.runId',
+    ),
+    verifierSummaryIssues(driftedFailureBundleTimelineSummary),
   );
 
   const requiredWarningFailureEvidence = {
@@ -4108,6 +4312,23 @@ function runVerifierSelfTest() {
     ),
     verifierSummaryIssues(mismatchedBundleScopeSummary),
   );
+  const mismatchedBundleTimelineSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        bundleTimelineRunId: 'other-run',
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects mismatched Evidence Bundle timeline',
+    verifierSummaryIssues(mismatchedBundleTimelineSummary).includes(
+      'passed summary bundleTimelineRunId must match skillOutput.bundleTimelineRunId',
+    ),
+    verifierSummaryIssues(mismatchedBundleTimelineSummary),
+  );
   const driftedBundleSchemaSummary = {
     ...passedSummary,
     evidence: {
@@ -4287,6 +4508,20 @@ function runVerifierSelfTest() {
     ),
     verifierSummaryIssues(driftedWarningBundleScopeSummary),
   );
+  const driftedWarningBundleTimelineSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      bundleTimelineRunId: 'other-run',
+    },
+  };
+  assert(
+    'verifier self-test rejects warning bundle timeline drift',
+    verifierSummaryIssues(driftedWarningBundleTimelineSummary).includes(
+      'triggered warning.bundleTimelineRunId must match warning.runId',
+    ),
+    verifierSummaryIssues(driftedWarningBundleTimelineSummary),
+  );
   const staleUntriggeredWarningListedCountSummary = {
     ...passedSummary,
     warning: {
@@ -4344,6 +4579,26 @@ function runVerifierSelfTest() {
     'verifier self-test rejects stale warning bundle scope when warning is not triggered',
     verifierSummaryIssues(staleUntriggeredWarningScopeSummary).includes('untriggered warning.bundleScopeRunId must be absent'),
     verifierSummaryIssues(staleUntriggeredWarningScopeSummary),
+  );
+  const staleUntriggeredWarningTimelineSummary = {
+    ...passedSummary,
+    warning: {
+      required: false,
+      triggered: false,
+      thresholdMs: nearTimeoutThresholdMs,
+      bundleTimelineRunId: runId,
+    },
+    timings: {
+      ...passedSummary.timings,
+      skill: 0,
+    },
+  };
+  assert(
+    'verifier self-test rejects stale warning bundle timeline when warning is not triggered',
+    verifierSummaryIssues(staleUntriggeredWarningTimelineSummary).includes(
+      'untriggered warning.bundleTimelineRunId must be absent',
+    ),
+    verifierSummaryIssues(staleUntriggeredWarningTimelineSummary),
   );
   const duplicateWarningRowsSummary = {
     ...passedSummary,
@@ -4881,6 +5136,7 @@ async function main() {
         runId: event.runId,
         agentId: event.agentId,
         sessionId: event.sessionId,
+        traceId: event.traceId,
         eventKind: event.eventKind,
         eventCategory: event.eventCategory,
         verdict: event.verdict,
@@ -4891,6 +5147,7 @@ async function main() {
         bundleListedEventCount: Array.isArray(bundle.events) ? bundle.events.length : undefined,
         bundlePrimaryEventId: bundlePrimaryEventId(bundle),
         ...bundleScopeEvidence(bundle),
+        ...bundleTimelineEvidence(bundle, event.eventId),
         persistedVerifierAttributes: persistedVerifierAttributeEvidence(event.attributes),
         persistedSkillAttributes: persistedSkillAttributeEvidence(event.attributes),
         persistedPreflightAttributes: persistedPreflightAttributeEvidence(event.attributes),
@@ -4901,6 +5158,7 @@ async function main() {
           runId: skillOutput.runId,
           agentId: skillOutput.agentId,
           sessionId: skillOutput.sessionId,
+          traceId: skillOutput.traceId,
           eventKind: skillOutput.eventKind,
           eventCategory: skillOutput.eventCategory,
           verdict: skillOutput.verdict,
@@ -4920,6 +5178,11 @@ async function main() {
           bundleScopeRunId: skillOutput.bundleScopeRunId,
           bundleScopeAgentId: skillOutput.bundleScopeAgentId,
           bundleScopeSessionId: skillOutput.bundleScopeSessionId,
+          bundleTimelineContainsEvent: skillOutput.bundleTimelineContainsEvent,
+          bundleTimelineEventCount: skillOutput.bundleTimelineEventCount,
+          bundleTimelineTraceId: skillOutput.bundleTimelineTraceId,
+          bundleTimelineRunId: skillOutput.bundleTimelineRunId,
+          bundleTimelineSessionId: skillOutput.bundleTimelineSessionId,
           queriedBack: skillOutput.queriedBack,
           timings: skillOutput.timings,
         },
@@ -4945,6 +5208,7 @@ async function main() {
         bundleListedEventCount: warningEvent && Array.isArray(bundle.events) ? bundle.events.length : undefined,
         bundlePrimaryEventId: warningEvent ? bundlePrimaryEventId(bundle) : undefined,
         ...(warningEvent ? bundleScopeEvidence(bundle) : {}),
+        ...(warningEvent ? bundleTimelineEvidence(bundle, event.eventId) : {}),
         persistedVerifierAttributes: warningEvent ? persistedVerifierAttributeEvidence(warningEvent.attributes) : undefined,
         persistedTimingAttributes: warningEvent ? persistedTimingAttributeEvidence(warningEvent.attributes, timings) : undefined,
         isolation: warningEvent?.verifierIsolation,

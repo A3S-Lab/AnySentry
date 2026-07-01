@@ -172,7 +172,11 @@ if (
   bundle.scope?.workspacePath !== workspacePath ||
   bundle.scope?.runId !== runId ||
   bundle.scope?.agentId !== agentId ||
-  bundle.scope?.sessionId !== sessionId
+  bundle.scope?.sessionId !== sessionId ||
+  !bundle.timeline?.items?.some((item) => item.eventId === eventId) ||
+  bundle.timeline?.traceId !== event.traceId ||
+  bundle.timeline?.runId !== runId ||
+  bundle.timeline?.sessionId !== sessionId
 ) {
   throw new Error(`buildEvidenceBundle did not include the recorded event: ${JSON.stringify(bundle)}`);
 }
@@ -197,6 +201,12 @@ console.log(
     bundleScopeRunId: bundle.scope?.runId,
     bundleScopeAgentId: bundle.scope?.agentId,
     bundleScopeSessionId: bundle.scope?.sessionId,
+    bundleTimelineContainsEvent: bundle.timeline?.items?.some((item) => item.eventId === eventId) === true,
+    bundleTimelineEventCount: Array.isArray(bundle.timeline?.items) ? bundle.timeline.items.length : undefined,
+    bundleTimelineTraceId: bundle.timeline?.traceId,
+    bundleTimelineRunId: bundle.timeline?.runId,
+    bundleTimelineSessionId: bundle.timeline?.sessionId,
+    traceId: event.traceId,
     eventKind: event.eventKind,
     eventCategory: event.eventCategory,
     verdict: event.verdict ?? recorded.items?.[0]?.verdict,
