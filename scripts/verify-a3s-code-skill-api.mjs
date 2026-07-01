@@ -13,11 +13,18 @@ const model = process.env.A3S_TEST_MODEL ?? process.env.A3S_CODE_MODEL ?? 'opena
 const aclPath = process.env.A3S_CODE_ACL ?? path.join(process.env.HOME ?? '', '.a3s/config.acl');
 const sdkBase = process.env.A3S_CODE_SDK_BASE ?? path.resolve(repoRoot, '../os/apps/api');
 const skillRoot = path.join(repoRoot, 'integrations/skills');
-const skillTimeoutMs = Number(process.env.A3S_CODE_SKILL_TIMEOUT_MS ?? '240000');
 const runId = process.env.ANYSENTRY_A3S_CODE_TEST_RUN_ID ?? safeProbeId('a3s-code-skill-itest');
 const agentId = process.env.ANYSENTRY_A3S_CODE_TEST_AGENT_ID ?? 'a3s-code-skill-itest';
 const sessionId = `${runId}-session`;
 const workspacePath = 'repo://anysentry/a3s-code-skill-itest';
+
+function positiveIntEnv(name, fallback, max) {
+  const parsed = Number(process.env[name]);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(Math.floor(parsed), max);
+}
+
+const skillTimeoutMs = positiveIntEnv('A3S_CODE_SKILL_TIMEOUT_MS', 240000, 900000);
 
 function fail(message, details) {
   console.error(`FAIL ${message}`);
@@ -41,17 +48,28 @@ function compact(value, limit = 2400) {
   return text.length > limit ? `${text.slice(0, limit)}... [truncated]` : text;
 }
 
-async function withTimeout(label, promise, timeoutMs) {
+async function withTimeout(label, task, timeoutMs, onTimeout) {
   let timer;
+  let timedOut = false;
+  const work = Promise.resolve().then(task);
   try {
     return await Promise.race([
-      promise,
+      work,
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+        timer = setTimeout(() => {
+          timedOut = true;
+          Promise.resolve()
+            .then(() => onTimeout?.())
+            .catch((error) => {
+              console.error(`Unable to stop timed-out ${label}: ${error instanceof Error ? error.message : String(error)}`);
+            })
+            .finally(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)));
+        }, timeoutMs);
       }),
     ]);
   } finally {
     if (timer) clearTimeout(timer);
+    if (timedOut) work.catch(() => undefined);
   }
 }
 
@@ -303,6 +321,13 @@ async function main() {
     maxToolRounds: 20,
     toolTimeoutMs: skillTimeoutMs,
   });
+  let sessionClosed = false;
+  async function closeSession(reason) {
+    if (sessionClosed) return;
+    sessionClosed = true;
+    await Promise.resolve(session.close?.());
+    console.error(`Closed a3s-code session after ${reason}`);
+  }
 
   try {
     const toolNames = session.toolNames();
@@ -312,8 +337,9 @@ async function main() {
     try {
       search = await withTimeout(
         'a3s-code search_skills tool invocation',
-        session.tool('search_skills', { query: 'AnySentry progressive API', limit: 5 }),
+        () => session.tool('search_skills', { query: 'AnySentry progressive API', limit: 5 }),
         Math.min(skillTimeoutMs, 60000),
+        () => closeSession('search_skills timeout'),
       );
     } catch (error) {
       await recordFailureEvidence('search_skills tool invocation failed or timed out', error instanceof Error ? error.message : String(error));
@@ -325,11 +351,12 @@ async function main() {
     try {
       result = await withTimeout(
         'a3s-code Skill tool invocation',
-        session.tool('Skill', {
+        () => session.tool('Skill', {
           skill_name: 'anysentry-api',
           prompt: buildSkillPrompt(),
         }),
         skillTimeoutMs,
+        () => closeSession('Skill timeout'),
       );
     } catch (error) {
       await recordFailureEvidence('Skill tool invocation failed or timed out', error instanceof Error ? error.message : String(error));
@@ -371,7 +398,7 @@ async function main() {
       ),
     );
   } finally {
-    session.close?.();
+    await closeSession('verification completion');
   }
 
   if (process.exitCode) {
