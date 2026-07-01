@@ -179,6 +179,9 @@ function successfulEvidenceIssues(summary, context) {
   if (!isNonEmptyString(summary.evidence?.skillOutput?.agentId)) {
     issues.push(`${context} evidence.skillOutput.agentId must be a non-empty string`);
   }
+  if (!isNonEmptyString(summary.evidence?.skillOutput?.sessionId)) {
+    issues.push(`${context} evidence.skillOutput.sessionId must be a non-empty string`);
+  }
   if (!isNonEmptyString(summary.evidence?.skillOutput?.bundleId)) {
     issues.push(`${context} evidence.skillOutput.bundleId must be a non-empty string`);
   }
@@ -207,11 +210,17 @@ function successfulEvidenceIssues(summary, context) {
   if (summary.evidence?.agentId !== summary.evidence?.skillOutput?.agentId) {
     issues.push(`${context} evidence.agentId must match skillOutput.agentId`);
   }
+  if (summary.evidence?.sessionId !== summary.evidence?.skillOutput?.sessionId) {
+    issues.push(`${context} evidence.sessionId must match skillOutput.sessionId`);
+  }
   if (summary.target?.runId !== summary.evidence?.skillOutput?.runId) {
     issues.push(`${context} target.runId must match skillOutput.runId`);
   }
   if (summary.target?.agentId !== summary.evidence?.skillOutput?.agentId) {
     issues.push(`${context} target.agentId must match skillOutput.agentId`);
+  }
+  if (summary.target?.sessionId !== summary.evidence?.skillOutput?.sessionId) {
+    issues.push(`${context} target.sessionId must match skillOutput.sessionId`);
   }
   if (summary.evidence?.bundleId !== summary.evidence?.skillOutput?.bundleId) {
     issues.push(`${context} bundleId must match skillOutput.bundleId`);
@@ -872,6 +881,7 @@ function runVerifierSelfTest() {
         eventId: 'evt_self_test',
         runId,
         agentId,
+        sessionId,
         eventKind: 'LlmCall',
         eventCategory: 'llm',
         verdict: 'allow',
@@ -959,6 +969,21 @@ function runVerifierSelfTest() {
     'verifier self-test rejects Skill output run identity drift',
     verifierSummaryIssues(driftedSkillRunSummary).includes('passed summary target.runId must match skillOutput.runId'),
     verifierSummaryIssues(driftedSkillRunSummary),
+  );
+  const driftedSkillSessionSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        sessionId: 'other-session',
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects Skill output session identity drift',
+    verifierSummaryIssues(driftedSkillSessionSummary).includes('passed summary target.sessionId must match skillOutput.sessionId'),
+    verifierSummaryIssues(driftedSkillSessionSummary),
   );
   const mismatchedWarningRequirementSummary = {
     ...passedSummary,
@@ -1675,6 +1700,7 @@ console.log(JSON.stringify({
   timings: flowTimings,
   runId,
   agentId,
+  sessionId,
 }));
 `.trim();
 }
@@ -1907,6 +1933,7 @@ async function main() {
       typeof skillOutput.bundleId === 'string' &&
       skillOutput.runId === runId &&
       skillOutput.agentId === agentId &&
+      skillOutput.sessionId === sessionId &&
       skillOutput.eventKind === 'LlmCall' &&
       skillOutput.eventCategory === 'llm' &&
       skillOutput.verdict === 'allow' &&
@@ -1915,7 +1942,7 @@ async function main() {
     if (!outputMatchesRun) {
       timings.elapsed = durationMs(verifierStartedAt);
       const reason = 'skill output did not match the verifier run';
-      const details = { skillOutput, runId, agentId };
+      const details = { skillOutput, runId, agentId, sessionId };
       const failureTimings = {
         ...timings,
         failurePhase: 'skill_output',
@@ -2091,6 +2118,7 @@ async function main() {
           eventId: skillOutput.eventId,
           runId: skillOutput.runId,
           agentId: skillOutput.agentId,
+          sessionId: skillOutput.sessionId,
           eventKind: skillOutput.eventKind,
           eventCategory: skillOutput.eventCategory,
           verdict: skillOutput.verdict,
