@@ -129,6 +129,16 @@ function isPositiveInteger(value) {
   return Number.isInteger(value) && value > 0;
 }
 
+function evidenceFieldMismatchIssues(prefix, actual, expected, fields) {
+  const issues = [];
+  for (const field of fields) {
+    if (actual?.[field] !== expected?.[field]) {
+      issues.push(`${prefix}.${field} must match failure.evidence.${field}`);
+    }
+  }
+  return issues;
+}
+
 function verifierSummaryIssues(summary) {
   const issues = [];
   if (!isRecord(summary)) return ['summary must be an object'];
@@ -202,6 +212,27 @@ function verifierSummaryIssues(summary) {
     if (typeof summary.warning?.required !== 'boolean') issues.push('warning.required must be a boolean');
     if (typeof summary.warning?.triggered !== 'boolean') issues.push('warning.triggered must be a boolean');
     if (!isFiniteNumber(summary.warning?.thresholdMs) || summary.warning.thresholdMs <= 0) issues.push('warning.thresholdMs must be a positive number');
+    if (summary.status === 'failed' && summary.warning?.required === true && summary.warning?.triggered === false) {
+      if (!isRecord(summary.warning?.failure)) {
+        issues.push('failed warning.failure must be an object when required warning is missing');
+      } else if (!isRecord(summary.warning.failure.evidence)) {
+        issues.push('failed warning.failure.evidence must be an object when required warning is missing');
+      } else {
+        issues.push(
+          ...evidenceFieldMismatchIssues('failed warning.failure.evidence', summary.warning.failure.evidence, summary.failure?.evidence, [
+            'recorded',
+            'eventId',
+            'eventKind',
+            'eventCategory',
+            'verdict',
+            'riskCategory',
+            'bundleId',
+            'bundleEventCount',
+            'error',
+          ]),
+        );
+      }
+    }
     if (summary.warning?.triggered === true) {
       if (!isNonEmptyString(summary.warning?.eventId)) issues.push('triggered warning.eventId must be a non-empty string');
       if (!isNonEmptyString(summary.warning?.bundleId)) issues.push('triggered warning.bundleId must be a non-empty string');
@@ -816,6 +847,49 @@ function runVerifierSelfTest() {
       'recorded failure evidence.bundleEventCount must be a positive integer',
     ),
     verifierSummaryIssues(missingFailureBundleCountSummary),
+  );
+
+  const requiredWarningFailureSummary = {
+    ...failedSummary,
+    failure: {
+      ...failedSummary.failure,
+      phase: 'near_timeout_warning',
+      reason: 'required near-timeout warning was not emitted',
+    },
+    warning: {
+      required: true,
+      triggered: false,
+      thresholdMs: 100,
+      failure: {
+        evidence: failedSummary.failure.evidence,
+      },
+    },
+  };
+  assert(
+    'verifier self-test accepts required-warning failures bound to top-level evidence',
+    verifierSummaryIssues(requiredWarningFailureSummary).length === 0,
+    verifierSummaryIssues(requiredWarningFailureSummary),
+  );
+
+  const driftedWarningFailureSummary = {
+    ...requiredWarningFailureSummary,
+    warning: {
+      ...requiredWarningFailureSummary.warning,
+      failure: {
+        ...requiredWarningFailureSummary.warning.failure,
+        evidence: {
+          ...requiredWarningFailureSummary.warning.failure.evidence,
+          eventId: 'evt_other_failure',
+        },
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects warning failure evidence drift',
+    verifierSummaryIssues(driftedWarningFailureSummary).includes(
+      'failed warning.failure.evidence.eventId must match failure.evidence.eventId',
+    ),
+    verifierSummaryIssues(driftedWarningFailureSummary),
   );
 
   const unrecordedFailureSummary = failureSummary(
