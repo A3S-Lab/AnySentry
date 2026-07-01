@@ -334,8 +334,9 @@ The a3s-code verifier also wraps Skill calls with `A3S_CODE_SKILL_TIMEOUT_MS`;
 timeouts, max-tool-round failures, and invalid Skill results are recorded as
 `SecurityFinding` events through `recordSecurityEvents`, so failed soak attempts
 remain queryable and bundleable. Timeout handling closes the a3s-code session
-before writing failure evidence, so the failed probe does not keep consuming
-model or tool resources in the background. Coding-agent producer aliases such as
+before writing failure evidence, and `A3S_CODE_SESSION_CLOSE_TIMEOUT_MS` bounds
+that cleanup so a stuck close cannot suppress the failure finding. Coding-agent
+producer aliases such as
 `NetworkEgress`, `FileRead`, `FileWrite`, and `SecurityFinding` are normalized to
 the canonical AnySentry kinds `Egress`, `FileAccess`, and `SecurityAction`.
 Producer-reported `SecurityFinding` and `progressive.failure=true` events are

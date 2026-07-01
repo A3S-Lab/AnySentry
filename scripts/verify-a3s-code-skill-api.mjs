@@ -25,6 +25,7 @@ function positiveIntEnv(name, fallback, max) {
 }
 
 const skillTimeoutMs = positiveIntEnv('A3S_CODE_SKILL_TIMEOUT_MS', 240000, 900000);
+const sessionCloseTimeoutMs = positiveIntEnv('A3S_CODE_SESSION_CLOSE_TIMEOUT_MS', 5000, 60000);
 
 function fail(message, details) {
   console.error(`FAIL ${message}`);
@@ -51,26 +52,33 @@ function compact(value, limit = 2400) {
 async function withTimeout(label, task, timeoutMs, onTimeout) {
   let timer;
   let timedOut = false;
+  let settled = false;
   const work = Promise.resolve().then(task);
-  try {
-    return await Promise.race([
-      work,
-      new Promise((_, reject) => {
-        timer = setTimeout(() => {
-          timedOut = true;
-          Promise.resolve()
-            .then(() => onTimeout?.())
-            .catch((error) => {
-              console.error(`Unable to stop timed-out ${label}: ${error instanceof Error ? error.message : String(error)}`);
-            })
-            .finally(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)));
-        }, timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-    if (timedOut) work.catch(() => undefined);
-  }
+  return await new Promise((resolve, reject) => {
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      fn(value);
+    };
+    work.then(
+      (value) => {
+        if (!timedOut) settle(resolve, value);
+      },
+      (error) => {
+        if (!timedOut) settle(reject, error);
+      },
+    );
+    timer = setTimeout(() => {
+      timedOut = true;
+      Promise.resolve()
+        .then(() => onTimeout?.())
+        .catch((error) => {
+          console.error(`Unable to stop timed-out ${label}: ${error instanceof Error ? error.message : String(error)}`);
+        })
+        .finally(() => settle(reject, new Error(`${label} timed out after ${timeoutMs}ms`)));
+    }, timeoutMs);
+  });
 }
 
 async function recordFailureEvidence(reason, details) {
@@ -325,8 +333,27 @@ async function main() {
   async function closeSession(reason) {
     if (sessionClosed) return;
     sessionClosed = true;
-    await Promise.resolve(session.close?.());
-    console.error(`Closed a3s-code session after ${reason}`);
+    let closeTimer;
+    const closeWork = Promise.resolve().then(() => session.close?.());
+    try {
+      await Promise.race([
+        closeWork,
+        new Promise((_, reject) => {
+          closeTimer = setTimeout(
+            () => reject(new Error(`a3s-code session close timed out after ${sessionCloseTimeoutMs}ms`)),
+            sessionCloseTimeoutMs,
+          );
+        }),
+      ]);
+      console.error(`Closed a3s-code session after ${reason}`);
+    } catch (error) {
+      console.error(
+        `Timed out or failed closing a3s-code session after ${reason}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      if (closeTimer) clearTimeout(closeTimer);
+      closeWork.catch(() => undefined);
+    }
   }
 
   try {
