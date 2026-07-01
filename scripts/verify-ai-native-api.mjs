@@ -428,6 +428,19 @@ async function verifyRuntimeContract() {
             status: 'failed',
             subject: 'runner failure finding should canonicalize to SecurityAction',
           },
+          {
+            kind: 'RuntimeEvent',
+            runtimeKind: 'near_timeout',
+            workspacePath: aliasWorkspacePath,
+            agentId: aliasAgentId,
+            sessionId: aliasSessionId,
+            runId: aliasRunId,
+            subject: 'verifier near-timeout warning should remain runtime evidence',
+            attributes: {
+              'progressive.warning': 'near_timeout',
+              'progressive.warning.eventId': 'evt_previous',
+            },
+          },
         ],
       },
     }),
@@ -435,7 +448,7 @@ async function verifyRuntimeContract() {
   const aliasEventIds = aliasRecorded?.items?.map((item) => item.eventId).filter(Boolean) ?? [];
   assert(
     'runtime recordSecurityEvents accepts coding-agent alias event kinds',
-    aliasRecorded?.accepted === true && aliasRecorded?.acceptedEvents === 4 && aliasEventIds.length === 4,
+    aliasRecorded?.accepted === true && aliasRecorded?.acceptedEvents === 5 && aliasEventIds.length === 5,
     aliasRecorded,
   );
 
@@ -450,7 +463,15 @@ async function verifyRuntimeContract() {
   const aliasKinds = aliasEvents.map((event) => event.eventKind);
   assert(
     'runtime canonicalizes coding-agent aliases into supported event kinds',
-    aliasKinds.includes('Egress') && aliasKinds.filter((kind) => kind === 'FileAccess').length === 2 && aliasKinds.includes('SecurityAction'),
+    aliasKinds.includes('Egress') &&
+      aliasKinds.filter((kind) => kind === 'FileAccess').length === 2 &&
+      aliasKinds.includes('SecurityAction') &&
+      aliasKinds.includes('RuntimeEvent'),
+    aliasEvents,
+  );
+  assert(
+    'runtime verifier warnings remain allow-level runtime evidence',
+    aliasEvents.some((event) => event.eventKind === 'RuntimeEvent' && event.eventCategory === 'runtime' && event.verdict === 'allow'),
     aliasEvents,
   );
   assert(

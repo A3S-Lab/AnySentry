@@ -96,6 +96,7 @@ function eventCategory(kind: string): T.EventCategory {
   if (kind === 'LlmCall' || kind === 'LlmApi') return 'llm';
   if (kind === 'SecurityAction') return 'security';
   if (kind === 'ProcessExit') return 'process';
+  if (kind === 'RuntimeEvent') return 'runtime';
   return 'unknown';
 }
 

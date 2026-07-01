@@ -83,6 +83,7 @@ function eventCategory(kind: string): EventCategory {
   if (kind === 'LlmCall' || kind === 'LlmApi') return 'llm';
   if (kind === 'SecurityAction') return 'security';
   if (kind === 'ProcessExit') return 'process';
+  if (kind === 'RuntimeEvent') return 'runtime';
   return 'unknown';
 }
 
@@ -131,7 +132,19 @@ const HOSTILE: Array<() => Sample> = [
 // Every a3s-observer signal kind. The 6 security kinds are judged by sentry; the rest
 // (LlmCall/LlmApi/FileDelete/ProcessExit) sentry returns null for — we still record them so the
 // dashboard counts ALL observer features.
-const OBSERVER_KINDS = new Set(['ToolExec', 'ProcessExit', 'Egress', 'Dns', 'LlmCall', 'FileAccess', 'FileDelete', 'SslContent', 'LlmApi', 'SecurityAction']);
+const OBSERVER_KINDS = new Set([
+  'ToolExec',
+  'ProcessExit',
+  'Egress',
+  'Dns',
+  'LlmCall',
+  'FileAccess',
+  'FileDelete',
+  'SslContent',
+  'LlmApi',
+  'SecurityAction',
+  'RuntimeEvent',
+]);
 
 /** Real LLM token usage from an LlmApi event (prompt + completion); 0 for every other kind. */
 function extractTokens(line: string, kind: string): number {

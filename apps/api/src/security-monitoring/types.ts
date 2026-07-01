@@ -131,6 +131,7 @@ export interface UniversalIngestEvent extends Partial<EventMeta> {
   promptTokens?: string | number;
   completionTokens?: string | number;
   status?: string | number;
+  runtimeKind?: string;
   raw?: unknown;
 }
 export interface UniversalIngestRequest extends Partial<EventMeta> {

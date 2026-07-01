@@ -251,7 +251,8 @@ async function recordNearTimeoutWarning(event, bundle, timings) {
         sessionId,
         events: [
           {
-            kind: 'LlmCall',
+            kind: 'RuntimeEvent',
+            runtimeKind: 'near_timeout',
             workspacePath,
             agentId,
             sessionId,
@@ -282,7 +283,7 @@ async function recordNearTimeoutWarning(event, bundle, timings) {
   if (!warningEvent?.eventId) {
     throw new Error(`near-timeout warning evidence did not become queryable: ${compact({ recorded, warningEvent })}`);
   }
-  if (warningEvent.verdict !== 'allow') {
+  if (warningEvent.verdict !== 'allow' || warningEvent.eventKind !== 'RuntimeEvent' || warningEvent.eventCategory !== 'runtime') {
     throw new Error(`near-timeout warning should remain allow evidence: ${compact(warningEvent)}`);
   }
   const warningAttrs = warningEvent.attributes ?? {};

@@ -62,6 +62,7 @@ function eventCategory(kind: string): T.EventCategory {
   if (kind === 'LlmCall' || kind === 'LlmApi') return 'llm';
   if (kind === 'SecurityAction') return 'security';
   if (kind === 'ProcessExit') return 'process';
+  if (kind === 'RuntimeEvent') return 'runtime';
   return 'unknown';
 }
 
@@ -813,6 +814,11 @@ function canonicalEventKind(input: T.UniversalIngestEvent): string {
     process: 'ProcessExit',
     process_exit: 'ProcessExit',
     processexit: 'ProcessExit',
+    runtime: 'RuntimeEvent',
+    runtime_event: 'RuntimeEvent',
+    runtimeevent: 'RuntimeEvent',
+    verifier_warning: 'RuntimeEvent',
+    verifierwarning: 'RuntimeEvent',
   };
   if (key && aliases[key]) return aliases[key];
   if (raw) return raw;
@@ -857,6 +863,12 @@ function eventInner(kind: string, input: T.UniversalIngestEvent): Record<string,
   }
   if (kind === 'SslContent') return { ...base, content: cleanString(input.content ?? input.data ?? eventAttr(input, 'content') ?? eventAttr(input, 'data'), 1000) ?? '' };
   if (kind === 'SecurityAction') return { ...base, kind: cleanString(input.kind ?? input.status ?? eventAttr(input, 'kind') ?? eventAttr(input, 'status'), 240) ?? 'security' };
+  if (kind === 'RuntimeEvent') {
+    return {
+      ...base,
+      kind: cleanString(input.runtimeKind ?? input.status ?? eventAttr(input, 'runtimeKind') ?? eventAttr(input, 'progressive.warning'), 240) ?? 'runtime',
+    };
+  }
   if (kind === 'ProcessExit') return { ...base, status: finiteNumber(input.status ?? eventAttr(input, 'status')) ?? 0 };
   return { ...base, ...sanitizeEventAttributes(input.attributes) };
 }
@@ -1315,6 +1327,7 @@ const SECURITY_RECORD_EVENT_SCHEMA: Record<string, unknown> = {
     endpoint: { type: 'string' },
     content: { type: 'string' },
     data: { type: 'string' },
+    runtimeKind: { type: 'string' },
     verdict: { type: 'string', enum: SECURITY_VERDICTS },
     severity: { type: 'string', enum: SECURITY_SEVERITIES },
     attributes: { type: 'object', additionalProperties: EVENT_ATTRIBUTE_VALUE_SCHEMA },
