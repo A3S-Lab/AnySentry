@@ -165,7 +165,14 @@ const bundle = await timed('innerBundleMs', () =>
 if (
   bundle?.schemaVersion !== 'anysentry.evidence_bundle.v1' ||
   !bundle.events?.some((item) => item.eventId === eventId) ||
-  bundle.primary?.event?.eventId !== eventId
+  bundle.primary?.event?.eventId !== eventId ||
+  bundle.scope?.primaryType !== 'event' ||
+  bundle.scope?.primaryId !== eventId ||
+  bundle.scope?.eventId !== eventId ||
+  bundle.scope?.workspacePath !== workspacePath ||
+  bundle.scope?.runId !== runId ||
+  bundle.scope?.agentId !== agentId ||
+  bundle.scope?.sessionId !== sessionId
 ) {
   throw new Error(`buildEvidenceBundle did not include the recorded event: ${JSON.stringify(bundle)}`);
 }
@@ -183,6 +190,13 @@ console.log(
     bundleEventCount: bundle.summary?.eventCount,
     bundleListedEventCount: Array.isArray(bundle.events) ? bundle.events.length : undefined,
     bundlePrimaryEventId: bundle.primary?.event?.eventId,
+    bundleScopePrimaryType: bundle.scope?.primaryType,
+    bundleScopePrimaryId: bundle.scope?.primaryId,
+    bundleScopeEventId: bundle.scope?.eventId,
+    bundleScopeWorkspacePath: bundle.scope?.workspacePath,
+    bundleScopeRunId: bundle.scope?.runId,
+    bundleScopeAgentId: bundle.scope?.agentId,
+    bundleScopeSessionId: bundle.scope?.sessionId,
     eventKind: event.eventKind,
     eventCategory: event.eventCategory,
     verdict: event.verdict ?? recorded.items?.[0]?.verdict,

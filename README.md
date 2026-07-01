@@ -392,6 +392,10 @@ true, `warning.bundleEventCount` must match the success bundle summary count,
 and `warning.bundleListedEventCount` must match the success bundle's listed
 event count. `warning.bundlePrimaryEventId` must match the success evidence
 event, proving the shared bundle's primary event is the warning source event.
+The warning bundle scope fields (`bundleScopePrimaryType`,
+`bundleScopePrimaryId`, `bundleScopeEventId`, `bundleScopeWorkspacePath`,
+`bundleScopeRunId`, `bundleScopeAgentId`, and `bundleScopeSessionId`) must match
+the success evidence bundle scope.
 Success summaries also include the inner Skill output health/list/describe
 proofs, event, workspace, run, agent, session, bundle IDs, and inner API timing
 fields under `evidence.skillOutput`, and the verifier fails if those proofs do
@@ -425,7 +429,10 @@ count drift from listed-member drift without rebuilding the bundle. The
 contract also exposes `bundlePrimaryEventId`, which must match the stored event
 ID in both the outer evidence and the Skill output, so summary-only automation
 can detect bundles whose primary event drifted even when the event is still
-listed.
+listed. Bundle scope fields are also exposed and must bind to the same
+event/workspace/run/agent/session identity in both the outer evidence and the
+Skill output, so automation can reject bundles built with a stale or cross-run
+scope.
 Failed summaries always include explicit `failure.details` plus a failure
 evidence status, either with the recorded event/bundle IDs or with
 `recorded=false` plus the reason evidence was not written; these states are
@@ -446,7 +453,9 @@ and running verifier metadata plus `workspacePath`, `runId`, `agentId`, and
 Recorded failure bundles must use schema `anysentry.evidence_bundle.v1`, must
 include the failure event, and must report positive Evidence Bundle summary and
 listed event counts, with the listed count not exceeding the summary count. They
-must also expose `bundlePrimaryEventId` matching the recorded failure event.
+must also expose `bundlePrimaryEventId` matching the recorded failure event and
+bundle scope fields bound to that failure event's workspace, run, agent, and
+session identity.
 When a required near-timeout warning is missing, the nested
 `warning.failure.evidence` must match the top-level `failure.evidence`,
 including persisted verifier and timing attribute evidence, so automation does
