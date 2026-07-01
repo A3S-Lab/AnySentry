@@ -69,9 +69,14 @@ const eventInnerTimingFields = ['innerHealthzMs', 'innerListMs', 'innerDescribeR
 const expectedProgressiveFlow = 'healthz,list,describe,execute,events-list,build-evidence-bundle';
 const expectedDescribedOperation = 'recordSecurityEvents';
 const skillOutputPreflightBindings = [
-  { field: 'healthOk', attribute: 'progressive.verifier.healthOk', expected: true },
-  { field: 'listed', attribute: 'progressive.verifier.listed', expected: true },
-  { field: 'described', attribute: 'progressive.verifier.describedOperation', expected: expectedDescribedOperation },
+  { field: 'healthOk', summaryField: 'healthOk', attribute: 'progressive.verifier.healthOk', expected: true },
+  { field: 'listed', summaryField: 'listed', attribute: 'progressive.verifier.listed', expected: true },
+  {
+    field: 'described',
+    summaryField: 'describedOperation',
+    attribute: 'progressive.verifier.describedOperation',
+    expected: expectedDescribedOperation,
+  },
 ];
 const nearTimeoutWarningReason = 'a3s-code Skill verifier completed close to its timeout budget';
 
@@ -290,6 +295,31 @@ function eventPreflightAttributeIssues(attributes, skillOutput) {
       issues.push(`event attribute ${attribute} must be ${expectedValueText(expected)}`);
     } else if (!sameAttributeValue(attributes[attribute], skillOutput[field])) {
       issues.push(`event attribute ${attribute} must match skillOutput.${field}`);
+    }
+  }
+  return issues;
+}
+
+function persistedPreflightAttributeEvidence(attributes) {
+  if (!isRecord(attributes)) return {};
+  return Object.fromEntries(
+    skillOutputPreflightBindings.map(({ summaryField, attribute }) => [summaryField, attributes[attribute]]),
+  );
+}
+
+function persistedPreflightAttributeIssues(persistedAttributes, skillOutput, context) {
+  const issues = [];
+  if (!isRecord(persistedAttributes)) {
+    return [`${context} evidence.persistedPreflightAttributes must be an object`];
+  }
+  if (!isRecord(skillOutput)) {
+    return [`${context} evidence.skillOutput must be an object`];
+  }
+  for (const { field, summaryField, expected } of skillOutputPreflightBindings) {
+    if (!sameAttributeValue(persistedAttributes[summaryField], expected)) {
+      issues.push(`${context} evidence.persistedPreflightAttributes.${summaryField} must be ${expectedValueText(expected)}`);
+    } else if (!sameAttributeValue(persistedAttributes[summaryField], skillOutput[field])) {
+      issues.push(`${context} evidence.persistedPreflightAttributes.${summaryField} must match skillOutput.${field}`);
     }
   }
   return issues;
@@ -522,6 +552,13 @@ function successfulEvidenceIssues(summary, context) {
   if (summary.evidence?.eventKind !== 'LlmCall') issues.push(`${context} evidence.eventKind must be LlmCall`);
   if (summary.evidence?.eventCategory !== 'llm') issues.push(`${context} evidence.eventCategory must be llm`);
   if (summary.evidence?.verdict !== 'allow') issues.push(`${context} evidence.verdict must be allow`);
+  issues.push(
+    ...persistedPreflightAttributeIssues(
+      summary.evidence?.persistedPreflightAttributes,
+      summary.evidence?.skillOutput,
+      context,
+    ),
+  );
   if (!isNonEmptyString(summary.evidence?.skillOutput?.eventId)) {
     issues.push(`${context} evidence.skillOutput.eventId must be a non-empty string`);
   }
@@ -1366,6 +1403,11 @@ function runVerifierSelfTest() {
       bundleSchemaVersion: 'anysentry.evidence_bundle.v1',
       bundleContainsEvent: true,
       bundleEventCount: 1,
+      persistedPreflightAttributes: {
+        healthOk: true,
+        listed: true,
+        describedOperation: expectedDescribedOperation,
+      },
       skillOutput: {
         eventId: 'evt_self_test',
         workspacePath,
@@ -2617,6 +2659,37 @@ function runVerifierSelfTest() {
     verifierSummaryIssues(driftedEvidenceCategorySummary).includes('passed summary evidence.eventCategory must be llm'),
     verifierSummaryIssues(driftedEvidenceCategorySummary),
   );
+  const missingPersistedPreflightSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      persistedPreflightAttributes: undefined,
+    },
+  };
+  assert(
+    'verifier self-test rejects passed summaries without persisted preflight attributes',
+    verifierSummaryIssues(missingPersistedPreflightSummary).includes(
+      'passed summary evidence.persistedPreflightAttributes must be an object',
+    ),
+    verifierSummaryIssues(missingPersistedPreflightSummary),
+  );
+  const driftedPersistedPreflightSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      persistedPreflightAttributes: {
+        ...passedSummary.evidence.persistedPreflightAttributes,
+        describedOperation: 'buildEvidenceBundle',
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects persisted preflight attributes with describe drift',
+    verifierSummaryIssues(driftedPersistedPreflightSummary).includes(
+      `passed summary evidence.persistedPreflightAttributes.describedOperation must be ${expectedDescribedOperation}`,
+    ),
+    verifierSummaryIssues(driftedPersistedPreflightSummary),
+  );
   const driftedSkillOutputSummary = {
     ...passedSummary,
     evidence: {
@@ -3444,6 +3517,7 @@ async function main() {
         bundleSchemaVersion: bundle.schemaVersion,
         bundleContainsEvent: bundle.events?.some((item) => item.eventId === event.eventId) === true,
         bundleEventCount: bundle.summary?.eventCount,
+        persistedPreflightAttributes: persistedPreflightAttributeEvidence(event.attributes),
         skillOutput: {
           eventId: skillOutput.eventId,
           workspacePath: skillOutput.workspacePath,

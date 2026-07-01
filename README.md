@@ -389,8 +389,9 @@ proofs, event, workspace, run, agent, session, bundle IDs, and inner API timing
 fields under `evidence.skillOutput`, and the verifier fails if those proofs do
 not show `healthOk=true`, `listed=true`, and `described=recordSecurityEvents` or
 if the IDs do not match the target identity, rows, Evidence Bundle, or timing
-contract queried by the outer runtime. The stored success evidence row persists
-the same preflight proof attributes
+contract queried by the outer runtime. The summary also exposes
+`evidence.persistedPreflightAttributes` from the stored success row, which
+persists the same preflight proof attributes
 (`progressive.verifier.healthOk`, `progressive.verifier.listed`, and
 `progressive.verifier.describedOperation`), and the outer verifier rejects rows
 whose attributes drift from the Skill output. It also exposes
