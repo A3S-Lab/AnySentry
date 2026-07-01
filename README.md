@@ -418,9 +418,13 @@ numbers or non-empty strings, and failed summaries outside preflight and
 summary-validation must bind `timings.failurePhase` to `failure.phase`. If the
 verifier detects that its own summary violates the contract, the emitted summary
 is converted to `status=failed` with `failure.phase=summary_validation` so
-automation can trust the top-level status. Summary-validation failures are
-rebound to the running verifier commit, model, API base, run ID, agent ID, and
-session ID; stale or mismatched original identities are retained only under
+automation can trust the top-level status. Summary-validation failures must also
+carry `summaryValidation.status=failed` and a non-empty
+`summaryValidation.issues` array that exactly matches `failure.details.issues`;
+passed summaries and non-summary-validation failures must not carry stale
+`summaryValidation` payloads. Summary-validation failures are rebound to the
+running verifier commit, model, API base, run ID, agent ID, and session ID; stale
+or mismatched original identities are retained only under
 `failure.details.originalVerifier` and `failure.details.originalTarget`.
 Runtime contract failures after the Skill runs, such as missing event markers or
 Evidence Bundle drift, are recorded as phase-specific `SecurityFinding` evidence

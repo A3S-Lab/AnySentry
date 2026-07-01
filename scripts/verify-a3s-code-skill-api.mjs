@@ -184,6 +184,14 @@ function evidenceFieldMismatchIssues(prefix, actual, expected, fields) {
   return issues;
 }
 
+function stringArray(value) {
+  return Array.isArray(value) && value.every((item) => isNonEmptyString(item));
+}
+
+function sameStringArray(left, right) {
+  return stringArray(left) && stringArray(right) && left.length === right.length && left.every((item, index) => item === right[index]);
+}
+
 function skillOutputTimingIssues(timings, context) {
   const issues = [];
   if (!isRecord(timings)) {
@@ -628,6 +636,7 @@ function verifierSummaryIssues(summary) {
 
   if (summary.status === 'passed') {
     if (summary.failure) issues.push('passed summary must not include failure');
+    if (summary.summaryValidation !== undefined) issues.push('passed summary must not include summaryValidation');
     if (summary.verifier?.skill !== 'anysentry-api') issues.push('passed summary verifier.skill must be anysentry-api');
     if (!isPositiveInteger(summary.verifier?.toolCalls)) issues.push('passed summary verifier.toolCalls must be a positive integer');
     issues.push(...successfulEvidenceIssues(summary, 'passed summary'));
@@ -699,6 +708,25 @@ function verifierSummaryIssues(summary) {
     }
     if (summary.evidence !== undefined) {
       issues.push(...successfulEvidenceIssues(summary, 'failed summary'));
+    }
+    if (summary.failure?.phase === 'summary_validation') {
+      if (!isRecord(summary.summaryValidation)) {
+        issues.push('summary-validation failure must include summaryValidation');
+      } else {
+        if (summary.summaryValidation.status !== 'failed') {
+          issues.push('summaryValidation.status must be failed');
+        }
+        if (!stringArray(summary.summaryValidation.issues)) {
+          issues.push('summaryValidation.issues must be a non-empty string array');
+        } else if (summary.summaryValidation.issues.length === 0) {
+          issues.push('summaryValidation.issues must not be empty');
+        }
+        if (!sameStringArray(summary.summaryValidation.issues, summary.failure?.details?.issues)) {
+          issues.push('summaryValidation.issues must match failure.details.issues');
+        }
+      }
+    } else if (summary.summaryValidation !== undefined) {
+      issues.push('non-summary-validation failure must not include summaryValidation');
     }
   }
 
@@ -1623,8 +1651,66 @@ function runVerifierSelfTest() {
       normalizedStaleIdentitySummary.failure?.phase === 'summary_validation' &&
       normalizedStaleIdentitySummary.verifier?.commit === verifierCommit &&
       normalizedStaleIdentitySummary.target?.runId === runId &&
+      sameStringArray(normalizedStaleIdentitySummary.summaryValidation?.issues, normalizedStaleIdentitySummary.failure?.details?.issues) &&
       verifierSummaryIssues(normalizedStaleIdentitySummary).length === 0,
     { summary: normalizedStaleIdentitySummary, issues: verifierSummaryIssues(normalizedStaleIdentitySummary) },
+  );
+  const missingSummaryValidationSummary = {
+    ...normalizedStaleIdentitySummary,
+    summaryValidation: undefined,
+  };
+  assert(
+    'verifier self-test rejects summary-validation failures without summaryValidation',
+    verifierSummaryIssues(missingSummaryValidationSummary).includes('summary-validation failure must include summaryValidation'),
+    verifierSummaryIssues(missingSummaryValidationSummary),
+  );
+  const driftedSummaryValidationStatusSummary = {
+    ...normalizedStaleIdentitySummary,
+    summaryValidation: {
+      ...normalizedStaleIdentitySummary.summaryValidation,
+      status: 'passed',
+    },
+  };
+  assert(
+    'verifier self-test rejects summary-validation status drift',
+    verifierSummaryIssues(driftedSummaryValidationStatusSummary).includes('summaryValidation.status must be failed'),
+    verifierSummaryIssues(driftedSummaryValidationStatusSummary),
+  );
+  const emptySummaryValidationIssuesSummary = {
+    ...normalizedStaleIdentitySummary,
+    summaryValidation: {
+      ...normalizedStaleIdentitySummary.summaryValidation,
+      issues: [],
+    },
+  };
+  assert(
+    'verifier self-test rejects empty summary-validation issues',
+    verifierSummaryIssues(emptySummaryValidationIssuesSummary).includes('summaryValidation.issues must not be empty'),
+    verifierSummaryIssues(emptySummaryValidationIssuesSummary),
+  );
+  const driftedSummaryValidationIssuesSummary = {
+    ...normalizedStaleIdentitySummary,
+    summaryValidation: {
+      ...normalizedStaleIdentitySummary.summaryValidation,
+      issues: ['different summary issue'],
+    },
+  };
+  assert(
+    'verifier self-test rejects summary-validation issue drift',
+    verifierSummaryIssues(driftedSummaryValidationIssuesSummary).includes('summaryValidation.issues must match failure.details.issues'),
+    verifierSummaryIssues(driftedSummaryValidationIssuesSummary),
+  );
+  const stalePassedSummaryValidationSummary = {
+    ...passedSummary,
+    summaryValidation: {
+      status: 'failed',
+      issues: ['stale issue'],
+    },
+  };
+  assert(
+    'verifier self-test rejects stale summaryValidation on passed summaries',
+    verifierSummaryIssues(stalePassedSummaryValidationSummary).includes('passed summary must not include summaryValidation'),
+    verifierSummaryIssues(stalePassedSummaryValidationSummary),
   );
   const driftedSkillRunSummary = {
     ...passedSummary,
@@ -2011,6 +2097,18 @@ function runVerifierSelfTest() {
     },
   );
   assert('verifier self-test accepts the failed summary contract', verifierSummaryIssues(failedSummary).length === 0, verifierSummaryIssues(failedSummary));
+  const staleFailedSummaryValidationSummary = {
+    ...failedSummary,
+    summaryValidation: {
+      status: 'failed',
+      issues: ['stale issue'],
+    },
+  };
+  assert(
+    'verifier self-test rejects stale summaryValidation on non-summary-validation failures',
+    verifierSummaryIssues(staleFailedSummaryValidationSummary).includes('non-summary-validation failure must not include summaryValidation'),
+    verifierSummaryIssues(staleFailedSummaryValidationSummary),
+  );
 
   const passedFailureEvent = {
     eventId: failedSummary.failure.evidence.eventId,
