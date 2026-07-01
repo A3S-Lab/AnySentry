@@ -144,6 +144,43 @@ function extractTokens(line: string, kind: string): number {
   }
 }
 
+function trueAttr(value: unknown): boolean {
+  return value === true || (typeof value === 'string' && value.toLowerCase() === 'true');
+}
+
+type JudgedEventBase = Omit<
+  JudgedEvent,
+  'verdict' | 'tier' | 'severity' | 'reason' | 'actionKind' | 'actionTarget' | 'riskCategory' | 'riskName' | 'riskType' | 'riskScore'
+>;
+
+function producerReportedFinding(base: JudgedEventBase): {
+  severity: Severity;
+  reason: string;
+  riskCategory: string;
+  riskName: string;
+} | null {
+  if (base.eventKind !== 'SecurityAction' || base.source !== 'api') return null;
+  const kind = String(base.attributes.kind ?? '').trim().toLowerCase();
+  const status = String(base.attributes.status ?? '').trim().toLowerCase();
+  if (trueAttr(base.attributes['progressive.failure'])) {
+    return {
+      severity: 'medium',
+      reason: 'producer reported progressive verification failure',
+      riskCategory: 'runtime_failure',
+      riskName: 'Runtime verification failure',
+    };
+  }
+  if (kind === 'securityfinding' || kind === 'finding' || status === 'failed' || status === 'error') {
+    return {
+      severity: 'medium',
+      reason: 'producer reported security finding',
+      riskCategory: 'producer_finding',
+      riskName: 'Producer security finding',
+    };
+  }
+  return null;
+}
+
 @Injectable()
 export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   constructor(private readonly alerting: AlertingService) {}
@@ -262,9 +299,23 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       latencyMs,
       attributes,
       rawPreview: meta.rawPreview,
-    } satisfies Omit<JudgedEvent, 'verdict' | 'tier' | 'severity' | 'reason' | 'actionKind' | 'actionTarget' | 'riskCategory' | 'riskName' | 'riskType' | 'riskScore'>;
+    } satisfies JudgedEventBase;
 
     const d = this.sentry.evaluate(line) as SentryDecisionWithRisk | null;
+    const producerFinding = producerReportedFinding(base);
+    if (producerFinding) {
+      return this.push({
+        ...base,
+        verdict: 'escalate',
+        tier: 'Rules',
+        severity: producerFinding.severity,
+        reason: producerFinding.reason,
+        riskCategory: producerFinding.riskCategory,
+        riskName: producerFinding.riskName,
+        riskType: 'atomic',
+        riskScore: SEVERITY_SCORE[producerFinding.severity],
+      });
+    }
     if (!d) {
       // Not security-judged by the sentry policy, but still a real observed signal — record benign so
       // every observer feature is counted. Drop only truly unparseable input (unknown kind).

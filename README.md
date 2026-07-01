@@ -336,6 +336,9 @@ timeouts, max-tool-round failures, and invalid Skill results are recorded as
 remain queryable and bundleable. Coding-agent producer aliases such as
 `NetworkEgress`, `FileRead`, `FileWrite`, and `SecurityFinding` are normalized to
 the canonical AnySentry kinds `Egress`, `FileAccess`, and `SecurityAction`.
+Producer-reported `SecurityFinding` and `progressive.failure=true` events are
+stored as non-allow findings, so failed soak attempts show up in risk and action
+flows instead of looking like benign telemetry.
 `pnpm verify:progressive-api:local` and the production progressive verifier both
 regression-check that alias normalization and obvious high-risk runtime guard
 actions return a non-allow policy decision. Keep production probes on this single

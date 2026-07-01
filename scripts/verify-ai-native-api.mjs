@@ -393,7 +393,8 @@ async function verifyRuntimeContract() {
   );
   assert(
     'runtime negative-path aliases keep non-allow verdict coverage',
-    aliasEvents.some((event) => ['Egress', 'FileAccess'].includes(event.eventKind) && event.verdict && event.verdict !== 'allow'),
+    aliasEvents.some((event) => ['Egress', 'FileAccess'].includes(event.eventKind) && event.verdict && event.verdict !== 'allow') &&
+      aliasEvents.some((event) => event.eventKind === 'SecurityAction' && event.verdict && event.verdict !== 'allow'),
     aliasEvents,
   );
 
