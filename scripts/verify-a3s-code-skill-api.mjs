@@ -54,6 +54,16 @@ const verifierAttributes = {
   'progressive.verifier.model': model,
   'progressive.verifier.node': process.version,
 };
+const skillOutputTimingFields = [
+  'innerHealthzMs',
+  'innerListMs',
+  'innerDescribeRecordMs',
+  'innerPreRecordMs',
+  'innerRecordMs',
+  'innerQueryEventMs',
+  'innerBundleMs',
+  'innerTotalMs',
+];
 
 function durationMs(startedAt) {
   return Math.max(0, Date.now() - startedAt);
@@ -170,6 +180,26 @@ function evidenceFieldMismatchIssues(prefix, actual, expected, fields) {
   return issues;
 }
 
+function skillOutputTimingIssues(timings, context) {
+  const issues = [];
+  if (!isRecord(timings)) {
+    return [`${context} evidence.skillOutput.timings must be an object`];
+  }
+  for (const field of skillOutputTimingFields) {
+    if (!isFiniteNumber(timings[field]) || timings[field] < 0) {
+      issues.push(`${context} evidence.skillOutput.timings.${field} must be a non-negative number`);
+    }
+  }
+  if (isFiniteNumber(timings.innerTotalMs)) {
+    for (const field of skillOutputTimingFields.filter((item) => item !== 'innerTotalMs')) {
+      if (isFiniteNumber(timings[field]) && timings.innerTotalMs < timings[field]) {
+        issues.push(`${context} evidence.skillOutput.timings.innerTotalMs must be greater than or equal to ${field}`);
+      }
+    }
+  }
+  return issues;
+}
+
 function successfulEvidenceIssues(summary, context) {
   const issues = [];
   if (!isNonEmptyString(summary.evidence?.eventId)) issues.push(`${context} evidence.eventId must be a non-empty string`);
@@ -217,6 +247,7 @@ function successfulEvidenceIssues(summary, context) {
   if (summary.evidence?.skillOutput?.eventCategory !== 'llm') issues.push(`${context} evidence.skillOutput.eventCategory must be llm`);
   if (summary.evidence?.skillOutput?.verdict !== 'allow') issues.push(`${context} evidence.skillOutput.verdict must be allow`);
   if (summary.evidence?.skillOutput?.queriedBack !== true) issues.push(`${context} evidence.skillOutput.queriedBack must be true`);
+  issues.push(...skillOutputTimingIssues(summary.evidence?.skillOutput?.timings, context));
   if (summary.evidence?.eventId !== summary.evidence?.skillOutput?.eventId) {
     issues.push(`${context} eventId must match skillOutput.eventId`);
   }
@@ -1070,6 +1101,16 @@ function runVerifierSelfTest() {
         bundleContainsEvent: true,
         bundleEventCount: 1,
         queriedBack: true,
+        timings: {
+          innerHealthzMs: 1,
+          innerListMs: 2,
+          innerDescribeRecordMs: 3,
+          innerPreRecordMs: 6,
+          innerRecordMs: 4,
+          innerQueryEventMs: 5,
+          innerBundleMs: 6,
+          innerTotalMs: 30,
+        },
       },
     },
     warning: {
@@ -1922,6 +1963,63 @@ function runVerifierSelfTest() {
     verifierSummaryIssues(driftedSkillOutputCategorySummary).includes('passed summary evidence.skillOutput.eventCategory must be llm'),
     verifierSummaryIssues(driftedSkillOutputCategorySummary),
   );
+  const missingSkillOutputTimingsSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        timings: undefined,
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects Skill outputs without inner timings',
+    verifierSummaryIssues(missingSkillOutputTimingsSummary).includes(
+      'passed summary evidence.skillOutput.timings must be an object',
+    ),
+    verifierSummaryIssues(missingSkillOutputTimingsSummary),
+  );
+  const negativeSkillOutputTimingSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        timings: {
+          ...passedSummary.evidence.skillOutput.timings,
+          innerRecordMs: -1,
+        },
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects negative Skill output inner timings',
+    verifierSummaryIssues(negativeSkillOutputTimingSummary).includes(
+      'passed summary evidence.skillOutput.timings.innerRecordMs must be a non-negative number',
+    ),
+    verifierSummaryIssues(negativeSkillOutputTimingSummary),
+  );
+  const driftedSkillOutputTotalTimingSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        timings: {
+          ...passedSummary.evidence.skillOutput.timings,
+          innerTotalMs: 1,
+        },
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects Skill output total timing drift',
+    verifierSummaryIssues(driftedSkillOutputTotalTimingSummary).includes(
+      'passed summary evidence.skillOutput.timings.innerTotalMs must be greater than or equal to innerDescribeRecordMs',
+    ),
+    verifierSummaryIssues(driftedSkillOutputTotalTimingSummary),
+  );
   const mismatchedBundleCountSummary = {
     ...passedSummary,
     evidence: {
@@ -2498,7 +2596,8 @@ async function main() {
       skillOutput.verdict === 'allow' &&
       skillOutput.bundleSchemaVersion === 'anysentry.evidence_bundle.v1' &&
       skillOutput.bundleContainsEvent === true &&
-      skillOutput.queriedBack === true;
+      skillOutput.queriedBack === true &&
+      skillOutputTimingIssues(skillOutput.timings, 'Skill output').length === 0;
     assert('Skill output reports the recorded LlmCall allow event and bundle for this run', outputMatchesRun, skillOutput);
     if (!outputMatchesRun) {
       timings.elapsed = durationMs(verifierStartedAt);
@@ -2690,6 +2789,7 @@ async function main() {
           bundleContainsEvent: skillOutput.bundleContainsEvent,
           bundleEventCount: skillOutput.bundleEventCount,
           queriedBack: skillOutput.queriedBack,
+          timings: skillOutput.timings,
         },
       },
       warning: {
