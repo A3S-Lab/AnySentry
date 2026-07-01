@@ -368,6 +368,66 @@ function warningEvidenceBindingIssues(warningEvent, event, bundle, timings) {
   return issues;
 }
 
+function failureEvidenceBindingIssues(failureEvent, reason, timings) {
+  const issues = [];
+  if (!isRecord(failureEvent)) {
+    return ['failureEvent must be an object'];
+  }
+  if (!isNonEmptyString(failureEvent.eventId)) {
+    issues.push('failureEvent.eventId must be a non-empty string');
+  }
+  if (failureEvent.eventKind !== 'SecurityAction') {
+    issues.push('failureEvent.eventKind must be SecurityAction');
+  }
+  if (failureEvent.eventCategory !== 'security') {
+    issues.push('failureEvent.eventCategory must be security');
+  }
+  if (!isNonEmptyString(failureEvent.verdict) || failureEvent.verdict === 'allow') {
+    issues.push('failureEvent.verdict must be a non-allow string');
+  }
+  if (failureEvent.riskCategory !== 'runtime_failure') {
+    issues.push('failureEvent.riskCategory must be runtime_failure');
+  }
+  if (
+    failureEvent.workspacePath !== workspacePath ||
+    failureEvent.runId !== runId ||
+    failureEvent.agentId !== agentId ||
+    failureEvent.sessionId !== sessionId
+  ) {
+    issues.push('failureEvent must keep the verifier target identity');
+  }
+  const attributes = failureEvent.attributes;
+  if (!isRecord(attributes)) {
+    issues.push('failureEvent.attributes must be an object');
+    return issues;
+  }
+  const auditIssues = verifierAttributeIssues(attributes);
+  for (const key of auditIssues) {
+    issues.push(`failure attribute ${key} must match verifier audit metadata`);
+  }
+  if (attributes['progressive.runner'] !== 'a3s-code') {
+    issues.push('failure attribute progressive.runner must be a3s-code');
+  }
+  if (attributes['progressive.skill'] !== 'anysentry-api') {
+    issues.push('failure attribute progressive.skill must be anysentry-api');
+  }
+  if (!trueAttribute(attributes['progressive.failure'])) {
+    issues.push('failure attribute progressive.failure must be true');
+  }
+  if (attributes['progressive.failure.reason'] !== reason) {
+    issues.push('failure attribute progressive.failure.reason must match the failure reason');
+  }
+  if (!isNonEmptyString(attributes['progressive.failure.details'])) {
+    issues.push('failure attribute progressive.failure.details must be a non-empty string');
+  }
+  for (const [key, expected] of Object.entries(timingAttributes(timings))) {
+    if (!sameAttributeValue(attributes[key], expected)) {
+      issues.push(`failure attribute ${key} must match verifier timing metadata`);
+    }
+  }
+  return issues;
+}
+
 function successfulEvidenceIssues(summary, context) {
   const issues = [];
   if (!isNonEmptyString(summary.evidence?.eventId)) issues.push(`${context} evidence.eventId must be a non-empty string`);
@@ -929,27 +989,11 @@ async function recordFailureEvidence(reason, details, timings) {
     if (!failureEvent?.eventId) {
       throw new Error(`failure evidence did not become queryable: ${compact({ recorded, failureEvent })}`);
     }
-    if (!failureEvent.verdict || failureEvent.verdict === 'allow' || failureEvent.riskCategory !== 'runtime_failure') {
-      throw new Error(`failure evidence was not actionable runtime failure evidence: ${compact(failureEvent)}`);
-    }
-    if (
-      failureEvent.workspacePath !== workspacePath ||
-      failureEvent.runId !== runId ||
-      failureEvent.agentId !== agentId ||
-      failureEvent.sessionId !== sessionId
-    ) {
-      throw new Error(`failure evidence lost target identity: ${compact(failureEvent)}`);
+    const failureBindingIssues = failureEvidenceBindingIssues(failureEvent, reason, timings);
+    if (failureBindingIssues.length > 0) {
+      throw new Error(`failure evidence drifted from verifier metadata: ${compact({ failureBindingIssues, failureEvent })}`);
     }
     const failureAttrs = failureEvent.attributes ?? {};
-    const failureAuditIssues = verifierAttributeIssues(failureAttrs);
-    if (failureAuditIssues.length > 0) {
-      throw new Error(`failure evidence lost verifier audit metadata ${failureAuditIssues.join(', ')}: ${compact(failureEvent)}`);
-    }
-    for (const key of Object.keys(failureAttributes)) {
-      if (!sameAttributeValue(failureAttrs[key], failureAttributes[key])) {
-        throw new Error(`failure evidence lost verifier timing metadata ${key}: ${compact(failureEvent)}`);
-      }
-    }
     const bundle = await request('/capabilities', {
       method: 'POST',
       body: JSON.stringify({
@@ -1825,16 +1869,18 @@ function runVerifierSelfTest() {
     { summary: normalizedNegativeTiming, issues: verifierSummaryIssues(normalizedNegativeTiming) },
   );
 
+  const failedTimings = { elapsed: 10, failurePhase: 'skill_output' };
+  const failedReason = 'skill output JSON was invalid';
   const failedSummary = failureSummary(
     'skill_output',
-    'skill output JSON was invalid',
+    failedReason,
     'invalid JSON',
-    { elapsed: 10, failurePhase: 'skill_output' },
+    failedTimings,
     {
       recorded: true,
       eventId: 'evt_failure_self_test',
       failurePhase: 'skill_output',
-      failureReason: 'skill output JSON was invalid',
+      failureReason: failedReason,
       workspacePath,
       runId,
       agentId,
@@ -1851,11 +1897,51 @@ function runVerifierSelfTest() {
   );
   assert('verifier self-test accepts the failed summary contract', verifierSummaryIssues(failedSummary).length === 0, verifierSummaryIssues(failedSummary));
 
+  const passedFailureEvent = {
+    eventId: failedSummary.failure.evidence.eventId,
+    workspacePath,
+    runId,
+    agentId,
+    sessionId,
+    eventKind: 'SecurityAction',
+    eventCategory: 'security',
+    verdict: 'block',
+    riskCategory: 'runtime_failure',
+    attributes: {
+      ...verifierAttributes,
+      ...timingAttributes(failedTimings),
+      'progressive.runner': 'a3s-code',
+      'progressive.skill': 'anysentry-api',
+      'progressive.failure': true,
+      'progressive.failure.reason': failedReason,
+      'progressive.failure.details': 'invalid JSON',
+    },
+  };
+  assert(
+    'verifier self-test accepts failure evidence bound to verifier metadata',
+    failureEvidenceBindingIssues(passedFailureEvent, failedReason, failedTimings).length === 0,
+    failureEvidenceBindingIssues(passedFailureEvent, failedReason, failedTimings),
+  );
+  const driftedFailureReasonEvent = {
+    ...passedFailureEvent,
+    attributes: {
+      ...passedFailureEvent.attributes,
+      'progressive.failure.reason': 'other failure reason',
+    },
+  };
+  assert(
+    'verifier self-test rejects failure evidence reason metadata drift',
+    failureEvidenceBindingIssues(driftedFailureReasonEvent, failedReason, failedTimings).includes(
+      'failure attribute progressive.failure.reason must match the failure reason',
+    ),
+    failureEvidenceBindingIssues(driftedFailureReasonEvent, failedReason, failedTimings),
+  );
+
   const driftedFailureSummary = failureSummary(
     'skill_output',
-    'skill output JSON was invalid',
+    failedReason,
     'invalid JSON',
-    { elapsed: 10, failurePhase: 'skill_output' },
+    failedTimings,
     {
       ...failedSummary.failure.evidence,
       verdict: 'allow',
