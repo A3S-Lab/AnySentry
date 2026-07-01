@@ -1151,9 +1151,11 @@ In addition to the aggregate dashboard APIs, AnySentry exposes event evidence fo
   include notification deliveries by exact alert context scope, so operational handoffs keep the
   delivery trail even without a specific Alert ID. Scoped bundles also include exact target
   Maintenance windows so handoffs retain the active suppression context without broad keyword
-  matching; Source/Collector/Workspace scoped bundles also attach exact observed Agent maintenance
-  windows from scoped event evidence. A pure `sourceId` bundle hydrates that Source's bound
-  Collector and Workspace context so the handoff includes the upstream operational owner path,
+  matching; Event-primary bundles bind `primary.event` to the same normalized payload returned in
+  `events[]`, including Source, Collector, workspace, run, Agent, session, trace, event kind,
+  category, and verdict fields. Source/Collector/Workspace scoped bundles also attach exact
+  observed Agent maintenance windows from scoped event evidence. A pure `sourceId` bundle hydrates
+  that Source's bound Collector and Workspace context so the handoff includes the upstream operational owner path,
   Collector-scoped bundles attach the Workspace inventory context for exact matching Sources plus
   exact observed Agent context from the scoped event evidence without workspace-wide Agent bleed,
   Workspace-scoped bundles attach Collector health context for exact matching Sources and the

@@ -444,6 +444,28 @@ function contains(items, key, value) {
   return items?.some((item) => item?.[key] === value);
 }
 
+const eventIdentityFields = [
+  'eventId',
+  'sourceId',
+  'collectorId',
+  'workspacePath',
+  'agentId',
+  'sessionId',
+  'traceId',
+  'runId',
+  'eventKind',
+  'eventCategory',
+  'verdict',
+];
+
+function eventIdentitySnapshot(event) {
+  return Object.fromEntries(eventIdentityFields.map((field) => [field, event?.[field]]));
+}
+
+function sameEventIdentity(primary, listed) {
+  return Boolean(primary && listed && eventIdentityFields.every((field) => primary[field] === listed[field]));
+}
+
 async function verifyIncidentBundle(source, token, incident, alert, task, objective, delivery, brokenDelivery, maintenance, agentMetadata, eventId) {
   const bundle = await request('/evidence/bundle', 'POST', { timeType: 'last_30d', incidentId: incident.incidentId, limit: 80 });
   const encoded = JSON.stringify(bundle);
@@ -710,6 +732,15 @@ async function verifyEvidenceExport(source, token, incident, alert, task, object
 async function verifyAlternatePrimaries(eventId, taskId, incidentId, objectiveId, agentId, delivery, brokenDelivery, overdueObjectiveRemediation, maintenance) {
   const eventBundle = await request('/evidence/bundle', 'POST', { timeType: 'last_30d', eventId, limit: 30 });
   assert('event evidence bundle uses event as primary and keeps timeline', eventBundle.scope?.primaryType === 'event' && eventBundle.primary?.event?.eventId === eventId && eventBundle.timeline?.items?.some((item) => item.eventId === eventId), eventBundle);
+  const listedEvent = eventBundle.events?.find((item) => item.eventId === eventId);
+  assert(
+    'event evidence bundle binds primary Event identity to listed Event payload',
+    sameEventIdentity(eventBundle.primary?.event, listedEvent),
+    {
+      primary: eventIdentitySnapshot(eventBundle.primary?.event),
+      listed: eventIdentitySnapshot(listedEvent),
+    },
+  );
 
   const topologyEdge = eventBundle.topology?.edges?.find((edge) => edge.sampleEventId === eventId) ?? eventBundle.topology?.edges?.[0];
   const topologyEdgeId = topologyEdge?.edgeId ?? '__missing_topology_edge__';

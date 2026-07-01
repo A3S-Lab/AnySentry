@@ -3330,11 +3330,17 @@ export class SecurityMonitoringController {
     const relatedObjectiveId = explicitObjectiveId ?? auditObjectiveId ?? notificationDelivery?.objectiveId ?? alertObjectiveId(alert) ?? remediationObjectiveId(remediation);
     let objective = relatedObjectiveId ? this.objectives.list({ ...timeFilter, objectiveId: relatedObjectiveId, limit: 1 }, { observe: false }).items[0] : undefined;
     const explicitWorkspacePath = selector(query.workspacePath);
+    const explicitAgentId = selector(query.agentId, 240);
+    const explicitCollectorId = selector(query.collectorId, 180);
+    const explicitSourceId = selector(query.sourceId, 180);
+    const explicitTraceId = selector(query.traceId, 240);
+    const explicitRunId = selector(query.runId, 240);
+    const explicitSessionId = selector(query.sessionId, 240);
     const maintenanceAgentScope = maintenanceWindow?.targetType === 'agent' ? splitAgentTargetId(maintenanceWindow.targetId) : {};
     const objectiveAgentScope = objective?.targetType === 'agent' ? splitAgentTargetId(objective.targetId) : {};
     const agentWorkspaceScope = explicitWorkspacePath ?? maintenanceAgentScope.workspacePath ?? objectiveAgentScope.workspacePath;
     const relatedAgentId = prefer(
-      selector(query.agentId, 240),
+      explicitAgentId,
       auditAgentId,
       notificationDelivery?.agentId,
       maintenanceAgentScope.agentId,
@@ -3346,7 +3352,7 @@ export class SecurityMonitoringController {
       objectiveAgentScope.agentId,
     );
     const relatedSourceId = prefer(
-      selector(query.sourceId, 180),
+      explicitSourceId,
       auditSourceId,
       notificationDelivery?.sourceId,
       maintenanceTarget(maintenanceWindow, 'source'),
@@ -3380,14 +3386,14 @@ export class SecurityMonitoringController {
       windowId: prefer(explicitWindowId, auditWindowId, maintenanceWindow?.windowId),
       workspacePath: prefer(explicitWorkspacePath, auditWorkspacePath, notificationDelivery?.workspacePath, maintenanceTarget(maintenanceWindow, 'workspace'), maintenanceAgentScope.workspacePath, event?.workspacePath, incident?.workspacePath, alert?.workspacePath, remediation?.workspacePath, coverageIssue?.workspacePath, scopedSource?.workspacePath, scopedAgentMetadata?.workspacePath, objectiveAgentScope.workspacePath, objectiveTarget(objective, 'workspace')),
       agentId: relatedAgentId,
-      collectorId: prefer(selector(query.collectorId, 180), auditCollectorId, notificationDelivery?.collectorId, maintenanceTarget(maintenanceWindow, 'collector'), evidenceEventCollectorId(event), incident?.collectorId, alert?.collectorId, remediation?.collectorId, coverageIssue?.collectorId, scopedSource?.collectorId, objectiveTarget(objective, 'collector')),
+      collectorId: prefer(explicitCollectorId, auditCollectorId, notificationDelivery?.collectorId, maintenanceTarget(maintenanceWindow, 'collector'), evidenceEventCollectorId(event), incident?.collectorId, alert?.collectorId, remediation?.collectorId, coverageIssue?.collectorId, scopedSource?.collectorId, objectiveTarget(objective, 'collector')),
       sourceId: relatedSourceId,
-      traceId: prefer(selector(query.traceId, 240), event?.traceId, incident?.traceId, alert?.traceId, remediation?.traceId),
-      runId: prefer(selector(query.runId, 240), event?.runId, incident?.runId, alert?.runId),
-      sessionId: prefer(selector(query.sessionId, 240), event?.sessionId, incident?.sessionId, alert?.sessionId),
+      traceId: prefer(explicitTraceId, event?.traceId, incident?.traceId, alert?.traceId, remediation?.traceId),
+      runId: prefer(explicitRunId, event?.runId, incident?.runId, alert?.runId),
+      sessionId: prefer(explicitSessionId, event?.sessionId, incident?.sessionId, alert?.sessionId),
     };
 
-    const eventFilter: T.AgentEventQuery = {
+    const makeEventFilter = (): T.AgentEventQuery => ({
       ...timeFilter,
       eventId: scope.eventId,
       sourceId: scope.sourceId,
@@ -3398,9 +3404,38 @@ export class SecurityMonitoringController {
       traceId: scope.traceId,
       runId: scope.runId,
       limit,
-    };
-    const eventList = this.agg.agentEvents(eventFilter);
-    if (!event && scope.eventId) event = eventList.items.find((item) => item.eventId === scope.eventId);
+    });
+    let eventFilter = makeEventFilter();
+    let eventList = this.agg.agentEvents(eventFilter);
+    const initialEvent = event;
+    const listedPrimaryEvent = scope.eventId ? eventList.items.find((item) => item.eventId === scope.eventId) : undefined;
+    if (listedPrimaryEvent) {
+      event = listedPrimaryEvent;
+      if (!explicitWorkspacePath && (!scope.workspacePath || scope.workspacePath === initialEvent?.workspacePath)) {
+        scope.workspacePath = listedPrimaryEvent.workspacePath;
+      }
+      if (!explicitAgentId && (!scope.agentId || scope.agentId === initialEvent?.agentId)) {
+        scope.agentId = listedPrimaryEvent.agentId;
+      }
+      if (!explicitCollectorId && (!scope.collectorId || scope.collectorId === evidenceEventCollectorId(initialEvent))) {
+        scope.collectorId = evidenceEventCollectorId(listedPrimaryEvent) ?? scope.collectorId;
+      }
+      if (!explicitSourceId && (!scope.sourceId || scope.sourceId === evidenceEventSourceId(initialEvent))) {
+        scope.sourceId = evidenceEventSourceId(listedPrimaryEvent) ?? scope.sourceId;
+      }
+      if (!explicitTraceId && (!scope.traceId || scope.traceId === initialEvent?.traceId)) {
+        scope.traceId = listedPrimaryEvent.traceId;
+      }
+      if (!explicitRunId && (!scope.runId || scope.runId === initialEvent?.runId)) {
+        scope.runId = listedPrimaryEvent.runId;
+      }
+      if (!explicitSessionId && (!scope.sessionId || scope.sessionId === initialEvent?.sessionId)) {
+        scope.sessionId = listedPrimaryEvent.sessionId;
+      }
+      eventFilter = makeEventFilter();
+      eventList = this.agg.agentEvents(eventFilter);
+      event = eventList.items.find((item) => item.eventId === listedPrimaryEvent.eventId) ?? listedPrimaryEvent;
+    }
     const timeline = this.agg.agentTimeline({ ...eventFilter, limit: Math.max(limit, 120) });
     const exactEventContext = Boolean(
       scope.eventId ||
