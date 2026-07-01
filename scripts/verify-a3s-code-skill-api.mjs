@@ -1287,62 +1287,22 @@ function parseMetadataJson(result) {
   }
 }
 
-function jsonObjectCandidates(text) {
-  const candidates = [];
-  let depth = 0;
-  let start = -1;
-  let inString = false;
-  let escaped = false;
-  for (let index = 0; index < text.length; index += 1) {
-    const char = text[index];
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (char === '\\') {
-        escaped = true;
-      } else if (char === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (char === '"') {
-      inString = true;
-      continue;
-    }
-    if (char === '{') {
-      if (depth === 0) start = index;
-      depth += 1;
-      continue;
-    }
-    if (char === '}' && depth > 0) {
-      depth -= 1;
-      if (depth === 0 && start >= 0) {
-        candidates.push(text.slice(start, index + 1));
-        start = -1;
-      }
-    }
-  }
-  return candidates;
-}
-
 function parseSkillOutputJson(result) {
   const output = String(result?.output ?? '').trim();
   if (!output) throw new Error('Skill output was empty');
+  const finalLine = output
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .at(-1);
+  if (!finalLine) throw new Error('Skill output was empty');
   try {
-    const parsed = JSON.parse(output);
+    const parsed = JSON.parse(finalLine);
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
   } catch {
-    // Fall through to extracting a JSON object from tool output wrappers.
+    throw new Error(`Skill output final line was not a JSON object: ${compact(output)}`);
   }
-  for (const candidate of jsonObjectCandidates(output).reverse()) {
-    try {
-      const parsed = JSON.parse(candidate);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
-    } catch {
-      // Try the next candidate.
-    }
-  }
-  throw new Error(`Skill output did not contain a JSON object: ${compact(output)}`);
+  throw new Error(`Skill output final line was not a JSON object: ${compact(output)}`);
 }
 
 function runVerifierSelfTest() {
@@ -2858,13 +2818,31 @@ function runVerifierSelfTest() {
 
   const directSkillOutput = parseSkillOutputJson({ output: '{"eventId":"evt_a","bundleId":"evb_a"}' });
   assert('verifier self-test parses compact Skill JSON output', directSkillOutput.eventId === 'evt_a' && directSkillOutput.bundleId === 'evb_a', directSkillOutput);
-  const wrappedSkillOutput = parseSkillOutputJson({ output: 'log line {"ignored":true}\n{"eventId":"evt_b","bundleId":"evb_b"}' });
-  assert('verifier self-test extracts the final Skill JSON object from wrapper output', wrappedSkillOutput.eventId === 'evt_b' && wrappedSkillOutput.bundleId === 'evb_b', wrappedSkillOutput);
+  const finalLineSkillOutput = parseSkillOutputJson({ output: 'log line {"ignored":true}\n{"eventId":"evt_b","bundleId":"evb_b"}' });
+  assert(
+    'verifier self-test parses only the final Skill output line as JSON',
+    finalLineSkillOutput.eventId === 'evt_b' && finalLineSkillOutput.bundleId === 'evb_b',
+    finalLineSkillOutput,
+  );
+  try {
+    parseSkillOutputJson({ output: '{"eventId":"evt_stale","bundleId":"evb_stale"}\nVERDICT: PASS' });
+    fail('verifier self-test rejects JSON objects that are not the final output line');
+  } catch (error) {
+    assert(
+      'verifier self-test rejects JSON objects that are not the final output line',
+      error instanceof Error && error.message.includes('Skill output final line was not a JSON object'),
+      error instanceof Error ? error.message : String(error),
+    );
+  }
   try {
     parseSkillOutputJson({ output: 'not json' });
     fail('verifier self-test rejects non-JSON Skill output');
-  } catch {
-    pass('verifier self-test rejects non-JSON Skill output');
+  } catch (error) {
+    assert(
+      'verifier self-test rejects non-JSON Skill output',
+      error instanceof Error && error.message.includes('Skill output final line was not a JSON object'),
+      error instanceof Error ? error.message : String(error),
+    );
   }
   const source = innerVerifierSource();
   const missingSourceTimingFields = skillOutputTimingFields.filter((field) => !source.includes(field));
