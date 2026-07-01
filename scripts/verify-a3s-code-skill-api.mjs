@@ -255,6 +255,71 @@ function evidenceBundleBindingIssues(bundle, skillOutput, eventId) {
   return issues;
 }
 
+function warningEvidenceBindingIssues(warningEvent, event, bundle, timings) {
+  const issues = [];
+  if (!isRecord(warningEvent)) {
+    return ['warningEvent must be an object'];
+  }
+  if (!isRecord(event)) {
+    return ['source event must be an object'];
+  }
+  if (!isRecord(bundle)) {
+    return ['bundle must be an object'];
+  }
+  if (!isRecord(timings)) {
+    return ['timings must be an object'];
+  }
+  if (!isNonEmptyString(warningEvent.eventId)) {
+    issues.push('warningEvent.eventId must be a non-empty string');
+  } else if (warningEvent.eventId === event.eventId) {
+    issues.push('warningEvent.eventId must differ from the source event ID');
+  }
+  if (warningEvent.verdict !== 'allow' || warningEvent.eventKind !== 'RuntimeEvent' || warningEvent.eventCategory !== 'runtime') {
+    issues.push('warningEvent must remain RuntimeEvent runtime allow evidence');
+  }
+  if (
+    warningEvent.workspacePath !== workspacePath ||
+    warningEvent.runId !== runId ||
+    warningEvent.agentId !== agentId ||
+    warningEvent.sessionId !== sessionId
+  ) {
+    issues.push('warningEvent must keep the verifier target identity');
+  }
+  const attributes = warningEvent.attributes;
+  if (!isRecord(attributes)) {
+    issues.push('warningEvent.attributes must be an object');
+    return issues;
+  }
+  const auditIssues = verifierAttributeIssues(attributes);
+  for (const key of auditIssues) {
+    issues.push(`warning attribute ${key} must match verifier audit metadata`);
+  }
+  if (attributes['progressive.runner'] !== 'a3s-code') {
+    issues.push('warning attribute progressive.runner must be a3s-code');
+  }
+  if (attributes['progressive.skill'] !== 'anysentry-api') {
+    issues.push('warning attribute progressive.skill must be anysentry-api');
+  }
+  if (attributes['progressive.warning'] !== 'near_timeout') {
+    issues.push('warning attribute progressive.warning must be near_timeout');
+  }
+  if (attributes['progressive.warning.eventId'] !== event.eventId) {
+    issues.push('warning attribute progressive.warning.eventId must match the source event ID');
+  }
+  if (attributes['progressive.warning.bundleId'] !== bundle.bundleId) {
+    issues.push('warning attribute progressive.warning.bundleId must match the Evidence Bundle ID');
+  }
+  if (Number(attributes['progressive.warning.thresholdMs']) !== nearTimeoutThresholdMs) {
+    issues.push('warning attribute progressive.warning.thresholdMs must match the verifier threshold');
+  }
+  for (const [key, expected] of Object.entries(timingAttributes(timings))) {
+    if (!sameAttributeValue(attributes[key], expected)) {
+      issues.push(`warning attribute ${key} must match verifier timing metadata`);
+    }
+  }
+  return issues;
+}
+
 function successfulEvidenceIssues(summary, context) {
   const issues = [];
   if (!isNonEmptyString(summary.evidence?.eventId)) issues.push(`${context} evidence.eventId must be a non-empty string`);
@@ -951,28 +1016,9 @@ async function recordNearTimeoutWarning(event, bundle, timings) {
   if (!warningEvent?.eventId) {
     throw new Error(`near-timeout warning evidence did not become queryable: ${compact({ recorded, warningEvent })}`);
   }
-  if (warningEvent.verdict !== 'allow' || warningEvent.eventKind !== 'RuntimeEvent' || warningEvent.eventCategory !== 'runtime') {
-    throw new Error(`near-timeout warning should remain allow evidence: ${compact(warningEvent)}`);
-  }
-  if (
-    warningEvent.workspacePath !== workspacePath ||
-    warningEvent.runId !== runId ||
-    warningEvent.agentId !== agentId ||
-    warningEvent.sessionId !== sessionId
-  ) {
-    throw new Error(`near-timeout warning lost target identity: ${compact(warningEvent)}`);
-  }
-  const warningAttrs = warningEvent.attributes ?? {};
-  const warningAuditIssues = verifierAttributeIssues(warningAttrs);
-  if (
-    warningAuditIssues.length > 0 ||
-    warningAttrs['progressive.warning'] !== 'near_timeout' ||
-    warningAttrs['progressive.warning.eventId'] !== event.eventId ||
-    warningAttrs['progressive.warning.bundleId'] !== bundle.bundleId ||
-    Number(warningAttrs['progressive.warning.thresholdMs']) !== nearTimeoutThresholdMs ||
-    Number(warningAttrs['progressive.verifier.skillMs']) !== Math.round(timings.skill)
-  ) {
-    throw new Error(`near-timeout warning lost audit metadata: ${compact(warningEvent)}`);
+  const warningBindingIssues = warningEvidenceBindingIssues(warningEvent, event, bundle, timings);
+  if (warningBindingIssues.length > 0) {
+    throw new Error(`near-timeout warning evidence drifted from verifier metadata: ${compact({ warningBindingIssues, warningEvent })}`);
   }
   const warningRows = await request('/events/list', {
     method: 'POST',
@@ -1237,6 +1283,52 @@ function runVerifierSelfTest() {
       'bundle.summary.eventCount must match skillOutput.bundleEventCount',
     ),
     evidenceBundleBindingIssues(driftedBundleCount, passedSummary.evidence.skillOutput, passedSummary.evidence.eventId),
+  );
+  const passedEvent = {
+    eventId: passedSummary.evidence.eventId,
+    workspacePath,
+    runId,
+    agentId,
+    sessionId,
+  };
+  const passedWarningEvent = {
+    eventId: passedSummary.warning.eventId,
+    workspacePath,
+    runId,
+    agentId,
+    sessionId,
+    eventKind: 'RuntimeEvent',
+    eventCategory: 'runtime',
+    verdict: 'allow',
+    attributes: {
+      ...verifierAttributes,
+      ...timingAttributes(passedSummary.timings),
+      'progressive.runner': 'a3s-code',
+      'progressive.skill': 'anysentry-api',
+      'progressive.warning': 'near_timeout',
+      'progressive.warning.eventId': passedSummary.evidence.eventId,
+      'progressive.warning.bundleId': passedSummary.evidence.bundleId,
+      'progressive.warning.thresholdMs': nearTimeoutThresholdMs,
+    },
+  };
+  assert(
+    'verifier self-test accepts near-timeout warning evidence bound to verifier metadata',
+    warningEvidenceBindingIssues(passedWarningEvent, passedEvent, passedBundle, passedSummary.timings).length === 0,
+    warningEvidenceBindingIssues(passedWarningEvent, passedEvent, passedBundle, passedSummary.timings),
+  );
+  const driftedWarningTimingEvent = {
+    ...passedWarningEvent,
+    attributes: {
+      ...passedWarningEvent.attributes,
+      'progressive.verifier.elapsedMs': passedSummary.timings.elapsed + 1,
+    },
+  };
+  assert(
+    'verifier self-test rejects near-timeout warning timing drift',
+    warningEvidenceBindingIssues(driftedWarningTimingEvent, passedEvent, passedBundle, passedSummary.timings).includes(
+      'warning attribute progressive.verifier.elapsedMs must match verifier timing metadata',
+    ),
+    warningEvidenceBindingIssues(driftedWarningTimingEvent, passedEvent, passedBundle, passedSummary.timings),
   );
 
   const mismatchedCommitSummary = {
