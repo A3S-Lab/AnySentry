@@ -325,9 +325,11 @@ checks, and stop the server.
 | a3s-code verifier summary contract, without API/model calls | `pnpm verify:a3s-code-skill-api:self-test` |
 | Real a3s-code Skill plus LLM-backed evidence event | `ANYSENTRY_API_BASE=http://127.0.0.1:29653/security-center A3S_TEST_MODEL=openai/glm5.1-w4a8 A3S_CODE_ACL="$HOME/.a3s/config.acl" A3S_CODE_SDK_BASE=../os/apps/api pnpm verify:a3s-code-skill-api` |
 
-For production smoke or soak testing, do not reuse old event IDs as proof. Run
-new agents with unique `agentId` / `runId` values, make real `session.send()`
-calls through a configured model, write `LlmCall` evidence through
+For production smoke or soak testing, run the verifier on the target Shu'an OS
+production host or a production-equivalent node, not against a local
+Docker/OrbStack instance, and do not reuse old event IDs as proof. Run new
+agents with unique `agentId` / `runId` values, make real `session.send()` calls
+through a configured model, write `LlmCall` evidence through
 `security-center.recordSecurityEvents`, then query the new rows back through
 `/security-center/events/list` and build an Evidence Bundle for at least one new
 event. That is the same path the a3s-code verifier uses.
@@ -354,8 +356,9 @@ runs emit a single-line `VERIFIER_SUMMARY` JSON record with schema
 assert `status`, failure phase, failure evidence, event IDs, warning isolation,
 warning event/bundle bindings, and timing fields without scraping human-readable
 log lines. Success summaries also include the inner Skill output event and
-bundle IDs, and the verifier fails if those IDs do not match the rows and
-Evidence Bundle queried by the outer runtime. Failed summaries always include an explicit failure evidence status,
+bundle IDs under `evidence.skillOutput`, and the verifier fails if those IDs do
+not match the rows and Evidence Bundle queried by the outer runtime. Failed
+summaries always include an explicit failure evidence status,
 either with the recorded event/bundle IDs or with `recorded=false` plus the reason
 evidence was not written. If the verifier detects that its own summary violates
 the contract, the emitted summary is converted to `status=failed` with
