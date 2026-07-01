@@ -153,11 +153,14 @@ function verifierSummaryIssues(summary) {
     if (!isNonEmptyString(summary.failure?.phase)) issues.push('failed summary failure.phase must be a non-empty string');
     if (!isNonEmptyString(summary.failure?.reason)) issues.push('failed summary failure.reason must be a non-empty string');
     const evidence = summary.failure?.evidence;
-    if (isRecord(evidence) && evidence.recorded === true) {
+    if (!isRecord(evidence)) {
+      issues.push('failed summary failure.evidence must be an object');
+    } else if (typeof evidence.recorded !== 'boolean') {
+      issues.push('failed summary failure.evidence.recorded must be a boolean');
+    } else if (evidence.recorded === true) {
       if (!isNonEmptyString(evidence.eventId)) issues.push('recorded failure evidence.eventId must be a non-empty string');
       if (!isNonEmptyString(evidence.bundleId)) issues.push('recorded failure evidence.bundleId must be a non-empty string');
-    }
-    if (isRecord(evidence) && evidence.recorded === false && !isNonEmptyString(evidence.error)) {
+    } else if (!isNonEmptyString(evidence.error)) {
       issues.push('unrecorded failure evidence.error must explain why evidence was not written');
     }
   }
@@ -209,6 +212,13 @@ function verifierSummaryBase(status) {
   };
 }
 
+function defaultFailureEvidence(phase) {
+  return {
+    recorded: false,
+    error: `failure evidence was not attempted for phase ${phase}`,
+  };
+}
+
 function failureSummary(phase, reason, details, timings, failureEvidence) {
   return {
     ...verifierSummaryBase('failed'),
@@ -216,7 +226,7 @@ function failureSummary(phase, reason, details, timings, failureEvidence) {
       phase,
       reason,
       details,
-      evidence: failureEvidence,
+      evidence: failureEvidence ?? defaultFailureEvidence(phase),
     },
     timings,
   };
@@ -631,6 +641,18 @@ function runVerifierSelfTest() {
   );
   assert('verifier self-test accepts the failed summary contract', verifierSummaryIssues(failedSummary).length === 0, verifierSummaryIssues(failedSummary));
 
+  const unrecordedFailureSummary = failureSummary(
+    'preflight',
+    'required local verifier prerequisites are missing',
+    { aclPath: '/missing/config.acl' },
+    { elapsed: 1 },
+  );
+  assert(
+    'verifier self-test accepts explicit unrecorded failure evidence',
+    unrecordedFailureSummary.failure.evidence.recorded === false && verifierSummaryIssues(unrecordedFailureSummary).length === 0,
+    { summary: unrecordedFailureSummary, issues: verifierSummaryIssues(unrecordedFailureSummary) },
+  );
+
   const mismatchedSummary = {
     ...passedSummary,
     evidence: {
@@ -655,6 +677,12 @@ function runVerifierSelfTest() {
   assert(
     'verifier self-test rejects failed summaries without a phase',
     verifierSummaryIssues(invalidFailureSummary).includes('failed summary failure.phase must be a non-empty string'),
+    verifierSummaryIssues(invalidFailureSummary),
+  );
+
+  assert(
+    'verifier self-test rejects failed summaries without evidence status',
+    verifierSummaryIssues(invalidFailureSummary).includes('failed summary failure.evidence must be an object'),
     verifierSummaryIssues(invalidFailureSummary),
   );
 
