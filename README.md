@@ -330,6 +330,16 @@ calls through a configured model, write `LlmCall` evidence through
 `security-center.recordSecurityEvents`, then query the new rows back through
 `/security-center/events/list` and build an Evidence Bundle for at least one new
 event. That is the same path the a3s-code verifier uses.
+The a3s-code verifier also wraps Skill calls with `A3S_CODE_SKILL_TIMEOUT_MS`;
+timeouts, max-tool-round failures, and invalid Skill results are recorded as
+`SecurityFinding` events through `recordSecurityEvents`, so failed soak attempts
+remain queryable and bundleable. Coding-agent producer aliases such as
+`NetworkEgress`, `FileRead`, `FileWrite`, and `SecurityFinding` are normalized to
+the canonical AnySentry kinds `Egress`, `FileAccess`, and `SecurityAction`.
+`pnpm verify:progressive-api:local` and the production progressive verifier both
+regression-check that alias normalization and obvious high-risk runtime guard
+actions return a non-allow policy decision. Keep production probes on this single
+progressive API path rather than adding a parallel soak evidence format.
 
 To regression-check the primary observer path against a running API, including raw observer NDJSON,
 Source token rejection, evidence redaction, raw `CollectorHeartbeat`, direct forwarder heartbeat,
