@@ -336,8 +336,8 @@ timeouts, max-tool-round failures, and invalid Skill results are recorded as
 remain queryable and bundleable; the verifier now queries the failure event back
 and builds an Evidence Bundle before reporting the failure. Both success and
 failure evidence include verifier audit metadata such as the git commit, timeout
-configuration, model, and verifier schema version. Timeout handling closes the
-a3s-code session before writing failure evidence, and
+configuration, model, verifier schema version, and phase timing diagnostics.
+Timeout handling closes the a3s-code session before writing failure evidence, and
 `A3S_CODE_SESSION_CLOSE_TIMEOUT_MS` bounds that cleanup so a stuck close cannot
 suppress the failure finding. Coding-agent producer aliases such as
 `NetworkEgress`, `FileRead`, `FileWrite`, and `SecurityFinding` are normalized to

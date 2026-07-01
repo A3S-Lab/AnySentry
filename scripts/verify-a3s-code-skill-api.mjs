@@ -38,6 +38,27 @@ const verifierAttributes = {
   'progressive.verifier.node': process.version,
 };
 
+function durationMs(startedAt) {
+  return Math.max(0, Date.now() - startedAt);
+}
+
+function timingAttributes(timings = {}) {
+  const out = {};
+  for (const [key, value] of Object.entries(timings)) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      out[`progressive.verifier.${key}Ms`] = Math.max(0, Math.round(value));
+    } else if (typeof value === 'string' && value.trim()) {
+      out[`progressive.verifier.${key}`] = value.trim();
+    }
+  }
+  return out;
+}
+
+function sameAttributeValue(actual, expected) {
+  if (typeof expected === 'number') return Number(actual) === expected;
+  return actual === expected;
+}
+
 function currentGitCommit() {
   const fromEnv = (process.env.ANYSENTRY_VERIFIER_COMMIT ?? '').trim();
   if (fromEnv) return fromEnv;
@@ -106,8 +127,9 @@ async function withTimeout(label, task, timeoutMs, onTimeout) {
   });
 }
 
-async function recordFailureEvidence(reason, details) {
+async function recordFailureEvidence(reason, details, timings) {
   try {
+    const failureAttributes = timingAttributes(timings);
     const recorded = await request('/capabilities', {
       method: 'POST',
       body: JSON.stringify({
@@ -131,6 +153,7 @@ async function recordFailureEvidence(reason, details) {
               subject: `a3s-code Skill progressive API verification failed: ${reason}`,
               attributes: {
                 ...verifierAttributes,
+                ...failureAttributes,
                 'progressive.runner': 'a3s-code',
                 'progressive.skill': 'anysentry-api',
                 'progressive.failure': true,
@@ -168,6 +191,11 @@ async function recordFailureEvidence(reason, details) {
       Number(failureAttrs['progressive.verifier.sessionCloseTimeoutMs']) !== sessionCloseTimeoutMs
     ) {
       throw new Error(`failure evidence lost verifier audit metadata: ${compact(failureEvent)}`);
+    }
+    for (const key of Object.keys(failureAttributes)) {
+      if (!sameAttributeValue(failureAttrs[key], failureAttributes[key])) {
+        throw new Error(`failure evidence lost verifier timing metadata ${key}: ${compact(failureEvent)}`);
+      }
     }
     const bundle = await request('/capabilities', {
       method: 'POST',
@@ -258,6 +286,17 @@ const sessionId = ${JSON.stringify(sessionId)};
 const workspacePath = ${JSON.stringify(workspacePath)};
 const model = ${JSON.stringify(model)};
 const verifierAttributes = ${JSON.stringify(verifierAttributes)};
+const flowStartedAt = Date.now();
+const flowTimings = {};
+
+async function timed(label, fn) {
+  const startedAt = Date.now();
+  try {
+    return await fn();
+  } finally {
+    flowTimings[label] = Math.max(0, Date.now() - startedAt);
+  }
+}
 
 async function request(pathname, init = {}) {
   const response = await fetch(\`\${apiBase}\${pathname}\`, {
@@ -281,19 +320,22 @@ async function eventually(label, fn) {
   throw new Error(\`Timed out waiting for \${label}: \${JSON.stringify(lastValue)}\`);
 }
 
-await request('/healthz');
+await timed('innerHealthzMs', () => request('/healthz'));
 
-const modules = await request('/capabilities?action=list');
+const modules = await timed('innerListMs', () => request('/capabilities?action=list'));
 if (!Array.isArray(modules) || !modules.some((module) => module.name === 'security-center')) {
   throw new Error(\`security-center module missing from list: \${JSON.stringify(modules)}\`);
 }
 
-const operation = await request('/capabilities?action=describe&module=security-center&operation=recordSecurityEvents');
+const operation = await timed('innerDescribeRecordMs', () =>
+  request('/capabilities?action=describe&module=security-center&operation=recordSecurityEvents'),
+);
 if (operation?.name !== 'recordSecurityEvents' || !operation.inputSchema) {
   throw new Error(\`recordSecurityEvents describe failed: \${JSON.stringify(operation)}\`);
 }
 
-const recorded = await request('/capabilities', {
+const preRecordMs = Math.max(0, Date.now() - flowStartedAt);
+const recorded = await timed('innerRecordMs', () => request('/capabilities', {
   method: 'POST',
   body: JSON.stringify({
     action: 'execute',
@@ -319,31 +361,35 @@ const recorded = await request('/capabilities', {
           latencyMs: 321,
           attributes: {
             ...verifierAttributes,
+            'progressive.verifier.innerHealthzMs': flowTimings.innerHealthzMs,
+            'progressive.verifier.innerListMs': flowTimings.innerListMs,
+            'progressive.verifier.innerDescribeRecordMs': flowTimings.innerDescribeRecordMs,
+            'progressive.verifier.innerPreRecordMs': preRecordMs,
             'progressive.runner': 'a3s-code',
             'progressive.skill': 'anysentry-api',
-            'progressive.flow': 'healthz,list,describe,execute,events-list',
+            'progressive.flow': 'healthz,list,describe,execute,events-list,build-evidence-bundle',
             'progressive.model': model,
           },
         },
       ],
     },
   }),
-});
+}));
 
 const eventId = recorded.items?.[0]?.eventId;
 if (recorded.accepted !== true || !eventId) {
   throw new Error(\`recordSecurityEvents did not accept one event: \${JSON.stringify(recorded)}\`);
 }
 
-const event = await eventually('recorded event to be queryable', async () => {
+const event = await timed('innerQueryEventMs', () => eventually('recorded event to be queryable', async () => {
   const list = await request('/events/list', {
     method: 'POST',
     body: JSON.stringify({ timeType: 'last_30d', runId, agentId, limit: 10 }),
   });
   return list.items?.find((item) => item.eventId === eventId && item.runId === runId && item.agentId === agentId);
-});
+}));
 
-const bundle = await request('/capabilities', {
+const bundle = await timed('innerBundleMs', () => request('/capabilities', {
   method: 'POST',
   body: JSON.stringify({
     action: 'execute',
@@ -355,10 +401,11 @@ const bundle = await request('/capabilities', {
       limit: 20,
     },
   }),
-});
+}));
 if (bundle?.schemaVersion !== 'anysentry.evidence_bundle.v1' || !bundle.events?.some((item) => item.eventId === eventId)) {
   throw new Error(\`buildEvidenceBundle did not include the recorded event: \${JSON.stringify(bundle)}\`);
 }
+flowTimings.innerTotalMs = Math.max(0, Date.now() - flowStartedAt);
 
 console.log(JSON.stringify({
   healthOk: true,
@@ -370,6 +417,7 @@ console.log(JSON.stringify({
   eventKind: event.eventKind,
   verdict: event.verdict ?? recorded.items?.[0]?.verdict,
   queriedBack: true,
+  timings: flowTimings,
   runId,
   agentId,
 }));
@@ -398,6 +446,8 @@ ANYSENTRY_A3S_CODE_SKILL_VERIFY
 }
 
 async function main() {
+  const verifierStartedAt = Date.now();
+  const timings = {};
   console.log('AnySentry a3s-code Skill progressive API verification');
   console.log(`API base: ${apiBase}`);
   console.log(`Model: ${model}`);
@@ -407,11 +457,15 @@ async function main() {
   assert('anysentry-api Skill directory exists', fs.existsSync(path.join(skillRoot, 'anysentry-api', 'SKILL.md')), skillRoot);
   if (process.exitCode) process.exit(process.exitCode);
 
+  const healthStartedAt = Date.now();
   await request('/healthz');
+  timings.healthz = durationMs(healthStartedAt);
   pass('AnySentry API healthz responds before a3s-code run');
 
+  const loadStartedAt = Date.now();
   const { Agent } = await loadA3sCode();
   const agent = await Agent.create(aclPath);
+  timings.loadA3sCode = durationMs(loadStartedAt);
   const session = agent.session(repoRoot, {
     model,
     builtinSkills: false,
@@ -454,20 +508,27 @@ async function main() {
 
     let search;
     try {
+      const searchStartedAt = Date.now();
       search = await withTimeout(
         'a3s-code search_skills tool invocation',
         () => session.tool('search_skills', { query: 'AnySentry progressive API', limit: 5 }),
         Math.min(skillTimeoutMs, 60000),
         () => closeSession('search_skills timeout'),
       );
+      timings.searchSkills = durationMs(searchStartedAt);
     } catch (error) {
-      await recordFailureEvidence('search_skills tool invocation failed or timed out', error instanceof Error ? error.message : String(error));
+      timings.elapsed = durationMs(verifierStartedAt);
+      await recordFailureEvidence('search_skills tool invocation failed or timed out', error instanceof Error ? error.message : String(error), {
+        ...timings,
+        failurePhase: 'search_skills',
+      });
       throw error;
     }
     assert('a3s-code discovers the anysentry-api Skill', String(search.output ?? '').includes('anysentry-api'), search);
 
     let result;
     try {
+      const skillStartedAt = Date.now();
       result = await withTimeout(
         'a3s-code Skill tool invocation',
         () => session.tool('Skill', {
@@ -477,8 +538,13 @@ async function main() {
         skillTimeoutMs,
         () => closeSession('Skill timeout'),
       );
+      timings.skill = durationMs(skillStartedAt);
     } catch (error) {
-      await recordFailureEvidence('Skill tool invocation failed or timed out', error instanceof Error ? error.message : String(error));
+      timings.elapsed = durationMs(verifierStartedAt);
+      await recordFailureEvidence('Skill tool invocation failed or timed out', error instanceof Error ? error.message : String(error), {
+        ...timings,
+        failurePhase: 'skill',
+      });
       throw error;
     }
     const metadata = parseMetadataJson(result);
@@ -487,9 +553,14 @@ async function main() {
     assert('Skill invocation is for anysentry-api', metadata.skill_name === 'anysentry-api', metadata);
     assert('Skill used at least one tool while applying the API flow', Number(metadata.tool_calls ?? 0) >= 1, metadata);
     if (result.exitCode !== 0 || metadata.skill_name !== 'anysentry-api' || Number(metadata.tool_calls ?? 0) < 1) {
-      await recordFailureEvidence('skill invocation returned an invalid result', { result, metadata });
+      timings.elapsed = durationMs(verifierStartedAt);
+      await recordFailureEvidence('skill invocation returned an invalid result', { result, metadata }, {
+        ...timings,
+        failurePhase: 'skill_result',
+      });
     }
 
+    const queryStartedAt = Date.now();
     const event = await eventually('event recorded by a3s-code Skill run', async () => {
       const list = await request('/events/list', {
         method: 'POST',
@@ -497,6 +568,7 @@ async function main() {
       });
       return list.items?.find((item) => item.runId === runId && item.agentId === agentId && item.eventKind === 'LlmCall');
     });
+    timings.queryEvent = durationMs(queryStartedAt);
 
     assert('AnySentry stores the event created through progressive execute', Boolean(event?.eventId), event);
     assert('stored event carries the a3s-code Skill evidence markers', event?.attributes?.['progressive.skill'] === 'anysentry-api' && event?.attributes?.['progressive.runner'] === 'a3s-code', event);
@@ -507,6 +579,15 @@ async function main() {
         Number(event?.attributes?.['progressive.verifier.sessionCloseTimeoutMs']) === sessionCloseTimeoutMs,
       event,
     );
+    assert(
+      'stored event carries inner API timing metadata',
+      Number(event?.attributes?.['progressive.verifier.innerPreRecordMs']) >= 0 &&
+        Number(event?.attributes?.['progressive.verifier.innerHealthzMs']) >= 0 &&
+        Number(event?.attributes?.['progressive.verifier.innerListMs']) >= 0 &&
+        Number(event?.attributes?.['progressive.verifier.innerDescribeRecordMs']) >= 0,
+      event,
+    );
+    const bundleStartedAt = Date.now();
     const bundle = await request('/capabilities', {
       method: 'POST',
       body: JSON.stringify({
@@ -520,6 +601,8 @@ async function main() {
         },
       }),
     });
+    timings.bundle = durationMs(bundleStartedAt);
+    timings.elapsed = durationMs(verifierStartedAt);
     assert(
       'stored event builds an Evidence Bundle through the progressive API',
       bundle?.schemaVersion === 'anysentry.evidence_bundle.v1' && bundle.events?.some((item) => item.eventId === event.eventId),
@@ -537,6 +620,7 @@ async function main() {
           bundleId: bundle.bundleId,
           verdict: event.verdict,
           toolCalls: metadata.tool_calls,
+          timings,
         },
         null,
         2,
