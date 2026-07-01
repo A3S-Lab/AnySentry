@@ -177,6 +177,7 @@ console.log(
     bundleSchemaVersion: bundle.schemaVersion,
     bundleContainsEvent: bundle.events?.some((item) => item.eventId === eventId) === true,
     bundleEventCount: bundle.summary?.eventCount,
+    bundleListedEventCount: Array.isArray(bundle.events) ? bundle.events.length : undefined,
     eventKind: event.eventKind,
     eventCategory: event.eventCategory,
     verdict: event.verdict ?? recorded.items?.[0]?.verdict,

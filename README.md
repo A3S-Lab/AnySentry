@@ -388,7 +388,9 @@ evidence event. The warning reason binds to the same canonical
 warning bundle fields bind to the same Evidence Bundle as the success evidence:
 `warning.bundleSchemaVersion` must be
 `anysentry.evidence_bundle.v1`, `warning.bundleContainsSourceEvent` must be
-true, and `warning.bundleEventCount` must match the success bundle count.
+true, `warning.bundleEventCount` must match the success bundle summary count,
+and `warning.bundleListedEventCount` must match the success bundle's listed
+event count.
 Success summaries also include the inner Skill output health/list/describe
 proofs, event, workspace, run, agent, session, bundle IDs, and inner API timing
 fields under `evidence.skillOutput`, and the verifier fails if those proofs do
@@ -414,8 +416,11 @@ requires both the stored event and the Skill output to remain
 `evidence.skillOutput.queriedBack=true`, so automation can detect
 evidence-contract drift from the summary alone. The outer and Skill-reported
 Evidence Bundle schema, event-membership flag, and `bundleEventCount` fields
-must also be valid and equal, so automation can catch bundle schema, membership,
-and count drift without rebuilding the bundle.
+must also be valid and equal. The contract also exposes
+`bundleListedEventCount` from `events.length` on the Evidence Bundle response;
+it must be positive, must not exceed `bundleEventCount`, and must match the
+Skill-reported listed count. This lets automation distinguish bundle summary
+count drift from listed-member drift without rebuilding the bundle.
 Failed summaries always include explicit `failure.details` plus a failure
 evidence status, either with the recorded event/bundle IDs or with
 `recorded=false` plus the reason evidence was not written; these states are
@@ -434,7 +439,8 @@ must bind `failurePhase`, `failureReason`, persisted-attribute
 and running verifier metadata plus `workspacePath`, `runId`, `agentId`, and
 `sessionId` to the target identity.
 Recorded failure bundles must use schema `anysentry.evidence_bundle.v1`, must
-include the failure event, and must report a positive Evidence Bundle count.
+include the failure event, and must report positive Evidence Bundle summary and
+listed event counts, with the listed count not exceeding the summary count.
 When a required near-timeout warning is missing, the nested
 `warning.failure.evidence` must match the top-level `failure.evidence`,
 including persisted verifier and timing attribute evidence, so automation does
