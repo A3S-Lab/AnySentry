@@ -355,8 +355,11 @@ runs emit a single-line `VERIFIER_SUMMARY` JSON record with schema
 `anysentry.a3s_code_skill_verifier.summary.v1`, so production automation can
 assert `status`, failure phase, failure evidence, event IDs, warning isolation,
 warning event/bundle bindings, and timing fields without scraping human-readable
-log lines. Passed summaries must identify `verifier.skill=anysentry-api`, report
-a positive `verifier.toolCalls`, and include the warning budget state; when
+log lines. Summary validation binds `verifier.commit`, `verifier.model`, and the
+target `apiBase`/`runId`/`agentId`/`sessionId` to the running verifier process,
+so automation can reject stale or cross-run summaries. Passed summaries must
+identify `verifier.skill=anysentry-api`, report a positive `verifier.toolCalls`,
+and include the warning budget state; when
 `warning.required=true`, `warning.triggered` must also be true. Warning summaries
 are mutually exclusive: triggered warnings carry warning event/bundle/isolation
 evidence and no failure payload, while untriggered warnings carry no stale

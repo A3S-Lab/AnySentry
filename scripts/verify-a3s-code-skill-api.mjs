@@ -197,11 +197,29 @@ function verifierSummaryIssues(summary) {
   if (!['passed', 'failed'].includes(summary.status)) issues.push('status must be passed or failed');
   if (summary.verifier?.name !== 'verify-a3s-code-skill-api') issues.push('verifier.name must be verify-a3s-code-skill-api');
   if (!isNonEmptyString(summary.verifier?.commit)) issues.push('verifier.commit must be a non-empty string');
+  if (isNonEmptyString(summary.verifier?.commit) && summary.verifier.commit !== verifierCommit) {
+    issues.push('verifier.commit must match the running verifier commit');
+  }
   if (!isNonEmptyString(summary.verifier?.model)) issues.push('verifier.model must be a non-empty string');
+  if (isNonEmptyString(summary.verifier?.model) && summary.verifier.model !== model) {
+    issues.push('verifier.model must match the running verifier model');
+  }
   if (!isNonEmptyString(summary.target?.apiBase)) issues.push('target.apiBase must be a non-empty string');
+  if (isNonEmptyString(summary.target?.apiBase) && summary.target.apiBase !== apiBase) {
+    issues.push('target.apiBase must match the running verifier API base');
+  }
   if (!isNonEmptyString(summary.target?.runId)) issues.push('target.runId must be a non-empty string');
+  if (isNonEmptyString(summary.target?.runId) && summary.target.runId !== runId) {
+    issues.push('target.runId must match the running verifier runId');
+  }
   if (!isNonEmptyString(summary.target?.agentId)) issues.push('target.agentId must be a non-empty string');
+  if (isNonEmptyString(summary.target?.agentId) && summary.target.agentId !== agentId) {
+    issues.push('target.agentId must match the running verifier agentId');
+  }
   if (!isNonEmptyString(summary.target?.sessionId)) issues.push('target.sessionId must be a non-empty string');
+  if (isNonEmptyString(summary.target?.sessionId) && summary.target.sessionId !== sessionId) {
+    issues.push('target.sessionId must match the running verifier sessionId');
+  }
   if (!isRecord(summary.timings)) {
     issues.push('timings must be an object');
   } else {
@@ -803,6 +821,31 @@ function runVerifierSelfTest() {
     },
   };
   assert('verifier self-test accepts the passed summary contract', verifierSummaryIssues(passedSummary).length === 0, verifierSummaryIssues(passedSummary));
+
+  const mismatchedCommitSummary = {
+    ...passedSummary,
+    verifier: {
+      ...passedSummary.verifier,
+      commit: 'other-commit',
+    },
+  };
+  assert(
+    'verifier self-test rejects summaries from a different commit',
+    verifierSummaryIssues(mismatchedCommitSummary).includes('verifier.commit must match the running verifier commit'),
+    verifierSummaryIssues(mismatchedCommitSummary),
+  );
+  const mismatchedTargetSummary = {
+    ...passedSummary,
+    target: {
+      ...passedSummary.target,
+      runId: 'other-run',
+    },
+  };
+  assert(
+    'verifier self-test rejects summaries from a different run',
+    verifierSummaryIssues(mismatchedTargetSummary).includes('target.runId must match the running verifier runId'),
+    verifierSummaryIssues(mismatchedTargetSummary),
+  );
 
   const missingVerifierSkillSummary = {
     ...passedSummary,
