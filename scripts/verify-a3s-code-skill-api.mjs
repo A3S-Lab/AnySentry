@@ -973,6 +973,14 @@ function verifierSummaryIssues(summary) {
     }
     if (summary.evidence !== undefined) {
       issues.push(...successfulEvidenceIssues(summary, 'failed summary'));
+      if (
+        evidence?.recorded === true &&
+        isNonEmptyString(evidence.eventId) &&
+        isNonEmptyString(summary.evidence?.eventId) &&
+        evidence.eventId === summary.evidence.eventId
+      ) {
+        issues.push('recorded failure evidence.eventId must differ from success evidence.eventId');
+      }
     }
     if (summary.failure?.phase === 'summary_validation') {
       if (!isRecord(summary.summaryValidation)) {
@@ -2510,6 +2518,32 @@ function runVerifierSelfTest() {
     },
   );
   assert('verifier self-test accepts the failed summary contract', verifierSummaryIssues(failedSummary).length === 0, verifierSummaryIssues(failedSummary));
+  const failedWithSuccessEvidenceSummary = {
+    ...failedSummary,
+    evidence: passedSummary.evidence,
+  };
+  assert(
+    'verifier self-test accepts failed summaries with distinct success evidence',
+    verifierSummaryIssues(failedWithSuccessEvidenceSummary).length === 0,
+    verifierSummaryIssues(failedWithSuccessEvidenceSummary),
+  );
+  const reusedFailureSuccessEventSummary = {
+    ...failedWithSuccessEvidenceSummary,
+    failure: {
+      ...failedWithSuccessEvidenceSummary.failure,
+      evidence: {
+        ...failedWithSuccessEvidenceSummary.failure.evidence,
+        eventId: passedSummary.evidence.eventId,
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects recorded failure evidence that reuses success event IDs',
+    verifierSummaryIssues(reusedFailureSuccessEventSummary).includes(
+      'recorded failure evidence.eventId must differ from success evidence.eventId',
+    ),
+    verifierSummaryIssues(reusedFailureSuccessEventSummary),
+  );
   const staleFailedWarningSummary = {
     ...failedSummary,
     warning: {

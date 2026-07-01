@@ -422,7 +422,8 @@ evidence status, either with the recorded event/bundle IDs or with
 mutually exclusive, so recorded evidence must not carry `error` and unrecorded
 evidence must not carry stale event, bundle, or persisted-attribute fields. If a
 failed summary also includes top-level success `evidence`, that evidence must
-satisfy the same stored-event and Skill-output contract as a passed summary.
+satisfy the same stored-event and Skill-output contract as a passed summary and
+must not reuse the recorded failure evidence event ID.
 Recorded failure
 evidence must be the canonical
 `SecurityAction`/`security` event produced from the verifier's `SecurityFinding`,
