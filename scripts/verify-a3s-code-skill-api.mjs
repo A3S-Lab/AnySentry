@@ -284,11 +284,19 @@ function verifierSummaryIssues(summary) {
     if (summary.warning?.triggered === true) {
       if (!isNonEmptyString(summary.warning?.eventId)) issues.push('triggered warning.eventId must be a non-empty string');
       if (!isNonEmptyString(summary.warning?.bundleId)) issues.push('triggered warning.bundleId must be a non-empty string');
+      if (summary.warning?.failure !== undefined) issues.push('triggered warning.failure must be absent');
       if (isNonEmptyString(summary.evidence?.bundleId) && summary.warning?.bundleId !== summary.evidence.bundleId) {
         issues.push('triggered warning.bundleId must match evidence.bundleId');
       }
       if (summary.warning?.isolation?.warningRows !== 1) issues.push('triggered warning isolation.warningRows must be 1');
       if (summary.warning?.isolation?.llmPollutionCount !== 0) issues.push('triggered warning isolation.llmPollutionCount must be 0');
+    } else if (summary.warning?.triggered === false) {
+      if (summary.warning?.eventId !== undefined) issues.push('untriggered warning.eventId must be absent');
+      if (summary.warning?.bundleId !== undefined) issues.push('untriggered warning.bundleId must be absent');
+      if (summary.warning?.isolation !== undefined) issues.push('untriggered warning.isolation must be absent');
+      if (summary.status === 'passed' && summary.warning?.failure !== undefined) {
+        issues.push('passed untriggered warning.failure must be absent');
+      }
     }
   }
   return issues;
@@ -843,6 +851,39 @@ function runVerifierSelfTest() {
     'verifier self-test rejects passed summaries missing a required warning',
     verifierSummaryIssues(missingRequiredWarningSummary).includes('passed summary required warning must be triggered'),
     verifierSummaryIssues(missingRequiredWarningSummary),
+  );
+  const staleUntriggeredWarningSummary = {
+    ...passedSummary,
+    warning: {
+      required: false,
+      triggered: false,
+      thresholdMs: 100,
+      eventId: 'evt_stale_warning',
+      bundleId: 'evb_stale_warning',
+      isolation: {
+        warningRows: 1,
+        llmPollutionCount: 0,
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects stale warning evidence fields when warning is not triggered',
+    verifierSummaryIssues(staleUntriggeredWarningSummary).includes('untriggered warning.eventId must be absent'),
+    verifierSummaryIssues(staleUntriggeredWarningSummary),
+  );
+  const triggeredWarningFailureSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      failure: {
+        evidence: { recorded: false, error: 'stale failure' },
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects failure payloads on triggered warnings',
+    verifierSummaryIssues(triggeredWarningFailureSummary).includes('triggered warning.failure must be absent'),
+    verifierSummaryIssues(triggeredWarningFailureSummary),
   );
 
   const negativeTimingSummary = {

@@ -357,8 +357,11 @@ assert `status`, failure phase, failure evidence, event IDs, warning isolation,
 warning event/bundle bindings, and timing fields without scraping human-readable
 log lines. Passed summaries must identify `verifier.skill=anysentry-api`, report
 a positive `verifier.toolCalls`, and include the warning budget state; when
-`warning.required=true`, `warning.triggered` must also be true. Success summaries
-also include the inner Skill output event and bundle IDs under
+`warning.required=true`, `warning.triggered` must also be true. Warning summaries
+are mutually exclusive: triggered warnings carry warning event/bundle/isolation
+evidence and no failure payload, while untriggered warnings carry no stale
+warning event/bundle/isolation fields. Success summaries also include the inner
+Skill output event and bundle IDs under
 `evidence.skillOutput`, and the verifier fails if those IDs do not match the rows
 and Evidence Bundle queried by the outer runtime. Passed summary validation also
 requires both the stored event and the Skill output to remain `LlmCall`/`allow`,
