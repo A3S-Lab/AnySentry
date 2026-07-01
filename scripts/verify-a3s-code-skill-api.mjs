@@ -175,6 +175,7 @@ function verifierSummaryIssues(summary) {
       if (isNonEmptyString(summary.evidence?.bundleId) && summary.warning?.bundleId !== summary.evidence.bundleId) {
         issues.push('triggered warning.bundleId must match evidence.bundleId');
       }
+      if (summary.warning?.isolation?.warningRows !== 1) issues.push('triggered warning isolation.warningRows must be 1');
       if (summary.warning?.isolation?.llmPollutionCount !== 0) issues.push('triggered warning isolation.llmPollutionCount must be 0');
     }
   }
@@ -513,6 +514,9 @@ async function recordNearTimeoutWarning(event, bundle, timings) {
   if (nonRuntimeWarnings.length > 0) {
     throw new Error(`near-timeout warning rows must stay runtime evidence: ${compact(nonRuntimeWarnings)}`);
   }
+  if (warningItems.length !== 1) {
+    throw new Error(`near-timeout warning must produce exactly one runtime evidence row: ${compact(warningItems)}`);
+  }
   return {
     ...warningEvent,
     verifierIsolation: {
@@ -736,6 +740,21 @@ function runVerifierSelfTest() {
     'verifier self-test rejects warning bundle IDs that do not match evidence',
     verifierSummaryIssues(mismatchedWarningBundleSummary).includes('triggered warning.bundleId must match evidence.bundleId'),
     verifierSummaryIssues(mismatchedWarningBundleSummary),
+  );
+  const duplicateWarningRowsSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      isolation: {
+        ...passedSummary.warning.isolation,
+        warningRows: 2,
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects duplicate warning rows',
+    verifierSummaryIssues(duplicateWarningRowsSummary).includes('triggered warning isolation.warningRows must be 1'),
+    verifierSummaryIssues(duplicateWarningRowsSummary),
   );
   const normalizedMismatch = normalizedVerifierSummary(mismatchedSummary);
   assert(

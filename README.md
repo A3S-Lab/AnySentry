@@ -343,7 +343,8 @@ Successful runs that spend more than `A3S_CODE_NEAR_TIMEOUT_RATIO` (default
 allow-level `RuntimeEvent` with `progressive.warning=near_timeout`, so soak runs
 can spot latency drift before it becomes a hard timeout without polluting LLM
 call metrics. The verifier queries those warning rows back and fails if any
-near-timeout warning is stored as `LlmCall` or categorized as `llm`.
+near-timeout warning is stored as `LlmCall` or categorized as `llm`; triggered
+warning summaries also require exactly one runtime warning row for the run.
 Set `A3S_CODE_REQUIRE_NEAR_TIMEOUT_WARNING=1` with a deliberately low
 `A3S_CODE_NEAR_TIMEOUT_RATIO` for production smoke tests that must exercise the
 warning branch; if the warning is not emitted, the verifier records a
