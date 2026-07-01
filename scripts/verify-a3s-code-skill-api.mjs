@@ -252,6 +252,32 @@ function eventInnerTimingAttributeIssues(attributes, timings) {
   return issues;
 }
 
+function persistedInnerTimingAttributeEvidence(attributes) {
+  if (!isRecord(attributes)) return {};
+  return Object.fromEntries(
+    eventInnerTimingFields.map((field) => [field, attributes[`progressive.verifier.${field}`]]),
+  );
+}
+
+function persistedInnerTimingAttributeIssues(persistedTimings, timings, context) {
+  const issues = [];
+  if (!isRecord(persistedTimings)) {
+    return [`${context} evidence.persistedInnerTimingAttributes must be an object`];
+  }
+  if (!isRecord(timings)) {
+    return [`${context} evidence.skillOutput.timings must be an object`];
+  }
+  for (const field of eventInnerTimingFields) {
+    const expected = timings[field];
+    if (!isFiniteNumber(expected) || expected < 0) {
+      issues.push(`${context} evidence.skillOutput.timings.${field} must be a non-negative number`);
+    } else if (Number(persistedTimings[field]) !== Math.round(expected)) {
+      issues.push(`${context} evidence.persistedInnerTimingAttributes.${field} must match skillOutput.timings.${field}`);
+    }
+  }
+  return issues;
+}
+
 function skillEventAttributeIssues(attributes) {
   const issues = [];
   if (!isRecord(attributes)) {
@@ -556,6 +582,13 @@ function successfulEvidenceIssues(summary, context) {
     ...persistedPreflightAttributeIssues(
       summary.evidence?.persistedPreflightAttributes,
       summary.evidence?.skillOutput,
+      context,
+    ),
+  );
+  issues.push(
+    ...persistedInnerTimingAttributeIssues(
+      summary.evidence?.persistedInnerTimingAttributes,
+      summary.evidence?.skillOutput?.timings,
       context,
     ),
   );
@@ -1407,6 +1440,12 @@ function runVerifierSelfTest() {
         healthOk: true,
         listed: true,
         describedOperation: expectedDescribedOperation,
+      },
+      persistedInnerTimingAttributes: {
+        innerHealthzMs: 1,
+        innerListMs: 2,
+        innerDescribeRecordMs: 3,
+        innerPreRecordMs: 6,
       },
       skillOutput: {
         eventId: 'evt_self_test',
@@ -2690,6 +2729,37 @@ function runVerifierSelfTest() {
     ),
     verifierSummaryIssues(driftedPersistedPreflightSummary),
   );
+  const missingPersistedInnerTimingSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      persistedInnerTimingAttributes: undefined,
+    },
+  };
+  assert(
+    'verifier self-test rejects passed summaries without persisted inner timing attributes',
+    verifierSummaryIssues(missingPersistedInnerTimingSummary).includes(
+      'passed summary evidence.persistedInnerTimingAttributes must be an object',
+    ),
+    verifierSummaryIssues(missingPersistedInnerTimingSummary),
+  );
+  const driftedPersistedInnerTimingSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      persistedInnerTimingAttributes: {
+        ...passedSummary.evidence.persistedInnerTimingAttributes,
+        innerListMs: passedSummary.evidence.skillOutput.timings.innerListMs + 1,
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects persisted inner timing attributes with Skill output drift',
+    verifierSummaryIssues(driftedPersistedInnerTimingSummary).includes(
+      'passed summary evidence.persistedInnerTimingAttributes.innerListMs must match skillOutput.timings.innerListMs',
+    ),
+    verifierSummaryIssues(driftedPersistedInnerTimingSummary),
+  );
   const driftedSkillOutputSummary = {
     ...passedSummary,
     evidence: {
@@ -3518,6 +3588,7 @@ async function main() {
         bundleContainsEvent: bundle.events?.some((item) => item.eventId === event.eventId) === true,
         bundleEventCount: bundle.summary?.eventCount,
         persistedPreflightAttributes: persistedPreflightAttributeEvidence(event.attributes),
+        persistedInnerTimingAttributes: persistedInnerTimingAttributeEvidence(event.attributes),
         skillOutput: {
           eventId: skillOutput.eventId,
           workspacePath: skillOutput.workspacePath,

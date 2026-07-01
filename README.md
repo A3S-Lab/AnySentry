@@ -395,8 +395,11 @@ persists the same preflight proof attributes
 (`progressive.verifier.healthOk`, `progressive.verifier.listed`, and
 `progressive.verifier.describedOperation`), and the outer verifier rejects rows
 whose attributes drift from the Skill output. It also exposes
-`evidence.workspacePath`, `evidence.runId`, `evidence.agentId`, and
-`evidence.sessionId`, which must match the target identity. Passed summary validation also
+`evidence.persistedInnerTimingAttributes` for the stored pre-record timing
+attributes, and those values must match `evidence.skillOutput.timings`. The
+stored success evidence row also exposes `evidence.workspacePath`,
+`evidence.runId`, `evidence.agentId`, and `evidence.sessionId`, which must match
+the target identity. Passed summary validation also
 requires both the stored event and the Skill output to remain
 `LlmCall`/`llm`/`allow`, with matching event categories and
 `evidence.skillOutput.queriedBack=true`, so automation can detect
