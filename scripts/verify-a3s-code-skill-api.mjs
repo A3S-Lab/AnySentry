@@ -965,15 +965,51 @@ async function main() {
     process.exit(process.exitCode);
   }
 
+  async function failPhase(phase, reason, details, failureEvidenceOverride) {
+    timings.elapsed = durationMs(verifierStartedAt);
+    const failureTimings = {
+      ...timings,
+      failurePhase: phase,
+    };
+    const failureEvidence = failureEvidenceOverride ?? (await recordFailureEvidence(reason, details, failureTimings));
+    printVerifierSummary(failureSummary(phase, reason, details, failureTimings, failureEvidence));
+    throw new Error(reason);
+  }
+
   const healthStartedAt = Date.now();
-  await request('/healthz');
-  timings.healthz = durationMs(healthStartedAt);
+  try {
+    await request('/healthz');
+    timings.healthz = durationMs(healthStartedAt);
+  } catch (error) {
+    timings.healthz = durationMs(healthStartedAt);
+    const details = error instanceof Error ? error.message : String(error);
+    await failPhase('healthz', 'AnySentry API healthz failed before a3s-code run', details, {
+      recorded: false,
+      error: 'AnySentry API healthz failed before failure evidence could be written',
+    });
+  }
   pass('AnySentry API healthz responds before a3s-code run');
 
   const loadStartedAt = Date.now();
-  const { Agent } = await loadA3sCode();
-  const agent = await Agent.create(aclPath);
-  timings.loadA3sCode = durationMs(loadStartedAt);
+  let Agent;
+  try {
+    ({ Agent } = await loadA3sCode());
+    timings.loadA3sCode = durationMs(loadStartedAt);
+  } catch (error) {
+    timings.loadA3sCode = durationMs(loadStartedAt);
+    const details = error instanceof Error ? error.message : String(error);
+    await failPhase('load_a3s_code', 'unable to load @a3s-lab/code before a3s-code run', details);
+  }
+  const createAgentStartedAt = Date.now();
+  let agent;
+  try {
+    agent = await Agent.create(aclPath);
+    timings.createAgent = durationMs(createAgentStartedAt);
+  } catch (error) {
+    timings.createAgent = durationMs(createAgentStartedAt);
+    const details = error instanceof Error ? error.message : String(error);
+    await failPhase('agent_create', 'unable to create a3s-code Agent before Skill run', details);
+  }
   const session = agent.session(repoRoot, {
     model,
     builtinSkills: false,
@@ -1010,20 +1046,9 @@ async function main() {
     }
   }
 
-  async function failVerification(phase, reason, details) {
-    timings.elapsed = durationMs(verifierStartedAt);
-    const failureTimings = {
-      ...timings,
-      failurePhase: phase,
-    };
-    const failureEvidence = await recordFailureEvidence(reason, details, failureTimings);
-    printVerifierSummary(failureSummary(phase, reason, details, failureTimings, failureEvidence));
-    throw new Error(reason);
-  }
-
   async function requireVerification(message, condition, phase, reason, details) {
     assert(message, condition, details);
-    if (!condition) await failVerification(phase, reason, details);
+    if (!condition) await failPhase(phase, reason, details);
   }
 
   try {
@@ -1241,7 +1266,7 @@ async function main() {
       warningEvent = await recordNearTimeoutWarning(event, bundle, timings);
     } catch (error) {
       const details = error instanceof Error ? error.message : String(error);
-      await failVerification('near_timeout_warning', 'near-timeout warning evidence failed validation', details);
+      await failPhase('near_timeout_warning', 'near-timeout warning evidence failed validation', details);
     }
     let warningRequirementFailure;
     let summaryFailure;
