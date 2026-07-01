@@ -66,6 +66,7 @@ const skillOutputTimingFields = [
 ];
 const eventInnerTimingFields = ['innerHealthzMs', 'innerListMs', 'innerDescribeRecordMs', 'innerPreRecordMs'];
 const expectedProgressiveFlow = 'healthz,list,describe,execute,events-list,build-evidence-bundle';
+const nearTimeoutWarningReason = 'a3s-code Skill verifier completed close to its timeout budget';
 
 function durationMs(startedAt) {
   return Math.max(0, Date.now() - startedAt);
@@ -371,6 +372,9 @@ function warningEvidenceBindingIssues(warningEvent, event, bundle, timings) {
   }
   if (attributes['progressive.warning'] !== 'near_timeout') {
     issues.push('warning attribute progressive.warning must be near_timeout');
+  }
+  if (attributes['progressive.warning.reason'] !== nearTimeoutWarningReason) {
+    issues.push('warning attribute progressive.warning.reason must match the expected warning reason');
   }
   if (attributes['progressive.warning.eventId'] !== event.eventId) {
     issues.push('warning attribute progressive.warning.eventId must match the source event ID');
@@ -1079,7 +1083,7 @@ async function recordNearTimeoutWarning(event, bundle, timings) {
     'progressive.runner': 'a3s-code',
     'progressive.skill': 'anysentry-api',
     'progressive.warning': 'near_timeout',
-    'progressive.warning.reason': 'a3s-code Skill verifier completed close to its timeout budget',
+    'progressive.warning.reason': nearTimeoutWarningReason,
     'progressive.warning.eventId': event.eventId,
     'progressive.warning.bundleId': bundle.bundleId,
     'progressive.warning.thresholdMs': nearTimeoutThresholdMs,
@@ -1471,6 +1475,7 @@ function runVerifierSelfTest() {
       'progressive.runner': 'a3s-code',
       'progressive.skill': 'anysentry-api',
       'progressive.warning': 'near_timeout',
+      'progressive.warning.reason': nearTimeoutWarningReason,
       'progressive.warning.eventId': passedSummary.evidence.eventId,
       'progressive.warning.bundleId': passedSummary.evidence.bundleId,
       'progressive.warning.thresholdMs': nearTimeoutThresholdMs,
@@ -1494,6 +1499,20 @@ function runVerifierSelfTest() {
       'warning attribute progressive.verifier.elapsedMs must match verifier timing metadata',
     ),
     warningEvidenceBindingIssues(driftedWarningTimingEvent, passedEvent, passedBundle, passedSummary.timings),
+  );
+  const driftedWarningReasonEvent = {
+    ...passedWarningEvent,
+    attributes: {
+      ...passedWarningEvent.attributes,
+      'progressive.warning.reason': 'other warning reason',
+    },
+  };
+  assert(
+    'verifier self-test rejects near-timeout warning reason drift',
+    warningEvidenceBindingIssues(driftedWarningReasonEvent, passedEvent, passedBundle, passedSummary.timings).includes(
+      'warning attribute progressive.warning.reason must match the expected warning reason',
+    ),
+    warningEvidenceBindingIssues(driftedWarningReasonEvent, passedEvent, passedBundle, passedSummary.timings),
   );
 
   const mismatchedCommitSummary = {
