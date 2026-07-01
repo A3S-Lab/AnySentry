@@ -437,7 +437,8 @@ include the failure event, and must report a positive Evidence Bundle count.
 When a required near-timeout warning is missing, the nested
 `warning.failure.evidence` must match the top-level `failure.evidence`,
 including persisted verifier and timing attribute evidence, so automation does
-not need to guess which failure record is authoritative. Timing values in
+not need to guess which failure record is authoritative. Other failed summaries
+must not carry stale `warning` payloads. Timing values in
 summaries must be non-negative
 numbers or non-empty strings, and failed summaries outside preflight and
 summary-validation must bind `timings.failurePhase` to `failure.phase`. If the

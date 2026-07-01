@@ -818,6 +818,10 @@ function successfulEvidenceIssues(summary, context) {
 function verifierSummaryIssues(summary) {
   const issues = [];
   if (!isRecord(summary)) return ['summary must be an object'];
+  const isRequiredWarningFailure =
+    summary.status === 'failed' &&
+    summary.failure?.phase === 'near_timeout_warning' &&
+    summary.failure?.reason === 'required near-timeout warning was not emitted';
   if (summary.schemaVersion !== verifierSummarySchema) issues.push('schemaVersion must be anysentry.a3s_code_skill_verifier.summary.v1');
   if (!['passed', 'failed'].includes(summary.status)) issues.push('status must be passed or failed');
   if (summary.verifier?.name !== 'verify-a3s-code-skill-api') issues.push('verifier.name must be verify-a3s-code-skill-api');
@@ -984,6 +988,9 @@ function verifierSummaryIssues(summary) {
   }
 
   if (summary.warning !== undefined) {
+    if (summary.status === 'failed' && !isRequiredWarningFailure) {
+      issues.push('failed summary warning must be absent unless required near-timeout warning was missing');
+    }
     if (typeof summary.warning?.required !== 'boolean') issues.push('warning.required must be a boolean');
     if (typeof summary.warning?.triggered !== 'boolean') issues.push('warning.triggered must be a boolean');
     if (!isFiniteNumber(summary.warning?.thresholdMs) || summary.warning.thresholdMs <= 0) issues.push('warning.thresholdMs must be a positive number');
@@ -2480,6 +2487,21 @@ function runVerifierSelfTest() {
     },
   );
   assert('verifier self-test accepts the failed summary contract', verifierSummaryIssues(failedSummary).length === 0, verifierSummaryIssues(failedSummary));
+  const staleFailedWarningSummary = {
+    ...failedSummary,
+    warning: {
+      required: requireNearTimeoutWarning,
+      triggered: false,
+      thresholdMs: nearTimeoutThresholdMs,
+    },
+  };
+  assert(
+    'verifier self-test rejects stale warning payloads on non-warning failures',
+    verifierSummaryIssues(staleFailedWarningSummary).includes(
+      'failed summary warning must be absent unless required near-timeout warning was missing',
+    ),
+    verifierSummaryIssues(staleFailedWarningSummary),
+  );
   const staleFailedSummaryValidationSummary = {
     ...failedSummary,
     summaryValidation: {
