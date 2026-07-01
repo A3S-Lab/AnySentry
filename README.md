@@ -364,9 +364,12 @@ computed timeout threshold. Passed summaries must identify
 `verifier.skill=anysentry-api`, report a positive `verifier.toolCalls`, and
 include the warning budget state; when
 `warning.required=true`, `warning.triggered` must also be true. Warning summaries
-are mutually exclusive: triggered warnings carry warning event/bundle/isolation
-evidence and no failure payload, while untriggered warnings carry no stale
-warning event/bundle/isolation fields. Success summaries also include the inner
+are mutually exclusive: triggered warnings carry warning event kind, category,
+verdict, bundle, and isolation evidence and no failure payload, while
+untriggered warnings carry no stale warning event or isolation fields. Triggered
+warnings must be separate `RuntimeEvent`/`runtime`/`allow` rows, not the success
+`LlmCall` row, so summary-only automation can verify that latency warnings did
+not pollute LLM evidence. Success summaries also include the inner
 Skill output event, run, agent, and bundle IDs under `evidence.skillOutput`, and
 the verifier fails if those IDs do not match the target identity, rows, and
 Evidence Bundle queried by the outer runtime. Passed summary validation also

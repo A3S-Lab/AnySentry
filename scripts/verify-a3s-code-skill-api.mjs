@@ -324,8 +324,14 @@ function verifierSummaryIssues(summary) {
     }
     if (summary.warning?.triggered === true) {
       if (!isNonEmptyString(summary.warning?.eventId)) issues.push('triggered warning.eventId must be a non-empty string');
+      if (summary.warning?.eventKind !== 'RuntimeEvent') issues.push('triggered warning.eventKind must be RuntimeEvent');
+      if (summary.warning?.eventCategory !== 'runtime') issues.push('triggered warning.eventCategory must be runtime');
+      if (summary.warning?.verdict !== 'allow') issues.push('triggered warning.verdict must be allow');
       if (!isNonEmptyString(summary.warning?.bundleId)) issues.push('triggered warning.bundleId must be a non-empty string');
       if (summary.warning?.failure !== undefined) issues.push('triggered warning.failure must be absent');
+      if (isNonEmptyString(summary.evidence?.eventId) && summary.warning?.eventId === summary.evidence.eventId) {
+        issues.push('triggered warning.eventId must differ from evidence.eventId');
+      }
       if (isNonEmptyString(summary.evidence?.bundleId) && summary.warning?.bundleId !== summary.evidence.bundleId) {
         issues.push('triggered warning.bundleId must match evidence.bundleId');
       }
@@ -333,6 +339,9 @@ function verifierSummaryIssues(summary) {
       if (summary.warning?.isolation?.llmPollutionCount !== 0) issues.push('triggered warning isolation.llmPollutionCount must be 0');
     } else if (summary.warning?.triggered === false) {
       if (summary.warning?.eventId !== undefined) issues.push('untriggered warning.eventId must be absent');
+      if (summary.warning?.eventKind !== undefined) issues.push('untriggered warning.eventKind must be absent');
+      if (summary.warning?.eventCategory !== undefined) issues.push('untriggered warning.eventCategory must be absent');
+      if (summary.warning?.verdict !== undefined) issues.push('untriggered warning.verdict must be absent');
       if (summary.warning?.bundleId !== undefined) issues.push('untriggered warning.bundleId must be absent');
       if (summary.warning?.isolation !== undefined) issues.push('untriggered warning.isolation must be absent');
       if (summary.status === 'passed' && summary.warning?.failure !== undefined) {
@@ -838,6 +847,9 @@ function runVerifierSelfTest() {
       triggered: true,
       thresholdMs: nearTimeoutThresholdMs,
       eventId: 'evt_warning_self_test',
+      eventKind: 'RuntimeEvent',
+      eventCategory: 'runtime',
+      verdict: 'allow',
       bundleId: 'evb_self_test',
       isolation: {
         warningRows: 1,
@@ -999,6 +1011,22 @@ function runVerifierSelfTest() {
     verifierSummaryIssues(staleUntriggeredWarningSummary).includes('untriggered warning.eventId must be absent'),
     verifierSummaryIssues(staleUntriggeredWarningSummary),
   );
+  const staleUntriggeredWarningKindSummary = {
+    ...passedSummary,
+    warning: {
+      required: false,
+      triggered: false,
+      thresholdMs: nearTimeoutThresholdMs,
+      eventKind: 'RuntimeEvent',
+      eventCategory: 'runtime',
+      verdict: 'allow',
+    },
+  };
+  assert(
+    'verifier self-test rejects stale warning contract fields when warning is not triggered',
+    verifierSummaryIssues(staleUntriggeredWarningKindSummary).includes('untriggered warning.eventKind must be absent'),
+    verifierSummaryIssues(staleUntriggeredWarningKindSummary),
+  );
   const triggeredWarningFailureSummary = {
     ...passedSummary,
     warning: {
@@ -1012,6 +1040,42 @@ function runVerifierSelfTest() {
     'verifier self-test rejects failure payloads on triggered warnings',
     verifierSummaryIssues(triggeredWarningFailureSummary).includes('triggered warning.failure must be absent'),
     verifierSummaryIssues(triggeredWarningFailureSummary),
+  );
+  const driftedWarningEventKindSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      eventKind: 'LlmCall',
+    },
+  };
+  assert(
+    'verifier self-test rejects triggered warnings with drifted event kind',
+    verifierSummaryIssues(driftedWarningEventKindSummary).includes('triggered warning.eventKind must be RuntimeEvent'),
+    verifierSummaryIssues(driftedWarningEventKindSummary),
+  );
+  const driftedWarningEventCategorySummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      eventCategory: 'llm',
+    },
+  };
+  assert(
+    'verifier self-test rejects triggered warnings with drifted event category',
+    verifierSummaryIssues(driftedWarningEventCategorySummary).includes('triggered warning.eventCategory must be runtime'),
+    verifierSummaryIssues(driftedWarningEventCategorySummary),
+  );
+  const reusedWarningEventSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      eventId: passedSummary.evidence.eventId,
+    },
+  };
+  assert(
+    'verifier self-test rejects warnings that reuse the success event ID',
+    verifierSummaryIssues(reusedWarningEventSummary).includes('triggered warning.eventId must differ from evidence.eventId'),
+    verifierSummaryIssues(reusedWarningEventSummary),
   );
 
   const negativeTimingSummary = {
@@ -1902,6 +1966,9 @@ async function main() {
         triggered: Boolean(warningEvent),
         thresholdMs: nearTimeoutThresholdMs,
         eventId: warningEvent?.eventId,
+        eventKind: warningEvent?.eventKind,
+        eventCategory: warningEvent?.eventCategory,
+        verdict: warningEvent?.verdict,
         bundleId: warningEvent?.attributes?.['progressive.warning.bundleId'],
         isolation: warningEvent?.verifierIsolation,
         failure: warningRequirementFailure,
