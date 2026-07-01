@@ -935,8 +935,13 @@ function compact(value, limit = 2400) {
   return text.length > limit ? `${text.slice(0, limit)}... [truncated]` : text;
 }
 
+function persistedAttributeText(value, limit = 240) {
+  const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  return text.length > limit ? text.slice(0, limit) : text;
+}
+
 function failureDetailsText(details) {
-  return compact(details, 1200);
+  return persistedAttributeText(details);
 }
 
 async function withTimeout(label, task, timeoutMs, onTimeout) {
@@ -2032,6 +2037,12 @@ function runVerifierSelfTest() {
     failureEvidenceBindingIssues(passedFailureEvent, failedReason, 'invalid JSON', failedTimings).length === 0,
     failureEvidenceBindingIssues(passedFailureEvent, failedReason, 'invalid JSON', failedTimings),
   );
+  const longFailureDetails = `long failure details ${'x'.repeat(300)}`;
+  assert(
+    'verifier self-test truncates failure details to the persisted attribute budget',
+    failureDetailsText(longFailureDetails).length === 240 && failureDetailsText(longFailureDetails) === longFailureDetails.slice(0, 240),
+    failureDetailsText(longFailureDetails),
+  );
   const driftedFailureReasonEvent = {
     ...passedFailureEvent,
     attributes: {
@@ -2788,8 +2799,9 @@ Constraints:
 - Do not edit files.
 - Use bash to run exactly one verification command.
 - Follow the progressive flow: healthz, list, describe, execute, events/list, buildEvidenceBundle.
-- Return only the compact JSON printed by the command.
+- Return only the final stdout line printed by the command, copied byte-for-byte.
 - Do not reconstruct, rewrite, or summarize the JSON yourself.
+- If the command succeeds, any markdown, bullets, prose, or rewritten JSON makes this verification fail.
 
 Run this command:
 

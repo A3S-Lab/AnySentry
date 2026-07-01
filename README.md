@@ -405,9 +405,9 @@ evidence was not written. If a failed summary also includes top-level success
 contract as a passed summary. Recorded failure evidence must be the canonical
 `SecurityAction`/`security` event produced from the verifier's `SecurityFinding`,
 must carry a non-allow verdict, must use `riskCategory=runtime_failure`, and
-must bind `failurePhase`, `failureReason`, and compacted `failureDetails` to the
-top-level failure plus `workspacePath`, `runId`, `agentId`, and `sessionId` to
-the target identity.
+must bind `failurePhase`, `failureReason`, and persisted-attribute
+`failureDetails` to the top-level failure plus `workspacePath`, `runId`,
+`agentId`, and `sessionId` to the target identity.
 Recorded failure bundles must use schema `anysentry.evidence_bundle.v1`, must
 include the failure event, and must report a positive Evidence Bundle count.
 When a required near-timeout warning is missing, the nested
