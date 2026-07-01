@@ -181,6 +181,7 @@ const recordedFailureEvidenceFields = [
   'verdict',
   'riskCategory',
   'persistedVerifierAttributes',
+  'persistedSkillAttributes',
   'persistedTimingAttributes',
   'bundleId',
   'bundleSchemaVersion',
@@ -642,17 +643,29 @@ function persistedSkillAttributeEvidence(attributes) {
   );
 }
 
-function persistedSkillAttributeIssues(persistedAttributes, context) {
+function persistedSkillAttributePathIssues(persistedAttributes, path) {
   const issues = [];
   if (!isRecord(persistedAttributes)) {
-    return [`${context} evidence.persistedSkillAttributes must be an object`];
+    return [`${path} must be an object`];
   }
   for (const { field, expected } of skillEventAttributeSummaryBindings) {
     if (!sameAttributeValue(persistedAttributes[field], expected)) {
-      issues.push(`${context} evidence.persistedSkillAttributes.${field} must be ${expectedValueText(expected)}`);
+      issues.push(`${path}.${field} must be ${expectedValueText(expected)}`);
     }
   }
   return issues;
+}
+
+function persistedSkillAttributeIssues(persistedAttributes, context) {
+  return persistedSkillAttributePathIssues(persistedAttributes, `${context} evidence.persistedSkillAttributes`);
+}
+
+function warningPersistedSkillAttributeIssues(persistedAttributes) {
+  return persistedSkillAttributePathIssues(persistedAttributes, 'triggered warning.persistedSkillAttributes');
+}
+
+function failurePersistedSkillAttributeIssues(persistedAttributes) {
+  return persistedSkillAttributePathIssues(persistedAttributes, 'recorded failure evidence.persistedSkillAttributes');
 }
 
 function skillOutputPreflightIssues(skillOutput, prefix) {
@@ -956,11 +969,8 @@ function warningEvidenceBindingIssues(warningEvent, event, bundle, timings) {
   for (const key of auditIssues) {
     issues.push(`warning attribute ${key} must match verifier audit metadata`);
   }
-  if (attributes['progressive.runner'] !== 'a3s-code') {
-    issues.push('warning attribute progressive.runner must be a3s-code');
-  }
-  if (attributes['progressive.skill'] !== 'anysentry-api') {
-    issues.push('warning attribute progressive.skill must be anysentry-api');
+  for (const issue of skillEventAttributeIssues(attributes)) {
+    issues.push(issue.replace(/^event attribute/u, 'warning attribute'));
   }
   if (attributes['progressive.warning'] !== 'near_timeout') {
     issues.push('warning attribute progressive.warning must be near_timeout');
@@ -1022,11 +1032,8 @@ function failureEvidenceBindingIssues(failureEvent, reason, details, timings) {
   for (const key of auditIssues) {
     issues.push(`failure attribute ${key} must match verifier audit metadata`);
   }
-  if (attributes['progressive.runner'] !== 'a3s-code') {
-    issues.push('failure attribute progressive.runner must be a3s-code');
-  }
-  if (attributes['progressive.skill'] !== 'anysentry-api') {
-    issues.push('failure attribute progressive.skill must be anysentry-api');
+  for (const issue of skillEventAttributeIssues(attributes)) {
+    issues.push(issue.replace(/^event attribute/u, 'failure attribute'));
   }
   if (!trueAttribute(attributes['progressive.failure'])) {
     issues.push('failure attribute progressive.failure must be true');
@@ -1389,6 +1396,7 @@ function verifierSummaryIssues(summary) {
       issues.push(...bundleScopeIssues(evidence, evidence, 'recorded failure evidence', 'event'));
       issues.push(...bundleTimelineIssues(evidence, evidence, 'recorded failure evidence', 'event'));
       issues.push(...persistedVerifierAttributeIssues(evidence.persistedVerifierAttributes, 'recorded failure evidence'));
+      issues.push(...failurePersistedSkillAttributeIssues(evidence.persistedSkillAttributes));
       issues.push(...persistedTimingAttributeIssues(evidence.persistedTimingAttributes, summary.timings, 'recorded failure evidence'));
       if (evidence.workspacePath !== summary.target?.workspacePath) {
         issues.push('recorded failure evidence.workspacePath must match target.workspacePath');
@@ -1666,6 +1674,7 @@ function verifierSummaryIssues(summary) {
         }
       }
       issues.push(...persistedVerifierAttributeIssues(summary.warning?.persistedVerifierAttributes, 'triggered warning'));
+      issues.push(...warningPersistedSkillAttributeIssues(summary.warning?.persistedSkillAttributes));
       issues.push(...persistedTimingAttributeIssues(summary.warning?.persistedTimingAttributes, summary.timings, 'triggered warning'));
       if (summary.warning?.isolation?.warningRows !== 1) issues.push('triggered warning isolation.warningRows must be 1');
       if (summary.warning?.isolation?.llmPollutionCount !== 0) issues.push('triggered warning isolation.llmPollutionCount must be 0');
@@ -1724,6 +1733,9 @@ function verifierSummaryIssues(summary) {
       }
       if (summary.warning?.persistedVerifierAttributes !== undefined) {
         issues.push('untriggered warning.persistedVerifierAttributes must be absent');
+      }
+      if (summary.warning?.persistedSkillAttributes !== undefined) {
+        issues.push('untriggered warning.persistedSkillAttributes must be absent');
       }
       if (summary.warning?.persistedTimingAttributes !== undefined) {
         issues.push('untriggered warning.persistedTimingAttributes must be absent');
@@ -1922,6 +1934,8 @@ async function recordFailureEvidence(reason, details, timings) {
                 ...failureAttributes,
                 'progressive.runner': 'a3s-code',
                 'progressive.skill': 'anysentry-api',
+                'progressive.flow': expectedProgressiveFlow,
+                'progressive.model': model,
                 'progressive.failure': true,
                 'progressive.failure.reason': reason,
                 'progressive.failure.details': failureDetailsText(details),
@@ -2036,6 +2050,7 @@ async function recordFailureEvidence(reason, details, timings) {
       verdict: failureEvent.verdict,
       riskCategory: failureEvent.riskCategory,
       persistedVerifierAttributes: persistedVerifierAttributeEvidence(failureAttrs),
+      persistedSkillAttributes: persistedSkillAttributeEvidence(failureAttrs),
       persistedTimingAttributes: persistedTimingAttributeEvidence(failureAttrs, timings),
       bundleId: bundle.bundleId,
       bundleSchemaVersion: bundle.schemaVersion,
@@ -2064,6 +2079,8 @@ async function recordNearTimeoutWarning(event, bundle, timings) {
     ...timingAttributes(timings),
     'progressive.runner': 'a3s-code',
     'progressive.skill': 'anysentry-api',
+    'progressive.flow': expectedProgressiveFlow,
+    'progressive.model': model,
     'progressive.warning': 'near_timeout',
     'progressive.warning.reason': nearTimeoutWarningReason,
     'progressive.warning.eventId': event.eventId,
@@ -2419,6 +2436,12 @@ function runVerifierSelfTest() {
       bundleTimelineRunId: runId,
       bundleTimelineSessionId: sessionId,
       persistedVerifierAttributes: persistedVerifierAttributeEvidence(verifierAttributes),
+      persistedSkillAttributes: {
+        runner: 'a3s-code',
+        skill: 'anysentry-api',
+        flow: expectedProgressiveFlow,
+        model,
+      },
       persistedTimingAttributes: {
         skill: nearTimeoutThresholdMs + 1,
         elapsed: nearTimeoutThresholdMs + 25,
@@ -2822,6 +2845,8 @@ function runVerifierSelfTest() {
       ...timingAttributes(passedSummary.timings),
       'progressive.runner': 'a3s-code',
       'progressive.skill': 'anysentry-api',
+      'progressive.flow': expectedProgressiveFlow,
+      'progressive.model': model,
       'progressive.warning': 'near_timeout',
       'progressive.warning.reason': nearTimeoutWarningReason,
       'progressive.warning.eventId': passedSummary.evidence.eventId,
@@ -2872,6 +2897,20 @@ function runVerifierSelfTest() {
       'warning attribute progressive.warning.reason must match the expected warning reason',
     ),
     warningEvidenceBindingIssues(driftedWarningReasonEvent, passedEvent, passedBundle, passedSummary.timings),
+  );
+  const driftedWarningSkillFlowEvent = {
+    ...passedWarningEvent,
+    attributes: {
+      ...passedWarningEvent.attributes,
+      'progressive.flow': 'healthz,list',
+    },
+  };
+  assert(
+    'verifier self-test rejects near-timeout warning Skill flow drift',
+    warningEvidenceBindingIssues(driftedWarningSkillFlowEvent, passedEvent, passedBundle, passedSummary.timings).includes(
+      `warning attribute progressive.flow must be ${expectedProgressiveFlow}`,
+    ),
+    warningEvidenceBindingIssues(driftedWarningSkillFlowEvent, passedEvent, passedBundle, passedSummary.timings),
   );
 
   const mismatchedCommitSummary = {
@@ -3174,6 +3213,37 @@ function runVerifierSelfTest() {
     ),
     verifierSummaryIssues(driftedWarningPersistedVerifierAttributesSummary),
   );
+  const missingWarningPersistedSkillAttributesSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      persistedSkillAttributes: undefined,
+    },
+  };
+  assert(
+    'verifier self-test rejects triggered warnings without persisted Skill attributes',
+    verifierSummaryIssues(missingWarningPersistedSkillAttributesSummary).includes(
+      'triggered warning.persistedSkillAttributes must be an object',
+    ),
+    verifierSummaryIssues(missingWarningPersistedSkillAttributesSummary),
+  );
+  const driftedWarningPersistedSkillAttributesSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      persistedSkillAttributes: {
+        ...passedSummary.warning.persistedSkillAttributes,
+        flow: 'healthz,list',
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects triggered warning persisted Skill flow drift',
+    verifierSummaryIssues(driftedWarningPersistedSkillAttributesSummary).includes(
+      `triggered warning.persistedSkillAttributes.flow must be ${expectedProgressiveFlow}`,
+    ),
+    verifierSummaryIssues(driftedWarningPersistedSkillAttributesSummary),
+  );
   const missingWarningPersistedTimingAttributesSummary = {
     ...passedSummary,
     warning: {
@@ -3334,6 +3404,23 @@ function runVerifierSelfTest() {
       'untriggered warning.persistedVerifierAttributes must be absent',
     ),
     verifierSummaryIssues(staleUntriggeredWarningVerifierAttributesSummary),
+  );
+  const staleUntriggeredWarningSkillAttributesSummary = {
+    ...staleUntriggeredWarningSummary,
+    warning: {
+      ...staleUntriggeredWarningSummary.warning,
+      eventId: undefined,
+      bundleId: undefined,
+      isolation: undefined,
+      persistedSkillAttributes: passedSummary.warning.persistedSkillAttributes,
+    },
+  };
+  assert(
+    'verifier self-test rejects stale warning Skill attributes when warning is not triggered',
+    verifierSummaryIssues(staleUntriggeredWarningSkillAttributesSummary).includes(
+      'untriggered warning.persistedSkillAttributes must be absent',
+    ),
+    verifierSummaryIssues(staleUntriggeredWarningSkillAttributesSummary),
   );
   const staleUntriggeredWarningTimingAttributesSummary = {
     ...staleUntriggeredWarningSummary,
@@ -3542,6 +3629,12 @@ function runVerifierSelfTest() {
       verdict: 'block',
       riskCategory: 'runtime_failure',
       persistedVerifierAttributes: persistedVerifierAttributeEvidence(verifierAttributes),
+      persistedSkillAttributes: {
+        runner: 'a3s-code',
+        skill: 'anysentry-api',
+        flow: expectedProgressiveFlow,
+        model,
+      },
       persistedTimingAttributes: persistedTimingAttributeEvidence(failedTimingAttributes, failedTimings),
       bundleId: 'evb_failure_self_test',
       bundleSchemaVersion: 'anysentry.evidence_bundle.v1',
@@ -3651,6 +3744,8 @@ function runVerifierSelfTest() {
       ...failedTimingAttributes,
       'progressive.runner': 'a3s-code',
       'progressive.skill': 'anysentry-api',
+      'progressive.flow': expectedProgressiveFlow,
+      'progressive.model': model,
       'progressive.failure': true,
       'progressive.failure.reason': failedReason,
       'progressive.failure.details': 'invalid JSON',
@@ -3694,6 +3789,20 @@ function runVerifierSelfTest() {
       'failure attribute progressive.failure.details must match the failure details',
     ),
     failureEvidenceBindingIssues(driftedFailureDetailsEvent, failedReason, 'invalid JSON', failedTimings),
+  );
+  const driftedFailureSkillFlowEvent = {
+    ...passedFailureEvent,
+    attributes: {
+      ...passedFailureEvent.attributes,
+      'progressive.flow': 'healthz,list',
+    },
+  };
+  assert(
+    'verifier self-test rejects failure evidence Skill flow drift',
+    failureEvidenceBindingIssues(driftedFailureSkillFlowEvent, failedReason, 'invalid JSON', failedTimings).includes(
+      `failure attribute progressive.flow must be ${expectedProgressiveFlow}`,
+    ),
+    failureEvidenceBindingIssues(driftedFailureSkillFlowEvent, failedReason, 'invalid JSON', failedTimings),
   );
 
   const driftedFailureSummary = failureSummary(
@@ -3797,6 +3906,43 @@ function runVerifierSelfTest() {
       'recorded failure evidence.persistedVerifierAttributes.closeTimeoutMs must match verifier audit metadata',
     ),
     verifierSummaryIssues(driftedFailureEvidenceVerifierAttrsSummary),
+  );
+  const missingFailureEvidenceSkillAttrsSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      persistedSkillAttributes: undefined,
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence without persisted Skill attributes',
+    verifierSummaryIssues(missingFailureEvidenceSkillAttrsSummary).includes(
+      'recorded failure evidence.persistedSkillAttributes must be an object',
+    ),
+    verifierSummaryIssues(missingFailureEvidenceSkillAttrsSummary),
+  );
+  const driftedFailureEvidenceSkillAttrsSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      persistedSkillAttributes: {
+        ...failedSummary.failure.evidence.persistedSkillAttributes,
+        flow: 'healthz,list',
+      },
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence persisted Skill flow drift',
+    verifierSummaryIssues(driftedFailureEvidenceSkillAttrsSummary).includes(
+      `recorded failure evidence.persistedSkillAttributes.flow must be ${expectedProgressiveFlow}`,
+    ),
+    verifierSummaryIssues(driftedFailureEvidenceSkillAttrsSummary),
   );
   const missingFailureEvidenceTimingAttrsSummary = failureSummary(
     'skill_output',
@@ -5760,6 +5906,7 @@ async function main() {
         ...(warningEvent ? bundleScopeEvidence(bundle) : {}),
         ...(warningEvent ? bundleTimelineEvidence(bundle, event.eventId) : {}),
         persistedVerifierAttributes: warningEvent ? persistedVerifierAttributeEvidence(warningEvent.attributes) : undefined,
+        persistedSkillAttributes: warningEvent ? persistedSkillAttributeEvidence(warningEvent.attributes) : undefined,
         persistedTimingAttributes: warningEvent ? persistedTimingAttributeEvidence(warningEvent.attributes, timings) : undefined,
         isolation: warningEvent?.verifierIsolation,
         failure: warningRequirementFailure,

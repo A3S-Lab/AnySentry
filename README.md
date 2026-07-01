@@ -381,7 +381,7 @@ the success `LlmCall` row, so summary-only automation can verify that latency
 warnings did not pollute LLM evidence. Triggered warning summaries also bind the
 warning row's `workspacePath`, `runId`, `agentId`, `sessionId`, and `sourceId`
 to the target identity and success evidence Source, expose
-`warning.persistedVerifierAttributes` and
+`warning.persistedVerifierAttributes`, `warning.persistedSkillAttributes`, and
 `warning.persistedTimingAttributes` from the warning row's stored audit
 metadata, and expose `warning.sourceEventId`, which must match the success
 evidence event. The warning reason binds to the same canonical
@@ -467,10 +467,11 @@ evidence must be the canonical
 `SecurityAction`/`security` event produced from the verifier's `SecurityFinding`,
 must carry a non-allow verdict, must use `riskCategory=runtime_failure`, and
 must bind `failurePhase`, `failureReason`, persisted-attribute
-`failureDetails`, `failure.evidence.persistedVerifierAttributes`, and
+`failureDetails`, `failure.evidence.persistedVerifierAttributes`,
+`failure.evidence.persistedSkillAttributes`, and
 `failure.evidence.persistedTimingAttributes` to the top-level failure, timings,
-and running verifier metadata plus `workspacePath`, `runId`, `agentId`, and
-`sessionId` to the target identity.
+running verifier metadata, and the same Skill provenance markers used by success
+evidence plus `workspacePath`, `runId`, `agentId`, and `sessionId` to the target identity.
 Recorded failure bundles must use schema `anysentry.evidence_bundle.v1`, must
 include the failure event, and must report positive Evidence Bundle summary and
 listed event counts, with the listed count not exceeding the summary count. They
@@ -481,8 +482,8 @@ timeline fields must likewise prove the failure event is present in the failure
 case-file timeline and bound to the failure trace, run, and session.
 When a required near-timeout warning is missing, the nested
 `warning.failure.evidence` must match the top-level `failure.evidence`,
-including persisted verifier and timing attribute evidence, so automation does
-not need to guess which failure record is authoritative. Other failed summaries
+including persisted verifier, Skill, and timing attribute evidence, so automation
+does not need to guess which failure record is authoritative. Other failed summaries
 must not carry stale `warning` payloads. Timing values in
 summaries must be non-negative
 numbers or non-empty strings, and failed summaries outside preflight and
