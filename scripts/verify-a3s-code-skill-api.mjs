@@ -75,6 +75,10 @@ function sameAttributeValue(actual, expected) {
   return actual === expected;
 }
 
+function trueAttribute(value) {
+  return value === true || value === 'true';
+}
+
 function currentGitCommit() {
   const fromEnv = (process.env.ANYSENTRY_VERIFIER_COMMIT ?? '').trim();
   if (fromEnv) return fromEnv;
@@ -226,11 +230,15 @@ async function recordFailureEvidence(reason, details, timings) {
         method: 'POST',
         body: JSON.stringify({ timeType: 'last_30d', runId, agentId, limit: 20 }),
       });
+      const matches = list.items?.filter((item) => item.runId === runId && item.agentId === agentId) ?? [];
+      const byRecordedId = matches.find((item) => item.eventId === recordedEventId);
+      if (byRecordedId) return byRecordedId;
       return list.items?.find(
         (item) =>
           item.runId === runId &&
           item.agentId === agentId &&
-          (item.eventId === recordedEventId || item.attributes?.['progressive.failure'] === true || item.attributes?.['progressive.failure'] === 'true'),
+          trueAttribute(item.attributes?.['progressive.failure']) &&
+          item.attributes?.['progressive.failure.reason'] === reason,
       );
     });
     if (!failureEvent?.eventId) {
