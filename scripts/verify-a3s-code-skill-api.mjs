@@ -548,8 +548,14 @@ function successfulEvidenceIssues(summary, context) {
   if (summary.evidence?.bundleEventCount !== summary.evidence?.skillOutput?.bundleEventCount) {
     issues.push(`${context} bundleEventCount must match skillOutput.bundleEventCount`);
   }
+  if (summary.evidence?.eventKind !== summary.evidence?.skillOutput?.eventKind) {
+    issues.push(`${context} eventKind must match skillOutput.eventKind`);
+  }
   if (summary.evidence?.eventCategory !== summary.evidence?.skillOutput?.eventCategory) {
     issues.push(`${context} eventCategory must match skillOutput.eventCategory`);
+  }
+  if (summary.evidence?.verdict !== summary.evidence?.skillOutput?.verdict) {
+    issues.push(`${context} verdict must match skillOutput.verdict`);
   }
   return issues;
 }
@@ -2352,6 +2358,36 @@ function runVerifierSelfTest() {
     'verifier self-test rejects Skill outputs with drifted evidence category',
     verifierSummaryIssues(driftedSkillOutputCategorySummary).includes('passed summary evidence.skillOutput.eventCategory must be llm'),
     verifierSummaryIssues(driftedSkillOutputCategorySummary),
+  );
+  const driftedSkillOutputKindSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        eventKind: 'RuntimeEvent',
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects Skill outputs with event kind drift from stored evidence',
+    verifierSummaryIssues(driftedSkillOutputKindSummary).includes('passed summary eventKind must match skillOutput.eventKind'),
+    verifierSummaryIssues(driftedSkillOutputKindSummary),
+  );
+  const driftedSkillOutputVerdictSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        verdict: 'block',
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects Skill outputs with verdict drift from stored evidence',
+    verifierSummaryIssues(driftedSkillOutputVerdictSummary).includes('passed summary verdict must match skillOutput.verdict'),
+    verifierSummaryIssues(driftedSkillOutputVerdictSummary),
   );
   const missingSkillOutputTimingsSummary = {
     ...passedSummary,
