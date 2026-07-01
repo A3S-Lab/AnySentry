@@ -375,7 +375,9 @@ row's `runId`, `agentId`, and `sessionId` to the target identity and expose
 summaries also include the inner
 Skill output event, run, agent, and bundle IDs under `evidence.skillOutput`, and
 the verifier fails if those IDs do not match the target identity, rows, and
-Evidence Bundle queried by the outer runtime. Passed summary validation also
+Evidence Bundle queried by the outer runtime. The stored success evidence row
+also exposes `evidence.runId`, `evidence.agentId`, and `evidence.sessionId`,
+which must match the target identity. Passed summary validation also
 requires both the stored event and the Skill output to remain
 `LlmCall`/`llm`/`allow`, with matching event categories and
 `evidence.skillOutput.queriedBack=true`, so automation can detect

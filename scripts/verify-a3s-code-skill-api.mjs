@@ -162,6 +162,9 @@ function evidenceFieldMismatchIssues(prefix, actual, expected, fields) {
 function successfulEvidenceIssues(summary, context) {
   const issues = [];
   if (!isNonEmptyString(summary.evidence?.eventId)) issues.push(`${context} evidence.eventId must be a non-empty string`);
+  if (!isNonEmptyString(summary.evidence?.runId)) issues.push(`${context} evidence.runId must be a non-empty string`);
+  if (!isNonEmptyString(summary.evidence?.agentId)) issues.push(`${context} evidence.agentId must be a non-empty string`);
+  if (!isNonEmptyString(summary.evidence?.sessionId)) issues.push(`${context} evidence.sessionId must be a non-empty string`);
   if (!isNonEmptyString(summary.evidence?.bundleId)) issues.push(`${context} evidence.bundleId must be a non-empty string`);
   if (!isPositiveInteger(summary.evidence?.bundleEventCount)) issues.push(`${context} evidence.bundleEventCount must be a positive integer`);
   if (summary.evidence?.eventKind !== 'LlmCall') issues.push(`${context} evidence.eventKind must be LlmCall`);
@@ -188,6 +191,21 @@ function successfulEvidenceIssues(summary, context) {
   if (summary.evidence?.skillOutput?.queriedBack !== true) issues.push(`${context} evidence.skillOutput.queriedBack must be true`);
   if (summary.evidence?.eventId !== summary.evidence?.skillOutput?.eventId) {
     issues.push(`${context} eventId must match skillOutput.eventId`);
+  }
+  if (summary.target?.runId !== summary.evidence?.runId) {
+    issues.push(`${context} target.runId must match evidence.runId`);
+  }
+  if (summary.target?.agentId !== summary.evidence?.agentId) {
+    issues.push(`${context} target.agentId must match evidence.agentId`);
+  }
+  if (summary.target?.sessionId !== summary.evidence?.sessionId) {
+    issues.push(`${context} target.sessionId must match evidence.sessionId`);
+  }
+  if (summary.evidence?.runId !== summary.evidence?.skillOutput?.runId) {
+    issues.push(`${context} evidence.runId must match skillOutput.runId`);
+  }
+  if (summary.evidence?.agentId !== summary.evidence?.skillOutput?.agentId) {
+    issues.push(`${context} evidence.agentId must match skillOutput.agentId`);
   }
   if (summary.target?.runId !== summary.evidence?.skillOutput?.runId) {
     issues.push(`${context} target.runId must match skillOutput.runId`);
@@ -842,6 +860,9 @@ function runVerifierSelfTest() {
     },
     evidence: {
       eventId: 'evt_self_test',
+      runId,
+      agentId,
+      sessionId,
       eventKind: 'LlmCall',
       eventCategory: 'llm',
       verdict: 'allow',
@@ -1322,6 +1343,42 @@ function runVerifierSelfTest() {
     'verifier self-test rejects mismatched Skill output IDs',
     verifierSummaryIssues(mismatchedSummary).includes('passed summary bundleId must match skillOutput.bundleId'),
     verifierSummaryIssues(mismatchedSummary),
+  );
+  const driftedEvidenceRunSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      runId: 'other-run',
+    },
+  };
+  assert(
+    'verifier self-test rejects stored evidence run identity drift',
+    verifierSummaryIssues(driftedEvidenceRunSummary).includes('passed summary target.runId must match evidence.runId'),
+    verifierSummaryIssues(driftedEvidenceRunSummary),
+  );
+  const driftedEvidenceAgentSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      agentId: 'other-agent',
+    },
+  };
+  assert(
+    'verifier self-test rejects stored evidence agent identity drift',
+    verifierSummaryIssues(driftedEvidenceAgentSummary).includes('passed summary target.agentId must match evidence.agentId'),
+    verifierSummaryIssues(driftedEvidenceAgentSummary),
+  );
+  const driftedEvidenceSessionSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      sessionId: 'other-session',
+    },
+  };
+  assert(
+    'verifier self-test rejects stored evidence session identity drift',
+    verifierSummaryIssues(driftedEvidenceSessionSummary).includes('passed summary target.sessionId must match evidence.sessionId'),
+    verifierSummaryIssues(driftedEvidenceSessionSummary),
   );
   const driftedEvidenceSummary = {
     ...passedSummary,
@@ -1900,6 +1957,13 @@ async function main() {
       event,
     );
     await requireVerification(
+      'stored event carries the verifier target identity',
+      event?.runId === runId && event?.agentId === agentId && event?.sessionId === sessionId,
+      'event_contract',
+      'stored event lost verifier target identity',
+      event,
+    );
+    await requireVerification(
       'stored event carries the a3s-code Skill evidence markers',
       event?.attributes?.['progressive.skill'] === 'anysentry-api' && event?.attributes?.['progressive.runner'] === 'a3s-code',
       'event_contract',
@@ -2015,6 +2079,9 @@ async function main() {
       },
       evidence: {
         eventId: event.eventId,
+        runId: event.runId,
+        agentId: event.agentId,
+        sessionId: event.sessionId,
         eventKind: event.eventKind,
         eventCategory: event.eventCategory,
         verdict: event.verdict,
