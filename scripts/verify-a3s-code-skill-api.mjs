@@ -116,6 +116,7 @@ const recordedFailureEvidenceFields = [
   'bundleContainsEvent',
   'bundleEventCount',
   'bundleListedEventCount',
+  'bundlePrimaryEventId',
 ];
 const failureEvidenceMatchFields = ['recorded', ...recordedFailureEvidenceFields, 'error'];
 const nearTimeoutWarningReason = 'a3s-code Skill verifier completed close to its timeout budget';
@@ -272,6 +273,20 @@ function listedBundleCountIssues(listedCount, eventCount, listedField, eventCoun
   }
   if (isPositiveInteger(eventCount) && listedCount > eventCount) {
     return [`${listedField} must not exceed ${eventCountField}`];
+  }
+  return [];
+}
+
+function bundlePrimaryEventId(bundle) {
+  return isRecord(bundle?.primary?.event) ? bundle.primary.event.eventId : undefined;
+}
+
+function primaryEventIdIssues(primaryEventId, expectedEventId, primaryField, expectedField) {
+  if (!isNonEmptyString(primaryEventId)) {
+    return [`${primaryField} must be a non-empty string`];
+  }
+  if (isNonEmptyString(expectedEventId) && primaryEventId !== expectedEventId) {
+    return [`${primaryField} must match ${expectedField}`];
   }
   return [];
 }
@@ -543,6 +558,14 @@ function skillOutputEvidenceIssues(skillOutput) {
       'skillOutput.bundleEventCount',
     ),
   );
+  issues.push(
+    ...primaryEventIdIssues(
+      skillOutput.bundlePrimaryEventId,
+      skillOutput.eventId,
+      'skillOutput.bundlePrimaryEventId',
+      'skillOutput.eventId',
+    ),
+  );
   if (skillOutput.queriedBack !== true) {
     issues.push('skillOutput.queriedBack must be true');
   }
@@ -593,6 +616,18 @@ function evidenceBundleBindingIssues(bundle, skillOutput, eventId) {
   if (isPositiveInteger(skillOutput.bundleListedEventCount) && bundleListedEventCount !== skillOutput.bundleListedEventCount) {
     issues.push('bundle.events.length must match skillOutput.bundleListedEventCount');
   }
+  const primaryEventId = bundlePrimaryEventId(bundle);
+  if (primaryEventId !== eventId) {
+    issues.push('bundle.primary.event.eventId must match the stored event');
+  }
+  issues.push(
+    ...primaryEventIdIssues(
+      skillOutput.bundlePrimaryEventId,
+      primaryEventId,
+      'skillOutput.bundlePrimaryEventId',
+      'bundle.primary.event.eventId',
+    ),
+  );
   return issues;
 }
 
@@ -745,6 +780,14 @@ function successfulEvidenceIssues(summary, context) {
       'evidence.bundleEventCount',
     ),
   );
+  issues.push(
+    ...primaryEventIdIssues(
+      summary.evidence?.bundlePrimaryEventId,
+      summary.evidence?.eventId,
+      `${context} evidence.bundlePrimaryEventId`,
+      'evidence.eventId',
+    ),
+  );
   if (summary.evidence?.eventKind !== 'LlmCall') issues.push(`${context} evidence.eventKind must be LlmCall`);
   if (summary.evidence?.eventCategory !== 'llm') issues.push(`${context} evidence.eventCategory must be llm`);
   if (summary.evidence?.verdict !== 'allow') issues.push(`${context} evidence.verdict must be allow`);
@@ -798,6 +841,14 @@ function successfulEvidenceIssues(summary, context) {
       summary.evidence?.skillOutput?.bundleEventCount,
       `${context} evidence.skillOutput.bundleListedEventCount`,
       'evidence.skillOutput.bundleEventCount',
+    ),
+  );
+  issues.push(
+    ...primaryEventIdIssues(
+      summary.evidence?.skillOutput?.bundlePrimaryEventId,
+      summary.evidence?.skillOutput?.eventId,
+      `${context} evidence.skillOutput.bundlePrimaryEventId`,
+      'evidence.skillOutput.eventId',
     ),
   );
   if (summary.evidence?.skillOutput?.eventKind !== 'LlmCall') issues.push(`${context} evidence.skillOutput.eventKind must be LlmCall`);
@@ -858,6 +909,9 @@ function successfulEvidenceIssues(summary, context) {
   }
   if (summary.evidence?.bundleListedEventCount !== summary.evidence?.skillOutput?.bundleListedEventCount) {
     issues.push(`${context} bundleListedEventCount must match skillOutput.bundleListedEventCount`);
+  }
+  if (summary.evidence?.bundlePrimaryEventId !== summary.evidence?.skillOutput?.bundlePrimaryEventId) {
+    issues.push(`${context} bundlePrimaryEventId must match skillOutput.bundlePrimaryEventId`);
   }
   if (summary.evidence?.eventKind !== summary.evidence?.skillOutput?.eventKind) {
     issues.push(`${context} eventKind must match skillOutput.eventKind`);
@@ -989,6 +1043,14 @@ function verifierSummaryIssues(summary) {
           evidence.bundleEventCount,
           'recorded failure evidence.bundleListedEventCount',
           'bundleEventCount',
+        ),
+      );
+      issues.push(
+        ...primaryEventIdIssues(
+          evidence.bundlePrimaryEventId,
+          evidence.eventId,
+          'recorded failure evidence.bundlePrimaryEventId',
+          'eventId',
         ),
       );
       issues.push(...persistedVerifierAttributeIssues(evidence.persistedVerifierAttributes, 'recorded failure evidence'));
@@ -1134,6 +1196,14 @@ function verifierSummaryIssues(summary) {
           'warning.bundleEventCount',
         ),
       );
+      issues.push(
+        ...primaryEventIdIssues(
+          summary.warning?.bundlePrimaryEventId,
+          summary.warning?.sourceEventId,
+          'triggered warning.bundlePrimaryEventId',
+          'warning.sourceEventId',
+        ),
+      );
       if (summary.warning?.failure !== undefined) issues.push('triggered warning.failure must be absent');
       if (isNonEmptyString(summary.evidence?.eventId) && summary.warning?.eventId === summary.evidence.eventId) {
         issues.push('triggered warning.eventId must differ from evidence.eventId');
@@ -1162,6 +1232,9 @@ function verifierSummaryIssues(summary) {
       if (summary.warning?.bundleListedEventCount !== summary.evidence?.bundleListedEventCount) {
         issues.push('triggered warning.bundleListedEventCount must match evidence.bundleListedEventCount');
       }
+      if (summary.warning?.bundlePrimaryEventId !== summary.evidence?.bundlePrimaryEventId) {
+        issues.push('triggered warning.bundlePrimaryEventId must match evidence.bundlePrimaryEventId');
+      }
       issues.push(...persistedVerifierAttributeIssues(summary.warning?.persistedVerifierAttributes, 'triggered warning'));
       issues.push(...persistedTimingAttributeIssues(summary.warning?.persistedTimingAttributes, summary.timings, 'triggered warning'));
       if (summary.warning?.isolation?.warningRows !== 1) issues.push('triggered warning isolation.warningRows must be 1');
@@ -1183,6 +1256,9 @@ function verifierSummaryIssues(summary) {
       if (summary.warning?.bundleEventCount !== undefined) issues.push('untriggered warning.bundleEventCount must be absent');
       if (summary.warning?.bundleListedEventCount !== undefined) {
         issues.push('untriggered warning.bundleListedEventCount must be absent');
+      }
+      if (summary.warning?.bundlePrimaryEventId !== undefined) {
+        issues.push('untriggered warning.bundlePrimaryEventId must be absent');
       }
       if (summary.warning?.persistedVerifierAttributes !== undefined) {
         issues.push('untriggered warning.persistedVerifierAttributes must be absent');
@@ -1439,6 +1515,9 @@ async function recordFailureEvidence(reason, details, timings) {
     if (bundle?.schemaVersion !== 'anysentry.evidence_bundle.v1' || !bundle.events?.some((item) => item.eventId === failureEvent.eventId)) {
       throw new Error(`failure evidence bundle did not include the failure event: ${compact(bundle)}`);
     }
+    if (bundlePrimaryEventId(bundle) !== failureEvent.eventId) {
+      throw new Error(`failure evidence bundle primary event did not match the failure event: ${compact(bundle)}`);
+    }
     if (!isPositiveInteger(bundle.summary?.eventCount)) {
       throw new Error(`failure evidence bundle did not report a positive event count: ${compact(bundle)}`);
     }
@@ -1466,6 +1545,7 @@ async function recordFailureEvidence(reason, details, timings) {
       bundleContainsEvent: bundle.events?.some((item) => item.eventId === failureEvent.eventId) === true,
       bundleEventCount: bundle.summary?.eventCount,
       bundleListedEventCount: Array.isArray(bundle.events) ? bundle.events.length : undefined,
+      bundlePrimaryEventId: bundlePrimaryEventId(bundle),
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -1674,6 +1754,7 @@ function runVerifierSelfTest() {
       bundleContainsEvent: true,
       bundleEventCount: 1,
       bundleListedEventCount: 1,
+      bundlePrimaryEventId: 'evt_self_test',
       persistedVerifierAttributes: persistedVerifierAttributeEvidence(verifierAttributes),
       persistedSkillAttributes: {
         runner: 'a3s-code',
@@ -1709,6 +1790,7 @@ function runVerifierSelfTest() {
         bundleContainsEvent: true,
         bundleEventCount: 1,
         bundleListedEventCount: 1,
+        bundlePrimaryEventId: 'evt_self_test',
         queriedBack: true,
         timings: {
           innerHealthzMs: 1,
@@ -1741,6 +1823,7 @@ function runVerifierSelfTest() {
       bundleContainsSourceEvent: true,
       bundleEventCount: 1,
       bundleListedEventCount: 1,
+      bundlePrimaryEventId: 'evt_self_test',
       persistedVerifierAttributes: persistedVerifierAttributeEvidence(verifierAttributes),
       persistedTimingAttributes: {
         skill: nearTimeoutThresholdMs + 1,
@@ -1802,6 +1885,17 @@ function runVerifierSelfTest() {
       'skillOutput.bundleListedEventCount must not exceed skillOutput.bundleEventCount',
     ),
     skillOutputEvidenceIssues(impossibleSkillOutputBundleListedCount),
+  );
+  const driftedSkillOutputPrimaryEventId = {
+    ...passedSummary.evidence.skillOutput,
+    bundlePrimaryEventId: 'evt_other_primary',
+  };
+  assert(
+    'verifier self-test rejects Skill outputs with drifted primary bundle event IDs',
+    skillOutputEvidenceIssues(driftedSkillOutputPrimaryEventId).includes(
+      'skillOutput.bundlePrimaryEventId must match skillOutput.eventId',
+    ),
+    skillOutputEvidenceIssues(driftedSkillOutputPrimaryEventId),
   );
   const driftedSkillOutputDescribe = {
     ...passedSummary.evidence.skillOutput,
@@ -1896,6 +1990,11 @@ function runVerifierSelfTest() {
   const passedBundle = {
     bundleId: passedSummary.evidence.bundleId,
     schemaVersion: passedSummary.evidence.bundleSchemaVersion,
+    primary: {
+      event: {
+        eventId: passedSummary.evidence.eventId,
+      },
+    },
     events: [{ eventId: passedSummary.evidence.eventId }],
     summary: { eventCount: passedSummary.evidence.bundleEventCount },
   };
@@ -1925,6 +2024,21 @@ function runVerifierSelfTest() {
       'bundle.events.length must match skillOutput.bundleListedEventCount',
     ),
     evidenceBundleBindingIssues(driftedBundleListedCount, passedSummary.evidence.skillOutput, passedSummary.evidence.eventId),
+  );
+  const driftedBundlePrimaryEventId = {
+    ...passedBundle,
+    primary: {
+      event: {
+        eventId: 'evt_other_primary',
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects Evidence Bundle primary event drift',
+    evidenceBundleBindingIssues(driftedBundlePrimaryEventId, passedSummary.evidence.skillOutput, passedSummary.evidence.eventId).includes(
+      'bundle.primary.event.eventId must match the stored event',
+    ),
+    evidenceBundleBindingIssues(driftedBundlePrimaryEventId, passedSummary.evidence.skillOutput, passedSummary.evidence.eventId),
   );
   const passedEvent = {
     eventId: passedSummary.evidence.eventId,
@@ -2633,6 +2747,7 @@ function runVerifierSelfTest() {
       bundleContainsEvent: true,
       bundleEventCount: 1,
       bundleListedEventCount: 1,
+      bundlePrimaryEventId: 'evt_failure_self_test',
     },
   );
   assert('verifier self-test accepts the failed summary contract', verifierSummaryIssues(failedSummary).length === 0, verifierSummaryIssues(failedSummary));
@@ -3086,6 +3201,23 @@ function runVerifierSelfTest() {
       'recorded failure evidence.bundleListedEventCount must not exceed bundleEventCount',
     ),
     verifierSummaryIssues(impossibleFailureBundleListedCountSummary),
+  );
+  const driftedFailureBundlePrimaryEventSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      bundlePrimaryEventId: 'evt_other_primary',
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence with drifted primary bundle event IDs',
+    verifierSummaryIssues(driftedFailureBundlePrimaryEventSummary).includes(
+      'recorded failure evidence.bundlePrimaryEventId must match eventId',
+    ),
+    verifierSummaryIssues(driftedFailureBundlePrimaryEventSummary),
   );
 
   const requiredWarningFailureEvidence = {
@@ -3708,6 +3840,37 @@ function runVerifierSelfTest() {
     ),
     verifierSummaryIssues(impossibleBundleListedCountSummary),
   );
+  const missingBundlePrimaryEventSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      bundlePrimaryEventId: undefined,
+    },
+  };
+  assert(
+    'verifier self-test rejects success evidence without a primary bundle event ID',
+    verifierSummaryIssues(missingBundlePrimaryEventSummary).includes(
+      'passed summary evidence.bundlePrimaryEventId must be a non-empty string',
+    ),
+    verifierSummaryIssues(missingBundlePrimaryEventSummary),
+  );
+  const mismatchedBundlePrimaryEventSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        bundlePrimaryEventId: 'evt_other_primary',
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects mismatched Evidence Bundle primary event IDs',
+    verifierSummaryIssues(mismatchedBundlePrimaryEventSummary).includes(
+      'passed summary bundlePrimaryEventId must match skillOutput.bundlePrimaryEventId',
+    ),
+    verifierSummaryIssues(mismatchedBundlePrimaryEventSummary),
+  );
   const driftedBundleSchemaSummary = {
     ...passedSummary,
     evidence: {
@@ -3845,6 +4008,34 @@ function runVerifierSelfTest() {
     ),
     verifierSummaryIssues(driftedWarningBundleListedCountSummary),
   );
+  const missingWarningBundlePrimaryEventSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      bundlePrimaryEventId: undefined,
+    },
+  };
+  assert(
+    'verifier self-test rejects triggered warnings without primary bundle event IDs',
+    verifierSummaryIssues(missingWarningBundlePrimaryEventSummary).includes(
+      'triggered warning.bundlePrimaryEventId must be a non-empty string',
+    ),
+    verifierSummaryIssues(missingWarningBundlePrimaryEventSummary),
+  );
+  const driftedWarningBundlePrimaryEventSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      bundlePrimaryEventId: 'evt_other_primary',
+    },
+  };
+  assert(
+    'verifier self-test rejects warning primary bundle event ID drift',
+    verifierSummaryIssues(driftedWarningBundlePrimaryEventSummary).includes(
+      'triggered warning.bundlePrimaryEventId must match warning.sourceEventId',
+    ),
+    verifierSummaryIssues(driftedWarningBundlePrimaryEventSummary),
+  );
   const staleUntriggeredWarningListedCountSummary = {
     ...passedSummary,
     warning: {
@@ -3864,6 +4055,26 @@ function runVerifierSelfTest() {
       'untriggered warning.bundleListedEventCount must be absent',
     ),
     verifierSummaryIssues(staleUntriggeredWarningListedCountSummary),
+  );
+  const staleUntriggeredWarningPrimaryEventSummary = {
+    ...passedSummary,
+    warning: {
+      required: false,
+      triggered: false,
+      thresholdMs: nearTimeoutThresholdMs,
+      bundlePrimaryEventId: passedSummary.evidence.eventId,
+    },
+    timings: {
+      ...passedSummary.timings,
+      skill: 0,
+    },
+  };
+  assert(
+    'verifier self-test rejects stale warning primary bundle event IDs when warning is not triggered',
+    verifierSummaryIssues(staleUntriggeredWarningPrimaryEventSummary).includes(
+      'untriggered warning.bundlePrimaryEventId must be absent',
+    ),
+    verifierSummaryIssues(staleUntriggeredWarningPrimaryEventSummary),
   );
   const duplicateWarningRowsSummary = {
     ...passedSummary,
@@ -4409,6 +4620,7 @@ async function main() {
         bundleContainsEvent: bundle.events?.some((item) => item.eventId === event.eventId) === true,
         bundleEventCount: bundle.summary?.eventCount,
         bundleListedEventCount: Array.isArray(bundle.events) ? bundle.events.length : undefined,
+        bundlePrimaryEventId: bundlePrimaryEventId(bundle),
         persistedVerifierAttributes: persistedVerifierAttributeEvidence(event.attributes),
         persistedSkillAttributes: persistedSkillAttributeEvidence(event.attributes),
         persistedPreflightAttributes: persistedPreflightAttributeEvidence(event.attributes),
@@ -4430,6 +4642,7 @@ async function main() {
           bundleContainsEvent: skillOutput.bundleContainsEvent,
           bundleEventCount: skillOutput.bundleEventCount,
           bundleListedEventCount: skillOutput.bundleListedEventCount,
+          bundlePrimaryEventId: skillOutput.bundlePrimaryEventId,
           queriedBack: skillOutput.queriedBack,
           timings: skillOutput.timings,
         },
@@ -4453,6 +4666,7 @@ async function main() {
         bundleContainsSourceEvent: warningEvent ? bundle.events?.some((item) => item.eventId === event.eventId) === true : undefined,
         bundleEventCount: warningEvent ? bundle.summary?.eventCount : undefined,
         bundleListedEventCount: warningEvent && Array.isArray(bundle.events) ? bundle.events.length : undefined,
+        bundlePrimaryEventId: warningEvent ? bundlePrimaryEventId(bundle) : undefined,
         persistedVerifierAttributes: warningEvent ? persistedVerifierAttributeEvidence(warningEvent.attributes) : undefined,
         persistedTimingAttributes: warningEvent ? persistedTimingAttributeEvidence(warningEvent.attributes, timings) : undefined,
         isolation: warningEvent?.verifierIsolation,

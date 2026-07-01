@@ -162,7 +162,11 @@ const bundle = await timed('innerBundleMs', () =>
     }),
   }),
 );
-if (bundle?.schemaVersion !== 'anysentry.evidence_bundle.v1' || !bundle.events?.some((item) => item.eventId === eventId)) {
+if (
+  bundle?.schemaVersion !== 'anysentry.evidence_bundle.v1' ||
+  !bundle.events?.some((item) => item.eventId === eventId) ||
+  bundle.primary?.event?.eventId !== eventId
+) {
   throw new Error(`buildEvidenceBundle did not include the recorded event: ${JSON.stringify(bundle)}`);
 }
 flowTimings.innerTotalMs = Math.max(0, Date.now() - flowStartedAt);
@@ -178,6 +182,7 @@ console.log(
     bundleContainsEvent: bundle.events?.some((item) => item.eventId === eventId) === true,
     bundleEventCount: bundle.summary?.eventCount,
     bundleListedEventCount: Array.isArray(bundle.events) ? bundle.events.length : undefined,
+    bundlePrimaryEventId: bundle.primary?.event?.eventId,
     eventKind: event.eventKind,
     eventCategory: event.eventCategory,
     verdict: event.verdict ?? recorded.items?.[0]?.verdict,
