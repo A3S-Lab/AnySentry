@@ -370,8 +370,9 @@ warning event/bundle/isolation fields. Success summaries also include the inner
 Skill output event, run, agent, and bundle IDs under `evidence.skillOutput`, and
 the verifier fails if those IDs do not match the target identity, rows, and
 Evidence Bundle queried by the outer runtime. Passed summary validation also
-requires both the stored event and the Skill output to remain `LlmCall`/`allow`,
-with `evidence.skillOutput.queriedBack=true`, so automation can detect
+requires both the stored event and the Skill output to remain
+`LlmCall`/`llm`/`allow`, with matching event categories and
+`evidence.skillOutput.queriedBack=true`, so automation can detect
 evidence-contract drift from the summary alone. The outer and Skill-reported
 `bundleEventCount` fields must also be positive and equal, so automation can
 catch Evidence Bundle count drift without rebuilding the bundle.
@@ -481,7 +482,7 @@ A3S_CODE_SDK_BASE=../os/apps/api \
 pnpm verify:a3s-code-skill-api
 ```
 
-The verifier creates one unique `LlmCall` evidence event through
+The verifier creates one unique `LlmCall`/`llm` evidence event through
 `security-center.recordSecurityEvents`, then queries it back by `runId` and checks the stored
 attributes include `progressive.runner=a3s-code` and `progressive.skill=anysentry-api`. It then
 builds an Evidence Bundle for the same event and asserts that the bundle contains the new evidence.

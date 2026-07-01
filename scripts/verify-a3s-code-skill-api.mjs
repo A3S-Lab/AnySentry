@@ -165,6 +165,7 @@ function successfulEvidenceIssues(summary, context) {
   if (!isNonEmptyString(summary.evidence?.bundleId)) issues.push(`${context} evidence.bundleId must be a non-empty string`);
   if (!isPositiveInteger(summary.evidence?.bundleEventCount)) issues.push(`${context} evidence.bundleEventCount must be a positive integer`);
   if (summary.evidence?.eventKind !== 'LlmCall') issues.push(`${context} evidence.eventKind must be LlmCall`);
+  if (summary.evidence?.eventCategory !== 'llm') issues.push(`${context} evidence.eventCategory must be llm`);
   if (summary.evidence?.verdict !== 'allow') issues.push(`${context} evidence.verdict must be allow`);
   if (!isNonEmptyString(summary.evidence?.skillOutput?.eventId)) {
     issues.push(`${context} evidence.skillOutput.eventId must be a non-empty string`);
@@ -182,6 +183,7 @@ function successfulEvidenceIssues(summary, context) {
     issues.push(`${context} evidence.skillOutput.bundleEventCount must be a positive integer`);
   }
   if (summary.evidence?.skillOutput?.eventKind !== 'LlmCall') issues.push(`${context} evidence.skillOutput.eventKind must be LlmCall`);
+  if (summary.evidence?.skillOutput?.eventCategory !== 'llm') issues.push(`${context} evidence.skillOutput.eventCategory must be llm`);
   if (summary.evidence?.skillOutput?.verdict !== 'allow') issues.push(`${context} evidence.skillOutput.verdict must be allow`);
   if (summary.evidence?.skillOutput?.queriedBack !== true) issues.push(`${context} evidence.skillOutput.queriedBack must be true`);
   if (summary.evidence?.eventId !== summary.evidence?.skillOutput?.eventId) {
@@ -198,6 +200,9 @@ function successfulEvidenceIssues(summary, context) {
   }
   if (summary.evidence?.bundleEventCount !== summary.evidence?.skillOutput?.bundleEventCount) {
     issues.push(`${context} bundleEventCount must match skillOutput.bundleEventCount`);
+  }
+  if (summary.evidence?.eventCategory !== summary.evidence?.skillOutput?.eventCategory) {
+    issues.push(`${context} eventCategory must match skillOutput.eventCategory`);
   }
   return issues;
 }
@@ -812,6 +817,7 @@ function runVerifierSelfTest() {
     evidence: {
       eventId: 'evt_self_test',
       eventKind: 'LlmCall',
+      eventCategory: 'llm',
       verdict: 'allow',
       bundleId: 'evb_self_test',
       bundleEventCount: 1,
@@ -820,6 +826,7 @@ function runVerifierSelfTest() {
         runId,
         agentId,
         eventKind: 'LlmCall',
+        eventCategory: 'llm',
         verdict: 'allow',
         bundleId: 'evb_self_test',
         bundleEventCount: 1,
@@ -1193,6 +1200,18 @@ function runVerifierSelfTest() {
     verifierSummaryIssues(driftedEvidenceSummary).includes('passed summary evidence.eventKind must be LlmCall'),
     verifierSummaryIssues(driftedEvidenceSummary),
   );
+  const driftedEvidenceCategorySummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      eventCategory: 'runtime',
+    },
+  };
+  assert(
+    'verifier self-test rejects passed summaries with drifted evidence category',
+    verifierSummaryIssues(driftedEvidenceCategorySummary).includes('passed summary evidence.eventCategory must be llm'),
+    verifierSummaryIssues(driftedEvidenceCategorySummary),
+  );
   const driftedSkillOutputSummary = {
     ...passedSummary,
     evidence: {
@@ -1207,6 +1226,21 @@ function runVerifierSelfTest() {
     'verifier self-test rejects Skill outputs that were not queried back',
     verifierSummaryIssues(driftedSkillOutputSummary).includes('passed summary evidence.skillOutput.queriedBack must be true'),
     verifierSummaryIssues(driftedSkillOutputSummary),
+  );
+  const driftedSkillOutputCategorySummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        eventCategory: 'runtime',
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects Skill outputs with drifted evidence category',
+    verifierSummaryIssues(driftedSkillOutputCategorySummary).includes('passed summary evidence.skillOutput.eventCategory must be llm'),
+    verifierSummaryIssues(driftedSkillOutputCategorySummary),
   );
   const mismatchedBundleCountSummary = {
     ...passedSummary,
@@ -1443,6 +1477,7 @@ console.log(JSON.stringify({
   bundleId: bundle.bundleId,
   bundleEventCount: bundle.summary?.eventCount,
   eventKind: event.eventKind,
+  eventCategory: event.eventCategory,
   verdict: event.verdict ?? recorded.items?.[0]?.verdict,
   queriedBack: true,
   timings: flowTimings,
@@ -1680,8 +1715,11 @@ async function main() {
       typeof skillOutput.bundleId === 'string' &&
       skillOutput.runId === runId &&
       skillOutput.agentId === agentId &&
+      skillOutput.eventKind === 'LlmCall' &&
+      skillOutput.eventCategory === 'llm' &&
+      skillOutput.verdict === 'allow' &&
       skillOutput.queriedBack === true;
-    assert('Skill output reports the recorded event and bundle for this run', outputMatchesRun, skillOutput);
+    assert('Skill output reports the recorded LlmCall allow event and bundle for this run', outputMatchesRun, skillOutput);
     if (!outputMatchesRun) {
       timings.elapsed = durationMs(verifierStartedAt);
       const reason = 'skill output did not match the verifier run';
@@ -1721,9 +1759,9 @@ async function main() {
     );
     await requireVerification(
       'stored event remains LlmCall allow evidence',
-      event?.eventKind === 'LlmCall' && event?.verdict === 'allow',
+      event?.eventKind === 'LlmCall' && event?.eventCategory === 'llm' && event?.verdict === 'allow',
       'event_contract',
-      'stored event was not LlmCall allow evidence',
+      'stored event was not LlmCall llm allow evidence',
       event,
     );
     await requireVerification(
@@ -1843,6 +1881,7 @@ async function main() {
       evidence: {
         eventId: event.eventId,
         eventKind: event.eventKind,
+        eventCategory: event.eventCategory,
         verdict: event.verdict,
         bundleId: bundle.bundleId,
         bundleEventCount: bundle.summary?.eventCount,
@@ -1851,6 +1890,7 @@ async function main() {
           runId: skillOutput.runId,
           agentId: skillOutput.agentId,
           eventKind: skillOutput.eventKind,
+          eventCategory: skillOutput.eventCategory,
           verdict: skillOutput.verdict,
           bundleId: skillOutput.bundleId,
           bundleEventCount: skillOutput.bundleEventCount,
