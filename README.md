@@ -368,9 +368,13 @@ evidence-contract drift from the summary alone. The outer and Skill-reported
 catch Evidence Bundle count drift without rebuilding the bundle.
 Failed summaries always include an explicit failure evidence status,
 either with the recorded event/bundle IDs or with `recorded=false` plus the reason
-evidence was not written. If the verifier detects that its own summary violates
-the contract, the emitted summary is converted to `status=failed` with
-`failure.phase=summary_validation` so automation can trust the top-level status.
+evidence was not written. Recorded failure evidence must be the canonical
+`SecurityAction`/`security` event produced from the verifier's `SecurityFinding`,
+must carry a non-allow verdict, must use `riskCategory=runtime_failure`, and
+must include a positive Evidence Bundle count. If the verifier detects that its
+own summary violates the contract, the emitted summary is converted to
+`status=failed` with `failure.phase=summary_validation` so automation can trust
+the top-level status.
 Runtime contract failures after the Skill runs, such as missing event markers or
 Evidence Bundle drift, are recorded as phase-specific `SecurityFinding` evidence
 instead of being collapsed into generic summary-validation failures.

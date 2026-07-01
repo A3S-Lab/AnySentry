@@ -182,6 +182,17 @@ function verifierSummaryIssues(summary) {
     } else if (evidence.recorded === true) {
       if (!isNonEmptyString(evidence.eventId)) issues.push('recorded failure evidence.eventId must be a non-empty string');
       if (!isNonEmptyString(evidence.bundleId)) issues.push('recorded failure evidence.bundleId must be a non-empty string');
+      if (!isPositiveInteger(evidence.bundleEventCount)) {
+        issues.push('recorded failure evidence.bundleEventCount must be a positive integer');
+      }
+      if (evidence.eventKind !== 'SecurityAction') issues.push('recorded failure evidence.eventKind must be SecurityAction');
+      if (evidence.eventCategory !== 'security') issues.push('recorded failure evidence.eventCategory must be security');
+      if (!isNonEmptyString(evidence.verdict) || evidence.verdict === 'allow') {
+        issues.push('recorded failure evidence.verdict must be a non-allow string');
+      }
+      if (evidence.riskCategory !== 'runtime_failure') {
+        issues.push('recorded failure evidence.riskCategory must be runtime_failure');
+      }
     } else if (!isNonEmptyString(evidence.error)) {
       issues.push('unrecorded failure evidence.error must explain why evidence was not written');
     }
@@ -423,6 +434,9 @@ async function recordFailureEvidence(reason, details, timings) {
     });
     if (bundle?.schemaVersion !== 'anysentry.evidence_bundle.v1' || !bundle.events?.some((item) => item.eventId === failureEvent.eventId)) {
       throw new Error(`failure evidence bundle did not include the failure event: ${compact(bundle)}`);
+    }
+    if (!isPositiveInteger(bundle.summary?.eventCount)) {
+      throw new Error(`failure evidence bundle did not report a positive event count: ${compact(bundle)}`);
     }
     console.error(
       `Recorded and verified AnySentry failure evidence for ${reason}: ${failureEvent.eventId}, bundle ${bundle.bundleId}`,
@@ -757,9 +771,52 @@ function runVerifierSelfTest() {
     'skill output JSON was invalid',
     'invalid JSON',
     { elapsed: 10, failurePhase: 'skill_output' },
-    { recorded: true, eventId: 'evt_failure_self_test', bundleId: 'evb_failure_self_test' },
+    {
+      recorded: true,
+      eventId: 'evt_failure_self_test',
+      eventKind: 'SecurityAction',
+      eventCategory: 'security',
+      verdict: 'block',
+      riskCategory: 'runtime_failure',
+      bundleId: 'evb_failure_self_test',
+      bundleEventCount: 1,
+    },
   );
   assert('verifier self-test accepts the failed summary contract', verifierSummaryIssues(failedSummary).length === 0, verifierSummaryIssues(failedSummary));
+
+  const driftedFailureSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      verdict: 'allow',
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence that looks allow-listed',
+    verifierSummaryIssues(driftedFailureSummary).includes('recorded failure evidence.verdict must be a non-allow string'),
+    verifierSummaryIssues(driftedFailureSummary),
+  );
+
+  const missingFailureBundleCountSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      bundleEventCount: 0,
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence without a bundle count',
+    verifierSummaryIssues(missingFailureBundleCountSummary).includes(
+      'recorded failure evidence.bundleEventCount must be a positive integer',
+    ),
+    verifierSummaryIssues(missingFailureBundleCountSummary),
+  );
 
   const unrecordedFailureSummary = failureSummary(
     'preflight',
