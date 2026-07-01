@@ -343,6 +343,10 @@ allow-level `RuntimeEvent` with `progressive.warning=near_timeout`, so soak runs
 can spot latency drift before it becomes a hard timeout without polluting LLM
 call metrics. The verifier queries those warning rows back and fails if any
 near-timeout warning is stored as `LlmCall` or categorized as `llm`.
+Set `A3S_CODE_REQUIRE_NEAR_TIMEOUT_WARNING=1` with a deliberately low
+`A3S_CODE_NEAR_TIMEOUT_RATIO` for production smoke tests that must exercise the
+warning branch; if the warning is not emitted, the verifier records a
+`SecurityFinding` failure before exiting non-zero.
 Timeout handling closes the a3s-code session before writing failure evidence, and
 `A3S_CODE_SESSION_CLOSE_TIMEOUT_MS` bounds that cleanup so a stuck close cannot
 suppress the failure finding. Coding-agent producer aliases such as

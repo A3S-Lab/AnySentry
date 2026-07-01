@@ -25,10 +25,18 @@ function positiveIntEnv(name, fallback, max) {
   return Math.min(Math.floor(parsed), max);
 }
 
+function booleanEnv(name, fallback = false) {
+  const value = (process.env[name] ?? '').trim().toLowerCase();
+  if (!value) return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(value);
+}
+
 const skillTimeoutMs = positiveIntEnv('A3S_CODE_SKILL_TIMEOUT_MS', 240000, 900000);
 const sessionCloseTimeoutMs = positiveIntEnv('A3S_CODE_SESSION_CLOSE_TIMEOUT_MS', 5000, 60000);
 const nearTimeoutRatio = Number(process.env.A3S_CODE_NEAR_TIMEOUT_RATIO ?? 0.5);
 const nearTimeoutThresholdRatio = Number.isFinite(nearTimeoutRatio) && nearTimeoutRatio > 0 && nearTimeoutRatio < 1 ? nearTimeoutRatio : 0.5;
+const nearTimeoutThresholdMs = Math.round(skillTimeoutMs * nearTimeoutThresholdRatio);
+const requireNearTimeoutWarning = booleanEnv('A3S_CODE_REQUIRE_NEAR_TIMEOUT_WARNING');
 const verifierCommit = currentGitCommit();
 const verifierAttributes = {
   'progressive.verifier': 'verify-a3s-code-skill-api',
@@ -37,6 +45,8 @@ const verifierAttributes = {
   'progressive.verifier.skillTimeoutMs': skillTimeoutMs,
   'progressive.verifier.sessionCloseTimeoutMs': sessionCloseTimeoutMs,
   'progressive.verifier.nearTimeoutRatio': nearTimeoutThresholdRatio,
+  'progressive.verifier.nearTimeoutThresholdMs': nearTimeoutThresholdMs,
+  'progressive.verifier.requireNearTimeoutWarning': requireNearTimeoutWarning,
   'progressive.verifier.model': model,
   'progressive.verifier.node': process.version,
 };
@@ -225,7 +235,7 @@ async function recordFailureEvidence(reason, details, timings) {
 }
 
 async function recordNearTimeoutWarning(event, bundle, timings) {
-  if (timings.skill < skillTimeoutMs * nearTimeoutThresholdRatio) return undefined;
+  if (timings.skill < nearTimeoutThresholdMs) return undefined;
   const warningAttributes = {
     ...verifierAttributes,
     ...timingAttributes(timings),
@@ -235,7 +245,7 @@ async function recordNearTimeoutWarning(event, bundle, timings) {
     'progressive.warning.reason': 'a3s-code Skill verifier completed close to its timeout budget',
     'progressive.warning.eventId': event.eventId,
     'progressive.warning.bundleId': bundle.bundleId,
-    'progressive.warning.thresholdMs': Math.round(skillTimeoutMs * nearTimeoutThresholdRatio),
+    'progressive.warning.thresholdMs': nearTimeoutThresholdMs,
   };
   const recorded = await request('/capabilities', {
     method: 'POST',
@@ -551,6 +561,8 @@ async function main() {
   console.log(`API base: ${apiBase}`);
   console.log(`Model: ${model}`);
   console.log(`Run ID: ${runId}`);
+  console.log(`Near-timeout threshold: ${nearTimeoutThresholdMs}ms (${nearTimeoutThresholdRatio})`);
+  console.log(`Require near-timeout warning: ${requireNearTimeoutWarning ? 'yes' : 'no'}`);
 
   assert('a3s-code ACL exists', fs.existsSync(aclPath), `Set A3S_CODE_ACL. Missing: ${aclPath}`);
   assert('anysentry-api Skill directory exists', fs.existsSync(path.join(skillRoot, 'anysentry-api', 'SKILL.md')), skillRoot);
@@ -709,6 +721,21 @@ async function main() {
     );
     const warningEvent = await recordNearTimeoutWarning(event, bundle, timings);
     if (warningEvent) pass('near-timeout success warning evidence is queryable and non-blocking');
+    else if (requireNearTimeoutWarning) {
+      const details = {
+        skillMs: Math.round(timings.skill),
+        thresholdMs: nearTimeoutThresholdMs,
+        nearTimeoutRatio: nearTimeoutThresholdRatio,
+      };
+      timings.elapsed = durationMs(verifierStartedAt);
+      await recordFailureEvidence('required near-timeout warning was not emitted', details, {
+        ...timings,
+        failurePhase: 'near_timeout_warning',
+      });
+      fail('required near-timeout warning evidence is present when requested', details);
+    } else {
+      pass('near-timeout warning was not emitted because the Skill run stayed below threshold');
+    }
 
     console.log(
       JSON.stringify(
@@ -721,6 +748,9 @@ async function main() {
           bundleId: bundle.bundleId,
           warningEventId: warningEvent?.eventId,
           warningIsolation: warningEvent?.verifierIsolation,
+          warningRequired: requireNearTimeoutWarning,
+          warningTriggered: Boolean(warningEvent),
+          warningThresholdMs: nearTimeoutThresholdMs,
           verdict: event.verdict,
           toolCalls: metadata.tool_calls,
           timings,
