@@ -65,6 +65,7 @@ const skillOutputTimingFields = [
   'innerTotalMs',
 ];
 const eventInnerTimingFields = ['innerHealthzMs', 'innerListMs', 'innerDescribeRecordMs', 'innerPreRecordMs'];
+const expectedProgressiveFlow = 'healthz,list,describe,execute,events-list,build-evidence-bundle';
 
 function durationMs(startedAt) {
   return Math.max(0, Date.now() - startedAt);
@@ -217,6 +218,26 @@ function eventInnerTimingAttributeIssues(attributes, timings) {
     } else if (Number(attributes[attributeKey]) !== Math.round(expected)) {
       issues.push(`event attributes ${attributeKey} must match evidence.skillOutput.timings.${field}`);
     }
+  }
+  return issues;
+}
+
+function skillEventAttributeIssues(attributes) {
+  const issues = [];
+  if (!isRecord(attributes)) {
+    return ['event attributes must be an object'];
+  }
+  if (attributes['progressive.runner'] !== 'a3s-code') {
+    issues.push('event attribute progressive.runner must be a3s-code');
+  }
+  if (attributes['progressive.skill'] !== 'anysentry-api') {
+    issues.push('event attribute progressive.skill must be anysentry-api');
+  }
+  if (attributes['progressive.flow'] !== expectedProgressiveFlow) {
+    issues.push('event attribute progressive.flow must match the expected progressive flow');
+  }
+  if (attributes['progressive.model'] !== model) {
+    issues.push('event attribute progressive.model must match the verifier model');
   }
   return issues;
 }
@@ -1357,6 +1378,28 @@ function runVerifierSelfTest() {
     'verifier self-test rejects Skill outputs without a bundle event count',
     skillOutputEvidenceIssues(missingSkillOutputBundleCount).includes('skillOutput.bundleEventCount must be a positive integer'),
     skillOutputEvidenceIssues(missingSkillOutputBundleCount),
+  );
+  const passedSkillEventAttributes = {
+    'progressive.runner': 'a3s-code',
+    'progressive.skill': 'anysentry-api',
+    'progressive.flow': expectedProgressiveFlow,
+    'progressive.model': model,
+  };
+  assert(
+    'verifier self-test accepts stored event Skill provenance markers',
+    skillEventAttributeIssues(passedSkillEventAttributes).length === 0,
+    skillEventAttributeIssues(passedSkillEventAttributes),
+  );
+  const driftedSkillEventFlowAttributes = {
+    ...passedSkillEventAttributes,
+    'progressive.flow': 'healthz,list',
+  };
+  assert(
+    'verifier self-test rejects stored event Skill flow drift',
+    skillEventAttributeIssues(driftedSkillEventFlowAttributes).includes(
+      'event attribute progressive.flow must match the expected progressive flow',
+    ),
+    skillEventAttributeIssues(driftedSkillEventFlowAttributes),
   );
 
   const passedEventTimingAttributes = Object.fromEntries(
@@ -2573,6 +2616,7 @@ const sessionId = ${JSON.stringify(sessionId)};
 const workspacePath = ${JSON.stringify(workspacePath)};
 const model = ${JSON.stringify(model)};
 const verifierAttributes = ${JSON.stringify(verifierAttributes)};
+const expectedProgressiveFlow = ${JSON.stringify(expectedProgressiveFlow)};
 const flowStartedAt = Date.now();
 const flowTimings = {};
 
@@ -2655,7 +2699,7 @@ const recorded = await timed('innerRecordMs', () => request('/capabilities', {
             'progressive.verifier.innerPreRecordMs': preRecordMs,
             'progressive.runner': 'a3s-code',
             'progressive.skill': 'anysentry-api',
-            'progressive.flow': 'healthz,list,describe,execute,events-list,build-evidence-bundle',
+            'progressive.flow': expectedProgressiveFlow,
             'progressive.model': model,
           },
         },
@@ -3010,12 +3054,13 @@ async function main() {
       'stored event lost verifier target identity',
       event,
     );
+    const skillEventIssues = skillEventAttributeIssues(event?.attributes);
     await requireVerification(
       'stored event carries the a3s-code Skill evidence markers',
-      event?.attributes?.['progressive.skill'] === 'anysentry-api' && event?.attributes?.['progressive.runner'] === 'a3s-code',
+      skillEventIssues.length === 0,
       'event_contract',
-      'stored event lost a3s-code Skill evidence markers',
-      event,
+      'stored event lost or drifted a3s-code Skill evidence markers',
+      { skillEventIssues, event },
     );
     const eventAuditIssues = verifierAttributeIssues(event?.attributes);
     await requireVerification(

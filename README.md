@@ -507,8 +507,9 @@ pnpm verify:a3s-code-skill-api
 
 The verifier creates one unique `LlmCall`/`llm` evidence event through
 `security-center.recordSecurityEvents`, then queries it back by `runId` and checks the stored
-attributes include `progressive.runner=a3s-code` and `progressive.skill=anysentry-api`. It then
-builds an Evidence Bundle for the same event and asserts that the bundle contains the new evidence.
+attributes bind `progressive.runner=a3s-code`, `progressive.skill=anysentry-api`, the expected
+`progressive.flow`, and the verifier model. It then builds an Evidence Bundle for the same event
+and asserts that the bundle contains the new evidence.
 
 To regression-check optional management API auth, including admin-token protection for control-plane
 mutations while leaving read APIs, `/ingest`, Collector heartbeat, and Source check-in on their
