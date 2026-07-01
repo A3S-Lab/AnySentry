@@ -343,11 +343,30 @@ const event = await eventually('recorded event to be queryable', async () => {
   return list.items?.find((item) => item.eventId === eventId && item.runId === runId && item.agentId === agentId);
 });
 
+const bundle = await request('/capabilities', {
+  method: 'POST',
+  body: JSON.stringify({
+    action: 'execute',
+    module: 'security-center',
+    operation: 'buildEvidenceBundle',
+    params: {
+      timeType: 'last_30d',
+      eventId,
+      limit: 20,
+    },
+  }),
+});
+if (bundle?.schemaVersion !== 'anysentry.evidence_bundle.v1' || !bundle.events?.some((item) => item.eventId === eventId)) {
+  throw new Error(\`buildEvidenceBundle did not include the recorded event: \${JSON.stringify(bundle)}\`);
+}
+
 console.log(JSON.stringify({
   healthOk: true,
   listed: true,
   described: operation.name,
   eventId,
+  bundleId: bundle.bundleId,
+  bundleEventCount: bundle.summary?.eventCount,
   eventKind: event.eventKind,
   verdict: event.verdict ?? recorded.items?.[0]?.verdict,
   queriedBack: true,
@@ -365,7 +384,7 @@ Constraints:
 - Do not deploy services.
 - Do not edit files.
 - Use bash to run exactly one verification command.
-- Follow the progressive flow: healthz, list, describe, execute, events/list.
+- Follow the progressive flow: healthz, list, describe, execute, events/list, buildEvidenceBundle.
 - Return only the compact JSON printed by the command.
 
 Run this command:
@@ -488,6 +507,24 @@ async function main() {
         Number(event?.attributes?.['progressive.verifier.sessionCloseTimeoutMs']) === sessionCloseTimeoutMs,
       event,
     );
+    const bundle = await request('/capabilities', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'execute',
+        module: 'security-center',
+        operation: 'buildEvidenceBundle',
+        params: {
+          timeType: 'last_30d',
+          eventId: event.eventId,
+          limit: 20,
+        },
+      }),
+    });
+    assert(
+      'stored event builds an Evidence Bundle through the progressive API',
+      bundle?.schemaVersion === 'anysentry.evidence_bundle.v1' && bundle.events?.some((item) => item.eventId === event.eventId),
+      bundle,
+    );
 
     console.log(
       JSON.stringify(
@@ -497,6 +534,7 @@ async function main() {
           runId,
           agentId,
           eventId: event.eventId,
+          bundleId: bundle.bundleId,
           verdict: event.verdict,
           toolCalls: metadata.tool_calls,
         },

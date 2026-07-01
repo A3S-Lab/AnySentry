@@ -404,7 +404,8 @@ pnpm verify:progressive-api:local
 
 To run the real a3s-code Skill integration check, using `glm5.1-w4a8`, load
 `integrations/skills/anysentry-api`, invoke it through the a3s-code `Skill` tool, and have that
-Skill call the progressive API flow (`healthz -> list -> describe -> execute -> events/list`):
+Skill call the progressive API flow
+(`healthz -> list -> describe -> execute -> events/list -> buildEvidenceBundle`):
 
 ```bash
 ANYSENTRY_API_BASE=http://127.0.0.1:29653/security-center \
@@ -416,7 +417,8 @@ pnpm verify:a3s-code-skill-api
 
 The verifier creates one unique `LlmCall` evidence event through
 `security-center.recordSecurityEvents`, then queries it back by `runId` and checks the stored
-attributes include `progressive.runner=a3s-code` and `progressive.skill=anysentry-api`.
+attributes include `progressive.runner=a3s-code` and `progressive.skill=anysentry-api`. It then
+builds an Evidence Bundle for the same event and asserts that the bundle contains the new evidence.
 
 To regression-check optional management API auth, including admin-token protection for control-plane
 mutations while leaving read APIs, `/ingest`, Collector heartbeat, and Source check-in on their
