@@ -19,6 +19,8 @@ const agentId = process.env.ANYSENTRY_A3S_CODE_TEST_AGENT_ID ?? 'a3s-code-skill-
 const sessionId = `${runId}-session`;
 const workspacePath = 'repo://anysentry/a3s-code-skill-itest';
 const verifierSummarySchema = 'anysentry.a3s_code_skill_verifier.summary.v1';
+const verifierProcessStartedAt = Date.now();
+let lastVerifierTimings = {};
 
 function positiveIntEnv(name, fallback, max) {
   const parsed = Number(process.env[name]);
@@ -104,9 +106,43 @@ function assert(message, condition, details) {
   else fail(message, details);
 }
 
+let verifierSummaryPrinted = false;
+
 function printVerifierSummary(summary) {
+  verifierSummaryPrinted = true;
   console.log(`VERIFIER_SUMMARY ${JSON.stringify(summary)}`);
   console.log(JSON.stringify(summary, null, 2));
+}
+
+function verifierSummaryBase(status) {
+  return {
+    schemaVersion: verifierSummarySchema,
+    status,
+    verifier: {
+      name: 'verify-a3s-code-skill-api',
+      commit: verifierCommit,
+      model,
+    },
+    target: {
+      apiBase,
+      runId,
+      agentId,
+      sessionId,
+    },
+  };
+}
+
+function failureSummary(phase, reason, details, timings, failureEvidence) {
+  return {
+    ...verifierSummaryBase('failed'),
+    failure: {
+      phase,
+      reason,
+      details,
+      evidence: failureEvidence,
+    },
+    timings,
+  };
 }
 
 function compact(value, limit = 2400) {
@@ -235,8 +271,23 @@ async function recordFailureEvidence(reason, details, timings) {
     console.error(
       `Recorded and verified AnySentry failure evidence for ${reason}: ${failureEvent.eventId}, bundle ${bundle.bundleId}`,
     );
+    return {
+      recorded: true,
+      eventId: failureEvent.eventId,
+      eventKind: failureEvent.eventKind,
+      eventCategory: failureEvent.eventCategory,
+      verdict: failureEvent.verdict,
+      riskCategory: failureEvent.riskCategory,
+      bundleId: bundle.bundleId,
+      bundleEventCount: bundle.summary?.eventCount,
+    };
   } catch (error) {
-    console.error(`Unable to record or verify AnySentry failure evidence: ${error instanceof Error ? error.message : String(error)}`);
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Unable to record or verify AnySentry failure evidence: ${message}`);
+    return {
+      recorded: false,
+      error: message,
+    };
   }
 }
 
@@ -563,6 +614,7 @@ ANYSENTRY_A3S_CODE_SKILL_VERIFY
 async function main() {
   const verifierStartedAt = Date.now();
   const timings = {};
+  lastVerifierTimings = timings;
   console.log('AnySentry a3s-code Skill progressive API verification');
   console.log(`API base: ${apiBase}`);
   console.log(`Model: ${model}`);
@@ -572,7 +624,11 @@ async function main() {
 
   assert('a3s-code ACL exists', fs.existsSync(aclPath), `Set A3S_CODE_ACL. Missing: ${aclPath}`);
   assert('anysentry-api Skill directory exists', fs.existsSync(path.join(skillRoot, 'anysentry-api', 'SKILL.md')), skillRoot);
-  if (process.exitCode) process.exit(process.exitCode);
+  if (process.exitCode) {
+    timings.elapsed = durationMs(verifierStartedAt);
+    printVerifierSummary(failureSummary('preflight', 'required local verifier prerequisites are missing', { aclPath, skillRoot }, timings));
+    process.exit(process.exitCode);
+  }
 
   const healthStartedAt = Date.now();
   await request('/healthz');
@@ -635,10 +691,14 @@ async function main() {
       timings.searchSkills = durationMs(searchStartedAt);
     } catch (error) {
       timings.elapsed = durationMs(verifierStartedAt);
-      await recordFailureEvidence('search_skills tool invocation failed or timed out', error instanceof Error ? error.message : String(error), {
+      const reason = 'search_skills tool invocation failed or timed out';
+      const details = error instanceof Error ? error.message : String(error);
+      const failureTimings = {
         ...timings,
         failurePhase: 'search_skills',
-      });
+      };
+      const failureEvidence = await recordFailureEvidence(reason, details, failureTimings);
+      printVerifierSummary(failureSummary('search_skills', reason, details, failureTimings, failureEvidence));
       throw error;
     }
     assert('a3s-code discovers the anysentry-api Skill', String(search.output ?? '').includes('anysentry-api'), search);
@@ -658,10 +718,14 @@ async function main() {
       timings.skill = durationMs(skillStartedAt);
     } catch (error) {
       timings.elapsed = durationMs(verifierStartedAt);
-      await recordFailureEvidence('Skill tool invocation failed or timed out', error instanceof Error ? error.message : String(error), {
+      const reason = 'Skill tool invocation failed or timed out';
+      const details = error instanceof Error ? error.message : String(error);
+      const failureTimings = {
         ...timings,
         failurePhase: 'skill',
-      });
+      };
+      const failureEvidence = await recordFailureEvidence(reason, details, failureTimings);
+      printVerifierSummary(failureSummary('skill', reason, details, failureTimings, failureEvidence));
       throw error;
     }
     const metadata = parseMetadataJson(result);
@@ -671,10 +735,15 @@ async function main() {
     assert('Skill used at least one tool while applying the API flow', Number(metadata.tool_calls ?? 0) >= 1, metadata);
     if (result.exitCode !== 0 || metadata.skill_name !== 'anysentry-api' || Number(metadata.tool_calls ?? 0) < 1) {
       timings.elapsed = durationMs(verifierStartedAt);
-      await recordFailureEvidence('skill invocation returned an invalid result', { result, metadata }, {
+      const reason = 'skill invocation returned an invalid result';
+      const details = { result, metadata };
+      const failureTimings = {
         ...timings,
         failurePhase: 'skill_result',
-      });
+      };
+      const failureEvidence = await recordFailureEvidence(reason, details, failureTimings);
+      printVerifierSummary(failureSummary('skill_result', reason, details, failureTimings, failureEvidence));
+      throw new Error(reason);
     }
 
     const queryStartedAt = Date.now();
@@ -736,10 +805,13 @@ async function main() {
       };
       warningRequirementFailure = details;
       timings.elapsed = durationMs(verifierStartedAt);
-      await recordFailureEvidence('required near-timeout warning was not emitted', details, {
+      const reason = 'required near-timeout warning was not emitted';
+      const failureTimings = {
         ...timings,
         failurePhase: 'near_timeout_warning',
-      });
+      };
+      const failureEvidence = await recordFailureEvidence(reason, details, failureTimings);
+      warningRequirementFailure = { ...details, evidence: failureEvidence };
       fail('required near-timeout warning evidence is present when requested', details);
     } else {
       pass('near-timeout warning was not emitted because the Skill run stayed below threshold');
@@ -790,6 +862,11 @@ async function main() {
 }
 
 main().catch((error) => {
-  fail('verification threw', error instanceof Error ? error.message : String(error));
+  const message = error instanceof Error ? error.message : String(error);
+  fail('verification threw', message);
+  if (!verifierSummaryPrinted) {
+    lastVerifierTimings.elapsed = durationMs(verifierProcessStartedAt);
+    printVerifierSummary(failureSummary('uncaught', 'verification threw', message, lastVerifierTimings));
+  }
   process.exit(process.exitCode || 1);
 });
