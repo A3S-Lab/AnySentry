@@ -4709,7 +4709,7 @@ function runVerifierSelfTest() {
   assert(
     'verifier self-test binds Skill command identity through typed JSON',
     skillCommand.includes(`ANYSENTRY_A3S_CODE_IDENTITY_JSON=${shellQuote(expectedIdentityJson)}`) &&
-      skillCommand.includes('node scripts/verify-a3s-code-skill-inner.mjs'),
+      skillCommand.includes(`node ${shellQuote(innerVerifierScript)}`),
     skillCommand,
   );
 
@@ -4732,7 +4732,7 @@ function buildSkillCommand() {
     `ANYSENTRY_A3S_CODE_IDENTITY_JSON=${shellQuote(JSON.stringify({ runId, agentId, sessionId, workspacePath }))}`,
     `ANYSENTRY_A3S_CODE_VERIFIER_ATTRIBUTES_JSON=${shellQuote(JSON.stringify(verifierAttributes))}`,
     `ANYSENTRY_A3S_CODE_EXPECTED_PROGRESSIVE_FLOW=${shellQuote(expectedProgressiveFlow)}`,
-    'node scripts/verify-a3s-code-skill-inner.mjs',
+    `node ${shellQuote(innerVerifierScript)}`,
   ].join(' ');
 }
 
