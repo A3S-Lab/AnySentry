@@ -828,6 +828,7 @@ function verifierSummaryIssues(summary) {
       if (!isPositiveInteger(evidence.bundleEventCount)) {
         issues.push('recorded failure evidence.bundleEventCount must be a positive integer');
       }
+      issues.push(...persistedVerifierAttributeIssues(evidence.persistedVerifierAttributes, 'recorded failure evidence'));
       if (evidence.workspacePath !== summary.target?.workspacePath) {
         issues.push('recorded failure evidence.workspacePath must match target.workspacePath');
       }
@@ -1263,6 +1264,7 @@ async function recordFailureEvidence(reason, details, timings) {
       eventCategory: failureEvent.eventCategory,
       verdict: failureEvent.verdict,
       riskCategory: failureEvent.riskCategory,
+      persistedVerifierAttributes: persistedVerifierAttributeEvidence(failureAttrs),
       bundleId: bundle.bundleId,
       bundleSchemaVersion: bundle.schemaVersion,
       bundleContainsEvent: bundle.events?.some((item) => item.eventId === failureEvent.eventId) === true,
@@ -2317,6 +2319,7 @@ function runVerifierSelfTest() {
       eventCategory: 'security',
       verdict: 'block',
       riskCategory: 'runtime_failure',
+      persistedVerifierAttributes: persistedVerifierAttributeEvidence(verifierAttributes),
       bundleId: 'evb_failure_self_test',
       bundleSchemaVersion: 'anysentry.evidence_bundle.v1',
       bundleContainsEvent: true,
@@ -2446,6 +2449,43 @@ function runVerifierSelfTest() {
       'recorded failure evidence.failureReason must match failure.reason',
     ),
     verifierSummaryIssues(driftedFailureEvidenceReasonSummary),
+  );
+  const missingFailureEvidenceVerifierAttrsSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      persistedVerifierAttributes: undefined,
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence without persisted verifier attributes',
+    verifierSummaryIssues(missingFailureEvidenceVerifierAttrsSummary).includes(
+      'recorded failure evidence.persistedVerifierAttributes must be an object',
+    ),
+    verifierSummaryIssues(missingFailureEvidenceVerifierAttrsSummary),
+  );
+  const driftedFailureEvidenceVerifierAttrsSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      persistedVerifierAttributes: {
+        ...failedSummary.failure.evidence.persistedVerifierAttributes,
+        closeTimeoutMs: sessionCloseTimeoutMs + 1,
+      },
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence verifier attribute drift',
+    verifierSummaryIssues(driftedFailureEvidenceVerifierAttrsSummary).includes(
+      'recorded failure evidence.persistedVerifierAttributes.closeTimeoutMs must match verifier audit metadata',
+    ),
+    verifierSummaryIssues(driftedFailureEvidenceVerifierAttrsSummary),
   );
   const missingFailureEvidenceDetailsSummary = failureSummary(
     'skill_output',

@@ -421,8 +421,9 @@ stored-event and Skill-output contract as a passed summary. Recorded failure
 evidence must be the canonical
 `SecurityAction`/`security` event produced from the verifier's `SecurityFinding`,
 must carry a non-allow verdict, must use `riskCategory=runtime_failure`, and
-must bind `failurePhase`, `failureReason`, and persisted-attribute
-`failureDetails` to the top-level failure plus `workspacePath`, `runId`,
+must bind `failurePhase`, `failureReason`, persisted-attribute
+`failureDetails`, and `failure.evidence.persistedVerifierAttributes` to the
+top-level failure and running verifier metadata plus `workspacePath`, `runId`,
 `agentId`, and `sessionId` to the target identity.
 Recorded failure bundles must use schema `anysentry.evidence_bundle.v1`, must
 include the failure event, and must report a positive Evidence Bundle count.
