@@ -778,11 +778,20 @@ function canonicalEventKind(input: T.UniversalIngestEvent): string {
     toolexec: 'ToolExec',
     egress: 'Egress',
     network: 'Egress',
+    network_egress: 'Egress',
+    networkegress: 'Egress',
+    egress_event: 'Egress',
     http: 'Egress',
     dns: 'Dns',
     file: 'FileAccess',
     file_access: 'FileAccess',
     fileaccess: 'FileAccess',
+    file_read: 'FileAccess',
+    fileread: 'FileAccess',
+    read_file: 'FileAccess',
+    file_write: 'FileAccess',
+    filewrite: 'FileAccess',
+    write_file: 'FileAccess',
     file_delete: 'FileDelete',
     filedelete: 'FileDelete',
     llm: 'LlmCall',
@@ -796,6 +805,11 @@ function canonicalEventKind(input: T.UniversalIngestEvent): string {
     security: 'SecurityAction',
     security_action: 'SecurityAction',
     securityaction: 'SecurityAction',
+    security_finding: 'SecurityAction',
+    securityfinding: 'SecurityAction',
+    finding: 'SecurityAction',
+    alert: 'SecurityAction',
+    risk: 'SecurityAction',
     process: 'ProcessExit',
     process_exit: 'ProcessExit',
     processexit: 'ProcessExit',
@@ -2034,15 +2048,126 @@ function securityRuntimeGuardEvent(
   };
 }
 
+type RuntimeGuardFallbackRisk = {
+  policyAction: Exclude<T.SecurityCapabilityPolicyAction, 'allow'>;
+  severity: T.Severity;
+  riskCategory: string;
+  reason: string;
+};
+
+const RUNTIME_GUARD_FALLBACK_PATTERNS: Array<{ pattern: RegExp; risk: RuntimeGuardFallbackRisk }> = [
+  {
+    pattern: /\b169\.254\.169\.254\b|metadata\.google\.internal|metadata\.azure\.com/iu,
+    risk: {
+      policyAction: 'block',
+      severity: 'critical',
+      riskCategory: 'systemic_risk',
+      reason: 'runtime guard detected cloud metadata service access',
+    },
+  },
+  {
+    pattern: /\bcurl\b[\s\S]*\|[\s\S]*(?:\bsh\b|\bbash\b)|\bwget\b[\s\S]*\|[\s\S]*(?:\bsh\b|\bbash\b)|base64\s+-d[\s\S]*\|[\s\S]*(?:\bsh\b|\bbash\b)/iu,
+    risk: {
+      policyAction: 'block',
+      severity: 'critical',
+      riskCategory: 'command_danger',
+      reason: 'runtime guard detected piped remote-code execution',
+    },
+  },
+  {
+    pattern: /\brm\s+-[^\s]*r[^\s]*f[^\s]*(?:\s+--no-preserve-root)?\s+(?:\/|\$HOME|~)(?:\s|$)/iu,
+    risk: {
+      policyAction: 'block',
+      severity: 'critical',
+      riskCategory: 'command_danger',
+      reason: 'runtime guard detected destructive recursive deletion',
+    },
+  },
+  {
+    pattern: /\b(?:ncat|nc|netcat|socat)\b[\s\S]*(?:\s-e\s|exec:|\/bin\/(?:sh|bash))/iu,
+    risk: {
+      policyAction: 'block',
+      severity: 'critical',
+      riskCategory: 'communication_risk',
+      reason: 'runtime guard detected reverse-shell style command',
+    },
+  },
+  {
+    pattern: /(?:^|\s)(?:\/etc\/shadow|\/etc\/sudoers|\.aws\/credentials|\.ssh\/id_(?:rsa|ed25519)|\.kube\/config)(?:\s|$)/iu,
+    risk: {
+      policyAction: 'block',
+      severity: 'high',
+      riskCategory: 'data_leak',
+      reason: 'runtime guard detected credential or privileged file access',
+    },
+  },
+];
+
+function securityRuntimeGuardSearchText(body: T.SecurityRuntimeGuardParams, event: T.UniversalIngestEvent): string {
+  const command = securityCapabilityCommand(body);
+  return [
+    Array.isArray(command) ? command.join(' ') : undefined,
+    Array.isArray(event.argv) ? event.argv.join(' ') : undefined,
+    typeof event.command === 'string' ? event.command : undefined,
+    body.action,
+    body.toolName,
+    body.target,
+    body.resource,
+    body.input,
+    body.prompt,
+    body.output,
+    body.model,
+    body.subject,
+  ]
+    .map((value) => cleanString(value, 1_000))
+    .filter((value): value is string => Boolean(value))
+    .join('\n');
+}
+
+function securityRuntimeGuardFallbackRisk(
+  body: T.SecurityRuntimeGuardParams,
+  event: T.UniversalIngestEvent,
+): RuntimeGuardFallbackRisk | undefined {
+  const text = securityRuntimeGuardSearchText(body, event);
+  if (!text) return undefined;
+  return RUNTIME_GUARD_FALLBACK_PATTERNS.find((entry) => entry.pattern.test(text))?.risk;
+}
+
+function policyActionRank(action: T.SecurityCapabilityPolicyAction): number {
+  if (action === 'block') return 3;
+  if (action === 'require_approval') return 2;
+  if (action === 'warn') return 1;
+  return 0;
+}
+
+function strongestPolicyAction(left: T.SecurityCapabilityPolicyAction, right: T.SecurityCapabilityPolicyAction): T.SecurityCapabilityPolicyAction {
+  return policyActionRank(left) >= policyActionRank(right) ? left : right;
+}
+
+function fallbackRiskPolicyAction(
+  autonomy: T.SecurityCapabilityAutonomy,
+  risk: RuntimeGuardFallbackRisk | undefined,
+): T.SecurityCapabilityPolicyAction | undefined {
+  if (!risk) return undefined;
+  if (autonomy === 'suggest') return 'warn';
+  if (autonomy === 'guarded') return risk.policyAction === 'block' ? 'require_approval' : 'warn';
+  return risk.policyAction;
+}
+
 function securityCapabilityPolicyAction(
   autonomy: T.SecurityCapabilityAutonomy,
   item: T.UniversalIngestResultItem | undefined,
+  fallbackRisk?: RuntimeGuardFallbackRisk,
 ): T.SecurityCapabilityPolicyAction {
   if (!item?.accepted) return 'block';
-  if (item.verdict === 'allow') return 'allow';
-  if (autonomy === 'suggest') return 'warn';
-  if (autonomy === 'guarded') return item.verdict === 'block' ? 'require_approval' : 'warn';
-  return item.verdict === 'block' ? 'block' : 'warn';
+  let action: T.SecurityCapabilityPolicyAction = 'allow';
+  if (item.verdict !== 'allow') {
+    if (autonomy === 'suggest') action = 'warn';
+    else if (autonomy === 'guarded') action = item.verdict === 'block' ? 'require_approval' : 'warn';
+    else action = item.verdict === 'block' ? 'block' : 'warn';
+  }
+  const fallbackAction = fallbackRiskPolicyAction(autonomy, fallbackRisk);
+  return fallbackAction ? strongestPolicyAction(action, fallbackAction) : action;
 }
 
 function securityCapabilityRecommendedAction(policyAction: T.SecurityCapabilityPolicyAction): T.SecurityRuntimeGuardDecision['recommendedAction'] {
@@ -3860,7 +3985,8 @@ export class SecurityMonitoringController {
       'capabilities:security-center.assessRuntimeAction',
     );
     const item = result.items[0];
-    const policyAction = securityCapabilityPolicyAction(autonomy, item);
+    const fallbackRisk = securityRuntimeGuardFallbackRisk(body, event);
+    const policyAction = securityCapabilityPolicyAction(autonomy, item, fallbackRisk);
     const decision: T.SecurityRuntimeGuardDecision = {
       schemaVersion: 'anysentry.progressive.runtime_guard.result.v1',
       module: SECURITY_PROGRESSIVE_MODULE,
@@ -3877,9 +4003,9 @@ export class SecurityMonitoringController {
       runId: item?.runId,
       verdict: item?.verdict,
       tier: item?.tier,
-      severity: item?.severity,
-      riskCategory: item?.riskCategory,
-      reason: item?.reason,
+      severity: fallbackRisk?.severity ?? item?.severity,
+      riskCategory: fallbackRisk?.riskCategory ?? item?.riskCategory,
+      reason: fallbackRisk?.reason ?? item?.reason,
       evidence: {
         eventId: item?.eventId,
         eventsHref: item?.eventId ? `/events?eventId=${encodeURIComponent(item.eventId)}` : undefined,

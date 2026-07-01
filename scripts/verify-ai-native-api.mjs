@@ -45,6 +45,17 @@ async function request(pathname, init) {
   return body;
 }
 
+async function eventually(label, fn, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastValue;
+  while (Date.now() < deadline) {
+    lastValue = await fn();
+    if (lastValue) return lastValue;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(`Timed out waiting for ${label}. Last value: ${JSON.stringify(lastValue)}`);
+}
+
 function verifyStaticContract() {
   const controller = readText('apps/api/src/security-monitoring/security-monitoring.controller.ts');
   const apiTypes = readText('apps/api/src/security-monitoring/types.ts');
@@ -83,6 +94,11 @@ function verifyStaticContract() {
     controller,
   );
   assert('controller uses loop-autonomy vocabulary', hasAll(controller, ["'suggest'", "'guarded'", "'auto'", "'require_approval'"]), controller);
+  assert(
+    'controller normalizes coding-agent event kind aliases',
+    hasAll(controller, ['networkegress', 'fileread', 'filewrite', 'securityfinding']),
+    controller,
+  );
   assert('legacy ai-native endpoints are not exposed', !/ai-native|AiNative|aiNative|AI_NATIVE/u.test(controller), controller);
 
   assert('API types define SecurityCapabilityAction with all actions', hasAll(apiTypes, ['SecurityCapabilityAction', ...actions.map((action) => `'${action}'`)]), apiTypes);
@@ -285,14 +301,100 @@ async function verifyRuntimeContract() {
     }),
   });
   assert(
-    'runtime execute assesses a real guard event through sentry',
+    'runtime execute assesses an obvious high-risk guard event as non-allow',
     guarded?.schemaVersion === 'anysentry.progressive.runtime_guard.result.v1' &&
       guarded?.schemaVersion === describe.outputSchema.data.schemaVersion &&
       guarded?.module === 'security-center' &&
       guarded?.operation === 'assessRuntimeAction' &&
       guarded?.eventId &&
-      ['allow', 'warn', 'require_approval', 'block'].includes(guarded?.policyAction),
+      ['warn', 'require_approval', 'block'].includes(guarded?.policyAction) &&
+      guarded?.recommendedAction !== 'continue',
     guarded,
+  );
+
+  const aliasRunId = `${runId}-alias`;
+  const aliasWorkspacePath = `${workspacePath}/aliases`;
+  const aliasAgentId = `${agentId}-alias`;
+  const aliasSessionId = `${sessionId}-alias`;
+  const aliasRecorded = await request('/capabilities', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'execute',
+      module: 'security-center',
+      operation: 'recordSecurityEvents',
+      params: {
+        sourceName: 'progressive-alias-verifier',
+        sourceType: 'custom',
+        workspacePath: aliasWorkspacePath,
+        agentId: aliasAgentId,
+        sessionId: aliasSessionId,
+        events: [
+          {
+            kind: 'NetworkEgress',
+            workspacePath: aliasWorkspacePath,
+            agentId: aliasAgentId,
+            sessionId: aliasSessionId,
+            runId: aliasRunId,
+            peer: '169.254.169.254',
+            port: 80,
+            subject: 'metadata service egress alias should canonicalize to Egress',
+          },
+          {
+            kind: 'FileRead',
+            workspacePath: aliasWorkspacePath,
+            agentId: aliasAgentId,
+            sessionId: aliasSessionId,
+            runId: aliasRunId,
+            path: '/home/dev/.aws/credentials',
+            subject: 'credential file read alias should canonicalize to FileAccess',
+          },
+          {
+            kind: 'FileWrite',
+            workspacePath: aliasWorkspacePath,
+            agentId: aliasAgentId,
+            sessionId: aliasSessionId,
+            runId: aliasRunId,
+            path: '/workspace/out/report.json',
+            subject: 'file write alias should canonicalize to FileAccess',
+          },
+          {
+            kind: 'SecurityFinding',
+            workspacePath: aliasWorkspacePath,
+            agentId: aliasAgentId,
+            sessionId: aliasSessionId,
+            runId: aliasRunId,
+            status: 'failed',
+            subject: 'runner failure finding should canonicalize to SecurityAction',
+          },
+        ],
+      },
+    }),
+  });
+  const aliasEventIds = aliasRecorded?.items?.map((item) => item.eventId).filter(Boolean) ?? [];
+  assert(
+    'runtime recordSecurityEvents accepts coding-agent alias event kinds',
+    aliasRecorded?.accepted === true && aliasRecorded?.acceptedEvents === 4 && aliasEventIds.length === 4,
+    aliasRecorded,
+  );
+
+  const aliasEvents = await eventually('alias events to be queryable with canonical kinds', async () => {
+    const list = await request('/events/list', {
+      method: 'POST',
+      body: JSON.stringify({ timeType: 'last_30d', runId: aliasRunId, agentId: aliasAgentId, limit: 20 }),
+    });
+    const matches = list.items?.filter((item) => aliasEventIds.includes(item.eventId)) ?? [];
+    return matches.length === aliasEventIds.length ? matches : undefined;
+  });
+  const aliasKinds = aliasEvents.map((event) => event.eventKind);
+  assert(
+    'runtime canonicalizes coding-agent aliases into supported event kinds',
+    aliasKinds.includes('Egress') && aliasKinds.filter((kind) => kind === 'FileAccess').length === 2 && aliasKinds.includes('SecurityAction'),
+    aliasEvents,
+  );
+  assert(
+    'runtime negative-path aliases keep non-allow verdict coverage',
+    aliasEvents.some((event) => ['Egress', 'FileAccess'].includes(event.eventKind) && event.verdict && event.verdict !== 'allow'),
+    aliasEvents,
   );
 
   const plan = await request('/capabilities', {

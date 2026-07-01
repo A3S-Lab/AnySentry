@@ -41,6 +41,61 @@ function compact(value, limit = 2400) {
   return text.length > limit ? `${text.slice(0, limit)}... [truncated]` : text;
 }
 
+async function withTimeout(label, promise, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function recordFailureEvidence(reason, details) {
+  try {
+    await request('/capabilities', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'execute',
+        module: 'security-center',
+        operation: 'recordSecurityEvents',
+        params: {
+          sourceName: 'a3s-code-skill-itest',
+          sourceType: 'custom',
+          workspacePath,
+          agentId,
+          sessionId,
+          events: [
+            {
+              kind: 'SecurityFinding',
+              workspacePath,
+              agentId,
+              sessionId,
+              runId,
+              status: 'failed',
+              subject: `a3s-code Skill progressive API verification failed: ${reason}`,
+              attributes: {
+                'progressive.runner': 'a3s-code',
+                'progressive.skill': 'anysentry-api',
+                'progressive.failure': true,
+                'progressive.failure.reason': reason,
+                'progressive.failure.details': compact(details, 1200),
+              },
+            },
+          ],
+        },
+      }),
+    });
+    console.error(`Recorded AnySentry failure evidence for ${reason}`);
+  } catch (error) {
+    console.error(`Unable to record AnySentry failure evidence: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 async function loadA3sCode() {
   try {
     return await import('@a3s-lab/code');
@@ -253,18 +308,41 @@ async function main() {
     const toolNames = session.toolNames();
     assert('a3s-code exposes Skill, search_skills, and bash tools', ['Skill', 'search_skills', 'bash'].every((name) => toolNames.includes(name)), toolNames);
 
-    const search = await session.tool('search_skills', { query: 'AnySentry progressive API', limit: 5 });
+    let search;
+    try {
+      search = await withTimeout(
+        'a3s-code search_skills tool invocation',
+        session.tool('search_skills', { query: 'AnySentry progressive API', limit: 5 }),
+        Math.min(skillTimeoutMs, 60000),
+      );
+    } catch (error) {
+      await recordFailureEvidence('search_skills tool invocation failed or timed out', error instanceof Error ? error.message : String(error));
+      throw error;
+    }
     assert('a3s-code discovers the anysentry-api Skill', String(search.output ?? '').includes('anysentry-api'), search);
 
-    const result = await session.tool('Skill', {
-      skill_name: 'anysentry-api',
-      prompt: buildSkillPrompt(),
-    });
+    let result;
+    try {
+      result = await withTimeout(
+        'a3s-code Skill tool invocation',
+        session.tool('Skill', {
+          skill_name: 'anysentry-api',
+          prompt: buildSkillPrompt(),
+        }),
+        skillTimeoutMs,
+      );
+    } catch (error) {
+      await recordFailureEvidence('Skill tool invocation failed or timed out', error instanceof Error ? error.message : String(error));
+      throw error;
+    }
     const metadata = parseMetadataJson(result);
 
     assert('a3s-code Skill tool invocation succeeds', result.exitCode === 0, result);
     assert('Skill invocation is for anysentry-api', metadata.skill_name === 'anysentry-api', metadata);
     assert('Skill used at least one tool while applying the API flow', Number(metadata.tool_calls ?? 0) >= 1, metadata);
+    if (result.exitCode !== 0 || metadata.skill_name !== 'anysentry-api' || Number(metadata.tool_calls ?? 0) < 1) {
+      await recordFailureEvidence('skill invocation returned an invalid result', { result, metadata });
+    }
 
     const event = await eventually('event recorded by a3s-code Skill run', async () => {
       const list = await request('/events/list', {
