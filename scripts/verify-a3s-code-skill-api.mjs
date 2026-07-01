@@ -942,6 +942,11 @@ function warningEvidenceBindingIssues(warningEvent, event, bundle, timings) {
   ) {
     issues.push('warningEvent must keep the verifier target identity');
   }
+  if (!isNonEmptyString(warningEvent.sourceId)) {
+    issues.push('warningEvent.sourceId must be a non-empty string');
+  } else if (isNonEmptyString(event.sourceId) && warningEvent.sourceId !== event.sourceId) {
+    issues.push('warningEvent.sourceId must match the source event sourceId');
+  }
   const attributes = warningEvent.attributes;
   if (!isRecord(attributes)) {
     issues.push('warningEvent.attributes must be an object');
@@ -1505,6 +1510,7 @@ function verifierSummaryIssues(summary) {
       if (!isNonEmptyString(summary.warning?.runId)) issues.push('triggered warning.runId must be a non-empty string');
       if (!isNonEmptyString(summary.warning?.agentId)) issues.push('triggered warning.agentId must be a non-empty string');
       if (!isNonEmptyString(summary.warning?.sessionId)) issues.push('triggered warning.sessionId must be a non-empty string');
+      if (!isNonEmptyString(summary.warning?.sourceId)) issues.push('triggered warning.sourceId must be a non-empty string');
       if (!isNonEmptyString(summary.warning?.bundleTimelineTraceId)) {
         issues.push('triggered warning.bundleTimelineTraceId must be a non-empty string');
       }
@@ -1607,6 +1613,9 @@ function verifierSummaryIssues(summary) {
       if (summary.warning?.runId !== summary.target?.runId) issues.push('triggered warning.runId must match target.runId');
       if (summary.warning?.agentId !== summary.target?.agentId) issues.push('triggered warning.agentId must match target.agentId');
       if (summary.warning?.sessionId !== summary.target?.sessionId) issues.push('triggered warning.sessionId must match target.sessionId');
+      if (summary.warning?.sourceId !== summary.evidence?.sourceId) {
+        issues.push('triggered warning.sourceId must match evidence.sourceId');
+      }
       if (isNonEmptyString(summary.evidence?.bundleId) && summary.warning?.bundleId !== summary.evidence.bundleId) {
         issues.push('triggered warning.bundleId must match evidence.bundleId');
       }
@@ -1668,6 +1677,7 @@ function verifierSummaryIssues(summary) {
       if (summary.warning?.runId !== undefined) issues.push('untriggered warning.runId must be absent');
       if (summary.warning?.agentId !== undefined) issues.push('untriggered warning.agentId must be absent');
       if (summary.warning?.sessionId !== undefined) issues.push('untriggered warning.sessionId must be absent');
+      if (summary.warning?.sourceId !== undefined) issues.push('untriggered warning.sourceId must be absent');
       if (summary.warning?.eventKind !== undefined) issues.push('untriggered warning.eventKind must be absent');
       if (summary.warning?.eventCategory !== undefined) issues.push('untriggered warning.eventCategory must be absent');
       if (summary.warning?.verdict !== undefined) issues.push('untriggered warning.verdict must be absent');
@@ -2385,6 +2395,7 @@ function runVerifierSelfTest() {
       runId,
       agentId,
       sessionId,
+      sourceId: selfSourceId,
       eventKind: 'RuntimeEvent',
       eventCategory: 'runtime',
       verdict: 'allow',
@@ -2790,6 +2801,7 @@ function runVerifierSelfTest() {
   );
   const passedEvent = {
     eventId: passedSummary.evidence.eventId,
+    sourceId: passedSummary.evidence.sourceId,
     workspacePath,
     runId,
     agentId,
@@ -2797,6 +2809,7 @@ function runVerifierSelfTest() {
   };
   const passedWarningEvent = {
     eventId: passedSummary.warning.eventId,
+    sourceId: passedSummary.warning.sourceId,
     workspacePath,
     runId,
     agentId,
@@ -2820,6 +2833,17 @@ function runVerifierSelfTest() {
     'verifier self-test accepts near-timeout warning evidence bound to verifier metadata',
     warningEvidenceBindingIssues(passedWarningEvent, passedEvent, passedBundle, passedSummary.timings).length === 0,
     warningEvidenceBindingIssues(passedWarningEvent, passedEvent, passedBundle, passedSummary.timings),
+  );
+  const driftedWarningSourceEvent = {
+    ...passedWarningEvent,
+    sourceId: 'src_other_warning',
+  };
+  assert(
+    'verifier self-test rejects near-timeout warning source drift',
+    warningEvidenceBindingIssues(driftedWarningSourceEvent, passedEvent, passedBundle, passedSummary.timings).includes(
+      'warningEvent.sourceId must match the source event sourceId',
+    ),
+    warningEvidenceBindingIssues(driftedWarningSourceEvent, passedEvent, passedBundle, passedSummary.timings),
   );
   const driftedWarningTimingEvent = {
     ...passedWarningEvent,
@@ -3279,6 +3303,21 @@ function runVerifierSelfTest() {
     verifierSummaryIssues(staleUntriggeredWarningSummary).includes('untriggered warning.eventId must be absent'),
     verifierSummaryIssues(staleUntriggeredWarningSummary),
   );
+  const staleUntriggeredWarningSourceSummary = {
+    ...staleUntriggeredWarningSummary,
+    warning: {
+      ...staleUntriggeredWarningSummary.warning,
+      eventId: undefined,
+      bundleId: undefined,
+      isolation: undefined,
+      sourceId: selfSourceId,
+    },
+  };
+  assert(
+    'verifier self-test rejects stale warning Source identity when warning is not triggered',
+    verifierSummaryIssues(staleUntriggeredWarningSourceSummary).includes('untriggered warning.sourceId must be absent'),
+    verifierSummaryIssues(staleUntriggeredWarningSourceSummary),
+  );
   const staleUntriggeredWarningVerifierAttributesSummary = {
     ...staleUntriggeredWarningSummary,
     warning: {
@@ -3442,6 +3481,18 @@ function runVerifierSelfTest() {
     'verifier self-test rejects warning session identity drift',
     verifierSummaryIssues(driftedWarningSessionSummary).includes('triggered warning.sessionId must match target.sessionId'),
     verifierSummaryIssues(driftedWarningSessionSummary),
+  );
+  const driftedWarningSourceIdSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      sourceId: 'src_other_warning',
+    },
+  };
+  assert(
+    'verifier self-test rejects warning Source identity drift',
+    verifierSummaryIssues(driftedWarningSourceIdSummary).includes('triggered warning.sourceId must match evidence.sourceId'),
+    verifierSummaryIssues(driftedWarningSourceIdSummary),
   );
 
   const negativeTimingSummary = {
@@ -5695,6 +5746,7 @@ async function main() {
         runId: warningEvent?.runId,
         agentId: warningEvent?.agentId,
         sessionId: warningEvent?.sessionId,
+        sourceId: warningEvent?.sourceId,
         eventKind: warningEvent?.eventKind,
         eventCategory: warningEvent?.eventCategory,
         verdict: warningEvent?.verdict,
