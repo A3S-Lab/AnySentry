@@ -159,6 +159,11 @@ function isValidTimingValue(value) {
   return isNonEmptyString(value);
 }
 
+function hasFailureDetails(value) {
+  if (typeof value === 'string') return value.trim().length > 0;
+  return value !== undefined && value !== null;
+}
+
 function timingIssues(timings) {
   const issues = [];
   for (const [key, value] of Object.entries(timings)) {
@@ -649,6 +654,7 @@ function verifierSummaryIssues(summary) {
   if (summary.status === 'failed') {
     if (!isNonEmptyString(summary.failure?.phase)) issues.push('failed summary failure.phase must be a non-empty string');
     if (!isNonEmptyString(summary.failure?.reason)) issues.push('failed summary failure.reason must be a non-empty string');
+    if (!hasFailureDetails(summary.failure?.details)) issues.push('failed summary failure.details must be present');
     if (
       isNonEmptyString(summary.failure?.phase) &&
       !['preflight', 'summary_validation'].includes(summary.failure.phase) &&
@@ -692,7 +698,7 @@ function verifierSummaryIssues(summary) {
       if (evidence.failureReason !== summary.failure?.reason) {
         issues.push('recorded failure evidence.failureReason must match failure.reason');
       }
-      if (evidence.failureDetails !== failureDetailsText(summary.failure?.details)) {
+      if (hasFailureDetails(summary.failure?.details) && evidence.failureDetails !== failureDetailsText(summary.failure.details)) {
         issues.push('recorded failure evidence.failureDetails must match failure.details');
       }
       if (evidence.eventKind !== 'SecurityAction') issues.push('recorded failure evidence.eventKind must be SecurityAction');
@@ -964,7 +970,8 @@ function compact(value, limit = 2400) {
 }
 
 function persistedAttributeText(value, limit = 240) {
-  const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  const raw = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  const text = typeof raw === 'string' ? raw : '';
   return text.length > limit ? text.slice(0, limit) : text;
 }
 
@@ -2459,6 +2466,18 @@ function runVerifierSelfTest() {
     unrecordedFailureSummary.failure.evidence.recorded === false && verifierSummaryIssues(unrecordedFailureSummary).length === 0,
     { summary: unrecordedFailureSummary, issues: verifierSummaryIssues(unrecordedFailureSummary) },
   );
+  const missingUnrecordedFailureDetailsSummary = {
+    ...unrecordedFailureSummary,
+    failure: {
+      ...unrecordedFailureSummary.failure,
+      details: undefined,
+    },
+  };
+  assert(
+    'verifier self-test rejects unrecorded failures without details',
+    verifierSummaryIssues(missingUnrecordedFailureDetailsSummary).includes('failed summary failure.details must be present'),
+    verifierSummaryIssues(missingUnrecordedFailureDetailsSummary),
+  );
 
   const mismatchedSummary = {
     ...passedSummary,
@@ -2822,6 +2841,12 @@ function runVerifierSelfTest() {
   assert(
     'verifier self-test rejects failed summaries without a phase',
     verifierSummaryIssues(invalidFailureSummary).includes('failed summary failure.phase must be a non-empty string'),
+    verifierSummaryIssues(invalidFailureSummary),
+  );
+
+  assert(
+    'verifier self-test rejects failed summaries without details',
+    verifierSummaryIssues(invalidFailureSummary).includes('failed summary failure.details must be present'),
     verifierSummaryIssues(invalidFailureSummary),
   );
 
