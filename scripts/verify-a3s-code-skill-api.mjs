@@ -143,8 +143,13 @@ function verifierSummaryIssues(summary) {
     if (summary.failure) issues.push('passed summary must not include failure');
     if (!isNonEmptyString(summary.evidence?.eventId)) issues.push('passed summary evidence.eventId must be a non-empty string');
     if (!isNonEmptyString(summary.evidence?.bundleId)) issues.push('passed summary evidence.bundleId must be a non-empty string');
+    if (summary.evidence?.eventKind !== 'LlmCall') issues.push('passed summary evidence.eventKind must be LlmCall');
+    if (summary.evidence?.verdict !== 'allow') issues.push('passed summary evidence.verdict must be allow');
     if (!isNonEmptyString(summary.evidence?.skillOutput?.eventId)) issues.push('passed summary evidence.skillOutput.eventId must be a non-empty string');
     if (!isNonEmptyString(summary.evidence?.skillOutput?.bundleId)) issues.push('passed summary evidence.skillOutput.bundleId must be a non-empty string');
+    if (summary.evidence?.skillOutput?.eventKind !== 'LlmCall') issues.push('passed summary evidence.skillOutput.eventKind must be LlmCall');
+    if (summary.evidence?.skillOutput?.verdict !== 'allow') issues.push('passed summary evidence.skillOutput.verdict must be allow');
+    if (summary.evidence?.skillOutput?.queriedBack !== true) issues.push('passed summary evidence.skillOutput.queriedBack must be true');
     if (summary.evidence?.eventId !== summary.evidence?.skillOutput?.eventId) issues.push('passed summary eventId must match skillOutput.eventId');
     if (summary.evidence?.bundleId !== summary.evidence?.skillOutput?.bundleId) issues.push('passed summary bundleId must match skillOutput.bundleId');
   }
@@ -716,6 +721,33 @@ function runVerifierSelfTest() {
     'verifier self-test rejects mismatched Skill output IDs',
     verifierSummaryIssues(mismatchedSummary).includes('passed summary bundleId must match skillOutput.bundleId'),
     verifierSummaryIssues(mismatchedSummary),
+  );
+  const driftedEvidenceSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      eventKind: 'RuntimeEvent',
+    },
+  };
+  assert(
+    'verifier self-test rejects passed summaries with drifted evidence kind',
+    verifierSummaryIssues(driftedEvidenceSummary).includes('passed summary evidence.eventKind must be LlmCall'),
+    verifierSummaryIssues(driftedEvidenceSummary),
+  );
+  const driftedSkillOutputSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        queriedBack: false,
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects Skill outputs that were not queried back',
+    verifierSummaryIssues(driftedSkillOutputSummary).includes('passed summary evidence.skillOutput.queriedBack must be true'),
+    verifierSummaryIssues(driftedSkillOutputSummary),
   );
   const missingWarningBundleSummary = {
     ...passedSummary,
