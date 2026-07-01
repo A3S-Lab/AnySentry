@@ -387,18 +387,18 @@ function summaryValidationFailureSummary(summary, issues) {
   return {
     ...base,
     verifier: {
-      ...base.verifier,
       ...originalVerifier,
       name: 'verify-a3s-code-skill-api',
-      commit: isNonEmptyString(originalVerifier.commit) ? originalVerifier.commit : verifierCommit,
-      model: isNonEmptyString(originalVerifier.model) ? originalVerifier.model : model,
+      commit: verifierCommit,
+      model,
     },
     target: {
       ...base.target,
-      apiBase: isNonEmptyString(originalTarget.apiBase) ? originalTarget.apiBase : apiBase,
-      runId: isNonEmptyString(originalTarget.runId) ? originalTarget.runId : runId,
-      agentId: isNonEmptyString(originalTarget.agentId) ? originalTarget.agentId : agentId,
-      sessionId: isNonEmptyString(originalTarget.sessionId) ? originalTarget.sessionId : sessionId,
+      ...originalTarget,
+      apiBase,
+      runId,
+      agentId,
+      sessionId,
     },
     failure: {
       phase: 'summary_validation',
@@ -407,6 +407,8 @@ function summaryValidationFailureSummary(summary, issues) {
         issues,
         originalStatus: isRecord(summary) ? summary.status : undefined,
         originalFailurePhase: isRecord(summary) ? summary.failure?.phase : undefined,
+        originalVerifier: Object.keys(originalVerifier).length > 0 ? originalVerifier : undefined,
+        originalTarget: Object.keys(originalTarget).length > 0 ? originalTarget : undefined,
       },
       evidence: defaultFailureEvidence('summary_validation'),
     },
@@ -865,6 +867,22 @@ function runVerifierSelfTest() {
     'verifier self-test rejects summaries from a different run',
     verifierSummaryIssues(mismatchedTargetSummary).includes('target.runId must match the running verifier runId'),
     verifierSummaryIssues(mismatchedTargetSummary),
+  );
+  const normalizedStaleIdentitySummary = normalizedVerifierSummary({
+    ...mismatchedTargetSummary,
+    verifier: {
+      ...mismatchedTargetSummary.verifier,
+      commit: 'other-commit',
+    },
+  });
+  assert(
+    'verifier self-test converts stale-identity summaries into valid summary-validation results',
+    normalizedStaleIdentitySummary.status === 'failed' &&
+      normalizedStaleIdentitySummary.failure?.phase === 'summary_validation' &&
+      normalizedStaleIdentitySummary.verifier?.commit === verifierCommit &&
+      normalizedStaleIdentitySummary.target?.runId === runId &&
+      verifierSummaryIssues(normalizedStaleIdentitySummary).length === 0,
+    { summary: normalizedStaleIdentitySummary, issues: verifierSummaryIssues(normalizedStaleIdentitySummary) },
   );
   const driftedSkillRunSummary = {
     ...passedSummary,
