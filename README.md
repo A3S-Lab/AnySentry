@@ -363,22 +363,25 @@ cross-config summaries. The warning budget fields also bind to the running
 verifier config: `warning.required` must match
 `A3S_CODE_REQUIRE_NEAR_TIMEOUT_WARNING`, and `warning.thresholdMs` must match the
 computed timeout threshold. Triggered warnings must also bind to the timing
-budget by proving `timings.skill >= warning.thresholdMs`; passed summaries with
-untriggered warnings must prove `timings.skill < warning.thresholdMs`.
+budget by proving `timings.skill >= warning.thresholdMs` and to the canonical
+`warning.reason`; passed summaries with untriggered warnings must prove
+`timings.skill < warning.thresholdMs`.
 Passed summaries must identify
 `verifier.skill=anysentry-api`, report a positive `verifier.toolCalls`, and
 include the warning budget state; when
 `warning.required=true`, `warning.triggered` must also be true. Warning summaries
 are mutually exclusive: triggered warnings carry warning event kind, category,
-verdict, bundle, and isolation evidence and no failure payload, while
-untriggered warnings carry no stale warning event or isolation fields. Triggered
-warnings must be separate `RuntimeEvent`/`runtime`/`allow` rows, not the success
-`LlmCall` row, so summary-only automation can verify that latency warnings did
-not pollute LLM evidence. Triggered warning summaries also bind the warning
-row's `workspacePath`, `runId`, `agentId`, and `sessionId` to the target
+verdict, reason, bundle, and isolation evidence and no failure payload, while
+untriggered warnings carry no stale warning event, reason, or isolation fields.
+Triggered warnings must be separate `RuntimeEvent`/`runtime`/`allow` rows, not
+the success `LlmCall` row, so summary-only automation can verify that latency
+warnings did not pollute LLM evidence. Triggered warning summaries also bind the
+warning row's `workspacePath`, `runId`, `agentId`, and `sessionId` to the target
 identity and expose `warning.sourceEventId`, which must match the success
-evidence event. The warning bundle fields bind to the same Evidence Bundle as
-the success evidence: `warning.bundleSchemaVersion` must be
+evidence event. The warning reason binds to the same canonical
+`progressive.warning.reason` value recorded on the runtime warning row. The
+warning bundle fields bind to the same Evidence Bundle as the success evidence:
+`warning.bundleSchemaVersion` must be
 `anysentry.evidence_bundle.v1`, `warning.bundleContainsSourceEvent` must be
 true, and `warning.bundleEventCount` must match the success bundle count.
 Success summaries also include the inner Skill output event,

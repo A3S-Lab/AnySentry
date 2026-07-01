@@ -742,6 +742,9 @@ function verifierSummaryIssues(summary) {
       } else if (summary.timings.skill < summary.warning?.thresholdMs) {
         issues.push('triggered warning timings.skill must be greater than or equal to warning.thresholdMs');
       }
+      if (summary.warning?.reason !== nearTimeoutWarningReason) {
+        issues.push('triggered warning.reason must match the expected warning reason');
+      }
       if (!isNonEmptyString(summary.warning?.eventId)) issues.push('triggered warning.eventId must be a non-empty string');
       if (!isNonEmptyString(summary.warning?.sourceEventId)) issues.push('triggered warning.sourceEventId must be a non-empty string');
       if (!isNonEmptyString(summary.warning?.workspacePath)) issues.push('triggered warning.workspacePath must be a non-empty string');
@@ -789,6 +792,7 @@ function verifierSummaryIssues(summary) {
       if (summary.warning?.isolation?.warningRows !== 1) issues.push('triggered warning isolation.warningRows must be 1');
       if (summary.warning?.isolation?.llmPollutionCount !== 0) issues.push('triggered warning isolation.llmPollutionCount must be 0');
     } else if (summary.warning?.triggered === false) {
+      if (summary.warning?.reason !== undefined) issues.push('untriggered warning.reason must be absent');
       if (summary.warning?.eventId !== undefined) issues.push('untriggered warning.eventId must be absent');
       if (summary.warning?.sourceEventId !== undefined) issues.push('untriggered warning.sourceEventId must be absent');
       if (summary.warning?.workspacePath !== undefined) issues.push('untriggered warning.workspacePath must be absent');
@@ -1341,6 +1345,7 @@ function runVerifierSelfTest() {
       required: requireNearTimeoutWarning,
       triggered: true,
       thresholdMs: nearTimeoutThresholdMs,
+      reason: nearTimeoutWarningReason,
       eventId: 'evt_warning_self_test',
       sourceEventId: 'evt_self_test',
       workspacePath,
@@ -1688,6 +1693,30 @@ function runVerifierSelfTest() {
     ),
     verifierSummaryIssues(underThresholdTriggeredWarningSummary),
   );
+  const missingWarningReasonSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      reason: undefined,
+    },
+  };
+  assert(
+    'verifier self-test rejects triggered warning summaries without a reason',
+    verifierSummaryIssues(missingWarningReasonSummary).includes('triggered warning.reason must match the expected warning reason'),
+    verifierSummaryIssues(missingWarningReasonSummary),
+  );
+  const driftedWarningReasonSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      reason: 'other warning reason',
+    },
+  };
+  assert(
+    'verifier self-test rejects triggered warning reason drift in summaries',
+    verifierSummaryIssues(driftedWarningReasonSummary).includes('triggered warning.reason must match the expected warning reason'),
+    verifierSummaryIssues(driftedWarningReasonSummary),
+  );
   const untriggeredAboveThresholdSummary = {
     ...passedSummary,
     warning: {
@@ -1792,6 +1821,7 @@ function runVerifierSelfTest() {
       required: false,
       triggered: false,
       thresholdMs: nearTimeoutThresholdMs,
+      reason: nearTimeoutWarningReason,
       sourceEventId: 'evt_self_test',
       workspacePath,
       runId,
@@ -1802,7 +1832,7 @@ function runVerifierSelfTest() {
   };
   assert(
     'verifier self-test rejects stale warning contract fields when warning is not triggered',
-    verifierSummaryIssues(staleUntriggeredWarningKindSummary).includes('untriggered warning.sourceEventId must be absent'),
+    verifierSummaryIssues(staleUntriggeredWarningKindSummary).includes('untriggered warning.reason must be absent'),
     verifierSummaryIssues(staleUntriggeredWarningKindSummary),
   );
   const triggeredWarningFailureSummary = {
@@ -3242,6 +3272,7 @@ async function main() {
         required: requireNearTimeoutWarning,
         triggered: Boolean(warningEvent),
         thresholdMs: nearTimeoutThresholdMs,
+        reason: warningEvent?.attributes?.['progressive.warning.reason'],
         eventId: warningEvent?.eventId,
         sourceEventId: warningEvent?.attributes?.['progressive.warning.eventId'],
         workspacePath: warningEvent?.workspacePath,
