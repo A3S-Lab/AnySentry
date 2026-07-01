@@ -14,6 +14,7 @@ const model = process.env.A3S_TEST_MODEL ?? process.env.A3S_CODE_MODEL ?? 'opena
 const aclPath = process.env.A3S_CODE_ACL ?? path.join(process.env.HOME ?? '', '.a3s/config.acl');
 const sdkBase = process.env.A3S_CODE_SDK_BASE ?? path.resolve(repoRoot, '../os/apps/api');
 const skillRoot = path.join(repoRoot, 'integrations/skills');
+const innerVerifierScript = path.join(repoRoot, 'scripts/verify-a3s-code-skill-inner.mjs');
 const runId = process.env.ANYSENTRY_A3S_CODE_TEST_RUN_ID ?? safeProbeId('a3s-code-skill-itest');
 const agentId = process.env.ANYSENTRY_A3S_CODE_TEST_AGENT_ID ?? 'a3s-code-skill-itest';
 const sessionId = `${runId}-session`;
@@ -2672,10 +2673,10 @@ function runVerifierSelfTest() {
   } catch {
     pass('verifier self-test rejects non-JSON Skill output');
   }
-  const source = verifierSource();
+  const source = innerVerifierSource();
   const missingSourceTimingFields = skillOutputTimingFields.filter((field) => !source.includes(field));
   assert(
-    'verifier self-test keeps all Skill inner timing fields in the generated verifier source',
+    'verifier self-test keeps all Skill inner timing fields in the inner verifier source',
     missingSourceTimingFields.length === 0,
     missingSourceTimingFields,
   );
@@ -2683,174 +2684,40 @@ function runVerifierSelfTest() {
     (field) => !source.includes(`progressive.verifier.${field}`),
   );
   assert(
-    'verifier self-test keeps all stored event inner timing attributes in the generated verifier source',
+    'verifier self-test keeps all stored event inner timing attributes in the inner verifier source',
     missingSourceEventTimingAttributes.length === 0,
     missingSourceEventTimingAttributes,
+  );
+  const skillCommand = buildSkillCommand();
+  const expectedIdentityJson = JSON.stringify({ runId, agentId, sessionId, workspacePath });
+  assert(
+    'verifier self-test binds Skill command identity through typed JSON',
+    skillCommand.includes(`ANYSENTRY_A3S_CODE_IDENTITY_JSON=${shellQuote(expectedIdentityJson)}`) &&
+      skillCommand.includes('node scripts/verify-a3s-code-skill-inner.mjs'),
+    skillCommand,
   );
 
   if (process.exitCode) process.exit(process.exitCode);
   console.log('a3s-code Skill verifier self-test passed');
 }
 
-function verifierSource() {
-  return `
-const apiBase = ${JSON.stringify(apiBase)};
-const runId = ${JSON.stringify(runId)};
-const agentId = ${JSON.stringify(agentId)};
-const sessionId = ${JSON.stringify(sessionId)};
-const workspacePath = ${JSON.stringify(workspacePath)};
-const model = ${JSON.stringify(model)};
-const verifierAttributes = ${JSON.stringify(verifierAttributes)};
-const expectedProgressiveFlow = ${JSON.stringify(expectedProgressiveFlow)};
-const flowStartedAt = Date.now();
-const flowTimings = {};
-
-async function timed(label, fn) {
-  const startedAt = Date.now();
-  try {
-    return await fn();
-  } finally {
-    flowTimings[label] = Math.max(0, Date.now() - startedAt);
-  }
+function innerVerifierSource() {
+  return fs.readFileSync(innerVerifierScript, 'utf8');
 }
 
-async function request(pathname, init = {}) {
-  const response = await fetch(\`\${apiBase}\${pathname}\`, {
-    headers: { 'content-type': 'application/json', ...(init.headers ?? {}) },
-    ...init,
-  });
-  const text = await response.text();
-  const body = text ? JSON.parse(text) : undefined;
-  if (!response.ok) throw new Error(\`\${init.method ?? 'GET'} \${pathname} -> HTTP \${response.status}: \${text}\`);
-  return body?.data ?? body;
+function shellQuote(value) {
+  return `'${String(value).replace(/'/gu, `'"'"'`)}'`;
 }
 
-async function eventually(label, fn) {
-  const deadline = Date.now() + 15000;
-  let lastValue;
-  while (Date.now() < deadline) {
-    lastValue = await fn();
-    if (lastValue) return lastValue;
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  throw new Error(\`Timed out waiting for \${label}: \${JSON.stringify(lastValue)}\`);
-}
-
-await timed('innerHealthzMs', () => request('/healthz'));
-
-const modules = await timed('innerListMs', () => request('/capabilities?action=list'));
-if (!Array.isArray(modules) || !modules.some((module) => module.name === 'security-center')) {
-  throw new Error(\`security-center module missing from list: \${JSON.stringify(modules)}\`);
-}
-
-const operation = await timed('innerDescribeRecordMs', () =>
-  request('/capabilities?action=describe&module=security-center&operation=recordSecurityEvents'),
-);
-if (operation?.name !== 'recordSecurityEvents' || !operation.inputSchema) {
-  throw new Error(\`recordSecurityEvents describe failed: \${JSON.stringify(operation)}\`);
-}
-
-const preRecordMs = Math.max(0, Date.now() - flowStartedAt);
-flowTimings.innerPreRecordMs = preRecordMs;
-const recorded = await timed('innerRecordMs', () => request('/capabilities', {
-  method: 'POST',
-  body: JSON.stringify({
-    action: 'execute',
-    module: 'security-center',
-    operation: 'recordSecurityEvents',
-    params: {
-      sourceName: 'a3s-code-skill-itest',
-      sourceType: 'custom',
-      workspacePath,
-      agentId,
-      sessionId,
-      events: [
-        {
-          kind: 'LlmCall',
-          workspacePath,
-          agentId,
-          sessionId,
-          runId,
-          model,
-          subject: 'a3s-code used anysentry-api skill to call progressive API',
-          promptTokens: 12,
-          completionTokens: 8,
-          latencyMs: 321,
-          attributes: {
-            ...verifierAttributes,
-            'progressive.verifier.innerHealthzMs': flowTimings.innerHealthzMs,
-            'progressive.verifier.innerListMs': flowTimings.innerListMs,
-            'progressive.verifier.innerDescribeRecordMs': flowTimings.innerDescribeRecordMs,
-            'progressive.verifier.innerPreRecordMs': preRecordMs,
-            'progressive.runner': 'a3s-code',
-            'progressive.skill': 'anysentry-api',
-            'progressive.flow': expectedProgressiveFlow,
-            'progressive.model': model,
-          },
-        },
-      ],
-    },
-  }),
-}));
-
-const eventId = recorded.items?.[0]?.eventId;
-if (recorded.accepted !== true || !eventId) {
-  throw new Error(\`recordSecurityEvents did not accept one event: \${JSON.stringify(recorded)}\`);
-}
-
-const event = await timed('innerQueryEventMs', () => eventually('recorded event to be queryable', async () => {
-  const list = await request('/events/list', {
-    method: 'POST',
-    body: JSON.stringify({ timeType: 'last_30d', runId, agentId, limit: 10 }),
-  });
-  return list.items?.find(
-    (item) =>
-      item.eventId === eventId &&
-      item.workspacePath === workspacePath &&
-      item.runId === runId &&
-      item.agentId === agentId &&
-      item.sessionId === sessionId,
-  );
-}));
-
-const bundle = await timed('innerBundleMs', () => request('/capabilities', {
-  method: 'POST',
-  body: JSON.stringify({
-    action: 'execute',
-    module: 'security-center',
-    operation: 'buildEvidenceBundle',
-    params: {
-      timeType: 'last_30d',
-      eventId,
-      limit: 20,
-    },
-  }),
-}));
-if (bundle?.schemaVersion !== 'anysentry.evidence_bundle.v1' || !bundle.events?.some((item) => item.eventId === eventId)) {
-  throw new Error(\`buildEvidenceBundle did not include the recorded event: \${JSON.stringify(bundle)}\`);
-}
-flowTimings.innerTotalMs = Math.max(0, Date.now() - flowStartedAt);
-
-console.log(JSON.stringify({
-  healthOk: true,
-  listed: true,
-  described: operation.name,
-  eventId,
-  bundleId: bundle.bundleId,
-  bundleSchemaVersion: bundle.schemaVersion,
-  bundleContainsEvent: bundle.events?.some((item) => item.eventId === eventId) === true,
-  bundleEventCount: bundle.summary?.eventCount,
-  eventKind: event.eventKind,
-  eventCategory: event.eventCategory,
-  verdict: event.verdict ?? recorded.items?.[0]?.verdict,
-  queriedBack: true,
-  timings: flowTimings,
-  workspacePath: event.workspacePath,
-  runId,
-  agentId,
-  sessionId,
-}));
-`.trim();
+function buildSkillCommand() {
+  return [
+    `ANYSENTRY_API_BASE=${shellQuote(apiBase)}`,
+    `A3S_TEST_MODEL=${shellQuote(model)}`,
+    `ANYSENTRY_A3S_CODE_IDENTITY_JSON=${shellQuote(JSON.stringify({ runId, agentId, sessionId, workspacePath }))}`,
+    `ANYSENTRY_A3S_CODE_VERIFIER_ATTRIBUTES_JSON=${shellQuote(JSON.stringify(verifierAttributes))}`,
+    `ANYSENTRY_A3S_CODE_EXPECTED_PROGRESSIVE_FLOW=${shellQuote(expectedProgressiveFlow)}`,
+    'node scripts/verify-a3s-code-skill-inner.mjs',
+  ].join(' ');
 }
 
 function buildSkillPrompt() {
@@ -2863,13 +2730,12 @@ Constraints:
 - Use bash to run exactly one verification command.
 - Follow the progressive flow: healthz, list, describe, execute, events/list, buildEvidenceBundle.
 - Return only the compact JSON printed by the command.
+- Do not reconstruct, rewrite, or summarize the JSON yourself.
 
 Run this command:
 
 \`\`\`sh
-node --input-type=module <<'ANYSENTRY_A3S_CODE_SKILL_VERIFY'
-${verifierSource()}
-ANYSENTRY_A3S_CODE_SKILL_VERIFY
+${buildSkillCommand()}
 \`\`\`
 `.trim();
 }
@@ -2887,6 +2753,7 @@ async function main() {
 
   assert('a3s-code ACL exists', fs.existsSync(aclPath), `Set A3S_CODE_ACL. Missing: ${aclPath}`);
   assert('anysentry-api Skill directory exists', fs.existsSync(path.join(skillRoot, 'anysentry-api', 'SKILL.md')), skillRoot);
+  assert('a3s-code Skill inner verifier exists', fs.existsSync(innerVerifierScript), innerVerifierScript);
   if (process.exitCode) {
     timings.elapsed = durationMs(verifierStartedAt);
     printVerifierSummary(failureSummary('preflight', 'required local verifier prerequisites are missing', { aclPath, skillRoot }, timings));

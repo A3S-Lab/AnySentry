@@ -430,6 +430,10 @@ creation failures attempt to write the same failure evidence through AnySentry.
 `pnpm verify:a3s-code-skill-api:self-test` validates that summary
 contract and the Skill-output JSON parser offline, so the production verifier's
 machine-readable handoff is checked without adding a parallel soak path.
+The Skill invocation runs the checked-in `scripts/verify-a3s-code-skill-inner.mjs`
+helper with a typed identity JSON environment, so `runId`, `agentId`,
+`sessionId`, and `workspacePath` are not reconstructed by the model from a long
+inline script.
 Timeout handling closes the a3s-code session before writing failure evidence, and
 `A3S_CODE_SESSION_CLOSE_TIMEOUT_MS` bounds that cleanup so a stuck close cannot
 suppress the failure finding. Coding-agent producer aliases such as
