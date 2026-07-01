@@ -20,6 +20,7 @@
     "verify:ai-native-api": "node scripts/verify-ai-native-api.mjs",
     "verify:ai-native-api:local": "pnpm build:api && node scripts/verify-deep-links-local.mjs scripts/verify-ai-native-api.mjs",
     "verify:a3s-code-skill-api": "node scripts/verify-a3s-code-skill-api.mjs",
+    "verify:a3s-code-skill-api:self-test": "node scripts/verify-a3s-code-skill-api.mjs --self-test",
     "verify:management-auth": "node scripts/verify-management-auth.mjs",
     "verify:management-auth:local": "pnpm build:api && ANYSENTRY_ADMIN_TOKEN=verify-admin-token node scripts/verify-deep-links-local.mjs scripts/verify-management-auth.mjs",
     "verify:deep-links": "node scripts/verify-deep-links.mjs",
@@ -47,6 +48,6 @@
     "verify:evidence-bundle:local": "pnpm build:api && node scripts/verify-deep-links-local.mjs scripts/verify-evidence-bundle.mjs",
     "verify:notification-dispatch": "node scripts/verify-notification-dispatch.mjs",
     "verify:notification-dispatch:local": "pnpm build:api && node scripts/verify-deep-links-local.mjs scripts/verify-notification-dispatch.mjs",
-    "verify:contracts:local": "pnpm verify:deployment-manifests && pnpm verify:progressive-api:local && pnpm verify:management-auth:local && pnpm verify:dashboard-runtime:base-path:local && pnpm build && ANYSENTRY_ADMIN_TOKEN= ANYSENTRY_MANAGEMENT_TOKEN= node scripts/verify-deep-links-local.mjs scripts/verify-dashboard-runtime.mjs scripts/verify-coverage-runtime.mjs scripts/verify-forwarders.mjs scripts/verify-observer-ingest.mjs scripts/verify-ingest-protocols.mjs scripts/verify-ai-native-api.mjs scripts/verify-operations-lifecycle.mjs scripts/verify-objectives-runtime.mjs scripts/verify-maintenance-runtime.mjs scripts/verify-remediation-runtime.mjs scripts/verify-evidence-bundle.mjs scripts/verify-notification-dispatch.mjs scripts/verify-deep-links.mjs"
+    "verify:contracts:local": "pnpm verify:deployment-manifests && pnpm verify:a3s-code-skill-api:self-test && pnpm verify:progressive-api:local && pnpm verify:management-auth:local && pnpm verify:dashboard-runtime:base-path:local && pnpm build && ANYSENTRY_ADMIN_TOKEN= ANYSENTRY_MANAGEMENT_TOKEN= node scripts/verify-deep-links-local.mjs scripts/verify-dashboard-runtime.mjs scripts/verify-coverage-runtime.mjs scripts/verify-forwarders.mjs scripts/verify-observer-ingest.mjs scripts/verify-ingest-protocols.mjs scripts/verify-ai-native-api.mjs scripts/verify-operations-lifecycle.mjs scripts/verify-objectives-runtime.mjs scripts/verify-maintenance-runtime.mjs scripts/verify-remediation-runtime.mjs scripts/verify-evidence-bundle.mjs scripts/verify-notification-dispatch.mjs scripts/verify-deep-links.mjs"
   }
 }

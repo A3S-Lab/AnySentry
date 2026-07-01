@@ -322,6 +322,7 @@ checks, and stop the server.
 | Management auth | `pnpm verify:management-auth:local` |
 | Operations lifecycle | `pnpm verify:operations-lifecycle:local` |
 | Coverage, objectives, maintenance, remediation, evidence, notifications | `pnpm verify:contracts:local` |
+| a3s-code verifier summary contract, without API/model calls | `pnpm verify:a3s-code-skill-api:self-test` |
 | Real a3s-code Skill plus LLM-backed evidence event | `ANYSENTRY_API_BASE=http://127.0.0.1:29653/security-center A3S_TEST_MODEL=openai/glm5.1-w4a8 A3S_CODE_ACL="$HOME/.a3s/config.acl" A3S_CODE_SDK_BASE=../os/apps/api pnpm verify:a3s-code-skill-api` |
 
 For production smoke or soak testing, do not reuse old event IDs as proof. Run
@@ -353,7 +354,9 @@ assert `status`, failure phase, failure evidence, event IDs, warning isolation,
 and timing fields without scraping human-readable log lines. Success summaries
 also include the inner Skill output event and bundle IDs, and the verifier fails
 if those IDs do not match the rows and Evidence Bundle queried by the outer
-runtime.
+runtime. `pnpm verify:a3s-code-skill-api:self-test` validates that summary
+contract and the Skill-output JSON parser offline, so the production verifier's
+machine-readable handoff is checked without adding a parallel soak path.
 Timeout handling closes the a3s-code session before writing failure evidence, and
 `A3S_CODE_SESSION_CLOSE_TIMEOUT_MS` bounds that cleanup so a stuck close cannot
 suppress the failure finding. Coding-agent producer aliases such as

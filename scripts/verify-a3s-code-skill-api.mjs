@@ -40,6 +40,7 @@ const nearTimeoutRatio = Number(process.env.A3S_CODE_NEAR_TIMEOUT_RATIO ?? 0.5);
 const nearTimeoutThresholdRatio = Number.isFinite(nearTimeoutRatio) && nearTimeoutRatio > 0 && nearTimeoutRatio < 1 ? nearTimeoutRatio : 0.5;
 const nearTimeoutThresholdMs = Math.round(skillTimeoutMs * nearTimeoutThresholdRatio);
 const requireNearTimeoutWarning = booleanEnv('A3S_CODE_REQUIRE_NEAR_TIMEOUT_WARNING');
+const verifierSelfTest = process.argv.includes('--self-test') || booleanEnv('ANYSENTRY_A3S_CODE_VERIFIER_SELF_TEST');
 const verifierCommit = currentGitCommit();
 const verifierAttributes = {
   'progressive.verifier': 'verify-a3s-code-skill-api',
@@ -112,7 +113,79 @@ function assert(message, condition, details) {
 
 let verifierSummaryPrinted = false;
 
+function isRecord(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isFiniteNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function verifierSummaryIssues(summary) {
+  const issues = [];
+  if (!isRecord(summary)) return ['summary must be an object'];
+  if (summary.schemaVersion !== verifierSummarySchema) issues.push('schemaVersion must be anysentry.a3s_code_skill_verifier.summary.v1');
+  if (!['passed', 'failed'].includes(summary.status)) issues.push('status must be passed or failed');
+  if (summary.verifier?.name !== 'verify-a3s-code-skill-api') issues.push('verifier.name must be verify-a3s-code-skill-api');
+  if (!isNonEmptyString(summary.verifier?.commit)) issues.push('verifier.commit must be a non-empty string');
+  if (!isNonEmptyString(summary.verifier?.model)) issues.push('verifier.model must be a non-empty string');
+  if (!isNonEmptyString(summary.target?.apiBase)) issues.push('target.apiBase must be a non-empty string');
+  if (!isNonEmptyString(summary.target?.runId)) issues.push('target.runId must be a non-empty string');
+  if (!isNonEmptyString(summary.target?.agentId)) issues.push('target.agentId must be a non-empty string');
+  if (!isNonEmptyString(summary.target?.sessionId)) issues.push('target.sessionId must be a non-empty string');
+  if (!isRecord(summary.timings)) issues.push('timings must be an object');
+
+  if (summary.status === 'passed') {
+    if (summary.failure) issues.push('passed summary must not include failure');
+    if (!isNonEmptyString(summary.evidence?.eventId)) issues.push('passed summary evidence.eventId must be a non-empty string');
+    if (!isNonEmptyString(summary.evidence?.bundleId)) issues.push('passed summary evidence.bundleId must be a non-empty string');
+    if (!isNonEmptyString(summary.evidence?.skillOutput?.eventId)) issues.push('passed summary evidence.skillOutput.eventId must be a non-empty string');
+    if (!isNonEmptyString(summary.evidence?.skillOutput?.bundleId)) issues.push('passed summary evidence.skillOutput.bundleId must be a non-empty string');
+    if (summary.evidence?.eventId !== summary.evidence?.skillOutput?.eventId) issues.push('passed summary eventId must match skillOutput.eventId');
+    if (summary.evidence?.bundleId !== summary.evidence?.skillOutput?.bundleId) issues.push('passed summary bundleId must match skillOutput.bundleId');
+  }
+
+  if (summary.status === 'failed') {
+    if (!isNonEmptyString(summary.failure?.phase)) issues.push('failed summary failure.phase must be a non-empty string');
+    if (!isNonEmptyString(summary.failure?.reason)) issues.push('failed summary failure.reason must be a non-empty string');
+    const evidence = summary.failure?.evidence;
+    if (isRecord(evidence) && evidence.recorded === true) {
+      if (!isNonEmptyString(evidence.eventId)) issues.push('recorded failure evidence.eventId must be a non-empty string');
+      if (!isNonEmptyString(evidence.bundleId)) issues.push('recorded failure evidence.bundleId must be a non-empty string');
+    }
+    if (isRecord(evidence) && evidence.recorded === false && !isNonEmptyString(evidence.error)) {
+      issues.push('unrecorded failure evidence.error must explain why evidence was not written');
+    }
+  }
+
+  if (summary.warning !== undefined) {
+    if (typeof summary.warning?.required !== 'boolean') issues.push('warning.required must be a boolean');
+    if (typeof summary.warning?.triggered !== 'boolean') issues.push('warning.triggered must be a boolean');
+    if (!isFiniteNumber(summary.warning?.thresholdMs) || summary.warning.thresholdMs <= 0) issues.push('warning.thresholdMs must be a positive number');
+    if (summary.warning?.triggered === true) {
+      if (!isNonEmptyString(summary.warning?.eventId)) issues.push('triggered warning.eventId must be a non-empty string');
+      if (summary.warning?.isolation?.llmPollutionCount !== 0) issues.push('triggered warning isolation.llmPollutionCount must be 0');
+    }
+  }
+  return issues;
+}
+
 function printVerifierSummary(summary) {
+  const issues = verifierSummaryIssues(summary);
+  if (issues.length > 0) {
+    process.exitCode = 1;
+    summary = {
+      ...summary,
+      summaryValidation: {
+        status: 'failed',
+        issues,
+      },
+    };
+  }
   verifierSummaryPrinted = true;
   console.log(`VERIFIER_SUMMARY ${JSON.stringify(summary)}`);
   console.log(JSON.stringify(summary, null, 2));
@@ -507,6 +580,97 @@ function parseSkillOutputJson(result) {
     }
   }
   throw new Error(`Skill output did not contain a JSON object: ${compact(output)}`);
+}
+
+function runVerifierSelfTest() {
+  const passedSummary = {
+    ...verifierSummaryBase('passed'),
+    verifier: {
+      ...verifierSummaryBase('passed').verifier,
+      skill: 'anysentry-api',
+      toolCalls: 1,
+    },
+    evidence: {
+      eventId: 'evt_self_test',
+      eventKind: 'LlmCall',
+      verdict: 'allow',
+      bundleId: 'evb_self_test',
+      bundleEventCount: 1,
+      skillOutput: {
+        eventId: 'evt_self_test',
+        eventKind: 'LlmCall',
+        verdict: 'allow',
+        bundleId: 'evb_self_test',
+        bundleEventCount: 1,
+        queriedBack: true,
+      },
+    },
+    warning: {
+      required: true,
+      triggered: true,
+      thresholdMs: 100,
+      eventId: 'evt_warning_self_test',
+      isolation: {
+        warningRows: 1,
+        llmPollutionCount: 0,
+      },
+    },
+    timings: {
+      skill: 75,
+      elapsed: 100,
+    },
+  };
+  assert('verifier self-test accepts the passed summary contract', verifierSummaryIssues(passedSummary).length === 0, verifierSummaryIssues(passedSummary));
+
+  const failedSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    { recorded: true, eventId: 'evt_failure_self_test', bundleId: 'evb_failure_self_test' },
+  );
+  assert('verifier self-test accepts the failed summary contract', verifierSummaryIssues(failedSummary).length === 0, verifierSummaryIssues(failedSummary));
+
+  const mismatchedSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        bundleId: 'evb_mismatch',
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects mismatched Skill output IDs',
+    verifierSummaryIssues(mismatchedSummary).includes('passed summary bundleId must match skillOutput.bundleId'),
+    verifierSummaryIssues(mismatchedSummary),
+  );
+
+  const invalidFailureSummary = {
+    ...verifierSummaryBase('failed'),
+    failure: { reason: 'missing phase' },
+    timings: {},
+  };
+  assert(
+    'verifier self-test rejects failed summaries without a phase',
+    verifierSummaryIssues(invalidFailureSummary).includes('failed summary failure.phase must be a non-empty string'),
+    verifierSummaryIssues(invalidFailureSummary),
+  );
+
+  const directSkillOutput = parseSkillOutputJson({ output: '{"eventId":"evt_a","bundleId":"evb_a"}' });
+  assert('verifier self-test parses compact Skill JSON output', directSkillOutput.eventId === 'evt_a' && directSkillOutput.bundleId === 'evb_a', directSkillOutput);
+  const wrappedSkillOutput = parseSkillOutputJson({ output: 'log line {"ignored":true}\n{"eventId":"evt_b","bundleId":"evb_b"}' });
+  assert('verifier self-test extracts the final Skill JSON object from wrapper output', wrappedSkillOutput.eventId === 'evt_b' && wrappedSkillOutput.bundleId === 'evb_b', wrappedSkillOutput);
+  try {
+    parseSkillOutputJson({ output: 'not json' });
+    fail('verifier self-test rejects non-JSON Skill output');
+  } catch {
+    pass('verifier self-test rejects non-JSON Skill output');
+  }
+
+  if (process.exitCode) process.exit(process.exitCode);
+  console.log('a3s-code Skill verifier self-test passed');
 }
 
 function verifierSource() {
@@ -992,12 +1156,16 @@ async function main() {
   console.log('a3s-code Skill progressive API verification passed');
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  fail('verification threw', message);
-  if (!verifierSummaryPrinted) {
-    lastVerifierTimings.elapsed = durationMs(verifierProcessStartedAt);
-    printVerifierSummary(failureSummary('uncaught', 'verification threw', message, lastVerifierTimings));
-  }
-  process.exit(process.exitCode || 1);
-});
+if (verifierSelfTest) {
+  runVerifierSelfTest();
+} else {
+  main().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    fail('verification threw', message);
+    if (!verifierSummaryPrinted) {
+      lastVerifierTimings.elapsed = durationMs(verifierProcessStartedAt);
+      printVerifierSummary(failureSummary('uncaught', 'verification threw', message, lastVerifierTimings));
+    }
+    process.exit(process.exitCode || 1);
+  });
+}
