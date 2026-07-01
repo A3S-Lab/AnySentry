@@ -162,6 +162,7 @@ function evidenceFieldMismatchIssues(prefix, actual, expected, fields) {
 function successfulEvidenceIssues(summary, context) {
   const issues = [];
   if (!isNonEmptyString(summary.evidence?.eventId)) issues.push(`${context} evidence.eventId must be a non-empty string`);
+  if (!isNonEmptyString(summary.evidence?.workspacePath)) issues.push(`${context} evidence.workspacePath must be a non-empty string`);
   if (!isNonEmptyString(summary.evidence?.runId)) issues.push(`${context} evidence.runId must be a non-empty string`);
   if (!isNonEmptyString(summary.evidence?.agentId)) issues.push(`${context} evidence.agentId must be a non-empty string`);
   if (!isNonEmptyString(summary.evidence?.sessionId)) issues.push(`${context} evidence.sessionId must be a non-empty string`);
@@ -172,6 +173,9 @@ function successfulEvidenceIssues(summary, context) {
   if (summary.evidence?.verdict !== 'allow') issues.push(`${context} evidence.verdict must be allow`);
   if (!isNonEmptyString(summary.evidence?.skillOutput?.eventId)) {
     issues.push(`${context} evidence.skillOutput.eventId must be a non-empty string`);
+  }
+  if (!isNonEmptyString(summary.evidence?.skillOutput?.workspacePath)) {
+    issues.push(`${context} evidence.skillOutput.workspacePath must be a non-empty string`);
   }
   if (!isNonEmptyString(summary.evidence?.skillOutput?.runId)) {
     issues.push(`${context} evidence.skillOutput.runId must be a non-empty string`);
@@ -195,6 +199,9 @@ function successfulEvidenceIssues(summary, context) {
   if (summary.evidence?.eventId !== summary.evidence?.skillOutput?.eventId) {
     issues.push(`${context} eventId must match skillOutput.eventId`);
   }
+  if (summary.target?.workspacePath !== summary.evidence?.workspacePath) {
+    issues.push(`${context} target.workspacePath must match evidence.workspacePath`);
+  }
   if (summary.target?.runId !== summary.evidence?.runId) {
     issues.push(`${context} target.runId must match evidence.runId`);
   }
@@ -212,6 +219,12 @@ function successfulEvidenceIssues(summary, context) {
   }
   if (summary.evidence?.sessionId !== summary.evidence?.skillOutput?.sessionId) {
     issues.push(`${context} evidence.sessionId must match skillOutput.sessionId`);
+  }
+  if (summary.evidence?.workspacePath !== summary.evidence?.skillOutput?.workspacePath) {
+    issues.push(`${context} evidence.workspacePath must match skillOutput.workspacePath`);
+  }
+  if (summary.target?.workspacePath !== summary.evidence?.skillOutput?.workspacePath) {
+    issues.push(`${context} target.workspacePath must match skillOutput.workspacePath`);
   }
   if (summary.target?.runId !== summary.evidence?.skillOutput?.runId) {
     issues.push(`${context} target.runId must match skillOutput.runId`);
@@ -251,6 +264,10 @@ function verifierSummaryIssues(summary) {
   if (!isNonEmptyString(summary.target?.apiBase)) issues.push('target.apiBase must be a non-empty string');
   if (isNonEmptyString(summary.target?.apiBase) && summary.target.apiBase !== apiBase) {
     issues.push('target.apiBase must match the running verifier API base');
+  }
+  if (!isNonEmptyString(summary.target?.workspacePath)) issues.push('target.workspacePath must be a non-empty string');
+  if (isNonEmptyString(summary.target?.workspacePath) && summary.target.workspacePath !== workspacePath) {
+    issues.push('target.workspacePath must match the running verifier workspacePath');
   }
   if (!isNonEmptyString(summary.target?.runId)) issues.push('target.runId must be a non-empty string');
   if (isNonEmptyString(summary.target?.runId) && summary.target.runId !== runId) {
@@ -352,6 +369,7 @@ function verifierSummaryIssues(summary) {
     if (summary.warning?.triggered === true) {
       if (!isNonEmptyString(summary.warning?.eventId)) issues.push('triggered warning.eventId must be a non-empty string');
       if (!isNonEmptyString(summary.warning?.sourceEventId)) issues.push('triggered warning.sourceEventId must be a non-empty string');
+      if (!isNonEmptyString(summary.warning?.workspacePath)) issues.push('triggered warning.workspacePath must be a non-empty string');
       if (!isNonEmptyString(summary.warning?.runId)) issues.push('triggered warning.runId must be a non-empty string');
       if (!isNonEmptyString(summary.warning?.agentId)) issues.push('triggered warning.agentId must be a non-empty string');
       if (!isNonEmptyString(summary.warning?.sessionId)) issues.push('triggered warning.sessionId must be a non-empty string');
@@ -366,6 +384,9 @@ function verifierSummaryIssues(summary) {
       if (isNonEmptyString(summary.evidence?.eventId) && summary.warning?.sourceEventId !== summary.evidence.eventId) {
         issues.push('triggered warning.sourceEventId must match evidence.eventId');
       }
+      if (summary.warning?.workspacePath !== summary.target?.workspacePath) {
+        issues.push('triggered warning.workspacePath must match target.workspacePath');
+      }
       if (summary.warning?.runId !== summary.target?.runId) issues.push('triggered warning.runId must match target.runId');
       if (summary.warning?.agentId !== summary.target?.agentId) issues.push('triggered warning.agentId must match target.agentId');
       if (summary.warning?.sessionId !== summary.target?.sessionId) issues.push('triggered warning.sessionId must match target.sessionId');
@@ -377,6 +398,7 @@ function verifierSummaryIssues(summary) {
     } else if (summary.warning?.triggered === false) {
       if (summary.warning?.eventId !== undefined) issues.push('untriggered warning.eventId must be absent');
       if (summary.warning?.sourceEventId !== undefined) issues.push('untriggered warning.sourceEventId must be absent');
+      if (summary.warning?.workspacePath !== undefined) issues.push('untriggered warning.workspacePath must be absent');
       if (summary.warning?.runId !== undefined) issues.push('untriggered warning.runId must be absent');
       if (summary.warning?.agentId !== undefined) issues.push('untriggered warning.agentId must be absent');
       if (summary.warning?.sessionId !== undefined) issues.push('untriggered warning.sessionId must be absent');
@@ -421,6 +443,7 @@ function verifierSummaryBase(status) {
     },
     target: {
       apiBase,
+      workspacePath,
       runId,
       agentId,
       sessionId,
@@ -451,6 +474,7 @@ function summaryValidationFailureSummary(summary, issues) {
       ...base.target,
       ...originalTarget,
       apiBase,
+      workspacePath,
       runId,
       agentId,
       sessionId,
@@ -693,8 +717,13 @@ async function recordNearTimeoutWarning(event, bundle, timings) {
     });
     return list.items?.find(
       (item) =>
-        item.eventId === warningEventId ||
-        (item.attributes?.['progressive.warning'] === 'near_timeout' && item.attributes?.['progressive.warning.eventId'] === event.eventId),
+        (item.eventId === warningEventId ||
+          (item.attributes?.['progressive.warning'] === 'near_timeout' &&
+            item.attributes?.['progressive.warning.eventId'] === event.eventId)) &&
+        item.workspacePath === workspacePath &&
+        item.runId === runId &&
+        item.agentId === agentId &&
+        item.sessionId === sessionId,
     );
   });
   if (!warningEvent?.eventId) {
@@ -703,7 +732,12 @@ async function recordNearTimeoutWarning(event, bundle, timings) {
   if (warningEvent.verdict !== 'allow' || warningEvent.eventKind !== 'RuntimeEvent' || warningEvent.eventCategory !== 'runtime') {
     throw new Error(`near-timeout warning should remain allow evidence: ${compact(warningEvent)}`);
   }
-  if (warningEvent.runId !== runId || warningEvent.agentId !== agentId || warningEvent.sessionId !== sessionId) {
+  if (
+    warningEvent.workspacePath !== workspacePath ||
+    warningEvent.runId !== runId ||
+    warningEvent.agentId !== agentId ||
+    warningEvent.sessionId !== sessionId
+  ) {
     throw new Error(`near-timeout warning lost target identity: ${compact(warningEvent)}`);
   }
   const warningAttrs = warningEvent.attributes ?? {};
@@ -723,7 +757,12 @@ async function recordNearTimeoutWarning(event, bundle, timings) {
   });
   const warningItems =
     warningRows.items?.filter(
-      (item) => item.runId === runId && item.agentId === agentId && item.attributes?.['progressive.warning'] === 'near_timeout',
+      (item) =>
+        item.workspacePath === workspacePath &&
+        item.runId === runId &&
+        item.agentId === agentId &&
+        item.sessionId === sessionId &&
+        item.attributes?.['progressive.warning'] === 'near_timeout',
     ) ?? [];
   const llmPollution = warningItems.filter((item) => item.eventKind === 'LlmCall' || item.eventCategory === 'llm');
   if (llmPollution.length > 0) {
@@ -869,6 +908,7 @@ function runVerifierSelfTest() {
     },
     evidence: {
       eventId: 'evt_self_test',
+      workspacePath,
       runId,
       agentId,
       sessionId,
@@ -879,6 +919,7 @@ function runVerifierSelfTest() {
       bundleEventCount: 1,
       skillOutput: {
         eventId: 'evt_self_test',
+        workspacePath,
         runId,
         agentId,
         sessionId,
@@ -896,6 +937,7 @@ function runVerifierSelfTest() {
       thresholdMs: nearTimeoutThresholdMs,
       eventId: 'evt_warning_self_test',
       sourceEventId: 'evt_self_test',
+      workspacePath,
       runId,
       agentId,
       sessionId,
@@ -938,6 +980,18 @@ function runVerifierSelfTest() {
     'verifier self-test rejects summaries from a different run',
     verifierSummaryIssues(mismatchedTargetSummary).includes('target.runId must match the running verifier runId'),
     verifierSummaryIssues(mismatchedTargetSummary),
+  );
+  const mismatchedWorkspaceSummary = {
+    ...passedSummary,
+    target: {
+      ...passedSummary.target,
+      workspacePath: 'repo://other/workspace',
+    },
+  };
+  assert(
+    'verifier self-test rejects summaries from a different workspace',
+    verifierSummaryIssues(mismatchedWorkspaceSummary).includes('target.workspacePath must match the running verifier workspacePath'),
+    verifierSummaryIssues(mismatchedWorkspaceSummary),
   );
   const normalizedStaleIdentitySummary = normalizedVerifierSummary({
     ...mismatchedTargetSummary,
@@ -984,6 +1038,21 @@ function runVerifierSelfTest() {
     'verifier self-test rejects Skill output session identity drift',
     verifierSummaryIssues(driftedSkillSessionSummary).includes('passed summary target.sessionId must match skillOutput.sessionId'),
     verifierSummaryIssues(driftedSkillSessionSummary),
+  );
+  const driftedSkillWorkspaceSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        workspacePath: 'repo://other/workspace',
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects Skill output workspace drift',
+    verifierSummaryIssues(driftedSkillWorkspaceSummary).includes('passed summary target.workspacePath must match skillOutput.workspacePath'),
+    verifierSummaryIssues(driftedSkillWorkspaceSummary),
   );
   const mismatchedWarningRequirementSummary = {
     ...passedSummary,
@@ -1085,6 +1154,7 @@ function runVerifierSelfTest() {
       triggered: false,
       thresholdMs: nearTimeoutThresholdMs,
       sourceEventId: 'evt_self_test',
+      workspacePath,
       runId,
       eventKind: 'RuntimeEvent',
       eventCategory: 'runtime',
@@ -1157,6 +1227,18 @@ function runVerifierSelfTest() {
     'verifier self-test rejects warning source event drift',
     verifierSummaryIssues(driftedWarningSourceSummary).includes('triggered warning.sourceEventId must match evidence.eventId'),
     verifierSummaryIssues(driftedWarningSourceSummary),
+  );
+  const driftedWarningWorkspaceSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      workspacePath: 'repo://other/workspace',
+    },
+  };
+  assert(
+    'verifier self-test rejects warning workspace drift',
+    verifierSummaryIssues(driftedWarningWorkspaceSummary).includes('triggered warning.workspacePath must match target.workspacePath'),
+    verifierSummaryIssues(driftedWarningWorkspaceSummary),
   );
   const driftedWarningRunSummary = {
     ...passedSummary,
@@ -1380,6 +1462,18 @@ function runVerifierSelfTest() {
     'verifier self-test rejects stored evidence run identity drift',
     verifierSummaryIssues(driftedEvidenceRunSummary).includes('passed summary target.runId must match evidence.runId'),
     verifierSummaryIssues(driftedEvidenceRunSummary),
+  );
+  const driftedEvidenceWorkspaceSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      workspacePath: 'repo://other/workspace',
+    },
+  };
+  assert(
+    'verifier self-test rejects stored evidence workspace drift',
+    verifierSummaryIssues(driftedEvidenceWorkspaceSummary).includes('passed summary target.workspacePath must match evidence.workspacePath'),
+    verifierSummaryIssues(driftedEvidenceWorkspaceSummary),
   );
   const driftedEvidenceAgentSummary = {
     ...passedSummary,
@@ -1665,7 +1759,14 @@ const event = await timed('innerQueryEventMs', () => eventually('recorded event 
     method: 'POST',
     body: JSON.stringify({ timeType: 'last_30d', runId, agentId, limit: 10 }),
   });
-  return list.items?.find((item) => item.eventId === eventId && item.runId === runId && item.agentId === agentId);
+  return list.items?.find(
+    (item) =>
+      item.eventId === eventId &&
+      item.workspacePath === workspacePath &&
+      item.runId === runId &&
+      item.agentId === agentId &&
+      item.sessionId === sessionId,
+  );
 }));
 
 const bundle = await timed('innerBundleMs', () => request('/capabilities', {
@@ -1698,6 +1799,7 @@ console.log(JSON.stringify({
   verdict: event.verdict ?? recorded.items?.[0]?.verdict,
   queriedBack: true,
   timings: flowTimings,
+  workspacePath: event.workspacePath,
   runId,
   agentId,
   sessionId,
@@ -1931,6 +2033,7 @@ async function main() {
     const outputMatchesRun =
       typeof skillOutput.eventId === 'string' &&
       typeof skillOutput.bundleId === 'string' &&
+      skillOutput.workspacePath === workspacePath &&
       skillOutput.runId === runId &&
       skillOutput.agentId === agentId &&
       skillOutput.sessionId === sessionId &&
@@ -1942,7 +2045,7 @@ async function main() {
     if (!outputMatchesRun) {
       timings.elapsed = durationMs(verifierStartedAt);
       const reason = 'skill output did not match the verifier run';
-      const details = { skillOutput, runId, agentId, sessionId };
+      const details = { skillOutput, workspacePath, runId, agentId, sessionId };
       const failureTimings = {
         ...timings,
         failurePhase: 'skill_output',
@@ -1958,7 +2061,14 @@ async function main() {
         method: 'POST',
         body: JSON.stringify({ timeType: 'last_30d', runId, agentId, limit: 10 }),
       });
-      return list.items?.find((item) => item.eventId === skillOutput.eventId && item.runId === runId && item.agentId === agentId);
+      return list.items?.find(
+        (item) =>
+          item.eventId === skillOutput.eventId &&
+          item.workspacePath === workspacePath &&
+          item.runId === runId &&
+          item.agentId === agentId &&
+          item.sessionId === sessionId,
+      );
     });
     timings.queryEvent = durationMs(queryStartedAt);
 
@@ -1985,7 +2095,7 @@ async function main() {
     );
     await requireVerification(
       'stored event carries the verifier target identity',
-      event?.runId === runId && event?.agentId === agentId && event?.sessionId === sessionId,
+      event?.workspacePath === workspacePath && event?.runId === runId && event?.agentId === agentId && event?.sessionId === sessionId,
       'event_contract',
       'stored event lost verifier target identity',
       event,
@@ -2100,12 +2210,14 @@ async function main() {
       },
       target: {
         apiBase,
+        workspacePath,
         runId,
         agentId,
         sessionId,
       },
       evidence: {
         eventId: event.eventId,
+        workspacePath: event.workspacePath,
         runId: event.runId,
         agentId: event.agentId,
         sessionId: event.sessionId,
@@ -2116,6 +2228,7 @@ async function main() {
         bundleEventCount: bundle.summary?.eventCount,
         skillOutput: {
           eventId: skillOutput.eventId,
+          workspacePath: skillOutput.workspacePath,
           runId: skillOutput.runId,
           agentId: skillOutput.agentId,
           sessionId: skillOutput.sessionId,
@@ -2133,6 +2246,7 @@ async function main() {
         thresholdMs: nearTimeoutThresholdMs,
         eventId: warningEvent?.eventId,
         sourceEventId: warningEvent?.attributes?.['progressive.warning.eventId'],
+        workspacePath: warningEvent?.workspacePath,
         runId: warningEvent?.runId,
         agentId: warningEvent?.agentId,
         sessionId: warningEvent?.sessionId,

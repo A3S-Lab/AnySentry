@@ -370,15 +370,14 @@ untriggered warnings carry no stale warning event or isolation fields. Triggered
 warnings must be separate `RuntimeEvent`/`runtime`/`allow` rows, not the success
 `LlmCall` row, so summary-only automation can verify that latency warnings did
 not pollute LLM evidence. Triggered warning summaries also bind the warning
-row's `runId`, `agentId`, and `sessionId` to the target identity and expose
-`warning.sourceEventId`, which must match the success evidence event. Success
-summaries also include the inner
-Skill output event, run, agent, session, and bundle IDs under
-`evidence.skillOutput`, and the verifier fails if those IDs do not match the
-target identity, rows, and Evidence Bundle queried by the outer runtime. The
-stored success evidence row
-also exposes `evidence.runId`, `evidence.agentId`, and `evidence.sessionId`,
-which must match the target identity. Passed summary validation also
+row's `workspacePath`, `runId`, `agentId`, and `sessionId` to the target
+identity and expose `warning.sourceEventId`, which must match the success
+evidence event. Success summaries also include the inner Skill output event,
+workspace, run, agent, session, and bundle IDs under `evidence.skillOutput`,
+and the verifier fails if those IDs do not match the target identity, rows, and
+Evidence Bundle queried by the outer runtime. The stored success evidence row
+also exposes `evidence.workspacePath`, `evidence.runId`, `evidence.agentId`, and
+`evidence.sessionId`, which must match the target identity. Passed summary validation also
 requires both the stored event and the Skill output to remain
 `LlmCall`/`llm`/`allow`, with matching event categories and
 `evidence.skillOutput.queriedBack=true`, so automation can detect
