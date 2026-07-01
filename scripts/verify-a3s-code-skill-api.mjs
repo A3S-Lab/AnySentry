@@ -55,6 +55,18 @@ const verifierAttributes = {
   'progressive.verifier.model': model,
   'progressive.verifier.node': process.version,
 };
+const verifierAttributeSummaryBindings = [
+  { field: 'name', attribute: 'progressive.verifier' },
+  { field: 'schemaVersion', attribute: 'progressive.verifier.schema' },
+  { field: 'commit', attribute: 'progressive.verifier.commit' },
+  { field: 'skillTimeoutMs', attribute: 'progressive.verifier.skillTimeoutMs' },
+  { field: 'closeTimeoutMs', attribute: 'progressive.verifier.closeTimeoutMs' },
+  { field: 'nearTimeoutRatio', attribute: 'progressive.verifier.nearTimeoutRatio' },
+  { field: 'nearTimeoutThresholdMs', attribute: 'progressive.verifier.nearTimeoutThresholdMs' },
+  { field: 'requireNearTimeoutWarning', attribute: 'progressive.verifier.requireNearTimeoutWarning' },
+  { field: 'model', attribute: 'progressive.verifier.model' },
+  { field: 'node', attribute: 'progressive.verifier.node' },
+];
 const skillOutputTimingFields = [
   'innerHealthzMs',
   'innerListMs',
@@ -111,6 +123,27 @@ function verifierAttributeIssues(attributes) {
   for (const [key, expected] of Object.entries(verifierAttributes)) {
     if (!sameAttributeValue(attributes?.[key], expected)) {
       issues.push(key);
+    }
+  }
+  return issues;
+}
+
+function persistedVerifierAttributeEvidence(attributes) {
+  if (!isRecord(attributes)) return {};
+  return Object.fromEntries(
+    verifierAttributeSummaryBindings.map(({ field, attribute }) => [field, attributes[attribute]]),
+  );
+}
+
+function persistedVerifierAttributeIssues(persistedAttributes, context) {
+  const issues = [];
+  if (!isRecord(persistedAttributes)) {
+    return [`${context}.persistedVerifierAttributes must be an object`];
+  }
+  for (const { field, attribute } of verifierAttributeSummaryBindings) {
+    const expected = verifierAttributes[attribute];
+    if (!sameAttributeValue(persistedAttributes[field], expected)) {
+      issues.push(`${context}.persistedVerifierAttributes.${field} must match verifier audit metadata`);
     }
   }
   return issues;
@@ -939,6 +972,7 @@ function verifierSummaryIssues(summary) {
       if (summary.warning?.bundleEventCount !== summary.evidence?.bundleEventCount) {
         issues.push('triggered warning.bundleEventCount must match evidence.bundleEventCount');
       }
+      issues.push(...persistedVerifierAttributeIssues(summary.warning?.persistedVerifierAttributes, 'triggered warning'));
       if (summary.warning?.isolation?.warningRows !== 1) issues.push('triggered warning isolation.warningRows must be 1');
       if (summary.warning?.isolation?.llmPollutionCount !== 0) issues.push('triggered warning isolation.llmPollutionCount must be 0');
     } else if (summary.warning?.triggered === false) {
@@ -956,6 +990,9 @@ function verifierSummaryIssues(summary) {
       if (summary.warning?.bundleSchemaVersion !== undefined) issues.push('untriggered warning.bundleSchemaVersion must be absent');
       if (summary.warning?.bundleContainsSourceEvent !== undefined) issues.push('untriggered warning.bundleContainsSourceEvent must be absent');
       if (summary.warning?.bundleEventCount !== undefined) issues.push('untriggered warning.bundleEventCount must be absent');
+      if (summary.warning?.persistedVerifierAttributes !== undefined) {
+        issues.push('untriggered warning.persistedVerifierAttributes must be absent');
+      }
       if (summary.warning?.isolation !== undefined) issues.push('untriggered warning.isolation must be absent');
       if (summary.status === 'passed' && summary.warning?.failure !== undefined) {
         issues.push('passed untriggered warning.failure must be absent');
@@ -1494,6 +1531,7 @@ function runVerifierSelfTest() {
       bundleSchemaVersion: 'anysentry.evidence_bundle.v1',
       bundleContainsSourceEvent: true,
       bundleEventCount: 1,
+      persistedVerifierAttributes: persistedVerifierAttributeEvidence(verifierAttributes),
       isolation: {
         warningRows: 1,
         llmPollutionCount: 0,
@@ -1958,6 +1996,37 @@ function runVerifierSelfTest() {
     verifierSummaryIssues(driftedWarningReasonSummary).includes('triggered warning.reason must match the expected warning reason'),
     verifierSummaryIssues(driftedWarningReasonSummary),
   );
+  const missingWarningPersistedVerifierAttributesSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      persistedVerifierAttributes: undefined,
+    },
+  };
+  assert(
+    'verifier self-test rejects triggered warnings without persisted verifier attributes',
+    verifierSummaryIssues(missingWarningPersistedVerifierAttributesSummary).includes(
+      'triggered warning.persistedVerifierAttributes must be an object',
+    ),
+    verifierSummaryIssues(missingWarningPersistedVerifierAttributesSummary),
+  );
+  const driftedWarningPersistedVerifierAttributesSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      persistedVerifierAttributes: {
+        ...passedSummary.warning.persistedVerifierAttributes,
+        closeTimeoutMs: sessionCloseTimeoutMs + 1,
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects triggered warning persisted verifier attribute drift',
+    verifierSummaryIssues(driftedWarningPersistedVerifierAttributesSummary).includes(
+      'triggered warning.persistedVerifierAttributes.closeTimeoutMs must match verifier audit metadata',
+    ),
+    verifierSummaryIssues(driftedWarningPersistedVerifierAttributesSummary),
+  );
   const untriggeredAboveThresholdSummary = {
     ...passedSummary,
     warning: {
@@ -2055,6 +2124,23 @@ function runVerifierSelfTest() {
     'verifier self-test rejects stale warning evidence fields when warning is not triggered',
     verifierSummaryIssues(staleUntriggeredWarningSummary).includes('untriggered warning.eventId must be absent'),
     verifierSummaryIssues(staleUntriggeredWarningSummary),
+  );
+  const staleUntriggeredWarningVerifierAttributesSummary = {
+    ...staleUntriggeredWarningSummary,
+    warning: {
+      ...staleUntriggeredWarningSummary.warning,
+      eventId: undefined,
+      bundleId: undefined,
+      isolation: undefined,
+      persistedVerifierAttributes: persistedVerifierAttributeEvidence(verifierAttributes),
+    },
+  };
+  assert(
+    'verifier self-test rejects stale warning verifier attributes when warning is not triggered',
+    verifierSummaryIssues(staleUntriggeredWarningVerifierAttributesSummary).includes(
+      'untriggered warning.persistedVerifierAttributes must be absent',
+    ),
+    verifierSummaryIssues(staleUntriggeredWarningVerifierAttributesSummary),
   );
   const staleUntriggeredWarningKindSummary = {
     ...passedSummary,
@@ -3633,6 +3719,7 @@ async function main() {
         bundleSchemaVersion: warningEvent ? bundle.schemaVersion : undefined,
         bundleContainsSourceEvent: warningEvent ? bundle.events?.some((item) => item.eventId === event.eventId) === true : undefined,
         bundleEventCount: warningEvent ? bundle.summary?.eventCount : undefined,
+        persistedVerifierAttributes: warningEvent ? persistedVerifierAttributeEvidence(warningEvent.attributes) : undefined,
         isolation: warningEvent?.verifierIsolation,
         failure: warningRequirementFailure,
       },
