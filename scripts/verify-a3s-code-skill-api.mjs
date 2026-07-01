@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import process from 'node:process';
@@ -26,6 +27,30 @@ function positiveIntEnv(name, fallback, max) {
 
 const skillTimeoutMs = positiveIntEnv('A3S_CODE_SKILL_TIMEOUT_MS', 240000, 900000);
 const sessionCloseTimeoutMs = positiveIntEnv('A3S_CODE_SESSION_CLOSE_TIMEOUT_MS', 5000, 60000);
+const verifierCommit = currentGitCommit();
+const verifierAttributes = {
+  'progressive.verifier': 'verify-a3s-code-skill-api',
+  'progressive.verifier.schema': 'anysentry.a3s_code_skill_verifier.v1',
+  'progressive.verifier.commit': verifierCommit,
+  'progressive.verifier.skillTimeoutMs': skillTimeoutMs,
+  'progressive.verifier.sessionCloseTimeoutMs': sessionCloseTimeoutMs,
+  'progressive.verifier.model': model,
+  'progressive.verifier.node': process.version,
+};
+
+function currentGitCommit() {
+  const fromEnv = (process.env.ANYSENTRY_VERIFIER_COMMIT ?? '').trim();
+  if (fromEnv) return fromEnv;
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return 'unknown';
+  }
+}
 
 function fail(message, details) {
   console.error(`FAIL ${message}`);
@@ -105,6 +130,7 @@ async function recordFailureEvidence(reason, details) {
               status: 'failed',
               subject: `a3s-code Skill progressive API verification failed: ${reason}`,
               attributes: {
+                ...verifierAttributes,
                 'progressive.runner': 'a3s-code',
                 'progressive.skill': 'anysentry-api',
                 'progressive.failure': true,
@@ -134,6 +160,14 @@ async function recordFailureEvidence(reason, details) {
     }
     if (!failureEvent.verdict || failureEvent.verdict === 'allow' || failureEvent.riskCategory !== 'runtime_failure') {
       throw new Error(`failure evidence was not actionable runtime failure evidence: ${compact(failureEvent)}`);
+    }
+    const failureAttrs = failureEvent.attributes ?? {};
+    if (
+      failureAttrs['progressive.verifier.commit'] !== verifierCommit ||
+      Number(failureAttrs['progressive.verifier.skillTimeoutMs']) !== skillTimeoutMs ||
+      Number(failureAttrs['progressive.verifier.sessionCloseTimeoutMs']) !== sessionCloseTimeoutMs
+    ) {
+      throw new Error(`failure evidence lost verifier audit metadata: ${compact(failureEvent)}`);
     }
     const bundle = await request('/capabilities', {
       method: 'POST',
@@ -223,6 +257,7 @@ const agentId = ${JSON.stringify(agentId)};
 const sessionId = ${JSON.stringify(sessionId)};
 const workspacePath = ${JSON.stringify(workspacePath)};
 const model = ${JSON.stringify(model)};
+const verifierAttributes = ${JSON.stringify(verifierAttributes)};
 
 async function request(pathname, init = {}) {
   const response = await fetch(\`\${apiBase}\${pathname}\`, {
@@ -283,6 +318,7 @@ const recorded = await request('/capabilities', {
           completionTokens: 8,
           latencyMs: 321,
           attributes: {
+            ...verifierAttributes,
             'progressive.runner': 'a3s-code',
             'progressive.skill': 'anysentry-api',
             'progressive.flow': 'healthz,list,describe,execute,events-list',
@@ -445,6 +481,13 @@ async function main() {
 
     assert('AnySentry stores the event created through progressive execute', Boolean(event?.eventId), event);
     assert('stored event carries the a3s-code Skill evidence markers', event?.attributes?.['progressive.skill'] === 'anysentry-api' && event?.attributes?.['progressive.runner'] === 'a3s-code', event);
+    assert(
+      'stored event carries verifier audit metadata',
+      event?.attributes?.['progressive.verifier.commit'] === verifierCommit &&
+        Number(event?.attributes?.['progressive.verifier.skillTimeoutMs']) === skillTimeoutMs &&
+        Number(event?.attributes?.['progressive.verifier.sessionCloseTimeoutMs']) === sessionCloseTimeoutMs,
+      event,
+    );
 
     console.log(
       JSON.stringify(
