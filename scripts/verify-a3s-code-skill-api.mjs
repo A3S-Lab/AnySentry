@@ -981,6 +981,14 @@ function verifierSummaryIssues(summary) {
       ) {
         issues.push('recorded failure evidence.eventId must differ from success evidence.eventId');
       }
+      if (
+        evidence?.recorded === true &&
+        isNonEmptyString(evidence.bundleId) &&
+        isNonEmptyString(summary.evidence?.bundleId) &&
+        evidence.bundleId === summary.evidence.bundleId
+      ) {
+        issues.push('recorded failure evidence.bundleId must differ from success evidence.bundleId');
+      }
     }
     if (summary.failure?.phase === 'summary_validation') {
       if (!isRecord(summary.summaryValidation)) {
@@ -2543,6 +2551,23 @@ function runVerifierSelfTest() {
       'recorded failure evidence.eventId must differ from success evidence.eventId',
     ),
     verifierSummaryIssues(reusedFailureSuccessEventSummary),
+  );
+  const reusedFailureSuccessBundleSummary = {
+    ...failedWithSuccessEvidenceSummary,
+    failure: {
+      ...failedWithSuccessEvidenceSummary.failure,
+      evidence: {
+        ...failedWithSuccessEvidenceSummary.failure.evidence,
+        bundleId: passedSummary.evidence.bundleId,
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects recorded failure evidence that reuses success bundle IDs',
+    verifierSummaryIssues(reusedFailureSuccessBundleSummary).includes(
+      'recorded failure evidence.bundleId must differ from success evidence.bundleId',
+    ),
+    verifierSummaryIssues(reusedFailureSuccessBundleSummary),
   );
   const staleFailedWarningSummary = {
     ...failedSummary,
