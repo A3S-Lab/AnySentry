@@ -418,9 +418,12 @@ must also be valid and equal, so automation can catch bundle schema, membership,
 and count drift without rebuilding the bundle.
 Failed summaries always include explicit `failure.details` plus a failure
 evidence status, either with the recorded event/bundle IDs or with
-`recorded=false` plus the reason evidence was not written. If a failed summary
-also includes top-level success `evidence`, that evidence must satisfy the same
-stored-event and Skill-output contract as a passed summary. Recorded failure
+`recorded=false` plus the reason evidence was not written; these states are
+mutually exclusive, so recorded evidence must not carry `error` and unrecorded
+evidence must not carry stale event, bundle, or persisted-attribute fields. If a
+failed summary also includes top-level success `evidence`, that evidence must
+satisfy the same stored-event and Skill-output contract as a passed summary.
+Recorded failure
 evidence must be the canonical
 `SecurityAction`/`security` event produced from the verifier's `SecurityFinding`,
 must carry a non-allow verdict, must use `riskCategory=runtime_failure`, and

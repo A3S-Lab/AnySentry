@@ -96,6 +96,27 @@ const skillEventAttributeSummaryBindings = [
   { field: 'flow', attribute: 'progressive.flow', expected: expectedProgressiveFlow },
   { field: 'model', attribute: 'progressive.model', expected: model },
 ];
+const recordedFailureEvidenceFields = [
+  'eventId',
+  'failurePhase',
+  'failureReason',
+  'failureDetails',
+  'workspacePath',
+  'runId',
+  'agentId',
+  'sessionId',
+  'eventKind',
+  'eventCategory',
+  'verdict',
+  'riskCategory',
+  'persistedVerifierAttributes',
+  'persistedTimingAttributes',
+  'bundleId',
+  'bundleSchemaVersion',
+  'bundleContainsEvent',
+  'bundleEventCount',
+];
+const failureEvidenceMatchFields = ['recorded', ...recordedFailureEvidenceFields, 'error'];
 const nearTimeoutWarningReason = 'a3s-code Skill verifier completed close to its timeout budget';
 
 function durationMs(startedAt) {
@@ -927,8 +948,16 @@ function verifierSummaryIssues(summary) {
       if (evidence.riskCategory !== 'runtime_failure') {
         issues.push('recorded failure evidence.riskCategory must be runtime_failure');
       }
-    } else if (!isNonEmptyString(evidence.error)) {
-      issues.push('unrecorded failure evidence.error must explain why evidence was not written');
+      if (evidence.error !== undefined) issues.push('recorded failure evidence.error must be absent');
+    } else {
+      if (!isNonEmptyString(evidence.error)) {
+        issues.push('unrecorded failure evidence.error must explain why evidence was not written');
+      }
+      for (const field of recordedFailureEvidenceFields) {
+        if (evidence[field] !== undefined) {
+          issues.push(`unrecorded failure evidence.${field} must be absent`);
+        }
+      }
     }
     if (summary.evidence !== undefined) {
       issues.push(...successfulEvidenceIssues(summary, 'failed summary'));
@@ -971,28 +1000,12 @@ function verifierSummaryIssues(summary) {
         issues.push('failed warning.failure.evidence must be an object when required warning is missing');
       } else {
         issues.push(
-          ...evidenceFieldMismatchIssues('failed warning.failure.evidence', summary.warning.failure.evidence, summary.failure?.evidence, [
-            'recorded',
-            'eventId',
-            'failurePhase',
-            'failureReason',
-            'failureDetails',
-            'workspacePath',
-            'runId',
-            'agentId',
-            'sessionId',
-            'eventKind',
-            'eventCategory',
-            'verdict',
-            'riskCategory',
-            'persistedVerifierAttributes',
-            'persistedTimingAttributes',
-            'bundleId',
-            'bundleSchemaVersion',
-            'bundleContainsEvent',
-            'bundleEventCount',
-            'error',
-          ]),
+          ...evidenceFieldMismatchIssues(
+            'failed warning.failure.evidence',
+            summary.warning.failure.evidence,
+            summary.failure?.evidence,
+            failureEvidenceMatchFields,
+          ),
         );
       }
     }
@@ -2555,6 +2568,21 @@ function runVerifierSelfTest() {
     verifierSummaryIssues(driftedFailureSummary).includes('recorded failure evidence.verdict must be a non-allow string'),
     verifierSummaryIssues(driftedFailureSummary),
   );
+  const staleRecordedFailureErrorSummary = failureSummary(
+    'skill_output',
+    failedReason,
+    'invalid JSON',
+    failedTimings,
+    {
+      ...failedSummary.failure.evidence,
+      error: 'stale unrecorded failure error',
+    },
+  );
+  assert(
+    'verifier self-test rejects stale errors on recorded failure evidence',
+    verifierSummaryIssues(staleRecordedFailureErrorSummary).includes('recorded failure evidence.error must be absent'),
+    verifierSummaryIssues(staleRecordedFailureErrorSummary),
+  );
 
   const driftedFailureEvidencePhaseSummary = failureSummary(
     'skill_output',
@@ -2952,6 +2980,22 @@ function runVerifierSelfTest() {
     'verifier self-test accepts explicit unrecorded failure evidence',
     unrecordedFailureSummary.failure.evidence.recorded === false && verifierSummaryIssues(unrecordedFailureSummary).length === 0,
     { summary: unrecordedFailureSummary, issues: verifierSummaryIssues(unrecordedFailureSummary) },
+  );
+  const staleUnrecordedFailureEventSummary = failureSummary(
+    'preflight',
+    'required local verifier prerequisites are missing',
+    { aclPath: '/missing/config.acl' },
+    { elapsed: 1 },
+    {
+      recorded: false,
+      error: 'failure evidence was not attempted for phase preflight',
+      eventId: 'evt_stale_failure',
+    },
+  );
+  assert(
+    'verifier self-test rejects stale recorded fields on unrecorded failure evidence',
+    verifierSummaryIssues(staleUnrecordedFailureEventSummary).includes('unrecorded failure evidence.eventId must be absent'),
+    verifierSummaryIssues(staleUnrecordedFailureEventSummary),
   );
   const missingUnrecordedFailureDetailsSummary = {
     ...unrecordedFailureSummary,
