@@ -263,10 +263,26 @@ function sanitizedTimings(timings) {
   return Object.fromEntries(Object.entries(timings).filter(([, value]) => isValidTimingValue(value)));
 }
 
+function canonicalEvidenceValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalEvidenceValue);
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, canonicalEvidenceValue(value[key])]),
+    );
+  }
+  return value;
+}
+
+function sameEvidenceValue(actual, expected) {
+  return JSON.stringify(canonicalEvidenceValue(actual)) === JSON.stringify(canonicalEvidenceValue(expected));
+}
+
 function evidenceFieldMismatchIssues(prefix, actual, expected, fields) {
   const issues = [];
   for (const field of fields) {
-    if (actual?.[field] !== expected?.[field]) {
+    if (!sameEvidenceValue(actual?.[field], expected?.[field])) {
       issues.push(`${prefix}.${field} must match failure.evidence.${field}`);
     }
   }
@@ -949,6 +965,8 @@ function verifierSummaryIssues(summary) {
             'eventCategory',
             'verdict',
             'riskCategory',
+            'persistedVerifierAttributes',
+            'persistedTimingAttributes',
             'bundleId',
             'bundleSchemaVersion',
             'bundleContainsEvent',
@@ -2849,6 +2867,52 @@ function runVerifierSelfTest() {
         'failed warning.failure.evidence.eventId must match failure.evidence.eventId',
       ),
       verifierSummaryIssues(driftedWarningFailureSummary),
+    );
+    const driftedWarningFailureVerifierAttrsSummary = {
+      ...requiredWarningFailureSummary,
+      warning: {
+        ...requiredWarningFailureSummary.warning,
+        failure: {
+          ...requiredWarningFailureSummary.warning.failure,
+          evidence: {
+            ...requiredWarningFailureSummary.warning.failure.evidence,
+            persistedVerifierAttributes: {
+              ...requiredWarningFailureSummary.warning.failure.evidence.persistedVerifierAttributes,
+              closeTimeoutMs: sessionCloseTimeoutMs + 1,
+            },
+          },
+        },
+      },
+    };
+    assert(
+      'verifier self-test rejects warning failure verifier attribute drift',
+      verifierSummaryIssues(driftedWarningFailureVerifierAttrsSummary).includes(
+        'failed warning.failure.evidence.persistedVerifierAttributes must match failure.evidence.persistedVerifierAttributes',
+      ),
+      verifierSummaryIssues(driftedWarningFailureVerifierAttrsSummary),
+    );
+    const driftedWarningFailureTimingAttrsSummary = {
+      ...requiredWarningFailureSummary,
+      warning: {
+        ...requiredWarningFailureSummary.warning,
+        failure: {
+          ...requiredWarningFailureSummary.warning.failure,
+          evidence: {
+            ...requiredWarningFailureSummary.warning.failure.evidence,
+            persistedTimingAttributes: {
+              ...requiredWarningFailureSummary.warning.failure.evidence.persistedTimingAttributes,
+              elapsed: requiredWarningFailureSummary.failure.evidence.persistedTimingAttributes.elapsed + 1,
+            },
+          },
+        },
+      },
+    };
+    assert(
+      'verifier self-test rejects warning failure timing attribute drift',
+      verifierSummaryIssues(driftedWarningFailureTimingAttrsSummary).includes(
+        'failed warning.failure.evidence.persistedTimingAttributes must match failure.evidence.persistedTimingAttributes',
+      ),
+      verifierSummaryIssues(driftedWarningFailureTimingAttrsSummary),
     );
   }
 
