@@ -27,20 +27,65 @@ It ships as a single self-contained service (the API also serves the dashboard) 
 as the durable event store. Drop it in front of any agent fleet — it's a piece of middleware:
 events in via `POST /security-center/ingest`, risk out via the dashboard, API, and optional alert webhook.
 
-## What is real today
+## Capability map
 
-| Capability | What AnySentry does |
+AnySentry is useful when an AI platform needs more than logs: it needs runtime
+evidence, risk judgment, operational state, and safe ways for humans or agents to
+intervene. The tables below summarize what is implemented today.
+
+| Use case | Problem it solves | What AnySentry provides |
+|---|---|---|
+| See what agents really did | Agent tool calls, subprocesses, egress, file access, and LLM calls are hard to reconstruct from app logs alone. | Canonical `anysentry.agent_event.v1` events with agent/session/run/trace identity and redacted evidence. |
+| Judge runtime safety | Raw events do not say whether an action is acceptable, suspicious, or severe. | `@a3s-lab/sentry` decisions with verdict, tier, severity, reason, action, and risk category. |
+| Preserve audit evidence | Incidents need a case file, not scattered dashboard clicks. | Evidence Bundles and Markdown exports around events, runs, traces, sources, agents, alerts, remediations, objectives, maintenance windows, notifications, topology, and audit records. |
+| Find monitoring blind spots | Operators need to know which agents, sources, collectors, or workspaces are not covered. | Coverage issues for stale agents, source gaps, stale tokens, missing collector heartbeats, rejected ingress, and unowned events. |
+| Run security operations | Alerts without ownership and next steps create noise. | Incidents, alerts, notification routing, objectives, maintenance windows, remediation tasks, owner/team metadata, and audit trails. |
+| Let agents use security controls | Coding agents need a stable way to ask for guard decisions, write evidence, and request next actions. | A discoverable Progressive API at `/security-center/capabilities` plus the `integrations/skills/anysentry-api` Skill. |
+
+| What it observes | Examples | Entry points |
+|---|---|---|
+| Agent identity and execution context | `agentId`, `sessionId`, `runId`, `traceId`, `spanId`, user, workspace, pod/node context | `a3s-observer`, generic ingest, OTel, Progressive API |
+| Tool and subprocess activity | shell commands, argv, cwd, tool name, subprocess chains | observer NDJSON, `recordSecurityEvents`, generic JSON |
+| Network and DNS activity | egress peer, port, SNI, endpoint, metadata-service access attempts | observer NDJSON, OTel logs/traces, custom events |
+| File and process activity | file paths, read/write-style evidence, process/runtime events | observer NDJSON, custom events |
+| LLM activity | model, prompt/completion tokens, latency, `LlmCall` evidence, run/session linkage | `recordSecurityEvents`, a3s-code Skill verifier, custom producers |
+| Security-relevant evidence | dangerous commands, privilege escalation signals, suspicious network/file/content events | observer NDJSON, CloudEvents, OTel, generic ingest |
+| Sources and collectors | source identity, token state, accepted/rejected counts, heartbeat freshness, collector node/pod | Sources API, heartbeat endpoint, observer forwarder |
+| Assets and topology | agents, workspaces, collectors, sources, tool/network/file/LLM dependency edges | derived inventory and `/security-center/agents/topology` |
+
+| What it monitors | Signals and states | Output |
+|---|---|---|
+| Fleet risk health | block/escalate rates, severity distribution, risk categories, risk trend | health cards, risk summary, explainability wave |
+| Decision flow | L1 rules, L2 LLM escalation markers, L3 agent-tier risk, final verdict | decision funnel |
+| Agent behavior | throughput, error rate, latency, heartbeat, behavior drift, highest-risk session | live SSE observability and session views |
+| Incidents and alerts | risky events, source health, collector health, severe blocks, objective breaches, remediation overdue | incident and alert centers |
+| Coverage | stale agents, stale/down sources, source token rotation, missing collector heartbeat, uncovered workspaces | coverage overview and coverage alerts |
+| Objectives/SLOs | coverage score, active alerts, open incidents, overdue remediation, risky events, stale agents, collector/source down | objective status, breach alerts, remediation tasks |
+| Maintenance | planned windows for global, workspace, agent, collector, or source targets | alert suppression context and maintenance evidence |
+| Notification delivery | route matches, webhook delivery status, failures, recovery notifications | notification config, delivery log, audit records |
+| Remediation | task owner/status/due time/steps, overdue state, source/alert/objective links | remediation center and AI Operator actions |
+| Evidence integrity | timeline, related alerts/incidents/tasks/objectives/coverage/source/collector/audit linkage | Evidence Bundle and Markdown export |
+
+| How it can intervene | What it changes or returns | Interface |
+|---|---|---|
+| Runtime guard | Returns `allow`, `warn`, `require_approval`, or `block` for a proposed tool/model/output/runtime action. | `security-center.assessRuntimeAction` |
+| Schema-aware preflight | Validates an execute request and returns `schemaIssues` without writing events or mutating state. | `dryRun: true` on `/security-center/capabilities` |
+| Evidence recording | Writes custom/webhook/OTel-shaped evidence into the same judged event stream as observer events. | `security-center.recordSecurityEvents` |
+| Next-action planning | Ranks active remediation, incident, alert, objective, and coverage-derived work for an operator or agent. | `security-center.planNextActions`, `/operator` |
+| Case-file assembly | Builds a redaction-safe evidence bundle around an event, run, trace, source, agent, alert, task, objective, or scope. | `security-center.buildEvidenceBundle`, `/evidence` |
+| Remediation workflow | Updates task owner, status, notes, due time, and step completion state. | Remediation API and `/operator` |
+| Incident and alert lifecycle | Acknowledge, resolve, reopen, and deep-link operational findings. | Incidents and Alerts APIs |
+| Source protection | Create sources, enforce ingest tokens, reject invalid producers, and rotate source tokens. | Sources API and ingest headers |
+| Governance controls | Save/replay policy, create objectives, define maintenance windows, configure notification routes. | Config, Objectives, Maintenance, Notifications |
+| Agent metadata overlay | Attach owner, team, environment, criticality, tags, and notes without changing agent code. | Agent metadata API |
+
+| Boundary | What it means |
 |---|---|
-| Non-invasive capture | Runs `a3s-observer` as an observe-only eBPF collector and forwards raw observer NDJSON into `/security-center/ingest`. |
-| Event judgment | Uses one `@a3s-lab/sentry` judge for L1 rules, L2 LLM escalation markers, and L3 agent-tier risk decisions. |
-| Durable evidence | Persists judged events and control-plane state in ClickHouse; the in-memory ring is only a hot cache. |
-| Source and collector health | Tracks observer, forwarder, webhook, OTel, and custom sources with identity, token rotation, heartbeat, and rejection signals. |
-| Operator workflow | Builds incidents, alerts, coverage gaps, maintenance windows, objectives, notifications, remediation tasks, and audit records from the same event stream. |
-| Evidence handoff | Assembles redaction-safe Evidence Bundles and Markdown exports around events, runs, traces, agents, sources, topology edges, alerts, objectives, remediations, maintenance windows, notifications, or audit records. |
-| Progressive API | Exposes one discoverable endpoint, `/security-center/capabilities`, with `list`, `search`, `describe`, and `execute`; operation descriptions include executable input and output schemas. |
-| AI Operator | The `/operator` dashboard view calls `security-center.planNextActions`, previews evidence through `buildEvidenceBundle`, updates Remediation status, and deep-links the related assets. |
-| API workbench | The `/capabilities` dashboard view discovers modules, searches/describes operations, builds execute payloads from schemas, runs `dryRun` preflights, and generates canonical `curl`. |
-| Coding-agent Skill | `integrations/skills/anysentry-api` lets Codex, a3s-code, Claude Code, Cursor/Windsurf, Devin/OpenHands, or generic SDK agents use the same progressive API without memorizing REST paths. |
+| Observe-only by default | `a3s-observer` watches runtime behavior; it does not kill workloads by itself. |
+| Enforcement is opt-in | Hard blocking happens when an agent, gateway, or platform loop calls `assessRuntimeAction` and honors `block` / `require_approval`. |
+| Synthetic data is explicit | The dashboard is empty until real events arrive unless `ANYSENTRY_SYNTHETIC_FEED` is enabled for demos. |
+| No SDK requirement | SDKs and Skills enrich the stream, but the baseline observer path works without agent code changes. |
+| Not just a SIEM | AnySentry combines event evidence with guard decisions, source health, coverage, objectives, remediation, evidence handoff, and agent-readable next actions. |
 
 The README is the product entry point, not a second specification. Runtime schemas
 come from `describe`, detailed deployment notes live in [`deploy/README.md`](deploy/README.md),
@@ -470,8 +515,8 @@ Objectives. The token can be sent as `X-AnySentry-Admin-Token`,
 Read APIs and producer paths stay separate: `/security-center/ingest`, generic/OTLP ingest,
 Collector heartbeat, and Source check-in still use Source identity and Source ingest tokens. The
 dashboard also sends `X-AnySentry-Admin-Token` when the browser has
-`localStorage["anysentry.adminToken"]` set; the console header's `管理密钥` control manages that
-browser-local value, so the token is not built into the static web bundle.
+`localStorage["anysentry.adminToken"]` set; the console header's management-token control manages
+that browser-local value, so the token is not built into the static web bundle.
 Standalone verifier scripts that create or update management objects also forward
 `ANYSENTRY_ADMIN_TOKEN` / `ANYSENTRY_MANAGEMENT_TOKEN` when set, while the management-auth verifier
 keeps its explicit missing-token rejection checks.
