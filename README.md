@@ -351,10 +351,10 @@ warning branch; if the warning is not emitted, the verifier records a
 runs emit a single-line `VERIFIER_SUMMARY` JSON record with schema
 `anysentry.a3s_code_skill_verifier.summary.v1`, so production automation can
 assert `status`, failure phase, failure evidence, event IDs, warning isolation,
-and timing fields without scraping human-readable log lines. Success summaries
-also include the inner Skill output event and bundle IDs, and the verifier fails
-if those IDs do not match the rows and Evidence Bundle queried by the outer
-runtime. Failed summaries always include an explicit failure evidence status,
+warning event/bundle bindings, and timing fields without scraping human-readable
+log lines. Success summaries also include the inner Skill output event and
+bundle IDs, and the verifier fails if those IDs do not match the rows and
+Evidence Bundle queried by the outer runtime. Failed summaries always include an explicit failure evidence status,
 either with the recorded event/bundle IDs or with `recorded=false` plus the reason
 evidence was not written. If the verifier detects that its own summary violates
 the contract, the emitted summary is converted to `status=failed` with

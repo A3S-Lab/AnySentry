@@ -171,6 +171,10 @@ function verifierSummaryIssues(summary) {
     if (!isFiniteNumber(summary.warning?.thresholdMs) || summary.warning.thresholdMs <= 0) issues.push('warning.thresholdMs must be a positive number');
     if (summary.warning?.triggered === true) {
       if (!isNonEmptyString(summary.warning?.eventId)) issues.push('triggered warning.eventId must be a non-empty string');
+      if (!isNonEmptyString(summary.warning?.bundleId)) issues.push('triggered warning.bundleId must be a non-empty string');
+      if (isNonEmptyString(summary.evidence?.bundleId) && summary.warning?.bundleId !== summary.evidence.bundleId) {
+        issues.push('triggered warning.bundleId must match evidence.bundleId');
+      }
       if (summary.warning?.isolation?.llmPollutionCount !== 0) issues.push('triggered warning isolation.llmPollutionCount must be 0');
     }
   }
@@ -487,6 +491,8 @@ async function recordNearTimeoutWarning(event, bundle, timings) {
     warningAttrs['progressive.verifier.commit'] !== verifierCommit ||
     warningAttrs['progressive.warning'] !== 'near_timeout' ||
     warningAttrs['progressive.warning.eventId'] !== event.eventId ||
+    warningAttrs['progressive.warning.bundleId'] !== bundle.bundleId ||
+    Number(warningAttrs['progressive.warning.thresholdMs']) !== nearTimeoutThresholdMs ||
     Number(warningAttrs['progressive.verifier.skillMs']) !== Math.round(timings.skill)
   ) {
     throw new Error(`near-timeout warning lost audit metadata: ${compact(warningEvent)}`);
@@ -658,6 +664,7 @@ function runVerifierSelfTest() {
       triggered: true,
       thresholdMs: 100,
       eventId: 'evt_warning_self_test',
+      bundleId: 'evb_self_test',
       isolation: {
         warningRows: 1,
         llmPollutionCount: 0,
@@ -705,6 +712,30 @@ function runVerifierSelfTest() {
     'verifier self-test rejects mismatched Skill output IDs',
     verifierSummaryIssues(mismatchedSummary).includes('passed summary bundleId must match skillOutput.bundleId'),
     verifierSummaryIssues(mismatchedSummary),
+  );
+  const missingWarningBundleSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      bundleId: undefined,
+    },
+  };
+  assert(
+    'verifier self-test rejects triggered warnings without bundle IDs',
+    verifierSummaryIssues(missingWarningBundleSummary).includes('triggered warning.bundleId must be a non-empty string'),
+    verifierSummaryIssues(missingWarningBundleSummary),
+  );
+  const mismatchedWarningBundleSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      bundleId: 'evb_other',
+    },
+  };
+  assert(
+    'verifier self-test rejects warning bundle IDs that do not match evidence',
+    verifierSummaryIssues(mismatchedWarningBundleSummary).includes('triggered warning.bundleId must match evidence.bundleId'),
+    verifierSummaryIssues(mismatchedWarningBundleSummary),
   );
   const normalizedMismatch = normalizedVerifierSummary(mismatchedSummary);
   assert(
@@ -1213,6 +1244,7 @@ async function main() {
         triggered: Boolean(warningEvent),
         thresholdMs: nearTimeoutThresholdMs,
         eventId: warningEvent?.eventId,
+        bundleId: warningEvent?.attributes?.['progressive.warning.bundleId'],
         isolation: warningEvent?.verifierIsolation,
         failure: warningRequirementFailure,
       },
