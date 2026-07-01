@@ -394,7 +394,7 @@ function warningEvidenceBindingIssues(warningEvent, event, bundle, timings) {
   return issues;
 }
 
-function failureEvidenceBindingIssues(failureEvent, reason, timings) {
+function failureEvidenceBindingIssues(failureEvent, reason, details, timings) {
   const issues = [];
   if (!isRecord(failureEvent)) {
     return ['failureEvent must be an object'];
@@ -443,8 +443,8 @@ function failureEvidenceBindingIssues(failureEvent, reason, timings) {
   if (attributes['progressive.failure.reason'] !== reason) {
     issues.push('failure attribute progressive.failure.reason must match the failure reason');
   }
-  if (!isNonEmptyString(attributes['progressive.failure.details'])) {
-    issues.push('failure attribute progressive.failure.details must be a non-empty string');
+  if (attributes['progressive.failure.details'] !== failureDetailsText(details)) {
+    issues.push('failure attribute progressive.failure.details must match the failure details');
   }
   for (const [key, expected] of Object.entries(timingAttributes(timings))) {
     if (!sameAttributeValue(attributes[key], expected)) {
@@ -656,6 +656,7 @@ function verifierSummaryIssues(summary) {
       if (!isNonEmptyString(evidence.eventId)) issues.push('recorded failure evidence.eventId must be a non-empty string');
       if (!isNonEmptyString(evidence.failurePhase)) issues.push('recorded failure evidence.failurePhase must be a non-empty string');
       if (!isNonEmptyString(evidence.failureReason)) issues.push('recorded failure evidence.failureReason must be a non-empty string');
+      if (!isNonEmptyString(evidence.failureDetails)) issues.push('recorded failure evidence.failureDetails must be a non-empty string');
       if (!isNonEmptyString(evidence.workspacePath)) issues.push('recorded failure evidence.workspacePath must be a non-empty string');
       if (!isNonEmptyString(evidence.runId)) issues.push('recorded failure evidence.runId must be a non-empty string');
       if (!isNonEmptyString(evidence.agentId)) issues.push('recorded failure evidence.agentId must be a non-empty string');
@@ -681,6 +682,9 @@ function verifierSummaryIssues(summary) {
       }
       if (evidence.failureReason !== summary.failure?.reason) {
         issues.push('recorded failure evidence.failureReason must match failure.reason');
+      }
+      if (evidence.failureDetails !== failureDetailsText(summary.failure?.details)) {
+        issues.push('recorded failure evidence.failureDetails must match failure.details');
       }
       if (evidence.eventKind !== 'SecurityAction') issues.push('recorded failure evidence.eventKind must be SecurityAction');
       if (evidence.eventCategory !== 'security') issues.push('recorded failure evidence.eventCategory must be security');
@@ -720,6 +724,7 @@ function verifierSummaryIssues(summary) {
             'eventId',
             'failurePhase',
             'failureReason',
+            'failureDetails',
             'workspacePath',
             'runId',
             'agentId',
@@ -930,6 +935,10 @@ function compact(value, limit = 2400) {
   return text.length > limit ? `${text.slice(0, limit)}... [truncated]` : text;
 }
 
+function failureDetailsText(details) {
+  return compact(details, 1200);
+}
+
 async function withTimeout(label, task, timeoutMs, onTimeout) {
   let timer;
   let timedOut = false;
@@ -993,7 +1002,7 @@ async function recordFailureEvidence(reason, details, timings) {
                 'progressive.skill': 'anysentry-api',
                 'progressive.failure': true,
                 'progressive.failure.reason': reason,
-                'progressive.failure.details': compact(details, 1200),
+                'progressive.failure.details': failureDetailsText(details),
               },
             },
           ],
@@ -1025,7 +1034,7 @@ async function recordFailureEvidence(reason, details, timings) {
     if (!failureEvent?.eventId) {
       throw new Error(`failure evidence did not become queryable: ${compact({ recorded, failureEvent })}`);
     }
-    const failureBindingIssues = failureEvidenceBindingIssues(failureEvent, reason, timings);
+    const failureBindingIssues = failureEvidenceBindingIssues(failureEvent, reason, details, timings);
     if (failureBindingIssues.length > 0) {
       throw new Error(`failure evidence drifted from verifier metadata: ${compact({ failureBindingIssues, failureEvent })}`);
     }
@@ -1057,6 +1066,7 @@ async function recordFailureEvidence(reason, details, timings) {
       eventId: failureEvent.eventId,
       failurePhase: String(failureAttrs['progressive.verifier.failurePhase'] ?? timings.failurePhase ?? ''),
       failureReason: String(failureAttrs['progressive.failure.reason'] ?? reason),
+      failureDetails: String(failureAttrs['progressive.failure.details'] ?? failureDetailsText(details)),
       workspacePath: failureEvent.workspacePath,
       runId: failureEvent.runId,
       agentId: failureEvent.agentId,
@@ -1980,6 +1990,7 @@ function runVerifierSelfTest() {
       eventId: 'evt_failure_self_test',
       failurePhase: 'skill_output',
       failureReason: failedReason,
+      failureDetails: failureDetailsText('invalid JSON'),
       workspacePath,
       runId,
       agentId,
@@ -2018,8 +2029,8 @@ function runVerifierSelfTest() {
   };
   assert(
     'verifier self-test accepts failure evidence bound to verifier metadata',
-    failureEvidenceBindingIssues(passedFailureEvent, failedReason, failedTimings).length === 0,
-    failureEvidenceBindingIssues(passedFailureEvent, failedReason, failedTimings),
+    failureEvidenceBindingIssues(passedFailureEvent, failedReason, 'invalid JSON', failedTimings).length === 0,
+    failureEvidenceBindingIssues(passedFailureEvent, failedReason, 'invalid JSON', failedTimings),
   );
   const driftedFailureReasonEvent = {
     ...passedFailureEvent,
@@ -2030,10 +2041,24 @@ function runVerifierSelfTest() {
   };
   assert(
     'verifier self-test rejects failure evidence reason metadata drift',
-    failureEvidenceBindingIssues(driftedFailureReasonEvent, failedReason, failedTimings).includes(
+    failureEvidenceBindingIssues(driftedFailureReasonEvent, failedReason, 'invalid JSON', failedTimings).includes(
       'failure attribute progressive.failure.reason must match the failure reason',
     ),
-    failureEvidenceBindingIssues(driftedFailureReasonEvent, failedReason, failedTimings),
+    failureEvidenceBindingIssues(driftedFailureReasonEvent, failedReason, 'invalid JSON', failedTimings),
+  );
+  const driftedFailureDetailsEvent = {
+    ...passedFailureEvent,
+    attributes: {
+      ...passedFailureEvent.attributes,
+      'progressive.failure.details': 'different details',
+    },
+  };
+  assert(
+    'verifier self-test rejects failure evidence details metadata drift',
+    failureEvidenceBindingIssues(driftedFailureDetailsEvent, failedReason, 'invalid JSON', failedTimings).includes(
+      'failure attribute progressive.failure.details must match the failure details',
+    ),
+    failureEvidenceBindingIssues(driftedFailureDetailsEvent, failedReason, 'invalid JSON', failedTimings),
   );
 
   const driftedFailureSummary = failureSummary(
@@ -2085,6 +2110,40 @@ function runVerifierSelfTest() {
       'recorded failure evidence.failureReason must match failure.reason',
     ),
     verifierSummaryIssues(driftedFailureEvidenceReasonSummary),
+  );
+  const missingFailureEvidenceDetailsSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      failureDetails: undefined,
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence without details',
+    verifierSummaryIssues(missingFailureEvidenceDetailsSummary).includes(
+      'recorded failure evidence.failureDetails must be a non-empty string',
+    ),
+    verifierSummaryIssues(missingFailureEvidenceDetailsSummary),
+  );
+  const driftedFailureEvidenceDetailsSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      failureDetails: 'different details',
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence details drift',
+    verifierSummaryIssues(driftedFailureEvidenceDetailsSummary).includes(
+      'recorded failure evidence.failureDetails must match failure.details',
+    ),
+    verifierSummaryIssues(driftedFailureEvidenceDetailsSummary),
   );
 
   const driftedFailureWorkspaceSummary = failureSummary(
