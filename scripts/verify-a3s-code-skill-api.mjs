@@ -101,18 +101,27 @@ const skillEventAttributeSummaryBindings = [
   { field: 'flow', attribute: 'progressive.flow', expected: expectedProgressiveFlow },
   { field: 'model', attribute: 'progressive.model', expected: model },
 ];
-const bundlePrimaryEventFieldBindings = [
-  ['bundlePrimaryEventId', 'eventId'],
-  ['bundlePrimaryEventWorkspacePath', 'workspacePath'],
-  ['bundlePrimaryEventRunId', 'runId'],
-  ['bundlePrimaryEventAgentId', 'agentId'],
-  ['bundlePrimaryEventSessionId', 'sessionId'],
-  ['bundlePrimaryEventTraceId', 'traceId'],
-  ['bundlePrimaryEventKind', 'eventKind'],
-  ['bundlePrimaryEventCategory', 'eventCategory'],
-  ['bundlePrimaryEventVerdict', 'verdict'],
+const bundleEventPayloadBindings = [
+  ['Id', 'eventId'],
+  ['WorkspacePath', 'workspacePath'],
+  ['RunId', 'runId'],
+  ['AgentId', 'agentId'],
+  ['SessionId', 'sessionId'],
+  ['TraceId', 'traceId'],
+  ['Kind', 'eventKind'],
+  ['Category', 'eventCategory'],
+  ['Verdict', 'verdict'],
 ];
+const bundlePrimaryEventFieldBindings = bundleEventPayloadBindings.map(([suffix, field]) => [
+  `bundlePrimaryEvent${suffix}`,
+  field,
+]);
+const bundleListedEventFieldBindings = bundleEventPayloadBindings.map(([suffix, field]) => [
+  `bundleListedEvent${suffix}`,
+  field,
+]);
 const bundlePrimaryEventSummaryFields = bundlePrimaryEventFieldBindings.map(([field]) => field);
+const bundleListedEventSummaryFields = bundleListedEventFieldBindings.map(([field]) => field);
 const recordedFailureEvidenceFields = [
   'eventId',
   'failurePhase',
@@ -134,6 +143,7 @@ const recordedFailureEvidenceFields = [
   'bundleContainsEvent',
   'bundleEventCount',
   'bundleListedEventCount',
+  ...bundleListedEventSummaryFields,
   ...bundlePrimaryEventSummaryFields,
   'bundleScopePrimaryType',
   'bundleScopePrimaryId',
@@ -307,19 +317,18 @@ function listedBundleCountIssues(listedCount, eventCount, listedField, eventCoun
   return [];
 }
 
+function bundleEventPayloadEvidence(event, fieldBindings) {
+  const record = isRecord(event) ? event : {};
+  return Object.fromEntries(fieldBindings.map(([summaryField, eventField]) => [summaryField, record[eventField]]));
+}
+
 function bundlePrimaryEventEvidence(bundle) {
-  const event = isRecord(bundle?.primary?.event) ? bundle.primary.event : {};
-  return {
-    bundlePrimaryEventId: event.eventId,
-    bundlePrimaryEventWorkspacePath: event.workspacePath,
-    bundlePrimaryEventRunId: event.runId,
-    bundlePrimaryEventAgentId: event.agentId,
-    bundlePrimaryEventSessionId: event.sessionId,
-    bundlePrimaryEventTraceId: event.traceId,
-    bundlePrimaryEventKind: event.eventKind,
-    bundlePrimaryEventCategory: event.eventCategory,
-    bundlePrimaryEventVerdict: event.verdict,
-  };
+  return bundleEventPayloadEvidence(bundle?.primary?.event, bundlePrimaryEventFieldBindings);
+}
+
+function bundleListedEventEvidence(bundle, eventId) {
+  const events = Array.isArray(bundle?.events) ? bundle.events : [];
+  return bundleEventPayloadEvidence(events.find((item) => item.eventId === eventId), bundleListedEventFieldBindings);
 }
 
 function bundleScopeEvidence(bundle) {
@@ -400,15 +409,15 @@ function primaryEventIdIssues(primaryEventId, expectedEventId, primaryField, exp
   return [];
 }
 
-function bundlePrimaryEventIssues(evidence, expected, context, expectedContext) {
+function bundleEventPayloadIssues(evidence, expected, fieldBindings, context, expectedContext) {
   const issues = [];
-  const [[primaryField, primaryExpectedField], ...payloadBindings] = bundlePrimaryEventFieldBindings;
+  const [[idField, idExpectedField], ...payloadBindings] = fieldBindings;
   issues.push(
     ...primaryEventIdIssues(
-      evidence?.[primaryField],
-      expected?.[primaryExpectedField],
-      `${context}.${primaryField}`,
-      `${expectedContext}.${primaryExpectedField}`,
+      evidence?.[idField],
+      expected?.[idExpectedField],
+      `${context}.${idField}`,
+      `${expectedContext}.${idExpectedField}`,
     ),
   );
   for (const [field, expectedField] of payloadBindings) {
@@ -419,6 +428,14 @@ function bundlePrimaryEventIssues(evidence, expected, context, expectedContext) 
     }
   }
   return issues;
+}
+
+function bundlePrimaryEventIssues(evidence, expected, context, expectedContext) {
+  return bundleEventPayloadIssues(evidence, expected, bundlePrimaryEventFieldBindings, context, expectedContext);
+}
+
+function bundleListedEventIssues(evidence, expected, context, expectedContext) {
+  return bundleEventPayloadIssues(evidence, expected, bundleListedEventFieldBindings, context, expectedContext);
 }
 
 function isValidTimingValue(value) {
@@ -691,6 +708,7 @@ function skillOutputEvidenceIssues(skillOutput) {
       'skillOutput.bundleEventCount',
     ),
   );
+  issues.push(...bundleListedEventIssues(skillOutput, skillOutput, 'skillOutput', 'skillOutput'));
   issues.push(...bundlePrimaryEventIssues(skillOutput, skillOutput, 'skillOutput', 'skillOutput'));
   issues.push(...bundleScopeIssues(skillOutput, skillOutput, 'skillOutput', 'skillOutput'));
   issues.push(...bundleTimelineIssues(skillOutput, skillOutput, 'skillOutput', 'skillOutput'));
@@ -743,6 +761,30 @@ function evidenceBundleBindingIssues(bundle, skillOutput, eventId) {
   );
   if (isPositiveInteger(skillOutput.bundleListedEventCount) && bundleListedEventCount !== skillOutput.bundleListedEventCount) {
     issues.push('bundle.events.length must match skillOutput.bundleListedEventCount');
+  }
+  const listedEventEvidence = bundleListedEventEvidence(bundle, eventId);
+  issues.push(
+    ...bundleListedEventIssues(
+      listedEventEvidence,
+      {
+        eventId,
+        workspacePath: skillOutput.workspacePath,
+        runId: skillOutput.runId,
+        agentId: skillOutput.agentId,
+        sessionId: skillOutput.sessionId,
+        traceId: skillOutput.traceId,
+        eventKind: skillOutput.eventKind,
+        eventCategory: skillOutput.eventCategory,
+        verdict: skillOutput.verdict,
+      },
+      'bundle.events[target]',
+      'skillOutput',
+    ),
+  );
+  for (const field of bundleListedEventSummaryFields) {
+    if (listedEventEvidence[field] !== skillOutput[field]) {
+      issues.push(`bundle.events[target].${field} must match skillOutput.${field}`);
+    }
   }
   const primaryEventEvidence = bundlePrimaryEventEvidence(bundle);
   issues.push(
@@ -962,6 +1004,7 @@ function successfulEvidenceIssues(summary, context) {
       'evidence.bundleEventCount',
     ),
   );
+  issues.push(...bundleListedEventIssues(summary.evidence, summary.evidence, `${context} evidence`, 'evidence'));
   issues.push(...bundlePrimaryEventIssues(summary.evidence, summary.evidence, `${context} evidence`, 'evidence'));
   issues.push(...bundleScopeIssues(summary.evidence, summary.evidence, `${context} evidence`, 'evidence'));
   issues.push(...bundleTimelineIssues(summary.evidence, summary.evidence, `${context} evidence`, 'evidence'));
@@ -1021,6 +1064,14 @@ function successfulEvidenceIssues(summary, context) {
       summary.evidence?.skillOutput?.bundleEventCount,
       `${context} evidence.skillOutput.bundleListedEventCount`,
       'evidence.skillOutput.bundleEventCount',
+    ),
+  );
+  issues.push(
+    ...bundleListedEventIssues(
+      summary.evidence?.skillOutput,
+      summary.evidence?.skillOutput,
+      `${context} evidence.skillOutput`,
+      'evidence.skillOutput',
     ),
   );
   issues.push(
@@ -1108,6 +1159,11 @@ function successfulEvidenceIssues(summary, context) {
   }
   if (summary.evidence?.bundleListedEventCount !== summary.evidence?.skillOutput?.bundleListedEventCount) {
     issues.push(`${context} bundleListedEventCount must match skillOutput.bundleListedEventCount`);
+  }
+  for (const field of bundleListedEventSummaryFields) {
+    if (summary.evidence?.[field] !== summary.evidence?.skillOutput?.[field]) {
+      issues.push(`${context} ${field} must match skillOutput.${field}`);
+    }
   }
   for (const field of bundlePrimaryEventSummaryFields) {
     if (summary.evidence?.[field] !== summary.evidence?.skillOutput?.[field]) {
@@ -1271,6 +1327,7 @@ function verifierSummaryIssues(summary) {
           'bundleEventCount',
         ),
       );
+      issues.push(...bundleListedEventIssues(evidence, evidence, 'recorded failure evidence', 'event'));
       issues.push(...bundlePrimaryEventIssues(evidence, evidence, 'recorded failure evidence', 'event'));
       issues.push(...bundleScopeIssues(evidence, evidence, 'recorded failure evidence', 'event'));
       issues.push(...bundleTimelineIssues(evidence, evidence, 'recorded failure evidence', 'event'));
@@ -1421,6 +1478,24 @@ function verifierSummaryIssues(summary) {
         ),
       );
       issues.push(
+        ...bundleListedEventIssues(
+          summary.warning,
+          {
+            eventId: summary.warning?.sourceEventId,
+            workspacePath: summary.evidence?.workspacePath,
+            runId: summary.evidence?.runId,
+            agentId: summary.evidence?.agentId,
+            sessionId: summary.evidence?.sessionId,
+            traceId: summary.evidence?.traceId,
+            eventKind: summary.evidence?.eventKind,
+            eventCategory: summary.evidence?.eventCategory,
+            verdict: summary.evidence?.verdict,
+          },
+          'triggered warning',
+          'evidence',
+        ),
+      );
+      issues.push(
         ...bundlePrimaryEventIssues(
           summary.warning,
           {
@@ -1493,6 +1568,11 @@ function verifierSummaryIssues(summary) {
       if (summary.warning?.bundleListedEventCount !== summary.evidence?.bundleListedEventCount) {
         issues.push('triggered warning.bundleListedEventCount must match evidence.bundleListedEventCount');
       }
+      for (const field of bundleListedEventSummaryFields) {
+        if (summary.warning?.[field] !== summary.evidence?.[field]) {
+          issues.push(`triggered warning.${field} must match evidence.${field}`);
+        }
+      }
       for (const field of bundlePrimaryEventSummaryFields) {
         if (summary.warning?.[field] !== summary.evidence?.[field]) {
           issues.push(`triggered warning.${field} must match evidence.${field}`);
@@ -1543,6 +1623,11 @@ function verifierSummaryIssues(summary) {
       if (summary.warning?.bundleEventCount !== undefined) issues.push('untriggered warning.bundleEventCount must be absent');
       if (summary.warning?.bundleListedEventCount !== undefined) {
         issues.push('untriggered warning.bundleListedEventCount must be absent');
+      }
+      for (const field of bundleListedEventSummaryFields) {
+        if (summary.warning?.[field] !== undefined) {
+          issues.push(`untriggered warning.${field} must be absent`);
+        }
       }
       for (const field of bundlePrimaryEventSummaryFields) {
         if (summary.warning?.[field] !== undefined) {
@@ -1828,6 +1913,15 @@ async function recordFailureEvidence(reason, details, timings) {
     if (bundle?.schemaVersion !== 'anysentry.evidence_bundle.v1' || !bundle.events?.some((item) => item.eventId === failureEvent.eventId)) {
       throw new Error(`failure evidence bundle did not include the failure event: ${compact(bundle)}`);
     }
+    const failureBundleListedEventIssues = bundleListedEventIssues(
+      bundleListedEventEvidence(bundle, failureEvent.eventId),
+      failureEvent,
+      'failure evidence bundle listed event',
+      'failure event',
+    );
+    if (failureBundleListedEventIssues.length > 0) {
+      throw new Error(`failure evidence bundle listed event did not match the failure event: ${compact({ failureBundleListedEventIssues, bundle })}`);
+    }
     const failureBundlePrimaryEventIssues = bundlePrimaryEventIssues(
       bundlePrimaryEventEvidence(bundle),
       failureEvent,
@@ -1883,6 +1977,7 @@ async function recordFailureEvidence(reason, details, timings) {
       bundleContainsEvent: bundle.events?.some((item) => item.eventId === failureEvent.eventId) === true,
       bundleEventCount: bundle.summary?.eventCount,
       bundleListedEventCount: Array.isArray(bundle.events) ? bundle.events.length : undefined,
+      ...bundleListedEventEvidence(bundle, failureEvent.eventId),
       ...bundlePrimaryEventEvidence(bundle),
       ...bundleScopeEvidence(bundle),
       ...bundleTimelineEvidence(bundle, failureEvent.eventId),
@@ -2084,6 +2179,17 @@ function runVerifierSelfTest() {
     bundlePrimaryEventCategory: 'llm',
     bundlePrimaryEventVerdict: 'allow',
   };
+  const selfListedEventEvidence = {
+    bundleListedEventId: 'evt_self_test',
+    bundleListedEventWorkspacePath: workspacePath,
+    bundleListedEventRunId: runId,
+    bundleListedEventAgentId: agentId,
+    bundleListedEventSessionId: sessionId,
+    bundleListedEventTraceId: 'trace_self_test',
+    bundleListedEventKind: 'LlmCall',
+    bundleListedEventCategory: 'llm',
+    bundleListedEventVerdict: 'allow',
+  };
   const selfFailurePrimaryEventEvidence = {
     bundlePrimaryEventId: 'evt_failure_self_test',
     bundlePrimaryEventWorkspacePath: workspacePath,
@@ -2094,6 +2200,17 @@ function runVerifierSelfTest() {
     bundlePrimaryEventKind: 'SecurityAction',
     bundlePrimaryEventCategory: 'security',
     bundlePrimaryEventVerdict: 'block',
+  };
+  const selfFailureListedEventEvidence = {
+    bundleListedEventId: 'evt_failure_self_test',
+    bundleListedEventWorkspacePath: workspacePath,
+    bundleListedEventRunId: runId,
+    bundleListedEventAgentId: agentId,
+    bundleListedEventSessionId: sessionId,
+    bundleListedEventTraceId: 'trace_failure_self_test',
+    bundleListedEventKind: 'SecurityAction',
+    bundleListedEventCategory: 'security',
+    bundleListedEventVerdict: 'block',
   };
   const passedSummary = {
     ...verifierSummaryBase('passed'),
@@ -2117,6 +2234,7 @@ function runVerifierSelfTest() {
       bundleContainsEvent: true,
       bundleEventCount: 1,
       bundleListedEventCount: 1,
+      ...selfListedEventEvidence,
       ...selfPrimaryEventEvidence,
       bundleScopePrimaryType: 'event',
       bundleScopePrimaryId: 'evt_self_test',
@@ -2166,6 +2284,7 @@ function runVerifierSelfTest() {
         bundleContainsEvent: true,
         bundleEventCount: 1,
         bundleListedEventCount: 1,
+        ...selfListedEventEvidence,
         ...selfPrimaryEventEvidence,
         bundleScopePrimaryType: 'event',
         bundleScopePrimaryId: 'evt_self_test',
@@ -2211,6 +2330,7 @@ function runVerifierSelfTest() {
       bundleContainsSourceEvent: true,
       bundleEventCount: 1,
       bundleListedEventCount: 1,
+      ...selfListedEventEvidence,
       ...selfPrimaryEventEvidence,
       bundleScopePrimaryType: 'event',
       bundleScopePrimaryId: 'evt_self_test',
@@ -2285,6 +2405,17 @@ function runVerifierSelfTest() {
       'skillOutput.bundleListedEventCount must not exceed skillOutput.bundleEventCount',
     ),
     skillOutputEvidenceIssues(impossibleSkillOutputBundleListedCount),
+  );
+  const driftedSkillOutputListedEventPayload = {
+    ...passedSummary.evidence.skillOutput,
+    bundleListedEventTraceId: 'trace_other_listed',
+  };
+  assert(
+    'verifier self-test rejects Skill outputs with drifted listed bundle event payloads',
+    skillOutputEvidenceIssues(driftedSkillOutputListedEventPayload).includes(
+      'skillOutput.bundleListedEventTraceId must match skillOutput.traceId',
+    ),
+    skillOutputEvidenceIssues(driftedSkillOutputListedEventPayload),
   );
   const driftedSkillOutputPrimaryEventId = {
     ...passedSummary.evidence.skillOutput,
@@ -2447,7 +2578,19 @@ function runVerifierSelfTest() {
       sessionId,
       items: [{ eventId: passedSummary.evidence.eventId }],
     },
-    events: [{ eventId: passedSummary.evidence.eventId }],
+    events: [
+      {
+        eventId: passedSummary.evidence.eventId,
+        workspacePath,
+        runId,
+        agentId,
+        sessionId,
+        traceId: passedSummary.evidence.traceId,
+        eventKind: passedSummary.evidence.eventKind,
+        eventCategory: passedSummary.evidence.eventCategory,
+        verdict: passedSummary.evidence.verdict,
+      },
+    ],
     summary: { eventCount: passedSummary.evidence.bundleEventCount },
   };
   assert(
@@ -2476,6 +2619,22 @@ function runVerifierSelfTest() {
       'bundle.events.length must match skillOutput.bundleListedEventCount',
     ),
     evidenceBundleBindingIssues(driftedBundleListedCount, passedSummary.evidence.skillOutput, passedSummary.evidence.eventId),
+  );
+  const driftedBundleListedEventPayload = {
+    ...passedBundle,
+    events: [
+      {
+        ...passedBundle.events[0],
+        runId: 'other-run',
+      },
+    ],
+  };
+  assert(
+    'verifier self-test rejects Evidence Bundle listed event payload drift',
+    evidenceBundleBindingIssues(driftedBundleListedEventPayload, passedSummary.evidence.skillOutput, passedSummary.evidence.eventId).includes(
+      'bundle.events[target].bundleListedEventRunId must match skillOutput.runId',
+    ),
+    evidenceBundleBindingIssues(driftedBundleListedEventPayload, passedSummary.evidence.skillOutput, passedSummary.evidence.eventId),
   );
   const driftedBundlePrimaryEventId = {
     ...passedBundle,
@@ -3244,6 +3403,7 @@ function runVerifierSelfTest() {
       bundleContainsEvent: true,
       bundleEventCount: 1,
       bundleListedEventCount: 1,
+      ...selfFailureListedEventEvidence,
       ...selfFailurePrimaryEventEvidence,
       bundleScopePrimaryType: 'event',
       bundleScopePrimaryId: 'evt_failure_self_test',
@@ -3710,6 +3870,23 @@ function runVerifierSelfTest() {
       'recorded failure evidence.bundleListedEventCount must not exceed bundleEventCount',
     ),
     verifierSummaryIssues(impossibleFailureBundleListedCountSummary),
+  );
+  const driftedFailureBundleListedEventSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      bundleListedEventTraceId: 'trace_other_listed',
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence with drifted listed bundle event payloads',
+    verifierSummaryIssues(driftedFailureBundleListedEventSummary).includes(
+      'recorded failure evidence.bundleListedEventTraceId must match event.traceId',
+    ),
+    verifierSummaryIssues(driftedFailureBundleListedEventSummary),
   );
   const driftedFailureBundlePrimaryEventSummary = failureSummary(
     'skill_output',
@@ -4400,6 +4577,37 @@ function runVerifierSelfTest() {
     ),
     verifierSummaryIssues(impossibleBundleListedCountSummary),
   );
+  const missingBundleListedEventSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      bundleListedEventId: undefined,
+    },
+  };
+  assert(
+    'verifier self-test rejects success evidence without a listed bundle event ID',
+    verifierSummaryIssues(missingBundleListedEventSummary).includes(
+      'passed summary evidence.bundleListedEventId must be a non-empty string',
+    ),
+    verifierSummaryIssues(missingBundleListedEventSummary),
+  );
+  const mismatchedBundleListedEventSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        bundleListedEventTraceId: 'trace_other_listed',
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects mismatched Evidence Bundle listed event payloads',
+    verifierSummaryIssues(mismatchedBundleListedEventSummary).includes(
+      'passed summary bundleListedEventTraceId must match skillOutput.bundleListedEventTraceId',
+    ),
+    verifierSummaryIssues(mismatchedBundleListedEventSummary),
+  );
   const missingBundlePrimaryEventSummary = {
     ...passedSummary,
     evidence: {
@@ -4619,6 +4827,20 @@ function runVerifierSelfTest() {
     ),
     verifierSummaryIssues(driftedWarningBundleListedCountSummary),
   );
+  const driftedWarningBundleListedEventSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      bundleListedEventTraceId: 'trace_other_listed',
+    },
+  };
+  assert(
+    'verifier self-test rejects warning listed bundle event payload drift',
+    verifierSummaryIssues(driftedWarningBundleListedEventSummary).includes(
+      'triggered warning.bundleListedEventTraceId must match evidence.traceId',
+    ),
+    verifierSummaryIssues(driftedWarningBundleListedEventSummary),
+  );
   const missingWarningBundlePrimaryEventSummary = {
     ...passedSummary,
     warning: {
@@ -4708,6 +4930,26 @@ function runVerifierSelfTest() {
       'untriggered warning.bundleListedEventCount must be absent',
     ),
     verifierSummaryIssues(staleUntriggeredWarningListedCountSummary),
+  );
+  const staleUntriggeredWarningListedEventSummary = {
+    ...passedSummary,
+    warning: {
+      required: false,
+      triggered: false,
+      thresholdMs: nearTimeoutThresholdMs,
+      bundleListedEventId: passedSummary.evidence.eventId,
+    },
+    timings: {
+      ...passedSummary.timings,
+      skill: 0,
+    },
+  };
+  assert(
+    'verifier self-test rejects stale warning listed bundle event payloads when warning is not triggered',
+    verifierSummaryIssues(staleUntriggeredWarningListedEventSummary).includes(
+      'untriggered warning.bundleListedEventId must be absent',
+    ),
+    verifierSummaryIssues(staleUntriggeredWarningListedEventSummary),
   );
   const staleUntriggeredWarningPrimaryEventSummary = {
     ...passedSummary,
@@ -5337,6 +5579,7 @@ async function main() {
         bundleContainsEvent: bundle.events?.some((item) => item.eventId === event.eventId) === true,
         bundleEventCount: bundle.summary?.eventCount,
         bundleListedEventCount: Array.isArray(bundle.events) ? bundle.events.length : undefined,
+        ...bundleListedEventEvidence(bundle, event.eventId),
         ...bundlePrimaryEventEvidence(bundle),
         ...bundleScopeEvidence(bundle),
         ...bundleTimelineEvidence(bundle, event.eventId),
@@ -5362,6 +5605,15 @@ async function main() {
           bundleContainsEvent: skillOutput.bundleContainsEvent,
           bundleEventCount: skillOutput.bundleEventCount,
           bundleListedEventCount: skillOutput.bundleListedEventCount,
+          bundleListedEventId: skillOutput.bundleListedEventId,
+          bundleListedEventWorkspacePath: skillOutput.bundleListedEventWorkspacePath,
+          bundleListedEventRunId: skillOutput.bundleListedEventRunId,
+          bundleListedEventAgentId: skillOutput.bundleListedEventAgentId,
+          bundleListedEventSessionId: skillOutput.bundleListedEventSessionId,
+          bundleListedEventTraceId: skillOutput.bundleListedEventTraceId,
+          bundleListedEventKind: skillOutput.bundleListedEventKind,
+          bundleListedEventCategory: skillOutput.bundleListedEventCategory,
+          bundleListedEventVerdict: skillOutput.bundleListedEventVerdict,
           bundlePrimaryEventId: skillOutput.bundlePrimaryEventId,
           bundlePrimaryEventWorkspacePath: skillOutput.bundlePrimaryEventWorkspacePath,
           bundlePrimaryEventRunId: skillOutput.bundlePrimaryEventRunId,
@@ -5406,6 +5658,7 @@ async function main() {
         bundleContainsSourceEvent: warningEvent ? bundle.events?.some((item) => item.eventId === event.eventId) === true : undefined,
         bundleEventCount: warningEvent ? bundle.summary?.eventCount : undefined,
         bundleListedEventCount: warningEvent && Array.isArray(bundle.events) ? bundle.events.length : undefined,
+        ...(warningEvent ? bundleListedEventEvidence(bundle, event.eventId) : {}),
         ...(warningEvent ? bundlePrimaryEventEvidence(bundle) : {}),
         ...(warningEvent ? bundleScopeEvidence(bundle) : {}),
         ...(warningEvent ? bundleTimelineEvidence(bundle, event.eventId) : {}),

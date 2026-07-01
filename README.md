@@ -392,9 +392,9 @@ true, `warning.bundleEventCount` must match the success bundle summary count,
 and `warning.bundleListedEventCount` must match the success bundle's listed
 event count. `warning.bundlePrimaryEventId` must match the success evidence
 event, proving the shared bundle's primary event is the warning source event.
-The warning primary bundle event fields must match the success evidence primary
-bundle event fields, proving the warning references the same source event
-payload rather than only reusing the bundle ID.
+The warning listed target event and primary bundle event fields must match the
+success evidence event payload fields, proving the warning references the same
+source event payload rather than only reusing the bundle ID.
 The warning bundle scope fields (`bundleScopePrimaryType`,
 `bundleScopePrimaryId`, `bundleScopeEventId`, `bundleScopeWorkspacePath`,
 `bundleScopeRunId`, `bundleScopeAgentId`, and `bundleScopeSessionId`) must match
@@ -430,14 +430,19 @@ must also be valid and equal. The contract also exposes
 it must be positive, must not exceed `bundleEventCount`, and must match the
 Skill-reported listed count. This lets automation distinguish bundle summary
 count drift from listed-member drift without rebuilding the bundle. The
-contract also exposes the primary bundle event fields (`bundlePrimaryEventId`,
-`bundlePrimaryEventWorkspacePath`, `bundlePrimaryEventRunId`,
-`bundlePrimaryEventAgentId`, `bundlePrimaryEventSessionId`,
-`bundlePrimaryEventTraceId`, `bundlePrimaryEventKind`,
-`bundlePrimaryEventCategory`, and `bundlePrimaryEventVerdict`), which must match
-the stored event payload in both the outer evidence and the Skill output, so
-summary-only automation can detect bundles whose primary event payload drifted
-even when the event is still listed. Bundle scope fields are also exposed and
+contract also exposes the listed target event fields (`bundleListedEventId`,
+`bundleListedEventWorkspacePath`, `bundleListedEventRunId`,
+`bundleListedEventAgentId`, `bundleListedEventSessionId`,
+`bundleListedEventTraceId`, `bundleListedEventKind`,
+`bundleListedEventCategory`, and `bundleListedEventVerdict`) and the primary
+bundle event fields (`bundlePrimaryEventId`, `bundlePrimaryEventWorkspacePath`,
+`bundlePrimaryEventRunId`, `bundlePrimaryEventAgentId`,
+`bundlePrimaryEventSessionId`, `bundlePrimaryEventTraceId`,
+`bundlePrimaryEventKind`, `bundlePrimaryEventCategory`, and
+`bundlePrimaryEventVerdict`). Both field groups must match the stored event
+payload in the outer evidence and the Skill output, so summary-only automation
+can detect bundles whose listed member or primary event payload drifted even
+when the event ID is still present. Bundle scope fields are also exposed and
 must bind to the same
 event/workspace/run/agent/session identity in both the outer evidence and the
 Skill output, so automation can reject bundles built with a stale or cross-run
@@ -466,11 +471,11 @@ and running verifier metadata plus `workspacePath`, `runId`, `agentId`, and
 Recorded failure bundles must use schema `anysentry.evidence_bundle.v1`, must
 include the failure event, and must report positive Evidence Bundle summary and
 listed event counts, with the listed count not exceeding the summary count. They
-must also expose primary bundle event fields matching the recorded failure event
-payload and bundle scope fields bound to that failure event's workspace, run,
-agent, and session identity. Failure bundle timeline fields must likewise prove
-the failure event is present in the failure case-file timeline and bound to the
-failure trace, run, and session.
+must also expose listed target event and primary bundle event fields matching
+the recorded failure event payload, plus bundle scope fields bound to that
+failure event's workspace, run, agent, and session identity. Failure bundle
+timeline fields must likewise prove the failure event is present in the failure
+case-file timeline and bound to the failure trace, run, and session.
 When a required near-timeout warning is missing, the nested
 `warning.failure.evidence` must match the top-level `failure.evidence`,
 including persisted verifier and timing attribute evidence, so automation does

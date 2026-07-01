@@ -162,9 +162,18 @@ const bundle = await timed('innerBundleMs', () =>
     }),
   }),
 );
+const listedEvent = Array.isArray(bundle?.events) ? bundle.events.find((item) => item.eventId === eventId) : undefined;
 if (
   bundle?.schemaVersion !== 'anysentry.evidence_bundle.v1' ||
-  !bundle.events?.some((item) => item.eventId === eventId) ||
+  !listedEvent ||
+  listedEvent.workspacePath !== workspacePath ||
+  listedEvent.runId !== runId ||
+  listedEvent.agentId !== agentId ||
+  listedEvent.sessionId !== sessionId ||
+  listedEvent.traceId !== event.traceId ||
+  listedEvent.eventKind !== event.eventKind ||
+  listedEvent.eventCategory !== event.eventCategory ||
+  listedEvent.verdict !== (event.verdict ?? recorded.items?.[0]?.verdict) ||
   bundle.primary?.event?.eventId !== eventId ||
   bundle.primary?.event?.workspacePath !== workspacePath ||
   bundle.primary?.event?.runId !== runId ||
@@ -201,6 +210,15 @@ console.log(
     bundleContainsEvent: bundle.events?.some((item) => item.eventId === eventId) === true,
     bundleEventCount: bundle.summary?.eventCount,
     bundleListedEventCount: Array.isArray(bundle.events) ? bundle.events.length : undefined,
+    bundleListedEventId: listedEvent?.eventId,
+    bundleListedEventWorkspacePath: listedEvent?.workspacePath,
+    bundleListedEventRunId: listedEvent?.runId,
+    bundleListedEventAgentId: listedEvent?.agentId,
+    bundleListedEventSessionId: listedEvent?.sessionId,
+    bundleListedEventTraceId: listedEvent?.traceId,
+    bundleListedEventKind: listedEvent?.eventKind,
+    bundleListedEventCategory: listedEvent?.eventCategory,
+    bundleListedEventVerdict: listedEvent?.verdict,
     bundlePrimaryEventId: bundle.primary?.event?.eventId,
     bundlePrimaryEventWorkspacePath: bundle.primary?.event?.workspacePath,
     bundlePrimaryEventRunId: bundle.primary?.event?.runId,
