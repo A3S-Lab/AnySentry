@@ -278,6 +278,12 @@ function verifierSummaryIssues(summary) {
     if (typeof summary.warning?.required !== 'boolean') issues.push('warning.required must be a boolean');
     if (typeof summary.warning?.triggered !== 'boolean') issues.push('warning.triggered must be a boolean');
     if (!isFiniteNumber(summary.warning?.thresholdMs) || summary.warning.thresholdMs <= 0) issues.push('warning.thresholdMs must be a positive number');
+    if (typeof summary.warning?.required === 'boolean' && summary.warning.required !== requireNearTimeoutWarning) {
+      issues.push('warning.required must match the running verifier requirement');
+    }
+    if (isFiniteNumber(summary.warning?.thresholdMs) && summary.warning.thresholdMs !== nearTimeoutThresholdMs) {
+      issues.push('warning.thresholdMs must match the running verifier threshold');
+    }
     if (summary.status === 'failed' && summary.warning?.required === true && summary.warning?.triggered === false) {
       if (!isRecord(summary.warning?.failure)) {
         issues.push('failed warning.failure must be an object when required warning is missing');
@@ -805,9 +811,9 @@ function runVerifierSelfTest() {
       },
     },
     warning: {
-      required: true,
+      required: requireNearTimeoutWarning,
       triggered: true,
-      thresholdMs: 100,
+      thresholdMs: nearTimeoutThresholdMs,
       eventId: 'evt_warning_self_test',
       bundleId: 'evb_self_test',
       isolation: {
@@ -845,6 +851,30 @@ function runVerifierSelfTest() {
     'verifier self-test rejects summaries from a different run',
     verifierSummaryIssues(mismatchedTargetSummary).includes('target.runId must match the running verifier runId'),
     verifierSummaryIssues(mismatchedTargetSummary),
+  );
+  const mismatchedWarningRequirementSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      required: !requireNearTimeoutWarning,
+    },
+  };
+  assert(
+    'verifier self-test rejects warning requirements from a different verifier config',
+    verifierSummaryIssues(mismatchedWarningRequirementSummary).includes('warning.required must match the running verifier requirement'),
+    verifierSummaryIssues(mismatchedWarningRequirementSummary),
+  );
+  const mismatchedWarningThresholdSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      thresholdMs: nearTimeoutThresholdMs + 1,
+    },
+  };
+  assert(
+    'verifier self-test rejects warning thresholds from a different verifier config',
+    verifierSummaryIssues(mismatchedWarningThresholdSummary).includes('warning.thresholdMs must match the running verifier threshold'),
+    verifierSummaryIssues(mismatchedWarningThresholdSummary),
   );
 
   const missingVerifierSkillSummary = {
@@ -884,6 +914,7 @@ function runVerifierSelfTest() {
     ...passedSummary,
     warning: {
       ...passedSummary.warning,
+      required: true,
       triggered: false,
       eventId: undefined,
       bundleId: undefined,
@@ -900,7 +931,7 @@ function runVerifierSelfTest() {
     warning: {
       required: false,
       triggered: false,
-      thresholdMs: 100,
+      thresholdMs: nearTimeoutThresholdMs,
       eventId: 'evt_stale_warning',
       bundleId: 'evb_stale_warning',
       isolation: {
@@ -1016,64 +1047,66 @@ function runVerifierSelfTest() {
     warning: {
       required: true,
       triggered: false,
-      thresholdMs: 100,
+      thresholdMs: nearTimeoutThresholdMs,
       failure: {
         evidence: failedSummary.failure.evidence,
       },
     },
   };
-  assert(
-    'verifier self-test accepts required-warning failures bound to top-level evidence',
-    verifierSummaryIssues(requiredWarningFailureSummary).length === 0,
-    verifierSummaryIssues(requiredWarningFailureSummary),
-  );
+  if (requireNearTimeoutWarning) {
+    assert(
+      'verifier self-test accepts required-warning failures bound to top-level evidence',
+      verifierSummaryIssues(requiredWarningFailureSummary).length === 0,
+      verifierSummaryIssues(requiredWarningFailureSummary),
+    );
 
-  const driftedFailedEvidenceSummary = {
-    ...requiredWarningFailureSummary,
-    evidence: {
-      ...requiredWarningFailureSummary.evidence,
-      eventKind: 'RuntimeEvent',
-    },
-  };
-  assert(
-    'verifier self-test rejects failed summaries with drifted top-level evidence',
-    verifierSummaryIssues(driftedFailedEvidenceSummary).includes('failed summary evidence.eventKind must be LlmCall'),
-    verifierSummaryIssues(driftedFailedEvidenceSummary),
-  );
+    const driftedFailedEvidenceSummary = {
+      ...requiredWarningFailureSummary,
+      evidence: {
+        ...requiredWarningFailureSummary.evidence,
+        eventKind: 'RuntimeEvent',
+      },
+    };
+    assert(
+      'verifier self-test rejects failed summaries with drifted top-level evidence',
+      verifierSummaryIssues(driftedFailedEvidenceSummary).includes('failed summary evidence.eventKind must be LlmCall'),
+      verifierSummaryIssues(driftedFailedEvidenceSummary),
+    );
 
-  const driftedFailurePhaseSummary = {
-    ...requiredWarningFailureSummary,
-    timings: {
-      ...requiredWarningFailureSummary.timings,
-      failurePhase: 'skill_output',
-    },
-  };
-  assert(
-    'verifier self-test rejects failure phase timing drift',
-    verifierSummaryIssues(driftedFailurePhaseSummary).includes('failed summary timings.failurePhase must match failure.phase'),
-    verifierSummaryIssues(driftedFailurePhaseSummary),
-  );
+    const driftedFailurePhaseSummary = {
+      ...requiredWarningFailureSummary,
+      timings: {
+        ...requiredWarningFailureSummary.timings,
+        failurePhase: 'skill_output',
+      },
+    };
+    assert(
+      'verifier self-test rejects failure phase timing drift',
+      verifierSummaryIssues(driftedFailurePhaseSummary).includes('failed summary timings.failurePhase must match failure.phase'),
+      verifierSummaryIssues(driftedFailurePhaseSummary),
+    );
 
-  const driftedWarningFailureSummary = {
-    ...requiredWarningFailureSummary,
-    warning: {
-      ...requiredWarningFailureSummary.warning,
-      failure: {
-        ...requiredWarningFailureSummary.warning.failure,
-        evidence: {
-          ...requiredWarningFailureSummary.warning.failure.evidence,
-          eventId: 'evt_other_failure',
+    const driftedWarningFailureSummary = {
+      ...requiredWarningFailureSummary,
+      warning: {
+        ...requiredWarningFailureSummary.warning,
+        failure: {
+          ...requiredWarningFailureSummary.warning.failure,
+          evidence: {
+            ...requiredWarningFailureSummary.warning.failure.evidence,
+            eventId: 'evt_other_failure',
+          },
         },
       },
-    },
-  };
-  assert(
-    'verifier self-test rejects warning failure evidence drift',
-    verifierSummaryIssues(driftedWarningFailureSummary).includes(
-      'failed warning.failure.evidence.eventId must match failure.evidence.eventId',
-    ),
-    verifierSummaryIssues(driftedWarningFailureSummary),
-  );
+    };
+    assert(
+      'verifier self-test rejects warning failure evidence drift',
+      verifierSummaryIssues(driftedWarningFailureSummary).includes(
+        'failed warning.failure.evidence.eventId must match failure.evidence.eventId',
+      ),
+      verifierSummaryIssues(driftedWarningFailureSummary),
+    );
+  }
 
   const unrecordedFailureSummary = failureSummary(
     'preflight',

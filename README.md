@@ -357,9 +357,12 @@ assert `status`, failure phase, failure evidence, event IDs, warning isolation,
 warning event/bundle bindings, and timing fields without scraping human-readable
 log lines. Summary validation binds `verifier.commit`, `verifier.model`, and the
 target `apiBase`/`runId`/`agentId`/`sessionId` to the running verifier process,
-so automation can reject stale or cross-run summaries. Passed summaries must
-identify `verifier.skill=anysentry-api`, report a positive `verifier.toolCalls`,
-and include the warning budget state; when
+so automation can reject stale or cross-run summaries. The warning budget fields
+also bind to the running verifier config: `warning.required` must match
+`A3S_CODE_REQUIRE_NEAR_TIMEOUT_WARNING`, and `warning.thresholdMs` must match the
+computed timeout threshold. Passed summaries must identify
+`verifier.skill=anysentry-api`, report a positive `verifier.toolCalls`, and
+include the warning budget state; when
 `warning.required=true`, `warning.triggered` must also be true. Warning summaries
 are mutually exclusive: triggered warnings carry warning event/bundle/isolation
 evidence and no failure payload, while untriggered warnings carry no stale
