@@ -611,6 +611,7 @@ function successfulEvidenceIssues(summary, context) {
   if (summary.evidence?.eventKind !== 'LlmCall') issues.push(`${context} evidence.eventKind must be LlmCall`);
   if (summary.evidence?.eventCategory !== 'llm') issues.push(`${context} evidence.eventCategory must be llm`);
   if (summary.evidence?.verdict !== 'allow') issues.push(`${context} evidence.verdict must be allow`);
+  issues.push(...persistedVerifierAttributeIssues(summary.evidence?.persistedVerifierAttributes, `${context} evidence`));
   issues.push(
     ...persistedPreflightAttributeIssues(
       summary.evidence?.persistedPreflightAttributes,
@@ -1473,6 +1474,7 @@ function runVerifierSelfTest() {
       bundleSchemaVersion: 'anysentry.evidence_bundle.v1',
       bundleContainsEvent: true,
       bundleEventCount: 1,
+      persistedVerifierAttributes: persistedVerifierAttributeEvidence(verifierAttributes),
       persistedPreflightAttributes: {
         healthOk: true,
         listed: true,
@@ -2784,6 +2786,37 @@ function runVerifierSelfTest() {
     verifierSummaryIssues(driftedEvidenceCategorySummary).includes('passed summary evidence.eventCategory must be llm'),
     verifierSummaryIssues(driftedEvidenceCategorySummary),
   );
+  const missingPersistedVerifierAttributesSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      persistedVerifierAttributes: undefined,
+    },
+  };
+  assert(
+    'verifier self-test rejects passed summaries without persisted verifier attributes',
+    verifierSummaryIssues(missingPersistedVerifierAttributesSummary).includes(
+      'passed summary evidence.persistedVerifierAttributes must be an object',
+    ),
+    verifierSummaryIssues(missingPersistedVerifierAttributesSummary),
+  );
+  const driftedPersistedVerifierAttributesSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      persistedVerifierAttributes: {
+        ...passedSummary.evidence.persistedVerifierAttributes,
+        closeTimeoutMs: sessionCloseTimeoutMs + 1,
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects persisted verifier attributes with close-timeout drift',
+    verifierSummaryIssues(driftedPersistedVerifierAttributesSummary).includes(
+      'passed summary evidence.persistedVerifierAttributes.closeTimeoutMs must match verifier audit metadata',
+    ),
+    verifierSummaryIssues(driftedPersistedVerifierAttributesSummary),
+  );
   const missingPersistedPreflightSummary = {
     ...passedSummary,
     evidence: {
@@ -3679,6 +3712,7 @@ async function main() {
         bundleSchemaVersion: bundle.schemaVersion,
         bundleContainsEvent: bundle.events?.some((item) => item.eventId === event.eventId) === true,
         bundleEventCount: bundle.summary?.eventCount,
+        persistedVerifierAttributes: persistedVerifierAttributeEvidence(event.attributes),
         persistedPreflightAttributes: persistedPreflightAttributeEvidence(event.attributes),
         persistedInnerTimingAttributes: persistedInnerTimingAttributeEvidence(event.attributes),
         skillOutput: {
