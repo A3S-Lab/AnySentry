@@ -331,9 +331,25 @@ function verifierSummaryIssues(summary) {
       issues.push('failed summary failure.evidence.recorded must be a boolean');
     } else if (evidence.recorded === true) {
       if (!isNonEmptyString(evidence.eventId)) issues.push('recorded failure evidence.eventId must be a non-empty string');
+      if (!isNonEmptyString(evidence.workspacePath)) issues.push('recorded failure evidence.workspacePath must be a non-empty string');
+      if (!isNonEmptyString(evidence.runId)) issues.push('recorded failure evidence.runId must be a non-empty string');
+      if (!isNonEmptyString(evidence.agentId)) issues.push('recorded failure evidence.agentId must be a non-empty string');
+      if (!isNonEmptyString(evidence.sessionId)) issues.push('recorded failure evidence.sessionId must be a non-empty string');
       if (!isNonEmptyString(evidence.bundleId)) issues.push('recorded failure evidence.bundleId must be a non-empty string');
+      if (evidence.bundleSchemaVersion !== 'anysentry.evidence_bundle.v1') {
+        issues.push('recorded failure evidence.bundleSchemaVersion must be anysentry.evidence_bundle.v1');
+      }
+      if (evidence.bundleContainsEvent !== true) issues.push('recorded failure evidence.bundleContainsEvent must be true');
       if (!isPositiveInteger(evidence.bundleEventCount)) {
         issues.push('recorded failure evidence.bundleEventCount must be a positive integer');
+      }
+      if (evidence.workspacePath !== summary.target?.workspacePath) {
+        issues.push('recorded failure evidence.workspacePath must match target.workspacePath');
+      }
+      if (evidence.runId !== summary.target?.runId) issues.push('recorded failure evidence.runId must match target.runId');
+      if (evidence.agentId !== summary.target?.agentId) issues.push('recorded failure evidence.agentId must match target.agentId');
+      if (evidence.sessionId !== summary.target?.sessionId) {
+        issues.push('recorded failure evidence.sessionId must match target.sessionId');
       }
       if (evidence.eventKind !== 'SecurityAction') issues.push('recorded failure evidence.eventKind must be SecurityAction');
       if (evidence.eventCategory !== 'security') issues.push('recorded failure evidence.eventCategory must be security');
@@ -371,11 +387,17 @@ function verifierSummaryIssues(summary) {
           ...evidenceFieldMismatchIssues('failed warning.failure.evidence', summary.warning.failure.evidence, summary.failure?.evidence, [
             'recorded',
             'eventId',
+            'workspacePath',
+            'runId',
+            'agentId',
+            'sessionId',
             'eventKind',
             'eventCategory',
             'verdict',
             'riskCategory',
             'bundleId',
+            'bundleSchemaVersion',
+            'bundleContainsEvent',
             'bundleEventCount',
             'error',
           ]),
@@ -609,13 +631,18 @@ async function recordFailureEvidence(reason, details, timings) {
         method: 'POST',
         body: JSON.stringify({ timeType: 'last_30d', runId, agentId, limit: 20 }),
       });
-      const matches = list.items?.filter((item) => item.runId === runId && item.agentId === agentId) ?? [];
+      const matches =
+        list.items?.filter(
+          (item) =>
+            item.workspacePath === workspacePath &&
+            item.runId === runId &&
+            item.agentId === agentId &&
+            item.sessionId === sessionId,
+        ) ?? [];
       const byRecordedId = matches.find((item) => item.eventId === recordedEventId);
       if (byRecordedId) return byRecordedId;
-      return list.items?.find(
+      return matches.find(
         (item) =>
-          item.runId === runId &&
-          item.agentId === agentId &&
           trueAttribute(item.attributes?.['progressive.failure']) &&
           item.attributes?.['progressive.failure.reason'] === reason,
       );
@@ -625,6 +652,14 @@ async function recordFailureEvidence(reason, details, timings) {
     }
     if (!failureEvent.verdict || failureEvent.verdict === 'allow' || failureEvent.riskCategory !== 'runtime_failure') {
       throw new Error(`failure evidence was not actionable runtime failure evidence: ${compact(failureEvent)}`);
+    }
+    if (
+      failureEvent.workspacePath !== workspacePath ||
+      failureEvent.runId !== runId ||
+      failureEvent.agentId !== agentId ||
+      failureEvent.sessionId !== sessionId
+    ) {
+      throw new Error(`failure evidence lost target identity: ${compact(failureEvent)}`);
     }
     const failureAttrs = failureEvent.attributes ?? {};
     if (
@@ -664,11 +699,17 @@ async function recordFailureEvidence(reason, details, timings) {
     return {
       recorded: true,
       eventId: failureEvent.eventId,
+      workspacePath: failureEvent.workspacePath,
+      runId: failureEvent.runId,
+      agentId: failureEvent.agentId,
+      sessionId: failureEvent.sessionId,
       eventKind: failureEvent.eventKind,
       eventCategory: failureEvent.eventCategory,
       verdict: failureEvent.verdict,
       riskCategory: failureEvent.riskCategory,
       bundleId: bundle.bundleId,
+      bundleSchemaVersion: bundle.schemaVersion,
+      bundleContainsEvent: bundle.events?.some((item) => item.eventId === failureEvent.eventId) === true,
       bundleEventCount: bundle.summary?.eventCount,
     };
   } catch (error) {
@@ -1326,11 +1367,17 @@ function runVerifierSelfTest() {
     {
       recorded: true,
       eventId: 'evt_failure_self_test',
+      workspacePath,
+      runId,
+      agentId,
+      sessionId,
       eventKind: 'SecurityAction',
       eventCategory: 'security',
       verdict: 'block',
       riskCategory: 'runtime_failure',
       bundleId: 'evb_failure_self_test',
+      bundleSchemaVersion: 'anysentry.evidence_bundle.v1',
+      bundleContainsEvent: true,
       bundleEventCount: 1,
     },
   );
@@ -1350,6 +1397,101 @@ function runVerifierSelfTest() {
     'verifier self-test rejects recorded failure evidence that looks allow-listed',
     verifierSummaryIssues(driftedFailureSummary).includes('recorded failure evidence.verdict must be a non-allow string'),
     verifierSummaryIssues(driftedFailureSummary),
+  );
+
+  const driftedFailureWorkspaceSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      workspacePath: 'repo://other/workspace',
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence workspace drift',
+    verifierSummaryIssues(driftedFailureWorkspaceSummary).includes(
+      'recorded failure evidence.workspacePath must match target.workspacePath',
+    ),
+    verifierSummaryIssues(driftedFailureWorkspaceSummary),
+  );
+  const driftedFailureRunSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      runId: 'other-run',
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence run drift',
+    verifierSummaryIssues(driftedFailureRunSummary).includes('recorded failure evidence.runId must match target.runId'),
+    verifierSummaryIssues(driftedFailureRunSummary),
+  );
+  const driftedFailureAgentSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      agentId: 'other-agent',
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence agent drift',
+    verifierSummaryIssues(driftedFailureAgentSummary).includes('recorded failure evidence.agentId must match target.agentId'),
+    verifierSummaryIssues(driftedFailureAgentSummary),
+  );
+  const driftedFailureSessionSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      sessionId: 'other-session',
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence session drift',
+    verifierSummaryIssues(driftedFailureSessionSummary).includes('recorded failure evidence.sessionId must match target.sessionId'),
+    verifierSummaryIssues(driftedFailureSessionSummary),
+  );
+  const driftedFailureBundleSchemaSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      bundleSchemaVersion: 'legacy.bundle.v0',
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence bundle schema drift',
+    verifierSummaryIssues(driftedFailureBundleSchemaSummary).includes(
+      'recorded failure evidence.bundleSchemaVersion must be anysentry.evidence_bundle.v1',
+    ),
+    verifierSummaryIssues(driftedFailureBundleSchemaSummary),
+  );
+  const missingFailureBundleEventSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      bundleContainsEvent: false,
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure bundles that omit the failure event',
+    verifierSummaryIssues(missingFailureBundleEventSummary).includes('recorded failure evidence.bundleContainsEvent must be true'),
+    verifierSummaryIssues(missingFailureBundleEventSummary),
   );
 
   const missingFailureBundleCountSummary = failureSummary(
