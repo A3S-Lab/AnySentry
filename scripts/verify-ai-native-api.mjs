@@ -358,14 +358,19 @@ async function verifyRuntimeContract() {
       method: 'POST',
       body: JSON.stringify({ timeType: 'last_30d', runId, agentId, limit: 30 }),
     });
-    return list.items?.find((item) => item.eventId === fallbackOnly.eventId && item.eventKind === 'SecurityAction');
+    const finding = list.items?.find((item) => item.eventId === fallbackOnly.eventId && item.eventKind === 'SecurityAction');
+    const action = list.items?.find((item) => item.eventId === finding?.attributes?.['progressive.guard.actionEventId']);
+    return finding && action ? { finding, action } : undefined;
   });
   assert(
     'runtime guard fallback persists actionable SecurityFinding evidence',
-    fallbackFinding?.verdict &&
-      fallbackFinding.verdict !== 'allow' &&
-      fallbackFinding?.attributes?.['progressive.guard.fallback'] === true &&
-      fallbackFinding?.attributes?.['progressive.guard.actionEventId'],
+    fallbackFinding?.finding?.verdict &&
+      fallbackFinding.finding.verdict !== 'allow' &&
+      fallbackFinding.finding?.attributes?.['progressive.guard.fallback'] === true &&
+      fallbackFinding.finding?.attributes?.['progressive.guard.actionEventId'] === fallbackFinding.action?.eventId &&
+      fallbackFinding.finding?.traceId === fallbackFinding.action?.traceId &&
+      fallbackFinding.finding?.spanId !== fallbackFinding.action?.spanId &&
+      fallbackFinding.finding?.parentSpanId === fallbackFinding.action?.spanId,
     fallbackFinding,
   );
 

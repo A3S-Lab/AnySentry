@@ -2177,15 +2177,25 @@ function securityRuntimeGuardFallbackEvent(
   autonomy: T.SecurityCapabilityAutonomy,
   stage: T.SecurityCapabilityStage,
   actionEventId: string | undefined,
+  actionTraceId: string | undefined,
+  actionSpanId: string | undefined,
 ): T.UniversalIngestEvent {
+  const fallbackSpanId = `sp_guard_${createHash('sha1')
+    .update(actionEventId ?? '')
+    .update('\0')
+    .update(cleanString(body.runId, 240) ?? '')
+    .update('\0')
+    .update(risk.reason)
+    .digest('hex')
+    .slice(0, 16)}`;
   return {
     workspacePath: cleanString(body.workspacePath, 500),
     agentId: cleanString(body.agentId, 240),
     sessionId: cleanString(body.sessionId, 240),
     userId: cleanString(body.userId, 240),
-    traceId: cleanString(body.traceId, 240),
-    spanId: cleanString(body.spanId, 240),
-    parentSpanId: cleanString(body.parentSpanId, 240),
+    traceId: cleanString(actionTraceId ?? body.traceId, 240),
+    spanId: fallbackSpanId,
+    parentSpanId: cleanString(actionSpanId ?? body.parentSpanId, 240),
     runId: cleanString(body.runId, 240),
     taskId: cleanString(body.taskId, 240),
     collectorId: cleanString(body.collectorId, 180),
@@ -4043,7 +4053,7 @@ export class SecurityMonitoringController {
           sourceId: body.sourceId,
           token: body.token,
           collectorId: body.collectorId,
-          events: [securityRuntimeGuardFallbackEvent(body, event, fallbackRisk, autonomy, stage, item?.eventId)],
+          events: [securityRuntimeGuardFallbackEvent(body, event, fallbackRisk, autonomy, stage, item?.eventId, item?.traceId, item?.spanId)],
         },
         headers,
         'custom',
