@@ -221,6 +221,54 @@ function eventInnerTimingAttributeIssues(attributes, timings) {
   return issues;
 }
 
+function skillOutputEvidenceIssues(skillOutput) {
+  const issues = [];
+  if (!isRecord(skillOutput)) {
+    return ['skillOutput must be an object'];
+  }
+  if (!isNonEmptyString(skillOutput.eventId)) {
+    issues.push('skillOutput.eventId must be a non-empty string');
+  }
+  if (!isNonEmptyString(skillOutput.bundleId)) {
+    issues.push('skillOutput.bundleId must be a non-empty string');
+  }
+  if (skillOutput.workspacePath !== workspacePath) {
+    issues.push('skillOutput.workspacePath must match the verifier workspacePath');
+  }
+  if (skillOutput.runId !== runId) {
+    issues.push('skillOutput.runId must match the verifier runId');
+  }
+  if (skillOutput.agentId !== agentId) {
+    issues.push('skillOutput.agentId must match the verifier agentId');
+  }
+  if (skillOutput.sessionId !== sessionId) {
+    issues.push('skillOutput.sessionId must match the verifier sessionId');
+  }
+  if (skillOutput.eventKind !== 'LlmCall') {
+    issues.push('skillOutput.eventKind must be LlmCall');
+  }
+  if (skillOutput.eventCategory !== 'llm') {
+    issues.push('skillOutput.eventCategory must be llm');
+  }
+  if (skillOutput.verdict !== 'allow') {
+    issues.push('skillOutput.verdict must be allow');
+  }
+  if (skillOutput.bundleSchemaVersion !== 'anysentry.evidence_bundle.v1') {
+    issues.push('skillOutput.bundleSchemaVersion must be anysentry.evidence_bundle.v1');
+  }
+  if (skillOutput.bundleContainsEvent !== true) {
+    issues.push('skillOutput.bundleContainsEvent must be true');
+  }
+  if (!isPositiveInteger(skillOutput.bundleEventCount)) {
+    issues.push('skillOutput.bundleEventCount must be a positive integer');
+  }
+  if (skillOutput.queriedBack !== true) {
+    issues.push('skillOutput.queriedBack must be true');
+  }
+  issues.push(...skillOutputTimingIssues(skillOutput.timings, 'Skill output'));
+  return issues;
+}
+
 function evidenceBundleBindingIssues(bundle, skillOutput, eventId) {
   const issues = [];
   if (!isRecord(bundle)) {
@@ -1242,6 +1290,30 @@ function runVerifierSelfTest() {
     },
   };
   assert('verifier self-test accepts the passed summary contract', verifierSummaryIssues(passedSummary).length === 0, verifierSummaryIssues(passedSummary));
+
+  assert(
+    'verifier self-test accepts a Skill output bound to this verifier run',
+    skillOutputEvidenceIssues(passedSummary.evidence.skillOutput).length === 0,
+    skillOutputEvidenceIssues(passedSummary.evidence.skillOutput),
+  );
+  const emptySkillOutputEventId = {
+    ...passedSummary.evidence.skillOutput,
+    eventId: '',
+  };
+  assert(
+    'verifier self-test rejects Skill outputs without a non-empty event ID',
+    skillOutputEvidenceIssues(emptySkillOutputEventId).includes('skillOutput.eventId must be a non-empty string'),
+    skillOutputEvidenceIssues(emptySkillOutputEventId),
+  );
+  const missingSkillOutputBundleCount = {
+    ...passedSummary.evidence.skillOutput,
+    bundleEventCount: undefined,
+  };
+  assert(
+    'verifier self-test rejects Skill outputs without a bundle event count',
+    skillOutputEvidenceIssues(missingSkillOutputBundleCount).includes('skillOutput.bundleEventCount must be a positive integer'),
+    skillOutputEvidenceIssues(missingSkillOutputBundleCount),
+  );
 
   const passedEventTimingAttributes = Object.fromEntries(
     eventInnerTimingFields.map((field) => [`progressive.verifier.${field}`, passedSummary.evidence.skillOutput.timings[field]]),
@@ -2789,25 +2861,15 @@ async function main() {
       printVerifierSummary(failureSummary('skill_output', reason, details, failureTimings, failureEvidence));
       throw error;
     }
-    const outputMatchesRun =
-      typeof skillOutput.eventId === 'string' &&
-      typeof skillOutput.bundleId === 'string' &&
-      skillOutput.workspacePath === workspacePath &&
-      skillOutput.runId === runId &&
-      skillOutput.agentId === agentId &&
-      skillOutput.sessionId === sessionId &&
-      skillOutput.eventKind === 'LlmCall' &&
-      skillOutput.eventCategory === 'llm' &&
-      skillOutput.verdict === 'allow' &&
-      skillOutput.bundleSchemaVersion === 'anysentry.evidence_bundle.v1' &&
-      skillOutput.bundleContainsEvent === true &&
-      skillOutput.queriedBack === true &&
-      skillOutputTimingIssues(skillOutput.timings, 'Skill output').length === 0;
-    assert('Skill output reports the recorded LlmCall allow event and bundle for this run', outputMatchesRun, skillOutput);
-    if (!outputMatchesRun) {
+    const skillOutputIssues = skillOutputEvidenceIssues(skillOutput);
+    assert('Skill output reports the recorded LlmCall allow event and bundle for this run', skillOutputIssues.length === 0, {
+      skillOutputIssues,
+      skillOutput,
+    });
+    if (skillOutputIssues.length > 0) {
       timings.elapsed = durationMs(verifierStartedAt);
       const reason = 'skill output did not match the verifier run';
-      const details = { skillOutput, workspacePath, runId, agentId, sessionId };
+      const details = { skillOutputIssues, skillOutput, workspacePath, runId, agentId, sessionId };
       const failureTimings = {
         ...timings,
         failurePhase: 'skill_output',
