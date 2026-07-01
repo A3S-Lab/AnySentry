@@ -362,7 +362,10 @@ running verifier process, so automation can reject stale, cross-run, or
 cross-config summaries. The warning budget fields also bind to the running
 verifier config: `warning.required` must match
 `A3S_CODE_REQUIRE_NEAR_TIMEOUT_WARNING`, and `warning.thresholdMs` must match the
-computed timeout threshold. Passed summaries must identify
+computed timeout threshold. Triggered warnings must also bind to the timing
+budget by proving `timings.skill >= warning.thresholdMs`; passed summaries with
+untriggered warnings must prove `timings.skill < warning.thresholdMs`.
+Passed summaries must identify
 `verifier.skill=anysentry-api`, report a positive `verifier.toolCalls`, and
 include the warning budget state; when
 `warning.required=true`, `warning.triggered` must also be true. Warning summaries

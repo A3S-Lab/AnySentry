@@ -447,6 +447,11 @@ function verifierSummaryIssues(summary) {
       }
     }
     if (summary.warning?.triggered === true) {
+      if (!isFiniteNumber(summary.timings?.skill)) {
+        issues.push('triggered warning timings.skill must be a non-negative number');
+      } else if (summary.timings.skill < summary.warning?.thresholdMs) {
+        issues.push('triggered warning timings.skill must be greater than or equal to warning.thresholdMs');
+      }
       if (!isNonEmptyString(summary.warning?.eventId)) issues.push('triggered warning.eventId must be a non-empty string');
       if (!isNonEmptyString(summary.warning?.sourceEventId)) issues.push('triggered warning.sourceEventId must be a non-empty string');
       if (!isNonEmptyString(summary.warning?.workspacePath)) issues.push('triggered warning.workspacePath must be a non-empty string');
@@ -510,6 +515,13 @@ function verifierSummaryIssues(summary) {
       if (summary.warning?.isolation !== undefined) issues.push('untriggered warning.isolation must be absent');
       if (summary.status === 'passed' && summary.warning?.failure !== undefined) {
         issues.push('passed untriggered warning.failure must be absent');
+      }
+      if (summary.status === 'passed') {
+        if (!isFiniteNumber(summary.timings?.skill)) {
+          issues.push('passed untriggered warning timings.skill must be a non-negative number');
+        } else if (summary.timings.skill >= summary.warning?.thresholdMs) {
+          issues.push('passed untriggered warning timings.skill must be less than warning.thresholdMs');
+        }
       }
     }
   }
@@ -1083,8 +1095,8 @@ function runVerifierSelfTest() {
       },
     },
     timings: {
-      skill: 75,
-      elapsed: 100,
+      skill: nearTimeoutThresholdMs + 1,
+      elapsed: nearTimeoutThresholdMs + 25,
     },
   };
   assert('verifier self-test accepts the passed summary contract', verifierSummaryIssues(passedSummary).length === 0, verifierSummaryIssues(passedSummary));
@@ -1248,6 +1260,49 @@ function runVerifierSelfTest() {
     verifierSummaryIssues(mismatchedWarningThresholdSummary).includes('warning.thresholdMs must match the running verifier threshold'),
     verifierSummaryIssues(mismatchedWarningThresholdSummary),
   );
+  const underThresholdTriggeredWarningSummary = {
+    ...passedSummary,
+    timings: {
+      ...passedSummary.timings,
+      skill: nearTimeoutThresholdMs - 1,
+    },
+  };
+  assert(
+    'verifier self-test rejects triggered warnings below the timing threshold',
+    verifierSummaryIssues(underThresholdTriggeredWarningSummary).includes(
+      'triggered warning timings.skill must be greater than or equal to warning.thresholdMs',
+    ),
+    verifierSummaryIssues(underThresholdTriggeredWarningSummary),
+  );
+  const untriggeredAboveThresholdSummary = {
+    ...passedSummary,
+    warning: {
+      required: requireNearTimeoutWarning,
+      triggered: false,
+      thresholdMs: nearTimeoutThresholdMs,
+    },
+  };
+  assert(
+    'verifier self-test rejects passed untriggered warnings at or above the timing threshold',
+    verifierSummaryIssues(untriggeredAboveThresholdSummary).includes(
+      'passed untriggered warning timings.skill must be less than warning.thresholdMs',
+    ),
+    verifierSummaryIssues(untriggeredAboveThresholdSummary),
+  );
+  if (!requireNearTimeoutWarning) {
+    const untriggeredBelowThresholdSummary = {
+      ...untriggeredAboveThresholdSummary,
+      timings: {
+        ...passedSummary.timings,
+        skill: nearTimeoutThresholdMs - 1,
+      },
+    };
+    assert(
+      'verifier self-test accepts passed untriggered warnings below the timing threshold',
+      verifierSummaryIssues(untriggeredBelowThresholdSummary).length === 0,
+      verifierSummaryIssues(untriggeredBelowThresholdSummary),
+    );
+  }
 
   const missingVerifierSkillSummary = {
     ...passedSummary,
