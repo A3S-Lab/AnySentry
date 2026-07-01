@@ -19,9 +19,14 @@ const runId = process.env.ANYSENTRY_A3S_CODE_TEST_RUN_ID ?? safeProbeId('a3s-cod
 const agentId = process.env.ANYSENTRY_A3S_CODE_TEST_AGENT_ID ?? 'a3s-code-skill-itest';
 const sessionId = `${runId}-session`;
 const workspacePath = 'repo://anysentry/a3s-code-skill-itest';
+const skillRunnerScript = path.join(
+  process.env.TMPDIR ?? '/tmp',
+  `anysentry-a3s-code-skill-${runId.replace(/[^A-Za-z0-9_.-]/gu, '_')}-${process.pid}.sh`,
+);
 const verifierSummarySchema = 'anysentry.a3s_code_skill_verifier.summary.v1';
 const verifierProcessStartedAt = Date.now();
 let lastVerifierTimings = {};
+let skillRunnerScriptWritten = false;
 
 function positiveIntEnv(name, fallback, max) {
   const parsed = Number(process.env[name]);
@@ -4867,12 +4872,14 @@ function runVerifierSelfTest() {
     verifierAttributes,
   );
   const skillCommand = buildSkillCommand();
+  const skillRunnerSource = buildSkillRunnerScript();
   const expectedIdentityJson = JSON.stringify({ runId, agentId, sessionId, workspacePath });
   assert(
-    'verifier self-test binds Skill command identity through typed JSON',
-    skillCommand.includes(`ANYSENTRY_A3S_CODE_IDENTITY_JSON=${shellQuote(expectedIdentityJson)}`) &&
-      skillCommand.includes(`node ${shellQuote(innerVerifierScript)}`),
-    skillCommand,
+    'verifier self-test binds Skill command identity through a temporary runner script',
+    skillCommand === `bash ${shellQuote(skillRunnerScript)}` &&
+      skillRunnerSource.includes(`export ANYSENTRY_A3S_CODE_IDENTITY_JSON=${shellQuote(expectedIdentityJson)}`) &&
+      skillRunnerSource.includes(`exec node ${shellQuote(innerVerifierScript)}`),
+    { skillCommand, skillRunnerScript, skillRunnerSource },
   );
 
   if (process.exitCode) process.exit(process.exitCode);
@@ -4887,15 +4894,37 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/gu, `'"'"'`)}'`;
 }
 
-function buildSkillCommand() {
+function buildSkillRunnerScript() {
   return [
-    `ANYSENTRY_API_BASE=${shellQuote(apiBase)}`,
-    `A3S_TEST_MODEL=${shellQuote(model)}`,
-    `ANYSENTRY_A3S_CODE_IDENTITY_JSON=${shellQuote(JSON.stringify({ runId, agentId, sessionId, workspacePath }))}`,
-    `ANYSENTRY_A3S_CODE_VERIFIER_ATTRIBUTES_JSON=${shellQuote(JSON.stringify(verifierAttributes))}`,
-    `ANYSENTRY_A3S_CODE_EXPECTED_PROGRESSIVE_FLOW=${shellQuote(expectedProgressiveFlow)}`,
-    `node ${shellQuote(innerVerifierScript)}`,
-  ].join(' ');
+    '#!/usr/bin/env bash',
+    'set -euo pipefail',
+    `cd ${shellQuote(repoRoot)}`,
+    `export ANYSENTRY_API_BASE=${shellQuote(apiBase)}`,
+    `export A3S_TEST_MODEL=${shellQuote(model)}`,
+    `export ANYSENTRY_A3S_CODE_IDENTITY_JSON=${shellQuote(JSON.stringify({ runId, agentId, sessionId, workspacePath }))}`,
+    `export ANYSENTRY_A3S_CODE_VERIFIER_ATTRIBUTES_JSON=${shellQuote(JSON.stringify(verifierAttributes))}`,
+    `export ANYSENTRY_A3S_CODE_EXPECTED_PROGRESSIVE_FLOW=${shellQuote(expectedProgressiveFlow)}`,
+    `exec node ${shellQuote(innerVerifierScript)}`,
+    '',
+  ].join('\n');
+}
+
+function writeSkillRunnerScript() {
+  fs.writeFileSync(skillRunnerScript, buildSkillRunnerScript(), { mode: 0o700 });
+  skillRunnerScriptWritten = true;
+}
+
+function removeSkillRunnerScript() {
+  if (!skillRunnerScriptWritten) return;
+  try {
+    fs.rmSync(skillRunnerScript, { force: true });
+  } finally {
+    skillRunnerScriptWritten = false;
+  }
+}
+
+function buildSkillCommand() {
+  return `bash ${shellQuote(skillRunnerScript)}`;
 }
 
 function buildSkillPrompt() {
@@ -5025,6 +5054,7 @@ async function main() {
     if (!condition) await failPhase(phase, reason, details);
   }
 
+  writeSkillRunnerScript();
   try {
     const toolNames = session.toolNames();
     await requireVerification(
@@ -5389,6 +5419,7 @@ async function main() {
     });
   } finally {
     await closeSession('verification completion');
+    removeSkillRunnerScript();
   }
 
   if (process.exitCode) {
