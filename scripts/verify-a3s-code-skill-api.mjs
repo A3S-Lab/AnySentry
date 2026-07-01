@@ -865,6 +865,7 @@ function verifierSummaryIssues(summary) {
         issues.push('recorded failure evidence.bundleEventCount must be a positive integer');
       }
       issues.push(...persistedVerifierAttributeIssues(evidence.persistedVerifierAttributes, 'recorded failure evidence'));
+      issues.push(...persistedTimingAttributeIssues(evidence.persistedTimingAttributes, summary.timings, 'recorded failure evidence'));
       if (evidence.workspacePath !== summary.target?.workspacePath) {
         issues.push('recorded failure evidence.workspacePath must match target.workspacePath');
       }
@@ -1305,6 +1306,7 @@ async function recordFailureEvidence(reason, details, timings) {
       verdict: failureEvent.verdict,
       riskCategory: failureEvent.riskCategory,
       persistedVerifierAttributes: persistedVerifierAttributeEvidence(failureAttrs),
+      persistedTimingAttributes: persistedTimingAttributeEvidence(failureAttrs, timings),
       bundleId: bundle.bundleId,
       bundleSchemaVersion: bundle.schemaVersion,
       bundleContainsEvent: bundle.events?.some((item) => item.eventId === failureEvent.eventId) === true,
@@ -2391,6 +2393,7 @@ function runVerifierSelfTest() {
   );
 
   const failedTimings = { elapsed: 10, failurePhase: 'skill_output' };
+  const failedTimingAttributes = timingAttributes(failedTimings);
   const failedReason = 'skill output JSON was invalid';
   const failedSummary = failureSummary(
     'skill_output',
@@ -2412,6 +2415,7 @@ function runVerifierSelfTest() {
       verdict: 'block',
       riskCategory: 'runtime_failure',
       persistedVerifierAttributes: persistedVerifierAttributeEvidence(verifierAttributes),
+      persistedTimingAttributes: persistedTimingAttributeEvidence(failedTimingAttributes, failedTimings),
       bundleId: 'evb_failure_self_test',
       bundleSchemaVersion: 'anysentry.evidence_bundle.v1',
       bundleContainsEvent: true,
@@ -2444,7 +2448,7 @@ function runVerifierSelfTest() {
     riskCategory: 'runtime_failure',
     attributes: {
       ...verifierAttributes,
-      ...timingAttributes(failedTimings),
+      ...failedTimingAttributes,
       'progressive.runner': 'a3s-code',
       'progressive.skill': 'anysentry-api',
       'progressive.failure': true,
@@ -2578,6 +2582,43 @@ function runVerifierSelfTest() {
       'recorded failure evidence.persistedVerifierAttributes.closeTimeoutMs must match verifier audit metadata',
     ),
     verifierSummaryIssues(driftedFailureEvidenceVerifierAttrsSummary),
+  );
+  const missingFailureEvidenceTimingAttrsSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      persistedTimingAttributes: undefined,
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence without persisted timing attributes',
+    verifierSummaryIssues(missingFailureEvidenceTimingAttrsSummary).includes(
+      'recorded failure evidence.persistedTimingAttributes must be an object',
+    ),
+    verifierSummaryIssues(missingFailureEvidenceTimingAttrsSummary),
+  );
+  const driftedFailureEvidenceTimingAttrsSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      persistedTimingAttributes: {
+        ...failedSummary.failure.evidence.persistedTimingAttributes,
+        elapsed: 11,
+      },
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence timing attribute drift',
+    verifierSummaryIssues(driftedFailureEvidenceTimingAttrsSummary).includes(
+      'recorded failure evidence.persistedTimingAttributes.elapsed must match timings.elapsed',
+    ),
+    verifierSummaryIssues(driftedFailureEvidenceTimingAttrsSummary),
   );
   const missingFailureEvidenceDetailsSummary = failureSummary(
     'skill_output',
@@ -2731,6 +2772,10 @@ function runVerifierSelfTest() {
     ...failedSummary.failure.evidence,
     failurePhase: 'near_timeout_warning',
     failureReason: 'required near-timeout warning was not emitted',
+    persistedTimingAttributes: {
+      ...failedSummary.failure.evidence.persistedTimingAttributes,
+      failurePhase: 'near_timeout_warning',
+    },
   };
   const requiredWarningFailureSummary = {
     ...failedSummary,
