@@ -355,10 +355,12 @@ runs emit a single-line `VERIFIER_SUMMARY` JSON record with schema
 `anysentry.a3s_code_skill_verifier.summary.v1`, so production automation can
 assert `status`, failure phase, failure evidence, event IDs, warning isolation,
 warning event/bundle bindings, and timing fields without scraping human-readable
-log lines. Summary validation binds `verifier.commit`, `verifier.model`, and the
-target `apiBase`/`runId`/`agentId`/`sessionId` to the running verifier process,
-so automation can reject stale or cross-run summaries. The warning budget fields
-also bind to the running verifier config: `warning.required` must match
+log lines. Summary validation binds `verifier.commit`, `verifier.schemaVersion`,
+`verifier.model`, timeout settings, near-timeout warning settings, Node.js
+runtime version, and the target `apiBase`/`runId`/`agentId`/`sessionId` to the
+running verifier process, so automation can reject stale, cross-run, or
+cross-config summaries. The warning budget fields also bind to the running
+verifier config: `warning.required` must match
 `A3S_CODE_REQUIRE_NEAR_TIMEOUT_WARNING`, and `warning.thresholdMs` must match the
 computed timeout threshold. Passed summaries must identify
 `verifier.skill=anysentry-api`, report a positive `verifier.toolCalls`, and

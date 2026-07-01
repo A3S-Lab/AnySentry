@@ -73,7 +73,18 @@ function timingAttributes(timings = {}) {
 
 function sameAttributeValue(actual, expected) {
   if (typeof expected === 'number') return Number(actual) === expected;
+  if (typeof expected === 'boolean') return actual === expected || String(actual).toLowerCase() === String(expected);
   return actual === expected;
+}
+
+function verifierAttributeIssues(attributes) {
+  const issues = [];
+  for (const [key, expected] of Object.entries(verifierAttributes)) {
+    if (!sameAttributeValue(attributes?.[key], expected)) {
+      issues.push(key);
+    }
+  }
+  return issues;
 }
 
 function trueAttribute(value) {
@@ -273,9 +284,30 @@ function verifierSummaryIssues(summary) {
   if (isNonEmptyString(summary.verifier?.commit) && summary.verifier.commit !== verifierCommit) {
     issues.push('verifier.commit must match the running verifier commit');
   }
+  if (summary.verifier?.schemaVersion !== verifierAttributes['progressive.verifier.schema']) {
+    issues.push('verifier.schemaVersion must match the running verifier schema');
+  }
   if (!isNonEmptyString(summary.verifier?.model)) issues.push('verifier.model must be a non-empty string');
   if (isNonEmptyString(summary.verifier?.model) && summary.verifier.model !== model) {
     issues.push('verifier.model must match the running verifier model');
+  }
+  if (summary.verifier?.skillTimeoutMs !== skillTimeoutMs) {
+    issues.push('verifier.skillTimeoutMs must match the running verifier skill timeout');
+  }
+  if (summary.verifier?.sessionCloseTimeoutMs !== sessionCloseTimeoutMs) {
+    issues.push('verifier.sessionCloseTimeoutMs must match the running verifier session close timeout');
+  }
+  if (summary.verifier?.nearTimeoutRatio !== nearTimeoutThresholdRatio) {
+    issues.push('verifier.nearTimeoutRatio must match the running verifier near-timeout ratio');
+  }
+  if (summary.verifier?.nearTimeoutThresholdMs !== nearTimeoutThresholdMs) {
+    issues.push('verifier.nearTimeoutThresholdMs must match the running verifier near-timeout threshold');
+  }
+  if (summary.verifier?.requireNearTimeoutWarning !== requireNearTimeoutWarning) {
+    issues.push('verifier.requireNearTimeoutWarning must match the running verifier warning requirement');
+  }
+  if (summary.verifier?.node !== process.version) {
+    issues.push('verifier.node must match the running verifier Node.js version');
   }
   if (!isNonEmptyString(summary.target?.apiBase)) issues.push('target.apiBase must be a non-empty string');
   if (isNonEmptyString(summary.target?.apiBase) && summary.target.apiBase !== apiBase) {
@@ -508,7 +540,14 @@ function verifierSummaryBase(status) {
     verifier: {
       name: 'verify-a3s-code-skill-api',
       commit: verifierCommit,
+      schemaVersion: verifierAttributes['progressive.verifier.schema'],
       model,
+      skillTimeoutMs,
+      sessionCloseTimeoutMs,
+      nearTimeoutRatio: nearTimeoutThresholdRatio,
+      nearTimeoutThresholdMs,
+      requireNearTimeoutWarning,
+      node: process.version,
     },
     target: {
       apiBase,
@@ -535,9 +574,7 @@ function summaryValidationFailureSummary(summary, issues) {
     ...base,
     verifier: {
       ...originalVerifier,
-      name: 'verify-a3s-code-skill-api',
-      commit: verifierCommit,
-      model,
+      ...base.verifier,
     },
     target: {
       ...base.target,
@@ -693,12 +730,9 @@ async function recordFailureEvidence(reason, details, timings) {
       throw new Error(`failure evidence lost target identity: ${compact(failureEvent)}`);
     }
     const failureAttrs = failureEvent.attributes ?? {};
-    if (
-      failureAttrs['progressive.verifier.commit'] !== verifierCommit ||
-      Number(failureAttrs['progressive.verifier.skillTimeoutMs']) !== skillTimeoutMs ||
-      Number(failureAttrs['progressive.verifier.sessionCloseTimeoutMs']) !== sessionCloseTimeoutMs
-    ) {
-      throw new Error(`failure evidence lost verifier audit metadata: ${compact(failureEvent)}`);
+    const failureAuditIssues = verifierAttributeIssues(failureAttrs);
+    if (failureAuditIssues.length > 0) {
+      throw new Error(`failure evidence lost verifier audit metadata ${failureAuditIssues.join(', ')}: ${compact(failureEvent)}`);
     }
     for (const key of Object.keys(failureAttributes)) {
       if (!sameAttributeValue(failureAttrs[key], failureAttributes[key])) {
@@ -831,8 +865,9 @@ async function recordNearTimeoutWarning(event, bundle, timings) {
     throw new Error(`near-timeout warning lost target identity: ${compact(warningEvent)}`);
   }
   const warningAttrs = warningEvent.attributes ?? {};
+  const warningAuditIssues = verifierAttributeIssues(warningAttrs);
   if (
-    warningAttrs['progressive.verifier.commit'] !== verifierCommit ||
+    warningAuditIssues.length > 0 ||
     warningAttrs['progressive.warning'] !== 'near_timeout' ||
     warningAttrs['progressive.warning.eventId'] !== event.eventId ||
     warningAttrs['progressive.warning.bundleId'] !== bundle.bundleId ||
@@ -1065,6 +1100,44 @@ function runVerifierSelfTest() {
     'verifier self-test rejects summaries from a different commit',
     verifierSummaryIssues(mismatchedCommitSummary).includes('verifier.commit must match the running verifier commit'),
     verifierSummaryIssues(mismatchedCommitSummary),
+  );
+  const mismatchedVerifierSchemaSummary = {
+    ...passedSummary,
+    verifier: {
+      ...passedSummary.verifier,
+      schemaVersion: 'legacy.verifier.v0',
+    },
+  };
+  assert(
+    'verifier self-test rejects summaries from a different verifier schema',
+    verifierSummaryIssues(mismatchedVerifierSchemaSummary).includes('verifier.schemaVersion must match the running verifier schema'),
+    verifierSummaryIssues(mismatchedVerifierSchemaSummary),
+  );
+  const mismatchedVerifierTimeoutSummary = {
+    ...passedSummary,
+    verifier: {
+      ...passedSummary.verifier,
+      skillTimeoutMs: skillTimeoutMs + 1,
+    },
+  };
+  assert(
+    'verifier self-test rejects summaries from a different verifier timeout config',
+    verifierSummaryIssues(mismatchedVerifierTimeoutSummary).includes(
+      'verifier.skillTimeoutMs must match the running verifier skill timeout',
+    ),
+    verifierSummaryIssues(mismatchedVerifierTimeoutSummary),
+  );
+  const mismatchedVerifierNodeSummary = {
+    ...passedSummary,
+    verifier: {
+      ...passedSummary.verifier,
+      node: 'v0.0.0',
+    },
+  };
+  assert(
+    'verifier self-test rejects summaries from a different Node.js runtime',
+    verifierSummaryIssues(mismatchedVerifierNodeSummary).includes('verifier.node must match the running verifier Node.js version'),
+    verifierSummaryIssues(mismatchedVerifierNodeSummary),
   );
   const mismatchedTargetSummary = {
     ...passedSummary,
@@ -2437,14 +2510,13 @@ async function main() {
       'stored event lost a3s-code Skill evidence markers',
       event,
     );
+    const eventAuditIssues = verifierAttributeIssues(event?.attributes);
     await requireVerification(
       'stored event carries verifier audit metadata',
-      event?.attributes?.['progressive.verifier.commit'] === verifierCommit &&
-        Number(event?.attributes?.['progressive.verifier.skillTimeoutMs']) === skillTimeoutMs &&
-        Number(event?.attributes?.['progressive.verifier.sessionCloseTimeoutMs']) === sessionCloseTimeoutMs,
+      eventAuditIssues.length === 0,
       'event_contract',
       'stored event lost verifier audit metadata',
-      event,
+      { missingOrMismatchedVerifierAttributes: eventAuditIssues, event },
     );
     await requireVerification(
       'stored event carries inner API timing metadata',
@@ -2528,22 +2600,13 @@ async function main() {
       pass('near-timeout warning was not emitted because the Skill run stayed below threshold');
     }
 
+    const summaryBase = verifierSummaryBase(process.exitCode ? 'failed' : 'passed');
     printVerifierSummary({
-      schemaVersion: verifierSummarySchema,
-      status: process.exitCode ? 'failed' : 'passed',
+      ...summaryBase,
       verifier: {
-        name: 'verify-a3s-code-skill-api',
-        commit: verifierCommit,
-        model,
+        ...summaryBase.verifier,
         skill: metadata.skill_name,
         toolCalls: Number(metadata.tool_calls ?? 0),
-      },
-      target: {
-        apiBase,
-        workspacePath,
-        runId,
-        agentId,
-        sessionId,
       },
       evidence: {
         eventId: event.eventId,
