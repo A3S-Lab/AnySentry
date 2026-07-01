@@ -148,6 +148,15 @@ function trueAttr(value: unknown): boolean {
   return value === true || (typeof value === 'string' && value.toLowerCase() === 'true');
 }
 
+function severityAttr(value: unknown): Severity | undefined {
+  return value === 'critical' || value === 'high' || value === 'medium' || value === 'low' || value === 'info' ? value : undefined;
+}
+
+function stringAttr(value: unknown): string | undefined {
+  const text = typeof value === 'string' ? value.trim() : '';
+  return text || undefined;
+}
+
 type JudgedEventBase = Omit<
   JudgedEvent,
   'verdict' | 'tier' | 'severity' | 'reason' | 'actionKind' | 'actionTarget' | 'riskCategory' | 'riskName' | 'riskType' | 'riskScore'
@@ -162,6 +171,15 @@ function producerReportedFinding(base: JudgedEventBase): {
   if (base.eventKind !== 'SecurityAction' || base.source !== 'api') return null;
   const kind = String(base.attributes.kind ?? '').trim().toLowerCase();
   const status = String(base.attributes.status ?? '').trim().toLowerCase();
+  if (trueAttr(base.attributes['progressive.guard.fallback'])) {
+    const riskCategory = stringAttr(base.attributes['progressive.guard.riskCategory']) ?? 'runtime_guard_fallback';
+    return {
+      severity: severityAttr(base.attributes['progressive.guard.severity']) ?? 'medium',
+      reason: stringAttr(base.attributes['progressive.guard.reason']) ?? 'runtime guard fallback reported risk',
+      riskCategory,
+      riskName: stringAttr(base.attributes['progressive.guard.riskName']) ?? 'Runtime guard fallback',
+    };
+  }
   if (trueAttr(base.attributes['progressive.failure'])) {
     return {
       severity: 'medium',

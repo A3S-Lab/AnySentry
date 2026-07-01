@@ -295,6 +295,7 @@ async function verifyRuntimeContract() {
         workspacePath,
         agentId,
         sessionId,
+        runId,
         toolName: 'bash',
         command: ['bash', '-lc', 'curl http://169.254.169.254/latest/meta-data'],
       },
@@ -308,8 +309,64 @@ async function verifyRuntimeContract() {
       guarded?.operation === 'assessRuntimeAction' &&
       guarded?.eventId &&
       ['warn', 'require_approval', 'block'].includes(guarded?.policyAction) &&
-      guarded?.recommendedAction !== 'continue',
+      guarded?.recommendedAction !== 'continue' &&
+      guarded?.verdict !== 'allow',
     guarded,
+  );
+  const guardedEvidence = await eventually('runtime guard fallback finding evidence', async () => {
+    const list = await request('/events/list', {
+      method: 'POST',
+      body: JSON.stringify({ timeType: 'last_30d', runId, agentId, limit: 20 }),
+    });
+    return list.items?.find((item) => item.eventId === guarded.eventId);
+  });
+  assert(
+    'runtime guard decision points at actionable evidence',
+    guardedEvidence?.verdict && guardedEvidence.verdict !== 'allow',
+    guardedEvidence,
+  );
+
+  const fallbackOnly = await request('/capabilities', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'execute',
+      module: 'security-center',
+      operation: 'assessRuntimeAction',
+      params: {
+        autonomy: 'guarded',
+        stage: 'tool',
+        workspacePath,
+        agentId,
+        sessionId,
+        runId,
+        toolName: 'cat',
+        command: ['cat', '/workspace/.kube/config'],
+      },
+    }),
+  });
+  assert(
+    'runtime guard fallback blocks credential-path tool actions',
+    fallbackOnly?.schemaVersion === 'anysentry.progressive.runtime_guard.result.v1' &&
+      fallbackOnly?.eventId &&
+      ['warn', 'require_approval', 'block'].includes(fallbackOnly?.policyAction) &&
+      fallbackOnly?.recommendedAction !== 'continue' &&
+      fallbackOnly?.verdict !== 'allow',
+    fallbackOnly,
+  );
+  const fallbackFinding = await eventually('runtime guard fallback finding evidence', async () => {
+    const list = await request('/events/list', {
+      method: 'POST',
+      body: JSON.stringify({ timeType: 'last_30d', runId, agentId, limit: 30 }),
+    });
+    return list.items?.find((item) => item.eventId === fallbackOnly.eventId && item.eventKind === 'SecurityAction');
+  });
+  assert(
+    'runtime guard fallback persists actionable SecurityFinding evidence',
+    fallbackFinding?.verdict &&
+      fallbackFinding.verdict !== 'allow' &&
+      fallbackFinding?.attributes?.['progressive.guard.fallback'] === true &&
+      fallbackFinding?.attributes?.['progressive.guard.actionEventId'],
+    fallbackFinding,
   );
 
   const aliasRunId = `${runId}-alias`;

@@ -2093,7 +2093,7 @@ const RUNTIME_GUARD_FALLBACK_PATTERNS: Array<{ pattern: RegExp; risk: RuntimeGua
     },
   },
   {
-    pattern: /(?:^|\s)(?:\/etc\/shadow|\/etc\/sudoers|\.aws\/credentials|\.ssh\/id_(?:rsa|ed25519)|\.kube\/config)(?:\s|$)/iu,
+    pattern: /(?:^|\s)(?:\/etc\/shadow|\/etc\/sudoers|[^\s]*\.aws\/credentials|[^\s]*\.ssh\/id_(?:rsa|ed25519)|[^\s]*\.kube\/config)(?:\s|$)/iu,
     risk: {
       policyAction: 'block',
       severity: 'high',
@@ -2168,6 +2168,43 @@ function securityCapabilityPolicyAction(
   }
   const fallbackAction = fallbackRiskPolicyAction(autonomy, fallbackRisk);
   return fallbackAction ? strongestPolicyAction(action, fallbackAction) : action;
+}
+
+function securityRuntimeGuardFallbackEvent(
+  body: T.SecurityRuntimeGuardParams,
+  event: T.UniversalIngestEvent,
+  risk: RuntimeGuardFallbackRisk,
+  autonomy: T.SecurityCapabilityAutonomy,
+  stage: T.SecurityCapabilityStage,
+  actionEventId: string | undefined,
+): T.UniversalIngestEvent {
+  return {
+    workspacePath: cleanString(body.workspacePath, 500),
+    agentId: cleanString(body.agentId, 240),
+    sessionId: cleanString(body.sessionId, 240),
+    userId: cleanString(body.userId, 240),
+    traceId: cleanString(body.traceId, 240),
+    spanId: cleanString(body.spanId, 240),
+    parentSpanId: cleanString(body.parentSpanId, 240),
+    runId: cleanString(body.runId, 240),
+    taskId: cleanString(body.taskId, 240),
+    collectorId: cleanString(body.collectorId, 180),
+    source: 'api',
+    kind: 'SecurityFinding',
+    status: 'failed',
+    subject: `runtime guard fallback: ${risk.reason}`,
+    attributes: {
+      ...securityCapabilityAttributes(body, autonomy, stage),
+      'progressive.guard.fallback': true,
+      'progressive.guard.reason': risk.reason,
+      'progressive.guard.riskCategory': risk.riskCategory,
+      'progressive.guard.riskName': 'Runtime guard fallback',
+      'progressive.guard.severity': risk.severity,
+      'progressive.guard.policyAction': risk.policyAction,
+      ...(actionEventId ? { 'progressive.guard.actionEventId': actionEventId } : {}),
+    },
+    rawPreview: cleanString(JSON.stringify({ ...body, token: undefined, event }), 1800),
+  };
 }
 
 function securityCapabilityRecommendedAction(policyAction: T.SecurityCapabilityPolicyAction): T.SecurityRuntimeGuardDecision['recommendedAction'] {
@@ -3986,7 +4023,34 @@ export class SecurityMonitoringController {
     );
     const item = result.items[0];
     const fallbackRisk = securityRuntimeGuardFallbackRisk(body, event);
+    const basePolicyAction = securityCapabilityPolicyAction(autonomy, item);
     const policyAction = securityCapabilityPolicyAction(autonomy, item, fallbackRisk);
+    let evidenceItem = item;
+    if (fallbackRisk && policyActionRank(policyAction) > policyActionRank(basePolicyAction)) {
+      const finding = this.ingestUniversalEvents(
+        {
+          workspacePath: body.workspacePath,
+          agentId: body.agentId,
+          sessionId: body.sessionId,
+          userId: body.userId,
+          traceId: body.traceId,
+          spanId: body.spanId,
+          parentSpanId: body.parentSpanId,
+          runId: body.runId,
+          taskId: body.taskId,
+          sourceName: body.sourceName ?? 'progressive-security-runtime-client',
+          sourceType: 'custom',
+          sourceId: body.sourceId,
+          token: body.token,
+          collectorId: body.collectorId,
+          events: [securityRuntimeGuardFallbackEvent(body, event, fallbackRisk, autonomy, stage, item?.eventId)],
+        },
+        headers,
+        'custom',
+        'capabilities:security-center.assessRuntimeAction.fallback',
+      );
+      evidenceItem = finding.items.find((candidate) => candidate.accepted) ?? evidenceItem;
+    }
     const decision: T.SecurityRuntimeGuardDecision = {
       schemaVersion: 'anysentry.progressive.runtime_guard.result.v1',
       module: SECURITY_PROGRESSIVE_MODULE,
@@ -3998,18 +4062,18 @@ export class SecurityMonitoringController {
       recommendedAction: securityCapabilityRecommendedAction(policyAction),
       accepted: result.accepted,
       sourceId: result.sourceId,
-      eventId: item?.eventId,
-      traceId: item?.traceId,
-      runId: item?.runId,
-      verdict: item?.verdict,
-      tier: item?.tier,
-      severity: fallbackRisk?.severity ?? item?.severity,
-      riskCategory: fallbackRisk?.riskCategory ?? item?.riskCategory,
-      reason: fallbackRisk?.reason ?? item?.reason,
+      eventId: evidenceItem?.eventId,
+      traceId: evidenceItem?.traceId ?? item?.traceId,
+      runId: evidenceItem?.runId ?? item?.runId,
+      verdict: evidenceItem?.verdict ?? item?.verdict,
+      tier: evidenceItem?.tier ?? item?.tier,
+      severity: fallbackRisk?.severity ?? evidenceItem?.severity ?? item?.severity,
+      riskCategory: fallbackRisk?.riskCategory ?? evidenceItem?.riskCategory ?? item?.riskCategory,
+      reason: fallbackRisk?.reason ?? evidenceItem?.reason ?? item?.reason,
       evidence: {
-        eventId: item?.eventId,
-        eventsHref: item?.eventId ? `/events?eventId=${encodeURIComponent(item.eventId)}` : undefined,
-        bundleHint: item?.eventId ? { eventId: item.eventId } : undefined,
+        eventId: evidenceItem?.eventId,
+        eventsHref: evidenceItem?.eventId ? `/events?eventId=${encodeURIComponent(evidenceItem.eventId)}` : undefined,
+        bundleHint: evidenceItem?.eventId ? { eventId: evidenceItem.eventId } : undefined,
       },
     };
     return decision;

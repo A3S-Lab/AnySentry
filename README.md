@@ -339,6 +339,9 @@ the canonical AnySentry kinds `Egress`, `FileAccess`, and `SecurityAction`.
 Producer-reported `SecurityFinding` and `progressive.failure=true` events are
 stored as non-allow findings, so failed soak attempts show up in risk and action
 flows instead of looking like benign telemetry.
+When runtime guard fallback logic upgrades an otherwise-benign tool decision, it
+also records an actionable `SecurityFinding` that links back to the original
+action event, so the block/approval decision and the evidence stream stay aligned.
 `pnpm verify:progressive-api:local` and the production progressive verifier both
 regression-check that alias normalization and obvious high-risk runtime guard
 actions return a non-allow policy decision. Keep production probes on this single
