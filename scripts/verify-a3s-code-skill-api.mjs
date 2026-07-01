@@ -18,6 +18,7 @@ const runId = process.env.ANYSENTRY_A3S_CODE_TEST_RUN_ID ?? safeProbeId('a3s-cod
 const agentId = process.env.ANYSENTRY_A3S_CODE_TEST_AGENT_ID ?? 'a3s-code-skill-itest';
 const sessionId = `${runId}-session`;
 const workspacePath = 'repo://anysentry/a3s-code-skill-itest';
+const verifierSummarySchema = 'anysentry.a3s_code_skill_verifier.summary.v1';
 
 function positiveIntEnv(name, fallback, max) {
   const parsed = Number(process.env[name]);
@@ -101,6 +102,11 @@ function pass(message) {
 function assert(message, condition, details) {
   if (condition) pass(message);
   else fail(message, details);
+}
+
+function printVerifierSummary(summary) {
+  console.log(`VERIFIER_SUMMARY ${JSON.stringify(summary)}`);
+  console.log(JSON.stringify(summary, null, 2));
 }
 
 function compact(value, limit = 2400) {
@@ -720,6 +726,7 @@ async function main() {
       bundle,
     );
     const warningEvent = await recordNearTimeoutWarning(event, bundle, timings);
+    let warningRequirementFailure;
     if (warningEvent) pass('near-timeout success warning evidence is queryable and non-blocking');
     else if (requireNearTimeoutWarning) {
       const details = {
@@ -727,6 +734,7 @@ async function main() {
         thresholdMs: nearTimeoutThresholdMs,
         nearTimeoutRatio: nearTimeoutThresholdRatio,
       };
+      warningRequirementFailure = details;
       timings.elapsed = durationMs(verifierStartedAt);
       await recordFailureEvidence('required near-timeout warning was not emitted', details, {
         ...timings,
@@ -737,28 +745,39 @@ async function main() {
       pass('near-timeout warning was not emitted because the Skill run stayed below threshold');
     }
 
-    console.log(
-      JSON.stringify(
-        {
-          skill: metadata.skill_name,
-          model,
-          runId,
-          agentId,
-          eventId: event.eventId,
-          bundleId: bundle.bundleId,
-          warningEventId: warningEvent?.eventId,
-          warningIsolation: warningEvent?.verifierIsolation,
-          warningRequired: requireNearTimeoutWarning,
-          warningTriggered: Boolean(warningEvent),
-          warningThresholdMs: nearTimeoutThresholdMs,
-          verdict: event.verdict,
-          toolCalls: metadata.tool_calls,
-          timings,
-        },
-        null,
-        2,
-      ),
-    );
+    printVerifierSummary({
+      schemaVersion: verifierSummarySchema,
+      status: process.exitCode ? 'failed' : 'passed',
+      verifier: {
+        name: 'verify-a3s-code-skill-api',
+        commit: verifierCommit,
+        model,
+        skill: metadata.skill_name,
+        toolCalls: Number(metadata.tool_calls ?? 0),
+      },
+      target: {
+        apiBase,
+        runId,
+        agentId,
+        sessionId,
+      },
+      evidence: {
+        eventId: event.eventId,
+        eventKind: event.eventKind,
+        verdict: event.verdict,
+        bundleId: bundle.bundleId,
+        bundleEventCount: bundle.summary?.eventCount,
+      },
+      warning: {
+        required: requireNearTimeoutWarning,
+        triggered: Boolean(warningEvent),
+        thresholdMs: nearTimeoutThresholdMs,
+        eventId: warningEvent?.eventId,
+        isolation: warningEvent?.verifierIsolation,
+        failure: warningRequirementFailure,
+      },
+      timings,
+    });
   } finally {
     await closeSession('verification completion');
   }
