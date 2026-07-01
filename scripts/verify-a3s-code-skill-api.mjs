@@ -295,7 +295,29 @@ async function recordNearTimeoutWarning(event, bundle, timings) {
   ) {
     throw new Error(`near-timeout warning lost audit metadata: ${compact(warningEvent)}`);
   }
-  return warningEvent;
+  const warningRows = await request('/events/list', {
+    method: 'POST',
+    body: JSON.stringify({ timeType: 'last_30d', runId, agentId, limit: 50 }),
+  });
+  const warningItems =
+    warningRows.items?.filter(
+      (item) => item.runId === runId && item.agentId === agentId && item.attributes?.['progressive.warning'] === 'near_timeout',
+    ) ?? [];
+  const llmPollution = warningItems.filter((item) => item.eventKind === 'LlmCall' || item.eventCategory === 'llm');
+  if (llmPollution.length > 0) {
+    throw new Error(`near-timeout warning polluted LLM metrics: ${compact(llmPollution)}`);
+  }
+  const nonRuntimeWarnings = warningItems.filter((item) => item.eventKind !== 'RuntimeEvent' || item.eventCategory !== 'runtime');
+  if (nonRuntimeWarnings.length > 0) {
+    throw new Error(`near-timeout warning rows must stay runtime evidence: ${compact(nonRuntimeWarnings)}`);
+  }
+  return {
+    ...warningEvent,
+    verifierIsolation: {
+      warningRows: warningItems.length,
+      llmPollutionCount: llmPollution.length,
+    },
+  };
 }
 
 async function loadA3sCode() {
@@ -698,6 +720,7 @@ async function main() {
           eventId: event.eventId,
           bundleId: bundle.bundleId,
           warningEventId: warningEvent?.eventId,
+          warningIsolation: warningEvent?.verifierIsolation,
           verdict: event.verdict,
           toolCalls: metadata.tool_calls,
           timings,

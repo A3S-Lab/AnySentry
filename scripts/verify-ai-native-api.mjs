@@ -475,6 +475,13 @@ async function verifyRuntimeContract() {
     aliasEvents,
   );
   assert(
+    'runtime verifier warnings do not pollute LLM metrics',
+    aliasEvents
+      .filter((event) => event.attributes?.['progressive.warning'] === 'near_timeout')
+      .every((event) => event.eventKind === 'RuntimeEvent' && event.eventCategory === 'runtime'),
+    aliasEvents,
+  );
+  assert(
     'runtime negative-path aliases keep non-allow verdict coverage',
     aliasEvents.some((event) => ['Egress', 'FileAccess'].includes(event.eventKind) && event.verdict && event.verdict !== 'allow') &&
       aliasEvents.some((event) => event.eventKind === 'SecurityAction' && event.verdict && event.verdict !== 'allow'),
