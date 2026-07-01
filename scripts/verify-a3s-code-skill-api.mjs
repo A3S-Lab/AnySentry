@@ -68,6 +68,11 @@ const skillOutputTimingFields = [
 const eventInnerTimingFields = ['innerHealthzMs', 'innerListMs', 'innerDescribeRecordMs', 'innerPreRecordMs'];
 const expectedProgressiveFlow = 'healthz,list,describe,execute,events-list,build-evidence-bundle';
 const expectedDescribedOperation = 'recordSecurityEvents';
+const skillOutputPreflightBindings = [
+  { field: 'healthOk', attribute: 'progressive.verifier.healthOk', expected: true },
+  { field: 'listed', attribute: 'progressive.verifier.listed', expected: true },
+  { field: 'described', attribute: 'progressive.verifier.describedOperation', expected: expectedDescribedOperation },
+];
 const nearTimeoutWarningReason = 'a3s-code Skill verifier completed close to its timeout budget';
 
 function durationMs(startedAt) {
@@ -90,6 +95,10 @@ function sameAttributeValue(actual, expected) {
   if (typeof expected === 'number') return Number(actual) === expected;
   if (typeof expected === 'boolean') return actual === expected || String(actual).toLowerCase() === String(expected);
   return actual === expected;
+}
+
+function expectedValueText(value) {
+  return String(value);
 }
 
 function verifierAttributeIssues(attributes) {
@@ -258,6 +267,34 @@ function skillEventAttributeIssues(attributes) {
   return issues;
 }
 
+function skillOutputPreflightIssues(skillOutput, prefix) {
+  const issues = [];
+  for (const { field, expected } of skillOutputPreflightBindings) {
+    if (skillOutput?.[field] !== expected) {
+      issues.push(`${prefix}.${field} must be ${expectedValueText(expected)}`);
+    }
+  }
+  return issues;
+}
+
+function eventPreflightAttributeIssues(attributes, skillOutput) {
+  const issues = [];
+  if (!isRecord(attributes)) {
+    return ['event attributes must be an object'];
+  }
+  if (!isRecord(skillOutput)) {
+    return ['skillOutput must be an object'];
+  }
+  for (const { field, attribute, expected } of skillOutputPreflightBindings) {
+    if (!sameAttributeValue(attributes[attribute], expected)) {
+      issues.push(`event attribute ${attribute} must be ${expectedValueText(expected)}`);
+    } else if (!sameAttributeValue(attributes[attribute], skillOutput[field])) {
+      issues.push(`event attribute ${attribute} must match skillOutput.${field}`);
+    }
+  }
+  return issues;
+}
+
 function skillOutputEvidenceIssues(skillOutput) {
   const issues = [];
   if (!isRecord(skillOutput)) {
@@ -281,15 +318,7 @@ function skillOutputEvidenceIssues(skillOutput) {
   if (skillOutput.sessionId !== sessionId) {
     issues.push('skillOutput.sessionId must match the verifier sessionId');
   }
-  if (skillOutput.healthOk !== true) {
-    issues.push('skillOutput.healthOk must be true');
-  }
-  if (skillOutput.listed !== true) {
-    issues.push('skillOutput.listed must be true');
-  }
-  if (skillOutput.described !== expectedDescribedOperation) {
-    issues.push(`skillOutput.described must be ${expectedDescribedOperation}`);
-  }
+  issues.push(...skillOutputPreflightIssues(skillOutput, 'skillOutput'));
   if (skillOutput.eventKind !== 'LlmCall') {
     issues.push('skillOutput.eventKind must be LlmCall');
   }
@@ -511,15 +540,7 @@ function successfulEvidenceIssues(summary, context) {
   if (!isNonEmptyString(summary.evidence?.skillOutput?.bundleId)) {
     issues.push(`${context} evidence.skillOutput.bundleId must be a non-empty string`);
   }
-  if (summary.evidence?.skillOutput?.healthOk !== true) {
-    issues.push(`${context} evidence.skillOutput.healthOk must be true`);
-  }
-  if (summary.evidence?.skillOutput?.listed !== true) {
-    issues.push(`${context} evidence.skillOutput.listed must be true`);
-  }
-  if (summary.evidence?.skillOutput?.described !== expectedDescribedOperation) {
-    issues.push(`${context} evidence.skillOutput.described must be ${expectedDescribedOperation}`);
-  }
+  issues.push(...skillOutputPreflightIssues(summary.evidence?.skillOutput, `${context} evidence.skillOutput`));
   if (summary.evidence?.skillOutput?.bundleSchemaVersion !== 'anysentry.evidence_bundle.v1') {
     issues.push(`${context} evidence.skillOutput.bundleSchemaVersion must be anysentry.evidence_bundle.v1`);
   }
@@ -1450,6 +1471,9 @@ function runVerifierSelfTest() {
     'progressive.skill': 'anysentry-api',
     'progressive.flow': expectedProgressiveFlow,
     'progressive.model': model,
+    'progressive.verifier.healthOk': true,
+    'progressive.verifier.listed': true,
+    'progressive.verifier.describedOperation': expectedDescribedOperation,
   };
   assert(
     'verifier self-test accepts stored event Skill provenance markers',
@@ -1466,6 +1490,33 @@ function runVerifierSelfTest() {
       'event attribute progressive.flow must match the expected progressive flow',
     ),
     skillEventAttributeIssues(driftedSkillEventFlowAttributes),
+  );
+  assert(
+    'verifier self-test accepts stored event Skill preflight attributes bound to the Skill output',
+    eventPreflightAttributeIssues(passedSkillEventAttributes, passedSummary.evidence.skillOutput).length === 0,
+    eventPreflightAttributeIssues(passedSkillEventAttributes, passedSummary.evidence.skillOutput),
+  );
+  const driftedPreflightDescribeAttributes = {
+    ...passedSkillEventAttributes,
+    'progressive.verifier.describedOperation': 'buildEvidenceBundle',
+  };
+  assert(
+    'verifier self-test rejects stored event preflight describe drift',
+    eventPreflightAttributeIssues(driftedPreflightDescribeAttributes, passedSummary.evidence.skillOutput).includes(
+      `event attribute progressive.verifier.describedOperation must be ${expectedDescribedOperation}`,
+    ),
+    eventPreflightAttributeIssues(driftedPreflightDescribeAttributes, passedSummary.evidence.skillOutput),
+  );
+  const driftedPreflightHealthAttributes = {
+    ...passedSkillEventAttributes,
+    'progressive.verifier.healthOk': false,
+  };
+  assert(
+    'verifier self-test rejects stored event preflight health drift',
+    eventPreflightAttributeIssues(driftedPreflightHealthAttributes, passedSummary.evidence.skillOutput).includes(
+      'event attribute progressive.verifier.healthOk must be true',
+    ),
+    eventPreflightAttributeIssues(driftedPreflightHealthAttributes, passedSummary.evidence.skillOutput),
   );
 
   const passedEventTimingAttributes = Object.fromEntries(
@@ -2946,6 +2997,14 @@ function runVerifierSelfTest() {
     missingSourceEventTimingAttributes.length === 0,
     missingSourceEventTimingAttributes,
   );
+  const missingSourceEventPreflightAttributes = skillOutputPreflightBindings
+    .filter(({ attribute }) => !source.includes(attribute))
+    .map(({ attribute }) => attribute);
+  assert(
+    'verifier self-test keeps all stored event preflight attributes in the inner verifier source',
+    missingSourceEventPreflightAttributes.length === 0,
+    missingSourceEventPreflightAttributes,
+  );
   const skillCommand = buildSkillCommand();
   const expectedIdentityJson = JSON.stringify({ runId, agentId, sessionId, workspacePath });
   assert(
@@ -3272,6 +3331,14 @@ async function main() {
       'event_contract',
       'stored event lost or drifted a3s-code Skill evidence markers',
       { skillEventIssues, event },
+    );
+    const eventPreflightIssues = eventPreflightAttributeIssues(event?.attributes, skillOutput);
+    await requireVerification(
+      'stored event binds Skill preflight proof attributes to the Skill output',
+      eventPreflightIssues.length === 0,
+      'event_contract',
+      'stored event lost or drifted Skill preflight proof attributes',
+      { eventPreflightIssues, event, skillOutput },
     );
     const eventAuditIssues = verifierAttributeIssues(event?.attributes);
     await requireVerification(

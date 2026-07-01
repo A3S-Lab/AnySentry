@@ -389,8 +389,12 @@ proofs, event, workspace, run, agent, session, bundle IDs, and inner API timing
 fields under `evidence.skillOutput`, and the verifier fails if those proofs do
 not show `healthOk=true`, `listed=true`, and `described=recordSecurityEvents` or
 if the IDs do not match the target identity, rows, Evidence Bundle, or timing
-contract queried by the outer runtime. The stored success evidence row
-also exposes `evidence.workspacePath`, `evidence.runId`, `evidence.agentId`, and
+contract queried by the outer runtime. The stored success evidence row persists
+the same preflight proof attributes
+(`progressive.verifier.healthOk`, `progressive.verifier.listed`, and
+`progressive.verifier.describedOperation`), and the outer verifier rejects rows
+whose attributes drift from the Skill output. It also exposes
+`evidence.workspacePath`, `evidence.runId`, `evidence.agentId`, and
 `evidence.sessionId`, which must match the target identity. Passed summary validation also
 requires both the stored event and the Skill output to remain
 `LlmCall`/`llm`/`allow`, with matching event categories and
