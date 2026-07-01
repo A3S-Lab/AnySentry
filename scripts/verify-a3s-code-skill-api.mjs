@@ -796,6 +796,7 @@ async function main() {
     );
     const warningEvent = await recordNearTimeoutWarning(event, bundle, timings);
     let warningRequirementFailure;
+    let summaryFailure;
     if (warningEvent) pass('near-timeout success warning evidence is queryable and non-blocking');
     else if (requireNearTimeoutWarning) {
       const details = {
@@ -812,6 +813,12 @@ async function main() {
       };
       const failureEvidence = await recordFailureEvidence(reason, details, failureTimings);
       warningRequirementFailure = { ...details, evidence: failureEvidence };
+      summaryFailure = {
+        phase: 'near_timeout_warning',
+        reason,
+        details,
+        evidence: failureEvidence,
+      };
       fail('required near-timeout warning evidence is present when requested', details);
     } else {
       pass('near-timeout warning was not emitted because the Skill run stayed below threshold');
@@ -848,6 +855,7 @@ async function main() {
         isolation: warningEvent?.verifierIsolation,
         failure: warningRequirementFailure,
       },
+      ...(summaryFailure ? { failure: summaryFailure } : {}),
       timings,
     });
   } finally {
