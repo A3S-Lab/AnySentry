@@ -166,6 +166,14 @@ if (
   bundle?.schemaVersion !== 'anysentry.evidence_bundle.v1' ||
   !bundle.events?.some((item) => item.eventId === eventId) ||
   bundle.primary?.event?.eventId !== eventId ||
+  bundle.primary?.event?.workspacePath !== workspacePath ||
+  bundle.primary?.event?.runId !== runId ||
+  bundle.primary?.event?.agentId !== agentId ||
+  bundle.primary?.event?.sessionId !== sessionId ||
+  bundle.primary?.event?.traceId !== event.traceId ||
+  bundle.primary?.event?.eventKind !== event.eventKind ||
+  bundle.primary?.event?.eventCategory !== event.eventCategory ||
+  bundle.primary?.event?.verdict !== (event.verdict ?? recorded.items?.[0]?.verdict) ||
   bundle.scope?.primaryType !== 'event' ||
   bundle.scope?.primaryId !== eventId ||
   bundle.scope?.eventId !== eventId ||
@@ -194,6 +202,14 @@ console.log(
     bundleEventCount: bundle.summary?.eventCount,
     bundleListedEventCount: Array.isArray(bundle.events) ? bundle.events.length : undefined,
     bundlePrimaryEventId: bundle.primary?.event?.eventId,
+    bundlePrimaryEventWorkspacePath: bundle.primary?.event?.workspacePath,
+    bundlePrimaryEventRunId: bundle.primary?.event?.runId,
+    bundlePrimaryEventAgentId: bundle.primary?.event?.agentId,
+    bundlePrimaryEventSessionId: bundle.primary?.event?.sessionId,
+    bundlePrimaryEventTraceId: bundle.primary?.event?.traceId,
+    bundlePrimaryEventKind: bundle.primary?.event?.eventKind,
+    bundlePrimaryEventCategory: bundle.primary?.event?.eventCategory,
+    bundlePrimaryEventVerdict: bundle.primary?.event?.verdict,
     bundleScopePrimaryType: bundle.scope?.primaryType,
     bundleScopePrimaryId: bundle.scope?.primaryId,
     bundleScopeEventId: bundle.scope?.eventId,
