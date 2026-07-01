@@ -442,8 +442,10 @@ bundle event fields (`bundlePrimaryEventId`, `bundlePrimaryEventSourceId`,
 `bundlePrimaryEventVerdict`). Both field groups must match the stored event
 payload in the outer evidence and the Skill output, so summary-only automation
 can detect bundles whose listed member or primary event payload drifted even
-when the event ID is still present. Bundle scope fields are also exposed and
-must bind to the same
+when the event ID is still present. The verifier projects the nested Skill
+output summary from the same listed/primary field contract, so source identity
+cannot disappear while the top-level evidence still reports it. Bundle scope
+fields are also exposed and must bind to the same
 event/workspace/run/agent/session identity in both the outer evidence and the
 Skill output, so automation can reject bundles built with a stale or cross-run
 scope. Bundle timeline fields (`bundleTimelineContainsEvent`,

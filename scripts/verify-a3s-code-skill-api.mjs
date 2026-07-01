@@ -123,6 +123,48 @@ const bundleListedEventFieldBindings = bundleEventPayloadBindings.map(([suffix, 
 ]);
 const bundlePrimaryEventSummaryFields = bundlePrimaryEventFieldBindings.map(([field]) => field);
 const bundleListedEventSummaryFields = bundleListedEventFieldBindings.map(([field]) => field);
+const bundleScopeSummaryFields = [
+  'bundleScopePrimaryType',
+  'bundleScopePrimaryId',
+  'bundleScopeEventId',
+  'bundleScopeWorkspacePath',
+  'bundleScopeRunId',
+  'bundleScopeAgentId',
+  'bundleScopeSessionId',
+];
+const bundleTimelineSummaryFields = [
+  'bundleTimelineContainsEvent',
+  'bundleTimelineEventCount',
+  'bundleTimelineTraceId',
+  'bundleTimelineRunId',
+  'bundleTimelineSessionId',
+];
+const skillOutputSummaryFields = [
+  'eventId',
+  'workspacePath',
+  'runId',
+  'agentId',
+  'sessionId',
+  'traceId',
+  'sourceId',
+  'eventKind',
+  'eventCategory',
+  'verdict',
+  'bundleId',
+  'healthOk',
+  'listed',
+  'described',
+  'bundleSchemaVersion',
+  'bundleContainsEvent',
+  'bundleEventCount',
+  'bundleListedEventCount',
+  ...bundleListedEventSummaryFields,
+  ...bundlePrimaryEventSummaryFields,
+  ...bundleScopeSummaryFields,
+  ...bundleTimelineSummaryFields,
+  'queriedBack',
+  'timings',
+];
 const recordedFailureEvidenceFields = [
   'eventId',
   'failurePhase',
@@ -399,6 +441,15 @@ function bundleTimelineIssues(evidence, expected, context, expectedContext) {
     issues.push(`${context}.bundleTimelineSessionId must match ${expectedContext}.sessionId`);
   }
   return issues;
+}
+
+function pickEvidenceFields(record, fields) {
+  const source = isRecord(record) ? record : {};
+  return Object.fromEntries(fields.map((field) => [field, source[field]]));
+}
+
+function skillOutputSummaryEvidence(skillOutput) {
+  return pickEvidenceFields(skillOutput, skillOutputSummaryFields);
 }
 
 function primaryEventIdIssues(primaryEventId, expectedEventId, primaryField, expectedField) {
@@ -1184,26 +1235,12 @@ function successfulEvidenceIssues(summary, context) {
       issues.push(`${context} ${field} must match skillOutput.${field}`);
     }
   }
-  for (const field of [
-    'bundleScopePrimaryType',
-    'bundleScopePrimaryId',
-    'bundleScopeEventId',
-    'bundleScopeWorkspacePath',
-    'bundleScopeRunId',
-    'bundleScopeAgentId',
-    'bundleScopeSessionId',
-  ]) {
+  for (const field of bundleScopeSummaryFields) {
     if (summary.evidence?.[field] !== summary.evidence?.skillOutput?.[field]) {
       issues.push(`${context} ${field} must match skillOutput.${field}`);
     }
   }
-  for (const field of [
-    'bundleTimelineContainsEvent',
-    'bundleTimelineEventCount',
-    'bundleTimelineTraceId',
-    'bundleTimelineRunId',
-    'bundleTimelineSessionId',
-  ]) {
+  for (const field of bundleTimelineSummaryFields) {
     if (summary.evidence?.[field] !== summary.evidence?.skillOutput?.[field]) {
       issues.push(`${context} ${field} must match skillOutput.${field}`);
     }
@@ -2386,6 +2423,23 @@ function runVerifierSelfTest() {
     },
   };
   assert('verifier self-test accepts the passed summary contract', verifierSummaryIssues(passedSummary).length === 0, verifierSummaryIssues(passedSummary));
+  const projectedSkillOutputSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: skillOutputSummaryEvidence(passedSummary.evidence.skillOutput),
+    },
+  };
+  assert(
+    'verifier self-test projects Skill output Evidence Bundle source IDs into summaries',
+    projectedSkillOutputSummary.evidence.skillOutput.bundleListedEventSourceId === selfSourceId &&
+      projectedSkillOutputSummary.evidence.skillOutput.bundlePrimaryEventSourceId === selfSourceId &&
+      verifierSummaryIssues(projectedSkillOutputSummary).length === 0,
+    {
+      projectedSkillOutput: projectedSkillOutputSummary.evidence.skillOutput,
+      issues: verifierSummaryIssues(projectedSkillOutputSummary),
+    },
+  );
 
   assert(
     'verifier self-test accepts a Skill output bound to this verifier run',
@@ -5628,58 +5682,7 @@ async function main() {
         persistedSkillAttributes: persistedSkillAttributeEvidence(event.attributes),
         persistedPreflightAttributes: persistedPreflightAttributeEvidence(event.attributes),
         persistedInnerTimingAttributes: persistedInnerTimingAttributeEvidence(event.attributes),
-        skillOutput: {
-          eventId: skillOutput.eventId,
-          workspacePath: skillOutput.workspacePath,
-          runId: skillOutput.runId,
-          agentId: skillOutput.agentId,
-          sessionId: skillOutput.sessionId,
-          traceId: skillOutput.traceId,
-          sourceId: skillOutput.sourceId,
-          eventKind: skillOutput.eventKind,
-          eventCategory: skillOutput.eventCategory,
-          verdict: skillOutput.verdict,
-          bundleId: skillOutput.bundleId,
-          healthOk: skillOutput.healthOk,
-          listed: skillOutput.listed,
-          described: skillOutput.described,
-          bundleSchemaVersion: skillOutput.bundleSchemaVersion,
-          bundleContainsEvent: skillOutput.bundleContainsEvent,
-          bundleEventCount: skillOutput.bundleEventCount,
-          bundleListedEventCount: skillOutput.bundleListedEventCount,
-          bundleListedEventId: skillOutput.bundleListedEventId,
-          bundleListedEventWorkspacePath: skillOutput.bundleListedEventWorkspacePath,
-          bundleListedEventRunId: skillOutput.bundleListedEventRunId,
-          bundleListedEventAgentId: skillOutput.bundleListedEventAgentId,
-          bundleListedEventSessionId: skillOutput.bundleListedEventSessionId,
-          bundleListedEventTraceId: skillOutput.bundleListedEventTraceId,
-          bundleListedEventKind: skillOutput.bundleListedEventKind,
-          bundleListedEventCategory: skillOutput.bundleListedEventCategory,
-          bundleListedEventVerdict: skillOutput.bundleListedEventVerdict,
-          bundlePrimaryEventId: skillOutput.bundlePrimaryEventId,
-          bundlePrimaryEventWorkspacePath: skillOutput.bundlePrimaryEventWorkspacePath,
-          bundlePrimaryEventRunId: skillOutput.bundlePrimaryEventRunId,
-          bundlePrimaryEventAgentId: skillOutput.bundlePrimaryEventAgentId,
-          bundlePrimaryEventSessionId: skillOutput.bundlePrimaryEventSessionId,
-          bundlePrimaryEventTraceId: skillOutput.bundlePrimaryEventTraceId,
-          bundlePrimaryEventKind: skillOutput.bundlePrimaryEventKind,
-          bundlePrimaryEventCategory: skillOutput.bundlePrimaryEventCategory,
-          bundlePrimaryEventVerdict: skillOutput.bundlePrimaryEventVerdict,
-          bundleScopePrimaryType: skillOutput.bundleScopePrimaryType,
-          bundleScopePrimaryId: skillOutput.bundleScopePrimaryId,
-          bundleScopeEventId: skillOutput.bundleScopeEventId,
-          bundleScopeWorkspacePath: skillOutput.bundleScopeWorkspacePath,
-          bundleScopeRunId: skillOutput.bundleScopeRunId,
-          bundleScopeAgentId: skillOutput.bundleScopeAgentId,
-          bundleScopeSessionId: skillOutput.bundleScopeSessionId,
-          bundleTimelineContainsEvent: skillOutput.bundleTimelineContainsEvent,
-          bundleTimelineEventCount: skillOutput.bundleTimelineEventCount,
-          bundleTimelineTraceId: skillOutput.bundleTimelineTraceId,
-          bundleTimelineRunId: skillOutput.bundleTimelineRunId,
-          bundleTimelineSessionId: skillOutput.bundleTimelineSessionId,
-          queriedBack: skillOutput.queriedBack,
-          timings: skillOutput.timings,
-        },
+        skillOutput: skillOutputSummaryEvidence(skillOutput),
       },
       warning: {
         required: requireNearTimeoutWarning,
