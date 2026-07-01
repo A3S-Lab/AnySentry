@@ -451,6 +451,64 @@ function parseMetadataJson(result) {
   }
 }
 
+function jsonObjectCandidates(text) {
+  const candidates = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === '{') {
+      if (depth === 0) start = index;
+      depth += 1;
+      continue;
+    }
+    if (char === '}' && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        candidates.push(text.slice(start, index + 1));
+        start = -1;
+      }
+    }
+  }
+  return candidates;
+}
+
+function parseSkillOutputJson(result) {
+  const output = String(result?.output ?? '').trim();
+  if (!output) throw new Error('Skill output was empty');
+  try {
+    const parsed = JSON.parse(output);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  } catch {
+    // Fall through to extracting a JSON object from tool output wrappers.
+  }
+  for (const candidate of jsonObjectCandidates(output).reverse()) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    } catch {
+      // Try the next candidate.
+    }
+  }
+  throw new Error(`Skill output did not contain a JSON object: ${compact(output)}`);
+}
+
 function verifierSource() {
   return `
 const apiBase = ${JSON.stringify(apiBase)};
@@ -753,6 +811,40 @@ async function main() {
       printVerifierSummary(failureSummary('skill_result', reason, details, failureTimings, failureEvidence));
       throw new Error(reason);
     }
+    let skillOutput;
+    try {
+      skillOutput = parseSkillOutputJson(result);
+    } catch (error) {
+      timings.elapsed = durationMs(verifierStartedAt);
+      const reason = 'skill output JSON was invalid';
+      const details = error instanceof Error ? error.message : String(error);
+      const failureTimings = {
+        ...timings,
+        failurePhase: 'skill_output',
+      };
+      const failureEvidence = await recordFailureEvidence(reason, details, failureTimings);
+      printVerifierSummary(failureSummary('skill_output', reason, details, failureTimings, failureEvidence));
+      throw error;
+    }
+    const outputMatchesRun =
+      typeof skillOutput.eventId === 'string' &&
+      typeof skillOutput.bundleId === 'string' &&
+      skillOutput.runId === runId &&
+      skillOutput.agentId === agentId &&
+      skillOutput.queriedBack === true;
+    assert('Skill output reports the recorded event and bundle for this run', outputMatchesRun, skillOutput);
+    if (!outputMatchesRun) {
+      timings.elapsed = durationMs(verifierStartedAt);
+      const reason = 'skill output did not match the verifier run';
+      const details = { skillOutput, runId, agentId };
+      const failureTimings = {
+        ...timings,
+        failurePhase: 'skill_output',
+      };
+      const failureEvidence = await recordFailureEvidence(reason, details, failureTimings);
+      printVerifierSummary(failureSummary('skill_output', reason, details, failureTimings, failureEvidence));
+      throw new Error(reason);
+    }
 
     const queryStartedAt = Date.now();
     const event = await eventually('event recorded by a3s-code Skill run', async () => {
@@ -760,11 +852,13 @@ async function main() {
         method: 'POST',
         body: JSON.stringify({ timeType: 'last_30d', runId, agentId, limit: 10 }),
       });
-      return list.items?.find((item) => item.runId === runId && item.agentId === agentId && item.eventKind === 'LlmCall');
+      return list.items?.find((item) => item.eventId === skillOutput.eventId && item.runId === runId && item.agentId === agentId);
     });
     timings.queryEvent = durationMs(queryStartedAt);
 
     assert('AnySentry stores the event created through progressive execute', Boolean(event?.eventId), event);
+    assert('stored event ID matches the Skill output', event?.eventId === skillOutput.eventId, { event, skillOutput });
+    assert('stored event remains LlmCall allow evidence', event?.eventKind === 'LlmCall' && event?.verdict === 'allow', event);
     assert('stored event carries the a3s-code Skill evidence markers', event?.attributes?.['progressive.skill'] === 'anysentry-api' && event?.attributes?.['progressive.runner'] === 'a3s-code', event);
     assert(
       'stored event carries verifier audit metadata',
@@ -802,6 +896,19 @@ async function main() {
       bundle?.schemaVersion === 'anysentry.evidence_bundle.v1' && bundle.events?.some((item) => item.eventId === event.eventId),
       bundle,
     );
+    assert('Evidence Bundle ID matches the Skill output', bundle?.bundleId === skillOutput.bundleId, { bundle, skillOutput });
+    if (bundle?.bundleId !== skillOutput.bundleId) {
+      timings.elapsed = durationMs(verifierStartedAt);
+      const reason = 'evidence bundle did not match the Skill output';
+      const details = { eventId: event.eventId, outerBundleId: bundle?.bundleId, skillBundleId: skillOutput.bundleId };
+      const failureTimings = {
+        ...timings,
+        failurePhase: 'evidence_bundle',
+      };
+      const failureEvidence = await recordFailureEvidence(reason, details, failureTimings);
+      printVerifierSummary(failureSummary('evidence_bundle', reason, details, failureTimings, failureEvidence));
+      throw new Error(reason);
+    }
     const warningEvent = await recordNearTimeoutWarning(event, bundle, timings);
     let warningRequirementFailure;
     let summaryFailure;
@@ -854,6 +961,14 @@ async function main() {
         verdict: event.verdict,
         bundleId: bundle.bundleId,
         bundleEventCount: bundle.summary?.eventCount,
+        skillOutput: {
+          eventId: skillOutput.eventId,
+          eventKind: skillOutput.eventKind,
+          verdict: skillOutput.verdict,
+          bundleId: skillOutput.bundleId,
+          bundleEventCount: skillOutput.bundleEventCount,
+          queriedBack: skillOutput.queriedBack,
+        },
       },
       warning: {
         required: requireNearTimeoutWarning,

@@ -350,7 +350,10 @@ warning branch; if the warning is not emitted, the verifier records a
 runs emit a single-line `VERIFIER_SUMMARY` JSON record with schema
 `anysentry.a3s_code_skill_verifier.summary.v1`, so production automation can
 assert `status`, failure phase, failure evidence, event IDs, warning isolation,
-and timing fields without scraping human-readable log lines.
+and timing fields without scraping human-readable log lines. Success summaries
+also include the inner Skill output event and bundle IDs, and the verifier fails
+if those IDs do not match the rows and Evidence Bundle queried by the outer
+runtime.
 Timeout handling closes the a3s-code session before writing failure evidence, and
 `A3S_CODE_SESSION_CLOSE_TIMEOUT_MS` bounds that cleanup so a stuck close cannot
 suppress the failure finding. Coding-agent producer aliases such as
