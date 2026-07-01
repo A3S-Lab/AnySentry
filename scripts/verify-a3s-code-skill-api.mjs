@@ -1010,9 +1010,31 @@ async function main() {
     }
   }
 
+  async function failVerification(phase, reason, details) {
+    timings.elapsed = durationMs(verifierStartedAt);
+    const failureTimings = {
+      ...timings,
+      failurePhase: phase,
+    };
+    const failureEvidence = await recordFailureEvidence(reason, details, failureTimings);
+    printVerifierSummary(failureSummary(phase, reason, details, failureTimings, failureEvidence));
+    throw new Error(reason);
+  }
+
+  async function requireVerification(message, condition, phase, reason, details) {
+    assert(message, condition, details);
+    if (!condition) await failVerification(phase, reason, details);
+  }
+
   try {
     const toolNames = session.toolNames();
-    assert('a3s-code exposes Skill, search_skills, and bash tools', ['Skill', 'search_skills', 'bash'].every((name) => toolNames.includes(name)), toolNames);
+    await requireVerification(
+      'a3s-code exposes Skill, search_skills, and bash tools',
+      ['Skill', 'search_skills', 'bash'].every((name) => toolNames.includes(name)),
+      'tool_capabilities',
+      'a3s-code did not expose required Skill, search_skills, and bash tools',
+      { toolNames },
+    );
 
     let search;
     try {
@@ -1036,7 +1058,13 @@ async function main() {
       printVerifierSummary(failureSummary('search_skills', reason, details, failureTimings, failureEvidence));
       throw error;
     }
-    assert('a3s-code discovers the anysentry-api Skill', String(search.output ?? '').includes('anysentry-api'), search);
+    await requireVerification(
+      'a3s-code discovers the anysentry-api Skill',
+      String(search.output ?? '').includes('anysentry-api'),
+      'search_skills',
+      'a3s-code did not discover the anysentry-api Skill',
+      search,
+    );
 
     let result;
     try {
@@ -1125,23 +1153,51 @@ async function main() {
     });
     timings.queryEvent = durationMs(queryStartedAt);
 
-    assert('AnySentry stores the event created through progressive execute', Boolean(event?.eventId), event);
-    assert('stored event ID matches the Skill output', event?.eventId === skillOutput.eventId, { event, skillOutput });
-    assert('stored event remains LlmCall allow evidence', event?.eventKind === 'LlmCall' && event?.verdict === 'allow', event);
-    assert('stored event carries the a3s-code Skill evidence markers', event?.attributes?.['progressive.skill'] === 'anysentry-api' && event?.attributes?.['progressive.runner'] === 'a3s-code', event);
-    assert(
+    await requireVerification(
+      'AnySentry stores the event created through progressive execute',
+      Boolean(event?.eventId),
+      'event_query',
+      'event recorded by the a3s-code Skill run was not queryable',
+      event,
+    );
+    await requireVerification(
+      'stored event ID matches the Skill output',
+      event?.eventId === skillOutput.eventId,
+      'event_binding',
+      'stored event ID did not match the Skill output',
+      { event, skillOutput },
+    );
+    await requireVerification(
+      'stored event remains LlmCall allow evidence',
+      event?.eventKind === 'LlmCall' && event?.verdict === 'allow',
+      'event_contract',
+      'stored event was not LlmCall allow evidence',
+      event,
+    );
+    await requireVerification(
+      'stored event carries the a3s-code Skill evidence markers',
+      event?.attributes?.['progressive.skill'] === 'anysentry-api' && event?.attributes?.['progressive.runner'] === 'a3s-code',
+      'event_contract',
+      'stored event lost a3s-code Skill evidence markers',
+      event,
+    );
+    await requireVerification(
       'stored event carries verifier audit metadata',
       event?.attributes?.['progressive.verifier.commit'] === verifierCommit &&
         Number(event?.attributes?.['progressive.verifier.skillTimeoutMs']) === skillTimeoutMs &&
         Number(event?.attributes?.['progressive.verifier.sessionCloseTimeoutMs']) === sessionCloseTimeoutMs,
+      'event_contract',
+      'stored event lost verifier audit metadata',
       event,
     );
-    assert(
+    await requireVerification(
       'stored event carries inner API timing metadata',
       Number(event?.attributes?.['progressive.verifier.innerPreRecordMs']) >= 0 &&
         Number(event?.attributes?.['progressive.verifier.innerHealthzMs']) >= 0 &&
         Number(event?.attributes?.['progressive.verifier.innerListMs']) >= 0 &&
         Number(event?.attributes?.['progressive.verifier.innerDescribeRecordMs']) >= 0,
+      'event_contract',
+      'stored event lost inner API timing metadata',
       event,
     );
     const bundleStartedAt = Date.now();
@@ -1160,9 +1216,11 @@ async function main() {
     });
     timings.bundle = durationMs(bundleStartedAt);
     timings.elapsed = durationMs(verifierStartedAt);
-    assert(
+    await requireVerification(
       'stored event builds an Evidence Bundle through the progressive API',
       bundle?.schemaVersion === 'anysentry.evidence_bundle.v1' && bundle.events?.some((item) => item.eventId === event.eventId),
+      'evidence_bundle',
+      'evidence bundle did not include the stored event',
       bundle,
     );
     assert('Evidence Bundle ID matches the Skill output', bundle?.bundleId === skillOutput.bundleId, { bundle, skillOutput });
@@ -1178,7 +1236,13 @@ async function main() {
       printVerifierSummary(failureSummary('evidence_bundle', reason, details, failureTimings, failureEvidence));
       throw new Error(reason);
     }
-    const warningEvent = await recordNearTimeoutWarning(event, bundle, timings);
+    let warningEvent;
+    try {
+      warningEvent = await recordNearTimeoutWarning(event, bundle, timings);
+    } catch (error) {
+      const details = error instanceof Error ? error.message : String(error);
+      await failVerification('near_timeout_warning', 'near-timeout warning evidence failed validation', details);
+    }
     let warningRequirementFailure;
     let summaryFailure;
     if (warningEvent) pass('near-timeout success warning evidence is queryable and non-blocking');

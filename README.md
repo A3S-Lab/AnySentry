@@ -359,6 +359,9 @@ either with the recorded event/bundle IDs or with `recorded=false` plus the reas
 evidence was not written. If the verifier detects that its own summary violates
 the contract, the emitted summary is converted to `status=failed` with
 `failure.phase=summary_validation` so automation can trust the top-level status.
+Runtime contract failures after the Skill runs, such as missing event markers or
+Evidence Bundle drift, are recorded as phase-specific `SecurityFinding` evidence
+instead of being collapsed into generic summary-validation failures.
 `pnpm verify:a3s-code-skill-api:self-test` validates that summary
 contract and the Skill-output JSON parser offline, so the production verifier's
 machine-readable handoff is checked without adding a parallel soak path.
