@@ -425,6 +425,15 @@ function verifierSummaryIssues(summary) {
       if (summary.warning?.eventCategory !== 'runtime') issues.push('triggered warning.eventCategory must be runtime');
       if (summary.warning?.verdict !== 'allow') issues.push('triggered warning.verdict must be allow');
       if (!isNonEmptyString(summary.warning?.bundleId)) issues.push('triggered warning.bundleId must be a non-empty string');
+      if (summary.warning?.bundleSchemaVersion !== 'anysentry.evidence_bundle.v1') {
+        issues.push('triggered warning.bundleSchemaVersion must be anysentry.evidence_bundle.v1');
+      }
+      if (summary.warning?.bundleContainsSourceEvent !== true) {
+        issues.push('triggered warning.bundleContainsSourceEvent must be true');
+      }
+      if (!isPositiveInteger(summary.warning?.bundleEventCount)) {
+        issues.push('triggered warning.bundleEventCount must be a positive integer');
+      }
       if (summary.warning?.failure !== undefined) issues.push('triggered warning.failure must be absent');
       if (isNonEmptyString(summary.evidence?.eventId) && summary.warning?.eventId === summary.evidence.eventId) {
         issues.push('triggered warning.eventId must differ from evidence.eventId');
@@ -441,6 +450,15 @@ function verifierSummaryIssues(summary) {
       if (isNonEmptyString(summary.evidence?.bundleId) && summary.warning?.bundleId !== summary.evidence.bundleId) {
         issues.push('triggered warning.bundleId must match evidence.bundleId');
       }
+      if (summary.warning?.bundleSchemaVersion !== summary.evidence?.bundleSchemaVersion) {
+        issues.push('triggered warning.bundleSchemaVersion must match evidence.bundleSchemaVersion');
+      }
+      if (summary.warning?.bundleContainsSourceEvent !== summary.evidence?.bundleContainsEvent) {
+        issues.push('triggered warning.bundleContainsSourceEvent must match evidence.bundleContainsEvent');
+      }
+      if (summary.warning?.bundleEventCount !== summary.evidence?.bundleEventCount) {
+        issues.push('triggered warning.bundleEventCount must match evidence.bundleEventCount');
+      }
       if (summary.warning?.isolation?.warningRows !== 1) issues.push('triggered warning isolation.warningRows must be 1');
       if (summary.warning?.isolation?.llmPollutionCount !== 0) issues.push('triggered warning isolation.llmPollutionCount must be 0');
     } else if (summary.warning?.triggered === false) {
@@ -454,6 +472,9 @@ function verifierSummaryIssues(summary) {
       if (summary.warning?.eventCategory !== undefined) issues.push('untriggered warning.eventCategory must be absent');
       if (summary.warning?.verdict !== undefined) issues.push('untriggered warning.verdict must be absent');
       if (summary.warning?.bundleId !== undefined) issues.push('untriggered warning.bundleId must be absent');
+      if (summary.warning?.bundleSchemaVersion !== undefined) issues.push('untriggered warning.bundleSchemaVersion must be absent');
+      if (summary.warning?.bundleContainsSourceEvent !== undefined) issues.push('untriggered warning.bundleContainsSourceEvent must be absent');
+      if (summary.warning?.bundleEventCount !== undefined) issues.push('untriggered warning.bundleEventCount must be absent');
       if (summary.warning?.isolation !== undefined) issues.push('untriggered warning.isolation must be absent');
       if (summary.status === 'passed' && summary.warning?.failure !== undefined) {
         issues.push('passed untriggered warning.failure must be absent');
@@ -1018,6 +1039,9 @@ function runVerifierSelfTest() {
       eventCategory: 'runtime',
       verdict: 'allow',
       bundleId: 'evb_self_test',
+      bundleSchemaVersion: 'anysentry.evidence_bundle.v1',
+      bundleContainsSourceEvent: true,
+      bundleEventCount: 1,
       isolation: {
         warningRows: 1,
         llmPollutionCount: 0,
@@ -1854,6 +1878,48 @@ function runVerifierSelfTest() {
     verifierSummaryIssues(mismatchedWarningBundleSummary).includes('triggered warning.bundleId must match evidence.bundleId'),
     verifierSummaryIssues(mismatchedWarningBundleSummary),
   );
+  const driftedWarningBundleSchemaSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      bundleSchemaVersion: 'legacy.bundle.v0',
+    },
+  };
+  assert(
+    'verifier self-test rejects warning bundle schema drift',
+    verifierSummaryIssues(driftedWarningBundleSchemaSummary).includes(
+      'triggered warning.bundleSchemaVersion must be anysentry.evidence_bundle.v1',
+    ),
+    verifierSummaryIssues(driftedWarningBundleSchemaSummary),
+  );
+  const missingWarningSourceEventSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      bundleContainsSourceEvent: false,
+    },
+  };
+  assert(
+    'verifier self-test rejects warning bundles that omit the source event',
+    verifierSummaryIssues(missingWarningSourceEventSummary).includes(
+      'triggered warning.bundleContainsSourceEvent must be true',
+    ),
+    verifierSummaryIssues(missingWarningSourceEventSummary),
+  );
+  const driftedWarningBundleCountSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      bundleEventCount: 2,
+    },
+  };
+  assert(
+    'verifier self-test rejects warning bundle count drift',
+    verifierSummaryIssues(driftedWarningBundleCountSummary).includes(
+      'triggered warning.bundleEventCount must match evidence.bundleEventCount',
+    ),
+    verifierSummaryIssues(driftedWarningBundleCountSummary),
+  );
   const duplicateWarningRowsSummary = {
     ...passedSummary,
     warning: {
@@ -2522,6 +2588,9 @@ async function main() {
         eventCategory: warningEvent?.eventCategory,
         verdict: warningEvent?.verdict,
         bundleId: warningEvent?.attributes?.['progressive.warning.bundleId'],
+        bundleSchemaVersion: warningEvent ? bundle.schemaVersion : undefined,
+        bundleContainsSourceEvent: warningEvent ? bundle.events?.some((item) => item.eventId === event.eventId) === true : undefined,
+        bundleEventCount: warningEvent ? bundle.summary?.eventCount : undefined,
         isolation: warningEvent?.verifierIsolation,
         failure: warningRequirementFailure,
       },

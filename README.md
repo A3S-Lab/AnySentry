@@ -372,7 +372,11 @@ warnings must be separate `RuntimeEvent`/`runtime`/`allow` rows, not the success
 not pollute LLM evidence. Triggered warning summaries also bind the warning
 row's `workspacePath`, `runId`, `agentId`, and `sessionId` to the target
 identity and expose `warning.sourceEventId`, which must match the success
-evidence event. Success summaries also include the inner Skill output event,
+evidence event. The warning bundle fields bind to the same Evidence Bundle as
+the success evidence: `warning.bundleSchemaVersion` must be
+`anysentry.evidence_bundle.v1`, `warning.bundleContainsSourceEvent` must be
+true, and `warning.bundleEventCount` must match the success bundle count.
+Success summaries also include the inner Skill output event,
 workspace, run, agent, session, and bundle IDs under `evidence.skillOutput`,
 and the verifier fails if those IDs do not match the target identity, rows, and
 Evidence Bundle queried by the outer runtime. The stored success evidence row
