@@ -360,8 +360,10 @@ bundle IDs under `evidence.skillOutput`, and the verifier fails if those IDs do
 not match the rows and Evidence Bundle queried by the outer runtime. Passed
 summary validation also requires both the stored event and the Skill output to
 remain `LlmCall`/`allow`, with `evidence.skillOutput.queriedBack=true`, so
-automation can detect evidence-contract drift from the summary alone. Failed
-summaries always include an explicit failure evidence status,
+automation can detect evidence-contract drift from the summary alone. The outer
+and Skill-reported `bundleEventCount` fields must also be positive and equal, so
+automation can catch Evidence Bundle count drift without rebuilding the bundle.
+Failed summaries always include an explicit failure evidence status,
 either with the recorded event/bundle IDs or with `recorded=false` plus the reason
 evidence was not written. If the verifier detects that its own summary violates
 the contract, the emitted summary is converted to `status=failed` with
