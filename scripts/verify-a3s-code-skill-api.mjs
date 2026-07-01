@@ -2197,6 +2197,13 @@ function runVerifierSelfTest() {
   } catch {
     pass('verifier self-test rejects non-JSON Skill output');
   }
+  const source = verifierSource();
+  const missingSourceTimingFields = skillOutputTimingFields.filter((field) => !source.includes(field));
+  assert(
+    'verifier self-test keeps all Skill inner timing fields in the generated verifier source',
+    missingSourceTimingFields.length === 0,
+    missingSourceTimingFields,
+  );
 
   if (process.exitCode) process.exit(process.exitCode);
   console.log('a3s-code Skill verifier self-test passed');
@@ -2260,6 +2267,7 @@ if (operation?.name !== 'recordSecurityEvents' || !operation.inputSchema) {
 }
 
 const preRecordMs = Math.max(0, Date.now() - flowStartedAt);
+flowTimings.innerPreRecordMs = preRecordMs;
 const recorded = await timed('innerRecordMs', () => request('/capabilities', {
   method: 'POST',
   body: JSON.stringify({
