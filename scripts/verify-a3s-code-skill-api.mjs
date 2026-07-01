@@ -331,6 +331,8 @@ function verifierSummaryIssues(summary) {
       issues.push('failed summary failure.evidence.recorded must be a boolean');
     } else if (evidence.recorded === true) {
       if (!isNonEmptyString(evidence.eventId)) issues.push('recorded failure evidence.eventId must be a non-empty string');
+      if (!isNonEmptyString(evidence.failurePhase)) issues.push('recorded failure evidence.failurePhase must be a non-empty string');
+      if (!isNonEmptyString(evidence.failureReason)) issues.push('recorded failure evidence.failureReason must be a non-empty string');
       if (!isNonEmptyString(evidence.workspacePath)) issues.push('recorded failure evidence.workspacePath must be a non-empty string');
       if (!isNonEmptyString(evidence.runId)) issues.push('recorded failure evidence.runId must be a non-empty string');
       if (!isNonEmptyString(evidence.agentId)) issues.push('recorded failure evidence.agentId must be a non-empty string');
@@ -350,6 +352,12 @@ function verifierSummaryIssues(summary) {
       if (evidence.agentId !== summary.target?.agentId) issues.push('recorded failure evidence.agentId must match target.agentId');
       if (evidence.sessionId !== summary.target?.sessionId) {
         issues.push('recorded failure evidence.sessionId must match target.sessionId');
+      }
+      if (evidence.failurePhase !== summary.failure?.phase) {
+        issues.push('recorded failure evidence.failurePhase must match failure.phase');
+      }
+      if (evidence.failureReason !== summary.failure?.reason) {
+        issues.push('recorded failure evidence.failureReason must match failure.reason');
       }
       if (evidence.eventKind !== 'SecurityAction') issues.push('recorded failure evidence.eventKind must be SecurityAction');
       if (evidence.eventCategory !== 'security') issues.push('recorded failure evidence.eventCategory must be security');
@@ -387,6 +395,8 @@ function verifierSummaryIssues(summary) {
           ...evidenceFieldMismatchIssues('failed warning.failure.evidence', summary.warning.failure.evidence, summary.failure?.evidence, [
             'recorded',
             'eventId',
+            'failurePhase',
+            'failureReason',
             'workspacePath',
             'runId',
             'agentId',
@@ -699,6 +709,8 @@ async function recordFailureEvidence(reason, details, timings) {
     return {
       recorded: true,
       eventId: failureEvent.eventId,
+      failurePhase: String(failureAttrs['progressive.verifier.failurePhase'] ?? timings.failurePhase ?? ''),
+      failureReason: String(failureAttrs['progressive.failure.reason'] ?? reason),
       workspacePath: failureEvent.workspacePath,
       runId: failureEvent.runId,
       agentId: failureEvent.agentId,
@@ -1367,6 +1379,8 @@ function runVerifierSelfTest() {
     {
       recorded: true,
       eventId: 'evt_failure_self_test',
+      failurePhase: 'skill_output',
+      failureReason: 'skill output JSON was invalid',
       workspacePath,
       runId,
       agentId,
@@ -1397,6 +1411,41 @@ function runVerifierSelfTest() {
     'verifier self-test rejects recorded failure evidence that looks allow-listed',
     verifierSummaryIssues(driftedFailureSummary).includes('recorded failure evidence.verdict must be a non-allow string'),
     verifierSummaryIssues(driftedFailureSummary),
+  );
+
+  const driftedFailureEvidencePhaseSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      failurePhase: 'skill',
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence phase drift',
+    verifierSummaryIssues(driftedFailureEvidencePhaseSummary).includes(
+      'recorded failure evidence.failurePhase must match failure.phase',
+    ),
+    verifierSummaryIssues(driftedFailureEvidencePhaseSummary),
+  );
+  const driftedFailureEvidenceReasonSummary = failureSummary(
+    'skill_output',
+    'skill output JSON was invalid',
+    'invalid JSON',
+    { elapsed: 10, failurePhase: 'skill_output' },
+    {
+      ...failedSummary.failure.evidence,
+      failureReason: 'other failure reason',
+    },
+  );
+  assert(
+    'verifier self-test rejects recorded failure evidence reason drift',
+    verifierSummaryIssues(driftedFailureEvidenceReasonSummary).includes(
+      'recorded failure evidence.failureReason must match failure.reason',
+    ),
+    verifierSummaryIssues(driftedFailureEvidenceReasonSummary),
   );
 
   const driftedFailureWorkspaceSummary = failureSummary(
@@ -1512,12 +1561,18 @@ function runVerifierSelfTest() {
     verifierSummaryIssues(missingFailureBundleCountSummary),
   );
 
+  const requiredWarningFailureEvidence = {
+    ...failedSummary.failure.evidence,
+    failurePhase: 'near_timeout_warning',
+    failureReason: 'required near-timeout warning was not emitted',
+  };
   const requiredWarningFailureSummary = {
     ...failedSummary,
     failure: {
       ...failedSummary.failure,
       phase: 'near_timeout_warning',
       reason: 'required near-timeout warning was not emitted',
+      evidence: requiredWarningFailureEvidence,
     },
     timings: {
       ...failedSummary.timings,
@@ -1528,7 +1583,7 @@ function runVerifierSelfTest() {
       triggered: false,
       thresholdMs: nearTimeoutThresholdMs,
       failure: {
-        evidence: failedSummary.failure.evidence,
+        evidence: requiredWarningFailureEvidence,
       },
     },
   };
