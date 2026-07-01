@@ -441,7 +441,9 @@ not need to guess which failure record is authoritative. Other failed summaries
 must not carry stale `warning` payloads. Timing values in
 summaries must be non-negative
 numbers or non-empty strings, and failed summaries outside preflight and
-summary-validation must bind `timings.failurePhase` to `failure.phase`. If the
+summary-validation must bind `timings.failurePhase` to `failure.phase`, while
+preflight and summary-validation failures must not carry stale
+`timings.failurePhase`. If the
 verifier detects that its own summary violates the contract, the emitted summary
 is converted to `status=failed` with `failure.phase=summary_validation` so
 automation can trust the top-level status. Summary-validation failures must also

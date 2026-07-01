@@ -290,6 +290,12 @@ function sanitizedTimings(timings) {
   return Object.fromEntries(Object.entries(timings).filter(([, value]) => isValidTimingValue(value)));
 }
 
+function sanitizedSummaryValidationTimings(timings) {
+  const out = sanitizedTimings(timings);
+  delete out.failurePhase;
+  return out;
+}
+
 function canonicalEvidenceValue(value) {
   if (Array.isArray(value)) return value.map(canonicalEvidenceValue);
   if (isRecord(value)) {
@@ -896,12 +902,14 @@ function verifierSummaryIssues(summary) {
     if (!isNonEmptyString(summary.failure?.phase)) issues.push('failed summary failure.phase must be a non-empty string');
     if (!isNonEmptyString(summary.failure?.reason)) issues.push('failed summary failure.reason must be a non-empty string');
     if (!hasFailureDetails(summary.failure?.details)) issues.push('failed summary failure.details must be present');
-    if (
-      isNonEmptyString(summary.failure?.phase) &&
-      !['preflight', 'summary_validation'].includes(summary.failure.phase) &&
-      summary.timings?.failurePhase !== summary.failure.phase
-    ) {
-      issues.push('failed summary timings.failurePhase must match failure.phase');
+    if (isNonEmptyString(summary.failure?.phase)) {
+      if (['preflight', 'summary_validation'].includes(summary.failure.phase)) {
+        if (summary.timings?.failurePhase !== undefined) {
+          issues.push('failed summary timings.failurePhase must be absent for preflight and summary_validation phases');
+        }
+      } else if (summary.timings?.failurePhase !== summary.failure.phase) {
+        issues.push('failed summary timings.failurePhase must match failure.phase');
+      }
     }
     const evidence = summary.failure?.evidence;
     if (!isRecord(evidence)) {
@@ -1195,7 +1203,7 @@ function summaryValidationFailureSummary(summary, issues) {
       status: 'failed',
       issues,
     },
-    timings: sanitizedTimings(summary?.timings),
+    timings: sanitizedSummaryValidationTimings(summary?.timings),
   };
 }
 
@@ -1946,6 +1954,20 @@ function runVerifierSelfTest() {
       verifierSummaryIssues(normalizedStaleIdentitySummary).length === 0,
     { summary: normalizedStaleIdentitySummary, issues: verifierSummaryIssues(normalizedStaleIdentitySummary) },
   );
+  const staleSummaryValidationFailurePhaseSummary = {
+    ...normalizedStaleIdentitySummary,
+    timings: {
+      ...normalizedStaleIdentitySummary.timings,
+      failurePhase: 'summary_validation',
+    },
+  };
+  assert(
+    'verifier self-test rejects stale failurePhase timings on summary-validation failures',
+    verifierSummaryIssues(staleSummaryValidationFailurePhaseSummary).includes(
+      'failed summary timings.failurePhase must be absent for preflight and summary_validation phases',
+    ),
+    verifierSummaryIssues(staleSummaryValidationFailurePhaseSummary),
+  );
   const missingSummaryValidationSummary = {
     ...normalizedStaleIdentitySummary,
     summaryValidation: undefined,
@@ -2452,6 +2474,7 @@ function runVerifierSelfTest() {
     'verifier self-test sanitizes invalid timings in summary-validation failures',
     normalizedNegativeTiming.status === 'failed' &&
       normalizedNegativeTiming.failure?.phase === 'summary_validation' &&
+      normalizedNegativeTiming.timings.failurePhase === undefined &&
       verifierSummaryIssues(normalizedNegativeTiming).length === 0,
     { summary: normalizedNegativeTiming, issues: verifierSummaryIssues(normalizedNegativeTiming) },
   );
@@ -3002,6 +3025,19 @@ function runVerifierSelfTest() {
     'verifier self-test accepts explicit unrecorded failure evidence',
     unrecordedFailureSummary.failure.evidence.recorded === false && verifierSummaryIssues(unrecordedFailureSummary).length === 0,
     { summary: unrecordedFailureSummary, issues: verifierSummaryIssues(unrecordedFailureSummary) },
+  );
+  const stalePreflightFailurePhaseSummary = failureSummary(
+    'preflight',
+    'required local verifier prerequisites are missing',
+    { aclPath: '/missing/config.acl' },
+    { elapsed: 1, failurePhase: 'preflight' },
+  );
+  assert(
+    'verifier self-test rejects stale failurePhase timings on preflight failures',
+    verifierSummaryIssues(stalePreflightFailurePhaseSummary).includes(
+      'failed summary timings.failurePhase must be absent for preflight and summary_validation phases',
+    ),
+    verifierSummaryIssues(stalePreflightFailurePhaseSummary),
   );
   const staleUnrecordedFailureEventSummary = failureSummary(
     'preflight',
