@@ -67,6 +67,7 @@ const skillOutputTimingFields = [
 ];
 const eventInnerTimingFields = ['innerHealthzMs', 'innerListMs', 'innerDescribeRecordMs', 'innerPreRecordMs'];
 const expectedProgressiveFlow = 'healthz,list,describe,execute,events-list,build-evidence-bundle';
+const expectedDescribedOperation = 'recordSecurityEvents';
 const nearTimeoutWarningReason = 'a3s-code Skill verifier completed close to its timeout budget';
 
 function durationMs(startedAt) {
@@ -279,6 +280,15 @@ function skillOutputEvidenceIssues(skillOutput) {
   }
   if (skillOutput.sessionId !== sessionId) {
     issues.push('skillOutput.sessionId must match the verifier sessionId');
+  }
+  if (skillOutput.healthOk !== true) {
+    issues.push('skillOutput.healthOk must be true');
+  }
+  if (skillOutput.listed !== true) {
+    issues.push('skillOutput.listed must be true');
+  }
+  if (skillOutput.described !== expectedDescribedOperation) {
+    issues.push(`skillOutput.described must be ${expectedDescribedOperation}`);
   }
   if (skillOutput.eventKind !== 'LlmCall') {
     issues.push('skillOutput.eventKind must be LlmCall');
@@ -500,6 +510,15 @@ function successfulEvidenceIssues(summary, context) {
   }
   if (!isNonEmptyString(summary.evidence?.skillOutput?.bundleId)) {
     issues.push(`${context} evidence.skillOutput.bundleId must be a non-empty string`);
+  }
+  if (summary.evidence?.skillOutput?.healthOk !== true) {
+    issues.push(`${context} evidence.skillOutput.healthOk must be true`);
+  }
+  if (summary.evidence?.skillOutput?.listed !== true) {
+    issues.push(`${context} evidence.skillOutput.listed must be true`);
+  }
+  if (summary.evidence?.skillOutput?.described !== expectedDescribedOperation) {
+    issues.push(`${context} evidence.skillOutput.described must be ${expectedDescribedOperation}`);
   }
   if (summary.evidence?.skillOutput?.bundleSchemaVersion !== 'anysentry.evidence_bundle.v1') {
     issues.push(`${context} evidence.skillOutput.bundleSchemaVersion must be anysentry.evidence_bundle.v1`);
@@ -1336,6 +1355,9 @@ function runVerifierSelfTest() {
         eventCategory: 'llm',
         verdict: 'allow',
         bundleId: 'evb_self_test',
+        healthOk: true,
+        listed: true,
+        described: expectedDescribedOperation,
         bundleSchemaVersion: 'anysentry.evidence_bundle.v1',
         bundleContainsEvent: true,
         bundleEventCount: 1,
@@ -1404,6 +1426,24 @@ function runVerifierSelfTest() {
     'verifier self-test rejects Skill outputs without a bundle event count',
     skillOutputEvidenceIssues(missingSkillOutputBundleCount).includes('skillOutput.bundleEventCount must be a positive integer'),
     skillOutputEvidenceIssues(missingSkillOutputBundleCount),
+  );
+  const driftedSkillOutputDescribe = {
+    ...passedSummary.evidence.skillOutput,
+    described: 'buildEvidenceBundle',
+  };
+  assert(
+    'verifier self-test rejects Skill outputs with drifted described operation',
+    skillOutputEvidenceIssues(driftedSkillOutputDescribe).includes(`skillOutput.described must be ${expectedDescribedOperation}`),
+    skillOutputEvidenceIssues(driftedSkillOutputDescribe),
+  );
+  const missingSkillOutputHealth = {
+    ...passedSummary.evidence.skillOutput,
+    healthOk: false,
+  };
+  assert(
+    'verifier self-test rejects Skill outputs that did not prove healthz',
+    skillOutputEvidenceIssues(missingSkillOutputHealth).includes('skillOutput.healthOk must be true'),
+    skillOutputEvidenceIssues(missingSkillOutputHealth),
   );
   const passedSkillEventAttributes = {
     'progressive.runner': 'a3s-code',
@@ -2541,6 +2581,53 @@ function runVerifierSelfTest() {
     verifierSummaryIssues(driftedSkillOutputSummary).includes('passed summary evidence.skillOutput.queriedBack must be true'),
     verifierSummaryIssues(driftedSkillOutputSummary),
   );
+  const driftedSkillOutputDescribeSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        described: 'buildEvidenceBundle',
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects passed summaries with drifted Skill describe evidence',
+    verifierSummaryIssues(driftedSkillOutputDescribeSummary).includes(
+      `passed summary evidence.skillOutput.described must be ${expectedDescribedOperation}`,
+    ),
+    verifierSummaryIssues(driftedSkillOutputDescribeSummary),
+  );
+  const driftedSkillOutputHealthSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        healthOk: false,
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects passed summaries without Skill health evidence',
+    verifierSummaryIssues(driftedSkillOutputHealthSummary).includes('passed summary evidence.skillOutput.healthOk must be true'),
+    verifierSummaryIssues(driftedSkillOutputHealthSummary),
+  );
+  const driftedSkillOutputListSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        listed: false,
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects passed summaries without Skill list evidence',
+    verifierSummaryIssues(driftedSkillOutputListSummary).includes('passed summary evidence.skillOutput.listed must be true'),
+    verifierSummaryIssues(driftedSkillOutputListSummary),
+  );
   const driftedSkillOutputCategorySummary = {
     ...passedSummary,
     evidence: {
@@ -3300,6 +3387,9 @@ async function main() {
           eventCategory: skillOutput.eventCategory,
           verdict: skillOutput.verdict,
           bundleId: skillOutput.bundleId,
+          healthOk: skillOutput.healthOk,
+          listed: skillOutput.listed,
+          described: skillOutput.described,
           bundleSchemaVersion: skillOutput.bundleSchemaVersion,
           bundleContainsEvent: skillOutput.bundleContainsEvent,
           bundleEventCount: skillOutput.bundleEventCount,

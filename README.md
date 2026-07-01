@@ -384,11 +384,12 @@ warning bundle fields bind to the same Evidence Bundle as the success evidence:
 `warning.bundleSchemaVersion` must be
 `anysentry.evidence_bundle.v1`, `warning.bundleContainsSourceEvent` must be
 true, and `warning.bundleEventCount` must match the success bundle count.
-Success summaries also include the inner Skill output event,
-workspace, run, agent, session, bundle IDs, and inner API timing fields under
-`evidence.skillOutput`, and the verifier fails if those IDs do not match the
-target identity, rows, Evidence Bundle, or timing contract queried by the outer
-runtime. The stored success evidence row
+Success summaries also include the inner Skill output health/list/describe
+proofs, event, workspace, run, agent, session, bundle IDs, and inner API timing
+fields under `evidence.skillOutput`, and the verifier fails if those proofs do
+not show `healthOk=true`, `listed=true`, and `described=recordSecurityEvents` or
+if the IDs do not match the target identity, rows, Evidence Bundle, or timing
+contract queried by the outer runtime. The stored success evidence row
 also exposes `evidence.workspacePath`, `evidence.runId`, `evidence.agentId`, and
 `evidence.sessionId`, which must match the target identity. Passed summary validation also
 requires both the stored event and the Skill output to remain
