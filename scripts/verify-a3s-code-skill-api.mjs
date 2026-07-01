@@ -169,6 +169,12 @@ function successfulEvidenceIssues(summary, context) {
   if (!isNonEmptyString(summary.evidence?.skillOutput?.eventId)) {
     issues.push(`${context} evidence.skillOutput.eventId must be a non-empty string`);
   }
+  if (!isNonEmptyString(summary.evidence?.skillOutput?.runId)) {
+    issues.push(`${context} evidence.skillOutput.runId must be a non-empty string`);
+  }
+  if (!isNonEmptyString(summary.evidence?.skillOutput?.agentId)) {
+    issues.push(`${context} evidence.skillOutput.agentId must be a non-empty string`);
+  }
   if (!isNonEmptyString(summary.evidence?.skillOutput?.bundleId)) {
     issues.push(`${context} evidence.skillOutput.bundleId must be a non-empty string`);
   }
@@ -180,6 +186,12 @@ function successfulEvidenceIssues(summary, context) {
   if (summary.evidence?.skillOutput?.queriedBack !== true) issues.push(`${context} evidence.skillOutput.queriedBack must be true`);
   if (summary.evidence?.eventId !== summary.evidence?.skillOutput?.eventId) {
     issues.push(`${context} eventId must match skillOutput.eventId`);
+  }
+  if (summary.target?.runId !== summary.evidence?.skillOutput?.runId) {
+    issues.push(`${context} target.runId must match skillOutput.runId`);
+  }
+  if (summary.target?.agentId !== summary.evidence?.skillOutput?.agentId) {
+    issues.push(`${context} target.agentId must match skillOutput.agentId`);
   }
   if (summary.evidence?.bundleId !== summary.evidence?.skillOutput?.bundleId) {
     issues.push(`${context} bundleId must match skillOutput.bundleId`);
@@ -803,6 +815,8 @@ function runVerifierSelfTest() {
       bundleEventCount: 1,
       skillOutput: {
         eventId: 'evt_self_test',
+        runId,
+        agentId,
         eventKind: 'LlmCall',
         verdict: 'allow',
         bundleId: 'evb_self_test',
@@ -851,6 +865,21 @@ function runVerifierSelfTest() {
     'verifier self-test rejects summaries from a different run',
     verifierSummaryIssues(mismatchedTargetSummary).includes('target.runId must match the running verifier runId'),
     verifierSummaryIssues(mismatchedTargetSummary),
+  );
+  const driftedSkillRunSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        runId: 'other-run',
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects Skill output run identity drift',
+    verifierSummaryIssues(driftedSkillRunSummary).includes('passed summary target.runId must match skillOutput.runId'),
+    verifierSummaryIssues(driftedSkillRunSummary),
   );
   const mismatchedWarningRequirementSummary = {
     ...passedSummary,
@@ -1072,7 +1101,6 @@ function runVerifierSelfTest() {
       verifierSummaryIssues(driftedFailedEvidenceSummary).includes('failed summary evidence.eventKind must be LlmCall'),
       verifierSummaryIssues(driftedFailedEvidenceSummary),
     );
-
     const driftedFailurePhaseSummary = {
       ...requiredWarningFailureSummary,
       timings: {
@@ -1802,6 +1830,8 @@ async function main() {
         bundleEventCount: bundle.summary?.eventCount,
         skillOutput: {
           eventId: skillOutput.eventId,
+          runId: skillOutput.runId,
+          agentId: skillOutput.agentId,
           eventKind: skillOutput.eventKind,
           verdict: skillOutput.verdict,
           bundleId: skillOutput.bundleId,

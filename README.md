@@ -367,9 +367,9 @@ include the warning budget state; when
 are mutually exclusive: triggered warnings carry warning event/bundle/isolation
 evidence and no failure payload, while untriggered warnings carry no stale
 warning event/bundle/isolation fields. Success summaries also include the inner
-Skill output event and bundle IDs under
-`evidence.skillOutput`, and the verifier fails if those IDs do not match the rows
-and Evidence Bundle queried by the outer runtime. Passed summary validation also
+Skill output event, run, agent, and bundle IDs under `evidence.skillOutput`, and
+the verifier fails if those IDs do not match the target identity, rows, and
+Evidence Bundle queried by the outer runtime. Passed summary validation also
 requires both the stored event and the Skill output to remain `LlmCall`/`allow`,
 with `evidence.skillOutput.queriedBack=true`, so automation can detect
 evidence-contract drift from the summary alone. The outer and Skill-reported
