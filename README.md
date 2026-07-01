@@ -395,10 +395,12 @@ fields under `evidence.skillOutput`, and the verifier fails if those proofs do
 not show `healthOk=true`, `listed=true`, and `described=recordSecurityEvents` or
 if the IDs do not match the target identity, rows, Evidence Bundle, or timing
 contract queried by the outer runtime. The summary also exposes
-`evidence.persistedVerifierAttributes` and
+`evidence.persistedVerifierAttributes`, `evidence.persistedSkillAttributes`, and
 `evidence.persistedPreflightAttributes` from the stored success row, where the
-former must match the running verifier audit metadata and the latter persists
-the same preflight proof attributes
+first must match the running verifier audit metadata, the Skill attributes must
+match the stored `progressive.runner`, `progressive.skill`, `progressive.flow`,
+and `progressive.model` markers, and the preflight attributes persist the same
+preflight proof attributes
 (`progressive.verifier.healthOk`, `progressive.verifier.listed`, and
 `progressive.verifier.describedOperation`), and the outer verifier rejects rows
 whose attributes drift from the Skill output. It also exposes

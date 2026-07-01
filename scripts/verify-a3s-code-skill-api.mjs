@@ -90,6 +90,12 @@ const skillOutputPreflightBindings = [
     expected: expectedDescribedOperation,
   },
 ];
+const skillEventAttributeSummaryBindings = [
+  { field: 'runner', attribute: 'progressive.runner', expected: 'a3s-code' },
+  { field: 'skill', attribute: 'progressive.skill', expected: 'anysentry-api' },
+  { field: 'flow', attribute: 'progressive.flow', expected: expectedProgressiveFlow },
+  { field: 'model', attribute: 'progressive.model', expected: model },
+];
 const nearTimeoutWarningReason = 'a3s-code Skill verifier completed close to its timeout budget';
 
 function durationMs(startedAt) {
@@ -368,17 +374,30 @@ function skillEventAttributeIssues(attributes) {
   if (!isRecord(attributes)) {
     return ['event attributes must be an object'];
   }
-  if (attributes['progressive.runner'] !== 'a3s-code') {
-    issues.push('event attribute progressive.runner must be a3s-code');
+  for (const { attribute, expected } of skillEventAttributeSummaryBindings) {
+    if (!sameAttributeValue(attributes[attribute], expected)) {
+      issues.push(`event attribute ${attribute} must be ${expectedValueText(expected)}`);
+    }
   }
-  if (attributes['progressive.skill'] !== 'anysentry-api') {
-    issues.push('event attribute progressive.skill must be anysentry-api');
+  return issues;
+}
+
+function persistedSkillAttributeEvidence(attributes) {
+  if (!isRecord(attributes)) return {};
+  return Object.fromEntries(
+    skillEventAttributeSummaryBindings.map(({ field, attribute }) => [field, attributes[attribute]]),
+  );
+}
+
+function persistedSkillAttributeIssues(persistedAttributes, context) {
+  const issues = [];
+  if (!isRecord(persistedAttributes)) {
+    return [`${context} evidence.persistedSkillAttributes must be an object`];
   }
-  if (attributes['progressive.flow'] !== expectedProgressiveFlow) {
-    issues.push('event attribute progressive.flow must match the expected progressive flow');
-  }
-  if (attributes['progressive.model'] !== model) {
-    issues.push('event attribute progressive.model must match the verifier model');
+  for (const { field, expected } of skillEventAttributeSummaryBindings) {
+    if (!sameAttributeValue(persistedAttributes[field], expected)) {
+      issues.push(`${context} evidence.persistedSkillAttributes.${field} must be ${expectedValueText(expected)}`);
+    }
   }
   return issues;
 }
@@ -664,6 +683,7 @@ function successfulEvidenceIssues(summary, context) {
   if (summary.evidence?.eventCategory !== 'llm') issues.push(`${context} evidence.eventCategory must be llm`);
   if (summary.evidence?.verdict !== 'allow') issues.push(`${context} evidence.verdict must be allow`);
   issues.push(...persistedVerifierAttributeIssues(summary.evidence?.persistedVerifierAttributes, `${context} evidence`));
+  issues.push(...persistedSkillAttributeIssues(summary.evidence?.persistedSkillAttributes, context));
   issues.push(
     ...persistedPreflightAttributeIssues(
       summary.evidence?.persistedPreflightAttributes,
@@ -1537,6 +1557,12 @@ function runVerifierSelfTest() {
       bundleContainsEvent: true,
       bundleEventCount: 1,
       persistedVerifierAttributes: persistedVerifierAttributeEvidence(verifierAttributes),
+      persistedSkillAttributes: {
+        runner: 'a3s-code',
+        skill: 'anysentry-api',
+        flow: expectedProgressiveFlow,
+        model,
+      },
       persistedPreflightAttributes: {
         healthOk: true,
         listed: true,
@@ -1674,7 +1700,7 @@ function runVerifierSelfTest() {
   assert(
     'verifier self-test rejects stored event Skill flow drift',
     skillEventAttributeIssues(driftedSkillEventFlowAttributes).includes(
-      'event attribute progressive.flow must match the expected progressive flow',
+      `event attribute progressive.flow must be ${expectedProgressiveFlow}`,
     ),
     skillEventAttributeIssues(driftedSkillEventFlowAttributes),
   );
@@ -3058,6 +3084,37 @@ function runVerifierSelfTest() {
     ),
     verifierSummaryIssues(driftedPersistedVerifierAttributesSummary),
   );
+  const missingPersistedSkillAttributesSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      persistedSkillAttributes: undefined,
+    },
+  };
+  assert(
+    'verifier self-test rejects passed summaries without persisted Skill attributes',
+    verifierSummaryIssues(missingPersistedSkillAttributesSummary).includes(
+      'passed summary evidence.persistedSkillAttributes must be an object',
+    ),
+    verifierSummaryIssues(missingPersistedSkillAttributesSummary),
+  );
+  const driftedPersistedSkillAttributesSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      persistedSkillAttributes: {
+        ...passedSummary.evidence.persistedSkillAttributes,
+        flow: 'healthz,list',
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects persisted Skill flow drift',
+    verifierSummaryIssues(driftedPersistedSkillAttributesSummary).includes(
+      `passed summary evidence.persistedSkillAttributes.flow must be ${expectedProgressiveFlow}`,
+    ),
+    verifierSummaryIssues(driftedPersistedSkillAttributesSummary),
+  );
   const missingPersistedPreflightSummary = {
     ...passedSummary,
     evidence: {
@@ -3954,6 +4011,7 @@ async function main() {
         bundleContainsEvent: bundle.events?.some((item) => item.eventId === event.eventId) === true,
         bundleEventCount: bundle.summary?.eventCount,
         persistedVerifierAttributes: persistedVerifierAttributeEvidence(event.attributes),
+        persistedSkillAttributes: persistedSkillAttributeEvidence(event.attributes),
         persistedPreflightAttributes: persistedPreflightAttributeEvidence(event.attributes),
         persistedInnerTimingAttributes: persistedInnerTimingAttributeEvidence(event.attributes),
         skillOutput: {
