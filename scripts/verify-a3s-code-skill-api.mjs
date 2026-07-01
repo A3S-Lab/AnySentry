@@ -145,6 +145,8 @@ function verifierSummaryIssues(summary) {
 
   if (summary.status === 'passed') {
     if (summary.failure) issues.push('passed summary must not include failure');
+    if (summary.verifier?.skill !== 'anysentry-api') issues.push('passed summary verifier.skill must be anysentry-api');
+    if (!isPositiveInteger(summary.verifier?.toolCalls)) issues.push('passed summary verifier.toolCalls must be a positive integer');
     if (!isNonEmptyString(summary.evidence?.eventId)) issues.push('passed summary evidence.eventId must be a non-empty string');
     if (!isNonEmptyString(summary.evidence?.bundleId)) issues.push('passed summary evidence.bundleId must be a non-empty string');
     if (!isPositiveInteger(summary.evidence?.bundleEventCount)) issues.push('passed summary evidence.bundleEventCount must be a positive integer');
@@ -162,6 +164,10 @@ function verifierSummaryIssues(summary) {
     if (summary.evidence?.bundleId !== summary.evidence?.skillOutput?.bundleId) issues.push('passed summary bundleId must match skillOutput.bundleId');
     if (summary.evidence?.bundleEventCount !== summary.evidence?.skillOutput?.bundleEventCount) {
       issues.push('passed summary bundleEventCount must match skillOutput.bundleEventCount');
+    }
+    if (!isRecord(summary.warning)) issues.push('passed summary warning must be an object');
+    if (summary.warning?.required === true && summary.warning?.triggered !== true) {
+      issues.push('passed summary required warning must be triggered');
     }
   }
 
@@ -696,6 +702,55 @@ function runVerifierSelfTest() {
     },
   };
   assert('verifier self-test accepts the passed summary contract', verifierSummaryIssues(passedSummary).length === 0, verifierSummaryIssues(passedSummary));
+
+  const missingVerifierSkillSummary = {
+    ...passedSummary,
+    verifier: {
+      ...passedSummary.verifier,
+      skill: undefined,
+    },
+  };
+  assert(
+    'verifier self-test rejects passed summaries without the Skill name',
+    verifierSummaryIssues(missingVerifierSkillSummary).includes('passed summary verifier.skill must be anysentry-api'),
+    verifierSummaryIssues(missingVerifierSkillSummary),
+  );
+  const zeroToolCallSummary = {
+    ...passedSummary,
+    verifier: {
+      ...passedSummary.verifier,
+      toolCalls: 0,
+    },
+  };
+  assert(
+    'verifier self-test rejects passed summaries without tool calls',
+    verifierSummaryIssues(zeroToolCallSummary).includes('passed summary verifier.toolCalls must be a positive integer'),
+    verifierSummaryIssues(zeroToolCallSummary),
+  );
+  const missingWarningSummary = {
+    ...passedSummary,
+    warning: undefined,
+  };
+  assert(
+    'verifier self-test rejects passed summaries without warning budget state',
+    verifierSummaryIssues(missingWarningSummary).includes('passed summary warning must be an object'),
+    verifierSummaryIssues(missingWarningSummary),
+  );
+  const missingRequiredWarningSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      triggered: false,
+      eventId: undefined,
+      bundleId: undefined,
+      isolation: undefined,
+    },
+  };
+  assert(
+    'verifier self-test rejects passed summaries missing a required warning',
+    verifierSummaryIssues(missingRequiredWarningSummary).includes('passed summary required warning must be triggered'),
+    verifierSummaryIssues(missingRequiredWarningSummary),
+  );
 
   const failedSummary = failureSummary(
     'skill_output',

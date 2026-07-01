@@ -355,14 +355,17 @@ runs emit a single-line `VERIFIER_SUMMARY` JSON record with schema
 `anysentry.a3s_code_skill_verifier.summary.v1`, so production automation can
 assert `status`, failure phase, failure evidence, event IDs, warning isolation,
 warning event/bundle bindings, and timing fields without scraping human-readable
-log lines. Success summaries also include the inner Skill output event and
-bundle IDs under `evidence.skillOutput`, and the verifier fails if those IDs do
-not match the rows and Evidence Bundle queried by the outer runtime. Passed
-summary validation also requires both the stored event and the Skill output to
-remain `LlmCall`/`allow`, with `evidence.skillOutput.queriedBack=true`, so
-automation can detect evidence-contract drift from the summary alone. The outer
-and Skill-reported `bundleEventCount` fields must also be positive and equal, so
-automation can catch Evidence Bundle count drift without rebuilding the bundle.
+log lines. Passed summaries must identify `verifier.skill=anysentry-api`, report
+a positive `verifier.toolCalls`, and include the warning budget state; when
+`warning.required=true`, `warning.triggered` must also be true. Success summaries
+also include the inner Skill output event and bundle IDs under
+`evidence.skillOutput`, and the verifier fails if those IDs do not match the rows
+and Evidence Bundle queried by the outer runtime. Passed summary validation also
+requires both the stored event and the Skill output to remain `LlmCall`/`allow`,
+with `evidence.skillOutput.queriedBack=true`, so automation can detect
+evidence-contract drift from the summary alone. The outer and Skill-reported
+`bundleEventCount` fields must also be positive and equal, so automation can
+catch Evidence Bundle count drift without rebuilding the bundle.
 Failed summaries always include an explicit failure evidence status,
 either with the recorded event/bundle IDs or with `recorded=false` plus the reason
 evidence was not written. If the verifier detects that its own summary violates
