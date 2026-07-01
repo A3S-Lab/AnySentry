@@ -64,6 +64,7 @@ const skillOutputTimingFields = [
   'innerBundleMs',
   'innerTotalMs',
 ];
+const eventInnerTimingFields = ['innerHealthzMs', 'innerListMs', 'innerDescribeRecordMs', 'innerPreRecordMs'];
 
 function durationMs(startedAt) {
   return Math.max(0, Date.now() - startedAt);
@@ -195,6 +196,26 @@ function skillOutputTimingIssues(timings, context) {
       if (isFiniteNumber(timings[field]) && timings.innerTotalMs < timings[field]) {
         issues.push(`${context} evidence.skillOutput.timings.innerTotalMs must be greater than or equal to ${field}`);
       }
+    }
+  }
+  return issues;
+}
+
+function eventInnerTimingAttributeIssues(attributes, timings) {
+  const issues = [];
+  if (!isRecord(attributes)) {
+    return ['event attributes must be an object'];
+  }
+  if (!isRecord(timings)) {
+    return ['evidence.skillOutput.timings must be an object'];
+  }
+  for (const field of eventInnerTimingFields) {
+    const expected = timings[field];
+    const attributeKey = `progressive.verifier.${field}`;
+    if (!isFiniteNumber(expected) || expected < 0) {
+      issues.push(`evidence.skillOutput.timings.${field} must be a non-negative number`);
+    } else if (Number(attributes[attributeKey]) !== Math.round(expected)) {
+      issues.push(`event attributes ${attributeKey} must match evidence.skillOutput.timings.${field}`);
     }
   }
   return issues;
@@ -1141,6 +1162,26 @@ function runVerifierSelfTest() {
     },
   };
   assert('verifier self-test accepts the passed summary contract', verifierSummaryIssues(passedSummary).length === 0, verifierSummaryIssues(passedSummary));
+
+  const passedEventTimingAttributes = Object.fromEntries(
+    eventInnerTimingFields.map((field) => [`progressive.verifier.${field}`, passedSummary.evidence.skillOutput.timings[field]]),
+  );
+  assert(
+    'verifier self-test accepts stored event inner timing attributes that match the Skill output',
+    eventInnerTimingAttributeIssues(passedEventTimingAttributes, passedSummary.evidence.skillOutput.timings).length === 0,
+    eventInnerTimingAttributeIssues(passedEventTimingAttributes, passedSummary.evidence.skillOutput.timings),
+  );
+  const driftedEventTimingAttributes = {
+    ...passedEventTimingAttributes,
+    'progressive.verifier.innerListMs': passedSummary.evidence.skillOutput.timings.innerListMs + 1,
+  };
+  assert(
+    'verifier self-test rejects stored event inner timing attributes that drift from the Skill output',
+    eventInnerTimingAttributeIssues(driftedEventTimingAttributes, passedSummary.evidence.skillOutput.timings).includes(
+      'event attributes progressive.verifier.innerListMs must match evidence.skillOutput.timings.innerListMs',
+    ),
+    eventInnerTimingAttributeIssues(driftedEventTimingAttributes, passedSummary.evidence.skillOutput.timings),
+  );
 
   const mismatchedCommitSummary = {
     ...passedSummary,
@@ -2204,6 +2245,14 @@ function runVerifierSelfTest() {
     missingSourceTimingFields.length === 0,
     missingSourceTimingFields,
   );
+  const missingSourceEventTimingAttributes = eventInnerTimingFields.filter(
+    (field) => !source.includes(`progressive.verifier.${field}`),
+  );
+  assert(
+    'verifier self-test keeps all stored event inner timing attributes in the generated verifier source',
+    missingSourceEventTimingAttributes.length === 0,
+    missingSourceEventTimingAttributes,
+  );
 
   if (process.exitCode) process.exit(process.exitCode);
   console.log('a3s-code Skill verifier self-test passed');
@@ -2680,15 +2729,13 @@ async function main() {
       'stored event lost verifier audit metadata',
       { missingOrMismatchedVerifierAttributes: eventAuditIssues, event },
     );
+    const eventInnerTimingIssues = eventInnerTimingAttributeIssues(event?.attributes, skillOutput.timings);
     await requireVerification(
-      'stored event carries inner API timing metadata',
-      Number(event?.attributes?.['progressive.verifier.innerPreRecordMs']) >= 0 &&
-        Number(event?.attributes?.['progressive.verifier.innerHealthzMs']) >= 0 &&
-        Number(event?.attributes?.['progressive.verifier.innerListMs']) >= 0 &&
-        Number(event?.attributes?.['progressive.verifier.innerDescribeRecordMs']) >= 0,
+      'stored event binds pre-record inner API timing metadata to the Skill output',
+      eventInnerTimingIssues.length === 0,
       'event_contract',
-      'stored event lost inner API timing metadata',
-      event,
+      'stored event lost or drifted pre-record inner API timing metadata',
+      { eventInnerTimingIssues, event, skillOutputTimings: skillOutput.timings },
     );
     const bundleStartedAt = Date.now();
     const bundle = await request('/capabilities', {
