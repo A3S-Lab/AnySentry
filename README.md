@@ -356,7 +356,10 @@ also include the inner Skill output event and bundle IDs, and the verifier fails
 if those IDs do not match the rows and Evidence Bundle queried by the outer
 runtime. Failed summaries always include an explicit failure evidence status,
 either with the recorded event/bundle IDs or with `recorded=false` plus the reason
-evidence was not written. `pnpm verify:a3s-code-skill-api:self-test` validates that summary
+evidence was not written. If the verifier detects that its own summary violates
+the contract, the emitted summary is converted to `status=failed` with
+`failure.phase=summary_validation` so automation can trust the top-level status.
+`pnpm verify:a3s-code-skill-api:self-test` validates that summary
 contract and the Skill-output JSON parser offline, so the production verifier's
 machine-readable handoff is checked without adding a parallel soak path.
 Timeout handling closes the a3s-code session before writing failure evidence, and

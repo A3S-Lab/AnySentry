@@ -177,18 +177,18 @@ function verifierSummaryIssues(summary) {
   return issues;
 }
 
-function printVerifierSummary(summary) {
+function normalizedVerifierSummary(summary) {
   const issues = verifierSummaryIssues(summary);
   if (issues.length > 0) {
-    process.exitCode = 1;
-    summary = {
-      ...summary,
-      summaryValidation: {
-        status: 'failed',
-        issues,
-      },
-    };
+    return summaryValidationFailureSummary(summary, issues);
   }
+  return summary;
+}
+
+function printVerifierSummary(summary) {
+  const normalizedSummary = normalizedVerifierSummary(summary);
+  if (normalizedSummary !== summary) process.exitCode = 1;
+  summary = normalizedSummary;
   verifierSummaryPrinted = true;
   console.log(`VERIFIER_SUMMARY ${JSON.stringify(summary)}`);
   console.log(JSON.stringify(summary, null, 2));
@@ -216,6 +216,44 @@ function defaultFailureEvidence(phase) {
   return {
     recorded: false,
     error: `failure evidence was not attempted for phase ${phase}`,
+  };
+}
+
+function summaryValidationFailureSummary(summary, issues) {
+  const base = verifierSummaryBase('failed');
+  const originalVerifier = isRecord(summary?.verifier) ? summary.verifier : {};
+  const originalTarget = isRecord(summary?.target) ? summary.target : {};
+  return {
+    ...base,
+    verifier: {
+      ...base.verifier,
+      ...originalVerifier,
+      name: 'verify-a3s-code-skill-api',
+      commit: isNonEmptyString(originalVerifier.commit) ? originalVerifier.commit : verifierCommit,
+      model: isNonEmptyString(originalVerifier.model) ? originalVerifier.model : model,
+    },
+    target: {
+      ...base.target,
+      apiBase: isNonEmptyString(originalTarget.apiBase) ? originalTarget.apiBase : apiBase,
+      runId: isNonEmptyString(originalTarget.runId) ? originalTarget.runId : runId,
+      agentId: isNonEmptyString(originalTarget.agentId) ? originalTarget.agentId : agentId,
+      sessionId: isNonEmptyString(originalTarget.sessionId) ? originalTarget.sessionId : sessionId,
+    },
+    failure: {
+      phase: 'summary_validation',
+      reason: 'verifier summary contract validation failed',
+      details: {
+        issues,
+        originalStatus: isRecord(summary) ? summary.status : undefined,
+        originalFailurePhase: isRecord(summary) ? summary.failure?.phase : undefined,
+      },
+      evidence: defaultFailureEvidence('summary_validation'),
+    },
+    summaryValidation: {
+      status: 'failed',
+      issues,
+    },
+    timings: isRecord(summary?.timings) ? summary.timings : {},
   };
 }
 
@@ -667,6 +705,14 @@ function runVerifierSelfTest() {
     'verifier self-test rejects mismatched Skill output IDs',
     verifierSummaryIssues(mismatchedSummary).includes('passed summary bundleId must match skillOutput.bundleId'),
     verifierSummaryIssues(mismatchedSummary),
+  );
+  const normalizedMismatch = normalizedVerifierSummary(mismatchedSummary);
+  assert(
+    'verifier self-test converts invalid passed summaries into failed summary-validation results',
+    normalizedMismatch.status === 'failed' &&
+      normalizedMismatch.failure?.phase === 'summary_validation' &&
+      verifierSummaryIssues(normalizedMismatch).length === 0,
+    { summary: normalizedMismatch, issues: verifierSummaryIssues(normalizedMismatch) },
   );
 
   const invalidFailureSummary = {
