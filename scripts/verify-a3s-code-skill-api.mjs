@@ -83,7 +83,7 @@ async function withTimeout(label, task, timeoutMs, onTimeout) {
 
 async function recordFailureEvidence(reason, details) {
   try {
-    await request('/capabilities', {
+    const recorded = await request('/capabilities', {
       method: 'POST',
       body: JSON.stringify({
         action: 'execute',
@@ -116,9 +116,46 @@ async function recordFailureEvidence(reason, details) {
         },
       }),
     });
-    console.error(`Recorded AnySentry failure evidence for ${reason}`);
+    const recordedEventId = recorded?.items?.[0]?.eventId;
+    const failureEvent = await eventually('failure evidence to be queryable', async () => {
+      const list = await request('/events/list', {
+        method: 'POST',
+        body: JSON.stringify({ timeType: 'last_30d', runId, agentId, limit: 20 }),
+      });
+      return list.items?.find(
+        (item) =>
+          item.runId === runId &&
+          item.agentId === agentId &&
+          (item.eventId === recordedEventId || item.attributes?.['progressive.failure'] === true || item.attributes?.['progressive.failure'] === 'true'),
+      );
+    });
+    if (!failureEvent?.eventId) {
+      throw new Error(`failure evidence did not become queryable: ${compact({ recorded, failureEvent })}`);
+    }
+    if (!failureEvent.verdict || failureEvent.verdict === 'allow' || failureEvent.riskCategory !== 'runtime_failure') {
+      throw new Error(`failure evidence was not actionable runtime failure evidence: ${compact(failureEvent)}`);
+    }
+    const bundle = await request('/capabilities', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'execute',
+        module: 'security-center',
+        operation: 'buildEvidenceBundle',
+        params: {
+          timeType: 'last_30d',
+          eventId: failureEvent.eventId,
+          limit: 20,
+        },
+      }),
+    });
+    if (bundle?.schemaVersion !== 'anysentry.evidence_bundle.v1' || !bundle.events?.some((item) => item.eventId === failureEvent.eventId)) {
+      throw new Error(`failure evidence bundle did not include the failure event: ${compact(bundle)}`);
+    }
+    console.error(
+      `Recorded and verified AnySentry failure evidence for ${reason}: ${failureEvent.eventId}, bundle ${bundle.bundleId}`,
+    );
   } catch (error) {
-    console.error(`Unable to record AnySentry failure evidence: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`Unable to record or verify AnySentry failure evidence: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
