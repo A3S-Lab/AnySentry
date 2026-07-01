@@ -221,6 +221,40 @@ function eventInnerTimingAttributeIssues(attributes, timings) {
   return issues;
 }
 
+function evidenceBundleBindingIssues(bundle, skillOutput, eventId) {
+  const issues = [];
+  if (!isRecord(bundle)) {
+    return ['bundle must be an object'];
+  }
+  if (!isRecord(skillOutput)) {
+    return ['skillOutput must be an object'];
+  }
+  if (!isNonEmptyString(skillOutput.bundleId)) {
+    issues.push('skillOutput.bundleId must be a non-empty string');
+  } else if (bundle.bundleId !== skillOutput.bundleId) {
+    issues.push('bundle.bundleId must match skillOutput.bundleId');
+  }
+  if (bundle.schemaVersion !== 'anysentry.evidence_bundle.v1') {
+    issues.push('bundle.schemaVersion must be anysentry.evidence_bundle.v1');
+  }
+  if (bundle.schemaVersion !== skillOutput.bundleSchemaVersion) {
+    issues.push('bundle.schemaVersion must match skillOutput.bundleSchemaVersion');
+  }
+  const bundleContainsEvent = Array.isArray(bundle.events) && bundle.events.some((item) => item.eventId === eventId);
+  if (bundleContainsEvent !== true) {
+    issues.push('bundle.events must contain the stored event');
+  }
+  if (bundleContainsEvent !== skillOutput.bundleContainsEvent) {
+    issues.push('bundle event membership must match skillOutput.bundleContainsEvent');
+  }
+  if (!isPositiveInteger(skillOutput.bundleEventCount)) {
+    issues.push('skillOutput.bundleEventCount must be a positive integer');
+  } else if (bundle.summary?.eventCount !== skillOutput.bundleEventCount) {
+    issues.push('bundle.summary.eventCount must match skillOutput.bundleEventCount');
+  }
+  return issues;
+}
+
 function successfulEvidenceIssues(summary, context) {
   const issues = [];
   if (!isNonEmptyString(summary.evidence?.eventId)) issues.push(`${context} evidence.eventId must be a non-empty string`);
@@ -1181,6 +1215,28 @@ function runVerifierSelfTest() {
       'event attributes progressive.verifier.innerListMs must match evidence.skillOutput.timings.innerListMs',
     ),
     eventInnerTimingAttributeIssues(driftedEventTimingAttributes, passedSummary.evidence.skillOutput.timings),
+  );
+  const passedBundle = {
+    bundleId: passedSummary.evidence.bundleId,
+    schemaVersion: passedSummary.evidence.bundleSchemaVersion,
+    events: [{ eventId: passedSummary.evidence.eventId }],
+    summary: { eventCount: passedSummary.evidence.bundleEventCount },
+  };
+  assert(
+    'verifier self-test accepts Evidence Bundle metadata that matches the Skill output',
+    evidenceBundleBindingIssues(passedBundle, passedSummary.evidence.skillOutput, passedSummary.evidence.eventId).length === 0,
+    evidenceBundleBindingIssues(passedBundle, passedSummary.evidence.skillOutput, passedSummary.evidence.eventId),
+  );
+  const driftedBundleCount = {
+    ...passedBundle,
+    summary: { eventCount: passedSummary.evidence.bundleEventCount + 1 },
+  };
+  assert(
+    'verifier self-test rejects Evidence Bundle counts that drift from the Skill output',
+    evidenceBundleBindingIssues(driftedBundleCount, passedSummary.evidence.skillOutput, passedSummary.evidence.eventId).includes(
+      'bundle.summary.eventCount must match skillOutput.bundleEventCount',
+    ),
+    evidenceBundleBindingIssues(driftedBundleCount, passedSummary.evidence.skillOutput, passedSummary.evidence.eventId),
   );
 
   const mismatchedCommitSummary = {
@@ -2760,19 +2816,14 @@ async function main() {
       'evidence bundle did not include the stored event',
       bundle,
     );
-    assert('Evidence Bundle ID matches the Skill output', bundle?.bundleId === skillOutput.bundleId, { bundle, skillOutput });
-    if (bundle?.bundleId !== skillOutput.bundleId) {
-      timings.elapsed = durationMs(verifierStartedAt);
-      const reason = 'evidence bundle did not match the Skill output';
-      const details = { eventId: event.eventId, outerBundleId: bundle?.bundleId, skillBundleId: skillOutput.bundleId };
-      const failureTimings = {
-        ...timings,
-        failurePhase: 'evidence_bundle',
-      };
-      const failureEvidence = await recordFailureEvidence(reason, details, failureTimings);
-      printVerifierSummary(failureSummary('evidence_bundle', reason, details, failureTimings, failureEvidence));
-      throw new Error(reason);
-    }
+    const bundleBindingIssues = evidenceBundleBindingIssues(bundle, skillOutput, event.eventId);
+    await requireVerification(
+      'Evidence Bundle metadata matches the Skill output',
+      bundleBindingIssues.length === 0,
+      'evidence_bundle',
+      'evidence bundle metadata did not match the Skill output',
+      { bundleBindingIssues, eventId: event.eventId, bundle, skillOutput },
+    );
     let warningEvent;
     try {
       warningEvent = await recordNearTimeoutWarning(event, bundle, timings);
