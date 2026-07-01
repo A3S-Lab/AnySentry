@@ -337,6 +337,10 @@ remain queryable and bundleable; the verifier now queries the failure event back
 and builds an Evidence Bundle before reporting the failure. Both success and
 failure evidence include verifier audit metadata such as the git commit, timeout
 configuration, model, verifier schema version, and phase timing diagnostics.
+Successful runs that spend more than `A3S_CODE_NEAR_TIMEOUT_RATIO` (default
+`0.5`) of the configured timeout in the a3s-code Skill call also record an
+allow-level `near_timeout` warning event, so soak runs can spot latency drift
+before it becomes a hard timeout.
 Timeout handling closes the a3s-code session before writing failure evidence, and
 `A3S_CODE_SESSION_CLOSE_TIMEOUT_MS` bounds that cleanup so a stuck close cannot
 suppress the failure finding. Coding-agent producer aliases such as

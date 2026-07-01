@@ -27,6 +27,8 @@ function positiveIntEnv(name, fallback, max) {
 
 const skillTimeoutMs = positiveIntEnv('A3S_CODE_SKILL_TIMEOUT_MS', 240000, 900000);
 const sessionCloseTimeoutMs = positiveIntEnv('A3S_CODE_SESSION_CLOSE_TIMEOUT_MS', 5000, 60000);
+const nearTimeoutRatio = Number(process.env.A3S_CODE_NEAR_TIMEOUT_RATIO ?? 0.5);
+const nearTimeoutThresholdRatio = Number.isFinite(nearTimeoutRatio) && nearTimeoutRatio > 0 && nearTimeoutRatio < 1 ? nearTimeoutRatio : 0.5;
 const verifierCommit = currentGitCommit();
 const verifierAttributes = {
   'progressive.verifier': 'verify-a3s-code-skill-api',
@@ -34,6 +36,7 @@ const verifierAttributes = {
   'progressive.verifier.commit': verifierCommit,
   'progressive.verifier.skillTimeoutMs': skillTimeoutMs,
   'progressive.verifier.sessionCloseTimeoutMs': sessionCloseTimeoutMs,
+  'progressive.verifier.nearTimeoutRatio': nearTimeoutThresholdRatio,
   'progressive.verifier.model': model,
   'progressive.verifier.node': process.version,
 };
@@ -219,6 +222,79 @@ async function recordFailureEvidence(reason, details, timings) {
   } catch (error) {
     console.error(`Unable to record or verify AnySentry failure evidence: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+async function recordNearTimeoutWarning(event, bundle, timings) {
+  if (timings.skill < skillTimeoutMs * nearTimeoutThresholdRatio) return undefined;
+  const warningAttributes = {
+    ...verifierAttributes,
+    ...timingAttributes(timings),
+    'progressive.runner': 'a3s-code',
+    'progressive.skill': 'anysentry-api',
+    'progressive.warning': 'near_timeout',
+    'progressive.warning.reason': 'a3s-code Skill verifier completed close to its timeout budget',
+    'progressive.warning.eventId': event.eventId,
+    'progressive.warning.bundleId': bundle.bundleId,
+    'progressive.warning.thresholdMs': Math.round(skillTimeoutMs * nearTimeoutThresholdRatio),
+  };
+  const recorded = await request('/capabilities', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'execute',
+      module: 'security-center',
+      operation: 'recordSecurityEvents',
+      params: {
+        sourceName: 'a3s-code-skill-itest',
+        sourceType: 'custom',
+        workspacePath,
+        agentId,
+        sessionId,
+        events: [
+          {
+            kind: 'LlmCall',
+            workspacePath,
+            agentId,
+            sessionId,
+            runId,
+            model,
+            subject: `a3s-code Skill progressive API verification slow success: ${timings.skill}ms of ${skillTimeoutMs}ms`,
+            promptTokens: 0,
+            completionTokens: 0,
+            latencyMs: timings.skill,
+            attributes: warningAttributes,
+          },
+        ],
+      },
+    }),
+  });
+  const warningEventId = recorded?.items?.[0]?.eventId;
+  const warningEvent = await eventually('near-timeout warning evidence to be queryable', async () => {
+    const list = await request('/events/list', {
+      method: 'POST',
+      body: JSON.stringify({ timeType: 'last_30d', runId, agentId, limit: 20 }),
+    });
+    return list.items?.find(
+      (item) =>
+        item.eventId === warningEventId ||
+        (item.attributes?.['progressive.warning'] === 'near_timeout' && item.attributes?.['progressive.warning.eventId'] === event.eventId),
+    );
+  });
+  if (!warningEvent?.eventId) {
+    throw new Error(`near-timeout warning evidence did not become queryable: ${compact({ recorded, warningEvent })}`);
+  }
+  if (warningEvent.verdict !== 'allow') {
+    throw new Error(`near-timeout warning should remain allow evidence: ${compact(warningEvent)}`);
+  }
+  const warningAttrs = warningEvent.attributes ?? {};
+  if (
+    warningAttrs['progressive.verifier.commit'] !== verifierCommit ||
+    warningAttrs['progressive.warning'] !== 'near_timeout' ||
+    warningAttrs['progressive.warning.eventId'] !== event.eventId ||
+    Number(warningAttrs['progressive.verifier.skillMs']) !== Math.round(timings.skill)
+  ) {
+    throw new Error(`near-timeout warning lost audit metadata: ${compact(warningEvent)}`);
+  }
+  return warningEvent;
 }
 
 async function loadA3sCode() {
@@ -608,6 +684,8 @@ async function main() {
       bundle?.schemaVersion === 'anysentry.evidence_bundle.v1' && bundle.events?.some((item) => item.eventId === event.eventId),
       bundle,
     );
+    const warningEvent = await recordNearTimeoutWarning(event, bundle, timings);
+    if (warningEvent) pass('near-timeout success warning evidence is queryable and non-blocking');
 
     console.log(
       JSON.stringify(
@@ -618,6 +696,7 @@ async function main() {
           agentId,
           eventId: event.eventId,
           bundleId: bundle.bundleId,
+          warningEventId: warningEvent?.eventId,
           verdict: event.verdict,
           toolCalls: metadata.tool_calls,
           timings,
