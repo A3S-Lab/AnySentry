@@ -382,8 +382,9 @@ requires both the stored event and the Skill output to remain
 `LlmCall`/`llm`/`allow`, with matching event categories and
 `evidence.skillOutput.queriedBack=true`, so automation can detect
 evidence-contract drift from the summary alone. The outer and Skill-reported
-`bundleEventCount` fields must also be positive and equal, so automation can
-catch Evidence Bundle count drift without rebuilding the bundle.
+Evidence Bundle schema, event-membership flag, and `bundleEventCount` fields
+must also be valid and equal, so automation can catch bundle schema, membership,
+and count drift without rebuilding the bundle.
 Failed summaries always include an explicit failure evidence status,
 either with the recorded event/bundle IDs or with `recorded=false` plus the reason
 evidence was not written. If a failed summary also includes top-level success

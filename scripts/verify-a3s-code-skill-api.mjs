@@ -167,6 +167,10 @@ function successfulEvidenceIssues(summary, context) {
   if (!isNonEmptyString(summary.evidence?.agentId)) issues.push(`${context} evidence.agentId must be a non-empty string`);
   if (!isNonEmptyString(summary.evidence?.sessionId)) issues.push(`${context} evidence.sessionId must be a non-empty string`);
   if (!isNonEmptyString(summary.evidence?.bundleId)) issues.push(`${context} evidence.bundleId must be a non-empty string`);
+  if (summary.evidence?.bundleSchemaVersion !== 'anysentry.evidence_bundle.v1') {
+    issues.push(`${context} evidence.bundleSchemaVersion must be anysentry.evidence_bundle.v1`);
+  }
+  if (summary.evidence?.bundleContainsEvent !== true) issues.push(`${context} evidence.bundleContainsEvent must be true`);
   if (!isPositiveInteger(summary.evidence?.bundleEventCount)) issues.push(`${context} evidence.bundleEventCount must be a positive integer`);
   if (summary.evidence?.eventKind !== 'LlmCall') issues.push(`${context} evidence.eventKind must be LlmCall`);
   if (summary.evidence?.eventCategory !== 'llm') issues.push(`${context} evidence.eventCategory must be llm`);
@@ -188,6 +192,12 @@ function successfulEvidenceIssues(summary, context) {
   }
   if (!isNonEmptyString(summary.evidence?.skillOutput?.bundleId)) {
     issues.push(`${context} evidence.skillOutput.bundleId must be a non-empty string`);
+  }
+  if (summary.evidence?.skillOutput?.bundleSchemaVersion !== 'anysentry.evidence_bundle.v1') {
+    issues.push(`${context} evidence.skillOutput.bundleSchemaVersion must be anysentry.evidence_bundle.v1`);
+  }
+  if (summary.evidence?.skillOutput?.bundleContainsEvent !== true) {
+    issues.push(`${context} evidence.skillOutput.bundleContainsEvent must be true`);
   }
   if (!isPositiveInteger(summary.evidence?.skillOutput?.bundleEventCount)) {
     issues.push(`${context} evidence.skillOutput.bundleEventCount must be a positive integer`);
@@ -237,6 +247,12 @@ function successfulEvidenceIssues(summary, context) {
   }
   if (summary.evidence?.bundleId !== summary.evidence?.skillOutput?.bundleId) {
     issues.push(`${context} bundleId must match skillOutput.bundleId`);
+  }
+  if (summary.evidence?.bundleSchemaVersion !== summary.evidence?.skillOutput?.bundleSchemaVersion) {
+    issues.push(`${context} bundleSchemaVersion must match skillOutput.bundleSchemaVersion`);
+  }
+  if (summary.evidence?.bundleContainsEvent !== summary.evidence?.skillOutput?.bundleContainsEvent) {
+    issues.push(`${context} bundleContainsEvent must match skillOutput.bundleContainsEvent`);
   }
   if (summary.evidence?.bundleEventCount !== summary.evidence?.skillOutput?.bundleEventCount) {
     issues.push(`${context} bundleEventCount must match skillOutput.bundleEventCount`);
@@ -916,6 +932,8 @@ function runVerifierSelfTest() {
       eventCategory: 'llm',
       verdict: 'allow',
       bundleId: 'evb_self_test',
+      bundleSchemaVersion: 'anysentry.evidence_bundle.v1',
+      bundleContainsEvent: true,
       bundleEventCount: 1,
       skillOutput: {
         eventId: 'evt_self_test',
@@ -927,6 +945,8 @@ function runVerifierSelfTest() {
         eventCategory: 'llm',
         verdict: 'allow',
         bundleId: 'evb_self_test',
+        bundleSchemaVersion: 'anysentry.evidence_bundle.v1',
+        bundleContainsEvent: true,
         bundleEventCount: 1,
         queriedBack: true,
       },
@@ -1570,6 +1590,49 @@ function runVerifierSelfTest() {
     ),
     verifierSummaryIssues(mismatchedBundleCountSummary),
   );
+  const driftedBundleSchemaSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      bundleSchemaVersion: 'legacy.bundle.v0',
+    },
+  };
+  assert(
+    'verifier self-test rejects success evidence with drifted bundle schema',
+    verifierSummaryIssues(driftedBundleSchemaSummary).includes(
+      'passed summary evidence.bundleSchemaVersion must be anysentry.evidence_bundle.v1',
+    ),
+    verifierSummaryIssues(driftedBundleSchemaSummary),
+  );
+  const missingBundleEventSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      bundleContainsEvent: false,
+    },
+  };
+  assert(
+    'verifier self-test rejects success bundles that do not include the event',
+    verifierSummaryIssues(missingBundleEventSummary).includes('passed summary evidence.bundleContainsEvent must be true'),
+    verifierSummaryIssues(missingBundleEventSummary),
+  );
+  const driftedSkillBundleContainsSummary = {
+    ...passedSummary,
+    evidence: {
+      ...passedSummary.evidence,
+      skillOutput: {
+        ...passedSummary.evidence.skillOutput,
+        bundleContainsEvent: false,
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects Skill output bundles that do not include the event',
+    verifierSummaryIssues(driftedSkillBundleContainsSummary).includes(
+      'passed summary evidence.skillOutput.bundleContainsEvent must be true',
+    ),
+    verifierSummaryIssues(driftedSkillBundleContainsSummary),
+  );
   const missingWarningBundleSummary = {
     ...passedSummary,
     warning: {
@@ -1793,6 +1856,8 @@ console.log(JSON.stringify({
   described: operation.name,
   eventId,
   bundleId: bundle.bundleId,
+  bundleSchemaVersion: bundle.schemaVersion,
+  bundleContainsEvent: bundle.events?.some((item) => item.eventId === eventId) === true,
   bundleEventCount: bundle.summary?.eventCount,
   eventKind: event.eventKind,
   eventCategory: event.eventCategory,
@@ -2040,6 +2105,8 @@ async function main() {
       skillOutput.eventKind === 'LlmCall' &&
       skillOutput.eventCategory === 'llm' &&
       skillOutput.verdict === 'allow' &&
+      skillOutput.bundleSchemaVersion === 'anysentry.evidence_bundle.v1' &&
+      skillOutput.bundleContainsEvent === true &&
       skillOutput.queriedBack === true;
     assert('Skill output reports the recorded LlmCall allow event and bundle for this run', outputMatchesRun, skillOutput);
     if (!outputMatchesRun) {
@@ -2225,6 +2292,8 @@ async function main() {
         eventCategory: event.eventCategory,
         verdict: event.verdict,
         bundleId: bundle.bundleId,
+        bundleSchemaVersion: bundle.schemaVersion,
+        bundleContainsEvent: bundle.events?.some((item) => item.eventId === event.eventId) === true,
         bundleEventCount: bundle.summary?.eventCount,
         skillOutput: {
           eventId: skillOutput.eventId,
@@ -2236,6 +2305,8 @@ async function main() {
           eventCategory: skillOutput.eventCategory,
           verdict: skillOutput.verdict,
           bundleId: skillOutput.bundleId,
+          bundleSchemaVersion: skillOutput.bundleSchemaVersion,
+          bundleContainsEvent: skillOutput.bundleContainsEvent,
           bundleEventCount: skillOutput.bundleEventCount,
           queriedBack: skillOutput.queriedBack,
         },
