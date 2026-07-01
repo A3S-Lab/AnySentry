@@ -368,7 +368,9 @@ evidence-contract drift from the summary alone. The outer and Skill-reported
 catch Evidence Bundle count drift without rebuilding the bundle.
 Failed summaries always include an explicit failure evidence status,
 either with the recorded event/bundle IDs or with `recorded=false` plus the reason
-evidence was not written. Recorded failure evidence must be the canonical
+evidence was not written. If a failed summary also includes top-level success
+`evidence`, that evidence must satisfy the same stored-event and Skill-output
+contract as a passed summary. Recorded failure evidence must be the canonical
 `SecurityAction`/`security` event produced from the verifier's `SecurityFinding`,
 must carry a non-allow verdict, must use `riskCategory=runtime_failure`, and
 must include a positive Evidence Bundle count. When a required near-timeout

@@ -139,6 +139,37 @@ function evidenceFieldMismatchIssues(prefix, actual, expected, fields) {
   return issues;
 }
 
+function successfulEvidenceIssues(summary, context) {
+  const issues = [];
+  if (!isNonEmptyString(summary.evidence?.eventId)) issues.push(`${context} evidence.eventId must be a non-empty string`);
+  if (!isNonEmptyString(summary.evidence?.bundleId)) issues.push(`${context} evidence.bundleId must be a non-empty string`);
+  if (!isPositiveInteger(summary.evidence?.bundleEventCount)) issues.push(`${context} evidence.bundleEventCount must be a positive integer`);
+  if (summary.evidence?.eventKind !== 'LlmCall') issues.push(`${context} evidence.eventKind must be LlmCall`);
+  if (summary.evidence?.verdict !== 'allow') issues.push(`${context} evidence.verdict must be allow`);
+  if (!isNonEmptyString(summary.evidence?.skillOutput?.eventId)) {
+    issues.push(`${context} evidence.skillOutput.eventId must be a non-empty string`);
+  }
+  if (!isNonEmptyString(summary.evidence?.skillOutput?.bundleId)) {
+    issues.push(`${context} evidence.skillOutput.bundleId must be a non-empty string`);
+  }
+  if (!isPositiveInteger(summary.evidence?.skillOutput?.bundleEventCount)) {
+    issues.push(`${context} evidence.skillOutput.bundleEventCount must be a positive integer`);
+  }
+  if (summary.evidence?.skillOutput?.eventKind !== 'LlmCall') issues.push(`${context} evidence.skillOutput.eventKind must be LlmCall`);
+  if (summary.evidence?.skillOutput?.verdict !== 'allow') issues.push(`${context} evidence.skillOutput.verdict must be allow`);
+  if (summary.evidence?.skillOutput?.queriedBack !== true) issues.push(`${context} evidence.skillOutput.queriedBack must be true`);
+  if (summary.evidence?.eventId !== summary.evidence?.skillOutput?.eventId) {
+    issues.push(`${context} eventId must match skillOutput.eventId`);
+  }
+  if (summary.evidence?.bundleId !== summary.evidence?.skillOutput?.bundleId) {
+    issues.push(`${context} bundleId must match skillOutput.bundleId`);
+  }
+  if (summary.evidence?.bundleEventCount !== summary.evidence?.skillOutput?.bundleEventCount) {
+    issues.push(`${context} bundleEventCount must match skillOutput.bundleEventCount`);
+  }
+  return issues;
+}
+
 function verifierSummaryIssues(summary) {
   const issues = [];
   if (!isRecord(summary)) return ['summary must be an object'];
@@ -157,24 +188,7 @@ function verifierSummaryIssues(summary) {
     if (summary.failure) issues.push('passed summary must not include failure');
     if (summary.verifier?.skill !== 'anysentry-api') issues.push('passed summary verifier.skill must be anysentry-api');
     if (!isPositiveInteger(summary.verifier?.toolCalls)) issues.push('passed summary verifier.toolCalls must be a positive integer');
-    if (!isNonEmptyString(summary.evidence?.eventId)) issues.push('passed summary evidence.eventId must be a non-empty string');
-    if (!isNonEmptyString(summary.evidence?.bundleId)) issues.push('passed summary evidence.bundleId must be a non-empty string');
-    if (!isPositiveInteger(summary.evidence?.bundleEventCount)) issues.push('passed summary evidence.bundleEventCount must be a positive integer');
-    if (summary.evidence?.eventKind !== 'LlmCall') issues.push('passed summary evidence.eventKind must be LlmCall');
-    if (summary.evidence?.verdict !== 'allow') issues.push('passed summary evidence.verdict must be allow');
-    if (!isNonEmptyString(summary.evidence?.skillOutput?.eventId)) issues.push('passed summary evidence.skillOutput.eventId must be a non-empty string');
-    if (!isNonEmptyString(summary.evidence?.skillOutput?.bundleId)) issues.push('passed summary evidence.skillOutput.bundleId must be a non-empty string');
-    if (!isPositiveInteger(summary.evidence?.skillOutput?.bundleEventCount)) {
-      issues.push('passed summary evidence.skillOutput.bundleEventCount must be a positive integer');
-    }
-    if (summary.evidence?.skillOutput?.eventKind !== 'LlmCall') issues.push('passed summary evidence.skillOutput.eventKind must be LlmCall');
-    if (summary.evidence?.skillOutput?.verdict !== 'allow') issues.push('passed summary evidence.skillOutput.verdict must be allow');
-    if (summary.evidence?.skillOutput?.queriedBack !== true) issues.push('passed summary evidence.skillOutput.queriedBack must be true');
-    if (summary.evidence?.eventId !== summary.evidence?.skillOutput?.eventId) issues.push('passed summary eventId must match skillOutput.eventId');
-    if (summary.evidence?.bundleId !== summary.evidence?.skillOutput?.bundleId) issues.push('passed summary bundleId must match skillOutput.bundleId');
-    if (summary.evidence?.bundleEventCount !== summary.evidence?.skillOutput?.bundleEventCount) {
-      issues.push('passed summary bundleEventCount must match skillOutput.bundleEventCount');
-    }
+    issues.push(...successfulEvidenceIssues(summary, 'passed summary'));
     if (!isRecord(summary.warning)) issues.push('passed summary warning must be an object');
     if (summary.warning?.required === true && summary.warning?.triggered !== true) {
       issues.push('passed summary required warning must be triggered');
@@ -205,6 +219,9 @@ function verifierSummaryIssues(summary) {
       }
     } else if (!isNonEmptyString(evidence.error)) {
       issues.push('unrecorded failure evidence.error must explain why evidence was not written');
+    }
+    if (summary.evidence !== undefined) {
+      issues.push(...successfulEvidenceIssues(summary, 'failed summary'));
     }
   }
 
@@ -869,6 +886,19 @@ function runVerifierSelfTest() {
     'verifier self-test accepts required-warning failures bound to top-level evidence',
     verifierSummaryIssues(requiredWarningFailureSummary).length === 0,
     verifierSummaryIssues(requiredWarningFailureSummary),
+  );
+
+  const driftedFailedEvidenceSummary = {
+    ...requiredWarningFailureSummary,
+    evidence: {
+      ...requiredWarningFailureSummary.evidence,
+      eventKind: 'RuntimeEvent',
+    },
+  };
+  assert(
+    'verifier self-test rejects failed summaries with drifted top-level evidence',
+    verifierSummaryIssues(driftedFailedEvidenceSummary).includes('failed summary evidence.eventKind must be LlmCall'),
+    verifierSummaryIssues(driftedFailedEvidenceSummary),
   );
 
   const driftedWarningFailureSummary = {
