@@ -380,9 +380,10 @@ Triggered warnings must be separate `RuntimeEvent`/`runtime`/`allow` rows, not
 the success `LlmCall` row, so summary-only automation can verify that latency
 warnings did not pollute LLM evidence. Triggered warning summaries also bind the
 warning row's `workspacePath`, `runId`, `agentId`, and `sessionId` to the target
-identity, expose `warning.persistedVerifierAttributes` from the warning row's
-stored audit metadata, and expose `warning.sourceEventId`, which must match the
-success evidence event. The warning reason binds to the same canonical
+identity, expose `warning.persistedVerifierAttributes` and
+`warning.persistedTimingAttributes` from the warning row's stored audit
+metadata, and expose `warning.sourceEventId`, which must match the success
+evidence event. The warning reason binds to the same canonical
 `progressive.warning.reason` value recorded on the runtime warning row. The
 warning bundle fields bind to the same Evidence Bundle as the success evidence:
 `warning.bundleSchemaVersion` must be

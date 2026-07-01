@@ -108,6 +108,42 @@ function timingAttributes(timings = {}) {
   return out;
 }
 
+function timingAttributeKey(key, value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return `progressive.verifier.${key}Ms`;
+  if (typeof value === 'string' && value.trim()) return `progressive.verifier.${key}`;
+  return undefined;
+}
+
+function persistedTimingAttributeEvidence(attributes, timings) {
+  if (!isRecord(attributes) || !isRecord(timings)) return {};
+  const out = {};
+  for (const [key, value] of Object.entries(timings)) {
+    const attributeKey = timingAttributeKey(key, value);
+    if (attributeKey) out[key] = attributes[attributeKey];
+  }
+  return out;
+}
+
+function persistedTimingAttributeIssues(persistedTimings, timings, context) {
+  const issues = [];
+  if (!isRecord(persistedTimings)) {
+    return [`${context}.persistedTimingAttributes must be an object`];
+  }
+  if (!isRecord(timings)) {
+    return [`${context} timings must be an object`];
+  }
+  for (const [key, expected] of Object.entries(timings)) {
+    if (typeof expected === 'number' && Number.isFinite(expected)) {
+      if (Number(persistedTimings[key]) !== Math.round(expected)) {
+        issues.push(`${context}.persistedTimingAttributes.${key} must match timings.${key}`);
+      }
+    } else if (typeof expected === 'string' && expected.trim() && persistedTimings[key] !== expected.trim()) {
+      issues.push(`${context}.persistedTimingAttributes.${key} must match timings.${key}`);
+    }
+  }
+  return issues;
+}
+
 function sameAttributeValue(actual, expected) {
   if (typeof expected === 'number') return Number(actual) === expected;
   if (typeof expected === 'boolean') return actual === expected || String(actual).toLowerCase() === String(expected);
@@ -975,6 +1011,7 @@ function verifierSummaryIssues(summary) {
         issues.push('triggered warning.bundleEventCount must match evidence.bundleEventCount');
       }
       issues.push(...persistedVerifierAttributeIssues(summary.warning?.persistedVerifierAttributes, 'triggered warning'));
+      issues.push(...persistedTimingAttributeIssues(summary.warning?.persistedTimingAttributes, summary.timings, 'triggered warning'));
       if (summary.warning?.isolation?.warningRows !== 1) issues.push('triggered warning isolation.warningRows must be 1');
       if (summary.warning?.isolation?.llmPollutionCount !== 0) issues.push('triggered warning isolation.llmPollutionCount must be 0');
     } else if (summary.warning?.triggered === false) {
@@ -994,6 +1031,9 @@ function verifierSummaryIssues(summary) {
       if (summary.warning?.bundleEventCount !== undefined) issues.push('untriggered warning.bundleEventCount must be absent');
       if (summary.warning?.persistedVerifierAttributes !== undefined) {
         issues.push('untriggered warning.persistedVerifierAttributes must be absent');
+      }
+      if (summary.warning?.persistedTimingAttributes !== undefined) {
+        issues.push('untriggered warning.persistedTimingAttributes must be absent');
       }
       if (summary.warning?.isolation !== undefined) issues.push('untriggered warning.isolation must be absent');
       if (summary.status === 'passed' && summary.warning?.failure !== undefined) {
@@ -1536,6 +1576,10 @@ function runVerifierSelfTest() {
       bundleContainsSourceEvent: true,
       bundleEventCount: 1,
       persistedVerifierAttributes: persistedVerifierAttributeEvidence(verifierAttributes),
+      persistedTimingAttributes: {
+        skill: nearTimeoutThresholdMs + 1,
+        elapsed: nearTimeoutThresholdMs + 25,
+      },
       isolation: {
         warningRows: 1,
         llmPollutionCount: 0,
@@ -2031,6 +2075,37 @@ function runVerifierSelfTest() {
     ),
     verifierSummaryIssues(driftedWarningPersistedVerifierAttributesSummary),
   );
+  const missingWarningPersistedTimingAttributesSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      persistedTimingAttributes: undefined,
+    },
+  };
+  assert(
+    'verifier self-test rejects triggered warnings without persisted timing attributes',
+    verifierSummaryIssues(missingWarningPersistedTimingAttributesSummary).includes(
+      'triggered warning.persistedTimingAttributes must be an object',
+    ),
+    verifierSummaryIssues(missingWarningPersistedTimingAttributesSummary),
+  );
+  const driftedWarningPersistedTimingAttributesSummary = {
+    ...passedSummary,
+    warning: {
+      ...passedSummary.warning,
+      persistedTimingAttributes: {
+        ...passedSummary.warning.persistedTimingAttributes,
+        skill: passedSummary.timings.skill + 1,
+      },
+    },
+  };
+  assert(
+    'verifier self-test rejects triggered warning persisted timing drift',
+    verifierSummaryIssues(driftedWarningPersistedTimingAttributesSummary).includes(
+      'triggered warning.persistedTimingAttributes.skill must match timings.skill',
+    ),
+    verifierSummaryIssues(driftedWarningPersistedTimingAttributesSummary),
+  );
   const untriggeredAboveThresholdSummary = {
     ...passedSummary,
     warning: {
@@ -2145,6 +2220,23 @@ function runVerifierSelfTest() {
       'untriggered warning.persistedVerifierAttributes must be absent',
     ),
     verifierSummaryIssues(staleUntriggeredWarningVerifierAttributesSummary),
+  );
+  const staleUntriggeredWarningTimingAttributesSummary = {
+    ...staleUntriggeredWarningSummary,
+    warning: {
+      ...staleUntriggeredWarningSummary.warning,
+      eventId: undefined,
+      bundleId: undefined,
+      isolation: undefined,
+      persistedTimingAttributes: { skill: passedSummary.timings.skill },
+    },
+  };
+  assert(
+    'verifier self-test rejects stale warning timing attributes when warning is not triggered',
+    verifierSummaryIssues(staleUntriggeredWarningTimingAttributesSummary).includes(
+      'untriggered warning.persistedTimingAttributes must be absent',
+    ),
+    verifierSummaryIssues(staleUntriggeredWarningTimingAttributesSummary),
   );
   const staleUntriggeredWarningKindSummary = {
     ...passedSummary,
@@ -3794,6 +3886,7 @@ async function main() {
         bundleContainsSourceEvent: warningEvent ? bundle.events?.some((item) => item.eventId === event.eventId) === true : undefined,
         bundleEventCount: warningEvent ? bundle.summary?.eventCount : undefined,
         persistedVerifierAttributes: warningEvent ? persistedVerifierAttributeEvidence(warningEvent.attributes) : undefined,
+        persistedTimingAttributes: warningEvent ? persistedTimingAttributeEvidence(warningEvent.attributes, timings) : undefined,
         isolation: warningEvent?.verifierIsolation,
         failure: warningRequirementFailure,
       },
