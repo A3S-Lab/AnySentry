@@ -103,6 +103,7 @@ const skillEventAttributeSummaryBindings = [
 ];
 const bundleEventPayloadBindings = [
   ['Id', 'eventId'],
+  ['SourceId', 'sourceId'],
   ['WorkspacePath', 'workspacePath'],
   ['RunId', 'runId'],
   ['AgentId', 'agentId'],
@@ -132,6 +133,7 @@ const recordedFailureEvidenceFields = [
   'agentId',
   'sessionId',
   'traceId',
+  'sourceId',
   'eventKind',
   'eventCategory',
   'verdict',
@@ -681,6 +683,9 @@ function skillOutputEvidenceIssues(skillOutput) {
   if (!isNonEmptyString(skillOutput.traceId)) {
     issues.push('skillOutput.traceId must be a non-empty string');
   }
+  if (!isNonEmptyString(skillOutput.sourceId)) {
+    issues.push('skillOutput.sourceId must be a non-empty string');
+  }
   issues.push(...skillOutputPreflightIssues(skillOutput, 'skillOutput'));
   if (skillOutput.eventKind !== 'LlmCall') {
     issues.push('skillOutput.eventKind must be LlmCall');
@@ -768,6 +773,7 @@ function evidenceBundleBindingIssues(bundle, skillOutput, eventId) {
       listedEventEvidence,
       {
         eventId,
+        sourceId: skillOutput.sourceId,
         workspacePath: skillOutput.workspacePath,
         runId: skillOutput.runId,
         agentId: skillOutput.agentId,
@@ -792,6 +798,7 @@ function evidenceBundleBindingIssues(bundle, skillOutput, eventId) {
       primaryEventEvidence,
       {
         eventId,
+        sourceId: skillOutput.sourceId,
         workspacePath: skillOutput.workspacePath,
         runId: skillOutput.runId,
         agentId: skillOutput.agentId,
@@ -990,6 +997,7 @@ function successfulEvidenceIssues(summary, context) {
   if (!isNonEmptyString(summary.evidence?.agentId)) issues.push(`${context} evidence.agentId must be a non-empty string`);
   if (!isNonEmptyString(summary.evidence?.sessionId)) issues.push(`${context} evidence.sessionId must be a non-empty string`);
   if (!isNonEmptyString(summary.evidence?.traceId)) issues.push(`${context} evidence.traceId must be a non-empty string`);
+  if (!isNonEmptyString(summary.evidence?.sourceId)) issues.push(`${context} evidence.sourceId must be a non-empty string`);
   if (!isNonEmptyString(summary.evidence?.bundleId)) issues.push(`${context} evidence.bundleId must be a non-empty string`);
   if (summary.evidence?.bundleSchemaVersion !== 'anysentry.evidence_bundle.v1') {
     issues.push(`${context} evidence.bundleSchemaVersion must be anysentry.evidence_bundle.v1`);
@@ -1044,6 +1052,9 @@ function successfulEvidenceIssues(summary, context) {
   }
   if (!isNonEmptyString(summary.evidence?.skillOutput?.traceId)) {
     issues.push(`${context} evidence.skillOutput.traceId must be a non-empty string`);
+  }
+  if (!isNonEmptyString(summary.evidence?.skillOutput?.sourceId)) {
+    issues.push(`${context} evidence.skillOutput.sourceId must be a non-empty string`);
   }
   if (!isNonEmptyString(summary.evidence?.skillOutput?.bundleId)) {
     issues.push(`${context} evidence.skillOutput.bundleId must be a non-empty string`);
@@ -1129,6 +1140,9 @@ function successfulEvidenceIssues(summary, context) {
   }
   if (summary.evidence?.traceId !== summary.evidence?.skillOutput?.traceId) {
     issues.push(`${context} evidence.traceId must match skillOutput.traceId`);
+  }
+  if (summary.evidence?.sourceId !== summary.evidence?.skillOutput?.sourceId) {
+    issues.push(`${context} evidence.sourceId must match skillOutput.sourceId`);
   }
   if (summary.evidence?.workspacePath !== summary.evidence?.skillOutput?.workspacePath) {
     issues.push(`${context} evidence.workspacePath must match skillOutput.workspacePath`);
@@ -1311,6 +1325,7 @@ function verifierSummaryIssues(summary) {
       if (!isNonEmptyString(evidence.agentId)) issues.push('recorded failure evidence.agentId must be a non-empty string');
       if (!isNonEmptyString(evidence.sessionId)) issues.push('recorded failure evidence.sessionId must be a non-empty string');
       if (!isNonEmptyString(evidence.traceId)) issues.push('recorded failure evidence.traceId must be a non-empty string');
+      if (!isNonEmptyString(evidence.sourceId)) issues.push('recorded failure evidence.sourceId must be a non-empty string');
       if (!isNonEmptyString(evidence.bundleId)) issues.push('recorded failure evidence.bundleId must be a non-empty string');
       if (evidence.bundleSchemaVersion !== 'anysentry.evidence_bundle.v1') {
         issues.push('recorded failure evidence.bundleSchemaVersion must be anysentry.evidence_bundle.v1');
@@ -1482,6 +1497,7 @@ function verifierSummaryIssues(summary) {
           summary.warning,
           {
             eventId: summary.warning?.sourceEventId,
+            sourceId: summary.evidence?.sourceId,
             workspacePath: summary.evidence?.workspacePath,
             runId: summary.evidence?.runId,
             agentId: summary.evidence?.agentId,
@@ -1500,6 +1516,7 @@ function verifierSummaryIssues(summary) {
           summary.warning,
           {
             eventId: summary.warning?.sourceEventId,
+            sourceId: summary.evidence?.sourceId,
             workspacePath: summary.evidence?.workspacePath,
             runId: summary.evidence?.runId,
             agentId: summary.evidence?.agentId,
@@ -1966,6 +1983,7 @@ async function recordFailureEvidence(reason, details, timings) {
       agentId: failureEvent.agentId,
       sessionId: failureEvent.sessionId,
       traceId: failureEvent.traceId,
+      sourceId: failureEvent.sourceId,
       eventKind: failureEvent.eventKind,
       eventCategory: failureEvent.eventCategory,
       verdict: failureEvent.verdict,
@@ -2168,8 +2186,11 @@ function parseSkillOutputJson(result) {
 }
 
 function runVerifierSelfTest() {
+  const selfSourceId = 'src_self_test';
+  const selfFailureSourceId = 'src_failure_self_test';
   const selfPrimaryEventEvidence = {
     bundlePrimaryEventId: 'evt_self_test',
+    bundlePrimaryEventSourceId: selfSourceId,
     bundlePrimaryEventWorkspacePath: workspacePath,
     bundlePrimaryEventRunId: runId,
     bundlePrimaryEventAgentId: agentId,
@@ -2181,6 +2202,7 @@ function runVerifierSelfTest() {
   };
   const selfListedEventEvidence = {
     bundleListedEventId: 'evt_self_test',
+    bundleListedEventSourceId: selfSourceId,
     bundleListedEventWorkspacePath: workspacePath,
     bundleListedEventRunId: runId,
     bundleListedEventAgentId: agentId,
@@ -2192,6 +2214,7 @@ function runVerifierSelfTest() {
   };
   const selfFailurePrimaryEventEvidence = {
     bundlePrimaryEventId: 'evt_failure_self_test',
+    bundlePrimaryEventSourceId: selfFailureSourceId,
     bundlePrimaryEventWorkspacePath: workspacePath,
     bundlePrimaryEventRunId: runId,
     bundlePrimaryEventAgentId: agentId,
@@ -2203,6 +2226,7 @@ function runVerifierSelfTest() {
   };
   const selfFailureListedEventEvidence = {
     bundleListedEventId: 'evt_failure_self_test',
+    bundleListedEventSourceId: selfFailureSourceId,
     bundleListedEventWorkspacePath: workspacePath,
     bundleListedEventRunId: runId,
     bundleListedEventAgentId: agentId,
@@ -2226,6 +2250,7 @@ function runVerifierSelfTest() {
       agentId,
       sessionId,
       traceId: 'trace_self_test',
+      sourceId: selfSourceId,
       eventKind: 'LlmCall',
       eventCategory: 'llm',
       verdict: 'allow',
@@ -2273,6 +2298,7 @@ function runVerifierSelfTest() {
         agentId,
         sessionId,
         traceId: 'trace_self_test',
+        sourceId: selfSourceId,
         eventKind: 'LlmCall',
         eventCategory: 'llm',
         verdict: 'allow',
@@ -2417,6 +2443,17 @@ function runVerifierSelfTest() {
     ),
     skillOutputEvidenceIssues(driftedSkillOutputListedEventPayload),
   );
+  const driftedSkillOutputListedEventSource = {
+    ...passedSummary.evidence.skillOutput,
+    bundleListedEventSourceId: 'src_other_listed',
+  };
+  assert(
+    'verifier self-test rejects Skill outputs with drifted listed bundle event source IDs',
+    skillOutputEvidenceIssues(driftedSkillOutputListedEventSource).includes(
+      'skillOutput.bundleListedEventSourceId must match skillOutput.sourceId',
+    ),
+    skillOutputEvidenceIssues(driftedSkillOutputListedEventSource),
+  );
   const driftedSkillOutputPrimaryEventId = {
     ...passedSummary.evidence.skillOutput,
     bundlePrimaryEventId: 'evt_other_primary',
@@ -2553,6 +2590,7 @@ function runVerifierSelfTest() {
     primary: {
       event: {
         eventId: passedSummary.evidence.eventId,
+        sourceId: passedSummary.evidence.sourceId,
         workspacePath,
         runId,
         agentId,
@@ -2581,6 +2619,7 @@ function runVerifierSelfTest() {
     events: [
       {
         eventId: passedSummary.evidence.eventId,
+        sourceId: passedSummary.evidence.sourceId,
         workspacePath,
         runId,
         agentId,
@@ -3392,6 +3431,7 @@ function runVerifierSelfTest() {
       agentId,
       sessionId,
       traceId: 'trace_failure_self_test',
+      sourceId: selfFailureSourceId,
       eventKind: 'SecurityAction',
       eventCategory: 'security',
       verdict: 'block',
@@ -5571,6 +5611,7 @@ async function main() {
         agentId: event.agentId,
         sessionId: event.sessionId,
         traceId: event.traceId,
+        sourceId: event.sourceId,
         eventKind: event.eventKind,
         eventCategory: event.eventCategory,
         verdict: event.verdict,
@@ -5594,6 +5635,7 @@ async function main() {
           agentId: skillOutput.agentId,
           sessionId: skillOutput.sessionId,
           traceId: skillOutput.traceId,
+          sourceId: skillOutput.sourceId,
           eventKind: skillOutput.eventKind,
           eventCategory: skillOutput.eventCategory,
           verdict: skillOutput.verdict,

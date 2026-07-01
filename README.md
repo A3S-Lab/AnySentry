@@ -431,12 +431,12 @@ it must be positive, must not exceed `bundleEventCount`, and must match the
 Skill-reported listed count. This lets automation distinguish bundle summary
 count drift from listed-member drift without rebuilding the bundle. The
 contract also exposes the listed target event fields (`bundleListedEventId`,
-`bundleListedEventWorkspacePath`, `bundleListedEventRunId`,
-`bundleListedEventAgentId`, `bundleListedEventSessionId`,
+`bundleListedEventSourceId`, `bundleListedEventWorkspacePath`,
+`bundleListedEventRunId`, `bundleListedEventAgentId`, `bundleListedEventSessionId`,
 `bundleListedEventTraceId`, `bundleListedEventKind`,
 `bundleListedEventCategory`, and `bundleListedEventVerdict`) and the primary
-bundle event fields (`bundlePrimaryEventId`, `bundlePrimaryEventWorkspacePath`,
-`bundlePrimaryEventRunId`, `bundlePrimaryEventAgentId`,
+bundle event fields (`bundlePrimaryEventId`, `bundlePrimaryEventSourceId`,
+`bundlePrimaryEventWorkspacePath`, `bundlePrimaryEventRunId`, `bundlePrimaryEventAgentId`,
 `bundlePrimaryEventSessionId`, `bundlePrimaryEventTraceId`,
 `bundlePrimaryEventKind`, `bundlePrimaryEventCategory`, and
 `bundlePrimaryEventVerdict`). Both field groups must match the stored event

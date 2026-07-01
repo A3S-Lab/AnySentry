@@ -166,6 +166,7 @@ const listedEvent = Array.isArray(bundle?.events) ? bundle.events.find((item) =>
 if (
   bundle?.schemaVersion !== 'anysentry.evidence_bundle.v1' ||
   !listedEvent ||
+  listedEvent.sourceId !== event.sourceId ||
   listedEvent.workspacePath !== workspacePath ||
   listedEvent.runId !== runId ||
   listedEvent.agentId !== agentId ||
@@ -175,6 +176,7 @@ if (
   listedEvent.eventCategory !== event.eventCategory ||
   listedEvent.verdict !== (event.verdict ?? recorded.items?.[0]?.verdict) ||
   bundle.primary?.event?.eventId !== eventId ||
+  bundle.primary?.event?.sourceId !== event.sourceId ||
   bundle.primary?.event?.workspacePath !== workspacePath ||
   bundle.primary?.event?.runId !== runId ||
   bundle.primary?.event?.agentId !== agentId ||
@@ -211,6 +213,7 @@ console.log(
     bundleEventCount: bundle.summary?.eventCount,
     bundleListedEventCount: Array.isArray(bundle.events) ? bundle.events.length : undefined,
     bundleListedEventId: listedEvent?.eventId,
+    bundleListedEventSourceId: listedEvent?.sourceId,
     bundleListedEventWorkspacePath: listedEvent?.workspacePath,
     bundleListedEventRunId: listedEvent?.runId,
     bundleListedEventAgentId: listedEvent?.agentId,
@@ -220,6 +223,7 @@ console.log(
     bundleListedEventCategory: listedEvent?.eventCategory,
     bundleListedEventVerdict: listedEvent?.verdict,
     bundlePrimaryEventId: bundle.primary?.event?.eventId,
+    bundlePrimaryEventSourceId: bundle.primary?.event?.sourceId,
     bundlePrimaryEventWorkspacePath: bundle.primary?.event?.workspacePath,
     bundlePrimaryEventRunId: bundle.primary?.event?.runId,
     bundlePrimaryEventAgentId: bundle.primary?.event?.agentId,
@@ -241,6 +245,7 @@ console.log(
     bundleTimelineRunId: bundle.timeline?.runId,
     bundleTimelineSessionId: bundle.timeline?.sessionId,
     traceId: event.traceId,
+    sourceId: event.sourceId,
     eventKind: event.eventKind,
     eventCategory: event.eventCategory,
     verdict: event.verdict ?? recorded.items?.[0]?.verdict,
