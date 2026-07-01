@@ -129,6 +129,26 @@ function isPositiveInteger(value) {
   return Number.isInteger(value) && value > 0;
 }
 
+function isValidTimingValue(value) {
+  if (typeof value === 'number') return Number.isFinite(value) && value >= 0;
+  return isNonEmptyString(value);
+}
+
+function timingIssues(timings) {
+  const issues = [];
+  for (const [key, value] of Object.entries(timings)) {
+    if (!isValidTimingValue(value)) {
+      issues.push(`timings.${key} must be a non-negative number or non-empty string`);
+    }
+  }
+  return issues;
+}
+
+function sanitizedTimings(timings) {
+  if (!isRecord(timings)) return {};
+  return Object.fromEntries(Object.entries(timings).filter(([, value]) => isValidTimingValue(value)));
+}
+
 function evidenceFieldMismatchIssues(prefix, actual, expected, fields) {
   const issues = [];
   for (const field of fields) {
@@ -182,7 +202,11 @@ function verifierSummaryIssues(summary) {
   if (!isNonEmptyString(summary.target?.runId)) issues.push('target.runId must be a non-empty string');
   if (!isNonEmptyString(summary.target?.agentId)) issues.push('target.agentId must be a non-empty string');
   if (!isNonEmptyString(summary.target?.sessionId)) issues.push('target.sessionId must be a non-empty string');
-  if (!isRecord(summary.timings)) issues.push('timings must be an object');
+  if (!isRecord(summary.timings)) {
+    issues.push('timings must be an object');
+  } else {
+    issues.push(...timingIssues(summary.timings));
+  }
 
   if (summary.status === 'passed') {
     if (summary.failure) issues.push('passed summary must not include failure');
@@ -198,6 +222,13 @@ function verifierSummaryIssues(summary) {
   if (summary.status === 'failed') {
     if (!isNonEmptyString(summary.failure?.phase)) issues.push('failed summary failure.phase must be a non-empty string');
     if (!isNonEmptyString(summary.failure?.reason)) issues.push('failed summary failure.reason must be a non-empty string');
+    if (
+      isNonEmptyString(summary.failure?.phase) &&
+      !['preflight', 'summary_validation'].includes(summary.failure.phase) &&
+      summary.timings?.failurePhase !== summary.failure.phase
+    ) {
+      issues.push('failed summary timings.failurePhase must match failure.phase');
+    }
     const evidence = summary.failure?.evidence;
     if (!isRecord(evidence)) {
       issues.push('failed summary failure.evidence must be an object');
@@ -339,7 +370,7 @@ function summaryValidationFailureSummary(summary, issues) {
       status: 'failed',
       issues,
     },
-    timings: isRecord(summary?.timings) ? summary.timings : {},
+    timings: sanitizedTimings(summary?.timings),
   };
 }
 
@@ -814,6 +845,27 @@ function runVerifierSelfTest() {
     verifierSummaryIssues(missingRequiredWarningSummary),
   );
 
+  const negativeTimingSummary = {
+    ...passedSummary,
+    timings: {
+      ...passedSummary.timings,
+      skill: -1,
+    },
+  };
+  assert(
+    'verifier self-test rejects negative timing values',
+    verifierSummaryIssues(negativeTimingSummary).includes('timings.skill must be a non-negative number or non-empty string'),
+    verifierSummaryIssues(negativeTimingSummary),
+  );
+  const normalizedNegativeTiming = normalizedVerifierSummary(negativeTimingSummary);
+  assert(
+    'verifier self-test sanitizes invalid timings in summary-validation failures',
+    normalizedNegativeTiming.status === 'failed' &&
+      normalizedNegativeTiming.failure?.phase === 'summary_validation' &&
+      verifierSummaryIssues(normalizedNegativeTiming).length === 0,
+    { summary: normalizedNegativeTiming, issues: verifierSummaryIssues(normalizedNegativeTiming) },
+  );
+
   const failedSummary = failureSummary(
     'skill_output',
     'skill output JSON was invalid',
@@ -873,6 +925,10 @@ function runVerifierSelfTest() {
       phase: 'near_timeout_warning',
       reason: 'required near-timeout warning was not emitted',
     },
+    timings: {
+      ...failedSummary.timings,
+      failurePhase: 'near_timeout_warning',
+    },
     warning: {
       required: true,
       triggered: false,
@@ -899,6 +955,19 @@ function runVerifierSelfTest() {
     'verifier self-test rejects failed summaries with drifted top-level evidence',
     verifierSummaryIssues(driftedFailedEvidenceSummary).includes('failed summary evidence.eventKind must be LlmCall'),
     verifierSummaryIssues(driftedFailedEvidenceSummary),
+  );
+
+  const driftedFailurePhaseSummary = {
+    ...requiredWarningFailureSummary,
+    timings: {
+      ...requiredWarningFailureSummary.timings,
+      failurePhase: 'skill_output',
+    },
+  };
+  assert(
+    'verifier self-test rejects failure phase timing drift',
+    verifierSummaryIssues(driftedFailurePhaseSummary).includes('failed summary timings.failurePhase must match failure.phase'),
+    verifierSummaryIssues(driftedFailurePhaseSummary),
   );
 
   const driftedWarningFailureSummary = {
@@ -1575,9 +1644,9 @@ async function main() {
       warningRequirementFailure = details;
       timings.elapsed = durationMs(verifierStartedAt);
       const reason = 'required near-timeout warning was not emitted';
+      timings.failurePhase = 'near_timeout_warning';
       const failureTimings = {
         ...timings,
-        failurePhase: 'near_timeout_warning',
       };
       const failureEvidence = await recordFailureEvidence(reason, details, failureTimings);
       warningRequirementFailure = { ...details, evidence: failureEvidence };
@@ -1654,6 +1723,7 @@ if (verifierSelfTest) {
     fail('verification threw', message);
     if (!verifierSummaryPrinted) {
       lastVerifierTimings.elapsed = durationMs(verifierProcessStartedAt);
+      lastVerifierTimings.failurePhase = 'uncaught';
       printVerifierSummary(failureSummary('uncaught', 'verification threw', message, lastVerifierTimings));
     }
     process.exit(process.exitCode || 1);

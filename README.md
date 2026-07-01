@@ -376,9 +376,12 @@ must carry a non-allow verdict, must use `riskCategory=runtime_failure`, and
 must include a positive Evidence Bundle count. When a required near-timeout
 warning is missing, the nested `warning.failure.evidence` must match the
 top-level `failure.evidence`, so automation does not need to guess which failure
-record is authoritative. If the verifier detects that its own summary violates
-the contract, the emitted summary is converted to `status=failed` with
-`failure.phase=summary_validation` so automation can trust the top-level status.
+record is authoritative. Timing values in summaries must be non-negative
+numbers or non-empty strings, and failed summaries outside preflight and
+summary-validation must bind `timings.failurePhase` to `failure.phase`. If the
+verifier detects that its own summary violates the contract, the emitted summary
+is converted to `status=failed` with `failure.phase=summary_validation` so
+automation can trust the top-level status.
 Runtime contract failures after the Skill runs, such as missing event markers or
 Evidence Bundle drift, are recorded as phase-specific `SecurityFinding` evidence
 instead of being collapsed into generic summary-validation failures.
