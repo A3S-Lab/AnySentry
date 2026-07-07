@@ -38,6 +38,35 @@ export type ObjectiveStatus = 'ok' | 'breach' | 'disabled';
 export type IngestionSourceType = 'observer' | 'forwarder' | 'webhook' | 'otel' | 'custom';
 export type IngestionSourceStatus = 'active' | 'stale' | 'unused' | 'disabled';
 export type SourceTokenRotationStatus = 'untracked' | 'fresh' | 'overdue';
+export type AgentAttributionSource = 'none' | 'process_graph' | 'cgroup' | 'systemd' | 'argv' | 'env' | 'self_register' | 'workspace_hint';
+export type AgentAttributionReason = 'not_evaluated' | 'not_agent' | 'process_lineage' | 'authoritative_anchor' | 'hint_only' | 'conflict';
+
+export interface ProcessContext {
+  hostId?: string;
+  pid?: number;
+  ppid?: number;
+  startTimeNs?: string;
+  eventTimeNs?: string;
+  comm?: string;
+  exe?: string;
+  cwd?: string;
+  uid?: number;
+  cgroup?: string;
+  systemdUnit?: string;
+}
+
+export interface AgentAttribution {
+  monitored: boolean;
+  agentScopeId?: string;
+  agentDisplayName?: string;
+  agentSessionId?: string;
+  rootPid?: number;
+  confidence: number;
+  reason: AgentAttributionReason;
+  source: AgentAttributionSource;
+  conflict?: boolean;
+  degraded?: boolean;
+}
 export type CoverageIssueType =
   | 'collector_down'
   | 'collector_stale'
@@ -85,6 +114,8 @@ export interface JudgedEvent {
   tokenCount: number;
   latencyMs: number;
   attributes: Record<string, EventAttributeValue>;
+  process?: ProcessContext;
+  attribution?: AgentAttribution;
   rawPreview?: string;
 }
 
@@ -101,6 +132,8 @@ export interface EventMeta {
   runId?: string;
   taskId?: string;
   attributes?: Record<string, EventAttributeValue>;
+  process?: ProcessContext;
+  attribution?: AgentAttribution;
   rawPreview?: string;
   tokenCount?: number;
   latencyMs?: number;
@@ -479,6 +512,8 @@ export interface SecurityWorkspaceRiskDistribution {
 }
 
 export interface AgentEventQuery extends SecurityTimeFilter {
+  scope?: 'agent' | 'raw';
+  noise?: 'hide' | 'include';
   eventId?: string;
   sourceId?: string;
   collectorId?: string;
@@ -522,6 +557,10 @@ export interface AgentEventListItem {
   tokenCount: number;
   latencyMs: number;
   attributes: Record<string, EventAttributeValue>;
+  process?: ProcessContext;
+  attribution?: AgentAttribution;
+  repeatCount?: number;
+  lastAt?: string;
   rawPreview?: string;
 }
 export interface AgentEventList {

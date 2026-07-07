@@ -92,7 +92,27 @@ function attrValue(v: unknown, key?: string): T.EventAttributeValue | undefined 
 function compactAttributes(kind: string, inner: Record<string, unknown>, id: { task?: string | number }): Record<string, T.EventAttributeValue> {
   const a = inner as Record<string, unknown> & { argv?: string[] };
   const attrs: Record<string, T.EventAttributeValue> = {};
-  for (const key of ['pid', 'uid', 'cwd', 'peer', 'port', 'query', 'path', 'sni', 'kind', 'prompt_tokens', 'completion_tokens']) {
+  for (const key of [
+    'pid',
+    'ppid',
+    'uid',
+    'cwd',
+    'comm',
+    'exe',
+    'cgroup',
+    'systemdUnit',
+    'hostId',
+    'eventTimeNs',
+    'startTimeNs',
+    'peer',
+    'port',
+    'query',
+    'path',
+    'sni',
+    'kind',
+    'prompt_tokens',
+    'completion_tokens',
+  ]) {
     const v = attrValue(a[key], key);
     if (v !== undefined) attrs[key] = v;
   }
@@ -100,6 +120,33 @@ function compactAttributes(kind: string, inner: Record<string, unknown>, id: { t
   if (id.task != null) attrs.observerTask = String(id.task).slice(0, 120);
   attrs.observerKind = kind;
   return attrs;
+}
+
+function processFromObserverLine(process: unknown): T.ProcessContext | undefined {
+  if (!process || typeof process !== 'object') return undefined;
+  const p = process as Record<string, unknown>;
+  const numberField = (key: string) => {
+    const value = Number(p[key]);
+    return Number.isFinite(value) ? value : undefined;
+  };
+  const stringField = (key: string) => {
+    const value = p[key];
+    return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+  };
+  const ctx: T.ProcessContext = {
+    pid: numberField('pid'),
+    ppid: numberField('ppid'),
+    uid: numberField('uid'),
+    comm: stringField('comm'),
+    exe: stringField('exe'),
+    cwd: stringField('cwd'),
+    cgroup: stringField('cgroup'),
+    systemdUnit: stringField('systemdUnit'),
+    hostId: stringField('hostId'),
+    eventTimeNs: stringField('eventTimeNs'),
+    startTimeNs: stringField('startTimeNs'),
+  };
+  return Object.values(ctx).some((value) => value !== undefined) ? ctx : undefined;
 }
 
 function summarize(kind: string, inner: Record<string, unknown>): string {
@@ -119,9 +166,11 @@ function deriveMeta(line: string, given: Partial<T.EventMeta>): T.EventMeta {
   let id: { agent?: string; task?: string | number; session?: string } = {};
   let eventKey = 'Event';
   let inner: Record<string, unknown> = {};
+  let process: T.ProcessContext | undefined;
   try {
-    const o = JSON.parse(line) as { identity?: typeof id; event?: Record<string, Record<string, unknown>> };
+    const o = JSON.parse(line) as { identity?: typeof id; process?: unknown; event?: Record<string, Record<string, unknown>> };
     id = o.identity ?? {};
+    process = processFromObserverLine(o.process);
     const ev = o.event ?? {};
     eventKey = Object.keys(ev)[0] ?? 'Event';
     inner = ev[eventKey] ?? {};
@@ -151,6 +200,7 @@ function deriveMeta(line: string, given: Partial<T.EventMeta>): T.EventMeta {
     runId: given.runId ?? id.session ?? id.agent ?? (id.task != null ? `task-${id.task}` : undefined),
     taskId: given.taskId ?? (id.task != null ? String(id.task) : undefined),
     attributes: { ...compactAttributes(eventKey, inner, id), ...sanitizeEventAttributes(given.attributes) },
+    process: given.process ?? process,
     rawPreview: given.rawPreview ?? redact(line).slice(0, 1800),
     subject: given.subject ?? (isLlm ? `LLM 调用 → ${peer}` : summarize(eventKey, inner)),
     tokenCount: given.tokenCount,

@@ -1,11 +1,12 @@
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { Sentry, dns, egress, fileAccess, securityAction, sslContent, toolExec } from '@a3s-lab/sentry';
+import { AgentAttributionService } from './agent-attribution.service';
 import { AlertingService } from './alerting.service';
 import { ClickHouseStore, IncidentState } from './clickhouse-store';
 import { DEFAULT_POLICY, PolicyConfig, buildAcl, policyConfigError, sanitizePolicy, tierStatus } from './policy-config';
 import { cleanText } from './redaction';
-import { CollectorHeartbeatRecord, CollectorHeartbeatRequest, EventCategory, EventMeta, Incident, IncidentStatus, JudgedEvent, RiskType, Severity, Tier, Verdict } from './types';
+import { CollectorHeartbeatRecord, CollectorHeartbeatRequest, EventCategory, EventMeta, Incident, IncidentStatus, JudgedEvent, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
 
 const SEVERITY_SCORE: Record<Severity, number> = { info: 8, low: 28, medium: 52, high: 76, critical: 95 };
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
@@ -170,6 +171,28 @@ function stringAttr(value: unknown): string | undefined {
   return text || undefined;
 }
 
+function numberAttr(value: unknown): number | undefined {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function processFromAttributes(attributes: Record<string, unknown>): ProcessContext | undefined {
+  const ctx: ProcessContext = {
+    pid: numberAttr(attributes.pid),
+    ppid: numberAttr(attributes.ppid),
+    uid: numberAttr(attributes.uid),
+    cwd: stringAttr(attributes.cwd),
+    comm: stringAttr(attributes.comm),
+    exe: stringAttr(attributes.exe),
+    cgroup: stringAttr(attributes.cgroup),
+    systemdUnit: stringAttr(attributes.systemdUnit),
+    hostId: stringAttr(attributes.hostId),
+    eventTimeNs: stringAttr(attributes.eventTimeNs),
+    startTimeNs: stringAttr(attributes.startTimeNs),
+  };
+  return Object.values(ctx).some((value) => value !== undefined) ? ctx : undefined;
+}
+
 type JudgedEventBase = Omit<
   JudgedEvent,
   'verdict' | 'tier' | 'severity' | 'reason' | 'actionKind' | 'actionTarget' | 'riskCategory' | 'riskName' | 'riskType' | 'riskScore'
@@ -214,7 +237,7 @@ function producerReportedFinding(base: JudgedEventBase): {
 
 @Injectable()
 export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
-  constructor(private readonly alerting: AlertingService) {}
+  constructor(private readonly alerting: AlertingService, private readonly attributionService: AgentAttributionService) {}
 
   private sentry!: Sentry;
   // In-memory hot ring: the dashboard's fast, synchronous read/aggregation path. Durability + retention
@@ -308,6 +331,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const spanId = meta.spanId ?? hashId('sp', [at, eventKind, ids.agentId, ids.sessionId, line]);
     const runId = meta.runId ?? ids.sessionId;
     const attributes = meta.attributes ?? {};
+    const process = meta.process ?? processFromAttributes(attributes);
+    const attribution = meta.attribution ?? this.attributionService.attribute(meta, process, at);
     const collectorId = typeof attributes.collectorId === 'string' ? cleanText(attributes.collectorId, 180) : undefined;
     const sourceId = typeof attributes.sourceId === 'string' ? cleanText(attributes.sourceId, 160) : undefined;
     const base = {
@@ -329,6 +354,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       tokenCount,
       latencyMs,
       attributes,
+      process,
+      attribution,
       rawPreview: meta.rawPreview,
     } satisfies JudgedEventBase;
 

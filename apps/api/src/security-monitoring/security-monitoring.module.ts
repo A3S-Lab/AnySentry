@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { AgentAttributionService } from './agent-attribution.service';
 import { AgentMetadataService } from './agent-metadata.service';
 import { AggregationService } from './aggregation.service';
 import { AlertingService } from './alerting.service';
@@ -15,6 +16,6 @@ import { SentryJudgeService } from './sentry-judge.service';
 
 @Module({
   controllers: [SecurityMonitoringController],
-  providers: [AgentMetadataService, AlertingService, AuditService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, SentryJudgeService, AggregationService, RemediationService, KubeIdentityService, ManagementAuthGuard],
+  providers: [AgentAttributionService, AgentMetadataService, AlertingService, AuditService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, SentryJudgeService, AggregationService, RemediationService, KubeIdentityService, ManagementAuthGuard],
 })
 export class SecurityMonitoringModule {}

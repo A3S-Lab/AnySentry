@@ -227,7 +227,7 @@ async function loadSecurityDashboardData(filter: SecurityTimeFilter): Promise<Se
       highestRisk: securityCenterApi.highestRiskSession(filter),
       decisionFunnel: securityCenterApi.decisionFunnel(filter),
       workspaceRisk: securityCenterApi.workspaceRiskDistribution(filter),
-      events: securityCenterApi.agentEvents({ ...filter, limit: 36 }),
+      events: securityCenterApi.agentEvents({ ...filter, scope: "agent", limit: 36 }),
     },
     formatRequestError,
   );
@@ -421,13 +421,15 @@ function formatSignedPercent(value?: number) {
 
 function formatDate(value?: string) {
   if (!value) return "--";
-  const parsed = dayjs(value);
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value) ? value.replace(" ", "T") + "Z" : value;
+  const parsed = dayjs(normalized);
   return parsed.isValid() ? parsed.format("MM-DD HH:mm:ss") : value;
 }
 
 function formatTimeLabel(value?: string) {
   if (!value) return "";
-  const parsed = dayjs(value);
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value) ? value.replace(" ", "T") + "Z" : value;
+  const parsed = dayjs(normalized);
   return parsed.isValid() ? parsed.format("HH:mm:ss") : value.slice(-8);
 }
 
@@ -1541,6 +1543,14 @@ function shortId(value?: string) {
   return value.length > 18 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value;
 }
 
+function eventAgentLabel(event: AgentEventListItem) {
+  return event.attribution?.agentDisplayName || event.attribution?.agentScopeId || event.agentId;
+}
+
+function eventSessionLabel(event: AgentEventListItem) {
+  return event.attribution?.agentSessionId || event.sessionId;
+}
+
 function eventDetailHref(event: AgentEventListItem) {
   const qs = new URLSearchParams({
     eventId: event.eventId,
@@ -1613,14 +1623,15 @@ function AgentEventTimelinePanel({ events, error }: { events?: AgentEventList | 
                   <div className="min-w-0">
                     <p className="truncate font-medium text-zinc-100" title={event.subject}>
                       {event.subject}
+                      {event.repeatCount && event.repeatCount > 1 ? <span className="ml-2 rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[10px] text-zinc-400">x{event.repeatCount}</span> : null}
                     </p>
                     <p className="mt-0.5 truncate text-[11px] text-zinc-600" title={event.reason}>
                       {event.eventKind} · {riskEventName(event.riskCategory)} · {event.source}
                     </p>
                   </div>
                   <div className="min-w-0 font-mono text-xs">
-                    <p className="truncate text-zinc-300" title={event.agentId}>{event.agentId}</p>
-                    <p className="mt-0.5 truncate text-zinc-600" title={event.sessionId}>{event.sessionId}</p>
+                    <p className="truncate text-zinc-300" title={eventAgentLabel(event)}>{eventAgentLabel(event)}</p>
+                    <p className="mt-0.5 truncate text-zinc-600" title={eventSessionLabel(event)}>{eventSessionLabel(event)}</p>
                   </div>
                   <div className="min-w-0 font-mono text-xs">
                     <p className="truncate text-zinc-300" title={event.traceId}>{shortId(event.traceId)}</p>
