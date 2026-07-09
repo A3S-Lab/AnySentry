@@ -10,7 +10,7 @@
 
 import { ClickHouseClient, createClient } from '@clickhouse/client';
 import { PolicyConfig } from './policy-config';
-import { AgentMetadataRecord, AlertRecord, AuditRecord, CollectorHeartbeatRecord, Incident, IngestionSourceRecord, JudgedEvent, MaintenanceWindowRecord, NotificationState, ObjectiveRecord, RemediationRecord } from './types';
+import { AgentAttribution, AgentMetadataRecord, AlertRecord, AuditRecord, CollectorHeartbeatRecord, Incident, IngestionSourceRecord, JudgedEvent, MaintenanceWindowRecord, NotificationState, ObjectiveRecord, ProcessContext, RemediationRecord } from './types';
 
 const TABLE = 'events';
 // `at` is raw epoch-ms (matches the aggregator); `ts` is a derived DateTime only for TTL/partitioning.
@@ -46,6 +46,8 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   tokenCount UInt64,
   latencyMs Float64,
   attributes String,
+  process String DEFAULT '{}',
+  attribution String DEFAULT '{}',
   rawPreview String,
   ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000))
 ) ENGINE = MergeTree
@@ -65,6 +67,8 @@ const EVENT_ALTERS = [
   'ADD COLUMN IF NOT EXISTS runId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS taskId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS attributes String DEFAULT \'{}\'',
+  'ADD COLUMN IF NOT EXISTS process String DEFAULT \'{}\'',
+  'ADD COLUMN IF NOT EXISTS attribution String DEFAULT \'{}\'',
   'ADD COLUMN IF NOT EXISTS rawPreview String DEFAULT \'\'',
 ];
 
@@ -78,10 +82,12 @@ const CONFIG_DDL = `CREATE TABLE IF NOT EXISTS ${CONFIG_TABLE} (
 ) ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY key`;
 
-type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview'> & {
+type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'process' | 'attribution' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview'> & {
   actionKind: string;
   actionTarget: string;
   attributes: string;
+  process: string;
+  attribution: string;
   collectorId: string;
   sourceId: string;
   parentSpanId: string;
@@ -128,8 +134,21 @@ function toRow(e: JudgedEvent): Row {
     tokenCount: e.tokenCount,
     latencyMs: e.latencyMs,
     attributes: JSON.stringify(e.attributes ?? {}),
+    process: JSON.stringify(e.process ?? {}),
+    attribution: JSON.stringify(e.attribution ?? {}),
     rawPreview: e.rawPreview ?? '',
   };
+}
+
+function parseObject<T extends object>(value: unknown): T | undefined {
+  const text = String(value ?? '').trim();
+  if (!text || text === '{}') return undefined;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as T) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function fromRow(r: Record<string, unknown>): JudgedEvent {
@@ -179,6 +198,8 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
     tokenCount: num(r.tokenCount),
     latencyMs: num(r.latencyMs),
     attributes,
+    process: parseObject<ProcessContext>(r.process),
+    attribution: parseObject<AgentAttribution>(r.attribution),
     rawPreview: str(r.rawPreview) || undefined,
   };
 }

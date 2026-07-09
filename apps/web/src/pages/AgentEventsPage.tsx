@@ -83,7 +83,8 @@ const SEVERITY_LABEL: Record<SecuritySeverity, string> = {
 
 function formatDate(value?: string) {
   if (!value) return "--";
-  const parsed = dayjs(value);
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value) ? value.replace(" ", "T") + "Z" : value;
+  const parsed = dayjs(normalized);
   return parsed.isValid() ? parsed.format("MM-DD HH:mm:ss") : value;
 }
 
@@ -249,6 +250,20 @@ function EventDetail({ event, timeType }: { event?: AgentEventListItem; timeType
           <div className="rounded-md border border-white/10 bg-white/[0.03] px-3 py-2">
             <p className="text-[11px] text-zinc-600">延迟</p>
             <p className="mt-1 font-mono text-xl font-semibold text-zinc-100">{event.latencyMs}ms</p>
+          </div>
+        </div>
+
+        <div>
+          <p className="mb-2 text-xs font-medium text-zinc-400">Agent Attribution</p>
+          <div className="grid gap-3 rounded-md border border-white/10 bg-white/[0.03] px-3 py-3 sm:grid-cols-2 xl:grid-cols-4">
+            <FieldValue label="Monitored" value={event.attribution?.monitored ? "true" : "false"} />
+            <FieldValue label="Agent Scope" value={event.attribution?.agentScopeId ?? "non-agent"} />
+            <FieldValue label="Confidence" value={event.attribution ? event.attribution.confidence.toFixed(2) : "0.00"} />
+            <FieldValue label="Source" value={event.attribution?.source ?? "none"} />
+            <FieldValue label="Reason" value={event.attribution?.reason ?? "not_evaluated"} />
+            <FieldValue label="Root PID" value={event.attribution?.rootPid} />
+            <FieldValue label="PID" value={event.process?.pid} />
+            <FieldValue label="PPID" value={event.process?.ppid} />
           </div>
         </div>
 

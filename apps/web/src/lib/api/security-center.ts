@@ -13,6 +13,36 @@ export type SecurityTimeType = "last_3h" | "last_1d" | "last_7d" | "last_30d" | 
 export type SecurityRiskLevel = "safe" | "low" | "medium" | "high" | "critical" | "unknown" | string;
 export type SecurityPolicyAction = "allow" | "review" | "block" | string;
 
+export type AgentAttributionSource = "none" | "process_graph" | "cgroup" | "systemd" | "argv" | "env" | "self_register" | "workspace_hint";
+export type AgentAttributionReason = "not_evaluated" | "not_agent" | "process_lineage" | "authoritative_anchor" | "hint_only" | "conflict";
+
+export interface ProcessContext {
+  hostId?: string;
+  pid?: number;
+  ppid?: number;
+  startTimeNs?: string;
+  eventTimeNs?: string;
+  comm?: string;
+  exe?: string;
+  cwd?: string;
+  uid?: number;
+  cgroup?: string;
+  systemdUnit?: string;
+}
+
+export interface AgentAttribution {
+  monitored: boolean;
+  agentScopeId?: string;
+  agentDisplayName?: string;
+  agentSessionId?: string;
+  rootPid?: number;
+  confidence: number;
+  reason: AgentAttributionReason;
+  source: AgentAttributionSource;
+  conflict?: boolean;
+  degraded?: boolean;
+}
+
 export interface SecurityTimeFilter {
   timeType?: SecurityTimeType;
   startTime?: string;
@@ -246,6 +276,8 @@ export type CoverageIssueType =
   | "source_token_rotation_due";
 
 export interface AgentEventQuery extends SecurityTimeFilter {
+  scope?: "agent" | "raw";
+  noise?: "hide" | "include";
   eventId?: string;
   sourceId?: string;
   collectorId?: string;
@@ -290,6 +322,10 @@ export interface AgentEventListItem {
   tokenCount: number;
   latencyMs: number;
   attributes: Record<string, AgentEventAttributeValue>;
+  process?: ProcessContext;
+  attribution?: AgentAttribution;
+  repeatCount?: number;
+  lastAt?: string;
   rawPreview?: string;
 }
 

@@ -52,6 +52,7 @@ const ACTIVE_MS = 5 * 60_000;
 const STALE_MS = 60 * 60_000;
 const COLLECTOR_STALE_MS = 3 * 60_000;
 const COLLECTOR_DOWN_MS = 10 * 60_000;
+const COMPACT_WINDOW_MS = 3_000;
 
 const now = () => Date.now();
 const iso = (t = now()) => new Date(t).toISOString().slice(0, 19).replace('T', ' ');
@@ -113,6 +114,63 @@ function attrString(e: T.JudgedEvent, key: string): string {
   return value == null ? '' : String(value).trim();
 }
 
+function isMonitoredAgentEvent(e: T.JudgedEvent): boolean {
+  return e.attribution?.monitored === true;
+}
+
+function canonicalAgentName(value?: string): string | undefined {
+  const text = value?.trim().toLowerCase();
+  if (!text) return undefined;
+  if (text === 'a3s' || text === 'a3s-code' || text === 'a3s code') return 'a3s code';
+  if (text === 'claude' || text === 'claude-code' || text === 'claude code') return 'Claude Code';
+  return text;
+}
+
+function attributionWorkspacePath(e: T.JudgedEvent): string {
+  if (!isMonitoredAgentEvent(e)) return e.workspacePath;
+  const cwd = e.process?.cwd?.trim();
+  if (cwd) return cwd;
+  const scope = canonicalAgentName(e.attribution?.agentScopeId);
+  return scope ? `agent://${scope}` : e.workspacePath;
+}
+
+function eventAgentLabel(e: T.JudgedEvent): string {
+  return canonicalAgentName(e.attribution?.agentDisplayName) ?? canonicalAgentName(e.attribution?.agentScopeId) ?? e.agentId;
+}
+
+function eventSessionLabel(e: T.JudgedEvent): string {
+  return e.attribution?.agentSessionId?.trim() || eventAgentLabel(e);
+}
+
+function isLoopbackPeer(peer: string): boolean {
+  return peer === '127.0.0.1' || peer === '::1' || peer === 'localhost';
+}
+
+function normalizedCommand(e: T.JudgedEvent): string {
+  return (attrString(e, 'argv') || e.subject).trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function isLowValueAgentNoise(e: T.JudgedEvent): boolean {
+  if (!isMonitoredAgentEvent(e)) return false;
+  if (e.verdict !== 'allow' || e.riskScore > 0) return false;
+  if (e.eventKind === 'ProcessExit') return true;
+  if (e.eventKind === 'Egress') {
+    const peer = attrString(e, 'peer');
+    const port = Number(attrString(e, 'port'));
+    return isLoopbackPeer(peer) && (port === 7890 || port === 29653);
+  }
+  if (e.eventKind !== 'ToolExec') return false;
+  const cmd = normalizedCommand(e);
+  const exactNoise = new Set([
+    'getconf long_bit',
+    'lsb_release -a',
+    'hostname -i',
+    'who',
+    'tr [:upper:] [:lower:]',
+    'cut -c2-',
+  ]);
+  return exactNoise.has(cmd) || cmd === 'uname' || cmd.startsWith('uname ');
+}
 function eventCollectorId(e: T.JudgedEvent): string {
   return e.collectorId?.trim() || attrString(e, 'collectorId');
 }
@@ -129,6 +187,30 @@ function basename(path: string): string {
 function commandName(argv: string): string {
   const first = argv.trim().split(/\s+/)[0] ?? '';
   return first.includes('/') ? basename(first) : first;
+}
+
+function compactEventKey(e: T.JudgedEvent): string {
+  const agent = eventAgentLabel(e);
+  const command = e.eventKind === 'ToolExec' ? normalizedCommand(e) : '';
+  const peer = e.eventKind === 'Egress' ? attrString(e, 'peer') + ':' + attrString(e, 'port') : '';
+  const file = e.eventKind === 'FileAccess' || e.eventKind === 'FileDelete' ? attrString(e, 'path') : '';
+  const subject = command || peer || file || e.subject;
+  return [agent, e.eventKind, e.verdict, e.riskCategory, subject].join('\0');
+}
+
+function compactEvents(events: T.JudgedEvent[]): Array<{ event: T.JudgedEvent; repeatCount: number; lastAt: number }> {
+  const out: Array<{ event: T.JudgedEvent; repeatCount: number; lastAt: number }> = [];
+  for (const event of events) {
+    const last = out[out.length - 1];
+    if (last && compactEventKey(last.event) === compactEventKey(event) && Math.abs(last.lastAt - event.at) <= COMPACT_WINDOW_MS) {
+      last.repeatCount += 1;
+      last.lastAt = Math.max(last.lastAt, event.at);
+      if (event.riskScore > last.event.riskScore || event.at > last.event.at) last.event = event;
+      continue;
+    }
+    out.push({ event, repeatCount: 1, lastAt: event.at });
+  }
+  return out;
 }
 
 function topologyTarget(e: T.JudgedEvent): { type: T.TopologyNodeType; key: string; label: string; subtitle?: string; edgeType: T.TopologyEdgeType; edgeLabel: string } | null {
@@ -260,7 +342,7 @@ export class AggregationService {
     const safeSeries: T.WaveSeriesPoint[] = [];
     const riskSeries: T.WaveSeriesPoint[] = [];
     buckets.forEach((b, i) => {
-      const statTime = iso(dataSinceMs + i * size).slice(11, 16);
+      const statTime = iso(dataSinceMs + i * size);
       const avgRisk = mean(b.map((e) => e.riskScore));
       riskSeries.push({ statTime, value: Math.round(avgRisk), activationCount: b.filter((e) => e.verdict !== 'allow').length });
       safeSeries.push({ statTime, value: Math.round(100 - avgRisk), activationCount: b.length });
@@ -275,7 +357,7 @@ export class AggregationService {
     };
   }
 
-  private eventItem(e: T.JudgedEvent): T.AgentEventListItem {
+  private eventItem(e: T.JudgedEvent, repeatCount = 1, lastAt = e.at): T.AgentEventListItem {
     return {
       schemaVersion: e.schemaVersion,
       eventId: e.eventId,
@@ -306,6 +388,10 @@ export class AggregationService {
       tokenCount: e.tokenCount,
       latencyMs: e.latencyMs,
       attributes: e.attributes,
+      process: e.process,
+      attribution: e.attribution,
+      repeatCount: repeatCount > 1 ? repeatCount : undefined,
+      lastAt: repeatCount > 1 ? iso(lastAt) : undefined,
       rawPreview: e.rawPreview,
     };
   }
@@ -320,11 +406,15 @@ export class AggregationService {
     const traceId = filter.traceId?.trim();
     const runId = filter.runId?.trim();
     const hasFilter = Boolean(sourceId || collectorId || agentId || sessionId || workspacePath || traceId || runId || filter.eventKind || filter.eventCategory || filter.verdict);
+    const agentScoped = filter.scope === 'agent' && !pinnedEventId;
+    const hideNoise = agentScoped && filter.noise !== 'include';
     return events.filter((e) => {
       const matchesEventId = Boolean(pinnedEventId && e.eventId === pinnedEventId);
       const eventSource = eventSourceId(e);
       const eventCollector = eventCollectorId(e);
+      const matchesScope = (!agentScoped || isMonitoredAgentEvent(e)) && (!hideNoise || !isLowValueAgentNoise(e));
       const matchesFilter =
+        matchesScope &&
         (!sourceId || eventSource === sourceId) &&
         (!collectorId || eventCollector === collectorId) &&
         (!agentId || e.agentId === agentId) &&
@@ -348,9 +438,10 @@ export class AggregationService {
       Number(Boolean(pinnedEventId) && b.eventId === pinnedEventId) - Number(Boolean(pinnedEventId) && a.eventId === pinnedEventId) ||
       b.at - a.at,
     );
+    const compacted = filter.scope === 'raw' || pinnedEventId ? filtered.map((event) => ({ event, repeatCount: 1, lastAt: event.at })) : compactEvents(filtered);
     return {
-      items: filtered.slice(0, limit).map((e) => this.eventItem(e)),
-      total: filtered.length,
+      items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) => this.eventItem(event, repeatCount, lastAt)),
+      total: compacted.length,
       updateTime: iso(),
     };
   }
@@ -1585,8 +1676,12 @@ export class AggregationService {
 
   highestRiskSession(filter: T.SecurityTimeFilter): T.SecurityHighestRiskSession {
     const { events } = this.win(filter);
+    const agentEvents = events.filter(isMonitoredAgentEvent);
     const bySession = new Map<string, T.JudgedEvent[]>();
-    for (const e of events) (bySession.get(e.sessionId) ?? bySession.set(e.sessionId, []).get(e.sessionId)!).push(e);
+    for (const e of agentEvents) {
+      const key = eventSessionLabel(e);
+      (bySession.get(key) ?? bySession.set(key, []).get(key)!).push(e);
+    }
     let top: T.JudgedEvent[] = [];
     let topScore = -1;
     for (const evs of bySession.values()) {
@@ -1604,7 +1699,7 @@ export class AggregationService {
     });
     const lvl = levelByRank(Math.min(4, Math.floor(composite / 22)));
     return {
-      sessionId: head.sessionId, userId: head.userId, workspacePath: head.workspacePath,
+      sessionId: eventAgentLabel(head), userId: head.userId, workspacePath: attributionWorkspacePath(head),
       riskLevel: lvl.level, riskLevelText: lvl.text, compositeScore: composite,
       lastEventTime: iso(Math.max(...top.map((e) => e.at))), riskDimensions: dims, updateTime: iso(),
     };
@@ -1644,8 +1739,12 @@ export class AggregationService {
 
   workspaceRiskDistribution(filter: T.SecurityTimeFilter): T.SecurityWorkspaceRiskDistribution {
     const { events } = this.win(filter);
+    const monitoredEvents = events.filter(isMonitoredAgentEvent);
     const byWs = new Map<string, T.JudgedEvent[]>();
-    for (const e of events) (byWs.get(e.workspacePath) ?? byWs.set(e.workspacePath, []).get(e.workspacePath)!).push(e);
+    for (const e of monitoredEvents) {
+      const workspacePath = attributionWorkspacePath(e);
+      (byWs.get(workspacePath) ?? byWs.set(workspacePath, []).get(workspacePath)!).push(e);
+    }
     const list = [...byWs.entries()]
       .map(([workspacePath, evs]) => {
         const lvl = worstLevel(evs);
