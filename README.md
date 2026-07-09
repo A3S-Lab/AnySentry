@@ -222,6 +222,23 @@ kubectl -n anysentry port-forward svc/anysentry 29653:29653
 curl -fsS http://localhost:29653/security-center/healthz
 ```
 
+Cluster-wide node coverage:
+
+```bash
+kubectl get nodes
+kubectl -n anysentry get daemonset a3s-observer
+kubectl -n anysentry get pods -l app=a3s-observer -o wide
+```
+
+The observer is a DaemonSet, so it targets every schedulable Linux/amd64 node. Each ready
+`a3s-observer` pod becomes a node-scoped Collector by using `spec.nodeName` as
+`A3S_OBSERVER_COLLECTOR_ID` / `A3S_NODE_NAME`; the dashboard then shows coverage, heartbeats, and
+risk events per node. Nodes are not covered when the cluster cannot schedule the privileged eBPF
+pod there, for example on managed control-plane nodes, incompatible architectures, or clusters that
+block privileged/eBPF workloads. AnySentry also focuses the dashboard on agent workloads by default:
+set `ANYSENTRY_AGENT_NAMESPACES` and matching namespaced pod-reader Roles for the namespaces where
+your agents actually run.
+
 If your cluster cannot pull the public observer-forwarder image, build and push it, then set
 `ANYSENTRY_OBSERVER_IMAGE`:
 
@@ -1380,9 +1397,12 @@ run in-memory.
 
 ## Kubernetes
 
-For a fleet, run `a3s-observer` as an observe-only eBPF DaemonSet on every node, forwarding events
-to AnySentry. See [`deploy/`](deploy/) for example manifests (AnySentry + ClickHouse + the observer
-DaemonSet) and the runbook.
+For a fleet, run `a3s-observer` as an observe-only eBPF DaemonSet on every schedulable Linux/amd64
+node, forwarding events to AnySentry. The DaemonSet uses the Kubernetes node name as the Collector
+identity, so you can verify full-machine coverage with `kubectl -n anysentry get daemonset
+a3s-observer` and `kubectl -n anysentry get pods -l app=a3s-observer -o wide`. See
+[`deploy/`](deploy/) for example manifests (AnySentry + ClickHouse + the observer DaemonSet) and the
+runbook.
 
 ## Layout
 
