@@ -34,5 +34,7 @@ install -m 0644 "$SENTRY_ADDON" "$sentry_dir/a3s-sentry.linux-arm64-gnu.node"
 rm -rf "$STAGE_DIR/app/node_modules/@a3s-lab/code" \
   "$STAGE_DIR/app/node_modules/@a3s-lab/code-linux-x64-gnu" \
   "$STAGE_DIR/app/node_modules/@a3s-lab/code-linux-x64-musl"
+find "$STAGE_DIR/app/node_modules/.pnpm" -maxdepth 1 -type d -name '@a3s-lab+code*' \
+  -exec rm -rf {} +
 
 echo "AnySentry application staged at $STAGE_DIR/app"

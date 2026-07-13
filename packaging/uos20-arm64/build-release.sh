@@ -48,6 +48,19 @@ install -m 0755 "$SCRIPT_DIR/verify.sh" "$STAGE_DIR/verify.sh"
 install -m 0755 "$SCRIPT_DIR/wait-clickhouse.sh" "$STAGE_DIR/wait-clickhouse.sh"
 install -m 0755 "$SCRIPT_DIR/provision-observer.mjs" "$STAGE_DIR/provision-observer.mjs"
 
+elf_count=0
+while IFS= read -r -d '' candidate; do
+  if LANG=C readelf -h "$candidate" >/dev/null 2>&1; then
+    "$SCRIPT_DIR/check-elf.sh" "$candidate"
+    elf_count=$((elf_count + 1))
+  fi
+done < <(find "$STAGE_DIR" -type f -print0)
+if (( elf_count == 0 )); then
+  echo "No ELF files found in release stage" >&2
+  exit 1
+fi
+echo "Verified $elf_count staged AArch64 ELF files"
+
 source_dirty=false
 
 {
