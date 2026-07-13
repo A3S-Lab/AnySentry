@@ -36,6 +36,7 @@ rm -rf "$STAGE_DIR/app/node_modules/@a3s-lab/code" \
   "$STAGE_DIR/app/node_modules/@a3s-lab/code-linux-x64-musl"
 find "$STAGE_DIR/app/node_modules/.pnpm" -maxdepth 1 -type d -name '@a3s-lab+code*' \
   -exec rm -rf {} +
+rm -f "$STAGE_DIR/app/node_modules/.pnpm/node_modules/@anysentry/api"
 find "$STAGE_DIR/app" -xtype l -delete
 
 echo "AnySentry application staged at $STAGE_DIR/app"

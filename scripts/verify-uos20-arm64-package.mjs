@@ -98,6 +98,7 @@ requireText(appBuild, /a3s-sentry\.linux-arm64-gnu\.node/u, 'application build i
 requireText(appBuild, /rm -f .*\/\*\.node/u, 'application build removes incompatible native addons');
 requireText(appBuild, /\.pnpm[\s\S]*@a3s-lab\+code/u, 'application build removes build-host a3s-code packages from the API virtual store');
 requireText(appBuild, /find "\$STAGE_DIR\/app" -xtype l -delete/u, 'application build removes dangling deployment links');
+requireText(appBuild, /\.pnpm\/node_modules\/@anysentry\/api/u, 'application build removes the build-workspace API link');
 
 const clickhouseBuild = requireFile('packaging/uos20-arm64/build-clickhouse.sh');
 requireText(clickhouseBuild, /clickhouse\/clickhouse-server@sha256:/u, 'ClickHouse build pins an immutable image digest');
