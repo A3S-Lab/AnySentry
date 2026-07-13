@@ -1534,7 +1534,7 @@ export class AggregationService {
     const config = sanitizePolicy(input.policy);
     let simulator: Sentry;
     try {
-      simulator = Sentry.create(buildAcl(config));
+      simulator = Sentry.create(buildAcl(config, { llmApiKey: process.env.ANYSENTRY_LLM_API_KEY }));
     } catch (error) {
       throw policyConfigError(error);
     }

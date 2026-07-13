@@ -1,0 +1,33 @@
+[Unit]
+Description=AnySentry Linux 4.19 eBPF Observer
+Requires=anysentry.service
+After=network.target anysentry.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/anysentry/observer
+EnvironmentFile=/etc/anysentry/anysentry.env
+Environment=A3S_OBSERVER_JSON=1
+Environment=A3S_OBSERVER_FILES=1
+ExecStart=/bin/bash -o pipefail -c '/opt/anysentry/observer/bin/a3s-observer-collector | /opt/anysentry/runtime/node/bin/node /opt/anysentry/observer/observer-forward.js'
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+KillMode=control-group
+LimitMEMLOCK=infinity
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RESOURCE
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RESOURCE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

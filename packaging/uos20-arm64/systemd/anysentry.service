@@ -1,0 +1,29 @@
+[Unit]
+Description=AnySentry API and security dashboard
+Requires=anysentry-clickhouse.service
+After=network.target anysentry-clickhouse.service
+
+[Service]
+Type=simple
+User=anysentry
+Group=anysentry
+WorkingDirectory=/opt/anysentry/app
+EnvironmentFile=/etc/anysentry/anysentry.env
+ExecStartPre=/opt/anysentry/wait-clickhouse.sh
+ExecStart=/opt/anysentry/runtime/node/bin/node /opt/anysentry/app/dist/main.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=120s
+TimeoutStopSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/anysentry
+
+[Install]
+WantedBy=multi-user.target

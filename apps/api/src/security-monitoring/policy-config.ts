@@ -22,7 +22,7 @@ export interface L1Rule {
   action?: RuleAction;
 }
 export interface L2Config { url: string; model: string; timeoutS: number } // LLM judge endpoint
-export interface L3Config { bin: string; skills: string } // a3s-code agent + skills dir
+export interface L3Config { bin: string; skills: string; timeoutS: number } // a3s-code agent + skills dir
 
 /** The whole judge policy. `null` tiers are "not configured" → the dashboard hides them. */
 export interface PolicyConfig {
@@ -53,6 +53,36 @@ export const DEFAULT_POLICY: PolicyConfig = {
   llm: null,
   agent: null,
 };
+
+const DEFAULT_L3_BIN = '/opt/anysentry/l3/l3-agent.mjs';
+const DEFAULT_L3_SKILLS = '/opt/anysentry/l3/skills';
+
+function enabled(value: string | undefined): boolean {
+  return ['1', 'true', 'yes', 'on'].includes((value ?? '').trim().toLowerCase());
+}
+
+/** Seed a fresh installation from its protected systemd EnvironmentFile. Secrets deliberately do
+ * not enter this serializable policy object; they are supplied only while building the in-memory ACL. */
+export function policyFromEnvironment(env: NodeJS.ProcessEnv = process.env): PolicyConfig {
+  const url = (env.ANYSENTRY_LLM_BASE_URL ?? '').trim().replace(/\/+$/, '');
+  if (!url) return { ...DEFAULT_POLICY, rules: [] };
+  const l3Enabled = enabled(env.ANYSENTRY_L3_ENABLED);
+  return sanitizePolicy({
+    ...DEFAULT_POLICY,
+    llm: {
+      url,
+      model: env.ANYSENTRY_LLM_MODEL,
+      timeoutS: env.ANYSENTRY_LLM_TIMEOUT,
+    },
+    agent: l3Enabled
+      ? {
+          bin: env.ANYSENTRY_L3_BIN || DEFAULT_L3_BIN,
+          skills: env.ANYSENTRY_L3_SKILLS || DEFAULT_L3_SKILLS,
+          timeoutS: env.ANYSENTRY_L3_TIMEOUT,
+        }
+      : null,
+  });
+}
 
 const KINDS: RuleKind[] = ['ToolExec', 'Egress', 'Dns', 'FileAccess', 'SslContent', 'SecurityAction'];
 const VERDICTS: Verdict[] = ['allow', 'block', 'escalate'];
@@ -88,7 +118,9 @@ export function sanitizePolicy(input: unknown): PolicyConfig {
   const llm: L2Config | null = llmIn && str(llmIn.url) ? { url: str(llmIn.url, 500), model: str(llmIn.model, 100) || 'default', timeoutS: num(llmIn.timeoutS, 1, 600, 30) } : null;
 
   const agentIn = o.agent as Record<string, unknown> | null | undefined;
-  const agent: L3Config | null = agentIn && str(agentIn.bin) ? { bin: str(agentIn.bin, 500), skills: str(agentIn.skills, 500) } : null;
+  const agent: L3Config | null = agentIn && str(agentIn.bin)
+    ? { bin: str(agentIn.bin, 500), skills: str(agentIn.skills, 500), timeoutS: num(agentIn.timeoutS, 1, 3600, 120) }
+    : null;
 
   return { failClosed: o.failClosed === true, speculate: pick(o.speculate, ['off', 'low', 'medium', 'high'], 'off'), rules, llm, agent };
 }
@@ -100,11 +132,14 @@ function q(s: string): string {
 
 /** Render the policy as a sentry ACL (HCL). Blocks are multi-line; the rules list uses object
  *  literals. Built-in rules always apply underneath these. */
-export function buildAcl(c: PolicyConfig): string {
+export function buildAcl(c: PolicyConfig, secrets: { llmApiKey?: string } = {}): string {
   const out: string[] = [`fail_closed = ${c.failClosed}`];
   if (c.speculate !== 'off') out.push(`speculate = ${q(c.speculate)}`);
-  if (c.llm) out.push(`llm {\n  url = ${q(c.llm.url)}\n  model = ${q(c.llm.model)}\n  timeout_s = ${c.llm.timeoutS | 0}\n}`);
-  if (c.agent) out.push(`agent {\n  bin = ${q(c.agent.bin)}\n  skills = ${q(c.agent.skills)}\n}`);
+  if (c.llm) {
+    const key = secrets.llmApiKey ? `\n  key = ${q(secrets.llmApiKey)}` : '';
+    out.push(`llm {\n  url = ${q(c.llm.url)}\n  model = ${q(c.llm.model)}${key}\n  timeout_s = ${c.llm.timeoutS | 0}\n}`);
+  }
+  if (c.agent) out.push(`agent {\n  bin = ${q(c.agent.bin)}\n  skills = ${q(c.agent.skills)}\n  timeout_s = ${c.agent.timeoutS | 0}\n}`);
   if (c.rules.length) {
     out.push('rules = [');
     for (const r of c.rules) {

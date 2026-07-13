@@ -10,20 +10,14 @@
 //   A3S_SENTRY_LLM_KEY   API key
 //   A3S_SENTRY_LLM_MODEL model id (default: glm5.1-w4a8)
 //
-// Requires `@a3s-lab/code` (npm i -g @a3s-lab/code, or a local install).
+// Requires a local `@a3s-lab/code` install next to this script.
 
 import { createRequire } from 'module'
-import { execSync } from 'child_process'
 
-const require = createRequire('/app/package.json')
+const require = createRequire(import.meta.url)
 
 function loadSdk() {
-  try {
-    return require('@a3s-lab/code')
-  } catch {
-    const groot = execSync('npm root -g').toString().trim()
-    return require(groot + '/@a3s-lab/code')
-  }
+  return require('@a3s-lab/code')
 }
 
 // --- args: -p <prompt> (or a bare trailing prompt), --skills <dir>, --json (ignored) ---
@@ -43,22 +37,24 @@ if (!prompt) {
 
 // L3 LLM config: prefer dedicated A3S_SENTRY_L3_* (lets L3 use a different/stronger model than L2,
 // and lets you run L3 without enabling sentry's L2), falling back to L2's A3S_SENTRY_LLM_*.
-const url = process.env.A3S_SENTRY_L3_URL || process.env.A3S_SENTRY_LLM_URL || 'http://localhost:18051/v1'
-const key = process.env.A3S_SENTRY_L3_KEY || process.env.A3S_SENTRY_LLM_KEY || ''
-const model = process.env.A3S_SENTRY_L3_MODEL || process.env.A3S_SENTRY_LLM_MODEL || 'glm-5.2'
+const url = process.env.A3S_SENTRY_L3_URL || process.env.A3S_SENTRY_LLM_URL || process.env.ANYSENTRY_LLM_BASE_URL || 'http://localhost:18051/v1'
+const key = process.env.A3S_SENTRY_L3_KEY || process.env.A3S_SENTRY_LLM_KEY || process.env.ANYSENTRY_LLM_API_KEY || ''
+const model = process.env.A3S_SENTRY_L3_MODEL || process.env.A3S_SENTRY_LLM_MODEL || process.env.ANYSENTRY_LLM_MODEL || 'default'
+
+const hclString = (value) => JSON.stringify(String(value))
 
 // a3s-code agent ACL — provider is matched by `name`; apiKey/baseUrl are camelCase on the model.
 const acl = `id = "sentry-l3"
 name = "Sentry L3 Security Investigator"
-default_model = "openai/${model}"
+default_model = ${hclString(`openai/${model}`)}
 providers "openai" {
   id = "openai"
   name = "openai"
-  models "${model}" {
-    id = "${model}"
-    name = "${model}"
-    apiKey = "${key}"
-    baseUrl = "${url}"
+  models ${hclString(model)} {
+    id = ${hclString(model)}
+    name = ${hclString(model)}
+    apiKey = ${hclString(key)}
+    baseUrl = ${hclString(url)}
   }
 }`
 
@@ -78,7 +74,8 @@ try {
   const agent = await Agent.create(acl)
   const opts = { planningMode: 'disabled' }
   if (skills) opts.skillDirs = [skills]
-  const session = agent.session('.', opts)
+  const workspace = process.env.ANYSENTRY_L3_WORKSPACE || '/var/lib/anysentry/l3'
+  const session = agent.session(workspace, opts)
   const result = await session.send(prompt)
   session.close()
   const verdict = extractVerdict(result.text)

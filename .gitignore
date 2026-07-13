@@ -6,3 +6,9 @@ dist/
 .env.local
 .a3s/
 perf-results/
+.build/
+.build/uos20-arm64/
+release/uos20-arm64/
+release/anysentry-*-uos20-arm64/
+release/anysentry-*-uos20-arm64.tar.gz
+release/anysentry-*-uos20-arm64.tar.gz.sha256

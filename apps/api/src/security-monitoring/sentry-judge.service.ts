@@ -4,7 +4,7 @@ import { Sentry, dns, egress, fileAccess, securityAction, sslContent, toolExec }
 import { AgentAttributionService } from './agent-attribution.service';
 import { AlertingService } from './alerting.service';
 import { ClickHouseStore, IncidentState } from './clickhouse-store';
-import { DEFAULT_POLICY, PolicyConfig, buildAcl, policyConfigError, sanitizePolicy, tierStatus } from './policy-config';
+import { PolicyConfig, buildAcl, policyConfigError, policyFromEnvironment, sanitizePolicy, tierStatus } from './policy-config';
 import { cleanText } from './redaction';
 import { CollectorHeartbeatRecord, CollectorHeartbeatRequest, EventCategory, EventMeta, Incident, IncidentStatus, JudgedEvent, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
 
@@ -253,11 +253,11 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   private readonly ch = new ClickHouseStore();
   private readonly incidents = new Map<string, Incident>();
   // The live editable judge policy (the config panels' target). Applied = ACL rebuilt + judge recreated.
-  private policy: PolicyConfig = DEFAULT_POLICY;
+  private policy: PolicyConfig = policyFromEnvironment();
 
   async onModuleInit(): Promise<void> {
     // fail_closed=false → judge-only (no kernel enforcement); built-in rule set always applies.
-    this.applyPolicy(DEFAULT_POLICY);
+    this.applyPolicy(policyFromEnvironment());
     // Connect ClickHouse, restore the saved policy, and hydrate the ring with recent history.
     if (await this.ch.init()) {
       const saved = await this.ch.loadConfig();
@@ -291,7 +291,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   private applyPolicy(config: PolicyConfig): void {
     let next: Sentry;
     try {
-      next = Sentry.create(buildAcl(config));
+      next = Sentry.create(buildAcl(config, { llmApiKey: process.env.ANYSENTRY_LLM_API_KEY }));
     } catch (error) {
       throw policyConfigError(error);
     }
