@@ -6,6 +6,7 @@ export interface SecurityTimeFilter {
   timeType?: 'last_3h' | 'last_1d' | 'last_7d' | 'last_30d' | 'custom';
   startTime?: string;
   endTime?: string;
+  scope?: 'agent' | 'raw';
 }
 export interface ExplainabilityScanRequest extends SecurityTimeFilter {
   seriesPoints?: number;

@@ -9,6 +9,7 @@
     "build": "nest build"
   },
   "dependencies": {
+    "@a3s-lab/code": "5.1.0",
     "@a3s-lab/sentry": "^0.1.0",
     "@clickhouse/client": "^1.22.0",
     "@nestjs/common": "^10.4.0",

@@ -35,5 +35,7 @@ ENV NODE_ENV=production PORT=29653 ANYSENTRY_WEB_DIR=/app/web PUBLIC_BASE_PATH=$
 COPY --from=build /out/node_modules ./node_modules
 COPY --from=build /out/dist ./dist
 COPY --from=build /src/apps/web/dist ./web
+COPY --from=build --chmod=755 /src/scripts/l3-agent.mjs /opt/anysentry/l3-agent.mjs
+COPY --from=build /src/skills/l3 /opt/anysentry/skills
 EXPOSE 29653
 CMD ["node", "dist/main.js"]
