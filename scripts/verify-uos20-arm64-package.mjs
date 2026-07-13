@@ -97,6 +97,7 @@ requireText(appBuild, /apps\/web\/dist/u, 'application build stages web assets')
 requireText(appBuild, /a3s-sentry\.linux-arm64-gnu\.node/u, 'application build installs the ARM64 sentry addon');
 requireText(appBuild, /rm -f .*\/\*\.node/u, 'application build removes incompatible native addons');
 requireText(appBuild, /\.pnpm[\s\S]*@a3s-lab\+code/u, 'application build removes build-host a3s-code packages from the API virtual store');
+requireText(appBuild, /find "\$STAGE_DIR\/app" -xtype l -delete/u, 'application build removes dangling deployment links');
 
 const clickhouseBuild = requireFile('packaging/uos20-arm64/build-clickhouse.sh');
 requireText(clickhouseBuild, /clickhouse\/clickhouse-server@sha256:/u, 'ClickHouse build pins an immutable image digest');
@@ -228,6 +229,7 @@ requireText(releaseBuild, /VERSION/u, 'release builder records component provena
 requireText(releaseBuild, /git -C "\$ROOT_DIR" status --porcelain/u, 'release builder records tracked and untracked source changes');
 requireText(releaseBuild, /manifest\.sha256/u, 'release builder emits content checksums');
 requireText(releaseBuild, /check-elf\.sh[\s\S]*done < <\(find "\$STAGE_DIR" -type f -print0\)/u, 'release builder validates every staged ELF');
+requireText(releaseBuild, /find "\$STAGE_DIR" -xtype l/u, 'release builder rejects dangling symbolic links');
 requireText(releaseBuild, /find \. -type f[\s\S]*-print0[\s\S]*sort -z[\s\S]*sha256sum/u, 'release builder hashes every staged file deterministically');
 requireText(releaseBuild, /--sort=name/u, 'release builder sorts archive entries');
 requireText(releaseBuild, /--owner=0/u, 'release builder normalizes archive ownership');

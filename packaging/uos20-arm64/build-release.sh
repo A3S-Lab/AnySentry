@@ -61,6 +61,12 @@ if (( elf_count == 0 )); then
 fi
 echo "Verified $elf_count staged AArch64 ELF files"
 
+if find "$STAGE_DIR" -xtype l -print -quit | grep -q .; then
+  echo "Release stage contains dangling symbolic links" >&2
+  find "$STAGE_DIR" -xtype l -print >&2
+  exit 1
+fi
+
 source_dirty=false
 
 {
