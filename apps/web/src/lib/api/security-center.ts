@@ -47,6 +47,7 @@ export interface SecurityTimeFilter {
   timeType?: SecurityTimeType;
   startTime?: string;
   endTime?: string;
+  scope?: "agent" | "raw";
 }
 
 export interface SecurityHealthCard {
