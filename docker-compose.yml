@@ -33,7 +33,12 @@ services:
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-anysentry}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-anysentry}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-anysentry}
+      A3S_SENTRY_L3_URL: ${A3S_SENTRY_L3_URL:-http://host.docker.internal:18051/v1}
+      A3S_SENTRY_L3_MODEL: ${A3S_SENTRY_L3_MODEL:-glm-5.2}
+      A3S_SENTRY_L3_KEY: ${A3S_SENTRY_L3_KEY:-proxy-managed}
       # ANYSENTRY_SYNTHETIC_FEED: "on"   # uncomment for a self-driving demo load
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "29653:29653"
     restart: unless-stopped

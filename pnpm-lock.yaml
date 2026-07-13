@@ -10,6 +10,9 @@ importers:
 
   apps/api:
     dependencies:
+      '@a3s-lab/code':
+        specifier: 5.1.0
+        version: 5.1.0
       '@a3s-lab/sentry':
         specifier: ^0.1.0
         version: 0.1.0
@@ -27,7 +30,7 @@ importers:
         version: 10.4.22(@nestjs/common@10.4.22(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@10.4.22)
       '@nestjs/serve-static':
         specifier: ^4.0.2
-        version: 4.0.2(@nestjs/common@10.4.22(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@10.4.22(@nestjs/common@10.4.22(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/platform-express@10.4.22)(reflect-metadata@0.2.2)(rxjs@7.8.2))(express@4.22.1)
+        version: 4.0.2(@nestjs/common@10.4.22(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@10.4.22)(express@4.22.1)
       express:
         specifier: ^4.22.1
         version: 4.22.1
@@ -123,6 +126,39 @@ importers:
 
 packages:
 
+  '@a3s-lab/code-darwin-arm64@5.1.0':
+    resolution: {integrity: sha512-nx7yOZ375IXyF6Zo3hScUjs1ZYtRwCuQXB420KemwXNaoZ5XBthl/b5JoGkGsUmKMykgF2FJVnK5wIsbuVf73w==}
+    cpu: [arm64]
+    os: [darwin]
+
+  '@a3s-lab/code-linux-arm64-gnu@5.1.0':
+    resolution: {integrity: sha512-UbkrWQTfdMCkrqZ2mG0fpEZXklwpZLevfPWEgUf02kMj/CjhwPeWPL3/N9x0UTafVujkMnyfn3IRQthlrTEB1w==}
+    cpu: [arm64]
+    os: [linux]
+
+  '@a3s-lab/code-linux-arm64-musl@5.1.0':
+    resolution: {integrity: sha512-NSfWItrvZbGCso7wM0rkFRRQUcoEwyuue30pPpO2mUGedVGO0Xu3YsKFsx037ojMkW/5xuAvIaS1RoiHXT+2Qg==}
+    cpu: [arm64]
+    os: [linux]
+
+  '@a3s-lab/code-linux-x64-gnu@5.1.0':
+    resolution: {integrity: sha512-yMnHnO+A7HA2eOVtq8WRlJpwEn/TOa0//JODlqE8RgjMCOVAROexaRScGZaGoEJu0yXuj147QQALCXPHEyV7CQ==}
+    cpu: [x64]
+    os: [linux]
+
+  '@a3s-lab/code-linux-x64-musl@5.1.0':
+    resolution: {integrity: sha512-Hc/Q7Gvm0fph+wC2a5OGUZUEUNfBP6meLWLJP4msTdOW9MWQ12PLzQfY9Yp2WGAdba+3PoOp3pcg4hhozvxgig==}
+    cpu: [x64]
+    os: [linux]
+
+  '@a3s-lab/code-win32-x64-msvc@5.1.0':
+    resolution: {integrity: sha512-gqx6RfWlmhMX4qJvYFo/OlL4qBRQ7X0dkO/4WTPYcp+wAmbdX8NTFcDLFY4lpqwFf8uSae9v7cRw3+M92xlDtA==}
+    cpu: [x64]
+    os: [win32]
+
+  '@a3s-lab/code@5.1.0':
+    resolution: {integrity: sha512-lqbInFqEBINJfWtmf8NZeDIBLYMUnAMXcFfJhadx91rp2dxe1ecaLRwuw33dqgfMVc+3Drt0ak5I00OXRB5YMA==}
+
   '@a3s-lab/sentry@0.1.0':
     resolution: {integrity: sha512-eKrPGuzbRpoY8JD/cm95JasBwCCRJocU1prKzQ79UNsPoj6kgdufq6IbGp6hK2VRjLpfAAQvvSmxZ94F3rzteg==}
     engines: {node: '>=12'}
@@ -166,6 +202,7 @@ packages:
 
   '@clickhouse/client-common@1.22.0':
     resolution: {integrity: sha512-MQgXRhoYXut6GhRrTJlub42bnPX7+5Vm+5gHNR0zZXU5+EwZKsBgMXiWXPOerAmQd3weGKm8hzoeZJCfU3Cw2w==}
+    deprecated: 'Deprecated: import from @clickhouse/client or @clickhouse/client-web instead.'
 
   '@clickhouse/client@1.22.0':
     resolution: {integrity: sha512-iQAAM4VT9fO7mYVOkGB/Ul9Xxuf0atKn+GFceZqfE8xFakV8KOAQxR3tfNrXFMlJ8T+Q3gbrpfLFyj7/TbOwyA==}
@@ -2637,6 +2674,33 @@ packages:
 
 snapshots:
 
+  '@a3s-lab/code-darwin-arm64@5.1.0':
+    optional: true
+
+  '@a3s-lab/code-linux-arm64-gnu@5.1.0':
+    optional: true
+
+  '@a3s-lab/code-linux-arm64-musl@5.1.0':
+    optional: true
+
+  '@a3s-lab/code-linux-x64-gnu@5.1.0':
+    optional: true
+
+  '@a3s-lab/code-linux-x64-musl@5.1.0':
+    optional: true
+
+  '@a3s-lab/code-win32-x64-msvc@5.1.0':
+    optional: true
+
+  '@a3s-lab/code@5.1.0':
+    optionalDependencies:
+      '@a3s-lab/code-darwin-arm64': 5.1.0
+      '@a3s-lab/code-linux-arm64-gnu': 5.1.0
+      '@a3s-lab/code-linux-arm64-musl': 5.1.0
+      '@a3s-lab/code-linux-x64-gnu': 5.1.0
+      '@a3s-lab/code-linux-x64-musl': 5.1.0
+      '@a3s-lab/code-win32-x64-msvc': 5.1.0
+
   '@a3s-lab/sentry@0.1.0': {}
 
   '@alloc/quick-lru@5.2.0': {}
@@ -2855,7 +2919,7 @@ snapshots:
     transitivePeerDependencies:
       - chokidar
 
-  '@nestjs/serve-static@4.0.2(@nestjs/common@10.4.22(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@10.4.22(@nestjs/common@10.4.22(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/platform-express@10.4.22)(reflect-metadata@0.2.2)(rxjs@7.8.2))(express@4.22.1)':
+  '@nestjs/serve-static@4.0.2(@nestjs/common@10.4.22(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@10.4.22)(express@4.22.1)':
     dependencies:
       '@nestjs/common': 10.4.22(reflect-metadata@0.2.2)(rxjs@7.8.2)
       '@nestjs/core': 10.4.22(@nestjs/common@10.4.22(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/platform-express@10.4.22)(reflect-metadata@0.2.2)(rxjs@7.8.2)

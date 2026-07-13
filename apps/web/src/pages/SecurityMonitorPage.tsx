@@ -91,6 +91,8 @@ interface SecurityDashboardData {
   errors: Partial<Record<SecuritySectionKey, string>>;
 }
 
+type TimelineScope = "agent" | "raw";
+
 const TIME_OPTIONS: Array<{ value: SecurityTimeType; label: string }> = [
   { value: "last_3h", label: "近3小时" },
   { value: "last_1d", label: "近一天" },
@@ -215,7 +217,7 @@ function formatRequestError(error: unknown) {
   return "请求失败";
 }
 
-async function loadSecurityDashboardData(filter: SecurityTimeFilter): Promise<SecurityDashboardData> {
+async function loadSecurityDashboardData(filter: SecurityTimeFilter, timelineScope: TimelineScope, riskBreakdownScope: TimelineScope, decisionFunnelScope: TimelineScope, workspaceRiskScope: TimelineScope): Promise<SecurityDashboardData> {
   const scanFilter = { ...filter, seriesPoints: 36 };
   const { data, errors } = await settleAll(
     {
@@ -223,11 +225,11 @@ async function loadSecurityDashboardData(filter: SecurityTimeFilter): Promise<Se
       scan: securityCenterApi.explainabilityScan(scanFilter),
       performance: securityCenterApi.performanceCard(filter),
       riskSummary: securityCenterApi.riskSummary(filter),
-      riskBreakdown: securityCenterApi.riskBreakdown(filter),
+      riskBreakdown: securityCenterApi.riskBreakdown({ ...filter, scope: riskBreakdownScope }),
       highestRisk: securityCenterApi.highestRiskSession(filter),
-      decisionFunnel: securityCenterApi.decisionFunnel(filter),
-      workspaceRisk: securityCenterApi.workspaceRiskDistribution(filter),
-      events: securityCenterApi.agentEvents({ ...filter, scope: "agent", limit: 36 }),
+      decisionFunnel: securityCenterApi.decisionFunnel({ ...filter, scope: decisionFunnelScope }),
+      workspaceRisk: securityCenterApi.workspaceRiskDistribution({ ...filter, scope: workspaceRiskScope }),
+      events: securityCenterApi.agentEvents({ ...filter, scope: timelineScope, limit: 36 }),
     },
     formatRequestError,
   );
@@ -1278,7 +1280,17 @@ function RiskCategoryColumn({
   );
 }
 
-function RiskBreakdownPanel({ breakdown, error }: { breakdown?: SecurityRiskBreakdown | null; error?: string }) {
+function RiskBreakdownPanel({
+  breakdown,
+  error,
+  scope,
+  onScopeChange,
+}: {
+  breakdown?: SecurityRiskBreakdown | null;
+  error?: string;
+  scope: TimelineScope;
+  onScopeChange: (value: TimelineScope) => void;
+}) {
   const data = breakdown ?? {
     systemRisks: FALLBACK_BREAKDOWN_CATEGORY,
     communicationRisks: FALLBACK_BREAKDOWN_CATEGORY,
@@ -1290,7 +1302,12 @@ function RiskBreakdownPanel({ breakdown, error }: { breakdown?: SecurityRiskBrea
     <Panel
       title="风险分层拆解"
       icon={BarChart3}
-      action={<span className="text-xs text-zinc-500">{data.updateTime ? formatDate(data.updateTime) : "--"}</span>}
+      action={
+        <div className="flex items-center gap-3">
+          <TimelineScopeTabs value={scope} onChange={onScopeChange} />
+          <span className="text-xs text-zinc-500">{data.updateTime ? formatDate(data.updateTime) : "--"}</span>
+        </div>
+      }
     >
       <div className="space-y-3 p-4">
         <InlineError message={error} />
@@ -1467,14 +1484,22 @@ function funnelTierKey(tier: SecurityDecisionTier): "l2" | "l3" | null {
 function DecisionFunnelPanel({
   funnel,
   status,
+  scope,
+  onScopeChange,
 }: {
   funnel?: SecurityDecisionFunnel | null;
   status?: PolicyStatus | null;
+  scope: TimelineScope;
+  onScopeChange: (value: TimelineScope) => void;
 }) {
   const tiers = funnel?.tiers ?? [];
 
   return (
-    <Panel title="决策层级漏斗" icon={Layers3}>
+    <Panel
+      title="决策层级漏斗"
+      icon={Layers3}
+      action={<TimelineScopeTabs value={scope} onChange={onScopeChange} />}
+    >
       {tiers.length === 0 && !funnel?.finalBlock ? (
         <EmptyState label="暂无决策漏斗数据" />
       ) : (
@@ -1580,7 +1605,50 @@ function VerdictPill({ verdict }: { verdict: SecurityVerdict }) {
   );
 }
 
-function AgentEventTimelinePanel({ events, error }: { events?: AgentEventList | null; error?: string }) {
+function TimelineScopeTabs({
+  value,
+  onChange,
+}: {
+  value: TimelineScope;
+  onChange: (value: TimelineScope) => void;
+}) {
+  const options: Array<{ value: TimelineScope; label: string }> = [
+    { value: "agent", label: "Agent 事件" },
+    { value: "raw", label: "全部事件" },
+  ];
+
+  return (
+    <div className="inline-flex h-8 items-center rounded-md border border-white/10 bg-white/5 p-0.5">
+      {options.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          onClick={() => onChange(option.value)}
+          className={cn(
+            "h-7 min-w-20 rounded px-2.5 text-xs font-semibold transition-colors",
+            value === option.value
+              ? "bg-teal-400/20 text-teal-100"
+              : "text-zinc-500 hover:bg-white/5 hover:text-zinc-200",
+          )}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function AgentEventTimelinePanel({
+  events,
+  error,
+  scope,
+  onScopeChange,
+}: {
+  events?: AgentEventList | null;
+  error?: string;
+  scope: TimelineScope;
+  onScopeChange: (value: TimelineScope) => void;
+}) {
   const items = events?.items ?? [];
 
   return (
@@ -1589,6 +1657,7 @@ function AgentEventTimelinePanel({ events, error }: { events?: AgentEventList | 
       icon={GitBranch}
       action={
         <div className="flex items-center gap-3">
+          <TimelineScopeTabs value={scope} onChange={onScopeChange} />
           <span className="text-xs text-zinc-500">{events ? `${formatNumber(events.total)} 条` : "--"}</span>
           <Link to="/events" className="text-xs text-teal-300 hover:text-teal-200">查看全部</Link>
         </div>
@@ -1653,11 +1722,23 @@ function AgentEventTimelinePanel({ events, error }: { events?: AgentEventList | 
   );
 }
 
-function WorkspaceRiskPanel({ workspaceRisk }: { workspaceRisk?: SecurityWorkspaceRiskDistribution | null }) {
+function WorkspaceRiskPanel({
+  workspaceRisk,
+  scope,
+  onScopeChange,
+}: {
+  workspaceRisk?: SecurityWorkspaceRiskDistribution | null;
+  scope: TimelineScope;
+  onScopeChange: (value: TimelineScope) => void;
+}) {
   const list = workspaceRisk?.list ?? [];
 
   return (
-    <Panel title="工作区风险分布" icon={Bot}>
+    <Panel
+      title="工作区风险分布"
+      icon={Bot}
+      action={<TimelineScopeTabs value={scope} onChange={onScopeChange} />}
+    >
       {list.length === 0 ? (
         <EmptyState label="暂无工作区风险数据" />
       ) : (
@@ -1695,6 +1776,10 @@ function WorkspaceRiskPanel({ workspaceRisk }: { workspaceRisk?: SecurityWorkspa
 
 export default function SecurityMonitorPage() {
   const [filter, setFilter] = useState<SecurityTimeFilter>(DEFAULT_FILTER);
+  const [timelineScope, setTimelineScope] = useState<TimelineScope>("agent");
+  const [riskBreakdownScope, setRiskBreakdownScope] = useState<TimelineScope>("agent");
+  const [decisionFunnelScope, setDecisionFunnelScope] = useState<TimelineScope>("agent");
+  const [workspaceRiskScope, setWorkspaceRiskScope] = useState<TimelineScope>("agent");
   const [customStart, setCustomStart] = useState(() => dayjs().subtract(1, "day").format("YYYY-MM-DD"));
   const [customEnd, setCustomEnd] = useState(() => dayjs().format("YYYY-MM-DD"));
   const [observability, setObservability] = useState<AgentObservability | null>(null);
@@ -1709,8 +1794,8 @@ export default function SecurityMonitorPage() {
   }, [customEnd, customStart, filter.timeType]);
 
   const requestFilter = useMemo(() => filter, [filter]);
-  const { data, loading, refresh } = useRequest(() => loadSecurityDashboardData(requestFilter), {
-    refreshDeps: [requestFilter],
+  const { data, loading, refresh } = useRequest(() => loadSecurityDashboardData(requestFilter, timelineScope, riskBreakdownScope, decisionFunnelScope, workspaceRiskScope), {
+    refreshDeps: [requestFilter, timelineScope, riskBreakdownScope, decisionFunnelScope, workspaceRiskScope],
     pollingInterval: 10000,
     pollingWhenHidden: false,
   });
@@ -1790,25 +1875,30 @@ export default function SecurityMonitorPage() {
           <DashboardSection title="实时扫描" icon={Radar}>
             <div className="grid gap-4 xl:grid-cols-[minmax(0,1.65fr)_minmax(360px,0.95fr)]">
               <ExplainabilityPanel scan={data?.scan} error={data?.errors.scan} />
-              <DecisionFunnelPanel funnel={data?.decisionFunnel} status={status} />
+              <DecisionFunnelPanel
+                funnel={data?.decisionFunnel}
+                status={status}
+                scope={decisionFunnelScope}
+                onScopeChange={setDecisionFunnelScope}
+              />
             </div>
           </DashboardSection>
 
           <DashboardSection title="风险态势" icon={Siren}>
             <div className="space-y-4">
               <RiskSummaryPanels summary={data?.riskSummary} />
-              <RiskBreakdownPanel breakdown={data?.riskBreakdown} error={data?.errors.riskBreakdown} />
+              <RiskBreakdownPanel breakdown={data?.riskBreakdown} error={data?.errors.riskBreakdown} scope={riskBreakdownScope} onScopeChange={setRiskBreakdownScope} />
             </div>
           </DashboardSection>
 
           <DashboardSection title="运行链路" icon={GitBranch}>
-            <AgentEventTimelinePanel events={data?.events} error={data?.errors.events} />
+            <AgentEventTimelinePanel events={data?.events} error={data?.errors.events} scope={timelineScope} onScopeChange={setTimelineScope} />
           </DashboardSection>
 
           <DashboardSection title="会话与工作区" icon={TerminalSquare}>
             <div className="grid gap-4 xl:grid-cols-[minmax(360px,0.9fr)_minmax(0,1.6fr)]">
               <HighestRiskPanel session={data?.highestRisk} />
-              <WorkspaceRiskPanel workspaceRisk={data?.workspaceRisk} />
+              <WorkspaceRiskPanel workspaceRisk={data?.workspaceRisk} scope={workspaceRiskScope} onScopeChange={setWorkspaceRiskScope} />
             </div>
           </DashboardSection>
         </div>

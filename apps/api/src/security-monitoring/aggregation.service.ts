@@ -1649,10 +1649,13 @@ export class AggregationService {
 
   riskBreakdown(filter: T.SecurityTimeFilter): T.SecurityRiskBreakdown {
     const { events, sinceMs, spanMs } = this.win(filter);
+    const agentScoped = filter.scope === 'agent';
+    const scopedEvents = agentScoped ? events.filter(isMonitoredAgentEvent) : events;
     const prev = this.judge.query(sinceMs - spanMs).filter((e) => e.at < sinceMs);
+    const scopedPrev = agentScoped ? prev.filter(isMonitoredAgentEvent) : prev;
     const cat = (type: T.RiskType): T.RiskCategory => {
-      const risky = events.filter((e) => e.verdict !== 'allow' && e.riskType === type);
-      const prevRisky = prev.filter((e) => e.verdict !== 'allow' && e.riskType === type);
+      const risky = scopedEvents.filter((e) => e.verdict !== 'allow' && e.riskType === type);
+      const prevRisky = scopedPrev.filter((e) => e.verdict !== 'allow' && e.riskType === type);
       const countOf = (xs: T.JudgedEvent[], code: string) => xs.filter((e) => e.riskCategory === code).length;
       // Always emit the full taxonomy for this type, then append any live code not in it (so a new
       // category from deriveRisk is never silently dropped).
@@ -1706,17 +1709,18 @@ export class AggregationService {
   }
 
   decisionFunnel(filter: T.SecurityTimeFilter): T.SecurityDecisionFunnel {
-    const { events } = this.win(filter);
+    const windowEvents = this.win(filter).events;
+    const events = filter.scope === 'agent' ? windowEvents.filter(isMonitoredAgentEvent) : windowEvents;
     const total = events.length || 1;
-    const escalated = events.filter((e) => e.verdict === 'escalate');
-    const deep = escalated.filter((e) => SEV_RANK[e.severity] >= 3);
+    const l2 = events.filter((e) => e.tier === 'Llm' || e.tier === 'Agent');
+    const l3 = events.filter((e) => e.tier === 'Agent');
     const blocked = events.filter((e) => e.verdict === 'block').length;
     const pct = (c: number) => round1((c / total) * 100);
     return {
       tiers: [
         { tierCode: 'L1', tierName: '规则引擎', count: events.length, percentage: 100, slaDesc: '确定性匹配 · <1ms' },
-        { tierCode: 'L2', tierName: 'LLM 研判', count: escalated.length, percentage: pct(escalated.length), slaDesc: '语义判定 · <100ms' },
-        { tierCode: 'L3', tierName: '智能体深判', count: deep.length, percentage: pct(deep.length), slaDesc: 'a3s-code · 深度调查' },
+        { tierCode: 'L2', tierName: 'LLM 研判', count: l2.length, percentage: pct(l2.length), slaDesc: '语义判定 · <100ms' },
+        { tierCode: 'L3', tierName: '智能体深判', count: l3.length, percentage: pct(l3.length), slaDesc: 'a3s-code · 深度调查' },
       ],
       finalBlock: { count: blocked, percentage: pct(blocked) },
       updateTime: iso(),
@@ -1739,10 +1743,11 @@ export class AggregationService {
 
   workspaceRiskDistribution(filter: T.SecurityTimeFilter): T.SecurityWorkspaceRiskDistribution {
     const { events } = this.win(filter);
-    const monitoredEvents = events.filter(isMonitoredAgentEvent);
+    const agentScoped = filter.scope !== 'raw';
+    const scopedEvents = agentScoped ? events.filter(isMonitoredAgentEvent) : events;
     const byWs = new Map<string, T.JudgedEvent[]>();
-    for (const e of monitoredEvents) {
-      const workspacePath = attributionWorkspacePath(e);
+    for (const e of scopedEvents) {
+      const workspacePath = agentScoped ? attributionWorkspacePath(e) : e.workspacePath;
       (byWs.get(workspacePath) ?? byWs.set(workspacePath, []).get(workspacePath)!).push(e);
     }
     const list = [...byWs.entries()]
