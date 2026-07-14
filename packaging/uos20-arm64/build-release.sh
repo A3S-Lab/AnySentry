@@ -30,6 +30,7 @@ mkdir -p "$STAGE_DIR" "$RELEASE_DIR"
 "$SCRIPT_DIR/build-sentry.sh"
 "$SCRIPT_DIR/build-node-runtime.sh"
 "$SCRIPT_DIR/build-app.sh"
+"$SCRIPT_DIR/build-clickhouse-compat.sh"
 "$SCRIPT_DIR/build-clickhouse.sh"
 "$SCRIPT_DIR/build-observer.sh"
 "$SCRIPT_DIR/build-l3.sh"
@@ -87,6 +88,11 @@ source_dirty=false
   printf 'CARGO_ZIGBUILD_VERSION=0.23.0\n'
   printf 'CLICKHOUSE_VERSION=24.8.14.39\n'
   printf 'CLICKHOUSE_IMAGE_DIGEST=sha256:ae7eea6602398611a8d34ed6cbee659cf355de907304a44e105cf8a97cfadd5a\n'
+  printf 'CLICKHOUSE_SOURCE_COMMIT=%s\n' "$(cat "$STAGE_DIR/clickhouse/SOURCE_COMMIT")"
+  printf 'CLICKHOUSE_ARM_PROFILE=%s\n' "$(cat "$STAGE_DIR/clickhouse/PROFILE")"
+  printf 'CLICKHOUSE_BINARY_SHA256=%s\n' "$(cat "$STAGE_DIR/clickhouse/BINARY_SHA256")"
+  printf 'CLICKHOUSE_BUILDER_IMAGE=%s\n' "$(cat "$STAGE_DIR/clickhouse/BUILDER_IMAGE")"
+  printf 'CLICKHOUSE_STRIP_MODE=%s\n' "$(cat "$STAGE_DIR/clickhouse/STRIP_MODE")"
   printf 'OBSERVER_COMMIT=%s\n' "$(cat "$STAGE_DIR/observer/OBSERVER_COMMIT")"
   printf 'OBSERVER_TARGET=%s\n' "$(cat "$STAGE_DIR/observer/OBSERVER_TARGET")"
   printf 'OBSERVER_BACKEND=perf-kprobe-legacy\n'

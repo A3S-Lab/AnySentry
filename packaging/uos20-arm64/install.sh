@@ -13,6 +13,7 @@ SYSTEMD_DIR=/etc/systemd/system
 MIN_FREE_KB=$((5 * 1024 * 1024))
 CHECK_ONLY=0
 INSTALL_STAGING=
+INSTALL_SERVICES_STARTED=0
 
 usage() {
   cat <<'EOF'
@@ -75,7 +76,7 @@ verify_package_files() {
 }
 
 preflight() {
-  local arch glibc_line glibc_version kernel_version page_size disk_path free_kb command_name config_source api_port kernel_config flag
+  local arch glibc_line glibc_version kernel_version page_size disk_path free_kb command_name config_source api_port kernel_config kernel_config_reader flag node_version clickhouse_version
 
   for command_name in uname getconf sort df du sha256sum ss systemctl curl awk sed grep install cp mv chmod chown id getent groupadd useradd nologin od tr bash; do
     command -v "$command_name" >/dev/null 2>&1 || fail "required command not found: $command_name"
@@ -102,12 +103,25 @@ preflight() {
   fi
   grep -qE '[[:space:]]__arm64_sys_execve$' /proc/kallsyms 2>/dev/null || fail "ARM64 execve kprobe symbol is unavailable"
   kernel_config=/boot/config-$(uname -r)
-  [ -r "$kernel_config" ] || fail "kernel configuration is not readable: $kernel_config"
+  kernel_config_reader=grep
+  if [ -r "$kernel_config" ]; then
+    :
+  elif [ -r /proc/config.gz ]; then
+    command -v zgrep >/dev/null 2>&1 || fail "zgrep is required to read /proc/config.gz"
+    kernel_config=/proc/config.gz
+    kernel_config_reader=zgrep
+  else
+    fail "kernel configuration is not readable from /boot/config-$(uname -r) or /proc/config.gz"
+  fi
   for flag in CONFIG_BPF CONFIG_BPF_SYSCALL CONFIG_BPF_EVENTS CONFIG_KPROBES CONFIG_KPROBE_EVENTS CONFIG_PERF_EVENTS; do
-    grep -qx "$flag=y" "$kernel_config" || fail "required kernel option is disabled: $flag"
+    "$kernel_config_reader" -qx "$flag=y" "$kernel_config" || fail "required kernel option is disabled: $flag"
   done
 
   verify_package_files
+  node_version=$("$PACKAGE_ROOT/runtime/node/bin/node" --version 2>&1) \
+    || fail "bundled Node runtime cannot execute on this host: $node_version"
+  clickhouse_version=$("$PACKAGE_ROOT/clickhouse/bin/clickhouse" --version 2>&1) \
+    || fail "bundled ClickHouse cannot execute on this CPU: $clickhouse_version"
 
   config_source=$PACKAGE_ROOT/config/anysentry.env.example
   [ -f "$PACKAGE_ROOT/config/anysentry.env" ] && config_source=$PACKAGE_ROOT/config/anysentry.env
@@ -132,7 +146,7 @@ preflight() {
     fail "TCP port 8123 is already in use by another process"
   fi
 
-  echo "Preflight passed: architecture=$arch glibc=$glibc_version kernel=$kernel_version page_size=$page_size free=$((free_kb / 1024))MiB"
+  echo "Preflight passed: architecture=$arch glibc=$glibc_version kernel=$kernel_version page_size=$page_size free=$((free_kb / 1024))MiB node=$node_version clickhouse=$clickhouse_version config=$kernel_config"
 }
 
 random_secret() {
@@ -207,6 +221,9 @@ activate_program_files() {
 
 cleanup() {
   [ -z "$INSTALL_STAGING" ] || rm -rf "$INSTALL_STAGING"
+  if [ "$INSTALL_SERVICES_STARTED" -eq 1 ]; then
+    systemctl disable --now anysentry-observer.service anysentry.service anysentry-clickhouse.service 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -265,10 +282,12 @@ install -m 0644 "$PACKAGE_ROOT/systemd/anysentry-clickhouse.service" "$SYSTEMD_D
 install -m 0644 "$PACKAGE_ROOT/systemd/anysentry.service" "$SYSTEMD_DIR/anysentry.service"
 install -m 0644 "$PACKAGE_ROOT/systemd/anysentry-observer.service" "$SYSTEMD_DIR/anysentry-observer.service"
 systemctl daemon-reload
+INSTALL_SERVICES_STARTED=1
 systemctl enable --now anysentry-clickhouse.service
 systemctl enable --now anysentry.service
 provision_observer_source
 systemctl enable --now anysentry-observer.service
 
 "$INSTALL_ROOT/verify.sh"
+INSTALL_SERVICES_STARTED=0
 echo "AnySentry installation completed. Dashboard: http://<host>:29653/"

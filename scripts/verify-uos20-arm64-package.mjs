@@ -41,6 +41,7 @@ const requiredFiles = [
   'packaging/uos20-arm64/build-sentry.sh',
   'packaging/uos20-arm64/build-app.sh',
   'packaging/uos20-arm64/build-node-runtime.sh',
+  'packaging/uos20-arm64/build-clickhouse-compat.sh',
   'packaging/uos20-arm64/build-clickhouse.sh',
   'packaging/uos20-arm64/build-observer.sh',
   'packaging/uos20-arm64/build-l3.sh',
@@ -100,10 +101,29 @@ requireText(appBuild, /\.pnpm[\s\S]*@a3s-lab\+code/u, 'application build removes
 requireText(appBuild, /find "\$STAGE_DIR\/app" -xtype l -delete/u, 'application build removes dangling deployment links');
 requireText(appBuild, /\.pnpm\/node_modules\/@anysentry\/api/u, 'application build removes the build-workspace API link');
 
+const clickhouseCompatBuild = requireFile('packaging/uos20-arm64/build-clickhouse-compat.sh');
+requireText(clickhouseCompatBuild, /v24\.8\.14\.39-lts/u, 'ClickHouse compat build pins the source tag');
+requireText(clickhouseCompatBuild, /502d03925cf2c9c6629ed5c1b2d16b5de46e4362/u, 'ClickHouse compat build pins the source commit');
+requireText(clickhouseCompatBuild, /clang-18-aarch64-v80compat/u, 'ClickHouse compat build selects the ARMv8.0 profile');
+requireText(clickhouseCompatBuild, /NO_ARMV81_OR_HIGHER/u, 'ClickHouse compat build verifies the compatibility CMake option');
+requireText(clickhouseCompatBuild, /clickhouse\/binary-builder:[^\s]+@sha256:[0-9a-f]{64}/u, 'ClickHouse compat build pins the builder image digest');
+requireText(clickhouseCompatBuild, /VERSION_STRING[\s\S]*CLICKHOUSE_VERSION/u, 'ClickHouse compat build normalizes the embedded tagged version');
+requireText(clickhouseCompatBuild, /git[\s\S]*submodule update --init --recursive/u, 'ClickHouse compat build checks out all pinned submodules');
+requireText(clickhouseCompatBuild, /llvm-strip-18[\s\S]*--strip-all/u, 'ClickHouse compat build strips the release binary with the pinned LLVM toolchain');
+requireText(clickhouseCompatBuild, /check-elf\.sh/u, 'ClickHouse compat build verifies the output ABI');
+requireText(clickhouseCompatBuild, /armv8\.2-a\+simd\+crypto\+dotprod\+ssbs\+rcpc/u, 'ClickHouse compat build rejects the modern ARM profile');
+requireText(clickhouseCompatBuild, /sha256sum[\s\S]*clickhouse\.sha256/u, 'ClickHouse compat build records the binary checksum');
+requireText(clickhouseCompatBuild, /SOURCE_COMMIT/u, 'ClickHouse compat build records source provenance');
+requireText(clickhouseCompatBuild, /PROFILE/u, 'ClickHouse compat build records the selected profile');
+requireText(clickhouseCompatBuild, /STRIP_MODE/u, 'ClickHouse compat build records strip provenance');
+
 const clickhouseBuild = requireFile('packaging/uos20-arm64/build-clickhouse.sh');
-requireText(clickhouseBuild, /clickhouse\/clickhouse-server@sha256:/u, 'ClickHouse build pins an immutable image digest');
-requireText(clickhouseBuild, /--platform linux\/arm64/u, 'ClickHouse build selects the ARM64 image');
-requireText(clickhouseBuild, /docker cp .*\/usr\/bin\/clickhouse/u, 'ClickHouse build extracts the server binary');
+requireText(clickhouseBuild, /clickhouse\/clickhouse-server@sha256:/u, 'ClickHouse config build pins an immutable image digest');
+requireText(clickhouseBuild, /--platform linux\/arm64/u, 'ClickHouse config build selects the ARM64 image');
+requireText(clickhouseBuild, /clickhouse\.sha256[\s\S]*sha256sum --check/u, 'ClickHouse staging verifies the compat binary checksum');
+requireText(clickhouseBuild, /CLICKHOUSE_COMPAT_DIR/u, 'ClickHouse staging consumes the compat cache');
+requireText(clickhouseBuild, /SOURCE_COMMIT[\s\S]*PROFILE/u, 'ClickHouse staging verifies compat provenance');
+requireText(clickhouseBuild, /STRIP_MODE/u, 'ClickHouse staging verifies and preserves strip provenance');
 requireText(clickhouseBuild, /docker cp .*\/etc\/clickhouse-server/u, 'ClickHouse build extracts official configuration');
 requireText(clickhouseBuild, /check-elf\.sh/u, 'ClickHouse build verifies the extracted ARM64 binary');
 requireText(clickhouseBuild, /rm -f .*docker_related_config\.xml/u, 'ClickHouse build removes container-wide network overrides');
@@ -132,11 +152,16 @@ requireText(installer, /--check/u, 'installer exposes a non-mutating preflight m
 requireText(installer, /\$\(id -u\)/u, 'installer requires root for mutations');
 requireText(installer, /uname -m/u, 'installer checks the target architecture');
 requireText(installer, /getconf GNU_LIBC_VERSION/u, 'installer checks the target glibc ABI');
+requireText(installer, /\/proc\/config\.gz/u, 'installer supports the IKCONFIG kernel configuration source');
+requireText(installer, /kernel_config_reader=zgrep/u, 'installer uses zgrep for compressed kernel configuration');
 requireText(installer, /df -Pk/u, 'installer checks target filesystem capacity');
 requireText(installer, /ss -lnt/u, 'installer checks required ports');
 requireText(installer, /env_value PORT/u, 'installer preflights the configured API port');
 requireText(installer, /sha256sum --check/u, 'installer validates package contents before mutation');
 requireText(installer, /sha256sum --check --quiet manifest\.sha256/u, 'installer keeps successful package verification concise');
+requireText(installer, /runtime\/node\/bin\/node" --version/u, 'installer executes the bundled Node runtime during preflight');
+requireText(installer, /clickhouse\/bin\/clickhouse" --version/u, 'installer executes the bundled ClickHouse runtime during preflight');
+requireText(installer, /bundled ClickHouse cannot execute on this CPU/u, 'installer reports an actionable ClickHouse CPU failure');
 requireText(installer, /useradd[\s\S]*--system/u, 'installer creates an unprivileged system account');
 requireText(installer, /getent group anysentry/u, 'installer detects a pre-existing service group');
 requireText(installer, /groupadd --system anysentry/u, 'installer creates the service group idempotently');
@@ -225,6 +250,9 @@ requireText(releaseBuild, /build-observer\.sh/u, 'release builder includes the O
 requireText(releaseBuild, /build-l3\.sh/u, 'release builder includes the L3 agent runtime');
 requireText(releaseBuild, /OBSERVER_COMMIT/u, 'release records Observer source provenance');
 requireText(releaseBuild, /SENTRY_COMMIT/u, 'release records Sentry source provenance');
+requireText(releaseBuild, /CLICKHOUSE_SOURCE_COMMIT/u, 'release records ClickHouse source provenance');
+requireText(releaseBuild, /CLICKHOUSE_ARM_PROFILE/u, 'release records the ClickHouse ARM profile');
+requireText(releaseBuild, /CLICKHOUSE_BINARY_SHA256/u, 'release records the ClickHouse binary checksum');
 requireText(releaseBuild, /SOURCE_DATE_EPOCH/u, 'release builder pins archive timestamps');
 requireText(releaseBuild, /VERSION/u, 'release builder records component provenance');
 requireText(releaseBuild, /git -C "\$ROOT_DIR" status --porcelain/u, 'release builder records tracked and untracked source changes');
@@ -260,6 +288,9 @@ requireText(runbook, /security-center\/ingest\/events/u, 'runbook documents gene
 requireText(runbook, /security-center\/ingest\/otlp\/v1\/logs/u, 'runbook documents OTLP logs ingest');
 requireText(runbook, /security-center\/ingest\/otlp\/v1\/traces/u, 'runbook documents OTLP traces ingest');
 requireText(runbook, /a3s-observer[\s\S]*(legacy|perf.?buffer|Linux 4\.19)/iu, 'runbook documents the bundled Linux 4.19 Observer backend');
+requireText(runbook, /armv8\.0-compat|ARMv8\.0 compat/iu, 'runbook documents the ClickHouse compatibility profile');
+requireText(runbook, /0\.1\.0-compat1/u, 'runbook documents the corrected revisioned archive');
+requireText(runbook, /非法指令|SIGILL/u, 'runbook documents recovery from the incompatible ClickHouse build');
 requireText(runbook, /ANYSENTRY_LLM_BASE_URL[\s\S]*ANYSENTRY_LLM_MODEL[\s\S]*ANYSENTRY_LLM_API_KEY/u, 'runbook documents OpenAI-compatible LLM configuration');
 requireText(runbook, /choices\[0\]\.message\.content|chat\/completions/u, 'runbook documents the required model response contract');
 requireText(runbook, /journalctl -u anysentry/u, 'runbook documents service diagnostics');

@@ -4,28 +4,32 @@
 64 KiB 内核页。目标机配置为 16 核 Kunpeng 920、64 GiB 内存、约 34 GiB 可用磁盘；
 ClickHouse 内存上限已设为 8 GiB，数据写入 `/var/lib/anysentry/clickhouse`。
 
-包内包含 AnySentry API、Web 监控中台、Node.js 20.19.4、ClickHouse 24.8.14.39、
+包内包含 AnySentry API、Web 监控中台、Node.js 20.19.4、ClickHouse 24.8.14.39
+`armv8.0-compat`、
 ARM64 `a3s-sentry`、L1/L2/L3、`@a3s-lab/code` 5.1.0 和 Linux 4.19 legacy
 `a3s-observer`。目标机不需要 Docker、Node、npm、pnpm、Rust，也不需要联网。
 
 ## 1. 构建与网络边界
 
 构建机需要联网，用于下载固定版本并校验摘要的 Zig、Rust crate、Node ARM64 包、
-ClickHouse ARM64 镜像和 a3s-code ARM64 addon。目标机安装和运行完全离线，安装脚本
+ClickHouse 24.8 固定源码及构建镜像、ClickHouse 配置镜像和 a3s-code ARM64 addon。
+目标机安装和运行完全离线，安装脚本
 不会调用软件源、容器仓库或包管理器。
 
 构建机执行：
 
 ```bash
 pnpm install --frozen-lockfile
-OBSERVER_SOURCE_DIR=/path/to/Observer-worktree pnpm build:uos20-arm64-package
+ANYSENTRY_RELEASE_VERSION=0.1.0-compat1 \
+OBSERVER_SOURCE_DIR=/path/to/Observer-worktree \
+pnpm build:uos20-arm64-package
 ```
 
 输出：
 
 ```text
-release/anysentry-security-suite-0.1.0-uos20-arm64.tar.gz
-release/anysentry-security-suite-0.1.0-uos20-arm64.tar.gz.sha256
+release/anysentry-security-suite-0.1.0-compat1-uos20-arm64.tar.gz
+release/anysentry-security-suite-0.1.0-compat1-uos20-arm64.tar.gz.sha256
 ```
 
 只有配置了内网 LLM 或告警 Webhook 后，运行时才会主动访问对应的内网地址。包本身不
@@ -37,15 +41,34 @@ release/anysentry-security-suite-0.1.0-uos20-arm64.tar.gz.sha256
 
 ```bash
 cd /mnt
-sha256sum -c anysentry-security-suite-0.1.0-uos20-arm64.tar.gz.sha256
-tar -xzf anysentry-security-suite-0.1.0-uos20-arm64.tar.gz
-cd anysentry-security-suite-0.1.0-uos20-arm64
+sha256sum -c anysentry-security-suite-0.1.0-compat1-uos20-arm64.tar.gz.sha256
+tar -xzf anysentry-security-suite-0.1.0-compat1-uos20-arm64.tar.gz
+cd anysentry-security-suite-0.1.0-compat1-uos20-arm64
 ./install.sh --check
 ```
 
 `--check` 不修改系统。它会检查 AArch64、glibc、Linux 4.19、4/64 KiB 页、BPF、
-perf、kprobe、`__arm64_sys_execve`、systemd、端口、5 GiB 可用空间和包内 SHA-256。
+perf、kprobe、`__arm64_sys_execve`、systemd、端口、5 GiB 可用空间、包内 SHA-256，
+并实际执行随包 Node 与 ClickHouse 的 `--version`。若 CPU 不兼容，预检会在创建用户、
+写入配置或启动服务前失败。
 预检失败时不要强行安装，应先处理错误中指出的内核能力、端口或磁盘问题。
+
+### 从首版 ClickHouse `SIGILL` 恢复
+
+若 `0.1.0` 首版在目标机出现 `非法指令`、`signal=ILL` 或 `status=4/ILL`，先停止旧包
+留下的重启服务：
+
+```bash
+systemctl disable --now anysentry-observer.service 2>/dev/null || true
+systemctl disable --now anysentry.service 2>/dev/null || true
+systemctl disable --now anysentry-clickhouse.service 2>/dev/null || true
+systemctl reset-failed anysentry-observer.service anysentry.service anysentry-clickhouse.service
+```
+
+随后上传并安装本 `0.1.0-compat1` 包。重复安装会保留
+`/etc/anysentry/anysentry.env` 和 `/var/lib/anysentry`；不要删除已生成的密钥或状态目录。
+本包的 ClickHouse 使用官方 `clang-18-aarch64-v80compat` profile 构建，不再包含首版
+使用的现代 `armv8.2-a+dotprod+ssbs+rcpc` 指令集基线。
 
 ## 3. 安装前配置 LLM
 
