@@ -10,12 +10,13 @@ import { ManagementAuthGuard } from './management-auth.guard';
 import { MaintenanceWindowService } from './maintenance-window.service';
 import { NotificationService } from './notification.service';
 import { ObjectiveService } from './objective.service';
+import { OpenPlatformSecurityCenterController } from './open-platform-security-center.controller';
 import { RemediationService } from './remediation.service';
 import { SecurityMonitoringController } from './security-monitoring.controller';
 import { SentryJudgeService } from './sentry-judge.service';
 
 @Module({
-  controllers: [SecurityMonitoringController],
+  controllers: [SecurityMonitoringController, OpenPlatformSecurityCenterController],
   providers: [AgentAttributionService, AgentMetadataService, AlertingService, AuditService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, SentryJudgeService, AggregationService, RemediationService, KubeIdentityService, ManagementAuthGuard],
 })
 export class SecurityMonitoringModule {}

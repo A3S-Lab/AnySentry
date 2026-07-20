@@ -5,10 +5,9 @@ import { IngestionSourceService } from './ingestion-source.service';
 import { MaintenanceWindowService } from './maintenance-window.service';
 import { buildAcl, policyConfigError, sanitizePolicy } from './policy-config';
 import { SentryJudgeService } from './sentry-judge.service';
+import { resolveSecurityWindow } from './security-window';
 import * as T from './types';
 
-const HOUR = 3_600_000;
-const WINDOW: Record<string, number> = { last_3h: 3 * HOUR, last_1d: 24 * HOUR, last_7d: 7 * 24 * HOUR, last_30d: 30 * 24 * HOUR };
 
 const SEV_RANK: Record<T.Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 const LEVEL_BY_RANK = ['safe', 'low', 'medium', 'high', 'critical'];
@@ -291,7 +290,7 @@ export class AggregationService {
   }
 
   private win(filter: T.SecurityTimeFilter): { events: T.JudgedEvent[]; sinceMs: number; spanMs: number; dataSinceMs: number; dataSpanMs: number } {
-    const key = `${filter.timeType ?? 'last_3h'}|${filter.startTime ?? ''}`;
+    const key = [filter.timeType ?? 'last_3h', filter.startTime ?? '', filter.endTime ?? ''].join('|');
     const cached = this.winCache.get(key);
     const t = now();
     if (cached && t - cached.at < 1500) return cached.val;
@@ -301,15 +300,12 @@ export class AggregationService {
   }
 
   private computeWin(filter: T.SecurityTimeFilter): { events: T.JudgedEvent[]; sinceMs: number; spanMs: number; dataSinceMs: number; dataSpanMs: number } {
-    const end = now();
-    let sinceMs: number;
-    if (filter.timeType === 'custom' && filter.startTime) sinceMs = Date.parse(filter.startTime) || end - 3 * HOUR;
-    else sinceMs = end - (WINDOW[filter.timeType ?? 'last_3h'] ?? 3 * HOUR);
-    const events = this.judge.query(sinceMs);
+    const { sinceMs, endMs, spanMs } = resolveSecurityWindow(filter);
+    const events = this.judge.query(sinceMs).filter((event) => event.at <= endMs);
     // The in-memory ring may hold less time than the nominal window. Time-series/rate panels must
     // bucket over the data that actually exists, or everything piles into one bucket (req=100000).
     const dataSinceMs = events.length ? events[0].at : sinceMs;
-    return { events, sinceMs, spanMs: end - sinceMs, dataSinceMs, dataSpanMs: Math.max(1, end - dataSinceMs) };
+    return { events, sinceMs, spanMs, dataSinceMs, dataSpanMs: Math.max(1, endMs - dataSinceMs) };
   }
 
   // bucketed counts over the window (for time-series + rate panels)

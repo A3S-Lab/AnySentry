@@ -13,7 +13,7 @@ export class ApiResponseInterceptor implements NestInterceptor {
   constructor(private readonly reflector: Reflector) {}
 
   intercept(ctx: ExecutionContext, next: CallHandler): Observable<unknown> {
-    if (this.reflector.get<boolean>('skipWrap', ctx.getHandler())) return next.handle();
+    if (this.reflector.getAllAndOverride<boolean>('skipWrap', [ctx.getHandler(), ctx.getClass()])) return next.handle();
     return next.handle().pipe(
       map((data) => ({
         code: 200,

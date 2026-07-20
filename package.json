@@ -21,6 +21,8 @@
     "verify:ai-native-api:local": "pnpm build:api && node scripts/verify-deep-links-local.mjs scripts/verify-ai-native-api.mjs",
     "verify:a3s-code-skill-api": "node scripts/verify-a3s-code-skill-api.mjs",
     "verify:a3s-code-skill-api:self-test": "node scripts/verify-a3s-code-skill-api.mjs --self-test",
+    "test:open-platform-security-center:unit": "pnpm build:api && node --test --experimental-test-coverage apps/api/dist/security-monitoring/security-window.spec.js",
+    "test:open-platform-security-center": "pnpm test:open-platform-security-center:unit && node scripts/verify-deep-links-local.mjs scripts/verify-open-platform-security-center.mjs",
     "verify:management-auth": "node scripts/verify-management-auth.mjs",
     "verify:management-auth:local": "pnpm build:api && ANYSENTRY_ADMIN_TOKEN=verify-admin-token node scripts/verify-deep-links-local.mjs scripts/verify-management-auth.mjs",
     "verify:deep-links": "node scripts/verify-deep-links.mjs",
