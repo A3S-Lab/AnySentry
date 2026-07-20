@@ -68,13 +68,11 @@ function asDryRunResult(value: unknown): SecurityCapabilityDryRunResult | undefi
 }
 
 function operationExamples(operation?: SecurityApiOperation): OperationExample[] {
-  return (operation?.examples ?? [])
-    .map((example) => {
-      const item = asObject(example);
-      const request = isSecurityCapabilityRequest(item?.request) ? item.request : undefined;
-      return request ? { description: typeof item?.description === "string" ? item.description : undefined, request } : undefined;
-    })
-    .filter((example): example is OperationExample => Boolean(example));
+  return (operation?.examples ?? []).flatMap((example) => {
+    const item = asObject(example);
+    const request = isSecurityCapabilityRequest(item?.request) ? item.request : undefined;
+    return request ? [{ description: typeof item?.description === "string" ? item.description : undefined, request }] : [];
+  });
 }
 
 function schemaValue(schema: unknown): unknown {

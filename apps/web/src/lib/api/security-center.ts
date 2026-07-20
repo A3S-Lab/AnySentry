@@ -525,11 +525,13 @@ export interface UniversalIngestRequest {
   parentSpanId?: string;
   runId?: string;
   taskId?: string;
-  source?: AgentEventSource;
+  source?: string;
   eventCategory?: AgentEventCategory;
   subject?: string;
   tokenCount?: number;
   latencyMs?: number;
+  peer?: string;
+  port?: string | number;
   attributes?: Record<string, unknown>;
   rawPreview?: string;
   collectorId?: string;
@@ -2087,7 +2089,7 @@ export const securityCenterApi = {
     apiClient.put<AlertListItem>(`/security-center/alerts/${encodeURIComponent(alertId)}`, body),
   alertConfig: () => apiClient.get<AlertConfig>("/security-center/alerts/config"),
   notificationConfig: (filter: NotificationConfigQuery = {}) =>
-    apiClient.get<NotificationConfig>(`/security-center/notifications/config${querySuffix(filter)}`),
+    apiClient.get<NotificationConfig>(`/security-center/notifications/config${querySuffix({ ...filter })}`),
   createNotificationChannel: (body: NotificationChannelUpdateRequest) =>
     apiClient.post<NotificationChannelItem>("/security-center/notifications/channels", body),
   updateNotificationChannel: (channelId: string, body: NotificationChannelUpdateRequest) =>

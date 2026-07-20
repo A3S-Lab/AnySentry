@@ -409,8 +409,10 @@ export default function NotificationsPage() {
   const [routeFilters, setRouteFilters] = useState<RouteFilterDraft>(() => routeFilterDraftFromParams(searchParams));
   const [savingChannel, setSavingChannel] = useState(false);
   const [savingRoute, setSavingRoute] = useState(false);
-  const routeKindFilter = isAlertKind(searchParams.get("kind")) ? searchParams.get("kind")! : "";
-  const routeSeverityFilter = isSeverity(searchParams.get("minSeverity")) ? searchParams.get("minSeverity")! : "";
+  const routeKindParam = searchParams.get("kind");
+  const routeSeverityParam = searchParams.get("minSeverity");
+  const routeKindFilter = isAlertKind(routeKindParam) ? routeKindParam : "";
+  const routeSeverityFilter = isSeverity(routeSeverityParam) ? routeSeverityParam : "";
   const routeWorkspacePathFilter = searchParams.get("workspacePath") ?? "";
   const routeAgentIdFilter = searchParams.get("agentId") ?? "";
   const routeCollectorIdFilter = searchParams.get("collectorId") ?? "";
@@ -563,7 +565,7 @@ export default function NotificationsPage() {
   };
 
   const clearRouteFilters = () => {
-    const next = { kind: "", minSeverity: "", workspacePath: "", agentId: "", collectorId: "", sourceId: "", owner: "", team: "" };
+    const next: RouteFilterDraft = { kind: "", minSeverity: "", workspacePath: "", agentId: "", collectorId: "", sourceId: "", owner: "", team: "" };
     setRouteFilters(next);
     updateSearch(next);
   };

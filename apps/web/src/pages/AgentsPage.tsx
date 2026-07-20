@@ -2,6 +2,7 @@ import { useRequest } from "ahooks";
 import dayjs from "dayjs";
 import {
   Activity,
+  AlertTriangle,
   ArrowLeft,
   BellRing,
   Bot,
@@ -22,7 +23,7 @@ import {
   UserCheck,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
 import { Button } from "@/components/ui/button";
@@ -156,7 +157,7 @@ function draftFromAgent(agent?: AgentInventoryItem): AgentMetadataDraft {
   };
 }
 
-function Pill({ children, className }: { children: string; className?: string }) {
+function Pill({ children, className }: { children: ReactNode; className?: string }) {
   return (
     <span className={cn("inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold", className)}>
       {children}
