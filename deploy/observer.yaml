@@ -48,6 +48,9 @@ spec:
             - { name: ANYSENTRY_SOURCE_TYPE, value: "observer" }
             - { name: ANYSENTRY_SOURCE_NAME, value: "kubernetes-a3s-observer" }
             - { name: ANYSENTRY_HEARTBEAT_SECS, value: "30" }
+            # Forward known Agent events and unresolved events. Drop only events whose complete
+            # host PID ancestry proves they are unrelated to a configured Agent root.
+            - { name: FORWARD_SCOPE, value: "agent" }
             - { name: ANYSENTRY_INGEST_URL, value: "http://anysentry:29653/security-center/ingest" }
           command: ["/bin/sh", "-c"]
           args: ["a3s-observer-collector | node /opt/observer-forward.js"]

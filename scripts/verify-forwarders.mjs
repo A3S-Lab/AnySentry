@@ -67,8 +67,13 @@ function observerLine(identity, event) {
 }
 
 function forwarderEnv(source, fixture) {
+  const noProxy = ['127.0.0.1', 'localhost', '::1', process.env.NO_PROXY, process.env.no_proxy]
+    .filter(Boolean)
+    .join(',');
   return {
     ...process.env,
+    NO_PROXY: noProxy,
+    no_proxy: noProxy,
     ANYSENTRY_INGEST_URL: `${baseUrl}/ingest`,
     ANYSENTRY_HEARTBEAT_URL: `${baseUrl}/collectors/heartbeat`,
     ANYSENTRY_HEARTBEAT_SECS: '1',
@@ -81,6 +86,7 @@ function forwarderEnv(source, fixture) {
     A3S_NODE_NAME: fixture.nodeName,
     FORWARD_DROP_PATHS: '/sys/,/proc/,/run/,/dev/',
     FORWARD_MAX_INFLIGHT: '4',
+    FORWARD_SCOPE: 'all',
   };
 }
 
@@ -166,7 +172,11 @@ async function sourceFor(sourceId) {
 
 async function verifyForwarder(entry, source, fixture) {
   const output = await runForwarderProcess(entry, source, fixture);
-  assert(`${fixture.label} forwarder exits cleanly`, output.stderr.trim() === '', output.stderr);
+  const unexpectedStderr = output.stderr
+    .split('\n')
+    .filter((line) => line.trim() && !line.startsWith('[observer-forward] process snapshot:'))
+    .join('\n');
+  assert(`${fixture.label} forwarder exits cleanly`, unexpectedStderr === '', unexpectedStderr);
 
   const eventList = await eventually(`${fixture.label} forwarded events`, async () => {
     const list = await eventsFor(fixture);

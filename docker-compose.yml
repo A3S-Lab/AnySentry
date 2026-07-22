@@ -1,10 +1,8 @@
-# AnySentry — one-command standalone deployment: dashboard + tiered judge + ClickHouse.
+# AnySentry standalone deployment: dashboard, asynchronous tiered judgment, Redis, and ClickHouse.
 #
-#   docker compose up -d --build      # then open http://localhost:29653
+#   docker compose up -d --build
 #
-# Feed it real events by piping an a3s-observer collector into scripts/observer-forward.js
-# (see the README). With no feed the dashboard is empty but live; set ANYSENTRY_SYNTHETIC_FEED=on
-# for a self-driving demo load (every event is still really judged by a3s-sentry).
+# Feed real events by piping an a3s-observer collector into scripts/observer-forward.js.
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
@@ -21,11 +19,25 @@ services:
       retries: 24
     restart: unless-stopped
 
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+    restart: unless-stopped
+
   anysentry:
     build: .
     image: ghcr.io/a3s-lab/anysentry:latest
     depends_on:
       clickhouse:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     environment:
       PORT: 29653
@@ -33,15 +45,55 @@ services:
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-anysentry}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-anysentry}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-anysentry}
+      ANYSENTRY_ASYNC_JUDGE: "on"
+      ANYSENTRY_REDIS_URL: redis://redis:6379/0
+      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-proxy-managed}
       A3S_SENTRY_L3_URL: ${A3S_SENTRY_L3_URL:-http://host.docker.internal:18051/v1}
       A3S_SENTRY_L3_MODEL: ${A3S_SENTRY_L3_MODEL:-glm-5.2}
       A3S_SENTRY_L3_KEY: ${A3S_SENTRY_L3_KEY:-proxy-managed}
-      # ANYSENTRY_SYNTHETIC_FEED: "on"   # uncomment for a self-driving demo load
+      # ANYSENTRY_SYNTHETIC_FEED: "on"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
       - "29653:29653"
     restart: unless-stopped
 
+  fast-judge:
+    image: ghcr.io/a3s-lab/anysentry:latest
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["node", "dist/security-monitoring/worker-main.js"]
+    environment:
+      ANYSENTRY_WORKER_ROLE: fast
+      ANYSENTRY_REDIS_URL: redis://redis:6379/0
+      ANYSENTRY_FAST_JUDGE_CONCURRENCY: 4
+      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-proxy-managed}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  l3-worker:
+    image: ghcr.io/a3s-lab/anysentry:latest
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["node", "dist/security-monitoring/worker-main.js"]
+    environment:
+      ANYSENTRY_WORKER_ROLE: l3
+      ANYSENTRY_REDIS_URL: redis://redis:6379/0
+      ANYSENTRY_L3_CONCURRENCY: 2
+      ANYSENTRY_L3_TIMEOUT_MS: 120000
+      ANYSENTRY_L3_ATTEMPTS: 2
+      ANYSENTRY_L3_CONTEXT_TOKENS: 32768
+      ANYSENTRY_L3_SKILLS: /opt/anysentry/skills
+      A3S_SENTRY_L3_URL: ${A3S_SENTRY_L3_URL:-http://host.docker.internal:18051/v1}
+      A3S_SENTRY_L3_MODEL: ${A3S_SENTRY_L3_MODEL:-glm-5.2}
+      A3S_SENTRY_L3_KEY: ${A3S_SENTRY_L3_KEY:-proxy-managed}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
 volumes:
   clickhouse-data:
+  redis-data:

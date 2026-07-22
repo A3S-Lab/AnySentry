@@ -192,6 +192,11 @@ function verifyObserverManifest() {
     daemonSet?.source,
   );
   assert(
+    'Observer DaemonSet drops only proven non-Agent events before ingest',
+    /\{\s*name:\s*FORWARD_SCOPE,\s*value:\s*"agent"\s*\}/u.test(daemonSet?.source ?? ''),
+    daemonSet?.source,
+  );
+  assert(
     'Observer DaemonSet pipes observe-only collector output into the Node forwarder',
     /command:\s*\["\/bin\/sh",\s*"-c"\]/u.test(daemonSet?.source ?? '') &&
       /args:\s*\["a3s-observer-collector \| node \/opt\/observer-forward\.js"\]/u.test(daemonSet?.source ?? ''),
@@ -222,6 +227,8 @@ function verifyObserverForwarderDockerfile() {
   assert('Observer forwarder image extends the public observer image', /^FROM ghcr\.io\/a3s-lab\/observer:latest$/mu.test(dockerfile), dockerfile);
   assert('Observer forwarder image copies a Node runtime without package install', /^COPY --from=nodebin \/usr\/local\/bin\/node \/usr\/local\/bin\/node$/mu.test(dockerfile) && !/^\s*RUN\b/mu.test(dockerfile), dockerfile);
   assert('Observer forwarder image bundles scripts/observer-forward.js', /^COPY scripts\/observer-forward\.js \/opt\/observer-forward\.js$/mu.test(dockerfile), dockerfile);
+  assert('Observer forwarder image bundles PID attribution', /^COPY scripts\/observer-agent-attribution\.js \/opt\/observer-agent-attribution\.js$/mu.test(dockerfile), dockerfile);
+  assert('Observer forwarder image bundles ToolExec deduplication', /^COPY scripts\/observer-event-dedup\.js \/opt\/observer-event-dedup\.js$/mu.test(dockerfile), dockerfile);
   assert('Observer forwarder image has no npm or pnpm install step', !/\b(?:npm|pnpm|yarn)\s+(?:install|ci|add)\b/iu.test(dockerfile), dockerfile);
 }
 

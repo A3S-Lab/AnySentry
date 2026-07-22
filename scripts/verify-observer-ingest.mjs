@@ -39,8 +39,8 @@ async function request(path, method = 'GET', body, headers = {}) {
   return payload?.data ?? payload;
 }
 
-function observerLine(identity, event) {
-  return JSON.stringify({ identity, event });
+function observerLine(identity, event, process) {
+  return JSON.stringify({ identity, ...(process ? { process } : {}), event });
 }
 
 function sourceHeaders(sourceId, token) {
@@ -58,6 +58,16 @@ function leaks(value, needles) {
 async function eventById(eventId) {
   const list = await request('/events/list', 'POST', { timeType: 'last_30d', eventId, limit: 5 });
   return { list, event: list.items?.[0] };
+}
+
+async function waitForEvent(eventId, checks, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  let latest = await eventById(eventId);
+  while (!(latest.event && checks(latest.event)) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    latest = await eventById(eventId);
+  }
+  return latest;
 }
 
 async function assertEvent(message, eventId, checks) {
@@ -108,7 +118,22 @@ async function verifyObserverToolEvent(sourceId, token) {
   const apiKey = `sk-${runId.replace(/[^a-z0-9]/gi, '').padEnd(18, 'd')}`;
   const line = observerLine(
     { agent: agentId, session: `${runId}-tool-session`, task: 'task-tool' },
-    { ToolExec: { pid: 1312, uid: 1001, cwd: '/workspace/project', argv: ['bash', '-lc', `echo observer-ok --token=${secret}`] } },
+    {
+      ToolExec: {
+        pid: 1312,
+        uid: 1001,
+        cwd: '/workspace/project',
+        argv: ['bash', '-lc', `echo observer-ok --token=${secret}`],
+        argv_truncated: false,
+        argv_incomplete: false,
+        exec_confirmed: true,
+        argv_source: 'proc_cmdline',
+        captured_argc: 3,
+        captured_bytes: 64,
+        observed_argc: 3,
+        observed_bytes: 96,
+      },
+    },
   );
   const result = await request('/ingest', 'POST', {
     line,
@@ -134,6 +159,10 @@ async function verifyObserverToolEvent(sourceId, token) {
     event.attributes?.collectorId === `${runId}-collector` &&
     event.attributes?.collectorNode === `${runId}-node` &&
     event.attributes?.observerKind === 'ToolExec' &&
+    event.attributes?.exec_confirmed === true &&
+    event.attributes?.argv_source === 'proc_cmdline' &&
+    event.attributes?.observed_argc === 3 &&
+    event.attributes?.observed_bytes === 96 &&
     String(event.attributes?.argv ?? '').includes('observer-ok') &&
     String(event.attributes?.argv ?? '').includes('[redacted]') &&
     event.attributes?.password === '[redacted]' &&
@@ -143,6 +172,130 @@ async function verifyObserverToolEvent(sourceId, token) {
     (event.rawPreview ?? '').includes('ToolExec'),
   );
   return result.eventId;
+}
+
+async function verifyIncompleteObserverEvidence(sourceId, token) {
+  const line = observerLine(
+    { agent: `${runId}-incomplete-agent`, session: `${runId}-incomplete-session`, task: 'incomplete-task' },
+    {
+      ToolExec: {
+        pid: 1314,
+        uid: 1001,
+        cwd: '/workspace/project',
+        argv: ['echo', 'safe-prefix'],
+        argv_truncated: true,
+        argv_incomplete: false,
+        exec_confirmed: true,
+        argv_source: 'kernel_fragments',
+        captured_argc: 2,
+        captured_bytes: 16,
+        observed_argc: 2,
+        observed_bytes: 16,
+      },
+    },
+  );
+  const result = await request('/ingest', 'POST', {
+    line,
+    collectorId: `${runId}-collector`,
+    nodeName: `${runId}-node`,
+    sourceType: 'observer',
+    workspacePath: `repo://${runId}/incomplete`,
+  }, sourceHeaders(sourceId, token));
+
+  assert(
+    'incomplete Observer argv is accepted for asynchronous judgment',
+    result.accepted === true && Boolean(result.eventId) && (result.decisionStatus === 'pending' || result.decisionStatus === 'succeeded'),
+    result,
+  );
+  if (!result.eventId) return;
+
+  const { list, event } = await waitForEvent(result.eventId, (candidate) =>
+    candidate.decisionStatus === 'succeeded' &&
+    candidate.verdict === 'escalate' &&
+    candidate.tier === 'Rules' &&
+    String(candidate.reason).includes('incomplete ToolExec evidence'),
+  );
+  assert(
+    'incomplete Observer argv is escalated at L1 instead of allowed',
+    list.total === 1 && event?.eventId === result.eventId && event.decisionStatus === 'succeeded' && event.verdict === 'escalate' && event.tier === 'Rules' && String(event.reason).includes('incomplete ToolExec evidence'),
+    list,
+  );
+}
+
+async function verifyInternalL3RecursionSuppressed(sourceId, token) {
+  const line = observerLine(
+    { agent: 'l3-worker-container', session: 'l3-worker-container', task: 'internal-l3-task' },
+    {
+      ToolExec: {
+        pid: 1414,
+        ppid: 1400,
+        uid: 0,
+        cwd: '/app',
+        argv: [
+          'node',
+          '/opt/anysentry/l3-agent.mjs',
+          '--skills',
+          '/opt/anysentry/skills',
+          '--json',
+          '-p',
+          'Investigate runtime event. Actor: a3s code. Signal: ToolExec.',
+        ],
+      },
+    },
+    {
+      pid: 1414,
+      ppid: 1400,
+      comm: 'l3-agent.mjs',
+      exe: '/usr/local/bin/node',
+      cwd: '/app',
+      cgroup: '0::/system.slice/docker-verifier.scope',
+    },
+  );
+  const result = await request('/ingest', 'POST', {
+    line,
+    collectorId: `${runId}-collector`,
+    nodeName: `${runId}-node`,
+    sourceType: 'observer',
+    workspacePath: `repo://${runId}/internal-l3`,
+  }, sourceHeaders(sourceId, token));
+
+  assert(
+    'internal L3 ToolExec is recorded without entering the judgment queue',
+    result.accepted === true && result.decisionStatus === 'succeeded' && result.tier === 'Rules' && result.verdict === 'allow' && String(result.reason).includes('recursive judgment suppressed'),
+    result,
+  );
+  if (!result.eventId) return;
+  await assertEvent('internal L3 audit record carries a trusted recursion-suppression marker', result.eventId, (event) =>
+    event.decisionStatus === 'succeeded' &&
+    event.attributes?.origin === 'l3-judge' &&
+    event.attributes?.recursiveJudgmentSuppressed === true &&
+    String(event.reason).includes('recursive judgment suppressed'),
+  );
+
+  const inProcessLine = observerLine(
+    { agent: 'sentry-l3', session: 'pooled-l3-session', task: 'internal-pooled-l3-task' },
+    { ToolExec: { pid: 1515, ppid: 1500, uid: 0, cwd: '/tmp', argv: ['bash', '-lc', 'inspect-event'] } },
+    {
+      pid: 1500,
+      ppid: 1,
+      comm: 'node',
+      exe: '/usr/local/bin/node',
+      cwd: '/app',
+      cgroup: '0::/system.slice/docker-pooled-l3.scope',
+    },
+  );
+  const inProcess = await request('/ingest', 'POST', {
+    line: inProcessLine,
+    collectorId: `${runId}-collector`,
+    nodeName: `${runId}-node`,
+    sourceType: 'observer',
+    workspacePath: `repo://${runId}/internal-pooled-l3`,
+  }, sourceHeaders(sourceId, token));
+  assert(
+    'in-process sentry-l3 activity is recorded without entering the judgment queue',
+    inProcess.accepted === true && inProcess.decisionStatus === 'succeeded' && inProcess.tier === 'Rules' && inProcess.verdict === 'allow' && String(inProcess.reason).includes('recursive judgment suppressed'),
+    inProcess,
+  );
 }
 
 async function verifyObserverLlmEndpoint(sourceId, token) {
@@ -278,6 +431,8 @@ async function main() {
   const { source, token } = await createProtectedObserverSource();
   await verifyRejectedObserverToken(source.sourceId);
   await verifyObserverToolEvent(source.sourceId, token);
+  await verifyIncompleteObserverEvidence(source.sourceId, token);
+  await verifyInternalL3RecursionSuppressed(source.sourceId, token);
   await verifyObserverLlmEndpoint(source.sourceId, token);
   await verifyRawCollectorHeartbeat(source.sourceId, token);
   await verifyDirectForwarderHeartbeat(source.sourceId, token);

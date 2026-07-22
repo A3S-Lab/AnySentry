@@ -33,6 +33,10 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   parentSpanId String,
   runId String,
   taskId String,
+  decisionStatus LowCardinality(String) DEFAULT 'succeeded',
+  evaluationId String DEFAULT '',
+  policyVersion String DEFAULT '',
+  decisionUpdatedAt UInt64 DEFAULT at,
   verdict LowCardinality(String),
   tier LowCardinality(String),
   severity LowCardinality(String),
@@ -66,6 +70,10 @@ const EVENT_ALTERS = [
   'ADD COLUMN IF NOT EXISTS parentSpanId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS runId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS taskId String DEFAULT \'\'',
+  "ADD COLUMN IF NOT EXISTS decisionStatus LowCardinality(String) DEFAULT 'succeeded'",
+  "ADD COLUMN IF NOT EXISTS evaluationId String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS policyVersion String DEFAULT ''",
+  'ADD COLUMN IF NOT EXISTS decisionUpdatedAt UInt64 DEFAULT at',
   'ADD COLUMN IF NOT EXISTS attributes String DEFAULT \'{}\'',
   'ADD COLUMN IF NOT EXISTS process String DEFAULT \'{}\'',
   'ADD COLUMN IF NOT EXISTS attribution String DEFAULT \'{}\'',
@@ -121,6 +129,10 @@ function toRow(e: JudgedEvent): Row {
     parentSpanId: e.parentSpanId ?? '',
     runId: e.runId,
     taskId: e.taskId ?? '',
+    decisionStatus: e.decisionStatus ?? 'succeeded',
+    evaluationId: e.evaluationId ?? '',
+    policyVersion: e.policyVersion ?? '',
+    decisionUpdatedAt: e.decisionUpdatedAt ?? e.at,
     verdict: e.verdict,
     tier: e.tier,
     severity: e.severity,
@@ -185,6 +197,10 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
     parentSpanId: str(r.parentSpanId) || undefined,
     runId: str(r.runId) || sessionId,
     taskId: str(r.taskId) || undefined,
+    decisionStatus: (str(r.decisionStatus) || 'succeeded') as JudgedEvent['decisionStatus'],
+    evaluationId: str(r.evaluationId) || undefined,
+    policyVersion: str(r.policyVersion) || undefined,
+    decisionUpdatedAt: num(r.decisionUpdatedAt) || at,
     verdict: r.verdict as JudgedEvent['verdict'],
     tier: r.tier as JudgedEvent['tier'],
     severity: r.severity as JudgedEvent['severity'],
@@ -244,6 +260,12 @@ export class ClickHouseStore {
     this.buf.push(toRow(e));
     if (this.buf.length >= 500) void this.flush();
   }
+  /** Persist one lifecycle revision before acknowledging queue work. */
+  async insertNow(e: JudgedEvent): Promise<void> {
+    if (!this.client || !this.ready) throw new Error('ClickHouse is not ready');
+    await this.client.insert({ table: TABLE, values: [toRow(e)], format: 'JSONEachRow' });
+  }
+
 
   async flush(): Promise<void> {
     if (!this.client || this.buf.length === 0) return;
@@ -262,11 +284,16 @@ export class ClickHouseStore {
     try {
       const rs = await this.client.query({
         query: `SELECT * FROM (SELECT * FROM ${TABLE} WHERE at >= {since:UInt64} ORDER BY at DESC LIMIT {lim:UInt32}) ORDER BY at ASC`,
-        query_params: { since: sinceMs, lim: limit },
+        query_params: { since: sinceMs, lim: Math.min(limit * 3, 300_000) },
         format: 'JSONEachRow',
       });
       const rows = (await rs.json()) as Array<Record<string, unknown>>;
-      return rows.map(fromRow);
+      const latest = new Map<string, JudgedEvent>();
+      for (const event of rows.map(fromRow)) {
+        const previous = latest.get(event.eventId);
+        if (!previous || (event.decisionUpdatedAt ?? event.at) >= (previous.decisionUpdatedAt ?? previous.at)) latest.set(event.eventId, event);
+      }
+      return [...latest.values()].sort((a, b) => a.at - b.at).slice(-limit);
     } catch (err) {
       console.error('[clickhouse] hydrate failed:', (err as Error).message);
       return [];
