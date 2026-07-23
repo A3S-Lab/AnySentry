@@ -12,7 +12,7 @@ install -m 0644 "$CHANNEL_DIR/package/DEPLOYMENT.md" "$STAGE_DIR/DEPLOYMENT.md"
 install -m 0644 "$CHANNEL_DIR/package/AnySentry部署手册.md" "$STAGE_DIR/AnySentry部署手册.md"
 install -m 0644 "$CHANNEL_DIR/package/AnySentry使用手册.md" "$STAGE_DIR/AnySentry使用手册.md"
 install -m 0644 "$CHANNEL_DIR/package/DIAGNOSTICS.md" "$STAGE_DIR/diagnostics/DIAGNOSTICS.md"
-for file in install.sh verify.sh inspect-host.sh wait-clickhouse.sh run-l3-worker.sh uninstall.sh; do install -m 0755 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
+for file in install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh wait-clickhouse.sh run-l3-worker.sh uninstall.sh; do install -m 0755 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
 install -m 0755 "$CHANNEL_DIR/package/provision-observer.mjs" "$STAGE_DIR/provision-observer.mjs"
 
 source "$BUILD_DIR/source-provenance.env"

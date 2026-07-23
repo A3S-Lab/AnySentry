@@ -49,6 +49,21 @@ systemctl is-active anysentry-observer.service
 
 验证程序应全部显示 `PASS`，所有服务应显示 `active`。
 
+执行只读健康检查：
+
+```bash
+/opt/anysentry/RUN_HEALTH_SMOKE.sh --passive
+```
+
+执行安全模拟检查：
+
+```bash
+/opt/anysentry/RUN_HEALTH_SMOKE.sh --safe
+```
+
+安全模拟只使用 `/tmp`、本地回环网络和带唯一标识的自定义测试事件，不修改服务配置。
+详细报告保存在 `/tmp/anysentry-health-smoke-compat8/report.txt`。
+
 ## 5. 安装日志
 
 每次执行安装程序后，详细记录保存在：
@@ -81,4 +96,3 @@ http://<服务器IP>:29653/
 ```
 
 服务器IP必须能够从访问终端到达。禁止对外开放 ClickHouse 的 8123 端口。
-

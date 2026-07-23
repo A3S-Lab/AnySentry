@@ -26,11 +26,11 @@ for term in './install.sh --check' './install.sh' '/opt/anysentry/verify.sh' 'jo
   grep -Fq "$term" "$DEPLOY" || fail "deployment guide omits $term"
 done
 
-for term in 'sha256sum --check' './install.sh --check' './install.sh' '/var/log/anysentry/install/0.2.0-compat8' '/opt/anysentry/verify.sh'; do
+for term in 'sha256sum --check' './install.sh --check' './install.sh' '/var/log/anysentry/install/0.2.0-compat8' '/opt/anysentry/verify.sh' 'RUN_HEALTH_SMOKE.sh --safe'; do
   grep -Fq "$term" "$CUSTOMER_DEPLOY" || fail "customer deployment guide omits $term"
 done
 
-for term in 'http://<服务器IP>:29653/' '内置浏览器' 'Observer' 'Agent' 'Source' 'Collector' 'acceptedEvents'; do
+for term in 'http://<服务器IP>:29653/' '内置浏览器' 'Observer' 'Agent' 'Source' 'Collector' 'acceptedEvents' 'RUN_HEALTH_SMOKE.sh --safe'; do
   grep -Fq "$term" "$CUSTOMER_USER" || fail "customer user guide omits $term"
 done
 

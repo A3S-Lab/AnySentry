@@ -14,11 +14,12 @@ required=(
   observer/observer-agent-attribution.js observer/observer-event-dedup.js
   observer/KERNEL_VERSION_CODE
   l3/l3-agent.mjs diagnostics/a3s-bpf-syscall-probe
-  install.sh verify.sh inspect-host.sh DEPLOYMENT.md
+  install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh DEPLOYMENT.md
   AnySentry部署手册.md AnySentry使用手册.md
   VERSION PROVENANCE manifest.sha256
 )
 for file in "${required[@]}"; do [[ -f "$release/$file" ]] || die "release file missing: $file"; done
+[[ -x "$release/RUN_HEALTH_SMOKE.sh" ]] || die 'health smoke script is not executable'
 [[ "$(cat "$release/observer/KERNEL_VERSION_CODE")" == '0x0004135a' ]] || die 'Observer BPF kernel version code mismatch'
 [[ "$(cat "$release/clickhouse/PROFILE")" == 'armv8.0-compat' ]] || die 'ClickHouse profile mismatch'
 (cd "$release" && sha256sum --check --quiet manifest.sha256) || die 'release manifest checksum failed'

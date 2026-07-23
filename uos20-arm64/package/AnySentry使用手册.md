@@ -53,10 +53,18 @@ systemctl status anysentry-observer.service --no-pager -l
 journalctl -b -u anysentry-observer.service -n 200 --no-pager -o cat
 ```
 
+执行端到端安全模拟：
+
+```bash
+/opt/anysentry/RUN_HEALTH_SMOKE.sh --safe
+```
+
+脚本生成一条以 `a3s-health-smoke-` 开头的测试记录。可以在事件页面按该标识检索。
+扩展检查使用 `--extended`，只读检查使用 `--passive`。
+
 ## 4. 注意事项
 
 - 页面显示的事件总数可能是内存热窗口统计，不代表 ClickHouse 中的全部历史数据；
 - Observer、API 或数据库服务异常时，应先查看部署手册中的安装日志目录；
 - 不得手工删除 `/etc/anysentry/anysentry.env`、`/var/lib/anysentry` 或 Source Token；
 - 配置 L2 或 L3 后，应按维护要求重启对应服务并重新执行 `/opt/anysentry/verify.sh`。
-
