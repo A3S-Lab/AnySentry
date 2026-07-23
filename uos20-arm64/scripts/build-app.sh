@@ -17,8 +17,12 @@ sentry_dir=$STAGE_DIR/app/node_modules/@a3s-lab/sentry
 [[ -d "$sentry_dir" ]] || die "deployed Sentry module missing: $sentry_dir"
 rm -f "$sentry_dir"/*.node
 install -m 0644 "$STAGE_DIR/native/a3s-sentry.linux-arm64-gnu.node" "$sentry_dir/a3s-sentry.linux-arm64-gnu.node"
-rm -rf "$STAGE_DIR/app/node_modules/@a3s-lab/code" "$STAGE_DIR/app/node_modules/@a3s-lab/code-linux-x64-gnu" "$STAGE_DIR/app/node_modules/@a3s-lab/code-linux-x64-musl"
-find "$STAGE_DIR/app/node_modules/.pnpm" -maxdepth 1 -type d -name '@a3s-lab+code*' -exec rm -rf {} + 2>/dev/null || true
+code_dir=$STAGE_DIR/app/node_modules/@a3s-lab/code
+[[ -d "$code_dir" ]] || die "deployed a3s-code module missing: $code_dir"
+find "$code_dir" -maxdepth 1 -name '*.node' -delete
+rm -rf "$STAGE_DIR/app/node_modules/@a3s-lab/code-linux-x64-gnu" "$STAGE_DIR/app/node_modules/@a3s-lab/code-linux-x64-musl"
+find "$STAGE_DIR/app/node_modules/.pnpm" -maxdepth 1 -type d \
+  \( -name '@a3s-lab+code-linux-x64-gnu*' -o -name '@a3s-lab+code-linux-x64-musl*' \) \
+  -exec rm -rf {} + 2>/dev/null || true
 rm -f "$STAGE_DIR/app/node_modules/.pnpm/node_modules/@anysentry/api"
 find "$STAGE_DIR/app" -xtype l -delete
-

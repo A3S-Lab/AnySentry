@@ -1,7 +1,7 @@
 [Unit]
-Description=AnySentry API and security dashboard
-Requires=anysentry-clickhouse.service anysentry-redis.service
-After=network.target anysentry-clickhouse.service anysentry-redis.service
+Description=AnySentry asynchronous L1/L2 judgment worker
+Requires=anysentry-redis.service anysentry-clickhouse.service
+After=network.target anysentry-redis.service anysentry-clickhouse.service
 
 [Service]
 Type=simple
@@ -9,11 +9,11 @@ User=anysentry
 Group=anysentry
 WorkingDirectory=/opt/anysentry/app
 EnvironmentFile=/etc/anysentry/anysentry.env
-ExecStartPre=/opt/anysentry/wait-clickhouse.sh
-ExecStart=/opt/anysentry/runtime/node/bin/node /opt/anysentry/app/dist/main.js
+Environment=ANYSENTRY_WORKER_ROLE=fast
+ExecStart=/opt/anysentry/runtime/node/bin/node /opt/anysentry/app/dist/security-monitoring/worker-main.js
 Restart=on-failure
 RestartSec=5s
-TimeoutStartSec=120s
+TimeoutStartSec=60s
 TimeoutStopSec=30s
 NoNewPrivileges=true
 PrivateTmp=true

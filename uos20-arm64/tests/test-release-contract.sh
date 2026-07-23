@@ -21,12 +21,15 @@ for file in \
   package/config/anysentry.env.example package/config/clickhouse-config.xml \
   package/config/clickhouse-users.xml package/config/redis.conf \
   package/systemd/anysentry.service package/systemd/anysentry-redis.service \
+  package/systemd/anysentry-fast-judge.service package/systemd/anysentry-l3-worker.service \
   package/systemd/anysentry-clickhouse.service package/systemd/anysentry-observer.service; do
   [[ -f "$CHANNEL/$file" ]] || fail "missing package contract file $file"
 done
 
 grep -Fq '/var/lib/anysentry/clickhouse/' "$CHANNEL/package/systemd/anysentry-observer.service" || fail "ClickHouse self-noise filter is missing"
 grep -Fq '/var/lib/anysentry/redis/' "$CHANNEL/package/systemd/anysentry-observer.service" || fail "Redis self-noise filter is missing"
+grep -Fq 'worker-main.js' "$CHANNEL/package/systemd/anysentry-fast-judge.service" || fail "fast worker entrypoint is missing"
+grep -Fq 'ANYSENTRY_WORKER_ROLE=l3' "$CHANNEL/package/systemd/anysentry-l3-worker.service" || fail "L3 worker role is missing"
 grep -Fq 'manifest.sha256' "$CHANNEL/scripts/assemble-release.sh" || fail "release manifest is not generated"
 grep -Fq 'PROVENANCE' "$CHANNEL/scripts/assemble-release.sh" || fail "release provenance is not generated"
 grep -Fq '0x0004135a' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not enforce UOS BPF ABI"

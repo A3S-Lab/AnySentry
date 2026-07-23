@@ -10,7 +10,7 @@ for file in config/anysentry.env.example config/clickhouse-config.xml config/cli
 for file in systemd/anysentry.service systemd/anysentry-clickhouse.service systemd/anysentry-redis.service systemd/anysentry-fast-judge.service systemd/anysentry-l3-worker.service systemd/anysentry-observer.service; do install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
 install -m 0644 "$CHANNEL_DIR/package/DEPLOYMENT.md" "$STAGE_DIR/DEPLOYMENT.md"
 install -m 0644 "$CHANNEL_DIR/package/DIAGNOSTICS.md" "$STAGE_DIR/diagnostics/DIAGNOSTICS.md"
-for file in install.sh verify.sh inspect-host.sh wait-clickhouse.sh uninstall.sh; do install -m 0755 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
+for file in install.sh verify.sh inspect-host.sh wait-clickhouse.sh run-l3-worker.sh uninstall.sh; do install -m 0755 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
 install -m 0755 "$CHANNEL_DIR/package/provision-observer.mjs" "$STAGE_DIR/provision-observer.mjs"
 
 source "$BUILD_DIR/source-provenance.env"
