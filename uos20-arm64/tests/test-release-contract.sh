@@ -30,6 +30,12 @@ grep -Fq '/var/lib/anysentry/clickhouse/' "$CHANNEL/package/systemd/anysentry-ob
 grep -Fq '/var/lib/anysentry/redis/' "$CHANNEL/package/systemd/anysentry-observer.service" || fail "Redis self-noise filter is missing"
 grep -Fq 'worker-main.js' "$CHANNEL/package/systemd/anysentry-fast-judge.service" || fail "fast worker entrypoint is missing"
 grep -Fq 'ANYSENTRY_WORKER_ROLE=l3' "$CHANNEL/package/systemd/anysentry-l3-worker.service" || fail "L3 worker role is missing"
+grep -Fq 'ignore-warnings ARM64-COW-BUG' "$CHANNEL/package/config/redis.conf" || fail "Redis does not acknowledge the verified UOS ARM64 COW bug"
+grep -Fq 'save ""' "$CHANNEL/package/config/redis.conf" || fail "Redis background RDB persistence is not disabled for the affected ARM64 kernel"
+grep -Fq 'appendonly no' "$CHANNEL/package/config/redis.conf" || fail "Redis AOF persistence is not disabled for the affected ARM64 kernel"
+if grep -Fqx 'appendonly yes' "$CHANNEL/package/config/redis.conf"; then
+  fail "Redis AOF persistence is unsafe on the affected ARM64 kernel"
+fi
 grep -Fq 'msgpackr-extract-linux-x64' "$CHANNEL/scripts/build-app.sh" || fail "app builder does not remove the host msgpackr native package"
 grep -Fq 'STAGE_DIR/app/node_modules/@a3s-lab/code' "$CHANNEL/scripts/build-l3.sh" || fail "L3 component cannot resume from the staged app"
 grep -Fq 'manifest.sha256' "$CHANNEL/scripts/assemble-release.sh" || fail "release manifest is not generated"

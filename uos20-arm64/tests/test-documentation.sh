@@ -20,7 +20,7 @@ for term in 'integration branch' '--component' '--prepare-only' 'PROVENANCE' 'di
   grep -Fq -- "$term" "$DEV" || fail "developer guide omits $term"
 done
 
-for term in './install.sh --check' './install.sh' '/opt/anysentry/verify.sh' 'journalctl' 'rollback' '29653' 'L2' 'L3' 'inspect-host.sh'; do
+for term in './install.sh --check' './install.sh' '/opt/anysentry/verify.sh' 'journalctl' 'rollback' '29653' 'L2' 'L3' 'inspect-host.sh' 'ARM64-COW-BUG' '临时队列'; do
   grep -Fq "$term" "$DEPLOY" || fail "deployment guide omits $term"
 done
 

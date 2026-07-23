@@ -10,9 +10,9 @@
 
 ```bash
 cd /opt/shannon/anysentry
-sha256sum --check anysentry-security-suite-0.2.0-compat3-uos20-arm64.tar.gz.sha256
-tar -zxf anysentry-security-suite-0.2.0-compat3-uos20-arm64.tar.gz
-cd anysentry-security-suite-0.2.0-compat3-uos20-arm64
+sha256sum --check anysentry-security-suite-0.2.0-compat4-uos20-arm64.tar.gz.sha256
+tar -zxf anysentry-security-suite-0.2.0-compat4-uos20-arm64.tar.gz
+cd anysentry-security-suite-0.2.0-compat4-uos20-arm64
 sha256sum --check manifest.sha256
 ```
 
@@ -165,6 +165,12 @@ journalctl -b -u anysentry-fast-judge.service -u anysentry-l3-worker.service -n 
 ```
 
 未启用 L3 时，`anysentry-l3-worker.service` 保持 active 并由休眠进程占位，属于正常状态。
+
+### Redis 报告 `ARM64-COW-BUG`
+
+客户 UOS 4.19 ARM64 内核未通过 Redis 的 `MADV_FREE + fork()` 脏页自检，使用 RDB 或 AOF 后台重写可能造成数据损坏。本发布包将 Redis 配置为无 RDB、无 AOF 的临时队列，并在禁用 fork 型持久化后设置 `ignore-warnings ARM64-COW-BUG`。安全事件与判定结果仍由 ClickHouse 持久化。
+
+不得在该客户内核上将 Redis 配置改回 `appendonly yes` 或启用 `save`。Redis 或服务器重启时，尚未处理的临时队列任务可能丢失；服务恢复后新事件正常入队。
 
 ### Observer Source 配置失败
 

@@ -36,6 +36,10 @@
 
 该问题说明发行版显示版本不等于内核 BPF ABI。以后不得仅按 `uname -r` 选择 Observer，必须执行随包探测程序。
 
+### Redis 7.4.2 在 ARM64 内核主动退出
+
+Redis 的实际 `MADV_FREE + fork()` 脏页自检证明客户 UOS 4.19 ARM64 内核存在 Copy-on-Write 数据损坏风险，Redis 因 `ARM64-COW-BUG` 保护而拒绝启动。该 Redis 仅承担可重建的 BullMQ 临时队列，安全事件和判定结果由 ClickHouse 持久化。因此客户配置关闭 RDB 和 AOF 后台持久化，再显式忽略该启动警告；不得仅忽略警告并继续启用 fork 型持久化。
+
 ### Observer Source 配置脚本错误
 
 服务创建 Source 返回 HTTP 201，但旧脚本仅接受特定状态或未解析 API 的 `data` 信封，错误报告为创建失败。人工编辑时又曾产生 `payload?.data??payload:` 语法错误；执行命令缺少路径开头 `/` 时出现 `MODULE_NOT_FOUND`。当前脚本使用 `payload?.data ?? payload`，接受所有 `response.ok` 状态，并使用绝对安装路径。
