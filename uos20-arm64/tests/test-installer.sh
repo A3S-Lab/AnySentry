@@ -35,6 +35,10 @@ if grep -Fq 'fail "only $probe_count' "$VERIFY"; then
 fi
 grep -Fq 'attachedProbes' "$VERIFY" || fail "verifier does not inspect runtime probe metadata"
 grep -Fq 'attached_probes -ge 8' "$VERIFY" || fail "verifier does not require eight runtime probes"
+grep -Fq 'wait_for_collector_health' "$VERIFY" || fail "verifier does not wait for collector health visibility"
+collector_wait_body=$(sed -n '/^wait_for_collector_health()/,/^}/p' "$VERIFY")
+grep -Fq 'seq 1 60' <<<"$collector_wait_body" || fail "collector health wait is shorter than 60 seconds"
+grep -Fq 'Collector health response:' "$VERIFY" || fail "collector health failure omits the raw API response"
 grep -Fq 'acceptedEvents' "$VERIFY" || fail "verifier does not inspect Source acceptance"
 grep -Fq 'outputDropped' "$VERIFY" || fail "verifier does not inspect forwarder drops"
 grep -Fq 'errorCount' "$VERIFY" || fail "verifier does not inspect forwarder errors"

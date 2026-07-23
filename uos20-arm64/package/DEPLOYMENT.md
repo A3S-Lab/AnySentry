@@ -10,9 +10,9 @@
 
 ```bash
 cd /opt/shannon/anysentry
-sha256sum --check anysentry-security-suite-0.2.0-compat6-uos20-arm64.tar.gz.sha256
-tar -zxf anysentry-security-suite-0.2.0-compat6-uos20-arm64.tar.gz
-cd anysentry-security-suite-0.2.0-compat6-uos20-arm64
+sha256sum --check anysentry-security-suite-0.2.0-compat7-uos20-arm64.tar.gz.sha256
+tar -zxf anysentry-security-suite-0.2.0-compat7-uos20-arm64.tar.gz
+cd anysentry-security-suite-0.2.0-compat7-uos20-arm64
 sha256sum --check manifest.sha256
 ```
 
@@ -120,6 +120,9 @@ Observer 正常日志应包含 8 条 `legacy probe attached` 和汇总 `effectiv
 安装验证以 Source 事件增长及 collector 运行时健康为准，要求
 `attachedProbes>=8`、`outputDropped=0`、`errorCount=0`。journal 日志仅用于排错，
 不得作为独立的激活或回滚条件。
+
+Collector 健康记录在 API 启动后可能延迟可见。安装验证最长等待 60 秒；若仍未就绪，
+错误输出包含最后一次 `/collectors/health` 原始 JSON、`state` 和 `attachedProbes`。
 
 若日志出现 `Cannot find module './observer-agent-attribution'` 或
 `Cannot find module './observer-event-dedup'`，表示发布包不完整。停止部署并更换完整发布包，

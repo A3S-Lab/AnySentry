@@ -46,6 +46,27 @@ wait_health() {
   return 1
 }
 
+wait_for_collector_health() {
+  local body response= state attached_probes
+  body="{\"timeType\":\"last_3h\",\"collectorId\":\"$COLLECTOR_ID\",\"limit\":5}"
+  for _ in $(seq 1 60); do
+    if response=$(post_json collectors/health "$body"); then
+      state=$(printf '%s' "$response" |
+        json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.state')
+      attached_probes=$(printf '%s' "$response" |
+        json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.attachedProbes ?? -1')
+      if [[ $state == healthy && $attached_probes =~ ^[0-9]+$ && $attached_probes -ge 8 ]]; then
+        printf '%s' "$response"
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  [[ -n $response ]] || response='{"error":"collector health endpoint returned no successful response"}'
+  printf '%s' "$response"
+  return 1
+}
+
 host_checks() {
   [[ $(uname -m) == aarch64 ]] || fail "host architecture is not aarch64"
   [[ $(getconf PAGESIZE) == 65536 ]] || fail "host page size is not 65536"
@@ -134,17 +155,33 @@ after_rejected=$(printf '%s' "$after" | json_value 'data.items?.[0]?.rejectedEve
 [[ $(printf '%s' "$after" | json_value 'data.items?.[0]?.status') == active ]] || fail "Observer Source is not active"
 pass "Observer Source acceptedEvents increased without rejection"
 
-collector=$(post_json collectors/health \
-  "{\"timeType\":\"last_3h\",\"collectorId\":\"$COLLECTOR_ID\",\"limit\":5}") || fail "collector health request"
+if ! collector=$(wait_for_collector_health); then
+  state=$(printf '%s' "$collector" | json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.state')
+  attached_probes=$(printf '%s' "$collector" | json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.attachedProbes ?? -1')
+  echo "Collector health response: $collector" >&2
+  fail "collector did not become ready within 60 seconds; state=${state:-missing} attachedProbes=${attached_probes:--1}"
+fi
 state=$(printf '%s' "$collector" | json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.state')
 output_dropped=$(printf '%s' "$collector" | json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.outputDropped ?? -1')
 error_count=$(printf '%s' "$collector" | json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.errorCount ?? -1')
 attached_probes=$(printf '%s' "$collector" | json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.attachedProbes ?? -1')
-[[ $state == healthy ]] || fail "collector state is $state"
-[[ $output_dropped == 0 ]] || fail "collector outputDropped=$output_dropped"
-[[ $error_count == 0 ]] || fail "collector errorCount=$error_count"
+[[ $state == healthy ]] || {
+  echo "Collector health response: $collector" >&2
+  fail "collector state is ${state:-missing}"
+}
+[[ $output_dropped == 0 ]] || {
+  echo "Collector health response: $collector" >&2
+  fail "collector outputDropped=$output_dropped"
+}
+[[ $error_count == 0 ]] || {
+  echo "Collector health response: $collector" >&2
+  fail "collector errorCount=$error_count"
+}
 [[ $attached_probes =~ ^[0-9]+$ && $attached_probes -ge 8 ]] ||
-  fail "collector attachedProbes=$attached_probes; expected at least 8"
+  {
+    echo "Collector health response: $collector" >&2
+    fail "collector attachedProbes=$attached_probes; expected at least 8"
+  }
 pass "Observer collector is healthy; outputDropped=0 errorCount=0 attachedProbes=$attached_probes"
 
 echo "AnySentry verification completed successfully. acceptedEvents=$before_accepted->$after_accepted rejectedEvents=$after_rejected"
