@@ -5,6 +5,8 @@ import { AggregationService } from './aggregation.service';
 import { AlertingService } from './alerting.service';
 import { AuditService } from './audit.service';
 import { IngestionSourceService } from './ingestion-source.service';
+import { JudgmentQueueService } from './judgment-queue.service';
+import { DecisionResultApplyService } from './decision-result-apply.service';
 import { KubeIdentityService } from './kube-identity.service';
 import { ManagementAuthGuard } from './management-auth.guard';
 import { MaintenanceWindowService } from './maintenance-window.service';
@@ -16,6 +18,6 @@ import { SentryJudgeService } from './sentry-judge.service';
 
 @Module({
   controllers: [SecurityMonitoringController],
-  providers: [AgentAttributionService, AgentMetadataService, AlertingService, AuditService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, SentryJudgeService, AggregationService, RemediationService, KubeIdentityService, ManagementAuthGuard],
+  providers: [AgentAttributionService, AgentMetadataService, AlertingService, AuditService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, SentryJudgeService, AggregationService, RemediationService, KubeIdentityService, ManagementAuthGuard, JudgmentQueueService, DecisionResultApplyService],
 })
 export class SecurityMonitoringModule {}

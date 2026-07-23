@@ -135,6 +135,12 @@ so every node appears as a stable Collector. The bundled forwarder also emits so
 heartbeats every `ANYSENTRY_HEARTBEAT_SECS` seconds; with no explicit `ANYSENTRY_SOURCE_ID`,
 AnySentry discovers one observer Source per node/collector automatically.
 
+The manifest uses `FORWARD_SCOPE=agent`. The forwarder derives Agent identity from the process and
+its host PID ancestry, forwards known Agent and unresolved events, and drops only events whose
+complete ancestry proves they are unrelated to an Agent root. Heartbeats report the observed,
+Agent, unknown, and filtered counts. Set `FORWARD_SCOPE=all` for an unfiltered migration fallback,
+or `FORWARD_SCOPE=shadow` to observe classification counts before enabling filtering.
+
 ## Safety
 
 - **Observe-only.** Only `a3s-observer-collector` runs — never `a3s-observer-enforce` /

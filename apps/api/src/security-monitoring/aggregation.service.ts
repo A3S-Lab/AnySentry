@@ -377,6 +377,10 @@ export class AggregationService {
       parentSpanId: e.parentSpanId,
       runId: e.runId,
       taskId: e.taskId,
+      decisionStatus: e.decisionStatus,
+      evaluationId: e.evaluationId,
+      policyVersion: e.policyVersion,
+      decisionUpdatedAt: e.decisionUpdatedAt,
       verdict: e.verdict,
       tier: e.tier,
       severity: e.severity,
@@ -405,7 +409,7 @@ export class AggregationService {
     const workspacePath = filter.workspacePath?.trim();
     const traceId = filter.traceId?.trim();
     const runId = filter.runId?.trim();
-    const hasFilter = Boolean(sourceId || collectorId || agentId || sessionId || workspacePath || traceId || runId || filter.eventKind || filter.eventCategory || filter.verdict);
+    const hasFilter = Boolean(sourceId || collectorId || agentId || sessionId || workspacePath || traceId || runId || filter.eventKind || filter.eventCategory || filter.verdict || filter.tier);
     const agentScoped = filter.scope === 'agent' && !pinnedEventId;
     const hideNoise = agentScoped && filter.noise !== 'include';
     return events.filter((e) => {
@@ -424,7 +428,8 @@ export class AggregationService {
         (!runId || e.runId === runId) &&
         (!filter.eventKind || e.eventKind === filter.eventKind) &&
         (!filter.eventCategory || e.eventCategory === filter.eventCategory) &&
-        (!filter.verdict || e.verdict === filter.verdict);
+        (!filter.verdict || e.verdict === filter.verdict) &&
+        (!filter.tier || e.tier === filter.tier);
       if (pinnedEventId && !hasFilter) return matchesEventId;
       return matchesEventId || matchesFilter;
     });

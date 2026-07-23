@@ -112,6 +112,14 @@ function compactAttributes(kind: string, inner: Record<string, unknown>, id: { t
     'kind',
     'prompt_tokens',
     'completion_tokens',
+    'argv_truncated',
+    'argv_incomplete',
+    'exec_confirmed',
+    'argv_source',
+    'captured_argc',
+    'captured_bytes',
+    'observed_argc',
+    'observed_bytes',
   ]) {
     const v = attrValue(a[key], key);
     if (v !== undefined) attrs[key] = v;
@@ -201,6 +209,7 @@ function deriveMeta(line: string, given: Partial<T.EventMeta>): T.EventMeta {
     taskId: given.taskId ?? (id.task != null ? String(id.task) : undefined),
     attributes: { ...compactAttributes(eventKey, inner, id), ...sanitizeEventAttributes(given.attributes) },
     process: given.process ?? process,
+    attribution: given.attribution,
     rawPreview: given.rawPreview ?? redact(line).slice(0, 1800),
     subject: given.subject ?? (isLlm ? `LLM 调用 → ${peer}` : summarize(eventKey, inner)),
     tokenCount: given.tokenCount,
@@ -264,6 +273,7 @@ function parseCollectorHeartbeatLine(line: string): T.CollectorHeartbeatRequest 
         if (Number.isFinite(count)) eventKindCounts[key] = count;
       }
     }
+    const execIncomplete = numField(hb, 'execIncomplete', 'exec_incomplete');
     return {
       collectorId: strField(hb, 'collectorId', 'collector_id'),
       nodeName: strField(hb, 'nodeName', 'node_name'),
@@ -279,7 +289,7 @@ function parseCollectorHeartbeatLine(line: string): T.CollectorHeartbeatRequest 
       droppedEvents: numField(hb, 'droppedEvents', 'dropped'),
       outputDropped: numField(hb, 'outputDropped', 'output_dropped'),
       observedAgents: numField(hb, 'observedAgents', 'observed_agents'),
-      errorCount: numField(hb, 'errorCount', 'error_count'),
+      errorCount: numField(hb, 'errorCount', 'error_count') ?? execIncomplete,
       queueDepth: numField(hb, 'queueDepth', 'queue_depth'),
       message: strField(hb, 'message'),
     };
@@ -799,7 +809,17 @@ function eventAttr(event: T.UniversalIngestEvent, key: string): unknown {
 
 function argvField(event: T.UniversalIngestEvent): string[] | undefined {
   const direct = event.command ?? event.argv ?? eventAttr(event, 'argv') ?? eventAttr(event, 'command');
-  if (Array.isArray(direct)) return direct.map((item) => cleanString(item, 200)).filter((item): item is string => Boolean(item)).slice(0, 80);
+  if (Array.isArray(direct)) {
+    const argv: string[] = [];
+    let remaining = 32_768;
+    for (const item of direct.slice(0, 128)) {
+      if (typeof item !== 'string' || remaining <= 0) continue;
+      const arg = redact(item).slice(0, Math.min(8_192, remaining));
+      argv.push(arg);
+      remaining -= arg.length;
+    }
+    return argv.length ? argv : undefined;
+  }
   const text = cleanString(direct, 600);
   if (!text) return undefined;
   return text.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)?.map((part) => part.replace(/^["']|["']$/g, '')).slice(0, 80) ?? [text];
@@ -889,7 +909,14 @@ function eventInner(kind: string, input: T.UniversalIngestEvent): Record<string,
     ...(uid !== undefined ? { uid } : {}),
     ...(cwd ? { cwd } : {}),
   };
-  if (kind === 'ToolExec') return { ...base, argv: argvField(input) ?? ['unknown'] };
+  if (kind === 'ToolExec') {
+    return {
+      ...base,
+      argv: argvField(input) ?? ['unknown'],
+      argv_truncated: eventAttr(input, 'argv_truncated') === true,
+      argv_incomplete: eventAttr(input, 'argv_incomplete') === true,
+    };
+  }
   if (kind === 'Egress') {
     const peer = cleanString(input.peer ?? input.endpoint ?? eventAttr(input, 'peer') ?? eventAttr(input, 'endpoint'), 500) ?? 'unknown';
     const port = finiteNumber(input.port ?? eventAttr(input, 'port'));
@@ -3972,7 +3999,7 @@ export class SecurityMonitoringController {
     return this.dispatchSecurityCapability(normalizeSecurityCapabilityInput({ ...body, action: securityCapabilityAction(body.action) }), headers);
   }
 
-  private dispatchSecurityCapability(input: T.SecurityCapabilityRequest, headers: HeaderBag): unknown {
+  private async dispatchSecurityCapability(input: T.SecurityCapabilityRequest, headers: HeaderBag): Promise<unknown> {
     const action = securityCapabilityAction(input.action);
     const shaped = securityCapabilityShaped(input.shaped);
     let result: unknown;
@@ -3991,7 +4018,7 @@ export class SecurityMonitoringController {
         ? securityCapabilityResponse(action, input.operation ? { success: true, operation: result as T.SecurityApiOperation } : { success: true, module: result as T.SecurityApiModule })
         : result;
     }
-    result = this.executeSecurityCapability(input, headers);
+    result = await this.executeSecurityCapability(input, headers);
     return shaped
       ? securityCapabilityResponse(action, {
           success: true,
@@ -4003,7 +4030,7 @@ export class SecurityMonitoringController {
       : result;
   }
 
-  private executeSecurityCapability(input: T.SecurityCapabilityRequest, headers: HeaderBag): unknown {
+  private async executeSecurityCapability(input: T.SecurityCapabilityRequest, headers: HeaderBag): Promise<unknown> {
     const module = findSecurityModule(input.module);
     const operation = findSecurityOperation(module, input.operation);
     if (input.dryRun) {
@@ -4102,12 +4129,12 @@ export class SecurityMonitoringController {
     };
   }
 
-  private executeRuntimeGuardCapability(input: T.SecurityCapabilityRequest, headers: HeaderBag): T.SecurityRuntimeGuardDecision {
+  private async executeRuntimeGuardCapability(input: T.SecurityCapabilityRequest, headers: HeaderBag): Promise<T.SecurityRuntimeGuardDecision> {
     const body = securityRuntimeGuardParams(input.params);
     const autonomy = securityCapabilityAutonomy(body.autonomy ?? input.constraints?.autonomy);
     const stage = securityCapabilityStage(body.stage);
     const event = securityRuntimeGuardEvent(body, autonomy, stage);
-    const result = this.ingestUniversalEvents(
+    const result = await this.ingestUniversalEvents(
       {
         workspacePath: body.workspacePath,
         agentId: body.agentId,
@@ -4128,6 +4155,7 @@ export class SecurityMonitoringController {
       headers,
       'custom',
       'capabilities:security-center.assessRuntimeAction',
+      'sync',
     );
     const item = result.items[0];
     const fallbackRisk = securityRuntimeGuardFallbackRisk(body, event);
@@ -4135,7 +4163,7 @@ export class SecurityMonitoringController {
     const policyAction = securityCapabilityPolicyAction(autonomy, item, fallbackRisk);
     let evidenceItem = item;
     if (fallbackRisk && policyActionRank(policyAction) > policyActionRank(basePolicyAction)) {
-      const finding = this.ingestUniversalEvents(
+      const finding = await this.ingestUniversalEvents(
         {
           workspacePath: body.workspacePath,
           agentId: body.agentId,
@@ -4156,6 +4184,7 @@ export class SecurityMonitoringController {
         headers,
         'custom',
         'capabilities:security-center.assessRuntimeAction.fallback',
+        'sync',
       );
       evidenceItem = finding.items.find((candidate) => candidate.accepted) ?? evidenceItem;
     }
@@ -4189,30 +4218,30 @@ export class SecurityMonitoringController {
 
   /** Generic JSON event ingress for webhooks, OTel bridges, and custom producers. */
   @Post('ingest/events')
-  ingestEvents(@Body() body: T.UniversalIngestBody = {}, @Headers() headers: HeaderBag): T.UniversalIngestResult {
+  ingestEvents(@Body() body: T.UniversalIngestBody = {}, @Headers() headers: HeaderBag): Promise<T.UniversalIngestResult> {
     const normalized = normalizeUniversalIngestBody(body, headers);
     return this.ingestUniversalEvents(normalized, headers, normalized.sourceType ?? 'custom', 'ingest/events');
   }
 
   /** Native OTLP/HTTP JSON ingress: accepts resourceLogs/resourceSpans and normalizes them. */
   @Post('ingest/otel')
-  ingestOtel(@Body() body: T.UniversalIngestRequest & Record<string, unknown> = {}, @Headers() headers: HeaderBag): T.UniversalIngestResult {
+  ingestOtel(@Body() body: T.UniversalIngestRequest & Record<string, unknown> = {}, @Headers() headers: HeaderBag): Promise<T.UniversalIngestResult> {
     return this.ingestUniversalEvents(otlpToUniversal(body), headers, 'otel', 'ingest/otel');
   }
 
   /** OTLP/HTTP logs endpoint shape: set exporter base URL to /security-center/ingest/otlp. */
   @Post('ingest/otlp/v1/logs')
-  ingestOtlpLogs(@Body() body: T.UniversalIngestRequest & Record<string, unknown> = {}, @Headers() headers: HeaderBag): T.UniversalIngestResult {
+  ingestOtlpLogs(@Body() body: T.UniversalIngestRequest & Record<string, unknown> = {}, @Headers() headers: HeaderBag): Promise<T.UniversalIngestResult> {
     return this.ingestUniversalEvents(otlpToUniversal(body), headers, 'otel', 'ingest/otlp/v1/logs');
   }
 
   /** OTLP/HTTP traces endpoint shape: set exporter base URL to /security-center/ingest/otlp. */
   @Post('ingest/otlp/v1/traces')
-  ingestOtlpTraces(@Body() body: T.UniversalIngestRequest & Record<string, unknown> = {}, @Headers() headers: HeaderBag): T.UniversalIngestResult {
+  ingestOtlpTraces(@Body() body: T.UniversalIngestRequest & Record<string, unknown> = {}, @Headers() headers: HeaderBag): Promise<T.UniversalIngestResult> {
     return this.ingestUniversalEvents(otlpToUniversal(body), headers, 'otel', 'ingest/otlp/v1/traces');
   }
 
-  private ingestUniversalEvents(body: T.UniversalIngestRequest, headers: HeaderBag, fallbackType: T.IngestionSourceType, endpoint: string): T.UniversalIngestResult {
+  private async ingestUniversalEvents(body: T.UniversalIngestRequest, headers: HeaderBag, fallbackType: T.IngestionSourceType, endpoint: string, judgeMode: 'async' | 'sync' = 'async'): Promise<T.UniversalIngestResult> {
     const events = universalEvents(body);
     if (!events.length) {
       return { accepted: false, acceptedEvents: 0, rejectedEvents: 0, items: [] };
@@ -4295,7 +4324,7 @@ export class SecurityMonitoringController {
         eventKind: kind,
         eventCategory: partial.eventCategory ?? eventCategory(kind),
       });
-      const rec = this.judge.judge(line, meta, eventTime(input));
+      const rec = judgeMode === 'sync' ? this.judge.judge(line, meta, eventTime(input)) : await this.judge.accept(line, meta, eventTime(input));
       if (!rec) {
         const reason = `unsupported event kind: ${kind}`;
         this.recordRejectedIngest(sourceResolution, reason, {
@@ -4323,6 +4352,8 @@ export class SecurityMonitoringController {
         tier: rec.tier,
         severity: rec.severity,
         riskCategory: rec.riskCategory,
+        decisionStatus: rec.decisionStatus,
+        evaluationId: rec.evaluationId,
       });
     }
     if (acceptedEvents > 0) this.agg.invalidateWindowCache();
@@ -4337,7 +4368,7 @@ export class SecurityMonitoringController {
 
   /** The real ingestion seam: external agents/observers POST events here to be judged + counted. */
   @Post('ingest')
-  ingest(@Body() body: IngestBody, @Headers() headers: HeaderBag) {
+  async ingest(@Body() body: IngestBody, @Headers() headers: HeaderBag) {
     const { line, collectorId, nodeName, sourceId, sourceName, sourceType, token, ...given } = body;
     const heartbeat = parseCollectorHeartbeatLine(line);
     const requestSourceId = sourceId ?? headerValue(headers, 'x-anysentry-source-id');
@@ -4412,7 +4443,7 @@ export class SecurityMonitoringController {
       });
       return { accepted: false, sourceId: sourceResolution.source?.sourceId, reason: 'filtered: infra/host (not an agent workload)' };
     }
-    const rec = this.judge.judge(line, meta);
+    const rec = await this.judge.accept(line, meta);
     if (!rec) {
       this.recordRejectedIngest(sourceResolution, 'unparseable event', {
         sourceId: requestSourceId,
@@ -4428,6 +4459,6 @@ export class SecurityMonitoringController {
     }
     this.sources.recordAccepted(sourceResolution, 'event', { collectorId, workspacePath: rec.workspacePath });
     this.agg.invalidateWindowCache();
-    return { accepted: true, sourceId: sourceResolution.source?.sourceId, eventId: rec.eventId, traceId: rec.traceId, spanId: rec.spanId, runId: rec.runId, verdict: rec.verdict, tier: rec.tier, severity: rec.severity, reason: rec.reason, riskCategory: rec.riskCategory };
+    return { accepted: true, sourceId: sourceResolution.source?.sourceId, eventId: rec.eventId, traceId: rec.traceId, spanId: rec.spanId, runId: rec.runId, verdict: rec.verdict, tier: rec.tier, severity: rec.severity, reason: rec.reason, riskCategory: rec.riskCategory, decisionStatus: rec.decisionStatus, evaluationId: rec.evaluationId };
   }
 }

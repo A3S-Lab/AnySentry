@@ -223,6 +223,7 @@ export interface SecurityExplainabilityScanRequest extends SecurityTimeFilter {
 export type SecurityVerdict = "allow" | "block" | "escalate";
 export type SecuritySeverity = "info" | "low" | "medium" | "high" | "critical";
 export type AgentEventSource = "observer" | "synthetic" | "api";
+export type AgentDecisionStatus = "accepted" | "pending" | "running" | "succeeded" | "failed" | "timeout";
 export type AgentEventCategory = "tool" | "network" | "file" | "llm" | "security" | "process" | "runtime" | "unknown";
 export type AgentEventAttributeValue = string | number | boolean;
 export type IncidentStatus = "open" | "acknowledged" | "resolved";
@@ -290,6 +291,7 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   eventKind?: string;
   eventCategory?: AgentEventCategory;
   verdict?: SecurityVerdict;
+  tier?: "Rules" | "Llm" | "Agent";
   limit?: number;
 }
 
@@ -312,6 +314,10 @@ export interface AgentEventListItem {
   parentSpanId?: string;
   runId: string;
   taskId?: string;
+  decisionStatus?: AgentDecisionStatus;
+  evaluationId?: string;
+  policyVersion?: string;
+  decisionUpdatedAt?: number;
   verdict: SecurityVerdict;
   tier: "Rules" | "Llm" | "Agent";
   severity: SecuritySeverity;

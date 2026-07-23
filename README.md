@@ -186,8 +186,14 @@ To feed real local activity, pipe an observer collector into the Node forwarder:
 
 ```bash
 A3S_OBSERVER_JSON=1 sudo -E a3s-observer-collector \
-  | ANYSENTRY_INGEST_URL=http://localhost:29653/security-center/ingest node scripts/observer-forward.js
+  | FORWARD_SCOPE=agent ANYSENTRY_INGEST_URL=http://localhost:29653/security-center/ingest node scripts/observer-forward.js
 ```
+
+`FORWARD_SCOPE=agent` reduces ingest volume before Sentry evaluation. The forwarder uses PID
+ancestry to classify events as `agent`, `non_agent`, or `unknown`; it drops only proven
+`non_agent` events. Unknown events are forwarded so missing `/proc` data or short-lived processes
+do not become silent security gaps. Use `FORWARD_SCOPE=all` to retain the legacy all-event stream,
+or `FORWARD_SCOPE=shadow` to measure classifications without applying the Agent filter.
 
 ### Kubernetes integrated stack
 

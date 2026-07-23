@@ -64,12 +64,23 @@ function argvRootMatch(argv?: string): string | undefined {
   return undefined;
 }
 
-function readProcName(pid?: number): string | undefined {
+type ProcIdentity = { pid: number; tgid?: number; comm?: string; exe?: string };
+
+function readProcIdentity(pid?: number): ProcIdentity | undefined {
   if (!pid) return undefined;
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const fs = require('node:fs') as typeof import('node:fs');
-    return fs.readFileSync(`/proc/${pid}/comm`, 'utf8').trim();
+    const comm = fs.readFileSync(`/proc/${pid}/comm`, 'utf8').trim();
+    let tgid: number | undefined;
+    let exe: string | undefined;
+    try {
+      const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
+      const value = Number(status.match(/^Tgid:\s+(\d+)/m)?.[1]);
+      if (Number.isInteger(value) && value > 0) tgid = value;
+    } catch {}
+    try { exe = fs.readlinkSync(`/proc/${pid}/exe`); } catch {}
+    return { pid, tgid, comm, exe };
   } catch {
     return undefined;
   }
@@ -155,8 +166,9 @@ export class AgentAttributionService {
   }
 
   private matchParentRoot(ppid: number | undefined, meta: EventMeta): AgentAttribution | undefined {
-    const parentComm = readProcName(ppid);
-    const matched = directRootMatch(parentComm);
+    const parent = readProcIdentity(ppid);
+    const leader = parent?.tgid && parent.tgid !== parent.pid ? readProcIdentity(parent.tgid) : parent;
+    const matched = directRootMatch(parent?.comm, parent?.exe) ?? directRootMatch(leader?.comm, leader?.exe);
     if (!matched) return undefined;
     const confidence = 0.82;
     return {
@@ -164,7 +176,7 @@ export class AgentAttributionService {
       agentScopeId: canonicalAgentName(matched) ?? matched,
       agentDisplayName: canonicalAgentName(matched) ?? matched,
       agentSessionId: meta.sessionId,
-      rootPid: ppid,
+      rootPid: leader?.pid ?? ppid,
       confidence,
       reason: 'hint_only',
       source: 'process_graph',
