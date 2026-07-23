@@ -1,0 +1,29 @@
+[Unit]
+Description=AnySentry Redis job queue
+After=local-fs.target
+Before=anysentry.service anysentry-fast-judge.service anysentry-l3-worker.service
+
+[Service]
+Type=simple
+User=anysentry
+Group=anysentry
+WorkingDirectory=/var/lib/anysentry/redis
+ExecStart=/opt/anysentry/redis/bin/redis-server /opt/anysentry/redis/etc/redis.conf
+ExecStop=/opt/anysentry/redis/bin/redis-cli -h 127.0.0.1 -p 6379 shutdown
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=60s
+TimeoutStopSec=60s
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/anysentry/redis /var/log/anysentry
+
+[Install]
+WantedBy=multi-user.target

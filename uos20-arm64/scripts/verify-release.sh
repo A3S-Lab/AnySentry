@@ -9,6 +9,7 @@ release=${1:-${STAGE_DIR:-}}
 required=(
   app/dist/main.js app/web/index.html runtime/node/bin/node
   native/a3s-sentry.linux-arm64-gnu.node clickhouse/bin/clickhouse
+  redis/bin/redis-server redis/bin/redis-cli redis/etc/redis.conf
   observer/bin/a3s-observer-collector observer/KERNEL_VERSION_CODE
   l3/l3-agent.mjs diagnostics/a3s-bpf-syscall-probe
   install.sh verify.sh inspect-host.sh DEPLOYMENT.md VERSION PROVENANCE manifest.sha256

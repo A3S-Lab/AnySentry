@@ -3,11 +3,11 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 ensure_stage
 
-for dir in app runtime native clickhouse observer l3 diagnostics; do [[ -d "$STAGE_DIR/$dir" ]] || die "staged component missing: $dir"; done
+for dir in app runtime native clickhouse redis observer l3 diagnostics; do [[ -d "$STAGE_DIR/$dir" ]] || die "staged component missing: $dir"; done
 
 install -d -m 0755 "$STAGE_DIR/config" "$STAGE_DIR/systemd"
-for file in config/anysentry.env.example config/clickhouse-config.xml config/clickhouse-users.xml; do install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
-for file in systemd/anysentry.service systemd/anysentry-clickhouse.service systemd/anysentry-observer.service; do install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
+for file in config/anysentry.env.example config/clickhouse-config.xml config/clickhouse-users.xml config/redis.conf; do install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
+for file in systemd/anysentry.service systemd/anysentry-clickhouse.service systemd/anysentry-redis.service systemd/anysentry-fast-judge.service systemd/anysentry-l3-worker.service systemd/anysentry-observer.service; do install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
 install -m 0644 "$CHANNEL_DIR/package/DEPLOYMENT.md" "$STAGE_DIR/DEPLOYMENT.md"
 install -m 0644 "$CHANNEL_DIR/package/DIAGNOSTICS.md" "$STAGE_DIR/diagnostics/DIAGNOSTICS.md"
 for file in install.sh verify.sh inspect-host.sh wait-clickhouse.sh uninstall.sh; do install -m 0755 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
@@ -19,10 +19,11 @@ source "$BUILD_DIR/source-provenance.env"
   printf 'TARGET_OS=UnionTech_OS_Server_20_Enterprise\nTARGET_ARCH=aarch64\nTARGET_GLIBC=%s\nTARGET_PAGE_SIZE=%s\n' "$TARGET_GLIBC" "$TARGET_PAGE_SIZE"
   printf 'TARGET_KERNEL_RELEASE=%s\nBPF_KERNEL_VERSION=%s\nBPF_KERNEL_VERSION_CODE=%s\n' "$UOS_KERNEL_RELEASE" "$UOS_BPF_KERNEL_VERSION" "$UOS_BPF_KERNEL_VERSION_CODE"
   printf 'ANYSENTRY_COMMIT=%s\nOBSERVER_COMMIT=%s\nSENTRY_COMMIT=%s\n' "$ANYSENTRY_COMMIT" "$OBSERVER_COMMIT" "$SENTRY_COMMIT"
-  printf 'CLICKHOUSE_VERSION=%s\nCLICKHOUSE_PROFILE=%s\nNODE_VERSION=%s\nA3S_CODE_VERSION=%s\n' "$CLICKHOUSE_VERSION" "$CLICKHOUSE_PROFILE" "$NODE_VERSION" "$CODE_VERSION"
+  printf 'CLICKHOUSE_VERSION=%s\nCLICKHOUSE_PROFILE=%s\nREDIS_VERSION=%s\nNODE_VERSION=%s\nA3S_CODE_VERSION=%s\n' "$CLICKHOUSE_VERSION" "$CLICKHOUSE_PROFILE" "$REDIS_VERSION" "$NODE_VERSION" "$CODE_VERSION"
 } > "$STAGE_DIR/VERSION"
 {
   cat "$STAGE_DIR/VERSION"
+  printf 'REDIS_SOURCE_SHA256=%s\n' "$REDIS_SOURCE_SHA256"
   printf 'SOURCE_DATE_EPOCH=%s\nBUILT_AT_UTC=%s\n' "$(git -C "$ANYSENTRY_REPO" log -1 --format=%ct)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$STAGE_DIR/PROVENANCE"
 

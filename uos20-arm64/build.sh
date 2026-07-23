@@ -13,7 +13,7 @@ Build the current AnySentry, Observer, and Sentry HEAD revisions for the verifie
 Shuangyang UOS 20 ARM64 customer profile.
 
 Options:
-  --component NAME  all, sentry, node, app, clickhouse, observer, l3,
+  --component NAME  all, sentry, node, app, clickhouse, redis, observer, l3,
                     diagnostics, or assemble (default: all)
   --version VERSION Release version (default: AnySentry package version + uos date)
   --prepare-only    Validate and export the locked integration sources, then stop
@@ -35,7 +35,7 @@ while (($#)); do
 done
 
 case "$component" in
-  all|sentry|node|app|clickhouse|observer|l3|diagnostics|assemble) ;;
+  all|sentry|node|app|clickhouse|redis|observer|l3|diagnostics|assemble) ;;
   *) die "unsupported component: $component" ;;
 esac
 
@@ -75,6 +75,7 @@ case "$component" in
     run_component node
     run_component app
     run_component clickhouse
+    run_component redis
     run_component observer
     run_component l3
     run_component diagnostics

@@ -19,6 +19,8 @@ move_line=$(grep -n 'mv "$INSTALL_ROOT" "$ROLLBACK_ROOT"' "$INSTALLER" | cut -d:
 grep -Fq 'ANYSENTRY_INSTALL_ROOT' "$INSTALLER" || fail "installer paths are not testable"
 grep -Fq 'merge_environment' "$INSTALLER" || fail "upgrade config merge is missing"
 grep -Fq 'manifest.sha256' "$INSTALLER" || fail "installer does not verify manifest"
+grep -Fq 'anysentry-redis.service' "$INSTALLER" || fail "installer does not manage Redis"
+grep -Fq 'redis-cli' "$VERIFY" || fail "verifier does not check Redis readiness"
 grep -Fq 'acceptedEvents' "$VERIFY" || fail "verifier does not inspect Source acceptance"
 grep -Fq 'outputDropped' "$VERIFY" || fail "verifier does not inspect forwarder drops"
 grep -Fq 'errorCount' "$VERIFY" || fail "verifier does not inspect forwarder errors"
