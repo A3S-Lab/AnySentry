@@ -39,6 +39,8 @@ done
   fail "Observer integration does not contain the legacy probe"
 grep -Fq 'legacy-kernel-4-19' "$tmp/build/sources/observer/a3s-observer-collector/Cargo.toml" ||
   fail "Observer integration does not contain the legacy feature"
+grep -Fq '.with_ansi(false)' "$tmp/build/sources/observer/a3s-observer-collector/src/legacy.rs" ||
+  fail "legacy Observer journal output does not disable ANSI formatting"
 grep -Fq 'policyFromEnvironment' "$tmp/build/sources/anysentry/apps/api/src/security-monitoring/policy-config.ts" ||
   fail "AnySentry integration does not contain the UOS policy environment"
 grep -Fq 'kernel_version_code=0x0004135a' "$tmp/build/source-provenance.env" || fail "UOS BPF ABI metadata is missing"

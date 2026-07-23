@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { createRequire } from 'node:module';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const { AgentAttributor } = require('./observer-agent-attribution.js');
@@ -171,6 +174,58 @@ function attributor(procEntries = []) {
 
   now += 5001;
   assert.equal(deduper.isDuplicate(event), false);
+}
+
+{
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    let raw = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => { raw += chunk; });
+    req.on('end', () => {
+      requests.push({ path: req.url, body: JSON.parse(raw) });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"accepted":true}');
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert(address && typeof address === 'object');
+
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./observer-forward.js', import.meta.url))], {
+    stdio: ['pipe', 'ignore', 'pipe'],
+    env: {
+      ...process.env,
+      ANYSENTRY_INGEST_URL: `http://127.0.0.1:${address.port}/security-center/ingest`,
+      ANYSENTRY_HEARTBEAT_SECS: '30',
+      A3S_OBSERVER_COLLECTOR_ID: 'observer-test',
+      FORWARD_SCOPE: 'all',
+    },
+  });
+  let childError = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk) => { childError += chunk; });
+  child.stdin.end(`${JSON.stringify({
+    event: {
+      CollectorHeartbeat: {
+        attached_probes: 8,
+        enabled_features: ['exec', 'files', 'network'],
+      },
+    },
+  })}\n`);
+  const exitCode = await Promise.race([
+    new Promise((resolve) => child.once('exit', resolve)),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('forwarder test timed out')), 5000)),
+  ]);
+  server.close();
+  assert.equal(exitCode, 0, childError);
+
+  const heartbeat = requests
+    .filter((request) => request.path === '/security-center/collectors/heartbeat')
+    .map((request) => request.body)
+    .find((body) => body.attachedProbes === 8);
+  assert(heartbeat, 'forwarder heartbeat did not retain attachedProbes=8');
+  assert.deepEqual(heartbeat.enabledFeatures, ['exec', 'files', 'network']);
 }
 
 console.log('Forwarder attribution and deduplication verification passed.');

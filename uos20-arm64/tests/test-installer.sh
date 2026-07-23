@@ -27,8 +27,14 @@ grep -Fq 'validate_redis_runtime' "$INSTALLER" || fail "installer preflight does
 grep -Fq -- '--port 0' "$INSTALLER" || fail "Redis preflight does not disable network listeners"
 grep -Fq 'observer/observer-agent-attribution.js' "$INSTALLER" || fail "installer does not require agent attribution runtime"
 grep -Fq 'observer/observer-event-dedup.js' "$INSTALLER" || fail "installer does not require event dedup runtime"
+wait_for_url_body=$(sed -n '/^wait_for_url()/,/^}/p' "$INSTALLER")
+grep -Fq '2>/dev/null' <<<"$wait_for_url_body" || fail "API readiness retries expose transient curl errors"
 grep -Fq 'redis-cli' "$VERIFY" || fail "verifier does not check Redis readiness"
-grep -Fq 'wait_for_legacy_probes' "$VERIFY" || fail "verifier does not wait for observer probe attachment"
+if grep -Fq 'fail "only $probe_count' "$VERIFY"; then
+  fail "verifier treats journal formatting as an activation failure"
+fi
+grep -Fq 'attachedProbes' "$VERIFY" || fail "verifier does not inspect runtime probe metadata"
+grep -Fq 'attached_probes -ge 8' "$VERIFY" || fail "verifier does not require eight runtime probes"
 grep -Fq 'acceptedEvents' "$VERIFY" || fail "verifier does not inspect Source acceptance"
 grep -Fq 'outputDropped' "$VERIFY" || fail "verifier does not inspect forwarder drops"
 grep -Fq 'errorCount' "$VERIFY" || fail "verifier does not inspect forwarder errors"
