@@ -71,10 +71,21 @@ package_checks
 [[ $PREFLIGHT -eq 0 ]] || exit 0
 [[ -f $ENV_FILE ]] || fail "$ENV_FILE is missing"
 
-for service in anysentry-clickhouse.service anysentry.service anysentry-observer.service; do
+for service in \
+  anysentry-clickhouse.service \
+  anysentry-redis.service \
+  anysentry.service \
+  anysentry-fast-judge.service \
+  anysentry-l3-worker.service \
+  anysentry-observer.service
+do
   systemctl is-active --quiet "$service" || fail "$service is not active"
 done
-pass "ClickHouse, API, and Observer systemd services are active"
+pass "ClickHouse, Redis, API, judgment workers, and Observer systemd services are active"
+
+"$INSTALL_ROOT/redis/bin/redis-cli" -h 127.0.0.1 -p 6379 ping 2>/dev/null |
+  grep -qx PONG || fail "Redis loopback readiness"
+pass "Redis loopback readiness"
 
 CLICKHOUSE_USER=$(env_value CLICKHOUSE_USER); [[ -n $CLICKHOUSE_USER ]] || CLICKHOUSE_USER=anysentry
 CLICKHOUSE_PASSWORD=$(env_value CLICKHOUSE_PASSWORD)

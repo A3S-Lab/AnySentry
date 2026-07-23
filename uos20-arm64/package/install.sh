@@ -20,7 +20,30 @@ ACTIVATED=0
 HAD_PREVIOUS=0
 EXPECTED_BPF_VERSION=4.19.90
 EXPECTED_BPF_CODE=0x0004135a
-SERVICES=(anysentry-clickhouse.service anysentry.service anysentry-observer.service)
+SERVICES=(
+  anysentry-clickhouse.service
+  anysentry-redis.service
+  anysentry.service
+  anysentry-fast-judge.service
+  anysentry-l3-worker.service
+  anysentry-observer.service
+)
+START_SERVICES=(
+  anysentry-clickhouse.service
+  anysentry-redis.service
+  anysentry.service
+  anysentry-fast-judge.service
+  anysentry-l3-worker.service
+  anysentry-observer.service
+)
+STOP_SERVICES=(
+  anysentry-observer.service
+  anysentry-l3-worker.service
+  anysentry-fast-judge.service
+  anysentry.service
+  anysentry-redis.service
+  anysentry-clickhouse.service
+)
 
 usage() {
   cat <<'EOF'
@@ -106,11 +129,15 @@ verify_package() {
   local file required=(
     app/dist/main.js app/web/index.html runtime/node/bin/node
     native/a3s-sentry.linux-arm64-gnu.node clickhouse/bin/clickhouse
+    redis/bin/redis-server redis/bin/redis-cli redis/etc/redis.conf
     observer/bin/a3s-observer-collector observer/observer-forward.js
     observer/KERNEL_VERSION_CODE l3/l3-agent.mjs
+    app/dist/security-monitoring/worker-main.js run-l3-worker.sh
     diagnostics/a3s-bpf-syscall-probe diagnostics/RUN_DIAGNOSTICS.sh
     config/anysentry.env.example systemd/anysentry.service
-    systemd/anysentry-clickhouse.service systemd/anysentry-observer.service
+    systemd/anysentry-clickhouse.service systemd/anysentry-redis.service
+    systemd/anysentry-fast-judge.service systemd/anysentry-l3-worker.service
+    systemd/anysentry-observer.service
     provision-observer.mjs wait-clickhouse.sh verify.sh inspect-host.sh
     VERSION PROVENANCE manifest.sha256
   )
@@ -157,7 +184,7 @@ validate_bpf_abi() {
 }
 
 preflight() {
-  local command_name arch glibc_line glibc_version page_size free_kb node_version clickhouse_version collector_version
+  local command_name arch glibc_line glibc_version page_size free_kb node_version clickhouse_version redis_version collector_version
   for command_name in uname getconf sort df sha256sum systemctl curl awk sed grep install cp mv chmod chown id getent groupadd useradd od tr bash timeout; do
     command -v "$command_name" >/dev/null 2>&1 || fail "required command not found: $command_name"
   done
@@ -178,17 +205,30 @@ preflight() {
     fail "bundled Node runtime cannot execute: $node_version"
   clickhouse_version=$("$PACKAGE_ROOT/clickhouse/bin/clickhouse" --version 2>&1) ||
     fail "bundled ClickHouse cannot execute on this CPU: $clickhouse_version"
+  redis_version=$("$PACKAGE_ROOT/redis/bin/redis-server" --version 2>&1) ||
+    fail "bundled Redis cannot execute on this CPU: $redis_version"
   collector_version=$("$PACKAGE_ROOT/observer/bin/a3s-observer-collector" --version 2>&1) ||
     fail "bundled Observer cannot execute: $collector_version"
   validate_bpf_abi
   free_kb=$(df -Pk "${INSTALL_PARENT:-/}" 2>/dev/null | awk 'NR == 2 {print $4}')
   [[ -n $free_kb ]] || free_kb=$(df -Pk / | awk 'NR == 2 {print $4}')
   [[ $free_kb -ge $MIN_FREE_KB ]] || fail "at least 5 GiB free disk space is required"
-  echo "Preflight passed: architecture=$arch glibc=$glibc_version kernel=$(uname -r) page_size=$page_size free=$((free_kb / 1024))MiB node=$node_version clickhouse=$clickhouse_version observer=$collector_version bpf=$EXPECTED_BPF_CODE"
+  echo "Preflight passed: architecture=$arch glibc=$glibc_version kernel=$(uname -r) page_size=$page_size free=$((free_kb / 1024))MiB node=$node_version clickhouse=$clickhouse_version redis=$redis_version observer=$collector_version bpf=$EXPECTED_BPF_CODE"
 }
 
 stop_services() {
-  systemctl stop anysentry-observer.service anysentry.service anysentry-clickhouse.service 2>/dev/null || true
+  local unit
+  for unit in "${STOP_SERVICES[@]}"; do
+    systemctl stop "$unit" 2>/dev/null || true
+  done
+}
+
+start_available_services() {
+  local unit
+  for unit in "${START_SERVICES[@]}"; do
+    [[ -f $SYSTEMD_DIR/$unit ]] || continue
+    systemctl enable --now "$unit"
+  done
 }
 
 stage_release() {
@@ -237,9 +277,7 @@ restore_previous() {
   [[ ! -f $ROLLBACK_ENV ]] || cp -a "$ROLLBACK_ENV" "$ENV_FILE"
   systemctl daemon-reload
   if [[ $HAD_PREVIOUS -eq 1 ]]; then
-    systemctl enable --now anysentry-clickhouse.service
-    systemctl enable --now anysentry.service
-    systemctl enable --now anysentry-observer.service
+    start_available_services
   fi
   echo "Automatic rollback completed." >&2
 }
@@ -256,6 +294,16 @@ wait_for_url() {
   for i in $(seq 1 60); do
     curl --connect-timeout 2 --max-time 5 -fsS "$url" >/dev/null && return 0
     sleep 2
+  done
+  return 1
+}
+
+wait_for_redis() {
+  local i
+  for i in $(seq 1 60); do
+    "$INSTALL_ROOT/redis/bin/redis-cli" -h 127.0.0.1 -p 6379 ping 2>/dev/null |
+      grep -qx PONG && return 0
+    sleep 1
   done
   return 1
 }
@@ -284,8 +332,12 @@ activate_release() {
   done
   systemctl daemon-reload
   systemctl enable --now anysentry-clickhouse.service
+  systemctl enable --now anysentry-redis.service
+  wait_for_redis || fail "AnySentry Redis readiness timeout"
   systemctl enable --now anysentry.service
   provision_observer
+  systemctl enable --now anysentry-fast-judge.service
+  systemctl enable --now anysentry-l3-worker.service
   systemctl enable --now anysentry-observer.service
   "$INSTALL_ROOT/verify.sh"
   ACTIVATED=0
@@ -310,7 +362,8 @@ main() {
   if ! id anysentry >/dev/null 2>&1; then
     useradd --system --gid anysentry --home-dir "$STATE_DIR" --shell "$(command -v nologin)" anysentry
   fi
-  install -d -o anysentry -g anysentry -m 0750 "$STATE_DIR" "$STATE_DIR/clickhouse" "$STATE_DIR/l3" "$LOG_DIR"
+  install -d -o anysentry -g anysentry -m 0750 \
+    "$STATE_DIR" "$STATE_DIR/clickhouse" "$STATE_DIR/redis" "$STATE_DIR/l3" "$LOG_DIR"
   install_environment
   stage_release
   trap cleanup EXIT

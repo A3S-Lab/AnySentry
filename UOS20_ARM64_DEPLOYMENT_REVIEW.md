@@ -2,7 +2,7 @@
 
 ## 正确打包流程
 
-正式发布以 `AnySentry`、`Observer`、`Sentry` 三个仓库的当前 HEAD 为输入。构建程序确认工作区 clean 后，将源码导出到临时目录，应用 `uos20-arm64/patches/` 的客户兼容层，再分别构建业务服务、原生 Sentry、Node、ClickHouse、Linux 4.19 Observer、L3 和诊断程序。构建完成后执行 ELF/ABI、BPF 版本、包结构和 SHA-256 校验，生成 `PROVENANCE` 后打包。上游仓库不保留客户专用修改。
+正式发布以 `AnySentry`、`Observer`、`Sentry` 三个仓库经过审核的 integration branch HEAD 为输入。AnySentry 和 Observer 通过 direct merge 引入上游 main，再提交客户兼容修改；Sentry 使用锁定的 main 提交。构建程序确认三个工作区 clean、提交号与 `versions.env` 一致后，将源码导出到临时目录，分别构建业务服务、原生 Sentry、Node、ClickHouse、Redis、Linux 4.19 Observer、L3 和诊断程序。构建完成后执行 ELF/ABI、BPF 版本、包结构和 SHA-256 校验，生成 `PROVENANCE` 后打包。稳定 UOS 分支仅在目标机验收通过后推进。
 
 ## 客户设备基线
 
@@ -48,12 +48,13 @@
 
 ## 最终部署状态
 
-ClickHouse、AnySentry API/页面和 Observer 均为 active。API 使用 ClickHouse 存储，受保护 Observer Source 为 active，事件持续接收，拒绝数为 0；collector 状态 healthy，队列、outputDropped 和 errorCount 均为 0。L1 已启用；L2、L3 需配置兼容 LLM 后显式重启服务。
+ClickHouse、AnySentry API/页面和 Observer 均为 active。API 使用 ClickHouse 存储，受保护 Observer Source 为 active，事件持续接收，拒绝数为 0；collector 状态 healthy，队列、outputDropped 和 errorCount 均为 0。新版本同时内置 Redis 及 L1/L2、L3 异步判定 Worker。L1 默认启用；L2、L3 需配置兼容 LLM 后显式重启 API 和判定 Worker。
 
 ## 组件维护注意事项
 
 - Sentry：必须使用 aarch64、glibc 2.28 和 64 KiB ELF 对齐构建；
 - ClickHouse：必须保留 `armv8.0-compat`，通用 ARM64 包可能触发 SIGILL；
+- Redis：必须随离线包提供 aarch64、glibc 2.28、64 KiB 对齐二进制，并仅监听回环地址；
 - Observer：必须使用 perf-kprobe-legacy 和 BPF 4.19.90；不得依赖 BTF；
 - AnySentry：Source 创建应兼容 HTTP 201 和标准响应信封；
 - Forwarder：必须保留 ClickHouse 自噪声过滤，并监控 acceptedEvents、outputDropped、errorCount；

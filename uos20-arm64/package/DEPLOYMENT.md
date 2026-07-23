@@ -9,10 +9,10 @@
 将 tar 包和同名 `.sha256` 文件上传至目标服务器后执行：
 
 ```bash
-cd /opt/shannon/anysentry/v0.1.0
-sha256sum --check anysentry-security-suite-0.1.0-compat2-uos20-arm64.tar.gz.sha256
-tar -zxf anysentry-security-suite-0.1.0-compat2-uos20-arm64.tar.gz
-cd anysentry-security-suite-0.1.0-compat2-uos20-arm64
+cd /opt/shannon/anysentry
+sha256sum --check anysentry-security-suite-0.2.0-compat3-uos20-arm64.tar.gz.sha256
+tar -zxf anysentry-security-suite-0.2.0-compat3-uos20-arm64.tar.gz
+cd anysentry-security-suite-0.2.0-compat3-uos20-arm64
 sha256sum --check manifest.sha256
 ```
 
@@ -30,7 +30,7 @@ sha256sum --check manifest.sha256
 ./install.sh
 ```
 
-安装程序保留 `/etc/anysentry/anysentry.env`、`/var/lib/anysentry` 和 `/var/log/anysentry`，自动合并新增配置项、依次启动服务、配置 Observer Source 并执行完整验证。激活失败时自动 rollback 至上一程序和 systemd 单元；失败版本保留为 `/opt/anysentry.failed.<时间>`。
+安装程序保留 `/etc/anysentry/anysentry.env`、`/var/lib/anysentry` 和 `/var/log/anysentry`，自动合并新增配置项，按 ClickHouse、Redis、API、判定 Worker、Observer 的顺序启动服务，配置 Observer Source 并执行完整验证。激活失败时自动 rollback 至上一程序和 systemd 单元；失败版本保留为 `/opt/anysentry.failed.<时间>`。
 
 安装成功后执行：
 
@@ -65,6 +65,7 @@ ANYSENTRY_LLM_BASE_URL=https://<LLM服务地址>/v1
 ANYSENTRY_LLM_MODEL=<模型名>
 ANYSENTRY_LLM_API_KEY=<API密钥>
 ANYSENTRY_LLM_TIMEOUT=30
+ANYSENTRY_ASYNC_JUDGE=on
 ```
 
 启用 L3：
@@ -72,7 +73,11 @@ ANYSENTRY_LLM_TIMEOUT=30
 ```ini
 ANYSENTRY_L3_ENABLED=true
 ANYSENTRY_L3_TIMEOUT=180
+ANYSENTRY_L3_TIMEOUT_MS=180000
 ANYSENTRY_L3_WORKSPACE=/var/lib/anysentry/l3
+A3S_SENTRY_L3_URL=https://<LLM服务地址>/v1
+A3S_SENTRY_L3_MODEL=<模型名>
+A3S_SENTRY_L3_KEY=<API密钥>
 ```
 
 配置文件变更不会自动重启服务。配置完成后执行：
@@ -80,24 +85,34 @@ ANYSENTRY_L3_WORKSPACE=/var/lib/anysentry/l3
 ```bash
 chown root:root /etc/anysentry/anysentry.env
 chmod 0600 /etc/anysentry/anysentry.env
-systemctl restart anysentry.service anysentry-observer.service
+systemctl restart anysentry.service
+systemctl restart anysentry-fast-judge.service
+systemctl restart anysentry-l3-worker.service
 curl -fsS http://127.0.0.1:29653/security-center/healthz
 ```
 
-健康响应中的 `policy.l2=true`、`policy.l3=true` 表示相应级别已启用。
+健康响应中的 `policy.l2=true`、`policy.l3=true` 表示相应级别已启用。手工修改配置不会触发自动重启；执行新版本 `install.sh` 升级时会自动重启全部服务。
 
 ## 6. 常用检查
 
 ```bash
 systemctl status anysentry-clickhouse.service --no-pager -l
+systemctl status anysentry-redis.service --no-pager -l
 systemctl status anysentry.service --no-pager -l
+systemctl status anysentry-fast-judge.service --no-pager -l
+systemctl status anysentry-l3-worker.service --no-pager -l
 systemctl status anysentry-observer.service --no-pager -l
 curl -fsS http://127.0.0.1:8123/ping
+/opt/anysentry/redis/bin/redis-cli -h 127.0.0.1 -p 6379 ping
 curl -fsS http://127.0.0.1:29653/security-center/healthz
 journalctl -b -u anysentry-clickhouse.service -n 200 --no-pager
+journalctl -b -u anysentry-redis.service -n 200 --no-pager
 journalctl -b -u anysentry.service -n 200 --no-pager
+journalctl -b -u anysentry-fast-judge.service -n 200 --no-pager
+journalctl -b -u anysentry-l3-worker.service -n 200 --no-pager
 journalctl -b -u anysentry-observer.service -n 300 --no-pager -o cat
 /opt/anysentry/inspect-host.sh
+/opt/anysentry/diagnostics/RUN_DIAGNOSTICS.sh
 ```
 
 Observer 正常日志应包含 8 条 `legacy probe attached` 和汇总 `effective_probes=3`。Source 应为 `active`，`acceptedEvents` 持续增加，`rejectedEvents` 不增加；collector 应为 `healthy`，`outputDropped=0`、`errorCount=0`。
@@ -131,13 +146,25 @@ scan.kprobe_candidate.version_code=0x0004135a
 
 ### API 启动超时
 
-先确认 ClickHouse：
+先确认 ClickHouse 和 Redis：
 
 ```bash
 systemctl status anysentry-clickhouse.service --no-pager -l
 tail -n 200 /var/log/anysentry/clickhouse-server.err.log
 curl -fsS http://127.0.0.1:8123/ping
+/opt/anysentry/redis/bin/redis-cli -h 127.0.0.1 -p 6379 ping
 ```
+
+### 判定 Worker 启动失败
+
+确认 Redis 为 `PONG`，再查看相应日志：
+
+```bash
+systemctl status anysentry-fast-judge.service anysentry-l3-worker.service --no-pager -l
+journalctl -b -u anysentry-fast-judge.service -u anysentry-l3-worker.service -n 300 --no-pager
+```
+
+未启用 L3 时，`anysentry-l3-worker.service` 保持 active 并由休眠进程占位，属于正常状态。
 
 ### Observer Source 配置失败
 
@@ -163,11 +190,16 @@ HTTP 201 为创建成功状态；随包脚本已支持标准响应信封。脚�
 
 ```bash
 ls -ld /opt/.anysentry.rollback.*
-systemctl stop anysentry-observer.service anysentry.service anysentry-clickhouse.service
+systemctl stop anysentry-observer.service anysentry-l3-worker.service anysentry-fast-judge.service
+systemctl stop anysentry.service anysentry-redis.service anysentry-clickhouse.service
 mv /opt/anysentry /opt/anysentry.failed.manual
 mv /opt/.anysentry.rollback.<时间> /opt/anysentry
 systemctl daemon-reload
-systemctl start anysentry-clickhouse.service anysentry.service anysentry-observer.service
+systemctl start anysentry-clickhouse.service
+systemctl start anysentry-redis.service 2>/dev/null || true
+systemctl start anysentry.service
+systemctl start anysentry-fast-judge.service anysentry-l3-worker.service 2>/dev/null || true
+systemctl start anysentry-observer.service
 /opt/anysentry/verify.sh
 ```
 

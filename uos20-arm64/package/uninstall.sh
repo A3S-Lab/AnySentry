@@ -23,12 +23,22 @@ done
 
 [ "$(id -u)" -eq 0 ] || { echo "ERROR: uninstaller must run as root" >&2; exit 1; }
 
-systemctl disable --now anysentry-observer.service 2>/dev/null || true
-systemctl disable --now anysentry.service 2>/dev/null || true
-systemctl disable --now anysentry-clickhouse.service 2>/dev/null || true
-rm -f /etc/systemd/system/anysentry-observer.service /etc/systemd/system/anysentry.service /etc/systemd/system/anysentry-clickhouse.service
+SERVICES=(
+  anysentry-observer.service
+  anysentry-l3-worker.service
+  anysentry-fast-judge.service
+  anysentry.service
+  anysentry-redis.service
+  anysentry-clickhouse.service
+)
+for service in "${SERVICES[@]}"; do
+  systemctl disable --now "$service" 2>/dev/null || true
+done
+for service in "${SERVICES[@]}"; do
+  rm -f "/etc/systemd/system/$service"
+done
 systemctl daemon-reload
-systemctl reset-failed anysentry-observer.service anysentry.service anysentry-clickhouse.service 2>/dev/null || true
+systemctl reset-failed "${SERVICES[@]}" 2>/dev/null || true
 rm -rf /opt/anysentry
 
 if [ "$PURGE_DATA" -eq 1 ]; then
