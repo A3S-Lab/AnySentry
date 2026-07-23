@@ -23,8 +23,8 @@ rm -rf "$source_root"
 mkdir -p "$source_root"
 tar -xzf "$archive" --strip-components=1 -C "$source_root"
 
-cross_cc="$zig cc -target $TARGET_TRIPLE -mcpu=baseline"
-make -C "$source_root" -j"$(getconf _NPROCESSORS_ONLN)" \
+cross_cc="$zig cc -target aarch64-linux-gnu.$TARGET_GLIBC -mcpu=baseline"
+make -C "$source_root/src" -j"$(getconf _NPROCESSORS_ONLN)" \
   CC="$cross_cc" \
   MALLOC=libc \
   BUILD_TLS=no \
