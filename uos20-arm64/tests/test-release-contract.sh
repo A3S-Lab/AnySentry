@@ -40,6 +40,10 @@ grep -Fq 'msgpackr-extract-linux-x64' "$CHANNEL/scripts/build-app.sh" || fail "a
 grep -Fq 'STAGE_DIR/app/node_modules/@a3s-lab/code' "$CHANNEL/scripts/build-l3.sh" || fail "L3 component cannot resume from the staged app"
 grep -Fq 'manifest.sha256' "$CHANNEL/scripts/assemble-release.sh" || fail "release manifest is not generated"
 grep -Fq 'PROVENANCE' "$CHANNEL/scripts/assemble-release.sh" || fail "release provenance is not generated"
+grep -Fq 'observer-agent-attribution.js' "$CHANNEL/scripts/build-observer.sh" || fail "observer builder omits agent attribution runtime"
+grep -Fq 'observer-event-dedup.js' "$CHANNEL/scripts/build-observer.sh" || fail "observer builder omits event dedup runtime"
+grep -Fq 'observer/observer-agent-attribution.js' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not require agent attribution runtime"
+grep -Fq 'observer/observer-event-dedup.js' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not require event dedup runtime"
 grep -Fq '0x0004135a' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not enforce UOS BPF ABI"
 grep -Fq "'Linux BPF'" "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not recognize the legacy BPF object"
 

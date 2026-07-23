@@ -10,9 +10,9 @@
 
 ```bash
 cd /opt/shannon/anysentry
-sha256sum --check anysentry-security-suite-0.2.0-compat4-uos20-arm64.tar.gz.sha256
-tar -zxf anysentry-security-suite-0.2.0-compat4-uos20-arm64.tar.gz
-cd anysentry-security-suite-0.2.0-compat4-uos20-arm64
+sha256sum --check anysentry-security-suite-0.2.0-compat5-uos20-arm64.tar.gz.sha256
+tar -zxf anysentry-security-suite-0.2.0-compat5-uos20-arm64.tar.gz
+cd anysentry-security-suite-0.2.0-compat5-uos20-arm64
 sha256sum --check manifest.sha256
 ```
 
@@ -116,6 +116,10 @@ journalctl -b -u anysentry-observer.service -n 300 --no-pager -o cat
 ```
 
 Observer 正常日志应包含 8 条 `legacy probe attached` 和汇总 `effective_probes=3`。Source 应为 `active`，`acceptedEvents` 持续增加，`rejectedEvents` 不增加；collector 应为 `healthy`，`outputDropped=0`、`errorCount=0`。
+
+若日志出现 `Cannot find module './observer-agent-attribution'` 或
+`Cannot find module './observer-event-dedup'`，表示发布包不完整。停止部署并更换完整发布包，
+不得单独复制 `observer-forward.js`。
 
 ## 7. 故障定位与修复
 

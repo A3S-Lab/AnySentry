@@ -131,6 +131,7 @@ verify_package() {
     native/a3s-sentry.linux-arm64-gnu.node clickhouse/bin/clickhouse
     redis/bin/redis-server redis/bin/redis-cli redis/etc/redis.conf
     observer/bin/a3s-observer-collector observer/observer-forward.js
+    observer/observer-agent-attribution.js observer/observer-event-dedup.js
     observer/KERNEL_VERSION_CODE l3/l3-agent.mjs
     app/dist/security-monitoring/worker-main.js run-l3-worker.sh
     diagnostics/a3s-bpf-syscall-probe diagnostics/RUN_DIAGNOSTICS.sh

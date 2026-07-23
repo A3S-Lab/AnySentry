@@ -46,6 +46,21 @@ wait_health() {
   return 1
 }
 
+wait_for_legacy_probes() {
+  local count=0
+  for _ in $(seq 1 30); do
+    count=$(journalctl -b -u anysentry-observer.service --no-pager -o cat 2>/dev/null |
+      grep -c 'legacy probe attached program=' || true)
+    if [[ $count -ge 8 ]]; then
+      printf '%s\n' "$count"
+      return 0
+    fi
+    sleep 1
+  done
+  printf '%s\n' "$count"
+  return 1
+}
+
 host_checks() {
   [[ $(uname -m) == aarch64 ]] || fail "host architecture is not aarch64"
   [[ $(getconf PAGESIZE) == 65536 ]] || fail "host page size is not 65536"
@@ -117,9 +132,8 @@ before_accepted=$(printf '%s' "$before" | json_value 'data.items?.[0]?.acceptedE
 before_rejected=$(printf '%s' "$before" | json_value 'data.items?.[0]?.rejectedEvents ?? -1')
 [[ $before_accepted =~ ^[0-9]+$ ]] || fail "Observer Source acceptedEvents is unavailable"
 
-probe_count=$(journalctl -b -u anysentry-observer.service --no-pager -o cat 2>/dev/null | \
-  grep -c 'legacy probe attached program=' || true)
-[[ $probe_count -ge 8 ]] || fail "only $probe_count of 8 legacy probes were confirmed attached"
+probe_count=$(wait_for_legacy_probes) ||
+  fail "only $probe_count of 8 legacy probes were confirmed attached after 30 seconds"
 
 /bin/sh -c 'echo anysentry-uos-observer-verify >/dev/null'
 /usr/bin/env >/dev/null
