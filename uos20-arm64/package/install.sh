@@ -183,6 +183,20 @@ validate_bpf_abi() {
     fail "kernel did not accept expected BPF code $EXPECTED_BPF_CODE"
 }
 
+validate_redis_runtime() {
+  local output rc=0
+  output=$("$PACKAGE_ROOT/redis/bin/redis-server" \
+    "$PACKAGE_ROOT/redis/etc/redis.conf" \
+    --port 0 --save "" --appendonly no --dir /tmp 2>&1) || rc=$?
+  printf '%s\n' "$output"
+  if grep -Fq 'Redis will now exit to prevent data corruption' <<<"$output"; then
+    fail "bundled Redis configuration did not safely acknowledge the ARM64 kernel COW check"
+  fi
+  [[ $rc -eq 1 ]] || fail "bundled Redis startup check returned unexpected exit code $rc"
+  grep -Fq 'Configured to not listen anywhere, exiting.' <<<"$output" ||
+    fail "bundled Redis did not complete its startup checks"
+}
+
 preflight() {
   local command_name arch glibc_line glibc_version page_size free_kb node_version clickhouse_version redis_version collector_version
   for command_name in uname getconf sort df sha256sum systemctl curl awk sed grep install cp mv chmod chown id getent groupadd useradd od tr bash timeout; do
@@ -207,6 +221,7 @@ preflight() {
     fail "bundled ClickHouse cannot execute on this CPU: $clickhouse_version"
   redis_version=$("$PACKAGE_ROOT/redis/bin/redis-server" --version 2>&1) ||
     fail "bundled Redis cannot execute on this CPU: $redis_version"
+  validate_redis_runtime
   collector_version=$("$PACKAGE_ROOT/observer/bin/a3s-observer-collector" --version 2>&1) ||
     fail "bundled Observer cannot execute: $collector_version"
   validate_bpf_abi

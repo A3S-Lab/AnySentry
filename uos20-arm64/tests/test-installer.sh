@@ -23,6 +23,8 @@ grep -Fq 'anysentry-redis.service' "$INSTALLER" || fail "installer does not mana
 grep -Fq 'anysentry-fast-judge.service' "$INSTALLER" || fail "installer does not manage the fast judgment worker"
 grep -Fq 'anysentry-l3-worker.service' "$INSTALLER" || fail "installer does not manage the L3 worker"
 grep -Fq 'wait_for_redis' "$INSTALLER" || fail "installer does not wait for Redis readiness"
+grep -Fq 'validate_redis_runtime' "$INSTALLER" || fail "installer preflight does not exercise the Redis startup checks"
+grep -Fq -- '--port 0' "$INSTALLER" || fail "Redis preflight does not disable network listeners"
 grep -Fq 'redis-cli' "$VERIFY" || fail "verifier does not check Redis readiness"
 grep -Fq 'acceptedEvents' "$VERIFY" || fail "verifier does not inspect Source acceptance"
 grep -Fq 'outputDropped' "$VERIFY" || fail "verifier does not inspect forwarder drops"
