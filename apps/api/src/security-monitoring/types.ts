@@ -13,6 +13,7 @@ export interface ExplainabilityScanRequest extends SecurityTimeFilter {
 }
 
 export type Verdict = 'allow' | 'block' | 'escalate';
+export type DecisionStatus = 'accepted' | 'pending' | 'running' | 'succeeded' | 'failed' | 'timeout';
 export type Tier = 'Rules' | 'Llm' | 'Agent';
 export type Severity = 'info' | 'low' | 'medium' | 'high' | 'critical';
 export type RiskType = 'system' | 'communication' | 'atomic';
@@ -102,6 +103,10 @@ export interface JudgedEvent {
   parentSpanId?: string;
   runId: string;
   taskId?: string;
+  decisionStatus?: DecisionStatus;
+  evaluationId?: string;
+  policyVersion?: string;
+  decisionUpdatedAt?: number;
   verdict: Verdict;
   tier: Tier;
   severity: Severity;
@@ -199,6 +204,8 @@ export interface UniversalIngestResultItem {
   tier?: Tier;
   severity?: Severity;
   riskCategory?: string;
+  decisionStatus?: DecisionStatus;
+  evaluationId?: string;
 }
 export interface UniversalIngestResult {
   accepted: boolean;
@@ -526,6 +533,7 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   eventKind?: string;
   eventCategory?: EventCategory;
   verdict?: Verdict;
+  tier?: Tier;
   limit?: number;
 }
 export interface AgentEventListItem {
@@ -547,6 +555,10 @@ export interface AgentEventListItem {
   parentSpanId?: string;
   runId: string;
   taskId?: string;
+  decisionStatus?: DecisionStatus;
+  evaluationId?: string;
+  policyVersion?: string;
+  decisionUpdatedAt?: number;
   verdict: Verdict;
   tier: Tier;
   severity: Severity;

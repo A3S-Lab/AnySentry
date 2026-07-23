@@ -22,7 +22,9 @@ export interface L1Rule {
   action?: RuleAction;
 }
 export interface L2Config { url: string; model: string; timeoutS: number } // LLM judge endpoint
-export interface L3Config { bin: string; skills: string; timeoutS: number } // a3s-code agent + skills dir
+/** `bin` and `timeoutS` are retained for policy and UOS upgrade compatibility;
+ * the async L3 worker uses the in-process SDK and its own execution timeout. */
+export interface L3Config { bin: string; skills: string; timeoutS: number }
 
 /** The whole judge policy. `null` tiers are "not configured" → the dashboard hides them. */
 export interface PolicyConfig {
@@ -115,7 +117,7 @@ export function sanitizePolicy(input: unknown): PolicyConfig {
     : [];
 
   const llmIn = o.llm as Record<string, unknown> | null | undefined;
-  const llm: L2Config | null = llmIn && str(llmIn.url) ? { url: str(llmIn.url, 500), model: str(llmIn.model, 100) || 'default', timeoutS: num(llmIn.timeoutS, 1, 600, 30) } : null;
+  const llm: L2Config | null = llmIn && str(llmIn.url) ? { url: str(llmIn.url, 500), model: str(llmIn.model, 100) || 'default', timeoutS: num(llmIn.timeoutS, 1, 600, 45) } : null;
 
   const agentIn = o.agent as Record<string, unknown> | null | undefined;
   const agent: L3Config | null = agentIn && str(agentIn.bin)
@@ -149,6 +151,11 @@ export function buildAcl(c: PolicyConfig, secrets: { llmApiKey?: string } = {}):
     out.push(']');
   }
   return out.join('\n') + '\n';
+}
+
+/** Build the API/Fast Judge policy without an in-process L3 agent. */
+export function buildFastAcl(c: PolicyConfig): string {
+  return buildAcl({ ...c, agent: null, speculate: 'off' });
 }
 
 /** Which tiers the dashboard should show (`如果没配置就前端不展示`). L1 is always active (built-ins). */

@@ -4,13 +4,17 @@ import { Sentry, dns, egress, fileAccess, securityAction, sslContent, toolExec }
 import { AgentAttributionService } from './agent-attribution.service';
 import { AlertingService } from './alerting.service';
 import { ClickHouseStore, IncidentState } from './clickhouse-store';
-import { PolicyConfig, buildAcl, policyConfigError, policyFromEnvironment, sanitizePolicy, tierStatus } from './policy-config';
+import { PolicyConfig, buildFastAcl, policyConfigError, policyFromEnvironment, sanitizePolicy, tierStatus } from './policy-config';
 import { cleanText } from './redaction';
+import { DecisionResultJob, FastJudgeJob } from './async-judgment.types';
+import { JudgmentQueueService } from './judgment-queue.service';
 import { CollectorHeartbeatRecord, CollectorHeartbeatRequest, EventCategory, EventMeta, Incident, IncidentStatus, JudgedEvent, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
 
 const SEVERITY_SCORE: Record<Severity, number> = { info: 8, low: 28, medium: 52, high: 76, critical: 95 };
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 const SCHEMA_VERSION: JudgedEvent['schemaVersion'] = 'anysentry.agent_event.v1';
+const SECURITY_JUDGED_KINDS = new Set(['ToolExec', 'Egress', 'Dns', 'FileAccess', 'SslContent', 'SecurityAction']);
+const DEFAULT_INTERNAL_L3_BIN = '/opt/anysentry/l3-agent.mjs';
 const RISK_NAME_BY_CATEGORY: Record<string, string> = {
   systemic_risk: '云元数据 SSRF',
   privilege_escalation: '提权 / 进程注入',
@@ -237,7 +241,7 @@ function producerReportedFinding(base: JudgedEventBase): {
 
 @Injectable()
 export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
-  constructor(private readonly alerting: AlertingService, private readonly attributionService: AgentAttributionService) {}
+  constructor(private readonly alerting: AlertingService, private readonly attributionService: AgentAttributionService, private readonly queues: JudgmentQueueService) {}
 
   private sentry!: Sentry;
   // In-memory hot ring: the dashboard's fast, synchronous read/aggregation path. Durability + retention
@@ -245,7 +249,9 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   // survive restarts/rollouts. ponytail: ring covers all windows at realistic volume; if a window ever
   // needs more than MAX rows, query ClickHouse for that window instead of the ring.
   private readonly store: JudgedEvent[] = [];
+  private readonly storeById = new Map<string, JudgedEvent>();
   private readonly MAX = 100_000;
+  private readonly TRIM_BATCH = 1_000;
   private readonly collectorHeartbeats: CollectorHeartbeatRecord[] = [];
   private readonly MAX_COLLECTOR_HEARTBEATS = 10_000;
   private collectorHeartbeatPersistTimer?: NodeJS.Timeout;
@@ -265,7 +271,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
       const hist = await this.ch.hydrate(Date.now() - THIRTY_DAYS, this.MAX);
       this.store.push(...hist); // direct (not push()) so hydrated rows aren't re-written to ClickHouse
-      for (const rec of hist) this.ingestIncident(rec);
+      for (const rec of hist) {
+        this.storeById.set(rec.eventId, rec);
+        this.ingestIncident(rec);
+      }
       this.applyIncidentState(await this.ch.loadIncidentState());
       const heartbeats = await this.ch.loadCollectorHeartbeats();
       for (const heartbeat of heartbeats.sort((a, b) => a.at - b.at).slice(-this.MAX_COLLECTOR_HEARTBEATS)) {
@@ -291,7 +300,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   private applyPolicy(config: PolicyConfig): void {
     let next: Sentry;
     try {
-      next = Sentry.create(buildAcl(config, { llmApiKey: process.env.ANYSENTRY_LLM_API_KEY }));
+      next = Sentry.create(buildFastAcl(config));
     } catch (error) {
       throw policyConfigError(error);
     }
@@ -316,6 +325,214 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     this.applyPolicy(config);
     await this.ch.saveConfig(config);
     return this.getPolicy();
+  }
+
+
+  private eventBase(line: string, meta: EventMeta, at: number): JudgedEventBase {
+    const eventKind = meta.eventKind ?? 'Event';
+    const ids = { workspacePath: meta.workspacePath, agentId: meta.agentId, sessionId: meta.sessionId, userId: meta.userId };
+    const attributes = meta.attributes ?? {};
+    const process = meta.process ?? processFromAttributes(attributes);
+    const attribution = meta.attribution ?? this.attributionService.attribute(meta, process, at);
+    return {
+      schemaVersion: SCHEMA_VERSION,
+      eventId: hashId('evt', [at, eventKind, ids.agentId, ids.sessionId, line]),
+      at,
+      eventKind,
+      eventCategory: meta.eventCategory ?? eventCategory(eventKind),
+      source: meta.source ?? 'observer',
+      subject: meta.subject ?? eventKind,
+      ...ids,
+      collectorId: typeof attributes.collectorId === 'string' ? cleanText(attributes.collectorId, 180) : undefined,
+      sourceId: typeof attributes.sourceId === 'string' ? cleanText(attributes.sourceId, 160) : undefined,
+      traceId: meta.traceId ?? hashId('tr', [ids.workspacePath, ids.agentId, ids.sessionId]),
+      spanId: meta.spanId ?? hashId('sp', [at, eventKind, ids.agentId, ids.sessionId, line]),
+      parentSpanId: meta.parentSpanId,
+      runId: meta.runId ?? ids.sessionId,
+      taskId: meta.taskId,
+      tokenCount: meta.tokenCount ?? extractTokens(line, eventKind),
+      latencyMs: meta.latencyMs ?? 1,
+      attributes,
+      process,
+      attribution,
+      rawPreview: meta.rawPreview,
+    };
+  }
+
+  private policyVersion(): string {
+    return hashId('pol', [JSON.stringify(this.policy)]);
+  }
+
+  private recordProducerFinding(base: JudgedEventBase, finding: NonNullable<ReturnType<typeof producerReportedFinding>>): JudgedEvent {
+    return this.push({
+      ...base,
+      verdict: 'escalate',
+      tier: 'Rules',
+      severity: finding.severity,
+      reason: finding.reason,
+      riskCategory: finding.riskCategory,
+      riskName: finding.riskName,
+      riskType: 'atomic',
+      riskScore: SEVERITY_SCORE[finding.severity],
+    });
+  }
+
+  private isInternalL3Invocation(line: string, base: JudgedEventBase): boolean {
+    if (base.source !== 'observer') return false;
+    const observedProcess = base.process;
+    const cgroup = observedProcess?.cgroup ?? '';
+    const containerized = /(?:\/docker-|\/kubepods(?:\.slice)?\/|\/containerd\/)/.test(cgroup);
+    const executable = (observedProcess?.exe ?? '').split('/').pop()?.toLowerCase();
+    if (!containerized) return false;
+
+    // The current L3 worker embeds a3s-code in-process, so there is no l3-agent.mjs ToolExec to
+    // match. Suppress events attributed to the fixed ACL identity only when they also originate
+    // from a containerized Node process; either signal alone is user-controllable and insufficient.
+    const internalIdentity = [base.agentId, base.attribution?.agentScopeId, base.attribution?.agentDisplayName]
+      .some((value) => value?.trim().toLowerCase() === 'sentry-l3');
+    if (internalIdentity && executable === 'node') return true;
+
+    if (base.eventKind !== 'ToolExec' || executable !== 'node') return false;
+
+    let argv: unknown;
+    try {
+      const parsed = JSON.parse(line) as { event?: { ToolExec?: { argv?: unknown } } };
+      argv = parsed.event?.ToolExec?.argv;
+    } catch {
+      return false;
+    }
+    if (!Array.isArray(argv) || argv.some((value) => typeof value !== 'string')) return false;
+    const args = argv as string[];
+    const configuredBins = new Set([
+      DEFAULT_INTERNAL_L3_BIN,
+      this.policy.agent?.bin,
+      process.env.ANYSENTRY_INTERNAL_L3_BIN,
+    ].filter((value): value is string => Boolean(value)));
+    return configuredBins.has(args[0]) || ((args[0]?.split('/').pop() === 'node') && configuredBins.has(args[1]));
+  }
+
+  private recordInternalL3Activity(base: JudgedEventBase): JudgedEvent {
+    return this.push({
+      ...base,
+      attributes: { ...base.attributes, origin: 'l3-judge', recursiveJudgmentSuppressed: true },
+      verdict: 'allow',
+      tier: 'Rules',
+      severity: 'info',
+      reason: 'internal L3 judge activity; recursive judgment suppressed',
+      riskCategory: 'benign',
+      riskName: '正常',
+      riskType: 'atomic',
+      riskScore: 0,
+    });
+  }
+
+  async accept(line: string, meta: EventMeta, at = Date.now()): Promise<JudgedEvent | null> {
+    if (!this.queues.enabled) return this.judge(line, meta, at);
+    const base = this.eventBase(line, meta, at);
+    if (this.isInternalL3Invocation(line, base)) return this.recordInternalL3Activity(base);
+    const producerFinding = producerReportedFinding(base);
+    if (producerFinding) return this.recordProducerFinding(base, producerFinding);
+    if (!SECURITY_JUDGED_KINDS.has(base.eventKind)) {
+      if (!OBSERVER_KINDS.has(base.eventKind) && base.source !== 'api') return null;
+      return this.push({
+        ...base,
+        verdict: 'allow',
+        tier: 'Rules',
+        severity: 'info',
+        reason: 'observed',
+        riskCategory: 'benign',
+        riskName: '正常',
+        riskType: 'atomic',
+        riskScore: 0,
+      });
+    }
+
+    const policyVersion = this.policyVersion();
+    const evaluationId = hashId('eval', [base.eventId, policyVersion]);
+    const pending: JudgedEvent = {
+      ...base,
+      decisionStatus: 'pending',
+      evaluationId,
+      policyVersion,
+      decisionUpdatedAt: Date.now(),
+      verdict: 'escalate',
+      tier: 'Rules',
+      severity: 'info',
+      reason: '等待L1/L2研判',
+      riskCategory: 'benign',
+      riskName: '待研判',
+      riskType: 'atomic',
+      riskScore: 0,
+    };
+    await this.ch.insertNow(pending);
+    this.upsertMemory(pending, false);
+    const job: FastJudgeJob = {
+      schemaVersion: 'anysentry.fast_judge_job.v1',
+      evaluationId,
+      policyVersion,
+      event: pending,
+      observerLine: line.slice(0, 64 * 1024),
+      policy: this.policy,
+      queuedAt: Date.now(),
+    };
+    try {
+      await this.queues.enqueueFast(job);
+      return pending;
+    } catch (error) {
+      const failed: JudgedEvent = {
+        ...pending,
+        decisionStatus: 'failed',
+        decisionUpdatedAt: Date.now(),
+        reason: '研判队列不可用: ' + (error instanceof Error ? error.message : String(error)).slice(0, 500),
+      };
+      await this.ch.insertNow(failed);
+      this.upsertMemory(failed, false);
+      throw error;
+    }
+  }
+
+
+  async applyAsyncResult(result: DecisionResultJob): Promise<void> {
+    const current = this.storeById.get(result.event.eventId);
+    if (current && (current.decisionUpdatedAt ?? current.at) >= result.completedAt) return;
+    const awaitingL3 = result.status === 'succeeded' && result.awaitingL3 === true;
+    let next: JudgedEvent;
+    if (result.decision) {
+      const decision = result.decision as SentryDecisionWithRisk;
+      const verdict = decision.verdict as Verdict;
+      const severity = decision.severity as Severity;
+      const risk = riskFromDecision(decision, result.event.eventKind);
+      next = {
+        ...result.event,
+        decisionStatus: awaitingL3 ? 'pending' : result.status,
+        evaluationId: result.evaluationId,
+        policyVersion: result.policyVersion,
+        decisionUpdatedAt: result.completedAt,
+        verdict,
+        tier: decision.tier as Tier,
+        severity,
+        reason: awaitingL3 ? decision.reason + ' [等待L3深判]' : decision.reason,
+        actionKind: decision.action?.kind,
+        actionTarget: decision.action?.target,
+        riskCategory: verdict === 'allow' ? 'benign' : risk.category,
+        riskName: verdict === 'allow' ? '正常' : risk.name,
+        riskType: risk.type,
+        riskScore: verdict === 'allow' ? 0 : SEVERITY_SCORE[severity],
+        latencyMs: Math.max(1, result.completedAt - result.startedAt),
+      };
+    } else {
+      next = {
+        ...(current ?? result.event),
+        decisionStatus: result.status,
+        evaluationId: result.evaluationId,
+        policyVersion: result.policyVersion,
+        decisionUpdatedAt: result.completedAt,
+        reason: result.stage + '研判' + result.status + ': ' + (result.error ?? 'unknown error'),
+        latencyMs: Math.max(1, result.completedAt - result.startedAt),
+      };
+    }
+    await this.ch.insertNow(next);
+    this.upsertMemory(next, !awaitingL3 && result.status === 'succeeded');
   }
 
   /** Judge one observer event against the live sentry policy and record it. Kinds sentry doesn't
@@ -359,6 +576,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       rawPreview: meta.rawPreview,
     } satisfies JudgedEventBase;
 
+    if (this.isInternalL3Invocation(line, base)) return this.recordInternalL3Activity(base);
     const d = this.sentry.evaluate(line) as SentryDecisionWithRisk | null;
     const producerFinding = producerReportedFinding(base);
     if (producerFinding) {
@@ -398,14 +616,36 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
+  private upsertMemory(rec: JudgedEvent, notify: boolean): JudgedEvent {
+    const current = this.storeById.get(rec.eventId);
+    if (current) Object.assign(current, rec);
+    else {
+      this.store.push(rec);
+      this.storeById.set(rec.eventId, rec);
+    }
+    if (this.store.length > this.MAX + this.TRIM_BATCH) {
+      for (const removed of this.store.splice(0, this.TRIM_BATCH)) {
+        if (this.storeById.get(removed.eventId) === removed) this.storeById.delete(removed.eventId);
+      }
+    }
+    const effective = current ?? rec;
+    if (notify) {
+      const incident = this.ingestIncident(effective);
+      this.alerting.observeEvent(effective);
+      if (incident) this.alerting.observeIncident(incident);
+    }
+    return effective;
+  }
+
   private push(rec: JudgedEvent): JudgedEvent {
-    this.store.push(rec);
-    if (this.store.length > this.MAX) this.store.shift();
-    const incident = this.ingestIncident(rec);
-    this.alerting.observeEvent(rec);
-    if (incident) this.alerting.observeIncident(incident);
-    this.ch.enqueue(rec); // durable write-through (batched); no-op if ClickHouse is unconfigured/down
-    return rec;
+    const normalized: JudgedEvent = {
+      ...rec,
+      decisionStatus: rec.decisionStatus ?? 'succeeded',
+      decisionUpdatedAt: rec.decisionUpdatedAt ?? Date.now(),
+    };
+    this.upsertMemory(normalized, true);
+    this.ch.enqueue(normalized);
+    return normalized;
   }
 
   private incidentId(e: JudgedEvent): string {

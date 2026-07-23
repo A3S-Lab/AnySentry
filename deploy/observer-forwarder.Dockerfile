@@ -8,4 +8,6 @@ FROM node:20-bookworm-slim AS nodebin
 FROM ghcr.io/a3s-lab/observer:latest
 COPY --from=nodebin /usr/local/bin/node /usr/local/bin/node
 COPY scripts/observer-forward.js /opt/observer-forward.js
+COPY scripts/observer-agent-attribution.js /opt/observer-agent-attribution.js
+COPY scripts/observer-event-dedup.js /opt/observer-event-dedup.js
 # The DaemonSet supplies the command: a3s-observer-collector | node /opt/observer-forward.js

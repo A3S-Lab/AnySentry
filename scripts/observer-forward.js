@@ -7,13 +7,14 @@
 // pause reading when at the cap — so memory stays flat and, under extreme load, the collector
 // (which drops on a slow consumer by design) sheds the excess rather than us OOMing.
 //
-// Noise filter: file access/delete on pseudo-filesystems (/sys cgroup mgmt by systemd/kubelet,
-// /proc, runtime dirs) is the dominant volume and never security-relevant for agents. Dropping it
-// here focuses the dashboard on real activity and cuts ingest load. Real paths (/home, /etc,
-// /workspace, credential files) are kept. Override the prefixes via FORWARD_DROP_PATHS.
+// Agent scope is fail-open for attribution: known Agent and unresolved events are forwarded, and
+// only events with a complete non-Agent PID ancestry are dropped. The legacy all/shadow modes also
+// remove pseudo-filesystem file noise; override those prefixes via FORWARD_DROP_PATHS.
 const http = require('node:http');
 const https = require('node:https');
 const readline = require('node:readline');
+const { AgentAttributor } = require('./observer-agent-attribution');
+const { ToolExecDeduper } = require('./observer-event-dedup');
 
 const target = new URL(process.env.ANYSENTRY_INGEST_URL || 'http://localhost:29653/security-center/ingest');
 function defaultHeartbeatUrl(ingestUrl) {
@@ -25,6 +26,9 @@ function defaultHeartbeatUrl(ingestUrl) {
 }
 
 const MAX_INFLIGHT = Number(process.env.FORWARD_MAX_INFLIGHT || 24);
+const FORWARD_SCOPE = ['agent', 'all', 'shadow'].includes(process.env.FORWARD_SCOPE)
+  ? process.env.FORWARD_SCOPE
+  : 'agent';
 const DROP_PATHS = (process.env.FORWARD_DROP_PATHS || '/sys/,/proc/,/run/,/dev/').split(',').map((s) => s.trim()).filter(Boolean);
 const COLLECTOR_ID = process.env.A3S_OBSERVER_COLLECTOR_ID || process.env.COLLECTOR_ID || process.env.HOSTNAME || '';
 const NODE_NAME = process.env.A3S_NODE_NAME || process.env.NODE_NAME || '';
@@ -37,11 +41,19 @@ const HEARTBEAT_SECS = Math.max(0, Number(process.env.ANYSENTRY_HEARTBEAT_SECS |
 const heartbeatTarget = new URL(process.env.ANYSENTRY_HEARTBEAT_URL || defaultHeartbeatUrl(target));
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_INFLIGHT });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_INFLIGHT });
+const attributor = new AgentAttributor();
+const bootstrap = attributor.seedFromProc();
+console.error(`[observer-forward] process snapshot: scanned=${bootstrap.scanned}; agent_roots=${bootstrap.roots}; agent_descendants=${bootstrap.descendants}`);
+const toolExecDeduper = new ToolExecDeduper({
+  windowMs: process.env.FORWARD_DEDUP_WINDOW_MS,
+  maxKeys: process.env.FORWARD_MAX_DEDUP_KEYS,
+});
 
 let inflight = 0;
 let outputDropped = 0;
 let errorCount = 0;
 let eventKindCounts = Object.create(null);
+let attributionCounts = { observed: 0, agent: 0, unknown: 0, filteredNonAgent: 0, deduplicated: 0 };
 let closing = false;
 let heartbeatTimer;
 const rl = readline.createInterface({ input: process.stdin });
@@ -126,7 +138,9 @@ function sendHeartbeat(done = () => {}) {
   const counts = eventKindCounts;
   const dropped = outputDropped;
   const errors = errorCount;
+  const classifications = attributionCounts;
   eventKindCounts = Object.create(null);
+  attributionCounts = { observed: 0, agent: 0, unknown: 0, filteredNonAgent: 0, deduplicated: 0 };
   outputDropped = 0;
   errorCount = 0;
   const status = dropped > 0 || errors > 0 ? 'degraded' : 'ok';
@@ -135,14 +149,14 @@ function sendHeartbeat(done = () => {}) {
     {
       collectorId: COLLECTOR_ID || undefined,
       nodeName: NODE_NAME || undefined,
-      mode: 'observer-forwarder',
+      mode: `observer-forwarder:${FORWARD_SCOPE}`,
       status,
       intervalSecs: HEARTBEAT_SECS,
       eventKindCounts: counts,
       queueDepth: inflight,
       outputDropped: dropped,
       errorCount: errors,
-      message: status === 'ok' ? undefined : `${dropped} output drops, ${errors} errors since last heartbeat`,
+      message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; agent=${classifications.agent}; unknown=${classifications.unknown}; filtered_non_agent=${classifications.filteredNonAgent}; deduplicated=${classifications.deduplicated}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
     },
     5000,
@@ -189,7 +203,17 @@ rl.on('line', (raw) => {
   if (!line) return;
   let o;
   try { o = JSON.parse(line); } catch { return; } // skip the collector's human log lines / partials
-  if (isNoise(o)) return;
+  attributionCounts.observed++;
+  if (toolExecDeduper.isDuplicate(o)) {
+    attributionCounts.deduplicated++;
+    return;
+  }
+  const classification = attributor.classify(o);
+  attributionCounts[classification.state === 'non_agent' ? 'filteredNonAgent' : classification.state]++;
+  if (FORWARD_SCOPE === 'agent' && classification.state === 'non_agent') return;
+  // Preserve the legacy pseudo-filesystem noise filter in all/shadow modes. In agent mode,
+  // unknown events must survive so incomplete lineage never becomes silent data loss.
+  if (FORWARD_SCOPE !== 'agent' && isNoise(o)) return;
   bumpEventKind(o);
 
   inflight++;
@@ -207,7 +231,13 @@ rl.on('line', (raw) => {
 
   postJson(
     target,
-    { line, ...(COLLECTOR_ID ? { collectorId: COLLECTOR_ID } : {}), ...(NODE_NAME ? { nodeName: NODE_NAME } : {}), ...sourceFields() },
+    {
+      line,
+      ...(classification.state === 'agent' ? { attribution: classification.attribution } : {}),
+      ...(COLLECTOR_ID ? { collectorId: COLLECTOR_ID } : {}),
+      ...(NODE_NAME ? { nodeName: NODE_NAME } : {}),
+      ...sourceFields(),
+    },
     5000,
     finish,
   );

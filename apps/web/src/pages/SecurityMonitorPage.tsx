@@ -67,6 +67,8 @@ import type { PolicyStatus } from "@/lib/api/security-center";
 import { settleAll } from "@/lib/settle-all";
 import { cn } from "@/lib/utils";
 
+type TimelineTierFilter = "all" | AgentEventListItem["tier"];
+
 type SecuritySectionKey =
   | "health"
   | "scan"
@@ -217,7 +219,7 @@ function formatRequestError(error: unknown) {
   return "请求失败";
 }
 
-async function loadSecurityDashboardData(filter: SecurityTimeFilter, timelineScope: TimelineScope, riskBreakdownScope: TimelineScope, decisionFunnelScope: TimelineScope, workspaceRiskScope: TimelineScope): Promise<SecurityDashboardData> {
+async function loadSecurityDashboardData(filter: SecurityTimeFilter, timelineScope: TimelineScope, timelineTier: TimelineTierFilter, riskBreakdownScope: TimelineScope, decisionFunnelScope: TimelineScope, workspaceRiskScope: TimelineScope): Promise<SecurityDashboardData> {
   const scanFilter = { ...filter, seriesPoints: 36 };
   const { data, errors } = await settleAll(
     {
@@ -229,7 +231,7 @@ async function loadSecurityDashboardData(filter: SecurityTimeFilter, timelineSco
       highestRisk: securityCenterApi.highestRiskSession(filter),
       decisionFunnel: securityCenterApi.decisionFunnel({ ...filter, scope: decisionFunnelScope }),
       workspaceRisk: securityCenterApi.workspaceRiskDistribution({ ...filter, scope: workspaceRiskScope }),
-      events: securityCenterApi.agentEvents({ ...filter, scope: timelineScope, limit: 36 }),
+      events: securityCenterApi.agentEvents({ ...filter, scope: timelineScope, ...(timelineTier === "all" ? {} : { tier: timelineTier }), limit: 36 }),
     },
     formatRequestError,
   );
@@ -1605,6 +1607,40 @@ function VerdictPill({ verdict }: { verdict: SecurityVerdict }) {
   );
 }
 
+const SENTRY_TIER_META: Record<AgentEventListItem["tier"], { label: string; title: string; className: string }> = {
+  Rules: { label: "L1", title: "L1 · 规则引擎", className: "border-zinc-600/60 bg-zinc-500/10 text-zinc-300" },
+  Llm: { label: "L2", title: "L2 · LLM 研判", className: "border-amber-500/40 bg-amber-500/10 text-amber-200" },
+  Agent: { label: "L3", title: "L3 · 智能体深判", className: "border-rose-500/40 bg-rose-500/10 text-rose-200" },
+};
+
+function SentryTierPill({ event }: { event: AgentEventListItem }) {
+  if (event.decisionStatus && event.decisionStatus !== "succeeded") {
+    const statusMeta = {
+      accepted: { label: "已接收", title: "事件已接收，等待进入研判队列", className: "border-sky-500/40 bg-sky-500/10 text-sky-200" },
+      pending: { label: event.tier === "Llm" ? "L2→L3" : "待研判", title: event.reason, className: "border-cyan-500/40 bg-cyan-500/10 text-cyan-200" },
+      running: { label: "研判中", title: "安全研判正在执行", className: "border-cyan-500/40 bg-cyan-500/10 text-cyan-200" },
+      failed: { label: "失败", title: event.reason, className: "border-rose-500/40 bg-rose-500/10 text-rose-200" },
+      timeout: { label: "超时", title: event.reason, className: "border-orange-500/40 bg-orange-500/10 text-orange-200" },
+    }[event.decisionStatus];
+    if (statusMeta) {
+      return (
+        <span title={statusMeta.title} className={cn("inline-flex h-6 min-w-10 items-center justify-center rounded border px-2 text-[10px] font-semibold", statusMeta.className)}>
+          {statusMeta.label}
+        </span>
+      );
+    }
+  }
+  const meta = SENTRY_TIER_META[event.tier];
+  return (
+    <span
+      title={meta.title}
+      className={cn("inline-flex h-6 min-w-10 items-center justify-center rounded border px-2 font-mono text-[11px] font-semibold", meta.className)}
+    >
+      {meta.label}
+    </span>
+  );
+}
+
 function TimelineScopeTabs({
   value,
   onChange,
@@ -1642,12 +1678,16 @@ function AgentEventTimelinePanel({
   events,
   error,
   scope,
+  tier,
   onScopeChange,
+  onTierChange,
 }: {
   events?: AgentEventList | null;
   error?: string;
   scope: TimelineScope;
+  tier: TimelineTierFilter;
   onScopeChange: (value: TimelineScope) => void;
+  onTierChange: (value: TimelineTierFilter) => void;
 }) {
   const items = events?.items ?? [];
 
@@ -1658,6 +1698,17 @@ function AgentEventTimelinePanel({
       action={
         <div className="flex items-center gap-3">
           <TimelineScopeTabs value={scope} onChange={onScopeChange} />
+          <Select value={tier} onValueChange={(value) => onTierChange(value as TimelineTierFilter)}>
+            <SelectTrigger className="h-8 w-[112px] border-white/10 bg-white/5 text-xs text-zinc-100" aria-label="筛选研判层级">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">全部研判</SelectItem>
+              <SelectItem value="Rules">L1</SelectItem>
+              <SelectItem value="Llm">L2</SelectItem>
+              <SelectItem value="Agent">L3</SelectItem>
+            </SelectContent>
+          </Select>
           <span className="text-xs text-zinc-500">{events ? `${formatNumber(events.total)} 条` : "--"}</span>
           <Link to="/events" className="text-xs text-teal-300 hover:text-teal-200">查看全部</Link>
         </div>
@@ -1669,21 +1720,22 @@ function AgentEventTimelinePanel({
           <EmptyState label="暂无事件明细" />
         ) : (
           <div className="overflow-x-auto">
-            <div className="grid min-w-[980px] grid-cols-[96px_88px_minmax(240px,1.4fr)_minmax(150px,0.9fr)_minmax(150px,0.9fr)_82px_76px] gap-3 border-b border-white/10 pb-2 text-xs text-zinc-500">
+            <div className="grid min-w-[1070px] grid-cols-[96px_88px_minmax(240px,1.4fr)_minmax(150px,0.9fr)_minmax(150px,0.9fr)_66px_82px_76px] gap-3 border-b border-white/10 pb-2 text-xs text-zinc-500">
               <span>时间</span>
               <span>类型</span>
               <span>事件</span>
               <span>智能体 / 会话</span>
               <span>Trace / Span</span>
+              <span className="text-center">研判</span>
               <span className="text-right">风险</span>
               <span className="text-center">处置</span>
             </div>
-            <div className="min-w-[980px] divide-y divide-white/8">
+            <div className="min-w-[1070px] divide-y divide-white/8">
               {items.map((event) => (
                 <Link
                   key={event.eventId}
                   to={eventDetailHref(event)}
-                  className="grid grid-cols-[96px_88px_minmax(240px,1.4fr)_minmax(150px,0.9fr)_minmax(150px,0.9fr)_82px_76px] items-center gap-3 py-3 text-sm"
+                  className="grid grid-cols-[96px_88px_minmax(240px,1.4fr)_minmax(150px,0.9fr)_minmax(150px,0.9fr)_66px_82px_76px] items-center gap-3 py-3 text-sm"
                 >
                   <span className="font-mono text-xs text-zinc-500">{formatDate(event.at)}</span>
                   <span className="flex min-w-0">
@@ -1706,6 +1758,9 @@ function AgentEventTimelinePanel({
                     <p className="truncate text-zinc-300" title={event.traceId}>{shortId(event.traceId)}</p>
                     <p className="mt-0.5 truncate text-zinc-600" title={event.spanId}>{shortId(event.spanId)}</p>
                   </div>
+                  <span className="flex justify-center">
+                    <SentryTierPill event={event} />
+                  </span>
                   <span className="text-right font-mono text-sm font-semibold tabular-nums text-zinc-100">
                     {formatNumber(event.riskScore, { maximumFractionDigits: 0 })}
                   </span>
@@ -1777,6 +1832,7 @@ function WorkspaceRiskPanel({
 export default function SecurityMonitorPage() {
   const [filter, setFilter] = useState<SecurityTimeFilter>(DEFAULT_FILTER);
   const [timelineScope, setTimelineScope] = useState<TimelineScope>("agent");
+  const [timelineTier, setTimelineTier] = useState<TimelineTierFilter>("all");
   const [riskBreakdownScope, setRiskBreakdownScope] = useState<TimelineScope>("agent");
   const [decisionFunnelScope, setDecisionFunnelScope] = useState<TimelineScope>("agent");
   const [workspaceRiskScope, setWorkspaceRiskScope] = useState<TimelineScope>("agent");
@@ -1794,8 +1850,8 @@ export default function SecurityMonitorPage() {
   }, [customEnd, customStart, filter.timeType]);
 
   const requestFilter = useMemo(() => filter, [filter]);
-  const { data, loading, refresh } = useRequest(() => loadSecurityDashboardData(requestFilter, timelineScope, riskBreakdownScope, decisionFunnelScope, workspaceRiskScope), {
-    refreshDeps: [requestFilter, timelineScope, riskBreakdownScope, decisionFunnelScope, workspaceRiskScope],
+  const { data, loading, refresh } = useRequest(() => loadSecurityDashboardData(requestFilter, timelineScope, timelineTier, riskBreakdownScope, decisionFunnelScope, workspaceRiskScope), {
+    refreshDeps: [requestFilter, timelineScope, timelineTier, riskBreakdownScope, decisionFunnelScope, workspaceRiskScope],
     pollingInterval: 10000,
     pollingWhenHidden: false,
   });
@@ -1892,7 +1948,14 @@ export default function SecurityMonitorPage() {
           </DashboardSection>
 
           <DashboardSection title="运行链路" icon={GitBranch}>
-            <AgentEventTimelinePanel events={data?.events} error={data?.errors.events} scope={timelineScope} onScopeChange={setTimelineScope} />
+            <AgentEventTimelinePanel
+              events={data?.events}
+              error={data?.errors.events}
+              scope={timelineScope}
+              tier={timelineTier}
+              onScopeChange={setTimelineScope}
+              onTierChange={setTimelineTier}
+            />
           </DashboardSection>
 
           <DashboardSection title="会话与工作区" icon={TerminalSquare}>
