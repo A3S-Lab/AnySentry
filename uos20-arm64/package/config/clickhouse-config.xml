@@ -1,0 +1,37 @@
+<clickhouse>
+  <listen_host replace="replace">127.0.0.1</listen_host>
+  <http_port>8123</http_port>
+  <path replace="replace">/var/lib/anysentry/clickhouse/</path>
+  <tmp_path replace="replace">/var/lib/anysentry/clickhouse/tmp/</tmp_path>
+  <user_files_path replace="replace">/var/lib/anysentry/clickhouse/user_files/</user_files_path>
+  <format_schema_path replace="replace">/var/lib/anysentry/clickhouse/format_schemas/</format_schema_path>
+  <user_directories replace="replace">
+    <users_xml>
+      <path>users.xml</path>
+    </users_xml>
+    <local_directory>
+      <path>/var/lib/anysentry/clickhouse/access/</path>
+    </local_directory>
+  </user_directories>
+
+  <!-- Sized for the customer's 16 CPU / 64 GiB host. -->
+  <max_server_memory_usage>8589934592</max_server_memory_usage>
+  <max_thread_pool_size>512</max_thread_pool_size>
+  <background_buffer_flush_schedule_pool_size>8</background_buffer_flush_schedule_pool_size>
+  <background_pool_size>16</background_pool_size>
+  <background_move_pool_size>4</background_move_pool_size>
+  <background_fetches_pool_size>4</background_fetches_pool_size>
+  <background_common_pool_size>4</background_common_pool_size>
+  <background_schedule_pool_size>32</background_schedule_pool_size>
+  <background_message_broker_schedule_pool_size>8</background_message_broker_schedule_pool_size>
+  <background_distributed_schedule_pool_size>8</background_distributed_schedule_pool_size>
+  <uncompressed_cache_size>536870912</uncompressed_cache_size>
+  <mark_cache_size>1073741824</mark_cache_size>
+  <logger>
+    <level>information</level>
+    <log replace="replace">/var/log/anysentry/clickhouse-server.log</log>
+    <errorlog replace="replace">/var/log/anysentry/clickhouse-server.err.log</errorlog>
+    <size>100M</size>
+    <count>3</count>
+  </logger>
+</clickhouse>

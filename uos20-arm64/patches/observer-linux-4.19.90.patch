@@ -1,0 +1,1179 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 13614fe..b0fcf0c 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -20,6 +20,7 @@ dependencies = [
+  "anyhow",
+  "aya",
+  "aya-build",
++ "bytes",
+  "libc",
+  "tokio",
+  "tracing",
+@@ -38,6 +39,14 @@ dependencies = [
+  "aya-ebpf",
+ ]
+ 
++[[package]]
++name = "a3s-observer-ebpf-legacy"
++version = "0.11.0"
++dependencies = [
++ "a3s-observer-common",
++ "aya-ebpf",
++]
++
+ [[package]]
+ name = "allocator-api2"
+ version = "0.2.21"
+@@ -71,6 +80,7 @@ dependencies = [
+  "object",
+  "once_cell",
+  "thiserror 1.0.69",
++ "tokio",
+ ]
+ 
+ [[package]]
+@@ -446,6 +456,16 @@ version = "1.15.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+ 
++[[package]]
++name = "socket2"
++version = "0.6.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
++dependencies = [
++ "libc",
++ "windows-sys",
++]
++
+ [[package]]
+ name = "syn"
+ version = "2.0.118"
+@@ -516,6 +536,7 @@ dependencies = [
+  "mio",
+  "pin-project-lite",
+  "signal-hook-registry",
++ "socket2",
+  "tokio-macros",
+  "windows-sys",
+ ]
+diff --git a/Cargo.toml b/Cargo.toml
+index e5e4af5..680145f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -9,7 +9,7 @@ repository = "https://github.com/A3S-Lab/Observer"
+ # Root crate = the light, language-agnostic contracts/model (builds anywhere).
+ # The eBPF/aya code lives in the collector + ebpf member crates (Linux-only).
+ [workspace]
+-members = ["a3s-observer-common", "a3s-observer-collector", "a3s-observer-ebpf"]
++members = ["a3s-observer-common", "a3s-observer-collector", "a3s-observer-ebpf", "a3s-observer-ebpf-legacy"]
+ # ebpf is a member so aya-build's `cargo build --package a3s-observer-ebpf` resolves,
+ # but it's kept out of default-members so a host `cargo build` never tries to compile
+ # the bpf-only crate for the host target.
+diff --git a/a3s-observer-collector/Cargo.toml b/a3s-observer-collector/Cargo.toml
+index d722722..76be029 100644
+--- a/a3s-observer-collector/Cargo.toml
++++ b/a3s-observer-collector/Cargo.toml
+@@ -5,15 +5,20 @@ edition = "2021"
+ license = "MIT"
+ description = "a3s-observer collector: loads the eBPF probes and exports enriched events."
+ 
++[features]
++default = []
++legacy-kernel-4-19 = ["aya/async_tokio", "dep:bytes"]
++
+ [dependencies]
+ a3s-observer = { path = ".." }
+ a3s-observer-common = { path = "../a3s-observer-common" }
+ aya = "0.13"
+ anyhow = "1"
+-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
++tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+ tracing = "0.1"
+ tracing-subscriber = "0.3"
+ libc = "0.2"
++bytes = { version = "1", optional = true }
+ 
+ [build-dependencies]
+ aya-build = "0.1"
+diff --git a/a3s-observer-collector/build.rs b/a3s-observer-collector/build.rs
+index f8b3ae8..9bf00d3 100644
+--- a/a3s-observer-collector/build.rs
++++ b/a3s-observer-collector/build.rs
+@@ -1,11 +1,31 @@
+-//! Compiles the sibling `a3s-observer-ebpf` crate to BPF bytecode (via bpf-linker, on
+-//! the nightly toolchain) and places the object in OUT_DIR for the loader to
+-//! `include_bytes_aligned!`.
++//! Places the selected BPF bytecode in OUT_DIR for `include_bytes_aligned!`.
+ use aya_build::{Package, Toolchain};
++use std::path::{Path, PathBuf};
++
++fn install_verified_legacy_object() -> anyhow::Result<()> {
++    println!("cargo:rerun-if-env-changed=A3S_LEGACY_BPF_OBJECT");
++    println!("cargo:rerun-if-changed=../a3s-observer-ebpf-legacy/src/probes.c");
++    let source = std::env::var("A3S_LEGACY_BPF_OBJECT").map_err(|_| {
++        anyhow::anyhow!(
++            "legacy-kernel-4-19 requires A3S_LEGACY_BPF_OBJECT; run scripts/build-legacy-bpf-object.sh first"
++        )
++    })?;
++    let source = Path::new(&source);
++    if !source.is_file() {
++        anyhow::bail!("A3S_LEGACY_BPF_OBJECT is not a file: {}", source.display());
++    }
++    let destination = PathBuf::from(std::env::var("OUT_DIR")?).join("probes-legacy");
++    std::fs::copy(source, &destination)?;
++    println!("cargo:rerun-if-changed={}", source.display());
++    Ok(())
++}
+ 
+ fn main() -> anyhow::Result<()> {
+     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
+     let ebpf_dir = format!("{manifest_dir}/../a3s-observer-ebpf");
++    if std::env::var_os("CARGO_FEATURE_LEGACY_KERNEL_4_19").is_some() {
++        return install_verified_legacy_object();
++    }
+     // aya_build doesn't emit rerun-if for the eBPF crate, so a source-only change to the probes
+     // would silently reuse stale bytecode. Track it explicitly.
+     println!("cargo:rerun-if-changed={ebpf_dir}/src");
+diff --git a/a3s-observer-collector/src/legacy.rs b/a3s-observer-collector/src/legacy.rs
+new file mode 100644
+index 0000000..05f24d8
+--- /dev/null
++++ b/a3s-observer-collector/src/legacy.rs
+@@ -0,0 +1,376 @@
++use super::{argv_of, cstr, emit, identity_for, peer_ip, process_context, CollectorMeta, Stats};
++use a3s_observer::{
++    read_ppid, AgentEvent, EnrichedEvent, Exporter, JsonExporter, KubeResolver, LogExporter,
++};
++use a3s_observer_common::{
++    ConnectEvent, ExecEvent, ExitEvent, FileEvent, SecEvent, FILE_DELETE_FLAG, SEC_BIND,
++    SEC_PTRACE, SEC_SETUID,
++};
++use anyhow::Context as _;
++use aya::{
++    maps::{perf::AsyncPerfEventArray, PerCpuArray},
++    programs::KProbe,
++    util::online_cpus,
++    Ebpf,
++};
++use bytes::BytesMut;
++use std::{
++    mem::size_of,
++    sync::{
++        atomic::{AtomicU64, Ordering},
++        Arc,
++    },
++    time::Duration,
++};
++use tokio::sync::mpsc;
++
++enum RawEvent {
++    Exec(Box<ExecEvent>),
++    Exit(ExitEvent),
++    Connect(ConnectEvent),
++    File(Box<FileEvent>),
++    Security(SecEvent),
++}
++
++pub(crate) async fn run() -> anyhow::Result<()> {
++    if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
++        println!(
++            "a3s-observer-collector {} backend=perf-kprobe-legacy",
++            env!("CARGO_PKG_VERSION")
++        );
++        return Ok(());
++    }
++    tracing_subscriber::fmt()
++        .with_writer(std::io::stderr)
++        .with_max_level(tracing::Level::INFO)
++        .init();
++
++    let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
++        env!("OUT_DIR"),
++        "/probes-legacy"
++    )))
++    .context("load Linux 4.19 legacy eBPF object")?;
++
++    let files = std::env::var_os("A3S_OBSERVER_FILES").is_some();
++    let mut attached = Vec::new();
++    attach_first(
++        &mut ebpf,
++        "legacy_exec",
++        &["__arm64_sys_execve"],
++        &mut attached,
++    );
++    attach_first(&mut ebpf, "legacy_exit", &["do_exit"], &mut attached);
++    attach_first(
++        &mut ebpf,
++        "legacy_connect",
++        &["__arm64_sys_connect"],
++        &mut attached,
++    );
++    attach_first(
++        &mut ebpf,
++        "legacy_setuid",
++        &["__arm64_sys_setuid"],
++        &mut attached,
++    );
++    attach_first(
++        &mut ebpf,
++        "legacy_ptrace",
++        &["__arm64_sys_ptrace"],
++        &mut attached,
++    );
++    attach_first(
++        &mut ebpf,
++        "legacy_bind",
++        &["__arm64_sys_bind"],
++        &mut attached,
++    );
++    if files {
++        attach_first(
++            &mut ebpf,
++            "legacy_openat",
++            &["__arm64_sys_openat"],
++            &mut attached,
++        );
++        attach_first(
++            &mut ebpf,
++            "legacy_unlinkat",
++            &["__arm64_sys_unlinkat"],
++            &mut attached,
++        );
++    }
++
++    let effective_probes = attached
++        .iter()
++        .filter(|name| {
++            matches!(
++                name.as_str(),
++                "legacy_exec" | "legacy_connect" | "legacy_openat"
++            )
++        })
++        .count();
++    if effective_probes == 0 {
++        anyhow::bail!("no effective legacy probes attached; refusing blind collector health");
++    }
++    tracing::info!(
++        backend = "perf-kprobe-legacy",
++        attached = attached.len(),
++        effective_probes,
++        probes = ?attached,
++        "legacy Observer probes attached"
++    );
++
++    let (tx, mut rx) = mpsc::channel(4096);
++    let perf_lost = Arc::new(AtomicU64::new(0));
++    spawn_perf(
++        &mut ebpf,
++        "EVENTS",
++        tx.clone(),
++        perf_lost.clone(),
++        wrap_exec,
++    )?;
++    spawn_perf(
++        &mut ebpf,
++        "EXIT_EVENTS",
++        tx.clone(),
++        perf_lost.clone(),
++        RawEvent::Exit,
++    )?;
++    spawn_perf(
++        &mut ebpf,
++        "CONNECT_EVENTS",
++        tx.clone(),
++        perf_lost.clone(),
++        RawEvent::Connect,
++    )?;
++    spawn_perf(
++        &mut ebpf,
++        "FILE_EVENTS",
++        tx.clone(),
++        perf_lost.clone(),
++        wrap_file,
++    )?;
++    spawn_perf(
++        &mut ebpf,
++        "SEC_EVENTS",
++        tx,
++        perf_lost.clone(),
++        RawEvent::Security,
++    )?;
++    let drops: PerCpuArray<_, u64> =
++        PerCpuArray::try_from(ebpf.take_map("DROPS").context("`DROPS` missing")?)?;
++
++    let exporter: Box<dyn Exporter> = if std::env::var_os("A3S_OBSERVER_JSON").is_some() {
++        Box::new(JsonExporter::new())
++    } else {
++        Box::new(LogExporter)
++    };
++    let resolver = KubeResolver;
++    let mut collector = CollectorMeta::from_env(files, false, attached.len());
++    collector.mode = "perf-kprobe-legacy".to_string();
++    collector.enabled_features = vec![
++        "exec".to_string(),
++        "process-exit".to_string(),
++        "network".to_string(),
++        "security".to_string(),
++    ];
++    if files {
++        collector.enabled_features.push("files".to_string());
++    }
++    let heartbeat_path = std::env::var("A3S_OBSERVER_HEARTBEAT")
++        .unwrap_or_else(|_| "/run/a3s-observer.alive".to_string());
++    let _ = std::fs::write(&heartbeat_path, b"ok");
++
++    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
++    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
++    let mut report = tokio::time::interval(Duration::from_secs(60));
++    report.tick().await;
++    let mut stats = Stats::default();
++    super::emit_collector_heartbeat(
++        exporter.as_ref(),
++        &collector,
++        0,
++        &stats,
++        0,
++        exporter.output_drops(),
++    );
++
++    loop {
++        tokio::select! {
++            _ = sigint.recv() => break,
++            _ = sigterm.recv() => break,
++            _ = report.tick() => {
++                let _ = std::fs::write(&heartbeat_path, b"ok");
++                let map_drops = drops.get(&0, 0).map(|values| values.iter().copied().sum()).unwrap_or(0);
++                let dropped = map_drops + perf_lost.load(Ordering::Relaxed);
++                super::emit_collector_heartbeat(exporter.as_ref(), &collector, 60, &stats, dropped, exporter.output_drops());
++                stats = Stats::default();
++            }
++            raw = rx.recv() => {
++                let Some(raw) = raw else { anyhow::bail!("legacy perf readers stopped"); };
++                handle_raw(exporter.as_ref(), &resolver, &mut stats, raw);
++            }
++        }
++    }
++    Ok(())
++}
++
++fn attach_first(ebpf: &mut Ebpf, program: &str, symbols: &[&str], attached: &mut Vec<String>) {
++    let Some(raw) = ebpf.program_mut(program) else {
++        tracing::warn!(program, "legacy probe program missing");
++        return;
++    };
++    let probe: &mut KProbe = match raw.try_into() {
++        Ok(probe) => probe,
++        Err(error) => {
++            tracing::warn!(program, error = %error, "legacy program type mismatch");
++            return;
++        }
++    };
++    if let Err(error) = probe.load() {
++        tracing::warn!(program, error = %error, "legacy probe load failed");
++        return;
++    }
++    for symbol in symbols {
++        match probe.attach(symbol, 0) {
++            Ok(_) => {
++                attached.push(program.to_string());
++                tracing::info!(program, symbol, "legacy probe attached");
++                return;
++            }
++            Err(error) => {
++                tracing::warn!(program, symbol, error = %error, "legacy symbol unavailable")
++            }
++        }
++    }
++}
++
++fn spawn_perf<T: Copy + Send + 'static>(
++    ebpf: &mut Ebpf,
++    map_name: &str,
++    tx: mpsc::Sender<RawEvent>,
++    lost: Arc<AtomicU64>,
++    wrap: fn(T) -> RawEvent,
++) -> anyhow::Result<()> {
++    let mut array = AsyncPerfEventArray::try_from(
++        ebpf.take_map(map_name)
++            .with_context(|| format!("`{map_name}` missing"))?,
++    )?;
++    for cpu in online_cpus().map_err(|(_, error)| error)? {
++        let mut buffer = array.open(cpu, Some(8))?;
++        let tx = tx.clone();
++        let lost = lost.clone();
++        tokio::spawn(async move {
++            let mut slots = (0..32)
++                .map(|_| BytesMut::with_capacity(size_of::<T>()))
++                .collect::<Vec<_>>();
++            loop {
++                let events = match buffer.read_events(&mut slots).await {
++                    Ok(events) => events,
++                    Err(error) => {
++                        tracing::error!(cpu, error = %error, "legacy perf reader failed");
++                        break;
++                    }
++                };
++                lost.fetch_add(events.lost as u64, Ordering::Relaxed);
++                for slot in slots.iter().take(events.read) {
++                    if let Some(value) = read_value::<T>(slot) {
++                        if tx.send(wrap(value)).await.is_err() {
++                            return;
++                        }
++                    }
++                }
++            }
++        });
++    }
++    Ok(())
++}
++
++fn read_value<T: Copy>(bytes: &[u8]) -> Option<T> {
++    (bytes.len() >= size_of::<T>())
++        .then(|| unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
++}
++
++fn wrap_exec(event: ExecEvent) -> RawEvent {
++    RawEvent::Exec(Box::new(event))
++}
++
++fn wrap_file(event: FileEvent) -> RawEvent {
++    RawEvent::File(Box::new(event))
++}
++
++fn handle_raw(exporter: &dyn Exporter, resolver: &KubeResolver, stats: &mut Stats, raw: RawEvent) {
++    let enriched = match raw {
++        RawEvent::Exec(ev) => EnrichedEvent {
++            identity: identity_for(resolver, ev.pid, &ev.comm),
++            process: Some(process_context(ev.pid, &ev.comm)),
++            provider: None,
++            event: AgentEvent::ToolExec {
++                pid: ev.pid,
++                ppid: read_ppid(ev.pid),
++                uid: ev.uid,
++                argv: argv_of(&ev),
++                cwd: super::read_cwd(ev.pid),
++            },
++        },
++        RawEvent::Exit(ev) => EnrichedEvent {
++            identity: identity_for(resolver, ev.pid, &ev.comm),
++            process: Some(process_context(ev.pid, &ev.comm)),
++            provider: None,
++            event: AgentEvent::ProcessExit {
++                pid: ev.pid,
++                exit_code: ev.exit_code,
++                signal: ev.signal,
++            },
++        },
++        RawEvent::Connect(ev) => EnrichedEvent {
++            identity: identity_for(resolver, ev.pid, &ev.comm),
++            process: Some(process_context(ev.pid, &ev.comm)),
++            provider: None,
++            event: AgentEvent::Egress {
++                pid: ev.pid,
++                sni: None,
++                peer: peer_ip(&ev),
++                port: ev.port,
++                bytes: 0,
++            },
++        },
++        RawEvent::File(ev) => {
++            let path = cstr(&ev.path);
++            if ev.flags == FILE_DELETE_FLAG {
++                EnrichedEvent {
++                    identity: identity_for(resolver, ev.pid, &ev.comm),
++                    process: Some(process_context(ev.pid, &ev.comm)),
++                    provider: None,
++                    event: AgentEvent::FileDelete { pid: ev.pid, path },
++                }
++            } else {
++                EnrichedEvent {
++                    identity: identity_for(resolver, ev.pid, &ev.comm),
++                    process: Some(process_context(ev.pid, &ev.comm)),
++                    provider: None,
++                    event: AgentEvent::FileAccess {
++                        pid: ev.pid,
++                        path,
++                        write: true,
++                    },
++                }
++            }
++        }
++        RawEvent::Security(ev) => EnrichedEvent {
++            identity: identity_for(resolver, ev.pid, &ev.comm),
++            process: Some(process_context(ev.pid, &ev.comm)),
++            provider: None,
++            event: AgentEvent::SecurityAction {
++                pid: ev.pid,
++                kind: match ev.kind {
++                    SEC_SETUID => "setuid-root",
++                    SEC_PTRACE => "ptrace",
++                    SEC_BIND => "bind",
++                    _ => "unknown",
++                },
++                detail: ev.detail,
++            },
++        },
++    };
++    emit(exporter, stats, enriched);
++}
+diff --git a/a3s-observer-collector/src/main.rs b/a3s-observer-collector/src/main.rs
+index f380c54..9c5af02 100644
+--- a/a3s-observer-collector/src/main.rs
++++ b/a3s-observer-collector/src/main.rs
+@@ -1,3 +1,5 @@
++#![cfg_attr(feature = "legacy-kernel-4-19", allow(dead_code, unused_imports))]
++
+ //! a3s-observer collector — loads the eBPF probes, pumps the ring buffers, and emits
+ //! enriched events through the [`Exporter`] contract.
+ //!
+@@ -24,6 +26,10 @@ use std::collections::{HashMap, HashSet};
+ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+ use std::time::Duration;
+ 
++#[cfg(feature = "legacy-kernel-4-19")]
++mod legacy;
++
++#[cfg(not(feature = "legacy-kernel-4-19"))]
+ #[tokio::main]
+ async fn main() -> anyhow::Result<()> {
+     match std::env::args().nth(1).as_deref() {
+@@ -475,6 +481,12 @@ async fn main() -> anyhow::Result<()> {
+     Ok(())
+ }
+ 
++#[cfg(feature = "legacy-kernel-4-19")]
++#[tokio::main]
++async fn main() -> anyhow::Result<()> {
++    legacy::run().await
++}
++
+ // ponytail: peer IP arrives with the flow probe (#5); SNI alone identifies the provider.
+ const UNKNOWN_PEER: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+ 
+diff --git a/a3s-observer-ebpf-legacy/Cargo.toml b/a3s-observer-ebpf-legacy/Cargo.toml
+new file mode 100644
+index 0000000..ebc9f16
+--- /dev/null
++++ b/a3s-observer-ebpf-legacy/Cargo.toml
+@@ -0,0 +1,14 @@
++[package]
++name = "a3s-observer-ebpf-legacy"
++version = "0.11.0"
++edition = "2021"
++license = "MIT"
++publish = false
++
++[dependencies]
++aya-ebpf = "0.1"
++a3s-observer-common = { path = "../a3s-observer-common" }
++
++[[bin]]
++name = "probes-legacy"
++path = "src/main.rs"
+diff --git a/a3s-observer-ebpf-legacy/src/main.rs b/a3s-observer-ebpf-legacy/src/main.rs
+new file mode 100644
+index 0000000..ddfb98a
+--- /dev/null
++++ b/a3s-observer-ebpf-legacy/src/main.rs
+@@ -0,0 +1,268 @@
++#![no_std]
++#![no_main]
++
++use a3s_observer_common::{
++    ConnectEvent, ExecEvent, ExitEvent, FileEvent, SecEvent, ARGV_SLOTS, ARG_LEN, FILE_DELETE_FLAG,
++    PATH_SNAP_LEN, SEC_BIND, SEC_PTRACE, SEC_SETUID,
++};
++use aya_ebpf::{
++    helpers::{
++        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
++        gen::{bpf_probe_read, bpf_probe_read_str},
++    },
++    macros::{kprobe, map},
++    maps::{PerCpuArray, PerfEventArray},
++    programs::ProbeContext,
++};
++
++#[map]
++static EVENTS: PerfEventArray<ExecEvent> = PerfEventArray::new(0);
++#[map]
++static EXIT_EVENTS: PerfEventArray<ExitEvent> = PerfEventArray::new(0);
++#[map]
++static CONNECT_EVENTS: PerfEventArray<ConnectEvent> = PerfEventArray::new(0);
++#[map]
++static FILE_EVENTS: PerfEventArray<FileEvent> = PerfEventArray::new(0);
++#[map]
++static SEC_EVENTS: PerfEventArray<SecEvent> = PerfEventArray::new(0);
++
++// ExecEvent is larger than the 512-byte BPF stack. Per-CPU scratch slots also keep concurrent
++// events isolated without requiring map locks on the target's 16 CPUs.
++#[map]
++static EXEC_SCRATCH: PerCpuArray<ExecEvent> = PerCpuArray::with_max_entries(1, 0);
++#[map]
++static EXIT_SCRATCH: PerCpuArray<ExitEvent> = PerCpuArray::with_max_entries(1, 0);
++#[map]
++static CONNECT_SCRATCH: PerCpuArray<ConnectEvent> = PerCpuArray::with_max_entries(1, 0);
++#[map]
++static FILE_SCRATCH: PerCpuArray<FileEvent> = PerCpuArray::with_max_entries(1, 0);
++#[map]
++static SEC_SCRATCH: PerCpuArray<SecEvent> = PerCpuArray::with_max_entries(1, 0);
++#[map]
++static DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
++
++fn dropped() {
++    unsafe {
++        if let Some(value) = DROPS.get_ptr_mut(0) {
++            *value = (*value).wrapping_add(1);
++        }
++    }
++}
++
++unsafe fn read_value(src: u64) -> Option<u64> {
++    let mut value = 0u64;
++    (bpf_probe_read(
++        &mut value as *mut _ as *mut core::ffi::c_void,
++        8,
++        src as *const core::ffi::c_void,
++    ) == 0)
++        .then_some(value)
++}
++
++unsafe fn read_bytes(src: u64, dst: *mut u8, len: u32) -> bool {
++    bpf_probe_read(
++        dst as *mut core::ffi::c_void,
++        len,
++        src as *const core::ffi::c_void,
++    ) == 0
++}
++
++unsafe fn read_string(src: u64, dst: *mut u8, len: u32) {
++    let _ = bpf_probe_read_str(
++        dst as *mut core::ffi::c_void,
++        len,
++        src as *const core::ffi::c_void,
++    );
++}
++
++// Linux ARM64 syscall wrappers receive one `struct pt_regs *`; x0..x5 are the syscall arguments.
++fn syscall_arg(ctx: &ProbeContext, index: usize) -> Option<u64> {
++    let regs = ctx.arg::<u64>(0)?;
++    unsafe { read_value(regs + (index as u64 * 8)) }
++}
++
++#[kprobe]
++pub fn legacy_exec(ctx: ProbeContext) -> u32 {
++    try_exec(&ctx).unwrap_or(0)
++}
++
++fn try_exec(ctx: &ProbeContext) -> Result<u32, i64> {
++    let filename = syscall_arg(ctx, 0).unwrap_or(0);
++    let argv = syscall_arg(ctx, 1).unwrap_or(0);
++    if filename == 0 {
++        return Ok(0);
++    }
++    let Some(ev) = EXEC_SCRATCH.get_ptr_mut(0) else {
++        dropped();
++        return Ok(0);
++    };
++    unsafe {
++        let id = bpf_get_current_pid_tgid();
++        (*ev).pid = (id >> 32) as u32;
++        (*ev).ppid = 0;
++        (*ev).uid = bpf_get_current_uid_gid() as u32;
++        (*ev).argc = 0;
++        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
++        (*ev).filename = [0; 128];
++        (*ev).args = [[0; ARG_LEN]; ARGV_SLOTS];
++        read_string(filename, (*ev).filename.as_mut_ptr(), 128);
++        if argv != 0 {
++            for i in 0..ARGV_SLOTS {
++                let Some(arg) = read_value(argv + (i as u64 * 8)) else {
++                    break;
++                };
++                if arg == 0 {
++                    break;
++                }
++                read_string(arg, (*ev).args[i].as_mut_ptr(), ARG_LEN as u32);
++                (*ev).argc += 1;
++            }
++        }
++        EVENTS.output(ctx, &*ev, 0);
++    }
++    Ok(0)
++}
++
++#[kprobe]
++pub fn legacy_exit(ctx: ProbeContext) -> u32 {
++    let id = bpf_get_current_pid_tgid();
++    if (id >> 32) as u32 != id as u32 {
++        return 0;
++    }
++    let Some(ev) = EXIT_SCRATCH.get_ptr_mut(0) else {
++        dropped();
++        return 0;
++    };
++    let code = ctx.arg::<u64>(0).unwrap_or(0);
++    unsafe {
++        (*ev).pid = (id >> 32) as u32;
++        (*ev).exit_code = ((code >> 8) & 0xff) as u32;
++        (*ev).signal = (code & 0x7f) as u32;
++        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
++        EXIT_EVENTS.output(&ctx, &*ev, 0);
++    }
++    0
++}
++
++#[kprobe]
++pub fn legacy_connect(ctx: ProbeContext) -> u32 {
++    let fd = syscall_arg(&ctx, 0).unwrap_or(0);
++    let sockaddr = syscall_arg(&ctx, 1).unwrap_or(0);
++    let addrlen = syscall_arg(&ctx, 2).unwrap_or(0);
++    if sockaddr == 0 || addrlen < 8 {
++        return 0;
++    }
++    let mut family_bytes = [0u8; 2];
++    if !unsafe { read_bytes(sockaddr, family_bytes.as_mut_ptr(), 2) } {
++        return 0;
++    }
++    let family = u16::from_ne_bytes(family_bytes);
++    if family != 2 && family != 10 {
++        return 0;
++    }
++    let Some(ev) = CONNECT_SCRATCH.get_ptr_mut(0) else {
++        dropped();
++        return 0;
++    };
++    unsafe {
++        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
++        (*ev).fd = fd as u32;
++        (*ev).family = family;
++        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
++        let mut port = [0u8; 2];
++        let _ = read_bytes(sockaddr + 2, port.as_mut_ptr(), 2);
++        (*ev).port = u16::from_be_bytes(port);
++        (*ev).addr = [0; 16];
++        let offset = if family == 2 { 4 } else { 8 };
++        let len = if family == 2 { 4 } else { 16 };
++        let _ = read_bytes(sockaddr + offset, (*ev).addr.as_mut_ptr(), len);
++        CONNECT_EVENTS.output(&ctx, &*ev, 0);
++    }
++    0
++}
++
++fn emit_file(ctx: &ProbeContext, path: u64, flags: u32) {
++    if path == 0 {
++        return;
++    }
++    let Some(ev) = FILE_SCRATCH.get_ptr_mut(0) else {
++        dropped();
++        return;
++    };
++    unsafe {
++        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
++        (*ev).flags = flags;
++        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
++        (*ev).path = [0; PATH_SNAP_LEN];
++        read_string(path, (*ev).path.as_mut_ptr(), PATH_SNAP_LEN as u32);
++        FILE_EVENTS.output(ctx, &*ev, 0);
++    }
++}
++
++#[kprobe]
++pub fn legacy_openat(ctx: ProbeContext) -> u32 {
++    let path = syscall_arg(&ctx, 1).unwrap_or(0);
++    let flags = syscall_arg(&ctx, 2).unwrap_or(0) as u32;
++    if flags & 0x3 != 0 {
++        emit_file(&ctx, path, flags);
++    }
++    0
++}
++
++#[kprobe]
++pub fn legacy_unlinkat(ctx: ProbeContext) -> u32 {
++    emit_file(&ctx, syscall_arg(&ctx, 1).unwrap_or(0), FILE_DELETE_FLAG);
++    0
++}
++
++fn emit_security(ctx: &ProbeContext, kind: u32, detail: u64) {
++    let Some(ev) = SEC_SCRATCH.get_ptr_mut(0) else {
++        dropped();
++        return;
++    };
++    unsafe {
++        (*ev).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
++        (*ev).kind = kind;
++        (*ev).detail = detail;
++        (*ev).comm = bpf_get_current_comm().unwrap_or_default();
++        SEC_EVENTS.output(ctx, &*ev, 0);
++    }
++}
++
++#[kprobe]
++pub fn legacy_setuid(ctx: ProbeContext) -> u32 {
++    let target = syscall_arg(&ctx, 0).unwrap_or(u64::MAX) as u32;
++    if target == 0 && bpf_get_current_uid_gid() as u32 != 0 {
++        emit_security(&ctx, SEC_SETUID, 0);
++    }
++    0
++}
++
++#[kprobe]
++pub fn legacy_ptrace(ctx: ProbeContext) -> u32 {
++    let request = syscall_arg(&ctx, 0).unwrap_or(0);
++    if request == 16 || request == 0x4206 {
++        emit_security(&ctx, SEC_PTRACE, syscall_arg(&ctx, 1).unwrap_or(0));
++    }
++    0
++}
++
++#[kprobe]
++pub fn legacy_bind(ctx: ProbeContext) -> u32 {
++    let sockaddr = syscall_arg(&ctx, 1).unwrap_or(0);
++    if sockaddr != 0 {
++        let mut port = [0u8; 2];
++        if unsafe { read_bytes(sockaddr + 2, port.as_mut_ptr(), 2) } {
++            let port = u16::from_be_bytes(port);
++            if port != 0 {
++                emit_security(&ctx, SEC_BIND, port as u64);
++            }
++        }
++    }
++    0
++}
++
++#[panic_handler]
++fn panic(_: &core::panic::PanicInfo) -> ! {
++    unsafe { core::hint::unreachable_unchecked() }
++}
+diff --git a/a3s-observer-ebpf-legacy/src/probes.c b/a3s-observer-ebpf-legacy/src/probes.c
+new file mode 100644
+index 0000000..d609dc9
+--- /dev/null
++++ b/a3s-observer-ebpf-legacy/src/probes.c
+@@ -0,0 +1,325 @@
++#define SEC(name) __attribute__((section(name), used))
++#define INLINE static __attribute__((always_inline)) inline
++
++typedef unsigned char u8;
++typedef unsigned short u16;
++typedef unsigned int u32;
++typedef unsigned long long u64;
++
++enum {
++    BPF_MAP_TYPE_PERF_EVENT_ARRAY = 4,
++    BPF_MAP_TYPE_PERCPU_ARRAY = 6,
++};
++
++struct bpf_map_def {
++    u32 type;
++    u32 key_size;
++    u32 value_size;
++    u32 max_entries;
++    u32 map_flags;
++};
++
++struct pt_regs {
++    u64 regs[31];
++    u64 sp;
++    u64 pc;
++    u64 pstate;
++};
++
++#define ARGV_SLOTS 12
++#define ARG_LEN 128
++#define PATH_SNAP_LEN 256
++#define FILE_DELETE_FLAG 0xffffffffU
++#define SEC_SETUID 1
++#define SEC_PTRACE 2
++#define SEC_BIND 3
++#define BPF_F_CURRENT_CPU 0xffffffffULL
++#define UOS_KERNEL_VERSION_4_19_90 0x0004135aU
++
++struct exec_event {
++    u32 pid;
++    u32 ppid;
++    u32 uid;
++    u32 argc;
++    u8 comm[16];
++    u8 filename[128];
++    u8 args[ARGV_SLOTS][ARG_LEN];
++};
++
++struct exit_event {
++    u32 pid;
++    u32 exit_code;
++    u32 signal;
++    u8 comm[16];
++};
++
++struct connect_event {
++    u32 pid;
++    u32 fd;
++    u16 family;
++    u16 port;
++    u8 addr[16];
++    u8 comm[16];
++};
++
++struct file_event {
++    u32 pid;
++    u32 flags;
++    u8 comm[16];
++    u8 path[PATH_SNAP_LEN];
++};
++
++struct sec_event {
++    u32 pid;
++    u32 kind;
++    u64 detail;
++    u8 comm[16];
++};
++
++_Static_assert(sizeof(struct exec_event) == 1696, "exec_event ABI mismatch");
++_Static_assert(sizeof(struct exit_event) == 28, "exit_event ABI mismatch");
++_Static_assert(sizeof(struct connect_event) == 44, "connect_event ABI mismatch");
++_Static_assert(sizeof(struct file_event) == 280, "file_event ABI mismatch");
++_Static_assert(sizeof(struct sec_event) == 32, "sec_event ABI mismatch");
++
++#define PERF_MAP(name) \
++    struct bpf_map_def SEC("maps") name = { \
++        .type = BPF_MAP_TYPE_PERF_EVENT_ARRAY, .key_size = 4, .value_size = 4 \
++    }
++#define SCRATCH_MAP(name, event_type) \
++    struct bpf_map_def SEC("maps") name = { \
++        .type = BPF_MAP_TYPE_PERCPU_ARRAY, .key_size = 4, \
++        .value_size = sizeof(event_type), .max_entries = 1 \
++    }
++
++PERF_MAP(EVENTS);
++PERF_MAP(EXIT_EVENTS);
++PERF_MAP(CONNECT_EVENTS);
++PERF_MAP(FILE_EVENTS);
++PERF_MAP(SEC_EVENTS);
++SCRATCH_MAP(EXEC_SCRATCH, struct exec_event);
++SCRATCH_MAP(EXIT_SCRATCH, struct exit_event);
++SCRATCH_MAP(CONNECT_SCRATCH, struct connect_event);
++SCRATCH_MAP(FILE_SCRATCH, struct file_event);
++SCRATCH_MAP(SEC_SCRATCH, struct sec_event);
++SCRATCH_MAP(DROPS, u64);
++
++/* UOS reports 4.19.0 in uname but its BPF KProbe gate requires 4.19.90. */
++u32 A3S_KERNEL_VERSION SEC("version") = UOS_KERNEL_VERSION_4_19_90;
++
++static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
++static long (*bpf_probe_read)(void *dst, u32 size, const void *src) = (void *)4;
++static u64 (*bpf_get_current_pid_tgid)(void) = (void *)14;
++static u64 (*bpf_get_current_uid_gid)(void) = (void *)15;
++static long (*bpf_get_current_comm)(void *buf, u32 size) = (void *)16;
++static long (*bpf_perf_event_output)(void *ctx, void *map, u64 flags,
++                                     const void *data, u64 size) = (void *)25;
++static long (*bpf_probe_read_str)(void *dst, u32 size, const void *src) = (void *)45;
++
++INLINE void count_drop(void) {
++    u32 key = 0;
++    u64 *value = bpf_map_lookup_elem(&DROPS, &key);
++    if (value)
++        *value += 1;
++}
++
++INLINE void *scratch(void *map) {
++    u32 key = 0;
++    return bpf_map_lookup_elem(map, &key);
++}
++
++INLINE u64 syscall_arg(struct pt_regs *ctx, u32 index) {
++    struct pt_regs *syscall_regs = (struct pt_regs *)ctx->regs[0];
++    u64 value = 0;
++    if (syscall_regs)
++        bpf_probe_read(&value, sizeof(value), &syscall_regs->regs[index]);
++    return value;
++}
++
++INLINE void output(void *ctx, void *map, const void *event, u64 size) {
++    if (bpf_perf_event_output(ctx, map, BPF_F_CURRENT_CPU, event, size) < 0)
++        count_drop();
++}
++
++#define READ_EXEC_ARG(index) \
++    arg = 0; \
++    if (bpf_probe_read(&arg, sizeof(arg), (const void *)(argv + ((index) * 8))) < 0 || arg == 0) \
++        goto submit_exec; \
++    event->args[(index)][0] = 0; \
++    bpf_probe_read_str(event->args[(index)], ARG_LEN, (const void *)arg); \
++    event->argc = (index) + 1
++
++SEC("kprobe")
++int legacy_exec(struct pt_regs *ctx) {
++    const u64 filename = syscall_arg(ctx, 0);
++    const u64 argv = syscall_arg(ctx, 1);
++    struct exec_event *event;
++    u64 arg;
++
++    if (!filename)
++        return 0;
++    event = scratch(&EXEC_SCRATCH);
++    if (!event) {
++        count_drop();
++        return 0;
++    }
++    event->pid = (u32)(bpf_get_current_pid_tgid() >> 32);
++    event->ppid = 0;
++    event->uid = (u32)bpf_get_current_uid_gid();
++    event->argc = 0;
++    event->filename[0] = 0;
++    bpf_get_current_comm(event->comm, sizeof(event->comm));
++    bpf_probe_read_str(event->filename, sizeof(event->filename), (const void *)filename);
++    if (!argv)
++        goto submit_exec;
++    READ_EXEC_ARG(0);
++    READ_EXEC_ARG(1);
++    READ_EXEC_ARG(2);
++    READ_EXEC_ARG(3);
++    READ_EXEC_ARG(4);
++    READ_EXEC_ARG(5);
++    READ_EXEC_ARG(6);
++    READ_EXEC_ARG(7);
++    READ_EXEC_ARG(8);
++    READ_EXEC_ARG(9);
++    READ_EXEC_ARG(10);
++    READ_EXEC_ARG(11);
++
++submit_exec:
++    output(ctx, &EVENTS, event, sizeof(*event));
++    return 0;
++}
++
++SEC("kprobe")
++int legacy_exit(struct pt_regs *ctx) {
++    const u64 id = bpf_get_current_pid_tgid();
++    const u64 code = ctx->regs[0];
++    struct exit_event *event;
++    if ((u32)(id >> 32) != (u32)id)
++        return 0;
++    event = scratch(&EXIT_SCRATCH);
++    if (!event) {
++        count_drop();
++        return 0;
++    }
++    event->pid = (u32)(id >> 32);
++    event->exit_code = (u32)((code >> 8) & 0xff);
++    event->signal = (u32)(code & 0x7f);
++    bpf_get_current_comm(event->comm, sizeof(event->comm));
++    output(ctx, &EXIT_EVENTS, event, sizeof(*event));
++    return 0;
++}
++
++SEC("kprobe")
++int legacy_connect(struct pt_regs *ctx) {
++    const u64 fd = syscall_arg(ctx, 0);
++    const u64 sockaddr = syscall_arg(ctx, 1);
++    const u64 addrlen = syscall_arg(ctx, 2);
++    struct connect_event *event;
++    u16 family = 0;
++    u16 network_port = 0;
++    if (!sockaddr || addrlen < 8)
++        return 0;
++    if (bpf_probe_read(&family, sizeof(family), (const void *)sockaddr) < 0)
++        return 0;
++    if (family != 2 && family != 10)
++        return 0;
++    event = scratch(&CONNECT_SCRATCH);
++    if (!event) {
++        count_drop();
++        return 0;
++    }
++    event->pid = (u32)(bpf_get_current_pid_tgid() >> 32);
++    event->fd = (u32)fd;
++    event->family = family;
++    bpf_probe_read(&network_port, sizeof(network_port), (const void *)(sockaddr + 2));
++    event->port = __builtin_bswap16(network_port);
++    event->addr[0] = 0; event->addr[1] = 0; event->addr[2] = 0; event->addr[3] = 0;
++    event->addr[4] = 0; event->addr[5] = 0; event->addr[6] = 0; event->addr[7] = 0;
++    event->addr[8] = 0; event->addr[9] = 0; event->addr[10] = 0; event->addr[11] = 0;
++    event->addr[12] = 0; event->addr[13] = 0; event->addr[14] = 0; event->addr[15] = 0;
++    if (family == 2)
++        bpf_probe_read(event->addr, 4, (const void *)(sockaddr + 4));
++    else
++        bpf_probe_read(event->addr, 16, (const void *)(sockaddr + 8));
++    bpf_get_current_comm(event->comm, sizeof(event->comm));
++    output(ctx, &CONNECT_EVENTS, event, sizeof(*event));
++    return 0;
++}
++
++INLINE void emit_file(struct pt_regs *ctx, u64 path, u32 flags) {
++    struct file_event *event;
++    if (!path)
++        return;
++    event = scratch(&FILE_SCRATCH);
++    if (!event) {
++        count_drop();
++        return;
++    }
++    event->pid = (u32)(bpf_get_current_pid_tgid() >> 32);
++    event->flags = flags;
++    event->path[0] = 0;
++    bpf_get_current_comm(event->comm, sizeof(event->comm));
++    bpf_probe_read_str(event->path, sizeof(event->path), (const void *)path);
++    output(ctx, &FILE_EVENTS, event, sizeof(*event));
++}
++
++SEC("kprobe")
++int legacy_openat(struct pt_regs *ctx) {
++    const u32 flags = (u32)syscall_arg(ctx, 2);
++    if ((flags & 3) != 0)
++        emit_file(ctx, syscall_arg(ctx, 1), flags);
++    return 0;
++}
++
++SEC("kprobe")
++int legacy_unlinkat(struct pt_regs *ctx) {
++    emit_file(ctx, syscall_arg(ctx, 1), FILE_DELETE_FLAG);
++    return 0;
++}
++
++INLINE void emit_security(struct pt_regs *ctx, u32 kind, u64 detail) {
++    struct sec_event *event = scratch(&SEC_SCRATCH);
++    if (!event) {
++        count_drop();
++        return;
++    }
++    event->pid = (u32)(bpf_get_current_pid_tgid() >> 32);
++    event->kind = kind;
++    event->detail = detail;
++    bpf_get_current_comm(event->comm, sizeof(event->comm));
++    output(ctx, &SEC_EVENTS, event, sizeof(*event));
++}
++
++SEC("kprobe")
++int legacy_setuid(struct pt_regs *ctx) {
++    const u32 target = (u32)syscall_arg(ctx, 0);
++    if (target == 0 && (u32)bpf_get_current_uid_gid() != 0)
++        emit_security(ctx, SEC_SETUID, 0);
++    return 0;
++}
++
++SEC("kprobe")
++int legacy_ptrace(struct pt_regs *ctx) {
++    const u64 request = syscall_arg(ctx, 0);
++    if (request == 16 || request == 0x4206)
++        emit_security(ctx, SEC_PTRACE, syscall_arg(ctx, 1));
++    return 0;
++}
++
++SEC("kprobe")
++int legacy_bind(struct pt_regs *ctx) {
++    const u64 sockaddr = syscall_arg(ctx, 1);
++    u16 network_port = 0;
++    u16 port;
++    if (!sockaddr)
++        return 0;
++    if (bpf_probe_read(&network_port, sizeof(network_port), (const void *)(sockaddr + 2)) < 0)
++        return 0;
++    port = __builtin_bswap16(network_port);
++    if (port)
++        emit_security(ctx, SEC_BIND, port);
++    return 0;
++}
++
++char LICENSE[] SEC("license") = "GPL";
