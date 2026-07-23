@@ -154,8 +154,8 @@ export function buildAcl(c: PolicyConfig, secrets: { llmApiKey?: string } = {}):
 }
 
 /** Build the API/Fast Judge policy without an in-process L3 agent. */
-export function buildFastAcl(c: PolicyConfig): string {
-  return buildAcl({ ...c, agent: null, speculate: 'off' });
+export function buildFastAcl(c: PolicyConfig, secrets: { llmApiKey?: string } = {}): string {
+  return buildAcl({ ...c, agent: null, speculate: 'off' }, secrets);
 }
 
 /** Which tiers the dashboard should show (`如果没配置就前端不展示`). L1 is always active (built-ins). */

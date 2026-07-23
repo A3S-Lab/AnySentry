@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 const require = createRequire(import.meta.url);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const policyModule = require(path.join(root, 'apps/api/dist/security-monitoring/policy-config.js'));
-const { buildAcl, policyFromEnvironment } = policyModule;
+const { buildAcl, buildFastAcl, policyFromEnvironment } = policyModule;
 
 assert.equal(typeof policyFromEnvironment, 'function', 'policyFromEnvironment must be exported');
 
@@ -35,6 +35,9 @@ assert.equal(JSON.stringify(policy).includes(key), false, 'API key must not ente
 const acl = buildAcl(policy, { llmApiKey: key });
 assert.match(acl, /key = "test-key-that-must-never-be-serialized"/u);
 assert.match(acl, /agent \{[\s\S]*timeout_s = 181[\s\S]*\}/u);
+const fastAcl = buildFastAcl(policy, { llmApiKey: key });
+assert.match(fastAcl, /key = "test-key-that-must-never-be-serialized"/u);
+assert.doesNotMatch(fastAcl, /agent \{/u);
 
 const disabled = policyFromEnvironment({
   ANYSENTRY_LLM_MODEL: 'unused-model',
