@@ -54,6 +54,7 @@ let outputDropped = 0;
 let errorCount = 0;
 let eventKindCounts = Object.create(null);
 let attributionCounts = { observed: 0, agent: 0, unknown: 0, filteredNonAgent: 0, deduplicated: 0 };
+let collectorRuntime = { attachedProbes: undefined, enabledFeatures: undefined };
 let closing = false;
 let heartbeatTimer;
 const rl = readline.createInterface({ input: process.stdin });
@@ -88,6 +89,17 @@ function sourceHeaders() {
     ...(SOURCE_ID ? { 'X-AnySentry-Source-Id': SOURCE_ID } : {}),
     ...(SOURCE_TOKEN ? { 'X-AnySentry-Ingest-Token': SOURCE_TOKEN } : {}),
   };
+}
+
+function retainCollectorRuntime(o) {
+  const heartbeat = o?.event?.CollectorHeartbeat;
+  if (!heartbeat || typeof heartbeat !== 'object' || Array.isArray(heartbeat)) return;
+  const attached = Number(heartbeat.attachedProbes ?? heartbeat.attached_probes);
+  if (Number.isFinite(attached) && attached >= 0) collectorRuntime.attachedProbes = Math.round(attached);
+  const features = heartbeat.enabledFeatures ?? heartbeat.enabled_features;
+  if (Array.isArray(features)) {
+    collectorRuntime.enabledFeatures = features.map((feature) => String(feature)).filter(Boolean);
+  }
 }
 
 function postJson(url, bodyObj, timeoutMs, done) {
@@ -156,6 +168,12 @@ function sendHeartbeat(done = () => {}) {
       queueDepth: inflight,
       outputDropped: dropped,
       errorCount: errors,
+      ...(collectorRuntime.attachedProbes === undefined
+        ? {}
+        : { attachedProbes: collectorRuntime.attachedProbes }),
+      ...(collectorRuntime.enabledFeatures === undefined
+        ? {}
+        : { enabledFeatures: collectorRuntime.enabledFeatures }),
       message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; agent=${classifications.agent}; unknown=${classifications.unknown}; filtered_non_agent=${classifications.filteredNonAgent}; deduplicated=${classifications.deduplicated}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
     },
@@ -203,6 +221,7 @@ rl.on('line', (raw) => {
   if (!line) return;
   let o;
   try { o = JSON.parse(line); } catch { return; } // skip the collector's human log lines / partials
+  retainCollectorRuntime(o);
   attributionCounts.observed++;
   if (toolExecDeduper.isDuplicate(o)) {
     attributionCounts.deduplicated++;

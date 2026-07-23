@@ -308,7 +308,7 @@ cleanup() {
 wait_for_url() {
   local url=$1 i
   for i in $(seq 1 60); do
-    curl --connect-timeout 2 --max-time 5 -fsS "$url" >/dev/null && return 0
+    curl --connect-timeout 2 --max-time 5 -fsS "$url" >/dev/null 2>/dev/null && return 0
     sleep 2
   done
   return 1

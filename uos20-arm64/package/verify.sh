@@ -46,21 +46,6 @@ wait_health() {
   return 1
 }
 
-wait_for_legacy_probes() {
-  local count=0
-  for _ in $(seq 1 30); do
-    count=$(journalctl -b -u anysentry-observer.service --no-pager -o cat 2>/dev/null |
-      grep -c 'legacy probe attached program=' || true)
-    if [[ $count -ge 8 ]]; then
-      printf '%s\n' "$count"
-      return 0
-    fi
-    sleep 1
-  done
-  printf '%s\n' "$count"
-  return 1
-}
-
 host_checks() {
   [[ $(uname -m) == aarch64 ]] || fail "host architecture is not aarch64"
   [[ $(getconf PAGESIZE) == 65536 ]] || fail "host page size is not 65536"
@@ -132,9 +117,6 @@ before_accepted=$(printf '%s' "$before" | json_value 'data.items?.[0]?.acceptedE
 before_rejected=$(printf '%s' "$before" | json_value 'data.items?.[0]?.rejectedEvents ?? -1')
 [[ $before_accepted =~ ^[0-9]+$ ]] || fail "Observer Source acceptedEvents is unavailable"
 
-probe_count=$(wait_for_legacy_probes) ||
-  fail "only $probe_count of 8 legacy probes were confirmed attached after 30 seconds"
-
 /bin/sh -c 'echo anysentry-uos-observer-verify >/dev/null'
 /usr/bin/env >/dev/null
 /bin/ls /etc >/dev/null
@@ -157,9 +139,12 @@ collector=$(post_json collectors/health \
 state=$(printf '%s' "$collector" | json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.state')
 output_dropped=$(printf '%s' "$collector" | json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.outputDropped ?? -1')
 error_count=$(printf '%s' "$collector" | json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.errorCount ?? -1')
+attached_probes=$(printf '%s' "$collector" | json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.attachedProbes ?? -1')
 [[ $state == healthy ]] || fail "collector state is $state"
 [[ $output_dropped == 0 ]] || fail "collector outputDropped=$output_dropped"
 [[ $error_count == 0 ]] || fail "collector errorCount=$error_count"
-pass "Observer collector is healthy; outputDropped=0 errorCount=0 attachedProbes=$probe_count"
+[[ $attached_probes =~ ^[0-9]+$ && $attached_probes -ge 8 ]] ||
+  fail "collector attachedProbes=$attached_probes; expected at least 8"
+pass "Observer collector is healthy; outputDropped=0 errorCount=0 attachedProbes=$attached_probes"
 
 echo "AnySentry verification completed successfully. acceptedEvents=$before_accepted->$after_accepted rejectedEvents=$after_rejected"
