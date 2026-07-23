@@ -26,6 +26,10 @@ function defaultHeartbeatUrl(ingestUrl) {
 }
 
 const MAX_INFLIGHT = Number(process.env.FORWARD_MAX_INFLIGHT || 24);
+const FORWARD_HTTP_TIMEOUT_MS = Math.max(
+  5000,
+  Number(process.env.FORWARD_HTTP_TIMEOUT_MS || 20000) || 20000,
+);
 const FORWARD_SCOPE = ['agent', 'all', 'shadow'].includes(process.env.FORWARD_SCOPE)
   ? process.env.FORWARD_SCOPE
   : 'agent';
@@ -111,9 +115,15 @@ function postJson(url, bodyObj, timeoutMs, done) {
   }
   const body = JSON.stringify(bodyObj);
   let settled = false;
-  const finish = (failed) => {
+  const startedAt = Date.now();
+  const finish = (failed, reason = '') => {
     if (settled) return;
     settled = true;
+    if (failed) {
+      console.error(
+        `[observer-forward] POST ${url.pathname} failed: ${reason || 'unknown'}; elapsed_ms=${Date.now() - startedAt}`,
+      );
+    }
     done(Boolean(failed));
   };
   const req = transport.request(
@@ -131,12 +141,17 @@ function postJson(url, bodyObj, timeoutMs, done) {
     },
     (res) => {
       res.resume();
-      res.on('end', () => finish((res.statusCode || 500) >= 400));
+      res.on('end', () => {
+        const statusCode = res.statusCode || 500;
+        finish(statusCode >= 400, `http_status=${statusCode}`);
+      });
     },
   );
-  req.on('error', () => finish(true));
+  req.on('error', (error) => {
+    finish(true, `request_error=${error.code || error.message || 'unknown'}`);
+  });
   req.setTimeout(timeoutMs, () => {
-    finish(true);
+    finish(true, `timeout_ms=${timeoutMs}`);
     req.destroy();
   });
   req.end(body);
@@ -177,7 +192,7 @@ function sendHeartbeat(done = () => {}) {
       message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; agent=${classifications.agent}; unknown=${classifications.unknown}; filtered_non_agent=${classifications.filteredNonAgent}; deduplicated=${classifications.deduplicated}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
     },
-    5000,
+    FORWARD_HTTP_TIMEOUT_MS,
     (failed) => {
       if (failed) {
         outputDropped++;
@@ -257,7 +272,7 @@ rl.on('line', (raw) => {
       ...(NODE_NAME ? { nodeName: NODE_NAME } : {}),
       ...sourceFields(),
     },
-    5000,
+    FORWARD_HTTP_TIMEOUT_MS,
     finish,
   );
 

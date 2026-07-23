@@ -9,12 +9,16 @@ User=anysentry
 Group=anysentry
 WorkingDirectory=/opt/anysentry/app
 EnvironmentFile=/etc/anysentry/anysentry.env
+Environment=NODE_OPTIONS=--max-old-space-size=4096
 ExecStartPre=/opt/anysentry/wait-clickhouse.sh
 ExecStart=/opt/anysentry/runtime/node/bin/node /opt/anysentry/app/dist/main.js
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=120s
 TimeoutStopSec=30s
+LimitNOFILE=65536
+MemoryHigh=6G
+MemoryMax=8G
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

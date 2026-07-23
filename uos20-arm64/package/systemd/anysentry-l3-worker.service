@@ -10,11 +10,15 @@ Group=anysentry
 WorkingDirectory=/opt/anysentry/app
 EnvironmentFile=/etc/anysentry/anysentry.env
 Environment=ANYSENTRY_WORKER_ROLE=l3
+Environment=NODE_OPTIONS=--max-old-space-size=4096
 ExecStart=/opt/anysentry/run-l3-worker.sh
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=60s
 TimeoutStopSec=30s
+LimitNOFILE=65536
+MemoryHigh=6G
+MemoryMax=8G
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

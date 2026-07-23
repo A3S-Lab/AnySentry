@@ -10,9 +10,9 @@
 
 ```bash
 cd /opt/shannon/anysentry
-sha256sum --check anysentry-security-suite-0.2.0-compat7-uos20-arm64.tar.gz.sha256
-tar -zxf anysentry-security-suite-0.2.0-compat7-uos20-arm64.tar.gz
-cd anysentry-security-suite-0.2.0-compat7-uos20-arm64
+sha256sum --check anysentry-security-suite-0.2.0-compat8-uos20-arm64.tar.gz.sha256
+tar -zxf anysentry-security-suite-0.2.0-compat8-uos20-arm64.tar.gz
+cd anysentry-security-suite-0.2.0-compat8-uos20-arm64
 sha256sum --check manifest.sha256
 ```
 
@@ -31,6 +31,19 @@ sha256sum --check manifest.sha256
 ```
 
 安装程序保留 `/etc/anysentry/anysentry.env`、`/var/lib/anysentry` 和 `/var/log/anysentry`，自动合并新增配置项，按 ClickHouse、Redis、API、判定 Worker、Observer 的顺序启动服务，配置 Observer Source 并执行完整验证。激活失败时自动 rollback 至上一程序和 systemd 单元；失败版本保留为 `/opt/anysentry.failed.<时间>`。
+
+每次执行安装程序都会覆盖写入本 compat 版本的完整诊断目录：
+
+```text
+/var/log/anysentry/install/0.2.0-compat8
+```
+
+`/tmp/anysentry-install-0.2.0-compat8` 指向同一目录。安装失败时，安装器先保存新版本服务状态、
+健康响应和 journal，再执行 rollback，并将失败阶段和回滚结果写入 `summary.txt`。
+
+正式安装还会写入 `/etc/sysctl.d/90-anysentry.conf`，持久设置
+`vm.overcommit_memory=1`。各 systemd 服务使用发布包内规定的 Node 堆和 MemoryHigh/MemoryMax；
+后续升级会重新应用这些资源配置。
 
 安装成功后执行：
 

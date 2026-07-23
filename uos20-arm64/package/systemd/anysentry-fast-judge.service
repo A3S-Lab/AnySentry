@@ -10,11 +10,15 @@ Group=anysentry
 WorkingDirectory=/opt/anysentry/app
 EnvironmentFile=/etc/anysentry/anysentry.env
 Environment=ANYSENTRY_WORKER_ROLE=fast
+Environment=NODE_OPTIONS=--max-old-space-size=2048
 ExecStart=/opt/anysentry/runtime/node/bin/node /opt/anysentry/app/dist/security-monitoring/worker-main.js
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=60s
 TimeoutStopSec=30s
+LimitNOFILE=65536
+MemoryHigh=3G
+MemoryMax=4G
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

@@ -10,20 +10,45 @@ pass() { echo "PASS $*"; }
 
 env_value() {
   local key=$1
-  awk -v key="$key" 'index($0, key "=") == 1 { sub(/^[^=]*=/, ""); print; exit }' "$ENV_FILE"
+  awk -v key="$key" '
+    index($0, key "=") == 1 {
+      sub(/^[^=]*=/, "")
+      value=$0
+    }
+    END {
+      if (value != "") print value
+    }
+  ' "$ENV_FILE"
 }
 
 json_value() {
-  local expression=$1
+  local path=$1
   "$INSTALL_ROOT/runtime/node/bin/node" -e '
     let raw="";
     process.stdin.on("data", c => raw += c);
     process.stdin.on("end", () => {
-      const payload=JSON.parse(raw); const data=payload?.data ?? payload;
-      const value=Function("data", `return (${process.argv[1]})`)(data);
+      const payload=JSON.parse(raw);
+      const value=process.argv[1].split(".").filter(Boolean)
+        .reduce((current, key) => current == null ? undefined : current[key], payload);
       if (value !== undefined && value !== null) process.stdout.write(String(value));
     });
-  ' "$expression"
+  ' "$path"
+}
+
+collector_value() {
+  local field=$1
+  "$INSTALL_ROOT/runtime/node/bin/node" -e '
+    let raw="";
+    process.stdin.on("data", c => raw += c);
+    process.stdin.on("end", () => {
+      const payload=JSON.parse(raw);
+      const collectorId=process.argv[1];
+      const field=process.argv[2];
+      const item=payload?.data?.items?.find(value => value?.collectorId === collectorId);
+      const value=item?.[field];
+      if (value !== undefined && value !== null) process.stdout.write(String(value));
+    });
+  ' "$COLLECTOR_ID" "$field"
 }
 
 post_json() {
@@ -52,9 +77,10 @@ wait_for_collector_health() {
   for _ in $(seq 1 60); do
     if response=$(post_json collectors/health "$body"); then
       state=$(printf '%s' "$response" |
-        json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.state')
+        collector_value state)
       attached_probes=$(printf '%s' "$response" |
-        json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.attachedProbes ?? -1')
+        collector_value attachedProbes)
+      [[ -n $attached_probes ]] || attached_probes=-1
       if [[ $state == healthy && $attached_probes =~ ^[0-9]+$ && $attached_probes -ge 8 ]]; then
         printf '%s' "$response"
         return 0
@@ -83,6 +109,10 @@ package_checks() {
   (cd "$INSTALL_ROOT" && sha256sum --check --quiet manifest.sha256) || fail "installed package checksums"
   pass "installed package checksums and UOS BPF ABI"
 }
+
+if [[ ${ANYSENTRY_VERIFY_LIB:-0} == 1 ]]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 if [[ ${1:-} == --preflight ]]; then PREFLIGHT=1; shift; fi
 [[ $# -eq 0 ]] || fail "usage: verify.sh [--preflight]"
@@ -115,27 +145,31 @@ SOURCE_ID=$(env_value ANYSENTRY_SOURCE_ID)
 COLLECTOR_ID=$(env_value A3S_OBSERVER_COLLECTOR_ID)
 [[ -n $SOURCE_ID ]] || fail "ANYSENTRY_SOURCE_ID is missing"
 [[ -n $COLLECTOR_ID ]] || fail "A3S_OBSERVER_COLLECTOR_ID is missing"
+[[ $COLLECTOR_ID =~ ^[A-Za-z0-9._:-]+$ ]] ||
+  fail "A3S_OBSERVER_COLLECTOR_ID contains an invalid value: $COLLECTOR_ID"
 
 curl --connect-timeout 2 --max-time 10 -fsS --user "$CLICKHOUSE_USER:$CLICKHOUSE_PASSWORD" \
   http://127.0.0.1:8123/ping >/dev/null || fail "ClickHouse loopback readiness"
 pass "ClickHouse loopback readiness"
 
 health=$(wait_health) || fail "API health endpoint readiness"
-[[ $(printf '%s' "$health" | json_value 'data.status') == ok ]] || fail "API health status"
-[[ $(printf '%s' "$health" | json_value 'data.storage?.mode') == clickhouse ]] || fail "API ClickHouse storage mode"
+[[ $(printf '%s' "$health" | json_value data.status) == ok ]] || fail "API health status"
+[[ $(printf '%s' "$health" | json_value data.storage.mode) == clickhouse ]] || fail "API ClickHouse storage mode"
 pass "API health and ClickHouse storage mode"
 
 smoke_id="install-$(date +%s)-$$"
 smoke=$(post_json ingest/events \
   "{\"sourceType\":\"custom\",\"sourceName\":\"offline-install-verifier\",\"workspacePath\":\"repo://offline-install\",\"agentId\":\"$smoke_id\",\"sessionId\":\"$smoke_id\",\"events\":[{\"kind\":\"egress\",\"peer\":\"169.254.169.254\",\"port\":80}]}") || fail "native Sentry smoke request"
-[[ $(printf '%s' "$smoke" | json_value 'data.acceptedEvents') == 1 ]] || fail "native Sentry acceptedEvents"
-[[ $(printf '%s' "$smoke" | json_value 'data.items?.[0]?.verdict') == block ]] || fail "native Sentry block verdict"
+[[ $(printf '%s' "$smoke" | json_value data.acceptedEvents) == 1 ]] || fail "native Sentry acceptedEvents"
+[[ $(printf '%s' "$smoke" | json_value data.items.0.verdict) == block ]] || fail "native Sentry block verdict"
 pass "ARM64 native Sentry ingest decision"
 
 source_body="{\"sourceId\":\"$SOURCE_ID\",\"limit\":5}"
 before=$(post_json sources/list "$source_body") || fail "Observer Source status before smoke"
-before_accepted=$(printf '%s' "$before" | json_value 'data.items?.[0]?.acceptedEvents ?? -1')
-before_rejected=$(printf '%s' "$before" | json_value 'data.items?.[0]?.rejectedEvents ?? -1')
+before_accepted=$(printf '%s' "$before" | json_value data.items.0.acceptedEvents)
+before_rejected=$(printf '%s' "$before" | json_value data.items.0.rejectedEvents)
+[[ -n $before_accepted ]] || before_accepted=-1
+[[ -n $before_rejected ]] || before_rejected=-1
 [[ $before_accepted =~ ^[0-9]+$ ]] || fail "Observer Source acceptedEvents is unavailable"
 
 /bin/sh -c 'echo anysentry-uos-observer-verify >/dev/null'
@@ -146,25 +180,31 @@ after=$before
 for _ in $(seq 1 30); do
   sleep 1
   after=$(post_json sources/list "$source_body") || continue
-  after_accepted=$(printf '%s' "$after" | json_value 'data.items?.[0]?.acceptedEvents ?? -1')
+  after_accepted=$(printf '%s' "$after" | json_value data.items.0.acceptedEvents)
+  [[ -n $after_accepted ]] || after_accepted=-1
   [[ $after_accepted =~ ^[0-9]+$ && $after_accepted -gt $before_accepted ]] && break
 done
 [[ ${after_accepted:-0} -gt $before_accepted ]] || fail "Observer Source acceptedEvents did not increase"
-after_rejected=$(printf '%s' "$after" | json_value 'data.items?.[0]?.rejectedEvents ?? -1')
+after_rejected=$(printf '%s' "$after" | json_value data.items.0.rejectedEvents)
+[[ -n $after_rejected ]] || after_rejected=-1
 [[ $after_rejected == "$before_rejected" ]] || fail "Observer Source rejectedEvents increased"
-[[ $(printf '%s' "$after" | json_value 'data.items?.[0]?.status') == active ]] || fail "Observer Source is not active"
+[[ $(printf '%s' "$after" | json_value data.items.0.status) == active ]] || fail "Observer Source is not active"
 pass "Observer Source acceptedEvents increased without rejection"
 
 if ! collector=$(wait_for_collector_health); then
-  state=$(printf '%s' "$collector" | json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.state')
-  attached_probes=$(printf '%s' "$collector" | json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.attachedProbes ?? -1')
+  state=$(printf '%s' "$collector" | collector_value state)
+  attached_probes=$(printf '%s' "$collector" | collector_value attachedProbes)
+  [[ -n $attached_probes ]] || attached_probes=-1
   echo "Collector health response: $collector" >&2
   fail "collector did not become ready within 60 seconds; state=${state:-missing} attachedProbes=${attached_probes:--1}"
 fi
-state=$(printf '%s' "$collector" | json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.state')
-output_dropped=$(printf '%s' "$collector" | json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.outputDropped ?? -1')
-error_count=$(printf '%s' "$collector" | json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.errorCount ?? -1')
-attached_probes=$(printf '%s' "$collector" | json_value 'data.items?.find(x => x.collectorId === '\"'$COLLECTOR_ID'\"')?.attachedProbes ?? -1')
+state=$(printf '%s' "$collector" | collector_value state)
+output_dropped=$(printf '%s' "$collector" | collector_value outputDropped)
+error_count=$(printf '%s' "$collector" | collector_value errorCount)
+attached_probes=$(printf '%s' "$collector" | collector_value attachedProbes)
+[[ -n $output_dropped ]] || output_dropped=-1
+[[ -n $error_count ]] || error_count=-1
+[[ -n $attached_probes ]] || attached_probes=-1
 [[ $state == healthy ]] || {
   echo "Collector health response: $collector" >&2
   fail "collector state is ${state:-missing}"

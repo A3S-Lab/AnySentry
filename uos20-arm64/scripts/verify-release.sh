@@ -14,7 +14,9 @@ required=(
   observer/observer-agent-attribution.js observer/observer-event-dedup.js
   observer/KERNEL_VERSION_CODE
   l3/l3-agent.mjs diagnostics/a3s-bpf-syscall-probe
-  install.sh verify.sh inspect-host.sh DEPLOYMENT.md VERSION PROVENANCE manifest.sha256
+  install.sh verify.sh inspect-host.sh DEPLOYMENT.md
+  AnySentry部署手册.md AnySentry使用手册.md
+  VERSION PROVENANCE manifest.sha256
 )
 for file in "${required[@]}"; do [[ -f "$release/$file" ]] || die "release file missing: $file"; done
 [[ "$(cat "$release/observer/KERNEL_VERSION_CODE")" == '0x0004135a' ]] || die 'Observer BPF kernel version code mismatch'

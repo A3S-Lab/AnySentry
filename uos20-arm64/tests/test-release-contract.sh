@@ -17,6 +17,7 @@ done
 
 for file in \
   package/install.sh package/verify.sh package/inspect-host.sh package/DEPLOYMENT.md \
+  package/AnySentry部署手册.md package/AnySentry使用手册.md \
   package/provision-observer.mjs package/wait-clickhouse.sh package/uninstall.sh \
   package/config/anysentry.env.example package/config/clickhouse-config.xml \
   package/config/clickhouse-users.xml package/config/redis.conf \
@@ -44,7 +45,22 @@ grep -Fq 'observer-agent-attribution.js' "$CHANNEL/scripts/build-observer.sh" ||
 grep -Fq 'observer-event-dedup.js' "$CHANNEL/scripts/build-observer.sh" || fail "observer builder omits event dedup runtime"
 grep -Fq 'observer/observer-agent-attribution.js' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not require agent attribution runtime"
 grep -Fq 'observer/observer-event-dedup.js' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not require event dedup runtime"
+grep -Fq 'AnySentry部署手册.md' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the customer deployment guide"
+grep -Fq 'AnySentry使用手册.md' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the customer user guide"
+grep -Fq 'AnySentry部署手册.md' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier omits the customer deployment guide"
+grep -Fq 'AnySentry使用手册.md' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier omits the customer user guide"
 grep -Fq '0x0004135a' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not enforce UOS BPF ABI"
 grep -Fq "'Linux BPF'" "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not recognize the legacy BPF object"
+grep -Fq 'maxmemory 4gb' "$CHANNEL/package/config/redis.conf" || fail "Redis queue memory is not capped at 4 GiB"
+grep -Fq 'MemoryHigh=32G' "$CHANNEL/package/systemd/anysentry-clickhouse.service" || fail "ClickHouse MemoryHigh is not configured"
+grep -Fq 'MemoryMax=40G' "$CHANNEL/package/systemd/anysentry-clickhouse.service" || fail "ClickHouse MemoryMax is not configured"
+grep -Fq '<max_server_memory_usage>34359738368</max_server_memory_usage>' "$CHANNEL/package/config/clickhouse-config.xml" || fail "ClickHouse server memory is not raised to 32 GiB"
+grep -Fq 'NODE_OPTIONS=--max-old-space-size=4096' "$CHANNEL/package/systemd/anysentry.service" || fail "API Node heap is not configured"
+grep -Fq 'NODE_OPTIONS=--max-old-space-size=2048' "$CHANNEL/package/systemd/anysentry-fast-judge.service" || fail "fast judge Node heap is not configured"
+grep -Fq 'NODE_OPTIONS=--max-old-space-size=4096' "$CHANNEL/package/systemd/anysentry-l3-worker.service" || fail "L3 Node heap is not configured"
+grep -Fq 'NODE_OPTIONS=--max-old-space-size=1024' "$CHANNEL/package/systemd/anysentry-observer.service" || fail "Observer forwarder Node heap is not configured"
+grep -Fq 'FORWARD_HTTP_TIMEOUT_MS=20000' "$CHANNEL/package/systemd/anysentry-observer.service" || fail "Observer HTTP timeout hotfix is not persisted"
+grep -Fq 'FORWARD_HTTP_TIMEOUT_MS' "$ROOT/scripts/observer-forward.js" || fail "Observer forwarder does not read the HTTP timeout"
+grep -Fq '[observer-forward] POST' "$ROOT/scripts/observer-forward.js" || fail "Observer forwarder does not log HTTP failure details"
 
 echo "PASS release file and metadata contract"

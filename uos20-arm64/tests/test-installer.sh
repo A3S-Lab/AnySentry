@@ -42,6 +42,19 @@ grep -Fq 'Collector health response:' "$VERIFY" || fail "collector health failur
 grep -Fq 'acceptedEvents' "$VERIFY" || fail "verifier does not inspect Source acceptance"
 grep -Fq 'outputDropped' "$VERIFY" || fail "verifier does not inspect forwarder drops"
 grep -Fq 'errorCount' "$VERIFY" || fail "verifier does not inspect forwarder errors"
+grep -Fq 'normalize_environment' "$INSTALLER" || fail "installer does not normalize duplicate environment keys"
+grep -Fq 'validate_collector_id' "$INSTALLER" || fail "installer does not validate the collector ID"
+grep -Fq '0.2.0-compat8' "$INSTALLER" || fail "installer does not define the compat8 diagnostic directory"
+grep -Fq '/var/log/anysentry/install' "$INSTALLER" || fail "installer does not persist installation diagnostics"
+grep -Fq '/tmp/anysentry-install-' "$INSTALLER" || fail "installer does not publish the temporary diagnostic link"
+grep -Fq 'capture_diagnostics' "$INSTALLER" || fail "installer does not capture activation and rollback diagnostics"
+grep -Fq 'anysentry-observer.service) name=observer' "$INSTALLER" || fail "installer does not map the Observer journal"
+grep -Fq 'journal-$name.log' "$INSTALLER" || fail "installer does not retain service journal output"
+grep -Fq 'vm.overcommit_memory=1' "$INSTALLER" || fail "installer does not persist the Redis overcommit requirement"
+if grep -Fq 'Function("data"' "$VERIFY"; then
+  fail "verifier still executes dynamic JavaScript expressions"
+fi
+grep -Fq 'collector_value' "$VERIFY" || fail "verifier does not parse collector fields with an explicit ID"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -58,5 +71,59 @@ ANYSENTRY_INSTALLER_LIB=1 bash -c '
 
 grep -Fxq 'EXISTING=value' "$tmp/existing.env" || fail "existing config was overwritten"
 grep -Fxq 'NEW_KEY=new-default' "$tmp/existing.env" || fail "new config key was not appended"
+
+printf '%s\n' \
+  'PORT=29653' \
+  'A3S_OBSERVER_COLLECTOR_ID=A3S_OBSERVER_COLLECTOR_ID=obsolete' \
+  'A3S_OBSERVER_COLLECTOR_ID=observer-customer-host' \
+  'PORT=29654' \
+  > "$tmp/duplicate.env"
+
+ANYSENTRY_INSTALLER_LIB=1 bash -c '
+  source "$1"
+  ENV_FILE="$2"
+  normalize_environment "$ENV_FILE"
+  validate_collector_id "$ENV_FILE"
+' _ "$tmp/package/install.sh" "$tmp/duplicate.env"
+
+[[ $(grep -c '^A3S_OBSERVER_COLLECTOR_ID=' "$tmp/duplicate.env") == 1 ]] ||
+  fail "collector ID duplicates were not removed"
+grep -Fxq 'A3S_OBSERVER_COLLECTOR_ID=observer-customer-host' "$tmp/duplicate.env" ||
+  fail "the last valid collector ID was not preserved"
+[[ $(grep -c '^PORT=' "$tmp/duplicate.env") == 1 ]] ||
+  fail "generic duplicate environment keys were not removed"
+grep -Fxq 'PORT=29654' "$tmp/duplicate.env" || fail "the last PORT value was not preserved"
+
+mkdir -p "$tmp/runtime-tmp"
+ANYSENTRY_INSTALLER_LIB=1 bash -c '
+  source "$1"
+  LOG_DIR="$2/runtime-log"
+  INSTALL_LOG_ROOT="$LOG_DIR/install/0.2.0-compat8"
+  TEMP_INSTALL_LOG="$2/runtime-tmp/anysentry-install-0.2.0-compat8"
+  initialize_install_logging
+  set_stage installer-contract-test
+  echo installer-log-marker
+  write_install_summary 0
+' _ "$tmp/package/install.sh" "$tmp"
+
+[[ -L $tmp/runtime-tmp/anysentry-install-0.2.0-compat8 ]] ||
+  fail "temporary diagnostic path is not a symlink"
+grep -Fq installer-log-marker "$tmp/runtime-log/install/0.2.0-compat8/install.log" ||
+  fail "installer output was not captured"
+grep -Fq result=success "$tmp/runtime-log/install/0.2.0-compat8/summary.txt" ||
+  fail "installation summary was not persisted"
+
+mkdir -p "$tmp/verify-root/runtime/node/bin"
+ln -s "$(command -v node)" "$tmp/verify-root/runtime/node/bin/node"
+collector_json='{"data":{"items":[{"collectorId":"observer-customer-host","state":"healthy","attachedProbes":8,"outputDropped":0,"errorCount":0}]}}'
+parsed=$(ANYSENTRY_VERIFY_LIB=1 ANYSENTRY_INSTALL_ROOT="$tmp/verify-root" \
+  bash -c '
+    source "$1"
+    COLLECTOR_ID=observer-customer-host
+    state=$(printf "%s" "$2" | collector_value state)
+    probes=$(printf "%s" "$2" | collector_value attachedProbes)
+    printf "%s,%s\n" "$state" "$probes"
+  ' _ "$VERIFY" "$collector_json")
+[[ $parsed == healthy,8 ]] || fail "collector parser returned '$parsed' instead of healthy,8"
 
 echo "PASS installer transaction and preservation contract"

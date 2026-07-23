@@ -11,6 +11,8 @@ WorkingDirectory=/opt/anysentry/observer
 EnvironmentFile=/etc/anysentry/anysentry.env
 Environment=A3S_OBSERVER_JSON=1
 Environment=A3S_OBSERVER_FILES=1
+Environment=NODE_OPTIONS=--max-old-space-size=1024
+Environment=FORWARD_HTTP_TIMEOUT_MS=20000
 Environment="FORWARD_DROP_PATHS=/sys/,/proc/,/run/,/dev/,/var/lib/anysentry/clickhouse/,/var/lib/anysentry/redis/,/var/log/anysentry/"
 ExecStart=/bin/bash -o pipefail -c '/opt/anysentry/observer/bin/a3s-observer-collector | /opt/anysentry/runtime/node/bin/node /opt/anysentry/observer/observer-forward.js'
 Restart=on-failure
@@ -19,6 +21,9 @@ TimeoutStartSec=60s
 TimeoutStopSec=30s
 KillMode=control-group
 LimitMEMLOCK=infinity
+LimitNOFILE=65536
+MemoryHigh=2G
+MemoryMax=3G
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RESOURCE
 AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RESOURCE
 NoNewPrivileges=true
