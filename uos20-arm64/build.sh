@@ -16,7 +16,7 @@ Options:
   --component NAME  all, sentry, node, app, clickhouse, observer, l3,
                     diagnostics, or assemble (default: all)
   --version VERSION Release version (default: AnySentry package version + uos date)
-  --prepare-only    Export current HEAD sources and apply adapters, then stop
+  --prepare-only    Validate and export the locked integration sources, then stop
   --help            Show this help
 EOF
 }
@@ -42,7 +42,7 @@ esac
 for command_name in git tar sha256sum awk sed; do require_command "$command_name"; done
 
 if [[ -z "$release_version" ]]; then
-  base=$(node -p "require('$SECURITY_ROOT/AnySentry/package.json').version")
+  base=$(node -p "require('$ANYSENTRY_REPO/package.json').version")
   release_version=${base}-uos$(date +%Y%m%d)
 fi
 RELEASE_VERSION=$release_version

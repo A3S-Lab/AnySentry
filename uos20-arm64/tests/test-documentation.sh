@@ -16,7 +16,7 @@ for term in 'Kunpeng 920' 'glibc 2.28' '65536' '4.19.90' '0x0004135a' 'SIGILL' '
   grep -Fq "$term" "$REVIEW" || fail "review omits $term"
 done
 
-for term in 'current HEAD' '--component' '--prepare-only' 'PROVENANCE' 'patch'; do
+for term in 'integration branch' '--component' '--prepare-only' 'PROVENANCE' 'direct merge'; do
   grep -Fq -- "$term" "$DEV" || fail "developer guide omits $term"
 done
 
@@ -25,4 +25,3 @@ for term in './install.sh --check' './install.sh' '/opt/anysentry/verify.sh' 'jo
 done
 
 echo "PASS documentation contract"
-

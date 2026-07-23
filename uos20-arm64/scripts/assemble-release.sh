@@ -23,8 +23,7 @@ source "$BUILD_DIR/source-provenance.env"
 } > "$STAGE_DIR/VERSION"
 {
   cat "$STAGE_DIR/VERSION"
-  printf 'ANYSENTRY_PATCH_SHA256=%s\nOBSERVER_PATCH_SHA256=%s\n' "$ANYSENTRY_PATCH_SHA256" "$OBSERVER_PATCH_SHA256"
-  printf 'SOURCE_DATE_EPOCH=%s\nBUILT_AT_UTC=%s\n' "$(git -C "$SECURITY_ROOT/AnySentry" log -1 --format=%ct)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'SOURCE_DATE_EPOCH=%s\nBUILT_AT_UTC=%s\n' "$(git -C "$ANYSENTRY_REPO" log -1 --format=%ct)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$STAGE_DIR/PROVENANCE"
 
 (cd "$STAGE_DIR" && find . -type f ! -name manifest.sha256 -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > manifest.sha256 && sha256sum --check --quiet manifest.sha256)
@@ -33,10 +32,9 @@ source "$BUILD_DIR/source-provenance.env"
 mkdir -p "$RELEASE_DIR"
 rm -rf "$RELEASE_DIR/$STAGE_NAME"
 cp -a "$STAGE_DIR" "$RELEASE_DIR/$STAGE_NAME"
-epoch=$(git -C "$SECURITY_ROOT/AnySentry" log -1 --format=%ct)
+epoch=$(git -C "$ANYSENTRY_REPO" log -1 --format=%ct)
 archive=$RELEASE_DIR/$STAGE_NAME.tar.gz
 tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner -C "$RELEASE_DIR" -czf "$archive" "$STAGE_NAME"
 (cd "$RELEASE_DIR" && sha256sum "$STAGE_NAME.tar.gz" > "$STAGE_NAME.tar.gz.sha256")
 echo "Release archive: $archive"
 echo "Checksum:       $archive.sha256"
-
