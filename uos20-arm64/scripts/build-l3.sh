@@ -4,7 +4,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 ensure_stage
 
 app_source=$SOURCE_DIR/anysentry
-generic=$app_source/apps/api/node_modules/@a3s-lab/code
+generic=$STAGE_DIR/app/node_modules/@a3s-lab/code
 [[ -f "$generic/index.js" ]] || die 'run the app component before l3'
 actual=$(node -p "require('$generic/package.json').version")
 [[ "$actual" == "$CODE_VERSION" ]] || die "a3s-code version mismatch: $actual"

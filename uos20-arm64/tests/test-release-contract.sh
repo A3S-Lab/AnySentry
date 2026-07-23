@@ -31,6 +31,7 @@ grep -Fq '/var/lib/anysentry/redis/' "$CHANNEL/package/systemd/anysentry-observe
 grep -Fq 'worker-main.js' "$CHANNEL/package/systemd/anysentry-fast-judge.service" || fail "fast worker entrypoint is missing"
 grep -Fq 'ANYSENTRY_WORKER_ROLE=l3' "$CHANNEL/package/systemd/anysentry-l3-worker.service" || fail "L3 worker role is missing"
 grep -Fq 'msgpackr-extract-linux-x64' "$CHANNEL/scripts/build-app.sh" || fail "app builder does not remove the host msgpackr native package"
+grep -Fq 'STAGE_DIR/app/node_modules/@a3s-lab/code' "$CHANNEL/scripts/build-l3.sh" || fail "L3 component cannot resume from the staged app"
 grep -Fq 'manifest.sha256' "$CHANNEL/scripts/assemble-release.sh" || fail "release manifest is not generated"
 grep -Fq 'PROVENANCE' "$CHANNEL/scripts/assemble-release.sh" || fail "release provenance is not generated"
 grep -Fq '0x0004135a' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not enforce UOS BPF ABI"
