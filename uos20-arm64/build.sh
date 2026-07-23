@@ -10,7 +10,7 @@ usage() {
 Usage: ./uos20-arm64/build.sh [options]
 
 Build the current AnySentry, Observer, and Sentry HEAD revisions for the verified
-Shuangyang UOS 20 ARM64 customer profile.
+UOS 20 ARM64 compatibility profile.
 
 Options:
   --component NAME  all, sentry, node, app, clickhouse, redis, observer, l3,

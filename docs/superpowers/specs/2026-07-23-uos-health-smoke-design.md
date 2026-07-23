@@ -2,7 +2,7 @@
 
 ## 目标
 
-提供单文件 `RUN_HEALTH_SMOKE.sh`，供部署人员在已经安装的 AnySentry UOS
+提供单文件 `RUN_HEALTH_SMOKE.sh`，用于已经安装的 AnySentry UOS
 服务器上执行全面健康检查，并通过安全、可追踪的模拟事件验证采集、接入、判定和存储链路。
 
 ## 执行模式
@@ -30,4 +30,3 @@ Sentry 判定或模拟事件落库失败时返回非零退出码；L2/L3 未启�
 
 脚本加入 `uos20-arm64/package/` 和后续发布包组装流程。为已部署 compat8 单独复制一份
 到 `security/release/RUN_HEALTH_SMOKE-compat8.sh`，不修改原 compat8 压缩包及其校验值。
-

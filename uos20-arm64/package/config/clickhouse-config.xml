@@ -14,7 +14,7 @@
     </local_directory>
   </user_directories>
 
-  <!-- Sized for the customer's 16 CPU / 64 GiB host. -->
+  <!-- Sized for the verified 16 CPU / 64 GiB profile. -->
   <max_server_memory_usage>34359738368</max_server_memory_usage>
   <max_thread_pool_size>512</max_thread_pool_size>
   <background_buffer_flush_schedule_pool_size>8</background_buffer_flush_schedule_pool_size>

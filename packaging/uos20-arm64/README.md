@@ -1,6 +1,6 @@
 # AnySentry Security Suite UOS 20 ARM64 离线部署手册
 
-本包用于客户主机 UOS Server 20 Enterprise、`aarch64`、glibc 2.28、Linux 4.19，兼容
+本包用于 UOS Server 20 Enterprise、`aarch64`、glibc 2.28、Linux 4.19，兼容
 64 KiB 内核页。目标机配置为 16 核 Kunpeng 920、64 GiB 内存、约 34 GiB 可用磁盘；
 ClickHouse 内存上限已设为 8 GiB，数据写入 `/var/lib/anysentry/clickhouse`。
 
@@ -37,7 +37,7 @@ release/anysentry-security-suite-0.1.0-compat1-uos20-arm64.tar.gz.sha256
 
 ## 2. WinSCP 上传、校验与解压
 
-通过 WinSCP 将 `.tar.gz` 和 `.sha256` 上传到客户机 `/mnt`，然后以 root 执行：
+通过 WinSCP 将 `.tar.gz` 和 `.sha256` 上传到服务器 `/mnt`，然后以 root 权限执行：
 
 ```bash
 cd /mnt
@@ -72,7 +72,7 @@ systemctl reset-failed anysentry-observer.service anysentry.service anysentry-cl
 
 ## 3. 安装前配置 LLM
 
-客户尚未提供内网模型时可保持 URL 为空：L1 规则始终启用，L2 和 L3 自动关闭。拿到
+尚未配置内网模型时可保持 URL 为空：L1 规则始终启用，L2 和 L3 自动关闭。取得
 接口后，在首次安装前复制模板并填写：
 
 ```bash
@@ -84,8 +84,8 @@ vi config/anysentry.env
 
 ```text
 ANYSENTRY_LLM_BASE_URL=http://内网模型地址:端口/v1
-ANYSENTRY_LLM_MODEL=客户提供的模型ID
-ANYSENTRY_LLM_API_KEY=客户提供的Key或留空
+ANYSENTRY_LLM_MODEL=模型ID
+ANYSENTRY_LLM_API_KEY=API密钥或留空
 ANYSENTRY_LLM_TIMEOUT=30
 ANYSENTRY_L3_ENABLED=true
 ANYSENTRY_L3_TIMEOUT=180
@@ -150,7 +150,7 @@ sudo ./install.sh
 | `29653/tcp` | `0.0.0.0` | 浏览器、API 和其他内网调用方 |
 | `8123/tcp` | `127.0.0.1` | 仅 AnySentry 本机访问 ClickHouse |
 
-只向需要访问中台/API 的客户网段放行 29653，禁止对外开放 8123。
+只向需要访问中台/API 的受控网段放行 29653，禁止对外开放 8123。
 
 ## 5. 安装验收与 LLM 测试
 
@@ -165,7 +165,7 @@ ss -lntp | grep -E ':(29653|8123)\b'
 
 验收要求：ClickHouse storage mode 为 `clickhouse`；ARM64 Sentry L1 阻断测试通过；
 Observer 执行唯一命令后，API 的 `/security-center/events/list` 中能查询到对应
-`ToolExec`。这是客户 Linux 4.19 内核上的最终 eBPF 接受条件。
+`ToolExec`。这是指定 Linux 4.19 内核上的最终 eBPF 接受条件。
 
 LLM 配好并重启后，从网页策略配置页或管理接口执行模拟。修改配置的重启命令：
 
@@ -181,23 +181,23 @@ sudo systemctl restart anysentry-clickhouse anysentry anysentry-observer
 
 ## 6. 网页与接口调用
 
-监控中台：`http://客户机器IP:29653/`
+监控中台：`http://服务器IP:29653/`
 
 健康接口：
 
 ```bash
-curl -fsS http://客户机器IP:29653/security-center/healthz
+curl -fsS http://服务器IP:29653/security-center/healthz
 ```
 
 通用 JSON 上报：
 
 ```bash
-curl -fsS -X POST http://客户机器IP:29653/security-center/ingest/events \
+curl -fsS -X POST http://服务器IP:29653/security-center/ingest/events \
   -H 'Content-Type: application/json' \
   -d '{
     "sourceType":"custom",
-    "sourceName":"customer-agent",
-    "workspacePath":"repo://customer/project",
+    "sourceName":"sample-agent",
+    "workspacePath":"repo://sample/project",
     "agentId":"agent-01",
     "sessionId":"session-001",
     "events":[{"kind":"egress","peer":"169.254.169.254","port":80}]
@@ -207,7 +207,7 @@ curl -fsS -X POST http://客户机器IP:29653/security-center/ingest/events \
 查询事件：
 
 ```bash
-curl -fsS -X POST http://客户机器IP:29653/security-center/events/list \
+curl -fsS -X POST http://服务器IP:29653/security-center/events/list \
   -H 'Content-Type: application/json' \
   -d '{"timeType":"last_24h","limit":20}'
 ```
@@ -234,7 +234,7 @@ unset ANYSENTRY_ADMIN_TOKEN
 
 ## 7. Observer 兼容范围与诊断
 
-本包不是主线 RingBuf Observer，而是为客户 Linux 4.19 构建的 legacy backend：
+本包不是主线 RingBuf Observer，而是为指定 Linux 4.19 ABI 构建的 legacy backend：
 `PerfEventArray + ARM64 syscall kprobe`，不依赖 `/sys/kernel/btf/vmlinux` 和 syscall
 tracepoint。默认仅观测，不启用 kernel enforcement。采集 exec、exit、connect、文件写入/
 删除、setuid、ptrace 和 bind；文件伪文件系统噪声由 forwarder 过滤。

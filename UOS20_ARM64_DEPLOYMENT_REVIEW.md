@@ -1,10 +1,10 @@
-# 双杨客户 AnySentry UOS 20 ARM64 部署复盘
+# AnySentry UOS 20 ARM64 部署复盘
 
 ## 正确打包流程
 
-正式发布以 `AnySentry`、`Observer`、`Sentry` 三个仓库经过审核的 integration branch HEAD 为输入。AnySentry 和 Observer 通过 direct merge 引入上游 main，再提交客户兼容修改；Sentry 使用锁定的 main 提交。构建程序确认三个工作区 clean、提交号与 `versions.env` 一致后，将源码导出到临时目录，分别构建业务服务、原生 Sentry、Node、ClickHouse、Redis、Linux 4.19 Observer、L3 和诊断程序。构建完成后执行 ELF/ABI、BPF 版本、包结构和 SHA-256 校验，生成 `PROVENANCE` 后打包。稳定 UOS 分支仅在目标机验收通过后推进。
+正式发布以 `AnySentry`、`Observer`、`Sentry` 三个仓库经过审核的 integration branch HEAD 为输入。AnySentry 和 Observer 通过 direct merge 引入上游 main，再提交 UOS 兼容修改；Sentry 使用锁定的 main 提交。构建程序确认三个工作区 clean、提交号与 `versions.env` 一致后，将源码导出到临时目录，分别构建业务服务、原生 Sentry、Node、ClickHouse、Redis、Linux 4.19 Observer、L3 和诊断程序。构建完成后执行 ELF/ABI、BPF 版本、包结构和 SHA-256 校验，生成 `PROVENANCE` 后打包。稳定 UOS 分支仅在目标环境验收通过后推进。
 
-## 客户设备基线
+## 设备基线
 
 - 操作系统：UnionTech OS Server 20 Enterprise；
 - 处理器：Kunpeng 920，aarch64，16 核；
@@ -18,7 +18,7 @@
 - BPF、KPROBE、KPROBE_EVENTS、PERF_EVENTS：已启用；
 - 权限：root，具有 `CAP_SYS_ADMIN`、`CAP_SYS_RESOURCE`，Seccomp 未启用；
 - 安全模块：capability、uosmanager、AppArmor；
-- systemd 和命名空间检测表现为宿主环境。客户说明该服务器由电信平台提供，运维访问路径具有容器化或平台托管特征，因此是否为容器不能仅依据 `/.dockerenv` 判断，部署门禁以实际 syscall 能力为准。
+- systemd 和命名空间检测表现为宿主环境。平台访问路径具有容器化或托管特征，因此是否为容器不能仅依据 `/.dockerenv` 判断，部署门禁以实际 syscall 能力为准。
 
 ## 主要故障与修正
 
@@ -38,7 +38,7 @@
 
 ### Redis 7.4.2 在 ARM64 内核主动退出
 
-Redis 的实际 `MADV_FREE + fork()` 脏页自检证明客户 UOS 4.19 ARM64 内核存在 Copy-on-Write 数据损坏风险，Redis 因 `ARM64-COW-BUG` 保护而拒绝启动。该 Redis 仅承担可重建的 BullMQ 临时队列，安全事件和判定结果由 ClickHouse 持久化。因此客户配置关闭 RDB 和 AOF 后台持久化，再显式忽略该启动警告；不得仅忽略警告并继续启用 fork 型持久化。
+Redis 的实际 `MADV_FREE + fork()` 脏页自检证明该 UOS 4.19 ARM64 内核存在 Copy-on-Write 数据损坏风险，Redis 因 `ARM64-COW-BUG` 保护而拒绝启动。该 Redis 仅承担可重建的 BullMQ 临时队列，安全事件和判定结果由 ClickHouse 持久化。因此发布配置关闭 RDB 和 AOF 后台持久化，再显式忽略该启动警告；不得仅忽略警告并继续启用 fork 型持久化。
 
 ### Observer Source 配置脚本错误
 

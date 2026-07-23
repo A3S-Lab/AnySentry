@@ -2,7 +2,7 @@
 
 ## 目标
 
-生成可直接交付双杨客户 UOS Server 20 ARM64 主机的
+生成可直接部署到 UOS Server 20 ARM64 环境的
 `anysentry-security-suite-0.2.0-compat8-uos20-arm64.tar.gz`。安装器同时支持首次安装和原地升级，
 失败时保留新版本现场并自动恢复上一版本。
 
@@ -14,7 +14,7 @@
 - 拒绝 `KEY=KEY=value` 形式的嵌套赋值；
 - 自动修复已知的 `A3S_OBSERVER_COLLECTOR_ID=A3S_OBSERVER_COLLECTOR_ID=...`；
 - 校验 Collector ID 不含 `=`、空白或控制字符；
-- 保留已有密钥和客户配置，新增模板键使用默认值。
+- 保留已有密钥和环境配置，新增模板键使用默认值。
 
 运行验证不再通过动态 JavaScript 表达式解析 Collector JSON，而是将 Collector ID 作为独立参数传给
 固定解析器。验证条件保持为 `state=healthy`、`attachedProbes>=8`、
@@ -47,7 +47,7 @@
 `--check` 只验证，不修改 sysctl。Redis 在该 UOS 内核上继续禁用 RDB 和 AOF，避免已确认的
 ARM64 COW 内核缺陷。
 
-## 客户文档
+## 发布文档
 
 发布包根目录包含：
 

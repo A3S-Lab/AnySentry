@@ -1,10 +1,10 @@
 # AnySentry 容器 BPF 能力诊断包
 
-本诊断包用于 UOS 20 / AArch64 / Linux 4.19 容器目标机。
+本诊断包用于检查 UOS 20 / AArch64 / Linux 4.19 环境的 BPF 运行能力。
 
 ## 推荐执行
 
-以 root 解压后进入目录：
+使用 root 权限解压并进入目录：
 
 ```bash
 sha256sum --check SHA256SUMS
@@ -23,7 +23,7 @@ sha256sum --check SHA256SUMS
 Please return this report file: /当前目录/a3s-container-bpf-diagnostics-*.txt
 ```
 
-把该文本文件完整返回即可。
+该文本文件用于后续兼容性分析。
 
 ## 只做被动检查
 

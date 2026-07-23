@@ -1,6 +1,7 @@
-# AnySentry UOS 20 ARM64 客户发布通道
+# AnySentry UOS 20 ARM64 发布通道
 
-本目录将三个仓库经过审核的 integration branch 与双杨客户 UOS 兼容层组合为可追溯的离线发布包。兼容代码不写入 `AnySentry`、`Observer`、`Sentry` 的上游开发分支。
+本目录将三个仓库经过审核的 integration branch 与 UOS 兼容层组合为可追溯的离线发布包。
+兼容代码不写入 `AnySentry`、`Observer`、`Sentry` 的上游开发分支。
 
 ## 构建模型
 
@@ -57,9 +58,10 @@ ANYSENTRY_RELEASE_DIR=/home/chensicheng/a3s/security/release \
 6. 在 UOS 同规格验证机执行 `./install.sh --check`、`./install.sh` 和 `/opt/anysentry/verify.sh`；
 7. 交付 tar 包、`.sha256` 和 `PROVENANCE`。
 
-更新兼容层时，应在新的 integration 分支提交最小、可审计差异，并确认其中不包含构建产物、密钥、客户数据或无关功能。
+更新兼容层时，应在新的 integration 分支提交最小、可审计差异，并确认其中不包含构建产物、
+密钥、环境数据或无关功能。
 
-## 固定客户 ABI
+## 固定目标 ABI
 
 - 操作系统：UnionTech OS Server 20 Enterprise；
 - 架构：aarch64，Kunpeng 920；
@@ -70,4 +72,4 @@ ANYSENTRY_RELEASE_DIR=/home/chensicheng/a3s/security/release \
 - ClickHouse：`armv8.0-compat`；
 - Observer：`perf-kprobe-legacy`，不依赖内核 BTF。
 
-该发布通道是指定客户 ABI，不替代上游通用 Linux 发布流程。
+该发布通道用于指定 UOS ABI，不替代上游通用 Linux 发布流程。

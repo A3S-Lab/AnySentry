@@ -337,7 +337,7 @@ verify_package() {
     systemd/anysentry-fast-judge.service systemd/anysentry-l3-worker.service
     systemd/anysentry-observer.service
     provision-observer.mjs wait-clickhouse.sh verify.sh inspect-host.sh
-    AnySentry部署手册.md AnySentry使用手册.md
+    AnySentry部署手册.md AnySentry使用手册.md AnySentry脚本说明.md
     VERSION PROVENANCE manifest.sha256
   )
   for file in "${required[@]}"; do
@@ -407,7 +407,7 @@ preflight() {
   glibc_version=${glibc_line##* }
   version_at_least "$glibc_version" 2.28 || fail "glibc $glibc_version is older than 2.28"
   page_size=$(getconf PAGESIZE)
-  [[ $page_size == 65536 ]] || fail "unsupported page size: $page_size (this customer release requires 65536)"
+  [[ $page_size == 65536 ]] || fail "unsupported page size: $page_size (this UOS release requires 65536)"
   [[ -e /sys/kernel/debug/tracing/kprobe_events || -e /sys/kernel/tracing/kprobe_events ]] ||
     fail "kprobe_events is unavailable; debugfs or tracefs is required"
   grep -qE '[[:space:]]__arm64_sys_execve$' /proc/kallsyms 2>/dev/null ||

@@ -17,7 +17,7 @@ done
 
 for file in \
   package/install.sh package/verify.sh package/inspect-host.sh package/RUN_HEALTH_SMOKE.sh package/DEPLOYMENT.md \
-  package/AnySentry部署手册.md package/AnySentry使用手册.md \
+  package/AnySentry部署手册.md package/AnySentry使用手册.md package/AnySentry脚本说明.md \
   package/provision-observer.mjs package/wait-clickhouse.sh package/uninstall.sh \
   package/config/anysentry.env.example package/config/clickhouse-config.xml \
   package/config/clickhouse-users.xml package/config/redis.conf \
@@ -45,10 +45,12 @@ grep -Fq 'observer-agent-attribution.js' "$CHANNEL/scripts/build-observer.sh" ||
 grep -Fq 'observer-event-dedup.js' "$CHANNEL/scripts/build-observer.sh" || fail "observer builder omits event dedup runtime"
 grep -Fq 'observer/observer-agent-attribution.js' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not require agent attribution runtime"
 grep -Fq 'observer/observer-event-dedup.js' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not require event dedup runtime"
-grep -Fq 'AnySentry部署手册.md' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the customer deployment guide"
-grep -Fq 'AnySentry使用手册.md' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the customer user guide"
-grep -Fq 'AnySentry部署手册.md' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier omits the customer deployment guide"
-grep -Fq 'AnySentry使用手册.md' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier omits the customer user guide"
+grep -Fq 'AnySentry部署手册.md' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the deployment guide"
+grep -Fq 'AnySentry使用手册.md' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the usage guide"
+grep -Fq 'AnySentry脚本说明.md' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the script guide"
+grep -Fq 'AnySentry部署手册.md' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier omits the deployment guide"
+grep -Fq 'AnySentry使用手册.md' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier omits the usage guide"
+grep -Fq 'AnySentry脚本说明.md' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier omits the script guide"
 grep -Fq 'RUN_HEALTH_SMOKE.sh' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the health smoke script"
 grep -Fq 'RUN_HEALTH_SMOKE.sh' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier omits the health smoke script"
 grep -Fq '0x0004135a' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not enforce UOS BPF ABI"

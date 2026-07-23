@@ -1,8 +1,16 @@
 # AnySentry UOS 20 ARM64 部署与维护
 
+## 文档导航
+
+- [AnySentry 部署手册](./AnySentry部署手册.md)
+- [AnySentry 使用手册](./AnySentry使用手册.md)
+- [AnySentry 脚本说明](./AnySentry脚本说明.md)
+
 ## 1. 适用范围
 
-本发布包适用于双杨客户 UOS Server 20 Enterprise ARM64 环境：glibc 2.28、64 KiB 页、显示内核 `4.19.0-arm64-server`，实际 BPF 版本码 `0x0004135a`。安装程序同时支持首次安装和后续升级。
+本发布包适用于指定的 UOS Server 20 Enterprise ARM64 环境：glibc 2.28、64 KiB
+内存页、显示内核 `4.19.0-arm64-server`，实际 BPF 版本码 `0x0004135a`。
+安装程序同时支持首次安装和后续升级。
 
 ## 2. 上传与校验
 
@@ -31,6 +39,10 @@ sha256sum --check manifest.sha256
 ```
 
 安装程序保留 `/etc/anysentry/anysentry.env`、`/var/lib/anysentry` 和 `/var/log/anysentry`，自动合并新增配置项，按 ClickHouse、Redis、API、判定 Worker、Observer 的顺序启动服务，配置 Observer Source 并执行完整验证。激活失败时自动 rollback 至上一程序和 systemd 单元；失败版本保留为 `/opt/anysentry.failed.<时间>`。
+
+上述 `/opt`、`/etc`、`/var/lib` 和 `/var/log` 路径由正式安装创建或管理。
+`/opt/anysentry.failed.<时间>` 仅在激活失败并执行回滚时创建；
+`/opt/.anysentry.rollback.<时间>` 仅在已有版本的升级过程中创建。
 
 每次执行安装程序都会覆盖写入本 compat 版本的完整诊断目录：
 
@@ -61,7 +73,9 @@ cat /opt/anysentry/PROVENANCE
 http://<目标服务器可达IP>:29653/
 ```
 
-若本地不能直接 SSH 或访问目标网段，应使用客户内置浏览器打开该地址。Xshell 可连接跳板入口时，可建立本地转发：本地 `29653` 转发至目标 `127.0.0.1:29653`，然后访问 `http://127.0.0.1:29653/`。ClickHouse `8123` 仅允许本机访问，不得对外发布。
+无法直接访问服务器网段时，可使用同网段浏览器。具备跳转连接时，可建立本地端口转发：
+本地 `29653` 转发至服务器 `127.0.0.1:29653`，然后访问
+`http://127.0.0.1:29653/`。ClickHouse `8123` 仅允许本机访问，不得对外发布。
 
 ## 5. L2 和 L3 配置
 
@@ -151,11 +165,12 @@ Collector 健康记录在 API 启动后可能延迟可见。安装验证最长�
 ./inspect-host.sh
 ```
 
-将生成的 `anysentry-host-inspection-*.txt` 返回开发人员。
+该命令在当前工作目录生成 `anysentry-host-inspection-*.txt`，用于兼容性分析。
 
 ### ClickHouse 出现 `signal=ILL` 或“非法指令”
 
-安装包不是 `armv8.0-compat` 构建，禁止继续安装。恢复使用本客户专用包并执行 `./install.sh --check`。不得复制通用 ARM64 ClickHouse 覆盖专用版本。
+安装包不是 `armv8.0-compat` 构建，禁止继续安装。更换为匹配此 ABI 的发布包并执行
+`./install.sh --check`。不得复制通用 ARM64 ClickHouse 覆盖兼容版本。
 
 ### Observer 出现 `BPF_PROG_LOAD`、`EINVAL` 或无有效探针
 
@@ -192,9 +207,13 @@ journalctl -b -u anysentry-fast-judge.service -u anysentry-l3-worker.service -n 
 
 ### Redis 报告 `ARM64-COW-BUG`
 
-客户 UOS 4.19 ARM64 内核未通过 Redis 的 `MADV_FREE + fork()` 脏页自检，使用 RDB 或 AOF 后台重写可能造成数据损坏。本发布包将 Redis 配置为无 RDB、无 AOF 的临时队列，并在禁用 fork 型持久化后设置 `ignore-warnings ARM64-COW-BUG`。安全事件与判定结果仍由 ClickHouse 持久化。
+指定的 UOS 4.19 ARM64 内核未通过 Redis 的 `MADV_FREE + fork()` 脏页自检，
+使用 RDB 或 AOF 后台重写可能造成数据损坏。本发布包将 Redis 配置为无 RDB、无 AOF
+的临时队列，并在禁用 fork 型持久化后设置 `ignore-warnings ARM64-COW-BUG`。
+安全事件与判定结果仍由 ClickHouse 持久化。
 
-不得在该客户内核上将 Redis 配置改回 `appendonly yes` 或启用 `save`。Redis 或服务器重启时，尚未处理的临时队列任务可能丢失；服务恢复后新事件正常入队。
+不得在该内核上将 Redis 配置改回 `appendonly yes` 或启用 `save`。Redis 或服务器重启时，
+尚未处理的临时队列任务可能丢失；服务恢复后新事件正常入队。
 
 ### Observer Source 配置失败
 

@@ -8,7 +8,7 @@
 
 ## 1. 一次性完整巡检
 
-将下面整个代码块复制到客户机器的 Bash 终端执行：
+将下面整个代码块复制到目标环境的 Bash 终端执行：
 
 ```bash
 REPORT="/mnt/anysentry-host-inspection-$(hostname)-$(date +%Y%m%d-%H%M%S).txt"
@@ -205,9 +205,9 @@ tail -n 30 /mnt/anysentry-host-inspection-*.txt
 
 需要反馈的是最新生成的完整 `.txt` 文件，而不只是最后 30 行。
 
-## 3. 可选：客户内网本地模型连通性检查
+## 3. 可选：内网本地模型连通性检查
 
-这部分会向客户内网模型发送真实 HTTP 请求，不属于上面的只读主机巡检。确认模型地址和
+这部分会向内网模型发送真实 HTTP 请求，不属于上面的只读主机巡检。确认模型地址和
 模型 ID 后再执行。`LLM_BASE_URL` 应填写到 OpenAI-compatible 的 `/v1` 层级，末尾不要写
 `/chat/completions`。
 
@@ -215,7 +215,7 @@ tail -n 30 /mnt/anysentry-host-inspection-*.txt
 
 ```bash
 LLM_BASE_URL='http://10.0.0.10:8000/v1'
-LLM_MODEL='请替换为客户模型ID'
+LLM_MODEL='请替换为模型ID'
 ```
 
 如果模型需要 API Key，使用静默输入；不需要时直接按回车：

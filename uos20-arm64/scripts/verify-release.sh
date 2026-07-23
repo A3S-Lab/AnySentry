@@ -15,7 +15,7 @@ required=(
   observer/KERNEL_VERSION_CODE
   l3/l3-agent.mjs diagnostics/a3s-bpf-syscall-probe
   install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh DEPLOYMENT.md
-  AnySentry部署手册.md AnySentry使用手册.md
+  AnySentry部署手册.md AnySentry使用手册.md AnySentry脚本说明.md
   VERSION PROVENANCE manifest.sha256
 )
 for file in "${required[@]}"; do [[ -f "$release/$file" ]] || die "release file missing: $file"; done
