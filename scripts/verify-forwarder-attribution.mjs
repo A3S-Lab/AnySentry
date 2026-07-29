@@ -60,6 +60,29 @@ function attributor(procEntries = []) {
 }
 
 {
+  const procs = new Map([
+    [580, { pid: 580, tgid: 580, ppid: 1, startTime: '58', comm: 'worker', exe: '/usr/bin/worker', argv: 'worker' }],
+  ]);
+  const judge = new AgentAttributor({
+    now: () => 1_000_000,
+    readProc: (pid) => procs.get(pid),
+  });
+  const routine = observerEvent({
+    pid: 580,
+    ppid: undefined,
+    comm: 'worker',
+    exe: '/usr/bin/worker',
+    startTimeNs: '58',
+  });
+  routine.event = { FileAccess: { pid: 580, path: '/workspace/result.txt', write: false } };
+  assert.equal(judge.classify(routine).state, 'non_agent');
+  assert.equal(judge.metrics().procReads, 1);
+  assert.equal(judge.classify(routine).state, 'non_agent');
+  assert.equal(judge.metrics().procReads, 1, 'a warm negative classification must not reread /proc');
+  assert.equal(judge.metrics().cacheHits, 1);
+}
+
+{
   const judge = attributor([
     { pid: 200, ppid: 1, startTime: '20', comm: 'systemd-worker', exe: '/usr/lib/systemd/systemd-worker', argv: '' },
     { pid: 201, ppid: 200, startTime: '21', comm: 'helper', exe: '/usr/bin/helper', argv: '' },
@@ -211,13 +234,15 @@ function attributor(procEntries = []) {
   assert.equal(agentResult.state, 'agent');
   assert.equal(agentResult.attribution.classification, 'confirmed_agent');
   assert.equal(agentResult.attribution.agentScopeId, 'claw-agent');
+  assert.equal(cache.classify(structuredClone(genericAgent)).state, 'agent');
+  assert.equal(cache.metrics().cgroupHits, 1, 'a stable cgroup must use its direct identity binding');
 
   const sidecar = structuredClone(genericAgent);
   sidecar.identity.session = 'sidecar-container-full';
   const sidecarResult = cache.classify(sidecar);
   assert.equal(sidecarResult.state, 'non_agent');
   assert.equal(sidecarResult.attribution.classification, 'non_agent');
-  assert.equal(cache.metrics().hits, 2);
+  assert.equal(cache.metrics().hits, 3);
 }
 
 {

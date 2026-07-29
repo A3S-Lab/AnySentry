@@ -1070,6 +1070,10 @@ export interface CollectorFilterMetrics {
   identityCacheEntries: number;
   identityCacheHits: number;
   identityCacheMisses: number;
+  identityCandidateCacheEntries: number;
+  identityCgroupBindings: number;
+  identityCgroupHits: number;
+  identityCgroupMisses: number;
   identityErrors: number;
   dockerEnabled: boolean;
   dockerReady: boolean;
@@ -1086,6 +1090,10 @@ export interface CollectorFilterMetrics {
   templateAmbiguous: number;
   processCacheEntries: number;
   processTombstones: number;
+  processClassifications: number;
+  processCacheHits: number;
+  processCacheMisses: number;
+  processProcReads: number;
 }
 export interface CollectorHeartbeatRecord extends Required<Pick<CollectorHeartbeatRequest, 'collectorId' | 'status'>> {
   at: number;

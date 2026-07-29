@@ -778,6 +778,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       identityCacheEntries: clamp(rawFilter.identityCacheEntries),
       identityCacheHits: clamp(rawFilter.identityCacheHits),
       identityCacheMisses: clamp(rawFilter.identityCacheMisses),
+      identityCandidateCacheEntries: clamp(rawFilter.identityCandidateCacheEntries),
+      identityCgroupBindings: clamp(rawFilter.identityCgroupBindings),
+      identityCgroupHits: clamp(rawFilter.identityCgroupHits),
+      identityCgroupMisses: clamp(rawFilter.identityCgroupMisses),
       identityErrors: clamp(rawFilter.identityErrors),
       dockerEnabled: rawFilter.dockerEnabled === true,
       dockerReady: rawFilter.dockerReady === true,
@@ -794,6 +798,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       templateAmbiguous: clamp(rawFilter.templateAmbiguous),
       processCacheEntries: clamp(rawFilter.processCacheEntries),
       processTombstones: clamp(rawFilter.processTombstones),
+      processClassifications: clamp(rawFilter.processClassifications),
+      processCacheHits: clamp(rawFilter.processCacheHits),
+      processCacheMisses: clamp(rawFilter.processCacheMisses),
+      processProcReads: clamp(rawFilter.processProcReads),
     };
     const rec: CollectorHeartbeatRecord = {
       collectorId,

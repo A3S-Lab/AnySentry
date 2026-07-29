@@ -496,6 +496,10 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       identityCacheEntries: 12,
       identityCacheHits: 8,
       identityCacheMisses: 1,
+      identityCandidateCacheEntries: 4,
+      identityCgroupBindings: 3,
+      identityCgroupHits: 7,
+      identityCgroupMisses: 1,
       identityErrors: 0,
       dockerEnabled: true,
       dockerReady: true,
@@ -512,6 +516,10 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       templateAmbiguous: 0,
       processCacheEntries: 8,
       processTombstones: 1,
+      processClassifications: 12,
+      processCacheHits: 10,
+      processCacheMisses: 2,
+      processProcReads: 1,
     },
     message: 'simulated forwarder pressure',
   });
@@ -529,7 +537,9 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       health.items?.[0]?.filterMetrics?.scope === 'shadow' &&
       health.items?.[0]?.filterMetrics?.wouldFilterNonAgent === 3 &&
       health.items?.[0]?.filterMetrics?.behaviorCandidates === 1 &&
-      health.items?.[0]?.filterMetrics?.processTombstones === 1,
+      health.items?.[0]?.filterMetrics?.processTombstones === 1 &&
+      health.items?.[0]?.filterMetrics?.identityCgroupHits === 7 &&
+      health.items?.[0]?.filterMetrics?.processProcReads === 1,
     health,
   );
 }

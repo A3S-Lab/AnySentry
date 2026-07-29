@@ -278,10 +278,10 @@ function CollectorDetail({ collector, timeType }: { collector?: CollectorHealthI
             <FieldValue label="Shadow Would Filter" value={collector.filterMetrics.wouldFilterNonAgent + collector.filterMetrics.wouldFilterNoise + collector.filterMetrics.wouldDiscoveryBudgetDrop} />
             <FieldValue label="Discovery Budget Drop" value={collector.filterMetrics.discoveryBudgetDropped} />
             <FieldValue label="Deduplicated / Queue Drop" value={`${collector.filterMetrics.deduplicated} / ${collector.filterMetrics.queueDropped}`} />
-            <FieldValue label="Identity Cache" value={`${collector.filterMetrics.identityCacheEntries} entries · ${collector.filterMetrics.identityCacheHits}/${collector.filterMetrics.identityCacheMisses} hit/miss`} />
+            <FieldValue label="Identity Cache" value={`${collector.filterMetrics.identityCacheEntries} identities · ${collector.filterMetrics.identityCgroupHits}/${collector.filterMetrics.identityCgroupMisses} cgroup hit/miss`} />
             <FieldValue label="Docker" value={collector.filterMetrics.dockerEnabled ? `${collector.filterMetrics.dockerReady ? "ready" : "starting"} · ${collector.filterMetrics.dockerEntries}` : "off"} />
             <FieldValue label="Templates" value={`${collector.filterMetrics.templateLoaded} loaded · ${collector.filterMetrics.templateMatches} matches`} />
-            <FieldValue label="Process Cache / Tombstone" value={`${collector.filterMetrics.processCacheEntries} / ${collector.filterMetrics.processTombstones}`} />
+            <FieldValue label="Process Cache / Tombstone" value={`${collector.filterMetrics.processCacheEntries} / ${collector.filterMetrics.processTombstones} · ${collector.filterMetrics.processProcReads} proc reads`} />
           </div>
         </div>
 

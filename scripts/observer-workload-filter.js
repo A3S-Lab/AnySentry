@@ -85,6 +85,11 @@ class WorkloadIdentityCache {
     this.templateRegistry = options.templateRegistry;
     this.sources = new Map();
     this.sourceMetrics = new Map();
+    this.candidateCache = new Map();
+    this.cgroupBindings = new Map();
+    this.maxEventKeys = Math.max(1_000, Number(options.maxEventKeys) || 50_000);
+    this.cgroupHits = 0;
+    this.cgroupMisses = 0;
   }
 
   replace(snapshot, sourceKey = 'kubernetes') {
@@ -140,6 +145,9 @@ class WorkloadIdentityCache {
      * share this cache without overwriting the Kubernetes snapshot.
      */
     this.byId = next;
+    // A snapshot change can reclassify or replace a container. Parsed cgroup candidates remain
+    // valid, but the fast cgroup -> identity binding must be rebuilt against the new snapshot.
+    this.cgroupBindings.clear();
     const metrics = [...this.sourceMetrics.values()];
     this.ready = metrics.some((source) => source.ready);
     this.version = metrics.reduce((total, source) => total + source.version, 0);
@@ -154,22 +162,70 @@ class WorkloadIdentityCache {
   }
 
   classify(observerEvent) {
-    const identity = eventIdentityCandidates(observerEvent);
+    const processInfo = observerEvent?.process && typeof observerEvent.process === 'object'
+      ? observerEvent.process
+      : {};
+    const cgroupKey =
+      text(processInfo.cgroupId) ||
+      text(processInfo.cgroup_id) ||
+      text(processInfo.cgroup);
+    const identityInfo =
+      observerEvent?.identity && typeof observerEvent.identity === 'object'
+        ? observerEvent.identity
+        : {};
+    const explicitContainerId = normalizedContainerId(identityInfo.session);
+    const boundIdentity = cgroupKey ? this.cgroupBindings.get(cgroupKey) : undefined;
+    const bindingConflicts =
+      boundIdentity &&
+      explicitContainerId &&
+      boundIdentity !== explicitContainerId &&
+      !boundIdentity.startsWith(explicitContainerId) &&
+      !explicitContainerId.startsWith(boundIdentity);
+    if (bindingConflicts) this.cgroupBindings.delete(cgroupKey);
+    if (boundIdentity && !bindingConflicts) {
+      const entry = this.byId.get(boundIdentity);
+      if (entry) {
+        this.hits++;
+        this.cgroupHits++;
+        return this.resultFor(entry);
+      }
+      this.cgroupBindings.delete(cgroupKey);
+    }
+    let identity;
+    const workload =
+      observerEvent?.workload && typeof observerEvent.workload === 'object'
+        ? observerEvent.workload
+        : {};
+    const candidateParts = [
+      cgroupKey,
+      text(identityInfo.session),
+      text(identityInfo.agent),
+      text(workload.provider_unit_id),
+      text(workload.replica_id),
+    ];
+    const candidateKey = candidateParts.some(Boolean) ? candidateParts.join('|') : '';
+    if (candidateKey && this.candidateCache.has(candidateKey)) {
+      identity = this.candidateCache.get(candidateKey);
+    } else {
+      identity = eventIdentityCandidates(observerEvent);
+      if (candidateKey) {
+        if (this.candidateCache.size >= this.maxEventKeys) {
+          const oldest = this.candidateCache.keys().next().value;
+          if (oldest) this.candidateCache.delete(oldest);
+        }
+        this.candidateCache.set(candidateKey, identity);
+      }
+    }
     if (!identity.containerized) return undefined;
     for (const candidate of identity.candidates) {
       const entry = this.byId.get(candidate);
       if (!entry) continue;
       this.hits++;
-      const attribution = attributionFor(entry);
-      if (entry.classification === 'confirmed_agent' || entry.classification === 'probable_agent') {
-        return { state: 'agent', attribution };
-      }
-      if (entry.classification === 'non_agent') {
-        return { state: 'non_agent', attribution };
-      }
-      return { state: 'unknown', attribution };
+      if (cgroupKey) this.cgroupBindings.set(cgroupKey, candidate);
+      return this.resultFor(entry);
     }
     this.misses++;
+    this.cgroupMisses++;
     // Container evidence without a registry match is never handed to host PID-name heuristics.
     // Metadata may be starting, stale, or temporarily unavailable, so the only safe state is
     // unknown and the event remains observable.
@@ -185,6 +241,17 @@ class WorkloadIdentityCache {
         evidence: [this.ready ? 'workload_snapshot:miss' : 'workload_snapshot:not_ready'],
       },
     };
+  }
+
+  resultFor(entry) {
+    const attribution = attributionFor(entry);
+    if (entry.classification === 'confirmed_agent' || entry.classification === 'probable_agent') {
+      return { state: 'agent', attribution };
+    }
+    if (entry.classification === 'non_agent') {
+      return { state: 'non_agent', attribution };
+    }
+    return { state: 'unknown', attribution };
   }
 
   metrics() {
@@ -207,6 +274,10 @@ class WorkloadIdentityCache {
           },
         ]),
       ),
+      candidateCacheEntries: this.candidateCache.size,
+      cgroupBindings: this.cgroupBindings.size,
+      cgroupHits: this.cgroupHits,
+      cgroupMisses: this.cgroupMisses,
     };
   }
 }
@@ -220,7 +291,7 @@ class DiscoveryBudget {
     this.windows = new Map();
   }
 
-  allow(observerEvent) {
+  allow(observerEvent, pressure = 0) {
     const identity = eventIdentityCandidates(observerEvent);
     const processInfo = observerEvent?.process && typeof observerEvent.process === 'object'
       ? observerEvent.process
@@ -241,7 +312,12 @@ class DiscoveryBudget {
       window = { startedAt: now, count: 0 };
       this.windows.set(key, window);
     }
-    if (window.count >= this.limit) return false;
+    const normalizedPressure = Math.max(0, Math.min(1, Number(pressure) || 0));
+    const effectiveLimit = Math.max(
+      1,
+      Math.floor(this.limit * (1 - normalizedPressure * 0.75)),
+    );
+    if (window.count >= effectiveLimit) return false;
     window.count++;
     if (this.windows.size > this.maxKeys) {
       for (const [candidate, item] of this.windows) {

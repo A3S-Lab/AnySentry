@@ -17,6 +17,7 @@ const { AgentAttributor } = require('./observer-agent-attribution');
 const { AgentTemplateRegistry, loadTemplateDocument } = require('./observer-agent-templates');
 const { DockerDiscovery } = require('./observer-docker-discovery');
 const { BehavioralAgentDetector } = require('./observer-behavior-discovery');
+const { BoundedPriorityQueue } = require('./observer-priority-queue');
 const { ToolExecDeduper } = require('./observer-event-dedup');
 const { DiscoveryBudget, WorkloadIdentityCache } = require('./observer-workload-filter');
 
@@ -113,7 +114,7 @@ const toolExecDeduper = new ToolExecDeduper({
 });
 
 let inflight = 0;
-let pending = [];
+const pending = new BoundedPriorityQueue(MAX_QUEUE, 5);
 let outputDropped = 0;
 let errorCount = 0;
 let eventKindCounts = Object.create(null);
@@ -343,6 +344,10 @@ function sendHeartbeat(done = () => {}) {
         identityCacheEntries: workload.entries,
         identityCacheHits: workload.hits,
         identityCacheMisses: workload.misses,
+        identityCandidateCacheEntries: workload.candidateCacheEntries,
+        identityCgroupBindings: workload.cgroupBindings,
+        identityCgroupHits: workload.cgroupHits,
+        identityCgroupMisses: workload.cgroupMisses,
         identityErrors: workload.errors,
         dockerEnabled: docker.enabled,
         dockerReady: docker.ready,
@@ -359,8 +364,12 @@ function sendHeartbeat(done = () => {}) {
         templateAmbiguous: templates.ambiguous,
         processCacheEntries: processes.processes,
         processTombstones: processes.tombstones,
+        processClassifications: processes.classifications,
+        processCacheHits: processes.cacheHits,
+        processCacheMisses: processes.cacheMisses,
+        processProcReads: processes.procReads,
       },
-      message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
+      message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
     },
     5000,
@@ -425,7 +434,13 @@ function flushPending() {
     clearTimeout(batchTimer);
     batchTimer = undefined;
   }
-  const batch = pending.splice(0, BATCH_SIZE);
+  const adaptiveBatchSize =
+    pending.length >= BATCH_SIZE * 8
+      ? Math.min(256, BATCH_SIZE * 4)
+      : pending.length >= BATCH_SIZE * 2
+        ? Math.min(256, BATCH_SIZE * 2)
+        : BATCH_SIZE;
+  const batch = pending.take(adaptiveBatchSize);
   inflight++;
   attributionCounts.batches++;
   attributionCounts.batchEvents += batch.length;
@@ -439,21 +454,12 @@ function flushPending() {
 }
 
 function enqueue(body, priority) {
-  if (pending.length >= MAX_QUEUE) {
-    let lowestIndex = 0;
-    for (let index = 1; index < pending.length; index += 1) {
-      if (pending[index].priority < pending[lowestIndex].priority) lowestIndex = index;
-    }
-    if (priority <= pending[lowestIndex].priority) {
-      outputDropped++;
-      attributionCounts.queueDropped++;
-      return;
-    }
-    pending.splice(lowestIndex, 1);
+  const result = pending.push({ body, priority }, priority);
+  if (!result.accepted || result.dropped) {
     outputDropped++;
     attributionCounts.queueDropped++;
   }
-  pending.push({ body, priority });
+  if (!result.accepted) return;
   attributionCounts.forwarded++;
   if (pending.length >= BATCH_SIZE) flushPending();
   else scheduleBatch();
@@ -476,9 +482,9 @@ function flushAndClose() {
       return;
     }
     if (pending.length > 0) {
-      outputDropped += pending.length;
-      attributionCounts.queueDropped += pending.length;
-      pending = [];
+      const abandoned = pending.clear();
+      outputDropped += abandoned;
+      attributionCounts.queueDropped += abandoned;
     }
     sendHeartbeat(() => {
       closeTransports();
@@ -533,7 +539,7 @@ rl.on('line', (raw) => {
     } else if (
       classification.state === 'unknown' &&
       kind === 'FileAccess' &&
-      !discoveryBudget.allow(o)
+      !discoveryBudget.allow(o, pending.length / MAX_QUEUE)
     ) {
       // Snapshot outages fail open for high-value evidence. Only routine unknown FileAccess is
       // budgeted. Shadow evaluates the same stateful decision without dropping the event.

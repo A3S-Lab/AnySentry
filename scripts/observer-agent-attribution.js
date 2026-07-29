@@ -96,13 +96,28 @@ class AgentAttributor {
       positiveInt(options.maxTombstones) ||
       positiveInt(process.env.ANYSENTRY_PROCESS_MAX_TOMBSTONES) ||
       this.maxProcs;
+    this.negativeTtlMs =
+      positiveInt(options.negativeTtlMs) ||
+      positiveInt(process.env.ANYSENTRY_PROCESS_NEGATIVE_TTL_MS) ||
+      1_000;
+    this.stats = {
+      classifications: 0,
+      cacheHits: 0,
+      cacheMisses: 0,
+      procReads: 0,
+    };
+  }
+
+  readProcess(pid) {
+    this.stats.procReads++;
+    return this.readProc(pid);
   }
 
   seedFromProc() {
     const now = this.now();
     const snapshot = new Map();
     for (const pid of this.listPids().slice(0, this.maxProcs)) {
-      const info = this.readProc(pid);
+      const info = this.readProcess(pid);
       if (info) snapshot.set(pid, info);
     }
 
@@ -149,36 +164,85 @@ class AgentAttributor {
 
   classify(observerEvent) {
     const now = this.now();
+    this.stats.classifications++;
     const payload = eventPayload(observerEvent);
     const processInfo = observerEvent?.process && typeof observerEvent.process === 'object' ? observerEvent.process : {};
     const pid = positiveInt(processInfo.pid) || positiveInt(payload.pid) || positiveInt(observerEvent?.identity?.task);
     if (!pid) return this.unknown();
     const exiting = Object.prototype.hasOwnProperty.call(observerEvent?.event ?? {}, 'ProcessExit');
-
-    const live = this.readProc(pid);
-    const current = {
+    const toolExec = Object.prototype.hasOwnProperty.call(observerEvent?.event ?? {}, 'ToolExec');
+    const observed = {
       pid,
-      ppid: positiveInt(processInfo.ppid) || positiveInt(payload.ppid) || live?.ppid,
+      ppid: positiveInt(processInfo.ppid) || positiveInt(payload.ppid),
       startTime:
         text(processInfo.startTimeTicks) ||
         text(processInfo.start_time_ticks) ||
         text(processInfo.startTimeNs) ||
-        text(processInfo.start_time_ns) ||
-        live?.startTime,
-      comm: text(processInfo.comm) || live?.comm || text(observerEvent?.identity?.agent),
-      exe: text(processInfo.exe) || live?.exe,
-      argv: argvText(payload.argv) || live?.argv,
+        text(processInfo.start_time_ns),
+      cgroupId: text(processInfo.cgroupId) || text(processInfo.cgroup_id),
+      comm: text(processInfo.comm) || text(observerEvent?.identity?.agent),
+      exe: text(processInfo.exe),
+      argv: argvText(payload.argv),
     };
-    this.discardReusedPid(current);
+    this.discardReusedPid(observed);
+    const cached = this.procs.get(pid);
+    const sameCachedProcess = Boolean(
+      cached &&
+      (
+        (observed.startTime && cached.startTime === observed.startTime) ||
+        (!observed.startTime &&
+          observed.cgroupId &&
+          cached.cgroupId &&
+          observed.cgroupId === cached.cgroupId)
+      ),
+    );
+    let current = {
+      ...(sameCachedProcess ? cached : {}),
+      ...observed,
+      ppid: observed.ppid || (sameCachedProcess ? cached.ppid : undefined),
+      startTime: observed.startTime || (sameCachedProcess ? cached.startTime : undefined),
+      cgroupId: observed.cgroupId || (sameCachedProcess ? cached.cgroupId : undefined),
+      comm: observed.comm || (sameCachedProcess ? cached.comm : ''),
+      exe: observed.exe || (sameCachedProcess ? cached.exe : ''),
+      argv: observed.argv || (sameCachedProcess ? cached.argv : ''),
+    };
+    if (sameCachedProcess) this.stats.cacheHits++;
+    else this.stats.cacheMisses++;
 
     const directAgent = this.matchAgent(current);
     if (directAgent) return this.finish(pid, this.rememberAgent(current, directAgent, pid, 'hint_only', 'argv'), exiting, current);
 
-    const existing = this.procs.get(pid);
+    const existing = sameCachedProcess ? cached : undefined;
     if (existing?.state === 'agent') return this.finish(pid, this.agentResult(existing), exiting, current);
     const tombstone = this.tombstoneFor(current);
     if (tombstone?.state === 'agent') {
       return this.finish(pid, this.agentResult(tombstone), exiting, current);
+    }
+
+    // Routine file/network/security observations reuse a recent negative result. ToolExec and
+    // ProcessExit re-evaluate because they are lifecycle/high-signal boundaries and can repair
+    // out-of-order parent information.
+    if (!toolExec && !exiting && existing?.nextResolveAt > now) {
+      if (existing.state === 'non_agent') return this.nonAgentResult();
+      return this.unknown();
+    }
+
+    // Observer normally supplies the complete process instance. `/proc` is now a cache-miss and
+    // missing-fact fallback instead of an unconditional per-event read.
+    if (!current.ppid || !current.startTime || !current.comm) {
+      const live = this.readProcess(pid);
+      if (live) {
+        this.discardReusedPid(live);
+        current = {
+          ...live,
+          ...current,
+          ppid: current.ppid || live.ppid,
+          startTime: current.startTime || live.startTime,
+          comm: current.comm || live.comm,
+          exe: current.exe || live.exe,
+          argv: current.argv || live.argv,
+        };
+      }
     }
 
     // Short-process events can arrive out of order. Re-evaluate negative cache entries when
@@ -190,21 +254,25 @@ class AgentAttributor {
 
     if (ancestry.state === 'non_agent') {
       this.remember({ ...current, state: 'non_agent', lastSeen: now });
-      return this.finish(pid, {
-        state: 'non_agent',
-        attribution: {
-          monitored: false,
-          classification: 'non_agent',
-          confidence: 1,
-          reason: 'not_agent',
-          source: 'process_graph',
-          evidence: ['process_lineage:pid1'],
-        },
-      }, exiting, current);
+      return this.finish(pid, this.nonAgentResult(), exiting, current);
     }
 
     this.remember({ ...current, state: 'unknown', lastSeen: now });
     return this.finish(pid, this.unknown(), exiting, current);
+  }
+
+  nonAgentResult() {
+    return {
+      state: 'non_agent',
+      attribution: {
+        monitored: false,
+        classification: 'non_agent',
+        confidence: 1,
+        reason: 'not_agent',
+        source: 'process_graph',
+        evidence: ['process_lineage:pid1'],
+      },
+    };
   }
 
   finish(pid, result, exiting, current) {
@@ -266,7 +334,7 @@ class AgentAttributor {
       if (cached?.state === 'agent') return { state: 'agent', agentId: cached.agentId, rootPid: cached.rootPid };
       if (pid === 1) return { state: 'non_agent' };
 
-      const live = this.readProc(pid);
+      const live = this.readProcess(pid);
       if (!live) return cached?.state === 'non_agent' ? { state: 'non_agent' } : { state: 'unknown' };
       this.discardReusedPid(live);
 
@@ -278,7 +346,7 @@ class AgentAttributor {
           return { state: 'agent', agentId: leaderCached.agentId, rootPid: leaderCached.rootPid };
         }
 
-        const leader = this.readProc(tgid);
+        const leader = this.readProcess(tgid);
         if (leader) {
           this.discardReusedPid(leader);
           const leaderAgent = this.matchAgent(leader);
@@ -398,7 +466,13 @@ class AgentAttributor {
       }
       if (this.procs.size >= this.maxProcs) this.procs.clear();
     }
-    this.procs.set(record.pid, record);
+    this.procs.set(record.pid, {
+      ...record,
+      nextResolveAt:
+        record.state === 'agent'
+          ? 0
+          : record.nextResolveAt ?? now + this.negativeTtlMs,
+    });
   }
 
   metrics() {
@@ -406,6 +480,7 @@ class AgentAttributor {
     return {
       processes: this.procs.size,
       tombstones: this.tombstones.size,
+      ...this.stats,
     };
   }
 }
