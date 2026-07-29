@@ -67,6 +67,11 @@ assert.equal(nodeSnapshot.entries.some((entry) => entry.nodeName === 'node-b'), 
 assert.equal(nodeSnapshot.entries.find((entry) => entry.ids.includes(agentId))?.classification, 'confirmed_agent');
 assert.equal(nodeSnapshot.entries.find((entry) => entry.ids.includes(sidecarId))?.classification, 'non_agent');
 assert.equal(nodeSnapshot.entries.find((entry) => entry.ids.includes(agentId))?.agentScopeId, 'claw-agent');
+assert.equal(
+  service.snapshot('node-b').entries.find((entry) => entry.podUid === 'pod-infra-uid')?.classification,
+  'unknown',
+  'an unlabelled Pod remains discoverable instead of becoming positive non-Agent evidence',
+);
 
 const enriched = service.enrich({
   workspacePath: 'agent://pod-agent-uid',

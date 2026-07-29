@@ -1,0 +1,38 @@
+{
+  "schemaVersion": "anysentry.agent_templates.v1",
+  "templates": [
+    {
+      "id": "docker-claw",
+      "agentId": "claw",
+      "deployment": "docker",
+      "name": "claw"
+    },
+    {
+      "id": "kubernetes-review-agent",
+      "agentId": "review-agent",
+      "deployment": "kubernetes",
+      "match": {
+        "namespace": "agents-*",
+        "pod": "review-*",
+        "container": "agent"
+      }
+    },
+    {
+      "id": "bare-metal-codex",
+      "agentId": "codex",
+      "deployment": "host",
+      "match": {
+        "systemdUnit": "codex*.service"
+      }
+    },
+    {
+      "id": "known-monitoring-infrastructure",
+      "deployment": "kubernetes",
+      "classification": "non_agent",
+      "match": {
+        "namespace": "monitoring",
+        "pod": "prometheus-*"
+      }
+    }
+  ]
+}

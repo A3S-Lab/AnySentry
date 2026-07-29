@@ -13,6 +13,7 @@ const http = require('node:http');
 const https = require('node:https');
 const readline = require('node:readline');
 const { AgentAttributor } = require('./observer-agent-attribution');
+const { AgentTemplateRegistry, loadTemplateDocument } = require('./observer-agent-templates');
 const { ToolExecDeduper } = require('./observer-event-dedup');
 const { DiscoveryBudget, WorkloadIdentityCache } = require('./observer-workload-filter');
 
@@ -78,11 +79,22 @@ const identitySnapshotTarget = new URL(
 if (NODE_NAME) identitySnapshotTarget.searchParams.set('nodeName', NODE_NAME);
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_INFLIGHT });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_INFLIGHT });
+let templateDocument;
+let templateLoadErrors = 0;
+try {
+  templateDocument = loadTemplateDocument();
+} catch (error) {
+  templateLoadErrors++;
+  templateDocument = { templates: [], source: 'invalid' };
+  console.error(`[observer-forward] agent templates ignored: ${error.message}`);
+}
+const templateRegistry = new AgentTemplateRegistry(templateDocument);
 const attributor = new AgentAttributor();
-const workloadCache = new WorkloadIdentityCache();
+const workloadCache = new WorkloadIdentityCache({ templateRegistry });
 const discoveryBudget = new DiscoveryBudget({ limit: UNKNOWN_FILE_BUDGET_PER_SEC });
 const bootstrap = attributor.seedFromProc();
 console.error(`[observer-forward] process snapshot: scanned=${bootstrap.scanned}; agent_roots=${bootstrap.roots}; agent_descendants=${bootstrap.descendants}`);
+console.error(`[observer-forward] agent templates: source=${templateRegistry.source}; loaded=${templateRegistry.metrics().loaded}; invalid=${templateRegistry.metrics().invalid + templateLoadErrors}`);
 const toolExecDeduper = new ToolExecDeduper({
   windowMs: process.env.FORWARD_DEDUP_WINDOW_MS,
   maxKeys: process.env.FORWARD_MAX_DEDUP_KEYS,
@@ -421,7 +433,12 @@ rl.on('line', (raw) => {
     attributionCounts.deduplicated++;
     return;
   }
-  const classification = workloadCache.classify(o) ?? attributor.classify(o);
+  const workloadClassification = workloadCache.classify(o);
+  const templateClassification = templateRegistry.classifyEvent(o);
+  const classification =
+    templateClassification ??
+    workloadClassification ??
+    attributor.classify(o);
   const classificationName = classification.attribution?.classification;
   if (classification.state === 'agent' && classificationName === 'confirmed_agent') {
     attributionCounts.confirmedAgent++;

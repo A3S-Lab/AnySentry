@@ -202,6 +202,23 @@ heartbeat. Routine `FileAccess` from unknown workloads is capped by a per-worklo
 subject to that budget. Use `FORWARD_SCOPE=all` for fallback or `FORWARD_SCOPE=shadow` for
 comparison.
 
+Operators can describe an Agent without copying exact Pod UIDs, Container IDs, or PIDs. Start from
+`deploy/agent-templates.example.json`, keep only the deployments you own, and pass it to the node
+forwarder:
+
+```bash
+ANYSENTRY_AGENT_TEMPLATES_FILE=/etc/anysentry/agent-templates.json \
+FORWARD_SCOPE=shadow \
+node scripts/observer-forward.js
+```
+
+The shortest useful template is `{ "agentId": "claw", "deployment": "docker", "name": "claw" }`.
+The name is matched against natural runtime fields; optional `match` fields narrow namespace, Pod,
+container, image, owner, systemd unit, executable, command, or labels. Use
+`classification: "non_agent"` only for infrastructure the operator positively owns. An unlabelled
+or unmatched workload remains `unknown` so framework discovery can still identify a new Agent.
+`ANYSENTRY_AGENT_TEMPLATES_JSON` accepts the same document inline for small deployments.
+
 ### Kubernetes integrated stack
 
 Kubernetes mode creates the namespace, ClickHouse Secret, bundled ClickHouse, AnySentry

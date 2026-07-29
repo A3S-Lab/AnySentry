@@ -82,6 +82,8 @@ export interface WorkloadIdentitySnapshotEntry {
   ids: string[];
   classification: AgentClassification;
   physicalWorkloadId: string;
+  source?: 'kubernetes' | 'docker' | 'systemd' | 'host';
+  environment?: 'kubernetes' | 'docker' | 'host';
   agentScopeId?: string;
   agentDisplayName?: string;
   agentInstanceId?: string;
@@ -90,6 +92,11 @@ export interface WorkloadIdentitySnapshotEntry {
   podUid?: string;
   nodeName?: string;
   containerName?: string;
+  containerImage?: string;
+  ownerKind?: string;
+  ownerName?: string;
+  labels?: Record<string, string>;
+  systemdUnit?: string;
   evidence: string[];
 }
 

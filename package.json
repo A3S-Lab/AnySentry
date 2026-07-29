@@ -38,6 +38,7 @@
     "verify:observer-ingest:local": "pnpm build:api && node scripts/verify-deep-links-local.mjs scripts/verify-observer-ingest.mjs",
     "verify:forwarders": "node scripts/verify-forwarders.mjs",
     "verify:forwarder-attribution": "node scripts/verify-forwarder-attribution.mjs",
+    "verify:agent-templates": "node scripts/verify-agent-templates.mjs",
     "verify:kube-identity": "pnpm build:api && node scripts/verify-kube-identity.mjs",
     "verify:forwarders:local": "pnpm build:api && node scripts/verify-deep-links-local.mjs scripts/verify-forwarders.mjs",
     "verify:operations-lifecycle": "node scripts/verify-operations-lifecycle.mjs",

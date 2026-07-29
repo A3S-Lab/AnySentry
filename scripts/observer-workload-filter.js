@@ -66,7 +66,7 @@ function attributionFor(entry) {
         : classification === 'non_agent'
           ? 'not_agent'
           : 'not_evaluated',
-    source: 'kubernetes',
+    source: entry.attributionSource || entry.source || 'kubernetes',
     evidence: Array.isArray(entry.evidence) ? entry.evidence.slice(0, 16) : [],
   };
 }
@@ -82,9 +82,11 @@ class WorkloadIdentityCache {
     this.errors = 0;
     this.hits = 0;
     this.misses = 0;
+    this.templateRegistry = options.templateRegistry;
+    this.sources = new Map();
   }
 
-  replace(snapshot) {
+  replace(snapshot, sourceKey = 'kubernetes') {
     if (
       !snapshot ||
       snapshot.schemaVersion !== 'anysentry.workload_identity_snapshot.v1' ||
@@ -93,14 +95,42 @@ class WorkloadIdentityCache {
       this.errors++;
       return false;
     }
-    const next = new Map();
+    const sourceEntries = [];
     for (const entry of snapshot.entries) {
       if (!entry || !Array.isArray(entry.ids) || !text(entry.classification)) continue;
-      for (const rawId of entry.ids) {
-        const id = normalizedContainerId(rawId);
-        if (id && !next.has(id)) next.set(id, entry);
+      const template = this.templateRegistry?.classifyEntry(entry);
+      const nextEntry = template
+        ? {
+            ...entry,
+            classification: template.attribution.classification,
+            agentScopeId: template.attribution.agentScopeId,
+            agentDisplayName: template.attribution.agentDisplayName,
+            agentInstanceId:
+              entry.agentInstanceId ||
+              (template.attribution.agentScopeId ? entry.physicalWorkloadId : undefined),
+            attributionSource: template.attribution.source,
+            evidence: [
+              ...(Array.isArray(entry.evidence) ? entry.evidence : []),
+              ...(template.attribution.evidence ?? []),
+            ].slice(0, 16),
+          }
+        : entry;
+      sourceEntries.push(nextEntry);
+    }
+    this.sources.set(sourceKey, sourceEntries);
+    const next = new Map();
+    for (const entries of this.sources.values()) {
+      for (const entry of entries) {
+        for (const rawId of entry.ids) {
+          const id = normalizedContainerId(rawId);
+          if (id && !next.has(id)) next.set(id, entry);
+        }
       }
     }
+    /*
+     * A source replacement is atomic from the event loop's perspective. A later Docker source can
+     * share this cache without overwriting the Kubernetes snapshot.
+     */
     this.byId = next;
     this.ready = snapshot.ready === true;
     this.version = Number(snapshot.version) || 0;

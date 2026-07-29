@@ -8,6 +8,18 @@
 # The image bundles the public a3s-observer with the node forwarder. Build it from this repo
 # (see deploy/observer-forwarder.Dockerfile + deploy/README.md) and push to YOUR registry, then set
 # the `image:` below to that tag.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: anysentry-agent-templates
+  namespace: anysentry
+data:
+  agent-templates.json: |
+    {
+      "schemaVersion": "anysentry.agent_templates.v1",
+      "templates": []
+    }
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -54,6 +66,7 @@ spec:
             - { name: ANYSENTRY_INGEST_URL, value: "http://anysentry:29653/security-center/ingest" }
             - { name: ANYSENTRY_IDENTITY_SNAPSHOT_URL, value: "http://anysentry:29653/security-center/identity/snapshot" }
             - { name: ANYSENTRY_IDENTITY_SNAPSHOT_SECS, value: "15" }
+            - { name: ANYSENTRY_AGENT_TEMPLATES_FILE, value: "/etc/anysentry/agent-templates.json" }
             # Bound memory and amortize HTTP/JSON overhead without adding perceptible UI delay.
             - { name: FORWARD_BATCH_SIZE, value: "32" }
             - { name: FORWARD_BATCH_FLUSH_MS, value: "50" }
@@ -64,6 +77,7 @@ spec:
           args: ["a3s-observer-collector | node /opt/observer-forward.js"]
           volumeMounts:
             - { name: sys, mountPath: /sys, readOnly: true } # tracepoint ids under /sys
+            - { name: agent-templates, mountPath: /etc/anysentry, readOnly: true }
           resources:
             requests: { cpu: 50m, memory: 128Mi }
             # 1Gi: full signal set (FILES high-volume + SSL uprobes) tracks more state, plus the
@@ -71,5 +85,6 @@ spec:
             limits: { memory: 1Gi }
       volumes:
         - { name: sys, hostPath: { path: /sys } }
+        - { name: agent-templates, configMap: { name: anysentry-agent-templates } }
       tolerations:
         - operator: Exists # every node, including tainted/control-plane

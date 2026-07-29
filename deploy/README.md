@@ -157,6 +157,12 @@ metadata:
 Set `FORWARD_SCOPE=all` for the unfiltered fallback or `FORWARD_SCOPE=shadow` to compute decisions
 and compare counters before applying the filter.
 
+For operator-managed discovery, copy `deploy/agent-templates.example.json` and set
+`ANYSENTRY_AGENT_TEMPLATES_FILE` in the observer-forwarder environment. Templates intentionally
+accept concise deployment/name declarations and may be refined with Kubernetes namespace/Pod/
+container/owner, Docker container/image, or bare-metal systemd/executable fields. Missing templates
+do not classify a workload as non-Agent.
+
 ## Safety
 
 - **Observe-only.** Only `a3s-observer-collector` runs — never `a3s-observer-enforce` /

@@ -5,6 +5,7 @@ import { EventMeta, WorkloadIdentitySnapshot, WorkloadIdentitySnapshotEntry } fr
 
 const SA = '/var/run/secrets/kubernetes.io/serviceaccount';
 const DEFAULT_AGENT_SELECTOR = 'anysentry.io/workload-kind=agent';
+const WORKLOAD_KIND_LABEL = 'anysentry.io/workload-kind';
 const AGENT_ID_LABEL = 'anysentry.io/agent-id';
 const AGENT_CONTAINER_LABEL = 'anysentry.io/agent-container';
 const WATCH_TIMEOUT_SECONDS = 300;
@@ -16,6 +17,12 @@ interface KubeMetadata {
   resourceVersion?: string;
   labels?: Record<string, string>;
   annotations?: Record<string, string>;
+  ownerReferences?: Array<{
+    kind?: string;
+    name?: string;
+    uid?: string;
+    controller?: boolean;
+  }>;
 }
 
 interface KubeContainerStatus {
@@ -27,7 +34,7 @@ interface KubePod {
   metadata?: KubeMetadata;
   spec?: {
     nodeName?: string;
-    containers?: Array<{ name?: string }>;
+    containers?: Array<{ name?: string; image?: string }>;
   };
   status?: {
     containerStatuses?: KubeContainerStatus[];
@@ -69,6 +76,14 @@ function selectorMatches(labels: Record<string, string>, selector: string): bool
     const match = /^([^!=\s]+)\s*(?:==|=)\s*(.+)$/.exec(requirement);
     return Boolean(match && labels[match[1]] === match[2]);
   });
+}
+
+function boundedLabels(labels: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(labels)
+      .slice(0, 64)
+      .map(([key, value]) => [key.slice(0, 128), String(value).slice(0, 256)]),
+  );
 }
 
 /**
@@ -349,20 +364,35 @@ export class KubeIdentityService implements OnModuleInit, OnModuleDestroy {
     const labels = metadata.labels ?? {};
     const annotations = metadata.annotations ?? {};
     const selectedAgent = selectorMatches(labels, this.agentSelector);
+    const explicitNonAgent = ['non-agent', 'non_agent', 'infrastructure'].includes(
+      labels[WORKLOAD_KIND_LABEL]?.trim().toLowerCase(),
+    );
     const agentId = selectedAgent ? labels[AGENT_ID_LABEL]?.trim() || podName : undefined;
     const explicitContainer =
       labels[AGENT_CONTAINER_LABEL]?.trim() || annotations[AGENT_CONTAINER_LABEL]?.trim();
     const configuredContainers = (pod.spec?.containers ?? [])
       .map((container) => container.name?.trim())
       .filter((name): name is string => Boolean(name));
+    const imagesByContainer = new Map(
+      (pod.spec?.containers ?? [])
+        .filter((container) => container.name)
+        .map((container) => [container.name as string, container.image?.trim()]),
+    );
+    const owner =
+      metadata.ownerReferences?.find((candidate) => candidate.controller) ??
+      metadata.ownerReferences?.[0];
     const singleContainer = configuredContainers.length === 1 ? configuredContainers[0] : undefined;
     const selectedContainer = explicitContainer || singleContainer;
     const statuses = pod.status?.containerStatuses ?? [];
-    const baseEvidence = selectedAgent
-      ? [`label:${this.agentSelector}`, `label:${AGENT_ID_LABEL}=${agentId}`]
-      : [`selector_miss:${this.agentSelector}`];
-    const podClassification = !selectedAgent
+    const baseEvidence = explicitNonAgent
+      ? [`label:${WORKLOAD_KIND_LABEL}=${labels[WORKLOAD_KIND_LABEL]}`]
+      : selectedAgent
+        ? [`label:${this.agentSelector}`, `label:${AGENT_ID_LABEL}=${agentId}`]
+        : [`selector_miss:${this.agentSelector}`];
+    const podClassification = explicitNonAgent
       ? 'non_agent'
+      : !selectedAgent
+        ? 'unknown'
       : selectedContainer
         ? 'confirmed_agent'
         : 'probable_agent';
@@ -372,6 +402,11 @@ export class KubeIdentityService implements OnModuleInit, OnModuleDestroy {
       podName,
       podUid,
       nodeName,
+      source: 'kubernetes' as const,
+      environment: 'kubernetes' as const,
+      ownerKind: owner?.kind,
+      ownerName: owner?.name,
+      labels: boundedLabels(labels),
       agentScopeId: agentId,
       agentDisplayName: agentId,
       agentInstanceId: selectedAgent ? `${podUid}/${selectedContainer ?? 'pod'}` : undefined,
@@ -392,8 +427,10 @@ export class KubeIdentityService implements OnModuleInit, OnModuleDestroy {
       const containerName = status.name?.trim();
       const isAgentContainer =
         selectedAgent && Boolean(selectedContainer) && containerName === selectedContainer;
-      const classification = !selectedAgent
+      const classification = explicitNonAgent
         ? 'non_agent'
+        : !selectedAgent
+          ? 'unknown'
         : isAgentContainer
           ? 'confirmed_agent'
           : selectedContainer
@@ -405,6 +442,7 @@ export class KubeIdentityService implements OnModuleInit, OnModuleDestroy {
         physicalWorkloadId: `${podPhysicalId}:${containerId}`,
         ...common,
         containerName,
+        containerImage: containerName ? imagesByContainer.get(containerName) : undefined,
         agentScopeId: isAgentContainer ? agentId : undefined,
         agentDisplayName: isAgentContainer ? agentId : undefined,
         agentInstanceId: isAgentContainer ? `${podUid}/${containerId}` : undefined,
