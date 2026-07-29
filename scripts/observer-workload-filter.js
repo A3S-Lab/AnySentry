@@ -84,6 +84,7 @@ class WorkloadIdentityCache {
     this.misses = 0;
     this.templateRegistry = options.templateRegistry;
     this.sources = new Map();
+    this.sourceMetrics = new Map();
   }
 
   replace(snapshot, sourceKey = 'kubernetes') {
@@ -118,6 +119,13 @@ class WorkloadIdentityCache {
       sourceEntries.push(nextEntry);
     }
     this.sources.set(sourceKey, sourceEntries);
+    this.sourceMetrics.set(sourceKey, {
+      ready: snapshot.ready === true,
+      version: Number(snapshot.version) || 0,
+      generatedAt: text(snapshot.generatedAt),
+      updatedAt: this.now(),
+      errors: Number(snapshot.errors) || 0,
+    });
     const next = new Map();
     for (const entries of this.sources.values()) {
       for (const entry of entries) {
@@ -132,11 +140,16 @@ class WorkloadIdentityCache {
      * share this cache without overwriting the Kubernetes snapshot.
      */
     this.byId = next;
-    this.ready = snapshot.ready === true;
-    this.version = Number(snapshot.version) || 0;
-    this.generatedAt = text(snapshot.generatedAt);
+    const metrics = [...this.sourceMetrics.values()];
+    this.ready = metrics.some((source) => source.ready);
+    this.version = metrics.reduce((total, source) => total + source.version, 0);
+    this.generatedAt = metrics
+      .map((source) => source.generatedAt)
+      .filter(Boolean)
+      .sort()
+      .at(-1) || '';
     this.updatedAt = this.now();
-    this.errors = Number(snapshot.errors) || 0;
+    this.errors = metrics.reduce((total, source) => total + source.errors, 0);
     return true;
   }
 
@@ -183,6 +196,17 @@ class WorkloadIdentityCache {
       hits: this.hits,
       misses: this.misses,
       errors: this.errors,
+      sources: Object.fromEntries(
+        [...this.sourceMetrics.entries()].map(([source, value]) => [
+          source,
+          {
+            ready: value.ready,
+            version: value.version,
+            entries: this.sources.get(source)?.length ?? 0,
+            errors: value.errors,
+          },
+        ]),
+      ),
     };
   }
 }

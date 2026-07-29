@@ -272,6 +272,11 @@ your agents actually run. Mark Agent Pods with
 Pods must also set `anysentry.io/agent-container=<container-name>` so sidecars do not inherit the
 Agent classification.
 
+Set `ANYSENTRY_AGENT_NAMESPACES=*` only when the AnySentry ServiceAccount has a read-only
+cluster-wide Pod `list/watch` permission. This mode uses one cluster-scoped list/watch and discovers
+new namespaces without restarting AnySentry. The bundled manifest remains namespaced and
+least-privilege by default.
+
 If your cluster cannot pull the public observer-forwarder image, build and push it, then set
 `ANYSENTRY_OBSERVER_IMAGE`:
 

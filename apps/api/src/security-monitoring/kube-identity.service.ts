@@ -231,7 +231,7 @@ export class KubeIdentityService implements OnModuleInit, OnModuleDestroy {
       ...(resourceVersion ? { resourceVersion } : {}),
     });
     const request = this.request(
-      `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods?${params.toString()}`,
+      this.podsPath(namespace, params),
       (response) => {
         if ((response.statusCode ?? 500) >= 400) {
           response.resume();
@@ -463,13 +463,19 @@ export class KubeIdentityService implements OnModuleInit, OnModuleDestroy {
       const params = new URLSearchParams({ limit: '2000' });
       if (continuation) params.set('continue', continuation);
       const page = await this.requestJson<KubePodList>(
-        `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods?${params.toString()}`,
+        this.podsPath(namespace, params),
       );
       pods.push(...(page.items ?? []));
       resourceVersion = page.metadata?.resourceVersion ?? resourceVersion;
       continuation = page.metadata?.continue ?? '';
     } while (continuation);
     return { pods, resourceVersion };
+  }
+
+  private podsPath(namespace: string, params: URLSearchParams): string {
+    return namespace === '*'
+      ? `/api/v1/pods?${params.toString()}`
+      : `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods?${params.toString()}`;
   }
 
   private requestJson<T>(path: string): Promise<T> {

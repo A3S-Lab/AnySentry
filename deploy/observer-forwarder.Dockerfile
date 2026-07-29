@@ -10,6 +10,7 @@ COPY --from=nodebin /usr/local/bin/node /usr/local/bin/node
 COPY scripts/observer-forward.js /opt/observer-forward.js
 COPY scripts/observer-agent-attribution.js /opt/observer-agent-attribution.js
 COPY scripts/observer-agent-templates.js /opt/observer-agent-templates.js
+COPY scripts/observer-docker-discovery.js /opt/observer-docker-discovery.js
 COPY scripts/observer-event-dedup.js /opt/observer-event-dedup.js
 COPY scripts/observer-workload-filter.js /opt/observer-workload-filter.js
 # The DaemonSet supplies the command: a3s-observer-collector | node /opt/observer-forward.js

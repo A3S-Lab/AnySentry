@@ -163,6 +163,16 @@ accept concise deployment/name declarations and may be refined with Kubernetes n
 container/owner, Docker container/image, or bare-metal systemd/executable fields. Missing templates
 do not classify a workload as non-Agent.
 
+`ANYSENTRY_AGENT_NAMESPACES` accepts a comma-separated namespaced allowlist. Setting it to `*`
+switches the registry to the cluster-scoped Pod list/watch endpoint, which covers namespaces
+created later without a restart but requires a read-only ClusterRole/ClusterRoleBinding supplied by
+the operator. The bundled manifest intentionally keeps namespaced RBAC as the default.
+
+For Docker hosts, run the forwarder on the node with read access to `/var/run/docker.sock`, or set
+`ANYSENTRY_DOCKER_SOCKET` to another Docker-compatible Unix socket. Discovery defaults to `auto`
+and uses an initial `/containers/json` list plus the Docker container event stream; set
+`ANYSENTRY_DOCKER_DISCOVERY=off` to disable it. Docker API access is outside the event hot path.
+
 ## Safety
 
 - **Observe-only.** Only `a3s-observer-collector` runs — never `a3s-observer-enforce` /

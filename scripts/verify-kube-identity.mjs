@@ -12,6 +12,11 @@ const require = createRequire(import.meta.url);
 const { KubeIdentityService } = require('../apps/api/dist/security-monitoring/kube-identity.service.js');
 
 const service = new KubeIdentityService();
+assert.equal(
+  service.podsPath('*', new URLSearchParams({ limit: '1' })),
+  '/api/v1/pods?limit=1',
+  'wildcard namespace uses the cluster-scoped Pod endpoint',
+);
 const agentId = 'a'.repeat(64);
 const sidecarId = 'b'.repeat(64);
 const infraId = 'c'.repeat(64);
@@ -25,10 +30,16 @@ const agentPod = {
       'anysentry.io/agent-id': 'claw-agent',
       'anysentry.io/agent-container': 'agent',
     },
+    ownerReferences: [
+      { kind: 'Deployment', name: 'claw-agent', uid: 'owner-uid', controller: true },
+    ],
   },
   spec: {
     nodeName: 'node-a',
-    containers: [{ name: 'agent' }, { name: 'metrics' }],
+    containers: [
+      { name: 'agent', image: 'company/claw:v1' },
+      { name: 'metrics', image: 'company/metrics:v1' },
+    ],
   },
   status: {
     containerStatuses: [
@@ -67,6 +78,8 @@ assert.equal(nodeSnapshot.entries.some((entry) => entry.nodeName === 'node-b'), 
 assert.equal(nodeSnapshot.entries.find((entry) => entry.ids.includes(agentId))?.classification, 'confirmed_agent');
 assert.equal(nodeSnapshot.entries.find((entry) => entry.ids.includes(sidecarId))?.classification, 'non_agent');
 assert.equal(nodeSnapshot.entries.find((entry) => entry.ids.includes(agentId))?.agentScopeId, 'claw-agent');
+assert.equal(nodeSnapshot.entries.find((entry) => entry.ids.includes(agentId))?.containerImage, 'company/claw:v1');
+assert.equal(nodeSnapshot.entries.find((entry) => entry.ids.includes(agentId))?.ownerName, 'claw-agent');
 assert.equal(
   service.snapshot('node-b').entries.find((entry) => entry.podUid === 'pod-infra-uid')?.classification,
   'unknown',
