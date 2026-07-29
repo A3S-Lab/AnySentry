@@ -219,6 +219,13 @@ container, image, owner, systemd unit, executable, command, or labels. Use
 or unmatched workload remains `unknown` so framework discovery can still identify a new Agent.
 `ANYSENTRY_AGENT_TEMPLATES_JSON` accepts the same document inline for small deployments.
 
+Unknown workloads also enter a bounded deterministic behavior detector. Alternating LLM endpoint
+activity and tool execution, repeated diverse tools, workspace activity, network targets, and
+child-process fanout can create a `probable_agent` candidate. Behavior never creates
+`confirmed_agent` and never calls an LLM. Tune it with `ANYSENTRY_BEHAVIOR_THRESHOLD`,
+`ANYSENTRY_BEHAVIOR_WINDOW_SECS`, `ANYSENTRY_BEHAVIOR_PROBABLE_TTL_SECS`, and
+`ANYSENTRY_BEHAVIOR_MAX_WORKLOADS`, or set `ANYSENTRY_BEHAVIOR_DISCOVERY=off`.
+
 ### Kubernetes integrated stack
 
 Kubernetes mode creates the namespace, ClickHouse Secret, bundled ClickHouse, AnySentry

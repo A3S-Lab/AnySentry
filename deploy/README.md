@@ -173,6 +173,12 @@ For Docker hosts, run the forwarder on the node with read access to `/var/run/do
 and uses an initial `/containers/json` list plus the Docker container event stream; set
 `ANYSENTRY_DOCKER_DISCOVERY=off` to disable it. Docker API access is outside the event hot path.
 
+Framework discovery is enabled by default and keeps only bounded counters/small sets per physical
+workload. It combines LLM endpoint, tool, workspace, network, alternation, and process-fanout
+signals to create `probable_agent` candidates. It cannot create confirmed identities and makes no
+model calls. Disable it with `ANYSENTRY_BEHAVIOR_DISCOVERY=off` or tune its threshold/window/TTL
+with the matching `ANYSENTRY_BEHAVIOR_*` variables.
+
 ## Safety
 
 - **Observe-only.** Only `a3s-observer-collector` runs — never `a3s-observer-enforce` /

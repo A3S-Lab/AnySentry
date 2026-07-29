@@ -15,6 +15,7 @@ const readline = require('node:readline');
 const { AgentAttributor } = require('./observer-agent-attribution');
 const { AgentTemplateRegistry, loadTemplateDocument } = require('./observer-agent-templates');
 const { DockerDiscovery } = require('./observer-docker-discovery');
+const { BehavioralAgentDetector } = require('./observer-behavior-discovery');
 const { ToolExecDeduper } = require('./observer-event-dedup');
 const { DiscoveryBudget, WorkloadIdentityCache } = require('./observer-workload-filter');
 
@@ -96,12 +97,14 @@ const dockerDiscovery = new DockerDiscovery({
   nodeName: NODE_NAME,
   hostId: process.env.A3S_OBSERVER_HOST_ID || NODE_NAME,
 });
+const behaviorDetector = new BehavioralAgentDetector();
 const discoveryBudget = new DiscoveryBudget({ limit: UNKNOWN_FILE_BUDGET_PER_SEC });
 const bootstrap = attributor.seedFromProc();
 console.error(`[observer-forward] process snapshot: scanned=${bootstrap.scanned}; agent_roots=${bootstrap.roots}; agent_descendants=${bootstrap.descendants}`);
 console.error(`[observer-forward] agent templates: source=${templateRegistry.source}; loaded=${templateRegistry.metrics().loaded}; invalid=${templateRegistry.metrics().invalid + templateLoadErrors}`);
 void dockerDiscovery.start((snapshot) => workloadCache.replace(snapshot, 'docker')).then((started) => {
   const docker = dockerDiscovery.metrics();
+  const behavior = behaviorDetector.metrics();
   console.error(`[observer-forward] docker discovery: enabled=${docker.enabled}; started=${started}; socket=${dockerDiscovery.socketPath}`);
 });
 const toolExecDeduper = new ToolExecDeduper({
@@ -307,7 +310,7 @@ function sendHeartbeat(done = () => {}) {
       queueDepth: pending.length,
       outputDropped: dropped,
       errorCount: errors,
-      message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; filtered_non_agent=${classifications.filteredNonAgent}; filtered_noise=${classifications.filteredNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; output_drops=${dropped}; errors=${errors}`,
+      message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; filtered_non_agent=${classifications.filteredNonAgent}; filtered_noise=${classifications.filteredNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
     },
     5000,
@@ -446,10 +449,21 @@ rl.on('line', (raw) => {
   }
   const workloadClassification = workloadCache.classify(o);
   const templateClassification = templateRegistry.classifyEvent(o);
-  const classification =
+  const baseClassification =
     templateClassification ??
     workloadClassification ??
     attributor.classify(o);
+  const behaviorEligible =
+    baseClassification.state === 'unknown' ||
+    (
+      baseClassification.state === 'non_agent' &&
+      baseClassification.attribution?.source === 'process_graph'
+    );
+  const classification =
+    (behaviorEligible
+      ? behaviorDetector.observe(o, baseClassification.attribution)
+      : undefined) ??
+    baseClassification;
   const classificationName = classification.attribution?.classification;
   if (classification.state === 'agent' && classificationName === 'confirmed_agent') {
     attributionCounts.confirmedAgent++;
