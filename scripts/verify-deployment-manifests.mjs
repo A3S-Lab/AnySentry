@@ -129,6 +129,12 @@ function verifyAnySentryManifest() {
     anySentryDeployment?.source,
   );
   assert(
+    'AnySentry Deployment configures workload identity namespaces and label selector',
+    /\{\s*name:\s*ANYSENTRY_AGENT_NAMESPACES,\s*value:\s*"anysentry"\s*\}/u.test(anySentryDeployment?.source ?? '') &&
+      /\{\s*name:\s*ANYSENTRY_AGENT_LABEL_SELECTOR,\s*value:\s*"anysentry\.io\/workload-kind=agent"\s*\}/u.test(anySentryDeployment?.source ?? ''),
+    anySentryDeployment?.source,
+  );
+  assert(
     'AnySentry probes use /security-center/healthz on port 29653',
     countMatches(anySentryDeployment?.source ?? '', /httpGet:\s*\{\s*path:\s*\/security-center\/healthz,\s*port:\s*29653\s*\}/gu) >= 2,
     anySentryDeployment?.source,
@@ -194,6 +200,13 @@ function verifyObserverManifest() {
   assert(
     'Observer DaemonSet drops only proven non-Agent events before ingest',
     /\{\s*name:\s*FORWARD_SCOPE,\s*value:\s*"agent"\s*\}/u.test(daemonSet?.source ?? ''),
+    daemonSet?.source,
+  );
+  assert(
+    'Observer DaemonSet consumes identity snapshots and uses bounded batching',
+    /\{\s*name:\s*ANYSENTRY_IDENTITY_SNAPSHOT_URL,\s*value:\s*"http:\/\/anysentry:29653\/security-center\/identity\/snapshot"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_BATCH_SIZE,\s*value:\s*"32"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_MAX_QUEUE,\s*value:\s*"4096"\s*\}/u.test(daemonSet?.source ?? ''),
     daemonSet?.source,
   );
   assert(

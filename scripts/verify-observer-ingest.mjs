@@ -91,6 +91,19 @@ async function createProtectedObserverSource() {
   return source;
 }
 
+async function verifyIdentitySnapshotContract() {
+  const snapshot = await request(`/identity/snapshot?nodeName=${encodeURIComponent(`${runId}-node`)}`);
+  assert(
+    'identity snapshot exposes a versioned fail-open forwarder contract',
+    snapshot.schemaVersion === 'anysentry.workload_identity_snapshot.v1' &&
+      typeof snapshot.version === 'number' &&
+      typeof snapshot.ready === 'boolean' &&
+      Array.isArray(snapshot.entries) &&
+      snapshot.nodeName === `${runId}-node`,
+    snapshot,
+  );
+}
+
 async function verifyRejectedObserverToken(sourceId) {
   const line = observerLine(
     { agent: `${runId}-rejected-agent`, session: `${runId}-rejected-session`, task: 'rejected-task' },
@@ -134,6 +147,18 @@ async function verifyObserverToolEvent(sourceId, token) {
         observed_bytes: 96,
       },
     },
+    {
+      host_id: `${runId}-host`,
+      boot_id: `${runId}-boot`,
+      pid: 1312,
+      ppid: 1200,
+      start_time_ticks: 998877,
+      comm: 'bash',
+      exe: '/usr/bin/bash',
+      cwd: '/workspace/project',
+      cgroup_id: 18412,
+      cgroup: '0::/user.slice/agent.scope',
+    },
   );
   const result = await request('/ingest', 'POST', {
     line,
@@ -163,6 +188,10 @@ async function verifyObserverToolEvent(sourceId, token) {
     event.attributes?.argv_source === 'proc_cmdline' &&
     event.attributes?.observed_argc === 3 &&
     event.attributes?.observed_bytes === 96 &&
+    event.process?.hostId === `${runId}-host` &&
+    event.process?.bootId === `${runId}-boot` &&
+    event.process?.startTimeTicks === '998877' &&
+    event.process?.cgroupId === '18412' &&
     String(event.attributes?.argv ?? '').includes('observer-ok') &&
     String(event.attributes?.argv ?? '').includes('[redacted]') &&
     event.attributes?.password === '[redacted]' &&
@@ -219,6 +248,57 @@ async function verifyIncompleteObserverEvidence(sourceId, token) {
     'incomplete Observer argv is escalated at L1 instead of allowed',
     list.total === 1 && event?.eventId === result.eventId && event.decisionStatus === 'succeeded' && event.verdict === 'escalate' && event.tier === 'Rules' && String(event.reason).includes('incomplete ToolExec evidence'),
     list,
+  );
+}
+
+async function verifyObserverBatch(sourceId, token) {
+  const attribution = {
+    monitored: true,
+    classification: 'confirmed_agent',
+    agentScopeId: `${runId}-batch-agent`,
+    agentDisplayName: `${runId}-batch-agent`,
+    agentInstanceId: 'pod-batch/container-batch',
+    physicalWorkloadId: 'k8s:test:pod-batch:container-batch',
+    confidence: 1,
+    reason: 'authoritative_anchor',
+    source: 'kubernetes',
+    evidence: ['label:anysentry.io/workload-kind=agent'],
+  };
+  const events = [1711, 1712].map((pid) => ({
+    line: observerLine(
+      { agent: 'pod-batch', session: 'container-batch', task: String(pid) },
+      {
+        ToolExec: {
+          pid,
+          ppid: 1700,
+          uid: 1000,
+          cwd: '/workspace/batch',
+          argv: ['echo', `batch-${pid}`],
+        },
+      },
+    ),
+    collectorId: `${runId}-collector`,
+    nodeName: `${runId}-node`,
+    sourceType: 'observer',
+    attribution,
+  }));
+  const result = await request('/ingest/batch', 'POST', { events }, sourceHeaders(sourceId, token));
+  assert(
+    'observer batch ingest accepts and accounts for every envelope',
+    result.accepted === true &&
+      result.acceptedEvents === 2 &&
+      result.rejectedEvents === 0 &&
+      result.items?.length === 2 &&
+      result.items.every((item) => item.accepted === true),
+    result,
+  );
+  const eventId = result.items?.[0]?.eventId;
+  if (!eventId) return;
+  await assertEvent('observer batch preserves workload-first attribution evidence', eventId, (event) =>
+    event.attribution?.classification === 'confirmed_agent' &&
+    event.attribution?.agentScopeId === `${runId}-batch-agent` &&
+    event.attribution?.physicalWorkloadId === 'k8s:test:pod-batch:container-batch' &&
+    event.attribution?.evidence?.includes('label:anysentry.io/workload-kind=agent'),
   );
 }
 
@@ -428,10 +508,12 @@ async function verifySourceRollup(sourceId) {
 async function main() {
   console.log(`AnySentry observer ingest verification against ${baseUrl}`);
   await request('/stats');
+  await verifyIdentitySnapshotContract();
   const { source, token } = await createProtectedObserverSource();
   await verifyRejectedObserverToken(source.sourceId);
   await verifyObserverToolEvent(source.sourceId, token);
   await verifyIncompleteObserverEvidence(source.sourceId, token);
+  await verifyObserverBatch(source.sourceId, token);
   await verifyInternalL3RecursionSuppressed(source.sourceId, token);
   await verifyObserverLlmEndpoint(source.sourceId, token);
   await verifyRawCollectorHeartbeat(source.sourceId, token);

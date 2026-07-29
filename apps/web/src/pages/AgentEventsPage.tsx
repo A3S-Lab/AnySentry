@@ -257,13 +257,21 @@ function EventDetail({ event, timeType }: { event?: AgentEventListItem; timeType
           <p className="mb-2 text-xs font-medium text-zinc-400">Agent Attribution</p>
           <div className="grid gap-3 rounded-md border border-white/10 bg-white/[0.03] px-3 py-3 sm:grid-cols-2 xl:grid-cols-4">
             <FieldValue label="Monitored" value={event.attribution?.monitored ? "true" : "false"} />
+            <FieldValue label="Classification" value={event.attribution?.classification ?? "unknown"} />
             <FieldValue label="Agent Scope" value={event.attribution?.agentScopeId ?? "non-agent"} />
+            <FieldValue label="Agent Instance" value={event.attribution?.agentInstanceId} />
+            <FieldValue label="Physical Workload" value={event.attribution?.physicalWorkloadId} />
             <FieldValue label="Confidence" value={event.attribution ? event.attribution.confidence.toFixed(2) : "0.00"} />
             <FieldValue label="Source" value={event.attribution?.source ?? "none"} />
             <FieldValue label="Reason" value={event.attribution?.reason ?? "not_evaluated"} />
+            <FieldValue label="Evidence" value={event.attribution?.evidence?.join(", ")} />
             <FieldValue label="Root PID" value={event.attribution?.rootPid} />
+            <FieldValue label="Host" value={event.process?.hostId} />
+            <FieldValue label="Boot" value={event.process?.bootId} />
             <FieldValue label="PID" value={event.process?.pid} />
             <FieldValue label="PPID" value={event.process?.ppid} />
+            <FieldValue label="Start Ticks" value={event.process?.startTimeTicks} />
+            <FieldValue label="Cgroup ID" value={event.process?.cgroupId} />
           </div>
         </div>
 

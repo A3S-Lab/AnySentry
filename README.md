@@ -191,11 +191,13 @@ A3S_OBSERVER_JSON=1 sudo -E a3s-observer-collector \
   | FORWARD_SCOPE=agent ANYSENTRY_INGEST_URL=http://localhost:29653/security-center/ingest node scripts/observer-forward.js
 ```
 
-`FORWARD_SCOPE=agent` reduces ingest volume before Sentry evaluation. The forwarder uses PID
-ancestry to classify events as `agent`, `non_agent`, or `unknown`; it drops only proven
-`non_agent` events. Unknown events are forwarded so missing `/proc` data or short-lived processes
-do not become silent security gaps. Use `FORWARD_SCOPE=all` to retain the legacy all-event stream,
-or `FORWARD_SCOPE=shadow` to measure classifications without applying the Agent filter.
+`FORWARD_SCOPE=agent` reduces ingest volume before Sentry evaluation. Kubernetes workload identity
+(Pod UID + full Container ID) is evaluated before process signatures and PID ancestry. The
+classification states are `confirmed_agent`, `probable_agent`, `unknown`, and `non_agent`; only
+positively identified `non_agent` events are dropped. Unknown events are forwarded so snapshot
+outages, missing `/proc` data, and short-lived processes do not become silent gaps. The forwarder
+sends bounded batches (default 32 events or 50 ms) and includes filter/cache/queue counters in its
+heartbeat. Use `FORWARD_SCOPE=all` for fallback or `FORWARD_SCOPE=shadow` for comparison.
 
 ### Kubernetes integrated stack
 
@@ -245,7 +247,10 @@ risk events per node. Nodes are not covered when the cluster cannot schedule the
 pod there, for example on managed control-plane nodes, incompatible architectures, or clusters that
 block privileged/eBPF workloads. AnySentry also focuses the dashboard on agent workloads by default:
 set `ANYSENTRY_AGENT_NAMESPACES` and matching namespaced pod-reader Roles for the namespaces where
-your agents actually run.
+your agents actually run. Mark Agent Pods with
+`anysentry.io/workload-kind=agent` and `anysentry.io/agent-id=<stable-agent-id>`. Multi-container
+Pods must also set `anysentry.io/agent-container=<container-name>` so sidecars do not inherit the
+Agent classification.
 
 If your cluster cannot pull the public observer-forwarder image, build and push it, then set
 `ANYSENTRY_OBSERVER_IMAGE`:
@@ -762,6 +767,10 @@ curl -X POST localhost:29653/security-center/ingest -H 'Content-Type: applicatio
 # → { "accepted": true, "verdict": "block", "tier": "Rules", "severity": "high", ... }
 ```
 
+The bundled forwarder uses `POST /security-center/ingest/batch` with up to 256 objects in
+`{ "events": [...] }`; each object has the same shape as the single-event endpoint. It retrieves
+the workload cache from `GET /security-center/identity/snapshot?nodeName=<node>`.
+
 For heterogeneous producers that do not emit observer NDJSON, use the generic JSON batch ingress.
 AnySentry converts each item into the same canonical `anysentry.agent_event.v1` stream and still
 runs it through `@a3s-lab/sentry` before it reaches Incidents, Alerts, Assets, Coverage, and
@@ -1194,6 +1203,9 @@ In addition to the aggregate dashboard APIs, AnySentry exposes event evidence fo
   ticket, review, or incident handoff workflows.
 - `POST /security-center/ingest/events` — generic JSON batch ingress for webhook, OTel bridge,
   or custom producers; items are normalized into the same canonical event stream as observer NDJSON.
+- `POST /security-center/ingest/batch` — bounded batch ingress for raw Observer NDJSON envelopes.
+- `GET /security-center/identity/snapshot` — versioned, optionally node-filtered Kubernetes
+  workload identities consumed by forwarders outside their per-event hot path.
 - `POST /security-center/ingest/otel`, `/security-center/ingest/otlp/v1/logs`, and
   `/security-center/ingest/otlp/v1/traces` — native OTLP/HTTP JSON ingress for `resourceLogs` and
   `resourceSpans`, normalized into the same canonical event stream and source registry.

@@ -1,11 +1,10 @@
 #!/usr/bin/env node
-// Bridge a3s-observer NDJSON (stdin) -> AnySentry /ingest. Node stdlib only (apt-free container).
+// Bridge a3s-observer NDJSON (stdin) -> AnySentry batched ingest. Node stdlib only.
 //   a3s-observer-collector | node observer-forward.js
 // Target from ANYSENTRY_INGEST_URL (default http://localhost:29653/security-center/ingest).
 //
-// Backpressure is essential: a busy node emits a firehose of events. We cap in-flight POSTs and
-// pause reading when at the cap — so memory stays flat and, under extreme load, the collector
-// (which drops on a slow consumer by design) sheds the excess rather than us OOMing.
+// Backpressure is essential: a busy node emits a firehose of events. We bound the priority queue,
+// batch network writes, cap in-flight POSTs, and pause stdin at pressure so memory stays flat.
 //
 // Agent scope is fail-open for attribution: known Agent and unresolved events are forwarded, and
 // only events with a complete non-Agent PID ancestry are dropped. The legacy all/shadow modes also
@@ -34,7 +33,24 @@ function defaultIdentitySnapshotUrl(ingestUrl) {
   return url;
 }
 
-const MAX_INFLIGHT = Number(process.env.FORWARD_MAX_INFLIGHT || 24);
+function defaultBatchIngestUrl(ingestUrl) {
+  const url = new URL(ingestUrl.toString());
+  const nextPath = url.pathname.replace(/\/ingest(?:\/.*)?$/, '/ingest/batch');
+  url.pathname = nextPath === url.pathname ? '/security-center/ingest/batch' : nextPath;
+  url.hash = '';
+  return url;
+}
+
+function boundedNumber(value, fallback, min, max) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.min(max, Math.max(min, Math.round(parsed))) : fallback;
+}
+
+const MAX_INFLIGHT = boundedNumber(process.env.FORWARD_MAX_INFLIGHT, 8, 1, 64);
+const BATCH_SIZE = boundedNumber(process.env.FORWARD_BATCH_SIZE, 32, 1, 256);
+const BATCH_FLUSH_MS = boundedNumber(process.env.FORWARD_BATCH_FLUSH_MS, 50, 1, 5_000);
+const MAX_QUEUE = boundedNumber(process.env.FORWARD_MAX_QUEUE, 4_096, BATCH_SIZE, 100_000);
+const HTTP_TIMEOUT_MS = boundedNumber(process.env.FORWARD_HTTP_TIMEOUT_MS, 10_000, 1_000, 120_000);
 const FORWARD_SCOPE = ['agent', 'all', 'shadow'].includes(process.env.FORWARD_SCOPE)
   ? process.env.FORWARD_SCOPE
   : 'agent';
@@ -48,6 +64,7 @@ const SOURCE_TOKEN = process.env.ANYSENTRY_INGEST_TOKEN || '';
 const WORKSPACE_PATH = process.env.ANYSENTRY_WORKSPACE_PATH || '';
 const HEARTBEAT_SECS = Math.max(0, Number(process.env.ANYSENTRY_HEARTBEAT_SECS || 30));
 const heartbeatTarget = new URL(process.env.ANYSENTRY_HEARTBEAT_URL || defaultHeartbeatUrl(target));
+const batchTarget = new URL(process.env.ANYSENTRY_BATCH_INGEST_URL || defaultBatchIngestUrl(target));
 const IDENTITY_SNAPSHOT_SECS = Math.max(0, Number(process.env.ANYSENTRY_IDENTITY_SNAPSHOT_SECS || 15));
 const identitySnapshotTarget = new URL(
   process.env.ANYSENTRY_IDENTITY_SNAPSHOT_URL || defaultIdentitySnapshotUrl(target),
@@ -65,6 +82,7 @@ const toolExecDeduper = new ToolExecDeduper({
 });
 
 let inflight = 0;
+let pending = [];
 let outputDropped = 0;
 let errorCount = 0;
 let eventKindCounts = Object.create(null);
@@ -75,11 +93,17 @@ let attributionCounts = {
   unknown: 0,
   nonAgent: 0,
   filteredNonAgent: 0,
+  filteredNoise: 0,
+  forwarded: 0,
+  queueDropped: 0,
+  batches: 0,
+  batchEvents: 0,
   deduplicated: 0,
 };
 let closing = false;
 let heartbeatTimer;
 let identitySnapshotTimer;
+let batchTimer;
 const rl = readline.createInterface({ input: process.stdin });
 
 function isNoise(o) {
@@ -230,6 +254,11 @@ function sendHeartbeat(done = () => {}) {
     unknown: 0,
     nonAgent: 0,
     filteredNonAgent: 0,
+    filteredNoise: 0,
+    forwarded: 0,
+    queueDropped: 0,
+    batches: 0,
+    batchEvents: 0,
     deduplicated: 0,
   };
   outputDropped = 0;
@@ -244,10 +273,10 @@ function sendHeartbeat(done = () => {}) {
       status,
       intervalSecs: HEARTBEAT_SECS,
       eventKindCounts: counts,
-      queueDepth: inflight,
+      queueDepth: pending.length,
       outputDropped: dropped,
       errorCount: errors,
-      message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; filtered_non_agent=${classifications.filteredNonAgent}; deduplicated=${classifications.deduplicated}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_errors=${workload.errors}; output_drops=${dropped}; errors=${errors}`,
+      message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; filtered_non_agent=${classifications.filteredNonAgent}; filtered_noise=${classifications.filteredNoise}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_errors=${workload.errors}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
     },
     5000,
@@ -277,16 +306,94 @@ function closeTransports() {
   httpsAgent.destroy();
 }
 
+function queuePriority(kind, classification) {
+  if (kind === 'SecurityAction') return 5;
+  if (classification.attribution?.classification === 'confirmed_agent') return 4;
+  if (classification.state === 'agent') return 3;
+  if (classification.state === 'unknown') return 2;
+  if (kind === 'ToolExec' || kind === 'ProcessExit') return 1;
+  return 0;
+}
+
+function scheduleBatch() {
+  if (batchTimer || pending.length === 0) return;
+  batchTimer = setTimeout(() => {
+    batchTimer = undefined;
+    flushPending();
+  }, BATCH_FLUSH_MS);
+  batchTimer.unref();
+}
+
+function finishBatch(failed, batchLength) {
+  if (failed) {
+    outputDropped += batchLength;
+    errorCount++;
+  }
+  inflight = Math.max(0, inflight - 1);
+  while (pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
+  if (!closing && pending.length < MAX_QUEUE && inflight < MAX_INFLIGHT) rl.resume();
+}
+
+function flushPending() {
+  if (pending.length === 0 || inflight >= MAX_INFLIGHT) return;
+  if (batchTimer) {
+    clearTimeout(batchTimer);
+    batchTimer = undefined;
+  }
+  const batch = pending.splice(0, BATCH_SIZE);
+  inflight++;
+  attributionCounts.batches++;
+  attributionCounts.batchEvents += batch.length;
+  postJson(
+    batchTarget,
+    { events: batch.map((item) => item.body) },
+    HTTP_TIMEOUT_MS,
+    (failed) => finishBatch(failed, batch.length),
+  );
+  if (pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
+}
+
+function enqueue(body, priority) {
+  if (pending.length >= MAX_QUEUE) {
+    let lowestIndex = 0;
+    for (let index = 1; index < pending.length; index += 1) {
+      if (pending[index].priority < pending[lowestIndex].priority) lowestIndex = index;
+    }
+    if (priority <= pending[lowestIndex].priority) {
+      outputDropped++;
+      attributionCounts.queueDropped++;
+      return;
+    }
+    pending.splice(lowestIndex, 1);
+    outputDropped++;
+    attributionCounts.queueDropped++;
+  }
+  pending.push({ body, priority });
+  attributionCounts.forwarded++;
+  if (pending.length >= BATCH_SIZE) flushPending();
+  else scheduleBatch();
+  if (pending.length >= MAX_QUEUE || inflight >= MAX_INFLIGHT) rl.pause();
+}
+
 function flushAndClose() {
   if (closing) return;
   closing = true;
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   if (identitySnapshotTimer) clearInterval(identitySnapshotTimer);
-  const deadline = Date.now() + 5000;
+  if (batchTimer) clearTimeout(batchTimer);
+  batchTimer = undefined;
+  while (pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
+  const deadline = Date.now() + Math.max(5_000, HTTP_TIMEOUT_MS + 1_000);
   const waitForInflight = () => {
-    if (inflight > 0 && Date.now() < deadline) {
+    while (pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
+    if ((inflight > 0 || pending.length > 0) && Date.now() < deadline) {
       setTimeout(waitForInflight, 50);
       return;
+    }
+    if (pending.length > 0) {
+      outputDropped += pending.length;
+      attributionCounts.queueDropped += pending.length;
+      pending = [];
     }
     sendHeartbeat(() => {
       closeTransports();
@@ -322,24 +429,13 @@ rl.on('line', (raw) => {
   }
   // Preserve the legacy pseudo-filesystem noise filter in all/shadow modes. In agent mode,
   // unknown events must survive so incomplete lineage never becomes silent data loss.
-  if (FORWARD_SCOPE !== 'agent' && isNoise(o)) return;
+  if (FORWARD_SCOPE !== 'agent' && isNoise(o)) {
+    attributionCounts.filteredNoise++;
+    return;
+  }
   bumpEventKind(o);
 
-  inflight++;
-  let settled = false;
-  const finish = (failed) => {
-    if (settled) return;
-    settled = true;
-    if (failed) {
-      outputDropped++;
-      errorCount++;
-    }
-    inflight = Math.max(0, inflight - 1);
-    if (!closing && inflight < MAX_INFLIGHT) rl.resume();
-  };
-
-  postJson(
-    target,
+  enqueue(
     {
       line,
       ...(classification.attribution ? { attribution: classification.attribution } : {}),
@@ -347,11 +443,8 @@ rl.on('line', (raw) => {
       ...(NODE_NAME ? { nodeName: NODE_NAME } : {}),
       ...sourceFields(),
     },
-    5000,
-    finish,
+    queuePriority(eventKind(o), classification),
   );
-
-  if (inflight >= MAX_INFLIGHT) rl.pause(); // stop reading until requests drain
 });
 
 rl.on('close', flushAndClose);

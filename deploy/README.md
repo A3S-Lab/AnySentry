@@ -135,11 +135,25 @@ so every node appears as a stable Collector. The bundled forwarder also emits so
 heartbeats every `ANYSENTRY_HEARTBEAT_SECS` seconds; with no explicit `ANYSENTRY_SOURCE_ID`,
 AnySentry discovers one observer Source per node/collector automatically.
 
-The manifest uses `FORWARD_SCOPE=agent`. The forwarder derives Agent identity from the process and
-its host PID ancestry, forwards known Agent and unresolved events, and drops only events whose
-complete ancestry proves they are unrelated to an Agent root. Heartbeats report the observed,
-Agent, unknown, and filtered counts. Set `FORWARD_SCOPE=all` for an unfiltered migration fallback,
-or `FORWARD_SCOPE=shadow` to observe classification counts before enabling filtering.
+The manifest uses `FORWARD_SCOPE=agent`. The forwarder checks the versioned Kubernetes workload
+snapshot before host process signatures and PID ancestry. A generic `node` or `python` process in
+an Agent container is therefore attributed by Pod UID + full Container ID, while a sidecar can be
+classified separately. Unknown identities remain observable; only positively identified
+non-Agent events are filtered. Events are sent in bounded batches (32 events or 50 ms), and
+heartbeats report classification, cache, queue, batch, filtered, and dropped counters.
+
+Label Agent Pods and, for multi-container Pods, identify the Agent container:
+
+```yaml
+metadata:
+  labels:
+    anysentry.io/workload-kind: agent
+    anysentry.io/agent-id: claw-agent
+    anysentry.io/agent-container: agent
+```
+
+Set `FORWARD_SCOPE=all` for the unfiltered fallback or `FORWARD_SCOPE=shadow` to compute decisions
+and compare counters before applying the filter.
 
 ## Safety
 

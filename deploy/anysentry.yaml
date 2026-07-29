@@ -154,9 +154,13 @@ spec:
               valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_USER } }
             - name: CLICKHOUSE_PASSWORD
               valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_PASSWORD } }
-            # Pod-identity enrichment (pod-uid -> agent name via the pod-reader Role above) is
-            # auto-enabled in-cluster. List the agent namespaces to read; set ENRICH=off to disable.
-            - { name: ANYSENTRY_AGENT_NAMESPACES, value: "default" }
+            # Workload registry: initial Pod list + watch, exposed as a node-filtered snapshot.
+            # This manifest's Role covers "anysentry"; duplicate the Role/Binding in every
+            # additional Agent namespace and list those namespaces here.
+            - { name: ANYSENTRY_AGENT_NAMESPACES, value: "anysentry" }
+            - { name: ANYSENTRY_AGENT_LABEL_SELECTOR, value: "anysentry.io/workload-kind=agent" }
+            # Change this to a stable, unique cluster asset ID when several clusters report here.
+            - { name: ANYSENTRY_CLUSTER_ID, value: "default-cluster" }
             # - { name: ANYSENTRY_KUBE_ENRICH, value: "off" }
             # Optional: drive the dashboard with a synthetic event mix for a demo (sentry still
             # really judges it). Leave unset to show only real ingested events.

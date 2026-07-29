@@ -28,6 +28,10 @@ interface IngestBody extends Partial<T.EventMeta> {
   token?: string;
 }
 
+interface ObserverBatchIngestBody {
+  events?: IngestBody[];
+}
+
 interface RejectedIngestContext {
   sourceId?: string;
   sourceName?: string;
@@ -4381,6 +4385,32 @@ export class SecurityMonitoringController {
       sourceId: sourceResolution.source?.sourceId,
       acceptedEvents,
       rejectedEvents: events.length - acceptedEvents,
+      items,
+    };
+  }
+
+  /** Bounded raw-Observer batch seam used by the node forwarder. */
+  @Post('ingest/batch')
+  async ingestBatch(@Body() body: ObserverBatchIngestBody = {}, @Headers() headers: HeaderBag) {
+    const events = Array.isArray(body.events) ? body.events.slice(0, 256) : [];
+    const items: unknown[] = [];
+    let acceptedEvents = 0;
+    for (let index = 0; index < events.length; index += 1) {
+      const event = events[index];
+      if (!event || typeof event.line !== 'string' || !event.line.trim()) {
+        items.push({ index, accepted: false, reason: 'missing observer line' });
+        continue;
+      }
+      const result = await this.ingest(event, headers);
+      const accepted = result.accepted === true;
+      if (accepted) acceptedEvents += 1;
+      items.push({ index, ...result });
+    }
+    const submittedEvents = Array.isArray(body.events) ? body.events.length : 0;
+    return {
+      accepted: acceptedEvents > 0,
+      acceptedEvents,
+      rejectedEvents: submittedEvents - acceptedEvents,
       items,
     };
   }
