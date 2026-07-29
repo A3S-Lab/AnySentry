@@ -141,6 +141,15 @@ function processFromObserverLine(process: unknown): T.ProcessContext | undefined
     const value = p[key];
     return typeof value === 'string' && value.trim() ? value.trim() : undefined;
   };
+  const stringLikeField = (...keys: string[]) => {
+    for (const key of keys) {
+      const value = p[key];
+      if ((typeof value === 'string' || typeof value === 'number' || typeof value === 'bigint') && String(value).trim()) {
+        return String(value).trim();
+      }
+    }
+    return undefined;
+  };
   const ctx: T.ProcessContext = {
     pid: numberField('pid'),
     ppid: numberField('ppid'),
@@ -149,10 +158,13 @@ function processFromObserverLine(process: unknown): T.ProcessContext | undefined
     exe: stringField('exe'),
     cwd: stringField('cwd'),
     cgroup: stringField('cgroup'),
-    systemdUnit: stringField('systemdUnit'),
-    hostId: stringField('hostId'),
-    eventTimeNs: stringField('eventTimeNs'),
-    startTimeNs: stringField('startTimeNs'),
+    cgroupId: stringLikeField('cgroupId', 'cgroup_id'),
+    systemdUnit: stringLikeField('systemdUnit', 'systemd_unit'),
+    hostId: stringLikeField('hostId', 'host_id'),
+    bootId: stringLikeField('bootId', 'boot_id'),
+    eventTimeNs: stringLikeField('eventTimeNs', 'event_time_ns'),
+    startTimeNs: stringLikeField('startTimeNs', 'start_time_ns'),
+    startTimeTicks: stringLikeField('startTimeTicks', 'start_time_ticks'),
   };
   return Object.values(ctx).some((value) => value !== undefined) ? ctx : undefined;
 }
@@ -3984,6 +3996,13 @@ export class SecurityMonitoringController {
     };
   }
 
+  /** Versioned, node-filtered workload identity data for observation-only forwarders. */
+  @Get('identity/snapshot')
+  @SkipWrap()
+  identitySnapshot(@Query('nodeName') nodeName?: string): T.WorkloadIdentitySnapshot {
+    return this.kube.snapshot(nodeName);
+  }
+
   @Get('capabilities')
   securityCapabilitiesGet(@Query() query: T.SecurityCapabilityRequest = {}, @Headers() headers: HeaderBag): unknown {
     const action = securityCapabilityAction(query.action);
@@ -4428,21 +4447,9 @@ export class SecurityMonitoringController {
         ...(sourceResolution.source?.sourceId ? { sourceId: sourceResolution.source.sourceId } : {}),
       },
     };
-    // Enrich identity (pod-uid → real agent name) and focus on agent workloads (drop infra/host).
+    // Enrich from the same registry consumed by forwarders. Filtering is node-local; direct API
+    // producers remain fail-open and are never dropped solely because metadata is incomplete.
     const meta = this.kube.enrich(deriveMeta(line, metaGiven));
-    if (!meta) {
-      this.recordRejectedIngest(sourceResolution, 'filtered: infra/host (not an agent workload)', {
-        sourceId: requestSourceId,
-        sourceName,
-        sourceType,
-        collectorId,
-        nodeName,
-        workspacePath: given.workspacePath,
-        endpoint: 'ingest',
-        rejectedEvents: 1,
-      });
-      return { accepted: false, sourceId: sourceResolution.source?.sourceId, reason: 'filtered: infra/host (not an agent workload)' };
-    }
     const rec = await this.judge.accept(line, meta);
     if (!rec) {
       this.recordRejectedIngest(sourceResolution, 'unparseable event', {

@@ -149,7 +149,12 @@ class AgentAttributor {
     const current = {
       pid,
       ppid: positiveInt(processInfo.ppid) || positiveInt(payload.ppid) || live?.ppid,
-      startTime: text(processInfo.startTimeNs) || live?.startTime,
+      startTime:
+        text(processInfo.startTimeTicks) ||
+        text(processInfo.start_time_ticks) ||
+        text(processInfo.startTimeNs) ||
+        text(processInfo.start_time_ns) ||
+        live?.startTime,
       comm: text(processInfo.comm) || live?.comm || text(observerEvent?.identity?.agent),
       exe: text(processInfo.exe) || live?.exe,
       argv: argvText(payload.argv) || live?.argv,
@@ -171,7 +176,17 @@ class AgentAttributor {
 
     if (ancestry.state === 'non_agent') {
       this.remember({ ...current, state: 'non_agent', lastSeen: now });
-      return this.finish(pid, { state: 'non_agent' }, exiting);
+      return this.finish(pid, {
+        state: 'non_agent',
+        attribution: {
+          monitored: false,
+          classification: 'non_agent',
+          confidence: 1,
+          reason: 'not_agent',
+          source: 'process_graph',
+          evidence: ['process_lineage:pid1'],
+        },
+      }, exiting);
     }
 
     this.remember({ ...current, state: 'unknown', lastSeen: now });
@@ -263,12 +278,14 @@ class AgentAttributor {
       state: 'agent',
       attribution: {
         monitored: true,
+        classification: 'probable_agent',
         agentScopeId: agentId,
         agentDisplayName: agentId,
         rootPid,
         confidence: source === 'process_graph' ? 0.9 : 0.85,
         reason,
         source,
+        evidence: [source === 'process_graph' ? 'process_lineage:agent_root' : 'process_signature:command'],
       },
     };
   }
@@ -279,12 +296,14 @@ class AgentAttributor {
       state: 'agent',
       attribution: {
         monitored: true,
+        classification: 'probable_agent',
         agentScopeId: record.agentId,
         agentDisplayName: record.agentId,
         rootPid: record.rootPid,
         confidence: 0.9,
         reason: 'process_lineage',
         source: 'process_graph',
+        evidence: ['process_lineage:cached_agent_root'],
       },
     };
   }
@@ -292,7 +311,14 @@ class AgentAttributor {
   unknown() {
     return {
       state: 'unknown',
-      attribution: { monitored: false, confidence: 0, reason: 'not_evaluated', source: 'none' },
+      attribution: {
+        monitored: false,
+        classification: 'unknown',
+        confidence: 0,
+        reason: 'not_evaluated',
+        source: 'none',
+        evidence: ['process_lineage:incomplete'],
+      },
     };
   }
 

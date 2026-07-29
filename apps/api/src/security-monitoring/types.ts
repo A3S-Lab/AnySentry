@@ -40,13 +40,16 @@ export type ObjectiveStatus = 'ok' | 'breach' | 'disabled';
 export type IngestionSourceType = 'observer' | 'forwarder' | 'webhook' | 'otel' | 'custom';
 export type IngestionSourceStatus = 'active' | 'stale' | 'unused' | 'disabled';
 export type SourceTokenRotationStatus = 'untracked' | 'fresh' | 'overdue';
-export type AgentAttributionSource = 'none' | 'process_graph' | 'cgroup' | 'systemd' | 'argv' | 'env' | 'self_register' | 'workspace_hint';
+export type AgentClassification = 'confirmed_agent' | 'probable_agent' | 'unknown' | 'non_agent';
+export type AgentAttributionSource = 'none' | 'process_graph' | 'cgroup' | 'systemd' | 'argv' | 'env' | 'self_register' | 'workspace_hint' | 'kubernetes' | 'docker' | 'behavior' | 'process_signature';
 export type AgentAttributionReason = 'not_evaluated' | 'not_agent' | 'process_lineage' | 'authoritative_anchor' | 'hint_only' | 'conflict';
 
 export interface ProcessContext {
   hostId?: string;
+  bootId?: string;
   pid?: number;
   ppid?: number;
+  startTimeTicks?: string;
   startTimeNs?: string;
   eventTimeNs?: string;
   comm?: string;
@@ -54,20 +57,50 @@ export interface ProcessContext {
   cwd?: string;
   uid?: number;
   cgroup?: string;
+  cgroupId?: string;
   systemdUnit?: string;
 }
 
 export interface AgentAttribution {
   monitored: boolean;
+  classification?: AgentClassification;
   agentScopeId?: string;
   agentDisplayName?: string;
   agentSessionId?: string;
+  agentInstanceId?: string;
+  physicalWorkloadId?: string;
   rootPid?: number;
   confidence: number;
   reason: AgentAttributionReason;
   source: AgentAttributionSource;
   conflict?: boolean;
   degraded?: boolean;
+  evidence?: string[];
+}
+
+export interface WorkloadIdentitySnapshotEntry {
+  ids: string[];
+  classification: AgentClassification;
+  physicalWorkloadId: string;
+  agentScopeId?: string;
+  agentDisplayName?: string;
+  agentInstanceId?: string;
+  namespace?: string;
+  podName?: string;
+  podUid?: string;
+  nodeName?: string;
+  containerName?: string;
+  evidence: string[];
+}
+
+export interface WorkloadIdentitySnapshot {
+  schemaVersion: 'anysentry.workload_identity_snapshot.v1';
+  version: number;
+  generatedAt: string;
+  ready: boolean;
+  nodeName?: string;
+  entries: WorkloadIdentitySnapshotEntry[];
+  errors: number;
 }
 export type CoverageIssueType =
   | 'collector_down'

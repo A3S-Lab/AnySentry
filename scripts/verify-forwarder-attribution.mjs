@@ -6,6 +6,7 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const { AgentAttributor } = require('./observer-agent-attribution.js');
 const { ToolExecDeduper } = require('./observer-event-dedup.js');
+const { WorkloadIdentityCache } = require('./observer-workload-filter.js');
 
 function observerEvent({ agent = 'process', pid, ppid, comm, exe, startTimeNs, argv = [] }) {
   return {
@@ -65,7 +66,8 @@ function attributor(procEntries = []) {
   ]);
   const result = judge.classify(observerEvent({ pid: 201, ppid: 200, comm: 'helper', exe: '/usr/bin/helper', startTimeNs: '21', argv: ['helper'] }));
   assert.equal(result.state, 'non_agent');
-  assert.equal(result.attribution, undefined);
+  assert.equal(result.attribution.classification, 'non_agent');
+  assert.equal(result.attribution.source, 'process_graph');
 }
 
 {
@@ -155,6 +157,84 @@ function attributor(procEntries = []) {
   assert.equal(judge.classify(exitEvent).state, 'agent');
   const reused = judge.classify(observerEvent({ pid: 600, ppid: 999, comm: 'short-task', exe: '/usr/bin/short-task', startTimeNs: '', argv: ['short-task'] }));
   assert.equal(reused.state, 'unknown');
+}
+
+{
+  const cache = new WorkloadIdentityCache({ now: () => 10_000 });
+  assert.equal(cache.replace({
+    schemaVersion: 'anysentry.workload_identity_snapshot.v1',
+    version: 7,
+    generatedAt: '2026-07-29T00:00:00.000Z',
+    ready: true,
+    errors: 0,
+    entries: [
+      {
+        ids: ['agent-container-full', 'agent-contai'],
+        classification: 'confirmed_agent',
+        physicalWorkloadId: 'k8s:test:pod-1:agent-container-full',
+        agentScopeId: 'claw-agent',
+        agentDisplayName: 'claw-agent',
+        agentInstanceId: 'pod-1/agent-container-full',
+        evidence: ['label:anysentry.io/workload-kind=agent'],
+      },
+      {
+        ids: ['sidecar-container-full', 'sidecar-cont'],
+        classification: 'non_agent',
+        physicalWorkloadId: 'k8s:test:pod-1:sidecar-container-full',
+        evidence: ['container:agent'],
+      },
+    ],
+  }), true);
+
+  const genericAgent = observerEvent({
+    agent: 'pod-1',
+    pid: 901,
+    ppid: 1,
+    comm: 'node',
+    exe: '/usr/bin/node',
+    startTimeNs: '901',
+    argv: ['node', 'server.js'],
+  });
+  genericAgent.identity.session = 'agent-container-full';
+  genericAgent.process.cgroup = '0::/kubepods/podpod-1/agent-container-full';
+  const agentResult = cache.classify(genericAgent);
+  assert.equal(agentResult.state, 'agent');
+  assert.equal(agentResult.attribution.classification, 'confirmed_agent');
+  assert.equal(agentResult.attribution.agentScopeId, 'claw-agent');
+
+  const sidecar = structuredClone(genericAgent);
+  sidecar.identity.session = 'sidecar-container-full';
+  const sidecarResult = cache.classify(sidecar);
+  assert.equal(sidecarResult.state, 'non_agent');
+  assert.equal(sidecarResult.attribution.classification, 'non_agent');
+  assert.equal(cache.metrics().hits, 2);
+}
+
+{
+  const cache = new WorkloadIdentityCache();
+  const containerEvent = observerEvent({
+    agent: 'pod-unknown',
+    pid: 910,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    argv: ['codex'],
+  });
+  containerEvent.identity.session = 'missing-container';
+  containerEvent.process.cgroup = '0::/kubepods/podpod-unknown/missing-container';
+  const result = cache.classify(containerEvent);
+  assert.equal(result.state, 'unknown');
+  assert.equal(result.attribution.degraded, true);
+  assert.equal(result.attribution.evidence[0], 'workload_snapshot:not_ready');
+
+  const hostEvent = observerEvent({
+    pid: 911,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    argv: ['codex'],
+  });
+  assert.equal(cache.classify(hostEvent), undefined);
 }
 
 {
