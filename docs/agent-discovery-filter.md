@@ -1,6 +1,6 @@
 # Agent Discovery and Observation Filter
 
-Status: implementation contract for `feat/agent-discovery-filter`
+Status: implemented and development-environment verified on `feat/agent-discovery-filter`
 
 The final acceptance target is the complete
 `AnySentry-Agent-Discovery-High-Performance-Design.md` roadmap, not only the first Kubernetes
@@ -356,6 +356,46 @@ The implementation is reconciled against the complete roadmap after every stage:
 7. Only after user-space shadow validation, evaluate the optional observation-only eBPF prefilter.
 
 Stages 2-6 are part of the final feature target even when an earlier stage is deployable.
+
+## Implementation status (2026-07-30)
+
+The Collector user-space target in stages 1-6 is implemented:
+
+- loose operator templates for host, Docker, Kubernetes, and deployment-agnostic matching;
+- Docker list/event discovery and Kubernetes dynamic list/watch identity;
+- container-level sidecar separation and lifecycle tombstones;
+- bounded behavior discovery that promotes only to `probable_agent`;
+- fail-open `all`/`shadow`/`agent` routing, discovery budgets, deduplication, priority buckets,
+  adaptive batches, and structured counters;
+- ProcessKey and direct cgroup caches, including numeric Observer fact compatibility and separate
+  bootstrap/fallback/ancestry `/proc` counters;
+- Collector UI visibility and server-side event evidence search;
+- real current-branch Observer -> forwarder -> API verification for host template, Docker
+  template, unknown Docker behavior, Kubernetes Agent container, and Kubernetes sidecar.
+
+The optional in-kernel observation prefilter in stage 7 is deliberately not enabled. One isolated
+shadow run is not sufficient evidence for irreversible early dropping, especially for the first
+short-lived process in a previously unseen cgroup. Standalone containerd/CRI and proprietary
+platform adapters, invocation identity inside a shared runtime, and production power/long-soak
+measurements remain environment-specific follow-up work.
+
+The 60,000-event filter-core benchmark most recently measured 708,275 events/second, p99 4.61
+microseconds, and 10.54 MiB RSS growth, with zero `/proc` reads on the warm path. This excludes
+network, persistence, and risk judgment. Run it with:
+
+```bash
+node scripts/perf-agent-filter.mjs
+```
+
+Run the real five-scenario chain with:
+
+```bash
+pnpm verify:real-agent-discovery-chain:local
+```
+
+The real test keeps the first Kubernetes Agent command alive briefly so Observer can establish the
+initial `cgroup_id -> Container ID` binding. A truly shorter first event with no prior binding
+remains unknown and is forwarded; after binding, short-lived events use the direct cgroup cache.
 
 ## Rollout and commits
 
