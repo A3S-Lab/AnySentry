@@ -15,7 +15,10 @@ function positiveInt(value) {
 }
 
 function text(value) {
-  return typeof value === 'string' ? value.trim() : '';
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (typeof value === 'bigint') return String(value);
+  return '';
 }
 
 function basename(value) {
@@ -105,11 +108,17 @@ class AgentAttributor {
       cacheHits: 0,
       cacheMisses: 0,
       procReads: 0,
+      bootstrapProcReads: 0,
+      fallbackProcReads: 0,
+      ancestryProcReads: 0,
     };
   }
 
-  readProcess(pid) {
+  readProcess(pid, reason = 'fallback') {
     this.stats.procReads++;
+    if (reason === 'bootstrap') this.stats.bootstrapProcReads++;
+    else if (reason === 'ancestry') this.stats.ancestryProcReads++;
+    else this.stats.fallbackProcReads++;
     return this.readProc(pid);
   }
 
@@ -117,7 +126,7 @@ class AgentAttributor {
     const now = this.now();
     const snapshot = new Map();
     for (const pid of this.listPids().slice(0, this.maxProcs)) {
-      const info = this.readProcess(pid);
+      const info = this.readProcess(pid, 'bootstrap');
       if (info) snapshot.set(pid, info);
     }
 
@@ -136,6 +145,13 @@ class AgentAttributor {
       if (!scope) continue;
       this.remember({ ...info, state: 'agent', agentId: scope.agentId, rootPid: scope.rootPid, lastSeen: now });
       descendants++;
+    }
+    // Keep the remaining process facts as short-lived unknown entries. The initial snapshot has
+    // already paid for these reads, so discarding them would make the first event for every
+    // unrelated host process walk /proc again. Unknown remains fail-open and is never promoted to
+    // non-Agent merely because it appeared in the snapshot.
+    for (const info of snapshot.values()) {
+      if (!this.procs.has(info.pid)) this.remember({ ...info, state: 'unknown', lastSeen: now });
     }
     return { scanned: snapshot.size, roots, descendants };
   }
@@ -230,7 +246,7 @@ class AgentAttributor {
     // Observer normally supplies the complete process instance. `/proc` is now a cache-miss and
     // missing-fact fallback instead of an unconditional per-event read.
     if (!current.ppid || !current.startTime || !current.comm) {
-      const live = this.readProcess(pid);
+      const live = this.readProcess(pid, 'fallback');
       if (live) {
         this.discardReusedPid(live);
         current = {
@@ -332,9 +348,20 @@ class AgentAttributor {
 
       const cached = this.procs.get(pid);
       if (cached?.state === 'agent') return { state: 'agent', agentId: cached.agentId, rootPid: cached.rootPid };
+      if (cached?.state === 'non_agent' && cached.nextResolveAt > now) {
+        return { state: 'non_agent' };
+      }
       if (pid === 1) return { state: 'non_agent' };
 
-      const live = this.readProcess(pid);
+      // A recent unknown entry still contains useful parent/start facts. Follow that cached
+      // parent without re-reading /proc; once the negative TTL expires, refresh it normally.
+      if (cached?.state === 'unknown' && cached.nextResolveAt > now) {
+        pid = positiveInt(cached.ppid);
+        if (!pid) return { state: 'unknown' };
+        continue;
+      }
+
+      const live = this.readProcess(pid, 'ancestry');
       if (!live) return cached?.state === 'non_agent' ? { state: 'non_agent' } : { state: 'unknown' };
       this.discardReusedPid(live);
 
@@ -346,7 +373,7 @@ class AgentAttributor {
           return { state: 'agent', agentId: leaderCached.agentId, rootPid: leaderCached.rootPid };
         }
 
-        const leader = this.readProcess(tgid);
+        const leader = this.readProcess(tgid, 'ancestry');
         if (leader) {
           this.discardReusedPid(leader);
           const leaderAgent = this.matchAgent(leader);

@@ -281,7 +281,10 @@ function CollectorDetail({ collector, timeType }: { collector?: CollectorHealthI
             <FieldValue label="Identity Cache" value={`${collector.filterMetrics.identityCacheEntries} identities · ${collector.filterMetrics.identityCgroupHits}/${collector.filterMetrics.identityCgroupMisses} cgroup hit/miss`} />
             <FieldValue label="Docker" value={collector.filterMetrics.dockerEnabled ? `${collector.filterMetrics.dockerReady ? "ready" : "starting"} · ${collector.filterMetrics.dockerEntries}` : "off"} />
             <FieldValue label="Templates" value={`${collector.filterMetrics.templateLoaded} loaded · ${collector.filterMetrics.templateMatches} matches`} />
-            <FieldValue label="Process Cache / Tombstone" value={`${collector.filterMetrics.processCacheEntries} / ${collector.filterMetrics.processTombstones} · ${collector.filterMetrics.processProcReads} proc reads`} />
+            <FieldValue
+              label="Process Cache / Tombstone"
+              value={`${collector.filterMetrics.processCacheEntries} / ${collector.filterMetrics.processTombstones} · proc ${collector.filterMetrics.processBootstrapProcReads} bootstrap + ${collector.filterMetrics.processFallbackProcReads + collector.filterMetrics.processAncestryProcReads} hot`}
+            />
           </div>
         </div>
 

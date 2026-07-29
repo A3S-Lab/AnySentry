@@ -409,7 +409,8 @@ export class AggregationService {
     const workspacePath = filter.workspacePath?.trim();
     const traceId = filter.traceId?.trim();
     const runId = filter.runId?.trim();
-    const hasFilter = Boolean(sourceId || collectorId || agentId || sessionId || workspacePath || traceId || runId || filter.eventKind || filter.eventCategory || filter.verdict || filter.tier);
+    const q = filter.q?.trim().toLowerCase();
+    const hasFilter = Boolean(sourceId || collectorId || agentId || sessionId || workspacePath || traceId || runId || filter.eventKind || filter.eventCategory || filter.verdict || filter.tier || q);
     const agentScoped = filter.scope === 'agent' && !pinnedEventId;
     const hideNoise = agentScoped && filter.noise !== 'include';
     return events.filter((e) => {
@@ -429,7 +430,18 @@ export class AggregationService {
         (!filter.eventKind || e.eventKind === filter.eventKind) &&
         (!filter.eventCategory || e.eventCategory === filter.eventCategory) &&
         (!filter.verdict || e.verdict === filter.verdict) &&
-        (!filter.tier || e.tier === filter.tier);
+        (!filter.tier || e.tier === filter.tier) &&
+        (
+          !q ||
+          [
+            e.subject,
+            e.agentId,
+            e.sessionId,
+            e.rawPreview,
+            JSON.stringify(e.attributes ?? {}),
+            JSON.stringify(e.attribution ?? {}),
+          ].some((value) => value?.toLowerCase().includes(q))
+        );
       if (pinnedEventId && !hasFilter) return matchesEventId;
       return matchesEventId || matchesFilter;
     });
@@ -1196,6 +1208,9 @@ export class AggregationService {
           processCacheHits: 0,
           processCacheMisses: 0,
           processProcReads: 0,
+          processBootstrapProcReads: 0,
+          processFallbackProcReads: 0,
+          processAncestryProcReads: 0,
         },
         message: latest?.message,
         eventCategoryCounts: categoryCounts,

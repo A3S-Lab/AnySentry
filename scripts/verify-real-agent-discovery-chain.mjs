@@ -2,7 +2,10 @@
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { symlink, unlink } from 'node:fs/promises';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 
 const baseUrl = (
   process.env.ANYSENTRY_API_BASE ??
@@ -13,14 +16,25 @@ const suffix = `${Date.now().toString(36)}-${process.pid}`;
 const collectorName = `anysentry-filter-chain-${suffix}`;
 const templateName = `anysentry-template-chain-${suffix}`;
 const unknownName = `anysentry-unknown-chain-${suffix}`;
+const hostExecutableName = `anysentry-host-agent-${suffix}`;
+const hostExecutablePath = path.join(os.tmpdir(), hostExecutableName);
 const podName = `anysentry-filter-k8s-${suffix}`.slice(0, 63);
 const collectorId = `real-filter-${suffix}`;
+const hostMarker = `marker-host-template-${suffix}`;
+const hostMarkerPath = path.join(os.tmpdir(), hostMarker);
 const dockerMarker = `marker-docker-template-${suffix}`;
 const unknownMarker = `marker-unknown-behavior-${suffix}`;
 const k8sAgentMarker = `marker-k8s-agent-${suffix}`;
 const k8sSidecarMarker = `marker-k8s-sidecar-${suffix}`;
 const namespace = process.env.ANYSENTRY_REAL_K8S_NAMESPACE || 'default';
-const created = { collector: false, template: false, unknown: false, pod: false };
+const created = {
+  collector: false,
+  template: false,
+  unknown: false,
+  pod: false,
+  hostExecutable: false,
+  hostMarker: false,
+};
 let snapshotServer;
 
 function run(command, args, options = {}) {
@@ -34,7 +48,11 @@ function run(command, args, options = {}) {
     let stderr = '';
     const timeout = setTimeout(() => {
       child.kill('SIGTERM');
-      reject(new Error(`${command} ${args.join(' ')} timed out\n${stderr}`));
+      if (options.allowFailure) {
+        resolve({ code: null, signal: 'timeout', stdout, stderr });
+      } else {
+        reject(new Error(`${command} ${args.join(' ')} timed out\n${stderr}`));
+      }
     }, options.timeoutMs ?? 30_000);
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
@@ -163,32 +181,40 @@ async function createSnapshotServer(pod) {
 }
 
 async function startUnknownContainer() {
-  await run('docker', [
-    'run',
-    '-d',
-    '--name',
-    unknownName,
-    '--entrypoint',
-    'node',
-    image,
-    '-e',
-    'setInterval(() => {}, 1000)',
-  ]);
+  await run(
+    'docker',
+    [
+      'run',
+      '-d',
+      '--name',
+      unknownName,
+      '--entrypoint',
+      'node',
+      image,
+      '-e',
+      'setInterval(() => {}, 1000)',
+    ],
+    { timeoutMs: 120_000 },
+  );
   created.unknown = true;
 }
 
 async function startTemplateContainer() {
-  await run('docker', [
-    'run',
-    '-d',
-    '--name',
-    templateName,
-    '--entrypoint',
-    'node',
-    image,
-    '-e',
-    'setInterval(() => {}, 1000)',
-  ]);
+  await run(
+    'docker',
+    [
+      'run',
+      '-d',
+      '--name',
+      templateName,
+      '--entrypoint',
+      'node',
+      image,
+      '-e',
+      'setInterval(() => {}, 1000)',
+    ],
+    { timeoutMs: 120_000 },
+  );
   created.template = true;
 }
 
@@ -196,60 +222,70 @@ async function startCollector(snapshotPort, nodeName) {
   const containerApi = baseUrl.replace('127.0.0.1', 'host.docker.internal');
   const templates = JSON.stringify([
     {
+      id: 'real-host-template',
+      agentId: 'real-host-template-agent',
+      deployment: 'host',
+      name: hostExecutableName,
+    },
+    {
       id: 'real-docker-template',
       agentId: 'real-docker-template-agent',
       deployment: 'docker',
       name: templateName,
     },
   ]);
-  await run('docker', [
-    'run',
-    '-d',
-    '--name',
-    collectorName,
-    '--privileged',
-    '--pid',
-    'host',
-    '--add-host',
-    'host.docker.internal:host-gateway',
-    '-v',
-    '/sys:/sys:ro',
-    '-v',
-    '/var/run/docker.sock:/var/run/docker.sock:ro',
-    '-e',
-    'A3S_OBSERVER_JSON=1',
-    '-e',
-    'A3S_OBSERVER_FILES=0',
-    '-e',
-    'A3S_OBSERVER_SSL=0',
-    '-e',
-    `A3S_OBSERVER_COLLECTOR_ID=${collectorId}`,
-    '-e',
-    `A3S_NODE_NAME=${nodeName}`,
-    '-e',
-    `ANYSENTRY_INGEST_URL=${containerApi}/ingest`,
-    '-e',
-    `ANYSENTRY_IDENTITY_SNAPSHOT_URL=http://host.docker.internal:${snapshotPort}/snapshot`,
-    '-e',
-    'ANYSENTRY_IDENTITY_SNAPSHOT_SECS=1',
-    '-e',
-    'ANYSENTRY_HEARTBEAT_SECS=2',
-    '-e',
-    'ANYSENTRY_DOCKER_DISCOVERY=on',
-    '-e',
-    'FORWARD_SCOPE=shadow',
-    '-e',
-    `ANYSENTRY_AGENT_TEMPLATES_JSON=${templates}`,
-    '-e',
-    'ANYSENTRY_SOURCE_TYPE=observer',
-    '-e',
-    'ANYSENTRY_SOURCE_NAME=real-agent-filter-chain',
-    '--entrypoint',
-    '/bin/sh',
-    image,
-    '-c',
-    'a3s-observer-collector | node /opt/observer-forward.js',
-  ]);
+  await run(
+    'docker',
+    [
+      'run',
+      '-d',
+      '--name',
+      collectorName,
+      '--privileged',
+      '--pid',
+      'host',
+      '--add-host',
+      'host.docker.internal:host-gateway',
+      '-v',
+      '/sys:/sys:ro',
+      '-v',
+      '/var/run/docker.sock:/var/run/docker.sock:ro',
+      '-e',
+      'A3S_OBSERVER_JSON=1',
+      '-e',
+      'A3S_OBSERVER_FILES=0',
+      '-e',
+      'A3S_OBSERVER_SSL=0',
+      '-e',
+      `A3S_OBSERVER_COLLECTOR_ID=${collectorId}`,
+      '-e',
+      `A3S_NODE_NAME=${nodeName}`,
+      '-e',
+      `ANYSENTRY_INGEST_URL=${containerApi}/ingest`,
+      '-e',
+      `ANYSENTRY_IDENTITY_SNAPSHOT_URL=http://host.docker.internal:${snapshotPort}/snapshot`,
+      '-e',
+      'ANYSENTRY_IDENTITY_SNAPSHOT_SECS=1',
+      '-e',
+      'ANYSENTRY_HEARTBEAT_SECS=2',
+      '-e',
+      'ANYSENTRY_DOCKER_DISCOVERY=on',
+      '-e',
+      'FORWARD_SCOPE=shadow',
+      '-e',
+      `ANYSENTRY_AGENT_TEMPLATES_JSON=${templates}`,
+      '-e',
+      'ANYSENTRY_SOURCE_TYPE=observer',
+      '-e',
+      'ANYSENTRY_SOURCE_NAME=real-agent-filter-chain',
+      '--entrypoint',
+      '/bin/sh',
+      image,
+      '-c',
+      'a3s-observer-collector | node /opt/observer-forward.js',
+    ],
+    { timeoutMs: 120_000 },
+  );
   created.collector = true;
   await eventually('current Observer probes and Docker discovery', async () => {
     const logs = await run('docker', ['logs', collectorName]);
@@ -275,6 +311,11 @@ async function startCollector(snapshotPort, nodeName) {
 }
 
 async function triggerScenarios() {
+  await symlink('/bin/sh', hostExecutablePath);
+  created.hostExecutable = true;
+  await run(hostExecutablePath, ['-c', `printf '%s' ${hostMarker} >${hostMarkerPath}`]);
+  created.hostMarker = true;
+
   await run('docker', [
     'exec',
     templateName,
@@ -313,7 +354,10 @@ async function triggerScenarios() {
     '--',
     '/bin/sh',
     '-c',
-    `printf '%s' ${k8sAgentMarker} >/tmp/${k8sAgentMarker}`,
+    // Keep the first observed process in this container alive long enough for Observer to read
+    // its full cgroup path and establish cgroup_id -> Container ID. A genuinely shorter first
+    // event can only carry cgroup_id and must remain fail-open unknown until such a binding exists.
+    `printf '%s' ${k8sAgentMarker} >/tmp/${k8sAgentMarker}; sleep 2`,
   ]);
   await run('kubectl', [
     '-n',
@@ -330,58 +374,103 @@ async function triggerScenarios() {
 }
 
 async function matchingEvents() {
-  const result = await api('/events/list', {
-    timeType: 'last_30d',
-    collectorId,
-    includeBenign: true,
-    eventKind: 'ToolExec',
-    scope: 'raw',
-    limit: 200,
-  });
-  const items = result.items ?? [];
-  const find = (marker, predicate) => items.find(
-    (event) => JSON.stringify(event).includes(marker) && predicate(event),
-  );
-  return {
-    total: result.total,
-    docker: find(
-      dockerMarker,
-      (event) => event.attribution?.source === 'self_register',
-    ),
-    unknown: find(
-      unknownMarker,
-      (event) => event.attribution?.source === 'behavior',
-    ),
-    k8sAgent: find(
+  const find = async (marker, predicate) => {
+    const result = await api('/events/list', {
+      timeType: 'last_30d',
+      collectorId,
+      includeBenign: true,
+      eventKind: 'ToolExec',
+      scope: 'raw',
+      q: marker,
+      limit: 20,
+    });
+    const candidates = result.items?.filter(
+      (candidate) => JSON.stringify(candidate).includes(marker),
+    ) ?? [];
+    return {
+      total: result.total,
+      event: candidates.find(predicate),
+      observed: candidates.slice(0, 5).map((candidate) => ({
+        eventId: candidate.eventId,
+        subject: candidate.subject,
+        process: candidate.process,
+        attribution: candidate.attribution,
+      })),
+    };
+  };
+  const [host, docker, unknown, k8sAgent, k8sSidecar] = await Promise.all([
+    find(hostMarker, (event) => event.attribution?.source === 'self_register'),
+    find(dockerMarker, (event) => event.attribution?.source === 'self_register'),
+    find(unknownMarker, (event) => event.attribution?.source === 'behavior'),
+    find(
       k8sAgentMarker,
       (event) =>
         event.attribution?.source === 'kubernetes' &&
         event.attribution?.classification === 'confirmed_agent',
     ),
-    k8sSidecar: find(
+    find(
       k8sSidecarMarker,
       (event) =>
         event.attribution?.source === 'kubernetes' &&
         event.attribution?.classification === 'non_agent',
     ),
+  ]);
+  return {
+    total: host.total + docker.total + unknown.total + k8sAgent.total + k8sSidecar.total,
+    host: host.event,
+    docker: docker.event,
+    unknown: unknown.event,
+    k8sAgent: k8sAgent.event,
+    k8sSidecar: k8sSidecar.event,
+    observed: {
+      host: host.observed,
+      docker: docker.observed,
+      unknown: unknown.observed,
+      k8sAgent: k8sAgent.observed,
+      k8sSidecar: k8sSidecar.observed,
+    },
   };
 }
 
 async function verifyResults() {
-  const events = await eventually('four real scenario events', async () => {
-    const current = await matchingEvents();
-    return current.docker && current.unknown && current.k8sAgent && current.k8sSidecar
-      ? current
-      : undefined;
-  });
+  let lastEvents;
+  let events;
+  try {
+    events = await eventually('five real scenario events', async () => {
+      const current = await matchingEvents();
+      lastEvents = current;
+      return current.host &&
+        current.docker &&
+        current.unknown &&
+        current.k8sAgent &&
+        current.k8sSidecar
+        ? current
+        : undefined;
+    });
+  } catch (error) {
+    error.message += `; scenario state=${JSON.stringify({
+      total: lastEvents?.total,
+      host: Boolean(lastEvents?.host),
+      docker: Boolean(lastEvents?.docker),
+      unknown: Boolean(lastEvents?.unknown),
+      k8sAgent: Boolean(lastEvents?.k8sAgent),
+      k8sSidecar: Boolean(lastEvents?.k8sSidecar),
+      observed: lastEvents?.observed,
+    })}`;
+    throw error;
+  }
   console.log(JSON.stringify({
     observedAttribution: {
+      host: events.host.attribution,
       docker: events.docker.attribution,
       unknown: events.unknown.attribution,
       k8sAgent: events.k8sAgent.attribution,
       k8sSidecar: events.k8sSidecar.attribution,
     },
   }, null, 2));
+  assert.equal(events.host.attribution?.classification, 'confirmed_agent');
+  assert.equal(events.host.attribution?.agentScopeId, 'real-host-template-agent');
+  assert.equal(events.host.attribution?.source, 'self_register');
   assert.equal(events.docker.attribution?.classification, 'confirmed_agent');
   assert.equal(events.docker.attribution?.agentScopeId, 'real-docker-template-agent');
   assert.equal(events.docker.attribution?.source, 'self_register');
@@ -409,6 +498,7 @@ async function verifyResults() {
   console.log(JSON.stringify({
     collectorId,
     events: {
+      hostTemplate: events.host.attribution,
       dockerTemplate: events.docker.attribution,
       unknownBehavior: events.unknown.attribution,
       kubernetesAgent: events.k8sAgent.attribution,
@@ -416,28 +506,38 @@ async function verifyResults() {
     },
     filterMetrics: heartbeat.filterMetrics,
   }, null, 2));
+  assert.equal(heartbeat.filterMetrics.queueDropped, 0);
+  assert.ok(
+    heartbeat.filterMetrics.processCacheHits > 0,
+    'real numeric Observer ProcessKey facts did not produce a process cache hit',
+  );
+  assert.ok(
+    heartbeat.filterMetrics.processFallbackProcReads <
+      heartbeat.filterMetrics.processClassifications,
+    'current-process /proc fallback ran for every classified event',
+  );
 }
 
 async function cleanup() {
-  if (created.collector) {
-    await run('docker', ['stop', '--time', '5', collectorName], {
-      timeoutMs: 15_000,
-      allowFailure: true,
-    });
-    await run('docker', ['rm', '-f', collectorName], { allowFailure: true });
-  }
-  if (created.unknown) {
-    await run('docker', ['rm', '-f', unknownName], { allowFailure: true });
-  }
-  if (created.template) {
-    await run('docker', ['rm', '-f', templateName], { allowFailure: true });
-  }
+  // A timed-out `docker run` can create its container before the CLI returns. Always remove all
+  // exact, run-unique names even when the corresponding creation flag was not set.
+  await run(
+    'docker',
+    ['rm', '-f', collectorName, unknownName, templateName],
+    { allowFailure: true, timeoutMs: 120_000 },
+  );
   if (created.pod) {
     await run(
       'kubectl',
       ['-n', namespace, 'delete', 'pod', podName, '--wait=true', '--timeout=30s'],
       { timeoutMs: 40_000, allowFailure: true },
     );
+  }
+  if (created.hostExecutable) {
+    await unlink(hostExecutablePath).catch(() => {});
+  }
+  if (created.hostMarker) {
+    await unlink(hostMarkerPath).catch(() => {});
   }
   if (snapshotServer) {
     await new Promise((resolve) => snapshotServer.close(resolve));

@@ -574,6 +574,7 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   eventCategory?: EventCategory;
   verdict?: Verdict;
   tier?: Tier;
+  q?: string;
   limit?: number;
 }
 export interface AgentEventListItem {
@@ -1094,6 +1095,9 @@ export interface CollectorFilterMetrics {
   processCacheHits: number;
   processCacheMisses: number;
   processProcReads: number;
+  processBootstrapProcReads: number;
+  processFallbackProcReads: number;
+  processAncestryProcReads: number;
 }
 export interface CollectorHeartbeatRecord extends Required<Pick<CollectorHeartbeatRequest, 'collectorId' | 'status'>> {
   at: number;

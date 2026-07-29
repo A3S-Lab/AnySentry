@@ -802,6 +802,9 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       processCacheHits: clamp(rawFilter.processCacheHits),
       processCacheMisses: clamp(rawFilter.processCacheMisses),
       processProcReads: clamp(rawFilter.processProcReads),
+      processBootstrapProcReads: clamp(rawFilter.processBootstrapProcReads),
+      processFallbackProcReads: clamp(rawFilter.processFallbackProcReads),
+      processAncestryProcReads: clamp(rawFilter.processAncestryProcReads),
     };
     const rec: CollectorHeartbeatRecord = {
       collectorId,

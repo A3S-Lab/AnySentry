@@ -43,7 +43,10 @@ function attributor(procEntries = []) {
   assert.equal(existingDescendant.attribution.agentScopeId, 'codex');
   assert.equal(existingDescendant.attribution.rootPid, 900);
 
-  assert.equal(judge.procs.get(950), undefined);
+  assert.equal(judge.procs.get(950)?.state, 'unknown');
+  assert.equal(judge.metrics().bootstrapProcReads, 4);
+  assert.equal(judge.metrics().fallbackProcReads, 0);
+  assert.equal(judge.metrics().ancestryProcReads, 0);
 
 }
 
@@ -80,6 +83,62 @@ function attributor(procEntries = []) {
   assert.equal(judge.classify(routine).state, 'non_agent');
   assert.equal(judge.metrics().procReads, 1, 'a warm negative classification must not reread /proc');
   assert.equal(judge.metrics().cacheHits, 1);
+}
+
+{
+  const procs = new Map([
+    [800, { pid: 800, tgid: 800, ppid: 1, startTime: '80', comm: 'worker', exe: '/usr/bin/worker', argv: 'worker' }],
+  ]);
+  const judge = new AgentAttributor({
+    now: () => 1_000_000,
+    readProc: (pid) => procs.get(pid),
+  });
+  const first = judge.classify(observerEvent({
+    pid: 801,
+    ppid: 800,
+    comm: 'helper',
+    exe: '/usr/bin/helper',
+    startTimeNs: '81',
+    argv: ['helper'],
+  }));
+  assert.equal(first.state, 'non_agent');
+  assert.equal(judge.metrics().ancestryProcReads, 1);
+  const sibling = judge.classify(observerEvent({
+    pid: 802,
+    ppid: 800,
+    comm: 'helper',
+    exe: '/usr/bin/helper',
+    startTimeNs: '82',
+    argv: ['helper'],
+  }));
+  assert.equal(sibling.state, 'non_agent');
+  assert.equal(
+    judge.metrics().ancestryProcReads,
+    1,
+    'a recent cached parent chain must not reread /proc for every sibling event',
+  );
+}
+
+{
+  const judge = new AgentAttributor({
+    now: () => 1_000_000,
+    readProc: () => {
+      throw new Error('complete numeric Observer process facts must not read /proc');
+    },
+  });
+  const numericFacts = observerEvent({
+    pid: 820,
+    ppid: 1,
+    comm: 'worker',
+    exe: '/usr/bin/worker',
+    startTimeNs: 82,
+    argv: ['worker'],
+  });
+  numericFacts.process.cgroupId = 42;
+  assert.equal(judge.classify(numericFacts).state, 'non_agent');
+  assert.equal(judge.classify(numericFacts).state, 'non_agent');
+  assert.equal(judge.metrics().cacheHits, 1);
+  assert.equal(judge.metrics().procReads, 0);
 }
 
 {

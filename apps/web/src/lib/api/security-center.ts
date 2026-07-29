@@ -300,6 +300,7 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   eventCategory?: AgentEventCategory;
   verdict?: SecurityVerdict;
   tier?: "Rules" | "Llm" | "Agent";
+  q?: string;
   limit?: number;
 }
 
@@ -1182,6 +1183,9 @@ export interface CollectorFilterMetrics {
   processCacheHits: number;
   processCacheMisses: number;
   processProcReads: number;
+  processBootstrapProcReads: number;
+  processFallbackProcReads: number;
+  processAncestryProcReads: number;
 }
 
 export interface CollectorHeartbeatAck {
