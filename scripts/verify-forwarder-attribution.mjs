@@ -150,13 +150,23 @@ function attributor(procEntries = []) {
 }
 
 {
-  const judge = attributor();
+  let now = 1_000_000;
+  const judge = new AgentAttributor({
+    now: () => now,
+    readProc: () => undefined,
+    tombstoneTtlMs: 5_000,
+  });
   assert.equal(judge.classify(observerEvent({ pid: 600, ppid: 1, comm: 'codex', exe: '/usr/bin/codex', startTimeNs: '60', argv: ['codex'] })).state, 'agent');
   const exitEvent = observerEvent({ pid: 600, ppid: 1, comm: 'codex', exe: '/usr/bin/codex', startTimeNs: '60', argv: [] });
   exitEvent.event = { ProcessExit: { pid: 600, exit_code: 0, signal: 0 } };
   assert.equal(judge.classify(exitEvent).state, 'agent');
+  assert.equal(judge.metrics().tombstones, 1);
+  const late = observerEvent({ pid: 600, ppid: 999, comm: 'bash', exe: '/usr/bin/bash', startTimeNs: '60', argv: ['bash', '-c', 'echo late'] });
+  assert.equal(judge.classify(late).state, 'agent', 'a late event reuses the matching process tombstone');
   const reused = judge.classify(observerEvent({ pid: 600, ppid: 999, comm: 'short-task', exe: '/usr/bin/short-task', startTimeNs: '', argv: ['short-task'] }));
   assert.equal(reused.state, 'unknown');
+  now += 5_001;
+  assert.equal(judge.metrics().tombstones, 0);
 }
 
 {

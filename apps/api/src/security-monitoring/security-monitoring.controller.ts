@@ -307,6 +307,8 @@ function parseCollectorHeartbeatLine(line: string): T.CollectorHeartbeatRequest 
       observedAgents: numField(hb, 'observedAgents', 'observed_agents'),
       errorCount: numField(hb, 'errorCount', 'error_count') ?? execIncomplete,
       queueDepth: numField(hb, 'queueDepth', 'queue_depth'),
+      filterMetrics:
+        (obj(hb.filterMetrics) ?? obj(hb.filter_metrics)) as T.CollectorFilterMetrics | undefined,
       message: strField(hb, 'message'),
     };
   } catch {

@@ -7,8 +7,9 @@
 // batch network writes, cap in-flight POSTs, and pause stdin at pressure so memory stays flat.
 //
 // Agent scope is fail-open for attribution: known Agent and unresolved events are forwarded, and
-// only events with a complete non-Agent PID ancestry are dropped. The legacy all/shadow modes also
-// remove pseudo-filesystem file noise; override those prefixes via FORWARD_DROP_PATHS.
+// only events with a complete non-Agent identity are dropped. Shadow computes the exact decision
+// but forwards it, while all is the unfiltered recovery mode. Override routine noise prefixes via
+// FORWARD_DROP_PATHS.
 const http = require('node:http');
 const https = require('node:https');
 const readline = require('node:readline');
@@ -104,7 +105,6 @@ console.error(`[observer-forward] process snapshot: scanned=${bootstrap.scanned}
 console.error(`[observer-forward] agent templates: source=${templateRegistry.source}; loaded=${templateRegistry.metrics().loaded}; invalid=${templateRegistry.metrics().invalid + templateLoadErrors}`);
 void dockerDiscovery.start((snapshot) => workloadCache.replace(snapshot, 'docker')).then((started) => {
   const docker = dockerDiscovery.metrics();
-  const behavior = behaviorDetector.metrics();
   console.error(`[observer-forward] docker discovery: enabled=${docker.enabled}; started=${started}; socket=${dockerDiscovery.socketPath}`);
 });
 const toolExecDeduper = new ToolExecDeduper({
@@ -124,8 +124,11 @@ let attributionCounts = {
   unknown: 0,
   nonAgent: 0,
   filteredNonAgent: 0,
+  wouldFilterNonAgent: 0,
   filteredNoise: 0,
+  wouldFilterNoise: 0,
   discoveryBudgetDropped: 0,
+  wouldDiscoveryBudgetDrop: 0,
   forwarded: 0,
   queueDropped: 0,
   batches: 0,
@@ -139,7 +142,7 @@ let batchTimer;
 const rl = readline.createInterface({ input: process.stdin });
 
 function isNoise(o) {
-  const fa = o.event && (o.event.FileAccess || o.event.FileDelete);
+  const fa = o.event && o.event.FileAccess;
   return !!(fa && typeof fa.path === 'string' && DROP_PATHS.some((p) => fa.path.startsWith(p)));
 }
 
@@ -279,6 +282,9 @@ function sendHeartbeat(done = () => {}) {
   const classifications = attributionCounts;
   const workload = workloadCache.metrics();
   const docker = dockerDiscovery.metrics();
+  const behavior = behaviorDetector.metrics();
+  const templates = templateRegistry.metrics();
+  const processes = attributor.metrics();
   eventKindCounts = Object.create(null);
   attributionCounts = {
     observed: 0,
@@ -287,8 +293,11 @@ function sendHeartbeat(done = () => {}) {
     unknown: 0,
     nonAgent: 0,
     filteredNonAgent: 0,
+    wouldFilterNonAgent: 0,
     filteredNoise: 0,
+    wouldFilterNoise: 0,
     discoveryBudgetDropped: 0,
+    wouldDiscoveryBudgetDrop: 0,
     forwarded: 0,
     queueDropped: 0,
     batches: 0,
@@ -310,7 +319,48 @@ function sendHeartbeat(done = () => {}) {
       queueDepth: pending.length,
       outputDropped: dropped,
       errorCount: errors,
-      message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; filtered_non_agent=${classifications.filteredNonAgent}; filtered_noise=${classifications.filteredNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
+      filterMetrics: {
+        scope: FORWARD_SCOPE,
+        observed: classifications.observed,
+        forwarded: classifications.forwarded,
+        confirmedAgent: classifications.confirmedAgent,
+        probableAgent: classifications.probableAgent,
+        unknown: classifications.unknown,
+        nonAgent: classifications.nonAgent,
+        filteredNonAgent: classifications.filteredNonAgent,
+        wouldFilterNonAgent: classifications.wouldFilterNonAgent,
+        filteredNoise: classifications.filteredNoise,
+        wouldFilterNoise: classifications.wouldFilterNoise,
+        discoveryBudgetDropped: classifications.discoveryBudgetDropped,
+        wouldDiscoveryBudgetDrop: classifications.wouldDiscoveryBudgetDrop,
+        deduplicated: classifications.deduplicated,
+        queueDropped: classifications.queueDropped,
+        batches: classifications.batches,
+        batchEvents: classifications.batchEvents,
+        identitySnapshotReady: workload.ready,
+        identitySnapshotVersion: workload.version,
+        identitySnapshotAgeSeconds: workload.ageSeconds,
+        identityCacheEntries: workload.entries,
+        identityCacheHits: workload.hits,
+        identityCacheMisses: workload.misses,
+        identityErrors: workload.errors,
+        dockerEnabled: docker.enabled,
+        dockerReady: docker.ready,
+        dockerEntries: docker.entries,
+        dockerReconnects: docker.reconnects,
+        dockerErrors: docker.errors,
+        behaviorWorkloads: behavior.workloads,
+        behaviorCandidates: behavior.candidates,
+        behaviorPromoted: behavior.promoted,
+        behaviorEvicted: behavior.evicted,
+        templateLoaded: templates.loaded,
+        templateInvalid: templates.invalid + templateLoadErrors,
+        templateMatches: templates.matches,
+        templateAmbiguous: templates.ambiguous,
+        processCacheEntries: processes.processes,
+        processTombstones: processes.tombstones,
+      },
+      message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
     },
     5000,
@@ -475,32 +525,36 @@ rl.on('line', (raw) => {
     attributionCounts.unknown++;
   }
   const kind = eventKind(o);
-  // A rare, high-signal security action is useful even when its workload is a known non-Agent.
-  if (
-    FORWARD_SCOPE === 'agent' &&
-    classification.state === 'non_agent' &&
-    kind !== 'SecurityAction'
-  ) {
-    attributionCounts.filteredNonAgent++;
-    return;
+  let filterReason = '';
+  if (FORWARD_SCOPE !== 'all') {
+    // A rare, high-signal security action is useful even when its workload is a known non-Agent.
+    if (classification.state === 'non_agent' && kind !== 'SecurityAction') {
+      filterReason = 'non_agent';
+    } else if (
+      classification.state === 'unknown' &&
+      kind === 'FileAccess' &&
+      !discoveryBudget.allow(o)
+    ) {
+      // Snapshot outages fail open for high-value evidence. Only routine unknown FileAccess is
+      // budgeted. Shadow evaluates the same stateful decision without dropping the event.
+      filterReason = 'discovery_budget';
+    } else if (isNoise(o)) {
+      // Routine pseudo-filesystem writes are a separate, explainable noise reason. FileDelete is
+      // deliberately excluded because deletion remains high-value evidence.
+      filterReason = 'routine_noise';
+    }
   }
-  // Snapshot outages fail open, but an unknown container must not flood the API with routine
-  // file-write churn. Preserve the first bounded set per workload/second; ToolExec, deletes,
-  // security, network, and LLM evidence never enter this budget.
-  if (
-    FORWARD_SCOPE === 'agent' &&
-    classification.state === 'unknown' &&
-    kind === 'FileAccess' &&
-    !discoveryBudget.allow(o)
-  ) {
-    attributionCounts.discoveryBudgetDropped++;
-    return;
-  }
-  // Preserve the legacy pseudo-filesystem noise filter in all/shadow modes. In agent mode,
-  // unknown events must survive so incomplete lineage never becomes silent data loss.
-  if (FORWARD_SCOPE !== 'agent' && isNoise(o)) {
-    attributionCounts.filteredNoise++;
-    return;
+  if (filterReason) {
+    if (FORWARD_SCOPE === 'shadow') {
+      if (filterReason === 'non_agent') attributionCounts.wouldFilterNonAgent++;
+      else if (filterReason === 'discovery_budget') attributionCounts.wouldDiscoveryBudgetDrop++;
+      else attributionCounts.wouldFilterNoise++;
+    } else {
+      if (filterReason === 'non_agent') attributionCounts.filteredNonAgent++;
+      else if (filterReason === 'discovery_budget') attributionCounts.discoveryBudgetDropped++;
+      else attributionCounts.filteredNoise++;
+      return;
+    }
   }
   bumpEventKind(o);
 

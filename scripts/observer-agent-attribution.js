@@ -7,6 +7,7 @@ const DEFAULT_ROOT_NAMES = 'codex,a3s,a3s-code,a3s code,claude,claude-code,claud
 const DEFAULT_MAX_PROCS = 20_000;
 const DEFAULT_MAX_ANCESTORS = 32;
 const RECORD_TTL_MS = 30 * 60_000;
+const DEFAULT_TOMBSTONE_TTL_MS = 15_000;
 
 function positiveInt(value) {
   const parsed = Number(value);
@@ -86,6 +87,15 @@ class AgentAttributor {
     this.rootNames = new Set((options.rootNames || process.env.ANYSENTRY_AGENT_ROOT_NAMES || DEFAULT_ROOT_NAMES)
       .split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
     this.procs = new Map();
+    this.tombstones = new Map();
+    this.tombstoneTtlMs =
+      positiveInt(options.tombstoneTtlMs) ||
+      positiveInt(process.env.ANYSENTRY_PROCESS_TOMBSTONE_MS) ||
+      DEFAULT_TOMBSTONE_TTL_MS;
+    this.maxTombstones =
+      positiveInt(options.maxTombstones) ||
+      positiveInt(process.env.ANYSENTRY_PROCESS_MAX_TOMBSTONES) ||
+      this.maxProcs;
   }
 
   seedFromProc() {
@@ -162,16 +172,20 @@ class AgentAttributor {
     this.discardReusedPid(current);
 
     const directAgent = this.matchAgent(current);
-    if (directAgent) return this.finish(pid, this.rememberAgent(current, directAgent, pid, 'hint_only', 'argv'), exiting);
+    if (directAgent) return this.finish(pid, this.rememberAgent(current, directAgent, pid, 'hint_only', 'argv'), exiting, current);
 
     const existing = this.procs.get(pid);
-    if (existing?.state === 'agent') return this.finish(pid, this.agentResult(existing), exiting);
+    if (existing?.state === 'agent') return this.finish(pid, this.agentResult(existing), exiting, current);
+    const tombstone = this.tombstoneFor(current);
+    if (tombstone?.state === 'agent') {
+      return this.finish(pid, this.agentResult(tombstone), exiting, current);
+    }
 
     // Short-process events can arrive out of order. Re-evaluate negative cache entries when
     // a later event carries a usable parent, otherwise ProcessExit can hide the ToolExec lineage.
     const ancestry = this.resolveAncestry(current.ppid, now);
     if (ancestry.state === 'agent') {
-      return this.finish(pid, this.rememberAgent(current, ancestry.agentId, ancestry.rootPid, 'process_lineage', 'process_graph'), exiting);
+      return this.finish(pid, this.rememberAgent(current, ancestry.agentId, ancestry.rootPid, 'process_lineage', 'process_graph'), exiting, current);
     }
 
     if (ancestry.state === 'non_agent') {
@@ -186,16 +200,57 @@ class AgentAttributor {
           source: 'process_graph',
           evidence: ['process_lineage:pid1'],
         },
-      }, exiting);
+      }, exiting, current);
     }
 
     this.remember({ ...current, state: 'unknown', lastSeen: now });
-    return this.finish(pid, this.unknown(), exiting);
+    return this.finish(pid, this.unknown(), exiting, current);
   }
 
-  finish(pid, result, exiting) {
-    if (exiting) this.procs.delete(pid);
+  finish(pid, result, exiting, current) {
+    if (exiting) {
+      const record = this.procs.get(pid) || (
+        result.state === 'agent'
+          ? {
+              ...current,
+              state: 'agent',
+              agentId: result.attribution.agentScopeId,
+              rootPid: result.attribution.rootPid ?? pid,
+              lastSeen: this.now(),
+            }
+          : undefined
+      );
+      if (record?.startTime) this.rememberTombstone(record);
+      this.procs.delete(pid);
+    }
     return result;
+  }
+
+  tombstoneFor(info) {
+    this.pruneTombstones();
+    if (!info.startTime) return undefined;
+    const tombstone = this.tombstones.get(info.pid);
+    if (!tombstone || tombstone.expiresAt <= this.now()) return undefined;
+    return tombstone.record.startTime === info.startTime ? tombstone.record : undefined;
+  }
+
+  rememberTombstone(record) {
+    this.tombstones.set(record.pid, {
+      record: { ...record },
+      expiresAt: this.now() + this.tombstoneTtlMs,
+    });
+    while (this.tombstones.size > this.maxTombstones) {
+      const oldest = this.tombstones.keys().next().value;
+      if (oldest == null) break;
+      this.tombstones.delete(oldest);
+    }
+  }
+
+  pruneTombstones() {
+    const now = this.now();
+    for (const [pid, tombstone] of this.tombstones) {
+      if (tombstone.expiresAt <= now) this.tombstones.delete(pid);
+    }
   }
 
   resolveAncestry(initialPpid, now) {
@@ -325,6 +380,14 @@ class AgentAttributor {
   discardReusedPid(info) {
     const existing = this.procs.get(info.pid);
     if (existing?.startTime && info.startTime && existing.startTime !== info.startTime) this.procs.delete(info.pid);
+    const tombstone = this.tombstones.get(info.pid);
+    if (
+      tombstone?.record.startTime &&
+      info.startTime &&
+      tombstone.record.startTime !== info.startTime
+    ) {
+      this.tombstones.delete(info.pid);
+    }
   }
 
   remember(record) {
@@ -336,6 +399,14 @@ class AgentAttributor {
       if (this.procs.size >= this.maxProcs) this.procs.clear();
     }
     this.procs.set(record.pid, record);
+  }
+
+  metrics() {
+    this.pruneTombstones();
+    return {
+      processes: this.procs.size,
+      tombstones: this.tombstones.size,
+    };
   }
 }
 

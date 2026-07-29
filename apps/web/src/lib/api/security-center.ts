@@ -1130,7 +1130,50 @@ export interface CollectorHeartbeatRequest {
   outputDropped?: number;
   errorCount?: number;
   observedAgents?: number;
+  filterMetrics?: CollectorFilterMetrics;
   message?: string;
+}
+
+export interface CollectorFilterMetrics {
+  scope: "all" | "shadow" | "agent";
+  observed: number;
+  forwarded: number;
+  confirmedAgent: number;
+  probableAgent: number;
+  unknown: number;
+  nonAgent: number;
+  filteredNonAgent: number;
+  wouldFilterNonAgent: number;
+  filteredNoise: number;
+  wouldFilterNoise: number;
+  discoveryBudgetDropped: number;
+  wouldDiscoveryBudgetDrop: number;
+  deduplicated: number;
+  queueDropped: number;
+  batches: number;
+  batchEvents: number;
+  identitySnapshotReady: boolean;
+  identitySnapshotVersion: number;
+  identitySnapshotAgeSeconds: number;
+  identityCacheEntries: number;
+  identityCacheHits: number;
+  identityCacheMisses: number;
+  identityErrors: number;
+  dockerEnabled: boolean;
+  dockerReady: boolean;
+  dockerEntries: number;
+  dockerReconnects: number;
+  dockerErrors: number;
+  behaviorWorkloads: number;
+  behaviorCandidates: number;
+  behaviorPromoted: number;
+  behaviorEvicted: number;
+  templateLoaded: number;
+  templateInvalid: number;
+  templateMatches: number;
+  templateAmbiguous: number;
+  processCacheEntries: number;
+  processTombstones: number;
 }
 
 export interface CollectorHeartbeatAck {
@@ -1173,6 +1216,7 @@ export interface CollectorHealthItem {
   droppedEvents: number;
   outputDropped: number;
   errorCount: number;
+  filterMetrics: CollectorFilterMetrics;
   message?: string;
   eventCategoryCounts: Record<AgentEventCategory, number>;
 }

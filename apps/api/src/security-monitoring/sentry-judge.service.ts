@@ -751,6 +751,50 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const clamp = (n: unknown) => Math.max(0, Number.isFinite(Number(n)) ? Math.round(Number(n)) : 0);
     const eventKindCounts: Record<string, number> = {};
     for (const [key, value] of Object.entries(input.eventKindCounts ?? {})) eventKindCounts[key.slice(0, 64)] = clamp(value);
+    const rawFilter = input.filterMetrics ?? ({} as Partial<import('./types').CollectorFilterMetrics>);
+    const filterMetrics: import('./types').CollectorFilterMetrics = {
+      scope: ['all', 'shadow', 'agent'].includes(rawFilter.scope ?? '')
+        ? (rawFilter.scope as import('./types').CollectorFilterMetrics['scope'])
+        : 'all',
+      observed: clamp(rawFilter.observed),
+      forwarded: clamp(rawFilter.forwarded),
+      confirmedAgent: clamp(rawFilter.confirmedAgent),
+      probableAgent: clamp(rawFilter.probableAgent),
+      unknown: clamp(rawFilter.unknown),
+      nonAgent: clamp(rawFilter.nonAgent),
+      filteredNonAgent: clamp(rawFilter.filteredNonAgent),
+      wouldFilterNonAgent: clamp(rawFilter.wouldFilterNonAgent),
+      filteredNoise: clamp(rawFilter.filteredNoise),
+      wouldFilterNoise: clamp(rawFilter.wouldFilterNoise),
+      discoveryBudgetDropped: clamp(rawFilter.discoveryBudgetDropped),
+      wouldDiscoveryBudgetDrop: clamp(rawFilter.wouldDiscoveryBudgetDrop),
+      deduplicated: clamp(rawFilter.deduplicated),
+      queueDropped: clamp(rawFilter.queueDropped),
+      batches: clamp(rawFilter.batches),
+      batchEvents: clamp(rawFilter.batchEvents),
+      identitySnapshotReady: rawFilter.identitySnapshotReady === true,
+      identitySnapshotVersion: clamp(rawFilter.identitySnapshotVersion),
+      identitySnapshotAgeSeconds: clamp(rawFilter.identitySnapshotAgeSeconds),
+      identityCacheEntries: clamp(rawFilter.identityCacheEntries),
+      identityCacheHits: clamp(rawFilter.identityCacheHits),
+      identityCacheMisses: clamp(rawFilter.identityCacheMisses),
+      identityErrors: clamp(rawFilter.identityErrors),
+      dockerEnabled: rawFilter.dockerEnabled === true,
+      dockerReady: rawFilter.dockerReady === true,
+      dockerEntries: clamp(rawFilter.dockerEntries),
+      dockerReconnects: clamp(rawFilter.dockerReconnects),
+      dockerErrors: clamp(rawFilter.dockerErrors),
+      behaviorWorkloads: clamp(rawFilter.behaviorWorkloads),
+      behaviorCandidates: clamp(rawFilter.behaviorCandidates),
+      behaviorPromoted: clamp(rawFilter.behaviorPromoted),
+      behaviorEvicted: clamp(rawFilter.behaviorEvicted),
+      templateLoaded: clamp(rawFilter.templateLoaded),
+      templateInvalid: clamp(rawFilter.templateInvalid),
+      templateMatches: clamp(rawFilter.templateMatches),
+      templateAmbiguous: clamp(rawFilter.templateAmbiguous),
+      processCacheEntries: clamp(rawFilter.processCacheEntries),
+      processTombstones: clamp(rawFilter.processTombstones),
+    };
     const rec: CollectorHeartbeatRecord = {
       collectorId,
       at,
@@ -769,6 +813,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       outputDropped: clamp(input.outputDropped),
       errorCount: clamp(input.errorCount),
       observedAgents: clamp(input.observedAgents),
+      filterMetrics,
       message: cleanText(input.message, 500),
     };
     this.addCollectorHeartbeat(rec);

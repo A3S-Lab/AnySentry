@@ -472,6 +472,47 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
     outputDropped: 1,
     errorCount: 1,
     observedAgents: 2,
+    filterMetrics: {
+      scope: 'shadow',
+      observed: 9,
+      forwarded: 9,
+      confirmedAgent: 2,
+      probableAgent: 1,
+      unknown: 3,
+      nonAgent: 3,
+      filteredNonAgent: 0,
+      wouldFilterNonAgent: 3,
+      filteredNoise: 0,
+      wouldFilterNoise: 1,
+      discoveryBudgetDropped: 0,
+      wouldDiscoveryBudgetDrop: 1,
+      deduplicated: 0,
+      queueDropped: 0,
+      batches: 1,
+      batchEvents: 9,
+      identitySnapshotReady: true,
+      identitySnapshotVersion: 7,
+      identitySnapshotAgeSeconds: 2,
+      identityCacheEntries: 12,
+      identityCacheHits: 8,
+      identityCacheMisses: 1,
+      identityErrors: 0,
+      dockerEnabled: true,
+      dockerReady: true,
+      dockerEntries: 4,
+      dockerReconnects: 0,
+      dockerErrors: 0,
+      behaviorWorkloads: 3,
+      behaviorCandidates: 1,
+      behaviorPromoted: 1,
+      behaviorEvicted: 0,
+      templateLoaded: 2,
+      templateInvalid: 0,
+      templateMatches: 2,
+      templateAmbiguous: 0,
+      processCacheEntries: 8,
+      processTombstones: 1,
+    },
     message: 'simulated forwarder pressure',
   });
 
@@ -484,7 +525,11 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       health.items?.[0]?.state === 'degraded' &&
       health.items?.[0]?.queueDepth === 4 &&
       health.items?.[0]?.outputDropped === 1 &&
-      health.items?.[0]?.errorCount === 1,
+      health.items?.[0]?.errorCount === 1 &&
+      health.items?.[0]?.filterMetrics?.scope === 'shadow' &&
+      health.items?.[0]?.filterMetrics?.wouldFilterNonAgent === 3 &&
+      health.items?.[0]?.filterMetrics?.behaviorCandidates === 1 &&
+      health.items?.[0]?.filterMetrics?.processTombstones === 1,
     health,
   );
 }
