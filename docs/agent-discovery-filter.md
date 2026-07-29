@@ -2,6 +2,11 @@
 
 Status: implementation contract for `feat/agent-discovery-filter`
 
+The final acceptance target is the complete
+`AnySentry-Agent-Discovery-High-Performance-Design.md` roadmap, not only the first Kubernetes
+filter increment. Work is delivered in independently testable stages, but a stage is complete only
+when its result is reconciled with the remaining roadmap.
+
 ## Scope
 
 This feature reduces the volume of unrelated kernel events that reach AnySentry while preserving
@@ -18,6 +23,81 @@ The implementation spans two repositories:
 
 The filter is an identity and event-routing layer in front of Sentry. L1/L2/L3 risk judgment stays
 unchanged and receives only the events selected by this layer.
+
+## Discovery modes
+
+The registry has two complementary discovery modes. Both produce the same attribution envelope
+and classification state machine.
+
+### Operator templates
+
+An operator can declare how an Agent is deployed without enumerating every runtime identifier.
+Templates are trusted configuration and may be intentionally concise:
+
+```json
+{
+  "schemaVersion": "anysentry.agent_templates.v1",
+  "templates": [
+    {
+      "id": "claw-production",
+      "agentId": "claw",
+      "deployment": "docker",
+      "name": "claw"
+    },
+    {
+      "id": "review-agent",
+      "agentId": "review-agent",
+      "deployment": "kubernetes",
+      "match": {
+        "namespace": "agents-*",
+        "pod": "review-*",
+        "container": "agent"
+      }
+    },
+    {
+      "id": "host-codex",
+      "agentId": "codex",
+      "deployment": "host",
+      "match": {
+        "systemdUnit": "codex*.service",
+        "executable": "codex"
+      }
+    }
+  ]
+}
+```
+
+`deployment` is `host`, `docker`, `kubernetes`, or `any`. A short `name` is matched against the
+deployment's natural identity fields (unit/executable, container/image, or Pod/container/owner).
+The optional `match` object narrows the result. Exact label and explicit-field matches are stronger
+than fuzzy name matches. A template may explicitly declare `classification: "non_agent"`; absence
+of an Agent template is never by itself positive non-Agent evidence.
+
+Templates are loaded from `ANYSENTRY_AGENT_TEMPLATES_FILE` or
+`ANYSENTRY_AGENT_TEMPLATES_JSON`. Invalid or ambiguous templates fail open and increment a
+configuration/error counter. They never enter the kernel or execute arbitrary expressions.
+
+### Framework discovery
+
+The framework also discovers previously unknown runtimes. It keeps a bounded, expiring workload
+window containing counters and small sets rather than raw event history:
+
+```text
+LLM endpoint activity
+tool executions and unique tools
+LLM/tool alternation
+workspace file activity
+network targets
+child-process fanout
+```
+
+Lightweight deterministic scoring can promote `unknown` to `probable_agent`. Behavior alone never
+produces `confirmed_agent`; confirmation requires a trusted template, platform registration, or
+other authoritative binding. Hysteresis prevents a candidate from oscillating on every event.
+No LLM call is used in this detection path.
+
+The two modes are additive: an operator template gives immediate attribution, while framework
+discovery covers missing, incomplete, or newly introduced deployments.
 
 ## Required properties
 
@@ -123,6 +203,10 @@ Classification priority is:
 
 Generic names such as `node`, `python`, `bash`, and `sh` never confirm an Agent by themselves.
 
+A Kubernetes Pod that merely misses an Agent selector remains `unknown` unless an explicit
+non-Agent template or authoritative inventory classifies it. This preserves autonomous discovery
+for unlabelled Agents.
+
 ## Kubernetes discovery
 
 AnySentry performs an initial list followed by watch streams. The registry stores:
@@ -174,6 +258,10 @@ an ingest storm. The budget never changes the classification and every suppresse
 
 `shadow` computes the same decision and counters but forwards the event. `all` bypasses Agent
 classification filtering. `agent` applies the decision.
+
+Shadow counters use a separate `would_filter` namespace so operators can compare the result with
+`all` before enabling filtering. Filter metrics are structured heartbeat fields; the human-readable
+heartbeat message is only a compatibility summary.
 
 ## Data contract
 
@@ -250,6 +338,24 @@ output_drops_total{reason}
 ```
 
 Heartbeat messages carry interval deltas. No filter action is silent.
+
+## Delivery stages
+
+The implementation is reconciled against the complete roadmap after every stage:
+
+1. Stable Observer facts and the initial Kubernetes/host user-space filter.
+2. Unified operator templates, positive non-Agent semantics, and Docker/host/Kubernetes metadata
+   adapters.
+3. Bounded framework discovery with candidate scoring, evidence, hysteresis, and expiry.
+4. Correct shadow accounting, process/workload tombstones, structured metrics, and dashboard
+   visibility.
+5. Hot-path convergence: lifecycle-populated Process/Cgroup caches, cached parsing, priority
+   buckets, adaptive sampling/batching, and no routine per-event `/proc` traversal.
+6. Host, Docker, and Kubernetes end-to-end tests plus throughput, latency, CPU, RSS, wakeup, and
+   drop baselines.
+7. Only after user-space shadow validation, evaluate the optional observation-only eBPF prefilter.
+
+Stages 2-6 are part of the final feature target even when an earlier stage is deployable.
 
 ## Rollout and commits
 
