@@ -128,13 +128,13 @@ async function applyRealPod() {
           name: 'agent',
           image: 'redis:7-alpine',
           imagePullPolicy: 'IfNotPresent',
-          command: ['/bin/sh', '-c', 'sleep 180'],
+          command: ['/bin/sh', '-c', 'sleep 600'],
         },
         {
           name: 'metrics',
           image: 'redis:7-alpine',
           imagePullPolicy: 'IfNotPresent',
-          command: ['/bin/sh', '-c', 'sleep 180'],
+          command: ['/bin/sh', '-c', 'sleep 600'],
         },
       ],
     },
@@ -546,10 +546,12 @@ async function cleanup() {
 
 try {
   await api('/stats');
-  const pod = await applyRealPod();
-  const snapshotPort = await createSnapshotServer(pod);
+  // Create Docker workloads before the finite-lived Kubernetes fixture. Slow local Docker
+  // storage must not consume the Pod's entire test lifetime before collection starts.
   await startTemplateContainer();
   await startUnknownContainer();
+  const pod = await applyRealPod();
+  const snapshotPort = await createSnapshotServer(pod);
   await startCollector(snapshotPort, pod.spec.nodeName);
   await new Promise((resolve) => setTimeout(resolve, 2_000));
   await triggerScenarios();
