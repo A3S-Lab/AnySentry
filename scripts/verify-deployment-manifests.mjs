@@ -238,8 +238,20 @@ function verifyDockerfile() {
 function verifyObserverForwarderDockerfile() {
   const dockerfile = stripDockerComments(readText('deploy/observer-forwarder.Dockerfile'));
 
-  assert('Observer forwarder image extends the public observer image', /^FROM ghcr\.io\/a3s-lab\/observer:latest$/mu.test(dockerfile), dockerfile);
-  assert('Observer forwarder image copies a Node runtime without package install', /^COPY --from=nodebin \/usr\/local\/bin\/node \/usr\/local\/bin\/node$/mu.test(dockerfile) && !/^\s*RUN\b/mu.test(dockerfile), dockerfile);
+  assert(
+    'Observer forwarder image defaults to the public observer image and permits a tested build override',
+    /^ARG OBSERVER_IMAGE=ghcr\.io\/a3s-lab\/observer:latest$/mu.test(dockerfile) &&
+      /^FROM \$\{OBSERVER_IMAGE\}$/mu.test(dockerfile),
+    dockerfile,
+  );
+  assert(
+    'Observer forwarder image copies a configurable Node runtime without package install',
+    /^ARG NODE_IMAGE=node:20-bookworm-slim$/mu.test(dockerfile) &&
+      /^FROM \$\{NODE_IMAGE\} AS nodebin$/mu.test(dockerfile) &&
+      /^COPY --from=nodebin \/usr\/local\/bin\/node \/usr\/local\/bin\/node$/mu.test(dockerfile) &&
+      !/^\s*RUN\b/mu.test(dockerfile),
+    dockerfile,
+  );
   assert('Observer forwarder image bundles scripts/observer-forward.js', /^COPY scripts\/observer-forward\.js \/opt\/observer-forward\.js$/mu.test(dockerfile), dockerfile);
   assert('Observer forwarder image bundles PID attribution', /^COPY scripts\/observer-agent-attribution\.js \/opt\/observer-agent-attribution\.js$/mu.test(dockerfile), dockerfile);
   assert('Observer forwarder image bundles ToolExec deduplication', /^COPY scripts\/observer-event-dedup\.js \/opt\/observer-event-dedup\.js$/mu.test(dockerfile), dockerfile);

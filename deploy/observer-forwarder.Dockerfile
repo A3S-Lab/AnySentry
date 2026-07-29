@@ -4,8 +4,10 @@
 #   docker push <your-registry>/anysentry-observer:latest
 # The node binary comes from the bookworm image (glibc-built) and runs on the observer's
 # ubuntu:24.04 base (glibc 2.39).
-FROM node:20-bookworm-slim AS nodebin
-FROM ghcr.io/a3s-lab/observer:latest
+ARG OBSERVER_IMAGE=ghcr.io/a3s-lab/observer:latest
+ARG NODE_IMAGE=node:20-bookworm-slim
+FROM ${NODE_IMAGE} AS nodebin
+FROM ${OBSERVER_IMAGE}
 COPY --from=nodebin /usr/local/bin/node /usr/local/bin/node
 COPY scripts/observer-forward.js /opt/observer-forward.js
 COPY scripts/observer-agent-attribution.js /opt/observer-agent-attribution.js

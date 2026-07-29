@@ -44,6 +44,7 @@
     "verify:filter-pipeline": "node scripts/verify-filter-pipeline.mjs",
     "verify:priority-queue": "node scripts/verify-priority-queue.mjs",
     "perf:agent-filter": "node scripts/perf-agent-filter.mjs",
+    "verify:real-agent-discovery-chain:local": "pnpm build:api && node scripts/verify-deep-links-local.mjs scripts/verify-real-agent-discovery-chain.mjs",
     "verify:kube-identity": "pnpm build:api && node scripts/verify-kube-identity.mjs",
     "verify:forwarders:local": "pnpm build:api && node scripts/verify-deep-links-local.mjs scripts/verify-forwarders.mjs",
     "verify:operations-lifecycle": "node scripts/verify-operations-lifecycle.mjs",
