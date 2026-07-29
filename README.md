@@ -197,7 +197,10 @@ classification states are `confirmed_agent`, `probable_agent`, `unknown`, and `n
 positively identified `non_agent` events are dropped. Unknown events are forwarded so snapshot
 outages, missing `/proc` data, and short-lived processes do not become silent gaps. The forwarder
 sends bounded batches (default 32 events or 50 ms) and includes filter/cache/queue counters in its
-heartbeat. Use `FORWARD_SCOPE=all` for fallback or `FORWARD_SCOPE=shadow` for comparison.
+heartbeat. Routine `FileAccess` from unknown workloads is capped by a per-workload discovery budget
+(default 20 events/second); tool execution, deletion, security, network, and LLM evidence is never
+subject to that budget. Use `FORWARD_SCOPE=all` for fallback or `FORWARD_SCOPE=shadow` for
+comparison.
 
 ### Kubernetes integrated stack
 

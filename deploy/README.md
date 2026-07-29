@@ -141,6 +141,8 @@ an Agent container is therefore attributed by Pod UID + full Container ID, while
 classified separately. Unknown identities remain observable; only positively identified
 non-Agent events are filtered. Events are sent in bounded batches (32 events or 50 ms), and
 heartbeats report classification, cache, queue, batch, filtered, and dropped counters.
+During snapshot outages, high-value evidence stays fail-open while routine unknown `FileAccess`
+uses a per-workload discovery budget (20 events/second by default).
 
 Label Agent Pods and, for multi-container Pods, identify the Agent container:
 

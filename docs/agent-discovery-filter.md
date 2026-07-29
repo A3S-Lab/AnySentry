@@ -166,6 +166,12 @@ Routing policy:
 | unknown | keep | keep | keep within discovery budget | sample |
 | non_agent | cleanup only | keep | filter in `agent` mode | aggregate/filter |
 
+When identity metadata is unavailable, `ToolExec`, `SecurityAction`, `FileDelete`, network, and LLM
+evidence remain fail-open. Only routine unknown `FileAccess` is rate-budgeted per physical
+workload (default 20 events/second) to prevent a snapshot outage from turning filesystem churn into
+an ingest storm. The budget never changes the classification and every suppressed event increments
+`discovery_budget_dropped`.
+
 `shadow` computes the same decision and counters but forwards the event. `all` bypasses Agent
 classification filtering. `agent` applies the decision.
 

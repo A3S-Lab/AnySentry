@@ -157,7 +157,54 @@ class WorkloadIdentityCache {
   }
 }
 
+class DiscoveryBudget {
+  constructor(options = {}) {
+    this.now = typeof options.now === 'function' ? options.now : Date.now;
+    this.limit = Math.max(1, Number(options.limit) || 20);
+    this.windowMs = Math.max(100, Number(options.windowMs) || 1_000);
+    this.maxKeys = Math.max(100, Number(options.maxKeys) || 10_000);
+    this.windows = new Map();
+  }
+
+  allow(observerEvent) {
+    const identity = eventIdentityCandidates(observerEvent);
+    const processInfo = observerEvent?.process && typeof observerEvent.process === 'object'
+      ? observerEvent.process
+      : {};
+    const rawPayload = Object.values(observerEvent?.event ?? {})[0];
+    const payload = rawPayload && typeof rawPayload === 'object' ? rawPayload : {};
+    const key =
+      identity.candidates[0] ||
+      text(processInfo.cgroupId) ||
+      text(processInfo.cgroup_id) ||
+      text(observerEvent?.identity?.agent) ||
+      text(processInfo.pid) ||
+      text(payload.pid) ||
+      'unknown';
+    const now = this.now();
+    let window = this.windows.get(key);
+    if (!window || now - window.startedAt >= this.windowMs) {
+      window = { startedAt: now, count: 0 };
+      this.windows.set(key, window);
+    }
+    if (window.count >= this.limit) return false;
+    window.count++;
+    if (this.windows.size > this.maxKeys) {
+      for (const [candidate, item] of this.windows) {
+        if (now - item.startedAt >= this.windowMs) this.windows.delete(candidate);
+      }
+      while (this.windows.size > this.maxKeys) {
+        const oldest = this.windows.keys().next().value;
+        if (!oldest) break;
+        this.windows.delete(oldest);
+      }
+    }
+    return true;
+  }
+}
+
 module.exports = {
+  DiscoveryBudget,
   WorkloadIdentityCache,
   eventIdentityCandidates,
   normalizedContainerId,

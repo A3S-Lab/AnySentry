@@ -58,6 +58,8 @@ spec:
             - { name: FORWARD_BATCH_SIZE, value: "32" }
             - { name: FORWARD_BATCH_FLUSH_MS, value: "50" }
             - { name: FORWARD_MAX_QUEUE, value: "4096" }
+            # Fail-open discovery budget for high-frequency unknown FileAccess only.
+            - { name: FORWARD_UNKNOWN_FILE_BUDGET_PER_SEC, value: "20" }
           command: ["/bin/sh", "-c"]
           args: ["a3s-observer-collector | node /opt/observer-forward.js"]
           volumeMounts:

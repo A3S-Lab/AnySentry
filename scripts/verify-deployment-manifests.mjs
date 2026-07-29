@@ -206,7 +206,8 @@ function verifyObserverManifest() {
     'Observer DaemonSet consumes identity snapshots and uses bounded batching',
     /\{\s*name:\s*ANYSENTRY_IDENTITY_SNAPSHOT_URL,\s*value:\s*"http:\/\/anysentry:29653\/security-center\/identity\/snapshot"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_BATCH_SIZE,\s*value:\s*"32"\s*\}/u.test(daemonSet?.source ?? '') &&
-      /\{\s*name:\s*FORWARD_MAX_QUEUE,\s*value:\s*"4096"\s*\}/u.test(daemonSet?.source ?? ''),
+      /\{\s*name:\s*FORWARD_MAX_QUEUE,\s*value:\s*"4096"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_UNKNOWN_FILE_BUDGET_PER_SEC,\s*value:\s*"20"\s*\}/u.test(daemonSet?.source ?? ''),
     daemonSet?.source,
   );
   assert(

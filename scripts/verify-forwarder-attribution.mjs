@@ -6,7 +6,7 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const { AgentAttributor } = require('./observer-agent-attribution.js');
 const { ToolExecDeduper } = require('./observer-event-dedup.js');
-const { WorkloadIdentityCache } = require('./observer-workload-filter.js');
+const { DiscoveryBudget, WorkloadIdentityCache } = require('./observer-workload-filter.js');
 
 function observerEvent({ agent = 'process', pid, ppid, comm, exe, startTimeNs, argv = [] }) {
   return {
@@ -235,6 +235,25 @@ function attributor(procEntries = []) {
     argv: ['codex'],
   });
   assert.equal(cache.classify(hostEvent), undefined);
+}
+
+{
+  let now = 1_000;
+  const budget = new DiscoveryBudget({ limit: 2, windowMs: 1_000, now: () => now });
+  const fileEvent = observerEvent({
+    agent: 'pod-budget',
+    pid: 920,
+    ppid: 1,
+    comm: 'worker',
+    exe: '/usr/bin/worker',
+  });
+  fileEvent.identity.session = 'container-budget';
+  fileEvent.event = { FileAccess: { pid: 920, path: '/tmp/a', write: true } };
+  assert.equal(budget.allow(fileEvent), true);
+  assert.equal(budget.allow(fileEvent), true);
+  assert.equal(budget.allow(fileEvent), false);
+  now += 1_001;
+  assert.equal(budget.allow(fileEvent), true);
 }
 
 {

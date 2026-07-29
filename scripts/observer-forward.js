@@ -14,7 +14,7 @@ const https = require('node:https');
 const readline = require('node:readline');
 const { AgentAttributor } = require('./observer-agent-attribution');
 const { ToolExecDeduper } = require('./observer-event-dedup');
-const { WorkloadIdentityCache } = require('./observer-workload-filter');
+const { DiscoveryBudget, WorkloadIdentityCache } = require('./observer-workload-filter');
 
 const target = new URL(process.env.ANYSENTRY_INGEST_URL || 'http://localhost:29653/security-center/ingest');
 function defaultHeartbeatUrl(ingestUrl) {
@@ -51,6 +51,12 @@ const BATCH_SIZE = boundedNumber(process.env.FORWARD_BATCH_SIZE, 32, 1, 256);
 const BATCH_FLUSH_MS = boundedNumber(process.env.FORWARD_BATCH_FLUSH_MS, 50, 1, 5_000);
 const MAX_QUEUE = boundedNumber(process.env.FORWARD_MAX_QUEUE, 4_096, BATCH_SIZE, 100_000);
 const HTTP_TIMEOUT_MS = boundedNumber(process.env.FORWARD_HTTP_TIMEOUT_MS, 10_000, 1_000, 120_000);
+const UNKNOWN_FILE_BUDGET_PER_SEC = boundedNumber(
+  process.env.FORWARD_UNKNOWN_FILE_BUDGET_PER_SEC,
+  20,
+  1,
+  10_000,
+);
 const FORWARD_SCOPE = ['agent', 'all', 'shadow'].includes(process.env.FORWARD_SCOPE)
   ? process.env.FORWARD_SCOPE
   : 'agent';
@@ -74,6 +80,7 @@ const httpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_INFLIGHT });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_INFLIGHT });
 const attributor = new AgentAttributor();
 const workloadCache = new WorkloadIdentityCache();
+const discoveryBudget = new DiscoveryBudget({ limit: UNKNOWN_FILE_BUDGET_PER_SEC });
 const bootstrap = attributor.seedFromProc();
 console.error(`[observer-forward] process snapshot: scanned=${bootstrap.scanned}; agent_roots=${bootstrap.roots}; agent_descendants=${bootstrap.descendants}`);
 const toolExecDeduper = new ToolExecDeduper({
@@ -94,6 +101,7 @@ let attributionCounts = {
   nonAgent: 0,
   filteredNonAgent: 0,
   filteredNoise: 0,
+  discoveryBudgetDropped: 0,
   forwarded: 0,
   queueDropped: 0,
   batches: 0,
@@ -255,6 +263,7 @@ function sendHeartbeat(done = () => {}) {
     nonAgent: 0,
     filteredNonAgent: 0,
     filteredNoise: 0,
+    discoveryBudgetDropped: 0,
     forwarded: 0,
     queueDropped: 0,
     batches: 0,
@@ -276,7 +285,7 @@ function sendHeartbeat(done = () => {}) {
       queueDepth: pending.length,
       outputDropped: dropped,
       errorCount: errors,
-      message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; filtered_non_agent=${classifications.filteredNonAgent}; filtered_noise=${classifications.filteredNoise}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_errors=${workload.errors}; output_drops=${dropped}; errors=${errors}`,
+      message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; filtered_non_agent=${classifications.filteredNonAgent}; filtered_noise=${classifications.filteredNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_errors=${workload.errors}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
     },
     5000,
@@ -423,8 +432,26 @@ rl.on('line', (raw) => {
   } else {
     attributionCounts.unknown++;
   }
-  if (FORWARD_SCOPE === 'agent' && classification.state === 'non_agent') {
+  const kind = eventKind(o);
+  // A rare, high-signal security action is useful even when its workload is a known non-Agent.
+  if (
+    FORWARD_SCOPE === 'agent' &&
+    classification.state === 'non_agent' &&
+    kind !== 'SecurityAction'
+  ) {
     attributionCounts.filteredNonAgent++;
+    return;
+  }
+  // Snapshot outages fail open, but an unknown container must not flood the API with routine
+  // file-write churn. Preserve the first bounded set per workload/second; ToolExec, deletes,
+  // security, network, and LLM evidence never enter this budget.
+  if (
+    FORWARD_SCOPE === 'agent' &&
+    classification.state === 'unknown' &&
+    kind === 'FileAccess' &&
+    !discoveryBudget.allow(o)
+  ) {
+    attributionCounts.discoveryBudgetDropped++;
     return;
   }
   // Preserve the legacy pseudo-filesystem noise filter in all/shadow modes. In agent mode,
@@ -443,7 +470,7 @@ rl.on('line', (raw) => {
       ...(NODE_NAME ? { nodeName: NODE_NAME } : {}),
       ...sourceFields(),
     },
-    queuePriority(eventKind(o), classification),
+    queuePriority(kind, classification),
   );
 });
 
