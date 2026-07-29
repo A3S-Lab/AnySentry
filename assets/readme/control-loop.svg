@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="470" viewBox="0 0 1200 470" role="img" aria-labelledby="title desc">
+  <title id="title">AnySentry signal-to-action control loop</title>
+  <desc id="desc">Runtime signals are captured, normalized and redacted, judged by configured tiers, then exposed as evidence and governed actions to human and AI operators.</desc>
+
+  <rect width="1200" height="470" rx="24" fill="#0B0F0C"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif">
+    <text x="48" y="55" fill="#F8FAFC" font-size="34" font-weight="740">From runtime signal to governed action</text>
+    <text x="48" y="82" fill="#94A3B8" font-size="18">One canonical evidence plane for security operators and AI agents</text>
+
+    <g transform="translate(48 111)">
+      <rect width="250" height="258" rx="14" fill="#111612" stroke="#2A3730"/>
+      <text x="20" y="34" fill="#2DD4BF" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" font-weight="700">01 / CAPTURE</text>
+      <text x="20" y="70" fill="#F8FAFC" font-size="25" font-weight="700">Runtime signals</text>
+      <rect x="20" y="94" width="210" height="38" rx="8" fill="#0E2420" stroke="#1A6A5E"/>
+      <text x="35" y="119" fill="#CCFBF1" font-size="18">eBPF observer</text>
+      <rect x="20" y="143" width="210" height="38" rx="8" fill="#171D19" stroke="#34413B"/>
+      <text x="35" y="168" fill="#CBD5E1" font-size="18">JSON · CloudEvents</text>
+      <rect x="20" y="192" width="210" height="38" rx="8" fill="#171D19" stroke="#34413B"/>
+      <text x="35" y="217" fill="#CBD5E1" font-size="18">OTLP · Progressive API</text>
+    </g>
+
+    <path d="M306 240H324" stroke="#547067" stroke-width="2"/>
+    <path d="M324 240L314 233M324 240L314 247" stroke="#547067" stroke-width="2" fill="none"/>
+
+    <g transform="translate(330 111)">
+      <rect width="250" height="258" rx="14" fill="#111612" stroke="#2A3730"/>
+      <text x="20" y="34" fill="#2DD4BF" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" font-weight="700">02 / NORMALIZE</text>
+      <text x="20" y="70" fill="#F8FAFC" font-size="25" font-weight="700">Canonical evidence</text>
+      <text x="20" y="111" fill="#CBD5E1" font-size="18">Agent / session / run identity</text>
+      <path d="M20 127H230" stroke="#2A3730"/>
+      <text x="20" y="159" fill="#CBD5E1" font-size="18">Key-aware redaction</text>
+      <path d="M20 175H230" stroke="#2A3730"/>
+      <text x="20" y="207" fill="#CBD5E1" font-size="18">Event category + source</text>
+      <rect x="20" y="222" width="210" height="24" rx="6" fill="#0E2420"/>
+      <text x="30" y="239" fill="#5EEAD4" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14">anysentry.agent_event.v1</text>
+    </g>
+
+    <path d="M588 240H606" stroke="#547067" stroke-width="2"/>
+    <path d="M606 240L596 233M606 240L596 247" stroke="#547067" stroke-width="2" fill="none"/>
+
+    <g transform="translate(612 111)">
+      <rect width="250" height="258" rx="14" fill="#111612" stroke="#2A3730"/>
+      <text x="20" y="34" fill="#FBBF24" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" font-weight="700">03 / DECIDE</text>
+      <text x="20" y="70" fill="#F8FAFC" font-size="25" font-weight="700">Tiered judgment</text>
+      <rect x="20" y="94" width="210" height="40" rx="8" fill="#17201B" stroke="#4D665A"/>
+      <text x="35" y="120" fill="#F8FAFC" font-size="18" font-weight="700">L1 Rules</text>
+      <text x="172" y="120" fill="#5EEAD4" font-size="16">default</text>
+      <rect x="20" y="145" width="210" height="40" rx="8" fill="#171A18" stroke="#3A443F" stroke-dasharray="5 5"/>
+      <text x="35" y="171" fill="#CBD5E1" font-size="18">L2 LLM</text>
+      <text x="164" y="171" fill="#94A3B8" font-size="16">optional</text>
+      <rect x="20" y="196" width="210" height="40" rx="8" fill="#171A18" stroke="#3A443F" stroke-dasharray="5 5"/>
+      <text x="35" y="222" fill="#CBD5E1" font-size="18">L3 Agent</text>
+      <text x="164" y="222" fill="#94A3B8" font-size="16">optional</text>
+    </g>
+
+    <path d="M870 240H888" stroke="#547067" stroke-width="2"/>
+    <path d="M888 240L878 233M888 240L878 247" stroke="#547067" stroke-width="2" fill="none"/>
+
+    <g transform="translate(894 111)">
+      <rect width="258" height="258" rx="14" fill="#111612" stroke="#2A3730"/>
+      <text x="20" y="34" fill="#FB7185" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" font-weight="700">04 / OPERATE</text>
+      <text x="20" y="70" fill="#F8FAFC" font-size="25" font-weight="700">Evidence + action</text>
+      <text x="20" y="111" fill="#CBD5E1" font-size="18">Incidents and alerts</text>
+      <text x="20" y="145" fill="#CBD5E1" font-size="18">Evidence Bundles</text>
+      <text x="20" y="179" fill="#CBD5E1" font-size="18">Runtime guard</text>
+      <text x="20" y="213" fill="#CBD5E1" font-size="18">Remediation workflow</text>
+      <rect x="20" y="228" width="218" height="20" rx="6" fill="#3A171D"/>
+    </g>
+
+    <rect x="48" y="393" width="1104" height="45" rx="10" fill="#101713" stroke="#26332C"/>
+    <circle cx="72" cy="415" r="6" fill="#2DD4BF"/>
+    <text x="89" y="422" fill="#CBD5E1" font-size="18">Hot evidence ring + ClickHouse</text>
+    <path d="M374 415H824" stroke="#31433B"/>
+    <text x="844" y="422" fill="#CBD5E1" font-size="18">Dashboard ↔ Agent Skill</text>
+  </g>
+</svg>
