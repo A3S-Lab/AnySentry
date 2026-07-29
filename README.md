@@ -89,7 +89,9 @@ intervene. The tables below summarize what is implemented today.
 
 The README is the product entry point, not a second specification. Runtime schemas
 come from `describe`, detailed deployment notes live in [`deploy/README.md`](deploy/README.md),
-and the canonical agent Skill lives in [`integrations/skills/anysentry-api`](integrations/skills/anysentry-api).
+the observation-only Agent discovery/filter contract lives in
+[`docs/agent-discovery-filter.md`](docs/agent-discovery-filter.md), and the canonical agent Skill
+lives in [`integrations/skills/anysentry-api`](integrations/skills/anysentry-api).
 
 ## Operating principles
 
