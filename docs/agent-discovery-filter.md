@@ -379,8 +379,8 @@ short-lived process in a previously unseen cgroup. Standalone containerd/CRI and
 platform adapters, invocation identity inside a shared runtime, and production power/long-soak
 measurements remain environment-specific follow-up work.
 
-The 60,000-event filter-core benchmark most recently measured 708,275 events/second, p99 4.61
-microseconds, and 10.54 MiB RSS growth, with zero `/proc` reads on the warm path. This excludes
+The 60,000-event filter-core benchmark most recently measured 835,140 events/second, p99 3.06
+microseconds, and 10.27 MiB RSS growth, with zero `/proc` reads on the warm path. This excludes
 network, persistence, and risk judgment. Run it with:
 
 ```bash
