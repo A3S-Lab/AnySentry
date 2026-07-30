@@ -167,6 +167,30 @@ ProcessKey = node_id + boot_id + pid + process_start_marker
 `process_start_marker` is best-effort for observations where `/proc` has already disappeared. An
 event without it remains `unknown`; it must not inherit an older PID's classification.
 
+### Host session boundary versus Agent process tree
+
+`session-*.scope`, `user-*.slice`, and an SSH login cgroup identify a shared runtime environment,
+not one Agent. Fine-grained host attribution is intentionally a separate follow-up and is not
+implemented in the current filter.
+
+The planned candidate key is:
+
+```text
+HostProcessTreeKey =
+  node_id + boot_id + root_pid + root_process_start_marker + root_executable_digest
+```
+
+Fork/exec/exit facts will maintain that root incrementally. `sshd`, user managers, login shells,
+terminal servers, and `session-*.scope` are boundaries/labels only; they cannot become the Agent
+root merely because Agent activity exists below them. Distinct roots, start markers, executables,
+or disjoint subtrees inside one SSH session become distinct candidates. A root tombstone handles
+late events, while PID reuse creates a new key.
+
+Until this split exists, a session-level candidate remains broad and the dashboard warns before a
+reviewer confirms it. A future migration may suggest carrying a review to one uniquely matching
+subtree, but must never fan a session-level verdict out to several Codex windows or ordinary
+terminals.
+
 ### Physical workload
 
 ```text
@@ -376,9 +400,14 @@ Stages 2-6 are part of the final feature target even when an earlier stage is de
 The Collector user-space target in stages 1-6 is implemented:
 
 - loose operator templates for host, Docker, Kubernetes, and deployment-agnostic matching;
-- Docker list/event discovery and Kubernetes dynamic list/watch identity;
+- Docker list/event discovery and Kubernetes cluster-wide dynamic list/watch identity, including
+  out-of-cluster kubeconfig access and namespace/Pod/container friendly names before classification;
 - container-level sidecar separation and lifecycle tombstones;
-- bounded behavior discovery that promotes only to `probable_agent`;
+- bounded behavior discovery that promotes only to `probable_agent`, requires an Agent sequence or
+  LLM/tool alternation, excludes service data from workspace evidence, and supports negative-evidence
+  early TTL downgrade;
+- auditable human candidate confirmation/rejection/clear, persisted as Agent metadata and exported
+  to the Collector identity snapshot without deleting historical events;
 - fail-open `all`/`shadow`/`agent` routing, discovery budgets, deduplication, priority buckets,
   adaptive batches, and structured counters;
 - ProcessKey and direct cgroup caches, including numeric Observer fact compatibility and separate
@@ -394,11 +423,12 @@ The Collector user-space target in stages 1-6 is implemented:
 The optional in-kernel observation prefilter in stage 7 is deliberately not enabled. One isolated
 shadow run is not sufficient evidence for irreversible early dropping, especially for the first
 short-lived process in a previously unseen cgroup. Standalone containerd/CRI and proprietary
-platform adapters, invocation identity inside a shared runtime, and production power/long-soak
-measurements remain environment-specific follow-up work.
+platform adapters, fine-grained process-tree identity inside a shared `session-*.scope`,
+invocation identity inside a shared runtime, and production power/long-soak measurements remain
+follow-up work.
 
-The 60,000-event filter-core benchmark most recently measured 835,140 events/second, p99 3.06
-microseconds, and 10.27 MiB RSS growth, with zero `/proc` reads on the warm path. This excludes
+The 60,000-event filter-core benchmark after Agent-sequence and negative-evidence work most recently
+measured 704,161 events/second, p99 3.13 microseconds, and 11.82 MiB RSS growth. This excludes
 network, persistence, and risk judgment. Run it with:
 
 ```bash
@@ -443,4 +473,11 @@ target environment.
 - Risk-event lists identify confirmed and candidate Agents by name color without replacing the
   stable `agentScopeId`; deployment type is a compact badge and detailed attribution is available
   after selecting the event.
+- Kubernetes candidates resolve to namespace/Pod/container before raw CRI scope text.
+- Service-state events remain observable but do not count as workspace changes; strong
+  infrastructure evidence may clear probable TTL without auto-classifying non-Agent.
+- Human review is audited and reversible, exports stable decisions to Collectors, and never deletes
+  historical events.
+- `session-*.scope` remains an environment label; fine-grained HostProcessTreeKey splitting is
+  documented but intentionally not claimed as implemented.
 - No enforcement binary or blocking hook is started by the integrated deployment.
