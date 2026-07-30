@@ -253,7 +253,7 @@ async function startCollector(snapshotPort, nodeName) {
       '-e',
       'A3S_OBSERVER_JSON=1',
       '-e',
-      'A3S_OBSERVER_FILES=0',
+      'A3S_OBSERVER_FILES=1',
       '-e',
       'A3S_OBSERVER_SSL=0',
       '-e',
@@ -321,10 +321,13 @@ async function triggerScenarios() {
     templateName,
     '/bin/sh',
     '-c',
-    `printf '%s' ${dockerMarker} >/tmp/${dockerMarker}`,
+    `printf '%s' ${dockerMarker} >/tmp/${dockerMarker}; sleep 2`,
   ]);
 
-  await run('docker', ['exec', unknownName, '/bin/sh', '-c', 'true']);
+  // Keep each phase alive briefly. Observer exports exec, connect and file records from
+  // independent ring buffers, so zero-lifetime processes make the intended causal order depend
+  // on scheduler timing rather than the real behavior sequence we want this test to validate.
+  await run('docker', ['exec', unknownName, '/bin/sleep', '2']);
   await run(
     'docker',
     [
@@ -332,7 +335,7 @@ async function triggerScenarios() {
       unknownName,
       'node',
       '-e',
-      "const https=require('https');const r=https.get('https://api.openai.com/',()=>process.exit(0));r.on('error',()=>process.exit(0));setTimeout(()=>process.exit(0),3000)",
+      "const https=require('https');const done=()=>setTimeout(()=>process.exit(0),1500);const r=https.get('https://api.openai.com/',(res)=>{res.resume();done()});r.on('error',done);setTimeout(()=>process.exit(0),5000)",
     ],
     { timeoutMs: 10_000, allowFailure: true },
   );
@@ -341,7 +344,16 @@ async function triggerScenarios() {
     unknownName,
     '/bin/sh',
     '-c',
-    `printf '%s' ${unknownMarker} >/tmp/${unknownMarker}`,
+    `printf '%s' ${unknownMarker} >/tmp/${unknownMarker}; sleep 2`,
+  ]);
+  // The file write completes tool A -> network/decision -> tool B -> workspace change.
+  // Verify a later tool inherits the resulting probable identity instead of accepting raw
+  // exec/file volume as sufficient evidence.
+  await run('docker', [
+    'exec',
+    unknownName,
+    '/bin/echo',
+    unknownMarker,
   ]);
 
   await run('kubectl', [
