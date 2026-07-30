@@ -12,6 +12,7 @@
 // FORWARD_DROP_PATHS.
 const http = require('node:http');
 const https = require('node:https');
+const crypto = require('node:crypto');
 const readline = require('node:readline');
 const { AgentAttributor } = require('./observer-agent-attribution');
 const { AgentTemplateRegistry, loadTemplateDocument } = require('./observer-agent-templates');
@@ -20,6 +21,7 @@ const { BehavioralAgentDetector } = require('./observer-behavior-discovery');
 const { BoundedPriorityQueue } = require('./observer-priority-queue');
 const { ToolExecDeduper } = require('./observer-event-dedup');
 const { DiscoveryBudget, WorkloadIdentityCache } = require('./observer-workload-filter');
+const { InfrastructureRootResolver } = require('./observer-infrastructure-roots');
 
 const target = new URL(process.env.ANYSENTRY_INGEST_URL || 'http://localhost:29653/security-center/ingest');
 function defaultHeartbeatUrl(ingestUrl) {
@@ -101,13 +103,7 @@ const dockerDiscovery = new DockerDiscovery({
 });
 const behaviorDetector = new BehavioralAgentDetector();
 const discoveryBudget = new DiscoveryBudget({ limit: UNKNOWN_FILE_BUDGET_PER_SEC });
-const bootstrap = attributor.seedFromProc();
-console.error(`[observer-forward] process snapshot: scanned=${bootstrap.scanned}; agent_roots=${bootstrap.roots}; agent_descendants=${bootstrap.descendants}`);
-console.error(`[observer-forward] agent templates: source=${templateRegistry.source}; loaded=${templateRegistry.metrics().loaded}; invalid=${templateRegistry.metrics().invalid + templateLoadErrors}`);
-void dockerDiscovery.start((snapshot) => workloadCache.replace(snapshot, 'docker')).then((started) => {
-  const docker = dockerDiscovery.metrics();
-  console.error(`[observer-forward] docker discovery: enabled=${docker.enabled}; started=${started}; socket=${dockerDiscovery.socketPath}`);
-});
+const infrastructureResolver = new InfrastructureRootResolver();
 const toolExecDeduper = new ToolExecDeduper({
   windowMs: process.env.FORWARD_DEDUP_WINDOW_MS,
   maxKeys: process.env.FORWARD_MAX_DEDUP_KEYS,
@@ -118,6 +114,8 @@ const pending = new BoundedPriorityQueue(MAX_QUEUE, 5);
 let outputDropped = 0;
 let errorCount = 0;
 let eventKindCounts = Object.create(null);
+const forwarderInstanceId = crypto.randomUUID();
+let sourceEventSequence = 0;
 let attributionCounts = {
   observed: 0,
   confirmedAgent: 0,
@@ -134,13 +132,15 @@ let attributionCounts = {
   queueDropped: 0,
   batches: 0,
   batchEvents: 0,
+  workspaceConflict: 0,
+  infrastructure: 0,
   deduplicated: 0,
 };
 let closing = false;
 let heartbeatTimer;
 let identitySnapshotTimer;
 let batchTimer;
-const rl = readline.createInterface({ input: process.stdin });
+let rl;
 
 function isNoise(o) {
   const fa = o.event && o.event.FileAccess;
@@ -158,12 +158,29 @@ function bumpEventKind(o) {
   eventKindCounts[kind] = (eventKindCounts[kind] || 0) + 1;
 }
 
-function sourceFields() {
+function sourceEventId(line) {
+  sourceEventSequence += 1;
+  return `ose_${crypto.createHash('sha256')
+    .update(COLLECTOR_ID)
+    .update('\0')
+    .update(NODE_NAME)
+    .update('\0')
+    .update(forwarderInstanceId)
+    .update('\0')
+    .update(String(sourceEventSequence))
+    .update('\0')
+    .update(line)
+    .digest('hex')
+    .slice(0, 24)}`;
+}
+
+function sourceFields(inferredWorkspacePath = '') {
+  const workspacePath = WORKSPACE_PATH || inferredWorkspacePath;
   return {
     ...(SOURCE_ID ? { sourceId: SOURCE_ID } : {}),
     ...(SOURCE_NAME ? { sourceName: SOURCE_NAME } : {}),
     ...(SOURCE_TYPE ? { sourceType: SOURCE_TYPE } : {}),
-    ...(WORKSPACE_PATH ? { workspacePath: WORKSPACE_PATH } : {}),
+    ...(workspacePath ? { workspacePath } : {}),
   };
 }
 
@@ -303,6 +320,8 @@ function sendHeartbeat(done = () => {}) {
     queueDropped: 0,
     batches: 0,
     batchEvents: 0,
+    workspaceConflict: 0,
+    infrastructure: 0,
     deduplicated: 0,
   };
   outputDropped = 0;
@@ -371,8 +390,10 @@ function sendHeartbeat(done = () => {}) {
         processBootstrapProcReads: processes.bootstrapProcReads,
         processFallbackProcReads: processes.fallbackProcReads,
         processAncestryProcReads: processes.ancestryProcReads,
+        infrastructure: classifications.infrastructure,
+        workspaceConflict: classifications.workspaceConflict,
       },
-      message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
+      message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
     },
     5000,
@@ -386,19 +407,9 @@ function sendHeartbeat(done = () => {}) {
   );
 }
 
-if (HEARTBEAT_SECS > 0) {
-  sendHeartbeat();
-  heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_SECS * 1000);
-  heartbeatTimer.unref();
-}
-if (IDENTITY_SNAPSHOT_SECS > 0) {
-  refreshIdentitySnapshot();
-  identitySnapshotTimer = setInterval(refreshIdentitySnapshot, IDENTITY_SNAPSHOT_SECS * 1000);
-  identitySnapshotTimer.unref();
-}
-
 function closeTransports() {
   dockerDiscovery.stop();
+  infrastructureResolver.close();
   httpAgent.destroy();
   httpsAgent.destroy();
 }
@@ -496,7 +507,7 @@ function flushAndClose() {
   waitForInflight();
 }
 
-rl.on('line', (raw) => {
+function handleLine(raw) {
   const line = raw.trim();
   if (!line) return;
   let o;
@@ -506,12 +517,19 @@ rl.on('line', (raw) => {
     attributionCounts.deduplicated++;
     return;
   }
+  const processClassification = attributor.classify(o);
+  // A trusted deployment label explicitly opts these process trees out. Infrastructure wins over
+  // templates and discovery caches and is dropped before ingest in every scope.
+  if (processClassification.state === 'infrastructure') {
+    attributionCounts.infrastructure++;
+    return;
+  }
   const workloadClassification = workloadCache.classify(o);
   const templateClassification = templateRegistry.classifyEvent(o);
   const baseClassification =
     templateClassification ??
     workloadClassification ??
-    attributor.classify(o);
+    processClassification;
   const behaviorEligible =
     baseClassification.state === 'unknown' ||
     (
@@ -532,6 +550,9 @@ rl.on('line', (raw) => {
     attributionCounts.nonAgent++;
   } else {
     attributionCounts.unknown++;
+  }
+  if (classification.workspaceConflict || classification.attribution?.conflict) {
+    attributionCounts.workspaceConflict++;
   }
   const kind = eventKind(o);
   let filterReason = '';
@@ -570,13 +591,54 @@ rl.on('line', (raw) => {
   enqueue(
     {
       line,
+      sourceEventId: sourceEventId(line),
       ...(classification.attribution ? { attribution: classification.attribution } : {}),
       ...(COLLECTOR_ID ? { collectorId: COLLECTOR_ID } : {}),
       ...(NODE_NAME ? { nodeName: NODE_NAME } : {}),
-      ...sourceFields(),
+      ...sourceFields(classification.state === 'agent' ? classification.workspacePath : ''),
     },
     queuePriority(kind, classification),
   );
-});
+}
 
-rl.on('close', flushAndClose);
+async function start() {
+  const infrastructure = await infrastructureResolver.resolve();
+  attributor.setInfrastructureRoots(infrastructure.roots);
+  const bootstrap = attributor.seedFromProc();
+  console.error(
+    `[observer-forward] process snapshot: scanned=${bootstrap.scanned}; ` +
+    `agent_roots=${bootstrap.roots}; agent_descendants=${bootstrap.descendants}; ` +
+    `infrastructure_roots=${bootstrap.infrastructureRoots}; ` +
+    `infrastructure_descendants=${bootstrap.infrastructureDescendants}` +
+    (infrastructure.error ? `; infrastructure_discovery=${infrastructure.error}` : ''),
+  );
+  infrastructureResolver.start((next) => {
+    attributor.setInfrastructureRoots(next.roots);
+  });
+
+  console.error(`[observer-forward] agent templates: source=${templateRegistry.source}; loaded=${templateRegistry.metrics().loaded}; invalid=${templateRegistry.metrics().invalid + templateLoadErrors}`);
+  const dockerStarted = await dockerDiscovery.start((snapshot) => workloadCache.replace(snapshot, 'docker'));
+  const docker = dockerDiscovery.metrics();
+  console.error(`[observer-forward] docker discovery: enabled=${docker.enabled}; started=${dockerStarted}; socket=${dockerDiscovery.socketPath}`);
+
+  if (HEARTBEAT_SECS > 0) {
+    sendHeartbeat();
+    heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_SECS * 1000);
+    heartbeatTimer.unref();
+  }
+  if (IDENTITY_SNAPSHOT_SECS > 0) {
+    refreshIdentitySnapshot();
+    identitySnapshotTimer = setInterval(refreshIdentitySnapshot, IDENTITY_SNAPSHOT_SECS * 1000);
+    identitySnapshotTimer.unref();
+  }
+
+  rl = readline.createInterface({ input: process.stdin });
+  rl.on('line', handleLine);
+  rl.on('close', flushAndClose);
+}
+
+void start().catch((error) => {
+  console.error('[observer-forward] startup failed:', error instanceof Error ? error.message : String(error));
+  closeTransports();
+  process.exitCode = 1;
+});

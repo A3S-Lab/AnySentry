@@ -17,6 +17,7 @@ const TABLE = 'events';
 const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   schemaVersion LowCardinality(String),
   eventId String,
+  sourceEventId String DEFAULT '',
   at UInt64,
   eventKind LowCardinality(String),
   eventCategory LowCardinality(String),
@@ -61,6 +62,7 @@ TTL ts + INTERVAL 90 DAY`;
 const EVENT_ALTERS = [
   'ADD COLUMN IF NOT EXISTS schemaVersion LowCardinality(String) DEFAULT \'anysentry.agent_event.v1\'',
   'ADD COLUMN IF NOT EXISTS eventId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS sourceEventId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS eventCategory LowCardinality(String) DEFAULT \'unknown\'',
   'ADD COLUMN IF NOT EXISTS source LowCardinality(String) DEFAULT \'observer\'',
   'ADD COLUMN IF NOT EXISTS collectorId String DEFAULT \'\'',
@@ -113,6 +115,7 @@ function toRow(e: JudgedEvent): Row {
   return {
     schemaVersion: e.schemaVersion,
     eventId: e.eventId,
+    sourceEventId: e.sourceEventId ?? '',
     at: e.at,
     eventKind: e.eventKind,
     eventCategory: e.eventCategory,
@@ -181,6 +184,7 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
   return {
     schemaVersion: (str(r.schemaVersion) || 'anysentry.agent_event.v1') as JudgedEvent['schemaVersion'],
     eventId: str(r.eventId) || `evt_${at}_${agentId}_${eventKind}`,
+    sourceEventId: str(r.sourceEventId) || undefined,
     at,
     eventKind,
     eventCategory: (str(r.eventCategory) || 'unknown') as JudgedEvent['eventCategory'],

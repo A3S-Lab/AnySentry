@@ -147,6 +147,7 @@ export type CoverageIssueType =
 export interface JudgedEvent {
   schemaVersion: 'anysentry.agent_event.v1';
   eventId: string;
+  sourceEventId?: string;
   at: number; // epoch ms
   eventKind: string; // ToolExec | Egress | FileAccess | Dns | SslContent | SecurityAction
   eventCategory: EventCategory;
@@ -205,9 +206,11 @@ export interface EventMeta {
   latencyMs?: number;
   subject?: string;
   eventKind?: string;
+  sourceEventId?: string;
 }
 
 export interface UniversalIngestEvent extends Partial<EventMeta> {
+  id?: string;
   at?: string | number;
   timestamp?: string | number;
   kind?: string;
@@ -600,6 +603,7 @@ export interface AgentEventQuery extends SecurityTimeFilter {
 export interface AgentEventListItem {
   schemaVersion: 'anysentry.agent_event.v1';
   eventId: string;
+  sourceEventId?: string;
   at: string;
   eventKind: string;
   eventCategory: EventCategory;

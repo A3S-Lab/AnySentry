@@ -326,6 +326,7 @@ export interface AgentEventQuery extends SecurityTimeFilter {
 export interface AgentEventListItem {
   schemaVersion: "anysentry.agent_event.v1";
   eventId: string;
+  sourceEventId?: string;
   at: string;
   eventKind: string;
   eventCategory: AgentEventCategory;
@@ -368,6 +369,224 @@ export interface AgentEventList {
   items: AgentEventListItem[];
   total: number;
   updateTime: string;
+}
+
+export interface StreamRiskProfileFinding {
+  schemaVersion: "anysentry.stream_finding.v1";
+  findingType: "risk_profile";
+  findingId: string;
+  profileId: string;
+  version: number;
+  tenantId: string;
+  environmentId: string;
+  workspaceId: string;
+  workspacePath: string;
+  agentCorrelationId: string;
+  agentType: string;
+  windowStart: number;
+  windowEnd: number;
+  calculatedAt: number;
+  riskScore: number;
+  riskLevel: SecurityRiskLevel;
+  features: Record<string, number>;
+  hitRules: string[];
+  ruleVersion: string;
+  shadow: true;
+}
+
+export interface StreamCompositeEvidence {
+  eventId: string;
+  sourceRecordId?: string;
+  eventTime: number;
+  eventKind: string;
+  operation: string;
+  subject: string;
+  traceId?: string;
+  sessionId?: string;
+  resource?: string;
+  destination?: string;
+  dangerous?: boolean;
+  sensitiveResource?: boolean;
+  externalDestination?: boolean;
+  failed?: boolean;
+  command?: string;
+  executable?: string;
+  argvTruncated?: boolean;
+  argvSource?: string;
+  behaviorStage?: string;
+  platformRuntime?: boolean;
+  synthetic?: boolean;
+  supplyChainWorkspaceId?: string;
+  dependencySnapshotId?: string;
+  vulnerabilityAssessmentId?: string;
+  runtimeVulnerabilities?: Array<{
+    findingId: string;
+    dependencySnapshotId: string;
+    vulnerabilityAssessmentId: string;
+    ecosystem: string;
+    packageName: string;
+    version: string;
+    vulnerabilityId: string;
+    aliases: string[];
+    confidence: "medium" | "high";
+    matchBasis: string;
+  }>;
+  processIdentity?: {
+    hostId?: string;
+    containerId?: string;
+    pid?: number;
+    ppid?: number;
+    rootPid?: number;
+    startTimeNs?: string;
+  };
+  judgment?: {
+    stage: "L1" | "L2" | "L3";
+    status: "pending" | "succeeded" | "failed" | "timeout";
+    verdict?: string;
+    severity?: string;
+    reason?: string;
+    latencyMs: number;
+    revision: number;
+  };
+}
+
+export interface StreamCompositeRiskFinding {
+  schemaVersion: "anysentry.stream_finding.v1";
+  findingType: "composite_risk";
+  findingId: string;
+  correlationId: string;
+  version: number;
+  tenantId: string;
+  environmentId: string;
+  workspaceId: string;
+  workspacePath: string;
+  agentCorrelationId: string;
+  agentType: string;
+  sessionId?: string;
+  traceId?: string;
+  ruleId: "sensitive-data-exfiltration";
+  ruleVersion: "1";
+  windowStart: number;
+  windowEnd: number;
+  calculatedAt: number;
+  evidenceScore: number;
+  severity: "high" | "critical";
+  evidenceEventIds: string[];
+  evidence: StreamCompositeEvidence[];
+  reason: string;
+  shadow: true;
+}
+
+export interface StreamFindingList {
+  enabled: boolean;
+  riskProfiles: StreamRiskProfileFinding[];
+  compositeRisks: StreamCompositeRiskFinding[];
+  compositeJudgments: Array<{
+    schemaVersion: "anysentry.stream_finding.v1";
+    findingType: "composite_judgment";
+    findingId: string;
+    episodeId: string;
+    revision: number;
+    evidenceFingerprint: string;
+    tenantId: string;
+    environmentId: string;
+    workspaceId: string;
+    workspacePath: string;
+    agentCorrelationId: string;
+    agentType: string;
+    sessionId: string;
+    traceIds: string[];
+    windowStart: number;
+    windowEnd: number;
+    judgedAt: number;
+    status: "pending" | "succeeded" | "failed" | "timeout" | "suppressed";
+    verdict?: "allow" | "block";
+    severity?: "low" | "medium" | "high" | "critical";
+    confidence?: number;
+    classification?: "benign" | "simulation" | "authorized_admin" | "suspicious" | "confirmed_attack";
+    attackType?: string;
+    reason?: string;
+    evidenceEventIds: string[];
+    evidence: StreamCompositeEvidence[];
+    model: string;
+    latencyMs: number;
+    error?: string;
+    updateRevision?: number;
+    updateStatus?: "pending" | "failed" | "timeout";
+    updateError?: string;
+    updateJudgedAt?: number;
+    ruleVersion: string;
+    decisionSource: "deterministic_rule" | "composite_judge";
+    synthetic: boolean;
+    shadow: true;
+  }>;
+  updateTime: string;
+}
+
+export interface SupplyChainComponent {
+  relativeSourcePath: string;
+  ecosystem: string;
+  packageName: string;
+  version: string;
+  dependencyScope: "runtime" | "development" | "optional" | "build" | "unknown";
+  direct: boolean | null;
+  purl?: string;
+  deploymentImages?: Array<{
+    reference: string;
+    digest: string;
+    componentSource: "osv_image" | "production_manifest";
+  }>;
+  installedEnvironments?: Array<{
+    kind: "node_modules" | "python_environment";
+    relativePath: string;
+  }>;
+}
+
+export interface SupplyChainFinding {
+  findingId: string;
+  workspaceId: string;
+  dependencySnapshotId: string;
+  vulnerabilityAssessmentId: string;
+  component: SupplyChainComponent;
+  vulnerability: {
+    id: string;
+    modified: string;
+    published?: string;
+    withdrawn?: string;
+    aliases: string[];
+    summary?: string;
+    severity?: Array<{
+      type: string;
+      score: string;
+      source?: string;
+    }>;
+    severityLevel?: "critical" | "high" | "medium" | "low" | "unknown";
+    cvssScore?: number;
+    cvssVector?: string;
+    vendorSeverity?: "critical" | "high" | "medium" | "low" | "unknown";
+    vendorSeveritySource?: string;
+    impactDescription?: string;
+    fixedVersions?: string[];
+  };
+  status: "open" | "closed" | "assessment_stale";
+  closureReason?: "dependency_removed" | "version_changed" | "no_longer_affected" | "advisory_withdrawn";
+  firstObservedAt: number;
+  lastObservedAt: number;
+  priority: "P0" | "P1" | "P2" | "P3";
+  priorityScore: number;
+  deploymentStatus: "confirmed" | "unknown";
+  shadow: true;
+}
+
+export interface SupplyChainOverview {
+  enabled: boolean;
+  runtimeCorrelationEnabled: boolean;
+  workspaces: number;
+  activeSnapshots: number;
+  openFindings: number;
+  staleFindings: number;
+  latestAssessmentAt?: number;
+  findings: SupplyChainFinding[];
 }
 
 export interface AgentTimeline {
@@ -2093,6 +2312,9 @@ export interface PlatformHealth {
   managementAuth?: {
     enabled: boolean;
   };
+  supplyChain?: {
+    enabled: boolean;
+  };
   events: {
     total: number;
     distinctAgents: number;
@@ -2125,6 +2347,10 @@ export const securityCenterApi = {
     apiClient.post<AgentEventList>("/security-center/events/list", filter),
   agentTimeline: (filter: AgentEventQuery) =>
     apiClient.post<AgentTimeline>("/security-center/events/timeline", filter),
+  streamFindings: (filter: SecurityTimeFilter & { limit?: number }) =>
+    apiClient.post<StreamFindingList>("/security-center/stream/findings", filter),
+  supplyChainOverview: (limit = 100) =>
+    apiClient.get<SupplyChainOverview>(`/security-center/supply-chain/overview?limit=${limit}`),
   evidenceBundle: (filter: EvidenceBundleQuery) =>
     apiClient.post<EvidenceBundle>("/security-center/evidence/bundle", filter),
   evidenceExport: (filter: EvidenceBundleExportQuery) =>

@@ -361,6 +361,7 @@ export class AggregationService {
     return {
       schemaVersion: e.schemaVersion,
       eventId: e.eventId,
+      sourceEventId: e.sourceEventId,
       at: iso(e.at),
       eventKind: e.eventKind,
       eventCategory: e.eventCategory,
@@ -412,12 +413,16 @@ export class AggregationService {
     const q = filter.q?.trim().toLowerCase();
     const hasFilter = Boolean(sourceId || collectorId || agentId || sessionId || workspacePath || traceId || runId || filter.eventKind || filter.eventCategory || filter.verdict || filter.tier || q);
     const agentScoped = filter.scope === 'agent' && !pinnedEventId;
-    const hideNoise = agentScoped && filter.noise !== 'include';
+    // Process lifecycle rows remain stored for audit/debugging, but are hidden from both the
+    // Agent and raw "all events" views by default. An explicit kind filter, noise=include, or a
+    // pinned event still makes them accessible.
+    const hideNoise = !pinnedEventId && !filter.eventKind && filter.noise !== 'include';
     return events.filter((e) => {
       const matchesEventId = Boolean(pinnedEventId && e.eventId === pinnedEventId);
       const eventSource = eventSourceId(e);
       const eventCollector = eventCollectorId(e);
-      const matchesScope = (!agentScoped || isMonitoredAgentEvent(e)) && (!hideNoise || !isLowValueAgentNoise(e));
+      const isHiddenNoise = agentScoped ? isLowValueAgentNoise(e) : e.eventKind === 'ProcessExit';
+      const matchesScope = (!agentScoped || isMonitoredAgentEvent(e)) && (!hideNoise || !isHiddenNoise);
       const matchesFilter =
         matchesScope &&
         (!sourceId || eventSource === sourceId) &&

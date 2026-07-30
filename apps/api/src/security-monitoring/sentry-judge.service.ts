@@ -336,7 +336,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const attribution = meta.attribution ?? this.attributionService.attribute(meta, process, at);
     return {
       schemaVersion: SCHEMA_VERSION,
-      eventId: hashId('evt', [at, eventKind, ids.agentId, ids.sessionId, line]),
+      eventId: meta.sourceEventId
+        ? hashId('evt', [typeof attributes.sourceId === 'string' ? attributes.sourceId : undefined, meta.sourceEventId])
+        : hashId('evt', [at, eventKind, ids.agentId, ids.sessionId, line]),
+      sourceEventId: meta.sourceEventId,
       at,
       eventKind,
       eventCategory: meta.eventCategory ?? eventCategory(eventKind),
@@ -554,7 +557,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const sourceId = typeof attributes.sourceId === 'string' ? cleanText(attributes.sourceId, 160) : undefined;
     const base = {
       schemaVersion: SCHEMA_VERSION,
-      eventId: hashId('evt', [at, eventKind, ids.agentId, ids.sessionId, line]),
+      eventId: meta.sourceEventId
+        ? hashId('evt', [typeof attributes.sourceId === 'string' ? attributes.sourceId : undefined, meta.sourceEventId])
+        : hashId('evt', [at, eventKind, ids.agentId, ids.sessionId, line]),
+      sourceEventId: meta.sourceEventId,
       at,
       eventKind,
       eventCategory: meta.eventCategory ?? eventCategory(eventKind),
