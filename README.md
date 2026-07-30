@@ -134,6 +134,13 @@ Judged events use an in-memory hot ring for current reads and ClickHouse for dur
 
 AnySentry gives coding agents and operators one discoverable endpoint instead of a second hard-coded API surface:
 
+### Source-compatible progressive capability API
+
+Requests use the stable `action + module + operation + params` shape; executable calls select a
+`module + operation + params` tuple after discovery. This keeps `assessRuntimeAction`,
+`recordSecurityEvents`, `buildEvidenceBundle`, and `planNextActions` source-compatible across
+agent clients. Verify the published contract with `pnpm verify:progressive-api`.
+
 ```text
 list → search / describe → dry-run → execute
 ```
