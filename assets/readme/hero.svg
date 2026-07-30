@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-labelledby="title desc">
+  <title id="title">AnySentry — AI agent runtime evidence and intervention</title>
+  <desc id="desc">A runtime event moves through observation, normalization, tiered judgment, and an evidence-linked approval action.</desc>
+
+  <rect width="1200" height="420" rx="24" fill="#0B0F0C"/>
+  <path d="M0 356H1200" stroke="#223029"/>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif">
+    <text x="58" y="56" fill="#2DD4BF" font-size="17" font-weight="700" letter-spacing="2.2">AI AGENT SECURITY · RUNTIME EVIDENCE PLANE</text>
+    <text x="56" y="137" fill="#F8FAFC" font-size="68" font-weight="750" letter-spacing="-2">AnySentry</text>
+    <text x="58" y="190" fill="#CBD5E1" font-size="27" font-weight="500">Observe what agents actually do.</text>
+    <text x="58" y="229" fill="#CBD5E1" font-size="27" font-weight="500">Judge risk. Turn evidence into action.</text>
+
+    <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" font-weight="650">
+      <rect x="58" y="268" width="181" height="36" rx="8" fill="#0E2420" stroke="#1A6A5E"/>
+      <text x="74" y="291" fill="#5EEAD4">ZERO-CODE OBSERVER</text>
+      <rect x="249" y="268" width="184" height="36" rx="8" fill="#141C19" stroke="#34413B"/>
+      <text x="265" y="291" fill="#CBD5E1">PROGRESSIVE GUARD</text>
+      <rect x="443" y="268" width="171" height="36" rx="8" fill="#231619" stroke="#71333E"/>
+      <text x="459" y="291" fill="#FDA4AF">EVIDENCE BUNDLES</text>
+    </g>
+
+    <text x="58" y="382" fill="#94A3B8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16">eBPF observer · JSON · CloudEvents · OTLP · agent-native API</text>
+  </g>
+
+  <g transform="translate(674 34)" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif">
+    <rect width="470" height="350" rx="18" fill="#111612" stroke="#2A3730"/>
+    <circle cx="24" cy="25" r="5" fill="#2DD4BF"/>
+    <text x="40" y="31" fill="#94A3B8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16">TRACE / evt_8c5667…</text>
+    <text x="392" y="31" fill="#5EEAD4" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16">LIVE</text>
+
+    <rect x="24" y="53" width="422" height="70" rx="10" fill="#171D19" stroke="#36413B"/>
+    <text x="43" y="82" fill="#F8FAFC" font-size="20" font-weight="700">ToolExec</text>
+    <text x="43" y="106" fill="#94A3B8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16">curl 169.254.169.254/latest/meta-data</text>
+
+    <path d="M49 123V308" stroke="#38524A" stroke-width="2"/>
+    <path d="M49 308L41 296M49 308L57 296" stroke="#38524A" stroke-width="2" fill="none"/>
+
+    <g>
+      <circle cx="49" cy="157" r="8" fill="#0B0F0C" stroke="#2DD4BF" stroke-width="3"/>
+      <text x="76" y="154" fill="#F8FAFC" font-size="20" font-weight="700">Observe</text>
+      <text x="170" y="154" fill="#94A3B8" font-size="18">node events · open ingest</text>
+      <text x="76" y="175" fill="#5EEAD4" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16">SOURCE / agent: release-agent</text>
+    </g>
+
+    <g>
+      <circle cx="49" cy="216" r="8" fill="#0B0F0C" stroke="#2DD4BF" stroke-width="3"/>
+      <text x="76" y="213" fill="#F8FAFC" font-size="20" font-weight="700">Normalize</text>
+      <text x="185" y="213" fill="#94A3B8" font-size="18">identity · redaction</text>
+      <text x="76" y="234" fill="#5EEAD4" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16">anysentry.agent_event.v1</text>
+    </g>
+
+    <g>
+      <circle cx="49" cy="275" r="8" fill="#0B0F0C" stroke="#FBBF24" stroke-width="3"/>
+      <text x="76" y="272" fill="#F8FAFC" font-size="20" font-weight="700">Judge</text>
+      <text x="145" y="272" fill="#94A3B8" font-size="18">L1 rules · optional L2/L3</text>
+      <text x="76" y="293" fill="#FDE68A" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16">CRITICAL / systemic_risk</text>
+    </g>
+
+    <rect x="75" y="313" width="214" height="25" rx="7" fill="#3A171D" stroke="#9F4555"/>
+    <text x="91" y="331" fill="#FECDD3" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" font-weight="700">REQUIRE APPROVAL</text>
+    <text x="306" y="331" fill="#94A3B8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15">evidence →</text>
+  </g>
+</svg>
