@@ -60,6 +60,8 @@ import {
   type SecurityTimeType,
   type SecurityVerdict,
   type SecurityWorkspaceRiskDistribution,
+  type StreamFindingList,
+  type SupplyChainOverview,
   securityCenterApi,
   streamAgentObservability,
 } from "@/lib/api/security-center";
@@ -78,6 +80,8 @@ type SecuritySectionKey =
   | "highestRisk"
   | "decisionFunnel"
   | "workspaceRisk"
+  | "streamFindings"
+  | "supplyChain"
   | "events";
 
 interface SecurityDashboardData {
@@ -89,6 +93,8 @@ interface SecurityDashboardData {
   highestRisk: SecurityHighestRiskSession | null;
   decisionFunnel: SecurityDecisionFunnel | null;
   workspaceRisk: SecurityWorkspaceRiskDistribution | null;
+  streamFindings: StreamFindingList | null;
+  supplyChain: SupplyChainOverview | null;
   events: AgentEventList | null;
   errors: Partial<Record<SecuritySectionKey, string>>;
 }
@@ -231,6 +237,8 @@ async function loadSecurityDashboardData(filter: SecurityTimeFilter, timelineSco
       highestRisk: securityCenterApi.highestRiskSession(filter),
       decisionFunnel: securityCenterApi.decisionFunnel({ ...filter, scope: decisionFunnelScope }),
       workspaceRisk: securityCenterApi.workspaceRiskDistribution({ ...filter, scope: workspaceRiskScope }),
+      streamFindings: securityCenterApi.streamFindings({ ...filter, limit: 30 }),
+      supplyChain: securityCenterApi.supplyChainOverview(500),
       events: securityCenterApi.agentEvents({ ...filter, scope: timelineScope, ...(timelineTier === "all" ? {} : { tier: timelineTier }), limit: 36 }),
     },
     formatRequestError,
@@ -249,6 +257,8 @@ function enrichSecurityDashboardData(data: SecurityDashboardData): SecurityDashb
     highestRisk: normalizeHighestRiskSession(data.highestRisk),
     decisionFunnel: data.decisionFunnel,
     workspaceRisk: data.workspaceRisk,
+    streamFindings: data.streamFindings,
+    supplyChain: data.supplyChain,
     events: data.events,
     errors: data.errors,
   };
@@ -1323,6 +1333,725 @@ function RiskBreakdownPanel({
   );
 }
 
+const STREAM_FEATURE_LABELS: Record<string, string> = {
+  toolExecCount1m: "工具调用 / 1分钟",
+  dangerousCommandCount1m: "危险命令 / 1分钟",
+  failedCount1m: "执行失败 / 1分钟",
+  sensitiveFileCount5m: "敏感文件 / 5分钟",
+  transformCount5m: "编码压缩 / 5分钟",
+  externalEgressCount5m: "外部连接 / 5分钟",
+  distinctSessionCount5m: "活跃会话 / 5分钟",
+  distinctDestinationCount5m: "外联目标 / 5分钟",
+};
+
+const STREAM_RULE_LABELS: Record<string, string> = {
+  "high-command-rate": "高频工具调用",
+  "repeated-dangerous-command": "重复危险命令",
+  "sensitive-access-with-egress": "敏感访问伴随外联",
+  "continued-after-block": "阻断后持续尝试",
+};
+
+const STREAM_OPERATION_LABELS: Record<string, string> = {
+  file_read: "读取敏感文件",
+  file_write: "写入文件",
+  encode: "编码数据",
+  compress: "压缩数据",
+  copy: "复制数据",
+  egress: "建立外部连接",
+  execute: "执行命令",
+  observe: "观测事件",
+};
+
+function cvssExplanation(vector?: string) {
+  if (!vector) {
+    return {
+      attackCondition: "OSV 未提供结构化攻击条件",
+      impact: "需结合漏洞说明人工确认影响",
+    };
+  }
+  const metrics = Object.fromEntries(vector.split("/").slice(1).map((part) => part.split(":")));
+  const access = {
+    N: "可通过网络触发",
+    A: "需相邻网络",
+    L: "需本地访问",
+    P: "需物理访问",
+  }[metrics.AV] ?? "攻击入口未知";
+  const privilege = {
+    N: "无需预先权限",
+    L: "需要低权限",
+    H: "需要高权限",
+  }[metrics.PR] ?? "权限条件未知";
+  const interaction = metrics.UI === "N" ? "无需用户交互" : metrics.UI === "R" ? "需要用户交互" : "交互条件未知";
+  const impactParts = [
+    metrics.C === "H" ? "机密性高影响" : metrics.C === "L" ? "机密性低影响" : "",
+    metrics.I === "H" ? "完整性高影响" : metrics.I === "L" ? "完整性低影响" : "",
+    metrics.A === "H" ? "可用性高影响" : metrics.A === "L" ? "可用性低影响" : "",
+  ].filter(Boolean);
+  return {
+    attackCondition: `${access} · ${privilege} · ${interaction}`,
+    impact: impactParts.length > 0 ? impactParts.join(" · ") : "CVSS 未标记机密性、完整性或可用性影响",
+  };
+}
+
+function SupplyChainPanel({
+  overview,
+  streamFindings,
+  error,
+}: {
+  overview?: SupplyChainOverview | null;
+  streamFindings?: StreamFindingList | null;
+  error?: string;
+}) {
+  const [showAll, setShowAll] = useState(false);
+  const findings = useMemo(() => {
+    const runtimeEvidence = new Map<string, "observed" | "attack_chain">();
+    for (const judgment of streamFindings?.compositeJudgments ?? []) {
+      const attackChain = judgment.ruleVersion === "supply-chain-exploit-v1"
+        && (judgment.classification === "suspicious" || judgment.classification === "confirmed_attack");
+      for (const evidence of judgment.evidence) {
+        for (const vulnerability of evidence.runtimeVulnerabilities ?? []) {
+          const existing = runtimeEvidence.get(vulnerability.findingId);
+          runtimeEvidence.set(
+            vulnerability.findingId,
+            attackChain || existing === "attack_chain" ? "attack_chain" : "observed",
+          );
+        }
+      }
+    }
+    return (overview?.findings ?? []).map((finding) => {
+      const exploitability = runtimeEvidence.get(finding.findingId) ?? "not_observed";
+      const score = Math.min(
+        100,
+        finding.priorityScore + (exploitability === "attack_chain" ? 15 : exploitability === "observed" ? 5 : 0),
+      );
+      return {
+        finding,
+        exploitability,
+        priorityScore: score,
+        priority: score >= 90 ? "P0" : score >= 60 ? "P1" : score >= 35 ? "P2" : "P3",
+      };
+    }).sort((left, right) => (
+      right.priorityScore - left.priorityScore
+      || right.finding.lastObservedAt - left.finding.lastObservedAt
+    ));
+  }, [overview?.findings, streamFindings?.compositeJudgments]);
+  if (!overview?.enabled) return null;
+  const visibleFindings = showAll ? findings : findings.slice(0, 4);
+  const severityLabel = {
+    critical: "严重",
+    high: "高危",
+    medium: "中危",
+    low: "低危",
+    unknown: "未知",
+  };
+  return (
+    <Panel
+      title="OSV 依赖漏洞资产"
+      icon={ShieldAlert}
+      action={(
+        <div className="flex flex-wrap items-center gap-2">
+          {overview.runtimeCorrelationEnabled && (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-teal-400/30 bg-teal-400/10 px-2.5 py-1 text-[11px] text-teal-200">
+              <GitBranch className="size-3" />
+              运行时关联已启用
+            </span>
+          )}
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-sky-400/30 bg-sky-400/10 px-2.5 py-1 text-[11px] text-sky-200">
+            <EyeOff className="size-3" />
+            治理提醒 · 不代表漏洞正在被利用
+          </span>
+        </div>
+      )}
+    >
+      <div className="space-y-4 p-4">
+        <InlineError message={error} />
+        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+          {[
+            { label: "可信 Workspace", value: overview.workspaces, detail: "按节点工作副本注册" },
+            { label: "有效依赖快照", value: overview.activeSnapshots, detail: "仅完整提取可生效" },
+            { label: "开放漏洞", value: overview.openFindings, detail: "漏洞治理提醒" },
+            {
+              label: "情报状态异常",
+              value: overview.staleFindings,
+              detail: overview.latestAssessmentAt
+                ? `最近评估 ${dayjs(overview.latestAssessmentAt).format("MM-DD HH:mm")}`
+                : "尚未完成评估",
+            },
+          ].map((item) => (
+            <div key={item.label} className="rounded-md border border-white/10 bg-white/[0.025] px-3 py-2.5">
+              <p className="text-[11px] text-zinc-500">{item.label}</p>
+              <p className="mt-1 text-lg font-semibold tabular-nums text-zinc-100">{item.value}</p>
+              <p className="mt-0.5 text-[10px] text-zinc-600">{item.detail}</p>
+            </div>
+          ))}
+        </div>
+        {findings.length === 0 ? (
+          <EmptyState label="当前组件快照未发现已知漏洞" />
+        ) : (
+          <>
+            <div className="grid gap-3 xl:grid-cols-2">
+            {visibleFindings.map(({ finding, exploitability, priority, priorityScore }) => {
+              const stale = finding.status === "assessment_stale";
+              const deployed = finding.deploymentStatus === "confirmed";
+              const image = finding.component.deploymentImages?.[0];
+              const installedEnvironment = finding.component.installedEnvironments?.[0];
+              const cvss = cvssExplanation(finding.vulnerability.cvssVector);
+              return (
+                <div
+                  key={finding.findingId}
+                  className={cn(
+                    "rounded-lg border bg-white/[0.025] p-4",
+                    stale ? "border-amber-400/25" : "border-rose-400/25",
+                  )}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-semibold text-zinc-100">
+                        {finding.component.packageName} · {finding.component.version}
+                      </p>
+                      <p className="mt-1 truncate text-[11px] text-zinc-500">
+                        {finding.component.ecosystem} · {finding.component.relativeSourcePath}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1.5">
+                      <span className={cn(
+                        "rounded-full border px-2 py-1 text-[10px] font-semibold",
+                        priority === "P0" || priority === "P1"
+                          ? "border-rose-400/30 bg-rose-400/10 text-rose-200"
+                          : priority === "P2"
+                            ? "border-amber-400/30 bg-amber-400/10 text-amber-200"
+                            : "border-zinc-500/30 bg-zinc-500/10 text-zinc-300",
+                      )}>
+                        {priority} · {priorityScore}
+                      </span>
+                      <span className={cn(
+                        "rounded-full border px-2 py-1 text-[10px]",
+                        stale
+                          ? "border-amber-400/25 bg-amber-400/10 text-amber-200"
+                          : "border-rose-400/25 bg-rose-400/10 text-rose-200",
+                      )}>
+                        {stale ? "情报待刷新" : "存在已知漏洞"}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="mt-3 rounded-md border border-white/[0.07] bg-black/20 p-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <a
+                        href={`https://osv.dev/vulnerability/${encodeURIComponent(finding.vulnerability.id)}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-xs font-medium text-sky-300 hover:text-sky-200"
+                      >
+                        {finding.vulnerability.id}
+                      </a>
+                      <span className="text-[10px] text-zinc-600">
+                        {finding.component.direct === true ? "直接依赖" : finding.component.direct === false ? "传递依赖" : "依赖层级未知"}
+                      </span>
+                    </div>
+                    <div className="mt-3 rounded-md border border-white/[0.06] bg-white/[0.02] p-2.5">
+                      <p className="text-[10px] font-medium text-zinc-500">漏洞原因与影响</p>
+                      <p className="mt-1.5 line-clamp-4 text-xs leading-5 text-zinc-300">
+                        {finding.vulnerability.impactDescription
+                          || finding.vulnerability.summary
+                          || "OSV 未提供漏洞原因说明"}
+                      </p>
+                      <div className="mt-2 grid gap-1 text-[10px] text-zinc-500">
+                        <p><span className="text-zinc-600">攻击条件：</span>{cvss.attackCondition}</p>
+                        <p><span className="text-zinc-600">安全影响：</span>{cvss.impact}</p>
+                      </div>
+                    </div>
+                    {finding.vulnerability.aliases.length > 0 && (
+                      <p className="mt-2 truncate text-[10px] text-zinc-600">
+                        别名 {finding.vulnerability.aliases.join(" · ")}
+                      </p>
+                    )}
+                    <div className="mt-3 grid gap-2 border-t border-white/[0.07] pt-3 sm:grid-cols-2">
+                      <div>
+                        <p className="text-[10px] text-zinc-600">厂商严重度 / CVSS</p>
+                        <p className="mt-1 text-[11px] text-zinc-300">
+                          {severityLabel[finding.vulnerability.severityLevel ?? "unknown"]}
+                          {finding.vulnerability.cvssScore !== undefined
+                            ? ` · ${finding.vulnerability.cvssScore.toFixed(1)}`
+                            : " · 暂无数值"}
+                        </p>
+                        {finding.vulnerability.vendorSeveritySource && (
+                          <p className="mt-1 text-[9px] text-zinc-600">
+                            {finding.vulnerability.vendorSeveritySource} 评级
+                          </p>
+                        )}
+                        {finding.vulnerability.cvssVector && (
+                          <p className="mt-1 truncate text-[9px] text-zinc-600" title={finding.vulnerability.cvssVector}>
+                            {finding.vulnerability.cvssVector}
+                          </p>
+                        )}
+                      </div>
+                      <div>
+                        <p className="text-[10px] text-zinc-600">可用修复版本</p>
+                        <p className="mt-1 truncate text-[11px] text-zinc-300">
+                          {finding.vulnerability.fixedVersions?.length
+                            ? finding.vulnerability.fixedVersions.slice(0, 3).join(" · ")
+                            : "OSV 未提供明确修复版本"}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-[10px] text-zinc-600">实际部署</p>
+                        <p className={cn("mt-1 text-[11px]", deployed ? "text-teal-200" : "text-zinc-400")}>
+                          {image
+                            ? "镜像内已确认"
+                            : installedEnvironment
+                              ? installedEnvironment.kind === "python_environment"
+                                ? "Workspace Python 环境已安装"
+                                : "Workspace node_modules 已安装"
+                              : "源码存在 · 部署状态未知"}
+                        </p>
+                        {image && (
+                          <p className="mt-1 truncate text-[9px] text-zinc-600" title={image.reference}>
+                            {image.reference}
+                          </p>
+                        )}
+                        {!image && installedEnvironment && (
+                          <p className="mt-1 truncate text-[9px] text-zinc-600" title={installedEnvironment.relativePath}>
+                            {installedEnvironment.relativePath}
+                          </p>
+                        )}
+                      </div>
+                      <div>
+                        <p className="text-[10px] text-zinc-600">运行时可利用性</p>
+                        <p className={cn(
+                          "mt-1 text-[11px]",
+                          exploitability === "attack_chain"
+                            ? "text-rose-200"
+                            : exploitability === "observed" ? "text-amber-200" : "text-zinc-400",
+                        )}>
+                          {exploitability === "attack_chain"
+                            ? "已形成疑似利用链"
+                            : exploitability === "observed"
+                              ? "已观察到组件运行证据"
+                              : "尚未观察到运行证据"}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="mt-3 flex items-center justify-between gap-3 border-t border-white/[0.07] pt-3 text-[10px] text-zinc-600">
+                    <span>Workspace {finding.workspaceId}</span>
+                    <span>评估 {dayjs(finding.lastObservedAt).format("MM-DD HH:mm")}</span>
+                  </div>
+                </div>
+              );
+            })}
+            </div>
+            {findings.length > 4 && (
+              <div className="flex justify-center">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setShowAll((value) => !value)}
+                  className="border-white/10 bg-white/[0.025] text-xs text-zinc-300 hover:bg-white/[0.06]"
+                >
+                  {showAll ? "收起漏洞" : `显示全部漏洞（${findings.length}）`}
+                </Button>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </Panel>
+  );
+}
+
+type StreamPanelTab = "profiles" | "composites" | "runtime";
+
+function streamWorkspacePath(value: string): string {
+  const path = value.trim();
+  return !path || path.toLowerCase().startsWith("agent://") ? "" : path.replace(new RegExp("/+$"), "");
+}
+
+function streamWorkspaceName(path: string): string {
+  if (!path) return "未归属 Workspace";
+  return path.split("/").filter(Boolean).at(-1) ?? path;
+}
+
+function streamProfileKey(profile: StreamFindingList["riskProfiles"][number]): string {
+  return [profile.environmentId, profile.agentType, streamWorkspacePath(profile.workspacePath) || "unassigned"].join(":");
+}
+
+function streamFeatureValue(features: Record<string, number>, key: string): number {
+  return Math.max(0, Number(features[key]) || 0);
+}
+
+function streamScoreContributions(profile: StreamFindingList["riskProfiles"][number]) {
+  const weighted = [
+    ["dangerousCommandCount1m", 5, 25],
+    ["sensitiveFileCount5m", 10, 25],
+    ["externalEgressCount5m", 8, 20],
+    ["transformCount5m", 5, 15],
+  ] as const;
+  const contributions = weighted.map(([key, weight, cap]) => ({
+    key,
+    label: STREAM_FEATURE_LABELS[key],
+    value: streamFeatureValue(profile.features, key),
+    score: Math.min(cap, streamFeatureValue(profile.features, key) * weight),
+  }));
+  const toolExecCount = streamFeatureValue(profile.features, "toolExecCount1m");
+  const failedCount = streamFeatureValue(profile.features, "failedCount1m");
+  if (toolExecCount >= 20) contributions.push({ key: "toolExecCount1m", label: STREAM_FEATURE_LABELS.toolExecCount1m, value: toolExecCount, score: 10 });
+  if (failedCount >= 5) contributions.push({ key: "failedCount1m", label: STREAM_FEATURE_LABELS.failedCount1m, value: failedCount, score: 5 });
+  return contributions.filter((item) => item.score > 0).sort((a, b) => b.score - a.score);
+}
+
+function StreamShadowPanel({
+  findings,
+  error,
+}: {
+  findings?: StreamFindingList | null;
+  error?: string;
+}) {
+  const [tab, setTab] = useState<StreamPanelTab>("profiles");
+  const [showSafe, setShowSafe] = useState(false);
+  const profileViews = useMemo(() => {
+    const groups = new Map<string, StreamFindingList["riskProfiles"]>();
+    for (const profile of findings?.riskProfiles ?? []) {
+      const key = streamProfileKey(profile);
+      const history = groups.get(key) ?? [];
+      history.push(profile);
+      groups.set(key, history);
+    }
+    return [...groups.values()]
+      .map((history) => {
+        history.sort((a, b) => b.calculatedAt - a.calculatedAt);
+        return { profile: history[0], previousScore: history[1]?.riskScore };
+      })
+      .filter((item): item is { profile: StreamFindingList["riskProfiles"][number]; previousScore?: number } => Boolean(item.profile))
+      .sort((a, b) => Math.max(0, b.profile.riskScore) - Math.max(0, a.profile.riskScore));
+  }, [findings?.riskProfiles]);
+  const riskyProfiles = profileViews.filter(({ profile }) => profile.riskLevel !== "safe" || profile.riskScore > 0);
+  const safeProfiles = profileViews.filter(({ profile }) => profile.riskLevel === "safe" && profile.riskScore <= 0);
+  const visibleProfiles = showSafe ? profileViews : riskyProfiles;
+  const compositeRisks = findings?.compositeRisks ?? [];
+  const compositeJudgments = findings?.compositeJudgments ?? [];
+  const syntheticEpisodes = compositeJudgments.filter((item) => item.synthetic);
+  const suppressedEpisodes = compositeJudgments.filter((item) =>
+    item.status === "suppressed" || item.error === "Historical episode suppressed before model evaluation");
+  const visibleCompositeJudgments = compositeJudgments.filter((item) =>
+    !item.synthetic && !suppressedEpisodes.includes(item));
+  const blockedEpisodes = visibleCompositeJudgments.filter((item) =>
+    item.status === "succeeded" && item.classification === "confirmed_attack" && item.verdict === "block");
+  const failedEpisodes = visibleCompositeJudgments.filter((item) =>
+    item.status === "failed" || item.status === "timeout" || item.updateStatus === "failed" || item.updateStatus === "timeout");
+  const pendingEpisodes = visibleCompositeJudgments.filter((item) =>
+    item.status === "pending" || item.updateStatus === "pending");
+  const latestCalculatedAt = Math.max(
+    0,
+    ...profileViews.map(({ profile }) => profile.calculatedAt),
+    ...compositeRisks.map((risk) => risk.calculatedAt),
+    ...visibleCompositeJudgments.map((judgment) => judgment.updateJudgedAt ?? judgment.judgedAt),
+  );
+  const ruleVersions = [...new Set(profileViews.map(({ profile }) => profile.ruleVersion).filter(Boolean))];
+
+  const tabs: Array<{ key: StreamPanelTab; label: string; count?: number }> = [
+    { key: "profiles", label: "风险画像", count: riskyProfiles.length },
+    { key: "composites", label: "复合攻击链", count: visibleCompositeJudgments.length },
+    { key: "runtime", label: "流处理状态" },
+  ];
+
+  return (
+    <Panel
+      title="Flink 实时风险关联"
+      icon={Sparkles}
+      action={
+        <span className="inline-flex items-center gap-1.5 rounded-full border border-violet-400/30 bg-violet-400/10 px-2.5 py-1 text-[11px] text-violet-200">
+          <EyeOff className="size-3" />
+          旁路分析 · 不参与实时阻断
+        </span>
+      }
+    >
+      <div className="space-y-4 p-4">
+        <InlineError message={error} />
+        {!findings?.enabled ? (
+          <div className="rounded-md border border-dashed border-white/10 px-4 py-10 text-center">
+            <p className="text-sm font-medium text-zinc-300">流式分析当前未启用</p>
+            <p className="mt-1 text-xs text-zinc-600">现有 L1 / L2 / L3 研判链路不受影响</p>
+          </div>
+        ) : (
+          <>
+            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+              {[
+                { label: "Agent 资产", value: profileViews.length, detail: "按 Agent + Workspace 聚合" },
+                { label: "风险资产", value: riskyProfiles.length, detail: safeProfiles.length + " 个安全资产已折叠" },
+                { label: "高风险攻击链", value: blockedEpisodes.length, detail: pendingEpisodes.length + " 待研判 / " + failedEpisodes.length + " 异常" },
+                { label: "最新计算", value: latestCalculatedAt ? dayjs(latestCalculatedAt).format("HH:mm:ss") : "--", detail: latestCalculatedAt ? dayjs(latestCalculatedAt).format("MM-DD") : "暂无结果" },
+              ].map((item) => (
+                <div key={item.label} className="rounded-md border border-white/10 bg-white/[0.025] px-3 py-2.5">
+                  <p className="text-[11px] text-zinc-500">{item.label}</p>
+                  <p className="mt-1 text-lg font-semibold tabular-nums text-zinc-100">{item.value}</p>
+                  <p className="mt-0.5 text-[10px] text-zinc-600">{item.detail}</p>
+                </div>
+              ))}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1 border-b border-white/10">
+              {tabs.map((item) => (
+                <button
+                  key={item.key}
+                  type="button"
+                  onClick={() => setTab(item.key)}
+                  className={cn(
+                    "border-b-2 px-3 py-2 text-xs transition-colors",
+                    tab === item.key ? "border-teal-300 text-teal-200" : "border-transparent text-zinc-500 hover:text-zinc-300",
+                  )}
+                >
+                  {item.label}{item.count === undefined ? "" : " · " + item.count}
+                </button>
+              ))}
+            </div>
+
+            {tab === "profiles" && (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-zinc-100">Agent 风险资产</p>
+                    <p className="mt-0.5 text-xs text-zinc-500">同名 Agent 通过 Workspace 和环境区分，分数展示可解释贡献</p>
+                  </div>
+                  {safeProfiles.length > 0 && (
+                    <button type="button" onClick={() => setShowSafe((value) => !value)} className="text-xs text-teal-300 hover:text-teal-200">
+                      {showSafe ? "隐藏安全资产" : "显示安全资产（" + safeProfiles.length + "）"}
+                    </button>
+                  )}
+                </div>
+                {visibleProfiles.length === 0 ? (
+                  <EmptyState label={safeProfiles.length ? "当前没有风险资产" : "暂无流式风险画像"} />
+                ) : (
+                  <div className="grid gap-3 xl:grid-cols-2">
+                    {visibleProfiles.map(({ profile, previousScore }) => {
+                      const workspacePath = streamWorkspacePath(profile.workspacePath);
+                      const contributions = streamScoreContributions(profile);
+                      const score = Math.max(0, profile.riskScore);
+                      const delta = previousScore === undefined ? undefined : score - Math.max(0, previousScore);
+                      const tone = riskTone(profile.riskLevel);
+                      const query = new URLSearchParams({ agentId: profile.agentType });
+                      if (workspacePath) query.set("workspacePath", workspacePath);
+                      return (
+                        <div key={streamProfileKey(profile)} className={cn("rounded-lg border bg-white/[0.025] p-4", tone.border)}>
+                          <div className="flex items-start justify-between gap-4">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <Bot className="size-4 text-teal-300" />
+                                <p className="truncate text-sm font-semibold text-zinc-100">{profile.agentType} · {streamWorkspaceName(workspacePath)}</p>
+                              </div>
+                              <p className="mt-1 truncate text-[11px] text-zinc-500" title={workspacePath || "未绑定规范 Workspace"}>
+                                {workspacePath || "未绑定规范 Workspace"}
+                              </p>
+                              <p className="mt-0.5 text-[10px] text-zinc-700">资产 ID {profile.agentCorrelationId.slice(0, 16)}</p>
+                            </div>
+                            <div className="text-right">
+                              <div className="flex items-baseline justify-end gap-1.5">
+                                <span className={cn("text-2xl font-semibold tabular-nums", tone.text)}>{formatNumber(score)}</span>
+                                {delta !== undefined && delta !== 0 && <span className={cn("text-[10px]", delta > 0 ? "text-rose-300" : "text-emerald-300")}>{delta > 0 ? "+" : ""}{formatNumber(delta)}</span>}
+                              </div>
+                              <span className={cn("text-[10px]", tone.text)}>{tone.label}</span>
+                            </div>
+                          </div>
+
+                          <div className="mt-3 rounded-md border border-white/[0.07] bg-black/20 p-3">
+                            <p className="text-[11px] font-medium text-zinc-400">风险分数贡献</p>
+                            {contributions.length === 0 ? (
+                              <p className="mt-2 text-xs text-zinc-600">当前窗口没有风险加分项</p>
+                            ) : (
+                              <div className="mt-2 space-y-1.5">
+                                {contributions.slice(0, 4).map((item) => (
+                                  <div key={item.key} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 text-[11px]">
+                                    <span className="truncate text-zinc-400">{item.label} · {formatNumber(item.value)}</span>
+                                    <span className="font-medium tabular-nums text-amber-200">+{formatNumber(item.score)}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="mt-3 grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+                            {["toolExecCount1m", "dangerousCommandCount1m", "sensitiveFileCount5m", "externalEgressCount5m"].map((key) => (
+                              <div key={key} className="rounded border border-white/[0.07] px-2 py-1.5">
+                                <p className="truncate text-[9px] text-zinc-600">{STREAM_FEATURE_LABELS[key]}</p>
+                                <p className="mt-0.5 text-xs tabular-nums text-zinc-300">{formatNumber(streamFeatureValue(profile.features, key))}</p>
+                              </div>
+                            ))}
+                          </div>
+
+                          <div className="mt-3 flex flex-wrap gap-1.5">
+                            {profile.hitRules.length === 0 ? (
+                              <span className="text-[10px] text-zinc-600">未命中复合规则</span>
+                            ) : profile.hitRules.map((rule) => (
+                              <span key={rule} className="rounded border border-amber-400/20 bg-amber-400/10 px-2 py-1 text-[10px] text-amber-200" title={rule}>
+                                {STREAM_RULE_LABELS[rule] ?? rule}
+                              </span>
+                            ))}
+                          </div>
+                          <div className="mt-3 flex items-center justify-between gap-3 border-t border-white/[0.07] pt-3 text-[10px] text-zinc-600">
+                            <span>{dayjs(profile.windowStart).format("HH:mm:ss")} — {dayjs(profile.windowEnd).format("HH:mm:ss")} · 规则 {profile.ruleVersion || "--"}</span>
+                            <Link to={"/events?" + query.toString()} className="text-teal-300 hover:text-teal-200">查看事件 →</Link>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {tab === "composites" && (
+              <div className="space-y-3">
+                <div>
+                  <p className="text-sm font-semibold text-zinc-100">行为片段复合研判</p>
+                  <p className="mt-0.5 text-xs text-zinc-500">Flink 聚合连续行为；完整确定性证据直接研判，歧义证据只调用一次模型；结论仅用于旁路告警</p>
+                </div>
+                {visibleCompositeJudgments.length === 0 ? (
+                  <EmptyState label="当前窗口暂无复合研判结果" />
+                ) : visibleCompositeJudgments.map((judgment) => {
+                  const workspacePath = streamWorkspacePath(judgment.workspacePath);
+                  const query = new URLSearchParams();
+                  if (judgment.traceIds[0]) query.set("traceId", judgment.traceIds[0]);
+                  const blocked = judgment.status === "succeeded" && judgment.verdict === "block";
+                  const failed = judgment.status === "failed" || judgment.status === "timeout";
+                  const pending = judgment.status === "pending";
+                  const updatePending = judgment.updateStatus === "pending";
+                  const suspicious = judgment.status === "succeeded" && judgment.classification === "suspicious";
+                  const border = pending ? "border-violet-400/25 bg-violet-400/[0.04]" : blocked ? "border-rose-400/25 bg-rose-400/[0.04]" : failed || suspicious ? "border-amber-400/25 bg-amber-400/[0.04]" : "border-emerald-400/20 bg-emerald-400/[0.03]";
+                  const title = pending ? "等待复合研判" : failed
+                    ? judgment.status === "timeout" ? "复合研判超时" : "复合研判失败"
+                    : blocked ? judgment.attackType === "known-vulnerability-exploitation"
+                      ? "高置信度供应链攻击"
+                      : judgment.attackType && judgment.attackType !== "none" ? judgment.attackType : "已确认攻击链"
+                    : judgment.classification === "suspicious" ? "可疑行为链"
+                    : judgment.classification === "authorized_admin" ? "已识别授权运维"
+                    : judgment.classification === "simulation" ? "已识别测试演练"
+                    : "未发现攻击链";
+                  const resultLabel = pending ? "待研判" : failed
+                    ? judgment.status === "timeout" ? "超时" : "失败"
+                    : blocked ? "已确认攻击"
+                    : judgment.classification === "suspicious" ? "可疑"
+                    : judgment.classification === "authorized_admin" ? "授权运维"
+                    : judgment.classification === "simulation" ? "测试演练"
+                    : "安全";
+                  return (
+                    <div key={`${judgment.episodeId}-${judgment.revision}`} className={cn("rounded-lg border p-4", border)}>
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <GitBranch className={cn("size-4", pending ? "text-violet-300" : blocked ? "text-rose-300" : failed || suspicious ? "text-amber-300" : "text-emerald-300")} />
+                            <p className="text-sm font-semibold text-zinc-100">{title}</p>
+                          </div>
+                          <p className="mt-1 text-[11px] text-zinc-500">{judgment.agentType} · {streamWorkspaceName(workspacePath)} · {judgment.sessionId || "无会话 ID"}</p>
+                          <p className="mt-0.5 text-[10px] text-zinc-700">Episode {judgment.episodeId.slice(0, 18)} · 修订 {judgment.revision}</p>
+                          {judgment.updateRevision !== undefined && (
+                            <p className={cn(
+                              "mt-1 text-[10px]",
+                              updatePending ? "text-violet-300" : "text-amber-300",
+                            )}>
+                              修订 {judgment.updateRevision}
+                              {updatePending ? " 正在重新研判，当前保留上一条有效结论" : judgment.updateStatus === "timeout"
+                                ? " 研判超时，当前保留上一条有效结论"
+                                : " 研判失败，当前保留上一条有效结论"}
+                            </p>
+                          )}
+                        </div>
+                        <div className="text-right">
+                          <span className={cn(
+                            "inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold",
+                            pending ? "border-violet-400/30 bg-violet-400/10 text-violet-200" : blocked ? "border-rose-400/30 bg-rose-400/10 text-rose-200" : failed || suspicious ? "border-amber-400/30 bg-amber-400/10 text-amber-200" : "border-emerald-400/30 bg-emerald-400/10 text-emerald-200",
+                          )}>
+                            {resultLabel}
+                          </span>
+                          {judgment.confidence !== undefined && <p className="mt-1 text-[10px] text-zinc-600">置信度 {Math.round(judgment.confidence * 100)}%</p>}
+                        </div>
+                      </div>
+                      <div className="mt-4 grid gap-2 md:grid-cols-3">
+                        {judgment.evidence.map((evidence, index) => (
+                          <div key={evidence.eventId} className="relative rounded-md border border-white/10 bg-black/20 p-3">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="flex size-5 items-center justify-center rounded-full bg-white/10 text-[10px] text-zinc-300">{index + 1}</span>
+                              <span className="text-[10px] text-zinc-600">{dayjs(evidence.eventTime).format("HH:mm:ss")}</span>
+                            </div>
+                            <p className="mt-2 text-xs font-medium text-zinc-200">{STREAM_OPERATION_LABELS[evidence.operation] ?? evidence.operation}</p>
+                            <p className="mt-1 line-clamp-2 text-[11px] text-zinc-500" title={evidence.subject}>{evidence.subject}</p>
+                            {evidence.runtimeVulnerabilities?.map((match) => (
+                              <p key={`${match.findingId}-${match.vulnerabilityId}`} className="mt-2 rounded border border-rose-400/20 bg-rose-400/[0.06] px-2 py-1 text-[10px] text-rose-200">
+                                {match.packageName}@{match.version} · {match.vulnerabilityId} · {match.confidence === "high" ? "高置信匹配" : "中置信匹配"}
+                              </p>
+                            ))}
+                            {evidence.judgment && (
+                              <p className="mt-2 text-[10px] text-zinc-600">
+                                {evidence.judgment.stage} · {evidence.judgment.status} · {evidence.judgment.verdict || "无结论"}
+                              </p>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                      <div className="mt-3 flex items-center justify-between gap-3 border-t border-white/[0.07] pt-3 text-[10px] text-zinc-600">
+                        <div className="min-w-0">
+                          <p className="text-zinc-400">{judgment.reason || judgment.error || "没有返回复合研判原因"}</p>
+                          <p className="mt-1">
+                            {pending
+                              ? `规则 ${judgment.ruleVersion || "--"} · 排队中`
+                              : judgment.decisionSource === "deterministic_rule"
+                                ? `确定性规则直判 · ${judgment.ruleVersion || "--"} · ${formatNumber(judgment.latencyMs)}ms`
+                                : `模型 ${judgment.model || "--"} · 规则 ${judgment.ruleVersion || "--"} · ${formatNumber(judgment.latencyMs)}ms`}
+                            {" · "}{dayjs(judgment.windowStart).format("HH:mm:ss")}—{dayjs(judgment.windowEnd).format("HH:mm:ss")}
+                          </p>
+                        </div>
+                        {judgment.traceIds[0] && <Link to={"/events?" + query.toString()} className="shrink-0 text-teal-300 hover:text-teal-200">查看证据链 →</Link>}
+                      </div>
+                    </div>
+                  );
+                })}
+                {suppressedEpisodes.length > 0 && (
+                  <p className="text-[10px] text-zinc-700">
+                    已折叠 {suppressedEpisodes.length} 条过期或历史回放 Episode；这些记录未调用模型，也不计入研判失败。
+                  </p>
+                )}
+                {syntheticEpisodes.length > 0 && (
+                  <p className="text-[10px] text-zinc-700">
+                    已折叠 {syntheticEpisodes.length} 条合成测试 Episode；测试结果不计入资产风险和攻击链统计。
+                  </p>
+                )}
+                {compositeRisks.length > 0 && (
+                  <p className="text-[10px] text-zinc-700">历史规则候选 {compositeRisks.length} 条已保留在存储中，新版不再将其作为最终复合攻击链。</p>
+                )}
+              </div>
+            )}
+
+            {tab === "runtime" && (
+              <div className="space-y-3">
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                  {[
+                    { label: "结果消费", value: findings.enabled ? "正常" : "未连接", detail: "AnySentry 已读取流式结果" },
+                    { label: "运行模式", value: "Shadow", detail: "不进入同步阻断链路" },
+                    { label: "结果总数", value: findings.riskProfiles.length + visibleCompositeJudgments.length, detail: findings.riskProfiles.length + " 画像 / " + visibleCompositeJudgments.length + " 复合研判" },
+                    { label: "规则版本", value: ruleVersions.join(", ") || "--", detail: "画像输出携带的规则版本" },
+                  ].map((item) => (
+                    <div key={item.label} className="rounded-md border border-white/10 bg-white/[0.025] p-3">
+                      <p className="text-[11px] text-zinc-500">{item.label}</p>
+                      <p className="mt-1 text-lg font-semibold text-zinc-100">{item.value}</p>
+                      <p className="mt-1 text-[10px] text-zinc-600">{item.detail}</p>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex gap-3 rounded-md border border-amber-400/20 bg-amber-400/[0.05] p-3">
+                  <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-300" />
+                  <div>
+                    <p className="text-xs font-medium text-amber-100">深度运行指标尚未接入查询接口</p>
+                    <p className="mt-1 text-[11px] leading-5 text-zinc-500">Checkpoint、Watermark、Kafka Lag 与 DLQ 数量目前不能从本页面可靠读取，因此不展示虚构的健康值。下一步应由 Flink / Redpanda 指标接口提供真实数据。</p>
+                  </div>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </Panel>
+  );
+}
+
 function RadarChart({ dimensions }: { dimensions: SecurityRiskDimension[] }) {
   const chartDimensions = normalizeRiskDimensions(dimensions);
   const center = 110;
@@ -1787,42 +2516,84 @@ function WorkspaceRiskPanel({
   onScopeChange: (value: TimelineScope) => void;
 }) {
   const list = workspaceRisk?.list ?? [];
+  const agentRisk = list.filter((item) => item.workspacePath.startsWith("agent://"));
+  const directoryRisk = list.filter((item) => !item.workspacePath.startsWith("agent://"));
 
-  return (
-    <Panel
-      title="工作区风险分布"
-      icon={Bot}
-      action={<TimelineScopeTabs value={scope} onChange={onScopeChange} />}
-    >
-      {list.length === 0 ? (
-        <EmptyState label="暂无工作区风险数据" />
+  const renderRiskDistribution = (
+    title: string,
+    description: string,
+    items: typeof list,
+    emptyLabel: string,
+    pathLabel: string,
+  ) => (
+    <div className="min-w-0 rounded-lg border border-white/10 bg-black/10">
+      <div className="border-b border-white/10 px-4 py-3">
+        <h3 className="text-sm font-semibold text-zinc-100">{title}</h3>
+        <p className="mt-0.5 text-xs text-zinc-500">{description}</p>
+      </div>
+      {items.length === 0 ? (
+        <EmptyState label={emptyLabel} />
       ) : (
-        <div className="max-h-[420px] overflow-y-auto p-4">
-          <div className="grid min-w-[640px] grid-cols-[minmax(220px,1fr)_110px_120px_110px] gap-3 border-b border-white/10 pb-2 text-xs text-zinc-500">
-            <span>工作区</span>
+        <div className="max-h-[420px] overflow-auto p-4">
+          <div className="grid min-w-[520px] grid-cols-[minmax(180px,1fr)_72px_96px_86px] gap-3 border-b border-white/10 pb-2 text-xs text-zinc-500">
+            <span>{pathLabel}</span>
             <span className="text-right">会话数</span>
             <span className="text-right">累计风险</span>
             <span className="text-right">等级</span>
           </div>
-          <div className="min-w-[640px] divide-y divide-white/8">
-            {list.map((item) => (
-              <div
-                key={item.workspacePath}
-                className="grid grid-cols-[minmax(220px,1fr)_110px_120px_110px] items-center gap-3 py-3 text-sm"
-              >
-                <span className="truncate font-medium text-zinc-200" title={item.workspacePath}>
-                  {item.workspacePath}
-                </span>
-                <span className="text-right tabular-nums text-zinc-400">{formatNumber(item.sessionCount)}</span>
-                <span className="text-right tabular-nums text-zinc-100">
-                  {formatNumber(item.totalRiskScore, { maximumFractionDigits: 1 })}
-                </span>
-                <span className="flex justify-end">
-                  <StatusPill level={item.riskLevel} label={item.riskLevelText} />
-                </span>
-              </div>
-            ))}
+          <div className="min-w-[520px] divide-y divide-white/8">
+            {items.map((item) => {
+              const displayName = item.workspacePath.startsWith("agent://")
+                ? item.workspacePath.slice("agent://".length)
+                : item.workspacePath;
+              return (
+                <div
+                  key={item.workspacePath}
+                  className="grid grid-cols-[minmax(180px,1fr)_72px_96px_86px] items-center gap-3 py-3 text-sm"
+                >
+                  <span className="truncate font-medium text-zinc-200" title={item.workspacePath}>
+                    {displayName}
+                  </span>
+                  <span className="text-right tabular-nums text-zinc-400">{formatNumber(item.sessionCount)}</span>
+                  <span className="text-right tabular-nums text-zinc-100">
+                    {formatNumber(item.totalRiskScore, { maximumFractionDigits: 1 })}
+                  </span>
+                  <span className="flex justify-end">
+                    <StatusPill level={item.riskLevel} label={item.riskLevelText} />
+                  </span>
+                </div>
+              );
+            })}
           </div>
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <Panel
+      title="Agent 与工作区风险分布"
+      icon={Bot}
+      action={<TimelineScopeTabs value={scope} onChange={onScopeChange} />}
+    >
+      {list.length === 0 ? (
+        <EmptyState label="暂无 Agent 与工作区风险数据" />
+      ) : (
+        <div className="grid gap-4 p-4 lg:grid-cols-2">
+          {renderRiskDistribution(
+            "Agent 风险分布",
+            "未绑定明确工作目录的 Agent 风险归属",
+            agentRisk,
+            "暂无 Agent 风险数据",
+            "Agent",
+          )}
+          {renderRiskDistribution(
+            "工作区风险分布",
+            "按真实工作目录聚合会话与风险",
+            directoryRisk,
+            "暂无工作区风险数据",
+            "工作目录",
+          )}
         </div>
       )}
     </Panel>
@@ -1886,6 +2657,7 @@ export default function SecurityMonitorPage() {
     data?.highestRisk?.updateTime ||
     data?.decisionFunnel?.updateTime ||
     data?.workspaceRisk?.updateTime ||
+    data?.streamFindings?.updateTime ||
     data?.events?.updateTime;
 
   const handleTimeTypeChange = (value: SecurityTimeType) => {
@@ -1946,6 +2718,20 @@ export default function SecurityMonitorPage() {
               <RiskBreakdownPanel breakdown={data?.riskBreakdown} error={data?.errors.riskBreakdown} scope={riskBreakdownScope} onScopeChange={setRiskBreakdownScope} />
             </div>
           </DashboardSection>
+
+          <DashboardSection title="流式复合研判" icon={Sparkles}>
+            <StreamShadowPanel findings={data?.streamFindings} error={data?.errors.streamFindings} />
+          </DashboardSection>
+
+          {data?.supplyChain?.enabled && (
+            <DashboardSection title="供应链漏洞资产" icon={ShieldAlert}>
+              <SupplyChainPanel
+                overview={data.supplyChain}
+                streamFindings={data.streamFindings}
+                error={data.errors.supplyChain}
+              />
+            </DashboardSection>
+          )}
 
           <DashboardSection title="运行链路" icon={GitBranch}>
             <AgentEventTimelinePanel

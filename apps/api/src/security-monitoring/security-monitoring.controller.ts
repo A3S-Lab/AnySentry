@@ -1,5 +1,5 @@
-import { BadRequestException, Body, Controller, Get, Headers, HttpCode, NotFoundException, Param, Post, Put, Query, Sse, UseGuards } from '@nestjs/common';
-import { createHash } from 'node:crypto';
+import { BadRequestException, Body, Controller, Get, Headers, HttpCode, NotFoundException, Param, Post, Put, Query, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { Observable, map, timer } from 'rxjs';
 import { SkipWrap } from '../shared/api-response.interceptor';
 import { AgentMetadataService } from './agent-metadata.service';
@@ -15,6 +15,15 @@ import { ObjectiveService } from './objective.service';
 import { PolicyConfigError } from './policy-config';
 import { RemediationService } from './remediation.service';
 import { SentryJudgeService } from './sentry-judge.service';
+import { StreamingFindingService } from './streaming-finding.service';
+import { StreamingQueueService } from './streaming-queue.service';
+import { SupplyChainService } from './supply-chain.service';
+import {
+  ClaimScanTaskRequest,
+  RegisterWorkspaceRequest,
+  ScanTaskHeartbeatRequest,
+  SubmitScanResultRequest,
+} from './supply-chain.types';
 import * as T from './types';
 
 /** Ingest a real observer event: judge it via sentry and record it for the dashboard. */
@@ -26,6 +35,7 @@ interface IngestBody extends Partial<T.EventMeta> {
   sourceName?: string;
   sourceType?: T.IngestionSourceType;
   token?: string;
+  sourceEventId?: string;
 }
 
 interface RejectedIngestContext {
@@ -207,6 +217,7 @@ function deriveMeta(line: string, given: Partial<T.EventMeta>): T.EventMeta {
     parentSpanId: given.parentSpanId,
     runId: given.runId ?? id.session ?? id.agent ?? (id.task != null ? `task-${id.task}` : undefined),
     taskId: given.taskId ?? (id.task != null ? String(id.task) : undefined),
+    sourceEventId: given.sourceEventId,
     attributes: { ...compactAttributes(eventKey, inner, id), ...sanitizeEventAttributes(given.attributes) },
     process: given.process ?? process,
     attribution: given.attribution,
@@ -1262,6 +1273,13 @@ function universalMeta(input: T.UniversalIngestEvent, defaults: T.UniversalInges
     tokenCount: finiteNumber(input.tokenCount ?? defaults.tokenCount),
     latencyMs: finiteNumber(input.latencyMs ?? defaults.latencyMs),
     rawPreview: cleanString(input.rawPreview ?? defaults.rawPreview, 1800),
+    sourceEventId: cleanString(
+      input.sourceEventId
+        ?? input.id
+        ?? eventAttr(input, 'sourceEventId')
+        ?? eventAttr(input, 'cloudEventId'),
+      240,
+    ),
     attributes: attrs,
   };
 }
@@ -2645,7 +2663,145 @@ export class SecurityMonitoringController {
     private readonly objectives: ObjectiveService,
     private readonly judge: SentryJudgeService,
     private readonly kube: KubeIdentityService,
+    private readonly streaming: StreamingQueueService,
+    private readonly streamFindings: StreamingFindingService,
+    private readonly supplyChain: SupplyChainService,
   ) {}
+
+  private requireWorkspaceScanner(
+    headers: Record<string, string | string[] | undefined>,
+    scannerId: string,
+  ): void {
+    let expected = process.env.ANYSENTRY_WORKSPACE_SCANNER_TOKEN?.trim();
+    const configuredTokens = process.env.ANYSENTRY_WORKSPACE_SCANNER_TOKENS?.trim();
+    if (configuredTokens) {
+      try {
+        const tokens = JSON.parse(configuredTokens) as Record<string, unknown>;
+        expected = typeof tokens[scannerId] === 'string' ? tokens[scannerId].trim() : undefined;
+      } catch {
+        throw new UnauthorizedException('workspace scanner token configuration is invalid');
+      }
+    }
+    const value = headers['x-anysentry-scanner-token'];
+    const presented = (Array.isArray(value) ? value[0] : value)?.trim();
+    if (!expected || !presented) throw new UnauthorizedException('workspace scanner token required');
+    const expectedHash = createHash('sha256').update(expected).digest();
+    const presentedHash = createHash('sha256').update(presented).digest();
+    if (!timingSafeEqual(expectedHash, presentedHash)) {
+      throw new UnauthorizedException('workspace scanner token required');
+    }
+  }
+
+  private supplyChainBadRequest(error: unknown): never {
+    throw new BadRequestException(error instanceof Error ? error.message : String(error));
+  }
+
+  @Post('supply-chain/workspaces/register')
+  @HttpCode(200)
+  async registerSupplyChainWorkspace(
+    @Headers() headers: Record<string, string | string[] | undefined>,
+    @Body() body: RegisterWorkspaceRequest,
+  ) {
+    this.requireWorkspaceScanner(headers, body.scannerId);
+    try {
+      return await this.supplyChain.registerWorkspace(body);
+    } catch (error) {
+      this.supplyChainBadRequest(error);
+    }
+  }
+
+  @Post('supply-chain/tasks/claim')
+  @HttpCode(200)
+  async claimSupplyChainScanTask(
+    @Headers() headers: Record<string, string | string[] | undefined>,
+    @Body() body: ClaimScanTaskRequest,
+  ) {
+    this.requireWorkspaceScanner(headers, body.scannerId);
+    try {
+      return { task: await this.supplyChain.claimTask(body.scannerId) ?? null };
+    } catch (error) {
+      this.supplyChainBadRequest(error);
+    }
+  }
+
+  @Put('supply-chain/tasks/:taskId/heartbeat')
+  @HttpCode(200)
+  async heartbeatSupplyChainScanTask(
+    @Headers() headers: Record<string, string | string[] | undefined>,
+    @Param('taskId') taskId: string,
+    @Body() body: ScanTaskHeartbeatRequest,
+  ) {
+    this.requireWorkspaceScanner(headers, body.scannerId);
+    try {
+      return { task: await this.supplyChain.heartbeat(taskId, body.scannerId, body.leaseToken) };
+    } catch (error) {
+      this.supplyChainBadRequest(error);
+    }
+  }
+
+  @Post('supply-chain/tasks/:taskId/result')
+  @HttpCode(200)
+  async submitSupplyChainScanResult(
+    @Headers() headers: Record<string, string | string[] | undefined>,
+    @Param('taskId') taskId: string,
+    @Body() body: SubmitScanResultRequest,
+  ) {
+    this.requireWorkspaceScanner(headers, body.scannerId);
+    try {
+      return await this.supplyChain.submitResult(taskId, body);
+    } catch (error) {
+      this.supplyChainBadRequest(error);
+    }
+  }
+
+  @Post('supply-chain/workspaces/:workspaceId/scan')
+  @RequireManagementAuth()
+  @HttpCode(202)
+  async requestSupplyChainScan(
+    @Param('workspaceId') workspaceId: string,
+    @Body() body: { reason?: 'manual' | 'dependency_descriptor_changed' | 'retry' },
+  ) {
+    try {
+      return {
+        task: await this.supplyChain.enqueueScan(workspaceId, body.reason ?? 'manual'),
+      };
+    } catch (error) {
+      this.supplyChainBadRequest(error);
+    }
+  }
+
+  @Post('supply-chain/workspaces/:workspaceId/dependency-change')
+  @HttpCode(202)
+  async notifySupplyChainDependencyChange(
+    @Headers() headers: Record<string, string | string[] | undefined>,
+    @Param('workspaceId') workspaceId: string,
+    @Body() body: { scannerId: string },
+  ) {
+    this.requireWorkspaceScanner(headers, body.scannerId);
+    try {
+      return {
+        task: await this.supplyChain.notifyDescriptorChange(workspaceId, body.scannerId),
+      };
+    } catch (error) {
+      this.supplyChainBadRequest(error);
+    }
+  }
+
+  @Post('supply-chain/workspaces/:workspaceId/assess')
+  @RequireManagementAuth()
+  @HttpCode(202)
+  async requestSupplyChainAssessment(@Param('workspaceId') workspaceId: string) {
+    try {
+      return await this.supplyChain.requestAssessment(workspaceId);
+    } catch (error) {
+      this.supplyChainBadRequest(error);
+    }
+  }
+
+  @Get('supply-chain/overview')
+  async supplyChainOverview(@Query('limit') limit?: string) {
+    return this.supplyChain.overview(limit ? Number(limit) : undefined);
+  }
 
   private recordRejectedIngest(resolution: IngestionSourceResolution, reason: string, context: RejectedIngestContext = {}): void {
     this.sources.recordRejected(resolution, reason);
@@ -2661,6 +2817,32 @@ export class SecurityMonitoringController {
       endpoint: context.endpoint,
       rejectedEvents: context.rejectedEvents,
     });
+  }
+
+  private async enqueueCanonicalShadow(event: T.JudgedEvent, observerLine: string): Promise<void> {
+    try {
+      await this.streaming.enqueueCanonical(event, observerLine);
+    } catch (error) {
+      // Streaming is an optional shadow path. A Redis/Kafka-side outage must never turn an accepted
+      // security event into an ingest failure or interfere with the existing L1/L2/L3 pipeline.
+      console.error('[streaming] canonical outbox enqueue failed', {
+        eventId: event.eventId,
+        error: error instanceof Error ? error.message.split('\n')[0].slice(0, 300) : String(error).slice(0, 300),
+      });
+    }
+  }
+
+  private async observeSupplyChainInstall(event: T.JudgedEvent, observerLine: string): Promise<void> {
+    try {
+      await this.supplyChain.observeRuntimeInstall(event, observerLine);
+    } catch (error) {
+      // Runtime install tracking is an optional supply-chain side path. It must not reject an
+      // otherwise accepted security event or interfere with L1/L2/L3.
+      console.error('[supply-chain] runtime install observation failed', {
+        eventId: event.eventId,
+        error: error instanceof Error ? error.message.split('\n')[0].slice(0, 300) : String(error).slice(0, 300),
+      });
+    }
   }
 
   @Post('top/healthCard')
@@ -2727,6 +2909,12 @@ export class SecurityMonitoringController {
   @HttpCode(200)
   agentTimeline(@Body() f: T.AgentEventQuery) {
     return this.agg.agentTimeline(f);
+  }
+
+  @Post('stream/findings')
+  @HttpCode(200)
+  streamFindingList(@Body() f: T.SecurityTimeFilter & { limit?: number }) {
+    return this.streamFindings.list(f, f.limit);
   }
 
   @Post('incidents/list')
@@ -3981,6 +4169,13 @@ export class SecurityMonitoringController {
         distinctSessions: stats.distinctSessions,
       },
       policy: policy.status,
+      streaming: {
+        ...this.streaming.status(),
+        findingStoreReady: this.streamFindings.enabled,
+      },
+      supplyChain: {
+        enabled: this.supplyChain.enabled,
+      },
     };
   }
 
@@ -4339,6 +4534,8 @@ export class SecurityMonitoringController {
         items.push({ index, accepted: false, reason });
         continue;
       }
+      await this.enqueueCanonicalShadow(rec, line);
+      await this.observeSupplyChainInstall(rec, line);
       this.sources.recordAccepted(sourceResolution, 'event', { collectorId: inputCollectorId, workspacePath: rec.workspacePath });
       acceptedEvents += 1;
       items.push({
@@ -4369,7 +4566,7 @@ export class SecurityMonitoringController {
   /** The real ingestion seam: external agents/observers POST events here to be judged + counted. */
   @Post('ingest')
   async ingest(@Body() body: IngestBody, @Headers() headers: HeaderBag) {
-    const { line, collectorId, nodeName, sourceId, sourceName, sourceType, token, ...given } = body;
+    const { line, collectorId, nodeName, sourceId, sourceName, sourceType, token, sourceEventId, ...given } = body;
     const heartbeat = parseCollectorHeartbeatLine(line);
     const requestSourceId = sourceId ?? headerValue(headers, 'x-anysentry-source-id');
     const requestToken = token ?? headerValue(headers, 'x-anysentry-ingest-token') ?? bearerToken(headers);
@@ -4421,6 +4618,7 @@ export class SecurityMonitoringController {
     }
     const metaGiven: Partial<T.EventMeta> = {
       ...given,
+      sourceEventId,
       attributes: {
         ...(given.attributes ?? {}),
         ...(collectorId ? { collectorId } : {}),
@@ -4457,6 +4655,8 @@ export class SecurityMonitoringController {
       });
       return { accepted: false, sourceId: sourceResolution.source?.sourceId, reason: 'unparseable event' };
     }
+    await this.enqueueCanonicalShadow(rec, line);
+    await this.observeSupplyChainInstall(rec, line);
     this.sources.recordAccepted(sourceResolution, 'event', { collectorId, workspacePath: rec.workspacePath });
     this.agg.invalidateWindowCache();
     return { accepted: true, sourceId: sourceResolution.source?.sourceId, eventId: rec.eventId, traceId: rec.traceId, spanId: rec.spanId, runId: rec.runId, verdict: rec.verdict, tier: rec.tier, severity: rec.severity, reason: rec.reason, riskCategory: rec.riskCategory, decisionStatus: rec.decisionStatus, evaluationId: rec.evaluationId };

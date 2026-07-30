@@ -17,6 +17,10 @@ async function bootstrap() {
     });
   }
   app.enableCors();
+  app.use('/security-center/supply-chain/tasks', json({
+    type: ['application/json', 'application/*+json'],
+    limit: process.env.ANYSENTRY_WORKSPACE_SCAN_BODY_LIMIT || '32mb',
+  }));
   app.use(json({ type: ['application/json', 'application/*+json'] }));
   app.useGlobalInterceptors(new ApiResponseInterceptor(app.get(Reflector)));
   const port = Number(process.env.PORT ?? 29653);

@@ -190,10 +190,178 @@ A3S_OBSERVER_JSON=1 sudo -E a3s-observer-collector \
 ```
 
 `FORWARD_SCOPE=agent` reduces ingest volume before Sentry evaluation. The forwarder uses PID
-ancestry to classify events as `agent`, `non_agent`, or `unknown`; it drops only proven
-`non_agent` events. Unknown events are forwarded so missing `/proc` data or short-lived processes
-do not become silent security gaps. Use `FORWARD_SCOPE=all` to retain the legacy all-event stream,
-or `FORWARD_SCOPE=shadow` to measure classifications without applying the Agent filter.
+ancestry to classify events as `agent`, `infrastructure`, `non_agent`, or `unknown`. Containers
+with `io.anysentry.observe=false` are discovered through the local Docker socket; their root PIDs
+and descendants are classified as infrastructure and dropped before HTTP ingest in every scope.
+The process lifecycle cache preserves that decision for short-lived `ProcessExit` events after
+`/proc/<pid>` disappears. The bundled Compose stack applies the label to AnySentry, Kafka, Flink,
+Redis, and ClickHouse services so the monitoring stack does not observe itself.
+
+For Agent-scoped events, the forwarder resolves a usable event `cwd` to its nearest Git root.
+Short-lived descendants inherit the Agent root Workspace only when their own `cwd` is unavailable
+or belongs to an ephemeral system tree such as `/tmp`, `/proc`, or `/run`. An unrelated non-Git
+`cwd` is marked as a Workspace conflict and is not force-merged into the root asset. Git resolution
+is cached, and `ANYSENTRY_WORKSPACE_PATH` remains an explicit deployment-wide override.
+
+Unknown events remain fail-open so incomplete lineage does not create a silent security gap. Use
+`FORWARD_SCOPE=all` to retain ordinary non-Agent events, or `FORWARD_SCOPE=shadow` to measure Agent
+classifications without applying the non-Agent filter. Set `ANYSENTRY_INFRA_FILTER=off` only to
+disable trusted infrastructure exclusion; `ANYSENTRY_DOCKER_SOCKET` and
+`ANYSENTRY_INFRA_REFRESH_SECS` override the Docker socket and the 30-second refresh interval.
+
+### Optional Flink shadow stream
+
+The optional streaming profile adds a shadow analysis path without changing the existing Observer,
+Sentry, or BullMQ single-event judgment path:
+
+```text
+AnySentry ingest ─┬─> Redis/BullMQ -> Sentry L1/L2/L3
+                  └─> Kafka canonical events ─┐
+Judgment updates ─────> Kafka judgments ──────┴─> Flink
+OSV runtime context ──> Kafka context ───────────┤
+                                                   ├─> rolling risk profiles
+                                                   └─> behavior / vulnerability episodes
+                                                          ├─ complete evidence -> deterministic rule
+                                                          └─ ambiguous evidence -> one Composite Judge call
+                                                          -> ClickHouse + Dashboard
+```
+
+Flink maintains rolling per-Agent features and builds bounded behavior episodes keyed by the
+stable Agent scope and Session. An episode closes after 60 seconds of inactivity, 20 evidence
+events, five minutes of continuous activity, or a short grace period after critical evidence.
+Recent evidence remains in state for revisions so an event arriving just after a boundary is not
+silently detached from its context.
+
+Lifecycle and observation noise such as `ProcessExit` is retained in the canonical stream for
+audit and metrics, but cannot open or extend a Composite Judge Episode. Episode evidence is limited
+to sensitive resources, external egress, dangerous commands, encoding, compression, copying, and
+risk-relevant single-event judgments.
+
+Ordinary composite episode revisions are judged by one OpenAI-compatible model request. Composite
+judgment does not start an Agent, load Skills, create Session memory, invoke tools, retry the
+semantic call, or escalate to L3. A timeout, transport failure, empty response, or invalid JSON is
+stored explicitly instead of being converted into an allow or block. All composite verdicts
+remain Shadow-only and never replace Sentry's single-event verdict or block an action.
+
+New Flink consumer groups start at the latest Kafka offsets by default, and Episodes older than
+15 minutes are suppressed before queueing and again before model evaluation. This prevents a
+first deployment or consumer-group reset from replaying historical events into a model-call
+storm. Set `ANYSENTRY_FLINK_STARTUP_MODE=earliest` only for an intentional offline replay.
+
+Only events with a confirmed, non-conflicted Agent attribution enter the streaming path by default
+(`ANYSENTRY_STREAM_AGENT_ONLY=on`). Ordinary host, container, and unresolved Observer events remain
+available to AnySentry but are not published to Kafka or processed by Flink. Set the option to
+`off` only for explicit ingestion-quality experiments.
+
+Start the optional profile with Apache Kafka KRaft, Flink 2.2.1, and the stream worker:
+
+```bash
+ANYSENTRY_STREAMING=on docker compose --profile streaming up -d --build
+docker compose --profile streaming ps
+docker compose --profile streaming logs -f stream-worker composite-judge flink-job-submit
+```
+
+Open the dashboard and use **流式复合研判** to inspect Agent profiles, Episode evidence, and the
+single-call composite verdict.
+Kafka-compatible brokers are supported by setting `ANYSENTRY_STREAM_BOOTSTRAP_SERVERS`; Apache
+Kafka is the local reference implementation.
+
+Stop the stack while retaining Kafka, Flink checkpoint, Redis, and ClickHouse data:
+
+```bash
+docker compose --profile streaming down
+```
+
+### Optional OSV supply-chain inventory
+
+The supply-chain profile is a Shadow-only asset path. It does not scan on every Observer event and
+does not participate in L1/L2/L3 blocking:
+
+```text
+trusted Workspace registration
+  -> host Workspace Scanner (OSV-Scanner, local path remains local)
+  -> confirmed component snapshot
+  -> central Assessment Worker
+  -> OSV vulnerability assessment
+  -> ClickHouse governance findings
+```
+
+`repositoryId` names the logical repository, while `workspaceId` identifies one concrete working
+copy on one node. The Scanner uploads normalized components and relative dependency source paths;
+it never uploads the configured absolute `localPath`. Only a complete extraction replaces the
+active dependency snapshot. Partial or failed OSV assessments preserve existing Findings and mark
+their intelligence stale instead of treating missing results as remediation.
+
+Start the central API and assessment worker:
+
+```bash
+export ANYSENTRY_WORKSPACE_SCANNER_TOKEN='replace-with-a-random-token'
+ANYSENTRY_SUPPLY_CHAIN=on docker compose --profile supply-chain up -d --build
+```
+
+For multiple nodes, prefer `ANYSENTRY_WORKSPACE_SCANNER_TOKENS` as a JSON object mapping each
+`scannerId` to a distinct token. When that mapping is configured, a Scanner cannot claim another
+node's tasks by presenting only its identifier.
+
+Copy `config/workspace-scanner.example.json` to a host-local file, set its allowed root and
+Workspace paths, then run the edge scanner with a pinned OSV-Scanner v2 binary:
+
+`allowedRoots` is only a filesystem safety boundary. The scanner never walks every repository
+under that directory automatically: each trusted working copy must have an explicit entry in
+`workspaces`. This avoids scanning unrelated repositories, user home directories, or an
+untrusted checkout by accident. A Workspace may also declare `deploymentImages`; those images
+are scanned alongside source descriptors and matched production components are recorded as
+deployment-confirmed evidence.
+
+```bash
+ANYSENTRY_WORKSPACE_SCANNER_TOKEN_FILE=/path/to/scanner-token \
+ANYSENTRY_WORKSPACE_SCANNER_CONFIG=/path/to/workspace-scanner.json \
+node scripts/workspace-scanner.mjs
+```
+
+The token file must be owned by the unprivileged Scanner user and must not grant any group or
+other permissions (for example, mode `0600`). Direct token environment variables remain available
+for ephemeral deployments.
+
+The central worker reassesses saved component inventories every 24 hours by default, so newly
+published advisories are discovered without rereading unchanged Workspace files.
+For isolated deployments, point `ANYSENTRY_OSV_API_URL` at an internal OSV-compatible service,
+set `ANYSENTRY_OSV_INTELLIGENCE_MODE=offline`, and provide the mirrored database digest through
+`ANYSENTRY_OSV_DATA_REVISION`.
+
+The Scanner polls dependency descriptors every 30 seconds by default. In addition, accepted
+Observer events recognize common npm, pnpm, Yarn, Bun, pip, Cargo, Go, Ruby, Composer, and .NET
+installation commands. The API correlates each command with its `ProcessExit`, schedules a scan
+only after exit code 0, and collapses a burst of successful installs into one delayed task. The
+Scanner inventories `node_modules` and Python environments inside the registered Workspace, so
+`--no-save` installations can enter the component snapshot even when no lockfile changes. Failed
+installs, unregistered paths, and host-global environments outside the trusted Workspace do not
+trigger or expand a scan. Override the short batching window with
+`ANYSENTRY_RUNTIME_INSTALL_DEBOUNCE_MS`.
+
+Supply-chain runtime correlation is the optional second stage. After a complete assessment, the
+Assessment Worker publishes a versioned context keyed by the SHA-256 fingerprint of the registered
+Workspace path. Flink keeps that context in broadcast state and only attaches a vulnerability when
+runtime evidence explicitly identifies the package executable, package-manager invocation,
+installed-package path, or versioned artifact. A vulnerable dependency in a snapshot alone remains
+an asset finding and never becomes an attack.
+
+Flink emits `supply-chain-exploit-v1` episodes when matched component execution is followed in the
+same Agent Session by shell, sensitive-data, external-egress, dangerous, or destructive behavior.
+Complete high-confidence evidence uses a deterministic Shadow rule without a model call. Ambiguous
+evidence uses the existing single-call Composite Judge. Both results retain the dependency snapshot,
+vulnerability assessment, Finding, and evidence event identifiers, and neither changes L1/L2/L3 or
+real-time enforcement.
+
+Enable both optional profiles together:
+
+```bash
+ANYSENTRY_STREAMING=on \
+ANYSENTRY_SUPPLY_CHAIN=on \
+ANYSENTRY_SUPPLY_CHAIN_RUNTIME=on \
+ANYSENTRY_WORKSPACE_SCANNER_TOKEN="$(cat /path/to/scanner-token)" \
+docker compose --profile streaming --profile supply-chain up -d --build
+```
 
 ### Kubernetes integrated stack
 
@@ -341,6 +509,11 @@ checks, and stop the server.
 | Dashboard serving, assets, deep links, Operator, Capabilities | `pnpm verify:dashboard-runtime:base-path:local` |
 | Observer NDJSON ingest | `ANYSENTRY_API_BASE=http://127.0.0.1:29653/security-center pnpm verify:observer-ingest` |
 | Node/Python forwarders | `ANYSENTRY_API_BASE=http://127.0.0.1:29653/security-center pnpm verify:forwarders` |
+| Phase 1 canonical streaming contract | `pnpm verify:streaming-phase1:local` |
+| Phase 2 Episode/Composite Judge contract | `pnpm verify:streaming-phase2:local` |
+| Running Kafka/Flink shadow pipeline | `pnpm verify:streaming-runtime` |
+| OSV supply-chain snapshot and assessment contract | `pnpm verify:supply-chain:local` |
+| Package-install trigger and installed-environment inventory | `pnpm build:api && pnpm verify:supply-chain-install-trigger && pnpm verify:workspace-installed-inventory` |
 | Generic JSON, CloudEvents, and OTLP ingest | `pnpm verify:ingest-protocols:local` |
 | Management auth | `pnpm verify:management-auth:local` |
 | Operations lifecycle | `pnpm verify:operations-lifecycle:local` |

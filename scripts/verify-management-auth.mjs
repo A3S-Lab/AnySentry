@@ -29,6 +29,8 @@ const expectedProtectedRoutes = [
   'PUT notifications/routes/:routeId',
   'POST objectives',
   'PUT objectives/:objectiveId',
+  'POST supply-chain/workspaces/:workspaceId/scan',
+  'POST supply-chain/workspaces/:workspaceId/assess',
   'PUT config',
   'POST config/simulate',
 ];
@@ -113,6 +115,8 @@ function protectedWriteProbes(id) {
     { route: 'PUT notifications/routes/:routeId', label: 'notification route update', method: 'PUT', path: `/notifications/routes/${id}-missing-route`, body: { name: `${id} route updated`, enabled: false, channelIds: [], kinds: ['source'] } },
     { route: 'POST objectives', label: 'objective create', method: 'POST', path: '/objectives', body: { name: `${id} objective`, enabled: true, targetType: 'source', targetId: `${id}-source`, metric: 'active_alerts', comparator: 'lte', threshold: 0, severity: 'medium' } },
     { route: 'PUT objectives/:objectiveId', label: 'objective update', method: 'PUT', path: `/objectives/${id}-missing-objective`, body: { name: `${id} objective updated`, enabled: false, threshold: 1 } },
+    { route: 'POST supply-chain/workspaces/:workspaceId/scan', label: 'supply-chain manual scan', method: 'POST', path: `/supply-chain/workspaces/${id}-missing-workspace/scan`, body: { reason: 'manual' } },
+    { route: 'POST supply-chain/workspaces/:workspaceId/assess', label: 'supply-chain manual assessment', method: 'POST', path: `/supply-chain/workspaces/${id}-missing-workspace/assess` },
     { route: 'PUT config', label: 'policy update', method: 'PUT', path: '/config', body: {} },
     { route: 'POST config/simulate', label: 'policy simulation', method: 'POST', path: '/config/simulate', body: { timeType: 'last_30d', limit: 1, policy: {} } },
   ];

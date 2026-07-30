@@ -12,6 +12,7 @@ import {
 } from './async-judgment.types';
 import { redisConnection } from './judgment-queue.service';
 import { isL3AgentTimeout, L3AgentPool } from './l3-agent-pool';
+import { parseL3Decision } from './l3-decision-parser';
 import { buildFastAcl } from './policy-config';
 
 const role = process.env.ANYSENTRY_WORKER_ROLE;
@@ -20,14 +21,19 @@ const resultQueue = new Queue<DecisionResultJob>(DECISION_RESULTS_QUEUE, { conne
 const l3Queue = new Queue<L3JudgeJob>(L3_JOBS_QUEUE, { connection });
 const resultRedis = new IORedis(process.env.ANYSENTRY_REDIS_URL || 'redis://redis:6379/0', { maxRetriesPerRequest: null });
 const sentryCache = new Map<string, Sentry>();
+const l2ModelOverride = process.env.ANYSENTRY_L2_MODEL?.trim();
 const l3Concurrency = Number(process.env.ANYSENTRY_L3_CONCURRENCY || 2);
 const l3TimeoutMs = Number(process.env.ANYSENTRY_L3_TIMEOUT_MS || 60_000);
+const l3RetryTimeoutMs = Math.max(
+  l3TimeoutMs,
+  Number(process.env.ANYSENTRY_L3_RETRY_TIMEOUT_MS || l3TimeoutMs),
+);
 const l3Attempts = Math.max(1, Number(process.env.ANYSENTRY_L3_ATTEMPTS || 2));
 const l3Pool = role === 'l3'
   ? new L3AgentPool({
       size: l3Concurrency,
-      timeoutMs: l3TimeoutMs,
-      executionTimeoutMs: Math.max(1_000, l3TimeoutMs - 5_000),
+      timeoutMs: l3RetryTimeoutMs,
+      executionTimeoutMs: Math.max(1_000, l3RetryTimeoutMs - 5_000),
       // Reuse the process-wide Agent, but never reuse a Session/Memory Store across events.
       maxJobsPerSession: 1,
       maxSessionAgeMs: 30 * 60_000,
@@ -67,7 +73,14 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
     let sentry = sentryCache.get(input.policyVersion);
     if (!sentry) {
       const fastPolicy = input.policy.llm
-        ? { ...input.policy, llm: { ...input.policy.llm, timeoutS: Math.min(input.policy.llm.timeoutS, 45) } }
+        ? {
+            ...input.policy,
+            llm: {
+              ...input.policy.llm,
+              model: l2ModelOverride || input.policy.llm.model,
+              timeoutS: Math.min(input.policy.llm.timeoutS, 60),
+            },
+          }
         : input.policy;
       sentry = Sentry.create(buildFastAcl(fastPolicy));
       sentryCache.set(input.policyVersion, sentry);
@@ -174,17 +187,6 @@ function l3Prompt(input: L3JudgeJob): string {
     '<<UNTRUSTED>>';
 }
 
-function parseL3Decision(stdout: string): AsyncDecision {
-  const start = stdout.indexOf('{');
-  const end = stdout.lastIndexOf('}');
-  if (start < 0 || end < start) throw new Error('L3 returned no JSON verdict');
-  const parsed = JSON.parse(stdout.slice(start, end + 1)) as AsyncDecision;
-  if (!['allow', 'block'].includes(parsed.verdict)) throw new Error('L3 returned an invalid verdict');
-  if (!['low', 'medium', 'high', 'critical'].includes(parsed.severity)) throw new Error('L3 returned an invalid severity');
-  if (typeof parsed.reason !== 'string' || !parsed.reason.trim()) throw new Error('L3 returned no reason');
-  return { ...parsed, tier: 'Agent', reason: parsed.reason.slice(0, 2_000) };
-}
-
 function l3FailureReason(error: unknown): string {
   if (isL3AgentTimeout(error)) return error.message;
   return (error instanceof Error ? error.message.split('\n')[0] : String(error)).slice(0, 2_000);
@@ -202,16 +204,19 @@ async function l3Judge(job: Job<L3JudgeJob>): Promise<void> {
     }
     const agent = input.policy.agent;
     if (!agent || !l3Pool) throw new Error('L3 is not configured');
+    const attempt = attemptNumber(job.attemptsMade);
+    const attemptTimeoutMs = attempt === 1 ? l3TimeoutMs : l3RetryTimeoutMs;
     const run = await l3Pool.run(agent.skills, l3Prompt(input), (text) => {
       // Validate inside the pool so an invalid response quarantines this Session before BullMQ
       // starts the retry. Agent response text is intentionally never written to service logs.
       parseL3Decision(text);
-    });
+    }, { timeoutMs: attemptTimeoutMs });
     const decision = parseL3Decision(run.text);
     console.info('[l3-worker] judgment completed', JSON.stringify({
       evaluationId: input.evaluationId,
       actor: l3Actor(input),
-      attempt: attemptNumber(job.attemptsMade),
+      attempt,
+      timeoutMs: attemptTimeoutMs,
       poolWaitMs: run.poolWaitMs,
       agentRunMs: run.agentRunMs,
     }));
@@ -233,6 +238,7 @@ async function l3Judge(job: Job<L3JudgeJob>): Promise<void> {
     console.warn('[l3-worker] judgment attempt failed', JSON.stringify({
       evaluationId: input.evaluationId,
       attempt: attemptNumber(job.attemptsMade),
+      timeoutMs: attemptNumber(job.attemptsMade) === 1 ? l3TimeoutMs : l3RetryTimeoutMs,
       error: l3FailureReason(error),
     }));
     if (!finalAttempt(job)) throw error;

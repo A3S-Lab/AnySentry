@@ -4,5 +4,6 @@ dist/
 .DS_Store
 .env
 .env.local
+config/workspace-scanner.local.json
 .a3s/
 perf-results/

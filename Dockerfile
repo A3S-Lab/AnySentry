@@ -25,7 +25,11 @@ ARG PUBLIC_BASE_PATH=""
 ENV PUBLIC_BASE_PATH=${PUBLIC_BASE_PATH}
 RUN pnpm --filter @anysentry/web build \
  && pnpm --filter @anysentry/api build \
- && pnpm --filter @anysentry/api --prod deploy /out
+ && pnpm --filter @anysentry/api --prod deploy /out \
+ && node scripts/generate-production-component-manifest.mjs \
+      /out/node_modules \
+      /out/package.json \
+      /out/anysentry-production-components.json
 
 FROM ubuntu:24.04 AS runtime
 ARG PUBLIC_BASE_PATH=""
@@ -34,6 +38,7 @@ WORKDIR /app
 ENV NODE_ENV=production PORT=29653 ANYSENTRY_WEB_DIR=/app/web PUBLIC_BASE_PATH=${PUBLIC_BASE_PATH}
 COPY --from=build /out/node_modules ./node_modules
 COPY --from=build /out/dist ./dist
+COPY --from=build /out/anysentry-production-components.json ./anysentry-production-components.json
 COPY --from=build /src/apps/web/dist ./web
 COPY --from=build --chmod=755 /src/scripts/l3-agent.mjs /opt/anysentry/l3-agent.mjs
 COPY --from=build /src/skills/l3 /opt/anysentry/skills
