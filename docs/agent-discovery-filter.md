@@ -370,6 +370,10 @@ The Collector user-space target in stages 1-6 is implemented:
 - ProcessKey and direct cgroup caches, including numeric Observer fact compatibility and separate
   bootstrap/fallback/ancestry `/proc` counters;
 - Collector UI visibility and server-side event evidence search;
+- workload-aware risk-event identity: the readable Agent/Pod/container/service name is shown first,
+  confirmed and candidate identities use distinct name colors, and compact Kubernetes, Docker, or
+  local-service badges follow the name; confidence, stable IDs, workload metadata, and evidence are
+  expanded only in the clicked event detail;
 - real current-branch Observer -> forwarder -> API verification for host template, Docker
   template, unknown Docker behavior, Kubernetes Agent container, and Kubernetes sidecar.
 
@@ -422,4 +426,7 @@ target environment.
 - Snapshot/watch interruption fails open and reports an error counter.
 - `all`, `shadow`, and `agent` modes produce explainable, reconcilable counts.
 - Existing Sentry judgment and ClickHouse persistence remain unchanged.
+- Risk-event lists identify confirmed and candidate Agents by name color without replacing the
+  stable `agentScopeId`; deployment type is a compact badge and detailed attribution is available
+  after selecting the event.
 - No enforcement binary or blocking hook is started by the integrated deployment.
