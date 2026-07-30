@@ -1571,12 +1571,27 @@ function shortId(value?: string) {
   return value.length > 18 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value;
 }
 
-function eventDetailHref(event: AgentEventListItem) {
+function eventDetailHref(event: AgentEventListItem, timeFilter: SecurityTimeFilter) {
   const qs = new URLSearchParams({
     eventId: event.eventId,
-    traceId: event.traceId,
-    timeType: "last_3h",
+    timeType: timeFilter.timeType ?? "last_3h",
   });
+  if (timeFilter.startTime) qs.set("startTime", timeFilter.startTime);
+  if (timeFilter.endTime) qs.set("endTime", timeFilter.endTime);
+  if (event.traceId) qs.set("traceId", event.traceId);
+  if (event.runId) qs.set("runId", event.runId);
+  if (event.sessionId) qs.set("sessionId", event.sessionId);
+  if (event.agentId) qs.set("agentId", event.agentId);
+  if (event.workspacePath) qs.set("workspacePath", event.workspacePath);
+  if (event.eventKind) qs.set("eventKind", event.eventKind);
+  const sourceId =
+    event.sourceId ??
+    (typeof event.attributes.sourceId === "string" ? event.attributes.sourceId : undefined);
+  const collectorId =
+    event.collectorId ??
+    (typeof event.attributes.collectorId === "string" ? event.attributes.collectorId : undefined);
+  if (sourceId) qs.set("sourceId", sourceId);
+  if (collectorId) qs.set("collectorId", collectorId);
   return `/events?${qs.toString()}`;
 }
 
@@ -1672,6 +1687,7 @@ function AgentEventTimelinePanel({
   error,
   scope,
   tier,
+  timeFilter,
   onScopeChange,
   onTierChange,
 }: {
@@ -1679,6 +1695,7 @@ function AgentEventTimelinePanel({
   error?: string;
   scope: TimelineScope;
   tier: TimelineTierFilter;
+  timeFilter: SecurityTimeFilter;
   onScopeChange: (value: TimelineScope) => void;
   onTierChange: (value: TimelineTierFilter) => void;
 }) {
@@ -1713,7 +1730,7 @@ function AgentEventTimelinePanel({
           <EmptyState label="暂无事件明细" />
         ) : (
           <div className="overflow-x-auto">
-            <div className="grid min-w-[1070px] grid-cols-[96px_88px_minmax(240px,1.4fr)_minmax(150px,0.9fr)_minmax(150px,0.9fr)_66px_82px_76px] gap-3 border-b border-white/10 pb-2 text-xs text-zinc-500">
+            <div className="grid min-w-[1140px] grid-cols-[96px_88px_minmax(240px,1.4fr)_minmax(150px,0.9fr)_minmax(150px,0.9fr)_66px_82px_76px_62px] gap-3 border-b border-white/10 pb-2 text-xs text-zinc-500">
               <span>时间</span>
               <span>类型</span>
               <span>事件</span>
@@ -1722,13 +1739,14 @@ function AgentEventTimelinePanel({
               <span className="text-center">研判</span>
               <span className="text-right">风险</span>
               <span className="text-center">处置</span>
+              <span className="text-right">操作</span>
             </div>
-            <div className="min-w-[1070px] divide-y divide-white/8">
+            <div className="min-w-[1140px] divide-y divide-white/8">
               {items.map((event) => (
                 <Link
                   key={event.eventId}
-                  to={eventDetailHref(event)}
-                  className="grid grid-cols-[96px_88px_minmax(240px,1.4fr)_minmax(150px,0.9fr)_minmax(150px,0.9fr)_66px_82px_76px] items-center gap-3 py-3 text-sm"
+                  to={eventDetailHref(event, timeFilter)}
+                  className="group grid grid-cols-[96px_88px_minmax(240px,1.4fr)_minmax(150px,0.9fr)_minmax(150px,0.9fr)_66px_82px_76px_62px] items-center gap-3 py-3 text-sm transition hover:bg-white/[0.03]"
                 >
                   <span className="font-mono text-xs text-zinc-500">{formatDate(event.at)}</span>
                   <span className="flex min-w-0">
@@ -1758,6 +1776,9 @@ function AgentEventTimelinePanel({
                   </span>
                   <span className="flex justify-center">
                     <VerdictPill verdict={event.verdict} />
+                  </span>
+                  <span className="text-right text-xs font-semibold text-teal-300 transition group-hover:text-teal-200">
+                    详情 →
                   </span>
                 </Link>
               ))}
@@ -1945,6 +1966,7 @@ export default function SecurityMonitorPage() {
               error={data?.errors.events}
               scope={timelineScope}
               tier={timelineTier}
+              timeFilter={filter}
               onScopeChange={setTimelineScope}
               onTierChange={setTimelineTier}
             />

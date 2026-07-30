@@ -262,7 +262,7 @@ function EdgeDetail({
     );
   }
 
-  const eventQs = new URLSearchParams();
+  const eventQs = new URLSearchParams({ timeType });
   if (edge.sampleEventId) eventQs.set("eventId", edge.sampleEventId);
   const edgeAgentId = source?.agentId ?? target?.agentId;
   const edgeWorkspacePath = source?.workspacePath ?? target?.workspacePath ?? routeWorkspacePath;
@@ -342,7 +342,7 @@ function EdgeDetail({
           <Button asChild size="sm" className="h-8 bg-teal-500 text-[#07100c] hover:bg-teal-400">
             <Link to={`/events?${eventQs.toString()}`}>
               <Search className="size-3.5" />
-              事件
+              查看事件
             </Link>
           </Button>
           {edgeAgentId ? (

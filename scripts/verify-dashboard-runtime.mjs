@@ -14,6 +14,7 @@ const managementRoutes = [
   '/events?runId=dashboard-smoke-run',
   '/events?eventKind=ToolExec',
   '/agents?agentId=dashboard-smoke-agent&workspacePath=repo://dashboard-smoke',
+  '/agents?timeType=last_1d&agentId=dashboard-smoke-agent&workspacePath=repo://dashboard-smoke&focus=review&eventId=dashboard-smoke-event',
   '/agents?userId=dashboard-smoke-user',
   '/workspaces?workspacePath=repo://dashboard-smoke',
   '/capabilities',
@@ -395,7 +396,17 @@ async function verifyDashboardSourceContracts() {
       agentsPage.includes('securityCenterApi.reviewAgent(selectedAgent.agentId') &&
       agentsPage.includes('原始事件会继续保留') &&
       agentsPage.includes('判定非 Agent') &&
-      agentsPage.includes('人工身份裁决'),
+      agentsPage.includes('人工身份裁决') &&
+      agentsPage.includes('aria-label="确认人工身份裁决"') &&
+      agentsPage.includes('<details className="group rounded-md') &&
+      agentsPage.includes('身份信息配置') &&
+      !agentsPage.includes('window.confirm') &&
+      !agentsPage.includes('Codex') &&
+      agentEventsPage.includes('focus: "review"') &&
+      agentEventsPage.includes('进入资产审核') &&
+      securityMonitorPage.includes('if (event.agentId) qs.set("agentId", event.agentId)') &&
+      securityMonitorPage.includes('详情 →') &&
+      topologyPage.includes('查看事件'),
     {
       hasBackendRoute: securityController.includes("@Put('agents/:agentId/review')"),
       hasAudits:
@@ -407,6 +418,20 @@ async function verifyDashboardSourceContracts() {
         agentsPage.includes('原始事件会继续保留') &&
         agentsPage.includes('判定非 Agent') &&
         agentsPage.includes('人工身份裁决'),
+      hasInlineReviewConfirmation:
+        agentsPage.includes('aria-label="确认人工身份裁决"') &&
+        !agentsPage.includes('window.confirm') &&
+        !agentsPage.includes('Codex'),
+      hasCollapsedIdentityConfig:
+        agentsPage.includes('<details className="group rounded-md') &&
+        agentsPage.includes('身份信息配置'),
+      hasReviewHandoff:
+        agentEventsPage.includes('focus: "review"') &&
+        agentEventsPage.includes('进入资产审核'),
+      hasRuntimeEventHandoff:
+        securityMonitorPage.includes('if (event.agentId) qs.set("agentId", event.agentId)') &&
+        securityMonitorPage.includes('详情 →') &&
+        topologyPage.includes('查看事件'),
     },
   );
   assert(

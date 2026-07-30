@@ -9,7 +9,9 @@ import {
   BellRing,
   Bot,
   CalendarClock,
+  ChevronDown,
   Clock3,
+  CircleCheck,
   EyeOff,
   FileCheck2,
   FileText,
@@ -20,7 +22,9 @@ import {
   RotateCcw,
   Save,
   Search,
+  Settings2,
   ShieldAlert,
+  ShieldQuestion,
   Target,
   TerminalSquare,
   UserCheck,
@@ -98,6 +102,8 @@ interface AgentMetadataDraft {
   tags: string;
   note: string;
 }
+
+type PendingReviewDecision = "confirmed_agent" | "non_agent" | "clear";
 
 const CATEGORY_LABEL: Record<AgentEventCategory, string> = {
   tool: "工具",
@@ -362,18 +368,32 @@ function AgentDetail({
   draft,
   saving,
   reviewing,
+  pendingReview,
+  reviewError,
+  reviewNotice,
+  reviewFocused,
+  reviewSourceEventHref,
   onDraftChange,
   onSaveMetadata,
-  onReview,
+  onRequestReview,
+  onCancelReview,
+  onConfirmReview,
 }: {
   agent?: AgentInventoryItem;
   timeType: SecurityTimeType;
   draft: AgentMetadataDraft;
   saving: boolean;
   reviewing: boolean;
+  pendingReview: PendingReviewDecision | null;
+  reviewError?: string;
+  reviewNotice?: string;
+  reviewFocused: boolean;
+  reviewSourceEventHref?: string;
   onDraftChange: (patch: Partial<AgentMetadataDraft>) => void;
   onSaveMetadata: () => void;
-  onReview: (decision: "confirmed_agent" | "non_agent" | "clear") => void;
+  onRequestReview: (decision: PendingReviewDecision) => void;
+  onCancelReview: () => void;
+  onConfirmReview: () => void;
 }) {
   if (!agent) {
     return (
@@ -387,6 +407,39 @@ function AgentDetail({
   const sourceRows = countRows(agent.sourceCounts, SOURCE_LABEL);
   const primaryName = agentPrimaryName(agent);
   const runtimeLabel = agentRuntimeLabel(agent);
+  const configuredMetadataCount = [
+    agent.displayName,
+    agent.owner,
+    agent.team,
+    agent.environment,
+    agent.criticality,
+    agent.note,
+    agent.tags.length > 0 ? agent.tags.join(",") : "",
+  ].filter(Boolean).length;
+  const reviewConfirmation = pendingReview === "confirmed_agent"
+    ? {
+        title: "确认 Agent 身份",
+        description: agent.workloadRef?.systemdUnit?.startsWith("session-")
+          ? "该裁决将作用于当前运行范围，其中可能包含多个智能体进程、终端和普通命令。请先核对工作负载与识别证据。"
+          : "确认后，后续同一稳定身份的事件将按已确认 Agent 归因，历史事件保持不变。",
+        action: "确认是 Agent",
+        actionClassName: "bg-emerald-500 text-[#07100c] hover:bg-emerald-400",
+      }
+    : pendingReview === "non_agent"
+      ? {
+          title: "确认排除该候选",
+          description: "后续常规事件可由 Collector 按非 Agent 处理；已采集的历史事件和审计记录会继续保留。",
+          action: "确认判定非 Agent",
+          actionClassName: "bg-slate-200 text-slate-950 hover:bg-white",
+        }
+      : pendingReview === "clear"
+        ? {
+            title: "确认撤销人工结论",
+            description: "撤销后，该身份将恢复自动发现与证据评分，不会删除现有事件或历史裁决审计。",
+            action: "确认撤销",
+            actionClassName: "bg-zinc-200 text-zinc-950 hover:bg-white",
+          }
+        : undefined;
 
   return (
     <section className="rounded-[8px] border border-white/10 bg-[#111612]/92">
@@ -409,28 +462,40 @@ function AgentDetail({
           <FieldValue label="内部 Scope" value={agent.agentId} />
           <FieldValue label="Workspace" value={agent.workspacePath} />
           <FieldValue label="User" value={agent.userId} />
-          <FieldValue label="Owner" value={agent.owner} />
-          <FieldValue label="Team" value={agent.team} />
-          <FieldValue label="Environment" value={agent.environment} />
           <FieldValue label="First Seen" value={formatDate(agent.firstSeen)} />
           <FieldValue label="Last Seen" value={formatDate(agent.lastSeen)} />
           <FieldValue label="Last Event" value={agent.lastEventSubject} />
         </div>
 
-        <div className="rounded-md border border-amber-400/20 bg-amber-500/[0.06] p-3">
+        <div
+          id="agent-review"
+          className={cn(
+            "scroll-mt-4 rounded-md border border-amber-400/20 bg-amber-500/[0.06] p-3 transition-shadow",
+            reviewFocused && "ring-1 ring-amber-300/50 ring-offset-2 ring-offset-[#111612]",
+          )}
+        >
           <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
             <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-2">
                 <UserCheck className="size-4 text-amber-200" />
                 <h3 className="text-sm font-semibold text-zinc-100">人工身份裁决</h3>
                 <Pill className={classificationClass(agent.classification)}>{CLASSIFICATION_LABEL[agent.classification]}</Pill>
+                {reviewSourceEventHref ? (
+                  <Link
+                    to={reviewSourceEventHref}
+                    className="inline-flex items-center gap-1 text-[11px] font-semibold text-teal-300 hover:text-teal-200"
+                  >
+                    <Search className="size-3" />
+                    返回来源事件
+                  </Link>
+                ) : null}
               </div>
               <p className="mt-2 text-xs leading-5 text-zinc-400">
                 原始事件会继续保留。确认后按 Agent 归因；判定非 Agent 后，Collector 收到身份快照将过滤该稳定工作负载的后续常规事件。
               </p>
               {agent.workloadRef?.systemdUnit?.startsWith("session-") ? (
                 <p className="mt-1 text-xs leading-5 text-amber-200/80">
-                  当前身份覆盖整个 {agent.workloadRef.systemdUnit}，其中可能包含多个 Codex、VS Code 和普通终端；细粒度进程树拆分完成前请谨慎裁决。
+                  当前身份覆盖整个 {agent.workloadRef.systemdUnit}，其中可能包含多个智能体进程、终端和普通命令；细粒度进程树拆分完成前请谨慎裁决。
                 </p>
               ) : null}
               <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-zinc-500">
@@ -451,8 +516,8 @@ function AgentDetail({
               <Button
                 type="button"
                 size="sm"
-                disabled={reviewing}
-                onClick={() => onReview("confirmed_agent")}
+                disabled={reviewing || Boolean(pendingReview)}
+                onClick={() => onRequestReview("confirmed_agent")}
                 className="h-8 bg-emerald-500 text-[#07100c] hover:bg-emerald-400"
               >
                 {reviewing ? <LoaderCircle className="size-3.5 animate-spin" /> : <BadgeCheck className="size-3.5" />}
@@ -462,8 +527,8 @@ function AgentDetail({
                 type="button"
                 variant="secondary"
                 size="sm"
-                disabled={reviewing}
-                onClick={() => onReview("non_agent")}
+                disabled={reviewing || Boolean(pendingReview)}
+                onClick={() => onRequestReview("non_agent")}
                 className="h-8 border border-slate-400/20 bg-slate-500/10 text-slate-200 hover:bg-slate-500/20"
               >
                 <Ban className="size-3.5" />
@@ -474,8 +539,8 @@ function AgentDetail({
                   type="button"
                   variant="ghost"
                   size="sm"
-                  disabled={reviewing}
-                  onClick={() => onReview("clear")}
+                  disabled={reviewing || Boolean(pendingReview)}
+                  onClick={() => onRequestReview("clear")}
                   className="h-8 text-zinc-400 hover:bg-white/5 hover:text-zinc-100"
                 >
                   <RotateCcw className="size-3.5" />
@@ -484,63 +549,128 @@ function AgentDetail({
               ) : null}
             </div>
           </div>
+          {reviewNotice ? (
+            <div className="mt-3 flex items-start gap-2 rounded-md border border-emerald-400/20 bg-emerald-500/10 px-3 py-2 text-xs leading-5 text-emerald-100">
+              <CircleCheck className="mt-0.5 size-3.5 shrink-0" />
+              <span>{reviewNotice}</span>
+            </div>
+          ) : null}
+          {reviewError ? (
+            <div className="mt-3 flex items-start gap-2 rounded-md border border-rose-400/20 bg-rose-500/10 px-3 py-2 text-xs leading-5 text-rose-100">
+              <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+              <span>{reviewError}</span>
+            </div>
+          ) : null}
+          {reviewConfirmation ? (
+            <div
+              role="group"
+              aria-label="确认人工身份裁决"
+              className="mt-3 rounded-md border border-amber-300/25 bg-[#17150d] px-3 py-3"
+            >
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                <div className="flex min-w-0 items-start gap-2.5">
+                  <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full border border-amber-300/25 bg-amber-400/10">
+                    <ShieldQuestion className="size-3.5 text-amber-200" />
+                  </span>
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-zinc-100">{reviewConfirmation.title}</p>
+                    <p className="mt-1 text-xs leading-5 text-zinc-400">{reviewConfirmation.description}</p>
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center justify-end gap-2">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    disabled={reviewing}
+                    onClick={onCancelReview}
+                    className="h-8 text-zinc-400 hover:bg-white/5 hover:text-zinc-100"
+                  >
+                    返回
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={reviewing}
+                    onClick={onConfirmReview}
+                    className={cn("h-8", reviewConfirmation.actionClassName)}
+                  >
+                    {reviewing ? <LoaderCircle className="size-3.5 animate-spin" /> : <BadgeCheck className="size-3.5" />}
+                    {reviewConfirmation.action}
+                  </Button>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </div>
 
-        <div className="rounded-md border border-white/10 bg-white/[0.03] p-3">
-          <div className="mb-3 flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2">
-              <UserCheck className="size-4 text-teal-200" />
-              <h3 className="text-sm font-semibold text-zinc-100">资产管理</h3>
+        <details className="group rounded-md border border-white/10 bg-white/[0.03]">
+          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-3 [&::-webkit-details-marker]:hidden">
+            <div className="flex min-w-0 items-center gap-2">
+              <Settings2 className="size-4 shrink-0 text-teal-200" />
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-zinc-100">身份信息配置</h3>
+                <p className="mt-0.5 truncate text-[11px] text-zinc-500">
+                  {configuredMetadataCount > 0
+                    ? `已配置 ${configuredMetadataCount} 项${agent.owner ? ` · ${agent.owner}` : ""}${agent.environment ? ` · ${agent.environment}` : ""}`
+                    : "未配置 · 展开后设置显示名、归属与环境"}
+                </p>
+              </div>
             </div>
-            {agent.metadataUpdatedAt ? <span className="font-mono text-[11px] text-zinc-600">{formatDate(agent.metadataUpdatedAt)}</span> : null}
+            <div className="flex shrink-0 items-center gap-2">
+              {agent.metadataUpdatedAt ? <span className="hidden font-mono text-[11px] text-zinc-600 sm:inline">{formatDate(agent.metadataUpdatedAt)}</span> : null}
+              <ChevronDown className="size-4 text-zinc-500 transition-transform group-open:rotate-180" />
+            </div>
+          </summary>
+          <div className="border-t border-white/10 p-3">
+            <div className="grid gap-3 md:grid-cols-3">
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-zinc-400">显示名</span>
+                <Input value={draft.displayName} onChange={(event) => onDraftChange({ displayName: event.target.value })} className="h-9 border-white/10 bg-white/5 text-xs" />
+              </label>
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-zinc-400">负责人</span>
+                <Input value={draft.owner} onChange={(event) => onDraftChange({ owner: event.target.value })} className="h-9 border-white/10 bg-white/5 text-xs" />
+              </label>
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-zinc-400">团队</span>
+                <Input value={draft.team} onChange={(event) => onDraftChange({ team: event.target.value })} className="h-9 border-white/10 bg-white/5 text-xs" />
+              </label>
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-zinc-400">环境</span>
+                <Input value={draft.environment} onChange={(event) => onDraftChange({ environment: event.target.value })} placeholder="prod / staging / dev" className="h-9 border-white/10 bg-white/5 text-xs" />
+              </label>
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-zinc-400">重要性</span>
+                <Select value={draft.criticality || "unset"} onValueChange={(next) => onDraftChange({ criticality: next === "unset" ? "" : next as AgentCriticality })}>
+                  <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {CRITICALITY_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </label>
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-zinc-400">标签</span>
+                <Input value={draft.tags} onChange={(event) => onDraftChange({ tags: event.target.value })} placeholder="pci, prod, external" className="h-9 border-white/10 bg-white/5 text-xs" />
+              </label>
+            </div>
+            <div className="mt-3 grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-zinc-400">备注</span>
+                <Input value={draft.note} onChange={(event) => onDraftChange({ note: event.target.value })} className="h-9 border-white/10 bg-white/5 text-xs" />
+              </label>
+              <Button type="button" onClick={onSaveMetadata} disabled={saving} className="mt-5 h-9 bg-teal-500 text-[#07100c] hover:bg-teal-400">
+                {saving ? <LoaderCircle className="size-3.5 animate-spin" /> : <Save className="size-3.5" />}
+                保存
+              </Button>
+            </div>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              {agent.criticality ? <Pill className={criticalityClass(agent.criticality)}>重要性 {CRITICALITY_LABEL[agent.criticality]}</Pill> : null}
+              {agent.environment ? <Pill className="border-sky-400/30 bg-sky-500/10 text-sky-100">{agent.environment}</Pill> : null}
+              {agent.tags.map((tag) => <Pill key={tag} className="border-white/10 bg-white/5 text-zinc-200">{tag}</Pill>)}
+            </div>
           </div>
-          <div className="grid gap-3 md:grid-cols-3">
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-medium text-zinc-400">显示名</span>
-              <Input value={draft.displayName} onChange={(event) => onDraftChange({ displayName: event.target.value })} className="h-9 border-white/10 bg-white/5 text-xs" />
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-medium text-zinc-400">负责人</span>
-              <Input value={draft.owner} onChange={(event) => onDraftChange({ owner: event.target.value })} className="h-9 border-white/10 bg-white/5 text-xs" />
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-medium text-zinc-400">团队</span>
-              <Input value={draft.team} onChange={(event) => onDraftChange({ team: event.target.value })} className="h-9 border-white/10 bg-white/5 text-xs" />
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-medium text-zinc-400">环境</span>
-              <Input value={draft.environment} onChange={(event) => onDraftChange({ environment: event.target.value })} placeholder="prod / staging / dev" className="h-9 border-white/10 bg-white/5 text-xs" />
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-medium text-zinc-400">重要性</span>
-              <Select value={draft.criticality || "unset"} onValueChange={(next) => onDraftChange({ criticality: next === "unset" ? "" : next as AgentCriticality })}>
-                <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {CRITICALITY_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
-                </SelectContent>
-              </Select>
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-medium text-zinc-400">标签</span>
-              <Input value={draft.tags} onChange={(event) => onDraftChange({ tags: event.target.value })} placeholder="pci, prod, external" className="h-9 border-white/10 bg-white/5 text-xs" />
-            </label>
-          </div>
-          <div className="mt-3 grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-medium text-zinc-400">备注</span>
-              <Input value={draft.note} onChange={(event) => onDraftChange({ note: event.target.value })} className="h-9 border-white/10 bg-white/5 text-xs" />
-            </label>
-            <Button type="button" onClick={onSaveMetadata} disabled={saving} className="mt-5 h-9 bg-teal-500 text-[#07100c] hover:bg-teal-400">
-              {saving ? <LoaderCircle className="size-3.5 animate-spin" /> : <Save className="size-3.5" />}
-              保存
-            </Button>
-          </div>
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            {agent.criticality ? <Pill className={criticalityClass(agent.criticality)}>重要性 {CRITICALITY_LABEL[agent.criticality]}</Pill> : null}
-            {agent.environment ? <Pill className="border-sky-400/30 bg-sky-500/10 text-sky-100">{agent.environment}</Pill> : null}
-            {agent.tags.map((tag) => <Pill key={tag} className="border-white/10 bg-white/5 text-zinc-200">{tag}</Pill>)}
-          </div>
-        </div>
+        </details>
 
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           <MetricTile label="事件" value={agent.eventCount} tone="border-white/10 bg-white/[0.03] text-zinc-100" />
@@ -654,6 +784,8 @@ function AgentDetail({
 export default function AgentsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
+  const routeStartTime = searchParams.get("startTime") ?? "";
+  const routeEndTime = searchParams.get("endTime") ?? "";
   const [healthState, setHealthState] = useState<AgentHealthState | "all">((searchParams.get("healthState") as AgentHealthState) || "all");
   const [queryText, setQueryText] = useState(searchParams.get("q") ?? "");
   const [selectedAgentId, setSelectedAgentId] = useState(searchParams.get("agentId") ?? "");
@@ -662,16 +794,23 @@ export default function AgentsPage() {
   const [metadataDraft, setMetadataDraft] = useState<AgentMetadataDraft>(() => draftFromAgent());
   const [savingMetadata, setSavingMetadata] = useState(false);
   const [reviewingAgent, setReviewingAgent] = useState(false);
+  const [pendingReview, setPendingReview] = useState<PendingReviewDecision | null>(null);
+  const [reviewError, setReviewError] = useState("");
+  const [reviewNotice, setReviewNotice] = useState("");
+  const reviewFocused = searchParams.get("focus") === "review";
+  const reviewSourceEventId = searchParams.get("eventId") ?? "";
 
   const query = useMemo<AgentInventoryQuery>(() => ({
     timeType,
+    startTime: timeType === "custom" ? clean(routeStartTime) : undefined,
+    endTime: timeType === "custom" ? clean(routeEndTime) : undefined,
     healthState,
     q: clean(queryText),
     agentId: clean(selectedAgentId),
     workspacePath: clean(selectedWorkspacePath),
     userId: clean(userId),
     limit: 200,
-  }), [healthState, queryText, selectedAgentId, selectedWorkspacePath, timeType, userId]);
+  }), [healthState, queryText, routeEndTime, routeStartTime, selectedAgentId, selectedWorkspacePath, timeType, userId]);
 
   const { data, loading, refresh } = useRequest(() => securityCenterApi.agentInventory(query), {
     refreshDeps: [query],
@@ -683,6 +822,18 @@ export default function AgentsPage() {
     const items = data?.items ?? [];
     return items.find((item) => item.agentId === selectedAgentId && item.workspacePath === selectedWorkspacePath) ?? items[0];
   }, [data, selectedAgentId, selectedWorkspacePath]);
+  const reviewSourceEventHref = useMemo(() => {
+    if (!reviewSourceEventId || !selectedAgent) return undefined;
+    const params = new URLSearchParams({
+      timeType,
+      eventId: reviewSourceEventId,
+      agentId: selectedAgent.agentId,
+      workspacePath: selectedAgent.workspacePath,
+    });
+    if (timeType === "custom" && routeStartTime) params.set("startTime", routeStartTime);
+    if (timeType === "custom" && routeEndTime) params.set("endTime", routeEndTime);
+    return `/events?${params.toString()}`;
+  }, [reviewSourceEventId, routeEndTime, routeStartTime, selectedAgent, timeType]);
 
   useEffect(() => {
     setMetadataDraft(draftFromAgent(selectedAgent));
@@ -699,11 +850,24 @@ export default function AgentsPage() {
     selectedAgent?.tags.join("|"),
   ]);
 
+  useEffect(() => {
+    if (!reviewFocused || !selectedAgent) return;
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById("agent-review")?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [reviewFocused, selectedAgent?.agentId, selectedAgent?.workspacePath]);
+
   const selectAgent = (agent: AgentInventoryItem) => {
+    setPendingReview(null);
+    setReviewError("");
+    setReviewNotice("");
     setSelectedAgentId(agent.agentId);
     setSelectedWorkspacePath(agent.workspacePath);
     const next = new URLSearchParams();
     next.set("timeType", timeType);
+    if (timeType === "custom" && routeStartTime) next.set("startTime", routeStartTime);
+    if (timeType === "custom" && routeEndTime) next.set("endTime", routeEndTime);
     next.set("agentId", agent.agentId);
     next.set("workspacePath", agent.workspacePath);
     if (healthState !== "all") next.set("healthState", healthState);
@@ -718,6 +882,9 @@ export default function AgentsPage() {
     setSelectedAgentId("");
     setSelectedWorkspacePath("");
     setUserId("");
+    setPendingReview(null);
+    setReviewError("");
+    setReviewNotice("");
     setSearchParams({});
   };
 
@@ -741,22 +908,24 @@ export default function AgentsPage() {
     }
   };
 
-  const reviewAgent = async (decision: "confirmed_agent" | "non_agent" | "clear") => {
-    if (!selectedAgent) return;
-    if (
-      decision === "non_agent" &&
-      !window.confirm("判定为非 Agent 后，Collector 将过滤这个稳定工作负载的后续常规事件。历史事件会保留，是否继续？")
-    ) {
-      return;
-    }
-    if (
-      decision === "confirmed_agent" &&
-      selectedAgent.workloadRef?.systemdUnit?.startsWith("session-") &&
-      !window.confirm(`当前候选覆盖整个 ${selectedAgent.workloadRef.systemdUnit}，其中可能包含多个进程。仍要确认整个范围为 Agent 吗？`)
-    ) {
-      return;
-    }
+  const requestReview = (decision: PendingReviewDecision) => {
+    setReviewError("");
+    setReviewNotice("");
+    setPendingReview(decision);
+  };
+
+  const cancelReview = () => {
+    if (reviewingAgent) return;
+    setPendingReview(null);
+    setReviewError("");
+  };
+
+  const reviewAgent = async () => {
+    if (!selectedAgent || !pendingReview) return;
+    const decision = pendingReview;
     setReviewingAgent(true);
+    setReviewError("");
+    setReviewNotice("");
     try {
       await securityCenterApi.reviewAgent(selectedAgent.agentId, {
         workspacePath: selectedAgent.workspacePath,
@@ -768,6 +937,16 @@ export default function AgentsPage() {
         note: metadataDraft.note,
       });
       await refresh();
+      setPendingReview(null);
+      setReviewNotice(
+        decision === "confirmed_agent"
+          ? "已确认 Agent 身份，新的归因快照将同步给 Collector。"
+          : decision === "non_agent"
+            ? "已排除该候选，历史事件仍可继续检索和复核。"
+            : "已撤销人工结论，身份恢复自动发现。",
+      );
+    } catch (error) {
+      setReviewError(error instanceof Error ? error.message : "身份裁决失败，请稍后重试。");
     } finally {
       setReviewingAgent(false);
     }
@@ -804,6 +983,7 @@ export default function AgentsPage() {
             <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
             <SelectContent>
               {TIME_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
+              {timeType === "custom" ? <SelectItem value="custom">自定义范围</SelectItem> : null}
             </SelectContent>
           </Select>
           <Select value={healthState} onValueChange={(next) => setHealthState(next as AgentHealthState | "all")}>
@@ -872,9 +1052,16 @@ export default function AgentsPage() {
                 draft={metadataDraft}
                 saving={savingMetadata}
                 reviewing={reviewingAgent}
+                pendingReview={pendingReview}
+                reviewError={reviewError}
+                reviewNotice={reviewNotice}
+                reviewFocused={reviewFocused}
+                reviewSourceEventHref={reviewSourceEventHref}
                 onDraftChange={(patch) => setMetadataDraft((current) => ({ ...current, ...patch }))}
                 onSaveMetadata={saveMetadata}
-                onReview={reviewAgent}
+                onRequestReview={requestReview}
+                onCancelReview={cancelReview}
+                onConfirmReview={reviewAgent}
               />
               <section className="rounded-[8px] border border-white/10 bg-[#111612]/92 p-4">
                 <div className="mb-3 flex items-center gap-2">

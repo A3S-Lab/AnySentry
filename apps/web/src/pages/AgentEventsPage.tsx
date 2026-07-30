@@ -10,6 +10,7 @@ import {
   Search,
   ShieldAlert,
   TerminalSquare,
+  UserCheck,
   X,
 } from "lucide-react";
 import { useMemo, useState } from "react";
@@ -178,7 +179,17 @@ function AttributeList({ event }: { event?: AgentEventListItem }) {
   );
 }
 
-function EventDetail({ event, timeType }: { event?: AgentEventListItem; timeType: SecurityTimeType }) {
+function EventDetail({
+  event,
+  timeType,
+  startTime,
+  endTime,
+}: {
+  event?: AgentEventListItem;
+  timeType: SecurityTimeType;
+  startTime?: string;
+  endTime?: string;
+}) {
   if (!event) {
     return (
       <section className="rounded-[8px] border border-white/10 bg-[#111612]/92">
@@ -210,6 +221,15 @@ function EventDetail({ event, timeType }: { event?: AgentEventListItem; timeType
   });
   if (eventSourceId) evidenceQs.set("sourceId", eventSourceId);
   if (eventCollectorId) evidenceQs.set("collectorId", eventCollectorId);
+  const agentQs = new URLSearchParams({
+    timeType,
+    agentId: event.agentId,
+    workspacePath: event.workspacePath,
+    focus: "review",
+    eventId: event.eventId,
+  });
+  if (startTime) agentQs.set("startTime", startTime);
+  if (endTime) agentQs.set("endTime", endTime);
 
   return (
     <section className="rounded-[8px] border border-white/10 bg-[#111612]/92">
@@ -305,6 +325,14 @@ function EventDetail({ event, timeType }: { event?: AgentEventListItem; timeType
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {event.agentId && event.workspacePath ? (
+            <Button asChild size="sm" className="h-8 bg-amber-400 text-[#171006] hover:bg-amber-300">
+              <Link to={`/agents?${agentQs.toString()}`}>
+                <UserCheck className="size-3.5" />
+                进入资产审核
+              </Link>
+            </Button>
+          ) : null}
           <Button asChild size="sm" className="h-8 bg-teal-500 text-[#07100c] hover:bg-teal-400">
             <Link to={`/topology?${topologyQs.toString()}`}>
               <GitBranch className="size-3.5" />
@@ -386,6 +414,8 @@ function clean(value: string) {
 export default function AgentEventsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
+  const routeStartTime = searchParams.get("startTime") ?? "";
+  const routeEndTime = searchParams.get("endTime") ?? "";
   const [sourceId, setSourceId] = useState(searchParams.get("sourceId") ?? "");
   const [collectorId, setCollectorId] = useState(searchParams.get("collectorId") ?? "");
   const [workspacePath, setWorkspacePath] = useState(searchParams.get("workspacePath") ?? "");
@@ -400,6 +430,8 @@ export default function AgentEventsPage() {
 
   const query = useMemo<AgentEventQuery>(() => ({
     timeType,
+    startTime: timeType === "custom" ? clean(routeStartTime) : undefined,
+    endTime: timeType === "custom" ? clean(routeEndTime) : undefined,
     eventId: clean(selectedEventId),
     sourceId: clean(sourceId),
     collectorId: clean(collectorId),
@@ -412,7 +444,7 @@ export default function AgentEventsPage() {
     eventCategory: eventCategory === "all" ? undefined : eventCategory,
     verdict: verdict === "all" ? undefined : verdict,
     limit: 120,
-  }), [agentId, collectorId, eventCategory, eventKind, runId, selectedEventId, sessionId, sourceId, timeType, traceId, verdict, workspacePath]);
+  }), [agentId, collectorId, eventCategory, eventKind, routeEndTime, routeStartTime, runId, selectedEventId, sessionId, sourceId, timeType, traceId, verdict, workspacePath]);
 
   const { data, loading, refresh } = useRequest(() => securityCenterApi.agentEvents(query), {
     refreshDeps: [query],
@@ -427,10 +459,17 @@ export default function AgentEventsPage() {
 
   const { data: timeline, loading: timelineLoading } = useRequest(
     () => selectedEvent
-      ? securityCenterApi.agentTimeline({ timeType, eventId: selectedEvent.eventId, traceId: selectedEvent.traceId, limit: 240 })
+      ? securityCenterApi.agentTimeline({
+          timeType,
+          startTime: timeType === "custom" ? clean(routeStartTime) : undefined,
+          endTime: timeType === "custom" ? clean(routeEndTime) : undefined,
+          eventId: selectedEvent.eventId,
+          traceId: selectedEvent.traceId,
+          limit: 240,
+        })
       : Promise.resolve({ traceId: "", items: [], updateTime: "" }),
     {
-      refreshDeps: [selectedEvent?.traceId, timeType],
+      refreshDeps: [routeEndTime, routeStartTime, selectedEvent?.traceId, timeType],
       pollingInterval: 10000,
       pollingWhenHidden: false,
     },
@@ -442,6 +481,8 @@ export default function AgentEventsPage() {
     setSelectedEventId(event.eventId);
     const next = new URLSearchParams();
     next.set("timeType", timeType);
+    if (timeType === "custom" && routeStartTime) next.set("startTime", routeStartTime);
+    if (timeType === "custom" && routeEndTime) next.set("endTime", routeEndTime);
     next.set("eventId", event.eventId);
     next.set("traceId", event.traceId);
     next.set("runId", event.runId);
@@ -504,6 +545,7 @@ export default function AgentEventsPage() {
             <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
             <SelectContent>
               {TIME_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
+              {timeType === "custom" ? <SelectItem value="custom">自定义范围</SelectItem> : null}
             </SelectContent>
           </Select>
           <Input value={sourceId} onChange={(event) => setSourceId(event.target.value)} placeholder="sourceId" className="h-9 border-white/10 bg-white/5 font-mono text-xs" />
@@ -568,7 +610,12 @@ export default function AgentEventsPage() {
             )}
           </section>
 
-          <EventDetail event={selectedEvent} timeType={timeType} />
+          <EventDetail
+            event={selectedEvent}
+            timeType={timeType}
+            startTime={timeType === "custom" ? routeStartTime : undefined}
+            endTime={timeType === "custom" ? routeEndTime : undefined}
+          />
 
           <div className="space-y-4">
             <section className="rounded-[8px] border border-white/10 bg-[#111612]/92 p-4">
