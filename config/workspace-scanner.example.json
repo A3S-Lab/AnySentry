@@ -1,0 +1,21 @@
+{
+  "scannerId": "scanner-node-a",
+  "allowedRoots": [
+    "/home/example/code"
+  ],
+  "workspaces": [
+    {
+      "repositoryId": "repo-anysentry",
+      "workspaceId": "wsp-node-a-anysentry",
+      "displayName": "AnySentry on node-a",
+      "localPath": "/home/example/code/AnySentry",
+      "environmentId": "development",
+      "deploymentImages": [
+        {
+          "reference": "ghcr.io/a3s-lab/anysentry:latest",
+          "componentManifestPath": "/app/anysentry-production-components.json"
+        }
+      ]
+    }
+  ]
+}

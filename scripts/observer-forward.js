@@ -12,9 +12,11 @@
 // remove pseudo-filesystem file noise; override those prefixes via FORWARD_DROP_PATHS.
 const http = require('node:http');
 const https = require('node:https');
+const crypto = require('node:crypto');
 const readline = require('node:readline');
 const { AgentAttributor } = require('./observer-agent-attribution');
 const { ToolExecDeduper } = require('./observer-event-dedup');
+const { InfrastructureRootResolver } = require('./observer-infrastructure-roots');
 
 const target = new URL(process.env.ANYSENTRY_INGEST_URL || 'http://localhost:29653/security-center/ingest');
 function defaultHeartbeatUrl(ingestUrl) {
@@ -42,8 +44,7 @@ const heartbeatTarget = new URL(process.env.ANYSENTRY_HEARTBEAT_URL || defaultHe
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_INFLIGHT });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_INFLIGHT });
 const attributor = new AgentAttributor();
-const bootstrap = attributor.seedFromProc();
-console.error(`[observer-forward] process snapshot: scanned=${bootstrap.scanned}; agent_roots=${bootstrap.roots}; agent_descendants=${bootstrap.descendants}`);
+const infrastructureResolver = new InfrastructureRootResolver();
 const toolExecDeduper = new ToolExecDeduper({
   windowMs: process.env.FORWARD_DEDUP_WINDOW_MS,
   maxKeys: process.env.FORWARD_MAX_DEDUP_KEYS,
@@ -53,10 +54,20 @@ let inflight = 0;
 let outputDropped = 0;
 let errorCount = 0;
 let eventKindCounts = Object.create(null);
-let attributionCounts = { observed: 0, agent: 0, unknown: 0, filteredNonAgent: 0, deduplicated: 0 };
+const forwarderInstanceId = crypto.randomUUID();
+let sourceEventSequence = 0;
+let attributionCounts = {
+  observed: 0,
+  agent: 0,
+  workspaceConflict: 0,
+  unknown: 0,
+  infrastructure: 0,
+  filteredNonAgent: 0,
+  deduplicated: 0,
+};
 let closing = false;
 let heartbeatTimer;
-const rl = readline.createInterface({ input: process.stdin });
+let rl;
 
 function isNoise(o) {
   const fa = o.event && (o.event.FileAccess || o.event.FileDelete);
@@ -74,12 +85,29 @@ function bumpEventKind(o) {
   eventKindCounts[kind] = (eventKindCounts[kind] || 0) + 1;
 }
 
-function sourceFields() {
+function sourceEventId(line) {
+  sourceEventSequence += 1;
+  return `ose_${crypto.createHash('sha256')
+    .update(COLLECTOR_ID)
+    .update('\0')
+    .update(NODE_NAME)
+    .update('\0')
+    .update(forwarderInstanceId)
+    .update('\0')
+    .update(String(sourceEventSequence))
+    .update('\0')
+    .update(line)
+    .digest('hex')
+    .slice(0, 24)}`;
+}
+
+function sourceFields(inferredWorkspacePath = '') {
+  const workspacePath = WORKSPACE_PATH || inferredWorkspacePath;
   return {
     ...(SOURCE_ID ? { sourceId: SOURCE_ID } : {}),
     ...(SOURCE_NAME ? { sourceName: SOURCE_NAME } : {}),
     ...(SOURCE_TYPE ? { sourceType: SOURCE_TYPE } : {}),
-    ...(WORKSPACE_PATH ? { workspacePath: WORKSPACE_PATH } : {}),
+    ...(workspacePath ? { workspacePath } : {}),
   };
 }
 
@@ -140,7 +168,15 @@ function sendHeartbeat(done = () => {}) {
   const errors = errorCount;
   const classifications = attributionCounts;
   eventKindCounts = Object.create(null);
-  attributionCounts = { observed: 0, agent: 0, unknown: 0, filteredNonAgent: 0, deduplicated: 0 };
+  attributionCounts = {
+    observed: 0,
+    agent: 0,
+    workspaceConflict: 0,
+    unknown: 0,
+    infrastructure: 0,
+    filteredNonAgent: 0,
+    deduplicated: 0,
+  };
   outputDropped = 0;
   errorCount = 0;
   const status = dropped > 0 || errors > 0 ? 'degraded' : 'ok';
@@ -156,7 +192,7 @@ function sendHeartbeat(done = () => {}) {
       queueDepth: inflight,
       outputDropped: dropped,
       errorCount: errors,
-      message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; agent=${classifications.agent}; unknown=${classifications.unknown}; filtered_non_agent=${classifications.filteredNonAgent}; deduplicated=${classifications.deduplicated}; output_drops=${dropped}; errors=${errors}`,
+      message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; agent=${classifications.agent}; workspace_conflict=${classifications.workspaceConflict}; unknown=${classifications.unknown}; filtered_infrastructure=${classifications.infrastructure}; filtered_non_agent=${classifications.filteredNonAgent}; deduplicated=${classifications.deduplicated}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
     },
     5000,
@@ -170,13 +206,8 @@ function sendHeartbeat(done = () => {}) {
   );
 }
 
-if (HEARTBEAT_SECS > 0) {
-  sendHeartbeat();
-  heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_SECS * 1000);
-  heartbeatTimer.unref();
-}
-
 function closeTransports() {
+  infrastructureResolver.close();
   httpAgent.destroy();
   httpsAgent.destroy();
 }
@@ -198,7 +229,7 @@ function flushAndClose() {
   waitForInflight();
 }
 
-rl.on('line', (raw) => {
+function handleLine(raw) {
   const line = raw.trim();
   if (!line) return;
   let o;
@@ -209,7 +240,12 @@ rl.on('line', (raw) => {
     return;
   }
   const classification = attributor.classify(o);
-  attributionCounts[classification.state === 'non_agent' ? 'filteredNonAgent' : classification.state]++;
+  const countKey = classification.state === 'non_agent' ? 'filteredNonAgent' : classification.state;
+  attributionCounts[countKey] = (attributionCounts[countKey] || 0) + 1;
+  if (classification.workspaceConflict) attributionCounts.workspaceConflict++;
+  // A trusted deployment label explicitly opts these process trees out. Drop them before HTTP
+  // ingest in every scope while unresolved identity remains fail-open.
+  if (classification.state === 'infrastructure') return;
   if (FORWARD_SCOPE === 'agent' && classification.state === 'non_agent') return;
   // Preserve the legacy pseudo-filesystem noise filter in all/shadow modes. In agent mode,
   // unknown events must survive so incomplete lineage never becomes silent data loss.
@@ -226,23 +262,54 @@ rl.on('line', (raw) => {
       errorCount++;
     }
     inflight = Math.max(0, inflight - 1);
-    if (!closing && inflight < MAX_INFLIGHT) rl.resume();
+    if (!closing && inflight < MAX_INFLIGHT) rl?.resume();
   };
 
   postJson(
     target,
     {
       line,
+      sourceEventId: sourceEventId(line),
       ...(classification.state === 'agent' ? { attribution: classification.attribution } : {}),
       ...(COLLECTOR_ID ? { collectorId: COLLECTOR_ID } : {}),
       ...(NODE_NAME ? { nodeName: NODE_NAME } : {}),
-      ...sourceFields(),
+      ...sourceFields(classification.state === 'agent' ? classification.workspacePath : ''),
     },
     5000,
     finish,
   );
 
-  if (inflight >= MAX_INFLIGHT) rl.pause(); // stop reading until requests drain
-});
+  if (inflight >= MAX_INFLIGHT) rl?.pause(); // stop reading until requests drain
+}
 
-rl.on('close', flushAndClose);
+async function start() {
+  const infrastructure = await infrastructureResolver.resolve();
+  attributor.setInfrastructureRoots(infrastructure.roots);
+  const bootstrap = attributor.seedFromProc();
+  console.error(
+    `[observer-forward] process snapshot: scanned=${bootstrap.scanned}; ` +
+    `agent_roots=${bootstrap.roots}; agent_descendants=${bootstrap.descendants}; ` +
+    `infrastructure_roots=${bootstrap.infrastructureRoots}; ` +
+    `infrastructure_descendants=${bootstrap.infrastructureDescendants}` +
+    (infrastructure.error ? `; infrastructure_discovery=${infrastructure.error}` : ''),
+  );
+  infrastructureResolver.start((next) => {
+    attributor.setInfrastructureRoots(next.roots);
+  });
+
+  if (HEARTBEAT_SECS > 0) {
+    sendHeartbeat();
+    heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_SECS * 1000);
+    heartbeatTimer.unref();
+  }
+
+  rl = readline.createInterface({ input: process.stdin });
+  rl.on('line', handleLine);
+  rl.on('close', flushAndClose);
+}
+
+void start().catch((error) => {
+  console.error('[observer-forward] startup failed:', error instanceof Error ? error.message : String(error));
+  closeTransports();
+  process.exitCode = 1;
+});

@@ -7,6 +7,8 @@ const DEFAULT_ROOT_NAMES = 'codex,a3s,a3s-code,a3s code,claude,claude-code,claud
 const DEFAULT_MAX_PROCS = 20_000;
 const DEFAULT_MAX_ANCESTORS = 32;
 const RECORD_TTL_MS = 30 * 60_000;
+const WORKSPACE_CACHE_SIZE = 4096;
+const EPHEMERAL_WORKSPACE_ROOTS = ['/tmp', '/var/tmp', '/proc', '/sys', '/run', '/dev'];
 
 function positiveInt(value) {
   const parsed = Number(value);
@@ -29,6 +31,34 @@ function canonicalAgentName(value) {
   return normalized;
 }
 
+function canonicalWorkspacePath(value) {
+  const normalized = text(value);
+  if (!normalized || !path.posix.isAbsolute(normalized) || normalized === '/') return undefined;
+  return path.posix.normalize(normalized).replace(/\/+$/, '');
+}
+
+function isPathWithin(candidate, parent) {
+  return candidate === parent || candidate.startsWith(`${parent}/`);
+}
+
+function isEphemeralWorkspacePath(value) {
+  const normalized = canonicalWorkspacePath(value);
+  return Boolean(normalized && EPHEMERAL_WORKSPACE_ROOTS.some((root) => isPathWithin(normalized, root)));
+}
+
+function findGitWorkspace(value, fsApi = fs) {
+  let current = canonicalWorkspacePath(value);
+  if (!current || isEphemeralWorkspacePath(current)) return undefined;
+  while (current && current !== '/') {
+    try {
+      fsApi.lstatSync(path.join(current, '.git'));
+      return current;
+    } catch {}
+    current = path.posix.dirname(current);
+  }
+  return undefined;
+}
+
 function eventPayload(observerEvent) {
   const entries = Object.entries(observerEvent?.event ?? {});
   return entries.length > 0 && entries[0][1] && typeof entries[0][1] === 'object' ? entries[0][1] : {};
@@ -37,6 +67,14 @@ function eventPayload(observerEvent) {
 function argvText(value) {
   if (Array.isArray(value)) return value.map(String).join(' ');
   return text(value);
+}
+
+function containerIdFromCgroup(value) {
+  const cgroup = text(value);
+  if (!cgroup) return undefined;
+  return cgroup.match(/(?:^|\/)docker[-/]([a-f0-9]{12,64})(?:\.scope)?(?:$|\/)/i)?.[1]
+    || cgroup.match(/(?:^|\/)(?:cri-containerd|crio)[-/]([a-f0-9]{12,64})(?:\.scope)?(?:$|\/)/i)?.[1]
+    || cgroup.match(/(?:^|\/)([a-f0-9]{64})(?:\.scope)?(?:$|\/)/i)?.[1];
 }
 
 function readProcInfo(pid, procRoot = '/proc') {
@@ -52,13 +90,17 @@ function readProcInfo(pid, procRoot = '/proc') {
     let tgid;
     let exe = '';
     let argv = '';
+    let cgroup = '';
+    let cwd = '';
     try {
       const status = fs.readFileSync(path.join(base, 'status'), 'utf8');
       tgid = positiveInt(status.match(/^Tgid:\s+(\d+)/m)?.[1]);
     } catch {}
     try { exe = fs.readlinkSync(path.join(base, 'exe')); } catch {}
     try { argv = fs.readFileSync(path.join(base, 'cmdline'), 'utf8').split('\0').filter(Boolean).join(' '); } catch {}
-    return { pid, tgid, ppid, startTime, comm, exe, argv };
+    try { cgroup = fs.readFileSync(path.join(base, 'cgroup'), 'utf8'); } catch {}
+    try { cwd = fs.readlinkSync(path.join(base, 'cwd')); } catch {}
+    return { pid, tgid, ppid, startTime, comm, exe, argv, cgroup, cwd };
   } catch {
     return undefined;
   }
@@ -83,9 +125,16 @@ class AgentAttributor {
     this.now = typeof options.now === 'function' ? options.now : Date.now;
     this.readProc = typeof options.readProc === 'function' ? options.readProc : (pid) => readProcInfo(pid, this.procRoot);
     this.listPids = typeof options.listPids === 'function' ? options.listPids : () => listProcPids(this.procRoot);
+    this.findWorkspaceRoot = typeof options.findWorkspaceRoot === 'function'
+      ? options.findWorkspaceRoot
+      : findGitWorkspace;
+    this.workspaceCache = new Map();
     this.rootNames = new Set((options.rootNames || process.env.ANYSENTRY_AGENT_ROOT_NAMES || DEFAULT_ROOT_NAMES)
       .split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
     this.procs = new Map();
+    this.infrastructureRoots = new Map();
+    this.infrastructureContainers = new Map();
+    if (Array.isArray(options.infrastructureRoots)) this.setInfrastructureRoots(options.infrastructureRoots);
   }
 
   seedFromProc() {
@@ -100,19 +149,52 @@ class AgentAttributor {
     for (const info of snapshot.values()) {
       const agentId = this.matchAgentExecutable(info);
       if (!agentId) continue;
-      this.remember({ ...info, state: 'agent', agentId, rootPid: info.tgid || info.pid, lastSeen: now });
+      this.remember({
+        ...info,
+        state: 'agent',
+        agentId,
+        rootPid: info.tgid || info.pid,
+        workspacePath: this.resolveWorkspace(info.cwd).workspacePath,
+        lastSeen: now,
+      });
       roots++;
     }
 
     let descendants = 0;
+    let infrastructureDescendants = 0;
     for (const info of snapshot.values()) {
-      if (this.procs.get(info.pid)?.state === 'agent') continue;
+      if (['agent', 'infrastructure'].includes(this.procs.get(info.pid)?.state)) continue;
       const scope = this.resolveSnapshotScope(info, snapshot);
       if (!scope) continue;
-      this.remember({ ...info, state: 'agent', agentId: scope.agentId, rootPid: scope.rootPid, lastSeen: now });
-      descendants++;
+      if (scope.state === 'agent') {
+        this.remember({
+          ...info,
+          state: 'agent',
+          agentId: scope.agentId,
+          rootPid: scope.rootPid,
+          ...this.resolveWorkspace(info.cwd, scope.workspacePath),
+          lastSeen: now,
+        });
+        descendants++;
+      } else if (scope.state === 'infrastructure') {
+        this.remember({
+          ...info,
+          state: 'infrastructure',
+          rootPid: scope.rootPid,
+          serviceName: scope.serviceName,
+          containerId: scope.containerId,
+          lastSeen: now,
+        });
+        infrastructureDescendants++;
+      }
     }
-    return { scanned: snapshot.size, roots, descendants };
+    return {
+      scanned: snapshot.size,
+      roots,
+      descendants,
+      infrastructureRoots: this.infrastructureRoots.size,
+      infrastructureDescendants,
+    };
   }
 
   resolveSnapshotScope(info, snapshot) {
@@ -122,13 +204,18 @@ class AgentAttributor {
       if (visited.has(current.pid)) return undefined;
       visited.add(current.pid);
 
+      const containerScope = this.matchInfrastructure(current);
+      if (containerScope) return containerScope;
+
       const tgid = positiveInt(current.tgid);
       if (tgid && tgid !== current.pid) {
         const leader = this.procs.get(tgid);
-        if (leader?.state === 'agent') return { agentId: leader.agentId, rootPid: leader.rootPid };
+        if (leader?.state === 'agent') return this.agentScope(leader);
+        if (leader?.state === 'infrastructure') return this.infrastructureScope(leader);
       }
       const cached = this.procs.get(current.pid);
-      if (cached?.state === 'agent') return { agentId: cached.agentId, rootPid: cached.rootPid };
+      if (cached?.state === 'agent') return this.agentScope(cached);
+      if (cached?.state === 'infrastructure') return this.infrastructureScope(cached);
 
       const ppid = positiveInt(current.ppid);
       if (!ppid || ppid === 1) return undefined;
@@ -153,20 +240,69 @@ class AgentAttributor {
       comm: text(processInfo.comm) || live?.comm || text(observerEvent?.identity?.agent),
       exe: text(processInfo.exe) || live?.exe,
       argv: argvText(payload.argv) || live?.argv,
+      cgroup: text(processInfo.cgroup) || live?.cgroup,
+      cwd: text(processInfo.cwd) || text(payload.cwd) || live?.cwd,
     };
     this.discardReusedPid(current);
 
     const directAgent = this.matchAgent(current);
     if (directAgent) return this.finish(pid, this.rememberAgent(current, directAgent, pid, 'hint_only', 'argv'), exiting);
 
+    const directInfrastructure = this.matchInfrastructure(current);
+    if (directInfrastructure) {
+      return this.finish(
+        pid,
+        this.rememberInfrastructure(
+          current,
+          directInfrastructure.rootPid,
+          directInfrastructure.serviceName,
+          directInfrastructure.containerId,
+        ),
+        exiting,
+      );
+    }
+
     const existing = this.procs.get(pid);
-    if (existing?.state === 'agent') return this.finish(pid, this.agentResult(existing), exiting);
+    if (existing?.state === 'agent') {
+      // A short process can emit ToolExec and ProcessExit after /proc/<pid>/cwd has already
+      // disappeared. Preserve an earlier conflict decision for the same PID instead of silently
+      // turning the later event into an unresolved-but-trusted Agent event.
+      const workspace = canonicalWorkspacePath(current.cwd)
+        ? this.resolveWorkspace(current.cwd, existing.workspacePath)
+        : {
+            workspacePath: existing.workspacePath,
+            workspaceSource: existing.workspaceSource || 'unresolved',
+            workspaceConflict: existing.workspaceConflict === true,
+          };
+      Object.assign(existing, current, workspace, { lastSeen: now });
+      return this.finish(pid, this.agentResult(existing), exiting);
+    }
+    if (existing?.state === 'infrastructure') return this.finish(pid, this.infrastructureResult(existing), exiting);
 
     // Short-process events can arrive out of order. Re-evaluate negative cache entries when
     // a later event carries a usable parent, otherwise ProcessExit can hide the ToolExec lineage.
     const ancestry = this.resolveAncestry(current.ppid, now);
     if (ancestry.state === 'agent') {
-      return this.finish(pid, this.rememberAgent(current, ancestry.agentId, ancestry.rootPid, 'process_lineage', 'process_graph'), exiting);
+      return this.finish(
+        pid,
+        this.rememberAgent(
+          current,
+          ancestry.agentId,
+          ancestry.rootPid,
+          'process_lineage',
+          'process_graph',
+          ancestry.workspacePath,
+        ),
+        exiting,
+      );
+    }
+
+    if (ancestry.state === 'infrastructure') {
+      return this.finish(
+        pid,
+        this.rememberInfrastructure(current, ancestry.rootPid, ancestry.serviceName, ancestry.containerId),
+        exiting,
+      );
     }
 
     if (ancestry.state === 'non_agent') {
@@ -193,19 +329,52 @@ class AgentAttributor {
       visited.add(pid);
 
       const cached = this.procs.get(pid);
-      if (cached?.state === 'agent') return { state: 'agent', agentId: cached.agentId, rootPid: cached.rootPid };
+      if (cached?.state === 'agent') return this.agentScope(cached);
+      if (cached?.state === 'infrastructure') return this.infrastructureScope(cached);
       if (pid === 1) return { state: 'non_agent' };
 
       const live = this.readProc(pid);
       if (!live) return cached?.state === 'non_agent' ? { state: 'non_agent' } : { state: 'unknown' };
       this.discardReusedPid(live);
 
+      const containerScope = this.matchInfrastructure(live);
+      if (containerScope) {
+        this.remember({
+          ...live,
+          state: 'infrastructure',
+          rootPid: containerScope.rootPid,
+          serviceName: containerScope.serviceName,
+          containerId: containerScope.containerId,
+          lastSeen: now,
+        });
+        return containerScope;
+      }
+
       const tgid = positiveInt(live.tgid);
       if (tgid && tgid !== pid) {
         const leaderCached = this.procs.get(tgid);
         if (leaderCached?.state === 'agent') {
-          this.remember({ ...live, state: 'agent', agentId: leaderCached.agentId, rootPid: leaderCached.rootPid, lastSeen: now });
-          return { state: 'agent', agentId: leaderCached.agentId, rootPid: leaderCached.rootPid };
+          const scope = this.agentScope(leaderCached);
+          this.remember({
+            ...live,
+            state: 'agent',
+            agentId: scope.agentId,
+            rootPid: scope.rootPid,
+            ...this.resolveWorkspace(live.cwd, scope.workspacePath),
+            lastSeen: now,
+          });
+          return scope;
+        }
+        if (leaderCached?.state === 'infrastructure') {
+          this.remember({
+            ...live,
+            state: 'infrastructure',
+            rootPid: leaderCached.rootPid,
+            serviceName: leaderCached.serviceName,
+            containerId: leaderCached.containerId,
+            lastSeen: now,
+          });
+          return this.infrastructureScope(leaderCached);
         }
 
         const leader = this.readProc(tgid);
@@ -213,17 +382,34 @@ class AgentAttributor {
           this.discardReusedPid(leader);
           const leaderAgent = this.matchAgent(leader);
           if (leaderAgent) {
-            this.remember({ ...leader, state: 'agent', agentId: leaderAgent, rootPid: tgid, lastSeen: now });
-            this.remember({ ...live, state: 'agent', agentId: leaderAgent, rootPid: tgid, lastSeen: now });
-            return { state: 'agent', agentId: leaderAgent, rootPid: tgid };
+            const { workspacePath } = this.resolveWorkspace(leader.cwd);
+            const root = { ...leader, state: 'agent', agentId: leaderAgent, rootPid: tgid, workspacePath, lastSeen: now };
+            this.remember(root);
+            this.remember({
+              ...live,
+              state: 'agent',
+              agentId: leaderAgent,
+              rootPid: tgid,
+              ...this.resolveWorkspace(live.cwd, workspacePath),
+              lastSeen: now,
+            });
+            return this.agentScope(root);
           }
         }
       }
 
       const directAgent = this.matchAgent(live);
       if (directAgent) {
-        this.remember({ ...live, state: 'agent', agentId: directAgent, rootPid: pid, lastSeen: now });
-        return { state: 'agent', agentId: directAgent, rootPid: pid };
+        const root = {
+          ...live,
+          state: 'agent',
+          agentId: directAgent,
+          rootPid: pid,
+          workspacePath: this.resolveWorkspace(live.cwd).workspacePath,
+          lastSeen: now,
+        };
+        this.remember(root);
+        return this.agentScope(root);
       }
 
       this.remember({ ...live, state: 'unknown', lastSeen: now });
@@ -256,11 +442,13 @@ class AgentAttributor {
     return undefined;
   }
 
-  rememberAgent(info, agentId, rootPid, reason, source) {
-    const record = { ...info, state: 'agent', agentId, rootPid, lastSeen: this.now() };
+  rememberAgent(info, agentId, rootPid, reason, source, inheritedWorkspacePath) {
+    const workspace = this.resolveWorkspace(info.workspacePath || info.cwd, inheritedWorkspacePath);
+    const record = { ...info, state: 'agent', agentId, rootPid, ...workspace, lastSeen: this.now() };
     this.remember(record);
     return {
       state: 'agent',
+      ...workspace,
       attribution: {
         monitored: true,
         agentScopeId: agentId,
@@ -269,6 +457,7 @@ class AgentAttributor {
         confidence: source === 'process_graph' ? 0.9 : 0.85,
         reason,
         source,
+        ...(workspace.workspaceConflict ? { conflict: true } : {}),
       },
     };
   }
@@ -277,6 +466,9 @@ class AgentAttributor {
     record.lastSeen = this.now();
     return {
       state: 'agent',
+      workspacePath: record.workspacePath,
+      workspaceSource: record.workspaceSource,
+      workspaceConflict: record.workspaceConflict,
       attribution: {
         monitored: true,
         agentScopeId: record.agentId,
@@ -285,7 +477,121 @@ class AgentAttributor {
         confidence: 0.9,
         reason: 'process_lineage',
         source: 'process_graph',
+        ...(record.workspaceConflict ? { conflict: true } : {}),
       },
+    };
+  }
+
+  agentScope(record) {
+    return {
+      state: 'agent',
+      agentId: record.agentId,
+      rootPid: record.rootPid,
+      workspacePath: record.workspacePath,
+    };
+  }
+
+  cachedGitWorkspace(value) {
+    const normalized = canonicalWorkspacePath(value);
+    if (!normalized || isEphemeralWorkspacePath(normalized)) return undefined;
+    if (this.workspaceCache.has(normalized)) return this.workspaceCache.get(normalized) || undefined;
+    const workspacePath = canonicalWorkspacePath(this.findWorkspaceRoot(normalized));
+    if (this.workspaceCache.size >= WORKSPACE_CACHE_SIZE) this.workspaceCache.clear();
+    this.workspaceCache.set(normalized, workspacePath || null);
+    return workspacePath;
+  }
+
+  resolveWorkspace(ownValue, inheritedValue) {
+    const ownPath = canonicalWorkspacePath(ownValue);
+    const inheritedPath = canonicalWorkspacePath(inheritedValue);
+    const ownGitWorkspace = this.cachedGitWorkspace(ownPath);
+    if (ownGitWorkspace) {
+      return { workspacePath: ownGitWorkspace, workspaceSource: 'event_git_root', workspaceConflict: false };
+    }
+
+    if (!ownPath || isEphemeralWorkspacePath(ownPath)) {
+      return inheritedPath
+        ? { workspacePath: inheritedPath, workspaceSource: 'agent_root', workspaceConflict: false }
+        : { workspacePath: undefined, workspaceSource: 'unresolved', workspaceConflict: false };
+    }
+
+    if (!inheritedPath) {
+      return { workspacePath: ownPath, workspaceSource: 'event_cwd', workspaceConflict: false };
+    }
+
+    if (isPathWithin(ownPath, inheritedPath) || isPathWithin(inheritedPath, ownPath)) {
+      return { workspacePath: inheritedPath, workspaceSource: 'agent_root', workspaceConflict: false };
+    }
+
+    return { workspacePath: undefined, workspaceSource: 'conflict', workspaceConflict: true };
+  }
+
+  setInfrastructureRoots(roots) {
+    const next = new Map();
+    const containers = new Map();
+    for (const root of Array.isArray(roots) ? roots : []) {
+      const pid = positiveInt(root?.pid);
+      if (!pid) continue;
+      const live = this.readProc(pid);
+      const record = {
+        ...(live || {}),
+        pid,
+        startTime: live?.startTime,
+        state: 'infrastructure',
+        rootPid: pid,
+        serviceName: text(root.serviceName) || 'infrastructure',
+        containerId: text(root.containerId) || undefined,
+        lastSeen: this.now(),
+      };
+      next.set(pid, record);
+      if (record.containerId) containers.set(record.containerId, record);
+      const existing = this.procs.get(pid);
+      if (existing?.state !== 'agent') this.remember(record);
+    }
+    this.infrastructureRoots = next;
+    this.infrastructureContainers = containers;
+    return next.size;
+  }
+
+  matchInfrastructure(info) {
+    const observedId = containerIdFromCgroup(info?.cgroup);
+    if (!observedId) return undefined;
+    for (const [containerId, record] of this.infrastructureContainers) {
+      if (containerId.startsWith(observedId) || observedId.startsWith(containerId)) {
+        return this.infrastructureScope(record);
+      }
+    }
+    return undefined;
+  }
+
+  rememberInfrastructure(info, rootPid, serviceName, containerId) {
+    const record = {
+      ...info,
+      state: 'infrastructure',
+      rootPid,
+      serviceName,
+      containerId,
+      lastSeen: this.now(),
+    };
+    this.remember(record);
+    return this.infrastructureResult(record);
+  }
+
+  infrastructureScope(record) {
+    return {
+      state: 'infrastructure',
+      rootPid: record.rootPid,
+      serviceName: record.serviceName,
+      containerId: record.containerId,
+    };
+  }
+
+  infrastructureResult(record) {
+    record.lastSeen = this.now();
+    return {
+      ...this.infrastructureScope(record),
+      reason: 'infrastructure_root',
+      source: record.containerId ? 'docker_label' : 'configured_root',
     };
   }
 
@@ -313,4 +619,12 @@ class AgentAttributor {
   }
 }
 
-module.exports = { AgentAttributor, readProcInfo, listProcPids };
+module.exports = {
+  AgentAttributor,
+  canonicalWorkspacePath,
+  findGitWorkspace,
+  isEphemeralWorkspacePath,
+  containerIdFromCgroup,
+  readProcInfo,
+  listProcPids,
+};
