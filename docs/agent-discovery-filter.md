@@ -99,6 +99,12 @@ No LLM call is used in this detection path.
 The two modes are additive: an operator template gives immediate attribution, while framework
 discovery covers missing, incomplete, or newly introduced deployments.
 
+Set `ANYSENTRY_BUILTIN_AGENT_HINTS=off` on both the forwarder and API to disable the built-in
+Codex, A3S Code, and Claude Code executable/argv hints for behavior-only discovery experiments.
+`ANYSENTRY_AGENT_ROOT_NAMES` remains available for an explicit custom root-name set, and operator
+templates are independently disabled by leaving both template variables unset or by setting
+`ANYSENTRY_AGENT_TEMPLATES_JSON=[]`.
+
 ## Required properties
 
 1. Workload identity is evaluated before process-name heuristics.

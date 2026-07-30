@@ -21,6 +21,13 @@ function text(value) {
   return '';
 }
 
+function enabledValue(value, fallback = true) {
+  if (typeof value === 'boolean') return value;
+  const normalized = text(value).toLowerCase();
+  if (!normalized) return fallback;
+  return !['0', 'false', 'off', 'no', 'disabled'].includes(normalized);
+}
+
 function basename(value) {
   const normalized = text(value).toLowerCase();
   return normalized ? path.posix.basename(normalized) : '';
@@ -87,7 +94,15 @@ class AgentAttributor {
     this.now = typeof options.now === 'function' ? options.now : Date.now;
     this.readProc = typeof options.readProc === 'function' ? options.readProc : (pid) => readProcInfo(pid, this.procRoot);
     this.listPids = typeof options.listPids === 'function' ? options.listPids : () => listProcPids(this.procRoot);
-    this.rootNames = new Set((options.rootNames || process.env.ANYSENTRY_AGENT_ROOT_NAMES || DEFAULT_ROOT_NAMES)
+    this.builtinHintsEnabled = enabledValue(
+      options.builtinHintsEnabled ?? process.env.ANYSENTRY_BUILTIN_AGENT_HINTS,
+      true,
+    );
+    const configuredRootNames =
+      options.rootNames ??
+      process.env.ANYSENTRY_AGENT_ROOT_NAMES ??
+      (this.builtinHintsEnabled ? DEFAULT_ROOT_NAMES : '');
+    this.rootNames = new Set(text(configuredRootNames)
       .split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
     this.procs = new Map();
     this.tombstones = new Map();
@@ -401,6 +416,7 @@ class AgentAttributor {
   matchAgent(info) {
     const executableMatch = this.matchAgentExecutable(info);
     if (executableMatch) return executableMatch;
+    if (!this.builtinHintsEnabled) return undefined;
     const argv = text(info.argv).toLowerCase();
     if (!argv) return undefined;
     // Only the command prefix is identity evidence. Scanning every argument lets untrusted

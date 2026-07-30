@@ -252,6 +252,31 @@ function attributor(procEntries = []) {
 }
 
 {
+  const noBuiltinHints = new AgentAttributor({
+    builtinHintsEnabled: false,
+    rootNames: '',
+    readProc: () => undefined,
+    listPids: () => [],
+  });
+  const a3sCode = noBuiltinHints.classify(observerEvent({
+    pid: 880,
+    ppid: 1,
+    comm: 'a3s',
+    exe: '/usr/local/bin/a3s',
+    argv: ['a3s', 'code'],
+  }));
+  const claudeCode = noBuiltinHints.classify(observerEvent({
+    pid: 881,
+    ppid: 1,
+    comm: 'claude',
+    exe: '/usr/local/bin/claude',
+    argv: ['claude', 'code'],
+  }));
+  assert.notEqual(a3sCode.state, 'agent', 'a3s code must not match when built-in hints are disabled');
+  assert.notEqual(claudeCode.state, 'agent', 'Claude Code must not match when built-in hints are disabled');
+}
+
+{
   const cache = new WorkloadIdentityCache({ now: () => 10_000 });
   assert.equal(cache.replace({
     schemaVersion: 'anysentry.workload_identity_snapshot.v1',
