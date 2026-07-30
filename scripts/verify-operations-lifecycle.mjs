@@ -325,6 +325,60 @@ async function verifyOtherControlPlaneObjects(sourceId, channelSecret) {
     check: (audit) => audit.details?.agentId === agentId && audit.details?.criticality === 'high',
   });
 
+  const reviewed = await request(`/agents/${encodeURIComponent(agentId)}/review`, 'PUT', {
+    workspacePath,
+    decision: 'confirmed_agent',
+    identityKeys: [`container:${runId}-reviewed`, `${runId}-reviewed`],
+    physicalWorkloadId: `docker:test:${runId}`,
+    agentInstanceId: `container:${runId}-reviewed`,
+    workloadRef: {
+      environment: 'docker',
+      kind: 'container',
+      name: `${runId}-container`,
+      nodeName: `${runId}-node`,
+      containerName: `${runId}-container`,
+      containerImage: 'example/review-fixture:latest',
+    },
+    note: 'confirmed by lifecycle verifier',
+  }, actorHeaders);
+  assert(
+    'agent review persists a stable human confirmation',
+    reviewed.reviewDecision === 'confirmed_agent' &&
+      reviewed.reviewedBy?.includes(actorId) &&
+      reviewed.reviewIdentityKeys?.includes(`${runId}-reviewed`) &&
+      reviewed.reviewPhysicalWorkloadId === `docker:test:${runId}`,
+    reviewed,
+  );
+  await auditFor({
+    action: 'agent.review.updated',
+    resourceType: 'agent',
+    resourceId: `${workspacePath}:${agentId}`,
+    check: (audit) =>
+      audit.details?.decision === 'confirmed_agent' &&
+      audit.details?.identityKeyCount === 3,
+  });
+  const identitySnapshot = await request(`/identity/snapshot?nodeName=${encodeURIComponent(`${runId}-node`)}`);
+  assert(
+    'human review is exported to the Collector identity snapshot',
+    identitySnapshot.entries?.some((entry) =>
+      entry.classification === 'confirmed_agent' &&
+      entry.attributionSource === 'manual_review' &&
+      entry.ids?.includes(`${runId}-reviewed`)
+    ),
+    identitySnapshot,
+  );
+  const clearedReview = await request(`/agents/${encodeURIComponent(agentId)}/review`, 'PUT', {
+    workspacePath,
+    decision: 'clear',
+  }, actorHeaders);
+  assert('agent review can be cleared without deleting metadata', !clearedReview.reviewDecision && clearedReview.owner === `${runId}-agent-owner`, clearedReview);
+  await auditFor({
+    action: 'agent.review.cleared',
+    resourceType: 'agent',
+    resourceId: `${workspacePath}:${agentId}`,
+    check: (audit) => audit.details?.decision === 'clear',
+  });
+
   const startAt = new Date(Date.now() - 60_000).toISOString();
   const endAt = new Date(Date.now() + 3_600_000).toISOString();
   const maintenance = await request('/maintenance/windows', 'POST', {

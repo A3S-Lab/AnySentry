@@ -387,6 +387,29 @@ async function verifyDashboardSourceContracts() {
     },
   );
   assert(
+    'dashboard supports auditable human Agent confirmation and rejection without deleting raw events',
+    securityController.includes("@Put('agents/:agentId/review')") &&
+      securityController.includes("'agent.review.cleared'") &&
+      securityController.includes("'agent.review.updated'") &&
+      apiClient.includes('reviewAgent: (agentId: string, body: AgentReviewRequest)') &&
+      agentsPage.includes('securityCenterApi.reviewAgent(selectedAgent.agentId') &&
+      agentsPage.includes('原始事件会继续保留') &&
+      agentsPage.includes('判定非 Agent') &&
+      agentsPage.includes('人工身份裁决'),
+    {
+      hasBackendRoute: securityController.includes("@Put('agents/:agentId/review')"),
+      hasAudits:
+        securityController.includes("'agent.review.cleared'") &&
+        securityController.includes("'agent.review.updated'"),
+      hasApiClient: apiClient.includes('reviewAgent: (agentId: string, body: AgentReviewRequest)'),
+      hasReviewUi:
+        agentsPage.includes('securityCenterApi.reviewAgent(selectedAgent.agentId') &&
+        agentsPage.includes('原始事件会继续保留') &&
+        agentsPage.includes('判定非 Agent') &&
+        agentsPage.includes('人工身份裁决'),
+    },
+  );
+  assert(
     'dashboard AI Operator uses progressive planning, progressive evidence, and shared handoffs',
     operatorPage.includes('securityCenterApi.nextActionPlan(params)') &&
       operatorPage.includes('securityCenterApi.evidenceBundleCapability(evidenceBundleParams(action.evidence.bundleHint, action, timeType))') &&

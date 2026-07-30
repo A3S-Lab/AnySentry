@@ -581,6 +581,15 @@ export class AggregationService {
       const lvl = worstLevel(sorted);
       const [workspacePath, agentId] = key.split('\0');
       const metadata = this.agentMetadata.get(workspacePath, agentId);
+      const identityEvent =
+        [...sorted].reverse().find((event) => Boolean(event.attribution?.classification)) ??
+        last;
+      const attribution = identityEvent.attribution;
+      const classification =
+        metadata?.reviewDecision ??
+        attribution?.classification ??
+        'unknown';
+      const reviewed = Boolean(metadata?.reviewDecision);
       const openIncidentCount = openIncidents.get(key) ?? 0;
       const sinceLast = t - last.at;
       const healthState: T.AgentHealthState = openIncidentCount > 0
@@ -614,6 +623,26 @@ export class AggregationService {
         tags: metadata?.tags ?? [],
         note: metadata?.note,
         metadataUpdatedAt: metadata?.updatedAt ? iso(metadata.updatedAt) : undefined,
+        classification,
+        confidence: reviewed ? 1 : attribution?.confidence ?? 0,
+        attributionSource: reviewed ? 'manual_review' : attribution?.source ?? 'none',
+        attributionEvidence: reviewed
+          ? [
+              ...(attribution?.evidence ?? []),
+              `manual_review:${metadata?.reviewDecision}`,
+              ...(metadata?.reviewedBy ? [`manual_review:reviewer=${metadata.reviewedBy}`] : []),
+            ].slice(-16)
+          : attribution?.evidence ?? [],
+        physicalWorkloadId: metadata?.reviewPhysicalWorkloadId ?? attribution?.physicalWorkloadId,
+        agentInstanceId: metadata?.reviewAgentInstanceId ?? attribution?.agentInstanceId,
+        workloadRef: metadata?.reviewWorkloadRef ?? attribution?.workloadRef,
+        reviewDecision: metadata?.reviewDecision,
+        reviewedBy: metadata?.reviewedBy,
+        reviewedAt: metadata?.reviewedAt ? iso(metadata.reviewedAt) : undefined,
+        reviewNote: metadata?.reviewNote,
+        reviewIdentityKeys:
+          metadata?.reviewIdentityKeys ??
+          this.agentMetadata.identityKeysForEvent(identityEvent),
         firstSeen: iso(first.at),
         lastSeen: iso(last.at),
         healthState,
@@ -657,6 +686,23 @@ export class AggregationService {
           tags: metadata.tags,
           note: metadata.note,
           metadataUpdatedAt: metadata.updatedAt,
+          classification: metadata.reviewDecision ?? 'unknown',
+          confidence: metadata.reviewDecision ? 1 : 0,
+          attributionSource: metadata.reviewDecision ? 'manual_review' : 'none',
+          attributionEvidence: metadata.reviewDecision
+            ? [
+                `manual_review:${metadata.reviewDecision}`,
+                ...(metadata.reviewedBy ? [`manual_review:reviewer=${metadata.reviewedBy}`] : []),
+              ]
+            : [],
+          physicalWorkloadId: metadata.reviewPhysicalWorkloadId,
+          agentInstanceId: metadata.reviewAgentInstanceId,
+          workloadRef: metadata.reviewWorkloadRef,
+          reviewDecision: metadata.reviewDecision,
+          reviewedBy: metadata.reviewedBy,
+          reviewedAt: metadata.reviewedAt,
+          reviewNote: metadata.reviewNote,
+          reviewIdentityKeys: metadata.reviewIdentityKeys ?? [metadata.agentId.toLowerCase()],
           firstSeen: metadata.updatedAt,
           lastSeen: metadata.updatedAt,
           healthState: 'stale',

@@ -2,7 +2,10 @@ import { useRequest } from "ahooks";
 import dayjs from "dayjs";
 import {
   Activity,
+  AlertTriangle,
   ArrowLeft,
+  BadgeCheck,
+  Ban,
   BellRing,
   Bot,
   CalendarClock,
@@ -14,6 +17,7 @@ import {
   LoaderCircle,
   RefreshCw,
   Route,
+  RotateCcw,
   Save,
   Search,
   ShieldAlert,
@@ -31,6 +35,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import {
   type AgentEventCategory,
   type AgentEventSource,
+  type AgentClassification,
   type AgentCriticality,
   type AgentHealthState,
   type AgentInventoryItem,
@@ -75,6 +80,13 @@ const CRITICALITY_LABEL: Record<AgentCriticality, string> = {
   medium: "中",
   high: "高",
   critical: "关键",
+};
+
+const CLASSIFICATION_LABEL: Record<AgentClassification, string> = {
+  confirmed_agent: "已确认 Agent",
+  probable_agent: "候选 Agent",
+  unknown: "身份未确认",
+  non_agent: "非 Agent",
 };
 
 interface AgentMetadataDraft {
@@ -134,6 +146,13 @@ function criticalityClass(level?: AgentCriticality) {
   if (level === "medium") return "border-amber-400/30 bg-amber-500/10 text-amber-100";
   if (level === "low") return "border-teal-400/30 bg-teal-500/10 text-teal-100";
   return "border-white/10 bg-white/5 text-zinc-300";
+}
+
+function classificationClass(classification: AgentClassification) {
+  if (classification === "confirmed_agent") return "border-emerald-400/30 bg-emerald-500/10 text-emerald-100";
+  if (classification === "probable_agent") return "border-amber-400/30 bg-amber-500/10 text-amber-100";
+  if (classification === "non_agent") return "border-slate-500/30 bg-slate-500/10 text-slate-300";
+  return "border-white/10 bg-white/5 text-zinc-400";
 }
 
 function splitTags(value: string) {
@@ -303,15 +322,19 @@ function AgentDetail({
   timeType,
   draft,
   saving,
+  reviewing,
   onDraftChange,
   onSaveMetadata,
+  onReview,
 }: {
   agent?: AgentInventoryItem;
   timeType: SecurityTimeType;
   draft: AgentMetadataDraft;
   saving: boolean;
+  reviewing: boolean;
   onDraftChange: (patch: Partial<AgentMetadataDraft>) => void;
   onSaveMetadata: () => void;
+  onReview: (decision: "confirmed_agent" | "non_agent" | "clear") => void;
 }) {
   if (!agent) {
     return (
@@ -332,6 +355,7 @@ function AgentDetail({
           <h2 className="truncate text-sm font-semibold text-zinc-100">{agent.agentId}</h2>
         </div>
         <div className="flex items-center gap-2">
+          <Pill className={classificationClass(agent.classification)}>{CLASSIFICATION_LABEL[agent.classification]}</Pill>
           <Pill className={riskClass(agent.riskLevel)}>{agent.riskLevelText}</Pill>
           <Pill className={healthClass(agent.healthState)}>{HEALTH_LABEL[agent.healthState]}</Pill>
         </div>
@@ -348,6 +372,75 @@ function AgentDetail({
           <FieldValue label="First Seen" value={formatDate(agent.firstSeen)} />
           <FieldValue label="Last Seen" value={formatDate(agent.lastSeen)} />
           <FieldValue label="Last Event" value={agent.lastEventSubject} />
+        </div>
+
+        <div className="rounded-md border border-amber-400/20 bg-amber-500/[0.06] p-3">
+          <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <UserCheck className="size-4 text-amber-200" />
+                <h3 className="text-sm font-semibold text-zinc-100">人工身份裁决</h3>
+                <Pill className={classificationClass(agent.classification)}>{CLASSIFICATION_LABEL[agent.classification]}</Pill>
+              </div>
+              <p className="mt-2 text-xs leading-5 text-zinc-400">
+                原始事件会继续保留。确认后按 Agent 归因；判定非 Agent 后，Collector 收到身份快照将过滤该稳定工作负载的后续常规事件。
+              </p>
+              {agent.workloadRef?.systemdUnit?.startsWith("session-") ? (
+                <p className="mt-1 text-xs leading-5 text-amber-200/80">
+                  当前身份覆盖整个 {agent.workloadRef.systemdUnit}，其中可能包含多个 Codex、VS Code 和普通终端；细粒度进程树拆分完成前请谨慎裁决。
+                </p>
+              ) : null}
+              <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-zinc-500">
+                <span>physical={agent.physicalWorkloadId ?? "--"}</span>
+                <span>instance={agent.agentInstanceId ?? "--"}</span>
+                <span>keys={agent.reviewIdentityKeys.length}</span>
+                <span>source={agent.attributionSource}</span>
+              </div>
+              {agent.reviewDecision ? (
+                <p className="mt-2 text-xs text-zinc-400">
+                  人工结论：{CLASSIFICATION_LABEL[agent.reviewDecision]}
+                  {agent.reviewedBy ? ` · ${agent.reviewedBy}` : ""}
+                  {agent.reviewedAt ? ` · ${formatDate(agent.reviewedAt)}` : ""}
+                </p>
+              ) : null}
+            </div>
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              <Button
+                type="button"
+                size="sm"
+                disabled={reviewing}
+                onClick={() => onReview("confirmed_agent")}
+                className="h-8 bg-emerald-500 text-[#07100c] hover:bg-emerald-400"
+              >
+                {reviewing ? <LoaderCircle className="size-3.5 animate-spin" /> : <BadgeCheck className="size-3.5" />}
+                确认是 Agent
+              </Button>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                disabled={reviewing}
+                onClick={() => onReview("non_agent")}
+                className="h-8 border border-slate-400/20 bg-slate-500/10 text-slate-200 hover:bg-slate-500/20"
+              >
+                <Ban className="size-3.5" />
+                判定非 Agent
+              </Button>
+              {agent.reviewDecision ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  disabled={reviewing}
+                  onClick={() => onReview("clear")}
+                  className="h-8 text-zinc-400 hover:bg-white/5 hover:text-zinc-100"
+                >
+                  <RotateCcw className="size-3.5" />
+                  撤销裁决
+                </Button>
+              ) : null}
+            </div>
+          </div>
         </div>
 
         <div className="rounded-md border border-white/10 bg-white/[0.03] p-3">
@@ -525,6 +618,7 @@ export default function AgentsPage() {
   const [userId, setUserId] = useState(searchParams.get("userId") ?? "");
   const [metadataDraft, setMetadataDraft] = useState<AgentMetadataDraft>(() => draftFromAgent());
   const [savingMetadata, setSavingMetadata] = useState(false);
+  const [reviewingAgent, setReviewingAgent] = useState(false);
 
   const query = useMemo<AgentInventoryQuery>(() => ({
     timeType,
@@ -601,6 +695,38 @@ export default function AgentsPage() {
       await refresh();
     } finally {
       setSavingMetadata(false);
+    }
+  };
+
+  const reviewAgent = async (decision: "confirmed_agent" | "non_agent" | "clear") => {
+    if (!selectedAgent) return;
+    if (
+      decision === "non_agent" &&
+      !window.confirm("判定为非 Agent 后，Collector 将过滤这个稳定工作负载的后续常规事件。历史事件会保留，是否继续？")
+    ) {
+      return;
+    }
+    if (
+      decision === "confirmed_agent" &&
+      selectedAgent.workloadRef?.systemdUnit?.startsWith("session-") &&
+      !window.confirm(`当前候选覆盖整个 ${selectedAgent.workloadRef.systemdUnit}，其中可能包含多个进程。仍要确认整个范围为 Agent 吗？`)
+    ) {
+      return;
+    }
+    setReviewingAgent(true);
+    try {
+      await securityCenterApi.reviewAgent(selectedAgent.agentId, {
+        workspacePath: selectedAgent.workspacePath,
+        decision,
+        identityKeys: selectedAgent.reviewIdentityKeys,
+        physicalWorkloadId: selectedAgent.physicalWorkloadId,
+        agentInstanceId: selectedAgent.agentInstanceId,
+        workloadRef: selectedAgent.workloadRef,
+        note: metadataDraft.note,
+      });
+      await refresh();
+    } finally {
+      setReviewingAgent(false);
     }
   };
 
@@ -702,8 +828,10 @@ export default function AgentsPage() {
                 timeType={timeType}
                 draft={metadataDraft}
                 saving={savingMetadata}
+                reviewing={reviewingAgent}
                 onDraftChange={(patch) => setMetadataDraft((current) => ({ ...current, ...patch }))}
                 onSaveMetadata={saveMetadata}
+                onReview={reviewAgent}
               />
               <section className="rounded-[8px] border border-white/10 bg-[#111612]/92 p-4">
                 <div className="mb-3 flex items-center gap-2">

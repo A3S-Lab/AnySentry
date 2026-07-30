@@ -2908,6 +2908,43 @@ export class SecurityMonitoringController {
     return updated;
   }
 
+  @Put('agents/:agentId/review')
+  @RequireManagementAuth()
+  reviewAgent(@Param('agentId') agentId: string, @Body() body: T.AgentReviewRequest, @Headers() headers: HeaderBag) {
+    if (!['confirmed_agent', 'non_agent', 'clear'].includes(body.decision)) {
+      throw new BadRequestException('decision must be confirmed_agent, non_agent, or clear');
+    }
+    const actor = auditActor(headers);
+    const updated = this.agentMetadata.review(
+      agentId,
+      body,
+      actor.displayName ? `${actor.displayName} (${actor.id})` : actor.id,
+    );
+    this.agg.invalidateWindowCache();
+    this.audit.record({
+      actor,
+      action: body.decision === 'clear' ? 'agent.review.cleared' : 'agent.review.updated',
+      resourceType: 'agent',
+      resourceId: `${updated.workspacePath}:${updated.agentId}`,
+      summary:
+        body.decision === 'confirmed_agent'
+          ? `Agent confirmed by reviewer: ${updated.displayName || updated.agentId}`
+          : body.decision === 'non_agent'
+            ? `Candidate rejected by reviewer: ${updated.displayName || updated.agentId}`
+            : `Agent review cleared: ${updated.displayName || updated.agentId}`,
+      details: {
+        agentId: updated.agentId,
+        workspacePath: updated.workspacePath,
+        decision: updated.reviewDecision ?? 'clear',
+        identityKeyCount: updated.reviewIdentityKeys?.length ?? 0,
+        physicalWorkloadId: updated.reviewPhysicalWorkloadId,
+        agentInstanceId: updated.reviewAgentInstanceId,
+        noteUpdated: body.note !== undefined,
+      },
+    });
+    return updated;
+  }
+
   @Post('agents/topology')
   @HttpCode(200)
   agentTopology(@Body() f: T.AgentTopologyQuery) {
@@ -4006,7 +4043,15 @@ export class SecurityMonitoringController {
   @Get('identity/snapshot')
   @SkipWrap()
   identitySnapshot(@Query('nodeName') nodeName?: string): T.WorkloadIdentitySnapshot {
-    return this.kube.snapshot(nodeName);
+    const platform = this.kube.snapshot(nodeName);
+    const reviewed = this.agentMetadata.identitySnapshotEntries(nodeName);
+    return {
+      ...platform,
+      version: platform.version + this.agentMetadata.identitySnapshotVersion(),
+      // Manual decisions are ordered first. WorkloadIdentityCache deliberately keeps the first
+      // identity for a key, so a reviewer decision overrides an automatic platform candidate.
+      entries: [...reviewed, ...platform.entries],
+    };
   }
 
   @Get('capabilities')
@@ -4344,11 +4389,11 @@ export class SecurityMonitoringController {
       const kind = canonicalEventKind(input);
       const line = universalEventLine(kind, input, defaults);
       const partial = universalMeta(input, defaults, sourceResolution.source?.sourceId);
-      const meta = deriveMeta(line, {
+      const meta = this.agentMetadata.applyReview(deriveMeta(line, {
         ...partial,
         eventKind: kind,
         eventCategory: partial.eventCategory ?? eventCategory(kind),
-      });
+      }));
       const rec = judgeMode === 'sync' ? this.judge.judge(line, meta, eventTime(input)) : await this.judge.accept(line, meta, eventTime(input));
       if (!rec) {
         const reason = `unsupported event kind: ${kind}`;
@@ -4481,7 +4526,7 @@ export class SecurityMonitoringController {
     };
     // Enrich from the same registry consumed by forwarders. Filtering is node-local; direct API
     // producers remain fail-open and are never dropped solely because metadata is incomplete.
-    const meta = this.kube.enrich(deriveMeta(line, metaGiven));
+    const meta = this.agentMetadata.applyReview(this.kube.enrich(deriveMeta(line, metaGiven)));
     const rec = await this.judge.accept(line, meta);
     if (!rec) {
       this.recordRejectedIngest(sourceResolution, 'unparseable event', {

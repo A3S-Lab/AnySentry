@@ -41,8 +41,9 @@ export type IngestionSourceType = 'observer' | 'forwarder' | 'webhook' | 'otel' 
 export type IngestionSourceStatus = 'active' | 'stale' | 'unused' | 'disabled';
 export type SourceTokenRotationStatus = 'untracked' | 'fresh' | 'overdue';
 export type AgentClassification = 'confirmed_agent' | 'probable_agent' | 'unknown' | 'non_agent';
-export type AgentAttributionSource = 'none' | 'process_graph' | 'cgroup' | 'systemd' | 'argv' | 'env' | 'self_register' | 'workspace_hint' | 'kubernetes' | 'docker' | 'behavior' | 'process_signature';
-export type AgentAttributionReason = 'not_evaluated' | 'not_agent' | 'process_lineage' | 'authoritative_anchor' | 'hint_only' | 'conflict';
+export type AgentReviewDecision = 'confirmed_agent' | 'non_agent';
+export type AgentAttributionSource = 'none' | 'process_graph' | 'cgroup' | 'systemd' | 'argv' | 'env' | 'self_register' | 'workspace_hint' | 'kubernetes' | 'docker' | 'behavior' | 'process_signature' | 'manual_review';
+export type AgentAttributionReason = 'not_evaluated' | 'not_agent' | 'process_lineage' | 'authoritative_anchor' | 'hint_only' | 'conflict' | 'human_confirmed' | 'human_rejected';
 
 export interface ProcessContext {
   hostId?: string;
@@ -101,6 +102,7 @@ export interface WorkloadIdentitySnapshotEntry {
   classification: AgentClassification;
   physicalWorkloadId: string;
   source?: 'kubernetes' | 'docker' | 'systemd' | 'host';
+  attributionSource?: AgentAttributionSource;
   environment?: 'kubernetes' | 'docker' | 'host';
   agentScopeId?: string;
   agentDisplayName?: string;
@@ -846,10 +848,19 @@ export interface AgentMetadataRecord {
   criticality?: AgentCriticality;
   tags: string[];
   note?: string;
+  reviewDecision?: AgentReviewDecision;
+  reviewedBy?: string;
+  reviewedAt?: number;
+  reviewNote?: string;
+  reviewIdentityKeys?: string[];
+  reviewPhysicalWorkloadId?: string;
+  reviewAgentInstanceId?: string;
+  reviewWorkloadRef?: AgentWorkloadRef;
   updatedAt: number;
 }
-export interface AgentMetadataListItem extends Omit<AgentMetadataRecord, 'updatedAt'> {
+export interface AgentMetadataListItem extends Omit<AgentMetadataRecord, 'updatedAt' | 'reviewedAt'> {
   updatedAt: string;
+  reviewedAt?: string;
 }
 export interface AgentInventoryItem {
   agentId: string;
@@ -863,6 +874,18 @@ export interface AgentInventoryItem {
   tags: string[];
   note?: string;
   metadataUpdatedAt?: string;
+  classification: AgentClassification;
+  confidence: number;
+  attributionSource: AgentAttributionSource;
+  attributionEvidence: string[];
+  physicalWorkloadId?: string;
+  agentInstanceId?: string;
+  workloadRef?: AgentWorkloadRef;
+  reviewDecision?: AgentReviewDecision;
+  reviewedBy?: string;
+  reviewedAt?: string;
+  reviewNote?: string;
+  reviewIdentityKeys: string[];
   firstSeen: string;
   lastSeen: string;
   healthState: AgentHealthState;
@@ -973,6 +996,16 @@ export interface AgentMetadataUpdateRequest {
   environment?: string;
   criticality?: AgentCriticality | '';
   tags?: string[];
+  note?: string;
+}
+
+export interface AgentReviewRequest {
+  workspacePath: string;
+  decision: AgentReviewDecision | 'clear';
+  identityKeys?: string[];
+  physicalWorkloadId?: string;
+  agentInstanceId?: string;
+  workloadRef?: AgentWorkloadRef;
   note?: string;
 }
 
@@ -1895,6 +1928,8 @@ export type AuditAction =
   | 'alert.updated'
   | 'remediation.updated'
   | 'agent.metadata.updated'
+  | 'agent.review.updated'
+  | 'agent.review.cleared'
   | 'maintenance.window.updated'
   | 'notification.channel.updated'
   | 'notification.route.updated'

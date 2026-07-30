@@ -14,8 +14,9 @@ export type SecurityRiskLevel = "safe" | "low" | "medium" | "high" | "critical" 
 export type SecurityPolicyAction = "allow" | "review" | "block" | string;
 
 export type AgentClassification = "confirmed_agent" | "probable_agent" | "unknown" | "non_agent";
-export type AgentAttributionSource = "none" | "process_graph" | "cgroup" | "systemd" | "argv" | "env" | "self_register" | "workspace_hint" | "kubernetes" | "docker" | "behavior" | "process_signature";
-export type AgentAttributionReason = "not_evaluated" | "not_agent" | "process_lineage" | "authoritative_anchor" | "hint_only" | "conflict";
+export type AgentReviewDecision = "confirmed_agent" | "non_agent";
+export type AgentAttributionSource = "none" | "process_graph" | "cgroup" | "systemd" | "argv" | "env" | "self_register" | "workspace_hint" | "kubernetes" | "docker" | "behavior" | "process_signature" | "manual_review";
+export type AgentAttributionReason = "not_evaluated" | "not_agent" | "process_lineage" | "authoritative_anchor" | "hint_only" | "conflict" | "human_confirmed" | "human_rejected";
 
 export interface ProcessContext {
   hostId?: string;
@@ -921,6 +922,18 @@ export interface AgentInventoryItem {
   tags: string[];
   note?: string;
   metadataUpdatedAt?: string;
+  classification: AgentClassification;
+  confidence: number;
+  attributionSource: AgentAttributionSource;
+  attributionEvidence: string[];
+  physicalWorkloadId?: string;
+  agentInstanceId?: string;
+  workloadRef?: AgentWorkloadRef;
+  reviewDecision?: AgentReviewDecision;
+  reviewedBy?: string;
+  reviewedAt?: string;
+  reviewNote?: string;
+  reviewIdentityKeys: string[];
   firstSeen: string;
   lastSeen: string;
   healthState: AgentHealthState;
@@ -965,6 +978,14 @@ export interface AgentMetadataListItem {
   criticality?: AgentCriticality;
   tags: string[];
   note?: string;
+  reviewDecision?: AgentReviewDecision;
+  reviewedBy?: string;
+  reviewedAt?: string;
+  reviewNote?: string;
+  reviewIdentityKeys?: string[];
+  reviewPhysicalWorkloadId?: string;
+  reviewAgentInstanceId?: string;
+  reviewWorkloadRef?: AgentWorkloadRef;
   updatedAt: string;
 }
 
@@ -981,6 +1002,16 @@ export interface AgentMetadataUpdateRequest {
   environment?: string;
   criticality?: AgentCriticality | "";
   tags?: string[];
+  note?: string;
+}
+
+export interface AgentReviewRequest {
+  workspacePath: string;
+  decision: AgentReviewDecision | "clear";
+  identityKeys?: string[];
+  physicalWorkloadId?: string;
+  agentInstanceId?: string;
+  workloadRef?: AgentWorkloadRef;
   note?: string;
 }
 
@@ -2169,6 +2200,8 @@ export const securityCenterApi = {
   agentMetadata: () => apiClient.get<AgentMetadataList>("/security-center/agents/metadata"),
   updateAgentMetadata: (agentId: string, body: AgentMetadataUpdateRequest) =>
     apiClient.put<AgentMetadataListItem>(`/security-center/agents/${encodeURIComponent(agentId)}/metadata`, body),
+  reviewAgent: (agentId: string, body: AgentReviewRequest) =>
+    apiClient.put<AgentMetadataListItem>(`/security-center/agents/${encodeURIComponent(agentId)}/review`, body),
   alerts: (filter: AlertListQuery) =>
     apiClient.post<AlertList>("/security-center/alerts/list", filter),
   updateAlert: (alertId: string, body: AlertUpdateRequest) =>
