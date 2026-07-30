@@ -29,23 +29,51 @@ function event(kind, payload, cgroupId = '77') {
   };
 }
 
+const behaviorAttribution = {
+  physicalWorkloadId: 'k8s:test:pod-uid-1',
+  workloadRef: {
+    environment: 'kubernetes',
+    kind: 'pod',
+    name: 'research-agent-7b8d9',
+    namespace: 'default',
+    podName: 'research-agent-7b8d9',
+    containerName: 'agent',
+    nodeName: 'node-a',
+  },
+};
 const tool = event('ToolExec', { pid: 100, argv: ['python', 'tool.py'] });
 assert.equal(
   behaviorKey(tool),
   'host:node-a:boot-a:cgroup:77',
   'behavior groups host activity by stable cgroup before PID',
 );
-assert.equal(detector.observe(tool), undefined, 'one generic tool is not an Agent');
-const promoted = detector.observe(event('Egress', { pid: 100, host: 'api.openai.com' }));
+assert.equal(
+  detector.observe(tool, behaviorAttribution),
+  undefined,
+  'one generic tool is not an Agent',
+);
+const promoted = detector.observe(
+  event('Egress', { pid: 100, host: 'api.openai.com' }),
+  behaviorAttribution,
+);
 assert.equal(promoted.state, 'agent');
 assert.equal(promoted.attribution.classification, 'probable_agent');
 assert.equal(promoted.attribution.source, 'behavior');
+assert.equal(promoted.attribution.agentDisplayName, 'research-agent-7b8d9');
+assert.equal(promoted.attribution.workloadRef.podName, 'research-agent-7b8d9');
+assert.equal(promoted.attribution.workloadRef.containerName, 'agent');
 assert.match(promoted.attribution.evidence[0], /behavior:score=/);
-const continued = detector.observe(event('ToolExec', { pid: 101, argv: ['curl', 'https://example.test'] }));
+const continued = detector.observe(
+  event('ToolExec', { pid: 101, argv: ['curl', 'https://example.test'] }),
+  behaviorAttribution,
+);
 assert.equal(continued.state, 'agent');
 
 now += 61_000;
-const hysteresis = detector.observe(event('FileAccess', { pid: 101, path: '/workspace/result.json' }));
+const hysteresis = detector.observe(
+  event('FileAccess', { pid: 101, path: '/workspace/result.json' }),
+  behaviorAttribution,
+);
 assert.equal(hysteresis.state, 'agent', 'a probable candidate survives one empty scoring window');
 
 now += 121_000;

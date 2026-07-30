@@ -61,6 +61,23 @@ export interface ProcessContext {
   systemdUnit?: string;
 }
 
+export interface AgentWorkloadRef {
+  environment?: 'kubernetes' | 'docker' | 'host';
+  kind?: 'pod' | 'container' | 'service' | 'process' | 'cgroup';
+  name?: string;
+  namespace?: string;
+  podName?: string;
+  podUid?: string;
+  nodeName?: string;
+  containerName?: string;
+  containerImage?: string;
+  ownerKind?: string;
+  ownerName?: string;
+  systemdUnit?: string;
+  processName?: string;
+  executable?: string;
+}
+
 export interface AgentAttribution {
   monitored: boolean;
   classification?: AgentClassification;
@@ -69,6 +86,7 @@ export interface AgentAttribution {
   agentSessionId?: string;
   agentInstanceId?: string;
   physicalWorkloadId?: string;
+  workloadRef?: AgentWorkloadRef;
   rootPid?: number;
   confidence: number;
   reason: AgentAttributionReason;

@@ -85,6 +85,53 @@ function toolText(payload) {
   return path.posix.basename(text(argv[0])).toLowerCase();
 }
 
+function workloadRef(observerEvent, attribution) {
+  if (attribution?.workloadRef && typeof attribution.workloadRef === 'object') {
+    return attribution.workloadRef;
+  }
+  const process = processInfo(observerEvent);
+  const cgroup = text(process.cgroup);
+  const physicalWorkloadId = text(attribution?.physicalWorkloadId);
+  const environment =
+    physicalWorkloadId.startsWith('k8s:') || /kubepods/i.test(cgroup)
+      ? 'kubernetes'
+      : physicalWorkloadId.startsWith('docker:') ||
+          /(?:docker|containerd|crio|libpod)/i.test(cgroup)
+        ? 'docker'
+        : 'host';
+  const systemdUnit =
+    text(process.systemdUnit ?? process.systemd_unit) ||
+    cgroup
+      .split(/[/:]/)
+      .map((item) => item.trim())
+      .find((item) => /\.(?:service|scope)$/.test(item)) ||
+    '';
+  const executable = text(process.exe);
+  const processName = text(process.comm) || (executable ? path.posix.basename(executable) : '');
+  const name = systemdUnit || processName;
+  return {
+    environment,
+    kind: systemdUnit ? 'service' : processName ? 'process' : 'cgroup',
+    ...(name ? { name } : {}),
+    ...(text(process.hostId ?? process.host_id)
+      ? { nodeName: text(process.hostId ?? process.host_id) }
+      : {}),
+    ...(systemdUnit ? { systemdUnit } : {}),
+    ...(processName ? { processName } : {}),
+    ...(executable ? { executable } : {}),
+  };
+}
+
+function workloadDisplayName(ref) {
+  return text(
+    ref?.podName ??
+      ref?.containerName ??
+      ref?.systemdUnit ??
+      ref?.name ??
+      ref?.processName,
+  );
+}
+
 function isLlmEvent(kind, payload) {
   if (['LlmApi', 'LlmCall'].includes(kind)) return true;
   const target = targetText(payload);
@@ -220,15 +267,17 @@ class BehavioralAgentDetector {
     }
     if (record.probableUntil <= now) return undefined;
     this.stats.probableEvents++;
+    const candidateWorkload = workloadRef(observerEvent, attribution);
     return {
       state: 'agent',
       attribution: {
         monitored: true,
         classification: 'probable_agent',
         agentScopeId: record.candidateId,
-        agentDisplayName: 'Discovered Agent candidate',
+        agentDisplayName: workloadDisplayName(candidateWorkload) || record.candidateId,
         agentInstanceId: key,
         physicalWorkloadId: text(attribution?.physicalWorkloadId) || key,
+        workloadRef: candidateWorkload,
         confidence: Math.min(0.9, 0.5 + record.score / Math.max(20, this.threshold * 2) * 0.4),
         reason: 'hint_only',
         source: 'behavior',

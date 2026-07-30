@@ -52,6 +52,40 @@ function eventIdentityCandidates(observerEvent) {
 function attributionFor(entry) {
   const classification = entry.classification;
   const monitored = classification === 'confirmed_agent' || classification === 'probable_agent';
+  const environment =
+    entry.environment ||
+    (entry.source === 'kubernetes' ? 'kubernetes' : entry.source === 'docker' ? 'docker' : 'host');
+  const processName = text(entry.processName || entry.executable);
+  const workloadName =
+    text(entry.podName) ||
+    text(entry.containerName) ||
+    text(entry.systemdUnit) ||
+    processName;
+  const workloadRef = {
+    environment,
+    kind:
+      environment === 'kubernetes'
+        ? 'pod'
+        : environment === 'docker'
+          ? 'container'
+          : entry.systemdUnit
+            ? 'service'
+            : processName
+              ? 'process'
+              : 'cgroup',
+    ...(workloadName ? { name: workloadName } : {}),
+    ...(entry.namespace ? { namespace: entry.namespace } : {}),
+    ...(entry.podName ? { podName: entry.podName } : {}),
+    ...(entry.podUid ? { podUid: entry.podUid } : {}),
+    ...(entry.nodeName ? { nodeName: entry.nodeName } : {}),
+    ...(entry.containerName ? { containerName: entry.containerName } : {}),
+    ...(entry.containerImage ? { containerImage: entry.containerImage } : {}),
+    ...(entry.ownerKind ? { ownerKind: entry.ownerKind } : {}),
+    ...(entry.ownerName ? { ownerName: entry.ownerName } : {}),
+    ...(entry.systemdUnit ? { systemdUnit: entry.systemdUnit } : {}),
+    ...(processName ? { processName } : {}),
+    ...(entry.executable ? { executable: entry.executable } : {}),
+  };
   return {
     monitored,
     classification,
@@ -59,6 +93,7 @@ function attributionFor(entry) {
     ...(entry.agentDisplayName ? { agentDisplayName: entry.agentDisplayName } : {}),
     ...(entry.agentInstanceId ? { agentInstanceId: entry.agentInstanceId } : {}),
     ...(entry.physicalWorkloadId ? { physicalWorkloadId: entry.physicalWorkloadId } : {}),
+    workloadRef,
     confidence: classification === 'confirmed_agent' ? 1 : classification === 'probable_agent' ? 0.7 : 0,
     reason:
       classification === 'confirmed_agent'
