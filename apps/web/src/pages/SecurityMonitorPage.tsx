@@ -34,6 +34,7 @@ import {
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import { AgentIdentityInline } from "@/components/custom/agent-identity";
 import { useVChartTheme } from "@/components/custom/charts/vchart-theme";
 import { type VChartSpec, VChartView } from "@/components/custom/vchart";
 import { Button } from "@/components/ui/button";
@@ -1570,14 +1571,6 @@ function shortId(value?: string) {
   return value.length > 18 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value;
 }
 
-function eventAgentLabel(event: AgentEventListItem) {
-  return event.attribution?.agentDisplayName || event.attribution?.agentScopeId || event.agentId;
-}
-
-function eventSessionLabel(event: AgentEventListItem) {
-  return event.attribution?.agentSessionId || event.sessionId;
-}
-
 function eventDetailHref(event: AgentEventListItem) {
   const qs = new URLSearchParams({
     eventId: event.eventId,
@@ -1724,7 +1717,7 @@ function AgentEventTimelinePanel({
               <span>时间</span>
               <span>类型</span>
               <span>事件</span>
-              <span>智能体 / 会话</span>
+              <span>Agent</span>
               <span>Trace / Span</span>
               <span className="text-center">研判</span>
               <span className="text-right">风险</span>
@@ -1750,9 +1743,8 @@ function AgentEventTimelinePanel({
                       {event.eventKind} · {riskEventName(event.riskCategory)} · {event.source}
                     </p>
                   </div>
-                  <div className="min-w-0 font-mono text-xs">
-                    <p className="truncate text-zinc-300" title={eventAgentLabel(event)}>{eventAgentLabel(event)}</p>
-                    <p className="mt-0.5 truncate text-zinc-600" title={eventSessionLabel(event)}>{eventSessionLabel(event)}</p>
+                  <div className="min-w-0 text-xs">
+                    <AgentIdentityInline event={event} />
                   </div>
                   <div className="min-w-0 font-mono text-xs">
                     <p className="truncate text-zinc-300" title={event.traceId}>{shortId(event.traceId)}</p>

@@ -267,6 +267,14 @@ function attributor(procEntries = []) {
         agentScopeId: 'claw-agent',
         agentDisplayName: 'claw-agent',
         agentInstanceId: 'pod-1/agent-container-full',
+        source: 'kubernetes',
+        environment: 'kubernetes',
+        namespace: 'research',
+        podName: 'research-agent-7b8d9',
+        podUid: 'pod-1',
+        nodeName: 'node-a',
+        containerName: 'agent',
+        containerImage: 'company/research-agent:latest',
         evidence: ['label:anysentry.io/workload-kind=agent'],
       },
       {
@@ -293,6 +301,17 @@ function attributor(procEntries = []) {
   assert.equal(agentResult.state, 'agent');
   assert.equal(agentResult.attribution.classification, 'confirmed_agent');
   assert.equal(agentResult.attribution.agentScopeId, 'claw-agent');
+  assert.deepEqual(agentResult.attribution.workloadRef, {
+    environment: 'kubernetes',
+    kind: 'pod',
+    name: 'research-agent-7b8d9',
+    namespace: 'research',
+    podName: 'research-agent-7b8d9',
+    podUid: 'pod-1',
+    nodeName: 'node-a',
+    containerName: 'agent',
+    containerImage: 'company/research-agent:latest',
+  });
   assert.equal(cache.classify(structuredClone(genericAgent)).state, 'agent');
   assert.equal(cache.metrics().cgroupHits, 1, 'a stable cgroup must use its direct identity binding');
 

@@ -15,6 +15,7 @@ import {
 import { useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import { AgentIdentityInline, resolveAgentIdentity } from "@/components/custom/agent-identity";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -148,11 +149,9 @@ function EventRow({
         <Pill className={severityClass(event.severity)}>{CATEGORY_LABEL[event.eventCategory] ?? event.eventCategory}</Pill>
       </span>
       <span className="min-w-0">
-        <span className="block truncate text-sm font-medium text-zinc-100" title={event.subject}>
+        <AgentIdentityInline event={event} className="flex" />
+        <span className="mt-0.5 block truncate text-[11px] text-zinc-500" title={event.subject}>
           {event.subject}
-        </span>
-        <span className="mt-0.5 block truncate font-mono text-[11px] text-zinc-600" title={event.traceId}>
-          {event.agentId} / {shortId(event.traceId)}
         </span>
       </span>
       <span className="flex justify-end">
@@ -190,6 +189,8 @@ function EventDetail({ event, timeType }: { event?: AgentEventListItem; timeType
 
   const eventSourceId = event.sourceId ?? (typeof event.attributes.sourceId === "string" ? event.attributes.sourceId : undefined);
   const eventCollectorId = event.collectorId ?? (typeof event.attributes.collectorId === "string" ? event.attributes.collectorId : undefined);
+  const agentIdentity = resolveAgentIdentity(event);
+  const workload = agentIdentity.workload;
   const topologyQs = new URLSearchParams({
     timeType,
     eventId: event.eventId,
@@ -215,7 +216,10 @@ function EventDetail({ event, timeType }: { event?: AgentEventListItem; timeType
       <div className="flex min-h-12 items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
         <div className="flex min-w-0 items-center gap-2">
           <FileText className="size-4 shrink-0 text-teal-200" />
-          <h2 className="truncate text-sm font-semibold text-zinc-100">{event.subject}</h2>
+          <div className="min-w-0">
+            <AgentIdentityInline event={event} showClassification />
+            <p className="mt-0.5 truncate text-xs text-zinc-500" title={event.subject}>{event.subject}</p>
+          </div>
         </div>
         <Pill className={severityClass(event.severity)}>{SEVERITY_LABEL[event.severity]}</Pill>
       </div>
@@ -225,7 +229,7 @@ function EventDetail({ event, timeType }: { event?: AgentEventListItem; timeType
           <FieldValue label="Trace ID" value={event.traceId} />
           <FieldValue label="Span ID" value={event.spanId} />
           <FieldValue label="Run ID" value={event.runId} />
-          <FieldValue label="Agent" value={event.agentId} />
+          <FieldValue label="Agent" value={agentIdentity.name} />
           <FieldValue label="Collector" value={eventCollectorId} />
           <FieldValue label="Source ID" value={eventSourceId} />
           <FieldValue label="Session" value={event.sessionId} />
@@ -254,26 +258,46 @@ function EventDetail({ event, timeType }: { event?: AgentEventListItem; timeType
         </div>
 
         <div>
-          <p className="mb-2 text-xs font-medium text-zinc-400">Agent Attribution</p>
+          <p className="mb-2 text-xs font-medium text-zinc-400">Agent 归因详情</p>
           <div className="grid gap-3 rounded-md border border-white/10 bg-white/[0.03] px-3 py-3 sm:grid-cols-2 xl:grid-cols-4">
-            <FieldValue label="Monitored" value={event.attribution?.monitored ? "true" : "false"} />
-            <FieldValue label="Classification" value={event.attribution?.classification ?? "unknown"} />
-            <FieldValue label="Agent Scope" value={event.attribution?.agentScopeId ?? "non-agent"} />
-            <FieldValue label="Agent Instance" value={event.attribution?.agentInstanceId} />
-            <FieldValue label="Physical Workload" value={event.attribution?.physicalWorkloadId} />
-            <FieldValue label="Confidence" value={event.attribution ? event.attribution.confidence.toFixed(2) : "0.00"} />
-            <FieldValue label="Source" value={event.attribution?.source ?? "none"} />
-            <FieldValue label="Reason" value={event.attribution?.reason ?? "not_evaluated"} />
-            <FieldValue label="Evidence" value={event.attribution?.evidence?.join(", ")} />
+            <FieldValue label="识别状态" value={agentIdentity.classificationLabel} />
+            <FieldValue label="部署环境" value={agentIdentity.runtimeLabel ?? "未知"} />
+            <FieldValue label="识别来源" value={event.attribution?.source ?? "none"} />
+            <FieldValue label="置信度" value={event.attribution ? `${Math.round(event.attribution.confidence * 100)}%` : "0%"} />
+            <FieldValue label="Agent Scope ID" value={event.attribution?.agentScopeId ?? "non-agent"} />
+            <FieldValue label="Agent Instance ID" value={event.attribution?.agentInstanceId} />
+            <FieldValue label="物理工作负载" value={event.attribution?.physicalWorkloadId} />
+            <FieldValue label="归因原因" value={event.attribution?.reason ?? "not_evaluated"} />
+            <FieldValue label="Namespace" value={workload?.namespace} />
+            <FieldValue label="Pod" value={workload?.podName} />
+            <FieldValue label="容器" value={workload?.containerName} />
+            <FieldValue label="镜像" value={workload?.containerImage} />
+            <FieldValue label="节点" value={workload?.nodeName ?? event.process?.hostId} />
+            <FieldValue label="Owner" value={[workload?.ownerKind, workload?.ownerName].filter(Boolean).join("/") || undefined} />
+            <FieldValue label="本地服务" value={workload?.systemdUnit ?? event.process?.systemdUnit} />
+            <FieldValue label="进程" value={workload?.processName ?? event.process?.comm} />
+            <FieldValue label="可执行文件" value={workload?.executable ?? event.process?.exe} />
             <FieldValue label="Root PID" value={event.attribution?.rootPid} />
-            <FieldValue label="Host" value={event.process?.hostId} />
-            <FieldValue label="Boot" value={event.process?.bootId} />
+            <FieldValue label="Boot ID" value={event.process?.bootId} />
             <FieldValue label="PID" value={event.process?.pid} />
             <FieldValue label="PPID" value={event.process?.ppid} />
-            <FieldValue label="Start Ticks" value={event.process?.startTimeTicks} />
+            <FieldValue label="进程启动 Ticks" value={event.process?.startTimeTicks} />
             <FieldValue label="Cgroup ID" value={event.process?.cgroupId} />
           </div>
         </div>
+
+        {event.attribution?.evidence?.length ? (
+          <div>
+            <p className="mb-2 text-xs font-medium text-zinc-400">Agent 识别证据</p>
+            <div className="flex flex-wrap gap-2 rounded-md border border-white/10 bg-white/[0.03] px-3 py-3">
+              {event.attribution.evidence.map((item) => (
+                <code key={item} className="rounded border border-white/10 bg-[#0b0f0c] px-2 py-1 text-[11px] text-zinc-400">
+                  {item}
+                </code>
+              ))}
+            </div>
+          </div>
+        ) : null}
 
         <div>
           <p className="mb-2 text-xs font-medium text-zinc-400">判定原因</p>

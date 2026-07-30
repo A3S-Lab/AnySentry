@@ -64,6 +64,14 @@ assert.equal(claw.attribution.classification, 'confirmed_agent');
 assert.equal(claw.attribution.agentScopeId, 'claw');
 assert.equal(claw.attribution.source, 'self_register');
 assert.equal(claw.attribution.physicalWorkloadId, `docker:host-a:${clawId}`);
+assert.deepEqual(claw.attribution.workloadRef, {
+  environment: 'docker',
+  kind: 'container',
+  name: 'production-claw-worker',
+  nodeName: 'node-a',
+  containerName: 'production-claw-worker',
+  containerImage: 'company/claw:latest',
+});
 
 const unknown = cache.classify({
   identity: { session: unknownId },
@@ -72,6 +80,8 @@ const unknown = cache.classify({
 });
 assert.equal(unknown.state, 'unknown');
 assert.equal(unknown.attribution.source, 'docker');
+assert.equal(unknown.attribution.workloadRef.containerName, 'new-runtime');
+assert.equal(unknown.attribution.workloadRef.environment, 'docker');
 
 let callbackSnapshot;
 const discovery = new DockerDiscovery({
