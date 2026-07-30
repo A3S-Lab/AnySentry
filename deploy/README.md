@@ -179,10 +179,14 @@ and uses an initial `/containers/json` list plus the Docker container event stre
 `ANYSENTRY_DOCKER_DISCOVERY=off` to disable it. Docker API access is outside the event hot path.
 
 Framework discovery is enabled by default and keeps only bounded counters/small sets per physical
-workload. It combines LLM endpoint, tool, workspace, network, alternation, and process-fanout
-signals to create `probable_agent` candidates. It cannot create confirmed identities and makes no
-model calls. Disable it with `ANYSENTRY_BEHAVIOR_DISCOVERY=off` or tune its threshold/window/TTL
-with the matching `ANYSENTRY_BEHAVIOR_*` variables.
+workload. It requires LLM/tool alternation or the sequence `tool → network/model decision →
+different tool → workspace change`; volume alone cannot create a candidate. Known service-data
+paths do not count as workspace evidence, and a dominant executable repeatedly touching service
+data without LLM/sequence evidence can end a probable TTL early without declaring `non_agent`.
+Configure additional comma-separated service-state prefixes with
+`ANYSENTRY_BEHAVIOR_SERVICE_DATA_PATHS`. It cannot create confirmed identities and makes no model
+calls. Disable it with `ANYSENTRY_BEHAVIOR_DISCOVERY=off` or tune the matching
+`ANYSENTRY_BEHAVIOR_*` variables.
 
 ## Safety
 

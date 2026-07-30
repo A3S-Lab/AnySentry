@@ -16,6 +16,13 @@ const LLM_HOST_HINTS = [
   'openrouter.ai',
 ];
 
+const DEFAULT_SERVICE_DATA_PATHS = [
+  '/var/lib/clickhouse/',
+  '/var/lib/postgresql/',
+  '/var/lib/mysql/',
+  '/var/lib/redis/',
+];
+
 function text(value) {
   return typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
 }
@@ -85,6 +92,21 @@ function toolText(payload) {
   return path.posix.basename(text(argv[0])).toLowerCase();
 }
 
+function toolSignature(payload) {
+  const argv = Array.isArray(payload.argv) ? payload.argv.map(String) : text(payload.argv).split(/\s+/);
+  return argv
+    .slice(0, 3)
+    .map((part, index) => index === 0 ? path.posix.basename(text(part)).toLowerCase() : text(part))
+    .filter(Boolean)
+    .join(' ')
+    .slice(0, 240);
+}
+
+function executableText(observerEvent) {
+  const process = processInfo(observerEvent);
+  return text(process.exe) || text(process.comm);
+}
+
 function workloadRef(observerEvent, attribution) {
   if (attribution?.workloadRef && typeof attribution.workloadRef === 'object') {
     return attribution.workloadRef;
@@ -138,10 +160,53 @@ function isLlmEvent(kind, payload) {
   return Boolean(target && LLM_HOST_HINTS.some((hint) => target.includes(hint)));
 }
 
-function isWorkspaceFile(payload) {
+function normalizedPathPrefix(value) {
+  const normalized = text(value).replace(/\/+$/, '');
+  return normalized ? `${normalized}/` : '';
+}
+
+function serviceDataPrefixes(value) {
+  const configured = Array.isArray(value)
+    ? value
+    : text(value)
+      ? text(value).split(',')
+      : [];
+  return [...new Set(
+    [...DEFAULT_SERVICE_DATA_PATHS, ...configured]
+      .map(normalizedPathPrefix)
+      .filter(Boolean),
+  )].slice(0, 128);
+}
+
+function isServiceDataFile(payload, prefixes = DEFAULT_SERVICE_DATA_PATHS) {
   const value = text(payload.path);
   if (!value) return false;
-  return !['/proc/', '/sys/', '/dev/', '/run/'].some((prefix) => value.startsWith(prefix));
+  const normalizedPrefixes = Array.isArray(prefixes) ? prefixes : serviceDataPrefixes(prefixes);
+  return normalizedPrefixes.some((prefix) =>
+    value === prefix.slice(0, -1) || value.startsWith(prefix),
+  );
+}
+
+function isWorkspaceFile(payload, prefixes = DEFAULT_SERVICE_DATA_PATHS) {
+  const value = text(payload.path);
+  if (!value) return false;
+  return (
+    !['/proc/', '/sys/', '/dev/', '/run/'].some((prefix) => value.startsWith(prefix)) &&
+    !isServiceDataFile(payload, prefixes)
+  );
+}
+
+function incrementBounded(map, value, max) {
+  const normalized = text(value);
+  if (!normalized) return;
+  if (!map.has(normalized) && map.size >= max) return;
+  map.set(normalized, (map.get(normalized) ?? 0) + 1);
+}
+
+function dominantCount(map) {
+  let max = 0;
+  for (const count of map.values()) max = Math.max(max, count);
+  return max;
 }
 
 function scoreRecord(record) {
@@ -152,7 +217,8 @@ function scoreRecord(record) {
   const network = Math.min(2, record.networkTargets.size);
   const workspace = record.workspaceFiles >= 2 ? 1 : 0;
   const fanout = record.childPids.size >= 3 ? 1 : 0;
-  return llm + tools + uniqueTools + alternation + network + workspace + fanout;
+  const sequences = Math.min(8, record.agentSequences * 4);
+  return llm + tools + uniqueTools + alternation + network + workspace + fanout + sequences;
 }
 
 function qualifies(record, threshold) {
@@ -161,10 +227,32 @@ function qualifies(record, threshold) {
     record.toolExecs > 0 &&
     (record.alternations > 0 || record.uniqueTools.size >= 2);
   const autonomousToolPattern =
-    record.toolExecs >= 5 &&
-    record.uniqueTools.size >= 3 &&
-    (record.networkTargets.size >= 2 || record.workspaceFiles >= 3);
+    record.agentSequences > 0 &&
+    record.toolExecs >= 2 &&
+    record.uniqueTools.size >= 2 &&
+    record.workspaceFiles > 0;
   return record.score >= threshold && (llmToolPattern || autonomousToolPattern);
+}
+
+function strongInfrastructurePattern(record, now, minAgeMs) {
+  const fileEvents = record.workspaceFiles + record.serviceDataFiles;
+  const serviceDataDominant =
+    record.serviceDataFiles >= 4 &&
+    record.serviceDataFiles / Math.max(1, fileEvents) >= 0.8;
+  const executableDominant =
+    record.events >= 6 &&
+    dominantCount(record.executables) / record.events >= 0.8;
+  const lacksAgentCycle =
+    record.llmEvents === 0 &&
+    record.agentSequences === 0 &&
+    record.alternations === 0 &&
+    record.uniqueTools.size <= 1;
+  return (
+    now - record.firstSeenAt >= minAgeMs &&
+    serviceDataDominant &&
+    executableDominant &&
+    lacksAgentCycle
+  );
 }
 
 class BehavioralAgentDetector {
@@ -188,6 +276,15 @@ class BehavioralAgentDetector {
       4,
       100,
     );
+    this.negativeMinAgeMs = boundedNumber(
+      options.negativeMinAgeMs ?? process.env.ANYSENTRY_BEHAVIOR_NEGATIVE_MIN_AGE_SECS * 1000,
+      60_000,
+      1_000,
+      24 * 60 * 60_000,
+    );
+    this.serviceDataPaths = serviceDataPrefixes(
+      options.serviceDataPaths ?? process.env.ANYSENTRY_BEHAVIOR_SERVICE_DATA_PATHS,
+    );
     this.maxWorkloads = boundedNumber(
       options.maxWorkloads ?? process.env.ANYSENTRY_BEHAVIOR_MAX_WORKLOADS,
       20_000,
@@ -204,6 +301,8 @@ class BehavioralAgentDetector {
       probableEvents: 0,
       evicted: 0,
       expired: 0,
+      demoted: 0,
+      negativeEvidenceEvents: 0,
       missingKey: 0,
     };
     this.operations = 0;
@@ -230,14 +329,22 @@ class BehavioralAgentDetector {
         windowStartedAt: now,
         lastSeenAt: now,
         probableUntil: previousProbableUntil,
+        events: 0,
         llmEvents: 0,
         toolExecs: 0,
         workspaceFiles: 0,
+        serviceDataFiles: 0,
         alternations: 0,
+        agentSequences: 0,
         uniqueTools: new Set(),
         networkTargets: new Set(),
+        serviceDataDirectories: new Set(),
         childPids: new Set(),
+        executables: new Map(),
         lastSignal: '',
+        lastToolSignature: '',
+        decisionSinceTool: false,
+        awaitingWorkspace: false,
         score: 0,
       };
       this.records.set(key, record);
@@ -247,16 +354,44 @@ class BehavioralAgentDetector {
     const payload = eventPayload(observerEvent);
     const llm = isLlmEvent(kind, payload);
     const tool = kind === 'ToolExec';
+    const network =
+      ['Egress', 'DnsQuery', 'Dns', 'Connect'].includes(kind) &&
+      Boolean(targetText(payload));
+    record.events++;
+    incrementBounded(record.executables, executableText(observerEvent), 32);
     if (llm) record.llmEvents++;
     if (tool) {
       record.toolExecs++;
       addBounded(record.uniqueTools, toolText(payload), 32);
       addBounded(record.childPids, payload.pid, 64);
+      const signature = toolSignature(payload);
+      if (
+        record.decisionSinceTool &&
+        record.lastToolSignature &&
+        signature &&
+        signature !== record.lastToolSignature
+      ) {
+        record.awaitingWorkspace = true;
+      }
+      if (signature) record.lastToolSignature = signature;
+      record.decisionSinceTool = false;
     }
-    if (['Egress', 'DnsQuery', 'Dns', 'Connect'].includes(kind) || llm) {
+    if (network || llm) {
       addBounded(record.networkTargets, targetText(payload), 32);
+      if (record.lastToolSignature) record.decisionSinceTool = true;
     }
-    if (kind === 'FileAccess' && isWorkspaceFile(payload)) record.workspaceFiles++;
+    if (kind === 'FileAccess') {
+      if (isServiceDataFile(payload, this.serviceDataPaths)) {
+        record.serviceDataFiles++;
+        addBounded(record.serviceDataDirectories, path.posix.dirname(text(payload.path)), 64);
+      } else if (isWorkspaceFile(payload, this.serviceDataPaths)) {
+        record.workspaceFiles++;
+        if (record.awaitingWorkspace) {
+          record.agentSequences++;
+          record.awaitingWorkspace = false;
+        }
+      }
+    }
     const signal = llm ? 'llm' : tool ? 'tool' : '';
     if (signal && record.lastSignal && signal !== record.lastSignal) record.alternations++;
     if (signal) record.lastSignal = signal;
@@ -264,6 +399,39 @@ class BehavioralAgentDetector {
     if (qualifies(record, this.threshold) && record.probableUntil < now) {
       record.probableUntil = now + this.probableTtlMs;
       this.stats.promoted++;
+    }
+    const negative = strongInfrastructurePattern(record, now, this.negativeMinAgeMs);
+    if (negative) {
+      if (record.probableUntil > now) {
+        record.probableUntil = 0;
+        this.stats.demoted++;
+      }
+      this.stats.negativeEvidenceEvents++;
+      if (attribution?.classification === 'non_agent') return undefined;
+      const candidateWorkload = workloadRef(observerEvent, attribution);
+      return {
+        state: 'unknown',
+        attribution: {
+          monitored: false,
+          classification: 'unknown',
+          physicalWorkloadId: text(attribution?.physicalWorkloadId) || key,
+          workloadRef: candidateWorkload,
+          confidence: 0,
+          reason: 'not_evaluated',
+          source: 'behavior',
+          evidence: [
+            ...(Array.isArray(attribution?.evidence) ? attribution.evidence : []),
+            'behavior:negative=service_data_pattern',
+            `behavior:service_data_files=${record.serviceDataFiles}`,
+            `behavior:service_data_directories=${record.serviceDataDirectories.size}`,
+            `behavior:dominant_executable_ratio=${(
+              dominantCount(record.executables) / Math.max(1, record.events)
+            ).toFixed(2)}`,
+            'behavior:llm=0',
+            `behavior:agent_sequences=${record.agentSequences}`,
+          ].slice(-16),
+        },
+      };
     }
     if (record.probableUntil <= now) return undefined;
     this.stats.probableEvents++;
@@ -289,6 +457,8 @@ class BehavioralAgentDetector {
           `behavior:alternations=${record.alternations}`,
           `behavior:network_targets=${record.networkTargets.size}`,
           `behavior:workspace_files=${record.workspaceFiles}`,
+          `behavior:service_data_files=${record.serviceDataFiles}`,
+          `behavior:agent_sequences=${record.agentSequences}`,
           `behavior:child_fanout=${record.childPids.size}`,
         ],
       },
@@ -340,6 +510,9 @@ module.exports = {
   BehavioralAgentDetector,
   behaviorKey,
   isLlmEvent,
+  isServiceDataFile,
+  isWorkspaceFile,
   qualifies,
   scoreRecord,
+  strongInfrastructurePattern,
 };

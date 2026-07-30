@@ -89,12 +89,20 @@ LLM/tool alternation
 workspace file activity
 network targets
 child-process fanout
+completed Agent sequences: tool → decision/network → different tool → workspace change
+service-data activity and dominant executable ratio (negative evidence)
 ```
 
 Lightweight deterministic scoring can promote `unknown` to `probable_agent`. Behavior alone never
 produces `confirmed_agent`; confirmation requires a trusted template, platform registration, or
 other authoritative binding. Hysteresis prevents a candidate from oscillating on every event.
-No LLM call is used in this detection path.
+No LLM call is used in this detection path. High exec/file/process volume without an Agent sequence
+does not promote a workload. Database service paths such as `/var/lib/clickhouse`,
+`/var/lib/postgresql`, `/var/lib/mysql`, and `/var/lib/redis` are still forwarded as evidence but
+are counted as service state rather than workspace changes. When a mature workload has one
+dominant executable, repeated service-state writes, no LLM activity, and no Agent sequence, the
+negative evidence can clear an existing probable TTL early. It remains `unknown` until an operator
+or authoritative inventory explicitly marks it `non_agent`.
 
 The two modes are additive: an operator template gives immediate attribution, while framework
 discovery covers missing, incomplete, or newly introduced deployments.

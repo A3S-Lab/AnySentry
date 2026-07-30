@@ -4,7 +4,12 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { BehavioralAgentDetector, behaviorKey } = require('./observer-behavior-discovery');
+const {
+  BehavioralAgentDetector,
+  behaviorKey,
+  isServiceDataFile,
+  isWorkspaceFile,
+} = require('./observer-behavior-discovery');
 
 let now = 1_000_000;
 const detector = new BehavioralAgentDetector({
@@ -24,6 +29,8 @@ function event(kind, payload, cgroupId = '77') {
       start_time_ticks: '99',
       cgroup_id: cgroupId,
       cgroup: '0::/user.slice/agent.scope',
+      comm: 'worker',
+      exe: '/usr/local/bin/worker',
     },
     event: { [kind]: payload },
   };
@@ -96,5 +103,113 @@ for (let index = 0; index < 150; index++) {
 }
 assert.ok(bounded.metrics().workloads <= 100);
 assert.ok(bounded.metrics().evicted > 0);
+
+assert.equal(isServiceDataFile({ path: '/var/lib/clickhouse/store/abc/data.bin' }), true);
+assert.equal(isServiceDataFile({ path: '/var/lib/postgresql/16/main/base/1' }), true);
+assert.equal(isServiceDataFile({ path: '/var/lib/mysql/orders.ibd' }), true);
+assert.equal(isServiceDataFile({ path: '/var/lib/redis/dump.rdb' }), true);
+const customServicePaths = new BehavioralAgentDetector({
+  serviceDataPaths: ['/srv/state/vector-db'],
+}).serviceDataPaths;
+assert.equal(isServiceDataFile({ path: '/srv/state/vector-db/segments/1' }, customServicePaths), true);
+assert.equal(
+  isServiceDataFile({ path: '/var/lib/clickhouse/store/abc/data.bin' }, customServicePaths),
+  true,
+  'custom service-state paths extend rather than replace safe defaults',
+);
+assert.equal(
+  isWorkspaceFile({ path: '/var/lib/clickhouse/store/abc/data.bin' }),
+  false,
+  'service data is not Agent workspace evidence',
+);
+assert.equal(isWorkspaceFile({ path: '/workspace/src/index.ts' }), true);
+
+const sequenceDetector = new BehavioralAgentDetector({
+  now: () => now,
+  threshold: 8,
+  negativeMinAgeMs: 1_000,
+});
+assert.equal(
+  sequenceDetector.observe(event('ToolExec', { pid: 500, argv: ['git', 'status'] }, '500')),
+  undefined,
+);
+assert.equal(
+  sequenceDetector.observe(event('Egress', { pid: 500, host: 'registry.example.test' }, '500')),
+  undefined,
+);
+assert.equal(
+  sequenceDetector.observe(event('ToolExec', { pid: 501, argv: ['npm', 'test'] }, '500')),
+  undefined,
+);
+const sequenceCandidate = sequenceDetector.observe(
+  event('FileAccess', { pid: 501, path: '/workspace/test-results.json' }, '500'),
+);
+assert.equal(sequenceCandidate?.state, 'agent');
+assert.ok(
+  sequenceCandidate.attribution.evidence.includes('behavior:agent_sequences=1'),
+  'tool → decision/network → different tool → workspace forms one Agent sequence',
+);
+
+const bulkActivity = new BehavioralAgentDetector({ now: () => now, threshold: 8 });
+for (const argv of [
+  ['find', '/data'],
+  ['sort', '/data/index'],
+  ['merge', '/data/part'],
+  ['find', '/data'],
+  ['sort', '/data/index'],
+  ['merge', '/data/part'],
+]) {
+  bulkActivity.observe(event('ToolExec', { pid: 600, argv }, '600'));
+}
+for (let index = 0; index < 8; index++) {
+  bulkActivity.observe(event('FileAccess', { pid: 600, path: `/data/part-${index}` }, '600'));
+}
+assert.equal(
+  bulkActivity.metrics().candidates,
+  0,
+  'many exec/file events without a decision cycle are insufficient for Agent promotion',
+);
+
+let infrastructureNow = now;
+const infrastructureDetector = new BehavioralAgentDetector({
+  now: () => infrastructureNow,
+  threshold: 8,
+  windowMs: 60_000,
+  probableTtlMs: 180_000,
+  negativeMinAgeMs: 60_000,
+});
+infrastructureDetector.observe(
+  event('ToolExec', { pid: 700, argv: ['worker', 'query'] }, '700'),
+  { physicalWorkloadId: 'k8s:test:clickhouse-container' },
+);
+const initialCandidate = infrastructureDetector.observe(
+  event('Egress', { pid: 700, host: 'api.openai.com' }, '700'),
+  { physicalWorkloadId: 'k8s:test:clickhouse-container' },
+);
+assert.equal(initialCandidate?.state, 'agent');
+infrastructureNow += 61_000;
+let infrastructureResult;
+for (let index = 0; index < 6; index++) {
+  const fileEvent = event('FileAccess', {
+    pid: 700,
+    path: `/var/lib/clickhouse/store/abc/merge-${index}.bin`,
+  }, '700');
+  const before = structuredClone(fileEvent);
+  infrastructureResult = infrastructureDetector.observe(
+    fileEvent,
+    { physicalWorkloadId: 'k8s:test:clickhouse-container' },
+  );
+  assert.deepEqual(fileEvent, before, 'behavior classification must not mutate or delete the raw event');
+}
+assert.equal(infrastructureResult?.state, 'unknown');
+assert.ok(
+  infrastructureResult.attribution.evidence.includes('behavior:negative=service_data_pattern'),
+);
+assert.equal(
+  infrastructureDetector.metrics().candidates,
+  0,
+  'strong infrastructure evidence clears probable TTL before its natural expiry',
+);
+assert.equal(infrastructureDetector.metrics().demoted, 1);
 
 console.log('Behavior discovery verification passed');
