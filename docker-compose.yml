@@ -171,6 +171,7 @@ services:
 
   flink-checkpoint-init:
     profiles: ["streaming"]
+    build: ./streaming/flink
     image: anysentry-flink-streaming:local
     labels: *anysentry-infrastructure-labels
     user: "0:0"
@@ -201,6 +202,7 @@ services:
 
   flink-taskmanager:
     profiles: ["streaming"]
+    build: ./streaming/flink
     image: anysentry-flink-streaming:local
     labels: *anysentry-infrastructure-labels
     depends_on:
@@ -218,6 +220,7 @@ services:
 
   flink-job-submit:
     profiles: ["streaming"]
+    build: ./streaming/flink
     image: anysentry-flink-streaming:local
     labels: *anysentry-infrastructure-labels
     depends_on:
