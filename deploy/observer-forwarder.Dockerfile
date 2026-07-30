@@ -17,4 +17,5 @@ COPY scripts/observer-behavior-discovery.js /opt/observer-behavior-discovery.js
 COPY scripts/observer-priority-queue.js /opt/observer-priority-queue.js
 COPY scripts/observer-event-dedup.js /opt/observer-event-dedup.js
 COPY scripts/observer-workload-filter.js /opt/observer-workload-filter.js
+COPY scripts/observer-infrastructure-roots.js /opt/observer-infrastructure-roots.js
 # The DaemonSet supplies the command: a3s-observer-collector | node /opt/observer-forward.js
