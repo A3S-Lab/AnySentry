@@ -83,6 +83,72 @@ assert.equal(unknown.attribution.source, 'docker');
 assert.equal(unknown.attribution.workloadRef.containerName, 'new-runtime');
 assert.equal(unknown.attribution.workloadRef.environment, 'docker');
 
+let procCgroupReads = 0;
+const procCgroupPids = [];
+const labeledContainerId = 'a'.repeat(64);
+const labeledSnapshot = dockerSnapshot([
+  {
+    Id: labeledContainerId,
+    Names: ['/a3s-code-agent'],
+    Image: 'anysentry-agent-runtime-lab:0.1.0',
+    Labels: {
+      'anysentry.io/workload-kind': 'agent',
+      'anysentry.io/agent-id': 'docker-a3s-code-loop',
+    },
+  },
+], {
+  version: 8,
+  nodeName: 'node-a',
+  hostId: 'host-a',
+});
+const legacyCollectorCache = new WorkloadIdentityCache({
+  readProcCgroup(pid) {
+    procCgroupReads += 1;
+    procCgroupPids.push(pid);
+    return pid === 42 ? `1:net_cls:/\n0::/../docker-${labeledContainerId}.scope` : '';
+  },
+});
+assert.equal(legacyCollectorCache.replace(labeledSnapshot, 'docker'), true);
+const legacyCollectorEvent = {
+  identity: { agent: 'node', task: '42' },
+  process: {
+    pid: 42,
+    ppid: 1,
+    cgroup_id: '987654',
+    comm: 'node',
+    exe: '/usr/local/bin/node',
+  },
+  event: { ToolExec: { pid: 42, argv: ['node', 'agent.mjs'] } },
+};
+const legacyCollectorResult = legacyCollectorCache.classify(legacyCollectorEvent);
+assert.equal(legacyCollectorResult.state, 'agent');
+assert.equal(legacyCollectorResult.attribution.classification, 'confirmed_agent');
+assert.equal(legacyCollectorResult.attribution.agentScopeId, 'docker-a3s-code-loop');
+assert.equal(procCgroupReads, 1);
+assert.equal(legacyCollectorCache.classify(structuredClone(legacyCollectorEvent)).state, 'agent');
+assert.equal(procCgroupReads, 1, 'numeric cgroup bindings must avoid repeated /proc reads');
+assert.equal(legacyCollectorCache.metrics().procCgroupReads, 1);
+
+const exitedChildResult = legacyCollectorCache.classify({
+  identity: { agent: 'bash', task: '43' },
+  process: {
+    pid: 43,
+    ppid: 42,
+    cgroup_id: '987655',
+    comm: 'bash',
+    exe: '/usr/bin/bash',
+  },
+  event: { ToolExec: { pid: 43, ppid: 42, argv: ['bash', '-c', 'true'] } },
+});
+assert.equal(exitedChildResult.state, 'agent');
+assert.equal(exitedChildResult.attribution.agentScopeId, 'docker-a3s-code-loop');
+assert.deepEqual(procCgroupPids, [42, 43, 42]);
+assert.equal(
+  legacyCollectorCache.metrics().procCgroupReads,
+  3,
+  'an exited child must fall back to its still-live parent cgroup',
+);
+
 let callbackSnapshot;
 const discovery = new DockerDiscovery({
   enabled: 'on',

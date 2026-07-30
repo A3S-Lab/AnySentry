@@ -1,0 +1,81 @@
+services:
+  a3s-code-agent:
+    image: ${AGENT_LAB_IMAGE:-anysentry-agent-runtime-lab:0.1.0}
+    build:
+      context: .
+    container_name: anysentry-test-a3s-code
+    restart: unless-stopped
+    environment:
+      AGENT_RUNTIME: a3s-loop
+      AGENT_ID: docker-a3s-code-loop
+      AGENT_INTERVAL_SECONDS: ${A3S_INTERVAL_SECONDS:-20}
+    labels:
+      anysentry.io/workload-kind: agent
+      anysentry.io/agent-id: docker-a3s-code-loop
+      anysentry.io/agent-runtime: a3s-code
+    volumes:
+      - a3s-workspace:/workspace
+
+  pi-agent:
+    image: ${AGENT_LAB_IMAGE:-anysentry-agent-runtime-lab:0.1.0}
+    build:
+      context: .
+    container_name: anysentry-test-pi
+    restart: unless-stopped
+    environment:
+      AGENT_RUNTIME: pi
+      AGENT_ID: docker-pi-agent
+      AGENT_INTERVAL_SECONDS: ${PI_INTERVAL_SECONDS:-60}
+      PI_EXECUTION_MODE: ${PI_EXECUTION_MODE:-auto}
+      PI_PROVIDER: ${PI_PROVIDER:-}
+      PI_MODEL: ${PI_MODEL:-}
+      PI_THINKING: ${PI_THINKING:-low}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    labels:
+      anysentry.io/workload-kind: agent
+      anysentry.io/agent-id: docker-pi-agent
+      anysentry.io/agent-runtime: pi
+    volumes:
+      - pi-workspace:/workspace
+      - pi-state:/home/node/.pi/agent
+
+  docker-observer:
+    profiles: [observe]
+    image: ${ANYSENTRY_OBSERVER_IMAGE:-127.0.0.1:5000/anysentry-observer:agent-runtime-lab}
+    container_name: anysentry-agent-lab-observer
+    restart: unless-stopped
+    privileged: true
+    pid: host
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        node /opt/legacy-ingest-proxy.cjs &
+        a3s-observer-collector | node /opt/observer-forward.js
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      A3S_OBSERVER_JSON: "1"
+      A3S_OBSERVER_COLLECTOR_ID: agent-runtime-lab-docker-agent-scope
+      A3S_NODE_NAME: agent-runtime-lab-docker-host
+      ANYSENTRY_INGEST_URL: ${ANYSENTRY_DOCKER_INGEST_URL:-http://host.docker.internal:29653/security-center/ingest}
+      ANYSENTRY_BATCH_INGEST_URL: http://127.0.0.1:29654/security-center/ingest/batch
+      ANYSENTRY_LEGACY_AGENT_IDS: docker-a3s-code-loop,docker-pi-agent
+      ANYSENTRY_SOURCE_TYPE: observer
+      ANYSENTRY_SOURCE_NAME: agent-runtime-lab-docker-observer
+      ANYSENTRY_HEARTBEAT_SECS: "5"
+      ANYSENTRY_IDENTITY_SNAPSHOT_SECS: "0"
+      ANYSENTRY_DOCKER_DISCOVERY: "on"
+      FORWARD_SCOPE: agent
+    volumes:
+      - /sys:/sys:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+volumes:
+  a3s-workspace:
+  pi-workspace:
+  pi-state:

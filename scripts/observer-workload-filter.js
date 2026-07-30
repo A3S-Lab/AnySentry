@@ -1,5 +1,7 @@
 'use strict';
 
+const fs = require('node:fs');
+
 function text(value) {
   return typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
 }
@@ -47,6 +49,16 @@ function eventIdentityCandidates(observerEvent) {
       Object.keys(workload).length > 0 ||
       /(?:kubepods|docker|containerd|crio|libpod)/i.test(cgroup),
   };
+}
+
+function readProcCgroup(pid, procRoot = '/proc') {
+  const normalizedPid = Number(pid);
+  if (!Number.isInteger(normalizedPid) || normalizedPid <= 0) return '';
+  try {
+    return fs.readFileSync(`${procRoot}/${normalizedPid}/cgroup`, 'utf8').trim();
+  } catch {
+    return '';
+  }
 }
 
 function attributionFor(entry) {
@@ -118,6 +130,10 @@ class WorkloadIdentityCache {
     this.hits = 0;
     this.misses = 0;
     this.templateRegistry = options.templateRegistry;
+    this.readProcCgroup =
+      typeof options.readProcCgroup === 'function'
+        ? options.readProcCgroup
+        : (pid) => readProcCgroup(pid, options.procRoot);
     this.sources = new Map();
     this.sourceMetrics = new Map();
     this.candidateCache = new Map();
@@ -125,6 +141,7 @@ class WorkloadIdentityCache {
     this.maxEventKeys = Math.max(1_000, Number(options.maxEventKeys) || 50_000);
     this.cgroupHits = 0;
     this.cgroupMisses = 0;
+    this.procCgroupReads = 0;
   }
 
   replace(snapshot, sourceKey = 'kubernetes') {
@@ -242,7 +259,31 @@ class WorkloadIdentityCache {
     if (candidateKey && this.candidateCache.has(candidateKey)) {
       identity = this.candidateCache.get(candidateKey);
     } else {
-      identity = eventIdentityCandidates(observerEvent);
+      let identityEvent = observerEvent;
+      if (!text(processInfo.cgroup)) {
+        const rawPayload = Object.values(observerEvent?.event ?? {})[0];
+        const payload = rawPayload && typeof rawPayload === 'object' ? rawPayload : {};
+        const candidatePids = [
+          Number(processInfo.pid) || Number(payload.pid) || Number(observerEvent?.identity?.task),
+          Number(processInfo.ppid) || Number(payload.ppid),
+        ].filter((pid, index, values) => Number.isInteger(pid) && pid > 0 && values.indexOf(pid) === index);
+        let procCgroup = '';
+        for (const pid of candidatePids) {
+          this.procCgroupReads++;
+          procCgroup = this.readProcCgroup(pid);
+          if (procCgroup) break;
+        }
+        if (procCgroup) {
+          identityEvent = {
+            ...observerEvent,
+            process: {
+              ...processInfo,
+              cgroup: procCgroup,
+            },
+          };
+        }
+      }
+      identity = eventIdentityCandidates(identityEvent);
       if (candidateKey) {
         if (this.candidateCache.size >= this.maxEventKeys) {
           const oldest = this.candidateCache.keys().next().value;
@@ -313,6 +354,7 @@ class WorkloadIdentityCache {
       cgroupBindings: this.cgroupBindings.size,
       cgroupHits: this.cgroupHits,
       cgroupMisses: this.cgroupMisses,
+      procCgroupReads: this.procCgroupReads,
     };
   }
 }
