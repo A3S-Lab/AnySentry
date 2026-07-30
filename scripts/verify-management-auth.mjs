@@ -18,6 +18,7 @@ const expectedProtectedRoutes = [
   'PUT alerts/:alertId',
   'PUT remediations/:taskId',
   'PUT agents/:agentId/metadata',
+  'PUT agents/:agentId/review',
   'POST sources',
   'PUT sources/:sourceId',
   'POST sources/:sourceId/rotate-token',
@@ -97,6 +98,7 @@ function protectedWriteProbes(id) {
     { route: 'PUT alerts/:alertId', label: 'alert update', method: 'PUT', path: `/alerts/${id}-missing-alert`, body: { status: 'acknowledged', note: 'auth guard probe' } },
     { route: 'PUT remediations/:taskId', label: 'remediation update', method: 'PUT', path: `/remediations/${id}-missing-task`, body: { status: 'done', note: 'auth guard probe' } },
     { route: 'PUT agents/:agentId/metadata', label: 'agent metadata update', method: 'PUT', path: `/agents/${id}-metadata-agent/metadata`, body: { workspacePath: `repo://${id}/auth`, owner: `${id}-owner` } },
+    { route: 'PUT agents/:agentId/review', label: 'agent review update', method: 'PUT', path: `/agents/${id}-review-agent/review`, body: { workspacePath: `repo://${id}/auth`, decision: 'non_agent', identityKeys: [`container:${id}`] } },
     { route: 'PUT sources/:sourceId', label: 'source update', method: 'PUT', path: `/sources/${id}-missing-source`, body: { name: `${id} source`, type: 'webhook', requireToken: true } },
     { route: 'POST sources/:sourceId/rotate-token', label: 'source token rotation', method: 'POST', path: `/sources/${id}-missing-source/rotate-token` },
     {
