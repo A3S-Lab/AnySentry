@@ -163,10 +163,15 @@ accept concise deployment/name declarations and may be refined with Kubernetes n
 container/owner, Docker container/image, or bare-metal systemd/executable fields. Missing templates
 do not classify a workload as non-Agent.
 
-`ANYSENTRY_AGENT_NAMESPACES` accepts a comma-separated namespaced allowlist. Setting it to `*`
-switches the registry to the cluster-scoped Pod list/watch endpoint, which covers namespaces
-created later without a restart but requires a read-only ClusterRole/ClusterRoleBinding supplied by
-the operator. The bundled manifest intentionally keeps namespaced RBAC as the default.
+`ANYSENTRY_IDENTITY_NAMESPACES` defaults to `*`, using the bundled read-only
+ClusterRole/ClusterRoleBinding to map CRI/containerd IDs for every namespace. This identity map is
+not an Agent allowlist: unlabelled infrastructure Pods remain `unknown` until behavior analysis or
+human review classifies them. Set a comma-separated namespace allowlist and replace the binding
+with equivalent namespaced Roles only when deliberately trading complete friendly-name coverage
+for narrower metadata visibility. `ANYSENTRY_AGENT_NAMESPACES` remains a compatibility fallback.
+For an out-of-cluster source deployment, set `ANYSENTRY_KUBECONFIG` (or `KUBECONFIG`) to a
+kubeconfig containing CA plus client-certificate/client-key or bearer-token credentials. The API
+also detects `~/.kube/config`; `ANYSENTRY_KUBE_CONTEXT` overrides its current context.
 
 For Docker hosts, run the forwarder on the node with read access to `/var/run/docker.sock`, or set
 `ANYSENTRY_DOCKER_SOCKET` to another Docker-compatible Unix socket. Discovery defaults to `auto`

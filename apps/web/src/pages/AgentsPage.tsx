@@ -155,6 +155,40 @@ function classificationClass(classification: AgentClassification) {
   return "border-white/10 bg-white/5 text-zinc-400";
 }
 
+function classificationNameClass(classification: AgentClassification) {
+  if (classification === "confirmed_agent") return "text-emerald-200";
+  if (classification === "probable_agent") return "text-amber-200";
+  if (classification === "non_agent") return "text-slate-400";
+  return "text-zinc-300";
+}
+
+function agentPrimaryName(agent: AgentInventoryItem) {
+  const customName = agent.displayName?.trim();
+  if (customName) return customName;
+  const workload = agent.workloadRef;
+  if (workload?.environment === "kubernetes") {
+    const parts = [workload.namespace, workload.podName, workload.containerName]
+      .map((part) => part?.trim())
+      .filter((part): part is string => Boolean(part));
+    if (parts.length) return parts.join("/");
+  }
+  if (workload?.environment === "docker" && workload.containerName?.trim()) {
+    return workload.containerName.trim();
+  }
+  if (workload?.environment === "host") {
+    const processName = workload.processName?.trim() || workload.name?.trim();
+    if (processName && !processName.startsWith("session-")) return processName;
+  }
+  return agent.agentId;
+}
+
+function agentRuntimeLabel(agent: AgentInventoryItem) {
+  if (agent.workloadRef?.environment === "kubernetes") return "K8s";
+  if (agent.workloadRef?.environment === "docker") return "Docker";
+  if (agent.workloadRef?.environment === "host") return "本地服务";
+  return undefined;
+}
+
 function splitTags(value: string) {
   return [...new Set(value
     .split(/[,，\s]+/)
@@ -293,6 +327,8 @@ function AgentRow({
   active: boolean;
   onSelect: () => void;
 }) {
+  const primaryName = agentPrimaryName(agent);
+  const runtimeLabel = agentRuntimeLabel(agent);
   return (
     <button
       type="button"
@@ -304,8 +340,11 @@ function AgentRow({
     >
       <span className="font-mono text-xs text-zinc-500">{formatDate(agent.lastSeen)}</span>
       <span className="min-w-0">
-        <span className="block truncate text-sm font-medium text-zinc-100" title={agent.displayName || agent.agentId}>
-          {agent.displayName || agent.agentId}
+        <span className="flex min-w-0 items-center gap-1.5" title={primaryName}>
+          <span className={cn("min-w-0 truncate text-sm font-semibold", classificationNameClass(agent.classification))}>
+            {primaryName}
+          </span>
+          {runtimeLabel ? <Pill className="shrink-0 border-white/10 bg-white/5 text-zinc-400">{runtimeLabel}</Pill> : null}
         </span>
         <span className="mt-0.5 block truncate font-mono text-[11px] text-zinc-600" title={agent.workspacePath}>
           {agent.owner ? `${agent.owner} · ` : ""}{agent.workspacePath}
@@ -346,13 +385,16 @@ function AgentDetail({
 
   const categoryRows = countRows(agent.eventCategoryCounts, CATEGORY_LABEL);
   const sourceRows = countRows(agent.sourceCounts, SOURCE_LABEL);
+  const primaryName = agentPrimaryName(agent);
+  const runtimeLabel = agentRuntimeLabel(agent);
 
   return (
     <section className="rounded-[8px] border border-white/10 bg-[#111612]/92">
       <div className="flex min-h-12 items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
         <div className="flex min-w-0 items-center gap-2">
           <Bot className="size-4 shrink-0 text-teal-200" />
-          <h2 className="truncate text-sm font-semibold text-zinc-100">{agent.agentId}</h2>
+          <h2 className={cn("truncate text-sm font-semibold", classificationNameClass(agent.classification))}>{primaryName}</h2>
+          {runtimeLabel ? <Pill className="shrink-0 border-white/10 bg-white/5 text-zinc-400">{runtimeLabel}</Pill> : null}
         </div>
         <div className="flex items-center gap-2">
           <Pill className={classificationClass(agent.classification)}>{CLASSIFICATION_LABEL[agent.classification]}</Pill>
@@ -363,7 +405,8 @@ function AgentDetail({
 
       <div className="space-y-4 p-4">
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-          <FieldValue label="Agent" value={agent.agentId} />
+          <FieldValue label="Agent" value={primaryName} />
+          <FieldValue label="内部 Scope" value={agent.agentId} />
           <FieldValue label="Workspace" value={agent.workspacePath} />
           <FieldValue label="User" value={agent.userId} />
           <FieldValue label="Owner" value={agent.owner} />

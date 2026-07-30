@@ -1,6 +1,9 @@
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { delimiter, dirname, isAbsolute, resolve } from 'node:path';
 import * as https from 'node:https';
+import { parse as parseYaml } from 'yaml';
 import { EventMeta, WorkloadIdentitySnapshot, WorkloadIdentitySnapshotEntry } from './types';
 
 const SA = '/var/run/secrets/kubernetes.io/serviceaccount';
@@ -59,6 +62,46 @@ interface Tombstone {
   expiresAt: number;
 }
 
+interface KubeConfigDocument {
+  'current-context'?: string;
+  clusters?: Array<{
+    name?: string;
+    cluster?: {
+      server?: string;
+      'certificate-authority'?: string;
+      'certificate-authority-data'?: string;
+      'insecure-skip-tls-verify'?: boolean;
+    };
+  }>;
+  contexts?: Array<{
+    name?: string;
+    context?: {
+      cluster?: string;
+      user?: string;
+    };
+  }>;
+  users?: Array<{
+    name?: string;
+    user?: {
+      token?: string;
+      'tokenFile'?: string;
+      'client-certificate'?: string;
+      'client-certificate-data'?: string;
+      'client-key'?: string;
+      'client-key-data'?: string;
+    };
+  }>;
+}
+
+interface KubeConnection {
+  server: URL;
+  ca?: Buffer;
+  cert?: Buffer;
+  key?: Buffer;
+  token?: string;
+  rejectUnauthorized: boolean;
+}
+
 function positiveNumber(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -86,6 +129,23 @@ function boundedLabels(labels: Record<string, string>): Record<string, string> {
   );
 }
 
+function firstKubeconfigPath(): string {
+  const configured =
+    process.env.ANYSENTRY_KUBECONFIG?.trim() ||
+    process.env.KUBECONFIG?.split(delimiter).map((value) => value.trim()).find(Boolean);
+  return resolve(configured || `${homedir()}/.kube/config`);
+}
+
+function configBytes(
+  configDirectory: string,
+  encoded: string | undefined,
+  filename: string | undefined,
+): Buffer | undefined {
+  if (encoded?.trim()) return Buffer.from(encoded.trim(), 'base64');
+  if (!filename?.trim()) return undefined;
+  return readFileSync(isAbsolute(filename) ? filename : resolve(configDirectory, filename));
+}
+
 /**
  * Kubernetes workload registry for the observation filter.
  *
@@ -106,11 +166,19 @@ export class KubeIdentityService implements OnModuleInit, OnModuleDestroy {
   private version = 0;
   private errorCount = 0;
   private destroyed = false;
+  private connection?: KubeConnection;
 
   private readonly enabled =
-    Boolean(process.env.KUBERNETES_SERVICE_HOST) &&
+    (
+      Boolean(process.env.KUBERNETES_SERVICE_HOST) ||
+      existsSync(firstKubeconfigPath())
+    ) &&
     process.env.ANYSENTRY_KUBE_ENRICH !== 'off';
-  private readonly agentNs = (process.env.ANYSENTRY_AGENT_NAMESPACES ?? 'default')
+  private readonly agentNs = (
+    process.env.ANYSENTRY_IDENTITY_NAMESPACES ??
+    process.env.ANYSENTRY_AGENT_NAMESPACES ??
+    '*'
+  )
     .split(',')
     .map((value) => value.trim())
     .filter(Boolean);
@@ -167,6 +235,19 @@ export class KubeIdentityService implements OnModuleInit, OnModuleDestroy {
         agentDisplayName: entry.agentDisplayName,
         agentInstanceId: entry.agentInstanceId,
         physicalWorkloadId: entry.physicalWorkloadId,
+        workloadRef: {
+          environment: 'kubernetes',
+          kind: entry.containerName ? 'container' : 'pod',
+          name: entry.podName ?? entry.containerName,
+          namespace: entry.namespace,
+          podName: entry.podName,
+          podUid: entry.podUid,
+          nodeName: entry.nodeName,
+          containerName: entry.containerName,
+          containerImage: entry.containerImage,
+          ownerKind: entry.ownerKind,
+          ownerName: entry.ownerName,
+        },
         confidence: entry.classification === 'confirmed_agent' ? 1 : entry.classification === 'probable_agent' ? 0.7 : 0,
         reason:
           entry.classification === 'confirmed_agent'
@@ -508,23 +589,77 @@ export class KubeIdentityService implements OnModuleInit, OnModuleDestroy {
     path: string,
     onResponse: (response: import('node:http').IncomingMessage) => void,
   ): ReturnType<typeof https.request> {
-    const host = process.env.KUBERNETES_SERVICE_HOST;
-    const port = process.env.KUBERNETES_SERVICE_PORT_HTTPS ?? '443';
-    const token = readFileSync(`${SA}/token`, 'utf8').trim();
-    const ca = readFileSync(`${SA}/ca.crt`);
+    const connection = this.connection ?? this.loadConnection();
+    this.connection = connection;
+    const prefix = connection.server.pathname.replace(/\/+$/, '');
     return https.request(
       {
-        host,
-        port,
-        path,
+        hostname: connection.server.hostname,
+        port: connection.server.port || '443',
+        path: `${prefix}${path}`,
         method: 'GET',
         headers: {
-          Authorization: `Bearer ${token}`,
+          ...(connection.token ? { Authorization: `Bearer ${connection.token}` } : {}),
           Accept: 'application/json',
         },
-        ca,
+        ca: connection.ca,
+        cert: connection.cert,
+        key: connection.key,
+        rejectUnauthorized: connection.rejectUnauthorized,
       },
       onResponse,
     );
+  }
+
+  private loadConnection(): KubeConnection {
+    const host = process.env.KUBERNETES_SERVICE_HOST?.trim();
+    if (host) {
+      const port = process.env.KUBERNETES_SERVICE_PORT_HTTPS?.trim() || '443';
+      return {
+        server: new URL(`https://${host}:${port}`),
+        token: readFileSync(`${SA}/token`, 'utf8').trim(),
+        ca: readFileSync(`${SA}/ca.crt`),
+        rejectUnauthorized: true,
+      };
+    }
+
+    const configPath = firstKubeconfigPath();
+    const document = parseYaml(readFileSync(configPath, 'utf8')) as KubeConfigDocument;
+    const contextName =
+      process.env.ANYSENTRY_KUBE_CONTEXT?.trim() ||
+      document['current-context']?.trim();
+    const context = document.contexts?.find((candidate) => candidate.name === contextName)?.context;
+    if (!context?.cluster) throw new Error(`kubeconfig context is missing: ${contextName || '<current-context>'}`);
+    const cluster = document.clusters?.find((candidate) => candidate.name === context.cluster)?.cluster;
+    if (!cluster?.server) throw new Error(`kubeconfig cluster is missing: ${context.cluster}`);
+    const server = new URL(cluster.server);
+    if (server.protocol !== 'https:') throw new Error(`kubeconfig server must use https: ${server.protocol}`);
+    const user = document.users?.find((candidate) => candidate.name === context.user)?.user;
+    const configDirectory = dirname(configPath);
+    const tokenFile = user?.tokenFile?.trim();
+    return {
+      server,
+      ca: configBytes(
+        configDirectory,
+        cluster['certificate-authority-data'],
+        cluster['certificate-authority'],
+      ),
+      cert: configBytes(
+        configDirectory,
+        user?.['client-certificate-data'],
+        user?.['client-certificate'],
+      ),
+      key: configBytes(
+        configDirectory,
+        user?.['client-key-data'],
+        user?.['client-key'],
+      ),
+      token:
+        user?.token?.trim() ||
+        (tokenFile
+          ? readFileSync(isAbsolute(tokenFile) ? tokenFile : resolve(configDirectory, tokenFile), 'utf8').trim()
+          : undefined),
+      rejectUnauthorized: cluster['insecure-skip-tls-verify'] !== true,
+    };
   }
 }

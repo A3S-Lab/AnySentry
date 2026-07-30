@@ -105,7 +105,8 @@ function verifyAnySentryManifest() {
   const anySentryService = docFor(docs, 'Service', 'anysentry');
   const clickHouseDeployment = docFor(docs, 'Deployment', 'clickhouse');
   const clickHouseService = docFor(docs, 'Service', 'clickhouse');
-  const podReaderRole = docFor(docs, 'Role', 'anysentry-pod-reader');
+  const podReaderRole = docFor(docs, 'ClusterRole', 'anysentry-pod-reader');
+  const podReaderBinding = docFor(docs, 'ClusterRoleBinding', 'anysentry-pod-reader');
 
   assert('AnySentry Deployment manifest exists', Boolean(anySentryDeployment));
   assert(
@@ -129,8 +130,8 @@ function verifyAnySentryManifest() {
     anySentryDeployment?.source,
   );
   assert(
-    'AnySentry Deployment configures workload identity namespaces and label selector',
-    /\{\s*name:\s*ANYSENTRY_AGENT_NAMESPACES,\s*value:\s*"anysentry"\s*\}/u.test(anySentryDeployment?.source ?? '') &&
+    'AnySentry Deployment configures cluster-wide workload identity and an independent Agent label selector',
+    /\{\s*name:\s*ANYSENTRY_IDENTITY_NAMESPACES,\s*value:\s*"\*"\s*\}/u.test(anySentryDeployment?.source ?? '') &&
       /\{\s*name:\s*ANYSENTRY_AGENT_LABEL_SELECTOR,\s*value:\s*"anysentry\.io\/workload-kind=agent"\s*\}/u.test(anySentryDeployment?.source ?? ''),
     anySentryDeployment?.source,
   );
@@ -161,15 +162,21 @@ function verifyAnySentryManifest() {
     clickHouseService?.source,
   );
 
-  assert('AnySentry pod identity uses a namespaced Role, not ClusterRole', Boolean(podReaderRole) && !docs.some((doc) => doc.kind === 'ClusterRole' || doc.kind === 'ClusterRoleBinding'), {
+  assert('AnySentry pod identity uses a cluster-wide read-only Pod metadata binding', Boolean(podReaderRole) && Boolean(podReaderBinding), {
     kinds: docs.map((doc) => `${doc.kind}/${doc.name}`),
   });
   assert(
-    'AnySentry pod reader Role is read-only for pods',
+    'AnySentry pod reader ClusterRole is read-only for pods',
     /resources:\s*\["pods"\]/u.test(podReaderRole?.source ?? '') &&
       /verbs:\s*\["get",\s*"list",\s*"watch"\]/u.test(podReaderRole?.source ?? '') &&
       !/\b(create|update|patch|delete)\b/u.test(podReaderRole?.source ?? ''),
     podReaderRole?.source,
+  );
+  assert(
+    'AnySentry pod reader ClusterRoleBinding targets only its ServiceAccount',
+    /kind:\s*ClusterRole[\s\S]*name:\s*anysentry-pod-reader/u.test(podReaderBinding?.source ?? '') &&
+      /kind:\s*ServiceAccount[\s\S]*name:\s*anysentry[\s\S]*namespace:\s*anysentry/u.test(podReaderBinding?.source ?? ''),
+    podReaderBinding?.source,
   );
 }
 

@@ -272,17 +272,23 @@ The observer is a DaemonSet, so it targets every schedulable Linux/amd64 node. E
 `A3S_OBSERVER_COLLECTOR_ID` / `A3S_NODE_NAME`; the dashboard then shows coverage, heartbeats, and
 risk events per node. Nodes are not covered when the cluster cannot schedule the privileged eBPF
 pod there, for example on managed control-plane nodes, incompatible architectures, or clusters that
-block privileged/eBPF workloads. AnySentry also focuses the dashboard on agent workloads by default:
-set `ANYSENTRY_AGENT_NAMESPACES` and matching namespaced pod-reader Roles for the namespaces where
-your agents actually run. Mark Agent Pods with
+block privileged/eBPF workloads. The bundled AnySentry deployment reads Pod metadata cluster-wide
+so CRI/containerd IDs are resolved to `namespace/Pod/container` independently of whether a workload
+is an Agent. Mark Agent Pods with
 `anysentry.io/workload-kind=agent` and `anysentry.io/agent-id=<stable-agent-id>`. Multi-container
 Pods must also set `anysentry.io/agent-container=<container-name>` so sidecars do not inherit the
 Agent classification.
 
-Set `ANYSENTRY_AGENT_NAMESPACES=*` only when the AnySentry ServiceAccount has a read-only
-cluster-wide Pod `list/watch` permission. This mode uses one cluster-scoped list/watch and discovers
-new namespaces without restarting AnySentry. The bundled manifest remains namespaced and
-least-privilege by default.
+`ANYSENTRY_IDENTITY_NAMESPACES` defaults to `*` and the bundled ServiceAccount receives only
+cluster-wide Pod `get/list/watch`. Set it to a comma-separated namespace allowlist and replace the
+ClusterRoleBinding with matching namespaced Roles only when namespace metadata must be restricted;
+containers outside that allowlist remain observable but cannot receive friendly Kubernetes names.
+The legacy `ANYSENTRY_AGENT_NAMESPACES` variable remains a fallback for existing installations.
+When the API runs from source outside Kubernetes, it uses `ANYSENTRY_KUBECONFIG`, `KUBECONFIG`, or
+`~/.kube/config` (in that order), including CA, client-certificate, client-key, and bearer-token
+credentials. Set `ANYSENTRY_KUBE_CONTEXT` to override the file's current context. Exec-based cloud
+credential plugins are not invoked; use an already materialized certificate/token or run the API
+in-cluster for those environments.
 
 If your cluster cannot pull the public observer-forwarder image, build and push it, then set
 `ANYSENTRY_OBSERVER_IMAGE`:

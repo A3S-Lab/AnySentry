@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 process.env.KUBERNETES_SERVICE_HOST = 'kubernetes.test';
 process.env.ANYSENTRY_AGENT_NAMESPACES = 'agents';
@@ -95,6 +98,19 @@ const enriched = service.enrich({
 assert.equal(enriched.agentId, 'claw-agent');
 assert.equal(enriched.attribution?.classification, 'confirmed_agent');
 assert.equal(enriched.attribution?.source, 'kubernetes');
+assert.deepEqual(enriched.attribution?.workloadRef, {
+  environment: 'kubernetes',
+  kind: 'container',
+  name: 'claw-agent-7',
+  namespace: 'agents',
+  podName: 'claw-agent-7',
+  podUid: 'pod-agent-uid',
+  nodeName: 'node-a',
+  containerName: 'agent',
+  containerImage: 'company/claw:v1',
+  ownerKind: 'Deployment',
+  ownerName: 'claw-agent',
+});
 
 const sidecar = service.enrich({
   workspacePath: 'agent://pod-agent-uid',
@@ -106,8 +122,59 @@ assert.equal(sidecar.agentId, 'pod-agent-uid');
 assert.equal(sidecar.attribution?.classification, 'non_agent');
 assert.equal(sidecar.attribution?.monitored, false);
 
+const infrastructure = service.enrich({
+  workspacePath: 'agent://pod-infra-uid',
+  agentId: 'cri-containerd-infrastructure.scope',
+  sessionId: infraId.slice(0, 12),
+  userId: 'uid:1000',
+});
+assert.equal(infrastructure.agentId, 'cri-containerd-infrastructure.scope');
+assert.equal(infrastructure.attribution?.classification, 'unknown');
+assert.equal(infrastructure.attribution?.workloadRef?.namespace, 'agents');
+assert.equal(infrastructure.attribution?.workloadRef?.podName, 'database');
+assert.equal(infrastructure.attribution?.workloadRef?.containerName, 'database');
+
 service.podsByNamespace.set('agents', new Map());
 service.rebuild();
 assert.equal(service.snapshot().entries.length, 0, 'an authoritative empty list clears active identities');
+
+const kubeconfigDirectory = mkdtempSync(join(tmpdir(), 'anysentry-kubeconfig-'));
+const kubeconfigPath = join(kubeconfigDirectory, 'config');
+try {
+  writeFileSync(kubeconfigPath, `
+apiVersion: v1
+kind: Config
+current-context: local-test
+clusters:
+  - name: local
+    cluster:
+      server: https://127.0.0.1:6443
+      certificate-authority-data: ${Buffer.from('test-ca').toString('base64')}
+contexts:
+  - name: local-test
+    context:
+      cluster: local
+      user: local-user
+users:
+  - name: local-user
+    user:
+      client-certificate-data: ${Buffer.from('test-cert').toString('base64')}
+      client-key-data: ${Buffer.from('test-key').toString('base64')}
+`, 'utf8');
+  delete process.env.KUBERNETES_SERVICE_HOST;
+  delete process.env.ANYSENTRY_AGENT_NAMESPACES;
+  process.env.ANYSENTRY_KUBECONFIG = kubeconfigPath;
+  const localService = new KubeIdentityService();
+  const localConnection = localService.loadConnection();
+  assert.equal(localService.enabled, true, 'an out-of-cluster kubeconfig enables identity enrichment');
+  assert.deepEqual(localService.agentNs, ['*'], 'identity discovery covers every namespace by default');
+  assert.equal(localConnection.server.toString(), 'https://127.0.0.1:6443/');
+  assert.equal(localConnection.ca.toString(), 'test-ca');
+  assert.equal(localConnection.cert.toString(), 'test-cert');
+  assert.equal(localConnection.key.toString(), 'test-key');
+} finally {
+  delete process.env.ANYSENTRY_KUBECONFIG;
+  rmSync(kubeconfigDirectory, { recursive: true, force: true });
+}
 
 console.log('Kubernetes identity registry verification passed.');

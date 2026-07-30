@@ -410,6 +410,20 @@ async function verifyDashboardSourceContracts() {
     },
   );
   assert(
+    'dashboard renders Kubernetes candidate identity as namespace/Pod/container before internal scope IDs',
+    agentsPage.includes('function agentPrimaryName(agent: AgentInventoryItem)') &&
+      agentsPage.includes('return parts.join("/")') &&
+      agentsPage.includes('<FieldValue label="内部 Scope" value={agent.agentId} />') &&
+      agentsPage.includes('{runtimeLabel ? <Pill') &&
+      agentsPage.includes('classificationNameClass(agent.classification)'),
+    {
+      hasFriendlyName: agentsPage.includes('return parts.join("/")'),
+      hasInternalScopeDetail: agentsPage.includes('<FieldValue label="内部 Scope" value={agent.agentId} />'),
+      hasRuntimeTag: agentsPage.includes('{runtimeLabel ? <Pill'),
+      hasClassificationColor: agentsPage.includes('classificationNameClass(agent.classification)'),
+    },
+  );
+  assert(
     'dashboard AI Operator uses progressive planning, progressive evidence, and shared handoffs',
     operatorPage.includes('securityCenterApi.nextActionPlan(params)') &&
       operatorPage.includes('securityCenterApi.evidenceBundleCapability(evidenceBundleParams(action.evidence.bundleHint, action, timeType))') &&
