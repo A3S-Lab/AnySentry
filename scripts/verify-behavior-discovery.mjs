@@ -134,7 +134,7 @@ assert.equal(
   undefined,
 );
 assert.equal(
-  sequenceDetector.observe(event('Egress', { pid: 500, host: 'registry.example.test' }, '500')),
+  sequenceDetector.observe(event('Egress', { pid: 500, peer: '203.0.113.10', port: 443 }, '500')),
   undefined,
 );
 assert.equal(
@@ -148,6 +148,22 @@ assert.equal(sequenceCandidate?.state, 'agent');
 assert.ok(
   sequenceCandidate.attribution.evidence.includes('behavior:agent_sequences=1'),
   'tool → decision/network → different tool → workspace forms one Agent sequence',
+);
+
+const dnsSequenceDetector = new BehavioralAgentDetector({
+  now: () => now,
+  threshold: 8,
+  negativeMinAgeMs: 1_000,
+});
+dnsSequenceDetector.observe(event('ToolExec', { pid: 510, argv: ['git', 'status'] }, '510'));
+dnsSequenceDetector.observe(event('Dns', { pid: 510, query: 'registry.example.test' }, '510'));
+dnsSequenceDetector.observe(event('ToolExec', { pid: 511, argv: ['npm', 'test'] }, '510'));
+const dnsSequenceCandidate = dnsSequenceDetector.observe(
+  event('FileAccess', { pid: 511, path: '/workspace/dns-test-results.json' }, '510'),
+);
+assert.ok(
+  dnsSequenceCandidate?.attribution.evidence.includes('behavior:agent_sequences=1'),
+  'Observer-native Dns.query is a decision/network step in the Agent sequence',
 );
 
 const bulkActivity = new BehavioralAgentDetector({ now: () => now, threshold: 8 });

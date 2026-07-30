@@ -79,7 +79,9 @@ function targetText(payload) {
     payload.host ??
       payload.hostname ??
       payload.domain ??
+      payload.query ??
       payload.address ??
+      payload.peer ??
       payload.remote ??
       payload.endpoint ??
       payload.url ??
