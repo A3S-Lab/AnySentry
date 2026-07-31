@@ -287,6 +287,8 @@ async function verifyIncidents() {
 }
 
 async function verifyAgentsAndWorkspaces() {
+  const workspaceAgentA = `${runId}-workspace-agent-a`;
+  const workspaceAgentB = `${runId}-workspace-agent-b`;
   await request(`/agents/${encodeURIComponent(ids.agentA)}/metadata`, 'PUT', {
     workspacePath: ids.workspaceAgents,
     displayName: `${runId} Agent A`,
@@ -303,20 +305,42 @@ async function verifyAgentsAndWorkspaces() {
     criticality: 'low',
     tags: [runId],
   });
-  await request(`/agents/${encodeURIComponent(`${runId}-workspace-agent-a`)}/metadata`, 'PUT', {
+  await request(`/agents/${encodeURIComponent(workspaceAgentA)}/metadata`, 'PUT', {
     workspacePath: ids.workspaceA,
     displayName: `${runId} Workspace A`,
     environment: 'dev',
     criticality: 'low',
     tags: [runId],
   });
-  await request(`/agents/${encodeURIComponent(`${runId}-workspace-agent-b`)}/metadata`, 'PUT', {
+  await request(`/agents/${encodeURIComponent(workspaceAgentB)}/metadata`, 'PUT', {
     workspacePath: ids.workspaceB,
     displayName: `${runId} Workspace B`,
     environment: 'dev',
     criticality: 'low',
     tags: [runId],
   });
+  for (const [agentId, workspacePath] of [
+    [ids.agentA, ids.workspaceAgents],
+    [ids.agentB, ids.workspaceAgents],
+    [workspaceAgentA, ids.workspaceA],
+    [workspaceAgentB, ids.workspaceB],
+  ]) {
+    await request(`/agents/${encodeURIComponent(agentId)}/review`, 'PUT', {
+      workspacePath,
+      decision: 'confirmed_agent',
+      currentClassification: 'unknown',
+      identityKeys: [agentId],
+      agentInstanceId: `deep-link:${agentId}`,
+      physicalWorkloadId: `deep-link:${workspacePath}:${agentId}`,
+      workloadRef: {
+        environment: 'host',
+        kind: 'process',
+        name: agentId,
+        processName: agentId,
+      },
+      note: 'confirmed by deep-link verifier',
+    });
+  }
 
   const exactAgent = await request('/agents/inventory', 'POST', { timeType: 'last_30d', agentId: ids.agentA, workspacePath: ids.workspaceAgents, limit: 20 });
   const pinnedAgent = await request('/agents/inventory', 'POST', { timeType: 'last_30d', agentId: ids.agentA, workspacePath: ids.workspaceAgents, healthState: 'stale', q: ids.agentB, limit: 20 });
