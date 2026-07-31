@@ -141,7 +141,17 @@ export class ObjectiveService implements OnModuleInit, OnModuleDestroy {
     const pinnedObjectiveId = query.objectiveId?.trim();
     const targetId = query.targetId?.trim();
     const hasFilter = Boolean((query.status && query.status !== 'all') || (query.targetType && query.targetType !== 'all') || targetId || (query.metric && query.metric !== 'all') || q);
-    const items = [...this.objectives.values()]
+    const records = [...this.objectives.values()].filter((record) => {
+      const matchesObjectiveId = Boolean(pinnedObjectiveId && record.objectiveId === pinnedObjectiveId);
+      const matchesIndexedSelectors =
+        (!query.targetType || query.targetType === 'all' || record.targetType === query.targetType) &&
+        (!targetId || record.targetId === targetId) &&
+        (!query.metric || query.metric === 'all' || record.metric === query.metric);
+      const hasIndexedSelector = Boolean((query.targetType && query.targetType !== 'all') || targetId || (query.metric && query.metric !== 'all'));
+      if (pinnedObjectiveId) return matchesObjectiveId || (hasFilter && matchesIndexedSelectors);
+      return !hasIndexedSelector || matchesIndexedSelectors;
+    });
+    const items = records
       .map((record) => (options.observe === false ? this.evaluate(record, query) : this.evaluateAndObserve(record, query)))
       .filter((item) => {
         const matchesObjectiveId = Boolean(pinnedObjectiveId && item.objectiveId === pinnedObjectiveId);

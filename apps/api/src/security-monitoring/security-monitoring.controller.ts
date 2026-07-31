@@ -3659,14 +3659,17 @@ export class SecurityMonitoringController {
       ? this.maintenance.list({ ...timeFilter, windowId: relatedWindowId, status: 'all', limit: 1 }).items.find((item) => item.windowId === relatedWindowId)
       : undefined;
 
-    let remediation = explicitTaskId ? this.remediation.list({ ...timeFilter, taskId: explicitTaskId, status: 'all', limit: 1 }).items[0] : undefined;
+    let remediation = explicitTaskId ? this.remediation.list({ ...timeFilter, taskId: explicitTaskId, status: 'all', limit: 1 }, { refresh: false }).items[0] : undefined;
     if (!remediation && auditTaskId) {
-      remediation = this.remediation.list({ ...timeFilter, taskId: auditTaskId, status: 'all', limit: 1 }).items[0];
+      remediation = this.remediation.list({ ...timeFilter, taskId: auditTaskId, status: 'all', limit: 1 }, { refresh: false }).items[0];
     }
     if (!remediation && notificationDelivery?.taskId) {
-      remediation = this.remediation.list({ ...timeFilter, taskId: notificationDelivery.taskId, status: 'all', limit: 1 }).items[0];
+      remediation = this.remediation.list({ ...timeFilter, taskId: notificationDelivery.taskId, status: 'all', limit: 1 }, { refresh: false }).items[0];
     }
     if (!remediation && explicitIssueId) {
+      // A directly requested coverage issue is an intentional governance action:
+      // materialize its remediation chain once before the evidence bundle switches
+      // to read-only aggregation for all subsequent scoped lookups.
       remediation = this.remediation.list({ ...timeFilter, sourceType: 'coverage', status: 'all', issueId: explicitIssueId, limit: 20 }).items.find((item) => item.sourceId === explicitIssueId);
     }
     let alert = explicitAlertId ? this.alerting.list({ ...timeFilter, alertId: explicitAlertId, status: 'all', limit: 1 }).items[0] : undefined;
@@ -3883,7 +3886,7 @@ export class SecurityMonitoringController {
       agentId: scope.agentId,
       workspacePath: scope.workspacePath,
       limit,
-    });
+    }, { refresh: false });
     const remediationItems = new Map<string, T.RemediationListItem>();
     for (const item of remediations.items) {
       remediationItems.set(item.taskId, item);
@@ -3893,8 +3896,23 @@ export class SecurityMonitoringController {
       const [firstObjectiveId] = [...relatedObjectiveIds];
       objective = this.objectives.list({ ...timeFilter, objectiveId: firstObjectiveId, limit: 1 }, { observe: false }).items[0];
     }
-    const objectiveCandidates = this.objectives.list({ ...timeFilter, limit: 500 }, { observe: false }).items
-      .filter((item) => relatedObjectiveIds.has(item.objectiveId) || objectiveMatchesScope(item, scope));
+    const objectiveCandidateMap = new Map<string, T.ObjectiveItem>();
+    const addObjectiveCandidates = (query: T.ObjectiveQuery) => {
+      for (const item of this.objectives.list({ ...timeFilter, ...query, limit: 500 }, { observe: false }).items) {
+        if (relatedObjectiveIds.has(item.objectiveId) || objectiveMatchesScope(item, scope)) {
+          objectiveCandidateMap.set(item.objectiveId, item);
+        }
+      }
+    };
+    for (const objectiveId of relatedObjectiveIds) addObjectiveCandidates({ objectiveId });
+    if (scope.workspacePath) addObjectiveCandidates({ targetType: 'workspace', targetId: scope.workspacePath });
+    if (scope.agentId) addObjectiveCandidates({ targetType: 'agent' });
+    if (scope.collectorId) addObjectiveCandidates({ targetType: 'collector', targetId: scope.collectorId });
+    if (scope.sourceId) addObjectiveCandidates({ targetType: 'source', targetId: scope.sourceId });
+    if (scope.primaryType === 'scope' && !scope.workspacePath && !scope.agentId && !scope.collectorId && !scope.sourceId) {
+      addObjectiveCandidates({ targetType: 'global' });
+    }
+    const objectiveCandidates = [...objectiveCandidateMap.values()];
     if (objective) objectiveCandidates.unshift(objective);
     const objectiveItems = new Map<string, T.ObjectiveItem>();
     for (const item of objectiveCandidates) {
@@ -3913,7 +3931,7 @@ export class SecurityMonitoringController {
         const found = this.objectives.list({ ...timeFilter, objectiveId, limit: 1 }, { observe: false }).items[0];
         if (found) objectiveItems.set(found.objectiveId, found);
       }
-      for (const task of this.remediation.list({ ...timeFilter, status: 'all', sourceType: 'alert', alertId: item.alertId, limit: 20 }).items) {
+      for (const task of this.remediation.list({ ...timeFilter, status: 'all', sourceType: 'alert', alertId: item.alertId, limit: 20 }, { refresh: false }).items) {
         remediationItems.set(task.taskId, task);
       }
     }
@@ -3933,7 +3951,7 @@ export class SecurityMonitoringController {
         for (const item of this.alerting.list({ ...timeFilter, status: 'all', kind: 'coverage', issueId, limit: 20 }).items) {
           alertItems.set(item.alertId, item);
         }
-        for (const item of this.remediation.list({ ...timeFilter, status: 'all', sourceType: 'coverage', issueId, limit: 20 }).items) {
+        for (const item of this.remediation.list({ ...timeFilter, status: 'all', sourceType: 'coverage', issueId, limit: 20 }, { refresh: false }).items) {
           remediationItems.set(item.taskId, item);
           addObjectiveId(remediationObjectiveId(item));
         }

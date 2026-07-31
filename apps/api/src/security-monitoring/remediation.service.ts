@@ -154,10 +154,12 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
     await this.ch.close();
   }
 
-  list(query: RemediationQuery): RemediationList {
-    this.syncGenerated(query);
-    this.syncOverdueAlerts();
-    this.scheduleOverdueScan();
+  list(query: RemediationQuery, options: { refresh?: boolean } = {}): RemediationList {
+    if (options.refresh !== false) {
+      this.syncGenerated(query);
+      this.syncOverdueAlerts();
+      this.scheduleOverdueScan();
+    }
 
     const sinceMs = this.since(query);
     const q = query.q?.trim().toLowerCase();
