@@ -217,8 +217,10 @@ Create managed Sources and use Source ingest tokens before accepting untrusted p
 ### Discover and filter Agent workloads
 
 The observer forwarder can attribute high-volume kernel events to Agent workloads before they enter
-the judged event stream. Set `FORWARD_SCOPE=agent` for workload-aware forwarding, or use
-`FORWARD_SCOPE=shadow` to compare decisions without dropping events. The filter resolves explicit
+the judged event stream. Retention is configured independently with
+`FORWARD_RETAIN_UNKNOWN=true`, `FORWARD_RETAIN_NON_AGENT=false`, and
+`FORWARD_NOISE_POLICY=balanced`; use `FORWARD_FILTER_MODE=shadow` to compare decisions without
+dropping events. The filter resolves explicit
 operator templates and Docker/Kubernetes workload metadata first, then uses bounded deterministic
 behavior evidence for previously unknown workloads.
 

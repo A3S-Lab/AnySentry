@@ -60,9 +60,12 @@ spec:
             - { name: ANYSENTRY_SOURCE_TYPE, value: "observer" }
             - { name: ANYSENTRY_SOURCE_NAME, value: "kubernetes-a3s-observer" }
             - { name: ANYSENTRY_HEARTBEAT_SECS, value: "30" }
-            # Forward known Agent events and unresolved events. Drop only events whose complete
-            # host PID ancestry proves they are unrelated to a configured Agent root.
-            - { name: FORWARD_SCOPE, value: "agent" }
+            # Retain unresolved identities for later review, stop reviewed non-Agents, and keep
+            # routine pseudo-filesystem noise independent from identity classification.
+            - { name: FORWARD_FILTER_MODE, value: "enforce" }
+            - { name: FORWARD_RETAIN_UNKNOWN, value: "true" }
+            - { name: FORWARD_RETAIN_NON_AGENT, value: "false" }
+            - { name: FORWARD_NOISE_POLICY, value: "balanced" }
             - { name: ANYSENTRY_INGEST_URL, value: "http://anysentry:29653/security-center/ingest" }
             - { name: ANYSENTRY_IDENTITY_SNAPSHOT_URL, value: "http://anysentry:29653/security-center/identity/snapshot" }
             - { name: ANYSENTRY_IDENTITY_SNAPSHOT_SECS, value: "15" }
@@ -71,8 +74,6 @@ spec:
             - { name: FORWARD_BATCH_SIZE, value: "32" }
             - { name: FORWARD_BATCH_FLUSH_MS, value: "50" }
             - { name: FORWARD_MAX_QUEUE, value: "4096" }
-            # Fail-open discovery budget for high-frequency unknown FileAccess only.
-            - { name: FORWARD_UNKNOWN_FILE_BUDGET_PER_SEC, value: "20" }
           command: ["/bin/sh", "-c"]
           args: ["a3s-observer-collector | node /opt/observer-forward.js"]
           volumeMounts:

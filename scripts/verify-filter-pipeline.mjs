@@ -25,7 +25,7 @@ function event(session, kind, payload) {
   });
 }
 
-async function runScope(scope) {
+async function runConfig(label, env = {}) {
   const batches = [];
   const heartbeats = [];
   let resolveSnapshotRequested;
@@ -83,17 +83,20 @@ async function runScope(scope) {
   const child = spawn(process.execPath, [forwarder], {
     env: {
       ...process.env,
-      FORWARD_SCOPE: scope,
+      FORWARD_FILTER_MODE: 'enforce',
+      FORWARD_RETAIN_UNKNOWN: 'true',
+      FORWARD_RETAIN_NON_AGENT: 'false',
+      FORWARD_NOISE_POLICY: 'balanced',
+      ...env,
       FORWARD_BATCH_SIZE: '32',
       FORWARD_BATCH_FLUSH_MS: '5',
-      FORWARD_UNKNOWN_FILE_BUDGET_PER_SEC: '1',
       ANYSENTRY_INGEST_URL: api,
       ANYSENTRY_IDENTITY_SNAPSHOT_SECS: '0.05',
       ANYSENTRY_HEARTBEAT_SECS: '0.05',
       ANYSENTRY_DOCKER_DISCOVERY: 'off',
       ANYSENTRY_BEHAVIOR_DISCOVERY: 'off',
       ANYSENTRY_AGENT_TEMPLATES_JSON: '[]',
-      A3S_OBSERVER_COLLECTOR_ID: `filter-${scope}`,
+      A3S_OBSERVER_COLLECTOR_ID: `filter-${label}`,
     },
     stdio: ['pipe', 'ignore', 'pipe'],
   });
@@ -107,6 +110,7 @@ async function runScope(scope) {
     event('nonagent-container', 'ToolExec', { pid: 10, argv: ['true'] }),
     event('unknown-container', 'FileAccess', { pid: 20, path: '/workspace/a', write: true }),
     event('unknown-container', 'FileAccess', { pid: 20, path: '/workspace/b', write: true }),
+    event('unknown-container', 'FileAccess', { pid: 20, path: '/proc/status', write: false }),
     event('unknown-container', 'FileDelete', { pid: 20, path: '/proc/important' }),
     event('unknown-container', 'SecurityAction', { pid: 20, kind: 'setuid' }),
   ];
@@ -114,7 +118,7 @@ async function runScope(scope) {
   const exitCode = await new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
-      reject(new Error(`forwarder ${scope} timed out: ${stderr}`));
+      reject(new Error(`forwarder ${label} timed out: ${stderr}`));
     }, 5_000);
     child.on('exit', (code) => {
       clearTimeout(timer);
@@ -126,7 +130,7 @@ async function runScope(scope) {
   const heartbeat = [...heartbeats]
     .reverse()
     .find((candidate) => candidate.filterMetrics?.observed === lines.length);
-  assert.ok(heartbeat, `missing structured ${scope} heartbeat: ${JSON.stringify(heartbeats)}`);
+  assert.ok(heartbeat, `missing structured ${label} heartbeat: ${JSON.stringify(heartbeats)}`);
   return { batches, heartbeat };
 }
 
@@ -185,7 +189,10 @@ async function runManualReviewRecovery() {
   const child = spawn(process.execPath, [forwarder], {
     env: {
       ...process.env,
-      FORWARD_SCOPE: 'agent',
+      FORWARD_FILTER_MODE: 'enforce',
+      FORWARD_RETAIN_UNKNOWN: 'true',
+      FORWARD_RETAIN_NON_AGENT: 'false',
+      FORWARD_NOISE_POLICY: 'balanced',
       FORWARD_BATCH_SIZE: '1',
       FORWARD_BATCH_FLUSH_MS: '1',
       ANYSENTRY_INGEST_URL: `http://127.0.0.1:${address.port}/security-center/ingest`,
@@ -234,33 +241,37 @@ async function runManualReviewRecovery() {
   assert.match(heartbeat?.filterMetrics?.lastSuppressedAt ?? '', /^\d{4}-\d{2}-\d{2}T/u);
 }
 
-const all = await runScope('all');
-assert.equal(all.batches.length, 5);
-assert.equal(all.heartbeat.filterMetrics.filteredNonAgent, 0);
-assert.equal(all.heartbeat.filterMetrics.wouldFilterNonAgent, 0);
+const include = await runConfig('include', {
+  FORWARD_RETAIN_NON_AGENT: 'true',
+  FORWARD_NOISE_POLICY: 'include',
+});
+assert.equal(include.batches.length, 6);
+assert.equal(include.heartbeat.filterMetrics.filteredNonAgent, 0);
+assert.equal(include.heartbeat.filterMetrics.filteredNoise, 0);
 
-const shadow = await runScope('shadow');
-assert.equal(shadow.batches.length, 5, 'shadow forwards every routing decision');
+const shadow = await runConfig('shadow', { FORWARD_FILTER_MODE: 'shadow' });
+assert.equal(shadow.batches.length, 6, 'shadow forwards every retention decision');
 assert.equal(shadow.heartbeat.filterMetrics.wouldFilterNonAgent, 1);
-assert.equal(shadow.heartbeat.filterMetrics.wouldDiscoveryBudgetDrop, 1);
+assert.equal(shadow.heartbeat.filterMetrics.wouldFilterNoise, 1);
 assert.equal(shadow.heartbeat.filterMetrics.filteredNonAgent, 0);
-assert.equal(shadow.heartbeat.filterMetrics.discoveryBudgetDropped, 0);
+assert.equal(shadow.heartbeat.filterMetrics.filteredNoise, 0);
 
-const agent = await runScope('agent');
-assert.equal(agent.batches.length, 3);
-assert.equal(agent.heartbeat.filterMetrics.filteredNonAgent, 1);
-assert.match(agent.heartbeat.filterMetrics.lastSuppressedAt, /^\d{4}-\d{2}-\d{2}T/u);
-assert.equal(agent.heartbeat.filterMetrics.discoveryBudgetDropped, 1);
-assert.equal(agent.heartbeat.filterMetrics.wouldFilterNonAgent, 0);
+const defaultRetention = await runConfig('default');
+assert.equal(defaultRetention.batches.length, 4);
+assert.equal(defaultRetention.heartbeat.filterMetrics.filteredNonAgent, 1);
+assert.equal(defaultRetention.heartbeat.filterMetrics.filteredNoise, 1);
+assert.equal(defaultRetention.heartbeat.filterMetrics.unknown, 5);
+assert.equal(defaultRetention.heartbeat.filterMetrics.discoveryBudgetDropped, 0);
+assert.match(defaultRetention.heartbeat.filterMetrics.lastSuppressedAt, /^\d{4}-\d{2}-\d{2}T/u);
 assert.ok(
-  agent.batches.some((item) => JSON.parse(item.line).event.FileDelete),
+  defaultRetention.batches.some((item) => JSON.parse(item.line).event.FileDelete),
   'high-value FileDelete survives even for a pseudo-filesystem path',
 );
 assert.ok(
-  agent.batches.some((item) => JSON.parse(item.line).event.SecurityAction),
+  defaultRetention.batches.some((item) => JSON.parse(item.line).event.SecurityAction),
   'SecurityAction survives unknown routing',
 );
 
 await runManualReviewRecovery();
 
-console.log('Filter all/shadow/agent pipeline verification passed');
+console.log('Independent retention/noise/shadow pipeline verification passed');

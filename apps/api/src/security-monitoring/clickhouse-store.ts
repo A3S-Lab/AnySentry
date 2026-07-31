@@ -108,6 +108,23 @@ type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'pro
   rawPreview: string;
 };
 export type IncidentState = Pick<Incident, 'incidentId' | 'status' | 'owner' | 'note' | 'acknowledgedAt' | 'resolvedAt' | 'updatedAt'>;
+export interface StoredEventQuery {
+  sinceMs: number;
+  untilMs: number;
+  eventId?: string;
+  sourceId?: string;
+  collectorId?: string;
+  agentId?: string;
+  sessionId?: string;
+  workspacePath?: string;
+  traceId?: string;
+  runId?: string;
+  eventKind?: string;
+  eventCategory?: string;
+  verdict?: string;
+  tier?: string;
+  limit: number;
+}
 
 function attrString(attributes: JudgedEvent['attributes'], key: string): string {
   const value = attributes[key];
@@ -305,6 +322,54 @@ export class ClickHouseStore {
       return [...latest.values()].sort((a, b) => a.at - b.at).slice(-limit);
     } catch (err) {
       console.error('[clickhouse] hydrate failed:', (err as Error).message);
+      return [];
+    }
+  }
+
+  /** Query durable event history. Identity visibility is deliberately applied by the service
+   * after current human-review metadata is resolved; a mutable review decision must never be
+   * baked into this immutable evidence query. */
+  async searchEvents(input: StoredEventQuery): Promise<JudgedEvent[]> {
+    if (!this.client) return [];
+    const conditions = ['at >= {since:UInt64}', 'at <= {until:UInt64}'];
+    const queryParams: Record<string, string | number> = { since: input.sinceMs, until: input.untilMs };
+    const fields: Array<[keyof StoredEventQuery, string]> = [
+      ['eventId', 'eventId'],
+      ['sourceId', 'sourceId'],
+      ['collectorId', 'collectorId'],
+      ['agentId', 'agentId'],
+      ['sessionId', 'sessionId'],
+      ['workspacePath', 'workspacePath'],
+      ['traceId', 'traceId'],
+      ['runId', 'runId'],
+      ['eventKind', 'eventKind'],
+      ['eventCategory', 'eventCategory'],
+      ['verdict', 'verdict'],
+      ['tier', 'tier'],
+    ];
+    for (const [key, column] of fields) {
+      const value = input[key];
+      if (typeof value !== 'string' || !value.trim()) continue;
+      conditions.push(`${column} = {${String(key)}:String}`);
+      queryParams[String(key)] = value.trim();
+    }
+    const rowLimit = Math.max(1, Math.min(100_000, input.limit));
+    queryParams.limit = rowLimit;
+    try {
+      const rs = await this.client.query({
+        query: `SELECT * FROM ${TABLE} WHERE ${conditions.join(' AND ')} ORDER BY at DESC, decisionUpdatedAt DESC LIMIT {limit:UInt32}`,
+        query_params: queryParams,
+        format: 'JSONEachRow',
+      });
+      const rows = (await rs.json()) as Array<Record<string, unknown>>;
+      const latest = new Map<string, JudgedEvent>();
+      for (const row of rows) {
+        const event = fromRow(row);
+        if (!latest.has(event.eventId)) latest.set(event.eventId, event);
+      }
+      return [...latest.values()].sort((a, b) => b.at - a.at);
+    } catch (err) {
+      console.error('[clickhouse] event search failed:', (err as Error).message);
       return [];
     }
   }

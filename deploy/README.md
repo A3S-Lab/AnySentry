@@ -135,14 +135,16 @@ so every node appears as a stable Collector. The bundled forwarder also emits so
 heartbeats every `ANYSENTRY_HEARTBEAT_SECS` seconds; with no explicit `ANYSENTRY_SOURCE_ID`,
 AnySentry discovers one observer Source per node/collector automatically.
 
-The manifest uses `FORWARD_SCOPE=agent`. The forwarder checks the versioned Kubernetes workload
+The manifest independently configures `FORWARD_FILTER_MODE=enforce`,
+`FORWARD_RETAIN_UNKNOWN=true`, `FORWARD_RETAIN_NON_AGENT=false`, and
+`FORWARD_NOISE_POLICY=balanced`. The forwarder checks the versioned Kubernetes workload
 snapshot before host process signatures and PID ancestry. A generic `node` or `python` process in
 an Agent container is therefore attributed by Pod UID + full Container ID, while a sidecar can be
 classified separately. Unknown identities remain observable; only positively identified
 non-Agent events are filtered. Events are sent in bounded batches (32 events or 50 ms), and
 heartbeats report classification, cache, queue, batch, filtered, and dropped counters.
-During snapshot outages, high-value evidence stays fail-open while routine unknown `FileAccess`
-uses a per-workload discovery budget (20 events/second by default).
+Routine `/proc`, `/sys`, `/run`, and `/dev` `FileAccess` noise is evaluated independently of the
+identity class; high-value deletion and security events remain observable.
 
 Label Agent Pods and, for multi-container Pods, identify the Agent container:
 
@@ -154,8 +156,9 @@ metadata:
     anysentry.io/agent-container: agent
 ```
 
-Set `FORWARD_SCOPE=all` for the unfiltered fallback or `FORWARD_SCOPE=shadow` to compute decisions
-and compare counters before applying the filter.
+Set `FORWARD_FILTER_MODE=shadow` to compare would-drop counters without dropping. For a temporary
+unfiltered recovery view, set `FORWARD_RETAIN_NON_AGENT=true` and `FORWARD_NOISE_POLICY=include`;
+this does not change identity classification or risk routing.
 
 For operator-managed discovery, copy `deploy/agent-templates.example.json` and set
 `ANYSENTRY_AGENT_TEMPLATES_FILE` in the observer-forwarder environment. Templates intentionally

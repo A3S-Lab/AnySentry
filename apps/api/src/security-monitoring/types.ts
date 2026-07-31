@@ -600,6 +600,10 @@ export interface SecurityWorkspaceRiskDistribution {
 
 export interface AgentEventQuery extends SecurityTimeFilter {
   scope?: 'agent' | 'raw';
+  /** Raw-view visibility only. Defaults to true; Agent scope always excludes Unknown. */
+  includeUnknown?: boolean;
+  /** Query the durable ClickHouse history instead of only the hot dashboard window. */
+  durable?: boolean;
   noise?: 'hide' | 'include';
   eventId?: string;
   sourceId?: string;
@@ -1148,7 +1152,12 @@ export interface CollectorHeartbeatRequest {
   message?: string;
 }
 export interface CollectorFilterMetrics {
-  scope: 'all' | 'shadow' | 'agent';
+  /** @deprecated Compatibility marker for pre-decoupling forwarders. */
+  scope: 'all' | 'shadow' | 'agent' | 'decoupled';
+  filterMode?: 'enforce' | 'shadow';
+  retainUnknown?: boolean;
+  retainNonAgent?: boolean;
+  noisePolicy?: 'balanced' | 'include';
   observed: number;
   forwarded: number;
   confirmedAgent: number;

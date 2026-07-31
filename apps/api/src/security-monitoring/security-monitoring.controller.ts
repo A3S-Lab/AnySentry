@@ -2920,7 +2920,7 @@ export class SecurityMonitoringController {
   @Post('events/list')
   @HttpCode(200)
   agentEvents(@Body() f: T.AgentEventQuery) {
-    return this.agg.agentEvents(f);
+    return f.durable ? this.agg.storedAgentEvents(f) : this.agg.agentEvents(f);
   }
 
   @Post('events/timeline')

@@ -226,7 +226,7 @@ function formatRequestError(error: unknown) {
   return "请求失败";
 }
 
-async function loadSecurityDashboardData(filter: SecurityTimeFilter, timelineScope: TimelineScope, timelineTier: TimelineTierFilter, riskBreakdownScope: TimelineScope, decisionFunnelScope: TimelineScope, workspaceRiskScope: TimelineScope): Promise<SecurityDashboardData> {
+async function loadSecurityDashboardData(filter: SecurityTimeFilter, timelineScope: TimelineScope, timelineTier: TimelineTierFilter, timelineIncludeUnknown: boolean, riskBreakdownScope: TimelineScope, decisionFunnelScope: TimelineScope, workspaceRiskScope: TimelineScope): Promise<SecurityDashboardData> {
   const scanFilter = { ...filter, seriesPoints: 36 };
   const { data, errors } = await settleAll(
     {
@@ -240,7 +240,7 @@ async function loadSecurityDashboardData(filter: SecurityTimeFilter, timelineSco
       workspaceRisk: securityCenterApi.workspaceRiskDistribution({ ...filter, scope: workspaceRiskScope }),
       streamFindings: securityCenterApi.streamFindings({ ...filter, limit: 30 }),
       supplyChain: securityCenterApi.supplyChainOverview(500),
-      events: securityCenterApi.agentEvents({ ...filter, scope: timelineScope, ...(timelineTier === "all" ? {} : { tier: timelineTier }), limit: 36 }),
+      events: securityCenterApi.agentEvents({ ...filter, scope: timelineScope, includeUnknown: timelineIncludeUnknown, ...(timelineTier === "all" ? {} : { tier: timelineTier }), limit: 36 }),
     },
     formatRequestError,
   );
@@ -2387,8 +2387,8 @@ function TimelineScopeTabs({
   onChange: (value: TimelineScope) => void;
 }) {
   const options: Array<{ value: TimelineScope; label: string }> = [
-    { value: "agent", label: "Agent 事件" },
-    { value: "raw", label: "全部事件" },
+    { value: "agent", label: "已识别 Agent" },
+    { value: "raw", label: "全部观测" },
   ];
 
   return (
@@ -2417,17 +2417,21 @@ function AgentEventTimelinePanel({
   error,
   scope,
   tier,
+  includeUnknown,
   timeFilter,
   onScopeChange,
   onTierChange,
+  onIncludeUnknownChange,
 }: {
   events?: AgentEventList | null;
   error?: string;
   scope: TimelineScope;
   tier: TimelineTierFilter;
+  includeUnknown: boolean;
   timeFilter: SecurityTimeFilter;
   onScopeChange: (value: TimelineScope) => void;
   onTierChange: (value: TimelineTierFilter) => void;
+  onIncludeUnknownChange: (value: boolean) => void;
 }) {
   const items = events?.items ?? [];
 
@@ -2438,6 +2442,21 @@ function AgentEventTimelinePanel({
       action={
         <div className="flex items-center gap-3">
           <TimelineScopeTabs value={scope} onChange={onScopeChange} />
+          {scope === "raw" ? (
+            <button
+              type="button"
+              aria-pressed={includeUnknown}
+              onClick={() => onIncludeUnknownChange(!includeUnknown)}
+              className={cn(
+                "h-8 rounded-md border px-2.5 text-xs font-semibold transition-colors",
+                includeUnknown
+                  ? "border-teal-400/30 bg-teal-400/10 text-teal-100"
+                  : "border-white/10 bg-white/5 text-zinc-500 hover:text-zinc-200",
+              )}
+            >
+              {includeUnknown ? "包含 Unknown" : "隐藏 Unknown"}
+            </button>
+          ) : null}
           <Select value={tier} onValueChange={(value) => onTierChange(value as TimelineTierFilter)}>
             <SelectTrigger className="h-8 w-[112px] border-white/10 bg-white/5 text-xs text-zinc-100" aria-label="筛选研判层级">
               <SelectValue />
@@ -2616,8 +2635,9 @@ function WorkspaceRiskPanel({
 
 export default function SecurityMonitorPage() {
   const [filter, setFilter] = useState<SecurityTimeFilter>(DEFAULT_FILTER);
-  const [timelineScope, setTimelineScope] = useState<TimelineScope>("agent");
+  const [timelineScope, setTimelineScope] = useState<TimelineScope>("raw");
   const [timelineTier, setTimelineTier] = useState<TimelineTierFilter>("all");
+  const [timelineIncludeUnknown, setTimelineIncludeUnknown] = useState(true);
   const [riskBreakdownScope, setRiskBreakdownScope] = useState<TimelineScope>("agent");
   const [decisionFunnelScope, setDecisionFunnelScope] = useState<TimelineScope>("agent");
   const [workspaceRiskScope, setWorkspaceRiskScope] = useState<TimelineScope>("agent");
@@ -2635,8 +2655,8 @@ export default function SecurityMonitorPage() {
   }, [customEnd, customStart, filter.timeType]);
 
   const requestFilter = useMemo(() => filter, [filter]);
-  const { data, loading, refresh } = useRequest(() => loadSecurityDashboardData(requestFilter, timelineScope, timelineTier, riskBreakdownScope, decisionFunnelScope, workspaceRiskScope), {
-    refreshDeps: [requestFilter, timelineScope, timelineTier, riskBreakdownScope, decisionFunnelScope, workspaceRiskScope],
+  const { data, loading, refresh } = useRequest(() => loadSecurityDashboardData(requestFilter, timelineScope, timelineTier, timelineIncludeUnknown, riskBreakdownScope, decisionFunnelScope, workspaceRiskScope), {
+    refreshDeps: [requestFilter, timelineScope, timelineTier, timelineIncludeUnknown, riskBreakdownScope, decisionFunnelScope, workspaceRiskScope],
     pollingInterval: 10000,
     pollingWhenHidden: false,
   });
@@ -2753,9 +2773,11 @@ export default function SecurityMonitorPage() {
               error={data?.errors.events}
               scope={timelineScope}
               tier={timelineTier}
+              includeUnknown={timelineIncludeUnknown}
               timeFilter={filter}
               onScopeChange={setTimelineScope}
               onTierChange={setTimelineTier}
+              onIncludeUnknownChange={setTimelineIncludeUnknown}
             />
           </DashboardSection>
 

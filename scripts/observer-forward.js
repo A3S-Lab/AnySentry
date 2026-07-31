@@ -6,10 +6,9 @@
 // Backpressure is essential: a busy node emits a firehose of events. We bound the priority queue,
 // batch network writes, cap in-flight POSTs, and pause stdin at pressure so memory stays flat.
 //
-// Agent scope is fail-open for attribution: known Agent and unresolved events are forwarded, and
-// only events with a complete non-Agent identity are dropped. Shadow computes the exact decision
-// but forwards it, while all is the unfiltered recovery mode. Override routine noise prefixes via
-// FORWARD_DROP_PATHS.
+// Retention, routine-noise filtering, and shadow evaluation are independent controls. Unknown is
+// retained by default so an operator can discover missed Agents later; known non-Agents and
+// infrastructure roots are not retained. Override routine noise prefixes via FORWARD_DROP_PATHS.
 const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
@@ -22,7 +21,6 @@ const { BoundedPriorityQueue } = require('./observer-priority-queue');
 const { ToolExecDeduper } = require('./observer-event-dedup');
 const {
   behaviorDiscoveryEligible,
-  DiscoveryBudget,
   WorkloadIdentityCache,
 } = require('./observer-workload-filter');
 const { InfrastructureRootResolver } = require('./observer-infrastructure-roots');
@@ -62,15 +60,22 @@ const BATCH_SIZE = boundedNumber(process.env.FORWARD_BATCH_SIZE, 32, 1, 256);
 const BATCH_FLUSH_MS = boundedNumber(process.env.FORWARD_BATCH_FLUSH_MS, 50, 1, 5_000);
 const MAX_QUEUE = boundedNumber(process.env.FORWARD_MAX_QUEUE, 4_096, BATCH_SIZE, 100_000);
 const HTTP_TIMEOUT_MS = boundedNumber(process.env.FORWARD_HTTP_TIMEOUT_MS, 10_000, 1_000, 120_000);
-const UNKNOWN_FILE_BUDGET_PER_SEC = boundedNumber(
-  process.env.FORWARD_UNKNOWN_FILE_BUDGET_PER_SEC,
-  20,
-  1,
-  10_000,
-);
-const FORWARD_SCOPE = ['agent', 'all', 'shadow'].includes(process.env.FORWARD_SCOPE)
+function envBoolean(value, fallback) {
+  if (value === undefined || value === '') return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+const LEGACY_FORWARD_SCOPE = ['agent', 'all', 'shadow'].includes(process.env.FORWARD_SCOPE)
   ? process.env.FORWARD_SCOPE
-  : 'agent';
+  : undefined;
+const FILTER_MODE = ['enforce', 'shadow'].includes(process.env.FORWARD_FILTER_MODE)
+  ? process.env.FORWARD_FILTER_MODE
+  : LEGACY_FORWARD_SCOPE === 'shadow' ? 'shadow' : 'enforce';
+const RETAIN_UNKNOWN = envBoolean(process.env.FORWARD_RETAIN_UNKNOWN, true);
+const RETAIN_NON_AGENT = envBoolean(process.env.FORWARD_RETAIN_NON_AGENT, false);
+const NOISE_POLICY = ['balanced', 'include'].includes(process.env.FORWARD_NOISE_POLICY)
+  ? process.env.FORWARD_NOISE_POLICY
+  : 'balanced';
 const DROP_PATHS = (process.env.FORWARD_DROP_PATHS || '/sys/,/proc/,/run/,/dev/').split(',').map((s) => s.trim()).filter(Boolean);
 const COLLECTOR_ID = process.env.A3S_OBSERVER_COLLECTOR_ID || process.env.COLLECTOR_ID || process.env.HOSTNAME || '';
 const NODE_NAME = process.env.A3S_NODE_NAME || process.env.NODE_NAME || '';
@@ -106,7 +111,6 @@ const dockerDiscovery = new DockerDiscovery({
   hostId: process.env.A3S_OBSERVER_HOST_ID || NODE_NAME,
 });
 const behaviorDetector = new BehavioralAgentDetector();
-const discoveryBudget = new DiscoveryBudget({ limit: UNKNOWN_FILE_BUDGET_PER_SEC });
 const infrastructureResolver = new InfrastructureRootResolver();
 const toolExecDeduper = new ToolExecDeduper({
   windowMs: process.env.FORWARD_DEDUP_WINDOW_MS,
@@ -337,7 +341,7 @@ function sendHeartbeat(done = () => {}) {
     {
       collectorId: COLLECTOR_ID || undefined,
       nodeName: NODE_NAME || undefined,
-      mode: `observer-forwarder:${FORWARD_SCOPE}`,
+      mode: `observer-forwarder:${FILTER_MODE}`,
       status,
       intervalSecs: HEARTBEAT_SECS,
       eventKindCounts: counts,
@@ -345,7 +349,11 @@ function sendHeartbeat(done = () => {}) {
       outputDropped: dropped,
       errorCount: errors,
       filterMetrics: {
-        scope: FORWARD_SCOPE,
+        scope: LEGACY_FORWARD_SCOPE ?? 'decoupled',
+        filterMode: FILTER_MODE,
+        retainUnknown: RETAIN_UNKNOWN,
+        retainNonAgent: RETAIN_NON_AGENT,
+        noisePolicy: NOISE_POLICY,
         observed: classifications.observed,
         forwarded: classifications.forwarded,
         confirmedAgent: classifications.confirmedAgent,
@@ -399,7 +407,7 @@ function sendHeartbeat(done = () => {}) {
         infrastructure: classifications.infrastructure,
         workspaceConflict: classifications.workspaceConflict,
       },
-      message: `scope=${FORWARD_SCOPE}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
+      message: `filter_mode=${FILTER_MODE}; retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
     },
     5000,
@@ -556,34 +564,25 @@ function handleLine(raw) {
   }
   const kind = eventKind(o);
   let filterReason = '';
-  if (FORWARD_SCOPE !== 'all') {
-    // A rare, high-signal security action is useful even when its workload is a known non-Agent.
-    if (classification.state === 'non_agent' && kind !== 'SecurityAction') {
-      filterReason = 'non_agent';
-    } else if (
-      classification.state === 'unknown' &&
-      kind === 'FileAccess' &&
-      !discoveryBudget.allow(o, pending.length / MAX_QUEUE)
-    ) {
-      // Snapshot outages fail open for high-value evidence. Only routine unknown FileAccess is
-      // budgeted. Shadow evaluates the same stateful decision without dropping the event.
-      filterReason = 'discovery_budget';
-    } else if (isNoise(o)) {
-      // Routine pseudo-filesystem writes are a separate, explainable noise reason. FileDelete is
-      // deliberately excluded because deletion remains high-value evidence.
-      filterReason = 'routine_noise';
-    }
+  if (classification.state === 'non_agent' && !RETAIN_NON_AGENT) {
+    filterReason = 'non_agent';
+  } else if (classification.state === 'unknown' && !RETAIN_UNKNOWN) {
+    filterReason = 'unknown';
+  } else if (NOISE_POLICY === 'balanced' && isNoise(o)) {
+    // Routine pseudo-filesystem writes are an independent, explainable noise rule. FileDelete is
+    // deliberately excluded because deletion remains high-value evidence.
+    filterReason = 'routine_noise';
   }
   if (filterReason) {
-    if (FORWARD_SCOPE === 'shadow') {
+    if (FILTER_MODE === 'shadow') {
       if (filterReason === 'non_agent') attributionCounts.wouldFilterNonAgent++;
-      else if (filterReason === 'discovery_budget') attributionCounts.wouldDiscoveryBudgetDrop++;
+      else if (filterReason === 'unknown') attributionCounts.wouldDiscoveryBudgetDrop++;
       else attributionCounts.wouldFilterNoise++;
     } else {
       if (filterReason === 'non_agent') {
         attributionCounts.filteredNonAgent++;
         lastNonAgentSuppressedAt = new Date().toISOString();
-      } else if (filterReason === 'discovery_budget') {
+      } else if (filterReason === 'unknown') {
         attributionCounts.discoveryBudgetDropped++;
       } else {
         attributionCounts.filteredNoise++;

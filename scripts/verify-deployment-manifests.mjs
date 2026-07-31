@@ -205,16 +205,18 @@ function verifyObserverManifest() {
     daemonSet?.source,
   );
   assert(
-    'Observer DaemonSet drops only proven non-Agent events before ingest',
-    /\{\s*name:\s*FORWARD_SCOPE,\s*value:\s*"agent"\s*\}/u.test(daemonSet?.source ?? ''),
+    'Observer DaemonSet independently retains Unknown, drops non-Agent, and filters routine noise',
+    /\{\s*name:\s*FORWARD_FILTER_MODE,\s*value:\s*"enforce"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_RETAIN_UNKNOWN,\s*value:\s*"true"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_RETAIN_NON_AGENT,\s*value:\s*"false"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_NOISE_POLICY,\s*value:\s*"balanced"\s*\}/u.test(daemonSet?.source ?? ''),
     daemonSet?.source,
   );
   assert(
     'Observer DaemonSet consumes identity snapshots and uses bounded batching',
     /\{\s*name:\s*ANYSENTRY_IDENTITY_SNAPSHOT_URL,\s*value:\s*"http:\/\/anysentry:29653\/security-center\/identity\/snapshot"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_BATCH_SIZE,\s*value:\s*"32"\s*\}/u.test(daemonSet?.source ?? '') &&
-      /\{\s*name:\s*FORWARD_MAX_QUEUE,\s*value:\s*"4096"\s*\}/u.test(daemonSet?.source ?? '') &&
-      /\{\s*name:\s*FORWARD_UNKNOWN_FILE_BUDGET_PER_SEC,\s*value:\s*"20"\s*\}/u.test(daemonSet?.source ?? ''),
+      /\{\s*name:\s*FORWARD_MAX_QUEUE,\s*value:\s*"4096"\s*\}/u.test(daemonSet?.source ?? ''),
     daemonSet?.source,
   );
   assert(

@@ -6,6 +6,7 @@ import {
   isAgentAssetClassification,
 } from './agent-identity';
 import { AgentMetadataService } from './agent-metadata.service';
+import { isEventClassificationVisible } from './event-visibility';
 import { IngestionSourceService } from './ingestion-source.service';
 import { MaintenanceWindowService } from './maintenance-window.service';
 import { buildAcl, policyConfigError, sanitizePolicy } from './policy-config';
@@ -429,6 +430,7 @@ export class AggregationService {
     const q = filter.q?.trim().toLowerCase();
     const hasFilter = Boolean(sourceId || collectorId || agentId || agentAssetId || sessionId || workspacePath || traceId || runId || filter.eventKind || filter.eventCategory || filter.verdict || filter.tier || q);
     const agentScoped = filter.scope === 'agent' && !pinnedEventId;
+    const includeUnknown = filter.includeUnknown !== false;
     // Process lifecycle rows remain stored for audit/debugging, but are hidden from both the
     // Agent and raw "all events" views by default. An explicit kind filter, noise=include, or a
     // pinned event still makes them accessible.
@@ -439,8 +441,14 @@ export class AggregationService {
       const eventSource = eventSourceId(e);
       const eventCollector = eventCollectorId(e);
       const isHiddenNoise = agentScoped ? isLowValueAgentNoise(e) : e.eventKind === 'ProcessExit';
+      const visibleClassification = isEventClassificationVisible(
+        resolved.effectiveClassification,
+        agentScoped ? 'agent' : 'raw',
+        includeUnknown,
+        matchesEventId,
+      );
       const matchesScope =
-        (!agentScoped || isAgentAssetClassification(resolved.effectiveClassification)) &&
+        visibleClassification &&
         (!hideNoise || !isHiddenNoise);
       const matchesFilter =
         matchesScope &&
@@ -483,6 +491,54 @@ export class AggregationService {
       b.at - a.at,
     );
     const compacted = filter.scope === 'raw' || pinnedEventId ? filtered.map((event) => ({ event, repeatCount: 1, lastAt: event.at })) : compactEvents(filtered);
+    return {
+      items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) => this.eventItem(event, repeatCount, lastAt)),
+      total: compacted.length,
+      updateTime: iso(),
+    };
+  }
+
+  async storedAgentEvents(filter: T.AgentEventQuery): Promise<T.AgentEventList> {
+    if (!this.judge.storageStatus().clickhouseReady) return this.agentEvents(filter);
+    const pinnedEventId = filter.eventId?.trim();
+    const { sinceMs } = this.win(filter);
+    const customEnd = filter.timeType === 'custom' && filter.endTime ? Date.parse(filter.endTime) : Number.NaN;
+    const dateOnlyEnd = Boolean(filter.endTime && /^\d{4}-\d{2}-\d{2}$/u.test(filter.endTime));
+    const untilMs = Number.isFinite(customEnd) ? customEnd + (dateOnlyEnd ? 24 * HOUR - 1 : 0) : now();
+    const limit = Math.max(1, Math.min(200, filter.limit ?? 40));
+    const persistent = await this.judge.searchStoredEvents({
+      sinceMs: pinnedEventId ? 0 : sinceMs,
+      untilMs,
+      eventId: pinnedEventId,
+      sourceId: filter.sourceId,
+      collectorId: filter.collectorId,
+      agentId: filter.agentId,
+      sessionId: filter.sessionId,
+      workspacePath: filter.workspacePath,
+      traceId: filter.traceId,
+      runId: filter.runId,
+      eventKind: filter.eventKind,
+      eventCategory: filter.eventCategory,
+      verdict: filter.verdict,
+      tier: filter.tier,
+      limit: Math.min(20_000, Math.max(2_000, limit * 50)),
+    });
+    // Buffered writes may not have reached ClickHouse yet. Merge the hot ring and prefer the most
+    // recent lifecycle revision without mutating either immutable source record.
+    const latest = new Map<string, T.JudgedEvent>();
+    for (const event of [...persistent, ...this.judge.query(pinnedEventId ? 0 : sinceMs)]) {
+      const previous = latest.get(event.eventId);
+      if (!previous || (event.decisionUpdatedAt ?? event.at) >= (previous.decisionUpdatedAt ?? previous.at)) {
+        latest.set(event.eventId, event);
+      }
+    }
+    const filtered = this.filterEvents([...latest.values()], filter).sort((a, b) =>
+      Number(Boolean(pinnedEventId) && b.eventId === pinnedEventId) - Number(Boolean(pinnedEventId) && a.eventId === pinnedEventId) ||
+      b.at - a.at,
+    );
+    const compacted = filter.scope === 'raw' || pinnedEventId
+      ? filtered.map((event) => ({ event, repeatCount: 1, lastAt: event.at }))
+      : compactEvents(filtered);
     return {
       items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) => this.eventItem(event, repeatCount, lastAt)),
       total: compacted.length,

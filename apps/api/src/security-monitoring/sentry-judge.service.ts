@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { Sentry, dns, egress, fileAccess, securityAction, sslContent, toolExec } from '@a3s-lab/sentry';
 import { AgentAttributionService } from './agent-attribution.service';
 import { AlertingService } from './alerting.service';
-import { ClickHouseStore, IncidentState } from './clickhouse-store';
+import { ClickHouseStore, IncidentState, StoredEventQuery } from './clickhouse-store';
 import { DEFAULT_POLICY, PolicyConfig, buildFastAcl, policyConfigError, sanitizePolicy, tierStatus } from './policy-config';
 import { cleanText } from './redaction';
 import { DecisionResultJob, FastJudgeJob } from './async-judgment.types';
@@ -318,6 +318,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const clickhouseConfigured = Boolean(process.env.CLICKHOUSE_URL);
     const clickhouseReady = this.ch.enabled;
     return { mode: clickhouseReady ? 'clickhouse' : 'memory', clickhouseConfigured, clickhouseReady };
+  }
+
+  async searchStoredEvents(query: StoredEventQuery): Promise<JudgedEvent[]> {
+    return this.ch.searchEvents(query);
   }
 
   /** Validate + apply a new policy, then persist it (survives restarts via ClickHouse). */
@@ -830,9 +834,13 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     for (const [key, value] of Object.entries(input.eventKindCounts ?? {})) eventKindCounts[key.slice(0, 64)] = clamp(value);
     const rawFilter = input.filterMetrics ?? ({} as Partial<import('./types').CollectorFilterMetrics>);
     const filterMetrics: import('./types').CollectorFilterMetrics = {
-      scope: ['all', 'shadow', 'agent'].includes(rawFilter.scope ?? '')
+      scope: ['all', 'shadow', 'agent', 'decoupled'].includes(rawFilter.scope ?? '')
         ? (rawFilter.scope as import('./types').CollectorFilterMetrics['scope'])
-        : 'all',
+        : 'decoupled',
+      filterMode: rawFilter.filterMode === 'shadow' ? 'shadow' : 'enforce',
+      retainUnknown: rawFilter.retainUnknown !== false,
+      retainNonAgent: rawFilter.retainNonAgent === true,
+      noisePolicy: rawFilter.noisePolicy === 'include' ? 'include' : 'balanced',
       observed: clamp(rawFilter.observed),
       forwarded: clamp(rawFilter.forwarded),
       confirmedAgent: clamp(rawFilter.confirmedAgent),

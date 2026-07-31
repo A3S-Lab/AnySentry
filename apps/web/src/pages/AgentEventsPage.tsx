@@ -443,6 +443,7 @@ export default function AgentEventsPage() {
   const [eventKind, setEventKind] = useState(searchParams.get("eventKind") ?? "");
   const [eventCategory, setEventCategory] = useState<AgentEventCategory | "all">((searchParams.get("eventCategory") as AgentEventCategory) || "all");
   const [verdict, setVerdict] = useState<SecurityVerdict | "all">((searchParams.get("verdict") as SecurityVerdict) || "all");
+  const [includeUnknown, setIncludeUnknown] = useState(searchParams.get("includeUnknown") !== "false");
   const [selectedEventId, setSelectedEventId] = useState(searchParams.get("eventId") ?? "");
 
   const query = useMemo<AgentEventQuery>(() => ({
@@ -461,8 +462,11 @@ export default function AgentEventsPage() {
     eventKind: clean(eventKind),
     eventCategory: eventCategory === "all" ? undefined : eventCategory,
     verdict: verdict === "all" ? undefined : verdict,
+    scope: "raw",
+    includeUnknown,
+    durable: true,
     limit: 120,
-  }), [agentAssetId, agentId, collectorId, eventCategory, eventKind, routeEndTime, routeStartTime, runId, selectedEventId, sessionId, sourceId, timeType, traceId, verdict, workspacePath]);
+  }), [agentAssetId, agentId, collectorId, eventCategory, eventKind, includeUnknown, routeEndTime, routeStartTime, runId, selectedEventId, sessionId, sourceId, timeType, traceId, verdict, workspacePath]);
 
   const { data, loading, refresh } = useRequest(() => securityCenterApi.agentEvents(query), {
     refreshDeps: [query],
@@ -511,6 +515,7 @@ export default function AgentEventsPage() {
     if (agentId) next.set("agentId", agentId);
     next.set("agentAssetId", event.agentAssetId);
     if (sessionId) next.set("sessionId", sessionId);
+    next.set("includeUnknown", String(includeUnknown));
     if (eventSourceId) setSourceId(eventSourceId);
     if (eventCollectorId) setCollectorId(eventCollectorId);
     setAgentAssetId(event.agentAssetId);
@@ -531,6 +536,7 @@ export default function AgentEventsPage() {
     setEventKind("");
     setEventCategory("all");
     setVerdict("all");
+    setIncludeUnknown(true);
     setSelectedEventId("");
     setSearchParams({});
   };
@@ -589,6 +595,21 @@ export default function AgentEventsPage() {
               {VERDICT_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
             </SelectContent>
           </Select>
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            aria-pressed={includeUnknown}
+            onClick={() => setIncludeUnknown((value) => !value)}
+            className={cn(
+              "h-9 border text-xs",
+              includeUnknown
+                ? "border-teal-400/30 bg-teal-400/10 text-teal-100 hover:bg-teal-400/15"
+                : "border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10",
+            )}
+          >
+            {includeUnknown ? "包含 Unknown" : "隐藏 Unknown"}
+          </Button>
           <Button type="button" variant="secondary" size="sm" onClick={clearFilters} className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
             <X className="size-3.5" />
             清除
