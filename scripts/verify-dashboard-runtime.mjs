@@ -249,6 +249,7 @@ async function verifyIndexAndAssets() {
 async function verifyDashboardSourceContracts() {
   const agentEventsPage = await readFile('apps/web/src/pages/AgentEventsPage.tsx', 'utf8');
   const agentsPage = await readFile('apps/web/src/pages/AgentsPage.tsx', 'utf8');
+  const agentIdentity = await readFile('apps/web/src/components/custom/agent-identity.tsx', 'utf8');
   const alertingService = await readFile('apps/api/src/security-monitoring/alerting.service.ts', 'utf8');
   const alertsPage = await readFile('apps/web/src/pages/AlertsPage.tsx', 'utf8');
   const apiClient = await readFile('apps/web/src/lib/api/security-center.ts', 'utf8');
@@ -394,8 +395,11 @@ async function verifyDashboardSourceContracts() {
       securityController.includes("'agent.review.updated'") &&
       apiClient.includes('reviewAgent: (agentId: string, body: AgentReviewRequest)') &&
       agentsPage.includes('securityCenterApi.reviewAgent(selectedAgent.agentId') &&
-      agentsPage.includes('原始事件会继续保留') &&
-      agentsPage.includes('判定非 Agent') &&
+      agentsPage.includes('原始事件始终保留') &&
+      agentsPage.includes('标记为非 Agent') &&
+      agentsPage.includes('证据不足，降为未知') &&
+      agentsPage.includes('撤销确认，重新观察') &&
+      agentsPage.includes('重新纳入观察') &&
       agentsPage.includes('人工身份裁决') &&
       agentsPage.includes('aria-label="确认人工身份裁决"') &&
       agentsPage.includes('<details className="group rounded-md') &&
@@ -415,8 +419,11 @@ async function verifyDashboardSourceContracts() {
       hasApiClient: apiClient.includes('reviewAgent: (agentId: string, body: AgentReviewRequest)'),
       hasReviewUi:
         agentsPage.includes('securityCenterApi.reviewAgent(selectedAgent.agentId') &&
-        agentsPage.includes('原始事件会继续保留') &&
-        agentsPage.includes('判定非 Agent') &&
+        agentsPage.includes('原始事件始终保留') &&
+        agentsPage.includes('标记为非 Agent') &&
+        agentsPage.includes('证据不足，降为未知') &&
+        agentsPage.includes('撤销确认，重新观察') &&
+        agentsPage.includes('重新纳入观察') &&
         agentsPage.includes('人工身份裁决'),
       hasInlineReviewConfirmation:
         agentsPage.includes('aria-label="确认人工身份裁决"') &&
@@ -438,14 +445,19 @@ async function verifyDashboardSourceContracts() {
     'dashboard renders Kubernetes candidate identity as namespace/Pod/container before internal scope IDs',
     agentsPage.includes('function agentPrimaryName(agent: AgentInventoryItem)') &&
       agentsPage.includes('return parts.join("/")') &&
-      agentsPage.includes('<FieldValue label="内部 Scope" value={agent.agentId} />') &&
-      agentsPage.includes('{runtimeLabel ? <Pill') &&
-      agentsPage.includes('classificationNameClass(agent.classification)'),
+      agentsPage.includes('<FieldValue label="原始 Scope" value={agent.agentId} />') &&
+      agentsPage.includes('<AgentAssetIdentityInline agent={agent}') &&
+      agentIdentity.includes('export function AgentAssetIdentityInline') &&
+      agentIdentity.includes('runtime ? (') &&
+      agentIdentity.includes('classification.nameClassName') &&
+      agentIdentity.includes('agent.locationLabel || shortWorkspaceLabel(agent.workspacePath)'),
     {
       hasFriendlyName: agentsPage.includes('return parts.join("/")'),
-      hasInternalScopeDetail: agentsPage.includes('<FieldValue label="内部 Scope" value={agent.agentId} />'),
-      hasRuntimeTag: agentsPage.includes('{runtimeLabel ? <Pill'),
-      hasClassificationColor: agentsPage.includes('classificationNameClass(agent.classification)'),
+      hasInternalScopeDetail: agentsPage.includes('<FieldValue label="原始 Scope" value={agent.agentId} />'),
+      hasUnifiedAssetIdentity: agentsPage.includes('<AgentAssetIdentityInline agent={agent}'),
+      hasRuntimeTag: agentIdentity.includes('runtime ? ('),
+      hasClassificationColor: agentIdentity.includes('classification.nameClassName'),
+      hasLocationLine: agentIdentity.includes('agent.locationLabel || shortWorkspaceLabel(agent.workspacePath)'),
     },
   );
   assert(
