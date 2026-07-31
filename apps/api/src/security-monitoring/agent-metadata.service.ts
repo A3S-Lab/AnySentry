@@ -253,31 +253,48 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
   }
 
   identityKeysForEvent(event: Pick<JudgedEvent, 'agentId' | 'sessionId' | 'process' | 'attribution'>): string[] {
-    const values: unknown[] = [];
     const attribution = event.attribution;
-    values.push(
+    const strongValues: unknown[] = [
       attribution?.physicalWorkloadId,
       attribution?.agentInstanceId,
       attribution?.workloadRef?.podUid,
-      attribution?.workloadRef?.systemdUnit,
-    );
+    ];
     for (const candidate of [attribution?.physicalWorkloadId, attribution?.agentInstanceId]) {
       const normalized = normalizeIdentityKey(candidate);
-      if (normalized?.startsWith('container:')) values.push(normalized.slice('container:'.length));
+      if (normalized?.startsWith('container:')) strongValues.push(normalized.slice('container:'.length));
     }
     const cgroup = event.process?.cgroup ?? '';
     for (const match of cgroup.matchAll(/(?:cri-containerd|docker|crio|libpod)[-/]([a-f0-9]{12,64})(?:\.scope)?/gi)) {
-      values.push(match[1], match[1]?.slice(0, 12));
+      strongValues.push(match[1], match[1]?.slice(0, 12));
     }
     for (const match of cgroup.matchAll(/kubepods[^/]*[-/]pod([a-f0-9_-]{16,})/gi)) {
       const podUid = match[1]?.replace(/_/g, '-');
-      values.push(podUid);
+      strongValues.push(podUid);
     }
-    if (event.process?.systemdUnit) values.push(event.process.systemdUnit);
-    const stable = cleanIdentityKeys(values);
-    return stable.length > 0
-      ? stable
-      : cleanIdentityKeys([event.agentId, event.sessionId]);
+    const strong = cleanIdentityKeys(strongValues);
+    if (strong.length > 0) return strong;
+
+    const host = clean(event.process?.hostId, 240) ?? 'host';
+    const boot = clean(event.process?.bootId, 240) ?? 'boot';
+    if (attribution?.rootPid) {
+      return cleanIdentityKeys([
+        `host:${host}:${boot}:root:${attribution.rootPid}:${attribution.agentScopeId ?? attribution.agentDisplayName ?? event.agentId}`,
+      ]);
+    }
+    if (event.process?.pid && (event.process.startTimeTicks || event.process.startTimeNs)) {
+      return cleanIdentityKeys([
+        `host:${host}:${boot}:process:${event.process.pid}:${event.process.startTimeTicks ?? event.process.startTimeNs}:${event.process.exe ?? event.process.comm ?? event.agentId}`,
+      ]);
+    }
+    const systemdUnit = clean(event.process?.systemdUnit, 240);
+    if (systemdUnit?.endsWith('.service') && !systemdUnit.startsWith('session-')) {
+      return cleanIdentityKeys([`systemd:${host}:${systemdUnit}`]);
+    }
+    // session-*.scope is a shared runtime boundary, never an Agent review or suppression key.
+    return cleanIdentityKeys([
+      event.agentId,
+      event.sessionId?.startsWith('session-') ? undefined : event.sessionId,
+    ]);
   }
 
   resolveEvent(event: JudgedEvent): ResolvedAgentMetadata {

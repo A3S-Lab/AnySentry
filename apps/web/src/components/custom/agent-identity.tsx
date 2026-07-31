@@ -1,6 +1,7 @@
 import type {
   AgentClassification,
   AgentEventListItem,
+  AgentInventoryItem,
   AgentWorkloadRef,
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
@@ -13,6 +14,9 @@ export interface ResolvedAgentIdentity {
   classificationLabel: string;
   runtime: AgentRuntimeKind;
   runtimeLabel?: string;
+  locationLabel?: string;
+  detectedName?: string;
+  rawAgentId: string;
   workload?: AgentWorkloadRef;
 }
 
@@ -95,6 +99,9 @@ function shortWorkloadId(value?: string) {
 }
 
 function runtimeKind(event: AgentEventListItem): AgentRuntimeKind {
+  if (event.runtime === "kubernetes") return "kubernetes";
+  if (event.runtime === "docker") return "docker";
+  if (event.runtime === "host") return "local";
   const workload = event.attribution?.workloadRef;
   if (workload?.environment === "kubernetes") return "kubernetes";
   if (workload?.environment === "docker") return "docker";
@@ -126,6 +133,10 @@ function runtimeKind(event: AgentEventListItem): AgentRuntimeKind {
 function workloadName(event: AgentEventListItem) {
   const attribution = event.attribution;
   const workload = attribution?.workloadRef;
+  const configuredName = meaningfulName(event.displayName);
+  if (configuredName) return configuredName;
+  const detectedName = meaningfulName(event.detectedName);
+  if (detectedName) return detectedName;
   const displayName = meaningfulName(attribution?.agentDisplayName);
   if (displayName) return displayName;
 
@@ -152,6 +163,7 @@ function workloadName(event: AgentEventListItem) {
 
 export function resolveAgentIdentity(event: AgentEventListItem): ResolvedAgentIdentity {
   const classification =
+    event.effectiveClassification ??
     event.attribution?.classification ??
     (event.attribution?.monitored ? "probable_agent" : "unknown");
   const runtime = runtimeKind(event);
@@ -161,6 +173,9 @@ export function resolveAgentIdentity(event: AgentEventListItem): ResolvedAgentId
     classificationLabel: CLASSIFICATION_META[classification].label,
     runtime,
     runtimeLabel: runtime === "unknown" ? undefined : RUNTIME_META[runtime].label,
+    locationLabel: event.locationLabel,
+    detectedName: event.detectedName ?? event.attribution?.agentDisplayName,
+    rawAgentId: event.agentId,
     workload: event.attribution?.workloadRef,
   };
 }
@@ -168,10 +183,12 @@ export function resolveAgentIdentity(event: AgentEventListItem): ResolvedAgentId
 export function AgentIdentityInline({
   event,
   showClassification = false,
+  showLocation = true,
   className,
 }: {
   event: AgentEventListItem;
   showClassification?: boolean;
+  showLocation?: boolean;
   className?: string;
 }) {
   const identity = resolveAgentIdentity(event);
@@ -181,28 +198,104 @@ export function AgentIdentityInline({
     identity.name,
     identity.classificationLabel,
     runtime?.label,
+    identity.locationLabel,
+    identity.detectedName && identity.detectedName !== identity.name ? `采集时：${identity.detectedName}` : undefined,
+    identity.rawAgentId !== identity.name ? `原始：${identity.rawAgentId}` : undefined,
     event.attribution?.source ? `来源：${event.attribution.source}` : undefined,
   ]
     .filter(Boolean)
     .join(" · ");
 
   return (
-    <span className={cn("inline-flex min-w-0 max-w-full items-center gap-1.5", className)} title={title}>
-      <span className={cn("size-1.5 shrink-0 rounded-full", classification.dotClassName)} />
-      <span className={cn("min-w-0 truncate font-semibold", classification.nameClassName)}>
-        {identity.name}
-        <span className="sr-only">（{identity.classificationLabel}）</span>
-      </span>
-      {showClassification ? (
-        <span className={cn("shrink-0 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold", classification.badgeClassName)}>
-          {identity.classificationLabel}
+    <span className={cn("inline-flex min-w-0 max-w-full flex-col gap-0.5", className)} title={title}>
+      <span className="flex min-w-0 max-w-full items-center gap-1.5">
+        <span className={cn("size-1.5 shrink-0 rounded-full", classification.dotClassName)} />
+        <span className={cn("min-w-0 truncate font-semibold", classification.nameClassName)}>
+          {identity.name}
+          <span className="sr-only">（{identity.classificationLabel}）</span>
         </span>
-      ) : null}
-      {runtime ? (
-        <span className={cn("shrink-0 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold", runtime.className)}>
-          {runtime.label}
+        {showClassification ? (
+          <span className={cn("shrink-0 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold", classification.badgeClassName)}>
+            {identity.classificationLabel}
+          </span>
+        ) : null}
+        {runtime ? (
+          <span className={cn("shrink-0 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold", runtime.className)}>
+            {runtime.label}
+          </span>
+        ) : null}
+      </span>
+      {showLocation && identity.locationLabel ? (
+        <span className="ml-3 block max-w-full truncate font-mono text-[10px] font-normal text-zinc-600" title={identity.locationLabel}>
+          {identity.locationLabel}
         </span>
       ) : null}
     </span>
   );
+}
+
+function assetRuntime(agent: AgentInventoryItem): AgentRuntimeKind {
+  if (agent.runtime === "kubernetes") return "kubernetes";
+  if (agent.runtime === "docker") return "docker";
+  if (agent.runtime === "host") return "local";
+  return "unknown";
+}
+
+export function AgentAssetIdentityInline({
+  agent,
+  showClassification = false,
+  className,
+}: {
+  agent: AgentInventoryItem;
+  showClassification?: boolean;
+  className?: string;
+}) {
+  const classification = CLASSIFICATION_META[agent.classification];
+  const runtimeKind = assetRuntime(agent);
+  const runtime = runtimeKind === "unknown" ? undefined : RUNTIME_META[runtimeKind];
+  const name =
+    meaningfulName(agent.displayName) ||
+    meaningfulName(agent.detectedName) ||
+    meaningfulName(agent.workloadRef?.podName) ||
+    meaningfulName(agent.workloadRef?.containerName) ||
+    meaningfulName(agent.workloadRef?.processName) ||
+    meaningfulName(agent.agentId) ||
+    "候选 Agent";
+  const location = agent.locationLabel || shortWorkspaceLabel(agent.workspacePath);
+  const title = [
+    name,
+    CLASSIFICATION_META[agent.classification].label,
+    runtime?.label,
+    location,
+    agent.detectedName && agent.detectedName !== name ? `采集时：${agent.detectedName}` : undefined,
+    `资产：${agent.agentAssetId}`,
+  ].filter(Boolean).join(" · ");
+  return (
+    <span className={cn("inline-flex min-w-0 max-w-full flex-col gap-0.5", className)} title={title}>
+      <span className="flex min-w-0 max-w-full items-center gap-1.5">
+        <span className={cn("size-1.5 shrink-0 rounded-full", classification.dotClassName)} />
+        <span className={cn("min-w-0 truncate font-semibold", classification.nameClassName)}>{name}</span>
+        {showClassification ? (
+          <span className={cn("shrink-0 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold", classification.badgeClassName)}>
+            {classification.label}
+          </span>
+        ) : null}
+        {runtime ? (
+          <span className={cn("shrink-0 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold", runtime.className)}>
+            {runtime.label}
+          </span>
+        ) : null}
+      </span>
+      {location ? (
+        <span className="ml-3 block max-w-full truncate font-mono text-[10px] font-normal text-zinc-600" title={agent.workspacePath}>
+          {location}{agent.instanceCount > 1 ? ` · ${agent.instanceCount} 个运行实例` : ""}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
+function shortWorkspaceLabel(value?: string) {
+  const parts = text(value).replace(/\/+$/, "").split("/").filter(Boolean);
+  return parts.slice(-2).join("/");
 }

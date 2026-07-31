@@ -208,6 +208,7 @@ function EventDetail({
     agentId: event.agentId,
     workspacePath: event.workspacePath,
   });
+  topologyQs.set("agentAssetId", event.agentAssetId);
   if (eventSourceId) topologyQs.set("sourceId", eventSourceId);
   if (eventCollectorId) topologyQs.set("collectorId", eventCollectorId);
   const evidenceQs = new URLSearchParams({
@@ -219,11 +220,13 @@ function EventDetail({
     agentId: event.agentId,
     workspacePath: event.workspacePath,
   });
+  evidenceQs.set("agentAssetId", event.agentAssetId);
   if (eventSourceId) evidenceQs.set("sourceId", eventSourceId);
   if (eventCollectorId) evidenceQs.set("collectorId", eventCollectorId);
   const agentQs = new URLSearchParams({
     timeType,
     agentId: event.agentId,
+    agentAssetId: event.agentAssetId,
     workspacePath: event.workspacePath,
     focus: "review",
     eventId: event.eventId,
@@ -249,7 +252,11 @@ function EventDetail({
           <FieldValue label="Trace ID" value={event.traceId} />
           <FieldValue label="Span ID" value={event.spanId} />
           <FieldValue label="Run ID" value={event.runId} />
-          <FieldValue label="Agent" value={agentIdentity.name} />
+          <FieldValue label="当前显示名" value={agentIdentity.name} />
+          <FieldValue label="采集时名称" value={event.detectedName ?? event.attribution?.agentDisplayName} />
+          <FieldValue label="原始执行者" value={event.agentId} />
+          <FieldValue label="Agent 资产 ID" value={event.agentAssetId} />
+          <FieldValue label="实例定位" value={event.locationLabel} />
           <FieldValue label="Collector" value={eventCollectorId} />
           <FieldValue label="Source ID" value={eventSourceId} />
           <FieldValue label="Session" value={event.sessionId} />
@@ -280,7 +287,16 @@ function EventDetail({
         <div>
           <p className="mb-2 text-xs font-medium text-zinc-400">Agent 归因详情</p>
           <div className="grid gap-3 rounded-md border border-white/10 bg-white/[0.03] px-3 py-3 sm:grid-cols-2 xl:grid-cols-4">
-            <FieldValue label="识别状态" value={agentIdentity.classificationLabel} />
+            <FieldValue label="当前状态" value={agentIdentity.classificationLabel} />
+            <FieldValue label="自动检测状态" value={
+              event.detectedClassification === "confirmed_agent"
+                ? "已确认 Agent"
+                : event.detectedClassification === "probable_agent"
+                  ? "候选 Agent"
+                  : event.detectedClassification === "non_agent"
+                    ? "已排除"
+                    : "尚未识别"
+            } />
             <FieldValue label="部署环境" value={agentIdentity.runtimeLabel ?? "未知"} />
             <FieldValue label="识别来源" value={event.attribution?.source ?? "none"} />
             <FieldValue label="置信度" value={event.attribution ? `${Math.round(event.attribution.confidence * 100)}%` : "0%"} />
@@ -420,6 +436,7 @@ export default function AgentEventsPage() {
   const [collectorId, setCollectorId] = useState(searchParams.get("collectorId") ?? "");
   const [workspacePath, setWorkspacePath] = useState(searchParams.get("workspacePath") ?? "");
   const [agentId, setAgentId] = useState(searchParams.get("agentId") ?? "");
+  const [agentAssetId, setAgentAssetId] = useState(searchParams.get("agentAssetId") ?? "");
   const [sessionId, setSessionId] = useState(searchParams.get("sessionId") ?? "");
   const [traceId, setTraceId] = useState(searchParams.get("traceId") ?? "");
   const [runId, setRunId] = useState(searchParams.get("runId") ?? "");
@@ -437,6 +454,7 @@ export default function AgentEventsPage() {
     collectorId: clean(collectorId),
     workspacePath: clean(workspacePath),
     agentId: clean(agentId),
+    agentAssetId: clean(agentAssetId),
     sessionId: clean(sessionId),
     traceId: clean(traceId),
     runId: clean(runId),
@@ -444,7 +462,7 @@ export default function AgentEventsPage() {
     eventCategory: eventCategory === "all" ? undefined : eventCategory,
     verdict: verdict === "all" ? undefined : verdict,
     limit: 120,
-  }), [agentId, collectorId, eventCategory, eventKind, routeEndTime, routeStartTime, runId, selectedEventId, sessionId, sourceId, timeType, traceId, verdict, workspacePath]);
+  }), [agentAssetId, agentId, collectorId, eventCategory, eventKind, routeEndTime, routeStartTime, runId, selectedEventId, sessionId, sourceId, timeType, traceId, verdict, workspacePath]);
 
   const { data, loading, refresh } = useRequest(() => securityCenterApi.agentEvents(query), {
     refreshDeps: [query],
@@ -491,9 +509,11 @@ export default function AgentEventsPage() {
     if (eventCollectorId ?? collectorId) next.set("collectorId", eventCollectorId ?? collectorId);
     if (workspacePath) next.set("workspacePath", workspacePath);
     if (agentId) next.set("agentId", agentId);
+    next.set("agentAssetId", event.agentAssetId);
     if (sessionId) next.set("sessionId", sessionId);
     if (eventSourceId) setSourceId(eventSourceId);
     if (eventCollectorId) setCollectorId(eventCollectorId);
+    setAgentAssetId(event.agentAssetId);
     setRunId(event.runId);
     setEventKind(event.eventKind);
     setSearchParams(next);
@@ -501,6 +521,7 @@ export default function AgentEventsPage() {
 
   const clearFilters = () => {
     setAgentId("");
+    setAgentAssetId("");
     setSourceId("");
     setCollectorId("");
     setWorkspacePath("");

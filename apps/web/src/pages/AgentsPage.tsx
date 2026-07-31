@@ -33,6 +33,7 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import { AgentAssetIdentityInline } from "@/components/custom/agent-identity";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -89,8 +90,8 @@ const CRITICALITY_LABEL: Record<AgentCriticality, string> = {
 const CLASSIFICATION_LABEL: Record<AgentClassification, string> = {
   confirmed_agent: "已确认 Agent",
   probable_agent: "候选 Agent",
-  unknown: "身份未确认",
-  non_agent: "非 Agent",
+  unknown: "尚未识别",
+  non_agent: "已排除",
 };
 
 interface AgentMetadataDraft {
@@ -103,7 +104,7 @@ interface AgentMetadataDraft {
   note: string;
 }
 
-type PendingReviewDecision = "confirmed_agent" | "non_agent" | "clear";
+type PendingReviewDecision = "confirmed_agent" | "unknown" | "non_agent";
 
 const CATEGORY_LABEL: Record<AgentEventCategory, string> = {
   tool: "工具",
@@ -161,16 +162,10 @@ function classificationClass(classification: AgentClassification) {
   return "border-white/10 bg-white/5 text-zinc-400";
 }
 
-function classificationNameClass(classification: AgentClassification) {
-  if (classification === "confirmed_agent") return "text-emerald-200";
-  if (classification === "probable_agent") return "text-amber-200";
-  if (classification === "non_agent") return "text-slate-400";
-  return "text-zinc-300";
-}
-
 function agentPrimaryName(agent: AgentInventoryItem) {
   const customName = agent.displayName?.trim();
   if (customName) return customName;
+  if (agent.detectedName?.trim()) return agent.detectedName.trim();
   const workload = agent.workloadRef;
   if (workload?.environment === "kubernetes") {
     const parts = [workload.namespace, workload.podName, workload.containerName]
@@ -186,13 +181,6 @@ function agentPrimaryName(agent: AgentInventoryItem) {
     if (processName && !processName.startsWith("session-")) return processName;
   }
   return agent.agentId;
-}
-
-function agentRuntimeLabel(agent: AgentInventoryItem) {
-  if (agent.workloadRef?.environment === "kubernetes") return "K8s";
-  if (agent.workloadRef?.environment === "docker") return "Docker";
-  if (agent.workloadRef?.environment === "host") return "本地服务";
-  return undefined;
 }
 
 function splitTags(value: string) {
@@ -267,6 +255,7 @@ function agentParams(agent: AgentInventoryItem, timeType?: SecurityTimeType) {
   const params = new URLSearchParams();
   if (timeType) params.set("timeType", timeType);
   params.set("agentId", agent.agentId);
+  params.set("agentAssetId", agent.agentAssetId);
   params.set("workspacePath", agent.workspacePath);
   return params;
 }
@@ -333,8 +322,6 @@ function AgentRow({
   active: boolean;
   onSelect: () => void;
 }) {
-  const primaryName = agentPrimaryName(agent);
-  const runtimeLabel = agentRuntimeLabel(agent);
   return (
     <button
       type="button"
@@ -346,15 +333,8 @@ function AgentRow({
     >
       <span className="font-mono text-xs text-zinc-500">{formatDate(agent.lastSeen)}</span>
       <span className="min-w-0">
-        <span className="flex min-w-0 items-center gap-1.5" title={primaryName}>
-          <span className={cn("min-w-0 truncate text-sm font-semibold", classificationNameClass(agent.classification))}>
-            {primaryName}
-          </span>
-          {runtimeLabel ? <Pill className="shrink-0 border-white/10 bg-white/5 text-zinc-400">{runtimeLabel}</Pill> : null}
-        </span>
-        <span className="mt-0.5 block truncate font-mono text-[11px] text-zinc-600" title={agent.workspacePath}>
-          {agent.owner ? `${agent.owner} · ` : ""}{agent.workspacePath}
-        </span>
+        <AgentAssetIdentityInline agent={agent} />
+        {agent.owner ? <span className="ml-3 mt-0.5 block truncate text-[10px] text-zinc-600">{agent.owner}</span> : null}
       </span>
       <span><Pill className={healthClass(agent.healthState)}>{HEALTH_LABEL[agent.healthState]}</Pill></span>
       <span className="text-right font-mono text-xs text-zinc-500">{agent.eventCount}</span>
@@ -406,7 +386,6 @@ function AgentDetail({
   const categoryRows = countRows(agent.eventCategoryCounts, CATEGORY_LABEL);
   const sourceRows = countRows(agent.sourceCounts, SOURCE_LABEL);
   const primaryName = agentPrimaryName(agent);
-  const runtimeLabel = agentRuntimeLabel(agent);
   const configuredMetadataCount = [
     agent.displayName,
     agent.owner,
@@ -427,16 +406,29 @@ function AgentDetail({
       }
     : pendingReview === "non_agent"
       ? {
-          title: "确认排除该候选",
-          description: "后续常规事件可由 Collector 按非 Agent 处理；已采集的历史事件和审计记录会继续保留。",
-          action: "确认判定非 Agent",
+          title: "确认标记为非 Agent",
+          description: "只有尚未识别的稳定身份可以被排除。Collector 将停止转发后续常规事件；历史证据、裁决记录和抑制计数仍会保留。",
+          action: "确认标记非 Agent",
           actionClassName: "bg-slate-200 text-slate-950 hover:bg-white",
         }
-      : pendingReview === "clear"
+      : pendingReview === "unknown"
         ? {
-            title: "确认撤销人工结论",
-            description: "撤销后，该身份将恢复自动发现与证据评分，不会删除现有事件或历史裁决审计。",
-            action: "确认撤销",
+            title:
+              agent.classification === "probable_agent"
+                ? "证据不足，降为未知"
+                : agent.classification === "non_agent"
+                  ? "重新纳入观察"
+                  : "撤销确认，重新观察",
+            description:
+              agent.classification === "non_agent"
+                ? "恢复后 Collector 将重新转发该稳定身份的事件，并从尚未识别状态继续观察。历史排除记录不会删除。"
+                : "该身份将进入尚未识别状态并继续采集，已有事件、原始分类和人工审核记录保持不变。",
+            action:
+              agent.classification === "non_agent"
+                ? "确认重新观察"
+                : agent.classification === "probable_agent"
+                  ? "确认降为未知"
+                  : "确认撤销",
             actionClassName: "bg-zinc-200 text-zinc-950 hover:bg-white",
           }
         : undefined;
@@ -446,11 +438,9 @@ function AgentDetail({
       <div className="flex min-h-12 items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
         <div className="flex min-w-0 items-center gap-2">
           <Bot className="size-4 shrink-0 text-teal-200" />
-          <h2 className={cn("truncate text-sm font-semibold", classificationNameClass(agent.classification))}>{primaryName}</h2>
-          {runtimeLabel ? <Pill className="shrink-0 border-white/10 bg-white/5 text-zinc-400">{runtimeLabel}</Pill> : null}
+          <AgentAssetIdentityInline agent={agent} showClassification />
         </div>
         <div className="flex items-center gap-2">
-          <Pill className={classificationClass(agent.classification)}>{CLASSIFICATION_LABEL[agent.classification]}</Pill>
           <Pill className={riskClass(agent.riskLevel)}>{agent.riskLevelText}</Pill>
           <Pill className={healthClass(agent.healthState)}>{HEALTH_LABEL[agent.healthState]}</Pill>
         </div>
@@ -458,8 +448,12 @@ function AgentDetail({
 
       <div className="space-y-4 p-4">
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-          <FieldValue label="Agent" value={primaryName} />
-          <FieldValue label="内部 Scope" value={agent.agentId} />
+          <FieldValue label="当前显示名" value={primaryName} />
+          <FieldValue label="采集时名称" value={agent.detectedName ?? agent.agentId} />
+          <FieldValue label="原始 Scope" value={agent.agentId} />
+          <FieldValue label="资产 ID" value={agent.agentAssetId} />
+          <FieldValue label="实例定位" value={agent.locationLabel} />
+          <FieldValue label="运行实例" value={agent.instanceCount} />
           <FieldValue label="Workspace" value={agent.workspacePath} />
           <FieldValue label="User" value={agent.userId} />
           <FieldValue label="First Seen" value={formatDate(agent.firstSeen)} />
@@ -491,7 +485,7 @@ function AgentDetail({
                 ) : null}
               </div>
               <p className="mt-2 text-xs leading-5 text-zinc-400">
-                原始事件会继续保留。确认后按 Agent 归因；判定非 Agent 后，Collector 收到身份快照将过滤该稳定工作负载的后续常规事件。
+                显示名和身份裁决相互独立，原始事件始终保留。候选可确认或降为未知；只有尚未识别的稳定身份才能标记为非 Agent。
               </p>
               {agent.workloadRef?.systemdUnit?.startsWith("session-") ? (
                 <p className="mt-1 text-xs leading-5 text-amber-200/80">
@@ -513,38 +507,46 @@ function AgentDetail({
               ) : null}
             </div>
             <div className="flex shrink-0 flex-wrap items-center gap-2">
-              <Button
-                type="button"
-                size="sm"
-                disabled={reviewing || Boolean(pendingReview)}
-                onClick={() => onRequestReview("confirmed_agent")}
-                className="h-8 bg-emerald-500 text-[#07100c] hover:bg-emerald-400"
-              >
-                {reviewing ? <LoaderCircle className="size-3.5 animate-spin" /> : <BadgeCheck className="size-3.5" />}
-                确认是 Agent
-              </Button>
-              <Button
-                type="button"
-                variant="secondary"
-                size="sm"
-                disabled={reviewing || Boolean(pendingReview)}
-                onClick={() => onRequestReview("non_agent")}
-                className="h-8 border border-slate-400/20 bg-slate-500/10 text-slate-200 hover:bg-slate-500/20"
-              >
-                <Ban className="size-3.5" />
-                判定非 Agent
-              </Button>
-              {agent.reviewDecision ? (
+              {(agent.classification === "probable_agent" || agent.classification === "unknown") ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={reviewing || Boolean(pendingReview)}
+                  onClick={() => onRequestReview("confirmed_agent")}
+                  className="h-8 bg-emerald-500 text-[#07100c] hover:bg-emerald-400"
+                >
+                  {reviewing ? <LoaderCircle className="size-3.5 animate-spin" /> : <BadgeCheck className="size-3.5" />}
+                  确认是 Agent
+                </Button>
+              ) : null}
+              {agent.classification === "unknown" ? (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  disabled={reviewing || Boolean(pendingReview)}
+                  onClick={() => onRequestReview("non_agent")}
+                  className="h-8 border border-slate-400/20 bg-slate-500/10 text-slate-200 hover:bg-slate-500/20"
+                >
+                  <Ban className="size-3.5" />
+                  标记为非 Agent
+                </Button>
+              ) : null}
+              {agent.classification !== "unknown" ? (
                 <Button
                   type="button"
                   variant="ghost"
                   size="sm"
                   disabled={reviewing || Boolean(pendingReview)}
-                  onClick={() => onRequestReview("clear")}
+                  onClick={() => onRequestReview("unknown")}
                   className="h-8 text-zinc-400 hover:bg-white/5 hover:text-zinc-100"
                 >
                   <RotateCcw className="size-3.5" />
-                  撤销裁决
+                  {agent.classification === "probable_agent"
+                    ? "证据不足，降为未知"
+                    : agent.classification === "non_agent"
+                      ? "重新纳入观察"
+                      : "撤销确认，重新观察"}
                 </Button>
               ) : null}
             </div>
@@ -789,6 +791,7 @@ export default function AgentsPage() {
   const [healthState, setHealthState] = useState<AgentHealthState | "all">((searchParams.get("healthState") as AgentHealthState) || "all");
   const [queryText, setQueryText] = useState(searchParams.get("q") ?? "");
   const [selectedAgentId, setSelectedAgentId] = useState(searchParams.get("agentId") ?? "");
+  const [selectedAgentAssetId, setSelectedAgentAssetId] = useState(searchParams.get("agentAssetId") ?? "");
   const [selectedWorkspacePath, setSelectedWorkspacePath] = useState(searchParams.get("workspacePath") ?? "");
   const [userId, setUserId] = useState(searchParams.get("userId") ?? "");
   const [metadataDraft, setMetadataDraft] = useState<AgentMetadataDraft>(() => draftFromAgent());
@@ -807,10 +810,12 @@ export default function AgentsPage() {
     healthState,
     q: clean(queryText),
     agentId: clean(selectedAgentId),
+    agentAssetId: clean(selectedAgentAssetId),
     workspacePath: clean(selectedWorkspacePath),
     userId: clean(userId),
+    includeUnclassified: reviewFocused && Boolean(selectedAgentAssetId || selectedAgentId),
     limit: 200,
-  }), [healthState, queryText, routeEndTime, routeStartTime, selectedAgentId, selectedWorkspacePath, timeType, userId]);
+  }), [healthState, queryText, reviewFocused, routeEndTime, routeStartTime, selectedAgentAssetId, selectedAgentId, selectedWorkspacePath, timeType, userId]);
 
   const { data, loading, refresh } = useRequest(() => securityCenterApi.agentInventory(query), {
     refreshDeps: [query],
@@ -820,14 +825,26 @@ export default function AgentsPage() {
 
   const selectedAgent = useMemo(() => {
     const items = data?.items ?? [];
-    return items.find((item) => item.agentId === selectedAgentId && item.workspacePath === selectedWorkspacePath) ?? items[0];
-  }, [data, selectedAgentId, selectedWorkspacePath]);
+    return items.find((item) =>
+      selectedAgentAssetId
+        ? item.agentAssetId === selectedAgentAssetId
+        : item.agentId === selectedAgentId && item.workspacePath === selectedWorkspacePath
+    ) ?? items[0];
+  }, [data, selectedAgentAssetId, selectedAgentId, selectedWorkspacePath]);
+  const classificationCounts = useMemo(() => {
+    const counts: Partial<Record<AgentClassification, number>> = {};
+    for (const item of data?.items ?? []) {
+      counts[item.classification] = (counts[item.classification] ?? 0) + 1;
+    }
+    return counts;
+  }, [data?.items]);
   const reviewSourceEventHref = useMemo(() => {
     if (!reviewSourceEventId || !selectedAgent) return undefined;
     const params = new URLSearchParams({
       timeType,
       eventId: reviewSourceEventId,
       agentId: selectedAgent.agentId,
+      agentAssetId: selectedAgent.agentAssetId,
       workspacePath: selectedAgent.workspacePath,
     });
     if (timeType === "custom" && routeStartTime) params.set("startTime", routeStartTime);
@@ -839,6 +856,7 @@ export default function AgentsPage() {
     setMetadataDraft(draftFromAgent(selectedAgent));
   }, [
     selectedAgent?.agentId,
+    selectedAgent?.agentAssetId,
     selectedAgent?.workspacePath,
     selectedAgent?.displayName,
     selectedAgent?.owner,
@@ -856,19 +874,21 @@ export default function AgentsPage() {
       document.getElementById("agent-review")?.scrollIntoView({ behavior: "smooth", block: "center" });
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [reviewFocused, selectedAgent?.agentId, selectedAgent?.workspacePath]);
+  }, [reviewFocused, selectedAgent?.agentAssetId]);
 
   const selectAgent = (agent: AgentInventoryItem) => {
     setPendingReview(null);
     setReviewError("");
     setReviewNotice("");
     setSelectedAgentId(agent.agentId);
+    setSelectedAgentAssetId(agent.agentAssetId);
     setSelectedWorkspacePath(agent.workspacePath);
     const next = new URLSearchParams();
     next.set("timeType", timeType);
     if (timeType === "custom" && routeStartTime) next.set("startTime", routeStartTime);
     if (timeType === "custom" && routeEndTime) next.set("endTime", routeEndTime);
     next.set("agentId", agent.agentId);
+    next.set("agentAssetId", agent.agentAssetId);
     next.set("workspacePath", agent.workspacePath);
     if (healthState !== "all") next.set("healthState", healthState);
     if (clean(queryText)) next.set("q", queryText.trim());
@@ -880,6 +900,7 @@ export default function AgentsPage() {
     setHealthState("all");
     setQueryText("");
     setSelectedAgentId("");
+    setSelectedAgentAssetId("");
     setSelectedWorkspacePath("");
     setUserId("");
     setPendingReview(null);
@@ -894,6 +915,7 @@ export default function AgentsPage() {
     try {
       await securityCenterApi.updateAgentMetadata(selectedAgent.agentId, {
         workspacePath: selectedAgent.workspacePath,
+        agentAssetId: selectedAgent.agentAssetId,
         displayName: metadataDraft.displayName,
         owner: metadataDraft.owner,
         team: metadataDraft.team,
@@ -901,6 +923,10 @@ export default function AgentsPage() {
         criticality: metadataDraft.criticality,
         tags: splitTags(metadataDraft.tags),
         note: metadataDraft.note,
+        identityKeys: selectedAgent.reviewIdentityKeys,
+        physicalWorkloadId: selectedAgent.physicalWorkloadId,
+        agentInstanceId: selectedAgent.agentInstanceId,
+        workloadRef: selectedAgent.workloadRef,
       });
       await refresh();
     } finally {
@@ -930,6 +956,8 @@ export default function AgentsPage() {
       await securityCenterApi.reviewAgent(selectedAgent.agentId, {
         workspacePath: selectedAgent.workspacePath,
         decision,
+        currentClassification: selectedAgent.classification,
+        agentAssetId: selectedAgent.agentAssetId,
         identityKeys: selectedAgent.reviewIdentityKeys,
         physicalWorkloadId: selectedAgent.physicalWorkloadId,
         agentInstanceId: selectedAgent.agentInstanceId,
@@ -942,8 +970,10 @@ export default function AgentsPage() {
         decision === "confirmed_agent"
           ? "已确认 Agent 身份，新的归因快照将同步给 Collector。"
           : decision === "non_agent"
-            ? "已排除该候选，历史事件仍可继续检索和复核。"
-            : "已撤销人工结论，身份恢复自动发现。",
+            ? "已标记为非 Agent；历史事件保留，后续常规事件将按稳定身份抑制。"
+            : selectedAgent.classification === "non_agent"
+              ? "已重新纳入观察，Collector 将恢复转发该身份的事件。"
+              : "已降为尚未识别并继续采集，历史证据保持不变。",
       );
     } catch (error) {
       setReviewError(error instanceof Error ? error.message : "身份裁决失败，请稍后重试。");
@@ -968,7 +998,7 @@ export default function AgentsPage() {
                 <Bot className="size-5 shrink-0 text-teal-300" />
                 <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">智能体资产</h1>
               </div>
-              <p className="mt-0.5 truncate text-xs text-zinc-500">旁路发现 · 活跃度 · Incident 暴露面</p>
+              <p className="mt-0.5 truncate text-xs text-zinc-500">已确认与候选 Agent · 事件聚合 · 人工身份审核</p>
             </div>
           </div>
           <div className="flex items-center gap-2 text-xs text-zinc-500">
@@ -1020,7 +1050,7 @@ export default function AgentsPage() {
               <div className="flex min-h-12 items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
                 <div className="flex items-center gap-2">
                   <Activity className="size-4 text-teal-200" />
-                  <h2 className="text-sm font-semibold text-zinc-100">Agents</h2>
+                  <h2 className="text-sm font-semibold text-zinc-100">智能体资产</h2>
                 </div>
                 <span className="text-xs text-zinc-500">{data ? `${data.total} 个` : "--"}</span>
               </div>
@@ -1030,17 +1060,41 @@ export default function AgentsPage() {
                   加载资产...
                 </div>
               ) : (data?.items?.length ?? 0) === 0 ? (
-                <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">暂无资产</div>
+                <div className="flex min-h-40 items-center justify-center px-6 text-center text-sm text-zinc-500">
+                  暂无已确认或候选 Agent；尚未识别和已排除身份不会进入资产列表
+                </div>
               ) : (
                 <div className="max-h-[calc(100vh-300px)] overflow-y-auto">
-                  {data?.items.map((agent) => (
-                    <AgentRow
-                      key={`${agent.workspacePath}:${agent.agentId}`}
-                      agent={agent}
-                      active={agent.agentId === selectedAgent?.agentId && agent.workspacePath === selectedAgent?.workspacePath}
-                      onSelect={() => selectAgent(agent)}
-                    />
-                  ))}
+                  {data?.items.map((agent, index, items) => {
+                    const previous = items[index - 1];
+                    const startsSection = !previous || previous.classification !== agent.classification;
+                    return (
+                      <div key={agent.agentAssetId}>
+                        {startsSection ? (
+                          <div className="sticky top-0 z-10 flex items-center justify-between border-b border-white/8 bg-[#111612]/95 px-3 py-2 backdrop-blur">
+                            <span className={cn(
+                              "text-[11px] font-semibold",
+                              agent.classification === "confirmed_agent"
+                                ? "text-emerald-200"
+                                : agent.classification === "probable_agent"
+                                  ? "text-amber-200"
+                                  : "text-zinc-400",
+                            )}>
+                              {CLASSIFICATION_LABEL[agent.classification]}
+                            </span>
+                            <span className="text-[10px] text-zinc-600">
+                              {classificationCounts[agent.classification] ?? 0} 个
+                            </span>
+                          </div>
+                        ) : null}
+                        <AgentRow
+                          agent={agent}
+                          active={agent.agentAssetId === selectedAgent?.agentAssetId}
+                          onSelect={() => selectAgent(agent)}
+                        />
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </section>

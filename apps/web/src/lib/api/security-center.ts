@@ -14,9 +14,9 @@ export type SecurityRiskLevel = "safe" | "low" | "medium" | "high" | "critical" 
 export type SecurityPolicyAction = "allow" | "review" | "block" | string;
 
 export type AgentClassification = "confirmed_agent" | "probable_agent" | "unknown" | "non_agent";
-export type AgentReviewDecision = "confirmed_agent" | "non_agent";
+export type AgentReviewDecision = "confirmed_agent" | "unknown" | "non_agent";
 export type AgentAttributionSource = "none" | "process_graph" | "cgroup" | "systemd" | "argv" | "env" | "self_register" | "workspace_hint" | "kubernetes" | "docker" | "behavior" | "process_signature" | "manual_review";
-export type AgentAttributionReason = "not_evaluated" | "not_agent" | "process_lineage" | "authoritative_anchor" | "hint_only" | "conflict" | "human_confirmed" | "human_rejected";
+export type AgentAttributionReason = "not_evaluated" | "not_agent" | "process_lineage" | "authoritative_anchor" | "hint_only" | "conflict" | "human_confirmed" | "human_deferred" | "human_rejected";
 
 export interface ProcessContext {
   hostId?: string;
@@ -311,6 +311,7 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   sourceId?: string;
   collectorId?: string;
   agentId?: string;
+  agentAssetId?: string;
   sessionId?: string;
   workspacePath?: string;
   traceId?: string;
@@ -334,6 +335,13 @@ export interface AgentEventListItem {
   subject: string;
   workspacePath: string;
   agentId: string;
+  agentAssetId: string;
+  displayName?: string;
+  detectedName?: string;
+  detectedClassification: AgentClassification;
+  effectiveClassification: AgentClassification;
+  runtime: "kubernetes" | "docker" | "host" | "unknown";
+  locationLabel?: string;
   collectorId?: string;
   sourceId?: string;
   sessionId: string;
@@ -1124,16 +1132,21 @@ export interface AgentInventoryQuery extends SecurityTimeFilter {
   tag?: string;
   q?: string;
   agentId?: string;
+  agentAssetId?: string;
   workspacePath?: string;
   userId?: string;
+  includeUnclassified?: boolean;
   limit?: number;
 }
 
 export interface AgentInventoryItem {
   agentId: string;
+  agentAssetId: string;
   workspacePath: string;
   userId: string;
   displayName?: string;
+  detectedName?: string;
+  detectedClassification: AgentClassification;
   owner?: string;
   team?: string;
   environment?: string;
@@ -1142,6 +1155,9 @@ export interface AgentInventoryItem {
   note?: string;
   metadataUpdatedAt?: string;
   classification: AgentClassification;
+  runtime: "kubernetes" | "docker" | "host" | "unknown";
+  locationLabel?: string;
+  instanceCount: number;
   confidence: number;
   attributionSource: AgentAttributionSource;
   attributionEvidence: string[];
@@ -1189,6 +1205,7 @@ export interface AgentInventorySummary {
 
 export interface AgentMetadataListItem {
   agentId: string;
+  agentAssetId?: string;
   workspacePath: string;
   displayName?: string;
   owner?: string;
@@ -1197,6 +1214,10 @@ export interface AgentMetadataListItem {
   criticality?: AgentCriticality;
   tags: string[];
   note?: string;
+  identityKeys?: string[];
+  physicalWorkloadId?: string;
+  agentInstanceId?: string;
+  workloadRef?: AgentWorkloadRef;
   reviewDecision?: AgentReviewDecision;
   reviewedBy?: string;
   reviewedAt?: string;
@@ -1215,6 +1236,7 @@ export interface AgentMetadataList {
 
 export interface AgentMetadataUpdateRequest {
   workspacePath: string;
+  agentAssetId?: string;
   displayName?: string;
   owner?: string;
   team?: string;
@@ -1222,11 +1244,17 @@ export interface AgentMetadataUpdateRequest {
   criticality?: AgentCriticality | "";
   tags?: string[];
   note?: string;
+  identityKeys?: string[];
+  physicalWorkloadId?: string;
+  agentInstanceId?: string;
+  workloadRef?: AgentWorkloadRef;
 }
 
 export interface AgentReviewRequest {
   workspacePath: string;
   decision: AgentReviewDecision | "clear";
+  currentClassification?: AgentClassification;
+  agentAssetId?: string;
   identityKeys?: string[];
   physicalWorkloadId?: string;
   agentInstanceId?: string;

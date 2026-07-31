@@ -722,7 +722,10 @@ export class AggregationService {
 
     const metadataOnlyItems = this.agentMetadata.list()
       .filter((metadata) =>
-        isAgentAssetClassification(metadata.reviewDecision ?? 'unknown') &&
+        (
+          isAgentAssetClassification(metadata.reviewDecision ?? 'unknown') ||
+          Boolean(filter.includeUnclassified && (agentAssetId || agentId))
+        ) &&
         !byAgent.has(metadata.agentAssetId ?? '') &&
         (
           !shouldScopeExactAgent ||
@@ -795,11 +798,16 @@ export class AggregationService {
 
     const filtered = items
       .filter((item) => {
-        if (!isAgentAssetClassification(item.classification)) return false;
         const matchesAgentId = Boolean(
           (agentAssetId && item.agentAssetId === agentAssetId) ||
           (agentId && item.agentId === agentId && (!workspacePath || item.workspacePath === workspacePath)),
         );
+        if (
+          !isAgentAssetClassification(item.classification) &&
+          !(filter.includeUnclassified && matchesAgentId)
+        ) {
+          return false;
+        }
         const matchesFilter =
           (!filter.healthState || filter.healthState === 'all' || item.healthState === filter.healthState) &&
           (!filter.criticality || filter.criticality === 'all' || item.criticality === filter.criticality) &&

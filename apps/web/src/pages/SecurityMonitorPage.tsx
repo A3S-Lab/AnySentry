@@ -2311,6 +2311,7 @@ function eventDetailHref(event: AgentEventListItem, timeFilter: SecurityTimeFilt
   if (event.runId) qs.set("runId", event.runId);
   if (event.sessionId) qs.set("sessionId", event.sessionId);
   if (event.agentId) qs.set("agentId", event.agentId);
+  if (event.agentAssetId) qs.set("agentAssetId", event.agentAssetId);
   if (event.workspacePath) qs.set("workspacePath", event.workspacePath);
   if (event.eventKind) qs.set("eventKind", event.eventKind);
   const sourceId =

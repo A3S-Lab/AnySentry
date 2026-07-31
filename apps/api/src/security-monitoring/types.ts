@@ -849,6 +849,7 @@ export interface AgentInventoryQuery extends SecurityTimeFilter {
   agentAssetId?: string;
   workspacePath?: string;
   userId?: string;
+  includeUnclassified?: boolean;
   limit?: number;
 }
 export interface AgentMetadataRecord {

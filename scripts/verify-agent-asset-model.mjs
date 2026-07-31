@@ -11,6 +11,9 @@ const {
 const {
   AgentMetadataService,
 } = require('../apps/api/dist/security-monitoring/agent-metadata.service.js');
+const {
+  AggregationService,
+} = require('../apps/api/dist/security-monitoring/aggregation.service.js');
 
 function event({
   agentId,
@@ -118,5 +121,91 @@ assert.deepEqual(
   originalAttribution,
   'query-time display metadata never mutates collected attribution evidence',
 );
+
+const confirmedEvent = event({ agentId: 'confirmed-root', pid: 301, rootPid: 300 });
+confirmedEvent.attribution.classification = 'confirmed_agent';
+confirmedEvent.attribution.agentScopeId = 'confirmed-agent';
+confirmedEvent.attribution.agentDisplayName = 'confirmed-agent';
+confirmedEvent.attribution.physicalWorkloadId = 'host:node-a:boot-a:root:300';
+
+const candidateEvent = event({ agentId: 'candidate-root', pid: 401, rootPid: 400 });
+candidateEvent.attribution.agentScopeId = 'candidate-agent';
+candidateEvent.attribution.agentDisplayName = 'candidate-agent';
+candidateEvent.attribution.physicalWorkloadId = 'host:node-a:boot-a:root:400';
+candidateEvent.verdict = 'block';
+candidateEvent.severity = 'critical';
+candidateEvent.riskScore = 99;
+
+const candidateChild = event({ agentId: 'bash', pid: 402, rootPid: 400 });
+candidateChild.attribution.agentScopeId = 'candidate-agent';
+candidateChild.attribution.agentDisplayName = 'candidate-agent';
+candidateChild.attribution.physicalWorkloadId = 'host:node-a:boot-a:root:400';
+
+const unknownEvent = event({ agentId: 'unknown-root', pid: 501, rootPid: 500 });
+unknownEvent.attribution.monitored = false;
+unknownEvent.attribution.classification = 'unknown';
+unknownEvent.attribution.agentScopeId = undefined;
+unknownEvent.attribution.agentDisplayName = undefined;
+unknownEvent.attribution.physicalWorkloadId = 'host:node-a:boot-a:root:500';
+
+const nonAgentEvent = event({ agentId: 'database', pid: 601, rootPid: 600 });
+nonAgentEvent.attribution.monitored = false;
+nonAgentEvent.attribution.classification = 'non_agent';
+nonAgentEvent.attribution.agentScopeId = undefined;
+nonAgentEvent.attribution.agentDisplayName = undefined;
+nonAgentEvent.attribution.physicalWorkloadId = 'host:node-a:boot-a:root:600';
+
+const judge = {
+  query: () => [confirmedEvent, candidateEvent, candidateChild, unknownEvent, nonAgentEvent],
+  listIncidents: () => [],
+};
+const aggregation = new AggregationService(judge, service, {}, {});
+let inventory = aggregation.agentInventory({ timeType: 'last_3h', limit: 100 });
+assert.equal(inventory.items.length, 2, 'only confirmed and candidate identities enter Agent assets');
+assert.equal(inventory.items[0].classification, 'confirmed_agent', 'confirmed assets sort before higher-risk candidates');
+assert.equal(inventory.items[1].classification, 'probable_agent');
+assert.equal(inventory.items[1].eventCount, 2, 'one Agent asset aggregates events with different raw process names');
+assert.equal(inventory.items[1].instanceCount, 1);
+
+const candidateAsset = inventory.items[1];
+service.review(candidateAsset.agentId, {
+  workspacePath: candidateAsset.workspacePath,
+  decision: 'unknown',
+  currentClassification: 'probable_agent',
+  agentAssetId: candidateAsset.agentAssetId,
+  identityKeys: candidateAsset.reviewIdentityKeys,
+  physicalWorkloadId: candidateAsset.physicalWorkloadId,
+  agentInstanceId: candidateAsset.agentInstanceId,
+  workloadRef: candidateAsset.workloadRef,
+}, 'security-reviewer');
+aggregation.invalidateWindowCache();
+assert.equal(
+  service.resolveEvent(confirmedEvent).effectiveClassification,
+  'confirmed_agent',
+  JSON.stringify(service.resolveEvent(confirmedEvent)),
+);
+assert.equal(
+  service.resolveEvent(candidateEvent).effectiveClassification,
+  'unknown',
+  JSON.stringify(service.resolveEvent(candidateEvent)),
+);
+inventory = aggregation.agentInventory({ timeType: 'last_3h', limit: 100 });
+assert.equal(
+  inventory.items.length,
+  1,
+  `an Agent returned to unknown leaves the primary asset inventory: ${JSON.stringify(inventory.items.map((item) => ({
+    asset: item.agentAssetId,
+    classification: item.classification,
+    physical: item.physicalWorkloadId,
+  })))}`,
+);
+const focusedUnknown = aggregation.agentInventory({
+  timeType: 'last_3h',
+  agentAssetId: candidateAsset.agentAssetId,
+  includeUnclassified: true,
+  limit: 10,
+});
+assert.equal(focusedUnknown.items.length, 1, 'a focused review can still reopen an unknown identity');
+assert.equal(focusedUnknown.items[0].classification, 'unknown');
 
 console.log('Agent asset identity and immutable display-name overlay verification passed.');
