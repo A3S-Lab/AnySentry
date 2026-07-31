@@ -26,6 +26,7 @@
     "verify:identity-routing-runtime": "node scripts/verify-identity-routing-runtime.mjs",
     "verify:event-visibility": "pnpm build:api && node scripts/verify-event-visibility.mjs",
     "verify:identity-review-agent": "pnpm build:api && node scripts/verify-identity-review-agent.mjs",
+    "verify:identity-review-runtime": "node scripts/verify-identity-review-runtime.mjs",
     "verify:l3-agent-pool:local": "pnpm build:api && pnpm verify:l3-agent-pool",
     "verify:streaming-phase1": "node scripts/verify-streaming-phase1.mjs",
     "verify:streaming-phase1:local": "pnpm build:api && pnpm verify:streaming-phase1",
