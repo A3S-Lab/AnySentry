@@ -10,6 +10,17 @@ function normalizedContainerId(value) {
   return text(value).replace(/^[a-z0-9._-]+:\/\//i, '');
 }
 
+function behaviorDiscoveryEligible(classification) {
+  if (!classification || classification.attribution?.source === 'manual_review') return false;
+  return (
+    classification.state === 'unknown' ||
+    (
+      classification.state === 'non_agent' &&
+      classification.attribution?.source === 'process_graph'
+    )
+  );
+}
+
 function eventIdentityCandidates(observerEvent) {
   const identity = observerEvent?.identity && typeof observerEvent.identity === 'object'
     ? observerEvent.identity
@@ -411,6 +422,7 @@ class DiscoveryBudget {
 }
 
 module.exports = {
+  behaviorDiscoveryEligible,
   DiscoveryBudget,
   WorkloadIdentityCache,
   eventIdentityCandidates,

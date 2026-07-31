@@ -20,7 +20,11 @@ const { DockerDiscovery } = require('./observer-docker-discovery');
 const { BehavioralAgentDetector } = require('./observer-behavior-discovery');
 const { BoundedPriorityQueue } = require('./observer-priority-queue');
 const { ToolExecDeduper } = require('./observer-event-dedup');
-const { DiscoveryBudget, WorkloadIdentityCache } = require('./observer-workload-filter');
+const {
+  behaviorDiscoveryEligible,
+  DiscoveryBudget,
+  WorkloadIdentityCache,
+} = require('./observer-workload-filter');
 const { InfrastructureRootResolver } = require('./observer-infrastructure-roots');
 
 const target = new URL(process.env.ANYSENTRY_INGEST_URL || 'http://localhost:29653/security-center/ingest');
@@ -116,6 +120,7 @@ let errorCount = 0;
 let eventKindCounts = Object.create(null);
 const forwarderInstanceId = crypto.randomUUID();
 let sourceEventSequence = 0;
+let lastNonAgentSuppressedAt = '';
 let attributionCounts = {
   observed: 0,
   confirmedAgent: 0,
@@ -349,6 +354,7 @@ function sendHeartbeat(done = () => {}) {
         nonAgent: classifications.nonAgent,
         filteredNonAgent: classifications.filteredNonAgent,
         wouldFilterNonAgent: classifications.wouldFilterNonAgent,
+        lastSuppressedAt: lastNonAgentSuppressedAt || undefined,
         filteredNoise: classifications.filteredNoise,
         wouldFilterNoise: classifications.wouldFilterNoise,
         discoveryBudgetDropped: classifications.discoveryBudgetDropped,
@@ -530,14 +536,8 @@ function handleLine(raw) {
     templateClassification ??
     workloadClassification ??
     processClassification;
-  const behaviorEligible =
-    baseClassification.state === 'unknown' ||
-    (
-      baseClassification.state === 'non_agent' &&
-      baseClassification.attribution?.source === 'process_graph'
-    );
   const classification =
-    (behaviorEligible
+    (behaviorDiscoveryEligible(baseClassification)
       ? behaviorDetector.observe(o, baseClassification.attribution)
       : undefined) ??
     baseClassification;
@@ -580,9 +580,14 @@ function handleLine(raw) {
       else if (filterReason === 'discovery_budget') attributionCounts.wouldDiscoveryBudgetDrop++;
       else attributionCounts.wouldFilterNoise++;
     } else {
-      if (filterReason === 'non_agent') attributionCounts.filteredNonAgent++;
-      else if (filterReason === 'discovery_budget') attributionCounts.discoveryBudgetDropped++;
-      else attributionCounts.filteredNoise++;
+      if (filterReason === 'non_agent') {
+        attributionCounts.filteredNonAgent++;
+        lastNonAgentSuppressedAt = new Date().toISOString();
+      } else if (filterReason === 'discovery_budget') {
+        attributionCounts.discoveryBudgetDropped++;
+      } else {
+        attributionCounts.filteredNoise++;
+      }
       return;
     }
   }

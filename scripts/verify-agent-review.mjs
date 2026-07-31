@@ -5,6 +5,16 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const { AgentMetadataService } = require('../apps/api/dist/security-monitoring/agent-metadata.service.js');
+const { behaviorDiscoveryEligible } = require('./observer-workload-filter.js');
+
+assert.equal(behaviorDiscoveryEligible({
+  state: 'unknown',
+  attribution: { source: 'manual_review' },
+}), false, 'a manual Unknown decision must not be immediately promoted by behavior discovery');
+assert.equal(behaviorDiscoveryEligible({
+  state: 'unknown',
+  attribution: { source: 'process_graph' },
+}), true, 'automatic Unknown identities remain eligible for behavior discovery');
 
 const service = new AgentMetadataService();
 const containerId = 'c4c5f098f38fe7a837c572d199133a5b13a6b1f39d3d31da053b9d261d865330';
