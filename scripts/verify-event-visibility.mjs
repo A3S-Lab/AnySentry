@@ -21,4 +21,11 @@ assert.match(storeSource, /async searchEvents\(input: StoredEventQuery\)/u);
 assert.match(storeSource, /ORDER BY at DESC, decisionUpdatedAt DESC/u);
 assert.match(storeSource, /const latest = new Map<string, JudgedEvent>/u);
 
+const aggregationSource = await readFile(new URL('../apps/api/src/security-monitoring/aggregation.service.ts', import.meta.url), 'utf8');
+const directFilterAt = aggregationSource.indexOf('const matchesDirectFilter =');
+const earlyRejectAt = aggregationSource.indexOf('if (!matchesEventId && !matchesDirectFilter) return false;');
+const identityResolveAt = aggregationSource.indexOf('const resolved = this.agentMetadata.resolveEvent(e);', directFilterAt);
+assert.ok(directFilterAt >= 0 && directFilterAt < earlyRejectAt && earlyRejectAt < identityResolveAt,
+  'exact event filters must reject before identity/display metadata resolution');
+
 console.log('PASS event visibility matrix and durable-search lifecycle contracts');

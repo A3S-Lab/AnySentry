@@ -436,11 +436,32 @@ export class AggregationService {
     // pinned event still makes them accessible.
     const hideNoise = !pinnedEventId && !filter.eventKind && filter.noise !== 'include';
     return events.filter((e) => {
-      const resolved = this.agentMetadata.resolveEvent(e);
       const matchesEventId = Boolean(pinnedEventId && e.eventId === pinnedEventId);
+      if (pinnedEventId && !hasFilter) return matchesEventId;
+
       const eventSource = eventSourceId(e);
       const eventCollector = eventCollectorId(e);
       const isHiddenNoise = agentScoped ? isLowValueAgentNoise(e) : e.eventKind === 'ProcessExit';
+      // Exact fields are already present on the event. Reject on them before resolving display
+      // metadata, which may read the manual-review registry and hash an asset identity. A scoped
+      // query commonly reduces the 100k hot ring to tens of rows, so this ordering keeps event
+      // search proportional to the result set without changing pinned-event semantics.
+      const matchesDirectFilter =
+        (!sourceId || eventSource === sourceId) &&
+        (!collectorId || eventCollector === collectorId) &&
+        (!agentId || e.agentId === agentId) &&
+        (!sessionId || e.sessionId === sessionId) &&
+        (!workspacePath || e.workspacePath === workspacePath) &&
+        (!traceId || e.traceId === traceId) &&
+        (!runId || e.runId === runId) &&
+        (!filter.eventKind || e.eventKind === filter.eventKind) &&
+        (!filter.eventCategory || e.eventCategory === filter.eventCategory) &&
+        (!filter.verdict || e.verdict === filter.verdict) &&
+        (!filter.tier || e.tier === filter.tier) &&
+        (!hideNoise || !isHiddenNoise);
+      if (!matchesEventId && !matchesDirectFilter) return false;
+
+      const resolved = this.agentMetadata.resolveEvent(e);
       const visibleClassification = isEventClassificationVisible(
         resolved.effectiveClassification,
         agentScoped ? 'agent' : 'raw',
@@ -452,18 +473,8 @@ export class AggregationService {
         (!hideNoise || !isHiddenNoise);
       const matchesFilter =
         matchesScope &&
-        (!sourceId || eventSource === sourceId) &&
-        (!collectorId || eventCollector === collectorId) &&
-        (!agentId || e.agentId === agentId) &&
+        matchesDirectFilter &&
         (!agentAssetId || resolved.agentAssetId === agentAssetId) &&
-        (!sessionId || e.sessionId === sessionId) &&
-        (!workspacePath || e.workspacePath === workspacePath) &&
-        (!traceId || e.traceId === traceId) &&
-        (!runId || e.runId === runId) &&
-        (!filter.eventKind || e.eventKind === filter.eventKind) &&
-        (!filter.eventCategory || e.eventCategory === filter.eventCategory) &&
-        (!filter.verdict || e.verdict === filter.verdict) &&
-        (!filter.tier || e.tier === filter.tier) &&
         (
           !q ||
           [
@@ -477,7 +488,6 @@ export class AggregationService {
             JSON.stringify(e.attribution ?? {}),
           ].some((value) => value?.toLowerCase().includes(q))
         );
-      if (pinnedEventId && !hasFilter) return matchesEventId;
       return matchesEventId || matchesFilter;
     });
   }
