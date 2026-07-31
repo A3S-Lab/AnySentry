@@ -24,6 +24,7 @@ export interface L1Rule {
 export interface L2Config { url: string; model: string; timeoutS: number } // LLM judge endpoint
 /** `bin` is retained for policy compatibility; the async L3 worker uses the in-process SDK. */
 export interface L3Config { bin: string; skills: string }
+export interface IdentityJudgmentPolicy { candidatePipeline: 'full' | 'l1_only' }
 
 /** The whole judge policy. `null` tiers are "not configured" → the dashboard hides them. */
 export interface PolicyConfig {
@@ -32,6 +33,7 @@ export interface PolicyConfig {
   rules: L1Rule[];
   llm: L2Config | null;
   agent: L3Config | null;
+  identity: IdentityJudgmentPolicy;
 }
 
 export class PolicyConfigError extends Error {
@@ -53,6 +55,7 @@ export const DEFAULT_POLICY: PolicyConfig = {
   rules: [],
   llm: null,
   agent: null,
+  identity: { candidatePipeline: 'full' },
 };
 
 const KINDS: RuleKind[] = ['ToolExec', 'Egress', 'Dns', 'FileAccess', 'SslContent', 'SecurityAction'];
@@ -91,7 +94,12 @@ export function sanitizePolicy(input: unknown): PolicyConfig {
   const agentIn = o.agent as Record<string, unknown> | null | undefined;
   const agent: L3Config | null = agentIn && str(agentIn.bin) ? { bin: str(agentIn.bin, 500), skills: str(agentIn.skills, 500) } : null;
 
-  return { failClosed: o.failClosed === true, speculate: pick(o.speculate, ['off', 'low', 'medium', 'high'], 'off'), rules, llm, agent };
+  const identityIn = o.identity as Record<string, unknown> | null | undefined;
+  const identity: IdentityJudgmentPolicy = {
+    candidatePipeline: pick(identityIn?.candidatePipeline, ['full', 'l1_only'], 'full'),
+  };
+
+  return { failClosed: o.failClosed === true, speculate: pick(o.speculate, ['off', 'low', 'medium', 'high'], 'off'), rules, llm, agent, identity };
 }
 
 /** HCL double-quoted string. */

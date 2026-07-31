@@ -8,6 +8,7 @@ import { DEFAULT_POLICY, PolicyConfig, buildFastAcl, policyConfigError, sanitize
 import { cleanText } from './redaction';
 import { DecisionResultJob, FastJudgeJob } from './async-judgment.types';
 import { JudgmentQueueService } from './judgment-queue.service';
+import { resolveJudgmentRoute } from './identity-judgment-routing';
 import { CollectorHeartbeatRecord, CollectorHeartbeatRequest, EventCategory, EventMeta, Incident, IncidentStatus, JudgedEvent, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
 
 const SEVERITY_SCORE: Record<Severity, number> = { info: 8, low: 28, medium: 52, high: 76, critical: 95 };
@@ -366,7 +367,11 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return hashId('pol', [JSON.stringify(this.policy)]);
   }
 
-  private recordProducerFinding(base: JudgedEventBase, finding: NonNullable<ReturnType<typeof producerReportedFinding>>): JudgedEvent {
+  private recordProducerFinding(
+    base: JudgedEventBase,
+    finding: NonNullable<ReturnType<typeof producerReportedFinding>>,
+    judgment?: JudgedEvent['judgment'],
+  ): JudgedEvent {
     return this.push({
       ...base,
       verdict: 'escalate',
@@ -377,6 +382,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       riskName: finding.riskName,
       riskType: 'atomic',
       riskScore: SEVERITY_SCORE[finding.severity],
+      judgment,
     });
   }
 
@@ -432,9 +438,19 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   async accept(line: string, meta: EventMeta, at = Date.now()): Promise<JudgedEvent | null> {
     if (!this.queues.enabled) return this.judge(line, meta, at);
     const base = this.eventBase(line, meta, at);
+    const routing = resolveJudgmentRoute(base.attribution?.classification, this.policy);
+    if (routing.profile === 'discard') return null;
     if (this.isInternalL3Invocation(line, base)) return this.recordInternalL3Activity(base);
     const producerFinding = producerReportedFinding(base);
-    if (producerFinding) return this.recordProducerFinding(base, producerFinding);
+    if (producerFinding) {
+      return this.recordProducerFinding(base, producerFinding, {
+        ...routing,
+        policyVersion: this.policyVersion(),
+        l1Verdict: 'escalate',
+        nextTierEligible: false,
+        stopReason: 'producer_finding',
+      });
+    }
     if (!SECURITY_JUDGED_KINDS.has(base.eventKind)) {
       if (!OBSERVER_KINDS.has(base.eventKind) && base.source !== 'api') return null;
       return this.push({
@@ -447,6 +463,13 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         riskName: '正常',
         riskType: 'atomic',
         riskScore: 0,
+        judgment: {
+          ...routing,
+          policyVersion: this.policyVersion(),
+          l1Verdict: 'allow',
+          nextTierEligible: false,
+          stopReason: 'no_applicable_l1_rule',
+        },
       });
     }
 
@@ -466,16 +489,21 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       riskName: '待研判',
       riskType: 'atomic',
       riskScore: 0,
+      judgment: {
+        ...routing,
+        policyVersion,
+      },
     };
     await this.ch.insertNow(pending);
     this.upsertMemory(pending, false);
     const job: FastJudgeJob = {
-      schemaVersion: 'anysentry.fast_judge_job.v1',
+      schemaVersion: 'anysentry.fast_judge_job.v2',
       evaluationId,
       policyVersion,
       event: pending,
       observerLine: line.slice(0, 64 * 1024),
       policy: this.policy,
+      routing,
       queuedAt: Date.now(),
     };
     try {
@@ -507,6 +535,18 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       const risk = riskFromDecision(decision, result.event.eventKind);
       next = {
         ...result.event,
+        judgment: {
+          ...(result.event.judgment ?? {
+            classification: result.event.attribution?.classification ?? 'unknown',
+            profile: 'full',
+            maxTier: 'L3',
+            reason: result.event.attribution?.classification === 'confirmed_agent' ? 'confirmed_agent_full' : 'candidate_agent_full',
+            routingVersion: 'legacy',
+          }),
+          l1Verdict: result.l1Decision?.verdict as Verdict | undefined,
+          nextTierEligible: result.nextTierEligible,
+          stopReason: result.stageStopReason,
+        },
         decisionStatus: awaitingL3 ? 'pending' : result.status,
         evaluationId: result.evaluationId,
         policyVersion: result.policyVersion,
@@ -526,6 +566,18 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     } else {
       next = {
         ...(current ?? result.event),
+        judgment: {
+          ...((current ?? result.event).judgment ?? {
+            classification: result.event.attribution?.classification ?? 'unknown',
+            profile: 'full',
+            maxTier: 'L3',
+            reason: result.event.attribution?.classification === 'confirmed_agent' ? 'confirmed_agent_full' : 'candidate_agent_full',
+            routingVersion: 'legacy',
+          }),
+          l1Verdict: result.l1Decision?.verdict as Verdict | undefined,
+          nextTierEligible: result.nextTierEligible,
+          stopReason: result.stageStopReason,
+        },
         decisionStatus: result.status,
         evaluationId: result.evaluationId,
         policyVersion: result.policyVersion,
@@ -582,8 +634,25 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       rawPreview: meta.rawPreview,
     } satisfies JudgedEventBase;
 
+    const routing = resolveJudgmentRoute(attribution?.classification, this.policy);
+    if (routing.profile === 'discard') return null;
+    const policyVersion = this.policyVersion();
     if (this.isInternalL3Invocation(line, base)) return this.recordInternalL3Activity(base);
-    const d = this.sentry.evaluate(line) as SentryDecisionWithRisk | null;
+    const evaluateL1 = (this.sentry as Sentry & { evaluateL1?: (event: string) => { l1Decision: SentryDecisionWithRisk; nextTierEligible: boolean; stopReason: string } | null }).evaluateL1;
+    const l1 = routing.profile === 'l1_only'
+      ? (typeof evaluateL1 === 'function' ? evaluateL1.call(this.sentry, line) : null)
+      : null;
+    if (routing.profile === 'l1_only' && typeof evaluateL1 !== 'function') {
+      throw new Error('@a3s-lab/sentry staged L1 SDK is required');
+    }
+    const d = (l1?.l1Decision ?? this.sentry.evaluate(line)) as SentryDecisionWithRisk | null;
+    const judgment = {
+      ...routing,
+      policyVersion,
+      l1Verdict: (l1?.l1Decision.verdict ?? (d?.tier === 'Rules' ? d.verdict : undefined)) as Verdict | undefined,
+      nextTierEligible: l1?.nextTierEligible,
+      stopReason: routing.profile === 'l1_only' ? routing.reason : undefined,
+    };
     const producerFinding = producerReportedFinding(base);
     if (producerFinding) {
       return this.push({
@@ -596,13 +665,14 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         riskName: producerFinding.riskName,
         riskType: 'atomic',
         riskScore: SEVERITY_SCORE[producerFinding.severity],
+        judgment,
       });
     }
     if (!d) {
       // Not security-judged by the sentry policy, but still a real observed signal — record benign so
       // every observer feature is counted. Drop only truly unparseable input (unknown kind).
       if (!OBSERVER_KINDS.has(eventKind) && base.source !== 'api') return null;
-      return this.push({ ...base, verdict: 'allow', tier: 'Rules', severity: 'info', reason: 'observed', riskCategory: 'benign', riskName: '正常', riskType: 'atomic', riskScore: 0 });
+      return this.push({ ...base, verdict: 'allow', tier: 'Rules', severity: 'info', reason: 'observed', riskCategory: 'benign', riskName: '正常', riskType: 'atomic', riskScore: 0, judgment: { ...judgment, l1Verdict: 'allow', nextTierEligible: false, stopReason: 'no_applicable_l1_rule' } });
     }
 
     const risk = riskFromDecision(d, eventKind);
@@ -619,6 +689,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       riskName: verdict === 'allow' ? '正常' : risk.name,
       riskType: risk.type,
       riskScore: verdict === 'allow' ? 0 : SEVERITY_SCORE[severity],
+      judgment,
     });
   }
 

@@ -1,5 +1,5 @@
 import { PolicyConfig } from './policy-config';
-import { JudgedEvent } from './types';
+import { JudgedEvent, JudgmentRoutingSnapshot } from './types';
 
 export const FAST_JUDGE_QUEUE = 'anysentry-fast-judge';
 export const L3_JOBS_QUEUE = 'anysentry-l3-jobs';
@@ -18,12 +18,13 @@ export interface AsyncDecision {
 }
 
 export interface FastJudgeJob {
-  schemaVersion: 'anysentry.fast_judge_job.v1';
+  schemaVersion: 'anysentry.fast_judge_job.v2';
   evaluationId: string;
   policyVersion: string;
   event: JudgedEvent;
   observerLine: string;
   policy: PolicyConfig;
+  routing: JudgmentRoutingSnapshot;
   queuedAt: number;
 }
 
@@ -35,6 +36,7 @@ export interface L3JudgeJob {
   observerLine: string;
   policy: PolicyConfig;
   provisionalDecision: AsyncDecision;
+  l1Decision: AsyncDecision;
   queuedAt: number;
 }
 
@@ -46,6 +48,9 @@ export interface DecisionResultJob {
   stage: DecisionStage;
   status: Exclude<DecisionStatus, 'accepted' | 'pending' | 'running'>;
   decision?: AsyncDecision;
+  l1Decision?: AsyncDecision;
+  nextTierEligible?: boolean;
+  stageStopReason?: string;
   awaitingL3?: boolean;
   error?: string;
   startedAt: number;

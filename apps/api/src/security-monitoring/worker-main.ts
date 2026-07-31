@@ -46,6 +46,15 @@ type ThroughL2Result = {
   effectiveDecision: AsyncDecision;
   stageStatus: 'completed' | 'escalated';
   escalationCause?: 'l1' | 'l2' | 'sae';
+  nextTierEligible: boolean;
+  stopReason: string;
+};
+
+type ThroughL1Result = {
+  l1Decision: AsyncDecision;
+  stageStatus: 'completed' | 'escalated' | 'stopped';
+  nextTierEligible: boolean;
+  stopReason: string;
 };
 
 function attemptNumber(attemptsMade: number): number {
@@ -86,12 +95,35 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
       sentryCache.set(input.policyVersion, sentry);
       if (sentryCache.size > 8) sentryCache.delete(sentryCache.keys().next().value as string);
     }
+    if (input.routing.profile === 'l1_only' || input.routing.maxTier === 'L1') {
+      const evaluateL1 = (sentry as Sentry & { evaluateL1?: (event: string) => ThroughL1Result | null }).evaluateL1;
+      if (typeof evaluateL1 !== 'function') throw new Error('@a3s-lab/sentry staged L1 SDK is required');
+      const evaluation = evaluateL1.call(sentry, input.observerLine);
+      if (!evaluation) throw new Error('observer event is not parseable by Sentry L1');
+      await publishResult({
+        schemaVersion: 'anysentry.decision_result.v1',
+        evaluationId: input.evaluationId,
+        policyVersion: input.policyVersion,
+        event: input.event,
+        stage: 'L1',
+        status: 'succeeded',
+        decision: evaluation.l1Decision,
+        l1Decision: evaluation.l1Decision,
+        nextTierEligible: evaluation.nextTierEligible,
+        stageStopReason: evaluation.stopReason === 'evidence_incomplete' ? evaluation.stopReason : input.routing.reason,
+        startedAt,
+        completedAt: Date.now(),
+        attempt: attemptNumber(job.attemptsMade),
+      });
+      return;
+    }
     const evaluation = (await sentry.evaluateThroughL2(input.observerLine)) as ThroughL2Result;
     const decision = evaluation.effectiveDecision;
     if (
       evaluation.stageStatus === 'escalated' &&
-      evaluation.escalationCause === 'l2' &&
+      evaluation.nextTierEligible &&
       decision.verdict === 'escalate' &&
+      input.routing.maxTier === 'L3' &&
       input.policy.agent
     ) {
       const l3Job: L3JudgeJob = {
@@ -102,6 +134,7 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
         observerLine: input.observerLine,
         policy: input.policy,
         provisionalDecision: decision,
+        l1Decision: evaluation.l1Decision,
         queuedAt: Date.now(),
       };
       await l3Queue.add('deep-investigation', l3Job, {
@@ -119,6 +152,9 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
         stage: 'L2',
         status: 'succeeded',
         decision,
+        l1Decision: evaluation.l1Decision,
+        nextTierEligible: evaluation.nextTierEligible,
+        stageStopReason: evaluation.stopReason,
         awaitingL3: true,
         startedAt,
         completedAt: Date.now(),
@@ -134,6 +170,9 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
       stage: decision.tier === 'Llm' ? 'L2' : 'L1',
       status: 'succeeded',
       decision,
+      l1Decision: evaluation.l1Decision,
+      nextTierEligible: evaluation.nextTierEligible,
+      stageStopReason: evaluation.stopReason,
       startedAt,
       completedAt: Date.now(),
       attempt: attemptNumber(job.attemptsMade),
@@ -228,6 +267,9 @@ async function l3Judge(job: Job<L3JudgeJob>): Promise<void> {
       stage: 'L3',
       status: 'succeeded',
       decision,
+      l1Decision: input.l1Decision,
+      nextTierEligible: false,
+      stageStopReason: 'decision_final',
       startedAt,
       completedAt: Date.now(),
       attempt: attemptNumber(job.attemptsMade),
@@ -254,6 +296,9 @@ async function l3Judge(job: Job<L3JudgeJob>): Promise<void> {
       // Preserve the provisional escalation, but distinguish a real execution timeout from
       // invalid/no JSON, tool-round exhaustion, and other terminal L3 failures.
       status: timedOut ? 'timeout' : 'failed',
+      l1Decision: input.l1Decision,
+      nextTierEligible: true,
+      stageStopReason: timedOut ? 'l3_timeout' : 'l3_failed',
       error: message.slice(0, 2_000),
       startedAt,
       completedAt: Date.now(),

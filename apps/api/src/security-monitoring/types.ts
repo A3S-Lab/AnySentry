@@ -42,6 +42,21 @@ export type IngestionSourceStatus = 'active' | 'stale' | 'unused' | 'disabled';
 export type SourceTokenRotationStatus = 'untracked' | 'fresh' | 'overdue';
 export type AgentClassification = 'confirmed_agent' | 'probable_agent' | 'unknown' | 'non_agent';
 export type AgentReviewDecision = 'confirmed_agent' | 'unknown' | 'non_agent';
+export type JudgmentProfile = 'full' | 'l1_only' | 'discard';
+export type JudgmentRouteReason = 'confirmed_agent_full' | 'candidate_agent_full' | 'candidate_agent_l1_only' | 'unknown_l1_only' | 'non_agent_discarded';
+export interface JudgmentRoutingSnapshot {
+  classification: AgentClassification;
+  profile: JudgmentProfile;
+  maxTier: 'L1' | 'L2' | 'L3';
+  reason: JudgmentRouteReason;
+  routingVersion: string;
+}
+export interface EventJudgmentMetadata extends JudgmentRoutingSnapshot {
+  policyVersion?: string;
+  l1Verdict?: Verdict;
+  nextTierEligible?: boolean;
+  stopReason?: string;
+}
 export type AgentAttributionSource = 'none' | 'process_graph' | 'cgroup' | 'systemd' | 'argv' | 'env' | 'self_register' | 'workspace_hint' | 'kubernetes' | 'docker' | 'behavior' | 'process_signature' | 'manual_review';
 export type AgentAttributionReason = 'not_evaluated' | 'not_agent' | 'process_lineage' | 'authoritative_anchor' | 'hint_only' | 'conflict' | 'human_confirmed' | 'human_deferred' | 'human_rejected';
 
@@ -183,6 +198,7 @@ export interface JudgedEvent {
   attributes: Record<string, EventAttributeValue>;
   process?: ProcessContext;
   attribution?: AgentAttribution;
+  judgment?: EventJudgmentMetadata;
   rawPreview?: string;
 }
 
@@ -645,6 +661,7 @@ export interface AgentEventListItem {
   attributes: Record<string, EventAttributeValue>;
   process?: ProcessContext;
   attribution?: AgentAttribution;
+  judgment?: EventJudgmentMetadata;
   repeatCount?: number;
   lastAt?: string;
   rawPreview?: string;

@@ -53,6 +53,7 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   attributes String,
   process String DEFAULT '{}',
   attribution String DEFAULT '{}',
+  judgment String DEFAULT '{}',
   rawPreview String,
   ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000))
 ) ENGINE = MergeTree
@@ -79,6 +80,7 @@ const EVENT_ALTERS = [
   'ADD COLUMN IF NOT EXISTS attributes String DEFAULT \'{}\'',
   'ADD COLUMN IF NOT EXISTS process String DEFAULT \'{}\'',
   'ADD COLUMN IF NOT EXISTS attribution String DEFAULT \'{}\'',
+  'ADD COLUMN IF NOT EXISTS judgment String DEFAULT \'{}\'',
   'ADD COLUMN IF NOT EXISTS rawPreview String DEFAULT \'\'',
 ];
 
@@ -92,12 +94,13 @@ const CONFIG_DDL = `CREATE TABLE IF NOT EXISTS ${CONFIG_TABLE} (
 ) ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY key`;
 
-type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'process' | 'attribution' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview'> & {
+type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'process' | 'attribution' | 'judgment' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview'> & {
   actionKind: string;
   actionTarget: string;
   attributes: string;
   process: string;
   attribution: string;
+  judgment: string;
   collectorId: string;
   sourceId: string;
   parentSpanId: string;
@@ -151,6 +154,7 @@ function toRow(e: JudgedEvent): Row {
     attributes: JSON.stringify(e.attributes ?? {}),
     process: JSON.stringify(e.process ?? {}),
     attribution: JSON.stringify(e.attribution ?? {}),
+    judgment: JSON.stringify(e.judgment ?? {}),
     rawPreview: e.rawPreview ?? '',
   };
 }
@@ -220,6 +224,7 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
     attributes,
     process: parseObject<ProcessContext>(r.process),
     attribution: parseObject<AgentAttribution>(r.attribution),
+    judgment: parseObject<NonNullable<JudgedEvent['judgment']>>(r.judgment),
     rawPreview: str(r.rawPreview) || undefined,
   };
 }

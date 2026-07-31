@@ -79,6 +79,11 @@ const SPECULATE_OPTIONS: Array<{ value: PolicyConfig["speculate"]; label: string
   { value: "high", label: "高 (high)" },
 ];
 
+const CANDIDATE_PIPELINE_OPTIONS: Array<{ value: PolicyConfig["identity"]["candidatePipeline"]; label: string }> = [
+  { value: "full", label: "完整分级研判（默认）" },
+  { value: "l1_only", label: "仅执行 L1" },
+];
+
 const TIME_OPTIONS: Array<{ value: SecurityTimeType; label: string }> = [
   { value: "last_3h", label: "近3小时" },
   { value: "last_1d", label: "近一天" },
@@ -166,6 +171,38 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
       {children}
       {hint ? <span className="text-[11px] text-zinc-600">{hint}</span> : null}
     </label>
+  );
+}
+
+function IdentityJudgmentSection({
+  value,
+  onChange,
+}: {
+  value: PolicyConfig["identity"];
+  onChange: (next: PolicyConfig["identity"]) => void;
+}) {
+  return (
+    <Panel title="身份研判路由" icon={Bot} description="身份保留、页面可见性与风险研判层级相互独立。">
+      <div className="grid gap-4 p-4 lg:grid-cols-3">
+        <div className="rounded-md border border-emerald-400/20 bg-emerald-400/5 p-3">
+          <p className="text-sm font-medium text-emerald-100">已确认 Agent</p>
+          <p className="mt-1 text-xs text-zinc-500">固定使用完整分级链路；只有上一层升级时才进入已配置的 L2/L3。</p>
+        </div>
+        <div className="rounded-md border border-amber-400/20 bg-amber-400/5 p-3">
+          <Field label="候选 Agent" hint="默认完整分级；可在成本敏感环境限制为只执行确定性 L1。">
+            <SelectField
+              value={value.candidatePipeline}
+              onChange={(candidatePipeline) => onChange({ candidatePipeline })}
+              options={CANDIDATE_PIPELINE_OPTIONS}
+            />
+          </Field>
+        </div>
+        <div className="rounded-md border border-zinc-400/20 bg-white/[0.03] p-3">
+          <p className="text-sm font-medium text-zinc-200">尚未识别</p>
+          <p className="mt-1 text-xs text-zinc-500">固定仅执行 L1；升级和高风险证据保留，但不调用 L2/L3。</p>
+        </div>
+      </div>
+    </Panel>
   );
 }
 
@@ -841,6 +878,7 @@ export default function PolicyConfigPage() {
               />
 
               <L1RulesSection rules={draft.rules} onChange={(next) => update("rules", next)} />
+              <IdentityJudgmentSection value={draft.identity} onChange={(next) => update("identity", next)} />
               <L2Section value={draft.llm} onChange={(next) => update("llm", next)} />
               <L3Section value={draft.agent} onChange={(next) => update("agent", next)} />
             </>

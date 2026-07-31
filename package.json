@@ -22,6 +22,7 @@
     "verify:a3s-code-skill-api": "node scripts/verify-a3s-code-skill-api.mjs",
     "verify:a3s-code-skill-api:self-test": "node scripts/verify-a3s-code-skill-api.mjs --self-test",
     "verify:l3-agent-pool": "node scripts/verify-l3-agent-pool.mjs",
+    "verify:identity-judgment-routing": "pnpm build:api && node scripts/verify-identity-judgment-routing.mjs",
     "verify:l3-agent-pool:local": "pnpm build:api && pnpm verify:l3-agent-pool",
     "verify:streaming-phase1": "node scripts/verify-streaming-phase1.mjs",
     "verify:streaming-phase1:local": "pnpm build:api && pnpm verify:streaming-phase1",

@@ -409,6 +409,7 @@ export class AggregationService {
       attributes: e.attributes,
       process: e.process,
       attribution: e.attribution,
+      judgment: e.judgment,
       repeatCount: repeatCount > 1 ? repeatCount : undefined,
       lastAt: repeatCount > 1 ? iso(lastAt) : undefined,
       rawPreview: e.rawPreview,

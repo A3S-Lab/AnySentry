@@ -14,6 +14,17 @@ export type SecurityRiskLevel = "safe" | "low" | "medium" | "high" | "critical" 
 export type SecurityPolicyAction = "allow" | "review" | "block" | string;
 
 export type AgentClassification = "confirmed_agent" | "probable_agent" | "unknown" | "non_agent";
+export interface EventJudgmentMetadata {
+  classification: AgentClassification;
+  profile: "full" | "l1_only" | "discard";
+  maxTier: "L1" | "L2" | "L3";
+  reason: "confirmed_agent_full" | "candidate_agent_full" | "candidate_agent_l1_only" | "unknown_l1_only" | "non_agent_discarded";
+  routingVersion: string;
+  policyVersion?: string;
+  l1Verdict?: SecurityVerdict;
+  nextTierEligible?: boolean;
+  stopReason?: string;
+}
 export type AgentReviewDecision = "confirmed_agent" | "unknown" | "non_agent";
 export type AgentAttributionSource = "none" | "process_graph" | "cgroup" | "systemd" | "argv" | "env" | "self_register" | "workspace_hint" | "kubernetes" | "docker" | "behavior" | "process_signature" | "manual_review";
 export type AgentAttributionReason = "not_evaluated" | "not_agent" | "process_lineage" | "authoritative_anchor" | "hint_only" | "conflict" | "human_confirmed" | "human_deferred" | "human_rejected";
@@ -368,6 +379,7 @@ export interface AgentEventListItem {
   attributes: Record<string, AgentEventAttributeValue>;
   process?: ProcessContext;
   attribution?: AgentAttribution;
+  judgment?: EventJudgmentMetadata;
   repeatCount?: number;
   lastAt?: string;
   rawPreview?: string;
@@ -2307,12 +2319,17 @@ export interface L3Config {
   skills: string;
 }
 
+export interface IdentityJudgmentPolicy {
+  candidatePipeline: "full" | "l1_only";
+}
+
 export interface PolicyConfig {
   failClosed: boolean;
   speculate: "off" | "low" | "medium" | "high";
   rules: L1Rule[];
   llm: L2Config | null;
   agent: L3Config | null;
+  identity: IdentityJudgmentPolicy;
 }
 
 // A null tier (llm/agent) means "not configured".
