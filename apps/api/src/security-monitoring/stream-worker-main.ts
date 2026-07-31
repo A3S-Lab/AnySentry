@@ -409,7 +409,34 @@ export function parseCompositeDecision(content: unknown, batch: RiskAnalysisBatc
   };
 }
 
+/**
+ * Synthetic Episodes are emitted only by explicit verification feeds. They must exercise the
+ * complete Kafka/Flink/queue/storage path without consuming model capacity or depending on an
+ * external LLM endpoint. Real Episodes never enter this branch.
+ */
+export function deterministicSyntheticDecision(batch: RiskAnalysisBatch): CompositeModelDecision {
+  if (!batch.synthetic) throw new Error('synthetic decision requires a synthetic episode');
+  const evidenceEventIds = [...new Set(
+    batch.evidence
+      .map((item) => item.eventId)
+      .filter((eventId): eventId is string => typeof eventId === 'string' && eventId.length > 0),
+  )];
+  if (evidenceEventIds.length < 2) {
+    throw new Error('synthetic decision has insufficient evidence');
+  }
+  return {
+    classification: 'simulation',
+    verdict: 'allow',
+    severity: 'low',
+    confidence: 1,
+    attackType: 'none',
+    reason: 'Synthetic verification episode; no runtime attack action is taken.',
+    evidenceEventIds,
+  };
+}
+
 async function callCompositeModel(batch: RiskAnalysisBatch): Promise<CompositeModelDecision> {
+  if (batch.synthetic) return deterministicSyntheticDecision(batch);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), compositeTimeoutMs);
   try {
@@ -484,6 +511,8 @@ function compositeFinding(
     evidence: batch.evidence,
     model: resolvedStatus === 'suppressed'
       ? ''
+      : batch.synthetic
+        ? 'synthetic-verifier'
       : batch.decisionPath === 'deterministic_rule'
         ? 'deterministic-rule'
         : compositeModel,

@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import {
   compositePrompt,
+  deterministicSyntheticDecision,
   deterministicSupplyChainDecision,
   parseCompositeDecision,
 } from '../apps/api/dist/security-monitoring/stream-worker-main.js';
@@ -115,6 +116,16 @@ assert.equal(syntheticDecision.classification, 'simulation');
 assert.equal(syntheticDecision.verdict, 'allow');
 assert.equal(syntheticDecision.severity, 'low');
 assert.equal(syntheticDecision.attackType, 'none');
+
+const offlineSyntheticDecision = deterministicSyntheticDecision({ ...batch, synthetic: true });
+assert.equal(offlineSyntheticDecision.classification, 'simulation');
+assert.equal(offlineSyntheticDecision.verdict, 'allow');
+assert.equal(offlineSyntheticDecision.confidence, 1);
+assert.deepEqual(offlineSyntheticDecision.evidenceEventIds, ['evt_read', 'evt_egress']);
+assert.throws(
+  () => deterministicSyntheticDecision(batch),
+  /requires a synthetic episode/,
+);
 
 assert.throws(
   () => parseCompositeDecision('{"verdict":"allow"} trailing text', batch),
