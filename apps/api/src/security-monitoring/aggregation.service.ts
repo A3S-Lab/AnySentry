@@ -1,5 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import { Sentry } from '@a3s-lab/sentry';
+import {
+  agentAssetIdForIdentityKey,
+  detectedAgentIdentity,
+  isAgentAssetClassification,
+} from './agent-identity';
 import { AgentMetadataService } from './agent-metadata.service';
 import { IngestionSourceService } from './ingestion-source.service';
 import { MaintenanceWindowService } from './maintenance-window.service';
@@ -358,6 +363,8 @@ export class AggregationService {
   }
 
   private eventItem(e: T.JudgedEvent, repeatCount = 1, lastAt = e.at): T.AgentEventListItem {
+    const detected = detectedAgentIdentity(e);
+    const resolved = this.agentMetadata.resolveEvent(e);
     return {
       schemaVersion: e.schemaVersion,
       eventId: e.eventId,
@@ -369,6 +376,13 @@ export class AggregationService {
       subject: e.subject,
       workspacePath: e.workspacePath,
       agentId: e.agentId,
+      agentAssetId: resolved.agentAssetId,
+      displayName: resolved.displayName,
+      detectedName: resolved.detectedName,
+      detectedClassification: resolved.detectedClassification,
+      effectiveClassification: resolved.effectiveClassification,
+      runtime: detected.runtime,
+      locationLabel: detected.locationLabel,
       collectorId: eventCollectorId(e) || undefined,
       sourceId: eventSourceId(e) || undefined,
       sessionId: e.sessionId,
@@ -406,28 +420,33 @@ export class AggregationService {
     const sourceId = filter.sourceId?.trim();
     const collectorId = filter.collectorId?.trim();
     const agentId = filter.agentId?.trim();
+    const agentAssetId = filter.agentAssetId?.trim();
     const sessionId = filter.sessionId?.trim();
     const workspacePath = filter.workspacePath?.trim();
     const traceId = filter.traceId?.trim();
     const runId = filter.runId?.trim();
     const q = filter.q?.trim().toLowerCase();
-    const hasFilter = Boolean(sourceId || collectorId || agentId || sessionId || workspacePath || traceId || runId || filter.eventKind || filter.eventCategory || filter.verdict || filter.tier || q);
+    const hasFilter = Boolean(sourceId || collectorId || agentId || agentAssetId || sessionId || workspacePath || traceId || runId || filter.eventKind || filter.eventCategory || filter.verdict || filter.tier || q);
     const agentScoped = filter.scope === 'agent' && !pinnedEventId;
     // Process lifecycle rows remain stored for audit/debugging, but are hidden from both the
     // Agent and raw "all events" views by default. An explicit kind filter, noise=include, or a
     // pinned event still makes them accessible.
     const hideNoise = !pinnedEventId && !filter.eventKind && filter.noise !== 'include';
     return events.filter((e) => {
+      const resolved = this.agentMetadata.resolveEvent(e);
       const matchesEventId = Boolean(pinnedEventId && e.eventId === pinnedEventId);
       const eventSource = eventSourceId(e);
       const eventCollector = eventCollectorId(e);
       const isHiddenNoise = agentScoped ? isLowValueAgentNoise(e) : e.eventKind === 'ProcessExit';
-      const matchesScope = (!agentScoped || isMonitoredAgentEvent(e)) && (!hideNoise || !isHiddenNoise);
+      const matchesScope =
+        (!agentScoped || isAgentAssetClassification(resolved.effectiveClassification)) &&
+        (!hideNoise || !isHiddenNoise);
       const matchesFilter =
         matchesScope &&
         (!sourceId || eventSource === sourceId) &&
         (!collectorId || eventCollector === collectorId) &&
         (!agentId || e.agentId === agentId) &&
+        (!agentAssetId || resolved.agentAssetId === agentAssetId) &&
         (!sessionId || e.sessionId === sessionId) &&
         (!workspacePath || e.workspacePath === workspacePath) &&
         (!traceId || e.traceId === traceId) &&
@@ -441,6 +460,8 @@ export class AggregationService {
           [
             e.subject,
             e.agentId,
+            resolved.displayName,
+            resolved.detectedName,
             e.sessionId,
             e.rawPreview,
             JSON.stringify(e.attributes ?? {}),
@@ -558,16 +579,18 @@ export class AggregationService {
     const environment = filter.environment?.trim().toLowerCase();
     const tag = filter.tag?.trim().toLowerCase();
     const agentId = filter.agentId?.trim();
+    const agentAssetId = filter.agentAssetId?.trim();
     const workspacePath = filter.workspacePath?.trim();
     const hasFilter = Boolean((filter.healthState && filter.healthState !== 'all') || (filter.criticality && filter.criticality !== 'all') || owner || environment || tag || q || filter.userId);
-    const shouldScopeExactAgent = Boolean(agentId && !hasFilter);
+    const shouldScopeExactAgent = Boolean((agentAssetId || agentId) && !hasFilter);
     const byAgent = new Map<string, T.JudgedEvent[]>();
     for (const e of events) {
-      if (shouldScopeExactAgent && e.agentId !== agentId) continue;
+      const resolved = this.agentMetadata.resolveEvent(e);
+      if (agentAssetId && resolved.agentAssetId !== agentAssetId) continue;
+      if (shouldScopeExactAgent && !agentAssetId && e.agentId !== agentId && e.attribution?.agentScopeId !== agentId) continue;
       if (workspacePath && e.workspacePath !== workspacePath) continue;
       if (!agentId && filter.userId && e.userId !== filter.userId) continue;
-      const key = `${e.workspacePath}\0${e.agentId}`;
-      (byAgent.get(key) ?? byAgent.set(key, []).get(key)!).push(e);
+      (byAgent.get(resolved.agentAssetId) ?? byAgent.set(resolved.agentAssetId, []).get(resolved.agentAssetId)!).push(e);
     }
 
     const openIncidents = new Map<string, number>();
@@ -578,24 +601,32 @@ export class AggregationService {
     }
 
     const t = now();
-    const eventBackedItems = [...byAgent.entries()].map(([key, evs]): T.AgentInventoryItem => {
+    const eventBackedItems = [...byAgent.entries()].map(([assetId, evs]): T.AgentInventoryItem => {
       const sorted = [...evs].sort((a, b) => a.at - b.at);
       const first = sorted[0];
       const last = sorted[sorted.length - 1];
       const risky = sorted.filter((e) => e.verdict !== 'allow');
       const lvl = worstLevel(sorted);
-      const [workspacePath, agentId] = key.split('\0');
-      const metadata = this.agentMetadata.get(workspacePath, agentId);
       const identityEvent =
         [...sorted].reverse().find((event) => Boolean(event.attribution?.classification)) ??
         last;
+      const resolved = this.agentMetadata.resolveEvent(identityEvent);
+      const detected = detectedAgentIdentity(identityEvent);
+      const metadata = resolved.metadata;
       const attribution = identityEvent.attribution;
-      const classification =
-        metadata?.reviewDecision ??
-        attribution?.classification ??
-        'unknown';
+      const classification = resolved.effectiveClassification;
       const reviewed = Boolean(metadata?.reviewDecision);
-      const openIncidentCount = openIncidents.get(key) ?? 0;
+      const itemAgentId =
+        metadata?.agentId ??
+        attribution?.agentScopeId ??
+        attribution?.agentDisplayName ??
+        last.agentId;
+      const itemWorkspacePath = metadata?.workspacePath ?? last.workspacePath;
+      const incidentKeys = new Set(sorted.map((event) => `${event.workspacePath}\0${event.agentId}`));
+      const openIncidentCount = [...incidentKeys].reduce(
+        (total, incidentKey) => total + (openIncidents.get(incidentKey) ?? 0),
+        0,
+      );
       const sinceLast = t - last.at;
       const healthState: T.AgentHealthState = openIncidentCount > 0
         ? 'risky'
@@ -616,11 +647,27 @@ export class AggregationService {
         }
       }
       const top = [...topRisk.entries()].sort((a, b) => b[1].count - a[1].count)[0];
+      const instanceCount = distinct(sorted.map((event) =>
+        event.attribution?.agentInstanceId ??
+        event.attribution?.physicalWorkloadId ??
+        (
+          event.attribution?.rootPid
+            ? [
+                event.process?.hostId ?? 'host',
+                event.process?.bootId ?? 'boot',
+                event.attribution.rootPid,
+              ].join(':')
+            : `${event.sessionId}:${event.process?.pid ?? event.agentId}`
+        )
+      ));
       return {
-        agentId,
-        workspacePath,
+        agentId: itemAgentId,
+        agentAssetId: assetId,
+        workspacePath: itemWorkspacePath,
         userId: last.userId,
-        displayName: metadata?.displayName,
+        displayName: resolved.displayName,
+        detectedName: resolved.detectedName,
+        detectedClassification: resolved.detectedClassification,
         owner: metadata?.owner,
         team: metadata?.team,
         environment: metadata?.environment,
@@ -629,6 +676,9 @@ export class AggregationService {
         note: metadata?.note,
         metadataUpdatedAt: metadata?.updatedAt ? iso(metadata.updatedAt) : undefined,
         classification,
+        runtime: detected.runtime,
+        locationLabel: detected.locationLabel,
+        instanceCount,
         confidence: reviewed ? 1 : attribution?.confidence ?? 0,
         attributionSource: reviewed ? 'manual_review' : attribution?.source ?? 'none',
         attributionEvidence: reviewed
@@ -646,6 +696,7 @@ export class AggregationService {
         reviewedAt: metadata?.reviewedAt ? iso(metadata.reviewedAt) : undefined,
         reviewNote: metadata?.reviewNote,
         reviewIdentityKeys:
+          metadata?.identityKeys ??
           metadata?.reviewIdentityKeys ??
           this.agentMetadata.identityKeysForEvent(identityEvent),
         firstSeen: iso(first.at),
@@ -671,8 +722,13 @@ export class AggregationService {
 
     const metadataOnlyItems = this.agentMetadata.list()
       .filter((metadata) =>
-        !byAgent.has(`${metadata.workspacePath}\0${metadata.agentId}`) &&
-        (!shouldScopeExactAgent || metadata.agentId === agentId) &&
+        isAgentAssetClassification(metadata.reviewDecision ?? 'unknown') &&
+        !byAgent.has(metadata.agentAssetId ?? '') &&
+        (
+          !shouldScopeExactAgent ||
+          (agentAssetId ? metadata.agentAssetId === agentAssetId : metadata.agentId === agentId)
+        ) &&
+        (!agentAssetId || metadata.agentAssetId === agentAssetId) &&
         (!workspacePath || metadata.workspacePath === workspacePath) &&
         !filter.userId
       )
@@ -681,9 +737,14 @@ export class AggregationService {
         const sourceCounts = Object.fromEntries(EVENT_SOURCES.map((source) => [source, 0])) as Record<T.EventSource, number>;
         return {
           agentId: metadata.agentId,
+          agentAssetId:
+            metadata.agentAssetId ??
+            agentAssetIdForIdentityKey(`${metadata.workspacePath}\0${metadata.agentId}`),
           workspacePath: metadata.workspacePath,
           userId: '-',
           displayName: metadata.displayName,
+          detectedName: metadata.agentId,
+          detectedClassification: 'unknown',
           owner: metadata.owner,
           team: metadata.team,
           environment: metadata.environment,
@@ -692,6 +753,9 @@ export class AggregationService {
           note: metadata.note,
           metadataUpdatedAt: metadata.updatedAt,
           classification: metadata.reviewDecision ?? 'unknown',
+          runtime: metadata.workloadRef?.environment ?? metadata.reviewWorkloadRef?.environment ?? 'unknown',
+          locationLabel: metadata.workspacePath,
+          instanceCount: metadata.agentInstanceId || metadata.reviewAgentInstanceId ? 1 : 0,
           confidence: metadata.reviewDecision ? 1 : 0,
           attributionSource: metadata.reviewDecision ? 'manual_review' : 'none',
           attributionEvidence: metadata.reviewDecision
@@ -700,14 +764,14 @@ export class AggregationService {
                 ...(metadata.reviewedBy ? [`manual_review:reviewer=${metadata.reviewedBy}`] : []),
               ]
             : [],
-          physicalWorkloadId: metadata.reviewPhysicalWorkloadId,
-          agentInstanceId: metadata.reviewAgentInstanceId,
-          workloadRef: metadata.reviewWorkloadRef,
+          physicalWorkloadId: metadata.physicalWorkloadId ?? metadata.reviewPhysicalWorkloadId,
+          agentInstanceId: metadata.agentInstanceId ?? metadata.reviewAgentInstanceId,
+          workloadRef: metadata.workloadRef ?? metadata.reviewWorkloadRef,
           reviewDecision: metadata.reviewDecision,
           reviewedBy: metadata.reviewedBy,
           reviewedAt: metadata.reviewedAt,
           reviewNote: metadata.reviewNote,
-          reviewIdentityKeys: metadata.reviewIdentityKeys ?? [metadata.agentId.toLowerCase()],
+          reviewIdentityKeys: metadata.identityKeys ?? metadata.reviewIdentityKeys ?? [metadata.agentId.toLowerCase()],
           firstSeen: metadata.updatedAt,
           lastSeen: metadata.updatedAt,
           healthState: 'stale',
@@ -731,7 +795,11 @@ export class AggregationService {
 
     const filtered = items
       .filter((item) => {
-        const matchesAgentId = Boolean(agentId && item.agentId === agentId && (!workspacePath || item.workspacePath === workspacePath));
+        if (!isAgentAssetClassification(item.classification)) return false;
+        const matchesAgentId = Boolean(
+          (agentAssetId && item.agentAssetId === agentAssetId) ||
+          (agentId && item.agentId === agentId && (!workspacePath || item.workspacePath === workspacePath)),
+        );
         const matchesFilter =
           (!filter.healthState || filter.healthState === 'all' || item.healthState === filter.healthState) &&
           (!filter.criticality || filter.criticality === 'all' || item.criticality === filter.criticality) &&
@@ -740,7 +808,10 @@ export class AggregationService {
           (!tag || item.tags.some((value) => value.toLowerCase().includes(tag))) &&
           (!q || [
             item.agentId,
+            item.agentAssetId,
             item.displayName,
+            item.detectedName,
+            item.locationLabel,
             item.workspacePath,
             item.userId,
             item.owner,
@@ -752,16 +823,40 @@ export class AggregationService {
             item.lastEventSubject,
             ...item.tags,
           ].some((v) => (v ?? '').toLowerCase().includes(q)));
-        if (agentId && !hasFilter) return matchesAgentId;
+        if ((agentAssetId || agentId) && !hasFilter) return matchesAgentId;
         return matchesAgentId || matchesFilter;
       })
       .sort((a, b) => {
-        const rank: Record<T.AgentHealthState, number> = { risky: 0, active: 1, idle: 2, stale: 3 };
-        return Number(Boolean(agentId) && b.agentId === agentId && (!workspacePath || b.workspacePath === workspacePath)) - Number(Boolean(agentId) && a.agentId === agentId && (!workspacePath || a.workspacePath === workspacePath))
-          || rank[a.healthState] - rank[b.healthState]
+        const classificationRank: Record<T.AgentClassification, number> = {
+          confirmed_agent: 0,
+          probable_agent: 1,
+          unknown: 2,
+          non_agent: 3,
+        };
+        const riskRank: Record<string, number> = {
+          critical: 4,
+          high: 3,
+          medium: 2,
+          low: 1,
+          safe: 0,
+          unknown: 0,
+        };
+        const aSelected = Boolean(
+          (agentAssetId && a.agentAssetId === agentAssetId) ||
+          (agentId && a.agentId === agentId && (!workspacePath || a.workspacePath === workspacePath)),
+        );
+        const bSelected = Boolean(
+          (agentAssetId && b.agentAssetId === agentAssetId) ||
+          (agentId && b.agentId === agentId && (!workspacePath || b.workspacePath === workspacePath)),
+        );
+        return Number(bSelected) - Number(aSelected)
+          || classificationRank[a.classification] - classificationRank[b.classification]
+          || (riskRank[b.riskLevel] ?? 0) - (riskRank[a.riskLevel] ?? 0)
           || b.openIncidentCount - a.openIncidentCount
           || b.riskyEventCount - a.riskyEventCount
-          || Date.parse(b.lastSeen) - Date.parse(a.lastSeen);
+          || Date.parse(b.lastSeen) - Date.parse(a.lastSeen)
+          || (a.displayName ?? a.detectedName ?? a.agentId).localeCompare(b.displayName ?? b.detectedName ?? b.agentId)
+          || a.agentAssetId.localeCompare(b.agentAssetId);
       });
 
     const summary: T.AgentInventorySummary = {

@@ -1,6 +1,8 @@
-import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { BadRequestException, Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ClickHouseStore } from './clickhouse-store';
+import { detectedAgentIdentity } from './agent-identity';
 import {
+  AgentClassification,
   AgentCriticality,
   AgentMetadataListItem,
   AgentMetadataRecord,
@@ -42,7 +44,7 @@ function cleanCriticality(value: unknown): AgentCriticality | undefined {
 }
 
 function cleanReviewDecision(value: unknown): AgentReviewDecision | undefined {
-  return value === 'confirmed_agent' || value === 'non_agent' ? value : undefined;
+  return value === 'confirmed_agent' || value === 'unknown' || value === 'non_agent' ? value : undefined;
 }
 
 function normalizeIdentityKey(value: unknown): string | undefined {
@@ -88,11 +90,37 @@ function cleanWorkloadRef(value: unknown): AgentWorkloadRef | undefined {
   return Object.values(next).some(Boolean) ? next : undefined;
 }
 
+const REVIEW_TRANSITIONS: Record<AgentClassification, ReadonlySet<AgentReviewDecision>> = {
+  confirmed_agent: new Set(['unknown']),
+  probable_agent: new Set(['confirmed_agent', 'unknown']),
+  unknown: new Set(['confirmed_agent', 'non_agent']),
+  non_agent: new Set(['unknown']),
+};
+
+export function isReviewTransitionAllowed(
+  from: AgentClassification,
+  to: AgentReviewDecision | 'clear',
+): boolean {
+  return to === 'clear' || from === to || REVIEW_TRANSITIONS[from].has(to);
+}
+
+export interface ResolvedAgentMetadata {
+  agentAssetId: string;
+  displayName?: string;
+  detectedName?: string;
+  detectedClassification: AgentClassification;
+  effectiveClassification: AgentClassification;
+  metadata?: AgentMetadataRecord;
+  reviewConflict: boolean;
+}
+
 @Injectable()
 export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
   private readonly ch = new ClickHouseStore();
   private readonly records = new Map<string, AgentMetadataRecord>();
   private readonly reviewIndex = new Map<string, string | null>();
+  private readonly identityIndex = new Map<string, string | null>();
+  private readonly assetIndex = new Map<string, string | null>();
   private persistTimer?: NodeJS.Timeout;
   private initialized = false;
   private reviewVersion = 0;
@@ -123,6 +151,7 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
     const cur = this.records.get(key(workspacePath, agentId));
     const next: AgentMetadataRecord = {
       agentId: clean(agentId, 240) ?? agentId,
+      agentAssetId: clean(input.agentAssetId, 160) ?? cur?.agentAssetId,
       workspacePath,
       displayName: 'displayName' in input ? cleanText(input.displayName, 160) : cur?.displayName,
       owner: 'owner' in input ? cleanText(input.owner, 160) : cur?.owner,
@@ -131,6 +160,14 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
       criticality: 'criticality' in input ? cleanCriticality(input.criticality) : cur?.criticality,
       tags: 'tags' in input ? cleanTags(input.tags) : cur?.tags ?? [],
       note: 'note' in input ? cleanText(input.note, 2_000) : cur?.note,
+      identityKeys: 'identityKeys' in input ? cleanIdentityKeys(input.identityKeys) : cur?.identityKeys,
+      physicalWorkloadId: 'physicalWorkloadId' in input
+        ? clean(input.physicalWorkloadId, 500)
+        : cur?.physicalWorkloadId,
+      agentInstanceId: 'agentInstanceId' in input
+        ? clean(input.agentInstanceId, 500)
+        : cur?.agentInstanceId,
+      workloadRef: 'workloadRef' in input ? cleanWorkloadRef(input.workloadRef) : cur?.workloadRef,
       reviewDecision: cur?.reviewDecision,
       reviewedBy: cur?.reviewedBy,
       reviewedAt: cur?.reviewedAt,
@@ -153,6 +190,21 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
     const recordKey = key(workspacePath, agentId);
     const cur = this.records.get(recordKey);
     const decision = cleanReviewDecision(input.decision);
+    const currentClassification =
+      cur?.reviewDecision ??
+      (
+        input.currentClassification === 'confirmed_agent' ||
+        input.currentClassification === 'probable_agent' ||
+        input.currentClassification === 'unknown' ||
+        input.currentClassification === 'non_agent'
+          ? input.currentClassification
+          : 'unknown'
+      );
+    if (!isReviewTransitionAllowed(currentClassification, input.decision)) {
+      throw new BadRequestException(
+        `cannot change Agent classification from ${currentClassification} to ${input.decision}`,
+      );
+    }
     const identityKeys = cleanIdentityKeys([
       ...(input.identityKeys ?? []),
       input.physicalWorkloadId,
@@ -163,6 +215,7 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
     ]);
     const next: AgentMetadataRecord = {
       agentId: clean(agentId, 240) ?? agentId,
+      agentAssetId: clean(input.agentAssetId, 160) ?? cur?.agentAssetId,
       workspacePath,
       displayName: cur?.displayName,
       owner: cur?.owner,
@@ -171,6 +224,16 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
       criticality: cur?.criticality,
       tags: cur?.tags ?? [],
       note: cur?.note,
+      identityKeys: decision ? identityKeys : cur?.identityKeys,
+      physicalWorkloadId: decision
+        ? clean(input.physicalWorkloadId, 500) ?? cur?.physicalWorkloadId
+        : cur?.physicalWorkloadId,
+      agentInstanceId: decision
+        ? clean(input.agentInstanceId, 500) ?? cur?.agentInstanceId
+        : cur?.agentInstanceId,
+      workloadRef: decision
+        ? cleanWorkloadRef(input.workloadRef) ?? cur?.workloadRef
+        : cur?.workloadRef,
       reviewDecision: decision,
       reviewedBy: decision ? clean(reviewer, 240) : undefined,
       reviewedAt: decision ? Date.now() : undefined,
@@ -217,22 +280,76 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
       : cleanIdentityKeys([event.agentId, event.sessionId]);
   }
 
+  resolveEvent(event: JudgedEvent): ResolvedAgentMetadata {
+    const detected = detectedAgentIdentity(event);
+    const exactKey = key(event.workspacePath, event.agentId);
+    const exact = this.records.get(exactKey);
+    const assetRecordKey = this.assetIndex.get(detected.agentAssetId);
+    const identityKeys = this.identityKeysForEvent(event);
+    let identityRecordKey: string | null | undefined;
+    let reviewRecordKey: string | null | undefined;
+    for (const identityKey of identityKeys) {
+      const indexed = this.identityIndex.get(identityKey);
+      if (indexed === null) {
+        identityRecordKey = null;
+        break;
+      }
+      if (indexed) identityRecordKey = indexed;
+    }
+    for (const identityKey of identityKeys) {
+      const indexed = this.reviewIndex.get(identityKey);
+      if (indexed === null) {
+        reviewRecordKey = null;
+        break;
+      }
+      if (indexed) reviewRecordKey = indexed;
+    }
+    const metadataRecordKey =
+      assetRecordKey === null || identityRecordKey === null
+        ? undefined
+        : assetRecordKey ?? identityRecordKey;
+    const metadata =
+      (metadataRecordKey ? this.records.get(metadataRecordKey) : undefined) ??
+      exact;
+    const reviewConflict = reviewRecordKey === null;
+    const review =
+      reviewConflict
+        ? undefined
+        : reviewRecordKey
+          ? this.records.get(reviewRecordKey)
+          : exact?.reviewDecision
+            ? exact
+            : undefined;
+    return {
+      agentAssetId: metadata?.agentAssetId ?? detected.agentAssetId,
+      displayName: metadata?.displayName,
+      detectedName: detected.detectedName,
+      detectedClassification: detected.detectedClassification,
+      effectiveClassification:
+        review?.reviewDecision ?? detected.detectedClassification,
+      metadata,
+      reviewConflict,
+    };
+  }
+
   applyReview(meta: EventMeta): EventMeta {
     const identityKeys = this.identityKeysForEvent(meta as JudgedEvent);
-    if (identityKeys.some((identityKey) => this.reviewIndex.has(identityKey) && this.reviewIndex.get(identityKey) === null)) {
-      // A stable identity claimed by multiple review records is ambiguous. Do not fall through
-      // to a weaker short ID and accidentally apply one review to the other workload.
+    if (identityKeys.some((identityKey) => this.reviewIndex.get(identityKey) === null)) {
+      // One conflicting stable key invalidates weaker aliases of the same event. Selecting the
+      // first short ID here could silently apply the wrong human decision.
       return meta;
     }
     let record: AgentMetadataRecord | undefined;
     for (const identityKey of identityKeys) {
       const recordKey = this.reviewIndex.get(identityKey);
+      if (recordKey === null) return meta;
       if (!recordKey) continue;
       record = this.records.get(recordKey);
       if (record?.reviewDecision) break;
     }
     if (!record?.reviewDecision) return meta;
     const confirmed = record.reviewDecision === 'confirmed_agent';
+    const rejected = record.reviewDecision === 'non_agent';
     const previous = meta.attribution;
     const evidence = [
       ...(previous?.evidence ?? []),
@@ -258,7 +375,7 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
         workloadRef: record.reviewWorkloadRef ?? previous?.workloadRef,
         rootPid: previous?.rootPid,
         confidence: 1,
-        reason: confirmed ? 'human_confirmed' : 'human_rejected',
+        reason: confirmed ? 'human_confirmed' : rejected ? 'human_rejected' : 'human_deferred',
         source: 'manual_review',
         evidence,
       },
@@ -286,7 +403,9 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
           classification: record.reviewDecision!,
           physicalWorkloadId:
             record.reviewPhysicalWorkloadId ??
+            record.physicalWorkloadId ??
             record.reviewAgentInstanceId ??
+            record.agentInstanceId ??
             `manual:${record.workspacePath}:${record.agentId}`,
           source,
           attributionSource: 'manual_review',
@@ -297,7 +416,7 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
             workload?.containerName ??
             workload?.processName ??
             record.agentId,
-          agentInstanceId: record.reviewAgentInstanceId,
+          agentInstanceId: record.reviewAgentInstanceId ?? record.agentInstanceId,
           namespace: workload?.namespace,
           podName: workload?.podName,
           podUid: workload?.podUid,
@@ -328,6 +447,7 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
   private normalize(record: AgentMetadataRecord): AgentMetadataRecord {
     return {
       agentId: clean(record.agentId, 240) ?? 'unknown',
+      agentAssetId: clean(record.agentAssetId, 160),
       workspacePath: clean(record.workspacePath, 500) ?? 'unknown',
       displayName: cleanText(record.displayName, 160),
       owner: cleanText(record.owner, 160),
@@ -336,6 +456,10 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
       criticality: cleanCriticality(record.criticality),
       tags: cleanTags(record.tags),
       note: cleanText(record.note, 2_000),
+      identityKeys: cleanIdentityKeys(record.identityKeys ?? record.reviewIdentityKeys),
+      physicalWorkloadId: clean(record.physicalWorkloadId ?? record.reviewPhysicalWorkloadId, 500),
+      agentInstanceId: clean(record.agentInstanceId ?? record.reviewAgentInstanceId, 500),
+      workloadRef: cleanWorkloadRef(record.workloadRef ?? record.reviewWorkloadRef),
       reviewDecision: cleanReviewDecision(record.reviewDecision),
       reviewedBy: clean(record.reviewedBy, 240),
       reviewedAt: Number(record.reviewedAt) || undefined,
@@ -353,6 +477,8 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
     return {
       ...rest,
       tags: [...record.tags],
+      identityKeys: record.identityKeys ? [...record.identityKeys] : undefined,
+      workloadRef: record.workloadRef ? { ...record.workloadRef } : undefined,
       reviewIdentityKeys: record.reviewIdentityKeys ? [...record.reviewIdentityKeys] : undefined,
       reviewWorkloadRef: record.reviewWorkloadRef ? { ...record.reviewWorkloadRef } : undefined,
       reviewedAt: reviewedAt ? iso(reviewedAt) : undefined,
@@ -369,19 +495,31 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
 
   private rebuildReviewIndex(): void {
     this.reviewIndex.clear();
+    this.identityIndex.clear();
+    this.assetIndex.clear();
     for (const [recordKey, record] of this.records) {
+      const assetId = clean(record.agentAssetId, 160);
+      if (assetId) this.addIndexEntry(this.assetIndex, assetId, recordKey);
+      for (const identityKey of record.identityKeys ?? record.reviewIdentityKeys ?? []) {
+        const normalized = normalizeIdentityKey(identityKey);
+        if (normalized) this.addIndexEntry(this.identityIndex, normalized, recordKey);
+      }
       if (!record.reviewDecision) continue;
       for (const identityKey of record.reviewIdentityKeys ?? []) {
         const normalized = normalizeIdentityKey(identityKey);
         if (!normalized) continue;
-        const existingKey = this.reviewIndex.get(normalized);
-        if (existingKey === undefined) {
-          this.reviewIndex.set(normalized, recordKey);
-          continue;
-        }
-        if (existingKey !== recordKey) this.reviewIndex.set(normalized, null);
+        this.addIndexEntry(this.reviewIndex, normalized, recordKey);
       }
     }
+  }
+
+  private addIndexEntry(index: Map<string, string | null>, identity: string, recordKey: string): void {
+    const existingKey = index.get(identity);
+    if (existingKey === undefined) {
+      index.set(identity, recordKey);
+      return;
+    }
+    if (existingKey !== recordKey) index.set(identity, null);
   }
 
   private persistSoon(): void {

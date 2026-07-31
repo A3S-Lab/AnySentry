@@ -3099,8 +3099,8 @@ export class SecurityMonitoringController {
   @Put('agents/:agentId/review')
   @RequireManagementAuth()
   reviewAgent(@Param('agentId') agentId: string, @Body() body: T.AgentReviewRequest, @Headers() headers: HeaderBag) {
-    if (!['confirmed_agent', 'non_agent', 'clear'].includes(body.decision)) {
-      throw new BadRequestException('decision must be confirmed_agent, non_agent, or clear');
+    if (!['confirmed_agent', 'unknown', 'non_agent', 'clear'].includes(body.decision)) {
+      throw new BadRequestException('decision must be confirmed_agent, unknown, non_agent, or clear');
     }
     const actor = auditActor(headers);
     const updated = this.agentMetadata.review(
@@ -3117,8 +3117,10 @@ export class SecurityMonitoringController {
       summary:
         body.decision === 'confirmed_agent'
           ? `Agent confirmed by reviewer: ${updated.displayName || updated.agentId}`
+          : body.decision === 'unknown'
+            ? `Agent returned to observation by reviewer: ${updated.displayName || updated.agentId}`
           : body.decision === 'non_agent'
-            ? `Candidate rejected by reviewer: ${updated.displayName || updated.agentId}`
+            ? `Unknown identity excluded by reviewer: ${updated.displayName || updated.agentId}`
             : `Agent review cleared: ${updated.displayName || updated.agentId}`,
       details: {
         agentId: updated.agentId,

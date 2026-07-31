@@ -51,6 +51,8 @@ assert(identityKeys.includes(containerId.slice(0, 12)), 'short CRI container ID 
 const confirmed = service.review('reviewed-clickhouse', {
   workspacePath: event.workspacePath,
   decision: 'confirmed_agent',
+  currentClassification: 'probable_agent',
+  agentAssetId: 'agent_reviewed_clickhouse',
   identityKeys,
   physicalWorkloadId: event.attribution.physicalWorkloadId,
   agentInstanceId: event.attribution.agentInstanceId,
@@ -72,9 +74,41 @@ assert.equal(snapshot[0].classification, 'confirmed_agent');
 assert.equal(snapshot[0].attributionSource, 'manual_review');
 assert(snapshot[0].ids.includes(containerId));
 
+assert.throws(
+  () => service.review('reviewed-clickhouse', {
+    workspacePath: event.workspacePath,
+    decision: 'non_agent',
+    currentClassification: 'confirmed_agent',
+    identityKeys,
+  }, 'security-reviewer'),
+  /cannot change Agent classification from confirmed_agent to non_agent/,
+  'a confirmed Agent must return to observation before it can be excluded',
+);
+
+const deferred = service.review('reviewed-clickhouse', {
+  workspacePath: event.workspacePath,
+  decision: 'unknown',
+  currentClassification: 'confirmed_agent',
+  agentAssetId: 'agent_reviewed_clickhouse',
+  identityKeys,
+  physicalWorkloadId: event.attribution.physicalWorkloadId,
+  agentInstanceId: event.attribution.agentInstanceId,
+  workloadRef: event.attribution.workloadRef,
+}, 'security-reviewer');
+assert.equal(deferred.reviewDecision, 'unknown');
+const deferredEvent = service.applyReview(event);
+assert.equal(deferredEvent.attribution?.classification, 'unknown');
+assert.equal(deferredEvent.attribution?.source, 'manual_review');
+assert.equal(deferredEvent.attribution?.reason, 'human_deferred');
+assert.equal(deferredEvent.attribution?.monitored, false);
+snapshot = service.identitySnapshotEntries('node-a');
+assert.equal(snapshot[0].classification, 'unknown');
+
 const rejected = service.review('reviewed-clickhouse', {
   workspacePath: event.workspacePath,
   decision: 'non_agent',
+  currentClassification: 'unknown',
+  agentAssetId: 'agent_reviewed_clickhouse',
   identityKeys,
   physicalWorkloadId: event.attribution.physicalWorkloadId,
   agentInstanceId: event.attribution.agentInstanceId,
@@ -91,9 +125,34 @@ assert.equal(rejectedEvent.attribution?.monitored, false);
 snapshot = service.identitySnapshotEntries('node-a');
 assert.equal(snapshot[0].classification, 'non_agent');
 
+const observedAgain = service.review('reviewed-clickhouse', {
+  workspacePath: event.workspacePath,
+  decision: 'unknown',
+  currentClassification: 'non_agent',
+  agentAssetId: 'agent_reviewed_clickhouse',
+  identityKeys,
+  physicalWorkloadId: event.attribution.physicalWorkloadId,
+  agentInstanceId: event.attribution.agentInstanceId,
+  workloadRef: event.attribution.workloadRef,
+}, 'security-reviewer');
+assert.equal(observedAgain.reviewDecision, 'unknown');
+assert.equal(service.applyReview(event).attribution?.classification, 'unknown');
+
+service.review('reviewed-clickhouse', {
+  workspacePath: event.workspacePath,
+  decision: 'non_agent',
+  currentClassification: 'unknown',
+  agentAssetId: 'agent_reviewed_clickhouse',
+  identityKeys,
+  physicalWorkloadId: event.attribution.physicalWorkloadId,
+  agentInstanceId: event.attribution.agentInstanceId,
+  workloadRef: event.attribution.workloadRef,
+}, 'security-reviewer');
+
 service.review('conflicting-review', {
   workspacePath: 'other/workspace',
   decision: 'confirmed_agent',
+  currentClassification: 'unknown',
   identityKeys: [containerId],
 }, 'second-reviewer');
 assert.equal(
