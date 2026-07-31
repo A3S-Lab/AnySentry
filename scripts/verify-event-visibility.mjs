@@ -27,5 +27,10 @@ const earlyRejectAt = aggregationSource.indexOf('if (!matchesEventId && !matches
 const identityResolveAt = aggregationSource.indexOf('const resolved = this.agentMetadata.resolveEvent(e);', directFilterAt);
 assert.ok(directFilterAt >= 0 && directFilterAt < earlyRejectAt && earlyRejectAt < identityResolveAt,
   'exact event filters must reject before identity/display metadata resolution');
+assert.match(aggregationSource, /const pinnedEvent = pinnedEventId \? this\.judge\.findEvent\(pinnedEventId\) : undefined;/u);
+assert.match(aggregationSource, /if \(!pinnedEdgeId && !isPinnedEvent && !matchesDirectScope\) continue;/u);
+
+const judgeSource = await readFile(new URL('../apps/api/src/security-monitoring/sentry-judge.service.ts', import.meta.url), 'utf8');
+assert.match(judgeSource, /findEvent\(eventId: string\): JudgedEvent \| undefined \{\s*return this\.storeById\.get\(eventId\);/u);
 
 console.log('PASS event visibility matrix and durable-search lifecycle contracts');

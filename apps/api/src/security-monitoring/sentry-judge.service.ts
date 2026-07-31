@@ -961,6 +961,11 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return this.store.filter((e) => e.at >= sinceMs);
   }
 
+  /** O(1) hot-ring lookup for pinned event drill-downs and evidence assembly. */
+  findEvent(eventId: string): JudgedEvent | undefined {
+    return this.storeById.get(eventId);
+  }
+
   /** Store histograms + a recent sample — which observer signal kinds / verdicts / tiers / identities
    *  are flowing (ops + verification). */
   stats(): {

@@ -652,11 +652,11 @@ export class AggregationService {
     const shouldScopeExactAgent = Boolean((agentAssetId || agentId) && !hasFilter);
     const byAgent = new Map<string, T.JudgedEvent[]>();
     for (const e of events) {
-      const resolved = this.agentMetadata.resolveEvent(e);
-      if (agentAssetId && resolved.agentAssetId !== agentAssetId) continue;
       if (shouldScopeExactAgent && !agentAssetId && e.agentId !== agentId && e.attribution?.agentScopeId !== agentId) continue;
       if (workspacePath && e.workspacePath !== workspacePath) continue;
       if (!agentId && filter.userId && e.userId !== filter.userId) continue;
+      const resolved = this.agentMetadata.resolveEvent(e);
+      if (agentAssetId && resolved.agentAssetId !== agentAssetId) continue;
       (byAgent.get(resolved.agentAssetId) ?? byAgent.set(resolved.agentAssetId, []).get(resolved.agentAssetId)!).push(e);
     }
 
@@ -1089,7 +1089,12 @@ export class AggregationService {
     const pinnedEventId = filter.eventId?.trim();
     const windowedEvents = this.win(filter).events;
     const windowedEventIds = new Set(windowedEvents.map((event) => event.eventId));
-    const events = pinnedEdgeId || pinnedEventId ? this.judge.query(0) : windowedEvents;
+    const pinnedEvent = pinnedEventId ? this.judge.findEvent(pinnedEventId) : undefined;
+    const events = pinnedEdgeId
+      ? this.judge.query(0)
+      : pinnedEvent && !windowedEventIds.has(pinnedEvent.eventId)
+        ? [...windowedEvents, pinnedEvent]
+        : windowedEvents;
     const includeBenign = filter.includeBenign !== false;
     const q = filter.q?.trim().toLowerCase();
     const agentId = filter.agentId?.trim();
@@ -1198,11 +1203,20 @@ export class AggregationService {
     };
 
     for (const e of events) {
+      const collectorRef = eventCollectorId(e);
+      const sourceRef = eventSourceId(e);
+      const isPinnedEvent = Boolean(pinnedEventId && e.eventId === pinnedEventId);
+      const matchesDirectScope =
+        (!agentId || e.agentId === agentId) &&
+        (!workspacePath || e.workspacePath === workspacePath) &&
+        (!collectorId || collectorRef === collectorId) &&
+        (!sourceId || sourceRef === sourceId) &&
+        (includeBenign || e.verdict !== 'allow');
+      if (!pinnedEdgeId && !isPinnedEvent && !matchesDirectScope) continue;
+
       const target = topologyTarget(e);
       const agentNodeId = nodeId('agent', `${e.workspacePath}|${e.agentId}`);
       const workspaceNodeId = nodeId('workspace', e.workspacePath);
-      const collectorRef = eventCollectorId(e);
-      const sourceRef = eventSourceId(e);
       const collectorNodeId = collectorRef ? nodeId('collector', collectorRef) : '';
       const targetNodeId = target ? nodeId(target.type, target.key) : '';
       const workspaceNode: NodeSpec = { id: workspaceNodeId, type: 'workspace', label: e.workspacePath, extra: { workspacePath: e.workspacePath } };
@@ -1219,15 +1233,10 @@ export class AggregationService {
       if (collectorNode) eventEdges.push({ id: edgeId(collectorNodeId, agentNodeId, 'observed_by'), source: collectorNode, target: agentNode, type: 'observed_by', label: '观测' });
       if (target && targetNode) eventEdges.push({ id: edgeId(agentNodeId, targetNodeId, target.edgeType), source: agentNode, target: targetNode, type: target.edgeType, label: target.edgeLabel });
       const eventEdgeIds = eventEdges.map((edge) => edge.id);
-      const isPinnedEvent = Boolean(pinnedEventId && e.eventId === pinnedEventId);
       const isPinnedEdge = Boolean(pinnedEdgeId && eventEdgeIds.includes(pinnedEdgeId));
       const normalMatch =
         windowedEventIds.has(e.eventId) &&
-        (!agentId || e.agentId === agentId) &&
-        (!workspacePath || e.workspacePath === workspacePath) &&
-        (!collectorId || collectorRef === collectorId) &&
-        (!sourceId || sourceRef === sourceId) &&
-        (includeBenign || e.verdict !== 'allow') &&
+        matchesDirectScope &&
         (!q || [e.agentId, e.workspacePath, e.subject, e.riskCategory, e.riskName, collectorRef, sourceRef, target?.label, target?.subtitle].some((v) => (v ?? '').toLowerCase().includes(q)));
       const includeAllEventEdges = exactPinnedMode ? isPinnedEvent : normalMatch || isPinnedEvent;
       const includedEdges = includeAllEventEdges ? eventEdges : eventEdges.filter((edge) => pinnedEdgeId && edge.id === pinnedEdgeId);
