@@ -340,7 +340,30 @@ async function createAgentMetadata(agentId, workspacePath, suffix) {
     metadata.agentId === agentId && metadata.workspacePath === workspacePath && hasRedactedProbe(metadata.owner, `${runId}-${suffix}-owner`),
     metadata,
   );
-  return metadata;
+  const reviewed = await request(`/agents/${encodeURIComponent(agentId)}/review`, 'PUT', {
+    workspacePath,
+    decision: 'confirmed_agent',
+    currentClassification: 'unknown',
+    identityKeys: [agentId],
+    agentInstanceId: `evidence:${agentId}`,
+    physicalWorkloadId: `evidence:${workspacePath}:${agentId}`,
+    workloadRef: {
+      environment: 'host',
+      kind: 'process',
+      name: agentId,
+      processName: agentId,
+    },
+    note: `confirmed by ${runId} evidence verifier`,
+  }, actorHeaders);
+  assert(
+    `evidence Agent identity is confirmed for ${suffix}`,
+    reviewed.reviewDecision === 'confirmed_agent' &&
+      reviewed.agentId === agentId &&
+      reviewed.workspacePath === workspacePath &&
+      reviewed.owner === metadata.owner,
+    reviewed,
+  );
+  return reviewed;
 }
 
 async function createMaintenanceWindow(targetType, targetId, suffix) {
