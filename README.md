@@ -272,6 +272,17 @@ pnpm --filter @anysentry/api exec tsc --noEmit
 pnpm --filter @anysentry/web exec tsc --noEmit
 ```
 
+For source-level development across this checkout and the adjacent Sentry checkout, stage the
+native SDK and apply the local Compose overlay:
+
+```bash
+./scripts/prepare-local-sentry-sdk.sh ../Sentry
+docker compose -f docker-compose.yml -f docker-compose.local-source.yml --profile streaming up -d --build
+```
+
+The overlay mounts the staged SDK into the API and every judgment/stream worker, so the staged L1
+API is exercised without publishing a package. `.local/` is generated and is never committed.
+
 Choose the verifier that matches the surface you changed:
 
 | Scope | Command |

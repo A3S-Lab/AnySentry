@@ -19,6 +19,8 @@ const expectedProtectedRoutes = [
   'PUT remediations/:taskId',
   'PUT agents/:agentId/metadata',
   'PUT agents/:agentId/review',
+  'POST identity/ai-review',
+  'GET identity/ai-reviews',
   'POST sources',
   'PUT sources/:sourceId',
   'POST sources/:sourceId/rotate-token',
@@ -101,6 +103,8 @@ function protectedWriteProbes(id) {
     { route: 'PUT remediations/:taskId', label: 'remediation update', method: 'PUT', path: `/remediations/${id}-missing-task`, body: { status: 'done', note: 'auth guard probe' } },
     { route: 'PUT agents/:agentId/metadata', label: 'agent metadata update', method: 'PUT', path: `/agents/${id}-metadata-agent/metadata`, body: { workspacePath: `repo://${id}/auth`, owner: `${id}-owner` } },
     { route: 'PUT agents/:agentId/review', label: 'agent review update', method: 'PUT', path: `/agents/${id}-review-agent/review`, body: { workspacePath: `repo://${id}/auth`, decision: 'non_agent', identityKeys: [`container:${id}`] } },
+    { route: 'POST identity/ai-review', label: 'AI identity review', method: 'POST', path: '/identity/ai-review', body: { targetType: 'event', eventId: `${id}-missing-event`, timeType: 'last_3h' } },
+    { route: 'GET identity/ai-reviews', label: 'AI identity review history', method: 'GET', path: `/identity/ai-reviews?eventId=${id}-missing-event` },
     { route: 'PUT sources/:sourceId', label: 'source update', method: 'PUT', path: `/sources/${id}-missing-source`, body: { name: `${id} source`, type: 'webhook', requireToken: true } },
     { route: 'POST sources/:sourceId/rotate-token', label: 'source token rotation', method: 'POST', path: `/sources/${id}-missing-source/rotate-token` },
     {
@@ -142,7 +146,7 @@ async function main() {
   const expectedRouteSet = new Set(expectedProtectedRoutes);
   const controllerRouteSet = new Set(controllerRoutes);
   assert(
-    'controller protected write route list matches management auth contract',
+    'controller protected management route list matches management auth contract',
     setDifference(expectedRouteSet, controllerRouteSet).length === 0 && setDifference(controllerRouteSet, expectedRouteSet).length === 0,
     {
       expectedProtectedRoutes,
@@ -155,7 +159,7 @@ async function main() {
   const protectedProbes = protectedWriteProbes(runId);
   const probedRouteSet = new Set(['POST sources', ...protectedProbes.map((probe) => probe.route)]);
   assert(
-    'management auth runtime probes cover every protected write route',
+    'management auth runtime probes cover every protected management route',
     setDifference(expectedRouteSet, probedRouteSet).length === 0 && setDifference(probedRouteSet, expectedRouteSet).length === 0,
     {
       expectedProtectedRoutes,
