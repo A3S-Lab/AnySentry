@@ -9,7 +9,7 @@ import { cleanText } from './redaction';
 import { DecisionResultJob, FastJudgeJob } from './async-judgment.types';
 import { JudgmentQueueService } from './judgment-queue.service';
 import { resolveJudgmentRoute } from './identity-judgment-routing';
-import { CollectorHeartbeatRecord, CollectorHeartbeatRequest, EventCategory, EventMeta, Incident, IncidentStatus, JudgedEvent, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
+import { CollectorHeartbeatRecord, CollectorHeartbeatRequest, EventCategory, EventMeta, IdentityAiReviewRecord, Incident, IncidentStatus, JudgedEvent, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
 
 const SEVERITY_SCORE: Record<Severity, number> = { info: 8, low: 28, medium: 52, high: 76, critical: 95 };
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
@@ -322,6 +322,14 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
 
   async searchStoredEvents(query: StoredEventQuery): Promise<JudgedEvent[]> {
     return this.ch.searchEvents(query);
+  }
+
+  loadIdentityAiReviews(): Promise<IdentityAiReviewRecord[]> {
+    return this.ch.loadIdentityAiReviews();
+  }
+
+  saveIdentityAiReviews(records: IdentityAiReviewRecord[]): Promise<void> {
+    return this.ch.saveIdentityAiReviews(records);
   }
 
   /** Validate + apply a new policy, then persist it (survives restarts via ClickHouse). */

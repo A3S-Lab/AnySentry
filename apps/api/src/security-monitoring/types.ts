@@ -971,6 +971,34 @@ export interface AgentInventory {
   updateTime: string;
 }
 
+export type IdentityAiReviewTargetType = 'event' | 'agent';
+export type IdentityAiVerdict = 'agent' | 'not_agent';
+export type IdentityAiReviewStatus = 'running' | 'succeeded' | 'failed';
+export interface IdentityAiReviewRequest extends SecurityTimeFilter {
+  targetType: IdentityAiReviewTargetType;
+  eventId?: string;
+  agentAssetId?: string;
+}
+export interface IdentityAiReviewRecord {
+  schemaVersion: 'anysentry.identity_ai_review.v1';
+  reviewId: string;
+  targetType: IdentityAiReviewTargetType;
+  eventId?: string;
+  agentAssetId: string;
+  status: IdentityAiReviewStatus;
+  verdict?: IdentityAiVerdict;
+  confidence?: number;
+  summary?: string;
+  reason?: string;
+  evidenceRefs: string[];
+  evidenceDigest: string;
+  model?: string;
+  provider: 'a3s-code-sdk';
+  error?: string;
+  createdAt: string;
+  completedAt?: string;
+}
+
 export interface WorkspaceInventoryQuery extends SecurityTimeFilter {
   healthState?: AgentHealthState | 'all';
   criticality?: AgentCriticality | 'all';
@@ -1988,6 +2016,7 @@ export type AuditAction =
   | 'agent.metadata.updated'
   | 'agent.review.updated'
   | 'agent.review.cleared'
+  | 'agent.identity_ai_review.completed'
   | 'maintenance.window.updated'
   | 'notification.channel.updated'
   | 'notification.route.updated'
@@ -1995,7 +2024,7 @@ export type AuditAction =
   | 'objective.updated'
   | 'source.updated'
   | 'source.token_rotated';
-export type AuditResourceType = 'policy' | 'incident' | 'alert' | 'remediation' | 'agent' | 'maintenance' | 'notification' | 'objective' | 'source';
+export type AuditResourceType = 'policy' | 'incident' | 'alert' | 'remediation' | 'agent' | 'event' | 'maintenance' | 'notification' | 'objective' | 'source';
 export type AuditResult = 'success' | 'failure';
 export interface AuditActor {
   type: AuditActorType;

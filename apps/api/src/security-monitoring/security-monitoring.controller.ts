@@ -7,6 +7,7 @@ import { AggregationService } from './aggregation.service';
 import { AlertingService } from './alerting.service';
 import { AuditService } from './audit.service';
 import { IngestionSourceResolution, IngestionSourceService } from './ingestion-source.service';
+import { IdentityReviewAgentService } from './identity-review-agent.service';
 import { KubeIdentityService } from './kube-identity.service';
 import { managementAuthConfigured, ManagementAuthGuard, RequireManagementAuth } from './management-auth.guard';
 import { MaintenanceWindowService } from './maintenance-window.service';
@@ -2684,6 +2685,7 @@ export class SecurityMonitoringController {
     private readonly streaming: StreamingQueueService,
     private readonly streamFindings: StreamingFindingService,
     private readonly supplyChain: SupplyChainService,
+    private readonly identityReview: IdentityReviewAgentService,
   ) {}
 
   private requireWorkspaceScanner(
@@ -3058,6 +3060,45 @@ export class SecurityMonitoringController {
   @HttpCode(200)
   agentInventory(@Body() f: T.AgentInventoryQuery) {
     return this.agg.agentInventory(f);
+  }
+
+  @Post('identity/ai-review')
+  @HttpCode(200)
+  @RequireManagementAuth()
+  async runIdentityAiReview(@Body() body: T.IdentityAiReviewRequest, @Headers() headers: HeaderBag) {
+    const result = await this.identityReview.run(body);
+    this.audit.record({
+      actor: auditActor(headers),
+      action: 'agent.identity_ai_review.completed',
+      resourceType: body.targetType === 'event' ? 'event' : 'agent',
+      resourceId: body.eventId ?? body.agentAssetId ?? result.reviewId,
+      summary: result.status === 'succeeded'
+        ? `AI identity review: ${result.verdict}`
+        : `AI identity review failed: ${result.error ?? 'unknown error'}`,
+      details: {
+        reviewId: result.reviewId,
+        targetType: result.targetType,
+        eventId: result.eventId,
+        agentAssetId: result.agentAssetId,
+        status: result.status,
+        verdict: result.verdict,
+        confidence: result.confidence,
+        evidenceDigest: result.evidenceDigest,
+        provider: result.provider,
+        model: result.model,
+      },
+    });
+    return result;
+  }
+
+  @Get('identity/ai-reviews')
+  @RequireManagementAuth()
+  identityAiReviews(
+    @Query('targetType') targetType?: string,
+    @Query('eventId') eventId?: string,
+    @Query('agentAssetId') agentAssetId?: string,
+  ) {
+    return { items: this.identityReview.list(targetType, eventId, agentAssetId), updateTime: new Date().toISOString() };
   }
 
   @Post('workspaces/inventory')

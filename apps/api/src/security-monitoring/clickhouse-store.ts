@@ -10,7 +10,7 @@
 
 import { ClickHouseClient, createClient } from '@clickhouse/client';
 import { PolicyConfig } from './policy-config';
-import { AgentAttribution, AgentMetadataRecord, AlertRecord, AuditRecord, CollectorHeartbeatRecord, Incident, IngestionSourceRecord, JudgedEvent, MaintenanceWindowRecord, NotificationState, ObjectiveRecord, ProcessContext, RemediationRecord } from './types';
+import { AgentAttribution, AgentMetadataRecord, AlertRecord, AuditRecord, CollectorHeartbeatRecord, IdentityAiReviewRecord, Incident, IngestionSourceRecord, JudgedEvent, MaintenanceWindowRecord, NotificationState, ObjectiveRecord, ProcessContext, RemediationRecord } from './types';
 
 const TABLE = 'events';
 // `at` is raw epoch-ms (matches the aggregator); `ts` is a derived DateTime only for TTL/partitioning.
@@ -557,6 +557,35 @@ export class ClickHouseStore {
       });
     } catch (err) {
       console.error('[clickhouse] saveAgentMetadata failed:', (err as Error).message);
+    }
+  }
+
+  async loadIdentityAiReviews(): Promise<IdentityAiReviewRecord[]> {
+    if (!this.client) return [];
+    try {
+      const rs = await this.client.query({
+        query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'identity_ai_reviews' LIMIT 1`,
+        format: 'JSONEachRow',
+      });
+      const rows = (await rs.json()) as Array<{ value: string }>;
+      const parsed = rows.length ? (JSON.parse(rows[0].value) as unknown) : [];
+      return Array.isArray(parsed) ? (parsed as IdentityAiReviewRecord[]) : [];
+    } catch (err) {
+      console.error('[clickhouse] loadIdentityAiReviews failed:', (err as Error).message);
+      return [];
+    }
+  }
+
+  async saveIdentityAiReviews(records: IdentityAiReviewRecord[]): Promise<void> {
+    if (!this.client) return;
+    try {
+      await this.client.insert({
+        table: CONFIG_TABLE,
+        values: [{ key: 'identity_ai_reviews', value: JSON.stringify(records.slice(-1_000)), updated_at: Date.now() }],
+        format: 'JSONEachRow',
+      });
+    } catch (err) {
+      console.error('[clickhouse] saveIdentityAiReviews failed:', (err as Error).message);
     }
   }
 
