@@ -17,6 +17,7 @@ import { useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
 import { AgentIdentityInline, resolveAgentIdentity } from "@/components/custom/agent-identity";
+import { IdentityAiReview } from "@/components/custom/identity-ai-review";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -283,6 +284,16 @@ function EventDetail({
             <p className="mt-1 font-mono text-xl font-semibold text-zinc-100">{event.latencyMs}ms</p>
           </div>
         </div>
+
+        <IdentityAiReview
+          targetType="event"
+          eventId={event.eventId}
+          agentAssetId={event.agentAssetId}
+          timeType={timeType}
+          startTime={startTime}
+          endTime={endTime}
+          compact
+        />
 
         <div>
           <p className="mb-2 text-xs font-medium text-zinc-400">Agent 归因详情</p>

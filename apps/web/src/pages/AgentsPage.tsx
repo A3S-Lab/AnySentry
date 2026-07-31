@@ -34,6 +34,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
 import { AgentAssetIdentityInline } from "@/components/custom/agent-identity";
+import { IdentityAiReview } from "@/components/custom/identity-ai-review";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -345,6 +346,8 @@ function AgentRow({
 function AgentDetail({
   agent,
   timeType,
+  startTime,
+  endTime,
   draft,
   saving,
   reviewing,
@@ -361,6 +364,8 @@ function AgentDetail({
 }: {
   agent?: AgentInventoryItem;
   timeType: SecurityTimeType;
+  startTime?: string;
+  endTime?: string;
   draft: AgentMetadataDraft;
   saving: boolean;
   reviewing: boolean;
@@ -460,6 +465,14 @@ function AgentDetail({
           <FieldValue label="Last Seen" value={formatDate(agent.lastSeen)} />
           <FieldValue label="Last Event" value={agent.lastEventSubject} />
         </div>
+
+        <IdentityAiReview
+          targetType="agent"
+          agentAssetId={agent.agentAssetId}
+          timeType={timeType}
+          startTime={startTime}
+          endTime={endTime}
+        />
 
         <div
           id="agent-review"
@@ -1103,6 +1116,8 @@ export default function AgentsPage() {
               <AgentDetail
                 agent={selectedAgent}
                 timeType={timeType}
+                startTime={timeType === "custom" ? routeStartTime : undefined}
+                endTime={timeType === "custom" ? routeEndTime : undefined}
                 draft={metadataDraft}
                 saving={savingMetadata}
                 reviewing={reviewingAgent}

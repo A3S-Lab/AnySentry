@@ -13,6 +13,7 @@ const events = read('apps/web/src/pages/AgentEventsPage.tsx');
 const agents = read('apps/web/src/pages/AgentsPage.tsx');
 const topology = read('apps/web/src/pages/TopologyPage.tsx');
 const apiTypes = read('apps/web/src/lib/api/security-center.ts');
+const aiReview = read('apps/web/src/components/custom/identity-ai-review.tsx');
 
 assert.match(apiTypes, /workloadRef\?: AgentWorkloadRef/u);
 assert.match(apiTypes, /agentAssetId: string/u);
@@ -74,5 +75,12 @@ assert.match(agents, /focus"\) === "review"/u);
 assert.match(agents, /getElementById\("agent-review"\)\?\.scrollIntoView/u);
 assert.match(agents, /返回来源事件/u);
 assert.match(agents, /reviewSourceEventId/u);
+assert.match(events, /<IdentityAiReview[\s\S]*targetType="event"/u);
+assert.match(agents, /<IdentityAiReview[\s\S]*targetType="agent"/u);
+assert.match(aiReview, /结果不会自动改变身份分类/u);
+assert.match(aiReview, /建议：是 Agent/u);
+assert.match(aiReview, /建议：不是 Agent/u);
+assert.match(apiTypes, /runIdentityAiReview/u);
+assert.match(apiTypes, /identityAiReviews/u);
 
 console.log('Agent identity UI verification passed');
