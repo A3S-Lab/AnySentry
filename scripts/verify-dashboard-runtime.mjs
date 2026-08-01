@@ -407,7 +407,9 @@ async function verifyDashboardSourceContracts() {
       !agentsPage.includes('window.confirm') &&
       !agentsPage.includes('Codex') &&
       agentEventsPage.includes('focus: "review"') &&
-      agentEventsPage.includes('进入资产审核') &&
+      agentEventsPage.includes('进入身份审核') &&
+      agentEventsPage.includes('查看智能体资产') &&
+      !agentEventsPage.includes('<IdentityAiReview') &&
       securityMonitorPage.includes('if (event.agentId) qs.set("agentId", event.agentId)') &&
       securityMonitorPage.includes('详情 →') &&
       topologyPage.includes('查看事件'),

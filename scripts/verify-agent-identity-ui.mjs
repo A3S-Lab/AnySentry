@@ -56,7 +56,6 @@ assert.doesNotMatch(monitoring, /Flink 实时风险关联|Flink 聚合连续行�
 assert.match(topology, /const eventQs = new URLSearchParams\(\{ timeType \}\)/u);
 assert.match(topology, /查看事件/u);
 assert.match(events, /focus: "review"/u);
-assert.match(events, /进入资产审核/u);
 assert.match(events, /agentAssetId: event\.agentAssetId/u);
 assert.match(events, /label="当前显示名"/u);
 assert.match(events, /label="采集时名称"/u);

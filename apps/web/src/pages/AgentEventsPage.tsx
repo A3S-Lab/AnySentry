@@ -362,14 +362,6 @@ function EventDetail({
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {event.agentId && event.workspacePath ? (
-            <Button asChild size="sm" className="h-8 bg-amber-400 text-[#171006] hover:bg-amber-300">
-              <Link to={`/agents?${agentQs.toString()}`}>
-                <UserCheck className="size-3.5" />
-                进入资产审核
-              </Link>
-            </Button>
-          ) : null}
           <Button asChild size="sm" className="h-8 bg-teal-500 text-[#07100c] hover:bg-teal-400">
             <Link to={`/topology?${topologyQs.toString()}`}>
               <GitBranch className="size-3.5" />
