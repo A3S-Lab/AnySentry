@@ -301,7 +301,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   private applyPolicy(config: PolicyConfig): void {
     let next: Sentry;
     try {
-      next = Sentry.create(buildFastAcl(config));
+      next = Sentry.create(buildFastAcl(config, { llmKey: process.env.A3S_SENTRY_LLM_KEY }));
     } catch (error) {
       throw policyConfigError(error);
     }

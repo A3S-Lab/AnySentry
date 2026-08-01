@@ -91,7 +91,7 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
             },
           }
         : input.policy;
-      sentry = Sentry.create(buildFastAcl(fastPolicy));
+      sentry = Sentry.create(buildFastAcl(fastPolicy, { llmKey: process.env.A3S_SENTRY_LLM_KEY }));
       sentryCache.set(input.policyVersion, sentry);
       if (sentryCache.size > 8) sentryCache.delete(sentryCache.keys().next().value as string);
     }

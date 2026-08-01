@@ -36,6 +36,10 @@ export interface PolicyConfig {
   identity: IdentityJudgmentPolicy;
 }
 
+/** Process-local secrets are injected only while constructing the Sentry ACL. They are never part
+ *  of the editable/persisted PolicyConfig returned to the dashboard or written to ClickHouse. */
+export interface PolicyRuntimeSecrets { llmKey?: string }
+
 export class PolicyConfigError extends Error {
   constructor(message = 'invalid policy') {
     super(message);
@@ -116,10 +120,13 @@ function q(s: string): string {
 
 /** Render the policy as a sentry ACL (HCL). Blocks are multi-line; the rules list uses object
  *  literals. Built-in rules always apply underneath these. */
-export function buildAcl(c: PolicyConfig): string {
+export function buildAcl(c: PolicyConfig, secrets: PolicyRuntimeSecrets = {}): string {
   const out: string[] = [`fail_closed = ${c.failClosed}`];
   if (c.speculate !== 'off') out.push(`speculate = ${q(c.speculate)}`);
-  if (c.llm) out.push(`llm {\n  url = ${q(c.llm.url)}\n  model = ${q(c.llm.model)}\n  timeout_s = ${c.llm.timeoutS | 0}\n}`);
+  if (c.llm) {
+    const key = secrets.llmKey?.trim() ? `\n  key = ${q(secrets.llmKey.trim())}` : '';
+    out.push(`llm {\n  url = ${q(c.llm.url)}\n  model = ${q(c.llm.model)}${key}\n  timeout_s = ${c.llm.timeoutS | 0}\n}`);
+  }
   if (c.agent) out.push(`agent {\n  bin = ${q(c.agent.bin)}\n  skills = ${q(c.agent.skills)}\n}`);
   if (c.rules.length) {
     out.push('rules = [');
@@ -133,8 +140,8 @@ export function buildAcl(c: PolicyConfig): string {
 }
 
 /** Build the API/Fast Judge policy without an in-process L3 agent. */
-export function buildFastAcl(c: PolicyConfig): string {
-  return buildAcl({ ...c, agent: null, speculate: 'off' });
+export function buildFastAcl(c: PolicyConfig, secrets: PolicyRuntimeSecrets = {}): string {
+  return buildAcl({ ...c, agent: null, speculate: 'off' }, secrets);
 }
 
 /** Which tiers the dashboard should show (`如果没配置就前端不展示`). L1 is always active (built-ins). */

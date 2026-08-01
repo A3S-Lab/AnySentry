@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 
 const require = createRequire(import.meta.url);
 const { resolveJudgmentRoute } = require('../apps/api/dist/security-monitoring/identity-judgment-routing.js');
-const { sanitizePolicy } = require('../apps/api/dist/security-monitoring/policy-config.js');
+const { buildFastAcl, sanitizePolicy } = require('../apps/api/dist/security-monitoring/policy-config.js');
 const { Sentry, fileAccess } = require('../apps/api/node_modules/@a3s-lab/sentry');
 
 const policy = sanitizePolicy({});
@@ -32,6 +32,9 @@ const full = sanitizePolicy({
 assert.equal(resolveJudgmentRoute('confirmed_agent', full).maxTier, 'L3');
 assert.equal(resolveJudgmentRoute('probable_agent', full).maxTier, 'L3');
 assert.equal(resolveJudgmentRoute('unknown', full).maxTier, 'L1');
+const runtimeAcl = buildFastAcl(full, { llmKey: 'runtime-secret' });
+assert.match(runtimeAcl, /key = "runtime-secret"/u);
+assert.doesNotMatch(JSON.stringify(full), /runtime-secret|"key"/u);
 
 const sentry = Sentry.create('fail_closed = true\nllm { url = "http://127.0.0.1:1/v1" }');
 assert.equal(typeof sentry.evaluateL1, 'function', 'local staged Sentry SDK must be installed');
