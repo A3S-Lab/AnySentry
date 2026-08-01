@@ -120,7 +120,7 @@ const NEW_RULE: L1Rule = {
 };
 
 const DEFAULT_L2: L2Config = { url: "", model: "", timeoutS: 20 };
-const DEFAULT_L3: L3Config = { bin: "a3s-code", skills: "" };
+const DEFAULT_L3: L3Config = { bin: "/opt/anysentry/l3-agent.mjs", skills: "/opt/anysentry/skills" };
 
 function formatRequestError(error: unknown) {
   if (error instanceof Error) return error.message;
@@ -490,11 +490,11 @@ function L2Section({ value, onChange }: { value: L2Config | null; onChange: (nex
     >
       {enabled ? (
         <div className="grid gap-4 p-4 md:grid-cols-2">
-          <Field label="端点 URL (url)" hint="OpenAI 兼容的 /chat/completions 端点">
+          <Field label="API 基础 URL (url)" hint="填写到 /v1；若粘贴完整 /chat/completions 地址，保存时会自动规范化。">
             <Input
               value={config.url}
               onChange={(event) => onChange({ ...config, url: event.target.value })}
-              placeholder="https://llm.internal/v1/chat/completions"
+              placeholder="https://llm.internal/v1"
               className="h-8 border-white/10 bg-white/5 font-mono text-xs"
             />
           </Field>
@@ -530,19 +530,19 @@ function L3Section({ value, onChange }: { value: L3Config | null; onChange: (nex
 
   return (
     <Panel
-      title="L3 a3s-code 深判"
+      title="L3 a3s-code SDK 深判"
       icon={Bot}
-      description="L1 规则升级时调用的 a3s-code 智能体;运行时需存在 a3s-code 二进制,缺失则优雅降级。"
+      description="L2 仍需升级时，由进程内 a3s-code SDK 安全智能体执行深度研判。"
       action={<Switch checked={enabled} onChange={(next) => onChange(next ? { ...DEFAULT_L3 } : null)} />}
     >
       {enabled ? (
         <div className="space-y-4 p-4">
           <div className="grid gap-4 md:grid-cols-2">
-            <Field label="二进制路径 (bin)" hint="运行时中 a3s-code 可执行文件的路径或命令名">
+            <Field label="兼容入口标识 (bin)" hint="用于兼容 Sentry Policy 结构；异步 L3 实际由进程内 SDK 执行。">
               <Input
                 value={config.bin}
                 onChange={(event) => onChange({ ...config, bin: event.target.value })}
-                placeholder="a3s-code"
+                placeholder="/opt/anysentry/l3-agent.mjs"
                 className="h-8 border-white/10 bg-white/5 font-mono text-xs"
               />
             </Field>
@@ -557,7 +557,7 @@ function L3Section({ value, onChange }: { value: L3Config | null; onChange: (nex
           </div>
           <div className="flex items-start gap-2 rounded-md border border-amber-400/25 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-100">
             <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
-            <span>需要运行时中存在 a3s-code 二进制;若缺失,L3 将自动降级而不阻断流程。</span>
+            <span>L3 使用受限技能目录与独立会话，不调用 a3s-code CLI；模型后端不可达时会记录失败并保留证据。</span>
           </div>
         </div>
       ) : (

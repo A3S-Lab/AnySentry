@@ -21,7 +21,7 @@ export interface L1Rule {
   reason: string;
   action?: RuleAction;
 }
-export interface L2Config { url: string; model: string; timeoutS: number } // LLM judge endpoint
+export interface L2Config { url: string; model: string; timeoutS: number } // OpenAI-compatible API base URL
 /** `bin` is retained for policy compatibility; the async L3 worker uses the in-process SDK. */
 export interface L3Config { bin: string; skills: string }
 export interface IdentityJudgmentPolicy { candidatePipeline: 'full' | 'l1_only' }
@@ -63,6 +63,12 @@ const VERDICTS: Verdict[] = ['allow', 'block', 'escalate'];
 const SEVERITIES: Severity[] = ['info', 'low', 'medium', 'high', 'critical'];
 const ACTIONS: RuleAction[] = ['', 'deny-exec', 'deny-egress', 'deny-file'];
 
+/** Sentry appends `/chat/completions` itself. Accept the full endpoint users commonly paste in
+ *  the UI, but persist the provider base URL so the runtime never requests the path twice. */
+export function normalizeLlmBaseUrl(value: string): string {
+  return value.trim().replace(/\/(?:chat\/completions|responses)\/?$/u, '').replace(/\/+$/u, '');
+}
+
 /** Coerce arbitrary input (the PUT body) into a valid PolicyConfig — never trust the wire. */
 export function sanitizePolicy(input: unknown): PolicyConfig {
   const o = (input ?? {}) as Record<string, unknown>;
@@ -89,7 +95,8 @@ export function sanitizePolicy(input: unknown): PolicyConfig {
     : [];
 
   const llmIn = o.llm as Record<string, unknown> | null | undefined;
-  const llm: L2Config | null = llmIn && str(llmIn.url) ? { url: str(llmIn.url, 500), model: str(llmIn.model, 100) || 'default', timeoutS: num(llmIn.timeoutS, 1, 600, 60) } : null;
+  const llmUrl = normalizeLlmBaseUrl(str(llmIn?.url, 500));
+  const llm: L2Config | null = llmIn && llmUrl ? { url: llmUrl, model: str(llmIn.model, 100) || 'default', timeoutS: num(llmIn.timeoutS, 1, 600, 60) } : null;
 
   const agentIn = o.agent as Record<string, unknown> | null | undefined;
   const agent: L3Config | null = agentIn && str(agentIn.bin) ? { bin: str(agentIn.bin, 500), skills: str(agentIn.skills, 500) } : null;

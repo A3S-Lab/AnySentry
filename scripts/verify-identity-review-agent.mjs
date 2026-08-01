@@ -9,6 +9,7 @@ import {
   parseIdentityReview,
 } from '../apps/api/dist/security-monitoring/identity-review-agent.service.js';
 import { IdentityEvidenceService } from '../apps/api/dist/security-monitoring/identity-evidence.service.js';
+import { sanitizePolicy } from '../apps/api/dist/security-monitoring/policy-config.js';
 
 const policy = {
   failClosed: false,
@@ -18,6 +19,8 @@ const policy = {
   agent: null,
   identity: { candidatePipeline: 'full' },
 };
+const normalizedPolicy = sanitizePolicy(policy);
+assert.equal(normalizedPolicy.llm?.url, 'https://llm.example/v1');
 const config = identityReviewModelConfig(policy, {});
 assert.equal(config.url, 'https://llm.example/v1');
 assert.equal(config.model, 'review-model');
