@@ -45,6 +45,14 @@ assert.match(monitoring, /if \(event\.agentAssetId\) qs\.set\("agentAssetId", ev
 assert.match(monitoring, /if \(event\.workspacePath\) qs\.set\("workspacePath", event\.workspacePath\)/u);
 assert.match(monitoring, /if \(event\.runId\) qs\.set\("runId", event\.runId\)/u);
 assert.match(monitoring, /详情 →/u);
+assert.match(monitoring, /title="智能体风险概览"/u);
+assert.match(monitoring, /label: "智能体资产"/u);
+assert.match(monitoring, /label: "时间窗分析"/u);
+assert.match(monitoring, /const \[visibleAgentCount, setVisibleAgentCount\] = useState\(8\)/u);
+assert.match(monitoring, /<AgentOverviewCard key=\{agent\.agentAssetId\}/u);
+assert.match(monitoring, /securityCenterApi\.agentInventory\(\{ \.\.\.filter, limit: 32 \}\)/u);
+assert.match(monitoring, /观察模式 · 不影响系统操作/u);
+assert.doesNotMatch(monitoring, /Flink 实时风险关联|Flink 聚合连续行为|value: "Shadow"/u);
 assert.match(topology, /const eventQs = new URLSearchParams\(\{ timeType \}\)/u);
 assert.match(topology, /查看事件/u);
 assert.match(events, /focus: "review"/u);

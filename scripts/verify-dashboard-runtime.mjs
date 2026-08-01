@@ -434,11 +434,39 @@ async function verifyDashboardSourceContracts() {
         agentsPage.includes('身份信息配置'),
       hasReviewHandoff:
         agentEventsPage.includes('focus: "review"') &&
-        agentEventsPage.includes('进入资产审核'),
+        agentEventsPage.includes('进入身份审核') &&
+        agentEventsPage.includes('查看智能体资产') &&
+        !agentEventsPage.includes('<IdentityAiReview'),
       hasRuntimeEventHandoff:
         securityMonitorPage.includes('if (event.agentId) qs.set("agentId", event.agentId)') &&
         securityMonitorPage.includes('详情 →') &&
         topologyPage.includes('查看事件'),
+    },
+  );
+  assert(
+    'dashboard presents Agent assets first and exposes implementation-neutral time-window analysis',
+    securityMonitorPage.includes('title="智能体风险概览"') &&
+      securityMonitorPage.includes('{ key: "assets" as const, label: "智能体资产"') &&
+      securityMonitorPage.includes('{ key: "window" as const, label: "时间窗分析"') &&
+      securityMonitorPage.includes('securityCenterApi.agentInventory({ ...filter, limit: 32 })') &&
+      securityMonitorPage.includes('const [visibleAgentCount, setVisibleAgentCount] = useState(8)') &&
+      securityMonitorPage.includes('<AgentOverviewCard key={agent.agentAssetId}') &&
+      securityMonitorPage.includes('进入智能体资产 →') &&
+      securityMonitorPage.includes('观察模式 · 不影响系统操作') &&
+      !securityMonitorPage.includes('title="Flink 实时风险关联"') &&
+      !securityMonitorPage.includes('Flink 聚合连续行为') &&
+      !securityMonitorPage.includes('value: "Shadow"'),
+    {
+      hasOverviewTitle: securityMonitorPage.includes('title="智能体风险概览"'),
+      hasAssetFirstView: securityMonitorPage.includes('{ key: "assets" as const, label: "智能体资产"'),
+      hasWindowView: securityMonitorPage.includes('{ key: "window" as const, label: "时间窗分析"'),
+      hasInventoryQuery: securityMonitorPage.includes('securityCenterApi.agentInventory({ ...filter, limit: 32 })'),
+      hasEightItemDisclosure: securityMonitorPage.includes('const [visibleAgentCount, setVisibleAgentCount] = useState(8)'),
+      hasAssetCards: securityMonitorPage.includes('<AgentOverviewCard key={agent.agentAssetId}'),
+      hidesImplementationTerms:
+        !securityMonitorPage.includes('title="Flink 实时风险关联"') &&
+        !securityMonitorPage.includes('Flink 聚合连续行为') &&
+        !securityMonitorPage.includes('value: "Shadow"'),
     },
   );
   assert(
