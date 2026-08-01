@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { readFile, stat } from 'node:fs/promises';
 import process from 'node:process';
 import {
+  assertIdentityReviewProvider,
   buildIdentityReviewAcl,
   identityReviewModelConfig,
   parseIdentityReview,
@@ -27,6 +28,11 @@ assert.equal(config.model, 'review-model');
 const acl = buildIdentityReviewAcl(config);
 assert.match(acl, /default_model = "openai\/review-model"/u);
 assert.match(acl, /baseUrl = "https:\/\/llm\.example\/v1"/u);
+await assert.doesNotReject(() => assertIdentityReviewProvider(config, 1_000, async () => new Response('{"ok":true}', { status: 200 })));
+await assert.rejects(
+  () => assertIdentityReviewProvider(config, 1_000, async () => new Response('no healthy upstream', { status: 503 })),
+  /模型当前不可用（HTTP 503: no healthy upstream）/u,
+);
 
 assert.deepEqual(
   parseIdentityReview(
@@ -102,6 +108,10 @@ const serviceSource = await readFile(new URL('../apps/api/src/security-monitorin
 assert.match(serviceSource, /deny: \['writeFile', 'editFile', 'patchFile', 'bash', 'git', 'webSearch', 'task', 'parallel_task', 'program', 'Skill', 'search_skills'\]/u);
 assert.match(serviceSource, /allow: \['readFile', 'ls', 'glob', 'grep'\]/u);
 assert.match(serviceSource, /defaultDecision: 'deny'/u);
+assert.match(serviceSource, /ANYSENTRY_IDENTITY_REVIEW_TIMEOUT_MS, 120_000/u);
+assert.match(serviceSource, /ANYSENTRY_IDENTITY_REVIEW_LLM_TIMEOUT_MS, 45_000/u);
+assert.match(serviceSource, /ANYSENTRY_IDENTITY_REVIEW_PREFLIGHT_TIMEOUT_MS, 15_000/u);
+assert.match(serviceSource, /circuitBreakerThreshold: 1/u);
 assert.match(serviceSource, /new LocalWorkspaceBackend\(bundle\.workspace\)/u);
 assert.doesNotMatch(serviceSource, /node:child_process|spawn\(|execFile\(|scripts\/l3-agent/iu, 'identity review must use the SDK, never a CLI process');
 

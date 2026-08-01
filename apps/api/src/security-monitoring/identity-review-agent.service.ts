@@ -15,6 +15,7 @@ type ReviewAgent = { sessionAsync(workspace: string, options?: Parameters<Agent[
 
 interface ReviewModelConfig { url: string; model: string; key: string; context: number }
 interface ParsedReview { verdict: IdentityAiVerdict; confidence: number; summary: string; reason: string; evidenceRefs: string[] }
+type ReviewFetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 function positiveInt(value: unknown, fallback: number, max: number): number {
   const parsed = Number(value);
@@ -58,6 +59,56 @@ export function buildIdentityReviewAcl(config: ReviewModelConfig): string {
     '  }',
     '}',
   ].join('\n');
+}
+
+/**
+ * The SDK's provider client may retry an HTTP 503 until the whole Agent budget expires, which
+ * turns a useful `no healthy upstream` response into a misleading generic timeout. This bounded
+ * one-token probe distinguishes provider availability from Agent reasoning latency. Successful
+ * probes are cached by the service; failures are never cached so an operator can retry as soon as
+ * the provider recovers.
+ */
+export async function assertIdentityReviewProvider(
+  config: ReviewModelConfig,
+  timeoutMs: number,
+  fetcher: ReviewFetch = fetch,
+): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetcher(`${config.url.replace(/\/+$/u, '')}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${config.key}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: config.model,
+        messages: [{ role: 'user', content: 'Reply with OK.' }],
+        max_tokens: 1,
+        temperature: 0,
+      }),
+      signal: controller.signal,
+    });
+    const body = await response.text();
+    if (!response.ok) {
+      const detail = cleanText(body || response.statusText, 240) || 'provider request failed';
+      if (response.status === 401 || response.status === 403) {
+        throw new Error(`AI 身份辅助审核模型鉴权失败（HTTP ${response.status}: ${detail}）`);
+      }
+      if (response.status === 429) {
+        throw new Error(`AI 身份辅助审核模型当前限流（HTTP 429: ${detail}）`);
+      }
+      throw new Error(`AI 身份辅助审核模型当前不可用（HTTP ${response.status}: ${detail}）`);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error(`AI 身份辅助审核模型连通性检查超过 ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function jsonObjects(text: string): unknown[] {
@@ -116,7 +167,13 @@ export class IdentityReviewAgentService implements OnModuleInit, OnModuleDestroy
   private readonly waiters: Array<() => void> = [];
   private readonly concurrency = positiveInt(process.env.ANYSENTRY_IDENTITY_REVIEW_CONCURRENCY, 2, 8);
   private readonly maxQueue = positiveInt(process.env.ANYSENTRY_IDENTITY_REVIEW_MAX_QUEUE, 20, 200);
-  private readonly timeoutMs = positiveInt(process.env.ANYSENTRY_IDENTITY_REVIEW_TIMEOUT_MS, 60_000, 300_000);
+  // Identity review can require several read-only tool/model rounds. Keep the total budget larger
+  // than a single provider request, otherwise the outer timer hides useful upstream failures as a
+  // generic timeout while the SDK is still retrying an unavailable backend.
+  private readonly timeoutMs = positiveInt(process.env.ANYSENTRY_IDENTITY_REVIEW_TIMEOUT_MS, 120_000, 300_000);
+  private readonly llmTimeoutMs = positiveInt(process.env.ANYSENTRY_IDENTITY_REVIEW_LLM_TIMEOUT_MS, 45_000, 120_000);
+  private readonly providerProbeTimeoutMs = positiveInt(process.env.ANYSENTRY_IDENTITY_REVIEW_PREFLIGHT_TIMEOUT_MS, 15_000, 30_000);
+  private readonly providerReadyUntil = new Map<string, number>();
 
   constructor(
     private readonly evidence: IdentityEvidenceService,
@@ -198,6 +255,10 @@ export class IdentityReviewAgentService implements OnModuleInit, OnModuleDestroy
       await this.persist(runningRecord);
       const acl = buildIdentityReviewAcl(config);
       const fingerprint = createHash('sha256').update(acl).digest('hex');
+      if ((this.providerReadyUntil.get(fingerprint) ?? 0) <= Date.now()) {
+        await assertIdentityReviewProvider(config, this.providerProbeTimeoutMs);
+        this.providerReadyUntil.set(fingerprint, Date.now() + 30_000);
+      }
       let agent = this.agents.get(fingerprint);
       if (!agent) {
         agent = await Agent.create(acl);
@@ -224,8 +285,9 @@ export class IdentityReviewAgentService implements OnModuleInit, OnModuleDestroy
         autoParallel: false,
         manualDelegationEnabled: false,
         maxParallelTasks: 1,
-        maxExecutionTimeMs: Math.max(1_000, this.timeoutMs - 2_000),
-        llmApiTimeoutMs: Math.max(1_000, this.timeoutMs - 2_000),
+        maxExecutionTimeMs: Math.max(1_000, this.timeoutMs - 5_000),
+        llmApiTimeoutMs: Math.min(this.llmTimeoutMs, Math.max(1_000, this.timeoutMs - 10_000)),
+        circuitBreakerThreshold: 1,
         temperature: 0,
       });
       let timer: NodeJS.Timeout | undefined;
