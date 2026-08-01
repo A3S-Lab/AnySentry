@@ -17,7 +17,6 @@ import { useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
 import { AgentIdentityInline, resolveAgentIdentity } from "@/components/custom/agent-identity";
-import { IdentityAiReview } from "@/components/custom/identity-ai-review";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -285,15 +284,26 @@ function EventDetail({
           </div>
         </div>
 
-        <IdentityAiReview
-          targetType="event"
-          eventId={event.eventId}
-          agentAssetId={event.agentAssetId}
-          timeType={timeType}
-          startTime={startTime}
-          endTime={endTime}
-          compact
-        />
+        <div className="flex flex-col gap-3 rounded-md border border-teal-400/20 bg-teal-500/[0.06] px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <UserCheck className="size-4 shrink-0 text-teal-200" />
+              <p className="text-sm font-semibold text-zinc-100">
+                {agentIdentity.classification === "unknown" ? "身份信息" : "归属智能体"}
+              </p>
+            </div>
+            <p className="mt-1 text-xs leading-5 text-zinc-400">
+              {agentIdentity.classification === "unknown"
+                ? "当前身份尚未确认，可前往身份审核查看完整运行证据。"
+                : "身份辅助审核与人工裁决在智能体资产中统一进行，本页保留采集时的单条事件证据。"}
+            </p>
+          </div>
+          <Button asChild type="button" size="sm" className="h-8 shrink-0 bg-teal-400 text-slate-950 hover:bg-teal-300">
+            <Link to={`/agents?${agentQs.toString()}`}>
+              {agentIdentity.classification === "unknown" ? "进入身份审核" : "查看智能体资产"}
+            </Link>
+          </Button>
+        </div>
 
         <div>
           <p className="mb-2 text-xs font-medium text-zinc-400">Agent 归因详情</p>
