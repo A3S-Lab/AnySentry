@@ -103,6 +103,21 @@ assert.equal(decision.classification, 'confirmed_attack');
 assert.equal(decision.confidence, 0.91);
 assert.deepEqual(decision.evidenceEventIds, ['evt_read', 'evt_egress']);
 
+const fencedDecision = parseCompositeDecision(`\`\`\`json
+${JSON.stringify({
+  classification: 'suspicious',
+  verdict: 'allow',
+  severity: 'high',
+  confidence: 0.72,
+  attackType: 'possible credential exposure',
+  reason: 'The sequence has suspicious indicators but does not prove an attack.',
+  evidenceEventIds: ['evt_read', 'evt_egress'],
+})}
+\`\`\``, batch);
+assert.equal(fencedDecision.classification, 'suspicious');
+assert.equal(fencedDecision.verdict, 'allow');
+assert.deepEqual(fencedDecision.evidenceEventIds, ['evt_read', 'evt_egress']);
+
 const syntheticDecision = parseCompositeDecision(JSON.stringify({
   classification: 'confirmed_attack',
   verdict: 'block',

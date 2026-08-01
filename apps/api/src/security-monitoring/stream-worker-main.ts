@@ -364,7 +364,13 @@ export function deterministicSupplyChainDecision(batch: RiskAnalysisBatch): Comp
 
 export function parseCompositeDecision(content: unknown, batch: RiskAnalysisBatch): CompositeModelDecision {
   if (typeof content !== 'string' || !content.trim()) throw new Error('Composite Judge returned an empty response');
-  const parsed = JSON.parse(content.trim()) as Partial<CompositeModelDecision>;
+  const trimmed = content.trim();
+  // Some OpenAI-compatible providers wrap an otherwise valid JSON response in a
+  // single Markdown code fence even when the prompt explicitly requests JSON.
+  // Accept only that narrow wrapper; prose or trailing text must still fail the
+  // strict parser so untrusted model output cannot silently change semantics.
+  const fenced = /^```(?:json)?\s*\n?([\s\S]*?)\n?```$/iu.exec(trimmed);
+  const parsed = JSON.parse((fenced?.[1] ?? trimmed).trim()) as Partial<CompositeModelDecision>;
   if (!['benign', 'simulation', 'authorized_admin', 'suspicious', 'confirmed_attack'].includes(String(parsed.classification))) {
     throw new Error('Composite Judge returned an invalid classification');
   }
@@ -509,7 +515,10 @@ function compositeFinding(
     reason: decision?.reason,
     evidenceEventIds: decision?.evidenceEventIds ?? [],
     evidence: batch.evidence,
-    model: resolvedStatus === 'suppressed'
+    // A pending finding is queued but has not contacted a model yet. Leaving the
+    // model empty avoids publishing the stream worker's local default as if it
+    // were the Composite Judge's configured runtime model.
+    model: resolvedStatus === 'pending' || resolvedStatus === 'suppressed'
       ? ''
       : batch.synthetic
         ? 'synthetic-verifier'
