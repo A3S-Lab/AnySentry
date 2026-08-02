@@ -33,7 +33,7 @@ assert.equal(resolveJudgmentRoute('confirmed_agent', full).maxTier, 'L3');
 assert.equal(resolveJudgmentRoute('probable_agent', full).maxTier, 'L3');
 assert.equal(resolveJudgmentRoute('unknown', full).maxTier, 'L1');
 const runtimeAcl = buildFastAcl(full, { llmKey: 'runtime-secret' });
-assert.match(runtimeAcl, /key = "runtime-secret"/u);
+assert.doesNotMatch(runtimeAcl, /runtime-secret|\bllm\s*\{/u, 'Sentry must remain a pure L1 engine');
 assert.doesNotMatch(JSON.stringify(full), /runtime-secret|"key"/u);
 
 const sentry = Sentry.create('fail_closed = true\nllm { url = "http://127.0.0.1:1/v1" }');
@@ -45,6 +45,7 @@ assert.equal(l1.nextTierEligible, true);
 const worker = await readFile(new URL('../apps/api/src/security-monitoring/worker-main.ts', import.meta.url), 'utf8');
 assert.match(worker, /input\.routing\.profile === 'l1_only'/);
 assert.match(worker, /evaluateL1\.call/);
+assert.match(worker, /new L2CodeJudge/u, 'the asynchronous L2 stage must use A3S Code');
 assert.match(worker, /input\.routing\.maxTier === 'L3'/);
 
 console.log('PASS identity-aware judgment routing contracts');

@@ -12,6 +12,7 @@ import {
 } from './async-judgment.types';
 import { redisConnection } from './judgment-queue.service';
 import { isL3AgentTimeout, L3AgentPool } from './l3-agent-pool';
+import { L2CodeJudge } from './l2-code-judge';
 import { parseL3Decision } from './l3-decision-parser';
 import { buildFastAcl } from './policy-config';
 
@@ -21,6 +22,7 @@ const resultQueue = new Queue<DecisionResultJob>(DECISION_RESULTS_QUEUE, { conne
 const l3Queue = new Queue<L3JudgeJob>(L3_JOBS_QUEUE, { connection });
 const resultRedis = new IORedis(process.env.ANYSENTRY_REDIS_URL || 'redis://redis:6379/0', { maxRetriesPerRequest: null });
 const sentryCache = new Map<string, Sentry>();
+const l2JudgeCache = new Map<string, L2CodeJudge>();
 const l2ModelOverride = process.env.ANYSENTRY_L2_MODEL?.trim();
 const l3Concurrency = Number(process.env.ANYSENTRY_L3_CONCURRENCY || 2);
 const l3TimeoutMs = Number(process.env.ANYSENTRY_L3_TIMEOUT_MS || 60_000);
@@ -39,16 +41,6 @@ const l3Pool = role === 'l3'
       maxSessionAgeMs: 30 * 60_000,
     })
   : null;
-
-type ThroughL2Result = {
-  l1Decision: AsyncDecision;
-  l2Decision?: AsyncDecision;
-  effectiveDecision: AsyncDecision;
-  stageStatus: 'completed' | 'escalated';
-  escalationCause?: 'l1' | 'l2' | 'sae';
-  nextTierEligible: boolean;
-  stopReason: string;
-};
 
 type ThroughL1Result = {
   l1Decision: AsyncDecision;
@@ -91,15 +83,20 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
             },
           }
         : input.policy;
-      sentry = Sentry.create(buildFastAcl(fastPolicy, { llmKey: process.env.A3S_SENTRY_LLM_KEY }));
+      sentry = Sentry.create(buildFastAcl(fastPolicy));
       sentryCache.set(input.policyVersion, sentry);
       if (sentryCache.size > 8) sentryCache.delete(sentryCache.keys().next().value as string);
     }
-    if (input.routing.profile === 'l1_only' || input.routing.maxTier === 'L1') {
-      const evaluateL1 = (sentry as Sentry & { evaluateL1?: (event: string) => ThroughL1Result | null }).evaluateL1;
-      if (typeof evaluateL1 !== 'function') throw new Error('@a3s-lab/sentry staged L1 SDK is required');
-      const evaluation = evaluateL1.call(sentry, input.observerLine);
-      if (!evaluation) throw new Error('observer event is not parseable by Sentry L1');
+    const evaluateL1 = (sentry as Sentry & { evaluateL1?: (event: string) => ThroughL1Result | null }).evaluateL1;
+    if (typeof evaluateL1 !== 'function') throw new Error('@a3s-lab/sentry staged L1 SDK is required');
+    const l1 = evaluateL1.call(sentry, input.observerLine);
+    if (!l1) throw new Error('observer event is not parseable by Sentry L1');
+    const shouldRunL2 = input.routing.profile !== 'l1_only' &&
+      input.routing.maxTier !== 'L1' &&
+      Boolean(input.policy.llm) &&
+      l1.nextTierEligible &&
+      l1.l1Decision.verdict === 'escalate';
+    if (!shouldRunL2) {
       await publishResult({
         schemaVersion: 'anysentry.decision_result.v1',
         evaluationId: input.evaluationId,
@@ -107,21 +104,45 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
         event: input.event,
         stage: 'L1',
         status: 'succeeded',
-        decision: evaluation.l1Decision,
-        l1Decision: evaluation.l1Decision,
-        nextTierEligible: evaluation.nextTierEligible,
-        stageStopReason: evaluation.stopReason === 'evidence_incomplete' ? evaluation.stopReason : input.routing.reason,
+        decision: l1.l1Decision,
+        l1Decision: l1.l1Decision,
+        nextTierEligible: l1.nextTierEligible,
+        stageStopReason: input.routing.profile === 'l1_only'
+          ? (l1.stopReason === 'evidence_incomplete' ? l1.stopReason : input.routing.reason)
+          : (!input.policy.llm && l1.l1Decision.verdict === 'escalate' ? 'l2_not_configured' : l1.stopReason),
         startedAt,
         completedAt: Date.now(),
         attempt: attemptNumber(job.attemptsMade),
       });
       return;
     }
-    const evaluation = (await sentry.evaluateThroughL2(input.observerLine)) as ThroughL2Result;
-    const decision = evaluation.effectiveDecision;
+    const llm = input.policy.llm;
+    if (!llm) throw new Error('L2 policy disappeared while dispatching the model request');
+    let l2Judge = l2JudgeCache.get(input.policyVersion);
+    if (!l2Judge) {
+      l2Judge = new L2CodeJudge({
+        url: process.env.A3S_SENTRY_LLM_URL || llm.url,
+        model: l2ModelOverride || process.env.A3S_SENTRY_LLM_MODEL || llm.model,
+        key: process.env.A3S_SENTRY_LLM_KEY || '',
+        timeoutMs: Math.min(llm.timeoutS * 1_000, 60_000),
+        contextLimit: Number(process.env.ANYSENTRY_L2_CONTEXT_TOKENS || 16_384),
+      });
+      l2JudgeCache.set(input.policyVersion, l2Judge);
+      if (l2JudgeCache.size > 8) {
+        const oldest = l2JudgeCache.keys().next().value as string;
+        const evicted = l2JudgeCache.get(oldest);
+        l2JudgeCache.delete(oldest);
+        void evicted?.close();
+      }
+    }
+    const decision = await l2Judge.judge({
+      observerLine: input.observerLine,
+      eventKind: input.event.eventKind,
+      subject: input.event.subject,
+      actor: l3Actor(input),
+      provider: l3Provider(input),
+    });
     if (
-      evaluation.stageStatus === 'escalated' &&
-      evaluation.nextTierEligible &&
       decision.verdict === 'escalate' &&
       input.routing.maxTier === 'L3' &&
       input.policy.agent
@@ -134,7 +155,7 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
         observerLine: input.observerLine,
         policy: input.policy,
         provisionalDecision: decision,
-        l1Decision: evaluation.l1Decision,
+        l1Decision: l1.l1Decision,
         queuedAt: Date.now(),
       };
       await l3Queue.add('deep-investigation', l3Job, {
@@ -152,9 +173,9 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
         stage: 'L2',
         status: 'succeeded',
         decision,
-        l1Decision: evaluation.l1Decision,
-        nextTierEligible: evaluation.nextTierEligible,
-        stageStopReason: evaluation.stopReason,
+        l1Decision: l1.l1Decision,
+        nextTierEligible: true,
+        stageStopReason: 'l2_escalated',
         awaitingL3: true,
         startedAt,
         completedAt: Date.now(),
@@ -170,9 +191,9 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
       stage: decision.tier === 'Llm' ? 'L2' : 'L1',
       status: 'succeeded',
       decision,
-      l1Decision: evaluation.l1Decision,
-      nextTierEligible: evaluation.nextTierEligible,
-      stageStopReason: evaluation.stopReason,
+      l1Decision: l1.l1Decision,
+      nextTierEligible: decision.verdict === 'escalate',
+      stageStopReason: decision.verdict === 'escalate' ? 'l3_not_configured' : 'decision_final',
       startedAt,
       completedAt: Date.now(),
       attempt: attemptNumber(job.attemptsMade),
@@ -194,11 +215,11 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
   }
 }
 
-function l3Actor(input: L3JudgeJob): string {
+function l3Actor(input: Pick<L3JudgeJob, 'event' | 'evaluationId'>): string {
   return input.event.attribution?.agentDisplayName || input.event.attribution?.agentScopeId || input.event.agentId || input.event.sessionId || input.evaluationId;
 }
 
-function l3Provider(input: L3JudgeJob): string {
+function l3Provider(input: Pick<L3JudgeJob, 'event'>): string {
   for (const key of ['provider', 'llm.provider', 'gen_ai.system']) {
     const value = input.event.attributes[key];
     if (typeof value === 'string' && value.trim()) return value;
@@ -330,6 +351,8 @@ async function main(): Promise<void> {
   const stop = async () => {
     await worker.close();
     if (l3Pool) await l3Pool.close();
+    await Promise.all([...l2JudgeCache.values()].map((judge) => judge.close()));
+    l2JudgeCache.clear();
     await Promise.all([resultQueue.close(), l3Queue.close()]);
     resultRedis.disconnect();
     process.exit(0);

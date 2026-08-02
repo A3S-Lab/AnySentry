@@ -21,7 +21,7 @@ export interface L1Rule {
   reason: string;
   action?: RuleAction;
 }
-export interface L2Config { url: string; model: string; timeoutS: number } // OpenAI-compatible API base URL
+export interface L2Config { url: string; model: string; timeoutS: number } // Provider base URL routed by A3S Code
 /** `bin` is retained for policy compatibility; the async L3 worker uses the in-process SDK. */
 export interface L3Config { bin: string; skills: string }
 export interface IdentityJudgmentPolicy { candidatePipeline: 'full' | 'l1_only' }
@@ -36,8 +36,8 @@ export interface PolicyConfig {
   identity: IdentityJudgmentPolicy;
 }
 
-/** Process-local secrets are injected only while constructing the Sentry ACL. They are never part
- *  of the editable/persisted PolicyConfig returned to the dashboard or written to ClickHouse. */
+/** Legacy Sentry runtime secrets. AnySentry's asynchronous L2/L3 path uses A3S Code and never
+ *  persists credentials in PolicyConfig or ClickHouse. */
 export interface PolicyRuntimeSecrets { llmKey?: string }
 
 export class PolicyConfigError extends Error {
@@ -67,8 +67,8 @@ const VERDICTS: Verdict[] = ['allow', 'block', 'escalate'];
 const SEVERITIES: Severity[] = ['info', 'low', 'medium', 'high', 'critical'];
 const ACTIONS: RuleAction[] = ['', 'deny-exec', 'deny-egress', 'deny-file'];
 
-/** Sentry appends `/chat/completions` itself. Accept the full endpoint users commonly paste in
- *  the UI, but persist the provider base URL so the runtime never requests the path twice. */
+/** Accept the full endpoint users commonly paste in the UI, but persist a provider base URL.
+ *  A3S Code then performs provider-specific URL normalization and request routing. */
 export function normalizeLlmBaseUrl(value: string): string {
   return value.trim().replace(/\/(?:chat\/completions|responses)\/?$/u, '').replace(/\/+$/u, '');
 }
@@ -139,9 +139,9 @@ export function buildAcl(c: PolicyConfig, secrets: PolicyRuntimeSecrets = {}): s
   return out.join('\n') + '\n';
 }
 
-/** Build the API/Fast Judge policy without an in-process L3 agent. */
+/** Build Sentry as a pure L1 engine. AnySentry routes L2 and L3 through A3S Code workers. */
 export function buildFastAcl(c: PolicyConfig, secrets: PolicyRuntimeSecrets = {}): string {
-  return buildAcl({ ...c, agent: null, speculate: 'off' }, secrets);
+  return buildAcl({ ...c, llm: null, agent: null, speculate: 'off' }, secrets);
 }
 
 /** Which tiers the dashboard should show (`如果没配置就前端不展示`). L1 is always active (built-ins). */

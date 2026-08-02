@@ -2,6 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Agent, FileMemoryStore, Session, SessionOptions } from '@a3s-lab/code';
+import { buildA3sCodeModelAcl, sharedModelConfig } from './a3s-code-model-config';
 
 type L3Session = Pick<Session, 'send' | 'cancelAsync' | 'closeAsync'>;
 
@@ -51,33 +52,17 @@ function positiveInt(value: number, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
-function hclString(value: string): string {
-  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
-}
-
 export function buildL3AgentAcl(env: NodeJS.ProcessEnv = process.env): string {
-  const url = env.A3S_SENTRY_L3_URL || env.A3S_SENTRY_LLM_URL || 'http://localhost:18051/v1';
-  const key = env.A3S_SENTRY_L3_KEY || env.A3S_SENTRY_LLM_KEY || '';
-  const model = env.A3S_SENTRY_L3_MODEL || env.A3S_SENTRY_LLM_MODEL || 'glm-5.2';
+  const { url, key, model } = sharedModelConfig(env);
   const contextLimit = positiveInt(Number(env.ANYSENTRY_L3_CONTEXT_TOKENS), 32_768);
-  return [
-    'id = "sentry-l3"',
-    'name = "Sentry L3 Security Investigator"',
-    `default_model = ${hclString(`openai/${model}`)}`,
-    'providers "openai" {',
-    '  id = "openai"',
-    '  name = "openai"',
-    `  models ${hclString(model)} {`,
-    `    id = ${hclString(model)}`,
-    `    name = ${hclString(model)}`,
-    `    apiKey = ${hclString(key)}`,
-    `    baseUrl = ${hclString(url)}`,
-    '    limit = {',
-    `      context = ${contextLimit}`,
-    '    }',
-    '  }',
-    '}',
-  ].join('\n');
+  return buildA3sCodeModelAcl({
+    id: 'sentry-l3',
+    name: 'Sentry L3 Security Investigator',
+    url,
+    key,
+    model,
+    contextLimit,
+  });
 }
 
 async function settleWithin(promise: Promise<unknown>, timeoutMs = 5_000): Promise<void> {
