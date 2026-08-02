@@ -83,6 +83,8 @@ assert.equal(confirmedEvent.attribution?.classification, 'confirmed_agent');
 assert.equal(confirmedEvent.attribution?.source, 'manual_review');
 assert.equal(confirmedEvent.attribution?.reason, 'human_confirmed');
 assert.equal(confirmedEvent.attribution?.monitored, true);
+assert.equal(confirmedEvent.attribution?.agentScopeId, event.attribution.agentScopeId, 'review preserves the observed Agent scope');
+assert.equal(confirmedEvent.attribution?.agentDisplayName, event.attribution.agentDisplayName, 'review preserves the collected display evidence');
 
 let snapshot = service.identitySnapshotEntries('node-a');
 assert.equal(snapshot.length, 1);

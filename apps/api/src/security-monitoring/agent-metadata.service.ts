@@ -405,9 +405,8 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
       attribution: {
         monitored: confirmed,
         classification: record.reviewDecision,
-        agentScopeId: confirmed ? record.agentId : previous?.agentScopeId,
+        agentScopeId: previous?.agentScopeId ?? (confirmed ? record.agentId : undefined),
         agentDisplayName:
-          record.displayName ??
           previous?.agentDisplayName ??
           record.reviewWorkloadRef?.podName ??
           record.reviewWorkloadRef?.containerName ??
@@ -455,7 +454,6 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
           attributionSource: 'manual_review',
           agentScopeId: record.reviewDecision === 'confirmed_agent' ? record.agentId : undefined,
           agentDisplayName:
-            record.displayName ??
             workload?.podName ??
             workload?.containerName ??
             workload?.processName ??

@@ -41,6 +41,7 @@
 - 旧算法生成的资产 ID 保存在 `agentAssetAliases` 中，旧深链接解析后跳转到规范资产。
 - ClickHouse 配置以 `anysentry.agent_metadata.v2` 包装格式写入，同时保留并兼容读取旧 `agent_metadata`；历史事件不迁移、不改写。
 - 服务加载 v1 元数据后会幂等写入并列的 v2 规范注册表；没有 `agentAssetId` 或稳定观测身份的新审核请求会被拒绝，避免审核接口凭空创建资产。
+- 人工结论只覆盖有效分类、审核来源和审核 evidence；不会把人工显示名或旧审核键回写到事件的原始 `agentScopeId`、`agentDisplayName`。
 
 ## 3. 分类、裁决和最终状态
 
