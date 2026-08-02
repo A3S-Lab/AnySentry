@@ -30,6 +30,16 @@
 - `non_agent` 的原始常规事件可以不进入 ClickHouse，但裁决记录、身份绑定、审计日志和轻量抑制统计必须保留。
 - 同一稳定身份被多条相互冲突的人工记录认领时不得任意选取，必须 fail-open 回到自动分类。
 - 行为负向证据可以让候选提前回到 Unknown，但不能自动生成等同人工排除的永久 `non_agent`。
+- Agent 资产只有一个唯一 `agentAssetId`。人工审核只向这个底层观测资产追加分类、显示名、负责人和说明，不得创建第二条“人工 Agent”。
+- `workspacePath`、原始 `agentId` 和容器名称是观测及展示字段，不得与 `agentAssetId` 组合成第二个资产主键。
+
+### 2.1 唯一资产与兼容迁移
+
+- 内部元数据以 `agentAssetId` 为主键；`workspacePath + agentId` 只保留为旧数据查找索引。
+- 对缺少 `agentAssetId` 的旧记录，优先从 `physicalWorkloadId`、`agentInstanceId`、Pod UID 和稳定身份键推导规范资产 ID。
+- 同一规范资产的事件与人工元数据只生成一个资产项，人工审核状态在查询时覆盖分类，但不生成 metadata-only 重复资产。
+- 旧算法生成的资产 ID 保存在 `agentAssetAliases` 中，旧深链接解析后跳转到规范资产。
+- ClickHouse 配置以 `anysentry.agent_metadata.v2` 包装格式写入，同时保留并兼容读取旧 `agent_metadata`；历史事件不迁移、不改写。
 
 ## 3. 分类、裁决和最终状态
 

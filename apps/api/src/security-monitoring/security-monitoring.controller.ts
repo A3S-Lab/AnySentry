@@ -3120,10 +3120,11 @@ export class SecurityMonitoringController {
       actor: auditActor(headers),
       action: 'agent.metadata.updated',
       resourceType: 'agent',
-      resourceId: `${updated.workspacePath}:${updated.agentId}`,
+      resourceId: updated.agentAssetId,
       summary: `Agent metadata updated: ${updated.displayName || updated.agentId}`,
       details: {
         agentId: updated.agentId,
+        agentAssetId: updated.agentAssetId,
         workspacePath: updated.workspacePath,
         displayName: updated.displayName,
         owner: updated.owner,
@@ -3154,7 +3155,7 @@ export class SecurityMonitoringController {
       actor,
       action: body.decision === 'clear' ? 'agent.review.cleared' : 'agent.review.updated',
       resourceType: 'agent',
-      resourceId: `${updated.workspacePath}:${updated.agentId}`,
+      resourceId: updated.agentAssetId,
       summary:
         body.decision === 'confirmed_agent'
           ? `Agent confirmed by reviewer: ${updated.displayName || updated.agentId}`
@@ -3165,6 +3166,7 @@ export class SecurityMonitoringController {
             : `Agent review cleared: ${updated.displayName || updated.agentId}`,
       details: {
         agentId: updated.agentId,
+        agentAssetId: updated.agentAssetId,
         workspacePath: updated.workspacePath,
         decision: updated.reviewDecision ?? 'clear',
         identityKeyCount: updated.reviewIdentityKeys?.length ?? 0,

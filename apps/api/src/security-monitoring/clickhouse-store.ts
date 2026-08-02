@@ -535,12 +535,21 @@ export class ClickHouseStore {
     if (!this.client) return [];
     try {
       const rs = await this.client.query({
-        query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'agent_metadata' LIMIT 1`,
+        query: `SELECT key, value FROM ${CONFIG_TABLE} FINAL WHERE key IN ('agent_metadata', 'agent_metadata_v2') ORDER BY key DESC LIMIT 1`,
         format: 'JSONEachRow',
       });
-      const rows = (await rs.json()) as Array<{ value: string }>;
+      const rows = (await rs.json()) as Array<{ key: string; value: string }>;
       const parsed = rows.length ? (JSON.parse(rows[0].value) as unknown) : [];
-      return Array.isArray(parsed) ? (parsed as AgentMetadataRecord[]) : [];
+      if (Array.isArray(parsed)) return parsed as AgentMetadataRecord[];
+      if (
+        parsed &&
+        typeof parsed === 'object' &&
+        (parsed as { schemaVersion?: unknown }).schemaVersion === 'anysentry.agent_metadata.v2' &&
+        Array.isArray((parsed as { assets?: unknown }).assets)
+      ) {
+        return (parsed as { assets: AgentMetadataRecord[] }).assets;
+      }
+      return [];
     } catch (err) {
       console.error('[clickhouse] loadAgentMetadata failed:', (err as Error).message);
       return [];
@@ -552,7 +561,11 @@ export class ClickHouseStore {
     try {
       await this.client.insert({
         table: CONFIG_TABLE,
-        values: [{ key: 'agent_metadata', value: JSON.stringify(records), updated_at: Date.now() }],
+        values: [{
+          key: 'agent_metadata_v2',
+          value: JSON.stringify({ schemaVersion: 'anysentry.agent_metadata.v2', assets: records }),
+          updated_at: Date.now(),
+        }],
         format: 'JSONEachRow',
       });
     } catch (err) {
