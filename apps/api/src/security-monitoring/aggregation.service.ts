@@ -1,7 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { Sentry } from '@a3s-lab/sentry';
 import {
-  agentAssetIdForIdentityKey,
   detectedAgentIdentity,
   isAgentAssetClassification,
 } from './agent-identity';
@@ -422,7 +421,10 @@ export class AggregationService {
     const sourceId = filter.sourceId?.trim();
     const collectorId = filter.collectorId?.trim();
     const agentId = filter.agentId?.trim();
-    const agentAssetId = filter.agentAssetId?.trim();
+    const requestedAgentAssetId = filter.agentAssetId?.trim();
+    const agentAssetId = requestedAgentAssetId
+      ? this.agentMetadata.canonicalAgentAssetId(requestedAgentAssetId)
+      : undefined;
     const sessionId = filter.sessionId?.trim();
     const workspacePath = filter.workspacePath?.trim();
     const traceId = filter.traceId?.trim();
@@ -449,9 +451,9 @@ export class AggregationService {
       const matchesDirectFilter =
         (!sourceId || eventSource === sourceId) &&
         (!collectorId || eventCollector === collectorId) &&
-        (!agentId || e.agentId === agentId) &&
+        (agentAssetId || !agentId || e.agentId === agentId) &&
         (!sessionId || e.sessionId === sessionId) &&
-        (!workspacePath || e.workspacePath === workspacePath) &&
+        (agentAssetId || !workspacePath || e.workspacePath === workspacePath) &&
         (!traceId || e.traceId === traceId) &&
         (!runId || e.runId === runId) &&
         (!filter.eventKind || e.eventKind === filter.eventKind) &&
@@ -646,14 +648,19 @@ export class AggregationService {
     const environment = filter.environment?.trim().toLowerCase();
     const tag = filter.tag?.trim().toLowerCase();
     const agentId = filter.agentId?.trim();
-    const agentAssetId = filter.agentAssetId?.trim();
+    const requestedAgentAssetId = filter.agentAssetId?.trim();
+    const agentAssetId = requestedAgentAssetId
+      ? this.agentMetadata.canonicalAgentAssetId(requestedAgentAssetId)
+      : undefined;
     const workspacePath = filter.workspacePath?.trim();
     const hasFilter = Boolean((filter.healthState && filter.healthState !== 'all') || (filter.criticality && filter.criticality !== 'all') || owner || environment || tag || q || filter.userId);
     const shouldScopeExactAgent = Boolean((agentAssetId || agentId) && !hasFilter);
     const byAgent = new Map<string, T.JudgedEvent[]>();
     for (const e of events) {
       if (shouldScopeExactAgent && !agentAssetId && e.agentId !== agentId && e.attribution?.agentScopeId !== agentId) continue;
-      if (workspacePath && e.workspacePath !== workspacePath) continue;
+      // A canonical asset selection identifies the workload. Legacy display fields must not
+      // reject its raw events before metadata/alias resolution.
+      if (!agentAssetId && workspacePath && e.workspacePath !== workspacePath) continue;
       if (!agentId && filter.userId && e.userId !== filter.userId) continue;
       const resolved = this.agentMetadata.resolveEvent(e);
       if (agentAssetId && resolved.agentAssetId !== agentAssetId) continue;
@@ -684,11 +691,11 @@ export class AggregationService {
       const classification = resolved.effectiveClassification;
       const reviewed = Boolean(metadata?.reviewDecision);
       const itemAgentId =
-        metadata?.agentId ??
         attribution?.agentScopeId ??
         attribution?.agentDisplayName ??
+        detected.detectedName ??
         last.agentId;
-      const itemWorkspacePath = metadata?.workspacePath ?? last.workspacePath;
+      const itemWorkspacePath = last.workspacePath;
       const incidentKeys = new Set(sorted.map((event) => `${event.workspacePath}\0${event.agentId}`));
       const openIncidentCount = [...incidentKeys].reduce(
         (total, incidentKey) => total + (openIncidents.get(incidentKey) ?? 0),
@@ -730,6 +737,7 @@ export class AggregationService {
       return {
         agentId: itemAgentId,
         agentAssetId: assetId,
+        agentAssetAliases: metadata?.agentAssetAliases,
         workspacePath: itemWorkspacePath,
         userId: last.userId,
         displayName: resolved.displayName,
@@ -793,7 +801,7 @@ export class AggregationService {
           isAgentAssetClassification(metadata.reviewDecision ?? 'unknown') ||
           Boolean(filter.includeUnclassified && (agentAssetId || agentId))
         ) &&
-        !byAgent.has(metadata.agentAssetId ?? '') &&
+        !byAgent.has(metadata.agentAssetId) &&
         (
           !shouldScopeExactAgent ||
           (agentAssetId ? metadata.agentAssetId === agentAssetId : metadata.agentId === agentId)
@@ -807,9 +815,8 @@ export class AggregationService {
         const sourceCounts = Object.fromEntries(EVENT_SOURCES.map((source) => [source, 0])) as Record<T.EventSource, number>;
         return {
           agentId: metadata.agentId,
-          agentAssetId:
-            metadata.agentAssetId ??
-            agentAssetIdForIdentityKey(`${metadata.workspacePath}\0${metadata.agentId}`),
+          agentAssetId: metadata.agentAssetId,
+          agentAssetAliases: metadata.agentAssetAliases,
           workspacePath: metadata.workspacePath,
           userId: '-',
           displayName: metadata.displayName,

@@ -208,4 +208,56 @@ const focusedUnknown = aggregation.agentInventory({
 assert.equal(focusedUnknown.items.length, 1, 'a focused review can still reopen an unknown identity');
 assert.equal(focusedUnknown.items[0].classification, 'unknown');
 
+const dockerContainerId = 'f6611c0768c2c33910118357d8c0702cde43b9723a620caabf63313d93611f8b';
+const dockerEvent = event({
+  agentId: 'docker-a3s-code-loop',
+  pid: 701,
+  rootPid: 700,
+  workspacePath: 'docker/anysentry-test-a3s-code',
+});
+dockerEvent.attribution.agentScopeId = 'docker-a3s-code-loop';
+dockerEvent.attribution.agentDisplayName = 'docker-a3s-code-loop';
+dockerEvent.attribution.physicalWorkloadId = `docker:node-a:${dockerContainerId}`;
+dockerEvent.attribution.agentInstanceId = `container:${dockerContainerId}`;
+dockerEvent.attribution.workloadRef = {
+  environment: 'docker',
+  kind: 'container',
+  containerName: 'docker-a3s-code-loop',
+};
+const dockerAssetId = agentAssetIdForEvent(dockerEvent);
+const dockerIdentityKeys = service.identityKeysForEvent(dockerEvent);
+const legacyMetadataAssetId = require('../apps/api/dist/security-monitoring/agent-identity.js')
+  .agentAssetIdForIdentityKey('unknown\0f6611c0768c2');
+const dockerMetadata = service.review('f6611c0768c2', {
+  workspacePath: 'unknown',
+  decision: 'confirmed_agent',
+  currentClassification: 'probable_agent',
+  identityKeys: dockerIdentityKeys,
+  physicalWorkloadId: dockerEvent.attribution.physicalWorkloadId,
+  agentInstanceId: dockerEvent.attribution.agentInstanceId,
+  workloadRef: dockerEvent.attribution.workloadRef,
+}, 'security-reviewer');
+assert.equal(dockerMetadata.agentAssetId, dockerAssetId, 'legacy review metadata derives the event-backed canonical asset ID');
+assert.equal(service.canonicalAgentAssetId(legacyMetadataAssetId), dockerAssetId, 'legacy metadata-only asset links resolve to the canonical asset');
+
+const dockerAggregation = new AggregationService({
+  query: () => [dockerEvent],
+  listIncidents: () => [],
+}, service, {}, {});
+const dockerInventory = dockerAggregation.agentInventory({ timeType: 'last_3h', limit: 100 });
+assert.equal(dockerInventory.items.filter((item) => item.agentAssetId === dockerAssetId).length, 1, 'event and human review produce one Agent asset');
+const dockerItem = dockerInventory.items.find((item) => item.agentAssetId === dockerAssetId);
+assert.equal(dockerItem?.workspacePath, dockerEvent.workspacePath, 'observed workspace is not overwritten by legacy review metadata');
+assert.equal(dockerItem?.agentId, 'docker-a3s-code-loop', 'detected Agent name is not overwritten by a legacy review key');
+const legacyDeepLink = dockerAggregation.agentInventory({
+  timeType: 'last_3h',
+  agentAssetId: legacyMetadataAssetId,
+  agentId: 'f6611c0768c2',
+  workspacePath: 'unknown',
+  includeUnclassified: true,
+  limit: 1,
+});
+assert.equal(legacyDeepLink.items[0]?.agentAssetId, dockerAssetId, 'asset selection wins over stale display and workspace parameters');
+assert.equal(legacyDeepLink.items[0]?.eventCount, 1);
+
 console.log('Agent asset identity and immutable display-name overlay verification passed.');

@@ -159,22 +159,18 @@ service.review('reviewed-clickhouse', {
   workloadRef: event.attribution.workloadRef,
 }, 'security-reviewer');
 
-service.review('conflicting-review', {
+assert.throws(() => service.review('conflicting-review', {
   workspacePath: 'other/workspace',
   decision: 'confirmed_agent',
   currentClassification: 'unknown',
   identityKeys: [containerId],
-}, 'second-reviewer');
+}, 'second-reviewer'), /cannot change Agent classification from non_agent to confirmed_agent/,
+'a second review of the same stable identity updates the existing asset instead of creating a duplicate');
 assert.equal(
-  service.applyReview(event).attribution?.source,
-  'behavior',
-  'conflicting manual records fail open instead of selecting an arbitrary decision',
+  service.list().length,
+  1,
+  'human review metadata remains attached to the single underlying Agent asset',
 );
-
-service.review('conflicting-review', {
-  workspacePath: 'other/workspace',
-  decision: 'clear',
-}, 'second-reviewer');
 assert.equal(service.applyReview(event).attribution?.classification, 'non_agent');
 
 service.review('reviewed-clickhouse', {

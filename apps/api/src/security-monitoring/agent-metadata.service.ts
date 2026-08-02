@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ClickHouseStore } from './clickhouse-store';
-import { detectedAgentIdentity } from './agent-identity';
+import { agentAssetIdForIdentityKey, detectedAgentIdentity } from './agent-identity';
 import {
   AgentClassification,
   AgentCriticality,
@@ -18,8 +18,12 @@ import { cleanText } from './redaction';
 
 const RETAIN_LIMIT = 10_000;
 
-function key(workspacePath: string, agentId: string): string {
+function legacyKey(workspacePath: string, agentId: string): string {
   return `${workspacePath}\0${agentId}`;
+}
+
+function assetKey(agentAssetId: string): string {
+  return `asset\0${agentAssetId}`;
 }
 
 function iso(t = Date.now()): string {
@@ -121,6 +125,8 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
   private readonly reviewIndex = new Map<string, string | null>();
   private readonly identityIndex = new Map<string, string | null>();
   private readonly assetIndex = new Map<string, string | null>();
+  private readonly legacyIndex = new Map<string, string | null>();
+  private readonly aliasIndex = new Map<string, string | null>();
   private persistTimer?: NodeJS.Timeout;
   private initialized = false;
   private reviewVersion = 0;
@@ -128,7 +134,7 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
   async onModuleInit(): Promise<void> {
     if (await this.ch.init()) {
       for (const record of await this.ch.loadAgentMetadata()) {
-        if (record.agentId && record.workspacePath) this.records.set(key(record.workspacePath, record.agentId), this.normalize(record));
+        if (record.agentId && record.workspacePath) this.storeNormalized(this.normalize(record));
       }
       this.rebuildReviewIndex();
     }
@@ -142,17 +148,29 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
   }
 
   get(workspacePath: string, agentId: string): AgentMetadataRecord | undefined {
-    const record = this.records.get(key(workspacePath, agentId));
+    const recordKey = this.legacyIndex.get(legacyKey(workspacePath, agentId));
+    const record = recordKey ? this.records.get(recordKey) : undefined;
     return record ? { ...record, tags: [...record.tags] } : undefined;
+  }
+
+  canonicalAgentAssetId(agentAssetId: string): string {
+    const normalized = clean(agentAssetId, 160) ?? agentAssetId;
+    const recordKey = this.assetIndex.get(normalized) ?? this.aliasIndex.get(normalized);
+    if (!recordKey) return normalized;
+    return this.records.get(recordKey)?.agentAssetId ?? normalized;
   }
 
   update(agentId: string, input: AgentMetadataUpdateRequest): AgentMetadataListItem {
     const workspacePath = clean(input.workspacePath, 500) ?? 'unknown';
-    const cur = this.records.get(key(workspacePath, agentId));
+    const inputAssetId = clean(input.agentAssetId, 160);
+    const curKey = this.findRecordKey(inputAssetId, workspacePath, agentId, input.identityKeys);
+    const cur = curKey ? this.records.get(curKey) : undefined;
+    const canonicalAssetId = this.canonicalAssetIdForMutation(agentId, workspacePath, input, cur);
     const next: AgentMetadataRecord = {
-      agentId: clean(agentId, 240) ?? agentId,
-      agentAssetId: clean(input.agentAssetId, 160) ?? cur?.agentAssetId,
-      workspacePath,
+      agentId: cur?.agentId ?? clean(agentId, 240) ?? agentId,
+      agentAssetId: canonicalAssetId,
+      agentAssetAliases: this.assetAliases(cur, canonicalAssetId, workspacePath, agentId),
+      workspacePath: cur?.workspacePath ?? workspacePath,
       displayName: 'displayName' in input ? cleanText(input.displayName, 160) : cur?.displayName,
       owner: 'owner' in input ? cleanText(input.owner, 160) : cur?.owner,
       team: 'team' in input ? cleanText(input.team, 160) : cur?.team,
@@ -178,7 +196,7 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
       reviewWorkloadRef: cur?.reviewWorkloadRef,
       updatedAt: Date.now(),
     };
-    this.records.set(key(workspacePath, agentId), next);
+    this.storeNormalized(next, curKey);
     this.trim();
     this.rebuildReviewIndex();
     this.persistSoon();
@@ -187,8 +205,10 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
 
   review(agentId: string, input: AgentReviewRequest, reviewer?: string): AgentMetadataListItem {
     const workspacePath = clean(input.workspacePath, 500) ?? 'unknown';
-    const recordKey = key(workspacePath, agentId);
-    const cur = this.records.get(recordKey);
+    const inputAssetId = clean(input.agentAssetId, 160);
+    const recordKey = this.findRecordKey(inputAssetId, workspacePath, agentId, input.identityKeys);
+    const cur = recordKey ? this.records.get(recordKey) : undefined;
+    const canonicalAssetId = this.canonicalAssetIdForMutation(agentId, workspacePath, input, cur);
     const decision = cleanReviewDecision(input.decision);
     const currentClassification =
       cur?.reviewDecision ??
@@ -214,9 +234,10 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
         : []),
     ]);
     const next: AgentMetadataRecord = {
-      agentId: clean(agentId, 240) ?? agentId,
-      agentAssetId: clean(input.agentAssetId, 160) ?? cur?.agentAssetId,
-      workspacePath,
+      agentId: cur?.agentId ?? clean(agentId, 240) ?? agentId,
+      agentAssetId: canonicalAssetId,
+      agentAssetAliases: this.assetAliases(cur, canonicalAssetId, workspacePath, agentId),
+      workspacePath: cur?.workspacePath ?? workspacePath,
       displayName: cur?.displayName,
       owner: cur?.owner,
       team: cur?.team,
@@ -244,7 +265,7 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
       reviewWorkloadRef: decision ? cleanWorkloadRef(input.workloadRef) : undefined,
       updatedAt: Date.now(),
     };
-    this.records.set(recordKey, next);
+    this.storeNormalized(next, recordKey);
     this.trim();
     this.reviewVersion += 1;
     this.rebuildReviewIndex();
@@ -299,9 +320,9 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
 
   resolveEvent(event: JudgedEvent): ResolvedAgentMetadata {
     const detected = detectedAgentIdentity(event);
-    const exactKey = key(event.workspacePath, event.agentId);
-    const exact = this.records.get(exactKey);
-    const assetRecordKey = this.assetIndex.get(detected.agentAssetId);
+    const exactRecordKey = this.legacyIndex.get(legacyKey(event.workspacePath, event.agentId));
+    const exact = exactRecordKey ? this.records.get(exactRecordKey) : undefined;
+    const assetRecordKey = this.assetIndex.get(detected.agentAssetId) ?? this.aliasIndex.get(detected.agentAssetId);
     const identityKeys = this.identityKeysForEvent(event);
     let identityRecordKey: string | null | undefined;
     let reviewRecordKey: string | null | undefined;
@@ -338,7 +359,7 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
             ? exact
             : undefined;
     return {
-      agentAssetId: metadata?.agentAssetId ?? detected.agentAssetId,
+      agentAssetId: metadata?.agentAssetId ?? this.canonicalAgentAssetId(detected.agentAssetId),
       displayName: metadata?.displayName,
       detectedName: detected.detectedName,
       detectedClassification: detected.detectedClassification,
@@ -462,10 +483,17 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
   }
 
   private normalize(record: AgentMetadataRecord): AgentMetadataRecord {
+    const agentId = clean(record.agentId, 240) ?? 'unknown';
+    const workspacePath = clean(record.workspacePath, 500) ?? 'unknown';
+    const agentAssetId = clean(record.agentAssetId, 160) ?? this.derivedAgentAssetId(record, workspacePath, agentId);
     return {
-      agentId: clean(record.agentId, 240) ?? 'unknown',
-      agentAssetId: clean(record.agentAssetId, 160),
-      workspacePath: clean(record.workspacePath, 500) ?? 'unknown',
+      agentId,
+      agentAssetId,
+      agentAssetAliases: cleanIdentityKeys([
+        ...(record.agentAssetAliases ?? []),
+        agentAssetIdForIdentityKey(`${workspacePath}\0${agentId}`),
+      ]).filter((alias) => alias !== agentAssetId),
+      workspacePath,
       displayName: cleanText(record.displayName, 160),
       owner: cleanText(record.owner, 160),
       team: cleanText(record.team, 160),
@@ -494,6 +522,7 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
     return {
       ...rest,
       tags: [...record.tags],
+      agentAssetAliases: record.agentAssetAliases ? [...record.agentAssetAliases] : undefined,
       identityKeys: record.identityKeys ? [...record.identityKeys] : undefined,
       workloadRef: record.workloadRef ? { ...record.workloadRef } : undefined,
       reviewIdentityKeys: record.reviewIdentityKeys ? [...record.reviewIdentityKeys] : undefined,
@@ -507,16 +536,23 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
     if (this.records.size <= RETAIN_LIMIT) return;
     const keep = [...this.records.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, RETAIN_LIMIT);
     this.records.clear();
-    for (const record of keep) this.records.set(key(record.workspacePath, record.agentId), record);
+    for (const record of keep) this.records.set(assetKey(record.agentAssetId), record);
+    this.rebuildReviewIndex();
   }
 
   private rebuildReviewIndex(): void {
     this.reviewIndex.clear();
     this.identityIndex.clear();
     this.assetIndex.clear();
+    this.legacyIndex.clear();
+    this.aliasIndex.clear();
     for (const [recordKey, record] of this.records) {
       const assetId = clean(record.agentAssetId, 160);
       if (assetId) this.addIndexEntry(this.assetIndex, assetId, recordKey);
+      this.addIndexEntry(this.legacyIndex, legacyKey(record.workspacePath, record.agentId), recordKey);
+      for (const alias of record.agentAssetAliases ?? []) {
+        this.addIndexEntry(this.aliasIndex, alias, recordKey);
+      }
       for (const identityKey of record.identityKeys ?? record.reviewIdentityKeys ?? []) {
         const normalized = normalizeIdentityKey(identityKey);
         if (normalized) this.addIndexEntry(this.identityIndex, normalized, recordKey);
@@ -537,6 +573,104 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     if (existingKey !== recordKey) index.set(identity, null);
+  }
+
+  private derivedAgentAssetId(
+    record: Partial<AgentMetadataRecord>,
+    workspacePath: string,
+    agentId: string,
+  ): string {
+    const workload = record.workloadRef ?? record.reviewWorkloadRef;
+    const identityKey =
+      clean(record.physicalWorkloadId ?? record.reviewPhysicalWorkloadId, 500) ??
+      clean(record.agentInstanceId ?? record.reviewAgentInstanceId, 500) ??
+      (
+        workload?.podUid
+          ? `k8s:${workload.podUid}:${workload.containerName ?? workload.name ?? 'container'}`
+          : undefined
+      ) ??
+      cleanIdentityKeys(record.identityKeys ?? record.reviewIdentityKeys)[0] ??
+      `${workspacePath}\0${agentId}`;
+    return agentAssetIdForIdentityKey(identityKey);
+  }
+
+  private canonicalAssetIdForMutation(
+    agentId: string,
+    workspacePath: string,
+    input: AgentMetadataUpdateRequest | AgentReviewRequest,
+    current?: AgentMetadataRecord,
+  ): string {
+    const requested = clean(input.agentAssetId, 160);
+    if (requested) return this.canonicalAgentAssetId(requested);
+    if (current) return current.agentAssetId;
+    return this.derivedAgentAssetId({
+      agentId,
+      workspacePath,
+      identityKeys: input.identityKeys,
+      physicalWorkloadId: input.physicalWorkloadId,
+      agentInstanceId: input.agentInstanceId,
+      workloadRef: input.workloadRef,
+    }, workspacePath, agentId);
+  }
+
+  private assetAliases(
+    current: AgentMetadataRecord | undefined,
+    canonicalAssetId: string,
+    workspacePath: string,
+    agentId: string,
+  ): string[] {
+    return cleanIdentityKeys([
+      ...(current?.agentAssetAliases ?? []),
+      current?.agentAssetId,
+      agentAssetIdForIdentityKey(`${workspacePath}\0${agentId}`),
+    ]).filter((alias) => alias !== canonicalAssetId);
+  }
+
+  private findRecordKey(
+    requestedAssetId: string | undefined,
+    workspacePath: string,
+    agentId: string,
+    identityKeys?: string[],
+  ): string | undefined {
+    if (requestedAssetId) {
+      const direct = this.assetIndex.get(requestedAssetId) ?? this.aliasIndex.get(requestedAssetId);
+      if (direct) return direct;
+    }
+    const legacy = this.legacyIndex.get(legacyKey(workspacePath, agentId));
+    if (legacy) return legacy;
+    for (const identity of cleanIdentityKeys(identityKeys)) {
+      const indexed = this.identityIndex.get(identity);
+      if (indexed) return indexed;
+    }
+    return undefined;
+  }
+
+  private storeNormalized(record: AgentMetadataRecord, previousKey?: string): void {
+    const normalized = this.normalize(record);
+    const nextKey = assetKey(normalized.agentAssetId);
+    if (previousKey && previousKey !== nextKey) this.records.delete(previousKey);
+    const existing = this.records.get(nextKey);
+    this.records.set(nextKey, existing ? this.mergeRecords(existing, normalized) : normalized);
+    this.rebuildReviewIndex();
+  }
+
+  private mergeRecords(left: AgentMetadataRecord, right: AgentMetadataRecord): AgentMetadataRecord {
+    const newer = right.updatedAt >= left.updatedAt ? right : left;
+    const older = newer === right ? left : right;
+    return this.normalize({
+      ...older,
+      ...newer,
+      displayName: newer.displayName ?? older.displayName,
+      owner: newer.owner ?? older.owner,
+      team: newer.team ?? older.team,
+      environment: newer.environment ?? older.environment,
+      criticality: newer.criticality ?? older.criticality,
+      note: newer.note ?? older.note,
+      tags: [...new Set([...(older.tags ?? []), ...(newer.tags ?? [])])],
+      identityKeys: cleanIdentityKeys([...(older.identityKeys ?? []), ...(newer.identityKeys ?? [])]),
+      reviewIdentityKeys: cleanIdentityKeys([...(older.reviewIdentityKeys ?? []), ...(newer.reviewIdentityKeys ?? [])]),
+      agentAssetAliases: cleanIdentityKeys([...(older.agentAssetAliases ?? []), ...(newer.agentAssetAliases ?? [])]),
+    });
   }
 
   private persistSoon(): void {

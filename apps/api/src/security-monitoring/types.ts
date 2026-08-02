@@ -875,7 +875,8 @@ export interface AgentInventoryQuery extends SecurityTimeFilter {
 }
 export interface AgentMetadataRecord {
   agentId: string;
-  agentAssetId?: string;
+  agentAssetId: string;
+  agentAssetAliases?: string[];
   workspacePath: string;
   displayName?: string;
   owner?: string;
@@ -905,6 +906,7 @@ export interface AgentMetadataListItem extends Omit<AgentMetadataRecord, 'update
 export interface AgentInventoryItem {
   agentId: string;
   agentAssetId: string;
+  agentAssetAliases?: string[];
   workspacePath: string;
   userId: string;
   displayName?: string;
