@@ -133,10 +133,16 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
 
   async onModuleInit(): Promise<void> {
     if (await this.ch.init()) {
-      for (const record of await this.ch.loadAgentMetadata()) {
+      const loadedRecords = await this.ch.loadAgentMetadata();
+      for (const record of loadedRecords) {
         if (record.agentId && record.workspacePath) this.storeNormalized(this.normalize(record));
       }
       this.rebuildReviewIndex();
+      if (loadedRecords.length > 0) {
+        // Non-destructive, idempotent migration: keep the v1 ClickHouse config row and write the
+        // canonical registry beside it. Historical events are never rewritten.
+        await this.ch.saveAgentMetadata([...this.records.values()]);
+      }
     }
     this.initialized = true;
   }
@@ -603,6 +609,15 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
     const requested = clean(input.agentAssetId, 160);
     if (requested) return this.canonicalAgentAssetId(requested);
     if (current) return current.agentAssetId;
+    const hasStableIdentity = Boolean(
+      clean(input.physicalWorkloadId, 500) ||
+      clean(input.agentInstanceId, 500) ||
+      clean(input.workloadRef?.podUid, 240) ||
+      cleanIdentityKeys(input.identityKeys).length,
+    );
+    if (!hasStableIdentity) {
+      throw new BadRequestException('agentAssetId or stable observed identity is required');
+    }
     return this.derivedAgentAssetId({
       agentId,
       workspacePath,

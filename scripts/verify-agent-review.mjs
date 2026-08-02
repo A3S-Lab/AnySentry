@@ -17,6 +17,12 @@ assert.equal(behaviorDiscoveryEligible({
 }), true, 'automatic Unknown identities remain eligible for behavior discovery');
 
 const service = new AgentMetadataService();
+assert.throws(() => service.review('unobserved-manual-agent', {
+  workspacePath: 'unknown',
+  decision: 'confirmed_agent',
+  currentClassification: 'unknown',
+}, 'security-reviewer'), /agentAssetId or stable observed identity is required/,
+'human review cannot create a standalone Agent without an underlying asset or stable observed identity');
 const containerId = 'c4c5f098f38fe7a837c572d199133a5b13a6b1f39d3d31da053b9d261d865330';
 const event = {
   workspacePath: 'anysentry/clickhouse-0',
