@@ -509,6 +509,7 @@ function AgentDetail({
                 <span>physical={agent.physicalWorkloadId ?? "--"}</span>
                 <span>instance={agent.agentInstanceId ?? "--"}</span>
                 <span>keys={agent.reviewIdentityKeys.length}</span>
+                {agent.agentAssetAliases?.length ? <span>aliases={agent.agentAssetAliases.length}</span> : null}
                 <span>source={agent.attributionSource}</span>
               </div>
               {agent.reviewDecision ? (
@@ -803,9 +804,10 @@ export default function AgentsPage() {
   const routeEndTime = searchParams.get("endTime") ?? "";
   const [healthState, setHealthState] = useState<AgentHealthState | "all">((searchParams.get("healthState") as AgentHealthState) || "all");
   const [queryText, setQueryText] = useState(searchParams.get("q") ?? "");
-  const [selectedAgentId, setSelectedAgentId] = useState(searchParams.get("agentId") ?? "");
-  const [selectedAgentAssetId, setSelectedAgentAssetId] = useState(searchParams.get("agentAssetId") ?? "");
-  const [selectedWorkspacePath, setSelectedWorkspacePath] = useState(searchParams.get("workspacePath") ?? "");
+  const selectedAgentAssetId = searchParams.get("selectedAgentAssetId") ?? searchParams.get("agentAssetId") ?? "";
+  const legacySelectedAgentId = selectedAgentAssetId ? "" : searchParams.get("agentId") ?? "";
+  const legacySelectedWorkspacePath = selectedAgentAssetId ? "" : searchParams.get("workspacePath") ?? "";
+  const hasPinnedSelection = Boolean(selectedAgentAssetId || legacySelectedAgentId);
   const [userId, setUserId] = useState(searchParams.get("userId") ?? "");
   const [metadataDraft, setMetadataDraft] = useState<AgentMetadataDraft>(() => draftFromAgent());
   const [savingMetadata, setSavingMetadata] = useState(false);
@@ -822,28 +824,43 @@ export default function AgentsPage() {
     endTime: timeType === "custom" ? clean(routeEndTime) : undefined,
     healthState,
     q: clean(queryText),
-    agentId: clean(selectedAgentId),
-    agentAssetId: clean(selectedAgentAssetId),
-    workspacePath: clean(selectedWorkspacePath),
     userId: clean(userId),
-    includeUnclassified: reviewFocused && Boolean(selectedAgentAssetId || selectedAgentId),
     limit: 200,
-  }), [healthState, queryText, reviewFocused, routeEndTime, routeStartTime, selectedAgentAssetId, selectedAgentId, selectedWorkspacePath, timeType, userId]);
+  }), [healthState, queryText, routeEndTime, routeStartTime, timeType, userId]);
 
-  const { data, loading, refresh } = useRequest(() => securityCenterApi.agentInventory(query), {
+  const { data, loading, error: listError, refresh: refreshList } = useRequest(() => securityCenterApi.agentInventory(query), {
     refreshDeps: [query],
+    pollingInterval: 10000,
+    pollingWhenHidden: false,
+  });
+
+  const detailQuery = useMemo<AgentInventoryQuery>(() => ({
+    timeType,
+    startTime: timeType === "custom" ? clean(routeStartTime) : undefined,
+    endTime: timeType === "custom" ? clean(routeEndTime) : undefined,
+    agentAssetId: clean(selectedAgentAssetId),
+    agentId: selectedAgentAssetId ? undefined : clean(legacySelectedAgentId),
+    workspacePath: selectedAgentAssetId ? undefined : clean(legacySelectedWorkspacePath),
+    includeUnclassified: hasPinnedSelection,
+    limit: 1,
+  }), [hasPinnedSelection, legacySelectedAgentId, legacySelectedWorkspacePath, routeEndTime, routeStartTime, selectedAgentAssetId, timeType]);
+  const {
+    data: detailData,
+    loading: detailLoading,
+    error: detailError,
+    refresh: refreshDetail,
+  } = useRequest(() => securityCenterApi.agentInventory(detailQuery), {
+    ready: hasPinnedSelection,
+    refreshDeps: [detailQuery],
     pollingInterval: 10000,
     pollingWhenHidden: false,
   });
 
   const selectedAgent = useMemo(() => {
     const items = data?.items ?? [];
-    return items.find((item) =>
-      selectedAgentAssetId
-        ? item.agentAssetId === selectedAgentAssetId
-        : item.agentId === selectedAgentId && item.workspacePath === selectedWorkspacePath
-    ) ?? items[0];
-  }, [data, selectedAgentAssetId, selectedAgentId, selectedWorkspacePath]);
+    if (hasPinnedSelection) return detailData?.items?.[0];
+    return items[0];
+  }, [data, detailData, hasPinnedSelection]);
   const classificationCounts = useMemo(() => {
     const counts: Partial<Record<AgentClassification, number>> = {};
     for (const item of data?.items ?? []) {
@@ -856,14 +873,23 @@ export default function AgentsPage() {
     const params = new URLSearchParams({
       timeType,
       eventId: reviewSourceEventId,
-      agentId: selectedAgent.agentId,
       agentAssetId: selectedAgent.agentAssetId,
-      workspacePath: selectedAgent.workspacePath,
     });
     if (timeType === "custom" && routeStartTime) params.set("startTime", routeStartTime);
     if (timeType === "custom" && routeEndTime) params.set("endTime", routeEndTime);
     return `/events?${params.toString()}`;
   }, [reviewSourceEventId, routeEndTime, routeStartTime, selectedAgent, timeType]);
+
+  useEffect(() => {
+    if (!hasPinnedSelection || !selectedAgent || (selectedAgentAssetId && selectedAgent.agentAssetId === selectedAgentAssetId)) return;
+    const next = new URLSearchParams(searchParams);
+    next.delete("agentId");
+    next.delete("agentAssetId");
+    next.delete("workspacePath");
+    next.set("selectedAgentAssetId", selectedAgent.agentAssetId);
+    setSearchParams(next, { replace: true });
+    setReviewNotice("该资产身份已归一，当前展示其唯一资产记录。");
+  }, [hasPinnedSelection, searchParams, selectedAgent, selectedAgentAssetId, setSearchParams]);
 
   useEffect(() => {
     setMetadataDraft(draftFromAgent(selectedAgent));
@@ -893,16 +919,14 @@ export default function AgentsPage() {
     setPendingReview(null);
     setReviewError("");
     setReviewNotice("");
-    setSelectedAgentId(agent.agentId);
-    setSelectedAgentAssetId(agent.agentAssetId);
-    setSelectedWorkspacePath(agent.workspacePath);
-    const next = new URLSearchParams();
+    const next = new URLSearchParams(searchParams);
     next.set("timeType", timeType);
     if (timeType === "custom" && routeStartTime) next.set("startTime", routeStartTime);
     if (timeType === "custom" && routeEndTime) next.set("endTime", routeEndTime);
-    next.set("agentId", agent.agentId);
-    next.set("agentAssetId", agent.agentAssetId);
-    next.set("workspacePath", agent.workspacePath);
+    next.delete("agentId");
+    next.delete("agentAssetId");
+    next.delete("workspacePath");
+    next.set("selectedAgentAssetId", agent.agentAssetId);
     if (healthState !== "all") next.set("healthState", healthState);
     if (clean(queryText)) next.set("q", queryText.trim());
     if (clean(userId)) next.set("userId", userId.trim());
@@ -912,9 +936,6 @@ export default function AgentsPage() {
   const clearFilters = () => {
     setHealthState("all");
     setQueryText("");
-    setSelectedAgentId("");
-    setSelectedAgentAssetId("");
-    setSelectedWorkspacePath("");
     setUserId("");
     setPendingReview(null);
     setReviewError("");
@@ -941,7 +962,7 @@ export default function AgentsPage() {
         agentInstanceId: selectedAgent.agentInstanceId,
         workloadRef: selectedAgent.workloadRef,
       });
-      await refresh();
+      await Promise.all([refreshList(), refreshDetail()]);
     } finally {
       setSavingMetadata(false);
     }
@@ -977,7 +998,7 @@ export default function AgentsPage() {
         workloadRef: selectedAgent.workloadRef,
         note: metadataDraft.note,
       });
-      await refresh();
+      await Promise.all([refreshList(), refreshDetail()]);
       setPendingReview(null);
       setReviewNotice(
         decision === "confirmed_agent"
@@ -1041,8 +1062,8 @@ export default function AgentsPage() {
             <X className="size-3.5" />
             清除
           </Button>
-          <Button type="button" size="sm" onClick={refresh} disabled={loading} className="h-9 bg-teal-500 text-[#07100c] hover:bg-teal-400">
-            {loading ? <LoaderCircle className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+          <Button type="button" size="sm" onClick={() => { void Promise.all([refreshList(), hasPinnedSelection ? refreshDetail() : Promise.resolve()]); }} disabled={loading || detailLoading} className="h-9 bg-teal-500 text-[#07100c] hover:bg-teal-400">
+            {loading || detailLoading ? <LoaderCircle className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
             刷新
           </Button>
         </div>
@@ -1072,9 +1093,15 @@ export default function AgentsPage() {
                   <LoaderCircle className="mr-2 size-4 animate-spin" />
                   加载资产...
                 </div>
+              ) : listError ? (
+                <div className="flex min-h-40 items-center justify-center px-6 text-center text-sm text-rose-300">
+                  智能体资产加载失败，请刷新重试
+                </div>
               ) : (data?.items?.length ?? 0) === 0 ? (
                 <div className="flex min-h-40 items-center justify-center px-6 text-center text-sm text-zinc-500">
-                  暂无已确认或候选 Agent；尚未识别和已排除身份不会进入资产列表
+                  {healthState !== "all" || clean(queryText) || clean(userId)
+                    ? "没有符合当前筛选条件的智能体"
+                    : "当前时间范围内暂无已确认或候选智能体"}
                 </div>
               ) : (
                 <div className="max-h-[calc(100vh-300px)] overflow-y-auto">
@@ -1113,7 +1140,19 @@ export default function AgentsPage() {
             </section>
 
             <div className="space-y-4">
-              <AgentDetail
+              {hasPinnedSelection && detailError ? (
+                <section className="rounded-[8px] border border-rose-400/20 bg-[#111612]/92">
+                  <div className="flex min-h-[360px] items-center justify-center px-6 text-center text-sm text-rose-300">指定智能体资产加载失败，请刷新重试</div>
+                </section>
+              ) : hasPinnedSelection && detailLoading && !selectedAgent ? (
+                <section className="rounded-[8px] border border-white/10 bg-[#111612]/92">
+                  <div className="flex min-h-[360px] items-center justify-center text-sm text-zinc-500"><LoaderCircle className="mr-2 size-4 animate-spin" />加载资产详情...</div>
+                </section>
+              ) : hasPinnedSelection && !detailLoading && !selectedAgent ? (
+                <section className="rounded-[8px] border border-white/10 bg-[#111612]/92">
+                  <div className="flex min-h-[360px] items-center justify-center px-6 text-center text-sm text-zinc-500">未找到指定智能体资产；该资产可能已合并或不在当前访问范围</div>
+                </section>
+              ) : <AgentDetail
                 agent={selectedAgent}
                 timeType={timeType}
                 startTime={timeType === "custom" ? routeStartTime : undefined}
@@ -1131,7 +1170,7 @@ export default function AgentsPage() {
                 onRequestReview={requestReview}
                 onCancelReview={cancelReview}
                 onConfirmReview={reviewAgent}
-              />
+              />}
               <section className="rounded-[8px] border border-white/10 bg-[#111612]/92 p-4">
                 <div className="mb-3 flex items-center gap-2">
                   <AlertTriangle className="size-4 text-amber-200" />

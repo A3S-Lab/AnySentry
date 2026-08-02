@@ -225,9 +225,7 @@ function EventDetail({
   if (eventCollectorId) evidenceQs.set("collectorId", eventCollectorId);
   const agentQs = new URLSearchParams({
     timeType,
-    agentId: event.agentId,
-    agentAssetId: event.agentAssetId,
-    workspacePath: event.workspacePath,
+    selectedAgentAssetId: event.agentAssetId,
     focus: "review",
     eventId: event.eventId,
   });

@@ -1700,9 +1700,7 @@ function agentActivityLabel(value: string): string {
 function agentAssetHref(agent: AgentInventoryItem, filter: SecurityTimeFilter): string {
   const query = new URLSearchParams({
     timeType: filter.timeType ?? "last_3h",
-    agentId: agent.agentId,
-    agentAssetId: agent.agentAssetId,
-    workspacePath: agent.workspacePath,
+    selectedAgentAssetId: agent.agentAssetId,
   });
   if (filter.startTime) query.set("startTime", filter.startTime);
   if (filter.endTime) query.set("endTime", filter.endTime);
