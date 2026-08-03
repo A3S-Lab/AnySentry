@@ -35,6 +35,10 @@ const expectedProtectedRoutes = [
   'POST supply-chain/workspaces/:workspaceId/scan',
   'POST supply-chain/workspaces/:workspaceId/assess',
   'PUT config',
+  'GET config/model-connections',
+  'POST config/model-connections/test',
+  'PUT config/model-connections/:profile',
+  'POST config/model-connections/:profile/clear',
   'POST config/simulate',
 ];
 
@@ -124,6 +128,10 @@ function protectedWriteProbes(id) {
     { route: 'POST supply-chain/workspaces/:workspaceId/scan', label: 'supply-chain manual scan', method: 'POST', path: `/supply-chain/workspaces/${id}-missing-workspace/scan`, body: { reason: 'manual' } },
     { route: 'POST supply-chain/workspaces/:workspaceId/assess', label: 'supply-chain manual assessment', method: 'POST', path: `/supply-chain/workspaces/${id}-missing-workspace/assess` },
     { route: 'PUT config', label: 'policy update', method: 'PUT', path: '/config', body: {} },
+    { route: 'GET config/model-connections', label: 'model connection status', method: 'GET', path: '/config/model-connections' },
+    { route: 'POST config/model-connections/test', label: 'model connection test', method: 'POST', path: '/config/model-connections/test', body: { profile: 'fast_review' } },
+    { route: 'PUT config/model-connections/:profile', label: 'model connection apply', method: 'PUT', path: '/config/model-connections/fast_review', body: { testToken: 'invalid-auth-probe' } },
+    { route: 'POST config/model-connections/:profile/clear', label: 'model credential clear', method: 'POST', path: '/config/model-connections/fast_review/clear' },
     { route: 'POST config/simulate', label: 'policy simulation', method: 'POST', path: '/config/simulate', body: { timeType: 'last_30d', limit: 1, policy: {} } },
   ];
 }
