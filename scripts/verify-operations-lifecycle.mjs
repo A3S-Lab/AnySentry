@@ -297,6 +297,9 @@ async function verifyOtherControlPlaneObjects(sourceId, channelSecret) {
 
   const metadata = await request(`/agents/${encodeURIComponent(agentId)}/metadata`, 'PUT', {
     workspacePath,
+    identityKeys: [`container:${runId}-reviewed`, `${runId}-reviewed`],
+    physicalWorkloadId: `docker:test:${runId}`,
+    agentInstanceId: `container:${runId}-reviewed`,
     displayName: `${runId} Agent`,
     owner: `${runId}-agent-owner`,
     team: 'ops',
@@ -321,12 +324,13 @@ async function verifyOtherControlPlaneObjects(sourceId, channelSecret) {
   await auditFor({
     action: 'agent.metadata.updated',
     resourceType: 'agent',
-    resourceId: `${workspacePath}:${agentId}`,
+    resourceId: metadata.agentAssetId,
     check: (audit) => audit.details?.agentId === agentId && audit.details?.criticality === 'high',
   });
 
   const reviewed = await request(`/agents/${encodeURIComponent(agentId)}/review`, 'PUT', {
     workspacePath,
+    agentAssetId: metadata.agentAssetId,
     decision: 'confirmed_agent',
     identityKeys: [`container:${runId}-reviewed`, `${runId}-reviewed`],
     physicalWorkloadId: `docker:test:${runId}`,
@@ -352,7 +356,7 @@ async function verifyOtherControlPlaneObjects(sourceId, channelSecret) {
   await auditFor({
     action: 'agent.review.updated',
     resourceType: 'agent',
-    resourceId: `${workspacePath}:${agentId}`,
+    resourceId: metadata.agentAssetId,
     check: (audit) =>
       audit.details?.decision === 'confirmed_agent' &&
       audit.details?.identityKeyCount === 3,
@@ -369,13 +373,14 @@ async function verifyOtherControlPlaneObjects(sourceId, channelSecret) {
   );
   const clearedReview = await request(`/agents/${encodeURIComponent(agentId)}/review`, 'PUT', {
     workspacePath,
+    agentAssetId: metadata.agentAssetId,
     decision: 'clear',
   }, actorHeaders);
   assert('agent review can be cleared without deleting metadata', !clearedReview.reviewDecision && clearedReview.owner === `${runId}-agent-owner`, clearedReview);
   await auditFor({
     action: 'agent.review.cleared',
     resourceType: 'agent',
-    resourceId: `${workspacePath}:${agentId}`,
+    resourceId: metadata.agentAssetId,
     check: (audit) => audit.details?.decision === 'clear',
   });
 
