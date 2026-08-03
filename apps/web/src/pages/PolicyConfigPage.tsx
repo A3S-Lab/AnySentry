@@ -561,7 +561,7 @@ function ConnectionControl({
 }
 
 interface ConnectionActions {
-  connectivity: ConnectivityViewState;
+  state: ConnectivityViewState;
   active?: ModelConnectionStatus;
   apiKey: string;
   onApiKeyChange: (next: string) => void;
@@ -570,7 +570,7 @@ interface ConnectionActions {
   onClear: (profile: ModelConnectionProfile) => void;
 }
 
-function FastReviewSection({ value, onChange, ...actions }: { value: L2Config | null; onChange: (next: L2Config | null) => void } & ConnectionActions) {
+function FastReviewSection({ value, onChange, state, ...actions }: { value: L2Config | null; onChange: (next: L2Config | null) => void } & ConnectionActions) {
   const enabled = value !== null;
   const config = value ?? DEFAULT_L2;
   return (
@@ -581,13 +581,13 @@ function FastReviewSection({ value, onChange, ...actions }: { value: L2Config | 
           <Field label="模型名称"><Input value={config.model} onChange={(event) => onChange({ ...config, model: event.target.value })} placeholder="model-id" className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
           <Field label="单次超时（秒）"><Input type="number" min={1} max={600} value={config.timeoutS} onChange={(event) => onChange({ ...config, timeoutS: Number(event.target.value) })} className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
         </div>
-        <ConnectionControl profile="fast_review" {...actions} />
+        <ConnectionControl profile="fast_review" state={state} {...actions} />
       </div> : <div className="px-4 py-5 text-xs text-zinc-500">未启用 — 仅保留基础规则研判，AI 身份辅助审核不可用。</div>}
     </Panel>
   );
 }
 
-function DeepReviewSection({ model, agent, onModelChange, onAgentChange, ...actions }: { model: DeepModelConfig | null; agent: L3Config | null; onModelChange: (next: DeepModelConfig | null) => void; onAgentChange: (next: L3Config | null) => void } & ConnectionActions) {
+function DeepReviewSection({ model, agent, onModelChange, onAgentChange, state, ...actions }: { model: DeepModelConfig | null; agent: L3Config | null; onModelChange: (next: DeepModelConfig | null) => void; onAgentChange: (next: L3Config | null) => void } & ConnectionActions) {
   const enabled = model !== null && agent !== null;
   const config = model ?? DEFAULT_DEEP_MODEL;
   const agentConfig = agent ?? DEFAULT_L3;
@@ -602,7 +602,7 @@ function DeepReviewSection({ model, agent, onModelChange, onAgentChange, ...acti
           <Field label="上下文上限"><Input type="number" min={4096} max={262144} value={config.contextTokens} onChange={(event) => onModelChange({ ...config, contextTokens: Number(event.target.value) })} className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
           <Field label="安全技能目录" hint="深度调查只能使用该目录中的受限技能。"><Input value={agentConfig.skills} onChange={(event) => onAgentChange({ ...agentConfig, skills: event.target.value })} placeholder="/opt/anysentry/skills" className="h-8 border-white/10 bg-white/5 font-mono text-xs" /></Field>
         </div>
-        <ConnectionControl profile="deep_investigation" {...actions} />
+        <ConnectionControl profile="deep_investigation" state={state} {...actions} />
       </div> : <div className="px-4 py-5 text-xs text-zinc-500">未启用 — 风险升级到深度调查时会明确记录“未配置”，不会伪装为完整研判成功。</div>}
     </Panel>
   );
@@ -802,7 +802,7 @@ export default function PolicyConfigPage() {
     if (!draft) return;
     const config = profile === "fast_review" ? draft.llm : draft.deepModel;
     if (!config) return;
-    setConnectivity((prev) => ({ ...prev, [profile]: { ...prev[profile], loading: true, result: null } }));
+    setConnectivity((prev) => ({ ...prev, [profile]: { ...(prev[profile] ?? EMPTY_CONNECTIVITY[profile]), loading: true, result: null } }));
     try {
       const result = await securityCenterApi.testModelConnection({
         profile,
@@ -814,15 +814,15 @@ export default function PolicyConfigPage() {
       });
       setConnectivity((prev) => ({ ...prev, [profile]: { loading: false, applying: false, result } }));
     } catch (testError) {
-      setConnectivity((prev) => ({ ...prev, [profile]: { ...prev[profile], loading: false } }));
+      setConnectivity((prev) => ({ ...prev, [profile]: { ...(prev[profile] ?? EMPTY_CONNECTIVITY[profile]), loading: false } }));
       setToast({ kind: "error", message: `连接测试失败：${formatRequestError(testError)}` });
     }
   }, [apiKeys, draft]);
 
   const handleApplyConnection = useCallback(async (profile: ModelConnectionProfile) => {
-    const token = connectivity[profile].result?.testToken;
+    const token = connectivity[profile]?.result?.testToken;
     if (!token) return;
-    setConnectivity((prev) => ({ ...prev, [profile]: { ...prev[profile], applying: true } }));
+    setConnectivity((prev) => ({ ...prev, [profile]: { ...(prev[profile] ?? EMPTY_CONNECTIVITY[profile]), applying: true } }));
     try {
       const response = await securityCenterApi.applyModelConnection(profile, token);
       setStatus(response.status);
@@ -836,7 +836,7 @@ export default function PolicyConfigPage() {
       setConnectivity((prev) => ({ ...prev, [profile]: EMPTY_CONNECTIVITY[profile] }));
       setToast({ kind: "success", message: `${profile === "fast_review" ? "快速研判模型" : "深度研判模型"}已实时生效` });
     } catch (applyError) {
-      setConnectivity((prev) => ({ ...prev, [profile]: { ...prev[profile], applying: false } }));
+      setConnectivity((prev) => ({ ...prev, [profile]: { ...(prev[profile] ?? EMPTY_CONNECTIVITY[profile]), applying: false } }));
       setToast({ kind: "error", message: `应用失败：${formatRequestError(applyError)}` });
     }
   }, [connectivity]);
@@ -990,7 +990,7 @@ export default function PolicyConfigPage() {
               <FastReviewSection
                 value={draft.llm}
                 onChange={(next) => update("llm", next)}
-                connectivity={connectivity.fast_review}
+                state={connectivity.fast_review ?? EMPTY_CONNECTIVITY.fast_review}
                 active={connections?.fast_review}
                 apiKey={apiKeys.fast_review}
                 onApiKeyChange={(next) => handleApiKeyChange("fast_review", next)}
@@ -1003,7 +1003,7 @@ export default function PolicyConfigPage() {
                 agent={draft.agent}
                 onModelChange={(next) => update("deepModel", next)}
                 onAgentChange={(next) => update("agent", next)}
-                connectivity={connectivity.deep_investigation}
+                state={connectivity.deep_investigation ?? EMPTY_CONNECTIVITY.deep_investigation}
                 active={connections?.deep_investigation}
                 apiKey={apiKeys.deep_investigation}
                 onApiKeyChange={(next) => handleApiKeyChange("deep_investigation", next)}

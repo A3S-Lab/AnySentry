@@ -81,6 +81,9 @@ assert.doesNotMatch(identity, /A3S_SENTRY_L3_KEY/u);
 assert.match(page, /快速研判模型/u);
 assert.match(page, /深度研判模型/u);
 assert.match(page, /type="password"/u);
+assert.match(page, /state=\{connectivity\.fast_review \?\? EMPTY_CONNECTIVITY\.fast_review\}/u);
+assert.match(page, /state=\{connectivity\.deep_investigation \?\? EMPTY_CONNECTIVITY\.deep_investigation\}/u);
+assert.doesNotMatch(page, /connectivity=\{connectivity\./u, 'connection controls must receive the state prop they render');
 assert.doesNotMatch(page, /localStorage[^\n]*apiKey/iu);
 
 console.log('Runtime model connection verification passed');
