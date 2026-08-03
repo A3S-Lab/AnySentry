@@ -325,8 +325,12 @@ async function createObjective(agentId) {
 }
 
 async function createAgentMetadata(agentId, workspacePath, suffix) {
+  const physicalWorkloadId = `evidence:${workspacePath}:${agentId}`;
   const metadata = await request(`/agents/${encodeURIComponent(agentId)}/metadata`, 'PUT', {
     workspacePath,
+    identityKeys: [agentId, physicalWorkloadId],
+    physicalWorkloadId,
+    agentInstanceId: `evidence:${agentId}`,
     displayName: bearerProbe(`${runId} ${suffix} agent`),
     owner: bearerProbe(`${runId}-${suffix}-owner`),
     team: apiKeyProbe(`${runId}-${suffix}-team`),
@@ -342,11 +346,12 @@ async function createAgentMetadata(agentId, workspacePath, suffix) {
   );
   const reviewed = await request(`/agents/${encodeURIComponent(agentId)}/review`, 'PUT', {
     workspacePath,
+    agentAssetId: metadata.agentAssetId,
     decision: 'confirmed_agent',
     currentClassification: 'unknown',
     identityKeys: [agentId],
     agentInstanceId: `evidence:${agentId}`,
-    physicalWorkloadId: `evidence:${workspacePath}:${agentId}`,
+    physicalWorkloadId,
     workloadRef: {
       environment: 'host',
       kind: 'process',
@@ -542,7 +547,7 @@ async function verifyIncidentBundle(source, token, incident, alert, task, object
       bundle.audits?.some((item) => item.resourceType === 'objective' && item.resourceId === objective.objectiveId) &&
       bundle.audits?.some((item) => item.resourceType === 'maintenance' && item.resourceId === maintenance.source.windowId) &&
       bundle.audits?.some((item) => item.resourceType === 'maintenance' && item.resourceId === maintenance.agent.windowId) &&
-      bundle.audits?.some((item) => item.resourceType === 'agent' && item.resourceId === `${source.workspacePath}:${incident.agentId}`) &&
+      bundle.audits?.some((item) => item.resourceType === 'agent' && item.resourceId === agentMetadata.agentAssetId) &&
       !encoded.includes(token),
     bundle,
   );
@@ -656,7 +661,7 @@ async function verifyMetadataOnlyAgentBundle() {
         item.metadataUpdatedAt) &&
       bundle.workspaces?.some((item) => item.workspacePath === workspacePath && item.managedAgentCount >= 1) &&
       bundle.maintenanceWindows?.some((item) => item.windowId === maintenance.windowId && item.targetType === 'agent' && item.targetId === `${workspacePath}:${agentId}`) &&
-      bundle.audits?.some((item) => item.resourceType === 'agent' && item.resourceId === `${workspacePath}:${agentId}`) &&
+      bundle.audits?.some((item) => item.resourceType === 'agent' && item.resourceId === metadata.agentAssetId) &&
       bundle.audits?.some((item) => item.resourceType === 'maintenance' && item.resourceId === maintenance.windowId),
     bundle,
   );

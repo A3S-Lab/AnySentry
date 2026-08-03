@@ -4076,10 +4076,14 @@ export class SecurityMonitoringController {
     for (const item of sources) addCollector(item.collectorId);
     const collectors = [...collectorItems.values()].slice(0, limit);
     const agentItems = new Map<string, T.AgentInventoryItem>();
-    const addAgentItem = (item: T.AgentInventoryItem) => agentItems.set(`${item.workspacePath}\0${item.agentId}`, item);
-    const addAgent = (workspacePath: string | undefined, agentId: string | undefined) => {
-      if (!workspacePath || !agentId || agentItems.has(`${workspacePath}\0${agentId}`)) return;
-      const item = this.agg.agentInventory({ ...timeFilter, agentId, workspacePath, limit: 1 }).items.find((candidate) => candidate.agentId === agentId && candidate.workspacePath === workspacePath);
+    const addAgentItem = (item: T.AgentInventoryItem) => agentItems.set(item.agentAssetId, item);
+    const addAgent = (workspacePath: string | undefined, agentId: string | undefined, agentAssetId?: string) => {
+      if (!workspacePath || !agentId || (agentAssetId && agentItems.has(agentAssetId))) return;
+      const item = this.agg.agentInventory({ ...timeFilter, agentId, agentAssetId, workspacePath, limit: 1 }).items.find((candidate) =>
+        agentAssetId
+          ? candidate.agentAssetId === agentAssetId
+          : candidate.agentId === agentId && candidate.workspacePath === workspacePath,
+      );
       if (item) addAgentItem(item);
     };
     if (scope.agentId) {
@@ -4087,7 +4091,7 @@ export class SecurityMonitoringController {
     } else if (scope.workspacePath && !scope.sourceId && !scope.collectorId) {
       for (const item of this.agg.agentInventory({ ...timeFilter, workspacePath: scope.workspacePath, limit }).items) addAgentItem(item);
     }
-    for (const item of eventList.items) addAgent(item.workspacePath, item.agentId);
+    for (const item of eventList.items) addAgent(item.workspacePath, item.agentId, item.agentAssetId);
     const agents = [...agentItems.values()].slice(0, limit);
     const workspaceItems = new Map<string, T.WorkspaceInventoryItem>();
     const addWorkspace = (workspacePath: string | undefined) => {
@@ -4119,7 +4123,11 @@ export class SecurityMonitoringController {
     addAudit('source', scope.sourceId);
     for (const item of sources) addAudit('source', item.sourceId);
     addAudit('agent', scope.workspacePath && scope.agentId ? `${scope.workspacePath}:${scope.agentId}` : undefined);
-    for (const item of agents) addAudit('agent', `${item.workspacePath}:${item.agentId}`);
+    for (const item of agents) {
+      addAudit('agent', item.agentAssetId);
+      // Compatibility for audit records written before Agent assets gained a stable ID.
+      addAudit('agent', `${item.workspacePath}:${item.agentId}`);
+    }
     const audits = [...auditItems.values()].sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).slice(0, limit);
 
 	    const primary = {
