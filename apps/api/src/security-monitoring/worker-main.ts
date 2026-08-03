@@ -32,33 +32,76 @@ const l3RetryTimeoutMs = Math.max(
 );
 const l3Attempts = Math.max(1, Number(process.env.ANYSENTRY_L3_ATTEMPTS || 2));
 const runtimeModel = new RuntimeModelClient(role === 'l3' ? 'deep_investigation' : 'fast_review');
-let l3Pool: L3AgentPool | null = null;
-let l3PoolVersion = '';
+interface ManagedL3Pool {
+  pool: L3AgentPool;
+  version: string;
+  active: number;
+  retired: boolean;
+}
 
-async function currentL3Pool(skills: string): Promise<L3AgentPool> {
+let managedL3Pool: ManagedL3Pool | null = null;
+let l3PoolInitialization: Promise<ManagedL3Pool> | null = null;
+let l3PoolInitializationVersion = '';
+
+function retireL3Pool(managed: ManagedL3Pool | null): void {
+  if (!managed || managed.retired) return;
+  managed.retired = true;
+  if (managed.active === 0) void managed.pool.close();
+}
+
+async function acquireL3Pool(skills: string): Promise<{ pool: L3AgentPool; release: () => void }> {
   const model = runtimeModel.get();
   if (!model) throw new Error('深度研判模型缺少运行时凭据，请在策略配置中重新测试并应用');
-  if (l3Pool && l3PoolVersion === model.version) return l3Pool;
-  const previous = l3Pool;
-  const next = new L3AgentPool({
-    size: l3Concurrency,
-    timeoutMs: Math.max(l3RetryTimeoutMs, model.timeoutS * 1_000),
-    executionTimeoutMs: Math.max(1_000, Math.max(l3RetryTimeoutMs, model.timeoutS * 1_000) - 5_000),
-    maxJobsPerSession: 1,
-    maxSessionAgeMs: 30 * 60_000,
-    modelConfig: {
-      url: model.url,
-      model: model.model,
-      key: model.apiKey,
-      contextLimit: model.contextTokens,
+  let managed = managedL3Pool;
+  if (!managed || managed.version !== model.version || managed.retired) {
+    if (!l3PoolInitialization || l3PoolInitializationVersion !== model.version) {
+      l3PoolInitializationVersion = model.version;
+      l3PoolInitialization = (async () => {
+        const next = new L3AgentPool({
+          size: l3Concurrency,
+          timeoutMs: Math.max(l3RetryTimeoutMs, model.timeoutS * 1_000),
+          executionTimeoutMs: Math.max(1_000, Math.max(l3RetryTimeoutMs, model.timeoutS * 1_000) - 5_000),
+          maxJobsPerSession: 1,
+          maxSessionAgeMs: 30 * 60_000,
+          modelConfig: {
+            url: model.url,
+            model: model.model,
+            key: model.apiKey,
+            contextLimit: model.contextTokens,
+          },
+        });
+        try {
+          await next.initialize();
+          await next.prewarm(skills);
+          return { pool: next, version: model.version, active: 0, retired: false };
+        } catch (error) {
+          await next.close().catch(() => undefined);
+          throw error;
+        }
+      })().finally(() => {
+        if (l3PoolInitializationVersion === model.version) l3PoolInitialization = null;
+      });
+    }
+    const initialized = await l3PoolInitialization;
+    if (runtimeModel.get()?.version !== initialized.version) {
+      retireL3Pool(initialized);
+      return acquireL3Pool(skills);
+    }
+    retireL3Pool(managedL3Pool);
+    managedL3Pool = initialized;
+    managed = initialized;
+  }
+  managed.active += 1;
+  let released = false;
+  return {
+    pool: managed.pool,
+    release: () => {
+      if (released) return;
+      released = true;
+      managed.active = Math.max(0, managed.active - 1);
+      if (managed.retired && managed.active === 0) void managed.pool.close();
     },
-  });
-  await next.initialize();
-  await next.prewarm(skills);
-  l3Pool = next;
-  l3PoolVersion = model.version;
-  if (previous) await previous.close().catch(() => undefined);
-  return next;
+  };
 }
 
 type ThroughL1Result = {
@@ -279,6 +322,7 @@ async function l3Judge(job: Job<L3JudgeJob>): Promise<void> {
   const startedAt = Date.now();
   const input = job.data;
   const computedKey = 'anysentry:l3:computed:' + input.evaluationId;
+  let poolLease: Awaited<ReturnType<typeof acquireL3Pool>> | undefined;
   try {
     const cached = await resultRedis.get(computedKey);
     if (cached) {
@@ -287,10 +331,10 @@ async function l3Judge(job: Job<L3JudgeJob>): Promise<void> {
     }
     const agent = input.policy.agent;
     if (!agent || !input.policy.deepModel) throw new Error('L3 is not configured');
-    const pool = await currentL3Pool(agent.skills);
+    poolLease = await acquireL3Pool(agent.skills);
     const attempt = attemptNumber(job.attemptsMade);
     const attemptTimeoutMs = attempt === 1 ? l3TimeoutMs : l3RetryTimeoutMs;
-    const run = await pool.run(agent.skills, l3Prompt(input), (text) => {
+    const run = await poolLease.pool.run(agent.skills, l3Prompt(input), (text) => {
       // Validate inside the pool so an invalid response quarantines this Session before BullMQ
       // starts the retry. Agent response text is intentionally never written to service logs.
       parseL3Decision(text);
@@ -349,6 +393,8 @@ async function l3Judge(job: Job<L3JudgeJob>): Promise<void> {
       completedAt: Date.now(),
       attempt: attemptNumber(job.attemptsMade),
     });
+  } finally {
+    poolLease?.release();
   }
 }
 
@@ -359,7 +405,12 @@ async function main(): Promise<void> {
     runtimeModel.onChange(() => {
       const judges = [...l2JudgeCache.values()];
       l2JudgeCache.clear();
-      void Promise.all(judges.map((judge) => judge.close().catch(() => undefined)));
+      // Let in-flight requests finish on the old Agent. The old cache is unreachable for new jobs
+      // and is closed after the maximum supported request budget.
+      const timer = setTimeout(() => {
+        void Promise.all(judges.map((judge) => judge.close().catch(() => undefined)));
+      }, 10 * 60_000);
+      timer.unref();
     });
     worker = new Worker<FastJudgeJob>(FAST_JUDGE_QUEUE, fastJudge, {
       connection,
@@ -367,10 +418,8 @@ async function main(): Promise<void> {
     });
   } else if (role === 'l3') {
     runtimeModel.onChange(() => {
-      const previous = l3Pool;
-      l3Pool = null;
-      l3PoolVersion = '';
-      if (previous) void previous.close();
+      retireL3Pool(managedL3Pool);
+      managedL3Pool = null;
     });
     worker = new Worker<L3JudgeJob>(L3_JOBS_QUEUE, l3Judge, {
       connection,
@@ -383,7 +432,7 @@ async function main(): Promise<void> {
   console.log('AnySentry ' + role + ' worker started');
   const stop = async () => {
     await worker.close();
-    if (l3Pool) await l3Pool.close();
+    retireL3Pool(managedL3Pool);
     await Promise.all([...l2JudgeCache.values()].map((judge) => judge.close()));
     l2JudgeCache.clear();
     await Promise.all([resultQueue.close(), l3Queue.close(), runtimeModel.close()]);
