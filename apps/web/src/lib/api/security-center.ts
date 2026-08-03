@@ -2359,6 +2359,10 @@ export interface L2Config {
   timeoutS: number;
 }
 
+export interface DeepModelConfig extends L2Config {
+  contextTokens: number;
+}
+
 export interface L3Config {
   bin: string;
   skills: string;
@@ -2373,6 +2377,7 @@ export interface PolicyConfig {
   speculate: "off" | "low" | "medium" | "high";
   rules: L1Rule[];
   llm: L2Config | null;
+  deepModel: DeepModelConfig | null;
   agent: L3Config | null;
   identity: IdentityJudgmentPolicy;
 }
@@ -2387,6 +2392,58 @@ export interface PolicyStatus {
 export interface PolicyConfigResponse {
   policy: PolicyConfig;
   status: PolicyStatus;
+  connections: ModelConnectionStatuses;
+}
+
+export type ModelConnectionProfile = "fast_review" | "deep_investigation";
+export type PolicyConnectivityStatus =
+  | "connected"
+  | "unauthorized"
+  | "rate_limited"
+  | "timeout"
+  | "unreachable"
+  | "invalid_response";
+
+export interface PolicyConnectivityResult {
+  schemaVersion: "anysentry.judgment_connectivity_result.v2";
+  profile: ModelConnectionProfile;
+  ok: boolean;
+  status: PolicyConnectivityStatus;
+  checkedAt: string;
+  latencyMs: number;
+  runtime: "api-a3s-code-sdk";
+  endpoint: string;
+  model: string;
+  message: string;
+  testToken?: string;
+  expiresAt?: string;
+}
+
+export interface ModelConnectionStatus {
+  profile: ModelConnectionProfile;
+  state: "active" | "missing_credential";
+  keyConfigured: boolean;
+  source?: "runtime" | "environment";
+  endpoint?: string;
+  model?: string;
+  timeoutS?: number;
+  contextTokens?: number;
+  appliedAt?: string;
+  version?: string;
+}
+
+export interface ModelConnectionStatuses {
+  fast_review: ModelConnectionStatus;
+  deep_investigation: ModelConnectionStatus;
+}
+
+export interface ModelConnectionTestInput {
+  profile: ModelConnectionProfile;
+  url: string;
+  model: string;
+  apiKey: string;
+  timeoutS: number;
+  contextTokens: number;
 }
 
 export interface PlatformHealth {
@@ -2593,6 +2650,12 @@ export const securityCenterApi = {
   // and returns the resulting policy + tier status.
   setConfig: (policy: Partial<PolicyConfig>) =>
     apiClient.put<PolicyConfigResponse>("/security-center/config", policy),
+  testModelConnection: (input: ModelConnectionTestInput) =>
+    apiClient.post<PolicyConnectivityResult>("/security-center/config/model-connections/test", input),
+  applyModelConnection: (profile: ModelConnectionProfile, testToken: string) =>
+    apiClient.put<PolicyConfigResponse>(`/security-center/config/model-connections/${profile}`, { testToken }),
+  clearModelConnection: (profile: ModelConnectionProfile) =>
+    apiClient.post<PolicyConfigResponse>(`/security-center/config/model-connections/${profile}/clear`, {}),
   simulateConfig: (body: PolicySimulationRequest) =>
     apiClient.post<PolicySimulationResult>("/security-center/config/simulate", body),
 };
