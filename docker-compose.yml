@@ -68,10 +68,10 @@ services:
       ANYSENTRY_STREAM_DLQ_TOPIC: ${ANYSENTRY_STREAM_DLQ_TOPIC:-anysentry.stream.dlq.v1}
       A3S_SENTRY_LLM_URL: ${A3S_SENTRY_LLM_URL:-http://host.docker.internal:18051/v1}
       A3S_SENTRY_LLM_MODEL: ${A3S_SENTRY_LLM_MODEL:-glm-5.2}
-      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-proxy-managed}
+      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-}
       A3S_SENTRY_L3_URL: ${A3S_SENTRY_L3_URL:-http://host.docker.internal:18051/v1}
       A3S_SENTRY_L3_MODEL: ${A3S_SENTRY_L3_MODEL:-glm-5.2}
-      A3S_SENTRY_L3_KEY: ${A3S_SENTRY_L3_KEY:-proxy-managed}
+      A3S_SENTRY_L3_KEY: ${A3S_SENTRY_L3_KEY:-}
       ANYSENTRY_IDENTITY_REVIEW_TIMEOUT_MS: ${ANYSENTRY_IDENTITY_REVIEW_TIMEOUT_MS:-120000}
       ANYSENTRY_IDENTITY_REVIEW_LLM_TIMEOUT_MS: ${ANYSENTRY_IDENTITY_REVIEW_LLM_TIMEOUT_MS:-45000}
       ANYSENTRY_IDENTITY_REVIEW_PREFLIGHT_TIMEOUT_MS: ${ANYSENTRY_IDENTITY_REVIEW_PREFLIGHT_TIMEOUT_MS:-15000}
@@ -97,7 +97,7 @@ services:
       ANYSENTRY_L2_CONTEXT_TOKENS: ${ANYSENTRY_L2_CONTEXT_TOKENS:-16384}
       A3S_SENTRY_LLM_URL: ${A3S_SENTRY_LLM_URL:-http://host.docker.internal:18051/v1}
       A3S_SENTRY_LLM_MODEL: ${A3S_SENTRY_LLM_MODEL:-glm-5.2}
-      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-proxy-managed}
+      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -120,10 +120,10 @@ services:
       ANYSENTRY_L3_SKILLS: /opt/anysentry/skills
       A3S_SENTRY_LLM_URL: ${A3S_SENTRY_LLM_URL:-http://host.docker.internal:18051/v1}
       A3S_SENTRY_LLM_MODEL: ${A3S_SENTRY_LLM_MODEL:-glm-5.2}
-      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-proxy-managed}
+      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-}
       A3S_SENTRY_L3_URL: ${A3S_SENTRY_L3_URL:-http://host.docker.internal:18051/v1}
       A3S_SENTRY_L3_MODEL: ${A3S_SENTRY_L3_MODEL:-glm-5.2}
-      A3S_SENTRY_L3_KEY: ${A3S_SENTRY_L3_KEY:-proxy-managed}
+      A3S_SENTRY_L3_KEY: ${A3S_SENTRY_L3_KEY:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

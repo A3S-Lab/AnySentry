@@ -95,9 +95,11 @@ Two UI launch points (selected event and Agent asset) use one asynchronous backe
 dedicated queue and worker run a small `@a3s-lab/code` SDK Agent. No A3S CLI process or legacy L3
 bridge is allowed.
 
-The worker resolves provider configuration from enabled L3 settings first and enabled L2 settings
-second. If neither exists, or the selected model cannot perform tool calls, review is unavailable.
-Credentials are never persisted in a review result.
+The reviewer always uses the **fast-review model profile**, shared with L2 only at the connection
+level. It never falls back to the deep-investigation profile. L2 and identity review still create
+independent A3S Code Agents/Sessions, prompts, permission policies and histories. If the fast-review
+profile is unavailable, or the selected model cannot perform the required read-only tool calls,
+review is unavailable. Credentials are never persisted in a review result.
 
 The Agent receives only allowlisted read-only evidence tools:
 
@@ -139,6 +141,34 @@ The UI offers only valid human state transitions after displaying the recommenda
 6. Event-detail and Agent-asset UI launch points.
 7. Full builds, contracts, Docker/Kafka/Flink chain tests, real identity review and performance
    regression.
+
+## Runtime model connections
+
+The policy page exposes two operator-facing connections instead of one shared L2/L3 credential:
+
+| Connection | Consumers | Isolation |
+| --- | --- | --- |
+| 快速研判模型 | L2 structured judgment and AI identity assistance | shared endpoint/model/key, separate Agents, Sessions, prompts, histories and permissions |
+| 深度研判模型 | L3 deep-investigation Agent only | independent endpoint/model/key, timeout, context and Agent pool |
+
+URL, model, timeout and context limits are non-secret policy fields and may be persisted. API keys
+are runtime credentials: the browser sends a key only for a bounded connection test; after a
+successful test the operator may apply the tested connection. The API keeps the credential in
+process memory and distributes it to judgment workers only through Redis Pub/Sub. It must never be
+placed in BullMQ job data, Redis keys/lists/streams, ClickHouse, audit details, application logs, API
+responses, browser storage or persisted policy JSON.
+
+Redis Pub/Sub is deliberately used as an ephemeral control channel. Workers keep only the newest
+version in memory and rotate cached L2 judges or the L3 Agent pool when a profile version changes.
+Workers request the current snapshot when they start. API restart clears UI-provided credentials;
+deployment-injected environment credentials remain an explicit compatibility source. A missing
+runtime credential leaves L1 available and makes the affected higher tier visibly unavailable; it
+must not silently report a successful full judgment.
+
+Each profile has a compact test state: unconfigured, untested, testing, connected or failed. Failed
+tests return a bounded, redacted reason (authentication, rate limit, timeout, network or invalid
+response). A successful test returns a short-lived opaque apply token, never the key. Applying is
+hot and does not require restarting API, fast-judge or L3 workers.
 
 Each phase is committed separately. No branch is pushed and no package is published as part of local
 delivery.

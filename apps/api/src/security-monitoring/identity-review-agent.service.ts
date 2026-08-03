@@ -9,6 +9,7 @@ import { PolicyConfig } from './policy-config';
 import { cleanText } from './redaction';
 import { SentryJudgeService } from './sentry-judge.service';
 import { IdentityAiReviewRecord, IdentityAiReviewRequest, IdentityAiVerdict } from './types';
+import { RuntimeModelConfigService, RuntimeModelSnapshot } from './runtime-model-config';
 
 type ReviewSession = Pick<Session, 'send' | 'cancelAsync' | 'closeAsync'>;
 type ReviewAgent = { sessionAsync(workspace: string, options?: Parameters<Agent['sessionAsync']>[1]): Promise<ReviewSession>; close(): Promise<void> };
@@ -30,15 +31,21 @@ function normalizeBaseUrl(value: string): string {
   return value.trim().replace(/\/(?:chat\/completions|responses)\/?$/u, '');
 }
 
-export function identityReviewModelConfig(policy: PolicyConfig, env: NodeJS.ProcessEnv = process.env): ReviewModelConfig {
-  const url = normalizeBaseUrl(env.A3S_SENTRY_L3_URL || env.A3S_SENTRY_LLM_URL || policy.llm?.url || '');
-  const model = (env.A3S_SENTRY_L3_MODEL || env.A3S_SENTRY_LLM_MODEL || policy.llm?.model || '').trim();
-  if (!url || !model) throw new BadRequestException('请先配置 L2/L3 的模型地址和模型名称，AI 辅助审核不会调用 A3S CLI');
+export function identityReviewModelConfig(
+  policy: PolicyConfig,
+  env: NodeJS.ProcessEnv = process.env,
+  runtime?: RuntimeModelSnapshot | null,
+): ReviewModelConfig {
+  const url = normalizeBaseUrl(runtime?.url || env.A3S_SENTRY_LLM_URL || policy.llm?.url || '');
+  const model = (runtime?.model || env.A3S_SENTRY_LLM_MODEL || policy.llm?.model || '').trim();
+  const key = runtime?.apiKey || env.A3S_SENTRY_LLM_KEY || '';
+  if (!url || !model) throw new BadRequestException('请先配置快速研判模型，AI 辅助审核不会调用 A3S CLI');
+  if (!key.trim()) throw new BadRequestException('快速研判模型的运行时 API Key 已失效，请重新测试并应用');
   return {
     url,
     model,
-    key: env.A3S_SENTRY_L3_KEY || env.A3S_SENTRY_LLM_KEY || '',
-    context: positiveInt(env.ANYSENTRY_IDENTITY_REVIEW_CONTEXT_TOKENS, 24_576, 131_072),
+    key,
+    context: runtime?.contextTokens ?? positiveInt(env.ANYSENTRY_IDENTITY_REVIEW_CONTEXT_TOKENS, 24_576, 131_072),
   };
 }
 
@@ -178,6 +185,7 @@ export class IdentityReviewAgentService implements OnModuleInit, OnModuleDestroy
   constructor(
     private readonly evidence: IdentityEvidenceService,
     private readonly judge: SentryJudgeService,
+    private readonly runtimeModels: RuntimeModelConfigService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -239,7 +247,11 @@ export class IdentityReviewAgentService implements OnModuleInit, OnModuleDestroy
     const createdAt = new Date().toISOString();
     let runningRecord: IdentityAiReviewRecord | undefined;
     try {
-      const config = identityReviewModelConfig(this.judge.getPolicy().policy);
+      const config = identityReviewModelConfig(
+        this.judge.getPolicy().policy,
+        process.env,
+        this.runtimeModels.get('fast_review'),
+      );
       bundle = await this.evidence.stage(input);
       runningRecord = {
         schemaVersion: 'anysentry.identity_ai_review.v1',

@@ -25,6 +25,7 @@
     "verify:l2-code-judge": "node scripts/verify-l2-code-judge.mjs",
     "verify:l2-code-judge:local": "pnpm build:api && pnpm verify:l2-code-judge",
     "verify:l2-runtime": "node scripts/verify-l2-runtime.mjs",
+    "verify:policy-connectivity": "pnpm build:api && node scripts/verify-policy-connectivity.mjs",
     "verify:identity-judgment-routing": "pnpm build:api && node scripts/verify-identity-judgment-routing.mjs",
     "verify:identity-routing-runtime": "node scripts/verify-identity-routing-runtime.mjs",
     "verify:event-visibility": "pnpm build:api && node scripts/verify-event-visibility.mjs",

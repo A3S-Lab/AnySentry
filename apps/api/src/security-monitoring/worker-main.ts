@@ -15,6 +15,7 @@ import { isL3AgentTimeout, L3AgentPool } from './l3-agent-pool';
 import { L2CodeJudge } from './l2-code-judge';
 import { parseL3Decision } from './l3-decision-parser';
 import { buildFastAcl } from './policy-config';
+import { RuntimeModelClient } from './runtime-model-config';
 
 const role = process.env.ANYSENTRY_WORKER_ROLE;
 const connection = redisConnection();
@@ -23,7 +24,6 @@ const l3Queue = new Queue<L3JudgeJob>(L3_JOBS_QUEUE, { connection });
 const resultRedis = new IORedis(process.env.ANYSENTRY_REDIS_URL || 'redis://redis:6379/0', { maxRetriesPerRequest: null });
 const sentryCache = new Map<string, Sentry>();
 const l2JudgeCache = new Map<string, L2CodeJudge>();
-const l2ModelOverride = process.env.ANYSENTRY_L2_MODEL?.trim();
 const l3Concurrency = Number(process.env.ANYSENTRY_L3_CONCURRENCY || 2);
 const l3TimeoutMs = Number(process.env.ANYSENTRY_L3_TIMEOUT_MS || 60_000);
 const l3RetryTimeoutMs = Math.max(
@@ -31,16 +31,35 @@ const l3RetryTimeoutMs = Math.max(
   Number(process.env.ANYSENTRY_L3_RETRY_TIMEOUT_MS || l3TimeoutMs),
 );
 const l3Attempts = Math.max(1, Number(process.env.ANYSENTRY_L3_ATTEMPTS || 2));
-const l3Pool = role === 'l3'
-  ? new L3AgentPool({
-      size: l3Concurrency,
-      timeoutMs: l3RetryTimeoutMs,
-      executionTimeoutMs: Math.max(1_000, l3RetryTimeoutMs - 5_000),
-      // Reuse the process-wide Agent, but never reuse a Session/Memory Store across events.
-      maxJobsPerSession: 1,
-      maxSessionAgeMs: 30 * 60_000,
-    })
-  : null;
+const runtimeModel = new RuntimeModelClient(role === 'l3' ? 'deep_investigation' : 'fast_review');
+let l3Pool: L3AgentPool | null = null;
+let l3PoolVersion = '';
+
+async function currentL3Pool(skills: string): Promise<L3AgentPool> {
+  const model = runtimeModel.get();
+  if (!model) throw new Error('深度研判模型缺少运行时凭据，请在策略配置中重新测试并应用');
+  if (l3Pool && l3PoolVersion === model.version) return l3Pool;
+  const previous = l3Pool;
+  const next = new L3AgentPool({
+    size: l3Concurrency,
+    timeoutMs: Math.max(l3RetryTimeoutMs, model.timeoutS * 1_000),
+    executionTimeoutMs: Math.max(1_000, Math.max(l3RetryTimeoutMs, model.timeoutS * 1_000) - 5_000),
+    maxJobsPerSession: 1,
+    maxSessionAgeMs: 30 * 60_000,
+    modelConfig: {
+      url: model.url,
+      model: model.model,
+      key: model.apiKey,
+      contextLimit: model.contextTokens,
+    },
+  });
+  await next.initialize();
+  await next.prewarm(skills);
+  l3Pool = next;
+  l3PoolVersion = model.version;
+  if (previous) await previous.close().catch(() => undefined);
+  return next;
+}
 
 type ThroughL1Result = {
   l1Decision: AsyncDecision;
@@ -78,7 +97,7 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
             ...input.policy,
             llm: {
               ...input.policy.llm,
-              model: l2ModelOverride || input.policy.llm.model,
+              model: input.policy.llm.model,
               timeoutS: Math.min(input.policy.llm.timeoutS, 60),
             },
           }
@@ -118,16 +137,19 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
     }
     const llm = input.policy.llm;
     if (!llm) throw new Error('L2 policy disappeared while dispatching the model request');
-    let l2Judge = l2JudgeCache.get(input.policyVersion);
+    const runtime = runtimeModel.get();
+    if (!runtime) throw new Error('快速研判模型缺少运行时凭据，请在策略配置中重新测试并应用');
+    const judgeCacheKey = `${input.policyVersion}:${runtime.version}`;
+    let l2Judge = l2JudgeCache.get(judgeCacheKey);
     if (!l2Judge) {
       l2Judge = new L2CodeJudge({
-        url: process.env.A3S_SENTRY_LLM_URL || llm.url,
-        model: l2ModelOverride || process.env.A3S_SENTRY_LLM_MODEL || llm.model,
-        key: process.env.A3S_SENTRY_LLM_KEY || '',
-        timeoutMs: Math.min(llm.timeoutS * 1_000, 60_000),
-        contextLimit: Number(process.env.ANYSENTRY_L2_CONTEXT_TOKENS || 16_384),
+        url: runtime.url,
+        model: runtime.model,
+        key: runtime.apiKey,
+        timeoutMs: Math.min(runtime.timeoutS, llm.timeoutS) * 1_000,
+        contextLimit: runtime.contextTokens,
       });
-      l2JudgeCache.set(input.policyVersion, l2Judge);
+      l2JudgeCache.set(judgeCacheKey, l2Judge);
       if (l2JudgeCache.size > 8) {
         const oldest = l2JudgeCache.keys().next().value as string;
         const evicted = l2JudgeCache.get(oldest);
@@ -145,7 +167,8 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
     if (
       decision.verdict === 'escalate' &&
       input.routing.maxTier === 'L3' &&
-      input.policy.agent
+      input.policy.agent &&
+      input.policy.deepModel
     ) {
       const l3Job: L3JudgeJob = {
         schemaVersion: 'anysentry.l3_judge_job.v1',
@@ -263,10 +286,11 @@ async function l3Judge(job: Job<L3JudgeJob>): Promise<void> {
       return;
     }
     const agent = input.policy.agent;
-    if (!agent || !l3Pool) throw new Error('L3 is not configured');
+    if (!agent || !input.policy.deepModel) throw new Error('L3 is not configured');
+    const pool = await currentL3Pool(agent.skills);
     const attempt = attemptNumber(job.attemptsMade);
     const attemptTimeoutMs = attempt === 1 ? l3TimeoutMs : l3RetryTimeoutMs;
-    const run = await l3Pool.run(agent.skills, l3Prompt(input), (text) => {
+    const run = await pool.run(agent.skills, l3Prompt(input), (text) => {
       // Validate inside the pool so an invalid response quarantines this Session before BullMQ
       // starts the retry. Agent response text is intentionally never written to service logs.
       parseL3Decision(text);
@@ -329,17 +353,26 @@ async function l3Judge(job: Job<L3JudgeJob>): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  await runtimeModel.initialize();
   let worker: Worker<FastJudgeJob | L3JudgeJob>;
   if (role === 'fast') {
+    runtimeModel.onChange(() => {
+      const judges = [...l2JudgeCache.values()];
+      l2JudgeCache.clear();
+      void Promise.all(judges.map((judge) => judge.close().catch(() => undefined)));
+    });
     worker = new Worker<FastJudgeJob>(FAST_JUDGE_QUEUE, fastJudge, {
       connection,
       concurrency: Number(process.env.ANYSENTRY_FAST_JUDGE_CONCURRENCY || 4),
     });
   } else if (role === 'l3') {
-    if (!l3Pool) throw new Error('L3 agent pool was not initialized');
-    await l3Pool.initialize();
-    await l3Pool.prewarm(process.env.ANYSENTRY_L3_SKILLS || '/opt/anysentry/skills');
-    worker = new Worker<L3JudgeJob>(L3_JOBS_QUEUE, (job) => l3Judge(job), {
+    runtimeModel.onChange(() => {
+      const previous = l3Pool;
+      l3Pool = null;
+      l3PoolVersion = '';
+      if (previous) void previous.close();
+    });
+    worker = new Worker<L3JudgeJob>(L3_JOBS_QUEUE, l3Judge, {
       connection,
       concurrency: l3Concurrency,
     });
@@ -353,7 +386,7 @@ async function main(): Promise<void> {
     if (l3Pool) await l3Pool.close();
     await Promise.all([...l2JudgeCache.values()].map((judge) => judge.close()));
     l2JudgeCache.clear();
-    await Promise.all([resultQueue.close(), l3Queue.close()]);
+    await Promise.all([resultQueue.close(), l3Queue.close(), runtimeModel.close()]);
     resultRedis.disconnect();
     process.exit(0);
   };

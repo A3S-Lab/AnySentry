@@ -27,6 +27,7 @@ assert.equal(resolveJudgmentRoute('probable_agent', candidateL1).reason, 'candid
 const full = sanitizePolicy({
   identity: { candidatePipeline: 'full' },
   llm: { url: 'http://127.0.0.1:1/v1', model: 'test', timeoutS: 1 },
+  deepModel: { url: 'http://127.0.0.1:2/v1', model: 'deep-test', timeoutS: 2, contextTokens: 32768 },
   agent: { bin: '/opt/anysentry/l3-agent.mjs', skills: '/opt/anysentry/skills' },
 });
 assert.equal(resolveJudgmentRoute('confirmed_agent', full).maxTier, 'L3');

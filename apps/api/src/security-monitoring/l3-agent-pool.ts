@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Agent, FileMemoryStore, Session, SessionOptions } from '@a3s-lab/code';
-import { buildA3sCodeModelAcl, sharedModelConfig } from './a3s-code-model-config';
+import { A3sCodeModelConfig, buildA3sCodeModelAcl, deepInvestigationModelConfig } from './a3s-code-model-config';
 
 type L3Session = Pick<Session, 'send' | 'cancelAsync' | 'closeAsync'>;
 
@@ -20,6 +20,7 @@ export interface L3AgentPoolOptions {
   workspace?: string;
   agentFactory?: (acl: string) => Promise<L3Agent>;
   env?: NodeJS.ProcessEnv;
+  modelConfig?: Pick<A3sCodeModelConfig, 'url' | 'model' | 'key' | 'contextLimit'>;
 }
 
 export interface L3AgentRunResult {
@@ -52,9 +53,12 @@ function positiveInt(value: number, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
-export function buildL3AgentAcl(env: NodeJS.ProcessEnv = process.env): string {
-  const { url, key, model } = sharedModelConfig(env);
-  const contextLimit = positiveInt(Number(env.ANYSENTRY_L3_CONTEXT_TOKENS), 32_768);
+export function buildL3AgentAcl(
+  env: NodeJS.ProcessEnv = process.env,
+  override?: Pick<A3sCodeModelConfig, 'url' | 'model' | 'key' | 'contextLimit'>,
+): string {
+  const { url, key, model } = override ?? deepInvestigationModelConfig(env);
+  const contextLimit = positiveInt(Number(override?.contextLimit ?? env.ANYSENTRY_L3_CONTEXT_TOKENS), 32_768);
   return buildA3sCodeModelAcl({
     id: 'sentry-l3',
     name: 'Sentry L3 Security Investigator',
@@ -280,7 +284,7 @@ export class L3AgentPool {
       workspace: options.workspace || '.',
     };
     this.agentFactory = options.agentFactory ?? (async (acl) => Agent.create(acl));
-    this.acl = buildL3AgentAcl(options.env);
+    this.acl = buildL3AgentAcl(options.env, options.modelConfig);
   }
 
   async initialize(): Promise<void> {

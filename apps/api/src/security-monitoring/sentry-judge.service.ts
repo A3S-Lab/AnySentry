@@ -8,6 +8,7 @@ import { DEFAULT_POLICY, PolicyConfig, buildFastAcl, policyConfigError, sanitize
 import { cleanText } from './redaction';
 import { DecisionResultJob, FastJudgeJob } from './async-judgment.types';
 import { JudgmentQueueService } from './judgment-queue.service';
+import { RuntimeModelConfigService } from './runtime-model-config';
 import { resolveJudgmentRoute } from './identity-judgment-routing';
 import { CollectorHeartbeatRecord, CollectorHeartbeatRequest, EventCategory, EventMeta, IdentityAiReviewRecord, Incident, IncidentStatus, JudgedEvent, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
 
@@ -242,7 +243,12 @@ function producerReportedFinding(base: JudgedEventBase): {
 
 @Injectable()
 export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
-  constructor(private readonly alerting: AlertingService, private readonly attributionService: AgentAttributionService, private readonly queues: JudgmentQueueService) {}
+  constructor(
+    private readonly alerting: AlertingService,
+    private readonly attributionService: AgentAttributionService,
+    private readonly queues: JudgmentQueueService,
+    private readonly runtimeModels: RuntimeModelConfigService,
+  ) {}
 
   private sentry!: Sentry;
   // In-memory hot ring: the dashboard's fast, synchronous read/aggregation path. Durability + retention
@@ -311,7 +317,16 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
 
   /** The current policy + which tiers are active (the config panel reads this). */
   getPolicy(): { policy: PolicyConfig; status: ReturnType<typeof tierStatus> } {
-    return { policy: this.policy, status: tierStatus(this.policy) };
+    return { policy: this.policy, status: this.availableTiers() };
+  }
+
+  private availableTiers(): ReturnType<typeof tierStatus> {
+    const configured = tierStatus(this.policy);
+    return {
+      l1: true,
+      l2: configured.l2 && Boolean(this.runtimeModels.get('fast_review')),
+      l3: configured.l3 && Boolean(this.runtimeModels.get('deep_investigation')),
+    };
   }
 
   storageStatus(): { mode: 'clickhouse' | 'memory'; clickhouseConfigured: boolean; clickhouseReady: boolean } {
@@ -450,7 +465,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   async accept(line: string, meta: EventMeta, at = Date.now()): Promise<JudgedEvent | null> {
     if (!this.queues.enabled) return this.judge(line, meta, at);
     const base = this.eventBase(line, meta, at);
-    const routing = resolveJudgmentRoute(base.attribution?.classification, this.policy);
+    const routing = resolveJudgmentRoute(base.attribution?.classification, this.policy, this.availableTiers());
     if (routing.profile === 'discard') return null;
     if (this.isInternalL3Invocation(line, base)) return this.recordInternalL3Activity(base);
     const producerFinding = producerReportedFinding(base);
@@ -646,7 +661,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       rawPreview: meta.rawPreview,
     } satisfies JudgedEventBase;
 
-    const routing = resolveJudgmentRoute(attribution?.classification, this.policy);
+    const routing = resolveJudgmentRoute(attribution?.classification, this.policy, this.availableTiers());
     if (routing.profile === 'discard') return null;
     const policyVersion = this.policyVersion();
     if (this.isInternalL3Invocation(line, base)) return this.recordInternalL3Activity(base);

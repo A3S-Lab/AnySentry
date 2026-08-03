@@ -22,9 +22,15 @@ const policy = {
 };
 const normalizedPolicy = sanitizePolicy(policy);
 assert.equal(normalizedPolicy.llm?.url, 'https://llm.example/v1');
-const config = identityReviewModelConfig(policy, {});
+const config = identityReviewModelConfig(policy, {
+  A3S_SENTRY_LLM_KEY: 'fast-review-test-key',
+  A3S_SENTRY_L3_URL: 'https://must-not-be-used.example/v1',
+  A3S_SENTRY_L3_MODEL: 'must-not-be-used',
+  A3S_SENTRY_L3_KEY: 'deep-key-must-not-be-used',
+});
 assert.equal(config.url, 'https://llm.example/v1');
 assert.equal(config.model, 'review-model');
+assert.equal(config.key, 'fast-review-test-key');
 const acl = buildIdentityReviewAcl(config);
 assert.match(acl, /default_model = "openai\/review-model"/u);
 assert.match(acl, /baseUrl = "https:\/\/llm\.example\/v1"/u);

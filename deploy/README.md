@@ -66,6 +66,26 @@ kubectl -n anysentry create secret generic anysentry-clickhouse \
   --from-literal=CLICKHOUSE_PASSWORD='change-me'
 ```
 
+L2/L3 model keys are deployment secrets too: do not put them in the policy document or a
+ConfigMap. When Redis plus asynchronous judgment workers are installed, create a dedicated Secret
+and expose it to every process that actually calls the model:
+
+```bash
+kubectl -n anysentry create secret generic anysentry-model-credentials \
+  --from-literal=A3S_SENTRY_LLM_KEY='<fast-review-key>' \
+  --from-literal=A3S_SENTRY_L3_KEY='<deep-investigation-key>'
+
+kubectl -n anysentry set env deployment/anysentry --from=secret/anysentry-model-credentials
+kubectl -n anysentry set env deployment/fast-judge --from=secret/anysentry-model-credentials
+kubectl -n anysentry set env deployment/l3-worker --from=secret/anysentry-model-credentials
+```
+
+Set model URLs and IDs separately through normal deployment configuration. L2 and AI identity
+review use only `A3S_SENTRY_LLM_*`; L3 uses only `A3S_SENTRY_L3_*`. Operators can instead test and
+apply either connection in the policy page. UI-provided keys remain memory-only and are synchronized
+to workers through Redis Pub/Sub, so they must be entered again after the API restarts. The secret
+value is never returned to the browser.
+
 ## 3. Deploy AnySentry (+ bundled ClickHouse)
 
 ```bash

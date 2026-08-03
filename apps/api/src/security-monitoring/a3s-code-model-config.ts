@@ -47,10 +47,18 @@ export function buildA3sCodeModelAcl(config: A3sCodeModelConfig): string {
   ].join('\n');
 }
 
-export function sharedModelConfig(env: NodeJS.ProcessEnv = process.env): Pick<A3sCodeModelConfig, 'url' | 'model' | 'key'> {
+export function fastReviewModelConfig(env: NodeJS.ProcessEnv = process.env): Pick<A3sCodeModelConfig, 'url' | 'model' | 'key'> {
   return {
-    url: env.A3S_SENTRY_LLM_URL || env.A3S_SENTRY_L3_URL || 'http://localhost:18051/v1',
-    model: env.A3S_SENTRY_LLM_MODEL || env.A3S_SENTRY_L3_MODEL || 'glm-5.2',
-    key: env.A3S_SENTRY_LLM_KEY || env.A3S_SENTRY_L3_KEY || '',
+    url: env.A3S_SENTRY_LLM_URL || 'http://localhost:18051/v1',
+    model: env.A3S_SENTRY_LLM_MODEL || 'glm-5.2',
+    key: env.A3S_SENTRY_LLM_KEY || '',
+  };
+}
+
+export function deepInvestigationModelConfig(env: NodeJS.ProcessEnv = process.env): Pick<A3sCodeModelConfig, 'url' | 'model' | 'key'> {
+  return {
+    url: env.A3S_SENTRY_L3_URL || 'http://localhost:18051/v1',
+    model: env.A3S_SENTRY_L3_MODEL || 'glm-5.2',
+    key: env.A3S_SENTRY_L3_KEY || '',
   };
 }

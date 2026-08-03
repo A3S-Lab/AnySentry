@@ -10,9 +10,10 @@ export function effectiveClassification(classification?: AgentClassification): A
 export function resolveJudgmentRoute(
   classification: AgentClassification | undefined,
   policy: PolicyConfig,
+  availableTiers: ReturnType<typeof tierStatus> = tierStatus(policy),
 ): JudgmentRoutingSnapshot {
   const resolved = effectiveClassification(classification);
-  const status = tierStatus(policy);
+  const status = availableTiers;
   if (resolved === 'non_agent') {
     return {
       classification: resolved,

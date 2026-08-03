@@ -22,6 +22,7 @@ export interface L1Rule {
   action?: RuleAction;
 }
 export interface L2Config { url: string; model: string; timeoutS: number } // Provider base URL routed by A3S Code
+export interface DeepModelConfig extends L2Config { contextTokens: number }
 /** `bin` is retained for policy compatibility; the async L3 worker uses the in-process SDK. */
 export interface L3Config { bin: string; skills: string }
 export interface IdentityJudgmentPolicy { candidatePipeline: 'full' | 'l1_only' }
@@ -32,6 +33,7 @@ export interface PolicyConfig {
   speculate: 'off' | 'low' | 'medium' | 'high';
   rules: L1Rule[];
   llm: L2Config | null;
+  deepModel: DeepModelConfig | null;
   agent: L3Config | null;
   identity: IdentityJudgmentPolicy;
 }
@@ -58,6 +60,7 @@ export const DEFAULT_POLICY: PolicyConfig = {
   speculate: 'off',
   rules: [],
   llm: null,
+  deepModel: null,
   agent: null,
   identity: { candidatePipeline: 'full' },
 };
@@ -102,6 +105,17 @@ export function sanitizePolicy(input: unknown): PolicyConfig {
   const llmUrl = normalizeLlmBaseUrl(str(llmIn?.url, 500));
   const llm: L2Config | null = llmIn && llmUrl ? { url: llmUrl, model: str(llmIn.model, 100) || 'default', timeoutS: num(llmIn.timeoutS, 1, 600, 60) } : null;
 
+  const deepModelIn = o.deepModel as Record<string, unknown> | null | undefined;
+  const deepModelUrl = normalizeLlmBaseUrl(str(deepModelIn?.url, 500));
+  const deepModel: DeepModelConfig | null = deepModelIn && deepModelUrl
+    ? {
+        url: deepModelUrl,
+        model: str(deepModelIn.model, 100) || 'default',
+        timeoutS: num(deepModelIn.timeoutS, 1, 600, 90),
+        contextTokens: num(deepModelIn.contextTokens, 4_096, 262_144, 32_768),
+      }
+    : null;
+
   const agentIn = o.agent as Record<string, unknown> | null | undefined;
   const agent: L3Config | null = agentIn && str(agentIn.bin) ? { bin: str(agentIn.bin, 500), skills: str(agentIn.skills, 500) } : null;
 
@@ -110,7 +124,7 @@ export function sanitizePolicy(input: unknown): PolicyConfig {
     candidatePipeline: pick(identityIn?.candidatePipeline, ['full', 'l1_only'], 'full'),
   };
 
-  return { failClosed: o.failClosed === true, speculate: pick(o.speculate, ['off', 'low', 'medium', 'high'], 'off'), rules, llm, agent, identity };
+  return { failClosed: o.failClosed === true, speculate: pick(o.speculate, ['off', 'low', 'medium', 'high'], 'off'), rules, llm, deepModel, agent, identity };
 }
 
 /** HCL double-quoted string. */
@@ -146,5 +160,5 @@ export function buildFastAcl(c: PolicyConfig, secrets: PolicyRuntimeSecrets = {}
 
 /** Which tiers the dashboard should show (`如果没配置就前端不展示`). L1 is always active (built-ins). */
 export function tierStatus(c: PolicyConfig): { l1: boolean; l2: boolean; l3: boolean } {
-  return { l1: true, l2: !!c.llm, l3: !!c.agent };
+  return { l1: true, l2: !!c.llm, l3: !!c.agent && !!c.deepModel };
 }

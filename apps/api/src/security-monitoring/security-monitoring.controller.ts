@@ -8,15 +8,17 @@ import { AlertingService } from './alerting.service';
 import { AuditService } from './audit.service';
 import { IngestionSourceResolution, IngestionSourceService } from './ingestion-source.service';
 import { IdentityReviewAgentService } from './identity-review-agent.service';
+import { testDeepInvestigationConnection, testFastReviewConnection } from './judgment-connectivity';
 import { KubeIdentityService } from './kube-identity.service';
 import { managementAuthConfigured, ManagementAuthGuard, RequireManagementAuth } from './management-auth.guard';
 import { MaintenanceWindowService } from './maintenance-window.service';
 import { NotificationService } from './notification.service';
 import { ObjectiveService } from './objective.service';
-import { PolicyConfigError } from './policy-config';
+import { PolicyConfigError, sanitizePolicy } from './policy-config';
 import { RemediationService } from './remediation.service';
 import { SentryJudgeService } from './sentry-judge.service';
 import { StreamingFindingService } from './streaming-finding.service';
+import { RuntimeModelConfigService, RuntimeModelProfile, sanitizeRuntimeModelConnection } from './runtime-model-config';
 import { StreamingQueueService } from './streaming-queue.service';
 import { SupplyChainService } from './supply-chain.service';
 import {
@@ -2681,12 +2683,18 @@ export class SecurityMonitoringController {
     private readonly notifications: NotificationService,
     private readonly objectives: ObjectiveService,
     private readonly judge: SentryJudgeService,
+    private readonly runtimeModels: RuntimeModelConfigService,
     private readonly kube: KubeIdentityService,
     private readonly streaming: StreamingQueueService,
     private readonly streamFindings: StreamingFindingService,
     private readonly supplyChain: SupplyChainService,
     private readonly identityReview: IdentityReviewAgentService,
   ) {}
+
+  private modelProfile(value: string): RuntimeModelProfile {
+    if (value === 'fast_review' || value === 'deep_investigation') return value;
+    throw new BadRequestException('unknown model connection profile');
+  }
 
   private requireWorkspaceScanner(
     headers: Record<string, string | string[] | undefined>,
@@ -4200,7 +4208,7 @@ export class SecurityMonitoringController {
    *  config panels read this; the dashboard hides tiers that aren't configured. */
   @Get('config')
   getConfig() {
-    return this.judge.getPolicy();
+    return { ...this.judge.getPolicy(), connections: this.runtimeModels.statuses() };
   }
 
   /** Apply + persist a new policy: rebuilds the sentry ACL and recreates the judge in place. */
@@ -4212,6 +4220,14 @@ export class SecurityMonitoringController {
       updated = await this.judge.setPolicy(body);
     } catch (error) {
       throw policyBadRequest(error);
+    }
+    const fast = this.runtimeModels.get('fast_review');
+    const deep = this.runtimeModels.get('deep_investigation');
+    if (fast && (!updated.policy.llm || fast.url !== updated.policy.llm.url || fast.model !== updated.policy.llm.model)) {
+      await this.runtimeModels.clear('fast_review');
+    }
+    if (deep && (!updated.policy.deepModel || deep.url !== updated.policy.deepModel.url || deep.model !== updated.policy.deepModel.model)) {
+      await this.runtimeModels.clear('deep_investigation');
     }
     this.audit.record({
       actor: auditActor(headers),
@@ -4228,7 +4244,105 @@ export class SecurityMonitoringController {
         status: updated.status,
       },
     });
-    return updated;
+    return { ...updated, connections: this.runtimeModels.statuses() };
+  }
+
+  @Get('config/model-connections')
+  @RequireManagementAuth()
+  modelConnectionStatus() {
+    return this.runtimeModels.statuses();
+  }
+
+  /** Test one exact connection through the same in-process A3S Code SDK used by judgment. The key
+   *  remains in API memory and the response contains only a short-lived opaque apply token. */
+  @Post('config/model-connections/test')
+  @RequireManagementAuth()
+  @HttpCode(200)
+  async testModelConnection(@Body() body: unknown) {
+    const input = body && typeof body === 'object' && !Array.isArray(body)
+      ? body as Record<string, unknown>
+      : {};
+    const profile = input.profile === 'fast_review' || input.profile === 'deep_investigation'
+      ? input.profile
+      : undefined;
+    if (!profile) throw new BadRequestException('profile must be fast_review or deep_investigation');
+    let connection;
+    try {
+      connection = sanitizeRuntimeModelConnection({
+        url: typeof input.url === 'string' ? input.url : '',
+        model: typeof input.model === 'string' ? input.model : '',
+        apiKey: typeof input.apiKey === 'string' ? input.apiKey : '',
+        timeoutS: Number(input.timeoutS),
+        contextTokens: Number(input.contextTokens),
+      }, profile);
+    } catch (error) {
+      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+    }
+    const result = profile === 'fast_review'
+      ? await testFastReviewConnection(connection)
+      : await testDeepInvestigationConnection(
+          connection,
+          this.judge.getPolicy().policy.agent?.skills || process.env.ANYSENTRY_L3_SKILLS || '/opt/anysentry/skills',
+        );
+    if (!result.ok) return result;
+    return { ...result, ...this.runtimeModels.rememberSuccessfulTest(profile, connection) };
+  }
+
+  @Put('config/model-connections/:profile')
+  @RequireManagementAuth()
+  async applyModelConnection(
+    @Param('profile') profileText: string,
+    @Body() body: unknown,
+    @Headers() headers: HeaderBag,
+  ) {
+    const profile = this.modelProfile(profileText);
+    const input = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
+    const testToken = typeof input.testToken === 'string' ? input.testToken : '';
+    let snapshot;
+    try {
+      const connection = this.runtimeModels.consumeSuccessfulTest(profile, testToken);
+      const current = this.judge.getPolicy().policy;
+      await this.judge.setPolicy(profile === 'fast_review'
+        ? { ...current, llm: { url: connection.url, model: connection.model, timeoutS: connection.timeoutS } }
+        : {
+            ...current,
+            deepModel: {
+              url: connection.url,
+              model: connection.model,
+              timeoutS: connection.timeoutS,
+              contextTokens: connection.contextTokens,
+            },
+          });
+      snapshot = await this.runtimeModels.activate(profile, connection);
+    } catch (error) {
+      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+    }
+    this.audit.record({
+      actor: auditActor(headers),
+      action: 'policy.updated',
+      resourceType: 'policy',
+      resourceId: profile,
+      summary: `${profile === 'fast_review' ? 'Fast review' : 'Deep investigation'} model connection applied`,
+      details: { profile, endpoint: snapshot.url, model: snapshot.model, source: snapshot.source },
+    });
+    return { ...this.judge.getPolicy(), connections: this.runtimeModels.statuses() };
+  }
+
+  @Post('config/model-connections/:profile/clear')
+  @RequireManagementAuth()
+  @HttpCode(200)
+  async clearModelConnection(@Param('profile') profileText: string, @Headers() headers: HeaderBag) {
+    const profile = this.modelProfile(profileText);
+    await this.runtimeModels.clear(profile);
+    this.audit.record({
+      actor: auditActor(headers),
+      action: 'policy.updated',
+      resourceType: 'policy',
+      resourceId: profile,
+      summary: `${profile === 'fast_review' ? 'Fast review' : 'Deep investigation'} runtime credential cleared`,
+      details: { profile },
+    });
+    return { ...this.judge.getPolicy(), connections: this.runtimeModels.statuses() };
   }
 
   @Post('config/simulate')

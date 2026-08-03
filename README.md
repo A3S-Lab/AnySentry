@@ -128,6 +128,14 @@ Judgment can run in two deployment modes:
 
 L1 rules are enabled by default. L2 and L3 remain inactive until their policy and model backends are explicitly configured; L3 follows an unresolved L2 escalation rather than severity alone.
 
+The policy page provides independent **快速研判模型** and **深度研判模型** connections. A key is
+accepted only for a bounded A3S Code connection test and, after explicit apply, remains in process
+memory; it is never saved in PolicyConfig, ClickHouse, Redis data structures, logs, responses or
+browser storage. Applied credentials are delivered to workers through non-persistent Redis Pub/Sub
+and take effect without restart. L2 and AI identity review share the fast connection, while L3 uses
+only the deep connection. Deployment-injected `A3S_SENTRY_LLM_*` (fast) and `A3S_SENTRY_L3_*`
+(deep) variables remain supported as independent restart-surviving compatibility sources.
+
 Judged events use an in-memory hot ring for current reads and ClickHouse for durable analytics. Without `CLICKHOUSE_URL`, AnySentry continues in memory but does not preserve state across restarts.
 
 ## Progressive API for AI agents

@@ -2,7 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { L2CodeJudge, isL2CodeJudgeTimeout } from '../apps/api/dist/security-monitoring/l2-code-judge.js';
-import { buildA3sCodeModelAcl, sharedModelConfig } from '../apps/api/dist/security-monitoring/a3s-code-model-config.js';
+import { buildA3sCodeModelAcl, fastReviewModelConfig } from '../apps/api/dist/security-monitoring/a3s-code-model-config.js';
 
 const state = { agents: 0, closes: 0, sessions: 0, sessionCloses: 0, calls: [], options: [] };
 const judge = new L2CodeJudge({
@@ -84,7 +84,7 @@ const acl = buildA3sCodeModelAcl({
 assert.match(acl, /baseUrl = "https:\/\/api\.deepseek\.com"/);
 assert.match(acl, /default_model = "openai\/deepseek-v4-flash"/);
 assert.deepEqual(
-  sharedModelConfig({
+  fastReviewModelConfig({
     A3S_SENTRY_LLM_URL: 'https://shared.example',
     A3S_SENTRY_LLM_MODEL: 'shared-model',
     A3S_SENTRY_LLM_KEY: 'shared-key',
