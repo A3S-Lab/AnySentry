@@ -1376,18 +1376,18 @@ function cvssExplanation(vector?: string) {
       impact: "需结合漏洞说明人工确认影响",
     };
   }
-  const metrics = Object.fromEntries(vector.split("/").slice(1).map((part) => part.split(":")));
+  const metrics: Record<string, string | undefined> = Object.fromEntries(vector.split("/").slice(1).map((part) => part.split(":")));
   const access = {
     N: "可通过网络触发",
     A: "需相邻网络",
     L: "需本地访问",
     P: "需物理访问",
-  }[metrics.AV] ?? "攻击入口未知";
+  }[metrics.AV ?? ""] ?? "攻击入口未知";
   const privilege = {
     N: "无需预先权限",
     L: "需要低权限",
     H: "需要高权限",
-  }[metrics.PR] ?? "权限条件未知";
+  }[metrics.PR ?? ""] ?? "权限条件未知";
   const interaction = metrics.UI === "N" ? "无需用户交互" : metrics.UI === "R" ? "需要用户交互" : "交互条件未知";
   const impactParts = [
     metrics.C === "H" ? "机密性高影响" : metrics.C === "L" ? "机密性低影响" : "",
@@ -1782,7 +1782,7 @@ function streamScoreContributions(profile: StreamFindingList["riskProfiles"][num
     ["externalEgressCount5m", 8, 20],
     ["transformCount5m", 5, 15],
   ] as const;
-  const contributions = weighted.map(([key, weight, cap]) => ({
+  const contributions: Array<{ key: string; label: string; value: number; score: number }> = weighted.map(([key, weight, cap]) => ({
     key,
     label: STREAM_FEATURE_LABELS[key],
     value: streamFeatureValue(profile.features, key),
@@ -1831,11 +1831,11 @@ function AgentRiskOverviewPanel({
       groups.set(key, history);
     }
     return [...groups.values()]
-      .map((history) => {
+      .flatMap((history) => {
         history.sort((a, b) => b.calculatedAt - a.calculatedAt);
-        return { profile: history[0], previousScore: history[1]?.riskScore };
+        const profile = history[0];
+        return profile ? [{ profile, previousScore: history[1]?.riskScore }] : [];
       })
-      .filter((item): item is { profile: StreamFindingList["riskProfiles"][number]; previousScore?: number } => Boolean(item.profile))
       .sort((a, b) => Math.max(0, b.profile.riskScore) - Math.max(0, a.profile.riskScore));
   }, [findings?.riskProfiles]);
   const riskyProfiles = profileViews.filter(({ profile }) => profile.riskLevel !== "safe" || profile.riskScore > 0);

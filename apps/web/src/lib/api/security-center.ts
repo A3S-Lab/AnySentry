@@ -1,6 +1,6 @@
 import { apiClient, apiRawFetch } from "@/lib/api/client";
 
-function querySuffix(params: Record<string, string | number | boolean | undefined>) {
+function querySuffix(params: object) {
   const qs = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
     const text = String(value ?? "").trim();
@@ -805,7 +805,7 @@ export interface UniversalIngestRequest {
   parentSpanId?: string;
   runId?: string;
   taskId?: string;
-  source?: AgentEventSource;
+  source?: string;
   eventCategory?: AgentEventCategory;
   subject?: string;
   tokenCount?: number;
@@ -815,6 +815,8 @@ export interface UniversalIngestRequest {
   collectorId?: string;
   sourceId?: string;
   nodeName?: string;
+  peer?: string;
+  port?: string | number;
   sourceName?: string;
   sourceType?: IngestionSourceType;
   token?: string;

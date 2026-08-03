@@ -27,7 +27,6 @@ import {
   type AgentTopologyEdge,
   type AgentTopologyNode,
   type AgentTopologyQuery,
-  type SecurityRiskLevel,
   type SecuritySeverity,
   type SecurityTimeType,
   type TopologyNodeType,
@@ -80,13 +79,6 @@ function toneBySeverity(severity?: SecuritySeverity) {
   if (severity === "critical" || severity === "high") return "border-rose-400/30 bg-rose-500/10 text-rose-100";
   if (severity === "medium") return "border-amber-400/30 bg-amber-500/10 text-amber-100";
   if (severity === "low") return "border-teal-400/30 bg-teal-500/10 text-teal-100";
-  return "border-white/10 bg-white/5 text-zinc-300";
-}
-
-function riskClass(level?: SecurityRiskLevel) {
-  if (level === "critical" || level === "high") return "border-rose-400/30 bg-rose-500/10 text-rose-100";
-  if (level === "medium") return "border-amber-400/30 bg-amber-500/10 text-amber-100";
-  if (level === "low") return "border-teal-400/30 bg-teal-500/10 text-teal-100";
   return "border-white/10 bg-white/5 text-zinc-300";
 }
 

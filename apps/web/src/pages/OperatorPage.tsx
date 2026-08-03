@@ -38,7 +38,6 @@ import {
   type RemediationSourceType,
   type RemediationStatus,
   type SecurityCapabilityRequest,
-  type SecurityCapabilityResponse,
   type SecurityNextActionPlan,
   type SecurityNextActionPlanItem,
   type SecurityNextActionPlanParams,
@@ -710,7 +709,7 @@ export default function OperatorPage() {
     action: "execute",
     module: "security-center",
     operation: "planNextActions",
-    params,
+    params: { ...params },
   }), [params]);
   const planCurl = useMemo(() => generatedSecurityCapabilityCurl(planRequest), [planRequest]);
 

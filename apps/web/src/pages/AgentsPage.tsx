@@ -698,7 +698,7 @@ function AgentDetail({
               </Button>
             </div>
             <div className="mt-3 flex flex-wrap items-center gap-2">
-              {agent.criticality ? <Pill className={criticalityClass(agent.criticality)}>重要性 {CRITICALITY_LABEL[agent.criticality]}</Pill> : null}
+              {agent.criticality ? <Pill className={criticalityClass(agent.criticality)}>{`重要性 ${CRITICALITY_LABEL[agent.criticality]}`}</Pill> : null}
               {agent.environment ? <Pill className="border-sky-400/30 bg-sky-500/10 text-sky-100">{agent.environment}</Pill> : null}
               {agent.tags.map((tag) => <Pill key={tag} className="border-white/10 bg-white/5 text-zinc-200">{tag}</Pill>)}
             </div>
