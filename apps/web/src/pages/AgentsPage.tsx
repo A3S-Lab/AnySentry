@@ -261,6 +261,23 @@ function agentParams(agent: AgentInventoryItem, timeType?: SecurityTimeType) {
   return params;
 }
 
+function matchesSelectedAgent(
+  agent: AgentInventoryItem | undefined,
+  agentAssetId: string,
+  legacyAgentId: string,
+  legacyWorkspacePath: string,
+) {
+  if (!agent) return false;
+  if (agentAssetId) {
+    return agent.agentAssetId === agentAssetId || agent.agentAssetAliases?.includes(agentAssetId) === true;
+  }
+  return Boolean(
+    legacyAgentId &&
+    agent.agentId === legacyAgentId &&
+    (!legacyWorkspacePath || agent.workspacePath === legacyWorkspacePath),
+  );
+}
+
 function agentEventsHref(agent: AgentInventoryItem, timeType: SecurityTimeType) {
   return `/events?${agentParams(agent, timeType).toString()}`;
 }
@@ -858,9 +875,17 @@ export default function AgentsPage() {
 
   const selectedAgent = useMemo(() => {
     const items = data?.items ?? [];
-    if (hasPinnedSelection) return detailData?.items?.[0];
+    if (hasPinnedSelection) {
+      const detailAgent = detailData?.items?.[0];
+      return matchesSelectedAgent(
+        detailAgent,
+        selectedAgentAssetId,
+        legacySelectedAgentId,
+        legacySelectedWorkspacePath,
+      ) ? detailAgent : undefined;
+    }
     return items[0];
-  }, [data, detailData, hasPinnedSelection]);
+  }, [data, detailData, hasPinnedSelection, legacySelectedAgentId, legacySelectedWorkspacePath, selectedAgentAssetId]);
   const classificationCounts = useMemo(() => {
     const counts: Partial<Record<AgentClassification, number>> = {};
     for (const item of data?.items ?? []) {
@@ -926,6 +951,8 @@ export default function AgentsPage() {
     next.delete("agentId");
     next.delete("agentAssetId");
     next.delete("workspacePath");
+    next.delete("focus");
+    next.delete("eventId");
     next.set("selectedAgentAssetId", agent.agentAssetId);
     if (healthState !== "all") next.set("healthState", healthState);
     if (clean(queryText)) next.set("q", queryText.trim());
