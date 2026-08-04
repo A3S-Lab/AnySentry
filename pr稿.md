@@ -573,9 +573,14 @@ wouldFilterNonAgent
 - [x] `git diff --check`
 - [x] `docker build -f Dockerfile .`
 - [x] 历史 GitHub Actions CI #137：`build` 与 `docker` 均通过
-- [ ] 当前 Draft PR GitHub Actions：创建 PR 后由 GitHub 生成最终检查记录
+- [x] Draft PR #5 GitHub Actions：push/PR 两组 `build` 与 `docker` 均通过
 
 CI 地址：<https://github.com/A3S-Lab/AnySentry/actions/runs/30802065349>
+
+当前 Draft PR 检查：
+
+- <https://github.com/A3S-Lab/AnySentry/actions/runs/30879060571>
+- <https://github.com/A3S-Lab/AnySentry/actions/runs/30879080279>
 
 ### 分阶段功能验证脚本
 
@@ -844,7 +849,7 @@ FORWARD_NOISE_POLICY=balanced
 - [x] 真实 Host/Docker/Kubernetes Observer 链路。
 - [x] Streaming phase 1/2、Flink 容器构建及 L3 pool。
 - [x] 隔离运行时模型 Pub/Sub 与异步 L2 worker 链路。
-- [ ] 当前 Draft PR GitHub Actions build/docker（PR 创建后等待）。
+- [x] Draft PR #5 GitHub Actions build/docker。
 - [x] Sentry staged SDK 已按顺序发布为 npm `0.3.0`。
 - [x] Observer 对应 PR 已审批；部署时仍需保证 probe/collector 使用匹配版本。
 
