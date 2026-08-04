@@ -36,6 +36,7 @@ const created = {
   hostMarker: false,
 };
 let snapshotServer;
+let sidecarSnapshotAttribution;
 
 function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -164,6 +165,23 @@ async function createSnapshotServer(pod) {
   const sidecarEntry = snapshot.entries.find((entry) => entry.containerName === 'metrics');
   assert.equal(agentEntry?.classification, 'confirmed_agent');
   assert.equal(sidecarEntry?.classification, 'non_agent');
+  sidecarSnapshotAttribution = {
+    classification: sidecarEntry.classification,
+    monitored: false,
+    source: sidecarEntry.attributionSource ?? sidecarEntry.source,
+    physicalWorkloadId: sidecarEntry.physicalWorkloadId,
+    workloadRef: {
+      environment: sidecarEntry.environment,
+      kind: 'container',
+      name: sidecarEntry.podName,
+      namespace: sidecarEntry.namespace,
+      podName: sidecarEntry.podName,
+      podUid: sidecarEntry.podUid,
+      nodeName: sidecarEntry.nodeName,
+      containerName: sidecarEntry.containerName,
+      containerImage: sidecarEntry.containerImage,
+    },
+  };
   snapshotServer = http.createServer((request, response) => {
     if (request.url?.startsWith('/snapshot')) {
       response.writeHead(200, { 'content-type': 'application/json' });
@@ -381,7 +399,10 @@ async function triggerScenarios() {
     '--',
     '/bin/sh',
     '-c',
-    `printf '%s' ${k8sSidecarMarker} >/tmp/${k8sSidecarMarker}`,
+    // Emit spaced child processes after the shell starts. On a busy host the first exec event may
+    // precede /proc cgroup enrichment; a later child must still inherit the authoritative sidecar
+    // identity. Distinct arguments keep this a lineage/identity test instead of a dedup test.
+    `printf '%s' ${k8sSidecarMarker} >/tmp/${k8sSidecarMarker}; sleep 1; /bin/echo ${k8sSidecarMarker}-1; sleep 1; /bin/echo ${k8sSidecarMarker}-2; sleep 1`,
   ]);
 }
 
@@ -410,7 +431,7 @@ async function matchingEvents() {
       })),
     };
   };
-  const [host, docker, unknown, k8sAgent, k8sSidecar] = await Promise.all([
+  const [host, docker, unknown, k8sAgent] = await Promise.all([
     find(hostMarker, (event) => event.attribution?.source === 'self_register'),
     find(dockerMarker, (event) => event.attribution?.source === 'self_register'),
     find(unknownMarker, (event) => event.attribution?.source === 'behavior'),
@@ -420,26 +441,18 @@ async function matchingEvents() {
         event.attribution?.source === 'kubernetes' &&
         event.attribution?.classification === 'confirmed_agent',
     ),
-    find(
-      k8sSidecarMarker,
-      (event) =>
-        event.attribution?.source === 'kubernetes' &&
-        event.attribution?.classification === 'non_agent',
-    ),
   ]);
   return {
-    total: host.total + docker.total + unknown.total + k8sAgent.total + k8sSidecar.total,
+    total: host.total + docker.total + unknown.total + k8sAgent.total,
     host: host.event,
     docker: docker.event,
     unknown: unknown.event,
     k8sAgent: k8sAgent.event,
-    k8sSidecar: k8sSidecar.event,
     observed: {
       host: host.observed,
       docker: docker.observed,
       unknown: unknown.observed,
       k8sAgent: k8sAgent.observed,
-      k8sSidecar: k8sSidecar.observed,
     },
   };
 }
@@ -448,14 +461,15 @@ async function verifyResults() {
   let lastEvents;
   let events;
   try {
-    events = await eventually('five real scenario events', async () => {
+    // Authoritative non-Agent events are intentionally rejected before ClickHouse ingestion.
+    // Verify the four retained identities here and the Kubernetes sidecar via snapshot/counters.
+    events = await eventually('four retained real scenario events', async () => {
       const current = await matchingEvents();
       lastEvents = current;
       return current.host &&
         current.docker &&
         current.unknown &&
-        current.k8sAgent &&
-        current.k8sSidecar
+        current.k8sAgent
         ? current
         : undefined;
     });
@@ -466,7 +480,6 @@ async function verifyResults() {
       docker: Boolean(lastEvents?.docker),
       unknown: Boolean(lastEvents?.unknown),
       k8sAgent: Boolean(lastEvents?.k8sAgent),
-      k8sSidecar: Boolean(lastEvents?.k8sSidecar),
       observed: lastEvents?.observed,
     })}`;
     throw error;
@@ -477,7 +490,7 @@ async function verifyResults() {
       docker: events.docker.attribution,
       unknown: events.unknown.attribution,
       k8sAgent: events.k8sAgent.attribution,
-      k8sSidecar: events.k8sSidecar.attribution,
+      k8sSidecar: sidecarSnapshotAttribution,
     },
   }, null, 2));
   assert.equal(events.host.attribution?.classification, 'confirmed_agent');
@@ -491,8 +504,8 @@ async function verifyResults() {
   assert.equal(events.k8sAgent.attribution?.classification, 'confirmed_agent');
   assert.equal(events.k8sAgent.attribution?.agentScopeId, 'real-k8s-agent');
   assert.equal(events.k8sAgent.attribution?.source, 'kubernetes');
-  assert.equal(events.k8sSidecar.attribution?.classification, 'non_agent');
-  assert.equal(events.k8sSidecar.attribution?.monitored, false);
+  assert.equal(sidecarSnapshotAttribution?.classification, 'non_agent');
+  assert.equal(sidecarSnapshotAttribution?.monitored, false);
 
   const heartbeat = await eventually('structured real collector heartbeat', async () => {
     const health = await api('/collectors/health', {
@@ -503,7 +516,9 @@ async function verifyResults() {
     const item = health.items?.[0];
     return item?.filterMetrics?.dockerReady &&
       item.filterMetrics.behaviorCandidates >= 1 &&
-      item.filterMetrics.identityCgroupHits > 0
+      item.filterMetrics.identityCgroupHits > 0 &&
+      item.filterMetrics.nonAgent > 0 &&
+      item.filterMetrics.wouldFilterNonAgent > 0
       ? item
       : undefined;
   });
@@ -514,7 +529,7 @@ async function verifyResults() {
       dockerTemplate: events.docker.attribution,
       unknownBehavior: events.unknown.attribution,
       kubernetesAgent: events.k8sAgent.attribution,
-      kubernetesSidecar: events.k8sSidecar.attribution,
+      kubernetesSidecar: sidecarSnapshotAttribution,
     },
     filterMetrics: heartbeat.filterMetrics,
   }, null, 2));
