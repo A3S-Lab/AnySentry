@@ -1,5 +1,5 @@
-import { BadRequestException, Body, Controller, Get, Headers, HttpCode, NotFoundException, Param, Post, Put, Query, Sse, UseGuards } from '@nestjs/common';
-import { createHash } from 'node:crypto';
+import { BadRequestException, Body, Controller, Get, Headers, HttpCode, NotFoundException, Param, Post, Put, Query, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { Observable, map, timer } from 'rxjs';
 import { SkipWrap } from '../shared/api-response.interceptor';
 import { AgentMetadataService } from './agent-metadata.service';
@@ -7,14 +7,26 @@ import { AggregationService } from './aggregation.service';
 import { AlertingService } from './alerting.service';
 import { AuditService } from './audit.service';
 import { IngestionSourceResolution, IngestionSourceService } from './ingestion-source.service';
+import { IdentityReviewAgentService } from './identity-review-agent.service';
+import { testDeepInvestigationConnection, testFastReviewConnection } from './judgment-connectivity';
 import { KubeIdentityService } from './kube-identity.service';
 import { managementAuthConfigured, ManagementAuthGuard, RequireManagementAuth } from './management-auth.guard';
 import { MaintenanceWindowService } from './maintenance-window.service';
 import { NotificationService } from './notification.service';
 import { ObjectiveService } from './objective.service';
-import { PolicyConfigError } from './policy-config';
+import { PolicyConfigError, sanitizePolicy } from './policy-config';
 import { RemediationService } from './remediation.service';
 import { SentryJudgeService } from './sentry-judge.service';
+import { StreamingFindingService } from './streaming-finding.service';
+import { RuntimeModelConfigService, RuntimeModelProfile, sanitizeRuntimeModelConnection } from './runtime-model-config';
+import { StreamingQueueService } from './streaming-queue.service';
+import { SupplyChainService } from './supply-chain.service';
+import {
+  ClaimScanTaskRequest,
+  RegisterWorkspaceRequest,
+  ScanTaskHeartbeatRequest,
+  SubmitScanResultRequest,
+} from './supply-chain.types';
 import * as T from './types';
 
 /** Ingest a real observer event: judge it via sentry and record it for the dashboard. */
@@ -26,6 +38,11 @@ interface IngestBody extends Partial<T.EventMeta> {
   sourceName?: string;
   sourceType?: T.IngestionSourceType;
   token?: string;
+  sourceEventId?: string;
+}
+
+interface ObserverBatchIngestBody {
+  events?: IngestBody[];
 }
 
 interface RejectedIngestContext {
@@ -141,6 +158,15 @@ function processFromObserverLine(process: unknown): T.ProcessContext | undefined
     const value = p[key];
     return typeof value === 'string' && value.trim() ? value.trim() : undefined;
   };
+  const stringLikeField = (...keys: string[]) => {
+    for (const key of keys) {
+      const value = p[key];
+      if ((typeof value === 'string' || typeof value === 'number' || typeof value === 'bigint') && String(value).trim()) {
+        return String(value).trim();
+      }
+    }
+    return undefined;
+  };
   const ctx: T.ProcessContext = {
     pid: numberField('pid'),
     ppid: numberField('ppid'),
@@ -149,10 +175,13 @@ function processFromObserverLine(process: unknown): T.ProcessContext | undefined
     exe: stringField('exe'),
     cwd: stringField('cwd'),
     cgroup: stringField('cgroup'),
-    systemdUnit: stringField('systemdUnit'),
-    hostId: stringField('hostId'),
-    eventTimeNs: stringField('eventTimeNs'),
-    startTimeNs: stringField('startTimeNs'),
+    cgroupId: stringLikeField('cgroupId', 'cgroup_id'),
+    systemdUnit: stringLikeField('systemdUnit', 'systemd_unit'),
+    hostId: stringLikeField('hostId', 'host_id'),
+    bootId: stringLikeField('bootId', 'boot_id'),
+    eventTimeNs: stringLikeField('eventTimeNs', 'event_time_ns'),
+    startTimeNs: stringLikeField('startTimeNs', 'start_time_ns'),
+    startTimeTicks: stringLikeField('startTimeTicks', 'start_time_ticks'),
   };
   return Object.values(ctx).some((value) => value !== undefined) ? ctx : undefined;
 }
@@ -207,6 +236,7 @@ function deriveMeta(line: string, given: Partial<T.EventMeta>): T.EventMeta {
     parentSpanId: given.parentSpanId,
     runId: given.runId ?? id.session ?? id.agent ?? (id.task != null ? `task-${id.task}` : undefined),
     taskId: given.taskId ?? (id.task != null ? String(id.task) : undefined),
+    sourceEventId: given.sourceEventId,
     attributes: { ...compactAttributes(eventKey, inner, id), ...sanitizeEventAttributes(given.attributes) },
     process: given.process ?? process,
     attribution: given.attribution,
@@ -291,6 +321,8 @@ function parseCollectorHeartbeatLine(line: string): T.CollectorHeartbeatRequest 
       observedAgents: numField(hb, 'observedAgents', 'observed_agents'),
       errorCount: numField(hb, 'errorCount', 'error_count') ?? execIncomplete,
       queueDepth: numField(hb, 'queueDepth', 'queue_depth'),
+      filterMetrics:
+        (obj(hb.filterMetrics) ?? obj(hb.filter_metrics)) as T.CollectorFilterMetrics | undefined,
       message: strField(hb, 'message'),
     };
   } catch {
@@ -1262,6 +1294,13 @@ function universalMeta(input: T.UniversalIngestEvent, defaults: T.UniversalInges
     tokenCount: finiteNumber(input.tokenCount ?? defaults.tokenCount),
     latencyMs: finiteNumber(input.latencyMs ?? defaults.latencyMs),
     rawPreview: cleanString(input.rawPreview ?? defaults.rawPreview, 1800),
+    sourceEventId: cleanString(
+      input.sourceEventId
+        ?? input.id
+        ?? eventAttr(input, 'sourceEventId')
+        ?? eventAttr(input, 'cloudEventId'),
+      240,
+    ),
     attributes: attrs,
   };
 }
@@ -2644,8 +2683,153 @@ export class SecurityMonitoringController {
     private readonly notifications: NotificationService,
     private readonly objectives: ObjectiveService,
     private readonly judge: SentryJudgeService,
+    private readonly runtimeModels: RuntimeModelConfigService,
     private readonly kube: KubeIdentityService,
+    private readonly streaming: StreamingQueueService,
+    private readonly streamFindings: StreamingFindingService,
+    private readonly supplyChain: SupplyChainService,
+    private readonly identityReview: IdentityReviewAgentService,
   ) {}
+
+  private modelProfile(value: string): RuntimeModelProfile {
+    if (value === 'fast_review' || value === 'deep_investigation') return value;
+    throw new BadRequestException('unknown model connection profile');
+  }
+
+  private requireWorkspaceScanner(
+    headers: Record<string, string | string[] | undefined>,
+    scannerId: string,
+  ): void {
+    let expected = process.env.ANYSENTRY_WORKSPACE_SCANNER_TOKEN?.trim();
+    const configuredTokens = process.env.ANYSENTRY_WORKSPACE_SCANNER_TOKENS?.trim();
+    if (configuredTokens) {
+      try {
+        const tokens = JSON.parse(configuredTokens) as Record<string, unknown>;
+        expected = typeof tokens[scannerId] === 'string' ? tokens[scannerId].trim() : undefined;
+      } catch {
+        throw new UnauthorizedException('workspace scanner token configuration is invalid');
+      }
+    }
+    const value = headers['x-anysentry-scanner-token'];
+    const presented = (Array.isArray(value) ? value[0] : value)?.trim();
+    if (!expected || !presented) throw new UnauthorizedException('workspace scanner token required');
+    const expectedHash = createHash('sha256').update(expected).digest();
+    const presentedHash = createHash('sha256').update(presented).digest();
+    if (!timingSafeEqual(expectedHash, presentedHash)) {
+      throw new UnauthorizedException('workspace scanner token required');
+    }
+  }
+
+  private supplyChainBadRequest(error: unknown): never {
+    throw new BadRequestException(error instanceof Error ? error.message : String(error));
+  }
+
+  @Post('supply-chain/workspaces/register')
+  @HttpCode(200)
+  async registerSupplyChainWorkspace(
+    @Headers() headers: Record<string, string | string[] | undefined>,
+    @Body() body: RegisterWorkspaceRequest,
+  ) {
+    this.requireWorkspaceScanner(headers, body.scannerId);
+    try {
+      return await this.supplyChain.registerWorkspace(body);
+    } catch (error) {
+      this.supplyChainBadRequest(error);
+    }
+  }
+
+  @Post('supply-chain/tasks/claim')
+  @HttpCode(200)
+  async claimSupplyChainScanTask(
+    @Headers() headers: Record<string, string | string[] | undefined>,
+    @Body() body: ClaimScanTaskRequest,
+  ) {
+    this.requireWorkspaceScanner(headers, body.scannerId);
+    try {
+      return { task: await this.supplyChain.claimTask(body.scannerId) ?? null };
+    } catch (error) {
+      this.supplyChainBadRequest(error);
+    }
+  }
+
+  @Put('supply-chain/tasks/:taskId/heartbeat')
+  @HttpCode(200)
+  async heartbeatSupplyChainScanTask(
+    @Headers() headers: Record<string, string | string[] | undefined>,
+    @Param('taskId') taskId: string,
+    @Body() body: ScanTaskHeartbeatRequest,
+  ) {
+    this.requireWorkspaceScanner(headers, body.scannerId);
+    try {
+      return { task: await this.supplyChain.heartbeat(taskId, body.scannerId, body.leaseToken) };
+    } catch (error) {
+      this.supplyChainBadRequest(error);
+    }
+  }
+
+  @Post('supply-chain/tasks/:taskId/result')
+  @HttpCode(200)
+  async submitSupplyChainScanResult(
+    @Headers() headers: Record<string, string | string[] | undefined>,
+    @Param('taskId') taskId: string,
+    @Body() body: SubmitScanResultRequest,
+  ) {
+    this.requireWorkspaceScanner(headers, body.scannerId);
+    try {
+      return await this.supplyChain.submitResult(taskId, body);
+    } catch (error) {
+      this.supplyChainBadRequest(error);
+    }
+  }
+
+  @Post('supply-chain/workspaces/:workspaceId/scan')
+  @RequireManagementAuth()
+  @HttpCode(202)
+  async requestSupplyChainScan(
+    @Param('workspaceId') workspaceId: string,
+    @Body() body: { reason?: 'manual' | 'dependency_descriptor_changed' | 'retry' },
+  ) {
+    try {
+      return {
+        task: await this.supplyChain.enqueueScan(workspaceId, body.reason ?? 'manual'),
+      };
+    } catch (error) {
+      this.supplyChainBadRequest(error);
+    }
+  }
+
+  @Post('supply-chain/workspaces/:workspaceId/dependency-change')
+  @HttpCode(202)
+  async notifySupplyChainDependencyChange(
+    @Headers() headers: Record<string, string | string[] | undefined>,
+    @Param('workspaceId') workspaceId: string,
+    @Body() body: { scannerId: string },
+  ) {
+    this.requireWorkspaceScanner(headers, body.scannerId);
+    try {
+      return {
+        task: await this.supplyChain.notifyDescriptorChange(workspaceId, body.scannerId),
+      };
+    } catch (error) {
+      this.supplyChainBadRequest(error);
+    }
+  }
+
+  @Post('supply-chain/workspaces/:workspaceId/assess')
+  @RequireManagementAuth()
+  @HttpCode(202)
+  async requestSupplyChainAssessment(@Param('workspaceId') workspaceId: string) {
+    try {
+      return await this.supplyChain.requestAssessment(workspaceId);
+    } catch (error) {
+      this.supplyChainBadRequest(error);
+    }
+  }
+
+  @Get('supply-chain/overview')
+  async supplyChainOverview(@Query('limit') limit?: string) {
+    return this.supplyChain.overview(limit ? Number(limit) : undefined);
+  }
 
   private recordRejectedIngest(resolution: IngestionSourceResolution, reason: string, context: RejectedIngestContext = {}): void {
     this.sources.recordRejected(resolution, reason);
@@ -2661,6 +2845,32 @@ export class SecurityMonitoringController {
       endpoint: context.endpoint,
       rejectedEvents: context.rejectedEvents,
     });
+  }
+
+  private async enqueueCanonicalShadow(event: T.JudgedEvent, observerLine: string): Promise<void> {
+    try {
+      await this.streaming.enqueueCanonical(event, observerLine);
+    } catch (error) {
+      // Streaming is an optional shadow path. A Redis/Kafka-side outage must never turn an accepted
+      // security event into an ingest failure or interfere with the existing L1/L2/L3 pipeline.
+      console.error('[streaming] canonical outbox enqueue failed', {
+        eventId: event.eventId,
+        error: error instanceof Error ? error.message.split('\n')[0].slice(0, 300) : String(error).slice(0, 300),
+      });
+    }
+  }
+
+  private async observeSupplyChainInstall(event: T.JudgedEvent, observerLine: string): Promise<void> {
+    try {
+      await this.supplyChain.observeRuntimeInstall(event, observerLine);
+    } catch (error) {
+      // Runtime install tracking is an optional supply-chain side path. It must not reject an
+      // otherwise accepted security event or interfere with L1/L2/L3.
+      console.error('[supply-chain] runtime install observation failed', {
+        eventId: event.eventId,
+        error: error instanceof Error ? error.message.split('\n')[0].slice(0, 300) : String(error).slice(0, 300),
+      });
+    }
   }
 
   @Post('top/healthCard')
@@ -2720,13 +2930,19 @@ export class SecurityMonitoringController {
   @Post('events/list')
   @HttpCode(200)
   agentEvents(@Body() f: T.AgentEventQuery) {
-    return this.agg.agentEvents(f);
+    return f.durable ? this.agg.storedAgentEvents(f) : this.agg.agentEvents(f);
   }
 
   @Post('events/timeline')
   @HttpCode(200)
   agentTimeline(@Body() f: T.AgentEventQuery) {
     return this.agg.agentTimeline(f);
+  }
+
+  @Post('stream/findings')
+  @HttpCode(200)
+  streamFindingList(@Body() f: T.SecurityTimeFilter & { limit?: number }) {
+    return this.streamFindings.list(f, f.limit);
   }
 
   @Post('incidents/list')
@@ -2854,6 +3070,45 @@ export class SecurityMonitoringController {
     return this.agg.agentInventory(f);
   }
 
+  @Post('identity/ai-review')
+  @HttpCode(200)
+  @RequireManagementAuth()
+  async runIdentityAiReview(@Body() body: T.IdentityAiReviewRequest, @Headers() headers: HeaderBag) {
+    const result = await this.identityReview.run(body);
+    this.audit.record({
+      actor: auditActor(headers),
+      action: 'agent.identity_ai_review.completed',
+      resourceType: body.targetType === 'event' ? 'event' : 'agent',
+      resourceId: body.eventId ?? body.agentAssetId ?? result.reviewId,
+      summary: result.status === 'succeeded'
+        ? `AI identity review: ${result.verdict}`
+        : `AI identity review failed: ${result.error ?? 'unknown error'}`,
+      details: {
+        reviewId: result.reviewId,
+        targetType: result.targetType,
+        eventId: result.eventId,
+        agentAssetId: result.agentAssetId,
+        status: result.status,
+        verdict: result.verdict,
+        confidence: result.confidence,
+        evidenceDigest: result.evidenceDigest,
+        provider: result.provider,
+        model: result.model,
+      },
+    });
+    return result;
+  }
+
+  @Get('identity/ai-reviews')
+  @RequireManagementAuth()
+  identityAiReviews(
+    @Query('targetType') targetType?: string,
+    @Query('eventId') eventId?: string,
+    @Query('agentAssetId') agentAssetId?: string,
+  ) {
+    return { items: this.identityReview.list(targetType, eventId, agentAssetId), updateTime: new Date().toISOString() };
+  }
+
   @Post('workspaces/inventory')
   @HttpCode(200)
   workspaceInventory(@Body() f: T.WorkspaceInventoryQuery) {
@@ -2873,10 +3128,11 @@ export class SecurityMonitoringController {
       actor: auditActor(headers),
       action: 'agent.metadata.updated',
       resourceType: 'agent',
-      resourceId: `${updated.workspacePath}:${updated.agentId}`,
+      resourceId: updated.agentAssetId,
       summary: `Agent metadata updated: ${updated.displayName || updated.agentId}`,
       details: {
         agentId: updated.agentId,
+        agentAssetId: updated.agentAssetId,
         workspacePath: updated.workspacePath,
         displayName: updated.displayName,
         owner: updated.owner,
@@ -2884,6 +3140,46 @@ export class SecurityMonitoringController {
         environment: updated.environment,
         criticality: updated.criticality,
         tags: updated.tags,
+        noteUpdated: body.note !== undefined,
+      },
+    });
+    return updated;
+  }
+
+  @Put('agents/:agentId/review')
+  @RequireManagementAuth()
+  reviewAgent(@Param('agentId') agentId: string, @Body() body: T.AgentReviewRequest, @Headers() headers: HeaderBag) {
+    if (!['confirmed_agent', 'unknown', 'non_agent', 'clear'].includes(body.decision)) {
+      throw new BadRequestException('decision must be confirmed_agent, unknown, non_agent, or clear');
+    }
+    const actor = auditActor(headers);
+    const updated = this.agentMetadata.review(
+      agentId,
+      body,
+      actor.displayName ? `${actor.displayName} (${actor.id})` : actor.id,
+    );
+    this.agg.invalidateWindowCache();
+    this.audit.record({
+      actor,
+      action: body.decision === 'clear' ? 'agent.review.cleared' : 'agent.review.updated',
+      resourceType: 'agent',
+      resourceId: updated.agentAssetId,
+      summary:
+        body.decision === 'confirmed_agent'
+          ? `Agent confirmed by reviewer: ${updated.displayName || updated.agentId}`
+          : body.decision === 'unknown'
+            ? `Agent returned to observation by reviewer: ${updated.displayName || updated.agentId}`
+          : body.decision === 'non_agent'
+            ? `Unknown identity excluded by reviewer: ${updated.displayName || updated.agentId}`
+            : `Agent review cleared: ${updated.displayName || updated.agentId}`,
+      details: {
+        agentId: updated.agentId,
+        agentAssetId: updated.agentAssetId,
+        workspacePath: updated.workspacePath,
+        decision: updated.reviewDecision ?? 'clear',
+        identityKeyCount: updated.reviewIdentityKeys?.length ?? 0,
+        physicalWorkloadId: updated.reviewPhysicalWorkloadId,
+        agentInstanceId: updated.reviewAgentInstanceId,
         noteUpdated: body.note !== undefined,
       },
     });
@@ -3373,14 +3669,17 @@ export class SecurityMonitoringController {
       ? this.maintenance.list({ ...timeFilter, windowId: relatedWindowId, status: 'all', limit: 1 }).items.find((item) => item.windowId === relatedWindowId)
       : undefined;
 
-    let remediation = explicitTaskId ? this.remediation.list({ ...timeFilter, taskId: explicitTaskId, status: 'all', limit: 1 }).items[0] : undefined;
+    let remediation = explicitTaskId ? this.remediation.list({ ...timeFilter, taskId: explicitTaskId, status: 'all', limit: 1 }, { refresh: false }).items[0] : undefined;
     if (!remediation && auditTaskId) {
-      remediation = this.remediation.list({ ...timeFilter, taskId: auditTaskId, status: 'all', limit: 1 }).items[0];
+      remediation = this.remediation.list({ ...timeFilter, taskId: auditTaskId, status: 'all', limit: 1 }, { refresh: false }).items[0];
     }
     if (!remediation && notificationDelivery?.taskId) {
-      remediation = this.remediation.list({ ...timeFilter, taskId: notificationDelivery.taskId, status: 'all', limit: 1 }).items[0];
+      remediation = this.remediation.list({ ...timeFilter, taskId: notificationDelivery.taskId, status: 'all', limit: 1 }, { refresh: false }).items[0];
     }
     if (!remediation && explicitIssueId) {
+      // A directly requested coverage issue is an intentional governance action:
+      // materialize its remediation chain once before the evidence bundle switches
+      // to read-only aggregation for all subsequent scoped lookups.
       remediation = this.remediation.list({ ...timeFilter, sourceType: 'coverage', status: 'all', issueId: explicitIssueId, limit: 20 }).items.find((item) => item.sourceId === explicitIssueId);
     }
     let alert = explicitAlertId ? this.alerting.list({ ...timeFilter, alertId: explicitAlertId, status: 'all', limit: 1 }).items[0] : undefined;
@@ -3597,7 +3896,7 @@ export class SecurityMonitoringController {
       agentId: scope.agentId,
       workspacePath: scope.workspacePath,
       limit,
-    });
+    }, { refresh: false });
     const remediationItems = new Map<string, T.RemediationListItem>();
     for (const item of remediations.items) {
       remediationItems.set(item.taskId, item);
@@ -3607,8 +3906,23 @@ export class SecurityMonitoringController {
       const [firstObjectiveId] = [...relatedObjectiveIds];
       objective = this.objectives.list({ ...timeFilter, objectiveId: firstObjectiveId, limit: 1 }, { observe: false }).items[0];
     }
-    const objectiveCandidates = this.objectives.list({ ...timeFilter, limit: 500 }, { observe: false }).items
-      .filter((item) => relatedObjectiveIds.has(item.objectiveId) || objectiveMatchesScope(item, scope));
+    const objectiveCandidateMap = new Map<string, T.ObjectiveItem>();
+    const addObjectiveCandidates = (query: T.ObjectiveQuery) => {
+      for (const item of this.objectives.list({ ...timeFilter, ...query, limit: 500 }, { observe: false }).items) {
+        if (relatedObjectiveIds.has(item.objectiveId) || objectiveMatchesScope(item, scope)) {
+          objectiveCandidateMap.set(item.objectiveId, item);
+        }
+      }
+    };
+    for (const objectiveId of relatedObjectiveIds) addObjectiveCandidates({ objectiveId });
+    if (scope.workspacePath) addObjectiveCandidates({ targetType: 'workspace', targetId: scope.workspacePath });
+    if (scope.agentId) addObjectiveCandidates({ targetType: 'agent' });
+    if (scope.collectorId) addObjectiveCandidates({ targetType: 'collector', targetId: scope.collectorId });
+    if (scope.sourceId) addObjectiveCandidates({ targetType: 'source', targetId: scope.sourceId });
+    if (scope.primaryType === 'scope' && !scope.workspacePath && !scope.agentId && !scope.collectorId && !scope.sourceId) {
+      addObjectiveCandidates({ targetType: 'global' });
+    }
+    const objectiveCandidates = [...objectiveCandidateMap.values()];
     if (objective) objectiveCandidates.unshift(objective);
     const objectiveItems = new Map<string, T.ObjectiveItem>();
     for (const item of objectiveCandidates) {
@@ -3627,7 +3941,7 @@ export class SecurityMonitoringController {
         const found = this.objectives.list({ ...timeFilter, objectiveId, limit: 1 }, { observe: false }).items[0];
         if (found) objectiveItems.set(found.objectiveId, found);
       }
-      for (const task of this.remediation.list({ ...timeFilter, status: 'all', sourceType: 'alert', alertId: item.alertId, limit: 20 }).items) {
+      for (const task of this.remediation.list({ ...timeFilter, status: 'all', sourceType: 'alert', alertId: item.alertId, limit: 20 }, { refresh: false }).items) {
         remediationItems.set(task.taskId, task);
       }
     }
@@ -3647,7 +3961,7 @@ export class SecurityMonitoringController {
         for (const item of this.alerting.list({ ...timeFilter, status: 'all', kind: 'coverage', issueId, limit: 20 }).items) {
           alertItems.set(item.alertId, item);
         }
-        for (const item of this.remediation.list({ ...timeFilter, status: 'all', sourceType: 'coverage', issueId, limit: 20 }).items) {
+        for (const item of this.remediation.list({ ...timeFilter, status: 'all', sourceType: 'coverage', issueId, limit: 20 }, { refresh: false }).items) {
           remediationItems.set(item.taskId, item);
           addObjectiveId(remediationObjectiveId(item));
         }
@@ -3762,10 +4076,14 @@ export class SecurityMonitoringController {
     for (const item of sources) addCollector(item.collectorId);
     const collectors = [...collectorItems.values()].slice(0, limit);
     const agentItems = new Map<string, T.AgentInventoryItem>();
-    const addAgentItem = (item: T.AgentInventoryItem) => agentItems.set(`${item.workspacePath}\0${item.agentId}`, item);
-    const addAgent = (workspacePath: string | undefined, agentId: string | undefined) => {
-      if (!workspacePath || !agentId || agentItems.has(`${workspacePath}\0${agentId}`)) return;
-      const item = this.agg.agentInventory({ ...timeFilter, agentId, workspacePath, limit: 1 }).items.find((candidate) => candidate.agentId === agentId && candidate.workspacePath === workspacePath);
+    const addAgentItem = (item: T.AgentInventoryItem) => agentItems.set(item.agentAssetId, item);
+    const addAgent = (workspacePath: string | undefined, agentId: string | undefined, agentAssetId?: string) => {
+      if (!workspacePath || !agentId || (agentAssetId && agentItems.has(agentAssetId))) return;
+      const item = this.agg.agentInventory({ ...timeFilter, agentId, agentAssetId, workspacePath, limit: 1 }).items.find((candidate) =>
+        agentAssetId
+          ? candidate.agentAssetId === agentAssetId
+          : candidate.agentId === agentId && candidate.workspacePath === workspacePath,
+      );
       if (item) addAgentItem(item);
     };
     if (scope.agentId) {
@@ -3773,7 +4091,7 @@ export class SecurityMonitoringController {
     } else if (scope.workspacePath && !scope.sourceId && !scope.collectorId) {
       for (const item of this.agg.agentInventory({ ...timeFilter, workspacePath: scope.workspacePath, limit }).items) addAgentItem(item);
     }
-    for (const item of eventList.items) addAgent(item.workspacePath, item.agentId);
+    for (const item of eventList.items) addAgent(item.workspacePath, item.agentId, item.agentAssetId);
     const agents = [...agentItems.values()].slice(0, limit);
     const workspaceItems = new Map<string, T.WorkspaceInventoryItem>();
     const addWorkspace = (workspacePath: string | undefined) => {
@@ -3805,7 +4123,11 @@ export class SecurityMonitoringController {
     addAudit('source', scope.sourceId);
     for (const item of sources) addAudit('source', item.sourceId);
     addAudit('agent', scope.workspacePath && scope.agentId ? `${scope.workspacePath}:${scope.agentId}` : undefined);
-    for (const item of agents) addAudit('agent', `${item.workspacePath}:${item.agentId}`);
+    for (const item of agents) {
+      addAudit('agent', item.agentAssetId);
+      // Compatibility for audit records written before Agent assets gained a stable ID.
+      addAudit('agent', `${item.workspacePath}:${item.agentId}`);
+    }
     const audits = [...auditItems.values()].sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).slice(0, limit);
 
 	    const primary = {
@@ -3894,7 +4216,7 @@ export class SecurityMonitoringController {
    *  config panels read this; the dashboard hides tiers that aren't configured. */
   @Get('config')
   getConfig() {
-    return this.judge.getPolicy();
+    return { ...this.judge.getPolicy(), connections: this.runtimeModels.statuses() };
   }
 
   /** Apply + persist a new policy: rebuilds the sentry ACL and recreates the judge in place. */
@@ -3906,6 +4228,14 @@ export class SecurityMonitoringController {
       updated = await this.judge.setPolicy(body);
     } catch (error) {
       throw policyBadRequest(error);
+    }
+    const fast = this.runtimeModels.get('fast_review');
+    const deep = this.runtimeModels.get('deep_investigation');
+    if (fast && (!updated.policy.llm || fast.url !== updated.policy.llm.url || fast.model !== updated.policy.llm.model)) {
+      await this.runtimeModels.clear('fast_review');
+    }
+    if (deep && (!updated.policy.deepModel || deep.url !== updated.policy.deepModel.url || deep.model !== updated.policy.deepModel.model)) {
+      await this.runtimeModels.clear('deep_investigation');
     }
     this.audit.record({
       actor: auditActor(headers),
@@ -3922,7 +4252,105 @@ export class SecurityMonitoringController {
         status: updated.status,
       },
     });
-    return updated;
+    return { ...updated, connections: this.runtimeModels.statuses() };
+  }
+
+  @Get('config/model-connections')
+  @RequireManagementAuth()
+  modelConnectionStatus() {
+    return this.runtimeModels.statuses();
+  }
+
+  /** Test one exact connection through the same in-process A3S Code SDK used by judgment. The key
+   *  remains in API memory and the response contains only a short-lived opaque apply token. */
+  @Post('config/model-connections/test')
+  @RequireManagementAuth()
+  @HttpCode(200)
+  async testModelConnection(@Body() body: unknown) {
+    const input = body && typeof body === 'object' && !Array.isArray(body)
+      ? body as Record<string, unknown>
+      : {};
+    const profile = input.profile === 'fast_review' || input.profile === 'deep_investigation'
+      ? input.profile
+      : undefined;
+    if (!profile) throw new BadRequestException('profile must be fast_review or deep_investigation');
+    let connection;
+    try {
+      connection = sanitizeRuntimeModelConnection({
+        url: typeof input.url === 'string' ? input.url : '',
+        model: typeof input.model === 'string' ? input.model : '',
+        apiKey: typeof input.apiKey === 'string' ? input.apiKey : '',
+        timeoutS: Number(input.timeoutS),
+        contextTokens: Number(input.contextTokens),
+      }, profile);
+    } catch (error) {
+      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+    }
+    const result = profile === 'fast_review'
+      ? await testFastReviewConnection(connection)
+      : await testDeepInvestigationConnection(
+          connection,
+          this.judge.getPolicy().policy.agent?.skills || process.env.ANYSENTRY_L3_SKILLS || '/opt/anysentry/skills',
+        );
+    if (!result.ok) return result;
+    return { ...result, ...this.runtimeModels.rememberSuccessfulTest(profile, connection) };
+  }
+
+  @Put('config/model-connections/:profile')
+  @RequireManagementAuth()
+  async applyModelConnection(
+    @Param('profile') profileText: string,
+    @Body() body: unknown,
+    @Headers() headers: HeaderBag,
+  ) {
+    const profile = this.modelProfile(profileText);
+    const input = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
+    const testToken = typeof input.testToken === 'string' ? input.testToken : '';
+    let snapshot;
+    try {
+      const connection = this.runtimeModels.consumeSuccessfulTest(profile, testToken);
+      const current = this.judge.getPolicy().policy;
+      await this.judge.setPolicy(profile === 'fast_review'
+        ? { ...current, llm: { url: connection.url, model: connection.model, timeoutS: connection.timeoutS } }
+        : {
+            ...current,
+            deepModel: {
+              url: connection.url,
+              model: connection.model,
+              timeoutS: connection.timeoutS,
+              contextTokens: connection.contextTokens,
+            },
+          });
+      snapshot = await this.runtimeModels.activate(profile, connection);
+    } catch (error) {
+      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+    }
+    this.audit.record({
+      actor: auditActor(headers),
+      action: 'policy.updated',
+      resourceType: 'policy',
+      resourceId: profile,
+      summary: `${profile === 'fast_review' ? 'Fast review' : 'Deep investigation'} model connection applied`,
+      details: { profile, endpoint: snapshot.url, model: snapshot.model, source: snapshot.source },
+    });
+    return { ...this.judge.getPolicy(), connections: this.runtimeModels.statuses() };
+  }
+
+  @Post('config/model-connections/:profile/clear')
+  @RequireManagementAuth()
+  @HttpCode(200)
+  async clearModelConnection(@Param('profile') profileText: string, @Headers() headers: HeaderBag) {
+    const profile = this.modelProfile(profileText);
+    await this.runtimeModels.clear(profile);
+    this.audit.record({
+      actor: auditActor(headers),
+      action: 'policy.updated',
+      resourceType: 'policy',
+      resourceId: profile,
+      summary: `${profile === 'fast_review' ? 'Fast review' : 'Deep investigation'} runtime credential cleared`,
+      details: { profile },
+    });
+    return { ...this.judge.getPolicy(), connections: this.runtimeModels.statuses() };
   }
 
   @Post('config/simulate')
@@ -3981,6 +4409,28 @@ export class SecurityMonitoringController {
         distinctSessions: stats.distinctSessions,
       },
       policy: policy.status,
+      streaming: {
+        ...this.streaming.status(),
+        findingStoreReady: this.streamFindings.enabled,
+      },
+      supplyChain: {
+        enabled: this.supplyChain.enabled,
+      },
+    };
+  }
+
+  /** Versioned, node-filtered workload identity data for observation-only forwarders. */
+  @Get('identity/snapshot')
+  @SkipWrap()
+  identitySnapshot(@Query('nodeName') nodeName?: string): T.WorkloadIdentitySnapshot {
+    const platform = this.kube.snapshot(nodeName);
+    const reviewed = this.agentMetadata.identitySnapshotEntries(nodeName);
+    return {
+      ...platform,
+      version: platform.version + this.agentMetadata.identitySnapshotVersion(),
+      // Manual decisions are ordered first. WorkloadIdentityCache deliberately keeps the first
+      // identity for a key, so a reviewer decision overrides an automatic platform candidate.
+      entries: [...reviewed, ...platform.entries],
     };
   }
 
@@ -4319,11 +4769,11 @@ export class SecurityMonitoringController {
       const kind = canonicalEventKind(input);
       const line = universalEventLine(kind, input, defaults);
       const partial = universalMeta(input, defaults, sourceResolution.source?.sourceId);
-      const meta = deriveMeta(line, {
+      const meta = this.agentMetadata.applyReview(deriveMeta(line, {
         ...partial,
         eventKind: kind,
         eventCategory: partial.eventCategory ?? eventCategory(kind),
-      });
+      }));
       const rec = judgeMode === 'sync' ? this.judge.judge(line, meta, eventTime(input)) : await this.judge.accept(line, meta, eventTime(input));
       if (!rec) {
         const reason = `unsupported event kind: ${kind}`;
@@ -4339,6 +4789,8 @@ export class SecurityMonitoringController {
         items.push({ index, accepted: false, reason });
         continue;
       }
+      await this.enqueueCanonicalShadow(rec, line);
+      await this.observeSupplyChainInstall(rec, line);
       this.sources.recordAccepted(sourceResolution, 'event', { collectorId: inputCollectorId, workspacePath: rec.workspacePath });
       acceptedEvents += 1;
       items.push({
@@ -4366,10 +4818,36 @@ export class SecurityMonitoringController {
     };
   }
 
+  /** Bounded raw-Observer batch seam used by the node forwarder. */
+  @Post('ingest/batch')
+  async ingestBatch(@Body() body: ObserverBatchIngestBody = {}, @Headers() headers: HeaderBag) {
+    const events = Array.isArray(body.events) ? body.events.slice(0, 256) : [];
+    const items: unknown[] = [];
+    let acceptedEvents = 0;
+    for (let index = 0; index < events.length; index += 1) {
+      const event = events[index];
+      if (!event || typeof event.line !== 'string' || !event.line.trim()) {
+        items.push({ index, accepted: false, reason: 'missing observer line' });
+        continue;
+      }
+      const result = await this.ingest(event, headers);
+      const accepted = result.accepted === true;
+      if (accepted) acceptedEvents += 1;
+      items.push({ index, ...result });
+    }
+    const submittedEvents = Array.isArray(body.events) ? body.events.length : 0;
+    return {
+      accepted: acceptedEvents > 0,
+      acceptedEvents,
+      rejectedEvents: submittedEvents - acceptedEvents,
+      items,
+    };
+  }
+
   /** The real ingestion seam: external agents/observers POST events here to be judged + counted. */
   @Post('ingest')
   async ingest(@Body() body: IngestBody, @Headers() headers: HeaderBag) {
-    const { line, collectorId, nodeName, sourceId, sourceName, sourceType, token, ...given } = body;
+    const { line, collectorId, nodeName, sourceId, sourceName, sourceType, token, sourceEventId, ...given } = body;
     const heartbeat = parseCollectorHeartbeatLine(line);
     const requestSourceId = sourceId ?? headerValue(headers, 'x-anysentry-source-id');
     const requestToken = token ?? headerValue(headers, 'x-anysentry-ingest-token') ?? bearerToken(headers);
@@ -4421,6 +4899,7 @@ export class SecurityMonitoringController {
     }
     const metaGiven: Partial<T.EventMeta> = {
       ...given,
+      sourceEventId,
       attributes: {
         ...(given.attributes ?? {}),
         ...(collectorId ? { collectorId } : {}),
@@ -4428,21 +4907,9 @@ export class SecurityMonitoringController {
         ...(sourceResolution.source?.sourceId ? { sourceId: sourceResolution.source.sourceId } : {}),
       },
     };
-    // Enrich identity (pod-uid → real agent name) and focus on agent workloads (drop infra/host).
-    const meta = this.kube.enrich(deriveMeta(line, metaGiven));
-    if (!meta) {
-      this.recordRejectedIngest(sourceResolution, 'filtered: infra/host (not an agent workload)', {
-        sourceId: requestSourceId,
-        sourceName,
-        sourceType,
-        collectorId,
-        nodeName,
-        workspacePath: given.workspacePath,
-        endpoint: 'ingest',
-        rejectedEvents: 1,
-      });
-      return { accepted: false, sourceId: sourceResolution.source?.sourceId, reason: 'filtered: infra/host (not an agent workload)' };
-    }
+    // Enrich from the same registry consumed by forwarders. Filtering is node-local; direct API
+    // producers remain fail-open and are never dropped solely because metadata is incomplete.
+    const meta = this.agentMetadata.applyReview(this.kube.enrich(deriveMeta(line, metaGiven)));
     const rec = await this.judge.accept(line, meta);
     if (!rec) {
       this.recordRejectedIngest(sourceResolution, 'unparseable event', {
@@ -4457,6 +4924,8 @@ export class SecurityMonitoringController {
       });
       return { accepted: false, sourceId: sourceResolution.source?.sourceId, reason: 'unparseable event' };
     }
+    await this.enqueueCanonicalShadow(rec, line);
+    await this.observeSupplyChainInstall(rec, line);
     this.sources.recordAccepted(sourceResolution, 'event', { collectorId, workspacePath: rec.workspacePath });
     this.agg.invalidateWindowCache();
     return { accepted: true, sourceId: sourceResolution.source?.sourceId, eventId: rec.eventId, traceId: rec.traceId, spanId: rec.spanId, runId: rec.runId, verdict: rec.verdict, tier: rec.tier, severity: rec.severity, reason: rec.reason, riskCategory: rec.riskCategory, decisionStatus: rec.decisionStatus, evaluationId: rec.evaluationId };

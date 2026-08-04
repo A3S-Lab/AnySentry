@@ -1,0 +1,18 @@
+{
+  "name": "anysentry-agent-runtime-lab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal A3S Code and Pi agent runtimes for AnySentry discovery tests",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "start:a3s": "node app/a3s-loop.mjs",
+    "start:pi": "node app/pi-loop.mjs"
+  },
+  "dependencies": {
+    "@a3s-lab/code": "6.6.0",
+    "@earendil-works/pi-coding-agent": "0.83.0"
+  }
+}

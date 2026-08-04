@@ -3,9 +3,13 @@
 #   docker compose up -d --build
 #
 # Feed real events by piping an a3s-observer collector into scripts/observer-forward.js.
+x-anysentry-infrastructure-labels: &anysentry-infrastructure-labels
+  io.anysentry.observe: "false"
+
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
+    labels: *anysentry-infrastructure-labels
     environment:
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-anysentry}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-anysentry}
@@ -21,6 +25,7 @@ services:
 
   redis:
     image: redis:7.4-alpine
+    labels: *anysentry-infrastructure-labels
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - redis-data:/data
@@ -34,6 +39,7 @@ services:
   anysentry:
     build: .
     image: ghcr.io/a3s-lab/anysentry:latest
+    labels: *anysentry-infrastructure-labels
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -47,10 +53,28 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-anysentry}
       ANYSENTRY_ASYNC_JUDGE: "on"
       ANYSENTRY_REDIS_URL: redis://redis:6379/0
-      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-proxy-managed}
+      ANYSENTRY_SUPPLY_CHAIN: ${ANYSENTRY_SUPPLY_CHAIN:-off}
+      ANYSENTRY_SUPPLY_CHAIN_RUNTIME: ${ANYSENTRY_SUPPLY_CHAIN_RUNTIME:-off}
+      ANYSENTRY_WORKSPACE_SCANNER_TOKEN: ${ANYSENTRY_WORKSPACE_SCANNER_TOKEN:-}
+      ANYSENTRY_WORKSPACE_SCANNER_TOKENS: ${ANYSENTRY_WORKSPACE_SCANNER_TOKENS:-}
+      ANYSENTRY_RUNTIME_INSTALL_DEBOUNCE_MS: ${ANYSENTRY_RUNTIME_INSTALL_DEBOUNCE_MS:-10000}
+      ANYSENTRY_STREAMING: ${ANYSENTRY_STREAMING:-off}
+      ANYSENTRY_STREAM_AGENT_ONLY: ${ANYSENTRY_STREAM_AGENT_ONLY:-on}
+      ANYSENTRY_STREAM_BOOTSTRAP_SERVERS: ${ANYSENTRY_STREAM_BOOTSTRAP_SERVERS:-kafka:9092}
+      ANYSENTRY_STREAM_CANONICAL_TOPIC: ${ANYSENTRY_STREAM_CANONICAL_TOPIC:-anysentry.events.canonical.v1}
+      ANYSENTRY_STREAM_JUDGMENTS_TOPIC: ${ANYSENTRY_STREAM_JUDGMENTS_TOPIC:-anysentry.judgments.v1}
+      ANYSENTRY_STREAM_EPISODES_TOPIC: ${ANYSENTRY_STREAM_EPISODES_TOPIC:-anysentry.risk-analysis-batches.v1}
+      ANYSENTRY_STREAM_FINDINGS_TOPIC: ${ANYSENTRY_STREAM_FINDINGS_TOPIC:-anysentry.stream.findings.v1}
+      ANYSENTRY_STREAM_DLQ_TOPIC: ${ANYSENTRY_STREAM_DLQ_TOPIC:-anysentry.stream.dlq.v1}
+      A3S_SENTRY_LLM_URL: ${A3S_SENTRY_LLM_URL:-http://host.docker.internal:18051/v1}
+      A3S_SENTRY_LLM_MODEL: ${A3S_SENTRY_LLM_MODEL:-glm-5.2}
+      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-}
       A3S_SENTRY_L3_URL: ${A3S_SENTRY_L3_URL:-http://host.docker.internal:18051/v1}
       A3S_SENTRY_L3_MODEL: ${A3S_SENTRY_L3_MODEL:-glm-5.2}
-      A3S_SENTRY_L3_KEY: ${A3S_SENTRY_L3_KEY:-proxy-managed}
+      A3S_SENTRY_L3_KEY: ${A3S_SENTRY_L3_KEY:-}
+      ANYSENTRY_IDENTITY_REVIEW_TIMEOUT_MS: ${ANYSENTRY_IDENTITY_REVIEW_TIMEOUT_MS:-120000}
+      ANYSENTRY_IDENTITY_REVIEW_LLM_TIMEOUT_MS: ${ANYSENTRY_IDENTITY_REVIEW_LLM_TIMEOUT_MS:-45000}
+      ANYSENTRY_IDENTITY_REVIEW_PREFLIGHT_TIMEOUT_MS: ${ANYSENTRY_IDENTITY_REVIEW_PREFLIGHT_TIMEOUT_MS:-15000}
       # ANYSENTRY_SYNTHETIC_FEED: "on"
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -60,6 +84,7 @@ services:
 
   fast-judge:
     image: ghcr.io/a3s-lab/anysentry:latest
+    labels: *anysentry-infrastructure-labels
     depends_on:
       redis:
         condition: service_healthy
@@ -68,13 +93,18 @@ services:
       ANYSENTRY_WORKER_ROLE: fast
       ANYSENTRY_REDIS_URL: redis://redis:6379/0
       ANYSENTRY_FAST_JUDGE_CONCURRENCY: 4
-      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-proxy-managed}
+      ANYSENTRY_L2_MODEL: ${ANYSENTRY_L2_MODEL:-deepseek-v4-flash}
+      ANYSENTRY_L2_CONTEXT_TOKENS: ${ANYSENTRY_L2_CONTEXT_TOKENS:-16384}
+      A3S_SENTRY_LLM_URL: ${A3S_SENTRY_LLM_URL:-http://host.docker.internal:18051/v1}
+      A3S_SENTRY_LLM_MODEL: ${A3S_SENTRY_LLM_MODEL:-glm-5.2}
+      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
   l3-worker:
     image: ghcr.io/a3s-lab/anysentry:latest
+    labels: *anysentry-infrastructure-labels
     depends_on:
       redis:
         condition: service_healthy
@@ -84,16 +114,240 @@ services:
       ANYSENTRY_REDIS_URL: redis://redis:6379/0
       ANYSENTRY_L3_CONCURRENCY: 2
       ANYSENTRY_L3_TIMEOUT_MS: 120000
+      ANYSENTRY_L3_RETRY_TIMEOUT_MS: 180000
       ANYSENTRY_L3_ATTEMPTS: 2
       ANYSENTRY_L3_CONTEXT_TOKENS: 32768
       ANYSENTRY_L3_SKILLS: /opt/anysentry/skills
+      A3S_SENTRY_LLM_URL: ${A3S_SENTRY_LLM_URL:-http://host.docker.internal:18051/v1}
+      A3S_SENTRY_LLM_MODEL: ${A3S_SENTRY_LLM_MODEL:-glm-5.2}
+      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-}
       A3S_SENTRY_L3_URL: ${A3S_SENTRY_L3_URL:-http://host.docker.internal:18051/v1}
       A3S_SENTRY_L3_MODEL: ${A3S_SENTRY_L3_MODEL:-glm-5.2}
-      A3S_SENTRY_L3_KEY: ${A3S_SENTRY_L3_KEY:-proxy-managed}
+      A3S_SENTRY_L3_KEY: ${A3S_SENTRY_L3_KEY:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  kafka:
+    profiles: ["streaming"]
+    image: apache/kafka:4.1.1
+    labels: *anysentry-infrastructure-labels
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 2
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/9092'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  kafka-init:
+    profiles: ["streaming"]
+    image: apache/kafka:4.1.1
+    labels: *anysentry-infrastructure-labels
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        for topic in \
+          "${ANYSENTRY_STREAM_CANONICAL_TOPIC:-anysentry.events.canonical.v1}" \
+          "${ANYSENTRY_STREAM_JUDGMENTS_TOPIC:-anysentry.judgments.v1}" \
+          "${ANYSENTRY_STREAM_EPISODES_TOPIC:-anysentry.risk-analysis-batches.v1}" \
+          "${ANYSENTRY_STREAM_FINDINGS_TOPIC:-anysentry.stream.findings.v1}" \
+          "${ANYSENTRY_SUPPLY_CHAIN_CONTEXT_TOPIC:-anysentry.supply-chain.context.v1}" \
+          "${ANYSENTRY_STREAM_DLQ_TOPIC:-anysentry.stream.dlq.v1}"; do
+          /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server kafka:9092 \
+            --create --if-not-exists \
+            --topic "$$topic" \
+            --partitions 2 \
+            --replication-factor 1
+        done
+
+  flink-checkpoint-init:
+    profiles: ["streaming"]
+    build: ./streaming/flink
+    image: anysentry-flink-streaming:local
+    labels: *anysentry-infrastructure-labels
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["chown -R flink:flink /opt/flink/checkpoints"]
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+
+  flink-jobmanager:
+    profiles: ["streaming"]
+    build: ./streaming/flink
+    image: anysentry-flink-streaming:local
+    labels: *anysentry-infrastructure-labels
+    depends_on:
+      flink-checkpoint-init:
+        condition: service_completed_successfully
+    command: jobmanager
+    environment:
+      JOB_MANAGER_RPC_ADDRESS: flink-jobmanager
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+    ports:
+      - "8081:8081"
+    restart: unless-stopped
+
+  flink-taskmanager:
+    profiles: ["streaming"]
+    build: ./streaming/flink
+    image: anysentry-flink-streaming:local
+    labels: *anysentry-infrastructure-labels
+    depends_on:
+      - flink-jobmanager
+    command: taskmanager
+    environment:
+      JOB_MANAGER_RPC_ADDRESS: flink-jobmanager
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+    restart: unless-stopped
+
+  flink-job-submit:
+    profiles: ["streaming"]
+    build: ./streaming/flink
+    image: anysentry-flink-streaming:local
+    labels: *anysentry-infrastructure-labels
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      flink-jobmanager:
+        condition: service_started
+      flink-taskmanager:
+        condition: service_started
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        until flink list -m flink-jobmanager:8081 >/dev/null 2>&1; do sleep 2; done
+        flink run -d \
+          -m flink-jobmanager:8081 \
+          -c org.a3s.anysentry.streaming.AnySentryStreamJob \
+          /opt/flink/usrlib/anysentry-flink-streaming.jar
+    environment:
+      ANYSENTRY_STREAM_BOOTSTRAP_SERVERS: kafka:9092
+      ANYSENTRY_STREAM_CANONICAL_TOPIC: ${ANYSENTRY_STREAM_CANONICAL_TOPIC:-anysentry.events.canonical.v1}
+      ANYSENTRY_STREAM_JUDGMENTS_TOPIC: ${ANYSENTRY_STREAM_JUDGMENTS_TOPIC:-anysentry.judgments.v1}
+      ANYSENTRY_STREAM_EPISODES_TOPIC: ${ANYSENTRY_STREAM_EPISODES_TOPIC:-anysentry.risk-analysis-batches.v1}
+      ANYSENTRY_STREAM_FINDINGS_TOPIC: ${ANYSENTRY_STREAM_FINDINGS_TOPIC:-anysentry.stream.findings.v1}
+      ANYSENTRY_STREAM_DLQ_TOPIC: ${ANYSENTRY_STREAM_DLQ_TOPIC:-anysentry.stream.dlq.v1}
+      ANYSENTRY_SUPPLY_CHAIN_CONTEXT_TOPIC: ${ANYSENTRY_SUPPLY_CHAIN_CONTEXT_TOPIC:-anysentry.supply-chain.context.v1}
+      ANYSENTRY_FLINK_CANONICAL_GROUP: ${ANYSENTRY_FLINK_CANONICAL_GROUP:-anysentry-flink-shadow-v2}
+      ANYSENTRY_FLINK_JUDGMENTS_GROUP: ${ANYSENTRY_FLINK_JUDGMENTS_GROUP:-anysentry-flink-judgments-v2}
+      ANYSENTRY_FLINK_SUPPLY_CHAIN_CONTEXT_GROUP: ${ANYSENTRY_FLINK_SUPPLY_CHAIN_CONTEXT_GROUP:-anysentry-flink-supply-chain-context-v1}
+      ANYSENTRY_FLINK_STARTUP_MODE: ${ANYSENTRY_FLINK_STARTUP_MODE:-latest}
+      ANYSENTRY_FLINK_PARALLELISM: ${ANYSENTRY_FLINK_PARALLELISM:-2}
+
+  stream-worker:
+    profiles: ["streaming"]
+    image: ghcr.io/a3s-lab/anysentry:latest
+    labels: *anysentry-infrastructure-labels
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    command: ["node", "dist/security-monitoring/stream-worker-main.js"]
+    environment:
+      ANYSENTRY_STREAM_WORKER_ROLE: all
+      ANYSENTRY_REDIS_URL: redis://redis:6379/0
+      ANYSENTRY_STREAM_BOOTSTRAP_SERVERS: kafka:9092
+      ANYSENTRY_STREAM_EPISODES_TOPIC: ${ANYSENTRY_STREAM_EPISODES_TOPIC:-anysentry.risk-analysis-batches.v1}
+      ANYSENTRY_STREAM_FINDINGS_TOPIC: ${ANYSENTRY_STREAM_FINDINGS_TOPIC:-anysentry.stream.findings.v1}
+      ANYSENTRY_STREAM_CONSUMER_GROUP: ${ANYSENTRY_STREAM_CONSUMER_GROUP:-anysentry-stream-findings}
+      ANYSENTRY_STREAM_EPISODE_CONSUMER_GROUP: ${ANYSENTRY_STREAM_EPISODE_CONSUMER_GROUP:-anysentry-stream-episodes}
+      ANYSENTRY_COMPOSITE_MAX_EVENT_AGE_MS: ${ANYSENTRY_COMPOSITE_MAX_EVENT_AGE_MS:-900000}
+      KAFKAJS_NO_PARTITIONER_WARNING: "1"
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-anysentry}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-anysentry}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-anysentry}
+    restart: unless-stopped
+
+  composite-judge:
+    profiles: ["streaming"]
+    image: ghcr.io/a3s-lab/anysentry:latest
+    labels: *anysentry-infrastructure-labels
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["node", "dist/security-monitoring/stream-worker-main.js"]
+    environment:
+      ANYSENTRY_STREAM_WORKER_ROLE: judge
+      ANYSENTRY_REDIS_URL: redis://redis:6379/0
+      ANYSENTRY_COMPOSITE_LLM_URL: ${ANYSENTRY_COMPOSITE_LLM_URL:-http://host.docker.internal:18051/v1}
+      ANYSENTRY_COMPOSITE_LLM_KEY: ${ANYSENTRY_COMPOSITE_LLM_KEY:-proxy-managed}
+      ANYSENTRY_COMPOSITE_MODEL: ${ANYSENTRY_COMPOSITE_MODEL:-deepseek-v4-flash}
+      ANYSENTRY_COMPOSITE_TIMEOUT_MS: ${ANYSENTRY_COMPOSITE_TIMEOUT_MS:-60000}
+      ANYSENTRY_COMPOSITE_CONCURRENCY: ${ANYSENTRY_COMPOSITE_CONCURRENCY:-2}
+      ANYSENTRY_COMPOSITE_MAX_EVENT_AGE_MS: ${ANYSENTRY_COMPOSITE_MAX_EVENT_AGE_MS:-900000}
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-anysentry}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-anysentry}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-anysentry}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  supply-chain-assessment:
+    profiles: ["supply-chain"]
+    image: ghcr.io/a3s-lab/anysentry:latest
+    labels: *anysentry-infrastructure-labels
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["node", "dist/security-monitoring/supply-chain-worker-main.js"]
+    environment:
+      ANYSENTRY_REDIS_URL: redis://redis:6379/0
+      ANYSENTRY_OSV_API_URL: ${ANYSENTRY_OSV_API_URL:-https://api.osv.dev}
+      ANYSENTRY_OSV_INTELLIGENCE_MODE: ${ANYSENTRY_OSV_INTELLIGENCE_MODE:-online}
+      ANYSENTRY_OSV_DATA_REVISION: ${ANYSENTRY_OSV_DATA_REVISION:-}
+      ANYSENTRY_OSV_REQUEST_TIMEOUT_MS: ${ANYSENTRY_OSV_REQUEST_TIMEOUT_MS:-20000}
+      ANYSENTRY_OSV_REFRESH_INTERVAL_MS: ${ANYSENTRY_OSV_REFRESH_INTERVAL_MS:-86400000}
+      ANYSENTRY_SUPPLY_CHAIN_ASSESSMENT_CONCURRENCY: ${ANYSENTRY_SUPPLY_CHAIN_ASSESSMENT_CONCURRENCY:-2}
+      ANYSENTRY_SUPPLY_CHAIN_RUNTIME: ${ANYSENTRY_SUPPLY_CHAIN_RUNTIME:-off}
+      ANYSENTRY_STREAM_BOOTSTRAP_SERVERS: kafka:9092
+      ANYSENTRY_SUPPLY_CHAIN_CONTEXT_TOPIC: ${ANYSENTRY_SUPPLY_CHAIN_CONTEXT_TOPIC:-anysentry.supply-chain.context.v1}
+      KAFKAJS_NO_PARTITIONER_WARNING: "1"
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-anysentry}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-anysentry}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-anysentry}
     restart: unless-stopped
 
 volumes:
   clickhouse-data:
   redis-data:
+  kafka-data:
+  flink-checkpoints:

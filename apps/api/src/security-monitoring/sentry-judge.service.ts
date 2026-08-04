@@ -3,12 +3,14 @@ import { createHash } from 'node:crypto';
 import { Sentry, dns, egress, fileAccess, securityAction, sslContent, toolExec } from '@a3s-lab/sentry';
 import { AgentAttributionService } from './agent-attribution.service';
 import { AlertingService } from './alerting.service';
-import { ClickHouseStore, IncidentState } from './clickhouse-store';
+import { ClickHouseStore, IncidentState, StoredEventQuery } from './clickhouse-store';
 import { PolicyConfig, buildFastAcl, policyConfigError, policyFromEnvironment, sanitizePolicy, tierStatus } from './policy-config';
 import { cleanText } from './redaction';
 import { DecisionResultJob, FastJudgeJob } from './async-judgment.types';
 import { JudgmentQueueService } from './judgment-queue.service';
-import { CollectorHeartbeatRecord, CollectorHeartbeatRequest, EventCategory, EventMeta, Incident, IncidentStatus, JudgedEvent, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
+import { RuntimeModelConfigService } from './runtime-model-config';
+import { resolveJudgmentRoute } from './identity-judgment-routing';
+import { CollectorHeartbeatRecord, CollectorHeartbeatRequest, EventCategory, EventMeta, IdentityAiReviewRecord, Incident, IncidentStatus, JudgedEvent, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
 
 const SEVERITY_SCORE: Record<Severity, number> = { info: 8, low: 28, medium: 52, high: 76, critical: 95 };
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
@@ -241,7 +243,12 @@ function producerReportedFinding(base: JudgedEventBase): {
 
 @Injectable()
 export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
-  constructor(private readonly alerting: AlertingService, private readonly attributionService: AgentAttributionService, private readonly queues: JudgmentQueueService) {}
+  constructor(
+    private readonly alerting: AlertingService,
+    private readonly attributionService: AgentAttributionService,
+    private readonly queues: JudgmentQueueService,
+    private readonly runtimeModels: RuntimeModelConfigService,
+  ) {}
 
   private sentry!: Sentry;
   // In-memory hot ring: the dashboard's fast, synchronous read/aggregation path. Durability + retention
@@ -301,7 +308,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     let next: Sentry;
     try {
       next = Sentry.create(buildFastAcl(config, {
-        llmApiKey: process.env.ANYSENTRY_LLM_API_KEY || process.env.A3S_SENTRY_LLM_KEY,
+        llmKey: process.env.A3S_SENTRY_LLM_KEY || process.env.ANYSENTRY_LLM_API_KEY,
       }));
     } catch (error) {
       throw policyConfigError(error);
@@ -312,13 +319,34 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
 
   /** The current policy + which tiers are active (the config panel reads this). */
   getPolicy(): { policy: PolicyConfig; status: ReturnType<typeof tierStatus> } {
-    return { policy: this.policy, status: tierStatus(this.policy) };
+    return { policy: this.policy, status: this.availableTiers() };
+  }
+
+  private availableTiers(): ReturnType<typeof tierStatus> {
+    const configured = tierStatus(this.policy);
+    return {
+      l1: true,
+      l2: configured.l2 && Boolean(this.runtimeModels.get('fast_review')),
+      l3: configured.l3 && Boolean(this.runtimeModels.get('deep_investigation')),
+    };
   }
 
   storageStatus(): { mode: 'clickhouse' | 'memory'; clickhouseConfigured: boolean; clickhouseReady: boolean } {
     const clickhouseConfigured = Boolean(process.env.CLICKHOUSE_URL);
     const clickhouseReady = this.ch.enabled;
     return { mode: clickhouseReady ? 'clickhouse' : 'memory', clickhouseConfigured, clickhouseReady };
+  }
+
+  async searchStoredEvents(query: StoredEventQuery): Promise<JudgedEvent[]> {
+    return this.ch.searchEvents(query);
+  }
+
+  loadIdentityAiReviews(): Promise<IdentityAiReviewRecord[]> {
+    return this.ch.loadIdentityAiReviews();
+  }
+
+  saveIdentityAiReviews(records: IdentityAiReviewRecord[]): Promise<void> {
+    return this.ch.saveIdentityAiReviews(records);
   }
 
   /** Validate + apply a new policy, then persist it (survives restarts via ClickHouse). */
@@ -338,7 +366,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const attribution = meta.attribution ?? this.attributionService.attribute(meta, process, at);
     return {
       schemaVersion: SCHEMA_VERSION,
-      eventId: hashId('evt', [at, eventKind, ids.agentId, ids.sessionId, line]),
+      eventId: meta.sourceEventId
+        ? hashId('evt', [typeof attributes.sourceId === 'string' ? attributes.sourceId : undefined, meta.sourceEventId])
+        : hashId('evt', [at, eventKind, ids.agentId, ids.sessionId, line]),
+      sourceEventId: meta.sourceEventId,
       at,
       eventKind,
       eventCategory: meta.eventCategory ?? eventCategory(eventKind),
@@ -365,7 +396,11 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return hashId('pol', [JSON.stringify(this.policy)]);
   }
 
-  private recordProducerFinding(base: JudgedEventBase, finding: NonNullable<ReturnType<typeof producerReportedFinding>>): JudgedEvent {
+  private recordProducerFinding(
+    base: JudgedEventBase,
+    finding: NonNullable<ReturnType<typeof producerReportedFinding>>,
+    judgment?: JudgedEvent['judgment'],
+  ): JudgedEvent {
     return this.push({
       ...base,
       verdict: 'escalate',
@@ -376,6 +411,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       riskName: finding.riskName,
       riskType: 'atomic',
       riskScore: SEVERITY_SCORE[finding.severity],
+      judgment,
     });
   }
 
@@ -431,9 +467,19 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   async accept(line: string, meta: EventMeta, at = Date.now()): Promise<JudgedEvent | null> {
     if (!this.queues.enabled) return this.judge(line, meta, at);
     const base = this.eventBase(line, meta, at);
+    const routing = resolveJudgmentRoute(base.attribution?.classification, this.policy, this.availableTiers());
+    if (routing.profile === 'discard') return null;
     if (this.isInternalL3Invocation(line, base)) return this.recordInternalL3Activity(base);
     const producerFinding = producerReportedFinding(base);
-    if (producerFinding) return this.recordProducerFinding(base, producerFinding);
+    if (producerFinding) {
+      return this.recordProducerFinding(base, producerFinding, {
+        ...routing,
+        policyVersion: this.policyVersion(),
+        l1Verdict: 'escalate',
+        nextTierEligible: false,
+        stopReason: 'producer_finding',
+      });
+    }
     if (!SECURITY_JUDGED_KINDS.has(base.eventKind)) {
       if (!OBSERVER_KINDS.has(base.eventKind) && base.source !== 'api') return null;
       return this.push({
@@ -446,6 +492,13 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         riskName: '正常',
         riskType: 'atomic',
         riskScore: 0,
+        judgment: {
+          ...routing,
+          policyVersion: this.policyVersion(),
+          l1Verdict: 'allow',
+          nextTierEligible: false,
+          stopReason: 'no_applicable_l1_rule',
+        },
       });
     }
 
@@ -465,16 +518,21 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       riskName: '待研判',
       riskType: 'atomic',
       riskScore: 0,
+      judgment: {
+        ...routing,
+        policyVersion,
+      },
     };
     await this.ch.insertNow(pending);
     this.upsertMemory(pending, false);
     const job: FastJudgeJob = {
-      schemaVersion: 'anysentry.fast_judge_job.v1',
+      schemaVersion: 'anysentry.fast_judge_job.v2',
       evaluationId,
       policyVersion,
       event: pending,
       observerLine: line.slice(0, 64 * 1024),
       policy: this.policy,
+      routing,
       queuedAt: Date.now(),
     };
     try {
@@ -506,6 +564,18 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       const risk = riskFromDecision(decision, result.event.eventKind);
       next = {
         ...result.event,
+        judgment: {
+          ...(result.event.judgment ?? {
+            classification: result.event.attribution?.classification ?? 'unknown',
+            profile: 'full',
+            maxTier: 'L3',
+            reason: result.event.attribution?.classification === 'confirmed_agent' ? 'confirmed_agent_full' : 'candidate_agent_full',
+            routingVersion: 'legacy',
+          }),
+          l1Verdict: result.l1Decision?.verdict as Verdict | undefined,
+          nextTierEligible: result.nextTierEligible,
+          stopReason: result.stageStopReason,
+        },
         decisionStatus: awaitingL3 ? 'pending' : result.status,
         evaluationId: result.evaluationId,
         policyVersion: result.policyVersion,
@@ -525,6 +595,18 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     } else {
       next = {
         ...(current ?? result.event),
+        judgment: {
+          ...((current ?? result.event).judgment ?? {
+            classification: result.event.attribution?.classification ?? 'unknown',
+            profile: 'full',
+            maxTier: 'L3',
+            reason: result.event.attribution?.classification === 'confirmed_agent' ? 'confirmed_agent_full' : 'candidate_agent_full',
+            routingVersion: 'legacy',
+          }),
+          l1Verdict: result.l1Decision?.verdict as Verdict | undefined,
+          nextTierEligible: result.nextTierEligible,
+          stopReason: result.stageStopReason,
+        },
         decisionStatus: result.status,
         evaluationId: result.evaluationId,
         policyVersion: result.policyVersion,
@@ -556,7 +638,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const sourceId = typeof attributes.sourceId === 'string' ? cleanText(attributes.sourceId, 160) : undefined;
     const base = {
       schemaVersion: SCHEMA_VERSION,
-      eventId: hashId('evt', [at, eventKind, ids.agentId, ids.sessionId, line]),
+      eventId: meta.sourceEventId
+        ? hashId('evt', [typeof attributes.sourceId === 'string' ? attributes.sourceId : undefined, meta.sourceEventId])
+        : hashId('evt', [at, eventKind, ids.agentId, ids.sessionId, line]),
+      sourceEventId: meta.sourceEventId,
       at,
       eventKind,
       eventCategory: meta.eventCategory ?? eventCategory(eventKind),
@@ -578,8 +663,25 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       rawPreview: meta.rawPreview,
     } satisfies JudgedEventBase;
 
+    const routing = resolveJudgmentRoute(attribution?.classification, this.policy, this.availableTiers());
+    if (routing.profile === 'discard') return null;
+    const policyVersion = this.policyVersion();
     if (this.isInternalL3Invocation(line, base)) return this.recordInternalL3Activity(base);
-    const d = this.sentry.evaluate(line) as SentryDecisionWithRisk | null;
+    const evaluateL1 = (this.sentry as Sentry & { evaluateL1?: (event: string) => { l1Decision: SentryDecisionWithRisk; nextTierEligible: boolean; stopReason: string } | null }).evaluateL1;
+    const l1 = routing.profile === 'l1_only'
+      ? (typeof evaluateL1 === 'function' ? evaluateL1.call(this.sentry, line) : null)
+      : null;
+    if (routing.profile === 'l1_only' && typeof evaluateL1 !== 'function') {
+      throw new Error('@a3s-lab/sentry staged L1 SDK is required');
+    }
+    const d = (l1?.l1Decision ?? this.sentry.evaluate(line)) as SentryDecisionWithRisk | null;
+    const judgment = {
+      ...routing,
+      policyVersion,
+      l1Verdict: (l1?.l1Decision.verdict ?? (d?.tier === 'Rules' ? d.verdict : undefined)) as Verdict | undefined,
+      nextTierEligible: l1?.nextTierEligible,
+      stopReason: routing.profile === 'l1_only' ? routing.reason : undefined,
+    };
     const producerFinding = producerReportedFinding(base);
     if (producerFinding) {
       return this.push({
@@ -592,13 +694,14 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         riskName: producerFinding.riskName,
         riskType: 'atomic',
         riskScore: SEVERITY_SCORE[producerFinding.severity],
+        judgment,
       });
     }
     if (!d) {
       // Not security-judged by the sentry policy, but still a real observed signal — record benign so
       // every observer feature is counted. Drop only truly unparseable input (unknown kind).
       if (!OBSERVER_KINDS.has(eventKind) && base.source !== 'api') return null;
-      return this.push({ ...base, verdict: 'allow', tier: 'Rules', severity: 'info', reason: 'observed', riskCategory: 'benign', riskName: '正常', riskType: 'atomic', riskScore: 0 });
+      return this.push({ ...base, verdict: 'allow', tier: 'Rules', severity: 'info', reason: 'observed', riskCategory: 'benign', riskName: '正常', riskType: 'atomic', riskScore: 0, judgment: { ...judgment, l1Verdict: 'allow', nextTierEligible: false, stopReason: 'no_applicable_l1_rule' } });
     }
 
     const risk = riskFromDecision(d, eventKind);
@@ -615,6 +718,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       riskName: verdict === 'allow' ? '正常' : risk.name,
       riskType: risk.type,
       riskScore: verdict === 'allow' ? 0 : SEVERITY_SCORE[severity],
+      judgment,
     });
   }
 
@@ -753,6 +857,65 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const clamp = (n: unknown) => Math.max(0, Number.isFinite(Number(n)) ? Math.round(Number(n)) : 0);
     const eventKindCounts: Record<string, number> = {};
     for (const [key, value] of Object.entries(input.eventKindCounts ?? {})) eventKindCounts[key.slice(0, 64)] = clamp(value);
+    const rawFilter = input.filterMetrics ?? ({} as Partial<import('./types').CollectorFilterMetrics>);
+    const filterMetrics: import('./types').CollectorFilterMetrics = {
+      scope: ['all', 'shadow', 'agent', 'decoupled'].includes(rawFilter.scope ?? '')
+        ? (rawFilter.scope as import('./types').CollectorFilterMetrics['scope'])
+        : 'decoupled',
+      filterMode: rawFilter.filterMode === 'shadow' ? 'shadow' : 'enforce',
+      retainUnknown: rawFilter.retainUnknown !== false,
+      retainNonAgent: rawFilter.retainNonAgent === true,
+      noisePolicy: rawFilter.noisePolicy === 'include' ? 'include' : 'balanced',
+      observed: clamp(rawFilter.observed),
+      forwarded: clamp(rawFilter.forwarded),
+      confirmedAgent: clamp(rawFilter.confirmedAgent),
+      probableAgent: clamp(rawFilter.probableAgent),
+      unknown: clamp(rawFilter.unknown),
+      nonAgent: clamp(rawFilter.nonAgent),
+      filteredNonAgent: clamp(rawFilter.filteredNonAgent),
+      wouldFilterNonAgent: clamp(rawFilter.wouldFilterNonAgent),
+      filteredNoise: clamp(rawFilter.filteredNoise),
+      wouldFilterNoise: clamp(rawFilter.wouldFilterNoise),
+      discoveryBudgetDropped: clamp(rawFilter.discoveryBudgetDropped),
+      wouldDiscoveryBudgetDrop: clamp(rawFilter.wouldDiscoveryBudgetDrop),
+      deduplicated: clamp(rawFilter.deduplicated),
+      queueDropped: clamp(rawFilter.queueDropped),
+      batches: clamp(rawFilter.batches),
+      batchEvents: clamp(rawFilter.batchEvents),
+      identitySnapshotReady: rawFilter.identitySnapshotReady === true,
+      identitySnapshotVersion: clamp(rawFilter.identitySnapshotVersion),
+      identitySnapshotAgeSeconds: clamp(rawFilter.identitySnapshotAgeSeconds),
+      identityCacheEntries: clamp(rawFilter.identityCacheEntries),
+      identityCacheHits: clamp(rawFilter.identityCacheHits),
+      identityCacheMisses: clamp(rawFilter.identityCacheMisses),
+      identityCandidateCacheEntries: clamp(rawFilter.identityCandidateCacheEntries),
+      identityCgroupBindings: clamp(rawFilter.identityCgroupBindings),
+      identityCgroupHits: clamp(rawFilter.identityCgroupHits),
+      identityCgroupMisses: clamp(rawFilter.identityCgroupMisses),
+      identityErrors: clamp(rawFilter.identityErrors),
+      dockerEnabled: rawFilter.dockerEnabled === true,
+      dockerReady: rawFilter.dockerReady === true,
+      dockerEntries: clamp(rawFilter.dockerEntries),
+      dockerReconnects: clamp(rawFilter.dockerReconnects),
+      dockerErrors: clamp(rawFilter.dockerErrors),
+      behaviorWorkloads: clamp(rawFilter.behaviorWorkloads),
+      behaviorCandidates: clamp(rawFilter.behaviorCandidates),
+      behaviorPromoted: clamp(rawFilter.behaviorPromoted),
+      behaviorEvicted: clamp(rawFilter.behaviorEvicted),
+      templateLoaded: clamp(rawFilter.templateLoaded),
+      templateInvalid: clamp(rawFilter.templateInvalid),
+      templateMatches: clamp(rawFilter.templateMatches),
+      templateAmbiguous: clamp(rawFilter.templateAmbiguous),
+      processCacheEntries: clamp(rawFilter.processCacheEntries),
+      processTombstones: clamp(rawFilter.processTombstones),
+      processClassifications: clamp(rawFilter.processClassifications),
+      processCacheHits: clamp(rawFilter.processCacheHits),
+      processCacheMisses: clamp(rawFilter.processCacheMisses),
+      processProcReads: clamp(rawFilter.processProcReads),
+      processBootstrapProcReads: clamp(rawFilter.processBootstrapProcReads),
+      processFallbackProcReads: clamp(rawFilter.processFallbackProcReads),
+      processAncestryProcReads: clamp(rawFilter.processAncestryProcReads),
+    };
     const rec: CollectorHeartbeatRecord = {
       collectorId,
       at,
@@ -771,6 +934,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       outputDropped: clamp(input.outputDropped),
       errorCount: clamp(input.errorCount),
       observedAgents: clamp(input.observedAgents),
+      filterMetrics,
       message: cleanText(input.message, 500),
     };
     this.addCollectorHeartbeat(rec);
@@ -812,6 +976,11 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   /** Events within a window [sinceMs, now]. */
   query(sinceMs: number): JudgedEvent[] {
     return this.store.filter((e) => e.at >= sinceMs);
+  }
+
+  /** O(1) hot-ring lookup for pinned event drill-downs and evidence assembly. */
+  findEvent(eventId: string): JudgedEvent | undefined {
+    return this.storeById.get(eventId);
   }
 
   /** Store histograms + a recent sample — which observer signal kinds / verdicts / tiers / identities

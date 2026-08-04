@@ -66,6 +66,26 @@ kubectl -n anysentry create secret generic anysentry-clickhouse \
   --from-literal=CLICKHOUSE_PASSWORD='change-me'
 ```
 
+L2/L3 model keys are deployment secrets too: do not put them in the policy document or a
+ConfigMap. When Redis plus asynchronous judgment workers are installed, create a dedicated Secret
+and expose it to every process that actually calls the model:
+
+```bash
+kubectl -n anysentry create secret generic anysentry-model-credentials \
+  --from-literal=A3S_SENTRY_LLM_KEY='<fast-review-key>' \
+  --from-literal=A3S_SENTRY_L3_KEY='<deep-investigation-key>'
+
+kubectl -n anysentry set env deployment/anysentry --from=secret/anysentry-model-credentials
+kubectl -n anysentry set env deployment/fast-judge --from=secret/anysentry-model-credentials
+kubectl -n anysentry set env deployment/l3-worker --from=secret/anysentry-model-credentials
+```
+
+Set model URLs and IDs separately through normal deployment configuration. L2 and AI identity
+review use only `A3S_SENTRY_LLM_*`; L3 uses only `A3S_SENTRY_L3_*`. Operators can instead test and
+apply either connection in the policy page. UI-provided keys remain memory-only and are synchronized
+to workers through Redis Pub/Sub, so they must be entered again after the API restarts. The secret
+value is never returned to the browser.
+
 ## 3. Deploy AnySentry (+ bundled ClickHouse)
 
 ```bash
@@ -135,11 +155,61 @@ so every node appears as a stable Collector. The bundled forwarder also emits so
 heartbeats every `ANYSENTRY_HEARTBEAT_SECS` seconds; with no explicit `ANYSENTRY_SOURCE_ID`,
 AnySentry discovers one observer Source per node/collector automatically.
 
-The manifest uses `FORWARD_SCOPE=agent`. The forwarder derives Agent identity from the process and
-its host PID ancestry, forwards known Agent and unresolved events, and drops only events whose
-complete ancestry proves they are unrelated to an Agent root. Heartbeats report the observed,
-Agent, unknown, and filtered counts. Set `FORWARD_SCOPE=all` for an unfiltered migration fallback,
-or `FORWARD_SCOPE=shadow` to observe classification counts before enabling filtering.
+The manifest independently configures `FORWARD_FILTER_MODE=enforce`,
+`FORWARD_RETAIN_UNKNOWN=true`, `FORWARD_RETAIN_NON_AGENT=false`, and
+`FORWARD_NOISE_POLICY=balanced`. The forwarder checks the versioned Kubernetes workload
+snapshot before host process signatures and PID ancestry. A generic `node` or `python` process in
+an Agent container is therefore attributed by Pod UID + full Container ID, while a sidecar can be
+classified separately. Unknown identities remain observable; only positively identified
+non-Agent events are filtered. Events are sent in bounded batches (32 events or 50 ms), and
+heartbeats report classification, cache, queue, batch, filtered, and dropped counters.
+Routine `/proc`, `/sys`, `/run`, and `/dev` `FileAccess` noise is evaluated independently of the
+identity class; high-value deletion and security events remain observable.
+
+Label Agent Pods and, for multi-container Pods, identify the Agent container:
+
+```yaml
+metadata:
+  labels:
+    anysentry.io/workload-kind: agent
+    anysentry.io/agent-id: claw-agent
+    anysentry.io/agent-container: agent
+```
+
+Set `FORWARD_FILTER_MODE=shadow` to compare would-drop counters without dropping. For a temporary
+unfiltered recovery view, set `FORWARD_RETAIN_NON_AGENT=true` and `FORWARD_NOISE_POLICY=include`;
+this does not change identity classification or risk routing.
+
+For operator-managed discovery, copy `deploy/agent-templates.example.json` and set
+`ANYSENTRY_AGENT_TEMPLATES_FILE` in the observer-forwarder environment. Templates intentionally
+accept concise deployment/name declarations and may be refined with Kubernetes namespace/Pod/
+container/owner, Docker container/image, or bare-metal systemd/executable fields. Missing templates
+do not classify a workload as non-Agent.
+
+`ANYSENTRY_IDENTITY_NAMESPACES` defaults to `*`, using the bundled read-only
+ClusterRole/ClusterRoleBinding to map CRI/containerd IDs for every namespace. This identity map is
+not an Agent allowlist: unlabelled infrastructure Pods remain `unknown` until behavior analysis or
+human review classifies them. Set a comma-separated namespace allowlist and replace the binding
+with equivalent namespaced Roles only when deliberately trading complete friendly-name coverage
+for narrower metadata visibility. `ANYSENTRY_AGENT_NAMESPACES` remains a compatibility fallback.
+For an out-of-cluster source deployment, set `ANYSENTRY_KUBECONFIG` (or `KUBECONFIG`) to a
+kubeconfig containing CA plus client-certificate/client-key or bearer-token credentials. The API
+also detects `~/.kube/config`; `ANYSENTRY_KUBE_CONTEXT` overrides its current context.
+
+For Docker hosts, run the forwarder on the node with read access to `/var/run/docker.sock`, or set
+`ANYSENTRY_DOCKER_SOCKET` to another Docker-compatible Unix socket. Discovery defaults to `auto`
+and uses an initial `/containers/json` list plus the Docker container event stream; set
+`ANYSENTRY_DOCKER_DISCOVERY=off` to disable it. Docker API access is outside the event hot path.
+
+Framework discovery is enabled by default and keeps only bounded counters/small sets per physical
+workload. It requires LLM/tool alternation or the sequence `tool → network/model decision →
+different tool → workspace change`; volume alone cannot create a candidate. Known service-data
+paths do not count as workspace evidence, and a dominant executable repeatedly touching service
+data without LLM/sequence evidence can end a probable TTL early without declaring `non_agent`.
+Configure additional comma-separated service-state prefixes with
+`ANYSENTRY_BEHAVIOR_SERVICE_DATA_PATHS`. It cannot create confirmed identities and makes no model
+calls. Disable it with `ANYSENTRY_BEHAVIOR_DISCOVERY=off` or tune the matching
+`ANYSENTRY_BEHAVIOR_*` variables.
 
 ## Safety
 

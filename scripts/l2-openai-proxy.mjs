@@ -6,7 +6,7 @@ const targetBase = process.env.L2_TARGET_BASE || "https://api.pjlab.org.cn/v1";
 const apiKey = process.env.PJLAB_API_KEY;
 const host = process.env.L2_PROXY_HOST || "0.0.0.0";
 const port = Number(process.env.L2_PROXY_PORT || 18051);
-const upstreamTimeoutMs = Number(process.env.L2_PROXY_UPSTREAM_TIMEOUT_MS || 58_000);
+const upstreamTimeoutMs = Number(process.env.L2_PROXY_UPSTREAM_TIMEOUT_MS || 120_000);
 let activeRequests = 0;
 let requestSequence = 0;
 

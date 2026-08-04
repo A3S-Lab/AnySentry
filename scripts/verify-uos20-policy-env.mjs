@@ -32,10 +32,10 @@ assert.deepEqual(policy.agent, {
 });
 assert.equal(JSON.stringify(policy).includes(key), false, 'API key must not enter serializable policy');
 
-const acl = buildAcl(policy, { llmApiKey: key });
+const acl = buildAcl(policy, { llmKey: key });
 assert.match(acl, /key = "test-key-that-must-never-be-serialized"/u);
 assert.match(acl, /agent \{[\s\S]*timeout_s = 181[\s\S]*\}/u);
-const fastAcl = buildFastAcl(policy, { llmApiKey: key });
+const fastAcl = buildFastAcl(policy, { llmKey: key });
 assert.match(fastAcl, /key = "test-key-that-must-never-be-serialized"/u);
 assert.doesNotMatch(fastAcl, /agent \{/u);
 

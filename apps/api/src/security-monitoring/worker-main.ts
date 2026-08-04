@@ -12,7 +12,10 @@ import {
 } from './async-judgment.types';
 import { redisConnection } from './judgment-queue.service';
 import { isL3AgentTimeout, L3AgentPool } from './l3-agent-pool';
+import { L2CodeJudge } from './l2-code-judge';
+import { parseL3Decision } from './l3-decision-parser';
 import { buildFastAcl } from './policy-config';
+import { RuntimeModelClient } from './runtime-model-config';
 
 const role = process.env.ANYSENTRY_WORKER_ROLE;
 const connection = redisConnection();
@@ -20,26 +23,92 @@ const resultQueue = new Queue<DecisionResultJob>(DECISION_RESULTS_QUEUE, { conne
 const l3Queue = new Queue<L3JudgeJob>(L3_JOBS_QUEUE, { connection });
 const resultRedis = new IORedis(process.env.ANYSENTRY_REDIS_URL || 'redis://redis:6379/0', { maxRetriesPerRequest: null });
 const sentryCache = new Map<string, Sentry>();
+const l2JudgeCache = new Map<string, L2CodeJudge>();
 const l3Concurrency = Number(process.env.ANYSENTRY_L3_CONCURRENCY || 2);
 const l3TimeoutMs = Number(process.env.ANYSENTRY_L3_TIMEOUT_MS || 60_000);
+const l3RetryTimeoutMs = Math.max(
+  l3TimeoutMs,
+  Number(process.env.ANYSENTRY_L3_RETRY_TIMEOUT_MS || l3TimeoutMs),
+);
 const l3Attempts = Math.max(1, Number(process.env.ANYSENTRY_L3_ATTEMPTS || 2));
-const l3Pool = role === 'l3'
-  ? new L3AgentPool({
-      size: l3Concurrency,
-      timeoutMs: l3TimeoutMs,
-      executionTimeoutMs: Math.max(1_000, l3TimeoutMs - 5_000),
-      // Reuse the process-wide Agent, but never reuse a Session/Memory Store across events.
-      maxJobsPerSession: 1,
-      maxSessionAgeMs: 30 * 60_000,
-    })
-  : null;
+const runtimeModel = new RuntimeModelClient(role === 'l3' ? 'deep_investigation' : 'fast_review');
+interface ManagedL3Pool {
+  pool: L3AgentPool;
+  version: string;
+  active: number;
+  retired: boolean;
+}
 
-type ThroughL2Result = {
+let managedL3Pool: ManagedL3Pool | null = null;
+let l3PoolInitialization: Promise<ManagedL3Pool> | null = null;
+let l3PoolInitializationVersion = '';
+
+function retireL3Pool(managed: ManagedL3Pool | null): void {
+  if (!managed || managed.retired) return;
+  managed.retired = true;
+  if (managed.active === 0) void managed.pool.close();
+}
+
+async function acquireL3Pool(skills: string): Promise<{ pool: L3AgentPool; release: () => void }> {
+  const model = runtimeModel.get();
+  if (!model) throw new Error('深度研判模型缺少运行时凭据，请在策略配置中重新测试并应用');
+  let managed = managedL3Pool;
+  if (!managed || managed.version !== model.version || managed.retired) {
+    if (!l3PoolInitialization || l3PoolInitializationVersion !== model.version) {
+      l3PoolInitializationVersion = model.version;
+      l3PoolInitialization = (async () => {
+        const next = new L3AgentPool({
+          size: l3Concurrency,
+          timeoutMs: Math.max(l3RetryTimeoutMs, model.timeoutS * 1_000),
+          executionTimeoutMs: Math.max(1_000, Math.max(l3RetryTimeoutMs, model.timeoutS * 1_000) - 5_000),
+          maxJobsPerSession: 1,
+          maxSessionAgeMs: 30 * 60_000,
+          modelConfig: {
+            url: model.url,
+            model: model.model,
+            key: model.apiKey,
+            contextLimit: model.contextTokens,
+          },
+        });
+        try {
+          await next.initialize();
+          await next.prewarm(skills);
+          return { pool: next, version: model.version, active: 0, retired: false };
+        } catch (error) {
+          await next.close().catch(() => undefined);
+          throw error;
+        }
+      })().finally(() => {
+        if (l3PoolInitializationVersion === model.version) l3PoolInitialization = null;
+      });
+    }
+    const initialized = await l3PoolInitialization;
+    if (runtimeModel.get()?.version !== initialized.version) {
+      retireL3Pool(initialized);
+      return acquireL3Pool(skills);
+    }
+    retireL3Pool(managedL3Pool);
+    managedL3Pool = initialized;
+    managed = initialized;
+  }
+  managed.active += 1;
+  let released = false;
+  return {
+    pool: managed.pool,
+    release: () => {
+      if (released) return;
+      released = true;
+      managed.active = Math.max(0, managed.active - 1);
+      if (managed.retired && managed.active === 0) void managed.pool.close();
+    },
+  };
+}
+
+type ThroughL1Result = {
   l1Decision: AsyncDecision;
-  l2Decision?: AsyncDecision;
-  effectiveDecision: AsyncDecision;
-  stageStatus: 'completed' | 'escalated';
-  escalationCause?: 'l1' | 'l2' | 'sae';
+  stageStatus: 'completed' | 'escalated' | 'stopped';
+  nextTierEligible: boolean;
+  stopReason: string;
 };
 
 function attemptNumber(attemptsMade: number): number {
@@ -67,21 +136,84 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
     let sentry = sentryCache.get(input.policyVersion);
     if (!sentry) {
       const fastPolicy = input.policy.llm
-        ? { ...input.policy, llm: { ...input.policy.llm, timeoutS: Math.min(input.policy.llm.timeoutS, 45) } }
+        ? {
+            ...input.policy,
+            llm: {
+              ...input.policy.llm,
+              model: input.policy.llm.model,
+              timeoutS: Math.min(input.policy.llm.timeoutS, 60),
+            },
+          }
         : input.policy;
       sentry = Sentry.create(buildFastAcl(fastPolicy, {
-        llmApiKey: process.env.ANYSENTRY_LLM_API_KEY || process.env.A3S_SENTRY_LLM_KEY,
+        llmKey: process.env.A3S_SENTRY_LLM_KEY || process.env.ANYSENTRY_LLM_API_KEY,
       }));
       sentryCache.set(input.policyVersion, sentry);
       if (sentryCache.size > 8) sentryCache.delete(sentryCache.keys().next().value as string);
     }
-    const evaluation = (await sentry.evaluateThroughL2(input.observerLine)) as ThroughL2Result;
-    const decision = evaluation.effectiveDecision;
+    const evaluateL1 = (sentry as Sentry & { evaluateL1?: (event: string) => ThroughL1Result | null }).evaluateL1;
+    if (typeof evaluateL1 !== 'function') throw new Error('@a3s-lab/sentry staged L1 SDK is required');
+    const l1 = evaluateL1.call(sentry, input.observerLine);
+    if (!l1) throw new Error('observer event is not parseable by Sentry L1');
+    const shouldRunL2 = input.routing.profile !== 'l1_only' &&
+      input.routing.maxTier !== 'L1' &&
+      Boolean(input.policy.llm) &&
+      l1.nextTierEligible &&
+      l1.l1Decision.verdict === 'escalate';
+    if (!shouldRunL2) {
+      await publishResult({
+        schemaVersion: 'anysentry.decision_result.v1',
+        evaluationId: input.evaluationId,
+        policyVersion: input.policyVersion,
+        event: input.event,
+        stage: 'L1',
+        status: 'succeeded',
+        decision: l1.l1Decision,
+        l1Decision: l1.l1Decision,
+        nextTierEligible: l1.nextTierEligible,
+        stageStopReason: input.routing.profile === 'l1_only'
+          ? (l1.stopReason === 'evidence_incomplete' ? l1.stopReason : input.routing.reason)
+          : (!input.policy.llm && l1.l1Decision.verdict === 'escalate' ? 'l2_not_configured' : l1.stopReason),
+        startedAt,
+        completedAt: Date.now(),
+        attempt: attemptNumber(job.attemptsMade),
+      });
+      return;
+    }
+    const llm = input.policy.llm;
+    if (!llm) throw new Error('L2 policy disappeared while dispatching the model request');
+    const runtime = runtimeModel.get();
+    if (!runtime) throw new Error('快速研判模型缺少运行时凭据，请在策略配置中重新测试并应用');
+    const judgeCacheKey = `${input.policyVersion}:${runtime.version}`;
+    let l2Judge = l2JudgeCache.get(judgeCacheKey);
+    if (!l2Judge) {
+      l2Judge = new L2CodeJudge({
+        url: runtime.url,
+        model: runtime.model,
+        key: runtime.apiKey,
+        timeoutMs: Math.min(runtime.timeoutS, llm.timeoutS) * 1_000,
+        contextLimit: runtime.contextTokens,
+      });
+      l2JudgeCache.set(judgeCacheKey, l2Judge);
+      if (l2JudgeCache.size > 8) {
+        const oldest = l2JudgeCache.keys().next().value as string;
+        const evicted = l2JudgeCache.get(oldest);
+        l2JudgeCache.delete(oldest);
+        void evicted?.close();
+      }
+    }
+    const decision = await l2Judge.judge({
+      observerLine: input.observerLine,
+      eventKind: input.event.eventKind,
+      subject: input.event.subject,
+      actor: l3Actor(input),
+      provider: l3Provider(input),
+    });
     if (
-      evaluation.stageStatus === 'escalated' &&
-      evaluation.escalationCause === 'l2' &&
       decision.verdict === 'escalate' &&
-      input.policy.agent
+      input.routing.maxTier === 'L3' &&
+      input.policy.agent &&
+      input.policy.deepModel
     ) {
       const l3Job: L3JudgeJob = {
         schemaVersion: 'anysentry.l3_judge_job.v1',
@@ -91,6 +223,7 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
         observerLine: input.observerLine,
         policy: input.policy,
         provisionalDecision: decision,
+        l1Decision: l1.l1Decision,
         queuedAt: Date.now(),
       };
       await l3Queue.add('deep-investigation', l3Job, {
@@ -108,6 +241,9 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
         stage: 'L2',
         status: 'succeeded',
         decision,
+        l1Decision: l1.l1Decision,
+        nextTierEligible: true,
+        stageStopReason: 'l2_escalated',
         awaitingL3: true,
         startedAt,
         completedAt: Date.now(),
@@ -123,6 +259,9 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
       stage: decision.tier === 'Llm' ? 'L2' : 'L1',
       status: 'succeeded',
       decision,
+      l1Decision: l1.l1Decision,
+      nextTierEligible: decision.verdict === 'escalate',
+      stageStopReason: decision.verdict === 'escalate' ? 'l3_not_configured' : 'decision_final',
       startedAt,
       completedAt: Date.now(),
       attempt: attemptNumber(job.attemptsMade),
@@ -144,11 +283,11 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
   }
 }
 
-function l3Actor(input: L3JudgeJob): string {
+function l3Actor(input: Pick<L3JudgeJob, 'event' | 'evaluationId'>): string {
   return input.event.attribution?.agentDisplayName || input.event.attribution?.agentScopeId || input.event.agentId || input.event.sessionId || input.evaluationId;
 }
 
-function l3Provider(input: L3JudgeJob): string {
+function l3Provider(input: Pick<L3JudgeJob, 'event'>): string {
   for (const key of ['provider', 'llm.provider', 'gen_ai.system']) {
     const value = input.event.attributes[key];
     if (typeof value === 'string' && value.trim()) return value;
@@ -176,17 +315,6 @@ function l3Prompt(input: L3JudgeJob): string {
     '<<UNTRUSTED>>';
 }
 
-function parseL3Decision(stdout: string): AsyncDecision {
-  const start = stdout.indexOf('{');
-  const end = stdout.lastIndexOf('}');
-  if (start < 0 || end < start) throw new Error('L3 returned no JSON verdict');
-  const parsed = JSON.parse(stdout.slice(start, end + 1)) as AsyncDecision;
-  if (!['allow', 'block'].includes(parsed.verdict)) throw new Error('L3 returned an invalid verdict');
-  if (!['low', 'medium', 'high', 'critical'].includes(parsed.severity)) throw new Error('L3 returned an invalid severity');
-  if (typeof parsed.reason !== 'string' || !parsed.reason.trim()) throw new Error('L3 returned no reason');
-  return { ...parsed, tier: 'Agent', reason: parsed.reason.slice(0, 2_000) };
-}
-
 function l3FailureReason(error: unknown): string {
   if (isL3AgentTimeout(error)) return error.message;
   return (error instanceof Error ? error.message.split('\n')[0] : String(error)).slice(0, 2_000);
@@ -196,6 +324,7 @@ async function l3Judge(job: Job<L3JudgeJob>): Promise<void> {
   const startedAt = Date.now();
   const input = job.data;
   const computedKey = 'anysentry:l3:computed:' + input.evaluationId;
+  let poolLease: Awaited<ReturnType<typeof acquireL3Pool>> | undefined;
   try {
     const cached = await resultRedis.get(computedKey);
     if (cached) {
@@ -203,17 +332,21 @@ async function l3Judge(job: Job<L3JudgeJob>): Promise<void> {
       return;
     }
     const agent = input.policy.agent;
-    if (!agent || !l3Pool) throw new Error('L3 is not configured');
-    const run = await l3Pool.run(agent.skills, l3Prompt(input), (text) => {
+    if (!agent || !input.policy.deepModel) throw new Error('L3 is not configured');
+    poolLease = await acquireL3Pool(agent.skills);
+    const attempt = attemptNumber(job.attemptsMade);
+    const attemptTimeoutMs = attempt === 1 ? l3TimeoutMs : l3RetryTimeoutMs;
+    const run = await poolLease.pool.run(agent.skills, l3Prompt(input), (text) => {
       // Validate inside the pool so an invalid response quarantines this Session before BullMQ
       // starts the retry. Agent response text is intentionally never written to service logs.
       parseL3Decision(text);
-    });
+    }, { timeoutMs: attemptTimeoutMs });
     const decision = parseL3Decision(run.text);
     console.info('[l3-worker] judgment completed', JSON.stringify({
       evaluationId: input.evaluationId,
       actor: l3Actor(input),
-      attempt: attemptNumber(job.attemptsMade),
+      attempt,
+      timeoutMs: attemptTimeoutMs,
       poolWaitMs: run.poolWaitMs,
       agentRunMs: run.agentRunMs,
     }));
@@ -225,6 +358,9 @@ async function l3Judge(job: Job<L3JudgeJob>): Promise<void> {
       stage: 'L3',
       status: 'succeeded',
       decision,
+      l1Decision: input.l1Decision,
+      nextTierEligible: false,
+      stageStopReason: 'decision_final',
       startedAt,
       completedAt: Date.now(),
       attempt: attemptNumber(job.attemptsMade),
@@ -235,6 +371,7 @@ async function l3Judge(job: Job<L3JudgeJob>): Promise<void> {
     console.warn('[l3-worker] judgment attempt failed', JSON.stringify({
       evaluationId: input.evaluationId,
       attempt: attemptNumber(job.attemptsMade),
+      timeoutMs: attemptNumber(job.attemptsMade) === 1 ? l3TimeoutMs : l3RetryTimeoutMs,
       error: l3FailureReason(error),
     }));
     if (!finalAttempt(job)) throw error;
@@ -250,26 +387,43 @@ async function l3Judge(job: Job<L3JudgeJob>): Promise<void> {
       // Preserve the provisional escalation, but distinguish a real execution timeout from
       // invalid/no JSON, tool-round exhaustion, and other terminal L3 failures.
       status: timedOut ? 'timeout' : 'failed',
+      l1Decision: input.l1Decision,
+      nextTierEligible: true,
+      stageStopReason: timedOut ? 'l3_timeout' : 'l3_failed',
       error: message.slice(0, 2_000),
       startedAt,
       completedAt: Date.now(),
       attempt: attemptNumber(job.attemptsMade),
     });
+  } finally {
+    poolLease?.release();
   }
 }
 
 async function main(): Promise<void> {
+  await runtimeModel.initialize();
   let worker: Worker<FastJudgeJob | L3JudgeJob>;
   if (role === 'fast') {
+    runtimeModel.onChange(() => {
+      const judges = [...l2JudgeCache.values()];
+      l2JudgeCache.clear();
+      // Let in-flight requests finish on the old Agent. The old cache is unreachable for new jobs
+      // and is closed after the maximum supported request budget.
+      const timer = setTimeout(() => {
+        void Promise.all(judges.map((judge) => judge.close().catch(() => undefined)));
+      }, 10 * 60_000);
+      timer.unref();
+    });
     worker = new Worker<FastJudgeJob>(FAST_JUDGE_QUEUE, fastJudge, {
       connection,
       concurrency: Number(process.env.ANYSENTRY_FAST_JUDGE_CONCURRENCY || 4),
     });
   } else if (role === 'l3') {
-    if (!l3Pool) throw new Error('L3 agent pool was not initialized');
-    await l3Pool.initialize();
-    await l3Pool.prewarm(process.env.ANYSENTRY_L3_SKILLS || '/opt/anysentry/skills');
-    worker = new Worker<L3JudgeJob>(L3_JOBS_QUEUE, (job) => l3Judge(job), {
+    runtimeModel.onChange(() => {
+      retireL3Pool(managedL3Pool);
+      managedL3Pool = null;
+    });
+    worker = new Worker<L3JudgeJob>(L3_JOBS_QUEUE, l3Judge, {
       connection,
       concurrency: l3Concurrency,
     });
@@ -280,8 +434,10 @@ async function main(): Promise<void> {
   console.log('AnySentry ' + role + ' worker started');
   const stop = async () => {
     await worker.close();
-    if (l3Pool) await l3Pool.close();
-    await Promise.all([resultQueue.close(), l3Queue.close()]);
+    retireL3Pool(managedL3Pool);
+    await Promise.all([...l2JudgeCache.values()].map((judge) => judge.close()));
+    l2JudgeCache.clear();
+    await Promise.all([resultQueue.close(), l3Queue.close(), runtimeModel.close()]);
     resultRedis.disconnect();
     process.exit(0);
   };

@@ -521,6 +521,8 @@ async function triggerAgentOwnerAlert(source, token, owner, team) {
   const workspacePath = `repo://${runId}/agent-owner`;
   await request(`/agents/${encodeURIComponent(agentId)}/metadata`, 'PUT', {
     workspacePath,
+    identityKeys: [agentId],
+    agentInstanceId: `notification:${agentId}`,
     owner,
     team,
     environment: 'prod',

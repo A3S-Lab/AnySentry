@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: a3s-code-tool-loop
+  namespace: anysentry-agent-test
+  labels:
+    app.kubernetes.io/name: a3s-code-tool-loop
+    app.kubernetes.io/part-of: anysentry-agent-runtime-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: a3s-code-tool-loop
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: a3s-code-tool-loop
+        app.kubernetes.io/part-of: anysentry-agent-runtime-lab
+        anysentry.io/workload-kind: agent
+        anysentry.io/agent-id: k8s-a3s-code-loop
+        anysentry.io/agent-container: agent
+        anysentry.io/agent-runtime: a3s-code
+    spec:
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: agent
+          image: 127.0.0.1:5000/anysentry-agent-runtime-lab:0.1.0
+          imagePullPolicy: Always
+          env:
+            - { name: AGENT_RUNTIME, value: a3s-loop }
+            - { name: AGENT_ID, value: k8s-a3s-code-loop }
+            - { name: AGENT_INTERVAL_SECONDS, value: "20" }
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+          readinessProbe:
+            exec: { command: ["/usr/bin/test", "-f", "/tmp/agent-ready"] }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            exec: { command: ["/usr/bin/test", "-f", "/tmp/agent-ready"] }
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 25m, memory: 96Mi }
+            limits: { cpu: "1", memory: 512Mi }
+      volumes:
+        - name: workspace
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pi-coding-agent
+  namespace: anysentry-agent-test
+  labels:
+    app.kubernetes.io/name: pi-coding-agent
+    app.kubernetes.io/part-of: anysentry-agent-runtime-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pi-coding-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pi-coding-agent
+        app.kubernetes.io/part-of: anysentry-agent-runtime-lab
+        anysentry.io/workload-kind: agent
+        anysentry.io/agent-id: k8s-pi-agent
+        anysentry.io/agent-container: agent
+        anysentry.io/agent-runtime: pi
+    spec:
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: agent
+          image: 127.0.0.1:5000/anysentry-agent-runtime-lab:0.1.0
+          imagePullPolicy: Always
+          env:
+            - { name: AGENT_RUNTIME, value: pi }
+            - { name: AGENT_ID, value: k8s-pi-agent }
+            - { name: AGENT_INTERVAL_SECONDS, value: "60" }
+            - { name: PI_EXECUTION_MODE, value: auto }
+            - { name: PI_THINKING, value: low }
+          envFrom:
+            - secretRef:
+                name: pi-agent-credentials
+                optional: true
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+            - { name: pi-state, mountPath: /home/node/.pi/agent }
+          readinessProbe:
+            exec: { command: ["/usr/bin/test", "-f", "/tmp/agent-ready"] }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec: { command: ["/usr/bin/test", "-f", "/tmp/agent-ready"] }
+            initialDelaySeconds: 25
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: "1", memory: 768Mi }
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        - name: pi-state
+          emptyDir: {}

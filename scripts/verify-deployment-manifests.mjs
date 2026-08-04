@@ -105,7 +105,8 @@ function verifyAnySentryManifest() {
   const anySentryService = docFor(docs, 'Service', 'anysentry');
   const clickHouseDeployment = docFor(docs, 'Deployment', 'clickhouse');
   const clickHouseService = docFor(docs, 'Service', 'clickhouse');
-  const podReaderRole = docFor(docs, 'Role', 'anysentry-pod-reader');
+  const podReaderRole = docFor(docs, 'ClusterRole', 'anysentry-pod-reader');
+  const podReaderBinding = docFor(docs, 'ClusterRoleBinding', 'anysentry-pod-reader');
 
   assert('AnySentry Deployment manifest exists', Boolean(anySentryDeployment));
   assert(
@@ -126,6 +127,12 @@ function verifyAnySentryManifest() {
   assert(
     'AnySentry Deployment points at bundled ClickHouse HTTP service',
     /\{\s*name:\s*CLICKHOUSE_URL,\s*value:\s*"http:\/\/clickhouse:8123"\s*\}/u.test(anySentryDeployment?.source ?? ''),
+    anySentryDeployment?.source,
+  );
+  assert(
+    'AnySentry Deployment configures cluster-wide workload identity and an independent Agent label selector',
+    /\{\s*name:\s*ANYSENTRY_IDENTITY_NAMESPACES,\s*value:\s*"\*"\s*\}/u.test(anySentryDeployment?.source ?? '') &&
+      /\{\s*name:\s*ANYSENTRY_AGENT_LABEL_SELECTOR,\s*value:\s*"anysentry\.io\/workload-kind=agent"\s*\}/u.test(anySentryDeployment?.source ?? ''),
     anySentryDeployment?.source,
   );
   assert(
@@ -155,15 +162,21 @@ function verifyAnySentryManifest() {
     clickHouseService?.source,
   );
 
-  assert('AnySentry pod identity uses a namespaced Role, not ClusterRole', Boolean(podReaderRole) && !docs.some((doc) => doc.kind === 'ClusterRole' || doc.kind === 'ClusterRoleBinding'), {
+  assert('AnySentry pod identity uses a cluster-wide read-only Pod metadata binding', Boolean(podReaderRole) && Boolean(podReaderBinding), {
     kinds: docs.map((doc) => `${doc.kind}/${doc.name}`),
   });
   assert(
-    'AnySentry pod reader Role is read-only for pods',
+    'AnySentry pod reader ClusterRole is read-only for pods',
     /resources:\s*\["pods"\]/u.test(podReaderRole?.source ?? '') &&
       /verbs:\s*\["get",\s*"list",\s*"watch"\]/u.test(podReaderRole?.source ?? '') &&
       !/\b(create|update|patch|delete)\b/u.test(podReaderRole?.source ?? ''),
     podReaderRole?.source,
+  );
+  assert(
+    'AnySentry pod reader ClusterRoleBinding targets only its ServiceAccount',
+    /kind:\s*ClusterRole[\s\S]*name:\s*anysentry-pod-reader/u.test(podReaderBinding?.source ?? '') &&
+      /kind:\s*ServiceAccount[\s\S]*name:\s*anysentry[\s\S]*namespace:\s*anysentry/u.test(podReaderBinding?.source ?? ''),
+    podReaderBinding?.source,
   );
 }
 
@@ -192,8 +205,18 @@ function verifyObserverManifest() {
     daemonSet?.source,
   );
   assert(
-    'Observer DaemonSet drops only proven non-Agent events before ingest',
-    /\{\s*name:\s*FORWARD_SCOPE,\s*value:\s*"agent"\s*\}/u.test(daemonSet?.source ?? ''),
+    'Observer DaemonSet independently retains Unknown, drops non-Agent, and filters routine noise',
+    /\{\s*name:\s*FORWARD_FILTER_MODE,\s*value:\s*"enforce"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_RETAIN_UNKNOWN,\s*value:\s*"true"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_RETAIN_NON_AGENT,\s*value:\s*"false"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_NOISE_POLICY,\s*value:\s*"balanced"\s*\}/u.test(daemonSet?.source ?? ''),
+    daemonSet?.source,
+  );
+  assert(
+    'Observer DaemonSet consumes identity snapshots and uses bounded batching',
+    /\{\s*name:\s*ANYSENTRY_IDENTITY_SNAPSHOT_URL,\s*value:\s*"http:\/\/anysentry:29653\/security-center\/identity\/snapshot"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_BATCH_SIZE,\s*value:\s*"32"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_MAX_QUEUE,\s*value:\s*"4096"\s*\}/u.test(daemonSet?.source ?? ''),
     daemonSet?.source,
   );
   assert(
@@ -224,11 +247,33 @@ function verifyDockerfile() {
 function verifyObserverForwarderDockerfile() {
   const dockerfile = stripDockerComments(readText('deploy/observer-forwarder.Dockerfile'));
 
-  assert('Observer forwarder image extends the public observer image', /^FROM ghcr\.io\/a3s-lab\/observer:latest$/mu.test(dockerfile), dockerfile);
-  assert('Observer forwarder image copies a Node runtime without package install', /^COPY --from=nodebin \/usr\/local\/bin\/node \/usr\/local\/bin\/node$/mu.test(dockerfile) && !/^\s*RUN\b/mu.test(dockerfile), dockerfile);
+  assert(
+    'Observer forwarder image defaults to the public observer image and permits a tested build override',
+    /^ARG OBSERVER_IMAGE=ghcr\.io\/a3s-lab\/observer:latest$/mu.test(dockerfile) &&
+      /^FROM \$\{OBSERVER_IMAGE\}$/mu.test(dockerfile),
+    dockerfile,
+  );
+  assert(
+    'Observer forwarder image copies a configurable Node runtime without package install',
+    /^ARG NODE_IMAGE=node:20-bookworm-slim$/mu.test(dockerfile) &&
+      /^FROM \$\{NODE_IMAGE\} AS nodebin$/mu.test(dockerfile) &&
+      /^COPY --from=nodebin \/usr\/local\/bin\/node \/usr\/local\/bin\/node$/mu.test(dockerfile) &&
+      !/^\s*RUN\b/mu.test(dockerfile),
+    dockerfile,
+  );
   assert('Observer forwarder image bundles scripts/observer-forward.js', /^COPY scripts\/observer-forward\.js \/opt\/observer-forward\.js$/mu.test(dockerfile), dockerfile);
   assert('Observer forwarder image bundles PID attribution', /^COPY scripts\/observer-agent-attribution\.js \/opt\/observer-agent-attribution\.js$/mu.test(dockerfile), dockerfile);
   assert('Observer forwarder image bundles ToolExec deduplication', /^COPY scripts\/observer-event-dedup\.js \/opt\/observer-event-dedup\.js$/mu.test(dockerfile), dockerfile);
+  assert('Observer forwarder image bundles workload-first filtering', /^COPY scripts\/observer-workload-filter\.js \/opt\/observer-workload-filter\.js$/mu.test(dockerfile), dockerfile);
+  assert('Observer forwarder image bundles infrastructure root filtering', /^COPY scripts\/observer-infrastructure-roots\.js \/opt\/observer-infrastructure-roots\.js$/mu.test(dockerfile), dockerfile);
+  assert('Observer forwarder image bundles the bounded priority queue', /^COPY scripts\/observer-priority-queue\.js \/opt\/observer-priority-queue\.js$/mu.test(dockerfile), dockerfile);
+  assert(
+    'Observer forwarder image bundles operator templates and Docker discovery',
+    /^COPY scripts\/observer-agent-templates\.js \/opt\/observer-agent-templates\.js$/mu.test(dockerfile) &&
+      /^COPY scripts\/observer-docker-discovery\.js \/opt\/observer-docker-discovery\.js$/mu.test(dockerfile) &&
+      /^COPY scripts\/observer-behavior-discovery\.js \/opt\/observer-behavior-discovery\.js$/mu.test(dockerfile),
+    dockerfile,
+  );
   assert('Observer forwarder image has no npm or pnpm install step', !/\b(?:npm|pnpm|yarn)\s+(?:install|ci|add)\b/iu.test(dockerfile), dockerfile);
 }
 
