@@ -1,0 +1,18 @@
+# Development overlay: build AnySentry from this checkout and mount the locally built Sentry SDK.
+# Prepare the SDK first with: ./scripts/prepare-local-sentry-sdk.sh ../Sentry
+x-local-sentry-volume: &local-sentry-volume
+  - ./.local/sentry-sdk:/app/node_modules/@a3s-lab/sentry:ro
+
+services:
+  anysentry:
+    volumes: *local-sentry-volume
+  fast-judge:
+    volumes: *local-sentry-volume
+  l3-worker:
+    volumes: *local-sentry-volume
+  stream-worker:
+    volumes: *local-sentry-volume
+  composite-judge:
+    volumes: *local-sentry-volume
+  supply-chain-assessment:
+    volumes: *local-sentry-volume

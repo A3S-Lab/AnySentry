@@ -1,0 +1,32 @@
+[Unit]
+Description=AnySentry Flink TaskManager
+Requires=anysentry-flink-jobmanager.service
+After=anysentry-flink-jobmanager.service
+
+[Service]
+Type=simple
+User=anysentry
+Group=anysentry
+WorkingDirectory=/opt/anysentry/flink
+EnvironmentFile=/etc/anysentry/anysentry.env
+ExecStart=/opt/anysentry/run-flink.sh taskmanager
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=120s
+TimeoutStopSec=60s
+LimitNOFILE=65536
+MemoryHigh=5G
+MemoryMax=6G
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/anysentry
+
+[Install]
+WantedBy=multi-user.target
+

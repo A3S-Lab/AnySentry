@@ -29,11 +29,11 @@
 | --- | --- | --- |
 | `/opt/anysentry` | 正式安装 | 程序、运行时和随包脚本 |
 | `/etc/anysentry` | 正式安装 | 受保护配置 |
-| `/var/lib/anysentry` | 正式安装 | ClickHouse、Redis 和 L3 状态 |
+| `/var/lib/anysentry` | 正式安装 | ClickHouse、Redis、Kafka、Flink 和 L3 状态 |
 | `/var/log/anysentry` | 正式安装 | 服务日志和安装诊断 |
 | `/etc/sysctl.d/90-anysentry.conf` | 正式安装 | 运行时内存参数 |
-| `/tmp/anysentry-install-0.2.0-compat8` | 每次执行安装程序 | 安装诊断入口；通常指向持久日志目录 |
-| `/tmp/anysentry-health-smoke-compat8` | 执行健康检查脚本 | 健康检查报告 |
+| `/tmp/anysentry-install-0.3.0-compat1` | 每次执行安装程序 | 安装诊断入口；通常指向持久日志目录 |
+| `/tmp/anysentry-health-smoke-0.3.0-compat1` | 执行健康检查脚本 | 健康检查报告 |
 | `/opt/.anysentry.rollback.*` | 成功升级且已有旧版本 | 上一版本程序备份 |
 | `/opt/anysentry.failed.*` | 激活失败并回滚 | 失败版本现场 |
 
@@ -44,9 +44,9 @@
 将压缩包及同名 `.sha256` 文件放在同一目录：
 
 ```bash
-sha256sum --check anysentry-security-suite-0.2.0-compat8-uos20-arm64.tar.gz.sha256
-tar -zxf anysentry-security-suite-0.2.0-compat8-uos20-arm64.tar.gz
-cd anysentry-security-suite-0.2.0-compat8-uos20-arm64
+sha256sum --check anysentry-security-suite-0.3.0-compat1-uos20-arm64.tar.gz.sha256
+tar -zxf anysentry-security-suite-0.3.0-compat1-uos20-arm64.tar.gz
+cd anysentry-security-suite-0.3.0-compat1-uos20-arm64
 sha256sum --check manifest.sha256
 ```
 
@@ -66,8 +66,8 @@ sha256sum --check manifest.sha256
 ./install.sh
 ```
 
-安装程序保留现有配置和持久数据，依次启动 ClickHouse、Redis、API、判定 Worker 和
-Observer。新版本验证失败时自动恢复上一版本。
+安装程序保留现有配置和持久数据，依次启动 ClickHouse、Redis、Kafka、Flink、API、
+判定 Worker 和 Observer。新版本验证失败时自动恢复上一版本。
 
 ## 5. 安装验证
 
@@ -77,6 +77,10 @@ Observer。新版本验证失败时自动恢复上一版本。
 curl -fsS http://127.0.0.1:29653/security-center/healthz
 systemctl is-active anysentry-clickhouse.service
 systemctl is-active anysentry-redis.service
+systemctl is-active anysentry-kafka.service
+systemctl is-active anysentry-flink-jobmanager.service
+systemctl is-active anysentry-flink-taskmanager.service
+systemctl is-active anysentry-stream-worker.service
 systemctl is-active anysentry.service
 systemctl is-active anysentry-fast-judge.service
 systemctl is-active anysentry-l3-worker.service
@@ -92,7 +96,7 @@ systemctl is-active anysentry-observer.service
 该命令仅使用 `/tmp`、回环网络和带唯一标识的模拟事件。报告目录由脚本创建：
 
 ```text
-/tmp/anysentry-health-smoke-compat8
+/tmp/anysentry-health-smoke-0.3.0-compat1
 ```
 
 ## 6. 安装日志
@@ -100,21 +104,21 @@ systemctl is-active anysentry-observer.service
 每次执行安装程序都会覆盖本版本诊断目录：
 
 ```text
-/var/log/anysentry/install/0.2.0-compat8
+/var/log/anysentry/install/0.3.0-compat1
 ```
 
 快速入口：
 
 ```text
-/tmp/anysentry-install-0.2.0-compat8
+/tmp/anysentry-install-0.3.0-compat1
 ```
 
 查看结果：
 
 ```bash
-cat /var/log/anysentry/install/0.2.0-compat8/summary.txt
-less /var/log/anysentry/install/0.2.0-compat8/install.log
-cat /var/log/anysentry/install/0.2.0-compat8/current-stage.txt
+cat /var/log/anysentry/install/0.3.0-compat1/summary.txt
+less /var/log/anysentry/install/0.3.0-compat1/install.log
+cat /var/log/anysentry/install/0.3.0-compat1/current-stage.txt
 ```
 
 安装失败时，诊断目录会在自动回滚前记录服务状态、接口响应、验证输出和 journal。
@@ -124,8 +128,21 @@ cat /var/log/anysentry/install/0.2.0-compat8/current-stage.txt
 默认地址：
 
 ```text
-http://<服务器可达IP>:29653/
+http://<服务器可达IP>:29653/anysentry/
 ```
 
 无法直达服务器网段时，可使用同网段浏览器，或将本地端口转发至服务器
-`127.0.0.1:29653` 后访问 `http://127.0.0.1:29653/`。ClickHouse 8123 端口仅供本机使用。
+`127.0.0.1:29653` 后访问 `http://127.0.0.1:29653/anysentry/`。ClickHouse 8123、
+Kafka 9092 和 Flink 8081 端口仅供本机使用。
+
+使用 Nginx 发布时必须保留 `/anysentry/` 前缀：
+
+```nginx
+location = /anysentry { return 301 /anysentry/; }
+location /anysentry/ {
+    proxy_pass http://127.0.0.1:29653;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```

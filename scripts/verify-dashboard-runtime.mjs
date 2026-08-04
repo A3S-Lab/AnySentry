@@ -14,6 +14,7 @@ const managementRoutes = [
   '/events?runId=dashboard-smoke-run',
   '/events?eventKind=ToolExec',
   '/agents?agentId=dashboard-smoke-agent&workspacePath=repo://dashboard-smoke',
+  '/agents?timeType=last_1d&agentId=dashboard-smoke-agent&workspacePath=repo://dashboard-smoke&focus=review&eventId=dashboard-smoke-event',
   '/agents?userId=dashboard-smoke-user',
   '/workspaces?workspacePath=repo://dashboard-smoke',
   '/capabilities',
@@ -248,6 +249,7 @@ async function verifyIndexAndAssets() {
 async function verifyDashboardSourceContracts() {
   const agentEventsPage = await readFile('apps/web/src/pages/AgentEventsPage.tsx', 'utf8');
   const agentsPage = await readFile('apps/web/src/pages/AgentsPage.tsx', 'utf8');
+  const agentIdentity = await readFile('apps/web/src/components/custom/agent-identity.tsx', 'utf8');
   const alertingService = await readFile('apps/api/src/security-monitoring/alerting.service.ts', 'utf8');
   const alertsPage = await readFile('apps/web/src/pages/AlertsPage.tsx', 'utf8');
   const apiClient = await readFile('apps/web/src/lib/api/security-center.ts', 'utf8');
@@ -384,6 +386,108 @@ async function verifyDashboardSourceContracts() {
     {
       hasBackendRoute: securityController.includes("@Get('agents/metadata')"),
       hasMetadataUpdateUi: agentsPage.includes('securityCenterApi.updateAgentMetadata'),
+    },
+  );
+  assert(
+    'dashboard supports auditable human Agent confirmation and rejection without deleting raw events',
+    securityController.includes("@Put('agents/:agentId/review')") &&
+      securityController.includes("'agent.review.cleared'") &&
+      securityController.includes("'agent.review.updated'") &&
+      apiClient.includes('reviewAgent: (agentId: string, body: AgentReviewRequest)') &&
+      agentsPage.includes('securityCenterApi.reviewAgent(selectedAgent.agentId') &&
+      agentsPage.includes('原始事件始终保留') &&
+      agentsPage.includes('标记为非 Agent') &&
+      agentsPage.includes('证据不足，降为未知') &&
+      agentsPage.includes('撤销确认，重新观察') &&
+      agentsPage.includes('重新纳入观察') &&
+      agentsPage.includes('人工身份裁决') &&
+      agentsPage.includes('aria-label="确认人工身份裁决"') &&
+      agentsPage.includes('<details className="group rounded-md') &&
+      agentsPage.includes('身份信息配置') &&
+      !agentsPage.includes('window.confirm') &&
+      !agentsPage.includes('Codex') &&
+      agentEventsPage.includes('focus: "review"') &&
+      agentEventsPage.includes('进入身份审核') &&
+      agentEventsPage.includes('查看智能体资产') &&
+      !agentEventsPage.includes('<IdentityAiReview') &&
+      securityMonitorPage.includes('if (event.agentId) qs.set("agentId", event.agentId)') &&
+      securityMonitorPage.includes('详情 →') &&
+      topologyPage.includes('查看事件'),
+    {
+      hasBackendRoute: securityController.includes("@Put('agents/:agentId/review')"),
+      hasAudits:
+        securityController.includes("'agent.review.cleared'") &&
+        securityController.includes("'agent.review.updated'"),
+      hasApiClient: apiClient.includes('reviewAgent: (agentId: string, body: AgentReviewRequest)'),
+      hasReviewUi:
+        agentsPage.includes('securityCenterApi.reviewAgent(selectedAgent.agentId') &&
+        agentsPage.includes('原始事件始终保留') &&
+        agentsPage.includes('标记为非 Agent') &&
+        agentsPage.includes('证据不足，降为未知') &&
+        agentsPage.includes('撤销确认，重新观察') &&
+        agentsPage.includes('重新纳入观察') &&
+        agentsPage.includes('人工身份裁决'),
+      hasInlineReviewConfirmation:
+        agentsPage.includes('aria-label="确认人工身份裁决"') &&
+        !agentsPage.includes('window.confirm') &&
+        !agentsPage.includes('Codex'),
+      hasCollapsedIdentityConfig:
+        agentsPage.includes('<details className="group rounded-md') &&
+        agentsPage.includes('身份信息配置'),
+      hasReviewHandoff:
+        agentEventsPage.includes('focus: "review"') &&
+        agentEventsPage.includes('进入身份审核') &&
+        agentEventsPage.includes('查看智能体资产') &&
+        !agentEventsPage.includes('<IdentityAiReview'),
+      hasRuntimeEventHandoff:
+        securityMonitorPage.includes('if (event.agentId) qs.set("agentId", event.agentId)') &&
+        securityMonitorPage.includes('详情 →') &&
+        topologyPage.includes('查看事件'),
+    },
+  );
+  assert(
+    'dashboard presents Agent assets first and exposes implementation-neutral time-window analysis',
+    securityMonitorPage.includes('title="智能体风险概览"') &&
+      securityMonitorPage.includes('{ key: "assets" as const, label: "智能体资产"') &&
+      securityMonitorPage.includes('{ key: "window" as const, label: "时间窗分析"') &&
+      securityMonitorPage.includes('securityCenterApi.agentInventory({ ...filter, limit: 32 })') &&
+      securityMonitorPage.includes('const [visibleAgentCount, setVisibleAgentCount] = useState(8)') &&
+      securityMonitorPage.includes('<AgentOverviewCard key={agent.agentAssetId}') &&
+      securityMonitorPage.includes('进入智能体资产 →') &&
+      securityMonitorPage.includes('观察模式 · 不影响系统操作') &&
+      !securityMonitorPage.includes('title="Flink 实时风险关联"') &&
+      !securityMonitorPage.includes('Flink 聚合连续行为') &&
+      !securityMonitorPage.includes('value: "Shadow"'),
+    {
+      hasOverviewTitle: securityMonitorPage.includes('title="智能体风险概览"'),
+      hasAssetFirstView: securityMonitorPage.includes('{ key: "assets" as const, label: "智能体资产"'),
+      hasWindowView: securityMonitorPage.includes('{ key: "window" as const, label: "时间窗分析"'),
+      hasInventoryQuery: securityMonitorPage.includes('securityCenterApi.agentInventory({ ...filter, limit: 32 })'),
+      hasEightItemDisclosure: securityMonitorPage.includes('const [visibleAgentCount, setVisibleAgentCount] = useState(8)'),
+      hasAssetCards: securityMonitorPage.includes('<AgentOverviewCard key={agent.agentAssetId}'),
+      hidesImplementationTerms:
+        !securityMonitorPage.includes('title="Flink 实时风险关联"') &&
+        !securityMonitorPage.includes('Flink 聚合连续行为') &&
+        !securityMonitorPage.includes('value: "Shadow"'),
+    },
+  );
+  assert(
+    'dashboard renders Kubernetes candidate identity as namespace/Pod/container before internal scope IDs',
+    agentsPage.includes('function agentPrimaryName(agent: AgentInventoryItem)') &&
+      agentsPage.includes('return parts.join("/")') &&
+      agentsPage.includes('<FieldValue label="原始 Scope" value={agent.agentId} />') &&
+      agentsPage.includes('<AgentAssetIdentityInline agent={agent}') &&
+      agentIdentity.includes('export function AgentAssetIdentityInline') &&
+      agentIdentity.includes('runtime ? (') &&
+      agentIdentity.includes('classification.nameClassName') &&
+      agentIdentity.includes('agent.locationLabel || shortWorkspaceLabel(agent.workspacePath)'),
+    {
+      hasFriendlyName: agentsPage.includes('return parts.join("/")'),
+      hasInternalScopeDetail: agentsPage.includes('<FieldValue label="原始 Scope" value={agent.agentId} />'),
+      hasUnifiedAssetIdentity: agentsPage.includes('<AgentAssetIdentityInline agent={agent}'),
+      hasRuntimeTag: agentIdentity.includes('runtime ? ('),
+      hasClassificationColor: agentIdentity.includes('classification.nameClassName'),
+      hasLocationLine: agentIdentity.includes('agent.locationLabel || shortWorkspaceLabel(agent.workspacePath)'),
     },
   );
   assert(

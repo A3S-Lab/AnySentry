@@ -10,8 +10,13 @@ required=(
   app/dist/main.js app/web/index.html runtime/node/bin/node
   native/a3s-sentry.linux-arm64-gnu.node clickhouse/bin/clickhouse
   redis/bin/redis-server redis/bin/redis-cli redis/etc/redis.conf
+  java/bin/java kafka/bin/kafka-server-start.sh
+  flink/bin/flink flink/usrlib/anysentry-flink-streaming.jar
   observer/bin/a3s-observer-collector observer/observer-forward.js
-  observer/observer-agent-attribution.js observer/observer-event-dedup.js
+  observer/observer-agent-attribution.js observer/observer-agent-templates.js
+  observer/observer-behavior-discovery.js observer/observer-docker-discovery.js
+  observer/observer-event-dedup.js observer/observer-infrastructure-roots.js
+  observer/observer-priority-queue.js observer/observer-workload-filter.js
   observer/KERNEL_VERSION_CODE
   l3/l3-agent.mjs diagnostics/a3s-bpf-syscall-probe
   install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh DEPLOYMENT.md
@@ -22,6 +27,9 @@ for file in "${required[@]}"; do [[ -f "$release/$file" ]] || die "release file 
 [[ -x "$release/RUN_HEALTH_SMOKE.sh" ]] || die 'health smoke script is not executable'
 [[ "$(cat "$release/observer/KERNEL_VERSION_CODE")" == '0x0004135a' ]] || die 'Observer BPF kernel version code mismatch'
 [[ "$(cat "$release/clickhouse/PROFILE")" == 'armv8.0-compat' ]] || die 'ClickHouse profile mismatch'
+grep -Fq 'src="/anysentry/static/' "$release/app/web/index.html" || die 'Web assets are not built for /anysentry'
+(cd "$release/app" && node -e "const p=require('./node_modules/@a3s-lab/sentry/package.json'); if(p.version !== '$SENTRY_NPM_VERSION') process.exit(1)") ||
+  die "staged Sentry npm module is not $SENTRY_NPM_VERSION"
 (cd "$release" && sha256sum --check --quiet manifest.sha256) || die 'release manifest checksum failed'
 
 elf_count=0

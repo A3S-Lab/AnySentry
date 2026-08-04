@@ -86,7 +86,10 @@ function forwarderEnv(source, fixture) {
     A3S_NODE_NAME: fixture.nodeName,
     FORWARD_DROP_PATHS: '/sys/,/proc/,/run/,/dev/',
     FORWARD_MAX_INFLIGHT: '4',
-    FORWARD_SCOPE: 'all',
+    // Exercise the production observation-filter path here. The recovery-mode `all` semantics
+    // (including routine-noise pass-through) are covered by verify-filter-pipeline.mjs.
+    FORWARD_SCOPE: 'agent',
+    ANYSENTRY_INFRA_ROOT_PIDS: '2299:fixture-infrastructure',
   };
 }
 
@@ -130,6 +133,9 @@ function runForwarderProcess({ label, command, args }, source, fixture) {
     child.stdin.write(`${observerLine({ agent: fixture.agentId, session: `${fixture.label}-session`, task: 'tool-task' }, { ToolExec: { pid: 2201, uid: 1000, cwd: '/workspace/app', argv: ['bash', '-lc', `echo ${fixture.label}-tool`] } })}\n`);
     child.stdin.write(`${observerLine({ agent: fixture.agentId, session: `${fixture.label}-session`, task: 'noise-task' }, { FileAccess: { pid: 2202, uid: 1000, cwd: '/workspace/app', path: `/proc/${fixture.label}/status` } })}\n`);
     child.stdin.write(`${observerLine({ agent: fixture.agentId, session: `${fixture.label}-session`, task: 'egress-task' }, { Egress: { pid: 2203, uid: 1000, cwd: '/workspace/app', peer: 'api.openai.com', port: 443 } })}\n`);
+    if (label === 'node') {
+      child.stdin.write(`${observerLine({ agent: 'kafka-run-class', session: null, task: '2299' }, { ToolExec: { pid: 2299, ppid: 1, uid: 1000, cwd: '/', argv: ['kafka-run-class', 'kafka.tools.GetOffsetShell'] } })}\n`);
+    }
     child.stdin.end();
   });
 }
@@ -174,7 +180,12 @@ async function verifyForwarder(entry, source, fixture) {
   const output = await runForwarderProcess(entry, source, fixture);
   const unexpectedStderr = output.stderr
     .split('\n')
-    .filter((line) => line.trim() && !line.startsWith('[observer-forward] process snapshot:'))
+    .filter((line) =>
+      line.trim() &&
+      !line.startsWith('[observer-forward] process snapshot:') &&
+      !line.startsWith('[observer-forward] agent templates:') &&
+      !line.startsWith('[observer-forward] docker discovery:'),
+    )
     .join('\n');
   assert(`${fixture.label} forwarder exits cleanly`, unexpectedStderr === '', unexpectedStderr);
 
@@ -196,6 +207,15 @@ async function verifyForwarder(entry, source, fixture) {
       ),
     eventList,
   );
+  if (entry.label === 'node') {
+    const sourceEventIds = eventList.items.map((event) => event.sourceEventId);
+    assert(
+      `${fixture.label} forwarder assigns distinct stable source event IDs`,
+      sourceEventIds.every((value) => typeof value === 'string' && value.startsWith('ose_')) &&
+        new Set(sourceEventIds).size === sourceEventIds.length,
+      sourceEventIds,
+    );
+  }
 
   const health = await eventually(`${fixture.label} collector heartbeat`, async () => {
     const list = await healthFor(fixture);

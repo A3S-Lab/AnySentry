@@ -18,6 +18,9 @@ const expectedProtectedRoutes = [
   'PUT alerts/:alertId',
   'PUT remediations/:taskId',
   'PUT agents/:agentId/metadata',
+  'PUT agents/:agentId/review',
+  'POST identity/ai-review',
+  'GET identity/ai-reviews',
   'POST sources',
   'PUT sources/:sourceId',
   'POST sources/:sourceId/rotate-token',
@@ -29,7 +32,13 @@ const expectedProtectedRoutes = [
   'PUT notifications/routes/:routeId',
   'POST objectives',
   'PUT objectives/:objectiveId',
+  'POST supply-chain/workspaces/:workspaceId/scan',
+  'POST supply-chain/workspaces/:workspaceId/assess',
   'PUT config',
+  'GET config/model-connections',
+  'POST config/model-connections/test',
+  'PUT config/model-connections/:profile',
+  'POST config/model-connections/:profile/clear',
   'POST config/simulate',
 ];
 
@@ -97,6 +106,9 @@ function protectedWriteProbes(id) {
     { route: 'PUT alerts/:alertId', label: 'alert update', method: 'PUT', path: `/alerts/${id}-missing-alert`, body: { status: 'acknowledged', note: 'auth guard probe' } },
     { route: 'PUT remediations/:taskId', label: 'remediation update', method: 'PUT', path: `/remediations/${id}-missing-task`, body: { status: 'done', note: 'auth guard probe' } },
     { route: 'PUT agents/:agentId/metadata', label: 'agent metadata update', method: 'PUT', path: `/agents/${id}-metadata-agent/metadata`, body: { workspacePath: `repo://${id}/auth`, owner: `${id}-owner` } },
+    { route: 'PUT agents/:agentId/review', label: 'agent review update', method: 'PUT', path: `/agents/${id}-review-agent/review`, body: { workspacePath: `repo://${id}/auth`, decision: 'non_agent', identityKeys: [`container:${id}`] } },
+    { route: 'POST identity/ai-review', label: 'AI identity review', method: 'POST', path: '/identity/ai-review', body: { targetType: 'event', eventId: `${id}-missing-event`, timeType: 'last_3h' } },
+    { route: 'GET identity/ai-reviews', label: 'AI identity review history', method: 'GET', path: `/identity/ai-reviews?eventId=${id}-missing-event` },
     { route: 'PUT sources/:sourceId', label: 'source update', method: 'PUT', path: `/sources/${id}-missing-source`, body: { name: `${id} source`, type: 'webhook', requireToken: true } },
     { route: 'POST sources/:sourceId/rotate-token', label: 'source token rotation', method: 'POST', path: `/sources/${id}-missing-source/rotate-token` },
     {
@@ -113,7 +125,13 @@ function protectedWriteProbes(id) {
     { route: 'PUT notifications/routes/:routeId', label: 'notification route update', method: 'PUT', path: `/notifications/routes/${id}-missing-route`, body: { name: `${id} route updated`, enabled: false, channelIds: [], kinds: ['source'] } },
     { route: 'POST objectives', label: 'objective create', method: 'POST', path: '/objectives', body: { name: `${id} objective`, enabled: true, targetType: 'source', targetId: `${id}-source`, metric: 'active_alerts', comparator: 'lte', threshold: 0, severity: 'medium' } },
     { route: 'PUT objectives/:objectiveId', label: 'objective update', method: 'PUT', path: `/objectives/${id}-missing-objective`, body: { name: `${id} objective updated`, enabled: false, threshold: 1 } },
+    { route: 'POST supply-chain/workspaces/:workspaceId/scan', label: 'supply-chain manual scan', method: 'POST', path: `/supply-chain/workspaces/${id}-missing-workspace/scan`, body: { reason: 'manual' } },
+    { route: 'POST supply-chain/workspaces/:workspaceId/assess', label: 'supply-chain manual assessment', method: 'POST', path: `/supply-chain/workspaces/${id}-missing-workspace/assess` },
     { route: 'PUT config', label: 'policy update', method: 'PUT', path: '/config', body: {} },
+    { route: 'GET config/model-connections', label: 'model connection status', method: 'GET', path: '/config/model-connections' },
+    { route: 'POST config/model-connections/test', label: 'model connection test', method: 'POST', path: '/config/model-connections/test', body: { profile: 'fast_review' } },
+    { route: 'PUT config/model-connections/:profile', label: 'model connection apply', method: 'PUT', path: '/config/model-connections/fast_review', body: { testToken: 'invalid-auth-probe' } },
+    { route: 'POST config/model-connections/:profile/clear', label: 'model credential clear', method: 'POST', path: '/config/model-connections/fast_review/clear' },
     { route: 'POST config/simulate', label: 'policy simulation', method: 'POST', path: '/config/simulate', body: { timeType: 'last_30d', limit: 1, policy: {} } },
   ];
 }
@@ -136,7 +154,7 @@ async function main() {
   const expectedRouteSet = new Set(expectedProtectedRoutes);
   const controllerRouteSet = new Set(controllerRoutes);
   assert(
-    'controller protected write route list matches management auth contract',
+    'controller protected management route list matches management auth contract',
     setDifference(expectedRouteSet, controllerRouteSet).length === 0 && setDifference(controllerRouteSet, expectedRouteSet).length === 0,
     {
       expectedProtectedRoutes,
@@ -149,7 +167,7 @@ async function main() {
   const protectedProbes = protectedWriteProbes(runId);
   const probedRouteSet = new Set(['POST sources', ...protectedProbes.map((probe) => probe.route)]);
   assert(
-    'management auth runtime probes cover every protected write route',
+    'management auth runtime probes cover every protected management route',
     setDifference(expectedRouteSet, probedRouteSet).length === 0 && setDifference(probedRouteSet, expectedRouteSet).length === 0,
     {
       expectedProtectedRoutes,

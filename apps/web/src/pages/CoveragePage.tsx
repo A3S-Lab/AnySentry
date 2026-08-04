@@ -16,7 +16,6 @@ import {
   RadioTower,
   RefreshCw,
   Search,
-  ShieldAlert,
   X,
 } from "lucide-react";
 import { useMemo, useState } from "react";

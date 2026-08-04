@@ -25,9 +25,17 @@ done
 
 SERVICES=(
   anysentry-observer.service
+  anysentry-supply-chain.service
+  anysentry-composite-judge.service
+  anysentry-stream-worker.service
   anysentry-l3-worker.service
   anysentry-fast-judge.service
   anysentry.service
+  anysentry-flink-job.service
+  anysentry-flink-taskmanager.service
+  anysentry-flink-jobmanager.service
+  anysentry-kafka-init.service
+  anysentry-kafka.service
   anysentry-redis.service
   anysentry-clickhouse.service
 )

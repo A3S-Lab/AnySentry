@@ -31,8 +31,8 @@
 
 ### `verify.sh`
 
-用途：验证主机 ABI、文件校验和、全部服务、ClickHouse、Redis、API、原生 Sentry、
-Source 事件增长及 Collector 健康状态。
+用途：验证主机 ABI、文件校验和、全部服务、ClickHouse、Redis、Kafka、Flink、API、
+原生 Sentry、Source 事件增长及 Collector 健康状态。
 
 ```bash
 /opt/anysentry/verify.sh
@@ -43,7 +43,7 @@ Source 事件增长及 Collector 健康状态。
 ### `RUN_HEALTH_SMOKE.sh`
 
 用途：生成统一健康报告。默认报告目录为
-`/tmp/anysentry-health-smoke-compat8`，该目录在脚本运行时创建并覆盖。
+`/tmp/anysentry-health-smoke-0.3.0-compat1`，该目录在脚本运行时创建并覆盖。
 
 ```bash
 /opt/anysentry/RUN_HEALTH_SMOKE.sh --passive
@@ -113,5 +113,8 @@ cd /tmp
 | --- | --- |
 | `wait-clickhouse.sh` | API 启动前等待 ClickHouse 回环接口就绪 |
 | `run-l3-worker.sh` | 根据 `ANYSENTRY_L3_ENABLED` 启动 L3 Worker；未启用时保持待机 |
+| `run-kafka.sh` | 初始化 Kafka KRaft 存储并启动本机 Broker |
+| `init-kafka-topics.sh` | 幂等创建 AnySentry 流处理主题 |
+| `run-flink.sh` | 启动 Flink JobManager、TaskManager 或提交流处理作业 |
 
 脚本参数和默认值以对应版本发布包内的 `--help` 输出及本说明为准。

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -u
 
-BASE_URL="${PJLAB_BASE_URL:-http://api.pjlab.org.cn/v1}"
+BASE_URL="${PJLAB_BASE_URL:-https://token.pjlab.org.cn/v1}"
 MODEL="${PJLAB_MODEL:-glm-5.2}"
 API_KEY="${PJLAB_API_KEY:-}"
+
+# Model and local service checks must bypass an operator's global terminal proxy.
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 
 if [[ -z "$API_KEY" ]]; then
   read -rsp "PJLAB API key: " API_KEY
@@ -25,11 +28,11 @@ request() {
   local status
 
   if [[ "$method" == "GET" ]]; then
-    status="$(curl -sS --max-time 30 -o "$response_file" -w '%{http_code}' \
+    status="$(curl --noproxy '*' -sS --max-time 30 -o "$response_file" -w '%{http_code}' \
       -H "Authorization: Bearer $API_KEY" \
       "$BASE_URL$path")" || return 1
   else
-    status="$(curl -sS --max-time 60 -o "$response_file" -w '%{http_code}' \
+    status="$(curl --noproxy '*' -sS --max-time 60 -o "$response_file" -w '%{http_code}' \
       -X "$method" \
       -H "Authorization: Bearer $API_KEY" \
       -H 'Content-Type: application/json' \

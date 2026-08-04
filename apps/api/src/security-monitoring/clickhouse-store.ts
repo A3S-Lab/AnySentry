@@ -10,13 +10,14 @@
 
 import { ClickHouseClient, createClient } from '@clickhouse/client';
 import { PolicyConfig } from './policy-config';
-import { AgentAttribution, AgentMetadataRecord, AlertRecord, AuditRecord, CollectorHeartbeatRecord, Incident, IngestionSourceRecord, JudgedEvent, MaintenanceWindowRecord, NotificationState, ObjectiveRecord, ProcessContext, RemediationRecord } from './types';
+import { AgentAttribution, AgentMetadataRecord, AlertRecord, AuditRecord, CollectorHeartbeatRecord, IdentityAiReviewRecord, Incident, IngestionSourceRecord, JudgedEvent, MaintenanceWindowRecord, NotificationState, ObjectiveRecord, ProcessContext, RemediationRecord } from './types';
 
 const TABLE = 'events';
 // `at` is raw epoch-ms (matches the aggregator); `ts` is a derived DateTime only for TTL/partitioning.
 const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   schemaVersion LowCardinality(String),
   eventId String,
+  sourceEventId String DEFAULT '',
   at UInt64,
   eventKind LowCardinality(String),
   eventCategory LowCardinality(String),
@@ -52,6 +53,7 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   attributes String,
   process String DEFAULT '{}',
   attribution String DEFAULT '{}',
+  judgment String DEFAULT '{}',
   rawPreview String,
   ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000))
 ) ENGINE = MergeTree
@@ -61,6 +63,7 @@ TTL ts + INTERVAL 90 DAY`;
 const EVENT_ALTERS = [
   'ADD COLUMN IF NOT EXISTS schemaVersion LowCardinality(String) DEFAULT \'anysentry.agent_event.v1\'',
   'ADD COLUMN IF NOT EXISTS eventId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS sourceEventId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS eventCategory LowCardinality(String) DEFAULT \'unknown\'',
   'ADD COLUMN IF NOT EXISTS source LowCardinality(String) DEFAULT \'observer\'',
   'ADD COLUMN IF NOT EXISTS collectorId String DEFAULT \'\'',
@@ -77,6 +80,7 @@ const EVENT_ALTERS = [
   'ADD COLUMN IF NOT EXISTS attributes String DEFAULT \'{}\'',
   'ADD COLUMN IF NOT EXISTS process String DEFAULT \'{}\'',
   'ADD COLUMN IF NOT EXISTS attribution String DEFAULT \'{}\'',
+  'ADD COLUMN IF NOT EXISTS judgment String DEFAULT \'{}\'',
   'ADD COLUMN IF NOT EXISTS rawPreview String DEFAULT \'\'',
 ];
 
@@ -90,12 +94,13 @@ const CONFIG_DDL = `CREATE TABLE IF NOT EXISTS ${CONFIG_TABLE} (
 ) ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY key`;
 
-type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'process' | 'attribution' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview'> & {
+type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'process' | 'attribution' | 'judgment' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview'> & {
   actionKind: string;
   actionTarget: string;
   attributes: string;
   process: string;
   attribution: string;
+  judgment: string;
   collectorId: string;
   sourceId: string;
   parentSpanId: string;
@@ -103,6 +108,23 @@ type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'pro
   rawPreview: string;
 };
 export type IncidentState = Pick<Incident, 'incidentId' | 'status' | 'owner' | 'note' | 'acknowledgedAt' | 'resolvedAt' | 'updatedAt'>;
+export interface StoredEventQuery {
+  sinceMs: number;
+  untilMs: number;
+  eventId?: string;
+  sourceId?: string;
+  collectorId?: string;
+  agentId?: string;
+  sessionId?: string;
+  workspacePath?: string;
+  traceId?: string;
+  runId?: string;
+  eventKind?: string;
+  eventCategory?: string;
+  verdict?: string;
+  tier?: string;
+  limit: number;
+}
 
 function attrString(attributes: JudgedEvent['attributes'], key: string): string {
   const value = attributes[key];
@@ -113,6 +135,7 @@ function toRow(e: JudgedEvent): Row {
   return {
     schemaVersion: e.schemaVersion,
     eventId: e.eventId,
+    sourceEventId: e.sourceEventId ?? '',
     at: e.at,
     eventKind: e.eventKind,
     eventCategory: e.eventCategory,
@@ -148,6 +171,7 @@ function toRow(e: JudgedEvent): Row {
     attributes: JSON.stringify(e.attributes ?? {}),
     process: JSON.stringify(e.process ?? {}),
     attribution: JSON.stringify(e.attribution ?? {}),
+    judgment: JSON.stringify(e.judgment ?? {}),
     rawPreview: e.rawPreview ?? '',
   };
 }
@@ -181,6 +205,7 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
   return {
     schemaVersion: (str(r.schemaVersion) || 'anysentry.agent_event.v1') as JudgedEvent['schemaVersion'],
     eventId: str(r.eventId) || `evt_${at}_${agentId}_${eventKind}`,
+    sourceEventId: str(r.sourceEventId) || undefined,
     at,
     eventKind,
     eventCategory: (str(r.eventCategory) || 'unknown') as JudgedEvent['eventCategory'],
@@ -216,6 +241,7 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
     attributes,
     process: parseObject<ProcessContext>(r.process),
     attribution: parseObject<AgentAttribution>(r.attribution),
+    judgment: parseObject<NonNullable<JudgedEvent['judgment']>>(r.judgment),
     rawPreview: str(r.rawPreview) || undefined,
   };
 }
@@ -296,6 +322,54 @@ export class ClickHouseStore {
       return [...latest.values()].sort((a, b) => a.at - b.at).slice(-limit);
     } catch (err) {
       console.error('[clickhouse] hydrate failed:', (err as Error).message);
+      return [];
+    }
+  }
+
+  /** Query durable event history. Identity visibility is deliberately applied by the service
+   * after current human-review metadata is resolved; a mutable review decision must never be
+   * baked into this immutable evidence query. */
+  async searchEvents(input: StoredEventQuery): Promise<JudgedEvent[]> {
+    if (!this.client) return [];
+    const conditions = ['at >= {since:UInt64}', 'at <= {until:UInt64}'];
+    const queryParams: Record<string, string | number> = { since: input.sinceMs, until: input.untilMs };
+    const fields: Array<[keyof StoredEventQuery, string]> = [
+      ['eventId', 'eventId'],
+      ['sourceId', 'sourceId'],
+      ['collectorId', 'collectorId'],
+      ['agentId', 'agentId'],
+      ['sessionId', 'sessionId'],
+      ['workspacePath', 'workspacePath'],
+      ['traceId', 'traceId'],
+      ['runId', 'runId'],
+      ['eventKind', 'eventKind'],
+      ['eventCategory', 'eventCategory'],
+      ['verdict', 'verdict'],
+      ['tier', 'tier'],
+    ];
+    for (const [key, column] of fields) {
+      const value = input[key];
+      if (typeof value !== 'string' || !value.trim()) continue;
+      conditions.push(`${column} = {${String(key)}:String}`);
+      queryParams[String(key)] = value.trim();
+    }
+    const rowLimit = Math.max(1, Math.min(100_000, input.limit));
+    queryParams.limit = rowLimit;
+    try {
+      const rs = await this.client.query({
+        query: `SELECT * FROM ${TABLE} WHERE ${conditions.join(' AND ')} ORDER BY at DESC, decisionUpdatedAt DESC LIMIT {limit:UInt32}`,
+        query_params: queryParams,
+        format: 'JSONEachRow',
+      });
+      const rows = (await rs.json()) as Array<Record<string, unknown>>;
+      const latest = new Map<string, JudgedEvent>();
+      for (const row of rows) {
+        const event = fromRow(row);
+        if (!latest.has(event.eventId)) latest.set(event.eventId, event);
+      }
+      return [...latest.values()].sort((a, b) => b.at - a.at);
+    } catch (err) {
+      console.error('[clickhouse] event search failed:', (err as Error).message);
       return [];
     }
   }
@@ -461,12 +535,21 @@ export class ClickHouseStore {
     if (!this.client) return [];
     try {
       const rs = await this.client.query({
-        query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'agent_metadata' LIMIT 1`,
+        query: `SELECT key, value FROM ${CONFIG_TABLE} FINAL WHERE key IN ('agent_metadata', 'agent_metadata_v2') ORDER BY key DESC LIMIT 1`,
         format: 'JSONEachRow',
       });
-      const rows = (await rs.json()) as Array<{ value: string }>;
+      const rows = (await rs.json()) as Array<{ key: string; value: string }>;
       const parsed = rows.length ? (JSON.parse(rows[0].value) as unknown) : [];
-      return Array.isArray(parsed) ? (parsed as AgentMetadataRecord[]) : [];
+      if (Array.isArray(parsed)) return parsed as AgentMetadataRecord[];
+      if (
+        parsed &&
+        typeof parsed === 'object' &&
+        (parsed as { schemaVersion?: unknown }).schemaVersion === 'anysentry.agent_metadata.v2' &&
+        Array.isArray((parsed as { assets?: unknown }).assets)
+      ) {
+        return (parsed as { assets: AgentMetadataRecord[] }).assets;
+      }
+      return [];
     } catch (err) {
       console.error('[clickhouse] loadAgentMetadata failed:', (err as Error).message);
       return [];
@@ -478,11 +561,44 @@ export class ClickHouseStore {
     try {
       await this.client.insert({
         table: CONFIG_TABLE,
-        values: [{ key: 'agent_metadata', value: JSON.stringify(records), updated_at: Date.now() }],
+        values: [{
+          key: 'agent_metadata_v2',
+          value: JSON.stringify({ schemaVersion: 'anysentry.agent_metadata.v2', assets: records }),
+          updated_at: Date.now(),
+        }],
         format: 'JSONEachRow',
       });
     } catch (err) {
       console.error('[clickhouse] saveAgentMetadata failed:', (err as Error).message);
+    }
+  }
+
+  async loadIdentityAiReviews(): Promise<IdentityAiReviewRecord[]> {
+    if (!this.client) return [];
+    try {
+      const rs = await this.client.query({
+        query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'identity_ai_reviews' LIMIT 1`,
+        format: 'JSONEachRow',
+      });
+      const rows = (await rs.json()) as Array<{ value: string }>;
+      const parsed = rows.length ? (JSON.parse(rows[0].value) as unknown) : [];
+      return Array.isArray(parsed) ? (parsed as IdentityAiReviewRecord[]) : [];
+    } catch (err) {
+      console.error('[clickhouse] loadIdentityAiReviews failed:', (err as Error).message);
+      return [];
+    }
+  }
+
+  async saveIdentityAiReviews(records: IdentityAiReviewRecord[]): Promise<void> {
+    if (!this.client) return;
+    try {
+      await this.client.insert({
+        table: CONFIG_TABLE,
+        values: [{ key: 'identity_ai_reviews', value: JSON.stringify(records.slice(-1_000)), updated_at: Date.now() }],
+        format: 'JSONEachRow',
+      });
+    } catch (err) {
+      console.error('[clickhouse] saveIdentityAiReviews failed:', (err as Error).message);
     }
   }
 

@@ -3,17 +3,35 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 ensure_stage
 
-for dir in app runtime native clickhouse redis observer l3 diagnostics; do [[ -d "$STAGE_DIR/$dir" ]] || die "staged component missing: $dir"; done
+for dir in app runtime native clickhouse redis observer l3 java kafka flink diagnostics; do [[ -d "$STAGE_DIR/$dir" ]] || die "staged component missing: $dir"; done
 
 install -d -m 0755 "$STAGE_DIR/config" "$STAGE_DIR/systemd"
-for file in config/anysentry.env.example config/clickhouse-config.xml config/clickhouse-users.xml config/redis.conf; do install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
-for file in systemd/anysentry.service systemd/anysentry-clickhouse.service systemd/anysentry-redis.service systemd/anysentry-fast-judge.service systemd/anysentry-l3-worker.service systemd/anysentry-observer.service; do install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
+for file in config/anysentry.env.example config/clickhouse-config.xml config/clickhouse-users.xml config/redis.conf config/kafka-server.properties config/flink-config.yaml; do install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
+install -m 0644 "$CHANNEL_DIR/package/config/flink-config.yaml" "$STAGE_DIR/flink/conf/config.yaml"
+for file in \
+  systemd/anysentry.service \
+  systemd/anysentry-clickhouse.service \
+  systemd/anysentry-redis.service \
+  systemd/anysentry-kafka.service \
+  systemd/anysentry-kafka-init.service \
+  systemd/anysentry-flink-jobmanager.service \
+  systemd/anysentry-flink-taskmanager.service \
+  systemd/anysentry-flink-job.service \
+  systemd/anysentry-fast-judge.service \
+  systemd/anysentry-l3-worker.service \
+  systemd/anysentry-stream-worker.service \
+  systemd/anysentry-composite-judge.service \
+  systemd/anysentry-supply-chain.service \
+  systemd/anysentry-observer.service
+do
+  install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"
+done
 install -m 0644 "$CHANNEL_DIR/package/DEPLOYMENT.md" "$STAGE_DIR/DEPLOYMENT.md"
 install -m 0644 "$CHANNEL_DIR/package/AnySentry部署手册.md" "$STAGE_DIR/AnySentry部署手册.md"
 install -m 0644 "$CHANNEL_DIR/package/AnySentry使用手册.md" "$STAGE_DIR/AnySentry使用手册.md"
 install -m 0644 "$CHANNEL_DIR/package/AnySentry脚本说明.md" "$STAGE_DIR/AnySentry脚本说明.md"
 install -m 0644 "$CHANNEL_DIR/package/DIAGNOSTICS.md" "$STAGE_DIR/diagnostics/DIAGNOSTICS.md"
-for file in install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh wait-clickhouse.sh run-l3-worker.sh uninstall.sh; do install -m 0755 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
+for file in install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh wait-clickhouse.sh run-l3-worker.sh run-kafka.sh init-kafka-topics.sh run-flink.sh uninstall.sh; do install -m 0755 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
 install -m 0755 "$CHANNEL_DIR/package/provision-observer.mjs" "$STAGE_DIR/provision-observer.mjs"
 
 source "$BUILD_DIR/source-provenance.env"
@@ -22,7 +40,8 @@ source "$BUILD_DIR/source-provenance.env"
   printf 'TARGET_OS=UnionTech_OS_Server_20_Enterprise\nTARGET_ARCH=aarch64\nTARGET_GLIBC=%s\nTARGET_PAGE_SIZE=%s\n' "$TARGET_GLIBC" "$TARGET_PAGE_SIZE"
   printf 'TARGET_KERNEL_RELEASE=%s\nBPF_KERNEL_VERSION=%s\nBPF_KERNEL_VERSION_CODE=%s\n' "$UOS_KERNEL_RELEASE" "$UOS_BPF_KERNEL_VERSION" "$UOS_BPF_KERNEL_VERSION_CODE"
   printf 'ANYSENTRY_COMMIT=%s\nOBSERVER_COMMIT=%s\nSENTRY_COMMIT=%s\n' "$ANYSENTRY_COMMIT" "$OBSERVER_COMMIT" "$SENTRY_COMMIT"
-  printf 'CLICKHOUSE_VERSION=%s\nCLICKHOUSE_PROFILE=%s\nREDIS_VERSION=%s\nNODE_VERSION=%s\nA3S_CODE_VERSION=%s\n' "$CLICKHOUSE_VERSION" "$CLICKHOUSE_PROFILE" "$REDIS_VERSION" "$NODE_VERSION" "$CODE_VERSION"
+  printf 'CLICKHOUSE_VERSION=%s\nCLICKHOUSE_PROFILE=%s\nREDIS_VERSION=%s\nNODE_VERSION=%s\nA3S_CODE_VERSION=%s\nSENTRY_NPM_VERSION=%s\n' "$CLICKHOUSE_VERSION" "$CLICKHOUSE_PROFILE" "$REDIS_VERSION" "$NODE_VERSION" "$CODE_VERSION" "$SENTRY_NPM_VERSION"
+  printf 'JAVA_VERSION=%s\nKAFKA_VERSION=%s\nFLINK_VERSION=%s\nFLINK_KAFKA_CONNECTOR_VERSION=%s\nPUBLIC_BASE_PATH=/anysentry\n' "$JAVA_DISPLAY_VERSION" "$KAFKA_VERSION" "$FLINK_VERSION" "$FLINK_KAFKA_CONNECTOR_VERSION"
 } > "$STAGE_DIR/VERSION"
 {
   cat "$STAGE_DIR/VERSION"

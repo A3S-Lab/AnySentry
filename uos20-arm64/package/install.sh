@@ -11,11 +11,11 @@ STATE_DIR=${ANYSENTRY_STATE_DIR:-/var/lib/anysentry}
 LOG_DIR=${ANYSENTRY_LOG_DIR:-/var/log/anysentry}
 SYSTEMD_DIR=${ANYSENTRY_SYSTEMD_DIR:-/etc/systemd/system}
 SYSCTL_DIR=${ANYSENTRY_SYSCTL_DIR:-/etc/sysctl.d}
-COMPAT_RELEASE_ID=0.2.0-compat8
+COMPAT_RELEASE_ID=0.3.0-compat1
 INSTALL_LOG_BASE=${ANYSENTRY_INSTALL_LOG_BASE:-/var/log/anysentry/install}
 INSTALL_LOG_ROOT=${ANYSENTRY_INSTALL_LOG_ROOT:-$INSTALL_LOG_BASE/$COMPAT_RELEASE_ID}
 TEMP_INSTALL_LOG=${ANYSENTRY_TEMP_INSTALL_LOG:-/tmp/anysentry-install-$COMPAT_RELEASE_ID}
-MIN_FREE_KB=$((5 * 1024 * 1024))
+MIN_FREE_KB=$((8 * 1024 * 1024))
 CHECK_ONLY=0
 STAGING=
 ROLLBACK_ROOT=
@@ -32,24 +32,48 @@ EXPECTED_BPF_CODE=0x0004135a
 SERVICES=(
   anysentry-clickhouse.service
   anysentry-redis.service
+  anysentry-kafka.service
+  anysentry-kafka-init.service
+  anysentry-flink-jobmanager.service
+  anysentry-flink-taskmanager.service
+  anysentry-flink-job.service
   anysentry.service
   anysentry-fast-judge.service
   anysentry-l3-worker.service
+  anysentry-stream-worker.service
+  anysentry-composite-judge.service
+  anysentry-supply-chain.service
   anysentry-observer.service
 )
 START_SERVICES=(
   anysentry-clickhouse.service
   anysentry-redis.service
+  anysentry-kafka.service
+  anysentry-kafka-init.service
+  anysentry-flink-jobmanager.service
+  anysentry-flink-taskmanager.service
+  anysentry-flink-job.service
   anysentry.service
   anysentry-fast-judge.service
   anysentry-l3-worker.service
+  anysentry-stream-worker.service
+  anysentry-composite-judge.service
+  anysentry-supply-chain.service
   anysentry-observer.service
 )
 STOP_SERVICES=(
   anysentry-observer.service
+  anysentry-supply-chain.service
+  anysentry-composite-judge.service
+  anysentry-stream-worker.service
   anysentry-l3-worker.service
   anysentry-fast-judge.service
   anysentry.service
+  anysentry-flink-job.service
+  anysentry-flink-taskmanager.service
+  anysentry-flink-jobmanager.service
+  anysentry-kafka-init.service
+  anysentry-kafka.service
   anysentry-redis.service
   anysentry-clickhouse.service
 )
@@ -147,6 +171,15 @@ capture_diagnostics() {
   curl --connect-timeout 2 --max-time 15 -fsS \
     "http://127.0.0.1:$port/security-center/healthz" \
     >"$INSTALL_LOG_ROOT/health-api-$phase.json" 2>&1 || true
+  if [[ -x $INSTALL_ROOT/kafka/bin/kafka-topics.sh && -x $INSTALL_ROOT/java/bin/java ]]; then
+    JAVA_HOME=$INSTALL_ROOT/java PATH=$INSTALL_ROOT/java/bin:$PATH \
+      "$INSTALL_ROOT/kafka/bin/kafka-topics.sh" --bootstrap-server 127.0.0.1:9092 --list \
+      >"$INSTALL_LOG_ROOT/kafka-topics-$phase.txt" 2>&1 || true
+  fi
+  curl --connect-timeout 2 --max-time 15 -fsS http://127.0.0.1:8081/overview \
+    >"$INSTALL_LOG_ROOT/flink-overview-$phase.json" 2>&1 || true
+  curl --connect-timeout 2 --max-time 15 -fsS http://127.0.0.1:8081/jobs/overview \
+    >"$INSTALL_LOG_ROOT/flink-jobs-$phase.json" 2>&1 || true
   if [[ -n $source_id ]]; then
     curl --connect-timeout 2 --max-time 15 -fsS -X POST \
       "http://127.0.0.1:$port/security-center/sources/list" \
@@ -315,10 +348,14 @@ persist_resource_configuration() {
   printf '%s\n' \
     '# AnySentry UOS runtime requirements. Managed by install.sh.' \
     'vm.overcommit_memory=1' \
+    'vm.max_map_count=262144' \
+    'fs.file-max=1048576' \
     >"$sysctl_file"
   chown root:root "$sysctl_file"
   chmod 0644 "$sysctl_file"
   sysctl -w vm.overcommit_memory=1 >/dev/null
+  sysctl -w vm.max_map_count=262144 >/dev/null
+  sysctl -w fs.file-max=1048576 >/dev/null
   echo "Persisted runtime memory configuration: $sysctl_file"
 }
 
@@ -327,16 +364,26 @@ verify_package() {
     app/dist/main.js app/web/index.html runtime/node/bin/node
     native/a3s-sentry.linux-arm64-gnu.node clickhouse/bin/clickhouse
     redis/bin/redis-server redis/bin/redis-cli redis/etc/redis.conf
+    java/bin/java kafka/bin/kafka-server-start.sh kafka/VERSION
+    flink/bin/flink flink/usrlib/anysentry-flink-streaming.jar flink/VERSION
     observer/bin/a3s-observer-collector observer/observer-forward.js
-    observer/observer-agent-attribution.js observer/observer-event-dedup.js
+    observer/observer-agent-attribution.js observer/observer-agent-templates.js
+    observer/observer-behavior-discovery.js observer/observer-docker-discovery.js
+    observer/observer-event-dedup.js observer/observer-infrastructure-roots.js
+    observer/observer-priority-queue.js observer/observer-workload-filter.js
     observer/KERNEL_VERSION_CODE l3/l3-agent.mjs
     app/dist/security-monitoring/worker-main.js run-l3-worker.sh
     diagnostics/a3s-bpf-syscall-probe diagnostics/RUN_DIAGNOSTICS.sh
     config/anysentry.env.example systemd/anysentry.service
     systemd/anysentry-clickhouse.service systemd/anysentry-redis.service
+    systemd/anysentry-kafka.service systemd/anysentry-kafka-init.service
+    systemd/anysentry-flink-jobmanager.service systemd/anysentry-flink-taskmanager.service
+    systemd/anysentry-flink-job.service systemd/anysentry-stream-worker.service
+    systemd/anysentry-composite-judge.service systemd/anysentry-supply-chain.service
     systemd/anysentry-fast-judge.service systemd/anysentry-l3-worker.service
     systemd/anysentry-observer.service
-    provision-observer.mjs wait-clickhouse.sh verify.sh inspect-host.sh
+    provision-observer.mjs wait-clickhouse.sh run-kafka.sh init-kafka-topics.sh
+    run-flink.sh verify.sh inspect-host.sh
     AnySentry部署手册.md AnySentry使用手册.md AnySentry脚本说明.md
     VERSION PROVENANCE manifest.sha256
   )
@@ -347,6 +394,8 @@ verify_package() {
     fail "Observer BPF code is not $EXPECTED_BPF_CODE"
   (cd "$PACKAGE_ROOT" && sha256sum --check --quiet manifest.sha256) ||
     fail "package checksum validation failed"
+  grep -Fq 'src="/anysentry/static/' "$PACKAGE_ROOT/app/web/index.html" ||
+    fail "dashboard assets were not built for /anysentry"
 }
 
 kernel_config_source() {
@@ -397,7 +446,7 @@ validate_redis_runtime() {
 }
 
 preflight() {
-  local command_name arch glibc_line glibc_version page_size free_kb node_version clickhouse_version redis_version collector_version
+  local command_name arch glibc_line glibc_version page_size free_kb node_version java_version clickhouse_version redis_version collector_version
   for command_name in uname getconf sort df sha256sum systemctl curl awk sed grep install cp mv chmod chown id getent groupadd useradd od tr bash timeout tee journalctl ln sysctl; do
     command -v "$command_name" >/dev/null 2>&1 || fail "required command not found: $command_name"
   done
@@ -416,6 +465,8 @@ preflight() {
   validate_kernel_features
   node_version=$("$PACKAGE_ROOT/runtime/node/bin/node" --version 2>&1) ||
     fail "bundled Node runtime cannot execute: $node_version"
+  java_version=$("$PACKAGE_ROOT/java/bin/java" -version 2>&1) ||
+    fail "bundled Java runtime cannot execute: $java_version"
   clickhouse_version=$("$PACKAGE_ROOT/clickhouse/bin/clickhouse" --version 2>&1) ||
     fail "bundled ClickHouse cannot execute on this CPU: $clickhouse_version"
   redis_version=$("$PACKAGE_ROOT/redis/bin/redis-server" --version 2>&1) ||
@@ -426,8 +477,8 @@ preflight() {
   validate_bpf_abi
   free_kb=$(df -Pk "${INSTALL_PARENT:-/}" 2>/dev/null | awk 'NR == 2 {print $4}')
   [[ -n $free_kb ]] || free_kb=$(df -Pk / | awk 'NR == 2 {print $4}')
-  [[ $free_kb -ge $MIN_FREE_KB ]] || fail "at least 5 GiB free disk space is required"
-  echo "Preflight passed: architecture=$arch glibc=$glibc_version kernel=$(uname -r) page_size=$page_size free=$((free_kb / 1024))MiB node=$node_version clickhouse=$clickhouse_version redis=$redis_version observer=$collector_version bpf=$EXPECTED_BPF_CODE"
+  [[ $free_kb -ge $MIN_FREE_KB ]] || fail "at least 8 GiB free disk space is required"
+  echo "Preflight passed: architecture=$arch glibc=$glibc_version kernel=$(uname -r) page_size=$page_size free=$((free_kb / 1024))MiB node=$node_version java=$(head -n1 <<<"$java_version") clickhouse=$clickhouse_version redis=$redis_version observer=$collector_version bpf=$EXPECTED_BPF_CODE"
 }
 
 stop_services() {
@@ -534,6 +585,20 @@ wait_for_redis() {
   return 1
 }
 
+wait_for_kafka() {
+  local i
+  for i in $(seq 1 90); do
+    "$INSTALL_ROOT/kafka/bin/kafka-topics.sh" \
+      --bootstrap-server 127.0.0.1:9092 --list >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  return 1
+}
+
+wait_for_flink() {
+  wait_for_url http://127.0.0.1:8081/overview
+}
+
 provision_observer() {
   local port
   port=$(env_value PORT "$ENV_FILE")
@@ -567,6 +632,16 @@ activate_release() {
   set_stage start-redis
   systemctl enable --now anysentry-redis.service
   wait_for_redis || fail "AnySentry Redis readiness timeout"
+  set_stage start-kafka
+  systemctl enable --now anysentry-kafka.service
+  wait_for_kafka || fail "AnySentry Kafka readiness timeout"
+  set_stage initialize-kafka-topics
+  systemctl enable --now anysentry-kafka-init.service
+  set_stage start-flink
+  systemctl enable --now anysentry-flink-jobmanager.service
+  systemctl enable --now anysentry-flink-taskmanager.service
+  wait_for_flink || fail "AnySentry Flink readiness timeout"
+  systemctl enable --now anysentry-flink-job.service
   set_stage start-api
   systemctl enable --now anysentry.service
   set_stage provision-observer-source
@@ -574,6 +649,10 @@ activate_release() {
   set_stage start-judgment-workers
   systemctl enable --now anysentry-fast-judge.service
   systemctl enable --now anysentry-l3-worker.service
+  set_stage start-streaming-workers
+  systemctl enable --now anysentry-stream-worker.service
+  systemctl enable --now anysentry-composite-judge.service
+  systemctl enable --now anysentry-supply-chain.service
   set_stage start-observer
   systemctl enable --now anysentry-observer.service
   capture_diagnostics activation
@@ -608,7 +687,9 @@ main() {
     useradd --system --gid anysentry --home-dir "$STATE_DIR" --shell "$(command -v nologin)" anysentry
   fi
   install -d -o anysentry -g anysentry -m 0750 \
-    "$STATE_DIR" "$STATE_DIR/clickhouse" "$STATE_DIR/redis" "$STATE_DIR/l3" "$LOG_DIR"
+    "$STATE_DIR" "$STATE_DIR/clickhouse" "$STATE_DIR/redis" "$STATE_DIR/kafka" \
+    "$STATE_DIR/flink" "$STATE_DIR/flink/checkpoints" "$STATE_DIR/flink/savepoints" \
+    "$STATE_DIR/flink/blob" "$STATE_DIR/flink/tmp" "$STATE_DIR/l3" "$LOG_DIR"
   set_stage normalize-configuration
   install_environment 2>&1 | tee "$INSTALL_LOG_ROOT/config-validation.txt"
   set_stage persist-resource-configuration

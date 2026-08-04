@@ -2,11 +2,16 @@ import { useRequest } from "ahooks";
 import dayjs from "dayjs";
 import {
   Activity,
+  AlertTriangle,
   ArrowLeft,
+  BadgeCheck,
+  Ban,
   BellRing,
   Bot,
   CalendarClock,
+  ChevronDown,
   Clock3,
+  CircleCheck,
   EyeOff,
   FileCheck2,
   FileText,
@@ -14,9 +19,12 @@ import {
   LoaderCircle,
   RefreshCw,
   Route,
+  RotateCcw,
   Save,
   Search,
+  Settings2,
   ShieldAlert,
+  ShieldQuestion,
   Target,
   TerminalSquare,
   UserCheck,
@@ -25,12 +33,15 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import { AgentAssetIdentityInline } from "@/components/custom/agent-identity";
+import { IdentityAiReview } from "@/components/custom/identity-ai-review";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   type AgentEventCategory,
   type AgentEventSource,
+  type AgentClassification,
   type AgentCriticality,
   type AgentHealthState,
   type AgentInventoryItem,
@@ -77,6 +88,13 @@ const CRITICALITY_LABEL: Record<AgentCriticality, string> = {
   critical: "关键",
 };
 
+const CLASSIFICATION_LABEL: Record<AgentClassification, string> = {
+  confirmed_agent: "已确认 Agent",
+  probable_agent: "候选 Agent",
+  unknown: "尚未识别",
+  non_agent: "已排除",
+};
+
 interface AgentMetadataDraft {
   displayName: string;
   owner: string;
@@ -86,6 +104,8 @@ interface AgentMetadataDraft {
   tags: string;
   note: string;
 }
+
+type PendingReviewDecision = "confirmed_agent" | "unknown" | "non_agent";
 
 const CATEGORY_LABEL: Record<AgentEventCategory, string> = {
   tool: "工具",
@@ -134,6 +154,34 @@ function criticalityClass(level?: AgentCriticality) {
   if (level === "medium") return "border-amber-400/30 bg-amber-500/10 text-amber-100";
   if (level === "low") return "border-teal-400/30 bg-teal-500/10 text-teal-100";
   return "border-white/10 bg-white/5 text-zinc-300";
+}
+
+function classificationClass(classification: AgentClassification) {
+  if (classification === "confirmed_agent") return "border-emerald-400/30 bg-emerald-500/10 text-emerald-100";
+  if (classification === "probable_agent") return "border-amber-400/30 bg-amber-500/10 text-amber-100";
+  if (classification === "non_agent") return "border-slate-500/30 bg-slate-500/10 text-slate-300";
+  return "border-white/10 bg-white/5 text-zinc-400";
+}
+
+function agentPrimaryName(agent: AgentInventoryItem) {
+  const customName = agent.displayName?.trim();
+  if (customName) return customName;
+  if (agent.detectedName?.trim()) return agent.detectedName.trim();
+  const workload = agent.workloadRef;
+  if (workload?.environment === "kubernetes") {
+    const parts = [workload.namespace, workload.podName, workload.containerName]
+      .map((part) => part?.trim())
+      .filter((part): part is string => Boolean(part));
+    if (parts.length) return parts.join("/");
+  }
+  if (workload?.environment === "docker" && workload.containerName?.trim()) {
+    return workload.containerName.trim();
+  }
+  if (workload?.environment === "host") {
+    const processName = workload.processName?.trim() || workload.name?.trim();
+    if (processName && !processName.startsWith("session-")) return processName;
+  }
+  return agent.agentId;
 }
 
 function splitTags(value: string) {
@@ -208,8 +256,26 @@ function agentParams(agent: AgentInventoryItem, timeType?: SecurityTimeType) {
   const params = new URLSearchParams();
   if (timeType) params.set("timeType", timeType);
   params.set("agentId", agent.agentId);
+  params.set("agentAssetId", agent.agentAssetId);
   params.set("workspacePath", agent.workspacePath);
   return params;
+}
+
+function matchesSelectedAgent(
+  agent: AgentInventoryItem | undefined,
+  agentAssetId: string,
+  legacyAgentId: string,
+  legacyWorkspacePath: string,
+) {
+  if (!agent) return false;
+  if (agentAssetId) {
+    return agent.agentAssetId === agentAssetId || agent.agentAssetAliases?.includes(agentAssetId) === true;
+  }
+  return Boolean(
+    legacyAgentId &&
+    agent.agentId === legacyAgentId &&
+    (!legacyWorkspacePath || agent.workspacePath === legacyWorkspacePath),
+  );
 }
 
 function agentEventsHref(agent: AgentInventoryItem, timeType: SecurityTimeType) {
@@ -285,12 +351,8 @@ function AgentRow({
     >
       <span className="font-mono text-xs text-zinc-500">{formatDate(agent.lastSeen)}</span>
       <span className="min-w-0">
-        <span className="block truncate text-sm font-medium text-zinc-100" title={agent.displayName || agent.agentId}>
-          {agent.displayName || agent.agentId}
-        </span>
-        <span className="mt-0.5 block truncate font-mono text-[11px] text-zinc-600" title={agent.workspacePath}>
-          {agent.owner ? `${agent.owner} · ` : ""}{agent.workspacePath}
-        </span>
+        <AgentAssetIdentityInline agent={agent} />
+        {agent.owner ? <span className="ml-3 mt-0.5 block truncate text-[10px] text-zinc-600">{agent.owner}</span> : null}
       </span>
       <span><Pill className={healthClass(agent.healthState)}>{HEALTH_LABEL[agent.healthState]}</Pill></span>
       <span className="text-right font-mono text-xs text-zinc-500">{agent.eventCount}</span>
@@ -301,17 +363,39 @@ function AgentRow({
 function AgentDetail({
   agent,
   timeType,
+  startTime,
+  endTime,
   draft,
   saving,
+  reviewing,
+  pendingReview,
+  reviewError,
+  reviewNotice,
+  reviewFocused,
+  reviewSourceEventHref,
   onDraftChange,
   onSaveMetadata,
+  onRequestReview,
+  onCancelReview,
+  onConfirmReview,
 }: {
   agent?: AgentInventoryItem;
   timeType: SecurityTimeType;
+  startTime?: string;
+  endTime?: string;
   draft: AgentMetadataDraft;
   saving: boolean;
+  reviewing: boolean;
+  pendingReview: PendingReviewDecision | null;
+  reviewError?: string;
+  reviewNotice?: string;
+  reviewFocused: boolean;
+  reviewSourceEventHref?: string;
   onDraftChange: (patch: Partial<AgentMetadataDraft>) => void;
   onSaveMetadata: () => void;
+  onRequestReview: (decision: PendingReviewDecision) => void;
+  onCancelReview: () => void;
+  onConfirmReview: () => void;
 }) {
   if (!agent) {
     return (
@@ -323,13 +407,60 @@ function AgentDetail({
 
   const categoryRows = countRows(agent.eventCategoryCounts, CATEGORY_LABEL);
   const sourceRows = countRows(agent.sourceCounts, SOURCE_LABEL);
+  const primaryName = agentPrimaryName(agent);
+  const configuredMetadataCount = [
+    agent.displayName,
+    agent.owner,
+    agent.team,
+    agent.environment,
+    agent.criticality,
+    agent.note,
+    agent.tags.length > 0 ? agent.tags.join(",") : "",
+  ].filter(Boolean).length;
+  const reviewConfirmation = pendingReview === "confirmed_agent"
+    ? {
+        title: "确认 Agent 身份",
+        description: agent.workloadRef?.systemdUnit?.startsWith("session-")
+          ? "该裁决将作用于当前运行范围，其中可能包含多个智能体进程、终端和普通命令。请先核对工作负载与识别证据。"
+          : "确认后，后续同一稳定身份的事件将按已确认 Agent 归因，历史事件保持不变。",
+        action: "确认是 Agent",
+        actionClassName: "bg-emerald-500 text-[#07100c] hover:bg-emerald-400",
+      }
+    : pendingReview === "non_agent"
+      ? {
+          title: "确认标记为非 Agent",
+          description: "只有尚未识别的稳定身份可以被排除。Collector 将停止转发后续常规事件；历史证据、裁决记录和抑制计数仍会保留。",
+          action: "确认标记非 Agent",
+          actionClassName: "bg-slate-200 text-slate-950 hover:bg-white",
+        }
+      : pendingReview === "unknown"
+        ? {
+            title:
+              agent.classification === "probable_agent"
+                ? "证据不足，降为未知"
+                : agent.classification === "non_agent"
+                  ? "重新纳入观察"
+                  : "撤销确认，重新观察",
+            description:
+              agent.classification === "non_agent"
+                ? "恢复后 Collector 将重新转发该稳定身份的事件，并从尚未识别状态继续观察。历史排除记录不会删除。"
+                : "该身份将进入尚未识别状态并继续采集，已有事件、原始分类和人工审核记录保持不变。",
+            action:
+              agent.classification === "non_agent"
+                ? "确认重新观察"
+                : agent.classification === "probable_agent"
+                  ? "确认降为未知"
+                  : "确认撤销",
+            actionClassName: "bg-zinc-200 text-zinc-950 hover:bg-white",
+          }
+        : undefined;
 
   return (
     <section className="rounded-[8px] border border-white/10 bg-[#111612]/92">
       <div className="flex min-h-12 items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
         <div className="flex min-w-0 items-center gap-2">
           <Bot className="size-4 shrink-0 text-teal-200" />
-          <h2 className="truncate text-sm font-semibold text-zinc-100">{agent.agentId}</h2>
+          <AgentAssetIdentityInline agent={agent} showClassification />
         </div>
         <div className="flex items-center gap-2">
           <Pill className={riskClass(agent.riskLevel)}>{agent.riskLevelText}</Pill>
@@ -339,72 +470,240 @@ function AgentDetail({
 
       <div className="space-y-4 p-4">
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-          <FieldValue label="Agent" value={agent.agentId} />
+          <FieldValue label="当前显示名" value={primaryName} />
+          <FieldValue label="采集时名称" value={agent.detectedName ?? agent.agentId} />
+          <FieldValue label="原始 Scope" value={agent.agentId} />
+          <FieldValue label="资产 ID" value={agent.agentAssetId} />
+          <FieldValue label="实例定位" value={agent.locationLabel} />
+          <FieldValue label="运行实例" value={agent.instanceCount} />
           <FieldValue label="Workspace" value={agent.workspacePath} />
           <FieldValue label="User" value={agent.userId} />
-          <FieldValue label="Owner" value={agent.owner} />
-          <FieldValue label="Team" value={agent.team} />
-          <FieldValue label="Environment" value={agent.environment} />
           <FieldValue label="First Seen" value={formatDate(agent.firstSeen)} />
           <FieldValue label="Last Seen" value={formatDate(agent.lastSeen)} />
           <FieldValue label="Last Event" value={agent.lastEventSubject} />
         </div>
 
-        <div className="rounded-md border border-white/10 bg-white/[0.03] p-3">
-          <div className="mb-3 flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2">
-              <UserCheck className="size-4 text-teal-200" />
-              <h3 className="text-sm font-semibold text-zinc-100">资产管理</h3>
+        <IdentityAiReview
+          targetType="agent"
+          agentAssetId={agent.agentAssetId}
+          timeType={timeType}
+          startTime={startTime}
+          endTime={endTime}
+        />
+
+        <div
+          id="agent-review"
+          className={cn(
+            "scroll-mt-4 rounded-md border border-amber-400/20 bg-amber-500/[0.06] p-3 transition-shadow",
+            reviewFocused && "ring-1 ring-amber-300/50 ring-offset-2 ring-offset-[#111612]",
+          )}
+        >
+          <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <UserCheck className="size-4 text-amber-200" />
+                <h3 className="text-sm font-semibold text-zinc-100">人工身份裁决</h3>
+                <Pill className={classificationClass(agent.classification)}>{CLASSIFICATION_LABEL[agent.classification]}</Pill>
+                {reviewSourceEventHref ? (
+                  <Link
+                    to={reviewSourceEventHref}
+                    className="inline-flex items-center gap-1 text-[11px] font-semibold text-teal-300 hover:text-teal-200"
+                  >
+                    <Search className="size-3" />
+                    返回来源事件
+                  </Link>
+                ) : null}
+              </div>
+              <p className="mt-2 text-xs leading-5 text-zinc-400">
+                显示名和身份裁决相互独立，原始事件始终保留。候选可确认或降为未知；只有尚未识别的稳定身份才能标记为非 Agent。
+              </p>
+              {agent.workloadRef?.systemdUnit?.startsWith("session-") ? (
+                <p className="mt-1 text-xs leading-5 text-amber-200/80">
+                  当前身份覆盖整个 {agent.workloadRef.systemdUnit}，其中可能包含多个智能体进程、终端和普通命令；细粒度进程树拆分完成前请谨慎裁决。
+                </p>
+              ) : null}
+              <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-zinc-500">
+                <span>physical={agent.physicalWorkloadId ?? "--"}</span>
+                <span>instance={agent.agentInstanceId ?? "--"}</span>
+                <span>keys={agent.reviewIdentityKeys.length}</span>
+                {agent.agentAssetAliases?.length ? <span>aliases={agent.agentAssetAliases.length}</span> : null}
+                <span>source={agent.attributionSource}</span>
+              </div>
+              {agent.reviewDecision ? (
+                <p className="mt-2 text-xs text-zinc-400">
+                  人工结论：{CLASSIFICATION_LABEL[agent.reviewDecision]}
+                  {agent.reviewedBy ? ` · ${agent.reviewedBy}` : ""}
+                  {agent.reviewedAt ? ` · ${formatDate(agent.reviewedAt)}` : ""}
+                </p>
+              ) : null}
             </div>
-            {agent.metadataUpdatedAt ? <span className="font-mono text-[11px] text-zinc-600">{formatDate(agent.metadataUpdatedAt)}</span> : null}
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              {(agent.classification === "probable_agent" || agent.classification === "unknown") ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={reviewing || Boolean(pendingReview)}
+                  onClick={() => onRequestReview("confirmed_agent")}
+                  className="h-8 bg-emerald-500 text-[#07100c] hover:bg-emerald-400"
+                >
+                  {reviewing ? <LoaderCircle className="size-3.5 animate-spin" /> : <BadgeCheck className="size-3.5" />}
+                  确认是 Agent
+                </Button>
+              ) : null}
+              {agent.classification === "unknown" ? (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  disabled={reviewing || Boolean(pendingReview)}
+                  onClick={() => onRequestReview("non_agent")}
+                  className="h-8 border border-slate-400/20 bg-slate-500/10 text-slate-200 hover:bg-slate-500/20"
+                >
+                  <Ban className="size-3.5" />
+                  标记为非 Agent
+                </Button>
+              ) : null}
+              {agent.classification !== "unknown" ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  disabled={reviewing || Boolean(pendingReview)}
+                  onClick={() => onRequestReview("unknown")}
+                  className="h-8 text-zinc-400 hover:bg-white/5 hover:text-zinc-100"
+                >
+                  <RotateCcw className="size-3.5" />
+                  {agent.classification === "probable_agent"
+                    ? "证据不足，降为未知"
+                    : agent.classification === "non_agent"
+                      ? "重新纳入观察"
+                      : "撤销确认，重新观察"}
+                </Button>
+              ) : null}
+            </div>
           </div>
-          <div className="grid gap-3 md:grid-cols-3">
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-medium text-zinc-400">显示名</span>
-              <Input value={draft.displayName} onChange={(event) => onDraftChange({ displayName: event.target.value })} className="h-9 border-white/10 bg-white/5 text-xs" />
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-medium text-zinc-400">负责人</span>
-              <Input value={draft.owner} onChange={(event) => onDraftChange({ owner: event.target.value })} className="h-9 border-white/10 bg-white/5 text-xs" />
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-medium text-zinc-400">团队</span>
-              <Input value={draft.team} onChange={(event) => onDraftChange({ team: event.target.value })} className="h-9 border-white/10 bg-white/5 text-xs" />
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-medium text-zinc-400">环境</span>
-              <Input value={draft.environment} onChange={(event) => onDraftChange({ environment: event.target.value })} placeholder="prod / staging / dev" className="h-9 border-white/10 bg-white/5 text-xs" />
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-medium text-zinc-400">重要性</span>
-              <Select value={draft.criticality || "unset"} onValueChange={(next) => onDraftChange({ criticality: next === "unset" ? "" : next as AgentCriticality })}>
-                <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {CRITICALITY_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
-                </SelectContent>
-              </Select>
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-medium text-zinc-400">标签</span>
-              <Input value={draft.tags} onChange={(event) => onDraftChange({ tags: event.target.value })} placeholder="pci, prod, external" className="h-9 border-white/10 bg-white/5 text-xs" />
-            </label>
-          </div>
-          <div className="mt-3 grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-medium text-zinc-400">备注</span>
-              <Input value={draft.note} onChange={(event) => onDraftChange({ note: event.target.value })} className="h-9 border-white/10 bg-white/5 text-xs" />
-            </label>
-            <Button type="button" onClick={onSaveMetadata} disabled={saving} className="mt-5 h-9 bg-teal-500 text-[#07100c] hover:bg-teal-400">
-              {saving ? <LoaderCircle className="size-3.5 animate-spin" /> : <Save className="size-3.5" />}
-              保存
-            </Button>
-          </div>
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            {agent.criticality ? <Pill className={criticalityClass(agent.criticality)}>重要性 {CRITICALITY_LABEL[agent.criticality]}</Pill> : null}
-            {agent.environment ? <Pill className="border-sky-400/30 bg-sky-500/10 text-sky-100">{agent.environment}</Pill> : null}
-            {agent.tags.map((tag) => <Pill key={tag} className="border-white/10 bg-white/5 text-zinc-200">{tag}</Pill>)}
-          </div>
+          {reviewNotice ? (
+            <div className="mt-3 flex items-start gap-2 rounded-md border border-emerald-400/20 bg-emerald-500/10 px-3 py-2 text-xs leading-5 text-emerald-100">
+              <CircleCheck className="mt-0.5 size-3.5 shrink-0" />
+              <span>{reviewNotice}</span>
+            </div>
+          ) : null}
+          {reviewError ? (
+            <div className="mt-3 flex items-start gap-2 rounded-md border border-rose-400/20 bg-rose-500/10 px-3 py-2 text-xs leading-5 text-rose-100">
+              <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+              <span>{reviewError}</span>
+            </div>
+          ) : null}
+          {reviewConfirmation ? (
+            <div
+              role="group"
+              aria-label="确认人工身份裁决"
+              className="mt-3 rounded-md border border-amber-300/25 bg-[#17150d] px-3 py-3"
+            >
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                <div className="flex min-w-0 items-start gap-2.5">
+                  <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full border border-amber-300/25 bg-amber-400/10">
+                    <ShieldQuestion className="size-3.5 text-amber-200" />
+                  </span>
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-zinc-100">{reviewConfirmation.title}</p>
+                    <p className="mt-1 text-xs leading-5 text-zinc-400">{reviewConfirmation.description}</p>
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center justify-end gap-2">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    disabled={reviewing}
+                    onClick={onCancelReview}
+                    className="h-8 text-zinc-400 hover:bg-white/5 hover:text-zinc-100"
+                  >
+                    返回
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={reviewing}
+                    onClick={onConfirmReview}
+                    className={cn("h-8", reviewConfirmation.actionClassName)}
+                  >
+                    {reviewing ? <LoaderCircle className="size-3.5 animate-spin" /> : <BadgeCheck className="size-3.5" />}
+                    {reviewConfirmation.action}
+                  </Button>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </div>
+
+        <details className="group rounded-md border border-white/10 bg-white/[0.03]">
+          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-3 [&::-webkit-details-marker]:hidden">
+            <div className="flex min-w-0 items-center gap-2">
+              <Settings2 className="size-4 shrink-0 text-teal-200" />
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-zinc-100">身份信息配置</h3>
+                <p className="mt-0.5 truncate text-[11px] text-zinc-500">
+                  {configuredMetadataCount > 0
+                    ? `已配置 ${configuredMetadataCount} 项${agent.owner ? ` · ${agent.owner}` : ""}${agent.environment ? ` · ${agent.environment}` : ""}`
+                    : "未配置 · 展开后设置显示名、归属与环境"}
+                </p>
+              </div>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              {agent.metadataUpdatedAt ? <span className="hidden font-mono text-[11px] text-zinc-600 sm:inline">{formatDate(agent.metadataUpdatedAt)}</span> : null}
+              <ChevronDown className="size-4 text-zinc-500 transition-transform group-open:rotate-180" />
+            </div>
+          </summary>
+          <div className="border-t border-white/10 p-3">
+            <div className="grid gap-3 md:grid-cols-3">
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-zinc-400">显示名</span>
+                <Input value={draft.displayName} onChange={(event) => onDraftChange({ displayName: event.target.value })} className="h-9 border-white/10 bg-white/5 text-xs" />
+              </label>
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-zinc-400">负责人</span>
+                <Input value={draft.owner} onChange={(event) => onDraftChange({ owner: event.target.value })} className="h-9 border-white/10 bg-white/5 text-xs" />
+              </label>
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-zinc-400">团队</span>
+                <Input value={draft.team} onChange={(event) => onDraftChange({ team: event.target.value })} className="h-9 border-white/10 bg-white/5 text-xs" />
+              </label>
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-zinc-400">环境</span>
+                <Input value={draft.environment} onChange={(event) => onDraftChange({ environment: event.target.value })} placeholder="prod / staging / dev" className="h-9 border-white/10 bg-white/5 text-xs" />
+              </label>
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-zinc-400">重要性</span>
+                <Select value={draft.criticality || "unset"} onValueChange={(next) => onDraftChange({ criticality: next === "unset" ? "" : next as AgentCriticality })}>
+                  <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {CRITICALITY_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </label>
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-zinc-400">标签</span>
+                <Input value={draft.tags} onChange={(event) => onDraftChange({ tags: event.target.value })} placeholder="pci, prod, external" className="h-9 border-white/10 bg-white/5 text-xs" />
+              </label>
+            </div>
+            <div className="mt-3 grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-zinc-400">备注</span>
+                <Input value={draft.note} onChange={(event) => onDraftChange({ note: event.target.value })} className="h-9 border-white/10 bg-white/5 text-xs" />
+              </label>
+              <Button type="button" onClick={onSaveMetadata} disabled={saving} className="mt-5 h-9 bg-teal-500 text-[#07100c] hover:bg-teal-400">
+                {saving ? <LoaderCircle className="size-3.5 animate-spin" /> : <Save className="size-3.5" />}
+                保存
+              </Button>
+            </div>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              {agent.criticality ? <Pill className={criticalityClass(agent.criticality)}>{`重要性 ${CRITICALITY_LABEL[agent.criticality]}`}</Pill> : null}
+              {agent.environment ? <Pill className="border-sky-400/30 bg-sky-500/10 text-sky-100">{agent.environment}</Pill> : null}
+              {agent.tags.map((tag) => <Pill key={tag} className="border-white/10 bg-white/5 text-zinc-200">{tag}</Pill>)}
+            </div>
+          </div>
+        </details>
 
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           <MetricTile label="事件" value={agent.eventCount} tone="border-white/10 bg-white/[0.03] text-zinc-100" />
@@ -518,39 +817,110 @@ function AgentDetail({
 export default function AgentsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
+  const routeStartTime = searchParams.get("startTime") ?? "";
+  const routeEndTime = searchParams.get("endTime") ?? "";
   const [healthState, setHealthState] = useState<AgentHealthState | "all">((searchParams.get("healthState") as AgentHealthState) || "all");
   const [queryText, setQueryText] = useState(searchParams.get("q") ?? "");
-  const [selectedAgentId, setSelectedAgentId] = useState(searchParams.get("agentId") ?? "");
-  const [selectedWorkspacePath, setSelectedWorkspacePath] = useState(searchParams.get("workspacePath") ?? "");
+  const selectedAgentAssetId = searchParams.get("selectedAgentAssetId") ?? searchParams.get("agentAssetId") ?? "";
+  const legacySelectedAgentId = selectedAgentAssetId ? "" : searchParams.get("agentId") ?? "";
+  const legacySelectedWorkspacePath = selectedAgentAssetId ? "" : searchParams.get("workspacePath") ?? "";
+  const hasPinnedSelection = Boolean(selectedAgentAssetId || legacySelectedAgentId);
   const [userId, setUserId] = useState(searchParams.get("userId") ?? "");
   const [metadataDraft, setMetadataDraft] = useState<AgentMetadataDraft>(() => draftFromAgent());
   const [savingMetadata, setSavingMetadata] = useState(false);
+  const [reviewingAgent, setReviewingAgent] = useState(false);
+  const [pendingReview, setPendingReview] = useState<PendingReviewDecision | null>(null);
+  const [reviewError, setReviewError] = useState("");
+  const [reviewNotice, setReviewNotice] = useState("");
+  const reviewFocused = searchParams.get("focus") === "review";
+  const reviewSourceEventId = searchParams.get("eventId") ?? "";
 
   const query = useMemo<AgentInventoryQuery>(() => ({
     timeType,
+    startTime: timeType === "custom" ? clean(routeStartTime) : undefined,
+    endTime: timeType === "custom" ? clean(routeEndTime) : undefined,
     healthState,
     q: clean(queryText),
-    agentId: clean(selectedAgentId),
-    workspacePath: clean(selectedWorkspacePath),
     userId: clean(userId),
     limit: 200,
-  }), [healthState, queryText, selectedAgentId, selectedWorkspacePath, timeType, userId]);
+  }), [healthState, queryText, routeEndTime, routeStartTime, timeType, userId]);
 
-  const { data, loading, refresh } = useRequest(() => securityCenterApi.agentInventory(query), {
+  const { data, loading, error: listError, refresh: refreshList } = useRequest(() => securityCenterApi.agentInventory(query), {
     refreshDeps: [query],
+    pollingInterval: 10000,
+    pollingWhenHidden: false,
+  });
+
+  const detailQuery = useMemo<AgentInventoryQuery>(() => ({
+    timeType,
+    startTime: timeType === "custom" ? clean(routeStartTime) : undefined,
+    endTime: timeType === "custom" ? clean(routeEndTime) : undefined,
+    agentAssetId: clean(selectedAgentAssetId),
+    agentId: selectedAgentAssetId ? undefined : clean(legacySelectedAgentId),
+    workspacePath: selectedAgentAssetId ? undefined : clean(legacySelectedWorkspacePath),
+    includeUnclassified: hasPinnedSelection,
+    limit: 1,
+  }), [hasPinnedSelection, legacySelectedAgentId, legacySelectedWorkspacePath, routeEndTime, routeStartTime, selectedAgentAssetId, timeType]);
+  const {
+    data: detailData,
+    loading: detailLoading,
+    error: detailError,
+    refresh: refreshDetail,
+  } = useRequest(() => securityCenterApi.agentInventory(detailQuery), {
+    ready: hasPinnedSelection,
+    refreshDeps: [detailQuery],
     pollingInterval: 10000,
     pollingWhenHidden: false,
   });
 
   const selectedAgent = useMemo(() => {
     const items = data?.items ?? [];
-    return items.find((item) => item.agentId === selectedAgentId && item.workspacePath === selectedWorkspacePath) ?? items[0];
-  }, [data, selectedAgentId, selectedWorkspacePath]);
+    if (hasPinnedSelection) {
+      const detailAgent = detailData?.items?.[0];
+      return matchesSelectedAgent(
+        detailAgent,
+        selectedAgentAssetId,
+        legacySelectedAgentId,
+        legacySelectedWorkspacePath,
+      ) ? detailAgent : undefined;
+    }
+    return items[0];
+  }, [data, detailData, hasPinnedSelection, legacySelectedAgentId, legacySelectedWorkspacePath, selectedAgentAssetId]);
+  const classificationCounts = useMemo(() => {
+    const counts: Partial<Record<AgentClassification, number>> = {};
+    for (const item of data?.items ?? []) {
+      counts[item.classification] = (counts[item.classification] ?? 0) + 1;
+    }
+    return counts;
+  }, [data?.items]);
+  const reviewSourceEventHref = useMemo(() => {
+    if (!reviewSourceEventId || !selectedAgent) return undefined;
+    const params = new URLSearchParams({
+      timeType,
+      eventId: reviewSourceEventId,
+      agentAssetId: selectedAgent.agentAssetId,
+    });
+    if (timeType === "custom" && routeStartTime) params.set("startTime", routeStartTime);
+    if (timeType === "custom" && routeEndTime) params.set("endTime", routeEndTime);
+    return `/events?${params.toString()}`;
+  }, [reviewSourceEventId, routeEndTime, routeStartTime, selectedAgent, timeType]);
+
+  useEffect(() => {
+    if (!hasPinnedSelection || !selectedAgent || (selectedAgentAssetId && selectedAgent.agentAssetId === selectedAgentAssetId)) return;
+    const next = new URLSearchParams(searchParams);
+    next.delete("agentId");
+    next.delete("agentAssetId");
+    next.delete("workspacePath");
+    next.set("selectedAgentAssetId", selectedAgent.agentAssetId);
+    setSearchParams(next, { replace: true });
+    setReviewNotice("该资产身份已归一，当前展示其唯一资产记录。");
+  }, [hasPinnedSelection, searchParams, selectedAgent, selectedAgentAssetId, setSearchParams]);
 
   useEffect(() => {
     setMetadataDraft(draftFromAgent(selectedAgent));
   }, [
     selectedAgent?.agentId,
+    selectedAgent?.agentAssetId,
     selectedAgent?.workspacePath,
     selectedAgent?.displayName,
     selectedAgent?.owner,
@@ -562,13 +932,28 @@ export default function AgentsPage() {
     selectedAgent?.tags.join("|"),
   ]);
 
+  useEffect(() => {
+    if (!reviewFocused || !selectedAgent) return;
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById("agent-review")?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [reviewFocused, selectedAgent?.agentAssetId]);
+
   const selectAgent = (agent: AgentInventoryItem) => {
-    setSelectedAgentId(agent.agentId);
-    setSelectedWorkspacePath(agent.workspacePath);
-    const next = new URLSearchParams();
+    setPendingReview(null);
+    setReviewError("");
+    setReviewNotice("");
+    const next = new URLSearchParams(searchParams);
     next.set("timeType", timeType);
-    next.set("agentId", agent.agentId);
-    next.set("workspacePath", agent.workspacePath);
+    if (timeType === "custom" && routeStartTime) next.set("startTime", routeStartTime);
+    if (timeType === "custom" && routeEndTime) next.set("endTime", routeEndTime);
+    next.delete("agentId");
+    next.delete("agentAssetId");
+    next.delete("workspacePath");
+    next.delete("focus");
+    next.delete("eventId");
+    next.set("selectedAgentAssetId", agent.agentAssetId);
     if (healthState !== "all") next.set("healthState", healthState);
     if (clean(queryText)) next.set("q", queryText.trim());
     if (clean(userId)) next.set("userId", userId.trim());
@@ -578,9 +963,10 @@ export default function AgentsPage() {
   const clearFilters = () => {
     setHealthState("all");
     setQueryText("");
-    setSelectedAgentId("");
-    setSelectedWorkspacePath("");
     setUserId("");
+    setPendingReview(null);
+    setReviewError("");
+    setReviewNotice("");
     setSearchParams({});
   };
 
@@ -590,6 +976,7 @@ export default function AgentsPage() {
     try {
       await securityCenterApi.updateAgentMetadata(selectedAgent.agentId, {
         workspacePath: selectedAgent.workspacePath,
+        agentAssetId: selectedAgent.agentAssetId,
         displayName: metadataDraft.displayName,
         owner: metadataDraft.owner,
         team: metadataDraft.team,
@@ -597,10 +984,62 @@ export default function AgentsPage() {
         criticality: metadataDraft.criticality,
         tags: splitTags(metadataDraft.tags),
         note: metadataDraft.note,
+        identityKeys: selectedAgent.reviewIdentityKeys,
+        physicalWorkloadId: selectedAgent.physicalWorkloadId,
+        agentInstanceId: selectedAgent.agentInstanceId,
+        workloadRef: selectedAgent.workloadRef,
       });
-      await refresh();
+      await Promise.all([refreshList(), refreshDetail()]);
     } finally {
       setSavingMetadata(false);
+    }
+  };
+
+  const requestReview = (decision: PendingReviewDecision) => {
+    setReviewError("");
+    setReviewNotice("");
+    setPendingReview(decision);
+  };
+
+  const cancelReview = () => {
+    if (reviewingAgent) return;
+    setPendingReview(null);
+    setReviewError("");
+  };
+
+  const reviewAgent = async () => {
+    if (!selectedAgent || !pendingReview) return;
+    const decision = pendingReview;
+    setReviewingAgent(true);
+    setReviewError("");
+    setReviewNotice("");
+    try {
+      await securityCenterApi.reviewAgent(selectedAgent.agentId, {
+        workspacePath: selectedAgent.workspacePath,
+        decision,
+        currentClassification: selectedAgent.classification,
+        agentAssetId: selectedAgent.agentAssetId,
+        identityKeys: selectedAgent.reviewIdentityKeys,
+        physicalWorkloadId: selectedAgent.physicalWorkloadId,
+        agentInstanceId: selectedAgent.agentInstanceId,
+        workloadRef: selectedAgent.workloadRef,
+        note: metadataDraft.note,
+      });
+      await Promise.all([refreshList(), refreshDetail()]);
+      setPendingReview(null);
+      setReviewNotice(
+        decision === "confirmed_agent"
+          ? "已确认 Agent 身份，新的归因快照将同步给 Collector。"
+          : decision === "non_agent"
+            ? "已标记为非 Agent；历史事件保留，后续常规事件将按稳定身份抑制。"
+            : selectedAgent.classification === "non_agent"
+              ? "已重新纳入观察，Collector 将恢复转发该身份的事件。"
+              : "已降为尚未识别并继续采集，历史证据保持不变。",
+      );
+    } catch (error) {
+      setReviewError(error instanceof Error ? error.message : "身份裁决失败，请稍后重试。");
+    } finally {
+      setReviewingAgent(false);
     }
   };
 
@@ -620,7 +1059,7 @@ export default function AgentsPage() {
                 <Bot className="size-5 shrink-0 text-teal-300" />
                 <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">智能体资产</h1>
               </div>
-              <p className="mt-0.5 truncate text-xs text-zinc-500">旁路发现 · 活跃度 · Incident 暴露面</p>
+              <p className="mt-0.5 truncate text-xs text-zinc-500">已确认与候选 Agent · 事件聚合 · 人工身份审核</p>
             </div>
           </div>
           <div className="flex items-center gap-2 text-xs text-zinc-500">
@@ -635,6 +1074,7 @@ export default function AgentsPage() {
             <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
             <SelectContent>
               {TIME_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
+              {timeType === "custom" ? <SelectItem value="custom">自定义范围</SelectItem> : null}
             </SelectContent>
           </Select>
           <Select value={healthState} onValueChange={(next) => setHealthState(next as AgentHealthState | "all")}>
@@ -649,8 +1089,8 @@ export default function AgentsPage() {
             <X className="size-3.5" />
             清除
           </Button>
-          <Button type="button" size="sm" onClick={refresh} disabled={loading} className="h-9 bg-teal-500 text-[#07100c] hover:bg-teal-400">
-            {loading ? <LoaderCircle className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+          <Button type="button" size="sm" onClick={() => { void Promise.all([refreshList(), hasPinnedSelection ? refreshDetail() : Promise.resolve()]); }} disabled={loading || detailLoading} className="h-9 bg-teal-500 text-[#07100c] hover:bg-teal-400">
+            {loading || detailLoading ? <LoaderCircle className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
             刷新
           </Button>
         </div>
@@ -671,7 +1111,7 @@ export default function AgentsPage() {
               <div className="flex min-h-12 items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
                 <div className="flex items-center gap-2">
                   <Activity className="size-4 text-teal-200" />
-                  <h2 className="text-sm font-semibold text-zinc-100">Agents</h2>
+                  <h2 className="text-sm font-semibold text-zinc-100">智能体资产</h2>
                 </div>
                 <span className="text-xs text-zinc-500">{data ? `${data.total} 个` : "--"}</span>
               </div>
@@ -680,31 +1120,84 @@ export default function AgentsPage() {
                   <LoaderCircle className="mr-2 size-4 animate-spin" />
                   加载资产...
                 </div>
+              ) : listError ? (
+                <div className="flex min-h-40 items-center justify-center px-6 text-center text-sm text-rose-300">
+                  智能体资产加载失败，请刷新重试
+                </div>
               ) : (data?.items?.length ?? 0) === 0 ? (
-                <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">暂无资产</div>
+                <div className="flex min-h-40 items-center justify-center px-6 text-center text-sm text-zinc-500">
+                  {healthState !== "all" || clean(queryText) || clean(userId)
+                    ? "没有符合当前筛选条件的智能体"
+                    : "当前时间范围内暂无已确认或候选智能体"}
+                </div>
               ) : (
                 <div className="max-h-[calc(100vh-300px)] overflow-y-auto">
-                  {data?.items.map((agent) => (
-                    <AgentRow
-                      key={`${agent.workspacePath}:${agent.agentId}`}
-                      agent={agent}
-                      active={agent.agentId === selectedAgent?.agentId && agent.workspacePath === selectedAgent?.workspacePath}
-                      onSelect={() => selectAgent(agent)}
-                    />
-                  ))}
+                  {data?.items.map((agent, index, items) => {
+                    const previous = items[index - 1];
+                    const startsSection = !previous || previous.classification !== agent.classification;
+                    return (
+                      <div key={agent.agentAssetId}>
+                        {startsSection ? (
+                          <div className="sticky top-0 z-10 flex items-center justify-between border-b border-white/8 bg-[#111612]/95 px-3 py-2 backdrop-blur">
+                            <span className={cn(
+                              "text-[11px] font-semibold",
+                              agent.classification === "confirmed_agent"
+                                ? "text-emerald-200"
+                                : agent.classification === "probable_agent"
+                                  ? "text-amber-200"
+                                  : "text-zinc-400",
+                            )}>
+                              {CLASSIFICATION_LABEL[agent.classification]}
+                            </span>
+                            <span className="text-[10px] text-zinc-600">
+                              {classificationCounts[agent.classification] ?? 0} 个
+                            </span>
+                          </div>
+                        ) : null}
+                        <AgentRow
+                          agent={agent}
+                          active={agent.agentAssetId === selectedAgent?.agentAssetId}
+                          onSelect={() => selectAgent(agent)}
+                        />
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </section>
 
             <div className="space-y-4">
-              <AgentDetail
+              {hasPinnedSelection && detailError ? (
+                <section className="rounded-[8px] border border-rose-400/20 bg-[#111612]/92">
+                  <div className="flex min-h-[360px] items-center justify-center px-6 text-center text-sm text-rose-300">指定智能体资产加载失败，请刷新重试</div>
+                </section>
+              ) : hasPinnedSelection && detailLoading && !selectedAgent ? (
+                <section className="rounded-[8px] border border-white/10 bg-[#111612]/92">
+                  <div className="flex min-h-[360px] items-center justify-center text-sm text-zinc-500"><LoaderCircle className="mr-2 size-4 animate-spin" />加载资产详情...</div>
+                </section>
+              ) : hasPinnedSelection && !detailLoading && !selectedAgent ? (
+                <section className="rounded-[8px] border border-white/10 bg-[#111612]/92">
+                  <div className="flex min-h-[360px] items-center justify-center px-6 text-center text-sm text-zinc-500">未找到指定智能体资产；该资产可能已合并或不在当前访问范围</div>
+                </section>
+              ) : <AgentDetail
                 agent={selectedAgent}
                 timeType={timeType}
+                startTime={timeType === "custom" ? routeStartTime : undefined}
+                endTime={timeType === "custom" ? routeEndTime : undefined}
                 draft={metadataDraft}
                 saving={savingMetadata}
+                reviewing={reviewingAgent}
+                pendingReview={pendingReview}
+                reviewError={reviewError}
+                reviewNotice={reviewNotice}
+                reviewFocused={reviewFocused}
+                reviewSourceEventHref={reviewSourceEventHref}
                 onDraftChange={(patch) => setMetadataDraft((current) => ({ ...current, ...patch }))}
                 onSaveMetadata={saveMetadata}
-              />
+                onRequestReview={requestReview}
+                onCancelReview={cancelReview}
+                onConfirmReview={reviewAgent}
+              />}
               <section className="rounded-[8px] border border-white/10 bg-[#111612]/92 p-4">
                 <div className="mb-3 flex items-center gap-2">
                   <AlertTriangle className="size-4 text-amber-200" />

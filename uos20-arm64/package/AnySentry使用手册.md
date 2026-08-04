@@ -11,21 +11,22 @@
 默认页面地址：
 
 ```text
-http://<服务器可达IP>:29653/
+http://<服务器可达IP>:29653/anysentry/
 ```
 
 无法直达服务器网段时，可使用同网段浏览器。具备跳转连接时，也可将本地端口转发至服务器
 `127.0.0.1:29653`，然后访问：
 
 ```text
-http://127.0.0.1:29653/
+http://127.0.0.1:29653/anysentry/
 ```
 
 ## 2. 监控范围
 
 AnySentry Observer 在内核侧采集进程执行、进程退出、文件访问、网络连接和安全操作事件。
 Observer 根据进程关系识别 Agent 及其子进程，并将有效事件发送至 AnySentry API。
-API 执行 L1、L2 和 L3 判定，将事件、风险及判定结果保存到 ClickHouse。
+API 执行 L1、L2 和 L3 判定，将事件、风险及判定结果保存到 ClickHouse。Kafka 传递规范化
+事件和判定结果，Flink 生成滚动风险画像与行为 Episode，复合判定结果以影子模式保存。
 
 页面主要对象：
 
@@ -45,6 +46,9 @@ attachedProbes=8
 outputDropped=0
 errorCount=0
 ```
+
+Kafka、Flink 和流处理 Worker 应为 `active`。Flink 页面只监听本机 `127.0.0.1:8081`，
+其 `AnySentry Flink Shadow Risk` 作业状态应为 `RUNNING`。
 
 查看 API 健康状态：
 
