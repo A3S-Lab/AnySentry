@@ -14,8 +14,8 @@ importers:
         specifier: 5.1.0
         version: 5.1.0
       '@a3s-lab/sentry':
-        specifier: 0.2.0
-        version: 0.2.0
+        specifier: 0.3.0
+        version: 0.3.0
       '@clickhouse/client':
         specifier: ^1.22.0
         version: 1.22.0
@@ -171,8 +171,8 @@ packages:
   '@a3s-lab/code@5.1.0':
     resolution: {integrity: sha512-lqbInFqEBINJfWtmf8NZeDIBLYMUnAMXcFfJhadx91rp2dxe1ecaLRwuw33dqgfMVc+3Drt0ak5I00OXRB5YMA==}
 
-  '@a3s-lab/sentry@0.2.0':
-    resolution: {integrity: sha512-+rzJKnmRPB9HIldLPIaUYhoo8snzaLayRKVuAoiXw1GMxyqF2ncM5vqwL37HkdnlvgDADwmbII1Z9mnnXhC4ig==}
+  '@a3s-lab/sentry@0.3.0':
+    resolution: {integrity: sha512-R++fkHdtW6coTsYqUugsy3hF10pOzpklFZ65NExOFRwnoeiqxEtguVBHVaUiXWugkvV3JOqSPoNs1uVUYJU5pg==}
     engines: {node: '>=12'}
 
   '@alloc/quick-lru@5.2.0':
@@ -2810,7 +2810,7 @@ snapshots:
       '@a3s-lab/code-linux-x64-musl': 5.1.0
       '@a3s-lab/code-win32-x64-msvc': 5.1.0
 
-  '@a3s-lab/sentry@0.2.0': {}
+  '@a3s-lab/sentry@0.3.0': {}
 
   '@alloc/quick-lru@5.2.0': {}
 
