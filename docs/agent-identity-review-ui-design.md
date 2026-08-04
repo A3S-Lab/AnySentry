@@ -1,7 +1,7 @@
 # Agent 身份审核、资产聚合与 UI 展示设计
 
-状态：实现基线  
-适用分支：`feat/agent-discovery-filter`  
+状态：实现基线
+适用分支：`feat/agent-discovery-filter`
 上位设计：`../AnySentry-Agent-Discovery-High-Performance-Design.md`、`docs/agent-discovery-filter.md`
 
 ## 1. 目的

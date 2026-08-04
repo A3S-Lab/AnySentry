@@ -1,7 +1,7 @@
 # Identity-aware judgment and read-only AI review
 
-Status: implementation plan  
-Target branch: `feat/identity-aware-judgment`  
+Status: implementation plan
+Target branch: `feat/identity-aware-judgment`
 Related Sentry branch: `feat/staged-judgment-sdk`
 
 ## Goal
