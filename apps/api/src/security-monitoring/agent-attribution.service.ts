@@ -14,7 +14,13 @@ type ProcRecord = {
 };
 
 const MAX_PROCS = 20_000;
-const ROOT_NAMES = (process.env.ANYSENTRY_AGENT_ROOT_NAMES || 'codex,a3s,a3s-code,a3s code,claude,claude-code,claude code')
+const BUILTIN_AGENT_HINTS_ENABLED = !['0', 'false', 'off', 'no', 'disabled'].includes(
+  (process.env.ANYSENTRY_BUILTIN_AGENT_HINTS ?? 'on').trim().toLowerCase(),
+);
+const ROOT_NAMES = (
+  process.env.ANYSENTRY_AGENT_ROOT_NAMES ??
+  (BUILTIN_AGENT_HINTS_ENABLED ? 'codex,a3s,a3s-code,a3s code,claude,claude-code,claude code' : '')
+)
   .split(',')
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
@@ -56,6 +62,7 @@ function directRootMatch(comm?: string, exe?: string, agentId?: string): string 
 }
 
 function argvRootMatch(argv?: string): string | undefined {
+  if (!BUILTIN_AGENT_HINTS_ENABLED) return undefined;
   const text = lower(argv);
   if (!text) return undefined;
   if (text.includes('__codex_') || text.includes('codex_thread_id')) return 'codex';

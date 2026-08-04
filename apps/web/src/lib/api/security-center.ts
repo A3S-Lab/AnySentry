@@ -1,6 +1,6 @@
 import { apiClient, apiRawFetch } from "@/lib/api/client";
 
-function querySuffix(params: Record<string, string | number | boolean | undefined>) {
+function querySuffix(params: object) {
   const qs = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
     const text = String(value ?? "").trim();
@@ -13,13 +13,28 @@ export type SecurityTimeType = "last_3h" | "last_1d" | "last_7d" | "last_30d" | 
 export type SecurityRiskLevel = "safe" | "low" | "medium" | "high" | "critical" | "unknown" | string;
 export type SecurityPolicyAction = "allow" | "review" | "block" | string;
 
-export type AgentAttributionSource = "none" | "process_graph" | "cgroup" | "systemd" | "argv" | "env" | "self_register" | "workspace_hint";
-export type AgentAttributionReason = "not_evaluated" | "not_agent" | "process_lineage" | "authoritative_anchor" | "hint_only" | "conflict";
+export type AgentClassification = "confirmed_agent" | "probable_agent" | "unknown" | "non_agent";
+export interface EventJudgmentMetadata {
+  classification: AgentClassification;
+  profile: "full" | "l1_only" | "discard";
+  maxTier: "L1" | "L2" | "L3";
+  reason: "confirmed_agent_full" | "candidate_agent_full" | "candidate_agent_l1_only" | "unknown_l1_only" | "non_agent_discarded";
+  routingVersion: string;
+  policyVersion?: string;
+  l1Verdict?: SecurityVerdict;
+  nextTierEligible?: boolean;
+  stopReason?: string;
+}
+export type AgentReviewDecision = "confirmed_agent" | "unknown" | "non_agent";
+export type AgentAttributionSource = "none" | "process_graph" | "cgroup" | "systemd" | "argv" | "env" | "self_register" | "workspace_hint" | "kubernetes" | "docker" | "behavior" | "process_signature" | "manual_review";
+export type AgentAttributionReason = "not_evaluated" | "not_agent" | "process_lineage" | "authoritative_anchor" | "hint_only" | "conflict" | "human_confirmed" | "human_deferred" | "human_rejected";
 
 export interface ProcessContext {
   hostId?: string;
+  bootId?: string;
   pid?: number;
   ppid?: number;
+  startTimeTicks?: string;
   startTimeNs?: string;
   eventTimeNs?: string;
   comm?: string;
@@ -27,20 +42,43 @@ export interface ProcessContext {
   cwd?: string;
   uid?: number;
   cgroup?: string;
+  cgroupId?: string;
   systemdUnit?: string;
+}
+
+export interface AgentWorkloadRef {
+  environment?: "kubernetes" | "docker" | "host";
+  kind?: "pod" | "container" | "service" | "process" | "cgroup";
+  name?: string;
+  namespace?: string;
+  podName?: string;
+  podUid?: string;
+  nodeName?: string;
+  containerName?: string;
+  containerImage?: string;
+  ownerKind?: string;
+  ownerName?: string;
+  systemdUnit?: string;
+  processName?: string;
+  executable?: string;
 }
 
 export interface AgentAttribution {
   monitored: boolean;
+  classification?: AgentClassification;
   agentScopeId?: string;
   agentDisplayName?: string;
   agentSessionId?: string;
+  agentInstanceId?: string;
+  physicalWorkloadId?: string;
+  workloadRef?: AgentWorkloadRef;
   rootPid?: number;
   confidence: number;
   reason: AgentAttributionReason;
   source: AgentAttributionSource;
   conflict?: boolean;
   degraded?: boolean;
+  evidence?: string[];
 }
 
 export interface SecurityTimeFilter {
@@ -254,6 +292,9 @@ export type AuditAction =
   | "alert.updated"
   | "remediation.updated"
   | "agent.metadata.updated"
+  | "agent.review.updated"
+  | "agent.review.cleared"
+  | "agent.identity_ai_review.completed"
   | "maintenance.window.updated"
   | "notification.channel.updated"
   | "notification.route.updated"
@@ -261,7 +302,7 @@ export type AuditAction =
   | "objective.updated"
   | "source.updated"
   | "source.token_rotated";
-export type AuditResourceType = "policy" | "incident" | "alert" | "remediation" | "agent" | "maintenance" | "notification" | "objective" | "source";
+export type AuditResourceType = "policy" | "incident" | "alert" | "remediation" | "agent" | "event" | "maintenance" | "notification" | "objective" | "source";
 export type AuditResult = "success" | "failure";
 export type CoverageIssueType =
   | "collector_down"
@@ -279,11 +320,16 @@ export type CoverageIssueType =
 
 export interface AgentEventQuery extends SecurityTimeFilter {
   scope?: "agent" | "raw";
+  /** Raw-view visibility only. Defaults to true; Agent scope always excludes Unknown. */
+  includeUnknown?: boolean;
+  /** Query the durable ClickHouse history instead of only the hot dashboard window. */
+  durable?: boolean;
   noise?: "hide" | "include";
   eventId?: string;
   sourceId?: string;
   collectorId?: string;
   agentId?: string;
+  agentAssetId?: string;
   sessionId?: string;
   workspacePath?: string;
   traceId?: string;
@@ -292,6 +338,7 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   eventCategory?: AgentEventCategory;
   verdict?: SecurityVerdict;
   tier?: "Rules" | "Llm" | "Agent";
+  q?: string;
   limit?: number;
 }
 
@@ -306,6 +353,13 @@ export interface AgentEventListItem {
   subject: string;
   workspacePath: string;
   agentId: string;
+  agentAssetId: string;
+  displayName?: string;
+  detectedName?: string;
+  detectedClassification: AgentClassification;
+  effectiveClassification: AgentClassification;
+  runtime: "kubernetes" | "docker" | "host" | "unknown";
+  locationLabel?: string;
   collectorId?: string;
   sourceId?: string;
   sessionId: string;
@@ -332,6 +386,7 @@ export interface AgentEventListItem {
   attributes: Record<string, AgentEventAttributeValue>;
   process?: ProcessContext;
   attribution?: AgentAttribution;
+  judgment?: EventJudgmentMetadata;
   repeatCount?: number;
   lastAt?: string;
   rawPreview?: string;
@@ -750,7 +805,7 @@ export interface UniversalIngestRequest {
   parentSpanId?: string;
   runId?: string;
   taskId?: string;
-  source?: AgentEventSource;
+  source?: string;
   eventCategory?: AgentEventCategory;
   subject?: string;
   tokenCount?: number;
@@ -760,6 +815,8 @@ export interface UniversalIngestRequest {
   collectorId?: string;
   sourceId?: string;
   nodeName?: string;
+  peer?: string;
+  port?: string | number;
   sourceName?: string;
   sourceType?: IngestionSourceType;
   token?: string;
@@ -1096,16 +1153,22 @@ export interface AgentInventoryQuery extends SecurityTimeFilter {
   tag?: string;
   q?: string;
   agentId?: string;
+  agentAssetId?: string;
   workspacePath?: string;
   userId?: string;
+  includeUnclassified?: boolean;
   limit?: number;
 }
 
 export interface AgentInventoryItem {
   agentId: string;
+  agentAssetId: string;
+  agentAssetAliases?: string[];
   workspacePath: string;
   userId: string;
   displayName?: string;
+  detectedName?: string;
+  detectedClassification: AgentClassification;
   owner?: string;
   team?: string;
   environment?: string;
@@ -1113,6 +1176,21 @@ export interface AgentInventoryItem {
   tags: string[];
   note?: string;
   metadataUpdatedAt?: string;
+  classification: AgentClassification;
+  runtime: "kubernetes" | "docker" | "host" | "unknown";
+  locationLabel?: string;
+  instanceCount: number;
+  confidence: number;
+  attributionSource: AgentAttributionSource;
+  attributionEvidence: string[];
+  physicalWorkloadId?: string;
+  agentInstanceId?: string;
+  workloadRef?: AgentWorkloadRef;
+  reviewDecision?: AgentReviewDecision;
+  reviewedBy?: string;
+  reviewedAt?: string;
+  reviewNote?: string;
+  reviewIdentityKeys: string[];
   firstSeen: string;
   lastSeen: string;
   healthState: AgentHealthState;
@@ -1149,6 +1227,8 @@ export interface AgentInventorySummary {
 
 export interface AgentMetadataListItem {
   agentId: string;
+  agentAssetId: string;
+  agentAssetAliases?: string[];
   workspacePath: string;
   displayName?: string;
   owner?: string;
@@ -1157,6 +1237,18 @@ export interface AgentMetadataListItem {
   criticality?: AgentCriticality;
   tags: string[];
   note?: string;
+  identityKeys?: string[];
+  physicalWorkloadId?: string;
+  agentInstanceId?: string;
+  workloadRef?: AgentWorkloadRef;
+  reviewDecision?: AgentReviewDecision;
+  reviewedBy?: string;
+  reviewedAt?: string;
+  reviewNote?: string;
+  reviewIdentityKeys?: string[];
+  reviewPhysicalWorkloadId?: string;
+  reviewAgentInstanceId?: string;
+  reviewWorkloadRef?: AgentWorkloadRef;
   updatedAt: string;
 }
 
@@ -1167,6 +1259,7 @@ export interface AgentMetadataList {
 
 export interface AgentMetadataUpdateRequest {
   workspacePath: string;
+  agentAssetId?: string;
   displayName?: string;
   owner?: string;
   team?: string;
@@ -1174,12 +1267,59 @@ export interface AgentMetadataUpdateRequest {
   criticality?: AgentCriticality | "";
   tags?: string[];
   note?: string;
+  identityKeys?: string[];
+  physicalWorkloadId?: string;
+  agentInstanceId?: string;
+  workloadRef?: AgentWorkloadRef;
+}
+
+export interface AgentReviewRequest {
+  workspacePath: string;
+  decision: AgentReviewDecision | "clear";
+  currentClassification?: AgentClassification;
+  agentAssetId?: string;
+  identityKeys?: string[];
+  physicalWorkloadId?: string;
+  agentInstanceId?: string;
+  workloadRef?: AgentWorkloadRef;
+  note?: string;
 }
 
 export interface AgentInventory {
   items: AgentInventoryItem[];
   total: number;
   summary: AgentInventorySummary;
+  updateTime: string;
+}
+
+export type IdentityAiReviewTargetType = "event" | "agent";
+export type IdentityAiVerdict = "agent" | "not_agent";
+export interface IdentityAiReviewRequest extends SecurityTimeFilter {
+  targetType: IdentityAiReviewTargetType;
+  eventId?: string;
+  agentAssetId?: string;
+}
+export interface IdentityAiReviewRecord {
+  schemaVersion: "anysentry.identity_ai_review.v1";
+  reviewId: string;
+  targetType: IdentityAiReviewTargetType;
+  eventId?: string;
+  agentAssetId: string;
+  status: "running" | "succeeded" | "failed";
+  verdict?: IdentityAiVerdict;
+  confidence?: number;
+  summary?: string;
+  reason?: string;
+  evidenceRefs: string[];
+  evidenceDigest: string;
+  model?: string;
+  provider: "a3s-code-sdk";
+  error?: string;
+  createdAt: string;
+  completedAt?: string;
+}
+export interface IdentityAiReviewList {
+  items: IdentityAiReviewRecord[];
   updateTime: string;
 }
 
@@ -1341,7 +1481,66 @@ export interface CollectorHeartbeatRequest {
   outputDropped?: number;
   errorCount?: number;
   observedAgents?: number;
+  filterMetrics?: CollectorFilterMetrics;
   message?: string;
+}
+
+export interface CollectorFilterMetrics {
+  /** @deprecated Compatibility marker for pre-decoupling forwarders. */
+  scope: "all" | "shadow" | "agent" | "decoupled";
+  filterMode?: "enforce" | "shadow";
+  retainUnknown?: boolean;
+  retainNonAgent?: boolean;
+  noisePolicy?: "balanced" | "include";
+  observed: number;
+  forwarded: number;
+  confirmedAgent: number;
+  probableAgent: number;
+  unknown: number;
+  nonAgent: number;
+  filteredNonAgent: number;
+  wouldFilterNonAgent: number;
+  filteredNoise: number;
+  wouldFilterNoise: number;
+  discoveryBudgetDropped: number;
+  wouldDiscoveryBudgetDrop: number;
+  deduplicated: number;
+  queueDropped: number;
+  batches: number;
+  batchEvents: number;
+  identitySnapshotReady: boolean;
+  identitySnapshotVersion: number;
+  identitySnapshotAgeSeconds: number;
+  identityCacheEntries: number;
+  identityCacheHits: number;
+  identityCacheMisses: number;
+  identityCandidateCacheEntries: number;
+  identityCgroupBindings: number;
+  identityCgroupHits: number;
+  identityCgroupMisses: number;
+  identityErrors: number;
+  dockerEnabled: boolean;
+  dockerReady: boolean;
+  dockerEntries: number;
+  dockerReconnects: number;
+  dockerErrors: number;
+  behaviorWorkloads: number;
+  behaviorCandidates: number;
+  behaviorPromoted: number;
+  behaviorEvicted: number;
+  templateLoaded: number;
+  templateInvalid: number;
+  templateMatches: number;
+  templateAmbiguous: number;
+  processCacheEntries: number;
+  processTombstones: number;
+  processClassifications: number;
+  processCacheHits: number;
+  processCacheMisses: number;
+  processProcReads: number;
+  processBootstrapProcReads: number;
+  processFallbackProcReads: number;
+  processAncestryProcReads: number;
 }
 
 export interface CollectorHeartbeatAck {
@@ -1384,6 +1583,7 @@ export interface CollectorHealthItem {
   droppedEvents: number;
   outputDropped: number;
   errorCount: number;
+  filterMetrics: CollectorFilterMetrics;
   message?: string;
   eventCategoryCounts: Record<AgentEventCategory, number>;
 }
@@ -2161,9 +2361,17 @@ export interface L2Config {
   timeoutS: number;
 }
 
+export interface DeepModelConfig extends L2Config {
+  contextTokens: number;
+}
+
 export interface L3Config {
   bin: string;
   skills: string;
+}
+
+export interface IdentityJudgmentPolicy {
+  candidatePipeline: "full" | "l1_only";
 }
 
 export interface PolicyConfig {
@@ -2171,7 +2379,9 @@ export interface PolicyConfig {
   speculate: "off" | "low" | "medium" | "high";
   rules: L1Rule[];
   llm: L2Config | null;
+  deepModel: DeepModelConfig | null;
   agent: L3Config | null;
+  identity: IdentityJudgmentPolicy;
 }
 
 // A null tier (llm/agent) means "not configured".
@@ -2184,6 +2394,58 @@ export interface PolicyStatus {
 export interface PolicyConfigResponse {
   policy: PolicyConfig;
   status: PolicyStatus;
+  connections: ModelConnectionStatuses;
+}
+
+export type ModelConnectionProfile = "fast_review" | "deep_investigation";
+export type PolicyConnectivityStatus =
+  | "connected"
+  | "unauthorized"
+  | "rate_limited"
+  | "timeout"
+  | "unreachable"
+  | "invalid_response";
+
+export interface PolicyConnectivityResult {
+  schemaVersion: "anysentry.judgment_connectivity_result.v2";
+  profile: ModelConnectionProfile;
+  ok: boolean;
+  status: PolicyConnectivityStatus;
+  checkedAt: string;
+  latencyMs: number;
+  runtime: "api-a3s-code-sdk";
+  endpoint: string;
+  model: string;
+  message: string;
+  testToken?: string;
+  expiresAt?: string;
+}
+
+export interface ModelConnectionStatus {
+  profile: ModelConnectionProfile;
+  state: "active" | "missing_credential";
+  keyConfigured: boolean;
+  source?: "runtime" | "environment";
+  endpoint?: string;
+  model?: string;
+  timeoutS?: number;
+  contextTokens?: number;
+  appliedAt?: string;
+  version?: string;
+}
+
+export interface ModelConnectionStatuses {
+  fast_review: ModelConnectionStatus;
+  deep_investigation: ModelConnectionStatus;
+}
+
+export interface ModelConnectionTestInput {
+  profile: ModelConnectionProfile;
+  url: string;
+  model: string;
+  apiKey: string;
+  timeoutS: number;
+  contextTokens: number;
 }
 
 export interface PlatformHealth {
@@ -2232,6 +2494,15 @@ export const securityCenterApi = {
     apiClient.post<SecurityWorkspaceRiskDistribution>("/security-center/sessions/workspaceRiskDistribution", filter),
   agentEvents: (filter: AgentEventQuery) =>
     apiClient.post<AgentEventList>("/security-center/events/list", filter),
+  runIdentityAiReview: (body: IdentityAiReviewRequest) =>
+    apiClient.post<IdentityAiReviewRecord>("/security-center/identity/ai-review", body),
+  identityAiReviews: (query: { targetType?: IdentityAiReviewTargetType; eventId?: string; agentAssetId?: string }) => {
+    const params = new URLSearchParams();
+    if (query.targetType) params.set("targetType", query.targetType);
+    if (query.eventId) params.set("eventId", query.eventId);
+    if (query.agentAssetId) params.set("agentAssetId", query.agentAssetId);
+    return apiClient.get<IdentityAiReviewList>(`/security-center/identity/ai-reviews?${params.toString()}`);
+  },
   agentTimeline: (filter: AgentEventQuery) =>
     apiClient.post<AgentTimeline>("/security-center/events/timeline", filter),
   streamFindings: (filter: SecurityTimeFilter & { limit?: number }) =>
@@ -2313,6 +2584,8 @@ export const securityCenterApi = {
   agentMetadata: () => apiClient.get<AgentMetadataList>("/security-center/agents/metadata"),
   updateAgentMetadata: (agentId: string, body: AgentMetadataUpdateRequest) =>
     apiClient.put<AgentMetadataListItem>(`/security-center/agents/${encodeURIComponent(agentId)}/metadata`, body),
+  reviewAgent: (agentId: string, body: AgentReviewRequest) =>
+    apiClient.put<AgentMetadataListItem>(`/security-center/agents/${encodeURIComponent(agentId)}/review`, body),
   alerts: (filter: AlertListQuery) =>
     apiClient.post<AlertList>("/security-center/alerts/list", filter),
   updateAlert: (alertId: string, body: AlertUpdateRequest) =>
@@ -2379,6 +2652,12 @@ export const securityCenterApi = {
   // and returns the resulting policy + tier status.
   setConfig: (policy: Partial<PolicyConfig>) =>
     apiClient.put<PolicyConfigResponse>("/security-center/config", policy),
+  testModelConnection: (input: ModelConnectionTestInput) =>
+    apiClient.post<PolicyConnectivityResult>("/security-center/config/model-connections/test", input),
+  applyModelConnection: (profile: ModelConnectionProfile, testToken: string) =>
+    apiClient.put<PolicyConfigResponse>(`/security-center/config/model-connections/${profile}`, { testToken }),
+  clearModelConnection: (profile: ModelConnectionProfile) =>
+    apiClient.post<PolicyConfigResponse>(`/security-center/config/model-connections/${profile}/clear`, {}),
   simulateConfig: (body: PolicySimulationRequest) =>
     apiClient.post<PolicySimulationResult>("/security-center/config/simulate", body),
 };

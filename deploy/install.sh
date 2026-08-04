@@ -49,7 +49,7 @@ AnySentry is starting at:
 
 This image already bundles @a3s-lab/sentry. To attach a local a3s-observer collector:
   A3S_OBSERVER_JSON=1 sudo -E a3s-observer-collector \
-    | FORWARD_SCOPE=agent ANYSENTRY_INGEST_URL=http://localhost:29653/security-center/ingest node scripts/observer-forward.js
+    | FORWARD_FILTER_MODE=enforce FORWARD_RETAIN_UNKNOWN=true FORWARD_RETAIN_NON_AGENT=false FORWARD_NOISE_POLICY=balanced ANYSENTRY_INGEST_URL=http://localhost:29653/security-center/ingest node scripts/observer-forward.js
 
 For a fully integrated node/fleet install with a3s-observer, use:
   ANYSENTRY_INSTALL_MODE=kubernetes deploy/install.sh

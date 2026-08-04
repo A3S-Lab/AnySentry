@@ -364,7 +364,13 @@ export function deterministicSupplyChainDecision(batch: RiskAnalysisBatch): Comp
 
 export function parseCompositeDecision(content: unknown, batch: RiskAnalysisBatch): CompositeModelDecision {
   if (typeof content !== 'string' || !content.trim()) throw new Error('Composite Judge returned an empty response');
-  const parsed = JSON.parse(content.trim()) as Partial<CompositeModelDecision>;
+  const trimmed = content.trim();
+  // Some OpenAI-compatible providers wrap an otherwise valid JSON response in a
+  // single Markdown code fence even when the prompt explicitly requests JSON.
+  // Accept only that narrow wrapper; prose or trailing text must still fail the
+  // strict parser so untrusted model output cannot silently change semantics.
+  const fenced = /^```(?:json)?\s*\n?([\s\S]*?)\n?```$/iu.exec(trimmed);
+  const parsed = JSON.parse((fenced?.[1] ?? trimmed).trim()) as Partial<CompositeModelDecision>;
   if (!['benign', 'simulation', 'authorized_admin', 'suspicious', 'confirmed_attack'].includes(String(parsed.classification))) {
     throw new Error('Composite Judge returned an invalid classification');
   }
@@ -409,7 +415,34 @@ export function parseCompositeDecision(content: unknown, batch: RiskAnalysisBatc
   };
 }
 
+/**
+ * Synthetic Episodes are emitted only by explicit verification feeds. They must exercise the
+ * complete Kafka/Flink/queue/storage path without consuming model capacity or depending on an
+ * external LLM endpoint. Real Episodes never enter this branch.
+ */
+export function deterministicSyntheticDecision(batch: RiskAnalysisBatch): CompositeModelDecision {
+  if (!batch.synthetic) throw new Error('synthetic decision requires a synthetic episode');
+  const evidenceEventIds = [...new Set(
+    batch.evidence
+      .map((item) => item.eventId)
+      .filter((eventId): eventId is string => typeof eventId === 'string' && eventId.length > 0),
+  )];
+  if (evidenceEventIds.length < 2) {
+    throw new Error('synthetic decision has insufficient evidence');
+  }
+  return {
+    classification: 'simulation',
+    verdict: 'allow',
+    severity: 'low',
+    confidence: 1,
+    attackType: 'none',
+    reason: 'Synthetic verification episode; no runtime attack action is taken.',
+    evidenceEventIds,
+  };
+}
+
 async function callCompositeModel(batch: RiskAnalysisBatch): Promise<CompositeModelDecision> {
+  if (batch.synthetic) return deterministicSyntheticDecision(batch);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), compositeTimeoutMs);
   try {
@@ -482,8 +515,13 @@ function compositeFinding(
     reason: decision?.reason,
     evidenceEventIds: decision?.evidenceEventIds ?? [],
     evidence: batch.evidence,
-    model: resolvedStatus === 'suppressed'
+    // A pending finding is queued but has not contacted a model yet. Leaving the
+    // model empty avoids publishing the stream worker's local default as if it
+    // were the Composite Judge's configured runtime model.
+    model: resolvedStatus === 'pending' || resolvedStatus === 'suppressed'
       ? ''
+      : batch.synthetic
+        ? 'synthetic-verifier'
       : batch.decisionPath === 'deterministic_rule'
         ? 'deterministic-rule'
         : compositeModel,

@@ -85,9 +85,10 @@ spec:
     - { name: native, port: 9000, targetPort: 9000 }
 ---
 # ----------------------------------------------------------------------------
-# Optional pod-identity enrichment (set ANYSENTRY_KUBE_ENRICH=on below to use it).
-# A namespaced, read-only pod Role — NOT a cluster-wide ClusterRole. Add more agent namespaces by
-# duplicating the Role/RoleBinding in each namespace and listing them in ANYSENTRY_AGENT_NAMESPACES.
+# Pod-identity enrichment. This is metadata-only, read-only cluster access: it maps every observed
+# CRI/containerd ID to namespace/Pod/container before any Agent classification is attempted.
+# Restrict ANYSENTRY_IDENTITY_NAMESPACES and replace this binding with namespaced Roles when an
+# operator deliberately accepts incomplete cross-namespace identity coverage.
 # ----------------------------------------------------------------------------
 apiVersion: v1
 kind: ServiceAccount
@@ -96,23 +97,21 @@ metadata:
   namespace: anysentry
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
   name: anysentry-pod-reader
-  namespace: anysentry
 rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
   name: anysentry-pod-reader
-  namespace: anysentry
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: Role
+  kind: ClusterRole
   name: anysentry-pod-reader
 subjects:
   - kind: ServiceAccount
@@ -154,9 +153,13 @@ spec:
               valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_USER } }
             - name: CLICKHOUSE_PASSWORD
               valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_PASSWORD } }
-            # Pod-identity enrichment (pod-uid -> agent name via the pod-reader Role above) is
-            # auto-enabled in-cluster. List the agent namespaces to read; set ENRICH=off to disable.
-            - { name: ANYSENTRY_AGENT_NAMESPACES, value: "default" }
+            # Workload registry: a cluster-scoped initial Pod list + watch, exposed as a
+            # node-filtered snapshot. This maps infrastructure and Agent containers alike; labels
+            # below classify Agents but do not control whether workload names can be resolved.
+            - { name: ANYSENTRY_IDENTITY_NAMESPACES, value: "*" }
+            - { name: ANYSENTRY_AGENT_LABEL_SELECTOR, value: "anysentry.io/workload-kind=agent" }
+            # Change this to a stable, unique cluster asset ID when several clusters report here.
+            - { name: ANYSENTRY_CLUSTER_ID, value: "default-cluster" }
             # - { name: ANYSENTRY_KUBE_ENRICH, value: "off" }
             # Optional: drive the dashboard with a synthetic event mix for a demo (sentry still
             # really judges it). Leave unset to show only real ingested events.

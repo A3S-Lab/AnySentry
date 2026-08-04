@@ -66,10 +66,15 @@ services:
       ANYSENTRY_STREAM_EPISODES_TOPIC: ${ANYSENTRY_STREAM_EPISODES_TOPIC:-anysentry.risk-analysis-batches.v1}
       ANYSENTRY_STREAM_FINDINGS_TOPIC: ${ANYSENTRY_STREAM_FINDINGS_TOPIC:-anysentry.stream.findings.v1}
       ANYSENTRY_STREAM_DLQ_TOPIC: ${ANYSENTRY_STREAM_DLQ_TOPIC:-anysentry.stream.dlq.v1}
-      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-proxy-managed}
+      A3S_SENTRY_LLM_URL: ${A3S_SENTRY_LLM_URL:-http://host.docker.internal:18051/v1}
+      A3S_SENTRY_LLM_MODEL: ${A3S_SENTRY_LLM_MODEL:-glm-5.2}
+      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-}
       A3S_SENTRY_L3_URL: ${A3S_SENTRY_L3_URL:-http://host.docker.internal:18051/v1}
       A3S_SENTRY_L3_MODEL: ${A3S_SENTRY_L3_MODEL:-glm-5.2}
-      A3S_SENTRY_L3_KEY: ${A3S_SENTRY_L3_KEY:-proxy-managed}
+      A3S_SENTRY_L3_KEY: ${A3S_SENTRY_L3_KEY:-}
+      ANYSENTRY_IDENTITY_REVIEW_TIMEOUT_MS: ${ANYSENTRY_IDENTITY_REVIEW_TIMEOUT_MS:-120000}
+      ANYSENTRY_IDENTITY_REVIEW_LLM_TIMEOUT_MS: ${ANYSENTRY_IDENTITY_REVIEW_LLM_TIMEOUT_MS:-45000}
+      ANYSENTRY_IDENTITY_REVIEW_PREFLIGHT_TIMEOUT_MS: ${ANYSENTRY_IDENTITY_REVIEW_PREFLIGHT_TIMEOUT_MS:-15000}
       # ANYSENTRY_SYNTHETIC_FEED: "on"
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -89,7 +94,10 @@ services:
       ANYSENTRY_REDIS_URL: redis://redis:6379/0
       ANYSENTRY_FAST_JUDGE_CONCURRENCY: 4
       ANYSENTRY_L2_MODEL: ${ANYSENTRY_L2_MODEL:-deepseek-v4-flash}
-      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-proxy-managed}
+      ANYSENTRY_L2_CONTEXT_TOKENS: ${ANYSENTRY_L2_CONTEXT_TOKENS:-16384}
+      A3S_SENTRY_LLM_URL: ${A3S_SENTRY_LLM_URL:-http://host.docker.internal:18051/v1}
+      A3S_SENTRY_LLM_MODEL: ${A3S_SENTRY_LLM_MODEL:-glm-5.2}
+      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -110,9 +118,12 @@ services:
       ANYSENTRY_L3_ATTEMPTS: 2
       ANYSENTRY_L3_CONTEXT_TOKENS: 32768
       ANYSENTRY_L3_SKILLS: /opt/anysentry/skills
+      A3S_SENTRY_LLM_URL: ${A3S_SENTRY_LLM_URL:-http://host.docker.internal:18051/v1}
+      A3S_SENTRY_LLM_MODEL: ${A3S_SENTRY_LLM_MODEL:-glm-5.2}
+      A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-}
       A3S_SENTRY_L3_URL: ${A3S_SENTRY_L3_URL:-http://host.docker.internal:18051/v1}
       A3S_SENTRY_L3_MODEL: ${A3S_SENTRY_L3_MODEL:-glm-5.2}
-      A3S_SENTRY_L3_KEY: ${A3S_SENTRY_L3_KEY:-proxy-managed}
+      A3S_SENTRY_L3_KEY: ${A3S_SENTRY_L3_KEY:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -171,6 +182,7 @@ services:
 
   flink-checkpoint-init:
     profiles: ["streaming"]
+    build: ./streaming/flink
     image: anysentry-flink-streaming:local
     labels: *anysentry-infrastructure-labels
     user: "0:0"
@@ -201,6 +213,7 @@ services:
 
   flink-taskmanager:
     profiles: ["streaming"]
+    build: ./streaming/flink
     image: anysentry-flink-streaming:local
     labels: *anysentry-infrastructure-labels
     depends_on:
@@ -218,6 +231,7 @@ services:
 
   flink-job-submit:
     profiles: ["streaming"]
+    build: ./streaming/flink
     image: anysentry-flink-streaming:local
     labels: *anysentry-infrastructure-labels
     depends_on:

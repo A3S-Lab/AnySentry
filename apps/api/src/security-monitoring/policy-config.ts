@@ -21,9 +21,11 @@ export interface L1Rule {
   reason: string;
   action?: RuleAction;
 }
-export interface L2Config { url: string; model: string; timeoutS: number } // LLM judge endpoint
+export interface L2Config { url: string; model: string; timeoutS: number } // Provider base URL routed by A3S Code
+export interface DeepModelConfig extends L2Config { contextTokens: number }
 /** `bin` is retained for policy compatibility; the async L3 worker uses the in-process SDK. */
 export interface L3Config { bin: string; skills: string }
+export interface IdentityJudgmentPolicy { candidatePipeline: 'full' | 'l1_only' }
 
 /** The whole judge policy. `null` tiers are "not configured" → the dashboard hides them. */
 export interface PolicyConfig {
@@ -31,8 +33,14 @@ export interface PolicyConfig {
   speculate: 'off' | 'low' | 'medium' | 'high';
   rules: L1Rule[];
   llm: L2Config | null;
+  deepModel: DeepModelConfig | null;
   agent: L3Config | null;
+  identity: IdentityJudgmentPolicy;
 }
+
+/** Legacy Sentry runtime secrets. AnySentry's asynchronous L2/L3 path uses A3S Code and never
+ *  persists credentials in PolicyConfig or ClickHouse. */
+export interface PolicyRuntimeSecrets { llmKey?: string }
 
 export class PolicyConfigError extends Error {
   constructor(message = 'invalid policy') {
@@ -52,13 +60,21 @@ export const DEFAULT_POLICY: PolicyConfig = {
   speculate: 'off',
   rules: [],
   llm: null,
+  deepModel: null,
   agent: null,
+  identity: { candidatePipeline: 'full' },
 };
 
 const KINDS: RuleKind[] = ['ToolExec', 'Egress', 'Dns', 'FileAccess', 'SslContent', 'SecurityAction'];
 const VERDICTS: Verdict[] = ['allow', 'block', 'escalate'];
 const SEVERITIES: Severity[] = ['info', 'low', 'medium', 'high', 'critical'];
 const ACTIONS: RuleAction[] = ['', 'deny-exec', 'deny-egress', 'deny-file'];
+
+/** Accept the full endpoint users commonly paste in the UI, but persist a provider base URL.
+ *  A3S Code then performs provider-specific URL normalization and request routing. */
+export function normalizeLlmBaseUrl(value: string): string {
+  return value.trim().replace(/\/(?:chat\/completions|responses)\/?$/u, '').replace(/\/+$/u, '');
+}
 
 /** Coerce arbitrary input (the PUT body) into a valid PolicyConfig — never trust the wire. */
 export function sanitizePolicy(input: unknown): PolicyConfig {
@@ -86,12 +102,29 @@ export function sanitizePolicy(input: unknown): PolicyConfig {
     : [];
 
   const llmIn = o.llm as Record<string, unknown> | null | undefined;
-  const llm: L2Config | null = llmIn && str(llmIn.url) ? { url: str(llmIn.url, 500), model: str(llmIn.model, 100) || 'default', timeoutS: num(llmIn.timeoutS, 1, 600, 60) } : null;
+  const llmUrl = normalizeLlmBaseUrl(str(llmIn?.url, 500));
+  const llm: L2Config | null = llmIn && llmUrl ? { url: llmUrl, model: str(llmIn.model, 100) || 'default', timeoutS: num(llmIn.timeoutS, 1, 600, 60) } : null;
+
+  const deepModelIn = o.deepModel as Record<string, unknown> | null | undefined;
+  const deepModelUrl = normalizeLlmBaseUrl(str(deepModelIn?.url, 500));
+  const deepModel: DeepModelConfig | null = deepModelIn && deepModelUrl
+    ? {
+        url: deepModelUrl,
+        model: str(deepModelIn.model, 100) || 'default',
+        timeoutS: num(deepModelIn.timeoutS, 1, 600, 90),
+        contextTokens: num(deepModelIn.contextTokens, 4_096, 262_144, 32_768),
+      }
+    : null;
 
   const agentIn = o.agent as Record<string, unknown> | null | undefined;
   const agent: L3Config | null = agentIn && str(agentIn.bin) ? { bin: str(agentIn.bin, 500), skills: str(agentIn.skills, 500) } : null;
 
-  return { failClosed: o.failClosed === true, speculate: pick(o.speculate, ['off', 'low', 'medium', 'high'], 'off'), rules, llm, agent };
+  const identityIn = o.identity as Record<string, unknown> | null | undefined;
+  const identity: IdentityJudgmentPolicy = {
+    candidatePipeline: pick(identityIn?.candidatePipeline, ['full', 'l1_only'], 'full'),
+  };
+
+  return { failClosed: o.failClosed === true, speculate: pick(o.speculate, ['off', 'low', 'medium', 'high'], 'off'), rules, llm, deepModel, agent, identity };
 }
 
 /** HCL double-quoted string. */
@@ -101,10 +134,13 @@ function q(s: string): string {
 
 /** Render the policy as a sentry ACL (HCL). Blocks are multi-line; the rules list uses object
  *  literals. Built-in rules always apply underneath these. */
-export function buildAcl(c: PolicyConfig): string {
+export function buildAcl(c: PolicyConfig, secrets: PolicyRuntimeSecrets = {}): string {
   const out: string[] = [`fail_closed = ${c.failClosed}`];
   if (c.speculate !== 'off') out.push(`speculate = ${q(c.speculate)}`);
-  if (c.llm) out.push(`llm {\n  url = ${q(c.llm.url)}\n  model = ${q(c.llm.model)}\n  timeout_s = ${c.llm.timeoutS | 0}\n}`);
+  if (c.llm) {
+    const key = secrets.llmKey?.trim() ? `\n  key = ${q(secrets.llmKey.trim())}` : '';
+    out.push(`llm {\n  url = ${q(c.llm.url)}\n  model = ${q(c.llm.model)}${key}\n  timeout_s = ${c.llm.timeoutS | 0}\n}`);
+  }
   if (c.agent) out.push(`agent {\n  bin = ${q(c.agent.bin)}\n  skills = ${q(c.agent.skills)}\n}`);
   if (c.rules.length) {
     out.push('rules = [');
@@ -117,12 +153,12 @@ export function buildAcl(c: PolicyConfig): string {
   return out.join('\n') + '\n';
 }
 
-/** Build the API/Fast Judge policy without an in-process L3 agent. */
-export function buildFastAcl(c: PolicyConfig): string {
-  return buildAcl({ ...c, agent: null, speculate: 'off' });
+/** Build Sentry as a pure L1 engine. AnySentry routes L2 and L3 through A3S Code workers. */
+export function buildFastAcl(c: PolicyConfig, secrets: PolicyRuntimeSecrets = {}): string {
+  return buildAcl({ ...c, llm: null, agent: null, speculate: 'off' }, secrets);
 }
 
 /** Which tiers the dashboard should show (`如果没配置就前端不展示`). L1 is always active (built-ins). */
 export function tierStatus(c: PolicyConfig): { l1: boolean; l2: boolean; l3: boolean } {
-  return { l1: true, l2: !!c.llm, l3: !!c.agent };
+  return { l1: true, l2: !!c.llm, l3: !!c.agent && !!c.deepModel };
 }
