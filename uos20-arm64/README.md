@@ -19,17 +19,17 @@
 ## 标准构建
 
 ```bash
-cd /home/chensicheng/.config/superpowers/worktrees/AnySentry/uos20-arm64-0.2.0
+cd /home/chensicheng/.config/superpowers/worktrees/AnySentry/uos20-arm64-0.3.0
 ANYSENTRY_RELEASE_DIR=/home/chensicheng/a3s/security/release \
-./uos20-arm64/build.sh --version 0.2.0-compat3
+./uos20-arm64/build.sh --version 0.3.0-compat1
 ```
 
 输出目录：
 
 ```text
-/home/chensicheng/a3s/security/release/anysentry-security-suite-0.2.0-compat3-uos20-arm64/
-/home/chensicheng/a3s/security/release/anysentry-security-suite-0.2.0-compat3-uos20-arm64.tar.gz
-/home/chensicheng/a3s/security/release/anysentry-security-suite-0.2.0-compat3-uos20-arm64.tar.gz.sha256
+/home/chensicheng/a3s/security/release/anysentry-security-suite-0.3.0-compat1-uos20-arm64/
+/home/chensicheng/a3s/security/release/anysentry-security-suite-0.3.0-compat1-uos20-arm64.tar.gz
+/home/chensicheng/a3s/security/release/anysentry-security-suite-0.3.0-compat1-uos20-arm64.tar.gz.sha256
 ```
 
 仅检查并准备锁定源码：
@@ -41,9 +41,9 @@ ANYSENTRY_RELEASE_DIR=/home/chensicheng/a3s/security/release \
 分组件构建：
 
 ```bash
-./uos20-arm64/build.sh --version 0.2.0-compat3 --component observer
-./uos20-arm64/build.sh --version 0.2.0-compat3 --component app
-./uos20-arm64/build.sh --version 0.2.0-compat3 --component assemble
+./uos20-arm64/build.sh --version 0.3.0-compat1 --component observer
+./uos20-arm64/build.sh --version 0.3.0-compat1 --component app
+./uos20-arm64/build.sh --version 0.3.0-compat1 --component assemble
 ```
 
 `--component` 用于开发定位；正式交付必须执行默认的全量构建。

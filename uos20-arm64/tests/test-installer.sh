@@ -44,7 +44,7 @@ grep -Fq 'outputDropped' "$VERIFY" || fail "verifier does not inspect forwarder 
 grep -Fq 'errorCount' "$VERIFY" || fail "verifier does not inspect forwarder errors"
 grep -Fq 'normalize_environment' "$INSTALLER" || fail "installer does not normalize duplicate environment keys"
 grep -Fq 'validate_collector_id' "$INSTALLER" || fail "installer does not validate the collector ID"
-grep -Fq '0.2.0-compat8' "$INSTALLER" || fail "installer does not define the compat8 diagnostic directory"
+grep -Fq '0.3.0-compat1' "$INSTALLER" || fail "installer does not define the compat1 diagnostic directory"
 grep -Fq '/var/log/anysentry/install' "$INSTALLER" || fail "installer does not persist installation diagnostics"
 grep -Fq '/tmp/anysentry-install-' "$INSTALLER" || fail "installer does not publish the temporary diagnostic link"
 grep -Fq 'capture_diagnostics' "$INSTALLER" || fail "installer does not capture activation and rollback diagnostics"
@@ -98,19 +98,19 @@ mkdir -p "$tmp/runtime-tmp"
 ANYSENTRY_INSTALLER_LIB=1 bash -c '
   source "$1"
   LOG_DIR="$2/runtime-log"
-  INSTALL_LOG_ROOT="$LOG_DIR/install/0.2.0-compat8"
-  TEMP_INSTALL_LOG="$2/runtime-tmp/anysentry-install-0.2.0-compat8"
+  INSTALL_LOG_ROOT="$LOG_DIR/install/0.3.0-compat1"
+  TEMP_INSTALL_LOG="$2/runtime-tmp/anysentry-install-0.3.0-compat1"
   initialize_install_logging
   set_stage installer-contract-test
   echo installer-log-marker
   write_install_summary 0
 ' _ "$tmp/package/install.sh" "$tmp"
 
-[[ -L $tmp/runtime-tmp/anysentry-install-0.2.0-compat8 ]] ||
+[[ -L $tmp/runtime-tmp/anysentry-install-0.3.0-compat1 ]] ||
   fail "temporary diagnostic path is not a symlink"
-grep -Fq installer-log-marker "$tmp/runtime-log/install/0.2.0-compat8/install.log" ||
+grep -Fq installer-log-marker "$tmp/runtime-log/install/0.3.0-compat1/install.log" ||
   fail "installer output was not captured"
-grep -Fq result=success "$tmp/runtime-log/install/0.2.0-compat8/summary.txt" ||
+grep -Fq result=success "$tmp/runtime-log/install/0.3.0-compat1/summary.txt" ||
   fail "installation summary was not persisted"
 
 mkdir -p "$tmp/verify-root/runtime/node/bin"

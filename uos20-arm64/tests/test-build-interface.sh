@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 BUILD=$ROOT/uos20-arm64/build.sh
-OBSERVER_REPO=${OBSERVER_REPO:-/home/chensicheng/.config/superpowers/worktrees/Observer/uos20-arm64-0.2.0}
-SENTRY_REPO=${SENTRY_REPO:-/home/chensicheng/a3s/security/Sentry}
+OBSERVER_REPO=${OBSERVER_REPO:-/home/chensicheng/.config/superpowers/worktrees/Observer/uos20-arm64-0.3.0}
+SENTRY_REPO=${SENTRY_REPO:-/home/chensicheng/.config/superpowers/worktrees/Sentry/uos20-arm64-0.3.0}
 
 fail() { echo "FAIL $*" >&2; exit 1; }
 

@@ -7,7 +7,7 @@ ensure_stage
 app_source=$SOURCE_DIR/anysentry
 cd "$app_source"
 pnpm install --frozen-lockfile
-pnpm build
+PUBLIC_BASE_PATH=/anysentry pnpm build
 rm -rf "$STAGE_DIR/app"
 pnpm --filter @anysentry/api --prod deploy "$STAGE_DIR/app"
 install -d -m 0755 "$STAGE_DIR/app/web"
@@ -15,6 +15,9 @@ cp -a "$app_source/apps/web/dist/." "$STAGE_DIR/app/web/"
 
 sentry_dir=$STAGE_DIR/app/node_modules/@a3s-lab/sentry
 [[ -d "$sentry_dir" ]] || die "deployed Sentry module missing: $sentry_dir"
+sentry_version=$(node -p "require('$sentry_dir/package.json').version")
+[[ "$sentry_version" == "$SENTRY_NPM_VERSION" ]] ||
+  die "Sentry npm version mismatch: $sentry_version (required $SENTRY_NPM_VERSION)"
 rm -f "$sentry_dir"/*.node
 install -m 0644 "$STAGE_DIR/native/a3s-sentry.linux-arm64-gnu.node" "$sentry_dir/a3s-sentry.linux-arm64-gnu.node"
 code_dir=$STAGE_DIR/app/node_modules/@a3s-lab/code

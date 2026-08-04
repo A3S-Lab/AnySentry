@@ -1,0 +1,36 @@
+jobmanager:
+  rpc:
+    address: 127.0.0.1
+  memory:
+    process:
+      size: 1536m
+taskmanager:
+  memory:
+    process:
+      size: 4096m
+  numberOfTaskSlots: 2
+rest:
+  address: 127.0.0.1
+  bind-address: 127.0.0.1
+  port: 8081
+state:
+  checkpoints:
+    dir: file:///var/lib/anysentry/flink/checkpoints
+  savepoints:
+    dir: file:///var/lib/anysentry/flink/savepoints
+execution:
+  checkpointing:
+    interval: 30s
+    min-pause: 10s
+    timeout: 2min
+    max-concurrent-checkpoints: 1
+    externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+parallelism:
+  default: 2
+blob:
+  storage:
+    directory: /var/lib/anysentry/flink/blob
+io:
+  tmp:
+    dirs: /var/lib/anysentry/flink/tmp
+

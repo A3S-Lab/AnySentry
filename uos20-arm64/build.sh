@@ -14,7 +14,7 @@ UOS 20 ARM64 compatibility profile.
 
 Options:
   --component NAME  all, sentry, node, app, clickhouse, redis, observer, l3,
-                    diagnostics, or assemble (default: all)
+                    java, kafka, flink, diagnostics, or assemble (default: all)
   --version VERSION Release version (default: AnySentry package version + uos date)
   --prepare-only    Validate and export the locked integration sources, then stop
   --help            Show this help
@@ -35,7 +35,7 @@ while (($#)); do
 done
 
 case "$component" in
-  all|sentry|node|app|clickhouse|redis|observer|l3|diagnostics|assemble) ;;
+  all|sentry|node|app|clickhouse|redis|observer|l3|java|kafka|flink|diagnostics|assemble) ;;
   *) die "unsupported component: $component" ;;
 esac
 
@@ -78,6 +78,9 @@ case "$component" in
     run_component redis
     run_component observer
     run_component l3
+    run_component java
+    run_component kafka
+    run_component flink
     run_component diagnostics
     run_component assemble
     ;;

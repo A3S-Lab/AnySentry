@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-SCRIPT_VERSION=0.2.0-compat8
+SCRIPT_VERSION=0.3.0-compat1
 INSTALL_ROOT=${ANYSENTRY_SMOKE_INSTALL_ROOT:-/opt/anysentry}
 ENV_FILE=${ANYSENTRY_SMOKE_ENV_FILE:-/etc/anysentry/anysentry.env}
-REPORT_DIR=${ANYSENTRY_SMOKE_REPORT_DIR:-/tmp/anysentry-health-smoke-compat8}
+export JAVA_HOME=$INSTALL_ROOT/java
+export PATH=$JAVA_HOME/bin:$PATH
+REPORT_DIR=${ANYSENTRY_SMOKE_REPORT_DIR:-/tmp/anysentry-health-smoke-0.3.0-compat1}
 REPORT=$REPORT_DIR/report.txt
 MODE=safe
 PASS_COUNT=0
@@ -24,7 +26,7 @@ Modes:
 
 The script never restarts services, changes configuration, reads the Observer
 token, contacts an external network, or performs destructive system operations.
-The report is overwritten at /tmp/anysentry-health-smoke-compat8/report.txt.
+The report is overwritten at /tmp/anysentry-health-smoke-0.3.0-compat1/report.txt.
 EOF
 }
 
@@ -137,9 +139,17 @@ numeric_or() {
 SERVICES=(
   anysentry-clickhouse.service
   anysentry-redis.service
+  anysentry-kafka.service
+  anysentry-kafka-init.service
+  anysentry-flink-jobmanager.service
+  anysentry-flink-taskmanager.service
+  anysentry-flink-job.service
   anysentry.service
   anysentry-fast-judge.service
   anysentry-l3-worker.service
+  anysentry-stream-worker.service
+  anysentry-composite-judge.service
+  anysentry-supply-chain.service
   anysentry-observer.service
 )
 
@@ -180,10 +190,10 @@ fi
 if [[ -r $INSTALL_ROOT/VERSION ]]; then
   cat "$INSTALL_ROOT/VERSION"
   installed_release=$(awk -F= '$1=="RELEASE_VERSION" {print $2; exit}' "$INSTALL_ROOT/VERSION")
-  if [[ $installed_release == 0.2.0-compat8 ]]; then
+  if [[ $installed_release == 0.3.0-compat1 ]]; then
     pass "installed release is $installed_release"
   else
-    warn "script targets compat8; installed release is ${installed_release:-unknown}"
+    warn "script targets 0.3.0-compat1; installed release is ${installed_release:-unknown}"
   fi
 else
   fail "installed VERSION file is missing"
@@ -291,6 +301,27 @@ else
   fail "ClickHouse loopback readiness"
 fi
 
+if "$INSTALL_ROOT/kafka/bin/kafka-topics.sh" --bootstrap-server 127.0.0.1:9092 \
+  --list >"$REPORT_DIR/kafka-topics.txt" 2>/dev/null &&
+  grep -Fxq anysentry.events.canonical.v1 "$REPORT_DIR/kafka-topics.txt"; then
+  pass "Kafka loopback readiness and canonical topic"
+else
+  fail "Kafka loopback readiness or canonical topic"
+fi
+
+flink_overview=$(curl --connect-timeout 2 --max-time 15 -fsS \
+  http://127.0.0.1:8081/overview 2>/dev/null || true)
+flink_jobs=$(curl --connect-timeout 2 --max-time 15 -fsS \
+  http://127.0.0.1:8081/jobs/overview 2>/dev/null || true)
+save_raw flink-overview.json "${flink_overview:-{\"error\":\"unavailable\"}}"
+save_raw flink-jobs.json "${flink_jobs:-{\"error\":\"unavailable\"}}"
+if grep -Fq 'AnySentry Flink Shadow Risk' <<<"$flink_jobs" &&
+  grep -Eq '"state"[[:space:]]*:[[:space:]]*"RUNNING"' <<<"$flink_jobs"; then
+  pass "Flink streaming job is running"
+else
+  fail "Flink streaming job is unavailable or not running"
+fi
+
 health=$(curl --connect-timeout 2 --max-time 15 -fsS \
   "http://127.0.0.1:$API_PORT/security-center/healthz" 2>/dev/null || true)
 save_raw api-health.json "${health:-{\"error\":\"unavailable\"}}"
@@ -304,7 +335,7 @@ else
 fi
 
 if curl --connect-timeout 2 --max-time 15 -fsS \
-  "http://127.0.0.1:$API_PORT/" 2>/dev/null |
+  "http://127.0.0.1:$API_PORT/anysentry/" 2>/dev/null |
   grep -Eqi '<!doctype|<html|AnySentry'; then
   pass "dashboard HTTP endpoint"
 else
@@ -409,7 +440,7 @@ if [[ $MODE != passive ]]; then
   /bin/ls /etc >/dev/null
 
   section "SENTRY AND STORAGE SIMULATION"
-  block_payload="{\"sourceType\":\"custom\",\"sourceName\":\"uos-health-smoke\",\"workspacePath\":\"health://compat8\",\"agentId\":\"$RUN_ID\",\"sessionId\":\"$RUN_ID\",\"events\":[{\"kind\":\"egress\",\"peer\":\"169.254.169.254\",\"port\":80,\"attributes\":{\"marker\":\"$RUN_ID\",\"simulation\":\"safe\"}}]}"
+  block_payload="{\"sourceType\":\"custom\",\"sourceName\":\"uos-health-smoke\",\"workspacePath\":\"health://compat1\",\"agentId\":\"$RUN_ID\",\"sessionId\":\"$RUN_ID\",\"events\":[{\"kind\":\"egress\",\"peer\":\"169.254.169.254\",\"port\":80,\"attributes\":{\"marker\":\"$RUN_ID\",\"simulation\":\"safe\"}}]}"
   block_response=$(post_json ingest/events "$block_payload" 2>/dev/null || true)
   save_raw sentry-block-response.json "${block_response:-{\"error\":\"unavailable\"}}"
   block_accepted=$(printf '%s' "$block_response" |
@@ -441,7 +472,7 @@ if [[ $MODE != passive ]]; then
     fail "mock event was not visible through events/list marker=$RUN_ID"
 
   if [[ $MODE == extended ]]; then
-    extended_payload="{\"sourceType\":\"custom\",\"sourceName\":\"uos-health-smoke\",\"workspacePath\":\"health://compat8\",\"agentId\":\"$RUN_ID-extended\",\"sessionId\":\"$RUN_ID-extended\",\"events\":[{\"kind\":\"file\",\"path\":\"/tmp/$RUN_ID.txt\",\"operation\":\"read\"},{\"kind\":\"exec\",\"command\":\"/bin/true\"},{\"kind\":\"egress\",\"peer\":\"127.0.0.1\",\"port\":29653}]}"
+    extended_payload="{\"sourceType\":\"custom\",\"sourceName\":\"uos-health-smoke\",\"workspacePath\":\"health://compat1\",\"agentId\":\"$RUN_ID-extended\",\"sessionId\":\"$RUN_ID-extended\",\"events\":[{\"kind\":\"file\",\"path\":\"/tmp/$RUN_ID.txt\",\"operation\":\"read\"},{\"kind\":\"exec\",\"command\":\"/bin/true\"},{\"kind\":\"egress\",\"peer\":\"127.0.0.1\",\"port\":29653}]}"
     extended_response=$(post_json ingest/events "$extended_payload" 2>/dev/null || true)
     save_raw sentry-extended-response.json "${extended_response:-{\"error\":\"unavailable\"}}"
     extended_accepted=$(printf '%s' "$extended_response" |

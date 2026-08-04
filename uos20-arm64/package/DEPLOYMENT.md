@@ -18,9 +18,9 @@
 
 ```bash
 cd /opt/shannon/anysentry
-sha256sum --check anysentry-security-suite-0.2.0-compat8-uos20-arm64.tar.gz.sha256
-tar -zxf anysentry-security-suite-0.2.0-compat8-uos20-arm64.tar.gz
-cd anysentry-security-suite-0.2.0-compat8-uos20-arm64
+sha256sum --check anysentry-security-suite-0.3.0-compat1-uos20-arm64.tar.gz.sha256
+tar -zxf anysentry-security-suite-0.3.0-compat1-uos20-arm64.tar.gz
+cd anysentry-security-suite-0.3.0-compat1-uos20-arm64
 sha256sum --check manifest.sha256
 ```
 
@@ -38,7 +38,7 @@ sha256sum --check manifest.sha256
 ./install.sh
 ```
 
-安装程序保留 `/etc/anysentry/anysentry.env`、`/var/lib/anysentry` 和 `/var/log/anysentry`，自动合并新增配置项，按 ClickHouse、Redis、API、判定 Worker、Observer 的顺序启动服务，配置 Observer Source 并执行完整验证。激活失败时自动 rollback 至上一程序和 systemd 单元；失败版本保留为 `/opt/anysentry.failed.<时间>`。
+安装程序保留 `/etc/anysentry/anysentry.env`、`/var/lib/anysentry` 和 `/var/log/anysentry`，自动合并新增配置项，按 ClickHouse、Redis、Kafka、Flink、API、判定 Worker、Observer 的顺序启动服务，配置 Observer Source 并执行完整验证。激活失败时自动 rollback 至上一程序和 systemd 单元；失败版本保留为 `/opt/anysentry.failed.<时间>`。
 
 上述 `/opt`、`/etc`、`/var/lib` 和 `/var/log` 路径由正式安装创建或管理。
 `/opt/anysentry.failed.<时间>` 仅在激活失败并执行回滚时创建；
@@ -47,14 +47,14 @@ sha256sum --check manifest.sha256
 每次执行安装程序都会覆盖写入本 compat 版本的完整诊断目录：
 
 ```text
-/var/log/anysentry/install/0.2.0-compat8
+/var/log/anysentry/install/0.3.0-compat1
 ```
 
-`/tmp/anysentry-install-0.2.0-compat8` 指向同一目录。安装失败时，安装器先保存新版本服务状态、
+`/tmp/anysentry-install-0.3.0-compat1` 指向同一目录。安装失败时，安装器先保存新版本服务状态、
 健康响应和 journal，再执行 rollback，并将失败阶段和回滚结果写入 `summary.txt`。
 
 正式安装还会写入 `/etc/sysctl.d/90-anysentry.conf`，持久设置
-`vm.overcommit_memory=1`。各 systemd 服务使用发布包内规定的 Node 堆和 MemoryHigh/MemoryMax；
+`vm.overcommit_memory=1`、`vm.max_map_count=262144` 和 `fs.file-max=1048576`。各 systemd 服务使用发布包内规定的 Java/Node 堆和 MemoryHigh/MemoryMax；
 后续升级会重新应用这些资源配置。
 
 安装成功后执行：
@@ -70,12 +70,13 @@ cat /opt/anysentry/PROVENANCE
 管理页面默认地址：
 
 ```text
-http://<目标服务器可达IP>:29653/
+http://<服务器可达IP>:29653/anysentry/
 ```
 
 无法直接访问服务器网段时，可使用同网段浏览器。具备跳转连接时，可建立本地端口转发：
 本地 `29653` 转发至服务器 `127.0.0.1:29653`，然后访问
-`http://127.0.0.1:29653/`。ClickHouse `8123` 仅允许本机访问，不得对外发布。
+`http://127.0.0.1:29653/anysentry/`。ClickHouse `8123`、Kafka `9092` 和 Flink `8081`
+仅允许本机访问，不得对外发布。
 
 ## 5. L2 和 L3 配置
 
@@ -125,18 +126,31 @@ curl -fsS http://127.0.0.1:29653/security-center/healthz
 ```bash
 systemctl status anysentry-clickhouse.service --no-pager -l
 systemctl status anysentry-redis.service --no-pager -l
+systemctl status anysentry-kafka.service --no-pager -l
+systemctl status anysentry-flink-jobmanager.service --no-pager -l
+systemctl status anysentry-flink-taskmanager.service --no-pager -l
+systemctl status anysentry-flink-job.service --no-pager -l
 systemctl status anysentry.service --no-pager -l
 systemctl status anysentry-fast-judge.service --no-pager -l
 systemctl status anysentry-l3-worker.service --no-pager -l
+systemctl status anysentry-stream-worker.service --no-pager -l
+systemctl status anysentry-composite-judge.service --no-pager -l
+systemctl status anysentry-supply-chain.service --no-pager -l
 systemctl status anysentry-observer.service --no-pager -l
 curl -fsS http://127.0.0.1:8123/ping
 /opt/anysentry/redis/bin/redis-cli -h 127.0.0.1 -p 6379 ping
+JAVA_HOME=/opt/anysentry/java /opt/anysentry/kafka/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:9092 --list
+curl -fsS http://127.0.0.1:8081/overview
+curl -fsS http://127.0.0.1:8081/jobs/overview
 curl -fsS http://127.0.0.1:29653/security-center/healthz
 journalctl -b -u anysentry-clickhouse.service -n 200 --no-pager
 journalctl -b -u anysentry-redis.service -n 200 --no-pager
+journalctl -b -u anysentry-kafka.service -n 200 --no-pager
+journalctl -b -u anysentry-flink-jobmanager.service -u anysentry-flink-taskmanager.service -u anysentry-flink-job.service -n 300 --no-pager
 journalctl -b -u anysentry.service -n 200 --no-pager
 journalctl -b -u anysentry-fast-judge.service -n 200 --no-pager
 journalctl -b -u anysentry-l3-worker.service -n 200 --no-pager
+journalctl -b -u anysentry-stream-worker.service -u anysentry-composite-judge.service -u anysentry-supply-chain.service -n 300 --no-pager
 journalctl -b -u anysentry-observer.service -n 300 --no-pager -o cat
 /opt/anysentry/inspect-host.sh
 /opt/anysentry/diagnostics/RUN_DIAGNOSTICS.sh

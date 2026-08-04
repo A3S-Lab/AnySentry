@@ -10,6 +10,7 @@ for script in \
   build.sh \
   scripts/build-sentry.sh scripts/build-node.sh scripts/build-app.sh scripts/build-redis.sh \
   scripts/build-clickhouse.sh scripts/build-observer.sh scripts/build-l3.sh \
+  scripts/build-java.sh scripts/build-kafka.sh scripts/build-flink.sh \
   scripts/build-diagnostics.sh scripts/assemble-release.sh scripts/check-elf.sh \
   scripts/verify-release.sh; do
   [[ -x "$CHANNEL/$script" ]] || fail "missing executable $script"
@@ -21,7 +22,12 @@ for file in \
   package/provision-observer.mjs package/wait-clickhouse.sh package/uninstall.sh \
   package/config/anysentry.env.example package/config/clickhouse-config.xml \
   package/config/clickhouse-users.xml package/config/redis.conf \
+  package/config/kafka-server.properties package/config/flink-config.yaml \
   package/systemd/anysentry.service package/systemd/anysentry-redis.service \
+  package/systemd/anysentry-kafka.service package/systemd/anysentry-kafka-init.service \
+  package/systemd/anysentry-flink-jobmanager.service package/systemd/anysentry-flink-taskmanager.service \
+  package/systemd/anysentry-flink-job.service package/systemd/anysentry-stream-worker.service \
+  package/systemd/anysentry-composite-judge.service package/systemd/anysentry-supply-chain.service \
   package/systemd/anysentry-fast-judge.service package/systemd/anysentry-l3-worker.service \
   package/systemd/anysentry-clickhouse.service package/systemd/anysentry-observer.service; do
   [[ -f "$CHANNEL/$file" ]] || fail "missing package contract file $file"
@@ -43,6 +49,11 @@ grep -Fq 'manifest.sha256' "$CHANNEL/scripts/assemble-release.sh" || fail "relea
 grep -Fq 'PROVENANCE' "$CHANNEL/scripts/assemble-release.sh" || fail "release provenance is not generated"
 grep -Fq 'observer-agent-attribution.js' "$CHANNEL/scripts/build-observer.sh" || fail "observer builder omits agent attribution runtime"
 grep -Fq 'observer-event-dedup.js' "$CHANNEL/scripts/build-observer.sh" || fail "observer builder omits event dedup runtime"
+grep -Fq 'observer-priority-queue.js' "$CHANNEL/scripts/build-observer.sh" || fail "observer builder omits priority queue runtime"
+grep -Fq 'PUBLIC_BASE_PATH=/anysentry' "$CHANNEL/scripts/build-app.sh" || fail "app builder omits /anysentry base path"
+grep -Fq 'KAFKA_VERSION=4.1.1' "$CHANNEL/versions.env" || fail "Kafka version is not locked"
+grep -Fq 'FLINK_VERSION=2.2.1' "$CHANNEL/versions.env" || fail "Flink version is not locked"
+grep -Fq 'SENTRY_NPM_VERSION=0.3.0' "$CHANNEL/versions.env" || fail "Sentry npm version is not locked"
 grep -Fq 'observer/observer-agent-attribution.js' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not require agent attribution runtime"
 grep -Fq 'observer/observer-event-dedup.js' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not require event dedup runtime"
 grep -Fq 'AnySentry部署手册.md' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the deployment guide"

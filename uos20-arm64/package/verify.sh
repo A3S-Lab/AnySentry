@@ -4,6 +4,8 @@ set -euo pipefail
 INSTALL_ROOT=${ANYSENTRY_INSTALL_ROOT:-/opt/anysentry}
 ENV_FILE=${ANYSENTRY_ENV_FILE:-/etc/anysentry/anysentry.env}
 PREFLIGHT=0
+export JAVA_HOME=$INSTALL_ROOT/java
+export PATH=$JAVA_HOME/bin:$PATH
 
 fail() { echo "FAIL $*" >&2; exit 1; }
 pass() { echo "PASS $*"; }
@@ -125,18 +127,51 @@ package_checks
 for service in \
   anysentry-clickhouse.service \
   anysentry-redis.service \
+  anysentry-kafka.service \
+  anysentry-kafka-init.service \
+  anysentry-flink-jobmanager.service \
+  anysentry-flink-taskmanager.service \
+  anysentry-flink-job.service \
   anysentry.service \
   anysentry-fast-judge.service \
   anysentry-l3-worker.service \
+  anysentry-stream-worker.service \
+  anysentry-composite-judge.service \
+  anysentry-supply-chain.service \
   anysentry-observer.service
 do
   systemctl is-active --quiet "$service" || fail "$service is not active"
 done
-pass "ClickHouse, Redis, API, judgment workers, and Observer systemd services are active"
+pass "ClickHouse, Redis, Kafka, Flink, API, workers, and Observer systemd services are active"
 
 "$INSTALL_ROOT/redis/bin/redis-cli" -h 127.0.0.1 -p 6379 ping 2>/dev/null |
   grep -qx PONG || fail "Redis loopback readiness"
 pass "Redis loopback readiness"
+
+"$INSTALL_ROOT/kafka/bin/kafka-topics.sh" --bootstrap-server 127.0.0.1:9092 --list \
+  >/tmp/anysentry-kafka-topics.$$ 2>/dev/null || fail "Kafka loopback readiness"
+for topic in \
+  anysentry.events.canonical.v1 \
+  anysentry.judgments.v1 \
+  anysentry.risk-analysis-batches.v1 \
+  anysentry.stream.findings.v1 \
+  anysentry.stream.dlq.v1
+do
+  grep -Fxq "$topic" /tmp/anysentry-kafka-topics.$$ || fail "Kafka topic is missing: $topic"
+done
+rm -f /tmp/anysentry-kafka-topics.$$
+pass "Kafka loopback readiness and required topics"
+
+flink_overview=$(curl --connect-timeout 2 --max-time 15 -fsS http://127.0.0.1:8081/overview) ||
+  fail "Flink REST readiness"
+[[ $(printf '%s' "$flink_overview" | json_value taskmanagers) =~ ^[1-9][0-9]*$ ]] ||
+  fail "Flink has no active TaskManager"
+flink_jobs=$(curl --connect-timeout 2 --max-time 15 -fsS http://127.0.0.1:8081/jobs/overview) ||
+  fail "Flink jobs endpoint readiness"
+grep -Fq 'AnySentry Flink Shadow Risk' <<<"$flink_jobs" || fail "AnySentry Flink streaming job is missing"
+grep -Eq '"state"[[:space:]]*:[[:space:]]*"RUNNING"' <<<"$flink_jobs" ||
+  fail "AnySentry Flink streaming job is not RUNNING"
+pass "Flink JobManager, TaskManager, and streaming job readiness"
 
 CLICKHOUSE_USER=$(env_value CLICKHOUSE_USER); [[ -n $CLICKHOUSE_USER ]] || CLICKHOUSE_USER=anysentry
 CLICKHOUSE_PASSWORD=$(env_value CLICKHOUSE_PASSWORD)

@@ -14,10 +14,11 @@ fake_bin=$tmp/bin
 install_root=$tmp/opt/anysentry
 env_file=$tmp/etc/anysentry.env
 report_dir=$tmp/report
-mkdir -p "$fake_bin" "$install_root/runtime/node/bin" "$install_root/redis/bin" "$(dirname "$env_file")"
+mkdir -p "$fake_bin" "$install_root/runtime/node/bin" "$install_root/redis/bin" \
+  "$install_root/java/bin" "$install_root/kafka/bin" "$(dirname "$env_file")"
 ln -s "$(command -v node)" "$install_root/runtime/node/bin/node"
 cat > "$install_root/VERSION" <<'EOF'
-RELEASE_VERSION=0.2.0-compat8
+RELEASE_VERSION=0.3.0-compat1
 BPF_KERNEL_VERSION=4.19.90
 EOF
 cat > "$env_file" <<'EOF'
@@ -102,6 +103,8 @@ case "$all" in
   *security-center/events/list*)
     printf '%s\n' '{"code":200,"data":{"items":[{"eventId":"evt_test","agentId":"a3s-health-smoke-test","verdict":"block"}],"total":1}}'
     ;;
+  *:8081/overview*) printf '%s\n' '{"taskmanagers":1,"slots-total":2,"slots-available":1}' ;;
+  *:8081/jobs/overview*) printf '%s\n' '{"jobs":[{"name":"AnySentry Flink Shadow Risk","state":"RUNNING"}]}' ;;
   *127.0.0.1:29653/*) printf '%s\n' '<!doctype html><title>AnySentry</title>' ;;
   *) echo "unexpected curl call: $all" >&2; exit 22 ;;
 esac
@@ -111,9 +114,18 @@ cat > "$install_root/redis/bin/redis-cli" <<'EOF'
 #!/usr/bin/env bash
 echo PONG
 EOF
+cat > "$install_root/kafka/bin/kafka-topics.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' anysentry.events.canonical.v1 anysentry.judgments.v1 anysentry.risk-analysis-batches.v1 anysentry.stream.findings.v1 anysentry.stream.dlq.v1
+EOF
+cat > "$install_root/java/bin/java" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
 chmod +x "$fake_bin/systemctl" "$fake_bin/journalctl" "$fake_bin/uname" \
   "$fake_bin/getconf" "$fake_bin/sysctl" "$fake_bin/curl" \
-  "$install_root/redis/bin/redis-cli"
+  "$install_root/redis/bin/redis-cli" "$install_root/kafka/bin/kafka-topics.sh" \
+  "$install_root/java/bin/java"
 
 run_smoke() {
   PATH="$fake_bin:$PATH" \

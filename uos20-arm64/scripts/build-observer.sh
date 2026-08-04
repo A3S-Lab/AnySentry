@@ -27,9 +27,20 @@ built=$CARGO_TARGET_DIR/$RUST_TARGET/release/a3s-observer-collector
 rm -rf "$STAGE_DIR/observer"
 install -d -m 0755 "$STAGE_DIR/observer/bin"
 install -m 0755 "$built" "$STAGE_DIR/observer/bin/a3s-observer-collector"
-install -m 0644 "$SOURCE_DIR/anysentry/scripts/observer-forward.js" "$STAGE_DIR/observer/observer-forward.js"
-install -m 0644 "$SOURCE_DIR/anysentry/scripts/observer-agent-attribution.js" "$STAGE_DIR/observer/observer-agent-attribution.js"
-install -m 0644 "$SOURCE_DIR/anysentry/scripts/observer-event-dedup.js" "$STAGE_DIR/observer/observer-event-dedup.js"
+for module in \
+  observer-forward.js \
+  observer-agent-attribution.js \
+  observer-agent-templates.js \
+  observer-behavior-discovery.js \
+  observer-docker-discovery.js \
+  observer-event-dedup.js \
+  observer-infrastructure-roots.js \
+  observer-priority-queue.js \
+  observer-workload-filter.js
+do
+  [[ -f "$SOURCE_DIR/anysentry/scripts/$module" ]] || die "Observer forwarder module missing: $module"
+  install -m 0644 "$SOURCE_DIR/anysentry/scripts/$module" "$STAGE_DIR/observer/$module"
+done
 install -m 0644 "$bpf" "$STAGE_DIR/observer/probes-legacy.o"
 printf '%s\n' 'perf-kprobe-legacy' > "$STAGE_DIR/observer/BACKEND"
 printf '%s\n' "$UOS_BPF_KERNEL_VERSION" > "$STAGE_DIR/observer/KERNEL_VERSION"

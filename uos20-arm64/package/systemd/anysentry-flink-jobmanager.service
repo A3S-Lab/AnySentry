@@ -1,0 +1,32 @@
+[Unit]
+Description=AnySentry Flink JobManager
+Requires=anysentry-kafka-init.service
+After=network.target anysentry-kafka-init.service
+
+[Service]
+Type=simple
+User=anysentry
+Group=anysentry
+WorkingDirectory=/opt/anysentry/flink
+EnvironmentFile=/etc/anysentry/anysentry.env
+ExecStart=/opt/anysentry/run-flink.sh jobmanager
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=120s
+TimeoutStopSec=60s
+LimitNOFILE=65536
+MemoryHigh=2G
+MemoryMax=3G
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/anysentry
+
+[Install]
+WantedBy=multi-user.target
+

@@ -676,6 +676,7 @@ function attributor(procEntries = []) {
       ...process.env,
       ANYSENTRY_INGEST_URL: `http://127.0.0.1:${address.port}/security-center/ingest`,
       ANYSENTRY_HEARTBEAT_SECS: '30',
+      ANYSENTRY_IDENTITY_SNAPSHOT_SECS: '0',
       A3S_OBSERVER_COLLECTOR_ID: 'observer-test',
       FORWARD_SCOPE: 'all',
     },
