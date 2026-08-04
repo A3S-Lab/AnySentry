@@ -53,16 +53,15 @@ Override `ANYSENTRY_OBSERVER_IMAGE` or `ANYSENTRY_DOCKER_INGEST_URL` when the
 image/endpoint differs. The default forwarder image is
 `127.0.0.1:5000/anysentry-observer:agent-runtime-lab`; the build command above
 combines the local Observer binary with the repository's current workload
-discovery and filtering scripts. `FORWARD_SCOPE=agent` keeps known non-Agent
-host and container activity out of the AnySentry ingest stream. Plaintext SSL
-capture and the high-volume file-write probe are disabled in this lightweight
-profile; process execution, network, DNS, security, and other core signals
-remain available. The lab image also includes a loopback-only compatibility
-adapter: the current forwarder sends a bounded batch to the adapter, which
-submits its events one by one to older AnySentry deployments that only expose
-`/security-center/ingest`. The adapter promotes the current attribution scope
-to the legacy top-level `agentId` and only submits the two explicit Docker IDs
-listed in `ANYSENTRY_LEGACY_AGENT_IDS`.
+discovery and filtering scripts. Compose also bind-mounts those scripts from
+the current checkout so forwarder-only changes can be tested without rebuilding
+the image. The lab uses AnySentry's native
+`/security-center/ingest/batch` and `/security-center/identity/snapshot`
+endpoints. `FORWARD_FILTER_MODE=enforce` with unknown and known non-Agent
+retention disabled keeps this dedicated test collector scoped to the two
+explicitly labeled Agent containers. Plaintext SSL capture and the high-volume
+file-write probe are disabled in this lightweight profile; process execution,
+network, DNS, security, and other core signals remain available.
 
 By default Pi uses RPC standby because no API key is supplied. To run real Pi
 LLM/tool turns:
