@@ -4,14 +4,6 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 ensure_stage
 
 require_command docker
-CACHE=$BUILD_DIR/cache
-archive=$CACHE/flink-${FLINK_VERSION}-bin-scala_${FLINK_SCALA_VERSION}.tgz
-mkdir -p "$CACHE"
-if [[ ! -f $archive ]]; then
-  curl --fail --location --retry 3 -o "$archive" \
-    "https://archive.apache.org/dist/flink/flink-${FLINK_VERSION}/flink-${FLINK_VERSION}-bin-scala_${FLINK_SCALA_VERSION}.tgz"
-fi
-echo "$FLINK_SHA512  $archive" | sha512sum --check
 
 flink_source=$SOURCE_DIR/anysentry/streaming/flink
 m2=$BUILD_DIR/maven-cache
@@ -24,10 +16,17 @@ job_jar=$flink_source/target/anysentry-flink-streaming.jar
 [[ -f $job_jar ]] || die "Flink job build output is missing: $job_jar"
 
 tmp=$(mktemp -d "$BUILD_DIR/flink.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT
-tar -xzf "$archive" -C "$tmp"
-root=$tmp/flink-$FLINK_VERSION
+container=anysentry-flink-extract-$$
+trap 'docker rm -f "$container" >/dev/null 2>&1 || true; rm -rf "$tmp"' EXIT
+docker image inspect "$FLINK_IMAGE" >/dev/null 2>&1 ||
+  docker pull --platform linux/arm64 "$FLINK_IMAGE"
+docker create --platform linux/arm64 --name "$container" --entrypoint /bin/true \
+  "$FLINK_IMAGE" >/dev/null
+docker cp "$container:/opt/flink/." "$tmp/"
+docker rm "$container" >/dev/null
+root=$tmp
 [[ -x $root/bin/jobmanager.sh && -x $root/bin/taskmanager.sh ]] || die 'Flink archive is incomplete'
+[[ -f $root/lib/flink-dist-${FLINK_VERSION}.jar ]] || die 'Flink image version is incorrect'
 rm -rf "$STAGE_DIR/flink"
 install -d -m 0755 "$STAGE_DIR/flink/usrlib"
 cp -a "$root/bin" "$root/conf" "$root/lib" "$root/licenses" "$STAGE_DIR/flink/"
@@ -35,3 +34,4 @@ install -m 0644 "$job_jar" "$STAGE_DIR/flink/usrlib/anysentry-flink-streaming.ja
 printf '%s\n' "$FLINK_VERSION" >"$STAGE_DIR/flink/VERSION"
 printf '%s\n' "$FLINK_KAFKA_CONNECTOR_VERSION" >"$STAGE_DIR/flink/KAFKA_CONNECTOR_VERSION"
 printf '%s\n' "$MAVEN_BUILDER_IMAGE" >"$STAGE_DIR/flink/MAVEN_BUILDER_IMAGE"
+printf '%s\n' "$FLINK_IMAGE" >"$STAGE_DIR/flink/IMAGE"
