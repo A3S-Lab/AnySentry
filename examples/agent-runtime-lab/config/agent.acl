@@ -1,0 +1,16 @@
+# The SDK requires a resolvable default model when it creates a Session even if
+# the caller only uses trusted direct-tool helpers. This inert provider is never
+# contacted by app/a3s-loop.mjs; it only satisfies session construction.
+default_model = "openai/anysentry-noop"
+
+providers "openai" {
+  api_key  = "anysentry-test-only"
+  base_url = "http://127.0.0.1:9/v1"
+
+  models "anysentry-noop" {
+    name      = "AnySentry no-op model"
+    tool_call = true
+  }
+}
+
+storage_backend = "memory"

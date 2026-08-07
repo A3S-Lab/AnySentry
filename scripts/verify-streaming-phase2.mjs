@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import {
   compositePrompt,
+  deterministicSyntheticDecision,
   deterministicSupplyChainDecision,
   deterministicSupplyChainTemporalDecision,
   deterministicTemporalDecision,
@@ -118,6 +119,21 @@ ${JSON.stringify({
   'suspicious',
 );
 
+const fencedDecision = parseCompositeDecision(`\`\`\`json
+${JSON.stringify({
+  classification: 'suspicious',
+  verdict: 'allow',
+  severity: 'high',
+  confidence: 0.72,
+  attackType: 'possible credential exposure',
+  reason: 'The sequence has suspicious indicators but does not prove an attack.',
+  evidenceEventIds: ['evt_read', 'evt_egress'],
+})}
+\`\`\``, batch);
+assert.equal(fencedDecision.classification, 'suspicious');
+assert.equal(fencedDecision.verdict, 'allow');
+assert.deepEqual(fencedDecision.evidenceEventIds, ['evt_read', 'evt_egress']);
+
 const syntheticDecision = parseCompositeDecision(JSON.stringify({
   classification: 'confirmed_attack',
   verdict: 'block',
@@ -131,6 +147,16 @@ assert.equal(syntheticDecision.classification, 'simulation');
 assert.equal(syntheticDecision.verdict, 'allow');
 assert.equal(syntheticDecision.severity, 'low');
 assert.equal(syntheticDecision.attackType, 'none');
+
+const offlineSyntheticDecision = deterministicSyntheticDecision({ ...batch, synthetic: true });
+assert.equal(offlineSyntheticDecision.classification, 'simulation');
+assert.equal(offlineSyntheticDecision.verdict, 'allow');
+assert.equal(offlineSyntheticDecision.confidence, 1);
+assert.deepEqual(offlineSyntheticDecision.evidenceEventIds, ['evt_read', 'evt_egress']);
+assert.throws(
+  () => deterministicSyntheticDecision(batch),
+  /requires a synthetic episode/,
+);
 
 assert.throws(
   () => parseCompositeDecision('{"verdict":"allow"} trailing text', batch),

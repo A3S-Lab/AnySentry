@@ -273,7 +273,7 @@ function WorkspaceDetail({ item, timeType }: { item?: WorkspaceInventoryItem; ti
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {item.criticality ? <Pill className={criticalityClass(item.criticality)}>重要性 {CRITICALITY_LABEL[item.criticality]}</Pill> : null}
+          {item.criticality ? <Pill className={criticalityClass(item.criticality)}>{`重要性 ${CRITICALITY_LABEL[item.criticality]}`}</Pill> : null}
           {item.environment ? <Pill className="border-sky-400/30 bg-sky-500/10 text-sky-100">{item.environment}</Pill> : null}
           {item.tags.map((tag) => <Pill key={tag} className="border-white/10 bg-white/5 text-zinc-200">{tag}</Pill>)}
         </div>

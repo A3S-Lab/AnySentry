@@ -86,7 +86,9 @@ function forwarderEnv(source, fixture) {
     A3S_NODE_NAME: fixture.nodeName,
     FORWARD_DROP_PATHS: '/sys/,/proc/,/run/,/dev/',
     FORWARD_MAX_INFLIGHT: '4',
-    FORWARD_SCOPE: 'all',
+    // Exercise the production observation-filter path here. The recovery-mode `all` semantics
+    // (including routine-noise pass-through) are covered by verify-filter-pipeline.mjs.
+    FORWARD_SCOPE: 'agent',
     ANYSENTRY_INFRA_ROOT_PIDS: '2299:fixture-infrastructure',
   };
 }
@@ -178,7 +180,12 @@ async function verifyForwarder(entry, source, fixture) {
   const output = await runForwarderProcess(entry, source, fixture);
   const unexpectedStderr = output.stderr
     .split('\n')
-    .filter((line) => line.trim() && !line.startsWith('[observer-forward] process snapshot:'))
+    .filter((line) =>
+      line.trim() &&
+      !line.startsWith('[observer-forward] process snapshot:') &&
+      !line.startsWith('[observer-forward] agent templates:') &&
+      !line.startsWith('[observer-forward] docker discovery:'),
+    )
     .join('\n');
   assert(`${fixture.label} forwarder exits cleanly`, unexpectedStderr === '', unexpectedStderr);
 

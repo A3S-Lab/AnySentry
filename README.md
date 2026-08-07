@@ -128,11 +128,26 @@ Judgment can run in two deployment modes:
 
 L1 rules are enabled by default. L2 and L3 remain inactive until their policy and model backends are explicitly configured; L3 follows an unresolved L2 escalation rather than severity alone.
 
+The policy page provides independent **快速研判模型** and **深度研判模型** connections. A key is
+accepted only for a bounded A3S Code connection test and, after explicit apply, remains in process
+memory; it is never saved in PolicyConfig, ClickHouse, Redis data structures, logs, responses or
+browser storage. Applied credentials are delivered to workers through non-persistent Redis Pub/Sub
+and take effect without restart. L2 and AI identity review share the fast connection, while L3 uses
+only the deep connection. Deployment-injected `A3S_SENTRY_LLM_*` (fast) and `A3S_SENTRY_L3_*`
+(deep) variables remain supported as independent restart-surviving compatibility sources.
+
 Judged events use an in-memory hot ring for current reads and ClickHouse for durable analytics. Without `CLICKHOUSE_URL`, AnySentry continues in memory but does not preserve state across restarts.
 
 ## Progressive API for AI agents
 
 AnySentry gives coding agents and operators one discoverable endpoint instead of a second hard-coded API surface:
+
+### Source-compatible progressive capability API
+
+Requests use the stable `action + module + operation + params` shape; executable calls select a
+`module + operation + params` tuple after discovery. This keeps `assessRuntimeAction`,
+`recordSecurityEvents`, `buildEvidenceBundle`, and `planNextActions` source-compatible across
+agent clients. Verify the published contract with `pnpm verify:progressive-api`.
 
 ```text
 list → search / describe → dry-run → execute
@@ -207,6 +222,27 @@ Use these endpoints when telemetry already comes from a webhook, CI system, gate
 
 Create managed Sources and use Source ingest tokens before accepting untrusted producers.
 
+### Discover and filter Agent workloads
+
+The observer forwarder can attribute high-volume kernel events to Agent workloads before they enter
+the judged event stream. Retention is configured independently with
+`FORWARD_RETAIN_UNKNOWN=true`, `FORWARD_RETAIN_NON_AGENT=false`, and
+`FORWARD_NOISE_POLICY=balanced`; use `FORWARD_FILTER_MODE=shadow` to compare decisions without
+dropping events. The filter resolves explicit
+operator templates and Docker/Kubernetes workload metadata first, then uses bounded deterministic
+behavior evidence for previously unknown workloads.
+
+Identity states remain explicit: `confirmed_agent`, `probable_agent`, `unknown`, and `non_agent`.
+Only positively identified `non_agent` events are filtered; unknown workloads fail open so missing
+runtime metadata and short-lived processes do not create silent evidence gaps. Behavior discovery
+can produce candidates for human review, but it cannot create a confirmed identity by itself.
+
+Start from [`deploy/agent-templates.example.json`](deploy/agent-templates.example.json) for optional
+operator-owned deployment hints. See
+[`docs/agent-discovery-filter.md`](docs/agent-discovery-filter.md) for workload identity precedence,
+event budgets, cache and queue behavior, configuration, and the observation-only enforcement
+boundary.
+
 ## Security and operating boundaries
 
 AnySentry makes its enforcement and coverage boundary explicit:
@@ -244,6 +280,17 @@ pnpm --filter @anysentry/api exec tsc --noEmit
 pnpm --filter @anysentry/web exec tsc --noEmit
 ```
 
+For source-level development across this checkout and the adjacent Sentry checkout, stage the
+native SDK and apply the local Compose overlay:
+
+```bash
+./scripts/prepare-local-sentry-sdk.sh ../Sentry
+docker compose -f docker-compose.yml -f docker-compose.local-source.yml --profile streaming up -d --build
+```
+
+The overlay mounts the staged SDK into the API and every judgment/stream worker, so the staged L1
+API is exercised without publishing a package. `.local/` is generated and is never committed.
+
 Choose the verifier that matches the surface you changed:
 
 | Scope | Command |
@@ -252,6 +299,7 @@ Choose the verifier that matches the surface you changed:
 | Progressive API | `pnpm verify:progressive-api:local` |
 | Dashboard and deep links | `pnpm verify:dashboard-runtime:base-path:local` |
 | Ingest protocols | `pnpm verify:ingest-protocols:local` |
+| Agent discovery/filter contracts | `pnpm verify:agent-templates && pnpm verify:docker-discovery && pnpm verify:behavior-discovery && pnpm verify:filter-pipeline` |
 | Operations lifecycle | `pnpm verify:operations-lifecycle:local` |
 | Coverage, objectives, maintenance, remediation, evidence, notifications | `pnpm verify:contracts:local` |
 | Performance baseline | `pnpm perf:anysentry:local` |
@@ -273,6 +321,7 @@ skills/l3/                   L3 investigation prompts
 ## Documentation
 
 - [Deployment runbook](deploy/README.md)
+- [Agent discovery and workload-aware filtering](docs/agent-discovery-filter.md)
 - [Performance testing](docs/performance-testing.md)
 - [AnySentry Progressive API Skill](integrations/skills/anysentry-api/SKILL.md)
 

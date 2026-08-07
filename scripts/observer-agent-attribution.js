@@ -7,6 +7,7 @@ const DEFAULT_ROOT_NAMES = 'codex,a3s,a3s-code,a3s code,claude,claude-code,claud
 const DEFAULT_MAX_PROCS = 20_000;
 const DEFAULT_MAX_ANCESTORS = 32;
 const RECORD_TTL_MS = 30 * 60_000;
+const DEFAULT_TOMBSTONE_TTL_MS = 15_000;
 const WORKSPACE_CACHE_SIZE = 4096;
 const EPHEMERAL_WORKSPACE_ROOTS = ['/tmp', '/var/tmp', '/proc', '/sys', '/run', '/dev'];
 
@@ -16,7 +17,17 @@ function positiveInt(value) {
 }
 
 function text(value) {
-  return typeof value === 'string' ? value.trim() : '';
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (typeof value === 'bigint') return String(value);
+  return '';
+}
+
+function enabledValue(value, fallback = true) {
+  if (typeof value === 'boolean') return value;
+  const normalized = text(value).toLowerCase();
+  if (!normalized) return fallback;
+  return !['0', 'false', 'off', 'no', 'disabled'].includes(normalized);
 }
 
 function basename(value) {
@@ -129,19 +140,57 @@ class AgentAttributor {
       ? options.findWorkspaceRoot
       : findGitWorkspace;
     this.workspaceCache = new Map();
-    this.rootNames = new Set((options.rootNames || process.env.ANYSENTRY_AGENT_ROOT_NAMES || DEFAULT_ROOT_NAMES)
+    this.builtinHintsEnabled = enabledValue(
+      options.builtinHintsEnabled ?? process.env.ANYSENTRY_BUILTIN_AGENT_HINTS,
+      true,
+    );
+    const configuredRootNames =
+      options.rootNames ??
+      process.env.ANYSENTRY_AGENT_ROOT_NAMES ??
+      (this.builtinHintsEnabled ? DEFAULT_ROOT_NAMES : '');
+    this.rootNames = new Set(text(configuredRootNames)
       .split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
     this.procs = new Map();
+    this.tombstones = new Map();
+    this.tombstoneTtlMs =
+      positiveInt(options.tombstoneTtlMs) ||
+      positiveInt(process.env.ANYSENTRY_PROCESS_TOMBSTONE_MS) ||
+      DEFAULT_TOMBSTONE_TTL_MS;
+    this.maxTombstones =
+      positiveInt(options.maxTombstones) ||
+      positiveInt(process.env.ANYSENTRY_PROCESS_MAX_TOMBSTONES) ||
+      this.maxProcs;
+    this.negativeTtlMs =
+      positiveInt(options.negativeTtlMs) ||
+      positiveInt(process.env.ANYSENTRY_PROCESS_NEGATIVE_TTL_MS) ||
+      1_000;
+    this.stats = {
+      classifications: 0,
+      cacheHits: 0,
+      cacheMisses: 0,
+      procReads: 0,
+      bootstrapProcReads: 0,
+      fallbackProcReads: 0,
+      ancestryProcReads: 0,
+    };
     this.infrastructureRoots = new Map();
     this.infrastructureContainers = new Map();
     if (Array.isArray(options.infrastructureRoots)) this.setInfrastructureRoots(options.infrastructureRoots);
+  }
+
+  readProcess(pid, reason = 'fallback') {
+    this.stats.procReads++;
+    if (reason === 'bootstrap') this.stats.bootstrapProcReads++;
+    else if (reason === 'ancestry') this.stats.ancestryProcReads++;
+    else this.stats.fallbackProcReads++;
+    return this.readProc(pid);
   }
 
   seedFromProc() {
     const now = this.now();
     const snapshot = new Map();
     for (const pid of this.listPids().slice(0, this.maxProcs)) {
-      const info = this.readProc(pid);
+      const info = this.readProcess(pid, 'bootstrap');
       if (info) snapshot.set(pid, info);
     }
 
@@ -188,6 +237,13 @@ class AgentAttributor {
         infrastructureDescendants++;
       }
     }
+    // Keep the remaining process facts as short-lived unknown entries. The initial snapshot has
+    // already paid for these reads, so discarding them would make the first event for every
+    // unrelated host process walk /proc again. Unknown remains fail-open and is never promoted to
+    // non-Agent merely because it appeared in the snapshot.
+    for (const info of snapshot.values()) {
+      if (!this.procs.has(info.pid)) this.remember({ ...info, state: 'unknown', lastSeen: now });
+    }
     return {
       scanned: snapshot.size,
       roots,
@@ -226,27 +282,78 @@ class AgentAttributor {
 
   classify(observerEvent) {
     const now = this.now();
+    this.stats.classifications++;
     const payload = eventPayload(observerEvent);
     const processInfo = observerEvent?.process && typeof observerEvent.process === 'object' ? observerEvent.process : {};
     const pid = positiveInt(processInfo.pid) || positiveInt(payload.pid) || positiveInt(observerEvent?.identity?.task);
     if (!pid) return this.unknown();
     const exiting = Object.prototype.hasOwnProperty.call(observerEvent?.event ?? {}, 'ProcessExit');
-
-    const live = this.readProc(pid);
-    const current = {
+    const toolExec = Object.prototype.hasOwnProperty.call(observerEvent?.event ?? {}, 'ToolExec');
+    const observed = {
       pid,
-      ppid: positiveInt(processInfo.ppid) || positiveInt(payload.ppid) || live?.ppid,
-      startTime: text(processInfo.startTimeNs) || live?.startTime,
-      comm: text(processInfo.comm) || live?.comm || text(observerEvent?.identity?.agent),
-      exe: text(processInfo.exe) || live?.exe,
-      argv: argvText(payload.argv) || live?.argv,
-      cgroup: text(processInfo.cgroup) || live?.cgroup,
-      cwd: text(processInfo.cwd) || text(payload.cwd) || live?.cwd,
+      ppid: positiveInt(processInfo.ppid) || positiveInt(payload.ppid),
+      startTime:
+        text(processInfo.startTimeTicks) ||
+        text(processInfo.start_time_ticks) ||
+        text(processInfo.startTimeNs) ||
+        text(processInfo.start_time_ns),
+      cgroupId: text(processInfo.cgroupId) || text(processInfo.cgroup_id),
+      comm: text(processInfo.comm) || text(observerEvent?.identity?.agent),
+      exe: text(processInfo.exe),
+      argv: argvText(payload.argv),
+      cgroup: text(processInfo.cgroup),
+      cwd: text(processInfo.cwd) || text(payload.cwd),
     };
-    this.discardReusedPid(current);
+    this.discardReusedPid(observed);
+    const cached = this.procs.get(pid);
+    const sameCachedProcess = Boolean(
+      cached &&
+      (
+        (observed.startTime && cached.startTime === observed.startTime) ||
+        (!observed.startTime &&
+          observed.cgroupId &&
+          cached.cgroupId &&
+          observed.cgroupId === cached.cgroupId)
+      ),
+    );
+    let current = {
+      ...(sameCachedProcess ? cached : {}),
+      ...observed,
+      ppid: observed.ppid || (sameCachedProcess ? cached.ppid : undefined),
+      startTime: observed.startTime || (sameCachedProcess ? cached.startTime : undefined),
+      cgroupId: observed.cgroupId || (sameCachedProcess ? cached.cgroupId : undefined),
+      comm: observed.comm || (sameCachedProcess ? cached.comm : ''),
+      exe: observed.exe || (sameCachedProcess ? cached.exe : ''),
+      argv: observed.argv || (sameCachedProcess ? cached.argv : ''),
+      cgroup: observed.cgroup || (sameCachedProcess ? cached.cgroup : ''),
+      cwd: observed.cwd || (sameCachedProcess ? cached.cwd : ''),
+    };
+    if (sameCachedProcess) this.stats.cacheHits++;
+    else this.stats.cacheMisses++;
 
     const directAgent = this.matchAgent(current);
-    if (directAgent) return this.finish(pid, this.rememberAgent(current, directAgent, pid, 'hint_only', 'argv'), exiting);
+    if (directAgent) return this.finish(pid, this.rememberAgent(current, directAgent, pid, 'hint_only', 'argv'), exiting, current);
+
+    const existing = sameCachedProcess ? cached : undefined;
+    // Observer normally supplies the complete process instance. `/proc` is now a cache-miss and
+    // missing-fact fallback instead of an unconditional per-event read.
+    if (!sameCachedProcess && (!current.ppid || !current.startTime || !current.comm || (!current.cgroup && !current.cwd))) {
+      const live = this.readProcess(pid, 'fallback');
+      if (live) {
+        this.discardReusedPid(live);
+        current = {
+          ...live,
+          ...current,
+          ppid: current.ppid || live.ppid,
+          startTime: current.startTime || live.startTime,
+          comm: current.comm || live.comm,
+          exe: current.exe || live.exe,
+          argv: current.argv || live.argv,
+          cgroup: current.cgroup || live.cgroup,
+          cwd: current.cwd || live.cwd,
+        };
+      }
+    }
 
     const directInfrastructure = this.matchInfrastructure(current);
     if (directInfrastructure) {
@@ -259,15 +366,15 @@ class AgentAttributor {
           directInfrastructure.containerId,
         ),
         exiting,
+        current,
       );
     }
 
-    const existing = this.procs.get(pid);
     if (existing?.state === 'agent') {
       // A short process can emit ToolExec and ProcessExit after /proc/<pid>/cwd has already
       // disappeared. Preserve an earlier conflict decision for the same PID instead of silently
       // turning the later event into an unresolved-but-trusted Agent event.
-      const workspace = canonicalWorkspacePath(current.cwd)
+      const workspace = canonicalWorkspacePath(observed.cwd)
         ? this.resolveWorkspace(current.cwd, existing.workspacePath)
         : {
             workspacePath: existing.workspacePath,
@@ -275,9 +382,23 @@ class AgentAttributor {
             workspaceConflict: existing.workspaceConflict === true,
           };
       Object.assign(existing, current, workspace, { lastSeen: now });
-      return this.finish(pid, this.agentResult(existing), exiting);
+      return this.finish(pid, this.agentResult(existing), exiting, current);
     }
-    if (existing?.state === 'infrastructure') return this.finish(pid, this.infrastructureResult(existing), exiting);
+    if (existing?.state === 'infrastructure') {
+      return this.finish(pid, this.infrastructureResult(existing), exiting, current);
+    }
+    const tombstone = this.tombstoneFor(current);
+    if (tombstone?.state === 'agent') {
+      return this.finish(pid, this.agentResult(tombstone), exiting, current);
+    }
+
+    // Routine file/network/security observations reuse a recent negative result. ToolExec and
+    // ProcessExit re-evaluate because they are lifecycle/high-signal boundaries and can repair
+    // out-of-order parent information.
+    if (!toolExec && !exiting && existing?.nextResolveAt > now) {
+      if (existing.state === 'non_agent') return this.nonAgentResult();
+      return this.unknown();
+    }
 
     // Short-process events can arrive out of order. Re-evaluate negative cache entries when
     // a later event carries a usable parent, otherwise ProcessExit can hide the ToolExec lineage.
@@ -294,6 +415,7 @@ class AgentAttributor {
           ancestry.workspacePath,
         ),
         exiting,
+        current,
       );
     }
 
@@ -302,21 +424,77 @@ class AgentAttributor {
         pid,
         this.rememberInfrastructure(current, ancestry.rootPid, ancestry.serviceName, ancestry.containerId),
         exiting,
+        current,
       );
     }
 
     if (ancestry.state === 'non_agent') {
       this.remember({ ...current, state: 'non_agent', lastSeen: now });
-      return this.finish(pid, { state: 'non_agent' }, exiting);
+      return this.finish(pid, this.nonAgentResult(), exiting, current);
     }
 
     this.remember({ ...current, state: 'unknown', lastSeen: now });
-    return this.finish(pid, this.unknown(), exiting);
+    return this.finish(pid, this.unknown(), exiting, current);
   }
 
-  finish(pid, result, exiting) {
-    if (exiting) this.procs.delete(pid);
+  nonAgentResult() {
+    return {
+      state: 'non_agent',
+      attribution: {
+        monitored: false,
+        classification: 'non_agent',
+        confidence: 1,
+        reason: 'not_agent',
+        source: 'process_graph',
+        evidence: ['process_lineage:pid1'],
+      },
+    };
+  }
+
+  finish(pid, result, exiting, current) {
+    if (exiting) {
+      const record = this.procs.get(pid) || (
+        result.state === 'agent'
+          ? {
+              ...current,
+              state: 'agent',
+              agentId: result.attribution.agentScopeId,
+              rootPid: result.attribution.rootPid ?? pid,
+              lastSeen: this.now(),
+            }
+          : undefined
+      );
+      if (record?.startTime) this.rememberTombstone(record);
+      this.procs.delete(pid);
+    }
     return result;
+  }
+
+  tombstoneFor(info) {
+    this.pruneTombstones();
+    if (!info.startTime) return undefined;
+    const tombstone = this.tombstones.get(info.pid);
+    if (!tombstone || tombstone.expiresAt <= this.now()) return undefined;
+    return tombstone.record.startTime === info.startTime ? tombstone.record : undefined;
+  }
+
+  rememberTombstone(record) {
+    this.tombstones.set(record.pid, {
+      record: { ...record },
+      expiresAt: this.now() + this.tombstoneTtlMs,
+    });
+    while (this.tombstones.size > this.maxTombstones) {
+      const oldest = this.tombstones.keys().next().value;
+      if (oldest == null) break;
+      this.tombstones.delete(oldest);
+    }
+  }
+
+  pruneTombstones() {
+    const now = this.now();
+    for (const [pid, tombstone] of this.tombstones) {
+      if (tombstone.expiresAt <= now) this.tombstones.delete(pid);
+    }
   }
 
   resolveAncestry(initialPpid, now) {
@@ -331,9 +509,20 @@ class AgentAttributor {
       const cached = this.procs.get(pid);
       if (cached?.state === 'agent') return this.agentScope(cached);
       if (cached?.state === 'infrastructure') return this.infrastructureScope(cached);
+      if (cached?.state === 'non_agent' && cached.nextResolveAt > now) {
+        return { state: 'non_agent' };
+      }
       if (pid === 1) return { state: 'non_agent' };
 
-      const live = this.readProc(pid);
+      // A recent unknown entry still contains useful parent/start facts. Follow that cached
+      // parent without re-reading /proc; once the negative TTL expires, refresh it normally.
+      if (cached?.state === 'unknown' && cached.nextResolveAt > now) {
+        pid = positiveInt(cached.ppid);
+        if (!pid) return { state: 'unknown' };
+        continue;
+      }
+
+      const live = this.readProcess(pid, 'ancestry');
       if (!live) return cached?.state === 'non_agent' ? { state: 'non_agent' } : { state: 'unknown' };
       this.discardReusedPid(live);
 
@@ -377,7 +566,7 @@ class AgentAttributor {
           return this.infrastructureScope(leaderCached);
         }
 
-        const leader = this.readProc(tgid);
+        const leader = this.readProcess(tgid, 'ancestry');
         if (leader) {
           this.discardReusedPid(leader);
           const leaderAgent = this.matchAgent(leader);
@@ -422,6 +611,7 @@ class AgentAttributor {
   matchAgent(info) {
     const executableMatch = this.matchAgentExecutable(info);
     if (executableMatch) return executableMatch;
+    if (!this.builtinHintsEnabled) return undefined;
     const argv = text(info.argv).toLowerCase();
     if (!argv) return undefined;
     // Only the command prefix is identity evidence. Scanning every argument lets untrusted
@@ -451,12 +641,14 @@ class AgentAttributor {
       ...workspace,
       attribution: {
         monitored: true,
+        classification: 'probable_agent',
         agentScopeId: agentId,
         agentDisplayName: agentId,
         rootPid,
         confidence: source === 'process_graph' ? 0.9 : 0.85,
         reason,
         source,
+        evidence: [source === 'process_graph' ? 'process_lineage:agent_root' : 'process_signature:command'],
         ...(workspace.workspaceConflict ? { conflict: true } : {}),
       },
     };
@@ -471,12 +663,14 @@ class AgentAttributor {
       workspaceConflict: record.workspaceConflict,
       attribution: {
         monitored: true,
+        classification: 'probable_agent',
         agentScopeId: record.agentId,
         agentDisplayName: record.agentId,
         rootPid: record.rootPid,
         confidence: 0.9,
         reason: 'process_lineage',
         source: 'process_graph',
+        evidence: ['process_lineage:cached_agent_root'],
         ...(record.workspaceConflict ? { conflict: true } : {}),
       },
     };
@@ -532,7 +726,7 @@ class AgentAttributor {
     for (const root of Array.isArray(roots) ? roots : []) {
       const pid = positiveInt(root?.pid);
       if (!pid) continue;
-      const live = this.readProc(pid);
+      const live = this.readProcess(pid, 'fallback');
       const record = {
         ...(live || {}),
         pid,
@@ -598,13 +792,28 @@ class AgentAttributor {
   unknown() {
     return {
       state: 'unknown',
-      attribution: { monitored: false, confidence: 0, reason: 'not_evaluated', source: 'none' },
+      attribution: {
+        monitored: false,
+        classification: 'unknown',
+        confidence: 0,
+        reason: 'not_evaluated',
+        source: 'none',
+        evidence: ['process_lineage:incomplete'],
+      },
     };
   }
 
   discardReusedPid(info) {
     const existing = this.procs.get(info.pid);
     if (existing?.startTime && info.startTime && existing.startTime !== info.startTime) this.procs.delete(info.pid);
+    const tombstone = this.tombstones.get(info.pid);
+    if (
+      tombstone?.record.startTime &&
+      info.startTime &&
+      tombstone.record.startTime !== info.startTime
+    ) {
+      this.tombstones.delete(info.pid);
+    }
   }
 
   remember(record) {
@@ -615,7 +824,22 @@ class AgentAttributor {
       }
       if (this.procs.size >= this.maxProcs) this.procs.clear();
     }
-    this.procs.set(record.pid, record);
+    this.procs.set(record.pid, {
+      ...record,
+      nextResolveAt:
+        record.state === 'agent'
+          ? 0
+          : record.nextResolveAt ?? now + this.negativeTtlMs,
+    });
+  }
+
+  metrics() {
+    this.pruneTombstones();
+    return {
+      processes: this.procs.size,
+      tombstones: this.tombstones.size,
+      ...this.stats,
+    };
   }
 }
 

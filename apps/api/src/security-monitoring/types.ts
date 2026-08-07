@@ -40,14 +40,32 @@ export type ObjectiveStatus = 'ok' | 'breach' | 'disabled';
 export type IngestionSourceType = 'observer' | 'forwarder' | 'webhook' | 'otel' | 'custom';
 export type IngestionSourceStatus = 'active' | 'stale' | 'unused' | 'disabled';
 export type SourceTokenRotationStatus = 'untracked' | 'fresh' | 'overdue';
-export type AgentAttributionSource = 'none' | 'process_graph' | 'cgroup' | 'systemd' | 'argv' | 'env' | 'self_register' | 'workspace_hint';
-export type AgentAttributionReason = 'not_evaluated' | 'not_agent' | 'process_lineage' | 'authoritative_anchor' | 'hint_only' | 'conflict';
+export type AgentClassification = 'confirmed_agent' | 'probable_agent' | 'unknown' | 'non_agent';
+export type AgentReviewDecision = 'confirmed_agent' | 'unknown' | 'non_agent';
+export type JudgmentProfile = 'full' | 'l1_only' | 'discard';
+export type JudgmentRouteReason = 'confirmed_agent_full' | 'candidate_agent_full' | 'candidate_agent_l1_only' | 'unknown_l1_only' | 'non_agent_discarded';
+export interface JudgmentRoutingSnapshot {
+  classification: AgentClassification;
+  profile: JudgmentProfile;
+  maxTier: 'L1' | 'L2' | 'L3';
+  reason: JudgmentRouteReason;
+  routingVersion: string;
+}
+export interface EventJudgmentMetadata extends JudgmentRoutingSnapshot {
+  policyVersion?: string;
+  l1Verdict?: Verdict;
+  nextTierEligible?: boolean;
+  stopReason?: string;
+}
+export type AgentAttributionSource = 'none' | 'process_graph' | 'cgroup' | 'systemd' | 'argv' | 'env' | 'self_register' | 'workspace_hint' | 'kubernetes' | 'docker' | 'behavior' | 'process_signature' | 'manual_review';
+export type AgentAttributionReason = 'not_evaluated' | 'not_agent' | 'process_lineage' | 'authoritative_anchor' | 'hint_only' | 'conflict' | 'human_confirmed' | 'human_deferred' | 'human_rejected';
 
 export interface ProcessContext {
   hostId?: string;
   bootId?: string;
   pid?: number;
   ppid?: number;
+  startTimeTicks?: string;
   startTimeNs?: string;
   mountNamespace?: number;
   eventTimeNs?: string;
@@ -56,20 +74,76 @@ export interface ProcessContext {
   cwd?: string;
   uid?: number;
   cgroup?: string;
+  cgroupId?: string;
   systemdUnit?: string;
+}
+
+export interface AgentWorkloadRef {
+  environment?: 'kubernetes' | 'docker' | 'host';
+  kind?: 'pod' | 'container' | 'service' | 'process' | 'cgroup';
+  name?: string;
+  namespace?: string;
+  podName?: string;
+  podUid?: string;
+  nodeName?: string;
+  containerName?: string;
+  containerImage?: string;
+  ownerKind?: string;
+  ownerName?: string;
+  systemdUnit?: string;
+  processName?: string;
+  executable?: string;
 }
 
 export interface AgentAttribution {
   monitored: boolean;
+  classification?: AgentClassification;
   agentScopeId?: string;
   agentDisplayName?: string;
   agentSessionId?: string;
+  agentInstanceId?: string;
+  physicalWorkloadId?: string;
+  workloadRef?: AgentWorkloadRef;
   rootPid?: number;
   confidence: number;
   reason: AgentAttributionReason;
   source: AgentAttributionSource;
   conflict?: boolean;
   degraded?: boolean;
+  evidence?: string[];
+}
+
+export interface WorkloadIdentitySnapshotEntry {
+  ids: string[];
+  classification: AgentClassification;
+  physicalWorkloadId: string;
+  source?: 'kubernetes' | 'docker' | 'systemd' | 'host';
+  attributionSource?: AgentAttributionSource;
+  environment?: 'kubernetes' | 'docker' | 'host';
+  agentScopeId?: string;
+  agentDisplayName?: string;
+  agentInstanceId?: string;
+  namespace?: string;
+  podName?: string;
+  podUid?: string;
+  nodeName?: string;
+  containerName?: string;
+  containerImage?: string;
+  ownerKind?: string;
+  ownerName?: string;
+  labels?: Record<string, string>;
+  systemdUnit?: string;
+  evidence: string[];
+}
+
+export interface WorkloadIdentitySnapshot {
+  schemaVersion: 'anysentry.workload_identity_snapshot.v1';
+  version: number;
+  generatedAt: string;
+  ready: boolean;
+  nodeName?: string;
+  entries: WorkloadIdentitySnapshotEntry[];
+  errors: number;
 }
 export type CoverageIssueType =
   | 'collector_down'
@@ -125,6 +199,7 @@ export interface JudgedEvent {
   attributes: Record<string, EventAttributeValue>;
   process?: ProcessContext;
   attribution?: AgentAttribution;
+  judgment?: EventJudgmentMetadata;
   rawPreview?: string;
 }
 
@@ -526,11 +601,16 @@ export interface SecurityWorkspaceRiskDistribution {
 
 export interface AgentEventQuery extends SecurityTimeFilter {
   scope?: 'agent' | 'raw';
+  /** Raw-view visibility only. Defaults to true; Agent scope always excludes Unknown. */
+  includeUnknown?: boolean;
+  /** Query the durable ClickHouse history instead of only the hot dashboard window. */
+  durable?: boolean;
   noise?: 'hide' | 'include';
   eventId?: string;
   sourceId?: string;
   collectorId?: string;
   agentId?: string;
+  agentAssetId?: string;
   sessionId?: string;
   workspacePath?: string;
   traceId?: string;
@@ -539,6 +619,7 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   eventCategory?: EventCategory;
   verdict?: Verdict;
   tier?: Tier;
+  q?: string;
   limit?: number;
 }
 export interface AgentEventListItem {
@@ -552,6 +633,13 @@ export interface AgentEventListItem {
   subject: string;
   workspacePath: string;
   agentId: string;
+  agentAssetId: string;
+  displayName?: string;
+  detectedName?: string;
+  detectedClassification: AgentClassification;
+  effectiveClassification: AgentClassification;
+  runtime: 'kubernetes' | 'docker' | 'host' | 'unknown';
+  locationLabel?: string;
   collectorId?: string;
   sourceId?: string;
   sessionId: string;
@@ -578,6 +666,7 @@ export interface AgentEventListItem {
   attributes: Record<string, EventAttributeValue>;
   process?: ProcessContext;
   attribution?: AgentAttribution;
+  judgment?: EventJudgmentMetadata;
   repeatCount?: number;
   lastAt?: string;
   rawPreview?: string;
@@ -781,12 +870,16 @@ export interface AgentInventoryQuery extends SecurityTimeFilter {
   tag?: string;
   q?: string;
   agentId?: string;
+  agentAssetId?: string;
   workspacePath?: string;
   userId?: string;
+  includeUnclassified?: boolean;
   limit?: number;
 }
 export interface AgentMetadataRecord {
   agentId: string;
+  agentAssetId: string;
+  agentAssetAliases?: string[];
   workspacePath: string;
   displayName?: string;
   owner?: string;
@@ -795,16 +888,33 @@ export interface AgentMetadataRecord {
   criticality?: AgentCriticality;
   tags: string[];
   note?: string;
+  identityKeys?: string[];
+  physicalWorkloadId?: string;
+  agentInstanceId?: string;
+  workloadRef?: AgentWorkloadRef;
+  reviewDecision?: AgentReviewDecision;
+  reviewedBy?: string;
+  reviewedAt?: number;
+  reviewNote?: string;
+  reviewIdentityKeys?: string[];
+  reviewPhysicalWorkloadId?: string;
+  reviewAgentInstanceId?: string;
+  reviewWorkloadRef?: AgentWorkloadRef;
   updatedAt: number;
 }
-export interface AgentMetadataListItem extends Omit<AgentMetadataRecord, 'updatedAt'> {
+export interface AgentMetadataListItem extends Omit<AgentMetadataRecord, 'updatedAt' | 'reviewedAt'> {
   updatedAt: string;
+  reviewedAt?: string;
 }
 export interface AgentInventoryItem {
   agentId: string;
+  agentAssetId: string;
+  agentAssetAliases?: string[];
   workspacePath: string;
   userId: string;
   displayName?: string;
+  detectedName?: string;
+  detectedClassification: AgentClassification;
   owner?: string;
   team?: string;
   environment?: string;
@@ -812,6 +922,21 @@ export interface AgentInventoryItem {
   tags: string[];
   note?: string;
   metadataUpdatedAt?: string;
+  classification: AgentClassification;
+  runtime: 'kubernetes' | 'docker' | 'host' | 'unknown';
+  locationLabel?: string;
+  instanceCount: number;
+  confidence: number;
+  attributionSource: AgentAttributionSource;
+  attributionEvidence: string[];
+  physicalWorkloadId?: string;
+  agentInstanceId?: string;
+  workloadRef?: AgentWorkloadRef;
+  reviewDecision?: AgentReviewDecision;
+  reviewedBy?: string;
+  reviewedAt?: string;
+  reviewNote?: string;
+  reviewIdentityKeys: string[];
   firstSeen: string;
   lastSeen: string;
   healthState: AgentHealthState;
@@ -849,6 +974,34 @@ export interface AgentInventory {
   total: number;
   summary: AgentInventorySummary;
   updateTime: string;
+}
+
+export type IdentityAiReviewTargetType = 'event' | 'agent';
+export type IdentityAiVerdict = 'agent' | 'not_agent';
+export type IdentityAiReviewStatus = 'running' | 'succeeded' | 'failed';
+export interface IdentityAiReviewRequest extends SecurityTimeFilter {
+  targetType: IdentityAiReviewTargetType;
+  eventId?: string;
+  agentAssetId?: string;
+}
+export interface IdentityAiReviewRecord {
+  schemaVersion: 'anysentry.identity_ai_review.v1';
+  reviewId: string;
+  targetType: IdentityAiReviewTargetType;
+  eventId?: string;
+  agentAssetId: string;
+  status: IdentityAiReviewStatus;
+  verdict?: IdentityAiVerdict;
+  confidence?: number;
+  summary?: string;
+  reason?: string;
+  evidenceRefs: string[];
+  evidenceDigest: string;
+  model?: string;
+  provider: 'a3s-code-sdk';
+  error?: string;
+  createdAt: string;
+  completedAt?: string;
 }
 
 export interface WorkspaceInventoryQuery extends SecurityTimeFilter {
@@ -916,12 +1069,29 @@ export interface WorkspaceInventory {
 }
 export interface AgentMetadataUpdateRequest {
   workspacePath: string;
+  agentAssetId?: string;
   displayName?: string;
   owner?: string;
   team?: string;
   environment?: string;
   criticality?: AgentCriticality | '';
   tags?: string[];
+  note?: string;
+  identityKeys?: string[];
+  physicalWorkloadId?: string;
+  agentInstanceId?: string;
+  workloadRef?: AgentWorkloadRef;
+}
+
+export interface AgentReviewRequest {
+  workspacePath: string;
+  decision: AgentReviewDecision | 'clear';
+  currentClassification?: AgentClassification;
+  agentAssetId?: string;
+  identityKeys?: string[];
+  physicalWorkloadId?: string;
+  agentInstanceId?: string;
+  workloadRef?: AgentWorkloadRef;
   note?: string;
 }
 
@@ -1011,7 +1181,65 @@ export interface CollectorHeartbeatRequest {
   outputDropped?: number;
   errorCount?: number;
   observedAgents?: number;
+  filterMetrics?: CollectorFilterMetrics;
   message?: string;
+}
+export interface CollectorFilterMetrics {
+  /** @deprecated Compatibility marker for pre-decoupling forwarders. */
+  scope: 'all' | 'shadow' | 'agent' | 'decoupled';
+  filterMode?: 'enforce' | 'shadow';
+  retainUnknown?: boolean;
+  retainNonAgent?: boolean;
+  noisePolicy?: 'balanced' | 'include';
+  observed: number;
+  forwarded: number;
+  confirmedAgent: number;
+  probableAgent: number;
+  unknown: number;
+  nonAgent: number;
+  filteredNonAgent: number;
+  wouldFilterNonAgent: number;
+  filteredNoise: number;
+  wouldFilterNoise: number;
+  discoveryBudgetDropped: number;
+  wouldDiscoveryBudgetDrop: number;
+  deduplicated: number;
+  queueDropped: number;
+  batches: number;
+  batchEvents: number;
+  identitySnapshotReady: boolean;
+  identitySnapshotVersion: number;
+  identitySnapshotAgeSeconds: number;
+  identityCacheEntries: number;
+  identityCacheHits: number;
+  identityCacheMisses: number;
+  identityCandidateCacheEntries: number;
+  identityCgroupBindings: number;
+  identityCgroupHits: number;
+  identityCgroupMisses: number;
+  identityErrors: number;
+  dockerEnabled: boolean;
+  dockerReady: boolean;
+  dockerEntries: number;
+  dockerReconnects: number;
+  dockerErrors: number;
+  behaviorWorkloads: number;
+  behaviorCandidates: number;
+  behaviorPromoted: number;
+  behaviorEvicted: number;
+  templateLoaded: number;
+  templateInvalid: number;
+  templateMatches: number;
+  templateAmbiguous: number;
+  processCacheEntries: number;
+  processTombstones: number;
+  processClassifications: number;
+  processCacheHits: number;
+  processCacheMisses: number;
+  processProcReads: number;
+  processBootstrapProcReads: number;
+  processFallbackProcReads: number;
+  processAncestryProcReads: number;
 }
 export interface CollectorHeartbeatRecord extends Required<Pick<CollectorHeartbeatRequest, 'collectorId' | 'status'>> {
   at: number;
@@ -1029,6 +1257,7 @@ export interface CollectorHeartbeatRecord extends Required<Pick<CollectorHeartbe
   outputDropped: number;
   errorCount: number;
   observedAgents: number;
+  filterMetrics: CollectorFilterMetrics;
   message?: string;
 }
 export interface CollectorHeartbeatAck {
@@ -1069,6 +1298,7 @@ export interface CollectorHealthItem {
   droppedEvents: number;
   outputDropped: number;
   errorCount: number;
+  filterMetrics: CollectorFilterMetrics;
   message?: string;
   eventCategoryCounts: Record<EventCategory, number>;
 }
@@ -1794,6 +2024,9 @@ export type AuditAction =
   | 'alert.updated'
   | 'remediation.updated'
   | 'agent.metadata.updated'
+  | 'agent.review.updated'
+  | 'agent.review.cleared'
+  | 'agent.identity_ai_review.completed'
   | 'maintenance.window.updated'
   | 'notification.channel.updated'
   | 'notification.route.updated'
@@ -1801,7 +2034,7 @@ export type AuditAction =
   | 'objective.updated'
   | 'source.updated'
   | 'source.token_rotated';
-export type AuditResourceType = 'policy' | 'supply-chain' | 'incident' | 'alert' | 'remediation' | 'agent' | 'maintenance' | 'notification' | 'objective' | 'source';
+export type AuditResourceType = 'policy' | 'supply-chain' | 'incident' | 'alert' | 'remediation' | 'agent' | 'event' | 'maintenance' | 'notification' | 'objective' | 'source';
 export type AuditResult = 'success' | 'failure';
 export interface AuditActor {
   type: AuditActorType;

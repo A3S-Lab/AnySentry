@@ -10,11 +10,13 @@ import {
   Search,
   ShieldAlert,
   TerminalSquare,
+  UserCheck,
   X,
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import { AgentIdentityInline, resolveAgentIdentity } from "@/components/custom/agent-identity";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -148,11 +150,9 @@ function EventRow({
         <Pill className={severityClass(event.severity)}>{CATEGORY_LABEL[event.eventCategory] ?? event.eventCategory}</Pill>
       </span>
       <span className="min-w-0">
-        <span className="block truncate text-sm font-medium text-zinc-100" title={event.subject}>
+        <AgentIdentityInline event={event} className="flex" />
+        <span className="mt-0.5 block truncate text-[11px] text-zinc-500" title={event.subject}>
           {event.subject}
-        </span>
-        <span className="mt-0.5 block truncate font-mono text-[11px] text-zinc-600" title={event.traceId}>
-          {event.agentId} / {shortId(event.traceId)}
         </span>
       </span>
       <span className="flex justify-end">
@@ -179,7 +179,17 @@ function AttributeList({ event }: { event?: AgentEventListItem }) {
   );
 }
 
-function EventDetail({ event, timeType }: { event?: AgentEventListItem; timeType: SecurityTimeType }) {
+function EventDetail({
+  event,
+  timeType,
+  startTime,
+  endTime,
+}: {
+  event?: AgentEventListItem;
+  timeType: SecurityTimeType;
+  startTime?: string;
+  endTime?: string;
+}) {
   if (!event) {
     return (
       <section className="rounded-[8px] border border-white/10 bg-[#111612]/92">
@@ -190,12 +200,15 @@ function EventDetail({ event, timeType }: { event?: AgentEventListItem; timeType
 
   const eventSourceId = event.sourceId ?? (typeof event.attributes.sourceId === "string" ? event.attributes.sourceId : undefined);
   const eventCollectorId = event.collectorId ?? (typeof event.attributes.collectorId === "string" ? event.attributes.collectorId : undefined);
+  const agentIdentity = resolveAgentIdentity(event);
+  const workload = agentIdentity.workload;
   const topologyQs = new URLSearchParams({
     timeType,
     eventId: event.eventId,
     agentId: event.agentId,
     workspacePath: event.workspacePath,
   });
+  topologyQs.set("agentAssetId", event.agentAssetId);
   if (eventSourceId) topologyQs.set("sourceId", eventSourceId);
   if (eventCollectorId) topologyQs.set("collectorId", eventCollectorId);
   const evidenceQs = new URLSearchParams({
@@ -207,15 +220,27 @@ function EventDetail({ event, timeType }: { event?: AgentEventListItem; timeType
     agentId: event.agentId,
     workspacePath: event.workspacePath,
   });
+  evidenceQs.set("agentAssetId", event.agentAssetId);
   if (eventSourceId) evidenceQs.set("sourceId", eventSourceId);
   if (eventCollectorId) evidenceQs.set("collectorId", eventCollectorId);
+  const agentQs = new URLSearchParams({
+    timeType,
+    selectedAgentAssetId: event.agentAssetId,
+    focus: "review",
+    eventId: event.eventId,
+  });
+  if (startTime) agentQs.set("startTime", startTime);
+  if (endTime) agentQs.set("endTime", endTime);
 
   return (
     <section className="rounded-[8px] border border-white/10 bg-[#111612]/92">
       <div className="flex min-h-12 items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
         <div className="flex min-w-0 items-center gap-2">
           <FileText className="size-4 shrink-0 text-teal-200" />
-          <h2 className="truncate text-sm font-semibold text-zinc-100">{event.subject}</h2>
+          <div className="min-w-0">
+            <AgentIdentityInline event={event} showClassification />
+            <p className="mt-0.5 truncate text-xs text-zinc-500" title={event.subject}>{event.subject}</p>
+          </div>
         </div>
         <Pill className={severityClass(event.severity)}>{SEVERITY_LABEL[event.severity]}</Pill>
       </div>
@@ -225,7 +250,11 @@ function EventDetail({ event, timeType }: { event?: AgentEventListItem; timeType
           <FieldValue label="Trace ID" value={event.traceId} />
           <FieldValue label="Span ID" value={event.spanId} />
           <FieldValue label="Run ID" value={event.runId} />
-          <FieldValue label="Agent" value={event.agentId} />
+          <FieldValue label="当前显示名" value={agentIdentity.name} />
+          <FieldValue label="采集时名称" value={event.detectedName ?? event.attribution?.agentDisplayName} />
+          <FieldValue label="原始执行者" value={event.agentId} />
+          <FieldValue label="Agent 资产 ID" value={event.agentAssetId} />
+          <FieldValue label="实例定位" value={event.locationLabel} />
           <FieldValue label="Collector" value={eventCollectorId} />
           <FieldValue label="Source ID" value={eventSourceId} />
           <FieldValue label="Session" value={event.sessionId} />
@@ -253,19 +282,77 @@ function EventDetail({ event, timeType }: { event?: AgentEventListItem; timeType
           </div>
         </div>
 
+        <div className="flex flex-col gap-3 rounded-md border border-teal-400/20 bg-teal-500/[0.06] px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <UserCheck className="size-4 shrink-0 text-teal-200" />
+              <p className="text-sm font-semibold text-zinc-100">
+                {agentIdentity.classification === "unknown" ? "身份信息" : "归属智能体"}
+              </p>
+            </div>
+            <p className="mt-1 text-xs leading-5 text-zinc-400">
+              {agentIdentity.classification === "unknown"
+                ? "当前身份尚未确认，可前往身份审核查看完整运行证据。"
+                : "身份辅助审核与人工裁决在智能体资产中统一进行，本页保留采集时的单条事件证据。"}
+            </p>
+          </div>
+          <Button asChild type="button" size="sm" className="h-8 shrink-0 bg-teal-400 text-slate-950 hover:bg-teal-300">
+            <Link to={`/agents?${agentQs.toString()}`}>
+              {agentIdentity.classification === "unknown" ? "进入身份审核" : "查看智能体资产"}
+            </Link>
+          </Button>
+        </div>
+
         <div>
-          <p className="mb-2 text-xs font-medium text-zinc-400">Agent Attribution</p>
+          <p className="mb-2 text-xs font-medium text-zinc-400">Agent 归因详情</p>
           <div className="grid gap-3 rounded-md border border-white/10 bg-white/[0.03] px-3 py-3 sm:grid-cols-2 xl:grid-cols-4">
-            <FieldValue label="Monitored" value={event.attribution?.monitored ? "true" : "false"} />
-            <FieldValue label="Agent Scope" value={event.attribution?.agentScopeId ?? "non-agent"} />
-            <FieldValue label="Confidence" value={event.attribution ? event.attribution.confidence.toFixed(2) : "0.00"} />
-            <FieldValue label="Source" value={event.attribution?.source ?? "none"} />
-            <FieldValue label="Reason" value={event.attribution?.reason ?? "not_evaluated"} />
+            <FieldValue label="当前状态" value={agentIdentity.classificationLabel} />
+            <FieldValue label="自动检测状态" value={
+              event.detectedClassification === "confirmed_agent"
+                ? "已确认 Agent"
+                : event.detectedClassification === "probable_agent"
+                  ? "候选 Agent"
+                  : event.detectedClassification === "non_agent"
+                    ? "已排除"
+                    : "尚未识别"
+            } />
+            <FieldValue label="部署环境" value={agentIdentity.runtimeLabel ?? "未知"} />
+            <FieldValue label="识别来源" value={event.attribution?.source ?? "none"} />
+            <FieldValue label="置信度" value={event.attribution ? `${Math.round(event.attribution.confidence * 100)}%` : "0%"} />
+            <FieldValue label="Agent Scope ID" value={event.attribution?.agentScopeId ?? "non-agent"} />
+            <FieldValue label="Agent Instance ID" value={event.attribution?.agentInstanceId} />
+            <FieldValue label="物理工作负载" value={event.attribution?.physicalWorkloadId} />
+            <FieldValue label="归因原因" value={event.attribution?.reason ?? "not_evaluated"} />
+            <FieldValue label="Namespace" value={workload?.namespace} />
+            <FieldValue label="Pod" value={workload?.podName} />
+            <FieldValue label="容器" value={workload?.containerName} />
+            <FieldValue label="镜像" value={workload?.containerImage} />
+            <FieldValue label="节点" value={workload?.nodeName ?? event.process?.hostId} />
+            <FieldValue label="Owner" value={[workload?.ownerKind, workload?.ownerName].filter(Boolean).join("/") || undefined} />
+            <FieldValue label="本地服务" value={workload?.systemdUnit ?? event.process?.systemdUnit} />
+            <FieldValue label="进程" value={workload?.processName ?? event.process?.comm} />
+            <FieldValue label="可执行文件" value={workload?.executable ?? event.process?.exe} />
             <FieldValue label="Root PID" value={event.attribution?.rootPid} />
+            <FieldValue label="Boot ID" value={event.process?.bootId} />
             <FieldValue label="PID" value={event.process?.pid} />
             <FieldValue label="PPID" value={event.process?.ppid} />
+            <FieldValue label="进程启动 Ticks" value={event.process?.startTimeTicks} />
+            <FieldValue label="Cgroup ID" value={event.process?.cgroupId} />
           </div>
         </div>
+
+        {event.attribution?.evidence?.length ? (
+          <div>
+            <p className="mb-2 text-xs font-medium text-zinc-400">Agent 识别证据</p>
+            <div className="flex flex-wrap gap-2 rounded-md border border-white/10 bg-white/[0.03] px-3 py-3">
+              {event.attribution.evidence.map((item) => (
+                <code key={item} className="rounded border border-white/10 bg-[#0b0f0c] px-2 py-1 text-[11px] text-zinc-400">
+                  {item}
+                </code>
+              ))}
+            </div>
+          </div>
+        ) : null}
 
         <div>
           <p className="mb-2 text-xs font-medium text-zinc-400">判定原因</p>
@@ -354,33 +441,43 @@ function clean(value: string) {
 export default function AgentEventsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
+  const routeStartTime = searchParams.get("startTime") ?? "";
+  const routeEndTime = searchParams.get("endTime") ?? "";
   const [sourceId, setSourceId] = useState(searchParams.get("sourceId") ?? "");
   const [collectorId, setCollectorId] = useState(searchParams.get("collectorId") ?? "");
   const [workspacePath, setWorkspacePath] = useState(searchParams.get("workspacePath") ?? "");
   const [agentId, setAgentId] = useState(searchParams.get("agentId") ?? "");
+  const [agentAssetId, setAgentAssetId] = useState(searchParams.get("agentAssetId") ?? "");
   const [sessionId, setSessionId] = useState(searchParams.get("sessionId") ?? "");
   const [traceId, setTraceId] = useState(searchParams.get("traceId") ?? "");
   const [runId, setRunId] = useState(searchParams.get("runId") ?? "");
   const [eventKind, setEventKind] = useState(searchParams.get("eventKind") ?? "");
   const [eventCategory, setEventCategory] = useState<AgentEventCategory | "all">((searchParams.get("eventCategory") as AgentEventCategory) || "all");
   const [verdict, setVerdict] = useState<SecurityVerdict | "all">((searchParams.get("verdict") as SecurityVerdict) || "all");
+  const [includeUnknown, setIncludeUnknown] = useState(searchParams.get("includeUnknown") !== "false");
   const [selectedEventId, setSelectedEventId] = useState(searchParams.get("eventId") ?? "");
 
   const query = useMemo<AgentEventQuery>(() => ({
     timeType,
+    startTime: timeType === "custom" ? clean(routeStartTime) : undefined,
+    endTime: timeType === "custom" ? clean(routeEndTime) : undefined,
     eventId: clean(selectedEventId),
     sourceId: clean(sourceId),
     collectorId: clean(collectorId),
     workspacePath: clean(workspacePath),
     agentId: clean(agentId),
+    agentAssetId: clean(agentAssetId),
     sessionId: clean(sessionId),
     traceId: clean(traceId),
     runId: clean(runId),
     eventKind: clean(eventKind),
     eventCategory: eventCategory === "all" ? undefined : eventCategory,
     verdict: verdict === "all" ? undefined : verdict,
+    scope: "raw",
+    includeUnknown,
+    durable: true,
     limit: 120,
-  }), [agentId, collectorId, eventCategory, eventKind, runId, selectedEventId, sessionId, sourceId, timeType, traceId, verdict, workspacePath]);
+  }), [agentAssetId, agentId, collectorId, eventCategory, eventKind, includeUnknown, routeEndTime, routeStartTime, runId, selectedEventId, sessionId, sourceId, timeType, traceId, verdict, workspacePath]);
 
   const { data, loading, refresh } = useRequest(() => securityCenterApi.agentEvents(query), {
     refreshDeps: [query],
@@ -395,10 +492,17 @@ export default function AgentEventsPage() {
 
   const { data: timeline, loading: timelineLoading } = useRequest(
     () => selectedEvent
-      ? securityCenterApi.agentTimeline({ timeType, eventId: selectedEvent.eventId, traceId: selectedEvent.traceId, limit: 240 })
+      ? securityCenterApi.agentTimeline({
+          timeType,
+          startTime: timeType === "custom" ? clean(routeStartTime) : undefined,
+          endTime: timeType === "custom" ? clean(routeEndTime) : undefined,
+          eventId: selectedEvent.eventId,
+          traceId: selectedEvent.traceId,
+          limit: 240,
+        })
       : Promise.resolve({ traceId: "", items: [], updateTime: "" }),
     {
-      refreshDeps: [selectedEvent?.traceId, timeType],
+      refreshDeps: [routeEndTime, routeStartTime, selectedEvent?.traceId, timeType],
       pollingInterval: 10000,
       pollingWhenHidden: false,
     },
@@ -410,6 +514,8 @@ export default function AgentEventsPage() {
     setSelectedEventId(event.eventId);
     const next = new URLSearchParams();
     next.set("timeType", timeType);
+    if (timeType === "custom" && routeStartTime) next.set("startTime", routeStartTime);
+    if (timeType === "custom" && routeEndTime) next.set("endTime", routeEndTime);
     next.set("eventId", event.eventId);
     next.set("traceId", event.traceId);
     next.set("runId", event.runId);
@@ -418,9 +524,12 @@ export default function AgentEventsPage() {
     if (eventCollectorId ?? collectorId) next.set("collectorId", eventCollectorId ?? collectorId);
     if (workspacePath) next.set("workspacePath", workspacePath);
     if (agentId) next.set("agentId", agentId);
+    next.set("agentAssetId", event.agentAssetId);
     if (sessionId) next.set("sessionId", sessionId);
+    next.set("includeUnknown", String(includeUnknown));
     if (eventSourceId) setSourceId(eventSourceId);
     if (eventCollectorId) setCollectorId(eventCollectorId);
+    setAgentAssetId(event.agentAssetId);
     setRunId(event.runId);
     setEventKind(event.eventKind);
     setSearchParams(next);
@@ -428,6 +537,7 @@ export default function AgentEventsPage() {
 
   const clearFilters = () => {
     setAgentId("");
+    setAgentAssetId("");
     setSourceId("");
     setCollectorId("");
     setWorkspacePath("");
@@ -437,6 +547,7 @@ export default function AgentEventsPage() {
     setEventKind("");
     setEventCategory("all");
     setVerdict("all");
+    setIncludeUnknown(true);
     setSelectedEventId("");
     setSearchParams({});
   };
@@ -472,6 +583,7 @@ export default function AgentEventsPage() {
             <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
             <SelectContent>
               {TIME_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
+              {timeType === "custom" ? <SelectItem value="custom">自定义范围</SelectItem> : null}
             </SelectContent>
           </Select>
           <Input value={sourceId} onChange={(event) => setSourceId(event.target.value)} placeholder="sourceId" className="h-9 border-white/10 bg-white/5 font-mono text-xs" />
@@ -494,6 +606,21 @@ export default function AgentEventsPage() {
               {VERDICT_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
             </SelectContent>
           </Select>
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            aria-pressed={includeUnknown}
+            onClick={() => setIncludeUnknown((value) => !value)}
+            className={cn(
+              "h-9 border text-xs",
+              includeUnknown
+                ? "border-teal-400/30 bg-teal-400/10 text-teal-100 hover:bg-teal-400/15"
+                : "border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10",
+            )}
+          >
+            {includeUnknown ? "包含 Unknown" : "隐藏 Unknown"}
+          </Button>
           <Button type="button" variant="secondary" size="sm" onClick={clearFilters} className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
             <X className="size-3.5" />
             清除
@@ -536,7 +663,12 @@ export default function AgentEventsPage() {
             )}
           </section>
 
-          <EventDetail event={selectedEvent} timeType={timeType} />
+          <EventDetail
+            event={selectedEvent}
+            timeType={timeType}
+            startTime={timeType === "custom" ? routeStartTime : undefined}
+            endTime={timeType === "custom" ? routeEndTime : undefined}
+          />
 
           <div className="space-y-4">
             <section className="rounded-[8px] border border-white/10 bg-[#111612]/92 p-4">

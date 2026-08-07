@@ -36,6 +36,7 @@ import {
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import { AgentAssetIdentityInline, AgentIdentityInline } from "@/components/custom/agent-identity";
 import { useVChartTheme } from "@/components/custom/charts/vchart-theme";
 import { type VChartSpec, VChartView } from "@/components/custom/vchart";
 import { useSecurityConsole } from "@/components/custom/security-console-header";
@@ -45,6 +46,8 @@ import {
   type AgentEventCategory,
   type AgentEventList,
   type AgentEventListItem,
+  type AgentInventory,
+  type AgentInventoryItem,
   type AgentObservability,
   type SecurityDecisionFunnel,
   type SecurityDecisionTier,
@@ -82,6 +85,7 @@ type SecuritySectionKey =
   | "highestRisk"
   | "decisionFunnel"
   | "workspaceRisk"
+  | "agentInventory"
   | "streamFindings"
   | "supplyChain"
   | "events";
@@ -95,6 +99,7 @@ interface SecurityDashboardData {
   highestRisk: SecurityHighestRiskSession | null;
   decisionFunnel: SecurityDecisionFunnel | null;
   workspaceRisk: SecurityWorkspaceRiskDistribution | null;
+  agentInventory: AgentInventory | null;
   streamFindings: StreamFindingList | null;
   supplyChain: SupplyChainOverview | null;
   events: AgentEventList | null;
@@ -245,6 +250,7 @@ async function loadSecurityDashboardData(
   scanScope: TimelineScope,
   timelineScope: TimelineScope,
   timelineTier: TimelineTierFilter,
+  timelineIncludeUnknown: boolean,
   riskBreakdownScope: TimelineScope,
   decisionFunnelScope: TimelineScope,
   workspaceRiskScope: TimelineScope,
@@ -261,9 +267,10 @@ async function loadSecurityDashboardData(
       highestRisk: securityCenterApi.highestRiskSession(filter),
       decisionFunnel: securityCenterApi.decisionFunnel({ ...filter, scope: decisionFunnelScope }),
       workspaceRisk: securityCenterApi.workspaceRiskDistribution({ ...filter, scope: workspaceRiskScope }),
+      agentInventory: securityCenterApi.agentInventory({ ...filter, limit: 32 }),
       streamFindings: securityCenterApi.streamFindings({ ...filter, limit: 30 }),
       supplyChain: securityCenterApi.supplyChainOverview(500),
-      events: securityCenterApi.agentEvents({ ...filter, scope: timelineScope, ...(timelineTier === "all" ? {} : { tier: timelineTier }), limit: 36 }),
+      events: securityCenterApi.agentEvents({ ...filter, scope: timelineScope, includeUnknown: timelineIncludeUnknown, ...(timelineTier === "all" ? {} : { tier: timelineTier }), limit: 36 }),
     },
     formatRequestError,
   );
@@ -281,6 +288,7 @@ function enrichSecurityDashboardData(data: SecurityDashboardData): SecurityDashb
     highestRisk: normalizeHighestRiskSession(data.highestRisk),
     decisionFunnel: data.decisionFunnel,
     workspaceRisk: data.workspaceRisk,
+    agentInventory: data.agentInventory,
     streamFindings: data.streamFindings,
     supplyChain: data.supplyChain,
     events: data.events,
@@ -1870,7 +1878,95 @@ function SupplyChainPanel({
   );
 }
 
+type AgentRiskView = "assets" | "window";
 type StreamPanelTab = "profiles" | "composites" | "runtime";
+
+const AGENT_CLASSIFICATION_ORDER: Record<AgentInventoryItem["classification"], number> = {
+  confirmed_agent: 0,
+  probable_agent: 1,
+  unknown: 2,
+  non_agent: 3,
+};
+
+const AGENT_RISK_ORDER: Record<string, number> = {
+  critical: 0,
+  high: 1,
+  medium: 2,
+  low: 3,
+  safe: 4,
+  unknown: 5,
+};
+
+function agentActivityLabel(value: string): string {
+  const timestamp = dayjs(value);
+  if (!timestamp.isValid()) return "时间未知";
+  const minutes = Math.max(0, dayjs().diff(timestamp, "minute"));
+  if (minutes < 1) return "刚刚";
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  return `${Math.floor(hours / 24)} 天前`;
+}
+
+function agentAssetHref(agent: AgentInventoryItem, filter: SecurityTimeFilter): string {
+  const query = new URLSearchParams({
+    timeType: filter.timeType ?? "last_3h",
+    selectedAgentAssetId: agent.agentAssetId,
+  });
+  if (filter.startTime) query.set("startTime", filter.startTime);
+  if (filter.endTime) query.set("endTime", filter.endTime);
+  return `/agents?${query.toString()}`;
+}
+
+function allAgentsHref(filter: SecurityTimeFilter): string {
+  const query = new URLSearchParams({ timeType: filter.timeType ?? "last_3h" });
+  if (filter.startTime) query.set("startTime", filter.startTime);
+  if (filter.endTime) query.set("endTime", filter.endTime);
+  return `/agents?${query.toString()}`;
+}
+
+function AgentOverviewCard({ agent, filter }: { agent: AgentInventoryItem; filter: SecurityTimeFilter }) {
+  const tone = riskTone(agent.riskLevel);
+  return (
+    <Link
+      to={agentAssetHref(agent, filter)}
+      className={cn(
+        "group flex min-h-[190px] flex-col rounded-lg border bg-white/[0.025] p-3.5 transition hover:-translate-y-0.5 hover:bg-white/[0.045] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300/60",
+        tone.border,
+      )}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <AgentAssetIdentityInline agent={agent} showClassification className="min-w-0" />
+        <StatusPill level={agent.riskLevel} label={agent.riskLevelText} />
+      </div>
+
+      <div className="mt-3 grid grid-cols-3 gap-1.5">
+        {[
+          { label: "事件", value: agent.eventCount },
+          { label: "风险事件", value: agent.riskyEventCount },
+          { label: "待处理风险", value: agent.openIncidentCount },
+        ].map((item) => (
+          <div key={item.label} className="rounded-md border border-white/[0.07] bg-black/15 px-2 py-2">
+            <p className="truncate text-[9px] text-zinc-600">{item.label}</p>
+            <p className="mt-0.5 text-sm font-semibold tabular-nums text-zinc-200">{formatNumber(item.value)}</p>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-3 min-h-10 rounded-md border border-white/[0.07] bg-black/15 px-2.5 py-2">
+        <p className="text-[9px] text-zinc-600">{agent.riskyEventCount > 0 ? "最近风险" : "最近活动"}</p>
+        <p className="mt-0.5 line-clamp-1 text-[11px] text-zinc-400" title={agent.lastEventSubject || "暂无活动摘要"}>
+          {agent.lastEventSubject || "暂无活动摘要"}
+        </p>
+      </div>
+
+      <div className="mt-auto flex items-center justify-between gap-3 pt-3 text-[10px] text-zinc-600">
+        <span>最近活动 {agentActivityLabel(agent.lastSeen)}</span>
+        <span className="font-medium text-teal-300 transition group-hover:text-teal-200">查看详情 →</span>
+      </div>
+    </Link>
+  );
+}
 
 function streamWorkspacePath(value: string): string {
   const path = value.trim();
@@ -1974,17 +2070,35 @@ function groupCompositeIncidents(judgments: CompositeJudgment[]): CompositeIncid
     .sort((left, right) => right.lastSeenAt - left.lastSeenAt);
 }
 
-function StreamShadowPanel({
+function AgentRiskOverviewPanel({
+  inventory,
   findings,
-  error,
+  inventoryError,
+  findingsError,
+  filter,
 }: {
+  inventory?: AgentInventory | null;
   findings?: StreamFindingList | null;
-  error?: string;
+  inventoryError?: string;
+  findingsError?: string;
+  filter: SecurityTimeFilter;
 }) {
   const { locale, t } = useI18n();
+  const [view, setView] = useState<AgentRiskView>("assets");
   const [tab, setTab] = useState<StreamPanelTab>("profiles");
   const [showSafe, setShowSafe] = useState(false);
   const [showSynthetic, setShowSynthetic] = useState(false);
+  const [visibleAgentCount, setVisibleAgentCount] = useState(8);
+  const agentAssets = useMemo(() => (inventory?.items ?? [])
+    .filter((agent) => agent.classification === "confirmed_agent" || agent.classification === "probable_agent")
+    .sort((a, b) =>
+      AGENT_CLASSIFICATION_ORDER[a.classification] - AGENT_CLASSIFICATION_ORDER[b.classification]
+      || (AGENT_RISK_ORDER[a.riskLevel] ?? 6) - (AGENT_RISK_ORDER[b.riskLevel] ?? 6)
+      || b.openIncidentCount - a.openIncidentCount
+      || b.riskyEventCount - a.riskyEventCount
+      || dayjs(b.lastSeen).valueOf() - dayjs(a.lastSeen).valueOf()), [inventory?.items]);
+  const visibleAgentAssets = agentAssets.slice(0, visibleAgentCount);
+  const agentAssetTotal = inventory?.summary.totalAgents ?? agentAssets.length;
   const profileViews = useMemo(() => {
     const groups = new Map<string, StreamFindingList["riskProfiles"]>();
     for (const profile of findings?.riskProfiles ?? []) {
@@ -1994,9 +2108,10 @@ function StreamShadowPanel({
       groups.set(key, history);
     }
     return [...groups.values()]
-      .map((history) => {
+      .flatMap((history) => {
         history.sort((a, b) => b.calculatedAt - a.calculatedAt);
-        return { profile: history[0], previousScore: history[1]?.riskScore };
+        const profile = history[0];
+        return profile ? [{ profile, previousScore: history[1]?.riskScore }] : [];
       })
       .sort((a, b) => Math.max(0, b.profile.riskScore) - Math.max(0, a.profile.riskScore));
   }, [findings?.riskProfiles]);
@@ -2037,7 +2152,6 @@ function StreamShadowPanel({
     ...productionCompositeJudgments.map((judgment) => judgment.updateJudgedAt ?? judgment.judgedAt),
   );
   const ruleVersions = [...new Set(profileViews.map(({ profile }) => profile.ruleVersion).filter(Boolean))];
-
   const tabs: Array<{ key: StreamPanelTab; label: string; count?: number }> = [
     { key: "profiles", label: "风险画像", count: riskyProfiles.length },
     { key: "composites", label: "复合攻击链", count: productionCompositeIncidents.length },
@@ -2046,18 +2160,93 @@ function StreamShadowPanel({
 
   return (
     <Panel
-      title="Flink 实时风险关联"
+      title="智能体风险概览"
       icon={Sparkles}
+      action={
+        <Link to={allAgentsHref(filter)} className="text-xs text-teal-300 transition hover:text-teal-200">
+          {t("查看全部智能体")} →
+        </Link>
+      }
     >
       <div className="space-y-4 p-4">
-        <InlineError message={error} />
-        {!findings?.enabled ? (
-          <div className="rounded-md border border-dashed border-white/10 px-4 py-10 text-center">
-            <p className="text-sm font-medium text-zinc-300">{t("流式分析当前未启用")}</p>
-            <p className="mt-1 text-xs text-zinc-600">{t("现有 L1 / L2 / L3 研判链路不受影响")}</p>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <p className="text-xs text-zinc-500">{t("集中查看智能体身份、运行状态与近期关联风险")}</p>
+          <div className="inline-flex rounded-md border border-white/10 bg-black/20 p-1" aria-label="智能体风险概览视角">
+            {([
+              { key: "assets" as const, label: t("智能体资产"), count: agentAssetTotal },
+              { key: "window" as const, label: t("时间窗分析"), count: profileViews.length },
+            ]).map((item) => (
+              <button
+                key={item.key}
+                type="button"
+                onClick={() => setView(item.key)}
+                aria-pressed={view === item.key}
+                className={cn(
+                  "rounded px-3 py-1.5 text-xs transition",
+                  view === item.key ? "bg-teal-300/15 text-teal-100 shadow-sm" : "text-zinc-500 hover:text-zinc-300",
+                )}
+              >
+                {item.label} · {item.count}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {view === "assets" ? (
+          <div className="space-y-4">
+            <InlineError message={inventoryError} />
+            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+              {[
+                { label: "智能体", value: agentAssetTotal, detail: "已确认与候选身份" },
+                { label: "活跃", value: inventory?.summary.activeAgents ?? 0, detail: "当前时间范围内有活动" },
+                { label: "存在风险", value: inventory?.summary.riskyAgents ?? 0, detail: "包含风险事件" },
+                { label: "待处理风险", value: inventory?.summary.openIncidentAgents ?? 0, detail: "需要进一步处置" },
+              ].map((item) => (
+                <div key={item.label} className="rounded-md border border-white/10 bg-white/[0.025] px-3 py-2.5">
+                  <p className="text-[11px] text-zinc-500">{item.label}</p>
+                  <p className="mt-1 text-lg font-semibold tabular-nums text-zinc-100">{formatNumber(item.value)}</p>
+                  <p className="mt-0.5 text-[10px] text-zinc-600">{item.detail}</p>
+                </div>
+              ))}
+            </div>
+
+            {agentAssets.length === 0 ? (
+              <EmptyState label="暂无已确认或候选智能体" />
+            ) : (
+              <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-4">
+                {visibleAgentAssets.map((agent) => (
+                  <AgentOverviewCard key={agent.agentAssetId} agent={agent} filter={filter} />
+                ))}
+              </div>
+            )}
+
+            <div className="flex flex-wrap items-center justify-center gap-4 border-t border-white/[0.07] pt-3">
+              {agentAssets.length > 8 && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setVisibleAgentCount((count) => count >= agentAssets.length ? 8 : Math.min(agentAssets.length, count + 8))}
+                  className="border-white/10 bg-white/[0.025] text-xs text-zinc-300 hover:bg-white/[0.06]"
+                >
+                  {visibleAgentCount >= agentAssets.length ? "收起" : `显示更多（剩余 ${agentAssets.length - visibleAgentAssets.length}）`}
+                </Button>
+              )}
+              <Link to={allAgentsHref(filter)} className="text-xs text-teal-300 hover:text-teal-200">
+                进入智能体资产 →
+              </Link>
+            </div>
           </div>
         ) : (
-          <>
+          <div className="space-y-4">
+            <InlineError message={findingsError} />
+            {!findings?.enabled ? (
+              <div className="rounded-md border border-dashed border-white/10 px-4 py-10 text-center">
+                <p className="text-sm font-medium text-zinc-300">{t("流式分析当前未启用")}</p>
+                <p className="mt-1 text-xs text-zinc-600">{t("现有 L1 / L2 / L3 研判链路不受影响")}</p>
+              </div>
+            ) : (
+              <>
             <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
               {[
                 { label: "Agent 资产", value: profileViews.length, detail: "按 Agent + Workspace 聚合" },
@@ -2103,7 +2292,7 @@ function StreamShadowPanel({
                   )}
                 </div>
                 {visibleProfiles.length === 0 ? (
-                  <EmptyState label={safeProfiles.length ? "当前没有风险资产" : "暂无流式风险画像"} />
+                  <EmptyState label={safeProfiles.length ? "当前没有风险画像" : "暂无时间窗风险画像"} />
                 ) : (
                   <div className="grid gap-3 xl:grid-cols-2">
                     {visibleProfiles.map(({ profile, previousScore }) => {
@@ -2229,10 +2418,10 @@ function StreamShadowPanel({
                     : "未发现攻击链";
                   const resultLabel = pending ? "待研判" : failed
                     ? judgment.status === "timeout" ? "超时" : "失败"
-                    : blocked ? "已确认攻击"
-                    : judgment.classification === "suspicious" ? "可疑"
-                    : judgment.classification === "authorized_admin" ? "授权运维"
-                    : judgment.classification === "simulation" ? "测试演练"
+                    : blocked ? "高风险"
+                    : judgment.classification === "suspicious" ? "可疑关联"
+                    : judgment.classification === "authorized_admin" ? "授权操作"
+                    : judgment.classification === "simulation" ? "测试行为"
                     : "安全";
                   return (
                     <div key={`${judgment.episodeId}-${judgment.revision}`} className={cn("rounded-lg border p-4", border)}>
@@ -2370,7 +2559,9 @@ function StreamShadowPanel({
                 </div>
               </div>
             )}
-          </>
+              </>
+            )}
+          </div>
         )}
       </div>
     </Panel>
@@ -2625,20 +2816,28 @@ function shortId(value?: string) {
   return value.length > 18 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value;
 }
 
-function eventAgentLabel(event: AgentEventListItem) {
-  return event.attribution?.agentDisplayName || event.attribution?.agentScopeId || event.agentId;
-}
-
-function eventSessionLabel(event: AgentEventListItem) {
-  return event.attribution?.agentSessionId || event.sessionId;
-}
-
-function eventDetailHref(event: AgentEventListItem) {
+function eventDetailHref(event: AgentEventListItem, timeFilter: SecurityTimeFilter) {
   const qs = new URLSearchParams({
     eventId: event.eventId,
-    traceId: event.traceId,
-    timeType: "last_3h",
+    timeType: timeFilter.timeType ?? "last_3h",
   });
+  if (timeFilter.startTime) qs.set("startTime", timeFilter.startTime);
+  if (timeFilter.endTime) qs.set("endTime", timeFilter.endTime);
+  if (event.traceId) qs.set("traceId", event.traceId);
+  if (event.runId) qs.set("runId", event.runId);
+  if (event.sessionId) qs.set("sessionId", event.sessionId);
+  if (event.agentId) qs.set("agentId", event.agentId);
+  if (event.agentAssetId) qs.set("agentAssetId", event.agentAssetId);
+  if (event.workspacePath) qs.set("workspacePath", event.workspacePath);
+  if (event.eventKind) qs.set("eventKind", event.eventKind);
+  const sourceId =
+    event.sourceId ??
+    (typeof event.attributes.sourceId === "string" ? event.attributes.sourceId : undefined);
+  const collectorId =
+    event.collectorId ??
+    (typeof event.attributes.collectorId === "string" ? event.attributes.collectorId : undefined);
+  if (sourceId) qs.set("sourceId", sourceId);
+  if (collectorId) qs.set("collectorId", collectorId);
   return `/events?${qs.toString()}`;
 }
 
@@ -2708,8 +2907,8 @@ function TimelineScopeTabs({
 }) {
   const { t } = useI18n();
   const options: Array<{ value: TimelineScope; label: string }> = [
-    { value: "agent", label: "Agent 事件" },
-    { value: "raw", label: "全部事件" },
+    { value: "agent", label: "已识别 Agent" },
+    { value: "raw", label: "全部观测" },
   ];
 
   return (
@@ -2738,15 +2937,21 @@ function AgentEventTimelinePanel({
   error,
   scope,
   tier,
+  includeUnknown,
+  timeFilter,
   onScopeChange,
   onTierChange,
+  onIncludeUnknownChange,
 }: {
   events?: AgentEventList | null;
   error?: string;
   scope: TimelineScope;
   tier: TimelineTierFilter;
+  includeUnknown: boolean;
+  timeFilter: SecurityTimeFilter;
   onScopeChange: (value: TimelineScope) => void;
   onTierChange: (value: TimelineTierFilter) => void;
+  onIncludeUnknownChange: (value: boolean) => void;
 }) {
   const { locale, t } = useI18n();
   const items = events?.items ?? [];
@@ -2758,6 +2963,21 @@ function AgentEventTimelinePanel({
       action={
         <div className="flex items-center gap-3">
           <TimelineScopeTabs value={scope} onChange={onScopeChange} />
+          {scope === "raw" ? (
+            <button
+              type="button"
+              aria-pressed={includeUnknown}
+              onClick={() => onIncludeUnknownChange(!includeUnknown)}
+              className={cn(
+                "h-8 rounded-md border px-2.5 text-xs font-semibold transition-colors",
+                includeUnknown
+                  ? "border-teal-400/30 bg-teal-400/10 text-teal-100"
+                  : "border-white/10 bg-white/5 text-zinc-500 hover:text-zinc-200",
+              )}
+            >
+              {includeUnknown ? "包含 Unknown" : "隐藏 Unknown"}
+            </button>
+          ) : null}
           <Select value={tier} onValueChange={(value) => onTierChange(value as TimelineTierFilter)}>
             <SelectTrigger className="h-8 w-[112px] border-white/10 bg-white/5 text-xs text-zinc-100" aria-label={locale === "en" ? "Filter judgment tier" : "筛选研判层级"}>
               <SelectValue />
@@ -2782,22 +3002,23 @@ function AgentEventTimelinePanel({
           <EmptyState label="暂无事件明细" />
         ) : (
           <div className="overflow-x-auto">
-            <div className="grid min-w-[1070px] grid-cols-[96px_88px_minmax(240px,1.4fr)_minmax(150px,0.9fr)_minmax(150px,0.9fr)_66px_82px_76px] gap-3 border-b border-white/10 pb-2 text-xs text-zinc-500">
+            <div className="grid min-w-[1140px] grid-cols-[96px_88px_minmax(240px,1.4fr)_minmax(150px,0.9fr)_minmax(150px,0.9fr)_66px_82px_76px_62px] gap-3 border-b border-white/10 pb-2 text-xs text-zinc-500">
               <span>{locale === "en" ? "Time" : "时间"}</span>
               <span>{locale === "en" ? "Type" : "类型"}</span>
               <span>{locale === "en" ? "Event" : "事件"}</span>
-              <span>{locale === "en" ? "Agent / Session" : "智能体 / 会话"}</span>
+              <span>Agent</span>
               <span>Trace / Span</span>
               <span className="text-center">{locale === "en" ? "Tier" : "研判"}</span>
               <span className="text-right">{locale === "en" ? "Risk" : "风险"}</span>
               <span className="text-center">{locale === "en" ? "Action" : "处置"}</span>
+              <span className="text-right">{locale === "en" ? "Details" : "详情"}</span>
             </div>
-            <div className="min-w-[1070px] divide-y divide-white/8">
+            <div className="min-w-[1140px] divide-y divide-white/8">
               {items.map((event) => (
                 <Link
                   key={event.eventId}
-                  to={eventDetailHref(event)}
-                  className="grid grid-cols-[96px_88px_minmax(240px,1.4fr)_minmax(150px,0.9fr)_minmax(150px,0.9fr)_66px_82px_76px] items-center gap-3 py-3 text-sm"
+                  to={eventDetailHref(event, timeFilter)}
+                  className="group grid grid-cols-[96px_88px_minmax(240px,1.4fr)_minmax(150px,0.9fr)_minmax(150px,0.9fr)_66px_82px_76px_62px] items-center gap-3 py-3 text-sm transition hover:bg-white/[0.03]"
                 >
                   <span className="font-mono text-xs text-zinc-500">{formatDate(event.at)}</span>
                   <span className="flex min-w-0">
@@ -2812,9 +3033,8 @@ function AgentEventTimelinePanel({
                       {event.eventKind} · {t(riskEventName(event.riskCategory))} · {event.source}
                     </p>
                   </div>
-                  <div className="min-w-0 font-mono text-xs">
-                    <p className="truncate text-zinc-300" title={eventAgentLabel(event)}>{eventAgentLabel(event)}</p>
-                    <p className="mt-0.5 truncate text-zinc-600" title={eventSessionLabel(event)}>{eventSessionLabel(event)}</p>
+                  <div className="min-w-0 text-xs">
+                    <AgentIdentityInline event={event} />
                   </div>
                   <div className="min-w-0 font-mono text-xs">
                     <p className="truncate text-zinc-300" title={event.traceId}>{shortId(event.traceId)}</p>
@@ -2828,6 +3048,9 @@ function AgentEventTimelinePanel({
                   </span>
                   <span className="flex justify-center">
                     <VerdictPill verdict={event.verdict} />
+                  </span>
+                  <span className="text-right text-xs font-semibold text-teal-300 transition group-hover:text-teal-200">
+                    详情 →
                   </span>
                 </Link>
               ))}
@@ -2945,6 +3168,7 @@ export default function SecurityMonitorPage() {
   );
   const [timelineScope, setTimelineScope] = useState<TimelineScope>("agent");
   const [timelineTier, setTimelineTier] = useState<TimelineTierFilter>("all");
+  const [timelineIncludeUnknown, setTimelineIncludeUnknown] = useState(true);
   const [overviewScope, setOverviewScope] = useState<TimelineScope>("agent");
   const [scanScope, setScanScope] = useState<TimelineScope>("agent");
   const [riskBreakdownScope, setRiskBreakdownScope] = useState<TimelineScope>("agent");
@@ -2960,11 +3184,12 @@ export default function SecurityMonitorPage() {
     scanScope,
     timelineScope,
     timelineTier,
+    timelineIncludeUnknown,
     riskBreakdownScope,
     decisionFunnelScope,
     workspaceRiskScope,
   ), {
-    refreshDeps: [requestFilter, refreshVersion, overviewScope, scanScope, timelineScope, timelineTier, riskBreakdownScope, decisionFunnelScope, workspaceRiskScope],
+    refreshDeps: [requestFilter, refreshVersion, overviewScope, scanScope, timelineScope, timelineTier, timelineIncludeUnknown, riskBreakdownScope, decisionFunnelScope, workspaceRiskScope],
     pollingInterval: 10000,
     pollingWhenHidden: false,
   });
@@ -3040,7 +3265,13 @@ export default function SecurityMonitorPage() {
 
               {activeView === "stream" && (
                 <DashboardSection title="流式复合研判" icon={Sparkles}>
-                  <StreamShadowPanel findings={data?.streamFindings} error={data?.errors.streamFindings} />
+                  <AgentRiskOverviewPanel
+                    inventory={data?.agentInventory}
+                    findings={data?.streamFindings}
+                    inventoryError={data?.errors.agentInventory}
+                    findingsError={data?.errors.streamFindings}
+                    filter={filter}
+                  />
                 </DashboardSection>
               )}
 
@@ -3061,8 +3292,11 @@ export default function SecurityMonitorPage() {
                     error={data?.errors.events}
                     scope={timelineScope}
                     tier={timelineTier}
+                    includeUnknown={timelineIncludeUnknown}
+                    timeFilter={filter}
                     onScopeChange={setTimelineScope}
                     onTierChange={setTimelineTier}
+                    onIncludeUnknownChange={setTimelineIncludeUnknown}
                   />
                 </DashboardSection>
               )}

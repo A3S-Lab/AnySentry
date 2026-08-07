@@ -5,6 +5,8 @@ import { AggregationService } from './aggregation.service';
 import { AlertingService } from './alerting.service';
 import { AuditService } from './audit.service';
 import { IngestionSourceService } from './ingestion-source.service';
+import { IdentityEvidenceService } from './identity-evidence.service';
+import { IdentityReviewAgentService } from './identity-review-agent.service';
 import { JudgmentQueueService } from './judgment-queue.service';
 import { DecisionResultApplyService } from './decision-result-apply.service';
 import { KubeIdentityService } from './kube-identity.service';
@@ -19,9 +21,10 @@ import { SentryJudgeService } from './sentry-judge.service';
 import { StreamingFindingService } from './streaming-finding.service';
 import { StreamingQueueService } from './streaming-queue.service';
 import { SupplyChainService } from './supply-chain.service';
+import { RuntimeModelConfigService } from './runtime-model-config';
 
 @Module({
   controllers: [SecurityMonitoringController],
-  providers: [AgentAttributionService, AgentMetadataService, AlertingService, AuditService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, SentryJudgeService, AggregationService, RemediationService, KubeIdentityService, ManagementAuthGuard, JudgmentQueueService, DecisionResultApplyService, StreamingQueueService, StreamingFindingService, SupplyChainService, SecurityAssistantService],
+  providers: [AgentAttributionService, AgentMetadataService, AlertingService, AuditService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, SentryJudgeService, AggregationService, IdentityEvidenceService, RuntimeModelConfigService, IdentityReviewAgentService, RemediationService, KubeIdentityService, ManagementAuthGuard, JudgmentQueueService, DecisionResultApplyService, StreamingQueueService, StreamingFindingService, SupplyChainService, SecurityAssistantService],
 })
 export class SecurityMonitoringModule {}

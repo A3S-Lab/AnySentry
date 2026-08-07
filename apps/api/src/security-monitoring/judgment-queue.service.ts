@@ -45,7 +45,7 @@ export class JudgmentQueueService implements OnModuleDestroy {
 
   async enqueueFast(job: FastJudgeJob): Promise<void> {
     if (!this.fastQueue) throw new Error('asynchronous judgment queue is disabled');
-    await this.fastQueue.add('judge-through-l2', job, {
+    await this.fastQueue.add('judge-by-identity-route', job, {
       jobId: job.evaluationId,
       attempts: 2,
       backoff: { type: 'exponential', delay: 5_000 },

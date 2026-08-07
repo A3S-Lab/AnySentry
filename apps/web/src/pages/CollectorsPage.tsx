@@ -259,6 +259,37 @@ function CollectorDetail({ collector, timeType }: { collector?: CollectorHealthI
         </div>
 
         <div className="rounded-md border border-white/10 bg-white/[0.03] p-3">
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <RadioTower className="size-4 text-teal-200" />
+              <h3 className="text-sm font-semibold text-zinc-100">Agent Filter</h3>
+            </div>
+            <Pill className="border-teal-400/25 bg-teal-500/10 text-teal-100">
+              {collector.filterMetrics.scope}
+            </Pill>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <MetricTile label="Observed / Forwarded" value={`${collector.filterMetrics.observed} / ${collector.filterMetrics.forwarded}`} tone="border-white/10 bg-white/[0.03] text-zinc-100" />
+            <MetricTile label="Confirmed / Probable" value={`${collector.filterMetrics.confirmedAgent} / ${collector.filterMetrics.probableAgent}`} tone="border-teal-400/25 bg-teal-500/10 text-teal-100" />
+            <MetricTile label="Unknown / Non-Agent" value={`${collector.filterMetrics.unknown} / ${collector.filterMetrics.nonAgent}`} tone="border-amber-400/25 bg-amber-500/10 text-amber-100" />
+            <MetricTile label="Behavior Candidates" value={collector.filterMetrics.behaviorCandidates} tone="border-violet-400/25 bg-violet-500/10 text-violet-100" />
+          </div>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <FieldValue label="Filtered Non-Agent" value={collector.filterMetrics.filteredNonAgent} />
+            <FieldValue label="Shadow Would Filter" value={collector.filterMetrics.wouldFilterNonAgent + collector.filterMetrics.wouldFilterNoise + collector.filterMetrics.wouldDiscoveryBudgetDrop} />
+            <FieldValue label="Discovery Budget Drop" value={collector.filterMetrics.discoveryBudgetDropped} />
+            <FieldValue label="Deduplicated / Queue Drop" value={`${collector.filterMetrics.deduplicated} / ${collector.filterMetrics.queueDropped}`} />
+            <FieldValue label="Identity Cache" value={`${collector.filterMetrics.identityCacheEntries} identities · ${collector.filterMetrics.identityCgroupHits}/${collector.filterMetrics.identityCgroupMisses} cgroup hit/miss`} />
+            <FieldValue label="Docker" value={collector.filterMetrics.dockerEnabled ? `${collector.filterMetrics.dockerReady ? "ready" : "starting"} · ${collector.filterMetrics.dockerEntries}` : "off"} />
+            <FieldValue label="Templates" value={`${collector.filterMetrics.templateLoaded} loaded · ${collector.filterMetrics.templateMatches} matches`} />
+            <FieldValue
+              label="Process Cache / Tombstone"
+              value={`${collector.filterMetrics.processCacheEntries} / ${collector.filterMetrics.processTombstones} · proc ${collector.filterMetrics.processBootstrapProcReads} bootstrap + ${collector.filterMetrics.processFallbackProcReads + collector.filterMetrics.processAncestryProcReads} hot`}
+            />
+          </div>
+        </div>
+
+        <div className="rounded-md border border-white/10 bg-white/[0.03] p-3">
           <div className="mb-3 flex items-center gap-2">
             <TerminalSquare className="size-4 text-teal-200" />
             <h3 className="text-sm font-semibold text-zinc-100">事件类型</h3>

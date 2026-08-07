@@ -287,36 +287,44 @@ async function verifyIncidents() {
 }
 
 async function verifyAgentsAndWorkspaces() {
-  await request(`/agents/${encodeURIComponent(ids.agentA)}/metadata`, 'PUT', {
-    workspacePath: ids.workspaceAgents,
-    displayName: `${runId} Agent A`,
-    owner: `${runId}-owner-a`,
-    environment: 'dev',
-    criticality: 'low',
-    tags: [runId],
-  });
-  await request(`/agents/${encodeURIComponent(ids.agentB)}/metadata`, 'PUT', {
-    workspacePath: ids.workspaceAgents,
-    displayName: `${runId} Agent B`,
-    owner: `${runId}-owner-b`,
-    environment: 'dev',
-    criticality: 'low',
-    tags: [runId],
-  });
-  await request(`/agents/${encodeURIComponent(`${runId}-workspace-agent-a`)}/metadata`, 'PUT', {
-    workspacePath: ids.workspaceA,
-    displayName: `${runId} Workspace A`,
-    environment: 'dev',
-    criticality: 'low',
-    tags: [runId],
-  });
-  await request(`/agents/${encodeURIComponent(`${runId}-workspace-agent-b`)}/metadata`, 'PUT', {
-    workspacePath: ids.workspaceB,
-    displayName: `${runId} Workspace B`,
-    environment: 'dev',
-    criticality: 'low',
-    tags: [runId],
-  });
+  const workspaceAgentA = `${runId}-workspace-agent-a`;
+  const workspaceAgentB = `${runId}-workspace-agent-b`;
+  const fixtures = [
+    [ids.agentA, ids.workspaceAgents, `${runId} Agent A`, `${runId}-owner-a`],
+    [ids.agentB, ids.workspaceAgents, `${runId} Agent B`, `${runId}-owner-b`],
+    [workspaceAgentA, ids.workspaceA, `${runId} Workspace A`, undefined],
+    [workspaceAgentB, ids.workspaceB, `${runId} Workspace B`, undefined],
+  ];
+  for (const [agentId, workspacePath, displayName, owner] of fixtures) {
+    const physicalWorkloadId = `deep-link:${workspacePath}:${agentId}`;
+    const metadata = await request(`/agents/${encodeURIComponent(agentId)}/metadata`, 'PUT', {
+      workspacePath,
+      identityKeys: [agentId, physicalWorkloadId],
+      physicalWorkloadId,
+      agentInstanceId: `deep-link:${agentId}`,
+      displayName,
+      owner,
+      environment: 'dev',
+      criticality: 'low',
+      tags: [runId],
+    });
+    await request(`/agents/${encodeURIComponent(agentId)}/review`, 'PUT', {
+      workspacePath,
+      agentAssetId: metadata.agentAssetId,
+      decision: 'confirmed_agent',
+      currentClassification: 'unknown',
+      identityKeys: [agentId],
+      agentInstanceId: `deep-link:${agentId}`,
+      physicalWorkloadId,
+      workloadRef: {
+        environment: 'host',
+        kind: 'process',
+        name: agentId,
+        processName: agentId,
+      },
+      note: 'confirmed by deep-link verifier',
+    });
+  }
 
   const exactAgent = await request('/agents/inventory', 'POST', { timeType: 'last_30d', agentId: ids.agentA, workspacePath: ids.workspaceAgents, limit: 20 });
   const pinnedAgent = await request('/agents/inventory', 'POST', { timeType: 'last_30d', agentId: ids.agentA, workspacePath: ids.workspaceAgents, healthState: 'stale', q: ids.agentB, limit: 20 });

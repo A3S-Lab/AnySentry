@@ -9,6 +9,7 @@ import {
   CalendarClock,
   CheckCircle2,
   GitBranch,
+  KeyRound,
   LayoutDashboard,
   LoaderCircle,
   type LucideIcon,
@@ -37,9 +38,13 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import {
   type L1Rule,
   type L2Config,
+  type DeepModelConfig,
   type L3Config,
+  type ModelConnectionProfile,
+  type ModelConnectionStatus,
   type PolicyConfig,
   type PolicyConfigResponse,
+  type PolicyConnectivityResult,
   type PolicySimulationDiff,
   type PolicySimulationResult,
   type PolicyStatus,
@@ -94,6 +99,11 @@ const SPECULATE_OPTIONS: Array<{ value: PolicyConfig["speculate"]; label: string
   { value: "high", label: "高 (high)" },
 ];
 
+const CANDIDATE_PIPELINE_OPTIONS: Array<{ value: PolicyConfig["identity"]["candidatePipeline"]; label: string }> = [
+  { value: "full", label: "完整分级研判（默认）" },
+  { value: "l1_only", label: "仅执行 L1" },
+];
+
 const TIME_OPTIONS: Array<{ value: SecurityTimeType; label: string }> = [
   { value: "last_3h", label: "近3小时" },
   { value: "last_1d", label: "近一天" },
@@ -130,7 +140,19 @@ const NEW_RULE: L1Rule = {
 };
 
 const DEFAULT_L2: L2Config = { url: "", model: "", timeoutS: 20 };
-const DEFAULT_L3: L3Config = { bin: "a3s-code", skills: "" };
+const DEFAULT_DEEP_MODEL: DeepModelConfig = { url: "", model: "", timeoutS: 90, contextTokens: 32768 };
+const DEFAULT_L3: L3Config = { bin: "/opt/anysentry/l3-agent.mjs", skills: "/opt/anysentry/skills" };
+
+interface ConnectivityViewState {
+  loading: boolean;
+  applying: boolean;
+  result: PolicyConnectivityResult | null;
+}
+
+const EMPTY_CONNECTIVITY: Record<ModelConnectionProfile, ConnectivityViewState> = {
+  fast_review: { loading: false, applying: false, result: null },
+  deep_investigation: { loading: false, applying: false, result: null },
+};
 
 const MONITORING_NAV_ITEMS = [
   { view: "overview", label: "运行总览", description: "平台健康与实时状态", icon: Activity },
@@ -193,6 +215,38 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
       {children}
       {hint ? <span className="text-[11px] text-zinc-600">{hint}</span> : null}
     </label>
+  );
+}
+
+function IdentityJudgmentSection({
+  value,
+  onChange,
+}: {
+  value: PolicyConfig["identity"];
+  onChange: (next: PolicyConfig["identity"]) => void;
+}) {
+  return (
+    <Panel title="身份研判路由" icon={Bot} description="身份保留、页面可见性与风险研判层级相互独立。">
+      <div className="grid gap-4 p-4 lg:grid-cols-3">
+        <div className="rounded-md border border-emerald-400/20 bg-emerald-400/5 p-3">
+          <p className="text-sm font-medium text-emerald-100">已确认 Agent</p>
+          <p className="mt-1 text-xs text-zinc-500">固定使用完整分级链路；只有上一层升级时才进入已配置的 L2/L3。</p>
+        </div>
+        <div className="rounded-md border border-amber-400/20 bg-amber-400/5 p-3">
+          <Field label="候选 Agent" hint="默认完整分级；可在成本敏感环境限制为只执行确定性 L1。">
+            <SelectField
+              value={value.candidatePipeline}
+              onChange={(candidatePipeline) => onChange({ candidatePipeline })}
+              options={CANDIDATE_PIPELINE_OPTIONS}
+            />
+          </Field>
+        </div>
+        <div className="rounded-md border border-zinc-400/20 bg-white/[0.03] p-3">
+          <p className="text-sm font-medium text-zinc-200">尚未识别</p>
+          <p className="mt-1 text-xs text-zinc-500">固定仅执行 L1；升级和高风险证据保留，但不调用 L2/L3。</p>
+        </div>
+      </div>
+    </Panel>
   );
 }
 
@@ -476,93 +530,117 @@ function L1RulesSection({ rules, onChange }: { rules: L1Rule[]; onChange: (next:
   );
 }
 
-// ── L2 / L3 sections ─────────────────────────────────────────────────────────
-function L2Section({ value, onChange }: { value: L2Config | null; onChange: (next: L2Config | null) => void }) {
+// ── Model connections ───────────────────────────────────────────────────────
+function ConnectionControl({
+  profile,
+  state,
+  active,
+  apiKey,
+  onApiKeyChange,
+  onTest,
+  onApply,
+  onClear,
+}: {
+  profile: ModelConnectionProfile;
+  state: ConnectivityViewState;
+  active?: ModelConnectionStatus;
+  apiKey: string;
+  onApiKeyChange: (next: string) => void;
+  onTest: (profile: ModelConnectionProfile) => void;
+  onApply: (profile: ModelConnectionProfile) => void;
+  onClear: (profile: ModelConnectionProfile) => void;
+}) {
+  const result = state.result;
+  const connected = active?.state === "active";
+  const tone = result && !result.ok
+    ? "border-rose-400/25 bg-rose-500/10 text-rose-100"
+    : connected || result?.ok
+      ? "border-teal-400/25 bg-teal-500/10 text-teal-100"
+      : "border-white/10 bg-white/[0.03] text-zinc-400";
+  return (
+    <div className="space-y-3 rounded-md border border-white/10 bg-black/10 p-3">
+      <Field label="API Key" hint="仅用于本次测试与当前服务运行；不写入策略、数据库、日志或浏览器存储。服务重启后需重新配置。">
+        <Input
+          type="password"
+          autoComplete="new-password"
+          value={apiKey}
+          onChange={(event) => onApiKeyChange(event.target.value)}
+          placeholder={connected ? "已配置运行时凭据；输入新 Key 可替换" : "输入 API Key"}
+          className="h-8 border-white/10 bg-white/5 font-mono text-xs"
+        />
+      </Field>
+      <div className={cn("flex flex-col gap-3 rounded-md border px-3 py-3 lg:flex-row lg:items-center lg:justify-between", tone)}>
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 text-xs font-semibold">
+            {state.loading || state.applying ? <LoaderCircle className="size-3.5 animate-spin" />
+              : result && !result.ok ? <AlertTriangle className="size-3.5" />
+                : connected || result?.ok ? <CheckCircle2 className="size-3.5" /> : <KeyRound className="size-3.5" />}
+            <span>{state.loading ? "正在验证连接…" : state.applying ? "正在应用…" : result?.message ?? (connected ? "运行时连接已生效" : "尚未配置运行时凭据")}</span>
+          </div>
+          <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] opacity-75">
+            {result ? <><span>{result.model}</span><span>{result.latencyMs} ms</span><span className="break-all">{result.endpoint}</span></>
+              : connected ? <><span>{active?.model}</span><span>{active?.source === "environment" ? "部署配置" : "页面配置"}</span><span className="break-all">{active?.endpoint}</span></>
+                : <span>请先测试，成功后再应用</span>}
+          </div>
+        </div>
+        <div className="flex shrink-0 flex-wrap gap-2">
+          {connected ? <Button type="button" size="sm" variant="ghost" onClick={() => onClear(profile)} className="h-8 text-xs text-zinc-300 hover:bg-white/10">清除凭据</Button> : null}
+          <Button type="button" size="sm" variant="secondary" disabled={state.loading || state.applying || !apiKey.trim()} onClick={() => onTest(profile)} className="h-8 border border-white/10 bg-white/5 text-xs text-zinc-100 hover:bg-white/10">
+            {state.loading ? <LoaderCircle className="size-3.5 animate-spin" /> : <Zap className="size-3.5" />}测试连接
+          </Button>
+          {result?.ok && result.testToken ? (
+            <Button type="button" size="sm" disabled={state.applying} onClick={() => onApply(profile)} className="h-8 bg-teal-500 text-xs text-[#07100c] hover:bg-teal-400">应用配置</Button>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+interface ConnectionActions {
+  state: ConnectivityViewState;
+  active?: ModelConnectionStatus;
+  apiKey: string;
+  onApiKeyChange: (next: string) => void;
+  onTest: (profile: ModelConnectionProfile) => void;
+  onApply: (profile: ModelConnectionProfile) => void;
+  onClear: (profile: ModelConnectionProfile) => void;
+}
+
+function FastReviewSection({ value, onChange, state, ...actions }: { value: L2Config | null; onChange: (next: L2Config | null) => void } & ConnectionActions) {
   const enabled = value !== null;
   const config = value ?? DEFAULT_L2;
-
   return (
-    <Panel
-      title="L2 LLM 研判"
-      icon={Zap}
-      description="L1 规则升级时调用的 LLM 判官;后端不可达时优雅降级。需要可达的端点。"
-      action={<Switch checked={enabled} onChange={(next) => onChange(next ? { ...DEFAULT_L2 } : null)} />}
-    >
-      {enabled ? (
-        <div className="grid gap-4 p-4 md:grid-cols-2">
-          <Field label="端点 URL (url)" hint="OpenAI 兼容的 /chat/completions 端点">
-            <Input
-              value={config.url}
-              onChange={(event) => onChange({ ...config, url: event.target.value })}
-              placeholder="https://llm.internal/v1/chat/completions"
-              className="h-8 border-white/10 bg-white/5 font-mono text-xs"
-            />
-          </Field>
-          <Field label="模型 (model)">
-            <Input
-              value={config.model}
-              onChange={(event) => onChange({ ...config, model: event.target.value })}
-              placeholder="例如 glm5.1-w4a8"
-              className="h-8 border-white/10 bg-white/5 text-xs"
-            />
-          </Field>
-          <Field label="超时秒数 (timeoutS)" hint="推理模型可能较慢,建议留足余量">
-            <Input
-              type="number"
-              min={1}
-              max={120}
-              value={config.timeoutS}
-              onChange={(event) => onChange({ ...config, timeoutS: Number(event.target.value) })}
-              className="h-8 border-white/10 bg-white/5 text-xs"
-            />
-          </Field>
+    <Panel title="快速研判模型" icon={Zap} description="用于快速结构化风险研判，并复用于 AI 身份辅助审核的模型连接。两类任务的会话、提示词和权限相互隔离。" action={<Switch checked={enabled} onChange={(next) => onChange(next ? { ...DEFAULT_L2 } : null)} />}>
+      {enabled ? <div className="space-y-4 p-4">
+        <div className="grid gap-4 md:grid-cols-3">
+          <Field label="API 基础 URL" hint="填写到 /v1；完整接口地址会自动规范化。"><Input value={config.url} onChange={(event) => onChange({ ...config, url: event.target.value })} placeholder="https://api.example.com/v1" className="h-8 border-white/10 bg-white/5 font-mono text-xs" /></Field>
+          <Field label="模型名称"><Input value={config.model} onChange={(event) => onChange({ ...config, model: event.target.value })} placeholder="model-id" className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
+          <Field label="单次超时（秒）"><Input type="number" min={1} max={600} value={config.timeoutS} onChange={(event) => onChange({ ...config, timeoutS: Number(event.target.value) })} className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
         </div>
-      ) : (
-        <div className="px-4 py-5 text-xs text-zinc-500">未启用 — 升级研判时将跳过 L2。开启后填写端点信息。</div>
-      )}
+        <ConnectionControl profile="fast_review" state={state} {...actions} />
+      </div> : <div className="px-4 py-5 text-xs text-zinc-500">未启用 — 仅保留基础规则研判，AI 身份辅助审核不可用。</div>}
     </Panel>
   );
 }
 
-function L3Section({ value, onChange }: { value: L3Config | null; onChange: (next: L3Config | null) => void }) {
-  const enabled = value !== null;
-  const config = value ?? DEFAULT_L3;
-
+function DeepReviewSection({ model, agent, onModelChange, onAgentChange, state, ...actions }: { model: DeepModelConfig | null; agent: L3Config | null; onModelChange: (next: DeepModelConfig | null) => void; onAgentChange: (next: L3Config | null) => void } & ConnectionActions) {
+  const enabled = model !== null && agent !== null;
+  const config = model ?? DEFAULT_DEEP_MODEL;
+  const agentConfig = agent ?? DEFAULT_L3;
+  const toggle = (next: boolean) => { onModelChange(next ? { ...DEFAULT_DEEP_MODEL } : null); onAgentChange(next ? { ...DEFAULT_L3 } : null); };
   return (
-    <Panel
-      title="L3 a3s-code 深判"
-      icon={Bot}
-      description="L1 规则升级时调用的 a3s-code 智能体;运行时需存在 a3s-code 二进制,缺失则优雅降级。"
-      action={<Switch checked={enabled} onChange={(next) => onChange(next ? { ...DEFAULT_L3 } : null)} />}
-    >
-      {enabled ? (
-        <div className="space-y-4 p-4">
-          <div className="grid gap-4 md:grid-cols-2">
-            <Field label="二进制路径 (bin)" hint="运行时中 a3s-code 可执行文件的路径或命令名">
-              <Input
-                value={config.bin}
-                onChange={(event) => onChange({ ...config, bin: event.target.value })}
-                placeholder="a3s-code"
-                className="h-8 border-white/10 bg-white/5 font-mono text-xs"
-              />
-            </Field>
-            <Field label="技能目录 (skills)">
-              <Input
-                value={config.skills}
-                onChange={(event) => onChange({ ...config, skills: event.target.value })}
-                placeholder="/etc/anysentry/skills"
-                className="h-8 border-white/10 bg-white/5 font-mono text-xs"
-              />
-            </Field>
-          </div>
-          <div className="flex items-start gap-2 rounded-md border border-amber-400/25 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-100">
-            <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
-            <span>需要运行时中存在 a3s-code 二进制;若缺失,L3 将自动降级而不阻断流程。</span>
-          </div>
+    <Panel title="深度研判模型" icon={Bot} description="仅用于安全智能体的深度调查。它拥有独立连接、上下文预算和受限技能会话，不与快速研判共享凭据。" action={<Switch checked={enabled} onChange={toggle} />}>
+      {enabled ? <div className="space-y-4 p-4">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <Field label="API 基础 URL"><Input value={config.url} onChange={(event) => onModelChange({ ...config, url: event.target.value })} placeholder="https://api.example.com/v1" className="h-8 border-white/10 bg-white/5 font-mono text-xs" /></Field>
+          <Field label="模型名称"><Input value={config.model} onChange={(event) => onModelChange({ ...config, model: event.target.value })} placeholder="model-id" className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
+          <Field label="任务超时（秒）"><Input type="number" min={1} max={600} value={config.timeoutS} onChange={(event) => onModelChange({ ...config, timeoutS: Number(event.target.value) })} className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
+          <Field label="上下文上限"><Input type="number" min={4096} max={262144} value={config.contextTokens} onChange={(event) => onModelChange({ ...config, contextTokens: Number(event.target.value) })} className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
+          <Field label="安全技能目录" hint="深度调查只能使用该目录中的受限技能。"><Input value={agentConfig.skills} onChange={(event) => onAgentChange({ ...agentConfig, skills: event.target.value })} placeholder="/opt/anysentry/skills" className="h-8 border-white/10 bg-white/5 font-mono text-xs" /></Field>
         </div>
-      ) : (
-        <div className="px-4 py-5 text-xs text-zinc-500">未启用 — 升级研判时将跳过 L3。开启后填写二进制与技能目录。</div>
-      )}
+        <ConnectionControl profile="deep_investigation" state={state} {...actions} />
+      </div> : <div className="px-4 py-5 text-xs text-zinc-500">未启用 — 风险升级到深度调查时会明确记录“未配置”，不会伪装为完整研判成功。</div>}
     </Panel>
   );
 }
@@ -922,9 +1000,9 @@ function SimulationPanel({
 // ── Tier status strip ────────────────────────────────────────────────────────
 function StatusStrip({ status }: { status: PolicyStatus }) {
   const tiers: Array<{ key: keyof PolicyStatus; label: string; icon: LucideIcon }> = [
-    { key: "l1", label: "L1 规则", icon: ShieldCheck },
-    { key: "l2", label: "L2 LLM", icon: Zap },
-    { key: "l3", label: "L3 深判", icon: Bot },
+    { key: "l1", label: "基础规则", icon: ShieldCheck },
+    { key: "l2", label: "快速研判", icon: Zap },
+    { key: "l3", label: "深度研判", icon: Bot },
   ];
   return (
     <div className="flex flex-wrap items-center gap-2">
@@ -962,10 +1040,14 @@ export default function PolicyConfigPage() {
   const [supplyChain, setSupplyChain] = useState<SupplyChainControlResponse | null>(null);
   const [supplyDraft, setSupplyDraft] = useState<SupplyChainControlConfig | null>(null);
   const [savingSupplyChain, setSavingSupplyChain] = useState(false);
+  const [connectivity, setConnectivity] = useState<Record<ModelConnectionProfile, ConnectivityViewState>>(EMPTY_CONNECTIVITY);
+  const [connections, setConnections] = useState<PolicyConfigResponse["connections"] | null>(null);
+  const [apiKeys, setApiKeys] = useState<Record<ModelConnectionProfile, string>>({ fast_review: "", deep_investigation: "" });
 
   const applyResponse = useCallback((response: PolicyConfigResponse) => {
     setDraft(response.policy);
     setStatus(response.status);
+    setConnections(response.connections);
   }, []);
 
   const { loading, error, refresh } = useRequest(() => securityCenterApi.getConfig(), {
@@ -990,6 +1072,69 @@ export default function PolicyConfigPage() {
 
   const update = useCallback(<K extends keyof PolicyConfig>(key: K, value: PolicyConfig[K]) => {
     setDraft((prev) => (prev ? { ...prev, [key]: value } : prev));
+    if (key === "llm") setConnectivity((prev) => ({ ...prev, fast_review: EMPTY_CONNECTIVITY.fast_review }));
+    if (key === "agent" || key === "deepModel") setConnectivity((prev) => ({ ...prev, deep_investigation: EMPTY_CONNECTIVITY.deep_investigation }));
+  }, []);
+
+  const handleConnectivityTest = useCallback(async (profile: ModelConnectionProfile) => {
+    if (!draft) return;
+    const config = profile === "fast_review" ? draft.llm : draft.deepModel;
+    if (!config) return;
+    setConnectivity((prev) => ({ ...prev, [profile]: { ...(prev[profile] ?? EMPTY_CONNECTIVITY[profile]), loading: true, result: null } }));
+    try {
+      const result = await securityCenterApi.testModelConnection({
+        profile,
+        url: config.url,
+        model: config.model,
+        apiKey: apiKeys[profile],
+        timeoutS: config.timeoutS,
+        contextTokens: profile === "deep_investigation" ? draft.deepModel?.contextTokens ?? 32768 : 16384,
+      });
+      setConnectivity((prev) => ({ ...prev, [profile]: { loading: false, applying: false, result } }));
+    } catch (testError) {
+      setConnectivity((prev) => ({ ...prev, [profile]: { ...(prev[profile] ?? EMPTY_CONNECTIVITY[profile]), loading: false } }));
+      setToast({ kind: "error", message: `连接测试失败：${formatRequestError(testError)}` });
+    }
+  }, [apiKeys, draft]);
+
+  const handleApplyConnection = useCallback(async (profile: ModelConnectionProfile) => {
+    const token = connectivity[profile]?.result?.testToken;
+    if (!token) return;
+    setConnectivity((prev) => ({ ...prev, [profile]: { ...(prev[profile] ?? EMPTY_CONNECTIVITY[profile]), applying: true } }));
+    try {
+      const response = await securityCenterApi.applyModelConnection(profile, token);
+      setStatus(response.status);
+      setConnections(response.connections);
+      setDraft((previous) => previous
+        ? profile === "fast_review"
+          ? { ...previous, llm: response.policy.llm }
+          : { ...previous, deepModel: response.policy.deepModel, agent: response.policy.agent }
+        : response.policy);
+      setApiKeys((prev) => ({ ...prev, [profile]: "" }));
+      setConnectivity((prev) => ({ ...prev, [profile]: EMPTY_CONNECTIVITY[profile] }));
+      setToast({ kind: "success", message: `${profile === "fast_review" ? "快速研判模型" : "深度研判模型"}已实时生效` });
+    } catch (applyError) {
+      setConnectivity((prev) => ({ ...prev, [profile]: { ...(prev[profile] ?? EMPTY_CONNECTIVITY[profile]), applying: false } }));
+      setToast({ kind: "error", message: `应用失败：${formatRequestError(applyError)}` });
+    }
+  }, [connectivity]);
+
+  const handleClearConnection = useCallback(async (profile: ModelConnectionProfile) => {
+    try {
+      const response = await securityCenterApi.clearModelConnection(profile);
+      setStatus(response.status);
+      setConnections(response.connections);
+      setApiKeys((prev) => ({ ...prev, [profile]: "" }));
+      setConnectivity((prev) => ({ ...prev, [profile]: EMPTY_CONNECTIVITY[profile] }));
+      setToast({ kind: "success", message: "运行时凭据已清除" });
+    } catch (clearError) {
+      setToast({ kind: "error", message: `清除失败：${formatRequestError(clearError)}` });
+    }
+  }, []);
+
+  const handleApiKeyChange = useCallback((profile: ModelConnectionProfile, next: string) => {
+    setApiKeys((prev) => ({ ...prev, [profile]: next }));
+    setConnectivity((prev) => ({ ...prev, [profile]: EMPTY_CONNECTIVITY[profile] }));
   }, []);
 
   const handleSave = async () => {
@@ -1186,7 +1331,7 @@ export default function PolicyConfigPage() {
                 <Sparkles className="size-5 shrink-0 text-teal-300" />
                 <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">策略配置</h1>
               </div>
-              <p className="mt-0.5 truncate text-xs text-zinc-500">L1 规则 · L2 LLM 研判 · L3 a3s-code 深判</p>
+              <p className="mt-0.5 truncate text-xs text-zinc-500">基础规则 · 快速研判 · 深度研判</p>
             </div>
           </div>
           <div className="flex items-center gap-3">
@@ -1260,8 +1405,31 @@ export default function PolicyConfigPage() {
               />
 
               <L1RulesSection rules={draft.rules} onChange={(next) => update("rules", next)} />
-              <L2Section value={draft.llm} onChange={(next) => update("llm", next)} />
-              <L3Section value={draft.agent} onChange={(next) => update("agent", next)} />
+              <IdentityJudgmentSection value={draft.identity} onChange={(next) => update("identity", next)} />
+              <FastReviewSection
+                value={draft.llm}
+                onChange={(next) => update("llm", next)}
+                state={connectivity.fast_review ?? EMPTY_CONNECTIVITY.fast_review}
+                active={connections?.fast_review}
+                apiKey={apiKeys.fast_review}
+                onApiKeyChange={(next) => handleApiKeyChange("fast_review", next)}
+                onTest={handleConnectivityTest}
+                onApply={handleApplyConnection}
+                onClear={handleClearConnection}
+              />
+              <DeepReviewSection
+                model={draft.deepModel}
+                agent={draft.agent}
+                onModelChange={(next) => update("deepModel", next)}
+                onAgentChange={(next) => update("agent", next)}
+                state={connectivity.deep_investigation ?? EMPTY_CONNECTIVITY.deep_investigation}
+                active={connections?.deep_investigation}
+                apiKey={apiKeys.deep_investigation}
+                onApiKeyChange={(next) => handleApiKeyChange("deep_investigation", next)}
+                onTest={handleConnectivityTest}
+                onApply={handleApplyConnection}
+                onClear={handleClearConnection}
+              />
               <SupplyChainSection
                 value={supplyChain}
                 draft={supplyDraft}

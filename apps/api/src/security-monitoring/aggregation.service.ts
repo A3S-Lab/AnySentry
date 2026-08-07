@@ -1,7 +1,12 @@
 import { Injectable } from '@nestjs/common';
 import { Sentry } from '@a3s-lab/sentry';
 import { DashboardWindowBucketRow, DashboardWindowDimensionRow, DashboardWindowHistory } from './clickhouse-store';
+import {
+  detectedAgentIdentity,
+  isAgentAssetClassification,
+} from './agent-identity';
 import { AgentMetadataService } from './agent-metadata.service';
+import { isEventClassificationVisible } from './event-visibility';
 import { IngestionSourceService } from './ingestion-source.service';
 import { MaintenanceWindowService } from './maintenance-window.service';
 import { buildAcl, policyConfigError, sanitizePolicy } from './policy-config';
@@ -52,6 +57,7 @@ const STALE_MS = 60 * 60_000;
 const COLLECTOR_STALE_MS = 3 * 60_000;
 const COLLECTOR_DOWN_MS = 10 * 60_000;
 const COMPACT_WINDOW_MS = 3_000;
+const HOUR = 3_600_000;
 
 const now = () => Date.now();
 const iso = (t = now()) => new Date(t).toISOString().slice(0, 19).replace('T', ' ');
@@ -370,7 +376,12 @@ export class AggregationService {
   }
 
   private computeWin(sinceMs: number, endMs: number): { events: T.JudgedEvent[]; sinceMs: number; spanMs: number; dataSinceMs: number; dataSpanMs: number } {
-    const events = this.judge.queryRange(sinceMs, endMs);
+    const queryRange = (this.judge as SentryJudgeService & {
+      queryRange?: (startMs: number, untilMs: number) => T.JudgedEvent[];
+    }).queryRange;
+    const events = typeof queryRange === 'function'
+      ? queryRange.call(this.judge, sinceMs, endMs)
+      : this.judge.query(sinceMs).filter((event) => event.at <= endMs);
     // The in-memory ring may hold less time than the nominal window. Time-series/rate panels must
     // bucket over the data that actually exists, or everything piles into one bucket (req=100000).
     const dataSinceMs = events.length ? events[0].at : sinceMs;
@@ -425,6 +436,8 @@ export class AggregationService {
   }
 
   private eventItem(e: T.JudgedEvent, repeatCount = 1, lastAt = e.at): T.AgentEventListItem {
+    const detected = detectedAgentIdentity(e);
+    const resolved = this.agentMetadata.resolveEvent(e);
     return {
       schemaVersion: e.schemaVersion,
       eventId: e.eventId,
@@ -436,6 +449,13 @@ export class AggregationService {
       subject: e.subject,
       workspacePath: e.workspacePath,
       agentId: e.agentId,
+      agentAssetId: resolved.agentAssetId,
+      displayName: resolved.displayName,
+      detectedName: resolved.detectedName,
+      detectedClassification: resolved.detectedClassification,
+      effectiveClassification: resolved.effectiveClassification,
+      runtime: detected.runtime,
+      locationLabel: detected.locationLabel,
       collectorId: eventCollectorId(e) || undefined,
       sourceId: eventSourceId(e) || undefined,
       sessionId: e.sessionId,
@@ -462,6 +482,7 @@ export class AggregationService {
       attributes: e.attributes,
       process: e.process,
       attribution: e.attribution,
+      judgment: e.judgment,
       repeatCount: repeatCount > 1 ? repeatCount : undefined,
       lastAt: repeatCount > 1 ? iso(lastAt) : undefined,
       rawPreview: e.rawPreview,
@@ -473,36 +494,75 @@ export class AggregationService {
     const sourceId = filter.sourceId?.trim();
     const collectorId = filter.collectorId?.trim();
     const agentId = filter.agentId?.trim();
+    const requestedAgentAssetId = filter.agentAssetId?.trim();
+    const agentAssetId = requestedAgentAssetId
+      ? this.agentMetadata.canonicalAgentAssetId(requestedAgentAssetId)
+      : undefined;
     const sessionId = filter.sessionId?.trim();
     const workspacePath = filter.workspacePath?.trim();
     const traceId = filter.traceId?.trim();
     const runId = filter.runId?.trim();
-    const hasFilter = Boolean(sourceId || collectorId || agentId || sessionId || workspacePath || traceId || runId || filter.eventKind || filter.eventCategory || filter.verdict || filter.tier);
+    const q = filter.q?.trim().toLowerCase();
+    const hasFilter = Boolean(sourceId || collectorId || agentId || agentAssetId || sessionId || workspacePath || traceId || runId || filter.eventKind || filter.eventCategory || filter.verdict || filter.tier || q);
     const agentScoped = filter.scope === 'agent' && !pinnedEventId;
+    const includeUnknown = filter.includeUnknown !== false;
     // Process lifecycle rows remain stored for audit/debugging, but are hidden from both the
     // Agent and raw "all events" views by default. An explicit kind filter, noise=include, or a
     // pinned event still makes them accessible.
     const hideNoise = !pinnedEventId && !filter.eventKind && filter.noise !== 'include';
     return events.filter((e) => {
       const matchesEventId = Boolean(pinnedEventId && e.eventId === pinnedEventId);
+      if (pinnedEventId && !hasFilter) return matchesEventId;
+
       const eventSource = eventSourceId(e);
       const eventCollector = eventCollectorId(e);
       const isHiddenNoise = agentScoped ? isLowValueAgentNoise(e) : e.eventKind === 'ProcessExit';
-      const matchesScope = (!agentScoped || isMonitoredAgentEvent(e)) && (!hideNoise || !isHiddenNoise);
-      const matchesFilter =
-        matchesScope &&
+      // Exact fields are already present on the event. Reject on them before resolving display
+      // metadata, which may read the manual-review registry and hash an asset identity. A scoped
+      // query commonly reduces the 100k hot ring to tens of rows, so this ordering keeps event
+      // search proportional to the result set without changing pinned-event semantics.
+      const matchesDirectFilter =
         (!sourceId || eventSource === sourceId) &&
         (!collectorId || eventCollector === collectorId) &&
-        (!agentId || e.agentId === agentId) &&
+        (agentAssetId || !agentId || e.agentId === agentId) &&
         (!sessionId || e.sessionId === sessionId) &&
-        (!workspacePath || e.workspacePath === workspacePath) &&
+        (agentAssetId || !workspacePath || e.workspacePath === workspacePath) &&
         (!traceId || e.traceId === traceId) &&
         (!runId || e.runId === runId) &&
         (!filter.eventKind || e.eventKind === filter.eventKind) &&
         (!filter.eventCategory || e.eventCategory === filter.eventCategory) &&
         (!filter.verdict || e.verdict === filter.verdict) &&
-        (!filter.tier || e.tier === filter.tier);
-      if (pinnedEventId && !hasFilter) return matchesEventId;
+        (!filter.tier || e.tier === filter.tier) &&
+        (!hideNoise || !isHiddenNoise);
+      if (!matchesEventId && !matchesDirectFilter) return false;
+
+      const resolved = this.agentMetadata.resolveEvent(e);
+      const visibleClassification = isEventClassificationVisible(
+        resolved.effectiveClassification,
+        agentScoped ? 'agent' : 'raw',
+        includeUnknown,
+        matchesEventId,
+      );
+      const matchesScope =
+        visibleClassification &&
+        (!hideNoise || !isHiddenNoise);
+      const matchesFilter =
+        matchesScope &&
+        matchesDirectFilter &&
+        (!agentAssetId || resolved.agentAssetId === agentAssetId) &&
+        (
+          !q ||
+          [
+            e.subject,
+            e.agentId,
+            resolved.displayName,
+            resolved.detectedName,
+            e.sessionId,
+            e.rawPreview,
+            JSON.stringify(e.attributes ?? {}),
+            JSON.stringify(e.attribution ?? {}),
+          ].some((value) => value?.toLowerCase().includes(q))
+        );
       return matchesEventId || matchesFilter;
     });
   }
@@ -550,6 +610,54 @@ export class AggregationService {
     return {
       items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) => this.eventItem(event, repeatCount, lastAt)),
       total,
+      updateTime: iso(),
+    };
+  }
+
+  async storedAgentEvents(filter: T.AgentEventQuery): Promise<T.AgentEventList> {
+    if (!this.judge.storageStatus().clickhouseReady) return this.agentEvents(filter);
+    const pinnedEventId = filter.eventId?.trim();
+    const { sinceMs } = this.win(filter);
+    const customEnd = filter.timeType === 'custom' && filter.endTime ? Date.parse(filter.endTime) : Number.NaN;
+    const dateOnlyEnd = Boolean(filter.endTime && /^\d{4}-\d{2}-\d{2}$/u.test(filter.endTime));
+    const untilMs = Number.isFinite(customEnd) ? customEnd + (dateOnlyEnd ? 24 * HOUR - 1 : 0) : now();
+    const limit = Math.max(1, Math.min(200, filter.limit ?? 40));
+    const persistent = await this.judge.searchStoredEvents({
+      sinceMs: pinnedEventId ? 0 : sinceMs,
+      untilMs,
+      eventId: pinnedEventId,
+      sourceId: filter.sourceId,
+      collectorId: filter.collectorId,
+      agentId: filter.agentId,
+      sessionId: filter.sessionId,
+      workspacePath: filter.workspacePath,
+      traceId: filter.traceId,
+      runId: filter.runId,
+      eventKind: filter.eventKind,
+      eventCategory: filter.eventCategory,
+      verdict: filter.verdict,
+      tier: filter.tier,
+      limit: Math.min(20_000, Math.max(2_000, limit * 50)),
+    });
+    // Buffered writes may not have reached ClickHouse yet. Merge the hot ring and prefer the most
+    // recent lifecycle revision without mutating either immutable source record.
+    const latest = new Map<string, T.JudgedEvent>();
+    for (const event of [...persistent, ...this.judge.query(pinnedEventId ? 0 : sinceMs)]) {
+      const previous = latest.get(event.eventId);
+      if (!previous || (event.decisionUpdatedAt ?? event.at) >= (previous.decisionUpdatedAt ?? previous.at)) {
+        latest.set(event.eventId, event);
+      }
+    }
+    const filtered = this.filterEvents([...latest.values()], filter).sort((a, b) =>
+      Number(Boolean(pinnedEventId) && b.eventId === pinnedEventId) - Number(Boolean(pinnedEventId) && a.eventId === pinnedEventId) ||
+      b.at - a.at,
+    );
+    const compacted = filter.scope === 'raw' || pinnedEventId
+      ? filtered.map((event) => ({ event, repeatCount: 1, lastAt: event.at }))
+      : compactEvents(filtered);
+    return {
+      items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) => this.eventItem(event, repeatCount, lastAt)),
+      total: compacted.length,
       updateTime: iso(),
     };
   }
@@ -648,16 +756,23 @@ export class AggregationService {
     const environment = filter.environment?.trim().toLowerCase();
     const tag = filter.tag?.trim().toLowerCase();
     const agentId = filter.agentId?.trim();
+    const requestedAgentAssetId = filter.agentAssetId?.trim();
+    const agentAssetId = requestedAgentAssetId
+      ? this.agentMetadata.canonicalAgentAssetId(requestedAgentAssetId)
+      : undefined;
     const workspacePath = filter.workspacePath?.trim();
     const hasFilter = Boolean((filter.healthState && filter.healthState !== 'all') || (filter.criticality && filter.criticality !== 'all') || owner || environment || tag || q || filter.userId);
-    const shouldScopeExactAgent = Boolean(agentId && !hasFilter);
+    const shouldScopeExactAgent = Boolean((agentAssetId || agentId) && !hasFilter);
     const byAgent = new Map<string, T.JudgedEvent[]>();
     for (const e of events) {
-      if (shouldScopeExactAgent && e.agentId !== agentId) continue;
-      if (workspacePath && e.workspacePath !== workspacePath) continue;
+      if (shouldScopeExactAgent && !agentAssetId && e.agentId !== agentId && e.attribution?.agentScopeId !== agentId) continue;
+      // A canonical asset selection identifies the workload. Legacy display fields must not
+      // reject its raw events before metadata/alias resolution.
+      if (!agentAssetId && workspacePath && e.workspacePath !== workspacePath) continue;
       if (!agentId && filter.userId && e.userId !== filter.userId) continue;
-      const key = `${e.workspacePath}\0${e.agentId}`;
-      (byAgent.get(key) ?? byAgent.set(key, []).get(key)!).push(e);
+      const resolved = this.agentMetadata.resolveEvent(e);
+      if (agentAssetId && resolved.agentAssetId !== agentAssetId) continue;
+      (byAgent.get(resolved.agentAssetId) ?? byAgent.set(resolved.agentAssetId, []).get(resolved.agentAssetId)!).push(e);
     }
 
     const openIncidents = new Map<string, number>();
@@ -669,15 +784,32 @@ export class AggregationService {
     }
 
     const t = now();
-    const eventBackedItems = [...byAgent.entries()].map(([key, evs]): T.AgentInventoryItem => {
+    const eventBackedItems = [...byAgent.entries()].map(([assetId, evs]): T.AgentInventoryItem => {
       const sorted = [...evs].sort((a, b) => a.at - b.at);
       const first = sorted[0];
       const last = sorted[sorted.length - 1];
       const risky = sorted.filter((e) => e.verdict !== 'allow');
       const lvl = worstLevel(sorted);
-      const [workspacePath, agentId] = key.split('\0');
-      const metadata = this.agentMetadata.get(workspacePath, agentId);
-      const openIncidentCount = openIncidents.get(key) ?? 0;
+      const identityEvent =
+        [...sorted].reverse().find((event) => Boolean(event.attribution?.classification)) ??
+        last;
+      const resolved = this.agentMetadata.resolveEvent(identityEvent);
+      const detected = detectedAgentIdentity(identityEvent);
+      const metadata = resolved.metadata;
+      const attribution = identityEvent.attribution;
+      const classification = resolved.effectiveClassification;
+      const reviewed = Boolean(metadata?.reviewDecision);
+      const itemAgentId =
+        attribution?.agentScopeId ??
+        attribution?.agentDisplayName ??
+        detected.detectedName ??
+        last.agentId;
+      const itemWorkspacePath = last.workspacePath;
+      const incidentKeys = new Set(sorted.map((event) => `${event.workspacePath}\0${event.agentId}`));
+      const openIncidentCount = [...incidentKeys].reduce(
+        (total, incidentKey) => total + (openIncidents.get(incidentKey) ?? 0),
+        0,
+      );
       const sinceLast = t - last.at;
       const healthState: T.AgentHealthState = openIncidentCount > 0
         ? 'risky'
@@ -698,11 +830,28 @@ export class AggregationService {
         }
       }
       const top = [...topRisk.entries()].sort((a, b) => b[1].count - a[1].count)[0];
+      const instanceCount = distinct(sorted.map((event) =>
+        event.attribution?.agentInstanceId ??
+        event.attribution?.physicalWorkloadId ??
+        (
+          event.attribution?.rootPid
+            ? [
+                event.process?.hostId ?? 'host',
+                event.process?.bootId ?? 'boot',
+                event.attribution.rootPid,
+              ].join(':')
+            : `${event.sessionId}:${event.process?.pid ?? event.agentId}`
+        )
+      ));
       return {
-        agentId,
-        workspacePath,
+        agentId: itemAgentId,
+        agentAssetId: assetId,
+        agentAssetAliases: metadata?.agentAssetAliases,
+        workspacePath: itemWorkspacePath,
         userId: last.userId,
-        displayName: metadata?.displayName,
+        displayName: resolved.displayName,
+        detectedName: resolved.detectedName,
+        detectedClassification: resolved.detectedClassification,
         owner: metadata?.owner,
         team: metadata?.team,
         environment: metadata?.environment,
@@ -710,6 +859,30 @@ export class AggregationService {
         tags: metadata?.tags ?? [],
         note: metadata?.note,
         metadataUpdatedAt: metadata?.updatedAt ? iso(metadata.updatedAt) : undefined,
+        classification,
+        runtime: detected.runtime,
+        locationLabel: detected.locationLabel,
+        instanceCount,
+        confidence: reviewed ? 1 : attribution?.confidence ?? 0,
+        attributionSource: reviewed ? 'manual_review' : attribution?.source ?? 'none',
+        attributionEvidence: reviewed
+          ? [
+              ...(attribution?.evidence ?? []),
+              `manual_review:${metadata?.reviewDecision}`,
+              ...(metadata?.reviewedBy ? [`manual_review:reviewer=${metadata.reviewedBy}`] : []),
+            ].slice(-16)
+          : attribution?.evidence ?? [],
+        physicalWorkloadId: metadata?.reviewPhysicalWorkloadId ?? attribution?.physicalWorkloadId,
+        agentInstanceId: metadata?.reviewAgentInstanceId ?? attribution?.agentInstanceId,
+        workloadRef: metadata?.reviewWorkloadRef ?? attribution?.workloadRef,
+        reviewDecision: metadata?.reviewDecision,
+        reviewedBy: metadata?.reviewedBy,
+        reviewedAt: metadata?.reviewedAt ? iso(metadata.reviewedAt) : undefined,
+        reviewNote: metadata?.reviewNote,
+        reviewIdentityKeys:
+          metadata?.identityKeys ??
+          metadata?.reviewIdentityKeys ??
+          this.agentMetadata.identityKeysForEvent(identityEvent),
         firstSeen: iso(first.at),
         lastSeen: iso(last.at),
         healthState,
@@ -733,8 +906,16 @@ export class AggregationService {
 
     const metadataOnlyItems = this.agentMetadata.list()
       .filter((metadata) =>
-        !byAgent.has(`${metadata.workspacePath}\0${metadata.agentId}`) &&
-        (!shouldScopeExactAgent || metadata.agentId === agentId) &&
+        (
+          isAgentAssetClassification(metadata.reviewDecision ?? 'unknown') ||
+          Boolean(filter.includeUnclassified && (agentAssetId || agentId))
+        ) &&
+        !byAgent.has(metadata.agentAssetId) &&
+        (
+          !shouldScopeExactAgent ||
+          (agentAssetId ? metadata.agentAssetId === agentAssetId : metadata.agentId === agentId)
+        ) &&
+        (!agentAssetId || metadata.agentAssetId === agentAssetId) &&
         (!workspacePath || metadata.workspacePath === workspacePath) &&
         !filter.userId
       )
@@ -743,9 +924,13 @@ export class AggregationService {
         const sourceCounts = Object.fromEntries(EVENT_SOURCES.map((source) => [source, 0])) as Record<T.EventSource, number>;
         return {
           agentId: metadata.agentId,
+          agentAssetId: metadata.agentAssetId,
+          agentAssetAliases: metadata.agentAssetAliases,
           workspacePath: metadata.workspacePath,
           userId: '-',
           displayName: metadata.displayName,
+          detectedName: metadata.agentId,
+          detectedClassification: 'unknown',
           owner: metadata.owner,
           team: metadata.team,
           environment: metadata.environment,
@@ -753,6 +938,26 @@ export class AggregationService {
           tags: metadata.tags,
           note: metadata.note,
           metadataUpdatedAt: metadata.updatedAt,
+          classification: metadata.reviewDecision ?? 'unknown',
+          runtime: metadata.workloadRef?.environment ?? metadata.reviewWorkloadRef?.environment ?? 'unknown',
+          locationLabel: metadata.workspacePath,
+          instanceCount: metadata.agentInstanceId || metadata.reviewAgentInstanceId ? 1 : 0,
+          confidence: metadata.reviewDecision ? 1 : 0,
+          attributionSource: metadata.reviewDecision ? 'manual_review' : 'none',
+          attributionEvidence: metadata.reviewDecision
+            ? [
+                `manual_review:${metadata.reviewDecision}`,
+                ...(metadata.reviewedBy ? [`manual_review:reviewer=${metadata.reviewedBy}`] : []),
+              ]
+            : [],
+          physicalWorkloadId: metadata.physicalWorkloadId ?? metadata.reviewPhysicalWorkloadId,
+          agentInstanceId: metadata.agentInstanceId ?? metadata.reviewAgentInstanceId,
+          workloadRef: metadata.workloadRef ?? metadata.reviewWorkloadRef,
+          reviewDecision: metadata.reviewDecision,
+          reviewedBy: metadata.reviewedBy,
+          reviewedAt: metadata.reviewedAt,
+          reviewNote: metadata.reviewNote,
+          reviewIdentityKeys: metadata.identityKeys ?? metadata.reviewIdentityKeys ?? [metadata.agentId.toLowerCase()],
           firstSeen: metadata.updatedAt,
           lastSeen: metadata.updatedAt,
           healthState: 'stale',
@@ -776,7 +981,16 @@ export class AggregationService {
 
     const filtered = items
       .filter((item) => {
-        const matchesAgentId = Boolean(agentId && item.agentId === agentId && (!workspacePath || item.workspacePath === workspacePath));
+        const matchesAgentId = Boolean(
+          (agentAssetId && item.agentAssetId === agentAssetId) ||
+          (agentId && item.agentId === agentId && (!workspacePath || item.workspacePath === workspacePath)),
+        );
+        if (
+          !isAgentAssetClassification(item.classification) &&
+          !(filter.includeUnclassified && matchesAgentId)
+        ) {
+          return false;
+        }
         const matchesFilter =
           (!filter.healthState || filter.healthState === 'all' || item.healthState === filter.healthState) &&
           (!filter.criticality || filter.criticality === 'all' || item.criticality === filter.criticality) &&
@@ -785,7 +999,10 @@ export class AggregationService {
           (!tag || item.tags.some((value) => value.toLowerCase().includes(tag))) &&
           (!q || [
             item.agentId,
+            item.agentAssetId,
             item.displayName,
+            item.detectedName,
+            item.locationLabel,
             item.workspacePath,
             item.userId,
             item.owner,
@@ -797,16 +1014,40 @@ export class AggregationService {
             item.lastEventSubject,
             ...item.tags,
           ].some((v) => (v ?? '').toLowerCase().includes(q)));
-        if (agentId && !hasFilter) return matchesAgentId;
+        if ((agentAssetId || agentId) && !hasFilter) return matchesAgentId;
         return matchesAgentId || matchesFilter;
       })
       .sort((a, b) => {
-        const rank: Record<T.AgentHealthState, number> = { risky: 0, active: 1, idle: 2, stale: 3 };
-        return Number(Boolean(agentId) && b.agentId === agentId && (!workspacePath || b.workspacePath === workspacePath)) - Number(Boolean(agentId) && a.agentId === agentId && (!workspacePath || a.workspacePath === workspacePath))
-          || rank[a.healthState] - rank[b.healthState]
+        const classificationRank: Record<T.AgentClassification, number> = {
+          confirmed_agent: 0,
+          probable_agent: 1,
+          unknown: 2,
+          non_agent: 3,
+        };
+        const riskRank: Record<string, number> = {
+          critical: 4,
+          high: 3,
+          medium: 2,
+          low: 1,
+          safe: 0,
+          unknown: 0,
+        };
+        const aSelected = Boolean(
+          (agentAssetId && a.agentAssetId === agentAssetId) ||
+          (agentId && a.agentId === agentId && (!workspacePath || a.workspacePath === workspacePath)),
+        );
+        const bSelected = Boolean(
+          (agentAssetId && b.agentAssetId === agentAssetId) ||
+          (agentId && b.agentId === agentId && (!workspacePath || b.workspacePath === workspacePath)),
+        );
+        return Number(bSelected) - Number(aSelected)
+          || classificationRank[a.classification] - classificationRank[b.classification]
+          || (riskRank[b.riskLevel] ?? 0) - (riskRank[a.riskLevel] ?? 0)
           || b.openIncidentCount - a.openIncidentCount
           || b.riskyEventCount - a.riskyEventCount
-          || Date.parse(b.lastSeen) - Date.parse(a.lastSeen);
+          || Date.parse(b.lastSeen) - Date.parse(a.lastSeen)
+          || (a.displayName ?? a.detectedName ?? a.agentId).localeCompare(b.displayName ?? b.detectedName ?? b.agentId)
+          || a.agentAssetId.localeCompare(b.agentAssetId);
       });
 
     const summary: T.AgentInventorySummary = {
@@ -974,7 +1215,12 @@ export class AggregationService {
     const pinnedEventId = filter.eventId?.trim();
     const windowedEvents = this.win(filter).events;
     const windowedEventIds = new Set(windowedEvents.map((event) => event.eventId));
-    const events = pinnedEdgeId || pinnedEventId ? this.judge.query(0) : windowedEvents;
+    const pinnedEvent = pinnedEventId ? this.judge.findEvent(pinnedEventId) : undefined;
+    const events = pinnedEdgeId
+      ? this.judge.query(0)
+      : pinnedEvent && !windowedEventIds.has(pinnedEvent.eventId)
+        ? [...windowedEvents, pinnedEvent]
+        : windowedEvents;
     const includeBenign = filter.includeBenign !== false;
     const q = filter.q?.trim().toLowerCase();
     const agentId = filter.agentId?.trim();
@@ -1083,11 +1329,20 @@ export class AggregationService {
     };
 
     for (const e of events) {
+      const collectorRef = eventCollectorId(e);
+      const sourceRef = eventSourceId(e);
+      const isPinnedEvent = Boolean(pinnedEventId && e.eventId === pinnedEventId);
+      const matchesDirectScope =
+        (!agentId || e.agentId === agentId) &&
+        (!workspacePath || e.workspacePath === workspacePath) &&
+        (!collectorId || collectorRef === collectorId) &&
+        (!sourceId || sourceRef === sourceId) &&
+        (includeBenign || e.verdict !== 'allow');
+      if (!pinnedEdgeId && !isPinnedEvent && !matchesDirectScope) continue;
+
       const target = topologyTarget(e);
       const agentNodeId = nodeId('agent', `${e.workspacePath}|${e.agentId}`);
       const workspaceNodeId = nodeId('workspace', e.workspacePath);
-      const collectorRef = eventCollectorId(e);
-      const sourceRef = eventSourceId(e);
       const collectorNodeId = collectorRef ? nodeId('collector', collectorRef) : '';
       const targetNodeId = target ? nodeId(target.type, target.key) : '';
       const workspaceNode: NodeSpec = { id: workspaceNodeId, type: 'workspace', label: e.workspacePath, extra: { workspacePath: e.workspacePath } };
@@ -1104,15 +1359,10 @@ export class AggregationService {
       if (collectorNode) eventEdges.push({ id: edgeId(collectorNodeId, agentNodeId, 'observed_by'), source: collectorNode, target: agentNode, type: 'observed_by', label: '观测' });
       if (target && targetNode) eventEdges.push({ id: edgeId(agentNodeId, targetNodeId, target.edgeType), source: agentNode, target: targetNode, type: target.edgeType, label: target.edgeLabel });
       const eventEdgeIds = eventEdges.map((edge) => edge.id);
-      const isPinnedEvent = Boolean(pinnedEventId && e.eventId === pinnedEventId);
       const isPinnedEdge = Boolean(pinnedEdgeId && eventEdgeIds.includes(pinnedEdgeId));
       const normalMatch =
         windowedEventIds.has(e.eventId) &&
-        (!agentId || e.agentId === agentId) &&
-        (!workspacePath || e.workspacePath === workspacePath) &&
-        (!collectorId || collectorRef === collectorId) &&
-        (!sourceId || sourceRef === sourceId) &&
-        (includeBenign || e.verdict !== 'allow') &&
+        matchesDirectScope &&
         (!q || [e.agentId, e.workspacePath, e.subject, e.riskCategory, e.riskName, collectorRef, sourceRef, target?.label, target?.subtitle].some((v) => (v ?? '').toLowerCase().includes(q)));
       const includeAllEventEdges = exactPinnedMode ? isPinnedEvent : normalMatch || isPinnedEvent;
       const includedEdges = includeAllEventEdges ? eventEdges : eventEdges.filter((edge) => pinnedEdgeId && edge.id === pinnedEdgeId);
@@ -1266,6 +1516,58 @@ export class AggregationService {
         droppedEvents: latest?.droppedEvents ?? 0,
         outputDropped: latest?.outputDropped ?? 0,
         errorCount: latest?.errorCount ?? 0,
+        filterMetrics: latest?.filterMetrics ?? {
+          scope: 'all',
+          observed: 0,
+          forwarded: 0,
+          confirmedAgent: 0,
+          probableAgent: 0,
+          unknown: 0,
+          nonAgent: 0,
+          filteredNonAgent: 0,
+          wouldFilterNonAgent: 0,
+          filteredNoise: 0,
+          wouldFilterNoise: 0,
+          discoveryBudgetDropped: 0,
+          wouldDiscoveryBudgetDrop: 0,
+          deduplicated: 0,
+          queueDropped: 0,
+          batches: 0,
+          batchEvents: 0,
+          identitySnapshotReady: false,
+          identitySnapshotVersion: 0,
+          identitySnapshotAgeSeconds: 0,
+          identityCacheEntries: 0,
+          identityCacheHits: 0,
+          identityCacheMisses: 0,
+          identityCandidateCacheEntries: 0,
+          identityCgroupBindings: 0,
+          identityCgroupHits: 0,
+          identityCgroupMisses: 0,
+          identityErrors: 0,
+          dockerEnabled: false,
+          dockerReady: false,
+          dockerEntries: 0,
+          dockerReconnects: 0,
+          dockerErrors: 0,
+          behaviorWorkloads: 0,
+          behaviorCandidates: 0,
+          behaviorPromoted: 0,
+          behaviorEvicted: 0,
+          templateLoaded: 0,
+          templateInvalid: 0,
+          templateMatches: 0,
+          templateAmbiguous: 0,
+          processCacheEntries: 0,
+          processTombstones: 0,
+          processClassifications: 0,
+          processCacheHits: 0,
+          processCacheMisses: 0,
+          processProcReads: 0,
+          processBootstrapProcReads: 0,
+          processFallbackProcReads: 0,
+          processAncestryProcReads: 0,
+        },
         message: latest?.message,
         eventCategoryCounts: categoryCounts,
       };
