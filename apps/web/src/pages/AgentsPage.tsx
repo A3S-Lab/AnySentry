@@ -33,6 +33,7 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import { OperationalEmptyState } from "@/components/custom/operational-empty-state";
 import { AgentAssetIdentityInline } from "@/components/custom/agent-identity";
 import { IdentityAiReview } from "@/components/custom/identity-ai-review";
 import { Button } from "@/components/ui/button";
@@ -816,6 +817,7 @@ function AgentDetail({
 
 export default function AgentsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const [scope, setScope] = useState<"agent" | "raw">(searchParams.get("scope") === "raw" ? "raw" : "agent");
   const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
   const routeStartTime = searchParams.get("startTime") ?? "";
   const routeEndTime = searchParams.get("endTime") ?? "";
@@ -837,13 +839,14 @@ export default function AgentsPage() {
 
   const query = useMemo<AgentInventoryQuery>(() => ({
     timeType,
+    scope,
     startTime: timeType === "custom" ? clean(routeStartTime) : undefined,
     endTime: timeType === "custom" ? clean(routeEndTime) : undefined,
     healthState,
     q: clean(queryText),
     userId: clean(userId),
     limit: 200,
-  }), [healthState, queryText, routeEndTime, routeStartTime, timeType, userId]);
+  }), [healthState, queryText, routeEndTime, routeStartTime, scope, timeType, userId]);
 
   const { data, loading, error: listError, refresh: refreshList } = useRequest(() => securityCenterApi.agentInventory(query), {
     refreshDeps: [query],
@@ -946,6 +949,7 @@ export default function AgentsPage() {
     setReviewNotice("");
     const next = new URLSearchParams(searchParams);
     next.set("timeType", timeType);
+    next.set("scope", scope);
     if (timeType === "custom" && routeStartTime) next.set("startTime", routeStartTime);
     if (timeType === "custom" && routeEndTime) next.set("endTime", routeEndTime);
     next.delete("agentId");
@@ -957,6 +961,20 @@ export default function AgentsPage() {
     if (healthState !== "all") next.set("healthState", healthState);
     if (clean(queryText)) next.set("q", queryText.trim());
     if (clean(userId)) next.set("userId", userId.trim());
+    setSearchParams(next);
+  };
+
+  const changeScope = (nextScope: "agent" | "raw") => {
+    setScope(nextScope);
+    setPendingReview(null);
+    const next = new URLSearchParams(searchParams);
+    next.set("scope", nextScope);
+    next.delete("agentId");
+    next.delete("agentAssetId");
+    next.delete("selectedAgentAssetId");
+    next.delete("workspacePath");
+    next.delete("focus");
+    next.delete("eventId");
     setSearchParams(next);
   };
 
@@ -1069,7 +1087,11 @@ export default function AgentsPage() {
           </div>
         </div>
 
-        <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-[120px_130px_minmax(160px,0.8fr)_minmax(180px,1fr)_auto_auto]">
+        <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-[auto_120px_130px_minmax(160px,0.8fr)_minmax(180px,1fr)_auto_auto]">
+          <div className="flex h-9 items-center rounded-md border border-white/10 bg-white/[0.03] p-1">
+            <button type="button" onClick={() => changeScope("agent")} className={cn("h-7 rounded px-3 text-xs text-zinc-500", scope === "agent" && "bg-teal-500/15 text-teal-100")}>Agent 资产</button>
+            <button type="button" onClick={() => changeScope("raw")} className={cn("h-7 rounded px-3 text-xs text-zinc-500", scope === "raw" && "bg-white/10 text-zinc-100")}>全部资产</button>
+          </div>
           <Select value={timeType} onValueChange={(next) => setTimeType(next as SecurityTimeType)}>
             <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
             <SelectContent>
@@ -1125,11 +1147,17 @@ export default function AgentsPage() {
                   智能体资产加载失败，请刷新重试
                 </div>
               ) : (data?.items?.length ?? 0) === 0 ? (
-                <div className="flex min-h-40 items-center justify-center px-6 text-center text-sm text-zinc-500">
-                  {healthState !== "all" || clean(queryText) || clean(userId)
+                <OperationalEmptyState
+                  icon={Bot}
+                  title={healthState !== "all" || clean(queryText) || clean(userId)
                     ? "没有符合当前筛选条件的智能体"
-                    : "当前时间范围内暂无已确认或候选智能体"}
-                </div>
+                    : scope === "agent" ? "当前没有已确认或候选 Agent 资产" : "当前窗口没有资产"}
+                  description={scope === "agent"
+                    ? "这里只展示已确认和候选 Agent。请检查 Collector 在线状态，或切换“全部资产”排查 Unknown 与 Non-Agent 记录。"
+                    : "扩大时间范围，或检查接入源与 Collector 是否持续上报事件。"}
+                  primary={{ label: "检查采集链路", href: "/collectors" }}
+                  secondary={{ label: "查看 Workspace", href: "/workspaces" }}
+                />
               ) : (
                 <div className="max-h-[calc(100vh-300px)] overflow-y-auto">
                   {data?.items.map((agent, index, items) => {

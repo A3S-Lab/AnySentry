@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { Sentry, dns, egress, fileAccess, securityAction, sslContent, toolExec } from '@a3s-lab/sentry';
 import { AgentAttributionService } from './agent-attribution.service';
 import { AlertingService } from './alerting.service';
-import { ClickHouseStore, IncidentState, StoredEventQuery } from './clickhouse-store';
+import { ClickHouseStore, DashboardWindowHistory, IncidentState, StoredEventQuery } from './clickhouse-store';
 import { DEFAULT_POLICY, PolicyConfig, buildFastAcl, policyConfigError, sanitizePolicy, tierStatus } from './policy-config';
 import { cleanText } from './redaction';
 import { DecisionResultJob, FastJudgeJob } from './async-judgment.types';
@@ -278,10 +278,13 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
       const hist = await this.ch.hydrate(Date.now() - THIRTY_DAYS, this.MAX);
       this.store.push(...hist); // direct (not push()) so hydrated rows aren't re-written to ClickHouse
+      const historicalScopes: Array<{ event: JudgedEvent; incidentId: string }> = [];
       for (const rec of hist) {
         this.storeById.set(rec.eventId, rec);
         this.ingestIncident(rec);
+        historicalScopes.push({ event: rec, incidentId: this.incidentId(rec) });
       }
+      this.alerting.backfillEventScopes(historicalScopes);
       this.applyIncidentState(await this.ch.loadIncidentState());
       const heartbeats = await this.ch.loadCollectorHeartbeats();
       for (const heartbeat of heartbeats.sort((a, b) => a.at - b.at).slice(-this.MAX_COLLECTOR_HEARTBEATS)) {
@@ -775,6 +778,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
           lastEventAt: e.at,
           lastEventSubject: e.subject,
           maxRiskScore: Math.max(prev.maxRiskScore, e.riskScore),
+          monitored: prev.monitored === true || e.attribution?.monitored === true,
+          agentScopeId: e.attribution?.agentScopeId ?? prev.agentScopeId,
           status: prev.status === 'resolved' ? 'open' : prev.status,
           resolvedAt: prev.status === 'resolved' ? undefined : prev.resolvedAt,
         }
@@ -802,6 +807,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
           lastEventAt: e.at,
           lastEventSubject: e.subject,
           maxRiskScore: e.riskScore,
+          monitored: e.attribution?.monitored === true,
+          agentScopeId: e.attribution?.agentScopeId,
         };
     this.incidents.set(incidentId, next);
     if (prev?.status === 'resolved') void this.ch.saveIncidentState([...this.incidents.values()]);
@@ -974,6 +981,24 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   /** Events within a window [sinceMs, now]. */
   query(sinceMs: number): JudgedEvent[] {
     return this.store.filter((e) => e.at >= sinceMs);
+  }
+
+  /** Events within the closed interval [sinceMs, untilMs]. */
+  queryRange(sinceMs: number, untilMs: number): JudgedEvent[] {
+    return this.store.filter((e) => e.at >= sinceMs && e.at <= untilMs);
+  }
+
+  dashboardWindowHistory(sinceMs: number, untilMs: number, bucketCount?: number): Promise<DashboardWindowHistory | null> {
+    return this.ch.dashboardWindowHistory(sinceMs, untilMs, bucketCount);
+  }
+
+  recentPersistedEvents(
+    sinceMs: number,
+    untilMs: number,
+    limit: number,
+    options?: { monitoredOnly?: boolean; tier?: string },
+  ): Promise<JudgedEvent[] | null> {
+    return this.ch.recentWindowEvents(sinceMs, untilMs, limit, options);
   }
 
   /** O(1) hot-ring lookup for pinned event drill-downs and evidence assembly. */

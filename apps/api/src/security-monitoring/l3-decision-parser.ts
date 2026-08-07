@@ -1,6 +1,6 @@
 import { AsyncDecision } from './async-judgment.types';
 
-function jsonObjects(text: string): unknown[] {
+export function jsonObjects(text: string): unknown[] {
   const objects: unknown[] = [];
   let start = -1;
   let depth = 0;

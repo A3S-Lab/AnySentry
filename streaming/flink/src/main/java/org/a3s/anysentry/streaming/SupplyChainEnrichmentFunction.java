@@ -114,10 +114,10 @@ public class SupplyChainEnrichmentFunction extends BroadcastProcessFunction<
         String version = value(finding.version).toLowerCase(Locale.ROOT);
         String escapedLeaf = Pattern.quote(normalizedLeaf);
         String escapedPackage = Pattern.quote(packageName.replace('_', '-'));
-        if (normalizedText.contains("/node_modules/" + packageName.replace('_', '-') + "/")
-                || normalizedText.contains("/node_modules/.bin/" + normalizedLeaf)
+        if (text.contains("node_modules/" + packageName + "/")
+                || text.contains("node_modules/.bin/" + leaf)
                 || Pattern.compile("(?:^|[/\\s])node_modules/\\.bin/"
-                + escapedLeaf + "(?:\\s|$)").matcher(normalizedText).find()) {
+                + Pattern.quote(leaf) + "(?:\\s|$)").matcher(text).find()) {
             return new MatchBasis("high", "node_modules path");
         }
         if (Pattern.compile("(?:^|/)(?:site|dist)-packages/(?:"

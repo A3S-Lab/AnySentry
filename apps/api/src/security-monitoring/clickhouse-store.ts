@@ -126,6 +126,55 @@ export interface StoredEventQuery {
   limit: number;
 }
 
+export interface DashboardWindowDimensionRow {
+  period: 'current' | 'previous';
+  monitored: boolean;
+  verdict: string;
+  tier: string;
+  riskType: string;
+  riskCategory: string;
+  riskName: string;
+  eventCount: number;
+  tokenCount: number;
+  latencyTotal: number;
+  riskScoreTotal: number;
+}
+
+export interface DashboardWindowBucketRow {
+  bucketIndex: number;
+  monitored: boolean;
+  eventCount: number;
+  blockedCount: number;
+  escalatedCount: number;
+  l2Count: number;
+  l3Count: number;
+  riskActivationCount: number;
+  tokenCount: number;
+  latencyTotal: number;
+  riskScoreTotal: number;
+}
+
+export interface DashboardWindowHistory {
+  dimensions: DashboardWindowDimensionRow[];
+  buckets: DashboardWindowBucketRow[];
+  topSession?: {
+    sessionId: string;
+    userId: string;
+    workspacePath: string;
+    eventCount: number;
+    riskyEventCount: number;
+    riskScoreTotal: number;
+    lastEventAt: number;
+    dimensionCounts: Record<string, number>;
+  };
+  workspaces: Array<{
+    workspacePath: string;
+    sessionCount: number;
+    totalRiskScore: number;
+    worstSeverityRank: number;
+  }>;
+}
+
 function attrString(attributes: JudgedEvent['attributes'], key: string): string {
   const value = attributes[key];
   return value == null ? '' : String(value).trim();
@@ -323,6 +372,254 @@ export class ClickHouseStore {
     } catch (err) {
       console.error('[clickhouse] hydrate failed:', (err as Error).message);
       return [];
+    }
+  }
+
+  /** Read the latest persisted events from a bounded interval for dashboard timelines. */
+  async recentWindowEvents(
+    sinceMs: number,
+    untilMs: number,
+    limit: number,
+    options: { monitoredOnly?: boolean; tier?: string } = {},
+  ): Promise<JudgedEvent[] | null> {
+    if (!this.client || !this.ready) return null;
+    const safeLimit = Math.max(1, Math.min(5_000, Math.round(limit)));
+    const clauses = ['at >= {since:UInt64}', 'at <= {until:UInt64}'];
+    if (options.monitoredOnly) clauses.push("JSONExtractBool(attribution, 'monitored')");
+    if (options.tier) clauses.push('tier = {tier:String}');
+    try {
+      const rs = await this.client.query({
+        query: `
+          SELECT *
+          FROM (
+            SELECT *
+            FROM ${TABLE}
+            WHERE ${clauses.join(' AND ')}
+            ORDER BY at DESC, decisionUpdatedAt DESC
+            LIMIT {scanLimit:UInt32}
+          )
+          ORDER BY at DESC, decisionUpdatedAt DESC
+          LIMIT 1 BY eventId
+          LIMIT {limit:UInt32}`,
+        query_params: {
+          since: sinceMs,
+          until: untilMs,
+          tier: options.tier ?? '',
+          scanLimit: Math.min(15_000, safeLimit * 3),
+          limit: safeLimit,
+        },
+        format: 'JSONEachRow',
+      });
+      return (await rs.json() as Array<Record<string, unknown>>).map(fromRow);
+    } catch (error) {
+      console.error('[clickhouse] recent dashboard events query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  /**
+   * Aggregate the complete persisted interval instead of the bounded in-memory hot ring. The latest
+   * decision revision is selected per eventId before grouping, so a pending event later judged by
+   * L2/L3 is counted once with its final state.
+   */
+  async dashboardWindowHistory(startMs: number, endMs: number, bucketCount = 180): Promise<DashboardWindowHistory | null> {
+    if (!this.client || !this.ready) return null;
+    const spanMs = Math.max(1, endMs - startMs);
+    const queryStartMs = Math.max(0, startMs - spanMs);
+    const buckets = Math.max(1, Math.min(360, Math.round(bucketCount)));
+    const bucketMs = Math.max(1, Math.ceil(spanMs / buckets));
+    const latestMonitored = `
+      SELECT
+        eventId,
+        argMax(sourceEvent.at, sourceEvent.decisionUpdatedAt) AS eventAt,
+        argMax(sourceEvent.agentId, sourceEvent.decisionUpdatedAt) AS agentId,
+        argMax(sourceEvent.sessionId, sourceEvent.decisionUpdatedAt) AS sessionId,
+        argMax(sourceEvent.userId, sourceEvent.decisionUpdatedAt) AS userId,
+        argMax(sourceEvent.workspacePath, sourceEvent.decisionUpdatedAt) AS workspacePath,
+        argMax(sourceEvent.verdict, sourceEvent.decisionUpdatedAt) AS verdict,
+        argMax(sourceEvent.severity, sourceEvent.decisionUpdatedAt) AS severity,
+        argMax(sourceEvent.riskCategory, sourceEvent.decisionUpdatedAt) AS riskCategory,
+        argMax(sourceEvent.riskScore, sourceEvent.decisionUpdatedAt) AS riskScore,
+        argMax(sourceEvent.process, sourceEvent.decisionUpdatedAt) AS process,
+        argMax(sourceEvent.attribution, sourceEvent.decisionUpdatedAt) AS attribution
+      FROM ${TABLE} AS sourceEvent
+      WHERE sourceEvent.at >= {start:UInt64} AND sourceEvent.at <= {end:UInt64}
+        AND JSONExtractBool(sourceEvent.attribution, 'monitored')
+      GROUP BY eventId
+      HAVING JSONExtractBool(attribution, 'monitored')`;
+    try {
+      const [dimensionResult, bucketResult, sessionResult, workspaceResult] = await Promise.all([
+        this.client.query({
+          query: `
+            SELECT
+              if(at < {start:UInt64}, 'previous', 'current') AS period,
+              JSONExtractBool(attribution, 'monitored') AS monitored,
+              verdict,
+              tier,
+              riskType,
+              riskCategory,
+              argMax(riskName, decisionUpdatedAt) AS riskName,
+              uniqExact(eventId) AS eventCount,
+              sum(tokenCount) AS tokenCount,
+              sum(latencyMs) AS latencyTotal,
+              sum(riskScore) AS riskScoreTotal
+            FROM ${TABLE}
+            WHERE at >= {queryStart:UInt64} AND at <= {end:UInt64}
+              AND decisionStatus IN ('succeeded', 'failed', 'timeout')
+            GROUP BY period, monitored, verdict, tier, riskType, riskCategory`,
+          query_params: { queryStart: queryStartMs, start: startMs, end: endMs },
+          format: 'JSONEachRow',
+        }),
+        this.client.query({
+          query: `
+            SELECT
+              least({bucketCount:UInt32} - 1, intDiv(at - {start:UInt64}, {bucketMs:UInt64})) AS bucketIndex,
+              JSONExtractBool(attribution, 'monitored') AS monitored,
+              uniqExact(eventId) AS eventCount,
+              uniqExactIf(eventId, verdict = 'block' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS blockedCount,
+              uniqExactIf(eventId, verdict = 'escalate' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS escalatedCount,
+              uniqExactIf(eventId, tier IN ('Llm', 'Agent') AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS l2Count,
+              uniqExactIf(eventId, tier = 'Agent' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS l3Count,
+              uniqExactIf(eventId, verdict != 'allow' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS riskActivationCount,
+              sumIf(tokenCount, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS tokenCount,
+              sumIf(latencyMs, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS latencyTotal,
+              sumIf(riskScore, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS riskScoreTotal
+            FROM ${TABLE}
+            WHERE at >= {start:UInt64} AND at <= {end:UInt64}
+            GROUP BY bucketIndex, monitored
+            ORDER BY bucketIndex`,
+          query_params: { queryStart: queryStartMs, start: startMs, end: endMs, bucketCount: buckets, bucketMs },
+          format: 'JSONEachRow',
+        }),
+        this.client.query({
+          query: `
+            SELECT
+              if(
+                JSONExtractString(attribution, 'agentSessionId') != '',
+                JSONExtractString(attribution, 'agentSessionId'),
+                if(
+                  JSONExtractString(attribution, 'agentDisplayName') != '',
+                  JSONExtractString(attribution, 'agentDisplayName'),
+                  if(JSONExtractString(attribution, 'agentScopeId') != '', JSONExtractString(attribution, 'agentScopeId'), agentId)
+                )
+              ) AS sessionLabel,
+              argMax(userId, eventAt) AS userId,
+              argMax(
+                if(
+                  JSONExtractString(process, 'cwd') != '',
+                  JSONExtractString(process, 'cwd'),
+                  if(
+                    JSONExtractString(attribution, 'agentScopeId') != '',
+                    concat('agent://', JSONExtractString(attribution, 'agentScopeId')),
+                    workspacePath
+                  )
+                ),
+                eventAt
+              ) AS resolvedWorkspacePath,
+              count() AS eventCount,
+              countIf(verdict != 'allow') AS riskyEventCount,
+              sum(riskScore) AS riskScoreTotal,
+              max(eventAt) AS lastEventAt,
+              countIf(verdict != 'allow' AND riskCategory = 'command_danger') AS commandDanger,
+              countIf(verdict != 'allow' AND riskCategory = 'prompt_injection') AS promptInjection,
+              countIf(verdict != 'allow' AND riskCategory IN ('data_leak', 'secret_exfil')) AS dataLeak,
+              countIf(verdict != 'allow' AND riskCategory = 'communication_risk') AS communicationRisk,
+              countIf(verdict != 'allow' AND riskCategory IN ('systemic_risk', 'privilege_escalation')) AS systemicRisk
+            FROM (${latestMonitored})
+            GROUP BY sessionLabel
+            ORDER BY riskScoreTotal DESC
+            LIMIT 1`,
+          query_params: { start: startMs, end: endMs },
+          format: 'JSONEachRow',
+        }),
+        this.client.query({
+          query: `
+            SELECT
+              if(
+                JSONExtractString(process, 'cwd') != '',
+                JSONExtractString(process, 'cwd'),
+                if(
+                  JSONExtractString(attribution, 'agentScopeId') != '',
+                  concat('agent://', JSONExtractString(attribution, 'agentScopeId')),
+                  workspacePath
+                )
+              ) AS resolvedWorkspacePath,
+              uniqExact(
+                if(
+                  JSONExtractString(attribution, 'agentSessionId') != '',
+                  JSONExtractString(attribution, 'agentSessionId'),
+                  if(JSONExtractString(attribution, 'agentScopeId') != '', JSONExtractString(attribution, 'agentScopeId'), sessionId)
+                )
+              ) AS sessionCount,
+              sum(riskScore) AS totalRiskScore,
+              maxIf(
+                multiIf(severity = 'critical', 4, severity = 'high', 3, severity = 'medium', 2, severity = 'low', 1, 0),
+                verdict != 'allow'
+              ) AS worstSeverityRank
+            FROM (${latestMonitored})
+            GROUP BY resolvedWorkspacePath
+            ORDER BY totalRiskScore DESC
+            LIMIT 500`,
+          query_params: { start: startMs, end: endMs },
+          format: 'JSONEachRow',
+        }),
+      ]);
+      const num = (value: unknown): number => Number(value) || 0;
+      const dimensions = (await dimensionResult.json() as Array<Record<string, unknown>>).map<DashboardWindowDimensionRow>((row) => ({
+        period: String(row.period) === 'previous' ? 'previous' : 'current',
+        monitored: Boolean(num(row.monitored)),
+        verdict: String(row.verdict ?? ''),
+        tier: String(row.tier ?? ''),
+        riskType: String(row.riskType ?? ''),
+        riskCategory: String(row.riskCategory ?? ''),
+        riskName: String(row.riskName ?? ''),
+        eventCount: num(row.eventCount),
+        tokenCount: num(row.tokenCount),
+        latencyTotal: num(row.latencyTotal),
+        riskScoreTotal: num(row.riskScoreTotal),
+      }));
+      const bucketRows = (await bucketResult.json() as Array<Record<string, unknown>>).map<DashboardWindowBucketRow>((row) => ({
+        bucketIndex: num(row.bucketIndex),
+        monitored: Boolean(num(row.monitored)),
+        eventCount: num(row.eventCount),
+        blockedCount: num(row.blockedCount),
+        escalatedCount: num(row.escalatedCount),
+        l2Count: num(row.l2Count),
+        l3Count: num(row.l3Count),
+        riskActivationCount: num(row.riskActivationCount),
+        tokenCount: num(row.tokenCount),
+        latencyTotal: num(row.latencyTotal),
+        riskScoreTotal: num(row.riskScoreTotal),
+      }));
+      const sessionRows = await sessionResult.json() as Array<Record<string, unknown>>;
+      const top = sessionRows[0];
+      const topSession = top ? {
+        sessionId: String(top.sessionLabel ?? ''),
+        userId: String(top.userId ?? ''),
+        workspacePath: String(top.resolvedWorkspacePath ?? ''),
+        eventCount: num(top.eventCount),
+        riskyEventCount: num(top.riskyEventCount),
+        riskScoreTotal: num(top.riskScoreTotal),
+        lastEventAt: num(top.lastEventAt),
+        dimensionCounts: {
+          command_danger: num(top.commandDanger),
+          prompt_injection: num(top.promptInjection),
+          data_leak: num(top.dataLeak),
+          jailbreak: num(top.promptInjection),
+          communication_risk: num(top.communicationRisk),
+          systemic_risk: num(top.systemicRisk),
+        },
+      } : undefined;
+      const workspaces = (await workspaceResult.json() as Array<Record<string, unknown>>).map((row) => ({
+        workspacePath: String(row.resolvedWorkspacePath ?? ''),
+        sessionCount: num(row.sessionCount),
+        totalRiskScore: num(row.totalRiskScore),
+        worstSeverityRank: num(row.worstSeverityRank),
+      }));
+      return { dimensions, buckets: bucketRows, topSession, workspaces };
+    } catch (error) {
+      console.error('[clickhouse] dashboard window aggregation failed:', (error as Error).message);
+      return null;
     }
   }
 

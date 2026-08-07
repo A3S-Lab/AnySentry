@@ -66,6 +66,15 @@ services:
       ANYSENTRY_STREAM_EPISODES_TOPIC: ${ANYSENTRY_STREAM_EPISODES_TOPIC:-anysentry.risk-analysis-batches.v1}
       ANYSENTRY_STREAM_FINDINGS_TOPIC: ${ANYSENTRY_STREAM_FINDINGS_TOPIC:-anysentry.stream.findings.v1}
       ANYSENTRY_STREAM_DLQ_TOPIC: ${ANYSENTRY_STREAM_DLQ_TOPIC:-anysentry.stream.dlq.v1}
+      ANYSENTRY_FLINK_REST_URL: ${ANYSENTRY_FLINK_REST_URL:-http://flink-jobmanager:8081}
+      ANYSENTRY_FLINK_JOB_NAME: ${ANYSENTRY_FLINK_JOB_NAME:-AnySentry Flink Shadow Risk}
+      ANYSENTRY_ASSISTANT: ${ANYSENTRY_ASSISTANT:-on}
+      ANYSENTRY_ASSISTANT_CONCURRENCY: ${ANYSENTRY_ASSISTANT_CONCURRENCY:-2}
+      ANYSENTRY_ASSISTANT_TIMEOUT_MS: ${ANYSENTRY_ASSISTANT_TIMEOUT_MS:-90000}
+      ANYSENTRY_ASSISTANT_CONTEXT_TOKENS: ${ANYSENTRY_ASSISTANT_CONTEXT_TOKENS:-32768}
+      A3S_SENTRY_ASSISTANT_URL: ${A3S_SENTRY_ASSISTANT_URL:-http://host.docker.internal:18051/v1}
+      A3S_SENTRY_ASSISTANT_MODEL: ${A3S_SENTRY_ASSISTANT_MODEL:-minimax-m2.7}
+      A3S_SENTRY_ASSISTANT_KEY: ${A3S_SENTRY_ASSISTANT_KEY:-proxy-managed}
       A3S_SENTRY_LLM_URL: ${A3S_SENTRY_LLM_URL:-http://host.docker.internal:18051/v1}
       A3S_SENTRY_LLM_MODEL: ${A3S_SENTRY_LLM_MODEL:-glm-5.2}
       A3S_SENTRY_LLM_KEY: ${A3S_SENTRY_LLM_KEY:-}
@@ -93,7 +102,7 @@ services:
       ANYSENTRY_WORKER_ROLE: fast
       ANYSENTRY_REDIS_URL: redis://redis:6379/0
       ANYSENTRY_FAST_JUDGE_CONCURRENCY: 4
-      ANYSENTRY_L2_MODEL: ${ANYSENTRY_L2_MODEL:-deepseek-v4-flash}
+      ANYSENTRY_L2_MODEL: ${ANYSENTRY_L2_MODEL:-glm-5.2}
       ANYSENTRY_L2_CONTEXT_TOKENS: ${ANYSENTRY_L2_CONTEXT_TOKENS:-16384}
       A3S_SENTRY_LLM_URL: ${A3S_SENTRY_LLM_URL:-http://host.docker.internal:18051/v1}
       A3S_SENTRY_LLM_MODEL: ${A3S_SENTRY_LLM_MODEL:-glm-5.2}
@@ -113,7 +122,7 @@ services:
       ANYSENTRY_WORKER_ROLE: l3
       ANYSENTRY_REDIS_URL: redis://redis:6379/0
       ANYSENTRY_L3_CONCURRENCY: 2
-      ANYSENTRY_L3_TIMEOUT_MS: 120000
+      ANYSENTRY_L3_TIMEOUT_MS: 180000
       ANYSENTRY_L3_RETRY_TIMEOUT_MS: 180000
       ANYSENTRY_L3_ATTEMPTS: 2
       ANYSENTRY_L3_CONTEXT_TOKENS: 32768
@@ -245,10 +254,20 @@ services:
     command:
       - |
         until flink list -m flink-jobmanager:8081 >/dev/null 2>&1; do sleep 2; done
-        flink run -d \
-          -m flink-jobmanager:8081 \
-          -c org.a3s.anysentry.streaming.AnySentryStreamJob \
-          /opt/flink/usrlib/anysentry-flink-streaming.jar
+        while true; do
+          if flink list -m flink-jobmanager:8081 2>/dev/null \
+            | grep -Fq "AnySentry Flink Shadow Risk (RUNNING)"; then
+            sleep 15
+            continue
+          fi
+          echo "AnySentry Flink job is absent; submitting it"
+          flink run -d \
+            -m flink-jobmanager:8081 \
+            -c org.a3s.anysentry.streaming.AnySentryStreamJob \
+            /opt/flink/usrlib/anysentry-flink-streaming.jar || true
+          sleep 15
+        done
+    restart: unless-stopped
     environment:
       ANYSENTRY_STREAM_BOOTSTRAP_SERVERS: kafka:9092
       ANYSENTRY_STREAM_CANONICAL_TOPIC: ${ANYSENTRY_STREAM_CANONICAL_TOPIC:-anysentry.events.canonical.v1}
@@ -262,6 +281,7 @@ services:
       ANYSENTRY_FLINK_SUPPLY_CHAIN_CONTEXT_GROUP: ${ANYSENTRY_FLINK_SUPPLY_CHAIN_CONTEXT_GROUP:-anysentry-flink-supply-chain-context-v1}
       ANYSENTRY_FLINK_STARTUP_MODE: ${ANYSENTRY_FLINK_STARTUP_MODE:-latest}
       ANYSENTRY_FLINK_PARALLELISM: ${ANYSENTRY_FLINK_PARALLELISM:-2}
+      ANYSENTRY_FLINK_LEGACY_COMPOSITE_ENABLED: ${ANYSENTRY_FLINK_LEGACY_COMPOSITE_ENABLED:-off}
 
   stream-worker:
     profiles: ["streaming"]
@@ -283,6 +303,7 @@ services:
       ANYSENTRY_STREAM_FINDINGS_TOPIC: ${ANYSENTRY_STREAM_FINDINGS_TOPIC:-anysentry.stream.findings.v1}
       ANYSENTRY_STREAM_CONSUMER_GROUP: ${ANYSENTRY_STREAM_CONSUMER_GROUP:-anysentry-stream-findings}
       ANYSENTRY_STREAM_EPISODE_CONSUMER_GROUP: ${ANYSENTRY_STREAM_EPISODE_CONSUMER_GROUP:-anysentry-stream-episodes}
+      ANYSENTRY_LEGACY_COMPOSITE_ENABLED: ${ANYSENTRY_LEGACY_COMPOSITE_ENABLED:-off}
       ANYSENTRY_COMPOSITE_MAX_EVENT_AGE_MS: ${ANYSENTRY_COMPOSITE_MAX_EVENT_AGE_MS:-900000}
       KAFKAJS_NO_PARTITIONER_WARNING: "1"
       CLICKHOUSE_URL: http://clickhouse:8123
@@ -306,7 +327,7 @@ services:
       ANYSENTRY_REDIS_URL: redis://redis:6379/0
       ANYSENTRY_COMPOSITE_LLM_URL: ${ANYSENTRY_COMPOSITE_LLM_URL:-http://host.docker.internal:18051/v1}
       ANYSENTRY_COMPOSITE_LLM_KEY: ${ANYSENTRY_COMPOSITE_LLM_KEY:-proxy-managed}
-      ANYSENTRY_COMPOSITE_MODEL: ${ANYSENTRY_COMPOSITE_MODEL:-deepseek-v4-flash}
+      ANYSENTRY_COMPOSITE_MODEL: ${ANYSENTRY_COMPOSITE_MODEL:-glm-5.2}
       ANYSENTRY_COMPOSITE_TIMEOUT_MS: ${ANYSENTRY_COMPOSITE_TIMEOUT_MS:-60000}
       ANYSENTRY_COMPOSITE_CONCURRENCY: ${ANYSENTRY_COMPOSITE_CONCURRENCY:-2}
       ANYSENTRY_COMPOSITE_MAX_EVENT_AGE_MS: ${ANYSENTRY_COMPOSITE_MAX_EVENT_AGE_MS:-900000}
@@ -319,7 +340,6 @@ services:
     restart: unless-stopped
 
   supply-chain-assessment:
-    profiles: ["supply-chain"]
     image: ghcr.io/a3s-lab/anysentry:latest
     labels: *anysentry-infrastructure-labels
     depends_on:

@@ -1,16 +1,28 @@
 import { useRequest } from "ahooks";
 import dayjs from "dayjs";
 import {
+  Activity,
   ArrowLeft,
+  BellRing,
   CalendarClock,
   CheckCircle2,
   Clock3,
   FileText,
+  GitBranch,
+  LayoutDashboard,
   LoaderCircle,
+  Radar,
   RefreshCw,
   Save,
   Search,
   ScrollText,
+  ServerCog,
+  ShieldAlert,
+  Siren,
+  SlidersHorizontal,
+  Sparkles,
+  TerminalSquare,
+  Wrench,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
@@ -27,7 +39,20 @@ import {
   type SecurityTimeType,
   securityCenterApi,
 } from "@/lib/api/security-center";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
+
+const MONITORING_NAV_ITEMS = [
+  { view: "overview", label: "运行总览", description: "平台健康与实时状态", icon: Activity },
+  { view: "scan", label: "实时扫描", description: "可解释扫描与研判漏斗", icon: Radar },
+  { view: "risk", label: "风险态势", description: "风险分类与趋势分布", icon: Siren },
+  { view: "stream", label: "复合研判", description: "Flink 连续行为关联", icon: Sparkles },
+] as const;
+
+const PLATFORM_NAV_ITEMS = [
+  { view: "events", label: "运行链路", description: "无侵入事件时间线", icon: GitBranch },
+  { view: "workspace", label: "会话与工作区", description: "Agent 与 Workspace 风险", icon: TerminalSquare },
+] as const;
 
 const TIME_OPTIONS: Array<{ value: SecurityTimeType; label: string }> = [
   { value: "last_3h", label: "近3小时" },
@@ -268,6 +293,7 @@ function WindowRow({ item, active, onSelect }: { item: MaintenanceWindowItem; ac
 }
 
 export default function MaintenancePage() {
+  const { t } = useI18n();
   const [searchParams, setSearchParams] = useSearchParams();
   const routeTargetId = searchParams.get("targetId") ?? searchParams.get("sourceId") ?? "";
   const routeTargetType = searchParams.get("targetType");
@@ -356,11 +382,123 @@ export default function MaintenancePage() {
   };
 
   return (
-    <div className="flex h-full w-full flex-col overflow-hidden bg-[#0b0f0c] text-zinc-100">
+    <div className="flex h-full w-full overflow-hidden bg-[#0a0d12] text-zinc-100">
+      <aside className="hidden">
+        <nav className="space-y-1" aria-label={t("安全监控模块")}>
+          <p className="flex items-center gap-2 px-3 pb-1 pt-3 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <LayoutDashboard className="size-3.5" />
+            {t("概览")}
+          </p>
+          {MONITORING_NAV_ITEMS.map((item) => {
+            const Icon = item.icon;
+            return (
+              <Link
+                key={item.view}
+                to={`/?view=${item.view}`}
+                className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+              >
+                <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+                  <Icon className="size-3.5" />
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-xs font-semibold leading-[1.45]">{t(item.label)}</span>
+                  <span className="mt-0.5 block text-[10.5px] leading-4 text-[#5b6373]">{t(item.description)}</span>
+                </span>
+              </Link>
+            );
+          })}
+          <Link
+            to="/alerts"
+            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+          >
+            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+              <BellRing className="size-3.5" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-xs font-semibold leading-[1.45]">{t("告警")}</span>
+              <span className="mt-0.5 block text-[10.5px] leading-4 text-[#5b6373]">{t("活跃告警与处置")}</span>
+            </span>
+          </Link>
+
+          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <ServerCog className="size-3.5" />
+            {t("平台监控")}
+          </p>
+          {PLATFORM_NAV_ITEMS.map((item) => {
+            const Icon = item.icon;
+            return (
+              <Link
+                key={item.view}
+                to={`/?view=${item.view}`}
+                className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+              >
+                <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+                  <Icon className="size-3.5" />
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-xs font-semibold leading-[1.45]">{t(item.label)}</span>
+                  <span className="mt-0.5 block text-[10.5px] leading-4 text-[#5b6373]">{t(item.description)}</span>
+                </span>
+              </Link>
+            );
+          })}
+
+          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <Wrench className="size-3.5" />
+            {t("运维")}
+          </p>
+          <div
+            aria-current="page"
+            className="flex w-full items-start gap-2.5 rounded-md border border-transparent bg-[#1c222d] px-2.5 py-2 text-left text-[#e8ecf3] shadow-[inset_2px_0_0_#f97316]"
+          >
+            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#f97316]">
+              <CalendarClock className="size-3.5" />
+            </span>
+            <span className="block text-xs font-semibold leading-[1.45]">{t("维护")}</span>
+          </div>
+          <Link
+            to="/admin/policy"
+            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+          >
+            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+              <SlidersHorizontal className="size-3.5" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-xs font-semibold leading-[1.45]">{t("策略配置")}</span>
+              <span className="mt-0.5 block text-[10.5px] leading-4 text-[#5b6373]">{t("L1 / L2 / L3 研判策略")}</span>
+            </span>
+          </Link>
+
+          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <ShieldAlert className="size-3.5" />
+            {t("安全治理")}
+          </p>
+          <Link
+            to="/?view=supplyChain"
+            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+          >
+            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+              <ShieldAlert className="size-3.5" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-xs font-semibold leading-[1.45]">{t("供应链漏洞")}</span>
+              <span className="mt-0.5 block text-[10.5px] leading-4 text-[#5b6373]">{t("OSV 依赖漏洞资产")}</span>
+            </span>
+          </Link>
+
+          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <SlidersHorizontal className="size-3.5" />
+            {t("管理")}
+          </p>
+          <AdminTokenControl navigation />
+        </nav>
+      </aside>
+
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
       <header className="shrink-0 border-b border-white/10 bg-[#0b0f0c] px-4 py-3">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex min-w-0 items-center gap-3">
-            <Button asChild variant="secondary" size="sm" className="h-9 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
+            <Button asChild variant="secondary" size="sm" className="h-9 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10 lg:hidden">
               <Link to="/">
                 <ArrowLeft className="size-3.5" />
                 返回
@@ -375,7 +513,9 @@ export default function MaintenancePage() {
             </div>
           </div>
           <div className="flex items-center gap-2 text-xs text-zinc-500">
-            <AdminTokenControl compact />
+            <div className="lg:hidden">
+              <AdminTokenControl compact />
+            </div>
             <Clock3 className="size-3.5" />
             <span>{data?.updateTime ? formatDate(data.updateTime) : "等待刷新"}</span>
           </div>
@@ -556,6 +696,7 @@ export default function MaintenancePage() {
           </div>
         </div>
       </main>
+      </div>
     </div>
   );
 }

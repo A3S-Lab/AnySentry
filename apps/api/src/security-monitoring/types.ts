@@ -67,6 +67,7 @@ export interface ProcessContext {
   ppid?: number;
   startTimeTicks?: string;
   startTimeNs?: string;
+  mountNamespace?: number;
   eventTimeNs?: string;
   comm?: string;
   exe?: string;
@@ -828,6 +829,8 @@ export interface Incident {
   lastEventAt: number;
   lastEventSubject: string;
   maxRiskScore: number;
+  monitored?: boolean;
+  agentScopeId?: string;
 }
 export interface IncidentListItem extends Omit<Incident, 'openedAt' | 'updatedAt' | 'acknowledgedAt' | 'resolvedAt'> {
   openedAt: string;
@@ -1478,6 +1481,8 @@ export interface AlertRecord {
   occurrenceCount: number;
   lastNotificationAt?: number;
   labels: Record<string, string>;
+  monitored?: boolean;
+  agentScopeId?: string;
 }
 export interface AlertListItem extends Omit<AlertRecord, 'firstSeenAt' | 'lastSeenAt' | 'updatedAt' | 'acknowledgedAt' | 'resolvedAt' | 'silencedUntil' | 'lastNotificationAt'> {
   firstSeenAt: string;
@@ -1802,6 +1807,7 @@ export interface IngestionSourceQuery {
   workspacePath?: string;
   status?: IngestionSourceStatus | 'all';
   type?: IngestionSourceType | 'all';
+  includeVerification?: boolean;
   q?: string;
   limit?: number;
 }
@@ -1963,6 +1969,7 @@ export interface RemediationListItem extends Omit<RemediationRecord, 'createdAt'
   completedAt?: string;
 }
 export interface RemediationQuery extends SecurityTimeFilter {
+  includeBacklog?: boolean;
   taskId?: string;
   incidentId?: string;
   alertId?: string;
@@ -2012,6 +2019,7 @@ export type AuditActorType = 'system' | 'operator' | 'api';
 export type AuditAction =
   | 'policy.updated'
   | 'policy.simulated'
+  | 'supply-chain.config.updated'
   | 'incident.updated'
   | 'alert.updated'
   | 'remediation.updated'
@@ -2026,7 +2034,7 @@ export type AuditAction =
   | 'objective.updated'
   | 'source.updated'
   | 'source.token_rotated';
-export type AuditResourceType = 'policy' | 'incident' | 'alert' | 'remediation' | 'agent' | 'event' | 'maintenance' | 'notification' | 'objective' | 'source';
+export type AuditResourceType = 'policy' | 'supply-chain' | 'incident' | 'alert' | 'remediation' | 'agent' | 'event' | 'maintenance' | 'notification' | 'objective' | 'source';
 export type AuditResult = 'success' | 'failure';
 export interface AuditActor {
   type: AuditActorType;
@@ -2077,4 +2085,52 @@ export interface AuditList {
   total: number;
   summary: AuditSummary;
   updateTime: string;
+}
+
+export type SecurityAssistantLocale = 'en' | 'zh-CN';
+export type SecurityAssistantMessageRole = 'user' | 'assistant';
+
+export interface SecurityAssistantMessage {
+  role: SecurityAssistantMessageRole;
+  content: string;
+}
+
+export interface SecurityAssistantContext {
+  path?: string;
+  view?: string;
+  timeType?: SecurityTimeFilter['timeType'];
+  startTime?: string;
+  endTime?: string;
+  agentId?: string;
+  workspacePath?: string;
+  eventId?: string;
+  traceId?: string;
+  incidentId?: string;
+  alertId?: string;
+}
+
+export interface SecurityAssistantQuery {
+  sessionId?: string;
+  question: string;
+  locale?: SecurityAssistantLocale;
+  history?: SecurityAssistantMessage[];
+  context?: SecurityAssistantContext;
+}
+
+export interface SecurityAssistantReference {
+  kind: 'event' | 'alert' | 'incident' | 'episode' | 'vulnerability' | 'view';
+  id: string;
+  label: string;
+  href: string;
+}
+
+export interface SecurityAssistantAnswer {
+  sessionId: string;
+  answer: string;
+  model: string;
+  elapsedMs: number;
+  totalTokens: number;
+  evidenceSummary: string;
+  references: SecurityAssistantReference[];
+  readOnly: true;
 }

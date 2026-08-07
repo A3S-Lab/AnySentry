@@ -24,6 +24,7 @@ import {
 import { useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import { OperationalEmptyState } from "@/components/custom/operational-empty-state";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -482,7 +483,13 @@ export default function CollectorsPage() {
                   加载采集器...
                 </div>
               ) : (data?.items?.length ?? 0) === 0 ? (
-                <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">暂无 Collector 心跳</div>
+                <OperationalEmptyState
+                  icon={RadioTower}
+                  title="尚未收到 Collector 心跳"
+                  description="启动 Observer Collector 与 Forwarder 后，节点心跳、吞吐、丢弃量和覆盖范围会自动出现在这里。"
+                  primary={{ label: "配置接入源", href: "/sources" }}
+                  secondary={{ label: "查看覆盖缺口", href: "/coverage" }}
+                />
               ) : (
                 <div className="max-h-[calc(100vh-300px)] overflow-y-auto">
                   {data?.items.map((collector) => (

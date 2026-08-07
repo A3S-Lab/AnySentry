@@ -88,6 +88,54 @@ export interface SecurityTimeFilter {
   scope?: "agent" | "raw";
 }
 
+export type SecurityAssistantLocale = "en" | "zh-CN";
+export type SecurityAssistantMessageRole = "user" | "assistant";
+
+export interface SecurityAssistantMessage {
+  role: SecurityAssistantMessageRole;
+  content: string;
+}
+
+export interface SecurityAssistantContext {
+  path?: string;
+  view?: string;
+  timeType?: SecurityTimeType;
+  startTime?: string;
+  endTime?: string;
+  agentId?: string;
+  workspacePath?: string;
+  eventId?: string;
+  traceId?: string;
+  incidentId?: string;
+  alertId?: string;
+}
+
+export interface SecurityAssistantQuery {
+  sessionId?: string;
+  question: string;
+  locale?: SecurityAssistantLocale;
+  history?: SecurityAssistantMessage[];
+  context?: SecurityAssistantContext;
+}
+
+export interface SecurityAssistantReference {
+  kind: "event" | "alert" | "incident" | "episode" | "vulnerability" | "view";
+  id: string;
+  label: string;
+  href: string;
+}
+
+export interface SecurityAssistantAnswer {
+  sessionId: string;
+  answer: string;
+  model: string;
+  elapsedMs: number;
+  totalTokens: number;
+  evidenceSummary: string;
+  references: SecurityAssistantReference[];
+  readOnly: true;
+}
+
 export interface SecurityHealthCard {
   healthScore: number;
   healthStatusText: string;
@@ -577,6 +625,7 @@ export interface SupplyChainFinding {
   component: SupplyChainComponent;
   vulnerability: {
     id: string;
+    canonicalId?: string;
     modified: string;
     published?: string;
     withdrawn?: string;
@@ -601,7 +650,23 @@ export interface SupplyChainFinding {
   lastObservedAt: number;
   priority: "P0" | "P1" | "P2" | "P3";
   priorityScore: number;
+  priorityFactors: Array<{
+    code: "severity" | "deployed" | "direct_dependency" | "runtime_scope";
+    score: number;
+    reason: string;
+  }>;
   deploymentStatus: "confirmed" | "unknown";
+  remediation: {
+    action:
+      | "upgrade_direct_dependency"
+      | "upgrade_parent_dependency"
+      | "upgrade_component"
+      | "update_deployed_artifact"
+      | "monitor_advisory";
+    summary: string;
+    candidateFixedVersion?: string;
+    requiresArtifactRebuild: boolean;
+  };
   shadow: true;
 }
 
@@ -609,11 +674,68 @@ export interface SupplyChainOverview {
   enabled: boolean;
   runtimeCorrelationEnabled: boolean;
   workspaces: number;
+  workspaceOptions: Array<{
+    workspaceId: string;
+    repositoryId: string;
+    displayName: string;
+    sourceId?: string;
+    environmentId?: string;
+  }>;
   activeSnapshots: number;
   openFindings: number;
   staleFindings: number;
   latestAssessmentAt?: number;
   findings: SupplyChainFinding[];
+}
+
+export interface SupplyChainScanTask {
+  taskId: string;
+  workspaceId: string;
+  scannerId: string;
+  reason: "initial" | "dependency_descriptor_changed" | "runtime_install" | "manual" | "retry";
+  status: "pending" | "leased" | "completed" | "failed";
+  createdAt: number;
+  updatedAt: number;
+  attempt: number;
+}
+
+export interface SupplyChainControlConfig {
+  schemaVersion: "anysentry.supply_chain_control.v1";
+  enabled: boolean;
+  dailyRefreshEnabled: boolean;
+  runtimeCorrelationEnabled: boolean;
+  selectedWorkspaceIds: string[];
+  updatedAt: number;
+}
+
+export interface SupplyChainRuntimeReadiness {
+  serviceReady: boolean;
+  scannerAuthConfigured: boolean;
+  assessmentWorkerOnline: boolean;
+  runtimeCorrelationAvailable: boolean;
+  readyForInitialScan: boolean;
+  scanners: Array<{
+    scannerId: string;
+    online: boolean;
+    lastSeenAt?: number;
+    workspaceIds: string[];
+  }>;
+  issues: string[];
+}
+
+export interface SupplyChainControlResponse {
+  config: SupplyChainControlConfig;
+  readiness: SupplyChainRuntimeReadiness;
+  workspaceOptions: Array<{
+    workspaceId: string;
+    repositoryId: string;
+    displayName: string;
+    sourceId?: string;
+    environmentId?: string;
+    scannerId: string;
+  }>;
+  scanTasks?: SupplyChainScanTask[];
+  runtimeAssessmentsQueued?: number;
 }
 
 export interface AgentTimeline {
@@ -1770,6 +1892,8 @@ export interface AlertListItem {
   occurrenceCount: number;
   lastNotificationAt?: string;
   labels: Record<string, string>;
+  monitored?: boolean;
+  agentScopeId?: string;
 }
 
 export interface AlertListQuery extends SecurityTimeFilter {
@@ -2070,6 +2194,7 @@ export interface IngestionSourceQuery {
   workspacePath?: string;
   status?: IngestionSourceStatus | "all";
   type?: IngestionSourceType | "all";
+  includeVerification?: boolean;
   q?: string;
   limit?: number;
 }
@@ -2239,6 +2364,7 @@ export interface RemediationListItem {
 }
 
 export interface RemediationQuery extends SecurityTimeFilter {
+  includeBacklog?: boolean;
   taskId?: string;
   incidentId?: string;
   alertId?: string;
@@ -2474,6 +2600,8 @@ export interface PlatformHealth {
 
 export const securityCenterApi = {
   healthz: () => apiClient.get<PlatformHealth>("/security-center/healthz"),
+  assistantQuery: (body: SecurityAssistantQuery) =>
+    apiClient.postLong<SecurityAssistantAnswer>("/security-center/assistant/query", body),
   healthCard: (filter: SecurityTimeFilter) =>
     apiClient.post<SecurityHealthCard>("/security-center/top/healthCard", filter),
   explainabilityScan: (filter: SecurityExplainabilityScanRequest) =>
@@ -2509,6 +2637,15 @@ export const securityCenterApi = {
     apiClient.post<StreamFindingList>("/security-center/stream/findings", filter),
   supplyChainOverview: (limit = 100) =>
     apiClient.get<SupplyChainOverview>(`/security-center/supply-chain/overview?limit=${limit}`),
+  supplyChainConfig: () =>
+    apiClient.get<SupplyChainControlResponse>("/security-center/supply-chain/config"),
+  updateSupplyChainConfig: (body: Partial<SupplyChainControlConfig> & { runInitialScan?: boolean }) =>
+    apiClient.put<SupplyChainControlResponse>("/security-center/supply-chain/config", body),
+  scanSupplyChainWorkspace: (workspaceId: string) =>
+    apiClient.post<{ task: SupplyChainScanTask }>(
+      `/security-center/supply-chain/workspaces/${encodeURIComponent(workspaceId)}/scan`,
+      { reason: "manual" },
+    ),
   evidenceBundle: (filter: EvidenceBundleQuery) =>
     apiClient.post<EvidenceBundle>("/security-center/evidence/bundle", filter),
   evidenceExport: (filter: EvidenceBundleExportQuery) =>
@@ -2676,6 +2813,7 @@ export function streamAgentObservability(
   if (filter.timeType) qs.set("timeType", filter.timeType);
   if (filter.startTime) qs.set("startTime", filter.startTime);
   if (filter.endTime) qs.set("endTime", filter.endTime);
+  if (filter.scope) qs.set("scope", filter.scope);
   const url = `/security-center/sessions/agentObservability/stream${qs.toString() ? `?${qs.toString()}` : ""}`;
 
   const consumeBlock = (block: string) => {

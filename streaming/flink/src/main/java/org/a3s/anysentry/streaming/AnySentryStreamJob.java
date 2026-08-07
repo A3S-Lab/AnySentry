@@ -41,6 +41,10 @@ public final class AnySentryStreamJob {
         String judgmentsGroup = env("ANYSENTRY_FLINK_JUDGMENTS_GROUP", "anysentry-flink-judgments-v2");
         String startupMode = env("ANYSENTRY_FLINK_STARTUP_MODE", "latest");
         int parallelism = Integer.parseInt(env("ANYSENTRY_FLINK_PARALLELISM", "2"));
+        boolean legacyCompositeEnabled = enabled(
+                "ANYSENTRY_FLINK_LEGACY_COMPOSITE_ENABLED",
+                false
+        );
 
         Configuration configuration = new Configuration();
         configuration.set(RestartStrategyOptions.RESTART_STRATEGY, "fixed-delay");
@@ -84,9 +88,10 @@ public final class AnySentryStreamJob {
                 WatermarkStrategy.noWatermarks(),
                 "canonical-events"
         );
-        SingleOutputStreamOperator<CanonicalEvent> canonical = raw
+        SingleOutputStreamOperator<CanonicalEvent> validatedCanonical = raw
                 .process(new CanonicalEventParser())
-                .name("canonical-schema-validation")
+                .name("canonical-schema-validation");
+        SingleOutputStreamOperator<CanonicalEvent> canonical = validatedCanonical
                 .assignTimestampsAndWatermarks(
                         WatermarkStrategy.<CanonicalEvent>forBoundedOutOfOrderness(Duration.ofSeconds(30))
                                 .withTimestampAssigner((event, timestamp) -> event.eventTime)
@@ -121,7 +126,7 @@ public final class AnySentryStreamJob {
                 .process(new RiskCorrelationFunction())
                 .name("risk-profile-and-composite-correlation");
 
-        DataStream<RiskAnalysisBatch> episodes = enrichedCanonical
+        SingleOutputStreamOperator<RiskAnalysisBatch> episodes = enrichedCanonical
                 .filter(AnySentryStreamJob::episodeRelevant)
                 .name("episode-relevant-events")
                 .map(BehaviorSignal::from)
@@ -130,6 +135,25 @@ public final class AnySentryStreamJob {
                 .keyBy(BehaviorSignal::episodeKey)
                 .process(new EpisodeBuilderFunction())
                 .name("risk-analysis-episode-builder");
+        SingleOutputStreamOperator<RiskAnalysisBatch> temporalEpisodes = enrichedCanonical
+                .filter(AnySentryStreamJob::temporalRelevant)
+                .name("temporal-relevant-events")
+                .map(BehaviorSignal::from)
+                .name("temporal-behavior-facts")
+                .keyBy(BehaviorSignal::episodeKey)
+                .process(new TemporalEpisodeBuilderFunction())
+                .name("temporal-episode-v1-builder");
+        SingleOutputStreamOperator<RiskAnalysisBatch> supplyChainTemporalEpisodes = enrichedCanonical
+                .filter(AnySentryStreamJob::supplyChainTemporalRelevant)
+                .name("supply-chain-temporal-relevant-events")
+                .map(BehaviorSignal::from)
+                .name("supply-chain-temporal-facts")
+                .keyBy(BehaviorSignal::episodeKey)
+                .process(new SupplyChainTemporalEpisodeBuilderFunction())
+                .name("supply-chain-temporal-v2-builder");
+        DataStream<RiskAnalysisBatch> allEpisodes = legacyCompositeEnabled
+                ? episodes.union(temporalEpisodes, supplyChainTemporalEpisodes)
+                : temporalEpisodes.union(supplyChainTemporalEpisodes);
 
         KafkaSink<StreamFinding> findingSink = KafkaSink.<StreamFinding>builder()
                 .setBootstrapServers(brokers)
@@ -151,7 +175,7 @@ public final class AnySentryStreamJob {
                         .setValueSerializationSchema(new EpisodeValueSerializationSchema())
                         .build())
                 .build();
-        episodes.sinkTo(episodeSink).name("risk-analysis-batches");
+        allEpisodes.sinkTo(episodeSink).name("risk-analysis-batches");
 
         KafkaSink<String> dlqSink = KafkaSink.<String>builder()
                 .setBootstrapServers(brokers)
@@ -161,10 +185,15 @@ public final class AnySentryStreamJob {
                         .setValueSerializationSchema(new SimpleStringSchema())
                         .build())
                 .build();
-        canonical.getSideOutput(CanonicalEventParser.DLQ)
+        validatedCanonical.getSideOutput(CanonicalEventParser.DLQ)
                 .union(
                         judgmentSignals.getSideOutput(CanonicalEventParser.DLQ),
-                        supplyChainContexts.getSideOutput(CanonicalEventParser.DLQ)
+                        supplyChainContexts.getSideOutput(CanonicalEventParser.DLQ),
+                        episodes.getSideOutput(EpisodeBuilderFunction.LATE_EVENTS),
+                        temporalEpisodes.getSideOutput(TemporalEpisodeBuilderFunction.REJECTED_FACTS),
+                        supplyChainTemporalEpisodes.getSideOutput(
+                                SupplyChainTemporalEpisodeBuilderFunction.REJECTED_FACTS
+                        )
                 )
                 .sinkTo(dlqSink)
                 .name("stream-dlq");
@@ -175,6 +204,15 @@ public final class AnySentryStreamJob {
     private static String env(String key, String fallback) {
         String value = System.getenv(key);
         return value == null || value.isBlank() ? fallback : value;
+    }
+
+    private static boolean enabled(String key, boolean fallback) {
+        String value = System.getenv(key);
+        if (value == null || value.isBlank()) return fallback;
+        return "1".equals(value)
+                || "true".equalsIgnoreCase(value)
+                || "on".equalsIgnoreCase(value)
+                || "yes".equalsIgnoreCase(value);
     }
 
     private static OffsetsInitializer startingOffsets(String mode) {
@@ -192,6 +230,24 @@ public final class AnySentryStreamJob {
 
     private static boolean profileRelevant(CanonicalEvent event) {
         return !event.platformRuntime && !event.synthetic;
+    }
+
+    private static boolean temporalRelevant(CanonicalEvent event) {
+        if (event.platformRuntime || event.failed || event.operation == null) return false;
+        return switch (event.operation) {
+            case "download", "file_write", "chmod", "execute", "encode", "compress",
+                    "persistence_activate", "sandbox_probe", "privilege_change",
+                    "target_discovery", "destroy", "remote_connect", "remote_execute",
+                    "remote_copy" -> true;
+            case "file_read" -> event.sensitiveResource;
+            case "egress" -> event.externalDestination;
+            default -> false;
+        };
+    }
+
+    private static boolean supplyChainTemporalRelevant(CanonicalEvent event) {
+        if (event.platformRuntime || event.failed) return false;
+        return SupplyChainTemporalMatcher.relevant(BehaviorSignal.from(event));
     }
 
     private static final class FindingKeySerializationSchema

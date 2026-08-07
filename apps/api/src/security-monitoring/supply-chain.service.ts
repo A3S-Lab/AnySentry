@@ -1,5 +1,6 @@
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { Queue } from 'bullmq';
+import { readFileSync } from 'node:fs';
 import IORedis from 'ioredis';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { redisConnection } from './judgment-queue.service';
@@ -19,7 +20,11 @@ import {
   ScanReason,
   SubmitScanResultRequest,
   SUPPLY_CHAIN_ASSESSMENT_QUEUE,
+  SUPPLY_CHAIN_ASSESSMENT_WORKER_HEARTBEAT_KEY,
+  SUPPLY_CHAIN_SCANNER_HEARTBEAT_PREFIX,
   SupplyChainAssessmentJob,
+  SupplyChainControlConfig,
+  SupplyChainControlResponse,
   SupplyChainOverview,
   WorkspaceRegistration,
   WorkspaceScanTask,
@@ -40,6 +45,7 @@ const INSTALL_DEBOUNCE_MS = Math.max(
   Number(process.env.ANYSENTRY_RUNTIME_INSTALL_DEBOUNCE_MS || 10_000),
 );
 const MAX_COMPONENTS = 100_000;
+const HEARTBEAT_TTL_MS = 20_000;
 
 interface RuntimeInstallIntent {
   workspacePath: string;
@@ -100,20 +106,64 @@ function installIntentKey(event: JudgedEvent, observed: RuntimeInstallEvent): st
 
 @Injectable()
 export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
-  readonly enabled = process.env.ANYSENTRY_SUPPLY_CHAIN === 'on';
   private readonly store = new SupplyChainStore();
   private redis?: IORedis;
   private assessmentQueue?: Queue<SupplyChainAssessmentJob>;
   private installTimer?: NodeJS.Timeout;
   private drainingInstallScans = false;
+  private serviceReady = false;
+  private control: SupplyChainControlConfig = {
+    schemaVersion: 'anysentry.supply_chain_control.v1',
+    enabled: process.env.ANYSENTRY_SUPPLY_CHAIN === 'on',
+    dailyRefreshEnabled: true,
+    runtimeCorrelationEnabled: process.env.ANYSENTRY_SUPPLY_CHAIN_RUNTIME === 'on',
+    selectedWorkspaceIds: [],
+    updatedAt: 0,
+  };
+
+  get enabled(): boolean {
+    return this.control.enabled && this.serviceReady;
+  }
+
+  private get runtimeCorrelationConfigured(): boolean {
+    return process.env.ANYSENTRY_SUPPLY_CHAIN_RUNTIME === 'on'
+      && process.env.ANYSENTRY_STREAMING === 'on';
+  }
+
+  private async runtimeCorrelationOnline(): Promise<boolean> {
+    if (!this.runtimeCorrelationConfigured) return false;
+    const endpoint = (
+      process.env.ANYSENTRY_FLINK_REST_URL
+      || 'http://flink-jobmanager:8081'
+    ).replace(/\/$/, '');
+    const expectedName = (
+      process.env.ANYSENTRY_FLINK_JOB_NAME
+      || 'AnySentry Flink Shadow Risk'
+    ).trim();
+    try {
+      const response = await fetch(`${endpoint}/jobs/overview`, {
+        signal: AbortSignal.timeout(1_500),
+      });
+      if (!response.ok) return false;
+      const payload = await response.json() as {
+        jobs?: Array<{ name?: string; state?: string }>;
+      };
+      return (payload.jobs || []).some((job) =>
+        job.name === expectedName && job.state === 'RUNNING');
+    } catch {
+      return false;
+    }
+  }
 
   async onModuleInit(): Promise<void> {
-    if (!this.enabled) return;
-    if (!process.env.ANYSENTRY_WORKSPACE_SCANNER_TOKEN?.trim()
-      && !process.env.ANYSENTRY_WORKSPACE_SCANNER_TOKENS?.trim()) {
-      throw new Error('a Workspace Scanner token is required when supply-chain scanning is enabled');
+    if (!(await this.store.init())) return;
+    const saved = await this.store.loadControl();
+    if (saved) {
+      this.control = this.sanitizeControl(saved);
+    } else {
+      this.control = { ...this.control, updatedAt: Date.now() };
+      await this.store.saveControl(this.control);
     }
-    if (!(await this.store.init())) throw new Error('supply-chain ClickHouse store is unavailable');
     this.redis = new IORedis(
       process.env.ANYSENTRY_REDIS_URL || 'redis://redis:6379/0',
       { maxRetriesPerRequest: null },
@@ -130,6 +180,7 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
         },
       },
     );
+    this.serviceReady = true;
     this.installTimer = setInterval(() => {
       void this.drainRuntimeInstallScans();
     }, 2_000);
@@ -138,8 +189,197 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
   }
 
   private requireRedis(): IORedis {
-    if (!this.enabled || !this.redis) throw new Error('supply-chain service is disabled');
+    if (!this.serviceReady || !this.redis) throw new Error('supply-chain service is unavailable');
     return this.redis;
+  }
+
+  private scannerAuthConfigured(): boolean {
+    const tokenFile = process.env.ANYSENTRY_WORKSPACE_SCANNER_TOKEN_FILE?.trim();
+    let tokenFileConfigured = false;
+    if (tokenFile) {
+      try {
+        tokenFileConfigured = readFileSync(tokenFile, 'utf8').trim().length >= 32;
+      } catch {
+        tokenFileConfigured = false;
+      }
+    }
+    return Boolean(
+      process.env.ANYSENTRY_WORKSPACE_SCANNER_TOKEN?.trim()
+      || process.env.ANYSENTRY_WORKSPACE_SCANNER_TOKENS?.trim()
+      || tokenFileConfigured,
+    );
+  }
+
+  private sanitizeControl(input: Partial<SupplyChainControlConfig>): SupplyChainControlConfig {
+    const selectedWorkspaceIds = Array.isArray(input.selectedWorkspaceIds)
+      ? [...new Set(input.selectedWorkspaceIds
+        .map((value) => String(value ?? '').trim())
+        .filter(Boolean))]
+        .slice(0, 500)
+      : [];
+    return {
+      schemaVersion: 'anysentry.supply_chain_control.v1',
+      enabled: input.enabled === true,
+      dailyRefreshEnabled: input.dailyRefreshEnabled !== false,
+      runtimeCorrelationEnabled: input.runtimeCorrelationEnabled === true,
+      selectedWorkspaceIds,
+      updatedAt: Number(input.updatedAt) || Date.now(),
+    };
+  }
+
+  private selectedWorkspace(workspaceId: string): boolean {
+    return this.control.selectedWorkspaceIds.length === 0
+      || this.control.selectedWorkspaceIds.includes(workspaceId);
+  }
+
+  private async recordScannerHeartbeat(scannerIdInput: string): Promise<void> {
+    const scannerId = safeId(scannerIdInput, 'scannerId');
+    const redis = this.requireRedis();
+    await redis.set(
+      `${SUPPLY_CHAIN_SCANNER_HEARTBEAT_PREFIX}${scannerId}`,
+      String(Date.now()),
+      'PX',
+      HEARTBEAT_TTL_MS,
+    );
+  }
+
+  private async readiness(workspaceRows?: WorkspaceRegistration[]) {
+    const workspaces = workspaceRows ?? await this.store.registeredWorkspaces();
+    const redis = this.redis;
+    const scannersById = new Map<string, string[]>();
+    for (const workspace of workspaces) {
+      const ids = scannersById.get(workspace.scannerId) ?? [];
+      ids.push(workspace.workspaceId);
+      scannersById.set(workspace.scannerId, ids);
+    }
+    const scannerRows = await Promise.all([...scannersById].map(async ([scannerId, workspaceIds]) => {
+      const raw = redis
+        ? await redis.get(`${SUPPLY_CHAIN_SCANNER_HEARTBEAT_PREFIX}${scannerId}`)
+        : null;
+      const lastSeenAt = Number(raw) || undefined;
+      return {
+        scannerId,
+        online: Boolean(lastSeenAt && Date.now() - lastSeenAt <= HEARTBEAT_TTL_MS),
+        lastSeenAt,
+        workspaceIds,
+      };
+    }));
+    const workerRaw = redis
+      ? await redis.get(SUPPLY_CHAIN_ASSESSMENT_WORKER_HEARTBEAT_KEY)
+      : null;
+    const workerLastSeenAt = Number(workerRaw) || 0;
+    const assessmentWorkerOnline = Date.now() - workerLastSeenAt <= HEARTBEAT_TTL_MS;
+    const selectedIds = this.control.selectedWorkspaceIds.length
+      ? this.control.selectedWorkspaceIds
+      : workspaces.map((workspace) => workspace.workspaceId);
+    const selected = workspaces.filter((workspace) => selectedIds.includes(workspace.workspaceId));
+    const selectedScannerIds = new Set(selected.map((workspace) => workspace.scannerId));
+    const selectedScannersOnline = [...selectedScannerIds].every((scannerId) =>
+      scannerRows.some((row) => row.scannerId === scannerId && row.online));
+    const issues: string[] = [];
+    if (!this.serviceReady) issues.push('供应链存储或 Redis 尚未就绪');
+    if (!this.scannerAuthConfigured()) issues.push('尚未配置 Workspace Scanner 凭据');
+    if (selected.length === 0) issues.push('尚未注册或选择 Workspace');
+    if (selected.length > 0 && !selectedScannersOnline) issues.push('所选 Workspace 的 Scanner 未在线');
+    if (!assessmentWorkerOnline) issues.push('OSV Assessment Worker 未在线');
+    return {
+      serviceReady: this.serviceReady,
+      scannerAuthConfigured: this.scannerAuthConfigured(),
+      assessmentWorkerOnline,
+      runtimeCorrelationAvailable: await this.runtimeCorrelationOnline(),
+      readyForInitialScan: issues.length === 0,
+      scanners: scannerRows,
+      issues,
+    };
+  }
+
+  async controlConfig(): Promise<SupplyChainControlResponse> {
+    const workspaces = this.serviceReady ? await this.store.registeredWorkspaces() : [];
+    return {
+      config: this.control,
+      readiness: await this.readiness(workspaces),
+      workspaceOptions: workspaces.map((workspace) => ({
+        workspaceId: workspace.workspaceId,
+        repositoryId: workspace.repositoryId,
+        displayName: workspace.displayName,
+        sourceId: workspace.sourceId,
+        environmentId: workspace.environmentId,
+        scannerId: workspace.scannerId,
+      })),
+    };
+  }
+
+  async setControl(
+    input: Partial<SupplyChainControlConfig> & { runInitialScan?: boolean },
+  ): Promise<SupplyChainControlResponse> {
+    if (!this.serviceReady) throw new Error('supply-chain service is unavailable');
+    const workspaces = await this.store.registeredWorkspaces();
+    const knownIds = new Set(workspaces.map((workspace) => workspace.workspaceId));
+    const next = this.sanitizeControl({
+      ...this.control,
+      ...input,
+      updatedAt: Date.now(),
+    });
+    if (next.selectedWorkspaceIds.some((workspaceId) => !knownIds.has(workspaceId))) {
+      throw new Error('selectedWorkspaceIds contains an unregistered Workspace');
+    }
+    if (next.enabled && next.selectedWorkspaceIds.length === 0 && workspaces.length === 0) {
+      throw new Error('at least one registered Workspace is required');
+    }
+    if (next.runtimeCorrelationEnabled && !this.runtimeCorrelationConfigured) {
+      throw new Error('runtime correlation requires the streaming and supply-chain runtime services');
+    }
+    const previous = this.control;
+    this.control = next;
+    const readiness = await this.readiness(workspaces);
+    if (next.enabled && !previous.enabled && !readiness.readyForInitialScan) {
+      this.control = previous;
+      throw new Error(readiness.issues.join('; '));
+    }
+    if (next.runtimeCorrelationEnabled
+      && !previous.runtimeCorrelationEnabled
+      && !readiness.runtimeCorrelationAvailable) {
+      this.control = previous;
+      throw new Error('runtime correlation requires a running AnySentry Flink job');
+    }
+    await this.store.saveControl(next);
+    const scanTasks: WorkspaceScanTask[] = [];
+    if (next.enabled && input.runInitialScan) {
+      const selectedIds = next.selectedWorkspaceIds.length
+        ? next.selectedWorkspaceIds
+        : workspaces.map((workspace) => workspace.workspaceId);
+      for (const workspaceId of selectedIds) {
+        scanTasks.push(await this.enqueueScan(workspaceId, 'manual'));
+      }
+    }
+    let runtimeAssessmentsQueued = 0;
+    if (next.enabled
+      && next.runtimeCorrelationEnabled
+      && !previous.runtimeCorrelationEnabled) {
+      const selectedIds = next.selectedWorkspaceIds.length
+        ? next.selectedWorkspaceIds
+        : workspaces.map((workspace) => workspace.workspaceId);
+      for (const workspaceId of selectedIds) {
+        const active = await this.store.activeBinding(workspaceId);
+        if (!active || active.state !== 'active') continue;
+        await this.enqueueAssessment(workspaceId, active.dependencySnapshotId, 'manual');
+        runtimeAssessmentsQueued += 1;
+      }
+    }
+    return {
+      config: next,
+      readiness: await this.readiness(workspaces),
+      workspaceOptions: workspaces.map((workspace) => ({
+        workspaceId: workspace.workspaceId,
+        repositoryId: workspace.repositoryId,
+        displayName: workspace.displayName,
+        sourceId: workspace.sourceId,
+        environmentId: workspace.environmentId,
+        scannerId: workspace.scannerId,
+      })),
+      scanTasks,
+      runtimeAssessmentsQueued,
+    };
   }
 
   async registerWorkspace(input: RegisterWorkspaceRequest): Promise<{
@@ -148,6 +388,7 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
     activeDependencySnapshotId?: string;
     activeDescriptorDigest?: string;
   }> {
+    await this.recordScannerHeartbeat(input.scannerId);
     const now = Date.now();
     const workspaceId = safeId(input.workspaceId, 'workspaceId');
     const repositoryId = safeId(input.repositoryId, 'repositoryId');
@@ -175,7 +416,9 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
     };
     await this.store.upsertWorkspace(workspace);
     const active = await this.store.activeBinding(workspaceId);
-    const initialTask = active ? undefined : await this.enqueueScan(workspaceId, 'initial');
+    const initialTask = active || !this.enabled || !this.selectedWorkspace(workspaceId)
+      ? undefined
+      : await this.enqueueScan(workspaceId, 'initial');
     const activeSnapshot = active ? await this.store.snapshot(active.dependencySnapshotId) : undefined;
     return {
       workspace,
@@ -186,6 +429,7 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
   }
 
   async enqueueScan(workspaceIdInput: string, reason: ScanReason): Promise<WorkspaceScanTask> {
+    if (!this.enabled) throw new Error('supply-chain scanning is disabled');
     const redis = this.requireRedis();
     const workspaceId = safeId(workspaceIdInput, 'workspaceId');
     const workspace = await this.store.workspace(workspaceId);
@@ -232,13 +476,17 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
     return task;
   }
 
-  async notifyDescriptorChange(workspaceIdInput: string, scannerIdInput: string): Promise<WorkspaceScanTask> {
+  async notifyDescriptorChange(
+    workspaceIdInput: string,
+    scannerIdInput: string,
+  ): Promise<WorkspaceScanTask | undefined> {
     const workspaceId = safeId(workspaceIdInput, 'workspaceId');
     const scannerId = safeId(scannerIdInput, 'scannerId');
     const workspace = await this.store.workspace(workspaceId);
     if (!workspace || workspace.scannerId !== scannerId) {
       throw new Error('workspace registration does not match scanner');
     }
+    if (!this.enabled || !this.selectedWorkspace(workspaceId)) return undefined;
     return this.enqueueScan(workspaceId, 'dependency_descriptor_changed');
   }
 
@@ -275,7 +523,7 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     const workspace = await this.store.workspaceByPathFingerprint(fingerprint);
-    if (!workspace) return;
+    if (!workspace || !this.selectedWorkspace(workspace.workspaceId)) return;
     const dueAt = Date.now() + INSTALL_DEBOUNCE_MS;
     await redis
       .multi()
@@ -322,6 +570,7 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
   }
 
   async requestAssessment(workspaceIdInput: string): Promise<{ dependencySnapshotId: string }> {
+    if (!this.enabled) throw new Error('supply-chain scanning is disabled');
     const workspaceId = safeId(workspaceIdInput, 'workspaceId');
     const active = await this.store.activeBinding(workspaceId);
     if (!active || active.state !== 'active') {
@@ -363,6 +612,7 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
   async claimTask(scannerIdInput: string): Promise<WorkspaceScanTask | undefined> {
     const redis = this.requireRedis();
     const scannerId = safeId(scannerIdInput, 'scannerId');
+    await this.recordScannerHeartbeat(scannerId);
     await this.reclaimExpired();
     for (let index = 0; index < 20; index += 1) {
       const taskId = await redis.rpop(pendingKey(scannerId));
@@ -395,6 +645,7 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
     const redis = this.requireRedis();
     const taskId = safeId(taskIdInput, 'taskId');
     const scannerId = safeId(scannerIdInput, 'scannerId');
+    await this.recordScannerHeartbeat(scannerId);
     const task = await this.task(taskId);
     if (!task || task.status !== 'leased') throw new Error('scan task is not leased');
     if (task.scannerId !== scannerId || task.leaseToken !== leaseToken) throw new Error('scan task lease does not match');
@@ -417,6 +668,7 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
     const redis = this.requireRedis();
     const taskId = safeId(taskIdInput, 'taskId');
     const scannerId = safeId(input.scannerId, 'scannerId');
+    await this.recordScannerHeartbeat(scannerId);
     const task = await this.task(taskId);
     if (task && (task.status === 'completed' || task.status === 'failed')) {
       if (task.scannerId !== scannerId) throw new Error('scan task does not match scanner');
@@ -526,11 +778,12 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
   }
 
   async overview(limit?: number): Promise<SupplyChainOverview> {
-    if (!this.enabled) {
+    if (!this.serviceReady) {
       return {
         enabled: false,
         runtimeCorrelationEnabled: false,
         workspaces: 0,
+        workspaceOptions: [],
         activeSnapshots: 0,
         openFindings: 0,
         staleFindings: 0,
@@ -539,8 +792,9 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
     }
     return {
       ...await this.store.overview(limit),
-      runtimeCorrelationEnabled: process.env.ANYSENTRY_SUPPLY_CHAIN_RUNTIME === 'on'
-        && process.env.ANYSENTRY_STREAMING === 'on',
+      enabled: this.enabled,
+      runtimeCorrelationEnabled: this.control.runtimeCorrelationEnabled
+        && await this.runtimeCorrelationOnline(),
     };
   }
 
@@ -551,5 +805,6 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
       this.redis?.quit(),
       this.store.close(),
     ]);
+    this.serviceReady = false;
   }
 }

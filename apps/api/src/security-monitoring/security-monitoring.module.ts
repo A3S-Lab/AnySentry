@@ -16,6 +16,7 @@ import { NotificationService } from './notification.service';
 import { ObjectiveService } from './objective.service';
 import { RemediationService } from './remediation.service';
 import { SecurityMonitoringController } from './security-monitoring.controller';
+import { SecurityAssistantService } from './security-assistant.service';
 import { SentryJudgeService } from './sentry-judge.service';
 import { StreamingFindingService } from './streaming-finding.service';
 import { StreamingQueueService } from './streaming-queue.service';
@@ -24,6 +25,6 @@ import { RuntimeModelConfigService } from './runtime-model-config';
 
 @Module({
   controllers: [SecurityMonitoringController],
-  providers: [AgentAttributionService, AgentMetadataService, AlertingService, AuditService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, SentryJudgeService, AggregationService, IdentityEvidenceService, RuntimeModelConfigService, IdentityReviewAgentService, RemediationService, KubeIdentityService, ManagementAuthGuard, JudgmentQueueService, DecisionResultApplyService, StreamingQueueService, StreamingFindingService, SupplyChainService],
+  providers: [AgentAttributionService, AgentMetadataService, AlertingService, AuditService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, SentryJudgeService, AggregationService, IdentityEvidenceService, RuntimeModelConfigService, IdentityReviewAgentService, RemediationService, KubeIdentityService, ManagementAuthGuard, JudgmentQueueService, DecisionResultApplyService, StreamingQueueService, StreamingFindingService, SupplyChainService, SecurityAssistantService],
 })
 export class SecurityMonitoringModule {}

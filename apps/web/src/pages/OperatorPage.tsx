@@ -27,6 +27,7 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import { OperationalEmptyState } from "@/components/custom/operational-empty-state";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -901,7 +902,13 @@ export default function OperatorPage() {
                   加载行动计划...
                 </div>
               ) : (data?.actions.length ?? 0) === 0 ? (
-                <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">暂无下一步行动</div>
+                <OperationalEmptyState
+                  icon={Zap}
+                  title="当前没有需要排序的行动"
+                  description="AI Operator 只从现有处置任务生成优先级、审批要求和证据入口，不会凭空创建处置动作。"
+                  primary={{ label: "打开处置中心", href: "/remediation" }}
+                  secondary={{ label: "查看告警", href: "/alerts" }}
+                />
               ) : (
                 <div className="max-h-[calc(100vh-350px)] overflow-y-auto">
                   {data?.actions.map((action) => (

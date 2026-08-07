@@ -7,6 +7,7 @@ import {
   RiskProfileFinding,
   StreamFindingList,
 } from './streaming.types';
+import { resolveTimeWindow } from './time-window';
 import { SecurityTimeFilter } from './types';
 
 const PROFILE_TABLE = 'stream_risk_profiles';
@@ -138,18 +139,6 @@ function nonNegativeFeatures(value: unknown): Record<string, number> {
   );
 }
 
-
-function sinceMs(filter: SecurityTimeFilter): number {
-  const now = Date.now();
-  if (filter.timeType === 'last_1d') return now - 24 * 60 * 60_000;
-  if (filter.timeType === 'last_7d') return now - 7 * 24 * 60 * 60_000;
-  if (filter.timeType === 'last_30d') return now - 30 * 24 * 60 * 60_000;
-  if (filter.timeType === 'custom') {
-    const parsed = Date.parse(filter.startTime ?? '');
-    return Number.isFinite(parsed) ? parsed : now - 3 * 60 * 60_000;
-  }
-  return now - 3 * 60 * 60_000;
-}
 
 function compositeJudgmentFromRow(row: Record<string, unknown>): CompositeJudgmentFinding {
   return {
@@ -341,33 +330,37 @@ export class StreamFindingStore {
     if (!this.client || !this.ready) {
       return { enabled: false, riskProfiles: [], compositeRisks: [], compositeJudgments: [], updateTime: new Date().toISOString() };
     }
-    const since = sinceMs(filter);
+    const { startMs: since, endMs: until } = resolveTimeWindow(filter);
     const safeLimit = Math.max(1, Math.min(200, limit));
     const [profileResult, compositeResult, compositeJudgmentResult] = await Promise.all([
       this.client.query({
-        query: `SELECT * FROM ${PROFILE_TABLE} FINAL WHERE calculatedAt >= {since:UInt64} ORDER BY calculatedAt DESC LIMIT {limit:UInt32}`,
-        query_params: { since, limit: safeLimit },
+        query: `SELECT * FROM ${PROFILE_TABLE} FINAL
+          WHERE calculatedAt >= {since:UInt64} AND calculatedAt <= {until:UInt64}
+          ORDER BY calculatedAt DESC LIMIT {limit:UInt32}`,
+        query_params: { since, until, limit: safeLimit },
         format: 'JSONEachRow',
       }),
       this.client.query({
-        query: `SELECT * FROM ${COMPOSITE_TABLE} FINAL WHERE calculatedAt >= {since:UInt64} ORDER BY calculatedAt DESC LIMIT {limit:UInt32}`,
-        query_params: { since, limit: safeLimit },
+        query: `SELECT * FROM ${COMPOSITE_TABLE} FINAL
+          WHERE calculatedAt >= {since:UInt64} AND calculatedAt <= {until:UInt64}
+          ORDER BY calculatedAt DESC LIMIT {limit:UInt32}`,
+        query_params: { since, until, limit: safeLimit },
         format: 'JSONEachRow',
       }),
       this.client.query({
         query: `SELECT * FROM ${COMPOSITE_JUDGMENT_TABLE} FINAL
-          WHERE judgedAt >= {since:UInt64}
-            AND ruleVersion IN ('composite-risk-v2', 'supply-chain-exploit-v1')
+          WHERE judgedAt >= {since:UInt64} AND judgedAt <= {until:UInt64}
+            AND ruleVersion IN ('composite-risk-v2', 'supply-chain-exploit-v1', 'supply-chain-temporal-v2', 'temporal-episode-v1', 'temporal-episode-v2')
             AND episodeId IN (
               SELECT episodeId FROM ${COMPOSITE_JUDGMENT_TABLE} FINAL
-              WHERE judgedAt >= {since:UInt64}
-                AND ruleVersion IN ('composite-risk-v2', 'supply-chain-exploit-v1')
+              WHERE judgedAt >= {since:UInt64} AND judgedAt <= {until:UInt64}
+                AND ruleVersion IN ('composite-risk-v2', 'supply-chain-exploit-v1', 'supply-chain-temporal-v2', 'temporal-episode-v1', 'temporal-episode-v2')
               GROUP BY episodeId
               ORDER BY max(judgedAt) DESC
               LIMIT {limit:UInt32}
             )
           ORDER BY episodeId, revision DESC, judgedAt DESC`,
-        query_params: { since, limit: safeLimit },
+        query_params: { since, until, limit: safeLimit },
         format: 'JSONEachRow',
       }),
     ]);

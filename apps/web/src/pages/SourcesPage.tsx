@@ -29,6 +29,7 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import { OperationalEmptyState } from "@/components/custom/operational-empty-state";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -762,6 +763,7 @@ export default function SourcesPage() {
   const [collectorIdFilter, setCollectorIdFilter] = useState(searchParams.get("collectorId") ?? "");
   const [workspacePathFilter, setWorkspacePathFilter] = useState(searchParams.get("workspacePath") ?? "");
   const [queryText, setQueryText] = useState(searchParams.get("q") ?? "");
+  const [showVerification, setShowVerification] = useState(searchParams.get("includeVerification") === "true");
   const [selectedId, setSelectedId] = useState(searchParams.get("sourceId") ?? "");
   const [draft, setDraft] = useState<Draft>(() => defaultDraft());
   const [saving, setSaving] = useState(false);
@@ -782,9 +784,10 @@ export default function SourcesPage() {
     workspacePath: clean(workspacePathFilter),
     status,
     type,
+    includeVerification: showVerification,
     q: clean(queryText),
     limit: 200,
-  }), [collectorIdFilter, queryText, selectedId, status, type, workspacePathFilter]);
+  }), [collectorIdFilter, queryText, selectedId, showVerification, status, type, workspacePathFilter]);
 
   const { data, loading, refresh } = useRequest(() => securityCenterApi.ingestionSources(query), {
     refreshDeps: [query],
@@ -1023,7 +1026,7 @@ export default function SourcesPage() {
           </div>
         </div>
 
-        <div className="mt-3 grid gap-2 md:grid-cols-[130px_130px_minmax(160px,0.75fr)_minmax(180px,1fr)_minmax(180px,1fr)_auto_auto]">
+        <div className="mt-3 grid gap-2 md:grid-cols-[130px_130px_minmax(160px,0.75fr)_minmax(180px,1fr)_minmax(180px,1fr)_auto_auto_auto]">
           <Select value={status} onValueChange={(next) => setStatus(next as IngestionSourceStatus | "all")}>
             <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
             <SelectContent>{STATUS_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
@@ -1035,6 +1038,10 @@ export default function SourcesPage() {
           <Input value={collectorIdFilter} onChange={(event) => setCollectorIdFilter(event.target.value)} placeholder="collectorId exact" className="h-9 border-white/10 bg-white/5 font-mono text-xs" />
           <Input value={workspacePathFilter} onChange={(event) => setWorkspacePathFilter(event.target.value)} placeholder="workspacePath exact" className="h-9 border-white/10 bg-white/5 font-mono text-xs" />
           <Input value={queryText} onChange={(event) => setQueryText(event.target.value)} placeholder="source / owner / team / tag / keyword" className="h-9 border-white/10 bg-white/5 font-mono text-xs" />
+          <Button type="button" variant="secondary" size="sm" onClick={() => setShowVerification((value) => !value)} className={cn("h-9 border border-white/10 bg-white/5 text-zinc-300 hover:bg-white/10", showVerification && "border-amber-400/30 bg-amber-500/10 text-amber-100")}>
+            <EyeOff className="size-3.5" />
+            {showVerification ? "隐藏验证源" : "显示验证源"}
+          </Button>
           <Button type="button" variant="secondary" size="sm" onClick={clearFilters} className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
             <X className="size-3.5" />
             清除
@@ -1074,7 +1081,13 @@ export default function SourcesPage() {
               {loading && !data ? (
                 <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500"><LoaderCircle className="mr-2 size-4 animate-spin" />加载接入源...</div>
               ) : (data?.items.length ?? 0) === 0 ? (
-                <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-zinc-500"><CheckCircle2 className="size-4 text-teal-300" />暂无接入源</div>
+                <OperationalEmptyState
+                  icon={PlugZap}
+                  title="还没有可运营的接入源"
+                  description="填写右侧表单注册 Observer、Forwarder、Webhook 或 OTel；验证工具产生的临时 Source 默认已折叠。"
+                  primary={{ label: "检查采集链路", href: "/collectors" }}
+                  secondary={{ label: "查看覆盖缺口", href: "/coverage" }}
+                />
               ) : (
                 <div className="max-h-[calc(100vh-300px)] overflow-y-auto">
                   {data?.items.map((item) => <SourceRow key={item.sourceId} item={item} active={item.sourceId === selectedId} onSelect={() => selectSource(item)} />)}

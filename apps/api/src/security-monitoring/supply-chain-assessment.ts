@@ -15,6 +15,7 @@ import {
   VulnerabilityAssessment,
   VulnerabilityFinding,
 } from './supply-chain.types';
+import { staticFindingPriority } from './supply-chain-priority';
 
 type OsvBatchResult = {
   results?: Array<{
@@ -237,30 +238,6 @@ function vulnerabilityForComponent(
   };
 }
 
-function findingPriority(
-  component: DependencyComponent,
-  vulnerability: OsvVulnerabilitySummary,
-): Pick<VulnerabilityFinding, 'priority' | 'priorityScore' | 'deploymentStatus'> {
-  const deploymentStatus = component.deploymentImages?.length || component.installedEnvironments?.length
-    ? 'confirmed'
-    : 'unknown';
-  const score = Math.min(100, {
-    critical: 80,
-    high: 60,
-    medium: 40,
-    low: 20,
-    unknown: 10,
-  }[vulnerability.severityLevel ?? 'unknown']
-    + (deploymentStatus === 'confirmed' ? 15 : 0)
-    + (component.direct === true ? 5 : 0)
-    + (component.dependencyScope === 'runtime' ? 5 : 0));
-  return {
-    priorityScore: score,
-    priority: score >= 90 ? 'P0' : score >= 60 ? 'P1' : score >= 35 ? 'P2' : 'P3',
-    deploymentStatus,
-  };
-}
-
 async function queryChunk(
   components: DependencyComponent[],
   apiBase: string,
@@ -402,6 +379,14 @@ export async function assessDependencySnapshot(
     root(vulnerability.id);
     for (const alias of vulnerability.aliases) connect(vulnerability.id, alias);
   }
+  const advisoryMembers = new Map<string, Set<string>>();
+  for (const vulnerability of details.values()) {
+    const canonicalId = root(vulnerability.id);
+    const members = advisoryMembers.get(canonicalId) ?? new Set<string>();
+    members.add(vulnerability.id);
+    for (const alias of vulnerability.aliases) members.add(alias);
+    advisoryMembers.set(canonicalId, members);
+  }
   const assessmentId = vulnerabilityAssessmentId(
     snapshot.dependencySnapshotId,
     assessedAt,
@@ -417,8 +402,16 @@ export async function assessDependencySnapshot(
         aliases: [],
         severityLevel: 'unknown' as const,
       };
-      const vulnerability = vulnerabilityForComponent(resolved, match.component);
-      const canonicalAdvisory = root(vulnerability.id);
+      const normalizedVulnerability = vulnerabilityForComponent(resolved, match.component);
+      const canonicalAdvisory = root(normalizedVulnerability.id);
+      const vulnerability: OsvVulnerabilitySummary = {
+        ...normalizedVulnerability,
+        canonicalId: canonicalAdvisory,
+        aliases: [...new Set([
+          ...normalizedVulnerability.aliases,
+          ...(advisoryMembers.get(canonicalAdvisory) ?? []),
+        ])].filter((alias) => alias !== normalizedVulnerability.id).sort(),
+      };
       const id = findingId(snapshot.workspaceId, match.component, canonicalAdvisory);
       if (priorFindings.has(id)) continue;
       const finding: VulnerabilityFinding = {
@@ -432,7 +425,7 @@ export async function assessDependencySnapshot(
         closureReason: vulnerability.withdrawn ? 'advisory_withdrawn' : undefined,
         firstObservedAt: assessedAt,
         lastObservedAt: assessedAt,
-        ...findingPriority(match.component, vulnerability),
+        ...staticFindingPriority(match.component, vulnerability),
         shadow: true,
       };
       priorFindings.set(id, finding);

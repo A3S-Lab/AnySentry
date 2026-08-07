@@ -2,6 +2,7 @@ import { Job, Queue, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { Kafka, logLevel, Producer, Consumer, SASLOptions } from 'kafkajs';
 import { redisConnection } from './judgment-queue.service';
+import { jsonObjects } from './l3-decision-parser';
 import { StreamFindingStore } from './streaming-finding.service';
 import {
   COMPOSITE_JUDGE_QUEUE,
@@ -26,7 +27,10 @@ const episodesTopic = process.env.ANYSENTRY_STREAM_EPISODES_TOPIC || DEFAULT_EPI
 const clientId = process.env.ANYSENTRY_STREAM_CLIENT_ID || 'anysentry-stream-worker';
 const groupId = process.env.ANYSENTRY_STREAM_CONSUMER_GROUP || 'anysentry-stream-findings';
 const episodeGroupId = process.env.ANYSENTRY_STREAM_EPISODE_CONSUMER_GROUP || 'anysentry-stream-episodes';
-const compositeModel = process.env.ANYSENTRY_COMPOSITE_MODEL || 'deepseek-v4-flash';
+const legacyCompositeEnabled = /^(?:1|true|on|yes)$/i.test(
+  process.env.ANYSENTRY_LEGACY_COMPOSITE_ENABLED || 'off',
+);
+const compositeModel = process.env.ANYSENTRY_COMPOSITE_MODEL || 'glm-5.2';
 const compositeTimeoutMs = Math.max(1_000, Number(process.env.ANYSENTRY_COMPOSITE_TIMEOUT_MS || 60_000));
 const compositeMaxEventAgeMs = Math.max(
   60_000,
@@ -175,7 +179,20 @@ async function startEpisodeConsumer(): Promise<void> {
     eachMessage: async ({ topic, partition, message }) => {
       const batch = riskAnalysisBatch(message.value);
       if (batch.ruleVersion !== 'composite-risk-v2'
-        && batch.ruleVersion !== 'supply-chain-exploit-v1') {
+        && batch.ruleVersion !== 'supply-chain-exploit-v1'
+        && batch.ruleVersion !== 'supply-chain-temporal-v2'
+        && batch.ruleVersion !== 'temporal-episode-v1'
+        && batch.ruleVersion !== 'temporal-episode-v2') {
+        await episodeConsumer!.commitOffsets([{
+          topic,
+          partition,
+          offset: (BigInt(message.offset) + 1n).toString(),
+        }]);
+        return;
+      }
+      if (!legacyCompositeEnabled
+        && (batch.ruleVersion === 'composite-risk-v2'
+          || batch.ruleVersion === 'supply-chain-exploit-v1')) {
         await episodeConsumer!.commitOffsets([{
           topic,
           partition,
@@ -194,7 +211,12 @@ async function startEpisodeConsumer(): Promise<void> {
       if (batch.decisionPath === 'deterministic_rule') {
         const startedAt = Date.now();
         try {
-          const decision = deterministicSupplyChainDecision(batch);
+          const decision = batch.ruleVersion === 'temporal-episode-v1'
+            || batch.ruleVersion === 'temporal-episode-v2'
+            ? deterministicTemporalDecision(batch)
+            : batch.ruleVersion === 'supply-chain-temporal-v2'
+              ? deterministicSupplyChainTemporalDecision(batch)
+              : deterministicSupplyChainDecision(batch);
           await store!.upsert(compositeFinding(batch, startedAt, decision));
           await episodeConsumer!.commitOffsets([{
             topic,
@@ -203,6 +225,20 @@ async function startEpisodeConsumer(): Promise<void> {
           }]);
           return;
         } catch (error) {
+          if (batch.ruleVersion === 'temporal-episode-v1'
+            || batch.ruleVersion === 'temporal-episode-v2'
+            || batch.ruleVersion === 'supply-chain-temporal-v2') {
+            await store!.upsert(compositeFinding(batch, startedAt, undefined, {
+              status: 'failed',
+              error: error instanceof Error ? error.message : String(error),
+            }));
+            await episodeConsumer!.commitOffsets([{
+              topic,
+              partition,
+              offset: (BigInt(message.offset) + 1n).toString(),
+            }]);
+            return;
+          }
           console.warn('[streaming] deterministic supply-chain evidence was incomplete; using Composite Judge', {
             episodeId: batch.episodeId,
             revision: batch.revision,
@@ -346,7 +382,7 @@ export function deterministicSupplyChainDecision(batch: RiskAnalysisBatch): Comp
       verdict: 'allow',
       severity: 'low',
       confidence: 1,
-      attackType: 'none',
+      attackType: 'known-vulnerability-exploitation',
       reason: 'Synthetic supply-chain verification episode; no runtime attack action is taken.',
       evidenceEventIds,
     };
@@ -362,15 +398,289 @@ export function deterministicSupplyChainDecision(batch: RiskAnalysisBatch): Comp
   };
 }
 
+function compatibleProcessScope(
+  left: NonNullable<RiskAnalysisBatch['evidence'][number]['processIdentity']>,
+  right: NonNullable<RiskAnalysisBatch['evidence'][number]['processIdentity']>,
+): boolean {
+  return [
+    [left.hostId, right.hostId],
+    [left.bootId, right.bootId],
+    [left.containerId, right.containerId],
+  ].every(([a, b]) => !a || !b || a === b);
+}
+
+function directProcessChild(
+  parent: RiskAnalysisBatch['evidence'][number],
+  child: RiskAnalysisBatch['evidence'][number],
+): boolean {
+  return Boolean(
+    parent.processIdentity
+    && child.processIdentity
+    && parent.processIdentity.pid !== undefined
+    && child.processIdentity.ppid === parent.processIdentity.pid
+    && compatibleProcessScope(parent.processIdentity, child.processIdentity),
+  );
+}
+
+function sameOrDirectProcessChild(
+  parent: RiskAnalysisBatch['evidence'][number],
+  child: RiskAnalysisBatch['evidence'][number],
+): boolean {
+  if (!parent.processIdentity || !child.processIdentity) return false;
+  const sameInstance = Boolean(
+    parent.processIdentity.processInstanceId
+    && child.processIdentity.processInstanceId
+    && parent.processIdentity.processInstanceId === child.processIdentity.processInstanceId,
+  );
+  return sameInstance || directProcessChild(parent, child);
+}
+
+function shellOrScriptEvidence(item: RiskAnalysisBatch['evidence'][number]): boolean {
+  const executable = (item.executable ?? '').split(/[\\/]/).pop()?.toLowerCase() ?? '';
+  return item.behaviorStage === 'shell_execution'
+    || /^(?:(?:ba|z|fi|da)?sh|powershell|pwsh|python\d*|node|perl|ruby)$/.test(executable);
+}
+
+function exploitConsequenceEvidence(item: RiskAnalysisBatch['evidence'][number]): boolean {
+  if (item.operation === 'egress' && item.externalDestination) return true;
+  if (item.behaviorStage === 'destructive_action' || item.behaviorStage === 'dangerous_exec') return true;
+  return item.sensitiveResource
+    && ['file_read', 'copy', 'encode', 'compress'].includes(item.operation);
+}
+
+export function deterministicSupplyChainTemporalDecision(batch: RiskAnalysisBatch): CompositeModelDecision {
+  if (batch.ruleVersion !== 'supply-chain-temporal-v2'
+    || batch.decisionPath !== 'deterministic_rule'
+    || batch.evidenceConfidence !== 'strong') {
+    throw new Error('deterministic supply-chain temporal decision requires strong v2 evidence');
+  }
+  const ordered = [...batch.evidence].sort((left, right) =>
+    left.eventTime - right.eventTime || left.eventId.localeCompare(right.eventId));
+  if (ordered.length !== 3) {
+    throw new Error('supply-chain temporal episode must contain exactly three evidence events');
+  }
+  const [component, shell, consequence] = ordered;
+  const match = component.runtimeVulnerabilities.find((item) => item.confidence === 'high');
+  if (!match
+    || !shellOrScriptEvidence(shell)
+    || !exploitConsequenceEvidence(consequence)
+    || !directProcessChild(component, shell)
+    || !sameOrDirectProcessChild(shell, consequence)) {
+    throw new Error('supply-chain temporal episode failed ordered process-lineage validation');
+  }
+  const evidenceEventIds = ordered.map((item) => item.eventId);
+  if (batch.synthetic) {
+    return {
+      classification: 'simulation',
+      verdict: 'allow',
+      severity: 'low',
+      confidence: 1,
+      attackType: 'known-vulnerability-exploitation',
+      reason: 'Synthetic supply-chain Temporal Episode verification; no runtime attack action is taken.',
+      evidenceEventIds,
+    };
+  }
+  return {
+    classification: 'suspicious',
+    verdict: 'allow',
+    severity: 'high',
+    confidence: 0.9,
+    attackType: 'known-vulnerability-exploitation',
+    reason: `High-confidence execution of ${match.packageName}@${match.version} (${match.vulnerabilityId}) directly spawned a shell or script runtime whose process lineage performed a sensitive or external action. This is a suspected runtime exploitation chain, not proof that the vulnerability was successfully exploited. Shadow detection only.`,
+    evidenceEventIds,
+  };
+}
+
+export function deterministicTemporalDecision(batch: RiskAnalysisBatch): CompositeModelDecision {
+  if ((batch.ruleVersion !== 'temporal-episode-v1'
+    && batch.ruleVersion !== 'temporal-episode-v2')
+    || batch.decisionPath !== 'deterministic_rule') {
+    throw new Error('deterministic temporal decision requires a Temporal Episode rule');
+  }
+  const ordered = [...batch.evidence].sort((left, right) =>
+    left.eventTime - right.eventTime || left.eventId.localeCompare(right.eventId));
+  const operations = ordered.map((item) => item.operation);
+  const expected = batch.candidateType === 'download_execute'
+    ? ['download', 'file_write', 'chmod', 'execute']
+    : batch.candidateType === 'sensitive_data_exfiltration'
+      ? ['file_read', 'encode_or_compress', 'egress']
+      : batch.candidateType === 'persistence_installation'
+        ? ['file_write', 'persistence_activate']
+        : batch.candidateType === 'sandbox_privilege_breakout'
+          ? ['sandbox_probe', 'privilege_change', 'consequence']
+          : batch.candidateType === 'destructive_behavior'
+            ? ['target_discovery', 'destroy', 'destroy']
+            : batch.candidateType === 'lateral_movement'
+              ? ['file_read', 'remote_connect', 'remote_action']
+      : undefined;
+  if (!expected) throw new Error(`unsupported temporal candidate: ${batch.candidateType}`);
+  const validOperations = batch.candidateType === 'download_execute'
+    ? operations.join(',') === expected.join(',')
+    : batch.candidateType === 'sensitive_data_exfiltration'
+      ? operations.length === 3
+      && operations[0] === 'file_read'
+      && (operations[1] === 'encode' || operations[1] === 'compress')
+      && operations[2] === 'egress'
+      : batch.candidateType === 'persistence_installation'
+        ? operations.join(',') === expected.join(',')
+        : batch.candidateType === 'sandbox_privilege_breakout'
+          ? operations.length === 3
+          && operations[0] === 'sandbox_probe'
+          && operations[1] === 'privilege_change'
+          && temporalConsequence(ordered[2])
+          : batch.candidateType === 'destructive_behavior'
+            ? operations.join(',') === expected.join(',')
+            : batch.candidateType === 'lateral_movement'
+              ? operations.length === 3
+              && operations[0] === 'file_read'
+              && operations[1] === 'remote_connect'
+              && (operations[2] === 'remote_execute' || operations[2] === 'remote_copy')
+              : false;
+  if (!validOperations) throw new Error('temporal episode operation sequence is incomplete');
+  validateTemporalEntities(batch.candidateType, ordered);
+  const result = temporalDecisionDetails(batch.candidateType);
+  if (batch.synthetic) {
+    return {
+      classification: 'simulation',
+      verdict: 'allow',
+      severity: 'low',
+      confidence: 1,
+      attackType: result.attackType,
+      reason: 'Synthetic Temporal Episode verification; no runtime action is taken.',
+      evidenceEventIds: ordered.map((item) => item.eventId),
+    };
+  }
+  const confidence = batch.evidenceConfidence === 'strong'
+    ? 0.92
+    : batch.evidenceConfidence === 'medium'
+      ? 0.78
+      : 0.6;
+  return {
+    classification: 'suspicious',
+    verdict: 'allow',
+    severity: result.severity,
+    confidence,
+    attackType: result.attackType,
+    reason: `${result.reason} Evidence confidence: ${batch.evidenceConfidence ?? 'weak'}. Shadow detection only.`,
+    evidenceEventIds: ordered.map((item) => item.eventId),
+  };
+}
+
+function temporalConsequence(item: RiskAnalysisBatch['evidence'][number]): boolean {
+  return item.sensitiveResource
+    || item.externalDestination
+    || item.dangerous
+    || item.operation === 'destroy';
+}
+
+function sameTemporalProcessScope(items: RiskAnalysisBatch['evidence']): boolean {
+  const processes = items.map((item) => item.processIdentity);
+  if (processes.some((process) => !process)) return false;
+  const [first, ...rest] = processes as Array<NonNullable<typeof processes[number]>>;
+  if (!rest.every((process) => compatibleProcessScope(first, process))) return false;
+  const roots = new Set(processes.map((process) => process?.rootPid).filter((value) => value !== undefined));
+  return roots.size <= 1 && (roots.size === 1 || processes.every((process) => process?.pid !== undefined));
+}
+
+function normalizedTemporalPath(value?: string): string {
+  return (value ?? '').replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+function temporalLeaf(value?: string): string {
+  return normalizedTemporalPath(value).split('/').pop() ?? '';
+}
+
+function withinTemporalPath(scopeValue?: string, targetValue?: string): boolean {
+  const scope = normalizedTemporalPath(scopeValue);
+  const target = normalizedTemporalPath(targetValue);
+  return Boolean(scope && target && (scope === target || target.startsWith(`${scope}/`)));
+}
+
+function validateTemporalEntities(
+  candidateType: string,
+  ordered: RiskAnalysisBatch['evidence'],
+): void {
+  if (candidateType === 'download_execute' || candidateType === 'sensitive_data_exfiltration') {
+    const fileEvidence = ordered.filter((item) => item.operation !== 'egress');
+    const fileIds = new Set(fileEvidence.map((item) => item.fileIdentity?.fileInstanceId).filter(Boolean));
+    if (fileIds.size !== 1) throw new Error('temporal episode does not correlate one file identity');
+    return;
+  }
+  if (!sameTemporalProcessScope(ordered)) {
+    throw new Error('temporal episode does not correlate one process scope');
+  }
+  if (candidateType === 'persistence_installation') {
+    const [write, activation] = ordered;
+    const exact = normalizedTemporalPath(write.resource) === normalizedTemporalPath(activation.resource);
+    if (!exact && temporalLeaf(write.resource) !== temporalLeaf(activation.resource)) {
+      throw new Error('persistence episode does not correlate one activation target');
+    }
+  } else if (candidateType === 'destructive_behavior') {
+    if (!withinTemporalPath(ordered[0].resource, ordered[1].resource)
+      || !withinTemporalPath(ordered[0].resource, ordered[2].resource)) {
+      throw new Error('destructive episode escaped the discovered path scope');
+    }
+  } else if (candidateType === 'lateral_movement') {
+    const fileIds = new Set(ordered.map((item) => item.fileIdentity?.fileInstanceId).filter(Boolean));
+    if (fileIds.size !== 1
+      || !ordered[1].destination
+      || ordered[1].destination !== ordered[2].destination) {
+      throw new Error('lateral episode does not correlate one credential and destination');
+    }
+  }
+}
+
+function temporalDecisionDetails(candidateType: string): {
+  attackType: string;
+  severity: 'high' | 'critical';
+  reason: string;
+} {
+  switch (candidateType) {
+    case 'download_execute':
+      return {
+        attackType: 'download-and-execute',
+        severity: 'high',
+        reason: 'Ordered download, write, permission change, and execution were correlated to one file identity.',
+      };
+    case 'sensitive_data_exfiltration':
+      return {
+        attackType: 'sensitive-data-exfiltration',
+        severity: 'high',
+        reason: 'A sensitive read, transformation, and external egress were correlated in one Agent session.',
+      };
+    case 'persistence_installation':
+      return {
+        attackType: 'persistence-installation',
+        severity: 'high',
+        reason: 'A persistence target was written and then activated in the same process scope.',
+      };
+    case 'sandbox_privilege_breakout':
+      return {
+        attackType: 'sandbox-privilege-breakout',
+        severity: 'critical',
+        reason: 'A sandbox-boundary probe was followed by a privilege transition and a sensitive consequence.',
+      };
+    case 'destructive_behavior':
+      return {
+        attackType: 'destructive-behavior',
+        severity: 'critical',
+        reason: 'Target discovery was followed by repeated destructive actions inside the discovered path scope.',
+      };
+    case 'lateral_movement':
+      return {
+        attackType: 'lateral-movement',
+        severity: 'critical',
+        reason: 'One credential was used to connect to and then act on the same remote destination.',
+      };
+    default:
+      throw new Error(`unsupported temporal candidate: ${candidateType}`);
+  }
+}
+
 export function parseCompositeDecision(content: unknown, batch: RiskAnalysisBatch): CompositeModelDecision {
   if (typeof content !== 'string' || !content.trim()) throw new Error('Composite Judge returned an empty response');
-  const trimmed = content.trim();
-  // Some OpenAI-compatible providers wrap an otherwise valid JSON response in a
-  // single Markdown code fence even when the prompt explicitly requests JSON.
-  // Accept only that narrow wrapper; prose or trailing text must still fail the
-  // strict parser so untrusted model output cannot silently change semantics.
-  const fenced = /^```(?:json)?\s*\n?([\s\S]*?)\n?```$/iu.exec(trimmed);
-  const parsed = JSON.parse((fenced?.[1] ?? trimmed).trim()) as Partial<CompositeModelDecision>;
+  const parsed = jsonObjects(content).at(-1) as Partial<CompositeModelDecision> | undefined;
+  if (!parsed) throw new Error('Composite Judge returned no valid JSON object');
   if (!['benign', 'simulation', 'authorized_admin', 'suspicious', 'confirmed_attack'].includes(String(parsed.classification))) {
     throw new Error('Composite Judge returned an invalid classification');
   }

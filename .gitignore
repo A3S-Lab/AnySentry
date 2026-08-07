@@ -6,5 +6,6 @@ dist/
 .env
 .env.local
 config/workspace-scanner.local.json
+config/workspace-scanner.token
 .a3s/
 perf-results/

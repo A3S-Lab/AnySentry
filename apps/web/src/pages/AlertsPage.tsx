@@ -1,24 +1,33 @@
 import { useRequest } from "ahooks";
 import dayjs from "dayjs";
 import {
+  Activity,
   ArrowLeft,
   BellRing,
   Bot,
+  CalendarClock,
   CheckCircle2,
   Clock3,
   FileText,
   FileCheck2,
+  GitBranch,
+  LayoutDashboard,
   LoaderCircle,
   PlugZap,
+  Radar,
   RadioTower,
   RefreshCw,
   RotateCcw,
   Search,
+  SlidersHorizontal,
   ShieldAlert,
   Siren,
+  Sparkles,
+  ServerCog,
   Target,
   TerminalSquare,
   UserCheck,
+  Wrench,
   X,
 } from "lucide-react";
 import { useMemo, useState } from "react";
@@ -36,6 +45,7 @@ import {
   type SecurityTimeType,
   securityCenterApi,
 } from "@/lib/api/security-center";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 const TIME_OPTIONS: Array<{ value: SecurityTimeType; label: string }> = [
@@ -74,6 +84,42 @@ const KIND_OPTIONS: Array<{ value: AlertKind | "all"; label: string }> = [
   { value: "remediation", label: "Remediation" },
 ];
 
+type AlertScope = NonNullable<AlertListQuery["scope"]>;
+
+function AlertScopeTabs({
+  value,
+  onChange,
+}: {
+  value: AlertScope;
+  onChange: (value: AlertScope) => void;
+}) {
+  const { t } = useI18n();
+  const options: Array<{ value: AlertScope; label: string }> = [
+    { value: "agent", label: "Agent 事件" },
+    { value: "raw", label: "全部事件" },
+  ];
+
+  return (
+    <div className="inline-flex h-9 items-center rounded-md border border-white/10 bg-white/5 p-0.5">
+      {options.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          onClick={() => onChange(option.value)}
+          className={cn(
+            "h-8 min-w-20 rounded px-2.5 text-xs font-semibold transition-colors",
+            value === option.value
+              ? "bg-teal-400/20 text-teal-100"
+              : "text-zinc-500 hover:bg-white/5 hover:text-zinc-200",
+          )}
+        >
+          {t(option.label)}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 const STATUS_LABEL: Record<AlertStatus, string> = {
   open: "待处理",
   acknowledged: "已确认",
@@ -99,6 +145,16 @@ const KIND_LABEL: Record<AlertKind, string> = {
   objective: "Objective",
   remediation: "Remediation",
 };
+
+const MONITORING_NAV_ITEMS = [
+  { view: "overview", label: "运行总览", description: "平台健康与实时状态", icon: Activity },
+  { view: "scan", label: "实时扫描", description: "可解释扫描与研判漏斗", icon: Radar },
+  { view: "risk", label: "风险态势", description: "风险分类与趋势分布", icon: Siren },
+  { view: "stream", label: "复合研判", description: "Flink 连续行为关联", icon: Sparkles },
+  { view: "supplyChain", label: "供应链漏洞", description: "OSV 依赖漏洞资产", icon: ShieldAlert },
+  { view: "events", label: "运行链路", description: "无侵入事件时间线", icon: GitBranch },
+  { view: "workspace", label: "会话与工作区", description: "Agent 与 Workspace 风险", icon: TerminalSquare },
+] as const;
 
 function clean(value: string) {
   return value.trim() || undefined;
@@ -143,18 +199,20 @@ function Pill({ children, className }: { children: string; className?: string })
 }
 
 function MetricTile({ label, value, tone }: { label: string; value: number | string; tone: string }) {
+  const { t } = useI18n();
   return (
     <div className={cn("rounded-[8px] border px-4 py-3", tone)}>
-      <p className="text-xs opacity-80">{label}</p>
+      <p className="text-xs opacity-80">{t(label)}</p>
       <p className="mt-1 truncate font-mono text-2xl font-semibold">{value}</p>
     </div>
   );
 }
 
 function FieldValue({ label, value }: { label: string; value?: string | number }) {
+  const { t } = useI18n();
   return (
     <div className="min-w-0">
-      <p className="text-[11px] text-zinc-600">{label}</p>
+      <p className="text-[11px] text-zinc-600">{t(label)}</p>
       <p className="mt-1 truncate font-mono text-xs text-zinc-300" title={String(value ?? "")}>
         {value ?? "--"}
       </p>
@@ -163,6 +221,7 @@ function FieldValue({ label, value }: { label: string; value?: string | number }
 }
 
 function AlertRow({ alert, active, onSelect }: { alert: AlertListItem; active: boolean; onSelect: () => void }) {
+  const { t } = useI18n();
   return (
     <button
       type="button"
@@ -180,13 +239,14 @@ function AlertRow({ alert, active, onSelect }: { alert: AlertListItem; active: b
         </span>
       </span>
       <span><Pill className={toneByKind(alert.kind)}>{KIND_LABEL[alert.kind]}</Pill></span>
-      <span><Pill className={toneBySeverity(alert.severity)}>{SEVERITY_LABEL[alert.severity]}</Pill></span>
-      <span><Pill className={toneByStatus(alert.status)}>{STATUS_LABEL[alert.status]}</Pill></span>
+      <span><Pill className={toneBySeverity(alert.severity)}>{t(SEVERITY_LABEL[alert.severity])}</Pill></span>
+      <span><Pill className={toneByStatus(alert.status)}>{t(STATUS_LABEL[alert.status])}</Pill></span>
     </button>
   );
 }
 
 function EvidenceLinks({ alert, timeType }: { alert: AlertListItem; timeType: SecurityTimeType }) {
+  const { t } = useI18n();
   const eventQs = new URLSearchParams();
   if (alert.traceId) eventQs.set("traceId", alert.traceId);
   if (alert.eventId) eventQs.set("eventId", alert.eventId);
@@ -249,14 +309,14 @@ function EvidenceLinks({ alert, timeType }: { alert: AlertListItem; timeType: Se
       <Button asChild size="sm" className="h-8 bg-teal-500 text-[#07100c] hover:bg-teal-400">
         <Link to={`/evidence?${bundleQs.toString()}`}>
           <FileText className="size-3.5" />
-          证据包
+          {t("证据包")}
         </Link>
       </Button>
       {alert.eventId || alert.traceId ? (
         <Button asChild variant="secondary" size="sm" className="h-8 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
           <Link to={`/events?${eventQs.toString()}`}>
             <Search className="size-3.5" />
-            事件
+            {t("事件")}
           </Link>
         </Button>
       ) : null}
@@ -343,10 +403,11 @@ function AlertDetail({
   onStatus: (status: AlertStatus) => void;
   timeType: SecurityTimeType;
 }) {
+  const { t } = useI18n();
   if (!alert) {
     return (
       <section className="rounded-[8px] border border-white/10 bg-[#111612]/92">
-        <div className="flex min-h-[360px] items-center justify-center text-sm text-zinc-500">选择一个告警查看处置详情</div>
+        <div className="flex min-h-[360px] items-center justify-center text-sm text-zinc-500">{t("选择一个告警查看处置详情")}</div>
       </section>
     );
   }
@@ -360,45 +421,45 @@ function AlertDetail({
           <BellRing className="size-4 shrink-0 text-rose-200" />
           <h2 className="truncate text-sm font-semibold text-zinc-100">{alert.title}</h2>
         </div>
-        <Pill className={toneByStatus(alert.status)}>{STATUS_LABEL[alert.status]}</Pill>
+        <Pill className={toneByStatus(alert.status)}>{t(STATUS_LABEL[alert.status])}</Pill>
       </div>
 
       <div className="space-y-4 p-4">
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
           <FieldValue label="Alert ID" value={alert.alertId} />
-          <FieldValue label="Rule" value={alert.ruleId} />
-          <FieldValue label="Dedupe" value={alert.dedupeKey} />
+          <FieldValue label="规则" value={alert.ruleId} />
+          <FieldValue label="去重键" value={alert.dedupeKey} />
           <FieldValue label="Agent" value={alert.agentId} />
           <FieldValue label="Workspace" value={alert.workspacePath} />
           <FieldValue label="Collector" value={alert.collectorId} />
           <FieldValue label="Source" value={alert.sourceId} />
-          <FieldValue label="Team" value={alert.team} />
-          <FieldValue label="Node" value={alert.nodeName} />
+          <FieldValue label="团队" value={alert.team} />
+          <FieldValue label="节点" value={alert.nodeName} />
           <FieldValue label="Trace" value={alert.traceId} />
           <FieldValue label="Incident" value={alert.incidentId} />
           <FieldValue label="Event" value={alert.eventId} />
-          <FieldValue label="Risk" value={alert.riskName ?? alert.riskCategory} />
-          <FieldValue label="First Seen" value={formatDate(alert.firstSeenAt)} />
-          <FieldValue label="Last Seen" value={formatDate(alert.lastSeenAt)} />
+          <FieldValue label="风险" value={alert.riskName ?? alert.riskCategory} />
+          <FieldValue label="首次发现" value={formatDate(alert.firstSeenAt)} />
+          <FieldValue label="最近发现" value={formatDate(alert.lastSeenAt)} />
         </div>
 
         <div className="grid gap-3 md:grid-cols-3">
           <div className="rounded-md border border-white/10 bg-white/[0.03] px-3 py-2">
-            <p className="text-[11px] text-zinc-600">等级</p>
-            <p className="mt-1 text-sm font-semibold text-zinc-100">{SEVERITY_LABEL[alert.severity]}</p>
+            <p className="text-[11px] text-zinc-600">{t("等级")}</p>
+            <p className="mt-1 text-sm font-semibold text-zinc-100">{t(SEVERITY_LABEL[alert.severity])}</p>
           </div>
           <div className="rounded-md border border-white/10 bg-white/[0.03] px-3 py-2">
-            <p className="text-[11px] text-zinc-600">触发次数</p>
+            <p className="text-[11px] text-zinc-600">{t("触发次数")}</p>
             <p className="mt-1 font-mono text-2xl font-semibold text-zinc-100">{alert.occurrenceCount}</p>
           </div>
           <div className="rounded-md border border-white/10 bg-white/[0.03] px-3 py-2">
-            <p className="text-[11px] text-zinc-600">通知</p>
+            <p className="text-[11px] text-zinc-600">{t("通知")}</p>
             <p className="mt-1 truncate font-mono text-xs text-zinc-300">{formatDate(alert.lastNotificationAt)}</p>
           </div>
         </div>
 
         <div>
-          <p className="mb-2 text-xs font-medium text-zinc-400">描述</p>
+          <p className="mb-2 text-xs font-medium text-zinc-400">{t("描述")}</p>
           <div className="rounded-md border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-zinc-300">{alert.description}</div>
         </div>
 
@@ -406,7 +467,7 @@ function AlertDetail({
           <div className="rounded-md border border-white/10 bg-white/[0.03] p-3">
             <div className="mb-2 flex items-center gap-2">
               <TerminalSquare className="size-4 text-teal-200" />
-              <h3 className="text-sm font-semibold text-zinc-100">Labels</h3>
+              <h3 className="text-sm font-semibold text-zinc-100">{t("标签")}</h3>
             </div>
             <div className="grid gap-2 sm:grid-cols-2">
               {labelRows.map(([key, value]) => <FieldValue key={key} label={key} value={value} />)}
@@ -416,15 +477,15 @@ function AlertDetail({
 
         <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_120px]">
           <label className="flex flex-col gap-1.5">
-            <span className="text-xs font-medium text-zinc-400">负责人</span>
+            <span className="text-xs font-medium text-zinc-400">{t("负责人")}</span>
             <Input value={owner} onChange={(event) => onOwnerChange(event.target.value)} placeholder="operator / team" className="h-9 border-white/10 bg-white/5 text-xs" />
           </label>
           <label className="flex flex-col gap-1.5">
-            <span className="text-xs font-medium text-zinc-400">备注</span>
-            <Input value={note} onChange={(event) => onNoteChange(event.target.value)} placeholder="处置说明" className="h-9 border-white/10 bg-white/5 text-xs" />
+            <span className="text-xs font-medium text-zinc-400">{t("备注")}</span>
+            <Input value={note} onChange={(event) => onNoteChange(event.target.value)} placeholder={t("处置说明")} className="h-9 border-white/10 bg-white/5 text-xs" />
           </label>
           <label className="flex flex-col gap-1.5">
-            <span className="text-xs font-medium text-zinc-400">静默分钟</span>
+            <span className="text-xs font-medium text-zinc-400">{t("静默分钟")}</span>
             <Input value={silenceMinutes} onChange={(event) => onSilenceMinutesChange(event.target.value.replace(/\D/g, "").slice(0, 5))} className="h-9 border-white/10 bg-white/5 font-mono text-xs" />
           </label>
         </div>
@@ -432,19 +493,19 @@ function AlertDetail({
         <div className="flex flex-wrap items-center gap-2">
           <Button type="button" size="sm" disabled={saving} onClick={() => onStatus("acknowledged")} className="h-8 bg-amber-400 text-[#171004] hover:bg-amber-300">
             {saving ? <LoaderCircle className="size-3.5 animate-spin" /> : <UserCheck className="size-3.5" />}
-            确认
+            {t("确认")}
           </Button>
           <Button type="button" size="sm" disabled={saving} onClick={() => onStatus("resolved")} className="h-8 bg-teal-500 text-[#07100c] hover:bg-teal-400">
             <CheckCircle2 className="size-3.5" />
-            解决
+            {t("解决")}
           </Button>
           <Button type="button" variant="secondary" size="sm" disabled={saving} onClick={() => onStatus("silenced")} className="h-8 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
             <Clock3 className="size-3.5" />
-            静默
+            {t("静默")}
           </Button>
           <Button type="button" variant="secondary" size="sm" disabled={saving} onClick={() => onStatus("open")} className="h-8 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
             <RotateCcw className="size-3.5" />
-            重开
+            {t("重开")}
           </Button>
         </div>
 
@@ -455,8 +516,10 @@ function AlertDetail({
 }
 
 export default function AlertsPage() {
+  const { t } = useI18n();
   const [searchParams, setSearchParams] = useSearchParams();
   const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
+  const [scope, setScope] = useState<AlertScope>(searchParams.get("scope") === "raw" ? "raw" : "agent");
   const [status, setStatus] = useState<AlertStatus | "all">((searchParams.get("status") as AlertStatus) || "all");
   const [severity, setSeverity] = useState<SecuritySeverity | "all">((searchParams.get("severity") as SecuritySeverity) || "all");
   const [kind, setKind] = useState<AlertKind | "all">((searchParams.get("kind") as AlertKind) || "all");
@@ -478,6 +541,7 @@ export default function AlertsPage() {
 
   const query = useMemo<AlertListQuery>(() => ({
     timeType,
+    scope,
     alertId: clean(selectedAlertId),
     status,
     severity,
@@ -493,7 +557,7 @@ export default function AlertsPage() {
     objectiveId: clean(routeObjectiveId),
     issueId: clean(routeIssueId),
     limit: 200,
-  }), [kind, queryText, routeAgentId, routeCollectorId, routeEventId, routeIncidentId, routeIssueId, routeObjectiveId, routeSourceId, routeTaskId, routeWorkspacePath, selectedAlertId, severity, status, timeType]);
+  }), [kind, queryText, routeAgentId, routeCollectorId, routeEventId, routeIncidentId, routeIssueId, routeObjectiveId, routeSourceId, routeTaskId, routeWorkspacePath, scope, selectedAlertId, severity, status, timeType]);
 
   const { data, loading, refresh } = useRequest(() => securityCenterApi.alerts(query), {
     refreshDeps: [query],
@@ -512,6 +576,7 @@ export default function AlertsPage() {
     setNote(alert.note ?? "");
     const next = new URLSearchParams();
     next.set("timeType", timeType);
+    next.set("scope", scope);
     next.set("alertId", alert.alertId);
     next.set("kind", alert.kind);
     if (alert.incidentId) next.set("incidentId", alert.incidentId);
@@ -556,62 +621,154 @@ export default function AlertsPage() {
     }
   };
 
+  const overviewNavItems = MONITORING_NAV_ITEMS.filter((item) =>
+    ["overview", "scan", "risk", "stream"].includes(item.view),
+  );
+  const platformNavItems = MONITORING_NAV_ITEMS.filter((item) =>
+    ["events", "workspace"].includes(item.view),
+  );
+  const governanceNavItems = MONITORING_NAV_ITEMS.filter((item) => item.view === "supplyChain");
+  const renderMonitoringNavItem = (item: (typeof MONITORING_NAV_ITEMS)[number]) => {
+    const Icon = item.icon;
+    return (
+      <Link
+        key={item.view}
+        to={`/?view=${item.view}`}
+        className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+      >
+        <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+          <Icon className="size-3.5" />
+        </span>
+        <span className="min-w-0">
+          <span className="block text-xs font-semibold leading-[1.45]">{t(item.label)}</span>
+          <span className="mt-0.5 block text-[10.5px] leading-4 text-[#5b6373]">{t(item.description)}</span>
+        </span>
+      </Link>
+    );
+  };
+
   return (
-    <div className="flex h-full w-full flex-col overflow-hidden bg-[#0b0f0c] text-zinc-100">
-      <header className="shrink-0 border-b border-white/10 bg-[#0b0f0c] px-4 py-3">
+    <div className="flex h-full w-full overflow-hidden bg-[#0a0d12] text-zinc-100">
+      <aside className="hidden">
+        <nav className="space-y-1" aria-label={t("安全监控模块")}>
+          <p className="flex items-center gap-2 px-3 pb-1 pt-3 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <LayoutDashboard className="size-3.5" />
+            {t("概览")}
+          </p>
+          {overviewNavItems.map(renderMonitoringNavItem)}
+          <div
+            aria-current="page"
+            className="flex w-full items-start gap-2.5 rounded-md border border-transparent bg-[#1c222d] px-2.5 py-2 text-left text-[#e8ecf3] shadow-[inset_2px_0_0_#f97316]"
+          >
+            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#f97316]">
+              <BellRing className="size-3.5" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-xs font-semibold leading-[1.45]">{t("告警")}</span>
+              <span className="mt-0.5 block text-[10.5px] leading-4 text-[#818a9c]">{t("活跃告警与处置")}</span>
+            </span>
+          </div>
+
+          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <ServerCog className="size-3.5" />
+            {t("平台监控")}
+          </p>
+          {platformNavItems.map(renderMonitoringNavItem)}
+
+          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <Wrench className="size-3.5" />
+            {t("运维")}
+          </p>
+          <Link
+            to="/maintenance"
+            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+          >
+            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+              <CalendarClock className="size-3.5" />
+            </span>
+            <span className="block text-xs font-semibold leading-[1.45]">{t("维护")}</span>
+          </Link>
+          <Link
+            to="/admin/policy"
+            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+          >
+            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+              <SlidersHorizontal className="size-3.5" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-xs font-semibold leading-[1.45]">{t("策略配置")}</span>
+              <span className="mt-0.5 block text-[10.5px] leading-4 text-[#5b6373]">{t("L1 / L2 / L3 研判策略")}</span>
+            </span>
+          </Link>
+
+          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <ShieldAlert className="size-3.5" />
+            {t("安全治理")}
+          </p>
+          {governanceNavItems.map(renderMonitoringNavItem)}
+
+          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <SlidersHorizontal className="size-3.5" />
+            {t("管理")}
+          </p>
+          <AdminTokenControl navigation />
+        </nav>
+      </aside>
+
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+      <header className="shrink-0 border-b border-[#232a37] bg-[#0f131a] px-4 py-3">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex min-w-0 items-center gap-3">
-            <Button asChild variant="secondary" size="sm" className="h-9 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
+            <Button asChild variant="secondary" size="sm" className="h-9 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10 lg:hidden">
               <Link to="/">
                 <ArrowLeft className="size-3.5" />
-                返回
+                {t("返回")}
               </Link>
             </Button>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <Siren className="size-5 shrink-0 text-rose-300" />
-                <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">告警中心</h1>
+                <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">{t("告警中心")}</h1>
               </div>
               <p className="mt-0.5 truncate text-xs text-zinc-500">Incident · Collector · Agent · Event · Source · Objective · Remediation</p>
             </div>
           </div>
           <div className="flex items-center gap-3 text-xs text-zinc-500">
-            <AdminTokenControl compact />
+            <div className="lg:hidden">
+              <AdminTokenControl compact />
+            </div>
             <span className={cn("rounded-full border px-2 py-0.5", data?.webhookConfigured ? "border-teal-400/25 bg-teal-500/10 text-teal-100" : "border-white/10 bg-white/5")}>
               Webhook {data?.webhookConfigured ? "on" : "off"}
             </span>
-            <span className="inline-flex items-center gap-1.5">
-              <Clock3 className="size-3.5" />
-              {data?.updateTime ? formatDate(data.updateTime) : "等待刷新"}
-            </span>
+            <AlertScopeTabs value={scope} onChange={setScope} />
           </div>
         </div>
 
         <div className="mt-3 grid gap-2 md:grid-cols-[120px_130px_130px_130px_minmax(180px,1fr)_auto_auto]">
           <Select value={timeType} onValueChange={(next) => setTimeType(next as SecurityTimeType)}>
             <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
-            <SelectContent>{TIME_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
+            <SelectContent>{TIME_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{t(option.label)}</SelectItem>)}</SelectContent>
           </Select>
           <Select value={status} onValueChange={(next) => setStatus(next as AlertStatus | "all")}>
             <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
-            <SelectContent>{STATUS_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
+            <SelectContent>{STATUS_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{t(option.label)}</SelectItem>)}</SelectContent>
           </Select>
           <Select value={severity} onValueChange={(next) => setSeverity(next as SecuritySeverity | "all")}>
             <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
-            <SelectContent>{SEVERITY_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
+            <SelectContent>{SEVERITY_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{t(option.label)}</SelectItem>)}</SelectContent>
           </Select>
           <Select value={kind} onValueChange={(next) => setKind(next as AlertKind | "all")}>
             <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
-            <SelectContent>{KIND_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
+            <SelectContent>{KIND_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{t(option.label)}</SelectItem>)}</SelectContent>
           </Select>
           <Input value={queryText} onChange={(event) => setQueryText(event.target.value)} placeholder="alert / agent / collector / source / owner / team / risk" className="h-9 border-white/10 bg-white/5 font-mono text-xs" />
           <Button type="button" variant="secondary" size="sm" onClick={clearFilters} className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
             <X className="size-3.5" />
-            清除
+            {t("清除")}
           </Button>
           <Button type="button" size="sm" onClick={refresh} disabled={loading} className="h-9 bg-teal-500 text-[#07100c] hover:bg-teal-400">
             {loading ? <LoaderCircle className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
-            刷新
+            {t("刷新")}
           </Button>
         </div>
       </header>
@@ -632,17 +789,17 @@ export default function AlertsPage() {
               <div className="flex min-h-12 items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
                 <div className="flex items-center gap-2">
                   <BellRing className="size-4 text-rose-200" />
-                  <h2 className="text-sm font-semibold text-zinc-100">Alerts</h2>
+                  <h2 className="text-sm font-semibold text-zinc-100">{t("告警")}</h2>
                 </div>
-                <span className="text-xs text-zinc-500">{data ? `${data.total} 条` : "--"}</span>
+                <span className="text-xs text-zinc-500">{data ? `${data.total} ${t("条")}` : "--"}</span>
               </div>
               {loading && !data ? (
                 <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">
                   <LoaderCircle className="mr-2 size-4 animate-spin" />
-                  加载告警...
+                  {t("加载告警...")}
                 </div>
               ) : (data?.items?.length ?? 0) === 0 ? (
-                <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">暂无告警</div>
+                <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">{t("暂无告警")}</div>
               ) : (
                 <div className="max-h-[calc(100vh-300px)] overflow-y-auto">
                   {data?.items.map((alert) => (
@@ -673,7 +830,7 @@ export default function AlertsPage() {
               <section className="rounded-[8px] border border-white/10 bg-[#111612]/92 p-4">
                 <div className="mb-3 flex items-center gap-2">
                   <ShieldAlert className="size-4 text-teal-200" />
-                  <h2 className="text-sm font-semibold text-zinc-100">规则</h2>
+                  <h2 className="text-sm font-semibold text-zinc-100">{t("规则")}</h2>
                 </div>
                 <div className="grid gap-2 lg:grid-cols-2">
                   {(data?.rules ?? []).map((rule) => (
@@ -693,6 +850,7 @@ export default function AlertsPage() {
           </div>
         </div>
       </main>
+      </div>
     </div>
   );
 }
