@@ -1,4 +1,5 @@
 import { Queue, Worker } from 'bullmq';
+import IORedis from 'ioredis';
 import { redisConnection } from './judgment-queue.service';
 import { assessDependencySnapshot } from './supply-chain-assessment';
 import { SupplyChainStore } from './supply-chain-store';
@@ -8,6 +9,7 @@ import {
 } from './supply-chain-runtime';
 import {
   SUPPLY_CHAIN_ASSESSMENT_QUEUE,
+  SUPPLY_CHAIN_ASSESSMENT_WORKER_HEARTBEAT_KEY,
   SupplyChainAssessmentJob,
 } from './supply-chain.types';
 
@@ -15,16 +17,34 @@ const connection = redisConnection();
 const store = new SupplyChainStore();
 const runtimePublisher = new SupplyChainRuntimePublisher();
 const queue = new Queue<SupplyChainAssessmentJob>(SUPPLY_CHAIN_ASSESSMENT_QUEUE, { connection });
+const heartbeatRedis = new IORedis(
+  process.env.ANYSENTRY_REDIS_URL || 'redis://redis:6379/0',
+  { maxRetriesPerRequest: null },
+);
 const refreshIntervalMs = Math.max(
   60 * 60_000,
   Number(process.env.ANYSENTRY_OSV_REFRESH_INTERVAL_MS || 24 * 60 * 60_000),
 );
 let closing = false;
 let refreshTimer: NodeJS.Timeout | undefined;
+let heartbeatTimer: NodeJS.Timeout | undefined;
+
+async function heartbeat(): Promise<void> {
+  await heartbeatRedis.set(
+    SUPPLY_CHAIN_ASSESSMENT_WORKER_HEARTBEAT_KEY,
+    String(Date.now()),
+    'PX',
+    20_000,
+  );
+}
 
 async function enqueueDueAssessments(): Promise<void> {
+  const control = await store.loadControl();
+  if (!control?.enabled || !control.dailyRefreshEnabled) return;
   const now = Date.now();
   for (const snapshot of await store.activeSnapshots()) {
+    if (control.selectedWorkspaceIds.length > 0
+      && !control.selectedWorkspaceIds.includes(snapshot.workspaceId)) continue;
     const latest = await store.latestAssessmentAt(snapshot.dependencySnapshotId);
     if (latest && now - latest < refreshIntervalMs) continue;
     await queue.add('assess-dependency-snapshot', {
@@ -50,6 +70,22 @@ async function start(): Promise<void> {
   const worker = new Worker<SupplyChainAssessmentJob>(
     SUPPLY_CHAIN_ASSESSMENT_QUEUE,
     async (job) => {
+      const control = await store.loadControl();
+      if (!control?.enabled) {
+        console.log('[supply-chain] assessment skipped because scanning is disabled', {
+          jobId: job.id,
+          workspaceId: job.data.workspaceId,
+        });
+        return;
+      }
+      if (control.selectedWorkspaceIds.length > 0
+        && !control.selectedWorkspaceIds.includes(job.data.workspaceId)) {
+        console.log('[supply-chain] assessment skipped for an unselected Workspace', {
+          jobId: job.id,
+          workspaceId: job.data.workspaceId,
+        });
+        return;
+      }
       const snapshot = await store.snapshot(job.data.dependencySnapshotId);
       if (!snapshot) throw new Error('dependency snapshot does not exist');
       if (snapshot.snapshotExtractionStatus !== 'complete') {
@@ -57,7 +93,7 @@ async function start(): Promise<void> {
       }
       const assessment = await assessDependencySnapshot(snapshot);
       await store.insertAssessment(assessment);
-      if (assessment.assessmentStatus === 'complete') {
+      if (assessment.assessmentStatus === 'complete' && control.runtimeCorrelationEnabled) {
         const workspace = await store.workspace(assessment.workspaceId);
         if (!workspace?.workspacePathFingerprint) {
           throw new Error('workspace path fingerprint is missing; restart its Workspace Scanner');
@@ -87,6 +123,13 @@ async function start(): Promise<void> {
     });
   });
   await enqueueDueAssessments();
+  await heartbeat();
+  heartbeatTimer = setInterval(() => {
+    void heartbeat().catch((error) => {
+      if (!closing) console.error('[supply-chain] worker heartbeat failed', error instanceof Error ? error.message : String(error));
+    });
+  }, 5_000);
+  heartbeatTimer.unref();
   refreshTimer = setInterval(() => {
     void enqueueDueAssessments().catch((error) => {
       if (!closing) console.error('[supply-chain] refresh scheduling failed', error instanceof Error ? error.message : String(error));
@@ -98,7 +141,14 @@ async function start(): Promise<void> {
     if (closing) return;
     closing = true;
     if (refreshTimer) clearInterval(refreshTimer);
-    await Promise.all([worker.close(), queue.close(), store.close(), runtimePublisher.close()]);
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    await Promise.all([
+      worker.close(),
+      queue.close(),
+      store.close(),
+      runtimePublisher.close(),
+      heartbeatRedis.quit(),
+    ]);
     process.exit(0);
   };
   process.on('SIGINT', () => void shutdown());
@@ -107,6 +157,11 @@ async function start(): Promise<void> {
 
 void start().catch(async (error) => {
   console.error('[supply-chain] worker failed to start', error instanceof Error ? error.stack : String(error));
-  await Promise.allSettled([queue.close(), store.close(), runtimePublisher.close()]);
+  await Promise.allSettled([
+    queue.close(),
+    store.close(),
+    runtimePublisher.close(),
+    heartbeatRedis.quit(),
+  ]);
   process.exit(1);
 });

@@ -1,14 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { Sentry } from '@a3s-lab/sentry';
+import { DashboardWindowBucketRow, DashboardWindowDimensionRow, DashboardWindowHistory } from './clickhouse-store';
 import { AgentMetadataService } from './agent-metadata.service';
 import { IngestionSourceService } from './ingestion-source.service';
 import { MaintenanceWindowService } from './maintenance-window.service';
 import { buildAcl, policyConfigError, sanitizePolicy } from './policy-config';
 import { SentryJudgeService } from './sentry-judge.service';
+import { resolveTimeWindow } from './time-window';
 import * as T from './types';
-
-const HOUR = 3_600_000;
-const WINDOW: Record<string, number> = { last_3h: 3 * HOUR, last_1d: 24 * HOUR, last_7d: 7 * 24 * HOUR, last_30d: 30 * 24 * HOUR };
 
 const SEV_RANK: Record<T.Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 const LEVEL_BY_RANK = ['safe', 'low', 'medium', 'high', 'critical'];
@@ -285,31 +284,97 @@ export class AggregationService {
   // The dashboard polls 9 endpoints with the same filter near-simultaneously; cache the windowed
   // scan for a beat so they share one pass over the 100k ring instead of nine (keeps latency flat).
   private readonly winCache = new Map<string, { at: number; val: ReturnType<AggregationService['computeWin']> }>();
+  private readonly historyCache = new Map<string, {
+    startedAt: number;
+    completedAt?: number;
+    value: Promise<DashboardWindowHistory | null>;
+  }>();
 
   invalidateWindowCache(): void {
     this.winCache.clear();
+    // Ingestion invalidates the millisecond-scale hot-ring cache, but must not cancel or discard a
+    // multi-second ClickHouse history query. Historical snapshots intentionally refresh on their
+    // own short TTL; clearing them for every event creates a query storm at observer throughput.
+  }
+
+  private history(filter: T.SecurityTimeFilter): Promise<DashboardWindowHistory | null> {
+    const window = resolveTimeWindow(filter);
+    const cached = this.historyCache.get(window.cacheKey);
+    const t = now();
+    const ttlMs = window.custom
+      ? 5 * 60_000
+      : window.spanMs >= 7 * 24 * 60 * 60_000
+        ? 5 * 60_000
+        : window.spanMs >= 24 * 60 * 60_000
+          ? 60_000
+          : 30_000;
+    if (cached && (cached.completedAt === undefined || t - cached.completedAt < ttlMs)) return cached.value;
+    const value = this.judge.dashboardWindowHistory(window.startMs, window.endMs, 180);
+    const entry = { startedAt: t, completedAt: undefined as number | undefined, value };
+    this.historyCache.set(window.cacheKey, entry);
+    void value.then((result) => {
+      if (this.historyCache.get(window.cacheKey)?.value !== value) return;
+      if (!result) this.historyCache.delete(window.cacheKey);
+      else entry.completedAt = now();
+    });
+    return value;
+  }
+
+  private currentDimensions(history: DashboardWindowHistory, filter: T.SecurityTimeFilter): DashboardWindowDimensionRow[] {
+    const agentScoped = filter.scope === 'agent';
+    return history.dimensions.filter((row) => row.period === 'current' && (!agentScoped || row.monitored));
+  }
+
+  private aggregateHistoryBuckets(history: DashboardWindowHistory, filter: T.SecurityTimeFilter, count: number): DashboardWindowBucketRow[] {
+    const agentScoped = filter.scope === 'agent';
+    const size = 180;
+    const out: DashboardWindowBucketRow[] = Array.from({ length: count }, (_, bucketIndex) => ({
+      bucketIndex,
+      monitored: agentScoped,
+      eventCount: 0,
+      blockedCount: 0,
+      escalatedCount: 0,
+      l2Count: 0,
+      l3Count: 0,
+      riskActivationCount: 0,
+      tokenCount: 0,
+      latencyTotal: 0,
+      riskScoreTotal: 0,
+    }));
+    for (const row of history.buckets) {
+      if (agentScoped && !row.monitored) continue;
+      const index = Math.min(count - 1, Math.floor((row.bucketIndex * count) / size));
+      const target = out[index];
+      target.eventCount += row.eventCount;
+      target.blockedCount += row.blockedCount;
+      target.escalatedCount += row.escalatedCount;
+      target.l2Count += row.l2Count;
+      target.l3Count += row.l3Count;
+      target.riskActivationCount += row.riskActivationCount;
+      target.tokenCount += row.tokenCount;
+      target.latencyTotal += row.latencyTotal;
+      target.riskScoreTotal += row.riskScoreTotal;
+    }
+    return out;
   }
 
   private win(filter: T.SecurityTimeFilter): { events: T.JudgedEvent[]; sinceMs: number; spanMs: number; dataSinceMs: number; dataSpanMs: number } {
-    const key = `${filter.timeType ?? 'last_3h'}|${filter.startTime ?? ''}`;
+    const window = resolveTimeWindow(filter);
+    const key = window.cacheKey;
     const cached = this.winCache.get(key);
     const t = now();
     if (cached && t - cached.at < 1500) return cached.val;
-    const val = this.computeWin(filter);
+    const val = this.computeWin(window.startMs, window.endMs);
     this.winCache.set(key, { at: t, val });
     return val;
   }
 
-  private computeWin(filter: T.SecurityTimeFilter): { events: T.JudgedEvent[]; sinceMs: number; spanMs: number; dataSinceMs: number; dataSpanMs: number } {
-    const end = now();
-    let sinceMs: number;
-    if (filter.timeType === 'custom' && filter.startTime) sinceMs = Date.parse(filter.startTime) || end - 3 * HOUR;
-    else sinceMs = end - (WINDOW[filter.timeType ?? 'last_3h'] ?? 3 * HOUR);
-    const events = this.judge.query(sinceMs);
+  private computeWin(sinceMs: number, endMs: number): { events: T.JudgedEvent[]; sinceMs: number; spanMs: number; dataSinceMs: number; dataSpanMs: number } {
+    const events = this.judge.queryRange(sinceMs, endMs);
     // The in-memory ring may hold less time than the nominal window. Time-series/rate panels must
     // bucket over the data that actually exists, or everything piles into one bucket (req=100000).
     const dataSinceMs = events.length ? events[0].at : sinceMs;
-    return { events, sinceMs, spanMs: end - sinceMs, dataSinceMs, dataSpanMs: Math.max(1, end - dataSinceMs) };
+    return { events, sinceMs, spanMs: endMs - sinceMs, dataSinceMs, dataSpanMs: Math.max(1, endMs - dataSinceMs) };
   }
 
   // bucketed counts over the window (for time-series + rate panels)
@@ -324,7 +389,8 @@ export class AggregationService {
   }
 
   healthCard(filter: T.SecurityTimeFilter): T.SecurityHealthCard {
-    const { events } = this.win(filter);
+    const windowEvents = this.win(filter).events;
+    const events = filter.scope === 'agent' ? windowEvents.filter(isMonitoredAgentEvent) : windowEvents;
     const total = events.length || 1;
     const blocked = events.filter((e) => e.verdict === 'block').length;
     const escalated = events.filter((e) => e.verdict === 'escalate').length;
@@ -335,7 +401,8 @@ export class AggregationService {
   }
 
   explainabilityScan(filter: T.ExplainabilityScanRequest): T.SecurityExplainabilityScan {
-    const { events, dataSinceMs, dataSpanMs } = this.win(filter);
+    const { events: windowEvents, dataSinceMs, dataSpanMs } = this.win(filter);
+    const events = filter.scope === 'agent' ? windowEvents.filter(isMonitoredAgentEvent) : windowEvents;
     const n = Math.max(8, Math.min(72, filter.seriesPoints ?? 24));
     const size = dataSpanMs / n || 1;
     const buckets = this.buckets(events, dataSinceMs, dataSpanMs, n);
@@ -456,6 +523,37 @@ export class AggregationService {
     };
   }
 
+  async agentEventsForWindow(filter: T.AgentEventQuery): Promise<T.AgentEventList> {
+    if (filter.eventId) return this.agentEvents(filter);
+    const window = resolveTimeWindow(filter);
+    const limit = Math.max(1, Math.min(200, filter.limit ?? 40));
+    const persisted = await this.judge.recentPersistedEvents(
+      window.startMs,
+      window.endMs,
+      Math.max(1_000, limit * 10),
+      { monitoredOnly: filter.scope === 'agent', tier: filter.tier },
+    );
+    if (!persisted) return this.agentEvents(filter);
+    const filtered = this.filterEvents(persisted, filter).sort((a, b) => b.at - a.at);
+    const compacted = filter.scope === 'raw'
+      ? filtered.map((event) => ({ event, repeatCount: 1, lastAt: event.at }))
+      : compactEvents(filtered);
+    const history = await this.history(filter);
+    const hasDetailedFilter = Boolean(
+      filter.sourceId || filter.collectorId || filter.agentId || filter.sessionId || filter.workspacePath ||
+      filter.traceId || filter.runId || filter.eventKind || filter.eventCategory || filter.verdict,
+    );
+    const rows = history && !hasDetailedFilter
+      ? this.currentDimensions(history, filter).filter((row) => !filter.tier || row.tier === filter.tier)
+      : [];
+    const total = rows.length ? rows.reduce((sum, row) => sum + row.eventCount, 0) : compacted.length;
+    return {
+      items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) => this.eventItem(event, repeatCount, lastAt)),
+      total,
+      updateTime: iso(),
+    };
+  }
+
   agentTimeline(filter: T.AgentEventQuery): T.AgentTimeline {
     const pinnedEventId = filter.eventId?.trim();
     const events = pinnedEventId ? this.judge.query(0) : this.win(filter).events;
@@ -507,6 +605,7 @@ export class AggregationService {
     const filtered = all
       .filter((i) => {
         const matchesIncidentId = Boolean(pinnedIncidentId && i.incidentId === pinnedIncidentId);
+        if (filter.scope === 'agent' && !matchesIncidentId && i.monitored !== true) return false;
         const matchesFilter =
           i.updatedAt >= sinceMs &&
           (!filter.status || filter.status === 'all' || i.status === filter.status) &&
@@ -540,7 +639,10 @@ export class AggregationService {
   }
 
   agentInventory(filter: T.AgentInventoryQuery): T.AgentInventory {
-    const { events } = this.win(filter);
+    const window = this.win(filter);
+    const events = filter.scope === 'agent'
+      ? window.events.filter((event) => event.attribution?.monitored === true)
+      : window.events;
     const q = filter.q?.trim().toLowerCase();
     const owner = filter.owner?.trim().toLowerCase();
     const environment = filter.environment?.trim().toLowerCase();
@@ -561,6 +663,7 @@ export class AggregationService {
     const openIncidents = new Map<string, number>();
     for (const incident of this.judge.listIncidents(0)) {
       if (incident.status !== 'open') continue;
+      if (filter.scope === 'agent' && incident.monitored !== true) continue;
       const key = `${incident.workspacePath}\0${incident.agentId}`;
       openIncidents.set(key, (openIncidents.get(key) ?? 0) + 1);
     }
@@ -724,14 +827,24 @@ export class AggregationService {
   }
 
   workspaceInventory(filter: T.WorkspaceInventoryQuery): T.WorkspaceInventory {
-    const { events } = this.win(filter);
+    const window = this.win(filter);
+    const events = filter.scope === 'agent'
+      ? window.events.filter((event) => event.attribution?.monitored === true)
+      : window.events;
     const q = filter.q?.trim().toLowerCase();
     const owner = filter.owner?.trim().toLowerCase();
     const environment = filter.environment?.trim().toLowerCase();
     const workspacePath = filter.workspacePath?.trim();
     const hasFilter = Boolean((filter.healthState && filter.healthState !== 'all') || (filter.criticality && filter.criticality !== 'all') || owner || environment || q);
     const shouldScopeExactWorkspace = Boolean(workspacePath && !hasFilter);
-    const agents = this.agentInventory({ timeType: filter.timeType, startTime: filter.startTime, endTime: filter.endTime, workspacePath: shouldScopeExactWorkspace ? workspacePath : undefined, limit: 500 });
+    const agents = this.agentInventory({
+      timeType: filter.timeType,
+      startTime: filter.startTime,
+      endTime: filter.endTime,
+      scope: filter.scope,
+      workspacePath: shouldScopeExactWorkspace ? workspacePath : undefined,
+      limit: 500,
+    });
     const byWorkspaceEvents = new Map<string, T.JudgedEvent[]>();
     for (const e of events) {
       if (shouldScopeExactWorkspace && e.workspacePath !== workspacePath) continue;
@@ -1195,9 +1308,10 @@ export class AggregationService {
   }
 
   coverageOverview(filter: T.CoverageQuery): T.CoverageOverview {
-    const { events } = this.win(filter);
+    const { events: windowEvents } = this.win(filter);
+    const events = windowEvents.filter((event) => event.attribution?.monitored === true);
     const collectors = this.collectorHealth({ timeType: filter.timeType, startTime: filter.startTime, endTime: filter.endTime, limit: 500 });
-    const agents = this.agentInventory({ timeType: filter.timeType, startTime: filter.startTime, endTime: filter.endTime, limit: 500 });
+    const agents = this.agentInventory({ timeType: filter.timeType, startTime: filter.startTime, endTime: filter.endTime, scope: 'agent', limit: 500 });
     const sourceList = this.sources.list({ status: 'all', type: 'all', limit: 500 });
     const collectorById = new Map(collectors.items.map((collector) => [collector.collectorId, collector]));
     const activeCollectorIds = new Set(
@@ -1636,7 +1750,8 @@ export class AggregationService {
   }
 
   performanceCard(filter: T.SecurityTimeFilter): T.SecurityPerformanceCard {
-    const { events, dataSinceMs, dataSpanMs } = this.win(filter);
+    const { events: windowEvents, dataSinceMs, dataSpanMs } = this.win(filter);
+    const events = filter.scope === 'agent' ? windowEvents.filter(isMonitoredAgentEvent) : windowEvents;
     const n = 60;
     const size = dataSpanMs / n || 1;
     const counts = this.buckets(events, dataSinceMs, dataSpanMs, n).map((b) => b.length);
@@ -1738,7 +1853,8 @@ export class AggregationService {
   }
 
   agentObservability(filter: T.SecurityTimeFilter): T.AgentObservability {
-    const { events } = this.win(filter);
+    const windowEvents = this.win(filter).events;
+    const events = filter.scope === 'agent' ? windowEvents.filter(isMonitoredAgentEvent) : windowEvents;
     const recent = events.filter((e) => e.at >= now() - 60_000);
     const total = events.length || 1;
     const errorRate = round1((events.filter((e) => e.verdict !== 'allow').length / total) * 100);
@@ -1767,5 +1883,207 @@ export class AggregationService {
       })
       .sort((a, b) => b.totalRiskScore - a.totalRiskScore);
     return { list, updateTime: iso() };
+  }
+
+  async healthCardForWindow(filter: T.SecurityTimeFilter): Promise<T.SecurityHealthCard> {
+    const history = await this.history(filter);
+    if (!history) return this.healthCard(filter);
+    const rows = this.currentDimensions(history, filter);
+    const total = rows.reduce((sum, row) => sum + row.eventCount, 0) || 1;
+    const blocked = rows.filter((row) => row.verdict === 'block').reduce((sum, row) => sum + row.eventCount, 0);
+    const escalated = rows.filter((row) => row.verdict === 'escalate').reduce((sum, row) => sum + row.eventCount, 0);
+    const score = Math.max(1, Math.min(100, Math.round(100 - (blocked / total) * 60 - (escalated / total) * 25)));
+    const text = score >= 90 ? '健康' : score >= 75 ? '良好' : score >= 60 ? '注意' : score >= 40 ? '风险偏高' : '高危';
+    const tokens = fmtTokens(rows.reduce((sum, row) => sum + row.tokenCount, 0));
+    return { healthScore: score, healthStatusText: text, tokenConsumptionTotal: tokens.total, tokenConsumptionUnit: tokens.unit };
+  }
+
+  async explainabilityScanForWindow(filter: T.ExplainabilityScanRequest): Promise<T.SecurityExplainabilityScan> {
+    const history = await this.history(filter);
+    if (!history) return this.explainabilityScan(filter);
+    const n = Math.max(8, Math.min(72, filter.seriesPoints ?? 24));
+    const window = resolveTimeWindow(filter);
+    const buckets = this.aggregateHistoryBuckets(history, filter, n);
+    const safeSeries: T.WaveSeriesPoint[] = [];
+    const riskSeries: T.WaveSeriesPoint[] = [];
+    buckets.forEach((bucket, index) => {
+      const statTime = iso(window.startMs + index * (window.spanMs / n));
+      const avgRisk = bucket.eventCount ? bucket.riskScoreTotal / bucket.eventCount : 0;
+      riskSeries.push({ statTime, value: Math.round(avgRisk), activationCount: bucket.riskActivationCount });
+      safeSeries.push({ statTime, value: Math.round(100 - avgRisk), activationCount: bucket.eventCount });
+    });
+    const rows = this.currentDimensions(history, filter);
+    const total = rows.reduce((sum, row) => sum + row.eventCount, 0);
+    const blocked = rows.filter((row) => row.verdict === 'block').reduce((sum, row) => sum + row.eventCount, 0);
+    const hotEvents = window.custom ? [] : this.judge.queryRange(Math.max(window.startMs, window.endMs - 5 * 60_000), window.endMs);
+    const scopedHotEvents = filter.scope === 'agent' ? hotEvents.filter(isMonitoredAgentEvent) : hotEvents;
+    return {
+      waveSeries: [{ safeSeries, riskSeries }],
+      threatInterception: `${round1((blocked / (total || 1)) * 100)}%`,
+      sessionActiveCount: String(distinct(scopedHotEvents.map((event) => event.sessionId))),
+      updateTime: iso(),
+    };
+  }
+
+  async performanceCardForWindow(filter: T.SecurityTimeFilter): Promise<T.SecurityPerformanceCard> {
+    const history = await this.history(filter);
+    if (!history) return this.performanceCard(filter);
+    const window = resolveTimeWindow(filter);
+    const buckets = this.aggregateHistoryBuckets(history, filter, 60);
+    const bucketSeconds = window.spanMs / buckets.length / 1000;
+    const counts = buckets.map((bucket) => bucket.eventCount);
+    const perSecond = counts.map((count) => count / (bucketSeconds || 1));
+    const total = buckets.reduce((sum, bucket) => sum + bucket.eventCount, 0);
+    const latencyTotal = buckets.reduce((sum, bucket) => sum + bucket.latencyTotal, 0);
+    return {
+      componentRequestCount: {
+        current: counts[counts.length - 1] ?? 0,
+        peak: Math.max(0, ...counts),
+        avg: Math.round(mean(counts)),
+      },
+      tps: {
+        current: round1(perSecond[perSecond.length - 1] ?? 0),
+        peak: round1(Math.max(0, ...perSecond)),
+        avg: round1(mean(perSecond)),
+      },
+      avgLatency: { value: Math.round(latencyTotal / (total || 1)), unit: 'ms' },
+      updateTime: iso(),
+    };
+  }
+
+  async riskSummaryForWindow(filter: T.SecurityTimeFilter): Promise<T.SecurityRiskSummary> {
+    const history = await this.history(filter);
+    if (!history) return this.riskSummary(filter);
+    const rows = this.currentDimensions(history, filter).filter((row) => row.verdict !== 'allow');
+    const card = (code: T.RiskType, name: string) => ({
+      riskTypeCode: code,
+      riskTypeName: name,
+      eventCount: rows.filter((row) => row.riskType === code).reduce((sum, row) => sum + row.eventCount, 0),
+    });
+    return {
+      summaryCards: [
+        card('system', '系统性风险'),
+        card('communication', '通信风险'),
+        card('atomic', '单体智能体风险'),
+      ],
+      updateTime: iso(),
+    };
+  }
+
+  async riskBreakdownForWindow(filter: T.SecurityTimeFilter): Promise<T.SecurityRiskBreakdown> {
+    const history = await this.history(filter);
+    if (!history) return this.riskBreakdown(filter);
+    const agentScoped = filter.scope === 'agent';
+    const select = (period: DashboardWindowDimensionRow['period']) => history.dimensions.filter((row) =>
+      row.period === period && row.verdict !== 'allow' && (!agentScoped || row.monitored));
+    const current = select('current');
+    const previous = select('previous');
+    const category = (type: T.RiskType): T.RiskCategory => {
+      const rows = current.filter((row) => row.riskType === type);
+      const previousRows = previous.filter((row) => row.riskType === type);
+      const countOf = (items: DashboardWindowDimensionRow[], code: string) =>
+        items.filter((row) => row.riskCategory === code).reduce((sum, row) => sum + row.eventCount, 0);
+      const known = RISK_TAXONOMY[type];
+      const extras = [...new Set(rows.map((row) => row.riskCategory))]
+        .filter((code) => !known.some((item) => item.code === code))
+        .map((code) => ({ code, name: rows.find((row) => row.riskCategory === code)?.riskName || code }));
+      const items = [...known, ...extras].map(({ code, name }) => {
+        const eventCount = countOf(rows, code);
+        const before = countOf(previousRows, code);
+        const changeRate = before === 0 ? (eventCount ? 100 : 0) : round1(((eventCount - before) / before) * 100);
+        return { riskCode: code, riskName: name, eventCount, changeRate };
+      }).sort((a, b) => b.eventCount - a.eventCount);
+      const top = items.find((item) => item.eventCount > 0);
+      return {
+        totalCount: rows.reduce((sum, row) => sum + row.eventCount, 0),
+        displayColor: CATEGORY_COLOR[top?.riskCode ?? ''] ?? '#94a3b8',
+        items,
+      };
+    };
+    return {
+      systemRisks: category('system'),
+      communicationRisks: category('communication'),
+      singleAgentRisks: category('atomic'),
+      updateTime: iso(),
+    };
+  }
+
+  async highestRiskSessionForWindow(filter: T.SecurityTimeFilter): Promise<T.SecurityHighestRiskSession> {
+    const history = await this.history(filter);
+    if (!history) return this.highestRiskSession(filter);
+    const top = history.topSession;
+    if (!top) {
+      return {
+        sessionId: '-',
+        userId: '-',
+        workspacePath: '-',
+        riskLevel: 'safe',
+        riskLevelText: LEVEL_TEXT.safe,
+        compositeScore: 0,
+        lastEventTime: iso(resolveTimeWindow(filter).endMs),
+        riskDimensions: DIMENSIONS.map((dimension) => ({ dimensionCode: dimension.code, dimensionName: dimension.name, score: 0 })),
+        updateTime: iso(),
+      };
+    }
+    const compositeScore = Math.min(100, Math.round((top.riskScoreTotal / (top.eventCount || 1)) + Math.sqrt(top.riskyEventCount) * 6));
+    const level = levelByRank(Math.min(4, Math.floor(compositeScore / 22)));
+    return {
+      sessionId: top.sessionId,
+      userId: top.userId,
+      workspacePath: top.workspacePath,
+      riskLevel: level.level,
+      riskLevelText: level.text,
+      compositeScore,
+      lastEventTime: iso(top.lastEventAt),
+      riskDimensions: DIMENSIONS.map((dimension) => {
+        const count = top.dimensionCounts[dimension.code] ?? 0;
+        return {
+          dimensionCode: dimension.code,
+          dimensionName: dimension.name,
+          score: count === 0 ? 0 : count === 1 ? 1 : count <= 3 ? 2 : 3,
+        };
+      }),
+      updateTime: iso(),
+    };
+  }
+
+  async decisionFunnelForWindow(filter: T.SecurityTimeFilter): Promise<T.SecurityDecisionFunnel> {
+    const history = await this.history(filter);
+    if (!history) return this.decisionFunnel(filter);
+    const rows = this.currentDimensions(history, filter);
+    const total = rows.reduce((sum, row) => sum + row.eventCount, 0) || 1;
+    const count = (predicate: (row: DashboardWindowDimensionRow) => boolean) =>
+      rows.filter(predicate).reduce((sum, row) => sum + row.eventCount, 0);
+    const l2 = count((row) => row.tier === 'Llm' || row.tier === 'Agent');
+    const l3 = count((row) => row.tier === 'Agent');
+    const blocked = count((row) => row.verdict === 'block');
+    const percentage = (value: number) => round1((value / total) * 100);
+    return {
+      tiers: [
+        { tierCode: 'L1', tierName: '规则引擎', count: total, percentage: 100, slaDesc: '确定性匹配 · <1ms' },
+        { tierCode: 'L2', tierName: 'LLM 研判', count: l2, percentage: percentage(l2), slaDesc: '语义判定 · <100ms' },
+        { tierCode: 'L3', tierName: '智能体深判', count: l3, percentage: percentage(l3), slaDesc: 'a3s-code · 深度调查' },
+      ],
+      finalBlock: { count: blocked, percentage: percentage(blocked) },
+      updateTime: iso(),
+    };
+  }
+
+  async workspaceRiskDistributionForWindow(filter: T.SecurityTimeFilter): Promise<T.SecurityWorkspaceRiskDistribution> {
+    const history = await this.history(filter);
+    if (!history || filter.scope === 'raw') return this.workspaceRiskDistribution(filter);
+    return {
+      list: history.workspaces.map((workspace) => {
+        const level = levelByRank(workspace.worstSeverityRank);
+        return {
+          workspacePath: workspace.workspacePath,
+          sessionCount: workspace.sessionCount,
+          totalRiskScore: workspace.totalRiskScore,
+          riskLevel: level.level,
+          riskLevelText: level.text,
+        };
+      }),
+      updateTime: iso(),
+    };
   }
 }

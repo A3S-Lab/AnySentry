@@ -4,6 +4,8 @@ import assert from 'node:assert/strict';
 import {
   compositePrompt,
   deterministicSupplyChainDecision,
+  deterministicSupplyChainTemporalDecision,
+  deterministicTemporalDecision,
   parseCompositeDecision,
 } from '../apps/api/dist/security-monitoring/stream-worker-main.js';
 import {
@@ -101,6 +103,20 @@ assert.equal(decision.verdict, 'block');
 assert.equal(decision.classification, 'confirmed_attack');
 assert.equal(decision.confidence, 0.91);
 assert.deepEqual(decision.evidenceEventIds, ['evt_read', 'evt_egress']);
+assert.equal(
+  parseCompositeDecision(`\`\`\`json
+${JSON.stringify({
+    classification: 'suspicious',
+    verdict: 'allow',
+    severity: 'medium',
+    confidence: 0.7,
+    attackType: 'download-and-execute',
+    reason: 'Incomplete chain requires investigation.',
+    evidenceEventIds: ['evt_read', 'evt_egress'],
+  })}
+\`\`\``, batch).classification,
+  'suspicious',
+);
 
 const syntheticDecision = parseCompositeDecision(JSON.stringify({
   classification: 'confirmed_attack',
@@ -118,7 +134,7 @@ assert.equal(syntheticDecision.attackType, 'none');
 
 assert.throws(
   () => parseCompositeDecision('{"verdict":"allow"} trailing text', batch),
-  /JSON/,
+  /invalid classification/,
 );
 assert.throws(
   () => parseCompositeDecision(JSON.stringify({
@@ -170,7 +186,7 @@ const completedRevision = {
   reason: 'The completed revision remains the active conclusion.',
   evidenceEventIds: ['evt_read', 'evt_egress'],
   evidence: batch.evidence,
-  model: 'deepseek-v4-flash',
+  model: 'deepseek-v4-pro',
   latencyMs: 2_000,
   ruleVersion: 'composite-risk-v2',
   synthetic: false,
@@ -252,5 +268,306 @@ const syntheticSupplyChainDecision = deterministicSupplyChainDecision({
 });
 assert.equal(syntheticSupplyChainDecision.classification, 'simulation');
 assert.equal(syntheticSupplyChainDecision.verdict, 'allow');
+assert.equal(syntheticSupplyChainDecision.attackType, 'known-vulnerability-exploitation');
+
+const strongProcess = (pid, ppid, rootPid = 10) => ({
+  hostId: 'node-1',
+  bootId: 'boot-1',
+  pid,
+  ppid,
+  rootPid,
+  processInstanceId: `process-${pid}`,
+  identityConfidence: 'strong',
+});
+const supplyChainTemporalBatch = {
+  ...supplyChainBatch,
+  episodeId: 'ste_supply_chain',
+  ruleVersion: 'supply-chain-temporal-v2',
+  evidenceConfidence: 'strong',
+  evidence: [
+    {
+      ...supplyChainBatch.evidence[0],
+      eventId: 'evt_component_v2',
+      eventTime: 1_785_000_000_000,
+      processIdentity: strongProcess(100, 10),
+    },
+    {
+      ...batch.evidence[0],
+      eventId: 'evt_shell_v2',
+      eventTime: 1_785_000_001_000,
+      operation: 'execute',
+      executable: 'bash',
+      behaviorStage: 'shell_execution',
+      processIdentity: strongProcess(101, 100),
+      runtimeVulnerabilities: [],
+    },
+    {
+      ...batch.evidence[1],
+      eventId: 'evt_egress_v2',
+      eventTime: 1_785_000_002_000,
+      operation: 'egress',
+      externalDestination: true,
+      processIdentity: strongProcess(102, 101),
+      runtimeVulnerabilities: [],
+    },
+  ],
+};
+const supplyChainTemporalDecision = deterministicSupplyChainTemporalDecision(
+  supplyChainTemporalBatch,
+);
+assert.equal(supplyChainTemporalDecision.classification, 'suspicious');
+assert.equal(supplyChainTemporalDecision.verdict, 'allow');
+assert.equal(supplyChainTemporalDecision.evidenceEventIds.length, 3);
+assert.equal(
+  deterministicSupplyChainTemporalDecision({
+    ...supplyChainTemporalBatch,
+    synthetic: true,
+  }).attackType,
+  'known-vulnerability-exploitation',
+);
+assert.throws(
+  () => deterministicSupplyChainTemporalDecision({
+    ...supplyChainTemporalBatch,
+    evidence: supplyChainTemporalBatch.evidence.map((item, index) =>
+      index === 1
+        ? { ...item, processIdentity: strongProcess(201, 200) }
+        : item),
+  }),
+  /process-lineage/,
+);
+
+const temporalFileIdentity = {
+  fileInstanceId: 'flp_test_payload',
+  path: '/tmp/temporal-payload',
+  mountNamespace: 4_026_531_840,
+  identityBasis: 'scoped_path',
+  identityConfidence: 'medium',
+};
+const temporalBatch = {
+  ...batch,
+  episodeId: 'tep_download_execute',
+  revision: 1,
+  supersedesRevision: undefined,
+  triggerReason: 'pattern_match',
+  candidateType: 'download_execute',
+  decisionPath: 'deterministic_rule',
+  ruleVersion: 'temporal-episode-v1',
+  evidenceConfidence: 'medium',
+  evidence: [
+    {
+      ...batch.evidence[0],
+      eventId: 'evt_download',
+      eventTime: 1_785_000_000_000,
+      operation: 'download',
+      fileIdentity: temporalFileIdentity,
+    },
+    {
+      ...batch.evidence[0],
+      eventId: 'evt_write',
+      eventTime: 1_785_000_001_000,
+      operation: 'file_write',
+      fileIdentity: temporalFileIdentity,
+    },
+    {
+      ...batch.evidence[0],
+      eventId: 'evt_chmod',
+      eventTime: 1_785_000_002_000,
+      operation: 'chmod',
+      fileIdentity: temporalFileIdentity,
+    },
+    {
+      ...batch.evidence[0],
+      eventId: 'evt_execute',
+      eventTime: 1_785_000_003_000,
+      operation: 'execute',
+      fileIdentity: temporalFileIdentity,
+    },
+  ],
+};
+const temporalDecision = deterministicTemporalDecision(temporalBatch);
+assert.equal(temporalDecision.classification, 'suspicious');
+assert.equal(temporalDecision.verdict, 'allow');
+assert.equal(temporalDecision.attackType, 'download-and-execute');
+assert.equal(temporalDecision.evidenceEventIds.length, 4);
+assert.equal(
+  deterministicTemporalDecision({ ...temporalBatch, synthetic: true }).attackType,
+  'download-and-execute',
+);
+assert.throws(
+  () => deterministicTemporalDecision({
+    ...temporalBatch,
+    evidence: temporalBatch.evidence.map((item, index) =>
+      index === 3
+        ? { ...item, fileIdentity: { ...temporalFileIdentity, fileInstanceId: 'other-file' } }
+        : item),
+  }),
+  /one file identity/,
+);
+
+const advancedEvidence = (id, eventTime, operation, {
+  resource,
+  destination,
+  behaviorStage,
+  sensitiveResource = false,
+  dangerous = false,
+  fileIdentity,
+  rootPid = 1200,
+} = {}) => ({
+  ...batch.evidence[0],
+  eventId: id,
+  eventTime,
+  operation,
+  resource,
+  destination,
+  behaviorStage,
+  sensitiveResource,
+  dangerous,
+  externalDestination: false,
+  fileIdentity,
+  processIdentity: strongProcess(rootPid + Math.floor(eventTime / 1_000), rootPid, rootPid),
+});
+
+const persistenceIdentity = {
+  ...temporalFileIdentity,
+  fileInstanceId: 'flp_persistence_target',
+  path: '/etc/systemd/system/anysentry-demo.service',
+  identityConfidence: 'strong',
+};
+const persistenceBatch = {
+  ...temporalBatch,
+  episodeId: 'tep_persistence',
+  ruleVersion: 'temporal-episode-v2',
+  candidateType: 'persistence_installation',
+  evidenceConfidence: 'strong',
+  evidence: [
+    advancedEvidence('evt_persistence_write', 1_000, 'file_write', {
+      resource: persistenceIdentity.path,
+      behaviorStage: 'persistence_write',
+      fileIdentity: persistenceIdentity,
+    }),
+    advancedEvidence('evt_persistence_activate', 2_000, 'persistence_activate', {
+      resource: persistenceIdentity.path,
+      behaviorStage: 'persistence_activation',
+      fileIdentity: persistenceIdentity,
+    }),
+  ],
+};
+assert.equal(deterministicTemporalDecision(persistenceBatch).attackType, 'persistence-installation');
+assert.throws(
+  () => deterministicTemporalDecision({
+    ...persistenceBatch,
+    evidence: persistenceBatch.evidence.map((item, index) =>
+      index === 1 ? { ...item, resource: '/etc/systemd/system/other.service' } : item),
+  }),
+  /activation target/,
+);
+
+const sandboxBatch = {
+  ...temporalBatch,
+  episodeId: 'tep_sandbox',
+  ruleVersion: 'temporal-episode-v2',
+  candidateType: 'sandbox_privilege_breakout',
+  evidenceConfidence: 'strong',
+  evidence: [
+    advancedEvidence('evt_sandbox_probe', 1_000, 'sandbox_probe', {
+      resource: 'unshare --user --mount',
+      behaviorStage: 'sandbox_probe',
+    }),
+    advancedEvidence('evt_privilege_change', 2_000, 'privilege_change', {
+      resource: 'sudo -n bash',
+      behaviorStage: 'privilege_change',
+    }),
+    advancedEvidence('evt_shadow_read', 3_000, 'file_read', {
+      resource: '/etc/shadow',
+      behaviorStage: 'credential_access',
+      sensitiveResource: true,
+    }),
+  ],
+};
+assert.equal(deterministicTemporalDecision(sandboxBatch).attackType, 'sandbox-privilege-breakout');
+assert.throws(
+  () => deterministicTemporalDecision({
+    ...sandboxBatch,
+    evidence: sandboxBatch.evidence.map((item, index) =>
+      index === 2
+        ? { ...item, processIdentity: { ...item.processIdentity, rootPid: 2200 } }
+        : item),
+  }),
+  /process scope/,
+);
+
+const destructiveBatch = {
+  ...temporalBatch,
+  episodeId: 'tep_destructive',
+  ruleVersion: 'temporal-episode-v2',
+  candidateType: 'destructive_behavior',
+  evidenceConfidence: 'strong',
+  evidence: [
+    advancedEvidence('evt_discover', 1_000, 'target_discovery', {
+      resource: '/srv/app',
+      behaviorStage: 'target_discovery',
+    }),
+    advancedEvidence('evt_destroy_1', 2_000, 'destroy', {
+      resource: '/srv/app/a',
+      behaviorStage: 'destructive_action',
+    }),
+    advancedEvidence('evt_destroy_2', 3_000, 'destroy', {
+      resource: '/srv/app/b',
+      behaviorStage: 'destructive_action',
+    }),
+  ],
+};
+assert.equal(deterministicTemporalDecision(destructiveBatch).attackType, 'destructive-behavior');
+assert.throws(
+  () => deterministicTemporalDecision({
+    ...destructiveBatch,
+    evidence: destructiveBatch.evidence.map((item, index) =>
+      index === 2 ? { ...item, resource: '/var/log/b' } : item),
+  }),
+  /path scope/,
+);
+
+const sshIdentity = {
+  ...temporalFileIdentity,
+  fileInstanceId: 'flp_ssh_key',
+  path: '/home/test/.ssh/id_demo',
+  identityConfidence: 'strong',
+};
+const lateralBatch = {
+  ...temporalBatch,
+  episodeId: 'tep_lateral',
+  ruleVersion: 'temporal-episode-v2',
+  candidateType: 'lateral_movement',
+  evidenceConfidence: 'strong',
+  evidence: [
+    advancedEvidence('evt_ssh_key', 1_000, 'file_read', {
+      resource: sshIdentity.path,
+      behaviorStage: 'credential_access',
+      sensitiveResource: true,
+      fileIdentity: sshIdentity,
+    }),
+    advancedEvidence('evt_remote_connect', 2_000, 'remote_connect', {
+      resource: sshIdentity.path,
+      destination: '10.0.0.8',
+      behaviorStage: 'lateral_connect',
+      fileIdentity: sshIdentity,
+    }),
+    advancedEvidence('evt_remote_execute', 3_000, 'remote_execute', {
+      resource: sshIdentity.path,
+      destination: '10.0.0.8',
+      behaviorStage: 'lateral_action',
+      fileIdentity: sshIdentity,
+    }),
+  ],
+};
+assert.equal(deterministicTemporalDecision(lateralBatch).attackType, 'lateral-movement');
+assert.throws(
+  () => deterministicTemporalDecision({
+    ...lateralBatch,
+    evidence: lateralBatch.evidence.map((item, index) =>
+      index === 2 ? { ...item, destination: '10.0.0.9' } : item),
+  }),
+  /credential and destination/,
+);
 
 console.log('Streaming phase 2 composite judgment contract verification passed');

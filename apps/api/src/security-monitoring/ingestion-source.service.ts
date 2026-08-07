@@ -79,6 +79,21 @@ function cleanTags(tags: unknown): string[] {
   return [...new Set(tags.map((tag) => cleanText(tag, 48)).filter((tag): tag is string => Boolean(tag)))].slice(0, 24);
 }
 
+function isVerificationSource(item: IngestionSourceItem): boolean {
+  const searchable = [
+    item.sourceId,
+    item.name,
+    item.owner,
+    item.team,
+    item.environment,
+    item.note,
+    ...(item.tags ?? []),
+  ].filter(Boolean).join(' ').toLowerCase();
+  return /\b(?:verify|verifier|verification|contract-test|streaming-phase|temporal-episode|supply-chain-(?:runtime|temporal|phase))\b/u.test(searchable)
+    || item.sourceId.startsWith('src_verify_')
+    || item.sourceId.startsWith('src_flink_');
+}
+
 function lastSignalAt(record: IngestionSourceRecord): number | undefined {
   const at = Math.max(Number(record.lastEventAt) || 0, Number(record.lastHeartbeatAt) || 0);
   return at > 0 ? at : undefined;
@@ -170,6 +185,7 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       .map((record) => this.item(record))
       .filter((item) => {
         const matchesSourceId = Boolean(sourceId && item.sourceId === sourceId);
+        if (!query.includeVerification && !matchesSourceId && isVerificationSource(item)) return false;
         const matchesFilter =
           (!query.status || query.status === 'all' || item.status === query.status) &&
           (!query.type || query.type === 'all' || item.type === query.type) &&

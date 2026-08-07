@@ -6,9 +6,11 @@ import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.common.state.StateTtlConfig;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
 import org.apache.flink.streaming.api.TimerService;
 import org.apache.flink.util.Collector;
+import org.apache.flink.util.OutputTag;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -27,9 +29,12 @@ public class EpisodeBuilderFunction extends KeyedProcessFunction<String, Behavio
     private static final long MAX_DURATION_MS = 5 * 60_000L;
     private static final long CRITICAL_GRACE_MS = 10_000L;
     private static final long EPISODE_GAP_MS = 5 * 60_000L;
+    private static final long ALLOWED_LATENESS_MS = 30_000L;
     private static final int MAX_EVENTS = 20;
     private static final int CARRYOVER_EVENTS = 10;
     private static final long DUPLICATE_WINDOW_MS = 30_000L;
+    public static final OutputTag<String> LATE_EVENTS =
+            new OutputTag<>("late-episode-events", TypeInformation.of(String.class));
 
     private transient MapState<String, RiskAnalysisBatch.Evidence> evidence;
     private transient MapState<String, RiskAnalysisBatch.Judgment> pendingJudgments;
@@ -85,16 +90,30 @@ public class EpisodeBuilderFunction extends KeyedProcessFunction<String, Behavio
 
     @Override
     public void processElement(BehaviorSignal signal, Context context, Collector<RiskAnalysisBatch> output) throws Exception {
-        long previousEventAt = number(lastEventAt.value());
-        if ("event".equals(signal.signalType)
-                && previousEventAt > 0
-                && signal.eventTime - previousEventAt > EPISODE_GAP_MS) {
-            resetEpisode(context);
-        }
-
         boolean changed = false;
         if ("event".equals(signal.signalType)) {
             if (signal.platformRuntime || blank(signal.behaviorStage) || "none".equals(signal.behaviorStage)) return;
+            long previousEventAt = number(lastEventAt.value());
+            if (tooLate(signal.eventTime, previousEventAt)) {
+                context.output(
+                        LATE_EVENTS,
+                        CanonicalEventParser.dlq(
+                                value(signal.eventId),
+                                new IllegalArgumentException(
+                                        "late episode event: eventTime=" + signal.eventTime
+                                                + " maximumEventTime=" + previousEventAt
+                                                + " allowedLatenessMs=" + ALLOWED_LATENESS_MS
+                                )
+                        )
+                );
+                return;
+            }
+            if (previousEventAt > 0 && signal.eventTime - previousEventAt > EPISODE_GAP_MS) {
+                resetEpisode(context);
+                previousEventAt = 0;
+            }
+            long maximumEventAt = Math.max(previousEventAt, signal.eventTime);
+            pruneEvidenceBefore(maximumEventAt - EPISODE_GAP_MS);
             String semanticKey = semanticKey(signal);
             Long seenAt = semanticSeenAt.get(semanticKey);
             if (seenAt != null && Math.abs(signal.eventTime - seenAt) <= DUPLICATE_WINDOW_MS) return;
@@ -109,8 +128,9 @@ public class EpisodeBuilderFunction extends KeyedProcessFunction<String, Behavio
                 pendingJudgments.remove(signal.eventId);
             }
             evidence.put(signal.eventId, item);
-            if (number(firstEventAt.value()) == 0) firstEventAt.update(signal.eventTime);
-            lastEventAt.update(Math.max(previousEventAt, signal.eventTime));
+            long first = number(firstEventAt.value());
+            if (first == 0 || signal.eventTime < first) firstEventAt.update(signal.eventTime);
+            lastEventAt.update(maximumEventAt);
             pendingTrigger.update("idle");
             changed = true;
         } else if (signal.judgment != null) {
@@ -166,9 +186,12 @@ public class EpisodeBuilderFunction extends KeyedProcessFunction<String, Behavio
 
     private void emit(String currentKey, TimerService timerService, Collector<RiskAnalysisBatch> output, String trigger) throws Exception {
         if (!Boolean.TRUE.equals(dirty.value())) return;
-        List<RiskAnalysisBatch.Evidence> items = evidenceItems();
-        if (items.size() < 2) return;
-        items.sort(Comparator.comparingLong(item -> item.eventTime));
+        pruneEvidenceBefore(number(lastEventAt.value()) - EPISODE_GAP_MS);
+        List<RiskAnalysisBatch.Evidence> items = boundedEvidence(evidenceItems());
+        if (items.size() < 2) {
+            dirty.update(false);
+            return;
+        }
         if (items.size() > MAX_EVENTS) items = new ArrayList<>(items.subList(items.size() - MAX_EVENTS, items.size()));
         String candidateType = candidateType(items);
         if (candidateType == null) {
@@ -253,6 +276,15 @@ public class EpisodeBuilderFunction extends KeyedProcessFunction<String, Behavio
         return items;
     }
 
+    private void pruneEvidenceBefore(long threshold) throws Exception {
+        if (threshold <= 0) return;
+        List<String> expired = new ArrayList<>();
+        for (RiskAnalysisBatch.Evidence item : evidence.values()) {
+            if (item.eventId != null && item.eventTime < threshold) expired.add(item.eventId);
+        }
+        for (String eventId : expired) evidence.remove(eventId);
+    }
+
     private void resetEpisode(Context context) throws Exception {
         clearTimer(context.timerService(), idleTimer);
         clearTimer(context.timerService(), maximumTimer);
@@ -264,6 +296,7 @@ public class EpisodeBuilderFunction extends KeyedProcessFunction<String, Behavio
         revision.clear();
         lastFingerprint.clear();
         firstEventAt.clear();
+        lastEventAt.clear();
         dirty.clear();
         pendingTrigger.clear();
         identity.clear();
@@ -300,24 +333,33 @@ public class EpisodeBuilderFunction extends KeyedProcessFunction<String, Behavio
                 || reason.contains("technical failure");
     }
 
+    static boolean tooLate(long eventTime, long maximumEventTime) {
+        return maximumEventTime > 0 && eventTime < maximumEventTime - ALLOWED_LATENESS_MS;
+    }
+
+    static List<RiskAnalysisBatch.Evidence> boundedEvidence(List<RiskAnalysisBatch.Evidence> items) {
+        if (items.isEmpty()) return List.of();
+        long maximumEventTime = items.stream()
+                .mapToLong(item -> item.eventTime)
+                .max()
+                .orElse(0);
+        long minimumEventTime = maximumEventTime - EPISODE_GAP_MS;
+        return items.stream()
+                .filter(item -> item.eventTime >= minimumEventTime)
+                .sorted(Comparator.comparingLong(item -> item.eventTime))
+                .toList();
+    }
+
     static String candidateType(List<RiskAnalysisBatch.Evidence> items) {
         Set<String> stages = new HashSet<>();
-        boolean vulnerableComponent = false;
         for (RiskAnalysisBatch.Evidence item : items) {
             if (!blank(item.behaviorStage) && !"none".equals(item.behaviorStage)) stages.add(item.behaviorStage);
-            if (item.runtimeVulnerabilities != null && !item.runtimeVulnerabilities.isEmpty()) {
-                vulnerableComponent = true;
-            }
         }
         boolean sensitive = stages.contains("credential_access") || stages.contains("staging");
         boolean transform = stages.contains("transform");
         boolean egress = stages.contains("external_egress");
         boolean dangerous = stages.contains("dangerous_exec");
         boolean destructive = stages.contains("destructive_action");
-        boolean shell = stages.contains("shell_execution");
-        if (vulnerableComponent && (sensitive || transform || egress || dangerous || destructive || shell)) {
-            return "known_vulnerability_exploitation";
-        }
         if (sensitive && egress) return "sensitive_data_egress";
         if (sensitive && transform) return "sensitive_data_staging";
         if (transform && egress) return "transformed_external_egress";

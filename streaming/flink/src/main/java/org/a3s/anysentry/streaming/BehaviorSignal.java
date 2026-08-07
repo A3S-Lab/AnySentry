@@ -37,6 +37,7 @@ public class BehaviorSignal implements Serializable {
     public boolean platformRuntime;
     public boolean synthetic;
     public CanonicalEvent.ProcessIdentity processIdentity;
+    public CanonicalEvent.FileIdentity fileIdentity;
     public JudgmentUpdate judgment;
 
     public static BehaviorSignal from(CanonicalEvent event) {
@@ -75,6 +76,7 @@ public class BehaviorSignal implements Serializable {
         signal.platformRuntime = event.platformRuntime;
         signal.synthetic = event.synthetic;
         signal.processIdentity = event.processIdentity;
+        signal.fileIdentity = event.fileIdentity;
         return signal;
     }
 

@@ -108,9 +108,9 @@ export async function apiRawFetch(endpoint: string, init?: RequestInit): Promise
   return fetch(withBase(endpoint), init);
 }
 
-async function request<T>(endpoint: string, init: RequestInit): Promise<T> {
+async function request<T>(endpoint: string, init: RequestInit, timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   let response: Response;
   try {
@@ -165,6 +165,12 @@ export const apiClient = {
       method: "POST",
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
+  },
+  postLong<T>(endpoint: string, body?: unknown, timeoutMs = 95000): Promise<T> {
+    return request<T>(endpoint, {
+      method: "POST",
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    }, timeoutMs);
   },
   postWithHeaders<T>(endpoint: string, body: unknown, headers: HeadersInit): Promise<T> {
     return request<T>(endpoint, {

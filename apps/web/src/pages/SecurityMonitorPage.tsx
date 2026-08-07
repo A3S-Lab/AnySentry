@@ -7,12 +7,12 @@ import {
   BellRing,
   Bot,
   CalendarClock,
-  Clock3,
   EyeOff,
   FileCheck2,
   Gauge,
   GitBranch,
   Layers3,
+  LayoutDashboard,
   LoaderCircle,
   Megaphone,
   type LucideIcon,
@@ -28,16 +28,18 @@ import {
   ShieldQuestion,
   Siren,
   Sparkles,
+  ServerCog,
   TerminalSquare,
+  Wrench,
   Zap,
 } from "lucide-react";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
 import { useVChartTheme } from "@/components/custom/charts/vchart-theme";
 import { type VChartSpec, VChartView } from "@/components/custom/vchart";
+import { useSecurityConsole } from "@/components/custom/security-console-header";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   type AgentEventCategory,
@@ -57,7 +59,6 @@ import {
   type SecurityRiskSummary,
   type SecuritySeverity,
   type SecurityTimeFilter,
-  type SecurityTimeType,
   type SecurityVerdict,
   type SecurityWorkspaceRiskDistribution,
   type StreamFindingList,
@@ -67,6 +68,7 @@ import {
 } from "@/lib/api/security-center";
 import type { PolicyStatus } from "@/lib/api/security-center";
 import { settleAll } from "@/lib/settle-all";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 type TimelineTierFilter = "all" | AgentEventListItem["tier"];
@@ -100,16 +102,28 @@ interface SecurityDashboardData {
 }
 
 type TimelineScope = "agent" | "raw";
+type DashboardView =
+  | "overview"
+  | "risk"
+  | "stream"
+  | "supplyChain"
+  | "events"
+  | "workspace";
 
-const TIME_OPTIONS: Array<{ value: SecurityTimeType; label: string }> = [
-  { value: "last_3h", label: "近3小时" },
-  { value: "last_1d", label: "近一天" },
-  { value: "last_7d", label: "近一周" },
-  { value: "last_30d", label: "近一月" },
-  { value: "custom", label: "自定义" },
+const DASHBOARD_VIEWS: Array<{
+  value: DashboardView;
+  label: string;
+  description: string;
+  icon: LucideIcon;
+}> = [
+  { value: "overview", label: "运行总览", description: "平台健康与实时状态", icon: Activity },
+  { value: "risk", label: "风险态势", description: "风险分类与趋势分布", icon: Siren },
+  { value: "stream", label: "复合研判", description: "Flink 连续行为关联", icon: Sparkles },
+  { value: "supplyChain", label: "供应链漏洞", description: "OSV 依赖漏洞资产", icon: ShieldAlert },
+  { value: "events", label: "运行链路", description: "无侵入事件时间线", icon: GitBranch },
+  { value: "workspace", label: "会话与工作区", description: "Agent 与 Workspace 风险", icon: TerminalSquare },
 ];
 
-const DEFAULT_FILTER: SecurityTimeFilter = { timeType: "last_3h" };
 const EXPLAINABILITY_CHART_ANIMATION_MS = 2000;
 
 const FALLBACK_BREAKDOWN_CATEGORY: SecurityRiskCategory = {
@@ -225,13 +239,23 @@ function formatRequestError(error: unknown) {
   return "请求失败";
 }
 
-async function loadSecurityDashboardData(filter: SecurityTimeFilter, timelineScope: TimelineScope, timelineTier: TimelineTierFilter, riskBreakdownScope: TimelineScope, decisionFunnelScope: TimelineScope, workspaceRiskScope: TimelineScope): Promise<SecurityDashboardData> {
-  const scanFilter = { ...filter, seriesPoints: 36 };
+async function loadSecurityDashboardData(
+  filter: SecurityTimeFilter,
+  overviewScope: TimelineScope,
+  scanScope: TimelineScope,
+  timelineScope: TimelineScope,
+  timelineTier: TimelineTierFilter,
+  riskBreakdownScope: TimelineScope,
+  decisionFunnelScope: TimelineScope,
+  workspaceRiskScope: TimelineScope,
+): Promise<SecurityDashboardData> {
+  const overviewFilter = { ...filter, scope: overviewScope };
+  const scanFilter = { ...filter, scope: scanScope, seriesPoints: 36 };
   const { data, errors } = await settleAll(
     {
-      health: securityCenterApi.healthCard(filter),
+      health: securityCenterApi.healthCard(overviewFilter),
       scan: securityCenterApi.explainabilityScan(scanFilter),
-      performance: securityCenterApi.performanceCard(filter),
+      performance: securityCenterApi.performanceCard(overviewFilter),
       riskSummary: securityCenterApi.riskSummary(filter),
       riskBreakdown: securityCenterApi.riskBreakdown({ ...filter, scope: riskBreakdownScope }),
       highestRisk: securityCenterApi.highestRiskSession(filter),
@@ -398,14 +422,6 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
 }
 
-function buildCustomFilter(start: string, end: string): SecurityTimeFilter {
-  return {
-    timeType: "custom",
-    startTime: dayjs(start).startOf("day").toISOString(),
-    endTime: dayjs(end).endOf("day").toISOString(),
-  };
-}
-
 function formatNumber(value?: number, options?: Intl.NumberFormatOptions) {
   if (typeof value !== "number" || !Number.isFinite(value)) return "--";
   return new Intl.NumberFormat("zh-CN", options).format(value);
@@ -475,13 +491,6 @@ function verdictLevel(verdict?: SecurityVerdict): SecurityRiskLevel {
   return "unknown";
 }
 
-function activeFilterLabel(filter: SecurityTimeFilter) {
-  if (filter.timeType === "custom" && filter.startTime && filter.endTime) {
-    return `${dayjs(filter.startTime).format("YYYY-MM-DD")} ~ ${dayjs(filter.endTime).format("YYYY-MM-DD")}`;
-  }
-  return TIME_OPTIONS.find((option) => option.value === (filter.timeType ?? "last_3h"))?.label ?? "近3小时";
-}
-
 function Panel({
   title,
   icon: Icon,
@@ -495,14 +504,15 @@ function Panel({
   children: ReactNode;
   className?: string;
 }) {
+  const { t } = useI18n();
   return (
-    <section className={cn("rounded-[8px] border border-white/10 bg-[#111612]/92", className)}>
-      <div className="flex min-h-12 items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
+    <section className={cn("rounded-[8px] border border-[#232a37] bg-[#0f131a]", className)}>
+      <div className="flex min-h-12 items-center justify-between gap-3 border-b border-[#232a37] px-4 py-3">
         <div className="flex min-w-0 items-center gap-2.5">
           <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-md border border-white/10 bg-white/5 text-teal-200">
             <Icon className="size-4" />
           </span>
-          <h2 className="truncate text-sm font-semibold text-zinc-100">{title}</h2>
+          <h2 className="truncate text-sm font-semibold text-zinc-100">{t(title)}</h2>
         </div>
         {action ? <div className="shrink-0">{action}</div> : null}
       </div>
@@ -512,7 +522,8 @@ function Panel({
 }
 
 function EmptyState({ label }: { label: string }) {
-  return <div className="flex min-h-28 items-center justify-center px-4 py-5 text-sm text-zinc-500">{label}</div>;
+  const { t } = useI18n();
+  return <div className="flex min-h-28 items-center justify-center px-4 py-5 text-sm text-zinc-500">{t(label)}</div>;
 }
 
 function InlineError({ message }: { message?: string }) {
@@ -526,6 +537,7 @@ function InlineError({ message }: { message?: string }) {
 }
 
 function StatusPill({ level, label }: { level?: SecurityRiskLevel; label?: string }) {
+  const { t } = useI18n();
   const tone = riskTone(level);
   return (
     <span
@@ -537,7 +549,7 @@ function StatusPill({ level, label }: { level?: SecurityRiskLevel; label?: strin
       )}
     >
       <span className={cn("size-1.5 rounded-full", tone.dot)} />
-      {label || tone.label}
+      {t(label || tone.label)}
     </span>
   );
 }
@@ -559,11 +571,12 @@ function MetricPanel({
   footer?: ReactNode;
   loading?: boolean;
 }) {
+  const { t } = useI18n();
   return (
-    <section className="min-h-[132px] rounded-[8px] border border-white/10 bg-[#111612]/92 p-4">
+    <section className="min-h-[132px] rounded-[8px] border border-[#232a37] bg-[#0f131a] p-4">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="truncate text-xs font-medium text-zinc-400">{label}</p>
+          <p className="truncate text-xs font-medium text-zinc-400">{t(label)}</p>
           <div className="mt-2 min-h-9">
             {loading ? (
               <LoaderCircle className="size-5 animate-spin text-zinc-500" />
@@ -576,23 +589,243 @@ function MetricPanel({
           <Icon className="size-5" />
         </span>
       </div>
-      <p className="mt-3 truncate text-xs text-zinc-500">{sub}</p>
+      <p className="mt-3 truncate text-xs text-zinc-500">{t(sub)}</p>
       {footer ? <div className="mt-3">{footer}</div> : null}
     </section>
   );
 }
 
-function DashboardSection({ title, icon: Icon, children }: { title: string; icon: LucideIcon; children: ReactNode }) {
+function DashboardSection({
+  title,
+  icon: Icon,
+  action,
+  children,
+}: {
+  title: string;
+  icon: LucideIcon;
+  action?: ReactNode;
+  children: ReactNode;
+}) {
+  const { t } = useI18n();
   return (
     <section className="space-y-3">
-      <div className="flex items-center gap-2 px-1">
-        <span className="inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-white/10 bg-white/5 text-teal-200">
-          <Icon className="size-3.5" />
-        </span>
-        <h2 className="text-sm font-semibold text-zinc-100">{title}</h2>
+      <div className="flex items-center justify-between gap-3 px-1">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-white/10 bg-white/5 text-teal-200">
+            <Icon className="size-3.5" />
+          </span>
+          <h2 className="truncate text-sm font-semibold text-zinc-100">{t(title)}</h2>
+        </div>
+        {action ? <div className="shrink-0">{action}</div> : null}
       </div>
       {children}
     </section>
+  );
+}
+
+function DashboardViewNavigation({
+  value,
+  supplyChainEnabled,
+  onChange,
+}: {
+  value: DashboardView;
+  supplyChainEnabled: boolean;
+  onChange: (value: DashboardView) => void;
+}) {
+  const { t } = useI18n();
+  const items = DASHBOARD_VIEWS.filter((item) => item.value !== "supplyChain" || supplyChainEnabled);
+  const overviewItems = items.filter((item) =>
+    ["overview", "scan", "risk", "stream"].includes(item.value),
+  );
+  const platformItems = items.filter((item) =>
+    ["events", "workspace"].includes(item.value),
+  );
+  const governanceItems = items.filter((item) => item.value === "supplyChain");
+  const renderDesktopItem = (item: (typeof items)[number]) => {
+    const Icon = item.icon;
+    const active = item.value === value;
+    return (
+      <button
+        key={item.value}
+        type="button"
+        aria-current={active ? "page" : undefined}
+        className={cn(
+          "flex w-full items-start gap-2.5 rounded-md border px-2.5 py-2 text-left transition-colors",
+          active
+            ? "border-transparent bg-[#1c222d] text-[#e8ecf3] shadow-[inset_2px_0_0_#f97316]"
+            : "border-transparent text-[#b6bdcc] hover:bg-[#151a23] hover:text-[#e8ecf3]",
+        )}
+        onClick={() => onChange(item.value)}
+      >
+        <span
+          className={cn(
+            "mt-0.5 inline-flex size-5 shrink-0 items-center justify-center",
+            active ? "text-[#f97316]" : "text-[#818a9c]",
+          )}
+        >
+          <Icon className="size-3.5" />
+        </span>
+        <span className="min-w-0">
+          <span className="block text-xs font-semibold leading-[1.45]">{t(item.label)}</span>
+          <span className={cn("mt-0.5 block text-[10.5px] leading-4", active ? "text-[#818a9c]" : "text-[#5b6373]")}>
+            {t(item.description)}
+          </span>
+        </span>
+      </button>
+    );
+  };
+  return (
+    <>
+      <aside className="hidden h-full w-[220px] shrink-0 overflow-y-auto rounded-lg border border-[#232a37] bg-[#0f131a] p-1.5 lg:block">
+        <nav className="space-y-1" aria-label={t("安全监控模块")}>
+          <p className="flex items-center gap-2 px-3 pb-1 pt-3 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <LayoutDashboard className="size-3.5" />
+            {t("概览")}
+          </p>
+          {overviewItems.map(renderDesktopItem)}
+          <Link
+            to="/alerts"
+            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+          >
+            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+              <BellRing className="size-3.5" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-xs font-semibold leading-[1.45]">{t("告警")}</span>
+              <span className="mt-0.5 block text-[10.5px] leading-4 text-[#5b6373]">{t("活跃告警与处置")}</span>
+            </span>
+          </Link>
+
+          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <ServerCog className="size-3.5" />
+            {t("平台监控")}
+          </p>
+          {platformItems.map(renderDesktopItem)}
+          <Link
+            to="/agents"
+            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+          >
+            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+              <Bot className="size-3.5" />
+            </span>
+            <span className="block text-xs font-semibold leading-[1.45]">{t("智能体资产")}</span>
+          </Link>
+          <Link
+            to="/workspaces"
+            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+          >
+            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+              <Layers3 className="size-3.5" />
+            </span>
+            <span className="block text-xs font-semibold leading-[1.45]">Workspace</span>
+          </Link>
+
+          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <Wrench className="size-3.5" />
+            {t("运维")}
+          </p>
+          <Link
+            to="/maintenance"
+            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+          >
+            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+              <CalendarClock className="size-3.5" />
+            </span>
+            <span className="block text-xs font-semibold leading-[1.45]">{t("维护")}</span>
+          </Link>
+          <Link
+            to="/admin/policy"
+            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+          >
+            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+              <SlidersHorizontal className="size-3.5" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-xs font-semibold leading-[1.45]">{t("策略配置")}</span>
+              <span className="mt-0.5 block text-[10.5px] leading-4 text-[#5b6373]">{t("L1 / L2 / L3 研判策略")}</span>
+            </span>
+          </Link>
+
+          {governanceItems.length > 0 ? (
+            <>
+              <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+                <ShieldAlert className="size-3.5" />
+                {t("安全治理")}
+              </p>
+              {governanceItems.map(renderDesktopItem)}
+            </>
+          ) : null}
+
+          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <SlidersHorizontal className="size-3.5" />
+            {t("管理")}
+          </p>
+          <AdminTokenControl navigation />
+        </nav>
+      </aside>
+
+      <nav
+        className="flex shrink-0 gap-2 overflow-x-auto rounded-lg border border-[#232a37] bg-[#0f131a] p-2 lg:hidden"
+        aria-label={t("安全监控模块")}
+      >
+        {items.map((item) => {
+          const Icon = item.icon;
+          const active = item.value === value;
+          return (
+            <button
+              key={item.value}
+              type="button"
+              aria-current={active ? "page" : undefined}
+              className={cn(
+                "inline-flex shrink-0 items-center gap-1.5 rounded-md border px-3 py-2 text-xs transition-colors",
+                active
+                  ? "border-[#f97316]/40 bg-[#f97316]/15 text-[#e8ecf3]"
+                  : "border-[#232a37] bg-[#151a23] text-[#818a9c]",
+              )}
+              onClick={() => onChange(item.value)}
+            >
+              <Icon className="size-3.5" />
+              {t(item.label)}
+            </button>
+          );
+        })}
+        <Link
+          to="/agents"
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-[#232a37] bg-[#151a23] px-3 py-2 text-xs text-[#818a9c]"
+        >
+          <Bot className="size-3.5" />
+          {t("智能体资产")}
+        </Link>
+        <Link
+          to="/workspaces"
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-[#232a37] bg-[#151a23] px-3 py-2 text-xs text-[#818a9c]"
+        >
+          <Layers3 className="size-3.5" />
+          Workspace
+        </Link>
+        <Link
+          to="/alerts"
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-[#232a37] bg-[#151a23] px-3 py-2 text-xs text-[#818a9c]"
+        >
+          <BellRing className="size-3.5" />
+          {t("告警")}
+        </Link>
+        <Link
+          to="/maintenance"
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-[#232a37] bg-[#151a23] px-3 py-2 text-xs text-[#818a9c]"
+        >
+          <CalendarClock className="size-3.5" />
+          {t("维护")}
+        </Link>
+        <Link
+          to="/admin/policy"
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-[#232a37] bg-[#151a23] px-3 py-2 text-xs text-[#818a9c]"
+        >
+          <SlidersHorizontal className="size-3.5" />
+          {t("策略配置")}
+        </Link>
+      </nav>
+    </>
   );
 }
 
@@ -607,301 +840,8 @@ function MiniGauge({ value, color }: { value: number; color: string }) {
   );
 }
 
-function SecurityHeader({
-  filter,
-  loading,
-  lastUpdatedAt,
-  customStart,
-  customEnd,
-  customError,
-  onTimeTypeChange,
-  onCustomStartChange,
-  onCustomEndChange,
-  onApplyCustomTime,
-  onRefresh,
-}: {
-  filter: SecurityTimeFilter;
-  loading: boolean;
-  lastUpdatedAt?: string;
-  customStart: string;
-  customEnd: string;
-  customError?: string;
-  onTimeTypeChange: (value: SecurityTimeType) => void;
-  onCustomStartChange: (value: string) => void;
-  onCustomEndChange: (value: string) => void;
-  onApplyCustomTime: () => void;
-  onRefresh: () => void;
-}) {
-  const maxDate = dayjs().format("YYYY-MM-DD");
-
-  return (
-    <header className="shrink-0 border-b border-white/10 bg-[#0b0f0c] px-4 py-3 text-zinc-100">
-      <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-        <div className="flex min-w-0 items-center gap-3">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <ShieldCheck className="size-5 shrink-0 text-teal-300" />
-              <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">安全监控中台</h1>
-              <span className="hidden rounded-full border border-teal-300/25 bg-teal-400/10 px-2 py-0.5 text-[11px] font-semibold text-teal-100 sm:inline-flex">
-                {activeFilterLabel(filter)}
-              </span>
-            </div>
-            <p className="mt-0.5 truncate text-xs text-zinc-500">风险监控面板 · 会话决策漏斗 · 工作区风险分布</p>
-          </div>
-        </div>
-
-        <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-end">
-          <div className="flex items-center gap-2">
-            <Select
-              value={filter.timeType ?? "last_3h"}
-              onValueChange={(value) => onTimeTypeChange(value as SecurityTimeType)}
-            >
-              <SelectTrigger className="h-9 w-[128px] border-white/10 bg-white/5 text-xs text-zinc-100">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {TIME_OPTIONS.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Button
-              type="button"
-              variant="secondary"
-              size="sm"
-              onClick={onRefresh}
-              disabled={loading}
-              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              {loading ? (
-                <LoaderCircle className="mr-1.5 size-3.5 animate-spin" />
-              ) : (
-                <RefreshCw className="mr-1.5 size-3.5" />
-              )}
-              刷新
-            </Button>
-            <AdminTokenControl />
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/sources">
-                <PlugZap className="mr-1.5 size-3.5" />
-                接入源
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/collectors">
-                <RadioTower className="mr-1.5 size-3.5" />
-                采集链路
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/agents">
-                <Bot className="mr-1.5 size-3.5" />
-                智能体资产
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/workspaces">
-                <Layers3 className="mr-1.5 size-3.5" />
-                Workspace
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/remediation">
-                <FileCheck2 className="mr-1.5 size-3.5" />
-                处置
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/operator">
-                <Zap className="mr-1.5 size-3.5" />
-                AI Operator
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/capabilities">
-                <Sparkles className="mr-1.5 size-3.5" />
-                API
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/coverage">
-                <EyeOff className="mr-1.5 size-3.5" />
-                覆盖
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/maintenance">
-                <CalendarClock className="mr-1.5 size-3.5" />
-                维护
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/topology">
-                <GitBranch className="mr-1.5 size-3.5" />
-                拓扑
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/objectives">
-                <Target className="mr-1.5 size-3.5" />
-                目标
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/alerts">
-                <BellRing className="mr-1.5 size-3.5" />
-                告警
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/notifications">
-                <Megaphone className="mr-1.5 size-3.5" />
-                通知
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/incidents">
-                <Siren className="mr-1.5 size-3.5" />
-                Incident
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/audit">
-                <Clock3 className="mr-1.5 size-3.5" />
-                审计
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/admin/policy">
-                <SlidersHorizontal className="mr-1.5 size-3.5" />
-                策略配置
-              </Link>
-            </Button>
-          </div>
-
-          {filter.timeType === "custom" ? (
-            <div className="flex flex-wrap items-center gap-2">
-              <Input
-                type="date"
-                value={customStart}
-                max={maxDate}
-                onChange={(event) => onCustomStartChange(event.target.value)}
-                className="h-9 w-[150px] border-white/10 bg-white/5 text-xs text-zinc-100"
-              />
-              <span className="text-xs text-zinc-500">至</span>
-              <Input
-                type="date"
-                value={customEnd}
-                max={maxDate}
-                onChange={(event) => onCustomEndChange(event.target.value)}
-                className="h-9 w-[150px] border-white/10 bg-white/5 text-xs text-zinc-100"
-              />
-              <Button
-                type="button"
-                size="sm"
-                onClick={onApplyCustomTime}
-                disabled={Boolean(customError)}
-                className="h-9 bg-teal-500 text-[#07100c] hover:bg-teal-400"
-              >
-                应用
-              </Button>
-            </div>
-          ) : null}
-
-          <div className="flex items-center gap-2 text-xs text-zinc-500">
-            <Clock3 className="size-3.5" />
-            <span>{lastUpdatedAt ? formatDate(lastUpdatedAt) : "等待刷新"}</span>
-          </div>
-        </div>
-      </div>
-      {customError ? <p className="mt-2 text-xs text-rose-200">{customError}</p> : null}
-    </header>
-  );
-}
-
 function ExplainabilityWaveChart({ scan }: { scan?: SecurityExplainabilityScan | null }) {
+  const { t } = useI18n();
   const chartTheme = useVChartTheme();
   const chartData = useMemo(() => {
     const series = scan?.waveSeries?.[0];
@@ -911,19 +851,19 @@ function ExplainabilityWaveChart({ scan }: { scan?: SecurityExplainabilityScan |
       ...safe.map((point) => ({
         id: `safe-${point.statTime}`,
         time: formatTimeLabel(point.statTime),
-        type: "安全感知",
+        type: t("安全感知"),
         value: point.value,
         activationCount: point.activationCount,
       })),
       ...risk.map((point) => ({
         id: `risk-${point.statTime}`,
         time: formatTimeLabel(point.statTime),
-        type: "风险感知",
+        type: t("风险感知"),
         value: point.value,
         activationCount: point.activationCount,
       })),
     ];
-  }, [scan]);
+  }, [scan, t]);
 
   const spec = useMemo<VChartSpec>(
     () => ({
@@ -984,17 +924,32 @@ function ExplainabilityWaveChart({ scan }: { scan?: SecurityExplainabilityScan |
   );
 }
 
-function ExplainabilityPanel({ scan, error }: { scan?: SecurityExplainabilityScan | null; error?: string }) {
+function ExplainabilityPanel({
+  scan,
+  error,
+  scope,
+  onScopeChange,
+}: {
+  scan?: SecurityExplainabilityScan | null;
+  error?: string;
+  scope: TimelineScope;
+  onScopeChange: (scope: TimelineScope) => void;
+}) {
+  const { t } = useI18n();
   const safeLatest = scan?.waveSeries?.[0]?.safeSeries?.at(-1)?.value ?? 0;
   const riskLatest = scan?.waveSeries?.[0]?.riskSeries?.at(-1)?.value ?? 0;
 
   return (
-    <Panel title="脑际可解释扫描" icon={Radar}>
+    <Panel
+      title="安全风险趋势"
+      icon={Radar}
+      action={<TimelineScopeTabs value={scope} onChange={onScopeChange} />}
+    >
       <div className="grid gap-4 p-4 lg:grid-cols-[280px_minmax(0,1fr)]">
         <div className="flex flex-col items-center justify-center gap-4">
           <div className="w-full rounded-md border border-white/10 bg-white/[0.04] p-4">
             <div className="flex items-baseline justify-between gap-3">
-              <span className="text-xs font-medium text-zinc-400">安全感知</span>
+              <span className="text-xs font-medium text-zinc-400">{t("安全感知")}</span>
               <span className="font-mono text-4xl font-semibold text-zinc-50">
                 {formatNumber(safeLatest, { maximumFractionDigits: 0 })}
               </span>
@@ -1006,7 +961,7 @@ function ExplainabilityPanel({ scan, error }: { scan?: SecurityExplainabilitySca
               />
             </div>
             <div className="mt-3 flex items-center justify-between gap-3 text-[11px] text-zinc-500">
-              <span>风险感知</span>
+              <span>{t("风险感知")}</span>
               <span className="font-mono text-zinc-300">{formatNumber(riskLatest, { maximumFractionDigits: 0 })}</span>
             </div>
             <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-white/8">
@@ -1018,11 +973,11 @@ function ExplainabilityPanel({ scan, error }: { scan?: SecurityExplainabilitySca
           </div>
           <div className="grid w-full grid-cols-2 gap-3 text-center">
             <div>
-              <p className="text-xs text-zinc-500">危险拦截</p>
+              <p className="text-xs text-zinc-500">{t("危险拦截")}</p>
               <p className="mt-1 text-xl font-semibold text-rose-100">{scan?.threatInterception ?? "--"}</p>
             </div>
             <div>
-              <p className="text-xs text-zinc-500">活跃会话</p>
+              <p className="text-xs text-zinc-500">{t("活跃会话")}</p>
               <p className="mt-1 text-xl font-semibold text-teal-100">{scan?.sessionActiveCount ?? "--"}</p>
             </div>
           </div>
@@ -1031,7 +986,7 @@ function ExplainabilityPanel({ scan, error }: { scan?: SecurityExplainabilitySca
           <div className="mb-3 grid gap-3 sm:grid-cols-2">
             <div>
               <div className="mb-1 flex items-center justify-between text-xs">
-                <span className="text-zinc-500">安全感知</span>
+                <span className="text-zinc-500">{t("安全感知")}</span>
                 <span className="font-semibold text-teal-100">
                   {formatNumber(safeLatest, { maximumFractionDigits: 1 })}
                 </span>
@@ -1040,7 +995,7 @@ function ExplainabilityPanel({ scan, error }: { scan?: SecurityExplainabilitySca
             </div>
             <div>
               <div className="mb-1 flex items-center justify-between text-xs">
-                <span className="text-zinc-500">风险感知</span>
+                <span className="text-zinc-500">{t("风险感知")}</span>
                 <span className="font-semibold text-orange-100">
                   {formatNumber(riskLatest, { maximumFractionDigits: 1 })}
                 </span>
@@ -1063,6 +1018,7 @@ function PerformanceMetricPanel({
   performance?: SecurityPerformanceCard | null;
   loading?: boolean;
 }) {
+  const { locale } = useI18n();
   const requestCount = performance?.componentRequestCount;
   const tps = performance?.tps;
   const latency = performance?.avgLatency;
@@ -1072,7 +1028,9 @@ function PerformanceMetricPanel({
       <MetricPanel
         label="组件请求数"
         value={formatCompactNumber(requestCount?.current)}
-        sub={`峰值 ${formatCompactNumber(requestCount?.peak)} / 平均 ${formatCompactNumber(requestCount?.avg)}`}
+        sub={locale === "en"
+          ? `Peak ${formatCompactNumber(requestCount?.peak)} / Avg ${formatCompactNumber(requestCount?.avg)}`
+          : `峰值 ${formatCompactNumber(requestCount?.peak)} / 平均 ${formatCompactNumber(requestCount?.avg)}`}
         icon={Network}
         tone="border-sky-300/25 bg-sky-400/10 text-sky-200"
         loading={loading}
@@ -1080,7 +1038,9 @@ function PerformanceMetricPanel({
       <MetricPanel
         label="实时 TPS"
         value={formatNumber(tps?.current, { maximumFractionDigits: 1 })}
-        sub={`峰值 ${formatNumber(tps?.peak, { maximumFractionDigits: 1 })} / 平均 ${formatNumber(tps?.avg, { maximumFractionDigits: 1 })}`}
+        sub={locale === "en"
+          ? `Peak ${formatNumber(tps?.peak, { maximumFractionDigits: 1 })} / Avg ${formatNumber(tps?.avg, { maximumFractionDigits: 1 })}`
+          : `峰值 ${formatNumber(tps?.peak, { maximumFractionDigits: 1 })} / 平均 ${formatNumber(tps?.avg, { maximumFractionDigits: 1 })}`}
         icon={Zap}
         tone="border-amber-300/25 bg-amber-400/10 text-amber-200"
         loading={loading}
@@ -1088,7 +1048,9 @@ function PerformanceMetricPanel({
       <MetricPanel
         label="平均响应延迟"
         value={`${formatNumber(latency?.value, { maximumFractionDigits: 1 })}${latency?.unit ?? "ms"}`}
-        sub={performance?.updateTime ? `更新 ${formatDate(performance.updateTime)}` : "等待性能数据"}
+        sub={performance?.updateTime
+          ? `${locale === "en" ? "Updated" : "更新"} ${formatDate(performance.updateTime)}`
+          : "等待性能数据"}
         icon={Gauge}
         tone="border-sky-300/25 bg-sky-400/10 text-sky-200"
         loading={loading}
@@ -1138,42 +1100,45 @@ function LiveObservabilityPanel({
   observability?: AgentObservability | null;
   connected: boolean;
 }) {
+  const { locale, t } = useI18n();
   const heartbeatLevel: SecurityRiskLevel = observability?.health.heartbeatOk ? "safe" : connected ? "critical" : "unknown";
   const driftLevel: SecurityRiskLevel = observability?.behavioral.decisionPattern === "drift" ? "medium" : "safe";
-  const statusLabel = connected ? `实时 ${formatTimeLabel(observability?.updateTime)}` : "连接中";
+  const statusLabel = connected
+    ? `${locale === "en" ? "Live" : "实时"} ${formatTimeLabel(observability?.updateTime)}`
+    : "连接中";
   const items = [
     {
       label: "心跳",
       value: observability ? (observability.health.heartbeatOk ? "在线" : "异常") : "--",
-      sub: `决策延迟 ${formatNumber(observability?.health.decisionLatencyMs, { maximumFractionDigits: 0 })}ms`,
+      sub: `${locale === "en" ? "Decision latency" : "决策延迟"} ${formatNumber(observability?.health.decisionLatencyMs, { maximumFractionDigits: 0 })}ms`,
       icon: RadioTower,
       tone: heartbeatLevel,
     },
     {
       label: "错误率",
       value: formatPercent(observability?.health.errorRate),
-      sub: `资源利用 ${formatPercent(observability?.health.resourceUtil)}`,
+      sub: `${locale === "en" ? "Resource utilization" : "资源利用"} ${formatPercent(observability?.health.resourceUtil)}`,
       icon: AlertTriangle,
       tone: observability && observability.health.errorRate > 10 ? "medium" : "safe",
     },
     {
       label: "吞吐",
       value: formatNumber(observability?.system.commThroughput, { maximumFractionDigits: 1 }),
-      sub: `智能体 ${formatNumber(observability?.system.agentCount, { maximumFractionDigits: 0 })}`,
+      sub: `${locale === "en" ? "Agents" : "智能体"} ${formatNumber(observability?.system.agentCount, { maximumFractionDigits: 0 })}`,
       icon: Network,
       tone: observability?.system.infraHealthy === false ? "medium" : "safe",
     },
     {
       label: "行为态势",
       value: observability?.behavioral.decisionPattern === "drift" ? "漂移" : observability ? "基线" : "--",
-      sub: `动作率 ${formatNumber(observability?.behavioral.actionRate, { maximumFractionDigits: 1 })}`,
+      sub: `${locale === "en" ? "Action rate" : "动作率"} ${formatNumber(observability?.behavioral.actionRate, { maximumFractionDigits: 1 })}`,
       icon: Activity,
       tone: driftLevel,
     },
     {
       label: "状态迁移",
       value: formatNumber(observability?.behavioral.stateTransitions, { maximumFractionDigits: 0 }),
-      sub: `目标进度 ${formatPercent(observability?.behavioral.goalProgress)}`,
+      sub: `${locale === "en" ? "Goal progress" : "目标进度"} ${formatPercent(observability?.behavioral.goalProgress)}`,
       icon: GitBranch,
       tone: "low",
     },
@@ -1189,14 +1154,14 @@ function LiveObservabilityPanel({
             <div key={item.label} className="min-h-[108px] rounded-[8px] border border-white/10 bg-white/[0.03] p-3">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
-                  <p className="truncate text-xs font-medium text-zinc-500">{item.label}</p>
-                  <p className="mt-2 truncate text-2xl font-semibold leading-none tracking-normal text-zinc-50">{item.value}</p>
+                  <p className="truncate text-xs font-medium text-zinc-500">{t(item.label)}</p>
+                  <p className="mt-2 truncate text-2xl font-semibold leading-none tracking-normal text-zinc-50">{t(item.value)}</p>
                 </div>
                 <span className={cn("inline-flex size-9 shrink-0 items-center justify-center rounded-md border", tone.border, tone.bg, tone.text)}>
                   <Icon className="size-4" />
                 </span>
               </div>
-              <p className="mt-3 truncate text-xs text-zinc-500">{item.sub}</p>
+              <p className="mt-3 truncate text-xs text-zinc-500">{t(item.sub)}</p>
             </div>
           );
         })}
@@ -1246,19 +1211,22 @@ function RiskCategoryColumn({
   category?: SecurityRiskCategory;
   color: string;
 }) {
+  const { t } = useI18n();
   const items = category?.items ?? [];
 
   return (
     <div className="min-w-0">
       <div className="mb-3 flex items-center justify-between gap-3">
         <div className="min-w-0">
-          <p className="truncate text-sm font-semibold text-zinc-100">{title}</p>
-          <p className="mt-0.5 text-xs text-zinc-500">总计 {formatNumber(category?.totalCount ?? 0)} 个事件</p>
+          <p className="truncate text-sm font-semibold text-zinc-100">{t(title)}</p>
+          <p className="mt-0.5 text-xs text-zinc-500">
+            {t("总计")} {formatNumber(category?.totalCount ?? 0)} {t("个事件")}
+          </p>
         </div>
         <span className="size-2.5 shrink-0 rounded-full" style={{ backgroundColor: color }} />
       </div>
       {items.length === 0 ? (
-        <div className="rounded-md border border-white/10 px-3 py-6 text-center text-xs text-zinc-500">暂无风险项</div>
+        <div className="rounded-md border border-white/10 px-3 py-6 text-center text-xs text-zinc-500">{t("暂无风险项")}</div>
       ) : (
         <div className="max-h-[310px] space-y-2 overflow-y-auto pr-1">
           {items.map((item) => {
@@ -1269,7 +1237,7 @@ function RiskCategoryColumn({
                 className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-3 rounded-md border border-white/10 bg-white/[0.03] px-3 py-2.5 transition hover:bg-white/[0.06]"
               >
                 <div className="min-w-0">
-                  <p className="truncate text-sm text-zinc-200">{riskEventName(item.riskCode || item.riskName)}</p>
+                  <p className="truncate text-sm text-zinc-200">{t(riskEventName(item.riskCode || item.riskName))}</p>
                   <p className="mt-0.5 truncate text-[11px] text-zinc-600">{item.riskCode}</p>
                 </div>
                 <span className="tabular-nums text-sm font-semibold text-zinc-100">
@@ -1354,12 +1322,38 @@ const STREAM_RULE_LABELS: Record<string, string> = {
 const STREAM_OPERATION_LABELS: Record<string, string> = {
   file_read: "读取敏感文件",
   file_write: "写入文件",
+  download: "下载文件",
+  chmod: "修改文件权限",
   encode: "编码数据",
   compress: "压缩数据",
   copy: "复制数据",
   egress: "建立外部连接",
+  persistence_activate: "激活持久化配置",
+  sandbox_probe: "探测沙箱边界",
+  privilege_change: "尝试权限转换",
+  target_discovery: "枚举破坏目标",
+  destroy: "破坏文件或数据",
+  remote_connect: "连接远程主机",
+  remote_execute: "远程执行命令",
+  remote_copy: "向远程主机复制数据",
   execute: "执行命令",
   observe: "观测事件",
+};
+
+const STREAM_ATTACK_TYPE_LABELS: Record<string, string> = {
+  "download-and-execute": "下载后执行候选",
+  download_execute: "下载后执行候选",
+  "sensitive-data-exfiltration": "敏感数据外传候选",
+  sensitive_data_exfiltration: "敏感数据外传候选",
+  "known-vulnerability-exploitation": "已知漏洞利用候选",
+  "persistence-installation": "持久化安装候选",
+  persistence_installation: "持久化安装候选",
+  "sandbox-privilege-breakout": "沙箱逃逸 / 权限突破候选",
+  sandbox_privilege_breakout: "沙箱逃逸 / 权限突破候选",
+  "destructive-behavior": "破坏性行为候选",
+  destructive_behavior: "破坏性行为候选",
+  "lateral-movement": "横向移动候选",
+  lateral_movement: "横向移动候选",
 };
 
 function cvssExplanation(vector?: string) {
@@ -1369,18 +1363,22 @@ function cvssExplanation(vector?: string) {
       impact: "需结合漏洞说明人工确认影响",
     };
   }
-  const metrics = Object.fromEntries(vector.split("/").slice(1).map((part) => part.split(":")));
-  const access = {
+  const metrics: Record<string, string> = Object.fromEntries(
+    vector.split("/").slice(1).map((part) => part.split(":")),
+  );
+  const accessLabels: Record<string, string> = {
     N: "可通过网络触发",
     A: "需相邻网络",
     L: "需本地访问",
     P: "需物理访问",
-  }[metrics.AV] ?? "攻击入口未知";
-  const privilege = {
+  };
+  const privilegeLabels: Record<string, string> = {
     N: "无需预先权限",
     L: "需要低权限",
     H: "需要高权限",
-  }[metrics.PR] ?? "权限条件未知";
+  };
+  const access = accessLabels[metrics.AV] ?? "攻击入口未知";
+  const privilege = privilegeLabels[metrics.PR] ?? "权限条件未知";
   const interaction = metrics.UI === "N" ? "无需用户交互" : metrics.UI === "R" ? "需要用户交互" : "交互条件未知";
   const impactParts = [
     metrics.C === "H" ? "机密性高影响" : metrics.C === "L" ? "机密性低影响" : "",
@@ -1402,11 +1400,36 @@ function SupplyChainPanel({
   streamFindings?: StreamFindingList | null;
   error?: string;
 }) {
+  const { locale, t } = useI18n();
   const [showAll, setShowAll] = useState(false);
+  const [priorityFilter, setPriorityFilter] = useState<"all" | "P0" | "P1" | "P2" | "P3" | "runtime">("all");
+  const [selectedWorkspace, setSelectedWorkspace] = useState("all");
+  const [scanningWorkspace, setScanningWorkspace] = useState("");
+  const [scanFeedback, setScanFeedback] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const workspaceOptions = useMemo(() => {
+    if (overview?.workspaceOptions?.length) return overview.workspaceOptions;
+    return [...new Set((overview?.findings ?? []).map((finding) => finding.workspaceId))].map((workspaceId) => ({
+      workspaceId,
+      repositoryId: workspaceId,
+      displayName: workspaceId,
+    }));
+  }, [overview?.findings, overview?.workspaceOptions]);
+  const workspaceNames = useMemo(
+    () => new Map(workspaceOptions.map((workspace) => [workspace.workspaceId, workspace.displayName])),
+    [workspaceOptions],
+  );
+  const workspaceFindingCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const finding of overview?.findings ?? []) {
+      counts.set(finding.workspaceId, (counts.get(finding.workspaceId) ?? 0) + 1);
+    }
+    return counts;
+  }, [overview?.findings]);
   const findings = useMemo(() => {
     const runtimeEvidence = new Map<string, "observed" | "attack_chain">();
     for (const judgment of streamFindings?.compositeJudgments ?? []) {
-      const attackChain = judgment.ruleVersion === "supply-chain-exploit-v1"
+      const attackChain = (judgment.ruleVersion === "supply-chain-exploit-v1"
+        || judgment.ruleVersion === "supply-chain-temporal-v2")
         && (judgment.classification === "suspicious" || judgment.classification === "confirmed_attack");
       for (const evidence of judgment.evidence) {
         for (const vulnerability of evidence.runtimeVulnerabilities ?? []) {
@@ -1418,7 +1441,9 @@ function SupplyChainPanel({
         }
       }
     }
-    return (overview?.findings ?? []).map((finding) => {
+    return (overview?.findings ?? [])
+      .filter((finding) => selectedWorkspace === "all" || finding.workspaceId === selectedWorkspace)
+      .map((finding) => {
       const exploitability = runtimeEvidence.get(finding.findingId) ?? "not_observed";
       const score = Math.min(
         100,
@@ -1427,6 +1452,7 @@ function SupplyChainPanel({
       return {
         finding,
         exploitability,
+        runtimeScore: exploitability === "attack_chain" ? 15 : exploitability === "observed" ? 5 : 0,
         priorityScore: score,
         priority: score >= 90 ? "P0" : score >= 60 ? "P1" : score >= 35 ? "P2" : "P3",
       };
@@ -1434,9 +1460,18 @@ function SupplyChainPanel({
       right.priorityScore - left.priorityScore
       || right.finding.lastObservedAt - left.finding.lastObservedAt
     ));
-  }, [overview?.findings, streamFindings?.compositeJudgments]);
+  }, [overview?.findings, selectedWorkspace, streamFindings?.compositeJudgments]);
   if (!overview?.enabled) return null;
-  const visibleFindings = showAll ? findings : findings.slice(0, 4);
+  const filteredFindings = findings.filter((item) => (
+    priorityFilter === "all"
+      ? true
+      : priorityFilter === "runtime"
+        ? item.exploitability !== "not_observed"
+        : item.priority === priorityFilter
+  ));
+  const visibleFindings = showAll ? filteredFindings : filteredFindings.slice(0, 4);
+  const highPriorityCount = findings.filter((item) => item.priority === "P0" || item.priority === "P1").length;
+  const runtimeExposureCount = findings.filter((item) => item.exploitability !== "not_observed").length;
   const severityLabel = {
     critical: "严重",
     high: "高危",
@@ -1444,44 +1479,133 @@ function SupplyChainPanel({
     low: "低危",
     unknown: "未知",
   };
+  const requestWorkspaceScan = async () => {
+    if (selectedWorkspace === "all") return;
+    setScanningWorkspace(selectedWorkspace);
+    setScanFeedback(null);
+    try {
+      const response = await securityCenterApi.scanSupplyChainWorkspace(selectedWorkspace);
+      const workspaceName = workspaceNames.get(selectedWorkspace) ?? selectedWorkspace;
+      setScanFeedback({
+        type: "success",
+        message: `已提交 ${workspaceName} 的扫描任务 ${response.task.taskId}。Workspace Scanner 领取后会更新依赖快照与 OSV 评估。`,
+      });
+    } catch (scanError) {
+      setScanFeedback({
+        type: "error",
+        message: scanError instanceof Error ? scanError.message : "提交扫描任务失败",
+      });
+    } finally {
+      setScanningWorkspace("");
+    }
+  };
   return (
     <Panel
       title="OSV 依赖漏洞资产"
       icon={ShieldAlert}
       action={(
         <div className="flex flex-wrap items-center gap-2">
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-zinc-600/50 bg-zinc-800/50 px-2.5 py-1 text-[11px] text-zinc-300">
+            {t("当前资产快照 · 不受顶部时间范围影响")}
+          </span>
           {overview.runtimeCorrelationEnabled && (
             <span className="inline-flex items-center gap-1.5 rounded-full border border-teal-400/30 bg-teal-400/10 px-2.5 py-1 text-[11px] text-teal-200">
               <GitBranch className="size-3" />
-              运行时关联已启用
+              {t("运行时关联已启用")}
             </span>
           )}
           <span className="inline-flex items-center gap-1.5 rounded-full border border-sky-400/30 bg-sky-400/10 px-2.5 py-1 text-[11px] text-sky-200">
             <EyeOff className="size-3" />
-            治理提醒 · 不代表漏洞正在被利用
+            {t("治理提醒 · 不代表漏洞正在被利用")}
           </span>
         </div>
       )}
     >
       <div className="space-y-4 p-4">
         <InlineError message={error} />
-        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-white/10 bg-white/[0.025] px-3 py-2.5">
+          <div>
+            <p className="text-[11px] font-medium text-zinc-300">{t("Workspace 范围")}</p>
+            <p className="mt-0.5 text-[10px] text-zinc-600">
+              {t("选择具体工作副本后，漏洞数量、优先级和列表同步过滤")}
+            </p>
+          </div>
+          <div className="flex w-full flex-wrap items-center justify-end gap-2 sm:w-auto">
+            <Select
+              value={selectedWorkspace}
+              onValueChange={(value) => {
+                setSelectedWorkspace(value);
+                setPriorityFilter("all");
+                setShowAll(false);
+                setScanFeedback(null);
+              }}
+            >
+              <SelectTrigger className="h-8 w-full border-white/10 bg-black/20 text-xs text-zinc-300 sm:w-[320px]">
+                <SelectValue placeholder={t("选择 Workspace")} />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">{t("全部 Workspace")} ({overview.openFindings})</SelectItem>
+                {workspaceOptions.map((workspace) => (
+                  <SelectItem key={workspace.workspaceId} value={workspace.workspaceId}>
+                    {workspace.displayName}（{workspaceFindingCounts.get(workspace.workspaceId) ?? 0}）
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Button
+              type="button"
+              variant="outline"
+              className="h-8 border-teal-400/30 bg-teal-400/5 px-3 text-xs text-teal-200 hover:bg-teal-400/10 hover:text-teal-100"
+              disabled={selectedWorkspace === "all" || Boolean(scanningWorkspace)}
+              title={t(selectedWorkspace === "all" ? "请先选择一个具体 Workspace" : "重新提取依赖并刷新 OSV 漏洞评估")}
+              onClick={() => void requestWorkspaceScan()}
+            >
+              {scanningWorkspace ? (
+                <LoaderCircle className="mr-1.5 size-3.5 animate-spin" />
+              ) : (
+                <RefreshCw className="mr-1.5 size-3.5" />
+              )}
+              {t(scanningWorkspace ? "提交中" : "重新扫描")}
+            </Button>
+          </div>
+        </div>
+        {scanFeedback && (
+          <div
+            className={cn(
+              "rounded-md border px-3 py-2 text-[11px]",
+              scanFeedback.type === "success"
+                ? "border-teal-400/25 bg-teal-400/[0.07] text-teal-200"
+                : "border-red-400/25 bg-red-400/[0.07] text-red-200",
+            )}
+          >
+            {scanFeedback.message}
+          </div>
+        )}
+        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-6">
           {[
-            { label: "可信 Workspace", value: overview.workspaces, detail: "按节点工作副本注册" },
+            {
+              label: "可信 Workspace",
+              value: selectedWorkspace === "all" ? overview.workspaces : 1,
+              detail: selectedWorkspace === "all"
+                ? "按节点工作副本注册"
+                : workspaceNames.get(selectedWorkspace) ?? selectedWorkspace,
+            },
             { label: "有效依赖快照", value: overview.activeSnapshots, detail: "仅完整提取可生效" },
-            { label: "开放漏洞", value: overview.openFindings, detail: "漏洞治理提醒" },
+            { label: "开放漏洞", value: findings.length, detail: selectedWorkspace === "all" ? "全部 Workspace" : "当前 Workspace" },
+            { label: "P0 / P1", value: highPriorityCount, detail: "优先处理的治理项" },
+            { label: "运行中暴露", value: runtimeExposureCount, detail: "观察到组件运行或攻击链" },
             {
               label: "情报状态异常",
-              value: overview.staleFindings,
+              value: findings.filter((item) => item.finding.status === "assessment_stale").length,
               detail: overview.latestAssessmentAt
                 ? `最近评估 ${dayjs(overview.latestAssessmentAt).format("MM-DD HH:mm")}`
                 : "尚未完成评估",
             },
           ].map((item) => (
             <div key={item.label} className="rounded-md border border-white/10 bg-white/[0.025] px-3 py-2.5">
-              <p className="text-[11px] text-zinc-500">{item.label}</p>
+              <p className="text-[11px] text-zinc-500">{t(item.label)}</p>
               <p className="mt-1 text-lg font-semibold tabular-nums text-zinc-100">{item.value}</p>
-              <p className="mt-0.5 text-[10px] text-zinc-600">{item.detail}</p>
+              <p className="mt-0.5 text-[10px] text-zinc-600">{t(item.detail)}</p>
             </div>
           ))}
         </div>
@@ -1489,8 +1613,40 @@ function SupplyChainPanel({
           <EmptyState label="当前组件快照未发现已知漏洞" />
         ) : (
           <>
+            <div className="flex flex-wrap items-center gap-2">
+              {([
+                ["all", `${locale === "en" ? "All" : "全部"} ${findings.length}`],
+                ["P0", `P0 ${findings.filter((item) => item.priority === "P0").length}`],
+                ["P1", `P1 ${findings.filter((item) => item.priority === "P1").length}`],
+                ["P2", `P2 ${findings.filter((item) => item.priority === "P2").length}`],
+                ["P3", `P3 ${findings.filter((item) => item.priority === "P3").length}`],
+                ["runtime", `${t("运行中暴露")} ${runtimeExposureCount}`],
+              ] as const).map(([value, label]) => (
+                <Button
+                  key={value}
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setPriorityFilter(value);
+                    setShowAll(false);
+                  }}
+                  className={cn(
+                    "h-7 border-white/10 px-2.5 text-[10px]",
+                    priorityFilter === value
+                      ? "bg-teal-400/10 text-teal-200"
+                      : "bg-white/[0.025] text-zinc-400 hover:bg-white/[0.06]",
+                  )}
+                >
+                  {label}
+                </Button>
+              ))}
+            </div>
+            {filteredFindings.length === 0 ? (
+              <EmptyState label="当前筛选条件下没有漏洞治理项" />
+            ) : (
             <div className="grid gap-3 xl:grid-cols-2">
-            {visibleFindings.map(({ finding, exploitability, priority, priorityScore }) => {
+            {visibleFindings.map(({ finding, exploitability, runtimeScore, priority, priorityScore }) => {
               const stale = finding.status === "assessment_stale";
               const deployed = finding.deploymentStatus === "confirmed";
               const image = finding.component.deploymentImages?.[0];
@@ -1530,7 +1686,7 @@ function SupplyChainPanel({
                           ? "border-amber-400/25 bg-amber-400/10 text-amber-200"
                           : "border-rose-400/25 bg-rose-400/10 text-rose-200",
                       )}>
-                        {stale ? "情报待刷新" : "存在已知漏洞"}
+                        {t(stale ? "情报待刷新" : "存在已知漏洞")}
                       </span>
                     </div>
                   </div>
@@ -1545,38 +1701,38 @@ function SupplyChainPanel({
                         {finding.vulnerability.id}
                       </a>
                       <span className="text-[10px] text-zinc-600">
-                        {finding.component.direct === true ? "直接依赖" : finding.component.direct === false ? "传递依赖" : "依赖层级未知"}
+                        {t(finding.component.direct === true ? "直接依赖" : finding.component.direct === false ? "传递依赖" : "依赖层级未知")}
                       </span>
                     </div>
                     <div className="mt-3 rounded-md border border-white/[0.06] bg-white/[0.02] p-2.5">
-                      <p className="text-[10px] font-medium text-zinc-500">漏洞原因与影响</p>
+                      <p className="text-[10px] font-medium text-zinc-500">{t("漏洞原因与影响")}</p>
                       <p className="mt-1.5 line-clamp-4 text-xs leading-5 text-zinc-300">
                         {finding.vulnerability.impactDescription
                           || finding.vulnerability.summary
-                          || "OSV 未提供漏洞原因说明"}
+                          || t("OSV 未提供漏洞原因说明")}
                       </p>
                       <div className="mt-2 grid gap-1 text-[10px] text-zinc-500">
-                        <p><span className="text-zinc-600">攻击条件：</span>{cvss.attackCondition}</p>
-                        <p><span className="text-zinc-600">安全影响：</span>{cvss.impact}</p>
+                        <p><span className="text-zinc-600">{t("攻击条件：")}</span>{cvss.attackCondition}</p>
+                        <p><span className="text-zinc-600">{t("安全影响：")}</span>{cvss.impact}</p>
                       </div>
                     </div>
                     {finding.vulnerability.aliases.length > 0 && (
                       <p className="mt-2 truncate text-[10px] text-zinc-600">
-                        别名 {finding.vulnerability.aliases.join(" · ")}
+                        {t("别名")} {finding.vulnerability.aliases.join(" · ")}
                       </p>
                     )}
                     <div className="mt-3 grid gap-2 border-t border-white/[0.07] pt-3 sm:grid-cols-2">
                       <div>
-                        <p className="text-[10px] text-zinc-600">厂商严重度 / CVSS</p>
+                        <p className="text-[10px] text-zinc-600">{t("厂商严重度 / CVSS")}</p>
                         <p className="mt-1 text-[11px] text-zinc-300">
-                          {severityLabel[finding.vulnerability.severityLevel ?? "unknown"]}
+                          {t(severityLabel[finding.vulnerability.severityLevel ?? "unknown"])}
                           {finding.vulnerability.cvssScore !== undefined
                             ? ` · ${finding.vulnerability.cvssScore.toFixed(1)}`
-                            : " · 暂无数值"}
+                            : ` · ${t("暂无数值")}`}
                         </p>
                         {finding.vulnerability.vendorSeveritySource && (
                           <p className="mt-1 text-[9px] text-zinc-600">
-                            {finding.vulnerability.vendorSeveritySource} 评级
+                            {finding.vulnerability.vendorSeveritySource} {t("评级")}
                           </p>
                         )}
                         {finding.vulnerability.cvssVector && (
@@ -1586,23 +1742,23 @@ function SupplyChainPanel({
                         )}
                       </div>
                       <div>
-                        <p className="text-[10px] text-zinc-600">可用修复版本</p>
+                        <p className="text-[10px] text-zinc-600">{t("可用修复版本")}</p>
                         <p className="mt-1 truncate text-[11px] text-zinc-300">
                           {finding.vulnerability.fixedVersions?.length
                             ? finding.vulnerability.fixedVersions.slice(0, 3).join(" · ")
-                            : "OSV 未提供明确修复版本"}
+                            : t("OSV 未提供明确修复版本")}
                         </p>
                       </div>
                       <div>
-                        <p className="text-[10px] text-zinc-600">实际部署</p>
+                        <p className="text-[10px] text-zinc-600">{t("实际部署")}</p>
                         <p className={cn("mt-1 text-[11px]", deployed ? "text-teal-200" : "text-zinc-400")}>
                           {image
-                            ? "镜像内已确认"
+                            ? t("镜像内已确认")
                             : installedEnvironment
                               ? installedEnvironment.kind === "python_environment"
-                                ? "Workspace Python 环境已安装"
-                                : "Workspace node_modules 已安装"
-                              : "源码存在 · 部署状态未知"}
+                                ? t("Workspace Python 环境已安装")
+                                : t("Workspace node_modules 已安装")
+                              : t("源码存在 · 部署状态未知")}
                         </p>
                         {image && (
                           <p className="mt-1 truncate text-[9px] text-zinc-600" title={image.reference}>
@@ -1616,7 +1772,7 @@ function SupplyChainPanel({
                         )}
                       </div>
                       <div>
-                        <p className="text-[10px] text-zinc-600">运行时可利用性</p>
+                        <p className="text-[10px] text-zinc-600">{t("运行时可利用性")}</p>
                         <p className={cn(
                           "mt-1 text-[11px]",
                           exploitability === "attack_chain"
@@ -1624,23 +1780,77 @@ function SupplyChainPanel({
                             : exploitability === "observed" ? "text-amber-200" : "text-zinc-400",
                         )}>
                           {exploitability === "attack_chain"
-                            ? "已形成疑似利用链"
+                            ? t("已形成疑似利用链")
                             : exploitability === "observed"
-                              ? "已观察到组件运行证据"
-                              : "尚未观察到运行证据"}
+                              ? t("已观察到组件运行证据")
+                              : t("尚未观察到运行证据")}
                         </p>
+                      </div>
+                    </div>
+                    <div className="mt-3 grid gap-2 border-t border-white/[0.07] pt-3 lg:grid-cols-2">
+                      <div className="rounded-md border border-white/[0.06] bg-white/[0.02] p-2.5">
+                        <p className="text-[10px] font-medium text-zinc-500">{t("优先级依据")}</p>
+                        <div className="mt-2 flex flex-wrap gap-1.5">
+                          {(finding.priorityFactors ?? []).map((factor) => (
+                            <span
+                              key={factor.code}
+                              title={factor.reason}
+                              className="rounded border border-white/[0.08] bg-black/20 px-1.5 py-1 text-[9px] text-zinc-400"
+                            >
+                              {factor.code === "severity"
+                                ? t("漏洞严重度")
+                                : factor.code === "deployed"
+                                  ? t("实际部署")
+                                  : factor.code === "direct_dependency"
+                                    ? t("直接依赖")
+                                    : t("运行时依赖")} +{factor.score}
+                            </span>
+                          ))}
+                          {runtimeScore > 0 && (
+                            <span className="rounded border border-rose-400/20 bg-rose-400/[0.07] px-1.5 py-1 text-[9px] text-rose-200">
+                              {t(exploitability === "attack_chain" ? "疑似利用链" : "运行证据")} +{runtimeScore}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <div className="rounded-md border border-teal-400/15 bg-teal-400/[0.04] p-2.5">
+                        <p className="text-[10px] font-medium text-teal-200">{t("建议处置")}</p>
+                        <p className="mt-1.5 text-[11px] leading-5 text-zinc-300">
+                          {exploitability === "attack_chain"
+                            ? locale === "en"
+                              ? "Review the related process and evidence chain first, isolate the affected runtime, then upgrade the component and rebuild the artifact after confirmation."
+                              : "优先核查对应进程与证据链，隔离受影响运行环境；确认后再升级组件并重建制品。"
+                            : finding.remediation?.action === "upgrade_direct_dependency"
+                              ? locale === "en" ? "Upgrade the direct dependency, regenerate the lockfile, and run a full scan." : "升级直接依赖并重新生成锁文件，完成后触发一次完整扫描。"
+                              : finding.remediation?.action === "upgrade_parent_dependency"
+                                ? locale === "en" ? "Upgrade the parent dependency or add a safe version override, then verify the transitive dependency tree." : "升级引入该组件的顶层依赖或增加安全版本覆盖，再验证传递依赖树。"
+                                : finding.remediation?.action === "update_deployed_artifact"
+                                  ? locale === "en" ? "Update the component or base image, rebuild the artifact, and scan the new image digest." : "更新组件或基础镜像，重新构建制品，并扫描新的镜像摘要。"
+                                  : finding.remediation?.action === "upgrade_component"
+                                    ? locale === "en" ? "Upgrade to a compatible safe version and confirm closure with a full scan." : "升级到兼容的安全版本，并通过完整扫描确认漏洞已关闭。"
+                                    : locale === "en" ? "No specific fix is available; monitor the advisory and reduce component exposure." : "当前情报没有明确修复版本；持续跟踪公告并减少组件暴露面。"}
+                        </p>
+                        {finding.remediation?.candidateFixedVersion && (
+                          <p className="mt-1.5 text-[10px] text-teal-300">
+                            {t("OSV 修复候选")}：{finding.remediation.candidateFixedVersion}
+                            {finding.remediation.requiresArtifactRebuild ? ` · ${t("需要重建制品")}` : ""}
+                          </p>
+                        )}
                       </div>
                     </div>
                   </div>
                   <div className="mt-3 flex items-center justify-between gap-3 border-t border-white/[0.07] pt-3 text-[10px] text-zinc-600">
-                    <span>Workspace {finding.workspaceId}</span>
-                    <span>评估 {dayjs(finding.lastObservedAt).format("MM-DD HH:mm")}</span>
+                    <span className="min-w-0 truncate" title={finding.workspaceId}>
+                      Workspace {workspaceNames.get(finding.workspaceId) ?? finding.workspaceId}
+                    </span>
+                    <span>{t("评估")} {dayjs(finding.lastObservedAt).format("MM-DD HH:mm")}</span>
                   </div>
                 </div>
               );
             })}
             </div>
-            {findings.length > 4 && (
+            )}
+            {filteredFindings.length > 4 && (
               <div className="flex justify-center">
                 <Button
                   type="button"
@@ -1649,7 +1859,7 @@ function SupplyChainPanel({
                   onClick={() => setShowAll((value) => !value)}
                   className="border-white/10 bg-white/[0.025] text-xs text-zinc-300 hover:bg-white/[0.06]"
                 >
-                  {showAll ? "收起漏洞" : `显示全部漏洞（${findings.length}）`}
+                  {showAll ? t("收起漏洞") : `${t("显示全部漏洞")}（${filteredFindings.length}）`}
                 </Button>
               </div>
             )}
@@ -1687,7 +1897,12 @@ function streamScoreContributions(profile: StreamFindingList["riskProfiles"][num
     ["externalEgressCount5m", 8, 20],
     ["transformCount5m", 5, 15],
   ] as const;
-  const contributions = weighted.map(([key, weight, cap]) => ({
+  const contributions: Array<{
+    key: string;
+    label: string;
+    value: number;
+    score: number;
+  }> = weighted.map(([key, weight, cap]) => ({
     key,
     label: STREAM_FEATURE_LABELS[key],
     value: streamFeatureValue(profile.features, key),
@@ -1700,6 +1915,65 @@ function streamScoreContributions(profile: StreamFindingList["riskProfiles"][num
   return contributions.filter((item) => item.score > 0).sort((a, b) => b.score - a.score);
 }
 
+type CompositeJudgment = StreamFindingList["compositeJudgments"][number];
+
+interface CompositeIncidentView {
+  latest: CompositeJudgment;
+  occurrences: CompositeJudgment[];
+  firstSeenAt: number;
+  lastSeenAt: number;
+}
+
+function compositeIncidentIdentity(judgment: CompositeJudgment): string {
+  const entityAnchors = [...new Set(judgment.evidence.flatMap((item) => [
+    item.resource,
+    item.destination,
+    ...(item.runtimeVulnerabilities ?? []).map((match) =>
+      `${match.ecosystem}:${match.packageName}@${match.version}:${match.vulnerabilityId}`),
+  ]).filter((value): value is string => Boolean(value?.trim())))]
+    .sort()
+    .join("|");
+  return [
+    judgment.synthetic ? "synthetic" : "production",
+    judgment.tenantId,
+    judgment.environmentId,
+    judgment.agentCorrelationId,
+    judgment.workspaceId,
+    judgment.sessionId,
+    judgment.ruleVersion,
+    judgment.attackType ?? "none",
+    entityAnchors,
+  ].join("\0");
+}
+
+function groupCompositeIncidents(judgments: CompositeJudgment[]): CompositeIncidentView[] {
+  const incidentGapMs = 10 * 60_000;
+  const groups = new Map<string, CompositeIncidentView[]>();
+  for (const judgment of [...judgments].sort((left, right) => left.windowStart - right.windowStart)) {
+    const key = compositeIncidentIdentity(judgment);
+    const incidents = groups.get(key) ?? [];
+    const current = incidents[incidents.length - 1];
+    if (current && judgment.windowStart - current.lastSeenAt <= incidentGapMs) {
+      current.occurrences.push(judgment);
+      current.lastSeenAt = Math.max(current.lastSeenAt, judgment.windowEnd);
+      if ((judgment.updateJudgedAt ?? judgment.judgedAt) >=
+        (current.latest.updateJudgedAt ?? current.latest.judgedAt)) {
+        current.latest = judgment;
+      }
+    } else {
+      incidents.push({
+        latest: judgment,
+        occurrences: [judgment],
+        firstSeenAt: judgment.windowStart,
+        lastSeenAt: judgment.windowEnd,
+      });
+    }
+    groups.set(key, incidents);
+  }
+  return [...groups.values()].flat()
+    .sort((left, right) => right.lastSeenAt - left.lastSeenAt);
+}
+
 function StreamShadowPanel({
   findings,
   error,
@@ -1707,8 +1981,10 @@ function StreamShadowPanel({
   findings?: StreamFindingList | null;
   error?: string;
 }) {
+  const { locale, t } = useI18n();
   const [tab, setTab] = useState<StreamPanelTab>("profiles");
   const [showSafe, setShowSafe] = useState(false);
+  const [showSynthetic, setShowSynthetic] = useState(false);
   const profileViews = useMemo(() => {
     const groups = new Map<string, StreamFindingList["riskProfiles"]>();
     for (const profile of findings?.riskProfiles ?? []) {
@@ -1722,7 +1998,6 @@ function StreamShadowPanel({
         history.sort((a, b) => b.calculatedAt - a.calculatedAt);
         return { profile: history[0], previousScore: history[1]?.riskScore };
       })
-      .filter((item): item is { profile: StreamFindingList["riskProfiles"][number]; previousScore?: number } => Boolean(item.profile))
       .sort((a, b) => Math.max(0, b.profile.riskScore) - Math.max(0, a.profile.riskScore));
   }, [findings?.riskProfiles]);
   const riskyProfiles = profileViews.filter(({ profile }) => profile.riskLevel !== "safe" || profile.riskScore > 0);
@@ -1730,28 +2005,42 @@ function StreamShadowPanel({
   const visibleProfiles = showSafe ? profileViews : riskyProfiles;
   const compositeRisks = findings?.compositeRisks ?? [];
   const compositeJudgments = findings?.compositeJudgments ?? [];
-  const syntheticEpisodes = compositeJudgments.filter((item) => item.synthetic);
-  const suppressedEpisodes = compositeJudgments.filter((item) =>
+  const legacyCompositeJudgments = compositeJudgments.filter((item) =>
+    item.ruleVersion === "composite-risk-v2" || item.ruleVersion === "supply-chain-exploit-v1");
+  const currentCompositeJudgments = compositeJudgments.filter((item) =>
+    item.ruleVersion !== "composite-risk-v2" && item.ruleVersion !== "supply-chain-exploit-v1");
+  const syntheticEpisodes = currentCompositeJudgments.filter((item) => item.synthetic);
+  const suppressedEpisodes = currentCompositeJudgments.filter((item) =>
     item.status === "suppressed" || item.error === "Historical episode suppressed before model evaluation");
-  const visibleCompositeJudgments = compositeJudgments.filter((item) =>
+  const productionCompositeJudgments = currentCompositeJudgments.filter((item) =>
     !item.synthetic && !suppressedEpisodes.includes(item));
-  const blockedEpisodes = visibleCompositeJudgments.filter((item) =>
+  const visibleCompositeJudgments = currentCompositeJudgments.filter((item) =>
+    !suppressedEpisodes.includes(item) && (!item.synthetic || showSynthetic));
+  const visibleCompositeIncidents = useMemo(
+    () => groupCompositeIncidents(visibleCompositeJudgments),
+    [visibleCompositeJudgments],
+  );
+  const productionCompositeIncidents = useMemo(
+    () => groupCompositeIncidents(productionCompositeJudgments),
+    [productionCompositeJudgments],
+  );
+  const blockedEpisodes = productionCompositeIncidents.filter(({ latest: item }) =>
     item.status === "succeeded" && item.classification === "confirmed_attack" && item.verdict === "block");
-  const failedEpisodes = visibleCompositeJudgments.filter((item) =>
+  const failedEpisodes = productionCompositeIncidents.filter(({ latest: item }) =>
     item.status === "failed" || item.status === "timeout" || item.updateStatus === "failed" || item.updateStatus === "timeout");
-  const pendingEpisodes = visibleCompositeJudgments.filter((item) =>
+  const pendingEpisodes = productionCompositeIncidents.filter(({ latest: item }) =>
     item.status === "pending" || item.updateStatus === "pending");
   const latestCalculatedAt = Math.max(
     0,
     ...profileViews.map(({ profile }) => profile.calculatedAt),
     ...compositeRisks.map((risk) => risk.calculatedAt),
-    ...visibleCompositeJudgments.map((judgment) => judgment.updateJudgedAt ?? judgment.judgedAt),
+    ...productionCompositeJudgments.map((judgment) => judgment.updateJudgedAt ?? judgment.judgedAt),
   );
   const ruleVersions = [...new Set(profileViews.map(({ profile }) => profile.ruleVersion).filter(Boolean))];
 
   const tabs: Array<{ key: StreamPanelTab; label: string; count?: number }> = [
     { key: "profiles", label: "风险画像", count: riskyProfiles.length },
-    { key: "composites", label: "复合攻击链", count: visibleCompositeJudgments.length },
+    { key: "composites", label: "复合攻击链", count: productionCompositeIncidents.length },
     { key: "runtime", label: "流处理状态" },
   ];
 
@@ -1759,33 +2048,27 @@ function StreamShadowPanel({
     <Panel
       title="Flink 实时风险关联"
       icon={Sparkles}
-      action={
-        <span className="inline-flex items-center gap-1.5 rounded-full border border-violet-400/30 bg-violet-400/10 px-2.5 py-1 text-[11px] text-violet-200">
-          <EyeOff className="size-3" />
-          旁路分析 · 不参与实时阻断
-        </span>
-      }
     >
       <div className="space-y-4 p-4">
         <InlineError message={error} />
         {!findings?.enabled ? (
           <div className="rounded-md border border-dashed border-white/10 px-4 py-10 text-center">
-            <p className="text-sm font-medium text-zinc-300">流式分析当前未启用</p>
-            <p className="mt-1 text-xs text-zinc-600">现有 L1 / L2 / L3 研判链路不受影响</p>
+            <p className="text-sm font-medium text-zinc-300">{t("流式分析当前未启用")}</p>
+            <p className="mt-1 text-xs text-zinc-600">{t("现有 L1 / L2 / L3 研判链路不受影响")}</p>
           </div>
         ) : (
           <>
             <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
               {[
                 { label: "Agent 资产", value: profileViews.length, detail: "按 Agent + Workspace 聚合" },
-                { label: "风险资产", value: riskyProfiles.length, detail: safeProfiles.length + " 个安全资产已折叠" },
-                { label: "高风险攻击链", value: blockedEpisodes.length, detail: pendingEpisodes.length + " 待研判 / " + failedEpisodes.length + " 异常" },
+                { label: "风险资产", value: riskyProfiles.length, detail: locale === "en" ? `${safeProfiles.length} safe assets hidden` : `${safeProfiles.length} 个安全资产已折叠` },
+                { label: "高风险攻击链", value: blockedEpisodes.length, detail: locale === "en" ? `${pendingEpisodes.length} pending / ${failedEpisodes.length} abnormal` : `${pendingEpisodes.length} 待研判 / ${failedEpisodes.length} 异常` },
                 { label: "最新计算", value: latestCalculatedAt ? dayjs(latestCalculatedAt).format("HH:mm:ss") : "--", detail: latestCalculatedAt ? dayjs(latestCalculatedAt).format("MM-DD") : "暂无结果" },
               ].map((item) => (
                 <div key={item.label} className="rounded-md border border-white/10 bg-white/[0.025] px-3 py-2.5">
-                  <p className="text-[11px] text-zinc-500">{item.label}</p>
+                  <p className="text-[11px] text-zinc-500">{t(item.label)}</p>
                   <p className="mt-1 text-lg font-semibold tabular-nums text-zinc-100">{item.value}</p>
-                  <p className="mt-0.5 text-[10px] text-zinc-600">{item.detail}</p>
+                  <p className="mt-0.5 text-[10px] text-zinc-600">{t(item.detail)}</p>
                 </div>
               ))}
             </div>
@@ -1801,7 +2084,7 @@ function StreamShadowPanel({
                     tab === item.key ? "border-teal-300 text-teal-200" : "border-transparent text-zinc-500 hover:text-zinc-300",
                   )}
                 >
-                  {item.label}{item.count === undefined ? "" : " · " + item.count}
+                  {t(item.label)}{item.count === undefined ? "" : " · " + item.count}
                 </button>
               ))}
             </div>
@@ -1810,12 +2093,12 @@ function StreamShadowPanel({
               <div className="space-y-3">
                 <div className="flex items-center justify-between gap-3">
                   <div>
-                    <p className="text-sm font-semibold text-zinc-100">Agent 风险资产</p>
-                    <p className="mt-0.5 text-xs text-zinc-500">同名 Agent 通过 Workspace 和环境区分，分数展示可解释贡献</p>
+                    <p className="text-sm font-semibold text-zinc-100">{t("Agent 风险资产")}</p>
+                    <p className="mt-0.5 text-xs text-zinc-500">{t("同名 Agent 通过 Workspace 和环境区分，分数展示可解释贡献")}</p>
                   </div>
                   {safeProfiles.length > 0 && (
                     <button type="button" onClick={() => setShowSafe((value) => !value)} className="text-xs text-teal-300 hover:text-teal-200">
-                      {showSafe ? "隐藏安全资产" : "显示安全资产（" + safeProfiles.length + "）"}
+                      {showSafe ? t("隐藏安全资产") : `${t("显示安全资产")}（${safeProfiles.length}）`}
                     </button>
                   )}
                 </div>
@@ -1837,31 +2120,31 @@ function StreamShadowPanel({
                             <div className="min-w-0">
                               <div className="flex items-center gap-2">
                                 <Bot className="size-4 text-teal-300" />
-                                <p className="truncate text-sm font-semibold text-zinc-100">{profile.agentType} · {streamWorkspaceName(workspacePath)}</p>
+                                <p className="truncate text-sm font-semibold text-zinc-100">{profile.agentType} · {t(streamWorkspaceName(workspacePath))}</p>
                               </div>
-                              <p className="mt-1 truncate text-[11px] text-zinc-500" title={workspacePath || "未绑定规范 Workspace"}>
-                                {workspacePath || "未绑定规范 Workspace"}
+                              <p className="mt-1 truncate text-[11px] text-zinc-500" title={workspacePath || t("未绑定规范 Workspace")}>
+                                {workspacePath || t("未绑定规范 Workspace")}
                               </p>
-                              <p className="mt-0.5 text-[10px] text-zinc-700">资产 ID {profile.agentCorrelationId.slice(0, 16)}</p>
+                              <p className="mt-0.5 text-[10px] text-zinc-700">{t("资产 ID")} {profile.agentCorrelationId.slice(0, 16)}</p>
                             </div>
                             <div className="text-right">
                               <div className="flex items-baseline justify-end gap-1.5">
                                 <span className={cn("text-2xl font-semibold tabular-nums", tone.text)}>{formatNumber(score)}</span>
                                 {delta !== undefined && delta !== 0 && <span className={cn("text-[10px]", delta > 0 ? "text-rose-300" : "text-emerald-300")}>{delta > 0 ? "+" : ""}{formatNumber(delta)}</span>}
                               </div>
-                              <span className={cn("text-[10px]", tone.text)}>{tone.label}</span>
+                              <span className={cn("text-[10px]", tone.text)}>{t(tone.label)}</span>
                             </div>
                           </div>
 
                           <div className="mt-3 rounded-md border border-white/[0.07] bg-black/20 p-3">
-                            <p className="text-[11px] font-medium text-zinc-400">风险分数贡献</p>
+                            <p className="text-[11px] font-medium text-zinc-400">{t("风险分数贡献")}</p>
                             {contributions.length === 0 ? (
-                              <p className="mt-2 text-xs text-zinc-600">当前窗口没有风险加分项</p>
+                              <p className="mt-2 text-xs text-zinc-600">{t("当前窗口没有风险加分项")}</p>
                             ) : (
                               <div className="mt-2 space-y-1.5">
                                 {contributions.slice(0, 4).map((item) => (
                                   <div key={item.key} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 text-[11px]">
-                                    <span className="truncate text-zinc-400">{item.label} · {formatNumber(item.value)}</span>
+                                    <span className="truncate text-zinc-400">{t(item.label)} · {formatNumber(item.value)}</span>
                                     <span className="font-medium tabular-nums text-amber-200">+{formatNumber(item.score)}</span>
                                   </div>
                                 ))}
@@ -1872,7 +2155,7 @@ function StreamShadowPanel({
                           <div className="mt-3 grid grid-cols-2 gap-1.5 sm:grid-cols-4">
                             {["toolExecCount1m", "dangerousCommandCount1m", "sensitiveFileCount5m", "externalEgressCount5m"].map((key) => (
                               <div key={key} className="rounded border border-white/[0.07] px-2 py-1.5">
-                                <p className="truncate text-[9px] text-zinc-600">{STREAM_FEATURE_LABELS[key]}</p>
+                                <p className="truncate text-[9px] text-zinc-600">{t(STREAM_FEATURE_LABELS[key])}</p>
                                 <p className="mt-0.5 text-xs tabular-nums text-zinc-300">{formatNumber(streamFeatureValue(profile.features, key))}</p>
                               </div>
                             ))}
@@ -1880,16 +2163,16 @@ function StreamShadowPanel({
 
                           <div className="mt-3 flex flex-wrap gap-1.5">
                             {profile.hitRules.length === 0 ? (
-                              <span className="text-[10px] text-zinc-600">未命中复合规则</span>
+                              <span className="text-[10px] text-zinc-600">{t("未命中复合规则")}</span>
                             ) : profile.hitRules.map((rule) => (
                               <span key={rule} className="rounded border border-amber-400/20 bg-amber-400/10 px-2 py-1 text-[10px] text-amber-200" title={rule}>
-                                {STREAM_RULE_LABELS[rule] ?? rule}
+                                {t(STREAM_RULE_LABELS[rule] ?? rule)}
                               </span>
                             ))}
                           </div>
                           <div className="mt-3 flex items-center justify-between gap-3 border-t border-white/[0.07] pt-3 text-[10px] text-zinc-600">
-                            <span>{dayjs(profile.windowStart).format("HH:mm:ss")} — {dayjs(profile.windowEnd).format("HH:mm:ss")} · 规则 {profile.ruleVersion || "--"}</span>
-                            <Link to={"/events?" + query.toString()} className="text-teal-300 hover:text-teal-200">查看事件 →</Link>
+                            <span>{dayjs(profile.windowStart).format("HH:mm:ss")} — {dayjs(profile.windowEnd).format("HH:mm:ss")} · {t("规则")} {profile.ruleVersion || "--"}</span>
+                            <Link to={"/events?" + query.toString()} className="text-teal-300 hover:text-teal-200">{t("查看事件")} →</Link>
                           </div>
                         </div>
                       );
@@ -1901,13 +2184,27 @@ function StreamShadowPanel({
 
             {tab === "composites" && (
               <div className="space-y-3">
-                <div>
-                  <p className="text-sm font-semibold text-zinc-100">行为片段复合研判</p>
-                  <p className="mt-0.5 text-xs text-zinc-500">Flink 聚合连续行为；完整确定性证据直接研判，歧义证据只调用一次模型；结论仅用于旁路告警</p>
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-zinc-100">{t("行为片段复合研判")}</p>
+                    <p className="mt-0.5 text-xs text-zinc-500">{t("Flink 聚合连续行为；完整确定性证据直接研判，歧义证据只调用一次模型；结论仅用于旁路告警")}</p>
+                  </div>
+                  {syntheticEpisodes.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setShowSynthetic((value) => !value)}
+                      className="text-xs text-teal-300 hover:text-teal-200"
+                    >
+                      {showSynthetic
+                        ? t("隐藏测试 Episode")
+                        : `${t("显示测试 Episode")}（${syntheticEpisodes.length}）`}
+                    </button>
+                  )}
                 </div>
-                {visibleCompositeJudgments.length === 0 ? (
+                {visibleCompositeIncidents.length === 0 ? (
                   <EmptyState label="当前窗口暂无复合研判结果" />
-                ) : visibleCompositeJudgments.map((judgment) => {
+                ) : visibleCompositeIncidents.map((incident) => {
+                  const judgment = incident.latest;
                   const workspacePath = streamWorkspacePath(judgment.workspacePath);
                   const query = new URLSearchParams();
                   if (judgment.traceIds[0]) query.set("traceId", judgment.traceIds[0]);
@@ -1917,14 +2214,18 @@ function StreamShadowPanel({
                   const updatePending = judgment.updateStatus === "pending";
                   const suspicious = judgment.status === "succeeded" && judgment.classification === "suspicious";
                   const border = pending ? "border-violet-400/25 bg-violet-400/[0.04]" : blocked ? "border-rose-400/25 bg-rose-400/[0.04]" : failed || suspicious ? "border-amber-400/25 bg-amber-400/[0.04]" : "border-emerald-400/20 bg-emerald-400/[0.03]";
-                  const title = pending ? "等待复合研判" : failed
+                  const title = pending ? t("等待复合研判") : failed
                     ? judgment.status === "timeout" ? "复合研判超时" : "复合研判失败"
                     : blocked ? judgment.attackType === "known-vulnerability-exploitation"
                       ? "高置信度供应链攻击"
-                      : judgment.attackType && judgment.attackType !== "none" ? judgment.attackType : "已确认攻击链"
-                    : judgment.classification === "suspicious" ? "可疑行为链"
+                      : judgment.attackType && judgment.attackType !== "none"
+                        ? t(STREAM_ATTACK_TYPE_LABELS[judgment.attackType] ?? judgment.attackType)
+                        : "已确认攻击链"
+                    : judgment.classification === "suspicious"
+                      ? t(STREAM_ATTACK_TYPE_LABELS[judgment.attackType ?? ""] ?? "可疑行为链")
                     : judgment.classification === "authorized_admin" ? "已识别授权运维"
-                    : judgment.classification === "simulation" ? "已识别测试演练"
+                    : judgment.classification === "simulation"
+                      ? `${t(STREAM_ATTACK_TYPE_LABELS[judgment.attackType ?? ""] ?? "攻击链")} · ${t("测试演练")}`
                     : "未发现攻击链";
                   const resultLabel = pending ? "待研判" : failed
                     ? judgment.status === "timeout" ? "超时" : "失败"
@@ -1939,19 +2240,24 @@ function StreamShadowPanel({
                         <div>
                           <div className="flex items-center gap-2">
                             <GitBranch className={cn("size-4", pending ? "text-violet-300" : blocked ? "text-rose-300" : failed || suspicious ? "text-amber-300" : "text-emerald-300")} />
-                            <p className="text-sm font-semibold text-zinc-100">{title}</p>
+                            <p className="text-sm font-semibold text-zinc-100">{t(title)}</p>
                           </div>
-                          <p className="mt-1 text-[11px] text-zinc-500">{judgment.agentType} · {streamWorkspaceName(workspacePath)} · {judgment.sessionId || "无会话 ID"}</p>
-                          <p className="mt-0.5 text-[10px] text-zinc-700">Episode {judgment.episodeId.slice(0, 18)} · 修订 {judgment.revision}</p>
+                          <p className="mt-1 text-[11px] text-zinc-500">{judgment.agentType} · {t(streamWorkspaceName(workspacePath))} · {judgment.sessionId || t("无会话 ID")}</p>
+                          <p className="mt-0.5 text-[10px] text-zinc-700">Episode {judgment.episodeId.slice(0, 18)} · {t("修订")} {judgment.revision}</p>
+                          {incident.occurrences.length > 1 && (
+                            <p className="mt-1 text-[10px] text-teal-300">
+                              {t("同一行为链重复发生")} {incident.occurrences.length} {t("次")} · {t("首次")} {dayjs(incident.firstSeenAt).format("HH:mm:ss")} · {t("最近")} {dayjs(incident.lastSeenAt).format("HH:mm:ss")}
+                            </p>
+                          )}
                           {judgment.updateRevision !== undefined && (
                             <p className={cn(
                               "mt-1 text-[10px]",
                               updatePending ? "text-violet-300" : "text-amber-300",
                             )}>
-                              修订 {judgment.updateRevision}
-                              {updatePending ? " 正在重新研判，当前保留上一条有效结论" : judgment.updateStatus === "timeout"
-                                ? " 研判超时，当前保留上一条有效结论"
-                                : " 研判失败，当前保留上一条有效结论"}
+                              {t("修订")} {judgment.updateRevision}{" "}
+                              {t(updatePending ? "正在重新研判，当前保留上一条有效结论" : judgment.updateStatus === "timeout"
+                                ? "研判超时，当前保留上一条有效结论"
+                                : "研判失败，当前保留上一条有效结论")}
                             </p>
                           )}
                         </div>
@@ -1960,9 +2266,9 @@ function StreamShadowPanel({
                             "inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold",
                             pending ? "border-violet-400/30 bg-violet-400/10 text-violet-200" : blocked ? "border-rose-400/30 bg-rose-400/10 text-rose-200" : failed || suspicious ? "border-amber-400/30 bg-amber-400/10 text-amber-200" : "border-emerald-400/30 bg-emerald-400/10 text-emerald-200",
                           )}>
-                            {resultLabel}
+                            {t(resultLabel)}
                           </span>
-                          {judgment.confidence !== undefined && <p className="mt-1 text-[10px] text-zinc-600">置信度 {Math.round(judgment.confidence * 100)}%</p>}
+                          {judgment.confidence !== undefined && <p className="mt-1 text-[10px] text-zinc-600">{t("置信度")} {Math.round(judgment.confidence * 100)}%</p>}
                         </div>
                       </div>
                       <div className="mt-4 grid gap-2 md:grid-cols-3">
@@ -1972,16 +2278,16 @@ function StreamShadowPanel({
                               <span className="flex size-5 items-center justify-center rounded-full bg-white/10 text-[10px] text-zinc-300">{index + 1}</span>
                               <span className="text-[10px] text-zinc-600">{dayjs(evidence.eventTime).format("HH:mm:ss")}</span>
                             </div>
-                            <p className="mt-2 text-xs font-medium text-zinc-200">{STREAM_OPERATION_LABELS[evidence.operation] ?? evidence.operation}</p>
+                            <p className="mt-2 text-xs font-medium text-zinc-200">{t(STREAM_OPERATION_LABELS[evidence.operation] ?? evidence.operation)}</p>
                             <p className="mt-1 line-clamp-2 text-[11px] text-zinc-500" title={evidence.subject}>{evidence.subject}</p>
                             {evidence.runtimeVulnerabilities?.map((match) => (
                               <p key={`${match.findingId}-${match.vulnerabilityId}`} className="mt-2 rounded border border-rose-400/20 bg-rose-400/[0.06] px-2 py-1 text-[10px] text-rose-200">
-                                {match.packageName}@{match.version} · {match.vulnerabilityId} · {match.confidence === "high" ? "高置信匹配" : "中置信匹配"}
+                                {match.packageName}@{match.version} · {match.vulnerabilityId} · {t(match.confidence === "high" ? "高置信匹配" : "中置信匹配")}
                               </p>
                             ))}
                             {evidence.judgment && (
                               <p className="mt-2 text-[10px] text-zinc-600">
-                                {evidence.judgment.stage} · {evidence.judgment.status} · {evidence.judgment.verdict || "无结论"}
+                                {evidence.judgment.stage} · {evidence.judgment.status} · {evidence.judgment.verdict || t("无结论")}
                               </p>
                             )}
                           </div>
@@ -1989,33 +2295,52 @@ function StreamShadowPanel({
                       </div>
                       <div className="mt-3 flex items-center justify-between gap-3 border-t border-white/[0.07] pt-3 text-[10px] text-zinc-600">
                         <div className="min-w-0">
-                          <p className="text-zinc-400">{judgment.reason || judgment.error || "没有返回复合研判原因"}</p>
+                          <p className="text-zinc-400">{judgment.reason || judgment.error || t("没有返回复合研判原因")}</p>
                           <p className="mt-1">
                             {pending
-                              ? `规则 ${judgment.ruleVersion || "--"} · 排队中`
+                              ? `${t("规则")} ${judgment.ruleVersion || "--"} · ${t("排队中")}`
                               : judgment.decisionSource === "deterministic_rule"
-                                ? `确定性规则直判 · ${judgment.ruleVersion || "--"} · ${formatNumber(judgment.latencyMs)}ms`
-                                : `模型 ${judgment.model || "--"} · 规则 ${judgment.ruleVersion || "--"} · ${formatNumber(judgment.latencyMs)}ms`}
+                                ? `${t("确定性规则直判")} · ${judgment.ruleVersion || "--"} · ${formatNumber(judgment.latencyMs)}ms`
+                                : `${t("模型")} ${judgment.model || "--"} · ${t("规则")} ${judgment.ruleVersion || "--"} · ${formatNumber(judgment.latencyMs)}ms`}
                             {" · "}{dayjs(judgment.windowStart).format("HH:mm:ss")}—{dayjs(judgment.windowEnd).format("HH:mm:ss")}
                           </p>
                         </div>
-                        {judgment.traceIds[0] && <Link to={"/events?" + query.toString()} className="shrink-0 text-teal-300 hover:text-teal-200">查看证据链 →</Link>}
+                        {judgment.traceIds[0] && <Link to={"/events?" + query.toString()} className="shrink-0 text-teal-300 hover:text-teal-200">{t("查看证据链")} →</Link>}
                       </div>
+                      {incident.occurrences.length > 1 && (
+                        <details className="mt-2 border-t border-white/[0.05] pt-2 text-[10px] text-zinc-600">
+                          <summary className="cursor-pointer text-teal-300 hover:text-teal-200">
+                            {t("查看事件")} {incident.occurrences.length} {t("个不可变 Episode")}
+                          </summary>
+                          <div className="mt-2 space-y-1">
+                            {incident.occurrences.map((occurrence) => (
+                              <p key={`${occurrence.episodeId}-${occurrence.revision}`}>
+                                {dayjs(occurrence.windowStart).format("MM-DD HH:mm:ss")} · {occurrence.episodeId} · {occurrence.status}
+                              </p>
+                            ))}
+                          </div>
+                        </details>
+                      )}
                     </div>
                   );
                 })}
                 {suppressedEpisodes.length > 0 && (
                   <p className="text-[10px] text-zinc-700">
-                    已折叠 {suppressedEpisodes.length} 条过期或历史回放 Episode；这些记录未调用模型，也不计入研判失败。
+                    {suppressedEpisodes.length} {t("过期或历史回放 Episode 已折叠；这些记录未调用模型，也不计入研判失败。")}
                   </p>
                 )}
-                {syntheticEpisodes.length > 0 && (
+                {syntheticEpisodes.length > 0 && !showSynthetic && (
                   <p className="text-[10px] text-zinc-700">
-                    已折叠 {syntheticEpisodes.length} 条合成测试 Episode；测试结果不计入资产风险和攻击链统计。
+                    {syntheticEpisodes.length} {t("合成测试 Episode 已折叠；测试结果不计入资产风险和攻击链统计。")}
                   </p>
                 )}
                 {compositeRisks.length > 0 && (
-                  <p className="text-[10px] text-zinc-700">历史规则候选 {compositeRisks.length} 条已保留在存储中，新版不再将其作为最终复合攻击链。</p>
+                  <p className="text-[10px] text-zinc-700">{t("历史规则候选")} {compositeRisks.length} {t("条已保留在存储中，新版不再将其作为最终复合攻击链。")}</p>
+                )}
+                {legacyCompositeJudgments.length > 0 && (
+                  <p className="text-[10px] text-zinc-700">
+                    {legacyCompositeJudgments.length} {t("旧版窗口研判记录已折叠；历史审计数据仍保留，新事件不再进入该链路。")}
+                  </p>
                 )}
               </div>
             )}
@@ -2026,21 +2351,21 @@ function StreamShadowPanel({
                   {[
                     { label: "结果消费", value: findings.enabled ? "正常" : "未连接", detail: "AnySentry 已读取流式结果" },
                     { label: "运行模式", value: "Shadow", detail: "不进入同步阻断链路" },
-                    { label: "结果总数", value: findings.riskProfiles.length + visibleCompositeJudgments.length, detail: findings.riskProfiles.length + " 画像 / " + visibleCompositeJudgments.length + " 复合研判" },
+                    { label: "结果总数", value: findings.riskProfiles.length + visibleCompositeIncidents.length, detail: findings.riskProfiles.length + " 画像 / " + visibleCompositeIncidents.length + " 复合 Incident" },
                     { label: "规则版本", value: ruleVersions.join(", ") || "--", detail: "画像输出携带的规则版本" },
                   ].map((item) => (
                     <div key={item.label} className="rounded-md border border-white/10 bg-white/[0.025] p-3">
-                      <p className="text-[11px] text-zinc-500">{item.label}</p>
-                      <p className="mt-1 text-lg font-semibold text-zinc-100">{item.value}</p>
-                      <p className="mt-1 text-[10px] text-zinc-600">{item.detail}</p>
+                      <p className="text-[11px] text-zinc-500">{t(item.label)}</p>
+                      <p className="mt-1 text-lg font-semibold text-zinc-100">{t(String(item.value))}</p>
+                      <p className="mt-1 text-[10px] text-zinc-600">{t(item.detail)}</p>
                     </div>
                   ))}
                 </div>
                 <div className="flex gap-3 rounded-md border border-amber-400/20 bg-amber-400/[0.05] p-3">
                   <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-300" />
                   <div>
-                    <p className="text-xs font-medium text-amber-100">深度运行指标尚未接入查询接口</p>
-                    <p className="mt-1 text-[11px] leading-5 text-zinc-500">Checkpoint、Watermark、Kafka Lag 与 DLQ 数量目前不能从本页面可靠读取，因此不展示虚构的健康值。下一步应由 Flink / Redpanda 指标接口提供真实数据。</p>
+                    <p className="text-xs font-medium text-amber-100">{t("深度运行指标尚未接入查询接口")}</p>
+                    <p className="mt-1 text-[11px] leading-5 text-zinc-500">{t("Checkpoint、Watermark、Kafka Lag 与 DLQ 数量目前不能从本页面可靠读取，因此不展示虚构的健康值。下一步应由 Flink / Redpanda 指标接口提供真实数据。")}</p>
                   </div>
                 </div>
               </div>
@@ -2119,6 +2444,7 @@ function RadarChart({ dimensions }: { dimensions: SecurityRiskDimension[] }) {
 }
 
 function HighestRiskPanel({ session }: { session?: SecurityHighestRiskSession | null }) {
+  const { t } = useI18n();
   const hasSession = Boolean(session?.sessionId);
   const tone = riskTone(session?.riskLevel);
 
@@ -2135,7 +2461,7 @@ function HighestRiskPanel({ session }: { session?: SecurityHighestRiskSession | 
           </div>
           <div className="min-w-0 space-y-3">
             <div>
-              <p className="text-xs text-zinc-500">综合风险评分</p>
+              <p className="text-xs text-zinc-500">{t("综合风险评分")}</p>
               <p className={cn("mt-1 text-4xl font-semibold leading-none", tone.text)}>
                 {formatNumber(session.compositeScore, { maximumFractionDigits: 1 })}
               </p>
@@ -2147,7 +2473,7 @@ function HighestRiskPanel({ session }: { session?: SecurityHighestRiskSession | 
               <InfoRow label="最后事件" value={formatDate(session.lastEventTime)} />
             </div>
             <Button asChild size="sm" className="h-8 bg-rose-400 text-[#16080b] hover:bg-rose-300">
-              <a href="#">打开会话</a>
+              <a href="#">{t("打开会话")}</a>
             </Button>
           </div>
         </div>
@@ -2159,9 +2485,10 @@ function HighestRiskPanel({ session }: { session?: SecurityHighestRiskSession | 
 }
 
 function InfoRow({ label, value }: { label: string; value?: string }) {
+  const { t } = useI18n();
   return (
     <div className="grid grid-cols-[64px_minmax(0,1fr)] gap-3">
-      <span className="text-zinc-600">{label}</span>
+      <span className="text-zinc-600">{t(label)}</span>
       <span className="truncate text-zinc-300" title={value}>
         {value || "--"}
       </span>
@@ -2174,14 +2501,15 @@ function InfoRow({ label, value }: { label: string; value?: string }) {
 // Always-on strip showing which judge tiers are configured — makes the config page's effect on the
 // dashboard immediate + obvious (a tier flips 未配置 → 已启用 the moment you save + come back).
 function TierStatusStrip({ status }: { status?: PolicyStatus | null }) {
+  const { t } = useI18n();
   const tiers: Array<{ key: keyof PolicyStatus; label: string }> = [
     { key: "l1", label: "L1 规则" },
     { key: "l2", label: "L2 LLM 研判" },
     { key: "l3", label: "L3 深判" },
   ];
   return (
-    <div className="flex flex-wrap items-center gap-2 rounded-[10px] border border-white/10 bg-[#111612]/80 px-4 py-2.5">
-      <span className="mr-1 text-xs font-medium text-zinc-400">研判层级</span>
+    <div className="flex flex-wrap items-center gap-2 rounded-[10px] border border-[#232a37] bg-[#0f131a] px-4 py-2.5">
+      <span className="mr-1 text-xs font-medium text-zinc-400">{t("研判层级")}</span>
       {tiers.map(({ key, label }) => {
         const on = Boolean(status?.[key]);
         return (
@@ -2193,14 +2521,11 @@ function TierStatusStrip({ status }: { status?: PolicyStatus | null }) {
             )}
           >
             <span className={cn("size-1.5 rounded-full", on ? "bg-teal-400" : "bg-zinc-600")} />
-            {label}
-            <span className="text-[10px] opacity-70">{on ? "已启用" : "未配置"}</span>
+            {t(label)}
+            <span className="text-[10px] opacity-70">{t(on ? "已启用" : "未启用")}</span>
           </span>
         );
       })}
-      <Link to="/admin/policy" className="ml-auto text-xs text-teal-300 hover:text-teal-200">
-        配置 →
-      </Link>
     </div>
   );
 }
@@ -2223,6 +2548,7 @@ function DecisionFunnelPanel({
   scope: TimelineScope;
   onScopeChange: (value: TimelineScope) => void;
 }) {
+  const { t } = useI18n();
   const tiers = funnel?.tiers ?? [];
 
   return (
@@ -2249,7 +2575,7 @@ function DecisionFunnelPanel({
                       {tier.tierCode} · {tier.tierName}
                     </span>
                     <span className="shrink-0 rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-zinc-500">
-                      未配置
+                      {t("未配置")}
                     </span>
                   </div>
                   <div className="relative h-8 overflow-hidden rounded-md border border-dashed border-white/10 bg-white/[0.03]" />
@@ -2282,7 +2608,7 @@ function DecisionFunnelPanel({
           })}
           <div className="mt-4 rounded-md border border-rose-300/20 bg-rose-400/10 px-3 py-3">
             <div className="flex items-center justify-between gap-3">
-              <span className="text-sm font-semibold text-rose-100">最终阻断</span>
+              <span className="text-sm font-semibold text-rose-100">{t("最终阻断")}</span>
               <span className="text-sm font-semibold text-rose-100">
                 {formatCompactNumber(funnel?.finalBlock?.count)} · {formatPercent(funnel?.finalBlock?.percentage)}
               </span>
@@ -2317,21 +2643,23 @@ function eventDetailHref(event: AgentEventListItem) {
 }
 
 function EventCellPill({ event }: { event: AgentEventListItem }) {
+  const { t } = useI18n();
   const tone = riskTone(severityLevel(event.severity));
   return (
     <span className={cn("inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-semibold", tone.bg, tone.border, tone.text)}>
       <span className={cn("size-1.5 rounded-full", tone.dot)} />
-      {EVENT_CATEGORY_LABEL[event.eventCategory] ?? event.eventCategory}
+      {t(EVENT_CATEGORY_LABEL[event.eventCategory] ?? event.eventCategory)}
     </span>
   );
 }
 
 function VerdictPill({ verdict }: { verdict: SecurityVerdict }) {
+  const { t } = useI18n();
   const tone = riskTone(verdictLevel(verdict));
   return (
     <span className={cn("inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-semibold", tone.bg, tone.border, tone.text)}>
       <span className={cn("size-1.5 rounded-full", tone.dot)} />
-      {VERDICT_LABEL[verdict] ?? verdict}
+      {t(VERDICT_LABEL[verdict] ?? verdict)}
     </span>
   );
 }
@@ -2343,6 +2671,7 @@ const SENTRY_TIER_META: Record<AgentEventListItem["tier"], { label: string; titl
 };
 
 function SentryTierPill({ event }: { event: AgentEventListItem }) {
+  const { t } = useI18n();
   if (event.decisionStatus && event.decisionStatus !== "succeeded") {
     const statusMeta = {
       accepted: { label: "已接收", title: "事件已接收，等待进入研判队列", className: "border-sky-500/40 bg-sky-500/10 text-sky-200" },
@@ -2354,7 +2683,7 @@ function SentryTierPill({ event }: { event: AgentEventListItem }) {
     if (statusMeta) {
       return (
         <span title={statusMeta.title} className={cn("inline-flex h-6 min-w-10 items-center justify-center rounded border px-2 text-[10px] font-semibold", statusMeta.className)}>
-          {statusMeta.label}
+          {t(statusMeta.label)}
         </span>
       );
     }
@@ -2377,6 +2706,7 @@ function TimelineScopeTabs({
   value: TimelineScope;
   onChange: (value: TimelineScope) => void;
 }) {
+  const { t } = useI18n();
   const options: Array<{ value: TimelineScope; label: string }> = [
     { value: "agent", label: "Agent 事件" },
     { value: "raw", label: "全部事件" },
@@ -2396,7 +2726,7 @@ function TimelineScopeTabs({
               : "text-zinc-500 hover:bg-white/5 hover:text-zinc-200",
           )}
         >
-          {option.label}
+          {t(option.label)}
         </button>
       ))}
     </div>
@@ -2418,6 +2748,7 @@ function AgentEventTimelinePanel({
   onScopeChange: (value: TimelineScope) => void;
   onTierChange: (value: TimelineTierFilter) => void;
 }) {
+  const { locale, t } = useI18n();
   const items = events?.items ?? [];
 
   return (
@@ -2428,18 +2759,20 @@ function AgentEventTimelinePanel({
         <div className="flex items-center gap-3">
           <TimelineScopeTabs value={scope} onChange={onScopeChange} />
           <Select value={tier} onValueChange={(value) => onTierChange(value as TimelineTierFilter)}>
-            <SelectTrigger className="h-8 w-[112px] border-white/10 bg-white/5 text-xs text-zinc-100" aria-label="筛选研判层级">
+            <SelectTrigger className="h-8 w-[112px] border-white/10 bg-white/5 text-xs text-zinc-100" aria-label={locale === "en" ? "Filter judgment tier" : "筛选研判层级"}>
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">全部研判</SelectItem>
+              <SelectItem value="all">{locale === "en" ? "All tiers" : "全部研判"}</SelectItem>
               <SelectItem value="Rules">L1</SelectItem>
               <SelectItem value="Llm">L2</SelectItem>
               <SelectItem value="Agent">L3</SelectItem>
             </SelectContent>
           </Select>
-          <span className="text-xs text-zinc-500">{events ? `${formatNumber(events.total)} 条` : "--"}</span>
-          <Link to="/events" className="text-xs text-teal-300 hover:text-teal-200">查看全部</Link>
+          <span className="text-xs text-zinc-500">
+            {events ? `${formatNumber(events.total)} ${locale === "en" ? "events" : "条"}` : "--"}
+          </span>
+          <Link to="/events" className="text-xs text-teal-300 hover:text-teal-200">{t("查看全部")}</Link>
         </div>
       }
     >
@@ -2450,14 +2783,14 @@ function AgentEventTimelinePanel({
         ) : (
           <div className="overflow-x-auto">
             <div className="grid min-w-[1070px] grid-cols-[96px_88px_minmax(240px,1.4fr)_minmax(150px,0.9fr)_minmax(150px,0.9fr)_66px_82px_76px] gap-3 border-b border-white/10 pb-2 text-xs text-zinc-500">
-              <span>时间</span>
-              <span>类型</span>
-              <span>事件</span>
-              <span>智能体 / 会话</span>
+              <span>{locale === "en" ? "Time" : "时间"}</span>
+              <span>{locale === "en" ? "Type" : "类型"}</span>
+              <span>{locale === "en" ? "Event" : "事件"}</span>
+              <span>{locale === "en" ? "Agent / Session" : "智能体 / 会话"}</span>
               <span>Trace / Span</span>
-              <span className="text-center">研判</span>
-              <span className="text-right">风险</span>
-              <span className="text-center">处置</span>
+              <span className="text-center">{locale === "en" ? "Tier" : "研判"}</span>
+              <span className="text-right">{locale === "en" ? "Risk" : "风险"}</span>
+              <span className="text-center">{locale === "en" ? "Action" : "处置"}</span>
             </div>
             <div className="min-w-[1070px] divide-y divide-white/8">
               {items.map((event) => (
@@ -2476,7 +2809,7 @@ function AgentEventTimelinePanel({
                       {event.repeatCount && event.repeatCount > 1 ? <span className="ml-2 rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[10px] text-zinc-400">x{event.repeatCount}</span> : null}
                     </p>
                     <p className="mt-0.5 truncate text-[11px] text-zinc-600" title={event.reason}>
-                      {event.eventKind} · {riskEventName(event.riskCategory)} · {event.source}
+                      {event.eventKind} · {t(riskEventName(event.riskCategory))} · {event.source}
                     </p>
                   </div>
                   <div className="min-w-0 font-mono text-xs">
@@ -2515,6 +2848,7 @@ function WorkspaceRiskPanel({
   scope: TimelineScope;
   onScopeChange: (value: TimelineScope) => void;
 }) {
+  const { locale, t } = useI18n();
   const list = workspaceRisk?.list ?? [];
   const agentRisk = list.filter((item) => item.workspacePath.startsWith("agent://"));
   const directoryRisk = list.filter((item) => !item.workspacePath.startsWith("agent://"));
@@ -2528,18 +2862,18 @@ function WorkspaceRiskPanel({
   ) => (
     <div className="min-w-0 rounded-lg border border-white/10 bg-black/10">
       <div className="border-b border-white/10 px-4 py-3">
-        <h3 className="text-sm font-semibold text-zinc-100">{title}</h3>
-        <p className="mt-0.5 text-xs text-zinc-500">{description}</p>
+        <h3 className="text-sm font-semibold text-zinc-100">{t(title)}</h3>
+        <p className="mt-0.5 text-xs text-zinc-500">{t(description)}</p>
       </div>
       {items.length === 0 ? (
         <EmptyState label={emptyLabel} />
       ) : (
         <div className="max-h-[420px] overflow-auto p-4">
           <div className="grid min-w-[520px] grid-cols-[minmax(180px,1fr)_72px_96px_86px] gap-3 border-b border-white/10 pb-2 text-xs text-zinc-500">
-            <span>{pathLabel}</span>
-            <span className="text-right">会话数</span>
-            <span className="text-right">累计风险</span>
-            <span className="text-right">等级</span>
+            <span>{t(pathLabel)}</span>
+            <span className="text-right">{locale === "en" ? "Sessions" : "会话数"}</span>
+            <span className="text-right">{locale === "en" ? "Cumulative Risk" : "累计风险"}</span>
+            <span className="text-right">{locale === "en" ? "Level" : "等级"}</span>
           </div>
           <div className="min-w-[520px] divide-y divide-white/8">
             {items.map((item) => {
@@ -2601,28 +2935,36 @@ function WorkspaceRiskPanel({
 }
 
 export default function SecurityMonitorPage() {
-  const [filter, setFilter] = useState<SecurityTimeFilter>(DEFAULT_FILTER);
+  const [searchParams] = useSearchParams();
+  const requestedView = searchParams.get("view");
+  const { filter, refreshVersion } = useSecurityConsole();
+  const activeView: DashboardView = (
+    DASHBOARD_VIEWS.some((item) => item.value === requestedView)
+      ? requestedView as DashboardView
+      : "overview"
+  );
   const [timelineScope, setTimelineScope] = useState<TimelineScope>("agent");
   const [timelineTier, setTimelineTier] = useState<TimelineTierFilter>("all");
+  const [overviewScope, setOverviewScope] = useState<TimelineScope>("agent");
+  const [scanScope, setScanScope] = useState<TimelineScope>("agent");
   const [riskBreakdownScope, setRiskBreakdownScope] = useState<TimelineScope>("agent");
   const [decisionFunnelScope, setDecisionFunnelScope] = useState<TimelineScope>("agent");
   const [workspaceRiskScope, setWorkspaceRiskScope] = useState<TimelineScope>("agent");
-  const [customStart, setCustomStart] = useState(() => dayjs().subtract(1, "day").format("YYYY-MM-DD"));
-  const [customEnd, setCustomEnd] = useState(() => dayjs().format("YYYY-MM-DD"));
   const [observability, setObservability] = useState<AgentObservability | null>(null);
   const [observabilityConnected, setObservabilityConnected] = useState(false);
 
-  const customError = useMemo(() => {
-    if (filter.timeType !== "custom") return undefined;
-    if (!customStart || !customEnd) return "请选择开始和结束日期";
-    if (dayjs(customEnd).isBefore(dayjs(customStart), "day")) return "结束日期不能早于开始日期";
-    if (dayjs(customEnd).isAfter(dayjs(), "day")) return "结束日期不能晚于今天";
-    return undefined;
-  }, [customEnd, customStart, filter.timeType]);
-
   const requestFilter = useMemo(() => filter, [filter]);
-  const { data, loading, refresh } = useRequest(() => loadSecurityDashboardData(requestFilter, timelineScope, timelineTier, riskBreakdownScope, decisionFunnelScope, workspaceRiskScope), {
-    refreshDeps: [requestFilter, timelineScope, timelineTier, riskBreakdownScope, decisionFunnelScope, workspaceRiskScope],
+  const { data, loading } = useRequest(() => loadSecurityDashboardData(
+    requestFilter,
+    overviewScope,
+    scanScope,
+    timelineScope,
+    timelineTier,
+    riskBreakdownScope,
+    decisionFunnelScope,
+    workspaceRiskScope,
+  ), {
+    refreshDeps: [requestFilter, refreshVersion, overviewScope, scanScope, timelineScope, timelineTier, riskBreakdownScope, decisionFunnelScope, workspaceRiskScope],
     pollingInterval: 10000,
     pollingWhenHidden: false,
   });
@@ -2631,7 +2973,7 @@ export default function SecurityMonitorPage() {
     setObservability(null);
     setObservabilityConnected(false);
     streamAgentObservability(
-      requestFilter,
+      { ...requestFilter, scope: overviewScope },
       (next) => {
         setObservability(next);
         setObservabilityConnected(true);
@@ -2639,7 +2981,7 @@ export default function SecurityMonitorPage() {
       controller.signal,
     );
     return () => controller.abort();
-  }, [requestFilter]);
+  }, [overviewScope, requestFilter]);
   // Tier status drives conditional rendering for L2/L3 funnel rows. Polled so a
   // Save reflects without a full reload.
   const { data: policyConfig } = useRequest(() => securityCenterApi.getConfig(), {
@@ -2648,108 +2990,93 @@ export default function SecurityMonitorPage() {
     refreshOnWindowFocus: true, // returning from the config page reflects immediately
   });
   const status = policyConfig?.status ?? null;
-  const lastUpdatedAt =
-    observability?.updateTime ||
-    data?.scan?.updateTime ||
-    data?.performance?.updateTime ||
-    data?.riskSummary?.updateTime ||
-    data?.riskBreakdown?.updateTime ||
-    data?.highestRisk?.updateTime ||
-    data?.decisionFunnel?.updateTime ||
-    data?.workspaceRisk?.updateTime ||
-    data?.streamFindings?.updateTime ||
-    data?.events?.updateTime;
-
-  const handleTimeTypeChange = (value: SecurityTimeType) => {
-    if (value === "custom") {
-      setFilter(buildCustomFilter(customStart, customEnd));
-      return;
-    }
-    setFilter({ timeType: value });
-  };
-
-  const applyCustomTime = () => {
-    if (customError) return;
-    setFilter(buildCustomFilter(customStart, customEnd));
-  };
-
   return (
-    <div className="flex h-full w-full flex-col overflow-hidden bg-[#0b0f0c] text-zinc-100">
-      <SecurityHeader
-        filter={filter}
-        loading={loading}
-        lastUpdatedAt={lastUpdatedAt}
-        customStart={customStart}
-        customEnd={customEnd}
-        customError={customError}
-        onTimeTypeChange={handleTimeTypeChange}
-        onCustomStartChange={setCustomStart}
-        onCustomEndChange={setCustomEnd}
-        onApplyCustomTime={applyCustomTime}
-        onRefresh={refresh}
-      />
+    <div className="flex h-full w-full flex-col overflow-hidden bg-[#0a0d12] text-zinc-100">
+      <main className="min-h-0 flex-1 overflow-hidden px-4 py-4">
+        <div className="mx-auto h-full w-full max-w-[1680px]">
+          <div className="h-full min-w-0 overflow-y-auto pr-1">
+            <div className="flex flex-col gap-4">
+              <TierStatusStrip status={status} />
 
-      <main className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
-        <div className="mx-auto flex w-full max-w-[1680px] flex-col gap-4">
-          <TierStatusStrip status={status} />
+              {activeView === "overview" && (
+                <DashboardSection
+                  title="运行总览"
+                  icon={Activity}
+                  action={<TimelineScopeTabs value={overviewScope} onChange={setOverviewScope} />}
+                >
+                  <div className="space-y-4">
+                    <TopMetrics data={data} loading={loading && !data} />
+                    <LiveObservabilityPanel observability={observability} connected={observabilityConnected} />
+                    <div className="border-t border-[#232a37] pt-4">
+                      <DashboardSection title="实时扫描" icon={Radar}>
+                        <div className="grid gap-4 xl:grid-cols-[minmax(0,1.65fr)_minmax(360px,0.95fr)]">
+                          <ExplainabilityPanel
+                            scan={data?.scan}
+                            error={data?.errors.scan}
+                            scope={scanScope}
+                            onScopeChange={setScanScope}
+                          />
+                          <DecisionFunnelPanel
+                            funnel={data?.decisionFunnel}
+                            status={status}
+                            scope={decisionFunnelScope}
+                            onScopeChange={setDecisionFunnelScope}
+                          />
+                        </div>
+                      </DashboardSection>
+                    </div>
+                  </div>
+                </DashboardSection>
+              )}
 
-          <DashboardSection title="运行总览" icon={Activity}>
-            <div className="space-y-3">
-              <TopMetrics data={data} loading={loading && !data} />
-              <LiveObservabilityPanel observability={observability} connected={observabilityConnected} />
+              {activeView === "risk" && (
+                <DashboardSection title="风险态势" icon={Siren}>
+                  <div className="space-y-4">
+                    <RiskSummaryPanels summary={data?.riskSummary} />
+                    <RiskBreakdownPanel breakdown={data?.riskBreakdown} error={data?.errors.riskBreakdown} scope={riskBreakdownScope} onScopeChange={setRiskBreakdownScope} />
+                  </div>
+                </DashboardSection>
+              )}
+
+              {activeView === "stream" && (
+                <DashboardSection title="流式复合研判" icon={Sparkles}>
+                  <StreamShadowPanel findings={data?.streamFindings} error={data?.errors.streamFindings} />
+                </DashboardSection>
+              )}
+
+              {activeView === "supplyChain" && data?.supplyChain?.enabled && (
+                <DashboardSection title="供应链漏洞资产" icon={ShieldAlert}>
+                  <SupplyChainPanel
+                    overview={data.supplyChain}
+                    streamFindings={data.streamFindings}
+                    error={data.errors.supplyChain}
+                  />
+                </DashboardSection>
+              )}
+
+              {activeView === "events" && (
+                <DashboardSection title="运行链路" icon={GitBranch}>
+                  <AgentEventTimelinePanel
+                    events={data?.events}
+                    error={data?.errors.events}
+                    scope={timelineScope}
+                    tier={timelineTier}
+                    onScopeChange={setTimelineScope}
+                    onTierChange={setTimelineTier}
+                  />
+                </DashboardSection>
+              )}
+
+              {activeView === "workspace" && (
+                <DashboardSection title="会话与工作区" icon={TerminalSquare}>
+                  <div className="grid gap-4 xl:grid-cols-[minmax(360px,0.9fr)_minmax(0,1.6fr)]">
+                    <HighestRiskPanel session={data?.highestRisk} />
+                    <WorkspaceRiskPanel workspaceRisk={data?.workspaceRisk} scope={workspaceRiskScope} onScopeChange={setWorkspaceRiskScope} />
+                  </div>
+                </DashboardSection>
+              )}
             </div>
-          </DashboardSection>
-
-          <DashboardSection title="实时扫描" icon={Radar}>
-            <div className="grid gap-4 xl:grid-cols-[minmax(0,1.65fr)_minmax(360px,0.95fr)]">
-              <ExplainabilityPanel scan={data?.scan} error={data?.errors.scan} />
-              <DecisionFunnelPanel
-                funnel={data?.decisionFunnel}
-                status={status}
-                scope={decisionFunnelScope}
-                onScopeChange={setDecisionFunnelScope}
-              />
-            </div>
-          </DashboardSection>
-
-          <DashboardSection title="风险态势" icon={Siren}>
-            <div className="space-y-4">
-              <RiskSummaryPanels summary={data?.riskSummary} />
-              <RiskBreakdownPanel breakdown={data?.riskBreakdown} error={data?.errors.riskBreakdown} scope={riskBreakdownScope} onScopeChange={setRiskBreakdownScope} />
-            </div>
-          </DashboardSection>
-
-          <DashboardSection title="流式复合研判" icon={Sparkles}>
-            <StreamShadowPanel findings={data?.streamFindings} error={data?.errors.streamFindings} />
-          </DashboardSection>
-
-          {data?.supplyChain?.enabled && (
-            <DashboardSection title="供应链漏洞资产" icon={ShieldAlert}>
-              <SupplyChainPanel
-                overview={data.supplyChain}
-                streamFindings={data.streamFindings}
-                error={data.errors.supplyChain}
-              />
-            </DashboardSection>
-          )}
-
-          <DashboardSection title="运行链路" icon={GitBranch}>
-            <AgentEventTimelinePanel
-              events={data?.events}
-              error={data?.errors.events}
-              scope={timelineScope}
-              tier={timelineTier}
-              onScopeChange={setTimelineScope}
-              onTierChange={setTimelineTier}
-            />
-          </DashboardSection>
-
-          <DashboardSection title="会话与工作区" icon={TerminalSquare}>
-            <div className="grid gap-4 xl:grid-cols-[minmax(360px,0.9fr)_minmax(0,1.6fr)]">
-              <HighestRiskPanel session={data?.highestRisk} />
-              <WorkspaceRiskPanel workspaceRisk={data?.workspaceRisk} scope={workspaceRiskScope} onScopeChange={setWorkspaceRiskScope} />
-            </div>
-          </DashboardSection>
+          </div>
         </div>
       </main>
     </div>

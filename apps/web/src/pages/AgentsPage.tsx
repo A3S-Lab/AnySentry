@@ -2,6 +2,7 @@ import { useRequest } from "ahooks";
 import dayjs from "dayjs";
 import {
   Activity,
+  AlertTriangle,
   ArrowLeft,
   BellRing,
   Bot,
@@ -25,6 +26,7 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import { OperationalEmptyState } from "@/components/custom/operational-empty-state";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -517,6 +519,7 @@ function AgentDetail({
 
 export default function AgentsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const [scope, setScope] = useState<"agent" | "raw">(searchParams.get("scope") === "raw" ? "raw" : "agent");
   const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
   const [healthState, setHealthState] = useState<AgentHealthState | "all">((searchParams.get("healthState") as AgentHealthState) || "all");
   const [queryText, setQueryText] = useState(searchParams.get("q") ?? "");
@@ -528,13 +531,14 @@ export default function AgentsPage() {
 
   const query = useMemo<AgentInventoryQuery>(() => ({
     timeType,
+    scope,
     healthState,
     q: clean(queryText),
     agentId: clean(selectedAgentId),
     workspacePath: clean(selectedWorkspacePath),
     userId: clean(userId),
     limit: 200,
-  }), [healthState, queryText, selectedAgentId, selectedWorkspacePath, timeType, userId]);
+  }), [healthState, queryText, scope, selectedAgentId, selectedWorkspacePath, timeType, userId]);
 
   const { data, loading, refresh } = useRequest(() => securityCenterApi.agentInventory(query), {
     refreshDeps: [query],
@@ -567,6 +571,7 @@ export default function AgentsPage() {
     setSelectedWorkspacePath(agent.workspacePath);
     const next = new URLSearchParams();
     next.set("timeType", timeType);
+    next.set("scope", scope);
     next.set("agentId", agent.agentId);
     next.set("workspacePath", agent.workspacePath);
     if (healthState !== "all") next.set("healthState", healthState);
@@ -630,7 +635,11 @@ export default function AgentsPage() {
           </div>
         </div>
 
-        <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-[120px_130px_minmax(160px,0.8fr)_minmax(180px,1fr)_auto_auto]">
+        <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-[auto_120px_130px_minmax(160px,0.8fr)_minmax(180px,1fr)_auto_auto]">
+          <div className="flex h-9 items-center rounded-md border border-white/10 bg-white/[0.03] p-1">
+            <button type="button" onClick={() => { setScope("agent"); setSelectedAgentId(""); setSelectedWorkspacePath(""); }} className={cn("h-7 rounded px-3 text-xs text-zinc-500", scope === "agent" && "bg-teal-500/15 text-teal-100")}>Agent 资产</button>
+            <button type="button" onClick={() => { setScope("raw"); setSelectedAgentId(""); setSelectedWorkspacePath(""); }} className={cn("h-7 rounded px-3 text-xs text-zinc-500", scope === "raw" && "bg-white/10 text-zinc-100")}>全部资产</button>
+          </div>
           <Select value={timeType} onValueChange={(next) => setTimeType(next as SecurityTimeType)}>
             <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
             <SelectContent>
@@ -681,7 +690,13 @@ export default function AgentsPage() {
                   加载资产...
                 </div>
               ) : (data?.items?.length ?? 0) === 0 ? (
-                <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">暂无资产</div>
+                <OperationalEmptyState
+                  icon={Bot}
+                  title={scope === "agent" ? "当前没有可信 Agent 资产" : "当前窗口没有资产"}
+                  description={scope === "agent" ? "这里只显示经进程血缘确认的 Agent。请检查 Collector 在线状态，或切换“全部资产”排查未归属事件。" : "扩大时间范围，或检查接入源与 Collector 是否持续上报事件。"}
+                  primary={{ label: "检查采集链路", href: "/collectors" }}
+                  secondary={{ label: "查看 Workspace", href: "/workspaces" }}
+                />
               ) : (
                 <div className="max-h-[calc(100vh-300px)] overflow-y-auto">
                   {data?.items.map((agent) => (

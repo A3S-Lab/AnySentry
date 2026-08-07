@@ -12,16 +12,30 @@ export const DEFAULT_DLQ_TOPIC = 'anysentry.stream.dlq.v1';
 export type CanonicalOperation =
   | 'file_read'
   | 'file_write'
+  | 'download'
+  | 'chmod'
   | 'encode'
   | 'compress'
   | 'copy'
   | 'execute'
   | 'egress'
+  | 'persistence_activate'
+  | 'sandbox_probe'
+  | 'privilege_change'
+  | 'target_discovery'
+  | 'destroy'
+  | 'remote_connect'
+  | 'remote_execute'
+  | 'remote_copy'
   | 'observe';
 
 export type CanonicalResourceType = 'file' | 'process' | 'network' | 'unknown';
 
 export type CanonicalBehaviorStage =
+  | 'download'
+  | 'file_written'
+  | 'permission_change'
+  | 'file_execution'
   | 'credential_access'
   | 'staging'
   | 'transform'
@@ -30,6 +44,13 @@ export type CanonicalBehaviorStage =
   | 'destructive_action'
   | 'shell_execution'
   | 'vulnerable_component_execution'
+  | 'persistence_write'
+  | 'persistence_activation'
+  | 'sandbox_probe'
+  | 'privilege_change'
+  | 'target_discovery'
+  | 'lateral_connect'
+  | 'lateral_action'
   | 'none';
 
 export interface RuntimeVulnerabilityMatch {
@@ -47,11 +68,25 @@ export interface RuntimeVulnerabilityMatch {
 
 export interface CanonicalProcessIdentity {
   hostId?: string;
+  bootId?: string;
   containerId?: string;
   pid?: number;
   ppid?: number;
   rootPid?: number;
   startTimeNs?: string;
+  mountNamespace?: number;
+  processInstanceId: string;
+  identityConfidence: 'strong' | 'medium' | 'weak';
+}
+
+export interface CanonicalFileIdentity {
+  fileInstanceId: string;
+  path: string;
+  device?: string;
+  inode?: string;
+  mountNamespace?: number;
+  identityBasis: 'device_inode' | 'scoped_path';
+  identityConfidence: 'strong' | 'medium' | 'weak';
 }
 
 export interface CanonicalSecurityEvent {
@@ -92,6 +127,7 @@ export interface CanonicalSecurityEvent {
   platformRuntime: boolean;
   synthetic: boolean;
   processIdentity: CanonicalProcessIdentity;
+  fileIdentity?: CanonicalFileIdentity;
   supplyChainWorkspaceId?: string;
   dependencySnapshotId?: string;
   vulnerabilityAssessmentId?: string;
@@ -157,6 +193,7 @@ export interface RiskAnalysisEvidence extends CompositeEvidence {
   platformRuntime: boolean;
   synthetic: boolean;
   processIdentity?: CanonicalProcessIdentity;
+  fileIdentity?: CanonicalFileIdentity;
   supplyChainWorkspaceId?: string;
   dependencySnapshotId?: string;
   vulnerabilityAssessmentId?: string;
@@ -170,7 +207,7 @@ export interface RiskAnalysisBatch {
   revision: number;
   supersedesRevision?: number;
   evidenceFingerprint: string;
-  triggerReason: 'idle' | 'max_duration' | 'event_limit' | 'critical_evidence' | 'judgment_update';
+  triggerReason: 'idle' | 'max_duration' | 'event_limit' | 'critical_evidence' | 'judgment_update' | 'pattern_match';
   tenantId: string;
   environmentId: string;
   workspaceId: string;
@@ -185,7 +222,13 @@ export interface RiskAnalysisBatch {
   evidence: RiskAnalysisEvidence[];
   candidateType: string;
   decisionPath: 'deterministic_rule' | 'composite_judge';
-  ruleVersion: 'composite-risk-v2' | 'supply-chain-exploit-v1';
+  ruleVersion:
+    | 'composite-risk-v2'
+    | 'supply-chain-exploit-v1'
+    | 'supply-chain-temporal-v2'
+    | 'temporal-episode-v1'
+    | 'temporal-episode-v2';
+  evidenceConfidence?: 'strong' | 'medium' | 'weak';
   synthetic: boolean;
   shadow: true;
 }

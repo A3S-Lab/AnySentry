@@ -26,6 +26,7 @@ public class RiskAnalysisBatch implements Serializable {
     public String candidateType;
     public String decisionPath = "composite_judge";
     public String ruleVersion = "composite-risk-v2";
+    public String evidenceConfidence;
     public boolean synthetic;
     public boolean shadow = true;
 
@@ -51,6 +52,7 @@ public class RiskAnalysisBatch implements Serializable {
         public boolean platformRuntime;
         public boolean synthetic;
         public CanonicalEvent.ProcessIdentity processIdentity;
+        public CanonicalEvent.FileIdentity fileIdentity;
         public String supplyChainWorkspaceId;
         public String dependencySnapshotId;
         public String vulnerabilityAssessmentId;
@@ -80,6 +82,7 @@ public class RiskAnalysisBatch implements Serializable {
             evidence.platformRuntime = signal.platformRuntime;
             evidence.synthetic = signal.synthetic;
             evidence.processIdentity = signal.processIdentity;
+            evidence.fileIdentity = signal.fileIdentity;
             evidence.supplyChainWorkspaceId = signal.supplyChainWorkspaceId;
             evidence.dependencySnapshotId = signal.dependencySnapshotId;
             evidence.vulnerabilityAssessmentId = signal.vulnerabilityAssessmentId;

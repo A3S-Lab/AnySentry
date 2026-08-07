@@ -193,8 +193,9 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
             (pinnedObjectiveId && task.labels?.objectiveId === pinnedObjectiveId) ||
             (pinnedIssueId && task.sourceType === 'coverage' && (task.sourceId === pinnedIssueId || task.labels?.issueId === pinnedIssueId)),
         );
+        const matchesTimeWindow = task.updatedAt >= sinceMs || task.createdAt >= sinceMs;
         const matchesFilter =
-          (active(task.status) || task.updatedAt >= sinceMs || task.createdAt >= sinceMs) &&
+          ((query.includeBacklog !== false && active(task.status)) || matchesTimeWindow) &&
           (!query.status || query.status === 'all' || task.status === query.status) &&
           (!query.severity || query.severity === 'all' || task.severity === query.severity) &&
           (!query.sourceType || query.sourceType === 'all' || task.sourceType === query.sourceType) &&

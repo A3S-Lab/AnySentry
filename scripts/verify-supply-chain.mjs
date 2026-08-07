@@ -60,7 +60,10 @@ const server = http.createServer(async (request, response) => {
       return;
     }
     const results = input.queries.map((query) => query.package.name === 'vulnerable-crate'
-      ? { vulns: [{ id: 'OSV-TEST-1', modified: '2026-07-29T00:00:00Z' }] }
+      ? { vulns: [
+          { id: 'OSV-TEST-1', modified: '2026-07-29T00:00:00Z' },
+          { id: 'GHSA-TEST-0001', modified: '2026-07-29T00:00:00Z' },
+        ] }
       : {});
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify({ results }));
@@ -78,6 +81,23 @@ const server = http.createServer(async (request, response) => {
         type: 'CVSS_V3',
         score: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H',
       }],
+      affected: [{
+        package: { ecosystem: 'crates.io', name: 'vulnerable-crate' },
+        ranges: [{
+          type: 'SEMVER',
+          events: [{ introduced: '0' }, { fixed: '0.2.0' }],
+        }],
+      }],
+    }));
+    return;
+  }
+  if (request.url === '/v1/vulns/GHSA-TEST-0001') {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({
+      id: 'GHSA-TEST-0001',
+      modified: '2026-07-29T00:00:00Z',
+      aliases: ['CVE-2026-0001'],
+      summary: 'The same synthetic verifier advisory from another database',
       affected: [{
         package: { ecosystem: 'crates.io', name: 'vulnerable-crate' },
         ranges: [{
@@ -127,12 +147,24 @@ try {
   assert.equal(assessment.failedComponentCount, 0);
   assert.equal(assessment.findings.length, 1);
   assert.equal(assessment.findings[0].vulnerability.id, 'OSV-TEST-1');
-  assert.deepEqual(assessment.findings[0].vulnerability.aliases, ['CVE-2026-0001']);
+  assert.equal(assessment.findings[0].vulnerability.canonicalId, 'CVE-2026-0001');
+  assert.deepEqual(
+    assessment.findings[0].vulnerability.aliases,
+    ['CVE-2026-0001', 'GHSA-TEST-0001'],
+  );
   assert.equal(assessment.findings[0].vulnerability.severityLevel, 'high');
   assert.equal(assessment.findings[0].vulnerability.cvssScore, 9.8);
   assert.deepEqual(assessment.findings[0].vulnerability.fixedVersions, ['0.2.0']);
   assert.equal(assessment.findings[0].priority, 'P1');
+  assert.equal(assessment.findings[0].priorityScore, 65);
+  assert.deepEqual(
+    assessment.findings[0].priorityFactors.map((factor) => [factor.code, factor.score]),
+    [['severity', 60], ['runtime_scope', 5]],
+  );
   assert.equal(assessment.findings[0].deploymentStatus, 'unknown');
+  assert.equal(assessment.findings[0].remediation.action, 'upgrade_parent_dependency');
+  assert.equal(assessment.findings[0].remediation.candidateFixedVersion, '0.2.0');
+  assert.equal(assessment.findings[0].remediation.requiresArtifactRebuild, false);
   assert.equal(assessment.findings[0].shadow, true);
   const runtimeContext = buildSupplyChainRuntimeContext({
     schemaVersion: 'anysentry.workspace_registration.v1',

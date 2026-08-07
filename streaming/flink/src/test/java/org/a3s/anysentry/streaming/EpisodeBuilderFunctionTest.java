@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -40,16 +41,12 @@ class EpisodeBuilderFunctionTest {
     }
 
     @Test
-    void vulnerableComponentWithAmbiguousFollowUpUsesCompositeJudge() {
+    void legacyWindowBuilderDoesNotCreateSupplyChainCandidate() {
         RiskAnalysisBatch.Evidence component = vulnerableEvidence("medium");
-        assertEquals("known_vulnerability_exploitation", EpisodeBuilderFunction.candidateType(List.of(
+        assertNull(EpisodeBuilderFunction.candidateType(List.of(
                 component,
                 evidence("shell_execution")
         )));
-        assertEquals("composite_judge", EpisodeBuilderFunction.decisionPath(List.of(
-                component,
-                evidence("shell_execution")
-        ), "known_vulnerability_exploitation"));
     }
 
     @Test
@@ -66,10 +63,36 @@ class EpisodeBuilderFunctionTest {
         ), "known_vulnerability_exploitation"));
     }
 
+    @Test
+    void eventAtAllowedLatenessBoundaryIsAccepted() {
+        assertFalse(EpisodeBuilderFunction.tooLate(70_000L, 100_000L));
+        assertTrue(EpisodeBuilderFunction.tooLate(69_999L, 100_000L));
+    }
+
+    @Test
+    void episodeEvidenceIsSortedAndBoundedToFiveMinutes() {
+        RiskAnalysisBatch.Evidence stale = evidence("credential_access", 99_999L);
+        RiskAnalysisBatch.Evidence recent = evidence("transform", 100_000L);
+        RiskAnalysisBatch.Evidence latest = evidence("external_egress", 400_000L);
+
+        List<RiskAnalysisBatch.Evidence> bounded = EpisodeBuilderFunction.boundedEvidence(List.of(
+                latest,
+                stale,
+                recent
+        ));
+
+        assertEquals(List.of(recent, latest), bounded);
+    }
+
     private static RiskAnalysisBatch.Evidence evidence(String stage) {
+        return evidence(stage, 0L);
+    }
+
+    private static RiskAnalysisBatch.Evidence evidence(String stage, long eventTime) {
         RiskAnalysisBatch.Evidence evidence = new RiskAnalysisBatch.Evidence();
         evidence.eventId = "evt-" + stage;
         evidence.behaviorStage = stage;
+        evidence.eventTime = eventTime;
         return evidence;
     }
 

@@ -14,20 +14,35 @@
 
     --radius: 8px;
 
-    --background: 222 47% 7%;
-    --foreground: 0 0% 96%;
-    --primary: 220 94% 62%;
+    /* Horizon-inspired observability palette. */
+    --background: 215 29% 5%;
+    --foreground: 220 32% 93%;
+    --primary: 25 95% 53%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 215 27% 18%;
-    --secondary-foreground: 0 0% 96%;
-    --muted: 215 25% 15%;
-    --muted-foreground: 217 12% 70%;
+    --secondary: 216 25% 11%;
+    --secondary-foreground: 220 32% 93%;
+    --muted: 215 24% 9%;
+    --muted-foreground: 220 12% 61%;
     --destructive: 0 62% 52%;
     --destructive-foreground: 0 0% 100%;
-    --border: 215 22% 20%;
-    --input: 215 22% 20%;
-    --ring: 220 94% 62%;
-    --col-border-light: #2a2b3a;
+    --border: 216 22% 18%;
+    --input: 216 22% 18%;
+    --ring: 25 95% 53%;
+    --col-border-light: #2e3645;
+
+    --as-bg-page: #0a0d12;
+    --as-bg-surface: #0f131a;
+    --as-bg-card: #151a23;
+    --as-bg-elevated: #1c222d;
+    --as-border: #232a37;
+    --as-border-strong: #2e3645;
+    --as-text-primary: #e8ecf3;
+    --as-text-secondary: #b6bdcc;
+    --as-text-tertiary: #818a9c;
+    --as-text-faint: #5b6373;
+    --as-accent: #f97316;
+    --as-accent-soft: rgba(249, 115, 22, 0.14);
+    --as-accent-line: rgba(249, 115, 22, 0.4);
   }
 
   * {
@@ -42,7 +57,7 @@
 
   body {
     margin: 0;
-    background-color: #0b0f0c;
+    background-color: var(--as-bg-page);
     color: hsl(var(--foreground));
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;

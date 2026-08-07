@@ -358,6 +358,8 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       traceId: event.traceId,
       runId: event.runId,
       eventId: event.eventId,
+      monitored: event.attribution?.monitored === true,
+      agentScopeId: event.attribution?.agentScopeId,
       riskCategory: event.riskCategory,
       riskName: event.riskName,
       sourceSummary: event.subject,
@@ -372,6 +374,46 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       },
       at: event.at,
     });
+  }
+
+  backfillEventScopes(entries: Array<{ event: JudgedEvent; incidentId: string }>): void {
+    if (entries.length === 0 || this.alerts.size === 0) return;
+    const eventScopes = new Map<string, { monitored: boolean; agentScopeId?: string }>();
+    const incidentScopes = new Map<string, { monitored: boolean; agentScopeId?: string }>();
+    const agentScopes = new Map<string, { monitored: boolean; agentScopeId?: string }>();
+    for (const { event, incidentId } of entries) {
+      const scope = {
+        monitored: event.attribution?.monitored === true,
+        agentScopeId: event.attribution?.agentScopeId,
+      };
+      eventScopes.set(event.eventId, scope);
+      const previousIncident = incidentScopes.get(incidentId);
+      incidentScopes.set(incidentId, {
+        monitored: previousIncident?.monitored === true || scope.monitored,
+        agentScopeId: scope.agentScopeId ?? previousIncident?.agentScopeId,
+      });
+      const agentKey = `${event.workspacePath}\0${event.agentId}`;
+      const previousAgent = agentScopes.get(agentKey);
+      agentScopes.set(agentKey, {
+        monitored: previousAgent?.monitored === true || scope.monitored,
+        agentScopeId: scope.agentScopeId ?? previousAgent?.agentScopeId,
+      });
+    }
+
+    let changed = false;
+    for (const [alertId, alert] of this.alerts) {
+      if (alert.monitored !== undefined) continue;
+      const scope =
+        (alert.eventId ? eventScopes.get(alert.eventId) : undefined) ??
+        (alert.incidentId ? incidentScopes.get(alert.incidentId) : undefined) ??
+        (alert.kind === 'agent' && alert.workspacePath && alert.agentId
+          ? agentScopes.get(`${alert.workspacePath}\0${alert.agentId}`)
+          : undefined);
+      if (!scope) continue;
+      this.alerts.set(alertId, { ...alert, ...scope });
+      changed = true;
+    }
+    if (changed) this.persistSoon();
   }
 
   observeIncident(incident: Incident): void {
@@ -409,6 +451,8 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
         runId: incident.runId,
         incidentId: incident.incidentId,
         eventId: incident.lastEventId,
+        monitored: incident.monitored,
+        agentScopeId: incident.agentScopeId,
         riskCategory: incident.riskCategory,
         riskName: incident.riskName,
         sourceSummary: incident.lastEventSubject,
@@ -786,6 +830,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     const taskId = query.taskId?.trim();
     const objectiveId = query.objectiveId?.trim();
     const issueId = query.issueId?.trim();
+    const agentScoped = query.scope === 'agent';
     const hasRelatedId = Boolean(eventId || taskId || objectiveId || issueId);
     const hasContextFilter = Boolean(
       (query.status && query.status !== 'all') ||
@@ -800,6 +845,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     );
     const items = [...this.alerts.values()]
       .filter((alert) => {
+        if (agentScoped && !this.isAgentAlert(alert)) return false;
         const matchesAlertId = Boolean(pinnedAlertId && alert.alertId === pinnedAlertId);
         const matchesRelatedId = Boolean(
           (eventId && alert.eventId === eventId) ||
@@ -982,6 +1028,9 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       traceId: top?.traceId,
       runId: top?.runId,
       incidentId: top?.incidentId,
+      eventId: top?.lastEventId,
+      monitored: top?.monitored,
+      agentScopeId: top?.agentScopeId,
       riskCategory: top?.riskCategory,
       riskName: top?.riskName,
       sourceSummary: top?.lastEventSubject ?? `${open.length} open incidents`,
@@ -1152,6 +1201,13 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       alert.riskName,
       ...Object.entries(alert.labels ?? {}).flat(),
     ].some((value) => (value ?? '').toLowerCase().includes(q));
+  }
+
+  private isAgentAlert(alert: AlertRecord): boolean {
+    if (alert.monitored !== undefined) return alert.monitored;
+    if (alert.labels?.monitored === 'true' || Boolean(alert.agentScopeId ?? alert.labels?.agentScopeId)) return true;
+    if (!alert.workspacePath || !alert.agentId) return false;
+    return Boolean(this.agentMetadata.get(alert.workspacePath, alert.agentId));
   }
 
   private since(query: AlertListQuery): number {

@@ -17,6 +17,7 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import { OperationalEmptyState } from "@/components/custom/operational-empty-state";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -721,7 +722,12 @@ export default function NotificationsPage() {
               {loading && !data ? (
                 <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500"><LoaderCircle className="mr-2 size-4 animate-spin" />加载通道...</div>
               ) : (data?.channels.length ?? 0) === 0 ? (
-                <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-zinc-500"><CheckCircle2 className="size-4 text-teal-300" />暂无通道</div>
+                <OperationalEmptyState
+                  icon={BellRing}
+                  title="尚未配置通知通道"
+                  description="先在右侧保存一个 Webhook Channel，再创建 Route，把不同等级和范围的告警发送到对应接收方。"
+                  primary={{ label: "查看当前告警", href: "/alerts" }}
+                />
               ) : (
                 <div className="max-h-[300px] overflow-y-auto">
                   {data?.channels.map((item) => <ChannelRow key={item.channelId} item={item} active={item.channelId === selectedChannelId} onSelect={() => selectChannel(item)} />)}
@@ -835,7 +841,12 @@ export default function NotificationsPage() {
                 </div>
               </div>
               {(data?.routes.length ?? 0) === 0 ? (
-                <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">暂无路由</div>
+                <OperationalEmptyState
+                  icon={Route}
+                  title="尚未配置告警路由"
+                  description="创建通道后，按风险等级、类型、Workspace、Agent、Collector、Owner 或 Team 配置精确路由。"
+                  primary={{ label: "查看当前告警", href: "/alerts" }}
+                />
               ) : (
                 <div className="max-h-[360px] overflow-y-auto">
                   {data?.routes.map((item) => <RouteRow key={item.routeId} item={item} active={item.routeId === selectedRouteId} onSelect={() => selectRoute(item)} />)}
@@ -962,7 +973,12 @@ export default function NotificationsPage() {
               </div>
             </div>
             {(data?.deliveries.length ?? 0) === 0 ? (
-              <div className="flex min-h-32 items-center justify-center text-sm text-zinc-500">暂无投递记录</div>
+              <OperationalEmptyState
+                icon={Send}
+                title="还没有通知投递记录"
+                description="启用 Channel 和 Route 后，新产生并命中的告警会在这里留下成功、失败或跳过的审计记录。"
+                primary={{ label: "查看告警", href: "/alerts" }}
+              />
             ) : (
               <div className="max-h-[420px] overflow-y-auto">
                 {data?.deliveries.map((item) => <DeliveryRow key={item.deliveryId} item={item} active={deliveryRowActive(item)} />)}

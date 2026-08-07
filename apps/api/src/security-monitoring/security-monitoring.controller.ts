@@ -1,5 +1,6 @@
 import { BadRequestException, Body, Controller, Get, Headers, HttpCode, NotFoundException, Param, Post, Put, Query, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { Observable, map, timer } from 'rxjs';
 import { SkipWrap } from '../shared/api-response.interceptor';
 import { AgentMetadataService } from './agent-metadata.service';
@@ -14,6 +15,7 @@ import { NotificationService } from './notification.service';
 import { ObjectiveService } from './objective.service';
 import { PolicyConfigError } from './policy-config';
 import { RemediationService } from './remediation.service';
+import { SecurityAssistantService } from './security-assistant.service';
 import { SentryJudgeService } from './sentry-judge.service';
 import { StreamingFindingService } from './streaming-finding.service';
 import { StreamingQueueService } from './streaming-queue.service';
@@ -161,8 +163,10 @@ function processFromObserverLine(process: unknown): T.ProcessContext | undefined
     cgroup: stringField('cgroup'),
     systemdUnit: stringField('systemdUnit'),
     hostId: stringField('hostId'),
+    bootId: stringField('bootId'),
     eventTimeNs: stringField('eventTimeNs'),
     startTimeNs: stringField('startTimeNs'),
+    mountNamespace: numberField('mountNamespace'),
   };
   return Object.values(ctx).some((value) => value !== undefined) ? ctx : undefined;
 }
@@ -2666,6 +2670,7 @@ export class SecurityMonitoringController {
     private readonly streaming: StreamingQueueService,
     private readonly streamFindings: StreamingFindingService,
     private readonly supplyChain: SupplyChainService,
+    private readonly assistant: SecurityAssistantService,
   ) {}
 
   private requireWorkspaceScanner(
@@ -2673,6 +2678,14 @@ export class SecurityMonitoringController {
     scannerId: string,
   ): void {
     let expected = process.env.ANYSENTRY_WORKSPACE_SCANNER_TOKEN?.trim();
+    const tokenFile = process.env.ANYSENTRY_WORKSPACE_SCANNER_TOKEN_FILE?.trim();
+    if (!expected && tokenFile) {
+      try {
+        expected = readFileSync(tokenFile, 'utf8').trim();
+      } catch {
+        throw new UnauthorizedException('workspace scanner token file is unavailable');
+      }
+    }
     const configuredTokens = process.env.ANYSENTRY_WORKSPACE_SCANNER_TOKENS?.trim();
     if (configuredTokens) {
       try {
@@ -2798,6 +2811,48 @@ export class SecurityMonitoringController {
     }
   }
 
+  @Get('supply-chain/config')
+  async supplyChainConfig() {
+    return this.supplyChain.controlConfig();
+  }
+
+  @Put('supply-chain/config')
+  @RequireManagementAuth()
+  async updateSupplyChainConfig(
+    @Body() body: {
+      enabled?: boolean;
+      dailyRefreshEnabled?: boolean;
+      runtimeCorrelationEnabled?: boolean;
+      selectedWorkspaceIds?: string[];
+      runInitialScan?: boolean;
+    },
+    @Headers() headers: HeaderBag,
+  ) {
+    try {
+      const result = await this.supplyChain.setControl(body);
+      this.audit.record({
+        actor: auditActor(headers),
+        action: 'supply-chain.config.updated',
+        resourceType: 'supply-chain',
+        resourceId: 'default',
+        summary: body.runInitialScan
+          ? 'Supply-chain scanning enabled and initial scans queued'
+          : 'Supply-chain configuration updated',
+        details: {
+          enabled: result.config.enabled,
+          dailyRefreshEnabled: result.config.dailyRefreshEnabled,
+          runtimeCorrelationEnabled: result.config.runtimeCorrelationEnabled,
+          selectedWorkspaceIds: result.config.selectedWorkspaceIds,
+          queuedScanTasks: result.scanTasks?.map((task) => task.taskId) ?? [],
+          runtimeAssessmentsQueued: result.runtimeAssessmentsQueued ?? 0,
+        },
+      });
+      return result;
+    } catch (error) {
+      this.supplyChainBadRequest(error);
+    }
+  }
+
   @Get('supply-chain/overview')
   async supplyChainOverview(@Query('limit') limit?: string) {
     return this.supplyChain.overview(limit ? Number(limit) : undefined);
@@ -2848,43 +2903,43 @@ export class SecurityMonitoringController {
   @Post('top/healthCard')
   @HttpCode(200)
   healthCard(@Body() f: T.SecurityTimeFilter) {
-    return this.agg.healthCard(f);
+    return this.agg.healthCardForWindow(f);
   }
 
   @Post('top/explainabilityScan')
   @HttpCode(200)
   explainabilityScan(@Body() f: T.ExplainabilityScanRequest) {
-    return this.agg.explainabilityScan(f);
+    return this.agg.explainabilityScanForWindow(f);
   }
 
   @Post('top/performanceCard')
   @HttpCode(200)
   performanceCard(@Body() f: T.SecurityTimeFilter) {
-    return this.agg.performanceCard(f);
+    return this.agg.performanceCardForWindow(f);
   }
 
   @Post('risks/summary')
   @HttpCode(200)
   riskSummary(@Body() f: T.SecurityTimeFilter) {
-    return this.agg.riskSummary(f);
+    return this.agg.riskSummaryForWindow(f);
   }
 
   @Post('risks/breakdown')
   @HttpCode(200)
   riskBreakdown(@Body() f: T.SecurityTimeFilter) {
-    return this.agg.riskBreakdown(f);
+    return this.agg.riskBreakdownForWindow(f);
   }
 
   @Post('sessions/highestRisk')
   @HttpCode(200)
   highestRisk(@Body() f: T.SecurityTimeFilter) {
-    return this.agg.highestRiskSession(f);
+    return this.agg.highestRiskSessionForWindow(f);
   }
 
   @Post('sessions/decisionFunnel')
   @HttpCode(200)
   decisionFunnel(@Body() f: T.SecurityTimeFilter) {
-    return this.agg.decisionFunnel(f);
+    return this.agg.decisionFunnelForWindow(f);
   }
 
   @Post('sessions/agentObservability')
@@ -2896,13 +2951,22 @@ export class SecurityMonitoringController {
   @Post('sessions/workspaceRiskDistribution')
   @HttpCode(200)
   workspaceRiskDistribution(@Body() f: T.SecurityTimeFilter) {
-    return this.agg.workspaceRiskDistribution(f);
+    return this.agg.workspaceRiskDistributionForWindow(f);
   }
 
   @Post('events/list')
   @HttpCode(200)
   agentEvents(@Body() f: T.AgentEventQuery) {
-    return this.agg.agentEvents(f);
+    return this.agg.agentEventsForWindow(f);
+  }
+
+  @Post('assistant/query')
+  @HttpCode(200)
+  assistantQuery(@Body() body: T.SecurityAssistantQuery) {
+    if (!body || typeof body.question !== 'string' || !body.question.trim()) {
+      throw new BadRequestException('assistant question is required');
+    }
+    return this.assistant.answer(body);
   }
 
   @Post('events/timeline')
