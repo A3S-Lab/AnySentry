@@ -43,13 +43,9 @@ export function GovernanceLoop({
           </span>
           <strong>{active.title}</strong>
         </div>
-        <button
-          type="button"
-          onClick={restart}
-          aria-label="Replay governance loop"
-        >
+        <button type="button" onClick={restart} aria-label={labels.replay}>
           <Icon name="replay" />
-          <span>Replay</span>
+          <span>{labels.replay}</span>
         </button>
       </header>
 
@@ -183,6 +179,8 @@ export function GovernanceLoop({
           {labels.loop.map((item, index) => (
             <li key={item.number}>
               <button
+                aria-current={step === index ? 'step' : undefined}
+                aria-label={`${item.number} · ${item.title} · ${item.body}`}
                 className={
                   step === index
                     ? 'is-active'

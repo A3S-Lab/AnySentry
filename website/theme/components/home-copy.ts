@@ -20,6 +20,7 @@ export const copy = {
         aria: '一条 Agent 拟执行动作如何与意图、运行事实和系统环境汇合，并经过 L1、L2、L3 形成执行前治理结果',
         live: '运行时判断',
         trace: 'evt_8c5667a9',
+        replay: '重播判断过程',
         sequence: [
           '拟执行动作',
           '任务意图',
@@ -66,6 +67,7 @@ export const copy = {
       eyebrow: '三个数字理解 AnySentry',
       title: '四个智能体 三类规则 两段治理链路',
       body: '安全智能体负责理解与协作，审查规则覆盖系统、通信与原子行为，运行时审查与执行前控制共同形成闭环。',
+      panelLabels: ['智能体接力', '风险覆盖', '治理闭环'],
       agents: {
         value: '04',
         label: 'AI-Native 安全智能体',
@@ -111,6 +113,8 @@ export const copy = {
         body: '判断从系统边界下钻到一次原子动作，而不是只匹配危险命令。',
         detail: '/judgment/',
         detailLabel: '查看分层研判与风险分类',
+        coreLabel: '风险槽位',
+        coreMeta: 'L1 → L2 → L3',
         items: [
           {
             count: '02',
@@ -140,6 +144,9 @@ export const copy = {
         body: '已经发生的行为沉淀为规则，批准后的规则回到下一次执行边界。',
         detail: '/safety-loop/',
         detailLabel: '查看完整治理闭环',
+        pathLabel: '链路',
+        loopLabel: '一个持续闭环',
+        loopMeta: '证据 · 批准 · 控制',
         items: [
           {
             name: '运行时审查',
@@ -164,6 +171,8 @@ export const copy = {
         actionLabel: '同一个工具动作',
         action: 'read /var/run/secrets/*',
         switchLabel: '切换运行现场',
+        systemLabel: '系统现场',
+        verdictLabel: '风险结论',
         contexts: [
           {
             environment: '开发沙箱',
@@ -218,6 +227,7 @@ export const copy = {
       title: '让一次审查成为下一次执行前的控制',
       body: '运行时事实经过分层研判和人工批准形成规则；相似动作再次出现时，Runtime Guard 在系统边界前完成匹配、判断与处置。',
       detailLabel: '查看从审查到阻断的完整链路',
+      replay: '重播闭环',
       paths: [
         {
           code: '运行时审查',
@@ -369,6 +379,7 @@ export const copy = {
       body: '运行总览说明系统现在怎样，关系拓扑解释风险如何传播，Evidence Bundle 保存判断为什么成立。三个视角共享同一身份和事件上下文。',
       detailLabel: '查看五个典型使用场景',
       synthetic: '合成演示',
+      navigationLabel: '产品导航预览',
       tabs: ['运行总览', '关系拓扑', '证据包'],
       tabLabels: ['查看运行总览', '查看关系拓扑', '查看证据包'],
       nav: [
@@ -405,6 +416,7 @@ export const copy = {
       evidence: {
         label: 'Evidence Bundle',
         meta: '案件 · 时间线 · 拓扑 · 审计',
+        timeline: '事件时间线',
         scope: 'Scope / evt_8c5667…',
         events: [
           'ToolExec · metadata access',
@@ -412,6 +424,17 @@ export const copy = {
           'Guard · require approval',
           'Operator · rule approved',
         ],
+      },
+      chrome: {
+        safe: '安全',
+        risk: '风险',
+        requireApproval: '需要批准',
+        intentZone: 'Agent 与意图',
+        runtimeZone: '运行事实',
+        controlZone: '风险与控制',
+        observedEdge: '观测关系',
+        riskPropagation: '风险传播',
+        controlDecision: '控制决策',
       },
     },
     cta: {
@@ -442,6 +465,7 @@ export const copy = {
         aria: 'How a proposed Agent action joins intent, runtime facts, and system state before L1, L2, and L3 produce a preflight governance result',
         live: 'Runtime judgment',
         trace: 'evt_8c5667a9',
+        replay: 'Replay runtime judgment',
         sequence: [
           'Proposed action',
           'Task intent',
@@ -510,8 +534,9 @@ export const copy = {
     ],
     signature: {
       eyebrow: 'AnySentry in three numbers',
-      title: 'Four agents Three risk domains Two governance paths',
+      title: 'Four agents, three risk domains, two governance paths',
       body: 'Security agents collaborate at critical moments, risk domains cover the system-to-action surface, and runtime review joins preflight control in one loop.',
+      panelLabels: ['Agent relay', 'Risk coverage', 'Governance loop'],
       agents: {
         value: '04',
         label: 'AI-Native security agents',
@@ -561,6 +586,8 @@ export const copy = {
         body: 'Judgment moves from system boundaries down to one atomic action—not just dangerous-command matching.',
         detail: '/judgment/',
         detailLabel: 'Explore tiered judgment and risk taxonomy',
+        coreLabel: 'Risk slots',
+        coreMeta: 'L1 → L2 → L3',
         items: [
           {
             count: '02',
@@ -602,6 +629,9 @@ export const copy = {
         body: 'Observed behavior becomes policy; approved policy returns to the boundary of the next execution.',
         detail: '/safety-loop/',
         detailLabel: 'Explore the governance loop',
+        pathLabel: 'Path',
+        loopLabel: 'One continuous loop',
+        loopMeta: 'Evidence · Approval · Control',
         items: [
           {
             name: 'Runtime review',
@@ -638,6 +668,8 @@ export const copy = {
         actionLabel: 'The same tool action',
         action: 'read /var/run/secrets/*',
         switchLabel: 'Switch runtime context',
+        systemLabel: 'System context',
+        verdictLabel: 'Risk verdict',
         contexts: [
           {
             environment: 'Development sandbox',
@@ -698,6 +730,7 @@ export const copy = {
       title: 'Turn one review into control before the next execution',
       body: 'Runtime facts pass through tiered judgment and human approval to become policy. When a similar action returns, Runtime Guard matches, judges, and responds before the system boundary.',
       detailLabel: 'Explore the complete review-to-block path',
+      replay: 'Replay loop',
       paths: [
         {
           code: 'Runtime review',
@@ -847,10 +880,11 @@ export const copy = {
     },
     console: {
       eyebrow: 'An evidence plane you can interrogate',
-      title: 'Risk is not a red dot It is a system fact you can question',
+      title: 'Risk is not a red dot — it is a system fact you can question',
       body: 'Overview shows the current system, topology explains propagation, and Evidence Bundle preserves why the decision holds. All three views share identity and event context.',
       detailLabel: 'Explore five operating scenarios',
       synthetic: 'Synthetic demo',
+      navigationLabel: 'Product navigation preview',
       tabs: ['Overview', 'Topology', 'Evidence'],
       tabLabels: [
         'View runtime overview',
@@ -891,6 +925,7 @@ export const copy = {
       evidence: {
         label: 'Evidence Bundle',
         meta: 'Case · Timeline · Topology · Audit',
+        timeline: 'Trace timeline',
         scope: 'Scope / evt_8c5667…',
         events: [
           'ToolExec · metadata access',
@@ -898,6 +933,17 @@ export const copy = {
           'Guard · require approval',
           'Operator · rule approved',
         ],
+      },
+      chrome: {
+        safe: 'safe',
+        risk: 'risk',
+        requireApproval: 'REQUIRE APPROVAL',
+        intentZone: 'AGENT + INTENT',
+        runtimeZone: 'RUNTIME FACTS',
+        controlZone: 'RISK + CONTROL',
+        observedEdge: 'observed edge',
+        riskPropagation: 'risk propagation',
+        controlDecision: 'control decision',
       },
     },
     cta: {

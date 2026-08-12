@@ -248,6 +248,11 @@
     line-height: 1.12;
   }
 
+  .as-hero h1 > span:first-child {
+    font-size: 0.9em;
+    white-space: nowrap;
+  }
+
   .as-hero h1 > span + span {
     margin-top: 4px;
   }
@@ -800,7 +805,8 @@
 
 @media (max-width: 420px) {
   .as-hero h1 {
-    font-size: 38px;
+    font-size: clamp(35px, 9.5vw, 38px);
+    letter-spacing: -0.065em;
   }
 
   .as-decision-lens__bar code {
@@ -808,7 +814,7 @@
   }
 
   .as-decision-lens__bar {
-    grid-template-columns: minmax(0, 1fr) 38px;
+    grid-template-columns: minmax(0, 1fr) 44px;
   }
 
   .as-decision-lens__result {

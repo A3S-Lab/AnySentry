@@ -150,7 +150,7 @@ export function HomeLayout() {
             <span className="as-section-eyebrow">
               {labels.signature.eyebrow}
             </span>
-            <h2>{labels.signature.title}</h2>
+            <h2 className="as-heading-balanced">{labels.signature.title}</h2>
           </div>
           <p>{labels.signature.body}</p>
         </header>
@@ -201,7 +201,7 @@ export function HomeLayout() {
             <span className="as-section-eyebrow">
               {labels.runtimeStory.eyebrow}
             </span>
-            <h2>{labels.runtimeStory.title}</h2>
+            <h2 className="as-heading-balanced">{labels.runtimeStory.title}</h2>
             <SectionLink
               href={route('/safety-loop/')}
               label={labels.runtimeStory.detailLabel}
@@ -218,7 +218,7 @@ export function HomeLayout() {
         <header className="as-section-header" data-reveal>
           <div>
             <span className="as-section-eyebrow">{labels.loop.eyebrow}</span>
-            <h2>{labels.loop.title}</h2>
+            <h2 className="as-heading-balanced">{labels.loop.title}</h2>
             <SectionLink
               href={route('/evidence/')}
               label={labels.loop.detailLabel}
@@ -233,7 +233,7 @@ export function HomeLayout() {
         <header className="as-section-header" data-reveal>
           <div>
             <span className="as-section-eyebrow">{labels.console.eyebrow}</span>
-            <h2>{labels.console.title}</h2>
+            <h2 className="as-heading-balanced">{labels.console.title}</h2>
             <SectionLink
               href={route('/scenarios/')}
               label={labels.console.detailLabel}

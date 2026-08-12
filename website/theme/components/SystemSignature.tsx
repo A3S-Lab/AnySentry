@@ -91,7 +91,7 @@ export function SystemSignature({
           >
             <header>
               <div>
-                <span>01 · 角色接力</span>
+                <span>01 · {labels.panelLabels[0]}</span>
                 <h3>{labels.agents.title}</h3>
               </div>
               <p>{labels.agents.body}</p>
@@ -134,7 +134,7 @@ export function SystemSignature({
           >
             <header>
               <div>
-                <span>02 · 风险面</span>
+                <span>02 · {labels.panelLabels[1]}</span>
                 <h3>{labels.domains.title}</h3>
               </div>
               <p>{labels.domains.body}</p>
@@ -142,8 +142,8 @@ export function SystemSignature({
             <div className="as-risk-orbit">
               <div className="as-risk-orbit__core">
                 <strong>08</strong>
-                <span>RISK SLOTS</span>
-                <small>L1 → L2 → L3</small>
+                <span>{labels.domains.coreLabel}</span>
+                <small>{labels.domains.coreMeta}</small>
               </div>
               {labels.domains.items.map((domain, index) => (
                 <article
@@ -194,7 +194,7 @@ export function SystemSignature({
           >
             <header>
               <div>
-                <span>03 · 闭环</span>
+                <span>03 · {labels.panelLabels[2]}</span>
                 <h3>{labels.paths.title}</h3>
               </div>
               <p>{labels.paths.body}</p>
@@ -205,7 +205,9 @@ export function SystemSignature({
                   className={`as-path-loop__rail as-path-loop__rail--${pathIndex}`}
                   key={path.name}
                 >
-                  <span>PATH 0{pathIndex + 1}</span>
+                  <span>
+                    {labels.paths.pathLabel} 0{pathIndex + 1}
+                  </span>
                   <strong>{path.name}</strong>
                   <p>{path.body}</p>
                   <ol>
@@ -220,8 +222,8 @@ export function SystemSignature({
               ))}
               <div className="as-path-loop__core">
                 <Icon name="replay" />
-                <strong>ONE LOOP</strong>
-                <span>证据 · 批准 · 控制</span>
+                <strong>{labels.paths.loopLabel}</strong>
+                <span>{labels.paths.loopMeta}</span>
               </div>
             </div>
             <footer>

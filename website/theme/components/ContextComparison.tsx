@@ -74,7 +74,9 @@ export function ContextComparison({
         <div className="as-context-stage__system">
           <div className="as-context-stage__grid" aria-hidden="true" />
           <header>
-            <span>SYSTEM CONTEXT / 0{step + 1}</span>
+            <span>
+              {labels.comparison.systemLabel} / 0{step + 1}
+            </span>
             <strong>{active.tone}</strong>
           </header>
           <div className="as-context-stage__host">
@@ -105,7 +107,7 @@ export function ContextComparison({
           <span>
             {step === 0 ? <Icon name="check" /> : <Icon name="shield" />}
           </span>
-          <small>VERDICT</small>
+          <small>{labels.comparison.verdictLabel}</small>
           <strong>{active.verdict}</strong>
           <p>{active.reason}</p>
         </div>

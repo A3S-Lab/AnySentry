@@ -55,13 +55,13 @@ const homepageChecks = [
     ],
   ],
   [
-    englishIndexHtml,
+    englishIndexHtml.replaceAll('&mdash;', '—'),
     [
       'Judge every Agent action',
-      'Four agents Three risk domains Two governance paths',
+      'Four agents, three risk domains, two governance paths',
       'The same action means something different in a different system context',
       'Turn one review into control before the next execution',
-      'Risk is not a red dot It is a system fact you can question',
+      'Risk is not a red dot — it is a system fact you can question',
     ],
   ],
 ];

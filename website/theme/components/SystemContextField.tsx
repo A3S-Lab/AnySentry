@@ -37,29 +37,21 @@ export function SystemContextField({
           {labels.live}
         </span>
         <code>{labels.trace}</code>
-        <button
-          type="button"
-          onClick={restart}
-          aria-label="Replay runtime judgment"
-        >
+        <button type="button" onClick={restart} aria-label={labels.replay}>
           <Icon name="replay" />
         </button>
       </header>
 
-      <div
-        className="as-decision-lens__progress"
-        role="tablist"
-        aria-label={labels.aria}
-      >
+      <div className="as-decision-lens__progress" aria-label={labels.aria}>
         {labels.sequence.map((item, index) => (
           <button
-            aria-selected={step === index}
+            aria-current={step === index ? 'step' : undefined}
+            aria-label={`0${index + 1} · ${item}`}
             className={
               step === index ? 'is-active' : index < step ? 'is-complete' : ''
             }
             key={item}
             onClick={() => setStep(index)}
-            role="tab"
             type="button"
           >
             <span>0{index + 1}</span>

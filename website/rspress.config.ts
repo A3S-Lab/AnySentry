@@ -10,7 +10,7 @@ export default defineConfig({
   siteOrigin,
   title: 'AnySentry',
   description:
-    'An evidence and governance plane for AI agent runtime security: observe actual behavior, judge risk, investigate context, and take auditable action.',
+    'AI-Native runtime security and governance that judges Agent actions with intent, runtime facts, and system context.',
   lang: 'zh',
   icon: '/favicon.svg',
   logo: '/anysentry-logo-horizontal-reversed.svg',
@@ -23,18 +23,18 @@ export default defineConfig({
       label: '简体中文',
       title: 'AnySentry',
       description:
-        '面向 AI Agent 运行时的证据与治理平面：观测真实行为、判断风险、调查上下文并执行可审计动作。',
+        '面向 AI-Native 系统的运行时安全与治理平面，将 Agent 意图、运行事实与系统现场汇入同一判断上下文。',
     },
     {
       lang: 'en',
       label: 'English',
       title: 'AnySentry',
       description:
-        'An evidence and governance plane for AI agent runtime security: observe actual behavior, judge risk, investigate context, and take auditable action.',
+        'AI-Native runtime security and governance that judges Agent actions with intent, runtime facts, and system context.',
     },
   ],
   head: [
-    ['meta', { name: 'theme-color', content: '#080b0d' }],
+    ['meta', { name: 'theme-color', content: '#05090e' }],
     ['meta', { property: 'og:type', content: 'website' }],
     ['meta', { property: 'og:site_name', content: 'AnySentry' }],
     [

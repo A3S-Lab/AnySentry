@@ -6,7 +6,13 @@ import { withBase } from '@rspress/core/runtime';
 
 type ConsoleLabels = HomeLabels['console'];
 
-function Overview({ labels }: { labels: ConsoleLabels['overview'] }) {
+function Overview({
+  labels,
+  chrome,
+}: {
+  labels: ConsoleLabels['overview'];
+  chrome: ConsoleLabels['chrome'];
+}) {
   return (
     <div className="as-console-view as-console-overview">
       <div className="as-console-view__title">
@@ -97,10 +103,10 @@ function Overview({ labels }: { labels: ConsoleLabels['overview'] }) {
             <div className="as-chart__legend">
               <span>
                 <i />
-                98 safe
+                98 {chrome.safe}
               </span>
               <span>
-                <i />2 risk
+                <i />2 {chrome.risk}
               </span>
             </div>
           </div>
@@ -133,7 +139,7 @@ function Overview({ labels }: { labels: ConsoleLabels['overview'] }) {
           </div>
           <div className="as-tier-result">
             <span>GUARD</span>
-            <strong>REQUIRE APPROVAL</strong>
+            <strong>{chrome.requireApproval}</strong>
           </div>
         </div>
       </div>
@@ -141,7 +147,13 @@ function Overview({ labels }: { labels: ConsoleLabels['overview'] }) {
   );
 }
 
-function Topology({ labels }: { labels: ConsoleLabels['topology'] }) {
+function Topology({
+  labels,
+  chrome,
+}: {
+  labels: ConsoleLabels['topology'];
+  chrome: ConsoleLabels['chrome'];
+}) {
   return (
     <div className="as-console-view as-console-topology">
       <div className="as-console-view__title">
@@ -166,13 +178,13 @@ function Topology({ labels }: { labels: ConsoleLabels['topology'] }) {
       </div>
       <div className="as-topology-map">
         <div className="as-topology-zone as-topology-zone--intent">
-          AGENT + INTENT
+          {chrome.intentZone}
         </div>
         <div className="as-topology-zone as-topology-zone--runtime">
-          RUNTIME FACTS
+          {chrome.runtimeZone}
         </div>
         <div className="as-topology-zone as-topology-zone--control">
-          RISK + CONTROL
+          {chrome.controlZone}
         </div>
         <svg
           aria-hidden="true"
@@ -267,13 +279,13 @@ function Topology({ labels }: { labels: ConsoleLabels['topology'] }) {
         </div>
         <div className="as-topology-legend">
           <span>
-            <i /> observed edge
+            <i /> {chrome.observedEdge}
           </span>
           <span>
-            <i /> risk propagation
+            <i /> {chrome.riskPropagation}
           </span>
           <span>
-            <i /> control decision
+            <i /> {chrome.controlDecision}
           </span>
         </div>
       </div>
@@ -297,7 +309,7 @@ function Evidence({ labels }: { labels: ConsoleLabels['evidence'] }) {
         <div className="as-evidence-primary">
           <div className="as-card-title">
             <Icon name="timeline" />
-            <span>Trace timeline</span>
+            <span>{labels.timeline}</span>
             <code>4</code>
           </div>
           <div className="as-evidence-timeline">
@@ -438,10 +450,7 @@ export function ProductConsole({ labels }: { labels: ConsoleLabels }) {
         </div>
       </div>
       <div className="as-product-window__body">
-        <aside
-          className="as-product-nav"
-          aria-label="Product navigation preview"
-        >
+        <aside className="as-product-nav" aria-label={labels.navigationLabel}>
           {labels.nav.map((item, index) => (
             <span
               className={
@@ -474,8 +483,12 @@ export function ProductConsole({ labels }: { labels: ConsoleLabels }) {
           id="as-product-panel"
           role="tabpanel"
         >
-          {step === 0 && <Overview labels={labels.overview} />}
-          {step === 1 && <Topology labels={labels.topology} />}
+          {step === 0 && (
+            <Overview labels={labels.overview} chrome={labels.chrome} />
+          )}
+          {step === 1 && (
+            <Topology labels={labels.topology} chrome={labels.chrome} />
+          )}
           {step === 2 && <Evidence labels={labels.evidence} />}
         </div>
       </div>

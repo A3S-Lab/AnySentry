@@ -376,7 +376,7 @@
 }
 
 .as-agent-story__replay {
-  min-height: 36px;
+  min-height: 44px;
   display: inline-flex;
   padding: 0 12px;
   border: 1px solid var(--as-line-strong);
@@ -4060,8 +4060,8 @@
   }
 
   .as-agent-story__replay {
-    width: 36px;
-    min-height: 34px;
+    width: 44px;
+    min-height: 44px;
     padding: 0;
   }
 
