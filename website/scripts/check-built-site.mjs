@@ -3,6 +3,7 @@ import path from 'node:path';
 
 const buildRoot = new URL('../doc_build/', import.meta.url);
 const requiredFiles = [
+  '404.html',
   'index.html',
   'en/index.html',
   'guide/index.html',
@@ -37,6 +38,34 @@ const englishIndexHtml = await readFile(
   new URL('en/index.html', buildRoot),
   'utf8',
 );
+
+const builtBase = indexHtml.match(
+  /(?:href|src)="(\/[^"<>]*?)static\/(?:css|js)\//,
+)?.[1];
+
+if (!builtBase?.endsWith('/')) {
+  throw new Error('Unable to determine the built site base path.');
+}
+
+const htmlFiles = requiredFiles.filter((file) => file.endsWith('.html'));
+for (const file of htmlFiles) {
+  const html = await readFile(new URL(file, buildRoot), 'utf8');
+  const localUrls = [...html.matchAll(/(?:href|src)="(\/[^"]+)"/g)].map(
+    (match) => match[1],
+  );
+  const escapedBaseUrls = localUrls.filter(
+    (url) => !url.startsWith('//') && !url.startsWith(builtBase),
+  );
+
+  if (escapedBaseUrls.length > 0) {
+    throw new Error(
+      `Built page ${file} contains URLs outside ${builtBase}: ${[
+        ...new Set(escapedBaseUrls),
+      ].join(', ')}`,
+    );
+  }
+}
+
 for (const marker of ['AnySentry', 'social-card.svg', 'search']) {
   if (!indexHtml.toLowerCase().includes(marker.toLowerCase())) {
     throw new Error(`Built homepage is missing marker: ${marker}`);
@@ -108,5 +137,5 @@ if (searchIndexes.length < 2) {
 }
 
 console.log(
-  `Built site verified: ${requiredFiles.length} required files and ${searchIndexes.length} search indexes.`,
+  `Built site verified at ${builtBase}: ${requiredFiles.length} required files and ${searchIndexes.length} search indexes.`,
 );

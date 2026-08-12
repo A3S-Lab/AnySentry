@@ -376,6 +376,7 @@
 }
 
 .as-agent-story__replay {
+  min-width: 44px;
   min-height: 44px;
   display: inline-flex;
   padding: 0 12px;

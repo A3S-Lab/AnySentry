@@ -782,6 +782,89 @@
     display: none;
   }
 
+  .as-product-window__bar {
+    min-height: 0;
+    padding: 14px;
+    gap: 12px;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .as-product-window__signals {
+    display: none;
+  }
+
+  .as-product-window__status {
+    min-width: 0;
+  }
+
+  .as-product-window__status > span:first-child {
+    display: none;
+  }
+
+  .as-product-tabs {
+    width: 100%;
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .as-product-tabs button {
+    min-width: 0;
+    flex: 1 1 0;
+  }
+
+  .as-product-window__body {
+    min-height: 0;
+    grid-template-columns: 1fr;
+  }
+
+  .as-product-nav {
+    display: none;
+  }
+
+  .as-product-panel {
+    overflow: hidden;
+  }
+
+  .as-console-view {
+    min-height: 0;
+    padding: 18px 14px 22px;
+  }
+
+  .as-overview-stats,
+  .as-topology-counts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .as-overview-bottom,
+  .as-evidence-layout {
+    min-height: 0;
+    grid-template-columns: 1fr;
+  }
+
+  .as-tier-card {
+    min-height: 340px;
+  }
+
+  .as-console-topology {
+    overflow-x: auto;
+  }
+
+  .as-console-topology .as-console-view__title,
+  .as-console-topology .as-topology-counts {
+    position: sticky;
+    left: 0;
+    width: 100%;
+  }
+
+  .as-topology-map {
+    min-width: 650px;
+  }
+
+  .as-evidence-side {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: repeat(2, minmax(105px, 1fr));
+  }
+
   .as-cta {
     min-height: 0;
     padding: 42px 24px;
@@ -827,5 +910,61 @@
 
   .as-context-compare__action code {
     max-width: 210px;
+  }
+
+  .as-product-brand small {
+    display: none;
+  }
+
+  .as-product-window__bar > .as-product-window__status {
+    justify-self: end;
+  }
+
+  .as-product-tabs button {
+    padding-right: 7px;
+    padding-left: 7px;
+  }
+
+  .as-console-view__title {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .as-console-view__title > span:not(.as-live-chip) {
+    line-height: 1.5;
+  }
+
+  .as-stat {
+    min-height: 102px;
+  }
+
+  .as-chart {
+    height: 278px;
+    padding-right: 12px;
+  }
+
+  .as-chart svg {
+    height: 195px;
+  }
+
+  .as-evidence-timeline {
+    padding-right: 10px;
+    padding-left: 44px;
+  }
+
+  .as-evidence-timeline::before {
+    left: 27px;
+  }
+
+  .as-evidence-event > span {
+    left: -35px;
+  }
+
+  .as-evidence-event {
+    grid-template-columns: 1fr;
+  }
+
+  .as-evidence-event > code {
+    justify-self: start;
   }
 }

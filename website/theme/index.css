@@ -149,13 +149,20 @@ body {
   font-weight: 560;
 }
 
+.rp-nav-menu__item__container,
+.rp-social-links__item {
+  min-width: 44px;
+  min-height: 44px;
+  justify-content: center;
+}
+
 .rp-nav-menu__item:hover {
   color: #f2f8f7;
 }
 
 .rp-search-button {
   min-width: 184px;
-  height: 40px;
+  min-height: 44px;
   border-color: rgba(137, 169, 190, 0.24);
   border-radius: 10px;
   background: rgba(9, 16, 24, 0.78);
@@ -164,6 +171,11 @@ body {
     border-color 180ms ease,
     background 180ms ease,
     box-shadow 180ms ease;
+}
+
+.rp-nav-hamburger {
+  min-width: 44px;
+  min-height: 44px;
 }
 
 .rp-search-button:hover {
@@ -1448,7 +1460,7 @@ body {
 
 .as-risk-orbit {
   position: relative;
-  min-height: 435px;
+  min-height: 490px;
   margin-top: 32px;
 }
 
@@ -1475,8 +1487,8 @@ body {
   top: 50%;
   left: 50%;
   display: flex;
-  width: 190px;
-  height: 190px;
+  width: 176px;
+  height: 176px;
   border: 1px solid rgba(76, 219, 207, 0.46);
   border-radius: 50%;
   background:

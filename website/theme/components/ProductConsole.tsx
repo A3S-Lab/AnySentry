@@ -394,6 +394,7 @@ export function ProductConsole({ labels }: { labels: ConsoleLabels }) {
   return (
     <div
       className="as-product-window"
+      data-step={step}
       onBlur={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget))
           setPaused(false);

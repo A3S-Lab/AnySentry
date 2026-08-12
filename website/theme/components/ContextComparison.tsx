@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState, type KeyboardEvent } from 'react';
 import type { HomeLabels } from './home-copy';
 import { Icon } from './icons';
 import { useAnimatedSequence } from './useAnimatedSequence';
@@ -9,12 +9,34 @@ export function ContextComparison({
   labels: HomeLabels['context'];
 }) {
   const [paused, setPaused] = useState(false);
+  const tabsRef = useRef<Array<HTMLButtonElement | null>>([]);
   const { containerRef, setStep, step } = useAnimatedSequence({
     interval: 5200,
     length: labels.comparison.contexts.length,
     paused,
   });
   const active = labels.comparison.contexts[step];
+
+  const moveFocus = (index: number) => {
+    setStep(index);
+    tabsRef.current[index]?.focus();
+  };
+
+  const onKeyDown = (
+    event: KeyboardEvent<HTMLButtonElement>,
+    index: number,
+  ) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    if (event.key === 'Home') return moveFocus(0);
+    if (event.key === 'End')
+      return moveFocus(labels.comparison.contexts.length - 1);
+    const direction = event.key === 'ArrowRight' ? 1 : -1;
+    moveFocus(
+      (index + direction + labels.comparison.contexts.length) %
+        labels.comparison.contexts.length,
+    );
+  };
 
   return (
     <div
@@ -55,7 +77,12 @@ export function ContextComparison({
               id={`as-context-tab-${index}`}
               key={context.environment}
               onClick={() => setStep(index)}
+              onKeyDown={(event) => onKeyDown(event, index)}
+              ref={(node) => {
+                tabsRef.current[index] = node;
+              }}
               role="tab"
+              tabIndex={step === index ? 0 : -1}
               type="button"
             >
               <span>0{index + 1}</span>
