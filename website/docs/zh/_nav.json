@@ -1,0 +1,47 @@
+[
+  {
+    "text": "安全闭环",
+    "link": "/safety-loop/"
+  },
+  {
+    "text": "AI-Native 智能体",
+    "link": "/ai-native/"
+  },
+  {
+    "text": "分层研判",
+    "link": "/judgment/"
+  },
+  {
+    "text": "架构",
+    "link": "/architecture/"
+  },
+  {
+    "text": "场景",
+    "link": "/scenarios/"
+  },
+  {
+    "text": "快速开始",
+    "link": "/guide/"
+  },
+  {
+    "text": "资源",
+    "items": [
+      {
+        "text": "事件与证据",
+        "link": "/evidence/"
+      },
+      {
+        "text": "GitHub",
+        "link": "https://github.com/A3S-Lab/AnySentry"
+      },
+      {
+        "text": "部署手册",
+        "link": "https://github.com/A3S-Lab/AnySentry/blob/main/deploy/README.md"
+      },
+      {
+        "text": "Agent API Skill",
+        "link": "https://github.com/A3S-Lab/AnySentry/tree/main/integrations/skills/anysentry-api"
+      }
+    ]
+  }
+]

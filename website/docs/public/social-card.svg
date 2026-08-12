@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
+  <title id="title">AnySentry</title>
+  <desc id="desc">Runtime evidence, risk decisions, and governed actions for AI agents.</desc>
+  <defs>
+    <linearGradient id="glow" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#2dd4bf" stop-opacity=".22"/>
+      <stop offset=".55" stop-color="#0b0f12" stop-opacity="0"/>
+      <stop offset="1" stop-color="#fb7185" stop-opacity=".13"/>
+    </linearGradient>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0H0V48" fill="none" stroke="#fff" stroke-opacity=".045"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="630" rx="30" fill="#080b0d"/>
+  <rect width="1200" height="630" rx="30" fill="url(#grid)"/>
+  <rect width="1200" height="630" rx="30" fill="url(#glow)"/>
+  <g transform="translate(70 68)">
+    <path d="M34 0 64 12v22c0 18-11 31-30 37C15 65 4 52 4 34V12L34 0Z" fill="#0b2622" stroke="#2dd4bf" stroke-width="4"/>
+    <path d="m19 35 10 9 21-23" fill="none" stroke="#d8fff8" stroke-linecap="round" stroke-linejoin="round" stroke-width="5"/>
+  </g>
+  <text x="160" y="119" fill="#f4f8f7" font-family="Inter,Arial,sans-serif" font-size="42" font-weight="720">AnySentry</text>
+  <text x="70" y="250" fill="#f4f8f7" font-family="Inter,Arial,sans-serif" font-size="70" font-weight="730" letter-spacing="-3">Evidence before action.</text>
+  <text x="70" y="320" fill="#92a09b" font-family="Inter,Arial,sans-serif" font-size="31">Observe what agents actually do. Judge risk.</text>
+  <text x="70" y="363" fill="#92a09b" font-family="Inter,Arial,sans-serif" font-size="31">Turn every decision into an auditable action.</text>
+  <g font-family="ui-monospace,monospace" font-size="18" font-weight="650">
+    <rect x="70" y="440" width="205" height="47" rx="9" fill="#0b2622" stroke="#21675e"/>
+    <text x="92" y="470" fill="#5eead4">RUNTIME EVIDENCE</text>
+    <path d="M295 464h64" stroke="#47605a" stroke-width="2"/>
+    <path d="m350 456 9 8-9 8" fill="none" stroke="#47605a" stroke-width="2"/>
+    <rect x="382" y="440" width="180" height="47" rx="9" fill="#2a220d" stroke="#765b10"/>
+    <text x="405" y="470" fill="#fde68a">RISK DECISION</text>
+    <path d="M582 464h64" stroke="#5f5550" stroke-width="2"/>
+    <path d="m637 456 9 8-9 8" fill="none" stroke="#5f5550" stroke-width="2"/>
+    <rect x="669" y="440" width="234" height="47" rx="9" fill="#2d151b" stroke="#7c3544"/>
+    <text x="691" y="470" fill="#fecdd3">GOVERNED ACTION</text>
+  </g>
+  <text x="70" y="564" fill="#64716d" font-family="ui-monospace,monospace" font-size="18">eBPF · JSON · CloudEvents · OTLP · Progressive API</text>
+</svg>
