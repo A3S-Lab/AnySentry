@@ -220,6 +220,12 @@ function verifyObserverManifest() {
     daemonSet?.source,
   );
   assert(
+    'Observer DaemonSet mounts a hot-reloadable low-trust runtime signature document',
+    /agent-runtime-signatures\.json/u.test(observerText) &&
+      /\{\s*name:\s*ANYSENTRY_AGENT_RUNTIME_SIGNATURES_FILE,\s*value:\s*"\/etc\/anysentry\/agent-runtime-signatures\.json"\s*\}/u.test(daemonSet?.source ?? ''),
+    daemonSet?.source,
+  );
+  assert(
     'Observer DaemonSet pipes observe-only collector output into the Node forwarder',
     /command:\s*\["\/bin\/sh",\s*"-c"\]/u.test(daemonSet?.source ?? '') &&
       /args:\s*\["a3s-observer-collector \| node \/opt\/observer-forward\.js"\]/u.test(daemonSet?.source ?? ''),
@@ -263,6 +269,7 @@ function verifyObserverForwarderDockerfile() {
   );
   assert('Observer forwarder image bundles scripts/observer-forward.js', /^COPY scripts\/observer-forward\.js \/opt\/observer-forward\.js$/mu.test(dockerfile), dockerfile);
   assert('Observer forwarder image bundles PID attribution', /^COPY scripts\/observer-agent-attribution\.js \/opt\/observer-agent-attribution\.js$/mu.test(dockerfile), dockerfile);
+  assert('Observer forwarder image bundles dynamic runtime signatures', /^COPY scripts\/observer-agent-runtime-signatures\.js \/opt\/observer-agent-runtime-signatures\.js$/mu.test(dockerfile), dockerfile);
   assert('Observer forwarder image bundles ToolExec deduplication', /^COPY scripts\/observer-event-dedup\.js \/opt\/observer-event-dedup\.js$/mu.test(dockerfile), dockerfile);
   assert('Observer forwarder image bundles workload-first filtering', /^COPY scripts\/observer-workload-filter\.js \/opt\/observer-workload-filter\.js$/mu.test(dockerfile), dockerfile);
   assert('Observer forwarder image bundles infrastructure root filtering', /^COPY scripts\/observer-infrastructure-roots\.js \/opt\/observer-infrastructure-roots\.js$/mu.test(dockerfile), dockerfile);

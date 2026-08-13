@@ -2,6 +2,11 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const {
+  RuntimeSignatureRegistry,
+  defaultSignatureDocument,
+  legacyRootNameDocument,
+} = require('./observer-agent-runtime-signatures');
 
 const DEFAULT_ROOT_NAMES = 'codex,a3s,a3s-code,a3s code,claude,claude-code,claude code';
 const DEFAULT_MAX_PROCS = 20_000;
@@ -150,6 +155,16 @@ class AgentAttributor {
       (this.builtinHintsEnabled ? DEFAULT_ROOT_NAMES : '');
     this.rootNames = new Set(text(configuredRootNames)
       .split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
+    this.signatureRegistry = options.signatureRegistry instanceof RuntimeSignatureRegistry
+      ? options.signatureRegistry
+      : new RuntimeSignatureRegistry(
+          options.rootNames != null || process.env.ANYSENTRY_AGENT_ROOT_NAMES != null
+            ? legacyRootNameDocument(configuredRootNames)
+            : this.builtinHintsEnabled
+              ? defaultSignatureDocument()
+              : legacyRootNameDocument(''),
+          { source: options.rootNames != null ? 'legacy-option' : 'builtin' },
+        );
     this.procs = new Map();
     this.tombstones = new Map();
     this.tombstoneTtlMs =
@@ -196,12 +211,16 @@ class AgentAttributor {
 
     let roots = 0;
     for (const info of snapshot.values()) {
-      const agentId = this.matchAgentExecutable(info);
-      if (!agentId) continue;
+      const directAgent = this.matchAgentExecutable(info);
+      if (!directAgent) continue;
       this.remember({
         ...info,
         state: 'agent',
-        agentId,
+        agentId: directAgent.agentId,
+        agentDisplayName: directAgent.displayName || directAgent.agentId,
+        signatureRuleId: directAgent.ruleId,
+        registryVersion: directAgent.registryVersion,
+        registryHash: directAgent.registryHash,
         rootPid: info.tgid || info.pid,
         workspacePath: this.resolveWorkspace(info.cwd).workspacePath,
         lastSeen: now,
@@ -618,23 +637,37 @@ class AgentAttributor {
     // prompts such as "Actor: a3s code" misclassify an ordinary node process as an Agent.
     const tokens = argv.split(/\s+/).filter(Boolean);
     const command = basename(tokens[0]);
-    if (command === 'codex') return 'codex';
-    if (command === 'a3s-code' || (command === 'a3s' && tokens[1] === 'code')) return 'a3s code';
-    if (command === 'claude' || command === 'claude-code' || (command === 'claude' && tokens[1] === 'code')) return 'Claude Code';
-    return undefined;
-  }
-
-  matchAgentExecutable(info) {
-    const candidates = [basename(info.comm), basename(info.exe)];
-    for (const root of this.rootNames) {
-      if (candidates.includes(root)) return canonicalAgentName(root);
+    if (command === 'codex') return { agentId: 'codex', displayName: 'Codex' };
+    if (command === 'a3s-code' || (command === 'a3s' && tokens[1] === 'code')) {
+      return { agentId: 'a3s code', displayName: 'A3S Code' };
+    }
+    if (command === 'claude' || command === 'claude-code' || (command === 'claude' && tokens[1] === 'code')) {
+      return { agentId: 'claude-code', displayName: 'Claude Code' };
     }
     return undefined;
   }
 
+  matchAgentExecutable(info) {
+    return this.signatureRegistry.match(info);
+  }
+
   rememberAgent(info, agentId, rootPid, reason, source, inheritedWorkspacePath) {
+    const match = typeof agentId === 'object' && agentId
+      ? agentId
+      : { agentId, displayName: agentId };
     const workspace = this.resolveWorkspace(info.workspacePath || info.cwd, inheritedWorkspacePath);
-    const record = { ...info, state: 'agent', agentId, rootPid, ...workspace, lastSeen: this.now() };
+    const record = {
+      ...info,
+      state: 'agent',
+      agentId: match.agentId,
+      agentDisplayName: match.displayName || match.agentId,
+      signatureRuleId: match.ruleId,
+      registryVersion: match.registryVersion,
+      registryHash: match.registryHash,
+      rootPid,
+      ...workspace,
+      lastSeen: this.now(),
+    };
     this.remember(record);
     return {
       state: 'agent',
@@ -642,13 +675,17 @@ class AgentAttributor {
       attribution: {
         monitored: true,
         classification: 'probable_agent',
-        agentScopeId: agentId,
-        agentDisplayName: agentId,
+        agentScopeId: match.agentId,
+        agentDisplayName: match.displayName || match.agentId,
         rootPid,
         confidence: source === 'process_graph' ? 0.9 : 0.85,
         reason,
         source,
-        evidence: [source === 'process_graph' ? 'process_lineage:agent_root' : 'process_signature:command'],
+        evidence: source === 'process_graph'
+          ? ['process_lineage:agent_root']
+          : match.evidence?.length
+            ? match.evidence
+            : ['process_signature:command'],
         ...(workspace.workspaceConflict ? { conflict: true } : {}),
       },
     };
@@ -665,7 +702,7 @@ class AgentAttributor {
         monitored: true,
         classification: 'probable_agent',
         agentScopeId: record.agentId,
-        agentDisplayName: record.agentId,
+        agentDisplayName: record.agentDisplayName || record.agentId,
         rootPid: record.rootPid,
         confidence: 0.9,
         reason: 'process_lineage',
@@ -838,6 +875,7 @@ class AgentAttributor {
     return {
       processes: this.procs.size,
       tombstones: this.tombstones.size,
+      runtimeSignatures: this.signatureRegistry.metrics(),
       ...this.stats,
     };
   }

@@ -19,6 +19,19 @@ data:
       "schemaVersion": "anysentry.agent_templates.v1",
       "templates": []
     }
+  agent-runtime-signatures.json: |
+    {
+      "schemaVersion": "anysentry.agent_runtime_signatures.v1",
+      "version": 1,
+      "runtimes": [
+        { "id": "codex", "displayName": "Codex", "variants": [{ "commExact": ["codex"] }] },
+        { "id": "a3s-code", "agentScopeId": "a3s code", "displayName": "A3S Code", "variants": [{ "commExact": ["a3s", "a3s-code", "a3s code"] }] },
+        { "id": "claude-code", "agentScopeId": "Claude Code", "displayName": "Claude Code", "variants": [{ "commExact": ["claude", "claude-code", "claude code"] }] },
+        { "id": "gemini-cli", "displayName": "Gemini CLI", "variants": [{ "commExact": ["gemini", "gemini-cli", "gemini cli"] }] },
+        { "id": "pi", "displayName": "Pi", "variants": [{ "commExact": ["pi"] }] },
+        { "id": "kimi-cli", "displayName": "Kimi Code CLI", "variants": [{ "commExact": ["Kimi Code"] }] }
+      ]
+    }
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -70,6 +83,10 @@ spec:
             - { name: ANYSENTRY_IDENTITY_SNAPSHOT_URL, value: "http://anysentry:29653/security-center/identity/snapshot" }
             - { name: ANYSENTRY_IDENTITY_SNAPSHOT_SECS, value: "15" }
             - { name: ANYSENTRY_AGENT_TEMPLATES_FILE, value: "/etc/anysentry/agent-templates.json" }
+            # Low-trust exact process signatures hot-reload to probable_agent only. ConfigMap
+            # projection is read-only; operators update it with kubectl, while directory watch plus
+            # periodic hash polling handles Kubernetes' atomic `..data` symlink rotation.
+            - { name: ANYSENTRY_AGENT_RUNTIME_SIGNATURES_FILE, value: "/etc/anysentry/agent-runtime-signatures.json" }
             # Bound memory and amortize HTTP/JSON overhead without adding perceptible UI delay.
             - { name: FORWARD_BATCH_SIZE, value: "32" }
             - { name: FORWARD_BATCH_FLUSH_MS, value: "50" }

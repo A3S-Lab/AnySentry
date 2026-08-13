@@ -15,6 +15,11 @@ const crypto = require('node:crypto');
 const readline = require('node:readline');
 const { AgentAttributor } = require('./observer-agent-attribution');
 const { AgentTemplateRegistry, loadTemplateDocument } = require('./observer-agent-templates');
+const {
+  RuntimeSignatureRegistry,
+  RuntimeSignatureReloader,
+  loadSignatureDocument,
+} = require('./observer-agent-runtime-signatures');
 const { DockerDiscovery } = require('./observer-docker-discovery');
 const { BehavioralAgentDetector } = require('./observer-behavior-discovery');
 const { BoundedPriorityQueue } = require('./observer-priority-queue');
@@ -104,7 +109,19 @@ try {
   console.error(`[observer-forward] agent templates ignored: ${error.message}`);
 }
 const templateRegistry = new AgentTemplateRegistry(templateDocument);
-const attributor = new AgentAttributor();
+let signatureDocument;
+let signatureLoadErrors = 0;
+try {
+  signatureDocument = loadSignatureDocument();
+} catch (error) {
+  signatureLoadErrors++;
+  signatureDocument = loadSignatureDocument({ env: {} });
+  console.error(`[observer-forward] Agent runtime signatures ignored: ${error.message}`);
+}
+const signatureRegistry = new RuntimeSignatureRegistry(signatureDocument.document, {
+  source: signatureDocument.source,
+});
+const attributor = new AgentAttributor({ signatureRegistry });
 const workloadCache = new WorkloadIdentityCache({ templateRegistry });
 const dockerDiscovery = new DockerDiscovery({
   nodeName: NODE_NAME,
@@ -149,6 +166,7 @@ let closing = false;
 let heartbeatTimer;
 let identitySnapshotTimer;
 let batchTimer;
+let signatureReloader;
 let rl;
 
 function isNoise(o) {
@@ -422,6 +440,7 @@ function sendHeartbeat(done = () => {}) {
 }
 
 function closeTransports() {
+  signatureReloader?.close();
   dockerDiscovery.stop();
   infrastructureResolver.close();
   httpAgent.destroy();
@@ -621,6 +640,30 @@ async function start() {
   });
 
   console.error(`[observer-forward] agent templates: source=${templateRegistry.source}; loaded=${templateRegistry.metrics().loaded}; invalid=${templateRegistry.metrics().invalid + templateLoadErrors}`);
+  const signatureFile = process.env.ANYSENTRY_AGENT_RUNTIME_SIGNATURES_FILE?.trim();
+  if (signatureFile) {
+    signatureReloader = new RuntimeSignatureReloader({
+      registry: signatureRegistry,
+      filePath: signatureFile,
+      onReload: (reload) => {
+        const reconciliation = attributor.seedFromProc();
+        console.error(
+          `[observer-forward] Agent runtime signatures reloaded: version=${reload.version}; ` +
+          `hash=${reload.hash}; scanned=${reconciliation.scanned}; roots=${reconciliation.roots}`,
+        );
+      },
+      onError: (error) => {
+        signatureLoadErrors++;
+        console.error(`[observer-forward] Agent runtime signatures reload ignored: ${error.message}`);
+      },
+    });
+    signatureReloader.start();
+  }
+  console.error(
+    `[observer-forward] Agent runtime signatures: source=${signatureRegistry.source}; ` +
+    `version=${signatureRegistry.version}; loaded=${signatureRegistry.metrics().loaded}; ` +
+    `hash=${signatureRegistry.hash}`,
+  );
   const dockerStarted = await dockerDiscovery.start((snapshot) => workloadCache.replace(snapshot, 'docker'));
   const docker = dockerDiscovery.metrics();
   console.error(`[observer-forward] docker discovery: enabled=${docker.enabled}; started=${dockerStarted}; socket=${dockerDiscovery.socketPath}`);
