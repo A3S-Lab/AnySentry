@@ -12,8 +12,9 @@
 const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
+const fs = require('node:fs');
 const readline = require('node:readline');
-const { AgentAttributor } = require('./observer-agent-attribution');
+const { AgentAttributor, readProcStartTime } = require('./observer-agent-attribution');
 const { mergeAttributionClassifications } = require('./observer-attribution-merge');
 const { AgentTemplateRegistry, loadTemplateDocument } = require('./observer-agent-templates');
 const {
@@ -56,6 +57,14 @@ function defaultRuntimeSnapshotUrl(ingestUrl) {
   return url;
 }
 
+function defaultRuntimeLeaseUrl(runtimeSnapshotUrl) {
+  const url = new URL(runtimeSnapshotUrl.toString());
+  const nextPath = url.pathname.replace(/\/runtime\/snapshot(?:\/.*)?$/, '/runtime/lease');
+  url.pathname = nextPath === url.pathname ? '/security-center/runtime/lease' : nextPath;
+  url.hash = '';
+  return url;
+}
+
 function defaultBatchIngestUrl(ingestUrl) {
   const url = new URL(ingestUrl.toString());
   const nextPath = url.pathname.replace(/\/ingest(?:\/.*)?$/, '/ingest/batch');
@@ -84,7 +93,7 @@ const LEGACY_FORWARD_SCOPE = ['agent', 'all', 'shadow'].includes(process.env.FOR
   : undefined;
 const FILTER_MODE = ['enforce', 'shadow'].includes(process.env.FORWARD_FILTER_MODE)
   ? process.env.FORWARD_FILTER_MODE
-  : LEGACY_FORWARD_SCOPE === 'shadow' ? 'shadow' : 'enforce';
+  : LEGACY_FORWARD_SCOPE === 'agent' ? 'enforce' : 'shadow';
 const RETAIN_UNKNOWN = envBoolean(process.env.FORWARD_RETAIN_UNKNOWN, true);
 const RETAIN_NON_AGENT = envBoolean(process.env.FORWARD_RETAIN_NON_AGENT, false);
 const NOISE_POLICY = ['balanced', 'include'].includes(process.env.FORWARD_NOISE_POLICY)
@@ -121,6 +130,43 @@ const ROOT_LIVENESS_SECS = boundedNumber(
 const runtimeSnapshotTarget = new URL(
   process.env.ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL || defaultRuntimeSnapshotUrl(target),
 );
+
+function observerForwarderProcessIdentity() {
+  const hostPid = positiveInteger(process.env.A3S_OBSERVER_FORWARDER_HOST_PID);
+  const pid = hostPid || process.pid;
+  const startTime = readProcStartTime(pid)
+    // In a nested PID namespace NSpid exposes the host PID, while /proc only exposes the local
+    // PID. Both names refer to the same process and therefore share one boot-relative start tick.
+    || readProcStartTime(process.pid);
+  return {
+    pid,
+    startTimeTicks: startTime || '0',
+  };
+}
+
+function resolveObserverForwarderHostPid() {
+  if (positiveInteger(process.env.A3S_OBSERVER_FORWARDER_HOST_PID)) return;
+  try {
+    const status = fs.readFileSync('/proc/self/status', 'utf8');
+    const nspid = status.match(/^NSpid:\s+(.+)$/mu)?.[1]
+      ?.trim()
+      .split(/\s+/u)
+      .map(Number)
+      .filter((value) => Number.isSafeInteger(value) && value > 0);
+    // With hostPID / `pid: host`, this is normally a single PID. Nested PID namespaces expose
+    // outermost -> innermost values; ProcessKey uses the host-visible outermost value.
+    const hostPid = nspid?.[0];
+    if (hostPid) process.env.A3S_OBSERVER_FORWARDER_HOST_PID = String(hostPid);
+  } catch {}
+}
+
+function positiveInteger(value) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+const runtimeLeaseTarget = new URL(
+  process.env.ANYSENTRY_AGENT_RUNTIME_LEASE_URL || defaultRuntimeLeaseUrl(runtimeSnapshotTarget),
+);
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_INFLIGHT });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_INFLIGHT });
 let templateDocument;
@@ -143,7 +189,10 @@ try {
   signatureLoadErrors++;
   console.error(`[observer-forward] Agent runtime signatures ignored: ${error.message}`);
 }
-const attributor = new AgentAttributor({ signatureRegistry });
+const attributor = new AgentAttributor({
+  signatureRegistry,
+  hostId: process.env.A3S_OBSERVER_HOST_ID || NODE_NAME,
+});
 const workloadCache = new WorkloadIdentityCache({ templateRegistry });
 const dockerDiscovery = new DockerDiscovery({
   nodeName: NODE_NAME,
@@ -195,7 +244,16 @@ let rl;
 let runtimeSnapshotVersion = 0;
 let runtimeSnapshotPosts = 0;
 let runtimeSnapshotErrors = 0;
+let runtimeSnapshotRejected = 0;
+let runtimeSnapshotDuplicates = 0;
 let lastRuntimeSnapshotAt = '';
+let lastRuntimeSnapshotError = '';
+let runtimeLeaseEpoch;
+let runtimeLeaseAttempts = 0;
+let runtimeLeaseErrors = 0;
+let runtimeLeaseFenced = false;
+let runtimeLeasePromise;
+let runtimeSnapshotInFlight = false;
 let reconcileTimer;
 let reconcileRunning = false;
 let reconcilePending = false;
@@ -306,6 +364,80 @@ function postJson(url, bodyObj, timeoutMs, done) {
   req.end(body);
 }
 
+/**
+ * POST a bounded JSON control-plane request and parse its business acknowledgement.
+ * Event batches intentionally keep using `postJson`: only lease/snapshot traffic needs the body.
+ */
+function postJsonResponse(url, bodyObj, timeoutMs, done) {
+  const isHttps = url.protocol === 'https:';
+  const transport = isHttps ? https : http;
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    done(new Error(`unsupported protocol ${url.protocol}`));
+    return;
+  }
+  const body = JSON.stringify(bodyObj);
+  let settled = false;
+  const finish = (error, value) => {
+    if (settled) return;
+    settled = true;
+    done(error, value);
+  };
+  const req = transport.request(
+    {
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: `${url.pathname}${url.search}`,
+      method: 'POST',
+      agent: isHttps ? httpsAgent : httpAgent,
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        ...sourceHeaders(),
+      },
+    },
+    (res) => {
+      let data = '';
+      let oversized = false;
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        if (oversized) return;
+        if (Buffer.byteLength(data) + Buffer.byteLength(chunk) > 64 * 1024) {
+          oversized = true;
+          data = '';
+          return;
+        }
+        data += chunk;
+      });
+      res.on('end', () => {
+        if ((res.statusCode || 500) >= 400) {
+          finish(new Error(`control endpoint returned ${res.statusCode}`));
+          return;
+        }
+        if (oversized) {
+          finish(new Error('control endpoint response exceeds 64 KiB'));
+          return;
+        }
+        try {
+          const parsed = data ? JSON.parse(data) : undefined;
+          finish(undefined, parsed?.data ?? parsed);
+        } catch {
+          finish(new Error('control endpoint returned invalid JSON'));
+        }
+      });
+    },
+  );
+  req.on('error', (error) => finish(error));
+  req.setTimeout(timeoutMs, () => {
+    finish(new Error('control endpoint request timed out'));
+    req.destroy();
+  });
+  req.end(body);
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function getJson(url, timeoutMs, done) {
   const isHttps = url.protocol === 'https:';
   const transport = isHttps ? https : http;
@@ -364,12 +496,90 @@ function refreshIdentitySnapshot() {
   });
 }
 
+function runtimeLeaseRequest() {
+  return new Promise((resolve) => {
+    runtimeLeaseAttempts++;
+    const processIdentity = observerForwarderProcessIdentity();
+    postJsonResponse(
+      runtimeLeaseTarget,
+      {
+        collectorId: COLLECTOR_ID || NODE_NAME || 'observer-forwarder',
+        forwarderInstanceId,
+        hostId: attributor.hostId,
+        bootId: attributor.bootId,
+        forwarderPid: processIdentity.pid,
+        forwarderStartTimeTicks: processIdentity.startTimeTicks,
+      },
+      5_000,
+      (error, ack) => {
+        if (error) {
+          resolve({ ok: false, reason: error.message, transient: true });
+          return;
+        }
+        const epoch = Number(ack?.leaseEpoch);
+        if (ack?.accepted !== true || !Number.isSafeInteger(epoch) || epoch < 1) {
+          resolve({
+            ok: false,
+            reason: typeof ack?.reason === 'string' && ack.reason.trim()
+              ? ack.reason.trim().slice(0, 500)
+              : 'runtime lease rejected',
+            reasonCode: typeof ack?.reasonCode === 'string' ? ack.reasonCode : '',
+            transient: false,
+          });
+          return;
+        }
+        runtimeLeaseEpoch = epoch;
+        runtimeLeaseFenced = false;
+        lastRuntimeSnapshotError = '';
+        resolve({ ok: true });
+      },
+    );
+  });
+}
+
+async function acquireRuntimeLease(maxAttempts = 1) {
+  if (runtimeLeaseFenced) return false;
+  if (Number.isSafeInteger(runtimeLeaseEpoch) && runtimeLeaseEpoch > 0) return true;
+  if (runtimeLeasePromise) return runtimeLeasePromise;
+  runtimeLeasePromise = (async () => {
+    const attempts = Math.max(1, Math.min(3, Number(maxAttempts) || 1));
+    for (let attempt = 0; attempt < attempts && !closing; attempt += 1) {
+      const result = await runtimeLeaseRequest();
+      if (result.ok) return true;
+      runtimeLeaseErrors++;
+      errorCount++;
+      lastRuntimeSnapshotError = result.reason;
+      console.error(`[observer-forward] Agent runtime lease unavailable: ${result.reason}`);
+      if (['lease_epoch_stale', 'lease_owner_mismatch', 'stale_forwarder'].includes(result.reasonCode)) {
+        // A server fencing decision is final for this process instance. Retrying the same
+        // identity every snapshot interval would create a control-plane retry loop and could
+        // contend with the replacement that already owns the collector.
+        runtimeLeaseFenced = true;
+        runtimeLeaseEpoch = undefined;
+        return false;
+      }
+      // `collector_conflict` is intentionally retryable on the next snapshot interval: a new
+      // host/boot is allowed to take over after the old lease TTL. It must not consume the
+      // immediate startup retry budget while the old lease is still fresh.
+      if (!result.transient || attempt + 1 >= attempts) return false;
+      await delay(250 * (2 ** attempt));
+    }
+    return false;
+  })();
+  try {
+    return await runtimeLeasePromise;
+  } finally {
+    runtimeLeasePromise = undefined;
+  }
+}
+
 function runtimeSnapshotBody(ready = true) {
   runtimeSnapshotVersion += 1;
   return {
     ...attributor.runtimeSnapshot(),
     collectorId: COLLECTOR_ID || NODE_NAME || 'observer-forwarder',
     forwarderInstanceId,
+    leaseEpoch: runtimeLeaseEpoch,
     snapshotVersion: runtimeSnapshotVersion,
     ready,
     intervalSecs: RUNTIME_SNAPSHOT_SECS,
@@ -378,14 +588,71 @@ function runtimeSnapshotBody(ready = true) {
 }
 
 function sendRuntimeSnapshot(ready = true, done = () => {}) {
-  postJson(runtimeSnapshotTarget, runtimeSnapshotBody(ready), 5_000, (failed) => {
-    runtimeSnapshotPosts++;
-    lastRuntimeSnapshotAt = new Date().toISOString();
-    if (failed) {
-      runtimeSnapshotErrors++;
-      errorCount++;
-    }
+  if (runtimeLeaseFenced) {
+    done(true);
+    return;
+  }
+  if (runtimeSnapshotInFlight) {
+    done(false);
+    return;
+  }
+  runtimeSnapshotInFlight = true;
+  const finish = (failed) => {
+    runtimeSnapshotInFlight = false;
     done(Boolean(failed));
+  };
+  void (async () => {
+    if (!Number.isSafeInteger(runtimeLeaseEpoch) || runtimeLeaseEpoch < 1) {
+      if (closing || !(await acquireRuntimeLease(1))) {
+        finish(true);
+        return;
+      }
+    }
+    const body = runtimeSnapshotBody(ready);
+    runtimeSnapshotPosts++;
+    postJsonResponse(runtimeSnapshotTarget, body, 5_000, (error, ack) => {
+      if (error) {
+        runtimeSnapshotErrors++;
+        errorCount++;
+        lastRuntimeSnapshotError = error.message;
+        finish(true);
+        return;
+      }
+      if (ack?.accepted !== true || (ack?.applied !== true && ack?.duplicate !== true)) {
+        const reason = typeof ack?.reason === 'string' && ack.reason.trim()
+          ? ack.reason.trim().slice(0, 500)
+          : 'runtime snapshot rejected';
+        const reasonCode = typeof ack?.reasonCode === 'string' ? ack.reasonCode : '';
+        runtimeSnapshotRejected++;
+        runtimeSnapshotErrors++;
+        errorCount++;
+        lastRuntimeSnapshotError = reason;
+        if (reasonCode === 'lease_not_found') {
+          // The API may have restarted and lost its in-memory lease table. A fresh server-issued
+          // epoch is safe; retry on the next bounded snapshot cycle.
+          runtimeLeaseEpoch = undefined;
+        } else if (
+          ['lease_epoch_stale', 'lease_owner_mismatch', 'stale_forwarder', 'collector_conflict'].includes(reasonCode)
+          || /\b(?:fenced|superseded)\b/iu.test(reason)
+        ) {
+          // A fenced process must never automatically acquire a newer epoch and steal ownership
+          // back from its replacement. Event forwarding remains available until normal shutdown.
+          runtimeLeaseFenced = true;
+          runtimeLeaseEpoch = undefined;
+        }
+        finish(true);
+        return;
+      }
+      if (ack.duplicate === true) runtimeSnapshotDuplicates++;
+      lastRuntimeSnapshotAt = new Date().toISOString();
+      lastRuntimeSnapshotError = '';
+      finish(false);
+    });
+  })().catch((error) => {
+    runtimeSnapshotErrors++;
+    errorCount++;
+    lastRuntimeSnapshotError = error instanceof Error ? error.message : String(error);
+    finish(true);
   });
 }
 
@@ -571,7 +838,14 @@ function sendHeartbeat(done = () => {}) {
         runtimeReconcileLastDurationMs: reconciliationMetrics.lastDurationMs,
         runtimeSnapshotPosts,
         runtimeSnapshotErrors,
+        runtimeSnapshotRejected,
+        runtimeSnapshotDuplicates,
         lastRuntimeSnapshotAt: lastRuntimeSnapshotAt || undefined,
+        lastRuntimeSnapshotError: lastRuntimeSnapshotError || undefined,
+        runtimeLeaseEpoch,
+        runtimeLeaseAttempts,
+        runtimeLeaseErrors,
+        runtimeLeaseFenced,
         infrastructure: classifications.infrastructure,
         workspaceConflict: classifications.workspaceConflict,
       },
@@ -785,6 +1059,7 @@ function handleLine(raw) {
 }
 
 async function start() {
+  resolveObserverForwarderHostPid();
   const infrastructure = await infrastructureResolver.resolve();
   attributor.setInfrastructureRoots(infrastructure.roots);
   const bootstrap = attributor.seedFromProc();
@@ -838,7 +1113,11 @@ async function start() {
     identitySnapshotTimer = setInterval(refreshIdentitySnapshot, IDENTITY_SNAPSHOT_SECS * 1000);
     identitySnapshotTimer.unref();
   }
-  sendRuntimeSnapshot(true);
+  // Lifecycle reporting is an independent control plane. Lease acquisition runs in the
+  // background so an unavailable API never holds up stdin consumption or observer backpressure.
+  void acquireRuntimeLease(3).then((acquired) => {
+    if (acquired && !closing) sendRuntimeSnapshot(true);
+  });
   runtimeSnapshotTimer = setInterval(() => sendRuntimeSnapshot(true), RUNTIME_SNAPSHOT_SECS * 1_000);
   runtimeSnapshotTimer.unref();
   rootLivenessTimer = setInterval(() => attributor.checkRootLiveness(), ROOT_LIVENESS_SECS * 1_000);

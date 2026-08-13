@@ -62,12 +62,14 @@ services:
       ANYSENTRY_INGEST_URL: ${ANYSENTRY_DOCKER_INGEST_URL:-http://host.docker.internal:29653/security-center/ingest}
       ANYSENTRY_BATCH_INGEST_URL: ${ANYSENTRY_DOCKER_BATCH_INGEST_URL:-http://host.docker.internal:29653/security-center/ingest/batch}
       ANYSENTRY_IDENTITY_SNAPSHOT_URL: ${ANYSENTRY_DOCKER_IDENTITY_URL:-http://host.docker.internal:29653/security-center/identity/snapshot}
+      ANYSENTRY_AGENT_RUNTIME_LEASE_URL: ${ANYSENTRY_DOCKER_RUNTIME_LEASE_URL:-http://host.docker.internal:29653/security-center/runtime/lease}
+      ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL: ${ANYSENTRY_DOCKER_RUNTIME_SNAPSHOT_URL:-http://host.docker.internal:29653/security-center/runtime/snapshot}
       ANYSENTRY_SOURCE_TYPE: observer
       ANYSENTRY_SOURCE_NAME: agent-runtime-lab-docker-native-observer
       ANYSENTRY_HEARTBEAT_SECS: "5"
       ANYSENTRY_IDENTITY_SNAPSHOT_SECS: "5"
       ANYSENTRY_DOCKER_DISCOVERY: "on"
-      FORWARD_FILTER_MODE: enforce
+      FORWARD_FILTER_MODE: ${FORWARD_FILTER_MODE:-shadow}
       FORWARD_RETAIN_UNKNOWN: "false"
       FORWARD_RETAIN_NON_AGENT: "false"
       FORWARD_NOISE_POLICY: balanced

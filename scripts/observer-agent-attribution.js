@@ -144,7 +144,11 @@ function readTextFile(file, fallback = '') {
 }
 
 function defaultHostId() {
-  return readTextFile('/etc/machine-id', text(process.env.A3S_OBSERVER_HOST_ID) || 'local-host');
+  return text(process.env.A3S_OBSERVER_HOST_ID)
+    || text(process.env.A3S_NODE_NAME)
+    || text(process.env.NODE_NAME)
+    || text(process.env.K8S_NODE_NAME)
+    || readTextFile('/etc/machine-id', 'local-host');
 }
 
 function defaultBootId(procRoot = '/proc') {

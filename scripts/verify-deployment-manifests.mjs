@@ -205,8 +205,8 @@ function verifyObserverManifest() {
     daemonSet?.source,
   );
   assert(
-    'Observer DaemonSet independently retains Unknown, drops non-Agent, and filters routine noise',
-    /\{\s*name:\s*FORWARD_FILTER_MODE,\s*value:\s*"enforce"\s*\}/u.test(daemonSet?.source ?? '') &&
+    'Observer DaemonSet starts in shadow while measuring Unknown, non-Agent, and routine-noise decisions',
+    /\{\s*name:\s*FORWARD_FILTER_MODE,\s*value:\s*"shadow"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_RETAIN_UNKNOWN,\s*value:\s*"true"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_RETAIN_NON_AGENT,\s*value:\s*"false"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_NOISE_POLICY,\s*value:\s*"balanced"\s*\}/u.test(daemonSet?.source ?? ''),
@@ -227,7 +227,8 @@ function verifyObserverManifest() {
   );
   assert(
     'Observer DaemonSet reports independent runtime snapshots outside event ingest',
-    /\{\s*name:\s*ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL,\s*value:\s*"http:\/\/anysentry:29653\/security-center\/runtime\/snapshot"\s*\}/u.test(daemonSet?.source ?? '') &&
+    /\{\s*name:\s*ANYSENTRY_AGENT_RUNTIME_LEASE_URL,\s*value:\s*"http:\/\/anysentry:29653\/security-center\/runtime\/lease"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL,\s*value:\s*"http:\/\/anysentry:29653\/security-center\/runtime\/snapshot"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_SECS,\s*value:\s*"10"\s*\}/u.test(daemonSet?.source ?? ''),
     daemonSet?.source,
   );

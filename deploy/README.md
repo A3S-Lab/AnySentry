@@ -155,13 +155,13 @@ so every node appears as a stable Collector. The bundled forwarder also emits so
 heartbeats every `ANYSENTRY_HEARTBEAT_SECS` seconds; with no explicit `ANYSENTRY_SOURCE_ID`,
 AnySentry discovers one observer Source per node/collector automatically.
 
-The manifest independently configures `FORWARD_FILTER_MODE=enforce`,
+The manifest initially configures `FORWARD_FILTER_MODE=shadow`,
 `FORWARD_RETAIN_UNKNOWN=true`, `FORWARD_RETAIN_NON_AGENT=false`, and
 `FORWARD_NOISE_POLICY=balanced`. The forwarder checks the versioned Kubernetes workload
 snapshot before host process signatures and PID ancestry. A generic `node` or `python` process in
 an Agent container is therefore attributed by Pod UID + full Container ID, while a sidecar can be
-classified separately. Unknown identities remain observable; only positively identified
-non-Agent events are filtered. Events are sent in bounded batches (32 events or 50 ms), and
+classified separately. Unknown identities and positively identified non-Agent decisions remain
+observable during this comparison. Events are sent in bounded batches (32 events or 50 ms), and
 heartbeats report classification, cache, queue, batch, filtered, and dropped counters.
 Routine `/proc`, `/sys`, `/run`, and `/dev` `FileAccess` noise is evaluated independently of the
 identity class; high-value deletion and security events remain observable.
@@ -176,7 +176,8 @@ metadata:
     anysentry.io/agent-container: agent
 ```
 
-Set `FORWARD_FILTER_MODE=shadow` to compare would-drop counters without dropping. For a temporary
+After local, Docker, and Kubernetes comparison passes, set `FORWARD_FILTER_MODE=enforce` to apply
+those decisions. For a temporary
 unfiltered recovery view, set `FORWARD_RETAIN_NON_AGENT=true` and `FORWARD_NOISE_POLICY=include`;
 this does not change identity classification or risk routing.
 

@@ -74,7 +74,13 @@ async function runConfig(label, env = {}) {
       if (request.url === '/security-center/ingest/batch') batches.push(...(parsed.events ?? []));
       if (request.url === '/security-center/collectors/heartbeat') heartbeats.push(parsed);
       response.writeHead(200, { 'Content-Type': 'application/json' });
-      response.end('{"accepted":true}');
+      if (request.url === '/security-center/runtime/lease') {
+        response.end('{"accepted":true,"leaseEpoch":1}');
+      } else if (request.url === '/security-center/runtime/snapshot') {
+        response.end('{"accepted":true,"applied":true,"duplicate":false}');
+      } else {
+        response.end('{"accepted":true}');
+      }
     });
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -181,7 +187,13 @@ async function runManualReviewRecovery() {
       if (request.url === '/security-center/ingest/batch') batches.push(...(parsed.events ?? []));
       if (request.url === '/security-center/collectors/heartbeat') heartbeats.push(parsed);
       response.writeHead(200, { 'Content-Type': 'application/json' });
-      response.end('{"accepted":true}');
+      if (request.url === '/security-center/runtime/lease') {
+        response.end('{"accepted":true,"leaseEpoch":1}');
+      } else if (request.url === '/security-center/runtime/snapshot') {
+        response.end('{"accepted":true,"applied":true,"duplicate":false}');
+      } else {
+        response.end('{"accepted":true}');
+      }
     });
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -255,6 +267,12 @@ assert.equal(shadow.heartbeat.filterMetrics.wouldFilterNonAgent, 1);
 assert.equal(shadow.heartbeat.filterMetrics.wouldFilterNoise, 1);
 assert.equal(shadow.heartbeat.filterMetrics.filteredNonAgent, 0);
 assert.equal(shadow.heartbeat.filterMetrics.filteredNoise, 0);
+
+const safeDefault = await runConfig('safe-default', { FORWARD_FILTER_MODE: '' });
+assert.equal(safeDefault.heartbeat.filterMetrics.filterMode, 'shadow');
+assert.equal(safeDefault.batches.length, 6, 'an unset filter mode must fail safe to shadow');
+assert.equal(safeDefault.heartbeat.filterMetrics.filteredNonAgent, 0);
+assert.equal(safeDefault.heartbeat.filterMetrics.wouldFilterNonAgent, 1);
 
 const defaultRetention = await runConfig('default');
 assert.equal(defaultRetention.batches.length, 4);

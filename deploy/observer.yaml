@@ -75,7 +75,9 @@ spec:
             - { name: ANYSENTRY_HEARTBEAT_SECS, value: "30" }
             # Retain unresolved identities for later review, stop reviewed non-Agents, and keep
             # routine pseudo-filesystem noise independent from identity classification.
-            - { name: FORWARD_FILTER_MODE, value: "enforce" }
+            # Roll out new attribution in shadow first. Switch this to `enforce` only after the
+            # real local/Docker/Kubernetes comparison meets the documented acceptance gates.
+            - { name: FORWARD_FILTER_MODE, value: "shadow" }
             - { name: FORWARD_RETAIN_UNKNOWN, value: "true" }
             - { name: FORWARD_RETAIN_NON_AGENT, value: "false" }
             - { name: FORWARD_NOISE_POLICY, value: "balanced" }
@@ -87,6 +89,7 @@ spec:
             # projection is read-only; operators update it with kubectl, while directory watch plus
             # periodic hash polling handles Kubernetes' atomic `..data` symlink rotation.
             - { name: ANYSENTRY_AGENT_RUNTIME_SIGNATURES_FILE, value: "/etc/anysentry/agent-runtime-signatures.json" }
+            - { name: ANYSENTRY_AGENT_RUNTIME_LEASE_URL, value: "http://anysentry:29653/security-center/runtime/lease" }
             - { name: ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL, value: "http://anysentry:29653/security-center/runtime/snapshot" }
             - { name: ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_SECS, value: "10" }
             - { name: ANYSENTRY_AGENT_RUNTIME_LIVENESS_SECS, value: "5" }

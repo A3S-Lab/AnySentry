@@ -9,6 +9,23 @@ const { ToolExecDeduper } = require('./observer-event-dedup.js');
 const { DiscoveryBudget, WorkloadIdentityCache } = require('./observer-workload-filter.js');
 const { InfrastructureRootResolver, staticRoots } = require('./observer-infrastructure-roots.js');
 
+{
+  const previousHostId = process.env.A3S_OBSERVER_HOST_ID;
+  const previousNodeName = process.env.A3S_NODE_NAME;
+  delete process.env.A3S_OBSERVER_HOST_ID;
+  process.env.A3S_NODE_NAME = 'node-identity-test';
+  const judge = new AgentAttributor({ readProc: () => undefined, listPids: () => [] });
+  assert.equal(
+    judge.hostId,
+    'node-identity-test',
+    'ProcessKey host identity must follow the collector/node identity before a container machine-id',
+  );
+  if (previousHostId === undefined) delete process.env.A3S_OBSERVER_HOST_ID;
+  else process.env.A3S_OBSERVER_HOST_ID = previousHostId;
+  if (previousNodeName === undefined) delete process.env.A3S_NODE_NAME;
+  else process.env.A3S_NODE_NAME = previousNodeName;
+}
+
 function observerEvent({
   agent = 'process',
   pid,
