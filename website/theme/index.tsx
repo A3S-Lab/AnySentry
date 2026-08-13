@@ -1,7 +1,7 @@
 import './index.css';
 import './agent-runtime-story.css';
-import './product-console.css';
 import './responsive.css';
+import './homepage-v2.css';
 
 export { HomeLayout } from './components/HomeLayout';
 export { Nav } from './components/Nav';

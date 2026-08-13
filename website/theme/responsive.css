@@ -1,6 +1,6 @@
 @media (max-width: 1240px) {
   .as-hero {
-    grid-template-columns: minmax(420px, 0.82fr) minmax(580px, 1.18fr);
+    grid-template-columns: minmax(520px, 0.92fr) minmax(0, 1.08fr);
   }
 
   .as-hero__copy {
@@ -41,10 +41,21 @@
     padding: 27px;
   }
 
-  .as-cta,
-  .as-footer {
+  .as-cta {
     margin-right: 48px;
     margin-left: 48px;
+  }
+
+  .as-trust-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .as-trust-card:nth-child(2) {
+    border-right: 0;
+  }
+
+  .as-trust-card:nth-child(-n + 2) {
+    border-bottom: 1px solid var(--as-line);
   }
 }
 
@@ -61,8 +72,8 @@
   }
 
   .as-hero__copy {
-    min-height: 680px;
-    padding: 82px 64px 66px;
+    min-height: 620px;
+    padding: 76px 64px 62px;
     border-right: 0;
     border-bottom: 1px solid var(--as-line);
   }
@@ -81,8 +92,8 @@
   }
 
   .as-hero__visual {
-    min-height: 760px;
-    padding: 52px 64px;
+    min-height: 700px;
+    padding: 44px 64px;
   }
 
   .as-proof-strip {
@@ -243,13 +254,13 @@
 
   .as-hero h1 {
     margin-top: 26px;
-    font-size: clamp(38px, 10.5vw, 48px);
+    font-size: clamp(42px, 11vw, 48px);
     letter-spacing: -0.06em;
     line-height: 1.12;
   }
 
   .as-hero h1 > span:first-child {
-    font-size: 0.9em;
+    font-size: 1em;
     white-space: nowrap;
   }
 
@@ -292,7 +303,7 @@
   }
 
   .as-decision-lens {
-    border-radius: 14px;
+    border-radius: var(--as-radius-lg);
   }
 
   .as-decision-lens__bar {
@@ -308,7 +319,7 @@
 
   .as-decision-lens__progress {
     overflow-x: auto;
-    grid-template-columns: repeat(6, minmax(104px, 1fr));
+    grid-template-columns: repeat(4, minmax(122px, 1fr));
   }
 
   .as-decision-lens__body {
@@ -865,6 +876,26 @@
     grid-template-rows: repeat(2, minmax(105px, 1fr));
   }
 
+  .as-trust-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .as-trust-card,
+  .as-trust-card:nth-child(2) {
+    min-height: 0;
+    border-right: 0;
+    border-bottom: 1px solid var(--as-line);
+  }
+
+  .as-trust-card:last-child {
+    border-bottom: 0;
+  }
+
+  .as-trust-card h3,
+  .as-trust-card > p {
+    min-height: 0;
+  }
+
   .as-cta {
     min-height: 0;
     padding: 42px 24px;
@@ -888,7 +919,7 @@
 
 @media (max-width: 420px) {
   .as-hero h1 {
-    font-size: clamp(35px, 9.5vw, 38px);
+    font-size: clamp(40px, 11vw, 44px);
     letter-spacing: -0.065em;
   }
 

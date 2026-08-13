@@ -9,7 +9,7 @@
 .as-product-window {
   overflow: hidden;
   border: 1px solid #344148;
-  border-radius: 14px;
+  border-radius: var(--as-radius-lg);
   background: #080c0e;
   box-shadow:
     0 35px 100px rgba(0, 0, 0, 0.36),
@@ -22,7 +22,7 @@
   max-width: var(--as-content);
   margin: 0 auto;
   border-color: var(--as-line-strong);
-  border-radius: 18px;
+  border-radius: var(--as-radius-lg);
   background: #050b11;
   box-shadow:
     0 36px 110px rgba(0, 0, 0, 0.38),
@@ -911,7 +911,7 @@
 .as-product-window {
   position: relative;
   border-color: #46555d;
-  border-radius: 17px;
+  border-radius: var(--as-radius-lg);
   background: #070b0e;
   box-shadow:
     0 45px 120px rgba(0, 0, 0, 0.44),

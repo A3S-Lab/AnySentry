@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { withBase } from '@rspress/core/runtime';
 import { Icon } from './icons';
 import {
   CHAPTER_INDEX,
@@ -397,10 +396,7 @@ function Scene({
   locale: 'en' | 'zh';
 }) {
   const text = sceneText[locale];
-  const finaleTagline =
-    locale === 'zh'
-      ? '一次风险判断 进入下一次执行前的控制'
-      : 'ONE DECISION BECOMES CONTROL BEFORE THE NEXT EXECUTION';
+  const finale = finaleCopy[locale];
   const scanState = getStageState(chapterIndex, 'scan');
   const revealState = getStageState(chapterIndex, 'reveal');
   const officeState = getStageState(chapterIndex, 'reveal', 'command');
@@ -1437,24 +1433,20 @@ function Scene({
 
       <g className={`finale-layer ${finaleState}`}>
         <rect className="finale-scrim" width="1440" height="810" />
-        <image
-          className="finale-mark"
-          href={withBase('/anysentry-mark-reversed.svg')}
-          x="602"
-          y="214"
-          width="236"
-          height="236"
-        />
-        <image
-          className="finale-logo"
-          href={withBase('/anysentry-logo-horizontal-reversed.svg')}
-          x="570"
-          y="465"
-          width="300"
-          height="75"
-        />
-        <text className="finale-tagline" x="720" y="594">
-          {finaleTagline}
+        <text className="finale-kicker" x="720" y="302">
+          {finale.kicker}
+        </text>
+        <text className="finale-statement" x="720" y="389">
+          <tspan x="720" dy="0">
+            {finale.lineOne}
+          </tspan>
+          <tspan x="720" dy="72">
+            {finale.lineTwo}
+          </tspan>
+        </text>
+        <path className="finale-divider" d="M624 506h192" />
+        <text className="finale-path" x="720" y="554">
+          {finale.path}
         </text>
       </g>
 
@@ -1483,6 +1475,21 @@ const sceneText = {
     implant: 'REMOTE PAYLOAD IMPLANT',
     execute: 'EXECUTE REMOTE TASK',
     retry: 'RETRY EXECUTION',
+  },
+} as const;
+
+const finaleCopy = {
+  zh: {
+    kicker: '治理闭环完成 / RUNTIME GOVERNANCE',
+    lineOne: '一次被看见的风险',
+    lineTwo: '在下一次执行前被治理',
+    path: '观测 · 研判 · 批准 · 执行前控制',
+  },
+  en: {
+    kicker: 'GOVERNANCE LOOP COMPLETE',
+    lineOne: 'A RISK SEEN ONCE',
+    lineTwo: 'BECOMES CONTROL BEFORE EXECUTION',
+    path: 'OBSERVE · JUDGE · APPROVE · GUARD',
   },
 } as const;
 
@@ -1601,9 +1608,6 @@ export function AgentRuntimeStory({ locale }: AgentRuntimeStoryProps) {
     >
       <header className="as-agent-story__header">
         <div className="as-agent-story__identity">
-          <span className="as-agent-story__mark" aria-hidden="true">
-            <img alt="" src={withBase('/anysentry-mark-reversed.svg')} />
-          </span>
           <div>
             <span>{labels.eyebrow}</span>
             <strong>{labels.title}</strong>

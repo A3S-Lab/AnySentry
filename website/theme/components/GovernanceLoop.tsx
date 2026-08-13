@@ -21,7 +21,6 @@ export function GovernanceLoop({
       className="as-governance-sequence"
       data-path={active.path}
       data-step={step}
-      data-reveal
       onBlur={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget))
           setPaused(false);

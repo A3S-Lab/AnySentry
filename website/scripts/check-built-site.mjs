@@ -76,21 +76,37 @@ const homepageChecks = [
   [
     indexHtml,
     [
-      '把 Agent 的每一次行动',
-      '四个智能体 三类规则 两段治理链路',
-      '同一个动作 在不同系统现场中得到不同结论',
-      '让一次审查成为下一次执行前的控制',
-      '风险不是一个红点 而是一条可追问的系统事实',
+      '接入智能体',
+      '可观测平台',
+      'AnySentry 把 Agent 意图、工具调用、内核事件和主机状态汇入同一证据链，在运行中发现风险，及时阻断。',
+      'WHAT YOU GET · 核心能力',
+      '从运行事实',
+      '到执行前控制',
+      '一次风险如何',
+      '从发现走向阻断',
+      '一条事件如何保留',
+      '每一步判断依据',
+      '让一次审查成为',
+      '下一次执行前的控制',
+      '接入什么、依据什么、何时生效',
+      '都能被验证',
     ],
   ],
   [
     englishIndexHtml.replaceAll('&mdash;', '—'),
     [
-      'Judge every Agent action',
-      'Four agents, three risk domains, two governance paths',
-      'The same action means something different in a different system context',
-      'Turn one review into control before the next execution',
-      'Risk is not a red dot — it is a system fact you can question',
+      'Connect Agents to',
+      'observability platform',
+      'From runtime facts',
+      'to control before execution',
+      'How one risk travels',
+      'from discovery to prevention',
+      'How one event preserves',
+      'every basis for judgment',
+      'Turn one review into control',
+      'before the next execution',
+      'Verify what enters, what supports a verdict',
+      'and when control applies',
     ],
   ],
 ];
@@ -115,14 +131,24 @@ const [chineseMarkdown, englishMarkdown] = await Promise.all([
 ]);
 
 if (
-  !chineseMarkdown.includes('把 Agent 的每一次行动') ||
-  !chineseMarkdown.includes('四个角色进入四个关键节点') ||
-  !chineseMarkdown.includes('两段链路构成一个持续治理闭环') ||
-  !englishMarkdown.includes('Judge every Agent action') ||
-  !englishMarkdown.includes('Four roles at four critical moments') ||
-  !englishMarkdown.includes('Two paths form one continuous control loop') ||
-  chineseMarkdown.length < 1_000 ||
-  englishMarkdown.length < 2_000
+  !chineseMarkdown.includes('接入智能体可观测平台') ||
+  !chineseMarkdown.includes('从运行事实到执行前控制') ||
+  !chineseMarkdown.includes('一次风险如何从发现走向阻断') ||
+  !chineseMarkdown.includes('让一次审查成为下一次执行前的控制') ||
+  !chineseMarkdown.includes('接入什么、依据什么、何时生效，都能被验证') ||
+  !englishMarkdown.includes('Connect Agents to an observability platform') ||
+  !englishMarkdown.includes('From runtime facts to control before execution') ||
+  !englishMarkdown.includes(
+    'How one risk travels from discovery to prevention',
+  ) ||
+  !englishMarkdown.includes(
+    'Turn one review into control before the next execution',
+  ) ||
+  !englishMarkdown.includes(
+    'Verify what enters, what supports a verdict, and when control applies',
+  ) ||
+  chineseMarkdown.length < 450 ||
+  englishMarkdown.length < 1_200
 ) {
   throw new Error('Homepage Markdown fallback is incomplete.');
 }

@@ -8,16 +8,16 @@
       <stop offset="1" stop-color="#0a1c2c"/>
     </linearGradient>
     <radialGradient id="tealGlow" cx="0" cy="0" r="1" gradientTransform="translate(165 135) rotate(44) scale(510 430)" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#2dd4bf" stop-opacity=".19"/>
-      <stop offset="1" stop-color="#2dd4bf" stop-opacity="0"/>
+      <stop stop-color="#8b7cff" stop-opacity=".22"/>
+      <stop offset="1" stop-color="#8b7cff" stop-opacity="0"/>
     </radialGradient>
     <radialGradient id="blueGlow" cx="0" cy="0" r="1" gradientTransform="translate(1045 514) rotate(-139) scale(520 390)" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#4da7f4" stop-opacity=".22"/>
-      <stop offset="1" stop-color="#4da7f4" stop-opacity="0"/>
+      <stop stop-color="#63d5ff" stop-opacity=".2"/>
+      <stop offset="1" stop-color="#63d5ff" stop-opacity="0"/>
     </radialGradient>
     <linearGradient id="accent" x1="0" x2="1">
-      <stop stop-color="#70f0dd"/>
-      <stop offset="1" stop-color="#72c7ff"/>
+      <stop stop-color="#b2aaff"/>
+      <stop offset="1" stop-color="#63d5ff"/>
     </linearGradient>
     <pattern id="grid" width="54" height="54" patternUnits="userSpaceOnUse">
       <path d="M54 0H0V54" fill="none" stroke="#a6d2e6" stroke-opacity=".045"/>
@@ -31,33 +31,33 @@
   <rect x="1" y="1" width="1198" height="628" rx="29" fill="none" stroke="#86aec1" stroke-opacity=".25" stroke-width="2"/>
 
   <g transform="translate(68 58) scale(.58)" fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M98 29 90 21H38L19 40v48l19 19h52l8-8" stroke="#D8FFF8" stroke-opacity=".88" stroke-width="10"/>
-    <path d="M87 42 80 35H46L33 48v32l13 13h34l7-7" stroke="#75CDBB" stroke-width="9"/>
-    <path d="M76 54 71 49H57L47 59v10l10 10h14l5-5" stroke="#2D9C7D" stroke-width="8"/>
-    <path d="M105 44v40" stroke="#2DD4BF" stroke-width="10"/>
-    <path d="m64 57 7 7-7 7-7-7 7-7Z" fill="#2DD4BF" stroke="none"/>
+    <path d="M98 29 90 21H38L19 40v48l19 19h52l8-8" stroke="#E8E6FF" stroke-opacity=".9" stroke-width="10"/>
+    <path d="M87 42 80 35H46L33 48v32l13 13h34l7-7" stroke="#B2AAFF" stroke-width="9"/>
+    <path d="M76 54 71 49H57L47 59v10l10 10h14l5-5" stroke="#8B7CFF" stroke-width="8"/>
+    <path d="M105 44v40" stroke="#63D5FF" stroke-width="10"/>
+    <path d="m64 57 7 7-7 7-7-7 7-7Z" fill="#63D5FF" stroke="none"/>
   </g>
   <text x="150" y="116" fill="#f2faf8" font-family="Inter,'Segoe UI',Arial,sans-serif" font-size="40" font-weight="700" letter-spacing="-1.6">AnySentry</text>
-  <text x="68" y="205" fill="#7fdcca" font-family="ui-monospace,monospace" font-size="18" font-weight="700" letter-spacing="2">AI-NATIVE RUNTIME SECURITY + GOVERNANCE</text>
+  <text x="68" y="205" fill="#a6e9ff" font-family="ui-monospace,monospace" font-size="18" font-weight="700" letter-spacing="2">AI-NATIVE RUNTIME SECURITY + GOVERNANCE</text>
 
   <text x="68" y="304" fill="#f3f8f7" font-family="Inter,'Segoe UI',Arial,sans-serif" font-size="68" font-weight="680" letter-spacing="-3.4">Judge every Agent action</text>
   <text x="68" y="382" fill="url(#accent)" font-family="Inter,'Segoe UI',Arial,sans-serif" font-size="68" font-weight="680" letter-spacing="-3.4">inside its system context</text>
   <text x="68" y="439" fill="#9dafb4" font-family="Inter,'Segoe UI',Arial,sans-serif" font-size="25">Intent · runtime facts · host state · tiered judgment · preflight control</text>
 
   <g font-family="ui-monospace,monospace" font-size="16" font-weight="700">
-    <rect x="68" y="500" width="226" height="54" rx="10" fill="#0d292b" stroke="#2dd4bf" stroke-opacity=".42"/>
-    <text x="92" y="533" fill="#91eadc">04 SECURITY AGENTS</text>
-    <rect x="310" y="500" width="220" height="54" rx="10" fill="#0c1e30" stroke="#65b9ff" stroke-opacity=".38"/>
-    <text x="334" y="533" fill="#9ad2ff">03 RISK DOMAINS</text>
+    <rect x="68" y="500" width="226" height="54" rx="10" fill="#17142f" stroke="#8b7cff" stroke-opacity=".48"/>
+    <text x="92" y="533" fill="#c6c0ff">04 SECURITY AGENTS</text>
+    <rect x="310" y="500" width="220" height="54" rx="10" fill="#0c1e30" stroke="#63d5ff" stroke-opacity=".4"/>
+    <text x="334" y="533" fill="#a6e9ff">03 RISK DOMAINS</text>
     <rect x="546" y="500" width="258" height="54" rx="10" fill="#171a20" stroke="#f4ca68" stroke-opacity=".34"/>
     <text x="570" y="533" fill="#f4ca68">02 GOVERNANCE PATHS</text>
   </g>
   <path d="M902 90v452" stroke="#86aec1" stroke-opacity=".15"/>
-  <path d="M942 161h190M942 215h132M942 269h164M942 323h112M942 377h146" stroke="#70f0dd" stroke-opacity=".28" stroke-width="2"/>
-  <circle cx="942" cy="161" r="5" fill="#2dd4bf"/>
-  <circle cx="942" cy="215" r="5" fill="#65b9ff"/>
+  <path d="M942 161h190M942 215h132M942 269h164M942 323h112M942 377h146" stroke="#b2aaff" stroke-opacity=".3" stroke-width="2"/>
+  <circle cx="942" cy="161" r="5" fill="#8b7cff"/>
+  <circle cx="942" cy="215" r="5" fill="#63d5ff"/>
   <circle cx="942" cy="269" r="5" fill="#f4ca68"/>
-  <circle cx="942" cy="323" r="5" fill="#65b9ff"/>
-  <circle cx="942" cy="377" r="5" fill="#2dd4bf"/>
+  <circle cx="942" cy="323" r="5" fill="#63d5ff"/>
+  <circle cx="942" cy="377" r="5" fill="#8b7cff"/>
   <text x="942" y="452" fill="#667e89" font-family="ui-monospace,monospace" font-size="15">L1 → L2 → L3 → GUARD</text>
 </svg>

@@ -4,14 +4,6 @@
     "link": "/safety-loop/"
   },
   {
-    "text": "AI-Native 智能体",
-    "link": "/ai-native/"
-  },
-  {
-    "text": "分层研判",
-    "link": "/judgment/"
-  },
-  {
     "text": "架构",
     "link": "/architecture/"
   },
@@ -26,6 +18,14 @@
   {
     "text": "资源",
     "items": [
+      {
+        "text": "AI-Native 智能体",
+        "link": "/ai-native/"
+      },
+      {
+        "text": "分层研判",
+        "link": "/judgment/"
+      },
       {
         "text": "事件与证据",
         "link": "/evidence/"

@@ -2,11 +2,11 @@
   <title id="title">AnySentry</title>
   <desc id="desc">AnySentry logo with evidence gate symbol and wordmark.</desc>
   <g fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M98 29 90 21H38L19 40v48l19 19h52l8-8" stroke="#0B2B23" stroke-width="10"/>
-    <path d="M87 42 80 35H46L33 48v32l13 13h34l7-7" stroke="#145541" stroke-width="9"/>
-    <path d="M76 54 71 49H57L47 59v10l10 10h14l5-5" stroke="#1A7A5A" stroke-width="8"/>
+    <path d="M98 29 90 21H38L19 40v48l19 19h52l8-8" stroke="#2A2463" stroke-width="10"/>
+    <path d="M87 42 80 35H46L33 48v32l13 13h34l7-7" stroke="#4C3FB3" stroke-width="9"/>
+    <path d="M76 54 71 49H57L47 59v10l10 10h14l5-5" stroke="#7464E8" stroke-width="8"/>
   </g>
-  <path d="M105 44v40" fill="none" stroke="#2DD4BF" stroke-width="10" stroke-linecap="round"/>
-  <path d="m64 57 7 7-7 7-7-7 7-7Z" fill="#2DD4BF"/>
-  <text x="145" y="82" fill="#0B2B23" font-family="Inter, 'Segoe UI', Arial, sans-serif" font-size="54" font-weight="700" letter-spacing="-2.4">AnySentry</text>
+  <path d="M105 44v40" fill="none" stroke="#63D5FF" stroke-width="10" stroke-linecap="round"/>
+  <path d="m64 57 7 7-7 7-7-7 7-7Z" fill="#63D5FF"/>
+  <text x="145" y="82" fill="#211D4F" font-family="Inter, 'Segoe UI', Arial, sans-serif" font-size="54" font-weight="700" letter-spacing="-2.4">AnySentry</text>
 </svg>

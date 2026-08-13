@@ -1,93 +1,122 @@
 import { useEffect } from 'react';
 
+const SURFACE_SELECTOR = [
+  '.as-install__command',
+  '.as-capability-card',
+  '.as-case-file > article',
+  '.as-feature-rail__tablist > button',
+  '.as-boundary-table > article',
+].join(',');
+
+type PointerPosition = {
+  clientX: number;
+  clientY: number;
+  target: EventTarget | null;
+};
+
 export function PageEffects() {
   useEffect(() => {
-    const root = document.documentElement;
     const home = document.querySelector<HTMLElement>('.as-home');
-    const targets = Array.from(
-      document.querySelectorAll<HTMLElement>('[data-reveal]'),
-    );
-    root.classList.add('as-reveal-ready');
+    if (!home) return undefined;
 
-    const reducedMotionQuery = window.matchMedia(
+    const motionPreference = window.matchMedia(
       '(prefers-reduced-motion: reduce)',
     );
-    const finePointerQuery = window.matchMedia('(pointer: fine)');
-    const reducedMotion = reducedMotionQuery.matches;
-    let pointerFrame = 0;
+    const hero = home.querySelector<HTMLElement>('.as-hero');
+    let activeSurface: HTMLElement | null = null;
+    let animationFrame = 0;
+    let latestPointer: PointerPosition | null = null;
 
-    const movePointerLight = (event: PointerEvent) => {
-      if (!home || reducedMotionQuery.matches || !finePointerQuery.matches) {
+    const clearActiveSurface = () => {
+      activeSurface?.classList.remove('is-pointer-active');
+      activeSurface = null;
+    };
+
+    const paintPointer = () => {
+      animationFrame = 0;
+      const pointer = latestPointer;
+      if (!pointer || motionPreference.matches) {
+        clearActiveSurface();
         return;
       }
 
-      window.cancelAnimationFrame(pointerFrame);
-      pointerFrame = window.requestAnimationFrame(() => {
-        const x = event.clientX;
-        const y = event.clientY;
-        home.style.setProperty('--as-pointer-x', `${x}px`);
-        home.style.setProperty('--as-pointer-y', `${y}px`);
-        home.style.setProperty(
-          '--as-pointer-shift-x',
-          `${(x / window.innerWidth - 0.5) * 12}px`,
+      const target =
+        pointer.target instanceof Element ? pointer.target : undefined;
+      const surface = target?.closest<HTMLElement>(SURFACE_SELECTOR) ?? null;
+
+      if (surface && home.contains(surface)) {
+        if (surface !== activeSurface) {
+          clearActiveSurface();
+          activeSurface = surface;
+          surface.classList.add('is-pointer-active');
+        }
+
+        const bounds = surface.getBoundingClientRect();
+        surface.style.setProperty(
+          '--as-spot-x',
+          `${pointer.clientX - bounds.left}px`,
         );
-        home.style.setProperty(
-          '--as-pointer-shift-y',
-          `${(y / window.innerHeight - 0.5) * 8}px`,
+        surface.style.setProperty(
+          '--as-spot-y',
+          `${pointer.clientY - bounds.top}px`,
         );
-        home.dataset.pointerActive = 'true';
-      });
+      } else {
+        clearActiveSurface();
+      }
+
+      if (hero && target && hero.contains(target)) {
+        const bounds = hero.getBoundingClientRect();
+        const x = ((pointer.clientX - bounds.left) / bounds.width) * 100;
+        const y = ((pointer.clientY - bounds.top) / bounds.height) * 100;
+        hero.style.setProperty(
+          '--as-hero-x',
+          `${Math.max(0, Math.min(x, 100))}%`,
+        );
+        hero.style.setProperty(
+          '--as-hero-y',
+          `${Math.max(0, Math.min(y, 100))}%`,
+        );
+      } else {
+        hero?.style.removeProperty('--as-hero-x');
+        hero?.style.removeProperty('--as-hero-y');
+      }
     };
 
-    const hidePointerLight = () => {
-      if (home) home.dataset.pointerActive = 'false';
-    };
-
-    if (home && !reducedMotion && finePointerQuery.matches) {
-      window.addEventListener('pointermove', movePointerLight, {
-        passive: true,
-      });
-      document.documentElement.addEventListener('mouseleave', hidePointerLight);
-    }
-
-    const cleanupPointer = () => {
-      window.cancelAnimationFrame(pointerFrame);
-      window.removeEventListener('pointermove', movePointerLight);
-      document.documentElement.removeEventListener(
-        'mouseleave',
-        hidePointerLight,
-      );
-      home?.style.removeProperty('--as-pointer-x');
-      home?.style.removeProperty('--as-pointer-y');
-      home?.style.removeProperty('--as-pointer-shift-x');
-      home?.style.removeProperty('--as-pointer-shift-y');
-      if (home) delete home.dataset.pointerActive;
-    };
-
-    if (reducedMotion || !('IntersectionObserver' in window)) {
-      targets.forEach((target) => target.classList.add('is-visible'));
-      return () => {
-        cleanupPointer();
-        root.classList.remove('as-reveal-ready');
+    const handlePointerMove = (event: PointerEvent) => {
+      if (event.pointerType === 'touch') return;
+      latestPointer = {
+        clientX: event.clientX,
+        clientY: event.clientY,
+        target: event.target,
       };
-    }
+      if (!animationFrame) {
+        animationFrame = window.requestAnimationFrame(paintPointer);
+      }
+    };
 
-    const observer = new IntersectionObserver(
-      (entries) => {
-        entries.forEach((entry) => {
-          if (!entry.isIntersecting) return;
-          (entry.target as HTMLElement).classList.add('is-visible');
-          observer.unobserve(entry.target);
-        });
-      },
-      { rootMargin: '0px 0px -8% 0px', threshold: 0.08 },
-    );
-    targets.forEach((target) => observer.observe(target));
+    const handlePointerLeave = () => {
+      latestPointer = null;
+      clearActiveSurface();
+      hero?.style.removeProperty('--as-hero-x');
+      hero?.style.removeProperty('--as-hero-y');
+    };
+
+    const handleMotionChange = () => {
+      if (motionPreference.matches) handlePointerLeave();
+    };
+
+    home.dataset.premiumEffects = 'ready';
+    home.addEventListener('pointermove', handlePointerMove);
+    home.addEventListener('pointerleave', handlePointerLeave);
+    motionPreference.addEventListener('change', handleMotionChange);
 
     return () => {
-      observer.disconnect();
-      cleanupPointer();
-      root.classList.remove('as-reveal-ready');
+      window.cancelAnimationFrame(animationFrame);
+      clearActiveSurface();
+      delete home.dataset.premiumEffects;
+      home.removeEventListener('pointermove', handlePointerMove);
+      home.removeEventListener('pointerleave', handlePointerLeave);
+      motionPreference.removeEventListener('change', handleMotionChange);
     };
   }, []);
 

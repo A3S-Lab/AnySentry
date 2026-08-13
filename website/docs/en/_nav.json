@@ -4,14 +4,6 @@
     "link": "/safety-loop/"
   },
   {
-    "text": "AI-Native agents",
-    "link": "/ai-native/"
-  },
-  {
-    "text": "Tiered judgment",
-    "link": "/judgment/"
-  },
-  {
     "text": "Architecture",
     "link": "/architecture/"
   },
@@ -26,6 +18,14 @@
   {
     "text": "Resources",
     "items": [
+      {
+        "text": "AI-Native agents",
+        "link": "/ai-native/"
+      },
+      {
+        "text": "Tiered judgment",
+        "link": "/judgment/"
+      },
       {
         "text": "Events and evidence",
         "link": "/evidence/"

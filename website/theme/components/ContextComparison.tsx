@@ -42,7 +42,6 @@ export function ContextComparison({
     <div
       className="as-context-compare"
       data-context={step}
-      data-reveal
       onBlur={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget))
           setPaused(false);

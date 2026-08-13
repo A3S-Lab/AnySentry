@@ -14,9 +14,6 @@ export function SystemContextField({
     length: labels.sequence.length,
     paused,
   });
-  const contextStep = Math.min(2, Math.max(0, step - 1));
-  const stageStep = Math.min(2, Math.max(0, step - 3));
-
   return (
     <figure
       className="as-decision-lens"
@@ -74,15 +71,15 @@ export function SystemContextField({
         </section>
 
         <section
-          className={`as-decision-lens__context ${step >= 1 && step <= 3 ? 'is-active' : step > 3 ? 'is-past' : ''}`}
+          className={`as-decision-lens__context ${step === 1 ? 'is-active' : step > 1 ? 'is-past' : ''}`}
         >
           <span>{labels.contextLabel}</span>
           <ol>
             {labels.contexts.map((context, index) => (
               <li
                 className={
-                  step >= index + 1
-                    ? contextStep === index && step <= 3
+                  step >= 1
+                    ? index === labels.contexts.length - 1 && step === 1
                       ? 'is-active'
                       : 'is-reached'
                     : ''
@@ -101,7 +98,7 @@ export function SystemContextField({
         </section>
 
         <section
-          className={`as-decision-lens__judgment ${step >= 4 ? 'is-active' : ''}`}
+          className={`as-decision-lens__judgment ${step === 2 ? 'is-active' : step > 2 ? 'is-past' : ''}`}
         >
           <header>
             <span>{labels.decision}</span>
@@ -111,8 +108,8 @@ export function SystemContextField({
             {labels.stages.map((stage, index) => (
               <li
                 className={
-                  step >= 4 && index <= stageStep
-                    ? index === stageStep
+                  step >= 2
+                    ? index === labels.stages.length - 1 && step === 2
                       ? 'is-active'
                       : 'is-reached'
                     : ''

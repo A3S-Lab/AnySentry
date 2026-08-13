@@ -1,10 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="AnySentry">
   <rect width="128" height="128" rx="26" fill="#050A10"/>
   <g fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M98 29 90 21H38L19 40v48l19 19h52l8-8" stroke="#D8FFF8" stroke-opacity=".88" stroke-width="10"/>
-    <path d="M87 42 80 35H46L33 48v32l13 13h34l7-7" stroke="#75CDBB" stroke-width="9"/>
-    <path d="M76 54 71 49H57L47 59v10l10 10h14l5-5" stroke="#2D9C7D" stroke-width="8"/>
+    <path d="M98 29 90 21H38L19 40v48l19 19h52l8-8" stroke="#E8E6FF" stroke-opacity=".9" stroke-width="10"/>
+    <path d="M87 42 80 35H46L33 48v32l13 13h34l7-7" stroke="#B2AAFF" stroke-width="9"/>
+    <path d="M76 54 71 49H57L47 59v10l10 10h14l5-5" stroke="#8B7CFF" stroke-width="8"/>
   </g>
-  <path d="M105 44v40" fill="none" stroke="#2DD4BF" stroke-width="10" stroke-linecap="round"/>
-  <path d="m64 57 7 7-7 7-7-7 7-7Z" fill="#2DD4BF"/>
+  <path d="M105 44v40" fill="none" stroke="#63D5FF" stroke-width="10" stroke-linecap="round"/>
+  <path d="m64 57 7 7-7 7-7-7 7-7Z" fill="#63D5FF"/>
 </svg>
