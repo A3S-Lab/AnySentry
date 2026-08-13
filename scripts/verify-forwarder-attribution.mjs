@@ -706,6 +706,28 @@ function attributor(procEntries = []) {
   assert.equal(lost.activityState, undefined);
   assert.ok(lost.rootGeneration > initialGeneration);
   assert.equal(judge.metrics().rootsLost, 1);
+
+  liveStartTimes.set(2_500, '250');
+  now += 1;
+  const recovered = judge.classify(observerEvent({
+    pid: 2_500,
+    ppid: 1,
+    comm: 'pi',
+    exe: '/usr/bin/node',
+    startTimeNs: '250',
+    argv: ['pi'],
+  }));
+  assert.equal(recovered.state, 'agent');
+  assert.equal(recovered.attribution.agentInstanceId, root.attribution.agentInstanceId);
+  assert.ok(recovered.attribution.rootGeneration > lost.rootGeneration);
+  assert.equal(
+    judge.runtimeSnapshot().entries.find(
+      (entry) => entry.agentInstanceId === root.attribution.agentInstanceId,
+    )?.runtimeState,
+    'running',
+    'a lost root may recover only when the same complete ProcessKey is observed again',
+  );
+  assert.equal(judge.metrics().rootsRecovered, 1);
 }
 
 {

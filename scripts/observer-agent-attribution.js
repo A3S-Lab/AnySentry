@@ -345,6 +345,7 @@ class AgentAttributor {
       rootsDiscovered: 0,
       rootsExited: 0,
       rootsLost: 0,
+      rootsRecovered: 0,
       rootLivenessChecks: 0,
       rootLivenessMisses: 0,
       staleGenerationMisses: 0,
@@ -432,8 +433,31 @@ class AgentAttributor {
     const now = this.now();
     const existing = this.rootsByKey.get(rootKey);
     if (existing) {
-      if (existing.runtimeState !== 'running') return undefined;
       if (existing.agentId !== text(match?.agentId)) return undefined;
+      if (existing.runtimeState === 'exited') return undefined;
+      if (existing.runtimeState === 'lost') {
+        existing.runtimeState = 'running';
+        existing.generation += 1;
+        existing.endedAt = undefined;
+        existing.reason = undefined;
+        existing.exitCode = undefined;
+        existing.signal = undefined;
+        existing.missedLivenessChecks = 0;
+        existing.signatureRuleId = match?.ruleId;
+        existing.registryVersion = match?.registryVersion;
+        existing.registryHash = match?.registryHash;
+        existing.registryMatcherHash = match?.registryMatcherHash;
+        existing.evidence = Array.isArray(match?.evidence) ? [...match.evidence] : [];
+        this.stats.rootsRecovered++;
+        this.transitions.push({
+          agentInstanceId: existing.agentInstanceId,
+          rootKey,
+          runtimeState: 'running',
+          at: now,
+          reason: 'reobserved_same_process',
+        });
+        if (this.transitions.length > this.maxTransitions) this.transitions.shift();
+      }
       existing.lastSeenAt = now;
       existing.lastActivityAt = now;
       existing.missedLivenessChecks = 0;

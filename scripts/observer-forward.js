@@ -546,6 +546,7 @@ function sendHeartbeat(done = () => {}) {
         processRootsDiscovered: processes.rootsDiscovered,
         processRootsExited: processes.rootsExited,
         processRootsLost: processes.rootsLost,
+        processRootsRecovered: processes.rootsRecovered,
         processRootLivenessChecks: processes.rootLivenessChecks,
         processRootLivenessMisses: processes.rootLivenessMisses,
         processStaleGenerationMisses: processes.staleGenerationMisses,
