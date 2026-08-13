@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { Observable, map, timer } from 'rxjs';
 import { SkipWrap } from '../shared/api-response.interceptor';
 import { AgentMetadataService } from './agent-metadata.service';
+import { AgentRuntimeStateService } from './agent-runtime-state.service';
 import { AggregationService } from './aggregation.service';
 import { AlertingService } from './alerting.service';
 import { AuditService } from './audit.service';
@@ -2693,6 +2694,7 @@ export class SecurityMonitoringController {
     private readonly supplyChain: SupplyChainService,
     private readonly assistant: SecurityAssistantService,
     private readonly identityReview: IdentityReviewAgentService,
+    private readonly agentRuntimeState: AgentRuntimeStateService,
   ) {}
 
   private modelProfile(value: string): RuntimeModelProfile {
@@ -3131,6 +3133,107 @@ export class SecurityMonitoringController {
   @HttpCode(200)
   agentInventory(@Body() f: T.AgentInventoryQuery) {
     return this.agg.agentInventory(f);
+  }
+
+  /** Issue a collector-scoped fencing epoch without routing anything through event judgment/L1. */
+  @Post('runtime/lease')
+  @HttpCode(200)
+  @SkipWrap()
+  issueAgentRuntimeLease(
+    @Body() body: T.AgentRuntimeLeaseRequest,
+    @Headers() headers: HeaderBag,
+  ): T.AgentRuntimeLeaseAck {
+    const sourceId = headerValue(headers, 'x-anysentry-source-id');
+    const token = headerValue(headers, 'x-anysentry-ingest-token') ?? bearerToken(headers);
+    const resolution = this.sources.resolve({
+      sourceId,
+      token,
+      collectorId: body?.collectorId,
+      type: 'forwarder',
+    });
+    if (!resolution.accepted) {
+      const reason = resolution.reason ?? 'runtime lease rejected';
+      this.recordRejectedIngest(resolution, reason, {
+        sourceId,
+        sourceType: 'forwarder',
+        collectorId: body?.collectorId,
+        endpoint: 'runtime/lease',
+        rejectedEvents: 1,
+      });
+      return this.agentRuntimeState.rejectLease(body, reason, 'source_rejected');
+    }
+    if (
+      body?.collectorId &&
+      resolution.source?.collectorId !== body.collectorId
+    ) {
+      const reason = 'source collector does not match runtime lease collector';
+      this.recordRejectedIngest(resolution, reason, {
+        sourceId,
+        sourceType: 'forwarder',
+        collectorId: body.collectorId,
+        endpoint: 'runtime/lease',
+        rejectedEvents: 1,
+      });
+      return this.agentRuntimeState.rejectLease(body, reason, 'collector_conflict');
+    }
+    return this.agentRuntimeState.issueLease(body);
+  }
+
+  /** Accept a complete forwarder lifecycle snapshot without routing it through event judgment/L1. */
+  @Post('runtime/snapshot')
+  @HttpCode(200)
+  @SkipWrap()
+  ingestAgentRuntimeSnapshot(
+    @Body() body: T.AgentRuntimeSnapshotRequest,
+    @Headers() headers: HeaderBag,
+  ): T.AgentRuntimeSnapshotAck {
+    const sourceId = headerValue(headers, 'x-anysentry-source-id');
+    const token = headerValue(headers, 'x-anysentry-ingest-token') ?? bearerToken(headers);
+    const resolution = this.sources.resolve({
+      sourceId,
+      token,
+      collectorId: body?.collectorId,
+      type: 'forwarder',
+    });
+    if (!resolution.accepted) {
+      const reason = resolution.reason ?? 'runtime snapshot rejected';
+      this.recordRejectedIngest(resolution, reason, {
+        sourceId,
+        sourceType: 'forwarder',
+        collectorId: body?.collectorId,
+        endpoint: 'runtime/snapshot',
+        rejectedEvents: 1,
+      });
+      return this.agentRuntimeState.rejectSnapshot(body, reason, 'source_rejected');
+    }
+    if (
+      body?.collectorId &&
+      resolution.source?.collectorId !== body.collectorId
+    ) {
+      const reason = 'source collector does not match runtime snapshot collector';
+      this.recordRejectedIngest(resolution, reason, {
+        sourceId,
+        sourceType: 'forwarder',
+        collectorId: body.collectorId,
+        endpoint: 'runtime/snapshot',
+        rejectedEvents: 1,
+      });
+      return this.agentRuntimeState.rejectSnapshot(body, reason, 'collector_conflict');
+    }
+    return this.agentRuntimeState.recordSnapshot(body);
+  }
+
+  @Post('runtime/instances')
+  @HttpCode(200)
+  agentRuntimeInstances(@Body() query: T.AgentRuntimeStateQuery = {}): T.AgentRuntimeStateList {
+    return this.agentRuntimeState.list(query);
+  }
+
+  @Post('runtime/summary')
+  @HttpCode(200)
+  agentRuntimeSummary(@Body() query: T.AgentRuntimeStateQuery = {}): T.AgentRuntimeStateSummaryResponse {
+    const { summary, updateTime } = this.agentRuntimeState.list(query);
+    return { summary, updateTime };
   }
 
   @Post('identity/ai-review')

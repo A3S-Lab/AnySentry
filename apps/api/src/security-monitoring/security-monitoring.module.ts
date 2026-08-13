@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { AgentRuntimeStateService } from './agent-runtime-state.service';
 import { AgentAttributionService } from './agent-attribution.service';
 import { AgentMetadataService } from './agent-metadata.service';
 import { AggregationService } from './aggregation.service';
@@ -25,6 +26,6 @@ import { RuntimeModelConfigService } from './runtime-model-config';
 
 @Module({
   controllers: [SecurityMonitoringController],
-  providers: [AgentAttributionService, AgentMetadataService, AlertingService, AuditService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, SentryJudgeService, AggregationService, IdentityEvidenceService, RuntimeModelConfigService, IdentityReviewAgentService, RemediationService, KubeIdentityService, ManagementAuthGuard, JudgmentQueueService, DecisionResultApplyService, StreamingQueueService, StreamingFindingService, SupplyChainService, SecurityAssistantService],
+  providers: [AgentRuntimeStateService, AgentAttributionService, AgentMetadataService, AlertingService, AuditService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, SentryJudgeService, AggregationService, IdentityEvidenceService, RuntimeModelConfigService, IdentityReviewAgentService, RemediationService, KubeIdentityService, ManagementAuthGuard, JudgmentQueueService, DecisionResultApplyService, StreamingQueueService, StreamingFindingService, SupplyChainService, SecurityAssistantService],
 })
 export class SecurityMonitoringModule {}

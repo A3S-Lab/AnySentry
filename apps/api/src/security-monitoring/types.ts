@@ -22,6 +22,29 @@ export type EventCategory = 'tool' | 'network' | 'file' | 'llm' | 'security' | '
 export type EventAttributeValue = string | number | boolean;
 export type IncidentStatus = 'open' | 'acknowledged' | 'resolved';
 export type AgentHealthState = 'active' | 'idle' | 'stale' | 'risky';
+/** Root-process lifecycle. This is intentionally separate from event-derived AgentHealthState. */
+export type AgentRuntimeReportedState = 'running' | 'exited' | 'lost';
+/** `unobserved` is derived by the API when a previously live forwarder stops reporting. */
+export type AgentRuntimeState = AgentRuntimeReportedState | 'unobserved';
+export type AgentActivityState = 'active' | 'idle';
+/** Stable machine-readable outcomes for the runtime lease/snapshot control plane. */
+export type AgentRuntimeAckReasonCode =
+  | 'lease_not_found'
+  | 'lease_epoch_stale'
+  | 'lease_owner_mismatch'
+  | 'stale_forwarder'
+  | 'collector_conflict'
+  | 'capacity_exceeded'
+  | 'validation_error'
+  | 'source_rejected'
+  | 'service_unavailable'
+  | 'snapshot_version_stale'
+  | 'snapshot_version_conflict'
+  | 'ready_regression'
+  | 'identity_conflict'
+  | 'generation_regression'
+  | 'terminal_state_conflict'
+  | 'awaiting_ready';
 export type AgentCriticality = 'low' | 'medium' | 'high' | 'critical';
 export type CollectorHealthState = 'healthy' | 'quiet' | 'degraded' | 'stale' | 'down';
 export type CollectorReportedStatus = 'ok' | 'degraded' | 'error';
@@ -144,6 +167,147 @@ export interface WorkloadIdentitySnapshot {
   nodeName?: string;
   entries: WorkloadIdentitySnapshotEntry[];
   errors: number;
+}
+
+/**
+ * One root-process instance reported by an observer forwarder.
+ *
+ * `agentScopeId` is a display/type label (for example, "codex"). Runtime identity is always
+ * `agentInstanceId`, optionally joined to the existing asset model through `physicalWorkloadId`.
+ */
+export interface AgentRuntimeSnapshotEntry {
+  agentScopeId: string;
+  agentDisplayName?: string;
+  agentInstanceId: string;
+  physicalWorkloadId?: string;
+  classification?: AgentClassification;
+  runtimeState: AgentRuntimeReportedState;
+  rootPid: number;
+  rootStartTimeTicks: string;
+  rootGeneration: number;
+  hostId: string;
+  bootId: string;
+  comm?: string;
+  exe?: string;
+  workspacePath?: string;
+  discoveredAt: string;
+  lastSeenAt: string;
+  lastActivityAt?: string;
+  endedAt?: string;
+  exitCode?: number;
+  signal?: number;
+  confidence?: number;
+  source?: AgentAttributionSource;
+  evidence?: string[];
+  workloadRef?: AgentWorkloadRef;
+}
+
+export interface AgentRuntimeLeaseRequest {
+  collectorId: string;
+  forwarderInstanceId: string;
+  hostId: string;
+  bootId: string;
+  forwarderPid: number;
+  forwarderStartTimeTicks: string;
+}
+
+export interface AgentRuntimeLeaseAck {
+  accepted: boolean;
+  collectorId?: string;
+  forwarderInstanceId?: string;
+  leaseEpoch?: number;
+  issuedAt: string;
+  reasonCode?: AgentRuntimeAckReasonCode;
+  reason?: string;
+}
+
+/** A complete, monotonically-versioned view produced by one forwarder process. */
+export interface AgentRuntimeSnapshotRequest {
+  schemaVersion: 'anysentry.agent_runtime_snapshot.v1';
+  collectorId: string;
+  forwarderInstanceId: string;
+  leaseEpoch: number;
+  snapshotVersion: number;
+  generatedAt: string;
+  ready: boolean;
+  intervalSecs: number;
+  filterMode?: 'shadow' | 'enforce';
+  registryVersion?: number;
+  registryHash?: string;
+  registryMatcherHash?: string;
+  entries: AgentRuntimeSnapshotEntry[];
+}
+
+export interface AgentRuntimeSnapshotAck {
+  accepted: boolean;
+  applied: boolean;
+  duplicate: boolean;
+  collectorId?: string;
+  forwarderInstanceId?: string;
+  leaseEpoch?: number;
+  snapshotVersion?: number;
+  snapshotHash?: string;
+  ready: boolean;
+  instanceCount: number;
+  receivedAt: string;
+  reasonCode?: AgentRuntimeAckReasonCode;
+  reason?: string;
+}
+
+/** Sanitized in-memory record returned to aggregation/query consumers. Epoch values are millis. */
+export interface AgentRuntimeInstanceRecord
+  extends Omit<AgentRuntimeSnapshotEntry, 'runtimeState' | 'discoveredAt' | 'lastSeenAt' | 'lastActivityAt' | 'endedAt'> {
+  collectorId: string;
+  forwarderInstanceId: string;
+  leaseEpoch: number;
+  snapshotVersion: number;
+  snapshotHash: string;
+  filterMode: 'shadow' | 'enforce';
+  registryVersion?: number;
+  registryHash?: string;
+  registryMatcherHash?: string;
+  runtimeState: AgentRuntimeState;
+  activityState?: AgentActivityState;
+  discoveredAt: number;
+  lastSeenAt: number;
+  lastActivityAt?: number;
+  endedAt?: number;
+  receivedAt: number;
+}
+
+export interface AgentRuntimeStateQuery {
+  collectorId?: string;
+  forwarderInstanceId?: string;
+  agentScopeId?: string;
+  agentInstanceId?: string;
+  physicalWorkloadId?: string;
+  runtimeState?: AgentRuntimeState | 'all';
+  activityState?: AgentActivityState | 'all';
+  includeShadow?: boolean;
+  limit?: number;
+}
+
+export interface AgentRuntimeStateSummary {
+  totalInstances: number;
+  runningInstances: number;
+  activeInstances: number;
+  idleInstances: number;
+  exitedInstances: number;
+  lostInstances: number;
+  unobservedInstances: number;
+  shadowInstances: number;
+}
+
+export interface AgentRuntimeStateList {
+  items: AgentRuntimeInstanceRecord[];
+  total: number;
+  summary: AgentRuntimeStateSummary;
+  updateTime: string;
+}
+
+export interface AgentRuntimeStateSummaryResponse {
+  summary: AgentRuntimeStateSummary;
+  updateTime: string;
 }
 export type CoverageIssueType =
   | 'collector_down'
@@ -1240,6 +1404,42 @@ export interface CollectorFilterMetrics {
   processBootstrapProcReads: number;
   processFallbackProcReads: number;
   processAncestryProcReads: number;
+  processRootsDiscovered?: number;
+  processRootsExited?: number;
+  processRootsLost?: number;
+  processRootsRecovered?: number;
+  processRootLivenessChecks?: number;
+  processRootLivenessMisses?: number;
+  processStaleGenerationMisses?: number;
+  runtimeSignatureVersion?: number;
+  runtimeSignatureHash?: string;
+  runtimeSignatureMatcherHash?: string;
+  runtimeSignatureLoaded?: number;
+  runtimeSignatureMatches?: number;
+  runtimeSignatureMisses?: number;
+  runtimeSignatureAmbiguous?: number;
+  runtimeSignatureInvalid?: number;
+  runtimeSignatureReloadAttempts?: number;
+  runtimeSignatureReloadSuccesses?: number;
+  runtimeSignatureReloadErrors?: number;
+  runtimeSignatureLastGoodHash?: string;
+  runtimeReconcileRequested?: number;
+  runtimeReconcileRuns?: number;
+  runtimeReconcileCoalesced?: number;
+  runtimeReconcileErrors?: number;
+  runtimeReconcileScanned?: number;
+  runtimeReconcileInvalidated?: number;
+  runtimeReconcileLastDurationMs?: number;
+  runtimeSnapshotPosts?: number;
+  runtimeSnapshotErrors?: number;
+  runtimeLeaseEpoch?: number;
+  runtimeLeaseAttempts?: number;
+  runtimeLeaseErrors?: number;
+  runtimeLeaseFenced?: boolean;
+  runtimeSnapshotRejected?: number;
+  runtimeSnapshotDuplicates?: number;
+  lastRuntimeSnapshotAt?: string;
+  lastRuntimeSnapshotError?: string;
 }
 export interface CollectorHeartbeatRecord extends Required<Pick<CollectorHeartbeatRequest, 'collectorId' | 'status'>> {
   at: number;
