@@ -1267,6 +1267,78 @@ export interface IncidentUpdateRequest {
   note?: string;
 }
 
+/** Root-process lifecycle, kept separate from event-derived AgentHealthState. */
+export type AgentRuntimeState = "running" | "exited" | "lost" | "unobserved";
+export type AgentActivityState = "active" | "idle";
+
+export interface AgentRuntimeInstanceRecord {
+  agentScopeId: string;
+  agentDisplayName?: string;
+  agentInstanceId: string;
+  physicalWorkloadId?: string;
+  classification?: AgentClassification;
+  runtimeState: AgentRuntimeState;
+  activityState?: AgentActivityState;
+  rootPid: number;
+  rootStartTimeTicks: string;
+  rootGeneration: number;
+  hostId: string;
+  bootId: string;
+  comm?: string;
+  exe?: string;
+  workspacePath?: string;
+  discoveredAt: number;
+  lastSeenAt: number;
+  lastActivityAt?: number;
+  endedAt?: number;
+  exitCode?: number;
+  signal?: number;
+  confidence?: number;
+  source?: AgentAttributionSource;
+  evidence?: string[];
+  workloadRef?: AgentWorkloadRef;
+  collectorId: string;
+  forwarderInstanceId: string;
+  leaseEpoch: number;
+  snapshotVersion: number;
+  snapshotHash: string;
+  filterMode: "shadow" | "enforce";
+  registryVersion?: number;
+  registryHash?: string;
+  registryMatcherHash?: string;
+  receivedAt: number;
+}
+
+export interface AgentRuntimeStateQuery {
+  collectorId?: string;
+  forwarderInstanceId?: string;
+  agentScopeId?: string;
+  agentInstanceId?: string;
+  physicalWorkloadId?: string;
+  runtimeState?: AgentRuntimeState | "all";
+  activityState?: AgentActivityState | "all";
+  includeShadow?: boolean;
+  limit?: number;
+}
+
+export interface AgentRuntimeStateSummary {
+  totalInstances: number;
+  runningInstances: number;
+  activeInstances: number;
+  idleInstances: number;
+  exitedInstances: number;
+  lostInstances: number;
+  unobservedInstances: number;
+  shadowInstances: number;
+}
+
+export interface AgentRuntimeStateList {
+  items: AgentRuntimeInstanceRecord[];
+  total: number;
+  summary: AgentRuntimeStateSummary;
+  updateTime: string;
+}
+
 export interface AgentInventoryQuery extends SecurityTimeFilter {
   healthState?: AgentHealthState | "all";
   criticality?: AgentCriticality | "all";
@@ -1412,6 +1484,55 @@ export interface AgentInventory {
   total: number;
   summary: AgentInventorySummary;
   updateTime: string;
+}
+
+export interface AgentRuntimeLookup {
+  byAgentInstanceId: ReadonlyMap<string, AgentRuntimeInstanceRecord>;
+  /** null means more than one Agent instance occupies the same physical workload. */
+  byPhysicalWorkloadId: ReadonlyMap<string, AgentRuntimeInstanceRecord | null>;
+}
+
+function runtimeIdentity(value?: string) {
+  return value?.trim() ?? "";
+}
+
+/**
+ * Build an instance-safe join index. Agent scope is intentionally absent: two Codex roots are two
+ * lifecycles, even when their display/type scope is identical.
+ */
+export function buildAgentRuntimeLookup(
+  items: AgentRuntimeInstanceRecord[],
+  options: { complete?: boolean } = {},
+): AgentRuntimeLookup {
+  const byAgentInstanceId = new Map<string, AgentRuntimeInstanceRecord>();
+  const byPhysicalWorkloadId = new Map<string, AgentRuntimeInstanceRecord | null>();
+  for (const item of items) {
+    const instanceId = runtimeIdentity(item.agentInstanceId);
+    if (instanceId && !byAgentInstanceId.has(instanceId)) byAgentInstanceId.set(instanceId, item);
+
+    // Physical identity is only a safe fallback over a complete result set. If the API response
+    // was truncated, another root in the omitted tail may occupy the same Pod/container.
+    if (options.complete === false) continue;
+    const physicalId = runtimeIdentity(item.physicalWorkloadId);
+    if (!physicalId) continue;
+    const previous = byPhysicalWorkloadId.get(physicalId);
+    if (previous === undefined) byPhysicalWorkloadId.set(physicalId, item);
+    else if (previous && previous.agentInstanceId !== item.agentInstanceId) {
+      byPhysicalWorkloadId.set(physicalId, null);
+    }
+  }
+  return { byAgentInstanceId, byPhysicalWorkloadId };
+}
+
+export function matchAgentRuntimeInstance(
+  agent: Pick<AgentInventoryItem, "agentInstanceId" | "physicalWorkloadId">,
+  lookup: AgentRuntimeLookup,
+): AgentRuntimeInstanceRecord | undefined {
+  const instanceId = runtimeIdentity(agent.agentInstanceId);
+  const exact = instanceId ? lookup.byAgentInstanceId.get(instanceId) : undefined;
+  if (exact) return exact;
+  const physicalId = runtimeIdentity(agent.physicalWorkloadId);
+  return physicalId ? lookup.byPhysicalWorkloadId.get(physicalId) ?? undefined : undefined;
 }
 
 export type IdentityAiReviewTargetType = "event" | "agent";
@@ -2760,6 +2881,8 @@ export const securityCenterApi = {
     apiClient.put<RemediationListItem>(`/security-center/remediations/${encodeURIComponent(taskId)}`, body),
   agentInventory: (filter: AgentInventoryQuery) =>
     apiClient.post<AgentInventory>("/security-center/agents/inventory", filter),
+  agentRuntimeInstances: (query: AgentRuntimeStateQuery = {}) =>
+    apiClient.post<AgentRuntimeStateList>("/security-center/runtime/instances", query),
   workspaceInventory: (filter: WorkspaceInventoryQuery) =>
     apiClient.post<WorkspaceInventory>("/security-center/workspaces/inventory", filter),
   agentTopology: (filter: AgentTopologyQuery) =>

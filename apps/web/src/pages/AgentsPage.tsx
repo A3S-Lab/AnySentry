@@ -47,7 +47,12 @@ import {
   type AgentHealthState,
   type AgentInventoryItem,
   type AgentInventoryQuery,
+  type AgentRuntimeInstanceRecord,
+  type AgentRuntimeState,
+  type AgentActivityState,
   type SecurityTimeType,
+  buildAgentRuntimeLookup,
+  matchAgentRuntimeInstance,
   securityCenterApi,
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
@@ -72,6 +77,18 @@ const HEALTH_LABEL: Record<AgentHealthState, string> = {
   idle: "空闲",
   stale: "失联",
   risky: "风险",
+};
+
+const RUNTIME_STATE_LABEL: Record<AgentRuntimeState, string> = {
+  running: "运行中",
+  exited: "已退出",
+  lost: "已丢失",
+  unobserved: "未观测",
+};
+
+const ACTIVITY_STATE_LABEL: Record<AgentActivityState, string> = {
+  active: "活跃",
+  idle: "空闲",
 };
 
 const CRITICALITY_OPTIONS: Array<{ value: AgentCriticality | "unset"; label: string }> = [
@@ -129,7 +146,7 @@ function clean(value: string) {
   return value.trim() || undefined;
 }
 
-function formatDate(value?: string) {
+function formatDate(value?: string | number) {
   if (!value) return "--";
   const parsed = dayjs(value);
   return parsed.isValid() ? parsed.format("MM-DD HH:mm:ss") : value;
@@ -140,6 +157,19 @@ function healthClass(health?: AgentHealthState) {
   if (health === "active") return "border-teal-400/30 bg-teal-500/10 text-teal-100";
   if (health === "idle") return "border-amber-400/30 bg-amber-500/10 text-amber-100";
   return "border-white/10 bg-white/5 text-zinc-300";
+}
+
+function runtimeStateClass(state: AgentRuntimeState) {
+  if (state === "running") return "border-teal-400/30 bg-teal-500/10 text-teal-100";
+  if (state === "lost") return "border-rose-400/30 bg-rose-500/10 text-rose-100";
+  if (state === "unobserved") return "border-amber-400/30 bg-amber-500/10 text-amber-100";
+  return "border-slate-400/20 bg-slate-500/10 text-slate-300";
+}
+
+function activityStateClass(state: AgentActivityState) {
+  return state === "active"
+    ? "border-sky-400/30 bg-sky-500/10 text-sky-100"
+    : "border-amber-400/30 bg-amber-500/10 text-amber-100";
 }
 
 function riskClass(level?: string) {
@@ -210,6 +240,22 @@ function Pill({ children, className }: { children: string; className?: string })
     <span className={cn("inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold", className)}>
       {children}
     </span>
+  );
+}
+
+function RuntimeLifecyclePills({ runtime }: { runtime?: AgentRuntimeInstanceRecord }) {
+  if (!runtime) return null;
+  return (
+    <>
+      <Pill className={runtimeStateClass(runtime.runtimeState)}>
+        {`生命周期 · ${RUNTIME_STATE_LABEL[runtime.runtimeState]}`}
+      </Pill>
+      {runtime.activityState ? (
+        <Pill className={activityStateClass(runtime.activityState)}>
+          {`活动 · ${ACTIVITY_STATE_LABEL[runtime.activityState]}`}
+        </Pill>
+      ) : null}
+    </>
   );
 }
 
@@ -334,10 +380,12 @@ function agentNotificationHref(agent: AgentInventoryItem) {
 
 function AgentRow({
   agent,
+  runtime,
   active,
   onSelect,
 }: {
   agent: AgentInventoryItem;
+  runtime?: AgentRuntimeInstanceRecord;
   active: boolean;
   onSelect: () => void;
 }) {
@@ -346,7 +394,7 @@ function AgentRow({
       type="button"
       onClick={onSelect}
       className={cn(
-        "grid w-full grid-cols-[92px_minmax(0,1fr)_70px_72px] items-center gap-3 border-b border-white/8 px-3 py-3 text-left transition hover:bg-white/[0.05]",
+        "grid w-full grid-cols-[92px_minmax(0,1fr)_134px_72px] items-center gap-3 border-b border-white/8 px-3 py-3 text-left transition hover:bg-white/[0.05]",
         active && "bg-teal-400/8",
       )}
     >
@@ -355,7 +403,10 @@ function AgentRow({
         <AgentAssetIdentityInline agent={agent} />
         {agent.owner ? <span className="ml-3 mt-0.5 block truncate text-[10px] text-zinc-600">{agent.owner}</span> : null}
       </span>
-      <span><Pill className={healthClass(agent.healthState)}>{HEALTH_LABEL[agent.healthState]}</Pill></span>
+      <span className="flex flex-col items-start gap-1">
+        <Pill className={healthClass(agent.healthState)}>{HEALTH_LABEL[agent.healthState]}</Pill>
+        <RuntimeLifecyclePills runtime={runtime} />
+      </span>
       <span className="text-right font-mono text-xs text-zinc-500">{agent.eventCount}</span>
     </button>
   );
@@ -363,6 +414,7 @@ function AgentRow({
 
 function AgentDetail({
   agent,
+  runtime,
   timeType,
   startTime,
   endTime,
@@ -381,6 +433,7 @@ function AgentDetail({
   onConfirmReview,
 }: {
   agent?: AgentInventoryItem;
+  runtime?: AgentRuntimeInstanceRecord;
   timeType: SecurityTimeType;
   startTime?: string;
   endTime?: string;
@@ -463,9 +516,10 @@ function AgentDetail({
           <Bot className="size-4 shrink-0 text-teal-200" />
           <AgentAssetIdentityInline agent={agent} showClassification />
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-end gap-2">
           <Pill className={riskClass(agent.riskLevel)}>{agent.riskLevelText}</Pill>
           <Pill className={healthClass(agent.healthState)}>{HEALTH_LABEL[agent.healthState]}</Pill>
+          <RuntimeLifecyclePills runtime={runtime} />
         </div>
       </div>
 
@@ -482,6 +536,10 @@ function AgentDetail({
           <FieldValue label="First Seen" value={formatDate(agent.firstSeen)} />
           <FieldValue label="Last Seen" value={formatDate(agent.lastSeen)} />
           <FieldValue label="Last Event" value={agent.lastEventSubject} />
+          <FieldValue label="生命周期" value={runtime ? RUNTIME_STATE_LABEL[runtime.runtimeState] : "未关联"} />
+          <FieldValue label="活动状态" value={runtime?.activityState ? ACTIVITY_STATE_LABEL[runtime.activityState] : "--"} />
+          <FieldValue label="根进程" value={runtime ? `PID ${runtime.rootPid} · generation ${runtime.rootGeneration}` : "--"} />
+          <FieldValue label="Runtime Last Seen" value={runtime ? formatDate(runtime.lastSeenAt) : "--"} />
         </div>
 
         <IdentityAiReview
@@ -854,6 +912,21 @@ export default function AgentsPage() {
     pollingWhenHidden: false,
   });
 
+  const {
+    data: runtimeData,
+    error: runtimeError,
+    refresh: refreshRuntime,
+  } = useRequest(() => securityCenterApi.agentRuntimeInstances({ includeShadow: true, limit: 4096 }), {
+    pollingInterval: 10000,
+    pollingWhenHidden: false,
+  });
+  const runtimeLookup = useMemo(
+    () => buildAgentRuntimeLookup(runtimeData?.items ?? [], {
+      complete: Boolean(runtimeData && runtimeData.total === runtimeData.items.length),
+    }),
+    [runtimeData],
+  );
+
   const detailQuery = useMemo<AgentInventoryQuery>(() => ({
     timeType,
     startTime: timeType === "custom" ? clean(routeStartTime) : undefined,
@@ -889,6 +962,10 @@ export default function AgentsPage() {
     }
     return items[0];
   }, [data, detailData, hasPinnedSelection, legacySelectedAgentId, legacySelectedWorkspacePath, selectedAgentAssetId]);
+  const selectedRuntime = useMemo(
+    () => selectedAgent ? matchAgentRuntimeInstance(selectedAgent, runtimeLookup) : undefined,
+    [runtimeLookup, selectedAgent],
+  );
   const classificationCounts = useMemo(() => {
     const counts: Partial<Record<AgentClassification, number>> = {};
     for (const item of data?.items ?? []) {
@@ -1082,6 +1159,11 @@ export default function AgentsPage() {
           </div>
           <div className="flex items-center gap-2 text-xs text-zinc-500">
             <AdminTokenControl compact />
+            {runtimeError ? (
+              <span className="text-amber-300" title="生命周期接口暂不可用；资产健康状态仍按原事件窗口计算">
+                生命周期暂不可用
+              </span>
+            ) : null}
             <Clock3 className="size-3.5" />
             <span>{data?.updateTime ? formatDate(data.updateTime) : "等待刷新"}</span>
           </div>
@@ -1111,7 +1193,7 @@ export default function AgentsPage() {
             <X className="size-3.5" />
             清除
           </Button>
-          <Button type="button" size="sm" onClick={() => { void Promise.all([refreshList(), hasPinnedSelection ? refreshDetail() : Promise.resolve()]); }} disabled={loading || detailLoading} className="h-9 bg-teal-500 text-[#07100c] hover:bg-teal-400">
+          <Button type="button" size="sm" onClick={() => { void Promise.all([refreshList(), refreshRuntime(), hasPinnedSelection ? refreshDetail() : Promise.resolve()]); }} disabled={loading || detailLoading} className="h-9 bg-teal-500 text-[#07100c] hover:bg-teal-400">
             {loading || detailLoading ? <LoaderCircle className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
             刷新
           </Button>
@@ -1184,6 +1266,7 @@ export default function AgentsPage() {
                         ) : null}
                         <AgentRow
                           agent={agent}
+                          runtime={matchAgentRuntimeInstance(agent, runtimeLookup)}
                           active={agent.agentAssetId === selectedAgent?.agentAssetId}
                           onSelect={() => selectAgent(agent)}
                         />
@@ -1209,6 +1292,7 @@ export default function AgentsPage() {
                 </section>
               ) : <AgentDetail
                 agent={selectedAgent}
+                runtime={selectedRuntime}
                 timeType={timeType}
                 startTime={timeType === "custom" ? routeStartTime : undefined}
                 endTime={timeType === "custom" ? routeEndTime : undefined}
