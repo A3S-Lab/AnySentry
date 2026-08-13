@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const {
   RuntimeSignatureRegistry,
   defaultSignatureDocument,
@@ -13,6 +14,11 @@ const DEFAULT_MAX_PROCS = 20_000;
 const DEFAULT_MAX_ANCESTORS = 32;
 const RECORD_TTL_MS = 30 * 60_000;
 const DEFAULT_TOMBSTONE_TTL_MS = 15_000;
+const DEFAULT_ROOT_TERMINAL_TTL_MS = 60 * 60_000;
+const DEFAULT_LIVENESS_MISSES = 2;
+const DEFAULT_ACTIVITY_IDLE_MS = 60_000;
+const DEFAULT_MAX_ROOTS = 4096;
+const DEFAULT_MAX_TRANSITIONS = 4096;
 const WORKSPACE_CACHE_SIZE = 4096;
 const EPHEMERAL_WORKSPACE_ROOTS = ['/tmp', '/var/tmp', '/proc', '/sys', '/run', '/dev'];
 
@@ -133,9 +139,145 @@ function listProcPids(procRoot = '/proc') {
   }
 }
 
+function readTextFile(file, fallback = '') {
+  try { return fs.readFileSync(file, 'utf8').trim() || fallback; } catch { return fallback; }
+}
+
+function defaultHostId() {
+  return readTextFile('/etc/machine-id', text(process.env.A3S_OBSERVER_HOST_ID) || 'local-host');
+}
+
+function defaultBootId(procRoot = '/proc') {
+  return readTextFile(path.join(procRoot, 'sys/kernel/random/boot_id'), 'unknown-boot');
+}
+
+function scopedPidKey(hostId, bootId, pid) {
+  return JSON.stringify([text(hostId) || 'local-host', text(bootId) || 'unknown-boot', positiveInt(pid) || 0]);
+}
+
+function processKey(info, defaults = {}) {
+  const pid = positiveInt(info?.pid);
+  const startTime = text(info?.startTime);
+  if (!pid || !startTime) return undefined;
+  return JSON.stringify([
+    text(info?.hostId) || defaults.hostId || 'local-host',
+    text(info?.bootId) || defaults.bootId || 'unknown-boot',
+    pid,
+    startTime,
+  ]);
+}
+
+function readProcStartTime(pid, procRoot = '/proc') {
+  try {
+    const stat = fs.readFileSync(path.join(procRoot, String(pid), 'stat'), 'utf8');
+    const close = stat.lastIndexOf(')');
+    if (close < 0) return undefined;
+    return stat.slice(close + 2).trim().split(/\s+/)[19] || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+class ProcessRecordStore {
+  constructor(defaults) {
+    this.defaults = defaults;
+    this.records = new Map();
+    this.pidIndex = new Map();
+  }
+
+  normalize(record) {
+    return {
+      ...record,
+      hostId: text(record?.hostId) || this.defaults.hostId,
+      bootId: text(record?.bootId) || this.defaults.bootId,
+      startTime: text(record?.startTime),
+    };
+  }
+
+  set(recordOrPid, maybeRecord) {
+    const record = maybeRecord && typeof maybeRecord === 'object' ? maybeRecord : recordOrPid;
+    const normalized = this.normalize(record);
+    const key = processKey(normalized, this.defaults);
+    if (!key) return undefined;
+    const pidKey = scopedPidKey(normalized.hostId, normalized.bootId, normalized.pid);
+    const previousKey = this.pidIndex.get(pidKey);
+    if (previousKey && previousKey !== key) this.records.delete(previousKey);
+    const stored = { ...normalized, processKey: key };
+    this.records.set(key, stored);
+    this.pidIndex.set(pidKey, key);
+    return stored;
+  }
+
+  get(pid, hostId = this.defaults.hostId, bootId = this.defaults.bootId) {
+    const key = this.pidIndex.get(scopedPidKey(hostId, bootId, pid));
+    return key ? this.records.get(key) : undefined;
+  }
+
+  getFor(info, allowPidFallback = false) {
+    const normalized = this.normalize(info);
+    const key = processKey(normalized, this.defaults);
+    if (key) return this.records.get(key);
+    return allowPidFallback ? this.get(normalized.pid, normalized.hostId, normalized.bootId) : undefined;
+  }
+
+  getByKey(key) {
+    return this.records.get(key);
+  }
+
+  deleteRecord(record) {
+    if (!record) return false;
+    const normalized = this.normalize(record);
+    const key = record.processKey || processKey(normalized, this.defaults);
+    if (!key) return false;
+    const deleted = this.records.delete(key);
+    const pidKey = scopedPidKey(normalized.hostId, normalized.bootId, normalized.pid);
+    if (this.pidIndex.get(pidKey) === key) this.pidIndex.delete(pidKey);
+    return deleted;
+  }
+
+  deletePid(pid, hostId = this.defaults.hostId, bootId = this.defaults.bootId) {
+    return this.deleteRecord(this.get(pid, hostId, bootId));
+  }
+
+  hasFor(info) {
+    return Boolean(this.getFor(info));
+  }
+
+  has(pid, hostId = this.defaults.hostId, bootId = this.defaults.bootId) {
+    return Boolean(this.get(pid, hostId, bootId));
+  }
+
+  delete(pid, hostId = this.defaults.hostId, bootId = this.defaults.bootId) {
+    return this.deletePid(pid, hostId, bootId);
+  }
+
+  clear() {
+    this.records.clear();
+    this.pidIndex.clear();
+  }
+
+  values() {
+    return this.records.values();
+  }
+
+  entries() {
+    return this.records.entries();
+  }
+
+  [Symbol.iterator]() {
+    return this.records[Symbol.iterator]();
+  }
+
+  get size() {
+    return this.records.size;
+  }
+}
+
 class AgentAttributor {
   constructor(options = {}) {
     this.procRoot = options.procRoot || '/proc';
+    this.hostId = text(options.hostId) || defaultHostId();
+    this.bootId = text(options.bootId) || defaultBootId(this.procRoot);
     this.maxProcs = positiveInt(options.maxProcs) || DEFAULT_MAX_PROCS;
     this.maxAncestors = positiveInt(options.maxAncestors) || DEFAULT_MAX_ANCESTORS;
     this.now = typeof options.now === 'function' ? options.now : Date.now;
@@ -165,7 +307,20 @@ class AgentAttributor {
               : legacyRootNameDocument(''),
           { source: options.rootNames != null ? 'legacy-option' : 'builtin' },
         );
-    this.procs = new Map();
+    this.processesByKey = new ProcessRecordStore({ hostId: this.hostId, bootId: this.bootId });
+    // Backward-compatible diagnostic name. This object is no longer keyed by bare PID internally;
+    // get(pid) resolves through a scoped PID index to the ProcessKey record.
+    this.procs = this.processesByKey;
+    this.rootsByKey = new Map();
+    this.transitions = [];
+    this.maxRoots = positiveInt(options.maxRoots) || DEFAULT_MAX_ROOTS;
+    this.maxTransitions = positiveInt(options.maxTransitions) || DEFAULT_MAX_TRANSITIONS;
+    this.terminalRootTtlMs = positiveInt(options.terminalRootTtlMs) || DEFAULT_ROOT_TERMINAL_TTL_MS;
+    this.livenessMissThreshold = positiveInt(options.livenessMissThreshold) || DEFAULT_LIVENESS_MISSES;
+    this.activityIdleMs = positiveInt(options.activityIdleMs) || DEFAULT_ACTIVITY_IDLE_MS;
+    this.readStartTime = typeof options.readStartTime === 'function'
+      ? options.readStartTime
+      : (pid) => readProcStartTime(pid, this.procRoot);
     this.tombstones = new Map();
     this.tombstoneTtlMs =
       positiveInt(options.tombstoneTtlMs) ||
@@ -187,6 +342,13 @@ class AgentAttributor {
       bootstrapProcReads: 0,
       fallbackProcReads: 0,
       ancestryProcReads: 0,
+      rootsDiscovered: 0,
+      rootsExited: 0,
+      rootsLost: 0,
+      rootLivenessChecks: 0,
+      rootLivenessMisses: 0,
+      staleGenerationMisses: 0,
+      cacheEvictions: 0,
     };
     this.infrastructureRoots = new Map();
     this.infrastructureContainers = new Map();
@@ -198,7 +360,281 @@ class AgentAttributor {
     if (reason === 'bootstrap') this.stats.bootstrapProcReads++;
     else if (reason === 'ancestry') this.stats.ancestryProcReads++;
     else this.stats.fallbackProcReads++;
-    return this.readProc(pid);
+    const info = this.readProc(pid);
+    return info
+      ? {
+          ...info,
+          hostId: text(info.hostId) || this.hostId,
+          bootId: text(info.bootId) || this.bootId,
+        }
+      : undefined;
+  }
+
+  processKey(info) {
+    return processKey(info, { hostId: this.hostId, bootId: this.bootId });
+  }
+
+  agentInstanceId(agentId, rootKey) {
+    return `ari_${crypto.createHash('sha256')
+      .update(text(agentId))
+      .update('\0')
+      .update(rootKey)
+      .digest('hex')
+      .slice(0, 24)}`;
+  }
+
+  rootForRecord(record, countMiss = true) {
+    if (!record?.rootKey) return undefined;
+    const root = this.rootsByKey.get(record.rootKey);
+    if (
+      !root ||
+      root.runtimeState !== 'running' ||
+      root.generation !== record.rootGeneration
+    ) {
+      if (countMiss) this.stats.staleGenerationMisses++;
+      return undefined;
+    }
+    return root;
+  }
+
+  transition(root, runtimeState, details = {}) {
+    if (!root || root.runtimeState === runtimeState) return false;
+    const at = this.now();
+    root.runtimeState = runtimeState;
+    root.generation += 1;
+    root.endedAt = at;
+    root.lastSeenAt = Math.max(root.lastSeenAt || 0, at);
+    Object.assign(root, details);
+    this.transitions.push({
+      agentInstanceId: root.agentInstanceId,
+      rootKey: root.rootKey,
+      runtimeState,
+      at,
+      ...details,
+    });
+    if (this.transitions.length > this.maxTransitions) {
+      this.transitions.splice(0, this.transitions.length - this.maxTransitions);
+    }
+    if (runtimeState === 'exited') this.stats.rootsExited++;
+    if (runtimeState === 'lost') this.stats.rootsLost++;
+    return true;
+  }
+
+  ensureRoot(info, match) {
+    const normalized = {
+      ...info,
+      hostId: text(info?.hostId) || this.hostId,
+      bootId: text(info?.bootId) || this.bootId,
+      startTime: text(info?.startTime),
+    };
+    const rootKey = this.processKey(normalized);
+    if (!rootKey) return undefined;
+    const now = this.now();
+    const existing = this.rootsByKey.get(rootKey);
+    if (existing) {
+      if (existing.runtimeState !== 'running') return undefined;
+      if (existing.agentId !== text(match?.agentId)) return undefined;
+      existing.lastSeenAt = now;
+      existing.lastActivityAt = now;
+      existing.missedLivenessChecks = 0;
+      return existing;
+    }
+    this.pruneRoots();
+    if (this.rootsByKey.size >= this.maxRoots) return undefined;
+    const agentId = text(match?.agentId);
+    if (!agentId) return undefined;
+    const root = {
+      rootKey,
+      generation: 1,
+      runtimeState: 'running',
+      agentId,
+      agentDisplayName: text(match?.displayName) || agentId,
+      agentInstanceId: this.agentInstanceId(agentId, rootKey),
+      hostId: normalized.hostId,
+      bootId: normalized.bootId,
+      pid: normalized.pid,
+      rootPid: normalized.pid,
+      startTime: normalized.startTime,
+      comm: text(normalized.comm),
+      exe: text(normalized.exe),
+      cgroup: text(normalized.cgroup),
+      cgroupId: text(normalized.cgroupId),
+      cwd: text(normalized.cwd),
+      workspacePath: normalized.workspacePath,
+      signatureRuleId: match?.ruleId,
+      registryVersion: match?.registryVersion,
+      registryHash: match?.registryHash,
+      registryMatcherHash: match?.registryMatcherHash,
+      classification: 'probable_agent',
+      confidence: 0.85,
+      attributionSource: 'process_signature',
+      evidence: Array.isArray(match?.evidence) ? [...match.evidence] : [],
+      discoveredAt: now,
+      lastSeenAt: now,
+      lastActivityAt: now,
+      missedLivenessChecks: 0,
+    };
+    this.rootsByKey.set(rootKey, root);
+    this.stats.rootsDiscovered++;
+    this.transitions.push({
+      agentInstanceId: root.agentInstanceId,
+      rootKey,
+      runtimeState: 'running',
+      at: now,
+      reason: 'discovered',
+    });
+    if (this.transitions.length > this.maxTransitions) this.transitions.shift();
+    return root;
+  }
+
+  activeRootByPid(pid, hostId = this.hostId, bootId = this.bootId) {
+    const record = this.procs.get(pid, hostId, bootId);
+    return this.rootForRecord(record, false);
+  }
+
+  pruneRoots() {
+    const cutoff = this.now() - this.terminalRootTtlMs;
+    for (const [key, root] of this.rootsByKey) {
+      if (root.runtimeState !== 'running' && (root.endedAt || 0) < cutoff) this.rootsByKey.delete(key);
+    }
+    if (this.rootsByKey.size < this.maxRoots) return;
+    const terminal = [...this.rootsByKey.values()]
+      .filter((root) => root.runtimeState !== 'running')
+      .sort((a, b) => (a.endedAt || 0) - (b.endedAt || 0));
+    for (const root of terminal) {
+      if (this.rootsByKey.size < this.maxRoots) break;
+      this.rootsByKey.delete(root.rootKey);
+    }
+  }
+
+  checkRootLiveness() {
+    const checkedAt = this.now();
+    let checked = 0;
+    let lost = 0;
+    for (const root of this.rootsByKey.values()) {
+      if (root.runtimeState !== 'running') continue;
+      checked++;
+      this.stats.rootLivenessChecks++;
+      const observedStart = text(this.readStartTime(root.pid));
+      root.lastLivenessCheckAt = checkedAt;
+      if (observedStart && observedStart === root.startTime) {
+        root.missedLivenessChecks = 0;
+        root.lastLivenessAt = checkedAt;
+        continue;
+      }
+      this.stats.rootLivenessMisses++;
+      root.missedLivenessChecks += observedStart && observedStart !== root.startTime
+        ? this.livenessMissThreshold
+        : 1;
+      if (root.missedLivenessChecks < this.livenessMissThreshold) continue;
+      if (this.transition(root, 'lost', {
+        reason: observedStart ? 'pid_reused' : 'process_missing',
+      })) lost++;
+    }
+    this.pruneRoots();
+    return { checked, lost, checkedAt };
+  }
+
+  runtimeSnapshot() {
+    const now = this.now();
+    this.pruneRoots();
+    return {
+      schemaVersion: 'anysentry.agent_runtime_snapshot.v1',
+      generatedAt: new Date(now).toISOString(),
+      registryVersion: this.signatureRegistry.version,
+      registryHash: this.signatureRegistry.hash,
+      registryMatcherHash: this.signatureRegistry.matcherHash,
+      entries: [...this.rootsByKey.values()].map((root) => ({
+        agentScopeId: root.agentId,
+        agentDisplayName: root.agentDisplayName,
+        agentInstanceId: root.agentInstanceId,
+        physicalWorkloadId: root.physicalWorkloadId,
+        classification: root.classification || 'probable_agent',
+        runtimeState: root.runtimeState,
+        activityState: root.runtimeState === 'running'
+          ? now - root.lastActivityAt <= this.activityIdleMs ? 'active' : 'idle'
+          : undefined,
+        rootPid: root.pid,
+        rootStartTimeTicks: root.startTime,
+        rootGeneration: root.generation,
+        hostId: root.hostId,
+        bootId: root.bootId,
+        comm: root.comm || undefined,
+        exe: root.exe || undefined,
+        workspacePath: root.workspacePath,
+        discoveredAt: new Date(root.discoveredAt).toISOString(),
+        lastSeenAt: new Date(root.lastSeenAt).toISOString(),
+        lastActivityAt: new Date(root.lastActivityAt).toISOString(),
+        endedAt: root.endedAt ? new Date(root.endedAt).toISOString() : undefined,
+        exitCode: root.exitCode,
+        signal: root.signal,
+        confidence: root.confidence ?? 0.85,
+        source: root.attributionSource || 'process_signature',
+        evidence: root.evidence,
+        workloadRef: root.workloadRef ? { ...root.workloadRef } : undefined,
+      })),
+    };
+  }
+
+  /**
+   * Adds workload/template placement to the stable process-root record without changing its
+   * physical instance identity. Event attribution may intentionally use a container identity,
+   * while runtime lifecycle always remains keyed by this root's ProcessKey-derived instance ID.
+   */
+  enrichRuntimeRoot(processClassification, mergedClassification) {
+    const processAttribution = processClassification?.attribution;
+    const mergedAttribution = mergedClassification?.attribution;
+    const rootKey = text(processAttribution?.rootKey);
+    if (!rootKey || !mergedAttribution || typeof mergedAttribution !== 'object') return false;
+    const root = this.rootsByKey.get(rootKey);
+    if (!root || text(processAttribution.agentInstanceId) !== root.agentInstanceId) return false;
+
+    const physicalWorkloadId = text(mergedAttribution.physicalWorkloadId);
+    if (physicalWorkloadId) root.physicalWorkloadId = physicalWorkloadId;
+    if (
+      mergedAttribution.workloadRef &&
+      typeof mergedAttribution.workloadRef === 'object' &&
+      !Array.isArray(mergedAttribution.workloadRef)
+    ) {
+      root.workloadRef = { ...mergedAttribution.workloadRef };
+    }
+
+    const classification = text(mergedAttribution.classification).toLowerCase();
+    if (['confirmed_agent', 'probable_agent', 'unknown', 'non_agent'].includes(classification)) {
+      root.classification = classification;
+    }
+    const confidence = Number(mergedAttribution.confidence);
+    if (Number.isFinite(confidence)) root.confidence = Math.max(0, Math.min(1, confidence));
+    const source = text(mergedAttribution.source);
+    if (source) root.attributionSource = source;
+
+    const evidence = [
+      ...(Array.isArray(mergedAttribution.evidence) ? mergedAttribution.evidence : []),
+      ...(root.evidence || []),
+    ];
+    root.evidence = [...new Set(evidence.map(text).filter(Boolean))].slice(0, 16);
+    root.attributionConflict = mergedAttribution.conflict === true;
+    return true;
+  }
+
+  invalidateUnmatchedRoots() {
+    let invalidated = 0;
+    for (const root of this.rootsByKey.values()) {
+      if (root.runtimeState !== 'running') continue;
+      const current = this.readProcess(root.pid, 'reconcile');
+      const sameProcess = current && text(current.startTime) === root.startTime;
+      const match = sameProcess ? this.matchAgentExecutable(current) : undefined;
+      if (match && text(match.agentId) === root.agentId) continue;
+      if (this.transition(root, 'lost', {
+        reason: sameProcess ? 'signature_removed' : 'process_missing_during_reconcile',
+      })) invalidated++;
+    }
+    return invalidated;
+  }
+
+  reconcileFromProc(options = {}) {
+    const invalidated = options.invalidateSignatures ? this.invalidateUnmatchedRoots() : 0;
+    return { ...this.seedFromProc(), invalidated };
   }
 
   seedFromProc() {
@@ -211,21 +647,12 @@ class AgentAttributor {
 
     let roots = 0;
     for (const info of snapshot.values()) {
+      if (positiveInt(info.tgid) && positiveInt(info.tgid) !== info.pid) continue;
       const directAgent = this.matchAgentExecutable(info);
       if (!directAgent) continue;
-      this.remember({
-        ...info,
-        state: 'agent',
-        agentId: directAgent.agentId,
-        agentDisplayName: directAgent.displayName || directAgent.agentId,
-        signatureRuleId: directAgent.ruleId,
-        registryVersion: directAgent.registryVersion,
-        registryHash: directAgent.registryHash,
-        rootPid: info.tgid || info.pid,
-        workspacePath: this.resolveWorkspace(info.cwd).workspacePath,
-        lastSeen: now,
-      });
-      roots++;
+      const before = this.rootsByKey.size;
+      const result = this.rememberAgent(info, directAgent, info.pid, 'hint_only', 'process_signature');
+      if (result.state === 'agent' && this.rootsByKey.size > before) roots++;
     }
 
     let descendants = 0;
@@ -235,15 +662,15 @@ class AgentAttributor {
       const scope = this.resolveSnapshotScope(info, snapshot);
       if (!scope) continue;
       if (scope.state === 'agent') {
-        this.remember({
-          ...info,
-          state: 'agent',
-          agentId: scope.agentId,
-          rootPid: scope.rootPid,
-          ...this.resolveWorkspace(info.cwd, scope.workspacePath),
-          lastSeen: now,
-        });
-        descendants++;
+        const result = this.rememberAgent(
+          info,
+          scope,
+          scope.rootPid,
+          'process_lineage',
+          'process_graph',
+          scope.workspacePath,
+        );
+        if (result.state === 'agent') descendants++;
       } else if (scope.state === 'infrastructure') {
         this.remember({
           ...info,
@@ -261,7 +688,7 @@ class AgentAttributor {
     // unrelated host process walk /proc again. Unknown remains fail-open and is never promoted to
     // non-Agent merely because it appeared in the snapshot.
     for (const info of snapshot.values()) {
-      if (!this.procs.has(info.pid)) this.remember({ ...info, state: 'unknown', lastSeen: now });
+      if (!this.procs.hasFor(info)) this.remember({ ...info, state: 'unknown', lastSeen: now });
     }
     return {
       scanned: snapshot.size,
@@ -269,6 +696,90 @@ class AgentAttributor {
       descendants,
       infrastructureRoots: this.infrastructureRoots.size,
       infrastructureDescendants,
+    };
+  }
+
+  async reconcileFromProcBatched(options = {}) {
+    const batchSize = positiveInt(options.batchSize) || 128;
+    const yieldNow = typeof options.yieldNow === 'function'
+      ? options.yieldNow
+      : () => new Promise((resolve) => setImmediate(resolve));
+    const now = this.now();
+    const snapshot = new Map();
+    const pids = this.listPids().slice(0, this.maxProcs);
+    for (let offset = 0; offset < pids.length; offset += batchSize) {
+      for (const pid of pids.slice(offset, offset + batchSize)) {
+        const info = this.readProcess(pid, 'bootstrap');
+        if (info) snapshot.set(pid, info);
+      }
+      if (offset + batchSize < pids.length) await yieldNow();
+    }
+
+    let invalidated = 0;
+    if (options.invalidateSignatures) {
+      const liveByKey = new Map([...snapshot.values()].map((info) => [this.processKey(info), info]));
+      for (const root of this.rootsByKey.values()) {
+        if (root.runtimeState !== 'running') continue;
+        const current = liveByKey.get(root.rootKey);
+        const match = current ? this.matchAgentExecutable(current) : undefined;
+        if (match && text(match.agentId) === root.agentId) continue;
+        if (this.transition(root, 'lost', {
+          reason: current ? 'signature_removed' : 'process_missing_during_reconcile',
+        })) invalidated++;
+      }
+    }
+
+    let roots = 0;
+    const all = [...snapshot.values()];
+    for (let offset = 0; offset < all.length; offset += batchSize) {
+      for (const info of all.slice(offset, offset + batchSize)) {
+        if (positiveInt(info.tgid) && positiveInt(info.tgid) !== info.pid) continue;
+        const directAgent = this.matchAgentExecutable(info);
+        if (!directAgent) continue;
+        const before = this.rootsByKey.size;
+        const result = this.rememberAgent(info, directAgent, info.pid, 'hint_only', 'process_signature');
+        if (result.state === 'agent' && this.rootsByKey.size > before) roots++;
+      }
+      if (offset + batchSize < all.length) await yieldNow();
+    }
+
+    let descendants = 0;
+    let infrastructureDescendants = 0;
+    for (let offset = 0; offset < all.length; offset += batchSize) {
+      for (const info of all.slice(offset, offset + batchSize)) {
+        if (['agent', 'infrastructure'].includes(this.procs.getFor(info)?.state)) continue;
+        const scope = this.resolveSnapshotScope(info, snapshot);
+        if (scope?.state === 'agent') {
+          if (this.rememberAgent(
+            info,
+            scope,
+            scope.rootPid,
+            'process_lineage',
+            'process_graph',
+            scope.workspacePath,
+          ).state === 'agent') descendants++;
+        } else if (scope?.state === 'infrastructure') {
+          this.rememberInfrastructure(
+            info,
+            scope.rootPid,
+            scope.serviceName,
+            scope.containerId,
+          );
+          infrastructureDescendants++;
+        }
+      }
+      if (offset + batchSize < all.length) await yieldNow();
+    }
+    for (const info of all) {
+      if (!this.procs.hasFor(info)) this.remember({ ...info, state: 'unknown', lastSeen: now });
+    }
+    return {
+      scanned: snapshot.size,
+      roots,
+      descendants,
+      infrastructureRoots: this.infrastructureRoots.size,
+      infrastructureDescendants,
+      invalidated,
     };
   }
 
@@ -285,11 +796,17 @@ class AgentAttributor {
       const tgid = positiveInt(current.tgid);
       if (tgid && tgid !== current.pid) {
         const leader = this.procs.get(tgid);
-        if (leader?.state === 'agent') return this.agentScope(leader);
+        if (leader?.state === 'agent') {
+          const scope = this.agentScope(leader);
+          if (scope.state === 'agent') return scope;
+        }
         if (leader?.state === 'infrastructure') return this.infrastructureScope(leader);
       }
       const cached = this.procs.get(current.pid);
-      if (cached?.state === 'agent') return this.agentScope(cached);
+      if (cached?.state === 'agent') {
+        const scope = this.agentScope(cached);
+        if (scope.state === 'agent') return scope;
+      }
       if (cached?.state === 'infrastructure') return this.infrastructureScope(cached);
 
       const ppid = positiveInt(current.ppid);
@@ -309,7 +826,10 @@ class AgentAttributor {
     const exiting = Object.prototype.hasOwnProperty.call(observerEvent?.event ?? {}, 'ProcessExit');
     const toolExec = Object.prototype.hasOwnProperty.call(observerEvent?.event ?? {}, 'ToolExec');
     const observed = {
+      hostId: text(processInfo.hostId) || text(processInfo.host_id) || this.hostId,
+      bootId: text(processInfo.bootId) || text(processInfo.boot_id) || this.bootId,
       pid,
+      tgid: positiveInt(processInfo.tgid),
       ppid: positiveInt(processInfo.ppid) || positiveInt(payload.ppid),
       startTime:
         text(processInfo.startTimeTicks) ||
@@ -322,9 +842,11 @@ class AgentAttributor {
       argv: argvText(payload.argv),
       cgroup: text(processInfo.cgroup),
       cwd: text(processInfo.cwd) || text(payload.cwd),
+      exitCode: exiting ? payload.exitCode ?? payload.exit_code : undefined,
+      signal: exiting ? payload.signal : undefined,
     };
     this.discardReusedPid(observed);
-    const cached = this.procs.get(pid);
+    const cached = this.procs.getFor(observed, !observed.startTime);
     const sameCachedProcess = Boolean(
       cached &&
       (
@@ -350,10 +872,32 @@ class AgentAttributor {
     if (sameCachedProcess) this.stats.cacheHits++;
     else this.stats.cacheMisses++;
 
-    const directAgent = this.matchAgent(current);
-    if (directAgent) return this.finish(pid, this.rememberAgent(current, directAgent, pid, 'hint_only', 'argv'), exiting, current);
-
     const existing = sameCachedProcess ? cached : undefined;
+    // A stable cached binding is the hot path. ToolExec still evaluates the executable first so a
+    // nested Agent (for example Pi launched by Codex) can establish its own root instance.
+    if (!toolExec && existing?.state === 'agent' && this.rootForRecord(existing, false)) {
+      const workspace = canonicalWorkspacePath(observed.cwd)
+        ? this.resolveWorkspace(current.cwd, existing.workspacePath)
+        : {
+            workspacePath: existing.workspacePath,
+            workspaceSource: existing.workspaceSource || 'unresolved',
+            workspaceConflict: existing.workspaceConflict === true,
+          };
+      Object.assign(existing, current, workspace, { lastSeen: now });
+      return this.finish(pid, this.agentResult(existing), exiting, current);
+    }
+
+    const directAgent = this.matchAgent(current);
+    if (directAgent) {
+      const directResult = this.rememberAgent(
+        current,
+        directAgent,
+        pid,
+        'hint_only',
+        'process_signature',
+      );
+      if (directResult.state === 'agent') return this.finish(pid, directResult, exiting, current);
+    }
     // Observer normally supplies the complete process instance. `/proc` is now a cache-miss and
     // missing-fact fallback instead of an unconditional per-event read.
     if (!sameCachedProcess && (!current.ppid || !current.startTime || !current.comm || (!current.cgroup && !current.cwd))) {
@@ -389,7 +933,7 @@ class AgentAttributor {
       );
     }
 
-    if (existing?.state === 'agent') {
+    if (existing?.state === 'agent' && this.rootForRecord(existing)) {
       // A short process can emit ToolExec and ProcessExit after /proc/<pid>/cwd has already
       // disappeared. Preserve an earlier conflict decision for the same PID instead of silently
       // turning the later event into an unresolved-but-trusted Agent event.
@@ -406,9 +950,9 @@ class AgentAttributor {
     if (existing?.state === 'infrastructure') {
       return this.finish(pid, this.infrastructureResult(existing), exiting, current);
     }
-    const tombstone = this.tombstoneFor(current);
+    const tombstone = exiting ? this.tombstoneFor(current) : undefined;
     if (tombstone?.state === 'agent') {
-      return this.finish(pid, this.agentResult(tombstone), exiting, current);
+      return this.finish(pid, this.agentResult(tombstone, true), exiting, current);
     }
 
     // Routine file/network/security observations reuse a recent negative result. ToolExec and
@@ -427,7 +971,7 @@ class AgentAttributor {
         pid,
         this.rememberAgent(
           current,
-          ancestry.agentId,
+          ancestry,
           ancestry.rootPid,
           'process_lineage',
           'process_graph',
@@ -472,7 +1016,7 @@ class AgentAttributor {
 
   finish(pid, result, exiting, current) {
     if (exiting) {
-      const record = this.procs.get(pid) || (
+      const record = this.procs.getFor(current, true) || (
         result.state === 'agent'
           ? {
               ...current,
@@ -484,21 +1028,32 @@ class AgentAttributor {
           : undefined
       );
       if (record?.startTime) this.rememberTombstone(record);
-      this.procs.delete(pid);
+      const root = record?.rootKey ? this.rootsByKey.get(record.rootKey) : undefined;
+      if (root && record.processKey === root.rootKey && root.runtimeState === 'running') {
+        this.transition(root, 'exited', {
+          reason: 'process_exit',
+          exitCode: current.exitCode,
+          signal: current.signal,
+        });
+      }
+      this.procs.deleteRecord(record);
     }
     return result;
   }
 
   tombstoneFor(info) {
     this.pruneTombstones();
-    if (!info.startTime) return undefined;
-    const tombstone = this.tombstones.get(info.pid);
+    const key = this.processKey(info);
+    if (!key) return undefined;
+    const tombstone = this.tombstones.get(key);
     if (!tombstone || tombstone.expiresAt <= this.now()) return undefined;
-    return tombstone.record.startTime === info.startTime ? tombstone.record : undefined;
+    return tombstone.record;
   }
 
   rememberTombstone(record) {
-    this.tombstones.set(record.pid, {
+    const key = record.processKey || this.processKey(record);
+    if (!key) return;
+    this.tombstones.set(key, {
       record: { ...record },
       expiresAt: this.now() + this.tombstoneTtlMs,
     });
@@ -511,8 +1066,8 @@ class AgentAttributor {
 
   pruneTombstones() {
     const now = this.now();
-    for (const [pid, tombstone] of this.tombstones) {
-      if (tombstone.expiresAt <= now) this.tombstones.delete(pid);
+    for (const [key, tombstone] of this.tombstones) {
+      if (tombstone.expiresAt <= now) this.tombstones.delete(key);
     }
   }
 
@@ -526,7 +1081,10 @@ class AgentAttributor {
       visited.add(pid);
 
       const cached = this.procs.get(pid);
-      if (cached?.state === 'agent') return this.agentScope(cached);
+      if (cached?.state === 'agent') {
+        const scope = this.agentScope(cached);
+        if (scope.state === 'agent') return scope;
+      }
       if (cached?.state === 'infrastructure') return this.infrastructureScope(cached);
       if (cached?.state === 'non_agent' && cached.nextResolveAt > now) {
         return { state: 'non_agent' };
@@ -563,15 +1121,17 @@ class AgentAttributor {
         const leaderCached = this.procs.get(tgid);
         if (leaderCached?.state === 'agent') {
           const scope = this.agentScope(leaderCached);
-          this.remember({
-            ...live,
-            state: 'agent',
-            agentId: scope.agentId,
-            rootPid: scope.rootPid,
-            ...this.resolveWorkspace(live.cwd, scope.workspacePath),
-            lastSeen: now,
-          });
-          return scope;
+          if (scope.state === 'agent') {
+            this.rememberAgent(
+              live,
+              scope,
+              scope.rootPid,
+              'process_lineage',
+              'process_graph',
+              scope.workspacePath,
+            );
+            return scope;
+          }
         }
         if (leaderCached?.state === 'infrastructure') {
           this.remember({
@@ -591,33 +1151,40 @@ class AgentAttributor {
           const leaderAgent = this.matchAgent(leader);
           if (leaderAgent) {
             const { workspacePath } = this.resolveWorkspace(leader.cwd);
-            const root = { ...leader, state: 'agent', agentId: leaderAgent, rootPid: tgid, workspacePath, lastSeen: now };
-            this.remember(root);
-            this.remember({
-              ...live,
-              state: 'agent',
-              agentId: leaderAgent,
-              rootPid: tgid,
-              ...this.resolveWorkspace(live.cwd, workspacePath),
-              lastSeen: now,
-            });
-            return this.agentScope(root);
+            const leaderResult = this.rememberAgent(
+              { ...leader, workspacePath },
+              leaderAgent,
+              tgid,
+              'hint_only',
+              'process_signature',
+            );
+            if (leaderResult.state === 'agent') {
+              const rootRecord = this.procs.getFor(leader);
+              const scope = this.agentScope(rootRecord);
+              this.rememberAgent(
+                live,
+                scope,
+                tgid,
+                'process_lineage',
+                'process_graph',
+                workspacePath,
+              );
+              return scope;
+            }
           }
         }
       }
 
       const directAgent = this.matchAgent(live);
       if (directAgent) {
-        const root = {
-          ...live,
-          state: 'agent',
-          agentId: directAgent,
-          rootPid: pid,
-          workspacePath: this.resolveWorkspace(live.cwd).workspacePath,
-          lastSeen: now,
-        };
-        this.remember(root);
-        return this.agentScope(root);
+        this.rememberAgent(
+          live,
+          directAgent,
+          pid,
+          'hint_only',
+          'process_signature',
+        );
+        return this.agentScope(this.procs.getFor(live));
       }
 
       this.remember({ ...live, state: 'unknown', lastSeen: now });
@@ -628,23 +1195,7 @@ class AgentAttributor {
   }
 
   matchAgent(info) {
-    const executableMatch = this.matchAgentExecutable(info);
-    if (executableMatch) return executableMatch;
-    if (!this.builtinHintsEnabled) return undefined;
-    const argv = text(info.argv).toLowerCase();
-    if (!argv) return undefined;
-    // Only the command prefix is identity evidence. Scanning every argument lets untrusted
-    // prompts such as "Actor: a3s code" misclassify an ordinary node process as an Agent.
-    const tokens = argv.split(/\s+/).filter(Boolean);
-    const command = basename(tokens[0]);
-    if (command === 'codex') return { agentId: 'codex', displayName: 'Codex' };
-    if (command === 'a3s-code' || (command === 'a3s' && tokens[1] === 'code')) {
-      return { agentId: 'a3s code', displayName: 'A3S Code' };
-    }
-    if (command === 'claude' || command === 'claude-code' || (command === 'claude' && tokens[1] === 'code')) {
-      return { agentId: 'claude-code', displayName: 'Claude Code' };
-    }
-    return undefined;
+    return this.matchAgentExecutable(info);
   }
 
   matchAgentExecutable(info) {
@@ -656,18 +1207,34 @@ class AgentAttributor {
       ? agentId
       : { agentId, displayName: agentId };
     const workspace = this.resolveWorkspace(info.workspacePath || info.cwd, inheritedWorkspacePath);
+    const root = match.rootKey
+      ? this.rootsByKey.get(match.rootKey)
+      : this.ensureRoot({ ...info, ...workspace }, match);
+    if (!root || root.runtimeState !== 'running') return this.unknown();
+    const now = this.now();
+    root.lastSeenAt = now;
+    root.lastActivityAt = now;
+    if (!root.workspacePath && workspace.workspacePath) root.workspacePath = workspace.workspacePath;
     const record = {
       ...info,
+      hostId: text(info.hostId) || root.hostId,
+      bootId: text(info.bootId) || root.bootId,
       state: 'agent',
-      agentId: match.agentId,
-      agentDisplayName: match.displayName || match.agentId,
-      signatureRuleId: match.ruleId,
-      registryVersion: match.registryVersion,
-      registryHash: match.registryHash,
-      rootPid,
+      agentId: root.agentId,
+      agentDisplayName: root.agentDisplayName,
+      signatureRuleId: root.signatureRuleId,
+      registryVersion: root.registryVersion,
+      registryHash: root.registryHash,
+      registryMatcherHash: root.registryMatcherHash,
+      rootPid: root.pid,
+      rootKey: root.rootKey,
+      rootGeneration: root.generation,
+      agentInstanceId: root.agentInstanceId,
       ...workspace,
-      lastSeen: this.now(),
+      lastSeen: now,
     };
+    // Some late kernel events lack start-time after /proc has disappeared. They may inherit a
+    // still-live root for this event, but are deliberately not cached without a complete key.
     this.remember(record);
     return {
       state: 'agent',
@@ -675,24 +1242,35 @@ class AgentAttributor {
       attribution: {
         monitored: true,
         classification: 'probable_agent',
-        agentScopeId: match.agentId,
-        agentDisplayName: match.displayName || match.agentId,
-        rootPid,
+        agentScopeId: root.agentId,
+        agentDisplayName: root.agentDisplayName,
+        agentInstanceId: root.agentInstanceId,
+        rootPid: root.pid,
+        rootKey: root.rootKey,
+        rootStartTimeTicks: root.startTime,
+        rootGeneration: root.generation,
         confidence: source === 'process_graph' ? 0.9 : 0.85,
         reason,
         source,
         evidence: source === 'process_graph'
           ? ['process_lineage:agent_root']
-          : match.evidence?.length
-            ? match.evidence
+          : root.evidence?.length
+            ? root.evidence
             : ['process_signature:command'],
         ...(workspace.workspaceConflict ? { conflict: true } : {}),
       },
     };
   }
 
-  agentResult(record) {
-    record.lastSeen = this.now();
+  agentResult(record, allowTerminal = false) {
+    const root = record?.rootKey ? this.rootsByKey.get(record.rootKey) : undefined;
+    if (!root || (!allowTerminal && !this.rootForRecord(record))) return this.unknown();
+    const now = this.now();
+    record.lastSeen = now;
+    if (root.runtimeState === 'running') {
+      root.lastSeenAt = now;
+      root.lastActivityAt = now;
+    }
     return {
       state: 'agent',
       workspacePath: record.workspacePath,
@@ -703,7 +1281,11 @@ class AgentAttributor {
         classification: 'probable_agent',
         agentScopeId: record.agentId,
         agentDisplayName: record.agentDisplayName || record.agentId,
+        agentInstanceId: root.agentInstanceId,
         rootPid: record.rootPid,
+        rootKey: root.rootKey,
+        rootStartTimeTicks: root.startTime,
+        rootGeneration: record.rootGeneration,
         confidence: 0.9,
         reason: 'process_lineage',
         source: 'process_graph',
@@ -714,10 +1296,20 @@ class AgentAttributor {
   }
 
   agentScope(record) {
+    const root = this.rootForRecord(record);
+    if (!root) return { state: 'unknown' };
     return {
       state: 'agent',
-      agentId: record.agentId,
-      rootPid: record.rootPid,
+      agentId: root.agentId,
+      displayName: root.agentDisplayName,
+      rootPid: root.pid,
+      rootKey: root.rootKey,
+      rootGeneration: root.generation,
+      agentInstanceId: root.agentInstanceId,
+      signatureRuleId: root.signatureRuleId,
+      registryVersion: root.registryVersion,
+      registryHash: root.registryHash,
+      registryMatcherHash: root.registryMatcherHash,
       workspacePath: record.workspacePath,
     };
   }
@@ -841,27 +1433,36 @@ class AgentAttributor {
   }
 
   discardReusedPid(info) {
-    const existing = this.procs.get(info.pid);
-    if (existing?.startTime && info.startTime && existing.startTime !== info.startTime) this.procs.delete(info.pid);
-    const tombstone = this.tombstones.get(info.pid);
-    if (
-      tombstone?.record.startTime &&
-      info.startTime &&
-      tombstone.record.startTime !== info.startTime
-    ) {
-      this.tombstones.delete(info.pid);
+    const hostId = text(info.hostId) || this.hostId;
+    const bootId = text(info.bootId) || this.bootId;
+    const existing = this.procs.get(info.pid, hostId, bootId);
+    if (existing?.startTime && info.startTime && existing.startTime !== info.startTime) {
+      this.procs.deleteRecord(existing);
     }
   }
 
   remember(record) {
     const now = this.now();
     if (this.procs.size >= this.maxProcs) {
-      for (const [pid, item] of this.procs) {
-        if (item.lastSeen < now - RECORD_TTL_MS) this.procs.delete(pid);
+      for (const [, item] of this.procs) {
+        if (item.lastSeen < now - RECORD_TTL_MS) {
+          this.procs.deleteRecord(item);
+          this.stats.cacheEvictions++;
+        }
       }
-      if (this.procs.size >= this.maxProcs) this.procs.clear();
+      if (this.procs.size >= this.maxProcs) {
+        const candidates = [...this.procs.values()].sort((left, right) => {
+          const leftPriority = left.state === 'agent' ? 1 : 0;
+          const rightPriority = right.state === 'agent' ? 1 : 0;
+          return leftPriority - rightPriority || (left.lastSeen || 0) - (right.lastSeen || 0);
+        });
+        const target = Math.max(1, Math.ceil(this.maxProcs * 0.05));
+        for (let index = 0; index < target && this.procs.size >= this.maxProcs; index += 1) {
+          if (this.procs.deleteRecord(candidates[index])) this.stats.cacheEvictions++;
+        }
+      }
     }
-    this.procs.set(record.pid, {
+    return this.procs.set(record.pid, {
       ...record,
       nextResolveAt:
         record.state === 'agent'
@@ -883,10 +1484,13 @@ class AgentAttributor {
 
 module.exports = {
   AgentAttributor,
+  ProcessRecordStore,
   canonicalWorkspacePath,
   findGitWorkspace,
   isEphemeralWorkspacePath,
   containerIdFromCgroup,
   readProcInfo,
   listProcPids,
+  processKey,
+  readProcStartTime,
 };

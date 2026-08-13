@@ -14,6 +14,7 @@ const https = require('node:https');
 const crypto = require('node:crypto');
 const readline = require('node:readline');
 const { AgentAttributor } = require('./observer-agent-attribution');
+const { mergeAttributionClassifications } = require('./observer-attribution-merge');
 const { AgentTemplateRegistry, loadTemplateDocument } = require('./observer-agent-templates');
 const {
   RuntimeSignatureRegistry,
@@ -43,6 +44,14 @@ function defaultIdentitySnapshotUrl(ingestUrl) {
   const url = new URL(ingestUrl.toString());
   const nextPath = url.pathname.replace(/\/ingest(?:\/.*)?$/, '/identity/snapshot');
   url.pathname = nextPath === url.pathname ? '/security-center/identity/snapshot' : nextPath;
+  url.hash = '';
+  return url;
+}
+
+function defaultRuntimeSnapshotUrl(ingestUrl) {
+  const url = new URL(ingestUrl.toString());
+  const nextPath = url.pathname.replace(/\/ingest(?:\/.*)?$/, '/runtime/snapshot');
+  url.pathname = nextPath === url.pathname ? '/security-center/runtime/snapshot' : nextPath;
   url.hash = '';
   return url;
 }
@@ -97,6 +106,21 @@ const identitySnapshotTarget = new URL(
   process.env.ANYSENTRY_IDENTITY_SNAPSHOT_URL || defaultIdentitySnapshotUrl(target),
 );
 if (NODE_NAME) identitySnapshotTarget.searchParams.set('nodeName', NODE_NAME);
+const RUNTIME_SNAPSHOT_SECS = boundedNumber(
+  process.env.ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_SECS,
+  10,
+  1,
+  300,
+);
+const ROOT_LIVENESS_SECS = boundedNumber(
+  process.env.ANYSENTRY_AGENT_RUNTIME_LIVENESS_SECS,
+  5,
+  1,
+  300,
+);
+const runtimeSnapshotTarget = new URL(
+  process.env.ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL || defaultRuntimeSnapshotUrl(target),
+);
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_INFLIGHT });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_INFLIGHT });
 let templateDocument;
@@ -109,18 +133,16 @@ try {
   console.error(`[observer-forward] agent templates ignored: ${error.message}`);
 }
 const templateRegistry = new AgentTemplateRegistry(templateDocument);
-let signatureDocument;
 let signatureLoadErrors = 0;
+const signatureRegistry = new RuntimeSignatureRegistry(undefined, { source: 'builtin' });
 try {
-  signatureDocument = loadSignatureDocument();
+  const signatureDocument = loadSignatureDocument();
+  const loaded = signatureRegistry.replaceSafely(signatureDocument.document, signatureDocument.source);
+  if (!loaded.ok) throw new Error(loaded.error);
 } catch (error) {
   signatureLoadErrors++;
-  signatureDocument = loadSignatureDocument({ env: {} });
   console.error(`[observer-forward] Agent runtime signatures ignored: ${error.message}`);
 }
-const signatureRegistry = new RuntimeSignatureRegistry(signatureDocument.document, {
-  source: signatureDocument.source,
-});
 const attributor = new AgentAttributor({ signatureRegistry });
 const workloadCache = new WorkloadIdentityCache({ templateRegistry });
 const dockerDiscovery = new DockerDiscovery({
@@ -165,9 +187,35 @@ let attributionCounts = {
 let closing = false;
 let heartbeatTimer;
 let identitySnapshotTimer;
+let runtimeSnapshotTimer;
+let rootLivenessTimer;
 let batchTimer;
 let signatureReloader;
 let rl;
+let runtimeSnapshotVersion = 0;
+let runtimeSnapshotPosts = 0;
+let runtimeSnapshotErrors = 0;
+let lastRuntimeSnapshotAt = '';
+let reconcileTimer;
+let reconcileRunning = false;
+let reconcilePending = false;
+let reconcileRequestedAt = 0;
+const RECONCILE_MIN_INTERVAL_MS = boundedNumber(
+  process.env.ANYSENTRY_AGENT_RUNTIME_RECONCILE_MIN_MS,
+  2_000,
+  250,
+  60_000,
+);
+let reconciliationMetrics = {
+  requested: 0,
+  runs: 0,
+  coalesced: 0,
+  errors: 0,
+  scanned: 0,
+  roots: 0,
+  invalidated: 0,
+  lastDurationMs: 0,
+};
 
 function isNoise(o) {
   const fa = o.event && o.event.FileAccess;
@@ -316,6 +364,77 @@ function refreshIdentitySnapshot() {
   });
 }
 
+function runtimeSnapshotBody(ready = true) {
+  runtimeSnapshotVersion += 1;
+  return {
+    ...attributor.runtimeSnapshot(),
+    collectorId: COLLECTOR_ID || NODE_NAME || 'observer-forwarder',
+    forwarderInstanceId,
+    snapshotVersion: runtimeSnapshotVersion,
+    ready,
+    intervalSecs: RUNTIME_SNAPSHOT_SECS,
+    filterMode: FILTER_MODE,
+  };
+}
+
+function sendRuntimeSnapshot(ready = true, done = () => {}) {
+  postJson(runtimeSnapshotTarget, runtimeSnapshotBody(ready), 5_000, (failed) => {
+    runtimeSnapshotPosts++;
+    lastRuntimeSnapshotAt = new Date().toISOString();
+    if (failed) {
+      runtimeSnapshotErrors++;
+      errorCount++;
+    }
+    done(Boolean(failed));
+  });
+}
+
+async function runReconciliation() {
+  if (closing || reconcileRunning) {
+    reconcilePending = true;
+    reconciliationMetrics.coalesced++;
+    return;
+  }
+  reconcileRunning = true;
+  reconcileTimer = undefined;
+  const startedAt = Date.now();
+  try {
+    const result = await attributor.reconcileFromProcBatched({ invalidateSignatures: true });
+    reconciliationMetrics.runs++;
+    reconciliationMetrics.scanned = result.scanned;
+    reconciliationMetrics.roots = result.roots;
+    reconciliationMetrics.invalidated = result.invalidated;
+    reconciliationMetrics.lastDurationMs = Date.now() - startedAt;
+    console.error(
+      `[observer-forward] Agent runtime reconciliation: scanned=${result.scanned}; ` +
+      `roots=${result.roots}; invalidated=${result.invalidated}; ` +
+      `duration_ms=${reconciliationMetrics.lastDurationMs}`,
+    );
+  } catch (error) {
+    reconciliationMetrics.errors++;
+    console.error(`[observer-forward] Agent runtime reconciliation failed: ${error.message}`);
+  } finally {
+    reconcileRunning = false;
+    reconcileRequestedAt = Date.now();
+    if (reconcilePending && !closing) {
+      reconcilePending = false;
+      requestReconciliation();
+    }
+  }
+}
+
+function requestReconciliation() {
+  reconciliationMetrics.requested++;
+  if (closing || reconcileTimer || reconcileRunning) {
+    reconcilePending = true;
+    reconciliationMetrics.coalesced++;
+    return;
+  }
+  const delay = Math.max(0, reconcileRequestedAt + RECONCILE_MIN_INTERVAL_MS - Date.now());
+  reconcileTimer = setTimeout(() => void runReconciliation(), delay);
+  reconcileTimer.unref();
+}
+
 function sendHeartbeat(done = () => {}) {
   if (!HEARTBEAT_SECS) {
     done(false);
@@ -330,6 +449,8 @@ function sendHeartbeat(done = () => {}) {
   const behavior = behaviorDetector.metrics();
   const templates = templateRegistry.metrics();
   const processes = attributor.metrics();
+  const signatures = processes.runtimeSignatures || {};
+  const reloader = signatureReloader?.metrics() || {};
   eventKindCounts = Object.create(null);
   attributionCounts = {
     observed: 0,
@@ -422,6 +543,34 @@ function sendHeartbeat(done = () => {}) {
         processBootstrapProcReads: processes.bootstrapProcReads,
         processFallbackProcReads: processes.fallbackProcReads,
         processAncestryProcReads: processes.ancestryProcReads,
+        processRootsDiscovered: processes.rootsDiscovered,
+        processRootsExited: processes.rootsExited,
+        processRootsLost: processes.rootsLost,
+        processRootLivenessChecks: processes.rootLivenessChecks,
+        processRootLivenessMisses: processes.rootLivenessMisses,
+        processStaleGenerationMisses: processes.staleGenerationMisses,
+        runtimeSignatureVersion: signatures.version,
+        runtimeSignatureHash: signatures.hash,
+        runtimeSignatureMatcherHash: signatures.matcherHash,
+        runtimeSignatureLoaded: signatures.loaded,
+        runtimeSignatureMatches: signatures.matches,
+        runtimeSignatureMisses: signatures.misses,
+        runtimeSignatureAmbiguous: signatures.ambiguous,
+        runtimeSignatureInvalid: (signatures.invalid || 0) + signatureLoadErrors,
+        runtimeSignatureReloadAttempts: reloader.reloadAttempts || 0,
+        runtimeSignatureReloadSuccesses: reloader.reloadSuccesses || 0,
+        runtimeSignatureReloadErrors: reloader.reloadErrors || 0,
+        runtimeSignatureLastGoodHash: reloader.lastGoodRawHash,
+        runtimeReconcileRequested: reconciliationMetrics.requested,
+        runtimeReconcileRuns: reconciliationMetrics.runs,
+        runtimeReconcileCoalesced: reconciliationMetrics.coalesced,
+        runtimeReconcileErrors: reconciliationMetrics.errors,
+        runtimeReconcileScanned: reconciliationMetrics.scanned,
+        runtimeReconcileInvalidated: reconciliationMetrics.invalidated,
+        runtimeReconcileLastDurationMs: reconciliationMetrics.lastDurationMs,
+        runtimeSnapshotPosts,
+        runtimeSnapshotErrors,
+        lastRuntimeSnapshotAt: lastRuntimeSnapshotAt || undefined,
         infrastructure: classifications.infrastructure,
         workspaceConflict: classifications.workspaceConflict,
       },
@@ -440,6 +589,8 @@ function sendHeartbeat(done = () => {}) {
 }
 
 function closeTransports() {
+  if (reconcileTimer) clearTimeout(reconcileTimer);
+  reconcileTimer = undefined;
   signatureReloader?.close();
   dockerDiscovery.stop();
   infrastructureResolver.close();
@@ -518,6 +669,9 @@ function flushAndClose() {
   closing = true;
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   if (identitySnapshotTimer) clearInterval(identitySnapshotTimer);
+  if (runtimeSnapshotTimer) clearInterval(runtimeSnapshotTimer);
+  if (rootLivenessTimer) clearInterval(rootLivenessTimer);
+  if (reconcileTimer) clearTimeout(reconcileTimer);
   if (batchTimer) clearTimeout(batchTimer);
   batchTimer = undefined;
   while (pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
@@ -533,9 +687,9 @@ function flushAndClose() {
       outputDropped += abandoned;
       attributionCounts.queueDropped += abandoned;
     }
-    sendHeartbeat(() => {
-      closeTransports();
-    });
+    // The API derives `unobserved` when this forwarder stops reporting. A ready snapshot is
+    // intentionally monotonic, so do not attempt to regress it during graceful shutdown.
+    sendRuntimeSnapshot(true, () => sendHeartbeat(() => closeTransports()));
   };
   waitForInflight();
 }
@@ -559,15 +713,20 @@ function handleLine(raw) {
   }
   const workloadClassification = workloadCache.classify(o);
   const templateClassification = templateRegistry.classifyEvent(o);
-  const baseClassification =
-    templateClassification ??
-    workloadClassification ??
-    processClassification;
+  const baseClassification = mergeAttributionClassifications(
+    processClassification,
+    workloadClassification,
+    templateClassification,
+  ) ?? processClassification;
   const classification =
     (behaviorDiscoveryEligible(baseClassification)
       ? behaviorDetector.observe(o, baseClassification.attribution)
       : undefined) ??
     baseClassification;
+  // Runtime lifecycle is rooted in ProcessKey, but placement/confirmation can come from Docker,
+  // Kubernetes, or a trusted template. Enrich the root after field-level merge without replacing
+  // its process-instance ID with a workload-level ID.
+  attributor.enrichRuntimeRoot(processClassification, classification);
   const classificationName = classification.attribution?.classification;
   if (classification.state === 'agent' && classificationName === 'confirmed_agent') {
     attributionCounts.confirmedAgent++;
@@ -646,11 +805,11 @@ async function start() {
       registry: signatureRegistry,
       filePath: signatureFile,
       onReload: (reload) => {
-        const reconciliation = attributor.seedFromProc();
         console.error(
           `[observer-forward] Agent runtime signatures reloaded: version=${reload.version}; ` +
-          `hash=${reload.hash}; scanned=${reconciliation.scanned}; roots=${reconciliation.roots}`,
+          `hash=${reload.hash}; matcher_changed=${reload.matcherChanged}`,
         );
+        if (reload.matcherChanged) requestReconciliation();
       },
       onError: (error) => {
         signatureLoadErrors++;
@@ -678,6 +837,11 @@ async function start() {
     identitySnapshotTimer = setInterval(refreshIdentitySnapshot, IDENTITY_SNAPSHOT_SECS * 1000);
     identitySnapshotTimer.unref();
   }
+  sendRuntimeSnapshot(true);
+  runtimeSnapshotTimer = setInterval(() => sendRuntimeSnapshot(true), RUNTIME_SNAPSHOT_SECS * 1_000);
+  runtimeSnapshotTimer.unref();
+  rootLivenessTimer = setInterval(() => attributor.checkRootLiveness(), ROOT_LIVENESS_SECS * 1_000);
+  rootLivenessTimer.unref();
 
   rl = readline.createInterface({ input: process.stdin });
   rl.on('line', handleLine);

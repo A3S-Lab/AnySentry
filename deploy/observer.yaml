@@ -87,6 +87,9 @@ spec:
             # projection is read-only; operators update it with kubectl, while directory watch plus
             # periodic hash polling handles Kubernetes' atomic `..data` symlink rotation.
             - { name: ANYSENTRY_AGENT_RUNTIME_SIGNATURES_FILE, value: "/etc/anysentry/agent-runtime-signatures.json" }
+            - { name: ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL, value: "http://anysentry:29653/security-center/runtime/snapshot" }
+            - { name: ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_SECS, value: "10" }
+            - { name: ANYSENTRY_AGENT_RUNTIME_LIVENESS_SECS, value: "5" }
             # Bound memory and amortize HTTP/JSON overhead without adding perceptible UI delay.
             - { name: FORWARD_BATCH_SIZE, value: "32" }
             - { name: FORWARD_BATCH_FLUSH_MS, value: "50" }

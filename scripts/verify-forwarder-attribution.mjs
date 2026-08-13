@@ -9,12 +9,29 @@ const { ToolExecDeduper } = require('./observer-event-dedup.js');
 const { DiscoveryBudget, WorkloadIdentityCache } = require('./observer-workload-filter.js');
 const { InfrastructureRootResolver, staticRoots } = require('./observer-infrastructure-roots.js');
 
-function observerEvent({ agent = 'process', pid, ppid, comm, exe, startTimeNs, cwd = '/workspace', argv = [] }) {
+function observerEvent({
+  agent = 'process',
+  pid,
+  ppid,
+  comm,
+  exe,
+  startTimeNs,
+  hostId,
+  bootId,
+  cwd = '/workspace',
+  argv = [],
+}) {
   return {
     identity: { agent, task: String(pid), session: null },
-    process: { pid, ppid, comm, exe, startTimeNs, cwd },
+    process: { pid, ppid, comm, exe, startTimeNs, hostId, bootId, cwd },
     event: { ToolExec: { pid, ppid, uid: 1000, cwd, argv } },
   };
+}
+
+function processExitEvent(options, exitCode = 0, signal = 0) {
+  const event = observerEvent({ ...options, argv: [] });
+  event.event = { ProcessExit: { pid: options.pid, exit_code: exitCode, signal } };
+  return event;
 }
 
 function attributor(procEntries = []) {
@@ -485,11 +502,419 @@ function attributor(procEntries = []) {
   assert.equal(judge.classify(exitEvent).state, 'agent');
   assert.equal(judge.metrics().tombstones, 1);
   const late = observerEvent({ pid: 600, ppid: 999, comm: 'bash', exe: '/usr/bin/bash', startTimeNs: '60', argv: ['bash', '-c', 'echo late'] });
-  assert.equal(judge.classify(late).state, 'agent', 'a late event reuses the matching process tombstone');
+  assert.notEqual(
+    judge.classify(late).state,
+    'agent',
+    'a root tombstone may deduplicate ProcessExit but must not revive the exited subtree',
+  );
   const reused = judge.classify(observerEvent({ pid: 600, ppid: 999, comm: 'short-task', exe: '/usr/bin/short-task', startTimeNs: '', argv: ['short-task'] }));
   assert.equal(reused.state, 'unknown');
   now += 5_001;
   assert.equal(judge.metrics().tombstones, 0);
+}
+
+{
+  const judge = new AgentAttributor({
+    hostId: 'host-a',
+    bootId: 'boot-a',
+    readProc: () => undefined,
+    listPids: () => [],
+  });
+  const base = { hostId: 'host-a', bootId: 'boot-a', pid: 2_000, startTime: '200' };
+  const processKeys = new Set([
+    judge.processKey(base),
+    judge.processKey({ ...base, hostId: 'host-b' }),
+    judge.processKey({ ...base, bootId: 'boot-b' }),
+    judge.processKey({ ...base, pid: 2_001 }),
+    judge.processKey({ ...base, startTime: '201' }),
+  ]);
+  assert.equal(
+    processKeys.size,
+    5,
+    'host, boot, pid, and start time must each isolate a ProcessKey',
+  );
+  assert.equal(judge.processKey({ ...base, startTime: '' }), undefined);
+}
+
+{
+  const judge = new AgentAttributor({
+    hostId: 'host-two-roots',
+    bootId: 'boot-two-roots',
+    now: () => 2_000_000,
+    readProc: () => undefined,
+    listPids: () => [],
+  });
+  const first = judge.classify(observerEvent({
+    pid: 2_100,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '210',
+    cwd: '/workspace/first',
+    argv: ['codex'],
+  }));
+  const second = judge.classify(observerEvent({
+    pid: 2_200,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '220',
+    cwd: '/workspace/second',
+    argv: ['codex'],
+  }));
+  assert.equal(first.state, 'agent');
+  assert.equal(second.state, 'agent');
+  assert.equal(first.attribution.agentScopeId, 'codex');
+  assert.equal(second.attribution.agentScopeId, 'codex');
+  assert.ok(first.attribution.agentInstanceId, 'a discovered root must expose an instance ID');
+  assert.ok(second.attribution.agentInstanceId, 'a discovered root must expose an instance ID');
+  assert.notEqual(
+    first.attribution.agentInstanceId,
+    second.attribution.agentInstanceId,
+    'two roots of the same Agent scope must remain separate instances',
+  );
+  assert.notEqual(first.attribution.rootKey, second.attribution.rootKey);
+  assert.equal(judge.runtimeSnapshot().entries.filter((entry) => entry.agentScopeId === 'codex').length, 2);
+}
+
+{
+  let now = 3_000_000;
+  const judge = new AgentAttributor({
+    hostId: 'host-generation',
+    bootId: 'boot-generation',
+    now: () => now,
+    readProc: () => undefined,
+    listPids: () => [],
+  });
+  const rootAEvent = {
+    pid: 2_300,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '230',
+    cwd: '/workspace/root-a',
+  };
+  const rootBEvent = {
+    pid: 2_400,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '240',
+    cwd: '/workspace/root-b',
+  };
+  const rootA = judge.classify(observerEvent({ ...rootAEvent, argv: ['codex'] }));
+  const rootB = judge.classify(observerEvent({ ...rootBEvent, argv: ['codex'] }));
+  const childAEvent = {
+    pid: 2_301,
+    ppid: 2_300,
+    comm: 'bash',
+    exe: '/usr/bin/bash',
+    startTimeNs: '231',
+    cwd: '/workspace/root-a',
+    argv: ['bash', '-lc', 'echo first'],
+  };
+  const childBEvent = {
+    pid: 2_401,
+    ppid: 2_400,
+    comm: 'bash',
+    exe: '/usr/bin/bash',
+    startTimeNs: '241',
+    cwd: '/workspace/root-b',
+    argv: ['bash', '-lc', 'echo second'],
+  };
+  const childA = judge.classify(observerEvent(childAEvent));
+  const childB = judge.classify(observerEvent(childBEvent));
+  assert.equal(childA.attribution.agentInstanceId, rootA.attribution.agentInstanceId);
+  assert.equal(childB.attribution.agentInstanceId, rootB.attribution.agentInstanceId);
+
+  const childABinding = judge.procs.get(2_301);
+  const rootABeforeExit = judge.rootsByKey.get(rootA.attribution.rootKey);
+  assert.equal(childABinding.rootGeneration, rootABeforeExit.generation);
+
+  now += 10;
+  const exited = judge.classify(processExitEvent(rootAEvent, 17, 0));
+  assert.equal(exited.attribution.agentInstanceId, rootA.attribution.agentInstanceId);
+  const rootAAfterExit = judge.rootsByKey.get(rootA.attribution.rootKey);
+  assert.equal(rootAAfterExit.runtimeState, 'exited');
+  assert.ok(rootAAfterExit.generation > childABinding.rootGeneration);
+
+  const staleMissesBefore = judge.metrics().staleGenerationMisses;
+  const orphanedChild = judge.classify(observerEvent({
+    ...childAEvent,
+    argv: ['bash', '-lc', 'echo after-root-exit'],
+  }));
+  assert.notEqual(
+    orphanedChild.attribution?.agentInstanceId,
+    rootA.attribution.agentInstanceId,
+    'a descendant must not hit an exited root generation',
+  );
+  assert.ok(judge.metrics().staleGenerationMisses > staleMissesBefore);
+
+  const unaffectedChild = judge.classify(observerEvent({
+    ...childBEvent,
+    argv: ['bash', '-lc', 'echo root-b-still-running'],
+  }));
+  assert.equal(unaffectedChild.state, 'agent');
+  assert.equal(unaffectedChild.attribution.agentInstanceId, rootB.attribution.agentInstanceId);
+  assert.equal(
+    judge.runtimeSnapshot().entries.find(
+      (entry) => entry.agentInstanceId === rootB.attribution.agentInstanceId,
+    )?.runtimeState,
+    'running',
+  );
+}
+
+{
+  let now = 4_000_000;
+  const liveStartTimes = new Map([[2_500, '250']]);
+  const judge = new AgentAttributor({
+    hostId: 'host-lost',
+    bootId: 'boot-lost',
+    now: () => now,
+    readProc: () => undefined,
+    readStartTime: (pid) => liveStartTimes.get(pid),
+    livenessMissThreshold: 2,
+    listPids: () => [],
+  });
+  const root = judge.classify(observerEvent({
+    pid: 2_500,
+    ppid: 1,
+    comm: 'pi',
+    exe: '/usr/bin/node',
+    startTimeNs: '250',
+    argv: ['pi'],
+  }));
+  const initialGeneration = root.attribution.rootGeneration;
+  liveStartTimes.delete(2_500);
+
+  now += 5_000;
+  assert.deepEqual(judge.checkRootLiveness(), { checked: 1, lost: 0, checkedAt: now });
+  assert.equal(
+    judge.runtimeSnapshot().entries.find(
+      (entry) => entry.agentInstanceId === root.attribution.agentInstanceId,
+    )?.runtimeState,
+    'running',
+    'one missing liveness read is only suspect, not lost',
+  );
+
+  now += 5_000;
+  assert.deepEqual(judge.checkRootLiveness(), { checked: 1, lost: 1, checkedAt: now });
+  const lost = judge.runtimeSnapshot().entries.find(
+    (entry) => entry.agentInstanceId === root.attribution.agentInstanceId,
+  );
+  assert.equal(lost.runtimeState, 'lost');
+  assert.equal(lost.activityState, undefined);
+  assert.ok(lost.rootGeneration > initialGeneration);
+  assert.equal(judge.metrics().rootsLost, 1);
+}
+
+{
+  let now = 5_000_000;
+  let observedStart = '260';
+  const judge = new AgentAttributor({
+    hostId: 'host-pid-reuse',
+    bootId: 'boot-pid-reuse',
+    now: () => now,
+    readProc: () => undefined,
+    readStartTime: () => observedStart,
+    livenessMissThreshold: 2,
+    listPids: () => [],
+  });
+  const oldRoot = judge.classify(observerEvent({
+    pid: 2_600,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '260',
+    argv: ['codex'],
+  }));
+  observedStart = '261';
+  now += 1;
+  const reusedRoot = judge.classify(observerEvent({
+    pid: 2_600,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '261',
+    argv: ['codex'],
+  }));
+  assert.notEqual(reusedRoot.attribution.rootKey, oldRoot.attribution.rootKey);
+  assert.notEqual(reusedRoot.attribution.agentInstanceId, oldRoot.attribution.agentInstanceId);
+  assert.equal(judge.checkRootLiveness().lost, 1, 'a reused PID invalidates the old root immediately');
+  const snapshot = judge.runtimeSnapshot().entries;
+  assert.equal(
+    snapshot.find((entry) => entry.agentInstanceId === oldRoot.attribution.agentInstanceId)?.runtimeState,
+    'lost',
+  );
+  assert.equal(
+    snapshot.find((entry) => entry.agentInstanceId === reusedRoot.attribution.agentInstanceId)?.runtimeState,
+    'running',
+  );
+}
+
+{
+  let now = 6_000_000;
+  const liveStartTimes = new Map([
+    [2_700, '270'],
+    [2_800, '280'],
+  ]);
+  const judge = new AgentAttributor({
+    hostId: 'host-runtime-snapshot',
+    bootId: 'boot-runtime-snapshot',
+    now: () => now,
+    readProc: () => undefined,
+    readStartTime: (pid) => liveStartTimes.get(pid),
+    livenessMissThreshold: 2,
+    activityIdleMs: 1_000,
+    listPids: () => [],
+  });
+  const exitedRootEvent = {
+    pid: 2_700,
+    ppid: 1,
+    comm: 'Kimi Code',
+    exe: '/usr/bin/python3',
+    startTimeNs: '270',
+    argv: ['Kimi Code'],
+  };
+  const exitedRoot = judge.classify(observerEvent(exitedRootEvent));
+  const lostRoot = judge.classify(observerEvent({
+    pid: 2_800,
+    ppid: 1,
+    comm: 'pi',
+    exe: '/usr/bin/node',
+    startTimeNs: '280',
+    argv: ['pi'],
+  }));
+
+  let snapshot = judge.runtimeSnapshot();
+  assert.equal(
+    snapshot.entries.find((entry) => entry.agentInstanceId === exitedRoot.attribution.agentInstanceId)?.activityState,
+    'active',
+  );
+  assert.equal(
+    snapshot.entries.find((entry) => entry.agentInstanceId === lostRoot.attribution.agentInstanceId)?.activityState,
+    'active',
+  );
+
+  now += 1_001;
+  snapshot = judge.runtimeSnapshot();
+  assert.equal(
+    snapshot.entries.find((entry) => entry.agentInstanceId === exitedRoot.attribution.agentInstanceId)?.activityState,
+    'idle',
+  );
+  assert.equal(
+    snapshot.entries.find((entry) => entry.agentInstanceId === lostRoot.attribution.agentInstanceId)?.activityState,
+    'idle',
+  );
+
+  now += 1;
+  judge.classify(processExitEvent(exitedRootEvent, 0, 15));
+  liveStartTimes.delete(2_800);
+  judge.checkRootLiveness();
+  now += 5_000;
+  judge.checkRootLiveness();
+  snapshot = judge.runtimeSnapshot();
+  const exited = snapshot.entries.find(
+    (entry) => entry.agentInstanceId === exitedRoot.attribution.agentInstanceId,
+  );
+  const lost = snapshot.entries.find(
+    (entry) => entry.agentInstanceId === lostRoot.attribution.agentInstanceId,
+  );
+  assert.equal(exited.runtimeState, 'exited');
+  assert.equal(exited.activityState, undefined);
+  assert.equal(exited.exitCode, 0);
+  assert.equal(exited.signal, 15);
+  assert.ok(exited.endedAt);
+  assert.equal(lost.runtimeState, 'lost');
+  assert.equal(lost.activityState, undefined);
+  assert.ok(lost.endedAt);
+}
+
+{
+  const judge = new AgentAttributor({
+    hostId: 'host-runtime-placement',
+    bootId: 'boot-runtime-placement',
+    now: () => 6_500_000,
+    readProc: () => undefined,
+    listPids: () => [],
+  });
+  const processResult = judge.classify(observerEvent({
+    pid: 2_900,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '290',
+    argv: ['codex'],
+  }));
+  assert.equal(judge.enrichRuntimeRoot(processResult, {
+    state: 'agent',
+    attribution: {
+      monitored: true,
+      classification: 'confirmed_agent',
+      agentScopeId: 'workload-codex',
+      agentInstanceId: 'pod-a/container-a',
+      physicalWorkloadId: 'k8s:cluster-a:pod-a:container-a',
+      workloadRef: {
+        environment: 'kubernetes',
+        kind: 'pod',
+        namespace: 'agents',
+        podName: 'codex-a',
+      },
+      confidence: 1,
+      source: 'kubernetes',
+      conflict: true,
+      evidence: ['identity_conflict:agentScopeId'],
+    },
+  }), true);
+  const runtime = judge.runtimeSnapshot().entries[0];
+  assert.equal(
+    runtime.agentInstanceId,
+    processResult.attribution.agentInstanceId,
+    'workload enrichment must not replace the ProcessKey-derived runtime instance ID',
+  );
+  assert.equal(runtime.agentScopeId, 'codex');
+  assert.equal(runtime.classification, 'confirmed_agent');
+  assert.equal(runtime.physicalWorkloadId, 'k8s:cluster-a:pod-a:container-a');
+  assert.equal(runtime.source, 'kubernetes');
+  assert.deepEqual(runtime.workloadRef, {
+    environment: 'kubernetes',
+    kind: 'pod',
+    namespace: 'agents',
+    podName: 'codex-a',
+  });
+  assert.ok(runtime.evidence.includes('identity_conflict:agentScopeId'));
+}
+
+{
+  const procs = new Map(Array.from({ length: 260 }, (_, index) => {
+    const pid = 3_000 + index;
+    return [pid, {
+      pid,
+      tgid: pid,
+      ppid: 1,
+      startTime: String(pid * 10),
+      comm: index === 259 ? 'codex' : 'worker',
+      exe: index === 259 ? '/usr/bin/codex' : '/usr/bin/worker',
+      argv: index === 259 ? 'codex' : 'worker',
+      cwd: '/workspace',
+    }];
+  }));
+  let yields = 0;
+  const judge = new AgentAttributor({
+    hostId: 'host-batched-reconcile',
+    bootId: 'boot-batched-reconcile',
+    now: () => 7_000_000,
+    listPids: () => [...procs.keys()],
+    readProc: (pid) => procs.get(pid),
+  });
+  const result = await judge.reconcileFromProcBatched({
+    batchSize: 64,
+    yieldNow: async () => { yields += 1; },
+  });
+  assert.equal(result.scanned, 260);
+  assert.equal(result.roots, 1);
+  assert.ok(yields >= 8, 'large reconciliation must yield between read and attribution batches');
+  assert.equal(judge.runtimeSnapshot().entries[0]?.agentScopeId, 'codex');
 }
 
 {

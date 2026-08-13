@@ -78,6 +78,7 @@ services:
       # is unavailable or an older observer image is already cached locally.
       - ../../scripts/observer-forward.js:/opt/observer-forward.js:ro
       - ../../scripts/observer-agent-attribution.js:/opt/observer-agent-attribution.js:ro
+      - ../../scripts/observer-attribution-merge.js:/opt/observer-attribution-merge.js:ro
       - ../../scripts/observer-agent-runtime-signatures.js:/opt/observer-agent-runtime-signatures.js:ro
       - ../../scripts/observer-agent-templates.js:/opt/observer-agent-templates.js:ro
       - ../../scripts/observer-docker-discovery.js:/opt/observer-docker-discovery.js:ro
