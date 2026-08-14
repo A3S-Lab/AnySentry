@@ -2,6 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 
@@ -114,7 +115,9 @@ async function runConfig(label, env = {}) {
   await new Promise((resolve) => setTimeout(resolve, 20));
   const lines = [
     event('nonagent-container', 'ToolExec', { pid: 10, argv: ['true'] }),
-    event('unknown-container', 'FileAccess', { pid: 20, path: '/workspace/a', write: true }),
+    env.ANYSENTRY_E2E_FILTER_MARKER_VALUE
+      ? event('unknown-container', 'ToolExec', { pid: 20, argv: ['/usr/bin/true', env.ANYSENTRY_E2E_FILTER_MARKER_VALUE] })
+      : event('unknown-container', 'FileAccess', { pid: 20, path: '/workspace/a', write: true }),
     event('unknown-container', 'FileAccess', { pid: 20, path: '/workspace/b', write: true }),
     event('unknown-container', 'FileAccess', { pid: 20, path: '/proc/status', write: false }),
     event('unknown-container', 'FileDelete', { pid: 20, path: '/proc/important' }),
@@ -289,6 +292,31 @@ assert.ok(
   defaultRetention.batches.some((item) => JSON.parse(item.line).event.SecurityAction),
   'SecurityAction survives unknown routing',
 );
+
+const e2eMarker = 'asel-marker-filter-receipt-test';
+const e2eMarkerLine = event('unknown-container', 'ToolExec', {
+  pid: 20,
+  argv: ['/usr/bin/true', e2eMarker],
+});
+const e2eReceipt = await runConfig('e2e-receipt', {
+  FORWARD_RETAIN_UNKNOWN: 'false',
+  ANYSENTRY_E2E_FILTER_MARKER_VALUE: e2eMarker,
+  ANYSENTRY_E2E_FILTER_MARKER_SHA256: createHash('sha256').update(JSON.stringify(e2eMarker)).digest('hex'),
+});
+assert.equal(e2eReceipt.batches.length, 0, 'E2E unknown marker must be filtered in enforce mode');
+assert.equal(e2eReceipt.heartbeat.filterMetrics.discoveryBudgetDropped, 5);
+assert.deepEqual(e2eReceipt.heartbeat.filterMetrics.e2eFilterReceipts, [{
+  schema: 'anysentry.e2e_filter_receipt.v1',
+  eventKind: 'ToolExec',
+  markerSha256: createHash('sha256').update(JSON.stringify(e2eMarker)).digest('hex'),
+  lineSha256: createHash('sha256').update(e2eMarkerLine).digest('hex'),
+  physicalWorkloadId: 'docker:test:unknown',
+  classification: 'unknown',
+  filterReason: 'unknown',
+  filteredAt: e2eReceipt.heartbeat.filterMetrics.e2eFilterReceipts[0].filteredAt,
+}]);
+assert.match(e2eReceipt.heartbeat.filterMetrics.e2eFilterReceipts[0].filteredAt, /^\d{4}-\d{2}-\d{2}T/u);
+assert.doesNotMatch(JSON.stringify(e2eReceipt.heartbeat.filterMetrics.e2eFilterReceipts), new RegExp(e2eMarker, 'u'));
 
 await runManualReviewRecovery();
 

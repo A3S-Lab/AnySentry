@@ -1747,6 +1747,17 @@ export interface CollectorFilterMetrics {
   wouldFilterNoise: number;
   discoveryBudgetDropped: number;
   wouldDiscoveryBudgetDrop: number;
+  /** Test-only and absent unless a lifecycle E2E run explicitly arms the forwarder. */
+  e2eFilterReceipts?: Array<{
+    schema: "anysentry.e2e_filter_receipt.v1";
+    eventKind: "ToolExec";
+    markerSha256: string;
+    lineSha256: string;
+    physicalWorkloadId?: string;
+    classification: string;
+    filterReason: string;
+    filteredAt: string;
+  }>;
   deduplicated: number;
   queueDropped: number;
   batches: number;

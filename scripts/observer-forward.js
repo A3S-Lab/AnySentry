@@ -88,6 +88,10 @@ function envBoolean(value, fallback) {
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
 }
 
+function text(value) {
+  return typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
+}
+
 const LEGACY_FORWARD_SCOPE = ['agent', 'all', 'shadow'].includes(process.env.FORWARD_SCOPE)
   ? process.env.FORWARD_SCOPE
   : undefined;
@@ -213,6 +217,7 @@ let eventKindCounts = Object.create(null);
 const forwarderInstanceId = crypto.randomUUID();
 let sourceEventSequence = 0;
 let lastNonAgentSuppressedAt = '';
+let e2eFilterReceipts = [];
 let attributionCounts = {
   observed: 0,
   confirmedAgent: 0,
@@ -305,6 +310,29 @@ function sourceEventId(line) {
     .update(line)
     .digest('hex')
     .slice(0, 24)}`;
+}
+
+function recordE2eFilterReceipt(o, classification, filterReason, line) {
+  const markerHash = text(process.env.ANYSENTRY_E2E_FILTER_MARKER_SHA256).toLowerCase();
+  if (!/^[a-f0-9]{64}$/u.test(markerHash)) return;
+  const payload = o?.event?.ToolExec;
+  if (!payload || !Array.isArray(payload.argv)) return;
+  const matched = payload.argv.some((arg) =>
+    crypto.createHash('sha256').update(JSON.stringify(text(arg))).digest('hex') === markerHash,
+  );
+  if (!matched) return;
+  const receipt = {
+    schema: 'anysentry.e2e_filter_receipt.v1',
+    eventKind: 'ToolExec',
+    markerSha256: markerHash,
+    lineSha256: crypto.createHash('sha256').update(line).digest('hex'),
+    physicalWorkloadId: classification.attribution?.physicalWorkloadId,
+    classification: classification.attribution?.classification || classification.state,
+    filterReason,
+    filteredAt: new Date().toISOString(),
+  };
+  e2eFilterReceipts.push(receipt);
+  if (e2eFilterReceipts.length > 8) e2eFilterReceipts.shift();
 }
 
 function sourceFields(inferredWorkspacePath = '') {
@@ -711,6 +739,7 @@ function sendHeartbeat(done = () => {}) {
   const dropped = outputDropped;
   const errors = errorCount;
   const classifications = attributionCounts;
+  const filterReceipts = e2eFilterReceipts;
   const workload = workloadCache.metrics();
   const docker = dockerDiscovery.metrics();
   const behavior = behaviorDetector.metrics();
@@ -739,6 +768,7 @@ function sendHeartbeat(done = () => {}) {
     infrastructure: 0,
     deduplicated: 0,
   };
+  e2eFilterReceipts = [];
   outputDropped = 0;
   errorCount = 0;
   const status = dropped > 0 || errors > 0 ? 'degraded' : 'ok';
@@ -773,6 +803,7 @@ function sendHeartbeat(done = () => {}) {
         wouldFilterNoise: classifications.wouldFilterNoise,
         discoveryBudgetDropped: classifications.discoveryBudgetDropped,
         wouldDiscoveryBudgetDrop: classifications.wouldDiscoveryBudgetDrop,
+        ...(filterReceipts.length ? { e2eFilterReceipts: filterReceipts } : {}),
         deduplicated: classifications.deduplicated,
         queueDropped: classifications.queueDropped,
         batches: classifications.batches,
@@ -1027,6 +1058,7 @@ function handleLine(raw) {
     filterReason = 'routine_noise';
   }
   if (filterReason) {
+    recordE2eFilterReceipt(o, classification, filterReason, line);
     if (FILTER_MODE === 'shadow') {
       if (filterReason === 'non_agent') attributionCounts.wouldFilterNonAgent++;
       else if (filterReason === 'unknown') attributionCounts.wouldDiscoveryBudgetDrop++;

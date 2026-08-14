@@ -883,6 +883,35 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       wouldFilterNoise: clamp(rawFilter.wouldFilterNoise),
       discoveryBudgetDropped: clamp(rawFilter.discoveryBudgetDropped),
       wouldDiscoveryBudgetDrop: clamp(rawFilter.wouldDiscoveryBudgetDrop),
+      e2eFilterReceipts: Array.isArray(rawFilter.e2eFilterReceipts)
+        ? rawFilter.e2eFilterReceipts.slice(0, 8).flatMap((raw) => {
+            if (!raw || typeof raw !== 'object') return [];
+            const receipt = raw as Record<string, unknown>;
+            if (receipt.schema !== 'anysentry.e2e_filter_receipt.v1' || receipt.eventKind !== 'ToolExec') return [];
+            const markerSha256 = typeof receipt.markerSha256 === 'string' ? receipt.markerSha256.trim() : '';
+            const lineSha256 = typeof receipt.lineSha256 === 'string' ? receipt.lineSha256.trim() : '';
+            const filteredAt = cleanText(receipt.filteredAt, 80) ?? '';
+            const classification = cleanText(receipt.classification, 40) ?? '';
+            const filterReason = cleanText(receipt.filterReason, 40) ?? '';
+            if (
+              !/^[a-f0-9]{64}$/u.test(markerSha256) ||
+              !/^[a-f0-9]{64}$/u.test(lineSha256) ||
+              !Number.isFinite(Date.parse(filteredAt)) ||
+              !['confirmed_agent', 'probable_agent', 'unknown', 'non_agent'].includes(classification) ||
+              !['unknown', 'non_agent', 'routine_noise'].includes(filterReason)
+            ) return [];
+            return [{
+              schema: 'anysentry.e2e_filter_receipt.v1' as const,
+              eventKind: 'ToolExec' as const,
+              markerSha256,
+              lineSha256,
+              physicalWorkloadId: cleanText(receipt.physicalWorkloadId, 500) || undefined,
+              classification,
+              filterReason,
+              filteredAt,
+            }];
+          })
+        : undefined,
       deduplicated: clamp(rawFilter.deduplicated),
       queueDropped: clamp(rawFilter.queueDropped),
       batches: clamp(rawFilter.batches),

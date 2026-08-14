@@ -486,6 +486,27 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       wouldFilterNoise: 1,
       discoveryBudgetDropped: 0,
       wouldDiscoveryBudgetDrop: 1,
+      e2eFilterReceipts: [
+        {
+          schema: 'anysentry.e2e_filter_receipt.v1',
+          eventKind: 'ToolExec',
+          markerSha256: 'a'.repeat(64),
+          lineSha256: 'b'.repeat(64),
+          physicalWorkloadId: 'docker:test:receipt',
+          classification: 'unknown',
+          filterReason: 'unknown',
+          filteredAt: '2026-08-14T00:00:00.000Z',
+        },
+        {
+          schema: 'anysentry.e2e_filter_receipt.v1',
+          eventKind: 'ToolExec',
+          markerSha256: 'c'.repeat(64),
+          lineSha256: 'd'.repeat(65),
+          classification: 'unknown',
+          filterReason: 'unknown',
+          filteredAt: 'not-a-date',
+        },
+      ],
       deduplicated: 0,
       queueDropped: 0,
       batches: 1,
@@ -536,6 +557,9 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       health.items?.[0]?.errorCount === 1 &&
       health.items?.[0]?.filterMetrics?.scope === 'shadow' &&
       health.items?.[0]?.filterMetrics?.wouldFilterNonAgent === 3 &&
+      health.items?.[0]?.filterMetrics?.e2eFilterReceipts?.length === 1 &&
+      health.items?.[0]?.filterMetrics?.e2eFilterReceipts?.[0]?.markerSha256 === 'a'.repeat(64) &&
+      health.items?.[0]?.filterMetrics?.e2eFilterReceipts?.[0]?.lineSha256 === 'b'.repeat(64) &&
       health.items?.[0]?.filterMetrics?.behaviorCandidates === 1 &&
       health.items?.[0]?.filterMetrics?.processTombstones === 1 &&
       health.items?.[0]?.filterMetrics?.identityCgroupHits === 7 &&
