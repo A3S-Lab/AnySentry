@@ -185,6 +185,37 @@ function eventSourceId(e: T.JudgedEvent): string {
   return e.sourceId?.trim() || attrString(e, 'sourceId');
 }
 
+function durableEventSearchKey(filter: T.AgentEventQuery): string {
+  const text = (value?: string): string => value?.trim() ?? '';
+  return JSON.stringify({
+    timeType: filter.timeType ?? 'last_3h',
+    // Preserve the raw custom boundaries: a date-only end includes the whole day, while an ISO
+    // midnight ends at that instant even though Date.parse yields the same millisecond value.
+    startTime: filter.startTime ?? '',
+    endTime: filter.endTime ?? '',
+    // Omitted scope compacts events; explicit raw scope does not, so these are not equivalent.
+    scope: filter.scope ?? '',
+    includeUnknown: filter.includeUnknown !== false,
+    noise: filter.noise ?? 'hide',
+    eventId: text(filter.eventId),
+    sourceId: text(filter.sourceId),
+    collectorId: text(filter.collectorId),
+    agentId: text(filter.agentId),
+    agentAssetId: text(filter.agentAssetId),
+    sessionId: text(filter.sessionId),
+    workspacePath: text(filter.workspacePath),
+    traceId: text(filter.traceId),
+    runId: text(filter.runId),
+    // eventKind and limit are used without text/round normalization by filterEvents/slice.
+    eventKind: filter.eventKind ?? '',
+    eventCategory: filter.eventCategory ?? '',
+    verdict: filter.verdict ?? '',
+    tier: filter.tier ?? '',
+    q: text(filter.q).toLowerCase(),
+    limit: String(filter.limit ?? 40),
+  });
+}
+
 function basename(path: string): string {
   const parts = path.split('/').filter(Boolean);
   return parts[parts.length - 1] || path;
@@ -297,6 +328,13 @@ export class AggregationService {
     failedAt?: number;
     value: Promise<DashboardWindowHistory | null>;
   }>();
+  // Two identical HTTP requests otherwise resolve a preset window at slightly different
+  // milliseconds and miss the ClickHouse store's exact-query single-flight key. Coalesce the
+  // complete durable response by request semantics before either request samples Date.now().
+  private durableEventSearchInFlight?: {
+    key: string;
+    value: Promise<T.AgentEventList>;
+  };
 
   invalidateWindowCache(): void {
     this.winCache.clear();
@@ -640,6 +678,28 @@ export class AggregationService {
   }
 
   async storedAgentEvents(filter: T.AgentEventQuery): Promise<T.AgentEventList> {
+    const snapshot = { ...filter };
+    const key = durableEventSearchKey(snapshot);
+    const current = this.durableEventSearchInFlight;
+    if (current?.key === key) {
+      const shared = await current.value;
+      return structuredClone(shared);
+    }
+    // A different request is still allowed to reach ClickHouseStore, whose shared wide-read slot
+    // will fail it closed to the explicit hot-ring fallback instead of queueing another query.
+    if (current) return this.computeStoredAgentEvents(snapshot);
+
+    const value = Promise.resolve().then(() => this.computeStoredAgentEvents(snapshot));
+    this.durableEventSearchInFlight = { key, value };
+    try {
+      const result = await value;
+      return structuredClone(result);
+    } finally {
+      if (this.durableEventSearchInFlight?.value === value) this.durableEventSearchInFlight = undefined;
+    }
+  }
+
+  private async computeStoredAgentEvents(filter: T.AgentEventQuery): Promise<T.AgentEventList> {
     if (!this.judge.storageStatus().clickhouseReady) {
       return { ...this.agentEvents(filter), totalApproximate: true, storageFallback: 'hot_ring' };
     }
@@ -649,7 +709,9 @@ export class AggregationService {
     const dateOnlyEnd = Boolean(filter.endTime && /^\d{4}-\d{2}-\d{2}$/u.test(filter.endTime));
     const untilMs = Number.isFinite(customEnd) ? customEnd + (dateOnlyEnd ? 24 * HOUR - 1 : 0) : now();
     const limit = Math.max(1, Math.min(200, filter.limit ?? 40));
-    const persistentLimit = Math.min(20_000, Math.max(2_000, limit * 50));
+    // Keep enough durable candidates for post-query text/identity filtering, but never ask the
+    // store to materialize more than the explicitly tested 10k-row bound.
+    const persistentLimit = Math.min(10_000, Math.max(2_000, limit * 50));
     const persistent = await this.judge.searchStoredEvents({
       sinceMs: pinnedEventId ? 0 : sinceMs,
       // A pinned evidence deep link takes precedence over the list's current filters and custom

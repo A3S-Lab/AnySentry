@@ -71,7 +71,7 @@ function assertRecentSettings(call) {
 }
 
 function assertEventSearchSettings(call) {
-  assertHydrateSettings(call);
+  assertBoundedSettings(call, { maxThreads: 1, smallBlocks: true, maxMemoryMiB: 512 });
 }
 
 const store = new ClickHouseStore();
@@ -119,22 +119,31 @@ const searched = await store.searchEvents({
   sourceId: 'source-a',
   verdict: 'block',
   tier: 'Llm',
-  limit: 2_000,
+  limit: 100_000,
 });
 assert.deepEqual(searched, []);
 assert.equal(fake.state.calls.length, 1);
 const searchCall = fake.state.calls[0];
 assertEventSearchSettings(searchCall);
-assert.equal(searchCall.query_params.scanLimit, 15_000);
+assert.equal(searchCall.query_params.limit, 10_000,
+  'durable search must cap complete-row materialization at 10k rows');
+assert.equal(searchCall.query_params.scanLimit, 30_000);
 assert.match(searchCall.query, /PREWHERE at >= \{since:UInt64\} AND at <= \{until:UInt64\}/u);
 assert.match(searchCall.query, /WHERE sourceId = \{sourceId:String\}/u);
 assert.match(searchCall.query, /WHERE verdict = \{verdict:String\} AND tier = \{tier:String\}/u);
+assert.match(searchCall.query, /_part AS selectedPart/u);
+assert.match(searchCall.query, /_part_offset AS selectedPartOffset/u);
+assert.match(searchCall.query, /FROM events AS e\s+PREWHERE[\s\S]*tuple\(e\.at, e\._part, e\._part_offset\) IN/u,
+  'the physical locator set must be evaluated by the outer PREWHERE before wide columns are read');
+assert.doesNotMatch(searchCall.query, /SELECT \*\s+FROM events\s+PREWHERE/u,
+  'wide event columns must not participate in the bounded candidate sort');
 assert.match(searchCall.query, /ORDER BY at DESC\s+LIMIT \{scanLimit:UInt32\} WITH TIES/u);
 const searchStableFilter = searchCall.query.indexOf('WHERE sourceId = {sourceId:String}');
 const searchBoundedLimit = searchCall.query.indexOf('LIMIT {scanLimit:UInt32} WITH TIES');
 const searchRevisionSort = searchCall.query.indexOf('ORDER BY at DESC, decisionUpdatedAt DESC');
 const searchRevisionDedup = searchCall.query.indexOf('LIMIT 1 BY eventId');
 const searchMutableFilter = searchCall.query.indexOf('WHERE verdict = {verdict:String} AND tier = {tier:String}');
+const searchSelectedLimit = searchCall.query.indexOf('LIMIT {limit:UInt32}');
 const searchResultLimit = searchCall.query.lastIndexOf('LIMIT {limit:UInt32}');
 assert.ok(searchStableFilter > 0 && searchStableFilter < searchBoundedLimit,
   'stable event filters must narrow the bounded primary-key sample');
@@ -144,8 +153,12 @@ assert.ok(searchRevisionDedup > searchRevisionSort,
   'durable event search must select the latest lifecycle revision before mutable filtering');
 assert.ok(searchMutableFilter > searchRevisionDedup,
   'verdict and tier filters must not resurrect an obsolete lifecycle revision');
-assert.ok(searchResultLimit > searchMutableFilter,
-  'the caller limit must apply after lifecycle selection and mutable filtering');
+assert.ok(searchSelectedLimit > searchMutableFilter,
+  'the candidate limit must apply after lifecycle selection and mutable filtering');
+assert.ok(searchResultLimit > searchSelectedLimit,
+  'the same bound must be re-applied after complete rows are materialized');
+assert.equal(searchCall.query.match(/LIMIT \{limit:UInt32\}/gu)?.length, 2,
+  'durable search must bound both the locator set and the final complete-row result');
 assert.equal(fake.state.active, 0);
 
 fake.state.calls.length = 0;
@@ -521,6 +534,102 @@ assert.equal(unavailableDurable.totalApproximate, true,
   'an unavailable durable store must expose the hot-ring result as approximate');
 assert.equal(unavailableDurable.storageFallback, 'hot_ring',
   'an unavailable durable store must identify its fallback source');
+
+let durableAggregationCalls = 0;
+let markDurableAggregationStarted;
+let releaseDurableAggregation;
+const durableAggregationStarted = new Promise((resolve) => { markDurableAggregationStarted = resolve; });
+const durableAggregationGate = new Promise((resolve) => { releaseDurableAggregation = resolve; });
+const coalescingDurableAggregation = new AggregationService(
+  {
+    storageStatus: () => ({ clickhouseReady: true }),
+    searchStoredEvents: async () => {
+      durableAggregationCalls += 1;
+      if (durableAggregationCalls > 1) return null;
+      markDurableAggregationStarted();
+      await durableAggregationGate;
+      return [];
+    },
+    queryRange: () => [],
+  },
+  {},
+  {},
+  {},
+);
+const durableAggregationA = coalescingDurableAggregation.storedAgentEvents({
+  timeType: 'last_30d',
+  scope: 'raw',
+  q: ' marker ',
+  limit: 40,
+});
+await durableAggregationStarted;
+const durableAggregationB = coalescingDurableAggregation.storedAgentEvents({
+  timeType: 'last_30d',
+  scope: 'raw',
+  q: 'MARKER',
+  limit: 40,
+});
+assert.equal(durableAggregationCalls, 1,
+  'equivalent concurrent durable HTTP requests must resolve one moving window and share one result');
+assert.equal((await coalescingDurableAggregation.storedAgentEvents({
+  timeType: 'last_30d',
+  q: 'marker',
+  limit: 40,
+})).storageFallback, 'hot_ring',
+'omitted scope must not share the non-compacted result of an explicit raw request');
+assert.equal((await coalescingDurableAggregation.storedAgentEvents({
+  timeType: 'last_30d',
+  scope: 'raw',
+  eventKind: ' ',
+  q: 'marker',
+  limit: 40,
+})).storageFallback, 'hot_ring',
+'an eventKind used verbatim by filtering must not collide with an omitted eventKind');
+assert.equal((await coalescingDurableAggregation.storedAgentEvents({
+  timeType: 'last_30d',
+  scope: 'raw',
+  q: 'marker',
+  limit: 40.4,
+})).storageFallback, 'hot_ring',
+'different pre-clamp numeric limits must not collide in the durable request key');
+releaseDurableAggregation();
+const [durableAggregationResultA, durableAggregationResultB] = await Promise.all([
+  durableAggregationA,
+  durableAggregationB,
+]);
+assert.equal(durableAggregationCalls, 4,
+  'semantically different durable requests must not join the active request');
+assert.equal(durableAggregationResultA.storageFallback, undefined);
+assert.equal(durableAggregationResultB.storageFallback, undefined);
+assert.deepEqual(durableAggregationResultA, durableAggregationResultB);
+assert.notStrictEqual(durableAggregationResultA, durableAggregationResultB);
+assert.notStrictEqual(durableAggregationResultA.items, durableAggregationResultB.items);
+
+let durableAggregationFailureCalls = 0;
+const recoveringDurableAggregation = new AggregationService(
+  {
+    storageStatus: () => ({ clickhouseReady: true }),
+    searchStoredEvents: async () => {
+      durableAggregationFailureCalls += 1;
+      if (durableAggregationFailureCalls === 1) throw new Error('synthetic aggregation durable failure');
+      return [];
+    },
+    queryRange: () => [],
+  },
+  {},
+  {},
+  {},
+);
+await assert.rejects(
+  recoveringDurableAggregation.storedAgentEvents({ timeType: 'last_30d', scope: 'raw', limit: 5 }),
+  /synthetic aggregation durable failure/u,
+);
+assert.equal(
+  (await recoveringDurableAggregation.storedAgentEvents({ timeType: 'last_30d', scope: 'raw', limit: 5 })).storageFallback,
+  undefined,
+  'a failed coalesced durable request must release the aggregation in-flight entry',
+);
+assert.equal(durableAggregationFailureCalls, 2);
 
 const pinnedEvent = {
   schemaVersion: 'anysentry.agent_event.v1',

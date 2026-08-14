@@ -133,6 +133,17 @@ const BOUNDED_RECENT_READ_SETTINGS: ClickHouseSettings = {
   max_memory_usage: String(448 * 1024 * 1024),
 };
 
+// Durable searches manually late-materialize wide rows: the candidate sort carries only row
+// locators and judgment keys, then the outer PREWHERE fetches the selected physical revisions.
+// A 512 MiB ceiling bounds the locator set and at most 10k final JSON rows without restoring the
+// former 640 MiB SELECT-* sort budget.
+const BOUNDED_EVENT_SEARCH_READ_SETTINGS: ClickHouseSettings = {
+  ...BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
+  max_memory_usage: String(512 * 1024 * 1024),
+};
+
+const MAX_DURABLE_EVENT_SEARCH_ROWS = 10_000;
+
 type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'process' | 'attribution' | 'judgment' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview'> & {
   actionKind: string;
   actionTarget: string;
@@ -771,6 +782,7 @@ export class ClickHouseStore {
     if (!this.client) return null;
     const sampleConditions: string[] = [];
     const latestConditions: string[] = [];
+    const activeMutableColumns: string[] = [];
     const queryParams: Record<string, string | number> = { since: input.sinceMs, until: input.untilMs };
     const stableFields: Array<[keyof StoredEventQuery, string]> = [
       ['eventId', 'eventId'],
@@ -798,9 +810,10 @@ export class ClickHouseStore {
       const value = input[key];
       if (typeof value !== 'string' || !value.trim()) continue;
       latestConditions.push(`${column} = {${String(key)}:String}`);
+      activeMutableColumns.push(column);
       queryParams[String(key)] = value.trim();
     }
-    const rowLimit = Math.max(1, Math.min(100_000, Math.round(input.limit)));
+    const rowLimit = Math.max(1, Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, Math.round(input.limit)));
     queryParams.limit = rowLimit;
     queryParams.scanLimit = Math.min(300_000, Math.max(rowLimit * 3, latestConditions.length ? 15_000 : 0));
     const queryKey = JSON.stringify(queryParams);
@@ -816,32 +829,45 @@ export class ClickHouseStore {
     const value = (async (): Promise<JudgedEvent[] | null> => {
       try {
         const rs = await client.query({
-          // Bound the primary-key scan before sorting lifecycle revisions. Verdict and tier can
-          // change between revisions, so apply them only after LIMIT 1 BY has selected the latest
-          // row; filtering them inside the sample would resurrect an obsolete judgment.
+          // Sort only narrow candidate columns, then use ClickHouse's physical row locators to
+          // fetch the selected full revisions. This preserves primary-key pruning and lifecycle
+          // semantics without making rawPreview/attributes/process part of the Top-N workspace.
+          // Verdict and tier can change between revisions, so filter them only after LIMIT 1 BY.
           query: `
-            SELECT *
-            FROM (
-              SELECT *
-              FROM (
-                SELECT *
-                FROM ${TABLE}
-                PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}
-                ${sampleConditions.length ? `WHERE ${sampleConditions.join(' AND ')}` : ''}
-                ORDER BY at DESC
-                LIMIT {scanLimit:UInt32} WITH TIES
+            SELECT e.*
+            FROM ${TABLE} AS e
+            PREWHERE
+              e.at >= {since:UInt64}
+              AND e.at <= {until:UInt64}
+              AND tuple(e.at, e._part, e._part_offset) IN (
+                SELECT at, selectedPart, selectedPartOffset
+                FROM (
+                  SELECT *
+                  FROM (
+                    SELECT
+                      eventId,
+                      at,
+                      decisionUpdatedAt,
+                      _part AS selectedPart,
+                      _part_offset AS selectedPartOffset
+                      ${activeMutableColumns.length ? `, ${activeMutableColumns.join(', ')}` : ''}
+                    FROM ${TABLE}
+                    PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}
+                    ${sampleConditions.length ? `WHERE ${sampleConditions.join(' AND ')}` : ''}
+                    ORDER BY at DESC
+                    LIMIT {scanLimit:UInt32} WITH TIES
+                  )
+                  ORDER BY at DESC, decisionUpdatedAt DESC
+                  LIMIT 1 BY eventId
+                )
+                ${latestConditions.length ? `WHERE ${latestConditions.join(' AND ')}` : ''}
+                ORDER BY at DESC, decisionUpdatedAt DESC
+                LIMIT {limit:UInt32}
               )
-              ORDER BY at DESC, decisionUpdatedAt DESC
-              LIMIT 1 BY eventId
-            )
-            ${latestConditions.length ? `WHERE ${latestConditions.join(' AND ')}` : ''}
-            ORDER BY at DESC, decisionUpdatedAt DESC
+            ORDER BY e.at DESC, e.decisionUpdatedAt DESC
             LIMIT {limit:UInt32}`,
           query_params: queryParams,
-          // A 6k-row moving production sample reached 451 MiB under the recent-read ceiling. Use
-          // the already bounded 640 MiB hydration profile here; the in-flight guard above ensures
-          // only one durable event search can consume that budget per API process.
-          clickhouse_settings: BOUNDED_HYDRATE_READ_SETTINGS,
+          clickhouse_settings: BOUNDED_EVENT_SEARCH_READ_SETTINGS,
           format: 'JSONEachRow',
         });
         const rows = (await rs.json()) as Array<Record<string, unknown>>;
