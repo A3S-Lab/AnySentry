@@ -2989,8 +2989,12 @@ function AgentEventTimelinePanel({
               <SelectItem value="Agent">L3</SelectItem>
             </SelectContent>
           </Select>
-          <span className="text-xs text-zinc-500">
-            {events ? `${formatNumber(events.total)} ${locale === "en" ? "events" : "条"}` : "--"}
+          <span
+            className="text-xs text-zinc-500"
+            title={events?.totalApproximate ? (locale === "en" ? "Bounded approximate distinct count" : "大窗口使用有界近似去重统计") : undefined}
+            aria-label={events ? `${events.totalApproximate ? (locale === "en" ? "Approximately " : "约 ") : ""}${formatNumber(events.total)} ${locale === "en" ? "events" : "条事件"}` : undefined}
+          >
+            {events ? `${events.totalApproximate ? "≈" : ""}${formatNumber(events.total)} ${locale === "en" ? "events" : "条"}` : "--"}
           </span>
           <Link to="/events" className="text-xs text-teal-300 hover:text-teal-200">{t("查看全部")}</Link>
         </div>

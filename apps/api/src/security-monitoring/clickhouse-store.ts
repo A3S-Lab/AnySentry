@@ -8,7 +8,7 @@
 // Connection comes from env (CLICKHOUSE_URL/USER/PASSWORD/DB). If ClickHouse is unreachable the store
 // degrades to in-memory-only (the dashboard keeps working; just no durability) rather than crashing.
 
-import { ClickHouseClient, createClient } from '@clickhouse/client';
+import { ClickHouseClient, createClient, type ClickHouseSettings } from '@clickhouse/client';
 import { PolicyConfig } from './policy-config';
 import { AgentAttribution, AgentMetadataRecord, AlertRecord, AuditRecord, CollectorHeartbeatRecord, IdentityAiReviewRecord, Incident, IngestionSourceRecord, JudgedEvent, MaintenanceWindowRecord, NotificationState, ObjectiveRecord, ProcessContext, RemediationRecord } from './types';
 
@@ -94,6 +94,40 @@ const CONFIG_DDL = `CREATE TABLE IF NOT EXISTS ${CONFIG_TABLE} (
 ) ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY key`;
 
+// Dashboard reads must coexist with sustained Observer writes inside the bundled 2 GiB
+// ClickHouse budget. Large window aggregations spill early and use at most two read threads;
+// otherwise several dashboard panels can collectively consume the server budget and evict one
+// another before any result is returned.
+const BOUNDED_DASHBOARD_READ_SETTINGS: ClickHouseSettings = {
+  max_threads: 2,
+  max_memory_usage: String(384 * 1024 * 1024),
+  max_bytes_before_external_group_by: String(64 * 1024 * 1024),
+  max_bytes_before_external_sort: String(64 * 1024 * 1024),
+  min_bytes_to_use_direct_io: String(1024 * 1024),
+  max_execution_time: 25,
+};
+
+// Hydration reads wide rows rather than compact aggregates. A single read thread and small blocks
+// keep both ClickHouse and the API startup peak bounded, while a separate 640 MiB query budget
+// leaves measured headroom above the roughly 341 MiB production query peak.
+const BOUNDED_HYDRATE_READ_SETTINGS: ClickHouseSettings = {
+  ...BOUNDED_DASHBOARD_READ_SETTINGS,
+  max_threads: 1,
+  max_memory_usage: String(640 * 1024 * 1024),
+  max_block_size: '1024',
+  preferred_block_size_bytes: String(1024 * 1024),
+};
+
+// Recent event reads also materialize wide rows. Production measurements show that the dashboard
+// budget is sufficient when ClickHouse uses one thread and small blocks; the default block shape
+// exceeded the same budget before yielding the first E2E result.
+const BOUNDED_RECENT_READ_SETTINGS: ClickHouseSettings = {
+  ...BOUNDED_DASHBOARD_READ_SETTINGS,
+  max_threads: 1,
+  max_block_size: '1024',
+  preferred_block_size_bytes: String(1024 * 1024),
+};
+
 type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'process' | 'attribution' | 'judgment' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview'> & {
   actionKind: string;
   actionTarget: string;
@@ -155,6 +189,8 @@ export interface DashboardWindowBucketRow {
 }
 
 export interface DashboardWindowHistory {
+  /** Distinct counts use ClickHouse's bounded approximate aggregate to avoid an unbounded hash set. */
+  countsApproximate: true;
   dimensions: DashboardWindowDimensionRow[];
   buckets: DashboardWindowBucketRow[];
   topSession?: {
@@ -300,6 +336,18 @@ export class ClickHouseStore {
   private buf: Row[] = [];
   private flushTimer?: NodeJS.Timeout;
   private ready = false;
+  private dashboardQueryActive = false;
+
+  private tryAcquireDashboardQuerySlot(): (() => void) | null {
+    if (this.dashboardQueryActive) return null;
+    this.dashboardQueryActive = true;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.dashboardQueryActive = false;
+    };
+  }
 
   get enabled(): boolean {
     return this.ready;
@@ -356,10 +404,30 @@ export class ClickHouseStore {
   /** Load the most-recent `limit` events at/after `sinceMs`, oldest-first (to seed the hot ring). */
   async hydrate(sinceMs: number, limit: number): Promise<JudgedEvent[]> {
     if (!this.client) return [];
+    const safeLimit = Math.max(1, Math.min(100_000, Math.round(limit)));
     try {
       const rs = await this.client.query({
-        query: `SELECT * FROM (SELECT * FROM ${TABLE} WHERE at >= {since:UInt64} ORDER BY at DESC LIMIT {lim:UInt32}) ORDER BY at ASC`,
-        query_params: { since: sinceMs, lim: Math.min(limit * 3, 300_000) },
+        // Bound the primary-key scan before revision ordering, but keep every row at the cutoff
+        // timestamp so lifecycle revisions cannot be split. Server-side dedup means the API parses
+        // only the hot-ring result instead of three times as many wide JSON rows during startup.
+        query: `
+          SELECT *
+          FROM (
+            SELECT *
+            FROM ${TABLE}
+            PREWHERE at >= {since:UInt64}
+            ORDER BY at DESC
+            LIMIT {scanLimit:UInt32} WITH TIES
+          )
+          ORDER BY at DESC, decisionUpdatedAt DESC
+          LIMIT 1 BY eventId
+          LIMIT {limit:UInt32}`,
+        query_params: {
+          since: sinceMs,
+          scanLimit: Math.min(safeLimit * 3, 300_000),
+          limit: safeLimit,
+        },
+        clickhouse_settings: BOUNDED_HYDRATE_READ_SETTINGS,
         format: 'JSONEachRow',
       });
       const rows = (await rs.json()) as Array<Record<string, unknown>>;
@@ -368,7 +436,7 @@ export class ClickHouseStore {
         const previous = latest.get(event.eventId);
         if (!previous || (event.decisionUpdatedAt ?? event.at) >= (previous.decisionUpdatedAt ?? previous.at)) latest.set(event.eventId, event);
       }
-      return [...latest.values()].sort((a, b) => a.at - b.at).slice(-limit);
+      return [...latest.values()].sort((a, b) => a.at - b.at).slice(-safeLimit);
     } catch (err) {
       console.error('[clickhouse] hydrate failed:', (err as Error).message);
       return [];
@@ -384,30 +452,39 @@ export class ClickHouseStore {
   ): Promise<JudgedEvent[] | null> {
     if (!this.client || !this.ready) return null;
     const safeLimit = Math.max(1, Math.min(5_000, Math.round(limit)));
-    const clauses = ['at >= {since:UInt64}', 'at <= {until:UInt64}'];
-    if (options.monitoredOnly) clauses.push("JSONExtractBool(attribution, 'monitored')");
-    if (options.tier) clauses.push('tier = {tier:String}');
+    // Attribution is copied unchanged into every judgment revision, so monitored can safely narrow
+    // the primary-key sample. Tier changes across L1/L2/L3 and must be filtered only after the
+    // latest revision is selected.
+    const scanFilters = options.monitoredOnly ? ["JSONExtractBool(attribution, 'monitored')"] : [];
+    const latestFilters = options.tier ? ['tier = {tier:String}'] : [];
     try {
       const rs = await this.client.query({
         query: `
           SELECT *
           FROM (
             SELECT *
-            FROM ${TABLE}
-            WHERE ${clauses.join(' AND ')}
+            FROM (
+              SELECT *
+              FROM ${TABLE}
+              PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}
+              ${scanFilters.length ? `WHERE ${scanFilters.join(' AND ')}` : ''}
+              ORDER BY at DESC
+              LIMIT {scanLimit:UInt32} WITH TIES
+            )
             ORDER BY at DESC, decisionUpdatedAt DESC
-            LIMIT {scanLimit:UInt32}
+            LIMIT 1 BY eventId
           )
+          ${latestFilters.length ? `WHERE ${latestFilters.join(' AND ')}` : ''}
           ORDER BY at DESC, decisionUpdatedAt DESC
-          LIMIT 1 BY eventId
           LIMIT {limit:UInt32}`,
         query_params: {
           since: sinceMs,
           until: untilMs,
           tier: options.tier ?? '',
-          scanLimit: Math.min(15_000, safeLimit * 3),
+          scanLimit: options.tier ? 15_000 : Math.min(15_000, safeLimit * 3),
           limit: safeLimit,
         },
+        clickhouse_settings: BOUNDED_RECENT_READ_SETTINGS,
         format: 'JSONEachRow',
       });
       return (await rs.json() as Array<Record<string, unknown>>).map(fromRow);
@@ -443,14 +520,29 @@ export class ClickHouseStore {
         argMax(sourceEvent.process, sourceEvent.decisionUpdatedAt) AS process,
         argMax(sourceEvent.attribution, sourceEvent.decisionUpdatedAt) AS attribution
       FROM ${TABLE} AS sourceEvent
-      WHERE sourceEvent.at >= {start:UInt64} AND sourceEvent.at <= {end:UInt64}
-        AND JSONExtractBool(sourceEvent.attribution, 'monitored')
+      PREWHERE sourceEvent.at >= {start:UInt64} AND sourceEvent.at <= {end:UInt64}
+      WHERE JSONExtractBool(sourceEvent.attribution, 'monitored')
       GROUP BY eventId
       HAVING JSONExtractBool(attribution, 'monitored')`;
+    // AggregationService already coalesces the same window. A different concurrent full-window
+    // request must fall back to the hot ring instead of building an unbounded queue of heavy reads.
+    const release = this.tryAcquireDashboardQuerySlot();
+    if (!release) return null;
     try {
-      const [dimensionResult, bucketResult, sessionResult, workspaceResult] = await Promise.all([
-        this.client.query({
-          query: `
+      const queryRows = async (
+        query: string,
+        queryParams: Record<string, string | number>,
+      ): Promise<Array<Record<string, unknown>>> => {
+        const result = await this.client!.query({
+          query,
+          query_params: queryParams,
+          clickhouse_settings: BOUNDED_DASHBOARD_READ_SETTINGS,
+          format: 'JSONEachRow',
+        });
+        return await result.json() as Array<Record<string, unknown>>;
+      };
+      const dimensionRows = await queryRows(
+        `
             SELECT
               if(at < {start:UInt64}, 'previous', 'current') AS period,
               JSONExtractBool(attribution, 'monitored') AS monitored,
@@ -459,40 +551,38 @@ export class ClickHouseStore {
               riskType,
               riskCategory,
               argMax(riskName, decisionUpdatedAt) AS riskName,
-              uniqExact(eventId) AS eventCount,
+              uniqCombined64(eventId) AS eventCount,
               sum(tokenCount) AS tokenCount,
               sum(latencyMs) AS latencyTotal,
               sum(riskScore) AS riskScoreTotal
             FROM ${TABLE}
-            WHERE at >= {queryStart:UInt64} AND at <= {end:UInt64}
-              AND decisionStatus IN ('succeeded', 'failed', 'timeout')
+            PREWHERE at >= {queryStart:UInt64} AND at <= {end:UInt64}
+            WHERE decisionStatus IN ('succeeded', 'failed', 'timeout')
             GROUP BY period, monitored, verdict, tier, riskType, riskCategory`,
-          query_params: { queryStart: queryStartMs, start: startMs, end: endMs },
-          format: 'JSONEachRow',
-        }),
-        this.client.query({
-          query: `
+        { queryStart: queryStartMs, start: startMs, end: endMs },
+      );
+      const bucketRowsRaw = await queryRows(
+        `
             SELECT
               least({bucketCount:UInt32} - 1, intDiv(at - {start:UInt64}, {bucketMs:UInt64})) AS bucketIndex,
               JSONExtractBool(attribution, 'monitored') AS monitored,
-              uniqExact(eventId) AS eventCount,
-              uniqExactIf(eventId, verdict = 'block' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS blockedCount,
-              uniqExactIf(eventId, verdict = 'escalate' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS escalatedCount,
-              uniqExactIf(eventId, tier IN ('Llm', 'Agent') AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS l2Count,
-              uniqExactIf(eventId, tier = 'Agent' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS l3Count,
-              uniqExactIf(eventId, verdict != 'allow' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS riskActivationCount,
+              uniqCombined64(eventId) AS eventCount,
+              uniqCombined64If(eventId, verdict = 'block' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS blockedCount,
+              uniqCombined64If(eventId, verdict = 'escalate' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS escalatedCount,
+              uniqCombined64If(eventId, tier IN ('Llm', 'Agent') AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS l2Count,
+              uniqCombined64If(eventId, tier = 'Agent' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS l3Count,
+              uniqCombined64If(eventId, verdict != 'allow' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS riskActivationCount,
               sumIf(tokenCount, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS tokenCount,
               sumIf(latencyMs, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS latencyTotal,
               sumIf(riskScore, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS riskScoreTotal
             FROM ${TABLE}
-            WHERE at >= {start:UInt64} AND at <= {end:UInt64}
+            PREWHERE at >= {start:UInt64} AND at <= {end:UInt64}
             GROUP BY bucketIndex, monitored
             ORDER BY bucketIndex`,
-          query_params: { queryStart: queryStartMs, start: startMs, end: endMs, bucketCount: buckets, bucketMs },
-          format: 'JSONEachRow',
-        }),
-        this.client.query({
-          query: `
+        { queryStart: queryStartMs, start: startMs, end: endMs, bucketCount: buckets, bucketMs },
+      );
+      const sessionRows = await queryRows(
+        `
             SELECT
               if(
                 JSONExtractString(attribution, 'agentSessionId') != '',
@@ -529,11 +619,10 @@ export class ClickHouseStore {
             GROUP BY sessionLabel
             ORDER BY riskScoreTotal DESC
             LIMIT 1`,
-          query_params: { start: startMs, end: endMs },
-          format: 'JSONEachRow',
-        }),
-        this.client.query({
-          query: `
+        { start: startMs, end: endMs },
+      );
+      const workspaceRows = await queryRows(
+        `
             SELECT
               if(
                 JSONExtractString(process, 'cwd') != '',
@@ -544,7 +633,7 @@ export class ClickHouseStore {
                   workspacePath
                 )
               ) AS resolvedWorkspacePath,
-              uniqExact(
+              uniqCombined64(
                 if(
                   JSONExtractString(attribution, 'agentSessionId') != '',
                   JSONExtractString(attribution, 'agentSessionId'),
@@ -560,12 +649,10 @@ export class ClickHouseStore {
             GROUP BY resolvedWorkspacePath
             ORDER BY totalRiskScore DESC
             LIMIT 500`,
-          query_params: { start: startMs, end: endMs },
-          format: 'JSONEachRow',
-        }),
-      ]);
+        { start: startMs, end: endMs },
+      );
       const num = (value: unknown): number => Number(value) || 0;
-      const dimensions = (await dimensionResult.json() as Array<Record<string, unknown>>).map<DashboardWindowDimensionRow>((row) => ({
+      const dimensions = dimensionRows.map<DashboardWindowDimensionRow>((row) => ({
         period: String(row.period) === 'previous' ? 'previous' : 'current',
         monitored: Boolean(num(row.monitored)),
         verdict: String(row.verdict ?? ''),
@@ -578,7 +665,7 @@ export class ClickHouseStore {
         latencyTotal: num(row.latencyTotal),
         riskScoreTotal: num(row.riskScoreTotal),
       }));
-      const bucketRows = (await bucketResult.json() as Array<Record<string, unknown>>).map<DashboardWindowBucketRow>((row) => ({
+      const bucketRows = bucketRowsRaw.map<DashboardWindowBucketRow>((row) => ({
         bucketIndex: num(row.bucketIndex),
         monitored: Boolean(num(row.monitored)),
         eventCount: num(row.eventCount),
@@ -591,7 +678,6 @@ export class ClickHouseStore {
         latencyTotal: num(row.latencyTotal),
         riskScoreTotal: num(row.riskScoreTotal),
       }));
-      const sessionRows = await sessionResult.json() as Array<Record<string, unknown>>;
       const top = sessionRows[0];
       const topSession = top ? {
         sessionId: String(top.sessionLabel ?? ''),
@@ -610,16 +696,18 @@ export class ClickHouseStore {
           systemic_risk: num(top.systemicRisk),
         },
       } : undefined;
-      const workspaces = (await workspaceResult.json() as Array<Record<string, unknown>>).map((row) => ({
+      const workspaces = workspaceRows.map((row) => ({
         workspacePath: String(row.resolvedWorkspacePath ?? ''),
         sessionCount: num(row.sessionCount),
         totalRiskScore: num(row.totalRiskScore),
         worstSeverityRank: num(row.worstSeverityRank),
       }));
-      return { dimensions, buckets: bucketRows, topSession, workspaces };
+      return { countsApproximate: true, dimensions, buckets: bucketRows, topSession, workspaces };
     } catch (error) {
       console.error('[clickhouse] dashboard window aggregation failed:', (error as Error).message);
       return null;
+    } finally {
+      release();
     }
   }
 

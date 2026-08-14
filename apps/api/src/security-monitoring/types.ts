@@ -838,6 +838,7 @@ export interface AgentEventListItem {
 export interface AgentEventList {
   items: AgentEventListItem[];
   total: number;
+  totalApproximate?: boolean;
   updateTime: string;
 }
 export interface AgentTimeline {

@@ -15,6 +15,7 @@ import { resolveTimeWindow } from './time-window';
 import * as T from './types';
 
 const SEV_RANK: Record<T.Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
+const MAX_HISTORY_CACHE_ENTRIES = 64;
 const LEVEL_BY_RANK = ['safe', 'low', 'medium', 'high', 'critical'];
 const LEVEL_TEXT: Record<string, string> = { safe: '安全', low: '低危', medium: '中危', high: '高危', critical: '严重', unknown: '未知' };
 const CATEGORY_COLOR: Record<string, string> = {
@@ -293,6 +294,7 @@ export class AggregationService {
   private readonly historyCache = new Map<string, {
     startedAt: number;
     completedAt?: number;
+    failedAt?: number;
     value: Promise<DashboardWindowHistory | null>;
   }>();
 
@@ -314,14 +316,31 @@ export class AggregationService {
         : window.spanMs >= 24 * 60 * 60_000
           ? 60_000
           : 30_000;
-    if (cached && (cached.completedAt === undefined || t - cached.completedAt < ttlMs)) return cached.value;
+    const cachedTtlMs = cached?.failedAt ? 30_000 : ttlMs;
+    if (cached && (cached.completedAt === undefined || t - cached.completedAt < cachedTtlMs)) {
+      // Refresh insertion order so completed entries are evicted least-recently-used.
+      this.historyCache.delete(window.cacheKey);
+      this.historyCache.set(window.cacheKey, cached);
+      return cached.value;
+    }
+    if (cached) this.historyCache.delete(window.cacheKey);
+    while (this.historyCache.size >= MAX_HISTORY_CACHE_ENTRIES) {
+      const completedKey = [...this.historyCache].find(([, entry]) => entry.completedAt !== undefined)?.[0];
+      if (!completedKey) return Promise.resolve(null);
+      this.historyCache.delete(completedKey);
+    }
     const value = this.judge.dashboardWindowHistory(window.startMs, window.endMs, 180);
-    const entry = { startedAt: t, completedAt: undefined as number | undefined, value };
+    const entry = {
+      startedAt: t,
+      completedAt: undefined as number | undefined,
+      failedAt: undefined as number | undefined,
+      value,
+    };
     this.historyCache.set(window.cacheKey, entry);
     void value.then((result) => {
       if (this.historyCache.get(window.cacheKey)?.value !== value) return;
-      if (!result) this.historyCache.delete(window.cacheKey);
-      else entry.completedAt = now();
+      entry.completedAt = now();
+      if (!result) entry.failedAt = entry.completedAt;
     });
     return value;
   }
@@ -587,29 +606,35 @@ export class AggregationService {
     if (filter.eventId) return this.agentEvents(filter);
     const window = resolveTimeWindow(filter);
     const limit = Math.max(1, Math.min(200, filter.limit ?? 40));
+    const persistedLimit = Math.max(1_000, limit * 10);
     const persisted = await this.judge.recentPersistedEvents(
       window.startMs,
       window.endMs,
-      Math.max(1_000, limit * 10),
+      persistedLimit,
       { monitoredOnly: filter.scope === 'agent', tier: filter.tier },
     );
-    if (!persisted) return this.agentEvents(filter);
+    if (!persisted) return { ...this.agentEvents(filter), totalApproximate: true };
     const filtered = this.filterEvents(persisted, filter).sort((a, b) => b.at - a.at);
     const compacted = filter.scope === 'raw'
       ? filtered.map((event) => ({ event, repeatCount: 1, lastAt: event.at }))
       : compactEvents(filtered);
-    const history = await this.history(filter);
     const hasDetailedFilter = Boolean(
-      filter.sourceId || filter.collectorId || filter.agentId || filter.sessionId || filter.workspacePath ||
-      filter.traceId || filter.runId || filter.eventKind || filter.eventCategory || filter.verdict,
+      filter.sourceId || filter.collectorId || filter.agentId || filter.agentAssetId || filter.sessionId || filter.workspacePath ||
+      filter.traceId || filter.runId || filter.eventKind || filter.eventCategory || filter.verdict || filter.q,
     );
+    // A history aggregate cannot answer a text/identity-filtered total. Avoid an unrelated full
+    // window scan and report the bounded compacted result set already fetched above.
+    const history = hasDetailedFilter ? null : await this.history(filter);
     const rows = history && !hasDetailedFilter
       ? this.currentDimensions(history, filter).filter((row) => !filter.tier || row.tier === filter.tier)
       : [];
     const total = rows.length ? rows.reduce((sum, row) => sum + row.eventCount, 0) : compacted.length;
+    const totalApproximate = hasDetailedFilter || !history ||
+      (rows.length > 0 && history.countsApproximate) || persisted.length >= persistedLimit;
     return {
       items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) => this.eventItem(event, repeatCount, lastAt)),
       total,
+      totalApproximate: totalApproximate ? true : undefined,
       updateTime: iso(),
     };
   }

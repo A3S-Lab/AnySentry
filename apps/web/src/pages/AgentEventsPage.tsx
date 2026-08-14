@@ -640,7 +640,13 @@ export default function AgentEventsPage() {
                 <Search className="size-4 text-teal-200" />
                 <h2 className="text-sm font-semibold text-zinc-100">事件</h2>
               </div>
-              <span className="text-xs text-zinc-500">{data ? `${data.total} 条` : "--"}</span>
+              <span
+                className="text-xs text-zinc-500"
+                title={data?.totalApproximate ? "大窗口使用有界近似去重统计" : undefined}
+                aria-label={data ? `${data.totalApproximate ? "约 " : ""}${data.total} 条事件` : undefined}
+              >
+                {data ? `${data.totalApproximate ? "≈" : ""}${data.total} 条` : "--"}
+              </span>
             </div>
             {loading && !data ? (
               <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">
