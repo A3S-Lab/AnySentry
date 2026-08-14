@@ -1454,6 +1454,8 @@ export interface CollectorFilterMetrics {
 }
 export interface CollectorHeartbeatRecord extends Required<Pick<CollectorHeartbeatRequest, 'collectorId' | 'status'>> {
   at: number;
+  /** Set only when this record carried Forwarder-enriched filter metrics. */
+  filterMetricsReportedAt?: number;
   nodeName?: string;
   namespace?: string;
   podName?: string;

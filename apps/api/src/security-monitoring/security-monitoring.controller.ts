@@ -3393,6 +3393,30 @@ export class SecurityMonitoringController {
         reason,
       } satisfies T.CollectorHeartbeatAck;
     }
+    if (
+      requestCollectorId &&
+      sourceResolution.source?.collectorId &&
+      sourceResolution.source.collectorId !== requestCollectorId
+    ) {
+      const reason = 'source collector does not match heartbeat collector';
+      this.recordRejectedIngest(sourceResolution, reason, {
+        sourceId: requestSourceId,
+        sourceName: body.sourceName,
+        sourceType: requestSourceType,
+        collectorId: requestCollectorId,
+        workspacePath: body.workspacePath,
+        nodeName: body.nodeName,
+        endpoint: 'collectors/heartbeat',
+        rejectedEvents: 1,
+      });
+      return {
+        accepted: false,
+        collectorId: requestCollectorId,
+        sourceId: sourceResolution.source.sourceId,
+        receivedAt: new Date().toISOString(),
+        reason,
+      } satisfies T.CollectorHeartbeatAck;
+    }
 
     const rec = this.judge.recordCollectorHeartbeat({
       ...body,
@@ -5039,6 +5063,25 @@ export class SecurityMonitoringController {
         rejectedEvents: 1,
       });
       return { accepted: false, reason, sourceId: sourceResolution.source?.sourceId };
+    }
+    if (
+      heartbeat &&
+      requestCollectorId &&
+      sourceResolution.source?.collectorId &&
+      sourceResolution.source.collectorId !== requestCollectorId
+    ) {
+      const reason = 'source collector does not match heartbeat collector';
+      this.recordRejectedIngest(sourceResolution, reason, {
+        sourceId: requestSourceId,
+        sourceName,
+        sourceType,
+        collectorId: requestCollectorId,
+        nodeName,
+        workspacePath: given.workspacePath,
+        endpoint: 'ingest',
+        rejectedEvents: 1,
+      });
+      return { accepted: false, reason, sourceId: sourceResolution.source.sourceId };
     }
     if (heartbeat) {
       const rec = this.judge.recordCollectorHeartbeat({

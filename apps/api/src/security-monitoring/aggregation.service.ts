@@ -1452,9 +1452,12 @@ export class AggregationService {
   collectorHealth(filter: T.CollectorHealthQuery): T.CollectorHealth {
     const { sinceMs, spanMs } = this.win(filter);
     const windowHeartbeats = this.judge.queryCollectorHeartbeats(sinceMs);
+    const heartbeatHeads = this.judge.collectorHeartbeatHeads();
+    const latestHeartbeatByCollector = new Map(heartbeatHeads.latest.map((heartbeat) => [heartbeat.collectorId, heartbeat]));
+    const latestMetricsByCollector = new Map(heartbeatHeads.latestMetrics.map((heartbeat) => [heartbeat.collectorId, heartbeat]));
     const byCollector = new Map<string, T.CollectorHeartbeatRecord[]>();
     for (const hb of windowHeartbeats) (byCollector.get(hb.collectorId) ?? byCollector.set(hb.collectorId, []).get(hb.collectorId)!).push(hb);
-    for (const hb of this.judge.latestCollectorHeartbeats()) {
+    for (const hb of heartbeatHeads.latest) {
       if (!byCollector.has(hb.collectorId)) byCollector.set(hb.collectorId, []);
     }
 
@@ -1467,8 +1470,12 @@ export class AggregationService {
       down: '断流',
     };
     const items = [...byCollector.entries()].map(([collectorId, hbs]): T.CollectorHealthItem => {
-      const latest = [...hbs, ...this.judge.latestCollectorHeartbeats().filter((hb) => hb.collectorId === collectorId)]
-        .sort((a, b) => b.at - a.at)[0];
+      const latest = latestHeartbeatByCollector.get(collectorId);
+      const latestMetricsHeartbeat = latestMetricsByCollector.get(collectorId);
+      const freshMetricsHeartbeat = latestMetricsHeartbeat?.filterMetricsReportedAt !== undefined &&
+        t - latestMetricsHeartbeat.filterMetricsReportedAt <= COLLECTOR_STALE_MS
+        ? latestMetricsHeartbeat
+        : undefined;
       const categoryCounts = Object.fromEntries(EVENT_CATEGORIES.map((category) => [category, 0])) as Record<T.EventCategory, number>;
       let eventCount = 0;
       let observedAgentCount = 0;
@@ -1516,8 +1523,12 @@ export class AggregationService {
         droppedEvents: latest?.droppedEvents ?? 0,
         outputDropped: latest?.outputDropped ?? 0,
         errorCount: latest?.errorCount ?? 0,
-        filterMetrics: latest?.filterMetrics ?? {
-          scope: 'all',
+        filterMetrics: freshMetricsHeartbeat?.filterMetrics ?? {
+          scope: 'decoupled',
+          filterMode: 'shadow',
+          retainUnknown: true,
+          retainNonAgent: false,
+          noisePolicy: 'balanced',
           observed: 0,
           forwarded: 0,
           confirmedAgent: 0,

@@ -76,18 +76,19 @@ async function assertEvent(message, eventId, checks) {
   assert(message, ok, list);
 }
 
-async function createProtectedObserverSource() {
+async function createProtectedObserverSource(suffix = '') {
+  const sourcePrefix = suffix ? `${runId}-${suffix}` : runId;
   const source = await request('/sources', 'POST', {
-    name: `${runId} observer forwarder`,
+    name: `${sourcePrefix} observer forwarder`,
     type: 'observer',
     enabled: true,
     requireToken: true,
-    collectorId: `${runId}-collector`,
-    workspacePath: `repo://${runId}/observer`,
+    collectorId: `${sourcePrefix}-collector`,
+    workspacePath: `repo://${sourcePrefix}/observer`,
     owner: 'verify-observer-ingest',
-    tags: [runId, 'observer-verifier'],
+    tags: [sourcePrefix, 'observer-verifier'],
   });
-  assert('observer source creation returns managed token', Boolean(source.source?.sourceId && source.token), source);
+  assert(`${suffix ? 'isolated ' : ''}observer source creation returns managed token`, Boolean(source.source?.sourceId && source.token), source);
   return source;
 }
 
@@ -101,6 +102,70 @@ async function verifyIdentitySnapshotContract() {
       Array.isArray(snapshot.entries) &&
       snapshot.nodeName === `${runId}-node`,
     snapshot,
+  );
+}
+
+async function verifyCollectorMetricFreshnessContract() {
+  const { AggregationService } = await import('../apps/api/dist/security-monitoring/aggregation.service.js');
+  const at = Date.now();
+  const heartbeat = (overrides = {}) => ({
+    collectorId: `${runId}-freshness-collector`,
+    at,
+    status: 'ok',
+    nodeName: `${runId}-freshness-node`,
+    attachedProbes: 0,
+    enabledFeatures: [],
+    intervalSecs: 30,
+    eventKindCounts: {},
+    queueDepth: 0,
+    droppedEvents: 0,
+    outputDropped: 0,
+    errorCount: 0,
+    observedAgents: 0,
+    filterMetrics: { scope: 'decoupled', observed: 0 },
+    ...overrides,
+  });
+
+  const sameMillisecondEnriched = heartbeat({
+    filterMetricsReportedAt: at,
+    nodeName: `${runId}-enriched-same-ms`,
+    filterMetrics: { scope: 'shadow', observed: 9 },
+  });
+  const sameMillisecondRaw = heartbeat({ nodeName: `${runId}-raw-same-ms` });
+  const sameMillisecondAggregation = new AggregationService({
+    query: () => [],
+    queryCollectorHeartbeats: () => [sameMillisecondEnriched, sameMillisecondRaw],
+    collectorHeartbeatHeads: () => ({ latest: [sameMillisecondRaw], latestMetrics: [sameMillisecondEnriched] }),
+  }, {}, {}, {});
+  const sameMillisecondHealth = sameMillisecondAggregation.collectorHealth({ timeType: 'last_30d', collectorId: sameMillisecondRaw.collectorId });
+  assert(
+    'same-millisecond raw heartbeat updates status while fresh enriched metrics remain selected',
+    sameMillisecondHealth.items?.[0]?.nodeName === `${runId}-raw-same-ms` &&
+      sameMillisecondHealth.items?.[0]?.filterMetrics?.scope === 'shadow' &&
+      sameMillisecondHealth.items?.[0]?.filterMetrics?.observed === 9,
+    sameMillisecondHealth,
+  );
+
+  const expiredAt = at - 4 * 60_000;
+  const expiredEnriched = heartbeat({
+    at: expiredAt,
+    filterMetricsReportedAt: expiredAt,
+    nodeName: `${runId}-expired-enriched`,
+    filterMetrics: { scope: 'shadow', observed: 99 },
+  });
+  const currentRaw = heartbeat({ at: at - 1_000, nodeName: `${runId}-current-raw` });
+  const expiredAggregation = new AggregationService({
+    query: () => [],
+    queryCollectorHeartbeats: () => [expiredEnriched, currentRaw],
+    collectorHeartbeatHeads: () => ({ latest: [currentRaw], latestMetrics: [expiredEnriched] }),
+  }, {}, {}, {});
+  const expiredHealth = expiredAggregation.collectorHealth({ timeType: 'last_30d', collectorId: currentRaw.collectorId });
+  assert(
+    'raw heartbeats cannot renew expired enriched filter metrics',
+    expiredHealth.items?.[0]?.nodeName === `${runId}-current-raw` &&
+      expiredHealth.items?.[0]?.filterMetrics?.scope === 'decoupled' &&
+      expiredHealth.items?.[0]?.filterMetrics?.observed === 0,
+    expiredHealth,
   );
 }
 
@@ -617,6 +682,112 @@ async function verifyRawHeartbeatPreservesForwarderMetrics(sourceId, token) {
   );
 }
 
+async function verifyCollectorSourceIsolation(sourceId) {
+  const other = await createProtectedObserverSource('other');
+  const mismatchedDirect = await request('/collectors/heartbeat', 'POST', {
+    sourceId: other.source.sourceId,
+    token: other.token,
+    sourceName: `${runId}-other observer forwarder`,
+    sourceType: 'observer',
+    collectorId: `${runId}-collector`,
+    nodeName: `${runId}-wrong-source-direct`,
+    filterMetrics: { scope: 'shadow', observed: 99, wouldFilterNonAgent: 99 },
+  });
+  assert(
+    'protected Source cannot publish enriched metrics under another collector ID',
+    mismatchedDirect.accepted === false &&
+      mismatchedDirect.sourceId === other.source.sourceId &&
+      mismatchedDirect.reason === 'source collector does not match heartbeat collector',
+    mismatchedDirect,
+  );
+
+  const mismatchedRaw = await request('/ingest', 'POST', {
+    line: observerLine(
+      { agent: null, session: null },
+      { CollectorHeartbeat: { node_name: `${runId}-wrong-source-raw`, mode: 'observe', exec: 77 } },
+    ),
+    collectorId: `${runId}-collector`,
+    sourceId: other.source.sourceId,
+    sourceName: `${runId}-other observer forwarder`,
+    sourceType: 'observer',
+    token: other.token,
+  });
+  assert(
+    'protected Source cannot publish raw heartbeat under another collector ID',
+    mismatchedRaw.accepted === false &&
+      mismatchedRaw.sourceId === other.source.sourceId &&
+      mismatchedRaw.reason === 'source collector does not match heartbeat collector',
+    mismatchedRaw,
+  );
+
+  const ownCollectorId = `${runId}-other-collector`;
+  const ownRaw = await request('/ingest', 'POST', {
+    line: observerLine(
+      { agent: null, session: null },
+      { CollectorHeartbeat: { node_name: `${runId}-other-node`, mode: 'observe', exec: 1 } },
+    ),
+    collectorId: ownCollectorId,
+    sourceId: other.source.sourceId,
+    sourceName: `${runId}-other observer forwarder`,
+    sourceType: 'observer',
+    token: other.token,
+  });
+  assert('isolated Source can publish under its own collector ID', ownRaw.accepted === true && ownRaw.collectorId === ownCollectorId, ownRaw);
+
+  const otherHealth = await request('/collectors/health', 'POST', { timeType: 'last_30d', collectorId: ownCollectorId, limit: 5 });
+  assert(
+    'raw heartbeat on isolated collector cannot inherit enriched metrics',
+    otherHealth.total === 1 &&
+      otherHealth.items?.[0]?.filterMetrics?.scope === 'decoupled' &&
+      otherHealth.items?.[0]?.filterMetrics?.observed === 0 &&
+      !otherHealth.items?.[0]?.filterMetrics?.e2eFilterReceipts?.length,
+    otherHealth,
+  );
+
+  const primaryHealth = await request('/collectors/health', 'POST', { timeType: 'last_30d', collectorId: `${runId}-collector`, limit: 5 });
+  assert(
+    'rejected cross-Source heartbeats do not replace primary collector metrics',
+    primaryHealth.total === 1 &&
+      primaryHealth.items?.[0]?.filterMetrics?.wouldFilterNonAgent === 3 &&
+      primaryHealth.items?.[0]?.filterMetrics?.e2eFilterReceipts?.[0]?.lineSha256 === 'b'.repeat(64),
+    { sourceId, primaryHealth },
+  );
+}
+
+async function verifyExplicitForwarderMetricsReplacePrevious(sourceId, token) {
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const result = await request('/collectors/heartbeat', 'POST', {
+    sourceId,
+    token,
+    sourceName: `${runId} observer forwarder`,
+    sourceType: 'observer',
+    collectorId: `${runId}-collector`,
+    nodeName: `${runId}-node-explicit-zero`,
+    mode: 'observer-forwarder',
+    status: 'ok',
+    intervalSecs: 30,
+    filterMetrics: {
+      scope: 'shadow',
+      filterMode: 'shadow',
+      observed: 0,
+      wouldFilterNonAgent: 0,
+      e2eFilterReceipts: [],
+    },
+  });
+  assert('new enriched heartbeat with explicit zero metrics is accepted', result.accepted === true, result);
+  const health = await request('/collectors/health', 'POST', { timeType: 'last_30d', collectorId: `${runId}-collector`, limit: 5 });
+  assert(
+    'new enriched heartbeat replaces prior non-zero metrics and receipts',
+    health.total === 1 &&
+      health.items?.[0]?.nodeName === `${runId}-node-explicit-zero` &&
+      health.items?.[0]?.filterMetrics?.scope === 'shadow' &&
+      health.items?.[0]?.filterMetrics?.observed === 0 &&
+      health.items?.[0]?.filterMetrics?.wouldFilterNonAgent === 0 &&
+      !health.items?.[0]?.filterMetrics?.e2eFilterReceipts?.length,
+    health,
+  );
+}
+
 async function verifySourceRollup(sourceId) {
   const sources = await request('/sources/list', 'POST', { sourceId, limit: 5 });
   const source = sources.items?.[0];
@@ -635,6 +806,7 @@ async function verifySourceRollup(sourceId) {
 
 async function main() {
   console.log(`AnySentry observer ingest verification against ${baseUrl}`);
+  await verifyCollectorMetricFreshnessContract();
   await request('/stats');
   await verifyIdentitySnapshotContract();
   const { source, token } = await createProtectedObserverSource();
@@ -646,7 +818,9 @@ async function main() {
   await verifyObserverLlmEndpoint(source.sourceId, token);
   await verifyRawCollectorHeartbeat(source.sourceId, token);
   await verifyDirectForwarderHeartbeat(source.sourceId, token);
+  await verifyCollectorSourceIsolation(source.sourceId);
   await verifyRawHeartbeatPreservesForwarderMetrics(source.sourceId, token);
+  await verifyExplicitForwarderMetricsReplacePrevious(source.sourceId, token);
   await verifySourceRollup(source.sourceId);
 
   if (process.exitCode) {

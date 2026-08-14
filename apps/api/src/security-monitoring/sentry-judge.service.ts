@@ -862,18 +862,11 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const clamp = (n: unknown) => Math.max(0, Number.isFinite(Number(n)) ? Math.round(Number(n)) : 0);
     const eventKindCounts: Record<string, number> = {};
     for (const [key, value] of Object.entries(input.eventKindCounts ?? {})) eventKindCounts[key.slice(0, 64)] = clamp(value);
-    let previous: CollectorHeartbeatRecord | undefined;
-    for (let index = this.collectorHeartbeats.length - 1; index >= 0; index -= 1) {
-      if (this.collectorHeartbeats[index].collectorId === collectorId) {
-        previous = this.collectorHeartbeats[index];
-        break;
-      }
-    }
-    // Rust collector heartbeats and the enriched Forwarder heartbeat intentionally share an ID.
-    // A raw heartbeat has no filterMetrics; retain the most recent enriched snapshot so it cannot
-    // transiently erase signature, lease, runtime, and shadow counters in collector health.
-    const rawFilter = input.filterMetrics ?? previous?.filterMetrics ??
-      ({} as Partial<import('./types').CollectorFilterMetrics>);
+    // Raw Rust and enriched Forwarder heartbeats share an ID, but only the latter owns these
+    // metrics. Provenance is recorded separately so a stream of raw heartbeats cannot keep stale
+    // signatures, leases, or filter receipts alive indefinitely.
+    const filterMetricsReportedAt = input.filterMetrics == null ? undefined : at;
+    const rawFilter = input.filterMetrics ?? ({} as Partial<import('./types').CollectorFilterMetrics>);
     const filterMetrics: import('./types').CollectorFilterMetrics = {
       scope: ['all', 'shadow', 'agent', 'decoupled'].includes(rawFilter.scope ?? '')
         ? (rawFilter.scope as import('./types').CollectorFilterMetrics['scope'])
@@ -1000,6 +993,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const rec: CollectorHeartbeatRecord = {
       collectorId,
       at,
+      filterMetricsReportedAt,
       status,
       nodeName: input.nodeName?.slice(0, 160),
       namespace: input.namespace?.slice(0, 160),
@@ -1045,13 +1039,21 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return this.collectorHeartbeats.filter((e) => e.at >= sinceMs);
   }
 
-  latestCollectorHeartbeats(): CollectorHeartbeatRecord[] {
+  collectorHeartbeatHeads(): { latest: CollectorHeartbeatRecord[]; latestMetrics: CollectorHeartbeatRecord[] } {
     const latest = new Map<string, CollectorHeartbeatRecord>();
+    const latestMetrics = new Map<string, CollectorHeartbeatRecord>();
     for (const hb of this.collectorHeartbeats) {
       const cur = latest.get(hb.collectorId);
-      if (!cur || hb.at > cur.at) latest.set(hb.collectorId, hb);
+      // Insertion order breaks a Date.now() millisecond tie in favour of the later request.
+      if (!cur || hb.at >= cur.at) latest.set(hb.collectorId, hb);
+      if (hb.filterMetricsReportedAt === undefined) continue;
+      const currentMetrics = latestMetrics.get(hb.collectorId);
+      if (
+        !currentMetrics ||
+        hb.filterMetricsReportedAt >= (currentMetrics.filterMetricsReportedAt ?? 0)
+      ) latestMetrics.set(hb.collectorId, hb);
     }
-    return [...latest.values()];
+    return { latest: [...latest.values()], latestMetrics: [...latestMetrics.values()] };
   }
 
   /** Events within a window [sinceMs, now]. */
