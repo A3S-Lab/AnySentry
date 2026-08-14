@@ -125,11 +125,12 @@ const BOUNDED_HYDRATE_READ_SETTINGS: ClickHouseSettings = {
   max_memory_usage: String(640 * 1024 * 1024),
 };
 
-// Recent event reads also materialize wide rows. Production measurements show that the dashboard
-// budget is sufficient when ClickHouse uses one thread and small blocks; the default block shape
-// exceeded the same budget before yielding the first E2E result.
+// Recent event reads also materialize wide rows. Moving-window production samples exceeded the
+// shared 384 MiB budget by up to 2.5 MiB, so only this path gets a measured 448 MiB ceiling while
+// retaining one thread and small blocks.
 const BOUNDED_RECENT_READ_SETTINGS: ClickHouseSettings = {
   ...BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
+  max_memory_usage: String(448 * 1024 * 1024),
 };
 
 type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'process' | 'attribution' | 'judgment' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview'> & {
@@ -341,6 +342,12 @@ export class ClickHouseStore {
   private flushTimer?: NodeJS.Timeout;
   private ready = false;
   private dashboardQueryActive = false;
+  // Share one equivalent wide read, but fail a different window closed to the hot-ring fallback.
+  // This is an in-flight guard only: completed results are never cached here.
+  private recentQueryInFlight?: {
+    key: string;
+    value: Promise<JudgedEvent[] | null>;
+  };
 
   private tryAcquireDashboardQuerySlot(): (() => void) | null {
     if (this.dashboardQueryActive) return null;
@@ -455,15 +462,26 @@ export class ClickHouseStore {
     options: { monitoredOnly?: boolean; tier?: string } = {},
   ): Promise<JudgedEvent[] | null> {
     if (!this.client || !this.ready) return null;
+    const client = this.client;
     const safeLimit = Math.max(1, Math.min(5_000, Math.round(limit)));
+    const monitoredOnly = Boolean(options.monitoredOnly);
+    const tier = options.tier ?? '';
+    const queryKey = JSON.stringify([String(sinceMs), String(untilMs), safeLimit, monitoredOnly, tier]);
+    const current = this.recentQueryInFlight;
+    if (current) {
+      if (current.key !== queryKey) return null;
+      const shared = await current.value;
+      return shared ? [...shared] : null;
+    }
     // Attribution is copied unchanged into every judgment revision, so monitored can safely narrow
     // the primary-key sample. Tier changes across L1/L2/L3 and must be filtered only after the
     // latest revision is selected.
-    const scanFilters = options.monitoredOnly ? ["JSONExtractBool(attribution, 'monitored')"] : [];
-    const latestFilters = options.tier ? ['tier = {tier:String}'] : [];
-    try {
-      const rs = await this.client.query({
-        query: `
+    const scanFilters = monitoredOnly ? ["JSONExtractBool(attribution, 'monitored')"] : [];
+    const latestFilters = tier ? ['tier = {tier:String}'] : [];
+    const value = (async (): Promise<JudgedEvent[] | null> => {
+      try {
+        const rs = await client.query({
+          query: `
           SELECT *
           FROM (
             SELECT *
@@ -481,20 +499,28 @@ export class ClickHouseStore {
           ${latestFilters.length ? `WHERE ${latestFilters.join(' AND ')}` : ''}
           ORDER BY at DESC, decisionUpdatedAt DESC
           LIMIT {limit:UInt32}`,
-        query_params: {
-          since: sinceMs,
-          until: untilMs,
-          tier: options.tier ?? '',
-          scanLimit: options.tier ? 15_000 : Math.min(15_000, safeLimit * 3),
-          limit: safeLimit,
-        },
-        clickhouse_settings: BOUNDED_RECENT_READ_SETTINGS,
-        format: 'JSONEachRow',
-      });
-      return (await rs.json() as Array<Record<string, unknown>>).map(fromRow);
-    } catch (error) {
-      console.error('[clickhouse] recent dashboard events query failed:', (error as Error).message);
-      return null;
+          query_params: {
+            since: sinceMs,
+            until: untilMs,
+            tier,
+            scanLimit: tier ? 15_000 : Math.min(15_000, safeLimit * 3),
+            limit: safeLimit,
+          },
+          clickhouse_settings: BOUNDED_RECENT_READ_SETTINGS,
+          format: 'JSONEachRow',
+        });
+        return (await rs.json() as Array<Record<string, unknown>>).map(fromRow);
+      } catch (error) {
+        console.error('[clickhouse] recent dashboard events query failed:', (error as Error).message);
+        return null;
+      }
+    })();
+    this.recentQueryInFlight = { key: queryKey, value };
+    try {
+      const rows = await value;
+      return rows ? [...rows] : null;
+    } finally {
+      if (this.recentQueryInFlight?.value === value) this.recentQueryInFlight = undefined;
     }
   }
 

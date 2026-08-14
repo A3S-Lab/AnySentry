@@ -46,9 +46,9 @@ function fakeClient() {
   };
 }
 
-function assertBoundedSettings(call, { maxThreads = 2, smallBlocks = false } = {}) {
+function assertBoundedSettings(call, { maxThreads = 2, smallBlocks = false, maxMemoryMiB = 384 } = {}) {
   assert.equal(call.clickhouse_settings?.max_threads, maxThreads);
-  assert.equal(call.clickhouse_settings?.max_memory_usage, String(384 * 1024 * 1024));
+  assert.equal(call.clickhouse_settings?.max_memory_usage, String(maxMemoryMiB * 1024 * 1024));
   assert.equal(call.clickhouse_settings?.max_bytes_before_external_group_by, String(64 * 1024 * 1024));
   assert.equal(call.clickhouse_settings?.max_bytes_before_external_sort, String(64 * 1024 * 1024));
   assert.equal(call.clickhouse_settings?.min_bytes_to_use_direct_io, String(1024 * 1024));
@@ -67,7 +67,7 @@ function assertHydrateSettings(call) {
 }
 
 function assertRecentSettings(call) {
-  assertBoundedSettings(call, { maxThreads: 1, smallBlocks: true });
+  assertBoundedSettings(call, { maxThreads: 1, smallBlocks: true, maxMemoryMiB: 448 });
 }
 
 const store = new ClickHouseStore();
@@ -108,6 +108,95 @@ assert.ok(revisionDedup > revisionSort, 'the latest lifecycle revision must be s
 assert.ok(mutableFilter > revisionDedup, 'tier filtering must not resurrect an older lifecycle revision');
 assert.equal(fake.state.active, 0);
 
+fake.state.calls.length = 0;
+const sameRecentA = store.recentWindowEvents(100, 201, 1_000, { monitoredOnly: true, tier: 'Llm' });
+const sameRecentB = store.recentWindowEvents(100, 201, 1_000, { monitoredOnly: true, tier: 'Llm' });
+const [sameRowsA, sameRowsB] = await Promise.all([sameRecentA, sameRecentB]);
+assert.equal(fake.state.calls.length, 1, 'equivalent concurrent recent reads must share one query');
+assert.deepEqual(sameRowsA, []);
+assert.deepEqual(sameRowsB, []);
+assert.notStrictEqual(sameRowsA, sameRowsB, 'each recent caller must receive its own array');
+
+fake.state.calls.length = 0;
+const occupiedRecent = store.recentWindowEvents(100, 202, 1_000, { monitoredOnly: true });
+assert.equal(
+  await store.recentWindowEvents(100, 203, 1_000, { monitoredOnly: true }),
+  null,
+  'a different recent window must fail fast while one query is active',
+);
+assert.deepEqual(await occupiedRecent, []);
+assert.equal(fake.state.calls.length, 1, 'a busy recent window must not start a second query');
+assert.deepEqual(
+  await store.recentWindowEvents(100, 203, 1_000, { monitoredOnly: true }),
+  [],
+  'a different recent window must recover after the active query settles',
+);
+assert.equal(fake.state.calls.length, 2);
+
+fake.state.calls.length = 0;
+fake.state.failNext = true;
+const recentConsoleError = console.error;
+console.error = () => {};
+try {
+  const failedRecentA = store.recentWindowEvents(100, 204, 1_000);
+  const failedRecentB = store.recentWindowEvents(100, 204, 1_000);
+  assert.deepEqual(await Promise.all([failedRecentA, failedRecentB]), [null, null]);
+} finally {
+  console.error = recentConsoleError;
+}
+assert.deepEqual(await store.recentWindowEvents(100, 205, 1_000), [], 'a failed recent query must release its slot');
+assert.equal(fake.state.calls.length, 2);
+
+let releaseRecent;
+let markRecentStarted;
+const recentGate = new Promise((resolve) => { releaseRecent = resolve; });
+const recentStarted = new Promise((resolve) => { markRecentStarted = resolve; });
+store.client = {
+  async query(options) {
+    const isRecent = options.query.includes('LIMIT {scanLimit:UInt32} WITH TIES');
+    return {
+      async json() {
+        if (isRecent) {
+          markRecentStarted();
+          await recentGate;
+        }
+        return [];
+      },
+    };
+  },
+};
+const blockedRecent = store.recentWindowEvents(100, 206, 1_000);
+await recentStarted;
+assert.ok(
+  await store.dashboardWindowHistory(100, 206, 8),
+  'the recent in-flight guard must remain independent from bounded history reads',
+);
+releaseRecent();
+assert.deepEqual(await blockedRecent, []);
+
+let failRecentJson = true;
+store.client = {
+  async query() {
+    return {
+      async json() {
+        if (failRecentJson) {
+          failRecentJson = false;
+          throw new Error('synthetic recent response failure');
+        }
+        return [];
+      },
+    };
+  },
+};
+console.error = () => {};
+try {
+  assert.equal(await store.recentWindowEvents(100, 207, 1_000), null);
+} finally {
+  console.error = recentConsoleError;
+}
+assert.deepEqual(await store.recentWindowEvents(100, 208, 1_000), [], 'a response parse failure must release the recent slot');
+
+store.client = fake.client;
 fake.state.calls.length = 0;
 fake.state.maxActive = 0;
 const histories = await Promise.all([
