@@ -1453,7 +1453,12 @@ async function removeTrackedDockerContainer(name, allowAlreadyAbsent = false) {
   ownership.id ||= state.id;
   const removed = await run('docker', ['rm', '-f', ownership.id], { allowFailure: true, timeoutMs: 30_000 });
   if (removed.code !== 0) {
-    throw new Error('Docker removal failed for ' + name + ': ' + redact(removed.stderr));
+    state = await dockerResourceState(ownership.id, ledger.runId, ownership);
+    if (!state.exists) {
+      ledger.dockerContainers.delete(name);
+      return;
+    }
+    throw new Error('Docker removal failed for ' + name + ': ' + redact(removed.stderr || removed.stdout));
   }
   state = await dockerResourceState(ownership.id, ledger.runId, ownership);
   if (state.exists) {
@@ -1547,11 +1552,13 @@ async function cleanup() {
   ledger.cleaning = true;
   ledger.cleanupPromise = (async () => {
     const errors = [];
+    let tempRootConsumersStopped = true;
     await Promise.allSettled([...ledger.mutations]);
     for (const name of [...ledger.systemdUnits.keys()]) {
       try {
         await stopTrackedSystemdUnit(name, true);
       } catch (error) {
+        tempRootConsumersStopped = false;
         errors.push('systemd unit ' + name + ': ' + redact(error.message));
       }
     }
@@ -1587,21 +1594,27 @@ async function cleanup() {
       try {
         await removeTrackedDockerContainer(name, true);
       } catch (error) {
+        tempRootConsumersStopped = false;
         errors.push('container ' + name + ': ' + redact(error.message));
       }
     }
     let credentialSafeToRemoveWithRoot = true;
-    try {
-      await removeRunCredential(true);
-    } catch (error) {
+    if (tempRootConsumersStopped) {
+      try {
+        await removeRunCredential(true);
+      } catch (error) {
+        credentialSafeToRemoveWithRoot = false;
+        errors.push('temporary credential: ' + redact(error.message));
+      }
+    } else {
       credentialSafeToRemoveWithRoot = false;
-      errors.push('temporary credential: ' + redact(error.message));
+      errors.push('temporary workspace retained because a systemd unit or Docker container may still be using it');
     }
     if (credentialSafeToRemoveWithRoot) {
       try { await removeTempRoot(); } catch (error) {
         errors.push('temporary workspace: ' + redact(error.message));
       }
-    } else if (ledger.tempRoot) {
+    } else if (ledger.tempRoot && tempRootConsumersStopped) {
       errors.push('temporary workspace retained because credential ownership verification failed');
     }
     if (errors.length) {
@@ -1671,29 +1684,26 @@ async function resourceAbsenceChecks(options, checks) {
   }
 
   if (options.agents.includes('k8s-pi')) {
-    const names = [k8sName(options, 'deepseek')];
+    const resources = [{ kind: 'secret', name: k8sName(options, 'deepseek') }];
     for (const phase of options.phases) {
-      names.push(k8sName(options, 'collector', 'k8s', phase));
-      names.push(k8sName(options, 'workload', 'k8s', phase));
-      names.push(k8sName(options, 'filter-canary', 'k8s', phase));
-      names.push(k8sName(options, 'filter-canary', 'value', phase));
-      names.push(k8sName(options, 'pi-marker', phase));
+      resources.push({ kind: 'pod', name: k8sName(options, 'collector', 'k8s', phase) });
+      resources.push({ kind: 'pod', name: k8sName(options, 'workload', 'k8s', phase) });
+      resources.push({ kind: 'pod', name: k8sName(options, 'filter-canary', 'k8s', phase) });
+      resources.push({ kind: 'secret', name: k8sName(options, 'filter-canary', 'value', phase) });
+      resources.push({ kind: 'secret', name: k8sName(options, 'pi-marker', phase) });
     }
-    for (const name of names) {
-      for (const kind of name.endsWith('-deepseek') || name.includes('-filter-canary-value-') ||
-          name.includes('-pi-marker-') ? ['secret'] : ['pod']) {
-        const result = await run(
-          'kubectl',
-          ['-n', options.k8sWorkloadNamespace, 'get', kind, name],
-          { allowFailure: true },
-        );
-        check(
-          checks,
-          'resource absent: ' + kind + '/' + name,
-          result.code === 0 ? 'block' : 'pass',
-          result.code === 0 ? 'a pre-existing exact-name resource would never be adopted' : 'exact name is unused',
-        );
-      }
+    for (const { kind, name } of resources) {
+      const result = await run(
+        'kubectl',
+        ['-n', options.k8sWorkloadNamespace, 'get', kind, name],
+        { allowFailure: true },
+      );
+      check(
+        checks,
+        'resource absent: ' + kind + '/' + name,
+        result.code === 0 ? 'block' : 'pass',
+        result.code === 0 ? 'a pre-existing exact-name resource would never be adopted' : 'exact name is unused',
+      );
     }
   }
 }
@@ -2263,8 +2273,11 @@ function startHeartbeatSampler(baseUrl, collector) {
     while (!stopping) {
       try {
         const item = await queryHeartbeat(baseUrl, collector);
-        if (item?.lastHeartbeatAt && !seen.has(item.lastHeartbeatAt)) {
-          seen.add(item.lastHeartbeatAt);
+        const fingerprint = item?.lastHeartbeatAt
+          ? heartbeatCursor(item).filterMetricsFingerprint
+          : undefined;
+        if (fingerprint && !seen.has(fingerprint)) {
+          seen.add(fingerprint);
           samples.push(item);
         }
       } catch {}
@@ -2280,7 +2293,7 @@ function startHeartbeatSampler(baseUrl, collector) {
   };
 }
 
-function aggregateHeartbeatSamples(samples) {
+function aggregateHeartbeatSamples(samples, finalHeartbeat = samples.at(-1)) {
   const sumFields = [
     'observed', 'forwarded', 'confirmedAgent', 'probableAgent', 'unknown', 'nonAgent',
     'filteredNonAgent', 'wouldFilterNonAgent', 'filteredNoise', 'wouldFilterNoise',
@@ -2303,9 +2316,22 @@ function aggregateHeartbeatSamples(samples) {
   for (const item of samples) {
     const metrics = item.filterMetrics || {};
     for (const field of sumFields) totals[field] += numericMetric(metrics, field);
-    errors.droppedEvents += numericMetric(item, 'droppedEvents');
-    errors.outputDropped += numericMetric(item, 'outputDropped');
-    errors.errorCount += numericMetric(item, 'errorCount');
+    const maxima = item?.windowErrorMaxima;
+    errors.droppedEvents = Math.max(
+      errors.droppedEvents,
+      numericMetric(item, 'droppedEvents'),
+      numericMetric(maxima, 'droppedEvents'),
+    );
+    errors.outputDropped = Math.max(
+      errors.outputDropped,
+      numericMetric(item, 'outputDropped'),
+      numericMetric(maxima, 'outputDropped'),
+    );
+    errors.errorCount = Math.max(
+      errors.errorCount,
+      numericMetric(item, 'errorCount'),
+      numericMetric(maxima, 'errorCount'),
+    );
     errors.queueDropped += numericMetric(metrics, 'queueDropped');
     errors.identityErrors = Math.max(errors.identityErrors, numericMetric(metrics, 'identityErrors'));
     errors.dockerErrors = Math.max(errors.dockerErrors, numericMetric(metrics, 'dockerErrors'));
@@ -2314,12 +2340,36 @@ function aggregateHeartbeatSamples(samples) {
     errors.runtimeLeaseErrors = Math.max(errors.runtimeLeaseErrors, numericMetric(metrics, 'runtimeLeaseErrors'));
     errors.runtimeLeaseFenced ||= metrics.runtimeLeaseFenced === true;
   }
+  const finalMaxima = finalHeartbeat?.windowErrorMaxima;
+  const windowErrorEvidence = Boolean(
+    finalMaxima && ['droppedEvents', 'outputDropped', 'errorCount'].every((name) => {
+      const value = finalMaxima[name];
+      return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+    }),
+  );
+  const finalMetrics = finalHeartbeat?.filterMetrics || {};
+  if (windowErrorEvidence) {
+    errors.droppedEvents = Math.max(errors.droppedEvents, finalMaxima.droppedEvents);
+    errors.outputDropped = Math.max(errors.outputDropped, finalMaxima.outputDropped);
+    errors.errorCount = Math.max(errors.errorCount, finalMaxima.errorCount);
+  }
+  errors.droppedEvents = Math.max(errors.droppedEvents, numericMetric(finalHeartbeat, 'droppedEvents'));
+  errors.outputDropped = Math.max(errors.outputDropped, numericMetric(finalHeartbeat, 'outputDropped'));
+  errors.errorCount = Math.max(errors.errorCount, numericMetric(finalHeartbeat, 'errorCount'));
+  errors.queueDropped = Math.max(errors.queueDropped, numericMetric(finalMetrics, 'queueDropped'));
+  errors.identityErrors = Math.max(errors.identityErrors, numericMetric(finalMetrics, 'identityErrors'));
+  errors.dockerErrors = Math.max(errors.dockerErrors, numericMetric(finalMetrics, 'dockerErrors'));
+  errors.runtimeSnapshotErrors = Math.max(errors.runtimeSnapshotErrors, numericMetric(finalMetrics, 'runtimeSnapshotErrors'));
+  errors.runtimeSnapshotRejected = Math.max(errors.runtimeSnapshotRejected, numericMetric(finalMetrics, 'runtimeSnapshotRejected'));
+  errors.runtimeLeaseErrors = Math.max(errors.runtimeLeaseErrors, numericMetric(finalMetrics, 'runtimeLeaseErrors'));
+  errors.runtimeLeaseFenced ||= finalMetrics.runtimeLeaseFenced === true;
   return {
     count: samples.length,
     firstHeartbeatAt: samples[0]?.lastHeartbeatAt,
-    lastHeartbeatAt: samples.at(-1)?.lastHeartbeatAt,
-    filterMode: samples.at(-1)?.filterMetrics?.filterMode,
-    last: samples.at(-1)?.filterMetrics,
+    lastHeartbeatAt: finalHeartbeat?.lastHeartbeatAt ?? samples.at(-1)?.lastHeartbeatAt,
+    filterMode: finalMetrics.filterMode ?? samples.at(-1)?.filterMetrics?.filterMode,
+    windowErrorEvidence,
+    last: finalMetrics,
     totals,
     errors,
   };
@@ -2327,6 +2377,11 @@ function aggregateHeartbeatSamples(samples) {
 
 function assertPhaseMetrics(phase, metrics, environment) {
   assert.ok(metrics.count >= 2, environment + '/' + phase + ' captured fewer than two heartbeat intervals');
+  assert.equal(
+    metrics.windowErrorEvidence,
+    true,
+    environment + '/' + phase + ' did not receive final window-stable drop/error evidence',
+  );
   assert.equal(metrics.filterMode, phase, environment + ' collector reported the wrong filter mode');
   for (const [name, value] of Object.entries(metrics.errors)) {
     if (name === 'runtimeLeaseFenced') assert.equal(value, false, environment + ' forwarder was fenced');
@@ -2486,7 +2541,14 @@ async function stopOwnedDockerContainer(name, remove = true) {
     allowFailure: true,
     timeoutMs: 30_000,
   });
-  if (stopped.code !== 0) throw new Error('Docker stop failed for ' + name + ': ' + redact(stopped.stderr));
+  if (stopped.code !== 0) {
+    const state = await dockerResourceState(ownership.id, ledger.runId, ownership);
+    if (state.exists) {
+      throw new Error('Docker stop failed for ' + name + ': ' + redact(stopped.stderr || stopped.stdout));
+    }
+    ledger.dockerContainers.delete(name);
+    return;
+  }
   if (remove) {
     await removeTrackedDockerContainer(name);
   }
@@ -2991,6 +3053,7 @@ async function armFilterWitness(collector, markerValue) {
 
 function validateWitnessRecord(record, markerValue, environment, containerId) {
   assert.equal(record?.schema, 'anysentry.e2e_raw_witness.v1', 'raw witness schema mismatch');
+  assert.ok(Number.isFinite(Date.parse(record?.observedAt || '')), 'raw witness has no valid observation time');
   assert.equal(record?.eventKind, 'ToolExec', 'raw witness did not observe ToolExec');
   assert.equal(record?.markerSha256, expectedMarkerHash(markerValue), 'raw witness marker digest mismatch');
   assert.equal(record?.argvMarkerMatched, true, 'raw witness did not match the exact argv marker');
@@ -3025,6 +3088,9 @@ function matchingFilterReceipt(heartbeat, runRecord, rawWitness) {
       receipt.classification !== 'unknown' ||
       receipt.filterReason !== 'unknown'
     ) return false;
+    const observedAt = Date.parse(rawWitness?.observedAt || '');
+    const filteredAt = Date.parse(receipt.filteredAt || '');
+    if (!Number.isFinite(observedAt) || !Number.isFinite(filteredAt) || filteredAt < observedAt) return false;
     if (runRecord.environment === 'host') return true;
     const physical = String(receipt.physicalWorkloadId || '');
     return physical.includes(runRecord.containerId) || physical.includes(runRecord.containerId.slice(0, 12));
@@ -3813,6 +3879,28 @@ async function waitForNewRunningInstance(apiBase, collector, baselineIds, scope,
   }, 90_000, 250);
 }
 
+function runtimeCandidateMatchesHostAgent(candidate, agent, observedComm) {
+  const expectedScope = agent === 'host-codex'
+    ? {
+      comms: new Set(['codex']),
+      exes: new Set(['codex']),
+      evidences: new Set(['runtime_signature:commExact=codex', 'runtime_signature:argv0Basename=codex']),
+    }
+    : {
+      comms: new Set(['Kimi Code', 'kimi', 'kimi-cli']),
+      exes: new Set(['kimi', 'kimi-cli']),
+      evidences: new Set([
+        'runtime_signature:commExact=kimi',
+        'runtime_signature:commExact=kimi-cli',
+        'runtime_signature:argv0Basename=kimi',
+      ]),
+    };
+  if (expectedScope.comms.has(observedComm)) return true;
+  const exeBase = path.basename(String(candidate?.exe || ''));
+  if (expectedScope.exes.has(exeBase)) return true;
+  return Array.isArray(candidate?.evidence) && candidate.evidence.some((item) => expectedScope.evidences.has(String(item)));
+}
+
 async function matchHostRuntimeToSystemdService(candidate, runRecord) {
   const service = runRecord.systemd;
   const state = await systemdUnitState(service.unitName, service.ownership);
@@ -3823,10 +3911,6 @@ async function matchHostRuntimeToSystemdService(candidate, runRecord) {
   const identity = (await processAncestry(candidate.rootPid, 1))[0];
   if (!identity || identity.startTime !== String(candidate.rootStartTimeTicks)) return undefined;
   if (candidate.rootPid === service.state.execMainPid) return undefined;
-  const allowedComms = runRecord.agent === 'host-codex'
-    ? new Set(['codex'])
-    : new Set(['Kimi Code', 'kimi', 'kimi-cli']);
-  if (!allowedComms.has(identity.comm)) return undefined;
   let observedControlGroup;
   try {
     observedControlGroup = await processUnifiedControlGroup(candidate.rootPid);
@@ -3837,6 +3921,7 @@ async function matchHostRuntimeToSystemdService(candidate, runRecord) {
   if (!controlGroupContains(service.ownership.controlGroup, observedControlGroup)) return undefined;
   const confirmedIdentity = (await processAncestry(candidate.rootPid, 1))[0];
   if (!confirmedIdentity || confirmedIdentity.startTime !== String(candidate.rootStartTimeTicks)) return undefined;
+  if (!runtimeCandidateMatchesHostAgent(candidate, runRecord.agent, confirmedIdentity.comm)) return undefined;
   return {
     processKey: String(candidate.rootPid) + ':' + String(candidate.rootStartTimeTicks),
     controlGroup: observedControlGroup,
@@ -3899,13 +3984,36 @@ async function waitForUnknownCanaryEvent(apiBase, collector, markerValue, enviro
   }, 90_000, 500);
 }
 
-async function waitForNextHeartbeat(apiBase, collector, afterHeartbeatAt, label, predicate = () => true) {
-  const after = Date.parse(afterHeartbeatAt || '');
-  assert.ok(Number.isFinite(after), 'heartbeat barrier is missing a valid timestamp');
+function heartbeatCursor(item) {
+  const filterMetrics = item?.filterMetrics && typeof item.filterMetrics === 'object'
+    ? item.filterMetrics
+    : {};
+  return {
+    lastHeartbeatAt: String(item?.lastHeartbeatAt || ''),
+    filterMetricsFingerprint: hashText(JSON.stringify(filterMetrics)),
+  };
+}
+
+function heartbeatAdvanced(previous, current) {
+  const before = heartbeatCursor(previous);
+  const after = heartbeatCursor(current);
+  const beforeTs = Date.parse(before.lastHeartbeatAt);
+  const afterTs = Date.parse(after.lastHeartbeatAt);
+  if (!Number.isFinite(beforeTs) || !Number.isFinite(afterTs)) return false;
+  if (afterTs < beforeTs) return false;
+  // collectors/health combines the newest raw Rust heartbeat timestamp with the newest
+  // Forwarder-enriched metrics. A newer timestamp alone can therefore be a raw heartbeat and is
+  // not a safe drain barrier. The E2E collectors post runtime snapshots every second, so each
+  // enriched heartbeat changes this bounded metrics fingerprint even when no event counter moves.
+  return after.filterMetricsFingerprint !== before.filterMetricsFingerprint;
+}
+
+async function waitForNextHeartbeat(apiBase, collector, previousHeartbeat, label, predicate = () => true) {
+  const before = heartbeatCursor(previousHeartbeat);
+  assert.ok(Number.isFinite(Date.parse(before.lastHeartbeatAt)), 'heartbeat barrier is missing a valid timestamp');
   return await eventually(label, async () => {
     const item = await queryHeartbeat(apiBase, collector);
-    const observed = Date.parse(item?.lastHeartbeatAt || '');
-    return Number.isFinite(observed) && observed > after && predicate(item) ? item : undefined;
+    return heartbeatAdvanced(previousHeartbeat, item) && predicate(item) ? item : undefined;
   }, 30_000, 200);
 }
 
@@ -3959,7 +4067,7 @@ async function executeFilterCanaryScenario(context, collector) {
     const armedHeartbeat = await waitForNextHeartbeat(
       apiBase,
       collectorId,
-      quietBarrier?.lastHeartbeatAt,
+      quietBarrier,
       environment + ' filter canary heartbeat barrier',
     );
     await triggerFilterCanary(runRecord);
@@ -3969,7 +4077,7 @@ async function executeFilterCanaryScenario(context, collector) {
     const counterHeartbeat = await waitForNextHeartbeat(
       apiBase,
       collectorId,
-      armedHeartbeat.lastHeartbeatAt,
+      armedHeartbeat,
       environment + ' correlated filter counter ' + metricName,
       (item) => Number(item?.filterMetrics?.[metricName]) > 0 &&
         Boolean(matchingFilterReceipt(item, runRecord, rawWitness)),
@@ -3989,16 +4097,18 @@ async function executeFilterCanaryScenario(context, collector) {
       const drained = await waitForNextHeartbeat(
         apiBase,
         collectorId,
-        counterHeartbeat.lastHeartbeatAt,
+        counterHeartbeat,
         environment + ' enforce post-filter drain heartbeat',
+        (item) => !matchingFilterReceipt(item, runRecord, rawWitness),
       );
       const firstFiltered = await queryEvents(apiBase, collectorId, runRecord.marker);
       assert.equal(firstFiltered.total, 0, environment + ' enforce leaked the unknown filter canary into L1');
       const stable = await waitForNextHeartbeat(
         apiBase,
         collectorId,
-        drained.lastHeartbeatAt,
+        drained,
         environment + ' enforce stable absence heartbeat',
+        (item) => !matchingFilterReceipt(item, runRecord, rawWitness),
       );
       const filtered = await queryEvents(apiBase, collectorId, runRecord.marker);
       assert.equal(filtered.total, 0, environment + ' enforce canary appeared after the drain interval');
@@ -4179,10 +4289,35 @@ async function executeK8sPiScenario(context, phase) {
   };
 }
 
+async function stopPhaseCollector(collector, requireTracked = false) {
+  let stopped = false;
+  if (collector.environment === 'host' || collector.environment === 'docker') {
+    if (ledger.dockerContainers.has(collector.name)) {
+      await stopOwnedDockerContainer(collector.name, true);
+      stopped = true;
+    }
+  } else if (ledger.k8sPods.get(collector.namespace)?.has(collector.name)) {
+    await deleteOwnedK8s('pod', collector.namespace, collector.name, ledger.k8sPods);
+    stopped = true;
+  }
+  if (requireTracked && !stopped) {
+    throw new Error(collector.environment + ' collector disappeared before final heartbeat collection');
+  }
+}
+
 async function finalizeCollectorPhase(context, collector, sampler, scenarioResults, filterCanary) {
   await delay(2_500);
+  const beforeStop = await queryHeartbeat(collector.apiBase, collector.collectorId);
+  assert.ok(beforeStop?.lastHeartbeatAt, collector.environment + ' collector has no heartbeat before shutdown');
+  await stopPhaseCollector(collector, true);
+  const finalHeartbeat = await waitForNextHeartbeat(
+    collector.apiBase,
+    collector.collectorId,
+    beforeStop,
+    collector.environment + ' final enriched shutdown heartbeat',
+  );
   const samples = await sampler.stop();
-  const metrics = aggregateHeartbeatSamples(samples);
+  const metrics = aggregateHeartbeatSamples(samples, finalHeartbeat);
   assertPhaseMetrics(collector.phase, metrics, collector.environment);
   const events = await queryEvents(collector.apiBase, collector.collectorId);
   const runtime = await queryRuntime(collector.apiBase, { collectorId: collector.collectorId });
@@ -4249,11 +4384,7 @@ async function executeEnvironmentPhase(context, environment, phase) {
     return await finalizeCollectorPhase(context, collector, sampler, scenarios, filterCanary);
   } finally {
     await sampler.stop().catch(() => []);
-    if (environment === 'host' || environment === 'docker') {
-      if (ledger.dockerContainers.has(collector.name)) await stopOwnedDockerContainer(collector.name, true);
-    } else if (ledger.k8sPods.get(collector.namespace)?.has(collector.name)) {
-      await deleteOwnedK8s('pod', collector.namespace, collector.name, ledger.k8sPods);
-    }
+    await stopPhaseCollector(collector);
   }
 }
 
@@ -4767,18 +4898,101 @@ async function selfTest() {
   validateLifecycleIdentity(running, terminal, 'host');
   assert.equal(runtimeIdentityIsComplete(running), true);
   assert.throws(() => validateLifecycleIdentity(running, { ...terminal, rootStartTimeTicks: '457' }, 'host'), /start time/u);
+  assert.equal(runtimeCandidateMatchesHostAgent({ exe: '/opt/codex' }, 'host-codex', 'node'), true);
+  assert.equal(runtimeCandidateMatchesHostAgent({ evidence: ['runtime_signature:commExact=kimi'] }, 'host-kimi', 'node'), true);
+  assert.equal(runtimeCandidateMatchesHostAgent({ exe: '/usr/bin/node', evidence: [] }, 'host-codex', 'node'), false);
+  const heartbeatBase = {
+    lastHeartbeatAt: '2026-01-01 00:00:00',
+    eventCount: 10,
+    filterMetrics: { observed: 4, forwarded: 3, runtimeSnapshotPosts: 2 },
+  };
+  assert.equal(heartbeatAdvanced(heartbeatBase, structuredClone(heartbeatBase)), false);
+  assert.equal(heartbeatAdvanced(heartbeatBase, {
+    ...heartbeatBase,
+    lastHeartbeatAt: '2026-01-01 00:00:01',
+    eventCount: 11,
+  }), false, 'a raw heartbeat must not satisfy an enriched heartbeat barrier');
+  assert.equal(heartbeatAdvanced(heartbeatBase, {
+    ...heartbeatBase,
+    filterMetrics: { ...heartbeatBase.filterMetrics, runtimeSnapshotPosts: 3 },
+  }), true, 'same-second Forwarder metrics must advance the heartbeat barrier');
+  assert.equal(heartbeatAdvanced(heartbeatBase, {
+    ...heartbeatBase,
+    filterMetrics: {
+      ...heartbeatBase.filterMetrics,
+      e2eFilterReceipts: [{ markerSha256: 'a'.repeat(64), lineSha256: 'b'.repeat(64) }],
+    },
+  }), true, 'a same-second canary receipt must advance the heartbeat barrier');
+  const receiptBarrier = {
+    ...heartbeatBase,
+    filterMetrics: {
+      ...heartbeatBase.filterMetrics,
+      e2eFilterReceipts: [{ markerSha256: 'a'.repeat(64), lineSha256: 'b'.repeat(64) }],
+    },
+  };
+  assert.equal(heartbeatAdvanced(receiptBarrier, {
+    ...receiptBarrier,
+    lastHeartbeatAt: '2026-01-01 00:00:01',
+  }), false, 'a later raw heartbeat must not drain an enriched canary receipt');
+  assert.equal(heartbeatAdvanced(receiptBarrier, {
+    ...heartbeatBase,
+    lastHeartbeatAt: '2026-01-01 00:00:01',
+    filterMetrics: { ...heartbeatBase.filterMetrics, runtimeSnapshotPosts: 3 },
+  }), true, 'the next enriched heartbeat must drain the canary receipt');
+  assert.equal(heartbeatAdvanced(heartbeatBase, {
+    ...heartbeatBase,
+    lastHeartbeatAt: '2025-12-31 23:59:59',
+    filterMetrics: { ...heartbeatBase.filterMetrics, runtimeSnapshotPosts: 3 },
+  }), false, 'an older health record must not advance the heartbeat barrier');
+  const zeroWindowErrors = {
+    windowErrorMaxima: { droppedEvents: 0, outputDropped: 0, errorCount: 0 },
+  };
   const shadow = aggregateHeartbeatSamples([
     {
       lastHeartbeatAt: '2026-01-01T00:00:00.000Z', droppedEvents: 0, outputDropped: 0, errorCount: 0,
+      ...zeroWindowErrors,
       filterMetrics: { filterMode: 'shadow', observed: 1, forwarded: 1, wouldDiscoveryBudgetDrop: 1 },
     },
     {
       lastHeartbeatAt: '2026-01-01T00:00:02.000Z', droppedEvents: 0, outputDropped: 0, errorCount: 0,
+      ...zeroWindowErrors,
       filterMetrics: { filterMode: 'shadow', observed: 2, forwarded: 2, probableAgent: 1 },
     },
   ]);
   assertPhaseMetrics('shadow', shadow, 'self-test');
   assert.equal(shadow.totals.observed, 3);
+  const maskedForwarderError = aggregateHeartbeatSamples([
+    {
+      lastHeartbeatAt: '2026-01-01T00:00:00.000Z', droppedEvents: 0, outputDropped: 1, errorCount: 1,
+      windowErrorMaxima: { droppedEvents: 0, outputDropped: 1, errorCount: 1 },
+      filterMetrics: { filterMode: 'shadow', observed: 1, runtimeSnapshotPosts: 1 },
+    },
+    {
+      lastHeartbeatAt: '2026-01-01T00:00:01.000Z', droppedEvents: 0, outputDropped: 0, errorCount: 0,
+      windowErrorMaxima: { droppedEvents: 0, outputDropped: 1, errorCount: 1 },
+      filterMetrics: { filterMode: 'shadow', observed: 0, runtimeSnapshotPosts: 2 },
+    },
+  ]);
+  assert.equal(maskedForwarderError.errors.outputDropped, 1);
+  assert.equal(maskedForwarderError.errors.errorCount, 1);
+  assert.throws(
+    () => assertPhaseMetrics('shadow', maskedForwarderError, 'self-test-masked-error'),
+    /outputDropped|errorCount/u,
+  );
+  const missingWindowEvidence = aggregateHeartbeatSamples([
+    {
+      lastHeartbeatAt: '2026-01-01T00:00:00.000Z', droppedEvents: 0, outputDropped: 0, errorCount: 0,
+      filterMetrics: { filterMode: 'shadow', runtimeSnapshotPosts: 1 },
+    },
+    {
+      lastHeartbeatAt: '2026-01-01T00:00:02.000Z', droppedEvents: 0, outputDropped: 0, errorCount: 0,
+      filterMetrics: { filterMode: 'shadow', runtimeSnapshotPosts: 2 },
+    },
+  ]);
+  assert.throws(
+    () => assertPhaseMetrics('shadow', missingWindowEvidence, 'self-test-missing-window-evidence'),
+    /window-stable drop\/error evidence/u,
+  );
   assert.equal(redact('token=secret-value sk-123456789'), 'token=<redacted> sk-<redacted>');
   const boundedDiagnostic = boundedRedactedText('x'.repeat(512) + ' token=secret-value sk-123456789', 128);
   assert.equal(boundedDiagnostic.truncated, true);
@@ -4861,6 +5075,7 @@ async function selfTest() {
   ), ['tool-events.log:marker_missing']);
   const witness = {
     schema: 'anysentry.e2e_raw_witness.v1',
+    observedAt: '2026-01-01T00:00:00.000Z',
     eventKind: 'ToolExec',
     markerSha256: expectedMarkerHash('e2e-marker-001'),
     argvMarkerMatched: true,
@@ -4879,6 +5094,7 @@ async function selfTest() {
         physicalWorkloadId: 'docker:test:' + 'c'.repeat(64),
         classification: 'unknown',
         filterReason: 'unknown',
+        filteredAt: '2026-01-01T00:00:00.001Z',
       }],
     },
   };
@@ -4891,6 +5107,16 @@ async function selfTest() {
   assert.equal(matchingFilterReceipt(receiptHeartbeat, {
     marker: 'e2e-marker-001', environment: 'docker', containerId: 'c'.repeat(64),
   }, { ...witness, lineSha256: 'd'.repeat(64) }), undefined);
+  assert.equal(matchingFilterReceipt({
+    filterMetrics: {
+      e2eFilterReceipts: [{
+        ...receiptHeartbeat.filterMetrics.e2eFilterReceipts[0],
+        filteredAt: '2025-12-31T23:59:59.999Z',
+      }],
+    },
+  }, {
+    marker: 'e2e-marker-001', environment: 'docker', containerId: 'c'.repeat(64),
+  }, witness), undefined);
   const exactEvent = {
     eventKind: 'ToolExec',
     attribution: { agentInstanceId: 'instance-a' },

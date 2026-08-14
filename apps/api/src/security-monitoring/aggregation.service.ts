@@ -1476,7 +1476,10 @@ export class AggregationService {
 
   collectorHealth(filter: T.CollectorHealthQuery): T.CollectorHealth {
     const { sinceMs, spanMs } = this.win(filter);
-    const windowHeartbeats = this.judge.queryCollectorHeartbeats(sinceMs);
+    const endMs = sinceMs + spanMs;
+    const windowHeartbeats = this.judge
+      .queryCollectorHeartbeats(sinceMs)
+      .filter((heartbeat) => heartbeat.at <= endMs);
     const heartbeatHeads = this.judge.collectorHeartbeatHeads();
     const latestHeartbeatByCollector = new Map(heartbeatHeads.latest.map((heartbeat) => [heartbeat.collectorId, heartbeat]));
     const latestMetricsByCollector = new Map(heartbeatHeads.latestMetrics.map((heartbeat) => [heartbeat.collectorId, heartbeat]));
@@ -1505,9 +1508,13 @@ export class AggregationService {
       let eventCount = 0;
       let observedAgentCount = 0;
       let reportedIntervalSecs = 0;
+      const windowErrorMaxima = { droppedEvents: 0, outputDropped: 0, errorCount: 0 };
       for (const hb of hbs) {
         observedAgentCount = Math.max(observedAgentCount, hb.observedAgents);
         reportedIntervalSecs += hb.intervalSecs;
+        windowErrorMaxima.droppedEvents = Math.max(windowErrorMaxima.droppedEvents, hb.droppedEvents ?? 0);
+        windowErrorMaxima.outputDropped = Math.max(windowErrorMaxima.outputDropped, hb.outputDropped ?? 0);
+        windowErrorMaxima.errorCount = Math.max(windowErrorMaxima.errorCount, hb.errorCount ?? 0);
         for (const [kind, count] of Object.entries(hb.eventKindCounts)) {
           eventCount += count;
           const category = eventCategory(kind);
@@ -1548,6 +1555,7 @@ export class AggregationService {
         droppedEvents: latest?.droppedEvents ?? 0,
         outputDropped: latest?.outputDropped ?? 0,
         errorCount: latest?.errorCount ?? 0,
+        windowErrorMaxima,
         filterMetrics: freshMetricsHeartbeat?.filterMetrics ?? {
           scope: 'decoupled',
           filterMode: 'shadow',

@@ -1512,6 +1512,12 @@ export interface CollectorHealthItem {
   droppedEvents: number;
   outputDropped: number;
   errorCount: number;
+  /** Maximum counter readings reported by heartbeat records in the requested health window. */
+  windowErrorMaxima: {
+    droppedEvents: number;
+    outputDropped: number;
+    errorCount: number;
+  };
   filterMetrics: CollectorFilterMetrics;
   message?: string;
   eventCategoryCounts: Record<EventCategory, number>;

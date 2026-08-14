@@ -1838,6 +1838,11 @@ export interface CollectorHealthItem {
   droppedEvents: number;
   outputDropped: number;
   errorCount: number;
+  windowErrorMaxima: {
+    droppedEvents: number;
+    outputDropped: number;
+    errorCount: number;
+  };
   filterMetrics: CollectorFilterMetrics;
   message?: string;
   eventCategoryCounts: Record<AgentEventCategory, number>;

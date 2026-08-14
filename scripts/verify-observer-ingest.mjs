@@ -139,6 +139,10 @@ async function verifyCollectorMetricFreshnessContract() {
   const sameMillisecondEnriched = heartbeat({
     filterMetricsReportedAt: at,
     nodeName: `${runId}-enriched-same-ms`,
+    status: 'degraded',
+    droppedEvents: 2,
+    outputDropped: 3,
+    errorCount: 4,
     filterMetrics: { scope: 'shadow', observed: 9 },
   });
   const sameMillisecondRaw = heartbeat({ nodeName: `${runId}-raw-same-ms` });
@@ -151,9 +155,46 @@ async function verifyCollectorMetricFreshnessContract() {
   assert(
     'same-millisecond raw heartbeat updates status while fresh enriched metrics remain selected',
     sameMillisecondHealth.items?.[0]?.nodeName === `${runId}-raw-same-ms` &&
+      sameMillisecondHealth.items?.[0]?.droppedEvents === 0 &&
+      sameMillisecondHealth.items?.[0]?.outputDropped === 0 &&
+      sameMillisecondHealth.items?.[0]?.errorCount === 0 &&
       sameMillisecondHealth.items?.[0]?.filterMetrics?.scope === 'shadow' &&
-      sameMillisecondHealth.items?.[0]?.filterMetrics?.observed === 9,
+      sameMillisecondHealth.items?.[0]?.filterMetrics?.observed === 9 &&
+      sameMillisecondHealth.items?.[0]?.windowErrorMaxima?.droppedEvents === 2 &&
+      sameMillisecondHealth.items?.[0]?.windowErrorMaxima?.outputDropped === 3 &&
+      sameMillisecondHealth.items?.[0]?.windowErrorMaxima?.errorCount === 4,
     sameMillisecondHealth,
+  );
+
+  const historicalInside = heartbeat({
+    at: at - 2_000,
+    droppedEvents: 2,
+    outputDropped: 3,
+    errorCount: 4,
+  });
+  const historicalAfterEnd = heartbeat({
+    at: at - 500,
+    droppedEvents: 99,
+    outputDropped: 99,
+    errorCount: 99,
+  });
+  const historicalAggregation = new AggregationService({
+    query: () => [],
+    queryCollectorHeartbeats: () => [historicalInside, historicalAfterEnd],
+    collectorHeartbeatHeads: () => ({ latest: [historicalAfterEnd], latestMetrics: [] }),
+  }, {}, {}, {});
+  const historicalHealth = historicalAggregation.collectorHealth({
+    timeType: 'custom',
+    startTime: new Date(at - 3_000).toISOString(),
+    endTime: new Date(at - 1_000).toISOString(),
+    collectorId: historicalInside.collectorId,
+  });
+  assert(
+    'collector window error maxima exclude heartbeats after a custom end time',
+    historicalHealth.items?.[0]?.windowErrorMaxima?.droppedEvents === 2 &&
+      historicalHealth.items?.[0]?.windowErrorMaxima?.outputDropped === 3 &&
+      historicalHealth.items?.[0]?.windowErrorMaxima?.errorCount === 4,
+    historicalHealth,
   );
 
   const expiredAt = at - 4 * 60_000;
@@ -765,6 +806,7 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
     intervalSecs: 30,
     eventKindCounts: { ToolExec: 2, Egress: 1 },
     queueDepth: 4,
+    droppedEvents: 2,
     outputDropped: 1,
     errorCount: 1,
     observedAgents: 2,
@@ -849,8 +891,12 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       health.items?.[0]?.collectorId === `${runId}-collector` &&
       health.items?.[0]?.state === 'degraded' &&
       health.items?.[0]?.queueDepth === 4 &&
+      health.items?.[0]?.droppedEvents === 2 &&
       health.items?.[0]?.outputDropped === 1 &&
       health.items?.[0]?.errorCount === 1 &&
+      health.items?.[0]?.windowErrorMaxima?.droppedEvents === 2 &&
+      health.items?.[0]?.windowErrorMaxima?.outputDropped === 1 &&
+      health.items?.[0]?.windowErrorMaxima?.errorCount === 1 &&
       health.items?.[0]?.filterMetrics?.scope === 'shadow' &&
       health.items?.[0]?.filterMetrics?.wouldFilterNonAgent === 3 &&
       health.items?.[0]?.filterMetrics?.e2eFilterReceipts?.length === 1 &&
@@ -904,6 +950,12 @@ async function verifyRawHeartbeatPreservesForwarderMetrics(sourceId, token) {
       health.items?.[0]?.state === 'healthy' &&
       health.items?.[0]?.observedAgentCount === 4 &&
       health.items?.[0]?.attachedProbes === 11 &&
+      health.items?.[0]?.droppedEvents === 0 &&
+      health.items?.[0]?.outputDropped === 0 &&
+      health.items?.[0]?.errorCount === 0 &&
+      health.items?.[0]?.windowErrorMaxima?.droppedEvents === 2 &&
+      health.items?.[0]?.windowErrorMaxima?.outputDropped === 1 &&
+      health.items?.[0]?.windowErrorMaxima?.errorCount === 1 &&
       health.items?.[0]?.filterMetrics?.scope === 'shadow' &&
       health.items?.[0]?.filterMetrics?.wouldFilterNonAgent === 3 &&
       health.items?.[0]?.filterMetrics?.e2eFilterReceipts?.length === 1 &&
@@ -1014,6 +1066,9 @@ async function verifyExplicitForwarderMetricsReplacePrevious(sourceId, token) {
       health.items?.[0]?.filterMetrics?.scope === 'shadow' &&
       health.items?.[0]?.filterMetrics?.observed === 0 &&
       health.items?.[0]?.filterMetrics?.wouldFilterNonAgent === 0 &&
+      health.items?.[0]?.windowErrorMaxima?.droppedEvents === 2 &&
+      health.items?.[0]?.windowErrorMaxima?.outputDropped === 1 &&
+      health.items?.[0]?.windowErrorMaxima?.errorCount === 1 &&
       !health.items?.[0]?.filterMetrics?.e2eFilterReceipts?.length,
     health,
   );
