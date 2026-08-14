@@ -5014,21 +5014,37 @@ export class SecurityMonitoringController {
     const events = Array.isArray(body.events) ? body.events.slice(0, 256) : [];
     const items: unknown[] = [];
     let acceptedEvents = 0;
+    let discardedEvents = 0;
     for (let index = 0; index < events.length; index += 1) {
       const event = events[index];
       if (!event || typeof event.line !== 'string' || !event.line.trim()) {
-        items.push({ index, accepted: false, reason: 'missing observer line' });
+        items.push({
+          index,
+          accepted: false,
+          disposition: 'rejected',
+          reasonCode: 'missing_observer_line',
+          reason: 'missing observer line',
+        });
         continue;
       }
       const result = await this.ingest(event, headers);
-      const accepted = result.accepted === true;
+      const declaredDisposition = 'disposition' in result ? result.disposition : undefined;
+      const discarded = declaredDisposition === 'discarded';
+      const accepted = result.accepted === true || discarded;
+      const disposition = declaredDisposition ?? (accepted ? 'retained' : 'rejected');
       if (accepted) acceptedEvents += 1;
-      items.push({ index, ...result });
+      if (discarded) discardedEvents += 1;
+      // `/ingest` keeps its historical accepted=false contract for policy discards. At the batch
+      // transport seam, accepted instead means the envelope was successfully consumed; disposition
+      // tells the Forwarder whether it was retained or deliberately discarded before L1.
+      items.push({ index, ...result, accepted, disposition });
     }
     const submittedEvents = Array.isArray(body.events) ? body.events.length : 0;
     return {
       accepted: acceptedEvents > 0,
       acceptedEvents,
+      retainedEvents: acceptedEvents - discardedEvents,
+      discardedEvents,
       rejectedEvents: submittedEvents - acceptedEvents,
       items,
     };
@@ -5119,8 +5135,19 @@ export class SecurityMonitoringController {
     // Enrich from the same registry consumed by forwarders. Filtering is node-local; direct API
     // producers remain fail-open and are never dropped solely because metadata is incomplete.
     const meta = this.agentMetadata.applyReview(this.kube.enrich(deriveMeta(line, metaGiven)));
-    const rec = await this.judge.accept(line, meta);
-    if (!rec) {
+    const outcome = await this.judge.acceptWithDisposition(line, meta);
+    if (outcome.disposition === 'discarded') {
+      this.sources.recordAccepted(sourceResolution, 'event', { collectorId, workspacePath: meta.workspacePath });
+      return {
+        accepted: false,
+        disposition: 'discarded',
+        retained: false,
+        sourceId: sourceResolution.source?.sourceId,
+        reasonCode: outcome.reasonCode,
+        reason: outcome.reasonCode,
+      };
+    }
+    if (outcome.disposition === 'rejected') {
       this.recordRejectedIngest(sourceResolution, 'unparseable event', {
         sourceId: requestSourceId,
         sourceName,
@@ -5131,12 +5158,20 @@ export class SecurityMonitoringController {
         endpoint: 'ingest',
         rejectedEvents: 1,
       });
-      return { accepted: false, sourceId: sourceResolution.source?.sourceId, reason: 'unparseable event' };
+      return {
+        accepted: false,
+        disposition: 'rejected',
+        retained: false,
+        sourceId: sourceResolution.source?.sourceId,
+        reasonCode: outcome.reasonCode,
+        reason: 'unparseable event',
+      };
     }
+    const rec = outcome.event;
     await this.enqueueCanonicalShadow(rec, line);
     await this.observeSupplyChainInstall(rec, line);
     this.sources.recordAccepted(sourceResolution, 'event', { collectorId, workspacePath: rec.workspacePath });
     this.agg.invalidateWindowCache();
-    return { accepted: true, sourceId: sourceResolution.source?.sourceId, eventId: rec.eventId, traceId: rec.traceId, spanId: rec.spanId, runId: rec.runId, verdict: rec.verdict, tier: rec.tier, severity: rec.severity, reason: rec.reason, riskCategory: rec.riskCategory, decisionStatus: rec.decisionStatus, evaluationId: rec.evaluationId };
+    return { accepted: true, disposition: 'retained', retained: true, sourceId: sourceResolution.source?.sourceId, eventId: rec.eventId, traceId: rec.traceId, spanId: rec.spanId, runId: rec.runId, verdict: rec.verdict, tier: rec.tier, severity: rec.severity, reason: rec.reason, riskCategory: rec.riskCategory, decisionStatus: rec.decisionStatus, evaluationId: rec.evaluationId };
   }
 }

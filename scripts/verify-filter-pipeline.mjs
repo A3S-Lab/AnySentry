@@ -525,6 +525,34 @@ assert.equal(shadow.heartbeat.filterMetrics.wouldFilterNoise, 1);
 assert.equal(shadow.heartbeat.filterMetrics.filteredNonAgent, 0);
 assert.equal(shadow.heartbeat.filterMetrics.filteredNoise, 0);
 
+const policyDiscardLines = Array.from({ length: 3 }, (_, index) => event(
+  'nonagent-container',
+  'ToolExec',
+  { pid: 1_800 + index, argv: ['/usr/bin/true', `policy-discard-${index}`] },
+));
+const policyDiscardAck = await runConfig('policy-discard-ack', {
+  FORWARD_FILTER_MODE: 'shadow',
+  FORWARD_BATCH_SIZE: '3',
+  FORWARD_MAX_INFLIGHT: '1',
+}, policyDiscardLines, {
+  batchReply: (events) => ({
+    statusCode: 200,
+    body: wrapped({
+      accepted: true,
+      acceptedEvents: events.length,
+      retainedEvents: 0,
+      discardedEvents: events.length,
+      rejectedEvents: 0,
+      items: events.map((_, index) => ({ index, accepted: true, disposition: 'discarded', reasonCode: 'non_agent_discarded' })),
+    }),
+  }),
+});
+assert.equal(policyDiscardAck.batchRequests.length, 1);
+assert.equal(policyDiscardAck.heartbeat.filterMetrics.wouldFilterNonAgent, policyDiscardLines.length);
+assert.equal(policyDiscardAck.heartbeat.outputDropped, 0, 'a deliberate policy discard is not a transport drop');
+assert.equal(policyDiscardAck.heartbeat.errorCount, 0, 'a deliberate policy discard does not degrade collector health');
+assert.equal(policyDiscardAck.heartbeat.status, 'ok');
+
 const oversizedIdentity = await runConfig('oversized-identity-snapshot', {
   FORWARD_FILTER_MODE: 'shadow',
   FORWARD_IDENTITY_SNAPSHOT_MAX_BYTES: String(64 * 1024),
@@ -573,10 +601,13 @@ const partialAck = await runConfig('partial-ack', {
     body: wrapped({
       accepted: true,
       acceptedEvents: 2,
+      retainedEvents: 1,
+      discardedEvents: 1,
       rejectedEvents: 1,
       items: events.map((_, index) => ({
         index,
         accepted: index !== 1,
+        disposition: index === 0 ? 'retained' : index === 2 ? 'discarded' : 'rejected',
         ...(index === 1 ? { reason: 'fixture rejection' } : {}),
       })),
     }),
@@ -588,6 +619,24 @@ assert.equal(partialAck.heartbeat.outputDropped, 1, 'HTTP 200 partial rejection 
 assert.ok(partialAck.heartbeat.errorCount >= 1);
 assert.equal(partialAck.heartbeat.filterMetrics.queueDropped, 0);
 assert.equal(partialAck.heartbeat.status, 'degraded');
+
+const contradictoryDisposition = await runConfig('contradictory-disposition', {
+  FORWARD_FILTER_MODE: 'shadow',
+  FORWARD_BATCH_SIZE: '1',
+  FORWARD_MAX_INFLIGHT: '1',
+}, [event('unknown-container', 'ToolExec', { pid: 3_050, argv: ['/usr/bin/true', 'bad-disposition'] })], {
+  batchReply: () => ({
+    statusCode: 200,
+    body: wrapped({
+      accepted: true,
+      acceptedEvents: 1,
+      rejectedEvents: 0,
+      items: [{ index: 0, accepted: true, disposition: 'rejected' }],
+    }),
+  }),
+});
+assert.equal(contradictoryDisposition.heartbeat.outputDropped, 1, 'a contradictory ACK disposition fails closed');
+assert.ok(contradictoryDisposition.heartbeat.errorCount >= 1);
 
 const oversizedAck = await runConfig('oversized-ack', {
   FORWARD_FILTER_MODE: 'shadow',

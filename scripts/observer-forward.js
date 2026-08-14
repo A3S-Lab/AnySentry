@@ -479,6 +479,8 @@ function validateBatchAck(value, batchLength) {
     return { dropped: batchLength, errors: 1, reason: 'batch endpoint returned an inconsistent acknowledgement' };
   }
   let acceptedItems = 0;
+  let retainedItems = 0;
+  let discardedItems = 0;
   for (let index = 0; index < items.length; index++) {
     const item = items[index];
     if (
@@ -487,10 +489,24 @@ function validateBatchAck(value, batchLength) {
     ) {
       return { dropped: batchLength, errors: 1, reason: 'batch endpoint returned malformed item acknowledgements' };
     }
-    if (item.accepted) acceptedItems++;
+    if (item.accepted) {
+      acceptedItems++;
+      if (item.disposition === undefined || item.disposition === 'retained') retainedItems++;
+      else if (item.disposition === 'discarded') discardedItems++;
+      else return { dropped: batchLength, errors: 1, reason: 'batch endpoint returned an invalid accepted disposition' };
+    } else if (item.disposition !== undefined && item.disposition !== 'rejected') {
+      return { dropped: batchLength, errors: 1, reason: 'batch endpoint returned an invalid rejected disposition' };
+    }
   }
   if (acceptedItems !== acceptedEvents) {
     return { dropped: batchLength, errors: 1, reason: 'batch endpoint acknowledgement counts do not match its items' };
+  }
+  if (
+    (ack.retainedEvents !== undefined && (!Number.isSafeInteger(ack.retainedEvents) || ack.retainedEvents !== retainedItems))
+    || (ack.discardedEvents !== undefined && (!Number.isSafeInteger(ack.discardedEvents) || ack.discardedEvents !== discardedItems))
+    || (ack.retainedEvents !== undefined && ack.discardedEvents !== undefined && ack.retainedEvents + ack.discardedEvents !== acceptedEvents)
+  ) {
+    return { dropped: batchLength, errors: 1, reason: 'batch endpoint disposition counts do not match its items' };
   }
   return {
     dropped: rejectedEvents,

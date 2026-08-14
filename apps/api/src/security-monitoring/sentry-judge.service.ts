@@ -10,7 +10,7 @@ import { DecisionResultJob, FastJudgeJob } from './async-judgment.types';
 import { JudgmentQueueService } from './judgment-queue.service';
 import { RuntimeModelConfigService } from './runtime-model-config';
 import { resolveJudgmentRoute } from './identity-judgment-routing';
-import { CollectorHeartbeatRecord, CollectorHeartbeatRequest, EventCategory, EventMeta, IdentityAiReviewRecord, Incident, IncidentStatus, JudgedEvent, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
+import { CollectorHeartbeatRecord, CollectorHeartbeatRequest, EventCategory, EventMeta, IdentityAiReviewRecord, Incident, IncidentStatus, JudgedEvent, JudgmentRouteReason, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
 
 const SEVERITY_SCORE: Record<Severity, number> = { info: 8, low: 28, medium: 52, high: 76, critical: 95 };
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
@@ -203,6 +203,11 @@ type JudgedEventBase = Omit<
   JudgedEvent,
   'verdict' | 'tier' | 'severity' | 'reason' | 'actionKind' | 'actionTarget' | 'riskCategory' | 'riskName' | 'riskType' | 'riskScore'
 >;
+
+export type JudgeAcceptOutcome =
+  | { disposition: 'retained'; event: JudgedEvent }
+  | { disposition: 'discarded'; reasonCode: JudgmentRouteReason }
+  | { disposition: 'rejected'; reasonCode: 'unsupported_or_unparseable' };
 
 function producerReportedFinding(base: JudgedEventBase): {
   severity: Severity;
@@ -483,42 +488,61 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  async accept(line: string, meta: EventMeta, at = Date.now()): Promise<JudgedEvent | null> {
-    if (!this.queues.enabled) return this.judge(line, meta, at);
+  async acceptWithDisposition(line: string, meta: EventMeta, at = Date.now()): Promise<JudgeAcceptOutcome> {
     const base = this.eventBase(line, meta, at);
+    if (!SECURITY_JUDGED_KINDS.has(base.eventKind) && !OBSERVER_KINDS.has(base.eventKind) && base.source !== 'api') {
+      return { disposition: 'rejected', reasonCode: 'unsupported_or_unparseable' };
+    }
     const routing = resolveJudgmentRoute(base.attribution?.classification, this.policy, this.availableTiers());
-    if (routing.profile === 'discard') return null;
-    if (this.isInternalL3Invocation(line, base)) return this.recordInternalL3Activity(base);
+    if (routing.profile === 'discard') return { disposition: 'discarded', reasonCode: routing.reason };
+    if (!this.queues.enabled) {
+      const event = this.judge(
+        line,
+        meta.attribution || !base.attribution ? meta : { ...meta, attribution: base.attribution },
+        at,
+      );
+      return event
+        ? { disposition: 'retained', event }
+        : { disposition: 'rejected', reasonCode: 'unsupported_or_unparseable' };
+    }
+    if (this.isInternalL3Invocation(line, base)) {
+      return { disposition: 'retained', event: this.recordInternalL3Activity(base) };
+    }
     const producerFinding = producerReportedFinding(base);
     if (producerFinding) {
-      return this.recordProducerFinding(base, producerFinding, {
-        ...routing,
-        policyVersion: this.policyVersion(),
-        l1Verdict: 'escalate',
-        nextTierEligible: false,
-        stopReason: 'producer_finding',
-      });
-    }
-    if (!SECURITY_JUDGED_KINDS.has(base.eventKind)) {
-      if (!OBSERVER_KINDS.has(base.eventKind) && base.source !== 'api') return null;
-      return this.push({
-        ...base,
-        verdict: 'allow',
-        tier: 'Rules',
-        severity: 'info',
-        reason: 'observed',
-        riskCategory: 'benign',
-        riskName: '正常',
-        riskType: 'atomic',
-        riskScore: 0,
-        judgment: {
+      return {
+        disposition: 'retained',
+        event: this.recordProducerFinding(base, producerFinding, {
           ...routing,
           policyVersion: this.policyVersion(),
-          l1Verdict: 'allow',
+          l1Verdict: 'escalate',
           nextTierEligible: false,
-          stopReason: 'no_applicable_l1_rule',
-        },
-      });
+          stopReason: 'producer_finding',
+        }),
+      };
+    }
+    if (!SECURITY_JUDGED_KINDS.has(base.eventKind)) {
+      return {
+        disposition: 'retained',
+        event: this.push({
+          ...base,
+          verdict: 'allow',
+          tier: 'Rules',
+          severity: 'info',
+          reason: 'observed',
+          riskCategory: 'benign',
+          riskName: '正常',
+          riskType: 'atomic',
+          riskScore: 0,
+          judgment: {
+            ...routing,
+            policyVersion: this.policyVersion(),
+            l1Verdict: 'allow',
+            nextTierEligible: false,
+            stopReason: 'no_applicable_l1_rule',
+          },
+        }),
+      };
     }
 
     const policyVersion = this.policyVersion();
@@ -556,7 +580,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     };
     try {
       await this.queues.enqueueFast(job);
-      return pending;
+      return { disposition: 'retained', event: pending };
     } catch (error) {
       const failed: JudgedEvent = {
         ...pending,
@@ -568,6 +592,11 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       this.upsertMemory(failed, false);
       throw error;
     }
+  }
+
+  async accept(line: string, meta: EventMeta, at = Date.now()): Promise<JudgedEvent | null> {
+    const outcome = await this.acceptWithDisposition(line, meta, at);
+    return outcome.disposition === 'retained' ? outcome.event : null;
   }
 
 

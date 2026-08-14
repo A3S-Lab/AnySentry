@@ -216,6 +216,69 @@ async function verifyHotRingCapacityContract() {
   }
 }
 
+async function verifyJudgeDispositionContract() {
+  const [{ SentryJudgeService }, { DEFAULT_POLICY }] = await Promise.all([
+    import('../apps/api/dist/security-monitoring/sentry-judge.service.js'),
+    import('../apps/api/dist/security-monitoring/policy-config.js'),
+  ]);
+  for (const enabled of [false, true]) {
+    let enqueued = 0;
+    const judge = new SentryJudgeService(
+      { observeEvent: () => undefined, observeIncident: () => undefined },
+      { attribute: () => undefined },
+      { enabled, enqueueFast: async () => { enqueued += 1; } },
+      { get: () => undefined },
+    );
+    judge.applyPolicy(DEFAULT_POLICY);
+    const meta = {
+      agentId: `${runId}-judge-agent`,
+      workspacePath: `repo://${runId}/judge`,
+      sessionId: `${runId}-judge-session`,
+      userId: 'uid:1000',
+      eventKind: 'ToolExec',
+      eventCategory: 'tool',
+      source: 'observer',
+      attributes: {},
+      attribution: {
+        monitored: false,
+        classification: 'non_agent',
+        confidence: 1,
+        reason: 'not_agent',
+        source: 'none',
+        evidence: [`test:${runId}`],
+      },
+    };
+    const discarded = await judge.acceptWithDisposition('{}', meta);
+    assert(
+      `Judge ${enabled ? 'queued' : 'synchronous'} path distinguishes policy discard`,
+      discarded.disposition === 'discarded' && discarded.reasonCode === 'non_agent_discarded',
+      discarded,
+    );
+    const rejected = await judge.acceptWithDisposition('{}', {
+      ...meta,
+      eventKind: 'UnsupportedObserverEvent',
+      eventCategory: 'unknown',
+    });
+    assert(
+      `Judge ${enabled ? 'queued' : 'synchronous'} path distinguishes unsupported input`,
+      rejected.disposition === 'rejected' && rejected.reasonCode === 'unsupported_or_unparseable',
+      rejected,
+    );
+    if (enabled) {
+      judge.ch.insertNow = async () => undefined;
+      const retained = await judge.acceptWithDisposition('{}', {
+        ...meta,
+        attribution: { ...meta.attribution, classification: 'unknown', reason: 'not_evaluated', confidence: 0 },
+      });
+      assert(
+        'Judge queued path retains and enqueues a supported event',
+        retained.disposition === 'retained' && retained.event?.decisionStatus === 'pending' && enqueued === 1,
+        { retained, enqueued },
+      );
+    }
+  }
+}
+
 async function verifyRouteScopedBodyLimits() {
   const ordinaryStatus = await rawJsonStatus('/ingest', JSON.stringify({ padding: 'x'.repeat(120 * 1024) }));
   assert(
@@ -263,6 +326,93 @@ async function verifyRejectedObserverToken(sourceId) {
   assert('observer /ingest rejects invalid source token', rejected.accepted === false && rejected.reason === 'invalid source token' && rejected.sourceId === sourceId, rejected);
   const sources = await request('/sources/list', 'POST', { sourceId, limit: 5 });
   assert('observer invalid token increments Source rejectedEvents', sources.total === 1 && sources.items?.[0]?.rejectedEvents >= 1 && sources.items?.[0]?.lastResult === 'rejected', sources);
+}
+
+async function verifyObserverDiscardDisposition() {
+  const sourcePrefix = `${runId}-discard`;
+  const { source, token } = await createProtectedObserverSource('discard');
+  const collectorId = `${sourcePrefix}-collector`;
+  const marker = `${sourcePrefix}-policy-discard`;
+  const discardedEvent = (suffix) => ({
+    line: observerLine(
+      { agent: `${marker}-${suffix}`, session: marker, task: suffix },
+      { ToolExec: { pid: 48_000 + suffix.length, uid: 1000, cwd: `/workspace/${marker}`, argv: ['/usr/bin/true', marker, suffix] } },
+    ),
+    sourceEventId: `${marker}-${suffix}`,
+    collectorId,
+    nodeName: `${sourcePrefix}-node`,
+    attribution: {
+      monitored: false,
+      classification: 'non_agent',
+      agentScopeId: `${marker}-scope`,
+      confidence: 1,
+      reason: 'not_agent',
+      source: 'none',
+      evidence: [`test:${marker}`],
+    },
+  });
+
+  const single = await request('/ingest', 'POST', discardedEvent('single'), sourceHeaders(source.sourceId, token));
+  assert(
+    'single Observer policy discard preserves its compatibility boolean and explicit disposition',
+    single.accepted === false &&
+      single.disposition === 'discarded' &&
+      single.retained === false &&
+      single.reasonCode === 'non_agent_discarded' &&
+      !single.eventId,
+    single,
+  );
+
+  const mixed = await request('/ingest/batch', 'POST', {
+    events: [
+      discardedEvent('batch'),
+      {
+        line: `${marker}-not-json`,
+        sourceEventId: `${marker}-invalid`,
+        collectorId,
+        nodeName: `${sourcePrefix}-node`,
+      },
+    ],
+  }, sourceHeaders(source.sourceId, token));
+  assert(
+    'Observer batch ACK separates a deliberate discard from a hard rejection',
+    mixed.accepted === true &&
+      mixed.acceptedEvents === 1 &&
+      mixed.retainedEvents === 0 &&
+      mixed.discardedEvents === 1 &&
+      mixed.rejectedEvents === 1 &&
+      mixed.items?.[0]?.accepted === true &&
+      mixed.items?.[0]?.disposition === 'discarded' &&
+      mixed.items?.[0]?.reasonCode === 'non_agent_discarded' &&
+      mixed.items?.[1]?.accepted === false &&
+      mixed.items?.[1]?.disposition === 'rejected' &&
+      mixed.items?.[1]?.reasonCode === 'unsupported_or_unparseable',
+    mixed,
+  );
+
+  const allDiscarded = await request('/ingest/batch', 'POST', {
+    events: [discardedEvent('all-a'), discardedEvent('all-b')],
+  }, sourceHeaders(source.sourceId, token));
+  assert(
+    'an all-discarded Observer batch is transport-successful without retained events',
+    allDiscarded.accepted === true &&
+      allDiscarded.acceptedEvents === 2 &&
+      allDiscarded.retainedEvents === 0 &&
+      allDiscarded.discardedEvents === 2 &&
+      allDiscarded.rejectedEvents === 0 &&
+      allDiscarded.items?.every((item) => item.accepted === true && item.disposition === 'discarded'),
+    allDiscarded,
+  );
+
+  const events = await request('/events/list', 'POST', { timeType: 'last_30d', q: marker, includeUnknown: true, limit: 20 });
+  assert('policy-discarded Observer events never enter the event/L1 store', events.total === 0, events);
+  const sources = await request('/sources/list', 'POST', { sourceId: source.sourceId, limit: 5 });
+  const item = sources.items?.[0];
+  assert(
+    'policy discards count as consumed Source events while only malformed input counts as rejected',
+    sources.total === 1 && item?.acceptedEvents === 4 && item?.rejectedEvents === 1 && item?.lastResult === 'accepted',
+    sources,
+  );
 }
 
 async function verifyObserverToolEvent(sourceId, token) {
@@ -889,11 +1039,13 @@ async function main() {
   console.log(`AnySentry observer ingest verification against ${baseUrl}`);
   await verifyCollectorMetricFreshnessContract();
   await verifyHotRingCapacityContract();
+  await verifyJudgeDispositionContract();
   await verifyRouteScopedBodyLimits();
   await request('/stats');
   await verifyIdentitySnapshotContract();
   const { source, token } = await createProtectedObserverSource();
   await verifyRejectedObserverToken(source.sourceId);
+  await verifyObserverDiscardDisposition();
   await verifyObserverToolEvent(source.sourceId, token);
   await verifyIncompleteObserverEvidence(source.sourceId, token);
   await verifyObserverBatch(source.sourceId, token);
