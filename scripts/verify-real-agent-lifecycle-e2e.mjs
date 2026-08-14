@@ -35,7 +35,8 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
-const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const scriptPath = fileURLToPath(import.meta.url);
+const scriptDir = path.dirname(scriptPath);
 const repoRoot = path.resolve(scriptDir, '..');
 const DEFAULT_KEY_FILE = '/tmp/observer-study-deepseek-key';
 const DEFAULT_DOCKER_API = 'http://127.0.0.1:29653/security-center';
@@ -54,12 +55,28 @@ const DIAGNOSTIC_JSON_LINE_LIMIT = 4 * 1024;
 const DIAGNOSTIC_JSON_MAX_LINES = 24;
 const DIAGNOSTIC_FILE_HASH_LIMIT = 256 * 1024;
 const LOCAL_PROOF_FILE_LIMIT = 1024 * 1024;
+const HOST_AGENT_RUNNER_OPTION = '--internal-host-agent-runner';
+const HOST_AGENT_CHILD_SELF_TEST_OPTION = '--internal-host-agent-child-self-test';
+const HOST_AGENT_RUNNER_SCHEMA = 'anysentry.host_agent_runner.v1';
+const HOST_AGENT_RUNNER_SELF_TEST_SCHEMA = 'anysentry.host_agent_runner.self_test.v1';
+const HOST_AGENT_RUNNER_INPUT_LIMIT = 512 * 1024;
+const HOST_AGENT_STOP_TIMEOUT_MS = 15_000;
+const HOST_AGENT_START_TIMEOUT_MS = 15_000;
+const HOST_AGENT_UNIT_SETTLE_MS = 1_000;
 const POLL_MS = 500;
 const FILTER_CANARY_WAIT_SECONDS = 120;
 const FILTER_CANARY_MAX_RUNTIME_SECONDS = 180;
 const AGENT_MAX_RUNTIME_SECONDS = 20 * 60;
+const HOST_AGENT_RUNTIME_MAX_SECONDS = 4 * 60;
 const COLLECTOR_MAX_RUNTIME_SECONDS = 30 * 60;
 const CONTAINER_KILL_GRACE_SECONDS = 20;
+const HOST_AGENT_ENV_NAMES = new Set([
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'TERM', 'TZ',
+  'CODEX_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+  'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
+  'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS',
+]);
 const FORWARDER_MODULES = [
   'observer-supervisor.js',
   'observer-forward.js',
@@ -422,13 +439,22 @@ function run(command, args = [], options = {}) {
 
 function spawnCaptured(command, args, options = {}) {
   const startedAt = Date.now();
+  const hasInput = options.input !== undefined;
+  const input = hasInput
+    ? Buffer.isBuffer(options.input) ? options.input : Buffer.from(String(options.input), 'utf8')
+    : undefined;
+  let inputErased = false;
+  const eraseInput = () => {
+    if (!inputErased && options.eraseInput === true && input) input.fill(0);
+    inputErased = true;
+  };
   const child = spawn(command, args, {
     cwd: options.cwd,
     env: options.inheritEnv === false
       ? { ...(options.env || {}) }
       : options.env ? { ...process.env, ...options.env } : process.env,
     detached: options.detached === true,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: [hasInput ? 'pipe' : 'ignore', 'pipe', 'pipe'],
   });
   const record = {
     child,
@@ -444,13 +470,19 @@ function spawnCaptured(command, args, options = {}) {
   child.stderr.setEncoding('utf8');
   child.stdout.on('data', (chunk) => { record.stdout = appendBounded(record.stdout, chunk); });
   child.stderr.on('data', (chunk) => { record.stderr = appendBounded(record.stderr, chunk); });
+  if (hasInput) {
+    child.stdin.on('error', eraseInput);
+    child.stdin.end(input, eraseInput);
+  }
   record.done = new Promise((resolve, reject) => {
     child.once('error', (error) => {
+      eraseInput();
       record.finished = true;
       ledger.children.delete(record);
       reject(error);
     });
     child.once('close', (code, signal) => {
+      eraseInput();
       record.finished = true;
       ledger.children.delete(record);
       resolve({
@@ -465,8 +497,8 @@ function spawnCaptured(command, args, options = {}) {
   return record;
 }
 
-async function terminateProcess(record, signal = 'SIGTERM') {
-  if (!record || record.finished || !record.child.pid) return;
+async function reapCapturedProcess(record, signal = 'SIGTERM') {
+  if (record.finished || !record.child.pid) return;
   try {
     if (record.detached) process.kill(-record.child.pid, signal);
     record.child.kill(signal);
@@ -495,8 +527,176 @@ async function terminateProcess(record, signal = 'SIGTERM') {
   if (!killed) throw new Error('child process did not terminate: ' + record.command);
 }
 
+async function terminateProcess(record, signal = 'SIGTERM') {
+  if (!record) return;
+  if (record.systemdUnitName && ledger.systemdUnits.has(record.systemdUnitName)) {
+    await stopTrackedSystemdUnit(record.systemdUnitName, true);
+  }
+  await reapCapturedProcess(record, signal);
+}
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function plainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value) &&
+    Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function hostAgentEnvironmentNameAllowed(name) {
+  return HOST_AGENT_ENV_NAMES.has(name) || /^LC_[A-Za-z0-9_]+$/u.test(name);
+}
+
+function sameStringRecord(actual, expected) {
+  const actualNames = Object.keys(actual).sort();
+  const expectedNames = Object.keys(expected).sort();
+  return actualNames.length === expectedNames.length &&
+    actualNames.every((name, index) => name === expectedNames[index] && actual[name] === expected[name]);
+}
+
+function validateHostAgentRunnerPayload(value, expected = {}) {
+  if (!plainObject(value)) throw new Error('host Agent runner payload must be an object');
+  const allowed = new Set(['schema', 'agent', 'command', 'args', 'cwd', 'env']);
+  const unexpected = Object.keys(value).filter((key) => !allowed.has(key));
+  if (unexpected.length) throw new Error('host Agent runner payload contains unsupported fields');
+  if (typeof value.command !== 'string' || !path.isAbsolute(value.command) ||
+      path.normalize(value.command) !== value.command || value.command.length > 4_096 || value.command.includes('\0')) {
+    throw new Error('host Agent runner command is invalid');
+  }
+  if (!Array.isArray(value.args) || value.args.length > 256 || value.args.some((item) =>
+    typeof item !== 'string' || item.length > 128 * 1024 || item.includes('\0'))) {
+    throw new Error('host Agent runner arguments are invalid');
+  }
+  if (typeof value.cwd !== 'string' || !path.isAbsolute(value.cwd) || value.cwd.length > 4_096 || value.cwd.includes('\0')) {
+    throw new Error('host Agent runner working directory is invalid');
+  }
+  if (!plainObject(value.env) || Object.keys(value.env).length > 256) {
+    throw new Error('host Agent runner environment is invalid');
+  }
+  for (const [name, nested] of Object.entries(value.env)) {
+    const productionEnvironment = value.schema === HOST_AGENT_RUNNER_SCHEMA;
+    const selfTestEnvironment = value.schema === HOST_AGENT_RUNNER_SELF_TEST_SCHEMA &&
+      (name === 'PATH' || name === 'ANYSENTRY_HOST_RUNNER_SELF_TEST');
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name) ||
+        /^(?:LD_|NODE_OPTIONS$|BASH_ENV$)/u.test(name) ||
+        /(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|SSH_AUTH_SOCK)/iu.test(name) ||
+        !(productionEnvironment ? hostAgentEnvironmentNameAllowed(name) : selfTestEnvironment) ||
+        typeof nested !== 'string' || nested.length > 128 * 1024 || nested.includes('\0')) {
+      throw new Error('host Agent runner environment contains an invalid entry');
+    }
+  }
+  const productionCommands = new Map([
+    ['host-codex', 'codex'],
+    ['host-kimi', 'kimi'],
+  ]);
+  if (value.schema === HOST_AGENT_RUNNER_SCHEMA) {
+    if (!productionCommands.has(value.agent) || productionCommands.get(value.agent) !== path.basename(value.command)) {
+      throw new Error('host Agent runner production command is not allowlisted');
+    }
+  } else if (value.schema === HOST_AGENT_RUNNER_SELF_TEST_SCHEMA) {
+    const validSelfTest = value.agent === 'self-test' &&
+      value.command === process.execPath &&
+      value.args.length === 3 &&
+      value.args[0] === scriptPath &&
+      value.args[1] === HOST_AGENT_CHILD_SELF_TEST_OPTION &&
+      /^[a-f0-9]{32}$/u.test(value.args[2]);
+    if (!validSelfTest) throw new Error('host Agent runner self-test command is invalid');
+  } else {
+    throw new Error('host Agent runner schema is unsupported');
+  }
+  if (expected.agent && value.agent !== expected.agent) {
+    throw new Error('host Agent runner agent differs from the launch contract');
+  }
+  if (expected.command && value.command !== expected.command) {
+    throw new Error('host Agent runner command differs from the preflight-pinned executable');
+  }
+  if (expected.env && !sameStringRecord(value.env, expected.env)) {
+    throw new Error('host Agent runner environment differs from the filtered launch environment');
+  }
+  return {
+    schema: value.schema,
+    agent: value.agent,
+    command: value.command,
+    args: [...value.args],
+    cwd: value.cwd,
+    env: { ...value.env },
+  };
+}
+
+function encodeHostAgentRunnerPayload(value, expected = {}) {
+  const payload = validateHostAgentRunnerPayload(value, expected);
+  const encoded = Buffer.from(JSON.stringify(payload), 'utf8');
+  if (encoded.length > HOST_AGENT_RUNNER_INPUT_LIMIT) {
+    encoded.fill(0);
+    throw new Error('host Agent runner payload exceeds the input limit');
+  }
+  return encoded;
+}
+
+async function readHostAgentRunnerPayload() {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of process.stdin) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > HOST_AGENT_RUNNER_INPUT_LIMIT) {
+      for (const item of chunks) item.fill(0);
+      buffer.fill(0);
+      throw new Error('host Agent runner input exceeds the limit');
+    }
+    chunks.push(buffer);
+  }
+  const encoded = Buffer.concat(chunks, size);
+  for (const item of chunks) item.fill(0);
+  try {
+    return validateHostAgentRunnerPayload(JSON.parse(encoded.toString('utf8')));
+  } finally {
+    encoded.fill(0);
+  }
+}
+
+async function runHostAgentRunner() {
+  const payload = await readHostAgentRunnerPayload();
+  const child = spawn(payload.command, payload.args, {
+    cwd: payload.cwd,
+    env: payload.env,
+    stdio: 'inherit',
+    shell: false,
+  });
+  const signalHandlers = new Map();
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    const handler = () => {
+      try { child.kill(signal); } catch {}
+    };
+    signalHandlers.set(signal, handler);
+    process.on(signal, handler);
+  }
+  try {
+    const result = await new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (code, signal) => resolve({ code, signal }));
+    });
+    process.exitCode = Number.isInteger(result.code)
+      ? result.code
+      : result.signal ? 128 + (os.constants.signals[result.signal] || 1) : 1;
+  } finally {
+    for (const [signal, handler] of signalHandlers) process.off(signal, handler);
+  }
+}
+
+async function runHostAgentChildSelfTest() {
+  assert.match(process.argv[3] || '', /^[a-f0-9]{32}$/u, 'host Agent child self-test nonce is invalid');
+  console.log(JSON.stringify({ hostAgentChildSelfTest: true, pid: process.pid }));
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, 60_000);
+    const stop = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    process.once('SIGINT', stop);
+    process.once('SIGTERM', stop);
+  });
 }
 
 async function eventually(label, check, timeoutMs = 90_000, intervalMs = POLL_MS) {
@@ -577,7 +777,7 @@ async function apiCapability(baseUrl, queryShape = false) {
         const runtime = await requestJson(baseUrl, 'runtime/instances', { limit: 1, includeShadow: true });
         result.runtime = Array.isArray(runtime?.items);
         if (!result.runtime) result.errors.push('runtime/instances returned an unexpected shape');
-      } catch (error) {
+      } catch {
         result.errors.push('runtime/instances: ' + redact(error.message));
       }
     } else {
@@ -663,6 +863,7 @@ const ledger = {
   dockerContainers: new Map(),
   k8sPods: new Map(),
   k8sSecrets: new Map(),
+  systemdUnits: new Map(),
   children: new Set(),
   mutations: new Set(),
   tempRoot: '',
@@ -691,6 +892,14 @@ function trackMutation(operation) {
 
 function ownershipNonce() {
   return randomBytes(16).toString('hex');
+}
+
+function hostAgentUnitName(options, phase, agent) {
+  return k8sName(options, 'host-agent', phase, agent) + '.service';
+}
+
+function hostAgentUnitDescription(runId, nonce) {
+  return 'AnySentry-E2E:' + runId + ':' + nonce;
 }
 
 function rememberK8s(map, namespace, name, ownership) {
@@ -942,6 +1151,295 @@ async function k8sResourceOwned(kind, namespace, name, runId, ownership) {
   return state.exists && state.owned;
 }
 
+function parseSystemdShow(value) {
+  return Object.fromEntries(String(value).split(/\r?\n/u).filter(Boolean).map((line) => {
+    const separator = line.indexOf('=');
+    return separator < 0 ? [line, ''] : [line.slice(0, separator), line.slice(separator + 1)];
+  }));
+}
+
+async function systemdUnitState(name, ownership) {
+  if (!/^[a-z0-9][a-z0-9.-]{0,200}\.service$/u.test(name)) {
+    throw new Error('refused to inspect an unsafe systemd unit name: ' + name);
+  }
+  const result = await run('systemctl', [
+    '--user', 'show', name, '--no-pager',
+    '--property=Id', '--property=LoadState', '--property=ActiveState', '--property=SubState',
+    '--property=InvocationID', '--property=Description', '--property=ExecMainPID', '--property=Result',
+    '--property=ControlGroup',
+  ], { allowFailure: true, timeoutMs: 10_000 });
+  if (result.code !== 0) {
+    throw new Error('systemctl show failed for ' + name + ': ' + redact(result.stderr));
+  }
+  const fields = parseSystemdShow(result.stdout);
+  const exists = fields.LoadState !== 'not-found';
+  const invocationId = fields.InvocationID || undefined;
+  const expectedDescription = ownership?.description;
+  const sameDescription = Boolean(expectedDescription) && fields.Description === expectedDescription;
+  const sameInvocation = !ownership?.invocationId || invocationId === ownership.invocationId;
+  return {
+    exists,
+    id: fields.Id,
+    loadState: fields.LoadState,
+    activeState: fields.ActiveState,
+    subState: fields.SubState,
+    invocationId,
+    description: fields.Description,
+    execMainPid: positiveInteger(fields.ExecMainPID),
+    controlGroup: normalizeSystemdControlGroup(fields.ControlGroup),
+    result: fields.Result,
+    owned: exists && fields.Id === name && sameDescription && sameInvocation,
+  };
+}
+
+function normalizeSystemdControlGroup(value) {
+  if (!value) return undefined;
+  const normalized = path.posix.normalize(String(value));
+  if (normalized !== value || !normalized.startsWith('/user.slice/') ||
+      normalized.split('/').includes('..') || /[\0\r\n]/u.test(normalized) || normalized.length > 4_096) {
+    throw new Error('systemd returned an unsafe user control group');
+  }
+  return normalized;
+}
+
+async function systemdControlGroupExists(controlGroup) {
+  if (!controlGroup) return false;
+  const normalized = normalizeSystemdControlGroup(controlGroup);
+  try {
+    await fs.lstat(path.join('/sys/fs/cgroup', normalized));
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function positiveInteger(value) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+async function processAncestry(startPid, maxDepth = 64) {
+  const chain = [];
+  const visited = new Set();
+  let pid = positiveInteger(startPid);
+  for (let depth = 0; pid && depth < maxDepth && !visited.has(pid); depth += 1) {
+    visited.add(pid);
+    let stat;
+    try {
+      stat = await fs.readFile('/proc/' + pid + '/stat', 'utf8');
+    } catch {
+      break;
+    }
+    const close = stat.lastIndexOf(')');
+    if (close < 0) break;
+    const open = stat.indexOf('(');
+    const fields = stat.slice(close + 2).trim().split(/\s+/u);
+    const ppid = positiveInteger(fields[1]);
+    const startTime = fields[19] || '';
+    chain.push({
+      pid,
+      ppid: ppid || 0,
+      startTime,
+      comm: open >= 0 ? stat.slice(open + 1, close) : '',
+    });
+    if (!ppid || pid === 1) break;
+    pid = ppid;
+  }
+  return chain;
+}
+
+function processIdentityKey(record) {
+  return String(record?.pid || '') + ':' + String(record?.startTime || '');
+}
+
+async function processUnifiedControlGroup(pid) {
+  const value = await fs.readFile('/proc/' + pid + '/cgroup', 'utf8');
+  for (const line of value.split(/\r?\n/u)) {
+    const first = line.indexOf(':');
+    const second = line.indexOf(':', first + 1);
+    if (first < 0 || second < 0) continue;
+    if (line.slice(0, first) === '0' && line.slice(first + 1, second) === '') {
+      return normalizeSystemdControlGroup(line.slice(second + 1));
+    }
+  }
+  return undefined;
+}
+
+async function processArguments(pid) {
+  const value = await fs.readFile('/proc/' + pid + '/cmdline');
+  return value.toString('utf8').split('\0').filter(Boolean);
+}
+
+function controlGroupContains(expected, observed) {
+  return Boolean(expected && observed) && (observed === expected || observed.startsWith(expected + '/'));
+}
+
+async function assertHostServiceDetached(execMainPid, controlGroup) {
+  const [controller, service] = await Promise.all([
+    processAncestry(process.pid),
+    processAncestry(execMainPid),
+  ]);
+  assert.ok(service.length > 1, 'host Agent service ancestry could not be read');
+  const managerIndex = service.findIndex((record, index) => index > 0 && record.comm === 'systemd');
+  assert.ok(managerIndex > 0, 'host Agent service has no user-manager boundary');
+  const controllerKeys = new Set(controller
+    .filter((record) => record.pid === process.pid || /^codex(?:$|-)/iu.test(record.comm))
+    .map(processIdentityKey));
+  const shared = service.slice(0, managerIndex)
+    .filter((record) => controllerKeys.has(processIdentityKey(record)));
+  assert.deepEqual(
+    shared,
+    [],
+    'host Agent service below the user manager contains the controller or its Codex ancestor',
+  );
+  const [controllerControlGroup, serviceControlGroup] = await Promise.all([
+    processUnifiedControlGroup(process.pid),
+    processUnifiedControlGroup(execMainPid),
+  ]);
+  assert.equal(
+    controlGroupContains(controlGroup, serviceControlGroup),
+    true,
+    'host Agent service main process is outside its transient unit control group',
+  );
+  assert.equal(
+    controlGroupContains(controlGroup, controllerControlGroup),
+    false,
+    'E2E controller unexpectedly belongs to the host Agent transient unit control group',
+  );
+  return {
+    execMainPid,
+    parentPid: service[0]?.ppid,
+    userManagerPid: service[managerIndex]?.pid,
+    controllerAncestryDepth: controller.length,
+    serviceAncestryDepth: service.length,
+    forbiddenSharedAncestorCount: shared.length,
+    controlGroup,
+  };
+}
+
+function lockSystemdUnitOwnership(name, ownership, state, options = {}) {
+  if (!state.exists || !state.owned) {
+    throw new Error('refused to control systemd unit after ownership changed: ' + name);
+  }
+  if (options.requireInvocation !== false && !/^[a-f0-9]{32}$/u.test(state.invocationId || '')) {
+    throw new Error('systemd unit has no valid InvocationID: ' + name);
+  }
+  if (ownership.invocationId && ownership.invocationId !== state.invocationId) {
+    throw new Error('systemd unit InvocationID changed: ' + name);
+  }
+  if (/^[a-f0-9]{32}$/u.test(state.invocationId || '')) ownership.invocationId ||= state.invocationId;
+  if (state.controlGroup) {
+    if (ownership.controlGroup && ownership.controlGroup !== state.controlGroup) {
+      throw new Error('systemd unit control group changed: ' + name);
+    }
+    ownership.controlGroup ||= state.controlGroup;
+  }
+  ownership.observed = true;
+  return state;
+}
+
+async function waitForSystemdUnitGone(name, ownership, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  let state;
+  while (Date.now() < deadline) {
+    state = await systemdUnitState(name, ownership);
+    if (state.exists && !state.owned) {
+      throw new Error('systemd unit ownership changed while waiting for cleanup: ' + name);
+    }
+    const cgroupExists = await systemdControlGroupExists(ownership.controlGroup);
+    if (!state.exists && !cgroupExists) return true;
+    await delay(100);
+  }
+  state ||= await systemdUnitState(name, ownership);
+  return !state.exists && !(await systemdControlGroupExists(ownership.controlGroup));
+}
+
+async function stopTrackedSystemdUnit(name, allowAlreadyAbsent = false) {
+  const ownership = ledger.systemdUnits.get(name);
+  if (!ownership?.nonce || !ownership?.description) {
+    throw new Error('missing tracked systemd unit ownership: ' + name);
+  }
+  if (ownership.stopPromise) return ownership.stopPromise;
+  ownership.stopPromise = (async () => {
+    let state = await systemdUnitState(name, ownership);
+    const startDeadline = Date.now() + HOST_AGENT_START_TIMEOUT_MS;
+    while (!state.exists && ownership.launcherRecord && !ownership.launcherRecord.finished &&
+           !ownership.observed && Date.now() < startDeadline) {
+      await delay(50);
+      state = await systemdUnitState(name, ownership);
+    }
+    if (state.exists) {
+      lockSystemdUnitOwnership(name, ownership, state, { requireInvocation: false });
+      await run(
+        'systemctl', ['--user', 'stop', name],
+        { allowFailure: true, timeoutMs: HOST_AGENT_STOP_TIMEOUT_MS },
+      );
+      state = await systemdUnitState(name, ownership);
+      if (state.exists && !state.owned) {
+        throw new Error('refused to kill systemd unit after ownership changed: ' + name);
+      }
+      const cgroupStillExists = await systemdControlGroupExists(ownership.controlGroup);
+      if (state.exists && (['active', 'activating', 'deactivating', 'reloading'].includes(state.activeState) ||
+          cgroupStillExists)) {
+        const killed = await run(
+          'systemctl', ['--user', 'kill', '--kill-whom=all', '--signal=SIGKILL', name],
+          { allowFailure: true, timeoutMs: 10_000 },
+        );
+        if (killed.code !== 0) {
+          state = await systemdUnitState(name, ownership);
+          if (state.exists && !state.owned) {
+            throw new Error('refused to retry systemd kill after ownership changed: ' + name);
+          }
+          if (state.exists && state.activeState !== 'inactive') {
+            throw new Error('systemctl kill failed for active owned unit ' + name + ': ' + redact(killed.stderr));
+          }
+        }
+        await run('systemctl', ['--user', 'stop', name], { allowFailure: true, timeoutMs: 10_000 });
+      }
+      if (!(await waitForSystemdUnitGone(name, ownership, HOST_AGENT_STOP_TIMEOUT_MS))) {
+        state = await systemdUnitState(name, ownership);
+        if (state.exists && state.owned && state.activeState === 'inactive') {
+          await run('systemctl', ['--user', 'reset-failed', name], { allowFailure: true, timeoutMs: 10_000 });
+        }
+      }
+    } else {
+      if (!allowAlreadyAbsent && ownership.observed) {
+        throw new Error('run-owned systemd unit disappeared before cleanup: ' + name);
+      }
+      // Fence the exact name before reaping a still-starting systemd-run client. A late unit is
+      // accepted only if its nonce-bearing Description proves that it belongs to this ledger.
+      await run('systemctl', ['--user', 'stop', name], { allowFailure: true, timeoutMs: 10_000 });
+    }
+    if (!(await waitForSystemdUnitGone(name, ownership, HOST_AGENT_STOP_TIMEOUT_MS))) {
+      throw new Error('run-owned systemd unit or control group remained after cleanup: ' + name);
+    }
+    if (ownership.launcherRecord && !ownership.launcherRecord.finished) {
+      await reapCapturedProcess(ownership.launcherRecord);
+      const settleDeadline = Date.now() + HOST_AGENT_UNIT_SETTLE_MS;
+      while (Date.now() < settleDeadline) {
+        state = await systemdUnitState(name, ownership);
+        if (state.exists) break;
+        await delay(50);
+      }
+      if (state?.exists) {
+        lockSystemdUnitOwnership(name, ownership, state, { requireInvocation: false });
+        await run('systemctl', ['--user', 'stop', name], { allowFailure: true, timeoutMs: HOST_AGENT_STOP_TIMEOUT_MS });
+        if (!(await waitForSystemdUnitGone(name, ownership, HOST_AGENT_STOP_TIMEOUT_MS))) {
+          throw new Error('late run-owned systemd unit remained after launcher cleanup: ' + name);
+        }
+      }
+    }
+    ledger.systemdUnits.delete(name);
+  })();
+  try {
+    await ownership.stopPromise;
+  } catch (error) {
+    ownership.stopPromise = undefined;
+    throw error;
+  }
+}
+
 async function removeTrackedDockerContainer(name, allowAlreadyAbsent = false) {
   const ownership = ledger.dockerContainers.get(name);
   if (!ownership?.nonce) throw new Error('missing tracked Docker ownership: ' + name);
@@ -1050,6 +1548,13 @@ async function cleanup() {
   ledger.cleanupPromise = (async () => {
     const errors = [];
     await Promise.allSettled([...ledger.mutations]);
+    for (const name of [...ledger.systemdUnits.keys()]) {
+      try {
+        await stopTrackedSystemdUnit(name, true);
+      } catch (error) {
+        errors.push('systemd unit ' + name + ': ' + redact(error.message));
+      }
+    }
     for (const record of [...ledger.children]) {
       try { await terminateProcess(record); } catch (error) { errors.push(redact(error.message)); }
     }
@@ -1172,9 +1677,11 @@ async function resourceAbsenceChecks(options, checks) {
       names.push(k8sName(options, 'workload', 'k8s', phase));
       names.push(k8sName(options, 'filter-canary', 'k8s', phase));
       names.push(k8sName(options, 'filter-canary', 'value', phase));
+      names.push(k8sName(options, 'pi-marker', phase));
     }
     for (const name of names) {
-      for (const kind of name.endsWith('-deepseek') || name.includes('-filter-canary-value-') ? ['secret'] : ['pod']) {
+      for (const kind of name.endsWith('-deepseek') || name.includes('-filter-canary-value-') ||
+          name.includes('-pi-marker-') ? ['secret'] : ['pod']) {
         const result = await run(
           'kubectl',
           ['-n', options.k8sWorkloadNamespace, 'get', kind, name],
@@ -1187,6 +1694,27 @@ async function resourceAbsenceChecks(options, checks) {
           result.code === 0 ? 'a pre-existing exact-name resource would never be adopted' : 'exact name is unused',
         );
       }
+    }
+  }
+}
+
+async function systemdResourceAbsenceChecks(options, checks) {
+  for (const phase of options.phases) {
+    for (const agent of options.agents.filter((name) => name.startsWith('host-'))) {
+      const name = hostAgentUnitName(options, phase, agent);
+      let state;
+      try {
+        state = await systemdUnitState(name);
+      } catch (error) {
+        check(checks, 'resource absent: systemd/' + name, 'block', 'could not inspect exact unit name');
+        continue;
+      }
+      check(
+        checks,
+        'resource absent: systemd/' + name,
+        state.exists ? 'block' : 'pass',
+        state.exists ? 'a pre-existing exact-name unit would never be adopted' : 'exact name is unused',
+      );
     }
   }
 }
@@ -1205,8 +1733,9 @@ async function preflight(options, apiState = {}) {
   const hostApiReady = Boolean(
     apiState.host?.health && apiState.host?.runtime && apiState.host?.lease && apiState.host?.snapshot,
   );
+  const hostWillRun = hostSelected && (hostApiReady || options.requireHost);
   const needsDocker = options.agents.includes('docker-pi') ||
-    (hostSelected && (hostApiReady || options.requireHost));
+    hostWillRun;
 
   const nodeMajor = Number(process.versions.node.split('.')[0]);
   check(checks, 'Node.js', nodeMajor >= 22 ? 'pass' : 'block', process.version + ' (requires >=22)');
@@ -1226,17 +1755,49 @@ async function preflight(options, apiState = {}) {
   requiredCommands.add('pnpm');
   if (needsDocker) requiredCommands.add('docker');
   if (needsK8s) requiredCommands.add('kubectl');
+  if (hostWillRun) {
+    requiredCommands.add('systemd-run');
+    requiredCommands.add('systemctl');
+  }
   const commandPresence = new Map();
   for (const command of requiredCommands) {
     const available = await commandAvailable(command);
     commandPresence.set(command, available);
     check(checks, 'binary: ' + command, available ? 'pass' : 'block', available ? 'present' : 'not found');
   }
-  if (options.agents.includes('host-codex') && (hostApiReady || options.requireHost)) {
-    const available = await commandAvailable('codex');
-    check(checks, 'binary: codex', available ? 'pass' : 'block', available ? 'present' : 'not found');
-    if (available) {
-      const login = await run('codex', ['login', 'status'], { allowFailure: true, timeoutMs: 15_000 });
+  if (hostWillRun && commandPresence.get('systemd-run') && commandPresence.get('systemctl')) {
+    const manager = await run('systemctl', ['--user', 'is-system-running'], {
+      allowFailure: true,
+      timeoutMs: 10_000,
+    });
+    check(
+      checks,
+      'systemd user manager',
+      manager.code === 0 && manager.stdout.trim() === 'running' ? 'pass' : 'block',
+      manager.code === 0 ? 'running' : 'unavailable or not running',
+    );
+    const help = await run('systemd-run', ['--help'], { allowFailure: true, timeoutMs: 10_000 });
+    const requiredFlags = [
+      '--wait', '--pipe', '--collect', '--expand-environment', '--service-type', '--property', '--no-ask-password',
+    ];
+    const missingFlags = requiredFlags.filter((flag) => !help.stdout.includes(flag));
+    check(
+      checks,
+      'systemd transient-service features',
+      help.code === 0 && missingFlags.length === 0 ? 'pass' : 'block',
+      missingFlags.length ? 'missing required options: ' + missingFlags.join(', ') : 'required options are present',
+    );
+  }
+  apiState.hostAgentCommands ||= {};
+  if (options.agents.includes('host-codex') && hostWillRun) {
+    let executable;
+    try {
+      executable = await resolveHostAgentExecutable('host-codex', hostAgentEnvironment());
+      apiState.hostAgentCommands['host-codex'] = executable;
+    } catch {}
+    check(checks, 'binary: codex', executable ? 'pass' : 'block', executable ? 'resolved through filtered PATH' : 'not found');
+    if (executable) {
+      const login = await run(executable.path, ['login', 'status'], { allowFailure: true, timeoutMs: 15_000 });
       check(
         checks,
         'Codex authentication',
@@ -1279,9 +1840,13 @@ async function preflight(options, apiState = {}) {
       }
     }
   }
-  if (options.agents.includes('host-kimi') && (hostApiReady || options.requireHost)) {
-    const available = await commandAvailable('kimi');
-    check(checks, 'binary: kimi', available ? 'pass' : 'block', available ? 'present' : 'not found');
+  if (options.agents.includes('host-kimi') && hostWillRun) {
+    let executable;
+    try {
+      executable = await resolveHostAgentExecutable('host-kimi', hostAgentEnvironment());
+      apiState.hostAgentCommands['host-kimi'] = executable;
+    } catch {}
+    check(checks, 'binary: kimi', executable ? 'pass' : 'block', executable ? 'resolved through filtered PATH' : 'not found');
     const configFile = path.join(os.homedir(), '.kimi', 'config.toml');
     try {
       const stat = await fs.stat(configFile);
@@ -1472,6 +2037,9 @@ async function preflight(options, apiState = {}) {
     const dockerOnly = { ...options, agents: options.agents.filter((agent) => agent !== 'k8s-pi') };
     await resourceAbsenceChecks(dockerOnly, checks);
   }
+  if (hostWillRun && commandPresence.get('systemctl')) {
+    await systemdResourceAbsenceChecks(options, checks);
+  }
   if (needsK8s && commandPresence.get('kubectl')) {
     const k8sOnly = { ...options, agents: ['k8s-pi'] };
     await resourceAbsenceChecks(k8sOnly, checks);
@@ -1490,6 +2058,9 @@ function plannedResources(options) {
     if (options.agents.some((agent) => agent.startsWith('host-'))) {
       resources.push({ plane: 'host', kind: 'Docker container', name: k8sName(options, 'collector', 'host', phase) });
       resources.push({ plane: 'host', kind: 'Docker container', name: k8sName(options, 'filter-canary', 'host', phase) });
+      for (const agent of options.agents.filter((name) => name.startsWith('host-'))) {
+        resources.push({ plane: 'host', kind: 'systemd user service', name: hostAgentUnitName(options, phase, agent) });
+      }
     }
     if (options.agents.includes('docker-pi')) {
       resources.push({ plane: 'docker', kind: 'Docker container', name: k8sName(options, 'collector', 'docker', phase) });
@@ -1501,6 +2072,7 @@ function plannedResources(options) {
       resources.push({ plane: 'kubernetes', kind: 'Pod', namespace: options.k8sWorkloadNamespace, name: k8sName(options, 'workload', 'k8s', phase) });
       resources.push({ plane: 'kubernetes', kind: 'Pod', namespace: options.k8sWorkloadNamespace, name: k8sName(options, 'filter-canary', 'k8s', phase) });
       resources.push({ plane: 'kubernetes', kind: 'Secret', namespace: options.k8sWorkloadNamespace, name: k8sName(options, 'filter-canary', 'value', phase) });
+      resources.push({ plane: 'kubernetes', kind: 'Secret', namespace: options.k8sWorkloadNamespace, name: k8sName(options, 'pi-marker', phase) });
     }
   }
   if (options.agents.includes('k8s-pi')) {
@@ -1551,6 +2123,7 @@ function executionPlan(options) {
       'local protocol tests reject old lease epochs and detect duplicate snapshots',
       'new Agent instance is distinct from the collector baseline',
       'running then exited/lost lifecycle is observed with stable ProcessKey identity',
+      'host runtime PID/start-time belongs to the exact nonce-fenced transient service cgroup',
       'real model run produces a tool-created marker',
       'marker event is attributed to the expected Agent instance',
       'a real unknown workload reaches L1 in shadow and is suppressed in enforce',
@@ -2652,18 +3225,44 @@ async function prepareHostWorkspace(options, phase, agent, markerValue) {
 }
 
 function hostAgentEnvironment() {
-  const exact = new Set([
-    'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'TERM', 'TZ',
-    'CODEX_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME',
-    'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
-    'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
-    'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS',
-  ]);
-  return Object.fromEntries(Object.entries(process.env).filter(([name, value]) =>
+  const environment = Object.fromEntries(Object.entries(process.env).filter(([name, value]) =>
     value !== undefined &&
-    (exact.has(name) || /^LC_/u.test(name)) &&
+    hostAgentEnvironmentNameAllowed(name) &&
+    !/^(?:LD_|NODE_OPTIONS$|BASH_ENV$)/u.test(name) &&
     !/(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|SSH_AUTH_SOCK)/iu.test(name),
   ));
+  assert.equal(
+    Object.keys(environment).every(hostAgentEnvironmentNameAllowed),
+    true,
+    'host Agent environment escaped its allowlist',
+  );
+  return environment;
+}
+
+function hostAgentExecutableName(agent) {
+  if (agent === 'host-codex') return 'codex';
+  if (agent === 'host-kimi') return 'kimi';
+  throw new Error('unsupported host Agent: ' + agent);
+}
+
+async function resolveHostAgentExecutable(agent, environment) {
+  const executable = hostAgentExecutableName(agent);
+  const searchPath = String(environment.PATH || '');
+  for (const directory of searchPath.split(path.delimiter)) {
+    if (!directory || !path.isAbsolute(directory)) continue;
+    const candidate = path.resolve(directory, executable);
+    if (path.basename(candidate) !== executable) continue;
+    try {
+      const stat = await fs.stat(candidate);
+      await fs.access(candidate, fsConstants.X_OK);
+      if (!stat.isFile()) continue;
+      return {
+        path: candidate,
+        identity: localPathIdentity(stat),
+      };
+    } catch {}
+  }
+  throw new Error('host Agent executable is not resolvable from the filtered absolute PATH: ' + executable);
 }
 
 function hostCodexArgs(options, workspace, prompt) {
@@ -2700,18 +3299,165 @@ function assertHostCodexLaunchAuthorization(options, args) {
   return actualMode;
 }
 
+function hostAgentSystemdRunArgs(unitName, description) {
+  return [
+    '--user',
+    '--no-ask-password',
+    '--unit=' + unitName,
+    '--description=' + description,
+    '--service-type=exec',
+    '--property=KillMode=control-group',
+    '--property=Restart=no',
+    '--property=TimeoutStopSec=5s',
+    '--property=RuntimeMaxSec=' + HOST_AGENT_RUNTIME_MAX_SECONDS + 's',
+    '--expand-environment=no',
+    '--collect',
+    '--wait',
+    '--pipe',
+    '--quiet',
+    process.execPath,
+    scriptPath,
+    HOST_AGENT_RUNNER_OPTION,
+  ];
+}
+
+function systemdClientEnvironment() {
+  const allowed = new Set(['PATH', 'LANG', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS']);
+  return Object.fromEntries(Object.entries(process.env).filter(([name, value]) =>
+    value !== undefined &&
+    (allowed.has(name) || /^LC_[A-Za-z0-9_]+$/u.test(name)) &&
+    !/^(?:LD_|NODE_OPTIONS$|BASH_ENV$)/u.test(name),
+  ));
+}
+
+function assertHostAgentPayloadOutsideSystemdArgv(systemdArgs, payload, proofValues = []) {
+  assert.deepEqual(
+    systemdArgs.slice(-3),
+    [process.execPath, scriptPath, HOST_AGENT_RUNNER_OPTION],
+    'systemd-run must invoke only the fixed internal host Agent runner',
+  );
+  const fixedValues = new Set([process.execPath, scriptPath, HOST_AGENT_RUNNER_OPTION]);
+  const hiddenValues = [
+    payload.command,
+    payload.cwd,
+    ...payload.args,
+    ...Object.values(payload.env),
+    ...proofValues,
+  ].filter((value) => value && !fixedValues.has(value));
+  for (const value of hiddenValues) {
+    assert.equal(
+      systemdArgs.includes(value),
+      false,
+      'host Agent payload value escaped into systemd-run argv',
+    );
+  }
+}
+
+async function launchHostAgentService(options, phase, agent, payload, launchOptions = {}) {
+  const unitName = launchOptions.unitName || hostAgentUnitName(options, phase, agent);
+  if (ledger.systemdUnits.has(unitName)) throw new Error('duplicate tracked systemd unit: ' + unitName);
+  const before = await systemdUnitState(unitName);
+  if (before.exists) throw new Error('refused to adopt pre-existing systemd unit: ' + unitName);
+  const ownership = {
+    nonce: ownershipNonce(),
+    description: '',
+    invocationId: undefined,
+    controlGroup: undefined,
+    observed: false,
+    launcherRecord: undefined,
+    stopPromise: undefined,
+  };
+  ownership.description = hostAgentUnitDescription(options.runId, ownership.nonce);
+  const expected = {
+    agent: payload.agent,
+    command: payload.command,
+    env: launchOptions.expectedEnvironment,
+  };
+  assert.ok(plainObject(expected.env), 'host Agent launch has no independently constructed environment contract');
+  let encoded;
+  let record;
+  // This is the ownership fence for the signal/startup window: ledger registration happens
+  // synchronously before systemd-run can request creation of the nonce-described unit.
+  ledger.systemdUnits.set(unitName, ownership);
+  try {
+    encoded = encodeHostAgentRunnerPayload(payload, expected);
+    const systemdArgs = hostAgentSystemdRunArgs(unitName, ownership.description);
+    assertHostAgentPayloadOutsideSystemdArgv(systemdArgs, payload, launchOptions.proofValues);
+    record = spawnCaptured('systemd-run', systemdArgs, {
+      input: encoded,
+      eraseInput: true,
+      env: systemdClientEnvironment(),
+      inheritEnv: false,
+    });
+    record.systemdUnitName = unitName;
+    ownership.launcherRecord = record;
+    const state = await eventually('owned transient systemd service ' + unitName, async () => {
+      if (record.finished) {
+        const result = await record.done;
+        throw new Error(
+          'systemd-run exited before the transient service became ready; exit=' +
+          (result.signal || result.code) + '; stderr hash=' + hashText(result.stderr),
+        );
+      }
+      const observed = await systemdUnitState(unitName, ownership);
+      if (!observed.exists) return undefined;
+      if (!observed.owned) throw new Error('systemd unit name was claimed outside this run: ' + unitName);
+      if (!observed.execMainPid || !observed.controlGroup ||
+          !/^[a-f0-9]{32}$/u.test(observed.invocationId || '') ||
+          !['active', 'activating'].includes(observed.activeState)) return undefined;
+      lockSystemdUnitOwnership(unitName, ownership, observed);
+      return observed;
+    }, HOST_AGENT_START_TIMEOUT_MS, 50);
+    const detached = await assertHostServiceDetached(state.execMainPid, state.controlGroup);
+    return {
+      record,
+      unitName,
+      ownership,
+      state,
+      detached,
+      systemdArgv: {
+        payloadTransport: 'stdin',
+        fixedArgumentCount: hostAgentSystemdRunArgs(unitName, ownership.description).length,
+      },
+    };
+  } catch (error) {
+    if (encoded) encoded.fill(0);
+    let cleanupError;
+    try {
+      if (ledger.systemdUnits.has(unitName)) await stopTrackedSystemdUnit(unitName, true);
+      else if (record && !record.finished) await reapCapturedProcess(record);
+    } catch (nested) {
+      cleanupError = nested;
+    }
+    if (cleanupError) {
+      error.message += '; transient service cleanup failed: ' + redact(cleanupError.message);
+    }
+    throw error;
+  }
+}
+
 async function launchHostAgent(options, phase, agent, markerValue) {
   const workspace = await prepareHostWorkspace(options, phase, agent, markerValue);
   const workspaceIdentity = localPathIdentity(await fs.lstat(workspace));
   const prompt = hostPrompt(workspace);
+  const environment = hostAgentEnvironment();
+  const pinnedExecutable = options.resolvedHostCommands?.[agent];
+  assert.ok(pinnedExecutable?.path && pinnedExecutable?.identity, agent + ' has no preflight-pinned executable');
+  const resolvedExecutable = await resolveHostAgentExecutable(agent, environment);
+  assert.equal(resolvedExecutable.path, pinnedExecutable.path, agent + ' executable path changed after preflight');
+  assert.equal(
+    sameLocalPathIdentity(resolvedExecutable.identity, pinnedExecutable.identity),
+    true,
+    agent + ' executable identity changed after preflight',
+  );
   let command;
   let args;
   if (agent === 'host-codex') {
-    command = 'codex';
+    command = resolvedExecutable.path;
     args = hostCodexArgs(options, workspace, prompt);
     assertHostCodexLaunchAuthorization(options, args);
   } else if (agent === 'host-kimi') {
-    command = 'kimi';
+    command = resolvedExecutable.path;
     args = [
       '--work-dir', workspace, '--print', '--no-thinking', '--max-steps-per-turn', '8',
       '--mcp-config', '{}', '--skills-dir', path.join(workspace, 'empty-skills'),
@@ -2721,14 +3467,19 @@ async function launchHostAgent(options, phase, agent, markerValue) {
     throw new Error('unsupported host Agent: ' + agent);
   }
   await fs.mkdir(path.join(workspace, 'empty-skills'), { mode: 0o700 });
-  const record = spawnCaptured(command, args, {
+  const service = await launchHostAgentService(options, phase, agent, {
+    schema: HOST_AGENT_RUNNER_SCHEMA,
+    agent,
+    command,
+    args,
     cwd: workspace,
-    detached: true,
-    env: hostAgentEnvironment(),
-    inheritEnv: false,
+    env: { ...environment },
+  }, {
+    expectedEnvironment: environment,
   });
   return {
-    record,
+    record: service.record,
+    systemd: service,
     workspace,
     workspaceIdentity,
     marker: markerValue,
@@ -2740,6 +3491,9 @@ async function launchHostAgent(options, phase, agent, markerValue) {
 }
 
 async function quiesceHostAgentForDiagnostic(runRecord) {
+  if (runRecord.systemd?.unitName && ledger.systemdUnits.has(runRecord.systemd.unitName)) {
+    await stopTrackedSystemdUnit(runRecord.systemd.unitName, true);
+  }
   if (!runRecord.record.finished) {
     try {
       await terminateProcess(runRecord.record);
@@ -2771,7 +3525,10 @@ async function finishHostAgent(runRecord) {
       }),
     ]);
   } catch (error) {
-    await terminateProcess(runRecord.record);
+    if (runRecord.systemd?.unitName && ledger.systemdUnits.has(runRecord.systemd.unitName)) {
+      await stopTrackedSystemdUnit(runRecord.systemd.unitName, true);
+    }
+    if (!runRecord.record.finished) await reapCapturedProcess(runRecord.record);
     if (runRecord.record.finished) {
       try { runRecord.result = await runRecord.record.done; } catch {}
     }
@@ -2780,6 +3537,9 @@ async function finishHostAgent(runRecord) {
     clearTimeout(timer);
   }
   runRecord.result = result;
+  if (runRecord.systemd?.unitName && ledger.systemdUnits.has(runRecord.systemd.unitName)) {
+    await stopTrackedSystemdUnit(runRecord.systemd.unitName, true);
+  }
   assert.equal(result.code, 0, runRecord.agent + ' exited unsuccessfully; stderr hash=' + hashText(result.stderr));
   const proof = await readLocalToolProof(runRecord.workspace, runRecord.marker, runRecord);
   return {
@@ -2790,6 +3550,13 @@ async function finishHostAgent(runRecord) {
       durationMs: result.durationMs,
       stdout: { bytes: Buffer.byteLength(result.stdout), sha256: hashText(result.stdout) },
       stderr: { bytes: Buffer.byteLength(result.stderr), sha256: hashText(result.stderr) },
+    },
+    launcher: {
+      unit: runRecord.systemd?.unitName,
+      invocationId: runRecord.systemd?.ownership?.invocationId,
+      controlGroup: runRecord.systemd?.ownership?.controlGroup,
+      detached: runRecord.systemd?.detached,
+      runtimePlacement: runRecord.runtimePlacement,
     },
   };
 }
@@ -3031,16 +3798,51 @@ function runtimeIdentityIsComplete(item) {
   );
 }
 
-async function waitForNewRunningInstance(apiBase, collector, baselineIds, scope) {
+async function waitForNewRunningInstance(apiBase, collector, baselineIds, scope, candidateMatches = async () => true) {
   return await eventually('new running ' + scope + ' instance on ' + collector, async () => {
     const runtime = await queryRuntime(apiBase, { collectorId: collector });
-    const candidate = runtime.items.find((item) =>
+    const candidates = runtime.items.filter((item) =>
       !baselineIds.has(item.agentInstanceId) &&
       String(item.agentScopeId || '').toLowerCase() === scope.toLowerCase() &&
       item.runtimeState === 'running' && runtimeIdentityIsComplete(item),
     );
-    return candidate || undefined;
+    for (const candidate of candidates) {
+      if (await candidateMatches(candidate)) return candidate;
+    }
+    return undefined;
   }, 90_000, 250);
+}
+
+async function matchHostRuntimeToSystemdService(candidate, runRecord) {
+  const service = runRecord.systemd;
+  const state = await systemdUnitState(service.unitName, service.ownership);
+  if (!state.exists) return undefined;
+  if (!state.owned) throw new Error('host Agent systemd ownership changed while matching runtime');
+  lockSystemdUnitOwnership(service.unitName, service.ownership, state);
+  if (!state.controlGroup || state.controlGroup !== service.ownership.controlGroup) return undefined;
+  const identity = (await processAncestry(candidate.rootPid, 1))[0];
+  if (!identity || identity.startTime !== String(candidate.rootStartTimeTicks)) return undefined;
+  if (candidate.rootPid === service.state.execMainPid) return undefined;
+  const allowedComms = runRecord.agent === 'host-codex'
+    ? new Set(['codex'])
+    : new Set(['Kimi Code', 'kimi', 'kimi-cli']);
+  if (!allowedComms.has(identity.comm)) return undefined;
+  let observedControlGroup;
+  try {
+    observedControlGroup = await processUnifiedControlGroup(candidate.rootPid);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return undefined;
+    throw error;
+  }
+  if (!controlGroupContains(service.ownership.controlGroup, observedControlGroup)) return undefined;
+  const confirmedIdentity = (await processAncestry(candidate.rootPid, 1))[0];
+  if (!confirmedIdentity || confirmedIdentity.startTime !== String(candidate.rootStartTimeTicks)) return undefined;
+  return {
+    processKey: String(candidate.rootPid) + ':' + String(candidate.rootStartTimeTicks),
+    controlGroup: observedControlGroup,
+    unit: service.unitName,
+    invocationId: service.ownership.invocationId,
+  };
 }
 
 async function waitForTerminalInstance(apiBase, collector, agentInstanceId) {
@@ -3278,6 +4080,11 @@ async function executeHostAgentScenario(context, phase, agent) {
       id,
       baselineIds,
       expectedScopeForAgent(agent),
+      async (candidate) => {
+        const placement = await matchHostRuntimeToSystemdService(candidate, runRecord);
+        if (placement) runRecord.runtimePlacement = placement;
+        return Boolean(placement);
+      },
     );
     const proof = await finishHostAgent(runRecord);
     const event = await waitForMarkerEvent(apiBase, id, markerValue, running.agentInstanceId);
@@ -3561,6 +4368,7 @@ async function executeE2e(options, preflightResult) {
   options = {
     ...options,
     resolvedDockerImages: preflightResult.apiState.dockerImages,
+    resolvedHostCommands: preflightResult.apiState.hostAgentCommands,
     forwarderModuleHashes: await forwarderModuleHashes(),
   };
   await fs.mkdir(options.artifactDir, { recursive: true, mode: 0o700 });
@@ -3753,6 +4561,107 @@ async function selfTestSafetyIo() {
   }
 }
 
+async function selfTestHostSystemdLauncher(options) {
+  const manager = await run('systemctl', ['--user', 'is-system-running'], {
+    allowFailure: true,
+    timeoutMs: 10_000,
+  });
+  assert.equal(manager.code, 0, 'host launcher self-test requires a running systemd user manager');
+  assert.equal(manager.stdout.trim(), 'running', 'host launcher self-test requires a healthy systemd user manager');
+  const unitName = hostAgentUnitName(options, 'runner-self-test', 'host-codex');
+  assert.equal((await systemdUnitState(unitName)).exists, false, 'host launcher self-test unit already exists');
+  const payloadNonce = ownershipNonce();
+  const environment = {
+    PATH: process.env.PATH || '/usr/bin:/bin',
+    ANYSENTRY_HOST_RUNNER_SELF_TEST: payloadNonce,
+  };
+  let service;
+  let childPid;
+  let controlGroup;
+  try {
+    service = await launchHostAgentService(options, 'runner-self-test', 'host-codex', {
+      schema: HOST_AGENT_RUNNER_SELF_TEST_SCHEMA,
+      agent: 'self-test',
+      command: process.execPath,
+      args: [scriptPath, HOST_AGENT_CHILD_SELF_TEST_OPTION, payloadNonce],
+      cwd: repoRoot,
+      env: { ...environment },
+    }, {
+      unitName,
+      proofValues: [payloadNonce, HOST_AGENT_CHILD_SELF_TEST_OPTION],
+      expectedEnvironment: environment,
+    });
+    controlGroup = service.ownership.controlGroup;
+    const [clientArgv, runnerArgv] = await Promise.all([
+      processArguments(service.record.child.pid),
+      processArguments(service.state.execMainPid),
+    ]);
+    for (const argv of [clientArgv, runnerArgv]) {
+      assert.equal(argv.includes(payloadNonce), false, 'stdin payload nonce appeared in launcher argv');
+      assert.equal(argv.includes(HOST_AGENT_CHILD_SELF_TEST_OPTION), false, 'stdin child command appeared in launcher argv');
+    }
+    const child = await eventually('host Agent systemd self-test child', async () => {
+      for (const line of service.record.stdout.split(/\r?\n/u)) {
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed?.hostAgentChildSelfTest === true && positiveInteger(parsed.pid)) return parsed;
+        } catch {}
+      }
+      if (service.record.finished) throw new Error('host Agent self-test service exited before child proof');
+      return undefined;
+    }, 10_000, 50);
+    childPid = child.pid;
+    const [childControlGroup, childAncestry] = await Promise.all([
+      processUnifiedControlGroup(childPid),
+      processAncestry(childPid),
+    ]);
+    assert.equal(controlGroupContains(controlGroup, childControlGroup), true, 'self-test child escaped the unit cgroup');
+    assert.equal(
+      childAncestry.some((record) => record.pid === service.state.execMainPid),
+      true,
+      'self-test child is not parented by the detached internal runner',
+    );
+    const clientExit = new Promise((resolve) => {
+      service.record.child.once('exit', (code, signal) => resolve({ code, signal }));
+    });
+    service.record.child.kill('SIGKILL');
+    const killedClient = await clientExit;
+    assert.equal(killedClient.signal, 'SIGKILL', 'self-test did not terminate the systemd-run client');
+    const orphanedService = await eventually('host Agent unit after launcher-client loss', async () => {
+      const state = await systemdUnitState(unitName, service.ownership);
+      return state.exists && state.owned && state.activeState === 'active' ? state : undefined;
+    }, 5_000, 50);
+    assert.equal(orphanedService.invocationId, service.ownership.invocationId);
+    await stopTrackedSystemdUnit(unitName);
+    assert.equal(service.record.finished, true, 'systemd-run client was not reaped after unit cleanup');
+    assert.equal(ledger.children.has(service.record), false, 'systemd-run client remained in the child ledger');
+    assert.equal(ledger.systemdUnits.has(unitName), false, 'self-test unit remained in the ownership ledger');
+    assert.equal((await systemdUnitState(unitName)).exists, false, 'self-test unit LoadState remained loaded');
+    assert.equal(await systemdControlGroupExists(controlGroup), false, 'self-test unit cgroup remained');
+    await eventually('host Agent self-test child removal', async () => {
+      try {
+        await fs.lstat('/proc/' + childPid);
+        return undefined;
+      } catch (error) {
+        if (error?.code === 'ENOENT') return true;
+        throw error;
+      }
+    }, 5_000, 50);
+    return {
+      unit: unitName,
+      detached: service.detached.forbiddenSharedAncestorCount === 0,
+      payloadAbsentFromSystemdRunArgv: true,
+      clientLossRecoveredByUnitLedger: true,
+      unitLoadStateRemoved: true,
+      controlGroupRemoved: true,
+      childRemoved: true,
+    };
+  } finally {
+    if (ledger.systemdUnits.has(unitName)) await stopTrackedSystemdUnit(unitName, true).catch(() => {});
+    if (service?.record && !service.record.finished) await reapCapturedProcess(service.record).catch(() => {});
+  }
+}
+
 async function selfTest() {
   const options = parseOptions([
     '--run-id', 'self-test-001',
@@ -3803,6 +4712,48 @@ async function selfTest() {
   const nonceB = ownershipNonce();
   assert.match(nonceA, /^[a-f0-9]{32}$/u);
   assert.notEqual(nonceA, nonceB);
+  const runnerEnvironment = { PATH: '/usr/bin:/bin', LC_ALL: 'C', HTTPS_PROXY: 'http://127.0.0.1:8080' };
+  const runnerPayload = {
+    schema: HOST_AGENT_RUNNER_SCHEMA,
+    agent: 'host-codex',
+    command: '/opt/anysentry/bin/codex',
+    args: ['exec', 'literal-$HOME', '安全测试'],
+    cwd: '/tmp/anysentry-runner-self-test',
+    env: { ...runnerEnvironment },
+  };
+  assert.deepEqual(
+    validateHostAgentRunnerPayload(runnerPayload, {
+      agent: 'host-codex', command: runnerPayload.command, env: runnerEnvironment,
+    }).args,
+    runnerPayload.args,
+  );
+  assert.throws(
+    () => validateHostAgentRunnerPayload({ ...runnerPayload, command: '/bin/sh' }),
+    /allowlisted/u,
+  );
+  for (const name of ['LD_PRELOAD', 'NODE_OPTIONS', 'BASH_ENV', 'UNEXPECTED']) {
+    assert.throws(
+      () => validateHostAgentRunnerPayload({ ...runnerPayload, env: { ...runnerEnvironment, [name]: 'blocked' } }),
+      /environment/u,
+    );
+  }
+  assert.throws(
+    () => validateHostAgentRunnerPayload({ ...runnerPayload, command: 'codex' }),
+    /command/u,
+  );
+  assert.throws(
+    () => validateHostAgentRunnerPayload(runnerPayload, {
+      agent: 'host-codex', command: runnerPayload.command, env: { ...runnerEnvironment, LANG: 'C' },
+    }),
+    /filtered launch environment/u,
+  );
+  assert.throws(
+    () => encodeHostAgentRunnerPayload({
+      ...runnerPayload,
+      args: Array.from({ length: 5 }, () => 'x'.repeat(120 * 1024)),
+    }),
+    /input limit/u,
+  );
   const firstAck = { accepted: true, applied: true, duplicate: false, leaseEpoch: 1 };
   const replayAck = { accepted: false, applied: false, duplicate: false, leaseEpoch: 1, reason: 'runtime lease is stale' };
   assert.equal(pickAck(firstAck).applied, true);
@@ -3976,16 +4927,20 @@ async function selfTest() {
   assert.ok(FORWARDER_MODULES.includes('observer-supervisor.js'));
   assert.ok(FORWARDER_MODULES.includes('observer-e2e-witness.js'));
   await selfTestSafetyIo();
+  const hostSystemdLauncher = await selfTestHostSystemdLauncher(options);
   return {
     protocolReserved: true,
     dryRunDefault: true,
     cleanupOwnershipRequired: true,
+    hostSystemdLauncher,
     safetyContracts: [
       'host full-access CLI and launch-point gate',
       'bounded credential-redacted diagnostics',
       'host process quiesced before failure evidence capture',
       'no-follow exclusive evidence writes with artifact directory identity pinning',
       'tracked transient sandbox-probe directory cleanup',
+      'nonce and InvocationID fenced transient host service cleanup',
+      'host runtime ProcessKey and cgroup correlation',
     ],
   };
 }
@@ -4049,17 +5004,40 @@ async function main() {
   if (successOutput) console.log(JSON.stringify(successOutput, null, 2));
 }
 
-for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.once(signal, () => {
-    ledger.aborting = true;
-    process.exitCode = 130;
-    void cleanup()
-      .catch((error) => console.error('[cleanup failed after ' + signal + '] ' + redact(error?.message || error)))
-      .finally(() => process.exit());
+const internalMode = process.argv[2];
+if (internalMode === HOST_AGENT_RUNNER_OPTION) {
+  if (process.argv.length !== 3) {
+    console.error('[host Agent runner failed] internal runner accepts input only on stdin');
+    process.exitCode = 2;
+  } else {
+    void runHostAgentRunner().catch((error) => {
+      console.error('[host Agent runner failed] ' + redact(error?.message || error));
+      process.exitCode = 1;
+    });
+  }
+} else if (internalMode === HOST_AGENT_CHILD_SELF_TEST_OPTION) {
+  if (process.argv.length !== 4) {
+    console.error('[host Agent child self-test failed] invalid arguments');
+    process.exitCode = 2;
+  } else {
+    void runHostAgentChildSelfTest().catch((error) => {
+      console.error('[host Agent child self-test failed] ' + redact(error?.message || error));
+      process.exitCode = 1;
+    });
+  }
+} else {
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.once(signal, () => {
+      ledger.aborting = true;
+      process.exitCode = 130;
+      void cleanup()
+        .catch((error) => console.error('[cleanup failed after ' + signal + '] ' + redact(error?.message || error)))
+        .finally(() => process.exit());
+    });
+  }
+
+  void main().catch((error) => {
+    console.error('[failed] ' + redact(error?.stack || error?.message || error));
+    process.exitCode = 1;
   });
 }
-
-void main().catch((error) => {
-  console.error('[failed] ' + redact(error?.stack || error?.message || error));
-  process.exitCode = 1;
-});
