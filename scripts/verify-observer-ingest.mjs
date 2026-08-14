@@ -568,6 +568,55 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
   );
 }
 
+async function verifyRawHeartbeatPreservesForwarderMetrics(sourceId, token) {
+  // The Rust collector and the enriched Forwarder intentionally publish under the same
+  // collector ID. Give the raw heartbeat a strictly later timestamp so this checks the
+  // record selected by Collector health instead of accidentally reading the prior record.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const line = observerLine(
+    { agent: null, session: null },
+    {
+      CollectorHeartbeat: {
+        node_name: `${runId}-node-raw-after-direct`,
+        mode: 'observe',
+        status: 'ok',
+        interval_secs: 30,
+        attached_probes: 11,
+        enabled_features: ['exec'],
+        exec: 5,
+        observed_agents: 4,
+      },
+    },
+  );
+  const result = await request('/ingest', 'POST', {
+    line,
+    collectorId: `${runId}-collector`,
+    sourceId,
+    sourceName: `${runId} observer forwarder`,
+    sourceType: 'observer',
+    token,
+    workspacePath: `repo://${runId}/observer`,
+  });
+  assert('later raw CollectorHeartbeat is accepted after enriched heartbeat', result.accepted === true && result.kind === 'collector-heartbeat', result);
+
+  const health = await request('/collectors/health', 'POST', { timeType: 'last_30d', collectorId: `${runId}-collector`, limit: 5 });
+  assert(
+    'raw CollectorHeartbeat preserves the latest enriched Forwarder metrics',
+    health.total === 1 &&
+      health.items?.[0]?.nodeName === `${runId}-node-raw-after-direct` &&
+      health.items?.[0]?.mode === 'observe' &&
+      health.items?.[0]?.state === 'healthy' &&
+      health.items?.[0]?.observedAgentCount === 4 &&
+      health.items?.[0]?.attachedProbes === 11 &&
+      health.items?.[0]?.filterMetrics?.scope === 'shadow' &&
+      health.items?.[0]?.filterMetrics?.wouldFilterNonAgent === 3 &&
+      health.items?.[0]?.filterMetrics?.e2eFilterReceipts?.length === 1 &&
+      health.items?.[0]?.filterMetrics?.e2eFilterReceipts?.[0]?.lineSha256 === 'b'.repeat(64) &&
+      health.items?.[0]?.filterMetrics?.identityCgroupHits === 7,
+    health,
+  );
+}
+
 async function verifySourceRollup(sourceId) {
   const sources = await request('/sources/list', 'POST', { sourceId, limit: 5 });
   const source = sources.items?.[0];
@@ -597,6 +646,7 @@ async function main() {
   await verifyObserverLlmEndpoint(source.sourceId, token);
   await verifyRawCollectorHeartbeat(source.sourceId, token);
   await verifyDirectForwarderHeartbeat(source.sourceId, token);
+  await verifyRawHeartbeatPreservesForwarderMetrics(source.sourceId, token);
   await verifySourceRollup(source.sourceId);
 
   if (process.exitCode) {

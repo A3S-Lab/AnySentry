@@ -862,7 +862,18 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const clamp = (n: unknown) => Math.max(0, Number.isFinite(Number(n)) ? Math.round(Number(n)) : 0);
     const eventKindCounts: Record<string, number> = {};
     for (const [key, value] of Object.entries(input.eventKindCounts ?? {})) eventKindCounts[key.slice(0, 64)] = clamp(value);
-    const rawFilter = input.filterMetrics ?? ({} as Partial<import('./types').CollectorFilterMetrics>);
+    let previous: CollectorHeartbeatRecord | undefined;
+    for (let index = this.collectorHeartbeats.length - 1; index >= 0; index -= 1) {
+      if (this.collectorHeartbeats[index].collectorId === collectorId) {
+        previous = this.collectorHeartbeats[index];
+        break;
+      }
+    }
+    // Rust collector heartbeats and the enriched Forwarder heartbeat intentionally share an ID.
+    // A raw heartbeat has no filterMetrics; retain the most recent enriched snapshot so it cannot
+    // transiently erase signature, lease, runtime, and shadow counters in collector health.
+    const rawFilter = input.filterMetrics ?? previous?.filterMetrics ??
+      ({} as Partial<import('./types').CollectorFilterMetrics>);
     const filterMetrics: import('./types').CollectorFilterMetrics = {
       scope: ['all', 'shadow', 'agent', 'decoupled'].includes(rawFilter.scope ?? '')
         ? (rawFilter.scope as import('./types').CollectorFilterMetrics['scope'])
