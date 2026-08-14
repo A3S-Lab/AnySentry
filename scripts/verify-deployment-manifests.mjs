@@ -103,10 +103,15 @@ function verifyAnySentryManifest() {
   const docs = documentsFromYaml(readText('deploy/anysentry.yaml'));
   const anySentryDeployment = docFor(docs, 'Deployment', 'anysentry');
   const anySentryService = docFor(docs, 'Service', 'anysentry');
+  const clickHouseMemoryConfig = docFor(docs, 'ConfigMap', 'clickhouse-memory-config');
   const clickHouseDeployment = docFor(docs, 'Deployment', 'clickhouse');
   const clickHouseService = docFor(docs, 'Service', 'clickhouse');
   const podReaderRole = docFor(docs, 'ClusterRole', 'anysentry-pod-reader');
   const podReaderBinding = docFor(docs, 'ClusterRoleBinding', 'anysentry-pod-reader');
+  const clickHouseSelectedResources = docs
+    .filter((doc) => /^  labels:\s*\{\s*app:\s*clickhouse\s*\}\s*$/mu.test(doc.source))
+    .map((doc) => `${doc.kind}/${doc.name}`)
+    .sort();
 
   assert('AnySentry Deployment manifest exists', Boolean(anySentryDeployment));
   assert(
@@ -160,6 +165,40 @@ function verifyAnySentryManifest() {
   assert(
     'Bundled ClickHouse readiness probe uses /ping on 8123',
     /httpGet:\s*\{\s*path:\s*\/ping,\s*port:\s*8123\s*\}/u.test(clickHouseDeployment?.source ?? ''),
+    clickHouseDeployment?.source,
+  );
+  assert(
+    'Bundled ClickHouse has an explicit 2 GiB server memory budget',
+    Boolean(clickHouseMemoryConfig) &&
+      /^  namespace:\s*anysentry\s*$/mu.test(clickHouseMemoryConfig?.source ?? '') &&
+      /labels:\s*\{\s*app:\s*clickhouse\s*\}/u.test(clickHouseMemoryConfig?.source ?? '') &&
+      /^data:\s*\n  memory\.xml:\s*\|\s*\n    <clickhouse>\s*\n      <max_server_memory_usage>2147483648<\/max_server_memory_usage>\s*\n    <\/clickhouse>\s*$/mu.test(
+        clickHouseMemoryConfig?.source ?? '',
+      ) &&
+      countMatches(clickHouseMemoryConfig?.source ?? '', /<max_server_memory_usage>/gu) === 1 &&
+      !/max_server_memory_usage_to_ram_ratio/u.test(clickHouseMemoryConfig?.source ?? ''),
+    clickHouseMemoryConfig?.source,
+  );
+  assert(
+    'Bundled ClickHouse mounts the memory budget read-only',
+    /\{\s*name:\s*memory-config,\s*mountPath:\s*\/etc\/clickhouse-server\/config\.d\/20-anysentry-memory\.xml,\s*subPath:\s*memory\.xml,\s*readOnly:\s*true\s*\}/u.test(
+      clickHouseDeployment?.source ?? '',
+    ) &&
+      /name:\s*memory-config\s*\n\s*configMap:\s*\n\s*name:\s*clickhouse-memory-config\s*\n\s*items:\s*\n\s*-\s*\{\s*key:\s*memory\.xml,\s*path:\s*memory\.xml\s*\}/u.test(
+        clickHouseDeployment?.source ?? '',
+      ),
+    clickHouseDeployment?.source,
+  );
+  assert(
+    'The ClickHouse apply selector targets only its ConfigMap, Deployment, and Service',
+    JSON.stringify(clickHouseSelectedResources) ===
+      JSON.stringify(['ConfigMap/clickhouse-memory-config', 'Deployment/clickhouse', 'Service/clickhouse']),
+    clickHouseSelectedResources,
+  );
+  assert(
+    'Bundled ClickHouse reserves 1 GiB and is capped at 3 GiB',
+    /requests:\s*\{\s*cpu:\s*250m,\s*memory:\s*1Gi\s*\}/u.test(clickHouseDeployment?.source ?? '') &&
+      /limits:\s*\{\s*cpu:\s*"2",\s*memory:\s*3Gi\s*\}/u.test(clickHouseDeployment?.source ?? ''),
     clickHouseDeployment?.source,
   );
   assert(

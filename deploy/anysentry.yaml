@@ -29,6 +29,18 @@ spec:
     requests:
       storage: 10Gi
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-memory-config
+  namespace: anysentry
+  labels: { app: clickhouse }
+data:
+  memory.xml: |
+    <clickhouse>
+      <max_server_memory_usage>2147483648</max_server_memory_usage>
+    </clickhouse>
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -59,17 +71,23 @@ spec:
               valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_PASSWORD } }
           volumeMounts:
             - { name: data, mountPath: /var/lib/clickhouse }
+            - { name: memory-config, mountPath: /etc/clickhouse-server/config.d/20-anysentry-memory.xml, subPath: memory.xml, readOnly: true }
           readinessProbe:
             httpGet: { path: /ping, port: 8123 }
             initialDelaySeconds: 10
             periodSeconds: 10
           resources:
-            requests: { cpu: 250m, memory: 512Mi }
-            limits: { cpu: "2", memory: 2Gi }
+            requests: { cpu: 250m, memory: 1Gi }
+            limits: { cpu: "2", memory: 3Gi }
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: clickhouse-data
+        - name: memory-config
+          configMap:
+            name: clickhouse-memory-config
+            items:
+              - { key: memory.xml, path: memory.xml }
 ---
 apiVersion: v1
 kind: Service
