@@ -13,6 +13,36 @@ import {
 import {
   buildSupplyChainRuntimeContext,
 } from '../apps/api/dist/security-monitoring/supply-chain-runtime.js';
+import { SupplyChainService } from '../apps/api/dist/security-monitoring/supply-chain.service.js';
+
+const previousRedisUrl = process.env.ANYSENTRY_REDIS_URL;
+delete process.env.ANYSENTRY_REDIS_URL;
+const disabledService = new SupplyChainService();
+let disabledStoreInitCalls = 0;
+disabledService.store.init = async () => {
+  disabledStoreInitCalls += 1;
+  throw new Error('disabled supply-chain must not initialize its ClickHouse store');
+};
+let disabledInitTimeout;
+try {
+  await Promise.race([
+    disabledService.onModuleInit(),
+    new Promise((_, reject) => {
+      disabledInitTimeout = setTimeout(() => reject(new Error('disabled supply-chain initialization attempted external I/O')), 500);
+    }),
+  ]);
+  const disabledOverview = await disabledService.overview();
+  assert.equal(disabledStoreInitCalls, 0);
+  assert.equal(disabledOverview.enabled, false);
+  assert.equal(disabledOverview.workspaces, 0);
+  const disabledControl = await disabledService.controlConfig();
+  assert.equal(disabledControl.readiness.serviceReady, false);
+} finally {
+  if (disabledInitTimeout) clearTimeout(disabledInitTimeout);
+  await disabledService.onModuleDestroy();
+  if (previousRedisUrl === undefined) delete process.env.ANYSENTRY_REDIS_URL;
+  else process.env.ANYSENTRY_REDIS_URL = previousRedisUrl;
+}
 
 const components = normalizeComponents([
   {

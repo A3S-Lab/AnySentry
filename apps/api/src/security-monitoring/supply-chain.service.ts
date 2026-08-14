@@ -156,6 +156,11 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleInit(): Promise<void> {
+    // Supply-chain queues require Redis, but the API and Kubernetes base manifest do not.
+    // Never turn an absent optional dependency into an implicit `redis` DNS connection that
+    // blocks the whole API from starting; deployments that enable this subsystem set the URL.
+    const redisUrl = process.env.ANYSENTRY_REDIS_URL?.trim();
+    if (!redisUrl) return;
     if (!(await this.store.init())) return;
     const saved = await this.store.loadControl();
     if (saved) {
@@ -164,14 +169,11 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
       this.control = { ...this.control, updatedAt: Date.now() };
       await this.store.saveControl(this.control);
     }
-    this.redis = new IORedis(
-      process.env.ANYSENTRY_REDIS_URL || 'redis://redis:6379/0',
-      { maxRetriesPerRequest: null },
-    );
+    this.redis = new IORedis(redisUrl, { maxRetriesPerRequest: null });
     this.assessmentQueue = new Queue<SupplyChainAssessmentJob>(
       SUPPLY_CHAIN_ASSESSMENT_QUEUE,
       {
-        connection: redisConnection(),
+        connection: redisConnection(redisUrl),
         defaultJobOptions: {
           attempts: 4,
           backoff: { type: 'exponential', delay: 15_000 },
