@@ -364,7 +364,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
-  async searchStoredEvents(query: StoredEventQuery): Promise<JudgedEvent[]> {
+  async searchStoredEvents(query: StoredEventQuery): Promise<JudgedEvent[] | null> {
     return this.ch.searchEvents(query);
   }
 

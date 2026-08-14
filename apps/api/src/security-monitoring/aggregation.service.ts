@@ -640,34 +640,40 @@ export class AggregationService {
   }
 
   async storedAgentEvents(filter: T.AgentEventQuery): Promise<T.AgentEventList> {
-    if (!this.judge.storageStatus().clickhouseReady) return this.agentEvents(filter);
+    if (!this.judge.storageStatus().clickhouseReady) {
+      return { ...this.agentEvents(filter), totalApproximate: true, storageFallback: 'hot_ring' };
+    }
     const pinnedEventId = filter.eventId?.trim();
     const { sinceMs } = this.win(filter);
     const customEnd = filter.timeType === 'custom' && filter.endTime ? Date.parse(filter.endTime) : Number.NaN;
     const dateOnlyEnd = Boolean(filter.endTime && /^\d{4}-\d{2}-\d{2}$/u.test(filter.endTime));
     const untilMs = Number.isFinite(customEnd) ? customEnd + (dateOnlyEnd ? 24 * HOUR - 1 : 0) : now();
     const limit = Math.max(1, Math.min(200, filter.limit ?? 40));
+    const persistentLimit = Math.min(20_000, Math.max(2_000, limit * 50));
     const persistent = await this.judge.searchStoredEvents({
       sinceMs: pinnedEventId ? 0 : sinceMs,
-      untilMs,
+      // A pinned evidence deep link takes precedence over the list's current filters and custom
+      // window, matching filterEvents/agentEvents. Only eventId may be pushed down in that case.
+      untilMs: pinnedEventId ? now() : untilMs,
       eventId: pinnedEventId,
-      sourceId: filter.sourceId,
-      collectorId: filter.collectorId,
-      agentId: filter.agentId,
-      sessionId: filter.sessionId,
-      workspacePath: filter.workspacePath,
-      traceId: filter.traceId,
-      runId: filter.runId,
-      eventKind: filter.eventKind,
-      eventCategory: filter.eventCategory,
-      verdict: filter.verdict,
-      tier: filter.tier,
-      limit: Math.min(20_000, Math.max(2_000, limit * 50)),
+      sourceId: pinnedEventId ? undefined : filter.sourceId,
+      collectorId: pinnedEventId ? undefined : filter.collectorId,
+      agentId: pinnedEventId ? undefined : filter.agentId,
+      sessionId: pinnedEventId ? undefined : filter.sessionId,
+      workspacePath: pinnedEventId ? undefined : filter.workspacePath,
+      traceId: pinnedEventId ? undefined : filter.traceId,
+      runId: pinnedEventId ? undefined : filter.runId,
+      eventKind: pinnedEventId ? undefined : filter.eventKind,
+      eventCategory: pinnedEventId ? undefined : filter.eventCategory,
+      verdict: pinnedEventId ? undefined : filter.verdict,
+      tier: pinnedEventId ? undefined : filter.tier,
+      limit: persistentLimit,
     });
     // Buffered writes may not have reached ClickHouse yet. Merge the hot ring and prefer the most
     // recent lifecycle revision without mutating either immutable source record.
     const latest = new Map<string, T.JudgedEvent>();
-    for (const event of [...persistent, ...this.judge.query(pinnedEventId ? 0 : sinceMs)]) {
+    const hotEvents = pinnedEventId ? this.judge.query(0) : this.judge.queryRange(sinceMs, untilMs);
+    for (const event of [...(persistent ?? []), ...hotEvents]) {
       const previous = latest.get(event.eventId);
       if (!previous || (event.decisionUpdatedAt ?? event.at) >= (previous.decisionUpdatedAt ?? previous.at)) {
         latest.set(event.eventId, event);
@@ -683,6 +689,10 @@ export class AggregationService {
     return {
       items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) => this.eventItem(event, repeatCount, lastAt)),
       total: compacted.length,
+      // Durable search is deliberately a bounded primary-key sample; a failed/busy read falls
+      // back to the hot ring. Never present either result as an exact all-window total.
+      totalApproximate: !pinnedEventId || persistent === null || persistent.length >= persistentLimit ? true : undefined,
+      storageFallback: persistent === null ? 'hot_ring' : undefined,
       updateTime: iso(),
     };
   }

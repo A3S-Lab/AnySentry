@@ -341,22 +341,33 @@ export class ClickHouseStore {
   private buf: Row[] = [];
   private flushTimer?: NodeJS.Timeout;
   private ready = false;
-  private dashboardQueryActive = false;
+  // All three dashboard paths below read or aggregate wide event rows. Keep one shared slot so a
+  // durable search cannot overlap a recent/history read and collectively exceed the 2 GiB server
+  // budget. Equivalent recent/durable requests still coalesce through their per-path in-flight
+  // promise before attempting to acquire this slot.
+  private wideEventReadActive = false;
   // Share one equivalent wide read, but fail a different window closed to the hot-ring fallback.
   // This is an in-flight guard only: completed results are never cached here.
   private recentQueryInFlight?: {
     key: string;
     value: Promise<JudgedEvent[] | null>;
   };
+  // Durable event searches materialize the same wide rows as the recent dashboard read. Share an
+  // equivalent request and fail a different one closed to the hot-ring fallback so concurrent API
+  // callers cannot multiply the per-query memory budget.
+  private eventSearchInFlight?: {
+    key: string;
+    value: Promise<JudgedEvent[] | null>;
+  };
 
-  private tryAcquireDashboardQuerySlot(): (() => void) | null {
-    if (this.dashboardQueryActive) return null;
-    this.dashboardQueryActive = true;
+  private tryAcquireWideEventReadSlot(): (() => void) | null {
+    if (this.wideEventReadActive) return null;
+    this.wideEventReadActive = true;
     let released = false;
     return () => {
       if (released) return;
       released = true;
-      this.dashboardQueryActive = false;
+      this.wideEventReadActive = false;
     };
   }
 
@@ -473,6 +484,8 @@ export class ClickHouseStore {
       const shared = await current.value;
       return shared ? [...shared] : null;
     }
+    const release = this.tryAcquireWideEventReadSlot();
+    if (!release) return null;
     // Attribution is copied unchanged into every judgment revision, so monitored can safely narrow
     // the primary-key sample. Tier changes across L1/L2/L3 and must be filtered only after the
     // latest revision is selected.
@@ -521,6 +534,7 @@ export class ClickHouseStore {
       return rows ? [...rows] : null;
     } finally {
       if (this.recentQueryInFlight?.value === value) this.recentQueryInFlight = undefined;
+      release();
     }
   }
 
@@ -556,7 +570,7 @@ export class ClickHouseStore {
       HAVING JSONExtractBool(attribution, 'monitored')`;
     // AggregationService already coalesces the same window. A different concurrent full-window
     // request must fall back to the hot ring instead of building an unbounded queue of heavy reads.
-    const release = this.tryAcquireDashboardQuerySlot();
+    const release = this.tryAcquireWideEventReadSlot();
     if (!release) return null;
     try {
       const queryRows = async (
@@ -753,11 +767,12 @@ export class ClickHouseStore {
   /** Query durable event history. Identity visibility is deliberately applied by the service
    * after current human-review metadata is resolved; a mutable review decision must never be
    * baked into this immutable evidence query. */
-  async searchEvents(input: StoredEventQuery): Promise<JudgedEvent[]> {
-    if (!this.client) return [];
-    const conditions = ['at >= {since:UInt64}', 'at <= {until:UInt64}'];
+  async searchEvents(input: StoredEventQuery): Promise<JudgedEvent[] | null> {
+    if (!this.client) return null;
+    const sampleConditions: string[] = [];
+    const latestConditions: string[] = [];
     const queryParams: Record<string, string | number> = { since: input.sinceMs, until: input.untilMs };
-    const fields: Array<[keyof StoredEventQuery, string]> = [
+    const stableFields: Array<[keyof StoredEventQuery, string]> = [
       ['eventId', 'eventId'],
       ['sourceId', 'sourceId'],
       ['collectorId', 'collectorId'],
@@ -768,33 +783,86 @@ export class ClickHouseStore {
       ['runId', 'runId'],
       ['eventKind', 'eventKind'],
       ['eventCategory', 'eventCategory'],
+    ];
+    const mutableFields: Array<[keyof StoredEventQuery, string]> = [
       ['verdict', 'verdict'],
       ['tier', 'tier'],
     ];
-    for (const [key, column] of fields) {
+    for (const [key, column] of stableFields) {
       const value = input[key];
       if (typeof value !== 'string' || !value.trim()) continue;
-      conditions.push(`${column} = {${String(key)}:String}`);
+      sampleConditions.push(`${column} = {${String(key)}:String}`);
       queryParams[String(key)] = value.trim();
     }
-    const rowLimit = Math.max(1, Math.min(100_000, input.limit));
+    for (const [key, column] of mutableFields) {
+      const value = input[key];
+      if (typeof value !== 'string' || !value.trim()) continue;
+      latestConditions.push(`${column} = {${String(key)}:String}`);
+      queryParams[String(key)] = value.trim();
+    }
+    const rowLimit = Math.max(1, Math.min(100_000, Math.round(input.limit)));
     queryParams.limit = rowLimit;
-    try {
-      const rs = await this.client.query({
-        query: `SELECT * FROM ${TABLE} WHERE ${conditions.join(' AND ')} ORDER BY at DESC, decisionUpdatedAt DESC LIMIT {limit:UInt32}`,
-        query_params: queryParams,
-        format: 'JSONEachRow',
-      });
-      const rows = (await rs.json()) as Array<Record<string, unknown>>;
-      const latest = new Map<string, JudgedEvent>();
-      for (const row of rows) {
-        const event = fromRow(row);
-        if (!latest.has(event.eventId)) latest.set(event.eventId, event);
+    queryParams.scanLimit = Math.min(300_000, Math.max(rowLimit * 3, latestConditions.length ? 15_000 : 0));
+    const queryKey = JSON.stringify(queryParams);
+    const current = this.eventSearchInFlight;
+    if (current) {
+      if (current.key !== queryKey) return null;
+      const shared = await current.value;
+      return shared ? [...shared] : null;
+    }
+    const release = this.tryAcquireWideEventReadSlot();
+    if (!release) return null;
+    const client = this.client;
+    const value = (async (): Promise<JudgedEvent[] | null> => {
+      try {
+        const rs = await client.query({
+          // Bound the primary-key scan before sorting lifecycle revisions. Verdict and tier can
+          // change between revisions, so apply them only after LIMIT 1 BY has selected the latest
+          // row; filtering them inside the sample would resurrect an obsolete judgment.
+          query: `
+            SELECT *
+            FROM (
+              SELECT *
+              FROM (
+                SELECT *
+                FROM ${TABLE}
+                PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}
+                ${sampleConditions.length ? `WHERE ${sampleConditions.join(' AND ')}` : ''}
+                ORDER BY at DESC
+                LIMIT {scanLimit:UInt32} WITH TIES
+              )
+              ORDER BY at DESC, decisionUpdatedAt DESC
+              LIMIT 1 BY eventId
+            )
+            ${latestConditions.length ? `WHERE ${latestConditions.join(' AND ')}` : ''}
+            ORDER BY at DESC, decisionUpdatedAt DESC
+            LIMIT {limit:UInt32}`,
+          query_params: queryParams,
+          // A 6k-row moving production sample reached 451 MiB under the recent-read ceiling. Use
+          // the already bounded 640 MiB hydration profile here; the in-flight guard above ensures
+          // only one durable event search can consume that budget per API process.
+          clickhouse_settings: BOUNDED_HYDRATE_READ_SETTINGS,
+          format: 'JSONEachRow',
+        });
+        const rows = (await rs.json()) as Array<Record<string, unknown>>;
+        const latest = new Map<string, JudgedEvent>();
+        for (const row of rows) {
+          const event = fromRow(row);
+          if (!latest.has(event.eventId)) latest.set(event.eventId, event);
+        }
+        return [...latest.values()].sort((a, b) => b.at - a.at);
+      } catch (err) {
+        console.error('[clickhouse] event search failed:', (err as Error).message);
+        return null;
       }
-      return [...latest.values()].sort((a, b) => b.at - a.at);
-    } catch (err) {
-      console.error('[clickhouse] event search failed:', (err as Error).message);
-      return [];
+    })();
+    this.eventSearchInFlight = { key: queryKey, value };
+    try {
+      const rows = await value;
+      return rows ? [...rows] : null;
+    } finally {
+      if (this.eventSearchInFlight?.value === value) this.eventSearchInFlight = undefined;
+      release();
     }
   }
 

@@ -70,6 +70,10 @@ function assertRecentSettings(call) {
   assertBoundedSettings(call, { maxThreads: 1, smallBlocks: true, maxMemoryMiB: 448 });
 }
 
+function assertEventSearchSettings(call) {
+  assertHydrateSettings(call);
+}
+
 const store = new ClickHouseStore();
 store.ready = true;
 const fake = fakeClient();
@@ -107,6 +111,100 @@ assert.ok(revisionSort > boundedLimit, 'revision sorting must happen only after 
 assert.ok(revisionDedup > revisionSort, 'the latest lifecycle revision must be selected before filtering');
 assert.ok(mutableFilter > revisionDedup, 'tier filtering must not resurrect an older lifecycle revision');
 assert.equal(fake.state.active, 0);
+
+fake.state.calls.length = 0;
+const searched = await store.searchEvents({
+  sinceMs: 100,
+  untilMs: 200,
+  sourceId: 'source-a',
+  verdict: 'block',
+  tier: 'Llm',
+  limit: 2_000,
+});
+assert.deepEqual(searched, []);
+assert.equal(fake.state.calls.length, 1);
+const searchCall = fake.state.calls[0];
+assertEventSearchSettings(searchCall);
+assert.equal(searchCall.query_params.scanLimit, 15_000);
+assert.match(searchCall.query, /PREWHERE at >= \{since:UInt64\} AND at <= \{until:UInt64\}/u);
+assert.match(searchCall.query, /WHERE sourceId = \{sourceId:String\}/u);
+assert.match(searchCall.query, /WHERE verdict = \{verdict:String\} AND tier = \{tier:String\}/u);
+assert.match(searchCall.query, /ORDER BY at DESC\s+LIMIT \{scanLimit:UInt32\} WITH TIES/u);
+const searchStableFilter = searchCall.query.indexOf('WHERE sourceId = {sourceId:String}');
+const searchBoundedLimit = searchCall.query.indexOf('LIMIT {scanLimit:UInt32} WITH TIES');
+const searchRevisionSort = searchCall.query.indexOf('ORDER BY at DESC, decisionUpdatedAt DESC');
+const searchRevisionDedup = searchCall.query.indexOf('LIMIT 1 BY eventId');
+const searchMutableFilter = searchCall.query.indexOf('WHERE verdict = {verdict:String} AND tier = {tier:String}');
+const searchResultLimit = searchCall.query.lastIndexOf('LIMIT {limit:UInt32}');
+assert.ok(searchStableFilter > 0 && searchStableFilter < searchBoundedLimit,
+  'stable event filters must narrow the bounded primary-key sample');
+assert.ok(searchRevisionSort > searchBoundedLimit,
+  'event revision sorting must happen only after the bounded primary-key sample');
+assert.ok(searchRevisionDedup > searchRevisionSort,
+  'durable event search must select the latest lifecycle revision before mutable filtering');
+assert.ok(searchMutableFilter > searchRevisionDedup,
+  'verdict and tier filters must not resurrect an obsolete lifecycle revision');
+assert.ok(searchResultLimit > searchMutableFilter,
+  'the caller limit must apply after lifecycle selection and mutable filtering');
+assert.equal(fake.state.active, 0);
+
+fake.state.calls.length = 0;
+const sameSearchInput = {
+  sinceMs: 100,
+  untilMs: 201,
+  collectorId: 'collector-a',
+  limit: 2_000,
+};
+const sameSearchA = store.searchEvents(sameSearchInput);
+const sameSearchB = store.searchEvents({ ...sameSearchInput });
+const [sameSearchRowsA, sameSearchRowsB] = await Promise.all([sameSearchA, sameSearchB]);
+assert.equal(fake.state.calls.length, 1, 'equivalent concurrent durable searches must share one query');
+assert.deepEqual(sameSearchRowsA, []);
+assert.deepEqual(sameSearchRowsB, []);
+assert.notStrictEqual(sameSearchRowsA, sameSearchRowsB, 'each durable-search caller must receive its own array');
+assert.equal(fake.state.calls[0].query_params.scanLimit, 6_000);
+
+fake.state.calls.length = 0;
+const occupiedSearch = store.searchEvents({ sinceMs: 100, untilMs: 202, limit: 2_000 });
+assert.deepEqual(
+  await store.searchEvents({ sinceMs: 100, untilMs: 203, limit: 2_000 }),
+  null,
+  'a different durable search must fail closed while one wide query is active',
+);
+assert.equal(
+  await store.recentWindowEvents(100, 203, 1_000),
+  null,
+  'a durable search must exclude a concurrent recent wide read',
+);
+assert.equal(
+  await store.dashboardWindowHistory(100, 203, 8),
+  null,
+  'a durable search must exclude concurrent dashboard history reads',
+);
+assert.deepEqual(await occupiedSearch, []);
+assert.equal(fake.state.calls.length, 1, 'a busy durable search must not start a second wide query');
+assert.deepEqual(
+  await store.searchEvents({ sinceMs: 100, untilMs: 203, limit: 2_000 }),
+  [],
+  'a different durable search must recover after the active query settles',
+);
+assert.equal(fake.state.calls.length, 2);
+
+fake.state.calls.length = 0;
+fake.state.failNext = true;
+const searchConsoleError = console.error;
+console.error = () => {};
+try {
+  assert.equal(await store.searchEvents({ sinceMs: 100, untilMs: 204, limit: 2_000 }), null);
+} finally {
+  console.error = searchConsoleError;
+}
+assert.deepEqual(
+  await store.searchEvents({ sinceMs: 100, untilMs: 205, limit: 2_000 }),
+  [],
+  'a failed durable search must release its in-flight slot',
+);
+assert.equal(fake.state.calls.length, 2);
 
 fake.state.calls.length = 0;
 const sameRecentA = store.recentWindowEvents(100, 201, 1_000, { monitoredOnly: true, tier: 'Llm' });
@@ -167,9 +265,15 @@ store.client = {
 };
 const blockedRecent = store.recentWindowEvents(100, 206, 1_000);
 await recentStarted;
-assert.ok(
+assert.equal(
   await store.dashboardWindowHistory(100, 206, 8),
-  'the recent in-flight guard must remain independent from bounded history reads',
+  null,
+  'a recent wide read must exclude concurrent dashboard history reads',
+);
+assert.equal(
+  await store.searchEvents({ sinceMs: 100, untilMs: 206, limit: 2_000 }),
+  null,
+  'a recent wide read must exclude a concurrent durable search',
 );
 releaseRecent();
 assert.deepEqual(await blockedRecent, []);
@@ -268,7 +372,9 @@ const monitorPageSource = await readFile(
   'utf8',
 );
 assert.match(apiTypesSource, /interface AgentEventList[\s\S]*totalApproximate\?: boolean/u);
+assert.match(apiTypesSource, /interface AgentEventList[\s\S]*storageFallback\?: 'hot_ring'/u);
 assert.match(webApiSource, /interface AgentEventList[\s\S]*totalApproximate\?: boolean/u);
+assert.match(webApiSource, /interface AgentEventList[\s\S]*storageFallback\?: "hot_ring"/u);
 assert.match(agentEventsPageSource, /data\.totalApproximate \? "≈"/u);
 assert.match(monitorPageSource, /events\.totalApproximate \? "≈"/u);
 assert.match(webApiSource, /const DASHBOARD_HISTORY_TIMEOUT_MS = 45_000/u);
@@ -303,6 +409,16 @@ try {
     await store.dashboardWindowHistory(1_100, 1_200, 8),
     null,
     'a failed detail sibling must not release the window slot while its peer is still running',
+  );
+  assert.equal(
+    await store.recentWindowEvents(1_100, 1_200, 1_000),
+    null,
+    'dashboard history must exclude a concurrent recent wide read until every detail settles',
+  );
+  assert.equal(
+    await store.searchEvents({ sinceMs: 1_100, untilMs: 1_200, limit: 2_000 }),
+    null,
+    'dashboard history must exclude a concurrent durable search until every detail settles',
   );
   releaseWorkspace();
   assert.equal(await failingWindow, null);
@@ -371,5 +487,138 @@ assert.deepEqual(detailed.items, []);
 assert.equal(detailed.total, 0);
 assert.equal(detailed.totalApproximate, true);
 assert.equal(detailedHistoryCalls, 0, 'a detailed marker query must not trigger unrelated history scans');
+
+const failedDurableAggregation = new AggregationService(
+  {
+    storageStatus: () => ({ clickhouseReady: true }),
+    searchStoredEvents: async () => null,
+    queryRange: () => [],
+  },
+  {},
+  {},
+  {},
+);
+const failedDurable = await failedDurableAggregation.storedAgentEvents({ timeType: 'last_30d', limit: 5 });
+assert.deepEqual(failedDurable.items, []);
+assert.equal(failedDurable.total, 0);
+assert.equal(failedDurable.totalApproximate, true,
+  'a failed or busy durable read must expose the hot-ring fallback as approximate');
+assert.equal(failedDurable.storageFallback, 'hot_ring',
+  'a failed or busy durable read must identify its fallback source');
+
+const unavailableDurableAggregation = new AggregationService(
+  {
+    storageStatus: () => ({ clickhouseReady: false }),
+    query: () => [],
+  },
+  {},
+  {},
+  {},
+);
+const unavailableDurable = await unavailableDurableAggregation.storedAgentEvents({ timeType: 'last_30d', limit: 5 });
+assert.deepEqual(unavailableDurable.items, []);
+assert.equal(unavailableDurable.totalApproximate, true,
+  'an unavailable durable store must expose the hot-ring result as approximate');
+assert.equal(unavailableDurable.storageFallback, 'hot_ring',
+  'an unavailable durable store must identify its fallback source');
+
+const pinnedEvent = {
+  schemaVersion: 'anysentry.agent_event.v1',
+  eventId: 'event-pinned',
+  at: 201,
+  eventKind: 'ToolExec',
+  eventCategory: 'tool',
+  source: 'observer',
+  subject: 'pinned evidence',
+  workspacePath: '/workspace',
+  agentId: 'agent-a',
+  collectorId: 'collector-current',
+  sourceId: 'source-current',
+  sessionId: 'session-a',
+  userId: 'user-a',
+  traceId: 'trace-a',
+  spanId: 'span-a',
+  runId: 'run-a',
+  decisionStatus: 'succeeded',
+  decisionUpdatedAt: 202,
+  verdict: 'allow',
+  tier: 'Rules',
+  severity: 'info',
+  reason: 'retained',
+  riskCategory: 'other',
+  riskName: 'none',
+  riskType: 'atomic',
+  riskScore: 0,
+  tokenCount: 0,
+  latencyMs: 0,
+  attributes: {},
+};
+let pinnedStoredQuery;
+const pinnedAggregation = new AggregationService(
+  {
+    storageStatus: () => ({ clickhouseReady: true }),
+    searchStoredEvents: async (query) => {
+      pinnedStoredQuery = query;
+      return [pinnedEvent];
+    },
+    query: () => [pinnedEvent],
+    queryRange: () => [],
+  },
+  {
+    canonicalAgentAssetId: (value) => value,
+    resolveEvent: () => ({
+      agentAssetId: 'asset-a',
+      displayName: 'Agent A',
+      detectedName: 'Agent A',
+      detectedClassification: 'probable_agent',
+      effectiveClassification: 'probable_agent',
+    }),
+  },
+  {},
+  {},
+);
+const pinnedResult = await pinnedAggregation.storedAgentEvents({
+  timeType: 'custom',
+  startTime: '1970-01-01T00:00:00.100Z',
+  endTime: '1970-01-01T00:00:00.200Z',
+  eventId: pinnedEvent.eventId,
+  sourceId: 'source-obsolete',
+  verdict: 'block',
+  tier: 'Agent',
+  limit: 5,
+});
+assert.equal(pinnedResult.items[0]?.eventId, pinnedEvent.eventId,
+  'a pinned evidence event must override stale list filters and the custom end time');
+assert.equal(pinnedStoredQuery.eventId, pinnedEvent.eventId);
+assert.equal(pinnedStoredQuery.sinceMs, 0);
+assert.ok(pinnedStoredQuery.untilMs > pinnedEvent.at);
+assert.equal(pinnedStoredQuery.sourceId, undefined);
+assert.equal(pinnedStoredQuery.verdict, undefined);
+assert.equal(pinnedStoredQuery.tier, undefined);
+
+const customRangeCalls = [];
+const customWindowAggregation = new AggregationService(
+  {
+    storageStatus: () => ({ clickhouseReady: true }),
+    searchStoredEvents: async () => [],
+    queryRange: (start, end) => {
+      customRangeCalls.push([start, end]);
+      return [];
+    },
+  },
+  {},
+  {},
+  {},
+);
+const customWindowResult = await customWindowAggregation.storedAgentEvents({
+  timeType: 'custom',
+  startTime: '1970-01-01T00:00:00.100Z',
+  endTime: '1970-01-01T00:00:00.200Z',
+  limit: 5,
+});
+assert.deepEqual(customWindowResult.items, []);
+assert.ok(customRangeCalls.length >= 1);
+assert.ok(customRangeCalls.every(([start, end]) => start === 100 && end === 200),
+  'custom durable hot-ring reads must preserve the closed requested interval');
 
 console.log('ClickHouse bounded dashboard query verification passed');

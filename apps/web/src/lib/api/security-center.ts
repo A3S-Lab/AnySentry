@@ -444,6 +444,7 @@ export interface AgentEventList {
   items: AgentEventListItem[];
   total: number;
   totalApproximate?: boolean;
+  storageFallback?: "hot_ring";
   updateTime: string;
 }
 
