@@ -918,6 +918,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       scope: ['all', 'shadow', 'agent', 'decoupled'].includes(rawFilter.scope ?? '')
         ? (rawFilter.scope as import('./types').CollectorFilterMetrics['scope'])
         : 'decoupled',
+      shutdownFinal: rawFilter.shutdownFinal === true,
       filterMode: rawFilter.filterMode === 'enforce' ? 'enforce' : 'shadow',
       retainUnknown: rawFilter.retainUnknown !== false,
       retainNonAgent: rawFilter.retainNonAgent === true,

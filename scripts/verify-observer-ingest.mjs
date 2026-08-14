@@ -908,6 +908,41 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       health.items?.[0]?.filterMetrics?.processProcReads === 1,
     health,
   );
+  assert(
+    'enriched heartbeat without a shutdown-final marker defaults to false',
+    health.items?.[0]?.filterMetrics?.shutdownFinal === false,
+    health,
+  );
+}
+
+async function verifyShutdownFinalHeartbeatIsPreserved(sourceId, token) {
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const result = await request('/collectors/heartbeat', 'POST', {
+    sourceId,
+    token,
+    sourceName: `${runId} observer forwarder`,
+    sourceType: 'observer',
+    collectorId: `${runId}-collector`,
+    nodeName: `${runId}-node-shutdown-final`,
+    mode: 'observer-forwarder',
+    status: 'ok',
+    intervalSecs: 30,
+    filterMetrics: {
+      scope: 'shadow',
+      filterMode: 'shadow',
+      shutdownFinal: true,
+      observed: 0,
+    },
+  });
+  assert('enriched shutdown-final heartbeat is accepted', result.accepted === true, result);
+  const health = await request('/collectors/health', 'POST', { timeType: 'last_30d', collectorId: `${runId}-collector`, limit: 5 });
+  assert(
+    'Collector health preserves an explicit shutdown-final marker',
+    health.total === 1 &&
+      health.items?.[0]?.nodeName === `${runId}-node-shutdown-final` &&
+      health.items?.[0]?.filterMetrics?.shutdownFinal === true,
+    health,
+  );
 }
 
 async function verifyRawHeartbeatPreservesForwarderMetrics(sourceId, token) {
@@ -1052,6 +1087,7 @@ async function verifyExplicitForwarderMetricsReplacePrevious(sourceId, token) {
     filterMetrics: {
       scope: 'shadow',
       filterMode: 'shadow',
+      shutdownFinal: false,
       observed: 0,
       wouldFilterNonAgent: 0,
       e2eFilterReceipts: [],
@@ -1070,6 +1106,11 @@ async function verifyExplicitForwarderMetricsReplacePrevious(sourceId, token) {
       health.items?.[0]?.windowErrorMaxima?.outputDropped === 1 &&
       health.items?.[0]?.windowErrorMaxima?.errorCount === 1 &&
       !health.items?.[0]?.filterMetrics?.e2eFilterReceipts?.length,
+    health,
+  );
+  assert(
+    'a subsequent explicit non-final heartbeat clears the shutdown-final marker',
+    health.items?.[0]?.filterMetrics?.shutdownFinal === false,
     health,
   );
 }
@@ -1110,6 +1151,7 @@ async function main() {
   await verifyDirectForwarderHeartbeat(source.sourceId, token);
   await verifyCollectorSourceIsolation(source.sourceId);
   await verifyRawHeartbeatPreservesForwarderMetrics(source.sourceId, token);
+  await verifyShutdownFinalHeartbeatIsPreserved(source.sourceId, token);
   await verifyExplicitForwarderMetricsReplacePrevious(source.sourceId, token);
   await verifySourceRollup(source.sourceId);
 

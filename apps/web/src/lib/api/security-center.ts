@@ -1732,6 +1732,8 @@ export interface CollectorHeartbeatRequest {
 export interface CollectorFilterMetrics {
   /** @deprecated Compatibility marker for pre-decoupling forwarders. */
   scope: "all" | "shadow" | "agent" | "decoupled";
+  /** True only for the Forwarder heartbeat emitted after its final snapshot and event drain. */
+  shutdownFinal?: boolean;
   filterMode?: "enforce" | "shadow";
   retainUnknown?: boolean;
   retainNonAgent?: boolean;

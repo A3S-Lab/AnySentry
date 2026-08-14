@@ -26,6 +26,22 @@ function event(session, kind, payload) {
   });
 }
 
+function collectorHeartbeat(collectorId) {
+  return JSON.stringify({
+    identity: { agent: null, task: null, session: null },
+    event: {
+      CollectorHeartbeat: {
+        collector_id: collectorId,
+        version: 'fixture',
+        mode: 'observe',
+        interval_secs: 1,
+        dropped: 0,
+        output_dropped: 0,
+      },
+    },
+  });
+}
+
 function acceptedBatchAck(events) {
   return {
     accepted: events.length > 0,
@@ -201,9 +217,10 @@ async function runConfig(label, env = {}, inputLines, options = {}) {
   });
   await new Promise((resolve) => server.close(resolve));
   assert.equal(exitCode, 0, stderr);
+  const expectedObserved = options.expectedObserved ?? lines.length;
   const heartbeat = [...heartbeats]
     .reverse()
-    .find((candidate) => candidate.filterMetrics?.observed === lines.length);
+    .find((candidate) => candidate.filterMetrics?.observed === expectedObserved);
   assert.ok(heartbeat, `missing structured ${label} heartbeat: ${JSON.stringify(heartbeats)}`);
   return { batches, batchRequests, batchRequestBytes, heartbeat };
 }
@@ -346,6 +363,7 @@ async function runHungShutdownScenario() {
   let hangingBatchSocket;
   let hangControlTraffic = false;
   let hungHeartbeats = 0;
+  let hungIdentitySnapshots = 0;
   let signalAt = 0;
   let child;
   let childExit;
@@ -361,6 +379,12 @@ async function runHungShutdownScenario() {
     });
   };
 
+  const occupyControlSocket = (request, response) => {
+    hungControlSockets.add(request.socket);
+    if (hungControlSockets.size === 4) controlAgentSaturated.resolve();
+    hangResponseBody(response);
+  };
+
   const server = http.createServer((request, response) => {
     let body = '';
     request.setEncoding('utf8');
@@ -370,6 +394,23 @@ async function runHungShutdownScenario() {
     request.on('end', () => {
       const parsed = body ? JSON.parse(body) : {};
       const receivedAt = Date.now();
+      if (request.url === '/security-center/identity/snapshot') {
+        response.writeHead(200, { 'Content-Type': 'application/json' });
+        if (hangControlTraffic && hungIdentitySnapshots < 1) {
+          hungIdentitySnapshots++;
+          occupyControlSocket(request, response);
+          return;
+        }
+        response.end(JSON.stringify({
+          schemaVersion: 'anysentry.workload_identity_snapshot.v1',
+          version: 1,
+          generatedAt: new Date().toISOString(),
+          ready: true,
+          errors: 0,
+          entries: [],
+        }));
+        return;
+      }
       if (request.url === '/security-center/ingest/batch') {
         hangingBatchSocket = request.socket;
         hangingBatchSocket.once('close', () => hangingBatchClosed.resolve());
@@ -387,9 +428,8 @@ async function runHungShutdownScenario() {
         if (runtimeSnapshots.length === 1) initialRuntimeSnapshot.resolve(record);
         if (runtimeSnapshots.length === 2 && hangingBatchSocket && !hangingBatchSocket.destroyed) {
           hangControlTraffic = true;
-          hungControlSockets.add(request.socket);
           snapshotWhileBatchOpen.resolve(record);
-          hangResponseBody(response);
+          occupyControlSocket(request, response);
           return;
         }
         response.end('{"accepted":true,"applied":true,"duplicate":false}');
@@ -404,11 +444,9 @@ async function runHungShutdownScenario() {
           hangResponseBody(response);
           return;
         }
-        if (hangControlTraffic && hungHeartbeats < 3) {
+        if (hangControlTraffic && hungHeartbeats < 2) {
           hungHeartbeats++;
-          hungControlSockets.add(request.socket);
-          if (hungHeartbeats === 3) controlAgentSaturated.resolve();
-          hangResponseBody(response);
+          occupyControlSocket(request, response);
           return;
         }
         response.end('{"accepted":true}');
@@ -444,7 +482,7 @@ async function runHungShutdownScenario() {
         ANYSENTRY_IDENTITY_SNAPSHOT_URL: `${base}/identity/snapshot`,
         ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL: `${base}/runtime/snapshot`,
         ANYSENTRY_AGENT_RUNTIME_LEASE_URL: `${base}/runtime/lease`,
-        ANYSENTRY_IDENTITY_SNAPSHOT_SECS: '0',
+        ANYSENTRY_IDENTITY_SNAPSHOT_SECS: '0.05',
         ANYSENTRY_HEARTBEAT_SECS: '0.05',
         ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_SECS: '1',
         ANYSENTRY_AGENT_RUNTIME_LIVENESS_SECS: '300',
@@ -478,6 +516,8 @@ async function runHungShutdownScenario() {
     assert.equal(hangingBatchSocket.destroyed, false);
     assert.notEqual(snapshotDuringHang.socket, hangingBatchSocket);
     assert.equal(hungControlSockets.size, 4, 'fixture must occupy every control Agent socket');
+    assert.equal(hungHeartbeats, 2, 'fixture must include two in-flight periodic heartbeats');
+    assert.equal(hungIdentitySnapshots, 1, 'fixture must include one in-flight identity request');
     for (const socket of hungControlSockets) assert.notEqual(socket, hangingBatchSocket);
 
     const preSignalSnapshotVersion = snapshotDuringHang.body.snapshotVersion ?? 0;
@@ -494,10 +534,27 @@ async function runHungShutdownScenario() {
       'graceful SIGTERM must publish a final runtime snapshot',
     );
     const finalHeartbeat = heartbeats.find((record) =>
-      record.receivedAt >= signalAt && record.body.outputDropped >= 1);
-    assert.ok(finalHeartbeat, `missing final dropped-event heartbeat: ${JSON.stringify(heartbeats.map((item) => item.body))}`);
-    assert.ok(finalHeartbeat.body.errorCount >= 1);
+      record.receivedAt >= signalAt &&
+      record.body.filterMetrics?.shutdownFinal === true);
+    assert.ok(finalHeartbeat, `missing final dropped-event heartbeat: ${JSON.stringify(heartbeats.map((item) => ({
+      receivedAt: item.receivedAt,
+      shutdownFinal: item.body.filterMetrics?.shutdownFinal,
+      outputDropped: item.body.outputDropped,
+      errorCount: item.body.errorCount,
+      identityErrors: item.body.filterMetrics?.identityErrors,
+      runtimeSnapshotErrors: item.body.filterMetrics?.runtimeSnapshotErrors,
+    })))}`);
+    assert.equal(finalHeartbeat.body.outputDropped, 1);
+    assert.equal(finalHeartbeat.body.errorCount, 1);
     assert.equal(finalHeartbeat.body.filterMetrics?.queueDropped, 0);
+    assert.equal(finalHeartbeat.body.filterMetrics?.identityErrors, 0);
+    assert.equal(finalHeartbeat.body.filterMetrics?.runtimeSnapshotErrors, 0);
+    assert.equal(finalHeartbeat.body.filterMetrics?.runtimeLeaseErrors, 0);
+    assert.equal(
+      heartbeats.some((record) => record.receivedAt < signalAt && record.body.filterMetrics?.shutdownFinal === true),
+      false,
+      'periodic heartbeats must never claim to be the final shutdown heartbeat',
+    );
   } finally {
     if (child && !childExit) child.kill('SIGKILL');
     child?.stdin.destroy();
@@ -747,6 +804,19 @@ assert.equal(safeDefault.heartbeat.filterMetrics.filterMode, 'shadow');
 assert.equal(safeDefault.batches.length, 6, 'an unset filter mode must fail safe to shadow');
 assert.equal(safeDefault.heartbeat.filterMetrics.filteredNonAgent, 0);
 assert.equal(safeDefault.heartbeat.filterMetrics.wouldFilterNonAgent, 1);
+
+const rawHeartbeatLine = collectorHeartbeat('raw-control-heartbeat');
+const rawHeartbeat = await runConfig('raw-control-heartbeat', {
+  FORWARD_FILTER_MODE: 'enforce',
+  FORWARD_RETAIN_UNKNOWN: 'false',
+}, [rawHeartbeatLine], { expectedObserved: 0 });
+assert.equal(rawHeartbeat.batches.length, 1, 'raw CollectorHeartbeat must bypass Agent filtering');
+assert.equal(rawHeartbeat.batches[0].line, rawHeartbeatLine);
+assert.equal(rawHeartbeat.batches[0].attribution, undefined, 'raw heartbeat must not gain Agent attribution');
+assert.equal(rawHeartbeat.heartbeat.filterMetrics.observed, 0, 'raw heartbeat is not Agent activity');
+assert.equal(rawHeartbeat.heartbeat.filterMetrics.unknown, 0, 'raw heartbeat is not an unknown Agent');
+assert.equal(rawHeartbeat.heartbeat.filterMetrics.forwarded, 0, 'raw heartbeat is not an Agent forward count');
+assert.equal(rawHeartbeat.heartbeat.filterMetrics.discoveryBudgetDropped, 0);
 
 const defaultRetention = await runConfig('default');
 assert.equal(defaultRetention.batches.length, 4);

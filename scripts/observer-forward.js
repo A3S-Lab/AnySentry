@@ -120,6 +120,7 @@ const SHUTDOWN_TIMEOUT_MS = boundedNumber(
   2_000,
   30_000,
 );
+const GRACEFUL_SHUTDOWN_SUPERSEDE = 'control request superseded by graceful shutdown';
 function envBoolean(value, fallback) {
   if (value === undefined || value === '') return fallback;
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
@@ -412,20 +413,22 @@ function postJson(url, bodyObj, timeoutMs, done) {
   let absoluteTimer;
   let req;
   let response;
+  let abortReason = '';
   const state = {
-    abort() {
+    abort(reason = 'control request aborted') {
       if (settled) return;
+      abortReason = reason;
       response?.destroy();
       req?.destroy();
-      finish(true);
+      finish(true, reason);
     },
   };
-  const finish = (failed) => {
+  const finish = (failed, reason) => {
     if (settled) return;
     settled = true;
     if (absoluteTimer) clearTimeout(absoluteTimer);
     activeControlRequests.delete(state);
-    done(Boolean(failed));
+    done(Boolean(failed), abortReason || reason);
   };
   req = transport.request(
     {
@@ -693,9 +696,11 @@ function postJsonResponse(url, bodyObj, timeoutMs, done) {
   let absoluteTimer;
   let req;
   let response;
+  let abortReason = '';
   const state = {
     abort(reason = 'control endpoint request aborted') {
       if (settled) return;
+      abortReason = reason;
       response?.destroy();
       req?.destroy();
       finish(new Error(reason));
@@ -706,7 +711,7 @@ function postJsonResponse(url, bodyObj, timeoutMs, done) {
     settled = true;
     if (absoluteTimer) clearTimeout(absoluteTimer);
     activeControlRequests.delete(state);
-    done(error, value);
+    done(abortReason ? new Error(abortReason) : error, value);
   };
   req = transport.request(
     {
@@ -782,9 +787,11 @@ function getJson(url, timeoutMs, done) {
   let absoluteTimer;
   let req;
   let response;
+  let abortReason = '';
   const state = {
     abort(reason = 'identity snapshot request aborted') {
       if (settled) return;
+      abortReason = reason;
       response?.destroy();
       req?.destroy();
       finish(new Error(reason));
@@ -795,7 +802,7 @@ function getJson(url, timeoutMs, done) {
     settled = true;
     if (absoluteTimer) clearTimeout(absoluteTimer);
     activeControlRequests.delete(state);
-    done(error, value);
+    done(abortReason ? new Error(abortReason) : error, value);
   };
   req = transport.request(
     {
@@ -851,6 +858,7 @@ function getJson(url, timeoutMs, done) {
 
 function refreshIdentitySnapshot() {
   getJson(identitySnapshotTarget, 5000, (error, snapshot) => {
+    if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) return;
     if (error || !workloadCache.replace(snapshot)) {
       if (error) workloadCache.errors++;
     }
@@ -907,6 +915,7 @@ async function acquireRuntimeLease(maxAttempts = 1) {
     for (let attempt = 0; attempt < attempts && !closing; attempt += 1) {
       const result = await runtimeLeaseRequest();
       if (result.ok) return true;
+      if (closing && result.reason === GRACEFUL_SHUTDOWN_SUPERSEDE) return false;
       runtimeLeaseErrors++;
       errorCount++;
       lastRuntimeSnapshotError = result.reason;
@@ -1076,7 +1085,7 @@ function requestReconciliation() {
   reconcileTimer.unref();
 }
 
-function sendHeartbeat(done = () => {}, timeoutMs = 5_000) {
+function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false) {
   if (!HEARTBEAT_SECS) {
     done(false);
     return;
@@ -1132,6 +1141,10 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000) {
       errorCount: errors,
       filterMetrics: {
         scope: LEGACY_FORWARD_SCOPE ?? 'decoupled',
+        // A periodic heartbeat can race with shutdown. Mark only the heartbeat emitted after the
+        // final runtime snapshot and bounded event drain so lifecycle checks cannot accept an
+        // ordinary interval heartbeat as shutdown evidence.
+        shutdownFinal,
         filterMode: FILTER_MODE,
         retainUnknown: RETAIN_UNKNOWN,
         retainNonAgent: RETAIN_NON_AGENT,
@@ -1230,8 +1243,11 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000) {
       ...sourceFields(),
     },
     timeoutMs,
-    (failed) => {
-      if (failed) {
+    (failed, reason) => {
+      const intentionallySuperseded = !shutdownFinal
+        && closing
+        && reason === GRACEFUL_SHUTDOWN_SUPERSEDE;
+      if (failed && !intentionallySuperseded) {
         outputDropped++;
         errorCount++;
       }
@@ -1307,7 +1323,7 @@ function flushPending() {
   if (pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
 }
 
-function enqueue(body, priority) {
+function enqueue(body, priority, countForwarded = true) {
   let bytes;
   try {
     bytes = Buffer.byteLength(JSON.stringify(body));
@@ -1344,7 +1360,7 @@ function enqueue(body, priority) {
     outputDropped++;
     attributionCounts.queueDropped++;
   }
-  attributionCounts.forwarded++;
+  if (countForwarded) attributionCounts.forwarded++;
   if (pending.length >= BATCH_SIZE) flushPending();
   else scheduleBatch();
   if (pending.length >= MAX_QUEUE || inflight >= MAX_INFLIGHT) rl.pause();
@@ -1369,13 +1385,13 @@ function finishShutdownControlPlane() {
   // higher-version snapshot. The shutdown force timer remains the outer wall-clock deadline.
   runtimeSnapshotOperation += 1;
   runtimeSnapshotInFlight = false;
-  abortActiveControlRequests('control request superseded by graceful shutdown');
+  abortActiveControlRequests(GRACEFUL_SHUTDOWN_SUPERSEDE);
   const snapshotTimeout = Math.min(5_000, Math.max(100, Math.floor(remainingShutdownMs() / 2)));
   // The API derives `unobserved` when this forwarder stops reporting. A ready snapshot is
   // intentionally monotonic, so do not attempt to regress it during graceful shutdown.
   sendRuntimeSnapshot(true, () => {
     const heartbeatTimeout = Math.min(5_000, remainingShutdownMs());
-    sendHeartbeat(() => closeTransports(), heartbeatTimeout);
+    sendHeartbeat(() => closeTransports(), heartbeatTimeout, true);
   }, snapshotTimeout);
 }
 
@@ -1434,6 +1450,24 @@ function handleLine(raw) {
   if (!line) return;
   let o;
   try { o = JSON.parse(line); } catch { return; } // skip the collector's human log lines / partials
+  const kind = eventKind(o);
+  if (kind === 'CollectorHeartbeat') {
+    // Collector health is control-plane telemetry, not Agent activity. It must reach the raw
+    // heartbeat ingest seam even when Enforce suppresses unknown workloads, and it must not
+    // inflate Agent observed/unknown/forwarded classification counters.
+    enqueue(
+      {
+        line,
+        sourceEventId: sourceEventId(line),
+        ...(COLLECTOR_ID ? { collectorId: COLLECTOR_ID } : {}),
+        ...(NODE_NAME ? { nodeName: NODE_NAME } : {}),
+        ...sourceFields(''),
+      },
+      5,
+      false,
+    );
+    return;
+  }
   attributionCounts.observed++;
   if (toolExecDeduper.isDuplicate(o)) {
     attributionCounts.deduplicated++;
@@ -1475,7 +1509,6 @@ function handleLine(raw) {
   if (classification.workspaceConflict || classification.attribution?.conflict) {
     attributionCounts.workspaceConflict++;
   }
-  const kind = eventKind(o);
   let filterReason = '';
   if (classification.state === 'non_agent' && !RETAIN_NON_AGENT) {
     filterReason = 'non_agent';
