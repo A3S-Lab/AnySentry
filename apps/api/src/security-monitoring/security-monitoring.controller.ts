@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Get, Headers, HttpCode, NotFoundException, Param, Post, Put, Query, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Headers, HttpCode, NotFoundException, Param, PayloadTooLargeException, Post, Put, Query, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { Observable, map, timer } from 'rxjs';
@@ -46,6 +46,20 @@ interface IngestBody extends Partial<T.EventMeta> {
 
 interface ObserverBatchIngestBody {
   events?: IngestBody[];
+}
+
+const CLICKHOUSE_EVENT_BUFFER_FULL = 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL';
+const OBSERVER_BATCH_RETRY_AFTER_MS = 1_000;
+
+function isClickHouseEventBufferFull(error: unknown): boolean {
+  return Boolean(
+    error &&
+    typeof error === 'object' &&
+    'code' in error &&
+    (error as { code?: unknown }).code === CLICKHOUSE_EVENT_BUFFER_FULL &&
+    'retrySafe' in error &&
+    (error as { retrySafe?: unknown }).retrySafe === true,
+  );
 }
 
 interface RejectedIngestContext {
@@ -5052,14 +5066,36 @@ export class SecurityMonitoringController {
 
   /** Bounded raw-Observer batch seam used by the node forwarder. */
   @Post('ingest/batch')
-  async ingestBatch(@Body() body: ObserverBatchIngestBody = {}, @Headers() headers: HeaderBag) {
-    const events = Array.isArray(body.events) ? body.events.slice(0, 256) : [];
-    const items: unknown[] = [];
+  async ingestBatch(
+    @Body() body: ObserverBatchIngestBody = {},
+    @Headers() headers: HeaderBag,
+  ): Promise<T.ObserverBatchIngestResult> {
+    const events = Array.isArray(body.events) ? body.events : [];
+    if (events.length > 256) {
+      // Reject before processing any prefix. The Forwarder may safely split an HTTP 413 only when
+      // the controller has consumed zero items; truncating here would make its retry ambiguous.
+      throw new PayloadTooLargeException('observer batch exceeds 256 events');
+    }
+    const items: T.ObserverBatchIngestResultItem[] = [];
     let acceptedEvents = 0;
     let discardedEvents = 0;
+    let rejectedEvents = 0;
+    let retryableEvents = 0;
+    let capacityReached = false;
     for (let index = 0; index < events.length; index += 1) {
       const event = events[index];
+      if (capacityReached) {
+        retryableEvents += 1;
+        items.push({
+          index,
+          accepted: false,
+          disposition: 'retryable',
+          reasonCode: 'clickhouse_event_buffer_full',
+        });
+        continue;
+      }
       if (!event || typeof event.line !== 'string' || !event.line.trim()) {
+        rejectedEvents += 1;
         items.push({
           index,
           accepted: false,
@@ -5069,25 +5105,45 @@ export class SecurityMonitoringController {
         });
         continue;
       }
-      const result = await this.ingest(event, headers);
+      let result: Awaited<ReturnType<SecurityMonitoringController['ingest']>>;
+      try {
+        result = await this.ingest(event, headers);
+      } catch (error) {
+        if (!isClickHouseEventBufferFull(error)) throw error;
+        capacityReached = true;
+        retryableEvents += 1;
+        items.push({
+          index,
+          accepted: false,
+          disposition: 'retryable',
+          reasonCode: 'clickhouse_event_buffer_full',
+        });
+        continue;
+      }
       const declaredDisposition = 'disposition' in result ? result.disposition : undefined;
       const discarded = declaredDisposition === 'discarded';
       const accepted = result.accepted === true || discarded;
-      const disposition = declaredDisposition ?? (accepted ? 'retained' : 'rejected');
+      const disposition: T.ObserverBatchIngestDisposition = discarded
+        ? 'discarded'
+        : accepted
+          ? 'retained'
+          : 'rejected';
       if (accepted) acceptedEvents += 1;
       if (discarded) discardedEvents += 1;
+      if (!accepted) rejectedEvents += 1;
       // `/ingest` keeps its historical accepted=false contract for policy discards. At the batch
       // transport seam, accepted instead means the envelope was successfully consumed; disposition
       // tells the Forwarder whether it was retained or deliberately discarded before L1.
       items.push({ index, ...result, accepted, disposition });
     }
-    const submittedEvents = Array.isArray(body.events) ? body.events.length : 0;
     return {
       accepted: acceptedEvents > 0,
       acceptedEvents,
       retainedEvents: acceptedEvents - discardedEvents,
       discardedEvents,
-      rejectedEvents: submittedEvents - acceptedEvents,
+      rejectedEvents,
+      retryableEvents,
+      ...(retryableEvents > 0 ? { retryAfterMs: OBSERVER_BATCH_RETRY_AFTER_MS } : {}),
       items,
     };
   }

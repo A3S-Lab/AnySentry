@@ -68,4 +68,16 @@ assert.equal(accounted.totalWeight, 13);
 assert.equal(accounted.clear(), 1);
 assert.equal(accounted.totalWeight, 0);
 
+const released = new BoundedPriorityQueue(2_000, 5);
+for (let index = 0; index < 1_100; index++) {
+  released.push({ index, body: `event-${index}` }, 3);
+}
+assert.equal(released.take(1_000).length, 1_000);
+assert.equal(released.buckets[3].head, 1_000, 'fixture must remain below the compaction threshold');
+assert.ok(
+  released.buckets[3].items.slice(0, released.buckets[3].head).every((item) => item === undefined),
+  'consumed queue slots must release event body references before compaction',
+);
+assert.equal(released.buckets[3].items[released.buckets[3].head].index, 1_000);
+
 console.log('Priority queue verification passed');

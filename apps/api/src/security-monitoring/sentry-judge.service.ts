@@ -604,7 +604,21 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         decisionUpdatedAt: Date.now(),
         reason: '研判队列不可用: ' + (error instanceof Error ? error.message : String(error)).slice(0, 500),
       };
-      await this.ch.insertNow(failed);
+      try {
+        await this.ch.insertNow(failed);
+      } catch (persistError) {
+        // `pending` was already durably accepted above. Do not let a secondary failure-revision
+        // write replace the primary queue error with EVENT_BUFFER_FULL: the batch controller may
+        // retry only an event that was provably never accepted. Keep the in-memory state accurate
+        // and retain both causes in the log for diagnosis.
+        console.error('[judge] failed to persist asynchronous judgment failure revision', {
+          eventId: pending.eventId,
+          queueError: error instanceof Error ? error.message.split('\n')[0].slice(0, 300) : String(error).slice(0, 300),
+          persistError: persistError instanceof Error
+            ? persistError.message.split('\n')[0].slice(0, 300)
+            : String(persistError).slice(0, 300),
+        });
+      }
       this.upsertMemory(failed, false);
       throw error;
     }
@@ -990,6 +1004,24 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       queueDropped: clamp(rawFilter.queueDropped),
       batches: clamp(rawFilter.batches),
       batchEvents: clamp(rawFilter.batchEvents),
+      retryQueued: clamp(rawFilter.retryQueued),
+      retryAttempts: clamp(rawFilter.retryAttempts),
+      retryRecovered: clamp(rawFilter.retryRecovered),
+      retryExhausted: clamp(rawFilter.retryExhausted),
+      queueBytes: clamp(rawFilter.queueBytes),
+      inflightEvents: clamp(rawFilter.inflightEvents),
+      inflightBytes: clamp(rawFilter.inflightBytes),
+      inflightOldestAgeMs: clamp(rawFilter.inflightOldestAgeMs),
+      retryQueueDepth: clamp(rawFilter.retryQueueDepth),
+      retryQueueBytes: clamp(rawFilter.retryQueueBytes),
+      retryOutstandingEvents: clamp(rawFilter.retryOutstandingEvents),
+      retryOutstandingBytes: clamp(rawFilter.retryOutstandingBytes),
+      retryOldestAgeMs: clamp(rawFilter.retryOldestAgeMs),
+      outstandingEvents: clamp(rawFilter.outstandingEvents),
+      outstandingBytes: clamp(rawFilter.outstandingBytes),
+      outstandingOldestAgeMs: clamp(rawFilter.outstandingOldestAgeMs),
+      outstandingEventLimit: clamp(rawFilter.outstandingEventLimit),
+      outstandingByteLimit: clamp(rawFilter.outstandingByteLimit),
       identitySnapshotReady: rawFilter.identitySnapshotReady === true,
       identitySnapshotVersion: clamp(rawFilter.identitySnapshotVersion),
       identitySnapshotAgeSeconds: clamp(rawFilter.identitySnapshotAgeSeconds),

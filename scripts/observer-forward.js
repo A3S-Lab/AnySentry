@@ -81,7 +81,6 @@ function boundedNumber(value, fallback, min, max) {
 const MAX_INFLIGHT = boundedNumber(process.env.FORWARD_MAX_INFLIGHT, 8, 1, 64);
 const BATCH_SIZE = boundedNumber(process.env.FORWARD_BATCH_SIZE, 32, 1, 256);
 const BATCH_FLUSH_MS = boundedNumber(process.env.FORWARD_BATCH_FLUSH_MS, 50, 1, 5_000);
-const MAX_QUEUE = boundedNumber(process.env.FORWARD_MAX_QUEUE, 4_096, BATCH_SIZE, 100_000);
 // Leave at least 1 MiB for the batch envelope below the API route's default 4 MiB parser ceiling.
 const BATCH_MAX_BYTES = boundedNumber(
   process.env.FORWARD_BATCH_MAX_BYTES,
@@ -95,12 +94,31 @@ const MAX_EVENT_BYTES = boundedNumber(
   64 * 1024,
   3 * 1024 * 1024,
 );
-const MAX_QUEUE_BYTES = boundedNumber(
-  process.env.FORWARD_MAX_QUEUE_BYTES,
-  16 * 1024 * 1024,
-  Math.max(BATCH_MAX_BYTES, MAX_EVENT_BYTES),
-  256 * 1024 * 1024,
+// This cap covers every event owned by the forwarder, regardless of whether it is waiting in the
+// priority queue, inside an HTTP request, or waiting for an API-authorized retry. Keeping the
+// retry budget separate would let a prolonged ClickHouse outage silently multiply memory. Legacy
+// FORWARD_MAX_QUEUE(_BYTES) remain compatibility aliases for the unified limits; new names win.
+const MAX_OUTSTANDING_EVENTS = boundedNumber(
+  process.env.FORWARD_MAX_OUTSTANDING_EVENTS || process.env.FORWARD_MAX_QUEUE,
+  16_384,
+  1,
+  1_000_000,
 );
+const MAX_OUTSTANDING_BYTES = boundedNumber(
+  process.env.FORWARD_MAX_OUTSTANDING_BYTES || process.env.FORWARD_MAX_QUEUE_BYTES,
+  64 * 1024 * 1024,
+  1024,
+  1024 * 1024 * 1024,
+);
+const RETRY_BASE_DELAY_MS = boundedNumber(process.env.FORWARD_RETRY_BASE_DELAY_MS, 250, 10, 2_000);
+const RETRY_MAX_DELAY_MS = boundedNumber(
+  process.env.FORWARD_RETRY_MAX_DELAY_MS,
+  2_000,
+  RETRY_BASE_DELAY_MS,
+  2_000,
+);
+const RETRY_MAX_AGE_MS = boundedNumber(process.env.FORWARD_RETRY_MAX_AGE_MS, 45_000, 100, 45_000);
+const RETRY_JITTER_RATIO = 0.2;
 const HTTP_TIMEOUT_MS = boundedNumber(process.env.FORWARD_HTTP_TIMEOUT_MS, 10_000, 1_000, 120_000);
 const BATCH_ACK_MAX_BYTES = boundedNumber(
   process.env.FORWARD_BATCH_ACK_MAX_BYTES,
@@ -251,7 +269,15 @@ const toolExecDeduper = new ToolExecDeduper({
 });
 
 let inflight = 0;
-const pending = new BoundedPriorityQueue(MAX_QUEUE, 5, (item) => item.bytes);
+let inflightEvents = 0;
+let inflightBytes = 0;
+let outstandingEvents = 0;
+let outstandingBytes = 0;
+let retryOutstandingEvents = 0;
+let retryOutstandingBytes = 0;
+const outstandingItems = new Set();
+const pending = new BoundedPriorityQueue(MAX_OUTSTANDING_EVENTS, 5, (item) => item.bytes);
+const retryTasks = [];
 const activeEventRequests = new Set();
 const activeControlRequests = new Set();
 let eventRequestsAborted = false;
@@ -278,6 +304,10 @@ let attributionCounts = {
   queueDropped: 0,
   batches: 0,
   batchEvents: 0,
+  retryQueued: 0,
+  retryAttempts: 0,
+  retryRecovered: 0,
+  retryExhausted: 0,
   workspaceConflict: 0,
   infrastructure: 0,
   deduplicated: 0,
@@ -288,8 +318,10 @@ let identitySnapshotTimer;
 let runtimeSnapshotTimer;
 let rootLivenessTimer;
 let batchTimer;
+let retryTimer;
 let shutdownForceTimer;
 let shutdownDeadline = 0;
+let eventDrainDeadline = 0;
 let shutdownFinalizing = false;
 let transportsClosed = false;
 let signatureReloader;
@@ -487,58 +519,94 @@ function postJson(url, bodyObj, timeoutMs, done) {
   req.end(body);
 }
 
-function validateBatchAck(value, batchLength) {
+function invalidBatchAck(batchLength, reason) {
+  return { dropped: batchLength, errors: 1, retryItems: [], reason };
+}
+
+function validateBatchAck(value, batch) {
+  const batchLength = batch.length;
   const ack = value?.data ?? value;
   if (!ack || typeof ack !== 'object' || Array.isArray(ack)) {
-    return { dropped: batchLength, errors: 1, reason: 'batch endpoint returned no acknowledgement' };
+    return invalidBatchAck(batchLength, 'batch endpoint returned no acknowledgement');
   }
   const acceptedEvents = ack.acceptedEvents;
   const rejectedEvents = ack.rejectedEvents;
+  const retryableEvents = ack.retryableEvents ?? 0;
   const items = ack.items;
   if (
     !Number.isSafeInteger(acceptedEvents) || acceptedEvents < 0
     || !Number.isSafeInteger(rejectedEvents) || rejectedEvents < 0
-    || acceptedEvents + rejectedEvents !== batchLength
+    || !Number.isSafeInteger(retryableEvents) || retryableEvents < 0
+    || acceptedEvents + rejectedEvents + retryableEvents !== batchLength
     || typeof ack.accepted !== 'boolean'
     || ack.accepted !== (acceptedEvents > 0)
     || !Array.isArray(items)
     || items.length !== batchLength
   ) {
-    return { dropped: batchLength, errors: 1, reason: 'batch endpoint returned an inconsistent acknowledgement' };
+    return invalidBatchAck(batchLength, 'batch endpoint returned an inconsistent acknowledgement');
+  }
+  if (
+    ack.retryAfterMs !== undefined
+    && (!Number.isSafeInteger(ack.retryAfterMs) || ack.retryAfterMs < 0 || retryableEvents === 0)
+  ) {
+    return invalidBatchAck(batchLength, 'batch endpoint returned an invalid retry delay');
   }
   let acceptedItems = 0;
   let retainedItems = 0;
   let discardedItems = 0;
+  let rejectedItems = 0;
+  const retryItems = [];
+  let sawRetryable = false;
   for (let index = 0; index < items.length; index++) {
     const item = items[index];
     if (
       !item || typeof item !== 'object' || Array.isArray(item)
       || item.index !== index || typeof item.accepted !== 'boolean'
     ) {
-      return { dropped: batchLength, errors: 1, reason: 'batch endpoint returned malformed item acknowledgements' };
+      return invalidBatchAck(batchLength, 'batch endpoint returned malformed item acknowledgements');
     }
     if (item.accepted) {
+      if (sawRetryable) {
+        return invalidBatchAck(batchLength, 'batch endpoint retryable items are not a contiguous suffix');
+      }
       acceptedItems++;
       if (item.disposition === undefined || item.disposition === 'retained') retainedItems++;
       else if (item.disposition === 'discarded') discardedItems++;
-      else return { dropped: batchLength, errors: 1, reason: 'batch endpoint returned an invalid accepted disposition' };
-    } else if (item.disposition !== undefined && item.disposition !== 'rejected') {
-      return { dropped: batchLength, errors: 1, reason: 'batch endpoint returned an invalid rejected disposition' };
+      else return invalidBatchAck(batchLength, 'batch endpoint returned an invalid accepted disposition');
+    } else if (item.disposition === 'retryable') {
+      if (item.reasonCode !== 'clickhouse_event_buffer_full') {
+        return invalidBatchAck(batchLength, 'batch endpoint returned an unrecognized retry reason');
+      }
+      sawRetryable = true;
+      retryItems.push(batch[index]);
+    } else if (item.disposition === undefined || item.disposition === 'rejected') {
+      if (sawRetryable) {
+        return invalidBatchAck(batchLength, 'batch endpoint retryable items are not a contiguous suffix');
+      }
+      rejectedItems++;
+    } else {
+      return invalidBatchAck(batchLength, 'batch endpoint returned an invalid rejected disposition');
     }
   }
-  if (acceptedItems !== acceptedEvents) {
-    return { dropped: batchLength, errors: 1, reason: 'batch endpoint acknowledgement counts do not match its items' };
+  if (
+    acceptedItems !== acceptedEvents
+    || rejectedItems !== rejectedEvents
+    || retryItems.length !== retryableEvents
+  ) {
+    return invalidBatchAck(batchLength, 'batch endpoint acknowledgement counts do not match its items');
   }
   if (
     (ack.retainedEvents !== undefined && (!Number.isSafeInteger(ack.retainedEvents) || ack.retainedEvents !== retainedItems))
     || (ack.discardedEvents !== undefined && (!Number.isSafeInteger(ack.discardedEvents) || ack.discardedEvents !== discardedItems))
     || (ack.retainedEvents !== undefined && ack.discardedEvents !== undefined && ack.retainedEvents + ack.discardedEvents !== acceptedEvents)
   ) {
-    return { dropped: batchLength, errors: 1, reason: 'batch endpoint disposition counts do not match its items' };
+    return invalidBatchAck(batchLength, 'batch endpoint disposition counts do not match its items');
   }
   return {
     dropped: rejectedEvents,
     errors: rejectedEvents > 0 ? 1 : 0,
+    retryItems,
+    retryAfterMs: ack.retryAfterMs,
     reason: rejectedEvents > 0 ? `batch endpoint rejected ${rejectedEvents} event(s)` : '',
   };
 }
@@ -649,21 +717,28 @@ function combineBatchOutcomes(left, right, extraErrors = 0) {
   return {
     dropped: left.dropped + right.dropped,
     errors: left.errors + right.errors + extraErrors,
+    retryItems: [...(left.retryItems ?? []), ...(right.retryItems ?? [])],
+    retryAfterMs: Math.max(left.retryAfterMs ?? 0, right.retryAfterMs ?? 0),
   };
 }
 
 /** A 413 is safe to retry because Express rejects the body before the controller processes it. */
-function deliverEventBatch(batch, done) {
+function deliverEventBatch(batch, done, absoluteDeadline = 0) {
   if (eventRequestsAborted) {
-    done({ dropped: batch.length, errors: batch.length > 0 ? 1 : 0 });
+    done({ dropped: batch.length, errors: batch.length > 0 ? 1 : 0, retryItems: [] });
     return;
   }
-  postEventBatch(batch, HTTP_TIMEOUT_MS, (result) => {
+  const remainingMs = absoluteDeadline > 0 ? absoluteDeadline - Date.now() : HTTP_TIMEOUT_MS;
+  if (remainingMs <= 0) {
+    done({ dropped: batch.length, errors: batch.length > 0 ? 1 : 0, retryItems: [] });
+    return;
+  }
+  postEventBatch(batch, Math.max(1, Math.min(HTTP_TIMEOUT_MS, remainingMs)), (result) => {
     // Once a 413 header is received the request was rejected for size, regardless of whether its
     // proxy-generated response body later truncates or aborts. Splitting remains safe and useful.
     if (result.statusCode === 413) {
       if (batch.length === 1) {
-        done({ dropped: 1, errors: 1 });
+        done({ dropped: 1, errors: 1, retryItems: [] });
         return;
       }
       const middle = Math.ceil(batch.length / 2);
@@ -672,28 +747,28 @@ function deliverEventBatch(batch, done) {
       deliverEventBatch(left, (leftOutcome) => {
         deliverEventBatch(right, (rightOutcome) => {
           done(combineBatchOutcomes(leftOutcome, rightOutcome, 1));
-        });
-      });
+        }, absoluteDeadline);
+      }, absoluteDeadline);
       return;
     }
     if (result.error) {
-      done({ dropped: batch.length, errors: 1 });
+      done({ dropped: batch.length, errors: 1, retryItems: [] });
       return;
     }
     if (result.statusCode < 200 || result.statusCode >= 300) {
-      done({ dropped: batch.length, errors: 1 });
+      done({ dropped: batch.length, errors: 1, retryItems: [] });
       return;
     }
     let parsed;
     try {
       parsed = result.responseBody ? JSON.parse(result.responseBody) : undefined;
     } catch {
-      done({ dropped: batch.length, errors: 1 });
+      done({ dropped: batch.length, errors: 1, retryItems: [] });
       return;
     }
-    const outcome = validateBatchAck(parsed, batch.length);
+    const outcome = validateBatchAck(parsed, batch);
     if (outcome.reason) console.error(`[observer-forward] ${outcome.reason}`);
-    done({ dropped: outcome.dropped, errors: outcome.errors });
+    done(outcome);
   });
 }
 
@@ -1157,6 +1232,40 @@ function requestReconciliation() {
   reconcileTimer.unref();
 }
 
+function eventQueueMetrics(now = Date.now()) {
+  let retryQueueDepth = 0;
+  let retryQueueBytes = 0;
+  let outstandingOldestAt = now;
+  let retryOldestAt = now;
+  let inflightOldestAt = now;
+  for (const task of retryTasks) {
+    retryQueueDepth += task.items.length;
+    retryQueueBytes += itemsBytes(task.items);
+  }
+  for (const item of outstandingItems) {
+    outstandingOldestAt = Math.min(outstandingOldestAt, item.createdAt || now);
+    if (item.retryOwned) retryOldestAt = Math.min(retryOldestAt, item.retryStartedAt || now);
+    if (item.inflightSince) inflightOldestAt = Math.min(inflightOldestAt, item.inflightSince);
+  }
+  return {
+    queueDepth: pending.length,
+    queueBytes: pending.totalWeight,
+    inflightEvents,
+    inflightBytes,
+    inflightOldestAgeMs: inflightEvents > 0 ? Math.max(0, now - inflightOldestAt) : 0,
+    retryQueueDepth,
+    retryQueueBytes,
+    retryOutstandingEvents,
+    retryOutstandingBytes,
+    retryOldestAgeMs: retryOutstandingEvents > 0 ? Math.max(0, now - retryOldestAt) : 0,
+    outstandingEvents,
+    outstandingBytes,
+    outstandingOldestAgeMs: outstandingEvents > 0 ? Math.max(0, now - outstandingOldestAt) : 0,
+    outstandingEventLimit: MAX_OUTSTANDING_EVENTS,
+    outstandingByteLimit: MAX_OUTSTANDING_BYTES,
+  };
+}
+
 function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false) {
   if (!HEARTBEAT_SECS) {
     done(false);
@@ -1174,6 +1283,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
   const processes = attributor.metrics();
   const signatures = processes.runtimeSignatures || {};
   const reloader = signatureReloader?.metrics() || {};
+  const eventQueues = eventQueueMetrics();
   eventKindCounts = Object.create(null);
   attributionCounts = {
     observed: 0,
@@ -1191,6 +1301,10 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
     queueDropped: 0,
     batches: 0,
     batchEvents: 0,
+    retryQueued: 0,
+    retryAttempts: 0,
+    retryRecovered: 0,
+    retryExhausted: 0,
     workspaceConflict: 0,
     infrastructure: 0,
     deduplicated: 0,
@@ -1208,7 +1322,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
       status,
       intervalSecs: HEARTBEAT_SECS,
       eventKindCounts: counts,
-      queueDepth: pending.length,
+      queueDepth: eventQueues.queueDepth,
       outputDropped: dropped,
       errorCount: errors,
       filterMetrics: {
@@ -1239,6 +1353,24 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
         queueDropped: classifications.queueDropped,
         batches: classifications.batches,
         batchEvents: classifications.batchEvents,
+        retryQueued: classifications.retryQueued,
+        retryAttempts: classifications.retryAttempts,
+        retryRecovered: classifications.retryRecovered,
+        retryExhausted: classifications.retryExhausted,
+        queueBytes: eventQueues.queueBytes,
+        inflightEvents: eventQueues.inflightEvents,
+        inflightBytes: eventQueues.inflightBytes,
+        inflightOldestAgeMs: eventQueues.inflightOldestAgeMs,
+        retryQueueDepth: eventQueues.retryQueueDepth,
+        retryQueueBytes: eventQueues.retryQueueBytes,
+        retryOutstandingEvents: eventQueues.retryOutstandingEvents,
+        retryOutstandingBytes: eventQueues.retryOutstandingBytes,
+        retryOldestAgeMs: eventQueues.retryOldestAgeMs,
+        outstandingEvents: eventQueues.outstandingEvents,
+        outstandingBytes: eventQueues.outstandingBytes,
+        outstandingOldestAgeMs: eventQueues.outstandingOldestAgeMs,
+        outstandingEventLimit: eventQueues.outstandingEventLimit,
+        outstandingByteLimit: eventQueues.outstandingByteLimit,
         identitySnapshotReady: workload.ready,
         identitySnapshotVersion: workload.version,
         identitySnapshotAgeSeconds: workload.ageSeconds,
@@ -1318,7 +1450,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
         infrastructure: classifications.infrastructure,
         workspaceConflict: classifications.workspaceConflict,
       },
-      message: `filter_mode=${FILTER_MODE}; retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
+      message: `filter_mode=${FILTER_MODE}; retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; retry_queued=${classifications.retryQueued}; retry_attempts=${classifications.retryAttempts}; retry_recovered=${classifications.retryRecovered}; retry_exhausted=${classifications.retryExhausted}; retry_queue_depth=${eventQueues.retryQueueDepth}; retry_outstanding=${eventQueues.retryOutstandingEvents}; outstanding_events=${eventQueues.outstandingEvents}; outstanding_bytes=${eventQueues.outstandingBytes}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
     },
     timeoutMs,
@@ -1338,6 +1470,8 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
 function closeTransports() {
   if (transportsClosed) return;
   transportsClosed = true;
+  if (retryTimer) clearTimeout(retryTimer);
+  retryTimer = undefined;
   if (reconcileTimer) clearTimeout(reconcileTimer);
   reconcileTimer = undefined;
   signatureReloader?.close();
@@ -1371,19 +1505,169 @@ function scheduleBatch() {
   batchTimer.unref();
 }
 
-function finishBatch(outcome) {
+function itemsBytes(items) {
+  return items.reduce((sum, item) => sum + item.bytes, 0);
+}
+
+function trackOutstanding(item) {
+  item.settled = false;
+  outstandingItems.add(item);
+  outstandingEvents++;
+  outstandingBytes += item.bytes;
+}
+
+function settleOutstanding(items) {
+  let settled = 0;
+  let bytes = 0;
+  let retrySettled = 0;
+  let retryBytes = 0;
+  for (const item of items) {
+    if (item.settled) continue;
+    item.settled = true;
+    item.inflightSince = 0;
+    outstandingItems.delete(item);
+    settled++;
+    bytes += item.bytes;
+    if (item.retryOwned) {
+      retrySettled++;
+      retryBytes += item.bytes;
+    }
+  }
+  outstandingEvents = Math.max(0, outstandingEvents - settled);
+  outstandingBytes = Math.max(0, outstandingBytes - bytes);
+  retryOutstandingEvents = Math.max(0, retryOutstandingEvents - retrySettled);
+  retryOutstandingBytes = Math.max(0, retryOutstandingBytes - retryBytes);
+  return settled;
+}
+
+function markRetryOwned(items) {
+  const now = Date.now();
+  for (const item of items) {
+    if (item.retryOwned || item.settled) continue;
+    item.retryOwned = true;
+    item.retryStartedAt = now;
+    item.retryDeadlineAt = now + RETRY_MAX_AGE_MS;
+    retryOutstandingEvents++;
+    retryOutstandingBytes += item.bytes;
+    attributionCounts.retryQueued++;
+  }
+}
+
+function recordRetryExhausted(items, operationalError = true) {
+  const count = settleOutstanding(items);
+  if (!count) return;
+  attributionCounts.retryExhausted += count;
+  outputDropped += count;
+  if (operationalError) errorCount++;
+}
+
+function retryDelayMs(item, retryAfterMs) {
+  const nextAttempt = Math.max(1, (item.retryAttempt ?? 0) + 1);
+  const exponent = Math.min(30, nextAttempt - 1);
+  const nominal = Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * (2 ** exponent));
+  // Downward-only jitter keeps RETRY_MAX_DELAY_MS a hard bound. A server-provided retryAfterMs is
+  // honored as a minimum (also bounded locally), so the API can protect a still-full write queue.
+  const jittered = Math.max(1, Math.ceil(nominal * (1 - Math.random() * RETRY_JITTER_RATIO)));
+  const serverDelay = Number.isSafeInteger(retryAfterMs)
+    ? Math.min(RETRY_MAX_DELAY_MS, Math.max(0, retryAfterMs))
+    : 0;
+  return Math.max(jittered, serverDelay);
+}
+
+function scheduleRetryWakeup() {
+  if (retryTimer) clearTimeout(retryTimer);
+  retryTimer = undefined;
+  if (eventRequestsAborted || retryTasks.length === 0 || inflight >= MAX_INFLIGHT) return;
+  const delayMs = Math.max(0, retryTasks[0].dueAt - Date.now());
+  retryTimer = setTimeout(() => {
+    retryTimer = undefined;
+    pumpEventWork();
+  }, delayMs);
+}
+
+function scheduleRetryItems(items, retryAfterMs) {
+  if (!items.length) return;
+  markRetryOwned(items);
+  if (eventRequestsAborted) {
+    recordRetryExhausted(items);
+    return;
+  }
+  const now = Date.now();
+  const expired = items.filter((item) => now >= item.retryDeadlineAt);
+  const eligible = items.filter((item) => now < item.retryDeadlineAt);
+  if (expired.length) recordRetryExhausted(expired);
+  if (!eligible.length) return;
+  const delayMs = retryDelayMs(eligible[0], retryAfterMs);
+  const expiresAt = Math.min(...eligible.map((item) => item.retryDeadlineAt));
+  retryTasks.push({
+    items: eligible,
+    dueAt: Math.min(now + delayMs, expiresAt),
+  });
+  retryTasks.sort((left, right) => left.dueAt - right.dueAt);
+  scheduleRetryWakeup();
+}
+
+function takeReadyRetryBatch(now = Date.now()) {
+  while (retryTasks.length > 0 && retryTasks[0].dueAt <= now) {
+    const task = retryTasks.shift();
+    const expired = task.items.filter((item) => now >= item.retryDeadlineAt);
+    const eligible = task.items.filter((item) => now < item.retryDeadlineAt);
+    if (expired.length) recordRetryExhausted(expired);
+    if (eligible.length) return eligible;
+  }
+  return undefined;
+}
+
+function finishBatch(batch, outcome, retryDelivery) {
   outputDropped += outcome.dropped;
   errorCount += outcome.errors;
   inflight = Math.max(0, inflight - 1);
-  while (!eventRequestsAborted && pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
-  if (
-    !closing && pending.length < MAX_QUEUE && pending.totalWeight < MAX_QUEUE_BYTES
-    && inflight < MAX_INFLIGHT
-  ) rl.resume();
+  inflightEvents = Math.max(0, inflightEvents - batch.length);
+  inflightBytes = Math.max(0, inflightBytes - itemsBytes(batch));
+  for (const item of batch) item.inflightSince = 0;
+
+  const retryItems = outcome.retryItems ?? [];
+  const retrySet = new Set(retryItems);
+  const terminalItems = batch.filter((item) => !retrySet.has(item));
+  if (retryDelivery) {
+    const exhausted = Math.min(terminalItems.length, outcome.dropped);
+    const recovered = Math.max(0, terminalItems.length - exhausted);
+    attributionCounts.retryExhausted += exhausted;
+    attributionCounts.retryRecovered += recovered;
+  }
+  settleOutstanding(terminalItems);
+  scheduleRetryItems(retryItems, outcome.retryAfterMs);
+  pumpEventWork();
+  updateInputFlow();
 }
 
-function flushPending() {
-  if (eventRequestsAborted || pending.length === 0 || inflight >= MAX_INFLIGHT) return;
+function dispatchEventBatch(batch, retryDelivery) {
+  if (!batch.length) return;
+  inflight++;
+  inflightEvents += batch.length;
+  inflightBytes += itemsBytes(batch);
+  const dispatchedAt = Date.now();
+  for (const item of batch) item.inflightSince = dispatchedAt;
+  if (retryDelivery) {
+    for (const item of batch) item.retryAttempt = (item.retryAttempt ?? 0) + 1;
+    attributionCounts.retryAttempts += batch.length;
+  } else {
+    attributionCounts.batches++;
+    attributionCounts.batchEvents += batch.length;
+  }
+  let settled = false;
+  const absoluteDeadline = retryDelivery
+    ? Math.min(...batch.map((item) => item.retryDeadlineAt))
+    : 0;
+  deliverEventBatch(batch, (outcome) => {
+    if (settled) return;
+    settled = true;
+    finishBatch(batch, outcome, retryDelivery);
+  }, absoluteDeadline);
+}
+
+function takePendingBatch() {
+  if (pending.length === 0) return [];
   if (batchTimer) {
     clearTimeout(batchTimer);
     batchTimer = undefined;
@@ -1394,12 +1678,62 @@ function flushPending() {
       : pending.length >= BATCH_SIZE * 2
         ? Math.min(256, BATCH_SIZE * 2)
         : BATCH_SIZE;
-  const batch = pending.takeWeighted(adaptiveBatchSize, BATCH_MAX_BYTES, (item) => item.bytes);
-  inflight++;
-  attributionCounts.batches++;
-  attributionCounts.batchEvents += batch.length;
-  deliverEventBatch(batch, finishBatch);
-  if (pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
+  return pending.takeWeighted(adaptiveBatchSize, BATCH_MAX_BYTES, (item) => item.bytes);
+}
+
+function pumpEventWork() {
+  if (eventRequestsAborted) return;
+  while (inflight < MAX_INFLIGHT) {
+    const retryBatch = takeReadyRetryBatch();
+    if (retryBatch?.length) {
+      dispatchEventBatch(retryBatch, true);
+      continue;
+    }
+    if (pending.length === 0) break;
+    dispatchEventBatch(takePendingBatch(), false);
+  }
+  scheduleRetryWakeup();
+  // Expiring a scheduled retry can release the unified outstanding cap without an HTTP callback.
+  // Re-evaluate stdin here as well as in finishBatch so that path cannot leave readline paused.
+  updateInputFlow();
+}
+
+function flushPending() {
+  if (eventRequestsAborted) return;
+  pumpEventWork();
+}
+
+function dropQueuedItem(item) {
+  if (!item) return;
+  settleOutstanding([item]);
+  outputDropped++;
+  attributionCounts.queueDropped++;
+}
+
+function makeQueueRoom(bytes, priority) {
+  const exceedsOutstanding = () => (
+    outstandingEvents + 1 > MAX_OUTSTANDING_EVENTS
+    || outstandingBytes + bytes > MAX_OUTSTANDING_BYTES
+  );
+  while (exceedsOutstanding()) {
+    const lowest = pending.lowestPriority();
+    if (lowest < 0 || priority <= lowest) return false;
+    dropQueuedItem(pending.dropLowest());
+  }
+  return true;
+}
+
+function inputAtCapacity() {
+  return (
+    outstandingEvents >= MAX_OUTSTANDING_EVENTS
+    || outstandingBytes >= MAX_OUTSTANDING_BYTES
+  );
+}
+
+function updateInputFlow() {
+  if (!rl || closing) return;
+  if (inputAtCapacity()) rl.pause();
+  else rl.resume();
 }
 
 function enqueue(body, priority, countForwarded = true) {
@@ -1416,19 +1750,23 @@ function enqueue(body, priority, countForwarded = true) {
     attributionCounts.queueDropped++;
     return;
   }
-  while (pending.totalWeight + bytes > MAX_QUEUE_BYTES) {
-    const lowest = pending.lowestPriority();
-    if (lowest < 0 || priority <= lowest) {
-      outputDropped++;
-      attributionCounts.queueDropped++;
-      return;
-    }
-    const evicted = pending.dropLowest();
-    if (!evicted) break;
+  if (!makeQueueRoom(bytes, priority)) {
     outputDropped++;
     attributionCounts.queueDropped++;
+    return;
   }
-  const item = { body, priority, bytes };
+  const item = {
+    body,
+    priority,
+    bytes,
+    createdAt: Date.now(),
+    retryAttempt: 0,
+    retryOwned: false,
+    retryStartedAt: 0,
+    retryDeadlineAt: 0,
+    inflightSince: 0,
+    settled: false,
+  };
   const result = pending.push(item, priority);
   if (!result.accepted) {
     outputDropped++;
@@ -1436,20 +1774,26 @@ function enqueue(body, priority, countForwarded = true) {
     return;
   }
   if (result.dropped && !result.droppedIncoming) {
-    outputDropped++;
-    attributionCounts.queueDropped++;
+    dropQueuedItem(result.dropped);
   }
+  trackOutstanding(item);
   if (countForwarded) attributionCounts.forwarded++;
   if (pending.length >= BATCH_SIZE) flushPending();
   else scheduleBatch();
-  if (pending.length >= MAX_QUEUE || inflight >= MAX_INFLIGHT) rl.pause();
+  updateInputFlow();
 }
 
 function abandonPendingEvents() {
   if (pending.length === 0) return;
-  const abandoned = pending.clear();
-  outputDropped += abandoned;
-  attributionCounts.queueDropped += abandoned;
+  while (pending.length > 0) dropQueuedItem(pending.dropLowest());
+}
+
+function abandonRetryEvents() {
+  if (retryTimer) clearTimeout(retryTimer);
+  retryTimer = undefined;
+  if (retryTasks.length === 0) return;
+  const abandoned = retryTasks.splice(0).flatMap((task) => task.items);
+  recordRetryExhausted(abandoned);
 }
 
 function remainingShutdownMs() {
@@ -1475,9 +1819,9 @@ function finishShutdownControlPlane() {
 }
 
 function forceShutdown() {
-  eventRequestsAborted = true;
-  abandonPendingEvents();
   abortActiveEventRequests('forwarder shutdown deadline exceeded');
+  abandonPendingEvents();
+  abandonRetryEvents();
   closeTransports();
   process.exit(process.exitCode ?? 0);
 }
@@ -1494,18 +1838,20 @@ function flushAndClose() {
   batchTimer = undefined;
   shutdownDeadline = Date.now() + SHUTDOWN_TIMEOUT_MS;
   shutdownForceTimer = setTimeout(forceShutdown, SHUTDOWN_TIMEOUT_MS);
-  while (pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
   const controlReserveMs = Math.min(5_000, Math.max(1_000, Math.floor(SHUTDOWN_TIMEOUT_MS / 3)));
-  const eventDeadline = shutdownDeadline - controlReserveMs;
+  eventDrainDeadline = shutdownDeadline - controlReserveMs;
+  pumpEventWork();
   const waitForInflight = () => {
-    while (!eventRequestsAborted && pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
-    if ((inflight > 0 || pending.length > 0) && Date.now() < eventDeadline) {
+    pumpEventWork();
+    const hasEventWork = inflight > 0 || pending.length > 0 || retryTasks.length > 0;
+    if (hasEventWork && Date.now() < eventDrainDeadline) {
       setTimeout(waitForInflight, 50);
       return;
     }
-    if (inflight > 0 || pending.length > 0) {
-      abandonPendingEvents();
+    if (hasEventWork) {
       abortActiveEventRequests('forwarder event drain deadline exceeded');
+      abandonPendingEvents();
+      abandonRetryEvents();
     }
     finishShutdownControlPlane();
   };

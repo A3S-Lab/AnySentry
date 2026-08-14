@@ -104,7 +104,12 @@ class BoundedPriorityQueue {
   takeOne(priority) {
     const bucket = this.buckets[priority];
     if (bucket.head >= bucket.items.length) return undefined;
-    const item = bucket.items[bucket.head++];
+    const index = bucket.head++;
+    const item = bucket.items[index];
+    // Advancing head alone keeps the consumed event body strongly reachable until the next
+    // compaction (up to 1,023 slots). Clear ownership immediately so the Forwarder's byte gauge
+    // and hard cap also describe the objects retained by this queue.
+    bucket.items[index] = undefined;
     this.size--;
     this.weight = Math.max(0, this.weight - this.itemWeight(item));
     if (bucket.head >= 1_024 && bucket.head * 2 >= bucket.items.length) {

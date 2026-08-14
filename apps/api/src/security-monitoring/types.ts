@@ -459,6 +459,22 @@ export interface UniversalIngestResult {
   items: UniversalIngestResultItem[];
 }
 
+export type ObserverBatchIngestDisposition = 'retained' | 'discarded' | 'rejected' | 'retryable';
+export interface ObserverBatchIngestResultItem extends UniversalIngestResultItem {
+  disposition: ObserverBatchIngestDisposition;
+  reasonCode?: string;
+}
+export interface ObserverBatchIngestResult {
+  accepted: boolean;
+  acceptedEvents: number;
+  retainedEvents: number;
+  discardedEvents: number;
+  rejectedEvents: number;
+  retryableEvents: number;
+  retryAfterMs?: number;
+  items: ObserverBatchIngestResultItem[];
+}
+
 export type SecurityCapabilityAction = 'list' | 'search' | 'describe' | 'execute';
 export type SecurityCapabilityAutonomy = 'suggest' | 'guarded' | 'auto';
 export type SecurityCapabilityStage = 'input' | 'plan' | 'tool' | 'retrieval' | 'memory' | 'llm' | 'output' | 'feedback' | 'runtime';
@@ -1417,6 +1433,33 @@ export interface CollectorFilterMetrics {
   queueDropped: number;
   batches: number;
   batchEvents: number;
+  /** Events first queued for an API-authorized backpressure retry in this heartbeat interval. */
+  retryQueued?: number;
+  /** Backpressure retry delivery attempts made in this heartbeat interval. */
+  retryAttempts?: number;
+  /** Retried events accepted or policy-discarded by the API in this heartbeat interval. */
+  retryRecovered?: number;
+  /** Retried events that reached a terminal outcome or exceeded their retry deadline. */
+  retryExhausted?: number;
+  /** Serialized bytes currently waiting in the ordinary priority queue. */
+  queueBytes?: number;
+  /** Events currently owned by active event-delivery requests. */
+  inflightEvents?: number;
+  inflightBytes?: number;
+  inflightOldestAgeMs?: number;
+  /** Events waiting for their next API-authorized retry attempt. */
+  retryQueueDepth?: number;
+  retryQueueBytes?: number;
+  /** All retry-owned events, including retry requests currently in flight. */
+  retryOutstandingEvents?: number;
+  retryOutstandingBytes?: number;
+  retryOldestAgeMs?: number;
+  /** Total forwarder-owned events across pending, in-flight, and retry states. */
+  outstandingEvents?: number;
+  outstandingBytes?: number;
+  outstandingOldestAgeMs?: number;
+  outstandingEventLimit?: number;
+  outstandingByteLimit?: number;
   identitySnapshotReady: boolean;
   identitySnapshotVersion: number;
   identitySnapshotAgeSeconds: number;

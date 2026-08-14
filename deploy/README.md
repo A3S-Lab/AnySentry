@@ -163,6 +163,13 @@ an Agent container is therefore attributed by Pod UID + full Container ID, while
 classified separately. Unknown identities and positively identified non-Agent decisions remain
 observable during this comparison. Events are sent in bounded batches (32 events or 50 ms), and
 heartbeats report classification, cache, queue, batch, filtered, and dropped counters.
+`FORWARD_MAX_OUTSTANDING_EVENTS` and `FORWARD_MAX_OUTSTANDING_BYTES` bound the combined pending,
+in-flight, and API-authorized retry states (the manifest uses 16,384 events / 64 MiB and a 45-second
+retry age). Only an explicit per-item `clickhouse_event_buffer_full` acknowledgement is retried;
+transport failures
+and ambiguous HTTP failures remain terminal to avoid duplicating events whose acceptance is
+unknown. Legacy `FORWARD_MAX_QUEUE` names are accepted as fallback aliases, but new deployments
+should use the outstanding-limit names.
 Routine `/proc`, `/sys`, `/run`, and `/dev` `FileAccess` noise is evaluated independently of the
 identity class; high-value deletion and security events remain observable.
 

@@ -94,14 +94,19 @@ spec:
             - { name: ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL, value: "http://anysentry:29653/security-center/runtime/snapshot" }
             - { name: ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_SECS, value: "10" }
             - { name: ANYSENTRY_AGENT_RUNTIME_LIVENESS_SECS, value: "5" }
-            # Bound memory and amortize HTTP/JSON overhead without adding perceptible UI delay.
+            # Bound total Forwarder ownership across queued, in-flight, and API-authorized retry
+            # states; the retry window plus this budget covers a bounded ClickHouse restart.
             - { name: FORWARD_BATCH_SIZE, value: "32" }
             - { name: FORWARD_BATCH_FLUSH_MS, value: "50" }
             - { name: FORWARD_BATCH_MAX_BYTES, value: "524288" }
             - { name: FORWARD_MAX_EVENT_BYTES, value: "3145728" }
-            - { name: FORWARD_MAX_QUEUE_BYTES, value: "16777216" }
-            - { name: FORWARD_MAX_QUEUE, value: "4096" }
-            # PID 1 leaves ten seconds inside Kubernetes' grace window for child drain/reaping.
+            - { name: FORWARD_MAX_OUTSTANDING_EVENTS, value: "16384" }
+            - { name: FORWARD_MAX_OUTSTANDING_BYTES, value: "67108864" }
+            - { name: FORWARD_RETRY_BASE_DELAY_MS, value: "250" }
+            - { name: FORWARD_RETRY_MAX_DELAY_MS, value: "2000" }
+            - { name: FORWARD_RETRY_MAX_AGE_MS, value: "45000" }
+            # Forwarder event/control drain < PID 1 child supervision < Kubernetes grace.
+            - { name: FORWARD_SHUTDOWN_TIMEOUT_MS, value: "15000" }
             - { name: OBSERVER_SUPERVISOR_SHUTDOWN_TIMEOUT_MS, value: "20000" }
           command: ["/usr/local/bin/node"]
           args: ["/opt/observer-supervisor.js"]

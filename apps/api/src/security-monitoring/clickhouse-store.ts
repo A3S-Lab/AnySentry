@@ -568,7 +568,10 @@ export class ClickHouseStore {
     ) return;
     const error = Object.assign(
       new Error('ClickHouse event write buffer is full; retry the ingest request'),
-      { code: 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL' },
+      // Capacity is checked before the row joins any batch or enters an HTTP request. Callers may
+      // expose this exact failure as retryable only while they can still prove no earlier stage
+      // accepted the event.
+      { code: 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL', retrySafe: true as const },
     );
     // enqueue() intentionally remains synchronous for the existing judge path. Throwing is the
     // only available backpressure signal; silently dropping here would falsely claim durability.

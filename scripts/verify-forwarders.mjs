@@ -184,6 +184,7 @@ async function verifyForwarder(entry, source, fixture) {
       line.trim() &&
       !line.startsWith('[observer-forward] process snapshot:') &&
       !line.startsWith('[observer-forward] agent templates:') &&
+      !line.startsWith('[observer-forward] Agent runtime signatures:') &&
       !line.startsWith('[observer-forward] docker discovery:'),
     )
     .join('\n');

@@ -1142,6 +1142,24 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       queueDropped: 0,
       batches: 1,
       batchEvents: 9,
+      retryQueued: 5,
+      retryAttempts: 4,
+      retryRecovered: 3,
+      retryExhausted: 1,
+      queueBytes: 1234,
+      inflightEvents: 2,
+      inflightBytes: 567,
+      inflightOldestAgeMs: 89,
+      retryQueueDepth: 1,
+      retryQueueBytes: 234,
+      retryOutstandingEvents: 3,
+      retryOutstandingBytes: 678,
+      retryOldestAgeMs: 321,
+      outstandingEvents: 7,
+      outstandingBytes: 2479,
+      outstandingOldestAgeMs: 654,
+      outstandingEventLimit: 16_384,
+      outstandingByteLimit: 64 * 1024 * 1024,
       identitySnapshotReady: true,
       identitySnapshotVersion: 7,
       identitySnapshotAgeSeconds: 2,
@@ -1206,6 +1224,24 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       health.items?.[0]?.filterMetrics?.processTombstones === 1 &&
       health.items?.[0]?.filterMetrics?.identityCgroupHits === 7 &&
       health.items?.[0]?.filterMetrics?.processProcReads === 1 &&
+      health.items?.[0]?.filterMetrics?.retryQueued === 5 &&
+      health.items?.[0]?.filterMetrics?.retryAttempts === 4 &&
+      health.items?.[0]?.filterMetrics?.retryRecovered === 3 &&
+      health.items?.[0]?.filterMetrics?.retryExhausted === 1 &&
+      health.items?.[0]?.filterMetrics?.queueBytes === 1234 &&
+      health.items?.[0]?.filterMetrics?.inflightEvents === 2 &&
+      health.items?.[0]?.filterMetrics?.inflightBytes === 567 &&
+      health.items?.[0]?.filterMetrics?.inflightOldestAgeMs === 89 &&
+      health.items?.[0]?.filterMetrics?.retryQueueDepth === 1 &&
+      health.items?.[0]?.filterMetrics?.retryQueueBytes === 234 &&
+      health.items?.[0]?.filterMetrics?.retryOutstandingEvents === 3 &&
+      health.items?.[0]?.filterMetrics?.retryOutstandingBytes === 678 &&
+      health.items?.[0]?.filterMetrics?.retryOldestAgeMs === 321 &&
+      health.items?.[0]?.filterMetrics?.outstandingEvents === 7 &&
+      health.items?.[0]?.filterMetrics?.outstandingBytes === 2479 &&
+      health.items?.[0]?.filterMetrics?.outstandingOldestAgeMs === 654 &&
+      health.items?.[0]?.filterMetrics?.outstandingEventLimit === 16_384 &&
+      health.items?.[0]?.filterMetrics?.outstandingByteLimit === 64 * 1024 * 1024 &&
       health.items?.[0]?.filterMetrics?.runtimeSnapshotRetries === 2 &&
       health.items?.[0]?.filterMetrics?.runtimeSnapshotRecovered === 1 &&
       health.items?.[0]?.filterMetrics?.lastRuntimeSnapshotFailureAt === '2026-08-14T00:00:01.000Z' &&

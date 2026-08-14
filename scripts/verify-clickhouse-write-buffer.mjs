@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { ClickHouseStore } from '../apps/api/dist/security-monitoring/clickhouse-store.js';
+import { SecurityMonitoringController } from '../apps/api/dist/security-monitoring/security-monitoring.controller.js';
 import { SentryJudgeService } from '../apps/api/dist/security-monitoring/sentry-judge.service.js';
 
 const BATCH_BYTES = 4 * 1024 * 1024;
@@ -144,6 +145,48 @@ function batchToken(call) {
   return token;
 }
 
+function batchController(ingest) {
+  const controller = Object.create(SecurityMonitoringController.prototype);
+  Object.assign(controller, { ingest });
+  return controller;
+}
+
+function assertBatchAccounting(ack, batchLength) {
+  assert.equal(
+    ack.acceptedEvents + ack.rejectedEvents + ack.retryableEvents,
+    batchLength,
+    'batch acknowledgement counts must cover every submitted event exactly once',
+  );
+  assert.equal(ack.items.length, batchLength);
+  const dispositions = { retained: 0, discarded: 0, rejected: 0, retryable: 0 };
+  let retrySuffixStarted = false;
+  for (let index = 0; index < ack.items.length; index += 1) {
+    const item = ack.items[index];
+    assert.equal(item.index, index, 'batch item indices must remain positional and contiguous');
+    assert.ok(item.disposition in dispositions, `unexpected batch disposition: ${item.disposition}`);
+    dispositions[item.disposition] += 1;
+    if (item.disposition === 'retryable') {
+      retrySuffixStarted = true;
+      assert.equal(item.accepted, false);
+      assert.equal(item.reasonCode, 'clickhouse_event_buffer_full');
+    } else {
+      assert.equal(retrySuffixStarted, false, 'capacity backpressure must mark one contiguous suffix');
+      assert.equal(item.accepted, item.disposition === 'retained' || item.disposition === 'discarded');
+    }
+  }
+  assert.equal(dispositions.retained, ack.retainedEvents);
+  assert.equal(dispositions.discarded, ack.discardedEvents);
+  assert.equal(dispositions.rejected, ack.rejectedEvents);
+  assert.equal(dispositions.retryable, ack.retryableEvents);
+  assert.equal(ack.retainedEvents + ack.discardedEvents, ack.acceptedEvents);
+  assert.equal(ack.accepted, ack.acceptedEvents > 0);
+  assert.equal(
+    ack.retryAfterMs,
+    ack.retryableEvents > 0 ? 1_000 : undefined,
+    'retry delay must be present only for explicit retryable backpressure',
+  );
+}
+
 async function withoutExpectedErrorLogs(run) {
   const original = console.error;
   console.error = () => undefined;
@@ -214,7 +257,10 @@ await withoutExpectedErrorLogs(async () => {
 
   assert.throws(
     () => store.enqueue(event(5_000)),
-    (error) => error?.code === 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL',
+    (error) => (
+      error?.code === 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL' &&
+      error?.retrySafe === true
+    ),
     'the active batch must count toward the explicit 5k-row capacity',
   );
   const draining = store.flush();
@@ -557,6 +603,7 @@ assert.match(
 {
   const capacityError = Object.assign(new Error('synthetic event buffer full'), {
     code: 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL',
+    retrySafe: true,
   });
   const hotRing = [];
   const byId = new Map();
@@ -580,6 +627,233 @@ assert.match(
   assert.equal(byId.size, 0, 'queue rejection must not mutate the event index');
   assert.equal(incidents.size, 0, 'queue rejection must not create an incident');
   assert.deepEqual(observed, { events: 0, incidents: 0 }, 'queue rejection must not notify alerting');
+}
+
+await withoutExpectedErrorLogs(async () => {
+  const queueError = Object.assign(new Error('synthetic judgment queue unavailable'), {
+    code: 'SYNTHETIC_JUDGMENT_QUEUE_UNAVAILABLE',
+  });
+  const capacityError = Object.assign(new Error('synthetic failure-revision buffer full'), {
+    code: 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL',
+    retrySafe: true,
+  });
+  const writes = [];
+  const memoryStates = [];
+  const judge = Object.create(SentryJudgeService.prototype);
+  Object.assign(judge, {
+    policy: {},
+    queues: {
+      enabled: true,
+      async enqueueFast() { throw queueError; },
+    },
+    ch: {
+      async insertNow(record) {
+        writes.push(record);
+        if (writes.length === 2) throw capacityError;
+      },
+    },
+    eventBase() {
+      return {
+        schemaVersion: 'anysentry.event.v1',
+        eventId: 'evt-post-persist-capacity',
+        at: 1,
+        eventKind: 'ToolExec',
+        eventCategory: 'tool',
+        source: 'observer',
+        subject: 'post-persist capacity fixture',
+        workspacePath: '/workspace',
+        agentId: 'fixture-agent',
+        sessionId: 'fixture-session',
+        traceId: 'fixture-trace',
+        spanId: 'fixture-span',
+        runId: 'fixture-run',
+        attributes: {},
+        attribution: { classification: 'confirmed_agent' },
+      };
+    },
+    availableTiers() { return { l1: true, l2: false, l3: false }; },
+    policyVersion() { return 'fixture-policy'; },
+    isInternalL3Invocation() { return false; },
+    upsertMemory(record) { memoryStates.push(record); },
+  });
+  await assert.rejects(
+    judge.acceptWithDisposition('{"event":{"ToolExec":{}}}', {}, 1),
+    (error) => error === queueError,
+    'a post-persist capacity error must never replace the primary queue failure with retryable backpressure',
+  );
+  assert.equal(writes.length, 2, 'the pending revision and best-effort failed revision must both be attempted');
+  assert.equal(writes[0].decisionStatus, 'pending');
+  assert.equal(writes[1].decisionStatus, 'failed');
+  assert.deepEqual(
+    memoryStates.map((record) => record.decisionStatus),
+    ['pending', 'failed'],
+    'the hot ring must expose the actual queue failure even when its failure revision cannot persist',
+  );
+});
+
+{
+  const capacityError = Object.assign(new Error('synthetic event buffer full'), {
+    code: 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL',
+    retrySafe: true,
+  });
+  const calls = [];
+  const controller = batchController(async (input) => {
+    calls.push(input.line);
+    if (input.line === 'capacity') throw capacityError;
+    if (input.line === 'discarded') {
+      return { accepted: false, disposition: 'discarded', reasonCode: 'non_agent_discarded' };
+    }
+    return { accepted: true, disposition: 'retained', eventId: `event-${input.line}` };
+  });
+  const ack = await controller.ingestBatch({
+    events: [
+      { line: 'retained' },
+      { line: 'discarded' },
+      { line: 'capacity' },
+      { line: 'must-not-run' },
+    ],
+  }, {});
+  assertBatchAccounting(ack, 4);
+  assert.deepEqual(calls, ['retained', 'discarded', 'capacity'], 'capacity must stop processing the suffix');
+  assert.deepEqual(
+    {
+      accepted: ack.accepted,
+      acceptedEvents: ack.acceptedEvents,
+      retainedEvents: ack.retainedEvents,
+      discardedEvents: ack.discardedEvents,
+      rejectedEvents: ack.rejectedEvents,
+      retryableEvents: ack.retryableEvents,
+      retryAfterMs: ack.retryAfterMs,
+      dispositions: ack.items.map((item) => item.disposition),
+    },
+    {
+      accepted: true,
+      acceptedEvents: 2,
+      retainedEvents: 1,
+      discardedEvents: 1,
+      rejectedEvents: 0,
+      retryableEvents: 2,
+      retryAfterMs: 1_000,
+      dispositions: ['retained', 'discarded', 'retryable', 'retryable'],
+    },
+    'a partial prefix must be acknowledged without retrying already consumed items',
+  );
+  assert.ok(
+    ack.items.slice(2).every((item) => (
+      item.accepted === false &&
+      item.reasonCode === 'clickhouse_event_buffer_full'
+    )),
+  );
+}
+
+{
+  const capacityError = Object.assign(new Error('synthetic event buffer full'), {
+    code: 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL',
+    retrySafe: true,
+  });
+  let calls = 0;
+  const controller = batchController(async () => {
+    calls += 1;
+    throw capacityError;
+  });
+  const ack = await controller.ingestBatch({
+    events: [{ line: 'capacity' }, { line: 'suffix-a' }, { line: 'suffix-b' }],
+  }, {});
+  assertBatchAccounting(ack, 3);
+  assert.equal(calls, 1, 'zero-prefix backpressure must not invoke ingest for the suffix');
+  assert.deepEqual(
+    {
+      accepted: ack.accepted,
+      acceptedEvents: ack.acceptedEvents,
+      rejectedEvents: ack.rejectedEvents,
+      retryableEvents: ack.retryableEvents,
+      retryAfterMs: ack.retryAfterMs,
+    },
+    {
+      accepted: false,
+      acceptedEvents: 0,
+      rejectedEvents: 0,
+      retryableEvents: 3,
+      retryAfterMs: 1_000,
+    },
+  );
+  assert.ok(ack.items.every((item) => item.disposition === 'retryable' && item.accepted === false));
+}
+
+{
+  const capacityError = Object.assign(new Error('synthetic event buffer full'), {
+    code: 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL',
+    retrySafe: true,
+  });
+  const controller = batchController(async (input) => {
+    if (input.line === 'hard-rejection') {
+      return { accepted: false, disposition: 'rejected', reasonCode: 'unsupported_or_unparseable' };
+    }
+    if (input.line === 'capacity') throw capacityError;
+    return { accepted: true, eventId: `event-${input.line}` };
+  });
+  const ack = await controller.ingestBatch({
+    events: [
+      { line: 'hard-rejection' },
+      { line: 'retained' },
+      { line: 'capacity' },
+      { line: 'suffix' },
+    ],
+  }, {});
+  assertBatchAccounting(ack, 4);
+  assert.deepEqual(
+    {
+      acceptedEvents: ack.acceptedEvents,
+      rejectedEvents: ack.rejectedEvents,
+      retryableEvents: ack.retryableEvents,
+      dispositions: ack.items.map((item) => item.disposition),
+    },
+    {
+      acceptedEvents: 1,
+      rejectedEvents: 1,
+      retryableEvents: 2,
+      dispositions: ['rejected', 'retained', 'retryable', 'retryable'],
+    },
+    'hard rejections must remain distinct from retryable capacity backpressure',
+  );
+}
+
+{
+  const permanent = Object.assign(new Error('synthetic permanent ingest failure'), { code: 'SYNTHETIC_PERMANENT' });
+  const controller = batchController(async () => { throw permanent; });
+  await assert.rejects(
+    controller.ingestBatch({ events: [{ line: 'permanent' }] }, {}),
+    (error) => error === permanent,
+    'non-capacity errors must keep propagating through the batch endpoint',
+  );
+}
+
+{
+  const ambiguousCapacity = Object.assign(new Error('synthetic post-accept capacity failure'), {
+    code: 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL',
+  });
+  const controller = batchController(async () => { throw ambiguousCapacity; });
+  await assert.rejects(
+    controller.ingestBatch({ events: [{ line: 'already-accepted' }] }, {}),
+    (error) => error === ambiguousCapacity,
+    'the controller must require explicit retrySafe proof, not just a shared capacity error code',
+  );
+}
+
+{
+  let calls = 0;
+  const controller = batchController(async () => {
+    calls += 1;
+    return { accepted: true };
+  });
+  await assert.rejects(
+    controller.ingestBatch({
+      events: Array.from({ length: 257 }, (_, index) => ({ line: `oversized-${index}` })),
+    }, {}),
+    (error) => error?.getStatus?.() === 413,
+    'an oversized item-count batch must be rejected before any prefix is consumed',
+  );
+  assert.equal(calls, 0, 'HTTP 413 is safe to split only when the controller processed zero items');
 }
 
 {
