@@ -137,6 +137,7 @@ async function verifyCollectorMetricFreshnessContract() {
   });
 
   const sameMillisecondEnriched = heartbeat({
+    origin: 'forwarder',
     filterMetricsReportedAt: at,
     nodeName: `${runId}-enriched-same-ms`,
     status: 'degraded',
@@ -145,43 +146,74 @@ async function verifyCollectorMetricFreshnessContract() {
     errorCount: 4,
     filterMetrics: { scope: 'shadow', observed: 9 },
   });
-  const sameMillisecondRaw = heartbeat({ nodeName: `${runId}-raw-same-ms` });
+  const sameMillisecondRaw = heartbeat({
+    origin: 'raw_collector',
+    nodeName: `${runId}-raw-same-ms`,
+  });
   const sameMillisecondAggregation = new AggregationService({
     query: () => [],
     queryCollectorHeartbeats: () => [sameMillisecondEnriched, sameMillisecondRaw],
-    collectorHeartbeatHeads: () => ({ latest: [sameMillisecondRaw], latestMetrics: [sameMillisecondEnriched] }),
+    collectorHeartbeatHeads: () => ({
+      latest: [sameMillisecondRaw],
+      latestMetrics: [sameMillisecondEnriched],
+      latestRaw: [sameMillisecondRaw],
+      latestForwarder: [sameMillisecondEnriched],
+    }),
   }, {}, {}, {});
   const sameMillisecondHealth = sameMillisecondAggregation.collectorHealth({ timeType: 'last_30d', collectorId: sameMillisecondRaw.collectorId });
   assert(
-    'same-millisecond raw heartbeat updates status while fresh enriched metrics remain selected',
+    'same-millisecond raw heartbeat cannot erase Forwarder operational errors or enriched metrics',
     sameMillisecondHealth.items?.[0]?.nodeName === `${runId}-raw-same-ms` &&
-      sameMillisecondHealth.items?.[0]?.droppedEvents === 0 &&
-      sameMillisecondHealth.items?.[0]?.outputDropped === 0 &&
-      sameMillisecondHealth.items?.[0]?.errorCount === 0 &&
+      sameMillisecondHealth.items?.[0]?.state === 'degraded' &&
+      sameMillisecondHealth.items?.[0]?.droppedEvents === 2 &&
+      sameMillisecondHealth.items?.[0]?.outputDropped === 3 &&
+      sameMillisecondHealth.items?.[0]?.errorCount === 4 &&
       sameMillisecondHealth.items?.[0]?.filterMetrics?.scope === 'shadow' &&
       sameMillisecondHealth.items?.[0]?.filterMetrics?.observed === 9 &&
       sameMillisecondHealth.items?.[0]?.windowErrorMaxima?.droppedEvents === 2 &&
       sameMillisecondHealth.items?.[0]?.windowErrorMaxima?.outputDropped === 3 &&
-      sameMillisecondHealth.items?.[0]?.windowErrorMaxima?.errorCount === 4,
+      sameMillisecondHealth.items?.[0]?.windowErrorMaxima?.errorCount === 4 &&
+      sameMillisecondHealth.items?.[0]?.filterMetricsReported === true,
     sameMillisecondHealth,
   );
 
   const historicalInside = heartbeat({
     at: at - 2_000,
+    origin: 'raw_collector',
     droppedEvents: 2,
     outputDropped: 3,
     errorCount: 4,
+    execEvidence: {
+      exec: 2,
+      execTruncated: 1,
+      execIncomplete: 1,
+      execReassemblyTimeout: 0,
+      shutdownFinal: false,
+    },
   });
   const historicalAfterEnd = heartbeat({
     at: at - 500,
+    origin: 'raw_collector',
     droppedEvents: 99,
     outputDropped: 99,
     errorCount: 99,
+    execEvidence: {
+      exec: 99,
+      execTruncated: 99,
+      execIncomplete: 99,
+      execReassemblyTimeout: 99,
+      shutdownFinal: true,
+    },
   });
   const historicalAggregation = new AggregationService({
     query: () => [],
     queryCollectorHeartbeats: () => [historicalInside, historicalAfterEnd],
-    collectorHeartbeatHeads: () => ({ latest: [historicalAfterEnd], latestMetrics: [] }),
+    collectorHeartbeatHeads: () => ({
+      latest: [historicalAfterEnd],
+      latestMetrics: [],
+      latestRaw: [historicalAfterEnd],
+      latestForwarder: [],
+    }),
   }, {}, {}, {});
   const historicalHealth = historicalAggregation.collectorHealth({
     timeType: 'custom',
@@ -193,30 +225,78 @@ async function verifyCollectorMetricFreshnessContract() {
     'collector window error maxima exclude heartbeats after a custom end time',
     historicalHealth.items?.[0]?.windowErrorMaxima?.droppedEvents === 2 &&
       historicalHealth.items?.[0]?.windowErrorMaxima?.outputDropped === 3 &&
-      historicalHealth.items?.[0]?.windowErrorMaxima?.errorCount === 4,
+      historicalHealth.items?.[0]?.windowErrorMaxima?.errorCount === 4 &&
+      historicalHealth.items?.[0]?.execEvidence?.reported === true &&
+      historicalHealth.items?.[0]?.execEvidence?.latest?.exec === 2 &&
+      historicalHealth.items?.[0]?.execEvidence?.window?.exec === 2 &&
+      historicalHealth.items?.[0]?.execEvidence?.window?.execIncomplete === 1 &&
+      historicalHealth.items?.[0]?.execEvidence?.window?.heartbeatCount === 1 &&
+      historicalHealth.items?.[0]?.execEvidence?.window?.intervalSecs === 30 &&
+      historicalHealth.items?.[0]?.execEvidence?.latest?.shutdownFinal === false &&
+      historicalHealth.items?.[0]?.execEvidence?.window?.shutdownFinalCount === 0 &&
+      historicalHealth.items?.[0]?.filterMetricsReported === false,
     historicalHealth,
   );
 
   const expiredAt = at - 4 * 60_000;
   const expiredEnriched = heartbeat({
     at: expiredAt,
+    origin: 'forwarder',
     filterMetricsReportedAt: expiredAt,
     nodeName: `${runId}-expired-enriched`,
     filterMetrics: { scope: 'shadow', observed: 99 },
   });
-  const currentRaw = heartbeat({ at: at - 1_000, nodeName: `${runId}-current-raw` });
+  const currentRaw = heartbeat({
+    at: at - 1_000,
+    origin: 'raw_collector',
+    nodeName: `${runId}-current-raw`,
+  });
   const expiredAggregation = new AggregationService({
     query: () => [],
     queryCollectorHeartbeats: () => [expiredEnriched, currentRaw],
-    collectorHeartbeatHeads: () => ({ latest: [currentRaw], latestMetrics: [expiredEnriched] }),
+    collectorHeartbeatHeads: () => ({
+      latest: [currentRaw],
+      latestMetrics: [expiredEnriched],
+      latestRaw: [currentRaw],
+      latestForwarder: [expiredEnriched],
+    }),
   }, {}, {}, {});
   const expiredHealth = expiredAggregation.collectorHealth({ timeType: 'last_30d', collectorId: currentRaw.collectorId });
   assert(
     'raw heartbeats cannot renew expired enriched filter metrics',
     expiredHealth.items?.[0]?.nodeName === `${runId}-current-raw` &&
       expiredHealth.items?.[0]?.filterMetrics?.scope === 'decoupled' &&
-      expiredHealth.items?.[0]?.filterMetrics?.observed === 0,
+      expiredHealth.items?.[0]?.filterMetrics?.observed === 0 &&
+      expiredHealth.items?.[0]?.filterMetricsReported === false,
     expiredHealth,
+  );
+
+  const noFilterForwarder = heartbeat({
+    collectorId: `${runId}-no-filter-forwarder`,
+    origin: 'forwarder',
+    status: 'error',
+    errorCount: 2,
+    filterMetrics: undefined,
+  });
+  const noFilterAggregation = new AggregationService({
+    query: () => [],
+    queryCollectorHeartbeats: () => [noFilterForwarder],
+    collectorHeartbeatHeads: () => ({
+      latest: [noFilterForwarder],
+      latestMetrics: [],
+      latestRaw: [],
+      latestForwarder: [noFilterForwarder],
+    }),
+  }, {}, {}, {});
+  const noFilterHealth = noFilterAggregation.collectorHealth({
+    timeType: 'last_30d', collectorId: noFilterForwarder.collectorId,
+  });
+  assert(
+    'Forwarder heartbeat without filter metrics still drives operational health',
+    noFilterHealth.items?.[0]?.state === 'degraded' &&
+      noFilterHealth.items?.[0]?.errorCount === 2 &&
+      noFilterHealth.items?.[0]?.filterMetrics?.scope === 'decoupled',
+    noFilterHealth,
   );
 }
 
@@ -255,6 +335,193 @@ async function verifyHotRingCapacityContract() {
     if (previous === undefined) delete process.env.ANYSENTRY_EVENT_RING_MAX;
     else process.env.ANYSENTRY_EVENT_RING_MAX = previous;
   }
+}
+
+async function verifyCollectorHeartbeatProvenanceContract() {
+  const [{ SentryJudgeService }, { AlertingService }] = await Promise.all([
+    import('../apps/api/dist/security-monitoring/sentry-judge.service.js'),
+    import('../apps/api/dist/security-monitoring/alerting.service.js'),
+  ]);
+  const observed = [];
+  const seeded = [];
+  const judge = new SentryJudgeService(
+    {
+      observeCollectorHeartbeat: (heartbeat) => observed.push(heartbeat),
+      seedCollectorHeartbeat: (heartbeat) => seeded.push(heartbeat),
+    },
+    {},
+    { enabled: false },
+    {},
+  );
+  const raw = judge.recordCollectorHeartbeat({
+    collectorId: `${runId}-raw-provenance`,
+    mode: 'observe',
+    intervalSecs: 30,
+    eventKindCounts: { ToolExec: 3 },
+    errorCount: 2,
+    execEvidence: {
+      exec: 3,
+      execTruncated: 1,
+      execIncomplete: 2,
+      execReassemblyTimeout: 1,
+      shutdownFinal: true,
+    },
+    filterMetrics: { scope: 'shadow', shutdownFinal: true, observed: 99 },
+  }, 1_000, 'raw_collector');
+  assert(
+    'server-assigned raw provenance separates exec quality from operational health',
+    raw.origin === 'raw_collector' &&
+      raw.errorCount === 0 &&
+      raw.execEvidence?.execIncomplete === 2 &&
+      raw.execEvidence?.shutdownFinal === true &&
+      raw.filterMetricsReportedAt === undefined &&
+      raw.filterMetrics.scope === 'decoupled' &&
+      raw.filterMetrics.shutdownFinal === false &&
+      observed.at(-1)?.errorCount === 0,
+    { raw, observed },
+  );
+  const forwarder = judge.recordCollectorHeartbeat({
+    collectorId: `${runId}-forwarder-provenance`,
+    errorCount: 2,
+    execEvidence: {
+      exec: 999,
+      execTruncated: 999,
+      execIncomplete: 999,
+      execReassemblyTimeout: 999,
+      shutdownFinal: true,
+    },
+    filterMetrics: { scope: 'shadow', shutdownFinal: true, observed: 1 },
+  }, 2_000, 'forwarder');
+  assert(
+    'server-assigned forwarder provenance ignores raw-only evidence',
+    forwarder.origin === 'forwarder' &&
+      forwarder.errorCount === 2 &&
+      forwarder.execEvidence === undefined &&
+      forwarder.filterMetricsReportedAt === 2_000 &&
+      forwarder.filterMetrics.shutdownFinal === true,
+    forwarder,
+  );
+
+  const notificationsBeforeHydration = observed.length;
+  const legacyRaw = judge.normalizeHydratedCollectorHeartbeat({
+    ...raw,
+    origin: undefined,
+    mode: 'observe+extensions',
+    execEvidence: undefined,
+    errorCount: 1_899,
+  });
+  judge.addCollectorHeartbeat(legacyRaw, false, false);
+  assert(
+    'legacy raw hydration removes exec-incomplete fallback and never replays notifications',
+      legacyRaw.origin === 'raw_collector' &&
+      legacyRaw.errorCount === 0 &&
+      observed.length === notificationsBeforeHydration &&
+      seeded.at(-1)?.collectorId === legacyRaw.collectorId,
+    { legacyRaw, observed: observed.length, notificationsBeforeHydration, seeded },
+  );
+  const legacyForwarder = judge.normalizeHydratedCollectorHeartbeat({
+    ...raw,
+    collectorId: `${runId}-legacy-forwarder-no-metrics`,
+    origin: undefined,
+    filterMetricsReportedAt: undefined,
+    mode: 'observer-forwarder:shadow',
+    status: 'error',
+    errorCount: 2,
+    execEvidence: undefined,
+  });
+  judge.addCollectorHeartbeat(legacyForwarder, false, false);
+  const hydratedHeads = judge.collectorHeartbeatHeads();
+  assert(
+    'legacy Forwarder without filter metrics retains its operational provenance after hydration',
+    legacyForwarder.origin === 'forwarder' &&
+      legacyForwarder.errorCount === 2 &&
+      hydratedHeads.latestForwarder.some((item) =>
+        item.collectorId === legacyForwarder.collectorId && item.errorCount === 2),
+    { legacyForwarder, hydratedHeads },
+  );
+
+  const inconsistentRaw = judge.recordCollectorHeartbeat({
+    collectorId: `${runId}-inconsistent-raw-evidence`,
+    mode: 'observe+extensions',
+    eventKindCounts: { ToolExec: 1 },
+    execEvidence: {
+      exec: 1,
+      execTruncated: 2,
+      execIncomplete: 0,
+      execReassemblyTimeout: 0,
+      shutdownFinal: true,
+    },
+  }, 3_000, 'raw_collector');
+  assert(
+    'raw evidence whose quality counters exceed ToolExec count is not reported',
+    inconsistentRaw.execEvidence === undefined,
+    inconsistentRaw,
+  );
+
+  const alerting = new AlertingService(
+    { activeFor: () => false },
+    { dispatch: async () => 0, config: () => ({ summary: { enabledChannels: 0 } }) },
+    { snapshot: () => [] },
+    { get: () => undefined },
+  );
+  alerting.config.enabled = true;
+  const alertCollector = `${runId}-origin-alert-collector`;
+  const heartbeat = (origin, at, overrides = {}) => ({
+    collectorId: alertCollector,
+    at,
+    origin,
+    status: 'ok',
+    attachedProbes: 0,
+    enabledFeatures: [],
+    intervalSecs: 30,
+    eventKindCounts: {},
+    queueDepth: 0,
+    droppedEvents: 0,
+    outputDropped: 0,
+    errorCount: 0,
+    observedAgents: 0,
+    filterMetrics: { scope: 'decoupled', observed: 0 },
+    ...overrides,
+  });
+  const alertAt = Date.now();
+  alerting.observeCollectorHeartbeat(heartbeat('forwarder', alertAt, { errorCount: 1 }));
+  alerting.observeCollectorHeartbeat(heartbeat('raw_collector', alertAt + 1));
+  let qualityAlerts = alerting.list({
+    timeType: 'last_30d', collectorId: alertCollector, kind: 'collector', limit: 10,
+  }).items.filter((item) => item.ruleId === 'collector.quality');
+  assert(
+    'clean raw heartbeat cannot resolve a Forwarder-origin quality alert',
+    qualityAlerts.some((item) =>
+      item.status === 'open' && item.labels?.heartbeatOrigin === 'forwarder'),
+    qualityAlerts,
+  );
+  alerting.observeCollectorHeartbeat(heartbeat('raw_collector', alertAt + 2, { droppedEvents: 1 }));
+  alerting.observeCollectorHeartbeat(heartbeat('forwarder', alertAt + 3));
+  qualityAlerts = alerting.list({
+    timeType: 'last_30d', collectorId: alertCollector, kind: 'collector', limit: 10,
+  }).items.filter((item) => item.ruleId === 'collector.quality');
+  assert(
+    'quality recovery is isolated by heartbeat origin',
+    qualityAlerts.some((item) =>
+      item.status === 'resolved' && item.labels?.heartbeatOrigin === 'forwarder') &&
+      qualityAlerts.some((item) =>
+        item.status === 'open' && item.labels?.heartbeatOrigin === 'raw_collector'),
+    qualityAlerts,
+  );
+
+  const hydratedCollector = `${runId}-hydrated-liveness-collector`;
+  alerting.seedCollectorHeartbeat(heartbeat('forwarder', alertAt - 700_000, {
+    collectorId: hydratedCollector,
+  }));
+  alerting.checkCollectorAvailability(alertAt);
+  const availabilityAlerts = alerting.list({
+    timeType: 'last_30d', collectorId: hydratedCollector, kind: 'collector', limit: 10,
+  }).items.filter((item) => item.ruleId === 'collector.availability');
+  assert(
+    'hydration seeds collector liveness without replaying historical quality notifications',
+    availabilityAlerts.some((item) => item.status === 'open'),
+    availabilityAlerts,
+  );
 }
 
 async function verifyJudgeDispositionContract() {
@@ -761,6 +1028,11 @@ async function verifyRawCollectorHeartbeat(sourceId, token) {
         attached_probes: 7,
         enabled_features: ['exec', 'egress', 'dns', 'file'],
         exec: 3,
+        exec_truncated: 1,
+        exec_incomplete: 2,
+        exec_reassembly_timeout: 1,
+        shutdown_final: false,
+        filter_metrics: { scope: 'shadow', shutdownFinal: true, runtimeSnapshotPosts: 999 },
         dns: 2,
         egress: 1,
         observed_agents: 2,
@@ -786,8 +1058,22 @@ async function verifyRawCollectorHeartbeat(sourceId, token) {
       health.items?.[0]?.collectorId === `${runId}-collector` &&
       health.items?.[0]?.state === 'healthy' &&
       health.items?.[0]?.eventCount === 6 &&
+      health.items?.[0]?.errorCount === 0 &&
+      health.items?.[0]?.windowErrorMaxima?.errorCount === 0 &&
       health.items?.[0]?.observedAgentCount === 2 &&
-      health.items?.[0]?.attachedProbes === 7,
+      health.items?.[0]?.attachedProbes === 7 &&
+      health.items?.[0]?.execEvidence?.reported === true &&
+      health.items?.[0]?.execEvidence?.latest?.exec === 3 &&
+      health.items?.[0]?.execEvidence?.latest?.execTruncated === 1 &&
+      health.items?.[0]?.execEvidence?.latest?.execIncomplete === 2 &&
+      health.items?.[0]?.execEvidence?.latest?.execReassemblyTimeout === 1 &&
+      health.items?.[0]?.execEvidence?.latest?.shutdownFinal === false &&
+      health.items?.[0]?.execEvidence?.latest?.intervalSecs === 30 &&
+      health.items?.[0]?.execEvidence?.window?.heartbeatCount === 1 &&
+      health.items?.[0]?.execEvidence?.window?.intervalSecs === 30 &&
+      health.items?.[0]?.execEvidence?.window?.shutdownFinalCount === 0 &&
+      health.items?.[0]?.filterMetrics?.scope === 'decoupled' &&
+      health.items?.[0]?.filterMetrics?.shutdownFinal === false,
     health,
   );
 }
@@ -810,6 +1096,13 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
     outputDropped: 1,
     errorCount: 1,
     observedAgents: 2,
+    execEvidence: {
+      exec: 999,
+      execTruncated: 999,
+      execIncomplete: 999,
+      execReassemblyTimeout: 999,
+      shutdownFinal: true,
+    },
     filterMetrics: {
       scope: 'shadow',
       observed: 9,
@@ -879,6 +1172,13 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       processCacheHits: 10,
       processCacheMisses: 2,
       processProcReads: 1,
+      runtimeSnapshotRetries: 2,
+      runtimeSnapshotRecovered: 1,
+      lastRuntimeSnapshotFailureAt: '2026-08-14T00:00:01.000Z',
+      lastRuntimeSnapshotFailure: 'snapshot transport timed out',
+      lastRuntimeSnapshotFailureVersion: 9,
+      lastRuntimeSnapshotRetryAt: '2026-08-14T00:00:02.000Z',
+      lastRuntimeSnapshotRetryReason: 'snapshot transport timed out',
     },
     message: 'simulated forwarder pressure',
   });
@@ -905,7 +1205,15 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       health.items?.[0]?.filterMetrics?.behaviorCandidates === 1 &&
       health.items?.[0]?.filterMetrics?.processTombstones === 1 &&
       health.items?.[0]?.filterMetrics?.identityCgroupHits === 7 &&
-      health.items?.[0]?.filterMetrics?.processProcReads === 1,
+      health.items?.[0]?.filterMetrics?.processProcReads === 1 &&
+      health.items?.[0]?.filterMetrics?.runtimeSnapshotRetries === 2 &&
+      health.items?.[0]?.filterMetrics?.runtimeSnapshotRecovered === 1 &&
+      health.items?.[0]?.filterMetrics?.lastRuntimeSnapshotFailureAt === '2026-08-14T00:00:01.000Z' &&
+      health.items?.[0]?.filterMetrics?.lastRuntimeSnapshotFailure === 'snapshot transport timed out' &&
+      health.items?.[0]?.filterMetrics?.lastRuntimeSnapshotFailureVersion === 9 &&
+      health.items?.[0]?.filterMetrics?.lastRuntimeSnapshotRetryAt === '2026-08-14T00:00:02.000Z' &&
+      health.items?.[0]?.filterMetrics?.lastRuntimeSnapshotRetryReason === 'snapshot transport timed out' &&
+      health.items?.[0]?.execEvidence?.window?.exec === 3,
     health,
   );
   assert(
@@ -960,7 +1268,13 @@ async function verifyRawHeartbeatPreservesForwarderMetrics(sourceId, token) {
         interval_secs: 30,
         attached_probes: 11,
         enabled_features: ['exec'],
-        exec: 5,
+        exec: 4029,
+        exec_truncated: 0,
+        // Regression: evidence-quality loss must remain observable without becoming an
+        // operational collector error (the real host shutdown run reported this exact value).
+        exec_incomplete: 1899,
+        exec_reassembly_timeout: 4,
+        shutdown_final: true,
         observed_agents: 4,
       },
     },
@@ -982,20 +1296,38 @@ async function verifyRawHeartbeatPreservesForwarderMetrics(sourceId, token) {
     health.total === 1 &&
       health.items?.[0]?.nodeName === `${runId}-node-raw-after-direct` &&
       health.items?.[0]?.mode === 'observe' &&
-      health.items?.[0]?.state === 'healthy' &&
+      health.items?.[0]?.state === 'degraded' &&
       health.items?.[0]?.observedAgentCount === 4 &&
       health.items?.[0]?.attachedProbes === 11 &&
-      health.items?.[0]?.droppedEvents === 0 &&
-      health.items?.[0]?.outputDropped === 0 &&
-      health.items?.[0]?.errorCount === 0 &&
+      health.items?.[0]?.droppedEvents === 2 &&
+      health.items?.[0]?.outputDropped === 1 &&
+      health.items?.[0]?.errorCount === 1 &&
       health.items?.[0]?.windowErrorMaxima?.droppedEvents === 2 &&
       health.items?.[0]?.windowErrorMaxima?.outputDropped === 1 &&
       health.items?.[0]?.windowErrorMaxima?.errorCount === 1 &&
+      health.items?.[0]?.execEvidence?.reported === true &&
+      health.items?.[0]?.execEvidence?.latest?.exec === 4029 &&
+      health.items?.[0]?.execEvidence?.latest?.execTruncated === 0 &&
+      health.items?.[0]?.execEvidence?.latest?.execIncomplete === 1899 &&
+      health.items?.[0]?.execEvidence?.latest?.execReassemblyTimeout === 4 &&
+      health.items?.[0]?.execEvidence?.latest?.shutdownFinal === true &&
+      health.items?.[0]?.execEvidence?.latest?.intervalSecs === 30 &&
+      health.items?.[0]?.execEvidence?.window?.exec === 4032 &&
+      health.items?.[0]?.execEvidence?.window?.execTruncated === 1 &&
+      health.items?.[0]?.execEvidence?.window?.execIncomplete === 1901 &&
+      health.items?.[0]?.execEvidence?.window?.execReassemblyTimeout === 5 &&
+      health.items?.[0]?.execEvidence?.window?.heartbeatCount === 2 &&
+      health.items?.[0]?.execEvidence?.window?.intervalSecs === 60 &&
+      health.items?.[0]?.execEvidence?.window?.shutdownFinalCount === 1 &&
       health.items?.[0]?.filterMetrics?.scope === 'shadow' &&
       health.items?.[0]?.filterMetrics?.wouldFilterNonAgent === 3 &&
       health.items?.[0]?.filterMetrics?.e2eFilterReceipts?.length === 1 &&
       health.items?.[0]?.filterMetrics?.e2eFilterReceipts?.[0]?.lineSha256 === 'b'.repeat(64) &&
-      health.items?.[0]?.filterMetrics?.identityCgroupHits === 7,
+      health.items?.[0]?.filterMetrics?.identityCgroupHits === 7 &&
+      health.items?.[0]?.filterMetrics?.runtimeSnapshotRetries === 2 &&
+      health.items?.[0]?.filterMetrics?.runtimeSnapshotRecovered === 1 &&
+      health.items?.[0]?.filterMetrics?.lastRuntimeSnapshotFailure === 'snapshot transport timed out' &&
+      health.items?.[0]?.filterMetrics?.lastRuntimeSnapshotRetryReason === 'snapshot transport timed out',
     health,
   );
 }
@@ -1039,6 +1371,184 @@ async function verifyCollectorSourceIsolation(sourceId) {
   );
 
   const ownCollectorId = `${runId}-other-collector`;
+  const mismatchedEnvelope = await request('/ingest', 'POST', {
+    line: observerLine(
+      { agent: null, session: null },
+      {
+        CollectorHeartbeat: {
+          collector_id: `${runId}-collector`,
+          node_name: `${runId}-conflicting-envelope`,
+          mode: 'observe',
+          exec: 1,
+          exec_truncated: 0,
+          exec_incomplete: 0,
+          exec_reassembly_timeout: 0,
+          shutdown_final: false,
+        },
+      },
+    ),
+    collectorId: ownCollectorId,
+    sourceId: other.source.sourceId,
+    sourceName: `${runId}-other observer forwarder`,
+    sourceType: 'observer',
+    token: other.token,
+  });
+  assert(
+    'raw heartbeat rejects conflicting envelope and embedded collector IDs',
+    mismatchedEnvelope.accepted === false &&
+      mismatchedEnvelope.sourceId === other.source.sourceId &&
+      mismatchedEnvelope.reason === 'heartbeat envelope collector does not match raw collector',
+    mismatchedEnvelope,
+  );
+
+  const whitespaceEnvelope = await request('/ingest', 'POST', {
+    line: observerLine(
+      { agent: null, session: null },
+      {
+        CollectorHeartbeat: {
+          collector_id: `${runId}-collector`,
+          node_name: `${runId}-whitespace-envelope`,
+          mode: 'observe+extensions',
+          exec: 1,
+          exec_truncated: 0,
+          exec_incomplete: 0,
+          exec_reassembly_timeout: 0,
+          shutdown_final: false,
+        },
+      },
+    ),
+    collectorId: '   ',
+    sourceId: other.source.sourceId,
+    sourceName: `${runId}-other observer forwarder`,
+    sourceType: 'observer',
+    token: other.token,
+  });
+  assert(
+    'blank envelope collector cannot bypass Source-to-raw collector isolation',
+    whitespaceEnvelope.accepted === false &&
+      whitespaceEnvelope.sourceId === other.source.sourceId &&
+      whitespaceEnvelope.reason === 'source collector does not match heartbeat collector',
+    whitespaceEnvelope,
+  );
+
+  const anonymousOuter = `${runId}-anonymous-envelope`;
+  const anonymousInner = `${runId}-anonymous-raw`;
+  const anonymousConflict = await request('/ingest', 'POST', {
+    line: observerLine(
+      { agent: null, session: null },
+      {
+        CollectorHeartbeat: {
+          collector_id: anonymousInner,
+          mode: 'observe+extensions',
+          exec: 1,
+          exec_truncated: 0,
+          exec_incomplete: 0,
+          exec_reassembly_timeout: 0,
+          shutdown_final: false,
+        },
+      },
+    ),
+    collectorId: anonymousOuter,
+    sourceType: 'observer',
+    sourceName: `${runId}-anonymous-conflict`,
+  });
+  const [anonymousOuterSources, anonymousInnerSources, anonymousOuterAlerts, anonymousInnerAlerts] = await Promise.all([
+    request('/sources/list', 'POST', { collectorId: anonymousOuter, limit: 5 }),
+    request('/sources/list', 'POST', { collectorId: anonymousInner, limit: 5 }),
+    request('/alerts/list', 'POST', { timeType: 'last_30d', collectorId: anonymousOuter, kind: 'source', status: 'all', limit: 5 }),
+    request('/alerts/list', 'POST', { timeType: 'last_30d', collectorId: anonymousInner, kind: 'source', status: 'all', limit: 5 }),
+  ]);
+  assert(
+    'anonymous conflicting envelope is rejected without Source or alert side effects',
+    anonymousConflict.accepted === false &&
+      anonymousConflict.reason === 'heartbeat envelope collector does not match raw collector' &&
+      anonymousOuterSources.total === 0 &&
+      anonymousInnerSources.total === 0 &&
+      anonymousOuterAlerts.total === 0 &&
+      anonymousInnerAlerts.total === 0,
+    { anonymousConflict, anonymousOuterSources, anonymousInnerSources, anonymousOuterAlerts, anonymousInnerAlerts },
+  );
+
+  const longCollectorId = `${runId}-long-${'x'.repeat(220)}`;
+  const canonicalLongCollectorId = longCollectorId.slice(0, 180);
+  const longSource = await request('/sources', 'POST', {
+    name: `${runId}-long-collector-source`,
+    type: 'observer',
+    enabled: true,
+    requireToken: true,
+    collectorId: longCollectorId,
+  });
+  const longRaw = await request('/ingest', 'POST', {
+    line: observerLine(
+      { agent: null, session: null },
+      {
+        CollectorHeartbeat: {
+          collector_id: longCollectorId,
+          mode: 'observe+extensions',
+          exec: 1,
+          exec_truncated: 0,
+          exec_incomplete: 0,
+          exec_reassembly_timeout: 0,
+          shutdown_final: false,
+        },
+      },
+    ),
+    collectorId: longCollectorId,
+    sourceId: longSource.source.sourceId,
+    token: longSource.token,
+  });
+  assert(
+    'envelope, raw heartbeat, Source, and persisted record share one collector ID length domain',
+    longSource.source.collectorId === canonicalLongCollectorId &&
+      longRaw.accepted === true &&
+      longRaw.collectorId === canonicalLongCollectorId,
+    { longSource, longRaw, canonicalLongCollectorId },
+  );
+
+  const identityLikeCollectorId = `${runId}-token=sk-collectoridentity1234`;
+  const identityLikeSource = await request('/sources', 'POST', {
+    name: `${runId}-identity-like-collector-source`,
+    type: 'observer',
+    enabled: true,
+    requireToken: true,
+    collectorId: identityLikeCollectorId,
+  });
+  const identityLikeRaw = await request('/ingest', 'POST', {
+    line: observerLine(
+      { agent: null, session: null },
+      {
+        CollectorHeartbeat: {
+          collector_id: identityLikeCollectorId,
+          mode: 'observe+extensions',
+          exec: 1,
+          exec_truncated: 0,
+          exec_incomplete: 0,
+          exec_reassembly_timeout: 0,
+          shutdown_final: false,
+        },
+      },
+    ),
+    collectorId: identityLikeCollectorId,
+    sourceId: identityLikeSource.source.sourceId,
+    token: identityLikeSource.token,
+  });
+  const identityLikeDirect = await request('/collectors/heartbeat', 'POST', {
+    collectorId: identityLikeCollectorId,
+    sourceId: identityLikeSource.source.sourceId,
+    token: identityLikeSource.token,
+    mode: 'observer-forwarder:shadow',
+    status: 'ok',
+  });
+  assert(
+    'identity-like collector text is canonicalized without credential redaction drift',
+    identityLikeSource.source.collectorId === identityLikeCollectorId &&
+      identityLikeRaw.accepted === true &&
+      identityLikeRaw.collectorId === identityLikeCollectorId &&
+      identityLikeDirect.accepted === true &&
+      identityLikeDirect.collectorId === identityLikeCollectorId,
+    { identityLikeSource, identityLikeRaw, identityLikeDirect },
+  );
+
   const ownRaw = await request('/ingest', 'POST', {
     line: observerLine(
       { agent: null, session: null },
@@ -1056,6 +1566,9 @@ async function verifyCollectorSourceIsolation(sourceId) {
   assert(
     'raw heartbeat on isolated collector cannot inherit enriched metrics',
     otherHealth.total === 1 &&
+      otherHealth.items?.[0]?.execEvidence?.reported === false &&
+      otherHealth.items?.[0]?.execEvidence?.latest === undefined &&
+      otherHealth.items?.[0]?.execEvidence?.window?.heartbeatCount === 0 &&
       otherHealth.items?.[0]?.filterMetrics?.scope === 'decoupled' &&
       otherHealth.items?.[0]?.filterMetrics?.observed === 0 &&
       !otherHealth.items?.[0]?.filterMetrics?.e2eFilterReceipts?.length,
@@ -1099,6 +1612,10 @@ async function verifyExplicitForwarderMetricsReplacePrevious(sourceId, token) {
     'new enriched heartbeat replaces prior non-zero metrics and receipts',
     health.total === 1 &&
       health.items?.[0]?.nodeName === `${runId}-node-explicit-zero` &&
+      health.items?.[0]?.state === 'healthy' &&
+      health.items?.[0]?.droppedEvents === 0 &&
+      health.items?.[0]?.outputDropped === 0 &&
+      health.items?.[0]?.errorCount === 0 &&
       health.items?.[0]?.filterMetrics?.scope === 'shadow' &&
       health.items?.[0]?.filterMetrics?.observed === 0 &&
       health.items?.[0]?.filterMetrics?.wouldFilterNonAgent === 0 &&
@@ -1135,6 +1652,7 @@ async function main() {
   console.log(`AnySentry observer ingest verification against ${baseUrl}`);
   await verifyCollectorMetricFreshnessContract();
   await verifyHotRingCapacityContract();
+  await verifyCollectorHeartbeatProvenanceContract();
   await verifyJudgeDispositionContract();
   await verifyRouteScopedBodyLimits();
   await request('/stats');

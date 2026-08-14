@@ -481,11 +481,20 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       'collector heartbeat recovered',
     );
 
+    const qualityOrigin = heartbeat.origin === 'raw_collector' ? 'raw_collector' : 'forwarder';
+    const matchesQualityOrigin = (alert: AlertRecord) =>
+      alert.kind === 'collector' &&
+      alert.collectorId === heartbeat.collectorId &&
+      alert.ruleId === 'collector.quality' &&
+      (
+        alert.labels?.heartbeatOrigin === qualityOrigin ||
+        (qualityOrigin === 'forwarder' && !alert.labels?.heartbeatOrigin)
+      );
     const dropped = heartbeat.droppedEvents + heartbeat.outputDropped;
     const degraded = heartbeat.status !== 'ok' || dropped > 0 || heartbeat.errorCount > 0;
     if (!degraded) {
       this.resolveWhere(
-        (alert) => alert.kind === 'collector' && alert.collectorId === heartbeat.collectorId && alert.ruleId === 'collector.quality',
+        matchesQualityOrigin,
         heartbeat.at,
         'collector quality recovered',
       );
@@ -508,7 +517,11 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       heartbeat.queueDepth > 0 ? `queue=${heartbeat.queueDepth}` : '',
     ].filter(Boolean).join(', ');
     this.upsert({
-      dedupeKey: ['collector', heartbeat.collectorId, 'quality'].join(':'),
+      // Preserve the historical Forwarder alert ID for compatibility with external references;
+      // only the newly separated raw-Collector quality channel needs an origin suffix.
+      dedupeKey: qualityOrigin === 'forwarder'
+        ? ['collector', heartbeat.collectorId, 'quality'].join(':')
+        : ['collector', heartbeat.collectorId, 'quality', qualityOrigin].join(':'),
       ruleId: 'collector.quality',
       kind: 'collector',
       severity,
@@ -518,6 +531,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       nodeName: heartbeat.nodeName,
       sourceSummary: heartbeat.message || reason || heartbeat.status,
       labels: {
+        heartbeatOrigin: qualityOrigin,
         status: heartbeat.status,
         droppedEvents: String(heartbeat.droppedEvents),
         outputDropped: String(heartbeat.outputDropped),
@@ -525,6 +539,14 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       },
       at: heartbeat.at,
     });
+  }
+
+  /** Restore liveness heads without replaying historical resolve/open notifications. */
+  seedCollectorHeartbeat(heartbeat: CollectorHeartbeatRecord): void {
+    const current = this.latestCollectorHeartbeat.get(heartbeat.collectorId);
+    if (!current || heartbeat.at >= current.at) {
+      this.latestCollectorHeartbeat.set(heartbeat.collectorId, heartbeat);
+    }
   }
 
   observeSourceRejection(input: SourceRejectionInput): void {

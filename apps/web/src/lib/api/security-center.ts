@@ -1703,6 +1703,28 @@ export interface AgentTopology {
   updateTime: string;
 }
 
+export interface CollectorExecEvidenceMetrics {
+  exec: number;
+  execTruncated: number;
+  execIncomplete: number;
+  execReassemblyTimeout: number;
+}
+
+export interface CollectorExecEvidenceReport extends CollectorExecEvidenceMetrics {
+  shutdownFinal: boolean;
+}
+
+export interface CollectorExecEvidenceHealth {
+  reported: boolean;
+  lastReportedAt?: string;
+  latest?: CollectorExecEvidenceReport & { intervalSecs: number };
+  window: CollectorExecEvidenceMetrics & {
+    heartbeatCount: number;
+    intervalSecs: number;
+    shutdownFinalCount: number;
+  };
+}
+
 export interface CollectorHeartbeatRequest {
   collectorId?: string;
   sourceId?: string;
@@ -1798,6 +1820,13 @@ export interface CollectorFilterMetrics {
   processBootstrapProcReads: number;
   processFallbackProcReads: number;
   processAncestryProcReads: number;
+  runtimeSnapshotRetries?: number;
+  runtimeSnapshotRecovered?: number;
+  lastRuntimeSnapshotFailureAt?: string;
+  lastRuntimeSnapshotFailure?: string;
+  lastRuntimeSnapshotFailureVersion?: number;
+  lastRuntimeSnapshotRetryAt?: string;
+  lastRuntimeSnapshotRetryReason?: string;
 }
 
 export interface CollectorHeartbeatAck {
@@ -1845,6 +1874,8 @@ export interface CollectorHealthItem {
     outputDropped: number;
     errorCount: number;
   };
+  execEvidence: CollectorExecEvidenceHealth;
+  filterMetricsReported: boolean;
   filterMetrics: CollectorFilterMetrics;
   message?: string;
   eventCategoryCounts: Record<AgentEventCategory, number>;

@@ -1483,6 +1483,10 @@ export class AggregationService {
     const heartbeatHeads = this.judge.collectorHeartbeatHeads();
     const latestHeartbeatByCollector = new Map(heartbeatHeads.latest.map((heartbeat) => [heartbeat.collectorId, heartbeat]));
     const latestMetricsByCollector = new Map(heartbeatHeads.latestMetrics.map((heartbeat) => [heartbeat.collectorId, heartbeat]));
+    const latestRawByCollector = new Map(heartbeatHeads.latestRaw.map((heartbeat) => [heartbeat.collectorId, heartbeat]));
+    const latestForwarderByCollector = new Map(
+      heartbeatHeads.latestForwarder.map((heartbeat) => [heartbeat.collectorId, heartbeat]),
+    );
     const byCollector = new Map<string, T.CollectorHeartbeatRecord[]>();
     for (const hb of windowHeartbeats) (byCollector.get(hb.collectorId) ?? byCollector.set(hb.collectorId, []).get(hb.collectorId)!).push(hb);
     for (const hb of heartbeatHeads.latest) {
@@ -1500,6 +1504,8 @@ export class AggregationService {
     const items = [...byCollector.entries()].map(([collectorId, hbs]): T.CollectorHealthItem => {
       const latest = latestHeartbeatByCollector.get(collectorId);
       const latestMetricsHeartbeat = latestMetricsByCollector.get(collectorId);
+      const latestRawHeartbeat = latestRawByCollector.get(collectorId);
+      const latestForwarderHeartbeat = latestForwarderByCollector.get(collectorId);
       const freshMetricsHeartbeat = latestMetricsHeartbeat?.filterMetricsReportedAt !== undefined &&
         t - latestMetricsHeartbeat.filterMetricsReportedAt <= COLLECTOR_STALE_MS
         ? latestMetricsHeartbeat
@@ -1509,12 +1515,38 @@ export class AggregationService {
       let observedAgentCount = 0;
       let reportedIntervalSecs = 0;
       const windowErrorMaxima = { droppedEvents: 0, outputDropped: 0, errorCount: 0 };
+      const windowExecEvidence: T.CollectorExecEvidenceMetrics & {
+        heartbeatCount: number;
+        intervalSecs: number;
+        shutdownFinalCount: number;
+      } = {
+        exec: 0,
+        execTruncated: 0,
+        execIncomplete: 0,
+        execReassemblyTimeout: 0,
+        heartbeatCount: 0,
+        intervalSecs: 0,
+        shutdownFinalCount: 0,
+      };
+      let latestExecEvidenceHeartbeat: T.CollectorHeartbeatRecord | undefined;
       for (const hb of hbs) {
         observedAgentCount = Math.max(observedAgentCount, hb.observedAgents);
         reportedIntervalSecs += hb.intervalSecs;
         windowErrorMaxima.droppedEvents = Math.max(windowErrorMaxima.droppedEvents, hb.droppedEvents ?? 0);
         windowErrorMaxima.outputDropped = Math.max(windowErrorMaxima.outputDropped, hb.outputDropped ?? 0);
         windowErrorMaxima.errorCount = Math.max(windowErrorMaxima.errorCount, hb.errorCount ?? 0);
+        if (hb.origin === 'raw_collector' && hb.execEvidence) {
+          windowExecEvidence.exec += hb.execEvidence.exec ?? 0;
+          windowExecEvidence.execTruncated += hb.execEvidence.execTruncated ?? 0;
+          windowExecEvidence.execIncomplete += hb.execEvidence.execIncomplete ?? 0;
+          windowExecEvidence.execReassemblyTimeout += hb.execEvidence.execReassemblyTimeout ?? 0;
+          windowExecEvidence.heartbeatCount += 1;
+          windowExecEvidence.intervalSecs += hb.intervalSecs ?? 0;
+          if (hb.execEvidence.shutdownFinal) windowExecEvidence.shutdownFinalCount += 1;
+          if (!latestExecEvidenceHeartbeat || hb.at >= latestExecEvidenceHeartbeat.at) {
+            latestExecEvidenceHeartbeat = hb;
+          }
+        }
         for (const [kind, count] of Object.entries(hb.eventKindCounts)) {
           eventCount += count;
           const category = eventCategory(kind);
@@ -1522,7 +1554,29 @@ export class AggregationService {
         }
       }
       const age = latest ? t - latest.at : Infinity;
-      const degraded = latest ? latest.status !== 'ok' || latest.droppedEvents > 0 || latest.outputDropped > 0 || latest.errorCount > 0 : false;
+      // Raw Collector and enriched Forwarder heartbeats are independent operational producers.
+      // A clean record from one must not erase the latest error/drop reported by the other.
+      const operationalHeads = [latestRawHeartbeat, latestForwarderHeartbeat].filter(
+        (heartbeat): heartbeat is T.CollectorHeartbeatRecord => heartbeat !== undefined,
+      );
+      const currentDroppedEvents = operationalHeads.reduce(
+        (value, heartbeat) => Math.max(value, heartbeat.droppedEvents), 0,
+      );
+      const currentOutputDropped = operationalHeads.reduce(
+        (value, heartbeat) => Math.max(value, heartbeat.outputDropped), 0,
+      );
+      const currentErrorCount = operationalHeads.reduce(
+        (value, heartbeat) => Math.max(value, heartbeat.errorCount), 0,
+      );
+      const currentQueueDepth = operationalHeads.reduce(
+        (value, heartbeat) => Math.max(value, heartbeat.queueDepth), 0,
+      );
+      const degraded = operationalHeads.some((heartbeat) =>
+        heartbeat.status !== 'ok' ||
+        heartbeat.droppedEvents > 0 ||
+        heartbeat.outputDropped > 0 ||
+        heartbeat.errorCount > 0,
+      );
       const state: T.CollectorHealthState = age > COLLECTOR_DOWN_MS
         ? 'down'
         : age > COLLECTOR_STALE_MS
@@ -1551,13 +1605,32 @@ export class AggregationService {
         observedWorkspaceCount: 0,
         attachedProbes: latest?.attachedProbes ?? 0,
         enabledFeatures: latest?.enabledFeatures ?? [],
-        queueDepth: latest?.queueDepth ?? 0,
-        droppedEvents: latest?.droppedEvents ?? 0,
-        outputDropped: latest?.outputDropped ?? 0,
-        errorCount: latest?.errorCount ?? 0,
+        queueDepth: currentQueueDepth,
+        droppedEvents: currentDroppedEvents,
+        outputDropped: currentOutputDropped,
+        errorCount: currentErrorCount,
         windowErrorMaxima,
+        execEvidence: {
+          reported: latestExecEvidenceHeartbeat !== undefined,
+          ...(latestExecEvidenceHeartbeat ? {
+            // Preserve milliseconds for the shutdown barrier; top-level health timestamps are
+            // intentionally second-granular and cannot order two raw heartbeats in one second.
+            lastReportedAt: new Date(latestExecEvidenceHeartbeat.at).toISOString(),
+            latest: {
+              exec: latestExecEvidenceHeartbeat.execEvidence?.exec ?? 0,
+              execTruncated: latestExecEvidenceHeartbeat.execEvidence?.execTruncated ?? 0,
+              execIncomplete: latestExecEvidenceHeartbeat.execEvidence?.execIncomplete ?? 0,
+              execReassemblyTimeout: latestExecEvidenceHeartbeat.execEvidence?.execReassemblyTimeout ?? 0,
+              shutdownFinal: latestExecEvidenceHeartbeat.execEvidence?.shutdownFinal === true,
+              intervalSecs: latestExecEvidenceHeartbeat.intervalSecs ?? 0,
+            },
+          } : {}),
+          window: windowExecEvidence,
+        },
+        filterMetricsReported: freshMetricsHeartbeat !== undefined,
         filterMetrics: freshMetricsHeartbeat?.filterMetrics ?? {
           scope: 'decoupled',
+          shutdownFinal: false,
           filterMode: 'shadow',
           retainUnknown: true,
           retainNonAgent: false,

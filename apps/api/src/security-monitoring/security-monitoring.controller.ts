@@ -272,6 +272,22 @@ function numField(o: Record<string, unknown>, ...keys: string[]): number | undef
   return undefined;
 }
 
+function nonNegativeSafeIntegerField(o: Record<string, unknown>, ...keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = o[key];
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return value;
+  }
+  return undefined;
+}
+
+function boolField(o: Record<string, unknown>, ...keys: string[]): boolean | undefined {
+  for (const key of keys) {
+    const value = o[key];
+    if (typeof value === 'boolean') return value;
+  }
+  return undefined;
+}
+
 function strArrayField(o: Record<string, unknown>, ...keys: string[]): string[] | undefined {
   for (const key of keys) {
     const v = o[key];
@@ -280,7 +296,7 @@ function strArrayField(o: Record<string, unknown>, ...keys: string[]): string[] 
   return undefined;
 }
 
-function parseCollectorHeartbeatLine(line: string): T.CollectorHeartbeatRequest | null {
+function parseCollectorHeartbeatLine(line: string): T.CollectorRawHeartbeatRequest | null {
   try {
     const parsed = JSON.parse(line) as { event?: Record<string, unknown> };
     const hb = obj(parsed.event?.CollectorHeartbeat);
@@ -307,9 +323,20 @@ function parseCollectorHeartbeatLine(line: string): T.CollectorHeartbeatRequest 
         if (Number.isFinite(count)) eventKindCounts[key] = count;
       }
     }
-    const execIncomplete = numField(hb, 'execIncomplete', 'exec_incomplete');
+    const exec = nonNegativeSafeIntegerField(hb, 'exec');
+    const execTruncated = nonNegativeSafeIntegerField(hb, 'execTruncated', 'exec_truncated');
+    const execIncomplete = nonNegativeSafeIntegerField(hb, 'execIncomplete', 'exec_incomplete');
+    const execReassemblyTimeout = nonNegativeSafeIntegerField(hb, 'execReassemblyTimeout', 'exec_reassembly_timeout');
+    const shutdownFinal = boolField(hb, 'shutdownFinal', 'shutdown_final');
+    // Evidence is fail-closed: older or malformed raw schemas remain visible as heartbeats, but
+    // cannot masquerade as complete graceful-shutdown/argv-quality proof.
+    const reportsExecEvidence = [exec, execTruncated, execIncomplete, execReassemblyTimeout]
+      .every((value) => value !== undefined) &&
+      [execTruncated, execIncomplete, execReassemblyTimeout]
+        .every((value) => (value as number) <= (exec as number)) &&
+      shutdownFinal !== undefined;
     return {
-      collectorId: strField(hb, 'collectorId', 'collector_id'),
+      collectorId: canonicalCollectorId(strField(hb, 'collectorId', 'collector_id')),
       nodeName: strField(hb, 'nodeName', 'node_name'),
       namespace: strField(hb, 'namespace'),
       podName: strField(hb, 'podName', 'pod_name'),
@@ -323,10 +350,15 @@ function parseCollectorHeartbeatLine(line: string): T.CollectorHeartbeatRequest 
       droppedEvents: numField(hb, 'droppedEvents', 'dropped'),
       outputDropped: numField(hb, 'outputDropped', 'output_dropped'),
       observedAgents: numField(hb, 'observedAgents', 'observed_agents'),
-      errorCount: numField(hb, 'errorCount', 'error_count') ?? execIncomplete,
+      errorCount: numField(hb, 'errorCount', 'error_count'),
+      execEvidence: reportsExecEvidence ? {
+        exec: exec as number,
+        execTruncated: execTruncated as number,
+        execIncomplete: execIncomplete as number,
+        execReassemblyTimeout: execReassemblyTimeout as number,
+        shutdownFinal: shutdownFinal as boolean,
+      } : undefined,
       queueDepth: numField(hb, 'queueDepth', 'queue_depth'),
-      filterMetrics:
-        (obj(hb.filterMetrics) ?? obj(hb.filter_metrics)) as T.CollectorFilterMetrics | undefined,
       message: strField(hb, 'message'),
     };
   } catch {
@@ -826,6 +858,14 @@ function evidenceMarkdown(bundle: T.EvidenceBundle): string {
 function cleanString(value: unknown, limit: number): string | undefined {
   const text = typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
   return text ? redact(text).slice(0, limit) : undefined;
+}
+
+function canonicalCollectorId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const text = value.trim();
+  // Collector IDs are protocol identities, not display text. Redacting only one side of an
+  // identity comparison would change the principal and could bind a heartbeat to the wrong Source.
+  return text ? text.slice(0, 180) : undefined;
 }
 
 function finiteNumber(value: unknown): number | undefined {
@@ -3363,7 +3403,7 @@ export class SecurityMonitoringController {
     const requestSourceId = body.sourceId ?? headerValue(headers, 'x-anysentry-source-id');
     const requestToken = body.token ?? headerValue(headers, 'x-anysentry-ingest-token') ?? bearerToken(headers);
     const requestSourceType = body.sourceType ?? 'forwarder';
-    const requestCollectorId = body.collectorId;
+    const requestCollectorId = canonicalCollectorId(body.collectorId);
     const sourceResolution = this.sources.resolve({
       sourceId: requestSourceId,
       token: requestToken,
@@ -3396,7 +3436,7 @@ export class SecurityMonitoringController {
     if (
       requestCollectorId &&
       sourceResolution.source?.collectorId &&
-      sourceResolution.source.collectorId !== requestCollectorId
+      canonicalCollectorId(sourceResolution.source.collectorId) !== requestCollectorId
     ) {
       const reason = 'source collector does not match heartbeat collector';
       this.recordRejectedIngest(sourceResolution, reason, {
@@ -3420,8 +3460,10 @@ export class SecurityMonitoringController {
 
     const rec = this.judge.recordCollectorHeartbeat({
       ...body,
-      collectorId: body.collectorId ?? sourceResolution.source?.collectorId,
-    });
+      collectorId: requestCollectorId ?? canonicalCollectorId(sourceResolution.source?.collectorId),
+      // Raw-only evidence is accepted exclusively through the parsed Observer line ingress.
+      execEvidence: undefined,
+    }, Date.now(), 'forwarder');
     this.sources.recordAccepted(sourceResolution, 'heartbeat', { collectorId: rec.collectorId, workspacePath: body.workspacePath });
     this.agg.invalidateWindowCache();
     if (sourceResolution.source) {
@@ -5053,10 +5095,31 @@ export class SecurityMonitoringController {
   /** The real ingestion seam: external agents/observers POST events here to be judged + counted. */
   @Post('ingest')
   async ingest(@Body() body: IngestBody, @Headers() headers: HeaderBag) {
-    const { line, collectorId, nodeName, sourceId, sourceName, sourceType, token, sourceEventId, ...given } = body;
+    const {
+      line,
+      collectorId: collectorIdInput,
+      nodeName,
+      sourceId,
+      sourceName,
+      sourceType,
+      token,
+      sourceEventId,
+      ...given
+    } = body;
+    const collectorId = canonicalCollectorId(collectorIdInput);
     const heartbeat = parseCollectorHeartbeatLine(line);
     const requestSourceId = sourceId ?? headerValue(headers, 'x-anysentry-source-id');
     const requestToken = token ?? headerValue(headers, 'x-anysentry-ingest-token') ?? bearerToken(headers);
+    if (heartbeat?.collectorId && collectorId && heartbeat.collectorId !== collectorId) {
+      // Reject before Source resolution. This branch is intentionally side-effect free because the
+      // optional Source identity and token have not been authenticated yet.
+      const reason = 'heartbeat envelope collector does not match raw collector';
+      return {
+        accepted: false,
+        reason,
+        sourceId: requestSourceId,
+      };
+    }
     const requestCollectorId = collectorId ?? heartbeat?.collectorId;
     const sourceResolution = this.sources.resolve({
       sourceId: requestSourceId,
@@ -5084,7 +5147,7 @@ export class SecurityMonitoringController {
       heartbeat &&
       requestCollectorId &&
       sourceResolution.source?.collectorId &&
-      sourceResolution.source.collectorId !== requestCollectorId
+      canonicalCollectorId(sourceResolution.source.collectorId) !== requestCollectorId
     ) {
       const reason = 'source collector does not match heartbeat collector';
       this.recordRejectedIngest(sourceResolution, reason, {
@@ -5102,9 +5165,11 @@ export class SecurityMonitoringController {
     if (heartbeat) {
       const rec = this.judge.recordCollectorHeartbeat({
         ...heartbeat,
-        collectorId: heartbeat.collectorId ?? requestCollectorId ?? sourceResolution.source?.collectorId,
+        collectorId: heartbeat.collectorId ?? requestCollectorId ?? canonicalCollectorId(sourceResolution.source?.collectorId),
         nodeName: heartbeat.nodeName ?? nodeName,
-      });
+        // A raw line cannot refresh Forwarder-owned leases, receipts, or filter metrics.
+        filterMetrics: undefined,
+      }, Date.now(), 'raw_collector');
       this.sources.recordAccepted(sourceResolution, 'heartbeat', { collectorId: rec.collectorId, workspacePath: given.workspacePath ?? sourceResolution.source?.workspacePath });
       this.agg.invalidateWindowCache();
       if (sourceResolution.source) {

@@ -38,6 +38,10 @@ async function withForwarder(label, respond, verify) {
       const parsed = body ? JSON.parse(body) : undefined;
       requests.push({ method: request.method, url: request.url, body: parsed });
       const payload = respond({ method: request.method, url: request.url, body: parsed }, requests);
+      if (payload?.destroy === true) {
+        response.destroy();
+        return;
+      }
       response.writeHead(payload?.status ?? 200, { 'Content-Type': 'application/json' });
       response.end(JSON.stringify(payload?.body ?? { accepted: true }));
     });
@@ -66,7 +70,7 @@ async function withForwarder(label, respond, verify) {
   });
 
   try {
-    await verify(requests);
+    await verify(requests, child);
     child.stdin.end();
     const exitCode = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -124,6 +128,155 @@ await withForwarder(
     assert.equal(typeof leases[0].body.bootId, 'string');
     assert.equal(leases[0].body.forwarderPid > 0, true);
     assert.match(leases[0].body.forwarderStartTimeTicks, /^\d+$/u);
+  },
+);
+
+await withForwarder(
+  'snapshot-transport-retry',
+  (request, requests) => {
+    if (request.url === '/security-center/runtime/lease') {
+      return { body: { accepted: true, leaseEpoch: 3 } };
+    }
+    if (request.url === '/security-center/runtime/snapshot') {
+      const snapshots = requests.filter((item) => item.url === request.url).length;
+      if (snapshots === 1) return { destroy: true };
+      return { body: { accepted: true, applied: false, duplicate: true } };
+    }
+    return { body: { accepted: true } };
+  },
+  async (requests) => {
+    const snapshots = await waitFor(
+      'same-version runtime snapshot retry after a transport failure',
+      () => {
+        const items = requests.filter((item) => item.url === '/security-center/runtime/snapshot');
+        return items.length >= 2 ? items : undefined;
+      },
+    );
+    assert.equal(snapshots[0].body.snapshotVersion, snapshots[1].body.snapshotVersion);
+    assert.deepEqual(snapshots[0].body, snapshots[1].body);
+    const heartbeat = await waitFor(
+      'successful runtime snapshot metrics after retry',
+      () => [...requests]
+        .reverse()
+        .find((item) =>
+          item.url === '/security-center/collectors/heartbeat' &&
+          item.body?.filterMetrics?.runtimeSnapshotPosts >= 2 &&
+          item.body?.filterMetrics?.lastRuntimeSnapshotAt),
+    );
+    assert.equal(heartbeat.body.filterMetrics.runtimeSnapshotErrors, 0);
+    assert.equal(heartbeat.body.errorCount, 0);
+    assert.equal(heartbeat.body.filterMetrics.runtimeSnapshotPosts, 2);
+    assert.equal(heartbeat.body.filterMetrics.runtimeSnapshotRetries, 1);
+    assert.equal(heartbeat.body.filterMetrics.runtimeSnapshotRecovered, 1);
+    assert.equal(heartbeat.body.filterMetrics.runtimeSnapshotDuplicates, 1);
+    assert.equal(typeof heartbeat.body.filterMetrics.lastRuntimeSnapshotRetryAt, 'string');
+    assert.match(heartbeat.body.filterMetrics.lastRuntimeSnapshotRetryReason ?? '', /socket|hang|reset/iu);
+    assert.equal(heartbeat.body.filterMetrics.lastRuntimeSnapshotError, undefined);
+  },
+);
+
+await withForwarder(
+  'snapshot-retry-superseded-by-shutdown',
+  (request, requests) => {
+    if (request.url === '/security-center/runtime/lease') {
+      return { body: { accepted: true, leaseEpoch: 6 } };
+    }
+    if (request.url === '/security-center/runtime/snapshot') {
+      const snapshots = requests.filter((item) => item.url === request.url).length;
+      if (snapshots === 1) return { status: 503, body: { accepted: false } };
+      return { body: { accepted: true, applied: true, duplicate: false } };
+    }
+    return { body: { accepted: true } };
+  },
+  async (requests, child) => {
+    const first = await waitFor(
+      'runtime snapshot failure before graceful shutdown',
+      () => requests.find((item) => item.url === '/security-center/runtime/snapshot'),
+    );
+    child.stdin.end();
+    const finalHeartbeat = await waitFor(
+      'final heartbeat after scheduled runtime snapshot retry is superseded',
+      () => [...requests]
+        .reverse()
+        .find((item) =>
+          item.url === '/security-center/collectors/heartbeat' &&
+          item.body?.filterMetrics?.shutdownFinal === true),
+    );
+    const snapshots = requests.filter((item) => item.url === '/security-center/runtime/snapshot');
+    assert.equal(
+      snapshots.filter((item) => item.body.snapshotVersion === first.body.snapshotVersion).length,
+      1,
+      'a scheduled retry must not post after graceful shutdown supersedes its operation',
+    );
+    assert.ok(snapshots.some((item) => item.body.snapshotVersion > first.body.snapshotVersion));
+    assert.equal(finalHeartbeat.body.errorCount, 0);
+    assert.equal(finalHeartbeat.body.filterMetrics.runtimeSnapshotErrors, 0);
+    assert.equal(finalHeartbeat.body.filterMetrics.runtimeSnapshotRetries, 0);
+    assert.equal(finalHeartbeat.body.filterMetrics.runtimeSnapshotRecovered, 0);
+  },
+);
+
+await withForwarder(
+  'snapshot-transport-exhausted',
+  (request) => {
+    if (request.url === '/security-center/runtime/lease') {
+      return { body: { accepted: true, leaseEpoch: 4 } };
+    }
+    if (request.url === '/security-center/runtime/snapshot') {
+      return { status: 503, body: { accepted: false } };
+    }
+    return { body: { accepted: true } };
+  },
+  async (requests) => {
+    const heartbeat = await waitFor(
+      'exhausted runtime snapshot retry metrics',
+      () => [...requests]
+        .reverse()
+        .find((item) =>
+          item.url === '/security-center/collectors/heartbeat' &&
+          item.body?.filterMetrics?.runtimeSnapshotPosts === 2 &&
+          item.body?.filterMetrics?.runtimeSnapshotErrors === 1),
+    );
+    assert.equal(heartbeat.body.filterMetrics.runtimeSnapshotRetries, 1);
+    assert.equal(heartbeat.body.filterMetrics.runtimeSnapshotRecovered, 0);
+    assert.equal(heartbeat.body.errorCount, 1);
+    assert.equal(heartbeat.body.filterMetrics.runtimeSnapshotPosts, 2);
+    assert.match(heartbeat.body.filterMetrics.lastRuntimeSnapshotError ?? '', /503/u);
+    assert.equal(typeof heartbeat.body.filterMetrics.lastRuntimeSnapshotFailureAt, 'string');
+    assert.match(heartbeat.body.filterMetrics.lastRuntimeSnapshotFailure ?? '', /503/u);
+    assert.equal(heartbeat.body.filterMetrics.lastRuntimeSnapshotFailureVersion, 1);
+  },
+);
+
+await withForwarder(
+  'snapshot-non-retryable-http',
+  (request) => {
+    if (request.url === '/security-center/runtime/lease') {
+      return { body: { accepted: true, leaseEpoch: 5 } };
+    }
+    if (request.url === '/security-center/runtime/snapshot') {
+      return { status: 401, body: { accepted: false } };
+    }
+    return { body: { accepted: true } };
+  },
+  async (requests) => {
+    const heartbeat = await waitFor(
+      'non-retryable runtime snapshot HTTP failure metrics',
+      () => [...requests]
+        .reverse()
+        .find((item) =>
+          item.url === '/security-center/collectors/heartbeat' &&
+          item.body?.filterMetrics?.runtimeSnapshotErrors === 1),
+    );
+    assert.equal(
+      requests.filter((item) => item.url === '/security-center/runtime/snapshot').length,
+      1,
+    );
+    assert.equal(heartbeat.body.filterMetrics.runtimeSnapshotRetries, 0);
+    assert.equal(heartbeat.body.filterMetrics.runtimeSnapshotRecovered, 0);
+    assert.equal(heartbeat.body.errorCount, 1);
+    assert.equal(heartbeat.body.filterMetrics.runtimeSnapshotPosts, 1);
+    assert.match(heartbeat.body.filterMetrics.lastRuntimeSnapshotError ?? '', /401/u);
   },
 );
 

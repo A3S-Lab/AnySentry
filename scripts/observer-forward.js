@@ -299,8 +299,15 @@ let runtimeSnapshotPosts = 0;
 let runtimeSnapshotErrors = 0;
 let runtimeSnapshotRejected = 0;
 let runtimeSnapshotDuplicates = 0;
+let runtimeSnapshotRetries = 0;
+let runtimeSnapshotRecovered = 0;
 let lastRuntimeSnapshotAt = '';
 let lastRuntimeSnapshotError = '';
+let lastRuntimeSnapshotRetryAt = '';
+let lastRuntimeSnapshotRetryReason = '';
+let lastRuntimeSnapshotFailureAt = '';
+let lastRuntimeSnapshotFailure = '';
+let lastRuntimeSnapshotFailureVersion = 0;
 let runtimeLeaseEpoch;
 let runtimeLeaseAttempts = 0;
 let runtimeLeaseErrors = 0;
@@ -311,6 +318,24 @@ let runtimeSnapshotOperation = 0;
 let reconcileTimer;
 let reconcileRunning = false;
 let reconcilePending = false;
+
+function recordRuntimeSnapshotFailure(reason, snapshotVersion = runtimeSnapshotVersion) {
+  lastRuntimeSnapshotFailureAt = new Date().toISOString();
+  lastRuntimeSnapshotFailure = String(reason || 'runtime snapshot failed').slice(0, 500);
+  lastRuntimeSnapshotFailureVersion = Number.isSafeInteger(snapshotVersion) && snapshotVersion > 0
+    ? snapshotVersion
+    : 0;
+}
+
+function retryableRuntimeSnapshotError(error) {
+  if (error?.retriable === false) return false;
+  const statusCode = Number(error?.statusCode);
+  return !Number.isFinite(statusCode)
+    || statusCode === 408
+    || statusCode === 425
+    || statusCode === 429
+    || statusCode >= 500;
+}
 let reconcileRequestedAt = 0;
 const RECONCILE_MIN_INTERVAL_MS = boundedNumber(
   process.env.ANYSENTRY_AGENT_RUNTIME_RECONCILE_MIN_MS,
@@ -688,7 +713,9 @@ function postJsonResponse(url, bodyObj, timeoutMs, done) {
   const isHttps = url.protocol === 'https:';
   const transport = isHttps ? https : http;
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    done(new Error(`unsupported protocol ${url.protocol}`));
+    const error = new Error(`unsupported protocol ${url.protocol}`);
+    error.retriable = false;
+    done(error);
     return;
   }
   const body = JSON.stringify(bodyObj);
@@ -742,18 +769,24 @@ function postJsonResponse(url, bodyObj, timeoutMs, done) {
       });
       res.on('end', () => {
         if ((res.statusCode || 500) >= 400) {
-          finish(new Error(`control endpoint returned ${res.statusCode}`));
+          const error = new Error(`control endpoint returned ${res.statusCode}`);
+          error.statusCode = res.statusCode;
+          finish(error);
           return;
         }
         if (oversized) {
-          finish(new Error('control endpoint response exceeds 64 KiB'));
+          const error = new Error('control endpoint response exceeds 64 KiB');
+          error.retriable = false;
+          finish(error);
           return;
         }
         try {
           const parsed = data ? JSON.parse(data) : undefined;
           finish(undefined, parsed?.data ?? parsed);
         } catch {
-          finish(new Error('control endpoint returned invalid JSON'));
+          const error = new Error('control endpoint returned invalid JSON');
+          error.retriable = false;
+          finish(error);
         }
       });
       res.on('aborted', () => finish(new Error('control endpoint response aborted')));
@@ -984,49 +1017,87 @@ function sendRuntimeSnapshot(ready = true, done = () => {}, timeoutMs = 5_000) {
       return;
     }
     const body = runtimeSnapshotBody(ready);
-    runtimeSnapshotPosts++;
-    postJsonResponse(runtimeSnapshotTarget, body, timeoutMs, (error, ack) => {
+    const deadline = Date.now() + Math.max(100, timeoutMs);
+    const maxAttempts = 2;
+    const postSnapshot = (attempt, retryReason = '') => {
       if (operation !== runtimeSnapshotOperation) {
         finish(true);
         return;
       }
-      if (error) {
-        runtimeSnapshotErrors++;
-        errorCount++;
-        lastRuntimeSnapshotError = error.message;
-        finish(true);
-        return;
-      }
-      if (ack?.accepted !== true || (ack?.applied !== true && ack?.duplicate !== true)) {
-        const reason = typeof ack?.reason === 'string' && ack.reason.trim()
-          ? ack.reason.trim().slice(0, 500)
-          : 'runtime snapshot rejected';
-        const reasonCode = typeof ack?.reasonCode === 'string' ? ack.reasonCode : '';
-        runtimeSnapshotRejected++;
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        const reason = retryReason || lastRuntimeSnapshotRetryReason || 'runtime snapshot retry deadline exceeded';
         runtimeSnapshotErrors++;
         errorCount++;
         lastRuntimeSnapshotError = reason;
-        if (reasonCode === 'lease_not_found') {
-          // The API may have restarted and lost its in-memory lease table. A fresh server-issued
-          // epoch is safe; retry on the next bounded snapshot cycle.
-          runtimeLeaseEpoch = undefined;
-        } else if (
-          ['lease_epoch_stale', 'lease_owner_mismatch', 'stale_forwarder', 'collector_conflict'].includes(reasonCode)
-          || /\b(?:fenced|superseded)\b/iu.test(reason)
-        ) {
-          // A fenced process must never automatically acquire a newer epoch and steal ownership
-          // back from its replacement. Event forwarding remains available until normal shutdown.
-          runtimeLeaseFenced = true;
-          runtimeLeaseEpoch = undefined;
-        }
+        recordRuntimeSnapshotFailure(reason, body.snapshotVersion);
         finish(true);
         return;
       }
-      if (ack.duplicate === true) runtimeSnapshotDuplicates++;
-      lastRuntimeSnapshotAt = new Date().toISOString();
-      lastRuntimeSnapshotError = '';
-      finish(false);
-    });
+      const attemptsLeft = maxAttempts - attempt + 1;
+      const attemptTimeoutMs = Math.max(1, Math.floor(remainingMs / attemptsLeft));
+      if (attempt > 1) {
+        runtimeSnapshotRetries++;
+        lastRuntimeSnapshotRetryAt = new Date().toISOString();
+        lastRuntimeSnapshotRetryReason = retryReason.slice(0, 500);
+      }
+      runtimeSnapshotPosts++;
+      postJsonResponse(runtimeSnapshotTarget, body, attemptTimeoutMs, (error, ack) => {
+        if (operation !== runtimeSnapshotOperation) {
+          finish(true);
+          return;
+        }
+        if (
+          error &&
+          retryableRuntimeSnapshotError(error) &&
+          attempt < maxAttempts &&
+          Date.now() + 150 < deadline
+        ) {
+          setTimeout(() => postSnapshot(attempt + 1, error.message), 100);
+          return;
+        }
+        if (error) {
+          runtimeSnapshotErrors++;
+          errorCount++;
+          lastRuntimeSnapshotError = error.message;
+          recordRuntimeSnapshotFailure(error.message, body.snapshotVersion);
+          finish(true);
+          return;
+        }
+        if (ack?.accepted !== true || (ack?.applied !== true && ack?.duplicate !== true)) {
+          const reason = typeof ack?.reason === 'string' && ack.reason.trim()
+            ? ack.reason.trim().slice(0, 500)
+            : 'runtime snapshot rejected';
+          const reasonCode = typeof ack?.reasonCode === 'string' ? ack.reasonCode : '';
+          runtimeSnapshotRejected++;
+          runtimeSnapshotErrors++;
+          errorCount++;
+          lastRuntimeSnapshotError = reason;
+          recordRuntimeSnapshotFailure(reason, body.snapshotVersion);
+          if (reasonCode === 'lease_not_found') {
+            // The API may have restarted and lost its in-memory lease table. A fresh server-issued
+            // epoch is safe; retry on the next bounded snapshot cycle.
+            runtimeLeaseEpoch = undefined;
+          } else if (
+            ['lease_epoch_stale', 'lease_owner_mismatch', 'stale_forwarder', 'collector_conflict'].includes(reasonCode)
+            || /\b(?:fenced|superseded)\b/iu.test(reason)
+          ) {
+            // A fenced process must never automatically acquire a newer epoch and steal ownership
+            // back from its replacement. Event forwarding remains available until normal shutdown.
+            runtimeLeaseFenced = true;
+            runtimeLeaseEpoch = undefined;
+          }
+          finish(true);
+          return;
+        }
+        if (ack.duplicate === true) runtimeSnapshotDuplicates++;
+        if (attempt > 1) runtimeSnapshotRecovered++;
+        lastRuntimeSnapshotAt = new Date().toISOString();
+        lastRuntimeSnapshotError = '';
+        finish(false);
+      });
+    };
+    postSnapshot(1);
   })().catch((error) => {
     if (operation !== runtimeSnapshotOperation) {
       finish(true);
@@ -1035,6 +1106,7 @@ function sendRuntimeSnapshot(ready = true, done = () => {}, timeoutMs = 5_000) {
     runtimeSnapshotErrors++;
     errorCount++;
     lastRuntimeSnapshotError = error instanceof Error ? error.message : String(error);
+    recordRuntimeSnapshotFailure(lastRuntimeSnapshotError);
     finish(true);
   });
 }
@@ -1230,8 +1302,15 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
         runtimeSnapshotErrors,
         runtimeSnapshotRejected,
         runtimeSnapshotDuplicates,
+        runtimeSnapshotRetries,
+        runtimeSnapshotRecovered,
         lastRuntimeSnapshotAt: lastRuntimeSnapshotAt || undefined,
         lastRuntimeSnapshotError: lastRuntimeSnapshotError || undefined,
+        lastRuntimeSnapshotRetryAt: lastRuntimeSnapshotRetryAt || undefined,
+        lastRuntimeSnapshotRetryReason: lastRuntimeSnapshotRetryReason || undefined,
+        lastRuntimeSnapshotFailureAt: lastRuntimeSnapshotFailureAt || undefined,
+        lastRuntimeSnapshotFailure: lastRuntimeSnapshotFailure || undefined,
+        lastRuntimeSnapshotFailureVersion: lastRuntimeSnapshotFailureVersion || undefined,
         runtimeLeaseEpoch,
         runtimeLeaseAttempts,
         runtimeLeaseErrors,

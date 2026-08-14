@@ -1751,6 +1751,45 @@ async function systemdResourceAbsenceChecks(options, checks) {
   }
 }
 
+async function collectorHistoryAbsenceChecks(options, checks, apiState) {
+  const planes = [
+    ...(options.agents.some((agent) => agent.startsWith('host-'))
+      ? [{ environment: 'host', baseUrl: options.hostApiBase, available: Boolean(apiState.host?.health) }]
+      : []),
+    ...(options.agents.includes('docker-pi')
+      ? [{ environment: 'docker', baseUrl: options.dockerApiBase, available: Boolean(apiState.docker?.health) }]
+      : []),
+    ...(options.agents.includes('k8s-pi')
+      ? [{ environment: 'k8s', baseUrl: options.k8sApiBase, available: Boolean(apiState.k8s?.health) }]
+      : []),
+  ];
+  for (const plane of planes) {
+    if (!plane.available) continue;
+    for (const phase of options.phases) {
+      const id = collectorId(options, plane.environment, phase);
+      try {
+        const existing = await queryHeartbeat(plane.baseUrl, id);
+        check(
+          checks,
+          'collector history absent: ' + id,
+          existing ? 'block' : 'pass',
+          existing
+            ? 'the exact collector ID already has API heartbeat history; use a new run ID'
+            : 'no prior heartbeat exists for this run-scoped collector ID',
+        );
+      } catch (error) {
+        check(
+          checks,
+          'collector history absent: ' + id,
+          'block',
+          'could not verify API heartbeat history: ' +
+            redact(error instanceof Error ? error.message : String(error)),
+        );
+      }
+    }
+  }
+}
+
 async function preflight(options, apiState = {}) {
   const checks = [];
   const needsK8s = options.agents.includes('k8s-pi');
@@ -2076,6 +2115,7 @@ async function preflight(options, apiState = {}) {
     const k8sOnly = { ...options, agents: ['k8s-pi'] };
     await resourceAbsenceChecks(k8sOnly, checks);
   }
+  await collectorHistoryAbsenceChecks(options, checks, apiState);
   return {
     checks,
     blockers: checks.filter((item) => item.status === 'block'),
@@ -2282,9 +2322,91 @@ async function queryHeartbeat(baseUrl, collector) {
   return result.items.find((item) => item.collectorId === collector);
 }
 
+async function assertCollectorHistoryAbsentBeforeStart(baseUrl, collector, environment, phase) {
+  const existing = await queryHeartbeat(baseUrl, collector);
+  assert.equal(
+    existing,
+    undefined,
+    environment + '/' + phase + ' collector ID acquired API history after preflight; use a new run ID',
+  );
+}
+
 function numericMetric(metrics, name) {
-  const value = Number(metrics?.[name]);
-  return Number.isFinite(value) && value >= 0 ? value : 0;
+  const value = metrics?.[name];
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function optionalNumericMetric(metrics, name) {
+  const raw = metrics?.[name];
+  return typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? raw : undefined;
+}
+
+function nonNegativeSafeInteger(metrics, name) {
+  const value = metrics?.[name];
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+function execEvidenceQuality(item) {
+  const evidence = item?.execEvidence && typeof item.execEvidence === 'object'
+    ? item.execEvidence
+    : {};
+  const latest = evidence.latest && typeof evidence.latest === 'object'
+    ? evidence.latest
+    : undefined;
+  const rawWindow = evidence.window && typeof evidence.window === 'object'
+    ? evidence.window
+    : {};
+  const metricFields = ['exec', 'execTruncated', 'execIncomplete', 'execReassemblyTimeout'];
+  const latestFields = [...metricFields, 'intervalSecs'];
+  const windowFields = [...metricFields, 'heartbeatCount', 'intervalSecs', 'shutdownFinalCount'];
+  const validLatestContract = Boolean(latest) && latestFields.every((name) =>
+    nonNegativeSafeInteger(latest, name) !== undefined,
+  ) && typeof latest.shutdownFinal === 'boolean';
+  const validWindowContract = windowFields.every((name) =>
+    nonNegativeSafeInteger(rawWindow, name) !== undefined,
+  );
+  const window = {
+    exec: nonNegativeSafeInteger(rawWindow, 'exec') ?? 0,
+    execTruncated: nonNegativeSafeInteger(rawWindow, 'execTruncated') ?? 0,
+    execIncomplete: nonNegativeSafeInteger(rawWindow, 'execIncomplete') ?? 0,
+    execReassemblyTimeout: nonNegativeSafeInteger(rawWindow, 'execReassemblyTimeout') ?? 0,
+    heartbeatCount: nonNegativeSafeInteger(rawWindow, 'heartbeatCount') ?? 0,
+    intervalSecs: nonNegativeSafeInteger(rawWindow, 'intervalSecs') ?? 0,
+    shutdownFinalCount: nonNegativeSafeInteger(rawWindow, 'shutdownFinalCount') ?? 0,
+  };
+  const normalizedLatest = validLatestContract ? {
+    exec: nonNegativeSafeInteger(latest, 'exec'),
+    execTruncated: nonNegativeSafeInteger(latest, 'execTruncated'),
+    execIncomplete: nonNegativeSafeInteger(latest, 'execIncomplete'),
+    execReassemblyTimeout: nonNegativeSafeInteger(latest, 'execReassemblyTimeout'),
+    intervalSecs: nonNegativeSafeInteger(latest, 'intervalSecs'),
+    shutdownFinal: latest.shutdownFinal,
+  } : undefined;
+  const lastReportedAt = typeof evidence.lastReportedAt === 'string' &&
+    Number.isFinite(Date.parse(evidence.lastReportedAt))
+    ? evidence.lastReportedAt
+    : undefined;
+  const countsFitExec = (metrics) => metrics &&
+    ['execTruncated', 'execIncomplete', 'execReassemblyTimeout']
+      .every((name) => metrics[name] <= metrics.exec);
+  const internallyConsistent = countsFitExec(normalizedLatest) && countsFitExec(window) &&
+    window.shutdownFinalCount <= window.heartbeatCount &&
+    (!normalizedLatest?.shutdownFinal || window.shutdownFinalCount > 0);
+  const ratio = (value) => window.exec > 0 ? value / window.exec : undefined;
+  return {
+    reported: evidence.reported === true && validLatestContract && validWindowContract &&
+      Boolean(lastReportedAt) && window.heartbeatCount > 0 && internallyConsistent,
+    lastReportedAt,
+    latest: normalizedLatest,
+    window,
+    ratios: {
+      truncated: ratio(window.execTruncated),
+      incomplete: ratio(window.execIncomplete),
+      reassemblyTimeout: ratio(window.execReassemblyTimeout),
+    },
+  };
 }
 
 function startHeartbeatSampler(baseUrl, collector) {
@@ -2295,7 +2417,7 @@ function startHeartbeatSampler(baseUrl, collector) {
     while (!stopping) {
       try {
         const item = await queryHeartbeat(baseUrl, collector);
-        const fingerprint = item?.lastHeartbeatAt
+        const fingerprint = item?.filterMetricsReported === true && item?.lastHeartbeatAt
           ? heartbeatCursor(item).filterMetricsFingerprint
           : undefined;
         if (fingerprint && !seen.has(fingerprint)) {
@@ -2307,6 +2429,9 @@ function startHeartbeatSampler(baseUrl, collector) {
     }
   })();
   return {
+    snapshot() {
+      return [...samples];
+    },
     async stop() {
       stopping = true;
       await done;
@@ -2316,8 +2441,10 @@ function startHeartbeatSampler(baseUrl, collector) {
 }
 
 function aggregateHeartbeatSamples(samples, finalHeartbeat = samples.at(-1)) {
-  const aggregatedSamples = [...samples];
-  if (finalHeartbeat) {
+  // A raw-only Collector heartbeat is intentionally visible in health with decoupled fallback
+  // metrics. It is not a Forwarder interval and must not be counted as zero-valued evidence.
+  const aggregatedSamples = samples.filter((item) => item?.filterMetricsReported === true);
+  if (finalHeartbeat?.filterMetricsReported === true) {
     const finalFingerprint = heartbeatCursor(finalHeartbeat).filterMetricsFingerprint;
     if (!aggregatedSamples.some((item) =>
       heartbeatCursor(item).filterMetricsFingerprint === finalFingerprint)) {
@@ -2343,8 +2470,16 @@ function aggregateHeartbeatSamples(samples, finalHeartbeat = samples.at(-1)) {
     runtimeLeaseErrors: 0,
     runtimeLeaseFenced: false,
   };
+  const operationalCounterFields = [
+    'queueDropped', 'identityErrors', 'dockerErrors', 'runtimeSnapshotErrors',
+    'runtimeSnapshotRejected', 'runtimeLeaseErrors',
+  ];
+  let operationalErrorEvidence = aggregatedSamples.length > 0;
   for (const item of aggregatedSamples) {
     const metrics = item.filterMetrics || {};
+    operationalErrorEvidence &&= operationalCounterFields.every((name) =>
+      nonNegativeSafeInteger(metrics, name) !== undefined,
+    ) && typeof metrics.runtimeLeaseFenced === 'boolean';
     for (const field of sumFields) totals[field] += numericMetric(metrics, field);
     const maxima = item?.windowErrorMaxima;
     errors.droppedEvents = Math.max(
@@ -2393,15 +2528,36 @@ function aggregateHeartbeatSamples(samples, finalHeartbeat = samples.at(-1)) {
   errors.runtimeSnapshotRejected = Math.max(errors.runtimeSnapshotRejected, numericMetric(finalMetrics, 'runtimeSnapshotRejected'));
   errors.runtimeLeaseErrors = Math.max(errors.runtimeLeaseErrors, numericMetric(finalMetrics, 'runtimeLeaseErrors'));
   errors.runtimeLeaseFenced ||= finalMetrics.runtimeLeaseFenced === true;
+  const evidenceQuality = execEvidenceQuality(finalHeartbeat ?? aggregatedSamples.at(-1));
+  const diagnostics = {
+    runtimeSnapshotRetries: numericMetric(finalMetrics, 'runtimeSnapshotRetries'),
+    runtimeSnapshotRecovered: numericMetric(finalMetrics, 'runtimeSnapshotRecovered'),
+    lastRuntimeSnapshotFailureAt: typeof finalMetrics.lastRuntimeSnapshotFailureAt === 'string'
+      ? finalMetrics.lastRuntimeSnapshotFailureAt
+      : undefined,
+    lastRuntimeSnapshotFailure: typeof finalMetrics.lastRuntimeSnapshotFailure === 'string'
+      ? finalMetrics.lastRuntimeSnapshotFailure
+      : undefined,
+    lastRuntimeSnapshotFailureVersion: optionalNumericMetric(finalMetrics, 'lastRuntimeSnapshotFailureVersion'),
+    lastRuntimeSnapshotRetryAt: typeof finalMetrics.lastRuntimeSnapshotRetryAt === 'string'
+      ? finalMetrics.lastRuntimeSnapshotRetryAt
+      : undefined,
+    lastRuntimeSnapshotRetryReason: typeof finalMetrics.lastRuntimeSnapshotRetryReason === 'string'
+      ? finalMetrics.lastRuntimeSnapshotRetryReason
+      : undefined,
+  };
   return {
     count: aggregatedSamples.length,
     firstHeartbeatAt: aggregatedSamples[0]?.lastHeartbeatAt,
     lastHeartbeatAt: finalHeartbeat?.lastHeartbeatAt ?? aggregatedSamples.at(-1)?.lastHeartbeatAt,
     filterMode: finalMetrics.filterMode ?? aggregatedSamples.at(-1)?.filterMetrics?.filterMode,
     windowErrorEvidence,
+    operationalErrorEvidence,
     last: finalMetrics,
     totals,
     errors,
+    evidenceQuality,
+    diagnostics,
   };
 }
 
@@ -2411,6 +2567,29 @@ function assertPhaseMetrics(phase, metrics, environment) {
     metrics.windowErrorEvidence,
     true,
     environment + '/' + phase + ' did not receive final window-stable drop/error evidence',
+  );
+  assert.equal(
+    metrics.operationalErrorEvidence,
+    true,
+    environment + '/' + phase + ' did not receive complete operational error counters',
+  );
+  assert.equal(
+    metrics.evidenceQuality?.reported,
+    true,
+    environment + '/' + phase + ' has no complete raw Collector exec evidence',
+  );
+  assert.ok(
+    metrics.evidenceQuality.window.exec > 0,
+    environment + '/' + phase + ' raw Collector evidence contains no ToolExec events',
+  );
+  assert.equal(
+    metrics.evidenceQuality.latest?.shutdownFinal,
+    true,
+    environment + '/' + phase + ' did not receive the final raw Collector heartbeat',
+  );
+  assert.ok(
+    metrics.evidenceQuality.window.shutdownFinalCount > 0,
+    environment + '/' + phase + ' raw Collector window has no shutdown-final evidence',
   );
   assert.equal(metrics.filterMode, phase, environment + ' collector reported the wrong filter mode');
   for (const [name, value] of Object.entries(metrics.errors)) {
@@ -2614,6 +2793,7 @@ async function stopOwnedDockerContainer(name, remove = true, graceSeconds = 15) 
 async function startDockerCollector(options, environment, phase, apiBase) {
   const name = k8sName(options, 'collector', environment, phase);
   const id = collectorId(options, environment, phase);
+  await assertCollectorHistoryAbsentBeforeStart(apiBase, id, environment, phase);
   // The host collector shares the Linux host network so that a debug API published only on
   // 127.0.0.1 remains private. The Docker collector stays bridged and uses host-gateway.
   const target = environment === 'host' ? apiBase : containerApiBase(apiBase);
@@ -2786,6 +2966,7 @@ async function startK8sCollector(options, phase, nodeName) {
   const namespace = options.k8sWorkloadNamespace;
   const name = k8sName(options, 'collector', 'k8s', phase);
   const id = collectorId(options, 'k8s', phase);
+  await assertCollectorHistoryAbsentBeforeStart(options.k8sApiBase, id, 'k8s', phase);
   const serviceBase = k8sApiServiceBase(options);
   const envValues = {
     A3S_OBSERVER_JSON: '1',
@@ -4070,13 +4251,25 @@ function finalShutdownHeartbeatAdvanced(previous, current) {
   const afterEpoch = Number(current?.filterMetrics?.runtimeLeaseEpoch);
   const beforeSnapshotAt = Date.parse(previous?.filterMetrics?.lastRuntimeSnapshotAt || '');
   const afterSnapshotAt = Date.parse(current?.filterMetrics?.lastRuntimeSnapshotAt || '');
-  return previous?.filterMetrics?.shutdownFinal !== true &&
+  const beforeRaw = execEvidenceQuality(previous);
+  const afterRaw = execEvidenceQuality(current);
+  const beforeRawAt = Date.parse(beforeRaw.lastReportedAt || '');
+  const afterRawAt = Date.parse(afterRaw.lastReportedAt || '');
+  return previous?.filterMetricsReported === true &&
+    current?.filterMetricsReported === true &&
+    previous?.filterMetrics?.shutdownFinal !== true &&
     current?.filterMetrics?.shutdownFinal === true &&
     Number.isFinite(beforePosts) && Number.isFinite(afterPosts) &&
     afterPosts > beforePosts &&
     Number.isSafeInteger(beforeEpoch) && beforeEpoch > 0 && afterEpoch === beforeEpoch &&
     Number.isFinite(beforeSnapshotAt) && Number.isFinite(afterSnapshotAt) &&
     afterSnapshotAt > beforeSnapshotAt &&
+    beforeRaw.reported && beforeRaw.latest?.shutdownFinal === false &&
+    afterRaw.reported && afterRaw.latest?.shutdownFinal === true &&
+    afterRaw.window.shutdownFinalCount > beforeRaw.window.shutdownFinalCount &&
+    afterRaw.window.heartbeatCount > beforeRaw.window.heartbeatCount &&
+    afterRaw.window.intervalSecs > beforeRaw.window.intervalSecs &&
+    Number.isFinite(beforeRawAt) && Number.isFinite(afterRawAt) && afterRawAt >= beforeRawAt &&
     heartbeatAdvanced(previous, current);
 }
 
@@ -4365,7 +4558,15 @@ async function stopPhaseCollector(collector, requireTracked = false) {
   let stopped = false;
   if (collector.environment === 'host' || collector.environment === 'docker') {
     if (ledger.dockerContainers.has(collector.name)) {
-      if (collector.shutdownRequested && await waitForOwnedDockerContainerStopped(collector.name)) {
+      const ownership = ledger.dockerContainers.get(collector.name);
+      const state = await dockerResourceState(
+        ownership.id || collector.name, ledger.runId, ownership,
+      );
+      if (!state.exists) {
+        // Creation may have failed after reserving the ledger entry but before Docker returned an
+        // ID. Absence is safe to forget; a replacement with changed identity is still refused.
+        ledger.dockerContainers.delete(collector.name);
+      } else if (collector.shutdownRequested && await waitForOwnedDockerContainerStopped(collector.name)) {
         await removeTrackedDockerContainer(collector.name, true);
       } else {
         await stopOwnedDockerContainer(collector.name, true, COLLECTOR_OUTER_GRACE_SECONDS);
@@ -4373,7 +4574,13 @@ async function stopPhaseCollector(collector, requireTracked = false) {
       stopped = true;
     }
   } else if (ledger.k8sPods.get(collector.namespace)?.has(collector.name)) {
-    if (collector.shutdownRequested) {
+    const ownership = ledger.k8sPods.get(collector.namespace).get(collector.name);
+    const state = await k8sResourceState(
+      'pod', collector.namespace, collector.name, ledger.runId, ownership,
+    );
+    if (!state.exists) {
+      forgetK8s(ledger.k8sPods, collector.namespace, collector.name);
+    } else if (collector.shutdownRequested) {
       await removeTrackedK8sResource(
         'pod', collector.namespace, collector.name, ledger.k8sPods, true,
       );
@@ -4445,6 +4652,17 @@ async function finalizeCollectorPhase(context, collector, sampler, scenarioResul
     true,
     collector.environment + ' collector reported a final heartbeat before shutdown',
   );
+  const beforeRawEvidence = execEvidenceQuality(beforeStop);
+  assert.equal(
+    beforeRawEvidence.reported,
+    true,
+    collector.environment + ' collector has no complete raw heartbeat evidence before shutdown',
+  );
+  assert.equal(
+    beforeRawEvidence.latest?.shutdownFinal,
+    false,
+    collector.environment + ' collector reported raw shutdown-final evidence before shutdown',
+  );
   assert.ok(
     Number.isFinite(Number(beforeStop.filterMetrics?.runtimeSnapshotPosts)),
     collector.environment + ' collector has no runtime snapshot count before shutdown',
@@ -4460,6 +4678,9 @@ async function finalizeCollectorPhase(context, collector, sampler, scenarioResul
   await stopPhaseCollector(collector, true);
   const samples = await sampler.stop();
   const metrics = aggregateHeartbeatSamples(samples, finalHeartbeat);
+  // Preserve the fully aggregated Collector evidence even when an acceptance assertion below
+  // fails, so the failure report retains the operational and evidence-quality root cause.
+  collector.finalMetrics = metrics;
   assertPhaseMetrics(collector.phase, metrics, collector.environment);
   const events = await queryEvents(collector.apiBase, collector.collectorId);
   const runtime = await queryRuntime(collector.apiBase, { collectorId: collector.collectorId });
@@ -4498,23 +4719,62 @@ async function finalizeCollectorPhase(context, collector, sampler, scenarioResul
   };
 }
 
-async function executeEnvironmentPhase(context, environment, phase) {
-  let collector;
-  if (environment === 'host') {
-    collector = await startDockerCollector(context.options, environment, phase, context.options.hostApiBase);
-  } else if (environment === 'docker') {
-    collector = await startDockerCollector(context.options, environment, phase, context.options.dockerApiBase);
-  } else {
-    collector = await startK8sCollector(context.options, phase, context.k8sNode);
+async function captureIncompletePhaseMetrics(collector, sampler) {
+  const samples = typeof sampler?.snapshot === 'function' ? sampler.snapshot() : [];
+  if (!collector) return { metrics: undefined, current: undefined, queryError: undefined };
+  let current;
+  let queryError;
+  try {
+    current = await queryHeartbeat(collector.apiBase, collector.collectorId);
+  } catch (error) {
+    queryError = error;
   }
-  const bootstrap = await queryRuntime(collector.apiBase, { collectorId: collector.collectorId });
-  collector.bootstrapInstanceIds = new Set(bootstrap.items.map((item) => item.agentInstanceId));
-  const sampler = startHeartbeatSampler(collector.apiBase, collector.collectorId);
+  return {
+    metrics: current || samples.length ? aggregateHeartbeatSamples(samples, current ?? samples.at(-1)) : undefined,
+    current,
+    queryError,
+  };
+}
+
+async function executeEnvironmentPhase(context, environment, phase) {
+  const apiBase = environment === 'host'
+    ? context.options.hostApiBase
+    : environment === 'docker'
+      ? context.options.dockerApiBase
+      : context.options.k8sApiBase;
+  let collector = {
+    name: k8sName(context.options, 'collector', environment, phase),
+    collectorId: collectorId(context.options, environment, phase),
+    environment,
+    phase,
+    apiBase,
+    ...(environment === 'k8s' ? { namespace: context.options.k8sWorkloadNamespace } : {}),
+  };
+  let sampler;
   const scenarios = [];
   let filterCanary;
   let primaryError;
+  let stage = 'collector-history-recheck';
   try {
+    await assertCollectorHistoryAbsentBeforeStart(
+      collector.apiBase, collector.collectorId, environment, phase,
+    );
+    // Start sampling before the resource mutation/readiness loop. Interval counters such as
+    // queueDropped reset on each enriched heartbeat and must not disappear before bootstrap ends.
+    sampler = startHeartbeatSampler(collector.apiBase, collector.collectorId);
+    stage = 'collector-start';
+    const started = environment === 'host'
+      ? await startDockerCollector(context.options, environment, phase, context.options.hostApiBase)
+      : environment === 'docker'
+        ? await startDockerCollector(context.options, environment, phase, context.options.dockerApiBase)
+        : await startK8sCollector(context.options, phase, context.k8sNode);
+    collector = { ...collector, ...started };
+    stage = 'runtime-bootstrap';
+    const bootstrap = await queryRuntime(collector.apiBase, { collectorId: collector.collectorId });
+    collector.bootstrapInstanceIds = new Set(bootstrap.items.map((item) => item.agentInstanceId));
+    stage = 'filter-canary';
     filterCanary = await executeFilterCanaryScenario(context, collector);
+    stage = 'agent-scenarios';
     if (environment === 'host') {
       for (const agent of context.options.agents.filter((name) => name.startsWith('host-'))) {
         scenarios.push(await executeHostAgentScenario(context, phase, agent));
@@ -4524,28 +4784,70 @@ async function executeEnvironmentPhase(context, environment, phase) {
     } else {
       scenarios.push(await executeK8sPiScenario(context, phase));
     }
+    stage = 'collector-finalize';
     return await finalizeCollectorPhase(context, collector, sampler, scenarios, filterCanary);
   } catch (error) {
     primaryError = error instanceof Error ? error : new Error(String(error));
+    const diagnostic = await captureIncompletePhaseMetrics(collector, sampler);
+    collector.finalMetrics ??= diagnostic.metrics;
     primaryError.incompletePhase = diagnosticSanitized({
       environment,
       phase,
+      stage,
       collectorId: collector.collectorId,
       scenarios,
       filterCanary,
+      metrics: collector.finalMetrics,
+      ...(diagnostic.queryError ? {
+        metricsCaptureError: diagnostic.queryError instanceof Error
+          ? diagnostic.queryError.message
+          : String(diagnostic.queryError),
+      } : {}),
     });
     throw primaryError;
   } finally {
     const cleanupFailures = [];
-    try {
-      await sampler.stop();
-    } catch (error) {
-      cleanupFailures.push(error);
+    const stopSampler = async () => {
+      if (!sampler) return;
+      try {
+        await sampler.stop();
+      } catch (error) {
+        cleanupFailures.push(error);
+      }
+    };
+    const stopCollector = async () => {
+      try {
+        await stopPhaseCollector(collector);
+      } catch (error) {
+        cleanupFailures.push(error);
+      }
+    };
+    if (primaryError) {
+      // Preserve terminal raw/enriched evidence by sampling throughout graceful shutdown.
+      await stopCollector();
+      await stopSampler();
+    } else {
+      await stopSampler();
+      await stopCollector();
     }
-    try {
-      await stopPhaseCollector(collector);
-    } catch (error) {
-      cleanupFailures.push(error);
+    const finalDiagnostic = await captureIncompletePhaseMetrics(collector, sampler);
+    if (primaryError && finalDiagnostic.current && finalDiagnostic.metrics) {
+      // The post-cleanup snapshot contains terminal raw/enriched evidence that may not have
+      // existed when the primary failure was first caught. Keep the primary error, but prefer
+      // the later diagnostic metrics in the failure artifact.
+      collector.finalMetrics = finalDiagnostic.metrics;
+    } else {
+      collector.finalMetrics ??= finalDiagnostic.metrics;
+    }
+    if (primaryError?.incompletePhase) {
+      primaryError.incompletePhase.metrics = diagnosticSanitized(collector.finalMetrics);
+      if (finalDiagnostic.queryError) {
+        primaryError.incompletePhase.metricsCaptureError = redact(
+          finalDiagnostic.queryError instanceof Error
+            ? finalDiagnostic.queryError.message
+            : String(finalDiagnostic.queryError),
+        );
+      }
     }
     if (cleanupFailures.length) {
       const cleanupError = new AggregateError(
@@ -4559,6 +4861,15 @@ async function executeEnvironmentPhase(context, environment, phase) {
           message: cleanupError.message,
         });
       } else {
+        cleanupError.incompletePhase = diagnosticSanitized({
+          environment,
+          phase,
+          stage,
+          collectorId: collector.collectorId,
+          scenarios,
+          filterCanary,
+          metrics: collector.finalMetrics,
+        });
         throw cleanupError;
       }
     }
@@ -5080,10 +5391,58 @@ async function selfTest() {
   assert.equal(runtimeCandidateMatchesHostAgent({ exe: '/opt/codex' }, 'host-codex', 'node'), true);
   assert.equal(runtimeCandidateMatchesHostAgent({ evidence: ['runtime_signature:commExact=kimi'] }, 'host-kimi', 'node'), true);
   assert.equal(runtimeCandidateMatchesHostAgent({ exe: '/usr/bin/node', evidence: [] }, 'host-codex', 'node'), false);
+  const rawBeforeEvidence = {
+    reported: true,
+    lastReportedAt: '2026-01-01T00:00:00.000Z',
+    latest: {
+      exec: 1, execTruncated: 0, execIncomplete: 0, execReassemblyTimeout: 0,
+      intervalSecs: 0, shutdownFinal: false,
+    },
+    window: {
+      exec: 1, execTruncated: 0, execIncomplete: 0, execReassemblyTimeout: 0,
+      heartbeatCount: 1, intervalSecs: 0, shutdownFinalCount: 0,
+    },
+  };
+  const rawPeriodicEvidence = {
+    reported: true,
+    lastReportedAt: '2026-01-01T00:00:00.500Z',
+    latest: {
+      exec: 2, execTruncated: 0, execIncomplete: 0, execReassemblyTimeout: 0,
+      intervalSecs: 60, shutdownFinal: false,
+    },
+    window: {
+      exec: 3, execTruncated: 0, execIncomplete: 0, execReassemblyTimeout: 0,
+      heartbeatCount: 2, intervalSecs: 60, shutdownFinalCount: 0,
+    },
+  };
+  const rawFinalEvidence = {
+    reported: true,
+    lastReportedAt: '2026-01-01T00:00:01.000Z',
+    latest: {
+      exec: 2, execTruncated: 0, execIncomplete: 0, execReassemblyTimeout: 0,
+      intervalSecs: 1, shutdownFinal: true,
+    },
+    window: {
+      exec: 3, execTruncated: 0, execIncomplete: 0, execReassemblyTimeout: 0,
+      heartbeatCount: 2, intervalSecs: 1, shutdownFinalCount: 1,
+    },
+  };
+  const zeroOperationalErrorCounters = {
+    queueDropped: 0,
+    identityErrors: 0,
+    dockerErrors: 0,
+    runtimeSnapshotErrors: 0,
+    runtimeSnapshotRejected: 0,
+    runtimeLeaseErrors: 0,
+    runtimeLeaseFenced: false,
+  };
   const heartbeatBase = {
     lastHeartbeatAt: '2026-01-01 00:00:00',
     eventCount: 10,
+    execEvidence: rawBeforeEvidence,
+    filterMetricsReported: true,
     filterMetrics: {
+      ...zeroOperationalErrorCounters,
       observed: 4,
       forwarded: 3,
       runtimeLeaseEpoch: 1,
@@ -5138,9 +5497,21 @@ async function selfTest() {
     ...heartbeatBase,
     lastHeartbeatAt: '2026-01-01 00:00:01',
     eventCount: 11,
+    execEvidence: rawPeriodicEvidence,
   }), false, 'a newer raw heartbeat must not satisfy the shutdown barrier');
   assert.equal(finalShutdownHeartbeatAdvanced(heartbeatBase, {
     ...heartbeatBase,
+    execEvidence: rawPeriodicEvidence,
+    filterMetrics: {
+      ...heartbeatBase.filterMetrics,
+      runtimeSnapshotPosts: 3,
+      lastRuntimeSnapshotAt: '2026-01-01T00:00:01.000Z',
+      shutdownFinal: true,
+    },
+  }), false, 'a periodic raw heartbeat plus an enriched final must not impersonate raw shutdown flush');
+  assert.equal(finalShutdownHeartbeatAdvanced(heartbeatBase, {
+    ...heartbeatBase,
+    execEvidence: rawFinalEvidence,
     filterMetrics: {
       ...heartbeatBase.filterMetrics,
       runtimeSnapshotPosts: 3,
@@ -5150,6 +5521,7 @@ async function selfTest() {
   }), true, 'a same-second final heartbeat after a new snapshot must satisfy the shutdown barrier');
   assert.equal(finalShutdownHeartbeatAdvanced(heartbeatBase, {
     ...heartbeatBase,
+    execEvidence: rawFinalEvidence,
     filterMetrics: {
       ...heartbeatBase.filterMetrics,
       runtimeLeaseEpoch: 2,
@@ -5160,6 +5532,7 @@ async function selfTest() {
   }), false, 'a replacement Forwarder lease must not satisfy the original shutdown barrier');
   assert.equal(finalShutdownHeartbeatAdvanced(heartbeatBase, {
     ...heartbeatBase,
+    execEvidence: rawFinalEvidence,
     filterMetrics: {
       ...heartbeatBase.filterMetrics,
       runtimeSnapshotPosts: 3,
@@ -5171,6 +5544,7 @@ async function selfTest() {
     filterMetrics: { ...heartbeatBase.filterMetrics, shutdownFinal: true },
   }, {
     ...heartbeatBase,
+    execEvidence: rawFinalEvidence,
     filterMetrics: {
       ...heartbeatBase.filterMetrics,
       runtimeSnapshotPosts: 3,
@@ -5179,38 +5553,156 @@ async function selfTest() {
     },
   }), false, 'a collector that was already final cannot reuse the shutdown barrier');
   const zeroWindowErrors = {
+    filterMetricsReported: true,
     windowErrorMaxima: { droppedEvents: 0, outputDropped: 0, errorCount: 0 },
+    execEvidence: {
+      reported: true,
+      lastReportedAt: '2026-01-01T00:00:01.000Z',
+      latest: {
+        exec: 1,
+        execTruncated: 0,
+        execIncomplete: 0,
+        execReassemblyTimeout: 0,
+        intervalSecs: 1,
+        shutdownFinal: true,
+      },
+      window: {
+        exec: 1,
+        execTruncated: 0,
+        execIncomplete: 0,
+        execReassemblyTimeout: 0,
+        heartbeatCount: 2,
+        intervalSecs: 1,
+        shutdownFinalCount: 1,
+      },
+    },
   };
   const shadow = aggregateHeartbeatSamples([
     {
       lastHeartbeatAt: '2026-01-01T00:00:00.000Z', droppedEvents: 0, outputDropped: 0, errorCount: 0,
       ...zeroWindowErrors,
-      filterMetrics: { filterMode: 'shadow', observed: 1, forwarded: 1, wouldDiscoveryBudgetDrop: 1 },
+      filterMetrics: {
+        ...zeroOperationalErrorCounters,
+        filterMode: 'shadow', observed: 1, forwarded: 1, wouldDiscoveryBudgetDrop: 1,
+      },
     },
     {
       lastHeartbeatAt: '2026-01-01T00:00:02.000Z', droppedEvents: 0, outputDropped: 0, errorCount: 0,
       ...zeroWindowErrors,
-      filterMetrics: { filterMode: 'shadow', observed: 2, forwarded: 2, probableAgent: 1 },
+      filterMetrics: {
+        ...zeroOperationalErrorCounters,
+        filterMode: 'shadow', observed: 2, forwarded: 2, probableAgent: 1,
+      },
     },
   ]);
   assertPhaseMetrics('shadow', shadow, 'self-test');
   assert.equal(shadow.totals.observed, 3);
+  const shadowWithActualDrop = structuredClone(shadow);
+  shadowWithActualDrop.totals.discoveryBudgetDropped = 1;
+  assert.throws(
+    () => assertPhaseMetrics('shadow', shadowWithActualDrop, 'self-test-shadow-actual-drop'),
+    /shadow mode dropped unknown events/u,
+  );
+  const enforce = aggregateHeartbeatSamples([
+    {
+      lastHeartbeatAt: '2026-01-01T00:00:00.000Z', droppedEvents: 0, outputDropped: 0, errorCount: 0,
+      ...zeroWindowErrors,
+      filterMetrics: {
+        ...zeroOperationalErrorCounters,
+        filterMode: 'enforce', observed: 1, forwarded: 1, discoveryBudgetDropped: 1,
+      },
+    },
+    {
+      lastHeartbeatAt: '2026-01-01T00:00:02.000Z', droppedEvents: 0, outputDropped: 0, errorCount: 0,
+      ...zeroWindowErrors,
+      filterMetrics: {
+        ...zeroOperationalErrorCounters,
+        filterMode: 'enforce', observed: 2, forwarded: 1, probableAgent: 1,
+      },
+    },
+  ]);
+  assertPhaseMetrics('enforce', enforce, 'self-test');
+  assert.equal(enforce.totals.discoveryBudgetDropped, 1);
+  const enforceWithWouldDrop = structuredClone(enforce);
+  enforceWithWouldDrop.totals.wouldDiscoveryBudgetDrop = 1;
+  assert.throws(
+    () => assertPhaseMetrics('enforce', enforceWithWouldDrop, 'self-test-enforce-would-drop'),
+    /enforce mode emitted shadow unknown counters/u,
+  );
   const preFinalSample = {
     lastHeartbeatAt: '2026-01-01T00:00:00.000Z', droppedEvents: 0, outputDropped: 0, errorCount: 0,
     ...zeroWindowErrors,
-    filterMetrics: { filterMode: 'shadow', observed: 1, forwarded: 1, runtimeSnapshotPosts: 1 },
+    filterMetrics: {
+      ...zeroOperationalErrorCounters,
+      filterMode: 'shadow', observed: 1, forwarded: 1, runtimeSnapshotPosts: 1,
+    },
   };
   const explicitFinalSample = {
     lastHeartbeatAt: '2026-01-01T00:00:01.000Z', droppedEvents: 0, outputDropped: 0, errorCount: 0,
     ...zeroWindowErrors,
     filterMetrics: {
-      filterMode: 'shadow', observed: 4, forwarded: 3, runtimeSnapshotPosts: 2, shutdownFinal: true,
+      ...zeroOperationalErrorCounters,
+      filterMode: 'shadow', observed: 4, forwarded: 3, runtimeSnapshotPosts: 2,
+      runtimeSnapshotRetries: 1, runtimeSnapshotRecovered: 1,
+      lastRuntimeSnapshotRetryAt: '2026-01-01T00:00:00.500Z',
+      lastRuntimeSnapshotRetryReason: 'transient timeout',
+      shutdownFinal: true,
     },
   };
   const finalInterval = aggregateHeartbeatSamples([preFinalSample], explicitFinalSample);
   assert.equal(finalInterval.count, 2, 'the explicit final heartbeat must be a sampled interval');
   assert.equal(finalInterval.totals.observed, 5, 'the final interval observed count must not be lost');
   assert.equal(finalInterval.totals.forwarded, 4, 'the final interval forwarded count must not be lost');
+  assert.equal(finalInterval.diagnostics.runtimeSnapshotRetries, 1);
+  assert.equal(finalInterval.diagnostics.runtimeSnapshotRecovered, 1);
+  assert.equal(finalInterval.diagnostics.lastRuntimeSnapshotFailure, undefined);
+  assert.equal(finalInterval.diagnostics.lastRuntimeSnapshotFailureVersion, undefined);
+  assert.equal(finalInterval.diagnostics.lastRuntimeSnapshotRetryReason, 'transient timeout');
+  const rawOnlyStartupIgnored = aggregateHeartbeatSamples([
+    {
+      ...zeroWindowErrors,
+      filterMetricsReported: false,
+      lastHeartbeatAt: '2025-12-31T23:59:59.000Z',
+      droppedEvents: 0,
+      outputDropped: 0,
+      errorCount: 0,
+      filterMetrics: { filterMode: 'shadow', observed: 0, forwarded: 0 },
+    },
+    preFinalSample,
+  ], explicitFinalSample);
+  assert.equal(rawOnlyStartupIgnored.count, 2, 'raw-only fallback health is not a Forwarder interval');
+  assert.equal(rawOnlyStartupIgnored.operationalErrorEvidence, true);
+  assert.equal(rawOnlyStartupIgnored.totals.observed, 5);
+  const missingOperationalCounter = aggregateHeartbeatSamples([
+    preFinalSample,
+    {
+      ...explicitFinalSample,
+      filterMetrics: { ...explicitFinalSample.filterMetrics, identityErrors: undefined },
+    },
+  ]);
+  assert.equal(missingOperationalCounter.operationalErrorEvidence, false);
+  assert.throws(
+    () => assertPhaseMetrics('shadow', missingOperationalCounter, 'self-test-missing-operational-counter'),
+    /complete operational error counters/u,
+  );
+  const exhaustedSnapshot = aggregateHeartbeatSamples([
+    preFinalSample,
+    {
+      ...explicitFinalSample,
+      filterMetrics: {
+        ...explicitFinalSample.filterMetrics,
+        runtimeSnapshotErrors: 1,
+        runtimeSnapshotRecovered: 0,
+        lastRuntimeSnapshotFailureAt: '2026-01-01T00:00:00.750Z',
+        lastRuntimeSnapshotFailure: 'snapshot transport timed out after retry',
+        lastRuntimeSnapshotFailureVersion: 2,
+      },
+    },
+  ]);
+  assert.equal(exhaustedSnapshot.errors.runtimeSnapshotErrors, 1);
+  assert.equal(exhaustedSnapshot.diagnostics.lastRuntimeSnapshotFailureAt, '2026-01-01T00:00:00.750Z');
+  assert.equal(exhaustedSnapshot.diagnostics.lastRuntimeSnapshotFailure, 'snapshot transport timed out after retry');
+  assert.equal(exhaustedSnapshot.diagnostics.lastRuntimeSnapshotFailureVersion, 2);
   const finalIntervalAlreadySampled = aggregateHeartbeatSamples(
     [preFinalSample, explicitFinalSample],
     explicitFinalSample,
@@ -5220,13 +5712,23 @@ async function selfTest() {
   const maskedForwarderError = aggregateHeartbeatSamples([
     {
       lastHeartbeatAt: '2026-01-01T00:00:00.000Z', droppedEvents: 0, outputDropped: 1, errorCount: 1,
+      filterMetricsReported: true,
       windowErrorMaxima: { droppedEvents: 0, outputDropped: 1, errorCount: 1 },
-      filterMetrics: { filterMode: 'shadow', observed: 1, runtimeSnapshotPosts: 1 },
+      execEvidence: zeroWindowErrors.execEvidence,
+      filterMetrics: {
+        ...zeroOperationalErrorCounters,
+        filterMode: 'shadow', observed: 1, runtimeSnapshotPosts: 1,
+      },
     },
     {
       lastHeartbeatAt: '2026-01-01T00:00:01.000Z', droppedEvents: 0, outputDropped: 0, errorCount: 0,
+      filterMetricsReported: true,
       windowErrorMaxima: { droppedEvents: 0, outputDropped: 1, errorCount: 1 },
-      filterMetrics: { filterMode: 'shadow', observed: 0, runtimeSnapshotPosts: 2 },
+      execEvidence: zeroWindowErrors.execEvidence,
+      filterMetrics: {
+        ...zeroOperationalErrorCounters,
+        filterMode: 'shadow', observed: 0, runtimeSnapshotPosts: 2,
+      },
     },
   ]);
   assert.equal(maskedForwarderError.errors.outputDropped, 1);
@@ -5238,16 +5740,194 @@ async function selfTest() {
   const missingWindowEvidence = aggregateHeartbeatSamples([
     {
       lastHeartbeatAt: '2026-01-01T00:00:00.000Z', droppedEvents: 0, outputDropped: 0, errorCount: 0,
-      filterMetrics: { filterMode: 'shadow', runtimeSnapshotPosts: 1 },
+      filterMetricsReported: true,
+      execEvidence: zeroWindowErrors.execEvidence,
+      filterMetrics: { ...zeroOperationalErrorCounters, filterMode: 'shadow', runtimeSnapshotPosts: 1 },
     },
     {
       lastHeartbeatAt: '2026-01-01T00:00:02.000Z', droppedEvents: 0, outputDropped: 0, errorCount: 0,
-      filterMetrics: { filterMode: 'shadow', runtimeSnapshotPosts: 2 },
+      filterMetricsReported: true,
+      execEvidence: zeroWindowErrors.execEvidence,
+      filterMetrics: { ...zeroOperationalErrorCounters, filterMode: 'shadow', runtimeSnapshotPosts: 2 },
     },
   ]);
   assert.throws(
     () => assertPhaseMetrics('shadow', missingWindowEvidence, 'self-test-missing-window-evidence'),
     /window-stable drop\/error evidence/u,
+  );
+  const incompleteEvidenceSample = {
+    lastHeartbeatAt: '2026-01-01T00:00:01.000Z',
+    filterMetricsReported: true,
+    droppedEvents: 0,
+    outputDropped: 0,
+    errorCount: 0,
+    windowErrorMaxima: { droppedEvents: 0, outputDropped: 0, errorCount: 0 },
+    execEvidence: {
+      reported: true,
+      lastReportedAt: '2026-01-01T00:00:00.900Z',
+      latest: {
+        exec: 4029, execTruncated: 0, execIncomplete: 1899, execReassemblyTimeout: 4,
+        intervalSecs: 1, shutdownFinal: true,
+      },
+      window: {
+        exec: 4029, execTruncated: 0, execIncomplete: 1899, execReassemblyTimeout: 4,
+        heartbeatCount: 2, intervalSecs: 1, shutdownFinalCount: 1,
+      },
+    },
+    filterMetrics: { ...zeroOperationalErrorCounters, filterMode: 'shadow', runtimeSnapshotPosts: 2 },
+  };
+  const incompleteEvidenceQuality = aggregateHeartbeatSamples([
+    {
+      ...incompleteEvidenceSample,
+      lastHeartbeatAt: '2026-01-01T00:00:00.000Z',
+      filterMetrics: { ...zeroOperationalErrorCounters, filterMode: 'shadow', runtimeSnapshotPosts: 1 },
+    },
+    incompleteEvidenceSample,
+  ]);
+  assert.equal(incompleteEvidenceQuality.errors.errorCount, 0);
+  assert.equal(incompleteEvidenceQuality.evidenceQuality.window.execIncomplete, 1899);
+  assert.equal(incompleteEvidenceQuality.evidenceQuality.ratios.incomplete, 1899 / 4029);
+  assert.equal(incompleteEvidenceQuality.evidenceQuality.ratios.reassemblyTimeout, 4 / 4029);
+  assert.equal(incompleteEvidenceQuality.evidenceQuality.ratios.truncated, 0);
+  assertPhaseMetrics('shadow', incompleteEvidenceQuality, 'self-test-evidence-quality');
+  const missingRawEvidenceSample = {
+    lastHeartbeatAt: '2026-01-01T00:00:01.000Z',
+    filterMetricsReported: true,
+    droppedEvents: 0,
+    outputDropped: 0,
+    errorCount: 0,
+    windowErrorMaxima: { droppedEvents: 0, outputDropped: 0, errorCount: 0 },
+    filterMetrics: { ...zeroOperationalErrorCounters, filterMode: 'shadow', runtimeSnapshotPosts: 2 },
+  };
+  const missingRawEvidence = aggregateHeartbeatSamples([
+    {
+      ...missingRawEvidenceSample,
+      lastHeartbeatAt: '2026-01-01T00:00:00.000Z',
+      filterMetrics: { ...zeroOperationalErrorCounters, filterMode: 'shadow', runtimeSnapshotPosts: 1 },
+    },
+    missingRawEvidenceSample,
+  ]);
+  assert.throws(
+    () => assertPhaseMetrics('shadow', missingRawEvidence, 'self-test-missing-raw-evidence'),
+    /complete raw Collector exec evidence/u,
+  );
+  const validExecEvidenceWindow = {
+    exec: 4029,
+    execTruncated: 0,
+    execIncomplete: 1899,
+    execReassemblyTimeout: 4,
+    heartbeatCount: 2,
+    intervalSecs: 1,
+    shutdownFinalCount: 1,
+  };
+  for (const [label, window] of [
+    ['string', { ...validExecEvidenceWindow, execIncomplete: '1899' }],
+    ['null', { ...validExecEvidenceWindow, execIncomplete: null }],
+    ['unsafe', { ...validExecEvidenceWindow, exec: Number.MAX_SAFE_INTEGER + 1 }],
+    ['count-exceeds-exec', { ...validExecEvidenceWindow, execIncomplete: 4030 }],
+    ['missing-window', undefined],
+  ]) {
+    const invalidSample = {
+      lastHeartbeatAt: '2026-01-01T00:00:01.000Z',
+      filterMetricsReported: true,
+      droppedEvents: 0,
+      outputDropped: 0,
+      errorCount: 0,
+      windowErrorMaxima: { droppedEvents: 0, outputDropped: 0, errorCount: 0 },
+      execEvidence: {
+        reported: true,
+        lastReportedAt: '2026-01-01T00:00:01.000Z',
+        latest: {
+          exec: 4029, execTruncated: 0, execIncomplete: 1899,
+          execReassemblyTimeout: 4, intervalSecs: 1, shutdownFinal: true,
+        },
+        ...(window ? { window } : {}),
+      },
+      filterMetrics: { ...zeroOperationalErrorCounters, filterMode: 'shadow', runtimeSnapshotPosts: 2 },
+    };
+    const invalidEvidence = aggregateHeartbeatSamples([
+      {
+        ...invalidSample,
+        lastHeartbeatAt: '2026-01-01T00:00:00.000Z',
+        filterMetrics: { ...zeroOperationalErrorCounters, filterMode: 'shadow', runtimeSnapshotPosts: 1 },
+      },
+      invalidSample,
+    ]);
+    assert.equal(invalidEvidence.evidenceQuality.reported, false, label + ' exec evidence must fail closed');
+    assert.throws(
+      () => assertPhaseMetrics('shadow', invalidEvidence, 'self-test-invalid-exec-evidence-' + label),
+      /complete raw Collector exec evidence/u,
+    );
+  }
+  for (const [label, evidencePatch] of [
+    ['missing-latest', { latest: undefined }],
+    ['invalid-time', { lastReportedAt: 'not-a-time' }],
+    ['non-final', {
+      latest: {
+        exec: 4029, execTruncated: 0, execIncomplete: 1899,
+        execReassemblyTimeout: 4, intervalSecs: 1, shutdownFinal: false,
+      },
+    }],
+  ]) {
+    const sample = {
+      lastHeartbeatAt: '2026-01-01T00:00:01.000Z',
+      filterMetricsReported: true,
+      droppedEvents: 0,
+      outputDropped: 0,
+      errorCount: 0,
+      windowErrorMaxima: { droppedEvents: 0, outputDropped: 0, errorCount: 0 },
+      execEvidence: {
+        reported: true,
+        lastReportedAt: '2026-01-01T00:00:01.000Z',
+        latest: {
+          exec: 4029, execTruncated: 0, execIncomplete: 1899,
+          execReassemblyTimeout: 4, intervalSecs: 1, shutdownFinal: true,
+        },
+        window: validExecEvidenceWindow,
+        ...evidencePatch,
+      },
+      filterMetrics: { ...zeroOperationalErrorCounters, filterMode: 'shadow', runtimeSnapshotPosts: 2 },
+    };
+    const invalid = aggregateHeartbeatSamples([sample, {
+      ...sample,
+      lastHeartbeatAt: '2026-01-01T00:00:02.000Z',
+      filterMetrics: { ...zeroOperationalErrorCounters, filterMode: 'shadow', runtimeSnapshotPosts: 3 },
+    }]);
+    assert.throws(
+      () => assertPhaseMetrics('shadow', invalid, 'self-test-exec-evidence-' + label),
+      label === 'non-final' ? /final raw Collector heartbeat/u : /complete raw Collector exec evidence/u,
+    );
+  }
+  const zeroExecSample = {
+    lastHeartbeatAt: '2026-01-01T00:00:01.000Z',
+    filterMetricsReported: true,
+    droppedEvents: 0,
+    outputDropped: 0,
+    errorCount: 0,
+    windowErrorMaxima: { droppedEvents: 0, outputDropped: 0, errorCount: 0 },
+    execEvidence: {
+      reported: true,
+      lastReportedAt: '2026-01-01T00:00:01.000Z',
+      latest: {
+        exec: 0, execTruncated: 0, execIncomplete: 0,
+        execReassemblyTimeout: 0, intervalSecs: 1, shutdownFinal: true,
+      },
+      window: {
+        exec: 0, execTruncated: 0, execIncomplete: 0, execReassemblyTimeout: 0,
+        heartbeatCount: 1, intervalSecs: 1, shutdownFinalCount: 1,
+      },
+    },
+    filterMetrics: { ...zeroOperationalErrorCounters, filterMode: 'shadow', runtimeSnapshotPosts: 2 },
+  };
+  const zeroExec = aggregateHeartbeatSamples([zeroExecSample, {
+    ...zeroExecSample,
+    lastHeartbeatAt: '2026-01-01T00:00:02.000Z',
+    filterMetrics: { ...zeroOperationalErrorCounters, filterMode: 'shadow', runtimeSnapshotPosts: 3 },
+  }]);
+  assert.equal(zeroExec.evidenceQuality.ratios.incomplete, undefined);
+  assert.throws(
+    () => assertPhaseMetrics('shadow', zeroExec, 'self-test-zero-exec-evidence'),
+    /contains no ToolExec events/u,
   );
   assert.equal(redact('token=secret-value sk-123456789'), 'token=<redacted> sk-<redacted>');
   const boundedDiagnostic = boundedRedactedText('x'.repeat(512) + ' token=secret-value sk-123456789', 128);

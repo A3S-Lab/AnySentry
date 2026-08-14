@@ -10,7 +10,7 @@ import { DecisionResultJob, FastJudgeJob } from './async-judgment.types';
 import { JudgmentQueueService } from './judgment-queue.service';
 import { RuntimeModelConfigService } from './runtime-model-config';
 import { resolveJudgmentRoute } from './identity-judgment-routing';
-import { CollectorHeartbeatRecord, CollectorHeartbeatRequest, EventCategory, EventMeta, IdentityAiReviewRecord, Incident, IncidentStatus, JudgedEvent, JudgmentRouteReason, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
+import { CollectorHeartbeatOrigin, CollectorHeartbeatRecord, CollectorHeartbeatRequest, CollectorRawHeartbeatRequest, EventCategory, EventMeta, IdentityAiReviewRecord, Incident, IncidentStatus, JudgedEvent, JudgmentRouteReason, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
 
 const SEVERITY_SCORE: Record<Severity, number> = { info: 8, low: 28, medium: 52, high: 76, critical: 95 };
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
@@ -299,7 +299,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       this.applyIncidentState(await this.ch.loadIncidentState());
       const heartbeats = await this.ch.loadCollectorHeartbeats();
       for (const heartbeat of heartbeats.sort((a, b) => a.at - b.at).slice(-this.MAX_COLLECTOR_HEARTBEATS)) {
-        this.addCollectorHeartbeat(heartbeat, false);
+        // Hydration reconstructs query state; it must not replay historical notifications. Raw
+        // records written before provenance existed are normalized so the old exec_incomplete
+        // compatibility fallback cannot re-enter operational error metrics after a restart.
+        this.addCollectorHeartbeat(this.normalizeHydratedCollectorHeartbeat(heartbeat), false, false);
       }
     }
     // Real by default: the store fills only from /ingest (a real a3s-observer feed). The synthetic
@@ -901,8 +904,12 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return next;
   }
 
-  recordCollectorHeartbeat(input: CollectorHeartbeatRequest, at = Date.now()): CollectorHeartbeatRecord {
-    const collectorId = (input.collectorId || input.podName || input.nodeName || 'unknown-collector').slice(0, 160);
+  recordCollectorHeartbeat(
+    input: CollectorHeartbeatRequest | CollectorRawHeartbeatRequest,
+    at: number,
+    origin: CollectorHeartbeatOrigin,
+  ): CollectorHeartbeatRecord {
+    const collectorId = (input.collectorId || input.podName || input.nodeName || 'unknown-collector').trim().slice(0, 180);
     const status: CollectorHeartbeatRecord['status'] = ['ok', 'degraded', 'error'].includes(input.status ?? '')
       ? (input.status as CollectorHeartbeatRecord['status'])
       : 'ok';
@@ -912,8 +919,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     // Raw Rust and enriched Forwarder heartbeats share an ID, but only the latter owns these
     // metrics. Provenance is recorded separately so a stream of raw heartbeats cannot keep stale
     // signatures, leases, or filter receipts alive indefinitely.
-    const filterMetricsReportedAt = input.filterMetrics == null ? undefined : at;
-    const rawFilter = input.filterMetrics ?? ({} as Partial<import('./types').CollectorFilterMetrics>);
+    const filterMetricsReportedAt = origin === 'forwarder' && input.filterMetrics != null ? at : undefined;
+    const rawFilter = origin === 'forwarder'
+      ? input.filterMetrics ?? ({} as Partial<import('./types').CollectorFilterMetrics>)
+      : ({} as Partial<import('./types').CollectorFilterMetrics>);
     const filterMetrics: import('./types').CollectorFilterMetrics = {
       scope: ['all', 'shadow', 'agent', 'decoupled'].includes(rawFilter.scope ?? '')
         ? (rawFilter.scope as import('./types').CollectorFilterMetrics['scope'])
@@ -1029,6 +1038,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       runtimeReconcileLastDurationMs: clamp(rawFilter.runtimeReconcileLastDurationMs),
       runtimeSnapshotPosts: clamp(rawFilter.runtimeSnapshotPosts),
       runtimeSnapshotErrors: clamp(rawFilter.runtimeSnapshotErrors),
+      runtimeSnapshotRetries: clamp(rawFilter.runtimeSnapshotRetries),
+      runtimeSnapshotRecovered: clamp(rawFilter.runtimeSnapshotRecovered),
       runtimeLeaseEpoch: clamp(rawFilter.runtimeLeaseEpoch),
       runtimeLeaseAttempts: clamp(rawFilter.runtimeLeaseAttempts),
       runtimeLeaseErrors: clamp(rawFilter.runtimeLeaseErrors),
@@ -1037,10 +1048,43 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       runtimeSnapshotDuplicates: clamp(rawFilter.runtimeSnapshotDuplicates),
       lastRuntimeSnapshotAt: cleanText(rawFilter.lastRuntimeSnapshotAt, 80),
       lastRuntimeSnapshotError: cleanText(rawFilter.lastRuntimeSnapshotError, 500),
+      lastRuntimeSnapshotFailureAt: cleanText(rawFilter.lastRuntimeSnapshotFailureAt, 80),
+      lastRuntimeSnapshotFailure: cleanText(rawFilter.lastRuntimeSnapshotFailure, 500),
+      lastRuntimeSnapshotFailureVersion: rawFilter.lastRuntimeSnapshotFailureVersion == null
+        ? undefined
+        : clamp(rawFilter.lastRuntimeSnapshotFailureVersion),
+      lastRuntimeSnapshotRetryAt: cleanText(rawFilter.lastRuntimeSnapshotRetryAt, 80),
+      lastRuntimeSnapshotRetryReason: cleanText(rawFilter.lastRuntimeSnapshotRetryReason, 500),
     };
+    const rawExecEvidence = origin === 'raw_collector' && 'execEvidence' in input &&
+      input.execEvidence && typeof input.execEvidence === 'object'
+      ? input.execEvidence
+      : undefined;
+    const evidenceCounts = rawExecEvidence
+      ? [
+          rawExecEvidence.exec,
+          rawExecEvidence.execTruncated,
+          rawExecEvidence.execIncomplete,
+          rawExecEvidence.execReassemblyTimeout,
+        ]
+      : [];
+    const execEvidence: import('./types').CollectorExecEvidenceReport | undefined = rawExecEvidence &&
+      evidenceCounts.every((value) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) &&
+      [rawExecEvidence.execTruncated, rawExecEvidence.execIncomplete, rawExecEvidence.execReassemblyTimeout]
+        .every((value) => (value as number) <= (rawExecEvidence.exec as number)) &&
+      typeof rawExecEvidence.shutdownFinal === 'boolean'
+      ? {
+          exec: rawExecEvidence.exec as number,
+          execTruncated: rawExecEvidence.execTruncated as number,
+          execIncomplete: rawExecEvidence.execIncomplete as number,
+          execReassemblyTimeout: rawExecEvidence.execReassemblyTimeout as number,
+          shutdownFinal: rawExecEvidence.shutdownFinal,
+        }
+      : undefined;
     const rec: CollectorHeartbeatRecord = {
       collectorId,
       at,
+      origin,
       filterMetricsReportedAt,
       status,
       nodeName: input.nodeName?.slice(0, 160),
@@ -1055,8 +1099,11 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       queueDepth: clamp(input.queueDepth),
       droppedEvents: clamp(input.droppedEvents),
       outputDropped: clamp(input.outputDropped),
-      errorCount: clamp(input.errorCount),
+      // The Rust CollectorHeartbeat schema has no operational error counter. argv/reassembly
+      // quality lives in execEvidence and must never degrade collector transport health.
+      errorCount: origin === 'raw_collector' ? 0 : clamp(input.errorCount),
       observedAgents: clamp(input.observedAgents),
+      execEvidence,
       filterMetrics,
       message: cleanText(input.message, 500),
     };
@@ -1064,10 +1111,21 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return rec;
   }
 
-  private addCollectorHeartbeat(rec: CollectorHeartbeatRecord, persist = true): void {
+  private normalizeHydratedCollectorHeartbeat(rec: CollectorHeartbeatRecord): CollectorHeartbeatRecord {
+    if (rec.origin === 'raw_collector' || rec.origin === 'forwarder') return rec;
+    if (rec.filterMetricsReportedAt !== undefined) return { ...rec, origin: 'forwarder' };
+    const looksLikeLegacyRaw = (rec.mode === 'observe' || rec.mode?.startsWith('observe+') === true) &&
+      Object.prototype.hasOwnProperty.call(rec.eventKindCounts ?? {}, 'ToolExec');
+    return looksLikeLegacyRaw
+      ? { ...rec, origin: 'raw_collector', errorCount: 0 }
+      : { ...rec, origin: 'forwarder' };
+  }
+
+  private addCollectorHeartbeat(rec: CollectorHeartbeatRecord, persist = true, notify = true): void {
     this.collectorHeartbeats.push(rec);
     if (this.collectorHeartbeats.length > this.MAX_COLLECTOR_HEARTBEATS) this.collectorHeartbeats.splice(0, this.collectorHeartbeats.length - this.MAX_COLLECTOR_HEARTBEATS);
-    this.alerting.observeCollectorHeartbeat(rec);
+    if (notify) this.alerting.observeCollectorHeartbeat(rec);
+    else this.alerting.seedCollectorHeartbeat(rec);
     if (persist) this.persistCollectorHeartbeatsSoon();
   }
 
@@ -1087,13 +1145,29 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return this.collectorHeartbeats.filter((e) => e.at >= sinceMs);
   }
 
-  collectorHeartbeatHeads(): { latest: CollectorHeartbeatRecord[]; latestMetrics: CollectorHeartbeatRecord[] } {
+  collectorHeartbeatHeads(): {
+    latest: CollectorHeartbeatRecord[];
+    latestMetrics: CollectorHeartbeatRecord[];
+    latestRaw: CollectorHeartbeatRecord[];
+    latestForwarder: CollectorHeartbeatRecord[];
+  } {
     const latest = new Map<string, CollectorHeartbeatRecord>();
     const latestMetrics = new Map<string, CollectorHeartbeatRecord>();
+    const latestRaw = new Map<string, CollectorHeartbeatRecord>();
+    const latestForwarder = new Map<string, CollectorHeartbeatRecord>();
     for (const hb of this.collectorHeartbeats) {
       const cur = latest.get(hb.collectorId);
       // Insertion order breaks a Date.now() millisecond tie in favour of the later request.
       if (!cur || hb.at >= cur.at) latest.set(hb.collectorId, hb);
+      if (hb.origin === 'raw_collector') {
+        const currentRaw = latestRaw.get(hb.collectorId);
+        if (!currentRaw || hb.at >= currentRaw.at) latestRaw.set(hb.collectorId, hb);
+      } else if (hb.origin === 'forwarder') {
+        const currentForwarder = latestForwarder.get(hb.collectorId);
+        if (!currentForwarder || hb.at >= currentForwarder.at) {
+          latestForwarder.set(hb.collectorId, hb);
+        }
+      }
       if (hb.filterMetricsReportedAt === undefined) continue;
       const currentMetrics = latestMetrics.get(hb.collectorId);
       if (
@@ -1101,7 +1175,12 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         hb.filterMetricsReportedAt >= (currentMetrics.filterMetricsReportedAt ?? 0)
       ) latestMetrics.set(hb.collectorId, hb);
     }
-    return { latest: [...latest.values()], latestMetrics: [...latestMetrics.values()] };
+    return {
+      latest: [...latest.values()],
+      latestMetrics: [...latestMetrics.values()],
+      latestRaw: [...latestRaw.values()],
+      latestForwarder: [...latestForwarder.values()],
+    };
   }
 
   /** Events within a window [sinceMs, now]. */

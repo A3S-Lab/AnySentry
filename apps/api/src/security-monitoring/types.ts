@@ -1324,6 +1324,33 @@ export interface AgentTopology {
   updateTime: string;
 }
 
+export interface CollectorExecEvidenceMetrics {
+  /** ToolExec events reported by the raw collector during this heartbeat interval. */
+  exec: number;
+  /** ToolExec events whose final argv evidence remained truncated. */
+  execTruncated: number;
+  /** ToolExec events whose final argv evidence remained incomplete. */
+  execIncomplete: number;
+  /** ToolExec reassemblies that timed out, including events later supplemented from /proc. */
+  execReassemblyTimeout: number;
+}
+export interface CollectorExecEvidenceReport extends CollectorExecEvidenceMetrics {
+  /** True only for the partial-window raw heartbeat flushed during graceful collector shutdown. */
+  shutdownFinal: boolean;
+}
+export interface CollectorExecEvidenceHealth {
+  /** Distinguishes a reported all-zero interval from a collector that does not expose the metrics. */
+  reported: boolean;
+  lastReportedAt?: string;
+  latest?: CollectorExecEvidenceReport & { intervalSecs: number };
+  /** Sums non-overlapping raw collector intervals whose heartbeat records fall in the query window. */
+  window: CollectorExecEvidenceMetrics & {
+    heartbeatCount: number;
+    intervalSecs: number;
+    shutdownFinalCount: number;
+  };
+}
+export type CollectorHeartbeatOrigin = 'raw_collector' | 'forwarder';
 export interface CollectorHeartbeatRequest {
   collectorId?: string;
   sourceId?: string;
@@ -1348,6 +1375,10 @@ export interface CollectorHeartbeatRequest {
   observedAgents?: number;
   filterMetrics?: CollectorFilterMetrics;
   message?: string;
+}
+export interface CollectorRawHeartbeatRequest extends CollectorHeartbeatRequest {
+  /** Raw collector-only argv/reassembly evidence quality; never an operational error counter. */
+  execEvidence?: Partial<CollectorExecEvidenceReport>;
 }
 export interface CollectorFilterMetrics {
   /** @deprecated Compatibility marker for pre-decoupling forwarders. */
@@ -1446,6 +1477,10 @@ export interface CollectorFilterMetrics {
   runtimeReconcileLastDurationMs?: number;
   runtimeSnapshotPosts?: number;
   runtimeSnapshotErrors?: number;
+  /** Runtime snapshot attempts retried after a transient transport failure. */
+  runtimeSnapshotRetries?: number;
+  /** Transient runtime snapshot failures followed by a successful retry. */
+  runtimeSnapshotRecovered?: number;
   runtimeLeaseEpoch?: number;
   runtimeLeaseAttempts?: number;
   runtimeLeaseErrors?: number;
@@ -1454,9 +1489,21 @@ export interface CollectorFilterMetrics {
   runtimeSnapshotDuplicates?: number;
   lastRuntimeSnapshotAt?: string;
   lastRuntimeSnapshotError?: string;
+  /** Sticky timestamp for the most recent terminal or exhausted snapshot failure. */
+  lastRuntimeSnapshotFailureAt?: string;
+  /** Sticky bounded reason for the most recent terminal or exhausted snapshot failure. */
+  lastRuntimeSnapshotFailure?: string;
+  /** Snapshot version associated with the most recent failure. */
+  lastRuntimeSnapshotFailureVersion?: number;
+  /** Sticky timestamp for the most recent transient snapshot retry. */
+  lastRuntimeSnapshotRetryAt?: string;
+  /** Sticky bounded reason that triggered the most recent retry. */
+  lastRuntimeSnapshotRetryReason?: string;
 }
-export interface CollectorHeartbeatRecord extends Required<Pick<CollectorHeartbeatRequest, 'collectorId' | 'status'>> {
+export interface CollectorHeartbeatRecord extends Required<Pick<CollectorRawHeartbeatRequest, 'collectorId' | 'status'>> {
   at: number;
+  /** Server-assigned ingress provenance; absent only on records persisted before provenance existed. */
+  origin?: CollectorHeartbeatOrigin;
   /** Set only when this record carried Forwarder-enriched filter metrics. */
   filterMetricsReportedAt?: number;
   nodeName?: string;
@@ -1473,6 +1520,8 @@ export interface CollectorHeartbeatRecord extends Required<Pick<CollectorHeartbe
   outputDropped: number;
   errorCount: number;
   observedAgents: number;
+  /** Present only when this record originated from a raw CollectorHeartbeat with quality fields. */
+  execEvidence?: CollectorExecEvidenceReport;
   filterMetrics: CollectorFilterMetrics;
   message?: string;
 }
@@ -1520,6 +1569,9 @@ export interface CollectorHealthItem {
     outputDropped: number;
     errorCount: number;
   };
+  execEvidence: CollectorExecEvidenceHealth;
+  /** True only when filterMetrics came from a fresh Forwarder heartbeat, not the decoupled fallback. */
+  filterMetricsReported: boolean;
   filterMetrics: CollectorFilterMetrics;
   message?: string;
   eventCategoryCounts: Record<EventCategory, number>;
