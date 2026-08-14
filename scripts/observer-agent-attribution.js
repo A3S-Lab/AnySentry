@@ -520,6 +520,69 @@ class AgentAttributor {
     return this.rootForRecord(record, false);
   }
 
+  /**
+   * Resolves only an ancestor of the same registered Agent scope. A different Agent scope is a
+   * lifecycle boundary: callers may establish a nested root below it. When startup reconciliation
+   * sees the child before its matching wrapper, the highest same-scope signature below that
+   * boundary is materialized first so process enumeration order cannot create duplicate roots.
+   */
+  resolveSameScopeAncestor(initialPpid, match, snapshot) {
+    const agentId = text(match?.agentId);
+    let pid = positiveInt(initialPpid);
+    if (!pid || !agentId) return undefined;
+    const visited = new Set();
+    let highestSameScope;
+
+    const establishHighest = () => {
+      if (!highestSameScope) return undefined;
+      const result = this.rememberAgent(
+        highestSameScope.info,
+        highestSameScope.match,
+        highestSameScope.info.pid,
+        'hint_only',
+        'process_signature',
+      );
+      if (result.state !== 'agent') return undefined;
+      const record = this.procs.getFor(highestSameScope.info);
+      const scope = this.agentScope(record);
+      return scope.state === 'agent' ? scope : undefined;
+    };
+
+    for (let depth = 0; pid && depth < this.maxAncestors; depth++) {
+      if (visited.has(pid)) return establishHighest();
+      visited.add(pid);
+      if (pid === 1) return establishHighest();
+
+      const usingSnapshot = snapshot instanceof Map;
+      const cachedBeforeRead = this.procs.get(pid);
+      let live = usingSnapshot ? snapshot.get(pid) : this.readProcess(pid, 'ancestry');
+      // A process may disappear between ToolExec and attribution. Cached non-Agent/unknown records
+      // still carry bounded ProcessKey and PPID facts that are safe to follow for this repair path.
+      if (!live && !usingSnapshot && cachedBeforeRead?.startTime) live = cachedBeforeRead;
+      if (!live) return establishHighest();
+      if (live !== cachedBeforeRead) this.discardReusedPid(live);
+      const cached = this.procs.get(pid);
+
+      if (this.matchInfrastructure(live)) return establishHighest();
+      const ancestorMatch = this.matchAgentExecutable(live);
+      if (ancestorMatch) {
+        if (text(ancestorMatch.agentId) !== agentId) return establishHighest();
+        const scope = cached?.state === 'agent' ? this.agentScope(cached) : undefined;
+        if (scope?.state === 'agent' && scope.agentId === agentId) return scope;
+        highestSameScope = { info: live, match: ancestorMatch };
+      } else if (cached?.state === 'agent') {
+        const scope = this.agentScope(cached);
+        if (scope.state === 'agent') {
+          return scope.agentId === agentId ? scope : establishHighest();
+        }
+      }
+      if (cached?.state === 'infrastructure') return establishHighest();
+
+      pid = positiveInt(live.ppid);
+    }
+    return establishHighest();
+  }
+
   pruneRoots() {
     const cutoff = this.now() - this.terminalRootTtlMs;
     for (const [key, root] of this.rootsByKey) {
@@ -674,16 +737,30 @@ class AgentAttributor {
     }
 
     let roots = 0;
+    let signatureDescendants = 0;
     for (const info of snapshot.values()) {
       if (positiveInt(info.tgid) && positiveInt(info.tgid) !== info.pid) continue;
       const directAgent = this.matchAgentExecutable(info);
       if (!directAgent) continue;
       const before = this.rootsByKey.size;
-      const result = this.rememberAgent(info, directAgent, info.pid, 'hint_only', 'process_signature');
-      if (result.state === 'agent' && this.rootsByKey.size > before) roots++;
+      const ancestor = this.resolveSameScopeAncestor(info.ppid, directAgent, snapshot);
+      const result = ancestor
+        ? this.rememberAgent(
+            info,
+            ancestor,
+            ancestor.rootPid,
+            'process_lineage',
+            'process_graph',
+            ancestor.workspacePath,
+          )
+        : this.rememberAgent(info, directAgent, info.pid, 'hint_only', 'process_signature');
+      if (result.state !== 'agent') continue;
+      const addedRoots = this.rootsByKey.size - before;
+      roots += addedRoots;
+      if (result.attribution.rootKey !== this.processKey(info)) signatureDescendants++;
     }
 
-    let descendants = 0;
+    let descendants = signatureDescendants;
     let infrastructureDescendants = 0;
     for (const info of snapshot.values()) {
       if (['agent', 'infrastructure'].includes(this.procs.get(info.pid)?.state)) continue;
@@ -758,6 +835,7 @@ class AgentAttributor {
     }
 
     let roots = 0;
+    let signatureDescendants = 0;
     const all = [...snapshot.values()];
     for (let offset = 0; offset < all.length; offset += batchSize) {
       for (const info of all.slice(offset, offset + batchSize)) {
@@ -765,13 +843,26 @@ class AgentAttributor {
         const directAgent = this.matchAgentExecutable(info);
         if (!directAgent) continue;
         const before = this.rootsByKey.size;
-        const result = this.rememberAgent(info, directAgent, info.pid, 'hint_only', 'process_signature');
-        if (result.state === 'agent' && this.rootsByKey.size > before) roots++;
+        const ancestor = this.resolveSameScopeAncestor(info.ppid, directAgent, snapshot);
+        const result = ancestor
+          ? this.rememberAgent(
+              info,
+              ancestor,
+              ancestor.rootPid,
+              'process_lineage',
+              'process_graph',
+              ancestor.workspacePath,
+            )
+          : this.rememberAgent(info, directAgent, info.pid, 'hint_only', 'process_signature');
+        if (result.state !== 'agent') continue;
+        const addedRoots = this.rootsByKey.size - before;
+        roots += addedRoots;
+        if (result.attribution.rootKey !== this.processKey(info)) signatureDescendants++;
       }
       if (offset + batchSize < all.length) await yieldNow();
     }
 
-    let descendants = 0;
+    let descendants = signatureDescendants;
     let infrastructureDescendants = 0;
     for (let offset = 0; offset < all.length; offset += batchSize) {
       for (const info of all.slice(offset, offset + batchSize)) {
@@ -916,13 +1007,21 @@ class AgentAttributor {
     }
 
     const directAgent = this.matchAgent(current);
-    if (directAgent) {
+    const existingScope = existing?.state === 'agent' ? this.agentScope(existing) : undefined;
+    const alreadyBoundToSameScope = Boolean(
+      directAgent &&
+      existingScope?.state === 'agent' &&
+      text(existingScope.agentId) === text(directAgent.agentId)
+    );
+    if (directAgent && !alreadyBoundToSameScope) {
+      const ancestor = this.resolveSameScopeAncestor(current.ppid, directAgent);
       const directResult = this.rememberAgent(
         current,
-        directAgent,
-        pid,
-        'hint_only',
-        'process_signature',
+        ancestor || directAgent,
+        ancestor?.rootPid || pid,
+        ancestor ? 'process_lineage' : 'hint_only',
+        ancestor ? 'process_graph' : 'process_signature',
+        ancestor?.workspacePath,
       );
       if (directResult.state === 'agent') return this.finish(pid, directResult, exiting, current);
     }
@@ -1179,12 +1278,14 @@ class AgentAttributor {
           const leaderAgent = this.matchAgent(leader);
           if (leaderAgent) {
             const { workspacePath } = this.resolveWorkspace(leader.cwd);
+            const ancestor = this.resolveSameScopeAncestor(leader.ppid, leaderAgent);
             const leaderResult = this.rememberAgent(
               { ...leader, workspacePath },
-              leaderAgent,
-              tgid,
-              'hint_only',
-              'process_signature',
+              ancestor || leaderAgent,
+              ancestor?.rootPid || tgid,
+              ancestor ? 'process_lineage' : 'hint_only',
+              ancestor ? 'process_graph' : 'process_signature',
+              ancestor?.workspacePath,
             );
             if (leaderResult.state === 'agent') {
               const rootRecord = this.procs.getFor(leader);
@@ -1205,12 +1306,14 @@ class AgentAttributor {
 
       const directAgent = this.matchAgent(live);
       if (directAgent) {
+        const ancestor = this.resolveSameScopeAncestor(live.ppid, directAgent);
         this.rememberAgent(
           live,
-          directAgent,
-          pid,
-          'hint_only',
-          'process_signature',
+          ancestor || directAgent,
+          ancestor?.rootPid || pid,
+          ancestor ? 'process_lineage' : 'hint_only',
+          ancestor ? 'process_graph' : 'process_signature',
+          ancestor?.workspacePath,
         );
         return this.agentScope(this.procs.getFor(live));
       }

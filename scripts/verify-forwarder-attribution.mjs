@@ -214,6 +214,131 @@ function attributor(procEntries = []) {
 }
 
 {
+  // npm-installed Codex is one lifecycle even though its Node wrapper, native binary, and sandbox
+  // helper can all independently match the Codex signature. Child-first insertion deliberately
+  // proves that /proc enumeration order cannot turn those implementation layers into three roots.
+  const entries = [
+    [1_203, { pid: 1_203, tgid: 1_203, ppid: 1_202, startTime: '123', comm: 'codex', exe: '/vendor/codex-linux-sandbox', argv: '/vendor/codex run-as-sandbox', cwd: '/workspace/codex' }],
+    [1_202, { pid: 1_202, tgid: 1_202, ppid: 1_201, startTime: '122', comm: 'codex', exe: '/vendor/codex', argv: '/vendor/codex exec', cwd: '/workspace/codex' }],
+    [1_201, { pid: 1_201, tgid: 1_201, ppid: 1_200, startTime: '121', comm: 'node', exe: '/usr/bin/node', argv: '/usr/local/bin/codex exec', cwd: '/workspace/codex' }],
+    [1_200, { pid: 1_200, tgid: 1_200, ppid: 1, startTime: '120', comm: 'bash', exe: '/usr/bin/bash', argv: 'bash', cwd: '/workspace/codex' }],
+  ];
+
+  for (const batched of [false, true]) {
+    const procs = new Map(entries);
+    const judge = new AgentAttributor({
+      now: () => 1_000_000,
+      listPids: () => [...procs.keys()],
+      readProc: (pid) => procs.get(pid),
+    });
+    const seeded = batched
+      ? await judge.reconcileFromProcBatched({ batchSize: 2, yieldNow: async () => {} })
+      : judge.seedFromProc();
+    assert.equal(seeded.roots, 1, `${batched ? 'batched' : 'sync'} scan must create one Codex root`);
+    assert.equal(seeded.descendants, 2);
+    assert.equal(judge.runtimeSnapshot().entries.length, 1);
+    assert.equal(judge.runtimeSnapshot().entries[0].rootPid, 1_201);
+    const bindings = [1_201, 1_202, 1_203].map((pid) => judge.procs.get(pid));
+    assert.equal(new Set(bindings.map((record) => record.agentInstanceId)).size, 1);
+    assert.equal(new Set(bindings.map((record) => record.rootKey)).size, 1);
+  }
+}
+
+{
+  // The live path must converge on the same wrapper root even when a grandchild event arrives
+  // before any Agent process event has populated the cache.
+  const procs = new Map([
+    [1_300, { pid: 1_300, tgid: 1_300, ppid: 1, startTime: '130', comm: 'bash', exe: '/usr/bin/bash', argv: 'bash', cwd: '/workspace/codex' }],
+    [1_301, { pid: 1_301, tgid: 1_301, ppid: 1_300, startTime: '131', comm: 'node', exe: '/usr/bin/node', argv: '/usr/local/bin/codex exec', cwd: '/workspace/codex' }],
+    [1_302, { pid: 1_302, tgid: 1_302, ppid: 1_301, startTime: '132', comm: 'codex', exe: '/vendor/codex', argv: '/vendor/codex exec', cwd: '/workspace/codex' }],
+    [1_303, { pid: 1_303, tgid: 1_303, ppid: 1_302, startTime: '133', comm: 'codex', exe: '/vendor/codex-linux-sandbox', argv: '/vendor/codex run-as-sandbox', cwd: '/workspace/codex' }],
+  ]);
+  const judge = new AgentAttributor({
+    now: () => 1_000_000,
+    readProc: (pid) => procs.get(pid),
+    listPids: () => [],
+  });
+  const grandchild = judge.classify(observerEvent({
+    pid: 1_304,
+    ppid: 1_303,
+    comm: 'rg',
+    exe: '/usr/bin/rg',
+    startTimeNs: '134',
+    argv: ['rg', 'AnySentry', '/workspace/codex'],
+  }));
+  const native = judge.classify(observerEvent({
+    pid: 1_302,
+    ppid: 1_301,
+    comm: 'codex',
+    exe: '/vendor/codex',
+    startTimeNs: '132',
+    argv: ['/vendor/codex', 'exec'],
+  }));
+  const sandbox = judge.classify(observerEvent({
+    pid: 1_303,
+    ppid: 1_302,
+    comm: 'codex',
+    exe: '/vendor/codex-linux-sandbox',
+    startTimeNs: '133',
+    argv: ['/vendor/codex', 'run-as-sandbox'],
+  }));
+  assert.equal(grandchild.attribution.rootPid, 1_301);
+  assert.equal(native.attribution.agentInstanceId, grandchild.attribution.agentInstanceId);
+  assert.equal(sandbox.attribution.agentInstanceId, grandchild.attribution.agentInstanceId);
+  assert.equal(judge.runtimeSnapshot().entries.length, 1);
+}
+
+{
+  // A genuinely different nested runtime remains an independent lifecycle boundary.
+  const judge = attributor();
+  const codex = judge.classify(observerEvent({
+    pid: 1_400,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '140',
+    argv: ['codex'],
+  }));
+  const pi = judge.classify(observerEvent({
+    pid: 1_401,
+    ppid: 1_400,
+    comm: 'pi',
+    exe: '/usr/bin/node',
+    startTimeNs: '141',
+    argv: ['pi'],
+  }));
+  assert.equal(codex.attribution.agentScopeId, 'codex');
+  assert.equal(pi.attribution.agentScopeId, 'pi');
+  assert.notEqual(pi.attribution.agentInstanceId, codex.attribution.agentInstanceId);
+  assert.equal(judge.runtimeSnapshot().entries.length, 2);
+}
+
+{
+  let reads = 0;
+  const cyclic = new Map([
+    [1_501, { pid: 1_501, tgid: 1_501, ppid: 1_502, startTime: '151', comm: 'bash', exe: '/usr/bin/bash', argv: 'bash' }],
+    [1_502, { pid: 1_502, tgid: 1_502, ppid: 1_501, startTime: '152', comm: 'bash', exe: '/usr/bin/bash', argv: 'bash' }],
+  ]);
+  const judge = new AgentAttributor({
+    maxAncestors: 2,
+    now: () => 1_000_000,
+    readProc: (pid) => { reads += 1; return cyclic.get(pid); },
+    listPids: () => [],
+  });
+  const result = judge.classify(observerEvent({
+    pid: 1_500,
+    ppid: 1_501,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '150',
+    argv: ['codex'],
+  }));
+  assert.equal(result.state, 'agent');
+  assert.ok(reads <= 2, 'same-scope ancestor resolution must obey the configured depth bound');
+  assert.equal(judge.runtimeSnapshot().entries.length, 1);
+}
+
+{
   const procs = new Map([
     [1000, { pid: 1000, tgid: 1000, ppid: 1, startTime: '100', comm: 'java', exe: '/opt/java/bin/java', argv: 'kafka.Kafka' }],
     [1001, { pid: 1001, tgid: 1001, ppid: 1000, startTime: '101', comm: 'bash', exe: '/usr/bin/bash', argv: 'kafka-topics.sh --list' }],
