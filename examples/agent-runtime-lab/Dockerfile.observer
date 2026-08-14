@@ -6,6 +6,7 @@ FROM ${NODE_IMAGE} AS nodebin
 
 FROM ${OBSERVER_IMAGE}
 COPY --from=nodebin /usr/local/bin/node /usr/local/bin/node
+COPY scripts/observer-supervisor.js /opt/observer-supervisor.js
 COPY scripts/observer-forward.js /opt/observer-forward.js
 COPY scripts/observer-agent-attribution.js /opt/observer-agent-attribution.js
 COPY scripts/observer-attribution-merge.js /opt/observer-attribution-merge.js
@@ -18,3 +19,4 @@ COPY scripts/observer-event-dedup.js /opt/observer-event-dedup.js
 COPY scripts/observer-workload-filter.js /opt/observer-workload-filter.js
 COPY scripts/observer-infrastructure-roots.js /opt/observer-infrastructure-roots.js
 COPY scripts/observer-e2e-witness.js /opt/observer-e2e-witness.js
+ENTRYPOINT ["/usr/local/bin/node", "/opt/observer-supervisor.js"]

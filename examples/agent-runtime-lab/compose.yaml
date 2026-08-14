@@ -51,8 +51,9 @@ services:
     restart: unless-stopped
     privileged: true
     pid: host
-    entrypoint: ["/bin/sh", "-c"]
-    command: ["a3s-observer-collector | node /opt/observer-forward.js"]
+    stop_grace_period: 30s
+    entrypoint: ["/usr/local/bin/node"]
+    command: ["/opt/observer-supervisor.js"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -78,6 +79,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       # Keep the lab on the current checkout even when Docker's image builder
       # is unavailable or an older observer image is already cached locally.
+      - ../../scripts/observer-supervisor.js:/opt/observer-supervisor.js:ro
       - ../../scripts/observer-forward.js:/opt/observer-forward.js:ro
       - ../../scripts/observer-agent-attribution.js:/opt/observer-agent-attribution.js:ro
       - ../../scripts/observer-attribution-merge.js:/opt/observer-attribution-merge.js:ro

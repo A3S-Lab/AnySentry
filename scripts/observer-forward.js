@@ -82,7 +82,44 @@ const MAX_INFLIGHT = boundedNumber(process.env.FORWARD_MAX_INFLIGHT, 8, 1, 64);
 const BATCH_SIZE = boundedNumber(process.env.FORWARD_BATCH_SIZE, 32, 1, 256);
 const BATCH_FLUSH_MS = boundedNumber(process.env.FORWARD_BATCH_FLUSH_MS, 50, 1, 5_000);
 const MAX_QUEUE = boundedNumber(process.env.FORWARD_MAX_QUEUE, 4_096, BATCH_SIZE, 100_000);
+// Leave at least 1 MiB for the batch envelope below the API route's default 4 MiB parser ceiling.
+const BATCH_MAX_BYTES = boundedNumber(
+  process.env.FORWARD_BATCH_MAX_BYTES,
+  512 * 1024,
+  64 * 1024,
+  3 * 1024 * 1024,
+);
+const MAX_EVENT_BYTES = boundedNumber(
+  process.env.FORWARD_MAX_EVENT_BYTES,
+  3 * 1024 * 1024,
+  64 * 1024,
+  3 * 1024 * 1024,
+);
+const MAX_QUEUE_BYTES = boundedNumber(
+  process.env.FORWARD_MAX_QUEUE_BYTES,
+  16 * 1024 * 1024,
+  Math.max(BATCH_MAX_BYTES, MAX_EVENT_BYTES),
+  256 * 1024 * 1024,
+);
 const HTTP_TIMEOUT_MS = boundedNumber(process.env.FORWARD_HTTP_TIMEOUT_MS, 10_000, 1_000, 120_000);
+const BATCH_ACK_MAX_BYTES = boundedNumber(
+  process.env.FORWARD_BATCH_ACK_MAX_BYTES,
+  1024 * 1024,
+  16 * 1024,
+  4 * 1024 * 1024,
+);
+const IDENTITY_SNAPSHOT_MAX_BYTES = boundedNumber(
+  process.env.FORWARD_IDENTITY_SNAPSHOT_MAX_BYTES,
+  4 * 1024 * 1024,
+  64 * 1024,
+  16 * 1024 * 1024,
+);
+const SHUTDOWN_TIMEOUT_MS = boundedNumber(
+  process.env.FORWARD_SHUTDOWN_TIMEOUT_MS,
+  15_000,
+  2_000,
+  30_000,
+);
 function envBoolean(value, fallback) {
   if (value === undefined || value === '') return fallback;
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
@@ -171,8 +208,11 @@ function positiveInteger(value) {
 const runtimeLeaseTarget = new URL(
   process.env.ANYSENTRY_AGENT_RUNTIME_LEASE_URL || defaultRuntimeLeaseUrl(runtimeSnapshotTarget),
 );
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_INFLIGHT });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_INFLIGHT });
+const eventHttpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_INFLIGHT });
+const eventHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_INFLIGHT });
+// Lifecycle/health traffic must remain available while every event socket is occupied.
+const controlHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 4 });
+const controlHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 4 });
 let templateDocument;
 let templateLoadErrors = 0;
 try {
@@ -210,7 +250,10 @@ const toolExecDeduper = new ToolExecDeduper({
 });
 
 let inflight = 0;
-const pending = new BoundedPriorityQueue(MAX_QUEUE, 5);
+const pending = new BoundedPriorityQueue(MAX_QUEUE, 5, (item) => item.bytes);
+const activeEventRequests = new Set();
+const activeControlRequests = new Set();
+let eventRequestsAborted = false;
 let outputDropped = 0;
 let errorCount = 0;
 let eventKindCounts = Object.create(null);
@@ -244,6 +287,10 @@ let identitySnapshotTimer;
 let runtimeSnapshotTimer;
 let rootLivenessTimer;
 let batchTimer;
+let shutdownForceTimer;
+let shutdownDeadline = 0;
+let shutdownFinalizing = false;
+let transportsClosed = false;
 let signatureReloader;
 let rl;
 let runtimeSnapshotVersion = 0;
@@ -259,6 +306,7 @@ let runtimeLeaseErrors = 0;
 let runtimeLeaseFenced = false;
 let runtimeLeasePromise;
 let runtimeSnapshotInFlight = false;
+let runtimeSnapshotOperation = 0;
 let reconcileTimer;
 let reconcileRunning = false;
 let reconcilePending = false;
@@ -361,18 +409,31 @@ function postJson(url, bodyObj, timeoutMs, done) {
   }
   const body = JSON.stringify(bodyObj);
   let settled = false;
+  let absoluteTimer;
+  let req;
+  let response;
+  const state = {
+    abort() {
+      if (settled) return;
+      response?.destroy();
+      req?.destroy();
+      finish(true);
+    },
+  };
   const finish = (failed) => {
     if (settled) return;
     settled = true;
+    if (absoluteTimer) clearTimeout(absoluteTimer);
+    activeControlRequests.delete(state);
     done(Boolean(failed));
   };
-  const req = transport.request(
+  req = transport.request(
     {
       hostname: url.hostname,
       port: url.port || (isHttps ? 443 : 80),
       path: `${url.pathname}${url.search}`,
       method: 'POST',
-      agent: isHttps ? httpsAgent : httpAgent,
+      agent: isHttps ? controlHttpsAgent : controlHttpAgent,
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body),
@@ -380,21 +441,229 @@ function postJson(url, bodyObj, timeoutMs, done) {
       },
     },
     (res) => {
+      response = res;
       res.resume();
       res.on('end', () => finish((res.statusCode || 500) >= 400));
+      res.on('aborted', () => finish(true));
+      res.on('error', () => finish(true));
+      res.on('close', () => {
+        if (!res.complete) finish(true);
+      });
     },
   );
+  activeControlRequests.add(state);
   req.on('error', () => finish(true));
-  req.setTimeout(timeoutMs, () => {
-    finish(true);
-    req.destroy();
-  });
+  absoluteTimer = setTimeout(() => {
+    state.abort();
+  }, timeoutMs);
   req.end(body);
+}
+
+function validateBatchAck(value, batchLength) {
+  const ack = value?.data ?? value;
+  if (!ack || typeof ack !== 'object' || Array.isArray(ack)) {
+    return { dropped: batchLength, errors: 1, reason: 'batch endpoint returned no acknowledgement' };
+  }
+  const acceptedEvents = ack.acceptedEvents;
+  const rejectedEvents = ack.rejectedEvents;
+  const items = ack.items;
+  if (
+    !Number.isSafeInteger(acceptedEvents) || acceptedEvents < 0
+    || !Number.isSafeInteger(rejectedEvents) || rejectedEvents < 0
+    || acceptedEvents + rejectedEvents !== batchLength
+    || typeof ack.accepted !== 'boolean'
+    || ack.accepted !== (acceptedEvents > 0)
+    || !Array.isArray(items)
+    || items.length !== batchLength
+  ) {
+    return { dropped: batchLength, errors: 1, reason: 'batch endpoint returned an inconsistent acknowledgement' };
+  }
+  let acceptedItems = 0;
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index];
+    if (
+      !item || typeof item !== 'object' || Array.isArray(item)
+      || item.index !== index || typeof item.accepted !== 'boolean'
+    ) {
+      return { dropped: batchLength, errors: 1, reason: 'batch endpoint returned malformed item acknowledgements' };
+    }
+    if (item.accepted) acceptedItems++;
+  }
+  if (acceptedItems !== acceptedEvents) {
+    return { dropped: batchLength, errors: 1, reason: 'batch endpoint acknowledgement counts do not match its items' };
+  }
+  return {
+    dropped: rejectedEvents,
+    errors: rejectedEvents > 0 ? 1 : 0,
+    reason: rejectedEvents > 0 ? `batch endpoint rejected ${rejectedEvents} event(s)` : '',
+  };
+}
+
+/** POST one event batch with a bounded response body and an absolute wall-clock timeout. */
+function postEventBatch(batch, timeoutMs, done) {
+  if (eventRequestsAborted) {
+    done({ error: new Error('event delivery stopped during shutdown') });
+    return;
+  }
+  const isHttps = batchTarget.protocol === 'https:';
+  const transport = isHttps ? https : http;
+  if (batchTarget.protocol !== 'http:' && batchTarget.protocol !== 'https:') {
+    done({ error: new Error(`unsupported protocol ${batchTarget.protocol}`) });
+    return;
+  }
+  let body;
+  try {
+    body = JSON.stringify({ events: batch.map((item) => item.body) });
+  } catch (error) {
+    done({ error: error instanceof Error ? error : new Error(String(error)) });
+    return;
+  }
+  let settled = false;
+  let absoluteTimer;
+  let req;
+  let response;
+  const state = {
+    abort(reason = 'event batch request aborted') {
+      if (settled) return;
+      response?.destroy();
+      req?.destroy();
+      finish({ error: new Error(reason), aborted: true });
+    },
+  };
+  const finish = (result) => {
+    if (settled) return;
+    settled = true;
+    if (absoluteTimer) clearTimeout(absoluteTimer);
+    activeEventRequests.delete(state);
+    done(result);
+  };
+  req = transport.request(
+    {
+      hostname: batchTarget.hostname,
+      port: batchTarget.port || (isHttps ? 443 : 80),
+      path: `${batchTarget.pathname}${batchTarget.search}`,
+      method: 'POST',
+      agent: isHttps ? eventHttpsAgent : eventHttpAgent,
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        ...sourceHeaders(),
+      },
+    },
+    (res) => {
+      response = res;
+      const statusCode = res.statusCode || 0;
+      if (statusCode === 413) {
+        // The status alone proves that the batch was rejected before the controller accepted it.
+        // Do not let a proxy's generated/trickled error body delay safe binary splitting.
+        res.once('error', () => {});
+        res.destroy();
+        finish({ statusCode, responseBody: '' });
+        return;
+      }
+      if (statusCode < 200 || statusCode >= 300) {
+        res.resume();
+        res.on('end', () => finish({ statusCode, responseBody: '' }));
+        res.on('aborted', () => finish({ error: new Error('batch error response aborted'), statusCode }));
+        res.on('error', (error) => finish({ error, statusCode }));
+        res.on('close', () => {
+          if (!res.complete) finish({ error: new Error('batch error response closed early'), statusCode });
+        });
+        return;
+      }
+      let responseBody = '';
+      let responseBytes = 0;
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        if (settled) return;
+        responseBytes += Buffer.byteLength(chunk);
+        if (responseBytes > BATCH_ACK_MAX_BYTES) {
+          res.destroy();
+          finish({ error: new Error(`batch acknowledgement exceeds ${BATCH_ACK_MAX_BYTES} bytes`), statusCode });
+          return;
+        }
+        responseBody += chunk;
+      });
+      res.on('end', () => finish({ statusCode, responseBody }));
+      res.on('aborted', () => finish({ error: new Error('batch acknowledgement aborted'), statusCode }));
+      res.on('error', (error) => finish({ error, statusCode }));
+      res.on('close', () => {
+        if (!res.complete) finish({ error: new Error('batch acknowledgement closed early'), statusCode });
+      });
+    },
+  );
+  activeEventRequests.add(state);
+  req.on('error', (error) => finish({ error }));
+  absoluteTimer = setTimeout(
+    () => state.abort(`event batch exceeded its ${timeoutMs} ms wall-clock timeout`),
+    timeoutMs,
+  );
+  req.end(body);
+}
+
+function combineBatchOutcomes(left, right, extraErrors = 0) {
+  return {
+    dropped: left.dropped + right.dropped,
+    errors: left.errors + right.errors + extraErrors,
+  };
+}
+
+/** A 413 is safe to retry because Express rejects the body before the controller processes it. */
+function deliverEventBatch(batch, done) {
+  if (eventRequestsAborted) {
+    done({ dropped: batch.length, errors: batch.length > 0 ? 1 : 0 });
+    return;
+  }
+  postEventBatch(batch, HTTP_TIMEOUT_MS, (result) => {
+    // Once a 413 header is received the request was rejected for size, regardless of whether its
+    // proxy-generated response body later truncates or aborts. Splitting remains safe and useful.
+    if (result.statusCode === 413) {
+      if (batch.length === 1) {
+        done({ dropped: 1, errors: 1 });
+        return;
+      }
+      const middle = Math.ceil(batch.length / 2);
+      const left = batch.slice(0, middle);
+      const right = batch.slice(middle);
+      deliverEventBatch(left, (leftOutcome) => {
+        deliverEventBatch(right, (rightOutcome) => {
+          done(combineBatchOutcomes(leftOutcome, rightOutcome, 1));
+        });
+      });
+      return;
+    }
+    if (result.error) {
+      done({ dropped: batch.length, errors: 1 });
+      return;
+    }
+    if (result.statusCode < 200 || result.statusCode >= 300) {
+      done({ dropped: batch.length, errors: 1 });
+      return;
+    }
+    let parsed;
+    try {
+      parsed = result.responseBody ? JSON.parse(result.responseBody) : undefined;
+    } catch {
+      done({ dropped: batch.length, errors: 1 });
+      return;
+    }
+    const outcome = validateBatchAck(parsed, batch.length);
+    if (outcome.reason) console.error(`[observer-forward] ${outcome.reason}`);
+    done({ dropped: outcome.dropped, errors: outcome.errors });
+  });
+}
+
+function abortActiveEventRequests(reason) {
+  eventRequestsAborted = true;
+  for (const state of [...activeEventRequests]) state.abort(reason);
+}
+
+function abortActiveControlRequests(reason) {
+  for (const state of [...activeControlRequests]) state.abort(reason);
 }
 
 /**
  * POST a bounded JSON control-plane request and parse its business acknowledgement.
- * Event batches intentionally keep using `postJson`: only lease/snapshot traffic needs the body.
  */
 function postJsonResponse(url, bodyObj, timeoutMs, done) {
   const isHttps = url.protocol === 'https:';
@@ -405,18 +674,31 @@ function postJsonResponse(url, bodyObj, timeoutMs, done) {
   }
   const body = JSON.stringify(bodyObj);
   let settled = false;
+  let absoluteTimer;
+  let req;
+  let response;
+  const state = {
+    abort(reason = 'control endpoint request aborted') {
+      if (settled) return;
+      response?.destroy();
+      req?.destroy();
+      finish(new Error(reason));
+    },
+  };
   const finish = (error, value) => {
     if (settled) return;
     settled = true;
+    if (absoluteTimer) clearTimeout(absoluteTimer);
+    activeControlRequests.delete(state);
     done(error, value);
   };
-  const req = transport.request(
+  req = transport.request(
     {
       hostname: url.hostname,
       port: url.port || (isHttps ? 443 : 80),
       path: `${url.pathname}${url.search}`,
       method: 'POST',
-      agent: isHttps ? httpsAgent : httpAgent,
+      agent: isHttps ? controlHttpsAgent : controlHttpAgent,
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body),
@@ -424,6 +706,7 @@ function postJsonResponse(url, bodyObj, timeoutMs, done) {
       },
     },
     (res) => {
+      response = res;
       let data = '';
       let oversized = false;
       res.setEncoding('utf8');
@@ -452,14 +735,20 @@ function postJsonResponse(url, bodyObj, timeoutMs, done) {
           finish(new Error('control endpoint returned invalid JSON'));
         }
       });
+      res.on('aborted', () => finish(new Error('control endpoint response aborted')));
+      res.on('error', (error) => finish(error));
+      res.on('close', () => {
+        if (!res.complete) finish(new Error('control endpoint response closed early'));
+      });
     },
   );
+  activeControlRequests.add(state);
   req.on('error', (error) => finish(error));
-  req.setTimeout(timeoutMs, () => {
-    finish(new Error('control endpoint request timed out'));
-    req.destroy();
-  });
+  absoluteTimer = setTimeout(() => {
+    state.abort('control endpoint request timed out');
+  }, timeoutMs);
   req.end(body);
+  return state;
 }
 
 function delay(ms) {
@@ -474,24 +763,46 @@ function getJson(url, timeoutMs, done) {
     return;
   }
   let settled = false;
+  let absoluteTimer;
+  let req;
+  let response;
+  const state = {
+    abort(reason = 'identity snapshot request aborted') {
+      if (settled) return;
+      response?.destroy();
+      req?.destroy();
+      finish(new Error(reason));
+    },
+  };
   const finish = (error, value) => {
     if (settled) return;
     settled = true;
+    if (absoluteTimer) clearTimeout(absoluteTimer);
+    activeControlRequests.delete(state);
     done(error, value);
   };
-  const req = transport.request(
+  req = transport.request(
     {
       hostname: url.hostname,
       port: url.port || (isHttps ? 443 : 80),
       path: `${url.pathname}${url.search}`,
       method: 'GET',
-      agent: isHttps ? httpsAgent : httpAgent,
+      agent: isHttps ? controlHttpsAgent : controlHttpAgent,
       headers: sourceHeaders(),
     },
     (res) => {
+      response = res;
       let data = '';
+      let responseBytes = 0;
       res.setEncoding('utf8');
       res.on('data', (chunk) => {
+        if (settled) return;
+        responseBytes += Buffer.byteLength(chunk);
+        if (responseBytes > IDENTITY_SNAPSHOT_MAX_BYTES) {
+          res.destroy();
+          finish(new Error(`identity snapshot response exceeds ${IDENTITY_SNAPSHOT_MAX_BYTES} bytes`));
+          return;
+        }
         data += chunk;
       });
       res.on('end', () => {
@@ -506,14 +817,20 @@ function getJson(url, timeoutMs, done) {
           finish(error);
         }
       });
+      res.on('aborted', () => finish(new Error('identity snapshot response aborted')));
+      res.on('error', (error) => finish(error));
+      res.on('close', () => {
+        if (!res.complete) finish(new Error('identity snapshot response closed early'));
+      });
     },
   );
+  activeControlRequests.add(state);
   req.on('error', (error) => finish(error));
-  req.setTimeout(timeoutMs, () => {
-    finish(new Error('identity snapshot timeout'));
-    req.destroy();
-  });
+  absoluteTimer = setTimeout(() => {
+    state.abort('identity snapshot timeout');
+  }, timeoutMs);
   req.end();
+  return state;
 }
 
 function refreshIdentitySnapshot() {
@@ -615,7 +932,7 @@ function runtimeSnapshotBody(ready = true) {
   };
 }
 
-function sendRuntimeSnapshot(ready = true, done = () => {}) {
+function sendRuntimeSnapshot(ready = true, done = () => {}, timeoutMs = 5_000) {
   if (runtimeLeaseFenced) {
     done(true);
     return;
@@ -624,9 +941,10 @@ function sendRuntimeSnapshot(ready = true, done = () => {}) {
     done(false);
     return;
   }
+  const operation = ++runtimeSnapshotOperation;
   runtimeSnapshotInFlight = true;
   const finish = (failed) => {
-    runtimeSnapshotInFlight = false;
+    if (operation === runtimeSnapshotOperation) runtimeSnapshotInFlight = false;
     done(Boolean(failed));
   };
   void (async () => {
@@ -636,9 +954,17 @@ function sendRuntimeSnapshot(ready = true, done = () => {}) {
         return;
       }
     }
+    if (operation !== runtimeSnapshotOperation) {
+      finish(true);
+      return;
+    }
     const body = runtimeSnapshotBody(ready);
     runtimeSnapshotPosts++;
-    postJsonResponse(runtimeSnapshotTarget, body, 5_000, (error, ack) => {
+    postJsonResponse(runtimeSnapshotTarget, body, timeoutMs, (error, ack) => {
+      if (operation !== runtimeSnapshotOperation) {
+        finish(true);
+        return;
+      }
       if (error) {
         runtimeSnapshotErrors++;
         errorCount++;
@@ -677,6 +1003,10 @@ function sendRuntimeSnapshot(ready = true, done = () => {}) {
       finish(false);
     });
   })().catch((error) => {
+    if (operation !== runtimeSnapshotOperation) {
+      finish(true);
+      return;
+    }
     runtimeSnapshotErrors++;
     errorCount++;
     lastRuntimeSnapshotError = error instanceof Error ? error.message : String(error);
@@ -730,7 +1060,7 @@ function requestReconciliation() {
   reconcileTimer.unref();
 }
 
-function sendHeartbeat(done = () => {}) {
+function sendHeartbeat(done = () => {}, timeoutMs = 5_000) {
   if (!HEARTBEAT_SECS) {
     done(false);
     return;
@@ -883,7 +1213,7 @@ function sendHeartbeat(done = () => {}) {
       message: `filter_mode=${FILTER_MODE}; retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
     },
-    5000,
+    timeoutMs,
     (failed) => {
       if (failed) {
         outputDropped++;
@@ -895,13 +1225,21 @@ function sendHeartbeat(done = () => {}) {
 }
 
 function closeTransports() {
+  if (transportsClosed) return;
+  transportsClosed = true;
   if (reconcileTimer) clearTimeout(reconcileTimer);
   reconcileTimer = undefined;
   signatureReloader?.close();
   dockerDiscovery.stop();
   infrastructureResolver.close();
-  httpAgent.destroy();
-  httpsAgent.destroy();
+  abortActiveEventRequests('event transport closed');
+  abortActiveControlRequests('control transport closed');
+  eventHttpAgent.destroy();
+  eventHttpsAgent.destroy();
+  controlHttpAgent.destroy();
+  controlHttpsAgent.destroy();
+  if (shutdownForceTimer) clearTimeout(shutdownForceTimer);
+  shutdownForceTimer = undefined;
 }
 
 function queuePriority(kind, classification) {
@@ -922,18 +1260,19 @@ function scheduleBatch() {
   batchTimer.unref();
 }
 
-function finishBatch(failed, batchLength) {
-  if (failed) {
-    outputDropped += batchLength;
-    errorCount++;
-  }
+function finishBatch(outcome) {
+  outputDropped += outcome.dropped;
+  errorCount += outcome.errors;
   inflight = Math.max(0, inflight - 1);
-  while (pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
-  if (!closing && pending.length < MAX_QUEUE && inflight < MAX_INFLIGHT) rl.resume();
+  while (!eventRequestsAborted && pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
+  if (
+    !closing && pending.length < MAX_QUEUE && pending.totalWeight < MAX_QUEUE_BYTES
+    && inflight < MAX_INFLIGHT
+  ) rl.resume();
 }
 
 function flushPending() {
-  if (pending.length === 0 || inflight >= MAX_INFLIGHT) return;
+  if (eventRequestsAborted || pending.length === 0 || inflight >= MAX_INFLIGHT) return;
   if (batchTimer) {
     clearTimeout(batchTimer);
     batchTimer = undefined;
@@ -944,30 +1283,92 @@ function flushPending() {
       : pending.length >= BATCH_SIZE * 2
         ? Math.min(256, BATCH_SIZE * 2)
         : BATCH_SIZE;
-  const batch = pending.take(adaptiveBatchSize);
+  const batch = pending.takeWeighted(adaptiveBatchSize, BATCH_MAX_BYTES, (item) => item.bytes);
   inflight++;
   attributionCounts.batches++;
   attributionCounts.batchEvents += batch.length;
-  postJson(
-    batchTarget,
-    { events: batch.map((item) => item.body) },
-    HTTP_TIMEOUT_MS,
-    (failed) => finishBatch(failed, batch.length),
-  );
+  deliverEventBatch(batch, finishBatch);
   if (pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
 }
 
 function enqueue(body, priority) {
-  const result = pending.push({ body, priority }, priority);
-  if (!result.accepted || result.dropped) {
+  let bytes;
+  try {
+    bytes = Buffer.byteLength(JSON.stringify(body));
+  } catch {
+    outputDropped++;
+    attributionCounts.queueDropped++;
+    return;
+  }
+  if (bytes > MAX_EVENT_BYTES) {
+    outputDropped++;
+    attributionCounts.queueDropped++;
+    return;
+  }
+  while (pending.totalWeight + bytes > MAX_QUEUE_BYTES) {
+    const lowest = pending.lowestPriority();
+    if (lowest < 0 || priority <= lowest) {
+      outputDropped++;
+      attributionCounts.queueDropped++;
+      return;
+    }
+    const evicted = pending.dropLowest();
+    if (!evicted) break;
     outputDropped++;
     attributionCounts.queueDropped++;
   }
-  if (!result.accepted) return;
+  const item = { body, priority, bytes };
+  const result = pending.push(item, priority);
+  if (!result.accepted) {
+    outputDropped++;
+    attributionCounts.queueDropped++;
+    return;
+  }
+  if (result.dropped && !result.droppedIncoming) {
+    outputDropped++;
+    attributionCounts.queueDropped++;
+  }
   attributionCounts.forwarded++;
   if (pending.length >= BATCH_SIZE) flushPending();
   else scheduleBatch();
   if (pending.length >= MAX_QUEUE || inflight >= MAX_INFLIGHT) rl.pause();
+}
+
+function abandonPendingEvents() {
+  if (pending.length === 0) return;
+  const abandoned = pending.clear();
+  outputDropped += abandoned;
+  attributionCounts.queueDropped += abandoned;
+}
+
+function remainingShutdownMs() {
+  return Math.max(100, shutdownDeadline - Date.now());
+}
+
+function finishShutdownControlPlane() {
+  if (shutdownFinalizing || transportsClosed) return;
+  shutdownFinalizing = true;
+  // A periodic snapshot or another control request may be holding every control socket. Invalidate
+  // the old snapshot callback and settle all old control requests before publishing the final,
+  // higher-version snapshot. The shutdown force timer remains the outer wall-clock deadline.
+  runtimeSnapshotOperation += 1;
+  runtimeSnapshotInFlight = false;
+  abortActiveControlRequests('control request superseded by graceful shutdown');
+  const snapshotTimeout = Math.min(5_000, Math.max(100, Math.floor(remainingShutdownMs() / 2)));
+  // The API derives `unobserved` when this forwarder stops reporting. A ready snapshot is
+  // intentionally monotonic, so do not attempt to regress it during graceful shutdown.
+  sendRuntimeSnapshot(true, () => {
+    const heartbeatTimeout = Math.min(5_000, remainingShutdownMs());
+    sendHeartbeat(() => closeTransports(), heartbeatTimeout);
+  }, snapshotTimeout);
+}
+
+function forceShutdown() {
+  eventRequestsAborted = true;
+  abandonPendingEvents();
+  abortActiveEventRequests('forwarder shutdown deadline exceeded');
+  closeTransports();
+  process.exit(process.exitCode ?? 0);
 }
 
 function flushAndClose() {
@@ -980,24 +1381,36 @@ function flushAndClose() {
   if (reconcileTimer) clearTimeout(reconcileTimer);
   if (batchTimer) clearTimeout(batchTimer);
   batchTimer = undefined;
+  shutdownDeadline = Date.now() + SHUTDOWN_TIMEOUT_MS;
+  shutdownForceTimer = setTimeout(forceShutdown, SHUTDOWN_TIMEOUT_MS);
   while (pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
-  const deadline = Date.now() + Math.max(5_000, HTTP_TIMEOUT_MS + 1_000);
+  const controlReserveMs = Math.min(5_000, Math.max(1_000, Math.floor(SHUTDOWN_TIMEOUT_MS / 3)));
+  const eventDeadline = shutdownDeadline - controlReserveMs;
   const waitForInflight = () => {
-    while (pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
-    if ((inflight > 0 || pending.length > 0) && Date.now() < deadline) {
+    while (!eventRequestsAborted && pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
+    if ((inflight > 0 || pending.length > 0) && Date.now() < eventDeadline) {
       setTimeout(waitForInflight, 50);
       return;
     }
-    if (pending.length > 0) {
-      const abandoned = pending.clear();
-      outputDropped += abandoned;
-      attributionCounts.queueDropped += abandoned;
+    if (inflight > 0 || pending.length > 0) {
+      abandonPendingEvents();
+      abortActiveEventRequests('forwarder event drain deadline exceeded');
     }
-    // The API derives `unobserved` when this forwarder stops reporting. A ready snapshot is
-    // intentionally monotonic, so do not attempt to regress it during graceful shutdown.
-    sendRuntimeSnapshot(true, () => sendHeartbeat(() => closeTransports()));
+    finishShutdownControlPlane();
   };
   waitForInflight();
+}
+
+function handleShutdownSignal(signal) {
+  if (closing) {
+    forceShutdown();
+    return;
+  }
+  console.error(`[observer-forward] received ${signal}; draining bounded event work`);
+  process.stdin.pause();
+  if (typeof process.stdin.unref === 'function') process.stdin.unref();
+  rl?.close();
+  flushAndClose();
 }
 
 function handleLine(raw) {
@@ -1093,6 +1506,7 @@ function handleLine(raw) {
 async function start() {
   resolveObserverForwarderHostPid();
   const infrastructure = await infrastructureResolver.resolve();
+  if (closing) return;
   attributor.setInfrastructureRoots(infrastructure.roots);
   const bootstrap = attributor.seedFromProc();
   console.error(
@@ -1132,6 +1546,7 @@ async function start() {
     `hash=${signatureRegistry.hash}`,
   );
   const dockerStarted = await dockerDiscovery.start((snapshot) => workloadCache.replace(snapshot, 'docker'));
+  if (closing) return;
   const docker = dockerDiscovery.metrics();
   console.error(`[observer-forward] docker discovery: enabled=${docker.enabled}; started=${dockerStarted}; socket=${dockerDiscovery.socketPath}`);
 
@@ -1159,6 +1574,9 @@ async function start() {
   rl.on('line', handleLine);
   rl.on('close', flushAndClose);
 }
+
+process.once('SIGINT', () => handleShutdownSignal('SIGINT'));
+process.once('SIGTERM', () => handleShutdownSignal('SIGTERM'));
 
 void start().catch((error) => {
   console.error('[observer-forward] startup failed:', error instanceof Error ? error.message : String(error));

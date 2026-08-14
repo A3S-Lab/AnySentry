@@ -84,6 +84,7 @@ spec:
             - { name: ANYSENTRY_INGEST_URL, value: "http://anysentry:29653/security-center/ingest" }
             - { name: ANYSENTRY_IDENTITY_SNAPSHOT_URL, value: "http://anysentry:29653/security-center/identity/snapshot" }
             - { name: ANYSENTRY_IDENTITY_SNAPSHOT_SECS, value: "15" }
+            - { name: FORWARD_IDENTITY_SNAPSHOT_MAX_BYTES, value: "4194304" }
             - { name: ANYSENTRY_AGENT_TEMPLATES_FILE, value: "/etc/anysentry/agent-templates.json" }
             # Low-trust exact process signatures hot-reload to probable_agent only. ConfigMap
             # projection is read-only; operators update it with kubectl, while directory watch plus
@@ -96,9 +97,14 @@ spec:
             # Bound memory and amortize HTTP/JSON overhead without adding perceptible UI delay.
             - { name: FORWARD_BATCH_SIZE, value: "32" }
             - { name: FORWARD_BATCH_FLUSH_MS, value: "50" }
+            - { name: FORWARD_BATCH_MAX_BYTES, value: "524288" }
+            - { name: FORWARD_MAX_EVENT_BYTES, value: "3145728" }
+            - { name: FORWARD_MAX_QUEUE_BYTES, value: "16777216" }
             - { name: FORWARD_MAX_QUEUE, value: "4096" }
-          command: ["/bin/sh", "-c"]
-          args: ["a3s-observer-collector | node /opt/observer-forward.js"]
+            # PID 1 leaves ten seconds inside Kubernetes' grace window for child drain/reaping.
+            - { name: OBSERVER_SUPERVISOR_SHUTDOWN_TIMEOUT_MS, value: "20000" }
+          command: ["/usr/local/bin/node"]
+          args: ["/opt/observer-supervisor.js"]
           volumeMounts:
             - { name: sys, mountPath: /sys, readOnly: true } # tracepoint ids under /sys
             - { name: agent-templates, mountPath: /etc/anysentry, readOnly: true }

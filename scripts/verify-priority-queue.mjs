@@ -31,4 +31,41 @@ bulk.push('leftover-b', 5);
 assert.equal(bulk.clear(), 2);
 assert.equal(bulk.length, 0);
 
+const weighted = new BoundedPriorityQueue(10, 5);
+weighted.push({ id: 'high-a', bytes: 6 }, 5);
+weighted.push({ id: 'high-b', bytes: 6 }, 5);
+weighted.push({ id: 'low', bytes: 1 }, 0);
+assert.deepEqual(
+  weighted.takeWeighted(10, 10, (item) => item.bytes).map((item) => item.id),
+  ['high-a'],
+);
+assert.deepEqual(
+  weighted.takeWeighted(10, 10, (item) => item.bytes).map((item) => item.id),
+  ['high-b', 'low'],
+);
+weighted.push({ id: 'oversized', bytes: 20 }, 4);
+assert.equal(weighted.takeWeighted(10, 10, (item) => item.bytes)[0].id, 'oversized');
+weighted.push({ id: 'lowest', bytes: 1 }, 0);
+weighted.push({ id: 'highest', bytes: 1 }, 5);
+assert.equal(weighted.dropLowest().id, 'lowest');
+assert.equal(weighted.dropLowest().id, 'highest');
+assert.equal(weighted.dropLowest(), undefined);
+
+const accounted = new BoundedPriorityQueue(2, 5, (item) => item.bytes);
+accounted.push({ id: 'low-a', bytes: 7 }, 0);
+accounted.push({ id: 'low-b', bytes: 11 }, 0);
+assert.equal(accounted.totalWeight, 18);
+const rejectedWeighted = accounted.push({ id: 'rejected', bytes: 101 }, 0);
+assert.equal(rejectedWeighted.accepted, false);
+assert.equal(rejectedWeighted.droppedIncoming, true);
+assert.equal(accounted.totalWeight, 18, 'rejecting an incoming item must not change queued bytes');
+const replaced = accounted.push({ id: 'high', bytes: 13 }, 5);
+assert.equal(replaced.accepted, true);
+assert.equal(replaced.dropped.id, 'low-a');
+assert.equal(accounted.totalWeight, 24, 'count eviction must subtract only the queued item');
+assert.equal(accounted.dropLowest().id, 'low-b');
+assert.equal(accounted.totalWeight, 13);
+assert.equal(accounted.clear(), 1);
+assert.equal(accounted.totalWeight, 0);
+
 console.log('Priority queue verification passed');

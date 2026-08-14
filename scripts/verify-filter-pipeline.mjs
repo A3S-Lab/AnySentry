@@ -26,8 +26,45 @@ function event(session, kind, payload) {
   });
 }
 
-async function runConfig(label, env = {}) {
+function acceptedBatchAck(events) {
+  return {
+    accepted: events.length > 0,
+    acceptedEvents: events.length,
+    rejectedEvents: 0,
+    items: events.map((_, index) => ({ index, accepted: true })),
+  };
+}
+
+function wrapped(data) {
+  return { code: 200, message: 'Success', data };
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+async function within(promise, timeoutMs, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs} ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function runConfig(label, env = {}, inputLines, options = {}) {
   const batches = [];
+  const batchRequests = [];
+  const batchRequestBytes = [];
   const heartbeats = [];
   let resolveSnapshotRequested;
   const snapshotRequested = new Promise((resolve) => {
@@ -61,8 +98,15 @@ async function runConfig(label, env = {}) {
   const server = http.createServer((request, response) => {
     if (request.method === 'GET' && request.url.startsWith('/security-center/identity/snapshot')) {
       resolveSnapshotRequested();
-      response.writeHead(200, { 'Content-Type': 'application/json' });
-      response.end(JSON.stringify(snapshot));
+      const reply = typeof options.identitySnapshotReply === 'function'
+        ? options.identitySnapshotReply(snapshot)
+        : options.identitySnapshotReply ?? { statusCode: 200, body: snapshot };
+      if (typeof reply.handle === 'function') {
+        reply.handle(response);
+        return;
+      }
+      response.writeHead(reply.statusCode ?? 200, { 'Content-Type': 'application/json' });
+      response.end(typeof reply.body === 'string' ? reply.body : JSON.stringify(reply.body ?? {}));
       return;
     }
     let body = '';
@@ -72,7 +116,23 @@ async function runConfig(label, env = {}) {
     });
     request.on('end', () => {
       const parsed = body ? JSON.parse(body) : {};
-      if (request.url === '/security-center/ingest/batch') batches.push(...(parsed.events ?? []));
+      if (request.url === '/security-center/ingest/batch') {
+        batchRequestBytes.push(Buffer.byteLength(body));
+        const events = parsed.events ?? [];
+        batchRequests.push(events);
+        batches.push(...events);
+        const reply = options.batchReply?.(events) ?? {
+          statusCode: 200,
+          body: wrapped(acceptedBatchAck(events)),
+        };
+        if (typeof reply.handle === 'function') {
+          reply.handle(response);
+          return;
+        }
+        response.writeHead(reply.statusCode ?? 200, { 'Content-Type': 'application/json' });
+        response.end(typeof reply.body === 'string' ? reply.body : JSON.stringify(reply.body ?? {}));
+        return;
+      }
       if (request.url === '/security-center/collectors/heartbeat') heartbeats.push(parsed);
       response.writeHead(200, { 'Content-Type': 'application/json' });
       if (request.url === '/security-center/runtime/lease') {
@@ -94,10 +154,15 @@ async function runConfig(label, env = {}) {
       FORWARD_RETAIN_UNKNOWN: 'true',
       FORWARD_RETAIN_NON_AGENT: 'false',
       FORWARD_NOISE_POLICY: 'balanced',
-      ...env,
       FORWARD_BATCH_SIZE: '32',
       FORWARD_BATCH_FLUSH_MS: '5',
+      ...env,
       ANYSENTRY_INGEST_URL: api,
+      ANYSENTRY_BATCH_INGEST_URL: `${api}/batch`,
+      ANYSENTRY_HEARTBEAT_URL: api.replace(/\/ingest$/u, '/collectors/heartbeat'),
+      ANYSENTRY_IDENTITY_SNAPSHOT_URL: api.replace(/\/ingest$/u, '/identity/snapshot'),
+      ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL: api.replace(/\/ingest$/u, '/runtime/snapshot'),
+      ANYSENTRY_AGENT_RUNTIME_LEASE_URL: api.replace(/\/ingest$/u, '/runtime/lease'),
       ANYSENTRY_IDENTITY_SNAPSHOT_SECS: '0.05',
       ANYSENTRY_HEARTBEAT_SECS: '0.05',
       ANYSENTRY_DOCKER_DISCOVERY: 'off',
@@ -113,7 +178,7 @@ async function runConfig(label, env = {}) {
   });
   await snapshotRequested;
   await new Promise((resolve) => setTimeout(resolve, 20));
-  const lines = [
+  const lines = inputLines ?? [
     event('nonagent-container', 'ToolExec', { pid: 10, argv: ['true'] }),
     env.ANYSENTRY_E2E_FILTER_MARKER_VALUE
       ? event('unknown-container', 'ToolExec', { pid: 20, argv: ['/usr/bin/true', env.ANYSENTRY_E2E_FILTER_MARKER_VALUE] })
@@ -140,7 +205,7 @@ async function runConfig(label, env = {}) {
     .reverse()
     .find((candidate) => candidate.filterMetrics?.observed === lines.length);
   assert.ok(heartbeat, `missing structured ${label} heartbeat: ${JSON.stringify(heartbeats)}`);
-  return { batches, heartbeat };
+  return { batches, batchRequests, batchRequestBytes, heartbeat };
 }
 
 async function runManualReviewRecovery() {
@@ -187,7 +252,13 @@ async function runManualReviewRecovery() {
     });
     request.on('end', () => {
       const parsed = body ? JSON.parse(body) : {};
-      if (request.url === '/security-center/ingest/batch') batches.push(...(parsed.events ?? []));
+      if (request.url === '/security-center/ingest/batch') {
+        const events = parsed.events ?? [];
+        batches.push(...events);
+        response.writeHead(200, { 'Content-Type': 'application/json' });
+        response.end(JSON.stringify(wrapped(acceptedBatchAck(events))));
+        return;
+      }
       if (request.url === '/security-center/collectors/heartbeat') heartbeats.push(parsed);
       response.writeHead(200, { 'Content-Type': 'application/json' });
       if (request.url === '/security-center/runtime/lease') {
@@ -211,6 +282,11 @@ async function runManualReviewRecovery() {
       FORWARD_BATCH_SIZE: '1',
       FORWARD_BATCH_FLUSH_MS: '1',
       ANYSENTRY_INGEST_URL: `http://127.0.0.1:${address.port}/security-center/ingest`,
+      ANYSENTRY_BATCH_INGEST_URL: `http://127.0.0.1:${address.port}/security-center/ingest/batch`,
+      ANYSENTRY_HEARTBEAT_URL: `http://127.0.0.1:${address.port}/security-center/collectors/heartbeat`,
+      ANYSENTRY_IDENTITY_SNAPSHOT_URL: `http://127.0.0.1:${address.port}/security-center/identity/snapshot`,
+      ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL: `http://127.0.0.1:${address.port}/security-center/runtime/snapshot`,
+      ANYSENTRY_AGENT_RUNTIME_LEASE_URL: `http://127.0.0.1:${address.port}/security-center/runtime/lease`,
       ANYSENTRY_IDENTITY_SNAPSHOT_SECS: '0.02',
       ANYSENTRY_HEARTBEAT_SECS: '60',
       ANYSENTRY_DOCKER_DISCOVERY: 'off',
@@ -256,6 +332,184 @@ async function runManualReviewRecovery() {
   assert.match(heartbeat?.filterMetrics?.lastSuppressedAt ?? '', /^\d{4}-\d{2}-\d{2}T/u);
 }
 
+async function runHungShutdownScenario() {
+  const initialRuntimeSnapshot = deferred();
+  const batchStarted = deferred();
+  const snapshotWhileBatchOpen = deferred();
+  const controlAgentSaturated = deferred();
+  const hangingBatchClosed = deferred();
+  const sockets = new Set();
+  const trickleTimers = new Set();
+  const hungControlSockets = new Set();
+  const heartbeats = [];
+  const runtimeSnapshots = [];
+  let hangingBatchSocket;
+  let hangControlTraffic = false;
+  let hungHeartbeats = 0;
+  let signalAt = 0;
+  let child;
+  let childExit;
+  let stderr = '';
+
+  const hangResponseBody = (response) => {
+    response.write(' ');
+    const timer = setInterval(() => response.write(' '), 100);
+    trickleTimers.add(timer);
+    response.once('close', () => {
+      clearInterval(timer);
+      trickleTimers.delete(timer);
+    });
+  };
+
+  const server = http.createServer((request, response) => {
+    let body = '';
+    request.setEncoding('utf8');
+    request.on('data', (chunk) => {
+      body += chunk;
+    });
+    request.on('end', () => {
+      const parsed = body ? JSON.parse(body) : {};
+      const receivedAt = Date.now();
+      if (request.url === '/security-center/ingest/batch') {
+        hangingBatchSocket = request.socket;
+        hangingBatchSocket.once('close', () => hangingBatchClosed.resolve());
+        batchStarted.resolve();
+        return;
+      }
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      if (request.url === '/security-center/runtime/lease') {
+        response.end('{"accepted":true,"leaseEpoch":1}');
+        return;
+      }
+      if (request.url === '/security-center/runtime/snapshot') {
+        const record = { body: parsed, receivedAt, socket: request.socket };
+        runtimeSnapshots.push(record);
+        if (runtimeSnapshots.length === 1) initialRuntimeSnapshot.resolve(record);
+        if (runtimeSnapshots.length === 2 && hangingBatchSocket && !hangingBatchSocket.destroyed) {
+          hangControlTraffic = true;
+          hungControlSockets.add(request.socket);
+          snapshotWhileBatchOpen.resolve(record);
+          hangResponseBody(response);
+          return;
+        }
+        response.end('{"accepted":true,"applied":true,"duplicate":false}');
+        return;
+      }
+      if (request.url === '/security-center/collectors/heartbeat') {
+        const record = { body: parsed, receivedAt, socket: request.socket };
+        heartbeats.push(record);
+        if (signalAt && receivedAt >= signalAt) {
+          // The final response deliberately trickles forever. The forwarder's absolute control
+          // timeout must still settle it and exit before the global shutdown deadline.
+          hangResponseBody(response);
+          return;
+        }
+        if (hangControlTraffic && hungHeartbeats < 3) {
+          hungHeartbeats++;
+          hungControlSockets.add(request.socket);
+          if (hungHeartbeats === 3) controlAgentSaturated.resolve();
+          hangResponseBody(response);
+          return;
+        }
+        response.end('{"accepted":true}');
+        return;
+      }
+      response.end('{}');
+    });
+  });
+  server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  const base = `http://127.0.0.1:${address.port}/security-center`;
+
+  try {
+    child = spawn(process.execPath, [forwarder], {
+      env: {
+        ...process.env,
+        FORWARD_FILTER_MODE: 'shadow',
+        FORWARD_RETAIN_UNKNOWN: 'true',
+        FORWARD_RETAIN_NON_AGENT: 'true',
+        FORWARD_NOISE_POLICY: 'include',
+        FORWARD_BATCH_SIZE: '1',
+        FORWARD_BATCH_FLUSH_MS: '1',
+        FORWARD_MAX_INFLIGHT: '1',
+        FORWARD_HTTP_TIMEOUT_MS: '120000',
+        FORWARD_SHUTDOWN_TIMEOUT_MS: '2500',
+        ANYSENTRY_INGEST_URL: `${base}/ingest`,
+        ANYSENTRY_BATCH_INGEST_URL: `${base}/ingest/batch`,
+        ANYSENTRY_HEARTBEAT_URL: `${base}/collectors/heartbeat`,
+        ANYSENTRY_IDENTITY_SNAPSHOT_URL: `${base}/identity/snapshot`,
+        ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL: `${base}/runtime/snapshot`,
+        ANYSENTRY_AGENT_RUNTIME_LEASE_URL: `${base}/runtime/lease`,
+        ANYSENTRY_IDENTITY_SNAPSHOT_SECS: '0',
+        ANYSENTRY_HEARTBEAT_SECS: '0.05',
+        ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_SECS: '1',
+        ANYSENTRY_AGENT_RUNTIME_LIVENESS_SECS: '300',
+        ANYSENTRY_DOCKER_DISCOVERY: 'off',
+        ANYSENTRY_BEHAVIOR_DISCOVERY: 'off',
+        ANYSENTRY_AGENT_TEMPLATES_JSON: '[]',
+        ANYSENTRY_AGENT_RUNTIME_SIGNATURES_FILE: '',
+        A3S_OBSERVER_COLLECTOR_ID: 'filter-hung-shutdown',
+      },
+      stdio: ['pipe', 'ignore', 'pipe'],
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    const exitPromise = new Promise((resolve) => {
+      child.once('exit', (code, signal) => {
+        childExit = { code, signal };
+        resolve(childExit);
+      });
+    });
+
+    await within(initialRuntimeSnapshot.promise, 3_000, 'initial runtime snapshot');
+    child.stdin.write(`${event('hung-container', 'ToolExec', { pid: 3_500, argv: ['/usr/bin/true', 'hung-request'] })}\n`);
+    await within(batchStarted.promise, 2_000, 'hanging event batch');
+    const snapshotDuringHang = await within(
+      snapshotWhileBatchOpen.promise,
+      3_000,
+      'in-flight runtime snapshot while the event socket is occupied',
+    );
+    await within(controlAgentSaturated.promise, 2_000, 'four saturated control sockets');
+    assert.equal(hangingBatchSocket.destroyed, false);
+    assert.notEqual(snapshotDuringHang.socket, hangingBatchSocket);
+    assert.equal(hungControlSockets.size, 4, 'fixture must occupy every control Agent socket');
+    for (const socket of hungControlSockets) assert.notEqual(socket, hangingBatchSocket);
+
+    const preSignalSnapshotVersion = snapshotDuringHang.body.snapshotVersion ?? 0;
+    signalAt = Date.now();
+    assert.equal(child.kill('SIGTERM'), true);
+    const exit = await within(exitPromise, 3_200, `bounded SIGTERM shutdown: ${stderr}`);
+    const elapsedMs = Date.now() - signalAt;
+    assert.deepEqual(exit, { code: 0, signal: null }, stderr);
+    assert.ok(elapsedMs < 3_200, `SIGTERM shutdown took ${elapsedMs} ms`);
+    await within(hangingBatchClosed.promise, 500, 'hanging batch socket close');
+    assert.ok(
+      runtimeSnapshots.some((record) =>
+        record.receivedAt >= signalAt && (record.body.snapshotVersion ?? 0) > preSignalSnapshotVersion),
+      'graceful SIGTERM must publish a final runtime snapshot',
+    );
+    const finalHeartbeat = heartbeats.find((record) =>
+      record.receivedAt >= signalAt && record.body.outputDropped >= 1);
+    assert.ok(finalHeartbeat, `missing final dropped-event heartbeat: ${JSON.stringify(heartbeats.map((item) => item.body))}`);
+    assert.ok(finalHeartbeat.body.errorCount >= 1);
+    assert.equal(finalHeartbeat.body.filterMetrics?.queueDropped, 0);
+  } finally {
+    if (child && !childExit) child.kill('SIGKILL');
+    child?.stdin.destroy();
+    for (const timer of trickleTimers) clearInterval(timer);
+    trickleTimers.clear();
+    const closed = new Promise((resolve) => server.close(resolve));
+    if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+    for (const socket of sockets) socket.destroy();
+    await closed;
+  }
+}
+
 const include = await runConfig('include', {
   FORWARD_RETAIN_NON_AGENT: 'true',
   FORWARD_NOISE_POLICY: 'include',
@@ -270,6 +524,174 @@ assert.equal(shadow.heartbeat.filterMetrics.wouldFilterNonAgent, 1);
 assert.equal(shadow.heartbeat.filterMetrics.wouldFilterNoise, 1);
 assert.equal(shadow.heartbeat.filterMetrics.filteredNonAgent, 0);
 assert.equal(shadow.heartbeat.filterMetrics.filteredNoise, 0);
+
+const oversizedIdentity = await runConfig('oversized-identity-snapshot', {
+  FORWARD_FILTER_MODE: 'shadow',
+  FORWARD_IDENTITY_SNAPSHOT_MAX_BYTES: String(64 * 1024),
+}, undefined, {
+  identitySnapshotReply: (snapshot) => ({
+    statusCode: 200,
+    body: { ...snapshot, padding: 'x'.repeat(70 * 1024) },
+  }),
+});
+assert.equal(oversizedIdentity.heartbeat.filterMetrics.identitySnapshotReady, false);
+assert.ok(
+  oversizedIdentity.heartbeat.filterMetrics.identityErrors >= 1,
+  'an oversized identity snapshot must fail within its configured memory bound',
+);
+
+const byteBoundLines = Array.from({ length: 12 }, (_, index) => event(
+  'unknown-container',
+  'ToolExec',
+  { pid: 2_000 + index, argv: ['/usr/bin/printf', 'x'.repeat(20_000)] },
+));
+const byteBound = await runConfig('byte-bound', {
+  FORWARD_FILTER_MODE: 'shadow',
+  FORWARD_BATCH_MAX_BYTES: String(64 * 1024),
+  FORWARD_MAX_EVENT_BYTES: String(64 * 1024),
+  FORWARD_MAX_QUEUE_BYTES: String(1024 * 1024),
+}, byteBoundLines);
+assert.equal(byteBound.batches.length, byteBoundLines.length);
+assert.ok(byteBound.batchRequestBytes.length >= 4, 'large events must be split into multiple HTTP batches');
+assert.ok(
+  byteBound.batchRequestBytes.every((bytes) => bytes <= 64 * 1024 + 512),
+  `serialized HTTP batch exceeded its byte budget: ${byteBound.batchRequestBytes.join(', ')}`,
+);
+
+const partialAckLines = Array.from({ length: 3 }, (_, index) => event(
+  'unknown-container',
+  'ToolExec',
+  { pid: 3_000 + index, argv: ['/usr/bin/true', `partial-${index}`] },
+));
+const partialAck = await runConfig('partial-ack', {
+  FORWARD_FILTER_MODE: 'shadow',
+  FORWARD_BATCH_SIZE: '3',
+  FORWARD_MAX_INFLIGHT: '1',
+}, partialAckLines, {
+  batchReply: (events) => ({
+    statusCode: 200,
+    body: wrapped({
+      accepted: true,
+      acceptedEvents: 2,
+      rejectedEvents: 1,
+      items: events.map((_, index) => ({
+        index,
+        accepted: index !== 1,
+        ...(index === 1 ? { reason: 'fixture rejection' } : {}),
+      })),
+    }),
+  }),
+});
+assert.equal(partialAck.batchRequests.length, 1, 'a business rejection must not retry accepted siblings');
+assert.equal(partialAck.heartbeat.filterMetrics.forwarded, partialAckLines.length);
+assert.equal(partialAck.heartbeat.outputDropped, 1, 'HTTP 200 partial rejection must be counted as a drop');
+assert.ok(partialAck.heartbeat.errorCount >= 1);
+assert.equal(partialAck.heartbeat.filterMetrics.queueDropped, 0);
+assert.equal(partialAck.heartbeat.status, 'degraded');
+
+const oversizedAck = await runConfig('oversized-ack', {
+  FORWARD_FILTER_MODE: 'shadow',
+  FORWARD_BATCH_SIZE: '1',
+  FORWARD_MAX_INFLIGHT: '1',
+  FORWARD_BATCH_ACK_MAX_BYTES: String(16 * 1024),
+}, [event('unknown-container', 'ToolExec', { pid: 3_100, argv: ['/usr/bin/true', 'oversized-ack'] })], {
+  batchReply: (events) => ({
+    statusCode: 200,
+    body: { ...wrapped(acceptedBatchAck(events)), padding: 'x'.repeat(20 * 1024) },
+  }),
+});
+assert.equal(oversizedAck.heartbeat.outputDropped, 1, 'an oversized batch ACK must fail within its memory bound');
+assert.ok(oversizedAck.heartbeat.errorCount >= 1);
+assert.equal(oversizedAck.heartbeat.filterMetrics.queueDropped, 0);
+
+const slowAckStartedAt = Date.now();
+const slowAck = await runConfig('slow-ack-timeout', {
+  FORWARD_FILTER_MODE: 'shadow',
+  FORWARD_BATCH_SIZE: '1',
+  FORWARD_MAX_INFLIGHT: '1',
+  FORWARD_HTTP_TIMEOUT_MS: '1000',
+}, [event('unknown-container', 'ToolExec', { pid: 3_150, argv: ['/usr/bin/true', 'slow-ack'] })], {
+  batchReply: () => ({
+    handle: (response) => {
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      const timer = setInterval(() => response.write(' '), 100);
+      response.once('close', () => clearInterval(timer));
+    },
+  }),
+});
+assert.ok(Date.now() - slowAckStartedAt < 3_000, 'trickled response bytes must not reset the absolute event timeout');
+assert.equal(slowAck.heartbeat.outputDropped, 1);
+assert.ok(slowAck.heartbeat.errorCount >= 1);
+assert.equal(slowAck.heartbeat.filterMetrics.queueDropped, 0);
+
+const splitLines = Array.from({ length: 4 }, (_, index) => event(
+  'unknown-container',
+  'ToolExec',
+  { pid: 3_200 + index, argv: ['/usr/bin/true', index === 2 ? 'reject-singleton' : `split-${index}`] },
+));
+const successfulSingletons = [];
+let rejectedSingletonAttempts = 0;
+let multi413Attempts = 0;
+const split413StartedAt = Date.now();
+const split413 = await runConfig('split-413', {
+  FORWARD_FILTER_MODE: 'shadow',
+  FORWARD_BATCH_SIZE: '4',
+  FORWARD_MAX_INFLIGHT: '1',
+  FORWARD_BATCH_ACK_MAX_BYTES: String(16 * 1024),
+  FORWARD_HTTP_TIMEOUT_MS: '4000',
+}, splitLines, {
+  batchReply: (events) => {
+    if (events.length > 1) {
+      multi413Attempts++;
+      if (multi413Attempts === 1) {
+        // A proxy can return an HTML error body larger than the normal ACK cap. Non-2xx bodies
+        // must be discarded without buffering, while the 413 status still triggers splitting.
+        return { statusCode: 413, body: 'x'.repeat(20 * 1024) };
+      }
+      if (multi413Attempts === 2) return {
+        handle: (response) => {
+          // Some proxies close their generated 413 body after sending headers. The status remains
+          // authoritative and the recoverable multi-event batch must still be split.
+          response.writeHead(413, { 'Content-Type': 'text/html' });
+          response.flushHeaders();
+          setTimeout(() => response.destroy(), 10);
+        },
+      };
+      return {
+        handle: (response) => {
+          // A 413 body may remain active forever while a reverse proxy trickles diagnostics.
+          // Receiving the header must immediately close it and continue the finite split tree.
+          response.writeHead(413, { 'Content-Type': 'text/html' });
+          response.write(' ');
+          const timer = setInterval(() => response.write(' '), 100);
+          response.once('close', () => clearInterval(timer));
+        },
+      };
+    }
+    const line = events[0]?.line ?? '';
+    if (line.includes('reject-singleton')) {
+      rejectedSingletonAttempts++;
+      return { statusCode: 413, body: { message: 'fixture event too large' } };
+    }
+    successfulSingletons.push(line);
+    return { statusCode: 200, body: wrapped(acceptedBatchAck(events)) };
+  },
+});
+assert.deepEqual(
+  split413.batchRequests.map((events) => events.length).sort((a, b) => a - b),
+  [1, 1, 1, 1, 2, 2, 4],
+  '413 recovery must use a finite binary split tree',
+);
+assert.equal(new Set(successfulSingletons).size, 3);
+assert.equal(successfulSingletons.length, 3, 'each accepted singleton must be delivered exactly once');
+assert.equal(multi413Attempts, 3, 'each multi-event node in the binary split tree is attempted once');
+assert.ok(Date.now() - split413StartedAt < 2_000, '413 headers must split without waiting for a trickled body timeout');
+assert.equal(rejectedSingletonAttempts, 1, 'an irreducible 413 must not loop');
+assert.equal(split413.heartbeat.filterMetrics.forwarded, splitLines.length);
+assert.equal(split413.heartbeat.outputDropped, 1, 'only the irreducible singleton is dropped');
+assert.ok(split413.heartbeat.errorCount >= 1);
+assert.equal(split413.heartbeat.filterMetrics.queueDropped, 0);
+assert.equal(split413.heartbeat.status, 'degraded');
 
 const safeDefault = await runConfig('safe-default', { FORWARD_FILTER_MODE: '' });
 assert.equal(safeDefault.heartbeat.filterMetrics.filterMode, 'shadow');
@@ -319,5 +741,6 @@ assert.match(e2eReceipt.heartbeat.filterMetrics.e2eFilterReceipts[0].filteredAt,
 assert.doesNotMatch(JSON.stringify(e2eReceipt.heartbeat.filterMetrics.e2eFilterReceipts), new RegExp(e2eMarker, 'u'));
 
 await runManualReviewRecovery();
+await runHungShutdownScenario();
 
 console.log('Independent retention/noise/shadow pipeline verification passed');

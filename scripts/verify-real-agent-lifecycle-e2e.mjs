@@ -61,6 +61,7 @@ const AGENT_MAX_RUNTIME_SECONDS = 20 * 60;
 const COLLECTOR_MAX_RUNTIME_SECONDS = 30 * 60;
 const CONTAINER_KILL_GRACE_SECONDS = 20;
 const FORWARDER_MODULES = [
+  'observer-supervisor.js',
   'observer-forward.js',
   'observer-agent-attribution.js',
   'observer-attribution-merge.js',
@@ -3972,6 +3973,7 @@ async function selfTest() {
   const pathIdentity = { dev: '1', ino: '2', mode: 0o100600, directory: false, file: true };
   assert.equal(sameLocalPathIdentity(pathIdentity, { ...pathIdentity }), true);
   assert.equal(sameLocalPathIdentity({ ...pathIdentity, ino: '3' }, pathIdentity), false);
+  assert.ok(FORWARDER_MODULES.includes('observer-supervisor.js'));
   assert.ok(FORWARDER_MODULES.includes('observer-e2e-witness.js'));
   await selfTestSafetyIo();
   return {

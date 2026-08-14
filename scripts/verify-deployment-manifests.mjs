@@ -125,6 +125,12 @@ function verifyAnySentryManifest() {
     anySentryDeployment?.source,
   );
   assert(
+    'AnySentry Deployment bounds its event hot ring and Observer request bodies',
+    /\{\s*name:\s*ANYSENTRY_EVENT_RING_MAX,\s*value:\s*"10000"\s*\}/u.test(anySentryDeployment?.source ?? '') &&
+      /\{\s*name:\s*ANYSENTRY_OBSERVER_BODY_LIMIT,\s*value:\s*"4mb"\s*\}/u.test(anySentryDeployment?.source ?? ''),
+    anySentryDeployment?.source,
+  );
+  assert(
     'AnySentry Deployment points at bundled ClickHouse HTTP service',
     /\{\s*name:\s*CLICKHOUSE_URL,\s*value:\s*"http:\/\/clickhouse:8123"\s*\}/u.test(anySentryDeployment?.source ?? ''),
     anySentryDeployment?.source,
@@ -189,6 +195,11 @@ function verifyObserverManifest() {
   assert('Observer DaemonSet runs with hostPID for host process identity', /\bhostPID:\s*true\b/u.test(daemonSet?.source ?? ''), daemonSet?.source);
   assert('Observer DaemonSet grants privileged eBPF access', /\bprivileged:\s*true\b/u.test(daemonSet?.source ?? ''), daemonSet?.source);
   assert(
+    'Observer DaemonSet gives the PID1 supervisor a 30-second termination window',
+    /\bterminationGracePeriodSeconds:\s*30\b/u.test(daemonSet?.source ?? ''),
+    daemonSet?.source,
+  );
+  assert(
     'Observer DaemonSet forwards to AnySentry ingest API',
     /\{\s*name:\s*ANYSENTRY_INGEST_URL,\s*value:\s*"http:\/\/anysentry:29653\/security-center\/ingest"\s*\}/u.test(daemonSet?.source ?? ''),
     daemonSet?.source,
@@ -213,9 +224,13 @@ function verifyObserverManifest() {
     daemonSet?.source,
   );
   assert(
-    'Observer DaemonSet consumes identity snapshots and uses bounded batching',
+    'Observer DaemonSet consumes identity snapshots and uses bounded count and byte queues',
     /\{\s*name:\s*ANYSENTRY_IDENTITY_SNAPSHOT_URL,\s*value:\s*"http:\/\/anysentry:29653\/security-center\/identity\/snapshot"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_IDENTITY_SNAPSHOT_MAX_BYTES,\s*value:\s*"4194304"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_BATCH_SIZE,\s*value:\s*"32"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_BATCH_MAX_BYTES,\s*value:\s*"524288"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_MAX_EVENT_BYTES,\s*value:\s*"3145728"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_MAX_QUEUE_BYTES,\s*value:\s*"16777216"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_MAX_QUEUE,\s*value:\s*"4096"\s*\}/u.test(daemonSet?.source ?? ''),
     daemonSet?.source,
   );
@@ -233,9 +248,12 @@ function verifyObserverManifest() {
     daemonSet?.source,
   );
   assert(
-    'Observer DaemonSet pipes observe-only collector output into the Node forwarder',
-    /command:\s*\["\/bin\/sh",\s*"-c"\]/u.test(daemonSet?.source ?? '') &&
-      /args:\s*\["a3s-observer-collector \| node \/opt\/observer-forward\.js"\]/u.test(daemonSet?.source ?? ''),
+    'Observer DaemonSet runs the no-shell lifecycle supervisor as container PID1',
+    /command:\s*\["\/usr\/local\/bin\/node"\]/u.test(daemonSet?.source ?? '') &&
+      /args:\s*\["\/opt\/observer-supervisor\.js"\]/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*OBSERVER_SUPERVISOR_SHUTDOWN_TIMEOUT_MS,\s*value:\s*"20000"\s*\}/u.test(daemonSet?.source ?? '') &&
+      !/command:\s*\["\/bin\/sh",\s*"-c"\]/u.test(daemonSet?.source ?? '') &&
+      !/a3s-observer-collector\s*\|/u.test(daemonSet?.source ?? ''),
     daemonSet?.source,
   );
   assert('Observer DaemonSet does not run enforcement binaries', !/\ba3s-observer-enforce\b/u.test(observerText) && !/\bfileguard\b/u.test(observerText), daemonSet?.source);
@@ -274,6 +292,12 @@ function verifyObserverForwarderDockerfile() {
       !/^\s*RUN\b/mu.test(dockerfile),
     dockerfile,
   );
+  assert('Observer forwarder image bundles the PID1 supervisor', /^COPY scripts\/observer-supervisor\.js \/opt\/observer-supervisor\.js$/mu.test(dockerfile), dockerfile);
+  assert(
+    'Observer forwarder image defaults to the supervisor as PID1',
+    /^ENTRYPOINT \["\/usr\/local\/bin\/node", "\/opt\/observer-supervisor\.js"\]$/mu.test(dockerfile),
+    dockerfile,
+  );
   assert('Observer forwarder image bundles scripts/observer-forward.js', /^COPY scripts\/observer-forward\.js \/opt\/observer-forward\.js$/mu.test(dockerfile), dockerfile);
   assert('Observer forwarder image bundles PID attribution', /^COPY scripts\/observer-agent-attribution\.js \/opt\/observer-agent-attribution\.js$/mu.test(dockerfile), dockerfile);
   assert('Observer forwarder image bundles field-merge attribution', /^COPY scripts\/observer-attribution-merge\.js \/opt\/observer-attribution-merge\.js$/mu.test(dockerfile), dockerfile);
@@ -291,6 +315,28 @@ function verifyObserverForwarderDockerfile() {
     dockerfile,
   );
   assert('Observer forwarder image has no npm or pnpm install step', !/\b(?:npm|pnpm|yarn)\s+(?:install|ci|add)\b/iu.test(dockerfile), dockerfile);
+}
+
+function verifyObserverLabWiring() {
+  const dockerfile = stripDockerComments(readText('examples/agent-runtime-lab/Dockerfile.observer'));
+  const compose = stripYamlComments(readText('examples/agent-runtime-lab/compose.yaml'));
+
+  assert(
+    'Agent runtime lab Observer image bundles the same PID1 supervisor',
+    /^COPY scripts\/observer-supervisor\.js \/opt\/observer-supervisor\.js$/mu.test(dockerfile) &&
+      /^ENTRYPOINT \["\/usr\/local\/bin\/node", "\/opt\/observer-supervisor\.js"\]$/mu.test(dockerfile),
+    dockerfile,
+  );
+  assert(
+    'Agent runtime lab runs the no-shell supervisor with a 30-second stop window',
+    /\bstop_grace_period:\s*30s\b/u.test(compose) &&
+      /entrypoint:\s*\["\/usr\/local\/bin\/node"\]/u.test(compose) &&
+      /command:\s*\["\/opt\/observer-supervisor\.js"\]/u.test(compose) &&
+      /observer-supervisor\.js:\/opt\/observer-supervisor\.js:ro/u.test(compose) &&
+      !/a3s-observer-collector\s*\|/u.test(compose) &&
+      !/entrypoint:\s*\["\/bin\/sh",\s*"-c"\]/u.test(compose),
+    compose,
+  );
 }
 
 function verifyInstaller() {
@@ -315,6 +361,7 @@ function main() {
   verifyIngressManifest();
   verifyDockerfile();
   verifyObserverForwarderDockerfile();
+  verifyObserverLabWiring();
   verifyInstaller();
 
   if (process.exitCode) {
