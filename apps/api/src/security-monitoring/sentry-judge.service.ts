@@ -17,6 +17,7 @@ const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, hi
 const SCHEMA_VERSION: JudgedEvent['schemaVersion'] = 'anysentry.agent_event.v1';
 const SECURITY_JUDGED_KINDS = new Set(['ToolExec', 'Egress', 'Dns', 'FileAccess', 'SslContent', 'SecurityAction']);
 const DEFAULT_INTERNAL_L3_BIN = '/opt/anysentry/l3-agent.mjs';
+const COLLECTOR_HEARTBEAT_SHUTDOWN_TIMEOUT_MS = 5_000;
 const RISK_NAME_BY_CATEGORY: Record<string, string> = {
   systemic_risk: '云元数据 SSRF',
   privilege_escalation: '提权 / 进程注入',
@@ -273,6 +274,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   private readonly collectorHeartbeats: CollectorHeartbeatRecord[] = [];
   private readonly MAX_COLLECTOR_HEARTBEATS = 10_000;
   private collectorHeartbeatPersistTimer?: NodeJS.Timeout;
+  private collectorHeartbeatShutdownTimeoutMs = COLLECTOR_HEARTBEAT_SHUTDOWN_TIMEOUT_MS;
   private timer?: NodeJS.Timeout;
   private readonly ch = new ClickHouseStore();
   private readonly incidents = new Map<string, Incident>();
@@ -315,8 +317,19 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   async onModuleDestroy(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     if (this.collectorHeartbeatPersistTimer) clearTimeout(this.collectorHeartbeatPersistTimer);
-    await this.persistCollectorHeartbeats();
-    await this.ch.close();
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort('collector heartbeat shutdown persistence timed out'),
+      this.collectorHeartbeatShutdownTimeoutMs,
+    );
+    try {
+      await this.persistCollectorHeartbeats(controller.signal);
+    } finally {
+      clearTimeout(timeout);
+      // Event rows are the durable evidence path. Always give their bounded drain the remaining
+      // 20 seconds, even when the best-effort heartbeat snapshot failed or timed out.
+      await this.ch.close();
+    }
   }
 
   /** Rebuild the sentry ACL from the policy and recreate the judge in place (built-in rules always
@@ -800,8 +813,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       decisionStatus: rec.decisionStatus ?? 'succeeded',
       decisionUpdatedAt: rec.decisionUpdatedAt ?? Date.now(),
     };
-    this.upsertMemory(normalized, true);
     this.ch.enqueue(normalized);
+    this.upsertMemory(normalized, true);
     return normalized;
   }
 
@@ -1137,8 +1150,11 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     }, 2_000);
   }
 
-  private async persistCollectorHeartbeats(): Promise<void> {
-    await this.ch.saveCollectorHeartbeats(this.collectorHeartbeats.slice(-this.MAX_COLLECTOR_HEARTBEATS));
+  private async persistCollectorHeartbeats(abortSignal?: AbortSignal): Promise<void> {
+    await this.ch.saveCollectorHeartbeats(
+      this.collectorHeartbeats.slice(-this.MAX_COLLECTOR_HEARTBEATS),
+      abortSignal,
+    );
   }
 
   queryCollectorHeartbeats(sinceMs = 0): CollectorHeartbeatRecord[] {

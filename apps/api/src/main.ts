@@ -17,6 +17,9 @@ async function bootstrap() {
     });
   }
   app.enableCors();
+  // Kubernetes sends SIGTERM during rollouts. Opt in so async provider teardown can drain the
+  // bounded ClickHouse event buffer before the pod's termination grace period expires.
+  app.enableShutdownHooks(['SIGTERM', 'SIGINT']);
   app.use([
     '/security-center/ingest/batch',
     '/security-center/runtime/snapshot',

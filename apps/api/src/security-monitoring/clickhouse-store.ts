@@ -1,14 +1,16 @@
-// Durable event store backed by ClickHouse — the system of record for judged events.
+// ClickHouse persistence for judged events. The dashboard serves reads from an in-memory hot ring;
+// this store adds a bounded in-memory write queue, retry-safe batch tokens, server-side deduplication
+// for ambiguous outcomes, and graceful shutdown drain. Persisted rows hydrate the ring on boot so
+// ordinary restarts and rollouts preserve date windows.
 //
-// The dashboard serves reads from an in-memory hot ring (fast, synchronous aggregation); this store
-// gives that ring durability: every judged event is written to ClickHouse (batched), and on boot the
-// ring is hydrated back from ClickHouse so date windows survive restarts/rollouts. ClickHouse is a
-// columnar TSDB — the right home for time-windowed event analytics as volume grows.
+// This queue is not a WAL/outbox: a process or host failure can still lose rows that had not reached
+// ClickHouse. Crash-durable delivery would require a persistent WAL/outbox and upstream replay.
 //
 // Connection comes from env (CLICKHOUSE_URL/USER/PASSWORD/DB). If ClickHouse is unreachable the store
-// degrades to in-memory-only (the dashboard keeps working; just no durability) rather than crashing.
+// degrades to in-memory-only (the dashboard keeps working; just no persistence) rather than crashing.
 
 import { ClickHouseClient, createClient, type ClickHouseSettings } from '@clickhouse/client';
+import { createHash, randomUUID } from 'node:crypto';
 import { PolicyConfig } from './policy-config';
 import { AgentAttribution, AgentMetadataRecord, AlertRecord, AuditRecord, CollectorHeartbeatRecord, IdentityAiReviewRecord, Incident, IngestionSourceRecord, JudgedEvent, MaintenanceWindowRecord, NotificationState, ObjectiveRecord, ProcessContext, RemediationRecord } from './types';
 
@@ -58,7 +60,23 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000))
 ) ENGINE = MergeTree
 ORDER BY at
-TTL ts + INTERVAL 90 DAY`;
+TTL ts + INTERVAL 90 DAY
+SETTINGS non_replicated_deduplication_window = 1000`;
+
+const EVENT_DEDUPLICATION_WINDOW = 1_000;
+const EVENT_WRITE_BATCH_ROWS = 500;
+const EVENT_WRITE_BATCH_BYTES = 4 * 1024 * 1024;
+// The API pod has a 512 MiB cgroup limit and already retains a wide 10k-event hot ring. Bound the
+// asynchronous ClickHouse payload separately by both rows and serialized bytes; JavaScript object
+// overhead is intentionally not claimed as an exact heap measurement.
+const EVENT_WRITE_MAX_BUFFERED_ROWS = 5_000;
+const EVENT_WRITE_MAX_BUFFERED_BYTES = 32 * 1024 * 1024;
+const EVENT_WRITE_RETRY_DEADLINE_MS = 15_000;
+const EVENT_WRITE_ATTEMPT_TIMEOUT_MS = 5_000;
+const EVENT_WRITE_RETRY_COOLDOWN_MS = 2_000;
+const EVENT_WRITE_CLOSE_DEADLINE_MS = 20_000;
+const EVENT_WRITE_BACKOFF_BASE_MS = 250;
+const EVENT_WRITE_BACKOFF_MAX_MS = 2_000;
 
 const EVENT_ALTERS = [
   'ADD COLUMN IF NOT EXISTS schemaVersion LowCardinality(String) DEFAULT \'anysentry.agent_event.v1\'',
@@ -157,6 +175,34 @@ type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'pro
   taskId: string;
   rawPreview: string;
 };
+
+interface QueuedEventRow {
+  row: Row;
+  bytes: number;
+}
+
+interface EventWriteWaiter {
+  resolve: () => void;
+  reject: (error: Error) => void;
+}
+
+interface EventWriteBatch {
+  rows: Row[];
+  bytes: number;
+  token: string;
+  settings: ClickHouseSettings;
+  source: 'buffered' | 'direct';
+  waiters: EventWriteWaiter[];
+  retryNotBefore: number;
+  createdAt: number;
+  lastError?: Error;
+}
+
+interface EventWriteErrorDecision {
+  retryable: boolean;
+  ambiguous: boolean;
+  code: string;
+}
 export type IncidentState = Pick<Incident, 'incidentId' | 'status' | 'owner' | 'note' | 'acknowledgedAt' | 'resolvedAt' | 'updatedAt'>;
 export interface StoredEventQuery {
   sinceMs: number;
@@ -349,9 +395,38 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
 
 export class ClickHouseStore {
   private client?: ClickHouseClient;
-  private buf: Row[] = [];
+  private buf: QueuedEventRow[] = [];
+  private bufferedEventBytes = 0;
+  // Includes unsealed rows plus sealed/active batches. Keeping the active batch in these totals
+  // prevents a slow HTTP request from becoming hidden memory outside the advertised buffer bound.
+  private eventWriteRows = 0;
+  private eventWriteBytes = 0;
+  private eventWriteBatches: EventWriteBatch[] = [];
+  private eventWriteBatchesByToken = new Map<string, EventWriteBatch>();
+  private eventWriteDrainInFlight?: Promise<void>;
+  private eventWriteRetryWakeTimer?: NodeJS.Timeout;
+  private eventWriteRetrySleep?: { timer: NodeJS.Timeout; wake: () => void };
+  private eventWriteAbortController?: AbortController;
+  private eventWritePermanentError?: Error;
+  private eventWriteClosingDeadline?: number;
+  private closeInFlight?: Promise<void>;
+  private closing = false;
   private flushTimer?: NodeJS.Timeout;
   private ready = false;
+
+  // Instance fields make the retry clock/delays replaceable by the standalone deterministic
+  // verifier without exposing a production API or relying on Node-version-specific fake timers.
+  private eventWriteNow = (): number => Date.now();
+  private eventWriteRetryDeadlineMs = EVENT_WRITE_RETRY_DEADLINE_MS;
+  private eventWriteAttemptTimeoutMs = EVENT_WRITE_ATTEMPT_TIMEOUT_MS;
+  private eventWriteCloseDeadlineMs = EVENT_WRITE_CLOSE_DEADLINE_MS;
+  private eventWriteRetryDelayMs = (failedAttempt: number): number => {
+    const exponential = Math.min(
+      EVENT_WRITE_BACKOFF_MAX_MS,
+      EVENT_WRITE_BACKOFF_BASE_MS * (2 ** Math.max(0, failedAttempt - 1)),
+    );
+    return Math.max(1, Math.round(exponential * (0.8 + Math.random() * 0.4)));
+  };
   // All three dashboard paths below read or aggregate wide event rows. Keep one shared slot so a
   // durable search cannot overlap a recent/history read and collectively exceed the 2 GiB server
   // budget. Equivalent recent/durable requests still coalesce through their per-path in-flight
@@ -383,7 +458,7 @@ export class ClickHouseStore {
   }
 
   get enabled(): boolean {
-    return this.ready;
+    return this.ready && !this.closing && !this.eventWritePermanentError;
   }
 
   /** Connect + ensure the database/table exist. Returns false (degrade to in-memory) if unreachable. */
@@ -399,8 +474,17 @@ export class ClickHouseStore {
       this.client = createClient({ url, database, username: process.env.CLICKHOUSE_USER || 'default', password: process.env.CLICKHOUSE_PASSWORD || '' });
       await this.client.command({ query: DDL(TABLE) });
       for (const alter of EVENT_ALTERS) await this.client.command({ query: `ALTER TABLE ${TABLE} ${alter}` });
+      // CREATE IF NOT EXISTS does not update an existing table. Explicitly enable the local
+      // MergeTree deduplication log so retrying an ambiguously acknowledged batch with the same
+      // token is idempotent on both fresh and upgraded installations.
+      await this.client.command({
+        query: `ALTER TABLE ${TABLE} MODIFY SETTING non_replicated_deduplication_window = ${EVENT_DEDUPLICATION_WINDOW}`,
+      });
       await this.client.command({ query: CONFIG_DDL });
-      this.flushTimer = setInterval(() => void this.flush(), 2000);
+      this.closing = false;
+      this.flushTimer = setInterval(() => {
+        void this.flush().catch(() => undefined);
+      }, 2000);
       this.ready = true;
       return true;
     } catch (err) {
@@ -412,26 +496,386 @@ export class ClickHouseStore {
 
   /** Buffer one event; flush opportunistically when the batch is large. */
   enqueue(e: JudgedEvent): void {
+    if (this.closing) throw new Error('ClickHouse event writer is closing');
     if (!this.ready) return;
-    this.buf.push(toRow(e));
-    if (this.buf.length >= 500) void this.flush();
+    if (this.eventWritePermanentError) throw this.eventWritePermanentError;
+    const queued = this.queuedEventRow(toRow(e));
+    this.assertEventWriteCapacity(queued.bytes);
+    this.buf.push(queued);
+    this.bufferedEventBytes += queued.bytes;
+    this.eventWriteRows += 1;
+    this.eventWriteBytes += queued.bytes;
+    const sealed = this.sealBufferedEventBatches(false);
+    if (sealed) this.startEventWriteDrain();
   }
+
   /** Persist one lifecycle revision before acknowledging queue work. */
   async insertNow(e: JudgedEvent): Promise<void> {
-    if (!this.client || !this.ready) throw new Error('ClickHouse is not ready');
-    await this.client.insert({ table: TABLE, values: [toRow(e)], format: 'JSONEachRow' });
+    if (!this.client || !this.ready || this.closing) throw new Error('ClickHouse is not ready');
+    if (this.eventWritePermanentError) throw this.eventWritePermanentError;
+    const queued = this.queuedEventRow(toRow(e));
+    const token = this.directEventWriteToken(queued.row);
+    const existing = this.eventWriteBatchesByToken.get(token);
+    if (existing) {
+      const completion = new Promise<void>((resolve, reject) => existing.waiters.push({ resolve, reject }));
+      this.startEventWriteDrain();
+      return completion;
+    }
+
+    this.assertEventWriteCapacity(queued.bytes);
+    // Preserve global event-write FIFO: a direct lifecycle revision may not jump over a partial
+    // buffered batch that was accepted earlier merely because the two-second timer has not fired.
+    this.sealBufferedEventBatches(true);
+    const batch = this.createEventWriteBatch([queued], token, 'direct');
+    this.eventWriteRows += 1;
+    this.eventWriteBytes += queued.bytes;
+    this.eventWriteBatches.push(batch);
+    this.eventWriteBatchesByToken.set(token, batch);
+    const completion = new Promise<void>((resolve, reject) => batch.waiters.push({ resolve, reject }));
+    this.startEventWriteDrain();
+    return completion;
   }
 
-
   async flush(): Promise<void> {
-    if (!this.client || this.buf.length === 0) return;
-    const values = this.buf;
-    this.buf = [];
-    try {
-      await this.client.insert({ table: TABLE, values, format: 'JSONEachRow' });
-    } catch (err) {
-      console.error('[clickhouse] insert failed (dropping batch):', (err as Error).message);
+    if (!this.client) return;
+    this.sealBufferedEventBatches(true);
+    if (!this.eventWriteBatches.length) return;
+    await this.ensureEventWriteDrain();
+  }
+
+  private queuedEventRow(row: Row): QueuedEventRow {
+    const bytes = Buffer.byteLength(JSON.stringify(row), 'utf8') + 1;
+    if (bytes > EVENT_WRITE_BATCH_BYTES) {
+      const error = Object.assign(
+        new Error(`ClickHouse event row is ${bytes} bytes, above the ${EVENT_WRITE_BATCH_BYTES}-byte insert bound`),
+        { code: 'ANYSENTRY_CLICKHOUSE_EVENT_ROW_TOO_LARGE' },
+      );
+      console.error('[clickhouse] event write rejected:', {
+        code: error.code,
+        eventId: row.eventId,
+        bytes,
+        maxBytes: EVENT_WRITE_BATCH_BYTES,
+      });
+      throw error;
     }
+    return { row, bytes };
+  }
+
+  private assertEventWriteCapacity(additionalBytes: number): void {
+    if (
+      this.eventWriteRows + 1 <= EVENT_WRITE_MAX_BUFFERED_ROWS &&
+      this.eventWriteBytes + additionalBytes <= EVENT_WRITE_MAX_BUFFERED_BYTES
+    ) return;
+    const error = Object.assign(
+      new Error('ClickHouse event write buffer is full; retry the ingest request'),
+      { code: 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL' },
+    );
+    // enqueue() intentionally remains synchronous for the existing judge path. Throwing is the
+    // only available backpressure signal; silently dropping here would falsely claim durability.
+    console.error('[clickhouse] event write buffer capacity reached:', {
+      code: error.code,
+      rows: this.eventWriteRows,
+      bytes: this.eventWriteBytes,
+      maxRows: EVENT_WRITE_MAX_BUFFERED_ROWS,
+      maxBytes: EVENT_WRITE_MAX_BUFFERED_BYTES,
+    });
+    throw error;
+  }
+
+  private createEventWriteBatch(
+    queued: QueuedEventRow[],
+    token: string,
+    source: EventWriteBatch['source'],
+  ): EventWriteBatch {
+    return {
+      rows: queued.map(({ row }) => row),
+      bytes: queued.reduce((sum, row) => sum + row.bytes, 0),
+      token,
+      settings: {
+        insert_deduplicate: 1,
+        insert_deduplication_token: token,
+      },
+      source,
+      waiters: [],
+      retryNotBefore: 0,
+      createdAt: this.eventWriteNow(),
+    };
+  }
+
+  /** Seal every eligible buffered chunk, retaining arrival order and a stable retry token. */
+  private sealBufferedEventBatches(forceTail: boolean): boolean {
+    let sealed = false;
+    while (
+      this.buf.length > 0 &&
+      (forceTail || this.buf.length >= EVENT_WRITE_BATCH_ROWS || this.bufferedEventBytes >= EVENT_WRITE_BATCH_BYTES)
+    ) {
+      let count = 0;
+      let bytes = 0;
+      for (const queued of this.buf) {
+        if (count >= EVENT_WRITE_BATCH_ROWS) break;
+        if (count > 0 && bytes + queued.bytes > EVENT_WRITE_BATCH_BYTES) break;
+        count += 1;
+        bytes += queued.bytes;
+      }
+      if (count === 0) break;
+      const queued = this.buf.splice(0, count);
+      this.bufferedEventBytes = Math.max(0, this.bufferedEventBytes - bytes);
+      const token = `events-${randomUUID()}`;
+      const batch = this.createEventWriteBatch(queued, token, 'buffered');
+      this.eventWriteBatches.push(batch);
+      this.eventWriteBatchesByToken.set(token, batch);
+      sealed = true;
+    }
+    return sealed;
+  }
+
+  private directEventWriteToken(row: Row): string {
+    return `event-${createHash('sha256').update(JSON.stringify(row)).digest('hex')}`;
+  }
+
+  private startEventWriteDrain(): void {
+    void this.ensureEventWriteDrain().catch(() => undefined);
+  }
+
+  private ensureEventWriteDrain(): Promise<void> {
+    if (this.eventWriteDrainInFlight) return this.eventWriteDrainInFlight;
+    let tracked!: Promise<void>;
+    tracked = this.drainEventWrites().finally(() => {
+      if (this.eventWriteDrainInFlight !== tracked) return;
+      this.eventWriteDrainInFlight = undefined;
+      // A direct-write waiter is resolved before the owner promise's finalizer runs. Its caller may
+      // enqueue the next lifecycle revision in that continuation and observe this just-completed
+      // owner. Re-check after clearing it so the newly queued head cannot remain stranded until the
+      // periodic timer. Respect retry cooldowns to avoid a rejected-drain microtask spin.
+      const head = this.eventWriteBatches[0];
+      const now = this.eventWriteNow();
+      const mayRestart = this.closing
+        ? this.eventWriteClosingDeadline !== undefined && now < this.eventWriteClosingDeadline
+        : Boolean(head && head.retryNotBefore <= now);
+      if (
+        head &&
+        this.client &&
+        !this.eventWritePermanentError &&
+        mayRestart
+      ) this.startEventWriteDrain();
+    });
+    this.eventWriteDrainInFlight = tracked;
+    return tracked;
+  }
+
+  private async drainEventWrites(): Promise<void> {
+    while (this.eventWriteBatches.length > 0) {
+      if (this.eventWritePermanentError) throw this.eventWritePermanentError;
+      const batch = this.eventWriteBatches[0];
+      const now = this.eventWriteNow();
+      if (!this.closing && batch.retryNotBefore > now) {
+        this.scheduleEventWriteRetry(batch.retryNotBefore);
+        throw batch.lastError ?? new Error('ClickHouse event batch is waiting for its retry cooldown');
+      }
+      const outcome = await this.insertEventWriteBatch(batch);
+      if (outcome.status === 'success') {
+        this.eventWriteBatches.shift();
+        this.eventWriteBatchesByToken.delete(batch.token);
+        this.eventWriteRows = Math.max(0, this.eventWriteRows - batch.rows.length);
+        this.eventWriteBytes = Math.max(0, this.eventWriteBytes - batch.bytes);
+        for (const waiter of batch.waiters.splice(0)) waiter.resolve();
+        continue;
+      }
+
+      batch.lastError = outcome.error;
+      if (outcome.status === 'permanent') {
+        this.eventWritePermanentError = outcome.error;
+        for (const waiter of batch.waiters.splice(0)) waiter.reject(outcome.error);
+        console.error('[clickhouse] event insert permanently blocked; batch retained:', {
+          token: batch.token,
+          rows: batch.rows.length,
+          bytes: batch.bytes,
+          code: outcome.decision.code,
+          ambiguous: outcome.decision.ambiguous,
+          message: outcome.error.message,
+        });
+        throw outcome.error;
+      }
+
+      // The active retry cycle is bounded. Keep the exact sealed batch and any direct-write
+      // waiters at the head, then retry after a cooldown rather than spinning. Rejecting a waiter
+      // here while retaining and later applying the batch would let its caller advance lifecycle
+      // work under the false belief that this revision was never persisted.
+      batch.retryNotBefore = this.closing ? 0 : this.eventWriteNow() + EVENT_WRITE_RETRY_COOLDOWN_MS;
+      if (!this.closing) this.scheduleEventWriteRetry(batch.retryNotBefore);
+      console.error('[clickhouse] event insert retry deadline reached; batch retained:', {
+        token: batch.token,
+        rows: batch.rows.length,
+        bytes: batch.bytes,
+        code: outcome.decision.code,
+        ambiguous: outcome.decision.ambiguous,
+        message: outcome.error.message,
+      });
+      throw outcome.error;
+    }
+  }
+
+  private async insertEventWriteBatch(batch: EventWriteBatch): Promise<
+    | { status: 'success' }
+    | { status: 'retry_later'; error: Error; decision: EventWriteErrorDecision }
+    | { status: 'permanent'; error: Error; decision: EventWriteErrorDecision }
+  > {
+    const cycleDeadline = this.eventWriteNow() + this.eventWriteRetryDeadlineMs;
+    const activeDeadline = (): number => Math.min(
+      cycleDeadline,
+      this.eventWriteClosingDeadline ?? Number.POSITIVE_INFINITY,
+    );
+    let failedAttempts = 0;
+    let lastError = new Error('ClickHouse event insert retry deadline reached');
+    let lastDecision: EventWriteErrorDecision = { retryable: true, ambiguous: true, code: 'DEADLINE' };
+
+    while (this.eventWriteNow() < activeDeadline()) {
+      try {
+        await this.insertEventWriteAttempt(batch, activeDeadline());
+        return { status: 'success' };
+      } catch (error) {
+        lastError = this.asEventWriteError(error);
+        lastDecision = this.classifyEventWriteError(lastError);
+        if (!lastDecision.retryable) {
+          return { status: 'permanent', error: lastError, decision: lastDecision };
+        }
+        failedAttempts += 1;
+        const delayMs = this.eventWriteRetryDelayMs(failedAttempts);
+        console.error('[clickhouse] event insert retrying:', {
+          token: batch.token,
+          attempt: failedAttempts,
+          delayMs,
+          code: lastDecision.code,
+          ambiguous: lastDecision.ambiguous,
+          message: lastError.message,
+        });
+        if (this.eventWriteNow() + delayMs >= activeDeadline()) break;
+        await this.sleepBeforeEventWriteRetry(delayMs);
+      }
+    }
+    return { status: 'retry_later', error: lastError, decision: lastDecision };
+  }
+
+  private async insertEventWriteAttempt(batch: EventWriteBatch, cycleDeadline: number): Promise<void> {
+    const client = this.client;
+    if (!client) throw new Error('ClickHouse client is unavailable');
+    const controller = new AbortController();
+    this.eventWriteAbortController = controller;
+    let attemptTimedOut = false;
+    const remainingMs = Math.max(1, cycleDeadline - this.eventWriteNow());
+    const timer = setTimeout(() => {
+      attemptTimedOut = true;
+      controller.abort('ClickHouse event insert attempt timed out');
+    }, Math.min(this.eventWriteAttemptTimeoutMs, remainingMs));
+    try {
+      await client.insert({
+        table: TABLE,
+        values: batch.rows,
+        format: 'JSONEachRow',
+        clickhouse_settings: batch.settings,
+        abort_signal: controller.signal,
+      });
+    } catch (error) {
+      const normalized = this.asEventWriteError(error);
+      if (attemptTimedOut) Object.assign(normalized, { eventWriteAttemptTimedOut: true });
+      throw normalized;
+    } finally {
+      clearTimeout(timer);
+      if (this.eventWriteAbortController === controller) this.eventWriteAbortController = undefined;
+    }
+  }
+
+  private asEventWriteError(error: unknown): Error {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+
+  private classifyEventWriteError(error: Error): EventWriteErrorDecision {
+    const detail = error as Error & {
+      code?: string | number;
+      type?: string;
+      status?: string | number;
+      statusCode?: string | number;
+      eventWriteAttemptTimedOut?: boolean;
+    };
+    const code = detail.code == null ? '' : String(detail.code);
+    const type = detail.type ?? '';
+    if (detail.eventWriteAttemptTimedOut) return { retryable: true, ambiguous: true, code: 'ATTEMPT_TIMEOUT' };
+
+    const status = Number(detail.status ?? detail.statusCode);
+    const retryableHttpStatuses = new Set([408, 425, 429, 502, 503, 504]);
+    if (retryableHttpStatuses.has(status)) {
+      // A 408 may be returned after an upstream accepted bytes; the remaining explicit gateway/
+      // overload responses are known unsuccessful responses rather than ambiguous applications.
+      return { retryable: true, ambiguous: status === 408, code: `HTTP_${status}` };
+    }
+
+    const transientServerTypes = new Set([
+      'MEMORY_LIMIT_EXCEEDED',
+      'TOO_MANY_SIMULTANEOUS_QUERIES',
+      'TOO_MANY_PARTS',
+    ]);
+    if (code === '241' || transientServerTypes.has(type)) {
+      return { retryable: true, ambiguous: false, code: type || code };
+    }
+    const ambiguousServerTypes = new Set([
+      'TIMEOUT_EXCEEDED',
+      'NETWORK_ERROR',
+      'SOCKET_TIMEOUT',
+      'UNKNOWN_STATUS_OF_INSERT',
+    ]);
+    if (ambiguousServerTypes.has(type)) return { retryable: true, ambiguous: true, code: type };
+
+    const transportCodes = new Set([
+      'ECONNREFUSED',
+      'ENOTFOUND',
+      'EHOSTUNREACH',
+      'ENETUNREACH',
+      'EAI_AGAIN',
+      'ECONNRESET',
+      'EPIPE',
+      'ETIMEDOUT',
+      'UND_ERR_CONNECT_TIMEOUT',
+    ]);
+    if (transportCodes.has(code)) {
+      const definitelyBeforeApply = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH', 'EAI_AGAIN']);
+      return { retryable: true, ambiguous: !definitelyBeforeApply.has(code), code };
+    }
+    if (/timeout error|socket hang up|aborted a request/i.test(error.message)) {
+      return { retryable: true, ambiguous: true, code: code || 'TRANSPORT_TIMEOUT' };
+    }
+    return { retryable: false, ambiguous: false, code: type || code || 'PERMANENT_OR_UNKNOWN' };
+  }
+
+  private sleepBeforeEventWriteRetry(milliseconds: number): Promise<void> {
+    if (milliseconds <= 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer!: NodeJS.Timeout;
+      const wake = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (this.eventWriteRetrySleep?.wake === wake) this.eventWriteRetrySleep = undefined;
+        resolve();
+      };
+      timer = setTimeout(wake, milliseconds);
+      this.eventWriteRetrySleep = { timer, wake };
+    });
+  }
+
+  private wakeEventWriteRetrySleep(): void {
+    this.eventWriteRetrySleep?.wake();
+  }
+
+  private scheduleEventWriteRetry(at: number): void {
+    if (this.closing || this.eventWritePermanentError) return;
+    if (this.eventWriteRetryWakeTimer) clearTimeout(this.eventWriteRetryWakeTimer);
+    const delayMs = Math.max(0, at - this.eventWriteNow());
+    this.eventWriteRetryWakeTimer = setTimeout(() => {
+      this.eventWriteRetryWakeTimer = undefined;
+      this.startEventWriteDrain();
+    }, delayMs);
+    this.eventWriteRetryWakeTimer.unref?.();
   }
 
   /** Load the most-recent `limit` events at/after `sinceMs`, oldest-first (to seed the hot ring). */
@@ -1256,22 +1700,112 @@ export class ClickHouseStore {
     }
   }
 
-  async saveCollectorHeartbeats(records: CollectorHeartbeatRecord[]): Promise<void> {
+  async saveCollectorHeartbeats(records: CollectorHeartbeatRecord[], abortSignal?: AbortSignal): Promise<void> {
     if (!this.client) return;
     try {
       await this.client.insert({
         table: CONFIG_TABLE,
         values: [{ key: 'collector_heartbeats', value: JSON.stringify(records), updated_at: Date.now() }],
         format: 'JSONEachRow',
+        abort_signal: abortSignal,
       });
     } catch (err) {
       console.error('[clickhouse] saveCollectorHeartbeats failed:', (err as Error).message);
     }
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (this.closeInFlight) return this.closeInFlight;
+    // Change the externally visible state before the first await so a concurrent enqueue cannot
+    // slip into the shutdown tail after it was sealed.
+    this.closing = true;
+    this.ready = false;
     if (this.flushTimer) clearInterval(this.flushTimer);
-    await this.flush();
-    await this.client?.close();
+    this.flushTimer = undefined;
+    if (this.eventWriteRetryWakeTimer) clearTimeout(this.eventWriteRetryWakeTimer);
+    this.eventWriteRetryWakeTimer = undefined;
+    this.eventWriteClosingDeadline = this.eventWriteNow() + this.eventWriteCloseDeadlineMs;
+    this.wakeEventWriteRetrySleep();
+    this.sealBufferedEventBatches(true);
+    const value = this.finishClose();
+    this.closeInFlight = value;
+    return value;
+  }
+
+  private async finishClose(): Promise<void> {
+    const client = this.client;
+    let closeError: Error | undefined;
+    try {
+      while (
+        this.eventWriteBatches.length > 0 &&
+        !this.eventWritePermanentError &&
+        this.eventWriteNow() < (this.eventWriteClosingDeadline ?? 0)
+      ) {
+        this.eventWriteBatches[0].retryNotBefore = 0;
+        try {
+          await this.waitForEventWriteDrainUntilCloseDeadline();
+        } catch (error) {
+          if (this.eventWritePermanentError) break;
+        }
+      }
+
+      if (this.eventWriteBatches.length > 0 || this.buf.length > 0) {
+        const head = this.eventWriteBatches[0];
+        closeError = Object.assign(
+          new Error(
+            `ClickHouse event writer closed with ${this.eventWriteRows} undrained rows` +
+            (head?.lastError ? `: ${head.lastError.message}` : ''),
+          ),
+          { code: 'ANYSENTRY_CLICKHOUSE_EVENT_SHUTDOWN_UNDRAINED' },
+        );
+        console.error('[clickhouse] event writer shutdown deadline/terminal failure:', {
+          code: (closeError as Error & { code?: string }).code,
+          rows: this.eventWriteRows,
+          bytes: this.eventWriteBytes,
+          oldestBatchAgeMs: head ? Math.max(0, this.eventWriteNow() - head.createdAt) : 0,
+          token: head?.token,
+          cause: head?.lastError?.message ?? this.eventWritePermanentError?.message,
+        });
+      }
+    } finally {
+      this.eventWriteAbortController?.abort('ClickHouse event writer is closing');
+      this.wakeEventWriteRetrySleep();
+      for (const batch of this.eventWriteBatches) {
+        for (const waiter of batch.waiters.splice(0)) {
+          waiter.reject(closeError ?? new Error('ClickHouse event writer closed before the direct write completed'));
+        }
+      }
+      try {
+        await client?.close();
+      } catch (error) {
+        closeError ??= this.asEventWriteError(error);
+      }
+      this.client = undefined;
+      this.eventWriteClosingDeadline = undefined;
+    }
+    if (closeError) throw closeError;
+  }
+
+  private async waitForEventWriteDrainUntilCloseDeadline(): Promise<void> {
+    const deadline = this.eventWriteClosingDeadline ?? this.eventWriteNow();
+    const remainingMs = Math.max(0, deadline - this.eventWriteNow());
+    if (remainingMs === 0) throw new Error('ClickHouse event writer shutdown deadline reached');
+    const drain = this.ensureEventWriteDrain();
+    // A fake/misbehaving client may ignore AbortSignal. The outer wall-clock timer prevents Nest's
+    // shutdown hook from consuming the full Kubernetes grace period before client.close destroys it.
+    let timer!: NodeJS.Timeout;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        this.eventWriteAbortController?.abort('ClickHouse event writer shutdown deadline reached');
+        reject(new Error('ClickHouse event writer shutdown deadline reached'));
+      }, remainingMs);
+    });
+    try {
+      await Promise.race([drain, timeout]);
+    } finally {
+      clearTimeout(timer);
+      // If the outer deadline won, ensure a later rejection from the tracked drain is observed.
+      void drain.catch(() => undefined);
+    }
   }
 }

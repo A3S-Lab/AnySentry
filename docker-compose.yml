@@ -16,11 +16,15 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-anysentry}
     volumes:
       - clickhouse-data:/var/lib/clickhouse
+      - ./deploy/clickhouse-memory.xml:/etc/clickhouse-server/config.d/20-anysentry-memory.xml:ro
+    mem_limit: 4g
+    memswap_limit: 4g
     healthcheck:
       test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 24
+    stop_grace_period: 30s
     restart: unless-stopped
 
   redis:
@@ -91,6 +95,7 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - "29653:29653"
+    stop_grace_period: 30s
     restart: unless-stopped
 
   fast-judge:

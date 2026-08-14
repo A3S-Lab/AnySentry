@@ -101,6 +101,25 @@ function docFor(docs, kind, name) {
 
 function verifyAnySentryManifest() {
   const docs = documentsFromYaml(readText('deploy/anysentry.yaml'));
+  const compose = stripYamlComments(readText('docker-compose.yml'));
+  const clickHouseConfigFile = readText('deploy/clickhouse-memory.xml').trim();
+  const expectedClickHouseConfig = `<clickhouse>
+  <max_server_memory_usage>2147483648</max_server_memory_usage>
+  <merges_mutations_memory_usage_soft_limit>536870912</merges_mutations_memory_usage_soft_limit>
+  <merge_tree>
+    <vertical_merge_algorithm_min_rows_to_activate>0</vertical_merge_algorithm_min_rows_to_activate>
+  </merge_tree>
+  <metric_log>
+    <collect_interval_milliseconds>10000</collect_interval_milliseconds>
+    <flush_interval_milliseconds>60000</flush_interval_milliseconds>
+  </metric_log>
+</clickhouse>`;
+  const clickHouseComposeService = compose
+    .split(/^  clickhouse:\s*$/mu)[1]
+    ?.split(/^  [a-zA-Z0-9_-]+:\s*$/mu)[0] ?? '';
+  const anySentryComposeService = compose
+    .split(/^  anysentry:\s*$/mu)[1]
+    ?.split(/^  [a-zA-Z0-9_-]+:\s*$/mu)[0] ?? '';
   const anySentryDeployment = docFor(docs, 'Deployment', 'anysentry');
   const anySentryService = docFor(docs, 'Service', 'anysentry');
   const clickHouseMemoryConfig = docFor(docs, 'ConfigMap', 'clickhouse-memory-config');
@@ -152,6 +171,16 @@ function verifyAnySentryManifest() {
     anySentryDeployment?.source,
   );
   assert(
+    'AnySentry gives its graceful event-buffer drain 30 seconds',
+    /^\s{6}terminationGracePeriodSeconds:\s*30\s*$/mu.test(anySentryDeployment?.source ?? ''),
+    anySentryDeployment?.source,
+  );
+  assert(
+    'Docker Compose gives AnySentry the same 30-second event-buffer drain',
+    /^    stop_grace_period:\s*30s\s*$/mu.test(anySentryComposeService),
+    anySentryComposeService,
+  );
+  assert(
     'AnySentry Service exposes port 29653 to targetPort 29653',
     /\{\s*name:\s*http,\s*port:\s*29653,\s*targetPort:\s*29653\s*\}/u.test(anySentryService?.source ?? ''),
     anySentryService?.source,
@@ -168,16 +197,41 @@ function verifyAnySentryManifest() {
     clickHouseDeployment?.source,
   );
   assert(
-    'Bundled ClickHouse has an explicit 2 GiB server memory budget',
+    'Bundled ClickHouse gets a 30-second graceful stop window',
+    /^\s{6}terminationGracePeriodSeconds:\s*30\s*$/mu.test(clickHouseDeployment?.source ?? ''),
+    clickHouseDeployment?.source,
+  );
+  assert(
+    'Bundled ClickHouse has explicit foreground and background memory guards',
     Boolean(clickHouseMemoryConfig) &&
       /^  namespace:\s*anysentry\s*$/mu.test(clickHouseMemoryConfig?.source ?? '') &&
       /labels:\s*\{\s*app:\s*clickhouse\s*\}/u.test(clickHouseMemoryConfig?.source ?? '') &&
-      /^data:\s*\n  memory\.xml:\s*\|\s*\n    <clickhouse>\s*\n      <max_server_memory_usage>2147483648<\/max_server_memory_usage>\s*\n    <\/clickhouse>\s*$/mu.test(
+      /^data:\s*\n  memory\.xml:\s*\|\s*\n    <clickhouse>\s*\n      <max_server_memory_usage>2147483648<\/max_server_memory_usage>\s*\n      <merges_mutations_memory_usage_soft_limit>536870912<\/merges_mutations_memory_usage_soft_limit>\s*\n      <merge_tree>\s*\n        <vertical_merge_algorithm_min_rows_to_activate>0<\/vertical_merge_algorithm_min_rows_to_activate>\s*\n      <\/merge_tree>\s*\n      <metric_log>\s*\n        <collect_interval_milliseconds>10000<\/collect_interval_milliseconds>\s*\n        <flush_interval_milliseconds>60000<\/flush_interval_milliseconds>\s*\n      <\/metric_log>\s*\n    <\/clickhouse>\s*$/mu.test(
         clickHouseMemoryConfig?.source ?? '',
       ) &&
       countMatches(clickHouseMemoryConfig?.source ?? '', /<max_server_memory_usage>/gu) === 1 &&
+      countMatches(clickHouseMemoryConfig?.source ?? '', /<merges_mutations_memory_usage_soft_limit>/gu) === 1 &&
+      countMatches(clickHouseMemoryConfig?.source ?? '', /<vertical_merge_algorithm_min_rows_to_activate>/gu) === 1 &&
+      clickHouseConfigFile === expectedClickHouseConfig &&
       !/max_server_memory_usage_to_ram_ratio/u.test(clickHouseMemoryConfig?.source ?? ''),
     clickHouseMemoryConfig?.source,
+  );
+  assert(
+    'Docker Compose mounts the same ClickHouse guards with a 4 GiB no-swap cgroup and 30-second stop',
+    /^      - \.\/deploy\/clickhouse-memory\.xml:\/etc\/clickhouse-server\/config\.d\/20-anysentry-memory\.xml:ro\s*$/mu.test(
+      clickHouseComposeService,
+    ) &&
+      /^    mem_limit:\s*4g\s*$/mu.test(clickHouseComposeService) &&
+      /^    memswap_limit:\s*4g\s*$/mu.test(clickHouseComposeService) &&
+      /^    stop_grace_period:\s*30s\s*$/mu.test(clickHouseComposeService),
+    clickHouseComposeService,
+  );
+  assert(
+    'ClickHouse PodTemplate pins the mounted merge configuration revision',
+    /annotations:\s*\n\s*anysentry\.io\/clickhouse-config-revision:\s*"memory-and-merge-v2"/u.test(
+      clickHouseDeployment?.source ?? '',
+    ),
+    clickHouseDeployment?.source,
   );
   assert(
     'Bundled ClickHouse mounts the memory budget read-only',
