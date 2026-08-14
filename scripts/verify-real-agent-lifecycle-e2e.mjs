@@ -783,7 +783,7 @@ async function apiCapability(baseUrl, queryShape = false) {
         const runtime = await requestJson(baseUrl, 'runtime/instances', { limit: 1, includeShadow: true });
         result.runtime = Array.isArray(runtime?.items);
         if (!result.runtime) result.errors.push('runtime/instances returned an unexpected shape');
-      } catch {
+      } catch (error) {
         result.errors.push('runtime/instances: ' + redact(error.message));
       }
     } else {
