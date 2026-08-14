@@ -196,9 +196,9 @@ function verifyAnySentryManifest() {
     clickHouseSelectedResources,
   );
   assert(
-    'Bundled ClickHouse reserves 1 GiB and is capped at 3 GiB',
+    'Bundled ClickHouse reserves 1 GiB and is capped at 4 GiB',
     /requests:\s*\{\s*cpu:\s*250m,\s*memory:\s*1Gi\s*\}/u.test(clickHouseDeployment?.source ?? '') &&
-      /limits:\s*\{\s*cpu:\s*"2",\s*memory:\s*3Gi\s*\}/u.test(clickHouseDeployment?.source ?? ''),
+      /limits:\s*\{\s*cpu:\s*"2",\s*memory:\s*4Gi\s*\}/u.test(clickHouseDeployment?.source ?? ''),
     clickHouseDeployment?.source,
   );
   assert(
