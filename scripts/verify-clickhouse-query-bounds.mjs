@@ -46,12 +46,14 @@ function fakeClient() {
   };
 }
 
-function assertBoundedSettings(call, { maxThreads = 2 } = {}) {
+function assertBoundedSettings(call, { maxThreads = 2, smallBlocks = false } = {}) {
   assert.equal(call.clickhouse_settings?.max_threads, maxThreads);
   assert.equal(call.clickhouse_settings?.max_memory_usage, String(384 * 1024 * 1024));
   assert.equal(call.clickhouse_settings?.max_bytes_before_external_group_by, String(64 * 1024 * 1024));
   assert.equal(call.clickhouse_settings?.max_bytes_before_external_sort, String(64 * 1024 * 1024));
   assert.equal(call.clickhouse_settings?.min_bytes_to_use_direct_io, String(1024 * 1024));
+  assert.equal(call.clickhouse_settings?.max_block_size, smallBlocks ? '1024' : undefined);
+  assert.equal(call.clickhouse_settings?.preferred_block_size_bytes, smallBlocks ? String(1024 * 1024) : undefined);
   assert.equal(call.clickhouse_settings?.max_execution_time, 25);
 }
 
@@ -65,9 +67,7 @@ function assertHydrateSettings(call) {
 }
 
 function assertRecentSettings(call) {
-  assertBoundedSettings(call, { maxThreads: 1 });
-  assert.equal(call.clickhouse_settings?.max_block_size, '1024');
-  assert.equal(call.clickhouse_settings?.preferred_block_size_bytes, String(1024 * 1024));
+  assertBoundedSettings(call, { maxThreads: 1, smallBlocks: true });
 }
 
 const store = new ClickHouseStore();
@@ -118,10 +118,13 @@ assert.equal(histories.length, 2);
 assert.equal(histories.filter(Boolean).length, 1, 'a different concurrent history window must fail fast');
 assert.equal(histories.filter((history) => history?.countsApproximate === true).length, 1);
 assert.equal(fake.state.calls.length, 4);
-assert.equal(fake.state.maxActive, 1, 'dashboard queries and windows must execute one at a time');
-for (const call of fake.state.calls) assertBoundedSettings(call);
+assert.equal(fake.state.maxActive, 2, 'only the bounded session/workspace pair may overlap');
 for (let index = 0; index < fake.state.calls.length; index += 4) {
   const [dimensions, buckets, session, workspace] = fake.state.calls.slice(index, index + 4);
+  assertBoundedSettings(dimensions);
+  assertBoundedSettings(buckets);
+  assertBoundedSettings(session, { maxThreads: 1, smallBlocks: true });
+  assertBoundedSettings(workspace, { maxThreads: 1, smallBlocks: true });
   assert.match(dimensions.query, /uniqCombined64\(eventId\) AS eventCount/u);
   assert.doesNotMatch(dimensions.query, /uniqExact/u);
   assert.match(buckets.query, /uniqCombined64If/u);
@@ -179,6 +182,46 @@ assert.match(apiTypesSource, /interface AgentEventList[\s\S]*totalApproximate\?:
 assert.match(webApiSource, /interface AgentEventList[\s\S]*totalApproximate\?: boolean/u);
 assert.match(agentEventsPageSource, /data\.totalApproximate \? "≈"/u);
 assert.match(monitorPageSource, /events\.totalApproximate \? "≈"/u);
+assert.match(webApiSource, /const DASHBOARD_HISTORY_TIMEOUT_MS = 45_000/u);
+assert.match(webApiSource, /dashboardPost<SecurityExplainabilityScan>\("\/security-center\/top\/explainabilityScan", filter\)/u);
+assert.match(webApiSource, /dashboardPost<AgentEventList>\("\/security-center\/events\/list", filter\)/u);
+
+let releaseWorkspace;
+let markWorkspaceStarted;
+const workspaceGate = new Promise((resolve) => { releaseWorkspace = resolve; });
+const workspaceStarted = new Promise((resolve) => { markWorkspaceStarted = resolve; });
+store.client = {
+  async query(options) {
+    const isSession = options.query.includes('GROUP BY sessionLabel');
+    const isWorkspace = options.query.includes('GROUP BY resolvedWorkspacePath');
+    return {
+      async json() {
+        if (isSession) throw new Error('synthetic detail query failure');
+        if (isWorkspace) {
+          markWorkspaceStarted();
+          await workspaceGate;
+        }
+        return [];
+      },
+    };
+  },
+};
+console.error = () => {};
+try {
+  const failingWindow = store.dashboardWindowHistory(900, 1_000, 8);
+  await workspaceStarted;
+  assert.equal(
+    await store.dashboardWindowHistory(1_100, 1_200, 8),
+    null,
+    'a failed detail sibling must not release the window slot while its peer is still running',
+  );
+  releaseWorkspace();
+  assert.equal(await failingWindow, null);
+} finally {
+  console.error = originalConsoleError;
+}
+store.client = fake.client;
+assert.ok(await store.dashboardWindowHistory(1_300, 1_400, 8), 'the slot must release after both detail siblings settle');
 
 let historyCalls = 0;
 const aggregation = new AggregationService(

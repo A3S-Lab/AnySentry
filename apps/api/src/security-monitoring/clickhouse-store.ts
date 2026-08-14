@@ -107,25 +107,29 @@ const BOUNDED_DASHBOARD_READ_SETTINGS: ClickHouseSettings = {
   max_execution_time: 25,
 };
 
+// Session/workspace queries materialize wider per-event state. Small blocks keep each below its
+// query budget; running only these two one-thread reads together keeps the cold dashboard under
+// the browser deadline without restoring the previous four-query fan-out.
+const BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS: ClickHouseSettings = {
+  ...BOUNDED_DASHBOARD_READ_SETTINGS,
+  max_threads: 1,
+  max_block_size: '1024',
+  preferred_block_size_bytes: String(1024 * 1024),
+};
+
 // Hydration reads wide rows rather than compact aggregates. A single read thread and small blocks
 // keep both ClickHouse and the API startup peak bounded, while a separate 640 MiB query budget
 // leaves measured headroom above the roughly 341 MiB production query peak.
 const BOUNDED_HYDRATE_READ_SETTINGS: ClickHouseSettings = {
-  ...BOUNDED_DASHBOARD_READ_SETTINGS,
-  max_threads: 1,
+  ...BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
   max_memory_usage: String(640 * 1024 * 1024),
-  max_block_size: '1024',
-  preferred_block_size_bytes: String(1024 * 1024),
 };
 
 // Recent event reads also materialize wide rows. Production measurements show that the dashboard
 // budget is sufficient when ClickHouse uses one thread and small blocks; the default block shape
 // exceeded the same budget before yielding the first E2E result.
 const BOUNDED_RECENT_READ_SETTINGS: ClickHouseSettings = {
-  ...BOUNDED_DASHBOARD_READ_SETTINGS,
-  max_threads: 1,
-  max_block_size: '1024',
-  preferred_block_size_bytes: String(1024 * 1024),
+  ...BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
 };
 
 type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'process' | 'attribution' | 'judgment' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview'> & {
@@ -532,11 +536,12 @@ export class ClickHouseStore {
       const queryRows = async (
         query: string,
         queryParams: Record<string, string | number>,
+        settings = BOUNDED_DASHBOARD_READ_SETTINGS,
       ): Promise<Array<Record<string, unknown>>> => {
         const result = await this.client!.query({
           query,
           query_params: queryParams,
-          clickhouse_settings: BOUNDED_DASHBOARD_READ_SETTINGS,
+          clickhouse_settings: settings,
           format: 'JSONEachRow',
         });
         return await result.json() as Array<Record<string, unknown>>;
@@ -581,8 +586,9 @@ export class ClickHouseStore {
             ORDER BY bucketIndex`,
         { queryStart: queryStartMs, start: startMs, end: endMs, bucketCount: buckets, bucketMs },
       );
-      const sessionRows = await queryRows(
-        `
+      const [sessionResult, workspaceResult] = await Promise.allSettled([
+        queryRows(
+          `
             SELECT
               if(
                 JSONExtractString(attribution, 'agentSessionId') != '',
@@ -619,10 +625,11 @@ export class ClickHouseStore {
             GROUP BY sessionLabel
             ORDER BY riskScoreTotal DESC
             LIMIT 1`,
-        { start: startMs, end: endMs },
-      );
-      const workspaceRows = await queryRows(
-        `
+          { start: startMs, end: endMs },
+          BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
+        ),
+        queryRows(
+          `
             SELECT
               if(
                 JSONExtractString(process, 'cwd') != '',
@@ -649,8 +656,14 @@ export class ClickHouseStore {
             GROUP BY resolvedWorkspacePath
             ORDER BY totalRiskScore DESC
             LIMIT 500`,
-        { start: startMs, end: endMs },
-      );
+          { start: startMs, end: endMs },
+          BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
+        ),
+      ]);
+      if (sessionResult.status === 'rejected') throw sessionResult.reason;
+      if (workspaceResult.status === 'rejected') throw workspaceResult.reason;
+      const sessionRows = sessionResult.value;
+      const workspaceRows = workspaceResult.value;
       const num = (value: unknown): number => Number(value) || 0;
       const dimensions = dimensionRows.map<DashboardWindowDimensionRow>((row) => ({
         period: String(row.period) === 'previous' ? 'previous' : 'current',

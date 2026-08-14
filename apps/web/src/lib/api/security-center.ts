@@ -2734,30 +2734,34 @@ export interface PlatformHealth {
   policy: PolicyStatus;
 }
 
+const DASHBOARD_HISTORY_TIMEOUT_MS = 45_000;
+const dashboardPost = <T>(endpoint: string, body: unknown) =>
+  apiClient.postLong<T>(endpoint, body, DASHBOARD_HISTORY_TIMEOUT_MS);
+
 export const securityCenterApi = {
   healthz: () => apiClient.get<PlatformHealth>("/security-center/healthz"),
   assistantQuery: (body: SecurityAssistantQuery) =>
     apiClient.postLong<SecurityAssistantAnswer>("/security-center/assistant/query", body),
   healthCard: (filter: SecurityTimeFilter) =>
-    apiClient.post<SecurityHealthCard>("/security-center/top/healthCard", filter),
+    dashboardPost<SecurityHealthCard>("/security-center/top/healthCard", filter),
   explainabilityScan: (filter: SecurityExplainabilityScanRequest) =>
-    apiClient.post<SecurityExplainabilityScan>("/security-center/top/explainabilityScan", filter),
+    dashboardPost<SecurityExplainabilityScan>("/security-center/top/explainabilityScan", filter),
   performanceCard: (filter: SecurityTimeFilter) =>
-    apiClient.post<SecurityPerformanceCard>("/security-center/top/performanceCard", filter),
+    dashboardPost<SecurityPerformanceCard>("/security-center/top/performanceCard", filter),
   riskSummary: (filter: SecurityTimeFilter) =>
-    apiClient.post<SecurityRiskSummary>("/security-center/risks/summary", filter),
+    dashboardPost<SecurityRiskSummary>("/security-center/risks/summary", filter),
   riskBreakdown: (filter: SecurityTimeFilter) =>
-    apiClient.post<SecurityRiskBreakdown>("/security-center/risks/breakdown", filter),
+    dashboardPost<SecurityRiskBreakdown>("/security-center/risks/breakdown", filter),
   highestRiskSession: (filter: SecurityTimeFilter) =>
-    apiClient.post<SecurityHighestRiskSession>("/security-center/sessions/highestRisk", filter),
+    dashboardPost<SecurityHighestRiskSession>("/security-center/sessions/highestRisk", filter),
   decisionFunnel: (filter: SecurityTimeFilter) =>
-    apiClient.post<SecurityDecisionFunnel>("/security-center/sessions/decisionFunnel", filter),
+    dashboardPost<SecurityDecisionFunnel>("/security-center/sessions/decisionFunnel", filter),
   agentObservability: (filter: SecurityTimeFilter) =>
     apiClient.post<AgentObservability>("/security-center/sessions/agentObservability", filter),
   workspaceRiskDistribution: (filter: SecurityTimeFilter) =>
-    apiClient.post<SecurityWorkspaceRiskDistribution>("/security-center/sessions/workspaceRiskDistribution", filter),
+    dashboardPost<SecurityWorkspaceRiskDistribution>("/security-center/sessions/workspaceRiskDistribution", filter),
   agentEvents: (filter: AgentEventQuery) =>
-    apiClient.post<AgentEventList>("/security-center/events/list", filter),
+    dashboardPost<AgentEventList>("/security-center/events/list", filter),
   runIdentityAiReview: (body: IdentityAiReviewRequest) =>
     apiClient.post<IdentityAiReviewRecord>("/security-center/identity/ai-review", body),
   identityAiReviews: (query: { targetType?: IdentityAiReviewTargetType; eventId?: string; agentAssetId?: string }) => {
