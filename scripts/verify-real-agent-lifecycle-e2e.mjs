@@ -417,6 +417,15 @@ async function requestJson(baseUrl, route, body, options = {}) {
   return parsed?.data ?? parsed;
 }
 
+function responseAllowsPost(response) {
+  if (!response?.ok) return false;
+  const allowed = ['allow', 'access-control-allow-methods']
+    .flatMap((name) => String(response.headers?.get(name) || '').split(','))
+    .map((item) => item.trim().toUpperCase())
+    .filter(Boolean);
+  return allowed.includes('POST');
+}
+
 async function supportsPostRoute(baseUrl, route) {
   const url = baseUrl + '/' + route.replace(/^\/+/, '');
   try {
@@ -424,10 +433,7 @@ async function supportsPostRoute(baseUrl, route) {
       method: 'OPTIONS',
       signal: AbortSignal.timeout(5_000),
     });
-    const allowed = String(response.headers.get('allow') || '')
-      .split(',')
-      .map((item) => item.trim().toUpperCase());
-    return response.ok && allowed.includes('POST');
+    return responseAllowsPost(response);
   } catch {
     return false;
   }
@@ -3068,6 +3074,18 @@ function selfTest() {
   assert.throws(() => parseOptions(['--phases', 'enforce', '--allow-enforce']), /cannot run alone/u);
   const gated = parseOptions(['--phases', 'shadow,enforce', '--allow-enforce']);
   assert.deepEqual(gated.phases, ['shadow', 'enforce']);
+  assert.equal(responseAllowsPost(new Response(null, {
+    status: 204,
+    headers: { Allow: 'GET, HEAD, POST' },
+  })), true);
+  assert.equal(responseAllowsPost(new Response(null, {
+    status: 204,
+    headers: { 'Access-Control-Allow-Methods': 'GET,HEAD,PUT,PATCH,POST,DELETE' },
+  })), true);
+  assert.equal(responseAllowsPost(new Response(null, {
+    status: 204,
+    headers: { Allow: 'GET, HEAD', 'Access-Control-Allow-Methods': 'GET, DELETE' },
+  })), false);
   const plan = executionPlan(options);
   assert.equal(plan.mode, 'dry-run');
   assert.equal(plan.safety.deploymentManifestsOrExistingResourcesModified, false);
@@ -3182,7 +3200,7 @@ function selfTest() {
   assert.equal(sameLocalPathIdentity(pathIdentity, { ...pathIdentity }), true);
   assert.equal(sameLocalPathIdentity({ ...pathIdentity, ino: '3' }, pathIdentity), false);
   assert.ok(FORWARDER_MODULES.includes('observer-e2e-witness.js'));
-  return { assertions: 67, protocolReserved: true, dryRunDefault: true, cleanupOwnershipRequired: true };
+  return { assertions: 70, protocolReserved: true, dryRunDefault: true, cleanupOwnershipRequired: true };
 }
 
 function printPreflight(result) {
