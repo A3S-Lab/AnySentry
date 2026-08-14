@@ -2715,6 +2715,9 @@ export interface PlatformHealth {
     mode: "clickhouse" | "memory";
     clickhouseConfigured: boolean;
     clickhouseReady: boolean;
+    /** Added in the bounded hot-ring API; optional while older API images are rolling out. */
+    hotRingSize?: number;
+    hotRingCapacity?: number;
   };
   managementAuth?: {
     enabled: boolean;

@@ -39,6 +39,16 @@ async function request(path, method = 'GET', body, headers = {}) {
   return payload?.data ?? payload;
 }
 
+async function rawJsonStatus(path, body) {
+  const res = await fetch(`${baseUrl}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...managementAuthHeaders() },
+    body,
+  });
+  await res.arrayBuffer();
+  return res.status;
+}
+
 function observerLine(identity, event, process) {
   return JSON.stringify({ identity, ...(process ? { process } : {}), event });
 }
@@ -166,6 +176,72 @@ async function verifyCollectorMetricFreshnessContract() {
       expiredHealth.items?.[0]?.filterMetrics?.scope === 'decoupled' &&
       expiredHealth.items?.[0]?.filterMetrics?.observed === 0,
     expiredHealth,
+  );
+}
+
+async function verifyHotRingCapacityContract() {
+  const previous = process.env.ANYSENTRY_EVENT_RING_MAX;
+  process.env.ANYSENTRY_EVENT_RING_MAX = '1234';
+  try {
+    const { SentryJudgeService } = await import('../apps/api/dist/security-monitoring/sentry-judge.service.js');
+    const judge = new SentryJudgeService({}, {}, { enabled: false }, {});
+    const storage = judge.storageStatus();
+    assert(
+      'event hot ring has an explicit bounded and observable capacity',
+      storage.hotRingCapacity === 1234 && storage.hotRingSize === 0,
+      storage,
+    );
+    for (let index = 0; index < 1_500; index += 1) {
+      judge.upsertMemory({ eventId: `ring-cap-${index}` }, false);
+    }
+    const boundedStorage = judge.storageStatus();
+    assert(
+      'event hot ring never retains more than its advertised capacity',
+      boundedStorage.hotRingSize <= 1_234 &&
+        judge.storeById.size === boundedStorage.hotRingSize &&
+        !judge.storeById.has('ring-cap-0'),
+      { ...boundedStorage, indexed: judge.storeById.size },
+    );
+
+    process.env.ANYSENTRY_EVENT_RING_MAX = '';
+    const defaultJudge = new SentryJudgeService({}, {}, { enabled: false }, {});
+    assert(
+      'an empty hot-ring setting uses the safe 10,000-event default',
+      defaultJudge.storageStatus().hotRingCapacity === 10_000,
+      defaultJudge.storageStatus(),
+    );
+  } finally {
+    if (previous === undefined) delete process.env.ANYSENTRY_EVENT_RING_MAX;
+    else process.env.ANYSENTRY_EVENT_RING_MAX = previous;
+  }
+}
+
+async function verifyRouteScopedBodyLimits() {
+  const ordinaryStatus = await rawJsonStatus('/ingest', JSON.stringify({ padding: 'x'.repeat(120 * 1024) }));
+  assert(
+    'ordinary ingest keeps the narrow default JSON body limit',
+    ordinaryStatus === 413,
+    { status: ordinaryStatus },
+  );
+
+  const snapshotStatus = await rawJsonStatus(
+    '/runtime/snapshot',
+    JSON.stringify({ padding: 'x'.repeat(120 * 1024) }),
+  );
+  assert(
+    'runtime snapshot payloads above 100 KiB reach controller validation',
+    snapshotStatus !== 413,
+    { status: snapshotStatus },
+  );
+
+  const oversizedBatchStatus = await rawJsonStatus(
+    '/ingest/batch',
+    JSON.stringify({ events: [], padding: 'x'.repeat(5 * 1024 * 1024) }),
+  );
+  assert(
+    'observer batch body limit rejects payloads above 4 MiB',
+    oversizedBatchStatus === 413,
+    { status: oversizedBatchStatus },
   );
 }
 
@@ -329,7 +405,7 @@ async function verifyObserverBatch(sourceId, token) {
     source: 'kubernetes',
     evidence: ['label:anysentry.io/workload-kind=agent'],
   };
-  const events = [1711, 1712].map((pid) => ({
+  const events = Array.from({ length: 24 }, (_, index) => 1711 + index).map((pid) => ({
     line: observerLine(
       { agent: 'pod-batch', session: 'container-batch', task: String(pid) },
       {
@@ -339,6 +415,7 @@ async function verifyObserverBatch(sourceId, token) {
           uid: 1000,
           cwd: '/workspace/batch',
           argv: ['echo', `batch-${pid}`],
+          padding: 'x'.repeat(6_000),
         },
       },
     ),
@@ -347,13 +424,17 @@ async function verifyObserverBatch(sourceId, token) {
     sourceType: 'observer',
     attribution,
   }));
+  assert(
+    'observer batch regression payload exceeds the old Express 100 KiB default',
+    Buffer.byteLength(JSON.stringify({ events })) > 100 * 1024,
+  );
   const result = await request('/ingest/batch', 'POST', { events }, sourceHeaders(sourceId, token));
   assert(
     'observer batch ingest accepts and accounts for every envelope',
     result.accepted === true &&
-      result.acceptedEvents === 2 &&
+      result.acceptedEvents === events.length &&
       result.rejectedEvents === 0 &&
-      result.items?.length === 2 &&
+      result.items?.length === events.length &&
       result.items.every((item) => item.accepted === true),
     result,
   );
@@ -807,6 +888,8 @@ async function verifySourceRollup(sourceId) {
 async function main() {
   console.log(`AnySentry observer ingest verification against ${baseUrl}`);
   await verifyCollectorMetricFreshnessContract();
+  await verifyHotRingCapacityContract();
+  await verifyRouteScopedBodyLimits();
   await request('/stats');
   await verifyIdentitySnapshotContract();
   const { source, token } = await createProtectedObserverSource();

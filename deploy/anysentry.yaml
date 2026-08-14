@@ -145,6 +145,9 @@ spec:
             - { containerPort: 29653 }
           env:
             - { name: PORT, value: "29653" }
+            # Keep the synchronous dashboard hot set within the 512 MiB API memory budget.
+            - { name: ANYSENTRY_EVENT_RING_MAX, value: "10000" }
+            - { name: ANYSENTRY_OBSERVER_BODY_LIMIT, value: "4mb" }
             # Bundled ClickHouse (namespace-local Service DNS). Point this at an external server to
             # use your own ClickHouse instead — then delete the ClickHouse objects above.
             - { name: CLICKHOUSE_URL, value: "http://clickhouse:8123" }

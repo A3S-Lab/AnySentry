@@ -17,6 +17,15 @@ async function bootstrap() {
     });
   }
   app.enableCors();
+  app.use([
+    '/security-center/ingest/batch',
+    '/security-center/runtime/snapshot',
+  ], json({
+    type: ['application/json', 'application/*+json'],
+    // Observer batches and runtime snapshots are bounded by their controllers, but regularly
+    // exceed Express' 100 KiB default. Keep a route-scoped ceiling instead of widening every API.
+    limit: process.env.ANYSENTRY_OBSERVER_BODY_LIMIT || '4mb',
+  }));
   app.use('/security-center/supply-chain/tasks', json({
     type: ['application/json', 'application/*+json'],
     limit: process.env.ANYSENTRY_WORKSPACE_SCAN_BODY_LIMIT || '32mb',

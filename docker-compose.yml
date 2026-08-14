@@ -47,6 +47,8 @@ services:
         condition: service_healthy
     environment:
       PORT: 29653
+      ANYSENTRY_EVENT_RING_MAX: ${ANYSENTRY_EVENT_RING_MAX:-10000}
+      ANYSENTRY_OBSERVER_BODY_LIMIT: ${ANYSENTRY_OBSERVER_BODY_LIMIT:-4mb}
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-anysentry}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-anysentry}

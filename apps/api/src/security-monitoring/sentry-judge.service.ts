@@ -257,8 +257,14 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   // needs more than MAX rows, query ClickHouse for that window instead of the ring.
   private readonly store: JudgedEvent[] = [];
   private readonly storeById = new Map<string, JudgedEvent>();
-  private readonly MAX = 100_000;
-  private readonly TRIM_BATCH = 1_000;
+  private readonly MAX = (() => {
+    const raw = process.env.ANYSENTRY_EVENT_RING_MAX?.trim();
+    const configured = raw ? Number(raw) : Number.NaN;
+    return Number.isInteger(configured)
+      ? Math.max(1_000, Math.min(100_000, configured))
+      : 10_000;
+  })();
+  private readonly TRIM_BATCH = Math.min(1_000, Math.max(100, Math.floor(this.MAX / 10)));
   private readonly collectorHeartbeats: CollectorHeartbeatRecord[] = [];
   private readonly MAX_COLLECTOR_HEARTBEATS = 10_000;
   private collectorHeartbeatPersistTimer?: NodeJS.Timeout;
@@ -332,10 +338,22 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
-  storageStatus(): { mode: 'clickhouse' | 'memory'; clickhouseConfigured: boolean; clickhouseReady: boolean } {
+  storageStatus(): {
+    mode: 'clickhouse' | 'memory';
+    clickhouseConfigured: boolean;
+    clickhouseReady: boolean;
+    hotRingSize: number;
+    hotRingCapacity: number;
+  } {
     const clickhouseConfigured = Boolean(process.env.CLICKHOUSE_URL);
     const clickhouseReady = this.ch.enabled;
-    return { mode: clickhouseReady ? 'clickhouse' : 'memory', clickhouseConfigured, clickhouseReady };
+    return {
+      mode: clickhouseReady ? 'clickhouse' : 'memory',
+      clickhouseConfigured,
+      clickhouseReady,
+      hotRingSize: this.store.length,
+      hotRingCapacity: this.MAX,
+    };
   }
 
   async searchStoredEvents(query: StoredEventQuery): Promise<JudgedEvent[]> {
@@ -730,7 +748,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       this.store.push(rec);
       this.storeById.set(rec.eventId, rec);
     }
-    if (this.store.length > this.MAX + this.TRIM_BATCH) {
+    if (this.store.length > this.MAX) {
       for (const removed of this.store.splice(0, this.TRIM_BATCH)) {
         if (this.storeById.get(removed.eventId) === removed) this.storeById.delete(removed.eventId);
       }
