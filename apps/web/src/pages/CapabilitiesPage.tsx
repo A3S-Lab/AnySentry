@@ -1,4 +1,5 @@
 import dayjs from "dayjs";
+import { formatSecurityDateTime } from "@/lib/date-time";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -220,9 +221,7 @@ function requestValidationIssues(requestText: string, operation?: SecurityApiOpe
 }
 
 function formatDate(value?: string) {
-  if (!value) return "--";
-  const parsed = dayjs(value);
-  return parsed.isValid() ? parsed.format("MM-DD HH:mm:ss") : value;
+  return formatSecurityDateTime(value, "MM-DD HH:mm:ss", value || "--");
 }
 
 function modulesFrom(value: SecurityCapabilityResponse | SecurityApiModule[] | SecurityApiModule | SecurityApiOperation[] | SecurityApiOperation | undefined): SecurityApiModule[] {

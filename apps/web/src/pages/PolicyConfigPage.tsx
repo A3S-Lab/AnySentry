@@ -105,6 +105,9 @@ const CANDIDATE_PIPELINE_OPTIONS: Array<{ value: PolicyConfig["identity"]["candi
 ];
 
 const TIME_OPTIONS: Array<{ value: SecurityTimeType; label: string }> = [
+  { value: "last_30m", label: "近30分钟" },
+  { value: "last_1h", label: "近1小时" },
+  { value: "last_2h", label: "近2小时" },
   { value: "last_3h", label: "近3小时" },
   { value: "last_1d", label: "近一天" },
   { value: "last_7d", label: "近一周" },
@@ -551,7 +554,8 @@ function ConnectionControl({
   onClear: (profile: ModelConnectionProfile) => void;
 }) {
   const result = state.result;
-  const connected = active?.state === "active";
+  const configured = active?.state === "active";
+  const connected = configured && active.callable;
   const tone = result && !result.ok
     ? "border-rose-400/25 bg-rose-500/10 text-rose-100"
     : connected || result?.ok
@@ -565,7 +569,7 @@ function ConnectionControl({
           autoComplete="new-password"
           value={apiKey}
           onChange={(event) => onApiKeyChange(event.target.value)}
-          placeholder={connected ? "已配置运行时凭据；输入新 Key 可替换" : "输入 API Key"}
+          placeholder={configured ? "已配置运行时凭据；输入新 Key 可替换" : "输入 API Key"}
           className="h-8 border-white/10 bg-white/5 font-mono text-xs"
         />
       </Field>
@@ -575,16 +579,16 @@ function ConnectionControl({
             {state.loading || state.applying ? <LoaderCircle className="size-3.5 animate-spin" />
               : result && !result.ok ? <AlertTriangle className="size-3.5" />
                 : connected || result?.ok ? <CheckCircle2 className="size-3.5" /> : <KeyRound className="size-3.5" />}
-            <span>{state.loading ? "正在验证连接…" : state.applying ? "正在应用…" : result?.message ?? (connected ? "运行时连接已生效" : "尚未配置运行时凭据")}</span>
+            <span>{state.loading ? "正在验证连接…" : state.applying ? "正在应用…" : result?.message ?? (connected ? "运行时连接已生效" : configured ? active?.message ?? "模型 API 当前不可用" : "尚未配置运行时凭据")}</span>
           </div>
           <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] opacity-75">
             {result ? <><span>{result.model}</span><span>{result.latencyMs} ms</span><span className="break-all">{result.endpoint}</span></>
-              : connected ? <><span>{active?.model}</span><span>{active?.source === "environment" ? "部署配置" : "页面配置"}</span><span className="break-all">{active?.endpoint}</span></>
+              : configured ? <><span>{active?.model}</span><span>{active?.source === "environment" ? "部署配置" : "页面配置"}</span><span className="break-all">{active?.endpoint}</span></>
                 : <span>请先测试，成功后再应用</span>}
           </div>
         </div>
         <div className="flex shrink-0 flex-wrap gap-2">
-          {connected ? <Button type="button" size="sm" variant="ghost" onClick={() => onClear(profile)} className="h-8 text-xs text-zinc-300 hover:bg-white/10">清除凭据</Button> : null}
+          {configured ? <Button type="button" size="sm" variant="ghost" onClick={() => onClear(profile)} className="h-8 text-xs text-zinc-300 hover:bg-white/10">清除凭据</Button> : null}
           <Button type="button" size="sm" variant="secondary" disabled={state.loading || state.applying || !apiKey.trim()} onClick={() => onTest(profile)} className="h-8 border border-white/10 bg-white/5 text-xs text-zinc-100 hover:bg-white/10">
             {state.loading ? <LoaderCircle className="size-3.5 animate-spin" /> : <Zap className="size-3.5" />}测试连接
           </Button>
@@ -935,6 +939,16 @@ function SimulationPanel({
       <div className="space-y-4 p-4">
         {result ? (
           <>
+            <div className={`rounded-md border px-3 py-2 text-xs ${
+              result.sampling.truncated
+                ? "border-amber-400/25 bg-amber-500/10 text-amber-100"
+                : "border-teal-400/20 bg-teal-500/10 text-teal-100"
+            }`}>
+              策略回放使用最近事件样本：已取 {result.sampling.sampledEvents} / 上限 {result.sampling.sampleLimit} 条
+              {result.sampling.truncated
+                ? "。所选时间范围数据更多，结果仅代表该有界样本。"
+                : "。当前时间范围未发生样本截断。"}
+            </div>
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
               <MetricTile label="已评估" value={result.summary.evaluatedEvents} tone="border-white/10 bg-white/[0.03] text-zinc-100" />
               <MetricTile label="变化事件" value={result.summary.changedEvents} tone="border-amber-400/25 bg-amber-500/10 text-amber-100" />

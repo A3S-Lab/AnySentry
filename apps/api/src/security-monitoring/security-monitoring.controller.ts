@@ -1,7 +1,7 @@
 import { BadRequestException, Body, Controller, Get, Headers, HttpCode, NotFoundException, Param, Post, Put, Query, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { Observable, map, timer } from 'rxjs';
+import { Observable, map, mergeMap, timer } from 'rxjs';
 import { SkipWrap } from '../shared/api-response.interceptor';
 import { AgentMetadataService } from './agent-metadata.service';
 import { AggregationService } from './aggregation.service';
@@ -12,6 +12,7 @@ import { IdentityReviewAgentService } from './identity-review-agent.service';
 import { testDeepInvestigationConnection, testFastReviewConnection } from './judgment-connectivity';
 import { KubeIdentityService } from './kube-identity.service';
 import { managementAuthConfigured, ManagementAuthGuard, RequireManagementAuth } from './management-auth.guard';
+import { RelationalBusinessStore } from './relational-business-store.service';
 import { MaintenanceWindowService } from './maintenance-window.service';
 import { NotificationService } from './notification.service';
 import { ObjectiveService } from './objective.service';
@@ -23,6 +24,7 @@ import { StreamingFindingService } from './streaming-finding.service';
 import { RuntimeModelConfigService, RuntimeModelProfile, sanitizeRuntimeModelConnection } from './runtime-model-config';
 import { StreamingQueueService } from './streaming-queue.service';
 import { SupplyChainService } from './supply-chain.service';
+import { WorkspaceDirectoryService } from './workspace-directory.service';
 import {
   ClaimScanTaskRequest,
   RegisterWorkspaceRequest,
@@ -2693,6 +2695,8 @@ export class SecurityMonitoringController {
     private readonly supplyChain: SupplyChainService,
     private readonly assistant: SecurityAssistantService,
     private readonly identityReview: IdentityReviewAgentService,
+    private readonly relational: RelationalBusinessStore,
+    private readonly workspaceDirectory: WorkspaceDirectoryService,
   ) {}
 
   private modelProfile(value: string): RuntimeModelProfile {
@@ -2927,6 +2931,19 @@ export class SecurityMonitoringController {
     }
   }
 
+  private observeWorkspaceAssociation(event: T.JudgedEvent): void {
+    try {
+      this.workspaceDirectory.observeEvent(event);
+    } catch (error) {
+      // Directory projection is an optional migration side effect. Immutable event acceptance and
+      // security judgment remain authoritative even when the business-state store is unavailable.
+      console.error('[workspace-directory] association observation failed', {
+        eventId: event.eventId,
+        error: error instanceof Error ? error.message.split('\n')[0].slice(0, 300) : String(error).slice(0, 300),
+      });
+    }
+  }
+
   @Post('top/healthCard')
   @HttpCode(200)
   healthCard(@Body() f: T.SecurityTimeFilter) {
@@ -2972,7 +2989,7 @@ export class SecurityMonitoringController {
   @Post('sessions/agentObservability')
   @HttpCode(200)
   agentObservability(@Body() f: T.SecurityTimeFilter) {
-    return this.agg.agentObservability(f);
+    return this.agg.agentObservabilityForWindow(f);
   }
 
   @Post('sessions/workspaceRiskDistribution')
@@ -2984,7 +3001,10 @@ export class SecurityMonitoringController {
   @Post('events/list')
   @HttpCode(200)
   agentEvents(@Body() f: T.AgentEventQuery) {
-    return f.durable ? this.agg.storedAgentEvents(f) : this.agg.agentEventsForWindow(f);
+    if (f.preview) return this.agg.agentEventsPreview(f);
+    // Durable history is the default. The bounded in-process ring is an explicit low-latency
+    // fallback/debug path and must not decide whether an event still exists.
+    return f.durable !== false ? this.agg.storedAgentEvents(f) : this.agg.agentEventsForWindow(f);
   }
 
   @Post('assistant/query')
@@ -2999,7 +3019,7 @@ export class SecurityMonitoringController {
   @Post('events/timeline')
   @HttpCode(200)
   agentTimeline(@Body() f: T.AgentEventQuery) {
-    return this.agg.agentTimeline(f);
+    return f.durable !== false ? this.agg.storedAgentTimeline(f) : this.agg.agentTimeline(f);
   }
 
   @Post('stream/findings')
@@ -3130,7 +3150,13 @@ export class SecurityMonitoringController {
   @Post('agents/inventory')
   @HttpCode(200)
   agentInventory(@Body() f: T.AgentInventoryQuery) {
-    return this.agg.agentInventory(f);
+    return this.agg.storedAgentInventory(f);
+  }
+
+  @Post('agents/instance-metrics')
+  @HttpCode(200)
+  agentInstanceMetrics(@Body() f: T.AgentInstanceMetricsQuery) {
+    return this.agg.storedAgentInstanceMetrics(f);
   }
 
   @Post('identity/ai-review')
@@ -3174,8 +3200,28 @@ export class SecurityMonitoringController {
 
   @Post('workspaces/inventory')
   @HttpCode(200)
-  workspaceInventory(@Body() f: T.WorkspaceInventoryQuery) {
-    return this.agg.workspaceInventory(f);
+  async workspaceInventory(@Body() f: T.WorkspaceInventoryQuery) {
+    return this.agg.storedWorkspaceInventory(f);
+  }
+
+  @Get('workspaces/directory')
+  workspaceDirectoryList() {
+    return {
+      items: this.workspaceDirectory.directory(),
+      status: this.workspaceDirectory.status(),
+      updateTime: new Date().toISOString(),
+    };
+  }
+
+  @Get('workspaces/bindings')
+  workspaceBindingHistory(
+    @Query('agentAssetId') agentAssetId?: string,
+    @Query('workspaceId') workspaceId?: string,
+  ) {
+    return {
+      items: this.workspaceDirectory.bindingHistory(agentAssetId, workspaceId),
+      updateTime: new Date().toISOString(),
+    };
   }
 
   @Get('agents/metadata')
@@ -3251,8 +3297,8 @@ export class SecurityMonitoringController {
 
   @Post('agents/topology')
   @HttpCode(200)
-  agentTopology(@Body() f: T.AgentTopologyQuery) {
-    return this.agg.agentTopology(f);
+  async agentTopology(@Body() f: T.AgentTopologyQuery) {
+    return this.agg.storedAgentTopology(f);
   }
 
   @Post('collectors/heartbeat')
@@ -3315,13 +3361,14 @@ export class SecurityMonitoringController {
 
   @Post('collectors/health')
   @HttpCode(200)
-  collectorHealth(@Body() f: T.CollectorHealthQuery) {
-    return this.agg.collectorHealth(f);
+  async collectorHealth(@Body() f: T.CollectorHealthQuery) {
+    return this.agg.storedCollectorHealth(f);
   }
 
   @Post('sources/list')
   @HttpCode(200)
-  ingestionSources(@Body() f: T.IngestionSourceQuery) {
+  async ingestionSources(@Body() f: T.IngestionSourceQuery) {
+    await this.sources.refreshDistributedCurrentState();
     return this.sources.list(f);
   }
 
@@ -3436,8 +3483,8 @@ export class SecurityMonitoringController {
 
   @Post('coverage/overview')
   @HttpCode(200)
-  coverageOverview(@Body() f: T.CoverageQuery) {
-    const coverage = this.agg.coverageOverview(f);
+  async coverageOverview(@Body() f: T.CoverageQuery) {
+    const coverage = await this.agg.storedCoverageOverview(f);
     const scoped = Boolean(f.issueId || f.type || f.workspacePath || f.agentId || f.collectorId || f.sourceId);
     this.alerting.observeCoverageList(coverage.issues, Date.now(), {
       resolveMissing: scoped,
@@ -4272,13 +4319,14 @@ export class SecurityMonitoringController {
   @Sse('sessions/agentObservability/stream')
   @SkipWrap()
   stream(@Query() q: T.SecurityTimeFilter): Observable<{ data: T.AgentObservability }> {
-    return timer(0, 3000).pipe(map(() => ({ data: this.agg.agentObservability(q) })));
+    return timer(0, 3000).pipe(mergeMap(async () => ({ data: await this.agg.agentObservabilityForWindow(q) })));
   }
 
   /** The editable judge policy (L1 rules / L2 LLM / L3 a3s-code) + which tiers are active. The
-   *  config panels read this; the dashboard hides tiers that aren't configured. */
+   *  config panels read this; the dashboard only enables tiers whose model API is callable. */
   @Get('config')
-  getConfig() {
+  async getConfig() {
+    await this.runtimeModels.refreshConnectivity();
     return { ...this.judge.getPolicy(), connections: this.runtimeModels.statuses() };
   }
 
@@ -4315,12 +4363,14 @@ export class SecurityMonitoringController {
         status: updated.status,
       },
     });
-    return { ...updated, connections: this.runtimeModels.statuses() };
+    await this.runtimeModels.refreshConnectivity();
+    return { policy: updated.policy, status: this.judge.getPolicy().status, connections: this.runtimeModels.statuses() };
   }
 
   @Get('config/model-connections')
   @RequireManagementAuth()
-  modelConnectionStatus() {
+  async modelConnectionStatus() {
+    await this.runtimeModels.refreshConnectivity();
     return this.runtimeModels.statuses();
   }
 
@@ -4419,10 +4469,10 @@ export class SecurityMonitoringController {
   @Post('config/simulate')
   @RequireManagementAuth()
   @HttpCode(200)
-  simulateConfig(@Body() body: T.PolicySimulationRequest, @Headers() headers: HeaderBag) {
+  async simulateConfig(@Body() body: T.PolicySimulationRequest, @Headers() headers: HeaderBag) {
     let result: T.PolicySimulationResult;
     try {
-      result = this.agg.policySimulation(body);
+      result = await this.agg.storedPolicySimulation(body);
     } catch (error) {
       throw policyBadRequest(error);
     }
@@ -4435,6 +4485,9 @@ export class SecurityMonitoringController {
       details: {
         timeType: body.timeType,
         limit: body.limit,
+        sampleLimit: result.sampling.sampleLimit,
+        sampledEvents: result.sampling.sampledEvents,
+        truncated: result.sampling.truncated,
         evaluatedEvents: result.summary.evaluatedEvents,
         changedEvents: result.summary.changedEvents,
         newBlocks: result.summary.newBlocks,
@@ -4463,6 +4516,20 @@ export class SecurityMonitoringController {
       service: 'anysentry-api',
       uptimeSeconds: Math.round(process.uptime()),
       storage: this.judge.storageStatus(),
+      businessState: {
+        mode: this.relational.configured() ? 'postgresql' : 'clickhouse-migration-fallback',
+        postgresqlConfigured: this.relational.configured(),
+        postgresqlReady: this.relational.isReady(),
+        workspaceDirectory: this.workspaceDirectory.status(),
+        incidents: this.judge.incidentStateStatus(),
+        alerts: this.alerting.stateStatus(),
+        remediations: this.remediation.stateStatus(),
+        ingestionSources: this.sources.stateStatus(),
+        maintenanceWindows: this.maintenance.stateStatus(),
+        notifications: this.notifications.stateStatus(),
+        objectives: this.objectives.stateStatus(),
+        policyConfig: this.judge.policyStateStatus(),
+      },
       managementAuth: {
         enabled: managementAuthConfigured(),
       },
@@ -4471,6 +4538,8 @@ export class SecurityMonitoringController {
         distinctAgents: stats.distinctAgents,
         distinctSessions: stats.distinctSessions,
       },
+      historyFactCache: this.agg.historyFactCacheStatus(),
+      dashboardBucketSnapshots: this.judge.dashboardBucketSnapshotStatus(),
       policy: policy.status,
       streaming: {
         ...this.streaming.status(),
@@ -4854,6 +4923,8 @@ export class SecurityMonitoringController {
       }
       await this.enqueueCanonicalShadow(rec, line);
       await this.observeSupplyChainInstall(rec, line);
+      this.observeWorkspaceAssociation(rec);
+      this.identityReview.considerCandidate(rec, () => this.agg.invalidateWindowCache());
       this.sources.recordAccepted(sourceResolution, 'event', { collectorId: inputCollectorId, workspacePath: rec.workspacePath });
       acceptedEvents += 1;
       items.push({
@@ -4989,6 +5060,8 @@ export class SecurityMonitoringController {
     }
     await this.enqueueCanonicalShadow(rec, line);
     await this.observeSupplyChainInstall(rec, line);
+    this.observeWorkspaceAssociation(rec);
+    this.identityReview.considerCandidate(rec, () => this.agg.invalidateWindowCache());
     this.sources.recordAccepted(sourceResolution, 'event', { collectorId, workspacePath: rec.workspacePath });
     this.agg.invalidateWindowCache();
     return { accepted: true, sourceId: sourceResolution.source?.sourceId, eventId: rec.eventId, traceId: rec.traceId, spanId: rec.spanId, runId: rec.runId, verdict: rec.verdict, tier: rec.tier, severity: rec.severity, reason: rec.reason, riskCategory: rec.riskCategory, decisionStatus: rec.decisionStatus, evaluationId: rec.evaluationId };

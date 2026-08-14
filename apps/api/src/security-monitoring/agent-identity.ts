@@ -27,6 +27,35 @@ function basename(value?: string): string | undefined {
   return normalized ? path.posix.basename(normalized) : undefined;
 }
 
+function canonicalAgentName(value?: string): string | undefined {
+  const normalized = text(value)?.toLowerCase();
+  if (!normalized) return undefined;
+  if (normalized === 'a3s' || normalized === 'a3s-code' || normalized === 'a3s code') return 'a3s code';
+  if (normalized === 'claude' || normalized === 'claude-code' || normalized === 'claude code') return 'claude code';
+  return normalized;
+}
+
+export function hasDirectAgentRootEvidence(
+  event: Pick<JudgedEvent, 'process' | 'attribution'>,
+): boolean {
+  // A process signature is only a discovery hint. A short-lived `codex ...` command can be
+  // observed after its parent has exited and must not become a standalone Agent asset until
+  // process-graph or workload evidence confirms the runtime root.
+  if (event.attribution?.source === 'process_signature') return false;
+  const rootPid = event.attribution?.rootPid;
+  if (!rootPid || event.process?.pid !== rootPid) return false;
+  const scope = canonicalAgentName(
+    event.attribution?.agentScopeId ??
+    event.attribution?.agentDisplayName,
+  );
+  if (!scope) return false;
+  const executableNames = new Set([
+    canonicalAgentName(basename(event.process?.comm)),
+    canonicalAgentName(basename(event.process?.exe)),
+  ].filter((value): value is string => Boolean(value)));
+  return executableNames.has(scope);
+}
+
 function shortWorkspace(value?: string): string | undefined {
   const normalized = text(value)?.replace(/\/+$/u, '');
   if (!normalized || normalized === 'unknown') return undefined;
@@ -80,12 +109,11 @@ function localInstanceKey(event: Pick<JudgedEvent, 'workspacePath' | 'process' |
     event.process?.hostId ?? 'host',
     event.process?.bootId ?? 'boot',
     rootPid,
-    event.attribution?.agentScopeId ?? event.attribution?.agentDisplayName ?? 'agent',
-    event.workspacePath,
+    event.attribution?.rootStartTime ?? 'start-unknown',
   ].join(':');
 }
 
-function workloadIdentityKey(event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'process' | 'attribution'>): string {
+export function agentIdentityKeyForEvent(event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'process' | 'attribution'>): string {
   const attribution = event.attribution;
   const workload = attribution?.workloadRef;
   return (
@@ -105,10 +133,66 @@ function workloadIdentityKey(event: Pick<JudgedEvent, 'agentId' | 'workspacePath
   );
 }
 
+/**
+ * Stable identity for one concrete Agent runtime.
+ *
+ * Human/AI review is intentionally inherited through a logical Agent identity, but a review must
+ * never collapse two terminal windows or two PID lifetimes into one runtime instance. For host
+ * processes the observed root PID and start time therefore win over any review-carried
+ * agentInstanceId. Container orchestrator identities remain authoritative when present.
+ */
+export function agentRuntimeInstanceIdForEvent(
+  event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'sessionId' | 'process' | 'attribution'>,
+): string {
+  const attribution = event.attribution;
+  const workload = attribution?.workloadRef;
+  if (workload?.podUid) {
+    return `k8s:${workload.podUid}:${workload.containerName ?? workload.name ?? 'container'}`;
+  }
+
+  const physical = text(attribution?.physicalWorkloadId);
+  const attributedInstance = text(attribution?.agentInstanceId);
+  const containerIdentity = [attributedInstance, physical].find((value) =>
+    /^(?:container|docker|k8s):/u.test(value ?? ''),
+  );
+  if (containerIdentity) return containerIdentity;
+
+  const rootPid = attribution?.rootPid;
+  if (rootPid) {
+    const rootStartTime =
+      text(attribution?.rootStartTime) ??
+      (
+        event.process?.pid === rootPid
+          ? text(event.process.startTimeNs) ?? text(event.process.startTimeTicks)
+          : undefined
+      );
+    return [
+      'host-root',
+      event.process?.hostId ?? 'host',
+      event.process?.bootId ?? 'boot',
+      rootPid,
+      rootStartTime ?? 'start-unknown',
+    ].join(':');
+  }
+
+  if (attributedInstance) return attributedInstance;
+  if (physical) return physical;
+  if (event.process?.pid) {
+    return [
+      'host-process',
+      event.process.hostId ?? 'host',
+      event.process.bootId ?? 'boot',
+      event.process.pid,
+      event.process.startTimeNs ?? event.process.startTimeTicks ?? 'start-unknown',
+    ].join(':');
+  }
+  return `session:${event.sessionId}:${event.agentId}`;
+}
+
 export function agentAssetIdForEvent(
   event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'process' | 'attribution'>,
 ): string {
-  return agentAssetIdForIdentityKey(workloadIdentityKey(event));
+  return agentAssetIdForIdentityKey(agentIdentityKeyForEvent(event));
 }
 
 export function agentAssetIdForIdentityKey(identityKey: string): string {

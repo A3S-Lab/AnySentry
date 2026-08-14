@@ -2,6 +2,7 @@ import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { AuditService } from './audit.service';
 import { ClickHouseStore } from './clickhouse-store';
+import { RelationalBusinessStore } from './relational-business-store.service';
 import {
   AlertKind,
   AlertListItem,
@@ -121,26 +122,55 @@ export class NotificationService implements OnModuleInit, OnModuleDestroy {
   private readonly channels = new Map<string, NotificationChannelRecord>();
   private readonly routes = new Map<string, NotificationRouteRecord>();
   private readonly deliveries = new Map<string, NotificationDeliveryRecord>();
+  private readonly pendingDeliveryFacts = new Map<string, NotificationDeliveryRecord>();
   private persistTimer?: NodeJS.Timeout;
+  private relationalRefreshTimer?: NodeJS.Timeout;
   private initialized = false;
+  private closing = false;
   private readonly legacyWebhookUrl = process.env.ANYSENTRY_ALERT_WEBHOOK_URL?.trim();
 
-  constructor(private readonly audit: AuditService) {}
+  constructor(
+    private readonly audit: AuditService,
+    private readonly relational: RelationalBusinessStore,
+  ) {}
 
   async onModuleInit(): Promise<void> {
     if (await this.ch.init()) {
       const state = await this.ch.loadNotificationState();
-      for (const channel of state.channels) this.channels.set(channel.channelId, this.normalizeChannel(channel));
-      for (const route of state.routes) this.routes.set(route.routeId, this.normalizeRoute(route));
+      for (const channel of state.channels) this.mergePersistedChannel(channel);
+      for (const route of state.routes) this.mergePersistedRoute(route);
       for (const delivery of state.deliveries ?? []) this.deliveries.set(delivery.deliveryId, this.normalizeDelivery(delivery));
     }
+    for (const channel of await this.relational.loadNotificationChannels()) {
+      this.mergePersistedChannel(channel);
+    }
+    for (const route of await this.relational.loadNotificationRoutes()) {
+      this.mergePersistedRoute(route);
+    }
     this.initialized = true;
+    await this.persistMutableConfig();
+    this.relationalRefreshTimer = setInterval(() => {
+      void this.refreshRelationalState();
+    }, 15_000);
+    this.relationalRefreshTimer.unref();
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.closing = true;
     if (this.persistTimer) clearTimeout(this.persistTimer);
+    if (this.relationalRefreshTimer) clearInterval(this.relationalRefreshTimer);
     await this.persist();
     await this.ch.close();
+  }
+
+  stateStatus() {
+    return {
+      channelCount: this.channels.size,
+      routeCount: this.routes.size,
+      deliveryFactCount: this.deliveries.size,
+      postgresqlBacked: this.relational.isReady(),
+      clickhouseMigrationCopy: this.ch.enabled,
+    };
   }
 
   config(query: NotificationConfigQuery = {}): NotificationConfig {
@@ -553,6 +583,7 @@ export class NotificationService implements OnModuleInit, OnModuleDestroy {
       team: cleanText(alert.team, 160),
     };
     this.deliveries.set(deliveryId, delivery);
+    this.pendingDeliveryFacts.set(deliveryId, delivery);
     this.auditFailedDelivery(delivery);
     this.trim();
     this.persistSoon();
@@ -630,10 +661,64 @@ export class NotificationService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async persist(): Promise<void> {
-    await this.ch.saveNotificationState({
-      channels: [...this.channels.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, RETAIN_LIMIT),
-      routes: [...this.routes.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, RETAIN_LIMIT),
-      deliveries: [...this.deliveries.values()].sort((a, b) => b.sentAt - a.sentAt).slice(0, RETAIN_LIMIT),
-    });
+    const channels = [...this.channels.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, RETAIN_LIMIT);
+    const routes = [...this.routes.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, RETAIN_LIMIT);
+    const deliveryFacts = [...this.pendingDeliveryFacts.values()];
+    const [, , , deliveryFactsSaved] = await Promise.all([
+      this.ch.saveNotificationState({
+        channels,
+        routes,
+        deliveries: [],
+      }),
+      this.relational.saveNotificationChannels(channels),
+      this.relational.saveNotificationRoutes(routes),
+      this.ch.appendNotificationDeliveryFacts(deliveryFacts),
+    ]);
+    if (deliveryFactsSaved) {
+      for (const delivery of deliveryFacts) {
+        if (this.pendingDeliveryFacts.get(delivery.deliveryId) === delivery) {
+          this.pendingDeliveryFacts.delete(delivery.deliveryId);
+        }
+      }
+    } else if (deliveryFacts.length > 0 && !this.closing && !this.persistTimer) {
+      this.persistTimer = setTimeout(() => {
+        this.persistTimer = undefined;
+        void this.persist();
+      }, 5_000);
+    }
+  }
+
+  private async persistMutableConfig(): Promise<void> {
+    await Promise.all([
+      this.relational.saveNotificationChannels([...this.channels.values()]),
+      this.relational.saveNotificationRoutes([...this.routes.values()]),
+    ]);
+  }
+
+  private mergePersistedChannel(record: NotificationChannelRecord): void {
+    if (!record.channelId) return;
+    const normalized = this.normalizeChannel(record);
+    const current = this.channels.get(normalized.channelId);
+    if (!current || normalized.updatedAt > current.updatedAt) {
+      this.channels.set(normalized.channelId, normalized);
+    }
+  }
+
+  private mergePersistedRoute(record: NotificationRouteRecord): void {
+    if (!record.routeId) return;
+    const normalized = this.normalizeRoute(record);
+    const current = this.routes.get(normalized.routeId);
+    if (!current || normalized.updatedAt > current.updatedAt) {
+      this.routes.set(normalized.routeId, normalized);
+    }
+  }
+
+  private async refreshRelationalState(): Promise<void> {
+    for (const channel of await this.relational.loadNotificationChannels()) {
+      this.mergePersistedChannel(channel);
+    }
+    for (const route of await this.relational.loadNotificationRoutes()) {
+      this.mergePersistedRoute(route);
+    }
   }
 }

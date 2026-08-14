@@ -54,9 +54,18 @@ const success = parseRuntimeInstallEvent(observerLine(
 assert.deepEqual(success, {
   phase: 'exited',
   pid: 42,
+  startTimeTicks: undefined,
   startTimeNs: '1234',
   succeeded: true,
 });
+
+const observerV2Success = parseRuntimeInstallEvent(observerLine(
+  'ProcessExit',
+  { pid: 44, exit_code: 0, signal: 0 },
+  { startTimeNs: undefined, start_time_ticks: 998877 },
+));
+assert.equal(observerV2Success?.startTimeTicks, '998877');
+assert.equal(observerV2Success?.startTimeNs, undefined);
 
 assert.equal(parseRuntimeInstallEvent(observerLine(
   'ProcessExit',

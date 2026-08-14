@@ -3,13 +3,16 @@ import { createHash } from 'node:crypto';
 import { Sentry, dns, egress, fileAccess, securityAction, sslContent, toolExec } from '@a3s-lab/sentry';
 import { AgentAttributionService } from './agent-attribution.service';
 import { AlertingService } from './alerting.service';
-import { ClickHouseStore, DashboardWindowHistory, IncidentState, StoredEventQuery } from './clickhouse-store';
+import { ClickHouseStore, DashboardWindowHistory, IncidentState, StoredAgentBucketFact, StoredAgentMetricBucketFact, StoredAgentWindowFact, StoredEventQuery, StoredEventSearchResult, StoredTopologyBucketFact, StoredTopologyWindowFact, StoredWorkspaceBucketFact, StoredWorkspaceWindowFact } from './clickhouse-store';
 import { DEFAULT_POLICY, PolicyConfig, buildFastAcl, policyConfigError, sanitizePolicy, tierStatus } from './policy-config';
 import { cleanText } from './redaction';
 import { DecisionResultJob, FastJudgeJob } from './async-judgment.types';
 import { JudgmentQueueService } from './judgment-queue.service';
 import { RuntimeModelConfigService } from './runtime-model-config';
+import { DistributedCurrentStateService } from './distributed-current-state.service';
+import { RelationalBusinessStore } from './relational-business-store.service';
 import { resolveJudgmentRoute } from './identity-judgment-routing';
+import { isNewerEventRevision } from './event-revision';
 import { CollectorHeartbeatRecord, CollectorHeartbeatRequest, EventCategory, EventMeta, IdentityAiReviewRecord, Incident, IncidentStatus, JudgedEvent, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
 
 const SEVERITY_SCORE: Record<Severity, number> = { info: 8, low: 28, medium: 52, high: 76, critical: 95 };
@@ -17,6 +20,11 @@ const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, hi
 const SCHEMA_VERSION: JudgedEvent['schemaVersion'] = 'anysentry.agent_event.v1';
 const SECURITY_JUDGED_KINDS = new Set(['ToolExec', 'Egress', 'Dns', 'FileAccess', 'SslContent', 'SecurityAction']);
 const DEFAULT_INTERNAL_L3_BIN = '/opt/anysentry/l3-agent.mjs';
+const RELATIONAL_REFRESH_MS = 15_000;
+const boundedEnvInt = (name: string, fallback: number, min: number, max: number): number => {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) ? Math.min(max, Math.max(min, Math.trunc(value))) : fallback;
+};
 const RISK_NAME_BY_CATEGORY: Record<string, string> = {
   systemic_risk: '云元数据 SSRF',
   privilege_escalation: '提权 / 进程注入',
@@ -177,9 +185,22 @@ function stringAttr(value: unknown): string | undefined {
   return text || undefined;
 }
 
+function stringLikeAttr(value: unknown): string | undefined {
+  if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'bigint') return undefined;
+  const text = String(value).trim();
+  return text || undefined;
+}
+
 function numberAttr(value: unknown): number | undefined {
   const n = Number(value);
   return Number.isFinite(n) ? n : undefined;
+}
+
+function isIncompleteToolEvidence(e: JudgedEvent): boolean {
+  return e.eventKind === 'ToolExec'
+    && e.verdict === 'escalate'
+    && e.tier === 'Rules'
+    && e.reason.toLowerCase().includes('incomplete toolexec evidence: argv was truncated or could not be fully reassembled');
 }
 
 function processFromAttributes(attributes: Record<string, unknown>): ProcessContext | undefined {
@@ -191,10 +212,14 @@ function processFromAttributes(attributes: Record<string, unknown>): ProcessCont
     comm: stringAttr(attributes.comm),
     exe: stringAttr(attributes.exe),
     cgroup: stringAttr(attributes.cgroup),
+    cgroupId: stringLikeAttr(attributes.cgroupId) ?? stringLikeAttr(attributes.cgroup_id),
     systemdUnit: stringAttr(attributes.systemdUnit),
-    hostId: stringAttr(attributes.hostId),
+    hostId: stringAttr(attributes.hostId) ?? stringAttr(attributes.host_id),
+    bootId: stringAttr(attributes.bootId) ?? stringAttr(attributes.boot_id),
     eventTimeNs: stringAttr(attributes.eventTimeNs),
-    startTimeNs: stringAttr(attributes.startTimeNs),
+    startTimeTicks: stringLikeAttr(attributes.startTimeTicks) ?? stringLikeAttr(attributes.start_time_ticks),
+    startTimeNs: stringLikeAttr(attributes.startTimeNs) ?? stringLikeAttr(attributes.start_time_ns),
+    mountNamespace: numberAttr(attributes.mountNamespace) ?? numberAttr(attributes.mount_namespace),
   };
   return Object.values(ctx).some((value) => value !== undefined) ? ctx : undefined;
 }
@@ -248,25 +273,31 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     private readonly attributionService: AgentAttributionService,
     private readonly queues: JudgmentQueueService,
     private readonly runtimeModels: RuntimeModelConfigService,
+    private readonly currentState: DistributedCurrentStateService,
+    private readonly relational: RelationalBusinessStore,
   ) {}
 
   private sentry!: Sentry;
-  // In-memory hot ring: the dashboard's fast, synchronous read/aggregation path. Durability + retention
-  // live in ClickHouse (see ClickHouseStore); the ring is hydrated from it on boot so date windows
-  // survive restarts/rollouts. ponytail: ring covers all windows at realistic volume; if a window ever
-  // needs more than MAX rows, query ClickHouse for that window instead of the ring.
+  // In-memory hot ring: bounded low-latency cache for uncommitted facts and explicit degraded-mode
+  // fallbacks. Historical existence, complete time windows, lists, and aggregates belong to
+  // ClickHouse; no user-facing history may silently inherit this ring's MAX limit.
   private readonly store: JudgedEvent[] = [];
   private readonly storeById = new Map<string, JudgedEvent>();
-  private readonly MAX = 100_000;
-  private readonly TRIM_BATCH = 1_000;
+  private readonly resultApplyLocks = new Map<string, Promise<void>>();
+  private readonly MAX = boundedEnvInt('ANYSENTRY_HOT_EVENT_LIMIT', 100_000, 1_000, 100_000);
+  private readonly TRIM_BATCH = Math.min(1_000, Math.max(100, Math.floor(this.MAX / 10)));
   private readonly collectorHeartbeats: CollectorHeartbeatRecord[] = [];
   private readonly MAX_COLLECTOR_HEARTBEATS = 10_000;
   private collectorHeartbeatPersistTimer?: NodeJS.Timeout;
   private timer?: NodeJS.Timeout;
   private readonly ch = new ClickHouseStore();
   private readonly incidents = new Map<string, Incident>();
+  private incidentPersistenceReady = false;
+  private incidentRelationalRefreshTimer?: NodeJS.Timeout;
+  private policyRelationalRefreshTimer?: NodeJS.Timeout;
   // The live editable judge policy (the config panels' target). Applied = ACL rebuilt + judge recreated.
   private policy: PolicyConfig = DEFAULT_POLICY;
+  private policyUpdatedAt = 0;
 
   async onModuleInit(): Promise<void> {
     // fail_closed=false → judge-only (no kernel enforcement); built-in rule set always applies.
@@ -276,7 +307,16 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       const saved = await this.ch.loadConfig();
       if (saved) this.applyPolicy(sanitizePolicy(saved));
       const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
-      const hist = await this.ch.hydrate(Date.now() - THIRTY_DAYS, this.MAX);
+      // The hot ring is a cache, not the historical source of truth. Hydrating all 100k entries
+      // (and extra judgment revisions) delays API startup and can exhaust a small ClickHouse
+      // container. Start with a bounded warm slice; durable history remains queryable in CH.
+      const hydrateLimit = boundedEnvInt(
+        'ANYSENTRY_HOT_HYDRATE_LIMIT',
+        Math.min(this.MAX, 1_000),
+        1_000,
+        this.MAX,
+      );
+      const hist = await this.ch.hydrate(Date.now() - THIRTY_DAYS, hydrateLimit);
       this.store.push(...hist); // direct (not push()) so hydrated rows aren't re-written to ClickHouse
       const historicalScopes: Array<{ event: JudgedEvent; incidentId: string }> = [];
       for (const rec of hist) {
@@ -291,6 +331,26 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         this.addCollectorHeartbeat(heartbeat, false);
       }
     }
+    const savedPolicy = await this.relational.loadPolicyConfig();
+    if (savedPolicy) {
+      this.applyPolicy(sanitizePolicy(savedPolicy.config));
+      this.policyUpdatedAt = savedPolicy.updatedAt;
+    }
+    if (this.policyUpdatedAt === 0) this.policyUpdatedAt = Date.now();
+    await this.relational.savePolicyConfig(this.policy, this.policyUpdatedAt);
+    for (const incident of await this.relational.loadIncidents()) {
+      this.mergePersistedIncident(incident);
+    }
+    this.incidentPersistenceReady = true;
+    await this.persistIncidentState([...this.incidents.values()]);
+    this.incidentRelationalRefreshTimer = setInterval(
+      () => void this.refreshRelationalIncidents(),
+      RELATIONAL_REFRESH_MS,
+    );
+    this.policyRelationalRefreshTimer = setInterval(
+      () => void this.refreshRelationalPolicy(),
+      RELATIONAL_REFRESH_MS,
+    );
     // Real by default: the store fills only from /ingest (a real a3s-observer feed). The synthetic
     // event generator is opt-in demo load (ANYSENTRY_SYNTHETIC_FEED=on); sentry still really judges it.
     if (process.env.ANYSENTRY_SYNTHETIC_FEED === 'on') {
@@ -301,7 +361,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   async onModuleDestroy(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     if (this.collectorHeartbeatPersistTimer) clearTimeout(this.collectorHeartbeatPersistTimer);
+    if (this.incidentRelationalRefreshTimer) clearInterval(this.incidentRelationalRefreshTimer);
+    if (this.policyRelationalRefreshTimer) clearInterval(this.policyRelationalRefreshTimer);
     await this.persistCollectorHeartbeats();
+    await this.persistIncidentState([...this.incidents.values()]);
     await this.ch.close();
   }
 
@@ -323,12 +386,20 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return { policy: this.policy, status: this.availableTiers() };
   }
 
+  policyStateStatus() {
+    return {
+      updatedAt: this.policyUpdatedAt,
+      postgresqlBacked: this.relational.isReady(),
+      clickhouseMigrationCopy: this.ch.enabled,
+    };
+  }
+
   private availableTiers(): ReturnType<typeof tierStatus> {
     const configured = tierStatus(this.policy);
     return {
       l1: true,
-      l2: configured.l2 && Boolean(this.runtimeModels.get('fast_review')),
-      l3: configured.l3 && Boolean(this.runtimeModels.get('deep_investigation')),
+      l2: configured.l2 && this.runtimeModels.isCallable('fast_review'),
+      l3: configured.l3 && this.runtimeModels.isCallable('deep_investigation'),
     };
   }
 
@@ -338,8 +409,94 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return { mode: clickhouseReady ? 'clickhouse' : 'memory', clickhouseConfigured, clickhouseReady };
   }
 
+  dashboardBucketSnapshotStatus() {
+    return this.ch.dashboardBucketSnapshotStatus();
+  }
+
   async searchStoredEvents(query: StoredEventQuery): Promise<JudgedEvent[]> {
     return this.ch.searchEvents(query);
+  }
+
+  async searchStoredEventsPage(query: StoredEventQuery): Promise<StoredEventSearchResult> {
+    return this.ch.searchEventsPage(query);
+  }
+
+  committedEventCutoffMs(): number | undefined {
+    return this.ch.committedCutoffMs();
+  }
+
+  committedEventProgress() {
+    return this.ch.committedProgress();
+  }
+
+  agentWindowFacts(
+    sinceMs: number,
+    untilMs: number,
+    monitoredOnly: boolean,
+    excludedEventIds: string[] = [],
+  ): Promise<StoredAgentWindowFact[] | null> {
+    return this.ch.agentWindowFacts(sinceMs, untilMs, monitoredOnly, excludedEventIds);
+  }
+
+  agentWindowBucketFacts(
+    sinceMs: number,
+    endExclusiveMs: number,
+    bucketMs: number,
+    monitoredOnly: boolean,
+  ): Promise<StoredAgentBucketFact[] | null> {
+    return this.ch.agentWindowBucketFacts(sinceMs, endExclusiveMs, bucketMs, monitoredOnly);
+  }
+
+  agentMetricBucketFacts(
+    sinceMs: number,
+    untilMs: number,
+    bucketCount: number,
+    monitoredOnly: boolean,
+    excludedEventIds: string[] = [],
+  ): Promise<StoredAgentMetricBucketFact[] | null> {
+    return this.ch.agentMetricBucketFacts(sinceMs, untilMs, bucketCount, monitoredOnly, excludedEventIds);
+  }
+
+  workspaceWindowFacts(
+    sinceMs: number,
+    untilMs: number,
+    monitoredOnly: boolean,
+    excludedEventIds: string[] = [],
+  ): Promise<StoredWorkspaceWindowFact[] | null> {
+    return this.ch.workspaceWindowFacts(sinceMs, untilMs, monitoredOnly, excludedEventIds);
+  }
+
+  workspaceWindowBucketFacts(
+    sinceMs: number,
+    endExclusiveMs: number,
+    bucketMs: number,
+    monitoredOnly: boolean,
+  ): Promise<StoredWorkspaceBucketFact[] | null> {
+    return this.ch.workspaceWindowBucketFacts(sinceMs, endExclusiveMs, bucketMs, monitoredOnly);
+  }
+
+  topologyWindowFacts(
+    sinceMs: number,
+    untilMs: number,
+    excludedEventIds: string[] = [],
+  ): Promise<StoredTopologyWindowFact[] | null> {
+    return this.ch.topologyWindowFacts(sinceMs, untilMs, excludedEventIds);
+  }
+
+  topologyWindowBucketFacts(
+    sinceMs: number,
+    endExclusiveMs: number,
+    bucketMs: number,
+  ): Promise<StoredTopologyBucketFact[] | null> {
+    return this.ch.topologyWindowBucketFacts(sinceMs, endExclusiveMs, bucketMs);
+  }
+
+  storedCollectorHeartbeats(sinceMs: number, untilMs: number): Promise<CollectorHeartbeatRecord[] | null> {
+    return this.ch.queryCollectorHeartbeats(sinceMs, untilMs);
+  }
+
+  storedLatestCollectorHeartbeats(untilMs: number): Promise<CollectorHeartbeatRecord[] | null> {
+    return this.ch.latestCollectorHeartbeats(untilMs);
   }
 
   loadIdentityAiReviews(): Promise<IdentityAiReviewRecord[]> {
@@ -350,11 +507,19 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return this.ch.saveIdentityAiReviews(records);
   }
 
+  appendIdentityAiReviewRevision(record: IdentityAiReviewRecord): Promise<boolean> {
+    return this.ch.appendIdentityAiReviewRevision(record);
+  }
+
   /** Validate + apply a new policy, then persist it (survives restarts via ClickHouse). */
   async setPolicy(input: unknown): Promise<{ policy: PolicyConfig; status: ReturnType<typeof tierStatus> }> {
     const config = sanitizePolicy(input);
     this.applyPolicy(config);
-    await this.ch.saveConfig(config);
+    this.policyUpdatedAt = Date.now();
+    await Promise.all([
+      this.ch.saveConfig(config),
+      this.relational.savePolicyConfig(config, this.policyUpdatedAt),
+    ]);
     return this.getPolicy();
   }
 
@@ -510,6 +675,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       decisionStatus: 'pending',
       evaluationId,
       policyVersion,
+      decisionRevision: 1,
       decisionUpdatedAt: Date.now(),
       verdict: 'escalate',
       tier: 'Rules',
@@ -543,6 +709,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       const failed: JudgedEvent = {
         ...pending,
         decisionStatus: 'failed',
+        decisionRevision: 2,
         decisionUpdatedAt: Date.now(),
         reason: '研判队列不可用: ' + (error instanceof Error ? error.message : String(error)).slice(0, 500),
       };
@@ -554,8 +721,26 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
 
 
   async applyAsyncResult(result: DecisionResultJob): Promise<void> {
+    const eventId = result.event.eventId;
+    const previous = this.resultApplyLocks.get(eventId) ?? Promise.resolve();
+    const current = previous
+      .catch(() => undefined)
+      .then(() => this.applyAsyncResultUnlocked(result));
+    this.resultApplyLocks.set(eventId, current);
+    try {
+      await current;
+    } finally {
+      if (this.resultApplyLocks.get(eventId) === current) this.resultApplyLocks.delete(eventId);
+    }
+  }
+
+  private async applyAsyncResultUnlocked(result: DecisionResultJob): Promise<void> {
     const current = this.storeById.get(result.event.eventId);
     if (current && (current.decisionUpdatedAt ?? current.at) >= result.completedAt) return;
+    const decisionRevision = Math.max(
+      1,
+      Math.trunc(current?.decisionRevision ?? result.event.decisionRevision ?? 1),
+    ) + 1;
     const awaitingL3 = result.status === 'succeeded' && result.awaitingL3 === true;
     let next: JudgedEvent;
     if (result.decision) {
@@ -580,6 +765,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         decisionStatus: awaitingL3 ? 'pending' : result.status,
         evaluationId: result.evaluationId,
         policyVersion: result.policyVersion,
+        decisionRevision,
         decisionUpdatedAt: result.completedAt,
         verdict,
         tier: decision.tier as Tier,
@@ -611,6 +797,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         decisionStatus: result.status,
         evaluationId: result.evaluationId,
         policyVersion: result.policyVersion,
+        decisionRevision,
         decisionUpdatedAt: result.completedAt,
         reason: result.stage + '研判' + result.status + ': ' + (result.error ?? 'unknown error'),
         latencyMs: Math.max(1, result.completedAt - result.startedAt),
@@ -618,6 +805,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     }
     await this.ch.insertNow(next);
     this.upsertMemory(next, !awaitingL3 && result.status === 'succeeded');
+    this.alerting.observeJudgmentResult(result);
   }
 
   /** Judge one observer event against the live sentry policy and record it. Kinds sentry doesn't
@@ -725,6 +913,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
 
   private upsertMemory(rec: JudgedEvent, notify: boolean): JudgedEvent {
     const current = this.storeById.get(rec.eventId);
+    if (current && !isNewerEventRevision(rec, current)) return current;
     if (current) Object.assign(current, rec);
     else {
       this.store.push(rec);
@@ -738,7 +927,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const effective = current ?? rec;
     if (notify) {
       const incident = this.ingestIncident(effective);
-      this.alerting.observeEvent(effective);
+      this.alerting.observeEvent(effective, incident?.incidentId);
       if (incident) this.alerting.observeIncident(incident);
     }
     return effective;
@@ -748,6 +937,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const normalized: JudgedEvent = {
       ...rec,
       decisionStatus: rec.decisionStatus ?? 'succeeded',
+      decisionRevision: Math.max(1, Math.trunc(rec.decisionRevision ?? 1)),
       decisionUpdatedAt: rec.decisionUpdatedAt ?? Date.now(),
     };
     this.upsertMemory(normalized, true);
@@ -756,11 +946,13 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   }
 
   private incidentId(e: JudgedEvent): string {
-    return hashId('inc', [e.workspacePath, e.agentId, e.sessionId, e.traceId, e.runId, e.riskCategory]);
+    const canonicalAgentId = e.attribution?.agentScopeId?.trim() || e.agentId;
+    return hashId('inc', [e.workspacePath, canonicalAgentId, e.sessionId, e.traceId, e.runId, e.riskCategory]);
   }
 
   private ingestIncident(e: JudgedEvent): Incident | null {
-    if (e.verdict === 'allow') return null;
+    if (e.verdict === 'allow' || isIncompleteToolEvidence(e)) return null;
+    const canonicalAgentId = e.attribution?.agentScopeId?.trim() || e.agentId;
     const incidentId = this.incidentId(e);
     const prev = this.incidents.get(incidentId);
     const severity = prev && SEVERITY_RANK[prev.severity] > SEVERITY_RANK[e.severity] ? prev.severity : e.severity;
@@ -792,7 +984,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
           openedAt: e.at,
           updatedAt: e.at,
           workspacePath: e.workspacePath,
-          agentId: e.agentId,
+          agentId: canonicalAgentId,
           collectorId,
           sourceId,
           sessionId: e.sessionId,
@@ -811,7 +1003,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
           agentScopeId: e.attribution?.agentScopeId,
         };
     this.incidents.set(incidentId, next);
-    if (prev?.status === 'resolved') void this.ch.saveIncidentState([...this.incidents.values()]);
+    if (this.incidentPersistenceReady) void this.persistIncidentState([next]);
     return next;
   }
 
@@ -835,6 +1027,13 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return [...this.incidents.values()].filter((i) => i.updatedAt >= sinceMs);
   }
 
+  incidentStateStatus(): { recordCount: number; postgresqlBacked: boolean } {
+    return {
+      recordCount: this.incidents.size,
+      postgresqlBacked: this.relational.isReady(),
+    };
+  }
+
   updateIncident(incidentId: string, input: { status?: IncidentStatus; owner?: string; note?: string }, at = Date.now()): Incident | null {
     const cur = this.incidents.get(incidentId);
     if (!cur) return null;
@@ -849,9 +1048,36 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       resolvedAt: status === 'resolved' ? cur.resolvedAt ?? at : status === 'open' ? undefined : cur.resolvedAt,
     };
     this.incidents.set(incidentId, next);
-    void this.ch.saveIncidentState([...this.incidents.values()]);
+    void this.persistIncidentState([next]);
     this.alerting.observeIncident(next);
     return next;
+  }
+
+  private mergePersistedIncident(saved: Incident): void {
+    const current = this.incidents.get(saved.incidentId);
+    if (!current || saved.updatedAt >= current.updatedAt) {
+      this.incidents.set(saved.incidentId, saved);
+    }
+  }
+
+  private async persistIncidentState(records: Incident[]): Promise<void> {
+    await Promise.all([
+      this.relational.saveIncidents(records),
+      this.ch.saveIncidentState([...this.incidents.values()]),
+    ]);
+  }
+
+  private async refreshRelationalIncidents(): Promise<void> {
+    for (const incident of await this.relational.loadIncidents()) {
+      this.mergePersistedIncident(incident);
+    }
+  }
+
+  private async refreshRelationalPolicy(): Promise<void> {
+    const saved = await this.relational.loadPolicyConfig();
+    if (!saved || saved.updatedAt <= this.policyUpdatedAt) return;
+    this.applyPolicy(sanitizePolicy(saved.config));
+    this.policyUpdatedAt = saved.updatedAt;
   }
 
   recordCollectorHeartbeat(input: CollectorHeartbeatRequest, at = Date.now()): CollectorHeartbeatRecord {
@@ -943,6 +1169,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       message: cleanText(input.message, 500),
     };
     this.addCollectorHeartbeat(rec);
+    void this.currentState.recordCollectorHeartbeat(rec);
     return rec;
   }
 
@@ -950,7 +1177,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     this.collectorHeartbeats.push(rec);
     if (this.collectorHeartbeats.length > this.MAX_COLLECTOR_HEARTBEATS) this.collectorHeartbeats.splice(0, this.collectorHeartbeats.length - this.MAX_COLLECTOR_HEARTBEATS);
     this.alerting.observeCollectorHeartbeat(rec);
-    if (persist) this.persistCollectorHeartbeatsSoon();
+    if (persist) {
+      this.ch.enqueueCollectorHeartbeat(rec);
+      this.persistCollectorHeartbeatsSoon();
+    }
   }
 
   private persistCollectorHeartbeatsSoon(): void {
@@ -965,17 +1195,26 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     await this.ch.saveCollectorHeartbeats(this.collectorHeartbeats.slice(-this.MAX_COLLECTOR_HEARTBEATS));
   }
 
-  queryCollectorHeartbeats(sinceMs = 0): CollectorHeartbeatRecord[] {
-    return this.collectorHeartbeats.filter((e) => e.at >= sinceMs);
+  queryCollectorHeartbeats(sinceMs = 0, untilMs = Number.POSITIVE_INFINITY): CollectorHeartbeatRecord[] {
+    return this.collectorHeartbeats.filter((e) => e.at >= sinceMs && e.at <= untilMs);
   }
 
-  latestCollectorHeartbeats(): CollectorHeartbeatRecord[] {
+  latestCollectorHeartbeats(untilMs = Number.POSITIVE_INFINITY): CollectorHeartbeatRecord[] {
     const latest = new Map<string, CollectorHeartbeatRecord>();
     for (const hb of this.collectorHeartbeats) {
+      if (hb.at > untilMs) continue;
       const cur = latest.get(hb.collectorId);
       if (!cur || hb.at > cur.at) latest.set(hb.collectorId, hb);
     }
     return [...latest.values()];
+  }
+
+  distributedLatestCollectorHeartbeats(untilMs: number): Promise<CollectorHeartbeatRecord[]> {
+    return this.currentState.latestCollectorHeartbeats(untilMs);
+  }
+
+  distributedCurrentStateReady(): boolean {
+    return this.currentState.isReady();
   }
 
   /** Events within a window [sinceMs, now]. */
@@ -988,8 +1227,41 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return this.store.filter((e) => e.at >= sinceMs && e.at <= untilMs);
   }
 
+  /** Newest bounded slice for low-latency dashboard previews. The hot ring is time ordered. */
+  queryRecentRange(sinceMs: number, untilMs: number, limit: number): JudgedEvent[] {
+    const out: JudgedEvent[] = [];
+    const boundedLimit = Math.max(1, Math.min(this.MAX, Math.trunc(limit)));
+    for (let index = this.store.length - 1; index >= 0 && out.length < boundedLimit; index -= 1) {
+      const event = this.store[index];
+      if (event.at > untilMs) continue;
+      if (event.at < sinceMs) break;
+      out.push(event);
+    }
+    return out.reverse();
+  }
+
   dashboardWindowHistory(sinceMs: number, untilMs: number, bucketCount?: number): Promise<DashboardWindowHistory | null> {
     return this.ch.dashboardWindowHistory(sinceMs, untilMs, bucketCount);
+  }
+
+  dashboardAggregateBucketFacts(sinceMs: number, untilExclusiveMs: number, bucketMs?: number) {
+    return this.ch.dashboardAggregateBucketFacts(sinceMs, untilExclusiveMs, bucketMs);
+  }
+
+  eventCommitChanges(after?: Parameters<ClickHouseStore['eventCommitChanges']>[0], limit?: number) {
+    return this.ch.eventCommitChanges(after, limit);
+  }
+
+  latestEventCommitCursor() {
+    return this.ch.latestEventCommitCursor();
+  }
+
+  earliestEventCommitCursor() {
+    return this.ch.earliestEventCommitCursor();
+  }
+
+  dashboardTailEvents(sinceMs: number, untilMs: number): Promise<JudgedEvent[] | null> {
+    return this.ch.dashboardTailEvents(sinceMs, untilMs);
   }
 
   recentPersistedEvents(

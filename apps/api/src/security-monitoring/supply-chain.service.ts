@@ -15,6 +15,7 @@ import {
   workspacePathFingerprint,
 } from './supply-chain-normalizer';
 import { SupplyChainStore } from './supply-chain-store';
+import { WorkspaceDirectoryService } from './workspace-directory.service';
 import {
   RegisterWorkspaceRequest,
   ScanReason,
@@ -50,6 +51,7 @@ const HEARTBEAT_TTL_MS = 20_000;
 interface RuntimeInstallIntent {
   workspacePath: string;
   packageManager: string;
+  startTimeTicks?: string;
   startTimeNs?: string;
   observedAt: number;
 }
@@ -121,6 +123,8 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
     updatedAt: 0,
   };
 
+  constructor(private readonly workspaceDirectory: WorkspaceDirectoryService) {}
+
   get enabled(): boolean {
     return this.control.enabled && this.serviceReady;
   }
@@ -157,6 +161,10 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
 
   async onModuleInit(): Promise<void> {
     if (!(await this.store.init())) return;
+    const registeredWorkspaces = await this.store.registeredWorkspaces();
+    for (const workspace of registeredWorkspaces) {
+      this.workspaceDirectory.registerWorkspace(workspace);
+    }
     const saved = await this.store.loadControl();
     if (saved) {
       this.control = this.sanitizeControl(saved);
@@ -415,6 +423,7 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
       updatedAt: now,
     };
     await this.store.upsertWorkspace(workspace);
+    this.workspaceDirectory.registerWorkspace(workspace);
     const active = await this.store.activeBinding(workspaceId);
     const initialTask = active || !this.enabled || !this.selectedWorkspace(workspaceId)
       ? undefined
@@ -505,6 +514,7 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
       const intent: RuntimeInstallIntent = {
         workspacePath: event.workspacePath,
         packageManager: observed.packageManager ?? 'unknown',
+        startTimeTicks: observed.startTimeTicks,
         startTimeNs: observed.startTimeNs,
         observedAt: event.at,
       };
@@ -515,6 +525,7 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
     const raw = await redis.getdel(key);
     if (!raw || !observed.succeeded) return;
     const intent = JSON.parse(raw) as RuntimeInstallIntent;
+    if (intent.startTimeTicks && observed.startTimeTicks && intent.startTimeTicks !== observed.startTimeTicks) return;
     if (intent.startTimeNs && observed.startTimeNs && intent.startTimeNs !== observed.startTimeNs) return;
     let fingerprint: string;
     try {

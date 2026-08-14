@@ -1,7 +1,11 @@
 import { SecurityTimeFilter } from './types';
 
+const MINUTE = 60_000;
 const HOUR = 3_600_000;
 const WINDOW_MS: Record<Exclude<NonNullable<SecurityTimeFilter['timeType']>, 'custom'>, number> = {
+  last_30m: 30 * MINUTE,
+  last_1h: HOUR,
+  last_2h: 2 * HOUR,
   last_3h: 3 * HOUR,
   last_1d: 24 * HOUR,
   last_7d: 7 * 24 * HOUR,
@@ -27,11 +31,13 @@ function parsedTime(value?: string): number | undefined {
  * custom ranges honor both boundaries and never silently extend through "now".
  */
 export function resolveTimeWindow(filter: SecurityTimeFilter, clockMs = Date.now()): ResolvedTimeWindow {
+  const requestedSnapshot = parsedTime(filter.snapshotAsOf);
+  const snapshotMs = Math.min(requestedSnapshot ?? clockMs, clockMs);
   if (filter.timeType === 'custom') {
     const requestedStart = parsedTime(filter.startTime);
     const requestedEnd = parsedTime(filter.endTime);
     if (requestedStart !== undefined && requestedEnd !== undefined && requestedEnd >= requestedStart) {
-      const endMs = Math.min(requestedEnd, clockMs);
+      const endMs = Math.min(requestedEnd, snapshotMs);
       const startMs = Math.min(requestedStart, endMs);
       return {
         startMs,
@@ -46,10 +52,10 @@ export function resolveTimeWindow(filter: SecurityTimeFilter, clockMs = Date.now
   const timeType = filter.timeType && filter.timeType !== 'custom' ? filter.timeType : 'last_3h';
   const spanMs = WINDOW_MS[timeType] ?? WINDOW_MS.last_3h;
   return {
-    startMs: clockMs - spanMs,
-    endMs: clockMs,
+    startMs: snapshotMs - spanMs,
+    endMs: snapshotMs,
     spanMs,
     custom: false,
-    cacheKey: timeType,
+    cacheKey: requestedSnapshot === undefined ? timeType : `${timeType}|${snapshotMs}`,
   };
 }

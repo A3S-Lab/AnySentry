@@ -136,7 +136,10 @@ and take effect without restart. L2 and AI identity review share the fast connec
 only the deep connection. Deployment-injected `A3S_SENTRY_LLM_*` (fast) and `A3S_SENTRY_L3_*`
 (deep) variables remain supported as independent restart-surviving compatibility sources.
 
-Judged events use an in-memory hot ring for current reads and ClickHouse for durable analytics. Without `CLICKHOUSE_URL`, AnySentry continues in memory but does not preserve state across restarts.
+ClickHouse is the source of truth for judged-event history and analytics. A bounded in-memory hot
+ring supplies uncommitted low-latency facts and degraded-mode fallbacks only; it does not decide
+whether historical events, Agents, or relationships exist. Without `CLICKHOUSE_URL`, AnySentry
+continues in partial in-memory mode but does not preserve state across restarts.
 
 ## Progressive API for AI agents
 

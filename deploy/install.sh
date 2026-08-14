@@ -7,6 +7,8 @@ NAMESPACE="${ANYSENTRY_NAMESPACE:-anysentry}"
 CLICKHOUSE_USER="${CLICKHOUSE_USER:-anysentry}"
 CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:-change-me}"
 OBSERVER_IMAGE="${ANYSENTRY_OBSERVER_IMAGE:-}"
+ANYSENTRY_IMAGE="${ANYSENTRY_IMAGE:-ghcr.io/a3s-lab/anysentry:latest}"
+FLINK_IMAGE="${ANYSENTRY_FLINK_IMAGE:-}"
 APPLY_INGRESS="${ANYSENTRY_APPLY_INGRESS:-0}"
 
 usage() {
@@ -15,13 +17,15 @@ Install AnySentry as an integrated middleware stack.
 
 Modes:
   docker       Build and run AnySentry + ClickHouse with docker compose.
-  kubernetes   Install AnySentry + ClickHouse + a3s-observer DaemonSet.
+  kubernetes   Install the complete AnySentry Kubernetes stack and observer DaemonSet.
 
 Environment:
   ANYSENTRY_INSTALL_MODE=docker|kubernetes
   ANYSENTRY_NAMESPACE=anysentry
   CLICKHOUSE_USER=anysentry
   CLICKHOUSE_PASSWORD=change-me
+  ANYSENTRY_IMAGE=ghcr.io/a3s-lab/anysentry:latest
+  ANYSENTRY_FLINK_IMAGE=<registry>/anysentry-flink-streaming:<version>  (required for Kubernetes)
   ANYSENTRY_OBSERVER_IMAGE=<registry>/anysentry-observer:latest
   ANYSENTRY_APPLY_INGRESS=1
 
@@ -58,7 +62,11 @@ DONE
 
 install_kubernetes() {
   need kubectl
-  echo "Installing AnySentry + ClickHouse + a3s-observer in namespace ${NAMESPACE}..."
+  if [[ -z "$FLINK_IMAGE" ]]; then
+    echo "ANYSENTRY_FLINK_IMAGE is required: build streaming/flink/Dockerfile and publish the image first" >&2
+    exit 1
+  fi
+  echo "Installing the complete AnySentry stack in namespace ${NAMESPACE}..."
 
   kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
   kubectl -n "$NAMESPACE" create secret generic anysentry-clickhouse \
@@ -66,28 +74,62 @@ install_kubernetes() {
     --from-literal=CLICKHOUSE_PASSWORD="$CLICKHOUSE_PASSWORD" \
     --dry-run=client -o yaml | kubectl apply -f -
 
-  kubectl -n "$NAMESPACE" apply -f "$ROOT_DIR/deploy/anysentry.yaml"
+  render_core_manifest() {
+    sed \
+      -e "s/namespace: anysentry/namespace: ${NAMESPACE}/g" \
+      -e "s#ghcr.io/a3s-lab/anysentry:latest#${ANYSENTRY_IMAGE}#g" \
+      "$1"
+  }
+
+  render_streaming_manifest() {
+    sed \
+      -e "s/namespace: anysentry/namespace: ${NAMESPACE}/g" \
+      -e "s#ghcr.io/a3s-lab/anysentry-flink-streaming:latest#${FLINK_IMAGE}#g" \
+      -e "s#ghcr.io/a3s-lab/anysentry:latest#${ANYSENTRY_IMAGE}#g" \
+      "$1"
+  }
+
+  render_core_manifest "$ROOT_DIR/deploy/anysentry.yaml" | kubectl -n "$NAMESPACE" apply -f -
+  render_streaming_manifest "$ROOT_DIR/deploy/streaming.yaml" | kubectl -n "$NAMESPACE" apply -f -
 
   if [[ -n "$OBSERVER_IMAGE" ]]; then
-    sed "s#ghcr.io/a3s-lab/anysentry-observer:latest#${OBSERVER_IMAGE}#g" "$ROOT_DIR/deploy/observer.yaml" | kubectl -n "$NAMESPACE" apply -f -
+    sed \
+      -e "s/namespace: anysentry/namespace: ${NAMESPACE}/g" \
+      -e "s#ghcr.io/a3s-lab/anysentry-observer:latest#${OBSERVER_IMAGE}#g" \
+      "$ROOT_DIR/deploy/observer.yaml" | kubectl -n "$NAMESPACE" apply -f -
   else
-    kubectl -n "$NAMESPACE" apply -f "$ROOT_DIR/deploy/observer.yaml"
+    sed "s/namespace: anysentry/namespace: ${NAMESPACE}/g" \
+      "$ROOT_DIR/deploy/observer.yaml" | kubectl -n "$NAMESPACE" apply -f -
   fi
 
   if [[ "$APPLY_INGRESS" == "1" ]]; then
-    kubectl -n "$NAMESPACE" apply -f "$ROOT_DIR/deploy/ingress.yaml"
+    sed "s/namespace: anysentry/namespace: ${NAMESPACE}/g" \
+      "$ROOT_DIR/deploy/ingress.yaml" | kubectl -n "$NAMESPACE" apply -f -
   fi
 
-  kubectl -n "$NAMESPACE" rollout status deploy/clickhouse
-  kubectl -n "$NAMESPACE" rollout status deploy/anysentry
-  kubectl -n "$NAMESPACE" rollout status daemonset/a3s-observer
+  kubectl -n "$NAMESPACE" rollout status deploy/clickhouse --timeout=300s
+  kubectl -n "$NAMESPACE" rollout status statefulset/redis --timeout=300s
+  kubectl -n "$NAMESPACE" rollout status statefulset/kafka --timeout=600s
+  kubectl -n "$NAMESPACE" rollout status deploy/kafka-topic-manager --timeout=300s
+  kubectl -n "$NAMESPACE" rollout status deploy/flink-jobmanager --timeout=600s
+  kubectl -n "$NAMESPACE" rollout status deploy/flink-taskmanager --timeout=600s
+  kubectl -n "$NAMESPACE" rollout status deploy/flink-job-submit --timeout=600s
+  kubectl -n "$NAMESPACE" rollout status deploy/anysentry --timeout=300s
+  kubectl -n "$NAMESPACE" rollout status deploy/fast-judge --timeout=300s
+  kubectl -n "$NAMESPACE" rollout status deploy/l3-worker --timeout=300s
+  kubectl -n "$NAMESPACE" rollout status deploy/stream-worker --timeout=300s
+  kubectl -n "$NAMESPACE" rollout status deploy/composite-judge --timeout=300s
+  kubectl -n "$NAMESPACE" rollout status deploy/supply-chain-assessment --timeout=300s
+  kubectl -n "$NAMESPACE" rollout status daemonset/a3s-observer --timeout=300s
 
   cat <<DONE
 
 AnySentry is installed with:
   - AnySentry API/dashboard
-  - @a3s-lab/sentry judge bundled in the AnySentry image
-  - ClickHouse storage
+  - ClickHouse and Redis durable state
+  - Fast Judge and L3 asynchronous workers
+  - Kafka, Flink, Stream Worker, and Composite Judge
+  - OSV supply-chain assessment worker
   - a3s-observer observe-only DaemonSet + AnySentry forwarder
 
 Open a local tunnel:

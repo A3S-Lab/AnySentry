@@ -198,12 +198,15 @@ class AgentAttributor {
     for (const info of snapshot.values()) {
       const agentId = this.matchAgentExecutable(info);
       if (!agentId) continue;
+      const workspacePath = this.resolveWorkspace(info.cwd).workspacePath;
       this.remember({
         ...info,
         state: 'agent',
         agentId,
         rootPid: info.tgid || info.pid,
-        workspacePath: this.resolveWorkspace(info.cwd).workspacePath,
+        rootStartTime: info.startTime,
+        workspacePath,
+        agentWorkspacePath: workspacePath,
         lastSeen: now,
       });
       roots++;
@@ -221,6 +224,8 @@ class AgentAttributor {
           state: 'agent',
           agentId: scope.agentId,
           rootPid: scope.rootPid,
+          rootStartTime: scope.rootStartTime,
+          agentWorkspacePath: scope.workspacePath,
           ...this.resolveWorkspace(info.cwd, scope.workspacePath),
           lastSeen: now,
         });
@@ -298,7 +303,10 @@ class AgentAttributor {
         text(processInfo.startTimeNs) ||
         text(processInfo.start_time_ns),
       cgroupId: text(processInfo.cgroupId) || text(processInfo.cgroup_id),
-      comm: text(processInfo.comm) || text(observerEvent?.identity?.agent),
+      // `identity.agent` is a claimed/inherited scope label from the Observer envelope. It is not
+      // process executable evidence. Falling back to it here promoted short-lived bwrap, shell,
+      // and ProcessExit records into new Agent roots whenever the real comm field was unavailable.
+      comm: text(processInfo.comm),
       exe: text(processInfo.exe),
       argv: argvText(payload.argv),
       cgroup: text(processInfo.cgroup),
@@ -330,9 +338,6 @@ class AgentAttributor {
     };
     if (sameCachedProcess) this.stats.cacheHits++;
     else this.stats.cacheMisses++;
-
-    const directAgent = this.matchAgent(current);
-    if (directAgent) return this.finish(pid, this.rememberAgent(current, directAgent, pid, 'hint_only', 'argv'), exiting, current);
 
     const existing = sameCachedProcess ? cached : undefined;
     // Observer normally supplies the complete process instance. `/proc` is now a cache-miss and
@@ -413,6 +418,7 @@ class AgentAttributor {
           'process_lineage',
           'process_graph',
           ancestry.workspacePath,
+          ancestry.rootStartTime,
         ),
         exiting,
         current,
@@ -423,6 +429,26 @@ class AgentAttributor {
       return this.finish(
         pid,
         this.rememberInfrastructure(current, ancestry.rootPid, ancestry.serviceName, ancestry.containerId),
+        exiting,
+        current,
+      );
+    }
+
+    // Parent/leader ownership wins over direct command hints. Only after ancestry has failed to
+    // identify an Agent do we allow this process to become a new root.
+    const directAgent = this.matchAgent(current);
+    if (directAgent) {
+      return this.finish(
+        pid,
+        this.rememberAgent(
+          current,
+          directAgent,
+          pid,
+          'hint_only',
+          'argv',
+          undefined,
+          current.startTime,
+        ),
         exiting,
         current,
       );
@@ -460,6 +486,7 @@ class AgentAttributor {
               state: 'agent',
               agentId: result.attribution.agentScopeId,
               rootPid: result.attribution.rootPid ?? pid,
+              rootStartTime: result.attribution.rootStartTime ?? current.startTime,
               lastSeen: this.now(),
             }
           : undefined
@@ -549,6 +576,7 @@ class AgentAttributor {
             state: 'agent',
             agentId: scope.agentId,
             rootPid: scope.rootPid,
+            rootStartTime: scope.rootStartTime,
             ...this.resolveWorkspace(live.cwd, scope.workspacePath),
             lastSeen: now,
           });
@@ -572,13 +600,24 @@ class AgentAttributor {
           const leaderAgent = this.matchAgent(leader);
           if (leaderAgent) {
             const { workspacePath } = this.resolveWorkspace(leader.cwd);
-            const root = { ...leader, state: 'agent', agentId: leaderAgent, rootPid: tgid, workspacePath, lastSeen: now };
+            const root = {
+              ...leader,
+              state: 'agent',
+              agentId: leaderAgent,
+              rootPid: tgid,
+              rootStartTime: leader.startTime,
+              workspacePath,
+              agentWorkspacePath: workspacePath,
+              lastSeen: now,
+            };
             this.remember(root);
             this.remember({
               ...live,
               state: 'agent',
               agentId: leaderAgent,
               rootPid: tgid,
+              rootStartTime: leader.startTime,
+              agentWorkspacePath: workspacePath,
               ...this.resolveWorkspace(live.cwd, workspacePath),
               lastSeen: now,
             });
@@ -589,12 +628,15 @@ class AgentAttributor {
 
       const directAgent = this.matchAgent(live);
       if (directAgent) {
+        const workspacePath = this.resolveWorkspace(live.cwd).workspacePath;
         const root = {
           ...live,
           state: 'agent',
           agentId: directAgent,
           rootPid: pid,
-          workspacePath: this.resolveWorkspace(live.cwd).workspacePath,
+          rootStartTime: live.startTime,
+          workspacePath,
+          agentWorkspacePath: workspacePath,
           lastSeen: now,
         };
         this.remember(root);
@@ -632,9 +674,25 @@ class AgentAttributor {
     return undefined;
   }
 
-  rememberAgent(info, agentId, rootPid, reason, source, inheritedWorkspacePath) {
+  rememberAgent(info, agentId, rootPid, reason, source, inheritedWorkspacePath, inheritedRootStartTime) {
     const workspace = this.resolveWorkspace(info.workspacePath || info.cwd, inheritedWorkspacePath);
-    const record = { ...info, state: 'agent', agentId, rootPid, ...workspace, lastSeen: this.now() };
+    const agentWorkspacePath =
+      canonicalWorkspacePath(inheritedWorkspacePath)
+      || canonicalWorkspacePath(info.agentWorkspacePath)
+      || workspace.workspacePath;
+    const rootStartTime =
+      inheritedRootStartTime ||
+      (rootPid === info.pid ? info.startTime : this.procs.get(rootPid)?.startTime);
+    const record = {
+      ...info,
+      state: 'agent',
+      agentId,
+      rootPid,
+      rootStartTime,
+      agentWorkspacePath,
+      ...workspace,
+      lastSeen: this.now(),
+    };
     this.remember(record);
     return {
       state: 'agent',
@@ -644,7 +702,9 @@ class AgentAttributor {
         classification: 'probable_agent',
         agentScopeId: agentId,
         agentDisplayName: agentId,
+        ...(agentWorkspacePath ? { agentWorkspacePath } : {}),
         rootPid,
+        ...(rootStartTime ? { rootStartTime } : {}),
         confidence: source === 'process_graph' ? 0.9 : 0.85,
         reason,
         source,
@@ -666,7 +726,11 @@ class AgentAttributor {
         classification: 'probable_agent',
         agentScopeId: record.agentId,
         agentDisplayName: record.agentId,
+        ...((record.agentWorkspacePath || record.workspacePath)
+          ? { agentWorkspacePath: record.agentWorkspacePath || record.workspacePath }
+          : {}),
         rootPid: record.rootPid,
+        ...(record.rootStartTime ? { rootStartTime: record.rootStartTime } : {}),
         confidence: 0.9,
         reason: 'process_lineage',
         source: 'process_graph',
@@ -681,7 +745,8 @@ class AgentAttributor {
       state: 'agent',
       agentId: record.agentId,
       rootPid: record.rootPid,
-      workspacePath: record.workspacePath,
+      rootStartTime: record.rootStartTime,
+      workspacePath: record.agentWorkspacePath || record.workspacePath,
     };
   }
 

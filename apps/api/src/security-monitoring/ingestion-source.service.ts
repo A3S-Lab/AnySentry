@@ -1,9 +1,12 @@
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { createHash, randomBytes } from 'node:crypto';
 import { ClickHouseStore } from './clickhouse-store';
+import { DistributedCurrentStateService } from './distributed-current-state.service';
+import { RelationalBusinessStore } from './relational-business-store.service';
 import {
   IngestionSourceCheckInAck,
   IngestionSourceCheckInRequest,
+  IngestionSourceCurrentActivity,
   IngestionSourceItem,
   IngestionSourceList,
   IngestionSourceMutationResult,
@@ -79,7 +82,12 @@ function cleanTags(tags: unknown): string[] {
   return [...new Set(tags.map((tag) => cleanText(tag, 48)).filter((tag): tag is string => Boolean(tag)))].slice(0, 24);
 }
 
-function isVerificationSource(item: IngestionSourceItem): boolean {
+type VerificationSourceIdentity = Pick<
+  IngestionSourceRecord,
+  'sourceId' | 'name' | 'owner' | 'team' | 'environment' | 'note' | 'tags'
+>;
+
+export function isVerificationSource(item: VerificationSourceIdentity): boolean {
   const searchable = [
     item.sourceId,
     item.name,
@@ -140,21 +148,46 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
   private readonly ch = new ClickHouseStore();
   private readonly sources = new Map<string, IngestionSourceRecord>();
   private persistTimer?: NodeJS.Timeout;
+  private currentStateTimer?: NodeJS.Timeout;
   private initialized = false;
+
+  constructor(
+    private readonly currentState: DistributedCurrentStateService,
+    private readonly relational: RelationalBusinessStore,
+  ) {}
 
   async onModuleInit(): Promise<void> {
     if (await this.ch.init()) {
       for (const record of await this.ch.loadIngestionSources()) {
-        if (record.sourceId) this.sources.set(record.sourceId, this.normalize(record));
+        this.mergePersisted(record);
       }
     }
+    for (const record of await this.relational.loadIngestionSources()) {
+      this.mergePersisted(record);
+    }
     this.initialized = true;
+    await this.persist();
+    await this.refreshDistributedCurrentState();
+    this.currentStateTimer = setInterval(() => {
+      void this.refreshRelationalState();
+      void this.refreshDistributedCurrentState();
+    }, 15_000);
+    this.currentStateTimer.unref();
   }
 
   async onModuleDestroy(): Promise<void> {
     if (this.persistTimer) clearTimeout(this.persistTimer);
+    if (this.currentStateTimer) clearInterval(this.currentStateTimer);
     await this.persist();
     await this.ch.close();
+  }
+
+  stateStatus() {
+    return {
+      sourceCount: this.sources.size,
+      postgresqlBacked: this.relational.isReady(),
+      clickhouseMigrationCopy: this.ch.enabled,
+    };
   }
 
   create(input: IngestionSourceUpdateRequest): IngestionSourceMutationResult {
@@ -317,7 +350,20 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       record.lastEventAt = at;
       record.acceptedEvents += 1;
     }
+    void this.currentState.recordSourceActivity({
+      sourceId: record.sourceId,
+      lastSeenAt: at,
+      lastEventAt: kind === 'event' ? at : undefined,
+      lastHeartbeatAt: kind === 'heartbeat' ? at : undefined,
+      collectorId: record.collectorId,
+      workspacePath: record.workspacePath,
+    });
     this.persistSoon();
+  }
+
+  async refreshDistributedCurrentState(untilMs = Date.now()): Promise<void> {
+    const activities = await this.currentState.latestSourceActivities(untilMs);
+    for (const activity of activities) this.mergeCurrentActivity(activity);
   }
 
   recordRejected(resolution: IngestionSourceResolution, reason: string): void {
@@ -461,6 +507,21 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
+  private mergeCurrentActivity(activity: IngestionSourceCurrentActivity): void {
+    const record = this.sources.get(activity.sourceId);
+    if (!record) return;
+    const existingAt = lastSignalAt(record) ?? 0;
+    if (existingAt > activity.lastSeenAt) return;
+    record.lastSeenAt = Math.max(record.lastSeenAt ?? 0, activity.lastSeenAt);
+    record.updatedAt = Math.max(record.updatedAt, activity.lastSeenAt);
+    record.lastResult = 'accepted';
+    record.lastError = undefined;
+    if (activity.collectorId) record.collectorId = clean(activity.collectorId, 180);
+    if (activity.workspacePath) record.workspacePath = clean(activity.workspacePath, 500);
+    if (activity.lastHeartbeatAt) record.lastHeartbeatAt = Math.max(record.lastHeartbeatAt ?? 0, activity.lastHeartbeatAt);
+    if (activity.lastEventAt) record.lastEventAt = Math.max(record.lastEventAt ?? 0, activity.lastEventAt);
+  }
+
   private item(record: IngestionSourceRecord): IngestionSourceItem {
     const status = statusOf(record);
     const signalAt = lastSignalAt(record);
@@ -520,6 +581,27 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async persist(): Promise<void> {
-    await this.ch.saveIngestionSources([...this.sources.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, RETAIN_LIMIT));
+    const records = [...this.sources.values()]
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, RETAIN_LIMIT);
+    await Promise.all([
+      this.ch.saveIngestionSources(records),
+      this.relational.saveIngestionSources(records),
+    ]);
+  }
+
+  private mergePersisted(record: IngestionSourceRecord): void {
+    if (!record.sourceId) return;
+    const normalized = this.normalize(record);
+    const current = this.sources.get(normalized.sourceId);
+    if (!current || normalized.updatedAt > current.updatedAt) {
+      this.sources.set(normalized.sourceId, normalized);
+    }
+  }
+
+  private async refreshRelationalState(): Promise<void> {
+    for (const record of await this.relational.loadIngestionSources()) {
+      this.mergePersisted(record);
+    }
   }
 }

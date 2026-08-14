@@ -12,7 +12,7 @@ import {
 } from './async-judgment.types';
 import { redisConnection } from './judgment-queue.service';
 import { isL3AgentTimeout, L3AgentPool } from './l3-agent-pool';
-import { L2CodeJudge } from './l2-code-judge';
+import { isL2CodeJudgeTimeout, L2CodeJudge } from './l2-code-judge';
 import { parseL3Decision } from './l3-decision-parser';
 import { buildFastAcl } from './policy-config';
 import { RuntimeModelClient } from './runtime-model-config';
@@ -266,13 +266,15 @@ async function fastJudge(job: { data: FastJudgeJob; attemptsMade: number; opts: 
     });
   } catch (error) {
     if (!finalAttempt(job)) throw error;
+    const timedOut = isL2CodeJudgeTimeout(error);
     await publishResult({
       schemaVersion: 'anysentry.decision_result.v1',
       evaluationId: input.evaluationId,
       policyVersion: input.policyVersion,
       event: input.event,
       stage: 'L2',
-      status: 'failed',
+      status: timedOut ? 'timeout' : 'failed',
+      stageStopReason: timedOut ? 'l2_timeout' : 'l2_failed',
       error: error instanceof Error ? error.message.slice(0, 2_000) : String(error).slice(0, 2_000),
       startedAt,
       completedAt: Date.now(),

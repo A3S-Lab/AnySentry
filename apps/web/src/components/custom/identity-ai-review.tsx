@@ -59,7 +59,7 @@ export function IdentityAiReview({
             <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-zinc-500">只读建议</span>
           </div>
           <p className="mt-1.5 text-xs leading-5 text-zinc-400">
-            使用当前 L2/L3 模型配置，由受限 A3S Code SDK Agent 读取证据快照。结果不会自动改变身份分类。
+            使用快速研判模型单次分析有界证据快照，不启动 Agent 或工具循环。结果不会自动改变身份分类。
           </p>
         </div>
         <Button
@@ -70,7 +70,7 @@ export function IdentityAiReview({
           className="h-8 shrink-0 bg-sky-400 text-slate-950 hover:bg-sky-300"
         >
           {loading ? <LoaderCircle className="size-3.5 animate-spin" /> : <Bot className="size-3.5" />}
-          {loading ? "正在读取证据..." : result ? "重新辅助审核" : "开始辅助审核"}
+          {loading ? "正在单次研判..." : result ? "重新辅助审核" : "开始辅助审核"}
         </Button>
       </div>
 

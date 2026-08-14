@@ -5,6 +5,7 @@ import { AlertingService } from './alerting.service';
 import { ClickHouseStore } from './clickhouse-store';
 import { IngestionSourceService } from './ingestion-source.service';
 import { RemediationService } from './remediation.service';
+import { RelationalBusinessStore } from './relational-business-store.service';
 import {
   AlertStatus,
   ObjectiveComparator,
@@ -80,6 +81,7 @@ export class ObjectiveService implements OnModuleInit, OnModuleDestroy {
   private readonly ch = new ClickHouseStore();
   private readonly objectives = new Map<string, ObjectiveRecord>();
   private persistTimer?: NodeJS.Timeout;
+  private relationalRefreshTimer?: NodeJS.Timeout;
   private initialized = false;
 
   constructor(
@@ -87,21 +89,39 @@ export class ObjectiveService implements OnModuleInit, OnModuleDestroy {
     private readonly alerting: AlertingService,
     private readonly sources: IngestionSourceService,
     private readonly remediations: RemediationService,
+    private readonly relational: RelationalBusinessStore,
   ) {}
 
   async onModuleInit(): Promise<void> {
     if (await this.ch.init()) {
       for (const record of await this.ch.loadObjectives()) {
-        if (record.objectiveId) this.objectives.set(record.objectiveId, this.normalize(record));
+        this.mergePersisted(record);
       }
     }
+    for (const record of await this.relational.loadObjectives()) {
+      this.mergePersisted(record);
+    }
     this.initialized = true;
+    await this.persist();
+    this.relationalRefreshTimer = setInterval(() => {
+      void this.refreshRelationalState();
+    }, 15_000);
+    this.relationalRefreshTimer.unref();
   }
 
   async onModuleDestroy(): Promise<void> {
     if (this.persistTimer) clearTimeout(this.persistTimer);
+    if (this.relationalRefreshTimer) clearInterval(this.relationalRefreshTimer);
     await this.persist();
     await this.ch.close();
+  }
+
+  stateStatus() {
+    return {
+      objectiveCount: this.objectives.size,
+      postgresqlBacked: this.relational.isReady(),
+      clickhouseMigrationCopy: this.ch.enabled,
+    };
   }
 
   upsert(objectiveId: string | undefined, input: ObjectiveUpdateRequest): ObjectiveItem {
@@ -392,6 +412,27 @@ export class ObjectiveService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async persist(): Promise<void> {
-    await this.ch.saveObjectives([...this.objectives.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, RETAIN_LIMIT));
+    const records = [...this.objectives.values()]
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, RETAIN_LIMIT);
+    await Promise.all([
+      this.ch.saveObjectives(records),
+      this.relational.saveObjectives(records),
+    ]);
+  }
+
+  private mergePersisted(record: ObjectiveRecord): void {
+    if (!record.objectiveId) return;
+    const normalized = this.normalize(record);
+    const current = this.objectives.get(normalized.objectiveId);
+    if (!current || normalized.updatedAt > current.updatedAt) {
+      this.objectives.set(normalized.objectiveId, normalized);
+    }
+  }
+
+  private async refreshRelationalState(): Promise<void> {
+    for (const record of await this.relational.loadObjectives()) {
+      this.mergePersisted(record);
+    }
   }
 }

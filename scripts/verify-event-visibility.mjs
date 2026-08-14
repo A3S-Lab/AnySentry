@@ -18,7 +18,7 @@ assert.equal(isEventClassificationVisible('non_agent', 'raw', true, true), true)
 
 const storeSource = await readFile(new URL('../apps/api/src/security-monitoring/clickhouse-store.ts', import.meta.url), 'utf8');
 assert.match(storeSource, /async searchEvents\(input: StoredEventQuery\)/u);
-assert.match(storeSource, /ORDER BY at DESC, decisionUpdatedAt DESC/u);
+assert.match(storeSource, /ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC/u);
 assert.match(storeSource, /const latest = new Map<string, JudgedEvent>/u);
 
 const aggregationSource = await readFile(new URL('../apps/api/src/security-monitoring/aggregation.service.ts', import.meta.url), 'utf8');
@@ -27,7 +27,11 @@ const earlyRejectAt = aggregationSource.indexOf('if (!matchesEventId && !matches
 const identityResolveAt = aggregationSource.indexOf('const resolved = this.agentMetadata.resolveEvent(e);', directFilterAt);
 assert.ok(directFilterAt >= 0 && directFilterAt < earlyRejectAt && earlyRejectAt < identityResolveAt,
   'exact event filters must reject before identity/display metadata resolution');
-assert.match(aggregationSource, /const pinnedEvent = pinnedEventId \? this\.judge\.findEvent\(pinnedEventId\) : undefined;/u);
+assert.match(aggregationSource, /const pinnedPage = pinnedEventId/u);
+assert.match(
+  aggregationSource,
+  /const pinned = pinnedPage\?\.events\[0\] \?\? \(pinnedEventId \? this\.judge\.findEvent\(pinnedEventId\) : undefined\);/u,
+);
 assert.match(aggregationSource, /if \(!pinnedEdgeId && !isPinnedEvent && !matchesDirectScope\) continue;/u);
 
 const judgeSource = await readFile(new URL('../apps/api/src/security-monitoring/sentry-judge.service.ts', import.meta.url), 'utf8');

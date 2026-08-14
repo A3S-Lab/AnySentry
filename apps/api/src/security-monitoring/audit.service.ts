@@ -92,8 +92,10 @@ function sanitizeDetails(details?: Record<string, unknown>): Record<string, unkn
 export class AuditService implements OnModuleInit, OnModuleDestroy {
   private readonly ch = new ClickHouseStore();
   private readonly records = new Map<string, AuditRecord>();
+  private readonly pendingFacts = new Map<string, AuditRecord>();
   private persistTimer?: NodeJS.Timeout;
   private initialized = false;
+  private closing = false;
   private sequence = 0;
 
   async onModuleInit(): Promise<void> {
@@ -104,6 +106,7 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.closing = true;
     if (this.persistTimer) clearTimeout(this.persistTimer);
     await this.persist();
     await this.ch.close();
@@ -126,6 +129,7 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
       details: sanitizeDetails(input.details),
     };
     this.records.set(record.auditId, record);
+    this.pendingFacts.set(record.auditId, record);
     this.trim();
     this.persistSoon();
     return this.item(record);
@@ -215,7 +219,17 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async persist(): Promise<void> {
-    const records = [...this.records.values()].sort((a, b) => b.at - a.at).slice(0, RETAIN_LIMIT);
-    await this.ch.saveAuditLog(records);
+    const facts = [...this.pendingFacts.values()];
+    const saved = await this.ch.appendAuditFacts(facts);
+    if (saved) {
+      for (const fact of facts) {
+        if (this.pendingFacts.get(fact.auditId) === fact) this.pendingFacts.delete(fact.auditId);
+      }
+    } else if (facts.length > 0 && !this.closing && !this.persistTimer) {
+      this.persistTimer = setTimeout(() => {
+        this.persistTimer = undefined;
+        void this.persist();
+      }, 5_000);
+    }
   }
 }
