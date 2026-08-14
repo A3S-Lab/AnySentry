@@ -3,10 +3,12 @@
 /**
  * Destructive-by-opt-in real Agent lifecycle E2E.
  *
- * Default invocation is a non-mutating application dry run. The --execute flag is required before this script
- * creates any persistent process, container, Pod, Secret, temporary workspace, or evidence
- * directory. A Kubernetes preflight may use a temporary port-forward and access reviews, which
- * can appear in API-server audit logs but do not alter application resources. All
+ * Default invocation is a non-mutating application dry run. A preflight may create and remove a
+ * private temporary directory to prove that the local Codex workspace sandbox is usable. The
+ * --execute flag is required before this script creates any persistent process, container, Pod,
+ * Secret, run workspace, or evidence directory. A Kubernetes preflight may use a temporary
+ * port-forward and access reviews, which can appear in API-server audit logs but do not alter
+ * application resources. All
  * orchestrated compute resources include a unique run ID and cleanup refuses to delete a resource
  * whose ownership label does not match that run ID. As with every real collector test, ingested
  * events, auto-discovered Source records, heartbeats, and bounded runtime records remain in the
@@ -46,6 +48,12 @@ const DEFAULT_AGENT_IMAGE = '127.0.0.1:5000/anysentry-agent-runtime-lab:0.1.0';
 const ALLOWED_PHASES = new Set(['shadow', 'enforce']);
 const ALLOWED_AGENTS = new Set(['host-codex', 'host-kimi', 'docker-pi', 'k8s-pi']);
 const CAPTURE_LIMIT = 2 * 1024 * 1024;
+const DIAGNOSTIC_TEXT_LIMIT = 16 * 1024;
+const DIAGNOSTIC_JSON_LIMIT = 32 * 1024;
+const DIAGNOSTIC_JSON_LINE_LIMIT = 4 * 1024;
+const DIAGNOSTIC_JSON_MAX_LINES = 24;
+const DIAGNOSTIC_FILE_HASH_LIMIT = 256 * 1024;
+const LOCAL_PROOF_FILE_LIMIT = 1024 * 1024;
 const POLL_MS = 500;
 const FILTER_CANARY_WAIT_SECONDS = 120;
 const FILTER_CANARY_MAX_RUNTIME_SECONDS = 180;
@@ -90,6 +98,7 @@ function usage() {
     '  --phases shadow,enforce            Phases to run (default: shadow)',
     '  --allow-enforce                   Permit enforce only after this run passes shadow',
     '  --allow-host-agents               Explicitly opt in to local Codex/Kimi tool execution',
+    '  --allow-host-full-access          Explicitly run host Codex with danger-full-access',
     '  --agents LIST                     host-codex,host-kimi,docker-pi,k8s-pi',
     '  --require-host                    Fail instead of skipping an absent host API',
     '  --docker-api-base URL             Docker API security-center base',
@@ -126,6 +135,7 @@ function parseOptions(argv) {
     phases: ['shadow'],
     allowEnforce: false,
     allowHostAgents: false,
+    allowHostFullAccess: false,
     agents: ['docker-pi', 'k8s-pi'],
     requireHost: false,
     dockerApiBase: DEFAULT_DOCKER_API,
@@ -148,6 +158,7 @@ function parseOptions(argv) {
     else if (arg === '--self-test') options.selfTest = true;
     else if (arg === '--allow-enforce') options.allowEnforce = true;
     else if (arg === '--allow-host-agents') options.allowHostAgents = true;
+    else if (arg === '--allow-host-full-access') options.allowHostFullAccess = true;
     else if (arg === '--require-host') options.requireHost = true;
     else if (arg === '--help' || arg === '-h') options.help = true;
     else if (arg === '--run-id') options.runId = valueAfter(argv, index++, arg);
@@ -186,6 +197,12 @@ function parseOptions(argv) {
   if (!options.agents.length || options.agents.some((agent) => !ALLOWED_AGENTS.has(agent))) {
     throw new Error('--agents contains an unsupported Agent kind');
   }
+  if (options.allowHostFullAccess && !options.allowHostAgents) {
+    throw new Error('--allow-host-full-access also requires the explicit --allow-host-agents safety gate');
+  }
+  if (options.allowHostFullAccess && !options.agents.includes('host-codex')) {
+    throw new Error('--allow-host-full-access is valid only when --agents includes host-codex');
+  }
   if (options.execute && options.agents.some((agent) => agent.startsWith('host-')) && !options.allowHostAgents) {
     throw new Error('host Agent execution requires the explicit --allow-host-agents safety gate');
   }
@@ -208,6 +225,10 @@ function parseOptions(argv) {
   options.artifactDir = options.artifactDir ||
     path.join(repoRoot, 'artifacts', 'real-agent-lifecycle-e2e', options.runId);
   return options;
+}
+
+function hostCodexSandboxMode(options) {
+  return options.allowHostFullAccess ? 'danger-full-access' : 'workspace-write';
 }
 
 function normalizeApiBase(value) {
@@ -247,10 +268,13 @@ function marker(options, environment, phase, agent) {
 
 function redact(value) {
   return String(value ?? '')
+    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '<redacted-private-key>')
+    .replace(/\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,}\b/g, '<redacted-jwt>')
     .replace(/sk-[A-Za-z0-9_-]{8,}/g, 'sk-<redacted>')
     .replace(/(authorization\s*:\s*bearer\s+)[^\s,;]+/gi, '$1<redacted>')
-    .replace(/((?:api[_-]?key|token|secret|password|credential)\s*[=:]\s*)[^\s,;]+/gi, '$1<redacted>')
-    .replace(/("(?:api[_-]?key|token|secret|password|credential)"\s*:\s*")[^"]*(")/gi, '$1<redacted>$2');
+    .replace(/((?:set-)?cookie\s*:\s*)[^\r\n]+/gi, '$1<redacted>')
+    .replace(/((?:api[_-]?key|token|secret|password|credentials?)\s*[=:]\s*)[^\s,;]+/gi, '$1<redacted>')
+    .replace(/("(?:api[_-]?key|token|secret|password|credentials?|authorization|proxy-authorization|cookie|set-cookie)"\s*:\s*")[^"]*(")/gi, '$1<redacted>$2');
 }
 
 function sanitized(value) {
@@ -259,12 +283,92 @@ function sanitized(value) {
   if (value && typeof value === 'object') {
     return Object.fromEntries(Object.entries(value).map(([key, nested]) => [
       key,
-      /(?:key|token|secret|password)/i.test(key) && typeof nested === 'string'
+      /(?:key|token|secret|password|credential|authorization|cookie)/i.test(key)
         ? '<redacted>'
         : sanitized(nested),
     ]));
   }
   return value;
+}
+
+function diagnosticSanitized(value, depth = 0) {
+  if (depth >= 32) return '<redacted-max-depth>';
+  if (typeof value === 'string') return redact(value);
+  if (Array.isArray(value)) {
+    const items = value.slice(0, 256).map((nested) => diagnosticSanitized(nested, depth + 1));
+    if (value.length > items.length) items.push('<truncated-items>');
+    return items;
+  }
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value).slice(0, 256).map(([key, nested]) => [
+      key,
+      /(?:key|token|secret|password|credential|authorization|cookie)/i.test(key)
+        ? '<redacted>'
+        : diagnosticSanitized(nested, depth + 1),
+    ]);
+    if (Object.keys(value).length > entries.length) entries.push(['<truncated>', true]);
+    return Object.fromEntries(entries);
+  }
+  return value;
+}
+
+function redactStructuredText(value) {
+  return String(value ?? '').split(/(\r?\n)/u).map((part) => {
+    if (/^\r?\n$/u.test(part) || !part.trim()) return part;
+    try {
+      return JSON.stringify(diagnosticSanitized(JSON.parse(part)));
+    } catch {
+      return redact(part);
+    }
+  }).join('');
+}
+
+function boundedRedactedText(value, limit = DIAGNOSTIC_TEXT_LIMIT) {
+  assert.ok(Number.isInteger(limit) && limit > 0, 'diagnostic text limit must be positive');
+  const source = String(value ?? '');
+  const safe = redactStructuredText(source);
+  const bytes = Buffer.from(safe, 'utf8');
+  let start = Math.max(0, bytes.length - limit);
+  while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start += 1;
+  const tail = bytes.subarray(start).toString('utf8');
+  return {
+    capturedBytes: Buffer.byteLength(source),
+    sha256: hashText(safe),
+    truncated: start > 0,
+    tail,
+  };
+}
+
+function boundedCodexJsonLines(value) {
+  const source = String(value ?? '');
+  const lines = source.split(/\r?\n/u).filter((line) => line.trim());
+  const kept = [];
+  let remaining = DIAGNOSTIC_JSON_LIMIT;
+  let parseableTailLines = 0;
+  for (let index = lines.length - 1; index >= 0 && kept.length < DIAGNOSTIC_JSON_MAX_LINES && remaining > 0; index -= 1) {
+    let parsed;
+    try {
+      parsed = JSON.parse(lines[index]);
+    } catch {
+      continue;
+    }
+    parseableTailLines += 1;
+    const serialized = JSON.stringify(diagnosticSanitized(parsed));
+    const bounded = boundedRedactedText(serialized, Math.min(DIAGNOSTIC_JSON_LINE_LIMIT, remaining));
+    const bytes = Buffer.byteLength(bounded.tail);
+    if (bytes === 0) continue;
+    kept.push({ truncated: bounded.truncated, json: bounded.tail });
+    remaining -= bytes;
+  }
+  kept.reverse();
+  return {
+    format: 'codex-jsonl',
+    observedLines: lines.length,
+    returnedLines: kept.length,
+    parseableTailLines,
+    truncated: kept.length < lines.length || kept.some((line) => line.truncated),
+    lines: kept,
+  };
 }
 
 function appendBounded(current, chunk) {
@@ -340,7 +444,11 @@ function spawnCaptured(command, args, options = {}) {
   child.stdout.on('data', (chunk) => { record.stdout = appendBounded(record.stdout, chunk); });
   child.stderr.on('data', (chunk) => { record.stderr = appendBounded(record.stderr, chunk); });
   record.done = new Promise((resolve, reject) => {
-    child.once('error', reject);
+    child.once('error', (error) => {
+      record.finished = true;
+      ledger.children.delete(record);
+      reject(error);
+    });
     child.once('close', (code, signal) => {
       record.finished = true;
       ledger.children.delete(record);
@@ -360,21 +468,29 @@ async function terminateProcess(record, signal = 'SIGTERM') {
   if (!record || record.finished || !record.child.pid) return;
   try {
     if (record.detached) process.kill(-record.child.pid, signal);
-    else record.child.kill(signal);
-  } catch {}
+    record.child.kill(signal);
+  } catch {
+    try { record.child.kill(signal); } catch {}
+  }
+  let stopTimer;
   const stopped = await Promise.race([
     record.done.then(() => true, () => true),
-    delay(3_000).then(() => false),
+    new Promise((resolve) => { stopTimer = setTimeout(() => resolve(false), 3_000); }),
   ]);
+  clearTimeout(stopTimer);
   if (stopped) return;
   try {
     if (record.detached) process.kill(-record.child.pid, 'SIGKILL');
-    else record.child.kill('SIGKILL');
-  } catch {}
+    record.child.kill('SIGKILL');
+  } catch {
+    try { record.child.kill('SIGKILL'); } catch {}
+  }
+  let killTimer;
   const killed = await Promise.race([
     record.done.then(() => true, () => true),
-    delay(2_000).then(() => false),
+    new Promise((resolve) => { killTimer = setTimeout(() => resolve(false), 2_000); }),
   ]);
+  clearTimeout(killTimer);
   if (!killed) throw new Error('child process did not terminate: ' + record.command);
 }
 
@@ -556,6 +672,9 @@ const ledger = {
   cleanupPromise: undefined,
   tempRootIdentity: undefined,
   tempCredential: undefined,
+  transientDirectories: new Map(),
+  artifactRoot: '',
+  artifactRootIdentity: undefined,
 };
 
 function trackMutation(operation) {
@@ -604,6 +723,146 @@ async function localPathState(target) {
     if (error?.code === 'ENOENT') return { exists: false };
     throw error;
   }
+}
+
+async function diagnosticFileState(workspace, name, includeHash = false) {
+  assert.equal(path.basename(name), name, 'diagnostic file name must be a basename');
+  const target = path.join(workspace, name);
+  let stat;
+  try {
+    stat = await fs.lstat(target);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { exists: false };
+    return { exists: false, error: redact(error?.code || error?.message || error) };
+  }
+  const state = {
+    exists: true,
+    bytes: stat.size,
+    mode: (stat.mode & 0o777).toString(8),
+    regularFile: stat.isFile() && !stat.isSymbolicLink(),
+    symbolicLink: stat.isSymbolicLink(),
+  };
+  if (!includeHash || !state.regularFile) return state;
+  if (stat.size > DIAGNOSTIC_FILE_HASH_LIMIT) {
+    return { ...state, hashSkipped: 'file_exceeds_' + DIAGNOSTIC_FILE_HASH_LIMIT + '_bytes' };
+  }
+  let handle;
+  try {
+    handle = await fs.open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const opened = await handle.stat();
+    if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.size !== stat.size ||
+        opened.mtimeMs !== stat.mtimeMs || opened.ctimeMs !== stat.ctimeMs || !opened.isFile()) {
+      return { ...state, hashSkipped: 'file_identity_changed' };
+    }
+    const content = await handle.readFile();
+    const after = await handle.stat();
+    if (after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size ||
+        after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs || content.length !== opened.size) {
+      return { ...state, hashSkipped: 'file_changed_while_reading' };
+    }
+    return { ...state, sha256: createHash('sha256').update(content).digest('hex') };
+  } catch (error) {
+    return { ...state, hashSkipped: redact(error?.code || error?.message || error) };
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
+}
+
+async function createTrackedTransientDirectory(prefix) {
+  return await trackMutation(async () => {
+    const workspace = await fs.mkdtemp(prefix);
+    const resolved = path.resolve(workspace);
+    const state = await localPathState(resolved);
+    if (!state.exists || !state.identity.directory) {
+      throw new Error('transient directory was not created as a real directory');
+    }
+    ledger.transientDirectories.set(resolved, state.identity);
+    return resolved;
+  });
+}
+
+async function removeTrackedTransientDirectory(target, allowAlreadyAbsent = false) {
+  const resolved = path.resolve(target);
+  const requiredPrefix = path.join(os.tmpdir(), 'anysentry-codex-sandbox-probe-');
+  if (!resolved.startsWith(requiredPrefix)) {
+    throw new Error('refused to remove unexpected sandbox probe path: ' + resolved);
+  }
+  const expected = ledger.transientDirectories.get(resolved);
+  if (!expected) {
+    if (allowAlreadyAbsent) return;
+    throw new Error('sandbox probe directory is not tracked: ' + resolved);
+  }
+  const state = await localPathState(resolved);
+  if (!state.exists) {
+    if (!allowAlreadyAbsent) throw new Error('sandbox probe directory disappeared before cleanup');
+    ledger.transientDirectories.delete(resolved);
+    return;
+  }
+  if (!state.identity.directory || !sameLocalPathIdentity(state.identity, expected)) {
+    throw new Error('refused to remove sandbox probe directory after its identity changed');
+  }
+  await fs.rm(resolved, { recursive: true });
+  if ((await localPathState(resolved)).exists) {
+    throw new Error('sandbox probe directory remained after cleanup');
+  }
+  ledger.transientDirectories.delete(resolved);
+}
+
+async function probeHostCodexWorkspaceSandbox() {
+  const prefix = path.join(os.tmpdir(), 'anysentry-codex-sandbox-probe-');
+  let workspace;
+  let outcome;
+  try {
+    workspace = await createTrackedTransientDirectory(prefix);
+    if (ledger.cleaning || ledger.aborting) throw new Error('sandbox probe interrupted before launch');
+    const record = spawnCaptured(
+      'codex',
+      ['sandbox', '--permission-profile', ':workspace', '-C', workspace, '--', '/bin/true'],
+      { env: hostAgentEnvironment(), inheritEnv: false },
+    );
+    let timedOut = false;
+    let probeTimer;
+    let result;
+    try {
+      result = await Promise.race([
+        record.done,
+        new Promise((resolve) => { probeTimer = setTimeout(() => resolve(undefined), 15_000); }),
+      ]);
+    } finally {
+      clearTimeout(probeTimer);
+    }
+    if (!result) {
+      timedOut = true;
+      await terminateProcess(record);
+      result = await record.done;
+    }
+    outcome = {
+      code: timedOut ? null : result.code,
+      signal: result.signal,
+      durationMs: result.durationMs,
+      stdout: boundedRedactedText(result.stdout, 1_024),
+      stderr: boundedRedactedText(result.stderr, 1_024),
+      ...(timedOut ? { error: boundedRedactedText('sandbox probe timed out after 15000ms', 1_024) } : {}),
+    };
+  } catch (error) {
+    outcome = {
+      code: null,
+      error: boundedRedactedText(error?.message || error, 1_024),
+    };
+  }
+  if (workspace && !ledger.cleaning) {
+    try {
+      await trackMutation(() => removeTrackedTransientDirectory(workspace, true));
+    } catch (error) {
+      if (ledger.cleaning) return outcome;
+      return {
+        ...outcome,
+        code: null,
+        cleanupError: boundedRedactedText(error?.message || error, 1_024),
+      };
+    }
+  }
+  return outcome;
 }
 
 function dockerInspectSaysMissing(result) {
@@ -793,6 +1052,13 @@ async function cleanup() {
     for (const record of [...ledger.children]) {
       try { await terminateProcess(record); } catch (error) { errors.push(redact(error.message)); }
     }
+    for (const directory of [...ledger.transientDirectories.keys()]) {
+      try {
+        await removeTrackedTransientDirectory(directory, true);
+      } catch (error) {
+        errors.push('sandbox probe directory ' + directory + ': ' + redact(error.message));
+      }
+    }
     for (const [namespace, resources] of [...ledger.k8sPods]) {
       for (const name of [...resources.keys()]) {
         try {
@@ -976,6 +1242,40 @@ async function preflight(options, apiState = {}) {
         login.code === 0 && /logged in/i.test(login.stdout + login.stderr) ? 'pass' : 'block',
         login.code === 0 ? 'login status command completed' : 'login status command failed',
       );
+      const sandboxMode = hostCodexSandboxMode(options);
+      if (options.allowHostFullAccess) {
+        apiState.hostCodexSandbox = {
+          mode: sandboxMode,
+          fullAccessAuthorized: true,
+          workspaceProbe: 'skipped_by_explicit_full_access_authorization',
+        };
+        check(
+          checks,
+          'Host Codex sandbox',
+          'warn',
+          'danger-full-access was explicitly authorized; the workspace sandbox probe was skipped',
+        );
+      } else {
+        const probe = await probeHostCodexWorkspaceSandbox();
+        const passed = probe.code === 0;
+        apiState.hostCodexSandbox = {
+          mode: sandboxMode,
+          fullAccessAuthorized: false,
+          workspaceProbe: passed ? 'passed' : 'failed',
+          exitCode: probe.code,
+          signal: probe.signal,
+        };
+        const failureTail = probe.stderr?.tail || probe.stdout?.tail || probe.error?.tail || probe.cleanupError?.tail || '';
+        check(
+          checks,
+          'Host Codex workspace sandbox',
+          passed ? 'pass' : 'block',
+          passed
+            ? 'codex sandbox --permission-profile :workspace executed /bin/true successfully'
+            : 'workspace sandbox failed; inspect AppArmor/bwrap unprivileged user-namespace policy before retrying' +
+              (failureTail ? ': ' + failureTail : ''),
+        );
+      }
     }
   }
   if (options.agents.includes('host-kimi') && (hostApiReady || options.requireHost)) {
@@ -1216,6 +1516,11 @@ function executionPlan(options) {
     phases: options.phases,
     enforceGate: options.allowEnforce,
     agents: options.agents,
+    hostAgentAuthorization: {
+      enabled: options.allowHostAgents,
+      codexFullAccess: options.allowHostFullAccess,
+      codexSandboxMode: hostCodexSandboxMode(options),
+    },
     apiPlanes: {
       host: {
         baseUrl: options.hostApiBase,
@@ -1231,6 +1536,7 @@ function executionPlan(options) {
     resources: plannedResources(options),
     safety: {
       credentialInput: 'caller-owned file only',
+      hostCodexFullAccessRequiresExplicitFlag: true,
       preExistingResourcesAdopted: false,
       cleanupOwnershipLabelRequired: true,
       deploymentManifestsOrExistingResourcesModified: false,
@@ -1255,9 +1561,37 @@ function executionPlan(options) {
 }
 
 async function writeJsonEvidence(directory, name, value) {
-  const file = path.join(directory, name);
+  assert.equal(path.basename(name), name, 'evidence file name must be a basename');
+  const resolvedDirectory = path.resolve(directory);
+  if (!ledger.artifactRoot || resolvedDirectory !== ledger.artifactRoot) {
+    throw new Error('refused to write evidence outside the tracked artifact directory');
+  }
+  const directoryState = await localPathState(resolvedDirectory);
+  if (!directoryState.exists || !directoryState.identity.directory ||
+      !sameLocalPathIdentity(directoryState.identity, ledger.artifactRootIdentity)) {
+    throw new Error('refused to write evidence after artifact directory identity changed');
+  }
+  const file = path.join(resolvedDirectory, name);
   const content = JSON.stringify(sanitized(value), null, 2) + '\n';
-  await fs.writeFile(file, content, { mode: 0o600 });
+  const handle = await fs.open(
+    file,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+    0o600,
+  );
+  let opened;
+  try {
+    await handle.writeFile(content, 'utf8');
+    await handle.sync();
+    opened = await handle.stat();
+  } finally {
+    await handle.close();
+  }
+  const written = await fs.lstat(file);
+  if (!written.isFile() || written.isSymbolicLink() || written.size !== Buffer.byteLength(content) ||
+      written.dev !== opened.dev || written.ino !== opened.ino || written.size !== opened.size ||
+      (written.mode & 0o777) !== 0o600) {
+    throw new Error('evidence file integrity check failed after write: ' + name);
+  }
   return { file, bytes: Buffer.byteLength(content), sha256: hashText(content) };
 }
 
@@ -2168,23 +2502,125 @@ async function waitForFilterCanaryProcess(runRecord) {
   }, 30_000, 250);
 }
 
-async function readLocalToolProof(workspace, markerValue) {
-  return await eventually('host tool result marker ' + markerValue, async () => {
-    try {
-      const [toolText, modelText] = await Promise.all([
-        fs.readFile(path.join(workspace, 'tool-events.log'), 'utf8'),
-        fs.readFile(path.join(workspace, 'model-result.txt'), 'utf8'),
-      ]);
-      if (!toolText.includes(markerValue) || !modelText.trim()) return undefined;
-      return {
-        markerPresent: true,
-        toolEvents: { bytes: Buffer.byteLength(toolText), sha256: hashText(toolText) },
-        modelResult: { bytes: Buffer.byteLength(modelText), sha256: hashText(modelText) },
-      };
-    } catch {
-      return undefined;
+async function readLocalProofTextFile(workspace, name) {
+  assert.equal(path.basename(name), name, 'proof file name must be a basename');
+  const target = path.join(workspace, name);
+  let expected;
+  let handle;
+  try {
+    expected = await fs.lstat(target);
+    if (!expected.isFile() || expected.isSymbolicLink()) {
+      return { exists: true, status: 'unsafe_file_type', bytes: expected.size };
     }
-  }, 20_000, 250);
+    if (expected.size > LOCAL_PROOF_FILE_LIMIT) {
+      return { exists: true, status: 'too_large', bytes: expected.size };
+    }
+    handle = await fs.open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const opened = await handle.stat();
+    if (opened.dev !== expected.dev || opened.ino !== expected.ino || opened.size !== expected.size ||
+        opened.mtimeMs !== expected.mtimeMs || opened.ctimeMs !== expected.ctimeMs || !opened.isFile()) {
+      return { exists: true, status: 'identity_changed', bytes: opened.size };
+    }
+    const content = Buffer.alloc(opened.size);
+    let offset = 0;
+    while (offset < content.length) {
+      const result = await handle.read(content, offset, content.length - offset, offset);
+      if (result.bytesRead === 0) break;
+      offset += result.bytesRead;
+    }
+    const after = await handle.stat();
+    if (offset !== content.length || after.dev !== opened.dev || after.ino !== opened.ino ||
+        after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs) {
+      return { exists: true, status: 'changed_while_reading', bytes: after.size };
+    }
+    return { exists: true, status: 'ok', bytes: content.length, text: content.toString('utf8') };
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { exists: false, status: 'missing', bytes: 0 };
+    return {
+      exists: Boolean(expected),
+      status: 'unreadable',
+      bytes: expected?.size ?? 0,
+      error: redact(error?.code || error?.message || error),
+    };
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
+}
+
+function localToolProofIssues(toolFile, modelFile, markerValue) {
+  const issues = [];
+  if (toolFile.status === 'missing') issues.push('tool-events.log:missing');
+  else if (toolFile.status !== 'ok') issues.push('tool-events.log:' + toolFile.status);
+  else if (!toolFile.text.trim()) issues.push('tool-events.log:empty');
+  else if (!toolFile.text.includes(markerValue)) issues.push('tool-events.log:marker_missing');
+
+  if (modelFile.status === 'missing') issues.push('model-result.txt:missing');
+  else if (modelFile.status !== 'ok') issues.push('model-result.txt:' + modelFile.status);
+  else if (!modelFile.text.trim()) issues.push('model-result.txt:empty');
+  return issues;
+}
+
+function proofFileSummary(file) {
+  return {
+    exists: file.exists,
+    status: file.status,
+    bytes: file.bytes,
+    ...(file.error ? { error: file.error } : {}),
+  };
+}
+
+async function localToolProofState(workspace, markerValue, workspaceIdentity) {
+  if (workspaceIdentity) {
+    const workspaceState = await localPathState(workspace);
+    const workspaceTrusted = workspaceState.exists && workspaceState.identity.directory &&
+      sameLocalPathIdentity(workspaceState.identity, workspaceIdentity);
+    if (!workspaceTrusted) {
+      const status = workspaceState.exists ? 'workspace_identity_changed' : 'workspace_missing';
+      return {
+        ready: false,
+        issues: ['workspace:' + status],
+        files: {
+          toolEvents: { exists: false, status: 'inspection_skipped', bytes: 0 },
+          modelResult: { exists: false, status: 'inspection_skipped', bytes: 0 },
+        },
+      };
+    }
+  }
+  const [toolFile, modelFile] = await Promise.all([
+    readLocalProofTextFile(workspace, 'tool-events.log'),
+    readLocalProofTextFile(workspace, 'model-result.txt'),
+  ]);
+  const issues = localToolProofIssues(toolFile, modelFile, markerValue);
+  return {
+    ready: issues.length === 0,
+    issues,
+    files: {
+      toolEvents: proofFileSummary(toolFile),
+      modelResult: proofFileSummary(modelFile),
+    },
+    proof: issues.length === 0 ? {
+      markerPresent: true,
+      toolEvents: { bytes: toolFile.bytes, sha256: hashText(toolFile.text) },
+      modelResult: { bytes: modelFile.bytes, sha256: hashText(modelFile.text) },
+    } : undefined,
+  };
+}
+
+async function readLocalToolProof(workspace, markerValue, runRecord) {
+  let lastState;
+  try {
+    return await eventually('host tool result marker ' + markerValue, async () => {
+      lastState = await localToolProofState(workspace, markerValue, runRecord?.workspaceIdentity);
+      if (runRecord) runRecord.lastProofState = lastState;
+      return lastState.ready ? lastState.proof : undefined;
+    }, 20_000, 250);
+  } catch (error) {
+    if (ledger.aborting) throw error;
+    const issues = lastState?.issues?.length ? lastState.issues.join(', ') : 'state_unavailable';
+    const proofError = new Error('host tool proof failed: ' + issues);
+    proofError.proofState = lastState;
+    throw proofError;
+  }
 }
 
 function hostPrompt(workspace) {
@@ -2229,18 +2665,50 @@ function hostAgentEnvironment() {
   ));
 }
 
+function hostCodexArgs(options, workspace, prompt) {
+  assert.ok(path.isAbsolute(workspace), 'host Codex workspace must be absolute');
+  if (options.allowHostFullAccess) {
+    assert.equal(options.allowHostAgents, true, 'danger-full-access requires host Agent authorization');
+    assert.ok(options.agents.includes('host-codex'), 'danger-full-access requires host-codex selection');
+  }
+  return [
+    'exec', '--ephemeral', '--skip-git-repo-check',
+    '--sandbox', hostCodexSandboxMode(options),
+    '--ignore-user-config', '--ignore-rules',
+    '--color', 'never', '--json',
+    '-C', workspace, '-o', path.join(workspace, 'final-output.txt'), prompt,
+  ];
+}
+
+function assertHostCodexLaunchAuthorization(options, args) {
+  const sandboxIndex = args.indexOf('--sandbox');
+  assert.notEqual(sandboxIndex, -1, 'host Codex launch must specify a sandbox mode');
+  const actualMode = args[sandboxIndex + 1];
+  const expectedMode = options.allowHostFullAccess ? 'danger-full-access' : 'workspace-write';
+  assert.equal(actualMode, expectedMode, 'host Codex launch sandbox mode does not match authorization');
+  assert.equal(
+    args.includes('--dangerously-bypass-approvals-and-sandbox'),
+    false,
+    'host Codex launch must never bypass the sandbox authorization gate',
+  );
+  if (actualMode === 'danger-full-access') {
+    assert.equal(options.allowHostFullAccess, true, 'danger-full-access was not explicitly authorized');
+    assert.equal(options.allowHostAgents, true, 'danger-full-access requires host Agent authorization');
+    assert.ok(options.agents.includes('host-codex'), 'danger-full-access requires host-codex selection');
+  }
+  return actualMode;
+}
+
 async function launchHostAgent(options, phase, agent, markerValue) {
   const workspace = await prepareHostWorkspace(options, phase, agent, markerValue);
+  const workspaceIdentity = localPathIdentity(await fs.lstat(workspace));
   const prompt = hostPrompt(workspace);
   let command;
   let args;
   if (agent === 'host-codex') {
     command = 'codex';
-    args = [
-      'exec', '--ephemeral', '--skip-git-repo-check', '--sandbox', 'workspace-write',
-      '--ignore-user-config', '--ignore-rules',
-      '--color', 'never', '-C', workspace, '-o', path.join(workspace, 'final-output.txt'), prompt,
-    ];
+    args = hostCodexArgs(options, workspace, prompt);
+    assertHostCodexLaunchAuthorization(options, args);
   } else if (agent === 'host-kimi') {
     command = 'kimi';
     args = [
@@ -2258,7 +2726,37 @@ async function launchHostAgent(options, phase, agent, markerValue) {
     env: hostAgentEnvironment(),
     inheritEnv: false,
   });
-  return { record, workspace, marker: markerValue, agent };
+  return {
+    record,
+    workspace,
+    workspaceIdentity,
+    marker: markerValue,
+    agent,
+    phase,
+    sandboxMode: agent === 'host-codex' ? hostCodexSandboxMode(options) : undefined,
+    fullAccessAuthorized: agent === 'host-codex' ? options.allowHostFullAccess : false,
+  };
+}
+
+async function quiesceHostAgentForDiagnostic(runRecord) {
+  if (!runRecord.record.finished) {
+    try {
+      await terminateProcess(runRecord.record);
+    } catch (error) {
+      if (!runRecord.record.finished) throw error;
+    }
+  }
+  if (!runRecord.record.finished) {
+    throw new Error('refused to capture host Agent evidence while its process is still running');
+  }
+  if (!runRecord.result) {
+    try {
+      runRecord.result = await runRecord.record.done;
+    } catch (error) {
+      runRecord.resultCaptureError = boundedRedactedText(error?.message || error, 2_048);
+    }
+  }
+  return runRecord.result;
 }
 
 async function finishHostAgent(runRecord) {
@@ -2273,12 +2771,16 @@ async function finishHostAgent(runRecord) {
     ]);
   } catch (error) {
     await terminateProcess(runRecord.record);
+    if (runRecord.record.finished) {
+      try { runRecord.result = await runRecord.record.done; } catch {}
+    }
     throw error;
   } finally {
     clearTimeout(timer);
   }
+  runRecord.result = result;
   assert.equal(result.code, 0, runRecord.agent + ' exited unsuccessfully; stderr hash=' + hashText(result.stderr));
-  const proof = await readLocalToolProof(runRecord.workspace, runRecord.marker);
+  const proof = await readLocalToolProof(runRecord.workspace, runRecord.marker, runRecord);
   return {
     realLlm: true,
     toolResult: proof,
@@ -2289,6 +2791,77 @@ async function finishHostAgent(runRecord) {
       stderr: { bytes: Buffer.byteLength(result.stderr), sha256: hashText(result.stderr) },
     },
   };
+}
+
+async function hostAgentFailureDiagnostic(runRecord, failure) {
+  assert.equal(
+    runRecord.record.finished,
+    true,
+    'refused to inspect host Agent failure files while its process is still running',
+  );
+  let result = runRecord.result;
+  if (!result && runRecord.record.finished) {
+    try { result = await runRecord.record.done; } catch {}
+  }
+  const stdout = result?.stdout ?? runRecord.record.stdout ?? '';
+  const stderr = result?.stderr ?? runRecord.record.stderr ?? '';
+  const workspaceState = await localPathState(runRecord.workspace);
+  const workspaceTrusted = workspaceState.exists && workspaceState.identity.directory &&
+    sameLocalPathIdentity(workspaceState.identity, runRecord.workspaceIdentity);
+  const skippedFileState = {
+    exists: false,
+    inspectionSkipped: workspaceState.exists ? 'workspace_identity_changed' : 'workspace_missing',
+  };
+  const [finalOutput, toolEvents, modelResult] = workspaceTrusted
+    ? await Promise.all([
+      diagnosticFileState(runRecord.workspace, 'final-output.txt', true),
+      diagnosticFileState(runRecord.workspace, 'tool-events.log'),
+      diagnosticFileState(runRecord.workspace, 'model-result.txt'),
+    ])
+    : [skippedFileState, skippedFileState, skippedFileState];
+  return {
+    schema: 'anysentry.real_agent_lifecycle_e2e.host_failure.v1',
+    capturedAt: new Date().toISOString(),
+    agent: runRecord.agent,
+    phase: runRecord.phase,
+    workspace: redact(runRecord.workspace),
+    workspaceTrusted,
+    accessPolicy: {
+      fullAccessAuthorized: runRecord.fullAccessAuthorized === true,
+      sandboxMode: runRecord.sandboxMode,
+    },
+    failure: {
+      name: failure instanceof Error ? failure.name : 'Error',
+      message: boundedRedactedText(failure instanceof Error ? failure.message : String(failure), 2_048),
+    },
+    process: {
+      pid: runRecord.record.child.pid,
+      finished: runRecord.record.finished,
+      exitCode: result?.code ?? null,
+      signal: result?.signal ?? null,
+      durationMs: result?.durationMs ?? Math.max(0, Date.now() - runRecord.record.startedAt),
+      stdout: boundedRedactedText(stdout),
+      stderr: boundedRedactedText(stderr),
+      codexJson: runRecord.agent === 'host-codex' ? boundedCodexJsonLines(stdout) : undefined,
+      ...(runRecord.diagnosticTerminationError
+        ? { terminationError: runRecord.diagnosticTerminationError }
+        : {}),
+      ...(runRecord.resultCaptureError
+        ? { resultCaptureError: runRecord.resultCaptureError }
+        : {}),
+    },
+    proof: {
+      issues: runRecord.lastProofState?.issues ?? failure?.proofState?.issues ?? [],
+      files: { finalOutput, toolEvents, modelResult },
+    },
+  };
+}
+
+async function persistHostAgentFailureDiagnostic(options, runRecord, failure) {
+  const diagnostic = await hostAgentFailureDiagnostic(runRecord, failure);
+  const name = 'host-agent-' + runRecord.phase + '-' + runRecord.agent + '-failure.json';
+  const evidence = await writeJsonEvidence(options.artifactDir, name, diagnostic);
+  return { file: path.basename(evidence.file), bytes: evidence.bytes, sha256: evidence.sha256 };
 }
 
 async function startDockerPi(options, phase, markerValue) {
@@ -2696,27 +3269,47 @@ async function executeHostAgentScenario(context, phase, agent) {
   const markerValue = marker(context.options, environment, phase, agent);
   const baseline = await queryRuntime(apiBase, { collectorId: id });
   const baselineIds = new Set(baseline.items.map((item) => item.agentInstanceId));
-  const runRecord = await launchHostAgent(context.options, phase, agent, markerValue);
-  const running = await waitForNewRunningInstance(
-    apiBase,
-    id,
-    baselineIds,
-    expectedScopeForAgent(agent),
-  );
-  const proof = await finishHostAgent(runRecord);
-  const event = await waitForMarkerEvent(apiBase, id, markerValue, running.agentInstanceId);
-  const terminal = await waitForTerminalInstance(apiBase, id, running.agentInstanceId);
-  validateLifecycleIdentity(running, terminal, environment);
-  const isolation = await assertApiIsolation(context.apiPlanes, environment, id, markerValue);
-  return {
-    agent,
-    marker: markerValue,
-    proof,
-    running: minimalRuntime(running),
-    terminal: minimalRuntime(terminal),
-    markerEvent: minimalEvent(event),
-    isolation,
-  };
+  let runRecord;
+  try {
+    runRecord = await launchHostAgent(context.options, phase, agent, markerValue);
+    const running = await waitForNewRunningInstance(
+      apiBase,
+      id,
+      baselineIds,
+      expectedScopeForAgent(agent),
+    );
+    const proof = await finishHostAgent(runRecord);
+    const event = await waitForMarkerEvent(apiBase, id, markerValue, running.agentInstanceId);
+    const terminal = await waitForTerminalInstance(apiBase, id, running.agentInstanceId);
+    validateLifecycleIdentity(running, terminal, environment);
+    const isolation = await assertApiIsolation(context.apiPlanes, environment, id, markerValue);
+    return {
+      agent,
+      marker: markerValue,
+      proof,
+      running: minimalRuntime(running),
+      terminal: minimalRuntime(terminal),
+      markerEvent: minimalEvent(event),
+      isolation,
+    };
+  } catch (error) {
+    if (runRecord && error && typeof error === 'object') {
+      try {
+        await quiesceHostAgentForDiagnostic(runRecord);
+      } catch (terminationError) {
+        runRecord.diagnosticTerminationError = boundedRedactedText(
+          terminationError?.message || terminationError,
+          2_048,
+        );
+      }
+      try {
+        error.hostAgentDiagnostic = await persistHostAgentFailureDiagnostic(context.options, runRecord, error);
+      } catch (diagnosticError) {
+        error.hostAgentDiagnosticError = boundedRedactedText(diagnosticError?.message || diagnosticError, 2_048);
+      }
+    }
+    throw error;
+  }
 }
 
 async function executeDockerPiScenario(context, phase) {
@@ -2970,6 +3563,12 @@ async function executeE2e(options, preflightResult) {
     forwarderModuleHashes: await forwarderModuleHashes(),
   };
   await fs.mkdir(options.artifactDir, { recursive: true, mode: 0o700 });
+  const artifactStat = await fs.lstat(options.artifactDir);
+  if (!artifactStat.isDirectory() || artifactStat.isSymbolicLink()) {
+    throw new Error('artifact output path is not a trusted directory: ' + options.artifactDir);
+  }
+  ledger.artifactRoot = path.resolve(options.artifactDir);
+  ledger.artifactRootIdentity = localPathIdentity(artifactStat);
   const apiPlanes = [
     { name: 'host', baseUrl: options.hostApiBase, available: Boolean(preflightResult.apiState.host?.health && preflightResult.apiState.host?.runtime) },
     { name: 'docker', baseUrl: options.dockerApiBase, available: Boolean(preflightResult.apiState.docker?.health && preflightResult.apiState.docker?.runtime) },
@@ -2996,6 +3595,9 @@ async function executeE2e(options, preflightResult) {
     options: {
       phases: options.phases,
       allowEnforce: options.allowEnforce,
+      allowHostAgents: options.allowHostAgents,
+      allowHostFullAccess: options.allowHostFullAccess,
+      hostCodexSandboxMode: hostCodexSandboxMode(options),
       agents: options.agents,
       maxUnexpectedAgents: options.maxUnexpectedAgents,
     },
@@ -3049,7 +3651,9 @@ async function executeE2e(options, preflightResult) {
     report.success = false;
     report.failure = {
       name: error instanceof Error ? error.name : 'Error',
-      message: redact(error instanceof Error ? error.message : String(error)),
+      message: boundedRedactedText(error instanceof Error ? error.message : String(error), 4_096).tail,
+      ...(error?.hostAgentDiagnostic ? { hostAgentDiagnostic: error.hostAgentDiagnostic } : {}),
+      ...(error?.hostAgentDiagnosticError ? { hostAgentDiagnosticError: error.hostAgentDiagnosticError } : {}),
     };
     try {
       const evidence = await writeJsonEvidence(options.artifactDir, 'report.json', report);
@@ -3059,7 +3663,96 @@ async function executeE2e(options, preflightResult) {
   }
 }
 
-function selfTest() {
+async function selfTestSafetyIo() {
+  const probePrefix = path.join(os.tmpdir(), 'anysentry-codex-sandbox-probe-');
+  let transientDirectory;
+  try {
+    transientDirectory = await createTrackedTransientDirectory(probePrefix);
+    assert.equal(ledger.transientDirectories.has(transientDirectory), true);
+    await removeTrackedTransientDirectory(transientDirectory);
+    assert.equal(ledger.transientDirectories.has(transientDirectory), false);
+    assert.equal((await localPathState(transientDirectory)).exists, false);
+    transientDirectory = undefined;
+  } finally {
+    if (transientDirectory) await removeTrackedTransientDirectory(transientDirectory, true).catch(() => {});
+  }
+
+  const child = spawnCaptured('/bin/sleep', ['30'], {
+    detached: true,
+    env: {},
+    inheritEnv: false,
+  });
+  const runRecord = { record: child };
+  try {
+    await assert.rejects(
+      () => hostAgentFailureDiagnostic(runRecord, new Error('self-test')),
+      /while its process is still running/u,
+    );
+    await quiesceHostAgentForDiagnostic(runRecord);
+    assert.equal(child.finished, true);
+    assert.equal(ledger.children.has(child), false);
+  } finally {
+    if (!child.finished) await terminateProcess(child).catch(() => {});
+  }
+
+  const previousArtifactRoot = ledger.artifactRoot;
+  const previousArtifactIdentity = ledger.artifactRootIdentity;
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'anysentry-evidence-self-test-'));
+  const rootIdentity = localPathIdentity(await fs.lstat(root));
+  const artifactDirectory = path.join(root, 'artifacts');
+  const outsideTarget = path.join(root, 'outside.json');
+  try {
+    const proofDirectory = path.join(root, 'proof');
+    await fs.mkdir(proofDirectory, { mode: 0o700 });
+    assert.deepEqual(
+      await readLocalProofTextFile(proofDirectory, 'tool-events.log'),
+      { exists: false, status: 'missing', bytes: 0 },
+    );
+    await fs.writeFile(path.join(proofDirectory, 'tool-events.log'), '', { mode: 0o600 });
+    const emptyProof = await readLocalProofTextFile(proofDirectory, 'tool-events.log');
+    assert.equal(emptyProof.status, 'ok');
+    assert.equal(emptyProof.bytes, 0);
+    await fs.symlink(outsideTarget, path.join(proofDirectory, 'model-result.txt'));
+    assert.equal(
+      (await readLocalProofTextFile(proofDirectory, 'model-result.txt')).status,
+      'unsafe_file_type',
+    );
+
+    await fs.mkdir(artifactDirectory, { mode: 0o700 });
+    ledger.artifactRoot = path.resolve(artifactDirectory);
+    ledger.artifactRootIdentity = localPathIdentity(await fs.lstat(artifactDirectory));
+    await fs.symlink(outsideTarget, path.join(artifactDirectory, 'linked.json'));
+    await assert.rejects(
+      () => writeJsonEvidence(artifactDirectory, 'linked.json', { status: 'must-not-write' }),
+      /EEXIST|exist/iu,
+    );
+    assert.equal((await localPathState(outsideTarget)).exists, false);
+    const safeEvidence = await writeJsonEvidence(artifactDirectory, 'safe.json', {
+      authorization: ['Bearer opaque-authorization'],
+      credentials: { token: 'opaque-token' },
+      accessPolicy: { fullAccessAuthorized: true, sandboxMode: 'danger-full-access' },
+      status: 'safe',
+    });
+    const safeContent = await fs.readFile(safeEvidence.file, 'utf8');
+    assert.doesNotMatch(safeContent, /opaque-authorization|opaque-token/u);
+    assert.equal(JSON.parse(safeContent).accessPolicy.sandboxMode, 'danger-full-access');
+    await fs.rename(artifactDirectory, artifactDirectory + '-original');
+    await fs.mkdir(artifactDirectory, { mode: 0o700 });
+    await assert.rejects(
+      () => writeJsonEvidence(artifactDirectory, 'after-replacement.json', { status: 'must-not-write' }),
+      /directory identity changed/u,
+    );
+  } finally {
+    ledger.artifactRoot = previousArtifactRoot;
+    ledger.artifactRootIdentity = previousArtifactIdentity;
+    const rootState = await localPathState(root);
+    if (rootState.exists && sameLocalPathIdentity(rootState.identity, rootIdentity)) {
+      await fs.rm(root, { recursive: true });
+    }
+  }
+}
+
+async function selfTest() {
   const options = parseOptions([
     '--run-id', 'self-test-001',
     '--agents', 'host-codex,docker-pi,k8s-pi',
@@ -3070,6 +3763,14 @@ function selfTest() {
   assert.equal(normalizeApiBase('http://127.0.0.1:29653/security-center/'), DEFAULT_DOCKER_API);
   assert.throws(() => parseOptions(['--run-id', '../unsafe']), /run-id/u);
   assert.throws(() => parseOptions(['--api-key', 'sk-not-allowed']), /unknown option/u);
+  assert.throws(
+    () => parseOptions(['--agents', 'host-codex', '--allow-host-full-access']),
+    /allow-host-agents/u,
+  );
+  assert.throws(
+    () => parseOptions(['--agents', 'docker-pi', '--allow-host-agents', '--allow-host-full-access']),
+    /host-codex/u,
+  );
   assert.throws(() => parseOptions(['--phases', 'enforce']), /allow-enforce/u);
   assert.throws(() => parseOptions(['--phases', 'enforce', '--allow-enforce']), /cannot run alone/u);
   const gated = parseOptions(['--phases', 'shadow,enforce', '--allow-enforce']);
@@ -3090,6 +3791,8 @@ function selfTest() {
   assert.equal(plan.mode, 'dry-run');
   assert.equal(plan.safety.deploymentManifestsOrExistingResourcesModified, false);
   assert.equal(plan.safety.protocolProbeWritesToApi, false);
+  assert.equal(plan.safety.hostCodexFullAccessRequiresExplicitFlag, true);
+  assert.equal(plan.hostAgentAuthorization.codexSandboxMode, 'workspace-write');
   assert.ok(plan.resources.every((resource) => resource.name.includes('self-test-001')));
   assert.notEqual(plan.apiPlanes.docker.baseUrl, plan.apiPlanes.kubernetes.baseUrl);
   assert.notEqual(plan.apiPlanes.host.baseUrl, plan.apiPlanes.docker.baseUrl);
@@ -3125,6 +3828,38 @@ function selfTest() {
   assertPhaseMetrics('shadow', shadow, 'self-test');
   assert.equal(shadow.totals.observed, 3);
   assert.equal(redact('token=secret-value sk-123456789'), 'token=<redacted> sk-<redacted>');
+  const boundedDiagnostic = boundedRedactedText('x'.repeat(512) + ' token=secret-value sk-123456789', 128);
+  assert.equal(boundedDiagnostic.truncated, true);
+  assert.ok(Buffer.byteLength(boundedDiagnostic.tail) <= 128);
+  assert.doesNotMatch(boundedDiagnostic.tail, /secret-value|sk-123456789/u);
+  assert.notEqual(boundedDiagnostic.sha256, hashText('x'.repeat(512) + ' token=secret-value sk-123456789'));
+  const structuredDiagnostic = boundedRedactedText(JSON.stringify({
+    authorization: ['Bearer opaque-authorization'],
+    cookie: { session: 'opaque-cookie' },
+    credentials: { value: 'opaque-credential' },
+  }), 2_048);
+  assert.doesNotMatch(
+    structuredDiagnostic.tail,
+    /opaque-authorization|opaque-cookie|opaque-credential/u,
+  );
+  const headerDiagnostic = boundedRedactedText(
+    'Authorization: Bearer opaque-bearer\nCookie: session=opaque-session',
+    2_048,
+  );
+  assert.doesNotMatch(headerDiagnostic.tail, /opaque-bearer|opaque-session/u);
+  const unicodeDiagnostic = boundedRedactedText('汉'.repeat(128), 17);
+  assert.ok(Buffer.byteLength(unicodeDiagnostic.tail) <= 17);
+  assert.doesNotMatch(unicodeDiagnostic.tail, /�/u);
+  const jsonDiagnostic = boundedCodexJsonLines(Array.from({ length: 40 }, (_, index) => JSON.stringify({
+    type: 'event',
+    index,
+    token: 'secret-value',
+    message: 'x'.repeat(2_000),
+  })).join('\n'));
+  assert.ok(jsonDiagnostic.returnedLines <= DIAGNOSTIC_JSON_MAX_LINES);
+  assert.ok(jsonDiagnostic.lines.every((line) => Buffer.byteLength(line.json) <= DIAGNOSTIC_JSON_LINE_LIMIT));
+  assert.ok(jsonDiagnostic.lines.reduce((sum, line) => sum + Buffer.byteLength(line.json), 0) <= DIAGNOSTIC_JSON_LIMIT);
+  assert.doesNotMatch(JSON.stringify(jsonDiagnostic), /secret-value/u);
   const prompt = piPrompt();
   const piEnv = piEnvironment(options, 'docker', 'shadow');
   assert.doesNotMatch(prompt, /e2e-marker-001/u);
@@ -3134,6 +3869,44 @@ function selfTest() {
   const hostAction = markerAction('e2e-marker-001');
   assert.match(hostAction, /exec \/usr\/bin\/true 'e2e-marker-001'/u);
   assert.match(hostAction, /tool-events\.log/u);
+  const hostWorkspace = '/tmp/anysentry-host-codex-self-test';
+  const workspaceArgs = hostCodexArgs(options, hostWorkspace, hostPrompt(hostWorkspace));
+  assert.equal(workspaceArgs[workspaceArgs.indexOf('--sandbox') + 1], 'workspace-write');
+  assert.ok(workspaceArgs.includes('--ignore-user-config'));
+  assert.ok(workspaceArgs.includes('--ignore-rules'));
+  assert.ok(workspaceArgs.includes('--json'));
+  assert.equal(workspaceArgs[workspaceArgs.indexOf('-C') + 1], hostWorkspace);
+  assert.equal(workspaceArgs[workspaceArgs.indexOf('-o') + 1], path.join(hostWorkspace, 'final-output.txt'));
+  assert.equal(assertHostCodexLaunchAuthorization(options, workspaceArgs), 'workspace-write');
+  assert.equal(workspaceArgs.includes('--dangerously-bypass-approvals-and-sandbox'), false);
+  const fullAccessOptions = parseOptions([
+    '--agents', 'host-codex', '--allow-host-agents', '--allow-host-full-access',
+  ]);
+  const fullAccessArgs = hostCodexArgs(fullAccessOptions, hostWorkspace, hostPrompt(hostWorkspace));
+  assert.equal(hostCodexSandboxMode(fullAccessOptions), 'danger-full-access');
+  assert.equal(fullAccessArgs[fullAccessArgs.indexOf('--sandbox') + 1], 'danger-full-access');
+  assert.ok(fullAccessArgs.includes('--ignore-user-config'));
+  assert.ok(fullAccessArgs.includes('--ignore-rules'));
+  assert.equal(assertHostCodexLaunchAuthorization(fullAccessOptions, fullAccessArgs), 'danger-full-access');
+  assert.equal(fullAccessArgs.includes('--dangerously-bypass-approvals-and-sandbox'), false);
+  assert.throws(
+    () => assertHostCodexLaunchAuthorization(options, [
+      ...workspaceArgs.slice(0, workspaceArgs.indexOf('--sandbox') + 1),
+      'danger-full-access',
+      ...workspaceArgs.slice(workspaceArgs.indexOf('--sandbox') + 2),
+    ]),
+    /does not match authorization/u,
+  );
+  assert.deepEqual(localToolProofIssues(
+    { status: 'missing', text: '' },
+    { status: 'ok', text: '' },
+    'e2e-marker-001',
+  ), ['tool-events.log:missing', 'model-result.txt:empty']);
+  assert.deepEqual(localToolProofIssues(
+    { status: 'ok', text: 'different-marker\n' },
+    { status: 'ok', text: 'summary\n' },
+    'e2e-marker-001',
+  ), ['tool-events.log:marker_missing']);
   const witness = {
     schema: 'anysentry.e2e_raw_witness.v1',
     eventKind: 'ToolExec',
@@ -3200,7 +3973,19 @@ function selfTest() {
   assert.equal(sameLocalPathIdentity(pathIdentity, { ...pathIdentity }), true);
   assert.equal(sameLocalPathIdentity({ ...pathIdentity, ino: '3' }, pathIdentity), false);
   assert.ok(FORWARDER_MODULES.includes('observer-e2e-witness.js'));
-  return { assertions: 70, protocolReserved: true, dryRunDefault: true, cleanupOwnershipRequired: true };
+  await selfTestSafetyIo();
+  return {
+    protocolReserved: true,
+    dryRunDefault: true,
+    cleanupOwnershipRequired: true,
+    safetyContracts: [
+      'host full-access CLI and launch-point gate',
+      'bounded credential-redacted diagnostics',
+      'host process quiesced before failure evidence capture',
+      'no-follow exclusive evidence writes with artifact directory identity pinning',
+      'tracked transient sandbox-probe directory cleanup',
+    ],
+  };
 }
 
 function printPreflight(result) {
@@ -3226,7 +4011,7 @@ async function main() {
     return;
   }
   if (options.selfTest) {
-    const result = selfTest();
+    const result = await selfTest();
     console.log(JSON.stringify({ status: 'passed', selfTest: result }, null, 2));
     return;
   }
@@ -3242,7 +4027,7 @@ async function main() {
       console.log(JSON.stringify(executionPlan(options), null, 2));
       console.log(result.blockers.length
         ? '[dry-run] plan generated; execute is blocked until preflight blockers are resolved.'
-        : '[dry-run] plan generated; no resources were created. Re-run with --execute to start the real E2E.');
+        : '[dry-run] plan generated; no run-scoped resources were created and transient preflight probes were removed. Re-run with --execute to start the real E2E.');
       return;
     }
     if (result.blockers.length) {
