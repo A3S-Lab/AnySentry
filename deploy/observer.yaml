@@ -24,12 +24,12 @@ data:
       "schemaVersion": "anysentry.agent_runtime_signatures.v1",
       "version": 1,
       "runtimes": [
-        { "id": "codex", "displayName": "Codex", "variants": [{ "commExact": ["codex"] }] },
-        { "id": "a3s-code", "agentScopeId": "a3s code", "displayName": "A3S Code", "variants": [{ "commExact": ["a3s", "a3s-code", "a3s code"] }] },
-        { "id": "claude-code", "agentScopeId": "Claude Code", "displayName": "Claude Code", "variants": [{ "commExact": ["claude", "claude-code", "claude code"] }] },
-        { "id": "gemini-cli", "displayName": "Gemini CLI", "variants": [{ "commExact": ["gemini", "gemini-cli", "gemini cli"] }] },
-        { "id": "pi", "displayName": "Pi", "variants": [{ "commExact": ["pi"] }] },
-        { "id": "kimi-cli", "displayName": "Kimi Code CLI", "variants": [{ "commExact": ["Kimi Code"] }] }
+        { "id": "codex", "displayName": "Codex", "variants": [{ "commExact": ["codex"] }, { "argv0Basename": ["codex"] }] },
+        { "id": "a3s-code", "agentScopeId": "a3s code", "displayName": "A3S Code", "variants": [{ "commExact": ["a3s", "a3s-code", "a3s code"] }, { "argv0Basename": ["a3s", "a3s-code"] }, { "argvPrefix": ["a3s code", "a3s-code"] }] },
+        { "id": "claude-code", "agentScopeId": "Claude Code", "displayName": "Claude Code", "variants": [{ "commExact": ["claude", "claude-code", "claude code"] }, { "argv0Basename": ["claude", "claude-code"] }] },
+        { "id": "gemini-cli", "displayName": "Gemini CLI", "variants": [{ "commExact": ["gemini", "gemini-cli", "gemini cli"] }, { "argv0Basename": ["gemini", "gemini-cli"] }] },
+        { "id": "pi", "displayName": "Pi", "variants": [{ "commExact": ["pi"] }, { "argv0Basename": ["pi"] }] },
+        { "id": "kimi-cli", "displayName": "Kimi Code CLI", "variants": [{ "commExact": ["Kimi Code", "kimi", "kimi-cli"] }, { "argv0Basename": ["kimi", "kimi-cli"] }] }
       ]
     }
 ---
