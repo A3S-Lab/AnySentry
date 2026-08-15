@@ -490,6 +490,9 @@ export interface AgentEventList {
   total: number;
   totalMode: QueryTotalMode;
   coverage: QueryCoverage;
+  /** Compatibility signal emitted by the bounded hot-ring query path. */
+  totalApproximate?: boolean;
+  storageFallback?: "hot_ring";
   updateTime: string;
 }
 
@@ -1583,6 +1586,7 @@ export interface AgentInstanceMetrics {
   avgLatencyMs: number;
   failedCount: number;
   timeoutCount: number;
+  coverage?: QueryCoverage;
   updateTime: string;
 }
 
@@ -3118,6 +3122,8 @@ export const securityCenterApi = {
     apiClient.post<AgentInventory>("/security-center/agents/inventory", filter),
   agentInstanceMetrics: (filter: AgentInstanceMetricsQuery) =>
     apiClient.post<AgentInstanceMetrics>("/security-center/agents/instance-metrics", filter),
+  agentRuntimeInstances: (query: AgentRuntimeStateQuery = {}) =>
+    apiClient.post<AgentRuntimeStateList>("/security-center/runtime/instances", query),
   workspaceInventory: (filter: WorkspaceInventoryQuery) =>
     apiClient.post<WorkspaceInventory>("/security-center/workspaces/inventory", filter),
   agentTopology: (filter: AgentTopologyQuery) =>

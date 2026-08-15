@@ -1,6 +1,6 @@
 import { useRequest } from "ahooks";
 import dayjs from "dayjs";
-import { formatSecurityDateTime, liveSecuritySnapshotAsOf } from "@/lib/date-time";
+import { liveSecuritySnapshotAsOf } from "@/lib/date-time";
 import {
   Activity,
   AlertTriangle,
@@ -152,8 +152,10 @@ function clean(value: string) {
   return value.trim() || undefined;
 }
 
-function formatDate(value?: string) {
-  return formatSecurityDateTime(value, "MM-DD HH:mm:ss", value || "--");
+function formatDate(value?: string | number) {
+  if (!value) return "--";
+  const parsed = dayjs(value);
+  return parsed.isValid() ? parsed.format("MM-DD HH:mm:ss") : value;
 }
 
 function healthClass(health?: AgentHealthState) {
@@ -1174,6 +1176,10 @@ export default function AgentsPage() {
     }
     return items[0];
   }, [data, detailData, hasPinnedSelection, legacySelectedAgentId, legacySelectedWorkspacePath, selectedAgentAssetId, selectedAgentInstanceId]);
+  const selectedRuntime = useMemo(
+    () => selectedAgent ? matchAgentRuntimeInstance(selectedAgent, runtimeLookup) : undefined,
+    [runtimeLookup, selectedAgent],
+  );
   const classificationCounts = useMemo(() => {
     const counts: Partial<Record<AgentClassification, number>> = {};
     for (const item of data?.items ?? []) {
@@ -1489,6 +1495,7 @@ export default function AgentsPage() {
                         ) : null}
                         <AgentRow
                           agent={agent}
+                          runtime={matchAgentRuntimeInstance(agent, runtimeLookup)}
                           active={
                             agent.agentAssetId === selectedAgent?.agentAssetId &&
                             agent.agentInstanceId === selectedAgent?.agentInstanceId

@@ -13,16 +13,19 @@ import { DistributedCurrentStateService } from './distributed-current-state.serv
 import { RelationalBusinessStore } from './relational-business-store.service';
 import { resolveJudgmentRoute } from './identity-judgment-routing';
 import { isNewerEventRevision } from './event-revision';
-import { CollectorHeartbeatRecord, CollectorHeartbeatRequest, EventCategory, EventMeta, IdentityAiReviewRecord, Incident, IncidentStatus, JudgedEvent, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
+import { CollectorHeartbeatOrigin, CollectorHeartbeatRecord, CollectorHeartbeatRequest, CollectorRawHeartbeatRequest, EventCategory, EventMeta, IdentityAiReviewRecord, Incident, IncidentStatus, JudgedEvent, JudgmentRouteReason, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
 
 const SEVERITY_SCORE: Record<Severity, number> = { info: 8, low: 28, medium: 52, high: 76, critical: 95 };
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 const SCHEMA_VERSION: JudgedEvent['schemaVersion'] = 'anysentry.agent_event.v1';
 const SECURITY_JUDGED_KINDS = new Set(['ToolExec', 'Egress', 'Dns', 'FileAccess', 'SslContent', 'SecurityAction']);
 const DEFAULT_INTERNAL_L3_BIN = '/opt/anysentry/l3-agent.mjs';
+const COLLECTOR_HEARTBEAT_SHUTDOWN_TIMEOUT_MS = 5_000;
 const RELATIONAL_REFRESH_MS = 15_000;
 const boundedEnvInt = (name: string, fallback: number, min: number, max: number): number => {
-  const value = Number(process.env[name]);
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const value = Number(raw);
   return Number.isFinite(value) ? Math.min(max, Math.max(min, Math.trunc(value))) : fallback;
 };
 const RISK_NAME_BY_CATEGORY: Record<string, string> = {
@@ -289,7 +292,17 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   private readonly store: JudgedEvent[] = [];
   private readonly storeById = new Map<string, JudgedEvent>();
   private readonly resultApplyLocks = new Map<string, Promise<void>>();
-  private readonly MAX = boundedEnvInt('ANYSENTRY_HOT_EVENT_LIMIT', 100_000, 1_000, 100_000);
+  private readonly MAX = (() => {
+    const primary = process.env.ANYSENTRY_HOT_EVENT_LIMIT?.trim();
+    // The remote name is canonical. The old name remains a compatibility fallback for existing
+    // deployments; the local hardening's 10k default and the shared 1k..100k bounds are retained.
+    return boundedEnvInt(
+      primary ? 'ANYSENTRY_HOT_EVENT_LIMIT' : 'ANYSENTRY_EVENT_RING_MAX',
+      10_000,
+      1_000,
+      100_000,
+    );
+  })();
   private readonly TRIM_BATCH = Math.min(1_000, Math.max(100, Math.floor(this.MAX / 10)));
   private readonly collectorHeartbeats: CollectorHeartbeatRecord[] = [];
   private readonly MAX_COLLECTOR_HEARTBEATS = 10_000;
@@ -372,9 +385,23 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     if (this.collectorHeartbeatPersistTimer) clearTimeout(this.collectorHeartbeatPersistTimer);
     if (this.incidentRelationalRefreshTimer) clearInterval(this.incidentRelationalRefreshTimer);
     if (this.policyRelationalRefreshTimer) clearInterval(this.policyRelationalRefreshTimer);
-    await this.persistCollectorHeartbeats();
-    await this.persistIncidentState([...this.incidents.values()]);
-    await this.ch.close();
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort('collector heartbeat shutdown persistence timed out'),
+      this.collectorHeartbeatShutdownTimeoutMs,
+    );
+    try {
+      try {
+        await this.persistCollectorHeartbeats(controller.signal);
+      } finally {
+        await this.persistIncidentState(this.incidents ? [...this.incidents.values()] : []);
+      }
+    } finally {
+      clearTimeout(timeout);
+      // Event rows are the durable evidence path. Always give their bounded drain the remaining
+      // 20 seconds, even when the best-effort heartbeat snapshot failed or timed out.
+      await this.ch.close();
+    }
   }
 
   /** Rebuild the sentry ACL from the policy and recreate the judge in place (built-in rules always
@@ -434,7 +461,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return this.ch.dashboardBucketSnapshotStatus();
   }
 
-  async searchStoredEvents(query: StoredEventQuery): Promise<JudgedEvent[]> {
+  async searchStoredEvents(query: StoredEventQuery): Promise<JudgedEvent[] | null> {
     return this.ch.searchEvents(query);
   }
 
@@ -1120,10 +1147,14 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async persistIncidentState(records: Incident[]): Promise<void> {
-    await Promise.all([
-      this.relational.saveIncidents(records),
-      this.ch.saveIncidentState([...this.incidents.values()]),
-    ]);
+    const writes: Array<Promise<unknown>> = [];
+    if (this.relational && typeof this.relational.saveIncidents === 'function') {
+      writes.push(this.relational.saveIncidents(records));
+    }
+    if (this.ch && typeof this.ch.saveIncidentState === 'function' && this.incidents) {
+      writes.push(this.ch.saveIncidentState([...this.incidents.values()]));
+    }
+    await Promise.all(writes);
   }
 
   private async refreshRelationalIncidents(): Promise<void> {
@@ -1139,8 +1170,12 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     this.policyUpdatedAt = saved.updatedAt;
   }
 
-  recordCollectorHeartbeat(input: CollectorHeartbeatRequest, at = Date.now()): CollectorHeartbeatRecord {
-    const collectorId = (input.collectorId || input.podName || input.nodeName || 'unknown-collector').slice(0, 160);
+  recordCollectorHeartbeat(
+    input: CollectorHeartbeatRequest | CollectorRawHeartbeatRequest,
+    at: number,
+    origin: CollectorHeartbeatOrigin,
+  ): CollectorHeartbeatRecord {
+    const collectorId = (input.collectorId || input.podName || input.nodeName || 'unknown-collector').trim().slice(0, 180);
     const status: CollectorHeartbeatRecord['status'] = ['ok', 'degraded', 'error'].includes(input.status ?? '')
       ? (input.status as CollectorHeartbeatRecord['status'])
       : 'ok';
@@ -1357,7 +1392,9 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       message: cleanText(input.message, 500),
     };
     this.addCollectorHeartbeat(rec);
-    void this.currentState.recordCollectorHeartbeat(rec);
+    // Nest always provides the distributed projection. The guard keeps focused contract tests and
+    // degraded single-process embeddings that predate that provider usable.
+    if (this.currentState) void this.currentState.recordCollectorHeartbeat(rec);
     return rec;
   }
 
@@ -1374,7 +1411,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   private addCollectorHeartbeat(rec: CollectorHeartbeatRecord, persist = true, notify = true): void {
     this.collectorHeartbeats.push(rec);
     if (this.collectorHeartbeats.length > this.MAX_COLLECTOR_HEARTBEATS) this.collectorHeartbeats.splice(0, this.collectorHeartbeats.length - this.MAX_COLLECTOR_HEARTBEATS);
-    this.alerting.observeCollectorHeartbeat(rec);
+    if (notify) this.alerting.observeCollectorHeartbeat(rec);
+    else this.alerting.seedCollectorHeartbeat(rec);
     if (persist) {
       this.ch.enqueueCollectorHeartbeat(rec);
       this.persistCollectorHeartbeatsSoon();
@@ -1400,7 +1438,12 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return this.collectorHeartbeats.filter((e) => e.at >= sinceMs && e.at <= untilMs);
   }
 
-  latestCollectorHeartbeats(untilMs = Number.POSITIVE_INFINITY): CollectorHeartbeatRecord[] {
+  collectorHeartbeatHeads(untilMs = Number.POSITIVE_INFINITY): {
+    latest: CollectorHeartbeatRecord[];
+    latestMetrics: CollectorHeartbeatRecord[];
+    latestRaw: CollectorHeartbeatRecord[];
+    latestForwarder: CollectorHeartbeatRecord[];
+  } {
     const latest = new Map<string, CollectorHeartbeatRecord>();
     const latestMetrics = new Map<string, CollectorHeartbeatRecord>();
     const latestRaw = new Map<string, CollectorHeartbeatRecord>();
@@ -1432,6 +1475,11 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       latestRaw: [...latestRaw.values()],
       latestForwarder: [...latestForwarder.values()],
     };
+  }
+
+  /** Compatibility view for remote aggregation callers that only need one latest heartbeat. */
+  latestCollectorHeartbeats(untilMs = Number.POSITIVE_INFINITY): CollectorHeartbeatRecord[] {
+    return this.collectorHeartbeatHeads(untilMs).latest;
   }
 
   distributedLatestCollectorHeartbeats(untilMs: number): Promise<CollectorHeartbeatRecord[]> {

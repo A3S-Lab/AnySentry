@@ -381,7 +381,6 @@ spec:
                 optional: true
           env:
             - { name: ANYSENTRY_STREAM_WORKER_ROLE, value: "judge" }
-            - { name: ANYSENTRY_COMPOSITE_MODEL, value: "glm-5.2" }
             - { name: ANYSENTRY_COMPOSITE_TIMEOUT_MS, value: "60000" }
             - { name: ANYSENTRY_COMPOSITE_CONCURRENCY, value: "2" }
             - { name: ANYSENTRY_COMPOSITE_MAX_EVENT_AGE_MS, value: "900000" }

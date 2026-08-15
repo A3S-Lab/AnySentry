@@ -1,5 +1,4 @@
 import { useRequest } from "ahooks";
-import dayjs from "dayjs";
 import { formatSecurityDateTime, liveSecuritySnapshotAsOf, securityTimestampValue } from "@/lib/date-time";
 import {
   ArrowLeft,
@@ -706,14 +705,14 @@ function EdgeDetail({
   if (edgeAgentAssetId) eventQs.set("agentAssetId", edgeAgentAssetId);
   else if (edgeAgentId) eventQs.set("agentId", edgeAgentId);
   if (edgeAgentInstanceId) eventQs.set("agentInstanceId", edgeAgentInstanceId);
-  if (!edgeAgentAssetId && edgeWorkspacePath) eventQs.set("workspacePath", edgeWorkspacePath);
+  if (edgeWorkspacePath) eventQs.set("workspacePath", edgeWorkspacePath);
   if (edgeCollectorId) eventQs.set("collectorId", edgeCollectorId);
   if (routeSourceId) eventQs.set("sourceId", routeSourceId);
   const agentQs = new URLSearchParams();
   if (edgeAgentAssetId) agentQs.set("agentAssetId", edgeAgentAssetId);
   else if (edgeAgentId) agentQs.set("agentId", edgeAgentId);
   if (edgeAgentInstanceId) agentQs.set("selectedAgentInstanceId", edgeAgentInstanceId);
-  if (!edgeAgentAssetId && edgeWorkspacePath) agentQs.set("workspacePath", edgeWorkspacePath);
+  if (edgeWorkspacePath) agentQs.set("workspacePath", edgeWorkspacePath);
   const collectorQs = new URLSearchParams();
   if (edgeCollectorId) collectorQs.set("collectorId", edgeCollectorId);
   const bundleQs = new URLSearchParams({ timeType });

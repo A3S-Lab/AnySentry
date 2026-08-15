@@ -245,6 +245,8 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
   private readonly alerts = new Map<string, AlertRecord>();
   private readonly incidents = new Map<string, Incident>();
   private readonly latestCollectorHeartbeat = new Map<string, CollectorHeartbeatRecord>();
+  /** Cumulative quality counters belong to one producer channel, not merely one collector ID. */
+  private readonly latestCollectorQualityHeartbeat = new Map<string, CollectorHeartbeatRecord>();
   private persistTimer?: NodeJS.Timeout;
   private collectorTimer?: NodeJS.Timeout;
   private sourceTimer?: NodeJS.Timeout;
@@ -591,8 +593,14 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
   }
 
   observeCollectorHeartbeat(heartbeat: CollectorHeartbeatRecord): void {
-    const previous = this.latestCollectorHeartbeat.get(heartbeat.collectorId);
-    this.latestCollectorHeartbeat.set(heartbeat.collectorId, heartbeat);
+    const qualityOrigin = heartbeat.origin === 'raw_collector' ? 'raw_collector' : 'forwarder';
+    const qualityKey = `${heartbeat.collectorId}\0${qualityOrigin}`;
+    const previous = this.latestCollectorQualityHeartbeat.get(qualityKey);
+    this.latestCollectorQualityHeartbeat.set(qualityKey, heartbeat);
+    const latest = this.latestCollectorHeartbeat.get(heartbeat.collectorId);
+    if (!latest || heartbeat.at >= latest.at) {
+      this.latestCollectorHeartbeat.set(heartbeat.collectorId, heartbeat);
+    }
     if (!this.config.enabled) return;
 
     this.resolveWhere(
@@ -601,10 +609,19 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       'collector heartbeat recovered',
     );
 
+    const matchesQualityOrigin = (alert: AlertRecord) =>
+      alert.kind === 'collector' &&
+      alert.collectorId === heartbeat.collectorId &&
+      alert.ruleId === 'collector.quality' &&
+      (
+        alert.labels?.heartbeatOrigin === qualityOrigin ||
+        (qualityOrigin === 'forwarder' && !alert.labels?.heartbeatOrigin)
+      );
     const counterDelta = (current: number, before: number | undefined): number => {
-      // The first heartbeat establishes a restart baseline. Its cumulative counters are history,
-      // not failures that happened after this service started observing the collector.
-      if (before === undefined) return 0;
+      // Hydration seeds the previous value after an API restart. A genuinely new producer has no
+      // persisted baseline, so its current non-zero failure count is actionable rather than lost.
+      // Counter resets start a new baseline; raw-collector and forwarder counters never share one.
+      if (before === undefined) return current;
       if (current < before) return current;
       return current - before;
     };
@@ -662,6 +679,20 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       },
       at: heartbeat.at,
     });
+  }
+
+  /** Restore liveness heads without replaying historical resolve/open notifications. */
+  seedCollectorHeartbeat(heartbeat: CollectorHeartbeatRecord): void {
+    const current = this.latestCollectorHeartbeat.get(heartbeat.collectorId);
+    if (!current || heartbeat.at >= current.at) {
+      this.latestCollectorHeartbeat.set(heartbeat.collectorId, heartbeat);
+    }
+    const qualityOrigin = heartbeat.origin === 'raw_collector' ? 'raw_collector' : 'forwarder';
+    const qualityKey = `${heartbeat.collectorId}\0${qualityOrigin}`;
+    const currentQuality = this.latestCollectorQualityHeartbeat.get(qualityKey);
+    if (!currentQuality || heartbeat.at >= currentQuality.at) {
+      this.latestCollectorQualityHeartbeat.set(qualityKey, heartbeat);
+    }
   }
 
   observeJudgmentResult(result: DecisionResultJob): void {

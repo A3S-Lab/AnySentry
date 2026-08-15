@@ -2750,6 +2750,7 @@ export class SecurityMonitoringController {
     private readonly supplyChain: SupplyChainService,
     private readonly assistant: SecurityAssistantService,
     private readonly identityReview: IdentityReviewAgentService,
+    private readonly agentRuntimeState: AgentRuntimeStateService,
     private readonly relational: RelationalBusinessStore,
     private readonly workspaceDirectory: WorkspaceDirectoryService,
   ) {}

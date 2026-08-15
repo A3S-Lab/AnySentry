@@ -267,6 +267,7 @@ async function verifyDashboardSourceContracts() {
   const remediationPage = await readFile('apps/web/src/pages/RemediationPage.tsx', 'utf8');
   const securityController = await readFile('apps/api/src/security-monitoring/security-monitoring.controller.ts', 'utf8');
   const securityMonitorPage = await readFile('apps/web/src/pages/SecurityMonitorPage.tsx', 'utf8');
+  const securitySidebar = await readFile('apps/web/src/components/custom/security-sidebar.tsx', 'utf8');
   const sourcesPage = await readFile('apps/web/src/pages/SourcesPage.tsx', 'utf8');
   const topologyPage = await readFile('apps/web/src/pages/TopologyPage.tsx', 'utf8');
   const aggregationService = await readFile('apps/api/src/security-monitoring/aggregation.service.ts', 'utf8');
@@ -452,7 +453,7 @@ async function verifyDashboardSourceContracts() {
       securityMonitorPage.includes('{ key: "window" as const, label: "时间窗分析"') &&
       securityMonitorPage.includes('securityCenterApi.agentInventory({ ...filter, limit: 32 })') &&
       securityMonitorPage.includes('const [visibleAgentCount, setVisibleAgentCount] = useState(8)') &&
-      securityMonitorPage.includes('<AgentOverviewCard key={agent.agentAssetId}') &&
+      securityMonitorPage.includes('<AgentOverviewCard key={agentRuntimeSelectionKey(agent)}') &&
       securityMonitorPage.includes('进入智能体资产 →') &&
       securityMonitorPage.includes('观察模式 · 不影响系统操作') &&
       !securityMonitorPage.includes('title="Flink 实时风险关联"') &&
@@ -464,7 +465,7 @@ async function verifyDashboardSourceContracts() {
       hasWindowView: securityMonitorPage.includes('{ key: "window" as const, label: "时间窗分析"'),
       hasInventoryQuery: securityMonitorPage.includes('securityCenterApi.agentInventory({ ...filter, limit: 32 })'),
       hasEightItemDisclosure: securityMonitorPage.includes('const [visibleAgentCount, setVisibleAgentCount] = useState(8)'),
-      hasAssetCards: securityMonitorPage.includes('<AgentOverviewCard key={agent.agentAssetId}'),
+      hasAssetCards: securityMonitorPage.includes('<AgentOverviewCard key={agentRuntimeSelectionKey(agent)}'),
       hidesImplementationTerms:
         !securityMonitorPage.includes('title="Flink 实时风险关联"') &&
         !securityMonitorPage.includes('Flink 聚合连续行为') &&
@@ -514,7 +515,7 @@ async function verifyDashboardSourceContracts() {
       apiClient.includes('operation: "buildEvidenceBundle"') &&
       securityController.includes("operation.name === 'planNextActions'") &&
       securityController.includes("operation.name === 'buildEvidenceBundle'") &&
-      securityMonitorPage.includes('<Link to="/operator">'),
+      securitySidebar.includes('{ label: "AI Operator", description: "辅助生成处置计划", href: "/operator"'),
     {
       hasProgressiveApiCall: operatorPage.includes('securityCenterApi.nextActionPlan(params)'),
       hasProgressiveEvidenceCall: operatorPage.includes('securityCenterApi.evidenceBundleCapability(evidenceBundleParams(action.evidence.bundleHint, action, timeType))'),
@@ -533,7 +534,7 @@ async function verifyDashboardSourceContracts() {
         operatorPage.includes('const routeText = searchParams.toString()') &&
         operatorPage.includes('setSearchParams(next, { replace: true })') &&
         operatorPage.includes('setSearchParams(operatorRouteParams({'),
-      hasDashboardEntry: securityMonitorPage.includes('<Link to="/operator">'),
+      hasDashboardEntry: securitySidebar.includes('{ label: "AI Operator", description: "辅助生成处置计划", href: "/operator"'),
     },
   );
   assert(
@@ -573,7 +574,7 @@ async function verifyDashboardSourceContracts() {
       !capabilitiesPage.includes('const SAMPLE_PARAMS') &&
       capabilitiesPage.includes('schemaConstString(bodyProperties.action, "execute")') &&
       capabilitiesPage.includes('schemaConstString(bodyProperties.module, "security-center")') &&
-      securityMonitorPage.includes('<Link to="/capabilities">'),
+      securitySidebar.includes('{ label: "API", description: "Progressive API 能力", href: "/capabilities"'),
     {
       hasList: capabilitiesPage.includes('securityCenterApi.securityCapabilities({ action: "list" })'),
       hasSearch: capabilitiesPage.includes('securityCenterApi.securityCapabilities({ action: "search", query: nextQuery })'),
@@ -614,7 +615,7 @@ async function verifyDashboardSourceContracts() {
         capabilitiesPage.includes('const routeAction = capabilityRouteAction(searchParams.get("action"))') &&
         capabilitiesPage.includes('const [query, setQuery] = useState(routeQuery)') &&
         capabilitiesPage.includes('void refreshModules(routeModule, routeOperation, false, routeAction)'),
-      hasDashboardEntry: securityMonitorPage.includes('<Link to="/capabilities">'),
+      hasDashboardEntry: securitySidebar.includes('{ label: "API", description: "Progressive API 能力", href: "/capabilities"'),
     },
   );
   assert(

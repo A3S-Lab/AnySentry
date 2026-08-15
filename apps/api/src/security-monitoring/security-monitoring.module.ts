@@ -29,6 +29,6 @@ import { WorkspaceDirectoryService } from './workspace-directory.service';
 
 @Module({
   controllers: [SecurityMonitoringController],
-  providers: [AgentAttributionService, RelationalBusinessStore, AgentMetadataService, WorkspaceDirectoryService, AlertingService, AuditService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, DistributedCurrentStateService, SentryJudgeService, AggregationService, IdentityEvidenceService, RuntimeModelConfigService, IdentityReviewAgentService, RemediationService, KubeIdentityService, ManagementAuthGuard, JudgmentQueueService, DecisionResultApplyService, StreamingQueueService, StreamingFindingService, SupplyChainService, SecurityAssistantService],
+  providers: [AgentRuntimeStateService, AgentAttributionService, RelationalBusinessStore, AgentMetadataService, WorkspaceDirectoryService, AlertingService, AuditService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, DistributedCurrentStateService, SentryJudgeService, AggregationService, IdentityEvidenceService, RuntimeModelConfigService, IdentityReviewAgentService, RemediationService, KubeIdentityService, ManagementAuthGuard, JudgmentQueueService, DecisionResultApplyService, StreamingQueueService, StreamingFindingService, SupplyChainService, SecurityAssistantService],
 })
 export class SecurityMonitoringModule {}

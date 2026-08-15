@@ -225,7 +225,6 @@ const ENGLISH: Record<string, string> = {
   "流式复合研判": "Streaming Composite Analysis",
   "Flink 实时风险关联": "Flink Real-time Risk Correlation",
   "供应链漏洞资产": "Supply Chain Vulnerabilities",
-  "OSV 依赖漏洞资产": "OSV Dependency Vulnerabilities",
   "当前资产快照 · 不受顶部时间范围影响":
     "Current asset snapshot · Independent of the global time range",
   "运行时关联已启用": "Runtime correlation enabled",
@@ -295,7 +294,7 @@ const ENGLISH: Record<string, string> = {
   "未命中复合规则": "No composite rule matched",
   "查看事件": "View events",
   "行为片段复合研判": "Behavior Episode Analysis",
-  "Flink 聚合连续行为；完整确定性证据直接研判，歧义证据只调用一次模型；结论仅用于旁路告警":
+  "持续聚合连续行为；完整确定性证据直接研判，歧义证据只调用一次模型；结论仅用于旁路告警":
     "Flink correlates continuous behavior; complete deterministic evidence is judged directly, while ambiguous evidence invokes the model once. Results are shadow alerts only.",
   "查看证据链": "View evidence chain",
   "深度运行指标尚未接入查询接口":
@@ -444,10 +443,9 @@ const ENGLISH: Record<string, string> = {
   "模型": "Model",
   "不可变 Episode": "immutable Episodes",
   "结果消费": "Result Consumer",
-  "正常": "Healthy",
-  "未连接": "Disconnected",
   "AnySentry 已读取流式结果": "AnySentry is consuming streaming results",
   "运行模式": "Runtime Mode",
+  "观察": "Observe",
   "不进入同步阻断链路": "Excluded from the synchronous blocking path",
   "结果总数": "Total Results",
   "画像": "profiles",

@@ -1,5 +1,4 @@
 import { useRequest } from "ahooks";
-import dayjs from "dayjs";
 import { formatSecurityDateTime, liveSecuritySnapshotAsOf } from "@/lib/date-time";
 import {
   ArrowLeft,
@@ -518,7 +517,22 @@ export default function AgentEventsPage() {
           durable: true,
           limit: 240,
         })
-      : Promise.resolve({ traceId: "", items: [], updateTime: "" }),
+      : Promise.resolve({
+          traceId: "",
+          items: [],
+          total: 0,
+          hasMore: false,
+          coverage: {
+            requestedFrom: "",
+            requestedTo: "",
+            snapshotAsOf: "",
+            asOf: "",
+            partial: false,
+            source: "memory_hot_ring" as const,
+            totalMode: "exact" as const,
+          },
+          updateTime: "",
+        }),
     {
       refreshDeps: [consoleTimeFilter.snapshotAsOf, routeEndTime, routeStartTime, selectedEvent?.traceId, timeType],
       pollingInterval: 10000,

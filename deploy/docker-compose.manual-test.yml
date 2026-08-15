@@ -1,0 +1,14 @@
+# Explicit full-function override for local/manual validation.
+# Keep docker-compose.yml production-like defaults unchanged and opt in with:
+#   docker compose --profile streaming -f docker-compose.yml \
+#     -f deploy/docker-compose.manual-test.yml up -d
+services:
+  anysentry:
+    environment:
+      ANYSENTRY_STREAMING: "on"
+      ANYSENTRY_SUPPLY_CHAIN: "on"
+      ANYSENTRY_SUPPLY_CHAIN_RUNTIME: "on"
+
+  supply-chain-assessment:
+    environment:
+      ANYSENTRY_SUPPLY_CHAIN_RUNTIME: "on"

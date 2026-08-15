@@ -1,0 +1,23 @@
+{
+  "failClosed": false,
+  "speculate": "off",
+  "rules": [],
+  "llm": {
+    "url": "http://runtime-model.invalid/v1",
+    "model": "runtime-managed-fast-review",
+    "timeoutS": 60
+  },
+  "deepModel": {
+    "url": "http://runtime-model.invalid/v1",
+    "model": "runtime-managed-deep-investigation",
+    "timeoutS": 180,
+    "contextTokens": 32768
+  },
+  "agent": {
+    "bin": "/opt/anysentry/l3-agent.mjs",
+    "skills": "/opt/anysentry/skills"
+  },
+  "identity": {
+    "candidatePipeline": "full"
+  }
+}

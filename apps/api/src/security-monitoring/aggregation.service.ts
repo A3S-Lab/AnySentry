@@ -1,6 +1,20 @@
 import { Injectable } from '@nestjs/common';
 import { Sentry } from '@a3s-lab/sentry';
-import { DashboardAggregateBucketFact, DashboardWindowBucketRow, DashboardWindowDimensionRow, DashboardWindowHistory, StoredAgentBucketFact, StoredAgentMetricBucketFact, StoredAgentWindowFact, StoredTopologyBucketFact, StoredTopologyWindowFact, StoredWorkspaceBucketFact, StoredWorkspaceWindowFact } from './clickhouse-store';
+import {
+  DashboardAggregateBucketFact,
+  DashboardWindowBucketRow,
+  DashboardWindowDimensionRow,
+  DashboardWindowHistory,
+  StoredAgentBucketFact,
+  StoredAgentMetricBucketFact,
+  StoredAgentWindowFact,
+  StoredEventQuery,
+  StoredEventSearchResult,
+  StoredTopologyBucketFact,
+  StoredTopologyWindowFact,
+  StoredWorkspaceBucketFact,
+  StoredWorkspaceWindowFact,
+} from './clickhouse-store';
 import {
   agentRuntimeInstanceIdForEvent,
   detectedAgentIdentity,
@@ -26,7 +40,8 @@ import { resolveTimeWindow } from './time-window';
 import * as T from './types';
 
 const SEV_RANK: Record<T.Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
-const LEVEL_BY_RANK = ['info', 'low', 'medium', 'high', 'critical'];
+const MAX_HISTORY_CACHE_ENTRIES = 64;
+const LEVEL_BY_RANK = ['safe', 'low', 'medium', 'high', 'critical'];
 const LEVEL_TEXT: Record<string, string> = { safe: '安全', low: '低危', medium: '中危', high: '高危', critical: '严重', unknown: '未知' };
 const CATEGORY_COLOR: Record<string, string> = {
   command_danger: '#fb7185', data_leak: '#f59e0b', secret_exfil: '#f59e0b', prompt_injection: '#a855f7',
@@ -441,6 +456,7 @@ export class AggregationService {
   private readonly historyCache = new Map<string, {
     startedAt: number;
     completedAt?: number;
+    failedAt?: number;
     ttlMs: number;
     value: Promise<DashboardWindowHistory | null>;
   }>();
@@ -458,10 +474,16 @@ export class AggregationService {
     'agent' | 'all',
     CommitAwareFactBucketCache<StoredWorkspaceBucketFact>
   >();
-  // A cold page can request Dashboard, Agent, Workspace and topology history together. Bounding
-  // only those expensive historical reads prevents their ClickHouse aggregation peaks from
-  // stacking while leaving ordinary event ingestion and short boundary reads unconstrained.
+  // A cold page can request several historical fact families together. Keep those ClickHouse
+  // aggregates bounded while leaving ingestion and small boundary reads unconstrained.
   private readonly historyQueryGate = new BoundedHistoryQueryGate(2);
+  // Two identical HTTP requests otherwise resolve a preset window at slightly different
+  // milliseconds and miss the ClickHouse store's exact-query single-flight key. Coalesce the
+  // complete durable response by request semantics before either request samples Date.now().
+  private durableEventSearchInFlight?: {
+    key: string;
+    value: Promise<T.AgentEventList>;
+  };
 
   historyFactCacheStatus() {
     const agents = [...this.agentHistoryBuckets.entries()].map(([scope, cache]) => ({
@@ -523,11 +545,29 @@ export class AggregationService {
         : window.spanMs >= 24 * 60 * 60_000
           ? 60_000
           : 30_000;
-    pruneSnapshotCache(this.historyCache, t, (entry) => entry.ttlMs);
+    pruneSnapshotCache(this.historyCache, t, (entry) => entry.failedAt ? 30_000 : entry.ttlMs);
     const cached = this.historyCache.get(window.cacheKey);
-    if (cached && (cached.completedAt === undefined || t - cached.completedAt < cached.ttlMs)) return cached.value;
+    const cachedTtlMs = cached?.failedAt ? 30_000 : ttlMs;
+    if (cached && (cached.completedAt === undefined || t - cached.completedAt < cachedTtlMs)) {
+      // Refresh insertion order so completed entries are evicted least-recently-used.
+      this.historyCache.delete(window.cacheKey);
+      this.historyCache.set(window.cacheKey, cached);
+      return cached.value;
+    }
+    if (cached) this.historyCache.delete(window.cacheKey);
+    while (this.historyCache.size >= MAX_HISTORY_CACHE_ENTRIES) {
+      const completedKey = [...this.historyCache].find(([, entry]) => entry.completedAt !== undefined)?.[0];
+      if (!completedKey) return Promise.resolve(null);
+      this.historyCache.delete(completedKey);
+    }
     const value = this.loadDashboardHistory(window);
-    const entry = { startedAt: t, completedAt: undefined as number | undefined, ttlMs, value };
+    const entry = {
+      startedAt: t,
+      completedAt: undefined as number | undefined,
+      failedAt: undefined as number | undefined,
+      ttlMs,
+      value,
+    };
     this.historyCache.set(window.cacheKey, entry);
     void value.then((result) => {
       if (this.historyCache.get(window.cacheKey)?.value !== value) return;
@@ -580,13 +620,25 @@ export class AggregationService {
           }`,
         );
       }
-      return this.historyQueryGate.run(() =>
-        this.judge.dashboardWindowHistory(window.startMs, window.endMs, 180),
-      );
+      return this.exactDashboardHistory(window);
     }
-    return this.historyQueryGate.run(() =>
-      this.judge.dashboardWindowHistory(window.startMs, window.endMs, 180),
-    );
+    return this.exactDashboardHistory(window);
+  }
+
+  private exactDashboardHistory(
+    window: ReturnType<typeof resolveTimeWindow>,
+  ): Promise<DashboardWindowHistory | null> {
+    const operation = () => this.judge.dashboardWindowHistory(window.startMs, window.endMs, 180);
+    const latestEventCommitCursor = (
+      this.judge as Partial<Pick<SentryJudgeService, 'latestEventCommitCursor'>>
+    ).latestEventCommitCursor;
+    // Production exposes the durable commit journal and shares the two-slot historical-query
+    // budget across dashboard, Agent, workspace and topology aggregates. Minimal/legacy judge
+    // adapters have only the already-bounded dashboard query; call that adapter directly so its
+    // own single-flight/cache contract remains observable and compatible.
+    return typeof latestEventCommitCursor === 'function'
+      ? this.historyQueryGate.run(operation)
+      : operation();
   }
 
   private currentDimensions(history: DashboardWindowHistory, filter: T.SecurityTimeFilter): DashboardWindowDimensionRow[] {
@@ -775,8 +827,16 @@ export class AggregationService {
       sourceId?: string;
       collectorId?: string;
     };
+    // Standalone/local contract tests use the minimal pre-durable judge surface. Treat an absent
+    // progress accessor as an empty durable-progress set; production SentryJudgeService provides
+    // it, while coverage still truthfully reports the hot-ring or fallback source below.
+    const committedEventProgress = (this.judge as SentryJudgeService & {
+      committedEventProgress?: () => ReturnType<SentryJudgeService['committedEventProgress']>;
+    }).committedEventProgress;
     const progress = relevantCommitProgress(
-      this.judge.committedEventProgress(),
+      typeof committedEventProgress === 'function'
+        ? this.judge.committedEventProgress()
+        : [],
       queryIdentity,
     );
     const observedThroughMs = observedDurableThrough(
@@ -954,7 +1014,16 @@ export class AggregationService {
       persistedLimit,
       { monitoredOnly: filter.scope === 'agent', tier: filter.tier },
     );
-    if (!persisted) return { ...this.agentEvents(filter), totalApproximate: true };
+    if (!persisted) {
+      const fallback = this.agentEvents(filter);
+      return {
+        ...fallback,
+        totalMode: 'estimated',
+        totalApproximate: true,
+        storageFallback: 'hot_ring',
+        coverage: { ...fallback.coverage, totalMode: 'estimated' },
+      };
+    }
     const filtered = this.filterEvents(persisted, filter).sort((a, b) => b.at - a.at);
     const compacted = filter.scope === 'raw'
       ? filtered.map((event) => ({ event, repeatCount: 1, lastAt: event.at }))
@@ -972,16 +1041,22 @@ export class AggregationService {
     const total = rows.length ? rows.reduce((sum, row) => sum + row.eventCount, 0) : compacted.length;
     const totalApproximate = hasDetailedFilter || !history ||
       (rows.length > 0 && history.countsApproximate) || persisted.length >= persistedLimit;
+    const committedEventCutoffMs = (
+      this.judge as Partial<Pick<SentryJudgeService, 'committedEventCutoffMs'>>
+    ).committedEventCutoffMs;
     return {
       items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) => this.eventItem(event, repeatCount, lastAt)),
       total,
-      totalMode: rows.length ? 'exact' : 'estimated',
+      totalMode: totalApproximate ? 'estimated' : 'exact',
+      totalApproximate: totalApproximate ? true : undefined,
       coverage: this.queryCoverage(filter, filtered, {
         source: 'clickhouse',
-        totalMode: rows.length ? 'exact' : 'estimated',
-        partial: persisted.length >= Math.max(1_000, limit * 10),
-        partialReason: persisted.length >= Math.max(1_000, limit * 10) ? 'scan_limit' : undefined,
-        committedCutoffMs: this.judge.committedEventCutoffMs(),
+        totalMode: totalApproximate ? 'estimated' : 'exact',
+        partial: persisted.length >= persistedLimit,
+        partialReason: persisted.length >= persistedLimit ? 'scan_limit' : undefined,
+        committedCutoffMs: typeof committedEventCutoffMs === 'function'
+          ? committedEventCutoffMs.call(this.judge)
+          : window.endMs,
       }),
       updateTime: iso(),
     };
@@ -1011,40 +1086,74 @@ export class AggregationService {
 
   private async computeStoredAgentEvents(filter: T.AgentEventQuery): Promise<T.AgentEventList> {
     if (!this.judge.storageStatus().clickhouseReady) {
-      return { ...this.agentEvents(filter), totalApproximate: true, storageFallback: 'hot_ring' };
+      const fallback = this.agentEvents(filter);
+      return {
+        ...fallback,
+        totalMode: 'estimated',
+        totalApproximate: true,
+        storageFallback: 'hot_ring',
+        coverage: { ...fallback.coverage, totalMode: 'estimated' },
+      };
     }
     const pinnedEventId = filter.eventId?.trim();
     const window = resolveTimeWindow(filter);
     const limit = Math.max(1, Math.min(200, filter.limit ?? 40));
-    const scanLimit = Math.min(20_000, Math.max(2_000, limit * 50));
-    const committedCutoffMs = this.judge.committedEventCutoffMs();
+    const scanLimit = Math.min(10_000, Math.max(2_000, limit * 50));
+    const durableJudge = this.judge as unknown as {
+      committedEventCutoffMs?: () => number | undefined;
+      searchStoredEventsPage?: (query: StoredEventQuery) => Promise<StoredEventSearchResult>;
+      searchStoredEvents?: (query: StoredEventQuery) => Promise<T.JudgedEvent[] | null>;
+      queryRange?: (startMs: number, untilMs: number) => T.JudgedEvent[];
+      query?: (sinceMs: number) => T.JudgedEvent[];
+    };
+    const committedCutoffMs = durableJudge.committedEventCutoffMs?.();
     const plan = planDashboardRead(window.startMs, window.endMs, committedCutoffMs);
     const persistedUntilMs = plan.persistedUntilMs ?? window.endMs;
-    const persistentPage = await this.judge.searchStoredEventsPage({
+    const persistentQuery: StoredEventQuery = {
       sinceMs: pinnedEventId ? 0 : window.startMs,
-      untilMs: pinnedEventId ? window.endMs : persistedUntilMs,
+      untilMs: pinnedEventId ? Math.max(window.endMs, now()) : persistedUntilMs,
       eventId: pinnedEventId,
-      sourceId: filter.sourceId,
-      collectorId: filter.collectorId,
-      agentId: filter.agentAssetId ? undefined : filter.agentId,
-      agentInstanceId: filter.agentInstanceId,
-      sessionId: filter.sessionId,
-      workspacePath: filter.agentAssetId ? undefined : filter.workspacePath,
-      traceId: filter.traceId,
-      runId: filter.runId,
-      eventKind: filter.eventKind,
-      eventCategory: filter.eventCategory,
-      verdict: filter.verdict,
-      tier: filter.tier,
+      sourceId: pinnedEventId ? undefined : filter.sourceId,
+      collectorId: pinnedEventId ? undefined : filter.collectorId,
+      agentId: pinnedEventId || filter.agentAssetId ? undefined : filter.agentId,
+      agentInstanceId: pinnedEventId ? undefined : filter.agentInstanceId,
+      sessionId: pinnedEventId ? undefined : filter.sessionId,
+      workspacePath: pinnedEventId || filter.agentAssetId ? undefined : filter.workspacePath,
+      traceId: pinnedEventId ? undefined : filter.traceId,
+      runId: pinnedEventId ? undefined : filter.runId,
+      eventKind: pinnedEventId ? undefined : filter.eventKind,
+      eventCategory: pinnedEventId ? undefined : filter.eventCategory,
+      verdict: pinnedEventId ? undefined : filter.verdict,
+      tier: pinnedEventId ? undefined : filter.tier,
       limit: scanLimit,
-    });
-    if (persistentPage.unavailable) {
-      return this.agentEvents(filter);
+    };
+    let persistentPage: StoredEventSearchResult;
+    if (typeof durableJudge.searchStoredEventsPage === 'function') {
+      persistentPage = await durableJudge.searchStoredEventsPage(persistentQuery);
+    } else {
+      // Older/minimal judge adapters expose only the row-list search. Preserve that contract while
+      // production uses the page form for explicit availability, scan truncation and commit data.
+      const events = typeof durableJudge.searchStoredEvents === 'function'
+        ? await durableJudge.searchStoredEvents(persistentQuery)
+        : null;
+      persistentPage = {
+        events: events ?? [],
+        hasMore: Boolean(events && events.length >= scanLimit),
+        unavailable: events === null,
+        committedCutoffMs,
+      };
     }
     // A collector/partition event-time watermark is not available yet. Query the bounded hot
     // overlap defensively and remove overlap by stable eventId before aggregation. Splitting only
     // at max(at) would lose a late event that is buffered with an event time below that maximum.
-    const hot = this.judge.queryRange(pinnedEventId ? 0 : plan.hotFromMs, window.endMs);
+    const hotFromMs = pinnedEventId
+      ? 0
+      : persistentPage.unavailable
+        ? window.startMs
+        : plan.hotFromMs;
+    const hot = typeof durableJudge.queryRange === 'function'
+      ? durableJudge.queryRange(hotFromMs, window.endMs)
+      : (durableJudge.query?.(hotFromMs) ?? []).filter((event) => event.at <= window.endMs);
     const folded = foldLatestEventRevisions([...persistentPage.events, ...hot]);
     const filtered = this.filterEvents(folded, filter).sort((a, b) =>
       Number(Boolean(pinnedEventId) && b.eventId === pinnedEventId) - Number(Boolean(pinnedEventId) && a.eventId === pinnedEventId) ||
@@ -1053,16 +1162,28 @@ export class AggregationService {
     const compacted = filter.scope === 'raw' || pinnedEventId
       ? filtered.map((event) => ({ event, repeatCount: 1, lastAt: event.at }))
       : compactEvents(filtered);
-    const totalMode: T.QueryTotalMode = persistentPage.hasMore ? 'estimated' : 'exact';
+    const totalMode: T.QueryTotalMode = persistentPage.unavailable || persistentPage.hasMore
+      ? 'estimated'
+      : 'exact';
     return {
       items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) => this.eventItem(event, repeatCount, lastAt)),
       total: compacted.length,
       totalMode,
+      totalApproximate: totalMode === 'estimated' ? true : undefined,
+      storageFallback: persistentPage.unavailable ? 'hot_ring' : undefined,
       coverage: this.queryCoverage(filter, filtered, {
-        source: hot.length ? 'clickhouse+hot_delta' : 'clickhouse',
+        source: persistentPage.unavailable
+          ? 'memory_hot_ring'
+          : hot.length
+            ? 'clickhouse+hot_delta'
+            : 'clickhouse',
         totalMode,
-        partial: persistentPage.hasMore,
-        partialReason: persistentPage.hasMore ? 'scan_limit' : undefined,
+        partial: persistentPage.unavailable || persistentPage.hasMore,
+        partialReason: persistentPage.unavailable
+          ? 'hot_ring_only'
+          : persistentPage.hasMore
+            ? 'scan_limit'
+            : undefined,
         committedCutoffMs: persistentPage.committedCutoffMs,
       }),
       updateTime: iso(),
@@ -2872,7 +2993,7 @@ export class AggregationService {
       const runtimeInstanceId = agentRuntimeInstanceIdForEvent(e);
       const runtimeLocation = detectedAgentIdentity(e).locationLabel ?? canonicalWorkspacePath;
       const isPinnedEvent = Boolean(pinnedEventId && e.eventId === pinnedEventId);
-      const matchesEntityScope =
+      const matchesDirectScope =
         (!agentAssetId || resolved.agentAssetId === agentAssetId) &&
         (!agentInstanceId || runtimeInstanceId === agentInstanceId) &&
         (!agentId || [e.agentId, canonicalAgentId, canonicalAgentLabel].includes(agentId)) &&
@@ -2880,9 +3001,9 @@ export class AggregationService {
         (!collectorId || collectorRef === collectorId) &&
         (!sourceId || sourceRef === sourceId);
       const matchesRelationshipScope =
-        matchesEntityScope &&
+        matchesDirectScope &&
         (includeBenign || e.verdict !== 'allow');
-      if (!pinnedEdgeId && !isPinnedEvent && !matchesEntityScope) continue;
+      if (!pinnedEdgeId && !isPinnedEvent && !matchesDirectScope) continue;
 
       const target = topologyTarget(e);
       const agentNodeId = nodeId(
@@ -2942,7 +3063,7 @@ export class AggregationService {
         ].some((v) => (v ?? '').toLowerCase().includes(q));
       const rosterMatch =
         windowedEventIds.has(e.eventId) &&
-        matchesEntityScope &&
+        matchesDirectScope &&
         matchesText;
       const normalMatch =
         rosterMatch &&
@@ -3085,8 +3206,8 @@ export class AggregationService {
       source: hasRedisCurrent
         ? 'clickhouse+redis_current'
         : hotHeartbeats.some((hot) => !persistedHeartbeats.some((saved) => saved.collectorId === hot.collectorId && saved.at === hot.at))
-        ? 'clickhouse+hot_delta'
-        : 'clickhouse',
+          ? 'clickhouse+hot_delta'
+          : 'clickhouse',
     });
   }
 
@@ -3101,13 +3222,34 @@ export class AggregationService {
     const window = resolveTimeWindow(filter);
     const sinceMs = window.startMs;
     const spanMs = window.spanMs;
-    const windowHeartbeats = durable?.heartbeats
-      ?? this.judge.queryCollectorHeartbeats(window.startMs, window.endMs);
-    const latestAtSnapshot = durable?.latest
-      ?? this.judge.latestCollectorHeartbeats(window.endMs);
+    // Some legacy/minimal judge implementations accept only `sinceMs`; enforce the closed custom
+    // end boundary here as well so a newer live heartbeat cannot leak into an historical snapshot.
+    const windowHeartbeats = (durable?.heartbeats
+      ?? this.judge.queryCollectorHeartbeats(window.startMs, window.endMs))
+      .filter((heartbeat) => heartbeat.at >= window.startMs && heartbeat.at <= window.endMs);
+    const rawHeartbeatHeads = durable
+      ? {
+          latest: durable.latest,
+          latestMetrics: durable.latest.filter((heartbeat) => heartbeat.filterMetricsReportedAt !== undefined),
+          latestRaw: durable.latest.filter((heartbeat) => heartbeat.origin === 'raw_collector'),
+          latestForwarder: durable.latest.filter((heartbeat) => heartbeat.origin === 'forwarder'),
+        }
+      : this.judge.collectorHeartbeatHeads();
+    const heartbeatHeads = {
+      latest: rawHeartbeatHeads.latest.filter((heartbeat) => heartbeat.at <= window.endMs),
+      latestMetrics: rawHeartbeatHeads.latestMetrics.filter((heartbeat) => heartbeat.at <= window.endMs),
+      latestRaw: rawHeartbeatHeads.latestRaw.filter((heartbeat) => heartbeat.at <= window.endMs),
+      latestForwarder: rawHeartbeatHeads.latestForwarder.filter((heartbeat) => heartbeat.at <= window.endMs),
+    };
+    const latestHeartbeatByCollector = new Map(heartbeatHeads.latest.map((heartbeat) => [heartbeat.collectorId, heartbeat]));
+    const latestMetricsByCollector = new Map(heartbeatHeads.latestMetrics.map((heartbeat) => [heartbeat.collectorId, heartbeat]));
+    const latestRawByCollector = new Map(heartbeatHeads.latestRaw.map((heartbeat) => [heartbeat.collectorId, heartbeat]));
+    const latestForwarderByCollector = new Map(
+      heartbeatHeads.latestForwarder.map((heartbeat) => [heartbeat.collectorId, heartbeat]),
+    );
     const byCollector = new Map<string, T.CollectorHeartbeatRecord[]>();
     for (const hb of windowHeartbeats) (byCollector.get(hb.collectorId) ?? byCollector.set(hb.collectorId, []).get(hb.collectorId)!).push(hb);
-    for (const hb of latestAtSnapshot) {
+    for (const hb of heartbeatHeads.latest) {
       if (!byCollector.has(hb.collectorId)) byCollector.set(hb.collectorId, []);
     }
 
@@ -3120,8 +3262,14 @@ export class AggregationService {
       down: '断流',
     };
     const items = [...byCollector.entries()].map(([collectorId, hbs]): T.CollectorHealthItem => {
-      const latest = [...hbs, ...latestAtSnapshot.filter((hb) => hb.collectorId === collectorId)]
-        .sort((a, b) => b.at - a.at)[0];
+      const latest = latestHeartbeatByCollector.get(collectorId);
+      const latestMetricsHeartbeat = latestMetricsByCollector.get(collectorId);
+      const latestRawHeartbeat = latestRawByCollector.get(collectorId);
+      const latestForwarderHeartbeat = latestForwarderByCollector.get(collectorId);
+      const freshMetricsHeartbeat = latestMetricsHeartbeat?.filterMetricsReportedAt !== undefined &&
+        t - latestMetricsHeartbeat.filterMetricsReportedAt <= COLLECTOR_STALE_MS
+        ? latestMetricsHeartbeat
+        : undefined;
       const categoryCounts = Object.fromEntries(EVENT_CATEGORIES.map((category) => [category, 0])) as Record<T.EventCategory, number>;
       let eventCount = 0;
       let observedAgentCount = 0;
@@ -3387,7 +3535,18 @@ export class AggregationService {
       this.collectorHealth({ timeType: filter.timeType, startTime: filter.startTime, endTime: filter.endTime, limit: 500 });
     const agents = durable?.agents ??
       this.agentInventory({ timeType: filter.timeType, startTime: filter.startTime, endTime: filter.endTime, scope: 'agent', limit: 500 });
-    const sourceList = this.sources.list({ status: 'all', type: 'all', limit: 500 });
+    // A directly scoped source or issue must also participate when it is a verifier
+    // source. IngestionSourceService deliberately hides verifier sources from broad
+    // inventory views, while an exact sourceId/issueId is an explicit operator
+    // selection. The issue list is pinned again below, so enabling verifier inputs for
+    // an exact issue cannot widen the returned issue inventory.
+    const sourceList = this.sources.list({
+      status: 'all',
+      type: 'all',
+      sourceId: filter.sourceId,
+      includeVerification: Boolean(filter.issueId),
+      limit: 500,
+    });
     const collectorById = new Map(collectors.items.map((collector) => [collector.collectorId, collector]));
     const activeCollectorIds = new Set(
       collectors.items

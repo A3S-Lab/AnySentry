@@ -5,38 +5,27 @@ import {
   Activity,
   AlertTriangle,
   BarChart3,
-  BellRing,
   Bot,
-  CalendarClock,
   EyeOff,
-  FileCheck2,
   Gauge,
   GitBranch,
   Layers3,
-  LayoutDashboard,
   LoaderCircle,
-  Megaphone,
   type LucideIcon,
   Network,
-  PlugZap,
   Radar,
   RadioTower,
   RefreshCw,
-  Target,
   ShieldAlert,
   ShieldCheck,
-  SlidersHorizontal,
   ShieldQuestion,
   Siren,
   Sparkles,
-  ServerCog,
   TerminalSquare,
-  Wrench,
   Zap,
 } from "lucide-react";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { AdminTokenControl } from "@/components/custom/admin-token-control";
 import { AgentAssetIdentityInline, AgentIdentityInline } from "@/components/custom/agent-identity";
 import { useVChartTheme } from "@/components/custom/charts/vchart-theme";
 import { type VChartSpec, VChartView } from "@/components/custom/vchart";
@@ -627,212 +616,6 @@ function DashboardSection({
       </div>
       {children}
     </section>
-  );
-}
-
-function DashboardViewNavigation({
-  value,
-  supplyChainEnabled,
-  onChange,
-}: {
-  value: DashboardView;
-  supplyChainEnabled: boolean;
-  onChange: (value: DashboardView) => void;
-}) {
-  const { t } = useI18n();
-  const items = DASHBOARD_VIEWS.filter((item) => item.value !== "supplyChain" || supplyChainEnabled);
-  const overviewItems = items.filter((item) =>
-    ["overview", "scan", "risk", "stream"].includes(item.value),
-  );
-  const platformItems = items.filter((item) =>
-    ["events", "workspace"].includes(item.value),
-  );
-  const governanceItems = items.filter((item) => item.value === "supplyChain");
-  const renderDesktopItem = (item: (typeof items)[number]) => {
-    const Icon = item.icon;
-    const active = item.value === value;
-    return (
-      <button
-        key={item.value}
-        type="button"
-        aria-current={active ? "page" : undefined}
-        className={cn(
-          "flex w-full items-start gap-2.5 rounded-md border px-2.5 py-2 text-left transition-colors",
-          active
-            ? "border-transparent bg-[#1c222d] text-[#e8ecf3] shadow-[inset_2px_0_0_#f97316]"
-            : "border-transparent text-[#b6bdcc] hover:bg-[#151a23] hover:text-[#e8ecf3]",
-        )}
-        onClick={() => onChange(item.value)}
-      >
-        <span
-          className={cn(
-            "mt-0.5 inline-flex size-5 shrink-0 items-center justify-center",
-            active ? "text-[#f97316]" : "text-[#818a9c]",
-          )}
-        >
-          <Icon className="size-3.5" />
-        </span>
-        <span className="min-w-0">
-          <span className="block text-xs font-semibold leading-[1.45]">{t(item.label)}</span>
-          <span className={cn("mt-0.5 block text-[10.5px] leading-4", active ? "text-[#818a9c]" : "text-[#5b6373]")}>
-            {t(item.description)}
-          </span>
-        </span>
-      </button>
-    );
-  };
-  return (
-    <>
-      <aside className="hidden h-full w-[220px] shrink-0 overflow-y-auto rounded-lg border border-[#232a37] bg-[#0f131a] p-1.5 lg:block">
-        <nav className="space-y-1" aria-label={t("安全监控模块")}>
-          <p className="flex items-center gap-2 px-3 pb-1 pt-3 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
-            <LayoutDashboard className="size-3.5" />
-            {t("概览")}
-          </p>
-          {overviewItems.map(renderDesktopItem)}
-          <Link
-            to="/alerts"
-            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
-          >
-            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
-              <BellRing className="size-3.5" />
-            </span>
-            <span className="min-w-0">
-              <span className="block text-xs font-semibold leading-[1.45]">{t("告警")}</span>
-              <span className="mt-0.5 block text-[10.5px] leading-4 text-[#5b6373]">{t("活跃告警与处置")}</span>
-            </span>
-          </Link>
-
-          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
-            <ServerCog className="size-3.5" />
-            {t("平台监控")}
-          </p>
-          {platformItems.map(renderDesktopItem)}
-          <Link
-            to="/agents"
-            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
-          >
-            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
-              <Bot className="size-3.5" />
-            </span>
-            <span className="block text-xs font-semibold leading-[1.45]">{t("智能体资产")}</span>
-          </Link>
-          <Link
-            to="/workspaces"
-            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
-          >
-            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
-              <Layers3 className="size-3.5" />
-            </span>
-            <span className="block text-xs font-semibold leading-[1.45]">Workspace</span>
-          </Link>
-
-          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
-            <Wrench className="size-3.5" />
-            {t("运维")}
-          </p>
-          <Link
-            to="/maintenance"
-            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
-          >
-            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
-              <CalendarClock className="size-3.5" />
-            </span>
-            <span className="block text-xs font-semibold leading-[1.45]">{t("维护")}</span>
-          </Link>
-          <Link
-            to="/admin/policy"
-            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
-          >
-            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
-              <SlidersHorizontal className="size-3.5" />
-            </span>
-            <span className="min-w-0">
-              <span className="block text-xs font-semibold leading-[1.45]">{t("策略配置")}</span>
-              <span className="mt-0.5 block text-[10.5px] leading-4 text-[#5b6373]">{t("L1 / L2 / L3 研判策略")}</span>
-            </span>
-          </Link>
-
-          {governanceItems.length > 0 ? (
-            <>
-              <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
-                <ShieldAlert className="size-3.5" />
-                {t("安全治理")}
-              </p>
-              {governanceItems.map(renderDesktopItem)}
-            </>
-          ) : null}
-
-          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
-            <SlidersHorizontal className="size-3.5" />
-            {t("管理")}
-          </p>
-          <AdminTokenControl navigation />
-        </nav>
-      </aside>
-
-      <nav
-        className="flex shrink-0 gap-2 overflow-x-auto rounded-lg border border-[#232a37] bg-[#0f131a] p-2 lg:hidden"
-        aria-label={t("安全监控模块")}
-      >
-        {items.map((item) => {
-          const Icon = item.icon;
-          const active = item.value === value;
-          return (
-            <button
-              key={item.value}
-              type="button"
-              aria-current={active ? "page" : undefined}
-              className={cn(
-                "inline-flex shrink-0 items-center gap-1.5 rounded-md border px-3 py-2 text-xs transition-colors",
-                active
-                  ? "border-[#f97316]/40 bg-[#f97316]/15 text-[#e8ecf3]"
-                  : "border-[#232a37] bg-[#151a23] text-[#818a9c]",
-              )}
-              onClick={() => onChange(item.value)}
-            >
-              <Icon className="size-3.5" />
-              {t(item.label)}
-            </button>
-          );
-        })}
-        <Link
-          to="/agents"
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-[#232a37] bg-[#151a23] px-3 py-2 text-xs text-[#818a9c]"
-        >
-          <Bot className="size-3.5" />
-          {t("智能体资产")}
-        </Link>
-        <Link
-          to="/workspaces"
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-[#232a37] bg-[#151a23] px-3 py-2 text-xs text-[#818a9c]"
-        >
-          <Layers3 className="size-3.5" />
-          Workspace
-        </Link>
-        <Link
-          to="/alerts"
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-[#232a37] bg-[#151a23] px-3 py-2 text-xs text-[#818a9c]"
-        >
-          <BellRing className="size-3.5" />
-          {t("告警")}
-        </Link>
-        <Link
-          to="/maintenance"
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-[#232a37] bg-[#151a23] px-3 py-2 text-xs text-[#818a9c]"
-        >
-          <CalendarClock className="size-3.5" />
-          {t("维护")}
-        </Link>
-        <Link
-          to="/admin/policy"
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-[#232a37] bg-[#151a23] px-3 py-2 text-xs text-[#818a9c]"
-        >
-          <SlidersHorizontal className="size-3.5" />
-          {t("策略配置")}
-        </Link>
-      </nav>
-    </>
   );
 }
 
@@ -2445,8 +2228,8 @@ function AgentRiskOverviewPanel({
           <p className="text-xs text-zinc-500">{t("集中查看智能体身份、运行状态与近期关联风险")}</p>
           <div className="inline-flex rounded-md border border-white/10 bg-black/20 p-1" aria-label="智能体风险概览视角">
             {([
-              { key: "assets" as const, label: t("智能体资产"), count: agentAssetTotal },
-              { key: "window" as const, label: t("时间窗分析"), count: profileViews.length },
+              { key: "assets" as const, label: "智能体资产", count: agentAssetTotal },
+              { key: "window" as const, label: "时间窗分析", count: profileViews.length },
             ]).map((item) => (
               <button
                 key={item.key}
@@ -2458,7 +2241,7 @@ function AgentRiskOverviewPanel({
                   view === item.key ? "bg-teal-300/15 text-teal-100 shadow-sm" : "text-zinc-500 hover:text-zinc-300",
                 )}
               >
-                {item.label} · {item.count}
+                {t(item.label)} · {item.count}
               </button>
             ))}
           </div>
@@ -2512,6 +2295,12 @@ function AgentRiskOverviewPanel({
         ) : (
           <div className="space-y-4">
             <InlineError message={findingsError} />
+            <div className="flex justify-end">
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-violet-400/30 bg-violet-400/10 px-2.5 py-1 text-[11px] text-violet-200">
+                <EyeOff className="size-3" />
+                {t("观察模式 · 不影响系统操作")}
+              </span>
+            </div>
             {!findings?.enabled ? (
               <div className="rounded-md border border-dashed border-white/10 px-4 py-10 text-center">
                 <p className="text-sm font-medium text-zinc-300">{t("流式分析当前未启用")}</p>
@@ -2648,7 +2437,7 @@ function AgentRiskOverviewPanel({
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
                     <p className="text-sm font-semibold text-zinc-100">{t("行为片段复合研判")}</p>
-                    <p className="mt-0.5 text-xs text-zinc-500">{t("Flink 聚合连续行为；完整确定性证据直接研判，歧义证据只调用一次模型；结论仅用于旁路告警")}</p>
+                    <p className="mt-0.5 text-xs text-zinc-500">{t("持续聚合连续行为；完整确定性证据直接研判，歧义证据只调用一次模型；结论仅用于旁路告警")}</p>
                   </div>
                   {syntheticEpisodes.length > 0 && (
                     <button
@@ -2811,7 +2600,7 @@ function AgentRiskOverviewPanel({
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                   {[
                     { label: "结果消费", value: findings.enabled ? "正常" : "未连接", detail: "AnySentry 已读取流式结果" },
-                    { label: "运行模式", value: "Shadow", detail: "不进入同步阻断链路" },
+                    { label: "运行模式", value: "观察", detail: "不进入同步阻断链路" },
                     { label: "结果总数", value: findings.riskProfiles.length + visibleCompositeIncidents.length, detail: findings.riskProfiles.length + " 画像 / " + visibleCompositeIncidents.length + " 复合 Incident" },
                     { label: "规则版本", value: ruleVersions.join(", ") || "--", detail: "画像输出携带的规则版本" },
                   ].map((item) => (
@@ -3281,6 +3070,7 @@ function AgentEventTimelinePanel({
 }) {
   const { locale, t } = useI18n();
   const items = events?.items ?? [];
+  const totalApproximate = Boolean(events?.totalApproximate || events?.totalMode === "estimated");
 
   return (
     <Panel
@@ -3315,8 +3105,12 @@ function AgentEventTimelinePanel({
               <SelectItem value="Agent">L3</SelectItem>
             </SelectContent>
           </Select>
-          <span className="text-xs text-zinc-500">
-            {events ? `${formatNumber(events.total)}${events.totalMode === "estimated" ? "+" : ""} ${locale === "en" ? "events" : "条"}` : "--"}
+          <span
+            className="text-xs text-zinc-500"
+            title={totalApproximate ? (locale === "en" ? "Bounded approximate distinct count" : "大窗口使用有界近似去重统计") : undefined}
+            aria-label={events ? `${totalApproximate ? (locale === "en" ? "Approximately " : "约 ") : ""}${formatNumber(events.total)} ${locale === "en" ? "events" : "条事件"}` : undefined}
+          >
+            {events ? `${events.totalApproximate ? "≈" : events.totalMode === "estimated" ? "≈" : ""}${formatNumber(events.total)} ${locale === "en" ? "events" : "条"}` : "--"}
           </span>
           <Link to="/events" className="text-xs text-teal-300 hover:text-teal-200">{t("查看全部")}</Link>
         </div>

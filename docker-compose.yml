@@ -16,8 +16,11 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-anysentry}
     volumes:
       - clickhouse-data:/var/lib/clickhouse
-      - ./config/clickhouse/anysentry-server.xml:/etc/clickhouse-server/config.d/anysentry-server.xml:ro
-      - ./config/clickhouse/anysentry-users.xml:/etc/clickhouse-server/users.d/anysentry-users.xml:ro
+      - ./config/clickhouse/anysentry-server.xml:/etc/clickhouse-server/config.d/10-anysentry-server.xml:ro
+      - ./deploy/clickhouse-memory.xml:/etc/clickhouse-server/config.d/20-anysentry-memory.xml:ro
+      - ./config/clickhouse/anysentry-users.xml:/etc/clickhouse-server/users.d/10-anysentry-users.xml:ro
+    mem_limit: 4g
+    memswap_limit: 4g
     healthcheck:
       test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' >/dev/null 2>&1 || exit 1"]
       interval: 5s
@@ -68,7 +71,7 @@ services:
         condition: service_healthy
     environment:
       PORT: 29653
-      ANYSENTRY_EVENT_RING_MAX: ${ANYSENTRY_EVENT_RING_MAX:-10000}
+      ANYSENTRY_HOT_EVENT_LIMIT: ${ANYSENTRY_HOT_EVENT_LIMIT:-10000}
       ANYSENTRY_OBSERVER_BODY_LIMIT: ${ANYSENTRY_OBSERVER_BODY_LIMIT:-4mb}
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-anysentry}
@@ -351,9 +354,11 @@ services:
     environment:
       ANYSENTRY_STREAM_WORKER_ROLE: judge
       ANYSENTRY_REDIS_URL: redis://redis:6379/0
-      ANYSENTRY_COMPOSITE_LLM_URL: ${ANYSENTRY_COMPOSITE_LLM_URL:-http://host.docker.internal:18051/v1}
-      ANYSENTRY_COMPOSITE_LLM_KEY: ${ANYSENTRY_COMPOSITE_LLM_KEY:-proxy-managed}
-      ANYSENTRY_COMPOSITE_MODEL: ${ANYSENTRY_COMPOSITE_MODEL:-glm-5.2}
+      ANYSENTRY_COMPOSITE_LLM_URL: ${ANYSENTRY_COMPOSITE_LLM_URL:-}
+      ANYSENTRY_COMPOSITE_LLM_KEY: ${ANYSENTRY_COMPOSITE_LLM_KEY:-}
+      # Empty means: follow the Deep Investigation runtime model/Secret; the worker keeps the
+      # historical glm fallback only when neither runtime nor A3S model configuration exists.
+      ANYSENTRY_COMPOSITE_MODEL: ${ANYSENTRY_COMPOSITE_MODEL:-}
       ANYSENTRY_COMPOSITE_TIMEOUT_MS: ${ANYSENTRY_COMPOSITE_TIMEOUT_MS:-60000}
       ANYSENTRY_COMPOSITE_CONCURRENCY: ${ANYSENTRY_COMPOSITE_CONCURRENCY:-2}
       ANYSENTRY_COMPOSITE_MAX_EVENT_AGE_MS: ${ANYSENTRY_COMPOSITE_MAX_EVENT_AGE_MS:-900000}

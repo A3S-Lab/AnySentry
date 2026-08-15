@@ -218,12 +218,17 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       .map((record) => this.item(record))
       .filter((item) => {
         const matchesSourceId = Boolean(sourceId && item.sourceId === sourceId);
-        if (!query.includeVerification && !matchesSourceId && isVerificationSource(item)) return false;
+        const matchesCollectorId = Boolean(collectorId && item.collectorId === collectorId);
+        const matchesWorkspacePath = Boolean(workspacePath && item.workspacePath === workspacePath);
+        // Verification sources stay out of broad inventory views, but an operator's exact
+        // identity selector must remain authoritative and auditable.
+        const matchesExactIdentity = matchesSourceId || matchesCollectorId || matchesWorkspacePath;
+        if (!query.includeVerification && !matchesExactIdentity && isVerificationSource(item)) return false;
         const matchesFilter =
           (!query.status || query.status === 'all' || item.status === query.status) &&
           (!query.type || query.type === 'all' || item.type === query.type) &&
-          (!collectorId || item.collectorId === collectorId) &&
-          (!workspacePath || item.workspacePath === workspacePath) &&
+          (!collectorId || matchesCollectorId) &&
+          (!workspacePath || matchesWorkspacePath) &&
           (!q || [item.sourceId, item.name, item.type, item.collectorId, item.workspacePath, item.owner, item.team, item.environment, item.note, ...(item.tags ?? [])].some((value) => (value ?? '').toLowerCase().includes(q)));
         if (sourceId && !hasFilter) return matchesSourceId;
         return matchesSourceId || matchesFilter;

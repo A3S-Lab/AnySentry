@@ -63,7 +63,31 @@ export type EventCategory = 'tool' | 'network' | 'file' | 'llm' | 'security' | '
 export type EventAttributeValue = string | number | boolean;
 export type IncidentStatus = 'open' | 'acknowledged' | 'resolved';
 export type AgentHealthState = 'active' | 'idle' | 'stale' | 'risky';
+/** Event-history lifecycle used by inventory views; separate from root-process runtime state. */
 export type AgentLifecycleState = 'current' | 'historical' | 'terminated';
+/** Root-process lifecycle. This is intentionally separate from event-derived AgentHealthState. */
+export type AgentRuntimeReportedState = 'running' | 'exited' | 'lost';
+/** `unobserved` is derived by the API when a previously live forwarder stops reporting. */
+export type AgentRuntimeState = AgentRuntimeReportedState | 'unobserved';
+export type AgentActivityState = 'active' | 'idle';
+/** Stable machine-readable outcomes for the runtime lease/snapshot control plane. */
+export type AgentRuntimeAckReasonCode =
+  | 'lease_not_found'
+  | 'lease_epoch_stale'
+  | 'lease_owner_mismatch'
+  | 'stale_forwarder'
+  | 'collector_conflict'
+  | 'capacity_exceeded'
+  | 'validation_error'
+  | 'source_rejected'
+  | 'service_unavailable'
+  | 'snapshot_version_stale'
+  | 'snapshot_version_conflict'
+  | 'ready_regression'
+  | 'identity_conflict'
+  | 'generation_regression'
+  | 'terminal_state_conflict'
+  | 'awaiting_ready';
 export type AgentCriticality = 'low' | 'medium' | 'high' | 'critical';
 export type CollectorHealthState = 'healthy' | 'quiet' | 'degraded' | 'stale' | 'down';
 export type CollectorReportedStatus = 'ok' | 'degraded' | 'error';
@@ -887,6 +911,8 @@ export interface AgentEventList {
   total: number;
   totalMode: QueryTotalMode;
   coverage: QueryCoverage;
+  totalApproximate?: boolean;
+  storageFallback?: 'hot_ring';
   updateTime: string;
 }
 export interface AgentTimeline {

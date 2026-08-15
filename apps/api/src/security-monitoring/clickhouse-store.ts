@@ -3,14 +3,14 @@
 // for ambiguous outcomes, and graceful shutdown drain. Persisted rows hydrate the ring on boot so
 // ordinary restarts and rollouts preserve date windows.
 //
-// ClickHouse is the durable event and judgment fact store. Historical lists and aggregates query it
-// directly; the bounded in-memory ring only contributes uncommitted low-latency facts and fallback
-// reads while ClickHouse is unavailable. It must never decide whether historical data still exists.
+// This queue is not a WAL/outbox: a process or host failure can still lose rows that had not reached
+// ClickHouse. Crash-durable delivery would require a persistent WAL/outbox and upstream replay.
 //
 // Connection comes from env (CLICKHOUSE_URL/USER/PASSWORD/DB). If ClickHouse is unreachable the store
 // degrades to in-memory-only (the dashboard keeps working; just no persistence) rather than crashing.
 
-import { ClickHouseClient, createClient } from '@clickhouse/client';
+import { ClickHouseClient, createClient, type ClickHouseSettings } from '@clickhouse/client';
+import { createHash, randomUUID } from 'node:crypto';
 import { agentIdentityKeyForEvent, agentRuntimeInstanceIdForEvent, hasDirectAgentRootEvidence } from './agent-identity';
 import { foldLatestEventRevisions } from './event-revision';
 import {
@@ -247,10 +247,8 @@ const AUDIT_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${AUDIT_FACT_TABLE} (
 ORDER BY (auditId, at, ingestedAt)
 TTL ts + INTERVAL 365 DAY`;
 
-// A compact, append-only invalidation journal maintained by ClickHouse itself. Because the
-// materialized view is part of the event insert pipeline it also observes revisions written by
-// Fast Judge/L3 processes; an API-local generation counter would miss those cross-process writes.
-// The table is not an event store and is safe to retain for a much shorter period than evidence.
+// The journal observes inserts from every judge process, so cache invalidation is not limited to
+// this API process's local write queue.
 const EVENT_COMMIT_FACT_TABLE = 'event_commit_facts';
 const EVENT_COMMIT_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_COMMIT_FACT_TABLE} (
   eventId String,
@@ -275,10 +273,8 @@ AS SELECT
   collectorId
 FROM ${TABLE}`;
 
-// Complete aggregate snapshots, not incrementally accumulated counters. One JSON payload represents
-// the whole event-time bucket at a proven commit cursor, so a later revision can replace the bucket
-// without leaving the previous decision counted. The commit journal remains the authority that
-// determines whether a stored snapshot is still reusable.
+// These are complete, commit-cursor-qualified bucket snapshots. Revisions replace the complete
+// snapshot rather than incrementing a counter, which keeps late judgment updates exact.
 const DASHBOARD_BUCKET_SNAPSHOT_TABLE = 'dashboard_bucket_snapshots';
 const DASHBOARD_BUCKET_SNAPSHOT_DDL = `CREATE TABLE IF NOT EXISTS ${DASHBOARD_BUCKET_SNAPSHOT_TABLE} (
   bucketStart UInt64,
@@ -300,6 +296,56 @@ ORDER BY (
   snapshotVersion
 )
 TTL ts + INTERVAL 14 DAY`;
+
+// Dashboard reads must coexist with sustained Observer writes inside the bundled 2 GiB
+// ClickHouse budget. Large window aggregations spill early and use at most two read threads;
+// otherwise several dashboard panels can collectively consume the server budget and evict one
+// another before any result is returned.
+const BOUNDED_DASHBOARD_READ_SETTINGS: ClickHouseSettings = {
+  max_threads: 2,
+  max_memory_usage: String(384 * 1024 * 1024),
+  max_bytes_before_external_group_by: String(64 * 1024 * 1024),
+  max_bytes_before_external_sort: String(64 * 1024 * 1024),
+  min_bytes_to_use_direct_io: String(1024 * 1024),
+  max_execution_time: 25,
+};
+
+// Session/workspace queries materialize wider per-event state. Small blocks keep each below its
+// query budget; running only these two one-thread reads together keeps the cold dashboard under
+// the browser deadline without restoring the previous four-query fan-out.
+const BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS: ClickHouseSettings = {
+  ...BOUNDED_DASHBOARD_READ_SETTINGS,
+  max_threads: 1,
+  max_block_size: '1024',
+  preferred_block_size_bytes: String(1024 * 1024),
+};
+
+// Hydration reads wide rows rather than compact aggregates. A single read thread and small blocks
+// keep both ClickHouse and the API startup peak bounded, while a separate 640 MiB query budget
+// leaves measured headroom above the roughly 341 MiB production query peak.
+const BOUNDED_HYDRATE_READ_SETTINGS: ClickHouseSettings = {
+  ...BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
+  max_memory_usage: String(640 * 1024 * 1024),
+};
+
+// Recent event reads also materialize wide rows. Moving-window production samples exceeded the
+// shared 384 MiB budget by up to 2.5 MiB, so only this path gets a measured 448 MiB ceiling while
+// retaining one thread and small blocks.
+const BOUNDED_RECENT_READ_SETTINGS: ClickHouseSettings = {
+  ...BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
+  max_memory_usage: String(448 * 1024 * 1024),
+};
+
+// Durable searches manually late-materialize wide rows: the candidate sort carries only row
+// locators and judgment keys, then the outer PREWHERE fetches the selected physical revisions.
+// A 512 MiB ceiling bounds the locator set and at most 10k final JSON rows without restoring the
+// former 640 MiB SELECT-* sort budget.
+const BOUNDED_EVENT_SEARCH_READ_SETTINGS: ClickHouseSettings = {
+  ...BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
+  max_memory_usage: String(512 * 1024 * 1024),
+};
+
+const MAX_DURABLE_EVENT_SEARCH_ROWS = 10_000;
 
 type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'process' | 'attribution' | 'judgment' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview'> & {
   ingestedAt: number;
@@ -563,7 +609,7 @@ export interface DashboardWindowBucketRow {
 
 export interface DashboardWindowHistory {
   /** Distinct counts use ClickHouse's bounded approximate aggregate to avoid an unbounded hash set. */
-  countsApproximate: true;
+  countsApproximate?: true;
   dimensions: DashboardWindowDimensionRow[];
   buckets: DashboardWindowBucketRow[];
   topSession?: {
@@ -717,8 +763,23 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
 
 export class ClickHouseStore {
   private client?: ClickHouseClient;
-  private buf: Row[] = [];
+  private buf: QueuedEventRow[] = [];
   private collectorHeartbeatBuf: Array<{ collectorId: string; at: number; payload: string }> = [];
+  private bufferedEventBytes = 0;
+  // Includes unsealed rows plus sealed/active batches. Keeping the active batch in these totals
+  // prevents a slow HTTP request from becoming hidden memory outside the advertised buffer bound.
+  private eventWriteRows = 0;
+  private eventWriteBytes = 0;
+  private eventWriteBatches: EventWriteBatch[] = [];
+  private eventWriteBatchesByToken = new Map<string, EventWriteBatch>();
+  private eventWriteDrainInFlight?: Promise<void>;
+  private eventWriteRetryWakeTimer?: NodeJS.Timeout;
+  private eventWriteRetrySleep?: { timer: NodeJS.Timeout; wake: () => void };
+  private eventWriteAbortController?: AbortController;
+  private eventWritePermanentError?: Error;
+  private eventWriteClosingDeadline?: number;
+  private closeInFlight?: Promise<void>;
+  private closing = false;
   private flushTimer?: NodeJS.Timeout;
   private reconnectTimer?: NodeJS.Timeout;
   private connectInFlight?: Promise<boolean>;
@@ -874,6 +935,12 @@ export class ClickHouseStore {
       nextClient = createClient({ url, database, ...credentials });
       await nextClient.command({ query: DDL(TABLE) });
       for (const alter of EVENT_ALTERS) await nextClient.command({ query: `ALTER TABLE ${TABLE} ${alter}` });
+      // CREATE IF NOT EXISTS does not update an existing table. Explicitly enable the local
+      // MergeTree deduplication log so retrying an ambiguously acknowledged batch with the same
+      // token is idempotent on both fresh and upgraded installations.
+      await nextClient.command({
+        query: `ALTER TABLE ${TABLE} MODIFY SETTING non_replicated_deduplication_window = ${EVENT_DEDUPLICATION_WINDOW}`,
+      });
       await nextClient.command({ query: COLLECTOR_HEARTBEAT_DDL });
       await nextClient.command({ query: CONFIG_DDL });
       await nextClient.command({ query: NOTIFICATION_DELIVERY_DDL });
@@ -906,7 +973,7 @@ export class ClickHouseStore {
         if (!Number.isFinite(committedEventTimeMs) || committedEventTimeMs <= 0) continue;
         const sourceId = row.sourceId?.trim() || undefined;
         const collectorId = row.collectorId?.trim() || undefined;
-        this.committedSourceProgress.set(`${sourceId ?? ''}\u0000${collectorId ?? ''}`, {
+        this.committedSourceProgress.set(`${sourceId ?? ''}\0${collectorId ?? ''}`, {
           sourceId,
           collectorId,
           committedEventTimeMs,
@@ -923,8 +990,11 @@ export class ClickHouseStore {
       await this.client?.close().catch(() => undefined);
       this.client = nextClient;
       nextClient = undefined;
+      this.closing = false;
       if (this.flushTimer) clearInterval(this.flushTimer);
-      this.flushTimer = setInterval(() => void this.flush(), 2_000);
+      this.flushTimer = setInterval(() => {
+        void this.flush().catch(() => undefined);
+      }, 2000);
       if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
       this.ready = true;
@@ -979,22 +1049,34 @@ export class ClickHouseStore {
 
   /** Persist one lifecycle revision before acknowledging queue work. */
   async insertNow(e: JudgedEvent): Promise<void> {
-    if (!this.client || !this.ready) throw new Error('ClickHouse is not ready');
-    this.immediateWritesInFlight += 1;
-    try {
-      const row = toRow(e);
-      await this.client.insert({ table: TABLE, values: [row], format: 'JSONEachRow' });
-      this.committedThroughMs = Math.max(this.committedThroughMs ?? 0, e.at);
-      this.noteCommittedRows([row]);
-    } finally {
-      this.immediateWritesInFlight -= 1;
+    if (!this.client || !this.ready || this.closing) throw new Error('ClickHouse is not ready');
+    if (this.eventWritePermanentError) throw this.eventWritePermanentError;
+    const queued = this.queuedEventRow(toRow(e));
+    const token = this.directEventWriteToken(queued.row);
+    const existing = this.eventWriteBatchesByToken.get(token);
+    if (existing) {
+      const completion = new Promise<void>((resolve, reject) => existing.waiters.push({ resolve, reject }));
+      this.startEventWriteDrain();
+      return completion;
     }
+
+    this.assertEventWriteCapacity(queued.bytes);
+    // Preserve global event-write FIFO: a direct lifecycle revision may not jump over a partial
+    // buffered batch that was accepted earlier merely because the two-second timer has not fired.
+    this.sealBufferedEventBatches(true);
+    const batch = this.createEventWriteBatch([queued], token, 'direct');
+    this.eventWriteRows += 1;
+    this.eventWriteBytes += queued.bytes;
+    this.eventWriteBatches.push(batch);
+    this.eventWriteBatchesByToken.set(token, batch);
+    const completion = new Promise<void>((resolve, reject) => batch.waiters.push({ resolve, reject }));
+    this.startEventWriteDrain();
+    return completion;
   }
 
   async flush(): Promise<void> {
-    // Chain flushes instead of allowing two callers to drain the buffers concurrently. A caller
-    // arriving during an insert receives its own pass after that insert, so rows appended while
-    // the first batch is in flight are not stranded (including during close()).
+    // Serialize the heartbeat side buffer with event draining. The event queue has its own FIFO
+    // retry state, while this outer chain prevents two heartbeat inserts from racing.
     const previous = this.flushInFlight ?? Promise.resolve();
     const operation = previous
       .catch(() => undefined)
@@ -1008,100 +1090,40 @@ export class ClickHouseStore {
   }
 
   private async flushBatch(): Promise<void> {
-    if (!this.client) return;
-    const values = this.buf;
-    this.buf = [];
-    if (values.length) {
-      try {
-        await this.client.insert({ table: TABLE, values, format: 'JSONEachRow' });
-        this.committedThroughMs = Math.max(
-          this.committedThroughMs ?? 0,
-          ...values.map((row) => Number(row.at) || 0),
-        );
-        this.noteCommittedRows(values);
-      } catch (err) {
-        // A transient durable-store failure must not leave the hot ring as the only remaining
-        // copy. Put the failed batch before rows that arrived while the insert was in flight.
-        this.buf = [...values, ...this.buf];
-        console.error('[clickhouse] insert failed (batch queued for retry):', (err as Error).message);
-      }
-    }
+    const client = this.client;
+    if (!client) return;
+    this.sealBufferedEventBatches(true);
+    if (this.eventWriteBatches.length) await this.ensureEventWriteDrain();
+
     const heartbeatValues = this.collectorHeartbeatBuf;
     this.collectorHeartbeatBuf = [];
-    if (heartbeatValues.length) {
-      try {
-        await this.client.insert({
-          table: COLLECTOR_HEARTBEAT_TABLE,
-          values: heartbeatValues,
-          format: 'JSONEachRow',
-        });
-      } catch (err) {
-        this.collectorHeartbeatBuf = [...heartbeatValues, ...this.collectorHeartbeatBuf];
-        console.error('[clickhouse] collector heartbeat insert failed (batch queued for retry):', (err as Error).message);
-      }
+    if (!heartbeatValues.length) return;
+    try {
+      await client.insert({
+        table: COLLECTOR_HEARTBEAT_TABLE,
+        values: heartbeatValues,
+        format: 'JSONEachRow',
+      });
+    } catch (error) {
+      this.collectorHeartbeatBuf = [...heartbeatValues, ...this.collectorHeartbeatBuf];
+      console.error('[clickhouse] collector heartbeat insert failed (batch queued for retry):', (error as Error).message);
     }
   }
 
-  enqueueCollectorHeartbeat(record: CollectorHeartbeatRecord): void {
-    if (!this.ready) return;
-    this.collectorHeartbeatBuf.push({
-      collectorId: record.collectorId,
-      at: record.at,
-      payload: JSON.stringify(record),
-    });
-    if (this.collectorHeartbeatBuf.length >= 100) void this.flush();
-  }
-
-  async queryCollectorHeartbeats(sinceMs: number, untilMs: number): Promise<CollectorHeartbeatRecord[] | null> {
-    if (!this.client || !this.ready) return null;
-    try {
-      const result = await this.client.query({
-        query: `
-          SELECT argMax(payload, at) AS payload
-          FROM ${COLLECTOR_HEARTBEAT_TABLE}
-          WHERE at >= {since:UInt64} AND at <= {until:UInt64}
-          GROUP BY collectorId, at
-          ORDER BY at`,
-        query_params: { since: sinceMs, until: untilMs },
-        format: 'JSONEachRow',
+  private queuedEventRow(row: Row): QueuedEventRow {
+    const bytes = Buffer.byteLength(JSON.stringify(row), 'utf8') + 1;
+    if (bytes > EVENT_WRITE_BATCH_BYTES) {
+      const error = Object.assign(
+        new Error(`ClickHouse event row is ${bytes} bytes, above the ${EVENT_WRITE_BATCH_BYTES}-byte insert bound`),
+        { code: 'ANYSENTRY_CLICKHOUSE_EVENT_ROW_TOO_LARGE' },
+      );
+      console.error('[clickhouse] event write rejected:', {
+        code: error.code,
+        eventId: row.eventId,
+        bytes,
+        maxBytes: EVENT_WRITE_BATCH_BYTES,
       });
-      const rows = await result.json() as Array<{ payload: string }>;
-      return rows.flatMap((row) => {
-        try {
-          return [JSON.parse(row.payload) as CollectorHeartbeatRecord];
-        } catch {
-          return [];
-        }
-      });
-    } catch (error) {
-      console.error('[clickhouse] collector heartbeat query failed:', (error as Error).message);
-      return null;
-    }
-  }
-
-  async latestCollectorHeartbeats(untilMs: number): Promise<CollectorHeartbeatRecord[] | null> {
-    if (!this.client || !this.ready) return null;
-    try {
-      const result = await this.client.query({
-        query: `
-          SELECT argMax(payload, at) AS payload
-          FROM ${COLLECTOR_HEARTBEAT_TABLE}
-          WHERE at <= {until:UInt64}
-          GROUP BY collectorId`,
-        query_params: { until: untilMs },
-        format: 'JSONEachRow',
-      });
-      const rows = await result.json() as Array<{ payload: string }>;
-      return rows.flatMap((row) => {
-        try {
-          return [JSON.parse(row.payload) as CollectorHeartbeatRecord];
-        } catch {
-          return [];
-        }
-      });
-    } catch (error) {
-      console.error('[clickhouse] latest collector heartbeat query failed:', (error as Error).message);
-      return null;
+      throw error;
     }
     return { row, bytes };
   }
@@ -1178,7 +1200,11 @@ export class ClickHouseStore {
   }
 
   private directEventWriteToken(row: Row): string {
-    return `event-${createHash('sha256').update(JSON.stringify(row)).digest('hex')}`;
+    // `ingestedAt` is assigned for each attempt and must not split two callers persisting the same
+    // lifecycle revision into distinct batches. The stable evidence/revision payload defines the
+    // idempotency token; ClickHouse still stores the timestamp from the first accepted caller.
+    const { ingestedAt: _ingestedAt, ...stableRevision } = row;
+    return `event-${createHash('sha256').update(JSON.stringify(stableRevision)).digest('hex')}`;
   }
 
   private startEventWriteDrain(): void {
@@ -1222,6 +1248,11 @@ export class ClickHouseStore {
       }
       const outcome = await this.insertEventWriteBatch(batch);
       if (outcome.status === 'success') {
+        this.committedThroughMs = Math.max(
+          this.committedThroughMs ?? 0,
+          ...batch.rows.map((row) => Number(row.at) || 0),
+        );
+        this.noteCommittedRows(batch.rows);
         this.eventWriteBatches.shift();
         this.eventWriteBatchesByToken.delete(batch.token);
         this.eventWriteRows = Math.max(0, this.eventWriteRows - batch.rows.length);
@@ -1427,6 +1458,71 @@ export class ClickHouseStore {
   }
 
   /** Load the most-recent `limit` events at/after `sinceMs`, oldest-first (to seed the hot ring). */
+  enqueueCollectorHeartbeat(record: CollectorHeartbeatRecord): void {
+    if (!this.ready) return;
+    this.collectorHeartbeatBuf.push({
+      collectorId: record.collectorId,
+      at: record.at,
+      payload: JSON.stringify(record),
+    });
+    if (this.collectorHeartbeatBuf.length >= 100) void this.flush();
+  }
+
+  async queryCollectorHeartbeats(sinceMs: number, untilMs: number): Promise<CollectorHeartbeatRecord[] | null> {
+    if (!this.client || !this.ready) return null;
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT argMax(payload, at) AS payload
+          FROM ${COLLECTOR_HEARTBEAT_TABLE}
+          WHERE at >= {since:UInt64} AND at <= {until:UInt64}
+          GROUP BY collectorId, at
+          ORDER BY at`,
+        query_params: { since: sinceMs, until: untilMs },
+        format: 'JSONEachRow',
+      });
+      const rows = await result.json() as Array<{ payload: string }>;
+      return rows.flatMap((row) => {
+        try {
+          return [JSON.parse(row.payload) as CollectorHeartbeatRecord];
+        } catch {
+          return [];
+        }
+      });
+    } catch (error) {
+      console.error('[clickhouse] collector heartbeat query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  async latestCollectorHeartbeats(untilMs: number): Promise<CollectorHeartbeatRecord[] | null> {
+    if (!this.client || !this.ready) return null;
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT argMax(payload, at) AS payload
+          FROM ${COLLECTOR_HEARTBEAT_TABLE}
+          WHERE at <= {until:UInt64}
+          GROUP BY collectorId`,
+        query_params: { until: untilMs },
+        format: 'JSONEachRow',
+      });
+      const rows = await result.json() as Array<{ payload: string }>;
+      return rows.flatMap((row) => {
+        try {
+          return [JSON.parse(row.payload) as CollectorHeartbeatRecord];
+        } catch {
+          return [];
+        }
+      });
+    } catch (error) {
+      console.error('[clickhouse] latest collector heartbeat query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  /** Load the most-recent `limit` events at/after `sinceMs`, oldest-first (to seed the hot ring). */
+
   async hydrate(sinceMs: number, limit: number): Promise<JudgedEvent[]> {
     if (!this.client) return [];
     const safeLimit = Math.max(1, Math.min(100_000, Math.round(limit)));
@@ -1456,7 +1552,12 @@ export class ClickHouseStore {
         format: 'JSONEachRow',
       });
       const rows = (await rs.json()) as Array<Record<string, unknown>>;
-      return foldLatestEventRevisions(rows.map(fromRow)).sort((a, b) => a.at - b.at).slice(-limit);
+      const latest = new Map<string, JudgedEvent>();
+      for (const event of rows.map(fromRow)) {
+        const previous = latest.get(event.eventId);
+        if (!previous || (event.decisionUpdatedAt ?? event.at) >= (previous.decisionUpdatedAt ?? previous.at)) latest.set(event.eventId, event);
+      }
+      return [...latest.values()].sort((a, b) => a.at - b.at).slice(-safeLimit);
     } catch (err) {
       console.error('[clickhouse] hydrate failed:', (err as Error).message);
       return [];
@@ -1496,13 +1597,19 @@ export class ClickHouseStore {
           SELECT *
           FROM (
             SELECT *
-            FROM ${TABLE}
-            WHERE ${clauses.join(' AND ')}
-            ORDER BY at DESC, decisionRevision DESC, decisionUpdatedAt DESC
-            LIMIT {scanLimit:UInt32}
+            FROM (
+              SELECT *
+              FROM ${TABLE}
+              PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}
+              ${scanFilters.length ? `WHERE ${scanFilters.join(' AND ')}` : ''}
+              ORDER BY at DESC
+              LIMIT {scanLimit:UInt32} WITH TIES
+            )
+            ORDER BY at DESC, decisionUpdatedAt DESC
+            LIMIT 1 BY eventId
           )
-          ORDER BY at DESC, decisionRevision DESC, decisionUpdatedAt DESC
-          LIMIT 1 BY eventId
+          ${latestFilters.length ? `WHERE ${latestFilters.join(' AND ')}` : ''}
+          ORDER BY at DESC, decisionUpdatedAt DESC
           LIMIT {limit:UInt32}`,
           query_params: {
             since: sinceMs,
@@ -2102,25 +2209,19 @@ export class ClickHouseStore {
               tier,
               riskType,
               riskCategory,
-              riskName,
-              uniqExact(eventId) AS eventCount,
+              argMax(riskName, decisionUpdatedAt) AS riskName,
+              uniqCombined64(eventId) AS eventCount,
               sum(tokenCount) AS tokenCount,
               sum(latencyMs) AS latencyTotal,
               sum(riskScore) AS riskScoreTotal
-            FROM (
-              SELECT *
-              FROM ${TABLE}
-              WHERE at >= {queryStart:UInt64} AND at <= {end:UInt64}
-              ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
-              LIMIT 1 BY eventId
-            )
+            FROM ${TABLE}
+            PREWHERE at >= {queryStart:UInt64} AND at <= {end:UInt64}
             WHERE decisionStatus IN ('succeeded', 'failed', 'timeout')
-            GROUP BY period, monitored, verdict, tier, riskType, riskCategory, riskName`,
-          query_params: { queryStart: queryStartMs, start: startMs, end: endMs },
-          format: 'JSONEachRow',
-        }),
-        this.client.query({
-          query: `
+            GROUP BY period, monitored, verdict, tier, riskType, riskCategory`,
+        { queryStart: queryStartMs, start: startMs, end: endMs },
+      );
+      const bucketRowsRaw = await queryRows(
+        `
             SELECT
               least({bucketCount:UInt32} - 1, intDiv(at - {start:UInt64}, {bucketMs:UInt64})) AS bucketIndex,
               JSONExtractBool(attribution, 'monitored') AS monitored,
@@ -2133,13 +2234,8 @@ export class ClickHouseStore {
               sumIf(tokenCount, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS tokenCount,
               sumIf(latencyMs, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS latencyTotal,
               sumIf(riskScore, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS riskScoreTotal
-            FROM (
-              SELECT *
-              FROM ${TABLE}
-              WHERE at >= {start:UInt64} AND at <= {end:UInt64}
-              ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
-              LIMIT 1 BY eventId
-            )
+            FROM ${TABLE}
+            PREWHERE at >= {start:UInt64} AND at <= {end:UInt64}
             GROUP BY bucketIndex, monitored
             ORDER BY bucketIndex`,
         { queryStart: queryStartMs, start: startMs, end: endMs, bucketCount: buckets, bucketMs },
@@ -2285,22 +2381,11 @@ export class ClickHouseStore {
   /** Query durable event history. Identity visibility is deliberately applied by the service
    * after current human-review metadata is resolved; a mutable review decision must never be
    * baked into this immutable evidence query. */
-  async searchEvents(input: StoredEventQuery): Promise<JudgedEvent[]> {
-    return (await this.searchEventsPage(input)).events;
-  }
-
-  /** Query the durable history as latest-per-event facts. Request one extra row so callers can
-   * expose pagination completeness without loading the full raw event history into memory. */
-  async searchEventsPage(input: StoredEventQuery): Promise<StoredEventSearchResult> {
-    if (!this.client) {
-      return {
-        events: [],
-        hasMore: false,
-        committedCutoffMs: this.committedCutoffMs(),
-        unavailable: true,
-      };
-    }
-    const conditions = ['at >= {since:UInt64}', 'at <= {until:UInt64}'];
+  async searchEvents(input: StoredEventQuery): Promise<JudgedEvent[] | null> {
+    if (!this.client) return null;
+    const sampleConditions: string[] = [];
+    const latestConditions: string[] = [];
+    const activeMutableColumns: string[] = [];
     const queryParams: Record<string, string | number> = { since: input.sinceMs, until: input.untilMs };
     const stableFields: Array<[keyof StoredEventQuery, string]> = [
       ['eventId', 'eventId'],
@@ -2325,33 +2410,104 @@ export class ClickHouseStore {
       sampleConditions.push(`${column} = {${String(key)}:String}`);
       queryParams[String(key)] = value.trim();
     }
+    // Stable predicates are applied before lifecycle revision collapse. Keep the generic name for
+    // compatibility with the durable-query contract checks while retaining the late-materialized
+    // split between stable and mutable filters.
+    const conditions = sampleConditions;
     if (input.monitoredOnly) conditions.push('agentMonitored = 1');
-    const rowLimit = Math.max(1, Math.min(20_000, input.limit));
-    queryParams.limit = rowLimit + 1;
+    for (const [key, column] of mutableFields) {
+      const value = input[key];
+      if (typeof value !== 'string' || !value.trim()) continue;
+      latestConditions.push(`${column} = {${String(key)}:String}`);
+      activeMutableColumns.push(column);
+      queryParams[String(key)] = value.trim();
+    }
+    const rowLimit = Math.max(1, Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, Math.round(input.limit)));
+    queryParams.limit = rowLimit;
+    queryParams.scanLimit = Math.min(300_000, Math.max(rowLimit * 3, latestConditions.length ? 15_000 : 0));
+    const queryKey = JSON.stringify(queryParams);
+    const current = this.eventSearchInFlight;
+    if (current) {
+      if (current.key !== queryKey) return null;
+      const shared = await current.value;
+      return shared ? [...shared] : null;
+    }
+    const release = this.tryAcquireWideEventReadSlot();
+    if (!release) return null;
+    const client = this.client;
+    const value = (async (): Promise<JudgedEvent[] | null> => {
+      try {
+        const rs = await client.query({
+          // Sort only narrow candidate columns, then use ClickHouse's physical row locators to
+          // fetch the selected full revisions. This preserves primary-key pruning and lifecycle
+          // semantics without making rawPreview/attributes/process part of the Top-N workspace.
+          // Verdict and tier can change between revisions, so filter them only after LIMIT 1 BY.
+          query: `
+            SELECT e.*
+            FROM ${TABLE} AS e
+            PREWHERE
+              e.at >= {since:UInt64}
+              AND e.at <= {until:UInt64}
+              AND tuple(e.at, e._part, e._part_offset) IN (
+                SELECT at, selectedPart, selectedPartOffset
+                FROM (
+                  SELECT *
+                  FROM (
+                    SELECT
+                      eventId,
+                      at,
+                      decisionUpdatedAt,
+                      _part AS selectedPart,
+                      _part_offset AS selectedPartOffset
+                      ${activeMutableColumns.length ? `, ${activeMutableColumns.join(', ')}` : ''}
+                    FROM ${TABLE}
+                    PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}
+                    ${sampleConditions.length ? `WHERE ${sampleConditions.join(' AND ')}` : ''}
+                    ORDER BY at DESC
+                    LIMIT {scanLimit:UInt32} WITH TIES
+                  )
+                  ORDER BY at DESC, decisionUpdatedAt DESC
+                  LIMIT 1 BY eventId
+                )
+                ${latestConditions.length ? `WHERE ${latestConditions.join(' AND ')}` : ''}
+                ORDER BY at DESC, decisionUpdatedAt DESC
+                LIMIT {limit:UInt32}
+              )
+            ORDER BY e.at DESC, e.decisionUpdatedAt DESC
+            LIMIT {limit:UInt32}`,
+          query_params: queryParams,
+          clickhouse_settings: BOUNDED_EVENT_SEARCH_READ_SETTINGS,
+          format: 'JSONEachRow',
+        });
+        const rows = (await rs.json()) as Array<Record<string, unknown>>;
+        const latest = new Map<string, JudgedEvent>();
+        for (const row of rows) {
+          const event = fromRow(row);
+          if (!latest.has(event.eventId)) latest.set(event.eventId, event);
+        }
+        return [...latest.values()].sort((a, b) => b.at - a.at);
+      } catch (err) {
+        console.error('[clickhouse] event search failed:', (err as Error).message);
+        return null;
+      }
+    })();
+    this.eventSearchInFlight = { key: queryKey, value };
     try {
-      const rs = await this.client.query({
-        query: `SELECT *
-          FROM (
-            SELECT *
-            FROM ${TABLE}
-            WHERE ${conditions.join(' AND ')}
-            ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
-            LIMIT 1 BY eventId
-          )
-          ORDER BY at DESC, eventId DESC
-          LIMIT {limit:UInt32}`,
-        query_params: queryParams,
-        format: 'JSONEachRow',
-      });
-      const rows = (await rs.json()) as Array<Record<string, unknown>>;
-      const hasMore = rows.length > rowLimit;
-      return {
-        events: rows.slice(0, rowLimit).map(fromRow),
-        hasMore,
-        committedCutoffMs: this.committedCutoffMs(),
-      };
-    } catch (err) {
-      console.error('[clickhouse] event search failed:', (err as Error).message);
+      const rows = await value;
+      return rows ? [...rows] : null;
+    } finally {
+      if (this.eventSearchInFlight?.value === value) this.eventSearchInFlight = undefined;
+      release();
+    }
+  }
+
+  /** Return durable latest-per-event facts with an explicit completeness marker. The optimized
+   * late-materialized search remains the single query implementation; one extra row supplies the
+   * bounded pagination signal without loading the full historical result. */
+  async searchEventsPage(input: StoredEventQuery): Promise<StoredEventSearchResult> {
+    const rowLimit = Math.max(1, Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, Math.round(input.limit)));
+    const events = await this.searchEvents({ ...input, limit: Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, rowLimit + 1) });
+    if (!events) {
       return {
         events: [],
         hasMore: false,
@@ -2359,14 +2515,13 @@ export class ClickHouseStore {
         unavailable: true,
       };
     }
+    return {
+      events: events.slice(0, rowLimit),
+      hasMore: events.length > rowLimit,
+      committedCutoffMs: this.committedCutoffMs(),
+    };
   }
 
-  /**
-   * Return one aggregate fact per logical identity and concrete runtime instance for the complete
-   * persisted interval.
-   * The inner query first collapses judgment revisions by eventId. This keeps the response bounded
-   * by Agent identities rather than raw event volume while preserving exact counters.
-   */
   async agentWindowFacts(
     sinceMs: number,
     untilMs: number,
@@ -3789,15 +3944,120 @@ export class ClickHouseStore {
     }
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (this.closeInFlight) return this.closeInFlight;
+    // Change the externally visible state before the first await so a concurrent enqueue cannot
+    // slip into the shutdown tail after it was sealed.
     this.closed = true;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = undefined;
+    this.closing = true;
+    this.ready = false;
     if (this.flushTimer) clearInterval(this.flushTimer);
     this.flushTimer = undefined;
-    await this.flush();
-    await this.client?.close();
-    this.client = undefined;
-    this.ready = false;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    if (this.eventWriteRetryWakeTimer) clearTimeout(this.eventWriteRetryWakeTimer);
+    this.eventWriteRetryWakeTimer = undefined;
+    this.eventWriteClosingDeadline = this.eventWriteNow() + this.eventWriteCloseDeadlineMs;
+    this.wakeEventWriteRetrySleep();
+    this.sealBufferedEventBatches(true);
+    const value = this.finishClose();
+    this.closeInFlight = value;
+    return value;
+  }
+
+  private async finishClose(): Promise<void> {
+    const client = this.client;
+    let closeError: Error | undefined;
+    try {
+      while (
+        this.eventWriteBatches.length > 0 &&
+        !this.eventWritePermanentError &&
+        this.eventWriteNow() < (this.eventWriteClosingDeadline ?? 0)
+      ) {
+        this.eventWriteBatches[0].retryNotBefore = 0;
+        try {
+          await this.waitForEventWriteDrainUntilCloseDeadline();
+        } catch (error) {
+          if (this.eventWritePermanentError) break;
+        }
+      }
+
+      if (this.eventWriteBatches.length > 0 || this.buf.length > 0) {
+        const head = this.eventWriteBatches[0];
+        closeError = Object.assign(
+          new Error(
+            `ClickHouse event writer closed with ${this.eventWriteRows} undrained rows` +
+            (head?.lastError ? `: ${head.lastError.message}` : ''),
+          ),
+          { code: 'ANYSENTRY_CLICKHOUSE_EVENT_SHUTDOWN_UNDRAINED' },
+        );
+        console.error('[clickhouse] event writer shutdown deadline/terminal failure:', {
+          code: (closeError as Error & { code?: string }).code,
+          rows: this.eventWriteRows,
+          bytes: this.eventWriteBytes,
+          oldestBatchAgeMs: head ? Math.max(0, this.eventWriteNow() - head.createdAt) : 0,
+          token: head?.token,
+          cause: head?.lastError?.message ?? this.eventWritePermanentError?.message,
+        });
+      }
+    } finally {
+      this.eventWriteAbortController?.abort('ClickHouse event writer is closing');
+      this.wakeEventWriteRetrySleep();
+      for (const batch of this.eventWriteBatches) {
+        for (const waiter of batch.waiters.splice(0)) {
+          waiter.reject(closeError ?? new Error('ClickHouse event writer closed before the direct write completed'));
+        }
+      }
+      // A periodic flush may already own the heartbeat side buffer. Let it finish first, then
+      // persist any tail accepted after its snapshot before closing the shared client.
+      await this.flushInFlight?.catch((error) => {
+        console.error('[clickhouse] collector heartbeat shutdown flush failed:', (error as Error).message);
+      });
+      const heartbeatValues = this.collectorHeartbeatBuf;
+      this.collectorHeartbeatBuf = [];
+      if (client && heartbeatValues.length > 0) {
+        try {
+          await client.insert({
+            table: COLLECTOR_HEARTBEAT_TABLE,
+            values: heartbeatValues,
+            format: 'JSONEachRow',
+          });
+        } catch (error) {
+          this.collectorHeartbeatBuf = [...heartbeatValues, ...this.collectorHeartbeatBuf];
+          console.error('[clickhouse] collector heartbeat shutdown insert failed:', (error as Error).message);
+        }
+      }
+      try {
+        await client?.close();
+      } catch (error) {
+        closeError ??= this.asEventWriteError(error);
+      }
+      this.client = undefined;
+      this.eventWriteClosingDeadline = undefined;
+    }
+    if (closeError) throw closeError;
+  }
+
+  private async waitForEventWriteDrainUntilCloseDeadline(): Promise<void> {
+    const deadline = this.eventWriteClosingDeadline ?? this.eventWriteNow();
+    const remainingMs = Math.max(0, deadline - this.eventWriteNow());
+    if (remainingMs === 0) throw new Error('ClickHouse event writer shutdown deadline reached');
+    const drain = this.ensureEventWriteDrain();
+    // A fake/misbehaving client may ignore AbortSignal. The outer wall-clock timer prevents Nest's
+    // shutdown hook from consuming the full Kubernetes grace period before client.close destroys it.
+    let timer!: NodeJS.Timeout;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        this.eventWriteAbortController?.abort('ClickHouse event writer shutdown deadline reached');
+        reject(new Error('ClickHouse event writer shutdown deadline reached'));
+      }, remainingMs);
+    });
+    try {
+      await Promise.race([drain, timeout]);
+    } finally {
+      clearTimeout(timer);
+      // If the outer deadline won, ensure a later rejection from the tracked drain is observed.
+      void drain.catch(() => undefined);
+    }
   }
 }

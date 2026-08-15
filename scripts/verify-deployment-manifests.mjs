@@ -100,8 +100,12 @@ function docFor(docs, kind, name) {
 }
 
 function verifyAnySentryManifest() {
-  const docs = documentsFromYaml(readText('deploy/anysentry.yaml'));
+  const anySentryManifest = readText('deploy/anysentry.yaml');
+  const docs = documentsFromYaml(anySentryManifest);
   const compose = stripYamlComments(readText('docker-compose.yml'));
+  const manualCompose = stripYamlComments(readText('deploy/docker-compose.manual-test.yml'));
+  const manualRuntimeDocs = documentsFromYaml(readText('deploy/manual-test/runtime-on.yaml'));
+  const manualPolicy = JSON.parse(readText('deploy/manual-test/policy.json'));
   const clickHouseConfigFile = readText('deploy/clickhouse-memory.xml').trim();
   const expectedClickHouseConfig = `<clickhouse>
   <max_server_memory_usage>2147483648</max_server_memory_usage>
@@ -109,10 +113,7 @@ function verifyAnySentryManifest() {
   <merge_tree>
     <vertical_merge_algorithm_min_rows_to_activate>0</vertical_merge_algorithm_min_rows_to_activate>
   </merge_tree>
-  <metric_log>
-    <collect_interval_milliseconds>10000</collect_interval_milliseconds>
-    <flush_interval_milliseconds>60000</flush_interval_milliseconds>
-  </metric_log>
+  <!-- High-volume metric_log remains explicitly disabled by 10-anysentry-server.xml. -->
 </clickhouse>`;
   const clickHouseComposeService = compose
     .split(/^  clickhouse:\s*$/mu)[1]
@@ -123,12 +124,14 @@ function verifyAnySentryManifest() {
   const anySentryDeployment = docFor(docs, 'Deployment', 'anysentry');
   const anySentryService = docFor(docs, 'Service', 'anysentry');
   const clickHouseMemoryConfig = docFor(docs, 'ConfigMap', 'clickhouse-memory-config');
+  const clickHouseBaseConfig = docFor(docs, 'ConfigMap', 'clickhouse-base-config');
   const clickHouseDeployment = docFor(docs, 'Deployment', 'clickhouse');
   const clickHouseService = docFor(docs, 'Service', 'clickhouse');
   const redisStatefulSet = docFor(docs, 'StatefulSet', 'redis');
   const redisService = docFor(docs, 'Service', 'redis');
   const redisPvc = docFor(docs, 'PersistentVolumeClaim', 'redis-data');
   const runtimeConfig = docFor(docs, 'ConfigMap', 'anysentry-runtime');
+  const manualRuntimeConfig = docFor(manualRuntimeDocs, 'ConfigMap', 'anysentry-runtime');
   const fastJudge = docFor(docs, 'Deployment', 'fast-judge');
   const l3Worker = docFor(docs, 'Deployment', 'l3-worker');
   const podReaderRole = docFor(docs, 'ClusterRole', 'anysentry-pod-reader');
@@ -155,16 +158,36 @@ function verifyAnySentryManifest() {
     anySentryDeployment?.source,
   );
   assert(
-    'AnySentry Deployment bounds its event hot ring and Observer request bodies',
-    /\{\s*name:\s*ANYSENTRY_EVENT_RING_MAX,\s*value:\s*"10000"\s*\}/u.test(anySentryDeployment?.source ?? '') &&
+    'AnySentry Deployment bounds its event hot set and Observer request bodies',
+    /\{\s*name:\s*ANYSENTRY_HOT_EVENT_LIMIT,\s*value:\s*"10000"\s*\}/u.test(anySentryDeployment?.source ?? '') &&
       /\{\s*name:\s*ANYSENTRY_OBSERVER_BODY_LIMIT,\s*value:\s*"4mb"\s*\}/u.test(anySentryDeployment?.source ?? ''),
     anySentryDeployment?.source,
+  );
+  assert(
+    'Docker Compose explicitly bounds the API hot event set with the current setting name',
+    /^      ANYSENTRY_HOT_EVENT_LIMIT:\s*\$\{ANYSENTRY_HOT_EVENT_LIMIT:-10000\}\s*$/mu.test(anySentryComposeService),
+    anySentryComposeService,
+  );
+  assert(
+    'Deployment manifests and Compose no longer advertise the legacy event-ring setting',
+    !/ANYSENTRY_EVENT_RING_MAX/u.test(anySentryManifest) && !/ANYSENTRY_EVENT_RING_MAX/u.test(compose),
+    { manifest: anySentryManifest, compose },
   );
   assert(
     'AnySentry Deployment points at bundled ClickHouse HTTP service',
     /CLICKHOUSE_URL:\s*"http:\/\/clickhouse:8123"/u.test(runtimeConfig?.source ?? '') &&
       /name:\s*anysentry-runtime/u.test(anySentryDeployment?.source ?? ''),
     { runtimeConfig: runtimeConfig?.source, deployment: anySentryDeployment?.source },
+  );
+  assert(
+    'Production manifests retain streaming and supply-chain configuration without enabling it by default',
+    /ANYSENTRY_STREAMING:\s*"off"/u.test(runtimeConfig?.source ?? '') &&
+      /ANYSENTRY_SUPPLY_CHAIN:\s*"off"/u.test(runtimeConfig?.source ?? '') &&
+      /ANYSENTRY_SUPPLY_CHAIN_RUNTIME:\s*"off"/u.test(runtimeConfig?.source ?? '') &&
+      /^      ANYSENTRY_STREAMING:\s*\$\{ANYSENTRY_STREAMING:-off\}\s*$/mu.test(anySentryComposeService) &&
+      /^      ANYSENTRY_SUPPLY_CHAIN:\s*\$\{ANYSENTRY_SUPPLY_CHAIN:-off\}\s*$/mu.test(anySentryComposeService) &&
+      /^      ANYSENTRY_SUPPLY_CHAIN_RUNTIME:\s*\$\{ANYSENTRY_SUPPLY_CHAIN_RUNTIME:-off\}\s*$/mu.test(anySentryComposeService),
+    { runtimeConfig: runtimeConfig?.source, compose: anySentryComposeService },
   );
   assert(
     'AnySentry Deployment configures cluster-wide workload identity and an independent Agent label selector',
@@ -234,12 +257,13 @@ function verifyAnySentryManifest() {
     Boolean(clickHouseMemoryConfig) &&
       /^  namespace:\s*anysentry\s*$/mu.test(clickHouseMemoryConfig?.source ?? '') &&
       /labels:\s*\{\s*app:\s*clickhouse\s*\}/u.test(clickHouseMemoryConfig?.source ?? '') &&
-      /^data:\s*\n  memory\.xml:\s*\|\s*\n    <clickhouse>\s*\n      <max_server_memory_usage>2147483648<\/max_server_memory_usage>\s*\n      <merges_mutations_memory_usage_soft_limit>536870912<\/merges_mutations_memory_usage_soft_limit>\s*\n      <merge_tree>\s*\n        <vertical_merge_algorithm_min_rows_to_activate>0<\/vertical_merge_algorithm_min_rows_to_activate>\s*\n      <\/merge_tree>\s*\n      <metric_log>\s*\n        <collect_interval_milliseconds>10000<\/collect_interval_milliseconds>\s*\n        <flush_interval_milliseconds>60000<\/flush_interval_milliseconds>\s*\n      <\/metric_log>\s*\n    <\/clickhouse>\s*$/mu.test(
+      /^data:\s*\n  memory\.xml:\s*\|\s*\n    <clickhouse>\s*\n      <max_server_memory_usage>2147483648<\/max_server_memory_usage>\s*\n      <merges_mutations_memory_usage_soft_limit>536870912<\/merges_mutations_memory_usage_soft_limit>\s*\n      <merge_tree>\s*\n        <vertical_merge_algorithm_min_rows_to_activate>0<\/vertical_merge_algorithm_min_rows_to_activate>\s*\n      <\/merge_tree>\s*\n      <!-- High-volume metric_log remains explicitly disabled by server\.xml\. -->\s*\n    <\/clickhouse>\s*$/mu.test(
         clickHouseMemoryConfig?.source ?? '',
       ) &&
       countMatches(clickHouseMemoryConfig?.source ?? '', /<max_server_memory_usage>/gu) === 1 &&
       countMatches(clickHouseMemoryConfig?.source ?? '', /<merges_mutations_memory_usage_soft_limit>/gu) === 1 &&
       countMatches(clickHouseMemoryConfig?.source ?? '', /<vertical_merge_algorithm_min_rows_to_activate>/gu) === 1 &&
+      !/<metric_log>/u.test(clickHouseMemoryConfig?.source ?? '') &&
       clickHouseConfigFile === expectedClickHouseConfig &&
       !/max_server_memory_usage_to_ram_ratio/u.test(clickHouseMemoryConfig?.source ?? ''),
     clickHouseMemoryConfig?.source,
@@ -255,11 +279,41 @@ function verifyAnySentryManifest() {
     clickHouseComposeService,
   );
   assert(
+    'Docker and Kubernetes merge the server, user-profile, and memory ClickHouse configurations',
+    Boolean(clickHouseBaseConfig) &&
+      /<logger>\s*\n\s*<level>warning<\/level>/u.test(clickHouseBaseConfig?.source ?? '') &&
+      /<metric_log remove="remove"\s*\/>/u.test(clickHouseBaseConfig?.source ?? '') &&
+      /<query_log>\s*\n\s*<ttl>event_date \+ INTERVAL 3 DAY DELETE<\/ttl>/u.test(clickHouseBaseConfig?.source ?? '') &&
+      /<max_memory_usage>1073741824<\/max_memory_usage>/u.test(clickHouseBaseConfig?.source ?? '') &&
+      /configMap:\s*\n\s*name:\s*clickhouse-base-config/u.test(clickHouseDeployment?.source ?? '') &&
+      /config\.d\/10-anysentry-server\.xml/u.test(clickHouseDeployment?.source ?? '') &&
+      /config\.d\/20-anysentry-memory\.xml/u.test(clickHouseDeployment?.source ?? '') &&
+      /users\.d\/10-anysentry-users\.xml/u.test(clickHouseDeployment?.source ?? '') &&
+      /config\/clickhouse\/anysentry-server\.xml:\/etc\/clickhouse-server\/config\.d\/10-anysentry-server\.xml:ro/u.test(clickHouseComposeService) &&
+      /config\/clickhouse\/anysentry-users\.xml:\/etc\/clickhouse-server\/users\.d\/10-anysentry-users\.xml:ro/u.test(clickHouseComposeService),
+    { baseConfig: clickHouseBaseConfig?.source, deployment: clickHouseDeployment?.source, compose: clickHouseComposeService },
+  );
+  assert(
     'ClickHouse PodTemplate pins the mounted merge configuration revision',
-    /annotations:\s*\n\s*anysentry\.io\/clickhouse-config-revision:\s*"memory-and-merge-v2"/u.test(
+    /annotations:\s*\n\s*anysentry\.io\/clickhouse-config-revision:\s*"memory-and-merge-v3"/u.test(
       clickHouseDeployment?.source ?? '',
     ),
     clickHouseDeployment?.source,
+  );
+  assert(
+    'Manual-test overrides enable streaming, supply-chain, runtime correlation, and all judgment tiers without credentials',
+    /ANYSENTRY_STREAMING:\s*"on"/u.test(manualCompose) &&
+      /ANYSENTRY_SUPPLY_CHAIN:\s*"on"/u.test(manualCompose) &&
+      /ANYSENTRY_SUPPLY_CHAIN_RUNTIME:\s*"on"/u.test(manualCompose) &&
+      /ANYSENTRY_STREAMING:\s*"on"/u.test(manualRuntimeConfig?.source ?? '') &&
+      /ANYSENTRY_SUPPLY_CHAIN:\s*"on"/u.test(manualRuntimeConfig?.source ?? '') &&
+      /ANYSENTRY_SUPPLY_CHAIN_RUNTIME:\s*"on"/u.test(manualRuntimeConfig?.source ?? '') &&
+      Array.isArray(manualPolicy.rules) &&
+      Boolean(manualPolicy.llm?.url) &&
+      Boolean(manualPolicy.deepModel?.url) &&
+      Boolean(manualPolicy.agent?.bin) &&
+      !/apiKey|api_key|key/iu.test(JSON.stringify(manualPolicy)),
+    { manualCompose, manualRuntime: manualRuntimeConfig?.source, manualPolicy },
   );
   assert(
     'Bundled ClickHouse mounts the memory budget read-only',
@@ -272,9 +326,9 @@ function verifyAnySentryManifest() {
     clickHouseDeployment?.source,
   );
   assert(
-    'The ClickHouse apply selector targets only its ConfigMap, Deployment, and Service',
+    'The ClickHouse apply selector includes both configuration maps, Deployment, and Service',
     JSON.stringify(clickHouseSelectedResources) ===
-      JSON.stringify(['ConfigMap/clickhouse-memory-config', 'Deployment/clickhouse', 'Service/clickhouse']),
+      JSON.stringify(['ConfigMap/clickhouse-base-config', 'ConfigMap/clickhouse-memory-config', 'Deployment/clickhouse', 'Service/clickhouse']),
     clickHouseSelectedResources,
   );
   assert(

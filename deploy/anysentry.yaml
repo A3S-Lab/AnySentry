@@ -42,10 +42,43 @@ data:
       <merge_tree>
         <vertical_merge_algorithm_min_rows_to_activate>0</vertical_merge_algorithm_min_rows_to_activate>
       </merge_tree>
-      <metric_log>
-        <collect_interval_milliseconds>10000</collect_interval_milliseconds>
-        <flush_interval_milliseconds>60000</flush_interval_milliseconds>
-      </metric_log>
+      <!-- High-volume metric_log remains explicitly disabled by server.xml. -->
+    </clickhouse>
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-base-config
+  namespace: anysentry
+  labels: { app: clickhouse }
+data:
+  server.xml: |
+    <clickhouse>
+      <max_server_memory_usage>2415919104</max_server_memory_usage>
+      <logger>
+        <level>warning</level>
+      </logger>
+      <text_log remove="remove"/>
+      <trace_log remove="remove"/>
+      <processors_profile_log remove="remove"/>
+      <part_log remove="remove"/>
+      <metric_log remove="remove"/>
+      <asynchronous_metric_log remove="remove"/>
+      <query_thread_log remove="remove"/>
+      <query_views_log remove="remove"/>
+      <query_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+      </query_log>
+    </clickhouse>
+  users.xml: |
+    <clickhouse>
+      <profiles>
+        <default>
+          <max_memory_usage>1073741824</max_memory_usage>
+          <max_bytes_before_external_group_by>268435456</max_bytes_before_external_group_by>
+          <max_bytes_before_external_sort>268435456</max_bytes_before_external_sort>
+        </default>
+      </profiles>
     </clickhouse>
 ---
 apiVersion: apps/v1
@@ -64,7 +97,8 @@ spec:
     metadata:
       labels: { app: clickhouse }
       annotations:
-        anysentry.io/clickhouse-config-revision: "memory-and-merge-v2"
+        anysentry.io/clickhouse-config-revision: "memory-and-merge-v3"
+        anysentry.io/clickhouse-base-config-revision: "server-users-v1"
     spec:
       terminationGracePeriodSeconds: 30
       containers:
@@ -81,7 +115,9 @@ spec:
               valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_PASSWORD } }
           volumeMounts:
             - { name: data, mountPath: /var/lib/clickhouse }
+            - { name: clickhouse-config, mountPath: /etc/clickhouse-server/config.d/10-anysentry-server.xml, subPath: server.xml, readOnly: true }
             - { name: memory-config, mountPath: /etc/clickhouse-server/config.d/20-anysentry-memory.xml, subPath: memory.xml, readOnly: true }
+            - { name: clickhouse-config, mountPath: /etc/clickhouse-server/users.d/10-anysentry-users.xml, subPath: users.xml, readOnly: true }
           readinessProbe:
             httpGet: { path: /ping, port: 8123 }
             initialDelaySeconds: 0
@@ -101,6 +137,12 @@ spec:
             name: clickhouse-memory-config
             items:
               - { key: memory.xml, path: memory.xml }
+        - name: clickhouse-config
+          configMap:
+            name: clickhouse-base-config
+            items:
+              - { key: server.xml, path: server.xml }
+              - { key: users.xml, path: users.xml }
 ---
 apiVersion: v1
 kind: Service
@@ -199,7 +241,9 @@ data:
   CLICKHOUSE_DB: "anysentry"
   ANYSENTRY_ASYNC_JUDGE: "on"
   ANYSENTRY_REDIS_URL: "redis://redis:6379/0"
-  ANYSENTRY_STREAMING: "on"
+  # The streaming resources remain available in deploy/streaming.yaml, but production operators
+  # opt in explicitly after Kafka/Flink capacity and retention have been reviewed.
+  ANYSENTRY_STREAMING: "off"
   ANYSENTRY_STREAM_AGENT_ONLY: "on"
   ANYSENTRY_STREAM_BOOTSTRAP_SERVERS: "kafka:9092"
   ANYSENTRY_STREAM_CANONICAL_TOPIC: "anysentry.events.canonical.v1"
@@ -210,8 +254,9 @@ data:
   ANYSENTRY_SUPPLY_CHAIN_CONTEXT_TOPIC: "anysentry.supply-chain.context.v1"
   ANYSENTRY_FLINK_REST_URL: "http://flink-jobmanager:8081"
   ANYSENTRY_FLINK_JOB_NAME: "AnySentry Flink Shadow Risk"
-  ANYSENTRY_SUPPLY_CHAIN: "on"
-  ANYSENTRY_SUPPLY_CHAIN_RUNTIME: "on"
+  # Supply-chain collection and its worker are likewise explicit production opt-ins.
+  ANYSENTRY_SUPPLY_CHAIN: "off"
+  ANYSENTRY_SUPPLY_CHAIN_RUNTIME: "off"
 ---
 # ----------------------------------------------------------------------------
 # Pod-identity enrichment. This is metadata-only, read-only cluster access: it maps every observed
@@ -287,6 +332,13 @@ spec:
                 optional: true
           env:
             - { name: PORT, value: "29653" }
+            # Keep the synchronous dashboard hot set within the 512 MiB API memory budget.
+            - { name: ANYSENTRY_HOT_EVENT_LIMIT, value: "10000" }
+            - { name: ANYSENTRY_OBSERVER_BODY_LIMIT, value: "4mb" }
+            # Bundled ClickHouse (namespace-local Service DNS). Point this at an external server to
+            # use your own ClickHouse instead — then delete the ClickHouse objects above.
+            - { name: CLICKHOUSE_URL, value: "http://clickhouse:8123" }
+            - { name: CLICKHOUSE_DB, value: "anysentry" }
             - name: CLICKHOUSE_USER
               valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_USER } }
             - name: CLICKHOUSE_PASSWORD
