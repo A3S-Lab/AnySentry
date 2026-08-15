@@ -11,11 +11,21 @@ from the in-memory Runtime Model profiles or from `anysentry-model-credentials`.
 Start the full stack:
 
 ```bash
+export ANYSENTRY_IMAGE='127.0.0.1:5000/anysentry@sha256:<digest>'
+export ANYSENTRY_FLINK_IMAGE='127.0.0.1:5000/anysentry-flink-streaming@sha256:<digest>'
+export ANYSENTRY_OBSERVER_IMAGE='127.0.0.1:5000/anysentry-observer@sha256:<digest>'
+export ANYSENTRY_RUNTIME_RULES_DIR="$PWD/.local/observer-rules"
 docker compose --profile streaming \
   -f docker-compose.yml \
   -f deploy/docker-compose.manual-test.yml \
   up -d
 ```
+
+The manual override pins the API and every Node worker to the same AnySentry digest, pins all four
+Flink roles to one Flink digest, and starts the digest-pinned Observer without source-code bind
+overlays. Its identity filter runs in `enforce` mode after the real multi-plane lifecycle gate has
+passed, so background non-Agent traffic is not duplicated into the manual API. L1/L2/L3 policy
+enforcement remains independent from this transport filter.
 
 Configure and apply both Runtime Model profiles through the Policy page before sending real model
 traffic. The Composite Judge subscribes to the same `deep_investigation` Runtime Model profile, so
