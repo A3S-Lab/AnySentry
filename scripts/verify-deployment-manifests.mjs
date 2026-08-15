@@ -125,6 +125,12 @@ function verifyAnySentryManifest() {
   const clickHouseMemoryConfig = docFor(docs, 'ConfigMap', 'clickhouse-memory-config');
   const clickHouseDeployment = docFor(docs, 'Deployment', 'clickhouse');
   const clickHouseService = docFor(docs, 'Service', 'clickhouse');
+  const redisStatefulSet = docFor(docs, 'StatefulSet', 'redis');
+  const redisService = docFor(docs, 'Service', 'redis');
+  const redisPvc = docFor(docs, 'PersistentVolumeClaim', 'redis-data');
+  const runtimeConfig = docFor(docs, 'ConfigMap', 'anysentry-runtime');
+  const fastJudge = docFor(docs, 'Deployment', 'fast-judge');
+  const l3Worker = docFor(docs, 'Deployment', 'l3-worker');
   const podReaderRole = docFor(docs, 'ClusterRole', 'anysentry-pod-reader');
   const podReaderBinding = docFor(docs, 'ClusterRoleBinding', 'anysentry-pod-reader');
   const clickHouseSelectedResources = docs
@@ -156,8 +162,9 @@ function verifyAnySentryManifest() {
   );
   assert(
     'AnySentry Deployment points at bundled ClickHouse HTTP service',
-    /\{\s*name:\s*CLICKHOUSE_URL,\s*value:\s*"http:\/\/clickhouse:8123"\s*\}/u.test(anySentryDeployment?.source ?? ''),
-    anySentryDeployment?.source,
+    /CLICKHOUSE_URL:\s*"http:\/\/clickhouse:8123"/u.test(runtimeConfig?.source ?? '') &&
+      /name:\s*anysentry-runtime/u.test(anySentryDeployment?.source ?? ''),
+    { runtimeConfig: runtimeConfig?.source, deployment: anySentryDeployment?.source },
   );
   assert(
     'AnySentry Deployment configures cluster-wide workload identity and an independent Agent label selector',
@@ -166,8 +173,27 @@ function verifyAnySentryManifest() {
     anySentryDeployment?.source,
   );
   assert(
-    'AnySentry probes use /security-center/healthz on port 29653',
-    countMatches(anySentryDeployment?.source ?? '', /httpGet:\s*\{\s*path:\s*\/security-center\/healthz,\s*port:\s*29653\s*\}/gu) >= 2,
+    'AnySentry startup, readiness, and liveness probes use /security-center/healthz',
+    countMatches(anySentryDeployment?.source ?? '', /httpGet:\s*\{\s*path:\s*\/security-center\/healthz,\s*port:\s*29653\s*\}/gu) === 3,
+    anySentryDeployment?.source,
+  );
+  assert(
+    'AnySentry startup probe protects at least three minutes of initialization',
+    /startupProbe:[\s\S]*?periodSeconds:\s*5[\s\S]*?failureThreshold:\s*36/u.test(anySentryDeployment?.source ?? ''),
+    anySentryDeployment?.source,
+  );
+  assert(
+    'AnySentry readiness and liveness checks start only after the startup probe',
+    /startupProbe:/u.test(anySentryDeployment?.source ?? '') &&
+      /readinessProbe:/u.test(anySentryDeployment?.source ?? '') &&
+      /livenessProbe:/u.test(anySentryDeployment?.source ?? '') &&
+      !/initialDelaySeconds:\s*15/u.test(anySentryDeployment?.source ?? ''),
+    anySentryDeployment?.source,
+  );
+  assert(
+    'AnySentry API has production-safe CPU and memory bounds',
+    /requests:\s*\{\s*cpu:\s*500m,\s*memory:\s*512Mi\s*\}/u.test(anySentryDeployment?.source ?? '') &&
+      /limits:\s*\{\s*cpu:\s*"2",\s*memory:\s*2Gi\s*\}/u.test(anySentryDeployment?.source ?? ''),
     anySentryDeployment?.source,
   );
   assert(
@@ -263,6 +289,33 @@ function verifyAnySentryManifest() {
     clickHouseService?.source,
   );
 
+  assert('Redis StatefulSet, Service, and persistent volume are deployed', Boolean(redisStatefulSet) && Boolean(redisService) && Boolean(redisPvc), {
+    kinds: docs.map((doc) => `${doc.kind}/${doc.name}`),
+  });
+  assert(
+    'Redis uses durable AOF and startup/readiness/liveness probes',
+    /--appendonly",\s*"yes"/u.test(redisStatefulSet?.source ?? '') &&
+      /--appendfsync",\s*"everysec"/u.test(redisStatefulSet?.source ?? '') &&
+      /startupProbe:/u.test(redisStatefulSet?.source ?? '') &&
+      /readinessProbe:/u.test(redisStatefulSet?.source ?? '') &&
+      /livenessProbe:/u.test(redisStatefulSet?.source ?? ''),
+    redisStatefulSet?.source,
+  );
+  assert(
+    'Fast Judge runs the asynchronous worker with the fast role',
+    /dist\/security-monitoring\/worker-main\.js/u.test(fastJudge?.source ?? '') &&
+      /\{\s*name:\s*ANYSENTRY_WORKER_ROLE,\s*value:\s*"fast"\s*\}/u.test(fastJudge?.source ?? ''),
+    fastJudge?.source,
+  );
+  assert(
+    'L3 Worker runs independently with bounded concurrency and two full attempts',
+    /dist\/security-monitoring\/worker-main\.js/u.test(l3Worker?.source ?? '') &&
+      /\{\s*name:\s*ANYSENTRY_WORKER_ROLE,\s*value:\s*"l3"\s*\}/u.test(l3Worker?.source ?? '') &&
+      /\{\s*name:\s*ANYSENTRY_L3_CONCURRENCY,\s*value:\s*"2"\s*\}/u.test(l3Worker?.source ?? '') &&
+      /\{\s*name:\s*ANYSENTRY_L3_ATTEMPTS,\s*value:\s*"2"\s*\}/u.test(l3Worker?.source ?? ''),
+    l3Worker?.source,
+  );
+
   assert('AnySentry pod identity uses a cluster-wide read-only Pod metadata binding', Boolean(podReaderRole) && Boolean(podReaderBinding), {
     kinds: docs.map((doc) => `${doc.kind}/${doc.name}`),
   });
@@ -278,6 +331,90 @@ function verifyAnySentryManifest() {
     /kind:\s*ClusterRole[\s\S]*name:\s*anysentry-pod-reader/u.test(podReaderBinding?.source ?? '') &&
       /kind:\s*ServiceAccount[\s\S]*name:\s*anysentry[\s\S]*namespace:\s*anysentry/u.test(podReaderBinding?.source ?? ''),
     podReaderBinding?.source,
+  );
+}
+
+function verifyStreamingManifest() {
+  const docs = documentsFromYaml(readText('deploy/streaming.yaml'));
+  const kafka = docFor(docs, 'StatefulSet', 'kafka');
+  const kafkaService = docFor(docs, 'Service', 'kafka');
+  const topicManager = docFor(docs, 'Deployment', 'kafka-topic-manager');
+  const checkpointPvc = docFor(docs, 'PersistentVolumeClaim', 'flink-checkpoints');
+  const jobManager = docFor(docs, 'Deployment', 'flink-jobmanager');
+  const taskManager = docFor(docs, 'Deployment', 'flink-taskmanager');
+  const jobSubmit = docFor(docs, 'Deployment', 'flink-job-submit');
+  const streamWorker = docFor(docs, 'Deployment', 'stream-worker');
+  const compositeJudge = docFor(docs, 'Deployment', 'composite-judge');
+  const assessmentWorker = docFor(docs, 'Deployment', 'supply-chain-assessment');
+
+  assert('Kafka uses a persistent KRaft StatefulSet and namespace-local Service', Boolean(kafka) && Boolean(kafkaService), {
+    kinds: docs.map((doc) => `${doc.kind}/${doc.name}`),
+  });
+  assert(
+    'Kafka has startup/readiness/liveness protection and durable storage',
+    /KAFKA_PROCESS_ROLES,\s*value:\s*"broker,controller"/u.test(kafka?.source ?? '') &&
+      /startupProbe:/u.test(kafka?.source ?? '') &&
+      /readinessProbe:/u.test(kafka?.source ?? '') &&
+      /livenessProbe:/u.test(kafka?.source ?? '') &&
+      /claimName:\s*kafka-data/u.test(kafka?.source ?? ''),
+    kafka?.source,
+  );
+  assert(
+    'Kafka topic manager reconciles all required event topics',
+    [
+      'anysentry.events.canonical.v1',
+      'anysentry.judgments.v1',
+      'anysentry.risk-analysis-batches.v1',
+      'anysentry.stream.findings.v1',
+      'anysentry.supply-chain.context.v1',
+      'anysentry.stream.dlq.v1',
+    ].every((topic) => topicManager?.source.includes(topic)),
+    topicManager?.source,
+  );
+  assert(
+    'Flink deploys JobManager, TaskManager, and the job submit controller',
+    Boolean(jobManager) && Boolean(taskManager) && Boolean(jobSubmit),
+    { kinds: docs.map((doc) => `${doc.kind}/${doc.name}`) },
+  );
+  assert(
+    'Flink checkpoints use an explicit shared RWX volume',
+    Boolean(checkpointPvc) &&
+      /accessModes:\s*\["ReadWriteMany"\]/u.test(checkpointPvc?.source ?? '') &&
+      /claimName:\s*flink-checkpoints/u.test(jobManager?.source ?? '') &&
+      /claimName:\s*flink-checkpoints/u.test(taskManager?.source ?? ''),
+    checkpointPvc?.source,
+  );
+  assert(
+    'Flink JobManager health is guarded by startup/readiness/liveness probes',
+    countMatches(jobManager?.source ?? '', /httpGet:\s*\{\s*path:\s*\/overview,\s*port:\s*8081\s*\}/gu) === 3,
+    jobManager?.source,
+  );
+  assert(
+    'Flink submit controller runs the packaged AnySentry streaming job',
+    /org\.a3s\.anysentry\.streaming\.AnySentryStreamJob/u.test(jobSubmit?.source ?? '') &&
+      /anysentry-flink-streaming\.jar/u.test(jobSubmit?.source ?? '') &&
+      /ANYSENTRY_FLINK_LEGACY_COMPOSITE_ENABLED,\s*value:\s*"off"/u.test(jobSubmit?.source ?? ''),
+    jobSubmit?.source,
+  );
+  assert(
+    'Stream Worker consumes Flink findings and episodes',
+    /dist\/security-monitoring\/stream-worker-main\.js/u.test(streamWorker?.source ?? '') &&
+      /\{\s*name:\s*ANYSENTRY_STREAM_WORKER_ROLE,\s*value:\s*"all"\s*\}/u.test(streamWorker?.source ?? ''),
+    streamWorker?.source,
+  );
+  assert(
+    'Composite Judge is an independent model-review worker',
+    /dist\/security-monitoring\/stream-worker-main\.js/u.test(compositeJudge?.source ?? '') &&
+      /\{\s*name:\s*ANYSENTRY_STREAM_WORKER_ROLE,\s*value:\s*"judge"\s*\}/u.test(compositeJudge?.source ?? '') &&
+      /anysentry-model-credentials/u.test(compositeJudge?.source ?? ''),
+    compositeJudge?.source,
+  );
+  assert(
+    'OSV assessment worker refreshes supply-chain intelligence independently',
+    /dist\/security-monitoring\/supply-chain-worker-main\.js/u.test(assessmentWorker?.source ?? '') &&
+      /ANYSENTRY_OSV_API_URL/u.test(assessmentWorker?.source ?? '') &&
+      /ANYSENTRY_OSV_REFRESH_INTERVAL_MS/u.test(assessmentWorker?.source ?? ''),
+    assessmentWorker?.source,
   );
 }
 
@@ -448,15 +585,45 @@ function verifyInstaller() {
   assert('Integrated installer supports docker mode', /install_docker\(\)/u.test(installer) && /docker compose up -d --build/u.test(installer), installer);
   assert('Integrated installer supports kubernetes mode', /install_kubernetes\(\)/u.test(installer) && /kubernetes\|k8s/u.test(installer), installer);
   assert('Integrated installer creates namespace and ClickHouse Secret', /kubectl create namespace/u.test(installer) && /create secret generic anysentry-clickhouse/u.test(installer), installer);
-  assert('Integrated installer applies AnySentry and observer manifests', /apply -f "\$ROOT_DIR\/deploy\/anysentry\.yaml"/u.test(installer) && /deploy\/observer\.yaml/u.test(installer), installer);
+  assert(
+    'Integrated installer renders core, streaming, and observer manifests',
+    /render_core_manifest "\$ROOT_DIR\/deploy\/anysentry\.yaml"/u.test(installer) &&
+      /render_streaming_manifest "\$ROOT_DIR\/deploy\/streaming\.yaml"/u.test(installer) &&
+      /deploy\/observer\.yaml/u.test(installer),
+    installer,
+  );
+  assert(
+    'Integrated installer supports immutable AnySentry and Flink image overrides',
+    /ANYSENTRY_IMAGE/u.test(installer) &&
+      /ANYSENTRY_FLINK_IMAGE/u.test(installer) &&
+      /ANYSENTRY_FLINK_IMAGE is required/u.test(installer),
+    installer,
+  );
   assert('Integrated installer supports optional Ingress', /ANYSENTRY_APPLY_INGRESS/u.test(installer) && /deploy\/ingress\.yaml/u.test(installer), installer);
-  assert('Integrated installer waits for AnySentry, ClickHouse, and observer rollouts', /rollout status deploy\/clickhouse/u.test(installer) && /rollout status deploy\/anysentry/u.test(installer) && /rollout status daemonset\/a3s-observer/u.test(installer), installer);
-  assert('Integrated installer documents the bundled a3s-sentry and a3s-observer stack', /@a3s-lab\/sentry/u.test(installer) && /a3s-observer/u.test(installer), installer);
+  assert(
+    'Integrated installer waits for storage, judges, streaming, OSV, and observer rollouts',
+    [
+      'deploy/clickhouse',
+      'statefulset/redis',
+      'statefulset/kafka',
+      'deploy/fast-judge',
+      'deploy/l3-worker',
+      'deploy/flink-jobmanager',
+      'deploy/flink-taskmanager',
+      'deploy/stream-worker',
+      'deploy/composite-judge',
+      'deploy/supply-chain-assessment',
+      'daemonset/a3s-observer',
+    ].every((resource) => installer.includes(`rollout status ${resource}`)),
+    installer,
+  );
+  assert('Integrated installer documents the observer, judge, streaming, and OSV stack', /a3s-observer/u.test(installer) && /Fast Judge/u.test(installer) && /Kafka, Flink/u.test(installer) && /OSV/u.test(installer), installer);
 }
 
 function main() {
   console.log('AnySentry deployment manifest verification');
   verifyAnySentryManifest();
+  verifyStreamingManifest();
   verifyObserverManifest();
   verifyIngressManifest();
   verifyDockerfile();

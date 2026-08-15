@@ -87,6 +87,7 @@ function attributor(procEntries = []) {
   }));
   assert.equal(temporaryChild.workspacePath, '/home/user/code');
   assert.equal(temporaryChild.workspaceSource, 'agent_root');
+  assert.equal(temporaryChild.attribution.agentWorkspacePath, '/home/user/code');
 
   const anySentryChild = judge.classify(observerEvent({
     pid: 851,
@@ -100,6 +101,7 @@ function attributor(procEntries = []) {
   assert.equal(anySentryChild.workspacePath, '/home/user/code/AnySentry');
   assert.equal(anySentryChild.workspaceSource, 'event_git_root');
   assert.equal(anySentryChild.workspaceConflict, false);
+  assert.equal(anySentryChild.attribution.agentWorkspacePath, '/home/user/code');
 
   const observerChild = judge.classify(observerEvent({
     pid: 851,
@@ -112,6 +114,7 @@ function attributor(procEntries = []) {
   }));
   assert.equal(observerChild.workspacePath, '/home/user/code/Observer');
   assert.equal(observerChild.workspaceSource, 'event_git_root');
+  assert.equal(observerChild.attribution.agentWorkspacePath, '/home/user/code');
 
   const conflictedChild = judge.classify(observerEvent({
     pid: 851,
@@ -336,6 +339,82 @@ function attributor(procEntries = []) {
   assert.equal(result.state, 'agent');
   assert.ok(reads <= 2, 'same-scope ancestor resolution must obey the configured depth bound');
   assert.equal(judge.runtimeSnapshot().entries.length, 1);
+}
+
+{
+  const procs = new Map([
+    [980, {
+      pid: 980,
+      tgid: 980,
+      ppid: 1,
+      startTime: 'agent-root-980',
+      comm: 'codex',
+      exe: '/usr/bin/codex',
+      argv: 'codex',
+      cwd: '/repos/codex-workspace',
+    }],
+    [981, {
+      pid: 981,
+      tgid: 981,
+      ppid: 980,
+      startTime: 'sandbox-child-981',
+      comm: 'bwrap',
+      exe: '/usr/bin/bwrap',
+      argv: 'bwrap --new-session',
+      cwd: '/repos/codex-workspace',
+    }],
+  ]);
+  const judge = new AgentAttributor({
+    now: () => 1_000_000,
+    listPids: () => [...procs.keys()],
+    readProc: (pid) => procs.get(pid),
+  });
+  judge.seedFromProc();
+
+  const incompleteExit = observerEvent({
+    agent: 'codex',
+    pid: 981,
+    ppid: 980,
+    comm: '',
+    exe: '',
+    startTimeNs: 'sandbox-child-981',
+    cwd: '',
+    argv: [],
+  });
+  incompleteExit.event = { ProcessExit: { pid: 981, exit_code: 0, signal: 0 } };
+  const inherited = judge.classify(incompleteExit);
+  assert.equal(inherited.state, 'agent');
+  assert.equal(inherited.attribution.agentScopeId, 'codex');
+  assert.equal(
+    inherited.attribution.rootPid,
+    980,
+    'an inherited Observer identity label must not promote a short child PID to an Agent root',
+  );
+  assert.equal(inherited.attribution.rootStartTime, 'agent-root-980');
+}
+
+{
+  const judge = new AgentAttributor({
+    now: () => 1_000_000,
+    readProc: () => undefined,
+  });
+  const incompleteExit = observerEvent({
+    agent: 'codex',
+    pid: 991,
+    ppid: 1,
+    comm: '',
+    exe: '',
+    startTimeNs: 'short-process-991',
+    cwd: '',
+    argv: [],
+  });
+  incompleteExit.event = { ProcessExit: { pid: 991, exit_code: 0, signal: 0 } };
+  const unresolved = judge.classify(incompleteExit);
+  assert.notEqual(
+    unresolved.state,
+    'agent',
+    'identity.agent is a claimed scope label, not executable evidence for a new Agent root',
+  );
 }
 
 {

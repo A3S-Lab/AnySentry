@@ -3,16 +3,40 @@
 // for ambiguous outcomes, and graceful shutdown drain. Persisted rows hydrate the ring on boot so
 // ordinary restarts and rollouts preserve date windows.
 //
-// This queue is not a WAL/outbox: a process or host failure can still lose rows that had not reached
-// ClickHouse. Crash-durable delivery would require a persistent WAL/outbox and upstream replay.
+// ClickHouse is the durable event and judgment fact store. Historical lists and aggregates query it
+// directly; the bounded in-memory ring only contributes uncommitted low-latency facts and fallback
+// reads while ClickHouse is unavailable. It must never decide whether historical data still exists.
 //
 // Connection comes from env (CLICKHOUSE_URL/USER/PASSWORD/DB). If ClickHouse is unreachable the store
 // degrades to in-memory-only (the dashboard keeps working; just no persistence) rather than crashing.
 
-import { ClickHouseClient, createClient, type ClickHouseSettings } from '@clickhouse/client';
-import { createHash, randomUUID } from 'node:crypto';
+import { ClickHouseClient, createClient } from '@clickhouse/client';
+import { agentIdentityKeyForEvent, agentRuntimeInstanceIdForEvent, hasDirectAgentRootEvidence } from './agent-identity';
+import { foldLatestEventRevisions } from './event-revision';
+import {
+  BucketCommitCursor,
+  compareEventCommitCursor,
+  PersistedDashboardBucket,
+  validPersistedDashboardBuckets,
+} from './persisted-dashboard-bucket';
 import { PolicyConfig } from './policy-config';
-import { AgentAttribution, AgentMetadataRecord, AlertRecord, AuditRecord, CollectorHeartbeatRecord, IdentityAiReviewRecord, Incident, IngestionSourceRecord, JudgedEvent, MaintenanceWindowRecord, NotificationState, ObjectiveRecord, ProcessContext, RemediationRecord } from './types';
+import { AgentAttribution, AgentMetadataRecord, AlertRecord, AuditRecord, CollectorHeartbeatRecord, IdentityAiReviewRecord, Incident, IngestionSourceRecord, JudgedEvent, MaintenanceWindowRecord, NotificationDeliveryRecord, NotificationState, ObjectiveRecord, ProcessContext, RemediationRecord } from './types';
+
+function boundedPositiveInt(
+  raw: string | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const value = Number(raw);
+  return Number.isFinite(value)
+    ? Math.min(max, Math.max(min, Math.trunc(value)))
+    : fallback;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 const TABLE = 'events';
 // `at` is raw epoch-ms (matches the aggregator); `ts` is a derived DateTime only for TTL/partitioning.
@@ -21,6 +45,7 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   eventId String,
   sourceEventId String DEFAULT '',
   at UInt64,
+  ingestedAt UInt64 DEFAULT at,
   eventKind LowCardinality(String),
   eventCategory LowCardinality(String),
   source LowCardinality(String),
@@ -39,6 +64,7 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   decisionStatus LowCardinality(String) DEFAULT 'succeeded',
   evaluationId String DEFAULT '',
   policyVersion String DEFAULT '',
+  decisionRevision UInt32 DEFAULT 1,
   decisionUpdatedAt UInt64 DEFAULT at,
   verdict LowCardinality(String),
   tier LowCardinality(String),
@@ -55,6 +81,11 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   attributes String,
   process String DEFAULT '{}',
   attribution String DEFAULT '{}',
+  agentIdentityKey String DEFAULT '',
+  agentInstanceKey String DEFAULT '',
+  agentMonitored UInt8 DEFAULT 0,
+  agentHasPhysicalIdentity UInt8 DEFAULT 0,
+  agentHasRootIdentity UInt8 DEFAULT 0,
   judgment String DEFAULT '{}',
   rawPreview String,
   ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000))
@@ -82,6 +113,7 @@ const EVENT_ALTERS = [
   'ADD COLUMN IF NOT EXISTS schemaVersion LowCardinality(String) DEFAULT \'anysentry.agent_event.v1\'',
   'ADD COLUMN IF NOT EXISTS eventId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS sourceEventId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS ingestedAt UInt64 DEFAULT at',
   'ADD COLUMN IF NOT EXISTS eventCategory LowCardinality(String) DEFAULT \'unknown\'',
   'ADD COLUMN IF NOT EXISTS source LowCardinality(String) DEFAULT \'observer\'',
   'ADD COLUMN IF NOT EXISTS collectorId String DEFAULT \'\'',
@@ -94,13 +126,80 @@ const EVENT_ALTERS = [
   "ADD COLUMN IF NOT EXISTS decisionStatus LowCardinality(String) DEFAULT 'succeeded'",
   "ADD COLUMN IF NOT EXISTS evaluationId String DEFAULT ''",
   "ADD COLUMN IF NOT EXISTS policyVersion String DEFAULT ''",
+  'ADD COLUMN IF NOT EXISTS decisionRevision UInt32 DEFAULT 1',
   'ADD COLUMN IF NOT EXISTS decisionUpdatedAt UInt64 DEFAULT at',
   'ADD COLUMN IF NOT EXISTS attributes String DEFAULT \'{}\'',
   'ADD COLUMN IF NOT EXISTS process String DEFAULT \'{}\'',
   'ADD COLUMN IF NOT EXISTS attribution String DEFAULT \'{}\'',
+  `ADD COLUMN IF NOT EXISTS agentIdentityKey String DEFAULT multiIf(
+    JSONExtractString(attribution, 'physicalWorkloadId') != '', JSONExtractString(attribution, 'physicalWorkloadId'),
+    JSONExtractString(attribution, 'agentInstanceId') != '', JSONExtractString(attribution, 'agentInstanceId'),
+    JSONExtractString(attribution, 'workloadRef', 'podUid') != '', concat(
+      'k8s:',
+      JSONExtractString(attribution, 'workloadRef', 'podUid'),
+      ':',
+      if(
+        JSONExtractString(attribution, 'workloadRef', 'containerName') != '',
+        JSONExtractString(attribution, 'workloadRef', 'containerName'),
+        if(JSONExtractString(attribution, 'workloadRef', 'name') != '', JSONExtractString(attribution, 'workloadRef', 'name'), 'container')
+      )
+    ),
+    JSONExtractUInt(attribution, 'rootPid') > 0, concat(
+      'host-root:',
+      if(JSONExtractString(process, 'hostId') != '', JSONExtractString(process, 'hostId'), 'host'),
+      ':',
+      if(JSONExtractString(process, 'bootId') != '', JSONExtractString(process, 'bootId'), 'boot'),
+      ':',
+      toString(JSONExtractUInt(attribution, 'rootPid')),
+      ':',
+      if(JSONExtractString(attribution, 'rootStartTime') != '', JSONExtractString(attribution, 'rootStartTime'), 'start-unknown')
+    ),
+    concat(
+      'logical:',
+      workspacePath,
+      ':',
+      if(
+        JSONExtractString(attribution, 'agentScopeId') != '',
+        JSONExtractString(attribution, 'agentScopeId'),
+        if(JSONExtractString(attribution, 'agentDisplayName') != '', JSONExtractString(attribution, 'agentDisplayName'), agentId)
+      )
+    )
+  )`,
+  `ADD COLUMN IF NOT EXISTS agentInstanceKey String DEFAULT multiIf(
+    JSONExtractString(attribution, 'agentInstanceId') != '', JSONExtractString(attribution, 'agentInstanceId'),
+    JSONExtractString(attribution, 'physicalWorkloadId') != '', JSONExtractString(attribution, 'physicalWorkloadId'),
+    JSONExtractUInt(attribution, 'rootPid') > 0, concat(
+      if(JSONExtractString(process, 'hostId') != '', JSONExtractString(process, 'hostId'), 'host'),
+      ':',
+      if(JSONExtractString(process, 'bootId') != '', JSONExtractString(process, 'bootId'), 'boot'),
+      ':',
+      toString(JSONExtractUInt(attribution, 'rootPid'))
+    ),
+    concat(sessionId, ':', agentId)
+  )`,
+  "ADD COLUMN IF NOT EXISTS agentMonitored UInt8 DEFAULT toUInt8(JSONExtractBool(attribution, 'monitored'))",
+  `ADD COLUMN IF NOT EXISTS agentHasPhysicalIdentity UInt8 DEFAULT toUInt8(
+    JSONExtractString(attribution, 'physicalWorkloadId') != ''
+    OR JSONExtractString(attribution, 'agentInstanceId') != ''
+    OR JSONExtractString(attribution, 'workloadRef', 'podUid') != ''
+  )`,
+  `ADD COLUMN IF NOT EXISTS agentHasRootIdentity UInt8 DEFAULT toUInt8(
+    JSONExtractUInt(attribution, 'rootPid') > 0
+    AND JSONExtractString(attribution, 'rootStartTime') != ''
+  )`,
   'ADD COLUMN IF NOT EXISTS judgment String DEFAULT \'{}\'',
   'ADD COLUMN IF NOT EXISTS rawPreview String DEFAULT \'\'',
 ];
+
+const COLLECTOR_HEARTBEAT_TABLE = 'collector_heartbeats';
+const COLLECTOR_HEARTBEAT_DDL = `CREATE TABLE IF NOT EXISTS ${COLLECTOR_HEARTBEAT_TABLE} (
+  collectorId String,
+  at UInt64,
+  payload String,
+  ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000))
+) ENGINE = MergeTree
+ORDER BY (collectorId, at)
+TTL ts + INTERVAL 90 DAY`;
 
 // Singleton policy config (the config panels' persistence). ReplacingMergeTree keeps only the latest
 // row per key; `FINAL` collapses to it on read.
@@ -112,62 +211,108 @@ const CONFIG_DDL = `CREATE TABLE IF NOT EXISTS ${CONFIG_TABLE} (
 ) ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY key`;
 
-// Dashboard reads must coexist with sustained Observer writes inside the bundled 2 GiB
-// ClickHouse budget. Large window aggregations spill early and use at most two read threads;
-// otherwise several dashboard panels can collectively consume the server budget and evict one
-// another before any result is returned.
-const BOUNDED_DASHBOARD_READ_SETTINGS: ClickHouseSettings = {
-  max_threads: 2,
-  max_memory_usage: String(384 * 1024 * 1024),
-  max_bytes_before_external_group_by: String(64 * 1024 * 1024),
-  max_bytes_before_external_sort: String(64 * 1024 * 1024),
-  min_bytes_to_use_direct_io: String(1024 * 1024),
-  max_execution_time: 25,
-};
+const NOTIFICATION_DELIVERY_TABLE = 'notification_delivery_facts';
+const NOTIFICATION_DELIVERY_DDL = `CREATE TABLE IF NOT EXISTS ${NOTIFICATION_DELIVERY_TABLE} (
+  deliveryId String,
+  sentAt UInt64,
+  ingestedAt UInt64,
+  payload String,
+  ts DateTime MATERIALIZED toDateTime(intDiv(sentAt, 1000))
+) ENGINE = MergeTree
+ORDER BY (deliveryId, sentAt, ingestedAt)
+TTL ts + INTERVAL 365 DAY`;
 
-// Session/workspace queries materialize wider per-event state. Small blocks keep each below its
-// query budget; running only these two one-thread reads together keeps the cold dashboard under
-// the browser deadline without restoring the previous four-query fan-out.
-const BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS: ClickHouseSettings = {
-  ...BOUNDED_DASHBOARD_READ_SETTINGS,
-  max_threads: 1,
-  max_block_size: '1024',
-  preferred_block_size_bytes: String(1024 * 1024),
-};
+const IDENTITY_AI_REVIEW_TABLE = 'identity_ai_review_revisions';
+const IDENTITY_AI_REVIEW_DDL = `CREATE TABLE IF NOT EXISTS ${IDENTITY_AI_REVIEW_TABLE} (
+  reviewId String,
+  revision UInt32,
+  status LowCardinality(String),
+  createdAt UInt64,
+  updatedAt UInt64,
+  ingestedAt UInt64,
+  payload String,
+  ts DateTime MATERIALIZED toDateTime(intDiv(createdAt, 1000))
+) ENGINE = MergeTree
+ORDER BY (reviewId, revision, ingestedAt)
+TTL ts + INTERVAL 365 DAY`;
 
-// Hydration reads wide rows rather than compact aggregates. A single read thread and small blocks
-// keep both ClickHouse and the API startup peak bounded, while a separate 640 MiB query budget
-// leaves measured headroom above the roughly 341 MiB production query peak.
-const BOUNDED_HYDRATE_READ_SETTINGS: ClickHouseSettings = {
-  ...BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
-  max_memory_usage: String(640 * 1024 * 1024),
-};
+const AUDIT_FACT_TABLE = 'audit_facts';
+const AUDIT_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${AUDIT_FACT_TABLE} (
+  auditId String,
+  at UInt64,
+  ingestedAt UInt64,
+  payload String,
+  ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000))
+) ENGINE = MergeTree
+ORDER BY (auditId, at, ingestedAt)
+TTL ts + INTERVAL 365 DAY`;
 
-// Recent event reads also materialize wide rows. Moving-window production samples exceeded the
-// shared 384 MiB budget by up to 2.5 MiB, so only this path gets a measured 448 MiB ceiling while
-// retaining one thread and small blocks.
-const BOUNDED_RECENT_READ_SETTINGS: ClickHouseSettings = {
-  ...BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
-  max_memory_usage: String(448 * 1024 * 1024),
-};
+// A compact, append-only invalidation journal maintained by ClickHouse itself. Because the
+// materialized view is part of the event insert pipeline it also observes revisions written by
+// Fast Judge/L3 processes; an API-local generation counter would miss those cross-process writes.
+// The table is not an event store and is safe to retain for a much shorter period than evidence.
+const EVENT_COMMIT_FACT_TABLE = 'event_commit_facts';
+const EVENT_COMMIT_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_COMMIT_FACT_TABLE} (
+  eventId String,
+  decisionRevision UInt32,
+  eventAt UInt64,
+  committedAt UInt64,
+  sourceId String,
+  collectorId String,
+  ts DateTime MATERIALIZED toDateTime(intDiv(committedAt, 1000))
+) ENGINE = MergeTree
+ORDER BY (committedAt, eventId, decisionRevision)
+TTL ts + INTERVAL 7 DAY`;
+const EVENT_COMMIT_FACT_MV = 'event_commit_facts_mv';
+const EVENT_COMMIT_FACT_MV_DDL = `CREATE MATERIALIZED VIEW IF NOT EXISTS ${EVENT_COMMIT_FACT_MV}
+TO ${EVENT_COMMIT_FACT_TABLE}
+AS SELECT
+  eventId,
+  decisionRevision,
+  at AS eventAt,
+  ingestedAt AS committedAt,
+  sourceId,
+  collectorId
+FROM ${TABLE}`;
 
-// Durable searches manually late-materialize wide rows: the candidate sort carries only row
-// locators and judgment keys, then the outer PREWHERE fetches the selected physical revisions.
-// A 512 MiB ceiling bounds the locator set and at most 10k final JSON rows without restoring the
-// former 640 MiB SELECT-* sort budget.
-const BOUNDED_EVENT_SEARCH_READ_SETTINGS: ClickHouseSettings = {
-  ...BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
-  max_memory_usage: String(512 * 1024 * 1024),
-};
-
-const MAX_DURABLE_EVENT_SEARCH_ROWS = 10_000;
+// Complete aggregate snapshots, not incrementally accumulated counters. One JSON payload represents
+// the whole event-time bucket at a proven commit cursor, so a later revision can replace the bucket
+// without leaving the previous decision counted. The commit journal remains the authority that
+// determines whether a stored snapshot is still reusable.
+const DASHBOARD_BUCKET_SNAPSHOT_TABLE = 'dashboard_bucket_snapshots';
+const DASHBOARD_BUCKET_SNAPSHOT_DDL = `CREATE TABLE IF NOT EXISTS ${DASHBOARD_BUCKET_SNAPSHOT_TABLE} (
+  bucketStart UInt64,
+  bucketMs UInt32,
+  snapshotCommittedAt UInt64,
+  snapshotEventId String,
+  snapshotDecisionRevision UInt32,
+  snapshotVersion UInt64,
+  factsJson String,
+  computedAt UInt64,
+  ts DateTime MATERIALIZED toDateTime(intDiv(computedAt, 1000))
+) ENGINE = MergeTree
+ORDER BY (
+  bucketMs,
+  bucketStart,
+  snapshotCommittedAt,
+  snapshotEventId,
+  snapshotDecisionRevision,
+  snapshotVersion
+)
+TTL ts + INTERVAL 14 DAY`;
 
 type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'process' | 'attribution' | 'judgment' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview'> & {
+  ingestedAt: number;
   actionKind: string;
   actionTarget: string;
   attributes: string;
   process: string;
   attribution: string;
+  agentIdentityKey: string;
+  agentInstanceKey: string;
+  agentMonitored: number;
+  agentHasPhysicalIdentity: number;
+  agentHasRootIdentity: number;
   judgment: string;
   collectorId: string;
   sourceId: string;
@@ -207,10 +352,13 @@ export type IncidentState = Pick<Incident, 'incidentId' | 'status' | 'owner' | '
 export interface StoredEventQuery {
   sinceMs: number;
   untilMs: number;
+  monitoredOnly?: boolean;
   eventId?: string;
   sourceId?: string;
   collectorId?: string;
   agentId?: string;
+  /** Stable concrete runtime identity. Unlike display agentId, this is safe to push down. */
+  agentInstanceId?: string;
   sessionId?: string;
   workspacePath?: string;
   traceId?: string;
@@ -220,6 +368,169 @@ export interface StoredEventQuery {
   verdict?: string;
   tier?: string;
   limit: number;
+}
+export interface StoredEventSearchResult {
+  events: JudgedEvent[];
+  hasMore: boolean;
+  committedCutoffMs?: number;
+  /** The durable query failed; callers must not interpret the empty page as an exact zero. */
+  unavailable?: boolean;
+}
+
+export interface CommittedSourceProgress {
+  sourceId?: string;
+  collectorId?: string;
+  committedEventTimeMs: number;
+  committedAtMs: number;
+}
+
+export interface EventCommitCursor {
+  committedAtMs: number;
+  eventId: string;
+  decisionRevision: number;
+}
+
+export interface EventCommitChange {
+  cursor: EventCommitCursor;
+  eventAtMs: number;
+  sourceId?: string;
+  collectorId?: string;
+}
+
+export interface EventCommitChanges {
+  changes: EventCommitChange[];
+  cursor?: EventCommitCursor;
+  hasMore: boolean;
+}
+
+export interface DashboardAggregateBucketFact {
+  bucketStartMs: number;
+  monitored: boolean;
+  decisionStatus: string;
+  verdict: string;
+  tier: string;
+  riskType: string;
+  riskCategory: string;
+  riskName: string;
+  severityRank: number;
+  sessionKey: string;
+  userId: string;
+  workspacePath: string;
+  eventCount: number;
+  blockedCount: number;
+  escalatedCount: number;
+  l2Count: number;
+  l3Count: number;
+  riskActivationCount: number;
+  riskyEventCount: number;
+  tokenCount: number;
+  latencyTotal: number;
+  riskScoreTotal: number;
+  lastEventAt: number;
+  commandDangerCount: number;
+  promptInjectionCount: number;
+  dataLeakCount: number;
+  communicationRiskCount: number;
+  systemicRiskCount: number;
+}
+
+export interface StoredAgentWindowFact {
+  identityKey: string;
+  representativeEvent: JudgedEvent;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  eventCount: number;
+  riskyEventCount: number;
+  sessionCount: number;
+  runCount: number;
+  traceCount: number;
+  sessionKeys: string[];
+  runKeys: string[];
+  traceKeys: string[];
+  collectorKeys: string[];
+  eventsWithoutCollector: number;
+  tokenCount: number;
+  latencyTotal: number;
+  instanceCount: number;
+  instanceKeys: string[];
+  worstSeverityRank: number;
+  topRiskAt?: number;
+  topRiskCategory?: string;
+  topRiskName?: string;
+  eventCategoryCounts: Record<string, number>;
+  sourceCounts: Record<string, number>;
+  hasPhysicalIdentity: boolean;
+  hasRootIdentity: boolean;
+}
+
+export interface StoredAgentBucketFact extends StoredAgentWindowFact {
+  bucketStartMs: number;
+}
+
+export interface StoredAgentMetricBucketFact {
+  bucketIndex: number;
+  identityKey: string;
+  representativeEvent: JudgedEvent;
+  eventCount: number;
+  riskyEventCount: number;
+  blockedCount: number;
+  escalatedCount: number;
+  toolCount: number;
+  fileCount: number;
+  networkCount: number;
+  processCount: number;
+  llmCount: number;
+  l1Count: number;
+  l2Count: number;
+  l3Count: number;
+  failedCount: number;
+  timeoutCount: number;
+  tokenCount: number;
+  latencyTotal: number;
+  maxRiskScore: number;
+  sessionKeys: string[];
+  recentEventCount: number;
+  recentCommCount: number;
+  recentSessionKeys: string[];
+}
+
+export interface StoredWorkspaceWindowFact {
+  workspacePath: string;
+  representativeEvent: JudgedEvent;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  eventCount: number;
+  riskyEventCount: number;
+  sessionKeys: string[];
+  runKeys: string[];
+  traceKeys: string[];
+  collectorKeys: string[];
+  tokenCount: number;
+  latencyTotal: number;
+  worstSeverityRank: number;
+  topRiskAt?: number;
+  topRiskCategory?: string;
+  topRiskName?: string;
+}
+
+export interface StoredWorkspaceBucketFact extends StoredWorkspaceWindowFact {
+  bucketStartMs: number;
+}
+
+export interface StoredTopologyWindowFact {
+  identityKey: string;
+  representativeEvent: JudgedEvent;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  eventCount: number;
+  riskyEventCount: number;
+  worstSeverityRank: number;
+  riskCategory?: string;
+  riskName?: string;
+}
+
+export interface StoredTopologyBucketFact extends StoredTopologyWindowFact {
+  bucketStartMs: number;
 }
 
 export interface DashboardWindowDimensionRow {
@@ -279,11 +590,15 @@ function attrString(attributes: JudgedEvent['attributes'], key: string): string 
 }
 
 function toRow(e: JudgedEvent): Row {
+  const attribution = e.attribution;
+  const physical = attribution?.physicalWorkloadId?.trim();
+  const instance = attribution?.agentInstanceId?.trim();
   return {
     schemaVersion: e.schemaVersion,
     eventId: e.eventId,
     sourceEventId: e.sourceEventId ?? '',
     at: e.at,
+    ingestedAt: Date.now(),
     eventKind: e.eventKind,
     eventCategory: e.eventCategory,
     source: e.source,
@@ -302,6 +617,7 @@ function toRow(e: JudgedEvent): Row {
     decisionStatus: e.decisionStatus ?? 'succeeded',
     evaluationId: e.evaluationId ?? '',
     policyVersion: e.policyVersion ?? '',
+    decisionRevision: Math.max(1, Math.trunc(e.decisionRevision ?? 1)),
     decisionUpdatedAt: e.decisionUpdatedAt ?? e.at,
     verdict: e.verdict,
     tier: e.tier,
@@ -317,7 +633,12 @@ function toRow(e: JudgedEvent): Row {
     latencyMs: e.latencyMs,
     attributes: JSON.stringify(e.attributes ?? {}),
     process: JSON.stringify(e.process ?? {}),
-    attribution: JSON.stringify(e.attribution ?? {}),
+    attribution: JSON.stringify(attribution ?? {}),
+    agentIdentityKey: agentIdentityKeyForEvent(e),
+    agentInstanceKey: agentRuntimeInstanceIdForEvent(e),
+    agentMonitored: attribution?.monitored === true ? 1 : 0,
+    agentHasPhysicalIdentity: physical || instance || attribution?.workloadRef?.podUid ? 1 : 0,
+    agentHasRootIdentity: attribution?.rootStartTime && hasDirectAgentRootEvidence(e) ? 1 : 0,
     judgment: JSON.stringify(e.judgment ?? {}),
     rawPreview: e.rawPreview ?? '',
   };
@@ -372,6 +693,7 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
     decisionStatus: (str(r.decisionStatus) || 'succeeded') as JudgedEvent['decisionStatus'],
     evaluationId: str(r.evaluationId) || undefined,
     policyVersion: str(r.policyVersion) || undefined,
+    decisionRevision: Math.max(1, num(r.decisionRevision) || 1),
     decisionUpdatedAt: num(r.decisionUpdatedAt) || at,
     verdict: r.verdict as JudgedEvent['verdict'],
     tier: r.tier as JudgedEvent['tier'],
@@ -395,24 +717,30 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
 
 export class ClickHouseStore {
   private client?: ClickHouseClient;
-  private buf: QueuedEventRow[] = [];
-  private bufferedEventBytes = 0;
-  // Includes unsealed rows plus sealed/active batches. Keeping the active batch in these totals
-  // prevents a slow HTTP request from becoming hidden memory outside the advertised buffer bound.
-  private eventWriteRows = 0;
-  private eventWriteBytes = 0;
-  private eventWriteBatches: EventWriteBatch[] = [];
-  private eventWriteBatchesByToken = new Map<string, EventWriteBatch>();
-  private eventWriteDrainInFlight?: Promise<void>;
-  private eventWriteRetryWakeTimer?: NodeJS.Timeout;
-  private eventWriteRetrySleep?: { timer: NodeJS.Timeout; wake: () => void };
-  private eventWriteAbortController?: AbortController;
-  private eventWritePermanentError?: Error;
-  private eventWriteClosingDeadline?: number;
-  private closeInFlight?: Promise<void>;
-  private closing = false;
+  private buf: Row[] = [];
+  private collectorHeartbeatBuf: Array<{ collectorId: string; at: number; payload: string }> = [];
   private flushTimer?: NodeJS.Timeout;
+  private reconnectTimer?: NodeJS.Timeout;
+  private connectInFlight?: Promise<boolean>;
+  private flushInFlight?: Promise<void>;
+  private immediateWritesInFlight = 0;
   private ready = false;
+  private closed = false;
+  private committedThroughMs?: number;
+  private readonly committedSourceProgress = new Map<string, CommittedSourceProgress>();
+  private earliestCommitCursorCache?: {
+    expiresAt: number;
+    value: Promise<EventCommitCursor | null>;
+  };
+  private dashboardSnapshotSequence = 0;
+  private readonly dashboardSnapshotStats = {
+    hits: 0,
+    misses: 0,
+    invalidated: 0,
+    exactRanges: 0,
+    writtenBuckets: 0,
+    fallbackErrors: 0,
+  };
 
   // Instance fields make the retry clock/delays replaceable by the standalone deterministic
   // verifier without exposing a production API or relying on Node-version-specific fake timers.
@@ -461,37 +789,177 @@ export class ClickHouseStore {
     return this.ready && !this.closing && !this.eventWritePermanentError;
   }
 
-  /** Connect + ensure the database/table exist. Returns false (degrade to in-memory) if unreachable. */
+  dashboardBucketSnapshotStatus() {
+    return {
+      schemaVersion: 'anysentry.dashboard-bucket-snapshots.v1' as const,
+      enabled: process.env.ANYSENTRY_PERSISTED_DASHBOARD_BUCKETS !== 'off',
+      ...this.dashboardSnapshotStats,
+    };
+  }
+
+  /**
+   * Connect and ensure the database/table exist.
+   *
+   * ClickHouse can become healthy a few seconds after the API container starts (for example during
+   * a full Compose restart). A single failed attempt used to leave this store in memory-only mode
+   * until the API was manually restarted. Keep startup retries bounded so boot cannot hang forever,
+   * then continue a low-frequency reconnect loop in the background.
+   */
   async init(): Promise<boolean> {
     const url = process.env.CLICKHOUSE_URL;
     if (!url) return false;
+    this.closed = false;
+    const attempts = boundedPositiveInt(
+      process.env.ANYSENTRY_CLICKHOUSE_INIT_ATTEMPTS,
+      15,
+      1,
+      60,
+    );
+    const retryMs = boundedPositiveInt(
+      process.env.ANYSENTRY_CLICKHOUSE_INIT_RETRY_MS,
+      2_000,
+      250,
+      30_000,
+    );
+    let errorMessage = 'unknown error';
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const result = await this.connect();
+      if (result.ok) return true;
+      errorMessage = result.error;
+      if (attempt < attempts) {
+        console.warn(
+          `[clickhouse] init attempt ${attempt}/${attempts} failed; retrying in ${retryMs}ms: ${errorMessage}`,
+        );
+        await delay(retryMs);
+      }
+    }
+    console.error(
+      `[clickhouse] init failed after ${attempts} attempts — running in-memory until reconnect: ${errorMessage}`,
+    );
+    this.scheduleReconnect();
+    return false;
+  }
+
+  private connect(): Promise<{ ok: boolean; error: string }> {
+    if (this.ready) return Promise.resolve({ ok: true, error: '' });
+    if (this.connectInFlight) {
+      return this.connectInFlight.then((ok) => ({
+        ok,
+        error: ok ? '' : 'connection attempt failed',
+      }));
+    }
+    const operation = this.connectOnce();
+    this.connectInFlight = operation.then((result) => result.ok);
+    return operation.finally(() => {
+      this.connectInFlight = undefined;
+    });
+  }
+
+  private async connectOnce(): Promise<{ ok: boolean; error: string }> {
+    const url = process.env.CLICKHOUSE_URL;
+    if (!url || this.closed) return { ok: false, error: 'ClickHouse is not configured or store is closed' };
     const database = process.env.CLICKHOUSE_DB || 'anysentry';
+    const credentials = {
+      username: process.env.CLICKHOUSE_USER || 'default',
+      password: process.env.CLICKHOUSE_PASSWORD || '',
+    };
+    let boot: ClickHouseClient | undefined;
+    let nextClient: ClickHouseClient | undefined;
     try {
       // Create the database with a bootstrap client (no db bound), then connect to it.
-      const boot = createClient({ url, username: process.env.CLICKHOUSE_USER || 'default', password: process.env.CLICKHOUSE_PASSWORD || '' });
+      boot = createClient({ url, ...credentials });
       await boot.command({ query: `CREATE DATABASE IF NOT EXISTS ${database}` });
       await boot.close();
-      this.client = createClient({ url, database, username: process.env.CLICKHOUSE_USER || 'default', password: process.env.CLICKHOUSE_PASSWORD || '' });
-      await this.client.command({ query: DDL(TABLE) });
-      for (const alter of EVENT_ALTERS) await this.client.command({ query: `ALTER TABLE ${TABLE} ${alter}` });
-      // CREATE IF NOT EXISTS does not update an existing table. Explicitly enable the local
-      // MergeTree deduplication log so retrying an ambiguously acknowledged batch with the same
-      // token is idempotent on both fresh and upgraded installations.
-      await this.client.command({
-        query: `ALTER TABLE ${TABLE} MODIFY SETTING non_replicated_deduplication_window = ${EVENT_DEDUPLICATION_WINDOW}`,
+      boot = undefined;
+      nextClient = createClient({ url, database, ...credentials });
+      await nextClient.command({ query: DDL(TABLE) });
+      for (const alter of EVENT_ALTERS) await nextClient.command({ query: `ALTER TABLE ${TABLE} ${alter}` });
+      await nextClient.command({ query: COLLECTOR_HEARTBEAT_DDL });
+      await nextClient.command({ query: CONFIG_DDL });
+      await nextClient.command({ query: NOTIFICATION_DELIVERY_DDL });
+      await nextClient.command({ query: IDENTITY_AI_REVIEW_DDL });
+      await nextClient.command({ query: AUDIT_FACT_DDL });
+      await nextClient.command({ query: EVENT_COMMIT_FACT_DDL });
+      await nextClient.command({ query: EVENT_COMMIT_FACT_MV_DDL });
+      await nextClient.command({ query: DASHBOARD_BUCKET_SNAPSHOT_DDL });
+      const committed = await nextClient.query({
+        query: `
+          SELECT
+            sourceId,
+            collectorId,
+            max(at) AS committedThrough,
+            max(ingestedAt) AS committedAt
+          FROM ${TABLE}
+          GROUP BY sourceId, collectorId
+        `,
+        format: 'JSONEachRow',
       });
-      await this.client.command({ query: CONFIG_DDL });
-      this.closing = false;
-      this.flushTimer = setInterval(() => {
-        void this.flush().catch(() => undefined);
-      }, 2000);
+      const committedRows = (await committed.json()) as Array<{
+        sourceId?: string;
+        collectorId?: string;
+        committedThrough?: string | number;
+        committedAt?: string | number;
+      }>;
+      this.committedSourceProgress.clear();
+      for (const row of committedRows) {
+        const committedEventTimeMs = Number(row.committedThrough);
+        if (!Number.isFinite(committedEventTimeMs) || committedEventTimeMs <= 0) continue;
+        const sourceId = row.sourceId?.trim() || undefined;
+        const collectorId = row.collectorId?.trim() || undefined;
+        this.committedSourceProgress.set(`${sourceId ?? ''}\u0000${collectorId ?? ''}`, {
+          sourceId,
+          collectorId,
+          committedEventTimeMs,
+          committedAtMs: Number(row.committedAt) || committedEventTimeMs,
+        });
+      }
+      const committedThrough = committedRows.reduce(
+        (maximum, row) => Math.max(maximum, Number(row.committedThrough) || 0),
+        0,
+      );
+      this.committedThroughMs = Number.isFinite(committedThrough) && committedThrough > 0
+        ? committedThrough
+        : undefined;
+      await this.client?.close().catch(() => undefined);
+      this.client = nextClient;
+      nextClient = undefined;
+      if (this.flushTimer) clearInterval(this.flushTimer);
+      this.flushTimer = setInterval(() => void this.flush(), 2_000);
+      if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
       this.ready = true;
-      return true;
-    } catch (err) {
-      console.error('[clickhouse] init failed — running in-memory only:', (err as Error).message);
+      console.info('[clickhouse] connection ready');
+      return { ok: true, error: '' };
+    } catch (error) {
       this.ready = false;
-      return false;
+      await boot?.close().catch(() => undefined);
+      await nextClient?.close().catch(() => undefined);
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.closed || this.ready || this.reconnectTimer || !process.env.CLICKHOUSE_URL) return;
+    const reconnectMs = boundedPositiveInt(
+      process.env.ANYSENTRY_CLICKHOUSE_RECONNECT_MS,
+      15_000,
+      1_000,
+      300_000,
+    );
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      void this.connect().then((result) => {
+        if (result.ok) {
+          console.info('[clickhouse] background reconnect succeeded');
+          return;
+        }
+        console.warn(`[clickhouse] background reconnect failed; retrying in ${reconnectMs}ms: ${result.error}`);
+        this.scheduleReconnect();
+      });
+    }, reconnectMs);
   }
 
   /** Buffer one event; flush opportunistically when the batch is large. */
@@ -511,52 +979,129 @@ export class ClickHouseStore {
 
   /** Persist one lifecycle revision before acknowledging queue work. */
   async insertNow(e: JudgedEvent): Promise<void> {
-    if (!this.client || !this.ready || this.closing) throw new Error('ClickHouse is not ready');
-    if (this.eventWritePermanentError) throw this.eventWritePermanentError;
-    const queued = this.queuedEventRow(toRow(e));
-    const token = this.directEventWriteToken(queued.row);
-    const existing = this.eventWriteBatchesByToken.get(token);
-    if (existing) {
-      const completion = new Promise<void>((resolve, reject) => existing.waiters.push({ resolve, reject }));
-      this.startEventWriteDrain();
-      return completion;
+    if (!this.client || !this.ready) throw new Error('ClickHouse is not ready');
+    this.immediateWritesInFlight += 1;
+    try {
+      const row = toRow(e);
+      await this.client.insert({ table: TABLE, values: [row], format: 'JSONEachRow' });
+      this.committedThroughMs = Math.max(this.committedThroughMs ?? 0, e.at);
+      this.noteCommittedRows([row]);
+    } finally {
+      this.immediateWritesInFlight -= 1;
     }
-
-    this.assertEventWriteCapacity(queued.bytes);
-    // Preserve global event-write FIFO: a direct lifecycle revision may not jump over a partial
-    // buffered batch that was accepted earlier merely because the two-second timer has not fired.
-    this.sealBufferedEventBatches(true);
-    const batch = this.createEventWriteBatch([queued], token, 'direct');
-    this.eventWriteRows += 1;
-    this.eventWriteBytes += queued.bytes;
-    this.eventWriteBatches.push(batch);
-    this.eventWriteBatchesByToken.set(token, batch);
-    const completion = new Promise<void>((resolve, reject) => batch.waiters.push({ resolve, reject }));
-    this.startEventWriteDrain();
-    return completion;
   }
 
   async flush(): Promise<void> {
-    if (!this.client) return;
-    this.sealBufferedEventBatches(true);
-    if (!this.eventWriteBatches.length) return;
-    await this.ensureEventWriteDrain();
+    // Chain flushes instead of allowing two callers to drain the buffers concurrently. A caller
+    // arriving during an insert receives its own pass after that insert, so rows appended while
+    // the first batch is in flight are not stranded (including during close()).
+    const previous = this.flushInFlight ?? Promise.resolve();
+    const operation = previous
+      .catch(() => undefined)
+      .then(() => this.flushBatch());
+    this.flushInFlight = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.flushInFlight === operation) this.flushInFlight = undefined;
+    }
   }
 
-  private queuedEventRow(row: Row): QueuedEventRow {
-    const bytes = Buffer.byteLength(JSON.stringify(row), 'utf8') + 1;
-    if (bytes > EVENT_WRITE_BATCH_BYTES) {
-      const error = Object.assign(
-        new Error(`ClickHouse event row is ${bytes} bytes, above the ${EVENT_WRITE_BATCH_BYTES}-byte insert bound`),
-        { code: 'ANYSENTRY_CLICKHOUSE_EVENT_ROW_TOO_LARGE' },
-      );
-      console.error('[clickhouse] event write rejected:', {
-        code: error.code,
-        eventId: row.eventId,
-        bytes,
-        maxBytes: EVENT_WRITE_BATCH_BYTES,
+  private async flushBatch(): Promise<void> {
+    if (!this.client) return;
+    const values = this.buf;
+    this.buf = [];
+    if (values.length) {
+      try {
+        await this.client.insert({ table: TABLE, values, format: 'JSONEachRow' });
+        this.committedThroughMs = Math.max(
+          this.committedThroughMs ?? 0,
+          ...values.map((row) => Number(row.at) || 0),
+        );
+        this.noteCommittedRows(values);
+      } catch (err) {
+        // A transient durable-store failure must not leave the hot ring as the only remaining
+        // copy. Put the failed batch before rows that arrived while the insert was in flight.
+        this.buf = [...values, ...this.buf];
+        console.error('[clickhouse] insert failed (batch queued for retry):', (err as Error).message);
+      }
+    }
+    const heartbeatValues = this.collectorHeartbeatBuf;
+    this.collectorHeartbeatBuf = [];
+    if (heartbeatValues.length) {
+      try {
+        await this.client.insert({
+          table: COLLECTOR_HEARTBEAT_TABLE,
+          values: heartbeatValues,
+          format: 'JSONEachRow',
+        });
+      } catch (err) {
+        this.collectorHeartbeatBuf = [...heartbeatValues, ...this.collectorHeartbeatBuf];
+        console.error('[clickhouse] collector heartbeat insert failed (batch queued for retry):', (err as Error).message);
+      }
+    }
+  }
+
+  enqueueCollectorHeartbeat(record: CollectorHeartbeatRecord): void {
+    if (!this.ready) return;
+    this.collectorHeartbeatBuf.push({
+      collectorId: record.collectorId,
+      at: record.at,
+      payload: JSON.stringify(record),
+    });
+    if (this.collectorHeartbeatBuf.length >= 100) void this.flush();
+  }
+
+  async queryCollectorHeartbeats(sinceMs: number, untilMs: number): Promise<CollectorHeartbeatRecord[] | null> {
+    if (!this.client || !this.ready) return null;
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT argMax(payload, at) AS payload
+          FROM ${COLLECTOR_HEARTBEAT_TABLE}
+          WHERE at >= {since:UInt64} AND at <= {until:UInt64}
+          GROUP BY collectorId, at
+          ORDER BY at`,
+        query_params: { since: sinceMs, until: untilMs },
+        format: 'JSONEachRow',
       });
-      throw error;
+      const rows = await result.json() as Array<{ payload: string }>;
+      return rows.flatMap((row) => {
+        try {
+          return [JSON.parse(row.payload) as CollectorHeartbeatRecord];
+        } catch {
+          return [];
+        }
+      });
+    } catch (error) {
+      console.error('[clickhouse] collector heartbeat query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  async latestCollectorHeartbeats(untilMs: number): Promise<CollectorHeartbeatRecord[] | null> {
+    if (!this.client || !this.ready) return null;
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT argMax(payload, at) AS payload
+          FROM ${COLLECTOR_HEARTBEAT_TABLE}
+          WHERE at <= {until:UInt64}
+          GROUP BY collectorId`,
+        query_params: { until: untilMs },
+        format: 'JSONEachRow',
+      });
+      const rows = await result.json() as Array<{ payload: string }>;
+      return rows.flatMap((row) => {
+        try {
+          return [JSON.parse(row.payload) as CollectorHeartbeatRecord];
+        } catch {
+          return [];
+        }
+      });
+    } catch (error) {
+      console.error('[clickhouse] latest collector heartbeat query failed:', (error as Error).message);
+      return null;
     }
     return { row, bytes };
   }
@@ -911,12 +1456,7 @@ export class ClickHouseStore {
         format: 'JSONEachRow',
       });
       const rows = (await rs.json()) as Array<Record<string, unknown>>;
-      const latest = new Map<string, JudgedEvent>();
-      for (const event of rows.map(fromRow)) {
-        const previous = latest.get(event.eventId);
-        if (!previous || (event.decisionUpdatedAt ?? event.at) >= (previous.decisionUpdatedAt ?? previous.at)) latest.set(event.eventId, event);
-      }
-      return [...latest.values()].sort((a, b) => a.at - b.at).slice(-safeLimit);
+      return foldLatestEventRevisions(rows.map(fromRow)).sort((a, b) => a.at - b.at).slice(-limit);
     } catch (err) {
       console.error('[clickhouse] hydrate failed:', (err as Error).message);
       return [];
@@ -956,19 +1496,13 @@ export class ClickHouseStore {
           SELECT *
           FROM (
             SELECT *
-            FROM (
-              SELECT *
-              FROM ${TABLE}
-              PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}
-              ${scanFilters.length ? `WHERE ${scanFilters.join(' AND ')}` : ''}
-              ORDER BY at DESC
-              LIMIT {scanLimit:UInt32} WITH TIES
-            )
-            ORDER BY at DESC, decisionUpdatedAt DESC
-            LIMIT 1 BY eventId
+            FROM ${TABLE}
+            WHERE ${clauses.join(' AND ')}
+            ORDER BY at DESC, decisionRevision DESC, decisionUpdatedAt DESC
+            LIMIT {scanLimit:UInt32}
           )
-          ${latestFilters.length ? `WHERE ${latestFilters.join(' AND ')}` : ''}
-          ORDER BY at DESC, decisionUpdatedAt DESC
+          ORDER BY at DESC, decisionRevision DESC, decisionUpdatedAt DESC
+          LIMIT 1 BY eventId
           LIMIT {limit:UInt32}`,
           query_params: {
             since: sinceMs,
@@ -997,6 +1531,521 @@ export class ClickHouseStore {
   }
 
   /**
+   * Return durable writes after a stable lexicographic cursor. The journal is populated by a
+   * ClickHouse materialized view, so revisions inserted by another worker process invalidate the
+   * same dashboard bucket cache. A bounded page prevents a recovery burst from monopolising the
+   * API; callers continue from the returned cursor while `hasMore` is true.
+   */
+  async eventCommitChanges(
+    after?: EventCommitCursor,
+    limit = 20_000,
+  ): Promise<EventCommitChanges | null> {
+    if (!this.client || !this.ready) return null;
+    const safeLimit = Math.max(1, Math.min(100_000, Math.trunc(limit)));
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT eventId, decisionRevision, eventAt, committedAt, sourceId, collectorId
+          FROM ${EVENT_COMMIT_FACT_TABLE}
+          WHERE tuple(committedAt, eventId, decisionRevision) >
+            tuple({committedAt:UInt64}, {eventId:String}, {decisionRevision:UInt32})
+          ORDER BY committedAt, eventId, decisionRevision
+          LIMIT {limit:UInt32}`,
+        query_params: {
+          committedAt: after?.committedAtMs ?? 0,
+          eventId: after?.eventId ?? '',
+          decisionRevision: after?.decisionRevision ?? 0,
+          limit: safeLimit + 1,
+        },
+        format: 'JSONEachRow',
+      });
+      const rows = await result.json() as Array<Record<string, unknown>>;
+      const hasMore = rows.length > safeLimit;
+      const selected = hasMore ? rows.slice(0, safeLimit) : rows;
+      const changes = selected.map<EventCommitChange>((row) => ({
+        cursor: {
+          committedAtMs: Number(row.committedAt) || 0,
+          eventId: String(row.eventId ?? ''),
+          decisionRevision: Math.max(1, Number(row.decisionRevision) || 1),
+        },
+        eventAtMs: Number(row.eventAt) || 0,
+        sourceId: String(row.sourceId ?? '').trim() || undefined,
+        collectorId: String(row.collectorId ?? '').trim() || undefined,
+      }));
+      return {
+        changes,
+        cursor: changes.at(-1)?.cursor ?? after,
+        hasMore,
+      };
+    } catch (error) {
+      console.error('[clickhouse] event commit journal query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  async latestEventCommitCursor(): Promise<EventCommitCursor | null> {
+    if (!this.client || !this.ready) return null;
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT committedAt, eventId, decisionRevision
+          FROM ${EVENT_COMMIT_FACT_TABLE}
+          ORDER BY committedAt DESC, eventId DESC, decisionRevision DESC
+          LIMIT 1`,
+        format: 'JSONEachRow',
+      });
+      const row = (await result.json() as Array<Record<string, unknown>>)[0];
+      if (!row) return { committedAtMs: 0, eventId: '', decisionRevision: 0 };
+      return {
+        committedAtMs: Number(row.committedAt) || 0,
+        eventId: String(row.eventId ?? ''),
+        decisionRevision: Math.max(1, Number(row.decisionRevision) || 1),
+      };
+    } catch (error) {
+      console.error('[clickhouse] latest event commit cursor query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  /**
+   * Return the oldest journal row that can still be observed.
+   *
+   * The commit journal has a finite TTL. A long-lived API cache whose cursor is older than this
+   * row cannot prove that it observed every invalidation, so callers must discard their cached
+   * historical prefix and rebuild it. Brief memoisation keeps several dashboard caches from
+   * issuing the same bounds query during one refresh cycle.
+   */
+  earliestEventCommitCursor(): Promise<EventCommitCursor | null> {
+    const current = Date.now();
+    const cached = this.earliestCommitCursorCache;
+    if (cached && cached.expiresAt > current) return cached.value;
+    const value = this.queryEarliestEventCommitCursor();
+    this.earliestCommitCursorCache = {
+      expiresAt: current + 10_000,
+      value,
+    };
+    void value.catch(() => {
+      if (this.earliestCommitCursorCache?.value === value) {
+        this.earliestCommitCursorCache = undefined;
+      }
+    });
+    return value;
+  }
+
+  private async queryEarliestEventCommitCursor(): Promise<EventCommitCursor | null> {
+    if (!this.client || !this.ready) return null;
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT committedAt, eventId, decisionRevision
+          FROM ${EVENT_COMMIT_FACT_TABLE}
+          ORDER BY committedAt, eventId, decisionRevision
+          LIMIT 1`,
+        format: 'JSONEachRow',
+      });
+      const row = (await result.json() as Array<Record<string, unknown>>)[0];
+      if (!row) return { committedAtMs: 0, eventId: '', decisionRevision: 0 };
+      return {
+        committedAtMs: Number(row.committedAt) || 0,
+        eventId: String(row.eventId ?? ''),
+        decisionRevision: Math.max(1, Number(row.decisionRevision) || 1),
+      };
+    } catch (error) {
+      console.error('[clickhouse] earliest event commit cursor query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  /**
+   * Read the complete persisted tail without an arbitrary row limit. The interval is intentionally
+   * short (the Dashboard uses 60 seconds), and the latest decision revision is selected before the
+   * result is merged with the in-process hot ring.
+   */
+  async dashboardTailEvents(startMs: number, endMs: number): Promise<JudgedEvent[] | null> {
+    if (!this.client || !this.ready) return null;
+    if (endMs < startMs) return [];
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT *
+          FROM (
+            SELECT *
+            FROM ${TABLE}
+            WHERE at >= {start:UInt64} AND at <= {end:UInt64}
+            ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
+            LIMIT 1 BY eventId
+          )
+          ORDER BY at, eventId`,
+        query_params: {
+          start: Math.max(0, Math.trunc(startMs)),
+          end: Math.max(0, Math.trunc(endMs)),
+        },
+        format: 'JSONEachRow',
+      });
+      return (await result.json() as Array<Record<string, unknown>>).map(fromRow);
+    } catch (error) {
+      console.error('[clickhouse] dashboard tail query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  async dashboardAggregateBucketFacts(
+    startMs: number,
+    endExclusiveMs: number,
+    bucketMs = 10_000,
+  ): Promise<DashboardAggregateBucketFact[] | null> {
+    if (!this.client || !this.ready) return null;
+    const size = Math.max(1_000, Math.min(60_000, Math.trunc(bucketMs)));
+    if (endExclusiveMs <= startMs) return [];
+    const start = Math.max(0, Math.trunc(startMs));
+    const end = Math.max(0, Math.trunc(endExclusiveMs));
+    const canPersist =
+      process.env.ANYSENTRY_PERSISTED_DASHBOARD_BUCKETS !== 'off' &&
+      start % size === 0 &&
+      end % size === 0;
+    if (!canPersist) return this.queryDashboardAggregateBucketFactsRaw(start, end, size);
+
+    try {
+      const stored = await this.readPersistedDashboardBuckets(start, end, size);
+      const byBucket = new Map<number, DashboardAggregateBucketFact[]>();
+      for (const snapshot of stored.values()) {
+        byBucket.set(snapshot.bucketStartMs, snapshot.facts);
+      }
+
+      const missingRanges: Array<{ start: number; end: number }> = [];
+      let missingStart: number | undefined;
+      for (let bucket = start; bucket <= end; bucket += size) {
+        const missing = bucket < end && !byBucket.has(bucket);
+        if (missing && missingStart === undefined) missingStart = bucket;
+        if ((!missing || bucket === end) && missingStart !== undefined) {
+          missingRanges.push({ start: missingStart, end: bucket });
+          missingStart = undefined;
+        }
+      }
+
+      // A very fragmented retained snapshot set should not turn into a query fan-out. Recompute
+      // one bounded span and replace all buckets in it instead.
+      const ranges = missingRanges.length > 8
+        ? [{ start: missingRanges[0].start, end: missingRanges.at(-1)!.end }]
+        : missingRanges;
+      for (const range of ranges) {
+        this.dashboardSnapshotStats.exactRanges += 1;
+        const before = await this.latestEventCommitCursor();
+        const rows = await this.queryDashboardAggregateBucketFactsRaw(
+          range.start,
+          range.end,
+          size,
+        );
+        if (rows === null) return null;
+        const grouped = new Map<number, DashboardAggregateBucketFact[]>();
+        for (const row of rows) {
+          const bucketRows = grouped.get(row.bucketStartMs) ?? [];
+          bucketRows.push(row);
+          grouped.set(row.bucketStartMs, bucketRows);
+        }
+        for (let bucket = range.start; bucket < range.end; bucket += size) {
+          byBucket.set(bucket, grouped.get(bucket) ?? []);
+        }
+
+        const after = await this.latestEventCommitCursor();
+        if (
+          before &&
+          after &&
+          compareEventCommitCursor(before, after) === 0
+        ) {
+          await this.writePersistedDashboardBuckets(
+            range.start,
+            range.end,
+            size,
+            after,
+            grouped,
+          );
+        }
+      }
+
+      const result: DashboardAggregateBucketFact[] = [];
+      for (let bucket = start; bucket < end; bucket += size) {
+        result.push(...(byBucket.get(bucket) ?? []));
+      }
+      return result;
+    } catch (error) {
+      this.dashboardSnapshotStats.fallbackErrors += 1;
+      console.warn(
+        '[clickhouse] persisted dashboard bucket cache unavailable; using exact raw aggregation:',
+        (error as Error).message,
+      );
+      return this.queryDashboardAggregateBucketFactsRaw(start, end, size);
+    }
+  }
+
+  /**
+   * Aggregate absolute, reusable time buckets. The query first folds all decision revisions to the
+   * latest fact for each eventId, then emits additive facts keyed by the security dimensions needed
+   * by the Dashboard. No sampling or event limit is used.
+   */
+  private async queryDashboardAggregateBucketFactsRaw(
+    startMs: number,
+    endExclusiveMs: number,
+    bucketMs: number,
+  ): Promise<DashboardAggregateBucketFact[] | null> {
+    if (!this.client || !this.ready) return null;
+    const size = Math.max(1_000, Math.min(60_000, Math.trunc(bucketMs)));
+    if (endExclusiveMs <= startMs) return [];
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT
+            intDiv(at, {bucketMs:UInt64}) * {bucketMs:UInt64} AS bucketStart,
+            JSONExtractBool(attribution, 'monitored') AS monitored,
+            decisionStatus,
+            verdict,
+            tier,
+            riskType,
+            riskCategory,
+            riskName,
+            multiIf(severity = 'critical', 4, severity = 'high', 3, severity = 'medium', 2, severity = 'low', 1, 0) AS severityRank,
+            if(
+              JSONExtractString(attribution, 'agentSessionId') != '',
+              JSONExtractString(attribution, 'agentSessionId'),
+              if(
+                JSONExtractString(attribution, 'agentDisplayName') != '',
+                JSONExtractString(attribution, 'agentDisplayName'),
+                if(JSONExtractString(attribution, 'agentScopeId') != '', JSONExtractString(attribution, 'agentScopeId'), agentId)
+              )
+            ) AS sessionKey,
+            userId,
+            if(
+              JSONExtractString(process, 'cwd') != '',
+              JSONExtractString(process, 'cwd'),
+              if(
+                JSONExtractString(attribution, 'agentScopeId') != '',
+                concat('agent://', JSONExtractString(attribution, 'agentScopeId')),
+                workspacePath
+              )
+            ) AS resolvedWorkspacePath,
+            count() AS eventCount,
+            countIf(verdict = 'block' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS blockedCount,
+            countIf(verdict = 'escalate' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS escalatedCount,
+            countIf(tier IN ('Llm', 'Agent') AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS l2Count,
+            countIf(tier = 'Agent' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS l3Count,
+            countIf(verdict != 'allow' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS riskActivationCount,
+            countIf(verdict != 'allow') AS riskyEventCount,
+            sumIf(tokenCount, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS tokenCount,
+            sumIf(latencyMs, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS latencyTotal,
+            sumIf(riskScore, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS riskScoreTotal,
+            max(at) AS lastEventAt,
+            countIf(verdict != 'allow' AND riskCategory = 'command_danger') AS commandDangerCount,
+            countIf(verdict != 'allow' AND riskCategory = 'prompt_injection') AS promptInjectionCount,
+            countIf(verdict != 'allow' AND riskCategory IN ('data_leak', 'secret_exfil')) AS dataLeakCount,
+            countIf(verdict != 'allow' AND riskCategory = 'communication_risk') AS communicationRiskCount,
+            countIf(verdict != 'allow' AND riskCategory IN ('systemic_risk', 'privilege_escalation')) AS systemicRiskCount
+          FROM (
+            SELECT *
+            FROM ${TABLE}
+            WHERE at >= {start:UInt64} AND at < {end:UInt64}
+            ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
+            LIMIT 1 BY eventId
+          )
+          GROUP BY
+            bucketStart, monitored, decisionStatus, verdict, tier, riskType, riskCategory, riskName,
+            severityRank, sessionKey, userId, resolvedWorkspacePath
+          ORDER BY bucketStart`,
+        query_params: {
+          start: Math.max(0, Math.trunc(startMs)),
+          end: Math.max(0, Math.trunc(endExclusiveMs)),
+          bucketMs: size,
+        },
+        format: 'JSONEachRow',
+      });
+      const num = (value: unknown): number => Number(value) || 0;
+      return (await result.json() as Array<Record<string, unknown>>).map((row) => ({
+        bucketStartMs: num(row.bucketStart),
+        monitored: Boolean(num(row.monitored)),
+        decisionStatus: String(row.decisionStatus ?? ''),
+        verdict: String(row.verdict ?? ''),
+        tier: String(row.tier ?? ''),
+        riskType: String(row.riskType ?? ''),
+        riskCategory: String(row.riskCategory ?? ''),
+        riskName: String(row.riskName ?? ''),
+        severityRank: num(row.severityRank),
+        sessionKey: String(row.sessionKey ?? ''),
+        userId: String(row.userId ?? ''),
+        workspacePath: String(row.resolvedWorkspacePath ?? ''),
+        eventCount: num(row.eventCount),
+        blockedCount: num(row.blockedCount),
+        escalatedCount: num(row.escalatedCount),
+        l2Count: num(row.l2Count),
+        l3Count: num(row.l3Count),
+        riskActivationCount: num(row.riskActivationCount),
+        riskyEventCount: num(row.riskyEventCount),
+        tokenCount: num(row.tokenCount),
+        latencyTotal: num(row.latencyTotal),
+        riskScoreTotal: num(row.riskScoreTotal),
+        lastEventAt: num(row.lastEventAt),
+        commandDangerCount: num(row.commandDangerCount),
+        promptInjectionCount: num(row.promptInjectionCount),
+        dataLeakCount: num(row.dataLeakCount),
+        communicationRiskCount: num(row.communicationRiskCount),
+        systemicRiskCount: num(row.systemicRiskCount),
+      }));
+    } catch (error) {
+      console.error('[clickhouse] reusable dashboard bucket query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  private async readPersistedDashboardBuckets(
+    startMs: number,
+    endExclusiveMs: number,
+    bucketMs: number,
+  ): Promise<Map<number, PersistedDashboardBucket>> {
+    if (!this.client || !this.ready) return new Map();
+    const [snapshotResult, commitResult, earliest] = await Promise.all([
+      this.client.query({
+        query: `
+          SELECT
+            bucketStart,
+            bucketMs,
+            argMax(
+              snapshotCommittedAt,
+              tuple(snapshotCommittedAt, snapshotEventId, snapshotDecisionRevision, snapshotVersion)
+            ) AS latestSnapshotCommittedAt,
+            argMax(
+              snapshotEventId,
+              tuple(snapshotCommittedAt, snapshotEventId, snapshotDecisionRevision, snapshotVersion)
+            ) AS latestSnapshotEventId,
+            argMax(
+              snapshotDecisionRevision,
+              tuple(snapshotCommittedAt, snapshotEventId, snapshotDecisionRevision, snapshotVersion)
+            ) AS latestSnapshotDecisionRevision,
+            argMax(
+              factsJson,
+              tuple(snapshotCommittedAt, snapshotEventId, snapshotDecisionRevision, snapshotVersion)
+            ) AS latestFactsJson
+          FROM ${DASHBOARD_BUCKET_SNAPSHOT_TABLE}
+          WHERE bucketMs = {bucketMs:UInt32}
+            AND bucketStart >= {start:UInt64}
+            AND bucketStart < {end:UInt64}
+          GROUP BY bucketStart, bucketMs
+          ORDER BY bucketStart`,
+        query_params: {
+          start: startMs,
+          end: endExclusiveMs,
+          bucketMs,
+        },
+        format: 'JSONEachRow',
+      }),
+      this.client.query({
+        query: `
+          SELECT
+            intDiv(eventAt, {bucketMs:UInt64}) * {bucketMs:UInt64} AS bucketStart,
+            argMax(committedAt, tuple(committedAt, eventId, decisionRevision)) AS latestCommittedAt,
+            argMax(eventId, tuple(committedAt, eventId, decisionRevision)) AS latestEventId,
+            argMax(decisionRevision, tuple(committedAt, eventId, decisionRevision)) AS latestDecisionRevision
+          FROM ${EVENT_COMMIT_FACT_TABLE}
+          WHERE eventAt >= {start:UInt64} AND eventAt < {end:UInt64}
+          GROUP BY bucketStart`,
+        query_params: {
+          start: startMs,
+          end: endExclusiveMs,
+          bucketMs,
+        },
+        format: 'JSONEachRow',
+      }),
+      this.earliestEventCommitCursor(),
+    ]);
+    if (earliest === null) return new Map();
+    const snapshots = (await snapshotResult.json() as Array<Record<string, unknown>>)
+      .flatMap<PersistedDashboardBucket>((row) => {
+        try {
+          const facts = JSON.parse(String(row.latestFactsJson ?? '[]')) as unknown;
+          if (!Array.isArray(facts)) return [];
+          return [{
+            bucketStartMs: Number(row.bucketStart) || 0,
+            bucketMs: Number(row.bucketMs) || bucketMs,
+            cursor: {
+              committedAtMs: Number(row.latestSnapshotCommittedAt) || 0,
+              eventId: String(row.latestSnapshotEventId ?? ''),
+              decisionRevision: Number(row.latestSnapshotDecisionRevision) || 0,
+            },
+            facts: facts as DashboardAggregateBucketFact[],
+          }];
+        } catch {
+          return [];
+        }
+      });
+    const latestCommits = (await commitResult.json() as Array<Record<string, unknown>>)
+      .map<BucketCommitCursor>((row) => ({
+        bucketStartMs: Number(row.bucketStart) || 0,
+        cursor: {
+          committedAtMs: Number(row.latestCommittedAt) || 0,
+          eventId: String(row.latestEventId ?? ''),
+          decisionRevision: Number(row.latestDecisionRevision) || 0,
+        },
+      }));
+    const valid = validPersistedDashboardBuckets(snapshots, latestCommits, earliest);
+    const expectedBuckets = Math.max(
+      0,
+      Math.ceil((endExclusiveMs - startMs) / bucketMs),
+    );
+    this.dashboardSnapshotStats.hits += valid.size;
+    this.dashboardSnapshotStats.misses += Math.max(0, expectedBuckets - valid.size);
+    this.dashboardSnapshotStats.invalidated += Math.max(0, snapshots.length - valid.size);
+    return valid;
+  }
+
+  private async writePersistedDashboardBuckets(
+    startMs: number,
+    endExclusiveMs: number,
+    bucketMs: number,
+    cursor: EventCommitCursor,
+    factsByBucket: Map<number, DashboardAggregateBucketFact[]>,
+  ): Promise<void> {
+    if (!this.client || !this.ready || endExclusiveMs <= startMs) return;
+    const computedAt = Date.now();
+    const baseVersion =
+      computedAt * 1_000 + (this.dashboardSnapshotSequence++ % 1_000);
+    const values: Array<{
+      bucketStart: number;
+      bucketMs: number;
+      snapshotCommittedAt: number;
+      snapshotEventId: string;
+      snapshotDecisionRevision: number;
+      snapshotVersion: number;
+      factsJson: string;
+      computedAt: number;
+    }> = [];
+    for (let bucket = startMs; bucket < endExclusiveMs; bucket += bucketMs) {
+      values.push({
+        bucketStart: bucket,
+        bucketMs,
+        snapshotCommittedAt: cursor.committedAtMs,
+        snapshotEventId: cursor.eventId,
+        snapshotDecisionRevision: cursor.decisionRevision,
+        snapshotVersion: baseVersion,
+        factsJson: JSON.stringify(factsByBucket.get(bucket) ?? []),
+        computedAt,
+      });
+    }
+    try {
+      await this.client.insert({
+        table: DASHBOARD_BUCKET_SNAPSHOT_TABLE,
+        values,
+        format: 'JSONEachRow',
+      });
+      this.dashboardSnapshotStats.writtenBuckets += values.length;
+    } catch (error) {
+      this.dashboardSnapshotStats.fallbackErrors += 1;
+      // Snapshot persistence is an optimisation only. Exact raw facts have already been computed;
+      // a write failure must not make the Dashboard unavailable.
+      console.warn(
+        '[clickhouse] dashboard bucket snapshot write failed:',
+        (error as Error).message,
+      );
+    }
+  }
+
+  /**
    * Aggregate the complete persisted interval instead of the bounded in-memory hot ring. The latest
    * decision revision is selected per eventId before grouping, so a pending event later judged by
    * L2/L3 is counted once with its final state.
@@ -1010,17 +2059,17 @@ export class ClickHouseStore {
     const latestMonitored = `
       SELECT
         eventId,
-        argMax(sourceEvent.at, sourceEvent.decisionUpdatedAt) AS eventAt,
-        argMax(sourceEvent.agentId, sourceEvent.decisionUpdatedAt) AS agentId,
-        argMax(sourceEvent.sessionId, sourceEvent.decisionUpdatedAt) AS sessionId,
-        argMax(sourceEvent.userId, sourceEvent.decisionUpdatedAt) AS userId,
-        argMax(sourceEvent.workspacePath, sourceEvent.decisionUpdatedAt) AS workspacePath,
-        argMax(sourceEvent.verdict, sourceEvent.decisionUpdatedAt) AS verdict,
-        argMax(sourceEvent.severity, sourceEvent.decisionUpdatedAt) AS severity,
-        argMax(sourceEvent.riskCategory, sourceEvent.decisionUpdatedAt) AS riskCategory,
-        argMax(sourceEvent.riskScore, sourceEvent.decisionUpdatedAt) AS riskScore,
-        argMax(sourceEvent.process, sourceEvent.decisionUpdatedAt) AS process,
-        argMax(sourceEvent.attribution, sourceEvent.decisionUpdatedAt) AS attribution
+        argMax(sourceEvent.at, tuple(sourceEvent.decisionRevision, sourceEvent.decisionUpdatedAt, sourceEvent.at)) AS eventAt,
+        argMax(sourceEvent.agentId, tuple(sourceEvent.decisionRevision, sourceEvent.decisionUpdatedAt, sourceEvent.at)) AS agentId,
+        argMax(sourceEvent.sessionId, tuple(sourceEvent.decisionRevision, sourceEvent.decisionUpdatedAt, sourceEvent.at)) AS sessionId,
+        argMax(sourceEvent.userId, tuple(sourceEvent.decisionRevision, sourceEvent.decisionUpdatedAt, sourceEvent.at)) AS userId,
+        argMax(sourceEvent.workspacePath, tuple(sourceEvent.decisionRevision, sourceEvent.decisionUpdatedAt, sourceEvent.at)) AS workspacePath,
+        argMax(sourceEvent.verdict, tuple(sourceEvent.decisionRevision, sourceEvent.decisionUpdatedAt, sourceEvent.at)) AS verdict,
+        argMax(sourceEvent.severity, tuple(sourceEvent.decisionRevision, sourceEvent.decisionUpdatedAt, sourceEvent.at)) AS severity,
+        argMax(sourceEvent.riskCategory, tuple(sourceEvent.decisionRevision, sourceEvent.decisionUpdatedAt, sourceEvent.at)) AS riskCategory,
+        argMax(sourceEvent.riskScore, tuple(sourceEvent.decisionRevision, sourceEvent.decisionUpdatedAt, sourceEvent.at)) AS riskScore,
+        argMax(sourceEvent.process, tuple(sourceEvent.decisionRevision, sourceEvent.decisionUpdatedAt, sourceEvent.at)) AS process,
+        argMax(sourceEvent.attribution, tuple(sourceEvent.decisionRevision, sourceEvent.decisionUpdatedAt, sourceEvent.at)) AS attribution
       FROM ${TABLE} AS sourceEvent
       PREWHERE sourceEvent.at >= {start:UInt64} AND sourceEvent.at <= {end:UInt64}
       WHERE JSONExtractBool(sourceEvent.attribution, 'monitored')
@@ -1053,19 +2102,25 @@ export class ClickHouseStore {
               tier,
               riskType,
               riskCategory,
-              argMax(riskName, decisionUpdatedAt) AS riskName,
-              uniqCombined64(eventId) AS eventCount,
+              riskName,
+              uniqExact(eventId) AS eventCount,
               sum(tokenCount) AS tokenCount,
               sum(latencyMs) AS latencyTotal,
               sum(riskScore) AS riskScoreTotal
-            FROM ${TABLE}
-            PREWHERE at >= {queryStart:UInt64} AND at <= {end:UInt64}
+            FROM (
+              SELECT *
+              FROM ${TABLE}
+              WHERE at >= {queryStart:UInt64} AND at <= {end:UInt64}
+              ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
+              LIMIT 1 BY eventId
+            )
             WHERE decisionStatus IN ('succeeded', 'failed', 'timeout')
-            GROUP BY period, monitored, verdict, tier, riskType, riskCategory`,
-        { queryStart: queryStartMs, start: startMs, end: endMs },
-      );
-      const bucketRowsRaw = await queryRows(
-        `
+            GROUP BY period, monitored, verdict, tier, riskType, riskCategory, riskName`,
+          query_params: { queryStart: queryStartMs, start: startMs, end: endMs },
+          format: 'JSONEachRow',
+        }),
+        this.client.query({
+          query: `
             SELECT
               least({bucketCount:UInt32} - 1, intDiv(at - {start:UInt64}, {bucketMs:UInt64})) AS bucketIndex,
               JSONExtractBool(attribution, 'monitored') AS monitored,
@@ -1078,8 +2133,13 @@ export class ClickHouseStore {
               sumIf(tokenCount, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS tokenCount,
               sumIf(latencyMs, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS latencyTotal,
               sumIf(riskScore, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS riskScoreTotal
-            FROM ${TABLE}
-            PREWHERE at >= {start:UInt64} AND at <= {end:UInt64}
+            FROM (
+              SELECT *
+              FROM ${TABLE}
+              WHERE at >= {start:UInt64} AND at <= {end:UInt64}
+              ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
+              LIMIT 1 BY eventId
+            )
             GROUP BY bucketIndex, monitored
             ORDER BY bucketIndex`,
         { queryStart: queryStartMs, start: startMs, end: endMs, bucketCount: buckets, bucketMs },
@@ -1225,17 +2285,29 @@ export class ClickHouseStore {
   /** Query durable event history. Identity visibility is deliberately applied by the service
    * after current human-review metadata is resolved; a mutable review decision must never be
    * baked into this immutable evidence query. */
-  async searchEvents(input: StoredEventQuery): Promise<JudgedEvent[] | null> {
-    if (!this.client) return null;
-    const sampleConditions: string[] = [];
-    const latestConditions: string[] = [];
-    const activeMutableColumns: string[] = [];
+  async searchEvents(input: StoredEventQuery): Promise<JudgedEvent[]> {
+    return (await this.searchEventsPage(input)).events;
+  }
+
+  /** Query the durable history as latest-per-event facts. Request one extra row so callers can
+   * expose pagination completeness without loading the full raw event history into memory. */
+  async searchEventsPage(input: StoredEventQuery): Promise<StoredEventSearchResult> {
+    if (!this.client) {
+      return {
+        events: [],
+        hasMore: false,
+        committedCutoffMs: this.committedCutoffMs(),
+        unavailable: true,
+      };
+    }
+    const conditions = ['at >= {since:UInt64}', 'at <= {until:UInt64}'];
     const queryParams: Record<string, string | number> = { since: input.sinceMs, until: input.untilMs };
     const stableFields: Array<[keyof StoredEventQuery, string]> = [
       ['eventId', 'eventId'],
       ['sourceId', 'sourceId'],
       ['collectorId', 'collectorId'],
       ['agentId', 'agentId'],
+      ['agentInstanceId', 'agentInstanceKey'],
       ['sessionId', 'sessionId'],
       ['workspacePath', 'workspacePath'],
       ['traceId', 'traceId'],
@@ -1253,89 +2325,930 @@ export class ClickHouseStore {
       sampleConditions.push(`${column} = {${String(key)}:String}`);
       queryParams[String(key)] = value.trim();
     }
-    for (const [key, column] of mutableFields) {
-      const value = input[key];
-      if (typeof value !== 'string' || !value.trim()) continue;
-      latestConditions.push(`${column} = {${String(key)}:String}`);
-      activeMutableColumns.push(column);
-      queryParams[String(key)] = value.trim();
-    }
-    const rowLimit = Math.max(1, Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, Math.round(input.limit)));
-    queryParams.limit = rowLimit;
-    queryParams.scanLimit = Math.min(300_000, Math.max(rowLimit * 3, latestConditions.length ? 15_000 : 0));
-    const queryKey = JSON.stringify(queryParams);
-    const current = this.eventSearchInFlight;
-    if (current) {
-      if (current.key !== queryKey) return null;
-      const shared = await current.value;
-      return shared ? [...shared] : null;
-    }
-    const release = this.tryAcquireWideEventReadSlot();
-    if (!release) return null;
-    const client = this.client;
-    const value = (async (): Promise<JudgedEvent[] | null> => {
-      try {
-        const rs = await client.query({
-          // Sort only narrow candidate columns, then use ClickHouse's physical row locators to
-          // fetch the selected full revisions. This preserves primary-key pruning and lifecycle
-          // semantics without making rawPreview/attributes/process part of the Top-N workspace.
-          // Verdict and tier can change between revisions, so filter them only after LIMIT 1 BY.
-          query: `
-            SELECT e.*
-            FROM ${TABLE} AS e
-            PREWHERE
-              e.at >= {since:UInt64}
-              AND e.at <= {until:UInt64}
-              AND tuple(e.at, e._part, e._part_offset) IN (
-                SELECT at, selectedPart, selectedPartOffset
-                FROM (
-                  SELECT *
-                  FROM (
-                    SELECT
-                      eventId,
-                      at,
-                      decisionUpdatedAt,
-                      _part AS selectedPart,
-                      _part_offset AS selectedPartOffset
-                      ${activeMutableColumns.length ? `, ${activeMutableColumns.join(', ')}` : ''}
-                    FROM ${TABLE}
-                    PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}
-                    ${sampleConditions.length ? `WHERE ${sampleConditions.join(' AND ')}` : ''}
-                    ORDER BY at DESC
-                    LIMIT {scanLimit:UInt32} WITH TIES
-                  )
-                  ORDER BY at DESC, decisionUpdatedAt DESC
-                  LIMIT 1 BY eventId
-                )
-                ${latestConditions.length ? `WHERE ${latestConditions.join(' AND ')}` : ''}
-                ORDER BY at DESC, decisionUpdatedAt DESC
-                LIMIT {limit:UInt32}
-              )
-            ORDER BY e.at DESC, e.decisionUpdatedAt DESC
-            LIMIT {limit:UInt32}`,
-          query_params: queryParams,
-          clickhouse_settings: BOUNDED_EVENT_SEARCH_READ_SETTINGS,
-          format: 'JSONEachRow',
-        });
-        const rows = (await rs.json()) as Array<Record<string, unknown>>;
-        const latest = new Map<string, JudgedEvent>();
-        for (const row of rows) {
-          const event = fromRow(row);
-          if (!latest.has(event.eventId)) latest.set(event.eventId, event);
-        }
-        return [...latest.values()].sort((a, b) => b.at - a.at);
-      } catch (err) {
-        console.error('[clickhouse] event search failed:', (err as Error).message);
-        return null;
-      }
-    })();
-    this.eventSearchInFlight = { key: queryKey, value };
+    if (input.monitoredOnly) conditions.push('agentMonitored = 1');
+    const rowLimit = Math.max(1, Math.min(20_000, input.limit));
+    queryParams.limit = rowLimit + 1;
     try {
-      const rows = await value;
-      return rows ? [...rows] : null;
-    } finally {
-      if (this.eventSearchInFlight?.value === value) this.eventSearchInFlight = undefined;
-      release();
+      const rs = await this.client.query({
+        query: `SELECT *
+          FROM (
+            SELECT *
+            FROM ${TABLE}
+            WHERE ${conditions.join(' AND ')}
+            ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
+            LIMIT 1 BY eventId
+          )
+          ORDER BY at DESC, eventId DESC
+          LIMIT {limit:UInt32}`,
+        query_params: queryParams,
+        format: 'JSONEachRow',
+      });
+      const rows = (await rs.json()) as Array<Record<string, unknown>>;
+      const hasMore = rows.length > rowLimit;
+      return {
+        events: rows.slice(0, rowLimit).map(fromRow),
+        hasMore,
+        committedCutoffMs: this.committedCutoffMs(),
+      };
+    } catch (err) {
+      console.error('[clickhouse] event search failed:', (err as Error).message);
+      return {
+        events: [],
+        hasMore: false,
+        committedCutoffMs: this.committedCutoffMs(),
+        unavailable: true,
+      };
+    }
+  }
+
+  /**
+   * Return one aggregate fact per logical identity and concrete runtime instance for the complete
+   * persisted interval.
+   * The inner query first collapses judgment revisions by eventId. This keeps the response bounded
+   * by Agent identities rather than raw event volume while preserving exact counters.
+   */
+  async agentWindowFacts(
+    sinceMs: number,
+    untilMs: number,
+    monitoredOnly: boolean,
+    excludedEventIds: string[] = [],
+  ): Promise<StoredAgentWindowFact[] | null> {
+    if (!this.client || !this.ready) return null;
+    const monitoredClause = monitoredOnly
+      ? 'AND agentMonitored = 1'
+      : '';
+    const latestEvents = `
+      SELECT
+        eventId,
+        argMax(at, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventAt,
+        argMax(eventKind, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventKind,
+        argMax(eventCategory, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventCategory,
+        argMax(source, tuple(decisionRevision, decisionUpdatedAt, at)) AS source,
+        argMax(agentId, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentId,
+        argMax(workspacePath, tuple(decisionRevision, decisionUpdatedAt, at)) AS workspacePath,
+        argMax(sessionId, tuple(decisionRevision, decisionUpdatedAt, at)) AS sessionId,
+        argMax(runId, tuple(decisionRevision, decisionUpdatedAt, at)) AS runId,
+        argMax(traceId, tuple(decisionRevision, decisionUpdatedAt, at)) AS traceId,
+        argMax(collectorId, tuple(decisionRevision, decisionUpdatedAt, at)) AS collectorId,
+        argMax(verdict, tuple(decisionRevision, decisionUpdatedAt, at)) AS verdict,
+        argMax(severity, tuple(decisionRevision, decisionUpdatedAt, at)) AS severity,
+        argMax(riskCategory, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskCategory,
+        argMax(riskName, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskName,
+        argMax(tokenCount, tuple(decisionRevision, decisionUpdatedAt, at)) AS tokenCount,
+        argMax(latencyMs, tuple(decisionRevision, decisionUpdatedAt, at)) AS latencyMs,
+        argMax(process, tuple(decisionRevision, decisionUpdatedAt, at)) AS process,
+        argMax(attribution, tuple(decisionRevision, decisionUpdatedAt, at)) AS attribution,
+        argMax(agentIdentityKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS identityKey,
+        argMax(agentInstanceKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS instanceKey,
+        argMax(agentMonitored, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentMonitored,
+        argMax(agentHasPhysicalIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasPhysicalIdentity,
+        argMax(agentHasRootIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasRootIdentity
+      FROM ${TABLE}
+      WHERE at >= {since:UInt64} AND at <= {until:UInt64}
+        AND eventId NOT IN {excludedEventIds:Array(String)}
+      GROUP BY eventId
+      HAVING 1 ${monitoredClause}`;
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT
+            identityKey,
+            min(eventAt) AS firstSeenAt,
+            max(eventAt) AS lastSeenAt,
+            count() AS eventCount,
+            countIf(verdict != 'allow') AS riskyEventCount,
+            uniqExact(sessionId) AS sessionCount,
+            uniqExact(runId) AS runCount,
+            uniqExact(traceId) AS traceCount,
+            groupUniqArray(sessionId) AS sessionKeys,
+            groupUniqArray(runId) AS runKeys,
+            groupUniqArray(traceId) AS traceKeys,
+            groupUniqArrayIf(collectorId, collectorId != '') AS collectorKeys,
+            countIf(collectorId = '') AS eventsWithoutCollector,
+            sum(tokenCount) AS tokenCount,
+            sum(latencyMs) AS latencyTotal,
+            uniqExact(instanceKey) AS instanceCount,
+            groupUniqArray(instanceKey) AS instanceKeys,
+            maxIf(
+              multiIf(severity = 'critical', 4, severity = 'high', 3, severity = 'medium', 2, severity = 'low', 1, 0),
+              verdict != 'allow'
+            ) AS worstSeverityRank,
+            argMaxIf(riskCategory, eventAt, verdict != 'allow') AS topRiskCategory,
+            argMaxIf(riskName, eventAt, verdict != 'allow') AS topRiskName,
+            maxIf(eventAt, verdict != 'allow') AS topRiskAt,
+            countIf(eventCategory = 'tool') AS toolCount,
+            countIf(eventCategory = 'file') AS fileCount,
+            countIf(eventCategory = 'network') AS networkCount,
+            countIf(eventCategory = 'process') AS processCount,
+            countIf(eventCategory = 'llm') AS llmCount,
+            countIf(eventCategory = 'security') AS securityCount,
+            countIf(eventCategory = 'runtime') AS runtimeCount,
+            countIf(eventCategory = 'unknown') AS unknownCount,
+            countIf(source = 'observer') AS observerCount,
+            countIf(source = 'api') AS apiCount,
+            countIf(source = 'synthetic') AS syntheticCount,
+            max(hasPhysicalIdentity) AS hasPhysicalIdentity,
+            max(hasRootIdentity) AS hasRootIdentity,
+            argMax(eventId, eventAt) AS representativeEventId
+          FROM (${latestEvents})
+          GROUP BY identityKey, instanceKey`,
+        query_params: { since: sinceMs, until: untilMs, excludedEventIds },
+        format: 'JSONEachRow',
+      });
+      const rows = await result.json() as Array<Record<string, unknown>>;
+      const representativeIds = rows
+        .map((row) => String(row.representativeEventId ?? ''))
+        .filter(Boolean);
+      const representativeEvents = await this.eventsByIds(representativeIds, sinceMs, untilMs);
+      const byId = new Map(representativeEvents.map((event) => [event.eventId, event]));
+      const num = (value: unknown): number => Number(value) || 0;
+      return rows.flatMap((row): StoredAgentWindowFact[] => {
+        const representativeEvent = byId.get(String(row.representativeEventId ?? ''));
+        if (!representativeEvent) return [];
+        const sessionKeys = Array.isArray(row.sessionKeys) ? row.sessionKeys.map(String).filter(Boolean) : [];
+        const runKeys = Array.isArray(row.runKeys) ? row.runKeys.map(String).filter(Boolean) : [];
+        const traceKeys = Array.isArray(row.traceKeys) ? row.traceKeys.map(String).filter(Boolean) : [];
+        const collectorKeys = Array.isArray(row.collectorKeys) ? row.collectorKeys.map(String).filter(Boolean) : [];
+        const instanceKeys = Array.isArray(row.instanceKeys) ? row.instanceKeys.map(String).filter(Boolean) : [];
+        return [{
+          identityKey: String(row.identityKey ?? ''),
+          representativeEvent,
+          firstSeenAt: num(row.firstSeenAt),
+          lastSeenAt: num(row.lastSeenAt),
+          eventCount: num(row.eventCount),
+          riskyEventCount: num(row.riskyEventCount),
+          sessionCount: sessionKeys.length,
+          runCount: runKeys.length,
+          traceCount: traceKeys.length,
+          sessionKeys,
+          runKeys,
+          traceKeys,
+          collectorKeys,
+          eventsWithoutCollector: num(row.eventsWithoutCollector),
+          tokenCount: num(row.tokenCount),
+          latencyTotal: num(row.latencyTotal),
+          instanceCount: instanceKeys.length,
+          instanceKeys,
+          worstSeverityRank: num(row.worstSeverityRank),
+          topRiskAt: num(row.topRiskAt) || undefined,
+          topRiskCategory: String(row.topRiskCategory ?? '') || undefined,
+          topRiskName: String(row.topRiskName ?? '') || undefined,
+          eventCategoryCounts: {
+            tool: num(row.toolCount),
+            file: num(row.fileCount),
+            network: num(row.networkCount),
+            process: num(row.processCount),
+            llm: num(row.llmCount),
+            security: num(row.securityCount),
+            runtime: num(row.runtimeCount),
+            unknown: num(row.unknownCount),
+          },
+          sourceCounts: {
+            observer: num(row.observerCount),
+            api: num(row.apiCount),
+            synthetic: num(row.syntheticCount),
+          },
+          hasPhysicalIdentity: Boolean(num(row.hasPhysicalIdentity)),
+          hasRootIdentity: Boolean(num(row.hasRootIdentity)),
+        }];
+      });
+    } catch (error) {
+      console.error('[clickhouse] agent window aggregation failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  /**
+   * Exact absolute buckets for the stable historical prefix of Agent inventory queries.
+   * The bucket dimension lets the API retain closed history across refreshes and invalidate only
+   * the event-time bucket touched by a late event or a newer judgment revision.
+   */
+  async agentWindowBucketFacts(
+    sinceMs: number,
+    endExclusiveMs: number,
+    bucketMs: number,
+    monitoredOnly: boolean,
+  ): Promise<StoredAgentBucketFact[] | null> {
+    if (!this.client || !this.ready) return null;
+    const monitoredClause = monitoredOnly ? 'AND agentMonitored = 1' : '';
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT
+            intDiv(eventAt, {bucketMs:UInt64}) * {bucketMs:UInt64} AS bucketStartMs,
+            identityKey,
+            min(eventAt) AS firstSeenAt,
+            max(eventAt) AS lastSeenAt,
+            count() AS eventCount,
+            countIf(verdict != 'allow') AS riskyEventCount,
+            groupUniqArray(sessionId) AS sessionKeys,
+            groupUniqArray(runId) AS runKeys,
+            groupUniqArray(traceId) AS traceKeys,
+            groupUniqArrayIf(collectorId, collectorId != '') AS collectorKeys,
+            countIf(collectorId = '') AS eventsWithoutCollector,
+            sum(tokenCount) AS tokenCount,
+            sum(latencyMs) AS latencyTotal,
+            groupUniqArray(instanceKey) AS instanceKeys,
+            maxIf(
+              multiIf(severity = 'critical', 4, severity = 'high', 3, severity = 'medium', 2, severity = 'low', 1, 0),
+              verdict != 'allow'
+            ) AS worstSeverityRank,
+            argMaxIf(riskCategory, eventAt, verdict != 'allow') AS topRiskCategory,
+            argMaxIf(riskName, eventAt, verdict != 'allow') AS topRiskName,
+            maxIf(eventAt, verdict != 'allow') AS topRiskAt,
+            countIf(eventCategory = 'tool') AS toolCount,
+            countIf(eventCategory = 'file') AS fileCount,
+            countIf(eventCategory = 'network') AS networkCount,
+            countIf(eventCategory = 'process') AS processCount,
+            countIf(eventCategory = 'llm') AS llmCount,
+            countIf(eventCategory = 'security') AS securityCount,
+            countIf(eventCategory = 'runtime') AS runtimeCount,
+            countIf(eventCategory = 'unknown') AS unknownCount,
+            countIf(source = 'observer') AS observerCount,
+            countIf(source = 'api') AS apiCount,
+            countIf(source = 'synthetic') AS syntheticCount,
+            max(hasPhysicalIdentity) AS hasPhysicalIdentity,
+            max(hasRootIdentity) AS hasRootIdentity,
+            argMax(eventId, eventAt) AS representativeEventId
+          FROM (
+            SELECT
+              eventId,
+              argMax(at, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventAt,
+              argMax(eventCategory, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventCategory,
+              argMax(source, tuple(decisionRevision, decisionUpdatedAt, at)) AS source,
+              argMax(sessionId, tuple(decisionRevision, decisionUpdatedAt, at)) AS sessionId,
+              argMax(runId, tuple(decisionRevision, decisionUpdatedAt, at)) AS runId,
+              argMax(traceId, tuple(decisionRevision, decisionUpdatedAt, at)) AS traceId,
+              argMax(collectorId, tuple(decisionRevision, decisionUpdatedAt, at)) AS collectorId,
+              argMax(verdict, tuple(decisionRevision, decisionUpdatedAt, at)) AS verdict,
+              argMax(severity, tuple(decisionRevision, decisionUpdatedAt, at)) AS severity,
+              argMax(riskCategory, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskCategory,
+              argMax(riskName, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskName,
+              argMax(tokenCount, tuple(decisionRevision, decisionUpdatedAt, at)) AS tokenCount,
+              argMax(latencyMs, tuple(decisionRevision, decisionUpdatedAt, at)) AS latencyMs,
+              argMax(agentIdentityKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS identityKey,
+              argMax(agentInstanceKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS instanceKey,
+              argMax(agentMonitored, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentMonitored,
+              argMax(agentHasPhysicalIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasPhysicalIdentity,
+              argMax(agentHasRootIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasRootIdentity
+            FROM ${TABLE}
+            WHERE at >= {since:UInt64} AND at < {endExclusive:UInt64}
+            GROUP BY eventId
+            HAVING 1 ${monitoredClause}
+          )
+          GROUP BY bucketStartMs, identityKey, instanceKey`,
+        query_params: {
+          since: sinceMs,
+          endExclusive: endExclusiveMs,
+          bucketMs: Math.max(1, Math.trunc(bucketMs)),
+        },
+        format: 'JSONEachRow',
+      });
+      const rows = await result.json() as Array<Record<string, unknown>>;
+      const representativeIds = rows
+        .map((row) => String(row.representativeEventId ?? ''))
+        .filter(Boolean);
+      const representativeEvents = await this.eventsByIds(
+        representativeIds,
+        sinceMs,
+        Math.max(sinceMs, endExclusiveMs - 1),
+      );
+      const byId = new Map(representativeEvents.map((event) => [event.eventId, event]));
+      const num = (value: unknown): number => Number(value) || 0;
+      return rows.flatMap((row): StoredAgentBucketFact[] => {
+        const representativeEvent = byId.get(String(row.representativeEventId ?? ''));
+        if (!representativeEvent) return [];
+        const sessionKeys = Array.isArray(row.sessionKeys) ? row.sessionKeys.map(String).filter(Boolean) : [];
+        const runKeys = Array.isArray(row.runKeys) ? row.runKeys.map(String).filter(Boolean) : [];
+        const traceKeys = Array.isArray(row.traceKeys) ? row.traceKeys.map(String).filter(Boolean) : [];
+        const collectorKeys = Array.isArray(row.collectorKeys) ? row.collectorKeys.map(String).filter(Boolean) : [];
+        const instanceKeys = Array.isArray(row.instanceKeys) ? row.instanceKeys.map(String).filter(Boolean) : [];
+        return [{
+          bucketStartMs: num(row.bucketStartMs),
+          identityKey: String(row.identityKey ?? ''),
+          representativeEvent,
+          firstSeenAt: num(row.firstSeenAt),
+          lastSeenAt: num(row.lastSeenAt),
+          eventCount: num(row.eventCount),
+          riskyEventCount: num(row.riskyEventCount),
+          sessionCount: sessionKeys.length,
+          runCount: runKeys.length,
+          traceCount: traceKeys.length,
+          sessionKeys,
+          runKeys,
+          traceKeys,
+          collectorKeys,
+          eventsWithoutCollector: num(row.eventsWithoutCollector),
+          tokenCount: num(row.tokenCount),
+          latencyTotal: num(row.latencyTotal),
+          instanceCount: instanceKeys.length,
+          instanceKeys,
+          worstSeverityRank: num(row.worstSeverityRank),
+          topRiskAt: num(row.topRiskAt) || undefined,
+          topRiskCategory: String(row.topRiskCategory ?? '') || undefined,
+          topRiskName: String(row.topRiskName ?? '') || undefined,
+          eventCategoryCounts: {
+            tool: num(row.toolCount),
+            file: num(row.fileCount),
+            network: num(row.networkCount),
+            process: num(row.processCount),
+            llm: num(row.llmCount),
+            security: num(row.securityCount),
+            runtime: num(row.runtimeCount),
+            unknown: num(row.unknownCount),
+          },
+          sourceCounts: {
+            observer: num(row.observerCount),
+            api: num(row.apiCount),
+            synthetic: num(row.syntheticCount),
+          },
+          hasPhysicalIdentity: Boolean(num(row.hasPhysicalIdentity)),
+          hasRootIdentity: Boolean(num(row.hasRootIdentity)),
+        }];
+      });
+    } catch (error) {
+      console.error('[clickhouse] agent bucket aggregation failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  /**
+   * Return bounded time-bucket metrics per stable workload identity. Persisted event revisions are
+   * collapsed before aggregation and hot event IDs can be excluded, allowing callers to merge the
+   * committed interval with an uncommitted hot delta without double counting.
+   */
+  async agentMetricBucketFacts(
+    sinceMs: number,
+    untilMs: number,
+    bucketCount: number,
+    monitoredOnly: boolean,
+    excludedEventIds: string[] = [],
+  ): Promise<StoredAgentMetricBucketFact[] | null> {
+    if (!this.client || !this.ready) return null;
+    const buckets = Math.max(1, Math.min(72, Math.round(bucketCount)));
+    const bucketMs = Math.max(1, Math.ceil(Math.max(1, untilMs - sinceMs) / buckets));
+    const monitoredClause = monitoredOnly ? 'AND agentMonitored = 1' : '';
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT
+            least({bucketCount:UInt32} - 1, intDiv(eventAt - {since:UInt64}, {bucketMs:UInt64})) AS bucketIndex,
+            identityKey,
+            instanceKey,
+            count() AS eventCount,
+            countIf(verdict != 'allow') AS riskyEventCount,
+            countIf(verdict = 'block') AS blockedCount,
+            countIf(verdict = 'escalate') AS escalatedCount,
+            countIf(eventCategory = 'tool') AS toolCount,
+            countIf(eventCategory = 'file') AS fileCount,
+            countIf(eventCategory = 'network') AS networkCount,
+            countIf(eventCategory IN ('process', 'runtime')) AS processCount,
+            countIf(eventCategory = 'llm') AS llmCount,
+            countIf(tier = 'Rules') AS l1Count,
+            countIf(tier = 'Llm') AS l2Count,
+            countIf(tier = 'Agent') AS l3Count,
+            countIf(decisionStatus = 'failed') AS failedCount,
+            countIf(decisionStatus = 'timeout') AS timeoutCount,
+            sum(tokenCount) AS tokenCount,
+            sum(latencyMs) AS latencyTotal,
+            max(riskScore) AS maxRiskScore,
+            groupUniqArray(sessionId) AS sessionKeys,
+            countIf(eventAt > {recentSince:UInt64}) AS recentEventCount,
+            countIf(eventAt > {recentSince:UInt64} AND eventKind IN ('Egress', 'Dns')) AS recentCommCount,
+            groupUniqArrayIf(sessionId, eventAt > {recentSince:UInt64}) AS recentSessionKeys,
+            argMax(eventId, eventAt) AS representativeEventId
+          FROM (
+            SELECT
+              eventId,
+              argMax(at, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventAt,
+              argMax(eventKind, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventKind,
+              argMax(eventCategory, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventCategory,
+              argMax(sessionId, tuple(decisionRevision, decisionUpdatedAt, at)) AS sessionId,
+              argMax(verdict, tuple(decisionRevision, decisionUpdatedAt, at)) AS verdict,
+              argMax(tier, tuple(decisionRevision, decisionUpdatedAt, at)) AS tier,
+              argMax(decisionStatus, tuple(decisionRevision, decisionUpdatedAt, at)) AS decisionStatus,
+              argMax(tokenCount, tuple(decisionRevision, decisionUpdatedAt, at)) AS tokenCount,
+              argMax(latencyMs, tuple(decisionRevision, decisionUpdatedAt, at)) AS latencyMs,
+              argMax(riskScore, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskScore,
+              argMax(agentIdentityKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS identityKey,
+              argMax(agentInstanceKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS instanceKey,
+              argMax(agentMonitored, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentMonitored
+            FROM ${TABLE}
+            WHERE at >= {since:UInt64} AND at <= {until:UInt64}
+              AND eventId NOT IN {excludedEventIds:Array(String)}
+            GROUP BY eventId
+            HAVING 1 ${monitoredClause}
+          )
+          GROUP BY bucketIndex, identityKey, instanceKey
+          ORDER BY bucketIndex, identityKey, instanceKey`,
+        query_params: {
+          since: sinceMs,
+          until: untilMs,
+          recentSince: Math.max(sinceMs, untilMs - 60_000),
+          bucketCount: buckets,
+          bucketMs,
+          excludedEventIds,
+        },
+        format: 'JSONEachRow',
+      });
+      const rows = await result.json() as Array<Record<string, unknown>>;
+      const representativeIds = rows
+        .map((row) => String(row.representativeEventId ?? ''))
+        .filter(Boolean);
+      const representativeEvents = await this.eventsByIds(representativeIds, sinceMs, untilMs);
+      const byId = new Map(representativeEvents.map((event) => [event.eventId, event]));
+      const num = (value: unknown): number => Number(value) || 0;
+      return rows.flatMap((row): StoredAgentMetricBucketFact[] => {
+        const representativeEvent = byId.get(String(row.representativeEventId ?? ''));
+        if (!representativeEvent) return [];
+        return [{
+          bucketIndex: num(row.bucketIndex),
+          identityKey: String(row.identityKey ?? ''),
+          representativeEvent,
+          eventCount: num(row.eventCount),
+          riskyEventCount: num(row.riskyEventCount),
+          blockedCount: num(row.blockedCount),
+          escalatedCount: num(row.escalatedCount),
+          toolCount: num(row.toolCount),
+          fileCount: num(row.fileCount),
+          networkCount: num(row.networkCount),
+          processCount: num(row.processCount),
+          llmCount: num(row.llmCount),
+          l1Count: num(row.l1Count),
+          l2Count: num(row.l2Count),
+          l3Count: num(row.l3Count),
+          failedCount: num(row.failedCount),
+          timeoutCount: num(row.timeoutCount),
+          tokenCount: num(row.tokenCount),
+          latencyTotal: num(row.latencyTotal),
+          maxRiskScore: num(row.maxRiskScore),
+          sessionKeys: Array.isArray(row.sessionKeys) ? row.sessionKeys.map(String).filter(Boolean) : [],
+          recentEventCount: num(row.recentEventCount),
+          recentCommCount: num(row.recentCommCount),
+          recentSessionKeys: Array.isArray(row.recentSessionKeys)
+            ? row.recentSessionKeys.map(String).filter(Boolean)
+            : [],
+        }];
+      });
+    } catch (error) {
+      console.error('[clickhouse] agent metric bucket query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  async workspaceWindowFacts(
+    sinceMs: number,
+    untilMs: number,
+    monitoredOnly: boolean,
+    excludedEventIds: string[] = [],
+  ): Promise<StoredWorkspaceWindowFact[] | null> {
+    if (!this.client || !this.ready) return null;
+    const monitoredClause = monitoredOnly ? 'AND agentMonitored = 1' : '';
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT
+            workspacePath,
+            min(eventAt) AS firstSeenAt,
+            max(eventAt) AS lastSeenAt,
+            count() AS eventCount,
+            countIf(verdict != 'allow') AS riskyEventCount,
+            groupUniqArray(sessionId) AS sessionKeys,
+            groupUniqArray(runId) AS runKeys,
+            groupUniqArray(traceId) AS traceKeys,
+            groupUniqArrayIf(collectorId, collectorId != '') AS collectorKeys,
+            sum(tokenCount) AS tokenCount,
+            sum(latencyMs) AS latencyTotal,
+            maxIf(
+              multiIf(severity = 'critical', 4, severity = 'high', 3, severity = 'medium', 2, severity = 'low', 1, 0),
+              verdict != 'allow'
+            ) AS worstSeverityRank,
+            argMaxIf(riskCategory, eventAt, verdict != 'allow') AS topRiskCategory,
+            argMaxIf(riskName, eventAt, verdict != 'allow') AS topRiskName,
+            maxIf(eventAt, verdict != 'allow') AS topRiskAt,
+            argMax(eventId, eventAt) AS representativeEventId
+          FROM (
+            SELECT
+              eventId,
+              argMax(at, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventAt,
+              argMax(
+                if(
+                  JSONExtractBool(attribution, 'monitored')
+                    AND JSONExtractString(process, 'cwd') != '',
+                  JSONExtractString(process, 'cwd'),
+                  workspacePath
+                ),
+                tuple(decisionRevision, decisionUpdatedAt, at)
+              ) AS workspacePath,
+              argMax(sessionId, tuple(decisionRevision, decisionUpdatedAt, at)) AS sessionId,
+              argMax(runId, tuple(decisionRevision, decisionUpdatedAt, at)) AS runId,
+              argMax(traceId, tuple(decisionRevision, decisionUpdatedAt, at)) AS traceId,
+              argMax(collectorId, tuple(decisionRevision, decisionUpdatedAt, at)) AS collectorId,
+              argMax(verdict, tuple(decisionRevision, decisionUpdatedAt, at)) AS verdict,
+              argMax(severity, tuple(decisionRevision, decisionUpdatedAt, at)) AS severity,
+              argMax(riskCategory, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskCategory,
+              argMax(riskName, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskName,
+              argMax(tokenCount, tuple(decisionRevision, decisionUpdatedAt, at)) AS tokenCount,
+              argMax(latencyMs, tuple(decisionRevision, decisionUpdatedAt, at)) AS latencyMs,
+              argMax(agentMonitored, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentMonitored
+            FROM ${TABLE}
+            WHERE at >= {since:UInt64} AND at <= {until:UInt64}
+              AND eventId NOT IN {excludedEventIds:Array(String)}
+            GROUP BY eventId
+            HAVING 1 ${monitoredClause}
+          )
+          GROUP BY workspacePath
+          ORDER BY lastSeenAt DESC`,
+        query_params: { since: sinceMs, until: untilMs, excludedEventIds },
+        format: 'JSONEachRow',
+      });
+      const rows = await result.json() as Array<Record<string, unknown>>;
+      const representativeIds = rows.map((row) => String(row.representativeEventId ?? '')).filter(Boolean);
+      const representativeEvents = await this.eventsByIds(representativeIds, sinceMs, untilMs);
+      const byId = new Map(representativeEvents.map((event) => [event.eventId, event]));
+      const strings = (value: unknown): string[] =>
+        Array.isArray(value) ? value.map(String).filter(Boolean) : [];
+      const num = (value: unknown): number => Number(value) || 0;
+      return rows.flatMap((row): StoredWorkspaceWindowFact[] => {
+        const representativeEvent = byId.get(String(row.representativeEventId ?? ''));
+        if (!representativeEvent) return [];
+        return [{
+          workspacePath: String(row.workspacePath ?? ''),
+          representativeEvent,
+          firstSeenAt: num(row.firstSeenAt),
+          lastSeenAt: num(row.lastSeenAt),
+          eventCount: num(row.eventCount),
+          riskyEventCount: num(row.riskyEventCount),
+          sessionKeys: strings(row.sessionKeys),
+          runKeys: strings(row.runKeys),
+          traceKeys: strings(row.traceKeys),
+          collectorKeys: strings(row.collectorKeys),
+          tokenCount: num(row.tokenCount),
+          latencyTotal: num(row.latencyTotal),
+          worstSeverityRank: num(row.worstSeverityRank),
+          topRiskAt: num(row.topRiskAt) || undefined,
+          topRiskCategory: String(row.topRiskCategory ?? '') || undefined,
+          topRiskName: String(row.topRiskName ?? '') || undefined,
+        }];
+      });
+    } catch (error) {
+      console.error('[clickhouse] workspace window aggregation failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  /**
+   * Return exact absolute workspace buckets for a closed persisted interval. These buckets are
+   * reusable across Dashboard refreshes; commit-journal changes invalidate the affected bucket.
+   */
+  async workspaceWindowBucketFacts(
+    sinceMs: number,
+    endExclusiveMs: number,
+    bucketMs: number,
+    monitoredOnly: boolean,
+  ): Promise<StoredWorkspaceBucketFact[] | null> {
+    if (!this.client || !this.ready) return null;
+    const monitoredClause = monitoredOnly ? 'AND agentMonitored = 1' : '';
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT
+            intDiv(eventAt, {bucketMs:UInt64}) * {bucketMs:UInt64} AS bucketStartMs,
+            workspacePath,
+            min(eventAt) AS firstSeenAt,
+            max(eventAt) AS lastSeenAt,
+            count() AS eventCount,
+            countIf(verdict != 'allow') AS riskyEventCount,
+            groupUniqArray(sessionId) AS sessionKeys,
+            groupUniqArray(runId) AS runKeys,
+            groupUniqArray(traceId) AS traceKeys,
+            groupUniqArrayIf(collectorId, collectorId != '') AS collectorKeys,
+            sum(tokenCount) AS tokenCount,
+            sum(latencyMs) AS latencyTotal,
+            maxIf(
+              multiIf(severity = 'critical', 4, severity = 'high', 3, severity = 'medium', 2, severity = 'low', 1, 0),
+              verdict != 'allow'
+            ) AS worstSeverityRank,
+            argMaxIf(riskCategory, eventAt, verdict != 'allow') AS topRiskCategory,
+            argMaxIf(riskName, eventAt, verdict != 'allow') AS topRiskName,
+            maxIf(eventAt, verdict != 'allow') AS topRiskAt,
+            argMax(eventId, eventAt) AS representativeEventId
+          FROM (
+            SELECT
+              eventId,
+              argMax(at, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventAt,
+              argMax(
+                if(
+                  JSONExtractBool(attribution, 'monitored')
+                    AND JSONExtractString(process, 'cwd') != '',
+                  JSONExtractString(process, 'cwd'),
+                  workspacePath
+                ),
+                tuple(decisionRevision, decisionUpdatedAt, at)
+              ) AS workspacePath,
+              argMax(sessionId, tuple(decisionRevision, decisionUpdatedAt, at)) AS sessionId,
+              argMax(runId, tuple(decisionRevision, decisionUpdatedAt, at)) AS runId,
+              argMax(traceId, tuple(decisionRevision, decisionUpdatedAt, at)) AS traceId,
+              argMax(collectorId, tuple(decisionRevision, decisionUpdatedAt, at)) AS collectorId,
+              argMax(verdict, tuple(decisionRevision, decisionUpdatedAt, at)) AS verdict,
+              argMax(severity, tuple(decisionRevision, decisionUpdatedAt, at)) AS severity,
+              argMax(riskCategory, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskCategory,
+              argMax(riskName, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskName,
+              argMax(tokenCount, tuple(decisionRevision, decisionUpdatedAt, at)) AS tokenCount,
+              argMax(latencyMs, tuple(decisionRevision, decisionUpdatedAt, at)) AS latencyMs,
+              argMax(agentMonitored, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentMonitored
+            FROM ${TABLE}
+            WHERE at >= {since:UInt64} AND at < {endExclusive:UInt64}
+            GROUP BY eventId
+            HAVING 1 ${monitoredClause}
+          )
+          GROUP BY bucketStartMs, workspacePath
+          ORDER BY bucketStartMs, workspacePath`,
+        query_params: {
+          since: sinceMs,
+          endExclusive: endExclusiveMs,
+          bucketMs: Math.max(1, Math.round(bucketMs)),
+        },
+        format: 'JSONEachRow',
+      });
+      const rows = await result.json() as Array<Record<string, unknown>>;
+      const representativeIds = rows.map((row) => String(row.representativeEventId ?? '')).filter(Boolean);
+      const representativeEvents = await this.eventsByIds(
+        representativeIds,
+        sinceMs,
+        Math.max(sinceMs, endExclusiveMs - 1),
+      );
+      const byId = new Map(representativeEvents.map((event) => [event.eventId, event]));
+      const strings = (value: unknown): string[] =>
+        Array.isArray(value) ? value.map(String).filter(Boolean) : [];
+      const num = (value: unknown): number => Number(value) || 0;
+      return rows.flatMap((row): StoredWorkspaceBucketFact[] => {
+        const representativeEvent = byId.get(String(row.representativeEventId ?? ''));
+        if (!representativeEvent) return [];
+        return [{
+          bucketStartMs: num(row.bucketStartMs),
+          workspacePath: String(row.workspacePath ?? ''),
+          representativeEvent,
+          firstSeenAt: num(row.firstSeenAt),
+          lastSeenAt: num(row.lastSeenAt),
+          eventCount: num(row.eventCount),
+          riskyEventCount: num(row.riskyEventCount),
+          sessionKeys: strings(row.sessionKeys),
+          runKeys: strings(row.runKeys),
+          traceKeys: strings(row.traceKeys),
+          collectorKeys: strings(row.collectorKeys),
+          tokenCount: num(row.tokenCount),
+          latencyTotal: num(row.latencyTotal),
+          worstSeverityRank: num(row.worstSeverityRank),
+          topRiskAt: num(row.topRiskAt) || undefined,
+          topRiskCategory: String(row.topRiskCategory ?? '') || undefined,
+          topRiskName: String(row.topRiskName ?? '') || undefined,
+        }];
+      });
+    } catch (error) {
+      console.error('[clickhouse] workspace bucket aggregation failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  /**
+   * Return persisted topology facts grouped by stable workload, relationship target and risk
+   * category. Raw events remain the evidence source; this query only bounds the amount of data
+   * transferred to the API by aggregating exact counters inside ClickHouse.
+   */
+  async topologyWindowFacts(
+    sinceMs: number,
+    untilMs: number,
+    excludedEventIds: string[] = [],
+  ): Promise<StoredTopologyWindowFact[] | null> {
+    if (!this.client || !this.ready) return null;
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT
+            identityKey,
+            min(eventAt) AS firstSeenAt,
+            max(eventAt) AS lastSeenAt,
+            count() AS eventCount,
+            countIf(verdict != 'allow') AS riskyEventCount,
+            maxIf(
+              multiIf(severity = 'critical', 4, severity = 'high', 3, severity = 'medium', 2, severity = 'low', 1, 0),
+              verdict != 'allow'
+            ) AS worstSeverityRank,
+            riskCategory,
+            argMax(riskName, eventAt) AS riskName,
+            argMax(eventId, eventAt) AS representativeEventId
+          FROM (
+            SELECT
+              eventId,
+              argMax(at, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventAt,
+              argMax(eventKind, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventKind,
+              argMax(eventCategory, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventCategory,
+              argMax(subject, tuple(decisionRevision, decisionUpdatedAt, at)) AS subject,
+              argMax(actionTarget, tuple(decisionRevision, decisionUpdatedAt, at)) AS actionTarget,
+              argMax(agentId, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentId,
+              argMax(workspacePath, tuple(decisionRevision, decisionUpdatedAt, at)) AS workspacePath,
+              argMax(verdict, tuple(decisionRevision, decisionUpdatedAt, at)) AS verdict,
+              argMax(severity, tuple(decisionRevision, decisionUpdatedAt, at)) AS severity,
+              argMax(riskCategory, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskCategory,
+              argMax(riskName, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskName,
+              argMax(agentIdentityKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS identityKey,
+              argMax(agentInstanceKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS instanceKey
+            FROM ${TABLE}
+            WHERE at >= {since:UInt64} AND at <= {until:UInt64}
+              AND eventId NOT IN {excludedEventIds:Array(String)}
+            GROUP BY eventId
+          )
+          GROUP BY
+            identityKey,
+            instanceKey,
+            workspacePath,
+            eventKind,
+            eventCategory,
+            subject,
+            actionTarget,
+            riskCategory`,
+        query_params: { since: sinceMs, until: untilMs, excludedEventIds },
+        format: 'JSONEachRow',
+      });
+      const rows = await result.json() as Array<Record<string, unknown>>;
+      const representativeIds = rows
+        .map((row) => String(row.representativeEventId ?? ''))
+        .filter(Boolean);
+      const representativeEvents = await this.eventsByIds(representativeIds, sinceMs, untilMs);
+      const byId = new Map(representativeEvents.map((event) => [event.eventId, event]));
+      const num = (value: unknown): number => Number(value) || 0;
+      return rows.flatMap((row): StoredTopologyWindowFact[] => {
+        const representativeEvent = byId.get(String(row.representativeEventId ?? ''));
+        if (!representativeEvent) return [];
+        return [{
+          identityKey: String(row.identityKey ?? ''),
+          representativeEvent,
+          firstSeenAt: num(row.firstSeenAt),
+          lastSeenAt: num(row.lastSeenAt),
+          eventCount: num(row.eventCount),
+          riskyEventCount: num(row.riskyEventCount),
+          worstSeverityRank: num(row.worstSeverityRank),
+          riskCategory: String(row.riskCategory ?? '') || undefined,
+          riskName: String(row.riskName ?? '') || undefined,
+        }];
+      });
+    } catch (error) {
+      console.error('[clickhouse] topology window aggregation failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  /** Absolute relationship buckets used by the cross-refresh topology cache. */
+  async topologyWindowBucketFacts(
+    sinceMs: number,
+    endExclusiveMs: number,
+    bucketMs: number,
+  ): Promise<StoredTopologyBucketFact[] | null> {
+    if (!this.client || !this.ready) return null;
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT
+            intDiv(eventAt, {bucketMs:UInt64}) * {bucketMs:UInt64} AS bucketStartMs,
+            identityKey,
+            min(eventAt) AS firstSeenAt,
+            max(eventAt) AS lastSeenAt,
+            count() AS eventCount,
+            countIf(verdict != 'allow') AS riskyEventCount,
+            maxIf(
+              multiIf(severity = 'critical', 4, severity = 'high', 3, severity = 'medium', 2, severity = 'low', 1, 0),
+              verdict != 'allow'
+            ) AS worstSeverityRank,
+            riskCategory,
+            argMax(riskName, eventAt) AS riskName,
+            argMax(eventId, eventAt) AS representativeEventId
+          FROM (
+            SELECT
+              eventId,
+              argMax(at, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventAt,
+              argMax(eventKind, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventKind,
+              argMax(eventCategory, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventCategory,
+              argMax(subject, tuple(decisionRevision, decisionUpdatedAt, at)) AS subject,
+              argMax(actionTarget, tuple(decisionRevision, decisionUpdatedAt, at)) AS actionTarget,
+              argMax(workspacePath, tuple(decisionRevision, decisionUpdatedAt, at)) AS workspacePath,
+              argMax(verdict, tuple(decisionRevision, decisionUpdatedAt, at)) AS verdict,
+              argMax(severity, tuple(decisionRevision, decisionUpdatedAt, at)) AS severity,
+              argMax(riskCategory, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskCategory,
+              argMax(riskName, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskName,
+              argMax(agentIdentityKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS identityKey,
+              argMax(agentInstanceKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS instanceKey
+            FROM ${TABLE}
+            WHERE at >= {since:UInt64} AND at < {endExclusive:UInt64}
+            GROUP BY eventId
+          )
+          GROUP BY
+            bucketStartMs,
+            identityKey,
+            instanceKey,
+            workspacePath,
+            eventKind,
+            eventCategory,
+            subject,
+            actionTarget,
+            riskCategory`,
+        query_params: {
+          since: sinceMs,
+          endExclusive: endExclusiveMs,
+          bucketMs: Math.max(1, Math.trunc(bucketMs)),
+        },
+        format: 'JSONEachRow',
+      });
+      const rows = await result.json() as Array<Record<string, unknown>>;
+      const representativeIds = rows
+        .map((row) => String(row.representativeEventId ?? ''))
+        .filter(Boolean);
+      const representativeEvents = await this.eventsByIds(
+        representativeIds,
+        sinceMs,
+        Math.max(sinceMs, endExclusiveMs - 1),
+      );
+      const byId = new Map(representativeEvents.map((event) => [event.eventId, event]));
+      const num = (value: unknown): number => Number(value) || 0;
+      return rows.flatMap((row): StoredTopologyBucketFact[] => {
+        const representativeEvent = byId.get(String(row.representativeEventId ?? ''));
+        if (!representativeEvent) return [];
+        return [{
+          bucketStartMs: num(row.bucketStartMs),
+          identityKey: String(row.identityKey ?? ''),
+          representativeEvent,
+          firstSeenAt: num(row.firstSeenAt),
+          lastSeenAt: num(row.lastSeenAt),
+          eventCount: num(row.eventCount),
+          riskyEventCount: num(row.riskyEventCount),
+          worstSeverityRank: num(row.worstSeverityRank),
+          riskCategory: String(row.riskCategory ?? '') || undefined,
+          riskName: String(row.riskName ?? '') || undefined,
+        }];
+      });
+    } catch (error) {
+      console.error('[clickhouse] topology bucket aggregation failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  private async eventsByIds(eventIds: string[], sinceMs?: number, untilMs?: number): Promise<JudgedEvent[]> {
+    if (!this.client || eventIds.length === 0) return [];
+    const timeClause = sinceMs === undefined || untilMs === undefined
+      ? ''
+      : 'AND at >= {since:UInt64} AND at <= {until:UInt64}';
+    const result = await this.client.query({
+      query: `
+        SELECT *
+        FROM (
+          SELECT *
+          FROM ${TABLE}
+          WHERE eventId IN {eventIds:Array(String)}
+            ${timeClause}
+          ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
+          LIMIT 1 BY eventId
+        )`,
+      query_params: { eventIds, since: sinceMs ?? 0, until: untilMs ?? Number.MAX_SAFE_INTEGER },
+      format: 'JSONEachRow',
+    });
+    return (await result.json() as Array<Record<string, unknown>>).map(fromRow);
+  }
+
+  committedCutoffMs(): number | undefined {
+    // This is an observed durable high-water mark, not an event-time watermark. While a batch is
+    // buffered, retrying, or in flight, omit it. Readers retain an overlap and deduplicate stable
+    // eventId/revision facts because late collector events can still fall below this timestamp.
+    if (
+      this.buf.length > 0 ||
+      this.collectorHeartbeatBuf.length > 0 ||
+      this.flushInFlight ||
+      this.immediateWritesInFlight > 0
+    ) return undefined;
+    return this.committedThroughMs;
+  }
+
+  committedProgress(): CommittedSourceProgress[] {
+    return [...this.committedSourceProgress.values()]
+      .map((entry) => ({ ...entry }))
+      .sort((left, right) =>
+        (left.sourceId ?? '').localeCompare(right.sourceId ?? '') ||
+        (left.collectorId ?? '').localeCompare(right.collectorId ?? ''),
+      );
+  }
+
+  private noteCommittedRows(rows: Row[]): void {
+    const committedAtMs = Date.now();
+    for (const row of rows) {
+      const sourceId = row.sourceId || undefined;
+      const collectorId = row.collectorId || undefined;
+      const key = `${sourceId ?? ''}\u0000${collectorId ?? ''}`;
+      const previous = this.committedSourceProgress.get(key);
+      this.committedSourceProgress.set(key, {
+        sourceId,
+        collectorId,
+        committedEventTimeMs: Math.max(previous?.committedEventTimeMs ?? 0, Number(row.at) || 0),
+        committedAtMs,
+      });
     }
   }
 
@@ -1470,30 +3383,67 @@ export class ClickHouseStore {
   async loadAuditLog(): Promise<AuditRecord[]> {
     if (!this.client) return [];
     try {
+      const factResult = await this.client.query({
+        query: `
+          SELECT argMax(payload, ingestedAt) AS payload
+          FROM ${AUDIT_FACT_TABLE}
+          GROUP BY auditId
+          ORDER BY max(at) DESC
+          LIMIT 5000`,
+        format: 'JSONEachRow',
+      });
+      const factRows = (await factResult.json()) as Array<{ payload: string }>;
+      const facts = factRows.flatMap(({ payload }) => {
+        try {
+          return [JSON.parse(payload) as AuditRecord];
+        } catch {
+          return [];
+        }
+      });
+      if (facts.length > 0) {
+        return facts.sort((a, b) => a.at - b.at);
+      }
+
       const rs = await this.client.query({
         query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'audit_log' LIMIT 1`,
         format: 'JSONEachRow',
       });
       const rows = (await rs.json()) as Array<{ value: string }>;
       const parsed = rows.length ? (JSON.parse(rows[0].value) as unknown) : [];
-      return Array.isArray(parsed) ? (parsed as AuditRecord[]) : [];
+      const legacy = Array.isArray(parsed) ? (parsed as AuditRecord[]) : [];
+      if (legacy.length > 0) await this.appendAuditFacts(legacy);
+      return legacy;
     } catch (err) {
       console.error('[clickhouse] loadAuditLog failed:', (err as Error).message);
       return [];
     }
   }
 
-  async saveAuditLog(records: AuditRecord[]): Promise<void> {
-    if (!this.client) return;
+  async appendAuditFacts(records: AuditRecord[]): Promise<boolean> {
+    if (records.length === 0) return true;
+    if (!this.client) return false;
     try {
+      const ingestedAt = Date.now();
       await this.client.insert({
-        table: CONFIG_TABLE,
-        values: [{ key: 'audit_log', value: JSON.stringify(records), updated_at: Date.now() }],
+        table: AUDIT_FACT_TABLE,
+        values: records.map((record) => ({
+          auditId: record.auditId,
+          at: record.at,
+          ingestedAt,
+          payload: JSON.stringify(record),
+        })),
         format: 'JSONEachRow',
       });
+      return true;
     } catch (err) {
-      console.error('[clickhouse] saveAuditLog failed:', (err as Error).message);
+      console.error('[clickhouse] appendAuditFacts failed:', (err as Error).message);
+      return false;
     }
+  }
+
+  /** @deprecated Compatibility writer for callers predating append-only audit facts. */
+  async saveAuditLog(records: AuditRecord[]): Promise<void> {
+    await this.appendAuditFacts(records.slice(-5_000));
   }
 
   async loadAgentMetadata(): Promise<AgentMetadataRecord[]> {
@@ -1541,30 +3491,71 @@ export class ClickHouseStore {
   async loadIdentityAiReviews(): Promise<IdentityAiReviewRecord[]> {
     if (!this.client) return [];
     try {
+      const factResult = await this.client.query({
+        query: `
+          SELECT argMax(payload, tuple(revision, ingestedAt)) AS payload
+          FROM ${IDENTITY_AI_REVIEW_TABLE}
+          GROUP BY reviewId
+          ORDER BY max(updatedAt) DESC
+          LIMIT 1000`,
+        format: 'JSONEachRow',
+      });
+      const factRows = (await factResult.json()) as Array<{ payload: string }>;
+      const facts = factRows.flatMap(({ payload }) => {
+        try {
+          return [JSON.parse(payload) as IdentityAiReviewRecord];
+        } catch {
+          return [];
+        }
+      });
+      if (facts.length > 0) return facts;
+
       const rs = await this.client.query({
         query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'identity_ai_reviews' LIMIT 1`,
         format: 'JSONEachRow',
       });
       const rows = (await rs.json()) as Array<{ value: string }>;
       const parsed = rows.length ? (JSON.parse(rows[0].value) as unknown) : [];
-      return Array.isArray(parsed) ? (parsed as IdentityAiReviewRecord[]) : [];
+      const legacy = Array.isArray(parsed) ? (parsed as IdentityAiReviewRecord[]) : [];
+      if (legacy.length > 0) await this.appendIdentityAiReviewRevisions(legacy);
+      return legacy;
     } catch (err) {
       console.error('[clickhouse] loadIdentityAiReviews failed:', (err as Error).message);
       return [];
     }
   }
 
-  async saveIdentityAiReviews(records: IdentityAiReviewRecord[]): Promise<void> {
-    if (!this.client) return;
+  async appendIdentityAiReviewRevision(record: IdentityAiReviewRecord): Promise<boolean> {
+    return this.appendIdentityAiReviewRevisions([record]);
+  }
+
+  private async appendIdentityAiReviewRevisions(records: IdentityAiReviewRecord[]): Promise<boolean> {
+    if (!this.client || records.length === 0) return false;
     try {
+      const ingestedAt = Date.now();
       await this.client.insert({
-        table: CONFIG_TABLE,
-        values: [{ key: 'identity_ai_reviews', value: JSON.stringify(records.slice(-1_000)), updated_at: Date.now() }],
+        table: IDENTITY_AI_REVIEW_TABLE,
+        values: records.map((record) => ({
+          reviewId: record.reviewId,
+          revision: Math.max(1, Math.floor(Number(record.revision) || (record.status === 'running' ? 1 : 2))),
+          status: record.status,
+          createdAt: Date.parse(record.createdAt) || ingestedAt,
+          updatedAt: Date.parse(record.updatedAt ?? record.completedAt ?? record.createdAt) || ingestedAt,
+          ingestedAt,
+          payload: JSON.stringify(record),
+        })),
         format: 'JSONEachRow',
       });
+      return true;
     } catch (err) {
-      console.error('[clickhouse] saveIdentityAiReviews failed:', (err as Error).message);
+      console.error('[clickhouse] appendIdentityAiReviewRevision failed:', (err as Error).message);
+      return false;
     }
+  }
+
+  /** @deprecated Compatibility writer for callers predating append-only review revisions. */
+  async saveIdentityAiReviews(records: IdentityAiReviewRecord[]): Promise<void> {
+    await this.appendIdentityAiReviewRevisions(records.slice(-1_000));
   }
 
   async loadMaintenanceWindows(): Promise<MaintenanceWindowRecord[]> {
@@ -1605,10 +3596,15 @@ export class ClickHouseStore {
       });
       const rows = (await rs.json()) as Array<{ value: string }>;
       const parsed = rows.length ? (JSON.parse(rows[0].value) as Partial<NotificationState>) : {};
+      const legacyDeliveries = Array.isArray(parsed.deliveries) ? parsed.deliveries : [];
+      const deliveries = await this.loadNotificationDeliveryFacts();
+      if (deliveries.length === 0 && legacyDeliveries.length > 0) {
+        await this.appendNotificationDeliveryFacts(legacyDeliveries);
+      }
       return {
         channels: Array.isArray(parsed.channels) ? parsed.channels : [],
         routes: Array.isArray(parsed.routes) ? parsed.routes : [],
-        deliveries: Array.isArray(parsed.deliveries) ? parsed.deliveries : [],
+        deliveries: deliveries.length > 0 ? deliveries : legacyDeliveries,
       };
     } catch (err) {
       console.error('[clickhouse] loadNotificationState failed:', (err as Error).message);
@@ -1621,11 +3617,66 @@ export class ClickHouseStore {
     try {
       await this.client.insert({
         table: CONFIG_TABLE,
-        values: [{ key: 'notification_state', value: JSON.stringify(state), updated_at: Date.now() }],
+        // Delivery history is immutable and lives in notification_delivery_facts. This row remains
+        // only as the migration copy for mutable channel/route configuration.
+        values: [{
+          key: 'notification_state',
+          value: JSON.stringify({ channels: state.channels, routes: state.routes, deliveries: [] }),
+          updated_at: Date.now(),
+        }],
         format: 'JSONEachRow',
       });
     } catch (err) {
       console.error('[clickhouse] saveNotificationState failed:', (err as Error).message);
+    }
+  }
+
+  async loadNotificationDeliveryFacts(limit = 1_000): Promise<NotificationDeliveryRecord[]> {
+    if (!this.client) return [];
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT argMax(payload, ingestedAt) AS payload
+          FROM ${NOTIFICATION_DELIVERY_TABLE}
+          GROUP BY deliveryId
+          ORDER BY max(sentAt) DESC
+          LIMIT {limit:UInt32}`,
+        query_params: { limit: Math.max(1, Math.min(20_000, Math.floor(limit))) },
+        format: 'JSONEachRow',
+      });
+      const rows = (await result.json()) as Array<{ payload: string }>;
+      return rows.flatMap(({ payload }) => {
+        try {
+          return [JSON.parse(payload) as NotificationDeliveryRecord];
+        } catch {
+          return [];
+        }
+      });
+    } catch (err) {
+      console.error('[clickhouse] loadNotificationDeliveryFacts failed:', (err as Error).message);
+      return [];
+    }
+  }
+
+  async appendNotificationDeliveryFacts(records: NotificationDeliveryRecord[]): Promise<boolean> {
+    if (records.length === 0) return true;
+    if (!this.client) return false;
+    try {
+      const ingestedAt = Date.now();
+      await this.client.insert({
+        table: NOTIFICATION_DELIVERY_TABLE,
+        values: records.map((record) => ({
+          deliveryId: record.deliveryId,
+          sentAt: record.sentAt,
+          ingestedAt,
+          payload: JSON.stringify(record),
+        })),
+        format: 'JSONEachRow',
+      });
+      return true;
+    } catch (err) {
+      console.error('[clickhouse] appendNotificationDeliveryFacts failed:', (err as Error).message);
+      return false;
     }
   }
 
@@ -1696,7 +3747,28 @@ export class ClickHouseStore {
       });
       const rows = (await rs.json()) as Array<{ value: string }>;
       const parsed = rows.length ? (JSON.parse(rows[0].value) as unknown) : [];
-      return Array.isArray(parsed) ? (parsed as CollectorHeartbeatRecord[]) : [];
+      const records = Array.isArray(parsed) ? (parsed as CollectorHeartbeatRecord[]) : [];
+      // One-time compatibility bridge from the former config snapshot. Queries deduplicate by
+      // collectorId+at, so retrying this after an interrupted startup remains safe.
+      if (records.length) {
+        const countResult = await this.client.query({
+          query: `SELECT count() AS count FROM ${COLLECTOR_HEARTBEAT_TABLE}`,
+          format: 'JSONEachRow',
+        });
+        const countRows = await countResult.json() as Array<{ count?: string | number }>;
+        if (Number(countRows[0]?.count ?? 0) === 0) {
+          await this.client.insert({
+            table: COLLECTOR_HEARTBEAT_TABLE,
+            values: records.map((record) => ({
+              collectorId: record.collectorId,
+              at: record.at,
+              payload: JSON.stringify(record),
+            })),
+            format: 'JSONEachRow',
+          });
+        }
+      }
+      return records;
     } catch (err) {
       console.error('[clickhouse] loadCollectorHeartbeats failed:', (err as Error).message);
       return [];
@@ -1717,98 +3789,15 @@ export class ClickHouseStore {
     }
   }
 
-  close(): Promise<void> {
-    if (this.closeInFlight) return this.closeInFlight;
-    // Change the externally visible state before the first await so a concurrent enqueue cannot
-    // slip into the shutdown tail after it was sealed.
-    this.closing = true;
-    this.ready = false;
+  async close(): Promise<void> {
+    this.closed = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
     if (this.flushTimer) clearInterval(this.flushTimer);
     this.flushTimer = undefined;
-    if (this.eventWriteRetryWakeTimer) clearTimeout(this.eventWriteRetryWakeTimer);
-    this.eventWriteRetryWakeTimer = undefined;
-    this.eventWriteClosingDeadline = this.eventWriteNow() + this.eventWriteCloseDeadlineMs;
-    this.wakeEventWriteRetrySleep();
-    this.sealBufferedEventBatches(true);
-    const value = this.finishClose();
-    this.closeInFlight = value;
-    return value;
-  }
-
-  private async finishClose(): Promise<void> {
-    const client = this.client;
-    let closeError: Error | undefined;
-    try {
-      while (
-        this.eventWriteBatches.length > 0 &&
-        !this.eventWritePermanentError &&
-        this.eventWriteNow() < (this.eventWriteClosingDeadline ?? 0)
-      ) {
-        this.eventWriteBatches[0].retryNotBefore = 0;
-        try {
-          await this.waitForEventWriteDrainUntilCloseDeadline();
-        } catch (error) {
-          if (this.eventWritePermanentError) break;
-        }
-      }
-
-      if (this.eventWriteBatches.length > 0 || this.buf.length > 0) {
-        const head = this.eventWriteBatches[0];
-        closeError = Object.assign(
-          new Error(
-            `ClickHouse event writer closed with ${this.eventWriteRows} undrained rows` +
-            (head?.lastError ? `: ${head.lastError.message}` : ''),
-          ),
-          { code: 'ANYSENTRY_CLICKHOUSE_EVENT_SHUTDOWN_UNDRAINED' },
-        );
-        console.error('[clickhouse] event writer shutdown deadline/terminal failure:', {
-          code: (closeError as Error & { code?: string }).code,
-          rows: this.eventWriteRows,
-          bytes: this.eventWriteBytes,
-          oldestBatchAgeMs: head ? Math.max(0, this.eventWriteNow() - head.createdAt) : 0,
-          token: head?.token,
-          cause: head?.lastError?.message ?? this.eventWritePermanentError?.message,
-        });
-      }
-    } finally {
-      this.eventWriteAbortController?.abort('ClickHouse event writer is closing');
-      this.wakeEventWriteRetrySleep();
-      for (const batch of this.eventWriteBatches) {
-        for (const waiter of batch.waiters.splice(0)) {
-          waiter.reject(closeError ?? new Error('ClickHouse event writer closed before the direct write completed'));
-        }
-      }
-      try {
-        await client?.close();
-      } catch (error) {
-        closeError ??= this.asEventWriteError(error);
-      }
-      this.client = undefined;
-      this.eventWriteClosingDeadline = undefined;
-    }
-    if (closeError) throw closeError;
-  }
-
-  private async waitForEventWriteDrainUntilCloseDeadline(): Promise<void> {
-    const deadline = this.eventWriteClosingDeadline ?? this.eventWriteNow();
-    const remainingMs = Math.max(0, deadline - this.eventWriteNow());
-    if (remainingMs === 0) throw new Error('ClickHouse event writer shutdown deadline reached');
-    const drain = this.ensureEventWriteDrain();
-    // A fake/misbehaving client may ignore AbortSignal. The outer wall-clock timer prevents Nest's
-    // shutdown hook from consuming the full Kubernetes grace period before client.close destroys it.
-    let timer!: NodeJS.Timeout;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => {
-        this.eventWriteAbortController?.abort('ClickHouse event writer shutdown deadline reached');
-        reject(new Error('ClickHouse event writer shutdown deadline reached'));
-      }, remainingMs);
-    });
-    try {
-      await Promise.race([drain, timeout]);
-    } finally {
-      clearTimeout(timer);
-      // If the outer deadline won, ensure a later rejection from the tracked drain is observed.
-      void drain.catch(() => undefined);
-    }
+    await this.flush();
+    await this.client?.close();
+    this.client = undefined;
+    this.ready = false;
   }
 }

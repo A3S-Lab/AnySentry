@@ -9,7 +9,15 @@ function querySuffix(params: object) {
   return qs.toString() ? `?${qs.toString()}` : "";
 }
 
-export type SecurityTimeType = "last_3h" | "last_1d" | "last_7d" | "last_30d" | "custom";
+export type SecurityTimeType =
+  | "last_30m"
+  | "last_1h"
+  | "last_2h"
+  | "last_3h"
+  | "last_1d"
+  | "last_7d"
+  | "last_30d"
+  | "custom";
 export type SecurityRiskLevel = "safe" | "low" | "medium" | "high" | "critical" | "unknown" | string;
 export type SecurityPolicyAction = "allow" | "review" | "block" | string;
 
@@ -73,6 +81,7 @@ export interface AgentAttribution {
   physicalWorkloadId?: string;
   workloadRef?: AgentWorkloadRef;
   rootPid?: number;
+  rootStartTime?: string;
   confidence: number;
   reason: AgentAttributionReason;
   source: AgentAttributionSource;
@@ -85,7 +94,37 @@ export interface SecurityTimeFilter {
   timeType?: SecurityTimeType;
   startTime?: string;
   endTime?: string;
+  snapshotAsOf?: string;
   scope?: "agent" | "raw";
+}
+export type QueryTotalMode = "exact" | "estimated" | "omitted";
+export type QueryDataSource = "clickhouse" | "clickhouse+hot_delta" | "clickhouse+redis_current" | "memory_hot_ring";
+export interface QueryCommitProgress {
+  sourceId?: string;
+  collectorId?: string;
+  committedEventTime: string;
+  committedAt: string;
+}
+export interface QueryCoverage {
+  requestedFrom: string;
+  requestedTo: string;
+  snapshotAsOf: string;
+  asOf: string;
+  dataFrom?: string;
+  dataTo?: string;
+  observedDurableThrough?: string;
+  /** @deprecated Compatibility alias for observedDurableThrough. */
+  committedCutoff?: string;
+  commitBoundaryKind?: "observed_durable_high_water";
+  commitProgress?: QueryCommitProgress[];
+  commitProgressScope?: "all_sources" | "query_sources";
+  lateDataPolicy?: "commit_journal_revision_repair";
+  completeness?: "exact_as_observed" | "partial";
+  watermark?: string;
+  partial: boolean;
+  partialReason?: "hot_ring_only" | "scan_limit" | "storage_unavailable";
+  source: QueryDataSource;
+  totalMode: QueryTotalMode;
 }
 
 export type SecurityAssistantLocale = "en" | "zh-CN";
@@ -314,11 +353,13 @@ export type AgentEventCategory = "tool" | "network" | "file" | "llm" | "security
 export type AgentEventAttributeValue = string | number | boolean;
 export type IncidentStatus = "open" | "acknowledged" | "resolved";
 export type AgentHealthState = "active" | "idle" | "stale" | "risky";
+export type AgentLifecycleState = "current" | "historical" | "terminated";
 export type AgentCriticality = "low" | "medium" | "high" | "critical";
 export type CollectorHealthState = "healthy" | "quiet" | "degraded" | "stale" | "down";
 export type CollectorReportedStatus = "ok" | "degraded" | "error";
 export type AlertStatus = "open" | "acknowledged" | "resolved" | "silenced";
-export type AlertKind = "incident" | "collector" | "agent" | "event" | "source" | "coverage" | "objective" | "remediation";
+export type AlertKind = "incident" | "collector" | "agent" | "event" | "judgment" | "source" | "coverage" | "objective" | "remediation";
+export type AlertTimeMode = "window" | "backlog" | "combined";
 export type TopologyNodeType = "agent" | "workspace" | "collector" | "tool" | "network" | "file" | "llm" | "security";
 export type TopologyEdgeType = "runs_in" | "observed_by" | "executes" | "connects" | "resolves" | "accesses" | "calls_llm" | "triggers";
 export type MaintenanceTargetType = "all" | "workspace" | "agent" | "collector" | "source";
@@ -370,6 +411,8 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   scope?: "agent" | "raw";
   /** Raw-view visibility only. Defaults to true; Agent scope always excludes Unknown. */
   includeUnknown?: boolean;
+  /** Bounded hot-ring preview for dashboard first paint; full history remains separately available. */
+  preview?: boolean;
   /** Query the durable ClickHouse history instead of only the hot dashboard window. */
   durable?: boolean;
   noise?: "hide" | "include";
@@ -378,6 +421,7 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   collectorId?: string;
   agentId?: string;
   agentAssetId?: string;
+  agentInstanceId?: string;
   sessionId?: string;
   workspacePath?: string;
   traceId?: string;
@@ -388,6 +432,7 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   tier?: "Rules" | "Llm" | "Agent";
   q?: string;
   limit?: number;
+  totalMode?: QueryTotalMode;
 }
 
 export interface AgentEventListItem {
@@ -443,8 +488,8 @@ export interface AgentEventListItem {
 export interface AgentEventList {
   items: AgentEventListItem[];
   total: number;
-  totalApproximate?: boolean;
-  storageFallback?: "hot_ring";
+  totalMode: QueryTotalMode;
+  coverage: QueryCoverage;
   updateTime: string;
 }
 
@@ -745,6 +790,9 @@ export interface AgentTimeline {
   runId?: string;
   sessionId?: string;
   items: AgentEventListItem[];
+  total: number;
+  hasMore: boolean;
+  coverage: QueryCoverage;
   updateTime: string;
 }
 
@@ -1350,6 +1398,7 @@ export interface AgentInventoryQuery extends SecurityTimeFilter {
   q?: string;
   agentId?: string;
   agentAssetId?: string;
+  agentInstanceId?: string;
   workspacePath?: string;
   userId?: string;
   includeUnclassified?: boolean;
@@ -1381,6 +1430,11 @@ export interface AgentInventoryItem {
   attributionEvidence: string[];
   physicalWorkloadId?: string;
   agentInstanceId?: string;
+  logicalInstanceCount?: number;
+  hostId?: string;
+  bootId?: string;
+  rootPid?: number;
+  rootStartTime?: string;
   workloadRef?: AgentWorkloadRef;
   reviewDecision?: AgentReviewDecision;
   reviewedBy?: string;
@@ -1389,6 +1443,8 @@ export interface AgentInventoryItem {
   reviewIdentityKeys: string[];
   firstSeen: string;
   lastSeen: string;
+  lifecycleState: AgentLifecycleState;
+  terminatedAt?: string;
   healthState: AgentHealthState;
   riskLevel: SecurityRiskLevel;
   riskLevelText: string;
@@ -1485,6 +1541,48 @@ export interface AgentInventory {
   items: AgentInventoryItem[];
   total: number;
   summary: AgentInventorySummary;
+  coverage: QueryCoverage;
+  updateTime: string;
+}
+
+export interface AgentInstanceMetricsQuery extends SecurityTimeFilter {
+  agentAssetId: string;
+  agentInstanceId?: string;
+  seriesPoints?: number;
+}
+
+export interface AgentInstanceMetricPoint {
+  statTime: string;
+  eventCount: number;
+  riskyEventCount: number;
+  blockedCount: number;
+  escalatedCount: number;
+  toolCount: number;
+  fileCount: number;
+  networkCount: number;
+  processCount: number;
+  llmCount: number;
+  l1Count: number;
+  l2Count: number;
+  l3Count: number;
+  failedCount: number;
+  timeoutCount: number;
+  tokenCount: number;
+  avgLatencyMs: number;
+  maxRiskScore: number;
+}
+
+export interface AgentInstanceMetrics {
+  agentAssetId: string;
+  points: AgentInstanceMetricPoint[];
+  eventCount: number;
+  riskyEventCount: number;
+  blockedCount: number;
+  escalatedCount: number;
+  tokenCount: number;
+  avgLatencyMs: number;
+  failedCount: number;
+  timeoutCount: number;
   updateTime: string;
 }
 
@@ -1558,7 +1656,11 @@ export interface IdentityAiReviewRecord {
   evidenceRefs: string[];
   evidenceDigest: string;
   model?: string;
-  provider: "a3s-code-sdk";
+  provider: "direct-llm" | "a3s-code-sdk";
+  automatic?: boolean;
+  logicalIdentityKey?: string;
+  appliedDecision?: AgentReviewDecision;
+  appliedAt?: string;
   error?: string;
   createdAt: string;
   completedAt?: string;
@@ -1579,6 +1681,7 @@ export interface WorkspaceInventoryQuery extends SecurityTimeFilter {
 }
 
 export interface WorkspaceInventoryItem {
+  workspaceId?: string;
   workspacePath: string;
   owner?: string;
   team?: string;
@@ -1636,8 +1739,11 @@ export interface WorkspaceInventory {
 }
 
 export interface AgentTopologyQuery extends SecurityTimeFilter {
+  scope?: "agent" | "raw";
   edgeId?: string;
   eventId?: string;
+  agentAssetId?: string;
+  agentInstanceId?: string;
   agentId?: string;
   workspacePath?: string;
   collectorId?: string;
@@ -1652,7 +1758,10 @@ export interface AgentTopologyNode {
   type: TopologyNodeType;
   label: string;
   subtitle?: string;
+  agentAssetId?: string;
+  agentInstanceId?: string;
   agentId?: string;
+  classification?: AgentClassification;
   workspacePath?: string;
   collectorId?: string;
   riskLevel: SecurityRiskLevel;
@@ -1701,6 +1810,7 @@ export interface AgentTopology {
   nodes: AgentTopologyNode[];
   edges: AgentTopologyEdge[];
   summary: AgentTopologySummary;
+  coverage: QueryCoverage;
   updateTime: string;
 }
 
@@ -1916,6 +2026,7 @@ export interface CollectorHealth {
   items: CollectorHealthItem[];
   total: number;
   summary: CollectorHealthSummary;
+  coverage: QueryCoverage;
   updateTime: string;
 }
 
@@ -2080,6 +2191,8 @@ export interface AlertListItem {
   riskName?: string;
   sourceSummary: string;
   occurrenceCount: number;
+  evidenceEventCount?: number;
+  evidenceEventIds?: string[];
   lastNotificationAt?: string;
   labels: Record<string, string>;
   monitored?: boolean;
@@ -2088,7 +2201,7 @@ export interface AlertListItem {
 
 export interface AlertListQuery extends SecurityTimeFilter {
   alertId?: string;
-  status?: AlertStatus | "all";
+  status?: AlertStatus | "active" | "all";
   severity?: SecuritySeverity | "all";
   kind?: AlertKind | "all";
   q?: string;
@@ -2101,6 +2214,7 @@ export interface AlertListQuery extends SecurityTimeFilter {
   taskId?: string;
   objectiveId?: string;
   issueId?: string;
+  timeMode?: AlertTimeMode;
   limit?: number;
 }
 
@@ -2113,10 +2227,13 @@ export interface AlertListSummary {
   resolvedAlerts: number;
   criticalAlerts: number;
   highAlerts: number;
+  urgentActiveAlerts: number;
+  unassignedActiveAlerts: number;
   incidentAlerts: number;
   collectorAlerts: number;
   agentAlerts: number;
   eventAlerts: number;
+  judgmentAlerts: number;
   sourceAlerts: number;
   coverageAlerts: number;
   objectiveAlerts: number;
@@ -2514,6 +2631,13 @@ export interface PolicySimulationResult {
   diffs: PolicySimulationDiff[];
   byAgent: PolicySimulationGroup[];
   byWorkspace: PolicySimulationGroup[];
+  sampling: {
+    strategy: "latest_event_sample";
+    sampleLimit: number;
+    sampledEvents: number;
+    truncated: boolean;
+  };
+  coverage: QueryCoverage;
   updateTime: string;
 }
 
@@ -2741,6 +2865,11 @@ export interface ModelConnectionStatus {
   profile: ModelConnectionProfile;
   state: "active" | "missing_credential";
   keyConfigured: boolean;
+  callable: boolean;
+  connectivityStatus?: PolicyConnectivityStatus;
+  checkedAt?: string;
+  latencyMs?: number;
+  message?: string;
   source?: "runtime" | "environment";
   endpoint?: string;
   model?: string;
@@ -2787,6 +2916,36 @@ export interface PlatformHealth {
     total: number;
     distinctAgents: number;
     distinctSessions: number;
+  };
+  historyFactCache?: {
+    schemaVersion: "anysentry.history-cache.v1";
+    caches: Array<{
+      name: string;
+      buckets: number;
+      facts: number;
+      estimatedBytes: number;
+      evictions: number;
+      budgetRejects: number;
+      journalResets: number;
+    }>;
+    totals: {
+      buckets: number;
+      facts: number;
+      estimatedBytes: number;
+      evictions: number;
+      budgetRejects: number;
+      journalResets: number;
+    };
+  };
+  dashboardBucketSnapshots?: {
+    schemaVersion: "anysentry.dashboard-bucket-snapshots.v1";
+    enabled: boolean;
+    hits: number;
+    misses: number;
+    invalidated: number;
+    exactRanges: number;
+    writtenBuckets: number;
+    fallbackErrors: number;
   };
   policy: PolicyStatus;
 }
@@ -2957,8 +3116,8 @@ export const securityCenterApi = {
     apiClient.put<RemediationListItem>(`/security-center/remediations/${encodeURIComponent(taskId)}`, body),
   agentInventory: (filter: AgentInventoryQuery) =>
     apiClient.post<AgentInventory>("/security-center/agents/inventory", filter),
-  agentRuntimeInstances: (query: AgentRuntimeStateQuery = {}) =>
-    apiClient.post<AgentRuntimeStateList>("/security-center/runtime/instances", query),
+  agentInstanceMetrics: (filter: AgentInstanceMetricsQuery) =>
+    apiClient.post<AgentInstanceMetrics>("/security-center/agents/instance-metrics", filter),
   workspaceInventory: (filter: WorkspaceInventoryQuery) =>
     apiClient.post<WorkspaceInventory>("/security-center/workspaces/inventory", filter),
   agentTopology: (filter: AgentTopologyQuery) =>

@@ -16,9 +16,8 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-anysentry}
     volumes:
       - clickhouse-data:/var/lib/clickhouse
-      - ./deploy/clickhouse-memory.xml:/etc/clickhouse-server/config.d/20-anysentry-memory.xml:ro
-    mem_limit: 4g
-    memswap_limit: 4g
+      - ./config/clickhouse/anysentry-server.xml:/etc/clickhouse-server/config.d/anysentry-server.xml:ro
+      - ./config/clickhouse/anysentry-users.xml:/etc/clickhouse-server/users.d/anysentry-users.xml:ro
     healthcheck:
       test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' >/dev/null 2>&1 || exit 1"]
       interval: 5s
@@ -40,6 +39,22 @@ services:
       retries: 24
     restart: unless-stopped
 
+  postgres:
+    image: postgres:17-alpine
+    labels: *anysentry-infrastructure-labels
+    environment:
+      POSTGRES_DB: ${ANYSENTRY_POSTGRES_DB:-anysentry}
+      POSTGRES_USER: ${ANYSENTRY_POSTGRES_USER:-anysentry}
+      POSTGRES_PASSWORD: ${ANYSENTRY_POSTGRES_PASSWORD:-anysentry}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+    restart: unless-stopped
+
   anysentry:
     build: .
     image: ghcr.io/a3s-lab/anysentry:latest
@@ -48,6 +63,8 @@ services:
       clickhouse:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     environment:
       PORT: 29653
@@ -59,6 +76,7 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-anysentry}
       ANYSENTRY_ASYNC_JUDGE: "on"
       ANYSENTRY_REDIS_URL: redis://redis:6379/0
+      ANYSENTRY_DATABASE_URL: ${ANYSENTRY_DATABASE_URL:-postgresql://${ANYSENTRY_POSTGRES_USER:-anysentry}:${ANYSENTRY_POSTGRES_PASSWORD:-anysentry}@postgres:5432/${ANYSENTRY_POSTGRES_DB:-anysentry}}
       ANYSENTRY_SUPPLY_CHAIN: ${ANYSENTRY_SUPPLY_CHAIN:-off}
       ANYSENTRY_SUPPLY_CHAIN_RUNTIME: ${ANYSENTRY_SUPPLY_CHAIN_RUNTIME:-off}
       ANYSENTRY_WORKSPACE_SCANNER_TOKEN: ${ANYSENTRY_WORKSPACE_SCANNER_TOKEN:-}
@@ -87,9 +105,10 @@ services:
       A3S_SENTRY_L3_URL: ${A3S_SENTRY_L3_URL:-http://host.docker.internal:18051/v1}
       A3S_SENTRY_L3_MODEL: ${A3S_SENTRY_L3_MODEL:-glm-5.2}
       A3S_SENTRY_L3_KEY: ${A3S_SENTRY_L3_KEY:-}
-      ANYSENTRY_IDENTITY_REVIEW_TIMEOUT_MS: ${ANYSENTRY_IDENTITY_REVIEW_TIMEOUT_MS:-120000}
-      ANYSENTRY_IDENTITY_REVIEW_LLM_TIMEOUT_MS: ${ANYSENTRY_IDENTITY_REVIEW_LLM_TIMEOUT_MS:-45000}
-      ANYSENTRY_IDENTITY_REVIEW_PREFLIGHT_TIMEOUT_MS: ${ANYSENTRY_IDENTITY_REVIEW_PREFLIGHT_TIMEOUT_MS:-15000}
+      ANYSENTRY_L2_CONTEXT_TOKENS: ${ANYSENTRY_L2_CONTEXT_TOKENS:-16384}
+      ANYSENTRY_L3_TIMEOUT_MS: ${ANYSENTRY_L3_TIMEOUT_MS:-180000}
+      ANYSENTRY_L3_CONTEXT_TOKENS: ${ANYSENTRY_L3_CONTEXT_TOKENS:-32768}
+      ANYSENTRY_IDENTITY_REVIEW_TIMEOUT_MS: ${ANYSENTRY_IDENTITY_REVIEW_TIMEOUT_MS:-45000}
       # ANYSENTRY_SYNTHETIC_FEED: "on"
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -376,5 +395,6 @@ services:
 volumes:
   clickhouse-data:
   redis-data:
+  postgres-data:
   kafka-data:
   flink-checkpoints:

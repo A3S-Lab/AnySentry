@@ -1,6 +1,7 @@
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { ClickHouseStore } from './clickhouse-store';
+import { RelationalBusinessStore } from './relational-business-store.service';
 import {
   MaintenanceStatus,
   MaintenanceTargetType,
@@ -72,21 +73,41 @@ export class MaintenanceWindowService implements OnModuleInit, OnModuleDestroy {
   private readonly ch = new ClickHouseStore();
   private readonly windows = new Map<string, MaintenanceWindowRecord>();
   private persistTimer?: NodeJS.Timeout;
+  private relationalRefreshTimer?: NodeJS.Timeout;
   private initialized = false;
+
+  constructor(private readonly relational: RelationalBusinessStore) {}
 
   async onModuleInit(): Promise<void> {
     if (await this.ch.init()) {
       for (const record of await this.ch.loadMaintenanceWindows()) {
-        if (record.windowId) this.windows.set(record.windowId, this.normalize(record));
+        this.mergePersisted(record);
       }
     }
+    for (const record of await this.relational.loadMaintenanceWindows()) {
+      this.mergePersisted(record);
+    }
     this.initialized = true;
+    await this.persist();
+    this.relationalRefreshTimer = setInterval(() => {
+      void this.refreshRelationalState();
+    }, 15_000);
+    this.relationalRefreshTimer.unref();
   }
 
   async onModuleDestroy(): Promise<void> {
     if (this.persistTimer) clearTimeout(this.persistTimer);
+    if (this.relationalRefreshTimer) clearInterval(this.relationalRefreshTimer);
     await this.persist();
     await this.ch.close();
+  }
+
+  stateStatus() {
+    return {
+      windowCount: this.windows.size,
+      postgresqlBacked: this.relational.isReady(),
+      clickhouseMigrationCopy: this.ch.enabled,
+    };
   }
 
   upsert(windowId: string | undefined, input: MaintenanceWindowUpdateRequest): MaintenanceWindowItem {
@@ -247,6 +268,24 @@ export class MaintenanceWindowService implements OnModuleInit, OnModuleDestroy {
 
   private async persist(): Promise<void> {
     const records = [...this.windows.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, RETAIN_LIMIT);
-    await this.ch.saveMaintenanceWindows(records);
+    await Promise.all([
+      this.ch.saveMaintenanceWindows(records),
+      this.relational.saveMaintenanceWindows(records),
+    ]);
+  }
+
+  private mergePersisted(record: MaintenanceWindowRecord): void {
+    if (!record.windowId) return;
+    const normalized = this.normalize(record);
+    const current = this.windows.get(normalized.windowId);
+    if (!current || normalized.updatedAt > current.updatedAt) {
+      this.windows.set(normalized.windowId, normalized);
+    }
+  }
+
+  private async refreshRelationalState(): Promise<void> {
+    for (const record of await this.relational.loadMaintenanceWindows()) {
+      this.mergePersisted(record);
+    }
   }
 }

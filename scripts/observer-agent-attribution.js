@@ -739,25 +739,20 @@ class AgentAttributor {
     let roots = 0;
     let signatureDescendants = 0;
     for (const info of snapshot.values()) {
-      if (positiveInt(info.tgid) && positiveInt(info.tgid) !== info.pid) continue;
-      const directAgent = this.matchAgentExecutable(info);
-      if (!directAgent) continue;
-      const before = this.rootsByKey.size;
-      const ancestor = this.resolveSameScopeAncestor(info.ppid, directAgent, snapshot);
-      const result = ancestor
-        ? this.rememberAgent(
-            info,
-            ancestor,
-            ancestor.rootPid,
-            'process_lineage',
-            'process_graph',
-            ancestor.workspacePath,
-          )
-        : this.rememberAgent(info, directAgent, info.pid, 'hint_only', 'process_signature');
-      if (result.state !== 'agent') continue;
-      const addedRoots = this.rootsByKey.size - before;
-      roots += addedRoots;
-      if (result.attribution.rootKey !== this.processKey(info)) signatureDescendants++;
+      const agentId = this.matchAgentExecutable(info);
+      if (!agentId) continue;
+      const workspacePath = this.resolveWorkspace(info.cwd).workspacePath;
+      this.remember({
+        ...info,
+        state: 'agent',
+        agentId,
+        rootPid: info.tgid || info.pid,
+        rootStartTime: info.startTime,
+        workspacePath,
+        agentWorkspacePath: workspacePath,
+        lastSeen: now,
+      });
+      roots++;
     }
 
     let descendants = signatureDescendants;
@@ -767,15 +762,17 @@ class AgentAttributor {
       const scope = this.resolveSnapshotScope(info, snapshot);
       if (!scope) continue;
       if (scope.state === 'agent') {
-        const result = this.rememberAgent(
-          info,
-          scope,
-          scope.rootPid,
-          'process_lineage',
-          'process_graph',
-          scope.workspacePath,
-        );
-        if (result.state === 'agent') descendants++;
+        this.remember({
+          ...info,
+          state: 'agent',
+          agentId: scope.agentId,
+          rootPid: scope.rootPid,
+          rootStartTime: scope.rootStartTime,
+          agentWorkspacePath: scope.workspacePath,
+          ...this.resolveWorkspace(info.cwd, scope.workspacePath),
+          lastSeen: now,
+        });
+        descendants++;
       } else if (scope.state === 'infrastructure') {
         this.remember({
           ...info,
@@ -956,7 +953,10 @@ class AgentAttributor {
         text(processInfo.startTimeNs) ||
         text(processInfo.start_time_ns),
       cgroupId: text(processInfo.cgroupId) || text(processInfo.cgroup_id),
-      comm: text(processInfo.comm) || text(observerEvent?.identity?.agent),
+      // `identity.agent` is a claimed/inherited scope label from the Observer envelope. It is not
+      // process executable evidence. Falling back to it here promoted short-lived bwrap, shell,
+      // and ProcessExit records into new Agent roots whenever the real comm field was unavailable.
+      comm: text(processInfo.comm),
       exe: text(processInfo.exe),
       argv: argvText(payload.argv),
       cgroup: text(processInfo.cgroup),
@@ -1103,6 +1103,7 @@ class AgentAttributor {
           'process_lineage',
           'process_graph',
           ancestry.workspacePath,
+          ancestry.rootStartTime,
         ),
         exiting,
         current,
@@ -1113,6 +1114,26 @@ class AgentAttributor {
       return this.finish(
         pid,
         this.rememberInfrastructure(current, ancestry.rootPid, ancestry.serviceName, ancestry.containerId),
+        exiting,
+        current,
+      );
+    }
+
+    // Parent/leader ownership wins over direct command hints. Only after ancestry has failed to
+    // identify an Agent do we allow this process to become a new root.
+    const directAgent = this.matchAgent(current);
+    if (directAgent) {
+      return this.finish(
+        pid,
+        this.rememberAgent(
+          current,
+          directAgent,
+          pid,
+          'hint_only',
+          'argv',
+          undefined,
+          current.startTime,
+        ),
         exiting,
         current,
       );
@@ -1150,6 +1171,7 @@ class AgentAttributor {
               state: 'agent',
               agentId: result.attribution.agentScopeId,
               rootPid: result.attribution.rootPid ?? pid,
+              rootStartTime: result.attribution.rootStartTime ?? current.startTime,
               lastSeen: this.now(),
             }
           : undefined
@@ -1248,17 +1270,16 @@ class AgentAttributor {
         const leaderCached = this.procs.get(tgid);
         if (leaderCached?.state === 'agent') {
           const scope = this.agentScope(leaderCached);
-          if (scope.state === 'agent') {
-            this.rememberAgent(
-              live,
-              scope,
-              scope.rootPid,
-              'process_lineage',
-              'process_graph',
-              scope.workspacePath,
-            );
-            return scope;
-          }
+          this.remember({
+            ...live,
+            state: 'agent',
+            agentId: scope.agentId,
+            rootPid: scope.rootPid,
+            rootStartTime: scope.rootStartTime,
+            ...this.resolveWorkspace(live.cwd, scope.workspacePath),
+            lastSeen: now,
+          });
+          return scope;
         }
         if (leaderCached?.state === 'infrastructure') {
           this.remember({
@@ -1278,44 +1299,47 @@ class AgentAttributor {
           const leaderAgent = this.matchAgent(leader);
           if (leaderAgent) {
             const { workspacePath } = this.resolveWorkspace(leader.cwd);
-            const ancestor = this.resolveSameScopeAncestor(leader.ppid, leaderAgent);
-            const leaderResult = this.rememberAgent(
-              { ...leader, workspacePath },
-              ancestor || leaderAgent,
-              ancestor?.rootPid || tgid,
-              ancestor ? 'process_lineage' : 'hint_only',
-              ancestor ? 'process_graph' : 'process_signature',
-              ancestor?.workspacePath,
-            );
-            if (leaderResult.state === 'agent') {
-              const rootRecord = this.procs.getFor(leader);
-              const scope = this.agentScope(rootRecord);
-              this.rememberAgent(
-                live,
-                scope,
-                tgid,
-                'process_lineage',
-                'process_graph',
-                workspacePath,
-              );
-              return scope;
-            }
+            const root = {
+              ...leader,
+              state: 'agent',
+              agentId: leaderAgent,
+              rootPid: tgid,
+              rootStartTime: leader.startTime,
+              workspacePath,
+              agentWorkspacePath: workspacePath,
+              lastSeen: now,
+            };
+            this.remember(root);
+            this.remember({
+              ...live,
+              state: 'agent',
+              agentId: leaderAgent,
+              rootPid: tgid,
+              rootStartTime: leader.startTime,
+              agentWorkspacePath: workspacePath,
+              ...this.resolveWorkspace(live.cwd, workspacePath),
+              lastSeen: now,
+            });
+            return this.agentScope(root);
           }
         }
       }
 
       const directAgent = this.matchAgent(live);
       if (directAgent) {
-        const ancestor = this.resolveSameScopeAncestor(live.ppid, directAgent);
-        this.rememberAgent(
-          live,
-          ancestor || directAgent,
-          ancestor?.rootPid || pid,
-          ancestor ? 'process_lineage' : 'hint_only',
-          ancestor ? 'process_graph' : 'process_signature',
-          ancestor?.workspacePath,
-        );
-        return this.agentScope(this.procs.getFor(live));
+        const workspacePath = this.resolveWorkspace(live.cwd).workspacePath;
+        const root = {
+          ...live,
+          state: 'agent',
+          agentId: directAgent,
+          rootPid: pid,
+          rootStartTime: live.startTime,
+          workspacePath,
+          agentWorkspacePath: workspacePath,
+          lastSeen: now,
+        };
+        this.remember(root);
+        return this.agentScope(root);
       }
 
       this.remember({ ...live, state: 'unknown', lastSeen: now });
@@ -1333,39 +1357,25 @@ class AgentAttributor {
     return this.signatureRegistry.match(info);
   }
 
-  rememberAgent(info, agentId, rootPid, reason, source, inheritedWorkspacePath) {
-    const match = typeof agentId === 'object' && agentId
-      ? agentId
-      : { agentId, displayName: agentId };
+  rememberAgent(info, agentId, rootPid, reason, source, inheritedWorkspacePath, inheritedRootStartTime) {
     const workspace = this.resolveWorkspace(info.workspacePath || info.cwd, inheritedWorkspacePath);
-    const root = match.rootKey
-      ? this.rootsByKey.get(match.rootKey)
-      : this.ensureRoot({ ...info, ...workspace }, match);
-    if (!root || root.runtimeState !== 'running') return this.unknown();
-    const now = this.now();
-    root.lastSeenAt = now;
-    root.lastActivityAt = now;
-    if (!root.workspacePath && workspace.workspacePath) root.workspacePath = workspace.workspacePath;
+    const agentWorkspacePath =
+      canonicalWorkspacePath(inheritedWorkspacePath)
+      || canonicalWorkspacePath(info.agentWorkspacePath)
+      || workspace.workspacePath;
+    const rootStartTime =
+      inheritedRootStartTime ||
+      (rootPid === info.pid ? info.startTime : this.procs.get(rootPid)?.startTime);
     const record = {
       ...info,
-      hostId: text(info.hostId) || root.hostId,
-      bootId: text(info.bootId) || root.bootId,
       state: 'agent',
-      agentId: root.agentId,
-      agentDisplayName: root.agentDisplayName,
-      signatureRuleId: root.signatureRuleId,
-      registryVersion: root.registryVersion,
-      registryHash: root.registryHash,
-      registryMatcherHash: root.registryMatcherHash,
-      rootPid: root.pid,
-      rootKey: root.rootKey,
-      rootGeneration: root.generation,
-      agentInstanceId: root.agentInstanceId,
+      agentId,
+      rootPid,
+      rootStartTime,
+      agentWorkspacePath,
       ...workspace,
-      lastSeen: now,
+      lastSeen: this.now(),
     };
-    // Some late kernel events lack start-time after /proc has disappeared. They may inherit a
-    // still-live root for this event, but are deliberately not cached without a complete key.
     this.remember(record);
     return {
       state: 'agent',
@@ -1373,13 +1383,11 @@ class AgentAttributor {
       attribution: {
         monitored: true,
         classification: 'probable_agent',
-        agentScopeId: root.agentId,
-        agentDisplayName: root.agentDisplayName,
-        agentInstanceId: root.agentInstanceId,
-        rootPid: root.pid,
-        rootKey: root.rootKey,
-        rootStartTimeTicks: root.startTime,
-        rootGeneration: root.generation,
+        agentScopeId: agentId,
+        agentDisplayName: agentId,
+        ...(agentWorkspacePath ? { agentWorkspacePath } : {}),
+        rootPid,
+        ...(rootStartTime ? { rootStartTime } : {}),
         confidence: source === 'process_graph' ? 0.9 : 0.85,
         reason,
         source,
@@ -1411,12 +1419,12 @@ class AgentAttributor {
         monitored: true,
         classification: 'probable_agent',
         agentScopeId: record.agentId,
-        agentDisplayName: record.agentDisplayName || record.agentId,
-        agentInstanceId: root.agentInstanceId,
+        agentDisplayName: record.agentId,
+        ...((record.agentWorkspacePath || record.workspacePath)
+          ? { agentWorkspacePath: record.agentWorkspacePath || record.workspacePath }
+          : {}),
         rootPid: record.rootPid,
-        rootKey: root.rootKey,
-        rootStartTimeTicks: root.startTime,
-        rootGeneration: record.rootGeneration,
+        ...(record.rootStartTime ? { rootStartTime: record.rootStartTime } : {}),
         confidence: 0.9,
         reason: 'process_lineage',
         source: 'process_graph',
@@ -1431,17 +1439,10 @@ class AgentAttributor {
     if (!root) return { state: 'unknown' };
     return {
       state: 'agent',
-      agentId: root.agentId,
-      displayName: root.agentDisplayName,
-      rootPid: root.pid,
-      rootKey: root.rootKey,
-      rootGeneration: root.generation,
-      agentInstanceId: root.agentInstanceId,
-      signatureRuleId: root.signatureRuleId,
-      registryVersion: root.registryVersion,
-      registryHash: root.registryHash,
-      registryMatcherHash: root.registryMatcherHash,
-      workspacePath: record.workspacePath,
+      agentId: record.agentId,
+      rootPid: record.rootPid,
+      rootStartTime: record.rootStartTime,
+      workspacePath: record.agentWorkspacePath || record.workspacePath,
     };
   }
 

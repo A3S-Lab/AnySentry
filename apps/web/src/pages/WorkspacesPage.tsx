@@ -1,5 +1,6 @@
 import { useRequest } from "ahooks";
 import dayjs from "dayjs";
+import { formatSecurityDateTime } from "@/lib/date-time";
 import {
   ArrowLeft,
   BellRing,
@@ -39,6 +40,9 @@ import {
 import { cn } from "@/lib/utils";
 
 const TIME_OPTIONS: Array<{ value: SecurityTimeType; label: string }> = [
+  { value: "last_30m", label: "近30分钟" },
+  { value: "last_1h", label: "近1小时" },
+  { value: "last_2h", label: "近2小时" },
   { value: "last_3h", label: "近3小时" },
   { value: "last_1d", label: "近一天" },
   { value: "last_7d", label: "近一周" },
@@ -80,9 +84,7 @@ function clean(value: string) {
 }
 
 function formatDate(value?: string) {
-  if (!value) return "--";
-  const parsed = dayjs(value);
-  return parsed.isValid() ? parsed.format("MM-DD HH:mm:ss") : value;
+  return formatSecurityDateTime(value, "MM-DD HH:mm:ss", value || "--");
 }
 
 function healthClass(health?: AgentHealthState) {

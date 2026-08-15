@@ -6,9 +6,12 @@ type ProcRecord = {
   ppid?: number;
   comm?: string;
   cwd?: string;
+  agentWorkspacePath?: string;
   agentId?: string;
   sessionId?: string;
   rootPid?: number;
+  rootStartTime?: string;
+  startTime?: string;
   confidence: number;
   lastSeen: number;
 };
@@ -56,8 +59,8 @@ function canonicalAgentName(value?: string): string | undefined {
   return text;
 }
 
-function directRootMatch(comm?: string, exe?: string, agentId?: string): string | undefined {
-  const names = [basename(comm), basename(exe), basename(agentId)].filter(Boolean);
+function directRootMatch(comm?: string, exe?: string): string | undefined {
+  const names = [basename(comm), basename(exe)].filter(Boolean);
   return ROOT_NAMES.find((root) => names.some((name) => name === root));
 }
 
@@ -65,13 +68,15 @@ function argvRootMatch(argv?: string): string | undefined {
   if (!BUILTIN_AGENT_HINTS_ENABLED) return undefined;
   const text = lower(argv);
   if (!text) return undefined;
-  if (text.includes('__codex_') || text.includes('codex_thread_id')) return 'codex';
-  if (/^a3s\s+code(?:\s|$)/.test(text) || /\/a3s\s+code(?:\s|$)/.test(text)) return 'a3s code';
-  if (/^claude(?:[-\s]code)?(?:\s|$)/.test(text) || /\/claude(?:[-\s]code)?(?:\s|$)/.test(text)) return 'Claude Code';
+  const tokens = text.split(/\s+/u).filter(Boolean);
+  const command = basename(tokens[0]);
+  if (command === 'codex') return 'codex';
+  if (command === 'a3s-code' || (command === 'a3s' && tokens[1] === 'code')) return 'a3s code';
+  if (command === 'claude' || command === 'claude-code') return 'Claude Code';
   return undefined;
 }
 
-type ProcIdentity = { pid: number; tgid?: number; comm?: string; exe?: string };
+type ProcIdentity = { pid: number; tgid?: number; startTime?: string; comm?: string; exe?: string; cwd?: string };
 
 function readProcIdentity(pid?: number): ProcIdentity | undefined {
   if (!pid) return undefined;
@@ -80,14 +85,22 @@ function readProcIdentity(pid?: number): ProcIdentity | undefined {
     const fs = require('node:fs') as typeof import('node:fs');
     const comm = fs.readFileSync(`/proc/${pid}/comm`, 'utf8').trim();
     let tgid: number | undefined;
+    let startTime: string | undefined;
     let exe: string | undefined;
+    let cwd: string | undefined;
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const close = stat.lastIndexOf(')');
+      if (close >= 0) startTime = stat.slice(close + 2).trim().split(/\s+/u)[19];
+    } catch {}
     try {
       const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
       const value = Number(status.match(/^Tgid:\s+(\d+)/m)?.[1]);
       if (Number.isInteger(value) && value > 0) tgid = value;
     } catch {}
     try { exe = fs.readlinkSync(`/proc/${pid}/exe`); } catch {}
-    return { pid, tgid, comm, exe };
+    try { cwd = fs.readlinkSync(`/proc/${pid}/cwd`); } catch {}
+    return { pid, tgid, startTime, comm, exe, cwd };
   } catch {
     return undefined;
   }
@@ -101,63 +114,106 @@ export class AgentAttributionService {
     const attributes = meta.attributes ?? {};
     const pid = process?.pid ?? attrNumber(attributes, 'pid') ?? attrNumber(attributes, 'observerTask');
     const ppid = process?.ppid ?? attrNumber(attributes, 'ppid');
-    const comm = process?.comm ?? attrString(attributes, 'comm') ?? meta.agentId;
+    const comm = process?.comm ?? attrString(attributes, 'comm');
     const exe = process?.exe ?? attrString(attributes, 'exe');
     const argv = attrString(attributes, 'argv');
     const cwd = process?.cwd ?? attrString(attributes, 'cwd') ?? meta.workspacePath;
+    const startTime = process?.startTimeTicks ?? process?.startTimeNs;
     if (!pid) return this.notAgent('not_evaluated');
 
-    const direct = this.matchRoot(pid, ppid, comm, exe, argv, meta, at);
-    if (direct) {
-      this.remember({ pid, ppid, comm, cwd, agentId: direct.agentScopeId, sessionId: direct.agentSessionId, rootPid: pid, confidence: direct.confidence, lastSeen: at });
-      return direct;
-    }
-
-    const parentRoot = this.matchParentRoot(ppid, meta);
-    if (parentRoot) {
-      this.remember({ pid: ppid!, agentId: parentRoot.agentScopeId, sessionId: parentRoot.agentSessionId, rootPid: ppid, confidence: parentRoot.confidence, lastSeen: at });
-    }
-
-    const parent = ppid ? this.procs.get(ppid) : undefined;
-    if (parent?.agentId) {
-      const confidence = Math.max(0, parent.confidence - INHERIT_DECAY);
-      const rec = { pid, ppid, comm, cwd, agentId: parent.agentId, sessionId: parent.sessionId, rootPid: parent.rootPid ?? parent.pid, confidence, lastSeen: at };
-      this.remember(rec);
-      return {
-        monitored: confidence >= MIN_MONITORED_CONFIDENCE,
-        agentScopeId: parent.agentId,
-        agentDisplayName: parent.agentId,
-        agentSessionId: parent.sessionId,
-        rootPid: parent.rootPid ?? parent.pid,
-        confidence,
-        reason: 'process_lineage',
-        source: 'process_graph',
-      };
-    }
-
     const existing = this.procs.get(pid);
-    if (existing?.agentId) {
+    if (existing && startTime && existing.startTime && existing.startTime !== startTime) {
+      this.procs.delete(pid);
+    } else if (existing?.agentId) {
       existing.lastSeen = at;
       return {
         monitored: existing.confidence >= MIN_MONITORED_CONFIDENCE,
         agentScopeId: existing.agentId,
         agentDisplayName: existing.agentId,
         agentSessionId: existing.sessionId,
+        agentWorkspacePath: existing.agentWorkspacePath,
         rootPid: existing.rootPid,
+        rootStartTime: existing.rootStartTime,
         confidence: existing.confidence,
         reason: 'process_lineage',
         source: 'process_graph',
       };
     }
 
-    this.remember({ pid, ppid, comm, cwd, confidence: 0, lastSeen: at });
+    const parentRoot = this.matchParentRoot(ppid, meta);
+    if (parentRoot) {
+      this.remember({
+        pid: ppid!,
+        agentId: parentRoot.agentScopeId,
+        sessionId: parentRoot.agentSessionId,
+        rootPid: parentRoot.rootPid ?? ppid,
+        rootStartTime: parentRoot.rootStartTime,
+        startTime: parentRoot.rootStartTime,
+        agentWorkspacePath: parentRoot.agentWorkspacePath,
+        confidence: parentRoot.confidence,
+        lastSeen: at,
+      });
+    }
+
+    const parent = ppid ? this.procs.get(ppid) : undefined;
+    if (parent?.agentId) {
+      const confidence = Math.max(0, parent.confidence - INHERIT_DECAY);
+      const rec = {
+        pid,
+        ppid,
+        comm,
+        cwd,
+        agentWorkspacePath: parent.agentWorkspacePath ?? parent.cwd,
+        startTime,
+        agentId: parent.agentId,
+        sessionId: parent.sessionId,
+        rootPid: parent.rootPid ?? parent.pid,
+        rootStartTime: parent.rootStartTime ?? parent.startTime,
+        confidence,
+        lastSeen: at,
+      };
+      this.remember(rec);
+      return {
+        monitored: confidence >= MIN_MONITORED_CONFIDENCE,
+        agentScopeId: parent.agentId,
+        agentDisplayName: parent.agentId,
+        agentSessionId: parent.sessionId,
+        agentWorkspacePath: parent.agentWorkspacePath ?? parent.cwd,
+        rootPid: parent.rootPid ?? parent.pid,
+        rootStartTime: parent.rootStartTime ?? parent.startTime,
+        confidence,
+        reason: 'process_lineage',
+        source: 'process_graph',
+      };
+    }
+
+    const direct = this.matchRoot(pid, ppid, comm, exe, argv, meta, at, startTime, cwd);
+    if (direct) {
+      this.remember({
+        pid,
+        ppid,
+        comm,
+        cwd,
+        agentWorkspacePath: direct.agentWorkspacePath ?? cwd,
+        startTime,
+        agentId: direct.agentScopeId,
+        sessionId: direct.agentSessionId,
+        rootPid: pid,
+        rootStartTime: startTime,
+        confidence: direct.confidence,
+        lastSeen: at,
+      });
+      return direct;
+    }
+
+    this.remember({ pid, ppid, comm, cwd, startTime, confidence: 0, lastSeen: at });
     return this.notAgent('not_agent');
   }
 
-  private matchRoot(pid: number, ppid: number | undefined, comm: string | undefined, exe: string | undefined, argv: string | undefined, meta: EventMeta, at: number): AgentAttribution | undefined {
-    const name = lower(comm || meta.agentId);
+  private matchRoot(pid: number, ppid: number | undefined, comm: string | undefined, exe: string | undefined, argv: string | undefined, meta: EventMeta, at: number, startTime?: string, cwd?: string): AgentAttribution | undefined {
+    const name = lower(comm || exe);
     if (!name || (GENERIC_NAMES.has(name) && !argvRootMatch(argv))) return undefined;
-    const matched = directRootMatch(comm, exe, meta.agentId) ?? argvRootMatch(argv);
+    const matched = directRootMatch(comm, exe) ?? argvRootMatch(argv);
     if (!matched) return undefined;
     const confidence = 0.82;
     return {
@@ -165,7 +221,9 @@ export class AgentAttributionService {
       agentScopeId: canonicalAgentName(matched) ?? matched,
       agentDisplayName: canonicalAgentName(matched) ?? matched,
       agentSessionId: meta.sessionId,
+      agentWorkspacePath: cwd ?? meta.workspacePath,
       rootPid: pid,
+      rootStartTime: startTime,
       confidence,
       reason: 'hint_only',
       source: 'argv',
@@ -183,7 +241,9 @@ export class AgentAttributionService {
       agentScopeId: canonicalAgentName(matched) ?? matched,
       agentDisplayName: canonicalAgentName(matched) ?? matched,
       agentSessionId: meta.sessionId,
+      agentWorkspacePath: leader?.cwd ?? parent?.cwd ?? meta.workspacePath,
       rootPid: leader?.pid ?? ppid,
+      rootStartTime: leader?.startTime ?? parent?.startTime,
       confidence,
       reason: 'hint_only',
       source: 'process_graph',

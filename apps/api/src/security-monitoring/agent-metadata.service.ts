@@ -15,8 +15,10 @@ import {
   WorkloadIdentitySnapshotEntry,
 } from './types';
 import { cleanText } from './redaction';
+import { RelationalBusinessStore } from './relational-business-store.service';
 
 const RETAIN_LIMIT = 10_000;
+const RELATIONAL_REFRESH_MS = 15_000;
 
 function legacyKey(workspacePath: string, agentId: string): string {
   return `${workspacePath}\0${agentId}`;
@@ -128,29 +130,62 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
   private readonly legacyIndex = new Map<string, string | null>();
   private readonly aliasIndex = new Map<string, string | null>();
   private persistTimer?: NodeJS.Timeout;
+  private relationalRefreshTimer?: NodeJS.Timeout;
+  private readonly dirtyAssetIds = new Set<string>();
   private initialized = false;
   private reviewVersion = 0;
 
+  constructor(private readonly relational: RelationalBusinessStore) {}
+
   async onModuleInit(): Promise<void> {
-    if (await this.ch.init()) {
-      const loadedRecords = await this.ch.loadAgentMetadata();
-      for (const record of loadedRecords) {
-        if (record.agentId && record.workspacePath) this.storeNormalized(this.normalize(record));
+    const [clickHouseReady, relationalReady] = await Promise.all([
+      this.ch.init(),
+      this.relational.initialize(),
+    ]);
+    const [clickHouseRecords, relationalRecords] = await Promise.all([
+      clickHouseReady ? this.ch.loadAgentMetadata() : Promise.resolve([]),
+      relationalReady ? this.relational.loadAgentMetadata() : Promise.resolve([]),
+    ]);
+    for (const record of [...clickHouseRecords, ...relationalRecords]) {
+      if (record.agentId && record.workspacePath) this.storeNormalized(this.normalize(record));
+    }
+    this.rebuildReviewIndex();
+
+    const canonicalRecords = [...this.records.values()];
+    if (canonicalRecords.length > 0) {
+      if (clickHouseReady) {
+        // Keep the ClickHouse migration copy until all deployments have PostgreSQL configured.
+        await this.ch.saveAgentMetadata(canonicalRecords);
       }
-      this.rebuildReviewIndex();
-      if (loadedRecords.length > 0) {
-        // Non-destructive, idempotent migration: keep the v1 ClickHouse config row and write the
-        // canonical registry beside it. Historical events are never rewritten.
-        await this.ch.saveAgentMetadata([...this.records.values()]);
+      if (relationalReady) {
+        // Idempotently backfill ClickHouse-only rows and reconcile by updatedAt.
+        await this.relational.saveAgentMetadata(canonicalRecords);
       }
+    }
+
+    if (this.relational.configured()) {
+      this.relationalRefreshTimer = setInterval(() => {
+        void this.refreshRelationalRecords();
+      }, RELATIONAL_REFRESH_MS);
+      this.relationalRefreshTimer.unref();
     }
     this.initialized = true;
   }
 
   async onModuleDestroy(): Promise<void> {
     if (this.persistTimer) clearTimeout(this.persistTimer);
+    if (this.relationalRefreshTimer) clearInterval(this.relationalRefreshTimer);
     await this.persist();
     await this.ch.close();
+  }
+
+  private async refreshRelationalRecords(): Promise<void> {
+    const loadedRecords = await this.relational.loadAgentMetadata();
+    if (loadedRecords.length === 0) return;
+    for (const record of loadedRecords) {
+      if (record.agentId && record.workspacePath) this.storeNormalized(this.normalize(record));
+    }
+    this.rebuildReviewIndex();
   }
 
   get(workspacePath: string, agentId: string): AgentMetadataRecord | undefined {
@@ -203,6 +238,7 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
       updatedAt: Date.now(),
     };
     this.storeNormalized(next, curKey);
+    this.dirtyAssetIds.add(next.agentAssetId);
     this.trim();
     this.rebuildReviewIndex();
     this.persistSoon();
@@ -272,6 +308,7 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
       updatedAt: Date.now(),
     };
     this.storeNormalized(next, recordKey);
+    this.dirtyAssetIds.add(next.agentAssetId);
     this.trim();
     this.reviewVersion += 1;
     this.rebuildReviewIndex();
@@ -279,8 +316,47 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
     return this.item(next);
   }
 
-  identityKeysForEvent(event: Pick<JudgedEvent, 'agentId' | 'sessionId' | 'process' | 'attribution'>): string[] {
+  logicalIdentityKeysForEvent(
+    event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'userId' | 'process' | 'attribution'>,
+  ): string[] {
     const attribution = event.attribution;
+    const workload = attribution?.workloadRef;
+    const host = clean(event.process?.hostId, 240);
+    const agentId = clean(
+      attribution?.agentScopeId ?? attribution?.agentDisplayName ?? event.agentId,
+      240,
+    );
+    if (!agentId) return [];
+
+    if (workload?.podUid && workload.namespace) {
+      const owner = clean(workload.ownerName ?? workload.podName, 240);
+      if (owner) {
+        return cleanIdentityKeys([
+          `logical:k8s:${workload.namespace}:${workload.ownerKind ?? 'pod'}:${owner}:${workload.containerName ?? 'container'}:${agentId}`,
+        ]);
+      }
+    }
+
+    if (workload?.environment === 'docker' && host && workload.containerName && workload.containerImage) {
+      return cleanIdentityKeys([
+        `logical:docker:${host}:${workload.containerName}:${workload.containerImage}:${agentId}`,
+      ]);
+    }
+
+    const systemdUnit = clean(event.process?.systemdUnit ?? workload?.systemdUnit, 240);
+    if (host && systemdUnit?.endsWith('.service') && !systemdUnit.startsWith('session-')) {
+      return cleanIdentityKeys([`logical:systemd:${host}:${systemdUnit}:${agentId}`]);
+    }
+
+    if (host) return cleanIdentityKeys([`logical:host:${host}:${agentId}`]);
+    return [];
+  }
+
+  identityKeysForEvent(
+    event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'userId' | 'sessionId' | 'process' | 'attribution'>,
+  ): string[] {
+    const attribution = event.attribution;
+    const logicalKeys = this.logicalIdentityKeysForEvent(event);
     const strongValues: unknown[] = [
       attribution?.physicalWorkloadId,
       attribution?.agentInstanceId,
@@ -299,26 +375,32 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
       strongValues.push(podUid);
     }
     const strong = cleanIdentityKeys(strongValues);
-    if (strong.length > 0) return strong;
+    if (strong.length > 0) return cleanIdentityKeys([...strong, ...logicalKeys]);
 
     const host = clean(event.process?.hostId, 240) ?? 'host';
     const boot = clean(event.process?.bootId, 240) ?? 'boot';
     if (attribution?.rootPid) {
       return cleanIdentityKeys([
+        `host:${host}:${boot}:root:${attribution.rootPid}:${attribution.rootStartTime ?? 'start-unknown'}`,
+        // Keep the previous identity shape as a migration alias so existing human reviews remain
+        // attached after workspace-independent, PID-reuse-safe instance identity is enabled.
         `host:${host}:${boot}:root:${attribution.rootPid}:${attribution.agentScopeId ?? attribution.agentDisplayName ?? event.agentId}`,
+        ...logicalKeys,
       ]);
     }
     if (event.process?.pid && (event.process.startTimeTicks || event.process.startTimeNs)) {
       return cleanIdentityKeys([
         `host:${host}:${boot}:process:${event.process.pid}:${event.process.startTimeTicks ?? event.process.startTimeNs}:${event.process.exe ?? event.process.comm ?? event.agentId}`,
+        ...logicalKeys,
       ]);
     }
     const systemdUnit = clean(event.process?.systemdUnit, 240);
     if (systemdUnit?.endsWith('.service') && !systemdUnit.startsWith('session-')) {
-      return cleanIdentityKeys([`systemd:${host}:${systemdUnit}`]);
+      return cleanIdentityKeys([`systemd:${host}:${systemdUnit}`, ...logicalKeys]);
     }
     // session-*.scope is a shared runtime boundary, never an Agent review or suppression key.
     return cleanIdentityKeys([
+      ...logicalKeys,
       event.agentId,
       event.sessionId?.startsWith('session-') ? undefined : event.sessionId,
     ]);
@@ -413,10 +495,14 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
           record.reviewWorkloadRef?.processName ??
           record.agentId,
         agentSessionId: previous?.agentSessionId,
-        agentInstanceId: record.reviewAgentInstanceId ?? previous?.agentInstanceId,
-        physicalWorkloadId: record.reviewPhysicalWorkloadId ?? previous?.physicalWorkloadId,
-        workloadRef: record.reviewWorkloadRef ?? previous?.workloadRef,
+        // Classification belongs to the logical Agent. Runtime identity belongs to the observed
+        // process/container and must never be copied from the instance that was originally
+        // reviewed onto a later terminal window or PID lifetime.
+        agentInstanceId: previous?.agentInstanceId,
+        physicalWorkloadId: previous?.physicalWorkloadId,
+        workloadRef: previous?.workloadRef ?? record.reviewWorkloadRef,
         rootPid: previous?.rootPid,
+        rootStartTime: previous?.rootStartTime,
         confidence: 1,
         reason: confirmed ? 'human_confirmed' : rejected ? 'human_rejected' : 'human_deferred',
         source: 'manual_review',
@@ -697,6 +783,18 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
 
   private async persist(): Promise<void> {
     const records = [...this.records.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, RETAIN_LIMIT);
-    await this.ch.saveAgentMetadata(records);
+    const dirtyRecords = records.filter((record) => this.dirtyAssetIds.has(record.agentAssetId));
+    const [, relationalSaved] = await Promise.all([
+      this.ch.saveAgentMetadata(records),
+      this.relational.saveAgentMetadata(dirtyRecords),
+    ]);
+    if (relationalSaved) {
+      for (const saved of dirtyRecords) {
+        const current = this.records.get(assetKey(saved.agentAssetId));
+        if (!current || current.updatedAt <= saved.updatedAt) {
+          this.dirtyAssetIds.delete(saved.agentAssetId);
+        }
+      }
+    }
   }
 }

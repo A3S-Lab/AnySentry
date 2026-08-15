@@ -1,5 +1,6 @@
 import { useRequest } from "ahooks";
 import dayjs from "dayjs";
+import { formatSecurityDateTime } from "@/lib/date-time";
 import {
   ArrowLeft,
   BellRing,
@@ -95,9 +96,7 @@ function deliveryLimitValue(value: string) {
 }
 
 function formatDate(value?: string) {
-  if (!value) return "--";
-  const parsed = dayjs(value);
-  return parsed.isValid() ? parsed.format("MM-DD HH:mm:ss") : value;
+  return formatSecurityDateTime(value, "MM-DD HH:mm:ss", value || "--");
 }
 
 function splitList(value: string) {

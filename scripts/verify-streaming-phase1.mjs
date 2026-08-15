@@ -85,6 +85,47 @@ assert.match(
   'absolute local workspaces must be eligible for supply-chain matching',
 );
 
+const observerV2Identity = canonicalizeEvent(
+  event({
+    eventId: 'evt_observer_v2_identity',
+    sourceEventId: 'observer-v2-identity',
+    process: {
+      hostId: 'host-observer-v2',
+      bootId: 'boot-observer-v2',
+      cgroupId: '73',
+      pid: 4200,
+      ppid: 1,
+      startTimeTicks: '987654',
+      mountNamespace: 4026531840,
+    },
+  }),
+  observer('ToolExec', { pid: 4200, argv: ['true'] }),
+);
+assert.equal(observerV2Identity.processIdentity.startTimeTicks, '987654');
+assert.equal(observerV2Identity.processIdentity.cgroupId, '73');
+assert.equal(observerV2Identity.processIdentity.identityConfidence, 'strong');
+assert.match(observerV2Identity.processIdentity.processInstanceId, /^pri_[a-f0-9]{24}$/);
+assert.notEqual(
+  observerV2Identity.processIdentity.processInstanceId,
+  canonicalizeEvent(
+    event({
+      eventId: 'evt_observer_v2_reused_pid',
+      sourceEventId: 'observer-v2-reused-pid',
+      process: {
+        hostId: 'host-observer-v2',
+        bootId: 'boot-observer-v2',
+        cgroupId: '73',
+        pid: 4200,
+        ppid: 1,
+        startTimeTicks: '987655',
+        mountNamespace: 4026531840,
+      },
+    }),
+    observer('ToolExec', { pid: 4200, argv: ['true'] }),
+  ).processIdentity.processInstanceId,
+  'PID reuse with a different start_time_ticks must create a different process instance',
+);
+
 const observedWrite = canonicalizeEvent(
   event({
     eventId: 'evt_observed_write',

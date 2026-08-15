@@ -1,22 +1,32 @@
 import { Injectable } from '@nestjs/common';
 import { Sentry } from '@a3s-lab/sentry';
-import { DashboardWindowBucketRow, DashboardWindowDimensionRow, DashboardWindowHistory } from './clickhouse-store';
+import { DashboardAggregateBucketFact, DashboardWindowBucketRow, DashboardWindowDimensionRow, DashboardWindowHistory, StoredAgentBucketFact, StoredAgentMetricBucketFact, StoredAgentWindowFact, StoredTopologyBucketFact, StoredTopologyWindowFact, StoredWorkspaceBucketFact, StoredWorkspaceWindowFact } from './clickhouse-store';
 import {
+  agentRuntimeInstanceIdForEvent,
   detectedAgentIdentity,
+  hasDirectAgentRootEvidence,
   isAgentAssetClassification,
 } from './agent-identity';
 import { AgentMetadataService } from './agent-metadata.service';
+import { WorkspaceDirectoryService } from './workspace-directory.service';
 import { isEventClassificationVisible } from './event-visibility';
 import { IngestionSourceService } from './ingestion-source.service';
 import { MaintenanceWindowService } from './maintenance-window.service';
 import { buildAcl, policyConfigError, sanitizePolicy } from './policy-config';
 import { SentryJudgeService } from './sentry-judge.service';
+import { planDashboardRead, pruneSnapshotCache } from './dashboard-query-plan';
+import { DashboardHistoryBucketCache } from './dashboard-history-cache';
+import {
+  observedDurableThrough,
+  relevantCommitProgress,
+} from './query-coverage';
+import { CommitAwareFactBucketCache } from './commit-aware-fact-cache';
+import { foldLatestEventRevisions } from './event-revision';
 import { resolveTimeWindow } from './time-window';
 import * as T from './types';
 
 const SEV_RANK: Record<T.Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
-const MAX_HISTORY_CACHE_ENTRIES = 64;
-const LEVEL_BY_RANK = ['safe', 'low', 'medium', 'high', 'critical'];
+const LEVEL_BY_RANK = ['info', 'low', 'medium', 'high', 'critical'];
 const LEVEL_TEXT: Record<string, string> = { safe: '安全', low: '低危', medium: '中危', high: '高危', critical: '严重', unknown: '未知' };
 const CATEGORY_COLOR: Record<string, string> = {
   command_danger: '#fb7185', data_leak: '#f59e0b', secret_exfil: '#f59e0b', prompt_injection: '#a855f7',
@@ -59,6 +69,69 @@ const COLLECTOR_STALE_MS = 3 * 60_000;
 const COLLECTOR_DOWN_MS = 10 * 60_000;
 const COMPACT_WINDOW_MS = 3_000;
 const HOUR = 3_600_000;
+const REUSABLE_BUCKET_MS = 10_000;
+const DASHBOARD_HOT_TAIL_MS = 60_000;
+const FINAL_DECISION_STATUSES = new Set<T.DecisionStatus>(['succeeded', 'failed', 'timeout']);
+
+export interface ReusableFactSlices {
+  fullStartMs: number;
+  fullEndExclusiveMs: number;
+  head?: { startMs: number; endMs: number };
+  tail?: { startMs: number; endMs: number };
+}
+
+/**
+ * Split the persisted closed interval into exact partial boundaries and reusable full buckets.
+ *
+ * Public Dashboard snapshots carry millisecond precision and are almost never bucket-aligned.
+ * Refusing those ranges silently disabled the Agent, Workspace and topology caches. The split
+ * preserves the exact closed-interval contract without letting a partial bucket enter the cache.
+ */
+export function reusableFactSlices(
+  startMs: number,
+  persistedUntilMs: number,
+  hotFromMs: number,
+  bucketMs = REUSABLE_BUCKET_MS,
+): ReusableFactSlices {
+  const size = Math.max(1, Math.trunc(bucketMs));
+  const endExclusiveMs = Math.max(startMs, persistedUntilMs + 1);
+  const firstFullBucket = Math.ceil(startMs / size) * size;
+  const safeFullEnd = Math.min(
+    Math.floor(endExclusiveMs / size) * size,
+    Math.floor(hotFromMs / size) * size,
+  );
+  const fullEndExclusiveMs = Math.max(firstFullBucket, safeFullEnd);
+  const headEndMs = Math.min(persistedUntilMs, firstFullBucket - 1);
+  const tailStartMs = Math.max(startMs, fullEndExclusiveMs);
+  return {
+    fullStartMs: firstFullBucket,
+    fullEndExclusiveMs,
+    head: startMs <= headEndMs ? { startMs, endMs: headEndMs } : undefined,
+    tail: tailStartMs <= persistedUntilMs
+      ? { startMs: tailStartMs, endMs: persistedUntilMs }
+      : undefined,
+  };
+}
+
+class BoundedHistoryQueryGate {
+  private active = 0;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(private readonly concurrency: number) {}
+
+  async run<V>(operation: () => Promise<V>): Promise<V> {
+    if (this.active >= this.concurrency) {
+      await new Promise<void>((resolve) => this.waiters.push(resolve));
+    }
+    this.active += 1;
+    try {
+      return await operation();
+    } finally {
+      this.active -= 1;
+      this.waiters.shift()?.();
+    }
+  }
+}
 
 const now = () => Date.now();
 const iso = (t = now()) => new Date(t).toISOString().slice(0, 19).replace('T', ' ');
@@ -72,6 +145,10 @@ function mode(values: Array<string | undefined>): string | undefined {
     counts.set(value, (counts.get(value) ?? 0) + 1);
   }
   return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0];
+}
+
+function agentInventoryGroupKey(agentAssetId: string, agentInstanceId: string): string {
+  return `${agentAssetId}\0${agentInstanceId}`;
 }
 function worstCriticality(values: Array<T.AgentCriticality | undefined>): T.AgentCriticality | undefined {
   const rank: Record<T.AgentCriticality, number> = { low: 1, medium: 2, high: 3, critical: 4 };
@@ -146,6 +223,44 @@ function eventAgentLabel(e: T.JudgedEvent): string {
 
 function eventSessionLabel(e: T.JudgedEvent): string {
   return e.attribution?.agentSessionId?.trim() || eventAgentLabel(e);
+}
+
+function dashboardFactForEvent(e: T.JudgedEvent): DashboardAggregateBucketFact {
+  const final = e.decisionStatus !== undefined && FINAL_DECISION_STATUSES.has(e.decisionStatus);
+  const risky = e.verdict !== 'allow';
+  return {
+    bucketStartMs: Math.floor(e.at / REUSABLE_BUCKET_MS) * REUSABLE_BUCKET_MS,
+    monitored: isMonitoredAgentEvent(e),
+    decisionStatus: e.decisionStatus ?? '',
+    verdict: e.verdict,
+    tier: e.tier,
+    riskType: e.riskType,
+    riskCategory: e.riskCategory,
+    riskName: e.riskName,
+    severityRank: SEV_RANK[e.severity],
+    sessionKey: eventSessionLabel(e),
+    userId: e.userId,
+    workspacePath: attributionWorkspacePath(e),
+    eventCount: 1,
+    blockedCount: final && e.verdict === 'block' ? 1 : 0,
+    escalatedCount: final && e.verdict === 'escalate' ? 1 : 0,
+    l2Count: final && (e.tier === 'Llm' || e.tier === 'Agent') ? 1 : 0,
+    l3Count: final && e.tier === 'Agent' ? 1 : 0,
+    riskActivationCount: final && risky ? 1 : 0,
+    riskyEventCount: risky ? 1 : 0,
+    tokenCount: final ? e.tokenCount : 0,
+    latencyTotal: final ? e.latencyMs : 0,
+    riskScoreTotal: final ? e.riskScore : 0,
+    lastEventAt: e.at,
+    commandDangerCount: risky && e.riskCategory === 'command_danger' ? 1 : 0,
+    promptInjectionCount: risky && e.riskCategory === 'prompt_injection' ? 1 : 0,
+    dataLeakCount: risky && (e.riskCategory === 'data_leak' || e.riskCategory === 'secret_exfil') ? 1 : 0,
+    communicationRiskCount: risky && e.riskCategory === 'communication_risk' ? 1 : 0,
+    systemicRiskCount: risky && (
+      e.riskCategory === 'systemic_risk' ||
+      e.riskCategory === 'privilege_escalation'
+    ) ? 1 : 0,
+  };
 }
 
 function isLoopbackPeer(peer: string): boolean {
@@ -315,6 +430,7 @@ export class AggregationService {
   constructor(
     private readonly judge: SentryJudgeService,
     private readonly agentMetadata: AgentMetadataService,
+    private readonly workspaceDirectory: WorkspaceDirectoryService,
     private readonly maintenance: MaintenanceWindowService,
     private readonly sources: IngestionSourceService,
   ) {}
@@ -325,16 +441,70 @@ export class AggregationService {
   private readonly historyCache = new Map<string, {
     startedAt: number;
     completedAt?: number;
-    failedAt?: number;
+    ttlMs: number;
     value: Promise<DashboardWindowHistory | null>;
   }>();
-  // Two identical HTTP requests otherwise resolve a preset window at slightly different
-  // milliseconds and miss the ClickHouse store's exact-query single-flight key. Coalesce the
-  // complete durable response by request semantics before either request samples Date.now().
-  private durableEventSearchInFlight?: {
-    key: string;
-    value: Promise<T.AgentEventList>;
-  };
+  private readonly agentInstanceMetricsCache = new Map<string, {
+    at: number;
+    value: T.AgentInstanceMetrics;
+  }>();
+  private dashboardHistoryBuckets?: DashboardHistoryBucketCache;
+  private readonly agentHistoryBuckets = new Map<
+    'agent' | 'all',
+    CommitAwareFactBucketCache<StoredAgentBucketFact>
+  >();
+  private topologyHistoryBuckets?: CommitAwareFactBucketCache<StoredTopologyBucketFact>;
+  private readonly workspaceHistoryBuckets = new Map<
+    'agent' | 'all',
+    CommitAwareFactBucketCache<StoredWorkspaceBucketFact>
+  >();
+  // A cold page can request Dashboard, Agent, Workspace and topology history together. Bounding
+  // only those expensive historical reads prevents their ClickHouse aggregation peaks from
+  // stacking while leaving ordinary event ingestion and short boundary reads unconstrained.
+  private readonly historyQueryGate = new BoundedHistoryQueryGate(2);
+
+  historyFactCacheStatus() {
+    const agents = [...this.agentHistoryBuckets.entries()].map(([scope, cache]) => ({
+      scope,
+      ...cache.stats(),
+    }));
+    const workspaces = [...this.workspaceHistoryBuckets.entries()].map(([scope, cache]) => ({
+      scope,
+      ...cache.stats(),
+    }));
+    const caches = [
+      ...(this.dashboardHistoryBuckets
+        ? [{ name: 'dashboard', ...this.dashboardHistoryBuckets.stats() }]
+        : []),
+      ...agents.map((stats) => ({ name: `agents:${stats.scope}`, ...stats })),
+      ...workspaces.map((stats) => ({ name: `workspaces:${stats.scope}`, ...stats })),
+      ...(this.topologyHistoryBuckets
+        ? [{ name: 'topology', ...this.topologyHistoryBuckets.stats() }]
+        : []),
+    ];
+    return {
+      schemaVersion: 'anysentry.history-cache.v1',
+      caches,
+      totals: caches.reduce(
+        (total, cache) => ({
+          buckets: total.buckets + cache.buckets,
+          facts: total.facts + cache.facts,
+          estimatedBytes: total.estimatedBytes + cache.estimatedBytes,
+          evictions: total.evictions + cache.evictions,
+          budgetRejects: total.budgetRejects + cache.budgetRejects,
+          journalResets: total.journalResets + cache.journalResets,
+        }),
+        {
+          buckets: 0,
+          facts: 0,
+          estimatedBytes: 0,
+          evictions: 0,
+          budgetRejects: 0,
+          journalResets: 0,
+        },
+      ),
+    };
+  }
 
   invalidateWindowCache(): void {
     this.winCache.clear();
@@ -345,7 +515,6 @@ export class AggregationService {
 
   private history(filter: T.SecurityTimeFilter): Promise<DashboardWindowHistory | null> {
     const window = resolveTimeWindow(filter);
-    const cached = this.historyCache.get(window.cacheKey);
     const t = now();
     const ttlMs = window.custom
       ? 5 * 60_000
@@ -354,26 +523,11 @@ export class AggregationService {
         : window.spanMs >= 24 * 60 * 60_000
           ? 60_000
           : 30_000;
-    const cachedTtlMs = cached?.failedAt ? 30_000 : ttlMs;
-    if (cached && (cached.completedAt === undefined || t - cached.completedAt < cachedTtlMs)) {
-      // Refresh insertion order so completed entries are evicted least-recently-used.
-      this.historyCache.delete(window.cacheKey);
-      this.historyCache.set(window.cacheKey, cached);
-      return cached.value;
-    }
-    if (cached) this.historyCache.delete(window.cacheKey);
-    while (this.historyCache.size >= MAX_HISTORY_CACHE_ENTRIES) {
-      const completedKey = [...this.historyCache].find(([, entry]) => entry.completedAt !== undefined)?.[0];
-      if (!completedKey) return Promise.resolve(null);
-      this.historyCache.delete(completedKey);
-    }
-    const value = this.judge.dashboardWindowHistory(window.startMs, window.endMs, 180);
-    const entry = {
-      startedAt: t,
-      completedAt: undefined as number | undefined,
-      failedAt: undefined as number | undefined,
-      value,
-    };
+    pruneSnapshotCache(this.historyCache, t, (entry) => entry.ttlMs);
+    const cached = this.historyCache.get(window.cacheKey);
+    if (cached && (cached.completedAt === undefined || t - cached.completedAt < cached.ttlMs)) return cached.value;
+    const value = this.loadDashboardHistory(window);
+    const entry = { startedAt: t, completedAt: undefined as number | undefined, ttlMs, value };
     this.historyCache.set(window.cacheKey, entry);
     void value.then((result) => {
       if (this.historyCache.get(window.cacheKey)?.value !== value) return;
@@ -381,6 +535,58 @@ export class AggregationService {
       if (!result) entry.failedAt = entry.completedAt;
     });
     return value;
+  }
+
+  private async loadDashboardHistory(window: ReturnType<typeof resolveTimeWindow>): Promise<DashboardWindowHistory | null> {
+    // The reusable cache currently targets the high-frequency preset ranges whose two-window
+    // footprint is bounded. Long/custom investigations retain the exact legacy query until their
+    // own persisted aggregate tables are available.
+    if (!window.custom && window.spanMs <= 24 * HOUR) {
+      this.dashboardHistoryBuckets ??= new DashboardHistoryBucketCache({
+        latestCursor: () => this.judge.latestEventCommitCursor(),
+        earliestCursor: () => this.judge.earliestEventCommitCursor(),
+        changes: (after) => this.judge.eventCommitChanges(after),
+        facts: (startMs, endExclusiveMs, bucketMs) =>
+          this.historyQueryGate.run(() =>
+            this.judge.dashboardAggregateBucketFacts(startMs, endExclusiveMs, bucketMs),
+          ),
+      });
+      const tailStartMs = Math.max(
+        window.startMs,
+        Math.floor((window.endMs - DASHBOARD_HOT_TAIL_MS) / REUSABLE_BUCKET_MS) *
+          REUSABLE_BUCKET_MS,
+      );
+      try {
+        const [persistedTail, hotTail] = await Promise.all([
+          this.judge.dashboardTailEvents(tailStartMs, window.endMs),
+          Promise.resolve(this.judge.queryRange(tailStartMs, window.endMs)),
+        ]);
+        if (persistedTail === null) throw new Error('persisted dashboard tail unavailable');
+        const tailFacts = foldLatestEventRevisions([...persistedTail, ...hotTail])
+          .filter((event) => event.at >= tailStartMs && event.at <= window.endMs)
+          .map(dashboardFactForEvent);
+        const history = await this.dashboardHistoryBuckets.readWithTail(
+          window.startMs,
+          window.endMs,
+          180,
+          tailStartMs,
+          tailFacts,
+        );
+        if (history) return history;
+      } catch (error) {
+        console.warn(
+          `[dashboard] reusable history unavailable; using exact fallback: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      return this.historyQueryGate.run(() =>
+        this.judge.dashboardWindowHistory(window.startMs, window.endMs, 180),
+      );
+    }
+    return this.historyQueryGate.run(() =>
+      this.judge.dashboardWindowHistory(window.startMs, window.endMs, 180),
+    );
   }
 
   private currentDimensions(history: DashboardWindowHistory, filter: T.SecurityTimeFilter): DashboardWindowDimensionRow[] {
@@ -525,6 +731,7 @@ export class AggregationService {
       decisionStatus: e.decisionStatus,
       evaluationId: e.evaluationId,
       policyVersion: e.policyVersion,
+      decisionRevision: e.decisionRevision,
       decisionUpdatedAt: e.decisionUpdatedAt,
       verdict: e.verdict,
       tier: e.tier,
@@ -546,6 +753,70 @@ export class AggregationService {
     };
   }
 
+  private queryCoverage(
+    filter: T.SecurityTimeFilter,
+    events: T.JudgedEvent[],
+    input: {
+      source: T.QueryDataSource;
+      totalMode: T.QueryTotalMode;
+      partial: boolean;
+      partialReason?: T.QueryCoverage['partialReason'];
+      committedCutoffMs?: number;
+      dataFromMs?: number;
+      dataToMs?: number;
+    },
+  ): T.QueryCoverage {
+    const window = resolveTimeWindow(filter);
+    const eventTimes = events.map((event) => event.at);
+    if (input.dataFromMs !== undefined) eventTimes.push(input.dataFromMs);
+    if (input.dataToMs !== undefined) eventTimes.push(input.dataToMs);
+    const snapshotAsOf = new Date(window.endMs).toISOString();
+    const queryIdentity = filter as T.SecurityTimeFilter & {
+      sourceId?: string;
+      collectorId?: string;
+    };
+    const progress = relevantCommitProgress(
+      this.judge.committedEventProgress(),
+      queryIdentity,
+    );
+    const observedThroughMs = observedDurableThrough(
+      input.committedCutoffMs,
+      progress,
+    );
+    const observedThrough = observedThroughMs === undefined
+      ? undefined
+      : new Date(Math.min(observedThroughMs, window.endMs)).toISOString();
+    return {
+      requestedFrom: new Date(window.startMs).toISOString(),
+      requestedTo: snapshotAsOf,
+      snapshotAsOf,
+      asOf: snapshotAsOf,
+      dataFrom: eventTimes.length ? new Date(Math.min(...eventTimes)).toISOString() : undefined,
+      dataTo: eventTimes.length ? new Date(Math.max(...eventTimes)).toISOString() : undefined,
+      observedDurableThrough: observedThrough,
+      committedCutoff: observedThrough,
+      commitBoundaryKind: observedThrough ? 'observed_durable_high_water' : undefined,
+      commitProgress: progress.entries.map((entry) => ({
+        sourceId: entry.sourceId,
+        collectorId: entry.collectorId,
+        committedEventTime: new Date(entry.committedEventTimeMs).toISOString(),
+        committedAt: new Date(entry.committedAtMs).toISOString(),
+      })),
+      commitProgressScope: progress.scope,
+      lateDataPolicy: input.source === 'memory_hot_ring'
+        ? undefined
+        : 'commit_journal_revision_repair',
+      completeness: input.partial ? 'partial' : 'exact_as_observed',
+      // A real event-time watermark is not yet available from every collector/partition. Do not
+      // present ClickHouse's latest timestamp as a watermark.
+      watermark: undefined,
+      partial: input.partial,
+      partialReason: input.partialReason,
+      source: input.source,
+      totalMode: input.totalMode,
+    };
+  }
+
   private filterEvents(events: T.JudgedEvent[], filter: T.AgentEventQuery): T.JudgedEvent[] {
     const pinnedEventId = filter.eventId?.trim();
     const sourceId = filter.sourceId?.trim();
@@ -555,12 +826,13 @@ export class AggregationService {
     const agentAssetId = requestedAgentAssetId
       ? this.agentMetadata.canonicalAgentAssetId(requestedAgentAssetId)
       : undefined;
+    const agentInstanceId = filter.agentInstanceId?.trim();
     const sessionId = filter.sessionId?.trim();
     const workspacePath = filter.workspacePath?.trim();
     const traceId = filter.traceId?.trim();
     const runId = filter.runId?.trim();
     const q = filter.q?.trim().toLowerCase();
-    const hasFilter = Boolean(sourceId || collectorId || agentId || agentAssetId || sessionId || workspacePath || traceId || runId || filter.eventKind || filter.eventCategory || filter.verdict || filter.tier || q);
+    const hasFilter = Boolean(sourceId || collectorId || agentId || agentAssetId || agentInstanceId || sessionId || workspacePath || traceId || runId || filter.eventKind || filter.eventCategory || filter.verdict || filter.tier || q);
     const agentScoped = filter.scope === 'agent' && !pinnedEventId;
     const includeUnknown = filter.includeUnknown !== false;
     // Process lifecycle rows remain stored for audit/debugging, but are hidden from both the
@@ -607,6 +879,7 @@ export class AggregationService {
         matchesScope &&
         matchesDirectFilter &&
         (!agentAssetId || resolved.agentAssetId === agentAssetId) &&
+        (!agentInstanceId || agentRuntimeInstanceIdForEvent(e) === agentInstanceId) &&
         (
           !q ||
           [
@@ -636,6 +909,36 @@ export class AggregationService {
     return {
       items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) => this.eventItem(event, repeatCount, lastAt)),
       total: compacted.length,
+      totalMode: 'exact',
+      coverage: this.queryCoverage(filter, filtered, {
+        source: 'memory_hot_ring',
+        totalMode: 'exact',
+        partial: true,
+        partialReason: 'hot_ring_only',
+      }),
+      updateTime: iso(),
+    };
+  }
+
+  agentEventsPreview(filter: T.AgentEventQuery): T.AgentEventList {
+    const window = resolveTimeWindow(filter);
+    const limit = Math.max(1, Math.min(200, filter.limit ?? 40));
+    const scanLimit = Math.min(4_000, Math.max(800, limit * 20));
+    const recent = this.judge.queryRecentRange(window.startMs, window.endMs, scanLimit);
+    const filtered = this.filterEvents(recent, filter).sort((a, b) => b.at - a.at);
+    const compacted = filter.scope === 'raw'
+      ? filtered.map((event) => ({ event, repeatCount: 1, lastAt: event.at }))
+      : compactEvents(filtered);
+    return {
+      items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) => this.eventItem(event, repeatCount, lastAt)),
+      total: compacted.length,
+      totalMode: 'estimated',
+      coverage: this.queryCoverage(filter, filtered, {
+        source: 'memory_hot_ring',
+        totalMode: 'estimated',
+        partial: true,
+        partialReason: 'hot_ring_only',
+      }),
       updateTime: iso(),
     };
   }
@@ -672,7 +975,14 @@ export class AggregationService {
     return {
       items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) => this.eventItem(event, repeatCount, lastAt)),
       total,
-      totalApproximate: totalApproximate ? true : undefined,
+      totalMode: rows.length ? 'exact' : 'estimated',
+      coverage: this.queryCoverage(filter, filtered, {
+        source: 'clickhouse',
+        totalMode: rows.length ? 'exact' : 'estimated',
+        partial: persisted.length >= Math.max(1_000, limit * 10),
+        partialReason: persisted.length >= Math.max(1_000, limit * 10) ? 'scan_limit' : undefined,
+        committedCutoffMs: this.judge.committedEventCutoffMs(),
+      }),
       updateTime: iso(),
     };
   }
@@ -704,57 +1014,123 @@ export class AggregationService {
       return { ...this.agentEvents(filter), totalApproximate: true, storageFallback: 'hot_ring' };
     }
     const pinnedEventId = filter.eventId?.trim();
-    const { sinceMs } = this.win(filter);
-    const customEnd = filter.timeType === 'custom' && filter.endTime ? Date.parse(filter.endTime) : Number.NaN;
-    const dateOnlyEnd = Boolean(filter.endTime && /^\d{4}-\d{2}-\d{2}$/u.test(filter.endTime));
-    const untilMs = Number.isFinite(customEnd) ? customEnd + (dateOnlyEnd ? 24 * HOUR - 1 : 0) : now();
+    const window = resolveTimeWindow(filter);
     const limit = Math.max(1, Math.min(200, filter.limit ?? 40));
-    // Keep enough durable candidates for post-query text/identity filtering, but never ask the
-    // store to materialize more than the explicitly tested 10k-row bound.
-    const persistentLimit = Math.min(10_000, Math.max(2_000, limit * 50));
-    const persistent = await this.judge.searchStoredEvents({
-      sinceMs: pinnedEventId ? 0 : sinceMs,
-      // A pinned evidence deep link takes precedence over the list's current filters and custom
-      // window, matching filterEvents/agentEvents. Only eventId may be pushed down in that case.
-      untilMs: pinnedEventId ? now() : untilMs,
+    const scanLimit = Math.min(20_000, Math.max(2_000, limit * 50));
+    const committedCutoffMs = this.judge.committedEventCutoffMs();
+    const plan = planDashboardRead(window.startMs, window.endMs, committedCutoffMs);
+    const persistedUntilMs = plan.persistedUntilMs ?? window.endMs;
+    const persistentPage = await this.judge.searchStoredEventsPage({
+      sinceMs: pinnedEventId ? 0 : window.startMs,
+      untilMs: pinnedEventId ? window.endMs : persistedUntilMs,
       eventId: pinnedEventId,
-      sourceId: pinnedEventId ? undefined : filter.sourceId,
-      collectorId: pinnedEventId ? undefined : filter.collectorId,
-      agentId: pinnedEventId ? undefined : filter.agentId,
-      sessionId: pinnedEventId ? undefined : filter.sessionId,
-      workspacePath: pinnedEventId ? undefined : filter.workspacePath,
-      traceId: pinnedEventId ? undefined : filter.traceId,
-      runId: pinnedEventId ? undefined : filter.runId,
-      eventKind: pinnedEventId ? undefined : filter.eventKind,
-      eventCategory: pinnedEventId ? undefined : filter.eventCategory,
-      verdict: pinnedEventId ? undefined : filter.verdict,
-      tier: pinnedEventId ? undefined : filter.tier,
-      limit: persistentLimit,
+      sourceId: filter.sourceId,
+      collectorId: filter.collectorId,
+      agentId: filter.agentAssetId ? undefined : filter.agentId,
+      agentInstanceId: filter.agentInstanceId,
+      sessionId: filter.sessionId,
+      workspacePath: filter.agentAssetId ? undefined : filter.workspacePath,
+      traceId: filter.traceId,
+      runId: filter.runId,
+      eventKind: filter.eventKind,
+      eventCategory: filter.eventCategory,
+      verdict: filter.verdict,
+      tier: filter.tier,
+      limit: scanLimit,
     });
-    // Buffered writes may not have reached ClickHouse yet. Merge the hot ring and prefer the most
-    // recent lifecycle revision without mutating either immutable source record.
-    const latest = new Map<string, T.JudgedEvent>();
-    const hotEvents = pinnedEventId ? this.judge.query(0) : this.judge.queryRange(sinceMs, untilMs);
-    for (const event of [...(persistent ?? []), ...hotEvents]) {
-      const previous = latest.get(event.eventId);
-      if (!previous || (event.decisionUpdatedAt ?? event.at) >= (previous.decisionUpdatedAt ?? previous.at)) {
-        latest.set(event.eventId, event);
-      }
+    if (persistentPage.unavailable) {
+      return this.agentEvents(filter);
     }
-    const filtered = this.filterEvents([...latest.values()], filter).sort((a, b) =>
+    // A collector/partition event-time watermark is not available yet. Query the bounded hot
+    // overlap defensively and remove overlap by stable eventId before aggregation. Splitting only
+    // at max(at) would lose a late event that is buffered with an event time below that maximum.
+    const hot = this.judge.queryRange(pinnedEventId ? 0 : plan.hotFromMs, window.endMs);
+    const folded = foldLatestEventRevisions([...persistentPage.events, ...hot]);
+    const filtered = this.filterEvents(folded, filter).sort((a, b) =>
       Number(Boolean(pinnedEventId) && b.eventId === pinnedEventId) - Number(Boolean(pinnedEventId) && a.eventId === pinnedEventId) ||
       b.at - a.at,
     );
     const compacted = filter.scope === 'raw' || pinnedEventId
       ? filtered.map((event) => ({ event, repeatCount: 1, lastAt: event.at }))
       : compactEvents(filtered);
+    const totalMode: T.QueryTotalMode = persistentPage.hasMore ? 'estimated' : 'exact';
     return {
       items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) => this.eventItem(event, repeatCount, lastAt)),
       total: compacted.length,
-      // Durable search is deliberately a bounded primary-key sample; a failed/busy read falls
-      // back to the hot ring. Never present either result as an exact all-window total.
-      totalApproximate: !pinnedEventId || persistent === null || persistent.length >= persistentLimit ? true : undefined,
-      storageFallback: persistent === null ? 'hot_ring' : undefined,
+      totalMode,
+      coverage: this.queryCoverage(filter, filtered, {
+        source: hot.length ? 'clickhouse+hot_delta' : 'clickhouse',
+        totalMode,
+        partial: persistentPage.hasMore,
+        partialReason: persistentPage.hasMore ? 'scan_limit' : undefined,
+        committedCutoffMs: persistentPage.committedCutoffMs,
+      }),
+      updateTime: iso(),
+    };
+  }
+
+  async storedAgentTimeline(filter: T.AgentEventQuery): Promise<T.AgentTimeline> {
+    if (!this.judge.storageStatus().clickhouseReady) {
+      const fallback = this.agentTimeline(filter);
+      return fallback;
+    }
+    const window = resolveTimeWindow(filter);
+    const limit = Math.max(1, Math.min(5_000, filter.limit ?? 240));
+    const pinnedEventId = filter.eventId?.trim();
+    const pinnedPage = pinnedEventId
+      ? await this.judge.searchStoredEventsPage({
+          sinceMs: 0,
+          untilMs: window.endMs,
+          eventId: pinnedEventId,
+          limit: 1,
+        })
+      : undefined;
+    const pinned = pinnedPage?.events[0] ?? (pinnedEventId ? this.judge.findEvent(pinnedEventId) : undefined);
+    const traceId = filter.traceId?.trim() || pinned?.traceId;
+    const effectiveFilter: T.AgentEventQuery = {
+      ...filter,
+      eventId: undefined,
+      traceId,
+    };
+    const committedCutoffMs = this.judge.committedEventCutoffMs();
+    const plan = planDashboardRead(window.startMs, window.endMs, committedCutoffMs);
+    const persistedUntilMs = plan.persistedUntilMs ?? window.endMs;
+    const persistentPage = await this.judge.searchStoredEventsPage({
+      sinceMs: window.startMs,
+      untilMs: persistedUntilMs,
+      traceId,
+      runId: traceId ? undefined : filter.runId,
+      sessionId: traceId || filter.runId ? undefined : filter.sessionId,
+      agentInstanceId: traceId || filter.runId || filter.sessionId
+        ? undefined
+        : filter.agentInstanceId,
+      limit,
+    });
+    if (persistentPage.unavailable) {
+      return this.agentTimeline(filter);
+    }
+    // See storedAgentEvents: until collector-scoped watermarks exist, overlap is safer than
+    // event-time splitting and is removed before building the ordered timeline.
+    const hot = this.judge.queryRange(plan.hotFromMs, window.endMs);
+    const folded = foldLatestEventRevisions([...persistentPage.events, ...hot]);
+    const filtered = this.filterEvents(folded, effectiveFilter).sort((a, b) => a.at - b.at);
+    const visible = filtered.slice(-limit);
+    const head = visible[0];
+    const hasMore = persistentPage.hasMore || filtered.length > limit;
+    return {
+      traceId: traceId ?? head?.traceId ?? '',
+      runId: filter.runId ?? head?.runId,
+      sessionId: filter.sessionId ?? head?.sessionId,
+      items: visible.map((event) => this.eventItem(event)),
+      total: filtered.length,
+      hasMore,
+      coverage: this.queryCoverage(filter, visible, {
+        source: hot.length ? 'clickhouse+hot_delta' : 'clickhouse',
+        totalMode: hasMore ? 'estimated' : 'exact',
+        partial: hasMore,
+        partialReason: hasMore ? 'scan_limit' : undefined,
+        committedCutoffMs: persistentPage.committedCutoffMs,
+      }),
       updateTime: iso(),
     };
   }
@@ -772,6 +1148,14 @@ export class AggregationService {
       runId: filter.runId ?? head?.runId,
       sessionId: filter.sessionId ?? head?.sessionId,
       items: filtered.map((e) => this.eventItem(e)),
+      total: filtered.length,
+      hasMore: false,
+      coverage: this.queryCoverage(filter, filtered, {
+        source: 'memory_hot_ring',
+        totalMode: 'exact',
+        partial: true,
+        partialReason: 'hot_ring_only',
+      }),
       updateTime: iso(),
     };
   }
@@ -848,6 +1232,232 @@ export class AggregationService {
     const events = filter.scope === 'agent'
       ? window.events.filter((event) => event.attribution?.monitored === true)
       : window.events;
+    return this.agentInventoryFromEvents(filter, events);
+  }
+
+  private agentFactForEvent(event: T.JudgedEvent): StoredAgentWindowFact {
+    const risky = event.verdict !== 'allow';
+    const instanceKey = agentRuntimeInstanceIdForEvent(event);
+    const categoryCounts = Object.fromEntries(EVENT_CATEGORIES.map((category) => [
+      category,
+      event.eventCategory === category ? 1 : 0,
+    ]));
+    const sourceCounts = Object.fromEntries(EVENT_SOURCES.map((source) => [
+      source,
+      event.source === source ? 1 : 0,
+    ]));
+    return {
+      identityKey: event.eventId,
+      representativeEvent: event,
+      firstSeenAt: event.at,
+      lastSeenAt: event.at,
+      eventCount: 1,
+      riskyEventCount: risky ? 1 : 0,
+      sessionCount: 1,
+      runCount: 1,
+      traceCount: 1,
+      sessionKeys: [event.sessionId],
+      runKeys: [event.runId],
+      traceKeys: [event.traceId],
+      collectorKeys: eventCollectorId(event) ? [eventCollectorId(event)] : [],
+      eventsWithoutCollector: eventCollectorId(event) ? 0 : 1,
+      tokenCount: event.tokenCount,
+      latencyTotal: event.latencyMs,
+      instanceCount: 1,
+      instanceKeys: [instanceKey],
+      worstSeverityRank: risky ? SEV_RANK[event.severity] : 0,
+      topRiskAt: risky ? event.at : undefined,
+      topRiskCategory: risky ? event.riskCategory : undefined,
+      topRiskName: risky ? event.riskName : undefined,
+      eventCategoryCounts: categoryCounts,
+      sourceCounts,
+      hasPhysicalIdentity: Boolean(
+        event.attribution?.physicalWorkloadId ||
+        event.attribution?.agentInstanceId ||
+        event.attribution?.workloadRef?.podUid,
+      ),
+      hasRootIdentity: Boolean(event.attribution?.rootStartTime) && hasDirectAgentRootEvidence(event),
+    };
+  }
+
+  private mergeAgentFacts(a: StoredAgentWindowFact, b: StoredAgentWindowFact): StoredAgentWindowFact {
+    const newest = a.lastSeenAt >= b.lastSeenAt ? a : b;
+    const latestRisk = (b.topRiskAt ?? 0) >= (a.topRiskAt ?? 0) ? b : a;
+    const sessionKeys = [...new Set([...a.sessionKeys, ...b.sessionKeys])];
+    const runKeys = [...new Set([...a.runKeys, ...b.runKeys])];
+    const traceKeys = [...new Set([...a.traceKeys, ...b.traceKeys])];
+    const collectorKeys = [...new Set([...a.collectorKeys, ...b.collectorKeys])];
+    const instanceKeys = [...new Set([...a.instanceKeys, ...b.instanceKeys])];
+    const eventCategoryCounts: Record<string, number> = {};
+    for (const category of EVENT_CATEGORIES) {
+      eventCategoryCounts[category] =
+        (a.eventCategoryCounts[category] ?? 0) +
+        (b.eventCategoryCounts[category] ?? 0);
+    }
+    const sourceCounts: Record<string, number> = {};
+    for (const source of EVENT_SOURCES) {
+      sourceCounts[source] =
+        (a.sourceCounts[source] ?? 0) +
+        (b.sourceCounts[source] ?? 0);
+    }
+    return {
+      identityKey: newest.identityKey,
+      representativeEvent: newest.representativeEvent,
+      firstSeenAt: Math.min(a.firstSeenAt, b.firstSeenAt),
+      lastSeenAt: Math.max(a.lastSeenAt, b.lastSeenAt),
+      eventCount: a.eventCount + b.eventCount,
+      riskyEventCount: a.riskyEventCount + b.riskyEventCount,
+      sessionCount: sessionKeys.length,
+      runCount: runKeys.length,
+      traceCount: traceKeys.length,
+      sessionKeys,
+      runKeys,
+      traceKeys,
+      collectorKeys,
+      eventsWithoutCollector: a.eventsWithoutCollector + b.eventsWithoutCollector,
+      tokenCount: a.tokenCount + b.tokenCount,
+      latencyTotal: a.latencyTotal + b.latencyTotal,
+      instanceCount: instanceKeys.length,
+      instanceKeys,
+      worstSeverityRank: Math.max(a.worstSeverityRank, b.worstSeverityRank),
+      topRiskAt: latestRisk.topRiskAt,
+      topRiskCategory: latestRisk.topRiskCategory,
+      topRiskName: latestRisk.topRiskName,
+      eventCategoryCounts,
+      sourceCounts,
+      hasPhysicalIdentity: a.hasPhysicalIdentity || b.hasPhysicalIdentity,
+      hasRootIdentity: a.hasRootIdentity || b.hasRootIdentity,
+    };
+  }
+
+  async storedAgentInventory(filter: T.AgentInventoryQuery): Promise<T.AgentInventory> {
+    if (!this.judge.storageStatus().clickhouseReady) return this.agentInventory(filter);
+    const window = resolveTimeWindow(filter);
+    const committedCutoffMs = this.judge.committedEventCutoffMs();
+    if (committedCutoffMs === undefined) return this.agentInventory(filter);
+    const plan = planDashboardRead(window.startMs, window.endMs, committedCutoffMs);
+    const persistedUntilMs = plan.persistedUntilMs ?? window.endMs;
+    const hotEvents = foldLatestEventRevisions(
+      this.judge.queryRange(plan.hotFromMs, window.endMs)
+        .filter((event) => filter.scope !== 'agent' || event.attribution?.monitored === true),
+    );
+    const overlapEventIds = hotEvents
+      .filter((event) => event.at <= persistedUntilMs)
+      .map((event) => event.eventId);
+    let persisted: StoredAgentWindowFact[] | null;
+    const slices = reusableFactSlices(window.startMs, persistedUntilMs, plan.hotFromMs);
+    if (
+      !window.custom &&
+      window.spanMs <= 24 * HOUR &&
+      slices.fullEndExclusiveMs > slices.fullStartMs
+    ) {
+      const scope = filter.scope === 'agent' ? 'agent' : 'all';
+      let cache = this.agentHistoryBuckets.get(scope);
+      if (!cache) {
+        cache = new CommitAwareFactBucketCache<StoredAgentBucketFact>({
+          latestCursor: () => this.judge.latestEventCommitCursor(),
+          earliestCursor: () => this.judge.earliestEventCommitCursor(),
+          changes: (after) => this.judge.eventCommitChanges(after),
+          facts: (startMs, endExclusiveMs, bucketMs) =>
+            this.historyQueryGate.run(() =>
+              this.judge.agentWindowBucketFacts(
+                startMs,
+                endExclusiveMs,
+                bucketMs,
+                scope === 'agent',
+              ),
+            ),
+        });
+        this.agentHistoryBuckets.set(scope, cache);
+      }
+      const [stableFacts, headFacts, tailFacts] = await Promise.all([
+        cache.read(slices.fullStartMs, slices.fullEndExclusiveMs).catch((error) => {
+          console.warn(
+            `[agents] reusable history unavailable; using exact fallback: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          return null;
+        }),
+        slices.head
+          ? this.historyQueryGate.run(() =>
+              this.judge.agentWindowFacts(
+                slices.head!.startMs,
+                slices.head!.endMs,
+                scope === 'agent',
+                overlapEventIds,
+              ),
+            )
+          : Promise.resolve([]),
+        slices.tail
+          ? this.historyQueryGate.run(() =>
+              this.judge.agentWindowFacts(
+                slices.tail!.startMs,
+                slices.tail!.endMs,
+                scope === 'agent',
+                overlapEventIds,
+              ),
+            )
+          : Promise.resolve([]),
+      ]);
+      persisted = stableFacts && headFacts && tailFacts
+        ? [...headFacts, ...stableFacts, ...tailFacts]
+        : null;
+      if (!persisted) {
+        persisted = await this.historyQueryGate.run(() =>
+          this.judge.agentWindowFacts(
+            window.startMs,
+            persistedUntilMs,
+            filter.scope === 'agent',
+            overlapEventIds,
+          ),
+        );
+      }
+    } else {
+      persisted = await this.historyQueryGate.run(() =>
+        this.judge.agentWindowFacts(
+          window.startMs,
+          persistedUntilMs,
+          filter.scope === 'agent',
+          overlapEventIds,
+        ),
+      );
+    }
+    if (!persisted) return this.agentInventory(filter);
+
+    const allFacts = [
+      ...persisted,
+      ...hotEvents.map((event) => this.agentFactForEvent(event)),
+    ];
+    const factsByInstance = new Map<string, StoredAgentWindowFact>();
+    for (const fact of allFacts) {
+      const assetId = this.agentMetadata.resolveEvent(fact.representativeEvent).agentAssetId;
+      const instanceId = agentRuntimeInstanceIdForEvent(fact.representativeEvent);
+      const groupKey = agentInventoryGroupKey(assetId, instanceId);
+      const current = factsByInstance.get(groupKey);
+      factsByInstance.set(groupKey, current ? this.mergeAgentFacts(current, fact) : fact);
+    }
+    const result = this.agentInventoryFromEvents(
+      filter,
+      [...factsByInstance.values()].map((fact) => fact.representativeEvent),
+      factsByInstance,
+    );
+    result.coverage = this.queryCoverage(filter, [...factsByInstance.values()].map((fact) => fact.representativeEvent), {
+      source: hotEvents.length ? 'clickhouse+hot_delta' : 'clickhouse',
+      totalMode: 'exact',
+      partial: false,
+      committedCutoffMs,
+      dataFromMs: allFacts.length ? Math.min(...allFacts.map((fact) => fact.firstSeenAt)) : undefined,
+      dataToMs: allFacts.length ? Math.max(...allFacts.map((fact) => fact.lastSeenAt)) : undefined,
+    });
+    return result;
+  }
+
+  private agentInventoryFromEvents(
+    filter: T.AgentInventoryQuery,
+    events: T.JudgedEvent[],
+    factsByInstance?: Map<string, StoredAgentWindowFact>,
+  ): T.AgentInventory {
     const q = filter.q?.trim().toLowerCase();
     const owner = filter.owner?.trim().toLowerCase();
     const environment = filter.environment?.trim().toLowerCase();
@@ -857,19 +1467,23 @@ export class AggregationService {
     const agentAssetId = requestedAgentAssetId
       ? this.agentMetadata.canonicalAgentAssetId(requestedAgentAssetId)
       : undefined;
+    const agentInstanceId = filter.agentInstanceId?.trim();
     const workspacePath = filter.workspacePath?.trim();
     const hasFilter = Boolean((filter.healthState && filter.healthState !== 'all') || (filter.criticality && filter.criticality !== 'all') || owner || environment || tag || q || filter.userId);
-    const shouldScopeExactAgent = Boolean((agentAssetId || agentId) && !hasFilter);
+    const shouldScopeExactAgent = Boolean((agentAssetId || agentId || agentInstanceId) && !hasFilter);
     const byAgent = new Map<string, T.JudgedEvent[]>();
     for (const e of events) {
-      if (shouldScopeExactAgent && !agentAssetId && e.agentId !== agentId && e.attribution?.agentScopeId !== agentId) continue;
+      if (shouldScopeExactAgent && !agentAssetId && agentId && e.agentId !== agentId && e.attribution?.agentScopeId !== agentId) continue;
       // A canonical asset selection identifies the workload. Legacy display fields must not
       // reject its raw events before metadata/alias resolution.
       if (!agentAssetId && workspacePath && e.workspacePath !== workspacePath) continue;
       if (!agentId && filter.userId && e.userId !== filter.userId) continue;
       const resolved = this.agentMetadata.resolveEvent(e);
       if (agentAssetId && resolved.agentAssetId !== agentAssetId) continue;
-      (byAgent.get(resolved.agentAssetId) ?? byAgent.set(resolved.agentAssetId, []).get(resolved.agentAssetId)!).push(e);
+      const runtimeInstanceId = agentRuntimeInstanceIdForEvent(e);
+      if (agentInstanceId && runtimeInstanceId !== agentInstanceId) continue;
+      const groupKey = agentInventoryGroupKey(resolved.agentAssetId, runtimeInstanceId);
+      (byAgent.get(groupKey) ?? byAgent.set(groupKey, []).get(groupKey)!).push(e);
     }
 
     const openIncidents = new Map<string, number>();
@@ -881,16 +1495,69 @@ export class AggregationService {
     }
 
     const t = now();
-    const eventBackedItems = [...byAgent.entries()].map(([assetId, evs]): T.AgentInventoryItem => {
+    const visibleAgentGroups = [...byAgent.entries()].filter(([groupKey, evs]) => {
+      if (shouldScopeExactAgent) return true;
+      const identityEvent =
+        [...evs].reverse().find((event) => Boolean(event.attribution?.classification)) ??
+        evs.at(-1);
+      if (!identityEvent) return false;
+      const resolved = this.agentMetadata.resolveEvent(identityEvent);
+      if (resolved.effectiveClassification !== 'probable_agent') return true;
+      if (resolved.metadata?.reviewDecision) return true;
+      if (
+        resolved.metadata?.displayName ||
+        resolved.metadata?.owner ||
+        resolved.metadata?.team ||
+        resolved.metadata?.environment ||
+        resolved.metadata?.note ||
+        resolved.metadata?.tags?.length
+      ) return true;
+      const fact = factsByInstance?.get(groupKey);
+      if (fact?.hasPhysicalIdentity || evs.some((event) =>
+        Boolean(
+          event.attribution?.physicalWorkloadId ||
+          event.attribution?.agentInstanceId ||
+          event.attribution?.workloadRef?.podUid,
+        )
+      )) return true;
+      if (
+        (
+          fact?.hasRootIdentity &&
+          Boolean(fact.representativeEvent.attribution?.rootStartTime) &&
+          hasDirectAgentRootEvidence(fact.representativeEvent)
+        ) ||
+        evs.some((event) =>
+          Boolean(event.attribution?.rootStartTime) && hasDirectAgentRootEvidence(event)
+        )
+      ) return true;
+      return evs.some((event) =>
+        ['self_register', 'manual_review']
+          .includes(event.attribution?.source ?? '')
+      );
+    });
+
+    const logicalInstanceCounts = new Map<string, number>();
+    for (const [, evs] of visibleAgentGroups) {
+      const identityEvent = evs.at(-1);
+      if (!identityEvent) continue;
+      const assetId = this.agentMetadata.resolveEvent(identityEvent).agentAssetId;
+      logicalInstanceCounts.set(assetId, (logicalInstanceCounts.get(assetId) ?? 0) + 1);
+    }
+
+    const eventBackedItems = visibleAgentGroups.map(([groupKey, evs]): T.AgentInventoryItem => {
       const sorted = [...evs].sort((a, b) => a.at - b.at);
+      const fact = factsByInstance?.get(groupKey);
       const first = sorted[0];
       const last = sorted[sorted.length - 1];
       const risky = sorted.filter((e) => e.verdict !== 'allow');
-      const lvl = worstLevel(sorted);
+      const lvl = fact
+        ? levelByRank(fact.worstSeverityRank)
+        : worstLevel(sorted);
       const identityEvent =
         [...sorted].reverse().find((event) => Boolean(event.attribution?.classification)) ??
         last;
       const resolved = this.agentMetadata.resolveEvent(identityEvent);
+      const assetId = resolved.agentAssetId;
       const detected = detectedAgentIdentity(identityEvent);
       const metadata = resolved.metadata;
       const attribution = identityEvent.attribution;
@@ -907,7 +1574,20 @@ export class AggregationService {
         (total, incidentKey) => total + (openIncidents.get(incidentKey) ?? 0),
         0,
       );
-      const sinceLast = t - last.at;
+      const sinceLast = t - (fact?.lastSeenAt ?? last.at);
+      const rootExit = [...sorted].reverse().find((event) =>
+        event.eventKind === 'ProcessExit' &&
+        Boolean(event.attribution?.rootPid) &&
+        event.process?.pid === event.attribution?.rootPid
+      );
+      const terminatedAt = rootExit && !sorted.some((event) => event.at > rootExit.at)
+        ? rootExit.at
+        : undefined;
+      const lifecycleState: T.AgentLifecycleState = terminatedAt !== undefined
+        ? 'terminated'
+        : sinceLast <= ACTIVE_MS
+          ? 'current'
+          : 'historical';
       const healthState: T.AgentHealthState = openIncidentCount > 0
         ? 'risky'
         : sinceLast <= ACTIVE_MS
@@ -915,31 +1595,27 @@ export class AggregationService {
           : sinceLast <= STALE_MS
             ? 'idle'
             : 'stale';
-      const categoryCounts = Object.fromEntries(EVENT_CATEGORIES.map((category) => [category, 0])) as Record<T.EventCategory, number>;
-      const sourceCounts = Object.fromEntries(EVENT_SOURCES.map((source) => [source, 0])) as Record<T.EventSource, number>;
+      const categoryCounts = Object.fromEntries(EVENT_CATEGORIES.map((category) => [
+        category,
+        fact?.eventCategoryCounts[category] ?? 0,
+      ])) as Record<T.EventCategory, number>;
+      const sourceCounts = Object.fromEntries(EVENT_SOURCES.map((source) => [
+        source,
+        fact?.sourceCounts[source] ?? 0,
+      ])) as Record<T.EventSource, number>;
       const topRisk = new Map<string, { count: number; name: string }>();
-      for (const e of sorted) {
-        categoryCounts[e.eventCategory] = (categoryCounts[e.eventCategory] ?? 0) + 1;
-        sourceCounts[e.source] = (sourceCounts[e.source] ?? 0) + 1;
-        if (e.verdict !== 'allow') {
-          const cur = topRisk.get(e.riskCategory);
-          topRisk.set(e.riskCategory, { count: (cur?.count ?? 0) + 1, name: e.riskName });
+      if (!fact) {
+        for (const e of sorted) {
+          categoryCounts[e.eventCategory] = (categoryCounts[e.eventCategory] ?? 0) + 1;
+          sourceCounts[e.source] = (sourceCounts[e.source] ?? 0) + 1;
+          if (e.verdict !== 'allow') {
+            const cur = topRisk.get(e.riskCategory);
+            topRisk.set(e.riskCategory, { count: (cur?.count ?? 0) + 1, name: e.riskName });
+          }
         }
       }
       const top = [...topRisk.entries()].sort((a, b) => b[1].count - a[1].count)[0];
-      const instanceCount = distinct(sorted.map((event) =>
-        event.attribution?.agentInstanceId ??
-        event.attribution?.physicalWorkloadId ??
-        (
-          event.attribution?.rootPid
-            ? [
-                event.process?.hostId ?? 'host',
-                event.process?.bootId ?? 'boot',
-                event.attribution.rootPid,
-              ].join(':')
-            : `${event.sessionId}:${event.process?.pid ?? event.agentId}`
-        )
-      ));
+      const runtimeInstanceId = agentRuntimeInstanceIdForEvent(identityEvent);
       return {
         agentId: itemAgentId,
         agentAssetId: assetId,
@@ -959,7 +1635,8 @@ export class AggregationService {
         classification,
         runtime: detected.runtime,
         locationLabel: detected.locationLabel,
-        instanceCount,
+        instanceCount: 1,
+        logicalInstanceCount: logicalInstanceCounts.get(assetId) ?? 1,
         confidence: reviewed ? 1 : attribution?.confidence ?? 0,
         attributionSource: reviewed ? 'manual_review' : attribution?.source ?? 'none',
         attributionEvidence: reviewed
@@ -969,9 +1646,13 @@ export class AggregationService {
               ...(metadata?.reviewedBy ? [`manual_review:reviewer=${metadata.reviewedBy}`] : []),
             ].slice(-16)
           : attribution?.evidence ?? [],
-        physicalWorkloadId: metadata?.reviewPhysicalWorkloadId ?? attribution?.physicalWorkloadId,
-        agentInstanceId: metadata?.reviewAgentInstanceId ?? attribution?.agentInstanceId,
-        workloadRef: metadata?.reviewWorkloadRef ?? attribution?.workloadRef,
+        physicalWorkloadId: attribution?.physicalWorkloadId ?? metadata?.reviewPhysicalWorkloadId,
+        agentInstanceId: runtimeInstanceId,
+        workloadRef: attribution?.workloadRef ?? metadata?.reviewWorkloadRef,
+        hostId: identityEvent.process?.hostId,
+        bootId: identityEvent.process?.bootId,
+        rootPid: attribution?.rootPid,
+        rootStartTime: attribution?.rootStartTime,
         reviewDecision: metadata?.reviewDecision,
         reviewedBy: metadata?.reviewedBy,
         reviewedAt: metadata?.reviewedAt ? iso(metadata.reviewedAt) : undefined,
@@ -980,34 +1661,43 @@ export class AggregationService {
           metadata?.identityKeys ??
           metadata?.reviewIdentityKeys ??
           this.agentMetadata.identityKeysForEvent(identityEvent),
-        firstSeen: iso(first.at),
-        lastSeen: iso(last.at),
+        firstSeen: iso(fact?.firstSeenAt ?? first.at),
+        lastSeen: iso(fact?.lastSeenAt ?? last.at),
+        lifecycleState,
+        terminatedAt: terminatedAt !== undefined ? iso(terminatedAt) : undefined,
         healthState,
         riskLevel: lvl.level,
         riskLevelText: lvl.text,
-        eventCount: sorted.length,
-        riskyEventCount: risky.length,
+        eventCount: fact?.eventCount ?? sorted.length,
+        riskyEventCount: fact?.riskyEventCount ?? risky.length,
         openIncidentCount,
-        sessionCount: distinct(sorted.map((e) => e.sessionId)),
-        runCount: distinct(sorted.map((e) => e.runId)),
-        traceCount: distinct(sorted.map((e) => e.traceId)),
-        tokenCount: sorted.reduce((a, e) => a + e.tokenCount, 0),
-        avgLatencyMs: Math.round(mean(sorted.map((e) => e.latencyMs))),
-        topRiskCategory: top?.[0],
-        topRiskName: top?.[1].name,
+        sessionCount: fact?.sessionCount ?? distinct(sorted.map((e) => e.sessionId)),
+        runCount: fact?.runCount ?? distinct(sorted.map((e) => e.runId)),
+        traceCount: fact?.traceCount ?? distinct(sorted.map((e) => e.traceId)),
+        tokenCount: fact?.tokenCount ?? sorted.reduce((a, e) => a + e.tokenCount, 0),
+        avgLatencyMs: fact
+          ? Math.round(fact.latencyTotal / Math.max(1, fact.eventCount))
+          : Math.round(mean(sorted.map((e) => e.latencyMs))),
+        topRiskCategory: fact?.topRiskCategory ?? top?.[0],
+        topRiskName: fact?.topRiskName ?? top?.[1].name,
         lastEventSubject: last.subject,
+        lastEventId: last.eventId,
+        collectorIds: fact?.collectorKeys ?? [...new Set(sorted.map(eventCollectorId).filter(Boolean))],
+        eventsWithoutCollector: fact?.eventsWithoutCollector ?? sorted.filter((event) => !eventCollectorId(event)).length,
         eventCategoryCounts: categoryCounts,
         sourceCounts,
       };
     });
 
+    const eventBackedAssetIds = new Set(eventBackedItems.map((item) => item.agentAssetId));
     const metadataOnlyItems = this.agentMetadata.list()
       .filter((metadata) =>
         (
           isAgentAssetClassification(metadata.reviewDecision ?? 'unknown') ||
           Boolean(filter.includeUnclassified && (agentAssetId || agentId))
         ) &&
-        !byAgent.has(metadata.agentAssetId) &&
+        !eventBackedAssetIds.has(metadata.agentAssetId) &&
+        !agentInstanceId &&
         (
           !shouldScopeExactAgent ||
           (agentAssetId ? metadata.agentAssetId === agentAssetId : metadata.agentId === agentId)
@@ -1057,6 +1747,7 @@ export class AggregationService {
           reviewIdentityKeys: metadata.identityKeys ?? metadata.reviewIdentityKeys ?? [metadata.agentId.toLowerCase()],
           firstSeen: metadata.updatedAt,
           lastSeen: metadata.updatedAt,
+          lifecycleState: 'historical',
           healthState: 'stale',
           riskLevel: 'safe',
           riskLevelText: LEVEL_TEXT.safe,
@@ -1069,6 +1760,8 @@ export class AggregationService {
           tokenCount: 0,
           avgLatencyMs: 0,
           lastEventSubject: 'metadata-only asset',
+          collectorIds: [],
+          eventsWithoutCollector: 0,
           eventCategoryCounts: categoryCounts,
           sourceCounts,
         };
@@ -1078,9 +1771,12 @@ export class AggregationService {
 
     const filtered = items
       .filter((item) => {
+        const matchesInstance = !agentInstanceId || item.agentInstanceId === agentInstanceId;
         const matchesAgentId = Boolean(
-          (agentAssetId && item.agentAssetId === agentAssetId) ||
-          (agentId && item.agentId === agentId && (!workspacePath || item.workspacePath === workspacePath)),
+          matchesInstance && (
+            (agentAssetId && item.agentAssetId === agentAssetId) ||
+            (agentId && item.agentId === agentId && (!workspacePath || item.workspacePath === workspacePath))
+          ),
         );
         if (
           !isAgentAssetClassification(item.classification) &&
@@ -1097,10 +1793,15 @@ export class AggregationService {
           (!q || [
             item.agentId,
             item.agentAssetId,
+            item.agentInstanceId,
             item.displayName,
             item.detectedName,
             item.locationLabel,
             item.workspacePath,
+            item.hostId,
+            item.bootId,
+            item.rootPid !== undefined ? String(item.rootPid) : undefined,
+            item.rootStartTime,
             item.userId,
             item.owner,
             item.team,
@@ -1130,12 +1831,18 @@ export class AggregationService {
           unknown: 0,
         };
         const aSelected = Boolean(
-          (agentAssetId && a.agentAssetId === agentAssetId) ||
-          (agentId && a.agentId === agentId && (!workspacePath || a.workspacePath === workspacePath)),
+          (!agentInstanceId || a.agentInstanceId === agentInstanceId) &&
+          (
+            (agentAssetId && a.agentAssetId === agentAssetId) ||
+            (agentId && a.agentId === agentId && (!workspacePath || a.workspacePath === workspacePath))
+          ),
         );
         const bSelected = Boolean(
-          (agentAssetId && b.agentAssetId === agentAssetId) ||
-          (agentId && b.agentId === agentId && (!workspacePath || b.workspacePath === workspacePath)),
+          (!agentInstanceId || b.agentInstanceId === agentInstanceId) &&
+          (
+            (agentAssetId && b.agentAssetId === agentAssetId) ||
+            (agentId && b.agentId === agentId && (!workspacePath || b.workspacePath === workspacePath))
+          ),
         );
         return Number(bSelected) - Number(aSelected)
           || classificationRank[a.classification] - classificationRank[b.classification]
@@ -1144,7 +1851,8 @@ export class AggregationService {
           || b.riskyEventCount - a.riskyEventCount
           || Date.parse(b.lastSeen) - Date.parse(a.lastSeen)
           || (a.displayName ?? a.detectedName ?? a.agentId).localeCompare(b.displayName ?? b.detectedName ?? b.agentId)
-          || a.agentAssetId.localeCompare(b.agentAssetId);
+          || a.agentAssetId.localeCompare(b.agentAssetId)
+          || (a.agentInstanceId ?? '').localeCompare(b.agentInstanceId ?? '');
       });
 
     const summary: T.AgentInventorySummary = {
@@ -1161,7 +1869,556 @@ export class AggregationService {
       riskyEventCount: filtered.reduce((a, item) => a + item.riskyEventCount, 0),
     };
     const limit = Math.max(1, Math.min(500, filter.limit ?? 120));
-    return { items: filtered.slice(0, limit), total: filtered.length, summary, updateTime: iso() };
+    return {
+      items: filtered.slice(0, limit),
+      total: filtered.length,
+      summary,
+      coverage: this.queryCoverage(filter, events, {
+        source: 'memory_hot_ring',
+        totalMode: 'exact',
+        partial: true,
+        partialReason: 'hot_ring_only',
+      }),
+      updateTime: iso(),
+    };
+  }
+
+  agentInstanceMetrics(filter: T.AgentInstanceMetricsQuery): T.AgentInstanceMetrics {
+    const requestedAgentAssetId = filter.agentAssetId?.trim();
+    const agentAssetId = requestedAgentAssetId
+      ? this.agentMetadata.canonicalAgentAssetId(requestedAgentAssetId)
+      : '';
+    const agentInstanceId = filter.agentInstanceId?.trim();
+    const cacheKey = [
+      agentAssetId,
+      agentInstanceId ?? '',
+      filter.timeType ?? '',
+      filter.startTime ?? '',
+      filter.endTime ?? '',
+      filter.seriesPoints ?? 36,
+      this.agentMetadata.identitySnapshotVersion(),
+    ].join('\0');
+    const cached = this.agentInstanceMetricsCache.get(cacheKey);
+    if (cached && now() - cached.at < 15_000) return cached.value;
+    const window = this.win(filter);
+    const events = agentAssetId
+      ? window.events.filter((event) =>
+          this.agentMetadata.resolveEvent(event).agentAssetId === agentAssetId &&
+          (!agentInstanceId || agentRuntimeInstanceIdForEvent(event) === agentInstanceId)
+        )
+      : [];
+    const pointCount = Math.max(12, Math.min(72, filter.seriesPoints ?? 36));
+    const bucketSize = window.spanMs / pointCount || 1;
+    const buckets = this.buckets(events, window.sinceMs, window.spanMs, pointCount);
+    const points = buckets.map((bucket, index): T.AgentInstanceMetricPoint => {
+      const latencies = bucket
+        .map((event) => event.latencyMs)
+        .filter((value) => Number.isFinite(value) && value >= 0);
+      return {
+        statTime: iso(window.sinceMs + index * bucketSize),
+        eventCount: bucket.length,
+        riskyEventCount: bucket.filter((event) => event.verdict !== 'allow').length,
+        blockedCount: bucket.filter((event) => event.verdict === 'block').length,
+        escalatedCount: bucket.filter((event) => event.verdict === 'escalate').length,
+        toolCount: bucket.filter((event) => event.eventCategory === 'tool').length,
+        fileCount: bucket.filter((event) => event.eventCategory === 'file').length,
+        networkCount: bucket.filter((event) => event.eventCategory === 'network').length,
+        processCount: bucket.filter((event) => event.eventCategory === 'process' || event.eventCategory === 'runtime').length,
+        llmCount: bucket.filter((event) => event.eventCategory === 'llm').length,
+        l1Count: bucket.filter((event) => event.tier === 'Rules').length,
+        l2Count: bucket.filter((event) => event.tier === 'Llm').length,
+        l3Count: bucket.filter((event) => event.tier === 'Agent').length,
+        failedCount: bucket.filter((event) => event.decisionStatus === 'failed').length,
+        timeoutCount: bucket.filter((event) => event.decisionStatus === 'timeout').length,
+        tokenCount: bucket.reduce((total, event) => total + event.tokenCount, 0),
+        avgLatencyMs: Math.round(mean(latencies)),
+        maxRiskScore: bucket.length ? Math.max(...bucket.map((event) => event.riskScore)) : 0,
+      };
+    });
+    const latencies = events
+      .map((event) => event.latencyMs)
+      .filter((value) => Number.isFinite(value) && value >= 0);
+    const value: T.AgentInstanceMetrics = {
+      agentAssetId,
+      points,
+      eventCount: events.length,
+      riskyEventCount: events.filter((event) => event.verdict !== 'allow').length,
+      blockedCount: events.filter((event) => event.verdict === 'block').length,
+      escalatedCount: events.filter((event) => event.verdict === 'escalate').length,
+      tokenCount: events.reduce((total, event) => total + event.tokenCount, 0),
+      avgLatencyMs: Math.round(mean(latencies)),
+      failedCount: events.filter((event) => event.decisionStatus === 'failed').length,
+      timeoutCount: events.filter((event) => event.decisionStatus === 'timeout').length,
+      updateTime: iso(),
+    };
+    this.agentInstanceMetricsCache.set(cacheKey, { at: now(), value });
+    if (this.agentInstanceMetricsCache.size > 256) {
+      const oldestKey = [...this.agentInstanceMetricsCache.entries()]
+        .sort((a, b) => a[1].at - b[1].at)[0]?.[0];
+      if (oldestKey) this.agentInstanceMetricsCache.delete(oldestKey);
+    }
+    return value;
+  }
+
+  private metricFactForEvent(
+    event: T.JudgedEvent,
+    bucketIndex: number,
+    recentSinceMs: number,
+  ): StoredAgentMetricBucketFact {
+    const recent = event.at > recentSinceMs;
+    return {
+      bucketIndex,
+      identityKey: event.eventId,
+      representativeEvent: event,
+      eventCount: 1,
+      riskyEventCount: event.verdict !== 'allow' ? 1 : 0,
+      blockedCount: event.verdict === 'block' ? 1 : 0,
+      escalatedCount: event.verdict === 'escalate' ? 1 : 0,
+      toolCount: event.eventCategory === 'tool' ? 1 : 0,
+      fileCount: event.eventCategory === 'file' ? 1 : 0,
+      networkCount: event.eventCategory === 'network' ? 1 : 0,
+      processCount: event.eventCategory === 'process' || event.eventCategory === 'runtime' ? 1 : 0,
+      llmCount: event.eventCategory === 'llm' ? 1 : 0,
+      l1Count: event.tier === 'Rules' ? 1 : 0,
+      l2Count: event.tier === 'Llm' ? 1 : 0,
+      l3Count: event.tier === 'Agent' ? 1 : 0,
+      failedCount: event.decisionStatus === 'failed' ? 1 : 0,
+      timeoutCount: event.decisionStatus === 'timeout' ? 1 : 0,
+      tokenCount: event.tokenCount,
+      latencyTotal: event.latencyMs,
+      maxRiskScore: event.riskScore,
+      sessionKeys: [event.sessionId],
+      recentEventCount: recent ? 1 : 0,
+      recentCommCount: recent && (event.eventKind === 'Egress' || event.eventKind === 'Dns') ? 1 : 0,
+      recentSessionKeys: recent ? [event.sessionId] : [],
+    };
+  }
+
+  private async storedAgentMetricFacts(
+    filter: T.SecurityTimeFilter,
+    bucketCount: number,
+  ): Promise<{
+    facts: StoredAgentMetricBucketFact[];
+    coverage: T.QueryCoverage;
+  } | null> {
+    if (!this.judge.storageStatus().clickhouseReady) return null;
+    const window = resolveTimeWindow(filter);
+    const pointCount = Math.max(1, Math.min(72, Math.round(bucketCount)));
+    const bucketSize = window.spanMs / pointCount || 1;
+    const committedCutoffMs = this.judge.committedEventCutoffMs();
+    if (committedCutoffMs === undefined) return null;
+    const plan = planDashboardRead(window.startMs, window.endMs, committedCutoffMs);
+    const persistedUntilMs = plan.persistedUntilMs ?? window.endMs;
+    const hotEvents = foldLatestEventRevisions(
+      this.judge.queryRange(plan.hotFromMs, window.endMs)
+        .filter((event) => filter.scope !== 'agent' || isMonitoredAgentEvent(event)),
+    );
+    const overlapEventIds = hotEvents
+      .filter((event) => event.at <= persistedUntilMs)
+      .map((event) => event.eventId);
+    const persisted = await this.judge.agentMetricBucketFacts(
+      window.startMs,
+      persistedUntilMs,
+      pointCount,
+      filter.scope === 'agent',
+      overlapEventIds,
+    );
+    if (!persisted) return null;
+    const recentSinceMs = Math.max(window.startMs, window.endMs - 60_000);
+    const hotFacts = hotEvents.map((event) => this.metricFactForEvent(
+      event,
+      Math.min(pointCount - 1, Math.max(0, Math.floor((event.at - window.startMs) / bucketSize))),
+      recentSinceMs,
+    ));
+    const facts = [...persisted, ...hotFacts];
+    return {
+      facts,
+      coverage: this.queryCoverage(filter, facts.map((fact) => fact.representativeEvent), {
+        source: hotEvents.length ? 'clickhouse+hot_delta' : 'clickhouse',
+        totalMode: 'exact',
+        partial: false,
+        committedCutoffMs,
+      }),
+    };
+  }
+
+  async storedAgentInstanceMetrics(filter: T.AgentInstanceMetricsQuery): Promise<T.AgentInstanceMetrics> {
+    const requestedAgentAssetId = filter.agentAssetId?.trim();
+    const agentAssetId = requestedAgentAssetId
+      ? this.agentMetadata.canonicalAgentAssetId(requestedAgentAssetId)
+      : '';
+    const agentInstanceId = filter.agentInstanceId?.trim();
+    const pointCount = Math.max(12, Math.min(72, filter.seriesPoints ?? 36));
+    const cacheKey = [
+      'durable',
+      agentAssetId,
+      agentInstanceId ?? '',
+      filter.timeType ?? '',
+      filter.startTime ?? '',
+      filter.endTime ?? '',
+      pointCount,
+      this.agentMetadata.identitySnapshotVersion(),
+    ].join('\0');
+    const cached = this.agentInstanceMetricsCache.get(cacheKey);
+    if (cached && now() - cached.at < 15_000) return cached.value;
+    const durable = await this.storedAgentMetricFacts({ ...filter, scope: 'agent' }, pointCount);
+    if (!durable) return this.agentInstanceMetrics(filter);
+    const window = resolveTimeWindow(filter);
+    const bucketSize = window.spanMs / pointCount || 1;
+    const selected = durable.facts.filter((fact) =>
+      agentAssetId &&
+      this.agentMetadata.resolveEvent(fact.representativeEvent).agentAssetId === agentAssetId &&
+      (!agentInstanceId || agentRuntimeInstanceIdForEvent(fact.representativeEvent) === agentInstanceId),
+    );
+    const bucketFacts = Array.from({ length: pointCount }, () => [] as StoredAgentMetricBucketFact[]);
+    for (const fact of selected) {
+      if (fact.bucketIndex >= 0 && fact.bucketIndex < pointCount) bucketFacts[fact.bucketIndex].push(fact);
+    }
+    const points = bucketFacts.map((facts, index): T.AgentInstanceMetricPoint => {
+      const eventCount = facts.reduce((sum, fact) => sum + fact.eventCount, 0);
+      return {
+        statTime: iso(window.startMs + index * bucketSize),
+        eventCount,
+        riskyEventCount: facts.reduce((sum, fact) => sum + fact.riskyEventCount, 0),
+        blockedCount: facts.reduce((sum, fact) => sum + fact.blockedCount, 0),
+        escalatedCount: facts.reduce((sum, fact) => sum + fact.escalatedCount, 0),
+        toolCount: facts.reduce((sum, fact) => sum + fact.toolCount, 0),
+        fileCount: facts.reduce((sum, fact) => sum + fact.fileCount, 0),
+        networkCount: facts.reduce((sum, fact) => sum + fact.networkCount, 0),
+        processCount: facts.reduce((sum, fact) => sum + fact.processCount, 0),
+        llmCount: facts.reduce((sum, fact) => sum + fact.llmCount, 0),
+        l1Count: facts.reduce((sum, fact) => sum + fact.l1Count, 0),
+        l2Count: facts.reduce((sum, fact) => sum + fact.l2Count, 0),
+        l3Count: facts.reduce((sum, fact) => sum + fact.l3Count, 0),
+        failedCount: facts.reduce((sum, fact) => sum + fact.failedCount, 0),
+        timeoutCount: facts.reduce((sum, fact) => sum + fact.timeoutCount, 0),
+        tokenCount: facts.reduce((sum, fact) => sum + fact.tokenCount, 0),
+        avgLatencyMs: Math.round(facts.reduce((sum, fact) => sum + fact.latencyTotal, 0) / (eventCount || 1)),
+        maxRiskScore: Math.max(0, ...facts.map((fact) => fact.maxRiskScore)),
+      };
+    });
+    const eventCount = selected.reduce((sum, fact) => sum + fact.eventCount, 0);
+    const value: T.AgentInstanceMetrics = {
+      agentAssetId,
+      points,
+      eventCount,
+      riskyEventCount: selected.reduce((sum, fact) => sum + fact.riskyEventCount, 0),
+      blockedCount: selected.reduce((sum, fact) => sum + fact.blockedCount, 0),
+      escalatedCount: selected.reduce((sum, fact) => sum + fact.escalatedCount, 0),
+      tokenCount: selected.reduce((sum, fact) => sum + fact.tokenCount, 0),
+      avgLatencyMs: Math.round(selected.reduce((sum, fact) => sum + fact.latencyTotal, 0) / (eventCount || 1)),
+      failedCount: selected.reduce((sum, fact) => sum + fact.failedCount, 0),
+      timeoutCount: selected.reduce((sum, fact) => sum + fact.timeoutCount, 0),
+      coverage: durable.coverage,
+      updateTime: iso(window.endMs),
+    };
+    this.agentInstanceMetricsCache.set(cacheKey, { at: now(), value });
+    return value;
+  }
+
+  private workspaceFactForEvent(event: T.JudgedEvent): StoredWorkspaceWindowFact {
+    const risky = event.verdict !== 'allow';
+    const collectorId = eventCollectorId(event);
+    const resolvedWorkspacePath =
+      this.agentMetadata.resolveEvent(event).metadata?.workspacePath ??
+      attributionWorkspacePath(event);
+    return {
+      workspacePath: resolvedWorkspacePath,
+      representativeEvent: event,
+      firstSeenAt: event.at,
+      lastSeenAt: event.at,
+      eventCount: 1,
+      riskyEventCount: risky ? 1 : 0,
+      sessionKeys: [event.sessionId],
+      runKeys: [event.runId],
+      traceKeys: [event.traceId],
+      collectorKeys: collectorId ? [collectorId] : [],
+      tokenCount: event.tokenCount,
+      latencyTotal: event.latencyMs,
+      worstSeverityRank: risky ? SEV_RANK[event.severity] : 0,
+      topRiskAt: risky ? event.at : undefined,
+      topRiskCategory: risky ? event.riskCategory : undefined,
+      topRiskName: risky ? event.riskName : undefined,
+    };
+  }
+
+  private mergeWorkspaceFacts(
+    a: StoredWorkspaceWindowFact,
+    b: StoredWorkspaceWindowFact,
+  ): StoredWorkspaceWindowFact {
+    const newest = a.lastSeenAt >= b.lastSeenAt ? a : b;
+    const latestRisk = (b.topRiskAt ?? 0) >= (a.topRiskAt ?? 0) ? b : a;
+    return {
+      workspacePath: newest.workspacePath,
+      representativeEvent: newest.representativeEvent,
+      firstSeenAt: Math.min(a.firstSeenAt, b.firstSeenAt),
+      lastSeenAt: Math.max(a.lastSeenAt, b.lastSeenAt),
+      eventCount: a.eventCount + b.eventCount,
+      riskyEventCount: a.riskyEventCount + b.riskyEventCount,
+      sessionKeys: [...new Set([...a.sessionKeys, ...b.sessionKeys])],
+      runKeys: [...new Set([...a.runKeys, ...b.runKeys])],
+      traceKeys: [...new Set([...a.traceKeys, ...b.traceKeys])],
+      collectorKeys: [...new Set([...a.collectorKeys, ...b.collectorKeys])],
+      tokenCount: a.tokenCount + b.tokenCount,
+      latencyTotal: a.latencyTotal + b.latencyTotal,
+      worstSeverityRank: Math.max(a.worstSeverityRank, b.worstSeverityRank),
+      topRiskAt: latestRisk.topRiskAt,
+      topRiskCategory: latestRisk.topRiskCategory,
+      topRiskName: latestRisk.topRiskName,
+    };
+  }
+
+  async storedWorkspaceInventory(filter: T.WorkspaceInventoryQuery): Promise<T.WorkspaceInventory> {
+    if (!this.judge.storageStatus().clickhouseReady) return this.workspaceInventory(filter);
+    const window = resolveTimeWindow(filter);
+    const committedCutoffMs = this.judge.committedEventCutoffMs();
+    if (committedCutoffMs === undefined) return this.workspaceInventory(filter);
+    const plan = planDashboardRead(window.startMs, window.endMs, committedCutoffMs);
+    const persistedUntilMs = plan.persistedUntilMs ?? window.endMs;
+    const hotEvents = foldLatestEventRevisions(
+      this.judge.queryRange(plan.hotFromMs, window.endMs)
+        .filter((event) => filter.scope !== 'agent' || event.attribution?.monitored === true),
+    );
+    const overlapEventIds = hotEvents
+      .filter((event) => event.at <= persistedUntilMs)
+      .map((event) => event.eventId);
+    const scope = filter.scope === 'agent' ? 'agent' : 'all';
+    const slices = reusableFactSlices(window.startMs, persistedUntilMs, plan.hotFromMs);
+    let persisted: StoredWorkspaceWindowFact[] | null = null;
+    if (
+      !window.custom &&
+      window.spanMs <= 24 * HOUR &&
+      slices.fullEndExclusiveMs > slices.fullStartMs
+    ) {
+      let cache = this.workspaceHistoryBuckets.get(scope);
+      if (!cache) {
+        cache = new CommitAwareFactBucketCache<StoredWorkspaceBucketFact>({
+          latestCursor: () => this.judge.latestEventCommitCursor(),
+          earliestCursor: () => this.judge.earliestEventCommitCursor(),
+          changes: (cursor) => this.judge.eventCommitChanges(cursor),
+          facts: (startMs, endExclusiveMs) => this.historyQueryGate.run(() =>
+            this.judge.workspaceWindowBucketFacts(
+              startMs,
+              endExclusiveMs,
+              REUSABLE_BUCKET_MS,
+              scope === 'agent',
+            ),
+          ),
+        }, REUSABLE_BUCKET_MS);
+        this.workspaceHistoryBuckets.set(scope, cache);
+      }
+      const [reusableFacts, headFacts, tailFacts] = await Promise.all([
+        cache.read(slices.fullStartMs, slices.fullEndExclusiveMs).catch((error) => {
+          console.error('[aggregation] reusable workspace history failed:', (error as Error).message);
+          return null;
+        }),
+        slices.head
+          ? this.historyQueryGate.run(() =>
+              this.judge.workspaceWindowFacts(
+                slices.head!.startMs,
+                slices.head!.endMs,
+                scope === 'agent',
+                overlapEventIds,
+              ),
+            )
+          : Promise.resolve([]),
+        slices.tail
+          ? this.historyQueryGate.run(() =>
+              this.judge.workspaceWindowFacts(
+                slices.tail!.startMs,
+                slices.tail!.endMs,
+                scope === 'agent',
+                overlapEventIds,
+              ),
+            )
+          : Promise.resolve([]),
+      ]);
+      if (reusableFacts && headFacts && tailFacts) {
+        persisted = [...headFacts, ...reusableFacts, ...tailFacts];
+      }
+    }
+    if (!persisted) {
+      // Custom ranges retain the exact query path; presets reuse their aligned interior.
+      persisted = await this.historyQueryGate.run(() =>
+        this.judge.workspaceWindowFacts(
+          window.startMs,
+          persistedUntilMs,
+          scope === 'agent',
+          overlapEventIds,
+        ),
+      );
+    }
+    if (!persisted) return this.workspaceInventory(filter);
+
+    const factsByWorkspace = new Map<string, StoredWorkspaceWindowFact>();
+    for (const fact of [...persisted, ...hotEvents.map((event) => this.workspaceFactForEvent(event))]) {
+      const resolvedWorkspacePath =
+        this.agentMetadata.resolveEvent(fact.representativeEvent).metadata?.workspacePath ??
+        fact.workspacePath;
+      const canonicalFact = resolvedWorkspacePath === fact.workspacePath
+        ? fact
+        : { ...fact, workspacePath: resolvedWorkspacePath };
+      const current = factsByWorkspace.get(resolvedWorkspacePath);
+      factsByWorkspace.set(
+        resolvedWorkspacePath,
+        current ? this.mergeWorkspaceFacts(current, canonicalFact) : canonicalFact,
+      );
+    }
+
+    const q = filter.q?.trim().toLowerCase();
+    const owner = filter.owner?.trim().toLowerCase();
+    const environment = filter.environment?.trim().toLowerCase();
+    const workspacePath = filter.workspacePath?.trim();
+    const hasFilter = Boolean(
+      (filter.healthState && filter.healthState !== 'all') ||
+      (filter.criticality && filter.criticality !== 'all') ||
+      owner ||
+      environment ||
+      q
+    );
+    const shouldScopeExactWorkspace = Boolean(workspacePath && !hasFilter);
+    const agents = await this.storedAgentInventory({
+      timeType: filter.timeType,
+      startTime: filter.startTime,
+      endTime: filter.endTime,
+      scope: filter.scope,
+      workspacePath: shouldScopeExactWorkspace ? workspacePath : undefined,
+      limit: 500,
+    });
+    const byWorkspaceAgents = new Map<string, T.AgentInventoryItem[]>();
+    for (const agent of agents.items) {
+      if (shouldScopeExactWorkspace && agent.workspacePath !== workspacePath) continue;
+      const current = byWorkspaceAgents.get(agent.workspacePath) ?? [];
+      current.push(agent);
+      byWorkspaceAgents.set(agent.workspacePath, current);
+    }
+
+    const workspaceKeys = new Set([...factsByWorkspace.keys(), ...byWorkspaceAgents.keys()]);
+    const items = [...workspaceKeys].flatMap((key): T.WorkspaceInventoryItem[] => {
+      if (shouldScopeExactWorkspace && key !== workspacePath) return [];
+      const fact = factsByWorkspace.get(key);
+      const wsAgents = byWorkspaceAgents.get(key) ?? [];
+      if (!fact && !wsAgents.length) return [];
+      const agentFirstSeen = wsAgents.map((agent) => Date.parse(agent.firstSeen)).filter(Number.isFinite);
+      const agentLastSeen = wsAgents.map((agent) => Date.parse(agent.lastSeen)).filter(Number.isFinite);
+      const firstMs = fact?.firstSeenAt ?? Math.min(...agentFirstSeen);
+      const lastMs = fact?.lastSeenAt ?? Math.max(...agentLastSeen);
+      const lvl = fact?.riskyEventCount
+        ? levelByRank(fact.worstSeverityRank)
+        : { level: 'safe', text: LEVEL_TEXT.safe };
+      const maintenance = this.maintenance.activeFor({ workspacePath: key });
+      const tags = [...new Set(wsAgents.flatMap((agent) => agent.tags ?? []))].slice(0, 24);
+      const healthState: T.AgentHealthState = wsAgents.some((agent) => agent.healthState === 'risky')
+        ? 'risky'
+        : wsAgents.some((agent) => agent.healthState === 'active')
+          ? 'active'
+          : wsAgents.some((agent) => agent.healthState === 'idle')
+            ? 'idle'
+            : 'stale';
+      const byLastSeen = [...wsAgents].sort((a, b) => Date.parse(b.lastSeen) - Date.parse(a.lastSeen));
+      const eventCount = fact?.eventCount ?? wsAgents.reduce((sum, agent) => sum + agent.eventCount, 0);
+      return [{
+        workspaceId: this.workspaceDirectory.resolveWorkspaceId(key),
+        workspacePath: key,
+        owner: mode(wsAgents.map((agent) => agent.owner)),
+        team: mode(wsAgents.map((agent) => agent.team)),
+        environment: mode(wsAgents.map((agent) => agent.environment)),
+        criticality: worstCriticality(wsAgents.map((agent) => agent.criticality)),
+        tags,
+        healthState,
+        riskLevel: lvl.level,
+        riskLevelText: lvl.text,
+        agentCount: wsAgents.length,
+        managedAgentCount: wsAgents.filter((agent) => agent.metadataUpdatedAt).length,
+        activeAgentCount: wsAgents.filter((agent) => agent.healthState === 'active').length,
+        idleAgentCount: wsAgents.filter((agent) => agent.healthState === 'idle').length,
+        staleAgentCount: wsAgents.filter((agent) => agent.healthState === 'stale').length,
+        riskyAgentCount: wsAgents.filter((agent) => agent.healthState === 'risky').length,
+        openIncidentCount: wsAgents.reduce((sum, agent) => sum + agent.openIncidentCount, 0),
+        collectorCount: fact?.collectorKeys.length ?? 0,
+        eventCount,
+        riskyEventCount: fact?.riskyEventCount ?? wsAgents.reduce((sum, agent) => sum + agent.riskyEventCount, 0),
+        sessionCount: fact?.sessionKeys.length ?? wsAgents.reduce((sum, agent) => sum + agent.sessionCount, 0),
+        runCount: fact?.runKeys.length ?? wsAgents.reduce((sum, agent) => sum + agent.runCount, 0),
+        traceCount: fact?.traceKeys.length ?? wsAgents.reduce((sum, agent) => sum + agent.traceCount, 0),
+        tokenCount: fact?.tokenCount ?? wsAgents.reduce((sum, agent) => sum + agent.tokenCount, 0),
+        avgLatencyMs: fact
+          ? Math.round(fact.latencyTotal / (eventCount || 1))
+          : Math.round(mean(wsAgents.map((agent) => agent.avgLatencyMs))),
+        topRiskCategory: fact?.topRiskCategory ?? mode(wsAgents.map((agent) => agent.topRiskCategory)),
+        topRiskName: fact?.topRiskName ?? mode(wsAgents.map((agent) => agent.topRiskName)),
+        firstSeen: iso(Number.isFinite(firstMs) ? firstMs : window.startMs),
+        lastSeen: iso(Number.isFinite(lastMs) ? lastMs : window.endMs),
+        lastEventSubject: fact?.representativeEvent.subject ?? byLastSeen[0]?.lastEventSubject ?? '',
+        maintenanceActive: Boolean(maintenance),
+        maintenanceWindowId: maintenance?.windowId,
+        maintenanceTitle: maintenance?.title,
+      }];
+    });
+
+    const filtered = items
+      .filter((item) => {
+        const matchesWorkspacePath = Boolean(workspacePath && item.workspacePath === workspacePath);
+        const matchesFilter =
+          (!filter.healthState || filter.healthState === 'all' || item.healthState === filter.healthState) &&
+          (!filter.criticality || filter.criticality === 'all' || item.criticality === filter.criticality) &&
+          (!owner || (item.owner ?? '').toLowerCase().includes(owner)) &&
+          (!environment || (item.environment ?? '').toLowerCase().includes(environment)) &&
+          (!q || [
+            item.workspacePath,
+            item.owner,
+            item.team,
+            item.environment,
+            item.criticality,
+            item.topRiskName,
+            item.topRiskCategory,
+            item.lastEventSubject,
+            item.maintenanceTitle,
+            ...item.tags,
+          ].some((value) => (value ?? '').toLowerCase().includes(q)));
+        if (workspacePath && !hasFilter) return matchesWorkspacePath;
+        return matchesWorkspacePath || matchesFilter;
+      })
+      .sort((a, b) => {
+        const rank: Record<T.AgentHealthState, number> = { risky: 0, active: 1, idle: 2, stale: 3 };
+        return Number(Boolean(workspacePath) && b.workspacePath === workspacePath) -
+          Number(Boolean(workspacePath) && a.workspacePath === workspacePath) ||
+          Number(b.maintenanceActive) - Number(a.maintenanceActive) ||
+          rank[a.healthState] - rank[b.healthState] ||
+          b.openIncidentCount - a.openIncidentCount ||
+          b.riskyEventCount - a.riskyEventCount ||
+          Date.parse(b.lastSeen) - Date.parse(a.lastSeen);
+      });
+    const summary: T.WorkspaceInventorySummary = {
+      totalWorkspaces: filtered.length,
+      managedWorkspaces: filtered.filter((item) => item.managedAgentCount > 0).length,
+      productionWorkspaces: filtered.filter((item) => ['prod', 'production'].includes(item.environment?.toLowerCase() ?? '')).length,
+      highCriticalityWorkspaces: filtered.filter((item) => item.criticality === 'high' || item.criticality === 'critical').length,
+      activeWorkspaces: filtered.filter((item) => item.healthState === 'active').length,
+      staleWorkspaces: filtered.filter((item) => item.healthState === 'stale').length,
+      riskyWorkspaces: filtered.filter((item) => item.healthState === 'risky').length,
+      maintainedWorkspaces: filtered.filter((item) => item.maintenanceActive).length,
+      totalAgents: filtered.reduce((sum, item) => sum + item.agentCount, 0),
+      openIncidentCount: filtered.reduce((sum, item) => sum + item.openIncidentCount, 0),
+      observedEventCount: filtered.reduce((sum, item) => sum + item.eventCount, 0),
+      riskyEventCount: filtered.reduce((sum, item) => sum + item.riskyEventCount, 0),
+    };
+    const allFacts = [...factsByWorkspace.values()];
+    const limit = Math.max(1, Math.min(500, filter.limit ?? 120));
+    return {
+      items: filtered.slice(0, limit),
+      total: filtered.length,
+      summary,
+      coverage: this.queryCoverage(filter, allFacts.map((fact) => fact.representativeEvent), {
+        source: hotEvents.length ? 'clickhouse+hot_delta' : 'clickhouse',
+        totalMode: 'exact',
+        partial: false,
+        committedCutoffMs,
+        dataFromMs: allFacts.length ? Math.min(...allFacts.map((fact) => fact.firstSeenAt)) : undefined,
+        dataToMs: allFacts.length ? Math.max(...allFacts.map((fact) => fact.lastSeenAt)) : undefined,
+      }),
+      updateTime: iso(window.endMs),
+    };
   }
 
   workspaceInventory(filter: T.WorkspaceInventoryQuery): T.WorkspaceInventory {
@@ -1221,6 +2478,7 @@ export class AggregationService {
             : 'stale';
       const byLastSeen = [...wsAgents].sort((a, b) => Date.parse(b.lastSeen) - Date.parse(a.lastSeen));
       return {
+        workspaceId: this.workspaceDirectory.resolveWorkspaceId(workspacePath),
         workspacePath,
         owner: mode(wsAgents.map((agent) => agent.owner)),
         team: mode(wsAgents.map((agent) => agent.team)),
@@ -1307,24 +2565,184 @@ export class AggregationService {
     return { items: filtered.slice(0, limit), total: filtered.length, summary, updateTime: iso() };
   }
 
-  agentTopology(filter: T.AgentTopologyQuery): T.AgentTopology {
+  async storedAgentTopology(filter: T.AgentTopologyQuery): Promise<T.AgentTopology> {
+    const window = resolveTimeWindow(filter);
+    const committed = this.judge.committedEventCutoffMs();
+    if (committed === undefined) return this.agentTopology(filter);
+    const plan = planDashboardRead(window.startMs, window.endMs, committed);
+    const persistedUntilMs = plan.persistedUntilMs ?? window.endMs;
+    const hotEvents = foldLatestEventRevisions(
+      this.judge.queryRange(plan.hotFromMs, window.endMs),
+    );
+    const overlapEventIds = hotEvents
+      .filter((event) => event.at <= persistedUntilMs)
+      .map((event) => event.eventId);
+    const slices = reusableFactSlices(window.startMs, persistedUntilMs, plan.hotFromMs);
+    let persisted: StoredTopologyWindowFact[] | null;
+    if (
+      !window.custom &&
+      window.spanMs <= 24 * HOUR &&
+      slices.fullEndExclusiveMs > slices.fullStartMs
+    ) {
+      this.topologyHistoryBuckets ??= new CommitAwareFactBucketCache<StoredTopologyBucketFact>({
+        latestCursor: () => this.judge.latestEventCommitCursor(),
+        earliestCursor: () => this.judge.earliestEventCommitCursor(),
+        changes: (after) => this.judge.eventCommitChanges(after),
+        facts: (startMs, endExclusiveMs, bucketMs) =>
+          this.historyQueryGate.run(() =>
+            this.judge.topologyWindowBucketFacts(startMs, endExclusiveMs, bucketMs),
+          ),
+      });
+      const [stableFacts, headFacts, tailFacts] = await Promise.all([
+        this.topologyHistoryBuckets.read(
+          slices.fullStartMs,
+          slices.fullEndExclusiveMs,
+        ).catch((error) => {
+          console.warn(
+            `[topology] reusable history unavailable; using exact fallback: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          return null;
+        }),
+        slices.head
+          ? this.historyQueryGate.run(() =>
+              this.judge.topologyWindowFacts(
+                slices.head!.startMs,
+                slices.head!.endMs,
+                overlapEventIds,
+              ),
+            )
+          : Promise.resolve([]),
+        slices.tail
+          ? this.historyQueryGate.run(() =>
+              this.judge.topologyWindowFacts(
+                slices.tail!.startMs,
+                slices.tail!.endMs,
+                overlapEventIds,
+              ),
+            )
+          : Promise.resolve([]),
+      ]);
+      persisted = stableFacts && headFacts && tailFacts
+        ? [...headFacts, ...stableFacts, ...tailFacts]
+        : null;
+      if (!persisted) {
+        persisted = await this.historyQueryGate.run(() =>
+          this.judge.topologyWindowFacts(
+            window.startMs,
+            persistedUntilMs,
+            overlapEventIds,
+          ),
+        );
+      }
+    } else {
+      persisted = await this.historyQueryGate.run(() =>
+        this.judge.topologyWindowFacts(
+          window.startMs,
+          persistedUntilMs,
+          overlapEventIds,
+        ),
+      );
+    }
+    if (persisted === null) return this.agentTopology(filter);
+    const pinnedEventId = filter.eventId?.trim();
+    const pinnedPage = pinnedEventId
+      ? await this.judge.searchStoredEventsPage({
+          sinceMs: 0,
+          untilMs: window.endMs,
+          eventId: pinnedEventId,
+          limit: 1,
+        })
+      : undefined;
+    const pinnedEvent = pinnedPage?.events[0] ?? (pinnedEventId ? this.judge.findEvent(pinnedEventId) : undefined);
+    const hotFacts: StoredTopologyWindowFact[] = hotEvents.map((event) => ({
+      identityKey: event.eventId,
+      representativeEvent: event,
+      firstSeenAt: event.at,
+      lastSeenAt: event.at,
+      eventCount: 1,
+      riskyEventCount: event.verdict === 'allow' ? 0 : 1,
+      worstSeverityRank: event.verdict === 'allow' ? 0 : SEV_RANK[event.severity],
+      riskCategory: event.riskCategory,
+      riskName: event.riskName,
+    }));
+    const facts = [...persisted, ...hotFacts];
+    if (pinnedEvent && !facts.some((fact) => fact.representativeEvent.eventId === pinnedEvent.eventId)) {
+      facts.push({
+        identityKey: pinnedEvent.eventId,
+        representativeEvent: pinnedEvent,
+        firstSeenAt: pinnedEvent.at,
+        lastSeenAt: pinnedEvent.at,
+        eventCount: 1,
+        riskyEventCount: pinnedEvent.verdict === 'allow' ? 0 : 1,
+        worstSeverityRank: pinnedEvent.verdict === 'allow' ? 0 : SEV_RANK[pinnedEvent.severity],
+        riskCategory: pinnedEvent.riskCategory,
+        riskName: pinnedEvent.riskName,
+      });
+    }
+    return this.agentTopology(filter, {
+      facts,
+      committedCutoffMs: Math.min(committed, window.endMs),
+      source: hotFacts.length ? 'clickhouse+hot_delta' : 'clickhouse',
+    });
+  }
+
+  agentTopology(
+    filter: T.AgentTopologyQuery,
+    durable?: {
+      facts: StoredTopologyWindowFact[];
+      committedCutoffMs: number;
+      source: 'clickhouse' | 'clickhouse+hot_delta';
+    },
+  ): T.AgentTopology {
     const pinnedEdgeId = filter.edgeId?.trim();
     const pinnedEventId = filter.eventId?.trim();
-    const windowedEvents = this.win(filter).events;
+    const agentScoped = filter.scope === 'agent';
+    const resolvedEvents = new Map<string, ReturnType<AgentMetadataService['resolveEvent']>>();
+    const resolveAgent = (event: T.JudgedEvent) => {
+      const cached = resolvedEvents.get(event.eventId);
+      if (cached) return cached;
+      const resolved = this.agentMetadata.resolveEvent(event);
+      resolvedEvents.set(event.eventId, resolved);
+      return resolved;
+    };
+    const isAgentRelatedEvent = (event: T.JudgedEvent) =>
+      isAgentAssetClassification(resolveAgent(event).effectiveClassification);
+    const topologyFacts = durable?.facts;
+    const factByEventId = new Map((topologyFacts ?? []).map((fact) => [fact.representativeEvent.eventId, fact]));
+    const rawWindowedEvents = topologyFacts
+      ? topologyFacts.map((fact) => fact.representativeEvent)
+      : this.win(filter).events;
+    const windowedEvents = agentScoped
+      ? rawWindowedEvents.filter(isAgentRelatedEvent)
+      : rawWindowedEvents;
     const windowedEventIds = new Set(windowedEvents.map((event) => event.eventId));
-    const pinnedEvent = pinnedEventId ? this.judge.findEvent(pinnedEventId) : undefined;
-    const events = pinnedEdgeId
+    const rawPinnedEvent = pinnedEventId
+      ? topologyFacts?.find((fact) => fact.representativeEvent.eventId === pinnedEventId)?.representativeEvent
+        ?? this.judge.findEvent(pinnedEventId)
+      : undefined;
+    const pinnedEvent = rawPinnedEvent && (!agentScoped || isAgentRelatedEvent(rawPinnedEvent))
+      ? rawPinnedEvent
+      : undefined;
+    const rawEvents = pinnedEdgeId && !topologyFacts
       ? this.judge.query(0)
       : pinnedEvent && !windowedEventIds.has(pinnedEvent.eventId)
         ? [...windowedEvents, pinnedEvent]
         : windowedEvents;
+    const events = agentScoped ? rawEvents.filter(isAgentRelatedEvent) : rawEvents;
     const includeBenign = filter.includeBenign !== false;
     const q = filter.q?.trim().toLowerCase();
+    const requestedAgentAssetId = filter.agentAssetId?.trim();
+    const agentAssetId = requestedAgentAssetId
+      ? this.agentMetadata.canonicalAgentAssetId(requestedAgentAssetId)
+      : undefined;
+    const agentInstanceId = filter.agentInstanceId?.trim();
     const agentId = filter.agentId?.trim();
     const workspacePath = filter.workspacePath?.trim();
     const collectorId = filter.collectorId?.trim();
     const sourceId = filter.sourceId?.trim();
-    const hasFilter = Boolean(agentId || workspacePath || collectorId || sourceId || q || !includeBenign);
+    const hasFilter = Boolean(agentAssetId || agentInstanceId || agentId || workspacePath || collectorId || sourceId || q || !includeBenign);
     const exactPinnedMode = Boolean((pinnedEdgeId || pinnedEventId) && !hasFilter);
     const limit = Math.max(20, Math.min(1000, filter.limit ?? 300));
     const pinnedEdgeIds = new Set<string>(pinnedEdgeId ? [pinnedEdgeId] : []);
@@ -1334,7 +2752,7 @@ export class AggregationService {
       type: T.TopologyNodeType;
       label: string;
       subtitle?: string;
-      extra?: Partial<Pick<T.AgentTopologyNode, 'agentId' | 'workspacePath' | 'collectorId'>>;
+      extra?: Partial<Pick<T.AgentTopologyNode, 'agentAssetId' | 'agentInstanceId' | 'agentId' | 'classification' | 'workspacePath' | 'collectorId'>>;
     };
     type EdgeSpec = {
       id: string;
@@ -1352,15 +2770,18 @@ export class AggregationService {
 
     const nodes = new Map<string, NodeAgg>();
     const edges = new Map<string, EdgeAgg>();
+    const rosterAgentNodeIds = new Set<string>();
     const bumpNode = (
       id: string,
       type: T.TopologyNodeType,
       label: string,
       subtitle: string | undefined,
       event: T.JudgedEvent,
-      extra: Partial<Pick<T.AgentTopologyNode, 'agentId' | 'workspacePath' | 'collectorId'>> = {},
+      extra: Partial<Pick<T.AgentTopologyNode, 'agentAssetId' | 'agentInstanceId' | 'agentId' | 'classification' | 'workspacePath' | 'collectorId'>> = {},
     ) => {
-      const risky = event.verdict !== 'allow';
+      const fact = factByEventId.get(event.eventId);
+      const eventCount = fact?.eventCount ?? 1;
+      const riskyEventCount = fact?.riskyEventCount ?? (event.verdict !== 'allow' ? 1 : 0);
       const cur = nodes.get(id);
       const base = cur ?? {
         nodeId: id,
@@ -1373,12 +2794,12 @@ export class AggregationService {
         severityRank: 0,
         ...extra,
       };
-      base.eventCount += 1;
-      if (risky) {
-        base.riskyEventCount += 1;
-        base.severityRank = Math.max(base.severityRank, SEV_RANK[event.severity]);
+      base.eventCount += eventCount;
+      if (riskyEventCount > 0) {
+        base.riskyEventCount += riskyEventCount;
+        base.severityRank = Math.max(base.severityRank, fact?.worstSeverityRank ?? SEV_RANK[event.severity]);
       }
-      base.lastSeenMs = Math.max(base.lastSeenMs, event.at);
+      base.lastSeenMs = Math.max(base.lastSeenMs, fact?.lastSeenAt ?? event.at);
       nodes.set(id, base);
     };
     const bumpEdge = (
@@ -1390,8 +2811,11 @@ export class AggregationService {
     ) => {
       const id = edgeId(sourceNodeId, targetNodeId, type);
       const cur = edges.get(id);
-      const risky = event.verdict !== 'allow';
-      const rank = risky ? SEV_RANK[event.severity] : 0;
+      const fact = factByEventId.get(event.eventId);
+      const eventCount = fact?.eventCount ?? 1;
+      const riskyEventCount = fact?.riskyEventCount ?? (event.verdict !== 'allow' ? 1 : 0);
+      const rank = riskyEventCount > 0 ? (fact?.worstSeverityRank ?? SEV_RANK[event.severity]) : 0;
+      const lastSeenAt = fact?.lastSeenAt ?? event.at;
       const base: EdgeAgg = cur ?? {
         edgeId: id,
         sourceNodeId,
@@ -1407,18 +2831,22 @@ export class AggregationService {
         sampleSubject: event.subject,
         risks: new Map(),
       };
-      base.eventCount += 1;
-      if (risky) {
-        base.riskyEventCount += 1;
+      base.eventCount += eventCount;
+      if (riskyEventCount > 0) {
+        base.riskyEventCount += riskyEventCount;
         if (rank >= base.severityRank) {
           base.severityRank = rank;
-          base.maxSeverity = event.severity;
+          base.maxSeverity = LEVEL_BY_RANK[Math.max(0, Math.min(4, rank))] as T.Severity;
         }
-        const risk = base.risks.get(event.riskCategory);
-        base.risks.set(event.riskCategory, { riskName: event.riskName, eventCount: (risk?.eventCount ?? 0) + 1 });
+        const category = fact?.riskCategory ?? event.riskCategory;
+        const risk = base.risks.get(category);
+        base.risks.set(category, {
+          riskName: fact?.riskName ?? event.riskName,
+          eventCount: (risk?.eventCount ?? 0) + riskyEventCount,
+        });
       }
-      if (event.at >= base.lastSeenMs) {
-        base.lastSeenMs = event.at;
+      if (lastSeenAt >= base.lastSeenMs) {
+        base.lastSeenMs = lastSeenAt;
         base.sampleEventId = event.eventId;
         base.sampleSubject = event.subject;
       }
@@ -1426,24 +2854,63 @@ export class AggregationService {
     };
 
     for (const e of events) {
+      const resolved = resolveAgent(e);
       const collectorRef = eventCollectorId(e);
       const sourceRef = eventSourceId(e);
+      const canonicalWorkspacePath = resolved.metadata?.workspacePath ?? e.workspacePath;
+      const canonicalAgentId =
+        canonicalAgentName(e.attribution?.agentScopeId) ??
+        canonicalAgentName(e.attribution?.agentDisplayName) ??
+        resolved.detectedName ??
+        e.agentId;
+      const canonicalAgentLabel =
+        resolved.displayName ??
+        canonicalAgentName(e.attribution?.agentDisplayName) ??
+        canonicalAgentName(e.attribution?.agentScopeId) ??
+        resolved.detectedName ??
+        e.agentId;
+      const runtimeInstanceId = agentRuntimeInstanceIdForEvent(e);
+      const runtimeLocation = detectedAgentIdentity(e).locationLabel ?? canonicalWorkspacePath;
       const isPinnedEvent = Boolean(pinnedEventId && e.eventId === pinnedEventId);
-      const matchesDirectScope =
-        (!agentId || e.agentId === agentId) &&
-        (!workspacePath || e.workspacePath === workspacePath) &&
+      const matchesEntityScope =
+        (!agentAssetId || resolved.agentAssetId === agentAssetId) &&
+        (!agentInstanceId || runtimeInstanceId === agentInstanceId) &&
+        (!agentId || [e.agentId, canonicalAgentId, canonicalAgentLabel].includes(agentId)) &&
+        (!workspacePath || canonicalWorkspacePath === workspacePath || e.workspacePath === workspacePath) &&
         (!collectorId || collectorRef === collectorId) &&
-        (!sourceId || sourceRef === sourceId) &&
+        (!sourceId || sourceRef === sourceId);
+      const matchesRelationshipScope =
+        matchesEntityScope &&
         (includeBenign || e.verdict !== 'allow');
-      if (!pinnedEdgeId && !isPinnedEvent && !matchesDirectScope) continue;
+      if (!pinnedEdgeId && !isPinnedEvent && !matchesEntityScope) continue;
 
       const target = topologyTarget(e);
-      const agentNodeId = nodeId('agent', `${e.workspacePath}|${e.agentId}`);
-      const workspaceNodeId = nodeId('workspace', e.workspacePath);
+      const agentNodeId = nodeId(
+        'agent',
+        agentInventoryGroupKey(resolved.agentAssetId, runtimeInstanceId),
+      );
+      const workspaceNodeId = nodeId('workspace', canonicalWorkspacePath);
       const collectorNodeId = collectorRef ? nodeId('collector', collectorRef) : '';
       const targetNodeId = target ? nodeId(target.type, target.key) : '';
-      const workspaceNode: NodeSpec = { id: workspaceNodeId, type: 'workspace', label: e.workspacePath, extra: { workspacePath: e.workspacePath } };
-      const agentNode: NodeSpec = { id: agentNodeId, type: 'agent', label: e.agentId, subtitle: e.workspacePath, extra: { agentId: e.agentId, workspacePath: e.workspacePath } };
+      const workspaceNode: NodeSpec = {
+        id: workspaceNodeId,
+        type: 'workspace',
+        label: canonicalWorkspacePath,
+        extra: { workspacePath: canonicalWorkspacePath },
+      };
+      const agentNode: NodeSpec = {
+        id: agentNodeId,
+        type: 'agent',
+        label: canonicalAgentLabel,
+        subtitle: runtimeLocation,
+        extra: {
+          agentAssetId: resolved.agentAssetId,
+          agentInstanceId: runtimeInstanceId,
+          agentId: canonicalAgentId,
+          classification: resolved.effectiveClassification,
+          workspacePath: canonicalWorkspacePath,
+        },
+      };
       const collectorNode: NodeSpec | undefined = collectorRef
         ? { id: collectorNodeId, type: 'collector', label: collectorRef, subtitle: attrString(e, 'collectorNode') || undefined, extra: { collectorId: collectorRef } }
         : undefined;
@@ -1457,13 +2924,31 @@ export class AggregationService {
       if (target && targetNode) eventEdges.push({ id: edgeId(agentNodeId, targetNodeId, target.edgeType), source: agentNode, target: targetNode, type: target.edgeType, label: target.edgeLabel });
       const eventEdgeIds = eventEdges.map((edge) => edge.id);
       const isPinnedEdge = Boolean(pinnedEdgeId && eventEdgeIds.includes(pinnedEdgeId));
-      const normalMatch =
+      const matchesText =
+        !q || [
+          e.agentId,
+          resolved.agentAssetId,
+          runtimeInstanceId,
+          canonicalAgentId,
+          canonicalAgentLabel,
+          canonicalWorkspacePath,
+          e.subject,
+          e.riskCategory,
+          e.riskName,
+          collectorRef,
+          sourceRef,
+          target?.label,
+          target?.subtitle,
+        ].some((v) => (v ?? '').toLowerCase().includes(q));
+      const rosterMatch =
         windowedEventIds.has(e.eventId) &&
-        matchesDirectScope &&
-        (!q || [e.agentId, e.workspacePath, e.subject, e.riskCategory, e.riskName, collectorRef, sourceRef, target?.label, target?.subtitle].some((v) => (v ?? '').toLowerCase().includes(q)));
+        matchesEntityScope &&
+        matchesText;
+      const normalMatch =
+        rosterMatch &&
+        matchesRelationshipScope;
       const includeAllEventEdges = exactPinnedMode ? isPinnedEvent : normalMatch || isPinnedEvent;
       const includedEdges = includeAllEventEdges ? eventEdges : eventEdges.filter((edge) => pinnedEdgeId && edge.id === pinnedEdgeId);
-      if (!includedEdges.length && !isPinnedEdge) continue;
       if (isPinnedEvent) for (const id of eventEdgeIds) pinnedEdgeIds.add(id);
 
       const bumpedNodeIds = new Set<string>();
@@ -1472,6 +2957,13 @@ export class AggregationService {
         bumpedNodeIds.add(node.id);
         bumpNode(node.id, node.type, node.label, node.subtitle, e, node.extra);
       };
+      // The relationship dropdown filters edges, not the Agent roster. Otherwise a healthy
+      // runtime disappears from topology and looks like an attribution/data-loss bug.
+      if (rosterMatch) {
+        rosterAgentNodeIds.add(agentNode.id);
+        bumpNodeOnce(agentNode);
+      }
+      if (!includedEdges.length && !isPinnedEdge) continue;
       for (const edge of includedEdges) {
         bumpNodeOnce(edge.source);
         bumpNodeOnce(edge.target);
@@ -1488,7 +2980,10 @@ export class AggregationService {
         b.lastSeenMs - a.lastSeenMs,
       )
       .slice(0, limit);
-    const selectedNodeIds = new Set(selectedEdges.flatMap((edge) => [edge.sourceNodeId, edge.targetNodeId]));
+    const selectedNodeIds = new Set([
+      ...selectedEdges.flatMap((edge) => [edge.sourceNodeId, edge.targetNodeId]),
+      ...rosterAgentNodeIds,
+    ]);
     const selectedNodes = [...nodes.values()].filter((node) => selectedNodeIds.has(node.nodeId));
     const nodeItem = (node: NodeAgg): T.AgentTopologyNode => {
       const level = node.riskyEventCount ? levelByRank(node.severityRank) : { level: 'safe', text: LEVEL_TEXT.safe };
@@ -1497,7 +2992,10 @@ export class AggregationService {
         type: node.type,
         label: node.label,
         subtitle: node.subtitle,
+        agentAssetId: node.agentAssetId,
+        agentInstanceId: node.agentInstanceId,
         agentId: node.agentId,
+        classification: node.classification,
         workspacePath: node.workspacePath,
         collectorId: node.collectorId,
         riskLevel: level.level,
@@ -1542,30 +3040,78 @@ export class AggregationService {
         edgeCount: edgeItems.length,
         riskyEdgeCount: edgeItems.filter((edge) => edge.riskyEventCount > 0).length,
       },
-      updateTime: iso(),
+      coverage: this.queryCoverage(filter, events, {
+        source: durable?.source ?? 'memory_hot_ring',
+        totalMode: 'exact',
+        partial: !durable,
+        partialReason: durable ? undefined : 'hot_ring_only',
+        committedCutoffMs: durable?.committedCutoffMs,
+        dataFromMs: topologyFacts?.length
+          ? Math.min(...topologyFacts.map((fact) => fact.firstSeenAt))
+          : undefined,
+        dataToMs: topologyFacts?.length
+          ? Math.max(...topologyFacts.map((fact) => fact.lastSeenAt))
+          : undefined,
+      }),
+      updateTime: iso(resolveTimeWindow(filter).endMs),
     };
   }
 
-  collectorHealth(filter: T.CollectorHealthQuery): T.CollectorHealth {
-    const { sinceMs, spanMs } = this.win(filter);
-    const endMs = sinceMs + spanMs;
-    const windowHeartbeats = this.judge
-      .queryCollectorHeartbeats(sinceMs)
-      .filter((heartbeat) => heartbeat.at <= endMs);
-    const heartbeatHeads = this.judge.collectorHeartbeatHeads();
-    const latestHeartbeatByCollector = new Map(heartbeatHeads.latest.map((heartbeat) => [heartbeat.collectorId, heartbeat]));
-    const latestMetricsByCollector = new Map(heartbeatHeads.latestMetrics.map((heartbeat) => [heartbeat.collectorId, heartbeat]));
-    const latestRawByCollector = new Map(heartbeatHeads.latestRaw.map((heartbeat) => [heartbeat.collectorId, heartbeat]));
-    const latestForwarderByCollector = new Map(
-      heartbeatHeads.latestForwarder.map((heartbeat) => [heartbeat.collectorId, heartbeat]),
+  async storedCollectorHealth(filter: T.CollectorHealthQuery): Promise<T.CollectorHealth> {
+    const window = resolveTimeWindow(filter);
+    const [persistedHeartbeats, persistedLatest, distributedLatest] = await Promise.all([
+      this.judge.storedCollectorHeartbeats(window.startMs, window.endMs),
+      this.judge.storedLatestCollectorHeartbeats(window.endMs),
+      this.judge.distributedLatestCollectorHeartbeats(window.endMs),
+    ]);
+    if (persistedHeartbeats === null || persistedLatest === null) return this.collectorHealth(filter);
+    const hotHeartbeats = this.judge.queryCollectorHeartbeats(window.startMs, window.endMs);
+    const hotLatest = this.judge.latestCollectorHeartbeats(window.endMs);
+    const merge = (items: T.CollectorHeartbeatRecord[]) => {
+      const unique = new Map<string, T.CollectorHeartbeatRecord>();
+      for (const item of items) unique.set(`${item.collectorId}\0${item.at}`, item);
+      return [...unique.values()];
+    };
+    const heartbeats = merge([...persistedHeartbeats, ...hotHeartbeats]);
+    const latest = merge([...persistedLatest, ...distributedLatest, ...hotLatest])
+      .sort((a, b) => a.at - b.at)
+      .reduce((map, item) => map.set(item.collectorId, item), new Map<string, T.CollectorHeartbeatRecord>());
+    const hasRedisCurrent = distributedLatest.some((current) =>
+      !persistedLatest.some((saved) => saved.collectorId === current.collectorId && saved.at >= current.at),
     );
+    return this.collectorHealth(filter, {
+      heartbeats,
+      latest: [...latest.values()],
+      source: hasRedisCurrent
+        ? 'clickhouse+redis_current'
+        : hotHeartbeats.some((hot) => !persistedHeartbeats.some((saved) => saved.collectorId === hot.collectorId && saved.at === hot.at))
+        ? 'clickhouse+hot_delta'
+        : 'clickhouse',
+    });
+  }
+
+  collectorHealth(
+    filter: T.CollectorHealthQuery,
+    durable?: {
+      heartbeats: T.CollectorHeartbeatRecord[];
+      latest: T.CollectorHeartbeatRecord[];
+      source: 'clickhouse' | 'clickhouse+hot_delta' | 'clickhouse+redis_current';
+    },
+  ): T.CollectorHealth {
+    const window = resolveTimeWindow(filter);
+    const sinceMs = window.startMs;
+    const spanMs = window.spanMs;
+    const windowHeartbeats = durable?.heartbeats
+      ?? this.judge.queryCollectorHeartbeats(window.startMs, window.endMs);
+    const latestAtSnapshot = durable?.latest
+      ?? this.judge.latestCollectorHeartbeats(window.endMs);
     const byCollector = new Map<string, T.CollectorHeartbeatRecord[]>();
     for (const hb of windowHeartbeats) (byCollector.get(hb.collectorId) ?? byCollector.set(hb.collectorId, []).get(hb.collectorId)!).push(hb);
-    for (const hb of heartbeatHeads.latest) {
+    for (const hb of latestAtSnapshot) {
       if (!byCollector.has(hb.collectorId)) byCollector.set(hb.collectorId, []);
     }
 
-    const t = now();
+    const t = window.endMs;
     const stateText: Record<T.CollectorHealthState, string> = {
       healthy: '健康',
       quiet: '静默',
@@ -1574,14 +3120,8 @@ export class AggregationService {
       down: '断流',
     };
     const items = [...byCollector.entries()].map(([collectorId, hbs]): T.CollectorHealthItem => {
-      const latest = latestHeartbeatByCollector.get(collectorId);
-      const latestMetricsHeartbeat = latestMetricsByCollector.get(collectorId);
-      const latestRawHeartbeat = latestRawByCollector.get(collectorId);
-      const latestForwarderHeartbeat = latestForwarderByCollector.get(collectorId);
-      const freshMetricsHeartbeat = latestMetricsHeartbeat?.filterMetricsReportedAt !== undefined &&
-        t - latestMetricsHeartbeat.filterMetricsReportedAt <= COLLECTOR_STALE_MS
-        ? latestMetricsHeartbeat
-        : undefined;
+      const latest = [...hbs, ...latestAtSnapshot.filter((hb) => hb.collectorId === collectorId)]
+        .sort((a, b) => b.at - a.at)[0];
       const categoryCounts = Object.fromEntries(EVENT_CATEGORIES.map((category) => [category, 0])) as Record<T.EventCategory, number>;
       let eventCount = 0;
       let observedAgentCount = 0;
@@ -1795,14 +3335,58 @@ export class AggregationService {
       observedAgentCount: filtered.reduce((a, item) => a + item.observedAgentCount, 0),
     };
     const limit = Math.max(1, Math.min(500, filter.limit ?? 120));
-    return { items: filtered.slice(0, limit), total: filtered.length, summary, updateTime: iso() };
+    return {
+      items: filtered.slice(0, limit),
+      total: filtered.length,
+      summary,
+      coverage: this.queryCoverage(filter, [], {
+        source: durable?.source ?? 'memory_hot_ring',
+        totalMode: 'exact',
+        partial: !durable,
+        partialReason: durable ? undefined : 'hot_ring_only',
+        dataFromMs: windowHeartbeats.length
+          ? Math.min(...windowHeartbeats.map((heartbeat) => heartbeat.at))
+          : undefined,
+        dataToMs: windowHeartbeats.length
+          ? Math.max(...windowHeartbeats.map((heartbeat) => heartbeat.at))
+          : undefined,
+      }),
+      updateTime: iso(window.endMs),
+    };
   }
 
-  coverageOverview(filter: T.CoverageQuery): T.CoverageOverview {
-    const { events: windowEvents } = this.win(filter);
-    const events = windowEvents.filter((event) => event.attribution?.monitored === true);
-    const collectors = this.collectorHealth({ timeType: filter.timeType, startTime: filter.startTime, endTime: filter.endTime, limit: 500 });
-    const agents = this.agentInventory({ timeType: filter.timeType, startTime: filter.startTime, endTime: filter.endTime, scope: 'agent', limit: 500 });
+  async storedCoverageOverview(filter: T.CoverageQuery): Promise<T.CoverageOverview> {
+    if (!this.judge.storageStatus().clickhouseReady) return this.coverageOverview(filter);
+    const [collectors, agents] = await Promise.all([
+      this.storedCollectorHealth({
+        timeType: filter.timeType,
+        startTime: filter.startTime,
+        endTime: filter.endTime,
+        limit: 500,
+      }),
+      this.storedAgentInventory({
+        timeType: filter.timeType,
+        startTime: filter.startTime,
+        endTime: filter.endTime,
+        scope: 'agent',
+        limit: 500,
+      }),
+      this.sources.refreshDistributedCurrentState(),
+    ]);
+    return this.coverageOverview(filter, { collectors, agents });
+  }
+
+  coverageOverview(
+    filter: T.CoverageQuery,
+    durable?: { collectors: T.CollectorHealth; agents: T.AgentInventory },
+  ): T.CoverageOverview {
+    const events = durable
+      ? []
+      : this.win(filter).events.filter((event) => event.attribution?.monitored === true);
+    const collectors = durable?.collectors ??
+      this.collectorHealth({ timeType: filter.timeType, startTime: filter.startTime, endTime: filter.endTime, limit: 500 });
+    const agents = durable?.agents ??
+      this.agentInventory({ timeType: filter.timeType, startTime: filter.startTime, endTime: filter.endTime, scope: 'agent', limit: 500 });
     const sourceList = this.sources.list({ status: 'all', type: 'all', limit: 500 });
     const collectorById = new Map(collectors.items.map((collector) => [collector.collectorId, collector]));
     const activeCollectorIds = new Set(
@@ -1966,7 +3550,12 @@ export class AggregationService {
       }
     }
 
-    const collectorIdsFromEvents = new Map<string, { count: number; agents: Set<string>; sample?: T.JudgedEvent }>();
+    const collectorIdsFromEvents = new Map<string, {
+      count: number;
+      agents: Set<string>;
+      sample?: T.JudgedEvent;
+      aggregateOnly?: boolean;
+    }>();
     for (const e of events) {
       const collectorId = eventCollectorId(e);
       if (!collectorId) continue;
@@ -1976,16 +3565,39 @@ export class AggregationService {
       if (!cur.sample || e.at > cur.sample.at) cur.sample = e;
       collectorIdsFromEvents.set(collectorId, cur);
     }
+    if (durable) {
+      for (const agent of agents.items) {
+        for (const collectorId of agent.collectorIds ?? []) {
+          const current = collectorIdsFromEvents.get(collectorId) ?? {
+            count: 0,
+            agents: new Set<string>(),
+            aggregateOnly: true,
+          };
+          current.agents.add(agent.agentId);
+          collectorIdsFromEvents.set(collectorId, current);
+        }
+      }
+    }
     for (const [collectorId, rec] of collectorIdsFromEvents) {
       if (collectorById.has(collectorId)) continue;
       issues.push(issue(
         'missing_collector_heartbeat',
         'high',
         `缺少 Collector 心跳 · ${collectorId}`,
-        `${rec.count} 条事件携带该 collectorId，但没有对应 CollectorHeartbeat。`,
+        rec.aggregateOnly
+          ? `${rec.agents.size} 个持久化 Agent 聚合仍引用该 collectorId，但查询窗口内没有对应 CollectorHeartbeat。`
+          : `${rec.count} 条事件携带该 collectorId，但没有对应 CollectorHeartbeat。`,
         '启用 a3s-observer CollectorHeartbeat，或让 forwarder 定期 POST /security-center/collectors/heartbeat。',
-        { eventCount: String(rec.count), agentCount: String(rec.agents.size) },
-        { collectorId, nodeName: attrString(rec.sample!, 'collectorNode') || undefined, evidenceEventId: rec.sample?.eventId, evidenceSubject: rec.sample?.subject, lastSeenAt: rec.sample ? iso(rec.sample.at) : undefined },
+        rec.aggregateOnly
+          ? { evidenceMode: 'agent_aggregate', agentCount: String(rec.agents.size) }
+          : { evidenceMode: 'event_fact', eventCount: String(rec.count), agentCount: String(rec.agents.size) },
+        {
+          collectorId,
+          nodeName: rec.sample ? attrString(rec.sample, 'collectorNode') || undefined : undefined,
+          evidenceEventId: rec.sample?.eventId,
+          evidenceSubject: rec.sample?.subject,
+          lastSeenAt: rec.sample ? iso(rec.sample.at) : undefined,
+        },
       ));
     }
 
@@ -1997,10 +3609,17 @@ export class AggregationService {
       const key = `${agent.workspacePath}\0${agent.agentId}`;
       const agentEvents = byAgent.get(key) ?? [];
       const latest = [...agentEvents].sort((a, b) => b.at - a.at)[0];
-      const collectorIds = new Set(agentEvents.map(eventCollectorId).filter(Boolean));
+      const collectorIds = new Set(
+        durable
+          ? agent.collectorIds ?? []
+          : agentEvents.map(eventCollectorId).filter(Boolean),
+      );
       const liveCollectorIds = [...collectorIds].filter((collectorId) => activeCollectorIds.has(collectorId));
       const missingCollectorEvents = agentEvents.filter((e) => !eventCollectorId(e));
-      eventsWithoutCollector += missingCollectorEvents.length;
+      const missingCollectorEventCount = durable
+        ? agent.eventsWithoutCollector ?? 0
+        : missingCollectorEvents.length;
+      eventsWithoutCollector += missingCollectorEventCount;
       const covered = liveCollectorIds.length > 0;
       if (covered) coveredAgents += 1;
       else uncoveredAgents += 1;
@@ -2014,7 +3633,7 @@ export class AggregationService {
           `最近事件: ${agent.lastSeen}，当前窗口内该 Agent 没有新的旁路活动。`,
           '确认该 Agent 是否仍在运行；若仍运行，检查所在节点 observer/forwarder 覆盖。',
           { openIncidents: String(agent.openIncidentCount), eventCount: String(agent.eventCount) },
-          { agentId: agent.agentId, workspacePath: agent.workspacePath, evidenceEventId: latest?.eventId, evidenceSubject: latest?.subject, lastSeenAt: agent.lastSeen },
+          { agentId: agent.agentId, workspacePath: agent.workspacePath, evidenceEventId: latest?.eventId ?? agent.lastEventId, evidenceSubject: latest?.subject ?? agent.lastEventSubject, lastSeenAt: agent.lastSeen },
         ));
       }
 
@@ -2028,18 +3647,18 @@ export class AggregationService {
             ? `事件归属 Collector: ${[...collectorIds].join(', ')}，但当前没有活跃心跳。`
             : '该 Agent 的事件没有 collectorId，无法定位采集链路。',
           '检查 forwarder 是否附加 collectorId/nodeName，并确认对应 CollectorHeartbeat 正常上报。',
-          { collectorIds: [...collectorIds].join(', ') || 'none', missingCollectorEvents: String(missingCollectorEvents.length) },
-          { agentId: agent.agentId, workspacePath: agent.workspacePath, evidenceEventId: latest?.eventId, evidenceSubject: latest?.subject, lastSeenAt: agent.lastSeen },
+          { collectorIds: [...collectorIds].join(', ') || 'none', missingCollectorEvents: String(missingCollectorEventCount) },
+          { agentId: agent.agentId, workspacePath: agent.workspacePath, evidenceEventId: latest?.eventId ?? agent.lastEventId, evidenceSubject: latest?.subject ?? agent.lastEventSubject, lastSeenAt: agent.lastSeen },
         ));
-      } else if (missingCollectorEvents.length > 0) {
+      } else if (missingCollectorEventCount > 0) {
         issues.push(issue(
           'agent_uncovered',
           agent.riskyEventCount > 0 ? 'medium' : 'low',
           `Agent 部分事件缺少 Collector 归属 · ${agent.agentId}`,
-          `${missingCollectorEvents.length}/${agentEvents.length} 条事件没有 collectorId。`,
+          `${missingCollectorEventCount}/${agent.eventCount} 条事件没有 collectorId。`,
           '统一使用 observer forwarder，并在事件 attributes 中附加 collectorId/nodeName。',
-          { missingCollectorEvents: String(missingCollectorEvents.length), eventCount: String(agentEvents.length) },
-          { agentId: agent.agentId, workspacePath: agent.workspacePath, evidenceEventId: missingCollectorEvents[0]?.eventId, evidenceSubject: missingCollectorEvents[0]?.subject, lastSeenAt: agent.lastSeen },
+          { missingCollectorEvents: String(missingCollectorEventCount), eventCount: String(agent.eventCount) },
+          { agentId: agent.agentId, workspacePath: agent.workspacePath, evidenceEventId: missingCollectorEvents[0]?.eventId ?? agent.lastEventId, evidenceSubject: missingCollectorEvents[0]?.subject ?? agent.lastEventSubject, lastSeenAt: agent.lastSeen },
         ));
       }
     }
@@ -2141,11 +3760,60 @@ export class AggregationService {
         observedWorkspaces: distinct(agents.items.map((agent) => agent.workspacePath)),
       },
       issues: filtered.slice(0, limit),
+      coverage: durable
+        ? {
+            ...agents.coverage,
+            source: agents.coverage.source === 'clickhouse+hot_delta' || collectors.coverage?.source === 'clickhouse+hot_delta'
+              ? 'clickhouse+hot_delta'
+              : collectors.coverage?.source === 'clickhouse+redis_current'
+                ? 'clickhouse+redis_current'
+                : 'clickhouse',
+            partial: Boolean(agents.coverage.partial || collectors.coverage?.partial),
+            partialReason: agents.coverage.partialReason ?? collectors.coverage?.partialReason,
+          }
+        : this.queryCoverage(filter, events, {
+            source: 'memory_hot_ring',
+            totalMode: 'exact',
+            partial: true,
+            partialReason: 'hot_ring_only',
+          }),
       updateTime: iso(),
     };
   }
 
-  policySimulation(input: T.PolicySimulationRequest): T.PolicySimulationResult {
+  async storedPolicySimulation(input: T.PolicySimulationRequest): Promise<T.PolicySimulationResult> {
+    if (!this.judge.storageStatus().clickhouseReady) return this.policySimulation(input);
+    const window = resolveTimeWindow(input);
+    const sampleLimit = Math.max(100, Math.min(5_000, input.sampleLimit ?? 2_000));
+    const persisted = await this.judge.searchStoredEventsPage({
+      sinceMs: window.startMs,
+      untilMs: window.endMs,
+      monitoredOnly: input.scope === 'agent',
+      limit: sampleLimit,
+    });
+    const hot = this.judge.queryRange(window.startMs, window.endMs);
+    const scoped = foldLatestEventRevisions([...persisted.events, ...hot])
+      .filter((event) => input.scope !== 'agent' || isMonitoredAgentEvent(event))
+      .sort((a, b) => b.at - a.at);
+    const truncated = persisted.hasMore || scoped.length > sampleLimit;
+    const events = scoped.slice(0, sampleLimit);
+    const coverage = this.queryCoverage(input, events, {
+      source: hot.length ? 'clickhouse+hot_delta' : 'clickhouse',
+      totalMode: 'omitted',
+      partial: truncated,
+      partialReason: truncated ? 'scan_limit' : undefined,
+      committedCutoffMs: persisted.committedCutoffMs,
+    });
+    return this.policySimulation(input, events, coverage, sampleLimit, truncated);
+  }
+
+  policySimulation(
+    input: T.PolicySimulationRequest,
+    sampledEvents?: T.JudgedEvent[],
+    durableCoverage?: T.QueryCoverage,
+    durableSampleLimit?: number,
+    durableTruncated = false,
+  ): T.PolicySimulationResult {
     const config = sanitizePolicy(input.policy);
     let simulator: Sentry;
     try {
@@ -2153,8 +3821,10 @@ export class AggregationService {
     } catch (error) {
       throw policyConfigError(error);
     }
-    const { events } = this.win(input);
+    const window = sampledEvents ? undefined : this.win(input);
+    const events = sampledEvents ?? window!.events;
     const limit = Math.max(1, Math.min(500, input.limit ?? 120));
+    const sampleLimit = durableSampleLimit ?? Math.max(1, Math.min(100_000, events.length));
     let evaluatedEvents = 0;
     let skippedEvents = 0;
     const diffs: T.PolicySimulationDiff[] = [];
@@ -2236,6 +3906,18 @@ export class AggregationService {
       diffs: diffs.slice(0, limit),
       byAgent: group((diff) => diff.agentId),
       byWorkspace: group((diff) => diff.workspacePath),
+      sampling: {
+        strategy: 'latest_event_sample',
+        sampleLimit,
+        sampledEvents: events.length,
+        truncated: durableTruncated || !sampledEvents,
+      },
+      coverage: durableCoverage ?? this.queryCoverage(input, events, {
+        source: 'memory_hot_ring',
+        totalMode: 'omitted',
+        partial: true,
+        partialReason: 'hot_ring_only',
+      }),
       updateTime: iso(),
     };
   }
@@ -2355,6 +4037,45 @@ export class AggregationService {
       behavioral: { actionRate: recent.length, decisionPattern: errorRate > 25 ? 'drift' : 'baseline', stateTransitions: distinct(recent.map((e) => e.sessionId)), goalProgress: Math.max(0, 100 - Math.round(errorRate)) },
       system: { agentCount: distinct(events.map((e) => e.agentId)), commThroughput: comm, infraHealthy: true },
       updateTime: iso(),
+    };
+  }
+
+  async agentObservabilityForWindow(filter: T.SecurityTimeFilter): Promise<T.AgentObservability> {
+    const durable = await this.storedAgentMetricFacts(filter, 60);
+    if (!durable) return this.agentObservability(filter);
+    const window = resolveTimeWindow(filter);
+    const facts = durable.facts;
+    const eventCount = facts.reduce((sum, fact) => sum + fact.eventCount, 0);
+    const riskyEventCount = facts.reduce((sum, fact) => sum + fact.riskyEventCount, 0);
+    const recentEventCount = facts.reduce((sum, fact) => sum + fact.recentEventCount, 0);
+    const recentCommCount = facts.reduce((sum, fact) => sum + fact.recentCommCount, 0);
+    const recentSessionKeys = new Set(facts.flatMap((fact) => fact.recentSessionKeys));
+    const agentAssetIds = new Set(facts.map((fact) =>
+      this.agentMetadata.resolveEvent(fact.representativeEvent).agentAssetId,
+    ));
+    const errorRate = round1((riskyEventCount / (eventCount || 1)) * 100);
+    return {
+      health: {
+        heartbeatOk: recentEventCount > 0,
+        resourceUtil: Math.min(99, 20 + recentEventCount * 3),
+        errorRate,
+        decisionLatencyMs: Math.round(
+          facts.reduce((sum, fact) => sum + fact.latencyTotal, 0) / (eventCount || 1),
+        ),
+      },
+      behavioral: {
+        actionRate: recentEventCount,
+        decisionPattern: errorRate > 25 ? 'drift' : 'baseline',
+        stateTransitions: recentSessionKeys.size,
+        goalProgress: Math.max(0, 100 - Math.round(errorRate)),
+      },
+      system: {
+        agentCount: agentAssetIds.size,
+        commThroughput: recentCommCount,
+        infraHealthy: true,
+      },
+      coverage: durable.coverage,
+      updateTime: iso(window.endMs),
     };
   }
 

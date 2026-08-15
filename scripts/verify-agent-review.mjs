@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const { AgentMetadataService } = require('../apps/api/dist/security-monitoring/agent-metadata.service.js');
+const { hasDirectAgentRootEvidence } = require('../apps/api/dist/security-monitoring/agent-identity.js');
 const { behaviorDiscoveryEligible } = require('./observer-workload-filter.js');
 
 assert.equal(behaviorDiscoveryEligible({
@@ -15,8 +16,65 @@ assert.equal(behaviorDiscoveryEligible({
   state: 'unknown',
   attribution: { source: 'process_graph' },
 }), true, 'automatic Unknown identities remain eligible for behavior discovery');
+const signatureOnlyRoot = {
+  process: { pid: 42, comm: 'codex', exe: '/usr/bin/codex' },
+  attribution: {
+    rootPid: 42,
+    agentScopeId: 'codex',
+    source: 'process_signature',
+  },
+};
+assert.equal(
+  hasDirectAgentRootEvidence(signatureOnlyRoot),
+  false,
+  'a one-event command signature is not sufficient to create a visible Agent asset',
+);
+assert.equal(
+  hasDirectAgentRootEvidence({
+    ...signatureOnlyRoot,
+    attribution: { ...signatureOnlyRoot.attribution, source: 'process_graph' },
+  }),
+  true,
+  'the same runtime root becomes direct evidence once process lineage confirms it',
+);
 
 const service = new AgentMetadataService();
+const hostAgentEvent = {
+  workspacePath: '/workspace/security',
+  agentId: 'codex',
+  sessionId: 'session-a',
+  userId: 'uid:1000',
+  process: {
+    hostId: 'host-a',
+    bootId: 'boot-a',
+    uid: 'uid:1000',
+    pid: 101,
+    exe: '/usr/bin/bash',
+  },
+  attribution: {
+    monitored: true,
+    classification: 'probable_agent',
+    agentScopeId: 'codex',
+    agentWorkspacePath: '/workspace/security',
+    rootPid: 100,
+    rootStartTime: '1000',
+    source: 'process_graph',
+  },
+};
+assert.deepEqual(
+  service.logicalIdentityKeysForEvent(hostAgentEvent),
+  service.logicalIdentityKeysForEvent({
+    ...hostAgentEvent,
+    workspacePath: '/workspace/security/subproject',
+    userId: 'system',
+    process: { ...hostAgentEvent.process, pid: 102, exe: '/usr/bin/git' },
+    attribution: {
+      ...hostAgentEvent.attribution,
+      agentWorkspacePath: '/workspace/security/subproject',
+    },
+  }),
+  'child tools and replacement instances of one host Agent share one logical review identity',
+);
 assert.throws(() => service.review('unobserved-manual-agent', {
   workspacePath: 'unknown',
   decision: 'confirmed_agent',
@@ -85,6 +143,20 @@ assert.equal(confirmedEvent.attribution?.reason, 'human_confirmed');
 assert.equal(confirmedEvent.attribution?.monitored, true);
 assert.equal(confirmedEvent.attribution?.agentScopeId, event.attribution.agentScopeId, 'review preserves the observed Agent scope');
 assert.equal(confirmedEvent.attribution?.agentDisplayName, event.attribution.agentDisplayName, 'review preserves the collected display evidence');
+
+const restartedContainerId = 'd5d6f109a49fe8b948d683e2aa244b6c24b7c2f49e4e42eb164c0e372e976441';
+const restartedEvent = structuredClone(event);
+restartedEvent.process.pid = 202;
+restartedEvent.process.cgroup =
+  `0::/kubepods.slice/kubepods-burstable-podnew_pod_uid.slice/cri-containerd-${restartedContainerId}.scope`;
+restartedEvent.attribution.agentInstanceId = `container:${restartedContainerId.slice(0, 12)}`;
+restartedEvent.attribution.physicalWorkloadId = `container:${restartedContainerId.slice(0, 12)}`;
+restartedEvent.attribution.workloadRef.podUid = 'new-pod-uid';
+assert.equal(
+  service.applyReview(restartedEvent).attribution?.classification,
+  'confirmed_agent',
+  'a trusted replacement instance inherits the logical Agent review without another model or human review',
+);
 
 let snapshot = service.identitySnapshotEntries('node-a');
 assert.equal(snapshot.length, 1);

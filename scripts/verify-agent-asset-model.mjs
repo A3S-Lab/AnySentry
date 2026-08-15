@@ -6,6 +6,7 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const {
   agentAssetIdForEvent,
+  agentRuntimeInstanceIdForEvent,
   detectedAgentIdentity,
 } = require('../apps/api/dist/security-monitoring/agent-identity.js');
 const {
@@ -14,11 +15,15 @@ const {
 const {
   AggregationService,
 } = require('../apps/api/dist/security-monitoring/aggregation.service.js');
+const {
+  AgentAttributionService,
+} = require('../apps/api/dist/security-monitoring/agent-attribution.service.js');
 
 function event({
   agentId,
   pid,
   rootPid,
+  rootStartTime = `root-${rootPid}`,
   workspacePath = '/home/user/security/AnySentry',
 }) {
   return {
@@ -64,6 +69,7 @@ function event({
       agentScopeId: 'codex',
       agentDisplayName: 'codex',
       rootPid,
+      rootStartTime,
       confidence: 0.9,
       reason: 'process_lineage',
       source: 'process_graph',
@@ -82,6 +88,34 @@ function event({
 const rootOneShell = event({ agentId: 'bash', pid: 101, rootPid: 100 });
 const rootOneCurl = event({ agentId: 'curl', pid: 102, rootPid: 100 });
 const rootTwoShell = event({ agentId: 'bash', pid: 201, rootPid: 200 });
+const rootOneOtherWorkspace = event({
+  agentId: 'bash',
+  pid: 103,
+  rootPid: 100,
+  workspacePath: '/home/user/security/Observer',
+});
+const reusedRootPid = event({
+  agentId: 'bash',
+  pid: 104,
+  rootPid: 100,
+  rootStartTime: 'new-root-100',
+});
+
+assert.equal(
+  agentRuntimeInstanceIdForEvent(rootOneShell),
+  agentRuntimeInstanceIdForEvent(rootOneCurl),
+  'children of one root share one runtime instance',
+);
+assert.notEqual(
+  agentRuntimeInstanceIdForEvent(rootOneShell),
+  agentRuntimeInstanceIdForEvent(rootTwoShell),
+  'two terminal roots remain two runtime instances',
+);
+assert.notEqual(
+  agentRuntimeInstanceIdForEvent(rootOneShell),
+  agentRuntimeInstanceIdForEvent(reusedRootPid),
+  'PID reuse with a new start time creates a new runtime instance',
+);
 
 assert.equal(
   agentAssetIdForEvent(rootOneShell),
@@ -93,6 +127,16 @@ assert.notEqual(
   agentAssetIdForEvent(rootTwoShell),
   'separate Agent roots in one SSH scope remain separate assets',
 );
+assert.equal(
+  agentAssetIdForEvent(rootOneShell),
+  agentAssetIdForEvent(rootOneOtherWorkspace),
+  'workspace changes are mutable Agent context and must not split one runtime instance',
+);
+assert.notEqual(
+  agentAssetIdForEvent(rootOneShell),
+  agentAssetIdForEvent(reusedRootPid),
+  'PID reuse in one boot must not merge distinct Agent process instances',
+);
 
 const detected = detectedAgentIdentity(rootOneShell);
 assert.equal(detected.detectedName, 'codex');
@@ -100,7 +144,13 @@ assert.equal(detected.detectedClassification, 'probable_agent');
 assert.equal(detected.runtime, 'host');
 assert.equal(detected.locationLabel, 'security/AnySentry · PID 100');
 
-const service = new AgentMetadataService();
+const relationalStub = {
+  initialize: async () => false,
+  configured: () => false,
+  loadAgentMetadata: async () => [],
+  saveAgentMetadata: async () => undefined,
+};
+const service = new AgentMetadataService(relationalStub);
 const originalAttribution = structuredClone(rootOneShell.attribution);
 service.update('codex', {
   workspacePath: rootOneShell.workspacePath,
@@ -155,17 +205,224 @@ nonAgentEvent.attribution.agentScopeId = undefined;
 nonAgentEvent.attribution.agentDisplayName = undefined;
 nonAgentEvent.attribution.physicalWorkloadId = 'host:node-a:boot-a:root:600';
 
+const ephemeralChildCandidate = event({
+  agentId: 'bwrap',
+  pid: 651,
+  rootPid: 651,
+  rootStartTime: 'sandbox-child-651',
+});
+ephemeralChildCandidate.process.comm = 'bwrap';
+ephemeralChildCandidate.process.exe = '/usr/bin/bwrap';
+ephemeralChildCandidate.attribution.agentScopeId = 'codex';
+ephemeralChildCandidate.attribution.agentDisplayName = 'codex';
+ephemeralChildCandidate.attribution.physicalWorkloadId = undefined;
+ephemeralChildCandidate.attribution.agentInstanceId = undefined;
+ephemeralChildCandidate.attribution.workloadRef = undefined;
+ephemeralChildCandidate.attribution.evidence = ['process_lineage:cached_agent_root'];
+
 const judge = {
-  query: () => [confirmedEvent, candidateEvent, candidateChild, unknownEvent, nonAgentEvent],
+  query: () => [
+    confirmedEvent,
+    candidateEvent,
+    candidateChild,
+    unknownEvent,
+    nonAgentEvent,
+    ephemeralChildCandidate,
+  ],
   listIncidents: () => [],
+  committedEventProgress: () => [],
 };
 const aggregation = new AggregationService(judge, service, {}, {});
 let inventory = aggregation.agentInventory({ timeType: 'last_3h', limit: 100 });
-assert.equal(inventory.items.length, 2, 'only confirmed and candidate identities enter Agent assets');
+assert.equal(
+  inventory.items.length,
+  2,
+  'unreviewed short helper processes without root evidence stay in audit events but not Agent assets',
+);
 assert.equal(inventory.items[0].classification, 'confirmed_agent', 'confirmed assets sort before higher-risk candidates');
 assert.equal(inventory.items[1].classification, 'probable_agent');
 assert.equal(inventory.items[1].eventCount, 2, 'one Agent asset aggregates events with different raw process names');
+
+{
+  const fallbackAttribution = new AgentAttributionService();
+  const unresolved = fallbackAttribution.attribute(
+    {
+      agentId: 'codex',
+      sessionId: 'claimed-session',
+      workspacePath: '/home/user/security/AnySentry',
+      attributes: {},
+    },
+    {
+      pid: 998_001,
+      ppid: 1,
+      startTimeTicks: '9980010',
+      comm: 'bwrap',
+      exe: '/usr/bin/bwrap',
+      cwd: '/home/user/security/AnySentry',
+    },
+    Date.now(),
+  );
+  assert.equal(
+    unresolved.monitored,
+    false,
+    'a claimed Agent label must not promote an unrelated process into a new Agent root',
+  );
+}
 assert.equal(inventory.items[1].instanceCount, 1);
+
+const windowOne = event({
+  agentId: 'a3s code',
+  pid: 801,
+  rootPid: 800,
+  rootStartTime: 'window-one-start',
+  workspacePath: '/home/user/code',
+});
+windowOne.eventId = 'window-one-event';
+windowOne.at = Date.now() - 2_000;
+windowOne.attribution.agentScopeId = 'a3s code';
+windowOne.attribution.agentDisplayName = 'a3s code';
+windowOne.process.pid = 800;
+windowOne.process.ppid = 1;
+windowOne.process.comm = 'a3s';
+windowOne.process.exe = '/usr/bin/a3s';
+
+const windowTwo = structuredClone(windowOne);
+windowTwo.eventId = 'window-two-event';
+windowTwo.at += 1_000;
+windowTwo.sessionId = 'session-window-two';
+windowTwo.traceId = 'trace-window-two';
+windowTwo.spanId = 'span-window-two';
+windowTwo.runId = 'run-window-two';
+windowTwo.process.pid = 900;
+windowTwo.process.startTimeTicks = '9000';
+windowTwo.attribution.rootPid = 900;
+windowTwo.attribution.rootStartTime = 'window-two-start';
+
+const windowOneRuntimeId = agentRuntimeInstanceIdForEvent(windowOne);
+const windowTwoRuntimeId = agentRuntimeInstanceIdForEvent(windowTwo);
+assert.notEqual(windowOneRuntimeId, windowTwoRuntimeId);
+
+const runtimeService = new AgentMetadataService(relationalStub);
+const windowOneDetected = detectedAgentIdentity(windowOne);
+runtimeService.review('a3s code', {
+  workspacePath: windowOne.workspacePath,
+  decision: 'confirmed_agent',
+  currentClassification: 'probable_agent',
+  agentAssetId: windowOneDetected.agentAssetId,
+  identityKeys: runtimeService.identityKeysForEvent(windowOne),
+  physicalWorkloadId: windowOne.attribution.physicalWorkloadId,
+  agentInstanceId: windowOneRuntimeId,
+  workloadRef: windowOne.attribution.workloadRef,
+}, 'security-reviewer');
+
+const reviewedWindowTwo = runtimeService.applyReview(windowTwo);
+assert.equal(reviewedWindowTwo.attribution?.classification, 'confirmed_agent');
+assert.equal(
+  agentRuntimeInstanceIdForEvent(reviewedWindowTwo),
+  windowTwoRuntimeId,
+  'logical review inheritance must preserve the newly observed runtime identity',
+);
+assert.notEqual(
+  reviewedWindowTwo.attribution?.agentInstanceId,
+  windowOneRuntimeId,
+  'the first reviewed window instance ID must not be copied to later windows',
+);
+
+const multiWindowAggregation = new AggregationService({
+  query: () => [runtimeService.applyReview(windowOne), reviewedWindowTwo],
+  listIncidents: () => [],
+  committedEventProgress: () => [],
+}, runtimeService, {}, {});
+const multiWindowInventory = multiWindowAggregation.agentInventory({
+  timeType: 'last_3h',
+  scope: 'agent',
+  limit: 100,
+});
+const a3sInstances = multiWindowInventory.items.filter((item) =>
+  item.displayName === 'a3s code' || item.detectedName === 'a3s code'
+);
+assert.equal(
+  a3sInstances.length,
+  2,
+  `two a3s code windows are displayed as two runtime instances: ${JSON.stringify(
+    multiWindowInventory.items.map((item) => ({
+      agentId: item.agentId,
+      displayName: item.displayName,
+      detectedName: item.detectedName,
+      assetId: item.agentAssetId,
+      instanceId: item.agentInstanceId,
+      classification: item.classification,
+      events: item.eventCount,
+    })),
+  )}`,
+);
+assert.equal(
+  new Set(a3sInstances.map((item) => item.agentAssetId)).size,
+  1,
+  'runtime windows share one reviewed logical Agent identity',
+);
+assert.equal(
+  new Set(a3sInstances.map((item) => item.agentInstanceId)).size,
+  2,
+  'each runtime window retains its own instance identity',
+);
+assert.deepEqual(
+  a3sInstances.map((item) => item.eventCount).sort((a, b) => a - b),
+  [1, 1],
+  'commands are counted within their own runtime instance',
+);
+assert.ok(
+  a3sInstances.every((item) => item.logicalInstanceCount === 2),
+  'each runtime row reports both siblings under the logical Agent',
+);
+const multiWindowTopology = multiWindowAggregation.agentTopology({
+  timeType: 'last_3h',
+  scope: 'agent',
+  includeBenign: true,
+  limit: 100,
+});
+const a3sTopologyInstances = multiWindowTopology.nodes.filter((node) =>
+  node.type === 'agent' &&
+  node.agentAssetId === a3sInstances[0].agentAssetId
+);
+assert.equal(
+  a3sTopologyInstances.length,
+  2,
+  `topology must preserve both runtime windows under one logical Agent identity: ${JSON.stringify(
+    multiWindowTopology.nodes.map((node) => ({
+      type: node.type,
+      label: node.label,
+      assetId: node.agentAssetId,
+      instanceId: node.agentInstanceId,
+      nodeId: node.nodeId,
+    })),
+  )}`,
+);
+assert.equal(
+  new Set(a3sTopologyInstances.map((node) => node.agentInstanceId)).size,
+  2,
+  'topology Agent nodes expose distinct runtime instance IDs',
+);
+const riskOnlyTopology = multiWindowAggregation.agentTopology({
+  timeType: 'last_3h',
+  scope: 'agent',
+  includeBenign: false,
+  limit: 100,
+});
+assert.equal(
+  riskOnlyTopology.nodes.filter((node) => node.type === 'agent').length,
+  2,
+  'risk-only relationship filtering must not hide healthy Agent runtime instances from the roster',
+);
+const focusedRuntime = multiWindowAggregation.agentInventory({
+  timeType: 'last_3h',
+  scope: 'agent',
+  agentAssetId: a3sInstances[0].agentAssetId,
+  agentInstanceId: a3sInstances[0].agentInstanceId,
+  limit: 10,
+});
+assert.equal(focusedRuntime.items.length, 1, 'runtime deep links resolve exactly one window');
+assert.equal(focusedRuntime.items[0].eventCount, 1);
 
 const candidateAsset = inventory.items[1];
 service.review(candidateAsset.agentId, {
@@ -243,6 +500,7 @@ assert.equal(service.canonicalAgentAssetId(legacyMetadataAssetId), dockerAssetId
 const dockerAggregation = new AggregationService({
   query: () => [dockerEvent],
   listIncidents: () => [],
+  committedEventProgress: () => [],
 }, service, {}, {});
 const dockerInventory = dockerAggregation.agentInventory({ timeType: 'last_3h', limit: 100 });
 assert.equal(dockerInventory.items.filter((item) => item.agentAssetId === dockerAssetId).length, 1, 'event and human review produce one Agent asset');
