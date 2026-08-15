@@ -57,3 +57,101 @@ kubectl -n anysentry port-forward service/anysentry 29653:29653
 Apply `policy.json` with the same curl command shown above. The policy only controls tier routing;
 credentials remain memory-only/Secret-backed. Supply-chain workspace discovery additionally needs
 a valid scanner token before external workspaces can publish dependency snapshots.
+
+## Persistent Pi agent for manual interaction
+
+The files in this section start a real Pi process in RPC standby. RPC mode waits for input and does
+not submit model turns, even though the authorized model catalogue and key file are mounted. A paid
+request is only possible after an operator enters the container and starts the interactive command
+shown below. Keep shell tracing disabled so the exported key is not printed.
+
+Use the immutable digest of the locally built Agent Runtime Lab image:
+
+```bash
+export ANYSENTRY_AGENT_LAB_IMAGE='127.0.0.1:5000/anysentry-agent-runtime-lab@sha256:<digest>'
+export ANYSENTRY_LLM_MODELS_FILE="$PWD/.local/real-llm/models.json"
+export ANYSENTRY_LLM_KEY_FILE="$PWD/.local/real-llm/secrets/api-key"
+export ANYSENTRY_AGENT_UID="$(id -u)"
+export ANYSENTRY_AGENT_GID="$(id -g)"
+export ANYSENTRY_PI_WORKSPACE_DIR="$PWD/.local/real-llm/docker-pi/workspace"
+export ANYSENTRY_PI_STATE_DIR="$PWD/.local/real-llm/docker-pi/state"
+install -d -m 0700 "$ANYSENTRY_PI_WORKSPACE_DIR" "$ANYSENTRY_PI_STATE_DIR"
+```
+
+Do not replace the digest with a mutable tag for this test. Neither Compose nor the Kubernetes
+helper copies or prints the key. Both mount `models.json` at
+`/home/node/.pi/agent/models.json` and the key at `/run/secrets/deepseek_api_key`, read-only.
+
+### Docker agent
+
+Start only the persistent Pi workload:
+
+```bash
+docker compose -f deploy/manual-test/docker-compose.pi-agent.yml up -d pi-agent
+docker compose -f deploy/manual-test/docker-compose.pi-agent.yml ps pi-agent
+```
+
+It can also be added to the full manual stack by appending
+`-f deploy/manual-test/docker-compose.pi-agent.yml` to the full-stack Compose command. Enter it and
+start the interactive agent only when ready to generate real model traffic:
+
+```bash
+docker compose -f deploy/manual-test/docker-compose.pi-agent.yml \
+  exec pi-agent /bin/bash
+```
+
+Then, inside the container:
+
+```bash
+set +x
+export DEEPSEEK_API_KEY="$(tr -d '\r\n' </run/secrets/deepseek_api_key)"
+cd /workspace
+exec /opt/agent-lab/node_modules/.bin/pi \
+  --provider anysentry-e2e-gateway \
+  --model bailian/deepseek-v4-flash \
+  --thinking off
+```
+
+### Kubernetes agent
+
+The helper creates `pi-agent-models` from the local `models.json` and `pi-agent-llm` directly from
+the local key file. The Secret is streamed to the API server; no Secret YAML is created on disk and
+the key is not printed. It then injects the required immutable image digest and applies a one-replica
+Deployment:
+
+```bash
+chmod 0755 deploy/manual-test/apply-pi-agent-k8s.sh
+deploy/manual-test/apply-pi-agent-k8s.sh
+kubectl -n anysentry-agent-test get pods -l app.kubernetes.io/name=pi-coding-agent -o wide
+```
+
+The bundled deployment already uses `ANYSENTRY_IDENTITY_NAMESPACES=*`, so it discovers the test
+namespace without another rollout. If an operator has deliberately narrowed that setting (or uses
+the legacy `ANYSENTRY_AGENT_NAMESPACES` fallback), preserve the existing entries and add
+`anysentry-agent-test`. For example:
+
+```bash
+kubectl -n anysentry set env deployment/anysentry \
+  ANYSENTRY_IDENTITY_NAMESPACES=default,anysentry-agent-test
+kubectl -n anysentry rollout status deployment/anysentry
+```
+
+Enter the running Pod:
+
+```bash
+kubectl -n anysentry-agent-test exec -it deployment/pi-coding-agent -c agent -- /bin/bash
+```
+
+Inside the container, run the same `set +x`, key-file export, `cd`, and `pi` command shown in the
+Docker section. The Deployment labels the workload as Agent ID `k8s-pi-agent-manual`; the Docker
+workload uses `docker-pi-agent-manual`. These are the expected instance IDs on the AnySentry Agent
+and Security Monitor pages.
+
+Updating the local models file does not change an already mounted Kubernetes ConfigMap. Re-run the
+helper and restart the Pod after an update:
+
+```bash
+deploy/manual-test/apply-pi-agent-k8s.sh
+kubectl -n anysentry-agent-test rollout restart deployment/pi-coding-agent
+kubectl -n anysentry-agent-test rollout status deployment/pi-coding-agent
+```

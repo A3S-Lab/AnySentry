@@ -1,0 +1,53 @@
+# Long-lived Pi workload for manual Observer/AnySentry validation.
+#
+# The image and both local files are deliberately required inputs. Use an
+# immutable image digest and absolute file paths as documented in README.md.
+services:
+  pi-agent:
+    image: ${ANYSENTRY_AGENT_LAB_IMAGE:?Set ANYSENTRY_AGENT_LAB_IMAGE to an immutable image digest}
+    container_name: anysentry-test-pi
+    # Match the owner of the 0600 key instead of weakening its host permissions.
+    user: ${ANYSENTRY_AGENT_UID:?Set ANYSENTRY_AGENT_UID to id -u}:${ANYSENTRY_AGENT_GID:?Set ANYSENTRY_AGENT_GID to id -g}
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    environment:
+      AGENT_RUNTIME: pi
+      AGENT_ID: docker-pi-agent-manual
+      AGENT_INTERVAL_SECONDS: "60"
+      # RPC waits for input and never submits a model turn on its own.
+      PI_EXECUTION_MODE: rpc
+      PI_TURN_TIMEOUT_SECONDS: "3600"
+      PI_PROVIDER: anysentry-e2e-gateway
+      PI_MODEL: bailian/deepseek-v4-flash
+      PI_THINKING: "off"
+      DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek_api_key
+    labels:
+      anysentry.io/workload-kind: agent
+      anysentry.io/agent-id: docker-pi-agent-manual
+      anysentry.io/agent-runtime: pi
+    volumes:
+      - type: bind
+        source: ${ANYSENTRY_PI_WORKSPACE_DIR:?Set ANYSENTRY_PI_WORKSPACE_DIR to an owned 0700 directory}
+        target: /workspace
+      - type: bind
+        source: ${ANYSENTRY_PI_STATE_DIR:?Set ANYSENTRY_PI_STATE_DIR to an owned 0700 directory}
+        target: /home/node/.pi/agent
+      - type: bind
+        source: ${ANYSENTRY_LLM_MODELS_FILE:?Set ANYSENTRY_LLM_MODELS_FILE to the absolute models.json path}
+        target: /home/node/.pi/agent/models.json
+        read_only: true
+      - type: bind
+        source: ${ANYSENTRY_LLM_KEY_FILE:?Set ANYSENTRY_LLM_KEY_FILE to the absolute API-key file path}
+        target: /run/secrets/deepseek_api_key
+        read_only: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 768m
+    cpus: 1.0
