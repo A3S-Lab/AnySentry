@@ -236,12 +236,96 @@ async function verifyPiMarkerHelper(tempRoot) {
       AGENT_WORKSPACE: workspace,
       PI_E2E_MARKER_FILE: markerFile,
     }),
-    timeout: 5_000,
+    timeout: 10_000,
   });
 
   await writeFile(markerFile, `${marker}\n`, { encoding: 'utf8', mode: 0o600 });
   commandSucceeded(execute(), 'Pi E2E marker helper valid marker');
   expectEqual(await readFile(path.join(workspace, 'tool-events.log'), 'utf8'), `${marker}\n`, 'marker helper must preserve the exact marker in its proof file');
+
+  const gatedWorkspace = path.join(fixture, 'gated-workspace');
+  const releaseFile = path.join(fixture, 'release');
+  await mkdir(gatedWorkspace, { mode: 0o700 });
+  const gated = spawn('/bin/sh', [piMarkerHelperPath], {
+    env: cleanRuntimeEnvironment({
+      AGENT_WORKSPACE: gatedWorkspace,
+      PI_E2E_MARKER_FILE: markerFile,
+      PI_E2E_RELEASE_FILE: releaseFile,
+    }),
+    stdio: 'ignore',
+  });
+  try {
+    await sleep(250);
+    expectEqual(gated.exitCode, null, 'marker helper must wait until the runtime release gate opens');
+    let proofExists = true;
+    try {
+      await stat(path.join(gatedWorkspace, 'tool-events.log'));
+    } catch (error) {
+      if (error?.code === 'ENOENT') proofExists = false;
+      else throw error;
+    }
+    expectEqual(proofExists, false, 'marker helper must not emit the marker before runtime release');
+    await writeFile(releaseFile, 'go\n', { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    let heldArgv;
+    const argvDeadline = Date.now() + 2_000;
+    while (Date.now() < argvDeadline) {
+      try {
+        const argv = (await readFile(`/proc/${gated.pid}/cmdline`))
+          .toString('utf8').split('\0').filter(Boolean);
+        if (argv[0] === '/bin/sh' && argv[1] === '-c') {
+          heldArgv = argv;
+          break;
+        }
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+      await sleep(25);
+    }
+    expectEqual(
+      JSON.stringify(heldArgv),
+      JSON.stringify(['/bin/sh', '-c', '/bin/sleep 3;:', marker]),
+      'marker helper must expose the exact held ToolExec argv contract',
+    );
+    const gatedExit = await waitForExit(gated, 10_000, 'released Pi marker helper');
+    expectEqual(gatedExit.code, 0, 'released marker helper must exit successfully');
+    expectEqual(
+      await readFile(path.join(gatedWorkspace, 'tool-events.log'), 'utf8'),
+      `${marker}\n`,
+      'released marker helper must preserve the exact marker',
+    );
+  } finally {
+    if (gated.exitCode === null && gated.signalCode === null) gated.kill('SIGKILL');
+  }
+
+  const invalidRelease = path.join(fixture, 'invalid-release');
+  await writeFile(invalidRelease, 'not-go\n', { encoding: 'utf8', mode: 0o600 });
+  const invalidReleaseResult = spawnSync('/bin/sh', [piMarkerHelperPath], {
+    encoding: 'utf8',
+    env: cleanRuntimeEnvironment({
+      AGENT_WORKSPACE: gatedWorkspace,
+      PI_E2E_MARKER_FILE: markerFile,
+      PI_E2E_RELEASE_FILE: invalidRelease,
+    }),
+    timeout: 5_000,
+  });
+  expectEqual(invalidReleaseResult.status, 65, 'marker helper must reject an invalid release gate');
+
+  const unterminatedExtraRelease = path.join(fixture, 'unterminated-extra-release');
+  await writeFile(unterminatedExtraRelease, 'go\ntrailing', { encoding: 'utf8', mode: 0o600 });
+  const unterminatedExtraReleaseResult = spawnSync('/bin/sh', [piMarkerHelperPath], {
+    encoding: 'utf8',
+    env: cleanRuntimeEnvironment({
+      AGENT_WORKSPACE: gatedWorkspace,
+      PI_E2E_MARKER_FILE: markerFile,
+      PI_E2E_RELEASE_FILE: unterminatedExtraRelease,
+    }),
+    timeout: 5_000,
+  });
+  expectEqual(
+    unterminatedExtraReleaseResult.status,
+    65,
+    'marker helper must reject an unterminated second release-gate line',
+  );
 
   await writeFile(markerFile, '', { encoding: 'utf8', mode: 0o600 });
   expectEqual(execute().status, 65, 'marker helper must reject an empty marker file');
@@ -249,11 +333,17 @@ async function verifyPiMarkerHelper(tempRoot) {
   await writeFile(markerFile, 'first-line\nsecond-line\n', { encoding: 'utf8', mode: 0o600 });
   expectEqual(execute().status, 65, 'marker helper must reject a multi-line marker file');
 
+  await writeFile(markerFile, 'first-line\nsecond-line', { encoding: 'utf8', mode: 0o600 });
+  expectEqual(execute().status, 65, 'marker helper must reject an unterminated second marker line');
+
   await writeFile(markerFile, 'contains_underscore\n', { encoding: 'utf8', mode: 0o600 });
   expectEqual(execute().status, 65, 'marker helper must reject characters outside the safe alphabet');
 
   await writeFile(markerFile, `${'a'.repeat(161)}\n`, { encoding: 'utf8', mode: 0o600 });
   expectEqual(execute().status, 65, 'marker helper must reject an overlong marker');
+
+  const markerHelperSource = await readFile(piMarkerHelperPath, 'utf8');
+  expect(markerHelperSource.includes("exec /bin/sh -c '/bin/sleep 3;:' \"$marker\""), 'marker helper must hold the marker-bearing exec for ancestry resolution');
 }
 
 async function verifySpawnErrorRetries(tempRoot) {

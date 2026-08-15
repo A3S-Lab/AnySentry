@@ -341,6 +341,67 @@ assert.equal(reloadMetrics.documentHash, registry.documentHash);
 assert.equal(reloadMetrics.matcherHash, registry.matcherHash);
 reloader.close();
 
+let watchFallbackError;
+let watchFallbackPoll;
+let watchFallbackDebounce;
+const watchFallbackRegistry = new RuntimeSignatureRegistry(defaultSignatureDocument(), {
+  source: 'watch-fallback-test',
+});
+const watchFallbackDocument = JSON.stringify(signatureDocument([
+  { id: 'poll-agent', displayName: 'Poll Agent', variants: [{ commExact: ['poll-agent'] }] },
+], 14));
+const watchFallbackReloader = new RuntimeSignatureReloader({
+  registry: watchFallbackRegistry,
+  filePath: '/tmp/watch-fallback-agent-runtime-signatures.json',
+  readFile: () => watchFallbackDocument,
+  stat: () => ({
+    dev: 1,
+    ino: 3,
+    size: Buffer.byteLength(watchFallbackDocument),
+    mtimeMs: 14,
+    ctimeMs: 14,
+  }),
+  watch: () => {
+    const error = new Error('too many open files');
+    error.code = 'EMFILE';
+    throw error;
+  },
+  timerApi: {
+    setInterval(callback) {
+      watchFallbackPoll = callback;
+      return { unref() {} };
+    },
+    clearInterval() {},
+    setTimeout(callback) {
+      watchFallbackDebounce = callback;
+      return { unref() {} };
+    },
+    clearTimeout() {},
+  },
+  onError: (error, kind) => {
+    watchFallbackError = { code: error.code, kind };
+  },
+});
+assert.equal(watchFallbackReloader.start(), true);
+assert.deepEqual(watchFallbackError, { code: 'EMFILE', kind: 'watch' });
+assert.equal(watchFallbackReloader.metrics().watchErrors, 1);
+assert.equal(watchFallbackReloader.metrics().reloadErrors, 0);
+assert.equal(
+  watchFallbackReloader.metrics().watching,
+  true,
+  'polling must remain active when fs.watch cannot be created',
+);
+assert.equal(typeof watchFallbackPoll, 'function');
+watchFallbackPoll();
+assert.equal(typeof watchFallbackDebounce, 'function');
+watchFallbackDebounce();
+assert.equal(watchFallbackRegistry.version, 14);
+assert.equal(watchFallbackRegistry.match({ comm: 'poll-agent' })?.agentId, 'poll-agent');
+assert.equal(watchFallbackReloader.metrics().reloadSuccesses, 1);
+assert.equal(watchFallbackReloader.metrics().reloadErrors, 0);
+assert.match(watchFallbackReloader.metrics().lastGoodRawHash ?? '', /^[a-f0-9]{64}$/);
+watchFallbackReloader.close();
+
 let oversizedReads = 0;
 let oversizedRevision = 1;
 const oversizedReloader = new RuntimeSignatureReloader({

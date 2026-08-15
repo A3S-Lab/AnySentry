@@ -767,11 +767,11 @@ class RuntimeSignatureReloader {
       });
       this.watcher.on?.('error', (error) => {
         this.stats.watchErrors++;
-        this.notifyError(error);
+        this.notifyError(error, 'watch');
       });
     } catch (error) {
       this.stats.watchErrors++;
-      this.notifyError(error);
+      this.notifyError(error, 'watch');
     }
     this.pollTimer = this.timerApi.setInterval(() => this.schedule('poll'), this.pollMs);
     this.pollTimer?.unref?.();
@@ -787,9 +787,9 @@ class RuntimeSignatureReloader {
     this.debounceTimer?.unref?.();
   }
 
-  notifyError(error) {
+  notifyError(error, kind = 'reload') {
     try {
-      this.onError(error instanceof Error ? error : new Error(String(error)));
+      this.onError(error instanceof Error ? error : new Error(String(error)), kind);
     } catch {
       this.stats.errorHandlerErrors++;
     }
@@ -832,7 +832,7 @@ class RuntimeSignatureReloader {
       ...extra,
     };
     this.lastFileResult = result;
-    this.notifyError(normalizedError);
+    this.notifyError(normalizedError, 'reload');
     return result;
   }
 
@@ -916,13 +916,13 @@ class RuntimeSignatureReloader {
           callbackResult.catch((error) => {
             this.stats.callbackErrors++;
             this.stats.reloadErrors++;
-            this.notifyError(error);
+            this.notifyError(error, 'callback');
           });
         }
       } catch (error) {
         this.stats.callbackErrors++;
         this.stats.reloadErrors++;
-        this.notifyError(error);
+        this.notifyError(error, 'callback');
         completed = {
           ...completed,
           callbackOk: false,

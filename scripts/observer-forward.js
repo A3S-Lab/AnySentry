@@ -148,6 +148,27 @@ function text(value) {
   return typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
 }
 
+const rawE2eIngestMarkerPrefix = process.env.ANYSENTRY_E2E_INGEST_MARKER_PREFIX;
+const e2eIngestMarkerPrefixMatch = rawE2eIngestMarkerPrefix?.match(
+  /^asel-marker-([a-z0-9](?:[a-z0-9-]{0,26}[a-z0-9])?)-(host|docker|k8s)-(shadow|enforce)-$/,
+);
+if (
+  rawE2eIngestMarkerPrefix !== undefined &&
+  !e2eIngestMarkerPrefixMatch
+) {
+  throw new Error('ANYSENTRY_E2E_INGEST_MARKER_PREFIX must identify one bounded E2E collector phase');
+}
+// This explicit, test-only scope prevents a lifecycle canary from turning host-wide kernel noise
+// into an API load test. Every event still reaches attribution/runtime discovery below; only the
+// exact run's marker-bearing ToolExec is admitted to the event queue. Production leaves it unset.
+const E2E_INGEST_MARKER_PREFIX = rawE2eIngestMarkerPrefix || '';
+const E2E_INGEST_MARKERS = new Set((!E2E_INGEST_MARKER_PREFIX
+  ? []
+  : e2eIngestMarkerPrefixMatch[2] === 'host'
+    ? ['non-agent-filter-canary', 'host-codex', 'host-kimi']
+    : ['unknown-filter-canary', 'pi']
+).map((suffix) => E2E_INGEST_MARKER_PREFIX + suffix));
+
 const LEGACY_FORWARD_SCOPE = ['agent', 'all', 'shadow'].includes(process.env.FORWARD_SCOPE)
   ? process.env.FORWARD_SCOPE
   : undefined;
@@ -242,14 +263,14 @@ try {
   console.error(`[observer-forward] agent templates ignored: ${error.message}`);
 }
 const templateRegistry = new AgentTemplateRegistry(templateDocument);
-let signatureLoadErrors = 0;
+let signatureInitialLoadErrors = 0;
 const signatureRegistry = new RuntimeSignatureRegistry(undefined, { source: 'builtin' });
 try {
   const signatureDocument = loadSignatureDocument();
   const loaded = signatureRegistry.replaceSafely(signatureDocument.document, signatureDocument.source);
   if (!loaded.ok) throw new Error(loaded.error);
 } catch (error) {
-  signatureLoadErrors++;
+  signatureInitialLoadErrors++;
   console.error(`[observer-forward] Agent runtime signatures ignored: ${error.message}`);
 }
 const attributor = new AgentAttributor({
@@ -300,6 +321,7 @@ let attributionCounts = {
   wouldFilterNoise: 0,
   discoveryBudgetDropped: 0,
   wouldDiscoveryBudgetDrop: 0,
+  e2eMarkerScopedOut: 0,
   forwarded: 0,
   queueDropped: 0,
   batches: 0,
@@ -400,6 +422,12 @@ function bumpEventKind(o) {
   const kind = eventKind(o);
   if (!kind || kind === 'CollectorHeartbeat') return;
   eventKindCounts[kind] = (eventKindCounts[kind] || 0) + 1;
+}
+
+function matchesE2eIngestMarkerScope(o) {
+  if (!E2E_INGEST_MARKER_PREFIX) return true;
+  const argv = o?.event?.ToolExec?.argv;
+  return Array.isArray(argv) && argv.some((arg) => E2E_INGEST_MARKERS.has(arg));
 }
 
 function sourceEventId(line) {
@@ -1297,6 +1325,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
     wouldFilterNoise: 0,
     discoveryBudgetDropped: 0,
     wouldDiscoveryBudgetDrop: 0,
+    e2eMarkerScopedOut: 0,
     forwarded: 0,
     queueDropped: 0,
     batches: 0,
@@ -1313,6 +1342,9 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
   outputDropped = 0;
   errorCount = 0;
   const status = dropped > 0 || errors > 0 ? 'degraded' : 'ok';
+  const e2eMarkerScopeMessage = E2E_INGEST_MARKER_PREFIX
+    ? `e2e_marker_scope=enabled; e2e_marker_scoped_out=${classifications.e2eMarkerScopedOut}; `
+    : '';
   postJson(
     heartbeatTarget,
     {
@@ -1418,7 +1450,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
         runtimeSignatureMatches: signatures.matches,
         runtimeSignatureMisses: signatures.misses,
         runtimeSignatureAmbiguous: signatures.ambiguous,
-        runtimeSignatureInvalid: (signatures.invalid || 0) + signatureLoadErrors,
+        runtimeSignatureInvalid: (signatures.invalid || 0) + signatureInitialLoadErrors,
         runtimeSignatureReloadAttempts: reloader.reloadAttempts || 0,
         runtimeSignatureReloadSuccesses: reloader.reloadSuccesses || 0,
         runtimeSignatureReloadErrors: reloader.reloadErrors || 0,
@@ -1450,7 +1482,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
         infrastructure: classifications.infrastructure,
         workspaceConflict: classifications.workspaceConflict,
       },
-      message: `filter_mode=${FILTER_MODE}; retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; retry_queued=${classifications.retryQueued}; retry_attempts=${classifications.retryAttempts}; retry_recovered=${classifications.retryRecovered}; retry_exhausted=${classifications.retryExhausted}; retry_queue_depth=${eventQueues.retryQueueDepth}; retry_outstanding=${eventQueues.retryOutstandingEvents}; outstanding_events=${eventQueues.outstandingEvents}; outstanding_bytes=${eventQueues.outstandingBytes}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
+      message: `filter_mode=${FILTER_MODE}; ${e2eMarkerScopeMessage}retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; retry_queued=${classifications.retryQueued}; retry_attempts=${classifications.retryAttempts}; retry_recovered=${classifications.retryRecovered}; retry_exhausted=${classifications.retryExhausted}; retry_queue_depth=${eventQueues.retryQueueDepth}; retry_outstanding=${eventQueues.retryOutstandingEvents}; outstanding_events=${eventQueues.outstandingEvents}; outstanding_bytes=${eventQueues.outstandingBytes}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
     },
     timeoutMs,
@@ -1962,6 +1994,10 @@ function handleLine(raw) {
       return;
     }
   }
+  if (!matchesE2eIngestMarkerScope(o)) {
+    attributionCounts.e2eMarkerScopedOut++;
+    return;
+  }
   bumpEventKind(o);
 
   enqueue(
@@ -2007,9 +2043,15 @@ async function start() {
         );
         if (reload.matcherChanged) requestReconciliation();
       },
-      onError: (error) => {
-        signatureLoadErrors++;
-        console.error(`[observer-forward] Agent runtime signatures reload ignored: ${error.message}`);
+      onError: (error, kind) => {
+        // fs.watch is an acceleration path. If the host has exhausted inotify/file descriptors,
+        // RuntimeSignatureReloader keeps its bounded polling fallback active. Do not report that
+        // operational degradation as an invalid signature document; actual reload/registry
+        // failures remain visible through runtimeSignatureReloadErrors/runtimeSignatureInvalid.
+        const message = kind === 'watch'
+          ? `watch unavailable; polling fallback remains active: ${error.message}`
+          : `${kind || 'reload'} ignored: ${error.message}`;
+        console.error(`[observer-forward] Agent runtime signatures ${message}`);
       },
     });
     signatureReloader.start();

@@ -20,8 +20,11 @@
  *   Kubernetes -> a dedicated local kubectl port-forward to service/anysentry
  *
  * No credential value is accepted on the command line. Pi receives a caller-owned 0600 key file
- * through a read-only bind mount or a run-scoped Kubernetes Secret. Reports contain only hashes,
- * sizes, boolean proof, and sanitized AnySentry records.
+ * and an independently validated models.json through read-only mounts or a run-scoped Kubernetes
+ * Secret. Host Kimi receives a run-owned 0600 config generated from the same validated model and
+ * credential, outside the Agent workspace and with isolated state. The models file may reference
+ * only $DEEPSEEK_API_KEY; it cannot contain a literal key. Reports contain only non-secret model
+ * identifiers, hashes of non-secret files, boolean proof, and sanitized AnySentry records.
  */
 
 import assert from 'node:assert/strict';
@@ -29,6 +32,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -38,6 +42,13 @@ import { fileURLToPath } from 'node:url';
 const scriptPath = fileURLToPath(import.meta.url);
 const scriptDir = path.dirname(scriptPath);
 const repoRoot = path.resolve(scriptDir, '..');
+const require = createRequire(import.meta.url);
+const {
+  canonicalDocument: canonicalRuntimeSignatureDocument,
+  defaultSignatureDocument,
+  documentHash: runtimeSignatureDocumentHash,
+  matcherHash: runtimeSignatureMatcherHash,
+} = require('./observer-agent-runtime-signatures.js');
 const DEFAULT_KEY_FILE = '/tmp/observer-study-deepseek-key';
 const DEFAULT_DOCKER_API = 'http://127.0.0.1:29653/security-center';
 const DEFAULT_HOST_API = 'http://127.0.0.1:29655/security-center';
@@ -46,8 +57,17 @@ const DEFAULT_NAMESPACE = 'anysentry-agent-test';
 const DEFAULT_OBSERVER_IMAGE = '127.0.0.1:5000/anysentry-observer:agent-runtime-lab';
 const DEFAULT_K8S_OBSERVER_IMAGE = 'localhost:5000/anysentry-observer:local';
 const DEFAULT_AGENT_IMAGE = '127.0.0.1:5000/anysentry-agent-runtime-lab:0.1.0';
+const DEFAULT_PI_PROVIDER = 'deepseek';
+const DEFAULT_PI_MODEL = 'deepseek-v4-flash';
 const ALLOWED_PHASES = new Set(['shadow', 'enforce']);
 const ALLOWED_AGENTS = new Set(['host-codex', 'host-kimi', 'docker-pi', 'k8s-pi']);
+const E2E_EVENT_QUERY_LIMIT = 200;
+const E2E_EVENT_QUERY_FUTURE_SKEW_MS = 2 * 60_000;
+const E2E_EVENT_QUERY_START_SKEW_MS = 2 * 60_000;
+const E2E_DURABLE_QUERY_WAIT_MS = 45_000;
+const API_BOOT_EPOCH_TOLERANCE_MS = 5_000;
+const MEMORY_API_MIN_BASELINE_UPTIME_SECONDS =
+  Math.ceil((2 * API_BOOT_EPOCH_TOLERANCE_MS) / 1_000) + 1;
 const CAPTURE_LIMIT = 2 * 1024 * 1024;
 const DIAGNOSTIC_TEXT_LIMIT = 16 * 1024;
 const DIAGNOSTIC_JSON_LIMIT = 32 * 1024;
@@ -55,10 +75,18 @@ const DIAGNOSTIC_JSON_LINE_LIMIT = 4 * 1024;
 const DIAGNOSTIC_JSON_MAX_LINES = 24;
 const DIAGNOSTIC_FILE_HASH_LIMIT = 256 * 1024;
 const LOCAL_PROOF_FILE_LIMIT = 1024 * 1024;
+const PI_MODELS_FILE_LIMIT = 64 * 1024;
+const KIMI_CONFIG_PROVIDER_KEY = 'anysentry-e2e-openai';
+const KIMI_CONFIG_MODEL_KEY = 'anysentry-e2e-model';
+const MIN_KIMI_VERSION = [1, 49, 0];
+const runtimeEvidenceRedactionLiterals = new Set();
+const RUNTIME_SIGNATURE_MOUNT_DIRECTORY = '/run/anysentry-runtime-signatures';
+const RUNTIME_SIGNATURE_FILE_NAME = 'runtime-signatures.json';
 const HOST_AGENT_RUNNER_OPTION = '--internal-host-agent-runner';
 const HOST_AGENT_CHILD_SELF_TEST_OPTION = '--internal-host-agent-child-self-test';
 const HOST_AGENT_RUNNER_SCHEMA = 'anysentry.host_agent_runner.v1';
 const HOST_AGENT_RUNNER_SELF_TEST_SCHEMA = 'anysentry.host_agent_runner.self_test.v1';
+const HOST_FILTER_CANARY_RUNNER_SCHEMA = 'anysentry.host_filter_canary_runner.v1';
 const HOST_AGENT_RUNNER_INPUT_LIMIT = 512 * 1024;
 const HOST_AGENT_STOP_TIMEOUT_MS = 15_000;
 const HOST_AGENT_START_TIMEOUT_MS = 15_000;
@@ -66,7 +94,19 @@ const HOST_AGENT_UNIT_SETTLE_MS = 1_000;
 const POLL_MS = 500;
 const FILTER_CANARY_WAIT_SECONDS = 120;
 const FILTER_CANARY_MAX_RUNTIME_SECONDS = 180;
+const FILTER_CANARY_COMPLETION_FILE = 'exit-code';
+const PRE_RELEASE_MARKER_FUTURE_SKEW_MS = 2 * 60_000;
+const PRE_RELEASE_DURABLE_WAIT_MS = 45_000;
 const AGENT_MAX_RUNTIME_SECONDS = 20 * 60;
+const PI_RUNTIME_EXIT_WAIT_MS = 120_000;
+const PI_RETRY_SECONDS = 600;
+const PI_MARKER_HELPER_SOURCE_FILE = path.join(
+  repoRoot,
+  'examples/agent-runtime-lab/app/pi-e2e-marker.sh',
+);
+const PI_MARKER_HELPER_CONTAINER_FILE = '/opt/agent-lab/app/pi-e2e-marker.sh';
+const PI_MARKER_RELEASE_FILE = '/run/anysentry-e2e-release/go';
+const PI_MARKER_HOLD_COMMAND = '/bin/sleep 3;:';
 const HOST_AGENT_RUNTIME_MAX_SECONDS = 4 * 60;
 const COLLECTOR_MAX_RUNTIME_SECONDS = 30 * 60;
 const CONTAINER_KILL_GRACE_SECONDS = 20;
@@ -79,6 +119,7 @@ const COLLECTOR_OUTER_GRACE_SECONDS = 30;
 const HOST_AGENT_ENV_NAMES = new Set([
   'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'TERM', 'TZ',
   'CODEX_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME',
+  'KIMI_SHARE_DIR',
   'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
   'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
   'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS',
@@ -118,11 +159,15 @@ function usage() {
     '  --self-test                       Run only local safety/contract checks',
     '  --run-id ID                       Lowercase run ID, max 28 characters',
     '  --key-file PATH                   0600 DeepSeek credential file',
+    '  --models-file PATH                Pi models.json; must reference $DEEPSEEK_API_KEY',
+    '  --pi-provider ID                  Provider key from models.json (default: deepseek)',
+    '  --pi-model ID                     Exact Pi model ID (default: deepseek-v4-flash)',
     '  --artifact-dir PATH               Evidence output directory',
     '  --phases shadow,enforce            Phases to run (default: shadow)',
     '  --allow-enforce                   Permit enforce only after this run passes shadow',
     '  --allow-host-agents               Explicitly opt in to local Codex/Kimi tool execution',
     '  --allow-host-full-access          Explicitly run host Codex with danger-full-access',
+    '  --exercise-signature-reload       Hot-reload run-scoped builtin runtime signatures v1 -> v2',
     '  --agents LIST                     host-codex,host-kimi,docker-pi,k8s-pi',
     '  --require-host                    Fail instead of skipping an absent host API',
     '  --docker-api-base URL             Docker API security-center base',
@@ -150,16 +195,35 @@ function commaList(value) {
   return [...new Set(String(value).split(',').map((item) => item.trim()).filter(Boolean))];
 }
 
+function parseKimiVersion(value) {
+  const match = String(value).match(/\b(\d+)\.(\d+)\.(\d+)\b/u);
+  if (!match) return undefined;
+  return match.slice(1).map(Number);
+}
+
+function versionAtLeast(actual, minimum) {
+  if (!Array.isArray(actual) || actual.length !== minimum.length) return false;
+  for (let index = 0; index < minimum.length; index += 1) {
+    if (actual[index] > minimum[index]) return true;
+    if (actual[index] < minimum[index]) return false;
+  }
+  return true;
+}
+
 function parseOptions(argv) {
   const options = {
     execute: false,
     runId: generatedRunId(),
     keyFile: DEFAULT_KEY_FILE,
+    modelsFile: undefined,
+    piProvider: DEFAULT_PI_PROVIDER,
+    piModel: DEFAULT_PI_MODEL,
     artifactDir: undefined,
     phases: ['shadow'],
     allowEnforce: false,
     allowHostAgents: false,
     allowHostFullAccess: false,
+    exerciseSignatureReload: false,
     agents: ['docker-pi', 'k8s-pi'],
     requireHost: false,
     dockerApiBase: DEFAULT_DOCKER_API,
@@ -183,10 +247,14 @@ function parseOptions(argv) {
     else if (arg === '--allow-enforce') options.allowEnforce = true;
     else if (arg === '--allow-host-agents') options.allowHostAgents = true;
     else if (arg === '--allow-host-full-access') options.allowHostFullAccess = true;
+    else if (arg === '--exercise-signature-reload') options.exerciseSignatureReload = true;
     else if (arg === '--require-host') options.requireHost = true;
     else if (arg === '--help' || arg === '-h') options.help = true;
     else if (arg === '--run-id') options.runId = valueAfter(argv, index++, arg);
     else if (arg === '--key-file') options.keyFile = path.resolve(valueAfter(argv, index++, arg));
+    else if (arg === '--models-file') options.modelsFile = path.resolve(valueAfter(argv, index++, arg));
+    else if (arg === '--pi-provider') options.piProvider = valueAfter(argv, index++, arg);
+    else if (arg === '--pi-model') options.piModel = valueAfter(argv, index++, arg);
     else if (arg === '--artifact-dir') options.artifactDir = path.resolve(valueAfter(argv, index++, arg));
     else if (arg === '--phases') options.phases = commaList(valueAfter(argv, index++, arg));
     else if (arg === '--agents') options.agents = commaList(valueAfter(argv, index++, arg));
@@ -220,6 +288,12 @@ function parseOptions(argv) {
   }
   if (!options.agents.length || options.agents.some((agent) => !ALLOWED_AGENTS.has(agent))) {
     throw new Error('--agents contains an unsupported Agent kind');
+  }
+  if (!/^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u.test(options.piProvider)) {
+    throw new Error('--pi-provider must be a lowercase provider identifier with at most 64 characters');
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}$/u.test(options.piModel)) {
+    throw new Error('--pi-model contains unsupported characters or exceeds 256 characters');
   }
   if (options.allowHostFullAccess && !options.allowHostAgents) {
     throw new Error('--allow-host-full-access also requires the explicit --allow-host-agents safety gate');
@@ -291,7 +365,11 @@ function marker(options, environment, phase, agent) {
 }
 
 function redact(value) {
-  return String(value ?? '')
+  let safe = String(value ?? '');
+  for (const literal of runtimeEvidenceRedactionLiterals) {
+    if (literal) safe = safe.replaceAll(literal, '<redacted-run-config>');
+  }
+  return safe
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '<redacted-private-key>')
     .replace(/\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,}\b/g, '<redacted-jwt>')
     .replace(/sk-[A-Za-z0-9_-]{8,}/g, 'sk-<redacted>')
@@ -299,6 +377,10 @@ function redact(value) {
     .replace(/((?:set-)?cookie\s*:\s*)[^\r\n]+/gi, '$1<redacted>')
     .replace(/((?:api[_-]?key|token|secret|password|credentials?)\s*[=:]\s*)[^\s,;]+/gi, '$1<redacted>')
     .replace(/("(?:api[_-]?key|token|secret|password|credentials?|authorization|proxy-authorization|cookie|set-cookie)"\s*:\s*")[^"]*(")/gi, '$1<redacted>$2');
+}
+
+function registerRuntimeEvidenceRedactionLiteral(value) {
+  if (typeof value === 'string' && value.length >= 4) runtimeEvidenceRedactionLiterals.add(value);
 }
 
 function sanitized(value) {
@@ -608,6 +690,14 @@ function validateHostAgentRunnerPayload(value, expected = {}) {
       value.args[1] === HOST_AGENT_CHILD_SELF_TEST_OPTION &&
       /^[a-f0-9]{32}$/u.test(value.args[2]);
     if (!validSelfTest) throw new Error('host Agent runner self-test command is invalid');
+  } else if (value.schema === HOST_FILTER_CANARY_RUNNER_SCHEMA) {
+    const validFilterCanary = value.agent === 'filter-canary' &&
+      value.command === '/usr/bin/true' &&
+      value.args.length === 1 &&
+      /^[a-f0-9]{64}$/u.test(value.args[0]) &&
+      /^filter-canary-host-(?:shadow|enforce)$/u.test(path.basename(value.cwd)) &&
+      Object.keys(value.env).length === 0;
+    if (!validFilterCanary) throw new Error('host filter canary runner contract is invalid');
   } else {
     throw new Error('host Agent runner schema is unsupported');
   }
@@ -662,9 +752,52 @@ async function readHostAgentRunnerPayload() {
   }
 }
 
+async function waitForHostFilterCanaryMarker(payload) {
+  const triggerFile = path.join(payload.cwd, 'go');
+  const valueFile = path.join(payload.cwd, 'value');
+  const deadline = Date.now() + FILTER_CANARY_WAIT_SECONDS * 1_000;
+  let triggered = false;
+  while (Date.now() < deadline) {
+    try {
+      const trigger = await fs.lstat(triggerFile);
+      if (!trigger.isFile() || trigger.isSymbolicLink()) {
+        throw new Error('host filter canary trigger is not a regular file');
+      }
+      triggered = true;
+      break;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    await delay(100);
+  }
+  if (!triggered) throw new Error('host filter canary trigger timed out');
+
+  let handle;
+  let encoded;
+  try {
+    handle = await fs.open(valueFile, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size < 2 || stat.size > 161) {
+      throw new Error('host filter canary marker file is invalid');
+    }
+    encoded = await handle.readFile();
+    const matched = encoded.toString('utf8').match(/^([a-z0-9-]{1,160})\n$/u);
+    if (!matched || expectedMarkerHash(matched[1]) !== payload.args[0]) {
+      throw new Error('host filter canary marker differs from the launch contract');
+    }
+    return matched[1];
+  } finally {
+    if (encoded) encoded.fill(0);
+    await handle?.close();
+  }
+}
+
 async function runHostAgentRunner() {
   const payload = await readHostAgentRunnerPayload();
-  const child = spawn(payload.command, payload.args, {
+  const childArgs = payload.schema === HOST_FILTER_CANARY_RUNNER_SCHEMA
+    ? [await waitForHostFilterCanaryMarker(payload)]
+    : payload.args;
+  const child = spawn(payload.command, childArgs, {
     cwd: payload.cwd,
     env: payload.env,
     stdio: 'inherit',
@@ -762,17 +895,57 @@ async function supportsPostRoute(baseUrl, route) {
   }
 }
 
+function parseStorageCapability(health, observedAtMs) {
+  const storage = health?.storage;
+  const uptimeSeconds = Number(health?.uptimeSeconds);
+  const hotRingSize = Number(storage?.hotRingSize);
+  const hotRingCapacity = Number(storage?.hotRingCapacity);
+  if (
+    !storage ||
+    !['clickhouse', 'memory'].includes(storage.mode) ||
+    typeof storage.clickhouseConfigured !== 'boolean' ||
+    typeof storage.clickhouseReady !== 'boolean' ||
+    !Number.isFinite(uptimeSeconds) || uptimeSeconds < 0 ||
+    !Number.isSafeInteger(hotRingSize) || hotRingSize < 0 ||
+    !Number.isSafeInteger(hotRingCapacity) || hotRingCapacity <= 0 ||
+    hotRingSize > hotRingCapacity ||
+    !Number.isFinite(observedAtMs)
+  ) {
+    return undefined;
+  }
+  return {
+    mode: storage.mode,
+    clickhouseConfigured: storage.clickhouseConfigured,
+    clickhouseReady: storage.clickhouseReady,
+    hotRingSize,
+    hotRingCapacity,
+    uptimeSeconds,
+    observedAtMs,
+    bootEpochEstimateMs: observedAtMs - uptimeSeconds * 1_000,
+  };
+}
+
+async function readApiStorageCapability(baseUrl) {
+  const startedAtMs = Date.now();
+  const health = await requestJson(baseUrl, 'healthz', undefined, { timeoutMs: 5_000 });
+  const observedAtMs = Math.round((startedAtMs + Date.now()) / 2);
+  const storage = parseStorageCapability(health, observedAtMs);
+  if (!storage) throw new Error('healthz returned no usable storage capability');
+  return storage;
+}
+
 async function apiCapability(baseUrl, queryShape = false) {
   const result = {
     baseUrl,
     health: false,
+    storage: undefined,
     runtime: false,
     lease: false,
     identity: undefined,
     errors: [],
   };
   try {
-    await requestJson(baseUrl, 'healthz', undefined, { timeoutMs: 5_000 });
+    result.storage = await readApiStorageCapability(baseUrl);
     result.health = true;
   } catch (error) {
     result.errors.push('healthz: ' + redact(error.message));
@@ -809,6 +982,63 @@ async function apiCapability(baseUrl, queryShape = false) {
   return result;
 }
 
+function eventStorageContract(storage, planeName = undefined) {
+  if (
+    storage?.mode === 'clickhouse' &&
+    storage.clickhouseConfigured === true &&
+    storage.clickhouseReady === true
+  ) {
+    return 'clickhouse-durable';
+  }
+  if (
+    planeName === 'host' &&
+    storage?.mode === 'memory' &&
+    storage.clickhouseConfigured === false &&
+    storage.clickhouseReady === false
+  ) {
+    return 'authoritative-hot-ring';
+  }
+  return undefined;
+}
+
+function hotRingTrimBatch(capacity) {
+  return Math.min(1_000, Math.max(100, Math.floor(capacity / 10)));
+}
+
+function memoryNoTrimThreshold(capacity) {
+  return capacity - hotRingTrimBatch(capacity);
+}
+
+function memoryStorageHasNoTrimEvidence(storage) {
+  return eventStorageContract(storage, 'host') === 'authoritative-hot-ring' &&
+    storage.hotRingSize <= memoryNoTrimThreshold(storage.hotRingCapacity);
+}
+
+function memoryStorageIsAuditableBaseline(storage) {
+  return memoryStorageHasNoTrimEvidence(storage) &&
+    Number.isFinite(storage.uptimeSeconds) &&
+    storage.uptimeSeconds >= MEMORY_API_MIN_BASELINE_UPTIME_SECONDS &&
+    Number.isFinite(storage.bootEpochEstimateMs);
+}
+
+function storageCapabilitySummary(storage, planeName = undefined) {
+  return storage ? {
+    mode: storage.mode,
+    clickhouseConfigured: storage.clickhouseConfigured,
+    clickhouseReady: storage.clickhouseReady,
+    hotRingSize: storage.hotRingSize,
+    hotRingCapacity: storage.hotRingCapacity,
+    uptimeSeconds: storage.uptimeSeconds,
+    eventEvidenceContract: eventStorageContract(storage, planeName),
+    memoryNoTrimProved: planeName === 'host' && storage.mode === 'memory'
+      ? memoryStorageHasNoTrimEvidence(storage)
+      : undefined,
+    memoryBootBaselineProved: planeName === 'host' && storage.mode === 'memory'
+      ? memoryStorageIsAuditableBaseline(storage)
+      : undefined,
+  } : undefined;
+}
+
 function hashText(value) {
   return createHash('sha256').update(String(value)).digest('hex');
 }
@@ -821,7 +1051,345 @@ async function hashLocalFile(file) {
 function matchesFileFingerprint(stat, expected) {
   return Boolean(expected) &&
     String(stat.dev) === expected.dev && String(stat.ino) === expected.ino &&
-    stat.uid === expected.uid && stat.mode === expected.mode && stat.size === expected.size;
+    stat.uid === expected.uid && stat.mode === expected.mode && stat.size === expected.size &&
+    (!Object.hasOwn(expected, 'mtimeMs') || stat.mtimeMs === expected.mtimeMs) &&
+    (!Object.hasOwn(expected, 'ctimeMs') || stat.ctimeMs === expected.ctimeMs);
+}
+
+function rejectEmbeddedPiCredential(value, location = '$', allowedApiKeyLocation = '') {
+  if (typeof value === 'string') {
+    if (/\bsk-[A-Za-z0-9_-]{8,}\b/u.test(value)) {
+      throw new Error('Pi models file contains a literal credential at ' + location);
+    }
+    if (location !== allowedApiKeyLocation && (value.includes('$') || value.startsWith('!'))) {
+      throw new Error('Pi models file may not use environment or command interpolation at ' + location);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((nested, index) => rejectEmbeddedPiCredential(
+      nested,
+      location + '[' + index + ']',
+      allowedApiKeyLocation,
+    ));
+    return;
+  }
+  if (!plainObject(value)) return;
+  for (const [key, nested] of Object.entries(value)) {
+    const nestedLocation = location + '.' + key;
+    if (/^(?:authorization|proxy-authorization|cookie|tokens?|secrets?|passwords?|credentials?)$/iu.test(key)) {
+      throw new Error('Pi models file may not embed credential-bearing field ' + nestedLocation);
+    }
+    if (/api[_-]?key/iu.test(key)) {
+      if (nestedLocation !== allowedApiKeyLocation || nested !== '$DEEPSEEK_API_KEY') {
+        throw new Error('Pi models file apiKey must be the exact $DEEPSEEK_API_KEY reference');
+      }
+    }
+    rejectEmbeddedPiCredential(nested, nestedLocation, allowedApiKeyLocation);
+  }
+}
+
+function rejectUnknownFields(value, allowed, label) {
+  if (!plainObject(value)) throw new Error(label + ' must be an object');
+  const unknown = Object.keys(value).filter((field) => !allowed.has(field));
+  if (unknown.length) throw new Error(label + ' has unsupported fields: ' + unknown.join(', '));
+}
+
+function validatePiModelsDocument(document, providerId, modelId) {
+  if (!plainObject(document) || !plainObject(document.providers)) {
+    throw new Error('Pi models file must contain a providers object');
+  }
+  rejectUnknownFields(document, new Set(['providers']), 'Pi models document');
+  if (Object.keys(document.providers).length !== 1 || !Object.hasOwn(document.providers, providerId)) {
+    throw new Error('Pi models file must contain exactly the selected provider');
+  }
+  const provider = document.providers[providerId];
+  if (!plainObject(provider)) throw new Error('Pi models file does not define provider ' + providerId);
+  rejectUnknownFields(
+    provider,
+    new Set(['baseUrl', 'api', 'apiKey', 'models']),
+    'Pi provider ' + providerId,
+  );
+  if (provider.api !== 'openai-completions') {
+    throw new Error('Pi provider must use api=openai-completions');
+  }
+  if (provider.apiKey !== '$DEEPSEEK_API_KEY') {
+    throw new Error('Pi provider apiKey must be the exact $DEEPSEEK_API_KEY reference');
+  }
+  let baseUrl;
+  try {
+    baseUrl = new URL(provider.baseUrl);
+  } catch {
+    throw new Error('Pi provider baseUrl is not a valid URL');
+  }
+  if (!['http:', 'https:'].includes(baseUrl.protocol) || baseUrl.username || baseUrl.password ||
+      baseUrl.search || baseUrl.hash) {
+    throw new Error('Pi provider baseUrl must be credential-free http(s) without query or fragment');
+  }
+  if (!baseUrl.pathname || !baseUrl.pathname.replace(/\/+$/u, '').endsWith('/v1')) {
+    throw new Error('Pi provider baseUrl must end with /v1');
+  }
+  if (!Array.isArray(provider.models)) throw new Error('Pi provider models must be an array');
+  if (provider.models.length !== 1) throw new Error('Pi provider must contain exactly one model');
+  const matches = provider.models.filter((model) => plainObject(model) && model.id === modelId);
+  if (matches.length !== 1) {
+    throw new Error('Pi models file must define the selected model exactly once: ' + modelId);
+  }
+  const model = matches[0];
+  rejectUnknownFields(
+    model,
+    new Set([
+      'id', 'name', 'reasoning', 'input', 'contextWindow', 'maxTokens',
+      'thinkingLevelMap', 'compat',
+    ]),
+    'selected Pi model',
+  );
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}$/u.test(model.id)) {
+    throw new Error('selected Pi model ID contains unsupported characters');
+  }
+  if (typeof model.name !== 'string' || model.name.length < 1 || model.name.length > 160 ||
+      /[\u0000-\u001f\u007f-\u009f]/u.test(model.name)) {
+    throw new Error('selected Pi model name must be a printable string of at most 160 characters');
+  }
+  if (typeof model.reasoning !== 'boolean') {
+    throw new Error('selected Pi model reasoning must be boolean');
+  }
+  if (!Array.isArray(model.input) || model.input.length !== 1 || model.input[0] !== 'text') {
+    throw new Error('selected Pi model input must be exactly ["text"]');
+  }
+  if (!Number.isInteger(model.contextWindow) || model.contextWindow < 1_024 ||
+      model.contextWindow > 10_000_000) {
+    throw new Error('selected Pi model contextWindow must be an integer from 1024 through 10000000');
+  }
+  if (!Number.isInteger(model.maxTokens) || model.maxTokens < 1 ||
+      model.maxTokens > Math.min(model.contextWindow, 1_000_000)) {
+    throw new Error('selected Pi model maxTokens must be a positive integer within contextWindow');
+  }
+  if (model.thinkingLevelMap !== undefined) {
+    rejectUnknownFields(
+      model.thinkingLevelMap,
+      new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']),
+      'selected Pi model thinkingLevelMap',
+    );
+    if (Object.values(model.thinkingLevelMap).some((value) =>
+      value !== null && (typeof value !== 'string' || !/^[A-Za-z0-9_-]{1,32}$/u.test(value)))) {
+      throw new Error('selected Pi model thinkingLevelMap values must be null or safe identifiers');
+    }
+  }
+  if (model.compat !== undefined) {
+    const booleanCompat = new Set([
+      'supportsStore', 'supportsDeveloperRole', 'supportsReasoningEffort',
+      'supportsUsageInStreaming', 'supportsStrictMode',
+      'requiresReasoningContentOnAssistantMessages',
+    ]);
+    rejectUnknownFields(
+      model.compat,
+      new Set([...booleanCompat, 'maxTokensField', 'thinkingFormat']),
+      'selected Pi model compat',
+    );
+    for (const field of booleanCompat) {
+      if (Object.hasOwn(model.compat, field) && typeof model.compat[field] !== 'boolean') {
+        throw new Error('selected Pi model compat.' + field + ' must be boolean');
+      }
+    }
+    if (Object.hasOwn(model.compat, 'maxTokensField') &&
+        !['max_tokens', 'max_completion_tokens'].includes(model.compat.maxTokensField)) {
+      throw new Error('selected Pi model compat.maxTokensField is unsupported');
+    }
+    if (Object.hasOwn(model.compat, 'thinkingFormat') &&
+        !['openai', 'openrouter', 'deepseek', 'together', 'zai', 'qwen'].includes(model.compat.thinkingFormat)) {
+      throw new Error('selected Pi model compat.thinkingFormat is unsupported');
+    }
+  }
+  rejectEmbeddedPiCredential(
+    document,
+    '$',
+    '$.providers.' + providerId + '.apiKey',
+  );
+  return {
+    providerId,
+    modelId,
+    contextWindow: model.contextWindow,
+    maxTokens: model.maxTokens,
+    api: provider.api,
+    baseUrl: baseUrl.toString().replace(/\/$/u, ''),
+    transportSecurity: baseUrl.protocol === 'https:' ? 'tls' : 'plaintext-http',
+  };
+}
+
+async function readStablePiModelsFile(file, expected) {
+  const stat = await fs.lstat(file);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 2 || stat.size > PI_MODELS_FILE_LIMIT) {
+    throw new Error('Pi models file must be a regular nonsymlink file of 2-' + PI_MODELS_FILE_LIMIT + ' bytes');
+  }
+  const handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const before = await handle.stat();
+    if (before.dev !== stat.dev || before.ino !== stat.ino || before.size !== stat.size ||
+        (expected && !matchesFileFingerprint(before, expected))) {
+      throw new Error('Pi models file identity changed');
+    }
+    const content = await handle.readFile();
+    const after = await handle.stat();
+    if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size ||
+        after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs ||
+        content.length !== before.size) {
+      throw new Error('Pi models file changed while it was being read');
+    }
+    return { stat: before, content };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function inspectPiModelsFile(options) {
+  const { stat, content } = await readStablePiModelsFile(options.modelsFile);
+  let document;
+  try {
+    document = JSON.parse(content.toString('utf8'));
+  } catch {
+    throw new Error('Pi models file is not valid JSON');
+  }
+  const model = validatePiModelsDocument(document, options.piProvider, options.piModel);
+  return {
+    fingerprint: {
+      dev: String(stat.dev), ino: String(stat.ino), uid: stat.uid,
+      mode: stat.mode, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs,
+    },
+    model,
+    sha256: createHash('sha256').update(content).digest('hex'),
+  };
+}
+
+async function stagePiModelsFile(options, expected) {
+  const { content } = await readStablePiModelsFile(options.modelsFile, expected.fingerprint);
+  let document;
+  try {
+    document = JSON.parse(content.toString('utf8'));
+  } catch {
+    throw new Error('Pi models file became invalid JSON after preflight');
+  }
+  const model = validatePiModelsDocument(document, options.piProvider, options.piModel);
+  if (JSON.stringify(model) !== JSON.stringify(expected.model) ||
+      createHash('sha256').update(content).digest('hex') !== expected.sha256) {
+    throw new Error('Pi models file semantics or content changed after preflight');
+  }
+  const destination = path.join(ledger.tempRoot, 'pi-models.json');
+  await fs.writeFile(destination, content, { mode: 0o600, flag: 'wx' });
+  await verifyRunOwnedFile(destination, content.length, expected.sha256, 'staged Pi models file');
+  return destination;
+}
+
+async function readNoFollow(file) {
+  const handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function verifyRunOwnedFile(file, expectedSize, expectedSha256, label) {
+  const handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let content;
+  try {
+    const before = await handle.stat();
+    const ownedByCaller = typeof process.getuid !== 'function' || before.uid === process.getuid();
+    if (!before.isFile() || (before.mode & 0o777) !== 0o600 || !ownedByCaller ||
+        before.size !== expectedSize) {
+      throw new Error(label + ' has an unsafe identity, mode, owner, or size');
+    }
+    content = await handle.readFile();
+    const after = await handle.stat();
+    if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size ||
+        after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs ||
+        content.length !== expectedSize ||
+        createHash('sha256').update(content).digest('hex') !== expectedSha256) {
+      throw new Error(label + ' changed or does not match its staged content');
+    }
+    return localPathIdentity(after);
+  } finally {
+    content?.fill(0);
+    await handle.close();
+  }
+}
+
+async function atomicallyPublishRunOwnedFile(directory, directoryIdentity, name, content, label) {
+  assert.equal(path.basename(name), name, label + ' name must be a basename');
+  const beforeDirectory = await localPathState(directory);
+  if (!beforeDirectory.exists || !beforeDirectory.identity.directory ||
+      !sameLocalPathIdentity(beforeDirectory.identity, directoryIdentity)) {
+    throw new Error(label + ' directory identity changed before publication');
+  }
+  const target = path.join(directory, name);
+  if ((await localPathState(target)).exists) {
+    throw new Error(label + ' target already exists');
+  }
+  const temporary = path.join(directory, '.' + name + '.' + ownershipNonce() + '.tmp');
+  const expectedSha256 = createHash('sha256').update(content).digest('hex');
+  let handle;
+  try {
+    handle = await fs.open(
+      temporary,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.writeFile(content);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+
+    const temporaryIdentity = await verifyRunOwnedFile(
+      temporary,
+      content.length,
+      expectedSha256,
+      label + ' temporary file',
+    );
+    const readyDirectory = await localPathState(directory);
+    if (!readyDirectory.exists || !sameLocalPathIdentity(readyDirectory.identity, directoryIdentity) ||
+        (await localPathState(target)).exists) {
+      throw new Error(label + ' publication target or directory changed');
+    }
+    await fs.rename(temporary, target);
+    const targetIdentity = await verifyRunOwnedFile(
+      target,
+      content.length,
+      expectedSha256,
+      label,
+    );
+    if (!sameLocalPathIdentity(targetIdentity, temporaryIdentity)) {
+      throw new Error(label + ' identity changed during atomic rename');
+    }
+    const afterDirectory = await localPathState(directory);
+    if (!afterDirectory.exists || !sameLocalPathIdentity(afterDirectory.identity, directoryIdentity)) {
+      throw new Error(label + ' directory identity changed after publication');
+    }
+    return { file: target, identity: targetIdentity, sha256: expectedSha256 };
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+    await fs.rm(temporary, { force: true }).catch(() => {});
+  }
+}
+
+async function assertModelsExcludeCredential(modelsFile, credentialFile) {
+  const [models, credential] = await Promise.all([
+    readNoFollow(modelsFile),
+    readNoFollow(credentialFile),
+  ]);
+  try {
+    let start = 0;
+    let end = credential.length;
+    while (start < end && (credential[start] === 0x0a || credential[start] === 0x0d)) start += 1;
+    while (end > start && (credential[end - 1] === 0x0a || credential[end - 1] === 0x0d)) end -= 1;
+    const value = credential.subarray(start, end);
+    if (!value.length) throw new Error('staged DeepSeek credential is empty');
+    if (models.indexOf(value) !== -1) {
+      throw new Error('Pi models file contains the exact staged credential value');
+    }
+  } finally {
+    models.fill(0);
+    credential.fill(0);
+  }
 }
 
 async function stageCredentialFile(options, expected) {
@@ -834,23 +1402,160 @@ async function stageCredentialFile(options, expected) {
     }
     credential = await handle.readFile();
     const after = await handle.stat();
-    if (!matchesFileFingerprint(after, expected) || credential.length !== expected.size) {
+    if (!matchesFileFingerprint(after, expected) || credential.length !== expected.size ||
+        createHash('sha256').update(credential).digest('hex') !== expected.sha256) {
       throw new Error('DeepSeek key file changed while creating the run-owned copy');
     }
   } finally {
     await handle.close();
   }
   const destination = path.join(ledger.tempRoot, 'deepseek-api-key');
+  let stagedIdentity;
   try {
+    let start = 0;
+    let end = credential.length;
+    while (start < end && (credential[start] === 0x0a || credential[start] === 0x0d)) start += 1;
+    while (end > start && (credential[end - 1] === 0x0a || credential[end - 1] === 0x0d)) end -= 1;
+    const value = credential.subarray(start, end);
+    const credentialText = value.toString('utf8');
+    if (!value.length || !Buffer.from(credentialText, 'utf8').equals(value) ||
+        /[\u0000\r\n]/u.test(credentialText)) {
+      throw new Error('DeepSeek key file must contain one nonempty UTF-8 credential value');
+    }
+    registerRuntimeEvidenceRedactionLiteral(credentialText);
     await fs.writeFile(destination, credential, { mode: 0o600, flag: 'wx' });
+    stagedIdentity = await verifyRunOwnedFile(
+      destination,
+      credential.length,
+      expected.sha256,
+      'staged DeepSeek key file',
+    );
   } finally {
     credential?.fill(0);
   }
   ledger.tempCredential = {
     path: destination,
-    identity: localPathIdentity(await fs.lstat(destination)),
+    identity: stagedIdentity,
+    size: expected.size,
+    sha256: expected.sha256,
   };
   return destination;
+}
+
+async function readVerifiedRunOwnedFile(file, expectedSize, expectedSha256, expectedIdentity, label) {
+  const handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let content;
+  try {
+    const before = await handle.stat();
+    const ownedByCaller = typeof process.getuid !== 'function' || before.uid === process.getuid();
+    if (!before.isFile() || (before.mode & 0o777) !== 0o600 || !ownedByCaller ||
+        before.size !== expectedSize ||
+        (expectedIdentity && !sameLocalPathIdentity(localPathIdentity(before), expectedIdentity))) {
+      throw new Error(label + ' has an unsafe or changed identity, mode, owner, or size');
+    }
+    content = await handle.readFile();
+    const after = await handle.stat();
+    if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size ||
+        after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs ||
+        content.length !== expectedSize ||
+        createHash('sha256').update(content).digest('hex') !== expectedSha256) {
+      throw new Error(label + ' changed or does not match its staged content');
+    }
+    return { content, identity: localPathIdentity(after) };
+  } catch (error) {
+    content?.fill(0);
+    throw error;
+  } finally {
+    await handle.close();
+  }
+}
+
+function kimiConfigDocument(model, credential) {
+  assert.equal(model.api, 'openai-completions', 'Host Kimi requires an OpenAI-compatible model');
+  assert.match(model.providerId, /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u);
+  assert.match(model.modelId, /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}$/u);
+  assert.ok(Number.isInteger(model.contextWindow) && model.contextWindow >= 1_024);
+  assert.ok(Number.isInteger(model.maxTokens) && model.maxTokens >= 1);
+  assert.ok(typeof credential === 'string' && credential.length > 0 && !/[\u0000\r\n]/u.test(credential));
+  return {
+    default_model: KIMI_CONFIG_MODEL_KEY,
+    default_thinking: false,
+    default_yolo: false,
+    show_thinking_stream: false,
+    telemetry: false,
+    merge_all_available_skills: false,
+    loop_control: {
+      max_steps_per_turn: 8,
+      max_retries_per_step: 3,
+      reserved_context_size: Math.max(
+        1_000,
+        Math.min(model.maxTokens, model.contextWindow - 1, 50_000),
+      ),
+    },
+    providers: {
+      [KIMI_CONFIG_PROVIDER_KEY]: {
+        type: 'openai_legacy',
+        base_url: model.baseUrl,
+        api_key: credential,
+        reasoning_key: 'reasoning_content',
+      },
+    },
+    models: {
+      [KIMI_CONFIG_MODEL_KEY]: {
+        provider: KIMI_CONFIG_PROVIDER_KEY,
+        model: model.modelId,
+        max_context_size: model.contextWindow,
+        capabilities: [],
+      },
+    },
+  };
+}
+
+async function stageKimiConfigFile(model, credentialFile, credentialIntegrity) {
+  const { content: credential } = await readVerifiedRunOwnedFile(
+    credentialFile,
+    credentialIntegrity.size,
+    credentialIntegrity.sha256,
+    ledger.tempCredential?.identity,
+    'staged DeepSeek key file for Host Kimi',
+  );
+  let credentialText = '';
+  let configBuffer;
+  try {
+    let start = 0;
+    let end = credential.length;
+    while (start < end && (credential[start] === 0x0a || credential[start] === 0x0d)) start += 1;
+    while (end > start && (credential[end - 1] === 0x0a || credential[end - 1] === 0x0d)) end -= 1;
+    const value = credential.subarray(start, end);
+    credentialText = value.toString('utf8');
+    if (!value.length || !Buffer.from(credentialText, 'utf8').equals(value) ||
+        /[\u0000\r\n]/u.test(credentialText)) {
+      throw new Error('staged DeepSeek credential is not a single nonempty UTF-8 value');
+    }
+    registerRuntimeEvidenceRedactionLiteral(credentialText);
+    configBuffer = Buffer.from(JSON.stringify(kimiConfigDocument(model, credentialText), null, 2) + '\n');
+    const destination = path.join(ledger.tempRoot, 'kimi-config.json');
+    const sha256 = createHash('sha256').update(configBuffer).digest('hex');
+    await fs.writeFile(destination, configBuffer, { mode: 0o600, flag: 'wx' });
+    const identity = await verifyRunOwnedFile(
+      destination,
+      configBuffer.length,
+      sha256,
+      'run-owned Host Kimi config',
+    );
+    return {
+      path: destination,
+      identity,
+      bytes: configBuffer.length,
+      sha256,
+      providerKey: KIMI_CONFIG_PROVIDER_KEY,
+      modelKey: KIMI_CONFIG_MODEL_KEY,
+    };
+  } finally {
+    credential.fill(0);
+    configBuffer?.fill(0);
+    credentialText = '';
+  }
 }
 
 async function isPortFree(port) {
@@ -902,6 +1607,10 @@ function ownershipNonce() {
 
 function hostAgentUnitName(options, phase, agent) {
   return k8sName(options, 'host-agent', phase, agent) + '.service';
+}
+
+function hostFilterCanaryUnitName(options, phase) {
+  return k8sName(options, 'filter-canary', 'host', phase) + '.service';
 }
 
 function hostAgentUnitDescription(runId, nonce) {
@@ -1236,6 +1945,16 @@ async function systemdControlGroupExists(controlGroup) {
   }
 }
 
+async function systemdControlGroupIdentity(controlGroup) {
+  const normalized = normalizeSystemdControlGroup(controlGroup);
+  const stat = await fs.lstat(path.join('/sys/fs/cgroup', normalized));
+  if (!stat.isDirectory() || stat.isSymbolicLink() ||
+      !Number.isSafeInteger(stat.ino) || stat.ino <= 0) {
+    throw new Error('systemd control group is not a real cgroup directory');
+  }
+  return localPathIdentity(stat);
+}
+
 function positiveInteger(value) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
@@ -1331,6 +2050,7 @@ async function assertHostServiceDetached(execMainPid, controlGroup) {
   );
   return {
     execMainPid,
+    execMainStartTimeTicks: service[0]?.startTime,
     parentPid: service[0]?.ppid,
     userManagerPid: service[managerIndex]?.pid,
     controllerAncestryDepth: controller.length,
@@ -1687,7 +2407,6 @@ async function resourceAbsenceChecks(options, checks) {
   for (const phase of options.phases) {
     if (options.agents.some((agent) => agent.startsWith('host-'))) {
       dockerNames.push(k8sName(options, 'collector', 'host', phase));
-      dockerNames.push(k8sName(options, 'filter-canary', 'host', phase));
     }
     if (options.agents.includes('docker-pi')) {
       dockerNames.push(k8sName(options, 'collector', 'docker', phase));
@@ -1713,6 +2432,12 @@ async function resourceAbsenceChecks(options, checks) {
       resources.push({ kind: 'pod', name: k8sName(options, 'filter-canary', 'k8s', phase) });
       resources.push({ kind: 'secret', name: k8sName(options, 'filter-canary', 'value', phase) });
       resources.push({ kind: 'secret', name: k8sName(options, 'pi-marker', phase) });
+      if (options.exerciseSignatureReload) {
+        resources.push({
+          kind: 'secret',
+          name: k8sName(options, 'runtime-signatures', 'k8s', phase),
+        });
+      }
     }
     for (const { kind, name } of resources) {
       const result = await run(
@@ -1732,8 +2457,13 @@ async function resourceAbsenceChecks(options, checks) {
 
 async function systemdResourceAbsenceChecks(options, checks) {
   for (const phase of options.phases) {
-    for (const agent of options.agents.filter((name) => name.startsWith('host-'))) {
-      const name = hostAgentUnitName(options, phase, agent);
+    const names = [
+      hostFilterCanaryUnitName(options, phase),
+      ...options.agents
+        .filter((name) => name.startsWith('host-'))
+        .map((agent) => hostAgentUnitName(options, phase, agent)),
+    ];
+    for (const name of names) {
       let state;
       try {
         state = await systemdUnitState(name);
@@ -1794,6 +2524,7 @@ async function preflight(options, apiState = {}) {
   const checks = [];
   const needsK8s = options.agents.includes('k8s-pi');
   const needsPiCredential = options.agents.includes('docker-pi') || options.agents.includes('k8s-pi');
+  const needsAuthorizedLlmCredential = needsPiCredential || options.agents.includes('host-kimi');
   const hostSelected = options.agents.some((agent) => agent.startsWith('host-'));
   // Probe every independently-addressed online plane so later negative isolation assertions are
   // not limited to the selected plane. Dry-run uses GET/OPTIONS only; execute additionally checks
@@ -1802,7 +2533,9 @@ async function preflight(options, apiState = {}) {
   if (!apiState.docker) apiState.docker = await apiCapability(options.dockerApiBase, options.execute);
   if (needsK8s && !apiState.k8s) apiState.k8s = await apiCapability(options.k8sApiBase, options.execute);
   const hostApiReady = Boolean(
-    apiState.host?.health && apiState.host?.runtime && apiState.host?.lease && apiState.host?.snapshot,
+    apiState.host?.health && apiState.host?.runtime && apiState.host?.lease && apiState.host?.snapshot &&
+    eventStorageContract(apiState.host?.storage, 'host') &&
+    (apiState.host?.storage?.mode !== 'memory' || memoryStorageIsAuditableBaseline(apiState.host.storage)),
   );
   const hostWillRun = hostSelected && (hostApiReady || options.requireHost);
   const needsDocker = options.agents.includes('docker-pi') ||
@@ -1918,36 +2651,77 @@ async function preflight(options, apiState = {}) {
       apiState.hostAgentCommands['host-kimi'] = executable;
     } catch {}
     check(checks, 'binary: kimi', executable ? 'pass' : 'block', executable ? 'resolved through filtered PATH' : 'not found');
-    const configFile = path.join(os.homedir(), '.kimi', 'config.toml');
-    try {
-      const stat = await fs.stat(configFile);
-      const exposed = stat.mode & 0o077;
+    if (executable) {
+      const filteredEnvironment = hostAgentEnvironment();
+      const versionResult = await run(executable.path, ['--version'], {
+        allowFailure: true,
+        timeoutMs: 15_000,
+        env: filteredEnvironment,
+        inheritEnv: false,
+      });
+      const version = parseKimiVersion(versionResult.stdout + versionResult.stderr);
+      const supportedVersion = versionResult.code === 0 && versionAtLeast(version, MIN_KIMI_VERSION);
+      if (version) apiState.hostKimiVersion = version.join('.');
       check(
         checks,
-        'Kimi configuration',
-        stat.size > 0 ? (exposed ? 'warn' : 'pass') : 'block',
-        stat.size > 0
-          ? 'configured; permission mode=' + (stat.mode & 0o777).toString(8) + (exposed ? ' (tighten if it contains credentials)' : '')
-          : 'empty configuration',
+        'Kimi CLI version',
+        supportedVersion ? 'pass' : 'block',
+        version
+          ? version.join('.') + ' (requires >= ' + MIN_KIMI_VERSION.join('.') + ')'
+          : 'could not determine installed Kimi CLI version',
       );
-    } catch {
-      check(checks, 'Kimi configuration', 'block', 'missing ~/.kimi/config.toml');
+      const help = await run(executable.path, ['--help'], {
+        allowFailure: true,
+        timeoutMs: 15_000,
+        env: filteredEnvironment,
+        inheritEnv: false,
+      });
+      const requiredFlags = ['--config-file', '--model', '--print', '--mcp-config', '--skills-dir'];
+      const missingFlags = requiredFlags.filter((flag) => !(help.stdout + help.stderr).includes(flag));
+      check(
+        checks,
+        'Kimi run-owned configuration support',
+        help.code === 0 && missingFlags.length === 0 ? 'pass' : 'block',
+        missingFlags.length
+          ? 'installed Kimi CLI lacks required flags: ' + missingFlags.join(', ')
+          : 'global Kimi configuration is ignored; a private config and state directory will be generated',
+      );
     }
   }
 
-  if (needsPiCredential) {
+  if (needsAuthorizedLlmCredential) {
     try {
       const stat = await fs.lstat(options.keyFile);
       const handle = await fs.open(options.keyFile, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-      const opened = await handle.stat();
-      await handle.close();
-      const safeMode = (stat.mode & 0o077) === 0;
+      const safeMode = (stat.mode & 0o777) === 0o600;
       const safeSize = stat.isFile() && !stat.isSymbolicLink() && stat.size > 0 && stat.size <= 512;
       const ownedByCaller = typeof process.getuid !== 'function' || stat.uid === process.getuid();
-      const stableOpen = stat.dev === opened.dev && stat.ino === opened.ino;
+      let credential;
+      let opened;
+      let after;
+      let credentialSha256;
+      try {
+        opened = await handle.stat();
+        if (safeMode && safeSize && ownedByCaller &&
+            stat.dev === opened.dev && stat.ino === opened.ino && stat.size === opened.size) {
+          credential = await handle.readFile();
+          after = await handle.stat();
+          if (after.dev === opened.dev && after.ino === opened.ino && after.size === opened.size &&
+              after.mtimeMs === opened.mtimeMs && after.ctimeMs === opened.ctimeMs &&
+              credential.length === opened.size) {
+            credentialSha256 = createHash('sha256').update(credential).digest('hex');
+          }
+        }
+      } finally {
+        credential?.fill(0);
+        await handle.close();
+      }
+      const stableOpen = Boolean(credentialSha256);
       apiState.keyFile = {
         dev: String(stat.dev), ino: String(stat.ino), uid: stat.uid,
         mode: stat.mode, size: stat.size,
+        mtimeMs: opened?.mtimeMs, ctimeMs: opened?.ctimeMs,
+        sha256: credentialSha256,
       };
       check(
         checks,
@@ -1955,10 +2729,55 @@ async function preflight(options, apiState = {}) {
         safeMode && safeSize && ownedByCaller && stableOpen ? 'pass' : 'block',
         'exists; bytes=' + stat.size + '; mode=' + (stat.mode & 0o777).toString(8) +
           '; regular_nonsymlink=' + safeSize + '; stable_open=' + stableOpen +
-          '; owned_by_caller=' + ownedByCaller + '; value was not read',
+          '; owned_by_caller=' + ownedByCaller +
+          '; value was read only for a non-reportable integrity digest',
       );
     } catch {
       check(checks, 'DeepSeek key file', 'block', 'missing or unreadable: ' + options.keyFile);
+    }
+    if (options.modelsFile) {
+      try {
+        const inspected = await inspectPiModelsFile(options);
+        const safeMode = (inspected.fingerprint.mode & 0o777) === 0o600;
+        const ownedByCaller = typeof process.getuid !== 'function' ||
+          inspected.fingerprint.uid === process.getuid();
+        apiState.piModelsFile = inspected;
+        check(
+          checks,
+          'Pi models file',
+          safeMode && ownedByCaller ? 'pass' : 'block',
+          'provider=' + inspected.model.providerId + '; model=' + inspected.model.modelId +
+            '; bytes=' + inspected.fingerprint.size +
+            '; mode=' + (inspected.fingerprint.mode & 0o777).toString(8) +
+            '; owned_by_caller=' + ownedByCaller + '; sha256=' + inspected.sha256,
+        );
+        if (inspected.model.transportSecurity === 'plaintext-http') {
+          check(
+            checks,
+            'Pi LLM transport security',
+            'warn',
+            'the authorized endpoint uses plaintext HTTP; Bearer credentials require a trusted network or later rotation',
+          );
+        } else {
+          check(checks, 'Pi LLM transport security', 'pass', 'the configured endpoint uses TLS');
+        }
+      } catch (error) {
+        check(
+          checks,
+          'Pi models file',
+          'block',
+          redact(error instanceof Error ? error.message : String(error)),
+        );
+      }
+    } else {
+      check(
+        checks,
+        'Pi models file',
+        options.agents.includes('host-kimi') ? 'block' : 'warn',
+        options.agents.includes('host-kimi')
+          ? 'host-kimi requires --models-file so its run-owned gateway config can be generated safely'
+          : 'not supplied; Pi will use its built-in provider catalog for ' + options.piProvider + '/' + options.piModel,
+      );
     }
   }
 
@@ -2003,6 +2822,7 @@ async function preflight(options, apiState = {}) {
     for (const tuple of [
       ['create', 'pods'], ['get', 'pods'], ['delete', 'pods'], ['get', 'pods/log'], ['create', 'pods/exec'],
       ['create', 'secrets'], ['get', 'secrets'], ['delete', 'secrets'],
+      ...(options.exerciseSignatureReload ? [['patch', 'secrets']] : []),
     ]) {
       const permission = await run(
         'kubectl',
@@ -2057,6 +2877,14 @@ async function preflight(options, apiState = {}) {
     check(checks, 'Docker API health', dockerApi.health ? 'pass' : 'block', dockerApi.health ? 'online' : dockerApi.errors.join('; '));
     check(checks, 'Docker API lifecycle endpoints', dockerApi.runtime && dockerApi.snapshot ? 'pass' : 'block', dockerApi.runtime && dockerApi.snapshot ? 'available' : dockerApi.errors.join('; '));
     check(checks, 'Docker API runtime lease', dockerApi.lease ? 'pass' : 'block', dockerApi.lease ? 'available' : dockerApi.errors.join('; '));
+    check(
+      checks,
+      'Docker API durable event evidence',
+      eventStorageContract(dockerApi.storage, 'docker') === 'clickhouse-durable' ? 'pass' : 'block',
+      eventStorageContract(dockerApi.storage, 'docker') === 'clickhouse-durable'
+        ? 'ClickHouse is configured and ready for collector-scoped durable evidence queries'
+        : 'ClickHouse-backed durable event evidence is unavailable',
+    );
   }
 
   if (needsK8s) {
@@ -2065,6 +2893,14 @@ async function preflight(options, apiState = {}) {
     check(checks, 'Kubernetes API health via dedicated port-forward', k8sApi.health ? 'pass' : 'block', k8sApi.health ? 'online' : k8sApi.errors.join('; '));
     check(checks, 'Kubernetes API lifecycle endpoints', k8sApi.runtime && k8sApi.snapshot ? 'pass' : 'block', k8sApi.runtime && k8sApi.snapshot ? 'available' : k8sApi.errors.join('; '));
     check(checks, 'Kubernetes API runtime lease', k8sApi.lease ? 'pass' : 'block', k8sApi.lease ? 'available' : k8sApi.errors.join('; '));
+    check(
+      checks,
+      'Kubernetes API durable event evidence',
+      eventStorageContract(k8sApi.storage, 'k8s') === 'clickhouse-durable' ? 'pass' : 'block',
+      eventStorageContract(k8sApi.storage, 'k8s') === 'clickhouse-durable'
+        ? 'ClickHouse is configured and ready for collector-scoped durable evidence queries'
+        : 'ClickHouse-backed durable event evidence is unavailable',
+    );
     check(
       checks,
       'Kubernetes identity snapshot',
@@ -2078,8 +2914,16 @@ async function preflight(options, apiState = {}) {
   if (hostSelected) {
     const hostApi = apiState.host;
     apiState.host = hostApi;
-    if (hostApi.health && hostApi.runtime && hostApi.lease && hostApi.snapshot) {
-      check(checks, 'Host debug API', 'pass', options.hostApiBase + ' is online with lifecycle and lease endpoints');
+    const hostStorage = eventStorageContract(hostApi.storage, 'host');
+    const hostMemorySafe = hostApi.storage?.mode !== 'memory' || memoryStorageIsAuditableBaseline(hostApi.storage);
+    if (hostApi.health && hostApi.runtime && hostApi.lease && hostApi.snapshot && hostStorage && hostMemorySafe) {
+      check(
+        checks,
+        'Host debug API',
+        'pass',
+        'online with lifecycle, lease, and ' + hostStorage +
+          (hostStorage === 'authoritative-hot-ring' ? ' event evidence without prior ring trim' : ' event evidence'),
+      );
     } else {
       check(
         checks,
@@ -2129,15 +2973,29 @@ function plannedResources(options) {
   for (const phase of options.phases) {
     if (options.agents.some((agent) => agent.startsWith('host-'))) {
       resources.push({ plane: 'host', kind: 'Docker container', name: k8sName(options, 'collector', 'host', phase) });
-      resources.push({ plane: 'host', kind: 'Docker container', name: k8sName(options, 'filter-canary', 'host', phase) });
+      resources.push({ plane: 'host', kind: 'systemd user service', name: hostFilterCanaryUnitName(options, phase) });
       for (const agent of options.agents.filter((name) => name.startsWith('host-'))) {
         resources.push({ plane: 'host', kind: 'systemd user service', name: hostAgentUnitName(options, phase, agent) });
+      }
+      if (options.exerciseSignatureReload) {
+        resources.push({
+          plane: 'host',
+          kind: 'run-workspace signature directory',
+          name: k8sName(options, 'runtime-signatures', 'host', phase),
+        });
       }
     }
     if (options.agents.includes('docker-pi')) {
       resources.push({ plane: 'docker', kind: 'Docker container', name: k8sName(options, 'collector', 'docker', phase) });
       resources.push({ plane: 'docker', kind: 'Docker container', name: k8sName(options, 'workload', 'docker', phase) });
       resources.push({ plane: 'docker', kind: 'Docker container', name: k8sName(options, 'filter-canary', 'docker', phase) });
+      if (options.exerciseSignatureReload) {
+        resources.push({
+          plane: 'docker',
+          kind: 'run-workspace signature directory',
+          name: k8sName(options, 'runtime-signatures', 'docker', phase),
+        });
+      }
     }
     if (options.agents.includes('k8s-pi')) {
       resources.push({ plane: 'kubernetes', kind: 'Pod', namespace: options.k8sWorkloadNamespace, name: k8sName(options, 'collector', 'k8s', phase) });
@@ -2145,6 +3003,14 @@ function plannedResources(options) {
       resources.push({ plane: 'kubernetes', kind: 'Pod', namespace: options.k8sWorkloadNamespace, name: k8sName(options, 'filter-canary', 'k8s', phase) });
       resources.push({ plane: 'kubernetes', kind: 'Secret', namespace: options.k8sWorkloadNamespace, name: k8sName(options, 'filter-canary', 'value', phase) });
       resources.push({ plane: 'kubernetes', kind: 'Secret', namespace: options.k8sWorkloadNamespace, name: k8sName(options, 'pi-marker', phase) });
+      if (options.exerciseSignatureReload) {
+        resources.push({
+          plane: 'kubernetes',
+          kind: 'Secret',
+          namespace: options.k8sWorkloadNamespace,
+          name: k8sName(options, 'runtime-signatures', 'k8s', phase),
+        });
+      }
     }
   }
   if (options.agents.includes('k8s-pi')) {
@@ -2161,6 +3027,51 @@ function executionPlan(options) {
     phases: options.phases,
     enforceGate: options.allowEnforce,
     agents: options.agents,
+    runtimeSignatureReload: options.exerciseSignatureReload ? {
+      enabled: true,
+      scope: 'run-scoped',
+      transition: 'complete builtin document v1 -> v2',
+      runtimeIdsScopesAndMatchPredicatesChanged: false,
+      displayNamesChanged: true,
+      completedBeforeAgentStart: true,
+    } : { enabled: false },
+    eventIngestScope: {
+      mode: 'collector-phase-tool-exec-marker-prefix',
+      prefixDimensions: ['runId', 'environment', 'phase'],
+      prefixSha256ReportedPerPhase: true,
+      collectorHeartbeatsBypassScope: true,
+      attributionAndRuntimeDiscoveryRunBeforeScope: true,
+      testOnly: true,
+      productionDefault: 'disabled-when-env-absent',
+      markerPrefixReported: false,
+    },
+    eventEvidenceQueries: {
+      timeWindow: 'fixed-phase-start-to-query-end-with-bounded-clock-skew',
+      clickhousePlanes: 'collector-scoped-durable-plus-hot-ring-merge-without-fallback',
+      hostMemoryPlane: 'explicit-hot-ring-fallback-with-boot-continuity-and-no-trim-proof',
+      markerFiltering: 'client-side-exact-argv-token',
+      serverTextSearchUsed: false,
+      completeGlobalApiInventoryClaimed: false,
+      completeFreshCollectorPageRequired: true,
+    },
+    pi: options.agents.some((agent) => agent.endsWith('-pi')) ? {
+      provider: options.piProvider,
+      model: options.piModel,
+      modelsFile: options.modelsFile ? 'caller-owned validated file' : 'built-in provider catalog',
+      lifecycleProof: 'fresh-workload-round-1-runtime-visible-then-release-held-tool-result-and-successful-exit',
+      retrySeconds: PI_RETRY_SECONDS,
+      successfulExitWaitSeconds: PI_RUNTIME_EXIT_WAIT_MS / 1_000,
+      markerHelperSourceSha256: options.piMarkerHelperSha256,
+      markerHelperVerifiedBeforeAgentProcess: true,
+      markerHelperRuntimeVerifiedPerScenario: true,
+      markerHelperPathReported: false,
+    } : undefined,
+    hostKimi: options.agents.includes('host-kimi') ? {
+      provider: options.piProvider,
+      model: options.piModel,
+      configuration: 'generated run-owned 0600 file',
+      state: 'isolated run-owned 0700 directory',
+    } : undefined,
     hostAgentAuthorization: {
       enabled: options.allowHostAgents,
       codexFullAccess: options.allowHostFullAccess,
@@ -2180,11 +3091,13 @@ function executionPlan(options) {
     },
     resources: plannedResources(options),
     safety: {
-      credentialInput: 'caller-owned file only',
+      credentialInput: 'caller-owned key file only; validated models file may reference only $DEEPSEEK_API_KEY',
       hostCodexFullAccessRequiresExplicitFlag: true,
       preExistingResourcesAdopted: false,
       cleanupOwnershipLabelRequired: true,
       deploymentManifestsOrExistingResourcesModified: false,
+      runtimeSignatureReloadTouchesOnlyRunOwnedResources: true,
+      e2eMarkerScopeTouchesOnlyRunOwnedCollectors: true,
       protocolProbeWritesToApi: false,
       liveApiRunEvidencePersists: true,
       persistentApiEvidence: ['events', 'auto-discovered Source', 'heartbeats', 'bounded runtime state'],
@@ -2197,10 +3110,16 @@ function executionPlan(options) {
       'running then exited/lost lifecycle is observed with stable ProcessKey identity',
       'host runtime PID/start-time belongs to the exact nonce-fenced transient service cgroup',
       'real model run produces a tool-created marker',
+      'Pi marker helper image bytes are verified before the Agent process can start',
+      'the verified helper remains gated with no tool proof before release, the durable merged API view is negative, and the kernel event does not predate release',
       'marker event is attributed to the expected Agent instance',
-      'a real unknown workload reaches L1 in shadow and is suppressed in enforce',
+      'run-owned collectors admit only this run marker ToolExec events while still processing all runtime attribution',
+      'a real Host non-Agent is policy-discarded while container unknown work reaches L1 only in shadow',
       'shadow and enforce counters obey their mode invariants',
       'collector ID and marker never appear in another API plane',
+      ...(options.exerciseSignatureReload ? [
+        'run-scoped builtin runtime signature v1 -> v2 display-name reload and reconciliation succeed before Agent start',
+      ] : []),
       'queue, output, identity, lease, and runtime-snapshot errors remain zero',
     ],
   };
@@ -2219,6 +3138,36 @@ async function writeJsonEvidence(directory, name, value) {
   }
   const file = path.join(resolvedDirectory, name);
   const content = JSON.stringify(sanitized(value), null, 2) + '\n';
+  for (const literal of runtimeEvidenceRedactionLiterals) {
+    assert.equal(content.includes(literal), false, 'evidence contains a run configuration literal');
+  }
+  if (ledger.tempCredential) {
+    const { content: credential } = await readVerifiedRunOwnedFile(
+      ledger.tempCredential.path,
+      ledger.tempCredential.size,
+      ledger.tempCredential.sha256,
+      ledger.tempCredential.identity,
+      'staged DeepSeek key file before evidence write',
+    );
+    try {
+      let start = 0;
+      let end = credential.length;
+      while (start < end && (credential[start] === 0x0a || credential[start] === 0x0d)) start += 1;
+      while (end > start && (credential[end - 1] === 0x0a || credential[end - 1] === 0x0d)) end -= 1;
+      const serialized = Buffer.from(content);
+      try {
+        assert.equal(
+          end > start && serialized.indexOf(credential.subarray(start, end)) === -1,
+          true,
+          'evidence contains the exact run credential',
+        );
+      } finally {
+        serialized.fill(0);
+      }
+    } finally {
+      credential.fill(0);
+    }
+  }
   const handle = await fs.open(
     file,
     fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
@@ -2299,17 +3248,208 @@ async function queryRuntime(baseUrl, query = {}) {
   return result;
 }
 
-async function queryEvents(baseUrl, collector, search = '') {
+function assertCompleteRuntimeInventory(runtime, label) {
+  assert.equal(
+    Number.isSafeInteger(runtime?.total) && runtime.total >= 0,
+    true,
+    label + ' runtime inventory has no valid total',
+  );
+  assert.equal(
+    runtime.items.length,
+    runtime.total,
+    label + ' runtime inventory is truncated; refusing to classify a partial root set',
+  );
+  return runtime;
+}
+
+function e2eEventQueryWindow(startTime, clockMs = Date.now()) {
+  const startMs = Date.parse(String(startTime || ''));
+  assert.equal(Number.isFinite(startMs), true, 'E2E event query has no fixed phase start');
+  assert.equal(Number.isFinite(clockMs), true, 'E2E event query clock is invalid');
+  return {
+    timeType: 'custom',
+    startTime: new Date(startMs).toISOString(),
+    endTime: new Date(clockMs + E2E_EVENT_QUERY_FUTURE_SKEW_MS).toISOString(),
+  };
+}
+
+async function requestEventList(baseUrl, collector, extra = {}) {
   const result = await requestJson(baseUrl, 'events/list', {
-    timeType: 'last_30d',
+    ...extra,
     collectorId: collector,
-    includeBenign: true,
+    includeUnknown: true,
+    noise: 'include',
     scope: 'raw',
-    ...(search ? { q: search } : {}),
-    limit: 200,
+    limit: E2E_EVENT_QUERY_LIMIT,
   });
   assert.ok(Array.isArray(result?.items), 'events/list returned an unexpected shape');
   return result;
+}
+
+function validateCompleteE2eEventResult(result, collector, storageContract, startMs, endMs, label) {
+  assert.equal(Array.isArray(result?.items), true, label + ' returned no event items array');
+  assert.equal(
+    Number.isSafeInteger(result?.total) && result.total >= 0,
+    true,
+    label + ' returned no valid total',
+  );
+  assert.equal(
+    result.items.length,
+    result.total,
+    label + ' returned a truncated collector inventory',
+  );
+  assert.ok(
+    result.total < E2E_EVENT_QUERY_LIMIT,
+    label + ' reached the collector page boundary',
+  );
+  for (const item of result.items) {
+    assert.equal(
+      item?.collectorId,
+      collector,
+      label + ' returned an event from another collector',
+    );
+    const eventAtMs = apiEventAtMs(item?.at);
+    assert.ok(
+      eventAtMs >= startMs && eventAtMs <= endMs,
+      label + ' returned an event outside its fixed phase window',
+    );
+  }
+  if (storageContract === 'clickhouse-durable') {
+    assert.equal(result.storageFallback, undefined, label + ' used a durable storage fallback');
+  } else {
+    assert.equal(storageContract, 'authoritative-hot-ring', label + ' has no supported storage contract');
+    assert.equal(
+      result.storageFallback,
+      'hot_ring',
+      label + ' did not prove the expected memory-only authoritative store',
+    );
+  }
+  return result;
+}
+
+async function proveAuthoritativeMemoryContinuity(
+  plane,
+  label,
+  readStorage = readApiStorageCapability,
+) {
+  const baseline = plane.storage;
+  assert.equal(memoryStorageIsAuditableBaseline(baseline), true,
+    label + ' baseline memory API cannot prove stable boot and untrimmed ring state');
+  const current = await readStorage(plane.baseUrl);
+  assert.equal(eventStorageContract(current, plane.name), 'authoritative-hot-ring',
+    label + ' memory storage mode changed');
+  assert.equal(current.hotRingCapacity, baseline.hotRingCapacity,
+    label + ' memory ring capacity changed');
+  assert.equal(memoryStorageHasNoTrimEvidence(current), true,
+    label + ' memory ring entered the post-trim ambiguity region');
+  assert.ok(current.uptimeSeconds >= baseline.uptimeSeconds,
+    label + ' API uptime regressed during the evidence run');
+  assert.ok(
+    Math.abs(current.bootEpochEstimateMs - baseline.bootEpochEstimateMs) <= API_BOOT_EPOCH_TOLERANCE_MS,
+    label + ' API process changed during the evidence run',
+  );
+  return {
+    bootContinuityProved: true,
+    noRingTrimProved: true,
+    baselineUptimeSeconds: baseline.uptimeSeconds,
+    observedUptimeSeconds: current.uptimeSeconds,
+    hotRingSize: current.hotRingSize,
+    hotRingCapacity: current.hotRingCapacity,
+    trimSafetyThreshold: memoryNoTrimThreshold(current.hotRingCapacity),
+  };
+}
+
+async function queryEvents(
+  plane,
+  collector,
+  extra = {},
+  label = 'E2E event evidence',
+  dependencies = {},
+) {
+  assert.equal(typeof plane?.baseUrl, 'string', label + ' has no API base');
+  const storageContract = eventStorageContract(plane.storage, plane.name);
+  assert.ok(storageContract, label + ' has no supported API storage contract');
+  assert.equal(extra.q, undefined, label + ' must filter exact markers client-side');
+  assert.equal(extra.timeType, 'custom', label + ' must use a fixed custom window');
+  const startMs = Date.parse(String(extra.startTime || ''));
+  const endMs = Date.parse(String(extra.endTime || ''));
+  assert.equal(Number.isFinite(startMs) && Number.isFinite(endMs) && endMs >= startMs, true,
+    label + ' has an invalid custom window');
+
+  let attempts = 0;
+  const request = dependencies.requestEventList ?? requestEventList;
+  const wait = dependencies.eventually ?? eventually;
+  const read = async () => {
+    attempts += 1;
+    const result = await request(plane.baseUrl, collector, {
+      ...extra,
+      durable: true,
+      includeUnknown: true,
+      noise: 'include',
+      scope: 'raw',
+      limit: E2E_EVENT_QUERY_LIMIT,
+    });
+    if (storageContract === 'clickhouse-durable' && result.storageFallback !== undefined) {
+      throw new Error(label + ' used a durable storage fallback: ' + result.storageFallback);
+    }
+    return result;
+  };
+  const result = storageContract === 'clickhouse-durable'
+    ? await wait(label + ' durable read', read, E2E_DURABLE_QUERY_WAIT_MS, 1_000)
+    : await read();
+  validateCompleteE2eEventResult(result, collector, storageContract, startMs, endMs, label);
+  const memoryContinuity = storageContract === 'authoritative-hot-ring'
+    ? await proveAuthoritativeMemoryContinuity(
+        plane,
+        label,
+        dependencies.readApiStorageCapability ?? readApiStorageCapability,
+      )
+    : undefined;
+  return {
+    ...result,
+    e2eQueryProof: {
+      storageContract,
+      durableRequested: true,
+      storageFallback: result.storageFallback,
+      apiTotalApproximate: result.totalApproximate === true,
+      collectorFilterPushedDown: storageContract === 'clickhouse-durable',
+      exactMarkerFiltering: 'client-side',
+      completeGlobalApiInventoryClaimed: false,
+      completeFreshCollectorPageProved: true,
+      pageBoundaryRejected: true,
+      attempts,
+      ...memoryContinuity,
+      queryWindow: {
+        timeType: 'custom',
+        startTime: new Date(startMs).toISOString(),
+        endTime: new Date(endMs).toISOString(),
+      },
+    },
+  };
+}
+
+function apiPlaneForEnvironment(context, environment) {
+  const plane = context.apiPlanes.find((candidate) => candidate.name === environment);
+  assert.ok(plane?.available, environment + ' API plane is unavailable');
+  assert.ok(
+    eventStorageContract(plane.storage, plane.name),
+    environment + ' API plane has no event evidence contract',
+  );
+  return plane;
+}
+
+function collectorEventQueryWindow(collector, clockMs = Date.now()) {
+  return e2eEventQueryWindow(collector.eventQueryStartTime, clockMs);
+}
+
+async function queryCollectorEvents(context, collector, label, plane = undefined) {
+  const selectedPlane = plane ?? apiPlaneForEnvironment(context, collector.environment);
+  return await queryEvents(
+    selectedPlane,
+    collector.collectorId,
+    collectorEventQueryWindow(collector),
+    label,
+  );
 }
 
 async function queryHeartbeat(baseUrl, collector) {
@@ -2641,7 +3781,7 @@ function minimalEvent(item) {
   return sanitized({
     eventId: item?.eventId,
     eventKind: item?.eventKind,
-    eventTime: item?.eventTime,
+    at: item?.at ?? item?.eventTime,
     attributes: item?.attributes,
     collectorId: item?.collectorId,
     subject: item?.subject,
@@ -2693,6 +3833,43 @@ function collectorSupervisorEnvironment() {
   };
 }
 
+function collectorEventTransportEnvironment() {
+  return {
+    // The ingest controller currently awaits per-event durable work in order. A host-wide E2E
+    // collector can fill the normal adaptive 128-event batch quickly enough that the server
+    // consumes every event but returns the acknowledgement after the default 10-second client
+    // deadline. Keep the test batch bounded and give its acknowledgement a realistic deadline;
+    // transport ambiguity is still terminal and is never blindly retried.
+    FORWARD_BATCH_SIZE: '8',
+    FORWARD_HTTP_TIMEOUT_MS: '60000',
+  };
+}
+
+function collectorEventIngestScopeEnvironment(options, environment, phase) {
+  assert.ok(['host', 'docker', 'k8s'].includes(environment), 'E2E ingest scope environment is invalid');
+  assert.ok(ALLOWED_PHASES.has(phase), 'E2E ingest scope phase is invalid');
+  const prefix = ['asel-marker', options.runId, environment, phase, ''].join('-');
+  assert.match(
+    prefix,
+    /^asel-marker-[a-z0-9](?:[a-z0-9-]{0,26}[a-z0-9])?-(?:host|docker|k8s)-(?:shadow|enforce)-$/u,
+    'collector-phase E2E ingest marker prefix is invalid',
+  );
+  return { ANYSENTRY_E2E_INGEST_MARKER_PREFIX: prefix };
+}
+
+function collectorEventIngestScopeProof(options, environment, phase) {
+  const prefix = collectorEventIngestScopeEnvironment(options, environment, phase)
+    .ANYSENTRY_E2E_INGEST_MARKER_PREFIX;
+  return {
+    mode: 'collector-phase-tool-exec-marker-prefix',
+    environment,
+    phase,
+    prefixSha256: createHash('sha256').update(prefix).digest('hex'),
+    collectorHeartbeatsBypassScope: true,
+    attributionAndRuntimeDiscoveryRunBeforeScope: true,
+  };
+}
+
 function dockerEnvArgs(environment) {
   return Object.entries(environment).flatMap(([key, value]) => ['-e', key + '=' + String(value)]);
 }
@@ -2708,6 +3885,149 @@ async function forwarderModuleHashes() {
     module,
     (await hashLocalFile(path.join(repoRoot, 'scripts', module))).sha256,
   ])));
+}
+
+function runtimeSignatureReloadDocuments() {
+  const version1 = canonicalRuntimeSignatureDocument(defaultSignatureDocument());
+  const version2 = canonicalRuntimeSignatureDocument({
+    ...version1,
+    version: 2,
+    runtimes: version1.runtimes.map((runtime) => ({
+      ...runtime,
+      displayName: runtime.displayName + ' [AnySentry E2E v2]',
+    })),
+  });
+  assert.equal(version1.version, 1, 'builtin runtime signature document must start at version 1');
+  assert.equal(version2.version, 2, 'runtime signature reload target must be version 2');
+  const matchingSemantics = (document) => document.runtimes.map((runtime) => ({
+    id: runtime.id,
+    agentScopeId: runtime.agentScopeId,
+    enabled: runtime.enabled,
+    variants: runtime.variants,
+  }));
+  assert.deepEqual(
+    matchingSemantics(version2),
+    matchingSemantics(version1),
+    'runtime signature reload must preserve every builtin runtime ID, scope, and match predicate',
+  );
+  assert.equal(
+    new Set(version2.runtimes.map((runtime) => runtime.displayName)).size,
+    version2.runtimes.length,
+    'runtime signature reload target display names must remain unique',
+  );
+  assert.ok(
+    version2.runtimes.every((runtime, index) =>
+      runtime.displayName !== version1.runtimes[index].displayName),
+    'runtime signature reload target must make its v2 display names externally observable',
+  );
+  const describe = (document) => {
+    const raw = JSON.stringify(document, null, 2) + '\n';
+    return {
+      document,
+      version: document.version,
+      runtimeCount: document.runtimes.filter((runtime) => runtime.enabled).length,
+      raw,
+      rawSha256: hashText(raw),
+      documentSha256: runtimeSignatureDocumentHash(document),
+      matcherSha256: runtimeSignatureMatcherHash(document),
+      matchPredicatesSha256: hashText(JSON.stringify(matchingSemantics(document))),
+    };
+  };
+  const result = { version1: describe(version1), version2: describe(version2) };
+  assert.notEqual(
+    result.version1.documentSha256,
+    result.version2.documentSha256,
+    'runtime signature version change must change the canonical document hash',
+  );
+  assert.notEqual(
+    result.version1.matcherSha256,
+    result.version2.matcherSha256,
+    'observable display-name updates must change the registry matcher hash',
+  );
+  assert.equal(
+    result.version1.matchPredicatesSha256,
+    result.version2.matchPredicatesSha256,
+    'runtime signature v1 -> v2 exercise must preserve IDs, scopes, and match predicates',
+  );
+  return result;
+}
+
+function assertTrackedTempRoot() {
+  if (!ledger.tempRoot || !ledger.tempRootIdentity) {
+    throw new Error('runtime signature files require a tracked run workspace');
+  }
+  return localPathState(ledger.tempRoot).then((state) => {
+    if (!state.exists || !state.identity.directory ||
+        !sameLocalPathIdentity(state.identity, ledger.tempRootIdentity)) {
+      throw new Error('refused to use runtime signature files after run workspace identity changed');
+    }
+  });
+}
+
+async function prepareLocalRuntimeSignatureReload(options, environment, phase) {
+  await assertTrackedTempRoot();
+  const directory = path.join(
+    ledger.tempRoot,
+    k8sName(options, 'runtime-signatures', environment, phase),
+  );
+  const file = path.join(directory, RUNTIME_SIGNATURE_FILE_NAME);
+  const documents = runtimeSignatureReloadDocuments();
+  await fs.mkdir(directory, { mode: 0o700 });
+  const directoryStat = await fs.lstat(directory);
+  if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() ||
+      (directoryStat.mode & 0o777) !== 0o700) {
+    throw new Error('run-owned runtime signature path is not a private directory');
+  }
+  await fs.writeFile(file, documents.version1.raw, { flag: 'wx', mode: 0o600 });
+  const fileStat = await fs.lstat(file);
+  if (!fileStat.isFile() || fileStat.isSymbolicLink() || (fileStat.mode & 0o777) !== 0o600) {
+    throw new Error('run-owned runtime signature document is not a private regular file');
+  }
+  return {
+    kind: 'local-directory',
+    directory,
+    directoryIdentity: localPathIdentity(directoryStat),
+    file,
+    documents,
+  };
+}
+
+async function atomicallyReplaceLocalRuntimeSignatures(config) {
+  const directoryState = await localPathState(config.directory);
+  if (!directoryState.exists || !directoryState.identity.directory ||
+      !sameLocalPathIdentity(directoryState.identity, config.directoryIdentity)) {
+    throw new Error('refused to update runtime signatures after run-owned directory identity changed');
+  }
+  const temporary = path.join(
+    config.directory,
+    '.' + RUNTIME_SIGNATURE_FILE_NAME + '.' + ownershipNonce(),
+  );
+  try {
+    await fs.writeFile(temporary, config.documents.version2.raw, { flag: 'wx', mode: 0o600 });
+    const temporaryStat = await fs.lstat(temporary);
+    if (!temporaryStat.isFile() || temporaryStat.isSymbolicLink() ||
+        (temporaryStat.mode & 0o777) !== 0o600) {
+      throw new Error('runtime signature replacement is not a private regular file');
+    }
+    await fs.rename(temporary, config.file);
+  } finally {
+    await fs.rm(temporary, { force: true }).catch(() => {});
+  }
+  const [afterDirectory, afterFile, content] = await Promise.all([
+    localPathState(config.directory),
+    fs.lstat(config.file),
+    fs.readFile(config.file),
+  ]);
+  if (!afterDirectory.exists ||
+      !sameLocalPathIdentity(afterDirectory.identity, config.directoryIdentity) ||
+      !afterFile.isFile() || afterFile.isSymbolicLink() || (afterFile.mode & 0o777) !== 0o600) {
+    throw new Error('runtime signature atomic replacement changed a pinned local identity');
+  }
+  assert.equal(
+    createHash('sha256').update(content).digest('hex'),
+    config.documents.version2.rawSha256,
+    'runtime signature atomic replacement content differs from v2',
+  );
 }
 
 function resolvedDockerImage(options, configuredImage) {
@@ -2764,6 +4084,139 @@ async function assertK8sForwarderModules(namespace, pod, expected) {
   assertModuleHashes(parseSha256Sums(result.stdout, '/opt'), expected, 'Kubernetes');
 }
 
+function markerHelperHashProof(output, expectedSha256, environment) {
+  const match = String(output).trim().match(/^([a-f0-9]{64})\s+(.+)$/u);
+  assert.ok(match, environment + ' Pi marker helper returned an invalid sha256sum record');
+  assert.equal(
+    match[2],
+    PI_MARKER_HELPER_CONTAINER_FILE,
+    environment + ' Pi marker helper path changed',
+  );
+  assert.equal(
+    match[1],
+    expectedSha256,
+    environment + ' Pi marker helper differs from the current verified source',
+  );
+  return {
+    sourceSha256: expectedSha256,
+    runtimeSha256: match[1],
+    pathReported: false,
+  };
+}
+
+async function assertDockerPiMarkerHelper(name, expectedSha256) {
+  assert.match(expectedSha256 || '', /^[a-f0-9]{64}$/u, 'Docker Pi marker helper source hash is unavailable');
+  const result = await run('docker', [
+    'exec', name, 'sha256sum', PI_MARKER_HELPER_CONTAINER_FILE,
+  ], { timeoutMs: 15_000 });
+  return markerHelperHashProof(result.stdout, expectedSha256, 'Docker');
+}
+
+function piMarkerHelperGateCommand(expectedSha256, continueToCommand) {
+  assert.match(
+    expectedSha256 || '',
+    /^[a-f0-9]{64}$/u,
+    'Pi marker helper gate requires a verified source hash',
+  );
+  const expectedRecord = expectedSha256 + '  ' + PI_MARKER_HELPER_CONTAINER_FILE;
+  return [
+    'set -eu',
+    'actual="$(sha256sum ' + PI_MARKER_HELPER_CONTAINER_FILE + ')"',
+    '[ "$actual" = "' + expectedRecord + '" ]',
+    ...(continueToCommand ? ['exec "$@"'] : []),
+  ].join('; ');
+}
+
+async function assertDockerPiImageAndMarkerHelper(
+  name,
+  configuredImage,
+  runtimeImageId,
+  expectedSha256,
+  expectedCommand,
+) {
+  const inspected = await run('docker', [
+    'inspect', '--format',
+    '{{json .Config.Entrypoint}}\n{{json .Config.Cmd}}\n{{.Image}}',
+    name,
+  ], { timeoutMs: 15_000 });
+  const [entrypointLine, commandLine, imageLine] = inspected.stdout.trim().split(/\r?\n/u);
+  assert.deepEqual(JSON.parse(entrypointLine), ['/bin/sh'], 'Docker Pi pre-LLM gate entrypoint changed');
+  assert.deepEqual(JSON.parse(commandLine), expectedCommand, 'Docker Pi pre-LLM gate command changed');
+  assert.equal(imageLine, runtimeImageId, 'Docker Pi runtime image differs from its pinned image');
+  const markerHelper = await assertDockerPiMarkerHelper(name, expectedSha256);
+  return {
+    configuredImage,
+    runtimeImageId,
+    preLlmGate: {
+      method: 'container-entrypoint-sha256-before-agent-exec',
+      completed: true,
+      expectedSha256,
+      pathReported: false,
+    },
+    markerHelper,
+  };
+}
+
+async function assertK8sPiImageAndMarkerHelper(namespace, pod, configuredImage, expectedSha256) {
+  assert.match(expectedSha256 || '', /^[a-f0-9]{64}$/u, 'Kubernetes Pi marker helper source hash is unavailable');
+  return await eventually('Kubernetes Pi workload image and marker helper provenance', async () => {
+    const podResult = await run('kubectl', [
+      '-n', namespace, 'get', 'pod', pod, '-o', 'json',
+    ], { allowFailure: true, timeoutMs: 10_000 });
+    if (podResult.code !== 0) return undefined;
+    let document;
+    try { document = JSON.parse(podResult.stdout); } catch { return undefined; }
+    const expectedContainers = ['workload', 'release-gate'];
+    const specContainers = new Map((document?.spec?.containers || []).map((container) => [
+      container.name,
+      container.image,
+    ]));
+    const statusContainers = new Map((document?.status?.containerStatuses || []).map((status) => [
+      status.name,
+      status,
+    ]));
+    const gateSpec = (document?.spec?.initContainers || []).find((container) =>
+      container.name === 'marker-helper-gate');
+    const gateStatus = (document?.status?.initContainerStatuses || []).find((status) =>
+      status.name === 'marker-helper-gate');
+    const gateCommand = piMarkerHelperGateCommand(expectedSha256, false);
+    if (gateSpec?.image !== configuredImage ||
+        JSON.stringify(gateSpec?.command) !== JSON.stringify(['/bin/sh', '-c']) ||
+        JSON.stringify(gateSpec?.args) !== JSON.stringify([gateCommand]) ||
+        gateStatus?.state?.terminated?.exitCode !== 0 ||
+        !gateStatus?.imageID) return undefined;
+    const proof = [];
+    for (const container of expectedContainers) {
+      if (specContainers.get(container) !== configuredImage ||
+          !statusContainers.get(container)?.state?.running ||
+          !statusContainers.get(container)?.imageID) return undefined;
+      const hash = await run('kubectl', [
+        '-n', namespace, 'exec', pod, '-c', container, '--',
+        'sha256sum', PI_MARKER_HELPER_CONTAINER_FILE,
+      ], { allowFailure: true, timeoutMs: 10_000 });
+      if (hash.code !== 0) return undefined;
+      proof.push({
+        container,
+        configuredImage,
+        runtimeImageId: statusContainers.get(container).imageID,
+        markerHelper: markerHelperHashProof(hash.stdout, expectedSha256, 'Kubernetes/' + container),
+      });
+    }
+    return {
+      preLlmGate: {
+        container: 'marker-helper-gate',
+        configuredImage,
+        runtimeImageId: gateStatus.imageID,
+        method: 'successful-init-container-sha256-before-workload-start',
+        completed: true,
+        expectedSha256,
+        pathReported: false,
+      },
+      containers: proof,
+    };
+  }, 120_000, 500);
+}
+
 async function stopOwnedDockerContainer(name, remove = true, graceSeconds = 15) {
   assert.ok(
     Number.isSafeInteger(graceSeconds) && graceSeconds >= 1 && graceSeconds <= 60,
@@ -2794,6 +4247,9 @@ async function startDockerCollector(options, environment, phase, apiBase) {
   const name = k8sName(options, 'collector', environment, phase);
   const id = collectorId(options, environment, phase);
   await assertCollectorHistoryAbsentBeforeStart(apiBase, id, environment, phase);
+  const signatureReloadConfig = options.exerciseSignatureReload
+    ? await prepareLocalRuntimeSignatureReload(options, environment, phase)
+    : undefined;
   // The host collector shares the Linux host network so that a debug API published only on
   // 127.0.0.1 remains private. The Docker collector stays bridged and uses host-gateway.
   const target = environment === 'host' ? apiBase : containerApiBase(apiBase);
@@ -2802,7 +4258,10 @@ async function startDockerCollector(options, environment, phase, apiBase) {
     A3S_OBSERVER_JSON: '1',
     A3S_OBSERVER_COLLECTOR_ID: id,
     A3S_NODE_NAME: 'e2e-' + environment + '-' + options.runId,
-    A3S_OBSERVER_FILES: '1',
+    // This lifecycle gate proves kernel ToolExec capture and attribution. File probes are an
+    // independent, opt-in high-volume signal and would make a zero-drop ToolExec gate depend on
+    // unrelated filesystem traffic from the whole host.
+    A3S_OBSERVER_FILES: '0',
     A3S_OBSERVER_SSL: '0',
     ANYSENTRY_SOURCE_TYPE: 'observer',
     ANYSENTRY_SOURCE_NAME: 'real-agent-lifecycle-' + environment + '-' + options.runId,
@@ -2820,6 +4279,12 @@ async function startDockerCollector(options, environment, phase, apiBase) {
     FORWARD_NOISE_POLICY: 'balanced',
     ANYSENTRY_E2E_FILTER_MARKER_SHA256: expectedMarkerHash(filterCanaryMarker(options, environment, phase)),
     ANYSENTRY_E2E_WITNESS_DIR: '/run/anysentry-e2e-witness',
+    ...(signatureReloadConfig ? {
+      ANYSENTRY_AGENT_RUNTIME_SIGNATURES_FILE:
+        path.posix.join(RUNTIME_SIGNATURE_MOUNT_DIRECTORY, RUNTIME_SIGNATURE_FILE_NAME),
+    } : {}),
+    ...collectorEventIngestScopeEnvironment(options, environment, phase),
+    ...collectorEventTransportEnvironment(),
     ...collectorSupervisorEnvironment(),
     ...endpointEnvironment(target),
   };
@@ -2835,6 +4300,9 @@ async function startDockerCollector(options, environment, phase, apiBase) {
       : ['--add-host', 'host.docker.internal:host-gateway']),
     '-v', '/sys:/sys:ro',
     '--tmpfs', '/run/anysentry-e2e-witness:rw,nosuid,nodev,noexec,size=1m,mode=0700',
+    ...(signatureReloadConfig
+      ? ['-v', signatureReloadConfig.directory + ':' + RUNTIME_SIGNATURE_MOUNT_DIRECTORY + ':ro']
+      : []),
     ...(environment === 'docker' ? ['-v', '/var/run/docker.sock:/var/run/docker.sock:ro'] : []),
     ...currentForwarderMountArgs('/opt'),
     ...dockerEnvArgs(env),
@@ -2868,7 +4336,15 @@ async function startDockerCollector(options, environment, phase, apiBase) {
       ? item
       : undefined;
   }, 45_000, 500);
-  return { name, collectorId: id, environment, phase, apiBase };
+  return {
+    name,
+    collectorId: id,
+    environment,
+    phase,
+    apiBase,
+    signatureReloadConfig,
+    eventIngestScope: collectorEventIngestScopeProof(options, environment, phase),
+  };
 }
 
 async function resolveK8sNode(options) {
@@ -2913,11 +4389,117 @@ async function deleteOwnedK8s(kind, namespace, name, map) {
   await removeTrackedK8sResource(kind, namespace, name, map);
 }
 
+async function createK8sRuntimeSignatureSecret(options, phase) {
+  const namespace = options.k8sWorkloadNamespace;
+  const name = k8sName(options, 'runtime-signatures', 'k8s', phase);
+  const documents = runtimeSignatureReloadDocuments();
+  const secret = {
+    apiVersion: 'v1',
+    kind: 'Secret',
+    metadata: {
+      name,
+      namespace,
+      labels: { 'anysentry.io/e2e-run-id': options.runId },
+    },
+    type: 'Opaque',
+    data: {
+      [RUNTIME_SIGNATURE_FILE_NAME]: Buffer.from(documents.version1.raw).toString('base64'),
+    },
+  };
+  await createK8sObject(namespace, 'secret', name, secret, ledger.k8sSecrets);
+  return { kind: 'k8s-secret', namespace, name, documents };
+}
+
+function parseOwnedRuntimeSignatureSecret(raw, config, ownership) {
+  const secret = JSON.parse(raw);
+  assert.equal(secret?.metadata?.uid, ownership.uid, 'runtime signature Secret UID changed');
+  assert.equal(
+    secret?.metadata?.labels?.['anysentry.io/e2e-run-id'],
+    ledger.runId,
+    'runtime signature Secret run ownership changed',
+  );
+  assert.equal(
+    secret?.metadata?.labels?.['anysentry.io/e2e-ownership'],
+    ownership.nonce,
+    'runtime signature Secret nonce ownership changed',
+  );
+  assert.notEqual(secret?.immutable, true, 'runtime signature Secret unexpectedly became immutable');
+  assert.ok(
+    typeof secret?.metadata?.resourceVersion === 'string' &&
+      secret.metadata.resourceVersion.length > 0 &&
+      secret.metadata.resourceVersion.length <= 256 &&
+      !/[\u0000-\u001f\u007f]/u.test(secret.metadata.resourceVersion),
+    'runtime signature Secret has no safe resourceVersion',
+  );
+  const encoded = secret?.data?.[RUNTIME_SIGNATURE_FILE_NAME];
+  assert.equal(typeof encoded, 'string', 'runtime signature Secret has no document');
+  return {
+    resourceVersion: secret.metadata.resourceVersion,
+    rawSha256: createHash('sha256').update(Buffer.from(encoded, 'base64')).digest('hex'),
+  };
+}
+
+async function updateK8sRuntimeSignatureSecret(config) {
+  const ownership = ledger.k8sSecrets.get(config.namespace)?.get(config.name);
+  if (!ownership?.nonce || !ownership?.uid) {
+    throw new Error('missing tracked runtime signature Secret ownership');
+  }
+  const beforeResult = await run('kubectl', [
+    '-n', config.namespace, 'get', 'secret', config.name, '-o', 'json',
+  ]);
+  const before = parseOwnedRuntimeSignatureSecret(beforeResult.stdout, config, ownership);
+  assert.equal(
+    before.rawSha256,
+    config.documents.version1.rawSha256,
+    'runtime signature Secret changed before the v2 update',
+  );
+  const patch = [
+    { op: 'test', path: '/metadata/uid', value: ownership.uid },
+    { op: 'test', path: '/metadata/resourceVersion', value: before.resourceVersion },
+    {
+      op: 'test',
+      path: '/metadata/labels/anysentry.io~1e2e-run-id',
+      value: ledger.runId,
+    },
+    {
+      op: 'test',
+      path: '/metadata/labels/anysentry.io~1e2e-ownership',
+      value: ownership.nonce,
+    },
+    {
+      op: 'replace',
+      path: '/data/' + RUNTIME_SIGNATURE_FILE_NAME.replace(/~/gu, '~0').replace(/\//gu, '~1'),
+      value: Buffer.from(config.documents.version2.raw).toString('base64'),
+    },
+  ];
+  const updated = await trackMutation(() => run('kubectl', [
+    '-n', config.namespace, 'patch', 'secret', config.name,
+    '--type=json', '-p', JSON.stringify(patch),
+  ], { allowFailure: true, timeoutMs: 45_000 }));
+  if (updated.code !== 0) {
+    throw new Error('failed to update run-owned runtime signature Secret: ' + redact(updated.stderr));
+  }
+  const afterResult = await run('kubectl', [
+    '-n', config.namespace, 'get', 'secret', config.name, '-o', 'json',
+  ]);
+  const after = parseOwnedRuntimeSignatureSecret(afterResult.stdout, config, ownership);
+  assert.notEqual(after.resourceVersion, before.resourceVersion, 'runtime signature Secret resourceVersion did not advance');
+  assert.equal(
+    after.rawSha256,
+    config.documents.version2.rawSha256,
+    'runtime signature Secret did not retain the v2 document',
+  );
+}
+
 async function createK8sCredentialSecret(options) {
   const namespace = options.k8sWorkloadNamespace;
   const name = k8sName(options, 'deepseek');
   const credential = await fs.readFile(options.keyFile);
   if (credential.length < 1 || credential.length > 512) throw new Error('DeepSeek key file size changed after preflight');
+  const models = options.piModelsFile ? await fs.readFile(options.piModelsFile) : undefined;
+  if (models && (models.length < 2 || models.length > PI_MODELS_FILE_LIMIT)) {
+    throw new Error('Pi models file size changed after staging');
+  }
   const secret = {
     apiVersion: 'v1',
     kind: 'Secret',
@@ -2928,12 +4510,16 @@ async function createK8sCredentialSecret(options) {
     },
     immutable: true,
     type: 'Opaque',
-    data: { deepseek_api_key: credential.toString('base64') },
+    data: {
+      deepseek_api_key: credential.toString('base64'),
+      ...(models ? { 'models.json': models.toString('base64') } : {}),
+    },
   };
   try {
     await createK8sObject(namespace, 'secret', name, secret, ledger.k8sSecrets);
   } finally {
     credential.fill(0);
+    models?.fill(0);
   }
   return name;
 }
@@ -2967,11 +4553,16 @@ async function startK8sCollector(options, phase, nodeName) {
   const name = k8sName(options, 'collector', 'k8s', phase);
   const id = collectorId(options, 'k8s', phase);
   await assertCollectorHistoryAbsentBeforeStart(options.k8sApiBase, id, 'k8s', phase);
+  const signatureReloadConfig = options.exerciseSignatureReload
+    ? await createK8sRuntimeSignatureSecret(options, phase)
+    : undefined;
   const serviceBase = k8sApiServiceBase(options);
   const envValues = {
     A3S_OBSERVER_JSON: '1',
     A3S_OBSERVER_COLLECTOR_ID: id,
-    A3S_OBSERVER_FILES: '1',
+    // Keep the run-scoped collector focused on the ToolExec signal under test. Production can
+    // still enable the independent high-volume file probes in its own deployment configuration.
+    A3S_OBSERVER_FILES: '0',
     A3S_OBSERVER_SSL: '0',
     ANYSENTRY_SOURCE_TYPE: 'observer',
     ANYSENTRY_SOURCE_NAME: 'real-agent-lifecycle-k8s-' + options.runId,
@@ -2986,6 +4577,12 @@ async function startK8sCollector(options, phase, nodeName) {
     FORWARD_NOISE_POLICY: 'balanced',
     ANYSENTRY_E2E_FILTER_MARKER_SHA256: expectedMarkerHash(filterCanaryMarker(options, 'k8s', phase)),
     ANYSENTRY_E2E_WITNESS_DIR: '/run/anysentry-e2e-witness',
+    ...(signatureReloadConfig ? {
+      ANYSENTRY_AGENT_RUNTIME_SIGNATURES_FILE:
+        path.posix.join(RUNTIME_SIGNATURE_MOUNT_DIRECTORY, RUNTIME_SIGNATURE_FILE_NAME),
+    } : {}),
+    ...collectorEventIngestScopeEnvironment(options, 'k8s', phase),
+    ...collectorEventTransportEnvironment(),
     ...collectorSupervisorEnvironment(),
     ...endpointEnvironment(serviceBase),
   };
@@ -3020,6 +4617,11 @@ async function startK8sCollector(options, phase, nodeName) {
         volumeMounts: [
           { name: 'sys', mountPath: '/sys', readOnly: true },
           { name: 'witness', mountPath: '/run/anysentry-e2e-witness' },
+          ...(signatureReloadConfig ? [{
+            name: 'runtime-signatures',
+            mountPath: RUNTIME_SIGNATURE_MOUNT_DIRECTORY,
+            readOnly: true,
+          }] : []),
         ],
         resources: {
           requests: { cpu: '50m', memory: '128Mi' },
@@ -3029,6 +4631,10 @@ async function startK8sCollector(options, phase, nodeName) {
       volumes: [
         { name: 'sys', hostPath: { path: '/sys', type: 'Directory' } },
         { name: 'witness', emptyDir: { medium: 'Memory', sizeLimit: '1Mi' } },
+        ...(signatureReloadConfig ? [{
+          name: 'runtime-signatures',
+          secret: { secretName: signatureReloadConfig.name, defaultMode: 256 },
+        }] : []),
       ],
       tolerations: [{ operator: 'Exists' }],
     },
@@ -3051,7 +4657,16 @@ async function startK8sCollector(options, phase, nodeName) {
       ? item
       : undefined;
   }, 60_000, 500);
-  return { name, namespace, collectorId: id, environment: 'k8s', phase, apiBase: options.k8sApiBase };
+  return {
+    name,
+    namespace,
+    collectorId: id,
+    environment: 'k8s',
+    phase,
+    apiBase: options.k8sApiBase,
+    signatureReloadConfig,
+    eventIngestScope: collectorEventIngestScopeProof(options, 'k8s', phase),
+  };
 }
 
 function markerAction(markerValue, outputFile = '/workspace/tool-events.log') {
@@ -3078,15 +4693,246 @@ function piEnvironment(options, environment, phase) {
     AGENT_ID: 'e2e-' + environment + '-' + phase + '-' + options.runId,
     AGENT_INTERVAL_SECONDS: '600',
     PI_EXECUTION_MODE: 'loop',
-    PI_PROVIDER: 'deepseek',
-    PI_MODEL: 'deepseek-v4-flash',
+    PI_PROVIDER: options.piProvider,
+    PI_MODEL: options.piModel,
     PI_THINKING: 'off',
     PI_TURN_TIMEOUT_SECONDS: '90',
-    PI_RETRY_SECONDS: '10',
+    // A real E2E proof is bound to the fresh workload's first Pi turn. Keep retries outside the
+    // bounded proof window so a failed first turn cannot borrow a later turn's successful exit.
+    PI_RETRY_SECONDS: String(PI_RETRY_SECONDS),
     DEEPSEEK_API_KEY_FILE: '/run/secrets/deepseek_api_key',
     PI_E2E_MARKER_FILE: '/run/anysentry-e2e-marker/value',
+    PI_E2E_RELEASE_FILE: environment === 'docker'
+      ? '/run/anysentry-e2e-marker/go'
+      : PI_MARKER_RELEASE_FILE,
     PI_AGENT_PROMPT: piPrompt(),
   };
+}
+
+function parsePiRuntimeLogRecords(logText) {
+  return String(logText).split(/\r?\n/u).flatMap((line) => {
+    try {
+      const parsed = JSON.parse(line);
+      return plainObject(parsed) ? [parsed] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
+function piRuntimeLogDiagnostic(logText, expectedAgentId) {
+  const source = String(logText ?? '');
+  const records = parsePiRuntimeLogRecords(source);
+  const lifecycleEvents = new Set([
+    'started',
+    'pi_process_starting',
+    'pi_process_timeout',
+    'pi_process_error',
+    'pi_process_exited',
+    'pi_retry_scheduled',
+    'next_agent_turn_scheduled',
+    'shutdown_requested',
+    'fatal',
+  ]);
+  const lifecycle = records.filter((record) =>
+    record.runtime === 'pi' && lifecycleEvents.has(record.event));
+  const matchingRoundOneStart = lifecycle.some((record) =>
+    record.event === 'pi_process_starting' &&
+    record.agentId === expectedAgentId &&
+    record.round === 1);
+  const matchingRoundOneFailure = lifecycle.some((record) =>
+    record.agentId === expectedAgentId &&
+    record.round === 1 &&
+    (record.event === 'pi_process_timeout' ||
+      record.event === 'pi_process_error' ||
+      (record.event === 'pi_process_exited' && (record.code !== 0 || record.signal !== null))));
+  const safeInteger = (value) => Number.isSafeInteger(value) ? value : undefined;
+  const safeSignal = (value) => typeof value === 'string' && /^SIG[A-Z0-9]+$/u.test(value)
+    ? value
+    : value === null ? null : undefined;
+  const lastLifecycleEvents = lifecycle.slice(-8).map((record) => ({
+    event: record.event,
+    agentIdMatches: record.agentId === expectedAgentId,
+    ...(safeInteger(record.round) !== undefined ? { round: safeInteger(record.round) } : {}),
+    ...(safeInteger(record.code) !== undefined ? { code: safeInteger(record.code) } : {}),
+    ...(safeSignal(record.signal) !== undefined ? { signal: safeSignal(record.signal) } : {}),
+    ...(Number.isFinite(record.timeoutSeconds) && record.timeoutSeconds > 0
+      ? { timeoutSeconds: Number(record.timeoutSeconds) }
+      : {}),
+  }));
+  return {
+    capturedBytes: Buffer.byteLength(source),
+    redactedLogSha256: hashText(redactStructuredText(source)),
+    parsedRecords: records.length,
+    lifecycleRecords: lifecycle.length,
+    matchingStartRecords: lifecycle.filter((record) =>
+      record.event === 'pi_process_starting' && record.agentId === expectedAgentId).length,
+    matchingSuccessfulExitRecords: lifecycle.filter((record) =>
+      record.event === 'pi_process_exited' &&
+      record.agentId === expectedAgentId &&
+      record.round === 1 &&
+      record.code === 0 &&
+      record.signal === null &&
+      !matchingRoundOneFailure &&
+      matchingRoundOneStart).length,
+    lastLifecycleEvents,
+  };
+}
+
+function inspectPiRuntimeLogs(logText, options, environment, phase, label) {
+  const records = parsePiRuntimeLogRecords(logText).filter((record) => record.runtime === 'pi');
+  const expectedAgentId = 'e2e-' + environment + '-' + phase + '-' + options.runId;
+  const starts = records.filter((record) => record.event === 'pi_process_starting');
+  const diagnostic = piRuntimeLogDiagnostic(logText, expectedAgentId);
+  if (!starts.length) return { successful: false, llm: undefined, diagnostic };
+  assert.equal(starts.length, 1, label + ' Pi emitted more than one process-start record');
+  for (const start of starts) {
+    assert.equal(start.agentId, expectedAgentId, label + ' Pi used the wrong Agent ID');
+    assert.equal(start.round, 1, label + ' Pi proof is not bound to the fresh workload first turn');
+    assert.equal(start.mode, 'loop', label + ' Pi did not run in real loop mode');
+    assert.equal(start.provider, options.piProvider, label + ' Pi used the wrong provider');
+    assert.equal(start.model, options.piModel, label + ' Pi used the wrong model');
+    assert.equal(
+      start.credentialSource,
+      'DEEPSEEK_API_KEY',
+      label + ' Pi did not consume the mounted DeepSeek credential',
+    );
+  }
+  const start = starts[0];
+  const terminalEvents = records.filter((record) =>
+    ['pi_process_timeout', 'pi_process_error', 'pi_process_exited'].includes(record.event));
+  for (const terminal of terminalEvents) {
+    assert.equal(terminal.agentId, expectedAgentId, label + ' Pi terminal record used the wrong Agent ID');
+    assert.equal(terminal.round, 1, label + ' Pi terminal record belongs to a different turn');
+  }
+  const exits = terminalEvents.filter((record) => record.event === 'pi_process_exited');
+  assert.ok(exits.length <= 1, label + ' Pi emitted duplicate first-turn exit records');
+  const terminalFailure = terminalEvents.some((record) =>
+    record.event === 'pi_process_timeout' ||
+    record.event === 'pi_process_error' ||
+    (record.event === 'pi_process_exited' && (record.code !== 0 || record.signal !== null)));
+  const successful = !terminalFailure &&
+    exits.length === 1 && exits[0].code === 0 && exits[0].signal === null;
+  return {
+    successful,
+    terminalFailure,
+    llm: {
+      provider: start.provider,
+      model: start.model,
+      agentId: start.agentId,
+      credentialSource: start.credentialSource,
+      round: start.round,
+    },
+    diagnostic,
+  };
+}
+
+function assertPiRuntimeLogs(logText, options, environment, phase, label) {
+  const inspected = inspectPiRuntimeLogs(logText, options, environment, phase, label);
+  const expectedAgentId = 'e2e-' + environment + '-' + phase + '-' + options.runId;
+  const start = inspected.llm;
+  assert.ok(start, label + ' Pi did not emit a structured process-start record');
+  assert.ok(
+    inspected.successful,
+    label + ' Pi real model turn did not exit successfully; structured state=' +
+      JSON.stringify(inspected.diagnostic),
+  );
+  assert.equal(start.agentId, expectedAgentId, label + ' Pi used the wrong Agent ID');
+  return start;
+}
+
+async function waitForSuccessfulPiRuntimeLogs(
+  readLogs,
+  options,
+  environment,
+  phase,
+  label,
+  timeoutMs = PI_RUNTIME_EXIT_WAIT_MS,
+  intervalMs = POLL_MS,
+) {
+  const deadline = Date.now() + timeoutMs;
+  const expectedAgentId = 'e2e-' + environment + '-' + phase + '-' + options.runId;
+  let latestLogText = '';
+  let latestRead = { code: undefined, signal: undefined, stderrBytes: 0, stderrSha256: undefined };
+  while (Date.now() < deadline) {
+    if (ledger.aborting) {
+      const interrupted = new Error('execution interrupted while waiting for ' + label + ' Pi exit');
+      interrupted.piRuntimeDiagnostic = {
+        ...piRuntimeLogDiagnostic(latestLogText, expectedAgentId),
+        logRead: latestRead,
+      };
+      throw interrupted;
+    }
+    let result;
+    try {
+      result = await readLogs();
+    } catch (error) {
+      latestRead = {
+        code: undefined,
+        signal: undefined,
+        stderrBytes: 0,
+        stderrSha256: undefined,
+        readError: boundedRedactedText(
+          error instanceof Error ? error.message : String(error),
+          512,
+        ).tail,
+      };
+      await delay(intervalMs);
+      continue;
+    }
+    latestRead = {
+      code: Number.isSafeInteger(result.code) ? result.code : result.code === null ? null : undefined,
+      signal: typeof result.signal === 'string' && /^SIG[A-Z0-9]+$/u.test(result.signal)
+        ? result.signal
+        : result.signal === null ? null : undefined,
+      stderrBytes: Buffer.byteLength(result.stderr || ''),
+      stderrSha256: hashText(redactStructuredText(result.stderr || '')),
+    };
+    if (result.code === 0) {
+      latestLogText = [result.stdout || '', result.stderr || '']
+        .filter((stream) => stream.length > 0)
+        .join('\n');
+      try {
+        const inspected = inspectPiRuntimeLogs(
+          latestLogText,
+          options,
+          environment,
+          phase,
+          label,
+        );
+        if (inspected.successful) {
+          return {
+            logText: latestLogText,
+            llm: inspected.llm,
+            diagnostic: { ...inspected.diagnostic, logRead: latestRead },
+          };
+        }
+        if (inspected.terminalFailure) {
+          const failure = new Error(label + ' Pi fresh-workload first turn terminated without success');
+          failure.piRuntimeDiagnostic = {
+            ...inspected.diagnostic,
+            logRead: latestRead,
+          };
+          throw failure;
+        }
+      } catch (error) {
+        if (error instanceof Error) {
+          error.piRuntimeDiagnostic = {
+            ...piRuntimeLogDiagnostic(latestLogText, expectedAgentId),
+            logRead: latestRead,
+          };
+        }
+        throw error;
+      }
+    }
+    await delay(intervalMs);
+  }
+  const failure = new Error(label + ' Pi real model turn did not emit a successful structured exit before timeout');
+  failure.piRuntimeDiagnostic = {
+    ...piRuntimeLogDiagnostic(latestLogText, expectedAgentId),
+    logRead: latestRead,
+  };
+  throw failure;
 }
 
 async function writeDockerPiMarkerFile(options, phase, markerValue) {
@@ -3098,7 +4944,26 @@ async function writeDockerPiMarkerFile(options, phase, markerValue) {
 }
 
 function filterCanaryMarker(options, environment, phase) {
-  return marker(options, environment, phase, 'unknown-filter-canary');
+  return marker(options, environment, phase,
+    environment === 'host' ? 'non-agent-filter-canary' : 'unknown-filter-canary');
+}
+
+function filterCanaryContract(environment, phase) {
+  assert.ok(['host', 'docker', 'k8s'].includes(environment), 'filter canary environment is invalid');
+  assert.ok(ALLOWED_PHASES.has(phase), 'filter canary phase is invalid');
+  const host = environment === 'host';
+  const metrics = host
+    ? { shadow: 'wouldFilterNonAgent', enforce: 'filteredNonAgent' }
+    : { shadow: 'wouldDiscoveryBudgetDrop', enforce: 'discoveryBudgetDropped' };
+  return {
+    classification: host ? 'non_agent' : 'unknown',
+    filterReason: host ? 'non_agent' : 'unknown',
+    metricName: metrics[phase],
+    // The API intentionally discards non-Agent events before L1 even when the node-local
+    // Forwarder is in Shadow. Unknown container work remains visible in Shadow for comparison.
+    shadowVisible: !host,
+    shadowApiDisposition: host ? 'non_agent_discarded' : 'retained',
+  };
 }
 
 function filterCanaryCommand() {
@@ -3109,7 +4974,13 @@ function filterCanaryCommand() {
     'remaining=' + FILTER_CANARY_WAIT_SECONDS,
     'while [ ! -f /run/canary/go ]; do [ "$remaining" -gt 0 ] || exit 124; remaining=$((remaining - 1)); /bin/sleep 1; done',
     'marker="$(cat /run/canary/value)"',
-    'exec /usr/bin/true "$marker"',
+    '/usr/bin/true "$marker"',
+    // Docker daemon state queries can lag even after task-delete. Record the command result in the
+    // private run-owned bind directory; the raw kernel witness and correlated filter receipt still
+    // provide the independent proof that the exact marker-bearing exec occurred.
+    'umask 077',
+    'printf "0\\n" > /run/canary/.' + FILTER_CANARY_COMPLETION_FILE + '.tmp',
+    'mv /run/canary/.' + FILTER_CANARY_COMPLETION_FILE + '.tmp /run/canary/' + FILTER_CANARY_COMPLETION_FILE,
   ].join('; ');
 }
 
@@ -3124,10 +4995,76 @@ async function writeFilterCanaryFiles(options, environment, phase) {
   return directory;
 }
 
+function hostFilterCanaryRunnerPayload(directory, markerValue) {
+  assert.match(markerValue, /^[a-z0-9-]{1,160}$/u, 'host filter canary marker must use the safe alphabet');
+  return {
+    schema: HOST_FILTER_CANARY_RUNNER_SCHEMA,
+    agent: 'filter-canary',
+    command: '/usr/bin/true',
+    args: [expectedMarkerHash(markerValue)],
+    cwd: directory,
+    env: {},
+  };
+}
+
+async function startHostFilterCanary(options, phase) {
+  const environment = 'host';
+  const markerValue = filterCanaryMarker(options, environment, phase);
+  const files = await writeFilterCanaryFiles(options, environment, phase);
+  const resolvedFiles = path.resolve(files);
+  const resolvedRoot = path.resolve(ledger.tempRoot);
+  if (!resolvedFiles.startsWith(resolvedRoot + path.sep)) {
+    throw new Error('refused to launch host filter canary outside the run workspace');
+  }
+  const directoryIdentity = localPathIdentity(await fs.lstat(resolvedFiles));
+  assert.equal(directoryIdentity.directory, true, 'host filter canary run path is not a directory');
+  const payload = hostFilterCanaryRunnerPayload(resolvedFiles, markerValue);
+  const unitName = hostFilterCanaryUnitName(options, phase);
+  let service;
+  try {
+    service = await launchHostAgentService(options, phase, 'filter-canary', payload, {
+      unitName,
+      expectedEnvironment: {},
+      proofValues: [markerValue],
+    });
+    const [clientArgv, runnerArgv] = await Promise.all([
+      processArguments(service.record.child.pid),
+      processArguments(service.state.execMainPid),
+    ]);
+    for (const argv of [clientArgv, runnerArgv]) {
+      assert.equal(argv.includes(markerValue), false, 'host filter canary marker appeared in launcher argv');
+    }
+  } catch (error) {
+    if (service && ledger.systemdUnits.has(unitName)) {
+      try {
+        await stopTrackedSystemdUnit(unitName, true);
+      } catch (cleanupError) {
+        error.message += '; host filter canary cleanup failed: ' + redact(cleanupError.message);
+      }
+    }
+    throw error;
+  }
+  return {
+    name: unitName,
+    environment,
+    phase,
+    marker: markerValue,
+    triggerFile: path.join(resolvedFiles, 'go'),
+    directory: resolvedFiles,
+    directoryIdentity,
+    record: service.record,
+    systemd: service,
+  };
+}
+
 async function startDockerFilterCanary(options, environment, phase) {
   const name = k8sName(options, 'filter-canary', environment, phase);
   const ownership = { nonce: ownershipNonce() };
   const files = await writeFilterCanaryFiles(options, environment, phase);
+  const filesState = await localPathState(files);
+  if (!filesState.exists || !filesState.identity.directory) {
+    throw new Error('Docker filter-canary directory is not a tracked local directory');
+  }
   const args = [
     'run', '-d', '--name', name,
     '--label', 'anysentry.e2e.run-id=' + options.runId,
@@ -3138,7 +5075,9 @@ async function startDockerFilterCanary(options, environment, phase) {
     '--user', (typeof process.getuid === 'function' ? process.getuid() : 1000) + ':' +
       (typeof process.getgid === 'function' ? process.getgid() : 1000),
     '--pids-limit', '16', '--memory', '32m', '--cpus', '0.1',
-    '-v', files + ':/run/canary:ro',
+    // Only this private run-owned directory is writable. It carries the trigger and an atomic
+    // command-completion record; the image root remains read-only and all capabilities are dropped.
+    '-v', files + ':/run/canary:rw',
     '--entrypoint', '/usr/bin/timeout',
     resolvedDockerImage(options, options.agentImage),
     '-s', 'TERM', '-k', '5', String(FILTER_CANARY_MAX_RUNTIME_SECONDS),
@@ -3160,6 +5099,9 @@ async function startDockerFilterCanary(options, environment, phase) {
     marker: filterCanaryMarker(options, environment, phase),
     containerId,
     triggerFile: path.join(files, 'go'),
+    completionFile: path.join(files, FILTER_CANARY_COMPLETION_FILE),
+    directory: files,
+    directoryIdentity: filesState.identity,
   };
 }
 
@@ -3269,6 +5211,13 @@ async function triggerFilterCanary(runRecord) {
     ], { timeoutMs: 15_000 });
     return;
   }
+  if (runRecord.environment === 'host') {
+    const state = await localPathState(runRecord.directory);
+    if (!state.exists || !state.identity.directory ||
+        !sameLocalPathIdentity(state.identity, runRecord.directoryIdentity)) {
+      throw new Error('refused to trigger host filter canary after its run directory changed');
+    }
+  }
   await fs.writeFile(runRecord.triggerFile, 'go\n', { mode: 0o600, flag: 'wx' });
 }
 
@@ -3314,23 +5263,154 @@ function expectedMarkerHash(markerValue) {
   return hashText(JSON.stringify(markerValue));
 }
 
+function filterReceiptMatchDetails(receipt, runRecord, rawWitness) {
+  const contract = filterCanaryContract(runRecord.environment, runRecord.phase);
+  const observedAt = Date.parse(rawWitness?.observedAt || '');
+  const filteredAt = Date.parse(receipt?.filteredAt || '');
+  const physical = String(receipt?.physicalWorkloadId || '');
+  const containerId = String(runRecord.containerId || '');
+  const physicalMatch = runRecord.environment === 'host' ||
+    (containerId.length >= 12 &&
+      (physical.includes(containerId) || physical.includes(containerId.slice(0, 12))));
+  const details = {
+    schemaMatch: receipt?.schema === 'anysentry.e2e_filter_receipt.v1',
+    eventKindMatch: receipt?.eventKind === 'ToolExec',
+    markerHashMatch: receipt?.markerSha256 === expectedMarkerHash(runRecord.marker),
+    lineHashMatch: receipt?.lineSha256 === rawWitness?.lineSha256,
+    classificationMatch: receipt?.classification === contract.classification,
+    filterReasonMatch: receipt?.filterReason === contract.filterReason,
+    filteredAfterWitness: Number.isFinite(observedAt) && Number.isFinite(filteredAt) &&
+      filteredAt >= observedAt,
+    physicalMatch,
+  };
+  return {
+    ...details,
+    matched: Object.values(details).every(Boolean),
+  };
+}
+
 function matchingFilterReceipt(heartbeat, runRecord, rawWitness) {
-  const expectedHash = expectedMarkerHash(runRecord.marker);
-  return heartbeat?.filterMetrics?.e2eFilterReceipts?.find((receipt) => {
-    if (receipt?.schema !== 'anysentry.e2e_filter_receipt.v1' || receipt.eventKind !== 'ToolExec') return false;
-    if (
-      receipt.markerSha256 !== expectedHash ||
-      receipt.lineSha256 !== rawWitness?.lineSha256 ||
-      receipt.classification !== 'unknown' ||
-      receipt.filterReason !== 'unknown'
-    ) return false;
-    const observedAt = Date.parse(rawWitness?.observedAt || '');
-    const filteredAt = Date.parse(receipt.filteredAt || '');
-    if (!Number.isFinite(observedAt) || !Number.isFinite(filteredAt) || filteredAt < observedAt) return false;
-    if (runRecord.environment === 'host') return true;
-    const physical = String(receipt.physicalWorkloadId || '');
-    return physical.includes(runRecord.containerId) || physical.includes(runRecord.containerId.slice(0, 12));
-  });
+  return heartbeat?.filterMetrics?.e2eFilterReceipts?.find((receipt) =>
+    filterReceiptMatchDetails(receipt, runRecord, rawWitness).matched,
+  );
+}
+
+function uniqueHeartbeatEvidence(samples, current) {
+  const unique = [];
+  const seen = new Set();
+  for (const item of [...(Array.isArray(samples) ? samples : []), ...(current ? [current] : [])]) {
+    if (item?.filterMetricsReported !== true) continue;
+    const fingerprint = heartbeatCursor(item).filterMetricsFingerprint;
+    if (seen.has(fingerprint)) continue;
+    seen.add(fingerprint);
+    unique.push(item);
+  }
+  return unique;
+}
+
+function findCorrelatedFilterHeartbeat(
+  samples,
+  current,
+  armedHeartbeat,
+  metricName,
+  runRecord,
+  rawWitness,
+) {
+  const heartbeats = uniqueHeartbeatEvidence(samples, current);
+  for (const heartbeat of heartbeats) {
+    if (!heartbeatAdvanced(armedHeartbeat, heartbeat)) continue;
+    if (!(Number(heartbeat?.filterMetrics?.[metricName]) > 0)) continue;
+    const receipt = matchingFilterReceipt(heartbeat, runRecord, rawWitness);
+    if (receipt) {
+      return {
+        heartbeat,
+        receipt,
+        examinedHeartbeatCount: heartbeats.length,
+      };
+    }
+  }
+  return undefined;
+}
+
+function filterReceiptCorrelationDiagnostic(
+  samples,
+  current,
+  armedHeartbeat,
+  metricName,
+  runRecord,
+  rawWitness,
+) {
+  const heartbeats = uniqueHeartbeatEvidence(samples, current);
+  const candidates = [];
+  let advancedHeartbeatCount = 0;
+  let positiveMetricHeartbeatCount = 0;
+  for (const heartbeat of heartbeats) {
+    const advanced = heartbeatAdvanced(armedHeartbeat, heartbeat);
+    const metricValue = Number(heartbeat?.filterMetrics?.[metricName]) || 0;
+    if (advanced) advancedHeartbeatCount += 1;
+    if (advanced && metricValue > 0) positiveMetricHeartbeatCount += 1;
+    for (const receipt of heartbeat?.filterMetrics?.e2eFilterReceipts || []) {
+      const details = filterReceiptMatchDetails(receipt, runRecord, rawWitness);
+      candidates.push({
+        heartbeatAdvanced: advanced,
+        metricPositive: metricValue > 0,
+        markerSha256: /^[a-f0-9]{64}$/u.test(receipt?.markerSha256 || '')
+          ? receipt.markerSha256
+          : '<invalid-hash>',
+        lineSha256: /^[a-f0-9]{64}$/u.test(receipt?.lineSha256 || '')
+          ? receipt.lineSha256
+          : '<invalid-hash>',
+        ...details,
+      });
+    }
+  }
+  return {
+    heartbeatCount: heartbeats.length,
+    advancedHeartbeatCount,
+    positiveMetricHeartbeatCount,
+    receiptCount: candidates.length,
+    candidates: candidates.slice(-8),
+  };
+}
+
+async function waitForCorrelatedFilterHeartbeat(
+  apiBase,
+  collectorId,
+  sampler,
+  armedHeartbeat,
+  metricName,
+  runRecord,
+  rawWitness,
+  label,
+) {
+  assert.equal(typeof sampler?.snapshot, 'function', 'filter receipt history sampler is unavailable');
+  let current;
+  try {
+    return await eventually(label, async () => {
+      current = await queryHeartbeat(apiBase, collectorId);
+      return findCorrelatedFilterHeartbeat(
+        sampler.snapshot(),
+        current,
+        armedHeartbeat,
+        metricName,
+        runRecord,
+        rawWitness,
+      );
+    }, 30_000, 200);
+  } catch (error) {
+    const diagnostic = filterReceiptCorrelationDiagnostic(
+      sampler.snapshot(),
+      current,
+      armedHeartbeat,
+      metricName,
+      runRecord,
+      rawWitness,
+    );
+    throw new Error(
+      (error instanceof Error ? error.message : String(error)) +
+      '; safeReceiptDiagnostic=' + JSON.stringify(diagnostic),
+    );
+  }
 }
 
 async function waitForFilterWitness(collector, runRecord) {
@@ -3368,13 +5448,55 @@ async function waitForFilterCanaryProcess(runRecord) {
       ], { allowFailure: true });
       return result.stdout.trim() === '0' ? true : undefined;
     }, 30_000, 250);
-    return;
+    return { method: 'kubernetes-terminated-state', exitCode: 0 };
   }
-  await eventually('Docker filter canary completed', async () => {
-    const result = await run('docker', ['inspect', '--format', '{{.State.Status}} {{.State.ExitCode}}', runRecord.name], {
-      allowFailure: true,
-    });
-    return result.stdout.trim() === 'exited 0' ? true : undefined;
+  if (runRecord.environment === 'host') {
+    let timer;
+    try {
+      const result = await Promise.race([
+        runRecord.record.done,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Host filter canary did not complete in 30 seconds')), 30_000);
+        }),
+      ]);
+      assert.equal(
+        result.code,
+        0,
+        'Host filter canary exited unsuccessfully; stderr hash=' + hashText(result.stderr),
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+    return { method: 'systemd-process-result', exitCode: 0 };
+  }
+  return await eventually('Docker filter canary command completion', async () => {
+    const directoryState = await localPathState(runRecord.directory);
+    if (!directoryState.exists || !directoryState.identity.directory ||
+        !sameLocalPathIdentity(directoryState.identity, runRecord.directoryIdentity)) {
+      throw new Error('run-owned filter-canary directory identity changed');
+    }
+    assert.equal(
+      runRecord.completionFile,
+      path.join(runRecord.directory, FILTER_CANARY_COMPLETION_FILE),
+      'Docker filter-canary completion path changed',
+    );
+    const proof = await readLocalProofTextFile(runRecord.directory, FILTER_CANARY_COMPLETION_FILE);
+    if (!proof.exists) return undefined;
+    if (proof.status !== 'ok') {
+      throw new Error('Docker filter-canary completion record is ' + proof.status);
+    }
+    const expectedUid = typeof process.getuid === 'function' ? process.getuid() : 1000;
+    const expectedGid = typeof process.getgid === 'function' ? process.getgid() : 1000;
+    assert.equal(proof.mode, 0o600, 'Docker filter-canary completion record is not mode 0600');
+    assert.equal(proof.uid, expectedUid, 'Docker filter-canary completion record has the wrong owner');
+    assert.equal(proof.gid, expectedGid, 'Docker filter-canary completion record has the wrong group');
+    assert.equal(proof.text, '0\n', 'Docker filter-canary command returned a non-zero result');
+    return {
+      method: 'run-owned-atomic-completion-record',
+      exitCode: 0,
+      bytes: proof.bytes,
+      mode: proof.mode.toString(8).padStart(3, '0'),
+    };
   }, 30_000, 250);
 }
 
@@ -3409,7 +5531,15 @@ async function readLocalProofTextFile(workspace, name) {
         after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs) {
       return { exists: true, status: 'changed_while_reading', bytes: after.size };
     }
-    return { exists: true, status: 'ok', bytes: content.length, text: content.toString('utf8') };
+    return {
+      exists: true,
+      status: 'ok',
+      bytes: content.length,
+      text: content.toString('utf8'),
+      mode: opened.mode & 0o777,
+      uid: opened.uid,
+      gid: opened.gid,
+    };
   } catch (error) {
     if (error?.code === 'ENOENT') return { exists: false, status: 'missing', bytes: 0 };
     return {
@@ -3529,6 +5659,7 @@ async function prepareHostWorkspace(options, phase, agent, markerValue) {
 function hostAgentEnvironment() {
   const environment = Object.fromEntries(Object.entries(process.env).filter(([name, value]) =>
     value !== undefined &&
+    name !== 'KIMI_SHARE_DIR' &&
     hostAgentEnvironmentNameAllowed(name) &&
     !/^(?:LD_|NODE_OPTIONS$|BASH_ENV$)/u.test(name) &&
     !/(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|SSH_AUTH_SOCK)/iu.test(name),
@@ -3665,6 +5796,7 @@ async function launchHostAgentService(options, phase, agent, payload, launchOpti
     description: '',
     invocationId: undefined,
     controlGroup: undefined,
+    controlGroupIdentity: undefined,
     observed: false,
     launcherRecord: undefined,
     stopPromise: undefined,
@@ -3710,6 +5842,7 @@ async function launchHostAgentService(options, phase, agent, payload, launchOpti
       lockSystemdUnitOwnership(unitName, ownership, observed);
       return observed;
     }, HOST_AGENT_START_TIMEOUT_MS, 50);
+    ownership.controlGroupIdentity = await systemdControlGroupIdentity(state.controlGroup);
     const detached = await assertHostServiceDetached(state.execMainPid, state.controlGroup);
     return {
       record,
@@ -3754,17 +5887,53 @@ async function launchHostAgent(options, phase, agent, markerValue) {
   );
   let command;
   let args;
+  let llmConfiguration;
   if (agent === 'host-codex') {
     command = resolvedExecutable.path;
     args = hostCodexArgs(options, workspace, prompt);
     assertHostCodexLaunchAuthorization(options, args);
   } else if (agent === 'host-kimi') {
+    for (const name of [
+      'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+      'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
+    ]) delete environment[name];
+    const config = options.kimiConfig;
+    assert.ok(config?.path && config?.identity, 'host-kimi has no run-owned configuration');
+    assert.equal(path.dirname(config.path), ledger.tempRoot, 'Host Kimi config escaped the run temp root');
+    const verifiedConfig = await readVerifiedRunOwnedFile(
+      config.path,
+      config.bytes,
+      config.sha256,
+      config.identity,
+      'run-owned Host Kimi config before launch',
+    );
+    verifiedConfig.content.fill(0);
+    const shareDirectory = path.join(ledger.tempRoot, 'kimi-state-' + phase);
+    await fs.mkdir(shareDirectory, { mode: 0o700 });
+    const shareStat = await fs.lstat(shareDirectory);
+    const ownedByCaller = typeof process.getuid !== 'function' || shareStat.uid === process.getuid();
+    assert.equal(
+      shareStat.isDirectory() && !shareStat.isSymbolicLink() &&
+        (shareStat.mode & 0o777) === 0o700 && ownedByCaller,
+      true,
+      'Host Kimi state directory is not a run-owned 0700 directory',
+    );
+    environment.KIMI_SHARE_DIR = shareDirectory;
+    registerRuntimeEvidenceRedactionLiteral(shareDirectory);
     command = resolvedExecutable.path;
     args = [
+      '--config-file', config.path, '--model', config.modelKey,
       '--work-dir', workspace, '--print', '--no-thinking', '--max-steps-per-turn', '8',
       '--mcp-config', '{}', '--skills-dir', path.join(workspace, 'empty-skills'),
       '--prompt', prompt,
     ];
+    llmConfiguration = {
+      provider: options.piProvider,
+      model: options.piModel,
+      source: 'run-owned-kimi-config',
+      stateIsolation: true,
+      proxyEnvironmentForwarded: false,
+    };
   } else {
     throw new Error('unsupported host Agent: ' + agent);
   }
@@ -3789,6 +5958,7 @@ async function launchHostAgent(options, phase, agent, markerValue) {
     phase,
     sandboxMode: agent === 'host-codex' ? hostCodexSandboxMode(options) : undefined,
     fullAccessAuthorized: agent === 'host-codex' ? options.allowHostFullAccess : false,
+    llmConfiguration,
   };
 }
 
@@ -3846,6 +6016,7 @@ async function finishHostAgent(runRecord) {
   const proof = await readLocalToolProof(runRecord.workspace, runRecord.marker, runRecord);
   return {
     realLlm: true,
+    llm: runRecord.llmConfiguration,
     toolResult: proof,
     process: {
       exitCode: result.code,
@@ -3940,6 +6111,18 @@ async function startDockerPi(options, phase, markerValue) {
   const runtimeUid = typeof process.getuid === 'function' ? process.getuid() : 1000;
   const runtimeGid = typeof process.getgid === 'function' ? process.getgid() : 1000;
   const markerDirectory = await writeDockerPiMarkerFile(options, phase, markerValue);
+  const markerDirectoryState = await localPathState(markerDirectory);
+  if (!markerDirectoryState.exists || !markerDirectoryState.identity.directory) {
+    throw new Error('Docker Pi marker directory is not a tracked local directory');
+  }
+  const runtimeImageId = resolvedDockerImage(options, options.agentImage);
+  const gateCommand = piMarkerHelperGateCommand(options.piMarkerHelperSha256, true);
+  const gatedCommand = [
+    '-c', gateCommand, 'anysentry-pi-marker-helper-gate',
+    '/usr/bin/timeout',
+    '-s', 'TERM', '-k', String(CONTAINER_KILL_GRACE_SECONDS), String(AGENT_MAX_RUNTIME_SECONDS),
+    '/opt/agent-lab/entrypoint.sh',
+  ];
   const args = [
     'run', '-d', '--name', name,
     '--label', 'anysentry.e2e.run-id=' + options.runId,
@@ -3953,12 +6136,14 @@ async function startDockerPi(options, phase, markerValue) {
     '--tmpfs', '/workspace:rw,nosuid,size=64m,uid=' + runtimeUid + ',gid=' + runtimeGid + ',mode=0750',
     '--tmpfs', '/home/node/.pi/agent:rw,nosuid,size=64m,uid=' + runtimeUid + ',gid=' + runtimeGid + ',mode=0750',
     '-v', options.keyFile + ':/run/secrets/deepseek_api_key:ro',
+    ...(options.piModelsFile
+      ? ['-v', options.piModelsFile + ':/home/node/.pi/agent/models.json:ro']
+      : []),
     '-v', markerDirectory + ':/run/anysentry-e2e-marker:ro',
     ...dockerEnvArgs(piEnvironment(options, 'docker', phase)),
-    '--entrypoint', '/usr/bin/timeout',
-    resolvedDockerImage(options, options.agentImage),
-    '-s', 'TERM', '-k', String(CONTAINER_KILL_GRACE_SECONDS), String(AGENT_MAX_RUNTIME_SECONDS),
-    '/opt/agent-lab/entrypoint.sh',
+    '--entrypoint', '/bin/sh',
+    runtimeImageId,
+    ...gatedCommand,
   ];
   ledger.dockerContainers.set(name, ownership);
   const created = await trackMutation(() => run('docker', args, { timeoutMs: 60_000 }));
@@ -3968,11 +6153,121 @@ async function startDockerPi(options, phase, markerValue) {
   if (!(await dockerResourceOwned(name, ledger.runId, ownership))) {
     throw new Error('new Docker workload ownership could not be verified: ' + name);
   }
-  await assertDockerContainerImage(name, resolvedDockerImage(options, options.agentImage));
-  return { name, marker: markerValue, environment: 'docker' };
+  await assertDockerContainerImage(name, runtimeImageId);
+  const agentImageProof = await assertDockerPiImageAndMarkerHelper(
+    name,
+    options.agentImage,
+    runtimeImageId,
+    options.piMarkerHelperSha256,
+    gatedCommand,
+  );
+  return {
+    name,
+    marker: markerValue,
+    environment: 'docker',
+    phase,
+    markerDirectory,
+    markerDirectoryIdentity: markerDirectoryState.identity,
+    markerReleaseFile: path.join(markerDirectory, 'go'),
+    agentImageProof,
+  };
 }
 
-async function dockerPiProof(runRecord) {
+function assertPiResultFiles(result, expectedProofHash, label) {
+  assert.equal(result.code, 0, label + ' Pi proof files were not readable after the successful exit');
+  const toolHash = String(result.stdout).split(/\r?\n/u).flatMap((line) => {
+    const match = line.match(/^([a-f0-9]{64})\s+\/workspace\/tool-events\.log$/u);
+    return match ? [match[1]] : [];
+  });
+  assert.deepEqual(toolHash, [expectedProofHash], label + ' Pi tool marker changed across process exit');
+  return redact(result.stdout.trim());
+}
+
+async function assertPiMarkerReleaseStillClosed(runRecord) {
+  const result = runRecord.environment === 'docker'
+    ? await run('docker', [
+        'exec', runRecord.name, '/bin/sh', '-c',
+        'test ! -e /run/anysentry-e2e-marker/go && test ! -e /workspace/tool-events.log',
+      ], { allowFailure: true, timeoutMs: 10_000 })
+    : await run('kubectl', [
+        '-n', runRecord.namespace, 'exec', runRecord.name, '-c', 'workload', '--',
+        '/bin/sh', '-c',
+        'test ! -e /run/anysentry-e2e-release/go && test ! -e /workspace/tool-events.log',
+      ], { allowFailure: true, timeoutMs: 10_000 });
+  assert.equal(
+    result.code,
+    0,
+    (runRecord.environment === 'docker' ? 'Docker' : 'Kubernetes') +
+      ' Pi marker helper was not still held immediately before release',
+  );
+  return {
+    checkedAt: new Date().toISOString(),
+    releaseFileAbsent: true,
+    toolProofAbsent: true,
+    verifiedHelperSha256: runRecord.agentImageProof?.markerHelper?.sourceSha256 ??
+      runRecord.agentImageProof?.containers?.find((item) => item.container === 'workload')
+        ?.markerHelper?.sourceSha256,
+    pathReported: false,
+  };
+}
+
+async function releasePiMarker(runRecord) {
+  const releasedAt = new Date().toISOString();
+  if (runRecord.environment === 'docker') {
+    const directoryState = await localPathState(runRecord.markerDirectory);
+    if (!directoryState.exists || !directoryState.identity.directory ||
+        !sameLocalPathIdentity(directoryState.identity, runRecord.markerDirectoryIdentity)) {
+      throw new Error('refused to release Docker Pi marker after its run directory changed');
+    }
+    assert.equal(
+      runRecord.markerReleaseFile,
+      path.join(runRecord.markerDirectory, 'go'),
+      'Docker Pi marker release path changed',
+    );
+    const content = Buffer.from('go\n');
+    const published = await atomicallyPublishRunOwnedFile(
+      runRecord.markerDirectory,
+      runRecord.markerDirectoryIdentity,
+      path.basename(runRecord.markerReleaseFile),
+      content,
+      'Docker Pi marker release file',
+    );
+    return {
+      method: 'host-fsynced-file-atomically-renamed-into-read-only-bind',
+      releasedAt,
+      bytes: 3,
+      mode: (published.identity.mode & 0o777).toString(8),
+      sha256: published.sha256,
+      pathReported: false,
+    };
+  }
+  assert.equal(runRecord.environment, 'k8s', 'Pi marker release environment is unsupported');
+  await eventually('Kubernetes Pi marker release sidecar', async () => {
+    const result = await run('kubectl', [
+      '-n', runRecord.namespace, 'exec', runRecord.name,
+      '-c', runRecord.markerReleaseContainer, '--',
+      '/bin/sh', '-c',
+      "set -eu; if [ -f /release/go ] && [ ! -L /release/go ] && [ \"$(cat /release/go)\" = go ]; then exit 0; fi; test ! -e /release/go; test ! -e /release/.go.tmp; printf 'go\\n' > /release/.go.tmp; chmod 600 /release/.go.tmp; mv /release/.go.tmp /release/go",
+    ], { allowFailure: true, timeoutMs: 10_000 });
+    return result.code === 0 ? true : false;
+  }, 60_000, 500);
+  const verified = await run('kubectl', [
+    '-n', runRecord.namespace, 'exec', runRecord.name, '-c', 'workload', '--',
+    '/bin/sh', '-c',
+    "test -f /run/anysentry-e2e-release/go && test ! -L /run/anysentry-e2e-release/go && [ \"$(cat /run/anysentry-e2e-release/go)\" = go ] && [ \"$(stat -c '%a %s' /run/anysentry-e2e-release/go)\" = '600 3' ]",
+  ], { allowFailure: true, timeoutMs: 10_000 });
+  assert.equal(verified.code, 0, 'Kubernetes workload could not verify the read-only Pi marker release');
+  return {
+    method: 'run-owned-sidecar-to-read-only-shared-memory-volume',
+    releasedAt,
+    bytes: 3,
+    mode: '600',
+    sha256: hashText('go\n'),
+    pathReported: false,
+  };
+}
+
+async function dockerPiProof(options, runRecord) {
   const expectedProofHash = hashText(runRecord.marker + '\n');
   await eventually('Docker Pi real LLM tool result', async () => {
     const result = await run('docker', [
@@ -3981,19 +6276,28 @@ async function dockerPiProof(runRecord) {
     ], { allowFailure: true, timeoutMs: 10_000 });
     return result.code === 0 && result.stdout.trim().split(/\s+/u)[0] === expectedProofHash ? true : false;
   }, 180_000, 1_000);
-  const logs = await run('docker', ['logs', runRecord.name], { timeoutMs: 15_000 });
-  assert.match(logs.stdout + logs.stderr, /"mode":"loop"/u, 'Docker Pi did not run in real loop mode');
-  assert.match(logs.stdout + logs.stderr, /"credentialSource":"DEEPSEEK_API_KEY"/u, 'Docker Pi did not consume the mounted DeepSeek credential');
-  assert.match(logs.stdout + logs.stderr, /"pi_process_exited"[^\n]*"code":0/u, 'Docker Pi real model turn did not exit successfully');
+  const runtimeProof = await waitForSuccessfulPiRuntimeLogs(
+    () => run('docker', ['logs', runRecord.name], { allowFailure: true, timeoutMs: 15_000 }),
+    options,
+    runRecord.environment,
+    runRecord.phase,
+    'Docker',
+  );
   const hashes = await run('docker', [
     'exec', runRecord.name, '/bin/sh', '-c',
-    'wc -c /workspace/tool-events.log /workspace/model-result.txt && sha256sum /workspace/tool-events.log /workspace/model-result.txt',
-  ]);
+    'test -s /workspace/model-result.txt && wc -c /workspace/tool-events.log /workspace/model-result.txt && sha256sum /workspace/tool-events.log /workspace/model-result.txt',
+  ], { allowFailure: true, timeoutMs: 15_000 });
+  const resultFiles = assertPiResultFiles(hashes, expectedProofHash, 'Docker');
   return {
     realLlm: true,
+    llm: runtimeProof.llm,
     markerPresent: true,
-    logs: { bytes: Buffer.byteLength(logs.stdout + logs.stderr), sha256: hashText(logs.stdout + logs.stderr) },
-    resultFiles: redact(hashes.stdout.trim()),
+    logs: {
+      bytes: Buffer.byteLength(runtimeProof.logText),
+      sha256: hashText(redactStructuredText(runtimeProof.logText)),
+      structured: runtimeProof.diagnostic,
+    },
+    resultFiles,
   };
 }
 
@@ -4025,6 +6329,22 @@ async function startK8sPi(options, phase, nodeName, secretName, markerValue) {
         fsGroup: 1000,
         seccompProfile: { type: 'RuntimeDefault' },
       },
+      initContainers: [{
+        name: 'marker-helper-gate',
+        image: options.agentImage,
+        imagePullPolicy: 'IfNotPresent',
+        command: ['/bin/sh', '-c'],
+        args: [piMarkerHelperGateCommand(options.piMarkerHelperSha256, false)],
+        securityContext: {
+          allowPrivilegeEscalation: false,
+          readOnlyRootFilesystem: true,
+          capabilities: { drop: ['ALL'] },
+        },
+        resources: {
+          requests: { cpu: '5m', memory: '8Mi' },
+          limits: { cpu: '50m', memory: '32Mi' },
+        },
+      }],
       containers: [{
         name: 'workload',
         image: options.agentImage,
@@ -4040,28 +6360,83 @@ async function startK8sPi(options, phase, nodeName, secretName, markerValue) {
           { name: 'workspace', mountPath: '/workspace' },
           { name: 'pi-state', mountPath: '/home/node/.pi/agent' },
           { name: 'credentials', mountPath: '/run/secrets', readOnly: true },
+          ...(options.piModelsFile
+            ? [{
+                name: 'pi-config',
+                mountPath: '/home/node/.pi/agent/models.json',
+                subPath: 'models.json',
+                readOnly: true,
+              }]
+            : []),
           { name: 'marker', mountPath: '/run/anysentry-e2e-marker', readOnly: true },
+          { name: 'marker-release', mountPath: '/run/anysentry-e2e-release', readOnly: true },
           { name: 'tmp', mountPath: '/tmp' },
         ],
         resources: {
           requests: { cpu: '50m', memory: '128Mi' },
           limits: { cpu: '1', memory: '768Mi' },
         },
+      }, {
+        name: 'release-gate',
+        image: options.agentImage,
+        imagePullPolicy: 'IfNotPresent',
+        command: ['/bin/sh', '-c'],
+        args: ['umask 077; while :; do /bin/sleep 3600; done'],
+        securityContext: {
+          allowPrivilegeEscalation: false,
+          readOnlyRootFilesystem: true,
+          capabilities: { drop: ['ALL'] },
+        },
+        volumeMounts: [
+          { name: 'marker-release', mountPath: '/release' },
+          { name: 'release-tmp', mountPath: '/tmp' },
+        ],
+        resources: {
+          requests: { cpu: '5m', memory: '8Mi' },
+          limits: { cpu: '50m', memory: '32Mi' },
+        },
       }],
       volumes: [
         { name: 'workspace', emptyDir: { sizeLimit: '64Mi' } },
         { name: 'pi-state', emptyDir: { sizeLimit: '64Mi' } },
         { name: 'credentials', secret: { secretName, defaultMode: 288 } },
+        ...(options.piModelsFile
+          ? [{
+              name: 'pi-config',
+              secret: {
+                secretName,
+                defaultMode: 288,
+                items: [{ key: 'models.json', path: 'models.json' }],
+              },
+            }]
+          : []),
         { name: 'marker', secret: { secretName: markerSecretName, defaultMode: 288 } },
+        { name: 'marker-release', emptyDir: { medium: 'Memory', sizeLimit: '1Mi' } },
         { name: 'tmp', emptyDir: { medium: 'Memory', sizeLimit: '32Mi' } },
+        { name: 'release-tmp', emptyDir: { medium: 'Memory', sizeLimit: '1Mi' } },
       ],
     },
   };
   await createK8sObject(namespace, 'pod', name, manifest, ledger.k8sPods);
-  return { name, namespace, marker: markerValue, markerSecretName, environment: 'k8s' };
+  const agentImageProof = await assertK8sPiImageAndMarkerHelper(
+    namespace,
+    name,
+    options.agentImage,
+    options.piMarkerHelperSha256,
+  );
+  return {
+    name,
+    namespace,
+    marker: markerValue,
+    markerSecretName,
+    markerReleaseContainer: 'release-gate',
+    environment: 'k8s',
+    phase,
+    agentImageProof,
+  };
 }
 
-async function k8sPiProof(runRecord) {
+async function k8sPiProof(options, runRecord) {
   const expectedProofHash = hashText(runRecord.marker + '\n');
   await eventually('Kubernetes Pi real LLM tool result', async () => {
     const result = await run('kubectl', [
@@ -4071,22 +6446,31 @@ async function k8sPiProof(runRecord) {
     ], { allowFailure: true, timeoutMs: 15_000 });
     return result.code === 0 && result.stdout.trim().split(/\s+/u)[0] === expectedProofHash ? true : false;
   }, 180_000, 1_000);
-  const logs = await run('kubectl', [
-    '-n', runRecord.namespace, 'logs', runRecord.name, '-c', 'workload',
-  ], { timeoutMs: 15_000 });
-  assert.match(logs.stdout + logs.stderr, /"mode":"loop"/u, 'Kubernetes Pi did not run in real loop mode');
-  assert.match(logs.stdout + logs.stderr, /"credentialSource":"DEEPSEEK_API_KEY"/u, 'Kubernetes Pi did not consume the mounted DeepSeek credential');
-  assert.match(logs.stdout + logs.stderr, /"pi_process_exited"[^\n]*"code":0/u, 'Kubernetes Pi real model turn did not exit successfully');
+  const runtimeProof = await waitForSuccessfulPiRuntimeLogs(
+    () => run('kubectl', [
+      '-n', runRecord.namespace, 'logs', runRecord.name, '-c', 'workload',
+    ], { allowFailure: true, timeoutMs: 15_000 }),
+    options,
+    runRecord.environment,
+    runRecord.phase,
+    'Kubernetes',
+  );
   const hashes = await run('kubectl', [
     '-n', runRecord.namespace, 'exec', runRecord.name, '-c', 'workload', '--',
     '/bin/sh', '-c',
-    'wc -c /workspace/tool-events.log /workspace/model-result.txt && sha256sum /workspace/tool-events.log /workspace/model-result.txt',
-  ]);
+    'test -s /workspace/model-result.txt && wc -c /workspace/tool-events.log /workspace/model-result.txt && sha256sum /workspace/tool-events.log /workspace/model-result.txt',
+  ], { allowFailure: true, timeoutMs: 15_000 });
+  const resultFiles = assertPiResultFiles(hashes, expectedProofHash, 'Kubernetes');
   return {
     realLlm: true,
+    llm: runtimeProof.llm,
     markerPresent: true,
-    logs: { bytes: Buffer.byteLength(logs.stdout + logs.stderr), sha256: hashText(logs.stdout + logs.stderr) },
-    resultFiles: redact(hashes.stdout.trim()),
+    logs: {
+      bytes: Buffer.byteLength(runtimeProof.logText),
+      sha256: hashText(redactStructuredText(runtimeProof.logText)),
+      structured: runtimeProof.diagnostic,
+    },
+    resultFiles,
   };
 }
 
@@ -4103,6 +6487,7 @@ function runtimeIdentityIsComplete(item) {
 async function waitForNewRunningInstance(apiBase, collector, baselineIds, scope, candidateMatches = async () => true) {
   return await eventually('new running ' + scope + ' instance on ' + collector, async () => {
     const runtime = await queryRuntime(apiBase, { collectorId: collector });
+    assertCompleteRuntimeInventory(runtime, collector + ' running-instance lookup');
     const candidates = runtime.items.filter((item) =>
       !baselineIds.has(item.agentInstanceId) &&
       String(item.agentScopeId || '').toLowerCase() === scope.toLowerCase() &&
@@ -4144,9 +6529,17 @@ async function matchHostRuntimeToSystemdService(candidate, runRecord) {
   if (!state.owned) throw new Error('host Agent systemd ownership changed while matching runtime');
   lockSystemdUnitOwnership(service.unitName, service.ownership, state);
   if (!state.controlGroup || state.controlGroup !== service.ownership.controlGroup) return undefined;
-  const identity = (await processAncestry(candidate.rootPid, 1))[0];
+  const currentControlGroupIdentity = await systemdControlGroupIdentity(state.controlGroup);
+  if (!sameLocalPathIdentity(currentControlGroupIdentity, service.ownership.controlGroupIdentity)) {
+    throw new Error('host Agent systemd control-group identity changed while matching runtime');
+  }
+  const ancestry = await processAncestry(candidate.rootPid);
+  const identity = ancestry[0];
   if (!identity || identity.startTime !== String(candidate.rootStartTimeTicks)) return undefined;
   if (candidate.rootPid === service.state.execMainPid) return undefined;
+  if (!ancestry.some((record) =>
+    record.pid === service.state.execMainPid &&
+    record.startTime === service.detached.execMainStartTimeTicks)) return undefined;
   let observedControlGroup;
   try {
     observedControlGroup = await processUnifiedControlGroup(candidate.rootPid);
@@ -4155,14 +6548,99 @@ async function matchHostRuntimeToSystemdService(candidate, runRecord) {
     throw error;
   }
   if (!controlGroupContains(service.ownership.controlGroup, observedControlGroup)) return undefined;
-  const confirmedIdentity = (await processAncestry(candidate.rootPid, 1))[0];
+  const confirmedAncestry = await processAncestry(candidate.rootPid);
+  const confirmedIdentity = confirmedAncestry[0];
   if (!confirmedIdentity || confirmedIdentity.startTime !== String(candidate.rootStartTimeTicks)) return undefined;
+  if (!confirmedAncestry.some((record) =>
+    record.pid === service.state.execMainPid &&
+    record.startTime === service.detached.execMainStartTimeTicks)) return undefined;
   if (!runtimeCandidateMatchesHostAgent(candidate, runRecord.agent, confirmedIdentity.comm)) return undefined;
   return {
     processKey: String(candidate.rootPid) + ':' + String(candidate.rootStartTimeTicks),
     controlGroup: observedControlGroup,
+    cgroupId: service.ownership.controlGroupIdentity.ino,
     unit: service.unitName,
     invocationId: service.ownership.invocationId,
+    launcherPid: service.state.execMainPid,
+    launcherStartTimeTicks: service.detached.execMainStartTimeTicks,
+  };
+}
+
+function hostRuntimePlacementEvidence(candidate, placement) {
+  return {
+    agentInstanceId: candidate.agentInstanceId,
+    agentScopeId: candidate.agentScopeId,
+    agentDisplayName: candidate.agentDisplayName,
+    classification: candidate.classification,
+    rootPid: candidate.rootPid,
+    rootStartTimeTicks: String(candidate.rootStartTimeTicks),
+    hostId: candidate.hostId,
+    bootId: candidate.bootId,
+    cgroupId: placement.cgroupId,
+    unit: placement.unit,
+    invocationId: placement.invocationId,
+    launcherPid: placement.launcherPid,
+    launcherStartTimeTicks: placement.launcherStartTimeTicks,
+    observedAt: Date.now(),
+  };
+}
+
+function startHostRuntimeOwnershipSampler(apiBase, collector, baselineIds, runRecord) {
+  let stopping = false;
+  let failure;
+  const placements = new Map();
+  const remember = (candidate, placement) => {
+    if (!placement) return;
+    const evidence = hostRuntimePlacementEvidence(candidate, placement);
+    const existing = placements.get(evidence.agentInstanceId);
+    if (existing) {
+      for (const name of [
+        'agentScopeId', 'agentDisplayName', 'classification', 'rootPid', 'rootStartTimeTicks',
+        'hostId', 'bootId', 'cgroupId', 'unit', 'invocationId',
+        'launcherPid', 'launcherStartTimeTicks',
+      ]) {
+        assert.equal(
+          evidence[name],
+          existing[name],
+          'host owned runtime placement identity changed for ' + evidence.agentInstanceId,
+        );
+      }
+      return;
+    }
+    placements.set(evidence.agentInstanceId, evidence);
+  };
+  const task = (async () => {
+    while (!stopping) {
+      try {
+        const runtime = await queryRuntime(apiBase, { collectorId: collector });
+        assertCompleteRuntimeInventory(runtime, collector + ' host ownership sampler');
+        const candidates = runtime.items.filter((item) =>
+          !baselineIds.has(item.agentInstanceId) &&
+          item.runtimeState === 'running' &&
+          item.agentScopeId === expectedScopeForAgent(runRecord.agent) &&
+          runtimeIdentityIsComplete(item),
+        );
+        for (const candidate of candidates) {
+          remember(candidate, await matchHostRuntimeToSystemdService(candidate, runRecord));
+        }
+      } catch (error) {
+        failure = error;
+        break;
+      }
+      if (!stopping) await delay(125);
+    }
+  })();
+  return {
+    remember,
+    assertHealthy() {
+      if (failure) throw failure;
+    },
+    async stop() {
+      stopping = true;
+      await task;
+      if (failure) throw failure;
+      return [...placements.values()];
+    },
   };
 }
 
@@ -4174,37 +6652,221 @@ async function waitForTerminalInstance(apiBase, collector, agentInstanceId) {
   }, 90_000, 500);
 }
 
-async function waitForMarkerEvent(apiBase, collector, markerValue, agentInstanceId) {
+function markerEventCandidateDiagnostic(result, markerValue, agentInstanceId, contract) {
+  return {
+    returnedItems: Array.isArray(result?.items) ? result.items.length : 0,
+    candidates: (Array.isArray(result?.items) ? result.items : []).slice(0, 8).map((item) => ({
+      eventKind: item?.eventKind,
+      executable: path.posix.basename(String(item?.process?.exe || '')),
+      exactShapeMatches: exactMarkerToolEvent(item, markerValue, agentInstanceId, contract),
+      attributedAgentMatches: item?.attribution?.agentInstanceId === agentInstanceId,
+      classification: item?.attribution?.classification,
+      agentScopeId: item?.attribution?.agentScopeId,
+      attributionReason: item?.attribution?.reason,
+      attributionSource: item?.attribution?.source,
+      execConfirmed: item?.attributes?.exec_confirmed,
+      argvIncomplete: item?.attributes?.argv_incomplete,
+      argvTruncated: item?.attributes?.argv_truncated,
+      argvSource: item?.attributes?.argv_source,
+      observedArgc: item?.attributes?.observed_argc,
+    })),
+  };
+}
+
+async function waitForMarkerEvent(
+  context,
+  collector,
+  markerValue,
+  agentInstanceId,
+  contract = 'true',
+) {
   return await eventually('attributed marker event ' + markerValue, async () => {
-    const result = await queryEvents(apiBase, collector, markerValue);
-    return result.items.find((item) => exactMarkerToolEvent(item, markerValue, agentInstanceId));
+    const result = await queryCollectorEvents(
+      context,
+      collector,
+      collector.environment + '/' + collector.phase + ' attributed marker event',
+    );
+    const matched = result.items.find((item) =>
+      exactMarkerToolEvent(item, markerValue, agentInstanceId, contract));
+    if (matched) return { item: matched, query: result.e2eQueryProof };
+    throw new Error('safe candidate state=' + JSON.stringify(
+      markerEventCandidateDiagnostic(result, markerValue, agentInstanceId, contract),
+    ));
   }, 90_000, 500);
 }
 
-function exactMarkerToolEvent(item, markerValue, agentInstanceId) {
+function eventContainsExactMarker(item, markerValue) {
+  if (item?.eventKind !== 'ToolExec') return false;
+  return String(item?.attributes?.argv || '').trim().split(/\s+/u).includes(markerValue);
+}
+
+function preReleaseMarkerViewProof(result, markerValue, view) {
+  assert.equal(Number.isSafeInteger(result?.total) && result.total >= 0, true,
+    'pre-release ' + view + ' marker query returned no valid total');
+  assert.equal(result.items.length, result.total,
+    'pre-release ' + view + ' marker query was truncated');
+  assert.ok(result.items.length < E2E_EVENT_QUERY_LIMIT,
+    'pre-release ' + view + ' marker query reached the page boundary');
+  const matches = result.items.filter((item) => eventContainsExactMarker(item, markerValue));
+  assert.equal(matches.length, 0,
+    'Pi marker ToolExec was visible in the ' + view + ' view before its release gate opened');
+  return {
+    view,
+    returnedItems: result.items.length,
+    reportedTotal: result.total,
+    totalApproximate: result.totalApproximate === true,
+    storageFallback: result.storageFallback,
+    matchingEvents: 0,
+  };
+}
+
+async function preReleaseMarkerNegativeCheck(
+  apiBase,
+  collector,
+  markerValue,
+  phaseEventQueryStartTime,
+  dependencies = {},
+) {
+  const query = dependencies.queryEvents ?? requestEventList;
+  const wait = dependencies.eventually ?? eventually;
+  const clock = typeof dependencies.now === 'function' ? dependencies.now : Date.now;
+  const nowMs = clock();
+  const startMs = Date.parse(String(phaseEventQueryStartTime || ''));
+  assert.equal(Number.isFinite(startMs), true, 'pre-release marker query has no fixed phase start');
+  const timeFilter = {
+    timeType: 'custom',
+    startTime: new Date(startMs).toISOString(),
+    endTime: new Date(nowMs + PRE_RELEASE_MARKER_FUTURE_SKEW_MS).toISOString(),
+  };
+  let durableAttempts = 0;
+  // The durable endpoint pushes this fresh collector ID into ClickHouse's narrow locator query and
+  // merges the hot ring before returning. Never pair it with agentEventsForWindow: that dashboard
+  // path performs a global wide read before filtering by collector, can consume the shared read
+  // slot, and can silently fall back to a partial hot-ring result.
+  const durableResult = await wait('pre-release durable marker query', async () => {
+    durableAttempts += 1;
+    const result = await query(apiBase, collector, {
+      ...timeFilter,
+      durable: true,
+    });
+    if (result.storageFallback !== undefined) {
+      throw new Error('durable marker query used storage fallback: ' + result.storageFallback);
+    }
+    return result;
+  }, PRE_RELEASE_DURABLE_WAIT_MS, 1_000);
+  validateCompleteE2eEventResult(
+    durableResult,
+    collector,
+    'clickhouse-durable',
+    Date.parse(timeFilter.startTime),
+    Date.parse(timeFilter.endTime),
+    'pre-release durable marker query',
+  );
+  // Do not pass q here. The API bounds durable candidates before text filtering; with q that
+  // bound could hide an early marker and return a misleading zero. This run uses a fresh
+  // collector ID plus marker-scoped forwarding, so fetch its entire small candidate set and apply
+  // the exact marker predicate locally. items.length !== total remains a hard failure.
+  const views = [
+    preReleaseMarkerViewProof(durableResult, markerValue, 'durable-plus-hot-ring'),
+  ];
+  const checkedAtMs = clock();
+  assert.ok(
+    checkedAtMs <= Date.parse(timeFilter.endTime),
+    'pre-release marker query exceeded its requested time window',
+  );
+  return {
+    checkedAt: new Date(checkedAtMs).toISOString(),
+    semantics: 'fresh-collector-durable-plus-hot-ring-negative-check',
+    queryScope: 'fresh-collector-candidates-with-client-side-exact-marker-check',
+    completeGlobalApiInventoryClaimed: false,
+    completeFreshCollectorPageProved: true,
+    queryWindow: timeFilter,
+    durableAttempts,
+    views,
+  };
+}
+
+function apiEventAtMs(value) {
+  const text = String(value || '').trim();
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,9})?$/u.test(text)
+    ? text.replace(' ', 'T') + 'Z'
+    : text;
+  const parsed = Date.parse(normalized);
+  assert.equal(Number.isFinite(parsed), true, 'marker event has no valid timestamp');
+  return parsed;
+}
+
+function proveMarkerEventAfterRelease(event, absenceProof, markerRelease) {
+  const checkedAtMs = Date.parse(absenceProof?.checkedAt || '');
+  const releasedAtMs = Date.parse(markerRelease?.releasedAt || '');
+  const eventAtValue = event?.at ?? event?.eventTime;
+  const eventAtMs = apiEventAtMs(eventAtValue);
+  assert.equal(Number.isFinite(checkedAtMs), true, 'pre-release marker absence proof has no timestamp');
+  assert.equal(Number.isFinite(releasedAtMs), true, 'Pi marker release has no valid timestamp');
+  assert.ok(releasedAtMs >= checkedAtMs, 'Pi marker release preceded its absence proof');
+  // The API currently serializes event time to whole seconds. Compare against the release
+  // lower-bound rounded down to the same precision, while retaining the pre-release absence gate.
+  assert.ok(
+    eventAtMs >= Math.floor(releasedAtMs / 1_000) * 1_000,
+    'attributed Pi marker event predates its release gate',
+  );
+  return {
+    preReleaseAbsenceCheckedAt: absenceProof.checkedAt,
+    releasedAt: markerRelease.releasedAt,
+    eventAt: eventAtValue,
+    eventTimeResolutionMs: 1_000,
+    observedAfterRelease: true,
+  };
+}
+
+function exactMarkerToolEvent(item, markerValue, agentInstanceId, contract = 'true') {
   if (item?.eventKind !== 'ToolExec' || item.attribution?.agentInstanceId !== agentInstanceId) return false;
   const executable = path.posix.basename(String(item.process?.exe || ''));
-  const argv = String(item.attributes?.argv || '').trim().split(/\s+/u).filter(Boolean);
+  const argvText = String(item.attributes?.argv || '').trim();
+  const common = item.attributes?.exec_confirmed === true &&
+    item.attributes?.argv_incomplete === false &&
+    item.attributes?.argv_truncated === false &&
+    ['kernel_fragments', 'proc_cmdline'].includes(String(item.attributes?.argv_source || ''));
+  if (!common) return false;
+  if (contract === 'pi-held-shell') {
+    return executable === 'dash' &&
+      argvText === '/bin/sh -c ' + PI_MARKER_HOLD_COMMAND + ' ' + markerValue &&
+      Number(item.attributes?.observed_argc) === 4;
+  }
+  assert.equal(contract, 'true', 'marker ToolExec contract is unsupported');
+  const argv = argvText.split(/\s+/u).filter(Boolean);
   return executable === 'true' &&
     argv.length === 2 &&
     path.posix.basename(argv[0]) === 'true' &&
     argv[1] === markerValue &&
-    item.attributes?.exec_confirmed === true &&
-    item.attributes?.argv_incomplete === false &&
-    item.attributes?.argv_truncated === false &&
-    ['kernel_fragments', 'proc_cmdline'].includes(String(item.attributes?.argv_source || '')) &&
     Number(item.attributes?.observed_argc) === 2;
 }
 
-async function waitForUnknownCanaryEvent(apiBase, collector, markerValue, environment, containerId) {
+async function waitForVisibleFilterCanaryEvent(
+  context,
+  collector,
+  markerValue,
+  containerId,
+  expectedClassification,
+) {
+  const environment = collector.environment;
   return await eventually('visible shadow filter canary ' + markerValue, async () => {
-    const result = await queryEvents(apiBase, collector, markerValue);
+    const result = await queryCollectorEvents(
+      context,
+      collector,
+      environment + '/' + collector.phase + ' visible filter canary',
+    );
     const item = result.items.find((candidate) =>
-      JSON.stringify(candidate).includes(markerValue) &&
-      candidate.attribution?.classification === 'unknown',
+      eventContainsExactMarker(candidate, markerValue) &&
+      candidate.attribution?.classification === expectedClassification,
     );
     if (!item) return undefined;
     assert.equal(item.eventKind, 'ToolExec', 'shadow filter canary did not route a ToolExec event');
+    assert.equal(
+      item.attribution?.classification,
+      expectedClassification,
+      'shadow filter canary classification differs from its environment contract',
+    );
     const argv = String(item.attributes?.argv || '');
     assert.ok(argv.split(/\s+/u).includes(markerValue), 'shadow ToolExec does not contain the exact marker argument');
     assert.equal(item.attributes?.exec_confirmed, true, 'shadow ToolExec was not kernel-confirmed');
@@ -4216,8 +6878,42 @@ async function waitForUnknownCanaryEvent(apiBase, collector, markerValue, enviro
         environment + ' filter canary did not retain its physical workload identity',
       );
     }
-    return item;
+    return { item, query: result.e2eQueryProof };
   }, 90_000, 500);
+}
+
+async function proveFilterCanaryApiAbsence(context, collector, runRecord, rawWitness, afterHeartbeat, label) {
+  const { apiBase, collectorId } = collector;
+  const drained = await waitForNextHeartbeat(
+    apiBase,
+    collectorId,
+    afterHeartbeat,
+    label + ' post-filter drain heartbeat',
+    (item) => !matchingFilterReceipt(item, runRecord, rawWitness),
+  );
+  const first = await queryCollectorEvents(context, collector, label + ' first absence read');
+  assert.equal(
+    first.items.some((item) => eventContainsExactMarker(item, runRecord.marker)),
+    false,
+    label + ' unexpectedly reached L1',
+  );
+  const stable = await waitForNextHeartbeat(
+    apiBase,
+    collectorId,
+    drained,
+    label + ' stable API absence heartbeat',
+    (item) => !matchingFilterReceipt(item, runRecord, rawWitness),
+  );
+  const second = await queryCollectorEvents(context, collector, label + ' second absence read');
+  assert.equal(
+    second.items.some((item) => eventContainsExactMarker(item, runRecord.marker)),
+    false,
+    label + ' appeared after the drain interval',
+  );
+  return {
+    heartbeat: stable,
+    eventQueries: [first.e2eQueryProof, second.e2eQueryProof],
+  };
 }
 
 function heartbeatCursor(item) {
@@ -4282,6 +6978,142 @@ async function waitForNextHeartbeat(apiBase, collector, previousHeartbeat, label
   }, 30_000, 200);
 }
 
+function runtimeSignatureMetric(metrics, name) {
+  const value = metrics?.[name];
+  assert.ok(
+    Number.isSafeInteger(value) && value >= 0,
+    'runtime signature heartbeat metric ' + name + ' is missing or invalid',
+  );
+  return value;
+}
+
+function assertRuntimeSignatureStartupHeartbeat(item, config, label) {
+  assert.equal(item?.filterMetricsReported, true, label + ' has no enriched heartbeat metrics');
+  const metrics = item.filterMetrics;
+  const expected = config.documents.version1;
+  assert.equal(metrics.runtimeSignatureVersion, expected.version, label + ' did not start from signature v1');
+  assert.equal(metrics.runtimeSignatureHash, expected.documentSha256, label + ' started with the wrong signature document');
+  assert.equal(metrics.runtimeSignatureMatcherHash, expected.matcherSha256, label + ' started with the wrong matcher set');
+  assert.equal(runtimeSignatureMetric(metrics, 'runtimeSignatureLoaded'), expected.runtimeCount, label + ' did not load every builtin runtime');
+  assert.equal(runtimeSignatureMetric(metrics, 'runtimeSignatureInvalid'), 0, label + ' rejected its initial signature document');
+  assert.equal(runtimeSignatureMetric(metrics, 'runtimeSignatureReloadErrors'), 0, label + ' reported a pre-update reload error');
+  return {
+    attempts: runtimeSignatureMetric(metrics, 'runtimeSignatureReloadAttempts'),
+    successes: runtimeSignatureMetric(metrics, 'runtimeSignatureReloadSuccesses'),
+    reconcileRequested: runtimeSignatureMetric(metrics, 'runtimeReconcileRequested'),
+    reconcileRuns: runtimeSignatureMetric(metrics, 'runtimeReconcileRuns'),
+    reconcileErrors: runtimeSignatureMetric(metrics, 'runtimeReconcileErrors'),
+  };
+}
+
+function runtimeSignatureReloadProof(before, after, config, label) {
+  const baseline = assertRuntimeSignatureStartupHeartbeat(before, config, label);
+  assert.equal(after?.filterMetricsReported, true, label + ' has no post-update enriched heartbeat');
+  const metrics = after.filterMetrics;
+  const expected = config.documents.version2;
+  const attempts = runtimeSignatureMetric(metrics, 'runtimeSignatureReloadAttempts');
+  const successes = runtimeSignatureMetric(metrics, 'runtimeSignatureReloadSuccesses');
+  assert.equal(metrics.runtimeSignatureVersion, expected.version, label + ' did not report signature v2');
+  assert.equal(metrics.runtimeSignatureHash, expected.documentSha256, label + ' reported the wrong v2 document hash');
+  assert.equal(metrics.runtimeSignatureMatcherHash, expected.matcherSha256, label + ' reported the wrong v2 registry matcher hash');
+  assert.equal(metrics.runtimeSignatureLastGoodHash, expected.rawSha256, label + ' has no v2 last-good raw hash');
+  assert.equal(runtimeSignatureMetric(metrics, 'runtimeSignatureLoaded'), expected.runtimeCount, label + ' lost builtin runtimes after reload');
+  assert.equal(runtimeSignatureMetric(metrics, 'runtimeSignatureInvalid'), 0, label + ' rejected the v2 signature document');
+  assert.equal(runtimeSignatureMetric(metrics, 'runtimeSignatureReloadErrors'), 0, label + ' reported a reload error');
+  assert.ok(attempts > baseline.attempts, label + ' reload attempt counter did not advance');
+  assert.ok(successes > baseline.successes, label + ' reload success counter did not advance');
+  assert.ok(attempts >= successes, label + ' reload successes exceed attempts');
+  assert.equal(runtimeSignatureMetric(metrics, 'runtimeReconcileErrors'), 0, label + ' reported a reconciliation error');
+  assert.ok(
+    runtimeSignatureMetric(metrics, 'runtimeReconcileRequested') > baseline.reconcileRequested,
+    label + ' did not request reconciliation for the display-name update',
+  );
+  assert.ok(
+    runtimeSignatureMetric(metrics, 'runtimeReconcileRuns') > baseline.reconcileRuns,
+    label + ' did not complete reconciliation before Agent start',
+  );
+  assert.equal(
+    config.documents.version1.matcherSha256,
+    before.filterMetrics.runtimeSignatureMatcherHash,
+    label + ' v1 matcher hash evidence is inconsistent',
+  );
+  assert.notEqual(
+    config.documents.version1.matcherSha256,
+    config.documents.version2.matcherSha256,
+    label + ' observable v2 display-name update did not change the registry matcher hash',
+  );
+  assert.equal(
+    config.documents.version1.matchPredicatesSha256,
+    config.documents.version2.matchPredicatesSha256,
+    label + ' changed runtime IDs, scopes, or match predicates',
+  );
+  return {
+    exercised: true,
+    scope: 'run-scoped',
+    updateMechanism: config.kind === 'k8s-secret'
+      ? 'mutable Kubernetes Secret directory projection'
+      : 'atomic rename in a bind-mounted run-owned directory',
+    before: {
+      version: config.documents.version1.version,
+      documentSha256: config.documents.version1.documentSha256,
+      matcherSha256: config.documents.version1.matcherSha256,
+      reloadAttempts: baseline.attempts,
+      reloadSuccesses: baseline.successes,
+      reconcileRequested: baseline.reconcileRequested,
+      reconcileRuns: baseline.reconcileRuns,
+    },
+    after: {
+      version: config.documents.version2.version,
+      documentSha256: config.documents.version2.documentSha256,
+      matcherSha256: config.documents.version2.matcherSha256,
+      lastGoodRawSha256: config.documents.version2.rawSha256,
+      reloadAttempts: attempts,
+      reloadSuccesses: successes,
+      reloadErrors: 0,
+      reconcileErrors: 0,
+      reconcileRequested: runtimeSignatureMetric(metrics, 'runtimeReconcileRequested'),
+      reconcileRuns: runtimeSignatureMetric(metrics, 'runtimeReconcileRuns'),
+    },
+    builtinRuntimeCount: config.documents.version2.runtimeCount,
+    runtimeIdsScopesAndMatchPredicatesPreserved: true,
+    v2DisplayNamesChanged: true,
+    completedBeforeAgentStart: true,
+    observedAt: after.lastHeartbeatAt,
+  };
+}
+
+function assertRuntimeSignatureV2Heartbeat(item, config, proof, label) {
+  assert.equal(item?.filterMetricsReported, true, label + ' has no enriched heartbeat metrics');
+  const metrics = item.filterMetrics;
+  const expected = config.documents.version2;
+  assert.equal(metrics.runtimeSignatureVersion, expected.version, label + ' regressed from signature v2');
+  assert.equal(metrics.runtimeSignatureHash, expected.documentSha256, label + ' changed the v2 document hash');
+  assert.equal(metrics.runtimeSignatureMatcherHash, expected.matcherSha256, label + ' changed the v2 matcher hash');
+  assert.equal(metrics.runtimeSignatureLastGoodHash, expected.rawSha256, label + ' changed the last-good raw hash');
+  assert.equal(runtimeSignatureMetric(metrics, 'runtimeSignatureLoaded'), expected.runtimeCount, label + ' lost builtin runtimes');
+  assert.equal(runtimeSignatureMetric(metrics, 'runtimeSignatureInvalid'), 0, label + ' reported an invalid signature document');
+  assert.equal(runtimeSignatureMetric(metrics, 'runtimeSignatureReloadErrors'), 0, label + ' reported a reload error');
+  assert.equal(runtimeSignatureMetric(metrics, 'runtimeReconcileErrors'), 0, label + ' reported a reconciliation error');
+  assert.ok(
+    runtimeSignatureMetric(metrics, 'runtimeSignatureReloadSuccesses') >= proof.after.reloadSuccesses,
+    label + ' reload success counter regressed',
+  );
+}
+
+async function exerciseRuntimeSignatureReload(collector) {
+  const config = collector.signatureReloadConfig;
+  assert.ok(config, collector.environment + ' collector has no run-scoped signature configuration');
+  const label = collector.environment + '/' + collector.phase + ' runtime signature reload';
+  const before = await queryHeartbeat(collector.apiBase, collector.collectorId);
+  assertRuntimeSignatureStartupHeartbeat(before, config, label);
+  if (config.kind === 'k8s-secret') await updateK8sRuntimeSignatureSecret(config);
+  else await atomicallyReplaceLocalRuntimeSignatures(config);
+  return await eventually(label + ' heartbeat proof', async () => {
+    const after = await queryHeartbeat(collector.apiBase, collector.collectorId);
+    return runtimeSignatureReloadProof(before, after, config, label);
+  }, config.kind === 'k8s-secret' ? 180_000 : 45_000, 500);
+}
+
 async function waitForK8sCanaryIdentity(options, runRecord, nodeName) {
   return await eventually('Kubernetes filter canary workload identity', async () => {
     const snapshot = await requestJson(
@@ -4299,12 +7131,18 @@ async function waitForK8sCanaryIdentity(options, runRecord, nodeName) {
   }, 60_000, 500);
 }
 
-async function executeFilterCanaryScenario(context, collector) {
+async function executeFilterCanaryScenario(context, collector, sampler) {
   const { environment, phase, apiBase, collectorId } = collector;
+  const contract = filterCanaryContract(environment, phase);
   const before = await queryHeartbeat(apiBase, collectorId);
-  const runRecord = environment === 'k8s'
-    ? await startK8sFilterCanary(context.options, phase, context.k8sNode)
-    : await startDockerFilterCanary(context.options, environment, phase);
+  let runRecord;
+  if (environment === 'k8s') {
+    runRecord = await startK8sFilterCanary(context.options, phase, context.k8sNode);
+  } else if (environment === 'host') {
+    runRecord = await startHostFilterCanary(context.options, phase);
+  } else {
+    runRecord = await startDockerFilterCanary(context.options, environment, phase);
+  }
   let placement;
   try {
     if (environment === 'docker') {
@@ -4326,6 +7164,13 @@ async function executeFilterCanaryScenario(context, collector) {
           ? item
           : undefined;
       }, 30_000, 200);
+    } else if (environment === 'host') {
+      placement = {
+        unit: runRecord.systemd.unitName,
+        invocationId: runRecord.systemd.ownership.invocationId,
+        controlGroup: runRecord.systemd.ownership.controlGroup,
+        detached: runRecord.systemd.detached.forbiddenSharedAncestorCount === 0,
+      };
     }
     await armFilterWitness(collector, runRecord.marker);
     const quietBarrier = await queryHeartbeat(apiBase, collectorId);
@@ -4336,62 +7181,88 @@ async function executeFilterCanaryScenario(context, collector) {
       environment + ' filter canary heartbeat barrier',
     );
     await triggerFilterCanary(runRecord);
-    await waitForFilterCanaryProcess(runRecord);
+    const processCompletion = await waitForFilterCanaryProcess(runRecord);
     const rawWitness = await waitForFilterWitness(collector, runRecord);
-    const metricName = phase === 'shadow' ? 'wouldDiscoveryBudgetDrop' : 'discoveryBudgetDropped';
-    const counterHeartbeat = await waitForNextHeartbeat(
+    const metricName = contract.metricName;
+    const correlated = await waitForCorrelatedFilterHeartbeat(
       apiBase,
       collectorId,
+      sampler,
       armedHeartbeat,
+      metricName,
+      runRecord,
+      rawWitness,
       environment + ' correlated filter counter ' + metricName,
-      (item) => Number(item?.filterMetrics?.[metricName]) > 0 &&
-        Boolean(matchingFilterReceipt(item, runRecord, rawWitness)),
     );
-    const filterReceipt = matchingFilterReceipt(counterHeartbeat, runRecord, rawWitness);
+    const counterHeartbeat = correlated.heartbeat;
+    const filterReceipt = correlated.receipt;
     assert.ok(filterReceipt, environment + ' filter heartbeat has no matching suppression receipt');
     let event;
+    let eventQuery;
     if (phase === 'shadow') {
-      event = await waitForUnknownCanaryEvent(
-        apiBase,
-        collectorId,
-        runRecord.marker,
-        environment,
-        runRecord.containerId,
-      );
+      if (contract.shadowVisible) {
+        const visible = await waitForVisibleFilterCanaryEvent(
+          context,
+          collector,
+          runRecord.marker,
+          runRecord.containerId,
+          contract.classification,
+        );
+        event = visible.item;
+        eventQuery = visible.query;
+      } else {
+        const stable = await proveFilterCanaryApiAbsence(
+          context,
+          collector,
+          runRecord,
+          rawWitness,
+          counterHeartbeat,
+          environment + ' shadow non-Agent policy discard',
+        );
+        placement = {
+          ...placement,
+          apiAbsenceCheckedThrough: stable.heartbeat.lastHeartbeatAt,
+          apiAbsenceEventQueries: stable.eventQueries,
+        };
+      }
     } else {
-      const drained = await waitForNextHeartbeat(
-        apiBase,
-        collectorId,
+      const stable = await proveFilterCanaryApiAbsence(
+        context,
+        collector,
+        runRecord,
+        rawWitness,
         counterHeartbeat,
-        environment + ' enforce post-filter drain heartbeat',
-        (item) => !matchingFilterReceipt(item, runRecord, rawWitness),
+        environment + ' enforce filter canary',
       );
-      const firstFiltered = await queryEvents(apiBase, collectorId, runRecord.marker);
-      assert.equal(firstFiltered.total, 0, environment + ' enforce leaked the unknown filter canary into L1');
-      const stable = await waitForNextHeartbeat(
-        apiBase,
-        collectorId,
-        drained,
-        environment + ' enforce stable absence heartbeat',
-        (item) => !matchingFilterReceipt(item, runRecord, rawWitness),
-      );
-      const filtered = await queryEvents(apiBase, collectorId, runRecord.marker);
-      assert.equal(filtered.total, 0, environment + ' enforce canary appeared after the drain interval');
-      placement = { ...placement, enforceAbsenceCheckedThrough: stable.lastHeartbeatAt };
+      placement = {
+        ...placement,
+        enforceAbsenceCheckedThrough: stable.heartbeat.lastHeartbeatAt,
+        apiAbsenceEventQueries: stable.eventQueries,
+      };
     }
     return {
       marker: runRecord.marker,
-      classification: 'unknown',
+      classification: contract.classification,
       processExecuted: true,
-      shadowVisible: phase === 'shadow',
-      filterMetric: phase === 'shadow' ? 'wouldDiscoveryBudgetDrop' : 'discoveryBudgetDropped',
-      filterMetricValue: Number(counterHeartbeat.filterMetrics?.[
-        phase === 'shadow' ? 'wouldDiscoveryBudgetDrop' : 'discoveryBudgetDropped'
-      ]) || 0,
+      processCompletion,
+      shadowVisible: Boolean(event),
+      apiDisposition: phase === 'enforce'
+        ? 'forwarder_filtered'
+        : event
+          ? 'retained'
+          : 'non_agent_discarded',
+      filterMetric: metricName,
+      filterMetricValue: Number(counterHeartbeat.filterMetrics?.[metricName]) || 0,
+      filterMetricEvidence: {
+        source: 'run-scoped-enriched-heartbeat-history',
+        heartbeatAt: counterHeartbeat.lastHeartbeatAt,
+        examinedHeartbeatCount: correlated.examinedHeartbeatCount,
+      },
       rawWitness: sanitized(rawWitness),
       filterReceipt: sanitized(filterReceipt),
       placement: sanitized(placement),
       event: event ? minimalEvent(event) : undefined,
+      eventQuery,
     };
   } finally {
     if (environment === 'k8s') {
@@ -4400,6 +7271,10 @@ async function executeFilterCanaryScenario(context, collector) {
       }
       if (ledger.k8sSecrets.get(runRecord.namespace)?.has(runRecord.secretName)) {
         await deleteOwnedK8s('secret', runRecord.namespace, runRecord.secretName, ledger.k8sSecrets);
+      }
+    } else if (environment === 'host') {
+      if (ledger.systemdUnits.has(runRecord.name)) {
+        await stopTrackedSystemdUnit(runRecord.name, true);
       }
     } else if (ledger.dockerContainers.has(runRecord.name)) {
       await stopOwnedDockerContainer(runRecord.name, true);
@@ -4421,15 +7296,28 @@ function validateLifecycleIdentity(running, terminal, environment) {
   }
 }
 
-async function assertApiIsolation(apiPlanes, intendedPlane, collector, markerValue) {
+async function assertApiIsolation(context, collector) {
   const evidence = [];
-  for (const plane of apiPlanes) {
-    if (plane.name === intendedPlane || !plane.available) continue;
-    const runtime = await queryRuntime(plane.baseUrl, { collectorId: collector });
-    const events = await queryEvents(plane.baseUrl, collector, markerValue);
-    assert.equal(runtime.total, 0, collector + ' leaked into ' + plane.name + ' runtime API');
-    assert.equal(events.total, 0, collector + ' marker leaked into ' + plane.name + ' event API');
-    evidence.push({ plane: plane.name, runtimeInstances: runtime.total, markerEvents: events.total });
+  for (const plane of context.apiPlanes) {
+    if (plane.name === collector.environment || !plane.available) continue;
+    const runtime = await queryRuntime(plane.baseUrl, { collectorId: collector.collectorId });
+    const heartbeat = await queryHeartbeat(plane.baseUrl, collector.collectorId);
+    const events = await queryCollectorEvents(
+      context,
+      collector,
+      collector.collectorId + ' isolation from ' + plane.name,
+      plane,
+    );
+    assert.equal(runtime.total, 0, collector.collectorId + ' leaked into ' + plane.name + ' runtime API');
+    assert.equal(heartbeat, undefined, collector.collectorId + ' leaked into ' + plane.name + ' collector API');
+    assert.equal(events.total, 0, collector.collectorId + ' marker leaked into ' + plane.name + ' event API');
+    evidence.push({
+      plane: plane.name,
+      runtimeInstances: runtime.total,
+      collectorHeartbeat: false,
+      markerEvents: events.total,
+      eventQuery: events.e2eQueryProof,
+    });
   }
   return evidence;
 }
@@ -4440,32 +7328,179 @@ function expectedScopeForAgent(agent) {
   return 'pi';
 }
 
-async function executeHostAgentScenario(context, phase, agent) {
-  const environment = 'host';
-  const apiBase = context.options.hostApiBase;
-  const id = collectorId(context.options, environment, phase);
+function proveReloadedSignatureInstanceRecognition(config, scenarios, environment) {
+  return scenarios.map((scenario) => {
+    const runtimeId = expectedScopeForAgent(scenario.agent);
+    const expected = config.documents.version2.document.runtimes.find(
+      (runtime) => runtime.id === runtimeId,
+    );
+    assert.ok(expected, 'signature v2 has no runtime for ' + scenario.agent);
+    assert.equal(
+      scenario.running?.agentScopeId,
+      expected.agentScopeId,
+      environment + ' running instance did not retain the v2 runtime scope for ' + scenario.agent,
+    );
+    assert.equal(
+      scenario.running?.agentDisplayName,
+      expected.displayName,
+      environment + ' running instance did not use the hot-reloaded v2 display name for ' + scenario.agent,
+    );
+    assert.equal(
+      scenario.terminal?.agentDisplayName,
+      expected.displayName,
+      environment + ' terminal instance did not retain the hot-reloaded v2 display name for ' + scenario.agent,
+    );
+    assert.ok(
+      typeof scenario.running?.agentInstanceId === 'string' && scenario.running.agentInstanceId.length > 0,
+      environment + ' has no instance ID for the v2 runtime signature proof',
+    );
+    return {
+      agent: scenario.agent,
+      runtimeId,
+      agentScopeId: expected.agentScopeId,
+      agentDisplayName: expected.displayName,
+      agentInstanceId: scenario.running.agentInstanceId,
+    };
+  });
+}
+
+function hostAuxiliaryCandidateMatchesScenario(candidate, scenario) {
+  const primaryStart = Number(scenario?.running?.discoveredAt);
+  const primaryEnd = Number(
+    scenario?.terminal?.endedAt ?? scenario?.terminal?.lastSeenAt ?? scenario?.running?.lastSeenAt,
+  );
+  const candidateStart = Number(candidate?.discoveredAt);
+  const candidateEnd = Number(candidate?.endedAt ?? candidate?.lastSeenAt);
+  return runtimeIdentityIsComplete(candidate) &&
+    /^ari_[a-f0-9]{24}$/u.test(String(candidate.agentInstanceId || '')) &&
+    ['exited', 'lost'].includes(candidate.runtimeState) &&
+    candidate.agentInstanceId !== scenario?.running?.agentInstanceId &&
+    candidate.agentScopeId === scenario?.running?.agentScopeId &&
+    candidate.agentDisplayName === scenario?.running?.agentDisplayName &&
+    candidate.classification === scenario?.running?.classification &&
+    candidate.hostId === scenario?.running?.hostId &&
+    candidate.bootId === scenario?.running?.bootId &&
+    Number.isFinite(primaryStart) && Number.isFinite(primaryEnd) &&
+    Number.isFinite(candidateStart) && Number.isFinite(candidateEnd) &&
+    candidateEnd >= candidateStart &&
+    candidateStart >= primaryStart - 5_000 &&
+    candidateStart <= primaryEnd + 15_000 &&
+    candidateEnd <= primaryEnd + 15_000;
+}
+
+function proveHostOwnedAuxiliaryRuntime(collector, candidate, scenarios) {
+  if (candidate?.collectorId !== collector) return undefined;
+  for (const scenario of scenarios) {
+    if (!hostAuxiliaryCandidateMatchesScenario(candidate, scenario)) continue;
+    const cgroupId = String(scenario.proof?.launcher?.runtimePlacement?.cgroupId || '');
+    if (!/^\d+$/u.test(cgroupId) || String(scenario.markerEvent?.process?.cgroupId || '') !== cgroupId) {
+      continue;
+    }
+    const placement = scenario.runtimeOwnership?.find((item) =>
+      item.agentInstanceId === candidate.agentInstanceId &&
+      item.agentScopeId === candidate.agentScopeId &&
+      item.agentDisplayName === candidate.agentDisplayName &&
+      item.classification === candidate.classification &&
+      item.rootPid === candidate.rootPid &&
+      String(item.rootStartTimeTicks) === String(candidate.rootStartTimeTicks) &&
+      item.hostId === candidate.hostId &&
+      item.bootId === candidate.bootId &&
+      item.cgroupId === cgroupId &&
+      item.unit === scenario.proof?.launcher?.unit &&
+      item.invocationId === scenario.proof?.launcher?.invocationId &&
+      item.launcherPid === scenario.proof?.launcher?.detached?.execMainPid &&
+      item.launcherStartTimeTicks === scenario.proof?.launcher?.detached?.execMainStartTimeTicks,
+    );
+    if (!placement) continue;
+    return {
+      runtime: minimalRuntime(candidate),
+      ownership: {
+        relation: 'live_root_in_same_run_owned_systemd_cgroup',
+        primaryAgentInstanceId: scenario.running.agentInstanceId,
+        cgroupId,
+        observedAt: placement.observedAt,
+      },
+    };
+  }
+  return undefined;
+}
+
+async function partitionNovelRuntimeRoots(collector, scenarioResults, runtimeItems) {
+  const expectedIds = new Set(scenarioResults.map((result) => result.running.agentInstanceId));
+  const novel = runtimeItems.filter((item) =>
+    !collector.bootstrapInstanceIds.has(item.agentInstanceId) &&
+    !expectedIds.has(item.agentInstanceId),
+  );
+  if (collector.environment !== 'host') return { ownedAuxiliary: [], unexpected: novel };
+  const ownedAuxiliary = [];
+  const unexpected = [];
+  for (const candidate of novel) {
+    const proof = proveHostOwnedAuxiliaryRuntime(
+      collector.collectorId,
+      candidate,
+      scenarioResults,
+    );
+    if (proof) ownedAuxiliary.push(proof);
+    else unexpected.push(candidate);
+  }
+  return { ownedAuxiliary, unexpected };
+}
+
+async function executeHostAgentScenario(context, collector, agent) {
+  const { environment, phase, apiBase, collectorId: id } = collector;
+  assert.equal(environment, 'host', 'host scenario received the wrong collector environment');
   const markerValue = marker(context.options, environment, phase, agent);
   const baseline = await queryRuntime(apiBase, { collectorId: id });
+  assertCompleteRuntimeInventory(baseline, environment + '/' + phase + ' Agent baseline');
   const baselineIds = new Set(baseline.items.map((item) => item.agentInstanceId));
   let runRecord;
+  let ownershipSampler;
+  let runtimeOwnership;
   try {
     runRecord = await launchHostAgent(context.options, phase, agent, markerValue);
+    ownershipSampler = startHostRuntimeOwnershipSampler(apiBase, id, baselineIds, runRecord);
     const running = await waitForNewRunningInstance(
       apiBase,
       id,
       baselineIds,
       expectedScopeForAgent(agent),
       async (candidate) => {
+        ownershipSampler.assertHealthy();
         const placement = await matchHostRuntimeToSystemdService(candidate, runRecord);
-        if (placement) runRecord.runtimePlacement = placement;
+        if (placement) {
+          runRecord.runtimePlacement = placement;
+          ownershipSampler.remember(candidate, placement);
+        }
         return Boolean(placement);
       },
     );
     const proof = await finishHostAgent(runRecord);
-    const event = await waitForMarkerEvent(apiBase, id, markerValue, running.agentInstanceId);
+    runtimeOwnership = await ownershipSampler.stop();
+    ownershipSampler = undefined;
+    assert.ok(
+      runtimeOwnership.some((item) => item.agentInstanceId === running.agentInstanceId),
+      environment + ' primary Agent was not retained in the live cgroup ownership sample',
+    );
+    const markerEventProof = await waitForMarkerEvent(
+      context,
+      collector,
+      markerValue,
+      running.agentInstanceId,
+    );
+    const event = markerEventProof.item;
+    assert.match(
+      String(runRecord.runtimePlacement?.cgroupId || ''),
+      /^\d+$/u,
+      environment + ' Agent has no pinned run-owned cgroup ID',
+    );
+    assert.equal(
+      String(event.process?.cgroupId || ''),
+      runRecord.runtimePlacement.cgroupId,
+      environment + ' marker event escaped the pinned run-owned systemd cgroup',
+    );
     const terminal = await waitForTerminalInstance(apiBase, id, running.agentInstanceId);
     validateLifecycleIdentity(running, terminal, environment);
-    const isolation = await assertApiIsolation(context.apiPlanes, environment, id, markerValue);
+    const isolation = await assertApiIsolation(context, collector);
     return {
       agent,
       marker: markerValue,
@@ -4473,9 +7508,20 @@ async function executeHostAgentScenario(context, phase, agent) {
       running: minimalRuntime(running),
       terminal: minimalRuntime(terminal),
       markerEvent: minimalEvent(event),
+      markerEventQuery: markerEventProof.query,
+      runtimeOwnership,
       isolation,
     };
   } catch (error) {
+    if (!(error instanceof Error)) error = new Error(String(error));
+    if (ownershipSampler) {
+      try {
+        runtimeOwnership = await ownershipSampler.stop();
+      } catch (samplingError) {
+        error.message += '; host runtime ownership sampler failed: ' + redact(samplingError.message);
+      }
+      ownershipSampler = undefined;
+    }
     if (runRecord && error && typeof error === 'object') {
       try {
         await quiesceHostAgentForDiagnostic(runRecord);
@@ -4495,38 +7541,64 @@ async function executeHostAgentScenario(context, phase, agent) {
   }
 }
 
-async function executeDockerPiScenario(context, phase) {
-  const environment = 'docker';
-  const apiBase = context.options.dockerApiBase;
-  const id = collectorId(context.options, environment, phase);
+async function executeDockerPiScenario(context, collector) {
+  const { environment, phase, apiBase, collectorId: id } = collector;
+  assert.equal(environment, 'docker', 'Docker scenario received the wrong collector environment');
   const markerValue = marker(context.options, environment, phase, 'pi');
   const baseline = await queryRuntime(apiBase, { collectorId: id });
+  assertCompleteRuntimeInventory(baseline, environment + '/' + phase + ' Agent baseline');
   const baselineIds = new Set(baseline.items.map((item) => item.agentInstanceId));
   const runRecord = await startDockerPi(context.options, phase, markerValue);
   const running = await waitForNewRunningInstance(apiBase, id, baselineIds, 'pi');
-  const proof = await dockerPiProof(runRecord);
-  const event = await waitForMarkerEvent(apiBase, id, markerValue, running.agentInstanceId);
+  const markerGateClosedBeforeRelease = await assertPiMarkerReleaseStillClosed(runRecord);
+  const markerNegativeCheckBeforeRelease = await preReleaseMarkerNegativeCheck(
+    apiBase,
+    id,
+    markerValue,
+    collector.eventQueryStartTime,
+  );
+  const markerRelease = await releasePiMarker(runRecord);
+  const proof = await dockerPiProof(context.options, runRecord);
+  const markerEventProof = await waitForMarkerEvent(
+    context,
+    collector,
+    markerValue,
+    running.agentInstanceId,
+    'pi-held-shell',
+  );
+  const event = markerEventProof.item;
+  const markerReleaseOrder = proveMarkerEventAfterRelease(
+    event,
+    markerNegativeCheckBeforeRelease,
+    markerRelease,
+  );
   await stopOwnedDockerContainer(runRecord.name, true);
   const terminal = await waitForTerminalInstance(apiBase, id, running.agentInstanceId);
   validateLifecycleIdentity(running, terminal, environment);
-  const isolation = await assertApiIsolation(context.apiPlanes, environment, id, markerValue);
+  const isolation = await assertApiIsolation(context, collector);
   return {
     agent: 'docker-pi',
     marker: markerValue,
+    agentImageProof: runRecord.agentImageProof,
+    markerGateClosedBeforeRelease,
+    markerNegativeCheckBeforeRelease,
+    markerRelease,
+    markerReleaseOrder,
     proof,
     running: minimalRuntime(running),
     terminal: minimalRuntime(terminal),
     markerEvent: minimalEvent(event),
+    markerEventQuery: markerEventProof.query,
     isolation,
   };
 }
 
-async function executeK8sPiScenario(context, phase) {
-  const environment = 'k8s';
-  const apiBase = context.options.k8sApiBase;
-  const id = collectorId(context.options, environment, phase);
+async function executeK8sPiScenario(context, collector) {
+  const { environment, phase, apiBase, collectorId: id } = collector;
+  assert.equal(environment, 'k8s', 'Kubernetes scenario received the wrong collector environment');
   const markerValue = marker(context.options, environment, phase, 'pi');
   const baseline = await queryRuntime(apiBase, { collectorId: id });
+  assertCompleteRuntimeInventory(baseline, environment + '/' + phase + ' Agent baseline');
   const baselineIds = new Set(baseline.items.map((item) => item.agentInstanceId));
   const runRecord = await startK8sPi(
     context.options,
@@ -4536,20 +7608,46 @@ async function executeK8sPiScenario(context, phase) {
     markerValue,
   );
   const running = await waitForNewRunningInstance(apiBase, id, baselineIds, 'pi');
-  const proof = await k8sPiProof(runRecord);
-  const event = await waitForMarkerEvent(apiBase, id, markerValue, running.agentInstanceId);
+  const markerGateClosedBeforeRelease = await assertPiMarkerReleaseStillClosed(runRecord);
+  const markerNegativeCheckBeforeRelease = await preReleaseMarkerNegativeCheck(
+    apiBase,
+    id,
+    markerValue,
+    collector.eventQueryStartTime,
+  );
+  const markerRelease = await releasePiMarker(runRecord);
+  const proof = await k8sPiProof(context.options, runRecord);
+  const markerEventProof = await waitForMarkerEvent(
+    context,
+    collector,
+    markerValue,
+    running.agentInstanceId,
+    'pi-held-shell',
+  );
+  const event = markerEventProof.item;
+  const markerReleaseOrder = proveMarkerEventAfterRelease(
+    event,
+    markerNegativeCheckBeforeRelease,
+    markerRelease,
+  );
   await deleteOwnedK8s('pod', runRecord.namespace, runRecord.name, ledger.k8sPods);
   await deleteOwnedK8s('secret', runRecord.namespace, runRecord.markerSecretName, ledger.k8sSecrets);
   const terminal = await waitForTerminalInstance(apiBase, id, running.agentInstanceId);
   validateLifecycleIdentity(running, terminal, environment);
-  const isolation = await assertApiIsolation(context.apiPlanes, environment, id, markerValue);
+  const isolation = await assertApiIsolation(context, collector);
   return {
     agent: 'k8s-pi',
     marker: markerValue,
+    agentImageProof: runRecord.agentImageProof,
+    markerGateClosedBeforeRelease,
+    markerNegativeCheckBeforeRelease,
+    markerRelease,
+    markerReleaseOrder,
     proof,
     running: minimalRuntime(running),
     terminal: minimalRuntime(terminal),
     markerEvent: minimalEvent(event),
+    markerEventQuery: markerEventProof.query,
     isolation,
   };
 }
@@ -4643,7 +7741,14 @@ async function requestPhaseCollectorShutdown(collector) {
   collector.shutdownRequested = true;
 }
 
-async function finalizeCollectorPhase(context, collector, sampler, scenarioResults, filterCanary) {
+async function finalizeCollectorPhase(
+  context,
+  collector,
+  sampler,
+  scenarioResults,
+  filterCanary,
+  runtimeSignatureReload,
+) {
   await delay(2_500);
   const beforeStop = await queryHeartbeat(collector.apiBase, collector.collectorId);
   assert.ok(beforeStop?.lastHeartbeatAt, collector.environment + ' collector has no heartbeat before shutdown');
@@ -4675,6 +7780,14 @@ async function finalizeCollectorPhase(context, collector, sampler, scenarioResul
     collector.environment + ' final enriched shutdown heartbeat',
     (item) => finalShutdownHeartbeatAdvanced(beforeStop, item),
   );
+  if (runtimeSignatureReload) {
+    assertRuntimeSignatureV2Heartbeat(
+      finalHeartbeat,
+      collector.signatureReloadConfig,
+      runtimeSignatureReload,
+      collector.environment + '/' + collector.phase + ' final runtime signature heartbeat',
+    );
+  }
   await stopPhaseCollector(collector, true);
   const samples = await sampler.stop();
   const metrics = aggregateHeartbeatSamples(samples, finalHeartbeat);
@@ -4682,12 +7795,17 @@ async function finalizeCollectorPhase(context, collector, sampler, scenarioResul
   // fails, so the failure report retains the operational and evidence-quality root cause.
   collector.finalMetrics = metrics;
   assertPhaseMetrics(collector.phase, metrics, collector.environment);
-  const events = await queryEvents(collector.apiBase, collector.collectorId);
+  const events = await queryCollectorEvents(
+    context,
+    collector,
+    collector.environment + '/' + collector.phase + ' final collector events',
+  );
   const runtime = await queryRuntime(collector.apiBase, { collectorId: collector.collectorId });
-  const expectedIds = new Set(scenarioResults.map((result) => result.running.agentInstanceId));
-  const unexpected = runtime.items.filter((item) =>
-    !collector.bootstrapInstanceIds.has(item.agentInstanceId) &&
-    !expectedIds.has(item.agentInstanceId),
+  assertCompleteRuntimeInventory(runtime, collector.environment + '/' + collector.phase + ' final');
+  const { ownedAuxiliary, unexpected } = await partitionNovelRuntimeRoots(
+    collector,
+    scenarioResults,
+    runtime.items,
   );
   assert.ok(
     unexpected.length <= context.options.maxUnexpectedAgents,
@@ -4705,15 +7823,19 @@ async function finalizeCollectorPhase(context, collector, sampler, scenarioResul
     collectorId: collector.collectorId,
     scenarios: scenarioResults,
     filterCanary,
+    runtimeSignatureReload,
+    eventIngestScope: collector.eventIngestScope,
     metrics,
     l1: {
       routedEvents: events.total,
       sampledEvents: events.items.length,
       classifications,
+      eventQuery: events.e2eQueryProof,
     },
     runtime: {
       total: runtime.total,
       summary: runtime.summary,
+      ownedAuxiliary,
       unexpected: unexpected.map(minimalRuntime),
     },
   };
@@ -4736,6 +7858,32 @@ async function captureIncompletePhaseMetrics(collector, sampler) {
   };
 }
 
+async function captureCollectorLogDiagnostic(collector) {
+  if (!collector?.name) return undefined;
+  try {
+    const result = collector.environment === 'k8s'
+      ? await run('kubectl', [
+        '-n', collector.namespace, 'logs', collector.name, '-c', 'collector',
+      ], { allowFailure: true, timeoutMs: 15_000 })
+      : await run('docker', ['logs', collector.name], { allowFailure: true, timeoutMs: 15_000 });
+    const bounded = boundedRedactedText(result.stdout + result.stderr, DIAGNOSTIC_TEXT_LIMIT);
+    return {
+      exitCode: result.code,
+      bytes: bounded.capturedBytes,
+      truncated: bounded.truncated,
+      sha256: bounded.sha256,
+      tail: bounded.tail,
+    };
+  } catch (error) {
+    return {
+      captureError: boundedRedactedText(
+        error instanceof Error ? error.message : String(error),
+        1_024,
+      ).tail,
+    };
+  }
+}
+
 async function executeEnvironmentPhase(context, environment, phase) {
   const apiBase = environment === 'host'
     ? context.options.hostApiBase
@@ -4748,11 +7896,13 @@ async function executeEnvironmentPhase(context, environment, phase) {
     environment,
     phase,
     apiBase,
+    eventQueryStartTime: new Date(Date.now() - E2E_EVENT_QUERY_START_SKEW_MS).toISOString(),
     ...(environment === 'k8s' ? { namespace: context.options.k8sWorkloadNamespace } : {}),
   };
   let sampler;
   const scenarios = [];
   let filterCanary;
+  let runtimeSignatureReload;
   let primaryError;
   let stage = 'collector-history-recheck';
   try {
@@ -4769,35 +7919,66 @@ async function executeEnvironmentPhase(context, environment, phase) {
         ? await startDockerCollector(context.options, environment, phase, context.options.dockerApiBase)
         : await startK8sCollector(context.options, phase, context.k8sNode);
     collector = { ...collector, ...started };
+    if (context.options.exerciseSignatureReload) {
+      stage = 'runtime-signature-reload';
+      runtimeSignatureReload = await exerciseRuntimeSignatureReload(collector);
+    }
     stage = 'runtime-bootstrap';
     const bootstrap = await queryRuntime(collector.apiBase, { collectorId: collector.collectorId });
+    assertCompleteRuntimeInventory(bootstrap, environment + '/' + phase + ' bootstrap');
     collector.bootstrapInstanceIds = new Set(bootstrap.items.map((item) => item.agentInstanceId));
     stage = 'filter-canary';
-    filterCanary = await executeFilterCanaryScenario(context, collector);
+    filterCanary = await executeFilterCanaryScenario(context, collector, sampler);
     stage = 'agent-scenarios';
     if (environment === 'host') {
       for (const agent of context.options.agents.filter((name) => name.startsWith('host-'))) {
-        scenarios.push(await executeHostAgentScenario(context, phase, agent));
+        scenarios.push(await executeHostAgentScenario(context, collector, agent));
       }
     } else if (environment === 'docker') {
-      scenarios.push(await executeDockerPiScenario(context, phase));
+      scenarios.push(await executeDockerPiScenario(context, collector));
     } else {
-      scenarios.push(await executeK8sPiScenario(context, phase));
+      scenarios.push(await executeK8sPiScenario(context, collector));
+    }
+    if (runtimeSignatureReload) {
+      runtimeSignatureReload = {
+        ...runtimeSignatureReload,
+        recognizedInstances: proveReloadedSignatureInstanceRecognition(
+          collector.signatureReloadConfig,
+          scenarios,
+          environment,
+        ),
+      };
     }
     stage = 'collector-finalize';
-    return await finalizeCollectorPhase(context, collector, sampler, scenarios, filterCanary);
+    return await finalizeCollectorPhase(
+      context,
+      collector,
+      sampler,
+      scenarios,
+      filterCanary,
+      runtimeSignatureReload,
+    );
   } catch (error) {
     primaryError = error instanceof Error ? error : new Error(String(error));
-    const diagnostic = await captureIncompletePhaseMetrics(collector, sampler);
+    const [diagnostic, collectorLogs] = await Promise.all([
+      captureIncompletePhaseMetrics(collector, sampler),
+      captureCollectorLogDiagnostic(collector),
+    ]);
     collector.finalMetrics ??= diagnostic.metrics;
     primaryError.incompletePhase = diagnosticSanitized({
       environment,
       phase,
       stage,
       collectorId: collector.collectorId,
+      eventIngestScope: collector.eventIngestScope,
       scenarios,
       filterCanary,
+      runtimeSignatureReload,
+      ...(primaryError.piRuntimeDiagnostic
+        ? { piRuntimeDiagnostic: primaryError.piRuntimeDiagnostic }
+        : {}),
       metrics: collector.finalMetrics,
+      collectorLogs,
       ...(diagnostic.queryError ? {
         metricsCaptureError: diagnostic.queryError instanceof Error
           ? diagnostic.queryError.message
@@ -4822,13 +8003,25 @@ async function executeEnvironmentPhase(context, environment, phase) {
         cleanupFailures.push(error);
       }
     };
+    const removeRuntimeSignatureResource = async () => {
+      const config = collector.signatureReloadConfig;
+      if (config?.kind !== 'k8s-secret') return;
+      if (!ledger.k8sSecrets.get(config.namespace)?.has(config.name)) return;
+      try {
+        await deleteOwnedK8s('secret', config.namespace, config.name, ledger.k8sSecrets);
+      } catch (error) {
+        cleanupFailures.push(error);
+      }
+    };
     if (primaryError) {
       // Preserve terminal raw/enriched evidence by sampling throughout graceful shutdown.
       await stopCollector();
       await stopSampler();
+      await removeRuntimeSignatureResource();
     } else {
       await stopSampler();
       await stopCollector();
+      await removeRuntimeSignatureResource();
     }
     const finalDiagnostic = await captureIncompletePhaseMetrics(collector, sampler);
     if (primaryError && finalDiagnostic.current && finalDiagnostic.metrics) {
@@ -4866,8 +8059,10 @@ async function executeEnvironmentPhase(context, environment, phase) {
           phase,
           stage,
           collectorId: collector.collectorId,
+          eventIngestScope: collector.eventIngestScope,
           scenarios,
           filterCanary,
+          runtimeSignatureReload,
           metrics: collector.finalMetrics,
         });
         throw cleanupError;
@@ -4898,9 +8093,19 @@ function phaseComparison(results) {
       filterCanary: phase.filterCanary ? {
         processExecuted: phase.filterCanary.processExecuted,
         shadowVisible: phase.filterCanary.shadowVisible,
+        apiDisposition: phase.filterCanary.apiDisposition,
         metric: phase.filterCanary.filterMetric,
         metricValue: phase.filterCanary.filterMetricValue,
         rawWitnessDigest: phase.filterCanary.rawWitness?.lineSha256,
+      } : undefined,
+      runtimeSignatureReload: phase.runtimeSignatureReload ? {
+        exercised: phase.runtimeSignatureReload.exercised,
+        beforeVersion: phase.runtimeSignatureReload.before.version,
+        afterVersion: phase.runtimeSignatureReload.after.version,
+        matchPredicatesPreserved:
+          phase.runtimeSignatureReload.runtimeIdsScopesAndMatchPredicatesPreserved,
+        reloadSuccesses: phase.runtimeSignatureReload.after.reloadSuccesses,
+        reloadErrors: phase.runtimeSignatureReload.after.reloadErrors,
       } : undefined,
     } : undefined;
     return { environment, shadow: compact(phases.shadow), enforce: compact(phases.enforce) };
@@ -4938,9 +8143,42 @@ function validateShadowGate(requestedPlanes, shadowResults, options) {
     );
     assert.ok(Number(result.metrics.last?.runtimeLeaseEpoch) > 0, result.environment + ' shadow has no runtime lease epoch');
     assert.ok(Number(result.metrics.last?.runtimeSnapshotPosts) > 0, result.environment + ' shadow posted no runtime snapshots');
+    if (options.exerciseSignatureReload) {
+      assert.equal(
+        result.runtimeSignatureReload?.exercised,
+        true,
+        result.environment + ' shadow did not complete the run-scoped runtime signature reload',
+      );
+      assert.equal(
+        result.runtimeSignatureReload?.completedBeforeAgentStart,
+        true,
+        result.environment + ' shadow reloaded runtime signatures after Agent start',
+      );
+      assert.equal(
+        result.runtimeSignatureReload?.runtimeIdsScopesAndMatchPredicatesPreserved,
+        true,
+        result.environment + ' shadow changed runtime signature IDs, scopes, or match predicates',
+      );
+      assert.equal(
+        result.runtimeSignatureReload?.recognizedInstances?.length,
+        result.scenarios.length,
+        result.environment + ' shadow did not recognize every Agent instance with v2 display names',
+      );
+    }
+    const filterContract = filterCanaryContract(result.environment, 'shadow');
     assert.equal(result.filterCanary?.processExecuted, true, result.environment + ' shadow filter canary did not execute');
-    assert.equal(result.filterCanary?.shadowVisible, true, result.environment + ' shadow filter canary was not visible');
-    assert.equal(result.filterCanary?.filterMetric, 'wouldDiscoveryBudgetDrop');
+    assert.equal(
+      result.filterCanary?.shadowVisible,
+      filterContract.shadowVisible,
+      result.environment + ' shadow filter canary visibility differs from the API policy contract',
+    );
+    assert.equal(
+      result.filterCanary?.apiDisposition,
+      filterContract.shadowApiDisposition,
+      result.environment + ' shadow filter canary disposition differs from the API policy contract',
+    );
+    assert.equal(result.filterCanary?.classification, filterContract.classification);
+    assert.equal(result.filterCanary?.filterMetric, filterContract.metricName);
     assert.ok(result.filterCanary?.filterMetricValue > 0, result.environment + ' shadow filter counter did not increase');
     assert.match(result.filterCanary?.rawWitness?.lineSha256 || '', /^[a-f0-9]{64}$/u, result.environment + ' shadow has no raw Observer witness');
     for (const scenario of result.scenarios) {
@@ -4956,6 +8194,7 @@ function validateShadowGate(requestedPlanes, shadowResults, options) {
       runtimeSnapshotPosts: result.metrics.last.runtimeSnapshotPosts,
       l1RoutedEvents: result.l1.routedEvents,
       unexpectedAgentInstances: result.runtime.unexpected.length,
+      runtimeSignatureReloadVersion: result.runtimeSignatureReload?.after.version,
     });
   }
   return {
@@ -4966,6 +8205,9 @@ function validateShadowGate(requestedPlanes, shadowResults, options) {
       'every scenario used a real model and produced a tool marker',
       'every marker was attributed and reached a terminal lifecycle state',
       'runtime lease and snapshot reporting were healthy',
+      ...(options.exerciseSignatureReload
+        ? ['run-scoped runtime signature v1 -> v2 reload completed before Agent start']
+        : []),
       'unexpected Agent roots stayed within the configured acceptance threshold',
     ],
     evidence,
@@ -4977,17 +8219,41 @@ async function executeE2e(options, preflightResult) {
   ledger.tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'anysentry-lifecycle-' + options.runId + '-'));
   ledger.tempRootIdentity = localPathIdentity(await fs.lstat(ledger.tempRoot));
   const needsPiCredential = options.agents.includes('docker-pi') || options.agents.includes('k8s-pi');
-  if (needsPiCredential) {
+  const needsAuthorizedLlmCredential = needsPiCredential || options.agents.includes('host-kimi');
+  if (needsAuthorizedLlmCredential) {
     assert.ok(preflightResult.apiState.keyFile, 'DeepSeek key file fingerprint is unavailable');
+    const piModelsFile = options.modelsFile
+      ? await stagePiModelsFile(options, preflightResult.apiState.piModelsFile)
+      : undefined;
+    const keyFile = await stageCredentialFile(options, preflightResult.apiState.keyFile);
+    if (piModelsFile) await assertModelsExcludeCredential(piModelsFile, keyFile);
+    const piModelDescriptor = preflightResult.apiState.piModelsFile?.model;
+    let kimiConfig;
+    if (options.agents.includes('host-kimi')) {
+      assert.ok(piModelsFile && piModelDescriptor, 'host-kimi requires a validated staged models file');
+      registerRuntimeEvidenceRedactionLiteral(piModelDescriptor.baseUrl);
+      registerRuntimeEvidenceRedactionLiteral(new URL(piModelDescriptor.baseUrl).origin);
+      kimiConfig = await stageKimiConfigFile(
+        piModelDescriptor,
+        keyFile,
+        preflightResult.apiState.keyFile,
+      );
+      registerRuntimeEvidenceRedactionLiteral(kimiConfig.path);
+    }
     options = {
       ...options,
-      keyFile: await stageCredentialFile(options, preflightResult.apiState.keyFile),
+      keyFile,
+      piModelsFile,
+      piModelDescriptor,
+      piModelsSha256: preflightResult.apiState.piModelsFile?.sha256,
+      kimiConfig,
     };
   }
   options = {
     ...options,
     resolvedDockerImages: preflightResult.apiState.dockerImages,
     resolvedHostCommands: preflightResult.apiState.hostAgentCommands,
+    resolvedHostKimiVersion: preflightResult.apiState.hostKimiVersion,
     forwarderModuleHashes: await forwarderModuleHashes(),
   };
   await fs.mkdir(options.artifactDir, { recursive: true, mode: 0o700 });
@@ -4998,9 +8264,35 @@ async function executeE2e(options, preflightResult) {
   ledger.artifactRoot = path.resolve(options.artifactDir);
   ledger.artifactRootIdentity = localPathIdentity(artifactStat);
   const apiPlanes = [
-    { name: 'host', baseUrl: options.hostApiBase, available: Boolean(preflightResult.apiState.host?.health && preflightResult.apiState.host?.runtime) },
-    { name: 'docker', baseUrl: options.dockerApiBase, available: Boolean(preflightResult.apiState.docker?.health && preflightResult.apiState.docker?.runtime) },
-    { name: 'k8s', baseUrl: options.k8sApiBase, available: Boolean(preflightResult.apiState.k8s?.health && preflightResult.apiState.k8s?.runtime) },
+    {
+      name: 'host',
+      baseUrl: options.hostApiBase,
+      storage: preflightResult.apiState.host?.storage,
+      available: Boolean(
+        preflightResult.apiState.host?.health && preflightResult.apiState.host?.runtime &&
+        eventStorageContract(preflightResult.apiState.host?.storage, 'host') &&
+        (preflightResult.apiState.host?.storage?.mode !== 'memory' ||
+          memoryStorageIsAuditableBaseline(preflightResult.apiState.host.storage)),
+      ),
+    },
+    {
+      name: 'docker',
+      baseUrl: options.dockerApiBase,
+      storage: preflightResult.apiState.docker?.storage,
+      available: Boolean(
+        preflightResult.apiState.docker?.health && preflightResult.apiState.docker?.runtime &&
+        eventStorageContract(preflightResult.apiState.docker?.storage, 'docker'),
+      ),
+    },
+    {
+      name: 'k8s',
+      baseUrl: options.k8sApiBase,
+      storage: preflightResult.apiState.k8s?.storage,
+      available: Boolean(
+        preflightResult.apiState.k8s?.health && preflightResult.apiState.k8s?.runtime &&
+        eventStorageContract(preflightResult.apiState.k8s?.storage, 'k8s'),
+      ),
+    },
   ];
   const selectedPlanes = new Set([
     ...(options.agents.some((agent) => agent.startsWith('host-')) && apiPlanes[0].available ? ['host'] : []),
@@ -5028,8 +8320,55 @@ async function executeE2e(options, preflightResult) {
       hostCodexSandboxMode: hostCodexSandboxMode(options),
       agents: options.agents,
       maxUnexpectedAgents: options.maxUnexpectedAgents,
+      exerciseSignatureReload: options.exerciseSignatureReload,
+      eventIngestScope: {
+        mode: 'collector-phase-tool-exec-marker-prefix',
+        prefixDimensions: ['runId', 'environment', 'phase'],
+        prefixSha256ReportedPerPhase: true,
+        collectorHeartbeatsBypassScope: true,
+        attributionAndRuntimeDiscoveryRunBeforeScope: true,
+        testOnly: true,
+        productionDefault: 'disabled-when-env-absent',
+        markerPrefixReported: false,
+      },
+      eventEvidenceQueries: {
+        timeWindow: 'fixed-phase-start-to-query-end-with-bounded-clock-skew',
+        clickhousePlanes: 'collector-scoped-durable-plus-hot-ring-merge-without-fallback',
+        hostMemoryPlane: 'explicit-hot-ring-fallback-with-boot-continuity-and-no-trim-proof',
+        markerFiltering: 'client-side-exact-argv-token',
+        serverTextSearchUsed: false,
+        completeGlobalApiInventoryClaimed: false,
+        completeFreshCollectorPageRequired: true,
+      },
+      pi: needsPiCredential ? {
+        provider: options.piProvider,
+        model: options.piModel,
+        modelsFileReported: Boolean(options.piModelsFile),
+        modelsFileSha256: options.piModelsSha256,
+        transportSecurity: options.piModelDescriptor?.transportSecurity ?? 'built-in-provider',
+        lifecycleProof: 'fresh-workload-round-1-runtime-visible-then-release-held-tool-result-and-successful-exit',
+        retrySeconds: PI_RETRY_SECONDS,
+        successfulExitWaitSeconds: PI_RUNTIME_EXIT_WAIT_MS / 1_000,
+        markerHelperSourceSha256: options.piMarkerHelperSha256,
+        markerHelperVerifiedBeforeAgentProcess: true,
+        markerHelperRuntimeVerifiedPerScenario: true,
+        markerHelperPathReported: false,
+      } : undefined,
+      hostKimi: options.agents.includes('host-kimi') ? {
+        provider: options.piProvider,
+        model: options.piModel,
+        cliVersion: options.resolvedHostKimiVersion,
+        configuration: 'run-owned-0600-openai-compatible',
+        state: 'run-owned-0700',
+        transportSecurity: options.piModelDescriptor?.transportSecurity,
+      } : undefined,
     },
-    apiPlanes: apiPlanes.map((plane) => ({ name: plane.name, baseUrl: plane.baseUrl, available: plane.available })),
+    apiPlanes: apiPlanes.map((plane) => ({
+      name: plane.name,
+      baseUrl: plane.baseUrl,
+      available: plane.available,
+      storage: storageCapabilitySummary(plane.storage, plane.name),
+    })),
     protocolEvidence,
     phaseResults: [],
   };
@@ -5052,9 +8391,16 @@ async function executeE2e(options, preflightResult) {
       }
     }
     for (const result of report.phaseResults.filter((item) => item.phase === 'enforce')) {
+      const filterContract = filterCanaryContract(result.environment, 'enforce');
       assert.equal(result.filterCanary?.processExecuted, true, result.environment + ' enforce filter canary did not execute');
       assert.equal(result.filterCanary?.shadowVisible, false, result.environment + ' enforce filter canary reached L1');
-      assert.equal(result.filterCanary?.filterMetric, 'discoveryBudgetDropped');
+      assert.equal(
+        result.filterCanary?.apiDisposition,
+        'forwarder_filtered',
+        result.environment + ' enforce filter canary disposition is invalid',
+      );
+      assert.equal(result.filterCanary?.classification, filterContract.classification);
+      assert.equal(result.filterCanary?.filterMetric, filterContract.metricName);
       assert.ok(result.filterCanary?.filterMetricValue > 0, result.environment + ' enforce filter counter did not increase');
       assert.match(result.filterCanary?.rawWitness?.lineSha256 || '', /^[a-f0-9]{64}$/u, result.environment + ' enforce has no raw Observer witness');
     }
@@ -5067,33 +8413,245 @@ async function executeE2e(options, preflightResult) {
       );
       context.k8sSecret = undefined;
     }
-    await removeRunCredential();
     report.comparison = phaseComparison(report.phaseResults);
-    report.completedAt = new Date().toISOString();
+    report.executionCompletedAt = new Date().toISOString();
     report.success = true;
-    const evidence = await writeJsonEvidence(options.artifactDir, 'report.json', report);
-    return { report, evidence };
+    return { report, artifactDir: options.artifactDir };
   } catch (error) {
     report.comparison = phaseComparison(report.phaseResults);
-    report.completedAt = new Date().toISOString();
+    report.executionCompletedAt = new Date().toISOString();
     report.success = false;
     report.failure = {
       name: error instanceof Error ? error.name : 'Error',
       message: boundedRedactedText(error instanceof Error ? error.message : String(error), 4_096).tail,
       ...(error?.hostAgentDiagnostic ? { hostAgentDiagnostic: error.hostAgentDiagnostic } : {}),
       ...(error?.hostAgentDiagnosticError ? { hostAgentDiagnosticError: error.hostAgentDiagnosticError } : {}),
+      ...(error?.piRuntimeDiagnostic
+        ? { piRuntimeDiagnostic: diagnosticSanitized(error.piRuntimeDiagnostic) }
+        : {}),
       ...(error?.phaseCleanupError ? { phaseCleanupError: error.phaseCleanupError } : {}),
     };
     if (error?.incompletePhase) report.incompletePhase = diagnosticSanitized(error.incompletePhase);
-    try {
-      const evidence = await writeJsonEvidence(options.artifactDir, 'report.json', report);
-      if (error instanceof Error) error.message += '; failure evidence=' + evidence.file;
-    } catch {}
+    if (error && typeof error === 'object') {
+      error.e2eReport = report;
+      error.e2eArtifactDir = options.artifactDir;
+    }
     throw error;
   }
 }
 
+async function selfTestRuntimeSignatureReload() {
+  const options = parseOptions([
+    '--run-id', 'self-reload-001',
+    '--agents', 'host-kimi,docker-pi,k8s-pi',
+    '--exercise-signature-reload',
+  ]);
+  assert.equal(options.exerciseSignatureReload, true);
+  const plan = executionPlan(options);
+  assert.equal(plan.runtimeSignatureReload.enabled, true);
+  assert.equal(plan.runtimeSignatureReload.runtimeIdsScopesAndMatchPredicatesChanged, false);
+  assert.equal(plan.runtimeSignatureReload.displayNamesChanged, true);
+  assert.equal(
+    plan.resources.some((resource) =>
+      resource.kind === 'Secret' && resource.name ===
+        k8sName(options, 'runtime-signatures', 'k8s', 'shadow')),
+    true,
+  );
+  const documents = runtimeSignatureReloadDocuments();
+  const metrics = (document, values) => ({
+    runtimeSignatureVersion: document.version,
+    runtimeSignatureHash: document.documentSha256,
+    runtimeSignatureMatcherHash: document.matcherSha256,
+    runtimeSignatureLoaded: document.runtimeCount,
+    runtimeSignatureInvalid: 0,
+    runtimeSignatureReloadAttempts: values.attempts,
+    runtimeSignatureReloadSuccesses: values.successes,
+    runtimeSignatureReloadErrors: 0,
+    runtimeSignatureLastGoodHash: values.lastGoodRawSha256,
+    runtimeReconcileRequested: values.reconcileRequested,
+    runtimeReconcileRuns: values.reconcileRuns,
+    runtimeReconcileErrors: 0,
+  });
+  const before = {
+    lastHeartbeatAt: '2026-01-01T00:00:00.000Z',
+    filterMetricsReported: true,
+    filterMetrics: metrics(documents.version1, {
+      attempts: 0,
+      successes: 0,
+      reconcileRequested: 0,
+      reconcileRuns: 0,
+    }),
+  };
+  const after = {
+    lastHeartbeatAt: '2026-01-01T00:00:02.000Z',
+    filterMetricsReported: true,
+    filterMetrics: metrics(documents.version2, {
+      attempts: 1,
+      successes: 1,
+      lastGoodRawSha256: documents.version2.rawSha256,
+      reconcileRequested: 1,
+      reconcileRuns: 1,
+    }),
+  };
+  const proof = runtimeSignatureReloadProof(
+    before,
+    after,
+    { kind: 'local-directory', documents },
+    'self-test runtime signature reload',
+  );
+  assert.equal(proof.runtimeIdsScopesAndMatchPredicatesPreserved, true);
+  assert.equal(proof.v2DisplayNamesChanged, true);
+  assertRuntimeSignatureV2Heartbeat(
+    after,
+    { documents },
+    proof,
+    'self-test final runtime signature heartbeat',
+  );
+  const expectedPi = documents.version2.document.runtimes.find((runtime) => runtime.id === 'pi');
+  assert.deepEqual(
+    proveReloadedSignatureInstanceRecognition({ documents }, [{
+      agent: 'docker-pi',
+      running: {
+        agentInstanceId: 'instance-v2',
+        agentScopeId: expectedPi.agentScopeId,
+        agentDisplayName: expectedPi.displayName,
+      },
+      terminal: { agentDisplayName: expectedPi.displayName },
+    }], 'self-test'),
+    [{
+      agent: 'docker-pi',
+      runtimeId: 'pi',
+      agentScopeId: expectedPi.agentScopeId,
+      agentDisplayName: expectedPi.displayName,
+      agentInstanceId: 'instance-v2',
+    }],
+  );
+
+  const previousRoot = ledger.tempRoot;
+  const previousRootIdentity = ledger.tempRootIdentity;
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'anysentry-signature-reload-self-test-'));
+  const rootIdentity = localPathIdentity(await fs.lstat(root));
+  try {
+    ledger.tempRoot = root;
+    ledger.tempRootIdentity = rootIdentity;
+    const config = await prepareLocalRuntimeSignatureReload(options, 'docker', 'shadow');
+    assert.equal((await hashLocalFile(config.file)).sha256, documents.version1.rawSha256);
+    await atomicallyReplaceLocalRuntimeSignatures(config);
+    assert.equal((await hashLocalFile(config.file)).sha256, documents.version2.rawSha256);
+  } finally {
+    ledger.tempRoot = previousRoot;
+    ledger.tempRootIdentity = previousRootIdentity;
+    const state = await localPathState(root);
+    if (state.exists && sameLocalPathIdentity(state.identity, rootIdentity)) {
+      await fs.rm(root, { recursive: true });
+    }
+  }
+}
+
+async function selfTestKimiConfigStaging() {
+  const previousRoot = ledger.tempRoot;
+  const previousRootIdentity = ledger.tempRootIdentity;
+  const previousCredential = ledger.tempCredential;
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'anysentry-kimi-config-self-test-'));
+  const rootIdentity = localPathIdentity(await fs.lstat(root));
+  let stagedContent;
+  try {
+    ledger.tempRoot = root;
+    ledger.tempRootIdentity = rootIdentity;
+    const credential = Buffer.from('opaque-self-test-credential');
+    const credentialFile = path.join(root, 'credential');
+    const credentialSha256 = createHash('sha256').update(credential).digest('hex');
+    await fs.writeFile(credentialFile, credential, { mode: 0o600, flag: 'wx' });
+    const credentialIdentity = await verifyRunOwnedFile(
+      credentialFile,
+      credential.length,
+      credentialSha256,
+      'self-test credential',
+    );
+    ledger.tempCredential = {
+      path: credentialFile,
+      identity: credentialIdentity,
+      size: credential.length,
+      sha256: credentialSha256,
+    };
+    credential.fill(0);
+    const staged = await stageKimiConfigFile({
+      providerId: 'self-test-provider',
+      modelId: 'vendor/self-test-model',
+      contextWindow: 16_384,
+      maxTokens: 2_048,
+      api: 'openai-completions',
+      baseUrl: 'https://llm.invalid/v1',
+      transportSecurity: 'tls',
+    }, credentialFile, ledger.tempCredential);
+    const verified = await readVerifiedRunOwnedFile(
+      staged.path,
+      staged.bytes,
+      staged.sha256,
+      staged.identity,
+      'self-test Host Kimi config',
+    );
+    stagedContent = verified.content;
+    const document = JSON.parse(stagedContent.toString('utf8'));
+    assert.equal(document.providers[KIMI_CONFIG_PROVIDER_KEY].type, 'openai_legacy');
+    assert.equal(document.providers[KIMI_CONFIG_PROVIDER_KEY].base_url, 'https://llm.invalid/v1');
+    assert.equal(document.providers[KIMI_CONFIG_PROVIDER_KEY].api_key, 'opaque-self-test-credential');
+    assert.equal(document.providers[KIMI_CONFIG_PROVIDER_KEY].reasoning_key, 'reasoning_content');
+    assert.equal(document.models[KIMI_CONFIG_MODEL_KEY].model, 'vendor/self-test-model');
+    assert.equal(document.telemetry, false);
+    assert.equal(document.merge_all_available_skills, false);
+  } finally {
+    stagedContent?.fill(0);
+    ledger.tempCredential = previousCredential;
+    ledger.tempRoot = previousRoot;
+    ledger.tempRootIdentity = previousRootIdentity;
+    const rootState = await localPathState(root);
+    if (rootState.exists && sameLocalPathIdentity(rootState.identity, rootIdentity)) {
+      await fs.rm(root, { recursive: true });
+    }
+  }
+}
+
+async function selfTestAtomicRunOwnedPublication() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'anysentry-atomic-publication-self-test-'));
+  const rootIdentity = localPathIdentity(await fs.lstat(root));
+  const content = Buffer.from('go\n');
+  try {
+    const published = await atomicallyPublishRunOwnedFile(
+      root,
+      rootIdentity,
+      'go',
+      content,
+      'self-test atomic publication',
+    );
+    assert.equal(published.file, path.join(root, 'go'));
+    assert.equal(published.sha256, hashText('go\n'));
+    assert.equal((published.identity.mode & 0o777), 0o600);
+    assert.deepEqual(await fs.readdir(root), ['go']);
+    assert.equal(await fs.readFile(published.file, 'utf8'), 'go\n');
+    await assert.rejects(
+      () => atomicallyPublishRunOwnedFile(
+        root,
+        rootIdentity,
+        'go',
+        content,
+        'self-test duplicate atomic publication',
+      ),
+      /target already exists/u,
+    );
+  } finally {
+    content.fill(0);
+    const rootState = await localPathState(root);
+    if (rootState.exists && sameLocalPathIdentity(rootState.identity, rootIdentity)) {
+      await fs.rm(root, { recursive: true });
+    }
+  }
+}
+
 async function selfTestSafetyIo() {
+  await selfTestRuntimeSignatureReload();
+  await selfTestKimiConfigStaging();
+  await selfTestAtomicRunOwnedPublication();
   const probePrefix = path.join(os.tmpdir(), 'anysentry-codex-sandbox-probe-');
   let transientDirectory;
   try {
@@ -5213,6 +8771,16 @@ async function selfTestHostSystemdLauncher(options) {
       expectedEnvironment: environment,
     });
     controlGroup = service.ownership.controlGroup;
+    assert.match(service.detached.execMainStartTimeTicks || '', /^\d+$/u);
+    assert.equal(
+      sameLocalPathIdentity(
+        await systemdControlGroupIdentity(controlGroup),
+        service.ownership.controlGroupIdentity,
+      ),
+      true,
+      'self-test systemd cgroup identity was not pinned',
+    );
+    assert.match(service.ownership.controlGroupIdentity.ino, /^\d+$/u);
     const [clientArgv, runnerArgv] = await Promise.all([
       processArguments(service.record.child.pid),
       processArguments(service.state.execMainPid),
@@ -5292,8 +8860,281 @@ async function selfTest() {
   assert.equal(options.selfTest, false);
   assert.deepEqual(options.phases, ['shadow']);
   assert.equal(normalizeApiBase('http://127.0.0.1:29653/security-center/'), DEFAULT_DOCKER_API);
+  const eventQueryWindow = e2eEventQueryWindow(
+    '2026-01-01T00:00:00.000Z',
+    Date.parse('2026-01-01T00:20:00.000Z'),
+  );
+  assert.deepEqual(eventQueryWindow, {
+    timeType: 'custom',
+    startTime: '2026-01-01T00:00:00.000Z',
+    endTime: '2026-01-01T00:22:00.000Z',
+  });
+  assert.equal(eventStorageContract({
+    mode: 'clickhouse', clickhouseConfigured: true, clickhouseReady: true,
+  }, 'k8s'), 'clickhouse-durable');
+  assert.equal(eventStorageContract({
+    mode: 'memory', clickhouseConfigured: false, clickhouseReady: false,
+  }, 'host'), 'authoritative-hot-ring');
+  assert.equal(eventStorageContract({
+    mode: 'memory', clickhouseConfigured: false, clickhouseReady: false,
+  }, 'docker'), undefined);
+  assert.equal(eventStorageContract({
+    mode: 'memory', clickhouseConfigured: true, clickhouseReady: false,
+  }, 'host'), undefined);
+  assert.equal(memoryNoTrimThreshold(10_000), 9_000);
+  assert.equal(memoryStorageHasNoTrimEvidence({
+    mode: 'memory', clickhouseConfigured: false, clickhouseReady: false,
+    hotRingSize: 9_000, hotRingCapacity: 10_000,
+  }), true);
+  assert.equal(memoryStorageHasNoTrimEvidence({
+    mode: 'memory', clickhouseConfigured: false, clickhouseReady: false,
+    hotRingSize: 9_001, hotRingCapacity: 10_000,
+  }), false);
+  assert.equal(memoryStorageIsAuditableBaseline({
+    mode: 'memory', clickhouseConfigured: false, clickhouseReady: false,
+    hotRingSize: 10, hotRingCapacity: 10_000,
+    uptimeSeconds: MEMORY_API_MIN_BASELINE_UPTIME_SECONDS - 1,
+    bootEpochEstimateMs: 900_000,
+  }), false);
+  assert.equal(memoryStorageIsAuditableBaseline({
+    mode: 'memory', clickhouseConfigured: false, clickhouseReady: false,
+    hotRingSize: 10, hotRingCapacity: 10_000,
+    uptimeSeconds: MEMORY_API_MIN_BASELINE_UPTIME_SECONDS,
+    bootEpochEstimateMs: 900_000,
+  }), true);
+  const strictWindow = e2eEventQueryWindow(
+    '2026-01-01T00:00:00.000Z',
+    Date.parse('2026-01-01T00:01:00.000Z'),
+  );
+  const strictCollector = 'asel-self-test-collector';
+  const strictEvent = {
+    collectorId: strictCollector,
+    at: '2026-01-01T00:00:30.000Z',
+    eventKind: 'ToolExec',
+  };
+  const strictPlane = {
+    name: 'k8s',
+    baseUrl: 'http://127.0.0.1:1/security-center',
+    storage: {
+      mode: 'clickhouse', clickhouseConfigured: true, clickhouseReady: true,
+      hotRingSize: 10, hotRingCapacity: 10_000,
+      uptimeSeconds: 100, observedAtMs: 1_000_000, bootEpochEstimateMs: 900_000,
+    },
+  };
+  const strictRequests = [];
+  let strictReadAttempts = 0;
+  const strictResult = await queryEvents(
+    strictPlane,
+    strictCollector,
+    strictWindow,
+    'self-test strict durable query',
+    {
+      eventually: async (_label, check) => {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            return await check();
+          } catch (error) {
+            if (attempt === 1) throw error;
+          }
+        }
+        throw new Error('strict durable self-test did not converge');
+      },
+      requestEventList: async (_baseUrl, collector, request) => {
+        strictRequests.push({ collector, request: structuredClone(request) });
+        strictReadAttempts += 1;
+        return strictReadAttempts === 1
+          ? { items: [], total: 0, totalApproximate: true, storageFallback: 'hot_ring' }
+          : { items: [strictEvent], total: 1, totalApproximate: true };
+      },
+    },
+  );
+  assert.equal(strictResult.e2eQueryProof.attempts, 2);
+  assert.equal(strictResult.e2eQueryProof.storageContract, 'clickhouse-durable');
+  assert.equal(strictRequests.length, 2);
+  assert.equal(strictRequests.every(({ collector }) => collector === strictCollector), true);
+  assert.equal(strictRequests.every(({ request }) =>
+    request.durable === true && request.q === undefined && request.timeType === 'custom' &&
+    request.startTime === strictWindow.startTime && request.endTime === strictWindow.endTime &&
+    request.scope === 'raw' && request.includeUnknown === true && request.noise === 'include' &&
+    request.limit === E2E_EVENT_QUERY_LIMIT), true);
+  assert.throws(
+    () => validateCompleteE2eEventResult(
+      { items: [{ ...strictEvent, collectorId: 'wrong-collector' }], total: 1 },
+      strictCollector,
+      'clickhouse-durable',
+      Date.parse(strictWindow.startTime),
+      Date.parse(strictWindow.endTime),
+      'wrong collector self-test',
+    ),
+    /another collector/u,
+  );
+  assert.throws(
+    () => validateCompleteE2eEventResult(
+      { items: [{ ...strictEvent, at: '2025-12-31T23:59:59.000Z' }], total: 1 },
+      strictCollector,
+      'clickhouse-durable',
+      Date.parse(strictWindow.startTime),
+      Date.parse(strictWindow.endTime),
+      'wrong time self-test',
+    ),
+    /outside its fixed phase window/u,
+  );
+  assert.throws(
+    () => validateCompleteE2eEventResult(
+      { items: [], total: 1 }, strictCollector, 'clickhouse-durable',
+      Date.parse(strictWindow.startTime), Date.parse(strictWindow.endTime), 'truncated self-test',
+    ),
+    /truncated/u,
+  );
+  const memoryBaseline = {
+    mode: 'memory', clickhouseConfigured: false, clickhouseReady: false,
+    hotRingSize: 10, hotRingCapacity: 10_000,
+    uptimeSeconds: 100, observedAtMs: 1_000_000, bootEpochEstimateMs: 900_000,
+  };
+  const memoryPlane = {
+    name: 'host', baseUrl: 'http://127.0.0.1:1/security-center', storage: memoryBaseline,
+  };
+  const memoryResult = await queryEvents(
+    memoryPlane,
+    strictCollector,
+    strictWindow,
+    'self-test memory query',
+    {
+      requestEventList: async () => ({
+        items: [strictEvent], total: 1, totalApproximate: true, storageFallback: 'hot_ring',
+      }),
+      readApiStorageCapability: async () => ({
+        ...memoryBaseline,
+        hotRingSize: 11,
+        uptimeSeconds: 101,
+        observedAtMs: 1_001_000,
+        bootEpochEstimateMs: 900_000,
+      }),
+    },
+  );
+  assert.equal(memoryResult.e2eQueryProof.bootContinuityProved, true);
+  assert.equal(memoryResult.e2eQueryProof.noRingTrimProved, true);
+  await assert.rejects(
+    () => queryEvents(memoryPlane, strictCollector, strictWindow, 'restarted memory self-test', {
+      requestEventList: async () => ({ items: [], total: 0, storageFallback: 'hot_ring' }),
+      readApiStorageCapability: async () => ({
+        ...memoryBaseline,
+        observedAtMs: 2_000_000,
+        bootEpochEstimateMs: 1_900_000,
+      }),
+    }),
+    /process changed/u,
+  );
+  await assert.rejects(
+    () => queryEvents(memoryPlane, strictCollector, strictWindow, 'regressed uptime self-test', {
+      requestEventList: async () => ({ items: [], total: 0, storageFallback: 'hot_ring' }),
+      readApiStorageCapability: async () => ({
+        ...memoryBaseline,
+        uptimeSeconds: memoryBaseline.uptimeSeconds - 1,
+        observedAtMs: memoryBaseline.observedAtMs - 1_000,
+        bootEpochEstimateMs: memoryBaseline.bootEpochEstimateMs,
+      }),
+    }),
+    /uptime regressed/u,
+  );
   assert.throws(() => parseOptions(['--run-id', '../unsafe']), /run-id/u);
   assert.throws(() => parseOptions(['--api-key', 'sk-not-allowed']), /unknown option/u);
+  assert.throws(() => parseOptions(['--pi-provider', 'Unsafe Provider']), /pi-provider/u);
+  assert.throws(() => parseOptions(['--pi-model', 'model with spaces']), /pi-model/u);
+  assert.throws(() => parseOptions(['--pi-model', 'model\u0000id']), /pi-model/u);
+  assert.deepEqual(parseKimiVersion('kimi, version 1.49.0'), [1, 49, 0]);
+  assert.equal(versionAtLeast([1, 49, 0], MIN_KIMI_VERSION), true);
+  assert.equal(versionAtLeast([1, 48, 9], MIN_KIMI_VERSION), false);
+  const customPiOptions = parseOptions([
+    '--models-file', '/tmp/anysentry-self-test-models.json',
+    '--pi-provider', 'self-test-provider',
+    '--pi-model', 'vendor/self-test-model',
+  ]);
+  const customPiDocument = {
+    providers: {
+      'self-test-provider': {
+        baseUrl: 'https://llm.invalid/v1',
+        api: 'openai-completions',
+        apiKey: '$DEEPSEEK_API_KEY',
+        models: [{
+          id: 'vendor/self-test-model',
+          name: 'Self-test model',
+          reasoning: false,
+          input: ['text'],
+          contextWindow: 16_384,
+          maxTokens: 2_048,
+        }],
+      },
+    },
+  };
+  assert.deepEqual(
+    validatePiModelsDocument(customPiDocument, customPiOptions.piProvider, customPiOptions.piModel),
+    {
+      providerId: 'self-test-provider',
+      modelId: 'vendor/self-test-model',
+      contextWindow: 16_384,
+      maxTokens: 2_048,
+      api: 'openai-completions',
+      baseUrl: 'https://llm.invalid/v1',
+      transportSecurity: 'tls',
+    },
+  );
+  const kimiDocument = kimiConfigDocument(
+    validatePiModelsDocument(customPiDocument, customPiOptions.piProvider, customPiOptions.piModel),
+    'opaque-self-test-credential',
+  );
+  assert.equal(kimiDocument.default_model, KIMI_CONFIG_MODEL_KEY);
+  assert.deepEqual(kimiDocument.providers[KIMI_CONFIG_PROVIDER_KEY], {
+    type: 'openai_legacy',
+    base_url: 'https://llm.invalid/v1',
+    api_key: 'opaque-self-test-credential',
+    reasoning_key: 'reasoning_content',
+  });
+  assert.deepEqual(kimiDocument.models[KIMI_CONFIG_MODEL_KEY], {
+    provider: KIMI_CONFIG_PROVIDER_KEY,
+    model: 'vendor/self-test-model',
+    max_context_size: 16_384,
+    capabilities: [],
+  });
+  assert.equal(kimiDocument.loop_control.reserved_context_size, 2_048);
+  assert.throws(
+    () => validatePiModelsDocument({
+      providers: {
+        'self-test-provider': {
+          ...customPiDocument.providers['self-test-provider'],
+          apiKey: 'sk-not-allowed-inline',
+        },
+      },
+    }, customPiOptions.piProvider, customPiOptions.piModel),
+    /apiKey|literal credential/u,
+  );
+  assert.throws(
+    () => validatePiModelsDocument({
+      providers: {
+        'self-test-provider': {
+          ...customPiDocument.providers['self-test-provider'],
+          headers: { Authorization: 'Bearer not-allowed' },
+        },
+      },
+    }, customPiOptions.piProvider, customPiOptions.piModel),
+    /unsupported fields/u,
+  );
+  for (const unsafeName of ['$UNAPPROVED_ENV', '!cat /run/secrets/credential']) {
+    assert.throws(
+      () => validatePiModelsDocument({
+        providers: {
+          'self-test-provider': {
+            ...customPiDocument.providers['self-test-provider'],
+            models: [{
+              ...customPiDocument.providers['self-test-provider'].models[0],
+              name: unsafeName,
+            }],
+          },
+        },
+      }, customPiOptions.piProvider, customPiOptions.piModel),
+      /environment or command interpolation/u,
+    );
+  }
   assert.throws(
     () => parseOptions(['--agents', 'host-codex', '--allow-host-full-access']),
     /allow-host-agents/u,
@@ -5325,6 +9166,15 @@ async function selfTest() {
   assert.equal(plan.safety.hostCodexFullAccessRequiresExplicitFlag, true);
   assert.equal(plan.hostAgentAuthorization.codexSandboxMode, 'workspace-write');
   assert.ok(plan.resources.every((resource) => resource.name.includes('self-test-001')));
+  const plannedHostCanaryUnit = hostFilterCanaryUnitName(options, 'shadow');
+  assert.ok(plan.resources.some((resource) =>
+    resource.plane === 'host' &&
+    resource.kind === 'systemd user service' &&
+    resource.name === plannedHostCanaryUnit));
+  assert.equal(plan.resources.some((resource) =>
+    resource.plane === 'host' &&
+    resource.kind === 'Docker container' &&
+    resource.name === k8sName(options, 'filter-canary', 'host', 'shadow')), false);
   assert.notEqual(plan.apiPlanes.docker.baseUrl, plan.apiPlanes.kubernetes.baseUrl);
   assert.notEqual(plan.apiPlanes.host.baseUrl, plan.apiPlanes.docker.baseUrl);
   assert.deepEqual([...requestedPlaneSet(options)].sort(), ['docker', 'host', 'k8s']);
@@ -5375,6 +9225,50 @@ async function selfTest() {
     }),
     /input limit/u,
   );
+  const hostCanaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'anysentry-host-filter-canary-self-test-'));
+  try {
+    const hostCanaryDirectory = path.join(hostCanaryRoot, 'filter-canary-host-shadow');
+    const hostCanaryMarker = filterCanaryMarker(options, 'host', 'shadow');
+    await fs.mkdir(hostCanaryDirectory, { mode: 0o700 });
+    await fs.writeFile(path.join(hostCanaryDirectory, 'value'), hostCanaryMarker + '\n', {
+      mode: 0o600,
+      flag: 'wx',
+    });
+    await fs.writeFile(path.join(hostCanaryDirectory, 'go'), 'go\n', { mode: 0o600, flag: 'wx' });
+    const hostCanaryPayload = hostFilterCanaryRunnerPayload(hostCanaryDirectory, hostCanaryMarker);
+    assert.deepEqual(
+      validateHostAgentRunnerPayload(hostCanaryPayload, {
+        agent: 'filter-canary', command: '/usr/bin/true', env: {},
+      }),
+      hostCanaryPayload,
+    );
+    assert.throws(
+      () => validateHostAgentRunnerPayload({ ...hostCanaryPayload, command: '/bin/sh' }),
+      /filter canary runner contract/u,
+    );
+    assert.throws(
+      () => validateHostAgentRunnerPayload({ ...hostCanaryPayload, env: { PATH: '/usr/bin:/bin' } }),
+      /environment/u,
+    );
+    const hostCanarySystemdArgs = hostAgentSystemdRunArgs(
+      plannedHostCanaryUnit,
+      hostAgentUnitDescription(options.runId, ownershipNonce()),
+    );
+    assertHostAgentPayloadOutsideSystemdArgv(
+      hostCanarySystemdArgs,
+      hostCanaryPayload,
+      [hostCanaryMarker],
+    );
+    assert.equal(hostCanarySystemdArgs.includes(hostCanaryMarker), false);
+    assert.equal(await waitForHostFilterCanaryMarker(hostCanaryPayload), hostCanaryMarker);
+    await fs.writeFile(path.join(hostCanaryDirectory, 'value'), 'different-marker\n');
+    await assert.rejects(
+      () => waitForHostFilterCanaryMarker(hostCanaryPayload),
+      /differs from the launch contract/u,
+    );
+  } finally {
+    await fs.rm(hostCanaryRoot, { recursive: true });
+  }
   const firstAck = { accepted: true, applied: true, duplicate: false, leaseEpoch: 1 };
   const replayAck = { accepted: false, applied: false, duplicate: false, leaseEpoch: 1, reason: 'runtime lease is stale' };
   assert.equal(pickAck(firstAck).applied, true);
@@ -5968,6 +9862,165 @@ async function selfTest() {
   assert.match(prompt, /\/opt\/agent-lab\/app\/pi-e2e-marker\.sh/u);
   assert.doesNotMatch(JSON.stringify(piEnv), /e2e-marker-001/u);
   assert.equal(piEnv.PI_E2E_MARKER_FILE, '/run/anysentry-e2e-marker/value');
+  assert.equal(piEnv.PI_E2E_RELEASE_FILE, '/run/anysentry-e2e-marker/go');
+  assert.equal(
+    piEnvironment(customPiOptions, 'k8s', 'shadow').PI_E2E_RELEASE_FILE,
+    PI_MARKER_RELEASE_FILE,
+  );
+  assert.equal(piEnv.PI_RETRY_SECONDS, String(PI_RETRY_SECONDS));
+  assert.ok(PI_RUNTIME_EXIT_WAIT_MS < PI_RETRY_SECONDS * 1_000);
+  const customPiEnv = piEnvironment({
+    ...customPiOptions,
+    piModelsFile: '/tmp/run-owned-models.json',
+  }, 'docker', 'shadow');
+  assert.equal(customPiEnv.PI_PROVIDER, 'self-test-provider');
+  assert.equal(customPiEnv.PI_MODEL, 'vendor/self-test-model');
+  assert.equal(customPiEnv.PI_CODING_AGENT_DIR, undefined);
+  const selfTestPiAgentId = 'e2e-docker-shadow-' + customPiOptions.runId;
+  const selfTestPiStart = JSON.stringify({
+    runtime: 'pi',
+    event: 'pi_process_starting',
+    round: 1,
+    mode: 'loop',
+    provider: 'self-test-provider',
+    model: 'vendor/self-test-model',
+    agentId: selfTestPiAgentId,
+    credentialSource: 'DEEPSEEK_API_KEY',
+  });
+  const selfTestPiExit = JSON.stringify({
+    runtime: 'pi',
+    agentId: selfTestPiAgentId,
+    event: 'pi_process_exited',
+    round: 1,
+    code: 0,
+    signal: null,
+  });
+  assert.deepEqual(
+    assertPiRuntimeLogs([
+      selfTestPiStart,
+      selfTestPiExit,
+    ].join('\n'), customPiOptions, 'docker', 'shadow', 'self-test'),
+    {
+      provider: 'self-test-provider',
+      model: 'vendor/self-test-model',
+      agentId: selfTestPiAgentId,
+      credentialSource: 'DEEPSEEK_API_KEY',
+      round: 1,
+    },
+  );
+  let piLogPolls = 0;
+  const delayedPiExit = await waitForSuccessfulPiRuntimeLogs(async () => {
+    piLogPolls += 1;
+    return {
+      code: 0,
+      signal: null,
+      stdout: piLogPolls === 1 ? selfTestPiStart : selfTestPiStart + '\n' + selfTestPiExit,
+      stderr: '',
+    };
+  }, customPiOptions, 'docker', 'shadow', 'self-test delayed', 100, 1);
+  assert.equal(piLogPolls, 2, 'Pi proof must wait for the structured successful exit record');
+  assert.equal(delayedPiExit.diagnostic.matchingSuccessfulExitRecords, 1);
+  let failedPiDiagnostic;
+  let failedPiPolls = 0;
+  await assert.rejects(
+    () => waitForSuccessfulPiRuntimeLogs(async () => {
+      failedPiPolls += 1;
+      return {
+        code: 0,
+        signal: null,
+        stdout: selfTestPiStart + '\n' + JSON.stringify({
+          runtime: 'pi',
+          agentId: selfTestPiAgentId,
+          event: 'pi_process_exited',
+          round: 1,
+          code: 1,
+          signal: null,
+        }),
+        stderr: 'opaque diagnostic body',
+      };
+    }, customPiOptions, 'docker', 'shadow', 'self-test failed', 10, 1),
+    (error) => {
+      failedPiDiagnostic = error.piRuntimeDiagnostic;
+      return /fresh-workload first turn terminated without success/u.test(error.message);
+    },
+  );
+  assert.equal(failedPiPolls, 1, 'a failed first Pi turn must not wait for a retry round');
+  assert.equal(failedPiDiagnostic.matchingSuccessfulExitRecords, 0);
+  assert.equal(failedPiDiagnostic.lastLifecycleEvents.at(-1).code, 1);
+  assert.equal(failedPiDiagnostic.logRead.stderrBytes, Buffer.byteLength('opaque diagnostic body'));
+  assert.equal(JSON.stringify(failedPiDiagnostic).includes('opaque diagnostic body'), false);
+  assert.throws(
+    () => assertPiRuntimeLogs([
+      selfTestPiStart,
+      JSON.stringify({
+        runtime: 'pi',
+        agentId: selfTestPiAgentId,
+        event: 'pi_process_exited',
+        round: 2,
+        code: 0,
+        signal: null,
+      }),
+    ].join('\n'), customPiOptions, 'docker', 'shadow', 'self-test mismatched round'),
+    /terminal record belongs to a different turn/u,
+  );
+  assert.throws(
+    () => assertPiRuntimeLogs([
+      selfTestPiStart,
+      JSON.stringify({
+        runtime: 'pi',
+        agentId: selfTestPiAgentId,
+        event: 'pi_process_exited',
+        code: 0,
+        signal: null,
+      }),
+    ].join('\n'), customPiOptions, 'docker', 'shadow', 'self-test missing round'),
+    /terminal record belongs to a different turn/u,
+  );
+  assert.throws(
+    () => assertPiRuntimeLogs([
+      selfTestPiStart,
+      JSON.stringify({
+        runtime: 'pi',
+        agentId: selfTestPiAgentId,
+        event: 'pi_process_exited',
+        round: 1,
+        code: 0,
+        signal: 'SIGTERM',
+      }),
+    ].join('\n'), customPiOptions, 'docker', 'shadow', 'self-test signaled exit'),
+    /did not exit successfully/u,
+  );
+  assert.throws(
+    () => assertPiRuntimeLogs([
+      selfTestPiStart,
+      JSON.stringify({
+        runtime: 'pi',
+        agentId: selfTestPiAgentId,
+        event: 'pi_process_timeout',
+        round: 1,
+        timeoutSeconds: 90,
+      }),
+      selfTestPiExit,
+    ].join('\n'), customPiOptions, 'docker', 'shadow', 'self-test timeout then exit'),
+    /did not exit successfully/u,
+  );
+  const selfTestProofHash = hashText('self-test-marker\n');
+  assert.match(assertPiResultFiles({
+    code: 0,
+    stdout: [
+      '17 /workspace/tool-events.log',
+      '12 /workspace/model-result.txt',
+      selfTestProofHash + '  /workspace/tool-events.log',
+      hashText('model result') + '  /workspace/model-result.txt',
+    ].join('\n'),
+  }, selfTestProofHash, 'self-test'), /tool-events\.log/u);
+  assert.throws(
+    () => assertPiResultFiles({
+      code: 0,
+      stdout: hashText('self-test-marker\nself-test-marker\n') + '  /workspace/tool-events.log',
+    }, selfTestProofHash, 'self-test changed marker'),
+    /tool marker changed across process exit/u,
+  );
   const hostAction = markerAction('e2e-marker-001');
   assert.match(hostAction, /exec \/usr\/bin\/true 'e2e-marker-001'/u);
   assert.match(hostAction, /tool-events\.log/u);
@@ -6034,14 +10087,30 @@ async function selfTest() {
       }],
     },
   };
+  assert.deepEqual(filterCanaryContract('host', 'shadow'), {
+    classification: 'non_agent', filterReason: 'non_agent', metricName: 'wouldFilterNonAgent',
+    shadowVisible: false, shadowApiDisposition: 'non_agent_discarded',
+  });
+  assert.deepEqual(filterCanaryContract('host', 'enforce'), {
+    classification: 'non_agent', filterReason: 'non_agent', metricName: 'filteredNonAgent',
+    shadowVisible: false, shadowApiDisposition: 'non_agent_discarded',
+  });
+  assert.deepEqual(filterCanaryContract('docker', 'shadow'), {
+    classification: 'unknown', filterReason: 'unknown', metricName: 'wouldDiscoveryBudgetDrop',
+    shadowVisible: true, shadowApiDisposition: 'retained',
+  });
+  assert.deepEqual(filterCanaryContract('k8s', 'enforce'), {
+    classification: 'unknown', filterReason: 'unknown', metricName: 'discoveryBudgetDropped',
+    shadowVisible: true, shadowApiDisposition: 'retained',
+  });
   assert.ok(matchingFilterReceipt(receiptHeartbeat, {
-    marker: 'e2e-marker-001', environment: 'docker', containerId: 'c'.repeat(64),
+    marker: 'e2e-marker-001', environment: 'docker', phase: 'shadow', containerId: 'c'.repeat(64),
   }, witness));
   assert.equal(matchingFilterReceipt(receiptHeartbeat, {
-    marker: 'different-marker', environment: 'docker', containerId: 'c'.repeat(64),
+    marker: 'different-marker', environment: 'docker', phase: 'shadow', containerId: 'c'.repeat(64),
   }, witness), undefined);
   assert.equal(matchingFilterReceipt(receiptHeartbeat, {
-    marker: 'e2e-marker-001', environment: 'docker', containerId: 'c'.repeat(64),
+    marker: 'e2e-marker-001', environment: 'docker', phase: 'shadow', containerId: 'c'.repeat(64),
   }, { ...witness, lineSha256: 'd'.repeat(64) }), undefined);
   assert.equal(matchingFilterReceipt({
     filterMetrics: {
@@ -6051,8 +10120,338 @@ async function selfTest() {
       }],
     },
   }, {
-    marker: 'e2e-marker-001', environment: 'docker', containerId: 'c'.repeat(64),
+    marker: 'e2e-marker-001', environment: 'docker', phase: 'shadow', containerId: 'c'.repeat(64),
   }, witness), undefined);
+  const hostReceiptHeartbeat = structuredClone(receiptHeartbeat);
+  Object.assign(hostReceiptHeartbeat.filterMetrics.e2eFilterReceipts[0], {
+    classification: 'non_agent',
+    filterReason: 'non_agent',
+    physicalWorkloadId: undefined,
+  });
+  assert.ok(matchingFilterReceipt(hostReceiptHeartbeat, {
+    marker: 'e2e-marker-001', environment: 'host', phase: 'shadow',
+  }, witness));
+  assert.equal(matchingFilterReceipt(receiptHeartbeat, {
+    marker: 'e2e-marker-001', environment: 'host', phase: 'shadow',
+  }, witness), undefined);
+  const filterRunRecord = {
+    marker: 'e2e-marker-001',
+    environment: 'docker',
+    phase: 'shadow',
+    containerId: 'c'.repeat(64),
+  };
+  const armedFilterHeartbeat = {
+    ...heartbeatBase,
+    lastHeartbeatAt: '2026-01-01 00:00:00',
+    filterMetrics: {
+      ...heartbeatBase.filterMetrics,
+      runtimeSnapshotPosts: 10,
+      wouldDiscoveryBudgetDrop: 0,
+      e2eFilterReceipts: [],
+    },
+  };
+  const historicalReceiptHeartbeat = {
+    ...heartbeatBase,
+    lastHeartbeatAt: '2026-01-01 00:00:00',
+    filterMetrics: {
+      ...heartbeatBase.filterMetrics,
+      runtimeSnapshotPosts: 11,
+      wouldDiscoveryBudgetDrop: 1,
+      e2eFilterReceipts: structuredClone(receiptHeartbeat.filterMetrics.e2eFilterReceipts),
+    },
+  };
+  const supersedingFilterHeartbeat = {
+    ...heartbeatBase,
+    lastHeartbeatAt: '2026-01-01 00:00:01',
+    filterMetrics: {
+      ...heartbeatBase.filterMetrics,
+      runtimeSnapshotPosts: 12,
+      wouldDiscoveryBudgetDrop: 2,
+      e2eFilterReceipts: [],
+    },
+  };
+  const historicalCorrelation = findCorrelatedFilterHeartbeat(
+    [historicalReceiptHeartbeat, supersedingFilterHeartbeat],
+    supersedingFilterHeartbeat,
+    armedFilterHeartbeat,
+    'wouldDiscoveryBudgetDrop',
+    filterRunRecord,
+    witness,
+  );
+  assert.equal(
+    historicalCorrelation?.heartbeat,
+    historicalReceiptHeartbeat,
+    'a superseding latest heartbeat must not hide the sampled correlated receipt',
+  );
+  assert.equal(
+    historicalCorrelation?.examinedHeartbeatCount,
+    2,
+    'snapshot/current duplicate heartbeats must be considered once',
+  );
+  assert.equal(
+    findCorrelatedFilterHeartbeat(
+      [supersedingFilterHeartbeat],
+      supersedingFilterHeartbeat,
+      armedFilterHeartbeat,
+      'wouldDiscoveryBudgetDrop',
+      filterRunRecord,
+      witness,
+    ),
+    undefined,
+    'a positive background counter without a receipt must not satisfy correlation',
+  );
+  assert.equal(
+    findCorrelatedFilterHeartbeat(
+      [{
+        ...historicalReceiptHeartbeat,
+        lastHeartbeatAt: '2025-12-31 23:59:59',
+      }],
+      undefined,
+      armedFilterHeartbeat,
+      'wouldDiscoveryBudgetDrop',
+      filterRunRecord,
+      witness,
+    ),
+    undefined,
+    'a matching receipt from before the armed heartbeat must not satisfy correlation',
+  );
+  const mismatchedReceiptHeartbeat = (overrides, metricValue = 1) => ({
+    ...historicalReceiptHeartbeat,
+    filterMetrics: {
+      ...historicalReceiptHeartbeat.filterMetrics,
+      wouldDiscoveryBudgetDrop: metricValue,
+      e2eFilterReceipts: [{
+        ...receiptHeartbeat.filterMetrics.e2eFilterReceipts[0],
+        ...overrides,
+      }],
+    },
+  });
+  for (const candidate of [
+    mismatchedReceiptHeartbeat({ schema: 'wrong-schema' }),
+    mismatchedReceiptHeartbeat({ eventKind: 'FileAccess' }),
+    mismatchedReceiptHeartbeat({ markerSha256: 'd'.repeat(64) }),
+    mismatchedReceiptHeartbeat({ lineSha256: 'd'.repeat(64) }),
+    mismatchedReceiptHeartbeat({ classification: 'probable_agent' }),
+    mismatchedReceiptHeartbeat({ filterReason: 'noise' }),
+    mismatchedReceiptHeartbeat({ physicalWorkloadId: 'docker:test:' + 'd'.repeat(64) }),
+    mismatchedReceiptHeartbeat({ filteredAt: '2025-12-31T23:59:59.999Z' }),
+    mismatchedReceiptHeartbeat({}, 0),
+  ]) {
+    assert.equal(
+      findCorrelatedFilterHeartbeat(
+        [candidate],
+        undefined,
+        armedFilterHeartbeat,
+        'wouldDiscoveryBudgetDrop',
+        filterRunRecord,
+        witness,
+      ),
+      undefined,
+      'a partial or counter-free receipt match must fail closed',
+    );
+  }
+  const correlationDiagnostic = filterReceiptCorrelationDiagnostic(
+    [historicalReceiptHeartbeat, supersedingFilterHeartbeat],
+    supersedingFilterHeartbeat,
+    armedFilterHeartbeat,
+    'wouldDiscoveryBudgetDrop',
+    filterRunRecord,
+    witness,
+  );
+  assert.equal(correlationDiagnostic.heartbeatCount, 2);
+  assert.equal(correlationDiagnostic.receiptCount, 1);
+  assert.equal(correlationDiagnostic.candidates[0].matched, true);
+  assert.equal(
+    JSON.stringify(correlationDiagnostic).includes(filterRunRecord.containerId),
+    false,
+    'filter receipt diagnostics must not expose the workload ID',
+  );
+  assert.equal(
+    JSON.stringify(correlationDiagnostic).includes(filterRunRecord.marker),
+    false,
+    'filter receipt diagnostics must not expose the raw marker',
+  );
+  const preReleaseQueryCalls = [];
+  const preReleaseSelfTestStart = '2026-01-01T00:00:00.000Z';
+  let durableSelfTestAttempts = 0;
+  const immediateRetry = async (_label, check) => {
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const result = await check();
+        if (result) return result;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError ?? new Error('self-test retry did not converge');
+  };
+  const preReleaseProof = await preReleaseMarkerNegativeCheck(
+    'http://127.0.0.1:1/security-center',
+    'self-test-collector',
+    'e2e-marker-001',
+    preReleaseSelfTestStart,
+    {
+      now: () => Date.parse('2026-01-01T00:10:00.000Z'),
+      eventually: immediateRetry,
+      queryEvents: async (_base, _collector, extra) => {
+        preReleaseQueryCalls.push(structuredClone(extra));
+        if (extra.durable === true && durableSelfTestAttempts++ === 0) {
+          return { items: [], total: 0, totalApproximate: true, storageFallback: 'hot_ring' };
+        }
+        return { items: [], total: 0, totalApproximate: true };
+      },
+    },
+  );
+  assert.deepEqual(
+    preReleaseQueryCalls.map((extra) => extra.durable === true),
+    [true, true],
+    'the gate must use only the collector-scoped durable merged view',
+  );
+  assert.equal(
+    preReleaseQueryCalls.every((extra) => extra.timeType === 'custom'),
+    true,
+  );
+  assert.equal(preReleaseProof.durableAttempts, 2);
+  assert.equal(preReleaseProof.completeGlobalApiInventoryClaimed, false);
+  assert.equal(preReleaseProof.completeFreshCollectorPageProved, true);
+  assert.equal(
+    preReleaseProof.queryScope,
+    'fresh-collector-candidates-with-client-side-exact-marker-check',
+  );
+  assert.equal(preReleaseProof.views.length, 1);
+  assert.equal(preReleaseProof.views[0].view, 'durable-plus-hot-ring');
+  assert.equal(preReleaseProof.views[0].storageFallback, undefined);
+  assert.equal(
+    preReleaseQueryCalls.every((extra) =>
+      extra.startTime === preReleaseSelfTestStart &&
+      extra.endTime === '2026-01-01T00:12:00.000Z'),
+    true,
+    'pre-release queries must use the bounded run-local time window',
+  );
+  let persistentFallbackCalls = 0;
+  await assert.rejects(
+    () => preReleaseMarkerNegativeCheck(
+      'http://127.0.0.1:1/security-center',
+      'self-test-collector',
+      'e2e-marker-001',
+      preReleaseSelfTestStart,
+      {
+        now: () => Date.parse('2026-01-01T00:10:00.000Z'),
+        eventually: immediateRetry,
+        queryEvents: async (_base, _collector, extra) => {
+          persistentFallbackCalls += 1;
+          if (extra.durable === true) {
+            return { items: [], total: 0, totalApproximate: true, storageFallback: 'hot_ring' };
+          }
+          throw new Error('pre-release gate issued a non-durable query');
+        },
+      },
+    ),
+    /storage fallback/u,
+  );
+  assert.equal(
+    persistentFallbackCalls,
+    3,
+    'persistent fallback must exhaust only the bounded durable retries',
+  );
+  const preReleaseMarkerEvent = {
+    collectorId: 'self-test-collector',
+    at: '2026-01-01T00:05:00.000Z',
+    eventKind: 'ToolExec',
+    attributes: { argv: '/usr/bin/true e2e-marker-001' },
+  };
+  await assert.rejects(
+    () => preReleaseMarkerNegativeCheck(
+      'http://127.0.0.1:1/security-center',
+      'self-test-collector',
+      'e2e-marker-001',
+      preReleaseSelfTestStart,
+      {
+        now: () => Date.parse('2026-01-01T00:10:00.000Z'),
+        eventually: immediateRetry,
+        queryEvents: async (_base, _collector, extra) => {
+          assert.equal(extra.q, undefined, 'pre-release marker filtering must remain client-side');
+          assert.equal(extra.durable, true, 'pre-release marker query must remain durable');
+          return { items: [preReleaseMarkerEvent], total: 1, totalApproximate: true };
+        },
+      },
+    ),
+    /visible/u,
+    'the durable merged view must fail closed when it contains the marker',
+  );
+  await assert.rejects(
+    () => preReleaseMarkerNegativeCheck(
+      'http://127.0.0.1:1/security-center',
+      'self-test-collector',
+      'e2e-marker-001',
+      preReleaseSelfTestStart,
+      {
+        now: () => Date.parse('2026-01-01T00:10:00.000Z'),
+        eventually: immediateRetry,
+        queryEvents: async () => ({ items: [], total: 1, totalApproximate: true }),
+      },
+    ),
+    /truncated/u,
+  );
+  await assert.rejects(
+    () => preReleaseMarkerNegativeCheck(
+      'http://127.0.0.1:1/security-center',
+      'self-test-collector',
+      'e2e-marker-001',
+      preReleaseSelfTestStart,
+      {
+        now: () => Date.parse('2026-01-01T00:10:00.000Z'),
+        eventually: immediateRetry,
+        queryEvents: async () => ({
+          items: Array.from({ length: E2E_EVENT_QUERY_LIMIT }, () => ({ eventKind: 'FileAccess' })),
+          total: E2E_EVENT_QUERY_LIMIT,
+          totalApproximate: true,
+        }),
+      },
+    ),
+    /page boundary/u,
+  );
+  let overrunClockReads = 0;
+  const overrunStart = Date.parse('2026-01-01T00:10:00.000Z');
+  await assert.rejects(
+    () => preReleaseMarkerNegativeCheck(
+      'http://127.0.0.1:1/security-center',
+      'self-test-collector',
+      'e2e-marker-001',
+      preReleaseSelfTestStart,
+      {
+        now: () => overrunStart +
+          (overrunClockReads++ === 0 ? 0 : PRE_RELEASE_MARKER_FUTURE_SKEW_MS + 1),
+        eventually: immediateRetry,
+        queryEvents: async () => ({ items: [], total: 0, totalApproximate: true }),
+      },
+    ),
+    /exceeded its requested time window/u,
+  );
+  let releaseSlowDurable;
+  let slowQueryCalls = 0;
+  const slowPreReleaseCheck = preReleaseMarkerNegativeCheck(
+    'http://127.0.0.1:1/security-center',
+    'self-test-collector',
+    'e2e-marker-001',
+    preReleaseSelfTestStart,
+    {
+      now: () => Date.parse('2026-01-01T00:10:00.000Z'),
+      eventually: async (_label, check) => await check(),
+      queryEvents: async (_base, _collector, extra) => {
+        assert.equal(extra.durable, true);
+        slowQueryCalls += 1;
+        return await new Promise((resolve) => { releaseSlowDurable = resolve; });
+      },
+    },
+  );
+  await delay(0);
+  assert.equal(typeof releaseSlowDurable, 'function');
+  assert.equal(slowQueryCalls, 1, 'the pre-release gate must issue only one durable query at a time');
+  releaseSlowDurable({ items: [], total: 0, totalApproximate: true });
+  await slowPreReleaseCheck;
+  assert.equal(slowQueryCalls, 1);
   const exactEvent = {
     eventKind: 'ToolExec',
     attribution: { agentInstanceId: 'instance-a' },
@@ -6074,10 +10473,139 @@ async function selfTest() {
   assert.equal(exactMarkerToolEvent({ ...exactEvent, attributes: { ...exactEvent.attributes, argv_truncated: true } }, 'e2e-marker-001', 'instance-a'), false);
   assert.equal(exactMarkerToolEvent({ ...exactEvent, attributes: { ...exactEvent.attributes, observed_argc: 3 } }, 'e2e-marker-001', 'instance-a'), false);
   assert.equal(exactMarkerToolEvent(exactEvent, 'e2e-marker-001', 'instance-b'), false);
+  const exactHeldPiEvent = {
+    ...exactEvent,
+    process: { exe: '/usr/bin/dash' },
+    attributes: {
+      ...exactEvent.attributes,
+      argv: '/bin/sh -c ' + PI_MARKER_HOLD_COMMAND + ' e2e-marker-001',
+      observed_argc: 4,
+    },
+  };
+  assert.equal(
+    exactMarkerToolEvent(exactHeldPiEvent, 'e2e-marker-001', 'instance-a', 'pi-held-shell'),
+    true,
+  );
+  assert.equal(
+    exactMarkerToolEvent(exactEvent, 'e2e-marker-001', 'instance-a', 'pi-held-shell'),
+    false,
+  );
+  assert.equal(
+    exactMarkerToolEvent({
+      ...exactHeldPiEvent,
+      attributes: { ...exactHeldPiEvent.attributes, observed_argc: 3 },
+    }, 'e2e-marker-001', 'instance-a', 'pi-held-shell'),
+    false,
+  );
+  const completeRuntimeInventory = { total: 1, items: [{ agentInstanceId: 'instance-a' }] };
+  assert.equal(
+    assertCompleteRuntimeInventory(completeRuntimeInventory, 'self-test'),
+    completeRuntimeInventory,
+  );
+  assert.throws(
+    () => assertCompleteRuntimeInventory({ total: 2, items: [{ agentInstanceId: 'instance-a' }] }, 'self-test'),
+    /runtime inventory is truncated/u,
+  );
+  const ownedHostScenario = {
+    running: {
+      agentInstanceId: 'ari_' + 'a'.repeat(24),
+      agentScopeId: 'kimi-cli',
+      agentDisplayName: 'Kimi Code CLI [AnySentry E2E v2]',
+      classification: 'probable_agent',
+      hostId: 'self-test-host',
+      bootId: 'self-test-boot',
+      discoveredAt: 10_000,
+      lastSeenAt: 20_000,
+    },
+    terminal: { endedAt: 30_000, lastSeenAt: 30_000 },
+    markerEvent: { process: { cgroupId: '108021' } },
+    proof: {
+      launcher: {
+        unit: 'self-test.service',
+        invocationId: 'c'.repeat(32),
+        detached: { execMainPid: 40, execMainStartTimeTicks: '1234' },
+        runtimePlacement: { cgroupId: '108021' },
+      },
+    },
+  };
+  const ownedHostAuxiliary = {
+    collectorId: 'self-test-collector',
+    agentInstanceId: 'ari_' + 'b'.repeat(24),
+    agentScopeId: 'kimi-cli',
+    agentDisplayName: 'Kimi Code CLI [AnySentry E2E v2]',
+    classification: 'probable_agent',
+    runtimeState: 'lost',
+    rootPid: 43,
+    rootStartTimeTicks: '1235',
+    rootGeneration: 2,
+    hostId: 'self-test-host',
+    bootId: 'self-test-boot',
+    discoveredAt: 11_000,
+    lastSeenAt: 31_000,
+    endedAt: 31_000,
+  };
+  ownedHostScenario.runtimeOwnership = [{
+    agentInstanceId: ownedHostAuxiliary.agentInstanceId,
+    agentScopeId: ownedHostAuxiliary.agentScopeId,
+    agentDisplayName: ownedHostAuxiliary.agentDisplayName,
+    classification: ownedHostAuxiliary.classification,
+    rootPid: ownedHostAuxiliary.rootPid,
+    rootStartTimeTicks: ownedHostAuxiliary.rootStartTimeTicks,
+    hostId: ownedHostAuxiliary.hostId,
+    bootId: ownedHostAuxiliary.bootId,
+    cgroupId: '108021',
+    unit: 'self-test.service',
+    invocationId: 'c'.repeat(32),
+    launcherPid: 40,
+    launcherStartTimeTicks: '1234',
+    observedAt: 12_000,
+  }];
+  const ownedAuxiliaryProof = proveHostOwnedAuxiliaryRuntime(
+    'self-test-collector',
+    ownedHostAuxiliary,
+    [ownedHostScenario],
+  );
+  assert.equal(ownedAuxiliaryProof.ownership.relation, 'live_root_in_same_run_owned_systemd_cgroup');
+  assert.equal(ownedAuxiliaryProof.ownership.primaryAgentInstanceId, ownedHostScenario.running.agentInstanceId);
+  assert.equal(
+    proveHostOwnedAuxiliaryRuntime(
+      'self-test-collector',
+      { ...ownedHostAuxiliary, runtimeState: 'running' },
+      [ownedHostScenario],
+    ),
+    undefined,
+  );
+  const wrongPlacementScenario = structuredClone(ownedHostScenario);
+  wrongPlacementScenario.runtimeOwnership[0].cgroupId = '108022';
+  assert.equal(
+    proveHostOwnedAuxiliaryRuntime(
+      'self-test-collector',
+      ownedHostAuxiliary,
+      [wrongPlacementScenario],
+    ),
+    undefined,
+  );
+  const unrelatedNovelRoot = {
+    ...ownedHostAuxiliary,
+    agentInstanceId: 'ari_' + 'd'.repeat(24),
+    rootPid: 45,
+    rootStartTimeTicks: '1236',
+  };
+  const partitionedRoots = await partitionNovelRuntimeRoots({
+    environment: 'host',
+    collectorId: 'self-test-collector',
+    bootstrapInstanceIds: new Set(),
+  }, [ownedHostScenario], [ownedHostAuxiliary, unrelatedNovelRoot]);
+  assert.equal(partitionedRoots.ownedAuxiliary.length, 1);
+  assert.equal(partitionedRoots.unexpected.length, 1);
+  assert.equal(partitionedRoots.unexpected[0].agentInstanceId, unrelatedNovelRoot.agentInstanceId);
   const boundedCanary = filterCanaryCommand();
   assert.match(boundedCanary, new RegExp('remaining=' + FILTER_CANARY_WAIT_SECONDS, 'u'));
   assert.match(boundedCanary, /\/bin\/sleep 1/u);
   assert.doesNotMatch(boundedCanary, /do\s+:;/u);
+  assert.match(boundedCanary, /\/usr\/bin\/true "\$marker"/u);
+  assert.match(boundedCanary, /printf "0\\n" > \/run\/canary\/\.exit-code\.tmp/u);
+  assert.match(boundedCanary, /mv \/run\/canary\/\.exit-code\.tmp \/run\/canary\/exit-code/u);
   assert.ok(FILTER_CANARY_MAX_RUNTIME_SECONDS > FILTER_CANARY_WAIT_SECONDS);
   assert.ok(AGENT_MAX_RUNTIME_SECONDS >= 10 * 60);
   assert.ok(COLLECTOR_MAX_RUNTIME_SECONDS > AGENT_MAX_RUNTIME_SECONDS);
@@ -6098,6 +10626,91 @@ async function selfTest() {
     JSON.parse(supervisorEnvironment.OBSERVER_SUPERVISOR_FORWARDER_ARGS_JSON),
     ['-c', '/usr/local/bin/node /opt/observer-e2e-witness.js | /usr/local/bin/node /opt/observer-forward.js'],
   );
+  assert.deepEqual(collectorEventTransportEnvironment(), {
+    FORWARD_BATCH_SIZE: '8',
+    FORWARD_HTTP_TIMEOUT_MS: '60000',
+  });
+  const markerHelperSelfTestHash = 'a'.repeat(64);
+  const markerHelperExecGate = piMarkerHelperGateCommand(markerHelperSelfTestHash, true);
+  const markerHelperInitGate = piMarkerHelperGateCommand(markerHelperSelfTestHash, false);
+  assert.match(markerHelperExecGate, /exec "\$@"/u);
+  assert.doesNotMatch(markerHelperInitGate, /exec "\$@"/u);
+  assert.match(markerHelperExecGate, new RegExp(markerHelperSelfTestHash, 'u'));
+  const postReleaseEvent = {
+    eventKind: 'ToolExec',
+    at: '2026-08-15 10:46:21',
+    attributes: { argv: '/bin/sh -c /bin/sleep 3;: asel-marker-self-test' },
+  };
+  assert.equal(eventContainsExactMarker(postReleaseEvent, 'asel-marker-self-test'), true);
+  assert.equal(eventContainsExactMarker({ ...postReleaseEvent, eventKind: 'FileAccess' }, 'asel-marker-self-test'), false);
+  assert.equal(apiEventAtMs('2026-08-15 10:46:21'), Date.parse('2026-08-15T10:46:21Z'));
+  assert.equal(
+    proveMarkerEventAfterRelease(
+      postReleaseEvent,
+      { checkedAt: '2026-08-15T10:46:12.900Z' },
+      { releasedAt: '2026-08-15T10:46:13.127Z' },
+    ).observedAfterRelease,
+    true,
+  );
+  assert.throws(
+    () => proveMarkerEventAfterRelease(
+      { ...postReleaseEvent, at: '2026-08-15 10:46:11' },
+      { checkedAt: '2026-08-15T10:46:12.900Z' },
+      { releasedAt: '2026-08-15T10:46:13.127Z' },
+    ),
+    /predates its release gate/u,
+  );
+  assert.equal(boundedRedactedText('diagnostic').capturedBytes, 10);
+  const cleanedReport = finalizeE2eReportAfterCleanup(
+    { success: true },
+    undefined,
+    '2026-08-15T10:47:00.000Z',
+  );
+  assert.deepEqual(cleanedReport.cleanup, {
+    completed: true,
+    completedAt: '2026-08-15T10:47:00.000Z',
+  });
+  assert.equal(cleanedReport.success, true);
+  const cleanupFailedReport = finalizeE2eReportAfterCleanup(
+    { success: true, failure: { message: 'primary failure' } },
+    new Error('cleanup self-test failure'),
+    '2026-08-15T10:48:00.000Z',
+  );
+  assert.equal(cleanupFailedReport.success, false);
+  assert.equal(cleanupFailedReport.cleanup.completed, false);
+  assert.equal(cleanupFailedReport.failure.message, 'primary failure');
+  assert.equal(cleanupFailedReport.failure.globalCleanupError.message, 'cleanup self-test failure');
+  const selfTestIngestScope = collectorEventIngestScopeEnvironment(
+    { runId: 'self-test-run' },
+    'docker',
+    'shadow',
+  );
+  assert.deepEqual(selfTestIngestScope, {
+    ANYSENTRY_E2E_INGEST_MARKER_PREFIX: 'asel-marker-self-test-run-docker-shadow-',
+  });
+  assert.ok(marker({ runId: 'self-test-run' }, 'docker', 'shadow', 'pi').startsWith(
+    selfTestIngestScope.ANYSENTRY_E2E_INGEST_MARKER_PREFIX,
+  ));
+  assert.equal(
+    marker({ runId: 'self-test-run' }, 'docker', 'enforce', 'pi').startsWith(
+      selfTestIngestScope.ANYSENTRY_E2E_INGEST_MARKER_PREFIX,
+    ),
+    false,
+  );
+  assert.deepEqual(collectorEventIngestScopeProof(
+    { runId: 'self-test-run' },
+    'docker',
+    'shadow',
+  ), {
+    mode: 'collector-phase-tool-exec-marker-prefix',
+    environment: 'docker',
+    phase: 'shadow',
+    prefixSha256: createHash('sha256')
+      .update(selfTestIngestScope.ANYSENTRY_E2E_INGEST_MARKER_PREFIX)
+      .digest('hex'),
+    collectorHeartbeatsBypassScope: true,
+    attributionAndRuntimeDiscoveryRunBeforeScope: true,
+  });
   assert.equal(dockerInspectSaysMissing({ stderr: 'Error: No such object: old-id' }), true);
   assert.equal(k8sGetSaysMissing({ stderr: 'Error from server (NotFound): pods "old" not found' }), true);
   const pathIdentity = { dev: '1', ino: '2', mode: 0o100600, directory: false, file: true };
@@ -6114,12 +10727,18 @@ async function selfTest() {
     hostSystemdLauncher,
     safetyContracts: [
       'host full-access CLI and launch-point gate',
+      'run-owned 0600 Host Kimi config and isolated 0700 state derived from the validated model',
       'bounded credential-redacted diagnostics',
       'host process quiesced before failure evidence capture',
       'no-follow exclusive evidence writes with artifact directory identity pinning',
       'tracked transient sandbox-probe directory cleanup',
       'nonce and InvocationID fenced transient host service cleanup',
-      'host runtime ProcessKey and cgroup correlation',
+      'host non-Agent filter canary runs in an owned transient systemd unit with stdin-only launch payload',
+      'host runtime ProcessKey, cgroup identity, and owned auxiliary-instance correlation',
+      'run-scoped runtime signature v1 -> v2 atomic reload and instance display-name contract',
+      'run-scoped ToolExec marker ingest boundary with full attribution/runtime processing',
+      'Pi runtime identity visible before releasing a held marker-bearing tool process',
+      'fsynced 0600 Pi release file atomically published through a pinned run-owned directory',
       'supervisor-owned collector shutdown with explicit final heartbeat evidence',
     ],
   };
@@ -6131,6 +10750,23 @@ function printPreflight(result) {
     console.log('[' + (symbols[item.status] || item.status.toUpperCase()) + '] ' + item.name + ': ' + item.detail);
   }
   console.log('preflight: blockers=' + result.blockers.length + '; warnings=' + result.warnings.length);
+}
+
+function finalizeE2eReportAfterCleanup(report, cleanupFailure, completedAt = new Date().toISOString()) {
+  assert.ok(plainObject(report), 'final E2E report is unavailable');
+  if (cleanupFailure) {
+    const error = diagnosticSanitized({
+      name: cleanupFailure.name || 'Error',
+      message: redact(cleanupFailure.message || String(cleanupFailure)),
+    });
+    report.cleanup = { completed: false, failedAt: completedAt, error };
+    report.success = false;
+    report.failure = { ...(report.failure || {}), globalCleanupError: error };
+  } else {
+    report.cleanup = { completed: true, completedAt };
+  }
+  report.completedAt = completedAt;
+  return report;
 }
 
 async function main() {
@@ -6153,8 +10789,13 @@ async function main() {
     return;
   }
   ledger.runId = options.runId;
+  if (options.agents.some((agent) => agent.endsWith('-pi'))) {
+    options.piMarkerHelperSha256 = (await hashLocalFile(PI_MARKER_HELPER_SOURCE_FILE)).sha256;
+  }
   const needsK8s = options.agents.includes('k8s-pi');
   const apiState = {};
+  let outcome;
+  let dryRunCompleted = false;
   let successOutput;
   let primaryError;
   try {
@@ -6166,37 +10807,56 @@ async function main() {
       console.log(result.blockers.length
         ? '[dry-run] plan generated; execute is blocked until preflight blockers are resolved.'
         : '[dry-run] plan generated; no run-scoped resources were created and transient preflight probes were removed. Re-run with --execute to start the real E2E.');
-      return;
+      dryRunCompleted = true;
+    } else {
+      if (result.blockers.length) {
+        throw new Error('execute refused because preflight has ' + result.blockers.length + ' blocker(s)');
+      }
+      outcome = await executeE2e(options, result);
     }
-    if (result.blockers.length) {
-      throw new Error('execute refused because preflight has ' + result.blockers.length + ' blocker(s)');
-    }
-    const outcome = await executeE2e(options, result);
-    successOutput = {
-      status: 'passed',
-      runId: options.runId,
-      report: outcome.evidence.file,
-      reportSha256: outcome.evidence.sha256,
-      comparison: outcome.report.comparison,
-    };
   } catch (error) {
     primaryError = error instanceof Error ? error : new Error(String(error));
-    throw primaryError;
-  } finally {
+  }
+  let cleanupFailure;
+  try {
+    await cleanup();
+  } catch (cleanupError) {
+    cleanupFailure = cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError));
+    const cleanupMessage = redact(cleanupFailure.message);
+    if (!primaryError) primaryError = cleanupFailure;
+    else primaryError.message += '; global cleanup failed: ' + cleanupMessage;
+    primaryError.globalCleanupError = diagnosticSanitized({
+      name: cleanupFailure.name,
+      message: cleanupMessage,
+    });
+  }
+  if (dryRunCompleted && !primaryError) return;
+
+  const finalReport = outcome?.report ?? primaryError?.e2eReport;
+  const artifactDir = outcome?.artifactDir ?? primaryError?.e2eArtifactDir;
+  if (finalReport && artifactDir) {
+    finalizeE2eReportAfterCleanup(finalReport, cleanupFailure);
     try {
-      await cleanup();
-    } catch (cleanupError) {
-      if (!primaryError) throw cleanupError;
-      const cleanupMessage = redact(
-        cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
-      );
-      primaryError.message += '; global cleanup failed: ' + cleanupMessage;
-      primaryError.globalCleanupError = diagnosticSanitized({
-        name: cleanupError instanceof Error ? cleanupError.name : 'Error',
-        message: cleanupMessage,
-      });
+      const evidence = await writeJsonEvidence(artifactDir, 'report.json', finalReport);
+      if (primaryError) primaryError.message += '; failure evidence=' + evidence.file;
+      else {
+        successOutput = {
+          status: 'passed',
+          runId: options.runId,
+          report: evidence.file,
+          reportSha256: evidence.sha256,
+          comparison: finalReport.comparison,
+        };
+      }
+    } catch (evidenceError) {
+      if (primaryError) {
+        primaryError.message += '; final evidence write failed: ' + redact(evidenceError?.message || evidenceError);
+      } else {
+        primaryError = evidenceError instanceof Error ? evidenceError : new Error(String(evidenceError));
+      }
     }
   }
+  if (primaryError) throw primaryError;
   if (successOutput) console.log(JSON.stringify(successOutput, null, 2));
 }
 

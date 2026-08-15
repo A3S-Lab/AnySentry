@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 
 const forwarder = fileURLToPath(new URL('./observer-forward.js', import.meta.url));
 
-function event(session, kind, payload) {
+function event(session, kind, payload, processFields = {}) {
   return JSON.stringify({
     identity: { agent: 'runtime', task: String(payload.pid), session },
     process: {
@@ -21,6 +21,7 @@ function event(session, kind, payload) {
       exe: '/usr/bin/worker',
       cgroup_id: payload.pid,
       cgroup: `0::/docker/${session}`,
+      ...processFields,
     },
     event: { [kind]: payload },
   });
@@ -118,6 +119,7 @@ async function runConfig(label, env = {}, inputLines, options = {}) {
   const batchRequests = [];
   const batchRequestBytes = [];
   const heartbeats = [];
+  const runtimeSnapshots = [];
   let resolveSnapshotRequested;
   const snapshotRequested = new Promise((resolve) => {
     resolveSnapshotRequested = resolve;
@@ -190,6 +192,7 @@ async function runConfig(label, env = {}, inputLines, options = {}) {
       if (request.url === '/security-center/runtime/lease') {
         response.end('{"accepted":true,"leaseEpoch":1}');
       } else if (request.url === '/security-center/runtime/snapshot') {
+        runtimeSnapshots.push(parsed);
         response.end('{"accepted":true,"applied":true,"duplicate":false}');
       } else {
         response.end('{"accepted":true}');
@@ -199,8 +202,7 @@ async function runConfig(label, env = {}, inputLines, options = {}) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   const api = `http://127.0.0.1:${address.port}/security-center/ingest`;
-  const child = spawn(process.execPath, [forwarder], {
-    env: {
+  const childEnv = {
       ...process.env,
       FORWARD_FILTER_MODE: 'enforce',
       FORWARD_RETAIN_UNKNOWN: 'true',
@@ -221,14 +223,26 @@ async function runConfig(label, env = {}, inputLines, options = {}) {
       ANYSENTRY_BEHAVIOR_DISCOVERY: 'off',
       ANYSENTRY_AGENT_TEMPLATES_JSON: '[]',
       A3S_OBSERVER_COLLECTOR_ID: `filter-${label}`,
-    },
+  };
+  if (!Object.prototype.hasOwnProperty.call(env, 'ANYSENTRY_E2E_INGEST_MARKER_PREFIX')) {
+    delete childEnv.ANYSENTRY_E2E_INGEST_MARKER_PREFIX;
+  }
+  const child = spawn(process.execPath, [forwarder], {
+    env: childEnv,
     stdio: ['pipe', 'ignore', 'pipe'],
   });
   let stderr = '';
   child.stderr.on('data', (chunk) => {
     stderr += chunk;
   });
-  await snapshotRequested;
+  try {
+    await within(snapshotRequested, 2_000, `${label} identity snapshot request`);
+  } catch (error) {
+    child.kill('SIGKILL');
+    if (child.exitCode === null) await new Promise((resolve) => child.once('exit', resolve));
+    await new Promise((resolve) => server.close(resolve));
+    throw new Error(`${error.message}: ${stderr}`);
+  }
   await new Promise((resolve) => setTimeout(resolve, 20));
   const lines = inputLines ?? [
     event('nonagent-container', 'ToolExec', { pid: 10, argv: ['true'] }),
@@ -264,7 +278,7 @@ async function runConfig(label, env = {}, inputLines, options = {}) {
       .reverse()
       .find((candidate) => candidate.filterMetrics?.observed === expectedObserved);
   assert.ok(heartbeat, `missing structured ${label} heartbeat: ${JSON.stringify(heartbeats)}`);
-  return { batches, batchRequests, batchRequestBytes, heartbeat, heartbeats };
+  return { batches, batchRequests, batchRequestBytes, heartbeat, heartbeats, runtimeSnapshots };
 }
 
 async function runManualReviewRecovery() {
@@ -1515,6 +1529,7 @@ assert.equal(safeDefault.heartbeat.filterMetrics.filterMode, 'shadow');
 assert.equal(safeDefault.batches.length, 6, 'an unset filter mode must fail safe to shadow');
 assert.equal(safeDefault.heartbeat.filterMetrics.filteredNonAgent, 0);
 assert.equal(safeDefault.heartbeat.filterMetrics.wouldFilterNonAgent, 1);
+assert.doesNotMatch(safeDefault.heartbeat.message, /e2e_marker_/u, 'unset E2E scope must preserve the production message contract');
 
 const rawHeartbeatLine = collectorHeartbeat('raw-control-heartbeat');
 const rawHeartbeat = await runConfig('raw-control-heartbeat', {
@@ -1528,6 +1543,100 @@ assert.equal(rawHeartbeat.heartbeat.filterMetrics.observed, 0, 'raw heartbeat is
 assert.equal(rawHeartbeat.heartbeat.filterMetrics.unknown, 0, 'raw heartbeat is not an unknown Agent');
 assert.equal(rawHeartbeat.heartbeat.filterMetrics.forwarded, 0, 'raw heartbeat is not an Agent forward count');
 assert.equal(rawHeartbeat.heartbeat.filterMetrics.discoveryBudgetDropped, 0);
+
+const scopedPrefix = 'asel-marker-run-docker-shadow-';
+const scopedMarkerValue = scopedPrefix + 'pi';
+const scopedMarkerLine = event('unknown-container', 'ToolExec', {
+  pid: 20,
+  argv: ['/usr/bin/true', scopedMarkerValue],
+});
+const scopedHeartbeatLine = collectorHeartbeat('scoped-control-heartbeat');
+const scopedIngest = await runConfig('e2e-marker-scope', {
+  FORWARD_FILTER_MODE: 'shadow',
+  FORWARD_RETAIN_UNKNOWN: 'false',
+  ANYSENTRY_E2E_INGEST_MARKER_PREFIX: scopedPrefix,
+  ANYSENTRY_E2E_FILTER_MARKER_SHA256: createHash('sha256')
+    .update(JSON.stringify(scopedMarkerValue))
+    .digest('hex'),
+}, [
+  scopedHeartbeatLine,
+  event('pi-runtime', 'ToolExec', { pid: 30, argv: ['pi', '--print'] }, {
+    comm: 'pi',
+    exe: '/usr/local/bin/pi',
+  }),
+  scopedMarkerLine,
+  event('unknown-container', 'ToolExec', {
+    pid: 20,
+    argv: ['/usr/bin/true', 'asel-marker-run-docker-shadow-child-docker-shadow-pi'],
+  }),
+  event('unknown-container', 'ToolExec', {
+    pid: 20,
+    argv: ['/usr/bin/true', 'asel-marker-run-k8s-shadow-pi'],
+  }),
+  event('unknown-container', 'ToolExec', {
+    pid: 20,
+    argv: ['/usr/bin/true', 'asel-marker-run-docker-enforce-pi'],
+  }),
+  event('unknown-container', 'FileAccess', {
+    pid: 20,
+    path: '/workspace/' + scopedPrefix + 'spoof',
+  }),
+], { expectedObserved: 6 });
+assert.equal(scopedIngest.batches.length, 2, 'E2E scope must retain only heartbeat and marker ToolExec');
+assert.ok(scopedIngest.batches.some((item) => item.line === scopedHeartbeatLine));
+assert.ok(scopedIngest.batches.some((item) => item.line === scopedMarkerLine));
+assert.equal(scopedIngest.heartbeat.filterMetrics.observed, 6, 'scope must run after attribution');
+assert.equal(scopedIngest.heartbeat.filterMetrics.forwarded, 1);
+assert.equal(scopedIngest.heartbeat.filterMetrics.probableAgent, 1);
+assert.equal(scopedIngest.heartbeat.filterMetrics.wouldDiscoveryBudgetDrop, 5);
+assert.match(scopedIngest.heartbeat.message, /e2e_marker_scope=enabled/u);
+assert.match(scopedIngest.heartbeat.message, /e2e_marker_scoped_out=5/u);
+assert.equal(scopedIngest.heartbeat.filterMetrics.e2eFilterReceipts.length, 1);
+assert.equal(
+  scopedIngest.heartbeat.filterMetrics.e2eFilterReceipts[0].lineSha256,
+  createHash('sha256').update(scopedMarkerLine).digest('hex'),
+);
+assert.equal(scopedIngest.heartbeat.filterMetrics.e2eFilterReceipts[0].filterReason, 'unknown');
+assert.ok(
+  scopedIngest.runtimeSnapshots.some((snapshot) => snapshot.entries?.some((entry) =>
+    entry.agentScopeId === 'pi' &&
+    entry.rootPid === 30 &&
+    entry.rootStartTimeTicks === '300' &&
+    entry.hostId === 'node-test' &&
+    entry.bootId === 'boot-test',
+  )),
+  'a non-marker Pi root must still reach runtime discovery and snapshots',
+);
+
+for (const invalidPrefix of [
+  '',
+  'asel-marker-',
+  'asel-marker-SCOPE-test-docker-shadow-',
+  ' asel-marker-scope-test-docker-shadow-',
+  'asel-marker-scope-test-docker-shadow',
+  'asel-marker-' + 'a'.repeat(29) + '-docker-shadow-',
+  'asel-marker-scope\ntest-docker-shadow-',
+  'asel-marker-scope-test-vm-shadow-',
+  'asel-marker-scope-test-docker-audit-',
+]) {
+  const invalidScopedIngest = spawnSync(process.execPath, [forwarder], {
+    env: {
+      ...process.env,
+      ANYSENTRY_E2E_INGEST_MARKER_PREFIX: invalidPrefix,
+    },
+    input: '',
+    encoding: 'utf8',
+    timeout: 2_000,
+  });
+  assert.notEqual(invalidScopedIngest.status, 0, 'invalid E2E marker scope must fail closed');
+  assert.match(invalidScopedIngest.stderr, /must identify one bounded E2E collector phase/u);
+  if (invalidPrefix) {
+    assert.doesNotMatch(
+      invalidScopedIngest.stderr,
+      new RegExp(invalidPrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'u'),
+    );
+  }
+}
 
 const defaultRetention = await runConfig('default');
 assert.equal(defaultRetention.batches.length, 4);
@@ -1545,13 +1654,14 @@ assert.ok(
   'SecurityAction survives unknown routing',
 );
 
-const e2eMarker = 'asel-marker-filter-receipt-test';
+const e2eMarker = 'asel-marker-filter-receipt-docker-enforce-test';
 const e2eMarkerLine = event('unknown-container', 'ToolExec', {
   pid: 20,
   argv: ['/usr/bin/true', e2eMarker],
 });
 const e2eReceipt = await runConfig('e2e-receipt', {
   FORWARD_RETAIN_UNKNOWN: 'false',
+  ANYSENTRY_E2E_INGEST_MARKER_PREFIX: 'asel-marker-filter-receipt-docker-enforce-',
   ANYSENTRY_E2E_FILTER_MARKER_VALUE: e2eMarker,
   ANYSENTRY_E2E_FILTER_MARKER_SHA256: createHash('sha256').update(JSON.stringify(e2eMarker)).digest('hex'),
 });
