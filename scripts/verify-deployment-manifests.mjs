@@ -400,6 +400,7 @@ function verifyStreamingManifest() {
   const kafkaService = docFor(docs, 'Service', 'kafka');
   const topicManager = docFor(docs, 'Deployment', 'kafka-topic-manager');
   const checkpointPvc = docFor(docs, 'PersistentVolumeClaim', 'flink-checkpoints');
+  const jobManagerService = docFor(docs, 'Service', 'flink-jobmanager');
   const jobManager = docFor(docs, 'Deployment', 'flink-jobmanager');
   const taskManager = docFor(docs, 'Deployment', 'flink-taskmanager');
   const jobSubmit = docFor(docs, 'Deployment', 'flink-job-submit');
@@ -454,6 +455,14 @@ function verifyStreamingManifest() {
     'Flink JobManager health is guarded by startup/readiness/liveness probes',
     countMatches(jobManager?.source ?? '', /httpGet:\s*\{\s*path:\s*\/overview,\s*port:\s*8081\s*\}/gu) === 3,
     jobManager?.source,
+  );
+  assert(
+    'Flink JobManager Service exposes RPC, BlobServer, and REST ports',
+    /\{\s*name:\s*rpc,\s*port:\s*6123,\s*targetPort:\s*6123\s*\}/u.test(jobManagerService?.source ?? '') &&
+      /\{\s*name:\s*blob,\s*port:\s*6124,\s*targetPort:\s*6124\s*\}/u.test(jobManagerService?.source ?? '') &&
+      /\{\s*name:\s*rest,\s*port:\s*8081,\s*targetPort:\s*8081\s*\}/u.test(jobManagerService?.source ?? '') &&
+      /\{\s*name:\s*blob,\s*containerPort:\s*6124\s*\}/u.test(jobManager?.source ?? ''),
+    { service: jobManagerService?.source, deployment: jobManager?.source },
   );
   assert(
     'Flink submit controller runs the packaged AnySentry streaming job',
