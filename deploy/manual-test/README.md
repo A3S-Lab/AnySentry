@@ -102,7 +102,8 @@ The dashboard URLs are:
 - Collector health: append `/collectors`
 - Security Monitor: append `/admin/security-monitor`
 - Policy and Runtime Model connections: append `/admin/policy`
-- Docker Flink: `http://127.0.0.1:8081/`
+- Docker Flink (only after the JobManager and TaskManager have started and report Ready):
+  `http://127.0.0.1:8081/`
 - Kubernetes Flink: `http://127.0.0.1:38081/`
 
 ## Persistent Pi agent for manual interaction
@@ -139,13 +140,28 @@ docker compose -f deploy/manual-test/docker-compose.pi-agent.yml ps pi-agent
 ```
 
 It can also be added to the full manual stack by appending
-`-f deploy/manual-test/docker-compose.pi-agent.yml` to the full-stack Compose command. Enter it and
-start the interactive agent only when ready to generate real model traffic:
+`-f deploy/manual-test/docker-compose.pi-agent.yml` to the full-stack Compose command. The reliable
+entry point for either launch mode is the fixed container name:
+
+```bash
+docker exec -it anysentry-test-pi /bin/bash
+```
+
+When the workload was started as the Pi-only Compose project, this Compose-scoped entry point is
+also available:
 
 ```bash
 docker compose -f deploy/manual-test/docker-compose.pi-agent.yml \
   exec pi-agent /bin/bash
 ```
+
+Do not rely on that Pi-only Compose command after adding the service to the full-stack Compose
+project: invoking only the Pi file can select a different Compose project and report that the
+service is missing or not running. `docker exec` addresses the fixed container directly.
+
+Start the interactive agent only when ready to generate real model traffic. It is a second Pi
+process in the same workload; the container's original Pi process remains in RPC standby. The
+`exec` below replaces only the temporary shell, not the standby process.
 
 Then, inside the container:
 
@@ -207,31 +223,137 @@ kubectl -n anysentry-agent-test rollout status deployment/pi-coding-agent
 
 The rule file is a complete registry document, not an incremental patch. Every accepted update must
 retain `schemaVersion`, every runtime entry, and every variant, while increasing the integer
-`version`.
+`version`. Treat `candidate.version > live.version` as a required operational gate; a valid but
+stale or equal version must not be published.
 
 - Docker source: `.local/observer-rules/agent-runtime-signatures.json`
 - Docker mount in the Observer: `/etc/anysentry/agent-runtime-signatures.json`
-- Kubernetes source of truth: ConfigMap `anysentry/anysentry-agent-templates`, key
+- Kubernetes live state: ConfigMap `anysentry/anysentry-agent-templates`, key
   `agent-runtime-signatures.json`
+- Kubernetes tracked desired state: `deploy/manual-test/k8s-observer/rules-version2-patch.yaml`
 - Kubernetes mount in the Observer: `/etc/anysentry/agent-runtime-signatures.json`
 
-For Docker, write the edited complete document to a mode-`0600` temporary file in the same
-`.local/observer-rules` directory, validate it, and atomically rename it over the live file. For
-Kubernetes, preserve the sibling `agent-templates.json` key by patching only the runtime-signature
-key:
+Validate candidates with the same parser used by the Observer. A shallow `jq` shape check is not
+enough: `canonicalDocument` also rejects unknown fields, unsafe generic matchers, duplicates, and
+invalid limits. From the repository root, define this helper; its candidate hash is the value that
+must later appear as `runtimeSignatureHash`:
 
 ```bash
-RULES="$PWD/.local/observer-rules/agent-runtime-signatures.json"
-jq -e '.schemaVersion == "anysentry.agent_runtime_signatures.v1" and
-       (.version | type == "number") and
-       (.runtimes | type == "array" and length > 0)' "$RULES" >/dev/null
-kubectl -n anysentry patch configmap anysentry-agent-templates --type merge \
-  --patch "$(jq -n --rawfile document "$RULES" \
-    '{data:{"agent-runtime-signatures.json":$document}}')"
+validate_runtime_candidate() {
+  node - "$1" "$2" <<'NODE'
+'use strict';
+const fs = require('node:fs');
+const {
+  canonicalDocument,
+  documentHash,
+} = require('./scripts/observer-agent-runtime-signatures.js');
+
+const [livePath, candidatePath] = process.argv.slice(2);
+const live = canonicalDocument(JSON.parse(fs.readFileSync(livePath, 'utf8')));
+const candidate = canonicalDocument(JSON.parse(fs.readFileSync(candidatePath, 'utf8')));
+if (candidate.version <= live.version) {
+  throw new Error(
+    `candidate.version (${candidate.version}) must be greater than live.version (${live.version})`,
+  );
+}
+process.stdout.write(`${JSON.stringify({
+  liveVersion: live.version,
+  candidateVersion: candidate.version,
+  candidateHash: documentHash(candidate),
+})}\n`);
+NODE
+}
 ```
 
-The Observer validates the full replacement before adopting it. A valid update changes the active
-version/hash and triggers runtime reconciliation. An invalid update increments reload diagnostics
-but keeps the last-good registry. Kubernetes projects ConfigMap changes through an atomic `..data`
-symlink rotation. The reloader watches the directory and also hashes it every five seconds; the
-polling path remains authoritative when `fs.watch` is unavailable because of host inotify limits.
+For Docker, create the candidate in the live file's directory so the final rename stays on one
+filesystem. `mktemp` plus the explicit `chmod` keeps the candidate at mode `0600`; failed validation
+leaves the live file unchanged:
+
+```bash
+RULES_DIR="$PWD/.local/observer-rules"
+LIVE="$RULES_DIR/agent-runtime-signatures.json"
+CANDIDATE="$(mktemp "$RULES_DIR/.agent-runtime-signatures.XXXXXX")"
+cp -- "$LIVE" "$CANDIDATE"
+vi "$CANDIDATE"
+chmod 0600 "$CANDIDATE"
+validate_runtime_candidate "$LIVE" "$CANDIDATE" &&
+  mv -- "$CANDIDATE" "$LIVE"
+```
+
+For a Kubernetes hot-reload drill, compare the edited complete JSON candidate with the current
+ConfigMap document, then merge-patch only the runtime-signature key so the sibling
+`agent-templates.json` key is preserved:
+
+```bash
+CANDIDATE="$PWD/.local/observer-rules/agent-runtime-signatures.candidate.json"
+K8S_LIVE="$(mktemp)"
+kubectl -n anysentry get configmap anysentry-agent-templates -o json |
+  jq -er '.data["agent-runtime-signatures.json"]' >"$K8S_LIVE"
+if validate_runtime_candidate "$K8S_LIVE" "$CANDIDATE"; then
+  kubectl -n anysentry patch configmap anysentry-agent-templates --type merge \
+    --patch "$(jq -n --rawfile document "$CANDIDATE" \
+      '{data:{"agent-runtime-signatures.json":$document}}')"
+fi
+rm -f -- "$K8S_LIVE"
+```
+
+That patch changes live cluster state only; it does not update the tracked overlay and a later
+overlay apply can replace it. For a persistent Kubernetes update, put the same validated complete
+document in `deploy/manual-test/k8s-observer/rules-version2-patch.yaml`, review the repository diff,
+and apply the tracked overlay with the client-side Kustomize command used above.
+
+Run the following query immediately before the update and again after a fresh Forwarder heartbeat.
+Use port `29653` and Collector `manual-docker-observer` for Docker. For Kubernetes, use port `39653`
+and the Observer Pod's `spec.nodeName` as the Collector ID:
+
+```bash
+API_BASE="http://127.0.0.1:29653/security-center"
+COLLECTOR_ID="manual-docker-observer"
+curl --fail-with-body --silent --show-error -X POST \
+  -H 'content-type: application/json' \
+  --data "$(jq -nc --arg collectorId "$COLLECTOR_ID" \
+    '{timeType:"last_30d",collectorId:$collectorId,limit:5}')" \
+  "$API_BASE/collectors/health" |
+  jq -e --arg collectorId "$COLLECTOR_ID" '
+    ((.data // .).items // [])
+    | map(select(.collectorId == $collectorId))[0]
+    | if . == null then error("collector not found") else . end
+    | {
+        collectorId,
+        lastHeartbeatAt,
+        filterMetricsReported,
+        version: .filterMetrics.runtimeSignatureVersion,
+        hash: .filterMetrics.runtimeSignatureHash,
+        matcherHash: .filterMetrics.runtimeSignatureMatcherHash,
+        lastGoodRawHash: .filterMetrics.runtimeSignatureLastGoodHash,
+        reload: {
+          attempts: .filterMetrics.runtimeSignatureReloadAttempts,
+          successes: .filterMetrics.runtimeSignatureReloadSuccesses,
+          errors: .filterMetrics.runtimeSignatureReloadErrors,
+          invalid: .filterMetrics.runtimeSignatureInvalid,
+          reconcileErrors: .filterMetrics.runtimeReconcileErrors
+        },
+        drops: {
+          droppedEvents,
+          outputDropped,
+          windowErrorMaxima,
+          queueDropped: .filterMetrics.queueDropped,
+          retryExhausted: (.filterMetrics.retryExhausted // 0),
+          discoveryBudgetDropped: .filterMetrics.discoveryBudgetDropped
+        }
+      }'
+```
+
+The post-update heartbeat must have `filterMetricsReported: true`; its `version` and `hash` must
+equal the validated candidate values. Reload attempts and successes must advance, while
+reload/invalid/reconciliation errors must stay at their baseline (normally zero). Transport-loss
+counters (`droppedEvents`, `outputDropped`, `queueDropped`, and `retryExhausted`) must not increase
+across the update. `discoveryBudgetDropped` is policy filtering in `enforce` mode rather than
+transport loss, but an unexpected jump still requires review. If management authentication is
+enabled, add the admin-token header as described above without enabling shell tracing.
+
+The Observer validates the full replacement before adopting it. An invalid update increments reload
+diagnostics but keeps the last-good registry. Kubernetes projects ConfigMap changes through an
+atomic `..data` symlink rotation. The reloader watches the directory and also hashes it every five
+seconds; the polling path remains authoritative when `fs.watch` is unavailable because of host
+inotify limits.
