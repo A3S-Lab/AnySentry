@@ -316,6 +316,12 @@ function verifyAnySentryManifest() {
     { manualCompose, manualRuntime: manualRuntimeConfig?.source, manualPolicy },
   );
   assert(
+    'Manual-test Observer keeps deterministic signature and workload discovery without behavior-promoting unrelated workloads',
+    /ANYSENTRY_DOCKER_DISCOVERY:\s*"on"/u.test(manualCompose) &&
+      /ANYSENTRY_BEHAVIOR_DISCOVERY:\s*"off"/u.test(manualCompose),
+    manualCompose,
+  );
+  assert(
     'Bundled ClickHouse mounts the memory budget read-only',
     /\{\s*name:\s*memory-config,\s*mountPath:\s*\/etc\/clickhouse-server\/config\.d\/20-anysentry-memory\.xml,\s*subPath:\s*memory\.xml,\s*readOnly:\s*true\s*\}/u.test(
       clickHouseDeployment?.source ?? '',

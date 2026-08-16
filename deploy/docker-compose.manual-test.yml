@@ -78,6 +78,10 @@ services:
       ANYSENTRY_IDENTITY_SNAPSHOT_SECS: "5"
       ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_SECS: "5"
       ANYSENTRY_DOCKER_DISCOVERY: "on"
+      # Keep manual validation deterministic: explicit runtime signatures and
+      # workload identity still apply, while unrelated host workloads cannot
+      # be behavior-promoted into the high-volume Agent event path.
+      ANYSENTRY_BEHAVIOR_DISCOVERY: "off"
       FORWARD_FILTER_MODE: enforce
       FORWARD_RETAIN_UNKNOWN: "false"
       FORWARD_RETAIN_NON_AGENT: "false"
