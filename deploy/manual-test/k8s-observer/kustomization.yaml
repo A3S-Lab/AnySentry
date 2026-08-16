@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# This overlay leaves the production-oriented canonical file unchanged, but deliberately renders
+# its manual-test DaemonSet in enforce mode with behavior promotion disabled. Render it with
+# --load-restrictor=LoadRestrictionsNone because the base lives above this manual-test directory,
+# then pipe the result to client-side `kubectl apply`.
+resources:
+  - ../../observer.yaml
+
+images:
+  - name: ghcr.io/a3s-lab/anysentry-observer
+    newName: 127.0.0.1:5000/anysentry-observer
+    digest: sha256:9f7a747dfc26477a7f3ce5ff96604e2e30c548976a89084e1419cc773c1a7b06
+
+patches:
+  - path: observer-manual-patch.yaml
+  - path: rules-version2-patch.yaml

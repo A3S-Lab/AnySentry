@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: a3s-observer
+  namespace: anysentry
+spec:
+  template:
+    metadata:
+      annotations:
+        anysentry.io/manual-observer-profile: "agent-enforce-behavior-off-no-files-v1"
+    spec:
+      containers:
+        - name: a3s-observer
+          env:
+            # The manual test is deterministic: Kubernetes/Docker workload metadata and exact
+            # runtime signatures identify Agents. Background behavior promotion is intentionally
+            # disabled so unrelated host churn cannot become an unbounded ingest source.
+            - { name: ANYSENTRY_BEHAVIOR_DISCOVERY, value: "off" }
+            - { name: FORWARD_FILTER_MODE, value: "enforce" }
+            - { name: FORWARD_RETAIN_UNKNOWN, value: "false" }
+            - { name: FORWARD_RETAIN_NON_AGENT, value: "false" }
+            # This single node already runs two other collectors, and the upstream FILE_EVENTS
+            # ring is a fixed 256 KiB with no runtime capacity/sampling knob. Disable only the
+            # high-volume FileAccess/FileDelete probes here so ToolExec/Exit, Egress/DNS, SSL,
+            # Kubernetes workload identity, and exact runtime-signature testing remain lossless.
+            # The Docker manual profile retains FileAccess for the complete rule exercise.
+            - { name: A3S_OBSERVER_FILES, value: "0" }
+            - { name: A3S_OBSERVER_SSL, value: "1" }
+            - { name: ANYSENTRY_BATCH_INGEST_URL, value: "http://anysentry:29653/security-center/ingest/batch" }

@@ -556,6 +556,105 @@ function verifyObserverManifest() {
   assert('Observer DaemonSet does not run enforcement binaries', !/\ba3s-observer-enforce\b/u.test(observerText) && !/\bfileguard\b/u.test(observerText), daemonSet?.source);
 }
 
+function verifyManualKubernetesObserverOverlay() {
+  const kustomization = stripYamlComments(readText('deploy/manual-test/k8s-observer/kustomization.yaml'));
+  const observerPatchText = readText('deploy/manual-test/k8s-observer/observer-manual-patch.yaml');
+  const observerPatch = stripYamlComments(observerPatchText);
+  const rulesPatch = readText('deploy/manual-test/k8s-observer/rules-version2-patch.yaml');
+  const rulesLines = rulesPatch.split(/\r?\n/u);
+  const literalStart = rulesLines.findIndex((line) => /^  agent-runtime-signatures\.json:\s*\|\s*$/u.test(line));
+  const literalLines = [];
+  for (const line of rulesLines.slice(literalStart + 1)) {
+    if (line !== '' && !/^    /u.test(line)) break;
+    literalLines.push(line);
+  }
+  let runtimeDocument;
+  try {
+    runtimeDocument = JSON.parse(literalLines.map((line) => line.slice(4)).join('\n'));
+  } catch {
+    runtimeDocument = undefined;
+  }
+
+  assert(
+    'Manual Kubernetes Observer overlay pins one immutable local image digest',
+    /resources:\s*\n\s*-\s*\.\.\/\.\.\/observer\.yaml/u.test(kustomization) &&
+      /newName:\s*127\.0\.0\.1:5000\/anysentry-observer/u.test(kustomization) &&
+      /digest:\s*sha256:[0-9a-f]{64}/u.test(kustomization) &&
+      !/:latest\b/u.test(kustomization),
+    kustomization,
+  );
+  assert(
+    'Manual Kubernetes Observer overlay keeps identity/tool/network/SSL signals but disables fixed-ring file capture and behavior promotion',
+    /\{\s*name:\s*ANYSENTRY_BEHAVIOR_DISCOVERY,\s*value:\s*"off"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*FORWARD_FILTER_MODE,\s*value:\s*"enforce"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*FORWARD_RETAIN_UNKNOWN,\s*value:\s*"false"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*FORWARD_RETAIN_NON_AGENT,\s*value:\s*"false"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*A3S_OBSERVER_FILES,\s*value:\s*"0"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*A3S_OBSERVER_SSL,\s*value:\s*"1"\s*\}/u.test(observerPatch) &&
+      /ToolExec\/Exit, Egress\/DNS, SSL/u.test(observerPatchText) &&
+      /fixed 256 KiB/u.test(observerPatchText) &&
+      /security-center\/ingest\/batch/u.test(observerPatch),
+    observerPatch,
+  );
+  const runtimeIds = new Set(runtimeDocument?.runtimes?.map((runtime) => runtime.id));
+  assert(
+    'Manual Kubernetes Observer overlay replaces the complete versioned signature document while inheriting templates',
+    runtimeDocument?.schemaVersion === 'anysentry.agent_runtime_signatures.v1' &&
+      Number.isInteger(runtimeDocument?.version) &&
+      runtimeDocument.version > 1 &&
+      ['codex', 'pi', 'a3s-code', 'claude-code', 'gemini-cli', 'kimi-cli'].every((id) => runtimeIds.has(id)) &&
+      runtimeDocument.runtimes.every((runtime) => Array.isArray(runtime.variants) && runtime.variants.length > 0) &&
+      runtimeDocument.runtimes.find((runtime) => runtime.id === 'a3s-code')?.agentScopeId === 'a3s code' &&
+      runtimeDocument.runtimes.find((runtime) => runtime.id === 'claude-code')?.agentScopeId === 'Claude Code' &&
+      !/^  agent-templates\.json:/mu.test(rulesPatch) &&
+      /resources:\s*\n\s*-\s*\.\.\/\.\.\/observer\.yaml/u.test(kustomization),
+    { runtimeDocument, kustomization },
+  );
+}
+
+function verifyManualKubernetesLocalPathOverlay() {
+  const kustomization = stripYamlComments(readText('deploy/manual-test/k8s-local-path/kustomization.yaml'));
+  const checkpointPatch = stripYamlComments(readText('deploy/manual-test/k8s-local-path/flink-checkpoints-rwo.yaml'));
+
+  assert(
+    'Manual Kubernetes local-path overlay composes canonical core and streaming with the complete runtime-on patch',
+    /resources:\s*\n\s*-\s*\.\.\/\.\.\/anysentry\.yaml\s*\n\s*-\s*\.\.\/\.\.\/streaming\.yaml/u.test(kustomization) &&
+      /path:\s*\.\.\/runtime-on\.yaml/u.test(kustomization) &&
+      /path:\s*flink-checkpoints-rwo\.yaml/u.test(kustomization),
+    kustomization,
+  );
+  assert(
+    'Manual Kubernetes local-path overlay pins the AnySentry and Flink images by immutable local digests',
+    /newName:\s*127\.0\.0\.1:5000\/anysentry\s*\n\s*digest:\s*sha256:8419c54d74dc487dc7609263caba11e2e317f979f2e374a2e25d20cd80a1cced/u.test(kustomization) &&
+      /newName:\s*127\.0\.0\.1:5000\/anysentry-flink-streaming\s*\n\s*digest:\s*sha256:bcce599325a53132a0e4495717878bcab53cbfc7724813ab83e6961ab934398c/u.test(kustomization) &&
+      !/:latest\b/u.test(kustomization),
+    kustomization,
+  );
+  assert(
+    'Manual Kubernetes local-path overlay changes only Flink checkpoints to explicit local-path RWO storage',
+    /^kind:\s*PersistentVolumeClaim$/mu.test(checkpointPatch) &&
+      /^  name:\s*flink-checkpoints$/mu.test(checkpointPatch) &&
+      /storageClassName:\s*local-path/u.test(checkpointPatch) &&
+      /accessModes:\s*\["ReadWriteOnce"\]/u.test(checkpointPatch) &&
+      /storage:\s*20Gi/u.test(checkpointPatch) &&
+      /manual-storage-profile:\s*"single-node-local-path-rwo-v1"/u.test(checkpointPatch),
+    checkpointPatch,
+  );
+}
+
+function verifyManualKubernetesCoreOverlay() {
+  const kustomization = stripYamlComments(readText('deploy/manual-test/k8s-core/kustomization.yaml'));
+  assert(
+    'Manual Kubernetes core overlay stages canonical core with full runtime flags and one immutable image',
+    /resources:\s*\n\s*-\s*\.\.\/\.\.\/anysentry\.yaml/u.test(kustomization) &&
+      /path:\s*\.\.\/runtime-on\.yaml/u.test(kustomization) &&
+      /newName:\s*127\.0\.0\.1:5000\/anysentry\s*\n\s*digest:\s*sha256:8419c54d74dc487dc7609263caba11e2e317f979f2e374a2e25d20cd80a1cced/u.test(kustomization) &&
+      !/streaming\.yaml/u.test(kustomization) &&
+      !/:latest\b/u.test(kustomization),
+    kustomization,
+  );
+}
+
 function verifyIngressManifest() {
   const docs = documentsFromYaml(readText('deploy/ingress.yaml'));
   const ingress = docFor(docs, 'Ingress', 'anysentry');
@@ -685,6 +784,9 @@ function main() {
   verifyAnySentryManifest();
   verifyStreamingManifest();
   verifyObserverManifest();
+  verifyManualKubernetesObserverOverlay();
+  verifyManualKubernetesLocalPathOverlay();
+  verifyManualKubernetesCoreOverlay();
   verifyIngressManifest();
   verifyDockerfile();
   verifyObserverForwarderDockerfile();

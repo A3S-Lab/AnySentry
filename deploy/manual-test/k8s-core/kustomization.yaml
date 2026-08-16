@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Staged core rollout used before the local-path streaming plane. The runtime patch enables every
+# feature flag now, while unavailable Kafka/Flink dependencies remain health-visible and recover
+# automatically when the second stage is applied.
+resources:
+  - ../../anysentry.yaml
+
+images:
+  - name: ghcr.io/a3s-lab/anysentry
+    newName: 127.0.0.1:5000/anysentry
+    digest: sha256:8419c54d74dc487dc7609263caba11e2e317f979f2e374a2e25d20cd80a1cced
+
+patches:
+  - path: ../runtime-on.yaml
