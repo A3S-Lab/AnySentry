@@ -281,6 +281,8 @@ metadata:
   labels: { app: flink-job-submit, io.anysentry.observe: "false" }
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels: { app: flink-job-submit }
   template:

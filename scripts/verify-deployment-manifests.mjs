@@ -469,6 +469,11 @@ function verifyStreamingManifest() {
     jobSubmit?.source,
   );
   assert(
+    'Flink submit controller uses Recreate so manifest updates cannot overlap reconcilers',
+    /strategy:\s*\n\s*type:\s*Recreate/u.test(jobSubmit?.source ?? ''),
+    jobSubmit?.source,
+  );
+  assert(
     'Stream Worker consumes Flink findings and episodes',
     /dist\/security-monitoring\/stream-worker-main\.js/u.test(streamWorker?.source ?? '') &&
       /\{\s*name:\s*ANYSENTRY_STREAM_WORKER_ROLE,\s*value:\s*"all"\s*\}/u.test(streamWorker?.source ?? ''),
