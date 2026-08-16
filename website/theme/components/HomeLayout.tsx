@@ -4,7 +4,7 @@ import { CapabilityMatrix } from './CapabilityMatrix';
 import { CanvasGridEffect } from './CanvasGridEffect';
 import { EvidenceCaseFile } from './EvidenceCaseFile';
 import { FeatureRail } from './FeatureRail';
-import { HeroTopology } from './HeroTopology';
+import { HeroProductDemo } from './HeroProductDemo';
 import { copy, type HomeLabels, type Locale } from './home-copy';
 import { Icon } from './icons';
 import { InstallCommand } from './InstallCommand';
@@ -141,7 +141,7 @@ export function HomeLayout() {
             </div>
           </div>
           <div className="as-hero__visual">
-            <HeroTopology labels={labels.console} locale={locale} />
+            <HeroProductDemo locale={locale} />
           </div>
         </section>
 
