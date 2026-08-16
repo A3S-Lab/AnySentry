@@ -10,6 +10,10 @@ services:
       ANYSENTRY_STREAMING: "on"
       ANYSENTRY_SUPPLY_CHAIN: "on"
       ANYSENTRY_SUPPLY_CHAIN_RUNTIME: "on"
+      # The full manual profile starts several relational projections together. Give their
+      # bounded transactions enough checkout capacity while retaining fail-closed fallbacks.
+      ANYSENTRY_DATABASE_POOL_MAX: "20"
+      ANYSENTRY_DATABASE_CONNECT_TIMEOUT_MS: "10000"
 
   fast-judge:
     image: ${ANYSENTRY_IMAGE:?Set ANYSENTRY_IMAGE to the immutable AnySentry image digest}

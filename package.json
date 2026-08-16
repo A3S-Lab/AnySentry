@@ -17,6 +17,7 @@
     "verify:deployment-manifests": "node scripts/verify-deployment-manifests.mjs",
     "verify:clickhouse-query-bounds": "node scripts/verify-clickhouse-query-bounds.mjs",
     "verify:clickhouse-write-buffer": "pnpm build:api && node scripts/verify-clickhouse-write-buffer.mjs",
+    "verify:persistence-single-flight": "pnpm build:api && node scripts/verify-persistence-single-flight.mjs",
     "verify:progressive-api": "pnpm verify:ai-native-api",
     "verify:progressive-api:local": "pnpm verify:ai-native-api:local",
     "verify:ai-native-api": "node scripts/verify-ai-native-api.mjs",

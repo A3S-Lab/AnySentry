@@ -259,8 +259,9 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   async saveAgentWorkspaceBindings(records: AgentWorkspaceBindingRecord[]): Promise<boolean> {
     if (records.length === 0) return true;
     if (!(await this.initialize()) || !this.pool) return false;
-    const client = await this.pool.connect();
+    let client: PoolClient | undefined;
     try {
+      client = await this.pool.connect();
       await client.query('BEGIN');
       for (const record of records) {
         await client.query(
@@ -299,11 +300,11 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       await client.query('COMMIT');
       return true;
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined);
+      if (client) await client.query('ROLLBACK').catch(() => undefined);
       this.markUnavailable('save Agent-Workspace bindings', error);
       return false;
     } finally {
-      client.release();
+      client?.release();
     }
   }
 
@@ -663,6 +664,12 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         ? { rejectUnauthorized: process.env.ANYSENTRY_DATABASE_SSL_REJECT_UNAUTHORIZED !== 'off' }
         : undefined,
     });
+    // node-postgres emits idle-client failures on the Pool itself. Without a listener, a
+    // transient PostgreSQL restart or network reset becomes an uncaught EventEmitter error and
+    // terminates the API process even though the ClickHouse migration fallback remains usable.
+    pool.on('error', (error) => {
+      this.markUnavailable('handle an idle PostgreSQL client failure', error);
+    });
 
     try {
       await pool.query('SELECT 1');
@@ -934,8 +941,9 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       identity(left).localeCompare(identity(right)));
     let lastError: unknown;
     for (let attempt = 1; attempt <= BUSINESS_WRITE_MAX_ATTEMPTS; attempt += 1) {
-      const client = await this.pool.connect();
+      let client: PoolClient | undefined;
       try {
+        client = await this.pool.connect();
         await client.query('BEGIN');
         for (let offset = 0; offset < ordered.length; offset += BUSINESS_WRITE_BATCH_SIZE) {
           await upsert(client, ordered.slice(offset, offset + BUSINESS_WRITE_BATCH_SIZE));
@@ -944,13 +952,13 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         return true;
       } catch (error) {
         lastError = error;
-        await client.query('ROLLBACK').catch(() => undefined);
+        if (client) await client.query('ROLLBACK').catch(() => undefined);
         if (!this.retryableTransactionError(error) || attempt === BUSINESS_WRITE_MAX_ATTEMPTS) {
           break;
         }
         await new Promise((resolve) => setTimeout(resolve, attempt * 50));
       } finally {
-        client.release();
+        client?.release();
       }
     }
     this.markUnavailable(operation, lastError);

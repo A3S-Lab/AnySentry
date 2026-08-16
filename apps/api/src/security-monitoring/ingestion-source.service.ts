@@ -149,6 +149,8 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
   private readonly sources = new Map<string, IngestionSourceRecord>();
   private persistTimer?: NodeJS.Timeout;
   private currentStateTimer?: NodeJS.Timeout;
+  private persistInFlight?: Promise<void>;
+  private persistRequested = false;
   private initialized = false;
 
   constructor(
@@ -585,14 +587,28 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     }, 500);
   }
 
-  private async persist(): Promise<void> {
-    const records = [...this.sources.values()]
-      .sort((a, b) => b.updatedAt - a.updatedAt)
-      .slice(0, RETAIN_LIMIT);
-    await Promise.all([
-      this.ch.saveIngestionSources(records),
-      this.relational.saveIngestionSources(records),
-    ]);
+  private persist(): Promise<void> {
+    this.persistRequested = true;
+    if (!this.persistInFlight) {
+      this.persistInFlight = this.drainPersistence().finally(() => {
+        this.persistInFlight = undefined;
+        if (this.persistRequested) void this.persist();
+      });
+    }
+    return this.persistInFlight;
+  }
+
+  private async drainPersistence(): Promise<void> {
+    do {
+      this.persistRequested = false;
+      const records = [...this.sources.values()]
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, RETAIN_LIMIT);
+      await Promise.all([
+        this.ch.saveIngestionSources(records),
+        this.relational.saveIngestionSources(records),
+      ]);
+    } while (this.persistRequested);
   }
 
   private mergePersisted(record: IngestionSourceRecord): void {
