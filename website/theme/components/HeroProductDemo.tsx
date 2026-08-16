@@ -712,6 +712,8 @@ function OverviewScene({ locale, revealCount }: HeroSceneProps) {
 
 function TopologyScene({ locale, revealCount }: HeroSceneProps) {
   const t = COPY[locale].scenes.topology;
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const [edgePaths, setEdgePaths] = useState<Record<string, string>>({});
   const nodes = [
     [
       'workspace',
@@ -727,22 +729,90 @@ function TopologyScene({ locale, revealCount }: HeroSceneProps) {
       'pjnl261070032',
       'Collector · 287 events',
       'risk',
-      8,
+      7,
     ],
-    ['agent', 'identity', 'codex', 'Agent · 3800 events', 'risk', 10],
-    ['lsb', 'terminal', 'lsb_release', 'Tool · 180 events', 'risk', 12],
-    ['awk', 'terminal', 'awk', 'Tool · 57 events', 'risk', 14],
-    ['bash', 'terminal', 'bash', 'Tool · 24 events', 'risk', 16],
-    ['getconf', 'terminal', 'getconf', 'Tool · 15 events', 'risk', 18],
+    ['agent', 'identity', 'codex', 'Agent · 3800 events', 'risk', 8],
+    ['lsb', 'terminal', 'lsb_release', 'Tool · 180 events', 'risk', 11],
+    ['awk', 'terminal', 'awk', 'Tool · 57 events', 'risk', 13],
+    ['bash', 'terminal', 'bash', 'Tool · 24 events', 'risk', 15],
+    ['getconf', 'terminal', 'getconf', 'Tool · 15 events', 'risk', 17],
   ] as const;
   const edges = [
-    ['M144 116C205 116 222 218 300 218', 'observed', 7],
-    ['M144 322C212 322 223 236 300 236', 'risk', 9],
-    ['M420 226C475 226 474 105 535 105', 'risk', 11],
-    ['M420 226C488 226 476 178 535 178', 'risk', 13],
-    ['M420 226C488 226 476 251 535 251', 'risk', 15],
-    ['M420 226C475 226 474 324 535 324', 'risk', 17],
+    ['workspace-agent', 'workspace', 'agent', 'observed', 9],
+    ['collector-agent', 'collector', 'agent', 'risk', 10],
+    ['agent-lsb', 'agent', 'lsb', 'risk', 12],
+    ['agent-awk', 'agent', 'awk', 'risk', 14],
+    ['agent-bash', 'agent', 'bash', 'risk', 16],
+    ['agent-getconf', 'agent', 'getconf', 'risk', 18],
   ] as const;
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    let animationFrame = 0;
+    const measureEdges = () => {
+      animationFrame = 0;
+      const nextPaths: Record<string, string> = {};
+
+      for (const [id, sourceId, targetId] of edges) {
+        const source = canvas.querySelector<HTMLElement>(
+          `[data-node="${sourceId}"]`,
+        );
+        const target = canvas.querySelector<HTMLElement>(
+          `[data-node="${targetId}"]`,
+        );
+        if (!source || !target) continue;
+
+        // offset geometry deliberately ignores reveal transforms, so a line
+        // remains attached while its cards animate into their final position.
+        const startX = source.offsetLeft + source.offsetWidth - 1;
+        const startY = source.offsetTop + source.offsetHeight / 2;
+        const endX = target.offsetLeft + 1;
+        const endY = target.offsetTop + target.offsetHeight / 2;
+        const horizontalSpace = Math.max(0, endX - startX);
+        const bend = Math.max(30, Math.min(92, horizontalSpace * 0.46));
+        nextPaths[id] = [
+          `M${startX.toFixed(1)} ${startY.toFixed(1)}`,
+          `C${(startX + bend).toFixed(1)} ${startY.toFixed(1)}`,
+          `${(endX - bend).toFixed(1)} ${endY.toFixed(1)}`,
+          `${endX.toFixed(1)} ${endY.toFixed(1)}`,
+        ].join(' ');
+      }
+
+      setEdgePaths((current) => {
+        const keys = Object.keys(nextPaths);
+        if (
+          keys.length === Object.keys(current).length &&
+          keys.every((key) => current[key] === nextPaths[key])
+        )
+          return current;
+        return nextPaths;
+      });
+    };
+    const scheduleMeasure = () => {
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      animationFrame = window.requestAnimationFrame(measureEdges);
+    };
+
+    scheduleMeasure();
+    window.addEventListener('resize', scheduleMeasure);
+    const resizeObserver =
+      'ResizeObserver' in window
+        ? new ResizeObserver(scheduleMeasure)
+        : undefined;
+    resizeObserver?.observe(canvas);
+    canvas
+      .querySelectorAll<HTMLElement>('[data-node]')
+      .forEach((node) => resizeObserver?.observe(node));
+
+    return () => {
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      window.removeEventListener('resize', scheduleMeasure);
+      resizeObserver?.disconnect();
+    };
+  }, []);
+
   return (
     <div className="as-product-demo__scene as-product-demo__scene--topology">
       <FilterBar items={t.filters} order={0} revealCount={revealCount} />
@@ -760,17 +830,16 @@ function TopologyScene({ locale, revealCount }: HeroSceneProps) {
             codex
           </span>
         </header>
-        <div className="as-product-demo__topology-canvas">
-          <svg
-            aria-hidden="true"
-            preserveAspectRatio="none"
-            viewBox="0 0 680 420"
-          >
-            {edges.map(([path, tone, order]) => (
+        <div className="as-product-demo__topology-canvas" ref={canvasRef}>
+          <svg aria-hidden="true">
+            {edges.map(([id, , , tone, order]) => (
               <path
-                d={path}
+                className="as-product-demo__topology-edge"
+                d={edgePaths[id] ?? ''}
+                data-connected={edgePaths[id] ? 'true' : 'false'}
                 data-tone={tone}
-                key={path}
+                key={id}
+                pathLength={1}
                 {...revealProps(order, revealCount)}
               />
             ))}
