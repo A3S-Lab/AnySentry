@@ -273,6 +273,12 @@ AS SELECT
   collectorId
 FROM ${TABLE}`;
 
+// Startup progress hydration must stay independent of the cardinality of the 90-day event table.
+// The commit journal is ordered by committedAt, so this compatibility sample reads a deterministic
+// recent prefix even when the materialized view was added after an older events table already
+// existed. It deliberately remains an observed-progress sample, never a completeness claim.
+const EVENT_COMMIT_PROGRESS_HYDRATE_ROWS = 100_000;
+
 // These are complete, commit-cursor-qualified bucket snapshots. Revisions replace the complete
 // snapshot rather than incrementing a counter, which keeps late judgment updates exact.
 const DASHBOARD_BUCKET_SNAPSHOT_TABLE = 'dashboard_bucket_snapshots';
@@ -343,6 +349,12 @@ const BOUNDED_RECENT_READ_SETTINGS: ClickHouseSettings = {
 const BOUNDED_EVENT_SEARCH_READ_SETTINGS: ClickHouseSettings = {
   ...BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
   max_memory_usage: String(512 * 1024 * 1024),
+};
+
+const BOUNDED_BOOTSTRAP_PROGRESS_READ_SETTINGS: ClickHouseSettings = {
+  max_threads: 1,
+  max_memory_usage: String(128 * 1024 * 1024),
+  max_execution_time: 15,
 };
 
 const MAX_DURABLE_EVENT_SEARCH_ROWS = 10_000;
@@ -428,6 +440,127 @@ export interface CommittedSourceProgress {
   collectorId?: string;
   committedEventTimeMs: number;
   committedAtMs: number;
+}
+
+interface ClickHouseBootstrapConfig {
+  url: string;
+  database: string;
+  username: string;
+  password: string;
+}
+
+interface ClickHouseBootstrapState {
+  committedSourceProgress: CommittedSourceProgress[];
+}
+
+// Nest can construct several services that each own a ClickHouseStore. Schema work and startup
+// progress hydration belong to the process/database target, not to an individual writer. Share only
+// the active operation: a later reconnect must validate/rebuild schema against the current server
+// and hydrate fresh journal progress rather than reusing a successful but stale snapshot forever.
+// The target digest includes credentials without retaining a plaintext password in a module-level
+// map key.
+const clickHouseBootstrapByTarget = new Map<string, Promise<ClickHouseBootstrapState>>();
+
+function clickHouseBootstrapTargetKey(config: ClickHouseBootstrapConfig): string {
+  return createHash('sha256')
+    .update(JSON.stringify([config.url, config.database, config.username, config.password]))
+    .digest('hex');
+}
+
+function sharedClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promise<ClickHouseBootstrapState> {
+  const key = clickHouseBootstrapTargetKey(config);
+  const current = clickHouseBootstrapByTarget.get(key);
+  if (current) return current;
+
+  const operation = runClickHouseBootstrap(config);
+  clickHouseBootstrapByTarget.set(key, operation);
+  void operation.finally(() => {
+    if (clickHouseBootstrapByTarget.get(key) === operation) clickHouseBootstrapByTarget.delete(key);
+  }).catch(() => undefined);
+  return operation;
+}
+
+async function runClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promise<ClickHouseBootstrapState> {
+  const credentials = { username: config.username, password: config.password };
+  let boot: ClickHouseClient | undefined;
+  let schema: ClickHouseClient | undefined;
+  try {
+    boot = createClient({ url: config.url, ...credentials });
+    await boot.command({ query: `CREATE DATABASE IF NOT EXISTS ${config.database}` });
+    await boot.close();
+    boot = undefined;
+
+    schema = createClient({
+      url: config.url,
+      database: config.database,
+      ...credentials,
+    });
+    await schema.command({ query: DDL(TABLE) });
+    for (const alter of EVENT_ALTERS) await schema.command({ query: `ALTER TABLE ${TABLE} ${alter}` });
+    await schema.command({
+      query: `ALTER TABLE ${TABLE} MODIFY SETTING non_replicated_deduplication_window = ${EVENT_DEDUPLICATION_WINDOW}`,
+    });
+    await schema.command({ query: COLLECTOR_HEARTBEAT_DDL });
+    await schema.command({ query: CONFIG_DDL });
+    await schema.command({ query: NOTIFICATION_DELIVERY_DDL });
+    await schema.command({ query: IDENTITY_AI_REVIEW_DDL });
+    await schema.command({ query: AUDIT_FACT_DDL });
+    await schema.command({ query: EVENT_COMMIT_FACT_DDL });
+    await schema.command({ query: EVENT_COMMIT_FACT_MV_DDL });
+    await schema.command({ query: DASHBOARD_BUCKET_SNAPSHOT_DDL });
+
+    // A materialized view does not retroactively populate rows that predate its creation. Read only
+    // a bounded recent journal prefix for per-source observed progress. Missing older sources stay
+    // absent instead of being presented as complete coverage. In particular this partial journal
+    // must not initialize the global committed cutoff: without an explicit full-backfill marker the
+    // dashboard safely performs its ordinary durable query rather than truncating at a false split.
+    let committedSourceProgress: CommittedSourceProgress[] = [];
+    try {
+      const progress = await schema.query({
+        query: `
+          SELECT
+            sourceId,
+            collectorId,
+            max(eventAt) AS committedThrough,
+            max(committedAt) AS committedAt
+          FROM (
+            SELECT sourceId, collectorId, eventAt, committedAt
+            FROM ${EVENT_COMMIT_FACT_TABLE}
+            ORDER BY committedAt DESC, eventId DESC, decisionRevision DESC
+            LIMIT {journalRows:UInt32}
+          )
+          GROUP BY sourceId, collectorId`,
+        query_params: { journalRows: EVENT_COMMIT_PROGRESS_HYDRATE_ROWS },
+        clickhouse_settings: BOUNDED_BOOTSTRAP_PROGRESS_READ_SETTINGS,
+        format: 'JSONEachRow',
+      });
+      const progressRows = (await progress.json()) as Array<{
+        sourceId?: string;
+        collectorId?: string;
+        committedThrough?: string | number;
+        committedAt?: string | number;
+      }>;
+      committedSourceProgress = progressRows.flatMap((row): CommittedSourceProgress[] => {
+        const committedEventTimeMs = Number(row.committedThrough);
+        if (!Number.isFinite(committedEventTimeMs) || committedEventTimeMs <= 0) return [];
+        return [{
+          sourceId: row.sourceId?.trim() || undefined,
+          collectorId: row.collectorId?.trim() || undefined,
+          committedEventTimeMs,
+          committedAtMs: Number(row.committedAt) || committedEventTimeMs,
+        }];
+      });
+    } catch (error) {
+      // Progress is query metadata, not a prerequisite for durable reads/writes. Failing closed to
+      // no boundary is correct and lets a healthy schema/client become ready under read pressure.
+      console.warn('[clickhouse] bounded startup progress hydration unavailable:',
+        error instanceof Error ? error.message : String(error));
+    }
+    return { committedSourceProgress };
+  } finally {
+    await boot?.close().catch(() => undefined);
+    await schema?.close().catch(() => undefined);
+  }
 }
 
 export interface EventCommitCursor {
@@ -788,6 +921,10 @@ export class ClickHouseStore {
   private ready = false;
   private closed = false;
   private committedThroughMs?: number;
+  // event_commit_facts can start after an existing events table and expires sooner than events.
+  // Until an explicit, durable full-backfill marker exists, no journal-derived/local maximum may
+  // be exposed as a global read split: doing so could hide persisted rows above a partial boundary.
+  private committedBoundaryComplete = false;
   private readonly committedSourceProgress = new Map<string, CommittedSourceProgress>();
   private earliestCommitCursorCache?: {
     expiresAt: number;
@@ -924,69 +1061,29 @@ export class ClickHouseStore {
       username: process.env.CLICKHOUSE_USER || 'default',
       password: process.env.CLICKHOUSE_PASSWORD || '',
     };
-    let boot: ClickHouseClient | undefined;
     let nextClient: ClickHouseClient | undefined;
     try {
-      // Create the database with a bootstrap client (no db bound), then connect to it.
-      boot = createClient({ url, ...credentials });
-      await boot.command({ query: `CREATE DATABASE IF NOT EXISTS ${database}` });
-      await boot.close();
-      boot = undefined;
+      const bootstrap = await sharedClickHouseBootstrap({ url, database, ...credentials });
+      if (this.closed) throw new Error('ClickHouse store closed during bootstrap');
+
+      // Schema/progress state is shared, while every store keeps its own client, buffers, retry
+      // lane, and shutdown lifecycle.
       nextClient = createClient({ url, database, ...credentials });
-      await nextClient.command({ query: DDL(TABLE) });
-      for (const alter of EVENT_ALTERS) await nextClient.command({ query: `ALTER TABLE ${TABLE} ${alter}` });
-      // CREATE IF NOT EXISTS does not update an existing table. Explicitly enable the local
-      // MergeTree deduplication log so retrying an ambiguously acknowledged batch with the same
-      // token is idempotent on both fresh and upgraded installations.
-      await nextClient.command({
-        query: `ALTER TABLE ${TABLE} MODIFY SETTING non_replicated_deduplication_window = ${EVENT_DEDUPLICATION_WINDOW}`,
-      });
-      await nextClient.command({ query: COLLECTOR_HEARTBEAT_DDL });
-      await nextClient.command({ query: CONFIG_DDL });
-      await nextClient.command({ query: NOTIFICATION_DELIVERY_DDL });
-      await nextClient.command({ query: IDENTITY_AI_REVIEW_DDL });
-      await nextClient.command({ query: AUDIT_FACT_DDL });
-      await nextClient.command({ query: EVENT_COMMIT_FACT_DDL });
-      await nextClient.command({ query: EVENT_COMMIT_FACT_MV_DDL });
-      await nextClient.command({ query: DASHBOARD_BUCKET_SNAPSHOT_DDL });
-      const committed = await nextClient.query({
-        query: `
-          SELECT
-            sourceId,
-            collectorId,
-            max(at) AS committedThrough,
-            max(ingestedAt) AS committedAt
-          FROM ${TABLE}
-          GROUP BY sourceId, collectorId
-        `,
-        format: 'JSONEachRow',
-      });
-      const committedRows = (await committed.json()) as Array<{
-        sourceId?: string;
-        collectorId?: string;
-        committedThrough?: string | number;
-        committedAt?: string | number;
-      }>;
-      this.committedSourceProgress.clear();
-      for (const row of committedRows) {
-        const committedEventTimeMs = Number(row.committedThrough);
-        if (!Number.isFinite(committedEventTimeMs) || committedEventTimeMs <= 0) continue;
-        const sourceId = row.sourceId?.trim() || undefined;
-        const collectorId = row.collectorId?.trim() || undefined;
-        this.committedSourceProgress.set(`${sourceId ?? ''}\0${collectorId ?? ''}`, {
-          sourceId,
-          collectorId,
-          committedEventTimeMs,
-          committedAtMs: Number(row.committedAt) || committedEventTimeMs,
+      const ping = await nextClient.ping({ select: true });
+      if (!ping.success) throw ping.error;
+      for (const entry of bootstrap.committedSourceProgress) {
+        const key = `${entry.sourceId ?? ''}\0${entry.collectorId ?? ''}`;
+        const previous = this.committedSourceProgress.get(key);
+        this.committedSourceProgress.set(key, {
+          sourceId: entry.sourceId,
+          collectorId: entry.collectorId,
+          committedEventTimeMs: Math.max(
+            previous?.committedEventTimeMs ?? 0,
+            entry.committedEventTimeMs,
+          ),
+          committedAtMs: Math.max(previous?.committedAtMs ?? 0, entry.committedAtMs),
         });
       }
-      const committedThrough = committedRows.reduce(
-        (maximum, row) => Math.max(maximum, Number(row.committedThrough) || 0),
-        0,
-      );
-      this.committedThroughMs = Number.isFinite(committedThrough) && committedThrough > 0
-        ? committedThrough
-        : undefined;
       await this.client?.close().catch(() => undefined);
       this.client = nextClient;
       nextClient = undefined;
@@ -1002,7 +1099,6 @@ export class ClickHouseStore {
       return { ok: true, error: '' };
     } catch (error) {
       this.ready = false;
-      await boot?.close().catch(() => undefined);
       await nextClient?.close().catch(() => undefined);
       return {
         ok: false,
@@ -3379,7 +3475,7 @@ export class ClickHouseStore {
       this.flushInFlight ||
       this.immediateWritesInFlight > 0
     ) return undefined;
-    return this.committedThroughMs;
+    return this.committedBoundaryComplete ? this.committedThroughMs : undefined;
   }
 
   committedProgress(): CommittedSourceProgress[] {
