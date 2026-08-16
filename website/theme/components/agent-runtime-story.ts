@@ -37,7 +37,7 @@ export type StoryChapter = {
 export const CHAPTERS: StoryChapter[] = [
   {
     key: 'scan',
-    duration: 2200,
+    duration: 1300,
     announcement: '初始化安全智能体以只读方式扫描本机中的智能体。',
     announcementEn:
       'The initialization security agent scans local agents in read-only mode.',
@@ -45,7 +45,7 @@ export const CHAPTERS: StoryChapter[] = [
   },
   {
     key: 'reveal',
-    duration: 4800,
+    duration: 3000,
     announcement:
       '扫描锁定目标后，初始化智能体擦开黑幕，显露已经存在并运行的工作环境。',
     announcementEn:
@@ -54,7 +54,7 @@ export const CHAPTERS: StoryChapter[] = [
   },
   {
     key: 'work',
-    duration: 3000,
+    duration: 2200,
     announcement:
       '工作智能体先完成版本检查、测试和读取配置等低风险任务，随后接收到一个未签名远程任务。',
     announcementEn:
@@ -155,7 +155,7 @@ export const CHAPTERS: StoryChapter[] = [
   },
   {
     key: 'l3-review',
-    duration: 7500,
+    duration: 8300,
     announcement:
       'L3 安全审查智能体依次核验攻击意图、行为轨迹和主机指标，并锁定三类证据。',
     announcementEn:
@@ -164,7 +164,7 @@ export const CHAPTERS: StoryChapter[] = [
   },
   {
     key: 'report',
-    duration: 5000,
+    duration: 5800,
     announcement: 'L3 将证据收敛为远程代码植入安全报告，并给出严重风险结论。',
     announcementEn:
       'L3 consolidates the evidence into a remote-code-implant report and reaches a critical-risk conclusion.',
@@ -172,7 +172,7 @@ export const CHAPTERS: StoryChapter[] = [
   },
   {
     key: 'rule',
-    duration: 5300,
+    duration: 6200,
     announcement:
       '系统从安全报告中抽取获取、写入和 Shell 行为链，生成拒绝规则并安装到执行前门控。',
     announcementEn:
@@ -197,7 +197,7 @@ export const CHAPTERS: StoryChapter[] = [
   },
   {
     key: 'finale',
-    duration: 3000,
+    duration: 4000,
     announcement: 'AnySentry 让一次被看见的风险，在下一次执行前直接被治理。',
     announcementEn:
       'AnySentry turns a risk seen once into governance before the next execution.',

@@ -650,10 +650,10 @@
   animation: scanFlicker 520ms steps(2, end) infinite;
 }
 .scan-layer.story-is-current .scan-progress-hot {
-  animation: scanProgress 1.65s 220ms steps(18, end) both;
+  animation: scanProgress 1.05s 90ms steps(14, end) both;
 }
 .scan-layer.story-is-current .scan-sweep {
-  animation: scanSweep 1.65s 220ms linear both;
+  animation: scanSweep 1.05s 90ms cubic-bezier(0.4, 0, 0.2, 1) both;
 }
 
 @keyframes scanFlicker {
@@ -798,26 +798,26 @@
 }
 
 .theatre-screen[data-chapter='work'] .safe-task {
-  animation: taskCommit 520ms steps(3, end) both;
+  animation: taskCommit 360ms steps(3, end) both;
 }
 .theatre-screen[data-chapter='work'] .safe-task-two {
-  animation-delay: 0.62s;
+  animation-delay: 0.34s;
 }
 .theatre-screen[data-chapter='work'] .safe-task-three {
-  animation-delay: 1.24s;
+  animation-delay: 0.68s;
 }
 .theatre-screen[data-chapter='reveal'] .suspicious-task,
 .theatre-screen[data-chapter='reveal'] .monitor-remote-job {
   opacity: 0;
 }
 .theatre-screen[data-chapter='work'] .suspicious-task {
-  animation: suspiciousTaskIn 640ms 2.12s steps(5, end) both;
+  animation: suspiciousTaskIn 420ms 1.18s steps(5, end) both;
 }
 .theatre-screen[data-chapter='work'] .monitor-remote-job {
-  animation: remoteJobIn 620ms 2.14s steps(5, end) both;
+  animation: remoteJobIn 420ms 1.2s steps(5, end) both;
 }
 .theatre-screen[data-chapter='work'] .terminal-note {
-  animation: normalTaskYield 380ms 2.04s steps(3, end) both;
+  animation: normalTaskYield 280ms 1.12s steps(3, end) both;
 }
 .theatre-screen:is(
     [data-chapter='intent'],
@@ -1004,7 +1004,7 @@
 }
 .theatre-screen[data-chapter='work'] .monitor-work-lines text:nth-child(3),
 .theatre-screen[data-chapter='work'] .monitor-work-lines text:nth-child(4) {
-  animation: monitorLineIn 520ms 1.45s steps(4, end) both;
+  animation: monitorLineIn 360ms 0.82s steps(4, end) both;
 }
 .monitor-cursor {
   fill: var(--observe);
@@ -1034,7 +1034,7 @@
   stroke-dasharray: 4 4;
 }
 .theatre-screen[data-chapter='work'] .side-source-route {
-  animation: sourceRouteIn 760ms 2.05s steps(5, end) both;
+  animation: sourceRouteIn 420ms 1.12s steps(5, end) both;
 }
 .theatre-screen:is(
     [data-chapter='intent'],
@@ -1181,13 +1181,13 @@
 }
 .theatre-screen[data-chapter='work'] .device-pulse {
   opacity: 0.42;
-  animation: cablePulse 1.8s linear infinite;
+  animation: cablePulse 1.4s linear infinite;
 }
 .theatre-screen[data-chapter='work'] .device-pulse-two {
-  animation-delay: 520ms;
+  animation-delay: 360ms;
 }
 .theatre-screen[data-chapter='work'] .device-pulse-three {
-  animation-delay: 980ms;
+  animation-delay: 720ms;
 }
 
 @keyframes cablePulse {
@@ -1458,13 +1458,13 @@
 .theatre-screen:is([data-chapter='reveal'], [data-chapter='work'])
   .worker-desk
   .worker-arm-back {
-  animation: typeLeft 560ms steps(2, end) infinite;
+  animation: typeLeft 440ms steps(2, end) infinite;
 }
 
 .theatre-screen:is([data-chapter='reveal'], [data-chapter='work'])
   .worker-desk
   .worker-arm-front {
-  animation: typeRight 560ms 280ms steps(2, end) infinite;
+  animation: typeRight 440ms 220ms steps(2, end) infinite;
 }
 
 .worker-intent .worker-body {
@@ -1832,10 +1832,10 @@
   filter: url(#soft-cyan);
 }
 .wipe-curtain.story-is-current .wipe-black {
-  animation: curtainErase 4.55s linear both;
+  animation: curtainErase 2.85s cubic-bezier(0.4, 0, 0.2, 1) both;
 }
 .wipe-curtain.story-is-current .wipe-edge {
-  animation: curtainEdge 4.55s linear both;
+  animation: curtainEdge 2.85s cubic-bezier(0.4, 0, 0.2, 1) both;
 }
 
 @keyframes curtainErase {
@@ -1872,7 +1872,7 @@
   transform: translate(-320px, 646px);
 }
 .cleaner-layer.story-is-current .cleaner-travel {
-  animation: cleanerRoute 4.55s linear both;
+  animation: cleanerRoute 2.85s cubic-bezier(0.4, 0, 0.2, 1) both;
 }
 
 .cleaner-track {
@@ -1965,13 +1965,13 @@
   transform-origin: 18% 90%;
 }
 .cleaner-layer.story-is-current .cleaner-wheel {
-  animation: wheelSpin 400ms linear infinite;
+  animation: wheelSpin 260ms linear infinite;
 }
 .cleaner-layer.story-is-current .cleaner-arm {
-  animation: brushPressure 640ms steps(2, end) infinite;
+  animation: brushPressure 420ms steps(2, end) infinite;
 }
 .cleaner-layer.story-is-current .wipe-flecks {
-  animation: fleckScatter 570ms steps(3, end) infinite;
+  animation: fleckScatter 360ms steps(3, end) infinite;
 }
 
 @keyframes cleanerRoute {
