@@ -463,6 +463,12 @@ function verifyStreamingManifest() {
     jobSubmit?.source,
   );
   assert(
+    'Flink submit controller treats one exact non-terminal job name as active',
+    jobSubmit?.source.includes("grep -Eq ' : AnySentry Flink Shadow Risk \\([[:upper:]_]+\\)$'") &&
+      !jobSubmit?.source.includes('AnySentry Flink Shadow Risk (RUNNING)'),
+    jobSubmit?.source,
+  );
+  assert(
     'Stream Worker consumes Flink findings and episodes',
     /dist\/security-monitoring\/stream-worker-main\.js/u.test(streamWorker?.source ?? '') &&
       /\{\s*name:\s*ANYSENTRY_STREAM_WORKER_ROLE,\s*value:\s*"all"\s*\}/u.test(streamWorker?.source ?? ''),

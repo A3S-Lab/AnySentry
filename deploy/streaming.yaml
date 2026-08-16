@@ -296,7 +296,7 @@ spec:
               until flink list -m flink-jobmanager:8081 >/dev/null 2>&1; do sleep 2; done
               while true; do
                 if flink list -m flink-jobmanager:8081 2>/dev/null \
-                  | grep -Fq "AnySentry Flink Shadow Risk (RUNNING)"; then
+                  | grep -Eq ' : AnySentry Flink Shadow Risk \([[:upper:]_]+\)$'; then
                   sleep 15
                   continue
                 fi
