@@ -1,4 +1,8 @@
+import { TOTAL_DURATION } from './agent-runtime-story';
+
 export type Locale = 'zh' | 'en';
+
+const RUNTIME_STORY_SECONDS = Math.round(TOTAL_DURATION / 1000);
 
 export const copy = {
   zh: {
@@ -288,7 +292,7 @@ export const copy = {
       },
     },
     runtimeStory: {
-      eyebrow: '64 秒运行时治理实录',
+      eyebrow: `${RUNTIME_STORY_SECONDS} 秒运行时治理实录`,
       title: '一次风险如何从发现走向阻断',
       titleLines: ['一次风险如何', '从发现走向阻断'],
       body: '保留完整运行过程：发现 Agent、捕获内核事实、完成 L1/L2/L3 研判、生成规则，并在相似动作再次执行前完成阻断。',
@@ -836,7 +840,7 @@ export const copy = {
       },
     },
     runtimeStory: {
-      eyebrow: '64-second runtime governance replay',
+      eyebrow: `${RUNTIME_STORY_SECONDS}-second runtime governance replay`,
       title: 'How one risk travels from discovery to prevention',
       titleLines: ['How one risk travels', 'from discovery to prevention'],
       body: 'The full sequence stays intact: discover the Agent, capture kernel facts, complete L1/L2/L3 judgment, generate policy, and stop a similar action before execution.',

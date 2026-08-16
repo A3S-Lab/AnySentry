@@ -1705,47 +1705,112 @@
 .theatre-screen[data-chapter='command'] .command-line {
   fill: #ffd7de;
   opacity: 1;
-  filter: url(#soft-red);
+  stroke: rgba(255, 70, 106, 0.16);
+  stroke-width: 0.55px;
+  paint-order: stroke fill;
   clip-path: inset(0 100% 0 0);
-}
-
-.theatre-screen[data-chapter='command'] .command-line-one {
-  animation:
-    commandType 228ms 300ms steps(6, end) both,
-    commandDim 180ms 566ms linear forwards;
-}
-.theatre-screen[data-chapter='command'] .command-line-two {
-  animation:
-    commandType 1444ms 566ms steps(38, end) both,
-    commandDim 180ms 2048ms linear forwards;
-}
-.theatre-screen[data-chapter='command'] .command-line-three {
-  animation:
-    commandType 912ms 2048ms steps(24, end) both,
-    commandDim 180ms 2998ms linear forwards;
-}
-.theatre-screen[data-chapter='command'] .command-line-four {
-  animation: commandType 1026ms 2998ms steps(27, end) both;
 }
 
 .command-cursor {
   fill: #ff466a;
   opacity: 0;
-  filter: url(#soft-red);
   transform-box: fill-box;
   transform-origin: left center;
 }
-.theatre-screen[data-chapter='command'] .command-cursor-one {
-  animation: commandCursorOne 228ms 300ms steps(6, end) forwards;
+
+.command-line-one,
+.command-cursor-one {
+  --command-delay: 180ms;
 }
-.theatre-screen[data-chapter='command'] .command-cursor-two {
-  animation: commandCursorTwo 1444ms 566ms steps(38, end) forwards;
+.command-copy[data-locale='zh'] .command-line-one,
+.command-copy[data-locale='zh'] .command-cursor-one {
+  --command-duration: 300ms;
+  --command-steps: 6;
+  --command-distance: 76px;
 }
-.theatre-screen[data-chapter='command'] .command-cursor-three {
-  animation: commandCursorThree 912ms 2048ms steps(24, end) forwards;
+.command-copy[data-locale='en'] .command-line-one,
+.command-copy[data-locale='en'] .command-cursor-one {
+  --command-duration: 570ms;
+  --command-steps: 19;
+  --command-distance: 146px;
 }
-.theatre-screen[data-chapter='command'] .command-cursor-four {
-  animation: commandCursorFour 1026ms 2998ms steps(27, end) forwards;
+.command-copy[data-locale='zh'] .command-line-one {
+  --command-dim-delay: 560ms;
+}
+.command-copy[data-locale='en'] .command-line-one {
+  --command-dim-delay: 830ms;
+}
+
+.command-copy[data-locale='zh'] .command-line-two,
+.command-copy[data-locale='zh'] .command-cursor-two {
+  --command-delay: 560ms;
+}
+.command-copy[data-locale='en'] .command-line-two,
+.command-copy[data-locale='en'] .command-cursor-two {
+  --command-delay: 830ms;
+}
+.command-line-two,
+.command-cursor-two {
+  --command-duration: 1110ms;
+  --command-steps: 37;
+  --command-distance: 284px;
+}
+.command-copy[data-locale='zh'] .command-line-two {
+  --command-dim-delay: 1750ms;
+}
+.command-copy[data-locale='en'] .command-line-two {
+  --command-dim-delay: 2020ms;
+}
+
+.command-copy[data-locale='zh'] .command-line-three,
+.command-copy[data-locale='zh'] .command-cursor-three {
+  --command-delay: 1750ms;
+}
+.command-copy[data-locale='en'] .command-line-three,
+.command-copy[data-locale='en'] .command-cursor-three {
+  --command-delay: 2020ms;
+}
+.command-line-three,
+.command-cursor-three {
+  --command-duration: 690ms;
+  --command-steps: 23;
+  --command-distance: 177px;
+}
+.command-copy[data-locale='zh'] .command-line-three {
+  --command-dim-delay: 2520ms;
+}
+.command-copy[data-locale='en'] .command-line-three {
+  --command-dim-delay: 2790ms;
+}
+
+.command-copy[data-locale='zh'] .command-line-four,
+.command-copy[data-locale='zh'] .command-cursor-four {
+  --command-delay: 2520ms;
+}
+.command-copy[data-locale='en'] .command-line-four,
+.command-copy[data-locale='en'] .command-cursor-four {
+  --command-delay: 2790ms;
+}
+.command-line-four,
+.command-cursor-four {
+  --command-duration: 780ms;
+  --command-steps: 26;
+  --command-distance: 200px;
+}
+
+.theatre-screen[data-chapter='command'] .command-line:not(.command-line-four) {
+  animation:
+    commandType var(--command-duration) var(--command-delay)
+      steps(var(--command-steps), end) both,
+    commandDim 180ms var(--command-dim-delay) linear forwards;
+}
+.theatre-screen[data-chapter='command'] .command-line-four {
+  animation: commandType var(--command-duration) var(--command-delay)
+    steps(var(--command-steps), end) both;
+}
+.theatre-screen[data-chapter='command'] .command-cursor {
+  animation: commandCursorTrack var(--command-duration) var(--command-delay)
+    steps(var(--command-steps), end) forwards;
 }
 .command-projection.story-is-current {
   transform-box: fill-box;
@@ -1768,44 +1833,14 @@
     filter: none;
   }
 }
-@keyframes commandCursorOne {
-  0%,
-  96% {
-    opacity: 1;
-  }
-  100% {
-    opacity: 0;
-    transform: translateX(46px);
-  }
-}
-@keyframes commandCursorTwo {
+@keyframes commandCursorTrack {
   0%,
   99% {
     opacity: 1;
   }
   100% {
     opacity: 0;
-    transform: translateX(291px);
-  }
-}
-@keyframes commandCursorThree {
-  0%,
-  98% {
-    opacity: 1;
-  }
-  100% {
-    opacity: 0;
-    transform: translateX(184px);
-  }
-}
-@keyframes commandCursorFour {
-  0%,
-  99% {
-    opacity: 1;
-  }
-  100% {
-    opacity: 0;
-    transform: translateX(207px);
+    transform: translateX(var(--command-distance));
   }
 }
 @keyframes dialogEnter {
@@ -2173,22 +2208,22 @@
 .theatre-screen[data-chapter='kernel'] .kernel-core {
   transform-box: fill-box;
   transform-origin: center;
-  animation: kernelRead 1.1s steps(8, end) infinite;
+  animation: kernelRead 960ms steps(8, end) infinite;
 }
 .theatre-screen[data-chapter='kernel'] .kernel-sensor {
-  animation: sensorRead 460ms steps(2, end) both;
+  animation: sensorRead 400ms steps(2, end) both;
 }
 .theatre-screen[data-chapter='kernel'] .sensor-two {
-  animation-delay: 0.55s;
+  animation-delay: 0.48s;
 }
 .theatre-screen[data-chapter='kernel'] .sensor-three {
-  animation-delay: 1.1s;
+  animation-delay: 0.96s;
 }
 .theatre-screen[data-chapter='kernel'] .sensor-four {
-  animation-delay: 1.65s;
+  animation-delay: 1.44s;
 }
 .theatre-screen[data-chapter='kernel'] .evidence-capsule {
-  animation: capsulePrint 720ms 2.45s steps(4, end) both;
+  animation: capsulePrint 620ms 2.08s steps(4, end) both;
 }
 
 @keyframes kernelRead {
@@ -2293,22 +2328,22 @@
 .theatre-screen[data-chapter='l1'] .l1-input-packet {
   offset-path: path('M 937 310 H 963');
   offset-rotate: 0deg;
-  animation: shortPacket 540ms 180ms ease-out both;
+  animation: shortPacket 480ms 140ms ease-out both;
 }
 .theatre-screen[data-chapter='l1'] .l1-scanline {
-  animation: l1Scan 1.75s 640ms steps(8, end) both;
+  animation: l1Scan 1.5s 550ms steps(8, end) both;
 }
 .theatre-screen[data-chapter='l1'] .hit-one {
-  animation: checkReveal 280ms 1.15s steps(2, end) both;
+  animation: checkReveal 240ms 1s steps(2, end) both;
 }
 .theatre-screen[data-chapter='l1'] .hit-two {
-  animation: checkReveal 280ms 1.75s steps(2, end) both;
+  animation: checkReveal 240ms 1.5s steps(2, end) both;
 }
 .theatre-screen[data-chapter='l1'] .check-none {
-  animation: checkReveal 280ms 2.28s steps(2, end) both;
+  animation: checkReveal 240ms 1.95s steps(2, end) both;
 }
 .theatre-screen[data-chapter='l1'] .l1-slip {
-  animation: slipReveal 420ms 2.75s steps(3, end) both;
+  animation: slipReveal 360ms 2.45s steps(3, end) both;
 }
 
 .escalation-rail {
@@ -2332,7 +2367,7 @@
 .l1-escalation-layer.story-is-current .l1-report-packet {
   offset-path: path('M 1035 338 V 355');
   offset-rotate: 0deg;
-  animation: escalationPacket 920ms ease-in-out both;
+  animation: escalationPacket 800ms ease-in-out both;
 }
 
 .l2-chain .chain-boxes {
@@ -2362,24 +2397,24 @@
   fill: #ff9d6c;
 }
 .theatre-screen[data-chapter='l2'] .chain-boxes {
-  animation: chainBuild 1.8s 520ms steps(3, end) both;
+  animation: chainBuild 1.55s 400ms steps(3, end) both;
 }
 .theatre-screen[data-chapter='l2'] .chain-links {
-  animation: linkBuild 1.25s 1.05s linear both;
+  animation: linkBuild 1.05s 900ms linear both;
 }
 .theatre-screen[data-chapter='l2'] .chain-found {
-  animation: checkReveal 360ms 2.25s steps(3, end) both;
+  animation: checkReveal 300ms 2s steps(3, end) both;
 }
 .theatre-screen[data-chapter='l2'] .context-required {
-  animation: checkReveal 360ms 2.75s steps(3, end) both;
+  animation: checkReveal 300ms 2.48s steps(3, end) both;
 }
 .theatre-screen[data-chapter='l2'] .l2-slip {
-  animation: slipReveal 420ms 3.3s steps(3, end) both;
+  animation: slipReveal 360ms 3.02s steps(3, end) both;
 }
 .l2-escalation-layer.story-is-current .l2-report-packet {
   offset-path: path('M 1108 436 H 1135');
   offset-rotate: 0deg;
-  animation: escalationPacket 920ms ease-in-out both;
+  animation: escalationPacket 800ms ease-in-out both;
 }
 
 @keyframes shortPacket {
@@ -2627,39 +2662,39 @@
 }
 
 .theatre-screen[data-chapter='l3-arrival'] .security-travel {
-  animation: securityEnter 900ms cubic-bezier(0.12, 0.76, 0.22, 1) both;
+  animation: securityEnter 780ms cubic-bezier(0.12, 0.76, 0.22, 1) both;
 }
 .theatre-screen[data-chapter='l3-arrival'] .security-body {
-  animation: securityArrivalBody 900ms ease-out both;
+  animation: securityArrivalBody 780ms ease-out both;
 }
 .theatre-screen[data-chapter='l3-arrival'] .security-leg-front,
 .theatre-screen[data-chapter='l3-arrival'] .security-arm-back {
-  animation: arrivalLimbFront 900ms ease-out both;
+  animation: arrivalLimbFront 780ms ease-out both;
 }
 .theatre-screen[data-chapter='l3-arrival'] .security-leg-back,
 .theatre-screen[data-chapter='l3-arrival'] .security-upper-arm {
-  animation: arrivalLimbBack 900ms ease-out both;
+  animation: arrivalLimbBack 780ms ease-out both;
 }
 .theatre-screen[data-chapter='l3-review'] .security-head {
-  animation: securityHeadReview 7.5s ease-in-out both;
+  animation: securityHeadReview 5.4s ease-in-out both;
 }
 .theatre-screen[data-chapter='l3-review'] .security-upper-arm {
-  animation: securityReviewUpperArm 7.5s cubic-bezier(0.35, 0.05, 0.24, 1) both;
+  animation: securityReviewUpperArm 5.4s cubic-bezier(0.35, 0.05, 0.24, 1) both;
 }
 .theatre-screen[data-chapter='l3-review'] .security-forearm {
-  animation: securityReviewForearm 7.5s cubic-bezier(0.35, 0.05, 0.24, 1) both;
+  animation: securityReviewForearm 5.4s cubic-bezier(0.35, 0.05, 0.24, 1) both;
 }
 .theatre-screen[data-chapter='l3-review'] .security-scanner {
-  animation: securityReviewScanner 7.5s cubic-bezier(0.35, 0.05, 0.24, 1) both;
+  animation: securityReviewScanner 5.4s cubic-bezier(0.35, 0.05, 0.24, 1) both;
 }
 .theatre-screen[data-chapter='l3-review'] .security-lens-screen {
-  animation: securityLensRead 7.5s steps(1, end) both;
+  animation: securityLensRead 5.4s steps(1, end) both;
 }
 .theatre-screen[data-chapter='l3-review'] .scanner-aperture {
-  animation: securityApertureRead 7.5s steps(1, end) both;
+  animation: securityApertureRead 5.4s steps(1, end) both;
 }
 .theatre-screen[data-chapter='report'] .security-upper-arm {
-  animation: securityCommit 620ms 220ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  animation: securityCommit 520ms 180ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }
 
 @keyframes securityEnter {
@@ -2887,43 +2922,43 @@
   transform-origin: center;
 }
 .theatre-screen[data-chapter='l3-review'] .reel-context {
-  animation: reelInspect 820ms 720ms steps(5, end) both;
+  animation: reelInspect 650ms 520ms steps(5, end) both;
 }
 .theatre-screen[data-chapter='l3-review'] .reel-trajectory {
-  animation: reelInspect 820ms 2.8s steps(5, end) both;
+  animation: reelInspect 650ms 2s steps(5, end) both;
 }
 .theatre-screen[data-chapter='l3-review'] .reel-host {
-  animation: reelInspect 820ms 4.88s steps(5, end) both;
+  animation: reelInspect 650ms 3.48s steps(5, end) both;
 }
 .theatre-screen[data-chapter='l3-review'] .focus-one {
-  animation: evidenceFrame 1.05s 620ms ease-out both;
+  animation: evidenceFrame 820ms 450ms ease-out both;
 }
 .theatre-screen[data-chapter='l3-review'] .focus-two {
-  animation: evidenceFrame 1.05s 2.7s ease-out both;
+  animation: evidenceFrame 820ms 1.93s ease-out both;
 }
 .theatre-screen[data-chapter='l3-review'] .focus-three {
-  animation: evidenceFrame 1.05s 4.78s ease-out both;
+  animation: evidenceFrame 820ms 3.41s ease-out both;
 }
 .theatre-screen[data-chapter='l3-review'] .node-one {
-  animation: evidenceNodeLock 360ms 1.55s steps(3, end) both;
+  animation: evidenceNodeLock 300ms 1.15s steps(3, end) both;
 }
 .theatre-screen[data-chapter='l3-review'] .node-two {
-  animation: evidenceNodeLock 360ms 3.63s steps(3, end) both;
+  animation: evidenceNodeLock 300ms 2.63s steps(3, end) both;
 }
 .theatre-screen[data-chapter='l3-review'] .node-three {
-  animation: evidenceNodeLock 360ms 5.71s steps(3, end) both;
+  animation: evidenceNodeLock 300ms 4.11s steps(3, end) both;
 }
 .theatre-screen[data-chapter='l3-review'] .intent-result {
-  animation: reviewResultWindow 1.62s 0.78s ease-out both;
+  animation: reviewResultWindow 1.2s 580ms ease-out both;
 }
 .theatre-screen[data-chapter='l3-review'] .trace-result {
-  animation: reviewResultWindow 1.62s 2.86s ease-out both;
+  animation: reviewResultWindow 1.2s 2.06s ease-out both;
 }
 .theatre-screen[data-chapter='l3-review'] .host-result {
-  animation: reviewResultWindow 1.62s 4.94s ease-out both;
+  animation: reviewResultWindow 1.2s 3.54s ease-out both;
 }
 .theatre-screen[data-chapter='l3-review'] .locked-result {
-  animation: lockedResultIn 420ms 6.45s steps(4, end) both;
+  animation: lockedResultIn 340ms 4.9s steps(4, end) both;
 }
 
 @keyframes reelInspect {
@@ -3065,22 +3100,22 @@
   animation: signalDash 420ms linear infinite;
 }
 .theatre-screen[data-chapter='report'] .security-report {
-  animation: reportRise 480ms 420ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  animation: reportRise 380ms 300ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }
 .theatre-screen[data-chapter='report'] .report-title {
-  animation: reportReveal 420ms 900ms steps(4, end) both;
+  animation: reportReveal 340ms 700ms steps(4, end) both;
 }
 .theatre-screen[data-chapter='report'] .report-finding {
-  animation: reportReveal 420ms 1.55s steps(4, end) both;
+  animation: reportReveal 340ms 1.25s steps(4, end) both;
 }
 .theatre-screen[data-chapter='report'] .report-evidence {
-  animation: reportReveal 420ms 2.35s steps(4, end) both;
+  animation: reportReveal 340ms 1.85s steps(4, end) both;
 }
 .theatre-screen[data-chapter='report'] .report-risk {
-  animation: reportReveal 420ms 3.15s steps(4, end) both;
+  animation: reportReveal 340ms 2.45s steps(4, end) both;
 }
 .theatre-screen[data-chapter='report'] .report-write {
-  animation: reportWrite 1.25s 3.45s linear both;
+  animation: reportWrite 1s 2.75s linear both;
 }
 
 @keyframes reportRise {
@@ -3155,28 +3190,28 @@
   opacity: 1;
 }
 .theatre-screen[data-chapter='rule'] .gate-empty {
-  animation: gateEmptyPhase 5.3s linear both;
+  animation: gateEmptyPhase 4.15s linear both;
 }
 .theatre-screen[data-chapter='rule'] .gate-armed {
-  animation: gateArmedPhase 5.3s linear both;
+  animation: gateArmedPhase 4.15s linear both;
 }
 .theatre-screen[data-chapter='rule'] .gate-card {
-  animation: gateCardInstall 5.3s linear both;
+  animation: gateCardInstall 4.15s linear both;
 }
 .theatre-screen[data-chapter='rule'] .slot-door-left {
-  animation: slotDoorLeft 5.3s linear both;
+  animation: slotDoorLeft 4.15s linear both;
 }
 .theatre-screen[data-chapter='rule'] .slot-door-right {
-  animation: slotDoorRight 5.3s linear both;
+  animation: slotDoorRight 4.15s linear both;
 }
 .theatre-screen[data-chapter='rule'] .gate-activation-path {
-  animation: gateActivate 620ms 4.25s ease-out both;
+  animation: gateActivate 500ms 3.4s ease-out both;
 }
 .theatre-screen[data-chapter='rule'] .gate-arm-top {
-  animation: gateSelfTop 520ms 4.55s ease-in-out both;
+  animation: gateSelfTop 420ms 3.72s ease-in-out both;
 }
 .theatre-screen[data-chapter='rule'] .gate-arm-bottom {
-  animation: gateSelfBottom 520ms 4.55s ease-in-out both;
+  animation: gateSelfBottom 420ms 3.72s ease-in-out both;
 }
 .theatre-screen[data-chapter='block'] .gate-armed {
   animation: gateArmedExit 420ms 240ms steps(3, end) both;
@@ -3331,7 +3366,7 @@
 .theatre-screen[data-chapter='rule'] .rule-source-slip {
   offset-path: path('M 1320 520 V 548 H 1292');
   offset-rotate: 0deg;
-  animation: reportToCompiler 820ms 180ms cubic-bezier(0.2, 0.75, 0.2, 1) both;
+  animation: reportToCompiler 680ms 150ms cubic-bezier(0.2, 0.75, 0.2, 1) both;
 }
 .compiler-title,
 .compiler-node,
@@ -3340,39 +3375,39 @@
   opacity: 0;
 }
 .theatre-screen[data-chapter='rule'] .compiler-title {
-  animation: compilerReveal 320ms 0.62s steps(3, end) both;
+  animation: compilerReveal 280ms 500ms steps(3, end) both;
 }
 .theatre-screen[data-chapter='rule'] .pattern-fetch {
-  animation: compilerReveal 320ms 0.95s steps(3, end) both;
+  animation: compilerReveal 280ms 800ms steps(3, end) both;
 }
 .theatre-screen[data-chapter='rule'] .link-one {
-  animation: linkBuild 300ms 1.25s linear both;
+  animation: linkBuild 260ms 1.08s linear both;
 }
 .theatre-screen[data-chapter='rule'] .pattern-write {
-  animation: compilerReveal 320ms 1.42s steps(3, end) both;
+  animation: compilerReveal 280ms 1.22s steps(3, end) both;
 }
 .theatre-screen[data-chapter='rule'] .link-two {
-  animation: linkBuild 300ms 1.72s linear both;
+  animation: linkBuild 260ms 1.48s linear both;
 }
 .theatre-screen[data-chapter='rule'] .pattern-shell {
-  animation: compilerReveal 320ms 1.9s steps(3, end) both;
+  animation: compilerReveal 280ms 1.65s steps(3, end) both;
 }
 .theatre-screen[data-chapter='rule'] .compiler-action {
-  animation: compilerActionLock 420ms 2.28s steps(4, end) both;
+  animation: compilerActionLock 360ms 1.95s steps(4, end) both;
 }
 .theatre-screen[data-chapter='rule'] .compiler-core rect:nth-child(1) {
-  animation: compilerPulse 420ms 1.25s steps(3, end) both;
+  animation: compilerPulse 360ms 1.08s steps(3, end) both;
 }
 .theatre-screen[data-chapter='rule'] .compiler-core rect:nth-child(2) {
-  animation: compilerPulse 420ms 1.7s steps(3, end) both;
+  animation: compilerPulse 360ms 1.45s steps(3, end) both;
 }
 .theatre-screen[data-chapter='rule'] .compiler-core rect:nth-child(3) {
-  animation: compilerPulse 420ms 2.15s steps(3, end) both;
+  animation: compilerPulse 360ms 1.82s steps(3, end) both;
 }
 .theatre-screen[data-chapter='rule'] .rule-cartridge {
   offset-path: path('M 1303 640 H 781 V 566');
   offset-rotate: 0deg;
-  animation: cartridgeRoute 1.68s 2.72s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  animation: cartridgeRoute 1.35s 2.25s cubic-bezier(0.2, 0.7, 0.2, 1) both;
 }
 .rule-layer.story-is-past .rule-cartridge {
   opacity: 0;
@@ -4049,6 +4084,12 @@
   .as-agent-story [class*='story-']::before,
   .as-agent-story [class*='story-']::after {
     scroll-behavior: auto !important;
+  }
+
+  .theatre-screen[data-chapter='command'] .command-line,
+  .theatre-screen[data-chapter='command'] .command-cursor {
+    animation-delay: 0ms !important;
+    animation-duration: 0.01ms !important;
   }
 
   .wipe-curtain.story-is-current .wipe-black {

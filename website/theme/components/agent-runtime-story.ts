@@ -104,7 +104,7 @@ export const CHAPTERS: StoryChapter[] = [
   },
   {
     key: 'kernel',
-    duration: 4000,
+    duration: 3500,
     announcement:
       'Linux 内核侧探针捕获执行、外联、写入和 Shell 四类事实并生成证据包。',
     announcementEn:
@@ -113,7 +113,7 @@ export const CHAPTERS: StoryChapter[] = [
   },
   {
     key: 'l1',
-    duration: 3800,
+    duration: 3300,
     announcement:
       'L1 快速筛查命中远程获取和管道执行模式，但没有现成规则能够终局判断。',
     announcementEn:
@@ -122,7 +122,7 @@ export const CHAPTERS: StoryChapter[] = [
   },
   {
     key: 'l1-escalate',
-    duration: 1300,
+    duration: 1100,
     announcement: 'L1 将初筛结果与内核证据一起升级到 L2。',
     announcementEn:
       'L1 escalates its preliminary result and kernel evidence to L2.',
@@ -130,7 +130,7 @@ export const CHAPTERS: StoryChapter[] = [
   },
   {
     key: 'l2',
-    duration: 4500,
+    duration: 3900,
     announcement:
       'L2 将外联、写入和 Shell 串成高风险行为链，但仍需 Agent 上下文。',
     announcementEn:
@@ -139,7 +139,7 @@ export const CHAPTERS: StoryChapter[] = [
   },
   {
     key: 'l2-escalate',
-    duration: 1300,
+    duration: 1100,
     announcement: 'L2 把结构化行为链升级到 L3 安全审查智能体。',
     announcementEn:
       'L2 escalates the structured behavior chain to the L3 security review agent.',
@@ -147,7 +147,7 @@ export const CHAPTERS: StoryChapter[] = [
   },
   {
     key: 'l3-arrival',
-    duration: 1000,
+    duration: 900,
     announcement: 'L3 安全审查智能体主动进入调查室并接手升级案件。',
     announcementEn:
       'The L3 security review agent enters the investigation and takes over the escalated case.',
@@ -155,7 +155,7 @@ export const CHAPTERS: StoryChapter[] = [
   },
   {
     key: 'l3-review',
-    duration: 8300,
+    duration: 6000,
     announcement:
       'L3 安全审查智能体依次核验攻击意图、行为轨迹和主机指标，并锁定三类证据。',
     announcementEn:
@@ -164,7 +164,7 @@ export const CHAPTERS: StoryChapter[] = [
   },
   {
     key: 'report',
-    duration: 5800,
+    duration: 4200,
     announcement: 'L3 将证据收敛为远程代码植入安全报告，并给出严重风险结论。',
     announcementEn:
       'L3 consolidates the evidence into a remote-code-implant report and reaches a critical-risk conclusion.',
@@ -172,7 +172,7 @@ export const CHAPTERS: StoryChapter[] = [
   },
   {
     key: 'rule',
-    duration: 6200,
+    duration: 4700,
     announcement:
       '系统从安全报告中抽取获取、写入和 Shell 行为链，生成拒绝规则并安装到执行前门控。',
     announcementEn:
@@ -197,7 +197,7 @@ export const CHAPTERS: StoryChapter[] = [
   },
   {
     key: 'finale',
-    duration: 4000,
+    duration: 3000,
     announcement: 'AnySentry 让一次被看见的风险，在下一次执行前直接被治理。',
     announcementEn:
       'AnySentry turns a risk seen once into governance before the next execution.',

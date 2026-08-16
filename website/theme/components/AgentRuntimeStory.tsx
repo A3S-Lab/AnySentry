@@ -804,7 +804,7 @@ function Scene({
           className="command-dialog-inner"
           d="M343 221h350l16 15v143l-16 15H343l-16-15V236z"
         />
-        <g className="command-copy">
+        <g className="command-copy" data-locale={locale}>
           <text className="command-line command-line-one" x="354" y="263">
             {text.execute}
           </text>
@@ -1495,7 +1495,7 @@ const finaleCopy = {
 
 const frameCopy = {
   zh: {
-    eyebrow: '64 秒运行实录',
+    eyebrow: (duration: number) => `${duration} 秒运行实录`,
     title: '智能体运行时治理实录',
     subtitle: '发现 Agent · 内核取证 · 分层研判 · 执行前治理',
     modeLabel: '观测模式',
@@ -1512,7 +1512,7 @@ const frameCopy = {
     standard: '动画离开画面后自动暂停，回到画面后继续播放。',
   },
   en: {
-    eyebrow: 'RUNTIME STORY / AUDIT REPLAY',
+    eyebrow: (duration: number) => `RUNTIME STORY / ${duration}s AUDIT REPLAY`,
     title: 'Agent runtime governance, reconstructed',
     subtitle: 'Discover · Observe · Judge · Govern before execution',
     modeLabel: 'OBSERVATION',
@@ -1541,6 +1541,8 @@ export function AgentRuntimeStory({ locale }: AgentRuntimeStoryProps) {
   const playback = usePlayback(isInView);
   const active = getChapterAt(playback.elapsed);
   const labels = frameCopy[locale];
+  const storyDurationSeconds = Math.round(TOTAL_DURATION / 1000);
+  const storyDuration = formatDuration(TOTAL_DURATION);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setSceneReady(true), 0);
@@ -1609,7 +1611,7 @@ export function AgentRuntimeStory({ locale }: AgentRuntimeStoryProps) {
       <header className="as-agent-story__header">
         <div className="as-agent-story__identity">
           <div>
-            <span>{labels.eyebrow}</span>
+            <span>{labels.eyebrow(storyDurationSeconds)}</span>
             <strong>{labels.title}</strong>
             <small>{labels.subtitle}</small>
           </div>
@@ -1624,7 +1626,7 @@ export function AgentRuntimeStory({ locale }: AgentRuntimeStoryProps) {
           </div>
           <div>
             <dt>{labels.durationLabel}</dt>
-            <dd>{formatDuration(TOTAL_DURATION)}</dd>
+            <dd>{storyDuration}</dd>
           </div>
         </dl>
       </header>
