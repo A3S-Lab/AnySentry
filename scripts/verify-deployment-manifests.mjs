@@ -411,6 +411,12 @@ function verifyStreamingManifest() {
     kinds: docs.map((doc) => `${doc.kind}/${doc.name}`),
   });
   assert(
+    'Kafka headless Service publishes its not-ready endpoint for single-node KRaft self-bootstrap',
+    /clusterIP:\s*None/u.test(kafkaService?.source ?? '') &&
+      /publishNotReadyAddresses:\s*true/u.test(kafkaService?.source ?? ''),
+    kafkaService?.source,
+  );
+  assert(
     'Kafka has startup/readiness/liveness protection and durable storage',
     /KAFKA_PROCESS_ROLES,\s*value:\s*"broker,controller"/u.test(kafka?.source ?? '') &&
       /startupProbe:/u.test(kafka?.source ?? '') &&
@@ -625,7 +631,7 @@ function verifyManualKubernetesLocalPathOverlay() {
   );
   assert(
     'Manual Kubernetes local-path overlay pins the AnySentry and Flink images by immutable local digests',
-    /newName:\s*127\.0\.0\.1:5000\/anysentry\s*\n\s*digest:\s*sha256:8419c54d74dc487dc7609263caba11e2e317f979f2e374a2e25d20cd80a1cced/u.test(kustomization) &&
+    /newName:\s*127\.0\.0\.1:5000\/anysentry\s*\n\s*digest:\s*sha256:f656891201648776371d4d8b5e20261f74ba7c22641d45571db8e984c6813072/u.test(kustomization) &&
       /newName:\s*127\.0\.0\.1:5000\/anysentry-flink-streaming\s*\n\s*digest:\s*sha256:bcce599325a53132a0e4495717878bcab53cbfc7724813ab83e6961ab934398c/u.test(kustomization) &&
       !/:latest\b/u.test(kustomization),
     kustomization,
@@ -648,7 +654,7 @@ function verifyManualKubernetesCoreOverlay() {
     'Manual Kubernetes core overlay stages canonical core with full runtime flags and one immutable image',
     /resources:\s*\n\s*-\s*\.\.\/\.\.\/anysentry\.yaml/u.test(kustomization) &&
       /path:\s*\.\.\/runtime-on\.yaml/u.test(kustomization) &&
-      /newName:\s*127\.0\.0\.1:5000\/anysentry\s*\n\s*digest:\s*sha256:8419c54d74dc487dc7609263caba11e2e317f979f2e374a2e25d20cd80a1cced/u.test(kustomization) &&
+      /newName:\s*127\.0\.0\.1:5000\/anysentry\s*\n\s*digest:\s*sha256:f656891201648776371d4d8b5e20261f74ba7c22641d45571db8e984c6813072/u.test(kustomization) &&
       !/streaming\.yaml/u.test(kustomization) &&
       !/:latest\b/u.test(kustomization),
     kustomization,

@@ -27,6 +27,10 @@ metadata:
   labels: { app: kafka }
 spec:
   clusterIP: None
+  # A single-node KRaft broker resolves its advertised controller address through this Service
+  # before the broker can become Ready. Publishing the StatefulSet endpoint during bootstrap avoids
+  # a readiness/DNS cycle where kafka:9093 cannot resolve until Kafka has already started.
+  publishNotReadyAddresses: true
   selector: { app: kafka }
   ports:
     - { name: broker, port: 9092, targetPort: 9092 }
