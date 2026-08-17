@@ -482,7 +482,7 @@ export const copy = {
     },
     cta: {
       eyebrow: '从一条真实事件开始',
-      title: '在自己的系统现场中验证 AnySentry',
+      title: '在自己的系统中验证 AnySentry',
       body: '启动本地证据平面，接入一个真实 Source，再沿 eventId 验证从运行事实、风险研判到 Runtime Guard 的完整链路。',
       primary: '打开快速开始',
       secondary: '在 GitHub 查看源码',
