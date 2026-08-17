@@ -350,6 +350,14 @@ export type SecuritySeverity = "info" | "low" | "medium" | "high" | "critical";
 export type AgentEventSource = "observer" | "synthetic" | "api";
 export type AgentDecisionStatus = "accepted" | "pending" | "running" | "succeeded" | "failed" | "timeout";
 export type AgentEventCategory = "tool" | "network" | "file" | "llm" | "security" | "process" | "runtime" | "unknown";
+export type ActivityContext = "agent_action" | "platform_healthcheck" | "collector_heartbeat";
+export type ActivitySubtype =
+  | "docker_healthcheck"
+  | "k8s_exec_probe"
+  | "k8s_liveness_probe"
+  | "k8s_readiness_probe"
+  | "k8s_startup_probe"
+  | "observer_heartbeat";
 export type AgentEventAttributeValue = string | number | boolean;
 export type IncidentStatus = "open" | "acknowledged" | "resolved";
 export type AgentHealthState = "active" | "idle" | "stale" | "risky";
@@ -428,6 +436,7 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   runId?: string;
   eventKind?: string;
   eventCategory?: AgentEventCategory;
+  activityContext?: ActivityContext;
   verdict?: SecurityVerdict;
   tier?: "Rules" | "Llm" | "Agent";
   q?: string;
@@ -442,6 +451,8 @@ export interface AgentEventListItem {
   at: string;
   eventKind: string;
   eventCategory: AgentEventCategory;
+  activityContext?: ActivityContext;
+  activitySubtype?: ActivitySubtype;
   source: AgentEventSource;
   subject: string;
   workspacePath: string;

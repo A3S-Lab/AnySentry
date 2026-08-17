@@ -209,6 +209,8 @@ await withoutExpectedErrorLogs(async () => {
 
   assert.equal(fake.state.calls.length, 2, '241 should retry the retained 500-row batch');
   assert.equal(fake.state.maxActive, 1, 'all event inserts must use one lane');
+  assert.equal(fake.state.calls[0].values[0].activityContext, 'agent_action');
+  assert.equal(fake.state.calls[0].values[0].activitySubtype, '');
   assert.deepEqual(
     fake.state.calls[1].values.map(({ eventId }) => eventId),
     fake.state.calls[0].values.map(({ eventId }) => eventId),
@@ -223,6 +225,23 @@ await withoutExpectedErrorLogs(async () => {
     batches: 0,
     permanentError: undefined,
   });
+  await store.close();
+});
+
+await withoutExpectedErrorLogs(async () => {
+  const fake = fakeClickHouse();
+  const store = storeFor(fake);
+  store.enqueue(event(501, {
+    eventCategory: 'runtime',
+    activityContext: 'platform_healthcheck',
+    activitySubtype: 'docker_healthcheck',
+  }));
+  await store.flush();
+  assert.equal(fake.state.calls.length, 1);
+  assert.equal(fake.state.calls[0].values[0].eventKind, 'ToolExec');
+  assert.equal(fake.state.calls[0].values[0].eventCategory, 'runtime');
+  assert.equal(fake.state.calls[0].values[0].activityContext, 'platform_healthcheck');
+  assert.equal(fake.state.calls[0].values[0].activitySubtype, 'docker_healthcheck');
   await store.close();
 });
 

@@ -452,7 +452,8 @@ function AgentCommandTrace({
       noise: "hide",
       agentAssetId: agent.agentAssetId,
       agentInstanceId: agent.agentInstanceId,
-      eventCategory: "tool",
+      eventKind: "ToolExec",
+      activityContext: "agent_action",
       limit: 80,
     }),
     {

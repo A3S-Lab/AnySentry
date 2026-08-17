@@ -40,8 +40,19 @@ const agentPod = {
   spec: {
     nodeName: 'node-a',
     containers: [
-      { name: 'agent', image: 'company/claw:v1' },
-      { name: 'metrics', image: 'company/metrics:v1' },
+      {
+        name: 'agent',
+        image: 'company/claw:v1',
+        livenessProbe: { exec: { command: ['/usr/bin/test', '-f', '/tmp/agent-ready'] } },
+        readinessProbe: { exec: { command: ['/usr/bin/test', '-f', '/tmp/agent-ready'] } },
+        startupProbe: { exec: { command: ['/usr/bin/test', '-f', '/tmp/agent-started'] } },
+      },
+      {
+        name: 'metrics',
+        image: 'company/metrics:v1',
+        livenessProbe: { httpGet: { path: '/healthz', port: 9090 } },
+        readinessProbe: { tcpSocket: { port: 9090 } },
+      },
     ],
   },
   status: {
@@ -83,6 +94,24 @@ assert.equal(nodeSnapshot.entries.find((entry) => entry.ids.includes(sidecarId))
 assert.equal(nodeSnapshot.entries.find((entry) => entry.ids.includes(agentId))?.agentScopeId, 'claw-agent');
 assert.equal(nodeSnapshot.entries.find((entry) => entry.ids.includes(agentId))?.containerImage, 'company/claw:v1');
 assert.equal(nodeSnapshot.entries.find((entry) => entry.ids.includes(agentId))?.ownerName, 'claw-agent');
+assert.deepEqual(
+  nodeSnapshot.entries.find((entry) => entry.ids.includes(agentId))?.platformHealthchecks,
+  [
+    { activitySubtype: 'k8s_liveness_probe', argv: ['/usr/bin/test', '-f', '/tmp/agent-ready'] },
+    { activitySubtype: 'k8s_readiness_probe', argv: ['/usr/bin/test', '-f', '/tmp/agent-ready'] },
+    { activitySubtype: 'k8s_startup_probe', argv: ['/usr/bin/test', '-f', '/tmp/agent-started'] },
+  ],
+);
+assert.equal(
+  nodeSnapshot.entries.find((entry) => entry.ids.includes(sidecarId))?.platformHealthchecks,
+  undefined,
+  'HTTP/TCP probes do not create container ToolExec metadata',
+);
+assert.equal(
+  nodeSnapshot.entries.find((entry) => entry.ids.includes('pod-agent-uid'))?.platformHealthchecks,
+  undefined,
+  'container probes are never attached to a Pod-wide identity',
+);
 assert.equal(
   service.snapshot('node-b').entries.find((entry) => entry.podUid === 'pod-infra-uid')?.classification,
   'unknown',

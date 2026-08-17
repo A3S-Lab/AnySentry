@@ -36,6 +36,7 @@ import {
 } from './query-coverage';
 import { CommitAwareFactBucketCache } from './commit-aware-fact-cache';
 import { foldLatestEventRevisions } from './event-revision';
+import { eventActivityContext, eventActivitySubtype } from './activity-context';
 import { resolveTimeWindow } from './time-window';
 import * as T from './types';
 
@@ -323,6 +324,7 @@ function durableEventSearchKey(filter: T.AgentEventQuery): string {
     // midnight ends at that instant even though Date.parse yields the same millisecond value.
     startTime: filter.startTime ?? '',
     endTime: filter.endTime ?? '',
+    snapshotAsOf: filter.snapshotAsOf ?? '',
     // Omitted scope compacts events; explicit raw scope does not, so these are not equivalent.
     scope: filter.scope ?? '',
     includeUnknown: filter.includeUnknown !== false,
@@ -332,6 +334,7 @@ function durableEventSearchKey(filter: T.AgentEventQuery): string {
     collectorId: text(filter.collectorId),
     agentId: text(filter.agentId),
     agentAssetId: text(filter.agentAssetId),
+    agentInstanceId: text(filter.agentInstanceId),
     sessionId: text(filter.sessionId),
     workspacePath: text(filter.workspacePath),
     traceId: text(filter.traceId),
@@ -339,6 +342,7 @@ function durableEventSearchKey(filter: T.AgentEventQuery): string {
     // eventKind and limit are used without text/round normalization by filterEvents/slice.
     eventKind: filter.eventKind ?? '',
     eventCategory: filter.eventCategory ?? '',
+    activityContext: filter.activityContext ?? '',
     verdict: filter.verdict ?? '',
     tier: filter.tier ?? '',
     q: text(filter.q).toLowerCase(),
@@ -362,7 +366,15 @@ function compactEventKey(e: T.JudgedEvent): string {
   const peer = e.eventKind === 'Egress' ? attrString(e, 'peer') + ':' + attrString(e, 'port') : '';
   const file = e.eventKind === 'FileAccess' || e.eventKind === 'FileDelete' ? attrString(e, 'path') : '';
   const subject = command || peer || file || e.subject;
-  return [agent, e.eventKind, e.verdict, e.riskCategory, subject].join('\0');
+  return [
+    agent,
+    e.eventKind,
+    eventActivityContext(e) ?? '',
+    eventActivitySubtype(e) ?? '',
+    e.verdict,
+    e.riskCategory,
+    subject,
+  ].join('\0');
 }
 
 function compactEvents(events: T.JudgedEvent[]): Array<{ event: T.JudgedEvent; repeatCount: number; lastAt: number }> {
@@ -381,6 +393,7 @@ function compactEvents(events: T.JudgedEvent[]): Array<{ event: T.JudgedEvent; r
 }
 
 function topologyTarget(e: T.JudgedEvent): { type: T.TopologyNodeType; key: string; label: string; subtitle?: string; edgeType: T.TopologyEdgeType; edgeLabel: string } | null {
+  if (eventActivityContext(e) === 'platform_healthcheck') return null;
   if (e.eventKind === 'ToolExec') {
     const argv = attrString(e, 'argv') || e.subject;
     const cmd = commandName(argv) || 'exec';
@@ -760,6 +773,8 @@ export class AggregationService {
       at: iso(e.at),
       eventKind: e.eventKind,
       eventCategory: e.eventCategory,
+      activityContext: eventActivityContext(e),
+      activitySubtype: eventActivitySubtype(e),
       source: e.source,
       subject: e.subject,
       workspacePath: e.workspacePath,
@@ -892,7 +907,7 @@ export class AggregationService {
     const traceId = filter.traceId?.trim();
     const runId = filter.runId?.trim();
     const q = filter.q?.trim().toLowerCase();
-    const hasFilter = Boolean(sourceId || collectorId || agentId || agentAssetId || agentInstanceId || sessionId || workspacePath || traceId || runId || filter.eventKind || filter.eventCategory || filter.verdict || filter.tier || q);
+    const hasFilter = Boolean(sourceId || collectorId || agentId || agentAssetId || agentInstanceId || sessionId || workspacePath || traceId || runId || filter.eventKind || filter.eventCategory || filter.activityContext || filter.verdict || filter.tier || q);
     const agentScoped = filter.scope === 'agent' && !pinnedEventId;
     const includeUnknown = filter.includeUnknown !== false;
     // Process lifecycle rows remain stored for audit/debugging, but are hidden from both the
@@ -920,6 +935,7 @@ export class AggregationService {
         (!runId || e.runId === runId) &&
         (!filter.eventKind || e.eventKind === filter.eventKind) &&
         (!filter.eventCategory || e.eventCategory === filter.eventCategory) &&
+        (!filter.activityContext || eventActivityContext(e) === filter.activityContext) &&
         (!filter.verdict || e.verdict === filter.verdict) &&
         (!filter.tier || e.tier === filter.tier) &&
         (!hideNoise || !isHiddenNoise);
@@ -1030,7 +1046,7 @@ export class AggregationService {
       : compactEvents(filtered);
     const hasDetailedFilter = Boolean(
       filter.sourceId || filter.collectorId || filter.agentId || filter.agentAssetId || filter.sessionId || filter.workspacePath ||
-      filter.traceId || filter.runId || filter.eventKind || filter.eventCategory || filter.verdict || filter.q,
+      filter.traceId || filter.runId || filter.eventKind || filter.eventCategory || filter.activityContext || filter.verdict || filter.q,
     );
     // A history aggregate cannot answer a text/identity-filtered total. Avoid an unrelated full
     // window scan and report the bounded compacted result set already fetched above.
@@ -1123,6 +1139,7 @@ export class AggregationService {
       runId: pinnedEventId ? undefined : filter.runId,
       eventKind: pinnedEventId ? undefined : filter.eventKind,
       eventCategory: pinnedEventId ? undefined : filter.eventCategory,
+      activityContext: pinnedEventId ? undefined : filter.activityContext,
       verdict: pinnedEventId ? undefined : filter.verdict,
       tier: pinnedEventId ? undefined : filter.tier,
       limit: scanLimit,
@@ -1219,12 +1236,21 @@ export class AggregationService {
     const persistentPage = await this.judge.searchStoredEventsPage({
       sinceMs: window.startMs,
       untilMs: persistedUntilMs,
+      sourceId: filter.sourceId,
+      collectorId: filter.collectorId,
+      agentId: filter.agentAssetId ? undefined : filter.agentId,
       traceId,
       runId: traceId ? undefined : filter.runId,
       sessionId: traceId || filter.runId ? undefined : filter.sessionId,
+      workspacePath: filter.agentAssetId ? undefined : filter.workspacePath,
       agentInstanceId: traceId || filter.runId || filter.sessionId
         ? undefined
         : filter.agentInstanceId,
+      eventKind: filter.eventKind,
+      eventCategory: filter.eventCategory,
+      activityContext: filter.activityContext,
+      verdict: filter.verdict,
+      tier: filter.tier,
       limit,
     });
     if (persistentPage.unavailable) {

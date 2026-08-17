@@ -13,6 +13,7 @@ import { DistributedCurrentStateService } from './distributed-current-state.serv
 import { RelationalBusinessStore } from './relational-business-store.service';
 import { resolveJudgmentRoute } from './identity-judgment-routing';
 import { isNewerEventRevision } from './event-revision';
+import { normalizeActivitySemantics } from './activity-context';
 import { CollectorHeartbeatOrigin, CollectorHeartbeatRecord, CollectorHeartbeatRequest, CollectorRawHeartbeatRequest, EventCategory, EventMeta, IdentityAiReviewRecord, Incident, IncidentStatus, JudgedEvent, JudgmentRouteReason, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
 
 const SEVERITY_SCORE: Record<Severity, number> = { info: 8, low: 28, medium: 52, high: 76, critical: 95 };
@@ -574,6 +575,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
 
   private eventBase(line: string, meta: EventMeta, at: number): JudgedEventBase {
     const eventKind = meta.eventKind ?? 'Event';
+    const activity = normalizeActivitySemantics(eventKind, meta.activityContext, meta.activitySubtype);
     const ids = { workspacePath: meta.workspacePath, agentId: meta.agentId, sessionId: meta.sessionId, userId: meta.userId };
     const attributes = meta.attributes ?? {};
     const process = meta.process ?? processFromAttributes(attributes);
@@ -586,7 +588,9 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       sourceEventId: meta.sourceEventId,
       at,
       eventKind,
-      eventCategory: meta.eventCategory ?? eventCategory(eventKind),
+      eventCategory: activity.eventCategory ?? meta.eventCategory ?? eventCategory(eventKind),
+      activityContext: activity.activityContext,
+      activitySubtype: activity.activitySubtype,
       source: meta.source ?? 'observer',
       subject: meta.subject ?? eventKind,
       ...ids,
@@ -899,6 +903,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
    *  so the dashboard counts ALL observer features. LlmApi carries real token usage. */
   judge(line: string, meta: EventMeta, at = Date.now()): JudgedEvent | null {
     const eventKind = meta.eventKind ?? 'Event';
+    const activity = normalizeActivitySemantics(eventKind, meta.activityContext, meta.activitySubtype);
     const tokenCount = meta.tokenCount ?? extractTokens(line, eventKind);
     const latencyMs = meta.latencyMs ?? 1; // L1 rule eval is sub-ms
     const ids = { workspacePath: meta.workspacePath, agentId: meta.agentId, sessionId: meta.sessionId, userId: meta.userId };
@@ -919,7 +924,9 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       sourceEventId: meta.sourceEventId,
       at,
       eventKind,
-      eventCategory: meta.eventCategory ?? eventCategory(eventKind),
+      eventCategory: activity.eventCategory ?? meta.eventCategory ?? eventCategory(eventKind),
+      activityContext: activity.activityContext,
+      activitySubtype: activity.activitySubtype,
       source: meta.source ?? 'observer',
       subject,
       ...ids,
@@ -1368,6 +1375,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const rec: CollectorHeartbeatRecord = {
       collectorId,
       at,
+      activityContext: 'collector_heartbeat',
+      activitySubtype: 'observer_heartbeat',
       origin,
       filterMetricsReportedAt,
       status,
@@ -1399,13 +1408,17 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   }
 
   private normalizeHydratedCollectorHeartbeat(rec: CollectorHeartbeatRecord): CollectorHeartbeatRecord {
-    if (rec.origin === 'raw_collector' || rec.origin === 'forwarder') return rec;
-    if (rec.filterMetricsReportedAt !== undefined) return { ...rec, origin: 'forwarder' };
+    const semantics = {
+      activityContext: 'collector_heartbeat' as const,
+      activitySubtype: 'observer_heartbeat' as const,
+    };
+    if (rec.origin === 'raw_collector' || rec.origin === 'forwarder') return { ...rec, ...semantics };
+    if (rec.filterMetricsReportedAt !== undefined) return { ...rec, origin: 'forwarder', ...semantics };
     const looksLikeLegacyRaw = (rec.mode === 'observe' || rec.mode?.startsWith('observe+') === true) &&
       Object.prototype.hasOwnProperty.call(rec.eventKindCounts ?? {}, 'ToolExec');
     return looksLikeLegacyRaw
-      ? { ...rec, origin: 'raw_collector', errorCount: 0 }
-      : { ...rec, origin: 'forwarder' };
+      ? { ...rec, origin: 'raw_collector', errorCount: 0, ...semantics }
+      : { ...rec, origin: 'forwarder', ...semantics };
   }
 
   private addCollectorHeartbeat(rec: CollectorHeartbeatRecord, persist = true, notify = true): void {

@@ -28,6 +28,7 @@ const { BoundedPriorityQueue } = require('./observer-priority-queue');
 const { ToolExecDeduper } = require('./observer-event-dedup');
 const {
   behaviorDiscoveryEligible,
+  classifyEventActivity,
   WorkloadIdentityCache,
 } = require('./observer-workload-filter');
 const { InfrastructureRootResolver } = require('./observer-infrastructure-roots');
@@ -1938,6 +1939,7 @@ function handleLine(raw) {
     return;
   }
   const workloadClassification = workloadCache.classify(o);
+  const activity = classifyEventActivity(o, processClassification, workloadClassification);
   const templateClassification = templateRegistry.classifyEvent(o);
   const baseClassification = mergeAttributionClassifications(
     processClassification,
@@ -2005,6 +2007,7 @@ function handleLine(raw) {
       line,
       sourceEventId: sourceEventId(line),
       ...(classification.attribution ? { attribution: classification.attribution } : {}),
+      ...(activity ?? {}),
       ...(COLLECTOR_ID ? { collectorId: COLLECTOR_ID } : {}),
       ...(NODE_NAME ? { nodeName: NODE_NAME } : {}),
       ...sourceFields(classification.state === 'agent' ? classification.workspacePath : ''),

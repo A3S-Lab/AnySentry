@@ -262,6 +262,8 @@ function EventDetail({
           <FieldValue label="Workspace" value={event.workspacePath} />
           <FieldValue label="Source" value={event.source} />
           <FieldValue label="Kind" value={event.eventKind} />
+          <FieldValue label="活动语义" value={event.activityContext} />
+          <FieldValue label="活动子类型" value={event.activitySubtype} />
         </div>
 
         <div className="grid gap-3 sm:grid-cols-4">

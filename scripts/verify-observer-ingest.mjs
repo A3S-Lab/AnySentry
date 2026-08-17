@@ -371,6 +371,8 @@ async function verifyCollectorHeartbeatProvenanceContract() {
   assert(
     'server-assigned raw provenance separates exec quality from operational health',
     raw.origin === 'raw_collector' &&
+      raw.activityContext === 'collector_heartbeat' &&
+      raw.activitySubtype === 'observer_heartbeat' &&
       raw.errorCount === 0 &&
       raw.execEvidence?.execIncomplete === 2 &&
       raw.execEvidence?.shutdownFinal === true &&
@@ -395,6 +397,8 @@ async function verifyCollectorHeartbeatProvenanceContract() {
   assert(
     'server-assigned forwarder provenance ignores raw-only evidence',
     forwarder.origin === 'forwarder' &&
+      forwarder.activityContext === 'collector_heartbeat' &&
+      forwarder.activitySubtype === 'observer_heartbeat' &&
       forwarder.errorCount === 2 &&
       forwarder.execEvidence === undefined &&
       forwarder.filterMetricsReportedAt === 2_000 &&
@@ -406,6 +410,8 @@ async function verifyCollectorHeartbeatProvenanceContract() {
   const legacyRaw = judge.normalizeHydratedCollectorHeartbeat({
     ...raw,
     origin: undefined,
+    activityContext: undefined,
+    activitySubtype: undefined,
     mode: 'observe+extensions',
     execEvidence: undefined,
     errorCount: 1_899,
@@ -414,6 +420,8 @@ async function verifyCollectorHeartbeatProvenanceContract() {
   assert(
     'legacy raw hydration removes exec-incomplete fallback and never replays notifications',
       legacyRaw.origin === 'raw_collector' &&
+      legacyRaw.activityContext === 'collector_heartbeat' &&
+      legacyRaw.activitySubtype === 'observer_heartbeat' &&
       legacyRaw.errorCount === 0 &&
       observed.length === notificationsBeforeHydration &&
       seeded.at(-1)?.collectorId === legacyRaw.collectorId,
@@ -580,8 +588,28 @@ async function verifyJudgeDispositionContract() {
       });
       assert(
         'Judge queued path retains and enqueues a supported event',
-        retained.disposition === 'retained' && retained.event?.decisionStatus === 'pending' && enqueued === 1,
+        retained.disposition === 'retained' &&
+          retained.event?.decisionStatus === 'pending' &&
+          retained.event?.activityContext === 'agent_action' &&
+          enqueued === 1,
         { retained, enqueued },
+      );
+      const platform = await judge.acceptWithDisposition('{}', {
+        ...meta,
+        activityContext: 'platform_healthcheck',
+        activitySubtype: 'k8s_readiness_probe',
+        attribution: { ...meta.attribution, classification: 'unknown', reason: 'not_evaluated', confidence: 0 },
+      });
+      assert(
+        'platform healthcheck keeps ToolExec and still enters the security judgment queue',
+        platform.disposition === 'retained' &&
+          platform.event?.eventKind === 'ToolExec' &&
+          platform.event?.eventCategory === 'runtime' &&
+          platform.event?.activityContext === 'platform_healthcheck' &&
+          platform.event?.activitySubtype === 'k8s_readiness_probe' &&
+          platform.event?.decisionStatus === 'pending' &&
+          enqueued === 2,
+        { platform, enqueued },
       );
     }
   }
@@ -774,6 +802,8 @@ async function verifyObserverToolEvent(sourceId, token) {
     event.source === 'observer' &&
     event.eventKind === 'ToolExec' &&
     event.eventCategory === 'tool' &&
+    event.activityContext === 'agent_action' &&
+    event.activitySubtype === undefined &&
     event.agentId === agentId &&
     event.workspacePath === workspacePath &&
     event.sessionId === `${runId}-tool-session` &&
@@ -800,6 +830,62 @@ async function verifyObserverToolEvent(sourceId, token) {
     (event.rawPreview ?? '').includes('ToolExec'),
   );
   return result.eventId;
+}
+
+async function verifyPlatformHealthcheckEvent(sourceId, token) {
+  const marker = `${runId}-declared-healthcheck`;
+  const line = observerLine(
+    { agent: `${runId}-health-agent`, session: `${runId}-health-session`, task: 'task-health' },
+    {
+      ToolExec: {
+        pid: 1313,
+        uid: 1001,
+        cwd: '/workspace/project',
+        argv: ['/bin/sh', '-c', `test -f /tmp/${marker} || exit 1`],
+        argv_truncated: false,
+        argv_incomplete: false,
+        exec_confirmed: true,
+      },
+    },
+  );
+  const result = await request('/ingest', 'POST', {
+    line,
+    collectorId: `${runId}-collector`,
+    sourceType: 'observer',
+    workspacePath: `repo://${runId}/healthcheck`,
+    activityContext: 'platform_healthcheck',
+    activitySubtype: 'docker_healthcheck',
+  }, sourceHeaders(sourceId, token));
+  assert('declared platform healthcheck remains a retained ToolExec', result.accepted === true && result.eventId, result);
+  await assertEvent('platform healthcheck keeps raw audit semantics while moving to runtime activity', result.eventId, (event) =>
+    event.eventKind === 'ToolExec' &&
+    event.eventCategory === 'runtime' &&
+    event.activityContext === 'platform_healthcheck' &&
+    event.activitySubtype === 'docker_healthcheck' &&
+    String(event.attributes?.argv ?? '').includes(marker),
+  );
+  const commandTrace = await request('/events/list', 'POST', {
+    timeType: 'last_30d',
+    q: marker,
+    includeUnknown: true,
+    eventKind: 'ToolExec',
+    activityContext: 'agent_action',
+    limit: 20,
+  });
+  assert('platform healthcheck is excluded from Agent command tracking', commandTrace.total === 0, commandTrace);
+  const runtimeEvents = await request('/events/list', 'POST', {
+    timeType: 'last_30d',
+    q: marker,
+    includeUnknown: true,
+    eventCategory: 'runtime',
+    activityContext: 'platform_healthcheck',
+    limit: 20,
+  });
+  assert(
+    'platform healthcheck remains visible in runtime event search',
+    runtimeEvents.total === 1 && runtimeEvents.items?.[0]?.eventId === result.eventId,
+    runtimeEvents,
+  );
 }
 
 async function verifyIncompleteObserverEvidence(sourceId, token) {
@@ -1697,6 +1783,7 @@ async function main() {
   await verifyRejectedObserverToken(source.sourceId);
   await verifyObserverDiscardDisposition();
   await verifyObserverToolEvent(source.sourceId, token);
+  await verifyPlatformHealthcheckEvent(source.sourceId, token);
   await verifyIncompleteObserverEvidence(source.sourceId, token);
   await verifyObserverBatch(source.sourceId, token);
   await verifyInternalL3RecursionSuppressed(source.sourceId, token);

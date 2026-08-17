@@ -250,6 +250,8 @@ function deriveMeta(line: string, given: Partial<T.EventMeta>): T.EventMeta {
     userId: given.userId ?? (uid != null ? `uid:${uid}` : 'system'),
     eventKind: given.eventKind ?? (isLlm ? 'LlmCall' : eventKey),
     eventCategory: given.eventCategory ?? eventCategory(isLlm ? 'LlmCall' : eventKey),
+    activityContext: given.activityContext,
+    activitySubtype: given.activitySubtype,
     source: given.source ?? 'observer',
     traceId: given.traceId,
     spanId: given.spanId,

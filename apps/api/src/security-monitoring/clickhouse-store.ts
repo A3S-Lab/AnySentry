@@ -12,6 +12,7 @@
 import { ClickHouseClient, createClient, type ClickHouseSettings } from '@clickhouse/client';
 import { createHash, randomUUID } from 'node:crypto';
 import { agentIdentityKeyForEvent, agentRuntimeInstanceIdForEvent, hasDirectAgentRootEvidence } from './agent-identity';
+import { eventActivityContext, eventActivitySubtype, normalizeActivitySemantics } from './activity-context';
 import { foldLatestEventRevisions } from './event-revision';
 import {
   BucketCommitCursor,
@@ -48,6 +49,8 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   ingestedAt UInt64 DEFAULT at,
   eventKind LowCardinality(String),
   eventCategory LowCardinality(String),
+  activityContext LowCardinality(String) DEFAULT if(eventKind = 'ToolExec', 'agent_action', ''),
+  activitySubtype LowCardinality(String) DEFAULT '',
   source LowCardinality(String),
   subject String,
   workspacePath String,
@@ -115,6 +118,8 @@ const EVENT_ALTERS = [
   'ADD COLUMN IF NOT EXISTS sourceEventId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS ingestedAt UInt64 DEFAULT at',
   'ADD COLUMN IF NOT EXISTS eventCategory LowCardinality(String) DEFAULT \'unknown\'',
+  "ADD COLUMN IF NOT EXISTS activityContext LowCardinality(String) DEFAULT if(eventKind = 'ToolExec', 'agent_action', '')",
+  "ADD COLUMN IF NOT EXISTS activitySubtype LowCardinality(String) DEFAULT ''",
   'ADD COLUMN IF NOT EXISTS source LowCardinality(String) DEFAULT \'observer\'',
   'ADD COLUMN IF NOT EXISTS collectorId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS sourceId String DEFAULT \'\'',
@@ -359,8 +364,10 @@ const BOUNDED_BOOTSTRAP_PROGRESS_READ_SETTINGS: ClickHouseSettings = {
 
 const MAX_DURABLE_EVENT_SEARCH_ROWS = 10_000;
 
-type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'process' | 'attribution' | 'judgment' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview'> & {
+type Row = Omit<JudgedEvent, 'activityContext' | 'activitySubtype' | 'actionKind' | 'actionTarget' | 'attributes' | 'process' | 'attribution' | 'judgment' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview'> & {
   ingestedAt: number;
+  activityContext: string;
+  activitySubtype: string;
   actionKind: string;
   actionTarget: string;
   attributes: string;
@@ -423,6 +430,7 @@ export interface StoredEventQuery {
   runId?: string;
   eventKind?: string;
   eventCategory?: string;
+  activityContext?: string;
   verdict?: string;
   tier?: string;
   limit: number;
@@ -780,6 +788,8 @@ function toRow(e: JudgedEvent): Row {
     ingestedAt: Date.now(),
     eventKind: e.eventKind,
     eventCategory: e.eventCategory,
+    activityContext: eventActivityContext(e) ?? '',
+    activitySubtype: eventActivitySubtype(e) ?? '',
     source: e.source,
     subject: e.subject,
     workspacePath: e.workspacePath,
@@ -847,6 +857,9 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
   const agentId = str(r.agentId);
   const sessionId = str(r.sessionId);
   const eventKind = str(r.eventKind);
+  const rawActivityContext = str(r.activityContext);
+  const rawActivitySubtype = str(r.activitySubtype);
+  const activity = normalizeActivitySemantics(eventKind, rawActivityContext, rawActivitySubtype);
   const collectorId = str(r.collectorId) || attrString(attributes, 'collectorId') || undefined;
   const sourceId = str(r.sourceId) || attrString(attributes, 'sourceId') || undefined;
   return {
@@ -856,6 +869,8 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
     at,
     eventKind,
     eventCategory: (str(r.eventCategory) || 'unknown') as JudgedEvent['eventCategory'],
+    activityContext: activity.activityContext,
+    activitySubtype: activity.activitySubtype,
     source: (str(r.source) || 'observer') as JudgedEvent['source'],
     subject: str(r.subject),
     workspacePath: str(r.workspacePath),
@@ -2506,6 +2521,23 @@ export class ClickHouseStore {
       sampleConditions.push(`${column} = {${String(key)}:String}`);
       queryParams[String(key)] = value.trim();
     }
+    const activityContext = input.activityContext?.trim();
+    if (activityContext) {
+      sampleConditions.push(`multiIf(
+        eventKind != 'ToolExec', '',
+        activityContext = 'platform_healthcheck'
+          AND activitySubtype IN (
+            'docker_healthcheck',
+            'k8s_exec_probe',
+            'k8s_liveness_probe',
+            'k8s_readiness_probe',
+            'k8s_startup_probe'
+          ),
+        'platform_healthcheck',
+        'agent_action'
+      ) = {activityContext:String}`);
+      queryParams.activityContext = activityContext;
+    }
     // Stable predicates are applied before lifecycle revision collapse. Keep the generic name for
     // compatibility with the durable-query contract checks while retaining the late-materialized
     // split between stable and mutable filters.
@@ -2521,7 +2553,7 @@ export class ClickHouseStore {
     const rowLimit = Math.max(1, Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, Math.round(input.limit)));
     queryParams.limit = rowLimit;
     queryParams.scanLimit = Math.min(300_000, Math.max(rowLimit * 3, latestConditions.length ? 15_000 : 0));
-    const queryKey = JSON.stringify(queryParams);
+    const queryKey = JSON.stringify({ queryParams, monitoredOnly: input.monitoredOnly === true });
     const current = this.eventSearchInFlight;
     if (current) {
       if (current.key !== queryKey) return null;

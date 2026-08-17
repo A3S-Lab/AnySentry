@@ -117,6 +117,7 @@ const searched = await store.searchEvents({
   sinceMs: 100,
   untilMs: 200,
   sourceId: 'source-a',
+  activityContext: 'agent_action',
   verdict: 'block',
   tier: 'Llm',
   limit: 100_000,
@@ -130,6 +131,9 @@ assert.equal(searchCall.query_params.limit, 10_000,
 assert.equal(searchCall.query_params.scanLimit, 30_000);
 assert.match(searchCall.query, /PREWHERE at >= \{since:UInt64\} AND at <= \{until:UInt64\}/u);
 assert.match(searchCall.query, /WHERE sourceId = \{sourceId:String\}/u);
+assert.match(searchCall.query, /\) = \{activityContext:String\}/u);
+assert.match(searchCall.query, /activitySubtype IN \(/u);
+assert.equal(searchCall.query_params.activityContext, 'agent_action');
 assert.match(searchCall.query, /WHERE verdict = \{verdict:String\} AND tier = \{tier:String\}/u);
 assert.match(searchCall.query, /_part AS selectedPart/u);
 assert.match(searchCall.query, /_part_offset AS selectedPartOffset/u);
@@ -176,6 +180,26 @@ assert.deepEqual(sameSearchRowsA, []);
 assert.deepEqual(sameSearchRowsB, []);
 assert.notStrictEqual(sameSearchRowsA, sameSearchRowsB, 'each durable-search caller must receive its own array');
 assert.equal(fake.state.calls[0].query_params.scanLimit, 6_000);
+
+fake.state.calls.length = 0;
+const monitoredSearch = store.searchEvents({
+  sinceMs: 100,
+  untilMs: 201,
+  monitoredOnly: true,
+  limit: 2_000,
+});
+assert.equal(
+  await store.searchEvents({
+    sinceMs: 100,
+    untilMs: 201,
+    monitoredOnly: false,
+    limit: 2_000,
+  }),
+  null,
+  'raw and monitored-only searches must never share a differently shaped in-flight query',
+);
+assert.deepEqual(await monitoredSearch, []);
+assert.equal(fake.state.calls.length, 1);
 
 fake.state.calls.length = 0;
 const occupiedSearch = store.searchEvents({ sinceMs: 100, untilMs: 202, limit: 2_000 });
@@ -535,6 +559,34 @@ assert.equal(unavailableDurable.totalApproximate, true,
 assert.equal(unavailableDurable.storageFallback, 'hot_ring',
   'an unavailable durable store must identify its fallback source');
 
+let timelineQuery;
+const timelineAggregation = new AggregationService(
+  {
+    storageStatus: () => ({ clickhouseReady: true }),
+    committedEventCutoffMs: () => undefined,
+    searchStoredEventsPage: async (query) => {
+      timelineQuery = query;
+      return { events: [], hasMore: false };
+    },
+    queryRange: () => [],
+  },
+  {},
+  {},
+  {},
+);
+await timelineAggregation.storedAgentTimeline({
+  timeType: 'last_30d',
+  agentInstanceId: 'instance-a',
+  eventKind: 'ToolExec',
+  eventCategory: 'tool',
+  activityContext: 'agent_action',
+  limit: 25,
+});
+assert.equal(timelineQuery.agentInstanceId, 'instance-a');
+assert.equal(timelineQuery.eventKind, 'ToolExec');
+assert.equal(timelineQuery.eventCategory, 'tool');
+assert.equal(timelineQuery.activityContext, 'agent_action');
+
 let durableAggregationCalls = 0;
 let markDurableAggregationStarted;
 let releaseDurableAggregation;
@@ -592,12 +644,28 @@ assert.equal((await coalescingDurableAggregation.storedAgentEvents({
   limit: 40.4,
 })).storageFallback, 'hot_ring',
 'different pre-clamp numeric limits must not collide in the durable request key');
+assert.equal((await coalescingDurableAggregation.storedAgentEvents({
+  timeType: 'last_30d',
+  scope: 'raw',
+  agentInstanceId: 'instance-b',
+  q: 'marker',
+  limit: 40,
+})).storageFallback, 'hot_ring',
+'different concrete Agent instances must not share an in-flight durable result');
+assert.equal((await coalescingDurableAggregation.storedAgentEvents({
+  timeType: 'last_30d',
+  scope: 'raw',
+  snapshotAsOf: '2026-08-17T00:00:00.000Z',
+  q: 'marker',
+  limit: 40,
+})).storageFallback, 'hot_ring',
+'different dashboard snapshots must not share an in-flight durable result');
 releaseDurableAggregation();
 const [durableAggregationResultA, durableAggregationResultB] = await Promise.all([
   durableAggregationA,
   durableAggregationB,
 ]);
-assert.equal(durableAggregationCalls, 4,
+assert.equal(durableAggregationCalls, 6,
   'semantically different durable requests must not join the active request');
 assert.equal(durableAggregationResultA.storageFallback, undefined);
 assert.equal(durableAggregationResultB.storageFallback, undefined);

@@ -60,6 +60,19 @@ export type Severity = 'info' | 'low' | 'medium' | 'high' | 'critical';
 export type RiskType = 'system' | 'communication' | 'atomic';
 export type EventSource = 'observer' | 'synthetic' | 'api';
 export type EventCategory = 'tool' | 'network' | 'file' | 'llm' | 'security' | 'process' | 'runtime' | 'unknown';
+export type ActivityContext = 'agent_action' | 'platform_healthcheck' | 'collector_heartbeat';
+export type ActivitySubtype =
+  | 'docker_healthcheck'
+  | 'k8s_exec_probe'
+  | 'k8s_liveness_probe'
+  | 'k8s_readiness_probe'
+  | 'k8s_startup_probe'
+  | 'observer_heartbeat';
+export type PlatformHealthcheckSubtype = Exclude<ActivitySubtype, 'observer_heartbeat'>;
+export interface PlatformHealthcheckSpec {
+  activitySubtype: PlatformHealthcheckSubtype;
+  argv: string[];
+}
 export type EventAttributeValue = string | number | boolean;
 export type IncidentStatus = 'open' | 'acknowledged' | 'resolved';
 export type AgentHealthState = 'active' | 'idle' | 'stale' | 'risky';
@@ -203,6 +216,8 @@ export interface WorkloadIdentitySnapshotEntry {
   ownerName?: string;
   labels?: Record<string, string>;
   systemdUnit?: string;
+  /** Exact, platform-declared exec probes for this physical container only. */
+  platformHealthchecks?: PlatformHealthcheckSpec[];
   evidence: string[];
 }
 
@@ -378,6 +393,8 @@ export interface JudgedEvent {
   at: number; // epoch ms
   eventKind: string; // ToolExec | Egress | FileAccess | Dns | SslContent | SecurityAction
   eventCategory: EventCategory;
+  activityContext?: ActivityContext;
+  activitySubtype?: ActivitySubtype;
   source: EventSource;
   subject: string; // human summary of the event
   workspacePath: string;
@@ -423,6 +440,8 @@ export interface EventMeta {
   userId: string;
   source?: EventSource;
   eventCategory?: EventCategory;
+  activityContext?: ActivityContext;
+  activitySubtype?: ActivitySubtype;
   traceId?: string;
   spanId?: string;
   parentSpanId?: string;
@@ -850,6 +869,7 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   runId?: string;
   eventKind?: string;
   eventCategory?: EventCategory;
+  activityContext?: ActivityContext;
   verdict?: Verdict;
   tier?: Tier;
   q?: string;
@@ -863,6 +883,8 @@ export interface AgentEventListItem {
   at: string;
   eventKind: string;
   eventCategory: EventCategory;
+  activityContext?: ActivityContext;
+  activitySubtype?: ActivitySubtype;
   source: EventSource;
   subject: string;
   workspacePath: string;
@@ -1702,6 +1724,9 @@ export interface CollectorFilterMetrics {
 }
 export interface CollectorHeartbeatRecord extends Required<Pick<CollectorRawHeartbeatRequest, 'collectorId' | 'status'>> {
   at: number;
+  /** Server-filled on new records; optional only for persisted pre-classification history. */
+  activityContext?: 'collector_heartbeat';
+  activitySubtype?: 'observer_heartbeat';
   /** Server-assigned ingress provenance; absent only on records persisted before provenance existed. */
   origin?: CollectorHeartbeatOrigin;
   /** Set only when this record carried Forwarder-enriched filter metrics. */

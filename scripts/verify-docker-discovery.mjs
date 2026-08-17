@@ -5,8 +5,24 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const { AgentTemplateRegistry } = require('./observer-agent-templates');
-const { DockerDiscovery, dockerSnapshot } = require('./observer-docker-discovery');
+const { DockerDiscovery, dockerHealthchecks, dockerSnapshot } = require('./observer-docker-discovery');
 const { WorkloadIdentityCache } = require('./observer-workload-filter');
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+async function eventually(predicate, message) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (predicate()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.fail(message);
+}
 
 const clawId = 'd'.repeat(64);
 const unknownId = 'e'.repeat(64);
@@ -31,6 +47,20 @@ const containers = [
     Labels: { 'anysentry.io/workload-kind': 'non-agent' },
   },
 ];
+
+assert.deepEqual(dockerHealthchecks({
+  Config: { Healthcheck: { Test: ['CMD', '/usr/bin/test', '-f', '/tmp/ready'] } },
+}), [{ activitySubtype: 'docker_healthcheck', argv: ['/usr/bin/test', '-f', '/tmp/ready'] }]);
+assert.deepEqual(dockerHealthchecks({
+  Config: { Healthcheck: { Test: ['CMD-SHELL', 'test -f /tmp/ready || exit 1'] } },
+}), [{ activitySubtype: 'docker_healthcheck', argv: ['/bin/sh', '-c', 'test -f /tmp/ready || exit 1'] }]);
+assert.deepEqual(dockerHealthchecks({
+  Config: {
+    Shell: ['/bin/bash', '-ec'],
+    Healthcheck: { Test: ['CMD-SHELL', 'test -f /tmp/ready'] },
+  },
+}), [{ activitySubtype: 'docker_healthcheck', argv: ['/bin/bash', '-ec', 'test -f /tmp/ready'] }]);
+assert.deepEqual(dockerHealthchecks({ Config: { Healthcheck: { Test: ['NONE'] } } }), []);
 
 const snapshot = dockerSnapshot(containers, {
   version: 7,
@@ -150,12 +180,20 @@ assert.equal(
 );
 
 let callbackSnapshot;
+const inspectRequests = new Map();
 const discovery = new DockerDiscovery({
   enabled: 'on',
   socketExists: () => true,
   nodeName: 'node-a',
   hostId: 'host-a',
-  requestJson: async () => containers,
+  requestJson: async (requestPath) => {
+    if (requestPath === '/containers/json?all=1') return containers;
+    const id = requestPath.split('/')[2];
+    inspectRequests.set(id, (inspectRequests.get(id) ?? 0) + 1);
+    return id === unknownId
+      ? { Config: { Healthcheck: { Test: ['CMD-SHELL', 'test -f /tmp/agent-ready || exit 1'] } } }
+      : { Config: {} };
+  },
   streamFactory: () => ({ destroy() {} }),
   refreshMs: 3_600_000,
 });
@@ -165,7 +203,70 @@ assert.equal(await discovery.start((value) => {
 assert.equal(callbackSnapshot.entries.length, 3);
 assert.equal(discovery.metrics().ready, true);
 assert.equal(discovery.metrics().version, 1);
+assert.equal(discovery.metrics().inspected, containers.length);
+assert.equal(discovery.metrics().healthchecks, 1);
+assert.deepEqual(
+  callbackSnapshot.entries.find((entry) => entry.ids.includes(unknownId))?.platformHealthchecks,
+  [{ activitySubtype: 'docker_healthcheck', argv: ['/bin/sh', '-c', 'test -f /tmp/agent-ready || exit 1'] }],
+);
+await discovery.refresh();
+assert.ok([...inspectRequests.values()].every((count) => count === 1), 'a container ID is inspected once');
+discovery.handleEvent({ Action: 'destroy', Actor: { ID: unknownId } });
+assert.equal(discovery.inspectById.has(unknownId), false, 'destroy evicts cached healthcheck metadata');
 discovery.stop();
+
+let inspectAttempts = 0;
+const retryingDiscovery = new DockerDiscovery({
+  enabled: 'on',
+  socketExists: () => true,
+  requestJson: async (requestPath) => {
+    if (requestPath === '/containers/json?all=1') return [containers[0]];
+    inspectAttempts++;
+    if (inspectAttempts === 1) throw new Error('transient inspect failure');
+    return { Config: {} };
+  },
+  streamFactory: () => ({ destroy() {} }),
+  refreshMs: 3_600_000,
+});
+await retryingDiscovery.start(() => {});
+assert.equal(retryingDiscovery.inspectById.has(clawId), false);
+await retryingDiscovery.refresh();
+assert.equal(inspectAttempts, 2, 'failed inspect remains eligible for the next bounded refresh');
+assert.equal(retryingDiscovery.inspectById.has(clawId), true);
+retryingDiscovery.stop();
+
+const staleList = deferred();
+let listCalls = 0;
+const raceSnapshots = [];
+const raceDiscovery = new DockerDiscovery({
+  enabled: 'on',
+  socketExists: () => true,
+  requestJson: async (requestPath) => {
+    if (requestPath === '/containers/json?all=1') {
+      listCalls++;
+      if (listCalls === 1) return staleList.promise;
+      throw new Error('synthetic authoritative refresh failure');
+    }
+    return { Config: { Healthcheck: { Test: ['CMD', '/usr/bin/true'] } } };
+  },
+  streamFactory: () => ({ destroy() {} }),
+  refreshMs: 3_600_000,
+});
+raceDiscovery.onSnapshot = (value) => raceSnapshots.push(value);
+const staleRefresh = raceDiscovery.refresh();
+raceDiscovery.handleEvent({ Action: 'destroy', Actor: { ID: clawId } });
+staleList.resolve([containers[0]]);
+await staleRefresh;
+await eventually(() => listCalls >= 2 && raceDiscovery.refreshInFlight === undefined,
+  'destroy must schedule one fresh authoritative list after an in-flight stale list');
+assert.equal(
+  raceSnapshots.some((value) => value.entries.some((entry) => entry.ids.includes(clawId))),
+  false,
+  'an old list response must never republish a destroyed container even when the follow-up list fails',
+);
+assert.equal(raceDiscovery.inspectById.has(clawId), false);
+assert.equal(raceDiscovery.inspectEpoch.size, 0, 'container churn metadata must remain bounded');
+raceDiscovery.stop();
 
 if (process.argv.includes('--real')) {
   const real = new DockerDiscovery();

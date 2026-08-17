@@ -627,6 +627,68 @@ const include = await runConfig('include', {
   FORWARD_RETAIN_NON_AGENT: 'true',
   FORWARD_NOISE_POLICY: 'include',
 });
+
+const declaredHealthcheckArgv = ['/bin/sh', '-c', 'test -f /tmp/agent-ready || exit 1'];
+const activityContext = await runConfig('activity-context', {}, [
+  event('unknown-container', 'ToolExec', { pid: 21, argv: declaredHealthcheckArgv }),
+  event('unknown-container', 'ToolExec', { pid: 22, argv: ['/bin/sh', '-c', 'echo manual'] }),
+], {
+  expectedObserved: 2,
+  identitySnapshotReply(snapshot) {
+    const target = snapshot.entries.find((entry) => entry.ids.includes('unknown-container'));
+    target.platformHealthchecks = [{
+      activitySubtype: 'docker_healthcheck',
+      argv: declaredHealthcheckArgv,
+    }];
+    return { statusCode: 200, body: snapshot };
+  },
+});
+const activityEvents = activityContext.batches.filter((item) =>
+  JSON.parse(item.line).event?.ToolExec);
+assert.equal(activityEvents.length, 2);
+assert.equal(activityEvents[0].activityContext, 'platform_healthcheck');
+assert.equal(activityEvents[0].activitySubtype, 'docker_healthcheck');
+assert.equal(activityEvents[1].activityContext, 'agent_action');
+assert.equal(activityEvents[1].activitySubtype, undefined);
+assert.deepEqual(
+  JSON.parse(activityEvents[0].line).event.ToolExec.argv,
+  declaredHealthcheckArgv,
+  'activity metadata must not rewrite the raw ToolExec audit line',
+);
+const agentOwnedHealthcheck = await runConfig('agent-owned-healthcheck', {}, [
+  event('unknown-container', 'ToolExec', { pid: 23, argv: ['pi', '--print'] }, {
+    host_id: undefined,
+    boot_id: undefined,
+    comm: 'pi',
+    exe: '/usr/local/bin/pi',
+  }),
+  event('unknown-container', 'ToolExec', { pid: 24, ppid: 23, argv: declaredHealthcheckArgv }, {
+    host_id: undefined,
+    boot_id: undefined,
+    ppid: 23,
+    comm: 'sh',
+    exe: '/bin/sh',
+  }),
+], {
+  expectedObserved: 2,
+  identitySnapshotReply(snapshot) {
+    const target = snapshot.entries.find((entry) => entry.ids.includes('unknown-container'));
+    target.platformHealthchecks = [{
+      activitySubtype: 'docker_healthcheck',
+      argv: declaredHealthcheckArgv,
+    }];
+    return { statusCode: 200, body: snapshot };
+  },
+});
+const agentOwnedEvents = agentOwnedHealthcheck.batches.filter((item) =>
+  JSON.parse(item.line).event?.ToolExec);
+assert.equal(agentOwnedEvents.length, 2);
+assert.equal(agentOwnedEvents[0].activityContext, 'agent_action');
+assert.equal(
+  agentOwnedEvents[1].activityContext,
+  'agent_action',
+  'an Agent descendant that runs the declared probe argv remains an Agent action',
+);
 assert.equal(include.batches.length, 6);
 assert.equal(include.heartbeat.filterMetrics.filteredNonAgent, 0);
 assert.equal(include.heartbeat.filterMetrics.filteredNoise, 0);
