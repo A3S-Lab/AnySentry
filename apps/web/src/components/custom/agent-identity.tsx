@@ -2,8 +2,10 @@ import type {
   AgentClassification,
   AgentEventListItem,
   AgentInventoryItem,
+  AgentLifecycleState,
   AgentWorkloadRef,
 } from "@/lib/api/security-center";
+import { formatSecurityDateTime } from "@/lib/date-time";
 import { cn } from "@/lib/utils";
 
 export type AgentRuntimeKind = "kubernetes" | "docker" | "local" | "unknown";
@@ -72,6 +74,24 @@ const RUNTIME_META: Record<
   local: {
     label: "本地服务",
     className: "border-zinc-500/40 bg-zinc-500/10 text-zinc-300",
+  },
+};
+
+const LIFECYCLE_META: Record<
+  AgentLifecycleState,
+  { label: string; className: string }
+> = {
+  current: {
+    label: "当前实例",
+    className: "border-teal-400/30 bg-teal-500/10 text-teal-100",
+  },
+  historical: {
+    label: "历史实例",
+    className: "border-amber-400/25 bg-amber-500/10 text-amber-100",
+  },
+  terminated: {
+    label: "已结束",
+    className: "border-white/10 bg-white/5 text-zinc-400",
   },
 };
 
@@ -253,6 +273,7 @@ export function AgentAssetIdentityInline({
   const classification = CLASSIFICATION_META[agent.classification];
   const runtimeKind = assetRuntime(agent);
   const runtime = runtimeKind === "unknown" ? undefined : RUNTIME_META[runtimeKind];
+  const lifecycle = LIFECYCLE_META[agent.lifecycleState];
   const name =
     meaningfulName(agent.displayName) ||
     meaningfulName(agent.detectedName) ||
@@ -262,8 +283,15 @@ export function AgentAssetIdentityInline({
     meaningfulName(agent.agentId) ||
     "候选 Agent";
   const location = agent.locationLabel || shortWorkspaceLabel(agent.workspacePath);
+  const observedAt = formatSecurityDateTime(agent.firstSeen, "MM-DD HH:mm:ss");
+  const instanceShortId =
+    agent.rootPid
+      ? `PID ${agent.rootPid}`
+      : shortWorkloadId(agent.agentInstanceId) || agent.agentAssetId.replace(/^agent_/, "").slice(-6);
   const title = [
     name,
+    `实例：${observedAt} · ${instanceShortId}`,
+    lifecycle.label,
     CLASSIFICATION_META[agent.classification].label,
     runtime?.label,
     location,
@@ -274,7 +302,13 @@ export function AgentAssetIdentityInline({
     <span className={cn("inline-flex min-w-0 max-w-full flex-col gap-0.5", className)} title={title}>
       <span className="flex min-w-0 max-w-full items-center gap-1.5">
         <span className={cn("size-1.5 shrink-0 rounded-full", classification.dotClassName)} />
-        <span className={cn("min-w-0 truncate font-semibold", classification.nameClassName)}>{name}</span>
+        <span className={cn("min-w-0 truncate font-semibold", classification.nameClassName)}>
+          {name}
+          <span className="ml-1 font-mono text-[10px] font-normal text-zinc-500">· {observedAt}</span>
+        </span>
+        <span className={cn("shrink-0 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold", lifecycle.className)}>
+          {lifecycle.label}
+        </span>
         {showClassification ? (
           <span className={cn("shrink-0 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold", classification.badgeClassName)}>
             {classification.label}
@@ -288,7 +322,10 @@ export function AgentAssetIdentityInline({
       </span>
       {location ? (
         <span className="ml-3 block max-w-full truncate font-mono text-[10px] font-normal text-zinc-600" title={agent.workspacePath}>
-          {location}{agent.instanceCount > 1 ? ` · ${agent.instanceCount} 个运行实例` : ""}
+          {location} · {instanceShortId}
+          {(agent.logicalInstanceCount ?? agent.instanceCount) > 1
+            ? ` · 同逻辑 Agent ${(agent.logicalInstanceCount ?? agent.instanceCount)} 个实例`
+            : ""}
         </span>
       ) : null}
     </span>

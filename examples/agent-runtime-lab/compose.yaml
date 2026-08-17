@@ -51,8 +51,9 @@ services:
     restart: unless-stopped
     privileged: true
     pid: host
-    entrypoint: ["/bin/sh", "-c"]
-    command: ["a3s-observer-collector | node /opt/observer-forward.js"]
+    stop_grace_period: 30s
+    entrypoint: ["/usr/local/bin/node"]
+    command: ["/opt/observer-supervisor.js"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -62,12 +63,14 @@ services:
       ANYSENTRY_INGEST_URL: ${ANYSENTRY_DOCKER_INGEST_URL:-http://host.docker.internal:29653/security-center/ingest}
       ANYSENTRY_BATCH_INGEST_URL: ${ANYSENTRY_DOCKER_BATCH_INGEST_URL:-http://host.docker.internal:29653/security-center/ingest/batch}
       ANYSENTRY_IDENTITY_SNAPSHOT_URL: ${ANYSENTRY_DOCKER_IDENTITY_URL:-http://host.docker.internal:29653/security-center/identity/snapshot}
+      ANYSENTRY_AGENT_RUNTIME_LEASE_URL: ${ANYSENTRY_DOCKER_RUNTIME_LEASE_URL:-http://host.docker.internal:29653/security-center/runtime/lease}
+      ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL: ${ANYSENTRY_DOCKER_RUNTIME_SNAPSHOT_URL:-http://host.docker.internal:29653/security-center/runtime/snapshot}
       ANYSENTRY_SOURCE_TYPE: observer
       ANYSENTRY_SOURCE_NAME: agent-runtime-lab-docker-native-observer
       ANYSENTRY_HEARTBEAT_SECS: "5"
       ANYSENTRY_IDENTITY_SNAPSHOT_SECS: "5"
       ANYSENTRY_DOCKER_DISCOVERY: "on"
-      FORWARD_FILTER_MODE: enforce
+      FORWARD_FILTER_MODE: ${FORWARD_FILTER_MODE:-shadow}
       FORWARD_RETAIN_UNKNOWN: "false"
       FORWARD_RETAIN_NON_AGENT: "false"
       FORWARD_NOISE_POLICY: balanced
@@ -76,8 +79,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       # Keep the lab on the current checkout even when Docker's image builder
       # is unavailable or an older observer image is already cached locally.
+      - ../../scripts/observer-supervisor.js:/opt/observer-supervisor.js:ro
       - ../../scripts/observer-forward.js:/opt/observer-forward.js:ro
       - ../../scripts/observer-agent-attribution.js:/opt/observer-agent-attribution.js:ro
+      - ../../scripts/observer-attribution-merge.js:/opt/observer-attribution-merge.js:ro
+      - ../../scripts/observer-agent-runtime-signatures.js:/opt/observer-agent-runtime-signatures.js:ro
       - ../../scripts/observer-agent-templates.js:/opt/observer-agent-templates.js:ro
       - ../../scripts/observer-docker-discovery.js:/opt/observer-docker-discovery.js:ro
       - ../../scripts/observer-behavior-discovery.js:/opt/observer-behavior-discovery.js:ro

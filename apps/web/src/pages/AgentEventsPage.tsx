@@ -1,5 +1,5 @@
 import { useRequest } from "ahooks";
-import dayjs from "dayjs";
+import { formatSecurityDateTime, liveSecuritySnapshotAsOf } from "@/lib/date-time";
 import {
   ArrowLeft,
   Clock3,
@@ -17,6 +17,7 @@ import { useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
 import { AgentIdentityInline, resolveAgentIdentity } from "@/components/custom/agent-identity";
+import { useSecurityConsole } from "@/components/custom/security-console-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -33,6 +34,9 @@ import {
 import { cn } from "@/lib/utils";
 
 const TIME_OPTIONS: Array<{ value: SecurityTimeType; label: string }> = [
+  { value: "last_30m", label: "近30分钟" },
+  { value: "last_1h", label: "近1小时" },
+  { value: "last_2h", label: "近2小时" },
   { value: "last_3h", label: "近3小时" },
   { value: "last_1d", label: "近一天" },
   { value: "last_7d", label: "近一周" },
@@ -84,10 +88,7 @@ const SEVERITY_LABEL: Record<SecuritySeverity, string> = {
 };
 
 function formatDate(value?: string) {
-  if (!value) return "--";
-  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value) ? value.replace(" ", "T") + "Z" : value;
-  const parsed = dayjs(normalized);
-  return parsed.isValid() ? parsed.format("MM-DD HH:mm:ss") : value;
+  return formatSecurityDateTime(value, "MM-DD HH:mm:ss", value || "--");
 }
 
 function shortId(value?: string) {
@@ -261,6 +262,8 @@ function EventDetail({
           <FieldValue label="Workspace" value={event.workspacePath} />
           <FieldValue label="Source" value={event.source} />
           <FieldValue label="Kind" value={event.eventKind} />
+          <FieldValue label="活动语义" value={event.activityContext} />
+          <FieldValue label="活动子类型" value={event.activitySubtype} />
         </div>
 
         <div className="grid gap-3 sm:grid-cols-4">
@@ -440,14 +443,16 @@ function clean(value: string) {
 
 export default function AgentEventsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
-  const routeStartTime = searchParams.get("startTime") ?? "";
-  const routeEndTime = searchParams.get("endTime") ?? "";
+  const { filter: consoleTimeFilter, setTimeFilter } = useSecurityConsole();
+  const timeType = consoleTimeFilter.timeType ?? "last_3h";
+  const routeStartTime = consoleTimeFilter.startTime ?? "";
+  const routeEndTime = consoleTimeFilter.endTime ?? "";
   const [sourceId, setSourceId] = useState(searchParams.get("sourceId") ?? "");
   const [collectorId, setCollectorId] = useState(searchParams.get("collectorId") ?? "");
   const [workspacePath, setWorkspacePath] = useState(searchParams.get("workspacePath") ?? "");
   const [agentId, setAgentId] = useState(searchParams.get("agentId") ?? "");
   const [agentAssetId, setAgentAssetId] = useState(searchParams.get("agentAssetId") ?? "");
+  const [agentInstanceId, setAgentInstanceId] = useState(searchParams.get("agentInstanceId") ?? "");
   const [sessionId, setSessionId] = useState(searchParams.get("sessionId") ?? "");
   const [traceId, setTraceId] = useState(searchParams.get("traceId") ?? "");
   const [runId, setRunId] = useState(searchParams.get("runId") ?? "");
@@ -461,12 +466,14 @@ export default function AgentEventsPage() {
     timeType,
     startTime: timeType === "custom" ? clean(routeStartTime) : undefined,
     endTime: timeType === "custom" ? clean(routeEndTime) : undefined,
+    snapshotAsOf: consoleTimeFilter.snapshotAsOf,
     eventId: clean(selectedEventId),
     sourceId: clean(sourceId),
     collectorId: clean(collectorId),
     workspacePath: clean(workspacePath),
     agentId: clean(agentId),
     agentAssetId: clean(agentAssetId),
+    agentInstanceId: clean(agentInstanceId),
     sessionId: clean(sessionId),
     traceId: clean(traceId),
     runId: clean(runId),
@@ -477,9 +484,16 @@ export default function AgentEventsPage() {
     includeUnknown,
     durable: true,
     limit: 120,
-  }), [agentAssetId, agentId, collectorId, eventCategory, eventKind, includeUnknown, routeEndTime, routeStartTime, runId, selectedEventId, sessionId, sourceId, timeType, traceId, verdict, workspacePath]);
+  }), [agentAssetId, agentId, agentInstanceId, collectorId, consoleTimeFilter.snapshotAsOf, eventCategory, eventKind, includeUnknown, routeEndTime, routeStartTime, runId, selectedEventId, sessionId, sourceId, timeType, traceId, verdict, workspacePath]);
 
-  const { data, loading, refresh } = useRequest(() => securityCenterApi.agentEvents(query), {
+  const { data, loading, refresh } = useRequest(() =>
+    securityCenterApi.agentEvents({
+      ...query,
+      snapshotAsOf: liveSecuritySnapshotAsOf(
+        timeType === "custom",
+        consoleTimeFilter.snapshotAsOf,
+      ),
+    }), {
     refreshDeps: [query],
     pollingInterval: 10000,
     pollingWhenHidden: false,
@@ -496,13 +510,33 @@ export default function AgentEventsPage() {
           timeType,
           startTime: timeType === "custom" ? clean(routeStartTime) : undefined,
           endTime: timeType === "custom" ? clean(routeEndTime) : undefined,
+          snapshotAsOf: liveSecuritySnapshotAsOf(
+            timeType === "custom",
+            consoleTimeFilter.snapshotAsOf,
+          ),
           eventId: selectedEvent.eventId,
           traceId: selectedEvent.traceId,
+          durable: true,
           limit: 240,
         })
-      : Promise.resolve({ traceId: "", items: [], updateTime: "" }),
+      : Promise.resolve({
+          traceId: "",
+          items: [],
+          total: 0,
+          hasMore: false,
+          coverage: {
+            requestedFrom: "",
+            requestedTo: "",
+            snapshotAsOf: "",
+            asOf: "",
+            partial: false,
+            source: "memory_hot_ring" as const,
+            totalMode: "exact" as const,
+          },
+          updateTime: "",
+        }),
     {
-      refreshDeps: [routeEndTime, routeStartTime, selectedEvent?.traceId, timeType],
+      refreshDeps: [consoleTimeFilter.snapshotAsOf, routeEndTime, routeStartTime, selectedEvent?.traceId, timeType],
       pollingInterval: 10000,
       pollingWhenHidden: false,
     },
@@ -525,6 +559,7 @@ export default function AgentEventsPage() {
     if (workspacePath) next.set("workspacePath", workspacePath);
     if (agentId) next.set("agentId", agentId);
     next.set("agentAssetId", event.agentAssetId);
+    if (agentInstanceId) next.set("agentInstanceId", agentInstanceId);
     if (sessionId) next.set("sessionId", sessionId);
     next.set("includeUnknown", String(includeUnknown));
     if (eventSourceId) setSourceId(eventSourceId);
@@ -538,6 +573,7 @@ export default function AgentEventsPage() {
   const clearFilters = () => {
     setAgentId("");
     setAgentAssetId("");
+    setAgentInstanceId("");
     setSourceId("");
     setCollectorId("");
     setWorkspacePath("");
@@ -579,7 +615,7 @@ export default function AgentEventsPage() {
         </div>
 
         <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-6">
-          <Select value={timeType} onValueChange={(next) => setTimeType(next as SecurityTimeType)}>
+          <Select value={timeType} onValueChange={(next) => setTimeFilter({ timeType: next as SecurityTimeType })}>
             <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
             <SelectContent>
               {TIME_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
@@ -640,7 +676,13 @@ export default function AgentEventsPage() {
                 <Search className="size-4 text-teal-200" />
                 <h2 className="text-sm font-semibold text-zinc-100">事件</h2>
               </div>
-              <span className="text-xs text-zinc-500">{data ? `${data.total} 条` : "--"}</span>
+              <span
+                className="text-xs text-zinc-500"
+                title={data?.totalApproximate ? "大窗口使用有界近似去重统计" : undefined}
+                aria-label={data ? `${data.totalApproximate ? "约 " : ""}${data.total} 条事件` : undefined}
+              >
+                {data ? `${data.totalApproximate ? "≈" : ""}${data.total} 条` : "--"}
+              </span>
             </div>
             {loading && !data ? (
               <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">

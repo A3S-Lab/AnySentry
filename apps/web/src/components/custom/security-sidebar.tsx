@@ -26,6 +26,10 @@ import {
 } from "lucide-react";
 import { Link, useLocation } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import {
+  COLLAPSED_SECURITY_SIDEBAR_WIDTH,
+  useSecurityConsole,
+} from "@/components/custom/security-console-header";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
@@ -43,6 +47,7 @@ const GROUPS: Array<{ label: string; icon: LucideIcon; items: NavigationItem[] }
     icon: LayoutDashboard,
     items: [
       { label: "运行总览", description: "平台健康与实时状态", href: "/?view=overview", icon: Activity, dashboardView: "overview" },
+      { label: "拓扑", description: "Agent 运行时安全关系", href: "/topology", icon: Network },
       { label: "风险态势", description: "风险分类与趋势分布", href: "/?view=risk", icon: Siren, dashboardView: "risk" },
       { label: "复合研判", description: "Flink 连续行为关联", href: "/?view=stream", icon: Sparkles, dashboardView: "stream" },
       { label: "告警", description: "活跃告警与处置", href: "/alerts", icon: BellRing },
@@ -55,7 +60,6 @@ const GROUPS: Array<{ label: string; icon: LucideIcon; items: NavigationItem[] }
       { label: "运行链路", description: "无侵入事件时间线", href: "/?view=events", icon: GitBranch, dashboardView: "events" },
       { label: "供应链漏洞", description: "OSV 依赖漏洞资产", href: "/?view=supplyChain", icon: ShieldAlert, dashboardView: "supplyChain" },
       { label: "会话与工作区", description: "Agent 与 Workspace 风险", href: "/?view=workspace", icon: TerminalSquare, dashboardView: "workspace" },
-      { label: "拓扑", description: "实体与行为关系", href: "/topology", icon: Network },
     ],
   },
   {
@@ -110,63 +114,76 @@ function isNavigationItemActive(pathname: string, search: string, item: Navigati
 export function SecuritySidebar() {
   const { pathname, search } = useLocation();
   const { t } = useI18n();
+  const { sidebarWidth, sidebarCollapsed } = useSecurityConsole();
 
   return (
-    <aside className="hidden h-full w-[220px] shrink-0 overflow-y-auto border-r border-[#232a37] bg-[#0f131a] p-1.5 lg:block">
-      <nav className="space-y-1" aria-label={t("安全监控模块")}>
-        {GROUPS.map((group, groupIndex) => {
-          const GroupIcon = group.icon;
-          return (
-            <div key={group.label}>
-              <p
-                className={cn(
-                  "flex items-center gap-2 px-3 pb-1 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]",
-                  groupIndex === 0 ? "pt-3" : "mt-3 border-t border-[#232a37] pt-4",
-                )}
-              >
-                <GroupIcon className="size-3.5" />
-                {t(group.label)}
-              </p>
-              {group.items.map((item) => {
-                const Icon = item.icon;
-                const active = isNavigationItemActive(pathname, search, item);
-                return (
-                  <Link
-                    key={item.href}
-                    to={item.href}
-                    aria-current={active ? "page" : undefined}
-                    className={cn(
-                      "flex w-full items-start gap-2.5 rounded-md border px-2.5 py-2 text-left transition-colors",
-                      active
-                        ? "border-transparent bg-[#1c222d] text-[#e8ecf3] shadow-[inset_2px_0_0_#f97316]"
-                        : "border-transparent text-[#b6bdcc] hover:bg-[#151a23] hover:text-[#e8ecf3]",
-                    )}
-                  >
-                    <span className={cn(
-                      "mt-0.5 inline-flex size-5 shrink-0 items-center justify-center",
-                      active ? "text-[#f97316]" : "text-[#818a9c]",
-                    )}>
-                      <Icon className="size-3.5" />
-                    </span>
-                    <span className="min-w-0">
-                      <span className="block text-xs font-semibold leading-[1.45]">{t(item.label)}</span>
-                      {item.description ? (
-                        <span className={cn(
-                          "mt-0.5 block text-[10.5px] leading-4",
-                          active ? "text-[#818a9c]" : "text-[#5b6373]",
-                        )}>
-                          {t(item.description)}
+    <aside
+      className="relative hidden h-full shrink-0 border-r border-[#232a37] bg-[#0f131a] lg:block"
+      style={{ width: sidebarCollapsed ? COLLAPSED_SECURITY_SIDEBAR_WIDTH : sidebarWidth }}
+    >
+      <div className="mr-1 h-full overflow-y-auto p-1.5">
+        <nav className="space-y-1" aria-label={t("安全监控模块")}>
+          {GROUPS.map((group, groupIndex) => {
+            const GroupIcon = group.icon;
+            return (
+              <div key={group.label}>
+                <p
+                  className={cn(
+                    "flex items-center gap-2 px-3 pb-1 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]",
+                    groupIndex === 0 ? "pt-3" : "mt-3 border-t border-[#232a37] pt-4",
+                    sidebarCollapsed && "justify-center px-0",
+                  )}
+                  title={sidebarCollapsed ? t(group.label) : undefined}
+                >
+                  <GroupIcon className="size-3.5" />
+                  {!sidebarCollapsed ? t(group.label) : null}
+                </p>
+                {group.items.map((item) => {
+                  const Icon = item.icon;
+                  const active = isNavigationItemActive(pathname, search, item);
+                  return (
+                    <Link
+                      key={item.href}
+                      to={item.href}
+                      title={sidebarCollapsed ? t(item.label) : undefined}
+                      aria-label={sidebarCollapsed ? t(item.label) : undefined}
+                      aria-current={active ? "page" : undefined}
+                      className={cn(
+                        "flex w-full items-start gap-2.5 rounded-md border px-2.5 py-2 text-left transition-colors",
+                        active
+                          ? "border-transparent bg-[#1c222d] text-[#e8ecf3] shadow-[inset_2px_0_0_#f97316]"
+                          : "border-transparent text-[#b6bdcc] hover:bg-[#151a23] hover:text-[#e8ecf3]",
+                        sidebarCollapsed && "justify-center px-0",
+                      )}
+                    >
+                      <span className={cn(
+                        "mt-0.5 inline-flex size-5 shrink-0 items-center justify-center",
+                        active ? "text-[#f97316]" : "text-[#818a9c]",
+                      )}>
+                        <Icon className="size-3.5" />
+                      </span>
+                      {!sidebarCollapsed ? (
+                        <span className="min-w-0">
+                          <span className="block text-xs font-semibold leading-[1.45]">{t(item.label)}</span>
+                          {item.description ? (
+                            <span className={cn(
+                              "mt-0.5 block text-[10.5px] leading-4",
+                              active ? "text-[#818a9c]" : "text-[#5b6373]",
+                            )}>
+                              {t(item.description)}
+                            </span>
+                          ) : null}
                         </span>
                       ) : null}
-                    </span>
-                  </Link>
-                );
-              })}
-              {group.label === "管理" ? <AdminTokenControl navigation /> : null}
-            </div>
-          );
-        })}
-      </nav>
+                    </Link>
+                  );
+                })}
+                {group.label === "管理" && !sidebarCollapsed ? <AdminTokenControl navigation /> : null}
+              </div>
+            );
+          })}
+        </nav>
+      </div>
     </aside>
   );
 }

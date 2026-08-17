@@ -194,6 +194,7 @@ type LogicalSessionContext = {
   hostId?: string;
   containerId?: string;
   rootPid?: number;
+  rootStartTime?: string;
 };
 
 function logicalSessionId(event: JudgedEvent, context: LogicalSessionContext): string {
@@ -213,6 +214,7 @@ function logicalSessionId(event: JudgedEvent, context: LogicalSessionContext): s
       context.hostId,
       context.containerId,
       context.rootPid,
+      context.rootStartTime,
     );
   }
 
@@ -488,23 +490,29 @@ export function canonicalizeEvent(event: JudgedEvent, observerLine: string, rece
   const workspaceId = text(event.attributes.workspaceId) ?? hash('ws', tenantId, environmentId, workspaceIdentity);
   const agentCorrelationId = hash('agc', tenantId, environmentId, workspaceId, agentType);
   const bootId = event.process?.bootId ?? text(event.attributes.bootId);
+  const startTimeTicks = event.process?.startTimeTicks;
   const startTimeNs = event.process?.startTimeNs;
+  const stableStartTime = startTimeTicks ?? startTimeNs;
+  const stableStartTimeKind = startTimeTicks ? 'ticks' : startTimeNs ? 'ns' : undefined;
   const mountNamespace = event.process?.mountNamespace
     ?? (Number.isFinite(Number(event.attributes.mountNamespace))
       ? Number(event.attributes.mountNamespace)
       : undefined);
-  const processIdentityConfidence: CanonicalProcessIdentity['identityConfidence'] = bootId && startTimeNs && event.process?.pid
+  const processIdentityConfidence: CanonicalProcessIdentity['identityConfidence'] = bootId && stableStartTime && event.process?.pid
     ? 'strong'
-    : startTimeNs && event.process?.pid
+    : stableStartTime && event.process?.pid
       ? 'medium'
       : 'weak';
   const processIdentity: CanonicalProcessIdentity = {
     hostId: event.process?.hostId ?? text(event.attributes.collectorNode),
     bootId,
     containerId: containerId(event.process?.cgroup),
+    cgroupId: event.process?.cgroupId,
     pid: event.process?.pid,
     ppid: event.process?.ppid,
     rootPid: event.attribution?.rootPid,
+    rootStartTime: event.attribution?.rootStartTime,
+    startTimeTicks,
     startTimeNs,
     mountNamespace,
     processInstanceId: hash(
@@ -513,8 +521,10 @@ export function canonicalizeEvent(event: JudgedEvent, observerLine: string, rece
       bootId,
       event.process?.hostId ?? text(event.attributes.collectorNode),
       containerId(event.process?.cgroup),
+      event.process?.cgroupId,
       event.process?.pid,
-      startTimeNs,
+      stableStartTimeKind,
+      stableStartTime,
     ),
     identityConfidence: processIdentityConfidence,
   };
@@ -559,6 +569,7 @@ export function canonicalizeEvent(event: JudgedEvent, observerLine: string, rece
         processIdentity.hostId,
         processIdentity.containerId,
         processIdentity.rootPid,
+        processIdentity.rootStartTime,
       )
       : hash(
         'agi',
@@ -567,7 +578,8 @@ export function canonicalizeEvent(event: JudgedEvent, observerLine: string, rece
         processIdentity.hostId,
         processIdentity.containerId,
         processIdentity.pid,
-        processIdentity.startTimeNs,
+        processIdentity.startTimeTicks ? 'ticks' : processIdentity.startTimeNs ? 'ns' : undefined,
+        processIdentity.startTimeTicks ?? processIdentity.startTimeNs,
       );
   return {
     schemaVersion: 'anysentry.canonical_event.v1',
@@ -596,6 +608,7 @@ export function canonicalizeEvent(event: JudgedEvent, observerLine: string, rece
       hostId: processIdentity.hostId,
       containerId: processIdentity.containerId,
       rootPid: processIdentity.rootPid,
+      rootStartTime: processIdentity.rootStartTime,
     }),
     traceId: event.traceId,
     spanId: event.spanId,

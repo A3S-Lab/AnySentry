@@ -1,0 +1,102 @@
+# Explicit full-function override for local/manual validation.
+# Keep docker-compose.yml production-like defaults unchanged and opt in with:
+#   docker compose --profile streaming -f docker-compose.yml \
+#     -f deploy/docker-compose.manual-test.yml up -d
+services:
+  anysentry:
+    build: null
+    image: ${ANYSENTRY_IMAGE:?Set ANYSENTRY_IMAGE to the immutable AnySentry image digest}
+    environment:
+      ANYSENTRY_STREAMING: "on"
+      ANYSENTRY_SUPPLY_CHAIN: "on"
+      ANYSENTRY_SUPPLY_CHAIN_RUNTIME: "on"
+      # The full manual profile starts several relational projections together. Give their
+      # bounded transactions enough checkout capacity while retaining fail-closed fallbacks.
+      ANYSENTRY_DATABASE_POOL_MAX: "20"
+      ANYSENTRY_DATABASE_CONNECT_TIMEOUT_MS: "10000"
+
+  fast-judge:
+    image: ${ANYSENTRY_IMAGE:?Set ANYSENTRY_IMAGE to the immutable AnySentry image digest}
+
+  l3-worker:
+    image: ${ANYSENTRY_IMAGE:?Set ANYSENTRY_IMAGE to the immutable AnySentry image digest}
+
+  stream-worker:
+    image: ${ANYSENTRY_IMAGE:?Set ANYSENTRY_IMAGE to the immutable AnySentry image digest}
+
+  composite-judge:
+    image: ${ANYSENTRY_IMAGE:?Set ANYSENTRY_IMAGE to the immutable AnySentry image digest}
+
+  supply-chain-assessment:
+    image: ${ANYSENTRY_IMAGE:?Set ANYSENTRY_IMAGE to the immutable AnySentry image digest}
+    environment:
+      ANYSENTRY_SUPPLY_CHAIN_RUNTIME: "on"
+
+  flink-checkpoint-init:
+    build: null
+    image: ${ANYSENTRY_FLINK_IMAGE:?Set ANYSENTRY_FLINK_IMAGE to the immutable Flink image digest}
+
+  flink-jobmanager:
+    build: null
+    image: ${ANYSENTRY_FLINK_IMAGE:?Set ANYSENTRY_FLINK_IMAGE to the immutable Flink image digest}
+
+  flink-taskmanager:
+    build: null
+    image: ${ANYSENTRY_FLINK_IMAGE:?Set ANYSENTRY_FLINK_IMAGE to the immutable Flink image digest}
+
+  flink-job-submit:
+    build: null
+    image: ${ANYSENTRY_FLINK_IMAGE:?Set ANYSENTRY_FLINK_IMAGE to the immutable Flink image digest}
+
+  observer:
+    image: ${ANYSENTRY_OBSERVER_IMAGE:?Set ANYSENTRY_OBSERVER_IMAGE to the immutable Observer image digest}
+    container_name: anysentry-manual-observer
+    restart: unless-stopped
+    privileged: true
+    pid: host
+    stop_grace_period: 30s
+    depends_on:
+      anysentry:
+        condition: service_started
+    entrypoint: ["/usr/local/bin/node"]
+    command: ["/opt/observer-supervisor.js"]
+    environment:
+      A3S_OBSERVER_JSON: "1"
+      A3S_OBSERVER_FILES: "1"
+      A3S_OBSERVER_SSL: "1"
+      A3S_OBSERVER_COLLECTOR_ID: manual-docker-observer
+      A3S_NODE_NAME: manual-docker-host
+      ANYSENTRY_INGEST_URL: http://anysentry:29653/security-center/ingest
+      ANYSENTRY_BATCH_INGEST_URL: http://anysentry:29653/security-center/ingest/batch
+      ANYSENTRY_IDENTITY_SNAPSHOT_URL: http://anysentry:29653/security-center/identity/snapshot
+      ANYSENTRY_AGENT_RUNTIME_LEASE_URL: http://anysentry:29653/security-center/runtime/lease
+      ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL: http://anysentry:29653/security-center/runtime/snapshot
+      ANYSENTRY_AGENT_RUNTIME_SIGNATURES_FILE: /etc/anysentry/agent-runtime-signatures.json
+      ANYSENTRY_SOURCE_TYPE: observer
+      ANYSENTRY_SOURCE_NAME: manual-docker-observer
+      ANYSENTRY_HEARTBEAT_SECS: "5"
+      ANYSENTRY_IDENTITY_SNAPSHOT_SECS: "5"
+      ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_SECS: "5"
+      ANYSENTRY_DOCKER_DISCOVERY: "on"
+      # Keep manual validation deterministic: explicit runtime signatures and
+      # workload identity still apply, while unrelated host workloads cannot
+      # be behavior-promoted into the high-volume Agent event path.
+      ANYSENTRY_BEHAVIOR_DISCOVERY: "off"
+      FORWARD_FILTER_MODE: enforce
+      FORWARD_RETAIN_UNKNOWN: "false"
+      FORWARD_RETAIN_NON_AGENT: "false"
+      FORWARD_NOISE_POLICY: balanced
+      FORWARD_BATCH_SIZE: "8"
+      FORWARD_HTTP_TIMEOUT_MS: "60000"
+      FORWARD_MAX_OUTSTANDING_EVENTS: "16384"
+      FORWARD_MAX_OUTSTANDING_BYTES: "67108864"
+      FORWARD_RETRY_MAX_AGE_MS: "45000"
+      FORWARD_SHUTDOWN_TIMEOUT_MS: "15000"
+      OBSERVER_SUPERVISOR_SHUTDOWN_TIMEOUT_MS: "20000"
+    volumes:
+      - /sys:/sys:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - type: bind
+        source: ${ANYSENTRY_RUNTIME_RULES_DIR:?Set ANYSENTRY_RUNTIME_RULES_DIR to the rule directory}
+        target: /etc/anysentry
+        read_only: true

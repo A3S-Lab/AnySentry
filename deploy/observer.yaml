@@ -19,6 +19,19 @@ data:
       "schemaVersion": "anysentry.agent_templates.v1",
       "templates": []
     }
+  agent-runtime-signatures.json: |
+    {
+      "schemaVersion": "anysentry.agent_runtime_signatures.v1",
+      "version": 1,
+      "runtimes": [
+        { "id": "codex", "displayName": "Codex", "variants": [{ "commExact": ["codex"] }, { "argv0Basename": ["codex"] }] },
+        { "id": "a3s-code", "agentScopeId": "a3s code", "displayName": "A3S Code", "variants": [{ "commExact": ["a3s", "a3s-code", "a3s code"] }, { "argv0Basename": ["a3s", "a3s-code"] }, { "argvPrefix": ["a3s code", "a3s-code"] }] },
+        { "id": "claude-code", "agentScopeId": "Claude Code", "displayName": "Claude Code", "variants": [{ "commExact": ["claude", "claude-code", "claude code"] }, { "argv0Basename": ["claude", "claude-code"] }] },
+        { "id": "gemini-cli", "displayName": "Gemini CLI", "variants": [{ "commExact": ["gemini", "gemini-cli", "gemini cli"] }, { "argv0Basename": ["gemini", "gemini-cli"] }] },
+        { "id": "pi", "displayName": "Pi", "variants": [{ "commExact": ["pi"] }, { "argv0Basename": ["pi"] }] },
+        { "id": "kimi-cli", "displayName": "Kimi Code CLI", "variants": [{ "commExact": ["Kimi Code", "kimi", "kimi-cli"] }, { "argv0Basename": ["kimi", "kimi-cli"] }] }
+      ]
+    }
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -62,20 +75,41 @@ spec:
             - { name: ANYSENTRY_HEARTBEAT_SECS, value: "30" }
             # Retain unresolved identities for later review, stop reviewed non-Agents, and keep
             # routine pseudo-filesystem noise independent from identity classification.
-            - { name: FORWARD_FILTER_MODE, value: "enforce" }
+            # Roll out new attribution in shadow first. Switch this to `enforce` only after the
+            # real local/Docker/Kubernetes comparison meets the documented acceptance gates.
+            - { name: FORWARD_FILTER_MODE, value: "shadow" }
             - { name: FORWARD_RETAIN_UNKNOWN, value: "true" }
             - { name: FORWARD_RETAIN_NON_AGENT, value: "false" }
             - { name: FORWARD_NOISE_POLICY, value: "balanced" }
             - { name: ANYSENTRY_INGEST_URL, value: "http://anysentry:29653/security-center/ingest" }
             - { name: ANYSENTRY_IDENTITY_SNAPSHOT_URL, value: "http://anysentry:29653/security-center/identity/snapshot" }
             - { name: ANYSENTRY_IDENTITY_SNAPSHOT_SECS, value: "15" }
+            - { name: FORWARD_IDENTITY_SNAPSHOT_MAX_BYTES, value: "4194304" }
             - { name: ANYSENTRY_AGENT_TEMPLATES_FILE, value: "/etc/anysentry/agent-templates.json" }
-            # Bound memory and amortize HTTP/JSON overhead without adding perceptible UI delay.
+            # Low-trust exact process signatures hot-reload to probable_agent only. ConfigMap
+            # projection is read-only; operators update it with kubectl, while directory watch plus
+            # periodic hash polling handles Kubernetes' atomic `..data` symlink rotation.
+            - { name: ANYSENTRY_AGENT_RUNTIME_SIGNATURES_FILE, value: "/etc/anysentry/agent-runtime-signatures.json" }
+            - { name: ANYSENTRY_AGENT_RUNTIME_LEASE_URL, value: "http://anysentry:29653/security-center/runtime/lease" }
+            - { name: ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL, value: "http://anysentry:29653/security-center/runtime/snapshot" }
+            - { name: ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_SECS, value: "10" }
+            - { name: ANYSENTRY_AGENT_RUNTIME_LIVENESS_SECS, value: "5" }
+            # Bound total Forwarder ownership across queued, in-flight, and API-authorized retry
+            # states; the retry window plus this budget covers a bounded ClickHouse restart.
             - { name: FORWARD_BATCH_SIZE, value: "32" }
             - { name: FORWARD_BATCH_FLUSH_MS, value: "50" }
-            - { name: FORWARD_MAX_QUEUE, value: "4096" }
-          command: ["/bin/sh", "-c"]
-          args: ["a3s-observer-collector | node /opt/observer-forward.js"]
+            - { name: FORWARD_BATCH_MAX_BYTES, value: "524288" }
+            - { name: FORWARD_MAX_EVENT_BYTES, value: "3145728" }
+            - { name: FORWARD_MAX_OUTSTANDING_EVENTS, value: "16384" }
+            - { name: FORWARD_MAX_OUTSTANDING_BYTES, value: "67108864" }
+            - { name: FORWARD_RETRY_BASE_DELAY_MS, value: "250" }
+            - { name: FORWARD_RETRY_MAX_DELAY_MS, value: "2000" }
+            - { name: FORWARD_RETRY_MAX_AGE_MS, value: "45000" }
+            # Forwarder event/control drain < PID 1 child supervision < Kubernetes grace.
+            - { name: FORWARD_SHUTDOWN_TIMEOUT_MS, value: "15000" }
+            - { name: OBSERVER_SUPERVISOR_SHUTDOWN_TIMEOUT_MS, value: "20000" }
+          command: ["/usr/local/bin/node"]
+          args: ["/opt/observer-supervisor.js"]
           volumeMounts:
             - { name: sys, mountPath: /sys, readOnly: true } # tracepoint ids under /sys
             - { name: agent-templates, mountPath: /etc/anysentry, readOnly: true }

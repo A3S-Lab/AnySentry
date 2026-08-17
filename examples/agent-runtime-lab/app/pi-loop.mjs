@@ -8,8 +8,16 @@ import { fileURLToPath } from 'node:url';
 const appDir = path.dirname(fileURLToPath(import.meta.url));
 const piBin = path.resolve(appDir, '../node_modules/.bin/pi');
 const workspace = process.env.AGENT_WORKSPACE || '/workspace';
-const intervalMs = Math.max(1, Number(process.env.AGENT_INTERVAL_SECONDS || 60)) * 1000;
-const retryMs = Math.max(1, Number(process.env.PI_RETRY_SECONDS || 10)) * 1000;
+
+function durationMs(value, fallbackSeconds, minSeconds, maxSeconds) {
+  const parsed = Number(value);
+  const seconds = Number.isFinite(parsed) ? parsed : fallbackSeconds;
+  return Math.round(Math.max(minSeconds, Math.min(maxSeconds, seconds)) * 1000);
+}
+
+const intervalMs = durationMs(process.env.AGENT_INTERVAL_SECONDS, 60, 1, 86_400);
+const retryMs = durationMs(process.env.PI_RETRY_SECONDS, 10, 1, 3_600);
+const turnTimeoutMs = durationMs(process.env.PI_TURN_TIMEOUT_SECONDS, 90, 10, 3_600);
 const agentId = process.env.AGENT_ID || 'pi-coding-agent';
 const requestedMode = (process.env.PI_EXECUTION_MODE || 'auto').toLowerCase();
 
@@ -34,6 +42,8 @@ const executionMode = requestedMode === 'auto'
 
 let stopping = false;
 let child;
+let childForceKillTimer;
+let wakeDelay;
 
 function log(event, fields = {}) {
   console.log(JSON.stringify({
@@ -46,7 +56,26 @@ function log(event, fields = {}) {
 }
 
 function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      if (wakeDelay === finish) wakeDelay = undefined;
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    wakeDelay = finish;
+  });
+}
+
+function terminateChild() {
+  const active = child;
+  if (!active) return;
+  active.kill('SIGTERM');
+  clearTimeout(childForceKillTimer);
+  childForceKillTimer = setTimeout(() => {
+    if (child === active) active.kill('SIGKILL');
+  }, 3_000);
+  childForceKillTimer.unref();
 }
 
 function emitLocalIdentityProbe() {
@@ -72,6 +101,7 @@ function childArgs(round) {
   const args = [
     '--mode',
     'json',
+    '--print',
     ...common,
     '--tools',
     'read,bash,write,ls',
@@ -102,7 +132,9 @@ async function runPi(round) {
   });
 
   return await new Promise((resolve) => {
-    child = spawn(piBin, args, {
+    let timedOut = false;
+    let settled = false;
+    const spawned = spawn(piBin, args, {
       cwd: workspace,
       env: {
         ...process.env,
@@ -110,20 +142,35 @@ async function runPi(round) {
         PI_SKIP_VERSION_CHECK: '1',
         PI_TELEMETRY: '0',
       },
-      stdio: ['pipe', 'pipe', 'pipe'],
+      stdio: [executionMode === 'rpc' ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     });
+    child = spawned;
 
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    child.stdout.on('data', (data) => process.stdout.write(data));
-    child.stderr.on('data', (data) => process.stderr.write(data));
-    child.once('error', (error) => {
+    spawned.stdout.setEncoding('utf8');
+    spawned.stderr.setEncoding('utf8');
+    spawned.stdout.on('data', (data) => process.stdout.write(data));
+    spawned.stderr.on('data', (data) => process.stderr.write(data));
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(turnTimer);
+      clearTimeout(childForceKillTimer);
+      if (child === spawned) child = undefined;
+      resolve(timedOut ? 124 : code);
+    };
+    const turnTimer = setTimeout(() => {
+      timedOut = true;
+      log('pi_process_timeout', { round, timeoutSeconds: turnTimeoutMs / 1000 });
+      terminateChild();
+    }, turnTimeoutMs);
+    turnTimer.unref();
+    spawned.once('error', (error) => {
       log('pi_process_error', { round, error: error.message });
+      finish(127);
     });
-    child.once('exit', (code, signal) => {
+    spawned.once('exit', (code, signal) => {
       log('pi_process_exited', { round, code, signal });
-      child = undefined;
-      resolve(code ?? 1);
+      finish(code ?? 1);
     });
 
     writeFile('/tmp/agent-ready', `${Date.now()}\n`, 'utf8').catch((error) => {
@@ -136,7 +183,8 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
     stopping = true;
     log('shutdown_requested', { signal });
-    child?.kill('SIGTERM');
+    wakeDelay?.();
+    terminateChild();
   });
 }
 
@@ -166,9 +214,12 @@ async function main() {
     if (executionMode === 'rpc') {
       log('rpc_restart_scheduled', { code, retrySeconds: retryMs / 1000 });
       await delay(retryMs);
-    } else {
+    } else if (code === 0) {
       log('next_agent_turn_scheduled', { code, intervalSeconds: intervalMs / 1000 });
       await delay(intervalMs);
+    } else {
+      log('pi_retry_scheduled', { code, retrySeconds: retryMs / 1000 });
+      await delay(retryMs);
     }
   }
 }

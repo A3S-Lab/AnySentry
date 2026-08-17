@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: a3s-observer
+  namespace: anysentry
+spec:
+  template:
+    metadata:
+      annotations:
+        anysentry.io/manual-observer-profile: "agent-enforce-docker-no-files-v2"
+    spec:
+      containers:
+        - name: a3s-observer
+          env:
+            # The manual test is deterministic: Kubernetes/Docker workload metadata and exact
+            # runtime signatures identify Agents. Background behavior promotion is intentionally
+            # disabled so unrelated host churn cannot become an unbounded ingest source.
+            - { name: ANYSENTRY_BEHAVIOR_DISCOVERY, value: "off" }
+            - { name: FORWARD_FILTER_MODE, value: "enforce" }
+            - { name: FORWARD_RETAIN_UNKNOWN, value: "false" }
+            - { name: FORWARD_RETAIN_NON_AGENT, value: "false" }
+            # FileAccess/FileDelete overwhelms the upstream fixed FILE_EVENTS ring on this shared
+            # single node even after the Docker AnySentry backend and duplicate Observer stop.
+            # Keep the lossless ToolExec/Exit, Egress/DNS/process/security and SSL signal set.
+            - { name: A3S_OBSERVER_FILES, value: "0" }
+            - { name: A3S_OBSERVER_SSL, value: "1" }
+            # This single host also runs the retained Docker Pi workload. Reuse the same Observer
+            # and enrich its eBPF events from the Docker lifecycle/inspect stream.
+            - { name: ANYSENTRY_DOCKER_DISCOVERY, value: "on" }
+            - { name: ANYSENTRY_DOCKER_SOCKET, value: "/var/run/docker.sock" }
+            # The API currently persists judged events synchronously. Keep requests small so one
+            # slow insert cannot make a 128-event adaptive batch ambiguous, while the existing
+            # outstanding event/byte limits still bound total ownership.
+            - { name: FORWARD_BATCH_SIZE, value: "1" }
+            - { name: FORWARD_HTTP_TIMEOUT_MS, value: "30000" }
+            - { name: ANYSENTRY_BATCH_INGEST_URL, value: "http://anysentry:29653/security-center/ingest/batch" }
+          volumeMounts:
+            - { name: docker-sock, mountPath: /var/run/docker.sock, readOnly: true }
+      volumes:
+        - { name: docker-sock, hostPath: { path: /var/run/docker.sock, type: Socket } }

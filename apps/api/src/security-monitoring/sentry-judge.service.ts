@@ -3,20 +3,32 @@ import { createHash } from 'node:crypto';
 import { Sentry, dns, egress, fileAccess, securityAction, sslContent, toolExec } from '@a3s-lab/sentry';
 import { AgentAttributionService } from './agent-attribution.service';
 import { AlertingService } from './alerting.service';
-import { ClickHouseStore, DashboardWindowHistory, IncidentState, StoredEventQuery } from './clickhouse-store';
+import { ClickHouseStore, DashboardWindowHistory, IncidentState, StoredAgentBucketFact, StoredAgentMetricBucketFact, StoredAgentWindowFact, StoredEventQuery, StoredEventSearchResult, StoredTopologyBucketFact, StoredTopologyWindowFact, StoredWorkspaceBucketFact, StoredWorkspaceWindowFact } from './clickhouse-store';
 import { DEFAULT_POLICY, PolicyConfig, buildFastAcl, policyConfigError, sanitizePolicy, tierStatus } from './policy-config';
 import { cleanText } from './redaction';
 import { DecisionResultJob, FastJudgeJob } from './async-judgment.types';
 import { JudgmentQueueService } from './judgment-queue.service';
 import { RuntimeModelConfigService } from './runtime-model-config';
+import { DistributedCurrentStateService } from './distributed-current-state.service';
+import { RelationalBusinessStore } from './relational-business-store.service';
 import { resolveJudgmentRoute } from './identity-judgment-routing';
-import { CollectorHeartbeatRecord, CollectorHeartbeatRequest, EventCategory, EventMeta, IdentityAiReviewRecord, Incident, IncidentStatus, JudgedEvent, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
+import { isNewerEventRevision } from './event-revision';
+import { normalizeActivitySemantics } from './activity-context';
+import { CollectorHeartbeatOrigin, CollectorHeartbeatRecord, CollectorHeartbeatRequest, CollectorRawHeartbeatRequest, EventCategory, EventMeta, IdentityAiReviewRecord, Incident, IncidentStatus, JudgedEvent, JudgmentRouteReason, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
 
 const SEVERITY_SCORE: Record<Severity, number> = { info: 8, low: 28, medium: 52, high: 76, critical: 95 };
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 const SCHEMA_VERSION: JudgedEvent['schemaVersion'] = 'anysentry.agent_event.v1';
 const SECURITY_JUDGED_KINDS = new Set(['ToolExec', 'Egress', 'Dns', 'FileAccess', 'SslContent', 'SecurityAction']);
 const DEFAULT_INTERNAL_L3_BIN = '/opt/anysentry/l3-agent.mjs';
+const COLLECTOR_HEARTBEAT_SHUTDOWN_TIMEOUT_MS = 5_000;
+const RELATIONAL_REFRESH_MS = 15_000;
+const boundedEnvInt = (name: string, fallback: number, min: number, max: number): number => {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) ? Math.min(max, Math.max(min, Math.trunc(value))) : fallback;
+};
 const RISK_NAME_BY_CATEGORY: Record<string, string> = {
   systemic_risk: '云元数据 SSRF',
   privilege_escalation: '提权 / 进程注入',
@@ -177,9 +189,22 @@ function stringAttr(value: unknown): string | undefined {
   return text || undefined;
 }
 
+function stringLikeAttr(value: unknown): string | undefined {
+  if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'bigint') return undefined;
+  const text = String(value).trim();
+  return text || undefined;
+}
+
 function numberAttr(value: unknown): number | undefined {
   const n = Number(value);
   return Number.isFinite(n) ? n : undefined;
+}
+
+function isIncompleteToolEvidence(e: JudgedEvent): boolean {
+  return e.eventKind === 'ToolExec'
+    && e.verdict === 'escalate'
+    && e.tier === 'Rules'
+    && e.reason.toLowerCase().includes('incomplete toolexec evidence: argv was truncated or could not be fully reassembled');
 }
 
 function processFromAttributes(attributes: Record<string, unknown>): ProcessContext | undefined {
@@ -191,10 +216,14 @@ function processFromAttributes(attributes: Record<string, unknown>): ProcessCont
     comm: stringAttr(attributes.comm),
     exe: stringAttr(attributes.exe),
     cgroup: stringAttr(attributes.cgroup),
+    cgroupId: stringLikeAttr(attributes.cgroupId) ?? stringLikeAttr(attributes.cgroup_id),
     systemdUnit: stringAttr(attributes.systemdUnit),
-    hostId: stringAttr(attributes.hostId),
+    hostId: stringAttr(attributes.hostId) ?? stringAttr(attributes.host_id),
+    bootId: stringAttr(attributes.bootId) ?? stringAttr(attributes.boot_id),
     eventTimeNs: stringAttr(attributes.eventTimeNs),
-    startTimeNs: stringAttr(attributes.startTimeNs),
+    startTimeTicks: stringLikeAttr(attributes.startTimeTicks) ?? stringLikeAttr(attributes.start_time_ticks),
+    startTimeNs: stringLikeAttr(attributes.startTimeNs) ?? stringLikeAttr(attributes.start_time_ns),
+    mountNamespace: numberAttr(attributes.mountNamespace) ?? numberAttr(attributes.mount_namespace),
   };
   return Object.values(ctx).some((value) => value !== undefined) ? ctx : undefined;
 }
@@ -203,6 +232,11 @@ type JudgedEventBase = Omit<
   JudgedEvent,
   'verdict' | 'tier' | 'severity' | 'reason' | 'actionKind' | 'actionTarget' | 'riskCategory' | 'riskName' | 'riskType' | 'riskScore'
 >;
+
+export type JudgeAcceptOutcome =
+  | { disposition: 'retained'; event: JudgedEvent }
+  | { disposition: 'discarded'; reasonCode: JudgmentRouteReason }
+  | { disposition: 'rejected'; reasonCode: 'unsupported_or_unparseable' };
 
 function producerReportedFinding(base: JudgedEventBase): {
   severity: Severity;
@@ -248,25 +282,42 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     private readonly attributionService: AgentAttributionService,
     private readonly queues: JudgmentQueueService,
     private readonly runtimeModels: RuntimeModelConfigService,
+    private readonly currentState: DistributedCurrentStateService,
+    private readonly relational: RelationalBusinessStore,
   ) {}
 
   private sentry!: Sentry;
-  // In-memory hot ring: the dashboard's fast, synchronous read/aggregation path. Durability + retention
-  // live in ClickHouse (see ClickHouseStore); the ring is hydrated from it on boot so date windows
-  // survive restarts/rollouts. ponytail: ring covers all windows at realistic volume; if a window ever
-  // needs more than MAX rows, query ClickHouse for that window instead of the ring.
+  // In-memory hot ring: bounded low-latency cache for uncommitted facts and explicit degraded-mode
+  // fallbacks. Historical existence, complete time windows, lists, and aggregates belong to
+  // ClickHouse; no user-facing history may silently inherit this ring's MAX limit.
   private readonly store: JudgedEvent[] = [];
   private readonly storeById = new Map<string, JudgedEvent>();
-  private readonly MAX = 100_000;
-  private readonly TRIM_BATCH = 1_000;
+  private readonly resultApplyLocks = new Map<string, Promise<void>>();
+  private readonly MAX = (() => {
+    const primary = process.env.ANYSENTRY_HOT_EVENT_LIMIT?.trim();
+    // The remote name is canonical. The old name remains a compatibility fallback for existing
+    // deployments; the local hardening's 10k default and the shared 1k..100k bounds are retained.
+    return boundedEnvInt(
+      primary ? 'ANYSENTRY_HOT_EVENT_LIMIT' : 'ANYSENTRY_EVENT_RING_MAX',
+      10_000,
+      1_000,
+      100_000,
+    );
+  })();
+  private readonly TRIM_BATCH = Math.min(1_000, Math.max(100, Math.floor(this.MAX / 10)));
   private readonly collectorHeartbeats: CollectorHeartbeatRecord[] = [];
   private readonly MAX_COLLECTOR_HEARTBEATS = 10_000;
   private collectorHeartbeatPersistTimer?: NodeJS.Timeout;
+  private collectorHeartbeatShutdownTimeoutMs = COLLECTOR_HEARTBEAT_SHUTDOWN_TIMEOUT_MS;
   private timer?: NodeJS.Timeout;
   private readonly ch = new ClickHouseStore();
   private readonly incidents = new Map<string, Incident>();
+  private incidentPersistenceReady = false;
+  private incidentRelationalRefreshTimer?: NodeJS.Timeout;
+  private policyRelationalRefreshTimer?: NodeJS.Timeout;
   // The live editable judge policy (the config panels' target). Applied = ACL rebuilt + judge recreated.
   private policy: PolicyConfig = DEFAULT_POLICY;
+  private policyUpdatedAt = 0;
 
   async onModuleInit(): Promise<void> {
     // fail_closed=false → judge-only (no kernel enforcement); built-in rule set always applies.
@@ -276,7 +327,16 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       const saved = await this.ch.loadConfig();
       if (saved) this.applyPolicy(sanitizePolicy(saved));
       const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
-      const hist = await this.ch.hydrate(Date.now() - THIRTY_DAYS, this.MAX);
+      // The hot ring is a cache, not the historical source of truth. Hydrating all 100k entries
+      // (and extra judgment revisions) delays API startup and can exhaust a small ClickHouse
+      // container. Start with a bounded warm slice; durable history remains queryable in CH.
+      const hydrateLimit = boundedEnvInt(
+        'ANYSENTRY_HOT_HYDRATE_LIMIT',
+        Math.min(this.MAX, 1_000),
+        1_000,
+        this.MAX,
+      );
+      const hist = await this.ch.hydrate(Date.now() - THIRTY_DAYS, hydrateLimit);
       this.store.push(...hist); // direct (not push()) so hydrated rows aren't re-written to ClickHouse
       const historicalScopes: Array<{ event: JudgedEvent; incidentId: string }> = [];
       for (const rec of hist) {
@@ -288,9 +348,32 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       this.applyIncidentState(await this.ch.loadIncidentState());
       const heartbeats = await this.ch.loadCollectorHeartbeats();
       for (const heartbeat of heartbeats.sort((a, b) => a.at - b.at).slice(-this.MAX_COLLECTOR_HEARTBEATS)) {
-        this.addCollectorHeartbeat(heartbeat, false);
+        // Hydration reconstructs query state; it must not replay historical notifications. Raw
+        // records written before provenance existed are normalized so the old exec_incomplete
+        // compatibility fallback cannot re-enter operational error metrics after a restart.
+        this.addCollectorHeartbeat(this.normalizeHydratedCollectorHeartbeat(heartbeat), false, false);
       }
     }
+    const savedPolicy = await this.relational.loadPolicyConfig();
+    if (savedPolicy) {
+      this.applyPolicy(sanitizePolicy(savedPolicy.config));
+      this.policyUpdatedAt = savedPolicy.updatedAt;
+    }
+    if (this.policyUpdatedAt === 0) this.policyUpdatedAt = Date.now();
+    await this.relational.savePolicyConfig(this.policy, this.policyUpdatedAt);
+    for (const incident of await this.relational.loadIncidents()) {
+      this.mergePersistedIncident(incident);
+    }
+    this.incidentPersistenceReady = true;
+    await this.persistIncidentState([...this.incidents.values()]);
+    this.incidentRelationalRefreshTimer = setInterval(
+      () => void this.refreshRelationalIncidents(),
+      RELATIONAL_REFRESH_MS,
+    );
+    this.policyRelationalRefreshTimer = setInterval(
+      () => void this.refreshRelationalPolicy(),
+      RELATIONAL_REFRESH_MS,
+    );
     // Real by default: the store fills only from /ingest (a real a3s-observer feed). The synthetic
     // event generator is opt-in demo load (ANYSENTRY_SYNTHETIC_FEED=on); sentry still really judges it.
     if (process.env.ANYSENTRY_SYNTHETIC_FEED === 'on') {
@@ -301,8 +384,25 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   async onModuleDestroy(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     if (this.collectorHeartbeatPersistTimer) clearTimeout(this.collectorHeartbeatPersistTimer);
-    await this.persistCollectorHeartbeats();
-    await this.ch.close();
+    if (this.incidentRelationalRefreshTimer) clearInterval(this.incidentRelationalRefreshTimer);
+    if (this.policyRelationalRefreshTimer) clearInterval(this.policyRelationalRefreshTimer);
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort('collector heartbeat shutdown persistence timed out'),
+      this.collectorHeartbeatShutdownTimeoutMs,
+    );
+    try {
+      try {
+        await this.persistCollectorHeartbeats(controller.signal);
+      } finally {
+        await this.persistIncidentState(this.incidents ? [...this.incidents.values()] : []);
+      }
+    } finally {
+      clearTimeout(timeout);
+      // Event rows are the durable evidence path. Always give their bounded drain the remaining
+      // 20 seconds, even when the best-effort heartbeat snapshot failed or timed out.
+      await this.ch.close();
+    }
   }
 
   /** Rebuild the sentry ACL from the policy and recreate the judge in place (built-in rules always
@@ -323,23 +423,129 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return { policy: this.policy, status: this.availableTiers() };
   }
 
+  policyStateStatus() {
+    return {
+      updatedAt: this.policyUpdatedAt,
+      postgresqlBacked: this.relational.isReady(),
+      clickhouseMigrationCopy: this.ch.enabled,
+    };
+  }
+
   private availableTiers(): ReturnType<typeof tierStatus> {
     const configured = tierStatus(this.policy);
     return {
       l1: true,
-      l2: configured.l2 && Boolean(this.runtimeModels.get('fast_review')),
-      l3: configured.l3 && Boolean(this.runtimeModels.get('deep_investigation')),
+      l2: configured.l2 && this.runtimeModels.isCallable('fast_review'),
+      l3: configured.l3 && this.runtimeModels.isCallable('deep_investigation'),
     };
   }
 
-  storageStatus(): { mode: 'clickhouse' | 'memory'; clickhouseConfigured: boolean; clickhouseReady: boolean } {
+  storageStatus(): {
+    mode: 'clickhouse' | 'memory';
+    clickhouseConfigured: boolean;
+    clickhouseReady: boolean;
+    hotRingSize: number;
+    hotRingCapacity: number;
+  } {
     const clickhouseConfigured = Boolean(process.env.CLICKHOUSE_URL);
     const clickhouseReady = this.ch.enabled;
-    return { mode: clickhouseReady ? 'clickhouse' : 'memory', clickhouseConfigured, clickhouseReady };
+    return {
+      mode: clickhouseReady ? 'clickhouse' : 'memory',
+      clickhouseConfigured,
+      clickhouseReady,
+      hotRingSize: this.store.length,
+      hotRingCapacity: this.MAX,
+    };
   }
 
-  async searchStoredEvents(query: StoredEventQuery): Promise<JudgedEvent[]> {
+  dashboardBucketSnapshotStatus() {
+    return this.ch.dashboardBucketSnapshotStatus();
+  }
+
+  async searchStoredEvents(query: StoredEventQuery): Promise<JudgedEvent[] | null> {
     return this.ch.searchEvents(query);
+  }
+
+  async searchStoredEventsPage(query: StoredEventQuery): Promise<StoredEventSearchResult> {
+    return this.ch.searchEventsPage(query);
+  }
+
+  committedEventCutoffMs(): number | undefined {
+    return this.ch.committedCutoffMs();
+  }
+
+  committedEventProgress() {
+    return this.ch.committedProgress();
+  }
+
+  agentWindowFacts(
+    sinceMs: number,
+    untilMs: number,
+    monitoredOnly: boolean,
+    excludedEventIds: string[] = [],
+  ): Promise<StoredAgentWindowFact[] | null> {
+    return this.ch.agentWindowFacts(sinceMs, untilMs, monitoredOnly, excludedEventIds);
+  }
+
+  agentWindowBucketFacts(
+    sinceMs: number,
+    endExclusiveMs: number,
+    bucketMs: number,
+    monitoredOnly: boolean,
+  ): Promise<StoredAgentBucketFact[] | null> {
+    return this.ch.agentWindowBucketFacts(sinceMs, endExclusiveMs, bucketMs, monitoredOnly);
+  }
+
+  agentMetricBucketFacts(
+    sinceMs: number,
+    untilMs: number,
+    bucketCount: number,
+    monitoredOnly: boolean,
+    excludedEventIds: string[] = [],
+  ): Promise<StoredAgentMetricBucketFact[] | null> {
+    return this.ch.agentMetricBucketFacts(sinceMs, untilMs, bucketCount, monitoredOnly, excludedEventIds);
+  }
+
+  workspaceWindowFacts(
+    sinceMs: number,
+    untilMs: number,
+    monitoredOnly: boolean,
+    excludedEventIds: string[] = [],
+  ): Promise<StoredWorkspaceWindowFact[] | null> {
+    return this.ch.workspaceWindowFacts(sinceMs, untilMs, monitoredOnly, excludedEventIds);
+  }
+
+  workspaceWindowBucketFacts(
+    sinceMs: number,
+    endExclusiveMs: number,
+    bucketMs: number,
+    monitoredOnly: boolean,
+  ): Promise<StoredWorkspaceBucketFact[] | null> {
+    return this.ch.workspaceWindowBucketFacts(sinceMs, endExclusiveMs, bucketMs, monitoredOnly);
+  }
+
+  topologyWindowFacts(
+    sinceMs: number,
+    untilMs: number,
+    excludedEventIds: string[] = [],
+  ): Promise<StoredTopologyWindowFact[] | null> {
+    return this.ch.topologyWindowFacts(sinceMs, untilMs, excludedEventIds);
+  }
+
+  topologyWindowBucketFacts(
+    sinceMs: number,
+    endExclusiveMs: number,
+    bucketMs: number,
+  ): Promise<StoredTopologyBucketFact[] | null> {
+    return this.ch.topologyWindowBucketFacts(sinceMs, endExclusiveMs, bucketMs);
+  }
+
+  storedCollectorHeartbeats(sinceMs: number, untilMs: number): Promise<CollectorHeartbeatRecord[] | null> {
+    return this.ch.queryCollectorHeartbeats(sinceMs, untilMs);
+  }
+
+  storedLatestCollectorHeartbeats(untilMs: number): Promise<CollectorHeartbeatRecord[] | null> {
+    return this.ch.latestCollectorHeartbeats(untilMs);
   }
 
   loadIdentityAiReviews(): Promise<IdentityAiReviewRecord[]> {
@@ -350,17 +556,26 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return this.ch.saveIdentityAiReviews(records);
   }
 
+  appendIdentityAiReviewRevision(record: IdentityAiReviewRecord): Promise<boolean> {
+    return this.ch.appendIdentityAiReviewRevision(record);
+  }
+
   /** Validate + apply a new policy, then persist it (survives restarts via ClickHouse). */
   async setPolicy(input: unknown): Promise<{ policy: PolicyConfig; status: ReturnType<typeof tierStatus> }> {
     const config = sanitizePolicy(input);
     this.applyPolicy(config);
-    await this.ch.saveConfig(config);
+    this.policyUpdatedAt = Date.now();
+    await Promise.all([
+      this.ch.saveConfig(config),
+      this.relational.savePolicyConfig(config, this.policyUpdatedAt),
+    ]);
     return this.getPolicy();
   }
 
 
   private eventBase(line: string, meta: EventMeta, at: number): JudgedEventBase {
     const eventKind = meta.eventKind ?? 'Event';
+    const activity = normalizeActivitySemantics(eventKind, meta.activityContext, meta.activitySubtype);
     const ids = { workspacePath: meta.workspacePath, agentId: meta.agentId, sessionId: meta.sessionId, userId: meta.userId };
     const attributes = meta.attributes ?? {};
     const process = meta.process ?? processFromAttributes(attributes);
@@ -373,7 +588,9 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       sourceEventId: meta.sourceEventId,
       at,
       eventKind,
-      eventCategory: meta.eventCategory ?? eventCategory(eventKind),
+      eventCategory: activity.eventCategory ?? meta.eventCategory ?? eventCategory(eventKind),
+      activityContext: activity.activityContext,
+      activitySubtype: activity.activitySubtype,
       source: meta.source ?? 'observer',
       subject: meta.subject ?? eventKind,
       ...ids,
@@ -465,42 +682,61 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  async accept(line: string, meta: EventMeta, at = Date.now()): Promise<JudgedEvent | null> {
-    if (!this.queues.enabled) return this.judge(line, meta, at);
+  async acceptWithDisposition(line: string, meta: EventMeta, at = Date.now()): Promise<JudgeAcceptOutcome> {
     const base = this.eventBase(line, meta, at);
+    if (!SECURITY_JUDGED_KINDS.has(base.eventKind) && !OBSERVER_KINDS.has(base.eventKind) && base.source !== 'api') {
+      return { disposition: 'rejected', reasonCode: 'unsupported_or_unparseable' };
+    }
     const routing = resolveJudgmentRoute(base.attribution?.classification, this.policy, this.availableTiers());
-    if (routing.profile === 'discard') return null;
-    if (this.isInternalL3Invocation(line, base)) return this.recordInternalL3Activity(base);
+    if (routing.profile === 'discard') return { disposition: 'discarded', reasonCode: routing.reason };
+    if (!this.queues.enabled) {
+      const event = this.judge(
+        line,
+        meta.attribution || !base.attribution ? meta : { ...meta, attribution: base.attribution },
+        at,
+      );
+      return event
+        ? { disposition: 'retained', event }
+        : { disposition: 'rejected', reasonCode: 'unsupported_or_unparseable' };
+    }
+    if (this.isInternalL3Invocation(line, base)) {
+      return { disposition: 'retained', event: this.recordInternalL3Activity(base) };
+    }
     const producerFinding = producerReportedFinding(base);
     if (producerFinding) {
-      return this.recordProducerFinding(base, producerFinding, {
-        ...routing,
-        policyVersion: this.policyVersion(),
-        l1Verdict: 'escalate',
-        nextTierEligible: false,
-        stopReason: 'producer_finding',
-      });
-    }
-    if (!SECURITY_JUDGED_KINDS.has(base.eventKind)) {
-      if (!OBSERVER_KINDS.has(base.eventKind) && base.source !== 'api') return null;
-      return this.push({
-        ...base,
-        verdict: 'allow',
-        tier: 'Rules',
-        severity: 'info',
-        reason: 'observed',
-        riskCategory: 'benign',
-        riskName: '正常',
-        riskType: 'atomic',
-        riskScore: 0,
-        judgment: {
+      return {
+        disposition: 'retained',
+        event: this.recordProducerFinding(base, producerFinding, {
           ...routing,
           policyVersion: this.policyVersion(),
-          l1Verdict: 'allow',
+          l1Verdict: 'escalate',
           nextTierEligible: false,
-          stopReason: 'no_applicable_l1_rule',
-        },
-      });
+          stopReason: 'producer_finding',
+        }),
+      };
+    }
+    if (!SECURITY_JUDGED_KINDS.has(base.eventKind)) {
+      return {
+        disposition: 'retained',
+        event: this.push({
+          ...base,
+          verdict: 'allow',
+          tier: 'Rules',
+          severity: 'info',
+          reason: 'observed',
+          riskCategory: 'benign',
+          riskName: '正常',
+          riskType: 'atomic',
+          riskScore: 0,
+          judgment: {
+            ...routing,
+            policyVersion: this.policyVersion(),
+            l1Verdict: 'allow',
+            nextTierEligible: false,
+            stopReason: 'no_applicable_l1_rule',
+          },
+        }),
+      };
     }
 
     const policyVersion = this.policyVersion();
@@ -510,6 +746,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       decisionStatus: 'pending',
       evaluationId,
       policyVersion,
+      decisionRevision: 1,
       decisionUpdatedAt: Date.now(),
       verdict: 'escalate',
       tier: 'Rules',
@@ -538,24 +775,62 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     };
     try {
       await this.queues.enqueueFast(job);
-      return pending;
+      return { disposition: 'retained', event: pending };
     } catch (error) {
       const failed: JudgedEvent = {
         ...pending,
         decisionStatus: 'failed',
+        decisionRevision: 2,
         decisionUpdatedAt: Date.now(),
         reason: '研判队列不可用: ' + (error instanceof Error ? error.message : String(error)).slice(0, 500),
       };
-      await this.ch.insertNow(failed);
+      try {
+        await this.ch.insertNow(failed);
+      } catch (persistError) {
+        // `pending` was already durably accepted above. Do not let a secondary failure-revision
+        // write replace the primary queue error with EVENT_BUFFER_FULL: the batch controller may
+        // retry only an event that was provably never accepted. Keep the in-memory state accurate
+        // and retain both causes in the log for diagnosis.
+        console.error('[judge] failed to persist asynchronous judgment failure revision', {
+          eventId: pending.eventId,
+          queueError: error instanceof Error ? error.message.split('\n')[0].slice(0, 300) : String(error).slice(0, 300),
+          persistError: persistError instanceof Error
+            ? persistError.message.split('\n')[0].slice(0, 300)
+            : String(persistError).slice(0, 300),
+        });
+      }
       this.upsertMemory(failed, false);
       throw error;
     }
   }
 
+  async accept(line: string, meta: EventMeta, at = Date.now()): Promise<JudgedEvent | null> {
+    const outcome = await this.acceptWithDisposition(line, meta, at);
+    return outcome.disposition === 'retained' ? outcome.event : null;
+  }
+
 
   async applyAsyncResult(result: DecisionResultJob): Promise<void> {
+    const eventId = result.event.eventId;
+    const previous = this.resultApplyLocks.get(eventId) ?? Promise.resolve();
+    const current = previous
+      .catch(() => undefined)
+      .then(() => this.applyAsyncResultUnlocked(result));
+    this.resultApplyLocks.set(eventId, current);
+    try {
+      await current;
+    } finally {
+      if (this.resultApplyLocks.get(eventId) === current) this.resultApplyLocks.delete(eventId);
+    }
+  }
+
+  private async applyAsyncResultUnlocked(result: DecisionResultJob): Promise<void> {
     const current = this.storeById.get(result.event.eventId);
     if (current && (current.decisionUpdatedAt ?? current.at) >= result.completedAt) return;
+    const decisionRevision = Math.max(
+      1,
+      Math.trunc(current?.decisionRevision ?? result.event.decisionRevision ?? 1),
+    ) + 1;
     const awaitingL3 = result.status === 'succeeded' && result.awaitingL3 === true;
     let next: JudgedEvent;
     if (result.decision) {
@@ -580,6 +855,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         decisionStatus: awaitingL3 ? 'pending' : result.status,
         evaluationId: result.evaluationId,
         policyVersion: result.policyVersion,
+        decisionRevision,
         decisionUpdatedAt: result.completedAt,
         verdict,
         tier: decision.tier as Tier,
@@ -611,6 +887,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         decisionStatus: result.status,
         evaluationId: result.evaluationId,
         policyVersion: result.policyVersion,
+        decisionRevision,
         decisionUpdatedAt: result.completedAt,
         reason: result.stage + '研判' + result.status + ': ' + (result.error ?? 'unknown error'),
         latencyMs: Math.max(1, result.completedAt - result.startedAt),
@@ -618,6 +895,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     }
     await this.ch.insertNow(next);
     this.upsertMemory(next, !awaitingL3 && result.status === 'succeeded');
+    this.alerting.observeJudgmentResult(result);
   }
 
   /** Judge one observer event against the live sentry policy and record it. Kinds sentry doesn't
@@ -625,6 +903,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
    *  so the dashboard counts ALL observer features. LlmApi carries real token usage. */
   judge(line: string, meta: EventMeta, at = Date.now()): JudgedEvent | null {
     const eventKind = meta.eventKind ?? 'Event';
+    const activity = normalizeActivitySemantics(eventKind, meta.activityContext, meta.activitySubtype);
     const tokenCount = meta.tokenCount ?? extractTokens(line, eventKind);
     const latencyMs = meta.latencyMs ?? 1; // L1 rule eval is sub-ms
     const ids = { workspacePath: meta.workspacePath, agentId: meta.agentId, sessionId: meta.sessionId, userId: meta.userId };
@@ -645,7 +924,9 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       sourceEventId: meta.sourceEventId,
       at,
       eventKind,
-      eventCategory: meta.eventCategory ?? eventCategory(eventKind),
+      eventCategory: activity.eventCategory ?? meta.eventCategory ?? eventCategory(eventKind),
+      activityContext: activity.activityContext,
+      activitySubtype: activity.activitySubtype,
       source: meta.source ?? 'observer',
       subject,
       ...ids,
@@ -725,12 +1006,13 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
 
   private upsertMemory(rec: JudgedEvent, notify: boolean): JudgedEvent {
     const current = this.storeById.get(rec.eventId);
+    if (current && !isNewerEventRevision(rec, current)) return current;
     if (current) Object.assign(current, rec);
     else {
       this.store.push(rec);
       this.storeById.set(rec.eventId, rec);
     }
-    if (this.store.length > this.MAX + this.TRIM_BATCH) {
+    if (this.store.length > this.MAX) {
       for (const removed of this.store.splice(0, this.TRIM_BATCH)) {
         if (this.storeById.get(removed.eventId) === removed) this.storeById.delete(removed.eventId);
       }
@@ -738,7 +1020,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const effective = current ?? rec;
     if (notify) {
       const incident = this.ingestIncident(effective);
-      this.alerting.observeEvent(effective);
+      this.alerting.observeEvent(effective, incident?.incidentId);
       if (incident) this.alerting.observeIncident(incident);
     }
     return effective;
@@ -748,19 +1030,22 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const normalized: JudgedEvent = {
       ...rec,
       decisionStatus: rec.decisionStatus ?? 'succeeded',
+      decisionRevision: Math.max(1, Math.trunc(rec.decisionRevision ?? 1)),
       decisionUpdatedAt: rec.decisionUpdatedAt ?? Date.now(),
     };
-    this.upsertMemory(normalized, true);
     this.ch.enqueue(normalized);
+    this.upsertMemory(normalized, true);
     return normalized;
   }
 
   private incidentId(e: JudgedEvent): string {
-    return hashId('inc', [e.workspacePath, e.agentId, e.sessionId, e.traceId, e.runId, e.riskCategory]);
+    const canonicalAgentId = e.attribution?.agentScopeId?.trim() || e.agentId;
+    return hashId('inc', [e.workspacePath, canonicalAgentId, e.sessionId, e.traceId, e.runId, e.riskCategory]);
   }
 
   private ingestIncident(e: JudgedEvent): Incident | null {
-    if (e.verdict === 'allow') return null;
+    if (e.verdict === 'allow' || isIncompleteToolEvidence(e)) return null;
+    const canonicalAgentId = e.attribution?.agentScopeId?.trim() || e.agentId;
     const incidentId = this.incidentId(e);
     const prev = this.incidents.get(incidentId);
     const severity = prev && SEVERITY_RANK[prev.severity] > SEVERITY_RANK[e.severity] ? prev.severity : e.severity;
@@ -792,7 +1077,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
           openedAt: e.at,
           updatedAt: e.at,
           workspacePath: e.workspacePath,
-          agentId: e.agentId,
+          agentId: canonicalAgentId,
           collectorId,
           sourceId,
           sessionId: e.sessionId,
@@ -811,7 +1096,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
           agentScopeId: e.attribution?.agentScopeId,
         };
     this.incidents.set(incidentId, next);
-    if (prev?.status === 'resolved') void this.ch.saveIncidentState([...this.incidents.values()]);
+    if (this.incidentPersistenceReady) void this.persistIncidentState([next]);
     return next;
   }
 
@@ -835,6 +1120,13 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return [...this.incidents.values()].filter((i) => i.updatedAt >= sinceMs);
   }
 
+  incidentStateStatus(): { recordCount: number; postgresqlBacked: boolean } {
+    return {
+      recordCount: this.incidents.size,
+      postgresqlBacked: this.relational.isReady(),
+    };
+  }
+
   updateIncident(incidentId: string, input: { status?: IncidentStatus; owner?: string; note?: string }, at = Date.now()): Incident | null {
     const cur = this.incidents.get(incidentId);
     if (!cur) return null;
@@ -849,25 +1141,67 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       resolvedAt: status === 'resolved' ? cur.resolvedAt ?? at : status === 'open' ? undefined : cur.resolvedAt,
     };
     this.incidents.set(incidentId, next);
-    void this.ch.saveIncidentState([...this.incidents.values()]);
+    void this.persistIncidentState([next]);
     this.alerting.observeIncident(next);
     return next;
   }
 
-  recordCollectorHeartbeat(input: CollectorHeartbeatRequest, at = Date.now()): CollectorHeartbeatRecord {
-    const collectorId = (input.collectorId || input.podName || input.nodeName || 'unknown-collector').slice(0, 160);
+  private mergePersistedIncident(saved: Incident): void {
+    const current = this.incidents.get(saved.incidentId);
+    if (!current || saved.updatedAt >= current.updatedAt) {
+      this.incidents.set(saved.incidentId, saved);
+    }
+  }
+
+  private async persistIncidentState(records: Incident[]): Promise<void> {
+    const writes: Array<Promise<unknown>> = [];
+    if (this.relational && typeof this.relational.saveIncidents === 'function') {
+      writes.push(this.relational.saveIncidents(records));
+    }
+    if (this.ch && typeof this.ch.saveIncidentState === 'function' && this.incidents) {
+      writes.push(this.ch.saveIncidentState([...this.incidents.values()]));
+    }
+    await Promise.all(writes);
+  }
+
+  private async refreshRelationalIncidents(): Promise<void> {
+    for (const incident of await this.relational.loadIncidents()) {
+      this.mergePersistedIncident(incident);
+    }
+  }
+
+  private async refreshRelationalPolicy(): Promise<void> {
+    const saved = await this.relational.loadPolicyConfig();
+    if (!saved || saved.updatedAt <= this.policyUpdatedAt) return;
+    this.applyPolicy(sanitizePolicy(saved.config));
+    this.policyUpdatedAt = saved.updatedAt;
+  }
+
+  recordCollectorHeartbeat(
+    input: CollectorHeartbeatRequest | CollectorRawHeartbeatRequest,
+    at: number,
+    origin: CollectorHeartbeatOrigin,
+  ): CollectorHeartbeatRecord {
+    const collectorId = (input.collectorId || input.podName || input.nodeName || 'unknown-collector').trim().slice(0, 180);
     const status: CollectorHeartbeatRecord['status'] = ['ok', 'degraded', 'error'].includes(input.status ?? '')
       ? (input.status as CollectorHeartbeatRecord['status'])
       : 'ok';
     const clamp = (n: unknown) => Math.max(0, Number.isFinite(Number(n)) ? Math.round(Number(n)) : 0);
     const eventKindCounts: Record<string, number> = {};
     for (const [key, value] of Object.entries(input.eventKindCounts ?? {})) eventKindCounts[key.slice(0, 64)] = clamp(value);
-    const rawFilter = input.filterMetrics ?? ({} as Partial<import('./types').CollectorFilterMetrics>);
+    // Raw Rust and enriched Forwarder heartbeats share an ID, but only the latter owns these
+    // metrics. Provenance is recorded separately so a stream of raw heartbeats cannot keep stale
+    // signatures, leases, or filter receipts alive indefinitely.
+    const filterMetricsReportedAt = origin === 'forwarder' && input.filterMetrics != null ? at : undefined;
+    const rawFilter = origin === 'forwarder'
+      ? input.filterMetrics ?? ({} as Partial<import('./types').CollectorFilterMetrics>)
+      : ({} as Partial<import('./types').CollectorFilterMetrics>);
     const filterMetrics: import('./types').CollectorFilterMetrics = {
       scope: ['all', 'shadow', 'agent', 'decoupled'].includes(rawFilter.scope ?? '')
         ? (rawFilter.scope as import('./types').CollectorFilterMetrics['scope'])
         : 'decoupled',
-      filterMode: rawFilter.filterMode === 'shadow' ? 'shadow' : 'enforce',
+      shutdownFinal: rawFilter.shutdownFinal === true,
+      filterMode: rawFilter.filterMode === 'enforce' ? 'enforce' : 'shadow',
       retainUnknown: rawFilter.retainUnknown !== false,
       retainNonAgent: rawFilter.retainNonAgent === true,
       noisePolicy: rawFilter.noisePolicy === 'include' ? 'include' : 'balanced',
@@ -883,10 +1217,57 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       wouldFilterNoise: clamp(rawFilter.wouldFilterNoise),
       discoveryBudgetDropped: clamp(rawFilter.discoveryBudgetDropped),
       wouldDiscoveryBudgetDrop: clamp(rawFilter.wouldDiscoveryBudgetDrop),
+      e2eFilterReceipts: Array.isArray(rawFilter.e2eFilterReceipts)
+        ? rawFilter.e2eFilterReceipts.slice(0, 8).flatMap((raw) => {
+            if (!raw || typeof raw !== 'object') return [];
+            const receipt = raw as Record<string, unknown>;
+            if (receipt.schema !== 'anysentry.e2e_filter_receipt.v1' || receipt.eventKind !== 'ToolExec') return [];
+            const markerSha256 = typeof receipt.markerSha256 === 'string' ? receipt.markerSha256.trim() : '';
+            const lineSha256 = typeof receipt.lineSha256 === 'string' ? receipt.lineSha256.trim() : '';
+            const filteredAt = cleanText(receipt.filteredAt, 80) ?? '';
+            const classification = cleanText(receipt.classification, 40) ?? '';
+            const filterReason = cleanText(receipt.filterReason, 40) ?? '';
+            if (
+              !/^[a-f0-9]{64}$/u.test(markerSha256) ||
+              !/^[a-f0-9]{64}$/u.test(lineSha256) ||
+              !Number.isFinite(Date.parse(filteredAt)) ||
+              !['confirmed_agent', 'probable_agent', 'unknown', 'non_agent'].includes(classification) ||
+              !['unknown', 'non_agent', 'routine_noise'].includes(filterReason)
+            ) return [];
+            return [{
+              schema: 'anysentry.e2e_filter_receipt.v1' as const,
+              eventKind: 'ToolExec' as const,
+              markerSha256,
+              lineSha256,
+              physicalWorkloadId: cleanText(receipt.physicalWorkloadId, 500) || undefined,
+              classification,
+              filterReason,
+              filteredAt,
+            }];
+          })
+        : undefined,
       deduplicated: clamp(rawFilter.deduplicated),
       queueDropped: clamp(rawFilter.queueDropped),
       batches: clamp(rawFilter.batches),
       batchEvents: clamp(rawFilter.batchEvents),
+      retryQueued: clamp(rawFilter.retryQueued),
+      retryAttempts: clamp(rawFilter.retryAttempts),
+      retryRecovered: clamp(rawFilter.retryRecovered),
+      retryExhausted: clamp(rawFilter.retryExhausted),
+      queueBytes: clamp(rawFilter.queueBytes),
+      inflightEvents: clamp(rawFilter.inflightEvents),
+      inflightBytes: clamp(rawFilter.inflightBytes),
+      inflightOldestAgeMs: clamp(rawFilter.inflightOldestAgeMs),
+      retryQueueDepth: clamp(rawFilter.retryQueueDepth),
+      retryQueueBytes: clamp(rawFilter.retryQueueBytes),
+      retryOutstandingEvents: clamp(rawFilter.retryOutstandingEvents),
+      retryOutstandingBytes: clamp(rawFilter.retryOutstandingBytes),
+      retryOldestAgeMs: clamp(rawFilter.retryOldestAgeMs),
+      outstandingEvents: clamp(rawFilter.outstandingEvents),
+      outstandingBytes: clamp(rawFilter.outstandingBytes),
+      outstandingOldestAgeMs: clamp(rawFilter.outstandingOldestAgeMs),
+      outstandingEventLimit: clamp(rawFilter.outstandingEventLimit),
+      outstandingByteLimit: clamp(rawFilter.outstandingByteLimit),
       identitySnapshotReady: rawFilter.identitySnapshotReady === true,
       identitySnapshotVersion: clamp(rawFilter.identitySnapshotVersion),
       identitySnapshotAgeSeconds: clamp(rawFilter.identitySnapshotAgeSeconds),
@@ -920,10 +1301,84 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       processBootstrapProcReads: clamp(rawFilter.processBootstrapProcReads),
       processFallbackProcReads: clamp(rawFilter.processFallbackProcReads),
       processAncestryProcReads: clamp(rawFilter.processAncestryProcReads),
+      processRootsDiscovered: clamp(rawFilter.processRootsDiscovered),
+      processRootsExited: clamp(rawFilter.processRootsExited),
+      processRootsLost: clamp(rawFilter.processRootsLost),
+      processRootsRecovered: clamp(rawFilter.processRootsRecovered),
+      processRootLivenessChecks: clamp(rawFilter.processRootLivenessChecks),
+      processRootLivenessMisses: clamp(rawFilter.processRootLivenessMisses),
+      processStaleGenerationMisses: clamp(rawFilter.processStaleGenerationMisses),
+      runtimeSignatureVersion: clamp(rawFilter.runtimeSignatureVersion),
+      runtimeSignatureHash: cleanText(rawFilter.runtimeSignatureHash, 128),
+      runtimeSignatureMatcherHash: cleanText(rawFilter.runtimeSignatureMatcherHash, 128),
+      runtimeSignatureLoaded: clamp(rawFilter.runtimeSignatureLoaded),
+      runtimeSignatureMatches: clamp(rawFilter.runtimeSignatureMatches),
+      runtimeSignatureMisses: clamp(rawFilter.runtimeSignatureMisses),
+      runtimeSignatureAmbiguous: clamp(rawFilter.runtimeSignatureAmbiguous),
+      runtimeSignatureInvalid: clamp(rawFilter.runtimeSignatureInvalid),
+      runtimeSignatureReloadAttempts: clamp(rawFilter.runtimeSignatureReloadAttempts),
+      runtimeSignatureReloadSuccesses: clamp(rawFilter.runtimeSignatureReloadSuccesses),
+      runtimeSignatureReloadErrors: clamp(rawFilter.runtimeSignatureReloadErrors),
+      runtimeSignatureLastGoodHash: cleanText(rawFilter.runtimeSignatureLastGoodHash, 128),
+      runtimeReconcileRequested: clamp(rawFilter.runtimeReconcileRequested),
+      runtimeReconcileRuns: clamp(rawFilter.runtimeReconcileRuns),
+      runtimeReconcileCoalesced: clamp(rawFilter.runtimeReconcileCoalesced),
+      runtimeReconcileErrors: clamp(rawFilter.runtimeReconcileErrors),
+      runtimeReconcileScanned: clamp(rawFilter.runtimeReconcileScanned),
+      runtimeReconcileInvalidated: clamp(rawFilter.runtimeReconcileInvalidated),
+      runtimeReconcileLastDurationMs: clamp(rawFilter.runtimeReconcileLastDurationMs),
+      runtimeSnapshotPosts: clamp(rawFilter.runtimeSnapshotPosts),
+      runtimeSnapshotErrors: clamp(rawFilter.runtimeSnapshotErrors),
+      runtimeSnapshotRetries: clamp(rawFilter.runtimeSnapshotRetries),
+      runtimeSnapshotRecovered: clamp(rawFilter.runtimeSnapshotRecovered),
+      runtimeLeaseEpoch: clamp(rawFilter.runtimeLeaseEpoch),
+      runtimeLeaseAttempts: clamp(rawFilter.runtimeLeaseAttempts),
+      runtimeLeaseErrors: clamp(rawFilter.runtimeLeaseErrors),
+      runtimeLeaseFenced: rawFilter.runtimeLeaseFenced === true,
+      runtimeSnapshotRejected: clamp(rawFilter.runtimeSnapshotRejected),
+      runtimeSnapshotDuplicates: clamp(rawFilter.runtimeSnapshotDuplicates),
+      lastRuntimeSnapshotAt: cleanText(rawFilter.lastRuntimeSnapshotAt, 80),
+      lastRuntimeSnapshotError: cleanText(rawFilter.lastRuntimeSnapshotError, 500),
+      lastRuntimeSnapshotFailureAt: cleanText(rawFilter.lastRuntimeSnapshotFailureAt, 80),
+      lastRuntimeSnapshotFailure: cleanText(rawFilter.lastRuntimeSnapshotFailure, 500),
+      lastRuntimeSnapshotFailureVersion: rawFilter.lastRuntimeSnapshotFailureVersion == null
+        ? undefined
+        : clamp(rawFilter.lastRuntimeSnapshotFailureVersion),
+      lastRuntimeSnapshotRetryAt: cleanText(rawFilter.lastRuntimeSnapshotRetryAt, 80),
+      lastRuntimeSnapshotRetryReason: cleanText(rawFilter.lastRuntimeSnapshotRetryReason, 500),
     };
+    const rawExecEvidence = origin === 'raw_collector' && 'execEvidence' in input &&
+      input.execEvidence && typeof input.execEvidence === 'object'
+      ? input.execEvidence
+      : undefined;
+    const evidenceCounts = rawExecEvidence
+      ? [
+          rawExecEvidence.exec,
+          rawExecEvidence.execTruncated,
+          rawExecEvidence.execIncomplete,
+          rawExecEvidence.execReassemblyTimeout,
+        ]
+      : [];
+    const execEvidence: import('./types').CollectorExecEvidenceReport | undefined = rawExecEvidence &&
+      evidenceCounts.every((value) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) &&
+      [rawExecEvidence.execTruncated, rawExecEvidence.execIncomplete, rawExecEvidence.execReassemblyTimeout]
+        .every((value) => (value as number) <= (rawExecEvidence.exec as number)) &&
+      typeof rawExecEvidence.shutdownFinal === 'boolean'
+      ? {
+          exec: rawExecEvidence.exec as number,
+          execTruncated: rawExecEvidence.execTruncated as number,
+          execIncomplete: rawExecEvidence.execIncomplete as number,
+          execReassemblyTimeout: rawExecEvidence.execReassemblyTimeout as number,
+          shutdownFinal: rawExecEvidence.shutdownFinal,
+        }
+      : undefined;
     const rec: CollectorHeartbeatRecord = {
       collectorId,
       at,
+      activityContext: 'collector_heartbeat',
+      activitySubtype: 'observer_heartbeat',
+      origin,
+      filterMetricsReportedAt,
       status,
       nodeName: input.nodeName?.slice(0, 160),
       namespace: input.namespace?.slice(0, 160),
@@ -937,20 +1392,44 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       queueDepth: clamp(input.queueDepth),
       droppedEvents: clamp(input.droppedEvents),
       outputDropped: clamp(input.outputDropped),
-      errorCount: clamp(input.errorCount),
+      // The Rust CollectorHeartbeat schema has no operational error counter. argv/reassembly
+      // quality lives in execEvidence and must never degrade collector transport health.
+      errorCount: origin === 'raw_collector' ? 0 : clamp(input.errorCount),
       observedAgents: clamp(input.observedAgents),
+      execEvidence,
       filterMetrics,
       message: cleanText(input.message, 500),
     };
     this.addCollectorHeartbeat(rec);
+    // Nest always provides the distributed projection. The guard keeps focused contract tests and
+    // degraded single-process embeddings that predate that provider usable.
+    if (this.currentState) void this.currentState.recordCollectorHeartbeat(rec);
     return rec;
   }
 
-  private addCollectorHeartbeat(rec: CollectorHeartbeatRecord, persist = true): void {
+  private normalizeHydratedCollectorHeartbeat(rec: CollectorHeartbeatRecord): CollectorHeartbeatRecord {
+    const semantics = {
+      activityContext: 'collector_heartbeat' as const,
+      activitySubtype: 'observer_heartbeat' as const,
+    };
+    if (rec.origin === 'raw_collector' || rec.origin === 'forwarder') return { ...rec, ...semantics };
+    if (rec.filterMetricsReportedAt !== undefined) return { ...rec, origin: 'forwarder', ...semantics };
+    const looksLikeLegacyRaw = (rec.mode === 'observe' || rec.mode?.startsWith('observe+') === true) &&
+      Object.prototype.hasOwnProperty.call(rec.eventKindCounts ?? {}, 'ToolExec');
+    return looksLikeLegacyRaw
+      ? { ...rec, origin: 'raw_collector', errorCount: 0, ...semantics }
+      : { ...rec, origin: 'forwarder', ...semantics };
+  }
+
+  private addCollectorHeartbeat(rec: CollectorHeartbeatRecord, persist = true, notify = true): void {
     this.collectorHeartbeats.push(rec);
     if (this.collectorHeartbeats.length > this.MAX_COLLECTOR_HEARTBEATS) this.collectorHeartbeats.splice(0, this.collectorHeartbeats.length - this.MAX_COLLECTOR_HEARTBEATS);
-    this.alerting.observeCollectorHeartbeat(rec);
-    if (persist) this.persistCollectorHeartbeatsSoon();
+    if (notify) this.alerting.observeCollectorHeartbeat(rec);
+    else this.alerting.seedCollectorHeartbeat(rec);
+    if (persist) {
+      this.ch.enqueueCollectorHeartbeat(rec);
+      this.persistCollectorHeartbeatsSoon();
+    }
   }
 
   private persistCollectorHeartbeatsSoon(): void {
@@ -961,21 +1440,67 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     }, 2_000);
   }
 
-  private async persistCollectorHeartbeats(): Promise<void> {
-    await this.ch.saveCollectorHeartbeats(this.collectorHeartbeats.slice(-this.MAX_COLLECTOR_HEARTBEATS));
+  private async persistCollectorHeartbeats(abortSignal?: AbortSignal): Promise<void> {
+    await this.ch.saveCollectorHeartbeats(
+      this.collectorHeartbeats.slice(-this.MAX_COLLECTOR_HEARTBEATS),
+      abortSignal,
+    );
   }
 
-  queryCollectorHeartbeats(sinceMs = 0): CollectorHeartbeatRecord[] {
-    return this.collectorHeartbeats.filter((e) => e.at >= sinceMs);
+  queryCollectorHeartbeats(sinceMs = 0, untilMs = Number.POSITIVE_INFINITY): CollectorHeartbeatRecord[] {
+    return this.collectorHeartbeats.filter((e) => e.at >= sinceMs && e.at <= untilMs);
   }
 
-  latestCollectorHeartbeats(): CollectorHeartbeatRecord[] {
+  collectorHeartbeatHeads(untilMs = Number.POSITIVE_INFINITY): {
+    latest: CollectorHeartbeatRecord[];
+    latestMetrics: CollectorHeartbeatRecord[];
+    latestRaw: CollectorHeartbeatRecord[];
+    latestForwarder: CollectorHeartbeatRecord[];
+  } {
     const latest = new Map<string, CollectorHeartbeatRecord>();
+    const latestMetrics = new Map<string, CollectorHeartbeatRecord>();
+    const latestRaw = new Map<string, CollectorHeartbeatRecord>();
+    const latestForwarder = new Map<string, CollectorHeartbeatRecord>();
     for (const hb of this.collectorHeartbeats) {
+      if (hb.at > untilMs) continue;
       const cur = latest.get(hb.collectorId);
-      if (!cur || hb.at > cur.at) latest.set(hb.collectorId, hb);
+      // Insertion order breaks a Date.now() millisecond tie in favour of the later request.
+      if (!cur || hb.at >= cur.at) latest.set(hb.collectorId, hb);
+      if (hb.origin === 'raw_collector') {
+        const currentRaw = latestRaw.get(hb.collectorId);
+        if (!currentRaw || hb.at >= currentRaw.at) latestRaw.set(hb.collectorId, hb);
+      } else if (hb.origin === 'forwarder') {
+        const currentForwarder = latestForwarder.get(hb.collectorId);
+        if (!currentForwarder || hb.at >= currentForwarder.at) {
+          latestForwarder.set(hb.collectorId, hb);
+        }
+      }
+      if (hb.filterMetricsReportedAt === undefined) continue;
+      const currentMetrics = latestMetrics.get(hb.collectorId);
+      if (
+        !currentMetrics ||
+        hb.filterMetricsReportedAt >= (currentMetrics.filterMetricsReportedAt ?? 0)
+      ) latestMetrics.set(hb.collectorId, hb);
     }
-    return [...latest.values()];
+    return {
+      latest: [...latest.values()],
+      latestMetrics: [...latestMetrics.values()],
+      latestRaw: [...latestRaw.values()],
+      latestForwarder: [...latestForwarder.values()],
+    };
+  }
+
+  /** Compatibility view for remote aggregation callers that only need one latest heartbeat. */
+  latestCollectorHeartbeats(untilMs = Number.POSITIVE_INFINITY): CollectorHeartbeatRecord[] {
+    return this.collectorHeartbeatHeads(untilMs).latest;
+  }
+
+  distributedLatestCollectorHeartbeats(untilMs: number): Promise<CollectorHeartbeatRecord[]> {
+    return this.currentState.latestCollectorHeartbeats(untilMs);
+  }
+
+  distributedCurrentStateReady(): boolean {
+    return this.currentState.isReady();
   }
 
   /** Events within a window [sinceMs, now]. */
@@ -988,8 +1513,41 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return this.store.filter((e) => e.at >= sinceMs && e.at <= untilMs);
   }
 
+  /** Newest bounded slice for low-latency dashboard previews. The hot ring is time ordered. */
+  queryRecentRange(sinceMs: number, untilMs: number, limit: number): JudgedEvent[] {
+    const out: JudgedEvent[] = [];
+    const boundedLimit = Math.max(1, Math.min(this.MAX, Math.trunc(limit)));
+    for (let index = this.store.length - 1; index >= 0 && out.length < boundedLimit; index -= 1) {
+      const event = this.store[index];
+      if (event.at > untilMs) continue;
+      if (event.at < sinceMs) break;
+      out.push(event);
+    }
+    return out.reverse();
+  }
+
   dashboardWindowHistory(sinceMs: number, untilMs: number, bucketCount?: number): Promise<DashboardWindowHistory | null> {
     return this.ch.dashboardWindowHistory(sinceMs, untilMs, bucketCount);
+  }
+
+  dashboardAggregateBucketFacts(sinceMs: number, untilExclusiveMs: number, bucketMs?: number) {
+    return this.ch.dashboardAggregateBucketFacts(sinceMs, untilExclusiveMs, bucketMs);
+  }
+
+  eventCommitChanges(after?: Parameters<ClickHouseStore['eventCommitChanges']>[0], limit?: number) {
+    return this.ch.eventCommitChanges(after, limit);
+  }
+
+  latestEventCommitCursor() {
+    return this.ch.latestEventCommitCursor();
+  }
+
+  earliestEventCommitCursor() {
+    return this.ch.earliestEventCommitCursor();
+  }
+
+  dashboardTailEvents(sinceMs: number, untilMs: number): Promise<JudgedEvent[] | null> {
+    return this.ch.dashboardTailEvents(sinceMs, untilMs);
   }
 
   recentPersistedEvents(

@@ -1,0 +1,437 @@
+# AnySentry streaming and supply-chain analysis plane.
+#
+# Build and publish streaming/flink/Dockerfile before applying this manifest, then replace
+# ghcr.io/a3s-lab/anysentry-flink-streaming:latest with that immutable image reference.
+# The bundled Kafka and filesystem checkpoints form a complete single-cluster baseline. For a
+# highly available production deployment, use managed Kafka and an object-store checkpoint URI.
+---
+# ----------------------------------------------------------------------------
+# Kafka-compatible durable event log (single-node KRaft baseline).
+# ----------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kafka-data
+  namespace: anysentry
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: anysentry
+  labels: { app: kafka }
+spec:
+  clusterIP: None
+  # A single-node KRaft broker resolves its advertised controller address through this Service
+  # before the broker can become Ready. Publishing the StatefulSet endpoint during bootstrap avoids
+  # a readiness/DNS cycle where kafka:9093 cannot resolve until Kafka has already started.
+  publishNotReadyAddresses: true
+  selector: { app: kafka }
+  ports:
+    - { name: broker, port: 9092, targetPort: 9092 }
+    - { name: controller, port: 9093, targetPort: 9093 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: anysentry
+  labels: { app: kafka, io.anysentry.observe: "false" }
+spec:
+  serviceName: kafka
+  replicas: 1
+  selector:
+    matchLabels: { app: kafka }
+  template:
+    metadata:
+      labels: { app: kafka, io.anysentry.observe: "false" }
+    spec:
+      securityContext:
+        fsGroup: 1000
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: kafka
+          image: apache/kafka:4.1.1
+          ports:
+            - { name: broker, containerPort: 9092 }
+            - { name: controller, containerPort: 9093 }
+          env:
+            - { name: CLUSTER_ID, value: "MkU3OEVBNTcwNTJENDM2Qk" }
+            - { name: KAFKA_NODE_ID, value: "1" }
+            - { name: KAFKA_PROCESS_ROLES, value: "broker,controller" }
+            - { name: KAFKA_LISTENERS, value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093" }
+            - { name: KAFKA_ADVERTISED_LISTENERS, value: "PLAINTEXT://kafka:9092" }
+            - { name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP, value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT" }
+            - { name: KAFKA_CONTROLLER_LISTENER_NAMES, value: "CONTROLLER" }
+            - { name: KAFKA_CONTROLLER_QUORUM_VOTERS, value: "1@kafka:9093" }
+            - { name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR, value: "1" }
+            - { name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR, value: "1" }
+            - { name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR, value: "1" }
+            - { name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS, value: "0" }
+            - { name: KAFKA_NUM_PARTITIONS, value: "2" }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/kafka/data }
+          startupProbe:
+            tcpSocket: { port: 9092 }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          readinessProbe:
+            tcpSocket: { port: 9092 }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket: { port: 9092 }
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { cpu: "2", memory: 3Gi }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: kafka-data
+---
+# Reconciles required topics after Kafka starts and after later broker/PVC recovery.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-topic-manager
+  namespace: anysentry
+  labels: { app: kafka-topic-manager, io.anysentry.observe: "false" }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: kafka-topic-manager }
+  template:
+    metadata:
+      labels: { app: kafka-topic-manager, io.anysentry.observe: "false" }
+    spec:
+      containers:
+        - name: topic-manager
+          image: apache/kafka:4.1.1
+          command: ["/bin/bash", "-ec"]
+          args:
+            - |
+              while true; do
+                for topic in \
+                  anysentry.events.canonical.v1 \
+                  anysentry.judgments.v1 \
+                  anysentry.risk-analysis-batches.v1 \
+                  anysentry.stream.findings.v1 \
+                  anysentry.supply-chain.context.v1 \
+                  anysentry.stream.dlq.v1; do
+                  /opt/kafka/bin/kafka-topics.sh \
+                    --bootstrap-server kafka:9092 \
+                    --create --if-not-exists \
+                    --topic "${topic}" \
+                    --partitions 2 \
+                    --replication-factor 1 || true
+                done
+                sleep 60
+              done
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+---
+# ----------------------------------------------------------------------------
+# Flink: event-time correlation and Temporal Episode generation.
+# The shared filesystem PVC must use an RWX-capable StorageClass.
+# ----------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: flink-checkpoints
+  namespace: anysentry
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flink-jobmanager
+  namespace: anysentry
+  labels: { app: flink-jobmanager }
+spec:
+  type: ClusterIP
+  selector: { app: flink-jobmanager }
+  ports:
+    - { name: rpc, port: 6123, targetPort: 6123 }
+    - { name: blob, port: 6124, targetPort: 6124 }
+    - { name: rest, port: 8081, targetPort: 8081 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-jobmanager
+  namespace: anysentry
+  labels: { app: flink-jobmanager, io.anysentry.observe: "false" }
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: flink-jobmanager }
+  template:
+    metadata:
+      labels: { app: flink-jobmanager, io.anysentry.observe: "false" }
+    spec:
+      initContainers:
+        - name: checkpoint-permissions
+          image: ghcr.io/a3s-lab/anysentry-flink-streaming:latest
+          securityContext: { runAsUser: 0 }
+          command: ["/bin/sh", "-ec", "chown -R flink:flink /opt/flink/checkpoints"]
+          volumeMounts:
+            - { name: checkpoints, mountPath: /opt/flink/checkpoints }
+      containers:
+        - name: jobmanager
+          image: ghcr.io/a3s-lab/anysentry-flink-streaming:latest
+          args: ["jobmanager"]
+          ports:
+            - { name: rpc, containerPort: 6123 }
+            - { name: blob, containerPort: 6124 }
+            - { name: rest, containerPort: 8081 }
+          env:
+            - { name: JOB_MANAGER_RPC_ADDRESS, value: "flink-jobmanager" }
+            - name: FLINK_PROPERTIES
+              value: |
+                jobmanager.rpc.address: flink-jobmanager
+                state.checkpoints.dir: file:///opt/flink/checkpoints
+          volumeMounts:
+            - { name: checkpoints, mountPath: /opt/flink/checkpoints }
+          startupProbe:
+            httpGet: { path: /overview, port: 8081 }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /overview, port: 8081 }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /overview, port: 8081 }
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { cpu: "2", memory: 2Gi }
+      volumes:
+        - name: checkpoints
+          persistentVolumeClaim:
+            claimName: flink-checkpoints
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-taskmanager
+  namespace: anysentry
+  labels: { app: flink-taskmanager, io.anysentry.observe: "false" }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: flink-taskmanager }
+  template:
+    metadata:
+      labels: { app: flink-taskmanager, io.anysentry.observe: "false" }
+    spec:
+      initContainers:
+        - name: checkpoint-permissions
+          image: ghcr.io/a3s-lab/anysentry-flink-streaming:latest
+          securityContext: { runAsUser: 0 }
+          command: ["/bin/sh", "-ec", "chown -R flink:flink /opt/flink/checkpoints"]
+          volumeMounts:
+            - { name: checkpoints, mountPath: /opt/flink/checkpoints }
+      containers:
+        - name: taskmanager
+          image: ghcr.io/a3s-lab/anysentry-flink-streaming:latest
+          args: ["taskmanager"]
+          env:
+            - { name: JOB_MANAGER_RPC_ADDRESS, value: "flink-jobmanager" }
+            - name: FLINK_PROPERTIES
+              value: |
+                jobmanager.rpc.address: flink-jobmanager
+                taskmanager.numberOfTaskSlots: 2
+                state.checkpoints.dir: file:///opt/flink/checkpoints
+          volumeMounts:
+            - { name: checkpoints, mountPath: /opt/flink/checkpoints }
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+            limits: { cpu: "4", memory: 4Gi }
+      volumes:
+        - name: checkpoints
+          persistentVolumeClaim:
+            claimName: flink-checkpoints
+---
+# Keeps the named AnySentry Flink Job present without coupling its lifecycle to JobManager startup.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-job-submit
+  namespace: anysentry
+  labels: { app: flink-job-submit, io.anysentry.observe: "false" }
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: flink-job-submit }
+  template:
+    metadata:
+      labels: { app: flink-job-submit, io.anysentry.observe: "false" }
+    spec:
+      containers:
+        - name: job-submit
+          image: ghcr.io/a3s-lab/anysentry-flink-streaming:latest
+          command: ["/bin/bash", "-ec"]
+          args:
+            - |
+              until flink list -m flink-jobmanager:8081 >/dev/null 2>&1; do sleep 2; done
+              while true; do
+                if flink list -m flink-jobmanager:8081 2>/dev/null \
+                  | grep -Eq ' : AnySentry Flink Shadow Risk \([[:upper:]_]+\)$'; then
+                  sleep 15
+                  continue
+                fi
+                flink run -d \
+                  -m flink-jobmanager:8081 \
+                  -c org.a3s.anysentry.streaming.AnySentryStreamJob \
+                  /opt/flink/usrlib/anysentry-flink-streaming.jar || true
+                sleep 15
+              done
+          envFrom:
+            - configMapRef:
+                name: anysentry-runtime
+          env:
+            - { name: ANYSENTRY_FLINK_CANONICAL_GROUP, value: "anysentry-flink-shadow-v2" }
+            - { name: ANYSENTRY_FLINK_JUDGMENTS_GROUP, value: "anysentry-flink-judgments-v2" }
+            - { name: ANYSENTRY_FLINK_SUPPLY_CHAIN_CONTEXT_GROUP, value: "anysentry-flink-supply-chain-context-v1" }
+            - { name: ANYSENTRY_FLINK_STARTUP_MODE, value: "latest" }
+            - { name: ANYSENTRY_FLINK_PARALLELISM, value: "2" }
+            - { name: ANYSENTRY_FLINK_LEGACY_COMPOSITE_ENABLED, value: "off" }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 1Gi }
+---
+# ----------------------------------------------------------------------------
+# Flink result ingestion, ambiguous-episode model review, and OSV intelligence refresh.
+# ----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stream-worker
+  namespace: anysentry
+  labels: { app: stream-worker, io.anysentry.observe: "false" }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: stream-worker }
+  template:
+    metadata:
+      labels: { app: stream-worker, io.anysentry.observe: "false" }
+    spec:
+      containers:
+        - name: stream-worker
+          image: ghcr.io/a3s-lab/anysentry:latest
+          command: ["node", "dist/security-monitoring/stream-worker-main.js"]
+          envFrom:
+            - configMapRef:
+                name: anysentry-runtime
+          env:
+            - { name: ANYSENTRY_STREAM_WORKER_ROLE, value: "all" }
+            - { name: ANYSENTRY_STREAM_CONSUMER_GROUP, value: "anysentry-stream-findings" }
+            - { name: ANYSENTRY_STREAM_EPISODE_CONSUMER_GROUP, value: "anysentry-stream-episodes" }
+            - { name: ANYSENTRY_LEGACY_COMPOSITE_ENABLED, value: "off" }
+            - { name: ANYSENTRY_COMPOSITE_MAX_EVENT_AGE_MS, value: "900000" }
+            - { name: KAFKAJS_NO_PARTITIONER_WARNING, value: "1" }
+            - name: CLICKHOUSE_USER
+              valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_USER } }
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_PASSWORD } }
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { cpu: "2", memory: 1Gi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: composite-judge
+  namespace: anysentry
+  labels: { app: composite-judge, io.anysentry.observe: "false" }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: composite-judge }
+  template:
+    metadata:
+      labels: { app: composite-judge, io.anysentry.observe: "false" }
+    spec:
+      containers:
+        - name: composite-judge
+          image: ghcr.io/a3s-lab/anysentry:latest
+          command: ["node", "dist/security-monitoring/stream-worker-main.js"]
+          envFrom:
+            - configMapRef:
+                name: anysentry-runtime
+            - secretRef:
+                name: anysentry-model-credentials
+                optional: true
+          env:
+            - { name: ANYSENTRY_STREAM_WORKER_ROLE, value: "judge" }
+            - { name: ANYSENTRY_COMPOSITE_TIMEOUT_MS, value: "60000" }
+            - { name: ANYSENTRY_COMPOSITE_CONCURRENCY, value: "2" }
+            - { name: ANYSENTRY_COMPOSITE_MAX_EVENT_AGE_MS, value: "900000" }
+            - name: CLICKHOUSE_USER
+              valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_USER } }
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_PASSWORD } }
+          resources:
+            requests: { cpu: 500m, memory: 512Mi }
+            limits: { cpu: "2", memory: 2Gi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: supply-chain-assessment
+  namespace: anysentry
+  labels: { app: supply-chain-assessment, io.anysentry.observe: "false" }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: supply-chain-assessment }
+  template:
+    metadata:
+      labels: { app: supply-chain-assessment, io.anysentry.observe: "false" }
+    spec:
+      containers:
+        - name: supply-chain-assessment
+          image: ghcr.io/a3s-lab/anysentry:latest
+          command: ["node", "dist/security-monitoring/supply-chain-worker-main.js"]
+          envFrom:
+            - configMapRef:
+                name: anysentry-runtime
+          env:
+            - { name: ANYSENTRY_OSV_API_URL, value: "https://api.osv.dev" }
+            - { name: ANYSENTRY_OSV_INTELLIGENCE_MODE, value: "online" }
+            - { name: ANYSENTRY_OSV_REQUEST_TIMEOUT_MS, value: "20000" }
+            - { name: ANYSENTRY_OSV_REFRESH_INTERVAL_MS, value: "86400000" }
+            - { name: ANYSENTRY_SUPPLY_CHAIN_ASSESSMENT_CONCURRENCY, value: "2" }
+            - { name: KAFKAJS_NO_PARTITIONER_WARNING, value: "1" }
+            - name: CLICKHOUSE_USER
+              valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_USER } }
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_PASSWORD } }
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { cpu: "1", memory: 1Gi }

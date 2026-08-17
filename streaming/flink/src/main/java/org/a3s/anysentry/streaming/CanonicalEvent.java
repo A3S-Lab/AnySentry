@@ -52,9 +52,12 @@ public class CanonicalEvent implements Serializable {
         public String hostId;
         public String bootId;
         public String containerId;
+        public String cgroupId;
         public Integer pid;
         public Integer ppid;
         public Integer rootPid;
+        public String rootStartTime;
+        public String startTimeTicks;
         public String startTimeNs;
         public Long mountNamespace;
         public String processInstanceId;

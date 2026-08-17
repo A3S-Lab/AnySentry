@@ -4,7 +4,12 @@ import { homedir } from 'node:os';
 import { delimiter, dirname, isAbsolute, resolve } from 'node:path';
 import * as https from 'node:https';
 import { parse as parseYaml } from 'yaml';
-import { EventMeta, WorkloadIdentitySnapshot, WorkloadIdentitySnapshotEntry } from './types';
+import {
+  EventMeta,
+  PlatformHealthcheckSpec,
+  WorkloadIdentitySnapshot,
+  WorkloadIdentitySnapshotEntry,
+} from './types';
 
 const SA = '/var/run/secrets/kubernetes.io/serviceaccount';
 const DEFAULT_AGENT_SELECTOR = 'anysentry.io/workload-kind=agent';
@@ -33,11 +38,23 @@ interface KubeContainerStatus {
   containerID?: string;
 }
 
+interface KubeProbe {
+  exec?: { command?: string[] };
+}
+
+interface KubeContainer {
+  name?: string;
+  image?: string;
+  livenessProbe?: KubeProbe;
+  readinessProbe?: KubeProbe;
+  startupProbe?: KubeProbe;
+}
+
 interface KubePod {
   metadata?: KubeMetadata;
   spec?: {
     nodeName?: string;
-    containers?: Array<{ name?: string; image?: string }>;
+    containers?: KubeContainer[];
   };
   status?: {
     containerStatuses?: KubeContainerStatus[];
@@ -127,6 +144,27 @@ function boundedLabels(labels: Record<string, string>): Record<string, string> {
       .slice(0, 64)
       .map(([key, value]) => [key.slice(0, 128), String(value).slice(0, 256)]),
   );
+}
+
+function boundedProbeCommand(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 64) return undefined;
+  if (value.some((item) => typeof item !== 'string' || item.length === 0 || item.length > 2_048)) {
+    return undefined;
+  }
+  return value.map((item) => item as string);
+}
+
+function platformHealthchecksForContainer(container: KubeContainer | undefined): PlatformHealthcheckSpec[] {
+  if (!container) return [];
+  const probes: Array<[PlatformHealthcheckSpec['activitySubtype'], KubeProbe | undefined]> = [
+    ['k8s_liveness_probe', container.livenessProbe],
+    ['k8s_readiness_probe', container.readinessProbe],
+    ['k8s_startup_probe', container.startupProbe],
+  ];
+  return probes.flatMap(([activitySubtype, probe]) => {
+    const argv = boundedProbeCommand(probe?.exec?.command);
+    return argv ? [{ activitySubtype, argv }] : [];
+  });
 }
 
 function firstKubeconfigPath(): string {
@@ -459,6 +497,11 @@ export class KubeIdentityService implements OnModuleInit, OnModuleDestroy {
         .filter((container) => container.name)
         .map((container) => [container.name as string, container.image?.trim()]),
     );
+    const specsByContainer = new Map(
+      (pod.spec?.containers ?? [])
+        .filter((container) => container.name)
+        .map((container) => [container.name as string, container]),
+    );
     const owner =
       metadata.ownerReferences?.find((candidate) => candidate.controller) ??
       metadata.ownerReferences?.[0];
@@ -517,6 +560,9 @@ export class KubeIdentityService implements OnModuleInit, OnModuleDestroy {
           : selectedContainer
             ? 'non_agent'
             : 'unknown';
+      const platformHealthchecks = containerName
+        ? platformHealthchecksForContainer(specsByContainer.get(containerName))
+        : [];
       entries.push({
         ids: [containerId, containerId.slice(0, 12)].filter(Boolean),
         classification,
@@ -524,6 +570,7 @@ export class KubeIdentityService implements OnModuleInit, OnModuleDestroy {
         ...common,
         containerName,
         containerImage: containerName ? imagesByContainer.get(containerName) : undefined,
+        ...(platformHealthchecks.length ? { platformHealthchecks } : {}),
         agentScopeId: isAgentContainer ? agentId : undefined,
         agentDisplayName: isAgentContainer ? agentId : undefined,
         agentInstanceId: isAgentContainer ? `${podUid}/${containerId}` : undefined,

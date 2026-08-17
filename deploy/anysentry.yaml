@@ -5,9 +5,8 @@
 #       --from-literal=CLICKHOUSE_PASSWORD='<choose-a-password>'
 #   kubectl -n anysentry apply -f deploy/anysentry.yaml
 #
-# This single manifest brings up BOTH a bundled ClickHouse (for durable, restart-surviving event
-# history) AND AnySentry itself, plus a ClusterIP Service on 29653 and an optional ServiceAccount +
-# namespaced Role so AnySentry can resolve observer pod identities (pod-uid → agent name/namespace).
+# This manifest brings up the durable API path: ClickHouse, Redis, AnySentry, Fast Judge, and the
+# L3 Worker. Apply deploy/streaming.yaml as well for Kafka, Flink, stream workers, and OSV refresh.
 #
 # Everything is in the `anysentry` namespace. To deploy elsewhere, either change the namespaces
 # below to match or drop the `namespace:` lines and apply with `kubectl -n <your-ns> apply -f ...`.
@@ -29,6 +28,59 @@ spec:
     requests:
       storage: 10Gi
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-memory-config
+  namespace: anysentry
+  labels: { app: clickhouse }
+data:
+  memory.xml: |
+    <clickhouse>
+      <max_server_memory_usage>2147483648</max_server_memory_usage>
+      <merges_mutations_memory_usage_soft_limit>536870912</merges_mutations_memory_usage_soft_limit>
+      <merge_tree>
+        <vertical_merge_algorithm_min_rows_to_activate>0</vertical_merge_algorithm_min_rows_to_activate>
+      </merge_tree>
+      <!-- High-volume metric_log remains explicitly disabled by server.xml. -->
+    </clickhouse>
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-base-config
+  namespace: anysentry
+  labels: { app: clickhouse }
+data:
+  server.xml: |
+    <clickhouse>
+      <max_server_memory_usage>2415919104</max_server_memory_usage>
+      <logger>
+        <level>warning</level>
+      </logger>
+      <text_log remove="remove"/>
+      <trace_log remove="remove"/>
+      <processors_profile_log remove="remove"/>
+      <part_log remove="remove"/>
+      <metric_log remove="remove"/>
+      <asynchronous_metric_log remove="remove"/>
+      <query_thread_log remove="remove"/>
+      <query_views_log remove="remove"/>
+      <query_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+      </query_log>
+    </clickhouse>
+  users.xml: |
+    <clickhouse>
+      <profiles>
+        <default>
+          <max_memory_usage>1073741824</max_memory_usage>
+          <max_bytes_before_external_group_by>268435456</max_bytes_before_external_group_by>
+          <max_bytes_before_external_sort>268435456</max_bytes_before_external_sort>
+        </default>
+      </profiles>
+    </clickhouse>
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -44,7 +96,11 @@ spec:
   template:
     metadata:
       labels: { app: clickhouse }
+      annotations:
+        anysentry.io/clickhouse-config-revision: "memory-and-merge-v3"
+        anysentry.io/clickhouse-base-config-revision: "server-users-v1"
     spec:
+      terminationGracePeriodSeconds: 30
       containers:
         - name: clickhouse
           image: clickhouse/clickhouse-server:24.8
@@ -59,17 +115,34 @@ spec:
               valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_PASSWORD } }
           volumeMounts:
             - { name: data, mountPath: /var/lib/clickhouse }
+            - { name: clickhouse-config, mountPath: /etc/clickhouse-server/config.d/10-anysentry-server.xml, subPath: server.xml, readOnly: true }
+            - { name: memory-config, mountPath: /etc/clickhouse-server/config.d/20-anysentry-memory.xml, subPath: memory.xml, readOnly: true }
+            - { name: clickhouse-config, mountPath: /etc/clickhouse-server/users.d/10-anysentry-users.xml, subPath: users.xml, readOnly: true }
           readinessProbe:
             httpGet: { path: /ping, port: 8123 }
-            initialDelaySeconds: 10
-            periodSeconds: 10
+            initialDelaySeconds: 0
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 3
+            successThreshold: 1
           resources:
-            requests: { cpu: 250m, memory: 512Mi }
-            limits: { cpu: "2", memory: 2Gi }
+            requests: { cpu: 250m, memory: 1Gi }
+            limits: { cpu: "2", memory: 4Gi }
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: clickhouse-data
+        - name: memory-config
+          configMap:
+            name: clickhouse-memory-config
+            items:
+              - { key: memory.xml, path: memory.xml }
+        - name: clickhouse-config
+          configMap:
+            name: clickhouse-base-config
+            items:
+              - { key: server.xml, path: server.xml }
+              - { key: users.xml, path: users.xml }
 ---
 apiVersion: v1
 kind: Service
@@ -83,6 +156,107 @@ spec:
   ports:
     - { name: http, port: 8123, targetPort: 8123 }
     - { name: native, port: 9000, targetPort: 9000 }
+---
+# ----------------------------------------------------------------------------
+# Redis: durable BullMQ queues and cross-process policy synchronization.
+# ----------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data
+  namespace: anysentry
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: anysentry
+  labels: { app: redis, io.anysentry.observe: "false" }
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels: { app: redis }
+  template:
+    metadata:
+      labels: { app: redis, io.anysentry.observe: "false" }
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+          ports:
+            - { name: redis, containerPort: 6379 }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          startupProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 1Gi }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: redis-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: anysentry
+  labels: { app: redis }
+spec:
+  clusterIP: None
+  selector: { app: redis }
+  ports:
+    - { name: redis, port: 6379, targetPort: 6379 }
+---
+# Shared non-secret runtime configuration. Model credentials remain in an optional Secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: anysentry-runtime
+  namespace: anysentry
+data:
+  CLICKHOUSE_URL: "http://clickhouse:8123"
+  CLICKHOUSE_DB: "anysentry"
+  ANYSENTRY_ASYNC_JUDGE: "on"
+  ANYSENTRY_REDIS_URL: "redis://redis:6379/0"
+  # The streaming resources remain available in deploy/streaming.yaml, but production operators
+  # opt in explicitly after Kafka/Flink capacity and retention have been reviewed.
+  ANYSENTRY_STREAMING: "off"
+  ANYSENTRY_STREAM_AGENT_ONLY: "on"
+  ANYSENTRY_STREAM_BOOTSTRAP_SERVERS: "kafka:9092"
+  ANYSENTRY_STREAM_CANONICAL_TOPIC: "anysentry.events.canonical.v1"
+  ANYSENTRY_STREAM_JUDGMENTS_TOPIC: "anysentry.judgments.v1"
+  ANYSENTRY_STREAM_EPISODES_TOPIC: "anysentry.risk-analysis-batches.v1"
+  ANYSENTRY_STREAM_FINDINGS_TOPIC: "anysentry.stream.findings.v1"
+  ANYSENTRY_STREAM_DLQ_TOPIC: "anysentry.stream.dlq.v1"
+  ANYSENTRY_SUPPLY_CHAIN_CONTEXT_TOPIC: "anysentry.supply-chain.context.v1"
+  ANYSENTRY_FLINK_REST_URL: "http://flink-jobmanager:8081"
+  ANYSENTRY_FLINK_JOB_NAME: "AnySentry Flink Shadow Risk"
+  # Supply-chain collection and its worker are likewise explicit production opt-ins.
+  ANYSENTRY_SUPPLY_CHAIN: "off"
+  ANYSENTRY_SUPPLY_CHAIN_RUNTIME: "off"
 ---
 # ----------------------------------------------------------------------------
 # Pod-identity enrichment. This is metadata-only, read-only cluster access: it maps every observed
@@ -135,16 +309,32 @@ spec:
     matchLabels: { app: anysentry }
   template:
     metadata:
-      labels: { app: anysentry }
+      labels: { app: anysentry, io.anysentry.observe: "false" }
     spec:
+      terminationGracePeriodSeconds: 30
       serviceAccountName: anysentry
       containers:
         - name: anysentry
           image: ghcr.io/a3s-lab/anysentry:latest
           ports:
             - { containerPort: 29653 }
+          envFrom:
+            - configMapRef:
+                name: anysentry-runtime
+            - secretRef:
+                name: anysentry-model-credentials
+                optional: true
+            - secretRef:
+                name: anysentry-admin
+                optional: true
+            - secretRef:
+                name: anysentry-supply-chain
+                optional: true
           env:
             - { name: PORT, value: "29653" }
+            # Keep the synchronous dashboard hot set within the 512 MiB API memory budget.
+            - { name: ANYSENTRY_HOT_EVENT_LIMIT, value: "10000" }
+            - { name: ANYSENTRY_OBSERVER_BODY_LIMIT, value: "4mb" }
             # Bundled ClickHouse (namespace-local Service DNS). Point this at an external server to
             # use your own ClickHouse instead — then delete the ClickHouse objects above.
             - { name: CLICKHOUSE_URL, value: "http://clickhouse:8123" }
@@ -153,6 +343,14 @@ spec:
               valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_USER } }
             - name: CLICKHOUSE_PASSWORD
               valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_PASSWORD } }
+            # Mutable business objects use PostgreSQL when this optional Secret exists. Agent
+            # metadata remains on the ClickHouse migration fallback while it is absent.
+            - name: ANYSENTRY_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: anysentry-database
+                  key: ANYSENTRY_DATABASE_URL
+                  optional: true
             # Workload registry: a cluster-scoped initial Pod list + watch, exposed as a
             # node-filtered snapshot. This maps infrastructure and Agent containers alike; labels
             # below classify Agents but do not control whether workload names can be resolved.
@@ -164,17 +362,26 @@ spec:
             # Optional: drive the dashboard with a synthetic event mix for a demo (sentry still
             # really judges it). Leave unset to show only real ingested events.
             # - { name: ANYSENTRY_SYNTHETIC_FEED, value: "on" }
+          # Startup can include ClickHouse schema initialization and event hydration. Kubernetes
+          # suppresses readiness/liveness checks until this succeeds (up to three minutes).
+          startupProbe:
+            httpGet: { path: /security-center/healthz, port: 29653 }
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 36
           readinessProbe:
             httpGet: { path: /security-center/healthz, port: 29653 }
-            initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           livenessProbe:
             httpGet: { path: /security-center/healthz, port: 29653 }
-            initialDelaySeconds: 15
             periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
-            requests: { cpu: 100m, memory: 128Mi }
-            limits: { cpu: "1", memory: 512Mi }
+            requests: { cpu: 500m, memory: 512Mi }
+            limits: { cpu: "2", memory: 2Gi }
 ---
 apiVersion: v1
 kind: Service
@@ -187,3 +394,75 @@ spec:
   selector: { app: anysentry }
   ports:
     - { name: http, port: 29653, targetPort: 29653 }
+---
+# ----------------------------------------------------------------------------
+# Asynchronous single-event judgment workers.
+# ----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fast-judge
+  namespace: anysentry
+  labels: { app: fast-judge, io.anysentry.observe: "false" }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: fast-judge }
+  template:
+    metadata:
+      labels: { app: fast-judge, io.anysentry.observe: "false" }
+    spec:
+      containers:
+        - name: fast-judge
+          image: ghcr.io/a3s-lab/anysentry:latest
+          command: ["node", "dist/security-monitoring/worker-main.js"]
+          envFrom:
+            - configMapRef:
+                name: anysentry-runtime
+            - secretRef:
+                name: anysentry-model-credentials
+                optional: true
+          env:
+            - { name: ANYSENTRY_WORKER_ROLE, value: "fast" }
+            - { name: ANYSENTRY_FAST_JUDGE_CONCURRENCY, value: "4" }
+            - { name: ANYSENTRY_L2_CONTEXT_TOKENS, value: "16384" }
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { cpu: "2", memory: 1Gi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: l3-worker
+  namespace: anysentry
+  labels: { app: l3-worker, io.anysentry.observe: "false" }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: l3-worker }
+  template:
+    metadata:
+      labels: { app: l3-worker, io.anysentry.observe: "false" }
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: l3-worker
+          image: ghcr.io/a3s-lab/anysentry:latest
+          command: ["node", "dist/security-monitoring/worker-main.js"]
+          envFrom:
+            - configMapRef:
+                name: anysentry-runtime
+            - secretRef:
+                name: anysentry-model-credentials
+                optional: true
+          env:
+            - { name: ANYSENTRY_WORKER_ROLE, value: "l3" }
+            - { name: ANYSENTRY_L3_CONCURRENCY, value: "2" }
+            - { name: ANYSENTRY_L3_TIMEOUT_MS, value: "180000" }
+            - { name: ANYSENTRY_L3_RETRY_TIMEOUT_MS, value: "180000" }
+            - { name: ANYSENTRY_L3_ATTEMPTS, value: "2" }
+            - { name: ANYSENTRY_L3_CONTEXT_TOKENS, value: "32768" }
+            - { name: ANYSENTRY_L3_SKILLS, value: "/opt/anysentry/skills" }
+          resources:
+            requests: { cpu: 500m, memory: 512Mi }
+            limits: { cpu: "2", memory: 2Gi }

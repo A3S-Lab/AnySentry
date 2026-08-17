@@ -1,27 +1,34 @@
 # Deploying AnySentry + a3s-observer on Kubernetes
 
-Real end-to-end: **a3s-observer** (eBPF, observe-only) on every node → forwards kernel events to
-**AnySentry** → embedded **a3s-sentry** judges them → the dashboard shows real risk.
+This deployment runs the complete event, judgment, streaming-correlation, and supply-chain stack:
 
 ```
- kernel events (every node)
-   a3s-observer-collector ──NDJSON──▶ observer-forward.js ──POST /security-center/ingest──▶ AnySentry
-                                                                               │
-                                                  @a3s-lab/sentry.evaluate() ◀──┘
-                                                                               │
-                                                          dashboard (Service :29653)
+ a3s-observer (every node)
+          │
+          ▼
+ AnySentry API ──▶ Redis/BullMQ ──▶ Fast Judge / L3 Worker
+          │
+          ├──▶ ClickHouse
+          │
+          └──▶ Kafka ──▶ Flink ──▶ Stream Worker / Composite Judge
+                         ▲
+                         └──────── OSV assessment context
 ```
 
-These manifests are a generic, self-contained example. They deploy into the `anysentry` namespace
-and bundle a single-node ClickHouse for durable storage; nothing is tied to a specific cluster.
+`deploy/anysentry.yaml` contains ClickHouse, Redis, the API, and single-event judge workers.
+`deploy/streaming.yaml` contains Kafka, Flink, stream/composite workers, and the OSV assessment
+worker. The bundled stateful services are a complete single-cluster baseline. Production fleets
+should normally replace single-node ClickHouse, Redis, and Kafka with managed HA services.
 
 ## Prerequisites
 
-- A Kubernetes cluster with a **default StorageClass** (the bundled ClickHouse PVC uses it).
+- A Kubernetes cluster with a default RWO StorageClass for ClickHouse, Redis, and Kafka.
+- An RWX-capable StorageClass for the bundled Flink checkpoint PVC. For production, use an object
+  store checkpoint URI instead of a shared filesystem.
 - **amd64 nodes** — `@a3s-lab/sentry` bundles a `linux-x64-gnu` binary requiring **GLIBC_2.39**, so
   the AnySentry runtime image is `ubuntu:24.04` (there is no linux-arm64 build).
 - `kubectl` configured for your cluster.
-- For the observer step only: a container registry you can push to (or use the public images).
+- Published AnySentry, Flink-job, and observer images accessible to every cluster node.
 
 ## One-command install
 
@@ -32,14 +39,13 @@ deploy/install.sh docker
 
 ANYSENTRY_INSTALL_MODE=kubernetes \
 CLICKHOUSE_PASSWORD="$(openssl rand -hex 16)" \
+ANYSENTRY_FLINK_IMAGE=<your-registry>/anysentry-flink-streaming:<version> \
 deploy/install.sh
 ```
 
-Docker mode builds and starts AnySentry + ClickHouse with compose. Kubernetes mode creates the
-namespace, creates the ClickHouse Secret, applies `deploy/anysentry.yaml`, applies the observe-only
-`a3s-observer` DaemonSet, optionally applies Ingress with `ANYSENTRY_APPLY_INGRESS=1`, and waits for
-the AnySentry, ClickHouse, and observer rollouts. The AnySentry image bundles `@a3s-lab/sentry`;
-the observer DaemonSet runs only `a3s-observer-collector` plus the AnySentry forwarder.
+Kubernetes mode creates the namespace and ClickHouse Secret, applies both core and streaming
+manifests, applies the observe-only observer DaemonSet, optionally applies Ingress with
+`ANYSENTRY_APPLY_INGRESS=1`, and waits for every workload to become available.
 
 ## 1. AnySentry image
 
@@ -53,6 +59,24 @@ docker push    <your-registry>/anysentry:latest
 ```
 
 The repo-root `Dockerfile` produces a standalone image with pnpm (corepack) — no extra steps.
+
+Build and publish the Flink job image as well:
+
+```bash
+docker build -t <your-registry>/anysentry-flink-streaming:latest streaming/flink
+docker push <your-registry>/anysentry-flink-streaming:latest
+```
+
+Pass immutable image references to the installer:
+
+```bash
+ANYSENTRY_IMAGE=<your-registry>/anysentry:<version> \
+ANYSENTRY_FLINK_IMAGE=<your-registry>/anysentry-flink-streaming:<version> \
+ANYSENTRY_OBSERVER_IMAGE=<your-registry>/anysentry-observer:<version> \
+ANYSENTRY_INSTALL_MODE=kubernetes \
+CLICKHOUSE_PASSWORD="$(openssl rand -hex 16)" \
+deploy/install.sh
+```
 
 ## 2. Create the namespace and ClickHouse credentials
 
@@ -73,26 +97,36 @@ and expose it to every process that actually calls the model:
 ```bash
 kubectl -n anysentry create secret generic anysentry-model-credentials \
   --from-literal=A3S_SENTRY_LLM_KEY='<fast-review-key>' \
-  --from-literal=A3S_SENTRY_L3_KEY='<deep-investigation-key>'
-
-kubectl -n anysentry set env deployment/anysentry --from=secret/anysentry-model-credentials
-kubectl -n anysentry set env deployment/fast-judge --from=secret/anysentry-model-credentials
-kubectl -n anysentry set env deployment/l3-worker --from=secret/anysentry-model-credentials
+  --from-literal=A3S_SENTRY_L3_KEY='<deep-investigation-key>' \
+  --from-literal=ANYSENTRY_COMPOSITE_LLM_KEY='<composite-review-key>'
 ```
 
-Set model URLs and IDs separately through normal deployment configuration. L2 and AI identity
-review use only `A3S_SENTRY_LLM_*`; L3 uses only `A3S_SENTRY_L3_*`. Operators can instead test and
-apply either connection in the policy page. UI-provided keys remain memory-only and are synchronized
-to workers through Redis Pub/Sub, so they must be entered again after the API restarts. The secret
-value is never returned to the browser.
+The manifests load this Secret optionally into only the processes that call models. Add model URL
+and model ID keys to the same Secret, or configure them from the policy page. UI-provided keys
+remain memory-only and are synchronized to workers through Redis Pub/Sub, so they must be entered
+again after the API restarts.
 
-## 3. Deploy AnySentry (+ bundled ClickHouse)
+## 3. Deploy the complete stack
 
 ```bash
 kubectl -n anysentry apply -f deploy/anysentry.yaml
+kubectl -n anysentry apply -f deploy/streaming.yaml
 kubectl -n anysentry rollout status deploy/clickhouse
+kubectl -n anysentry rollout status statefulset/redis
+kubectl -n anysentry rollout status statefulset/kafka
 kubectl -n anysentry rollout status deploy/anysentry
+kubectl -n anysentry rollout status deploy/fast-judge
+kubectl -n anysentry rollout status deploy/l3-worker
+kubectl -n anysentry rollout status deploy/flink-jobmanager
+kubectl -n anysentry rollout status deploy/flink-taskmanager
+kubectl -n anysentry rollout status deploy/stream-worker
+kubectl -n anysentry rollout status deploy/composite-judge
+kubectl -n anysentry rollout status deploy/supply-chain-assessment
 ```
+
+The API may hydrate ClickHouse history during startup. Its `startupProbe` allows up to 180 seconds
+and prevents liveness/readiness checks from killing it during that warm-up. After startup,
+readiness controls traffic admission and liveness only restarts an unresponsive process.
 
 Reach the dashboard:
 
@@ -116,9 +150,25 @@ kubectl -n anysentry create secret generic anysentry-admin \
   --from-literal=ANYSENTRY_ADMIN_TOKEN='<long-random-token>'
 ```
 
-Then add an `env` entry with `valueFrom.secretKeyRef` to the AnySentry container. Read APIs and
-producer paths (`/security-center/ingest`, Collector heartbeat, Source check-in) remain on Source
-identity and Source ingest tokens.
+The AnySentry Deployment already references this Secret with `optional: true`; creating it and
+restarting the API is sufficient. Read APIs and producer paths (`/security-center/ingest`,
+Collector heartbeat, Source check-in) remain on Source identity and Source ingest tokens.
+
+### PostgreSQL for mutable business state
+
+Agent metadata and human identity reviews use PostgreSQL when `ANYSENTRY_DATABASE_URL` is
+configured. Use a managed or separately operated PostgreSQL service in production and create the
+optional database Secret before deploying the API:
+
+```bash
+kubectl -n anysentry create secret generic anysentry-database \
+  --from-literal=ANYSENTRY_DATABASE_URL='postgresql://user:password@postgres.example:5432/anysentry'
+```
+
+The API creates its bounded Agent metadata table on first connection. During the migration it also
+keeps the ClickHouse copy and can start without this Secret, but production should alert when
+`healthz.businessState.postgresqlReady` is false. Do not store database credentials in the
+ConfigMap or commit them to the repository.
 
 ### Using an external ClickHouse
 
@@ -155,14 +205,21 @@ so every node appears as a stable Collector. The bundled forwarder also emits so
 heartbeats every `ANYSENTRY_HEARTBEAT_SECS` seconds; with no explicit `ANYSENTRY_SOURCE_ID`,
 AnySentry discovers one observer Source per node/collector automatically.
 
-The manifest independently configures `FORWARD_FILTER_MODE=enforce`,
+The manifest initially configures `FORWARD_FILTER_MODE=shadow`,
 `FORWARD_RETAIN_UNKNOWN=true`, `FORWARD_RETAIN_NON_AGENT=false`, and
 `FORWARD_NOISE_POLICY=balanced`. The forwarder checks the versioned Kubernetes workload
 snapshot before host process signatures and PID ancestry. A generic `node` or `python` process in
 an Agent container is therefore attributed by Pod UID + full Container ID, while a sidecar can be
-classified separately. Unknown identities remain observable; only positively identified
-non-Agent events are filtered. Events are sent in bounded batches (32 events or 50 ms), and
+classified separately. Unknown identities and positively identified non-Agent decisions remain
+observable during this comparison. Events are sent in bounded batches (32 events or 50 ms), and
 heartbeats report classification, cache, queue, batch, filtered, and dropped counters.
+`FORWARD_MAX_OUTSTANDING_EVENTS` and `FORWARD_MAX_OUTSTANDING_BYTES` bound the combined pending,
+in-flight, and API-authorized retry states (the manifest uses 16,384 events / 64 MiB and a 45-second
+retry age). Only an explicit per-item `clickhouse_event_buffer_full` acknowledgement is retried;
+transport failures
+and ambiguous HTTP failures remain terminal to avoid duplicating events whose acceptance is
+unknown. Legacy `FORWARD_MAX_QUEUE` names are accepted as fallback aliases, but new deployments
+should use the outstanding-limit names.
 Routine `/proc`, `/sys`, `/run`, and `/dev` `FileAccess` noise is evaluated independently of the
 identity class; high-value deletion and security events remain observable.
 
@@ -176,7 +233,8 @@ metadata:
     anysentry.io/agent-container: agent
 ```
 
-Set `FORWARD_FILTER_MODE=shadow` to compare would-drop counters without dropping. For a temporary
+After local, Docker, and Kubernetes comparison passes, set `FORWARD_FILTER_MODE=enforce` to apply
+those decisions. For a temporary
 unfiltered recovery view, set `FORWARD_RETAIN_NON_AGENT=true` and `FORWARD_NOISE_POLICY=include`;
 this does not change identity classification or risk routing.
 

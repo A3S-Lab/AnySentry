@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { AlertingService } from './alerting.service';
 import { AggregationService } from './aggregation.service';
 import { ClickHouseStore } from './clickhouse-store';
+import { RelationalBusinessStore } from './relational-business-store.service';
 import {
   AlertListItem,
   CoverageIssue,
@@ -25,11 +26,19 @@ const WINDOW: Record<string, number> = { last_3h: 3 * HOUR, last_1d: 24 * HOUR, 
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 const RETAIN_LIMIT = 2_000;
 const OVERDUE_SCAN_BUFFER_MS = 250;
+const RELATIONAL_REFRESH_MS = 15_000;
 
 function envInt(name: string, fallback: number, min: number, max: number): number {
   const n = Number(process.env[name]);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.round(n)));
+}
+
+function envSeverity(name: string, fallback: Severity): Severity {
+  const value = process.env[name];
+  return value === 'info' || value === 'low' || value === 'medium' || value === 'high' || value === 'critical'
+    ? value
+    : fallback;
 }
 
 function hashId(prefix: string, parts: Array<string | number | undefined>): string {
@@ -130,28 +139,46 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
   private readonly ch = new ClickHouseStore();
   private readonly state = new Map<string, RemediationRecord>();
   private readonly overdueScanIntervalMs = envInt('ANYSENTRY_REMEDIATION_OVERDUE_SCAN_SECS', 60, 5, 86_400) * 1000;
+  private readonly minimumSeverity = envSeverity('ANYSENTRY_REMEDIATION_MIN_SEVERITY', 'medium');
+  private readonly dueMinimumSeverity = envSeverity('ANYSENTRY_REMEDIATION_DUE_MIN_SEVERITY', 'high');
   private persistTimer?: NodeJS.Timeout;
   private overdueTimer?: NodeJS.Timeout;
+  private relationalRefreshTimer?: NodeJS.Timeout;
+  private persistInFlight?: Promise<void>;
+  private persistRequested = false;
   private initialized = false;
 
   constructor(
     private readonly agg: AggregationService,
     private readonly alerting: AlertingService,
+    private readonly relational: RelationalBusinessStore,
   ) {}
 
   async onModuleInit(): Promise<void> {
     if (await this.ch.init()) {
-      for (const record of await this.ch.loadRemediationState()) this.state.set(record.taskId, record);
+      for (const record of await this.ch.loadRemediationState()) this.mergePersisted(record);
     }
+    for (const record of await this.relational.loadRemediations()) this.mergePersisted(record);
+    this.retireDuplicateAlertTasks();
     this.initialized = true;
+    await this.persist();
     this.scheduleOverdueScan(0);
+    this.relationalRefreshTimer = setInterval(() => void this.refreshRelational(), RELATIONAL_REFRESH_MS);
   }
 
   async onModuleDestroy(): Promise<void> {
     if (this.persistTimer) clearTimeout(this.persistTimer);
     if (this.overdueTimer) clearTimeout(this.overdueTimer);
+    if (this.relationalRefreshTimer) clearInterval(this.relationalRefreshTimer);
     await this.persist();
     await this.ch.close();
+  }
+
+  stateStatus(): { recordCount: number; postgresqlBacked: boolean } {
+    return {
+      recordCount: this.state.size,
+      postgresqlBacked: this.relational.isReady(),
+    };
   }
 
   list(query: RemediationQuery, options: { refresh?: boolean } = {}): RemediationList {
@@ -271,15 +298,33 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
   private generate(query: RemediationQuery): RemediationRecord[] {
     const filter = { timeType: query.timeType, startTime: query.startTime, endTime: query.endTime };
     const incidents = this.agg.incidents({ ...filter, status: 'all', limit: 500 }).items
-      .filter((incident) => incident.status !== 'resolved')
+      .filter((incident) =>
+        incident.status !== 'resolved' &&
+        SEVERITY_RANK[incident.severity] >= SEVERITY_RANK[this.minimumSeverity])
       .map((incident) => this.fromIncident(incident));
     const alerts = this.alerting.list({ ...filter, status: 'all', limit: 500 }).items
-      .filter((alert) => alert.ruleId !== 'remediation.overdue' && alert.ruleId !== 'coverage.issue' && alert.status !== 'resolved' && alert.status !== 'silenced')
+      .filter((alert) =>
+        alert.kind !== 'incident' &&
+        alert.kind !== 'event' &&
+        alert.ruleId !== 'remediation.overdue' &&
+        alert.ruleId !== 'coverage.issue' &&
+        alert.status !== 'resolved' &&
+        alert.status !== 'silenced')
       .map((alert) => this.fromAlert(alert));
-    const coverageIssues = this.agg.coverageOverview({ ...filter, limit: 500 }).issues;
+    const coverageIssues = this.agg.coverageOverview({
+      ...filter,
+      issueId: query.issueId,
+      sourceId: query.sourceId,
+      collectorId: query.collectorId,
+      workspacePath: query.workspacePath,
+      agentId: query.agentId,
+      limit: 500,
+    }).issues;
     this.alerting.observeCoverageList(coverageIssues);
     const coverage = coverageIssues
-      .filter((issue) => !issue.suppressedByMaintenance)
+      .filter((issue) =>
+        !issue.suppressedByMaintenance &&
+        SEVERITY_RANK[issue.severity] >= SEVERITY_RANK[this.minimumSeverity])
       .map((issue) => this.fromCoverage(issue));
     return [...incidents, ...alerts, ...coverage];
   }
@@ -301,7 +346,9 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
       recommendedAction: '查看事件证据，确认影响范围，执行缓解动作后解决 Incident。',
       createdAt,
       updatedAt,
-      dueAt: dueFor(incident.severity, createdAt),
+      dueAt: SEVERITY_RANK[incident.severity] >= SEVERITY_RANK[this.dueMinimumSeverity]
+        ? dueFor(incident.severity, createdAt)
+        : undefined,
       owner: incident.owner,
       note: incident.note,
       agentId: incident.agentId,
@@ -345,7 +392,9 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
             : '查看告警来源，关联 Incident/事件证据并记录处置结果。',
       createdAt,
       updatedAt,
-      dueAt: dueFor(alert.severity, createdAt),
+      dueAt: SEVERITY_RANK[alert.severity] >= SEVERITY_RANK[this.dueMinimumSeverity]
+        ? dueFor(alert.severity, createdAt)
+        : undefined,
       owner: alert.owner,
       note: alert.note,
       agentId: alert.agentId,
@@ -379,7 +428,9 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
       recommendedAction: issue.recommendedAction,
       createdAt,
       updatedAt,
-      dueAt: dueFor(issue.severity, createdAt),
+      dueAt: SEVERITY_RANK[issue.severity] >= SEVERITY_RANK[this.dueMinimumSeverity]
+        ? dueFor(issue.severity, createdAt)
+        : undefined,
       agentId: issue.agentId,
       workspacePath: issue.workspacePath,
       collectorId: issue.collectorId,
@@ -412,6 +463,56 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
     this.persistSoon();
   }
 
+  private retireDuplicateAlertTasks(at = Date.now()): void {
+    for (const [taskId, task] of this.state) {
+      const coveredByIncident =
+        task.sourceType === 'alert' &&
+        (task.labels?.kind === 'incident' || task.labels?.kind === 'event');
+      const sourceAlertResolved =
+        task.sourceType === 'alert' &&
+        Boolean(task.alertId) &&
+        !this.alerting.isActiveAlert(task.alertId as string);
+      const verificationSourceRetired =
+        Boolean(task.ingestionSourceId) &&
+        this.alerting.isVerificationSourceId(task.ingestionSourceId as string);
+      const incompleteTelemetryRetired =
+        `${task.title} ${task.description}`.toLowerCase()
+          .includes('incomplete toolexec evidence: argv was truncated or could not be fully reassembled');
+      const belowActionThreshold =
+        SEVERITY_RANK[task.severity] < SEVERITY_RANK[this.minimumSeverity];
+      const belowDueThreshold =
+        SEVERITY_RANK[task.severity] < SEVERITY_RANK[this.dueMinimumSeverity];
+      if (active(task.status) && belowDueThreshold && task.dueAt) {
+        this.state.set(taskId, {
+          ...task,
+          dueAt: undefined,
+          updatedAt: at,
+          note: task.note ?? '低于强制处置时限门槛，保留治理任务但不再产生逾期告警。',
+        });
+      }
+      if (
+        !active(task.status) ||
+        (
+          !coveredByIncident &&
+          !sourceAlertResolved &&
+          !verificationSourceRetired &&
+          !incompleteTelemetryRetired &&
+          !belowActionThreshold
+        )
+      ) {
+        continue;
+      }
+      this.state.set(taskId, {
+        ...task,
+        status: 'dismissed',
+        dueAt: undefined,
+        completedAt: at,
+        updatedAt: at,
+        note: task.note ?? '已由对应 Incident 处置任务覆盖，自动关闭重复任务。',
+      });
+    }
+  }
+
   private item(task: RemediationRecord): RemediationListItem {
     return {
       ...task,
@@ -423,7 +524,9 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
   }
 
   private syncOverdueAlerts(at = Date.now()): void {
-    for (const task of this.state.values()) this.alerting.observeRemediation(this.item(task), at);
+    const tasks = [...this.state.values()].map((task) => this.item(task));
+    for (const task of tasks) this.alerting.observeRemediation(task, at);
+    this.alerting.reconcileRemediationOverdue(tasks, at);
   }
 
   private syncGenerated(query: RemediationQuery): void {
@@ -495,10 +598,38 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
     }, 500);
   }
 
-  private async persist(): Promise<void> {
-    const tasks = [...this.state.values()]
-      .sort((a, b) => b.updatedAt - a.updatedAt)
-      .slice(0, RETAIN_LIMIT);
-    await this.ch.saveRemediationState(tasks);
+  private persist(): Promise<void> {
+    this.persistRequested = true;
+    if (!this.persistInFlight) {
+      this.persistInFlight = this.drainPersistence().finally(() => {
+        this.persistInFlight = undefined;
+        if (this.persistRequested) void this.persist();
+      });
+    }
+    return this.persistInFlight;
+  }
+
+  private async drainPersistence(): Promise<void> {
+    do {
+      this.persistRequested = false;
+      const tasks = [...this.state.values()]
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, RETAIN_LIMIT);
+      await Promise.all([
+        this.relational.saveRemediations(tasks),
+        this.ch.saveRemediationState(tasks),
+      ]);
+    } while (this.persistRequested);
+  }
+
+  private mergePersisted(record: RemediationRecord): void {
+    const current = this.state.get(record.taskId);
+    if (!current || record.updatedAt >= current.updatedAt) {
+      this.state.set(record.taskId, record);
+    }
+  }
+
+  private async refreshRelational(): Promise<void> {
+    for (const record of await this.relational.loadRemediations()) this.mergePersisted(record);
   }
 }

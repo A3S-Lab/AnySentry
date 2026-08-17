@@ -70,9 +70,12 @@ export interface CanonicalProcessIdentity {
   hostId?: string;
   bootId?: string;
   containerId?: string;
+  cgroupId?: string;
   pid?: number;
   ppid?: number;
   rootPid?: number;
+  rootStartTime?: string;
+  startTimeTicks?: string;
   startTimeNs?: string;
   mountNamespace?: number;
   processInstanceId: string;

@@ -1,0 +1,9 @@
+[
+  { "type": "dir", "name": "guide", "label": "Quick start" },
+  { "type": "dir", "name": "safety-loop", "label": "Safety loop" },
+  { "type": "dir", "name": "ai-native", "label": "AI-Native agents" },
+  { "type": "dir", "name": "judgment", "label": "Tiered judgment" },
+  { "type": "dir", "name": "evidence", "label": "Events and evidence" },
+  { "type": "dir", "name": "architecture", "label": "Architecture" },
+  { "type": "dir", "name": "scenarios", "label": "Scenarios" }
+]

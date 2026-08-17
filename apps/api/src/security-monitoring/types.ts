@@ -3,10 +3,51 @@
 // @a3s-lab/sentry judgments.
 
 export interface SecurityTimeFilter {
-  timeType?: 'last_3h' | 'last_1d' | 'last_7d' | 'last_30d' | 'custom';
+  timeType?: 'last_30m' | 'last_1h' | 'last_2h' | 'last_3h' | 'last_1d' | 'last_7d' | 'last_30d' | 'custom';
   startTime?: string;
   endTime?: string;
+  /**
+   * Freeze all related queries at one instant. The browser reuses this value for every card and
+   * drill-down until the operator refreshes, so a page never mixes several moving "now" values.
+   */
+  snapshotAsOf?: string;
   scope?: 'agent' | 'raw';
+}
+export type QueryTotalMode = 'exact' | 'estimated' | 'omitted';
+export type QueryDataSource = 'clickhouse' | 'clickhouse+hot_delta' | 'clickhouse+redis_current' | 'memory_hot_ring';
+export interface QueryCommitProgress {
+  sourceId?: string;
+  collectorId?: string;
+  /** Greatest event time observed in a successful ClickHouse insert; not a completeness claim. */
+  committedEventTime: string;
+  /** Wall-clock time when that insert completed. */
+  committedAt: string;
+}
+export interface QueryCoverage {
+  requestedFrom: string;
+  requestedTo: string;
+  snapshotAsOf: string;
+  /** Logical read snapshot used by this response; equal across one dashboard refresh. */
+  asOf: string;
+  dataFrom?: string;
+  dataTo?: string;
+  /**
+   * Greatest event time observed in a successful relevant ClickHouse insert.
+   * This is not an event-time watermark and does not prove that older events cannot arrive later.
+   */
+  observedDurableThrough?: string;
+  /** @deprecated Compatibility alias for observedDurableThrough. */
+  committedCutoff?: string;
+  commitBoundaryKind?: 'observed_durable_high_water';
+  commitProgress?: QueryCommitProgress[];
+  commitProgressScope?: 'all_sources' | 'query_sources';
+  lateDataPolicy?: 'commit_journal_revision_repair';
+  completeness?: 'exact_as_observed' | 'partial';
+  watermark?: string;
+  partial: boolean;
+  partialReason?: 'hot_ring_only' | 'scan_limit' | 'storage_unavailable';
+  source: QueryDataSource;
+  totalMode: QueryTotalMode;
 }
 export interface ExplainabilityScanRequest extends SecurityTimeFilter {
   seriesPoints?: number;
@@ -19,14 +60,53 @@ export type Severity = 'info' | 'low' | 'medium' | 'high' | 'critical';
 export type RiskType = 'system' | 'communication' | 'atomic';
 export type EventSource = 'observer' | 'synthetic' | 'api';
 export type EventCategory = 'tool' | 'network' | 'file' | 'llm' | 'security' | 'process' | 'runtime' | 'unknown';
+export type ActivityContext = 'agent_action' | 'platform_healthcheck' | 'collector_heartbeat';
+export type ActivitySubtype =
+  | 'docker_healthcheck'
+  | 'k8s_exec_probe'
+  | 'k8s_liveness_probe'
+  | 'k8s_readiness_probe'
+  | 'k8s_startup_probe'
+  | 'observer_heartbeat';
+export type PlatformHealthcheckSubtype = Exclude<ActivitySubtype, 'observer_heartbeat'>;
+export interface PlatformHealthcheckSpec {
+  activitySubtype: PlatformHealthcheckSubtype;
+  argv: string[];
+}
 export type EventAttributeValue = string | number | boolean;
 export type IncidentStatus = 'open' | 'acknowledged' | 'resolved';
 export type AgentHealthState = 'active' | 'idle' | 'stale' | 'risky';
+/** Event-history lifecycle used by inventory views; separate from root-process runtime state. */
+export type AgentLifecycleState = 'current' | 'historical' | 'terminated';
+/** Root-process lifecycle. This is intentionally separate from event-derived AgentHealthState. */
+export type AgentRuntimeReportedState = 'running' | 'exited' | 'lost';
+/** `unobserved` is derived by the API when a previously live forwarder stops reporting. */
+export type AgentRuntimeState = AgentRuntimeReportedState | 'unobserved';
+export type AgentActivityState = 'active' | 'idle';
+/** Stable machine-readable outcomes for the runtime lease/snapshot control plane. */
+export type AgentRuntimeAckReasonCode =
+  | 'lease_not_found'
+  | 'lease_epoch_stale'
+  | 'lease_owner_mismatch'
+  | 'stale_forwarder'
+  | 'collector_conflict'
+  | 'capacity_exceeded'
+  | 'validation_error'
+  | 'source_rejected'
+  | 'service_unavailable'
+  | 'snapshot_version_stale'
+  | 'snapshot_version_conflict'
+  | 'ready_regression'
+  | 'identity_conflict'
+  | 'generation_regression'
+  | 'terminal_state_conflict'
+  | 'awaiting_ready';
 export type AgentCriticality = 'low' | 'medium' | 'high' | 'critical';
 export type CollectorHealthState = 'healthy' | 'quiet' | 'degraded' | 'stale' | 'down';
 export type CollectorReportedStatus = 'ok' | 'degraded' | 'error';
 export type AlertStatus = 'open' | 'acknowledged' | 'resolved' | 'silenced';
-export type AlertKind = 'incident' | 'collector' | 'agent' | 'event' | 'source' | 'coverage' | 'objective' | 'remediation';
+export type AlertKind = 'incident' | 'collector' | 'agent' | 'event' | 'judgment' | 'source' | 'coverage' | 'objective' | 'remediation';
+export type AlertTimeMode = 'window' | 'backlog' | 'combined';
 export type TopologyNodeType = 'agent' | 'workspace' | 'collector' | 'tool' | 'network' | 'file' | 'llm' | 'security';
 export type TopologyEdgeType = 'runs_in' | 'observed_by' | 'executes' | 'connects' | 'resolves' | 'accesses' | 'calls_llm' | 'triggers';
 export type MaintenanceTargetType = 'all' | 'workspace' | 'agent' | 'collector' | 'source';
@@ -102,9 +182,12 @@ export interface AgentAttribution {
   agentDisplayName?: string;
   agentSessionId?: string;
   agentInstanceId?: string;
+  /** Stable Workspace of the Agent root process; distinct from an individual event's cwd. */
+  agentWorkspacePath?: string;
   physicalWorkloadId?: string;
   workloadRef?: AgentWorkloadRef;
   rootPid?: number;
+  rootStartTime?: string;
   confidence: number;
   reason: AgentAttributionReason;
   source: AgentAttributionSource;
@@ -133,6 +216,8 @@ export interface WorkloadIdentitySnapshotEntry {
   ownerName?: string;
   labels?: Record<string, string>;
   systemdUnit?: string;
+  /** Exact, platform-declared exec probes for this physical container only. */
+  platformHealthchecks?: PlatformHealthcheckSpec[];
   evidence: string[];
 }
 
@@ -144,6 +229,147 @@ export interface WorkloadIdentitySnapshot {
   nodeName?: string;
   entries: WorkloadIdentitySnapshotEntry[];
   errors: number;
+}
+
+/**
+ * One root-process instance reported by an observer forwarder.
+ *
+ * `agentScopeId` is a display/type label (for example, "codex"). Runtime identity is always
+ * `agentInstanceId`, optionally joined to the existing asset model through `physicalWorkloadId`.
+ */
+export interface AgentRuntimeSnapshotEntry {
+  agentScopeId: string;
+  agentDisplayName?: string;
+  agentInstanceId: string;
+  physicalWorkloadId?: string;
+  classification?: AgentClassification;
+  runtimeState: AgentRuntimeReportedState;
+  rootPid: number;
+  rootStartTimeTicks: string;
+  rootGeneration: number;
+  hostId: string;
+  bootId: string;
+  comm?: string;
+  exe?: string;
+  workspacePath?: string;
+  discoveredAt: string;
+  lastSeenAt: string;
+  lastActivityAt?: string;
+  endedAt?: string;
+  exitCode?: number;
+  signal?: number;
+  confidence?: number;
+  source?: AgentAttributionSource;
+  evidence?: string[];
+  workloadRef?: AgentWorkloadRef;
+}
+
+export interface AgentRuntimeLeaseRequest {
+  collectorId: string;
+  forwarderInstanceId: string;
+  hostId: string;
+  bootId: string;
+  forwarderPid: number;
+  forwarderStartTimeTicks: string;
+}
+
+export interface AgentRuntimeLeaseAck {
+  accepted: boolean;
+  collectorId?: string;
+  forwarderInstanceId?: string;
+  leaseEpoch?: number;
+  issuedAt: string;
+  reasonCode?: AgentRuntimeAckReasonCode;
+  reason?: string;
+}
+
+/** A complete, monotonically-versioned view produced by one forwarder process. */
+export interface AgentRuntimeSnapshotRequest {
+  schemaVersion: 'anysentry.agent_runtime_snapshot.v1';
+  collectorId: string;
+  forwarderInstanceId: string;
+  leaseEpoch: number;
+  snapshotVersion: number;
+  generatedAt: string;
+  ready: boolean;
+  intervalSecs: number;
+  filterMode?: 'shadow' | 'enforce';
+  registryVersion?: number;
+  registryHash?: string;
+  registryMatcherHash?: string;
+  entries: AgentRuntimeSnapshotEntry[];
+}
+
+export interface AgentRuntimeSnapshotAck {
+  accepted: boolean;
+  applied: boolean;
+  duplicate: boolean;
+  collectorId?: string;
+  forwarderInstanceId?: string;
+  leaseEpoch?: number;
+  snapshotVersion?: number;
+  snapshotHash?: string;
+  ready: boolean;
+  instanceCount: number;
+  receivedAt: string;
+  reasonCode?: AgentRuntimeAckReasonCode;
+  reason?: string;
+}
+
+/** Sanitized in-memory record returned to aggregation/query consumers. Epoch values are millis. */
+export interface AgentRuntimeInstanceRecord
+  extends Omit<AgentRuntimeSnapshotEntry, 'runtimeState' | 'discoveredAt' | 'lastSeenAt' | 'lastActivityAt' | 'endedAt'> {
+  collectorId: string;
+  forwarderInstanceId: string;
+  leaseEpoch: number;
+  snapshotVersion: number;
+  snapshotHash: string;
+  filterMode: 'shadow' | 'enforce';
+  registryVersion?: number;
+  registryHash?: string;
+  registryMatcherHash?: string;
+  runtimeState: AgentRuntimeState;
+  activityState?: AgentActivityState;
+  discoveredAt: number;
+  lastSeenAt: number;
+  lastActivityAt?: number;
+  endedAt?: number;
+  receivedAt: number;
+}
+
+export interface AgentRuntimeStateQuery {
+  collectorId?: string;
+  forwarderInstanceId?: string;
+  agentScopeId?: string;
+  agentInstanceId?: string;
+  physicalWorkloadId?: string;
+  runtimeState?: AgentRuntimeState | 'all';
+  activityState?: AgentActivityState | 'all';
+  includeShadow?: boolean;
+  limit?: number;
+}
+
+export interface AgentRuntimeStateSummary {
+  totalInstances: number;
+  runningInstances: number;
+  activeInstances: number;
+  idleInstances: number;
+  exitedInstances: number;
+  lostInstances: number;
+  unobservedInstances: number;
+  shadowInstances: number;
+}
+
+export interface AgentRuntimeStateList {
+  items: AgentRuntimeInstanceRecord[];
+  total: number;
+  summary: AgentRuntimeStateSummary;
+  updateTime: string;
+}
+
+export interface AgentRuntimeStateSummaryResponse {
+  summary: AgentRuntimeStateSummary;
+  updateTime: string;
 }
 export type CoverageIssueType =
   | 'collector_down'
@@ -167,6 +393,8 @@ export interface JudgedEvent {
   at: number; // epoch ms
   eventKind: string; // ToolExec | Egress | FileAccess | Dns | SslContent | SecurityAction
   eventCategory: EventCategory;
+  activityContext?: ActivityContext;
+  activitySubtype?: ActivitySubtype;
   source: EventSource;
   subject: string; // human summary of the event
   workspacePath: string;
@@ -183,6 +411,8 @@ export interface JudgedEvent {
   decisionStatus?: DecisionStatus;
   evaluationId?: string;
   policyVersion?: string;
+  /** Strictly increasing within one eventId. Timestamp is only a tie-breaker, never the revision. */
+  decisionRevision?: number;
   decisionUpdatedAt?: number;
   verdict: Verdict;
   tier: Tier;
@@ -210,6 +440,8 @@ export interface EventMeta {
   userId: string;
   source?: EventSource;
   eventCategory?: EventCategory;
+  activityContext?: ActivityContext;
+  activitySubtype?: ActivitySubtype;
   traceId?: string;
   spanId?: string;
   parentSpanId?: string;
@@ -293,6 +525,22 @@ export interface UniversalIngestResult {
   acceptedEvents: number;
   rejectedEvents: number;
   items: UniversalIngestResultItem[];
+}
+
+export type ObserverBatchIngestDisposition = 'retained' | 'discarded' | 'rejected' | 'retryable';
+export interface ObserverBatchIngestResultItem extends UniversalIngestResultItem {
+  disposition: ObserverBatchIngestDisposition;
+  reasonCode?: string;
+}
+export interface ObserverBatchIngestResult {
+  accepted: boolean;
+  acceptedEvents: number;
+  retainedEvents: number;
+  discardedEvents: number;
+  rejectedEvents: number;
+  retryableEvents: number;
+  retryAfterMs?: number;
+  items: ObserverBatchIngestResultItem[];
 }
 
 export type SecurityCapabilityAction = 'list' | 'search' | 'describe' | 'execute';
@@ -592,6 +840,7 @@ export interface AgentObservability {
   health: { heartbeatOk: boolean; resourceUtil: number; errorRate: number; decisionLatencyMs: number };
   behavioral: { actionRate: number; decisionPattern: 'baseline' | 'drift'; stateTransitions: number; goalProgress: number };
   system: { agentCount: number; commThroughput: number; infraHealthy: boolean };
+  coverage?: QueryCoverage;
   updateTime: string;
 }
 export interface SecurityWorkspaceRiskDistribution {
@@ -603,6 +852,8 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   scope?: 'agent' | 'raw';
   /** Raw-view visibility only. Defaults to true; Agent scope always excludes Unknown. */
   includeUnknown?: boolean;
+  /** Bounded hot-ring preview for dashboard first paint; full history remains separately available. */
+  preview?: boolean;
   /** Query the durable ClickHouse history instead of only the hot dashboard window. */
   durable?: boolean;
   noise?: 'hide' | 'include';
@@ -611,16 +862,19 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   collectorId?: string;
   agentId?: string;
   agentAssetId?: string;
+  agentInstanceId?: string;
   sessionId?: string;
   workspacePath?: string;
   traceId?: string;
   runId?: string;
   eventKind?: string;
   eventCategory?: EventCategory;
+  activityContext?: ActivityContext;
   verdict?: Verdict;
   tier?: Tier;
   q?: string;
   limit?: number;
+  totalMode?: QueryTotalMode;
 }
 export interface AgentEventListItem {
   schemaVersion: 'anysentry.agent_event.v1';
@@ -629,6 +883,8 @@ export interface AgentEventListItem {
   at: string;
   eventKind: string;
   eventCategory: EventCategory;
+  activityContext?: ActivityContext;
+  activitySubtype?: ActivitySubtype;
   source: EventSource;
   subject: string;
   workspacePath: string;
@@ -652,6 +908,7 @@ export interface AgentEventListItem {
   decisionStatus?: DecisionStatus;
   evaluationId?: string;
   policyVersion?: string;
+  decisionRevision?: number;
   decisionUpdatedAt?: number;
   verdict: Verdict;
   tier: Tier;
@@ -674,6 +931,10 @@ export interface AgentEventListItem {
 export interface AgentEventList {
   items: AgentEventListItem[];
   total: number;
+  totalMode: QueryTotalMode;
+  coverage: QueryCoverage;
+  totalApproximate?: boolean;
+  storageFallback?: 'hot_ring';
   updateTime: string;
 }
 export interface AgentTimeline {
@@ -681,6 +942,9 @@ export interface AgentTimeline {
   runId?: string;
   sessionId?: string;
   items: AgentEventListItem[];
+  total: number;
+  hasMore: boolean;
+  coverage: QueryCoverage;
   updateTime: string;
 }
 
@@ -871,6 +1135,7 @@ export interface AgentInventoryQuery extends SecurityTimeFilter {
   q?: string;
   agentId?: string;
   agentAssetId?: string;
+  agentInstanceId?: string;
   workspacePath?: string;
   userId?: string;
   includeUnclassified?: boolean;
@@ -931,6 +1196,11 @@ export interface AgentInventoryItem {
   attributionEvidence: string[];
   physicalWorkloadId?: string;
   agentInstanceId?: string;
+  logicalInstanceCount?: number;
+  hostId?: string;
+  bootId?: string;
+  rootPid?: number;
+  rootStartTime?: string;
   workloadRef?: AgentWorkloadRef;
   reviewDecision?: AgentReviewDecision;
   reviewedBy?: string;
@@ -939,6 +1209,8 @@ export interface AgentInventoryItem {
   reviewIdentityKeys: string[];
   firstSeen: string;
   lastSeen: string;
+  lifecycleState: AgentLifecycleState;
+  terminatedAt?: string;
   healthState: AgentHealthState;
   riskLevel: string;
   riskLevelText: string;
@@ -953,6 +1225,9 @@ export interface AgentInventoryItem {
   topRiskCategory?: string;
   topRiskName?: string;
   lastEventSubject: string;
+  lastEventId?: string;
+  collectorIds?: string[];
+  eventsWithoutCollector?: number;
   eventCategoryCounts: Record<EventCategory, number>;
   sourceCounts: Record<EventSource, number>;
 }
@@ -973,6 +1248,49 @@ export interface AgentInventory {
   items: AgentInventoryItem[];
   total: number;
   summary: AgentInventorySummary;
+  coverage: QueryCoverage;
+  updateTime: string;
+}
+
+export interface AgentInstanceMetricsQuery extends SecurityTimeFilter {
+  agentAssetId: string;
+  agentInstanceId?: string;
+  seriesPoints?: number;
+}
+
+export interface AgentInstanceMetricPoint {
+  statTime: string;
+  eventCount: number;
+  riskyEventCount: number;
+  blockedCount: number;
+  escalatedCount: number;
+  toolCount: number;
+  fileCount: number;
+  networkCount: number;
+  processCount: number;
+  llmCount: number;
+  l1Count: number;
+  l2Count: number;
+  l3Count: number;
+  failedCount: number;
+  timeoutCount: number;
+  tokenCount: number;
+  avgLatencyMs: number;
+  maxRiskScore: number;
+}
+
+export interface AgentInstanceMetrics {
+  agentAssetId: string;
+  points: AgentInstanceMetricPoint[];
+  eventCount: number;
+  riskyEventCount: number;
+  blockedCount: number;
+  escalatedCount: number;
+  tokenCount: number;
+  avgLatencyMs: number;
+  failedCount: number;
+  timeoutCount: number;
+  coverage?: QueryCoverage;
   updateTime: string;
 }
 
@@ -987,6 +1305,8 @@ export interface IdentityAiReviewRequest extends SecurityTimeFilter {
 export interface IdentityAiReviewRecord {
   schemaVersion: 'anysentry.identity_ai_review.v1';
   reviewId: string;
+  /** Monotonic lifecycle revision within one reviewId. */
+  revision?: number;
   targetType: IdentityAiReviewTargetType;
   eventId?: string;
   agentAssetId: string;
@@ -998,9 +1318,16 @@ export interface IdentityAiReviewRecord {
   evidenceRefs: string[];
   evidenceDigest: string;
   model?: string;
-  provider: 'a3s-code-sdk';
+  provider: 'direct-llm' | 'a3s-code-sdk';
+  /** Automatic reviews are keyed by a stable logical identity, not by a transient PID instance. */
+  automatic?: boolean;
+  logicalIdentityKey?: string;
+  appliedDecision?: AgentReviewDecision;
+  appliedAt?: string;
   error?: string;
   createdAt: string;
+  /** Time this lifecycle revision was produced. */
+  updatedAt?: string;
   completedAt?: string;
 }
 
@@ -1013,7 +1340,31 @@ export interface WorkspaceInventoryQuery extends SecurityTimeFilter {
   q?: string;
   limit?: number;
 }
+export interface WorkspaceDirectoryRecord {
+  workspaceId: string;
+  workspacePath: string;
+  workspacePathFingerprint: string;
+  displayName: string;
+  repositoryId?: string;
+  sourceId?: string;
+  environmentId?: string;
+  nodeScope?: string;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  updatedAt: number;
+}
+export interface AgentWorkspaceBindingRecord {
+  bindingId: string;
+  agentAssetId: string;
+  workspaceId: string;
+  workspacePath: string;
+  validFrom: number;
+  validTo?: number;
+  lastObservedAt: number;
+  updatedAt: number;
+}
 export interface WorkspaceInventoryItem {
+  workspaceId?: string;
   workspacePath: string;
   owner?: string;
   team?: string;
@@ -1065,6 +1416,7 @@ export interface WorkspaceInventory {
   items: WorkspaceInventoryItem[];
   total: number;
   summary: WorkspaceInventorySummary;
+  coverage?: QueryCoverage;
   updateTime: string;
 }
 export interface AgentMetadataUpdateRequest {
@@ -1096,8 +1448,12 @@ export interface AgentReviewRequest {
 }
 
 export interface AgentTopologyQuery extends SecurityTimeFilter {
+  scope?: 'agent' | 'raw';
   edgeId?: string;
   eventId?: string;
+  agentAssetId?: string;
+  /** Select one concrete runtime while retaining the shared logical Agent identity. */
+  agentInstanceId?: string;
   agentId?: string;
   workspacePath?: string;
   collectorId?: string;
@@ -1111,7 +1467,10 @@ export interface AgentTopologyNode {
   type: TopologyNodeType;
   label: string;
   subtitle?: string;
+  agentAssetId?: string;
+  agentInstanceId?: string;
   agentId?: string;
+  classification?: AgentClassification;
   workspacePath?: string;
   collectorId?: string;
   riskLevel: string;
@@ -1156,9 +1515,37 @@ export interface AgentTopology {
   nodes: AgentTopologyNode[];
   edges: AgentTopologyEdge[];
   summary: AgentTopologySummary;
+  coverage: QueryCoverage;
   updateTime: string;
 }
 
+export interface CollectorExecEvidenceMetrics {
+  /** ToolExec events reported by the raw collector during this heartbeat interval. */
+  exec: number;
+  /** ToolExec events whose final argv evidence remained truncated. */
+  execTruncated: number;
+  /** ToolExec events whose final argv evidence remained incomplete. */
+  execIncomplete: number;
+  /** ToolExec reassemblies that timed out, including events later supplemented from /proc. */
+  execReassemblyTimeout: number;
+}
+export interface CollectorExecEvidenceReport extends CollectorExecEvidenceMetrics {
+  /** True only for the partial-window raw heartbeat flushed during graceful collector shutdown. */
+  shutdownFinal: boolean;
+}
+export interface CollectorExecEvidenceHealth {
+  /** Distinguishes a reported all-zero interval from a collector that does not expose the metrics. */
+  reported: boolean;
+  lastReportedAt?: string;
+  latest?: CollectorExecEvidenceReport & { intervalSecs: number };
+  /** Sums non-overlapping raw collector intervals whose heartbeat records fall in the query window. */
+  window: CollectorExecEvidenceMetrics & {
+    heartbeatCount: number;
+    intervalSecs: number;
+    shutdownFinalCount: number;
+  };
+}
+export type CollectorHeartbeatOrigin = 'raw_collector' | 'forwarder';
 export interface CollectorHeartbeatRequest {
   collectorId?: string;
   sourceId?: string;
@@ -1184,9 +1571,15 @@ export interface CollectorHeartbeatRequest {
   filterMetrics?: CollectorFilterMetrics;
   message?: string;
 }
+export interface CollectorRawHeartbeatRequest extends CollectorHeartbeatRequest {
+  /** Raw collector-only argv/reassembly evidence quality; never an operational error counter. */
+  execEvidence?: Partial<CollectorExecEvidenceReport>;
+}
 export interface CollectorFilterMetrics {
   /** @deprecated Compatibility marker for pre-decoupling forwarders. */
   scope: 'all' | 'shadow' | 'agent' | 'decoupled';
+  /** True only for the Forwarder heartbeat emitted after its final snapshot and event drain. */
+  shutdownFinal?: boolean;
   filterMode?: 'enforce' | 'shadow';
   retainUnknown?: boolean;
   retainNonAgent?: boolean;
@@ -1203,10 +1596,48 @@ export interface CollectorFilterMetrics {
   wouldFilterNoise: number;
   discoveryBudgetDropped: number;
   wouldDiscoveryBudgetDrop: number;
+  /** Test-only, bounded suppression receipts; absent outside explicitly armed lifecycle E2E. */
+  e2eFilterReceipts?: Array<{
+    schema: 'anysentry.e2e_filter_receipt.v1';
+    eventKind: 'ToolExec';
+    markerSha256: string;
+    lineSha256: string;
+    physicalWorkloadId?: string;
+    classification: string;
+    filterReason: string;
+    filteredAt: string;
+  }>;
   deduplicated: number;
   queueDropped: number;
   batches: number;
   batchEvents: number;
+  /** Events first queued for an API-authorized backpressure retry in this heartbeat interval. */
+  retryQueued?: number;
+  /** Backpressure retry delivery attempts made in this heartbeat interval. */
+  retryAttempts?: number;
+  /** Retried events accepted or policy-discarded by the API in this heartbeat interval. */
+  retryRecovered?: number;
+  /** Retried events that reached a terminal outcome or exceeded their retry deadline. */
+  retryExhausted?: number;
+  /** Serialized bytes currently waiting in the ordinary priority queue. */
+  queueBytes?: number;
+  /** Events currently owned by active event-delivery requests. */
+  inflightEvents?: number;
+  inflightBytes?: number;
+  inflightOldestAgeMs?: number;
+  /** Events waiting for their next API-authorized retry attempt. */
+  retryQueueDepth?: number;
+  retryQueueBytes?: number;
+  /** All retry-owned events, including retry requests currently in flight. */
+  retryOutstandingEvents?: number;
+  retryOutstandingBytes?: number;
+  retryOldestAgeMs?: number;
+  /** Total forwarder-owned events across pending, in-flight, and retry states. */
+  outstandingEvents?: number;
+  outstandingBytes?: number;
+  outstandingOldestAgeMs?: number;
+  outstandingEventLimit?: number;
+  outstandingByteLimit?: number;
   identitySnapshotReady: boolean;
   identitySnapshotVersion: number;
   identitySnapshotAgeSeconds: number;
@@ -1240,9 +1671,66 @@ export interface CollectorFilterMetrics {
   processBootstrapProcReads: number;
   processFallbackProcReads: number;
   processAncestryProcReads: number;
+  processRootsDiscovered?: number;
+  processRootsExited?: number;
+  processRootsLost?: number;
+  processRootsRecovered?: number;
+  processRootLivenessChecks?: number;
+  processRootLivenessMisses?: number;
+  processStaleGenerationMisses?: number;
+  runtimeSignatureVersion?: number;
+  runtimeSignatureHash?: string;
+  runtimeSignatureMatcherHash?: string;
+  runtimeSignatureLoaded?: number;
+  runtimeSignatureMatches?: number;
+  runtimeSignatureMisses?: number;
+  runtimeSignatureAmbiguous?: number;
+  runtimeSignatureInvalid?: number;
+  runtimeSignatureReloadAttempts?: number;
+  runtimeSignatureReloadSuccesses?: number;
+  runtimeSignatureReloadErrors?: number;
+  runtimeSignatureLastGoodHash?: string;
+  runtimeReconcileRequested?: number;
+  runtimeReconcileRuns?: number;
+  runtimeReconcileCoalesced?: number;
+  runtimeReconcileErrors?: number;
+  runtimeReconcileScanned?: number;
+  runtimeReconcileInvalidated?: number;
+  runtimeReconcileLastDurationMs?: number;
+  runtimeSnapshotPosts?: number;
+  runtimeSnapshotErrors?: number;
+  /** Runtime snapshot attempts retried after a transient transport failure. */
+  runtimeSnapshotRetries?: number;
+  /** Transient runtime snapshot failures followed by a successful retry. */
+  runtimeSnapshotRecovered?: number;
+  runtimeLeaseEpoch?: number;
+  runtimeLeaseAttempts?: number;
+  runtimeLeaseErrors?: number;
+  runtimeLeaseFenced?: boolean;
+  runtimeSnapshotRejected?: number;
+  runtimeSnapshotDuplicates?: number;
+  lastRuntimeSnapshotAt?: string;
+  lastRuntimeSnapshotError?: string;
+  /** Sticky timestamp for the most recent terminal or exhausted snapshot failure. */
+  lastRuntimeSnapshotFailureAt?: string;
+  /** Sticky bounded reason for the most recent terminal or exhausted snapshot failure. */
+  lastRuntimeSnapshotFailure?: string;
+  /** Snapshot version associated with the most recent failure. */
+  lastRuntimeSnapshotFailureVersion?: number;
+  /** Sticky timestamp for the most recent transient snapshot retry. */
+  lastRuntimeSnapshotRetryAt?: string;
+  /** Sticky bounded reason that triggered the most recent retry. */
+  lastRuntimeSnapshotRetryReason?: string;
 }
-export interface CollectorHeartbeatRecord extends Required<Pick<CollectorHeartbeatRequest, 'collectorId' | 'status'>> {
+export interface CollectorHeartbeatRecord extends Required<Pick<CollectorRawHeartbeatRequest, 'collectorId' | 'status'>> {
   at: number;
+  /** Server-filled on new records; optional only for persisted pre-classification history. */
+  activityContext?: 'collector_heartbeat';
+  activitySubtype?: 'observer_heartbeat';
+  /** Server-assigned ingress provenance; absent only on records persisted before provenance existed. */
+  origin?: CollectorHeartbeatOrigin;
+  /** Set only when this record carried Forwarder-enriched filter metrics. */
+  filterMetricsReportedAt?: number;
   nodeName?: string;
   namespace?: string;
   podName?: string;
@@ -1257,6 +1745,8 @@ export interface CollectorHeartbeatRecord extends Required<Pick<CollectorHeartbe
   outputDropped: number;
   errorCount: number;
   observedAgents: number;
+  /** Present only when this record originated from a raw CollectorHeartbeat with quality fields. */
+  execEvidence?: CollectorExecEvidenceReport;
   filterMetrics: CollectorFilterMetrics;
   message?: string;
 }
@@ -1298,6 +1788,15 @@ export interface CollectorHealthItem {
   droppedEvents: number;
   outputDropped: number;
   errorCount: number;
+  /** Maximum counter readings reported by heartbeat records in the requested health window. */
+  windowErrorMaxima: {
+    droppedEvents: number;
+    outputDropped: number;
+    errorCount: number;
+  };
+  execEvidence: CollectorExecEvidenceHealth;
+  /** True only when filterMetrics came from a fresh Forwarder heartbeat, not the decoupled fallback. */
+  filterMetricsReported: boolean;
   filterMetrics: CollectorFilterMetrics;
   message?: string;
   eventCategoryCounts: Record<EventCategory, number>;
@@ -1317,6 +1816,7 @@ export interface CollectorHealth {
   items: CollectorHealthItem[];
   total: number;
   summary: CollectorHealthSummary;
+  coverage: QueryCoverage;
   updateTime: string;
 }
 
@@ -1378,6 +1878,7 @@ export interface CoverageSummary {
 export interface CoverageOverview {
   summary: CoverageSummary;
   issues: CoverageIssue[];
+  coverage?: QueryCoverage;
   updateTime: string;
 }
 
@@ -1479,6 +1980,10 @@ export interface AlertRecord {
   riskName?: string;
   sourceSummary: string;
   occurrenceCount: number;
+  /** Distinct evidence events retained for this alert. Platform-only alerts can legitimately be 0. */
+  evidenceEventCount?: number;
+  /** Bounded evidence identity set used to avoid counting the same event revision twice. */
+  evidenceEventIds?: string[];
   lastNotificationAt?: number;
   labels: Record<string, string>;
   monitored?: boolean;
@@ -1495,7 +2000,7 @@ export interface AlertListItem extends Omit<AlertRecord, 'firstSeenAt' | 'lastSe
 }
 export interface AlertListQuery extends SecurityTimeFilter {
   alertId?: string;
-  status?: AlertStatus | 'all';
+  status?: AlertStatus | 'active' | 'all';
   severity?: Severity | 'all';
   kind?: AlertKind | 'all';
   q?: string;
@@ -1508,6 +2013,12 @@ export interface AlertListQuery extends SecurityTimeFilter {
   taskId?: string;
   objectiveId?: string;
   issueId?: string;
+  /**
+   * window: alerts observed/updated in the selected time range;
+   * backlog: currently active alerts regardless of age;
+   * combined: legacy behavior that returns both.
+   */
+  timeMode?: AlertTimeMode;
   limit?: number;
 }
 export interface AlertListSummary {
@@ -1519,10 +2030,13 @@ export interface AlertListSummary {
   resolvedAlerts: number;
   criticalAlerts: number;
   highAlerts: number;
+  urgentActiveAlerts: number;
+  unassignedActiveAlerts: number;
   incidentAlerts: number;
   collectorAlerts: number;
   agentAlerts: number;
   eventAlerts: number;
+  judgmentAlerts: number;
   sourceAlerts: number;
   coverageAlerts: number;
   objectiveAlerts: number;
@@ -1786,6 +2300,14 @@ export interface IngestionSourceRecord {
   lastResult?: 'accepted' | 'rejected';
   lastError?: string;
 }
+export interface IngestionSourceCurrentActivity {
+  sourceId: string;
+  lastSeenAt: number;
+  lastEventAt?: number;
+  lastHeartbeatAt?: number;
+  collectorId?: string;
+  workspacePath?: string;
+}
 export interface IngestionSourceItem extends Omit<IngestionSourceRecord, 'createdAt' | 'updatedAt' | 'lastSeenAt' | 'lastEventAt' | 'lastHeartbeatAt' | 'tokenHash' | 'tokenIssuedAt'> {
   createdAt: string;
   updatedAt: string;
@@ -1878,6 +2400,8 @@ export type RemediationActionKind = 'investigate' | 'collector' | 'source' | 'po
 export interface PolicySimulationRequest extends SecurityTimeFilter {
   policy?: unknown;
   limit?: number;
+  /** Maximum latest event facts replayed. The simulator is intentionally sampled, never full scan. */
+  sampleLimit?: number;
 }
 export interface PolicySimulationDecision {
   verdict: Verdict;
@@ -1925,6 +2449,13 @@ export interface PolicySimulationResult {
   diffs: PolicySimulationDiff[];
   byAgent: PolicySimulationGroup[];
   byWorkspace: PolicySimulationGroup[];
+  sampling: {
+    strategy: 'latest_event_sample';
+    sampleLimit: number;
+    sampledEvents: number;
+    truncated: boolean;
+  };
+  coverage: QueryCoverage;
   updateTime: string;
 }
 

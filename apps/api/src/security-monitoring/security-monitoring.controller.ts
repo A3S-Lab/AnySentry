@@ -1,9 +1,10 @@
-import { BadRequestException, Body, Controller, Get, Headers, HttpCode, NotFoundException, Param, Post, Put, Query, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Headers, HttpCode, NotFoundException, Param, PayloadTooLargeException, Post, Put, Query, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { Observable, map, timer } from 'rxjs';
+import { Observable, map, mergeMap, timer } from 'rxjs';
 import { SkipWrap } from '../shared/api-response.interceptor';
 import { AgentMetadataService } from './agent-metadata.service';
+import { AgentRuntimeStateService } from './agent-runtime-state.service';
 import { AggregationService } from './aggregation.service';
 import { AlertingService } from './alerting.service';
 import { AuditService } from './audit.service';
@@ -12,6 +13,7 @@ import { IdentityReviewAgentService } from './identity-review-agent.service';
 import { testDeepInvestigationConnection, testFastReviewConnection } from './judgment-connectivity';
 import { KubeIdentityService } from './kube-identity.service';
 import { managementAuthConfigured, ManagementAuthGuard, RequireManagementAuth } from './management-auth.guard';
+import { RelationalBusinessStore } from './relational-business-store.service';
 import { MaintenanceWindowService } from './maintenance-window.service';
 import { NotificationService } from './notification.service';
 import { ObjectiveService } from './objective.service';
@@ -23,6 +25,7 @@ import { StreamingFindingService } from './streaming-finding.service';
 import { RuntimeModelConfigService, RuntimeModelProfile, sanitizeRuntimeModelConnection } from './runtime-model-config';
 import { StreamingQueueService } from './streaming-queue.service';
 import { SupplyChainService } from './supply-chain.service';
+import { WorkspaceDirectoryService } from './workspace-directory.service';
 import {
   ClaimScanTaskRequest,
   RegisterWorkspaceRequest,
@@ -45,6 +48,20 @@ interface IngestBody extends Partial<T.EventMeta> {
 
 interface ObserverBatchIngestBody {
   events?: IngestBody[];
+}
+
+const CLICKHOUSE_EVENT_BUFFER_FULL = 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL';
+const OBSERVER_BATCH_RETRY_AFTER_MS = 1_000;
+
+function isClickHouseEventBufferFull(error: unknown): boolean {
+  return Boolean(
+    error &&
+    typeof error === 'object' &&
+    'code' in error &&
+    (error as { code?: unknown }).code === CLICKHOUSE_EVENT_BUFFER_FULL &&
+    'retrySafe' in error &&
+    (error as { retrySafe?: unknown }).retrySafe === true,
+  );
 }
 
 interface RejectedIngestContext {
@@ -233,6 +250,8 @@ function deriveMeta(line: string, given: Partial<T.EventMeta>): T.EventMeta {
     userId: given.userId ?? (uid != null ? `uid:${uid}` : 'system'),
     eventKind: given.eventKind ?? (isLlm ? 'LlmCall' : eventKey),
     eventCategory: given.eventCategory ?? eventCategory(isLlm ? 'LlmCall' : eventKey),
+    activityContext: given.activityContext,
+    activitySubtype: given.activitySubtype,
     source: given.source ?? 'observer',
     traceId: given.traceId,
     spanId: given.spanId,
@@ -271,6 +290,22 @@ function numField(o: Record<string, unknown>, ...keys: string[]): number | undef
   return undefined;
 }
 
+function nonNegativeSafeIntegerField(o: Record<string, unknown>, ...keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = o[key];
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return value;
+  }
+  return undefined;
+}
+
+function boolField(o: Record<string, unknown>, ...keys: string[]): boolean | undefined {
+  for (const key of keys) {
+    const value = o[key];
+    if (typeof value === 'boolean') return value;
+  }
+  return undefined;
+}
+
 function strArrayField(o: Record<string, unknown>, ...keys: string[]): string[] | undefined {
   for (const key of keys) {
     const v = o[key];
@@ -279,7 +314,7 @@ function strArrayField(o: Record<string, unknown>, ...keys: string[]): string[] 
   return undefined;
 }
 
-function parseCollectorHeartbeatLine(line: string): T.CollectorHeartbeatRequest | null {
+function parseCollectorHeartbeatLine(line: string): T.CollectorRawHeartbeatRequest | null {
   try {
     const parsed = JSON.parse(line) as { event?: Record<string, unknown> };
     const hb = obj(parsed.event?.CollectorHeartbeat);
@@ -306,9 +341,20 @@ function parseCollectorHeartbeatLine(line: string): T.CollectorHeartbeatRequest 
         if (Number.isFinite(count)) eventKindCounts[key] = count;
       }
     }
-    const execIncomplete = numField(hb, 'execIncomplete', 'exec_incomplete');
+    const exec = nonNegativeSafeIntegerField(hb, 'exec');
+    const execTruncated = nonNegativeSafeIntegerField(hb, 'execTruncated', 'exec_truncated');
+    const execIncomplete = nonNegativeSafeIntegerField(hb, 'execIncomplete', 'exec_incomplete');
+    const execReassemblyTimeout = nonNegativeSafeIntegerField(hb, 'execReassemblyTimeout', 'exec_reassembly_timeout');
+    const shutdownFinal = boolField(hb, 'shutdownFinal', 'shutdown_final');
+    // Evidence is fail-closed: older or malformed raw schemas remain visible as heartbeats, but
+    // cannot masquerade as complete graceful-shutdown/argv-quality proof.
+    const reportsExecEvidence = [exec, execTruncated, execIncomplete, execReassemblyTimeout]
+      .every((value) => value !== undefined) &&
+      [execTruncated, execIncomplete, execReassemblyTimeout]
+        .every((value) => (value as number) <= (exec as number)) &&
+      shutdownFinal !== undefined;
     return {
-      collectorId: strField(hb, 'collectorId', 'collector_id'),
+      collectorId: canonicalCollectorId(strField(hb, 'collectorId', 'collector_id')),
       nodeName: strField(hb, 'nodeName', 'node_name'),
       namespace: strField(hb, 'namespace'),
       podName: strField(hb, 'podName', 'pod_name'),
@@ -322,10 +368,15 @@ function parseCollectorHeartbeatLine(line: string): T.CollectorHeartbeatRequest 
       droppedEvents: numField(hb, 'droppedEvents', 'dropped'),
       outputDropped: numField(hb, 'outputDropped', 'output_dropped'),
       observedAgents: numField(hb, 'observedAgents', 'observed_agents'),
-      errorCount: numField(hb, 'errorCount', 'error_count') ?? execIncomplete,
+      errorCount: numField(hb, 'errorCount', 'error_count'),
+      execEvidence: reportsExecEvidence ? {
+        exec: exec as number,
+        execTruncated: execTruncated as number,
+        execIncomplete: execIncomplete as number,
+        execReassemblyTimeout: execReassemblyTimeout as number,
+        shutdownFinal: shutdownFinal as boolean,
+      } : undefined,
       queueDepth: numField(hb, 'queueDepth', 'queue_depth'),
-      filterMetrics:
-        (obj(hb.filterMetrics) ?? obj(hb.filter_metrics)) as T.CollectorFilterMetrics | undefined,
       message: strField(hb, 'message'),
     };
   } catch {
@@ -825,6 +876,14 @@ function evidenceMarkdown(bundle: T.EvidenceBundle): string {
 function cleanString(value: unknown, limit: number): string | undefined {
   const text = typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
   return text ? redact(text).slice(0, limit) : undefined;
+}
+
+function canonicalCollectorId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const text = value.trim();
+  // Collector IDs are protocol identities, not display text. Redacting only one side of an
+  // identity comparison would change the principal and could bind a heartbeat to the wrong Source.
+  return text ? text.slice(0, 180) : undefined;
 }
 
 function finiteNumber(value: unknown): number | undefined {
@@ -2693,6 +2752,9 @@ export class SecurityMonitoringController {
     private readonly supplyChain: SupplyChainService,
     private readonly assistant: SecurityAssistantService,
     private readonly identityReview: IdentityReviewAgentService,
+    private readonly agentRuntimeState: AgentRuntimeStateService,
+    private readonly relational: RelationalBusinessStore,
+    private readonly workspaceDirectory: WorkspaceDirectoryService,
   ) {}
 
   private modelProfile(value: string): RuntimeModelProfile {
@@ -2927,6 +2989,19 @@ export class SecurityMonitoringController {
     }
   }
 
+  private observeWorkspaceAssociation(event: T.JudgedEvent): void {
+    try {
+      this.workspaceDirectory.observeEvent(event);
+    } catch (error) {
+      // Directory projection is an optional migration side effect. Immutable event acceptance and
+      // security judgment remain authoritative even when the business-state store is unavailable.
+      console.error('[workspace-directory] association observation failed', {
+        eventId: event.eventId,
+        error: error instanceof Error ? error.message.split('\n')[0].slice(0, 300) : String(error).slice(0, 300),
+      });
+    }
+  }
+
   @Post('top/healthCard')
   @HttpCode(200)
   healthCard(@Body() f: T.SecurityTimeFilter) {
@@ -2972,7 +3047,7 @@ export class SecurityMonitoringController {
   @Post('sessions/agentObservability')
   @HttpCode(200)
   agentObservability(@Body() f: T.SecurityTimeFilter) {
-    return this.agg.agentObservability(f);
+    return this.agg.agentObservabilityForWindow(f);
   }
 
   @Post('sessions/workspaceRiskDistribution')
@@ -2984,7 +3059,10 @@ export class SecurityMonitoringController {
   @Post('events/list')
   @HttpCode(200)
   agentEvents(@Body() f: T.AgentEventQuery) {
-    return f.durable ? this.agg.storedAgentEvents(f) : this.agg.agentEventsForWindow(f);
+    if (f.preview) return this.agg.agentEventsPreview(f);
+    // Durable history is the default. The bounded in-process ring is an explicit low-latency
+    // fallback/debug path and must not decide whether an event still exists.
+    return f.durable !== false ? this.agg.storedAgentEvents(f) : this.agg.agentEventsForWindow(f);
   }
 
   @Post('assistant/query')
@@ -2999,7 +3077,7 @@ export class SecurityMonitoringController {
   @Post('events/timeline')
   @HttpCode(200)
   agentTimeline(@Body() f: T.AgentEventQuery) {
-    return this.agg.agentTimeline(f);
+    return f.durable !== false ? this.agg.storedAgentTimeline(f) : this.agg.agentTimeline(f);
   }
 
   @Post('stream/findings')
@@ -3130,7 +3208,114 @@ export class SecurityMonitoringController {
   @Post('agents/inventory')
   @HttpCode(200)
   agentInventory(@Body() f: T.AgentInventoryQuery) {
-    return this.agg.agentInventory(f);
+    return this.agg.storedAgentInventory(f);
+  }
+
+  @Post('agents/instance-metrics')
+  @HttpCode(200)
+  agentInstanceMetrics(@Body() f: T.AgentInstanceMetricsQuery) {
+    return this.agg.storedAgentInstanceMetrics(f);
+  }
+
+  /** Issue a collector-scoped fencing epoch without routing anything through event judgment/L1. */
+  @Post('runtime/lease')
+  @HttpCode(200)
+  @SkipWrap()
+  issueAgentRuntimeLease(
+    @Body() body: T.AgentRuntimeLeaseRequest,
+    @Headers() headers: HeaderBag,
+  ): T.AgentRuntimeLeaseAck {
+    const sourceId = headerValue(headers, 'x-anysentry-source-id');
+    const token = headerValue(headers, 'x-anysentry-ingest-token') ?? bearerToken(headers);
+    const resolution = this.sources.resolve({
+      sourceId,
+      token,
+      collectorId: body?.collectorId,
+      type: 'forwarder',
+    });
+    if (!resolution.accepted) {
+      const reason = resolution.reason ?? 'runtime lease rejected';
+      this.recordRejectedIngest(resolution, reason, {
+        sourceId,
+        sourceType: 'forwarder',
+        collectorId: body?.collectorId,
+        endpoint: 'runtime/lease',
+        rejectedEvents: 1,
+      });
+      return this.agentRuntimeState.rejectLease(body, reason, 'source_rejected');
+    }
+    if (
+      body?.collectorId &&
+      resolution.source?.collectorId !== body.collectorId
+    ) {
+      const reason = 'source collector does not match runtime lease collector';
+      this.recordRejectedIngest(resolution, reason, {
+        sourceId,
+        sourceType: 'forwarder',
+        collectorId: body.collectorId,
+        endpoint: 'runtime/lease',
+        rejectedEvents: 1,
+      });
+      return this.agentRuntimeState.rejectLease(body, reason, 'collector_conflict');
+    }
+    return this.agentRuntimeState.issueLease(body);
+  }
+
+  /** Accept a complete forwarder lifecycle snapshot without routing it through event judgment/L1. */
+  @Post('runtime/snapshot')
+  @HttpCode(200)
+  @SkipWrap()
+  ingestAgentRuntimeSnapshot(
+    @Body() body: T.AgentRuntimeSnapshotRequest,
+    @Headers() headers: HeaderBag,
+  ): T.AgentRuntimeSnapshotAck {
+    const sourceId = headerValue(headers, 'x-anysentry-source-id');
+    const token = headerValue(headers, 'x-anysentry-ingest-token') ?? bearerToken(headers);
+    const resolution = this.sources.resolve({
+      sourceId,
+      token,
+      collectorId: body?.collectorId,
+      type: 'forwarder',
+    });
+    if (!resolution.accepted) {
+      const reason = resolution.reason ?? 'runtime snapshot rejected';
+      this.recordRejectedIngest(resolution, reason, {
+        sourceId,
+        sourceType: 'forwarder',
+        collectorId: body?.collectorId,
+        endpoint: 'runtime/snapshot',
+        rejectedEvents: 1,
+      });
+      return this.agentRuntimeState.rejectSnapshot(body, reason, 'source_rejected');
+    }
+    if (
+      body?.collectorId &&
+      resolution.source?.collectorId !== body.collectorId
+    ) {
+      const reason = 'source collector does not match runtime snapshot collector';
+      this.recordRejectedIngest(resolution, reason, {
+        sourceId,
+        sourceType: 'forwarder',
+        collectorId: body.collectorId,
+        endpoint: 'runtime/snapshot',
+        rejectedEvents: 1,
+      });
+      return this.agentRuntimeState.rejectSnapshot(body, reason, 'collector_conflict');
+    }
+    return this.agentRuntimeState.recordSnapshot(body);
+  }
+
+  @Post('runtime/instances')
+  @HttpCode(200)
+  agentRuntimeInstances(@Body() query: T.AgentRuntimeStateQuery = {}): T.AgentRuntimeStateList {
+    return this.agentRuntimeState.list(query);
+  }
+
+  @Post('runtime/summary')
+  @HttpCode(200)
+  agentRuntimeSummary(@Body() query: T.AgentRuntimeStateQuery = {}): T.AgentRuntimeStateSummaryResponse {
+    const { summary, updateTime } = this.agentRuntimeState.list(query);
+    return { summary, updateTime };
   }
 
   @Post('identity/ai-review')
@@ -3174,8 +3359,28 @@ export class SecurityMonitoringController {
 
   @Post('workspaces/inventory')
   @HttpCode(200)
-  workspaceInventory(@Body() f: T.WorkspaceInventoryQuery) {
-    return this.agg.workspaceInventory(f);
+  async workspaceInventory(@Body() f: T.WorkspaceInventoryQuery) {
+    return this.agg.storedWorkspaceInventory(f);
+  }
+
+  @Get('workspaces/directory')
+  workspaceDirectoryList() {
+    return {
+      items: this.workspaceDirectory.directory(),
+      status: this.workspaceDirectory.status(),
+      updateTime: new Date().toISOString(),
+    };
+  }
+
+  @Get('workspaces/bindings')
+  workspaceBindingHistory(
+    @Query('agentAssetId') agentAssetId?: string,
+    @Query('workspaceId') workspaceId?: string,
+  ) {
+    return {
+      items: this.workspaceDirectory.bindingHistory(agentAssetId, workspaceId),
+      updateTime: new Date().toISOString(),
+    };
   }
 
   @Get('agents/metadata')
@@ -3251,8 +3456,8 @@ export class SecurityMonitoringController {
 
   @Post('agents/topology')
   @HttpCode(200)
-  agentTopology(@Body() f: T.AgentTopologyQuery) {
-    return this.agg.agentTopology(f);
+  async agentTopology(@Body() f: T.AgentTopologyQuery) {
+    return this.agg.storedAgentTopology(f);
   }
 
   @Post('collectors/heartbeat')
@@ -3260,7 +3465,7 @@ export class SecurityMonitoringController {
     const requestSourceId = body.sourceId ?? headerValue(headers, 'x-anysentry-source-id');
     const requestToken = body.token ?? headerValue(headers, 'x-anysentry-ingest-token') ?? bearerToken(headers);
     const requestSourceType = body.sourceType ?? 'forwarder';
-    const requestCollectorId = body.collectorId;
+    const requestCollectorId = canonicalCollectorId(body.collectorId);
     const sourceResolution = this.sources.resolve({
       sourceId: requestSourceId,
       token: requestToken,
@@ -3290,11 +3495,37 @@ export class SecurityMonitoringController {
         reason,
       } satisfies T.CollectorHeartbeatAck;
     }
+    if (
+      requestCollectorId &&
+      sourceResolution.source?.collectorId &&
+      canonicalCollectorId(sourceResolution.source.collectorId) !== requestCollectorId
+    ) {
+      const reason = 'source collector does not match heartbeat collector';
+      this.recordRejectedIngest(sourceResolution, reason, {
+        sourceId: requestSourceId,
+        sourceName: body.sourceName,
+        sourceType: requestSourceType,
+        collectorId: requestCollectorId,
+        workspacePath: body.workspacePath,
+        nodeName: body.nodeName,
+        endpoint: 'collectors/heartbeat',
+        rejectedEvents: 1,
+      });
+      return {
+        accepted: false,
+        collectorId: requestCollectorId,
+        sourceId: sourceResolution.source.sourceId,
+        receivedAt: new Date().toISOString(),
+        reason,
+      } satisfies T.CollectorHeartbeatAck;
+    }
 
     const rec = this.judge.recordCollectorHeartbeat({
       ...body,
-      collectorId: body.collectorId ?? sourceResolution.source?.collectorId,
-    });
+      collectorId: requestCollectorId ?? canonicalCollectorId(sourceResolution.source?.collectorId),
+      // Raw-only evidence is accepted exclusively through the parsed Observer line ingress.
+      execEvidence: undefined,
+    }, Date.now(), 'forwarder');
     this.sources.recordAccepted(sourceResolution, 'heartbeat', { collectorId: rec.collectorId, workspacePath: body.workspacePath });
     this.agg.invalidateWindowCache();
     if (sourceResolution.source) {
@@ -3315,13 +3546,14 @@ export class SecurityMonitoringController {
 
   @Post('collectors/health')
   @HttpCode(200)
-  collectorHealth(@Body() f: T.CollectorHealthQuery) {
-    return this.agg.collectorHealth(f);
+  async collectorHealth(@Body() f: T.CollectorHealthQuery) {
+    return this.agg.storedCollectorHealth(f);
   }
 
   @Post('sources/list')
   @HttpCode(200)
-  ingestionSources(@Body() f: T.IngestionSourceQuery) {
+  async ingestionSources(@Body() f: T.IngestionSourceQuery) {
+    await this.sources.refreshDistributedCurrentState();
     return this.sources.list(f);
   }
 
@@ -3436,8 +3668,8 @@ export class SecurityMonitoringController {
 
   @Post('coverage/overview')
   @HttpCode(200)
-  coverageOverview(@Body() f: T.CoverageQuery) {
-    const coverage = this.agg.coverageOverview(f);
+  async coverageOverview(@Body() f: T.CoverageQuery) {
+    const coverage = await this.agg.storedCoverageOverview(f);
     const scoped = Boolean(f.issueId || f.type || f.workspacePath || f.agentId || f.collectorId || f.sourceId);
     this.alerting.observeCoverageList(coverage.issues, Date.now(), {
       resolveMissing: scoped,
@@ -4272,13 +4504,14 @@ export class SecurityMonitoringController {
   @Sse('sessions/agentObservability/stream')
   @SkipWrap()
   stream(@Query() q: T.SecurityTimeFilter): Observable<{ data: T.AgentObservability }> {
-    return timer(0, 3000).pipe(map(() => ({ data: this.agg.agentObservability(q) })));
+    return timer(0, 3000).pipe(mergeMap(async () => ({ data: await this.agg.agentObservabilityForWindow(q) })));
   }
 
   /** The editable judge policy (L1 rules / L2 LLM / L3 a3s-code) + which tiers are active. The
-   *  config panels read this; the dashboard hides tiers that aren't configured. */
+   *  config panels read this; the dashboard only enables tiers whose model API is callable. */
   @Get('config')
-  getConfig() {
+  async getConfig() {
+    await this.runtimeModels.refreshConnectivity();
     return { ...this.judge.getPolicy(), connections: this.runtimeModels.statuses() };
   }
 
@@ -4315,12 +4548,14 @@ export class SecurityMonitoringController {
         status: updated.status,
       },
     });
-    return { ...updated, connections: this.runtimeModels.statuses() };
+    await this.runtimeModels.refreshConnectivity();
+    return { policy: updated.policy, status: this.judge.getPolicy().status, connections: this.runtimeModels.statuses() };
   }
 
   @Get('config/model-connections')
   @RequireManagementAuth()
-  modelConnectionStatus() {
+  async modelConnectionStatus() {
+    await this.runtimeModels.refreshConnectivity();
     return this.runtimeModels.statuses();
   }
 
@@ -4419,10 +4654,10 @@ export class SecurityMonitoringController {
   @Post('config/simulate')
   @RequireManagementAuth()
   @HttpCode(200)
-  simulateConfig(@Body() body: T.PolicySimulationRequest, @Headers() headers: HeaderBag) {
+  async simulateConfig(@Body() body: T.PolicySimulationRequest, @Headers() headers: HeaderBag) {
     let result: T.PolicySimulationResult;
     try {
-      result = this.agg.policySimulation(body);
+      result = await this.agg.storedPolicySimulation(body);
     } catch (error) {
       throw policyBadRequest(error);
     }
@@ -4435,6 +4670,9 @@ export class SecurityMonitoringController {
       details: {
         timeType: body.timeType,
         limit: body.limit,
+        sampleLimit: result.sampling.sampleLimit,
+        sampledEvents: result.sampling.sampledEvents,
+        truncated: result.sampling.truncated,
         evaluatedEvents: result.summary.evaluatedEvents,
         changedEvents: result.summary.changedEvents,
         newBlocks: result.summary.newBlocks,
@@ -4463,6 +4701,20 @@ export class SecurityMonitoringController {
       service: 'anysentry-api',
       uptimeSeconds: Math.round(process.uptime()),
       storage: this.judge.storageStatus(),
+      businessState: {
+        mode: this.relational.configured() ? 'postgresql' : 'clickhouse-migration-fallback',
+        postgresqlConfigured: this.relational.configured(),
+        postgresqlReady: this.relational.isReady(),
+        workspaceDirectory: this.workspaceDirectory.status(),
+        incidents: this.judge.incidentStateStatus(),
+        alerts: this.alerting.stateStatus(),
+        remediations: this.remediation.stateStatus(),
+        ingestionSources: this.sources.stateStatus(),
+        maintenanceWindows: this.maintenance.stateStatus(),
+        notifications: this.notifications.stateStatus(),
+        objectives: this.objectives.stateStatus(),
+        policyConfig: this.judge.policyStateStatus(),
+      },
       managementAuth: {
         enabled: managementAuthConfigured(),
       },
@@ -4471,6 +4723,8 @@ export class SecurityMonitoringController {
         distinctAgents: stats.distinctAgents,
         distinctSessions: stats.distinctSessions,
       },
+      historyFactCache: this.agg.historyFactCacheStatus(),
+      dashboardBucketSnapshots: this.judge.dashboardBucketSnapshotStatus(),
       policy: policy.status,
       streaming: {
         ...this.streaming.status(),
@@ -4854,6 +5108,8 @@ export class SecurityMonitoringController {
       }
       await this.enqueueCanonicalShadow(rec, line);
       await this.observeSupplyChainInstall(rec, line);
+      this.observeWorkspaceAssociation(rec);
+      this.identityReview.considerCandidate(rec, () => this.agg.invalidateWindowCache());
       this.sources.recordAccepted(sourceResolution, 'event', { collectorId: inputCollectorId, workspacePath: rec.workspacePath });
       acceptedEvents += 1;
       items.push({
@@ -4883,26 +5139,84 @@ export class SecurityMonitoringController {
 
   /** Bounded raw-Observer batch seam used by the node forwarder. */
   @Post('ingest/batch')
-  async ingestBatch(@Body() body: ObserverBatchIngestBody = {}, @Headers() headers: HeaderBag) {
-    const events = Array.isArray(body.events) ? body.events.slice(0, 256) : [];
-    const items: unknown[] = [];
+  async ingestBatch(
+    @Body() body: ObserverBatchIngestBody = {},
+    @Headers() headers: HeaderBag,
+  ): Promise<T.ObserverBatchIngestResult> {
+    const events = Array.isArray(body.events) ? body.events : [];
+    if (events.length > 256) {
+      // Reject before processing any prefix. The Forwarder may safely split an HTTP 413 only when
+      // the controller has consumed zero items; truncating here would make its retry ambiguous.
+      throw new PayloadTooLargeException('observer batch exceeds 256 events');
+    }
+    const items: T.ObserverBatchIngestResultItem[] = [];
     let acceptedEvents = 0;
+    let discardedEvents = 0;
+    let rejectedEvents = 0;
+    let retryableEvents = 0;
+    let capacityReached = false;
     for (let index = 0; index < events.length; index += 1) {
       const event = events[index];
-      if (!event || typeof event.line !== 'string' || !event.line.trim()) {
-        items.push({ index, accepted: false, reason: 'missing observer line' });
+      if (capacityReached) {
+        retryableEvents += 1;
+        items.push({
+          index,
+          accepted: false,
+          disposition: 'retryable',
+          reasonCode: 'clickhouse_event_buffer_full',
+        });
         continue;
       }
-      const result = await this.ingest(event, headers);
-      const accepted = result.accepted === true;
+      if (!event || typeof event.line !== 'string' || !event.line.trim()) {
+        rejectedEvents += 1;
+        items.push({
+          index,
+          accepted: false,
+          disposition: 'rejected',
+          reasonCode: 'missing_observer_line',
+          reason: 'missing observer line',
+        });
+        continue;
+      }
+      let result: Awaited<ReturnType<SecurityMonitoringController['ingest']>>;
+      try {
+        result = await this.ingest(event, headers);
+      } catch (error) {
+        if (!isClickHouseEventBufferFull(error)) throw error;
+        capacityReached = true;
+        retryableEvents += 1;
+        items.push({
+          index,
+          accepted: false,
+          disposition: 'retryable',
+          reasonCode: 'clickhouse_event_buffer_full',
+        });
+        continue;
+      }
+      const declaredDisposition = 'disposition' in result ? result.disposition : undefined;
+      const discarded = declaredDisposition === 'discarded';
+      const accepted = result.accepted === true || discarded;
+      const disposition: T.ObserverBatchIngestDisposition = discarded
+        ? 'discarded'
+        : accepted
+          ? 'retained'
+          : 'rejected';
       if (accepted) acceptedEvents += 1;
-      items.push({ index, ...result });
+      if (discarded) discardedEvents += 1;
+      if (!accepted) rejectedEvents += 1;
+      // `/ingest` keeps its historical accepted=false contract for policy discards. At the batch
+      // transport seam, accepted instead means the envelope was successfully consumed; disposition
+      // tells the Forwarder whether it was retained or deliberately discarded before L1.
+      items.push({ index, ...result, accepted, disposition });
     }
-    const submittedEvents = Array.isArray(body.events) ? body.events.length : 0;
     return {
       accepted: acceptedEvents > 0,
       acceptedEvents,
-      rejectedEvents: submittedEvents - acceptedEvents,
+      retainedEvents: acceptedEvents - discardedEvents,
+      discardedEvents,
+      rejectedEvents,
+      retryableEvents,
+      ...(retryableEvents > 0 ? { retryAfterMs: OBSERVER_BATCH_RETRY_AFTER_MS } : {}),
       items,
     };
   }
@@ -4910,10 +5224,31 @@ export class SecurityMonitoringController {
   /** The real ingestion seam: external agents/observers POST events here to be judged + counted. */
   @Post('ingest')
   async ingest(@Body() body: IngestBody, @Headers() headers: HeaderBag) {
-    const { line, collectorId, nodeName, sourceId, sourceName, sourceType, token, sourceEventId, ...given } = body;
+    const {
+      line,
+      collectorId: collectorIdInput,
+      nodeName,
+      sourceId,
+      sourceName,
+      sourceType,
+      token,
+      sourceEventId,
+      ...given
+    } = body;
+    const collectorId = canonicalCollectorId(collectorIdInput);
     const heartbeat = parseCollectorHeartbeatLine(line);
     const requestSourceId = sourceId ?? headerValue(headers, 'x-anysentry-source-id');
     const requestToken = token ?? headerValue(headers, 'x-anysentry-ingest-token') ?? bearerToken(headers);
+    if (heartbeat?.collectorId && collectorId && heartbeat.collectorId !== collectorId) {
+      // Reject before Source resolution. This branch is intentionally side-effect free because the
+      // optional Source identity and token have not been authenticated yet.
+      const reason = 'heartbeat envelope collector does not match raw collector';
+      return {
+        accepted: false,
+        reason,
+        sourceId: requestSourceId,
+      };
+    }
     const requestCollectorId = collectorId ?? heartbeat?.collectorId;
     const sourceResolution = this.sources.resolve({
       sourceId: requestSourceId,
@@ -4937,12 +5272,33 @@ export class SecurityMonitoringController {
       });
       return { accepted: false, reason, sourceId: sourceResolution.source?.sourceId };
     }
+    if (
+      heartbeat &&
+      requestCollectorId &&
+      sourceResolution.source?.collectorId &&
+      canonicalCollectorId(sourceResolution.source.collectorId) !== requestCollectorId
+    ) {
+      const reason = 'source collector does not match heartbeat collector';
+      this.recordRejectedIngest(sourceResolution, reason, {
+        sourceId: requestSourceId,
+        sourceName,
+        sourceType,
+        collectorId: requestCollectorId,
+        nodeName,
+        workspacePath: given.workspacePath,
+        endpoint: 'ingest',
+        rejectedEvents: 1,
+      });
+      return { accepted: false, reason, sourceId: sourceResolution.source.sourceId };
+    }
     if (heartbeat) {
       const rec = this.judge.recordCollectorHeartbeat({
         ...heartbeat,
-        collectorId: heartbeat.collectorId ?? requestCollectorId ?? sourceResolution.source?.collectorId,
+        collectorId: heartbeat.collectorId ?? requestCollectorId ?? canonicalCollectorId(sourceResolution.source?.collectorId),
         nodeName: heartbeat.nodeName ?? nodeName,
-      });
+        // A raw line cannot refresh Forwarder-owned leases, receipts, or filter metrics.
+        filterMetrics: undefined,
+      }, Date.now(), 'raw_collector');
       this.sources.recordAccepted(sourceResolution, 'heartbeat', { collectorId: rec.collectorId, workspacePath: given.workspacePath ?? sourceResolution.source?.workspacePath });
       this.agg.invalidateWindowCache();
       if (sourceResolution.source) {
@@ -4973,8 +5329,19 @@ export class SecurityMonitoringController {
     // Enrich from the same registry consumed by forwarders. Filtering is node-local; direct API
     // producers remain fail-open and are never dropped solely because metadata is incomplete.
     const meta = this.agentMetadata.applyReview(this.kube.enrich(deriveMeta(line, metaGiven)));
-    const rec = await this.judge.accept(line, meta);
-    if (!rec) {
+    const outcome = await this.judge.acceptWithDisposition(line, meta);
+    if (outcome.disposition === 'discarded') {
+      this.sources.recordAccepted(sourceResolution, 'event', { collectorId, workspacePath: meta.workspacePath });
+      return {
+        accepted: false,
+        disposition: 'discarded',
+        retained: false,
+        sourceId: sourceResolution.source?.sourceId,
+        reasonCode: outcome.reasonCode,
+        reason: outcome.reasonCode,
+      };
+    }
+    if (outcome.disposition === 'rejected') {
       this.recordRejectedIngest(sourceResolution, 'unparseable event', {
         sourceId: requestSourceId,
         sourceName,
@@ -4985,12 +5352,22 @@ export class SecurityMonitoringController {
         endpoint: 'ingest',
         rejectedEvents: 1,
       });
-      return { accepted: false, sourceId: sourceResolution.source?.sourceId, reason: 'unparseable event' };
+      return {
+        accepted: false,
+        disposition: 'rejected',
+        retained: false,
+        sourceId: sourceResolution.source?.sourceId,
+        reasonCode: outcome.reasonCode,
+        reason: 'unparseable event',
+      };
     }
+    const rec = outcome.event;
     await this.enqueueCanonicalShadow(rec, line);
     await this.observeSupplyChainInstall(rec, line);
+    this.observeWorkspaceAssociation(rec);
+    this.identityReview.considerCandidate(rec, () => this.agg.invalidateWindowCache());
     this.sources.recordAccepted(sourceResolution, 'event', { collectorId, workspacePath: rec.workspacePath });
     this.agg.invalidateWindowCache();
-    return { accepted: true, sourceId: sourceResolution.source?.sourceId, eventId: rec.eventId, traceId: rec.traceId, spanId: rec.spanId, runId: rec.runId, verdict: rec.verdict, tier: rec.tier, severity: rec.severity, reason: rec.reason, riskCategory: rec.riskCategory, decisionStatus: rec.decisionStatus, evaluationId: rec.evaluationId };
+    return { accepted: true, disposition: 'retained', retained: true, sourceId: sourceResolution.source?.sourceId, eventId: rec.eventId, traceId: rec.traceId, spanId: rec.spanId, runId: rec.runId, verdict: rec.verdict, tier: rec.tier, severity: rec.severity, reason: rec.reason, riskCategory: rec.riskCategory, decisionStatus: rec.decisionStatus, evaluationId: rec.evaluationId };
   }
 }

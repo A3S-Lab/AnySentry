@@ -15,6 +15,7 @@ import {
   workspacePathFingerprint,
 } from './supply-chain-normalizer';
 import { SupplyChainStore } from './supply-chain-store';
+import { WorkspaceDirectoryService } from './workspace-directory.service';
 import {
   RegisterWorkspaceRequest,
   ScanReason,
@@ -50,6 +51,7 @@ const HEARTBEAT_TTL_MS = 20_000;
 interface RuntimeInstallIntent {
   workspacePath: string;
   packageManager: string;
+  startTimeTicks?: string;
   startTimeNs?: string;
   observedAt: number;
 }
@@ -121,6 +123,8 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
     updatedAt: 0,
   };
 
+  constructor(private readonly workspaceDirectory: WorkspaceDirectoryService) {}
+
   get enabled(): boolean {
     return this.control.enabled && this.serviceReady;
   }
@@ -156,7 +160,16 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleInit(): Promise<void> {
+    // Supply-chain queues require Redis, but the API and Kubernetes base manifest do not.
+    // Never turn an absent optional dependency into an implicit `redis` DNS connection that
+    // blocks the whole API from starting; deployments that enable this subsystem set the URL.
+    const redisUrl = process.env.ANYSENTRY_REDIS_URL?.trim();
+    if (!redisUrl) return;
     if (!(await this.store.init())) return;
+    const registeredWorkspaces = await this.store.registeredWorkspaces();
+    for (const workspace of registeredWorkspaces) {
+      this.workspaceDirectory.registerWorkspace(workspace);
+    }
     const saved = await this.store.loadControl();
     if (saved) {
       this.control = this.sanitizeControl(saved);
@@ -164,14 +177,11 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
       this.control = { ...this.control, updatedAt: Date.now() };
       await this.store.saveControl(this.control);
     }
-    this.redis = new IORedis(
-      process.env.ANYSENTRY_REDIS_URL || 'redis://redis:6379/0',
-      { maxRetriesPerRequest: null },
-    );
+    this.redis = new IORedis(redisUrl, { maxRetriesPerRequest: null });
     this.assessmentQueue = new Queue<SupplyChainAssessmentJob>(
       SUPPLY_CHAIN_ASSESSMENT_QUEUE,
       {
-        connection: redisConnection(),
+        connection: redisConnection(redisUrl),
         defaultJobOptions: {
           attempts: 4,
           backoff: { type: 'exponential', delay: 15_000 },
@@ -415,6 +425,7 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
       updatedAt: now,
     };
     await this.store.upsertWorkspace(workspace);
+    this.workspaceDirectory.registerWorkspace(workspace);
     const active = await this.store.activeBinding(workspaceId);
     const initialTask = active || !this.enabled || !this.selectedWorkspace(workspaceId)
       ? undefined
@@ -505,6 +516,7 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
       const intent: RuntimeInstallIntent = {
         workspacePath: event.workspacePath,
         packageManager: observed.packageManager ?? 'unknown',
+        startTimeTicks: observed.startTimeTicks,
         startTimeNs: observed.startTimeNs,
         observedAt: event.at,
       };
@@ -515,6 +527,7 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
     const raw = await redis.getdel(key);
     if (!raw || !observed.succeeded) return;
     const intent = JSON.parse(raw) as RuntimeInstallIntent;
+    if (intent.startTimeTicks && observed.startTimeTicks && intent.startTimeTicks !== observed.startTimeTicks) return;
     if (intent.startTimeNs && observed.startTimeNs && intent.startTimeNs !== observed.startTimeNs) return;
     let fingerprint: string;
     try {
