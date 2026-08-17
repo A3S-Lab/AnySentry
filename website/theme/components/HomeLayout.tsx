@@ -153,7 +153,7 @@ export function HomeLayout() {
           className="as-home-block as-runtime-story-section"
           id="agent-runtime-story"
         >
-          <header className="as-home-section-head">
+          <header className="as-home-section-head as-home-section-head--runtime">
             <div>
               <span className="as-section-eyebrow">
                 {labels.runtimeStory.eyebrow}
@@ -172,7 +172,7 @@ export function HomeLayout() {
         </section>
 
         <section className="as-home-block as-case-section" id="case-file">
-          <header className="as-home-section-head as-home-section-head--compact">
+          <header className="as-home-section-head as-home-section-head--compact as-home-section-head--case">
             <div>
               <span className="as-section-eyebrow">{labels.loop.eyebrow}</span>
               <SemanticTitle lines={labels.loop.titleLines} />
@@ -187,7 +187,7 @@ export function HomeLayout() {
         </section>
 
         <section className="as-home-block as-feature-section" id="governance">
-          <header className="as-home-section-head">
+          <header className="as-home-section-head as-home-section-head--governance">
             <div>
               <span className="as-section-eyebrow">
                 {labels.governance.eyebrow}
@@ -204,7 +204,7 @@ export function HomeLayout() {
         </section>
 
         <section className="as-home-block as-boundaries" id="trust">
-          <header className="as-home-section-head as-home-section-head--compact">
+          <header className="as-home-section-head as-home-section-head--compact as-home-section-head--trust">
             <div>
               <span className="as-section-eyebrow">{labels.trust.eyebrow}</span>
               <SemanticTitle lines={labels.trust.titleLines} />

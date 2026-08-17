@@ -1495,8 +1495,8 @@ const finaleCopy = {
 
 const frameCopy = {
   zh: {
-    eyebrow: (duration: number) => `${duration} 秒运行实录`,
-    title: '智能体运行时治理实录',
+    eyebrow: (duration: number) => `${duration} 秒运行时治理演示`,
+    title: '智能体运行时治理演示',
     subtitle: '发现 Agent · 内核取证 · 分层研判 · 执行前治理',
     modeLabel: '观测模式',
     mode: '只读取证',
@@ -1506,14 +1506,14 @@ const frameCopy = {
     running: '正在重建风险链路',
     paused: '离开画面，已自动暂停',
     finished: '治理闭环已完成',
-    play: '播放完整故事',
+    play: '播放完整演示',
     replay: '从头重播',
     reduced: '已根据系统设置减少角色位移动画，故事内容仍会按顺序呈现。',
     standard: '动画离开画面后自动暂停，回到画面后继续播放。',
   },
   en: {
-    eyebrow: (duration: number) => `RUNTIME STORY / ${duration}s AUDIT REPLAY`,
-    title: 'Agent runtime governance, reconstructed',
+    eyebrow: (duration: number) => `RUNTIME GOVERNANCE / ${duration}s DEMO`,
+    title: 'Agent runtime governance demo',
     subtitle: 'Discover · Observe · Judge · Govern before execution',
     modeLabel: 'OBSERVATION',
     mode: 'READ ONLY',
@@ -1523,7 +1523,7 @@ const frameCopy = {
     running: 'Reconstructing the risk chain',
     paused: 'Paused while outside the viewport',
     finished: 'Governance loop complete',
-    play: 'Play the full story',
+    play: 'Play the full demo',
     replay: 'Replay from start',
     reduced:
       'Character travel is reduced by your system preference; the story still advances in sequence.',

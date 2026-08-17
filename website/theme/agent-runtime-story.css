@@ -1167,6 +1167,20 @@
   stroke-width: 5;
 }
 
+.device-cables,
+.phone-runtime-wire {
+  transition: opacity 220ms ease-out;
+}
+
+.theatre-screen:is([data-chapter='scan'], [data-chapter='reveal'])
+  :is(.device-cables, .phone-runtime-wire) {
+  opacity: 0;
+}
+
+.theatre-screen[data-chapter='work'] :is(.device-cables, .phone-runtime-wire) {
+  animation: connectionReveal 320ms ease-out both;
+}
+
 .device-cable {
   fill: none;
   stroke: #293641;
@@ -1193,6 +1207,15 @@
 @keyframes cablePulse {
   to {
     stroke-dashoffset: -102;
+  }
+}
+
+@keyframes connectionReveal {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
   }
 }
 
