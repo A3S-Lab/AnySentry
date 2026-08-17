@@ -40,7 +40,7 @@ assert.equal(
   'untrusted prompt text must not become an Agent signature',
 );
 assert.equal(
-  registry.match({ comm: 'node', argv: '/home/chensicheng/.local/bin/a3s code' })?.agentId,
+  registry.match({ comm: 'node', argv: '/opt/a3s/bin/a3s code' })?.agentId,
   'a3s code',
   'the builtin registry is the source of truth for an A3S argv0 path',
 );

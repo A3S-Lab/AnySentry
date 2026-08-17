@@ -718,7 +718,7 @@ function TopologyScene({ locale, revealCount }: HeroSceneProps) {
     [
       'workspace',
       'bundle',
-      '/home/chensicheng/a3s',
+      'repo://payments',
       'Workspace · 273 events',
       'observed',
       6,
