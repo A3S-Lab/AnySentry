@@ -610,15 +610,20 @@ function verifyManualKubernetesObserverOverlay() {
     kustomization,
   );
   assert(
-    'Manual Kubernetes Observer overlay keeps identity/tool/network/SSL signals but disables fixed-ring file capture and behavior promotion',
+    'Manual Kubernetes Observer overlay keeps one Docker-aware lossless collector while disabling fixed-ring file capture and behavior promotion',
     /\{\s*name:\s*ANYSENTRY_BEHAVIOR_DISCOVERY,\s*value:\s*"off"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*FORWARD_FILTER_MODE,\s*value:\s*"enforce"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*FORWARD_RETAIN_UNKNOWN,\s*value:\s*"false"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*FORWARD_RETAIN_NON_AGENT,\s*value:\s*"false"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*A3S_OBSERVER_FILES,\s*value:\s*"0"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*A3S_OBSERVER_SSL,\s*value:\s*"1"\s*\}/u.test(observerPatch) &&
-      /ToolExec\/Exit, Egress\/DNS, SSL/u.test(observerPatchText) &&
-      /fixed 256 KiB/u.test(observerPatchText) &&
+      /\{\s*name:\s*ANYSENTRY_DOCKER_DISCOVERY,\s*value:\s*"on"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*ANYSENTRY_DOCKER_SOCKET,\s*value:\s*"\/var\/run\/docker\.sock"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*FORWARD_BATCH_SIZE,\s*value:\s*"1"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*FORWARD_HTTP_TIMEOUT_MS,\s*value:\s*"30000"\s*\}/u.test(observerPatch) &&
+      /name:\s*docker-sock[\s\S]*mountPath:\s*\/var\/run\/docker\.sock[\s\S]*readOnly:\s*true/u.test(observerPatch) &&
+      /name:\s*docker-sock[\s\S]*hostPath:\s*\{\s*path:\s*\/var\/run\/docker\.sock,\s*type:\s*Socket\s*\}/u.test(observerPatch) &&
+      /fixed FILE_EVENTS ring/u.test(observerPatchText) &&
       /security-center\/ingest\/batch/u.test(observerPatch),
     observerPatch,
   );
@@ -651,7 +656,7 @@ function verifyManualKubernetesLocalPathOverlay() {
   );
   assert(
     'Manual Kubernetes local-path overlay pins the AnySentry and Flink images by immutable local digests',
-    /newName:\s*127\.0\.0\.1:5000\/anysentry\s*\n\s*digest:\s*sha256:f656891201648776371d4d8b5e20261f74ba7c22641d45571db8e984c6813072/u.test(kustomization) &&
+    /newName:\s*127\.0\.0\.1:5000\/anysentry\s*\n\s*digest:\s*sha256:df8c7d2d53059ce69b7625331863f73b121cff20a83f648ef9771c8a12b030fe/u.test(kustomization) &&
       /newName:\s*127\.0\.0\.1:5000\/anysentry-flink-streaming\s*\n\s*digest:\s*sha256:bcce599325a53132a0e4495717878bcab53cbfc7724813ab83e6961ab934398c/u.test(kustomization) &&
       !/:latest\b/u.test(kustomization),
     kustomization,
@@ -674,7 +679,7 @@ function verifyManualKubernetesCoreOverlay() {
     'Manual Kubernetes core overlay stages canonical core with full runtime flags and one immutable image',
     /resources:\s*\n\s*-\s*\.\.\/\.\.\/anysentry\.yaml/u.test(kustomization) &&
       /path:\s*\.\.\/runtime-on\.yaml/u.test(kustomization) &&
-      /newName:\s*127\.0\.0\.1:5000\/anysentry\s*\n\s*digest:\s*sha256:f656891201648776371d4d8b5e20261f74ba7c22641d45571db8e984c6813072/u.test(kustomization) &&
+      /newName:\s*127\.0\.0\.1:5000\/anysentry\s*\n\s*digest:\s*sha256:df8c7d2d53059ce69b7625331863f73b121cff20a83f648ef9771c8a12b030fe/u.test(kustomization) &&
       !/streaming\.yaml/u.test(kustomization) &&
       !/:latest\b/u.test(kustomization),
     kustomization,

@@ -56,10 +56,11 @@ Do not commit a Secret manifest.
 This repository includes three manual-test overlays. They leave the canonical manifests unchanged:
 
 - `k8s-observer` pins the Observer, switches the manual collector to `enforce`, disables behavior
-  promotion, and loads the complete versioned runtime-signature document. On this busy single node,
-  it also disables the opt-in high-volume FileAccess/FileDelete probes; ToolExec, Exit, Egress, DNS,
-  SSL, Kubernetes identity, and runtime-signature detection remain enabled. The Docker profile keeps
-  FileAccess enabled for that part of the rule exercise.
+  promotion, and loads the complete versioned runtime-signature document. The shared single-node
+  profile keeps ToolExec, Exit, Egress, DNS, process, security, and SSL signals enabled, but disables
+  FileAccess/FileDelete after a full-probe load test exceeded the fixed FILE_EVENTS capacity and
+  caused real Forwarder loss. A read-only Docker socket mount lets this one node-level Observer
+  enrich the retained Docker Agent and Kubernetes workloads into one AnySentry.
 - `k8s-core` rolls out the API and judges before Kafka/Flink are created.
 - `k8s-local-path` adds the streaming plane and changes only the manual checkpoint PVC from the
   production RWX contract to `local-path`/RWO, which is required by the single-node test cluster.
