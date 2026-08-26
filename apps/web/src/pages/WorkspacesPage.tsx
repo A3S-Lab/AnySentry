@@ -32,6 +32,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import {
   type AgentCriticality,
   type AgentHealthState,
+  type SecurityTimeFilter,
   type SecurityTimeType,
   type WorkspaceInventoryItem,
   type WorkspaceInventoryQuery,
@@ -355,7 +356,15 @@ function WorkspaceDetail({ item, timeType }: { item?: WorkspaceInventoryItem; ti
   );
 }
 
-export default function WorkspacesPage() {
+interface WorkspaceAssetsViewProps {
+  embedded?: boolean;
+  timeFilter?: SecurityTimeFilter;
+}
+
+export function WorkspaceAssetsView({
+  embedded = false,
+  timeFilter,
+}: WorkspaceAssetsViewProps) {
   const [searchParams, setSearchParams] = useSearchParams();
   const [scope, setScope] = useState<"agent" | "raw">(searchParams.get("scope") === "raw" ? "raw" : "agent");
   const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
@@ -363,16 +372,35 @@ export default function WorkspacesPage() {
   const [criticality, setCriticality] = useState<AgentCriticality | "all">((searchParams.get("criticality") as AgentCriticality) || "all");
   const [queryText, setQueryText] = useState(searchParams.get("q") ?? "");
   const [selectedWorkspacePath, setSelectedWorkspacePath] = useState(searchParams.get("workspacePath") ?? "");
+  const effectiveTimeType = timeFilter?.timeType ?? timeType;
 
   const query = useMemo<WorkspaceInventoryQuery>(() => ({
-    timeType,
+    ...(embedded && timeFilter
+      ? {
+          ...timeFilter,
+          // Relative windows stay live. A snapshot captured in the dashboard
+          // URL must not freeze the embedded inventory across later polls.
+          snapshotAsOf: timeFilter.timeType === "custom" ? timeFilter.snapshotAsOf : undefined,
+        }
+      : { timeType }),
+    timeType: effectiveTimeType,
     scope,
     healthState,
     criticality,
     workspacePath: clean(selectedWorkspacePath),
     q: clean(queryText),
     limit: 200,
-  }), [criticality, healthState, queryText, scope, selectedWorkspacePath, timeType]);
+  }), [
+    criticality,
+    effectiveTimeType,
+    embedded,
+    healthState,
+    queryText,
+    scope,
+    selectedWorkspacePath,
+    timeFilter,
+    timeType,
+  ]);
 
   const { data, loading, refresh } = useRequest(() => securityCenterApi.workspaceInventory(query), {
     refreshDeps: [query],
@@ -387,6 +415,7 @@ export default function WorkspacesPage() {
 
   const selectWorkspace = (item: WorkspaceInventoryItem) => {
     setSelectedWorkspacePath(item.workspacePath);
+    if (embedded) return;
     const next = new URLSearchParams();
     next.set("timeType", timeType);
     next.set("scope", scope);
@@ -402,44 +431,64 @@ export default function WorkspacesPage() {
     setCriticality("all");
     setQueryText("");
     setSelectedWorkspacePath("");
-    setSearchParams({});
+    if (!embedded) setSearchParams({});
   };
 
   return (
-    <div className="flex h-full w-full flex-col overflow-hidden bg-[#0b0f0c] text-zinc-100">
-      <header className="shrink-0 border-b border-white/10 bg-[#0b0f0c] px-4 py-3">
+    <div className={cn(
+      "w-full text-zinc-100",
+      embedded
+        ? "space-y-4 border-t border-[#232a37] pt-5"
+        : "flex h-full flex-col overflow-hidden bg-[#0b0f0c]",
+    )}>
+      <header className={cn(
+        embedded
+          ? "rounded-[8px] border border-white/10 bg-[#111612]/92 p-4"
+          : "shrink-0 border-b border-white/10 bg-[#0b0f0c] px-4 py-3",
+      )}>
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex min-w-0 items-center gap-3">
-            <Button asChild variant="secondary" size="sm" className="h-9 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
-              <Link to="/">
-                <ArrowLeft className="size-3.5" />
-                返回
-              </Link>
-            </Button>
+            {!embedded ? (
+              <Button asChild variant="secondary" size="sm" className="h-9 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
+                <Link to="/">
+                  <ArrowLeft className="size-3.5" />
+                  返回
+                </Link>
+              </Button>
+            ) : null}
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <BriefcaseBusiness className="size-5 shrink-0 text-teal-300" />
                 <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">Workspace 资产</h1>
               </div>
-              <p className="mt-0.5 truncate text-xs text-zinc-500">服务域 · Owner · 覆盖 · 风险</p>
+              <p className="mt-0.5 truncate text-xs text-zinc-500">
+                {embedded ? "工作区清单、归属、覆盖与风险" : "服务域 · Owner · 覆盖 · 风险"}
+              </p>
             </div>
           </div>
           <div className="flex items-center gap-2 text-xs text-zinc-500">
-            <AdminTokenControl compact />
+            {!embedded ? <AdminTokenControl compact /> : null}
             <Clock3 className="size-3.5" />
             <span>{data?.updateTime ? formatDate(data.updateTime) : "等待刷新"}</span>
           </div>
         </div>
 
-        <div className="mt-3 grid gap-2 md:grid-cols-[auto_120px_130px_150px_minmax(180px,1fr)_auto_auto]">
+        <div className={cn(
+          "mt-3 grid gap-2",
+          embedded
+            ? "md:grid-cols-[auto_130px_150px_minmax(180px,1fr)_auto_auto]"
+            : "md:grid-cols-[auto_120px_130px_150px_minmax(180px,1fr)_auto_auto]",
+        )}>
           <div className="flex h-9 items-center rounded-md border border-white/10 bg-white/[0.03] p-1">
             <button type="button" onClick={() => { setScope("agent"); setSelectedWorkspacePath(""); }} className={cn("h-7 rounded px-3 text-xs text-zinc-500", scope === "agent" && "bg-teal-500/15 text-teal-100")}>Agent Workspace</button>
             <button type="button" onClick={() => { setScope("raw"); setSelectedWorkspacePath(""); }} className={cn("h-7 rounded px-3 text-xs text-zinc-500", scope === "raw" && "bg-white/10 text-zinc-100")}>全部 Workspace</button>
           </div>
-          <Select value={timeType} onValueChange={(next) => setTimeType(next as SecurityTimeType)}>
-            <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
-            <SelectContent>{TIME_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
-          </Select>
+          {!embedded ? (
+            <Select value={timeType} onValueChange={(next) => setTimeType(next as SecurityTimeType)}>
+              <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
+              <SelectContent>{TIME_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
+            </Select>
+          ) : null}
           <Select value={healthState} onValueChange={(next) => setHealthState(next as AgentHealthState | "all")}>
             <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
             <SelectContent>{HEALTH_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
@@ -460,7 +509,9 @@ export default function WorkspacesPage() {
         </div>
       </header>
 
-      <main className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+      <main className={cn(
+        embedded ? "" : "min-h-0 flex-1 overflow-y-auto px-4 py-4",
+      )}>
         <div className="mx-auto flex w-full max-w-[1800px] flex-col gap-4">
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
             <MetricTile label="Workspace" value={data?.summary.totalWorkspaces ?? 0} tone="border-white/10 bg-white/[0.03] text-zinc-100" />
@@ -508,7 +559,7 @@ export default function WorkspacesPage() {
             </section>
 
             <div className="space-y-4">
-              <WorkspaceDetail item={selectedWorkspace} timeType={timeType} />
+              <WorkspaceDetail item={selectedWorkspace} timeType={effectiveTimeType} />
               <section className="rounded-[8px] border border-white/10 bg-[#111612]/92 p-4">
                 <div className="mb-3 flex items-center gap-2">
                   <RadioTower className="size-4 text-sky-200" />
@@ -529,4 +580,8 @@ export default function WorkspacesPage() {
       </main>
     </div>
   );
+}
+
+export default function WorkspacesPage() {
+  return <WorkspaceAssetsView />;
 }

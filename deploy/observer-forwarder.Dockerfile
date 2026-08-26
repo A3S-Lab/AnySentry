@@ -10,6 +10,7 @@ FROM ${NODE_IMAGE} AS nodebin
 FROM ${OBSERVER_IMAGE}
 COPY --from=nodebin /usr/local/bin/node /usr/local/bin/node
 COPY scripts/observer-forward.js /opt/observer-forward.js
+COPY scripts/observer-durable-spool.js /opt/observer-durable-spool.js
 COPY scripts/observer-agent-attribution.js /opt/observer-agent-attribution.js
 COPY scripts/observer-agent-templates.js /opt/observer-agent-templates.js
 COPY scripts/observer-docker-discovery.js /opt/observer-docker-discovery.js

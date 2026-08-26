@@ -18,6 +18,7 @@ public class StreamFinding implements Serializable {
     public String workspaceId;
     public String workspacePath;
     public String agentCorrelationId;
+    public String agentInstanceId;
     public String agentType;
     public String sessionId;
     public String traceId;

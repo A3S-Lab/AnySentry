@@ -108,6 +108,8 @@ assert.equal(isServiceDataFile({ path: '/var/lib/clickhouse/store/abc/data.bin' 
 assert.equal(isServiceDataFile({ path: '/var/lib/postgresql/16/main/base/1' }), true);
 assert.equal(isServiceDataFile({ path: '/var/lib/mysql/orders.ibd' }), true);
 assert.equal(isServiceDataFile({ path: '/var/lib/redis/dump.rdb' }), true);
+assert.equal(isServiceDataFile({ path: '/var/lib/kafka/data/topic-0/000000.log' }), true);
+assert.equal(isServiceDataFile({ path: '/opt/apache-doris/be/storage/data/0/1.dat' }), true);
 const customServicePaths = new BehavioralAgentDetector({
   serviceDataPaths: ['/srv/state/vector-db'],
 }).serviceDataPaths;
@@ -186,6 +188,35 @@ assert.equal(
   'many exec/file events without a decision cycle are insufficient for Agent promotion',
 );
 
+for (const infrastructureName of [
+  'ai-apm-ingest',
+  'ai-apm-web',
+  'anysentry-kafka-1',
+  'ai-apm-doris-fe',
+  'ai-apm-doris-be',
+  'anysentry-clickhouse-1',
+]) {
+  const knownInfrastructure = new BehavioralAgentDetector({ now: () => now, threshold: 8 });
+  const result = knownInfrastructure.observe(
+    event('ToolExec', { pid: 650, argv: ['service', 'start'] }, `infra-${infrastructureName}`),
+    {
+      physicalWorkloadId: `docker:local:${infrastructureName}`,
+      workloadRef: {
+        environment: 'docker',
+        kind: 'container',
+        name: infrastructureName,
+        containerName: infrastructureName,
+      },
+    },
+  );
+  assert.equal(result?.state, 'unknown', `${infrastructureName} must remain outside Agent scope`);
+  assert.ok(
+    result.attribution.evidence.includes('behavior:negative=known_infrastructure_workload'),
+    `${infrastructureName} must carry explicit infrastructure negative evidence`,
+  );
+  assert.equal(knownInfrastructure.metrics().candidates, 0);
+}
+
 let infrastructureNow = now;
 const infrastructureDetector = new BehavioralAgentDetector({
   now: () => infrastructureNow,
@@ -196,11 +227,11 @@ const infrastructureDetector = new BehavioralAgentDetector({
 });
 infrastructureDetector.observe(
   event('ToolExec', { pid: 700, argv: ['worker', 'query'] }, '700'),
-  { physicalWorkloadId: 'k8s:test:clickhouse-container' },
+  { physicalWorkloadId: 'k8s:test:database-container' },
 );
 const initialCandidate = infrastructureDetector.observe(
   event('Egress', { pid: 700, host: 'api.openai.com' }, '700'),
-  { physicalWorkloadId: 'k8s:test:clickhouse-container' },
+  { physicalWorkloadId: 'k8s:test:database-container' },
 );
 assert.equal(initialCandidate?.state, 'agent');
 infrastructureNow += 61_000;
@@ -213,7 +244,7 @@ for (let index = 0; index < 6; index++) {
   const before = structuredClone(fileEvent);
   infrastructureResult = infrastructureDetector.observe(
     fileEvent,
-    { physicalWorkloadId: 'k8s:test:clickhouse-container' },
+    { physicalWorkloadId: 'k8s:test:database-container' },
   );
   assert.deepEqual(fileEvent, before, 'behavior classification must not mutate or delete the raw event');
 }

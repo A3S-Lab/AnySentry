@@ -37,6 +37,36 @@ assert.equal(
   true,
   'the same runtime root becomes direct evidence once process lineage confirms it',
 );
+assert.equal(
+  hasDirectAgentRootEvidence({
+    ...signatureOnlyRoot,
+    attributes: { argv: 'codex --codex-run-as-fs-helper' },
+    attribution: {
+      ...signatureOnlyRoot.attribution,
+      source: 'manual_review',
+      rootStartTime: '4200',
+    },
+  }),
+  false,
+  'reviewing the logical Codex identity must not turn an internal filesystem helper into a runtime root',
+);
+assert.equal(
+  hasDirectAgentRootEvidence({
+    ...signatureOnlyRoot,
+    process: { pid: 43, comm: 'tokio-rt-worker', exe: '/opt/codex/bin/codex' },
+    attributes: {
+      argv: '/tmp/codex-arg0/codex-linux-sandbox --sandbox-policy-cwd /workspace',
+    },
+    attribution: {
+      ...signatureOnlyRoot.attribution,
+      rootPid: 43,
+      source: 'manual_review',
+      rootStartTime: '4300',
+    },
+  }),
+  false,
+  'reviewing Codex must not turn its sandbox executor into another runtime root',
+);
 
 const service = new AgentMetadataService();
 const hostAgentEvent = {

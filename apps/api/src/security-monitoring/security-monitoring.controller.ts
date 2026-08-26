@@ -1,7 +1,7 @@
-import { BadRequestException, Body, Controller, Get, Headers, HttpCode, NotFoundException, Param, Post, Put, Query, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Header, Headers, HttpCode, NotFoundException, Param, Post, Put, Query, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { Observable, map, mergeMap, timer } from 'rxjs';
+import { Observable, exhaustMap, map, timer } from 'rxjs';
 import { SkipWrap } from '../shared/api-response.interceptor';
 import { AgentMetadataService } from './agent-metadata.service';
 import { AggregationService } from './aggregation.service';
@@ -24,7 +24,9 @@ import { StreamingFindingService } from './streaming-finding.service';
 import { RuntimeModelConfigService, RuntimeModelProfile, sanitizeRuntimeModelConnection } from './runtime-model-config';
 import { StreamingQueueService } from './streaming-queue.service';
 import { SupplyChainService } from './supply-chain.service';
+import { UserDirectoryService } from './user-directory.service';
 import { WorkspaceDirectoryService } from './workspace-directory.service';
+import { PlatformMetricsService } from './platform-metrics.service';
 import {
   ClaimScanTaskRequest,
   RegisterWorkspaceRequest,
@@ -43,9 +45,15 @@ interface IngestBody extends Partial<T.EventMeta> {
   sourceType?: T.IngestionSourceType;
   token?: string;
   sourceEventId?: string;
+  observedAt?: number;
 }
 
 interface ObserverBatchIngestBody {
+  schemaVersion?: string;
+  batchId?: string;
+  writerId?: string;
+  writerVersion?: string;
+  idempotencyProtocolVersion?: string;
   events?: IngestBody[];
 }
 
@@ -67,6 +75,31 @@ const LLM_ENDPOINTS = (process.env.ANYSENTRY_LLM_ENDPOINTS ?? 'api.anthropic.com
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
+const OBSERVER_BATCH_CONCURRENCY = Math.max(
+  1,
+  Math.min(64, Number.parseInt(process.env.ANYSENTRY_OBSERVER_BATCH_CONCURRENCY ?? '24', 10) || 24),
+);
+
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  work: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from(
+    { length: Math.min(items.length, Math.max(1, concurrency)) },
+    async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        results[index] = await work(items[index], index);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return results;
+}
 
 function isLlmEndpoint(inner: Record<string, unknown>): boolean {
   const a = inner as { peer?: string; sni?: string; query?: string };
@@ -2697,6 +2730,8 @@ export class SecurityMonitoringController {
     private readonly identityReview: IdentityReviewAgentService,
     private readonly relational: RelationalBusinessStore,
     private readonly workspaceDirectory: WorkspaceDirectoryService,
+    private readonly users: UserDirectoryService,
+    private readonly platformMetrics: PlatformMetricsService,
   ) {}
 
   private modelProfile(value: string): RuntimeModelProfile {
@@ -2989,7 +3024,7 @@ export class SecurityMonitoringController {
   @Post('sessions/agentObservability')
   @HttpCode(200)
   agentObservability(@Body() f: T.SecurityTimeFilter) {
-    return this.agg.agentObservabilityForWindow(f);
+    return this.agg.sharedAgentObservabilityForWindow(f);
   }
 
   @Post('sessions/workspaceRiskDistribution')
@@ -3729,6 +3764,59 @@ export class SecurityMonitoringController {
     return this.audit.list(f);
   }
 
+  @Post('users/list')
+  @HttpCode(200)
+  usersList(@Body() query: T.PlatformUserQuery) {
+    return this.users.list(query);
+  }
+
+  @Post('users')
+  @RequireManagementAuth()
+  createUser(@Body() body: T.PlatformUserUpdateRequest, @Headers() headers: HeaderBag) {
+    const actor = auditActor(headers);
+    const updated = this.users.upsert(undefined, body, actor.id);
+    this.audit.record({
+      actor,
+      action: 'user.updated',
+      resourceType: 'user',
+      resourceId: updated.userId,
+      summary: `Platform user created: ${updated.username}`,
+      details: {
+        userId: updated.userId,
+        username: updated.username,
+        displayName: updated.displayName,
+        role: updated.role,
+        status: updated.status,
+        team: updated.team,
+      },
+    });
+    return updated;
+  }
+
+  @Put('users/:userId')
+  @RequireManagementAuth()
+  updateUser(@Param('userId') userId: string, @Body() body: T.PlatformUserUpdateRequest, @Headers() headers: HeaderBag) {
+    if (!this.users.has(userId)) throw new NotFoundException('platform user not found');
+    const actor = auditActor(headers);
+    const updated = this.users.upsert(userId, body, actor.id);
+    this.audit.record({
+      actor,
+      action: 'user.updated',
+      resourceType: 'user',
+      resourceId: updated.userId,
+      summary: `Platform user updated: ${updated.username}`,
+      details: {
+        userId: updated.userId,
+        username: updated.username,
+        displayName: updated.displayName,
+        role: updated.role,
+        status: updated.status,
+        team: updated.team,
+      },
+    });
+    return updated;
+  }
+
   @Post('evidence/bundle')
   @HttpCode(200)
   evidenceBundle(@Body() query: T.EvidenceBundleQuery = {}): T.EvidenceBundle {
@@ -4319,7 +4407,12 @@ export class SecurityMonitoringController {
   @Sse('sessions/agentObservability/stream')
   @SkipWrap()
   stream(@Query() q: T.SecurityTimeFilter): Observable<{ data: T.AgentObservability }> {
-    return timer(0, 3000).pipe(mergeMap(async () => ({ data: await this.agg.agentObservabilityForWindow(q) })));
+    // A slow durable read must never stack another full-window query behind itself. Every result
+    // still covers the complete requested window as of its own snapshot, so coalescing timer ticks
+    // drops duplicate work rather than events or query dimensions.
+    return timer(0, 3000).pipe(
+      exhaustMap(async () => ({ data: await this.agg.sharedAgentObservabilityForWindow(q) })),
+    );
   }
 
   /** The editable judge policy (L1 rules / L2 LLM / L3 a3s-code) + which tiers are active. The
@@ -4528,6 +4621,7 @@ export class SecurityMonitoringController {
         maintenanceWindows: this.maintenance.stateStatus(),
         notifications: this.notifications.stateStatus(),
         objectives: this.objectives.stateStatus(),
+        users: this.users.stateStatus(),
         policyConfig: this.judge.policyStateStatus(),
       },
       managementAuth: {
@@ -4539,6 +4633,7 @@ export class SecurityMonitoringController {
         distinctSessions: stats.distinctSessions,
       },
       historyFactCache: this.agg.historyFactCacheStatus(),
+      eventWriteBatch: this.judge.eventWriteBatchStatus(),
       dashboardBucketSnapshots: this.judge.dashboardBucketSnapshotStatus(),
       policy: policy.status,
       streaming: {
@@ -4549,6 +4644,18 @@ export class SecurityMonitoringController {
         enabled: this.supplyChain.enabled,
       },
     };
+  }
+
+  @Get('platform/metrics')
+  platformMetricsOverview(@Query('range') range?: string): Promise<T.PlatformMetricsOverview> {
+    return this.platformMetrics.overview(range);
+  }
+
+  @Get('platform/metrics/prometheus')
+  @SkipWrap()
+  @Header('Content-Type', 'text/plain; version=0.0.4; charset=utf-8')
+  platformMetricsPrometheus(): string {
+    return this.platformMetrics.prometheusText();
   }
 
   /** Versioned, node-filtered workload identity data for observation-only forwarders. */
@@ -4906,7 +5013,9 @@ export class SecurityMonitoringController {
         eventKind: kind,
         eventCategory: partial.eventCategory ?? eventCategory(kind),
       }));
-      const rec = judgeMode === 'sync' ? this.judge.judge(line, meta, eventTime(input)) : await this.judge.accept(line, meta, eventTime(input));
+      const rec = judgeMode === 'sync'
+        ? await this.judge.judgeDurable(line, meta, eventTime(input))
+        : await this.judge.accept(line, meta, eventTime(input));
       if (!rec) {
         const reason = `unsupported event kind: ${kind}`;
         this.recordRejectedIngest(sourceResolution, reason, {
@@ -4956,22 +5065,64 @@ export class SecurityMonitoringController {
   @Post('ingest/batch')
   async ingestBatch(@Body() body: ObserverBatchIngestBody = {}, @Headers() headers: HeaderBag) {
     const events = Array.isArray(body.events) ? body.events.slice(0, 256) : [];
-    const items: unknown[] = [];
-    let acceptedEvents = 0;
-    for (let index = 0; index < events.length; index += 1) {
-      const event = events[index];
+    // The request is already bounded to 256 items. Start their durable writes together so
+    // ClickHouseStore can coalesce them into one microbatch; awaiting each item serially turns a
+    // 1s durable-ack window into roughly one event per second per HTTP request.
+    const items = await mapWithConcurrency(events, OBSERVER_BATCH_CONCURRENCY, async (event, index) => {
       if (!event || typeof event.line !== 'string' || !event.line.trim()) {
-        items.push({ index, accepted: false, reason: 'missing observer line' });
-        continue;
+        return {
+          index,
+          sourceEventId: event?.sourceEventId,
+          accepted: false,
+          durable: false,
+          retryable: false,
+          error: 'missing observer line',
+        };
       }
-      const result = await this.ingest(event, headers);
-      const accepted = result.accepted === true;
-      if (accepted) acceptedEvents += 1;
-      items.push({ index, ...result });
-    }
+      try {
+        const result = await this.ingest({
+          ...event,
+          attributes: {
+            ...(event.attributes ?? {}),
+            ...(body.batchId ? { commitRequestBatchId: body.batchId.slice(0, 200) } : {}),
+            ...(body.writerId ? { writerId: body.writerId.slice(0, 240) } : {}),
+            ...(body.writerVersion ? { writerVersion: body.writerVersion.slice(0, 120) } : {}),
+            ...(body.idempotencyProtocolVersion
+              ? { idempotencyProtocolVersion: body.idempotencyProtocolVersion.slice(0, 120) }
+              : {}),
+          },
+        }, headers);
+        const accepted = result.accepted === true;
+        return {
+          index,
+          sourceEventId: event.sourceEventId,
+          ...result,
+          durable: accepted && result.kind !== 'collector-heartbeat',
+          retryable: accepted ? false : false,
+          error: accepted ? undefined : result.reason,
+        };
+      } catch (error) {
+        const message = (error instanceof Error ? error.message : String(error)).slice(0, 2_000);
+        // An immutable-Revision conflict cannot become valid through transport retries. Mark it
+        // permanent so durable forwarders preserve it in their DLQ instead of letting one poison
+        // event occupy a retry lane indefinitely.
+        const retryable = !message.includes('Revision conflict');
+        return {
+          index,
+          sourceEventId: event.sourceEventId,
+          accepted: false,
+          durable: false,
+          retryable,
+          error: message,
+        };
+      }
+    });
+    const acceptedEvents = items.filter((item) => item.accepted === true).length;
     const submittedEvents = Array.isArray(body.events) ? body.events.length : 0;
     return {
       accepted: acceptedEvents > 0,
+      batchId: body.batchId,
+      writerId: body.writerId,
       acceptedEvents,
       rejectedEvents: submittedEvents - acceptedEvents,
       items,
@@ -4981,7 +5132,18 @@ export class SecurityMonitoringController {
   /** The real ingestion seam: external agents/observers POST events here to be judged + counted. */
   @Post('ingest')
   async ingest(@Body() body: IngestBody, @Headers() headers: HeaderBag) {
-    const { line, collectorId, nodeName, sourceId, sourceName, sourceType, token, sourceEventId, ...given } = body;
+    const {
+      line,
+      collectorId,
+      nodeName,
+      sourceId,
+      sourceName,
+      sourceType,
+      token,
+      sourceEventId,
+      observedAt,
+      ...given
+    } = body;
     const heartbeat = parseCollectorHeartbeatLine(line);
     const requestSourceId = sourceId ?? headerValue(headers, 'x-anysentry-source-id');
     const requestToken = token ?? headerValue(headers, 'x-anysentry-ingest-token') ?? bearerToken(headers);
@@ -5008,12 +5170,47 @@ export class SecurityMonitoringController {
       });
       return { accepted: false, reason, sourceId: sourceResolution.source?.sourceId };
     }
+    const writerAttributes = given.attributes ?? {};
+    const writerId = cleanString(writerAttributes.writerId, 240);
+    const writerVersion = cleanString(writerAttributes.writerVersion, 120);
+    const idempotencyProtocolVersion = cleanString(
+      writerAttributes.idempotencyProtocolVersion,
+      120,
+    );
+    if (idempotencyProtocolVersion === 'anysentry.idempotency.v1') {
+      if (!writerId || !writerVersion) {
+        throw new Error('Idempotency protocol requires writerId and writerVersion');
+      }
+      const resolvedSourceId = sourceResolution.source?.sourceId ?? requestSourceId ?? 'unregistered';
+      const sourceScope = `${resolvedSourceId}:${requestCollectorId ?? 'default'}`;
+      const ownership = await this.relational.acquireWriterOwnership(
+        sourceScope,
+        writerId,
+        writerVersion,
+        idempotencyProtocolVersion,
+      );
+      if (ownership.status === 'conflict') {
+        throw new Error(
+          `Writer ownership conflict for ${sourceScope}; current owner is `
+          + `${ownership.ownerWriterId} until ${ownership.leaseExpiresAt}`,
+        );
+      }
+      if (ownership.status === 'unavailable') {
+        throw new Error(`Writer ownership registry unavailable for ${sourceScope}`);
+      }
+    }
     if (heartbeat) {
+      // A durable Forwarder can replay an old Observer heartbeat long after newer health has
+      // arrived. Preserve the time at which the Forwarder originally observed it; assigning
+      // Date.now() here would make stale cumulative counters look current and retrigger alerts.
+      const heartbeatAt = Number.isFinite(observedAt)
+        ? Math.max(0, Math.trunc(observedAt!))
+        : Date.now();
       const rec = this.judge.recordCollectorHeartbeat({
         ...heartbeat,
         collectorId: heartbeat.collectorId ?? requestCollectorId ?? sourceResolution.source?.collectorId,
         nodeName: heartbeat.nodeName ?? nodeName,
-      });
+      }, heartbeatAt);
       this.sources.recordAccepted(sourceResolution, 'heartbeat', { collectorId: rec.collectorId, workspacePath: given.workspacePath ?? sourceResolution.source?.workspacePath });
       this.agg.invalidateWindowCache();
       if (sourceResolution.source) {
@@ -5044,7 +5241,10 @@ export class SecurityMonitoringController {
     // Enrich from the same registry consumed by forwarders. Filtering is node-local; direct API
     // producers remain fail-open and are never dropped solely because metadata is incomplete.
     const meta = this.agentMetadata.applyReview(this.kube.enrich(deriveMeta(line, metaGiven)));
-    const rec = await this.judge.accept(line, meta);
+    const stableObservedAt = Number.isFinite(observedAt)
+      ? Math.max(0, Math.trunc(observedAt!))
+      : Date.now();
+    const rec = await this.judge.accept(line, meta, stableObservedAt);
     if (!rec) {
       this.recordRejectedIngest(sourceResolution, 'unparseable event', {
         sourceId: requestSourceId,
@@ -5064,6 +5264,6 @@ export class SecurityMonitoringController {
     this.identityReview.considerCandidate(rec, () => this.agg.invalidateWindowCache());
     this.sources.recordAccepted(sourceResolution, 'event', { collectorId, workspacePath: rec.workspacePath });
     this.agg.invalidateWindowCache();
-    return { accepted: true, sourceId: sourceResolution.source?.sourceId, eventId: rec.eventId, traceId: rec.traceId, spanId: rec.spanId, runId: rec.runId, verdict: rec.verdict, tier: rec.tier, severity: rec.severity, reason: rec.reason, riskCategory: rec.riskCategory, decisionStatus: rec.decisionStatus, evaluationId: rec.evaluationId };
+    return { accepted: true, durable: true, sourceId: sourceResolution.source?.sourceId, eventId: rec.eventId, traceId: rec.traceId, spanId: rec.spanId, runId: rec.runId, verdict: rec.verdict, tier: rec.tier, severity: rec.severity, reason: rec.reason, riskCategory: rec.riskCategory, decisionStatus: rec.decisionStatus, evaluationId: rec.evaluationId };
   }
 }

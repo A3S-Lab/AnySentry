@@ -3,7 +3,6 @@ import dayjs from "dayjs";
 import { formatSecurityDateTime } from "@/lib/date-time";
 import {
   AlertTriangle,
-  ArrowLeft,
   BellRing,
   Bot,
   CheckCircle2,
@@ -225,6 +224,9 @@ function operatorRouteParams({
   maxActions,
   selectedActionId,
   selectedAction,
+  snapshotAsOf,
+  startTime,
+  endTime,
 }: {
   timeType: SecurityTimeType;
   status: RemediationStatus | "all";
@@ -237,9 +239,17 @@ function operatorRouteParams({
   maxActions: string;
   selectedActionId?: string;
   selectedAction?: SecurityNextActionPlanItem;
+  snapshotAsOf?: string;
+  startTime?: string;
+  endTime?: string;
 }) {
   const next = new URLSearchParams();
-  if (timeType !== "last_3h" || selectedActionId) next.set("timeType", timeType);
+  if (timeType !== "last_3h" || selectedActionId || snapshotAsOf) next.set("timeType", timeType);
+  if (snapshotAsOf) next.set("snapshotAsOf", snapshotAsOf);
+  if (timeType === "custom" && startTime && endTime) {
+    next.set("startTime", startTime);
+    next.set("endTime", endTime);
+  }
   if (maxActions !== "10" || selectedActionId) next.set("maxActions", maxActions);
   if (status !== "all") next.set("status", status);
   if (selectedAction) next.set("sourceType", selectedAction.sourceType);
@@ -723,6 +733,9 @@ export default function OperatorPage() {
   const selectedEvidence = selectedAction?.actionId === evidenceActionId ? evidence : undefined;
   const selectedEvidenceError = selectedAction?.actionId === evidenceActionId ? evidenceError : "";
   const routeText = searchParams.toString();
+  const snapshotAsOf = searchParams.get("snapshotAsOf") ?? undefined;
+  const startTime = searchParams.get("startTime") ?? undefined;
+  const endTime = searchParams.get("endTime") ?? undefined;
 
   useEffect(() => {
     const next = operatorRouteParams({
@@ -737,9 +750,12 @@ export default function OperatorPage() {
       maxActions,
       selectedActionId,
       selectedAction: selectedActionId ? selectedAction : undefined,
+      snapshotAsOf,
+      startTime,
+      endTime,
     });
     if (next.toString() !== routeText) setSearchParams(next, { replace: true });
-  }, [agentId, maxActions, owner, queryText, routeText, selectedAction, selectedActionId, setSearchParams, severity, sourceType, status, timeType, workspacePath]);
+  }, [agentId, endTime, maxActions, owner, queryText, routeText, selectedAction, selectedActionId, setSearchParams, severity, snapshotAsOf, sourceType, startTime, status, timeType, workspacePath]);
 
   const selectAction = (action: SecurityNextActionPlanItem) => {
     setSelectedActionId(action.actionId);
@@ -755,6 +771,9 @@ export default function OperatorPage() {
       maxActions,
       selectedActionId: action.actionId,
       selectedAction: action,
+      snapshotAsOf,
+      startTime,
+      endTime,
     }));
   };
 
@@ -771,7 +790,16 @@ export default function OperatorPage() {
     setEvidenceActionId("");
     setEvidence(undefined);
     setEvidenceError("");
-    setSearchParams({});
+    const next = new URLSearchParams();
+    if (snapshotAsOf) {
+      next.set("timeType", timeType);
+      next.set("snapshotAsOf", snapshotAsOf);
+      if (timeType === "custom" && startTime && endTime) {
+        next.set("startTime", startTime);
+        next.set("endTime", endTime);
+      }
+    }
+    setSearchParams(next);
   };
 
   const loadEvidence = async (action: SecurityNextActionPlanItem) => {
@@ -813,12 +841,6 @@ export default function OperatorPage() {
       <header className="shrink-0 border-b border-white/10 bg-[#0b0f0c] px-4 py-3">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex min-w-0 items-center gap-3">
-            <Button asChild variant="secondary" size="sm" className="h-9 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
-              <Link to="/">
-                <ArrowLeft className="size-3.5" />
-                返回
-              </Link>
-            </Button>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <Zap className="size-5 shrink-0 text-teal-300" />

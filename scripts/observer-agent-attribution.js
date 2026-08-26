@@ -80,6 +80,16 @@ function argvText(value) {
   return text(value);
 }
 
+function isInternalAgentHelper(info) {
+  const argv = argvText(info?.argv).toLowerCase();
+  const tokens = argv.split(/\s+/).filter(Boolean);
+  return (
+    tokens.includes('--codex-run-as-fs-helper') ||
+    basename(tokens[0]) === 'codex-linux-sandbox' ||
+    tokens.includes('--sandbox-policy-cwd')
+  );
+}
+
 function containerIdFromCgroup(value) {
   const cgroup = text(value);
   if (!cgroup) return undefined;
@@ -196,7 +206,7 @@ class AgentAttributor {
 
     let roots = 0;
     for (const info of snapshot.values()) {
-      const agentId = this.matchAgentExecutable(info);
+      const agentId = this.matchAgent(info);
       if (!agentId) continue;
       const workspacePath = this.resolveWorkspace(info.cwd).workspacePath;
       this.remember({
@@ -651,6 +661,11 @@ class AgentAttributor {
   }
 
   matchAgent(info) {
+    // Codex starts short-lived filesystem helpers whose executable/comm is also `codex`.
+    // They are descendants of a real Agent root, not independent terminal/window instances.
+    // If their ancestry is temporarily unavailable, leave them unknown instead of inventing a
+    // new root that later becomes a permanent Agent asset.
+    if (isInternalAgentHelper(info)) return undefined;
     const executableMatch = this.matchAgentExecutable(info);
     if (executableMatch) return executableMatch;
     if (!this.builtinHintsEnabled) return undefined;

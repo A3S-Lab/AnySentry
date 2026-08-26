@@ -155,6 +155,32 @@ async function verifyIndexAndAssets() {
   }
 
   assert('dashboard HTML does not embed a dev API origin', !index.text.includes('127.0.0.1:29653') && !index.text.includes('localhost:29653'), index.text.slice(0, 500));
+  const manifestResponse = await fetchText('/manifest.json');
+  let asyncJsAssets = [];
+  if (manifestResponse.res.ok) {
+    try {
+      const manifest = JSON.parse(manifestResponse.text);
+      asyncJsAssets = manifest?.entries?.index?.async?.js ?? [];
+    } catch {
+      asyncJsAssets = [];
+    }
+  }
+  assert('dashboard build manifest exposes code-split route assets', asyncJsAssets.length >= 1, {
+    status: manifestResponse.res.status,
+    asyncJsAssets: asyncJsAssets.length,
+  });
+  for (const asset of asyncJsAssets) {
+    const assetUrl = new URL(asset, `${webBase}/`).toString();
+    const res = await fetch(assetUrl);
+    const bytes = await res.arrayBuffer();
+    const type = res.headers.get('content-type') ?? '';
+    if (res.ok && bytes.byteLength > 0) jsText.push(new TextDecoder().decode(bytes));
+    assert(
+      `dashboard lazy asset is served: ${asset}`,
+      res.ok && bytes.byteLength > 0 && type.toLowerCase().includes('javascript'),
+      { assetUrl, status: res.status, contentType: type, bytes: bytes.byteLength },
+    );
+  }
   const jsBundle = jsText.join('\n');
   assert('dashboard bundle supports browser-local management auth token', jsBundle.includes('anysentry.adminToken') && jsBundle.includes('X-AnySentry-Admin-Token'), { jsAssetCount: jsText.length });
   assert('dashboard bundle exposes management auth control UI', jsBundle.includes('管理密钥') && jsBundle.includes('控制面密钥'), { jsAssetCount: jsText.length });
@@ -630,6 +656,29 @@ async function verifyDashboardSourceContracts() {
       hasSkipWrap: securityController.includes('@SkipWrap()'),
       hasClientStream: apiClient.includes('export function streamAgentObservability') && apiClient.includes('Accept: "text/event-stream"'),
       hasDashboardPanel: securityMonitorPage.includes('<LiveObservabilityPanel observability={observability} connected={observabilityConnected} />'),
+    },
+  );
+  assert(
+    'dashboard isolates view data and prevents overlapping observability reads',
+    securityMonitorPage.includes('const needsAgentInventory = ["agentAssets", "agentInstances", "stream"].includes(activeView)') &&
+      securityMonitorPage.includes('const needsStreamFindings = ["agentAssets", "stream", "supplyChain"].includes(activeView)') &&
+      securityMonitorPage.includes('if (activeView !== "overview")') &&
+      securityController.includes('exhaustMap(async () =>') &&
+      securityController.includes('sharedAgentObservabilityForWindow(q)') &&
+      aggregationService.includes('private readonly agentInventoryInFlight') &&
+      aggregationService.includes('private readonly agentObservabilityInFlight'),
+    {
+      hasViewScopedInventory:
+        securityMonitorPage.includes('const needsAgentInventory = ["agentAssets", "agentInstances", "stream"].includes(activeView)'),
+      hasViewScopedFindings:
+        securityMonitorPage.includes('const needsStreamFindings = ["agentAssets", "stream", "supplyChain"].includes(activeView)'),
+      hasOverviewOnlyStream: securityMonitorPage.includes('if (activeView !== "overview")'),
+      hasNonOverlappingSse:
+        securityController.includes('exhaustMap(async () =>') &&
+        securityController.includes('sharedAgentObservabilityForWindow(q)'),
+      hasServerSingleFlight:
+        aggregationService.includes('private readonly agentInventoryInFlight') &&
+        aggregationService.includes('private readonly agentObservabilityInFlight'),
     },
   );
   assert(

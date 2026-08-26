@@ -1,4 +1,5 @@
 import { useRequest } from "ahooks";
+import { useQuery } from "@tanstack/react-query";
 import dayjs from "dayjs";
 import { formatSecurityDateTime, liveSecuritySnapshotAsOf } from "@/lib/date-time";
 import {
@@ -19,6 +20,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
 import { AgentIdentityInline, resolveAgentIdentity } from "@/components/custom/agent-identity";
 import { useSecurityConsole } from "@/components/custom/security-console-header";
+import { AdaptiveVirtualList } from "@/components/performance/adaptive-virtual-list";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -485,18 +487,25 @@ export default function AgentEventsPage() {
     limit: 120,
   }), [agentAssetId, agentId, agentInstanceId, collectorId, consoleTimeFilter.snapshotAsOf, eventCategory, eventKind, includeUnknown, routeEndTime, routeStartTime, runId, selectedEventId, sessionId, sourceId, timeType, traceId, verdict, workspacePath]);
 
-  const { data, loading, refresh } = useRequest(() =>
-    securityCenterApi.agentEvents({
+  const liveQuery = useMemo<AgentEventQuery>(() => ({
       ...query,
       snapshotAsOf: liveSecuritySnapshotAsOf(
         timeType === "custom",
         consoleTimeFilter.snapshotAsOf,
       ),
-    }), {
-    refreshDeps: [query],
-    pollingInterval: 10000,
-    pollingWhenHidden: false,
+  }), [consoleTimeFilter.snapshotAsOf, query, timeType]);
+  const {
+    data,
+    isFetching: loading,
+    refetch,
+  } = useQuery({
+    queryKey: ["agent-events", liveQuery],
+    queryFn: ({ signal }) => securityCenterApi.agentEvents(liveQuery, signal),
+    staleTime: 5_000,
+    refetchInterval: 10_000,
+    refetchIntervalInBackground: false,
   });
+  const refresh = async () => { await refetch(); };
 
   const selectedEvent = useMemo(() => {
     const items = data?.items ?? [];
@@ -670,16 +679,20 @@ export default function AgentEventsPage() {
             ) : (data?.items?.length ?? 0) === 0 ? (
               <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">暂无事件</div>
             ) : (
-              <div className="max-h-[calc(100vh-220px)] overflow-y-auto">
-                {data?.items.map((event) => (
+              <AdaptiveVirtualList
+                items={data?.items ?? []}
+                getKey={(event) => event.eventId}
+                estimateSize={76}
+                threshold={100}
+                className="max-h-[calc(100vh-220px)] overflow-y-auto"
+                renderItem={(event) => (
                   <EventRow
-                    key={event.eventId}
                     event={event}
                     active={event.eventId === selectedEvent?.eventId}
                     onSelect={() => selectEvent(event)}
                   />
-                ))}
-              </div>
+                )}
+              />
             )}
           </section>
 

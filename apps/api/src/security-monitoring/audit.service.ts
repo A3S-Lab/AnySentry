@@ -90,13 +90,14 @@ function sanitizeDetails(details?: Record<string, unknown>): Record<string, unkn
 
 @Injectable()
 export class AuditService implements OnModuleInit, OnModuleDestroy {
-  private readonly ch = new ClickHouseStore();
   private readonly records = new Map<string, AuditRecord>();
   private readonly pendingFacts = new Map<string, AuditRecord>();
   private persistTimer?: NodeJS.Timeout;
   private initialized = false;
   private closing = false;
   private sequence = 0;
+
+  constructor(private readonly ch: ClickHouseStore) {}
 
   async onModuleInit(): Promise<void> {
     if (await this.ch.init()) {
@@ -109,7 +110,6 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
     this.closing = true;
     if (this.persistTimer) clearTimeout(this.persistTimer);
     await this.persist();
-    await this.ch.close();
   }
 
   record(input: AuditRecordInput): AuditListItem {
@@ -168,6 +168,7 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
       notificationActions: items.filter((record) => record.resourceType === 'notification').length,
       objectiveActions: items.filter((record) => record.resourceType === 'objective').length,
       sourceActions: items.filter((record) => record.resourceType === 'source').length,
+      userActions: items.filter((record) => record.resourceType === 'user').length,
       incidentActions: items.filter((record) => record.resourceType === 'incident').length,
       alertActions: items.filter((record) => record.resourceType === 'alert').length,
       remediationActions: items.filter((record) => record.resourceType === 'remediation').length,

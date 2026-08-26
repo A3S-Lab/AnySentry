@@ -184,7 +184,8 @@ async function verifyForwarder(entry, source, fixture) {
       line.trim() &&
       !line.startsWith('[observer-forward] process snapshot:') &&
       !line.startsWith('[observer-forward] agent templates:') &&
-      !line.startsWith('[observer-forward] docker discovery:'),
+      !line.startsWith('[observer-forward] docker discovery:') &&
+      !line.startsWith('[observer-forward] durable spool:'),
     )
     .join('\n');
   assert(`${fixture.label} forwarder exits cleanly`, unexpectedStderr === '', unexpectedStderr);

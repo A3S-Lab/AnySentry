@@ -59,13 +59,24 @@ function canonicalAgentName(value?: string): string | undefined {
   return text;
 }
 
-function directRootMatch(comm?: string, exe?: string): string | undefined {
+function isInternalAgentHelper(argv?: string): boolean {
+  const tokens = lower(argv).split(/\s+/u).filter(Boolean);
+  return (
+    tokens.includes('--codex-run-as-fs-helper') ||
+    basename(tokens[0]) === 'codex-linux-sandbox' ||
+    tokens.includes('--sandbox-policy-cwd')
+  );
+}
+
+function directRootMatch(comm?: string, exe?: string, argv?: string): string | undefined {
+  if (isInternalAgentHelper(argv)) return undefined;
   const names = [basename(comm), basename(exe)].filter(Boolean);
   return ROOT_NAMES.find((root) => names.some((name) => name === root));
 }
 
 function argvRootMatch(argv?: string): string | undefined {
   if (!BUILTIN_AGENT_HINTS_ENABLED) return undefined;
+  if (isInternalAgentHelper(argv)) return undefined;
   const text = lower(argv);
   if (!text) return undefined;
   const tokens = text.split(/\s+/u).filter(Boolean);
@@ -76,7 +87,15 @@ function argvRootMatch(argv?: string): string | undefined {
   return undefined;
 }
 
-type ProcIdentity = { pid: number; tgid?: number; startTime?: string; comm?: string; exe?: string; cwd?: string };
+type ProcIdentity = {
+  pid: number;
+  tgid?: number;
+  startTime?: string;
+  comm?: string;
+  exe?: string;
+  argv?: string;
+  cwd?: string;
+};
 
 function readProcIdentity(pid?: number): ProcIdentity | undefined {
   if (!pid) return undefined;
@@ -87,6 +106,7 @@ function readProcIdentity(pid?: number): ProcIdentity | undefined {
     let tgid: number | undefined;
     let startTime: string | undefined;
     let exe: string | undefined;
+    let argv: string | undefined;
     let cwd: string | undefined;
     try {
       const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
@@ -99,8 +119,14 @@ function readProcIdentity(pid?: number): ProcIdentity | undefined {
       if (Number.isInteger(value) && value > 0) tgid = value;
     } catch {}
     try { exe = fs.readlinkSync(`/proc/${pid}/exe`); } catch {}
+    try {
+      argv = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8')
+        .split('\0')
+        .filter(Boolean)
+        .join(' ');
+    } catch {}
     try { cwd = fs.readlinkSync(`/proc/${pid}/cwd`); } catch {}
-    return { pid, tgid, startTime, comm, exe, cwd };
+    return { pid, tgid, startTime, comm, exe, argv, cwd };
   } catch {
     return undefined;
   }
@@ -211,9 +237,10 @@ export class AgentAttributionService {
   }
 
   private matchRoot(pid: number, ppid: number | undefined, comm: string | undefined, exe: string | undefined, argv: string | undefined, meta: EventMeta, at: number, startTime?: string, cwd?: string): AgentAttribution | undefined {
+    if (isInternalAgentHelper(argv)) return undefined;
     const name = lower(comm || exe);
     if (!name || (GENERIC_NAMES.has(name) && !argvRootMatch(argv))) return undefined;
-    const matched = directRootMatch(comm, exe) ?? argvRootMatch(argv);
+    const matched = directRootMatch(comm, exe, argv) ?? argvRootMatch(argv);
     if (!matched) return undefined;
     const confidence = 0.82;
     return {
@@ -233,7 +260,9 @@ export class AgentAttributionService {
   private matchParentRoot(ppid: number | undefined, meta: EventMeta): AgentAttribution | undefined {
     const parent = readProcIdentity(ppid);
     const leader = parent?.tgid && parent.tgid !== parent.pid ? readProcIdentity(parent.tgid) : parent;
-    const matched = directRootMatch(parent?.comm, parent?.exe) ?? directRootMatch(leader?.comm, leader?.exe);
+    const matched =
+      directRootMatch(parent?.comm, parent?.exe, parent?.argv) ??
+      directRootMatch(leader?.comm, leader?.exe, leader?.argv);
     if (!matched) return undefined;
     const confidence = 0.82;
     return {

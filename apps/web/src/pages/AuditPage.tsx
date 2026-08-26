@@ -1,8 +1,7 @@
-import { useRequest } from "ahooks";
+import { useQuery } from "@tanstack/react-query";
 import dayjs from "dayjs";
 import { formatSecurityDateTime } from "@/lib/date-time";
 import {
-  ArrowLeft,
   BellRing,
   Bot,
   CalendarClock,
@@ -20,11 +19,13 @@ import {
   ShieldAlert,
   SlidersHorizontal,
   TerminalSquare,
+  Users,
   X,
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import { AdaptiveVirtualList } from "@/components/performance/adaptive-virtual-list";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -63,6 +64,7 @@ const ACTION_OPTIONS: Array<{ value: AuditAction | "all"; label: string }> = [
   { value: "objective.updated", label: "监控目标" },
   { value: "source.updated", label: "接入源" },
   { value: "source.token_rotated", label: "Source Token" },
+  { value: "user.updated", label: "用户目录" },
   { value: "incident.updated", label: "Incident 更新" },
   { value: "alert.updated", label: "告警更新" },
   { value: "remediation.updated", label: "处置更新" },
@@ -77,6 +79,7 @@ const RESOURCE_OPTIONS: Array<{ value: AuditResourceType | "all"; label: string 
   { value: "notification", label: "Notification" },
   { value: "objective", label: "Objective" },
   { value: "source", label: "Source" },
+  { value: "user", label: "User" },
   { value: "incident", label: "Incident" },
   { value: "alert", label: "Alert" },
   { value: "remediation", label: "Remediation" },
@@ -96,6 +99,7 @@ const ACTION_LABEL: Record<AuditAction, string> = {
   "objective.updated": "监控目标",
   "source.updated": "接入源",
   "source.token_rotated": "Source Token",
+  "user.updated": "用户目录",
   "incident.updated": "Incident 更新",
   "alert.updated": "告警更新",
   "remediation.updated": "处置更新",
@@ -109,6 +113,7 @@ const RESOURCE_LABEL: Record<AuditResourceType, string> = {
   notification: "Notification",
   objective: "Objective",
   source: "Source",
+  user: "User",
   incident: "Incident",
   alert: "Alert",
   remediation: "Remediation",
@@ -129,6 +134,7 @@ function toneByResource(resource?: AuditResourceType) {
   if (resource === "notification") return "border-cyan-400/30 bg-cyan-500/10 text-cyan-100";
   if (resource === "objective") return "border-lime-400/30 bg-lime-500/10 text-lime-100";
   if (resource === "source") return "border-emerald-400/30 bg-emerald-500/10 text-emerald-100";
+  if (resource === "user") return "border-blue-400/30 bg-blue-500/10 text-blue-100";
   if (resource === "incident") return "border-rose-400/30 bg-rose-500/10 text-rose-100";
   if (resource === "alert") return "border-sky-400/30 bg-sky-500/10 text-sky-100";
   return "border-amber-400/30 bg-amber-500/10 text-amber-100";
@@ -147,6 +153,7 @@ function iconForResource(resource: AuditResourceType) {
   if (resource === "notification") return <Megaphone className="size-4 text-cyan-200" />;
   if (resource === "objective") return <Target className="size-4 text-lime-200" />;
   if (resource === "source") return <PlugZap className="size-4 text-emerald-200" />;
+  if (resource === "user") return <Users className="size-4 text-blue-200" />;
   if (resource === "incident") return <ShieldAlert className="size-4 text-rose-200" />;
   if (resource === "alert") return <BellRing className="size-4 text-sky-200" />;
   return <FileCheck2 className="size-4 text-amber-200" />;
@@ -346,6 +353,7 @@ function ResourceLinks({ item, timeType }: { item: AuditListItem; timeType: Secu
     addDetailParam(qs, item, "collectorId");
     addDetailParam(qs, item, "workspacePath");
   }
+  if (item.resourceType === "user") qs.set("userId", item.resourceId);
 
   const href =
     item.resourceType === "policy" ? "/admin/policy" :
@@ -354,6 +362,7 @@ function ResourceLinks({ item, timeType }: { item: AuditListItem; timeType: Secu
     item.resourceType === "notification" ? `/notifications?${qs.toString()}` :
     item.resourceType === "objective" ? `/objectives?${qs.toString()}` :
     item.resourceType === "source" ? `/sources?${qs.toString()}` :
+    item.resourceType === "user" ? `/users?${qs.toString()}` :
     item.resourceType === "incident" ? `/incidents?${qs.toString()}` :
     item.resourceType === "alert" ? `/alerts?${qs.toString()}` :
     `/remediation?${qs.toString()}`;
@@ -457,11 +466,18 @@ export default function AuditPage() {
     limit: 250,
   }), [action, actorId, queryText, resourceId, resourceType, selectedAuditId, timeType]);
 
-  const { data, loading, refresh } = useRequest(() => securityCenterApi.auditLog(query), {
-    refreshDeps: [query],
-    pollingInterval: 10000,
-    pollingWhenHidden: false,
+  const {
+    data,
+    isFetching: loading,
+    refetch,
+  } = useQuery({
+    queryKey: ["audit-log", query],
+    queryFn: ({ signal }) => securityCenterApi.auditLog(query, signal),
+    staleTime: 5_000,
+    refetchInterval: 10_000,
+    refetchIntervalInBackground: false,
   });
+  const refresh = async () => { await refetch(); };
 
   const selectedItem = useMemo(() => {
     const items = data?.items ?? [];
@@ -496,12 +512,6 @@ export default function AuditPage() {
       <header className="shrink-0 border-b border-white/10 bg-[#0b0f0c] px-4 py-3">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex min-w-0 items-center gap-3">
-            <Button asChild variant="secondary" size="sm" className="h-9 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
-              <Link to="/">
-                <ArrowLeft className="size-3.5" />
-                返回
-              </Link>
-            </Button>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <History className="size-5 shrink-0 text-teal-300" />
@@ -548,7 +558,7 @@ export default function AuditPage() {
 
       <main className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
         <div className="mx-auto flex w-full max-w-[1800px] flex-col gap-4">
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-7">
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-8">
             <MetricTile label="审计记录" value={data?.summary.totalRecords ?? 0} tone="border-white/10 bg-white/[0.03] text-zinc-100" />
             <MetricTile label="策略动作" value={data?.summary.policyActions ?? 0} tone="border-teal-400/25 bg-teal-500/10 text-teal-100" />
             <MetricTile label="Agent 管理" value={data?.summary.agentActions ?? 0} tone="border-violet-400/25 bg-violet-500/10 text-violet-100" />
@@ -556,6 +566,7 @@ export default function AuditPage() {
             <MetricTile label="通知动作" value={data?.summary.notificationActions ?? 0} tone="border-cyan-400/25 bg-cyan-500/10 text-cyan-100" />
             <MetricTile label="监控目标" value={data?.summary.objectiveActions ?? 0} tone="border-lime-400/25 bg-lime-500/10 text-lime-100" />
             <MetricTile label="接入源" value={data?.summary.sourceActions ?? 0} tone="border-emerald-400/25 bg-emerald-500/10 text-emerald-100" />
+            <MetricTile label="用户目录" value={data?.summary.userActions ?? 0} tone="border-blue-400/25 bg-blue-500/10 text-blue-100" />
             <MetricTile label="Incident" value={data?.summary.incidentActions ?? 0} tone="border-rose-400/25 bg-rose-500/10 text-rose-100" />
           </div>
 
@@ -576,16 +587,20 @@ export default function AuditPage() {
               ) : (data?.items?.length ?? 0) === 0 ? (
                 <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">暂无审计记录</div>
               ) : (
-                <div className="max-h-[calc(100vh-300px)] overflow-y-auto">
-                  {data?.items.map((item) => (
+                <AdaptiveVirtualList
+                  items={data?.items ?? []}
+                  getKey={(item) => item.auditId}
+                  estimateSize={76}
+                  threshold={100}
+                  className="max-h-[calc(100vh-300px)] overflow-y-auto"
+                  renderItem={(item) => (
                     <AuditRow
-                      key={item.auditId}
                       item={item}
                       active={item.auditId === selectedItem?.auditId}
                       onSelect={() => selectAudit(item)}
                     />
-                  ))}
-                </div>
+                  )}
+                />
               )}
             </section>
 

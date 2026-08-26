@@ -2,8 +2,8 @@ import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { Sentry, dns, egress, fileAccess, securityAction, sslContent, toolExec } from '@a3s-lab/sentry';
 import { AgentAttributionService } from './agent-attribution.service';
-import { AlertingService } from './alerting.service';
-import { ClickHouseStore, DashboardWindowHistory, IncidentState, StoredAgentBucketFact, StoredAgentMetricBucketFact, StoredAgentWindowFact, StoredEventQuery, StoredEventSearchResult, StoredTopologyBucketFact, StoredTopologyWindowFact, StoredWorkspaceBucketFact, StoredWorkspaceWindowFact } from './clickhouse-store';
+import { AlertingService, type DurableAlertMutation } from './alerting.service';
+import { ClickHouseStore, DashboardWindowHistory, IncidentState, StoredAgentBucketFact, StoredAgentMetricBucketFact, StoredAgentObservabilityFact, StoredAgentWindowFact, StoredEventQuery, StoredEventSearchResult, StoredTopologyBucketFact, StoredTopologyWindowFact, StoredWorkspaceBucketFact, StoredWorkspaceWindowFact, eventRevisionIdentity } from './clickhouse-store';
 import { DEFAULT_POLICY, PolicyConfig, buildFastAcl, policyConfigError, sanitizePolicy, tierStatus } from './policy-config';
 import { cleanText } from './redaction';
 import { DecisionResultJob, FastJudgeJob } from './async-judgment.types';
@@ -269,6 +269,7 @@ function producerReportedFinding(base: JudgedEventBase): {
 @Injectable()
 export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   constructor(
+    private readonly ch: ClickHouseStore,
     private readonly alerting: AlertingService,
     private readonly attributionService: AgentAttributionService,
     private readonly queues: JudgmentQueueService,
@@ -284,13 +285,14 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   private readonly store: JudgedEvent[] = [];
   private readonly storeById = new Map<string, JudgedEvent>();
   private readonly resultApplyLocks = new Map<string, Promise<void>>();
+  private businessEffectApplyTail: Promise<void> = Promise.resolve();
   private readonly MAX = boundedEnvInt('ANYSENTRY_HOT_EVENT_LIMIT', 100_000, 1_000, 100_000);
   private readonly TRIM_BATCH = Math.min(1_000, Math.max(100, Math.floor(this.MAX / 10)));
   private readonly collectorHeartbeats: CollectorHeartbeatRecord[] = [];
+  private readonly latestCollectorHeartbeatAt = new Map<string, number>();
   private readonly MAX_COLLECTOR_HEARTBEATS = 10_000;
   private collectorHeartbeatPersistTimer?: NodeJS.Timeout;
   private timer?: NodeJS.Timeout;
-  private readonly ch = new ClickHouseStore();
   private readonly incidents = new Map<string, Incident>();
   private incidentPersistenceReady = false;
   private incidentRelationalRefreshTimer?: NodeJS.Timeout;
@@ -365,7 +367,6 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     if (this.policyRelationalRefreshTimer) clearInterval(this.policyRelationalRefreshTimer);
     await this.persistCollectorHeartbeats();
     await this.persistIncidentState([...this.incidents.values()]);
-    await this.ch.close();
   }
 
   /** Rebuild the sentry ACL from the policy and recreate the judge in place (built-in rules always
@@ -413,6 +414,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return this.ch.dashboardBucketSnapshotStatus();
   }
 
+  eventWriteBatchStatus() {
+    return this.ch.eventWriteBatchStatus();
+  }
+
   async searchStoredEvents(query: StoredEventQuery): Promise<JudgedEvent[]> {
     return this.ch.searchEvents(query);
   }
@@ -453,8 +458,24 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     bucketCount: number,
     monitoredOnly: boolean,
     excludedEventIds: string[] = [],
+    hydrateRepresentatives = true,
   ): Promise<StoredAgentMetricBucketFact[] | null> {
-    return this.ch.agentMetricBucketFacts(sinceMs, untilMs, bucketCount, monitoredOnly, excludedEventIds);
+    return this.ch.agentMetricBucketFacts(
+      sinceMs,
+      untilMs,
+      bucketCount,
+      monitoredOnly,
+      excludedEventIds,
+      hydrateRepresentatives,
+    );
+  }
+
+  agentObservabilityFact(
+    sinceMs: number,
+    untilMs: number,
+    monitoredOnly: boolean,
+  ): Promise<StoredAgentObservabilityFact | null> {
+    return this.ch.agentObservabilityFact(sinceMs, untilMs, monitoredOnly);
   }
 
   workspaceWindowFacts(
@@ -478,17 +499,19 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   topologyWindowFacts(
     sinceMs: number,
     untilMs: number,
+    monitoredOnly: boolean,
     excludedEventIds: string[] = [],
   ): Promise<StoredTopologyWindowFact[] | null> {
-    return this.ch.topologyWindowFacts(sinceMs, untilMs, excludedEventIds);
+    return this.ch.topologyWindowFacts(sinceMs, untilMs, monitoredOnly, excludedEventIds);
   }
 
   topologyWindowBucketFacts(
     sinceMs: number,
     endExclusiveMs: number,
     bucketMs: number,
+    monitoredOnly: boolean,
   ): Promise<StoredTopologyBucketFact[] | null> {
-    return this.ch.topologyWindowBucketFacts(sinceMs, endExclusiveMs, bucketMs);
+    return this.ch.topologyWindowBucketFacts(sinceMs, endExclusiveMs, bucketMs, monitoredOnly);
   }
 
   storedCollectorHeartbeats(sinceMs: number, untilMs: number): Promise<CollectorHeartbeatRecord[] | null> {
@@ -567,7 +590,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     finding: NonNullable<ReturnType<typeof producerReportedFinding>>,
     judgment?: JudgedEvent['judgment'],
   ): JudgedEvent {
-    return this.push({
+    return {
       ...base,
       verdict: 'escalate',
       tier: 'Rules',
@@ -578,7 +601,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       riskType: 'atomic',
       riskScore: SEVERITY_SCORE[finding.severity],
       judgment,
-    });
+    };
   }
 
   private isInternalL3Invocation(line: string, base: JudgedEventBase): boolean {
@@ -616,7 +639,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   }
 
   private recordInternalL3Activity(base: JudgedEventBase): JudgedEvent {
-    return this.push({
+    return {
       ...base,
       attributes: { ...base.attributes, origin: 'l3-judge', recursiveJudgmentSuppressed: true },
       verdict: 'allow',
@@ -627,28 +650,30 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       riskName: '正常',
       riskType: 'atomic',
       riskScore: 0,
-    });
+    };
   }
 
   async accept(line: string, meta: EventMeta, at = Date.now()): Promise<JudgedEvent | null> {
-    if (!this.queues.enabled) return this.judge(line, meta, at);
+    if (!this.queues.enabled) return this.judgeDurable(line, meta, at);
     const base = this.eventBase(line, meta, at);
     const routing = resolveJudgmentRoute(base.attribution?.classification, this.policy, this.availableTiers());
     if (routing.profile === 'discard') return null;
-    if (this.isInternalL3Invocation(line, base)) return this.recordInternalL3Activity(base);
+    if (this.isInternalL3Invocation(line, base)) {
+      return this.pushDurable(this.recordInternalL3Activity(base));
+    }
     const producerFinding = producerReportedFinding(base);
     if (producerFinding) {
-      return this.recordProducerFinding(base, producerFinding, {
+      return this.pushDurable(this.recordProducerFinding(base, producerFinding, {
         ...routing,
         policyVersion: this.policyVersion(),
         l1Verdict: 'escalate',
         nextTierEligible: false,
         stopReason: 'producer_finding',
-      });
+      }));
     }
     if (!SECURITY_JUDGED_KINDS.has(base.eventKind)) {
       if (!OBSERVER_KINDS.has(base.eventKind) && base.source !== 'api') return null;
-      return this.push({
+      return this.pushDurable({
         ...base,
         verdict: 'allow',
         tier: 'Rules',
@@ -690,7 +715,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         policyVersion,
       },
     };
-    await this.ch.insertNow(pending);
+    await this.ch.insertNowWithReceipt(pending);
     this.upsertMemory(pending, false);
     const job: FastJudgeJob = {
       schemaVersion: 'anysentry.fast_judge_job.v2',
@@ -713,7 +738,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         decisionUpdatedAt: Date.now(),
         reason: '研判队列不可用: ' + (error instanceof Error ? error.message : String(error)).slice(0, 500),
       };
-      await this.ch.insertNow(failed);
+      await this.ch.insertNowWithReceipt(failed);
       this.upsertMemory(failed, false);
       throw error;
     }
@@ -803,15 +828,17 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         latencyMs: Math.max(1, result.completedAt - result.startedAt),
       };
     }
-    await this.ch.insertNow(next);
-    this.upsertMemory(next, !awaitingL3 && result.status === 'succeeded');
+    await this.ch.insertNowWithReceipt(next);
+    await this.upsertDurableMemory(next, !awaitingL3 && result.status === 'succeeded');
     this.alerting.observeJudgmentResult(result);
   }
 
   /** Judge one observer event against the live sentry policy and record it. Kinds sentry doesn't
    *  security-judge (LlmCall/LlmApi/FileDelete/ProcessExit) are still recorded as observed signals,
    *  so the dashboard counts ALL observer features. LlmApi carries real token usage. */
-  judge(line: string, meta: EventMeta, at = Date.now()): JudgedEvent | null {
+  judge(line: string, meta: EventMeta, at = Date.now(), persist = true): JudgedEvent | null {
+    const record = (event: JudgedEvent): JudgedEvent =>
+      persist ? this.push(event) : this.normalizeEvent(event);
     const eventKind = meta.eventKind ?? 'Event';
     const tokenCount = meta.tokenCount ?? extractTokens(line, eventKind);
     const latencyMs = meta.latencyMs ?? 1; // L1 rule eval is sub-ms
@@ -855,7 +882,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const routing = resolveJudgmentRoute(attribution?.classification, this.policy, this.availableTiers());
     if (routing.profile === 'discard') return null;
     const policyVersion = this.policyVersion();
-    if (this.isInternalL3Invocation(line, base)) return this.recordInternalL3Activity(base);
+    if (this.isInternalL3Invocation(line, base)) return record(this.recordInternalL3Activity(base));
     const evaluateL1 = (this.sentry as Sentry & { evaluateL1?: (event: string) => { l1Decision: SentryDecisionWithRisk; nextTierEligible: boolean; stopReason: string } | null }).evaluateL1;
     const l1 = routing.profile === 'l1_only'
       ? (typeof evaluateL1 === 'function' ? evaluateL1.call(this.sentry, line) : null)
@@ -873,7 +900,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     };
     const producerFinding = producerReportedFinding(base);
     if (producerFinding) {
-      return this.push({
+      return record({
         ...base,
         verdict: 'escalate',
         tier: 'Rules',
@@ -890,7 +917,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       // Not security-judged by the sentry policy, but still a real observed signal — record benign so
       // every observer feature is counted. Drop only truly unparseable input (unknown kind).
       if (!OBSERVER_KINDS.has(eventKind) && base.source !== 'api') return null;
-      return this.push({ ...base, verdict: 'allow', tier: 'Rules', severity: 'info', reason: 'observed', riskCategory: 'benign', riskName: '正常', riskType: 'atomic', riskScore: 0, judgment: { ...judgment, l1Verdict: 'allow', nextTierEligible: false, stopReason: 'no_applicable_l1_rule' } });
+      return record({ ...base, verdict: 'allow', tier: 'Rules', severity: 'info', reason: 'observed', riskCategory: 'benign', riskName: '正常', riskType: 'atomic', riskScore: 0, judgment: { ...judgment, l1Verdict: 'allow', nextTierEligible: false, stopReason: 'no_applicable_l1_rule' } });
     }
 
     const risk = riskFromDecision(d, eventKind);
@@ -899,7 +926,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     let verdict = d.verdict as Verdict;
     if (verdict === 'allow' && d.reason.includes('unresolved escalation')) verdict = 'escalate';
     const severity = d.severity as Severity;
-    return this.push({
+    return record({
       ...base,
       verdict, tier: d.tier as Tier, severity, reason: d.reason,
       actionKind: d.action?.kind, actionTarget: d.action?.target,
@@ -925,24 +952,139 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       }
     }
     const effective = current ?? rec;
-    if (notify) {
-      const incident = this.ingestIncident(effective);
-      this.alerting.observeEvent(effective, incident?.incidentId);
-      if (incident) this.alerting.observeIncident(incident);
-    }
+    if (notify) this.applyBusinessEffects(effective);
     return effective;
   }
 
+  private applyBusinessEffects(event: JudgedEvent): void {
+    const incident = this.ingestIncident(event);
+    this.alerting.observeEvent(event, incident?.incidentId);
+    if (incident) this.alerting.observeIncident(incident);
+  }
+
+  private idempotencyProtocol(event: JudgedEvent): string {
+    const value = event.attributes.idempotencyProtocolVersion;
+    return typeof value === 'string' ? value.trim() : '';
+  }
+
+  private requiresBusinessEffects(event: JudgedEvent): boolean {
+    // Allowed observations cannot create an Incident or event Alert. Incomplete ToolExec evidence
+    // is deliberately surfaced for investigation but is explicitly excluded from both paths.
+    // Avoiding a two-write PostgreSQL ledger transaction for these no-op events is both cheaper and
+    // more correct: there is no externally visible effect to make idempotent.
+    return event.verdict !== 'allow' && !isIncompleteToolEvidence(event);
+  }
+
+  private async upsertDurableMemory(rec: JudgedEvent, notify: boolean): Promise<JudgedEvent> {
+    const effective = this.upsertMemory(rec, false);
+    if (!notify || !this.requiresBusinessEffects(effective)) return effective;
+    if (this.idempotencyProtocol(effective) !== 'anysentry.idempotency.v1') {
+      this.applyBusinessEffects(effective);
+      return effective;
+    }
+    const previous = this.businessEffectApplyTail;
+    const current = previous
+      .catch(() => undefined)
+      .then(() => this.applyDurableBusinessEffects(effective));
+    this.businessEffectApplyTail = current.then(() => undefined, () => undefined);
+    await current;
+    return effective;
+  }
+
+  private async applyDurableBusinessEffects(effective: JudgedEvent): Promise<void> {
+    const revision = Math.max(1, Math.trunc(effective.decisionRevision ?? 1));
+    const sourceScope = effective.sourceId?.trim() || effective.source;
+    const effectKey = `incident-alert:${sourceScope}:${effective.eventId}:${revision}`;
+    const identity = eventRevisionIdentity(effective);
+    const lease = await this.relational.acquireBusinessEffect(
+      effectKey,
+      'incident-alert',
+      identity.fingerprint,
+      {
+        sourceId: sourceScope,
+        eventId: effective.eventId,
+        decisionRevision: revision,
+        verdict: effective.verdict,
+        severity: effective.severity,
+        eventKind: effective.eventKind,
+        tier: effective.tier,
+        writerId: typeof effective.attributes.writerId === 'string' ? effective.attributes.writerId : undefined,
+        writerVersion: typeof effective.attributes.writerVersion === 'string' ? effective.attributes.writerVersion : undefined,
+        idempotencyProtocolVersion: this.idempotencyProtocol(effective),
+      },
+    );
+    if (lease.status === 'duplicate') return;
+    if (lease.status === 'busy') {
+      throw new Error(`Business effect is still pending for ${identity.logicalKey}`);
+    }
+    if (lease.status === 'conflict') {
+      throw new Error(
+        `Business effect Revision conflict for ${identity.logicalKey}; accepted fingerprint `
+        + `${lease.acceptedFingerprint}`,
+      );
+    }
+    if (lease.status === 'unavailable') {
+      throw new Error(`Business effect ledger unavailable for ${identity.logicalKey}`);
+    }
+
+    const incidentId = this.incidentId(effective);
+    const previousIncident = this.incidents.get(incidentId);
+    const incident = this.ingestIncident(effective, false);
+    let alertMutation: DurableAlertMutation;
+    try {
+      alertMutation = this.alerting.prepareDurableBusinessEffects(effective, incident);
+    } catch (error) {
+      if (incident && this.incidents.get(incident.incidentId) === incident) {
+        if (previousIncident) this.incidents.set(incident.incidentId, previousIncident);
+        else this.incidents.delete(incident.incidentId);
+      }
+      throw error;
+    }
+    const committed = await this.relational.commitBusinessEffect(
+      effectKey,
+      incident ? [incident] : [],
+      alertMutation.records,
+    );
+    if (!committed) {
+      alertMutation.rollback();
+      if (incident && this.incidents.get(incident.incidentId) === incident) {
+        if (previousIncident) this.incidents.set(incident.incidentId, previousIncident);
+        else this.incidents.delete(incident.incidentId);
+      }
+      throw new Error(`Business effect transaction failed for ${identity.logicalKey}`);
+    }
+    alertMutation.commit();
+    // These ClickHouse rows are rebuildable projections. Persist them after the PostgreSQL
+    // transaction so an analytics outage cannot falsify the durable business-effect receipt.
+    if (incident) void this.ch.saveIncidentState([...this.incidents.values()]);
+  }
+
   private push(rec: JudgedEvent): JudgedEvent {
-    const normalized: JudgedEvent = {
-      ...rec,
-      decisionStatus: rec.decisionStatus ?? 'succeeded',
-      decisionRevision: Math.max(1, Math.trunc(rec.decisionRevision ?? 1)),
-      decisionUpdatedAt: rec.decisionUpdatedAt ?? Date.now(),
-    };
+    const normalized = this.normalizeEvent(rec);
     this.upsertMemory(normalized, true);
     this.ch.enqueue(normalized);
     return normalized;
+  }
+
+  private normalizeEvent(rec: JudgedEvent): JudgedEvent {
+    return {
+      ...rec,
+      decisionStatus: rec.decisionStatus ?? 'succeeded',
+      decisionRevision: Math.max(1, Math.trunc(rec.decisionRevision ?? 1)),
+      decisionUpdatedAt: rec.decisionUpdatedAt ?? rec.at,
+    };
+  }
+
+  private async pushDurable(rec: JudgedEvent, notify = true): Promise<JudgedEvent> {
+    const normalized = this.normalizeEvent(rec);
+    await this.ch.insertNowWithReceipt(normalized);
+    await this.upsertDurableMemory(normalized, notify);
+    return normalized;
+  }
+
+  async judgeDurable(line: string, meta: EventMeta, at = Date.now()): Promise<JudgedEvent | null> {
+    const evaluated = this.judge(line, meta, at, false);
+    return evaluated ? this.pushDurable(evaluated) : null;
   }
 
   private incidentId(e: JudgedEvent): string {
@@ -950,7 +1092,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return hashId('inc', [e.workspacePath, canonicalAgentId, e.sessionId, e.traceId, e.runId, e.riskCategory]);
   }
 
-  private ingestIncident(e: JudgedEvent): Incident | null {
+  private ingestIncident(e: JudgedEvent, persist = true): Incident | null {
     if (e.verdict === 'allow' || isIncompleteToolEvidence(e)) return null;
     const canonicalAgentId = e.attribution?.agentScopeId?.trim() || e.agentId;
     const incidentId = this.incidentId(e);
@@ -1003,7 +1145,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
           agentScopeId: e.attribution?.agentScopeId,
         };
     this.incidents.set(incidentId, next);
-    if (this.incidentPersistenceReady) void this.persistIncidentState([next]);
+    if (persist && this.incidentPersistenceReady) void this.persistIncidentState([next]);
     return next;
   }
 
@@ -1174,6 +1316,14 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   }
 
   private addCollectorHeartbeat(rec: CollectorHeartbeatRecord, persist = true): void {
+    const latestAt = this.latestCollectorHeartbeatAt.get(rec.collectorId) ?? Number.NEGATIVE_INFINITY;
+    if (rec.at <= latestAt) {
+      // Preserve historical facts in ClickHouse, but never let WAL replay replace current health,
+      // evict the hot ring, or fire the same cumulative-counter alert again.
+      if (persist) this.ch.enqueueCollectorHeartbeat(rec);
+      return;
+    }
+    this.latestCollectorHeartbeatAt.set(rec.collectorId, rec.at);
     this.collectorHeartbeats.push(rec);
     if (this.collectorHeartbeats.length > this.MAX_COLLECTOR_HEARTBEATS) this.collectorHeartbeats.splice(0, this.collectorHeartbeats.length - this.MAX_COLLECTOR_HEARTBEATS);
     this.alerting.observeCollectorHeartbeat(rec);

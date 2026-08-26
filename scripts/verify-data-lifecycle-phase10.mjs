@@ -12,6 +12,12 @@ const {
   foldLatestEventRevisions,
   isNewerEventRevision,
 } = require('../apps/api/dist/security-monitoring/event-revision.js');
+const {
+  eventRevisionIdentity,
+} = require('../apps/api/dist/security-monitoring/clickhouse-store.js');
+const {
+  resolveTimeWindow,
+} = require('../apps/api/dist/security-monitoring/time-window.js');
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), 'utf8');
 
 const plan = planDashboardRead(0, 100_000, 90_000, 60_000);
@@ -27,6 +33,20 @@ assert.deepEqual(planDashboardRead(10_000, 100_000, undefined), {
   hotFromMs: 10_000,
   hasDurableBoundary: false,
 });
+assert.equal(
+  resolveTimeWindow(
+    { timeType: 'last_1h', snapshotAsOf: '1970-01-01T00:01:41.000Z' },
+    100_000,
+  ).cacheKey,
+  'last_1h',
+);
+assert.equal(
+  resolveTimeWindow(
+    { timeType: 'last_1h', snapshotAsOf: '1970-01-01T00:01:39.000Z' },
+    100_000,
+  ).cacheKey,
+  'last_1h|99000',
+);
 
 const event = (revision, updatedAt, reason) => ({
   schemaVersion: 'anysentry.agent_event.v1',
@@ -51,9 +71,38 @@ const revision2 = event(2, 2_000, 'revision 2');
 const duplicateRevision2 = event(2, 2_100, 'latest delivery of revision 2');
 assert.equal(isNewerEventRevision(revision2, revision1), true);
 assert.equal(isNewerEventRevision(revision1, revision2), false);
+assert.equal(isNewerEventRevision(duplicateRevision2, revision2), false);
 assert.deepEqual(
   foldLatestEventRevisions([revision1, revision2, duplicateRevision2]),
-  [duplicateRevision2],
+  [revision2],
+);
+const transportRetry = {
+  ...revision2,
+  attributes: {
+    writerId: 'writer-b',
+    writerVersion: 'observer-forwarder/2',
+    idempotencyProtocolVersion: 'anysentry.idempotency.v1',
+    commitRequestBatchId: 'retry-batch',
+  },
+};
+const originalTransport = {
+  ...revision2,
+  attributes: {
+    writerId: 'writer-a',
+    writerVersion: 'observer-forwarder/1',
+    idempotencyProtocolVersion: 'anysentry.idempotency.v1',
+    commitRequestBatchId: 'original-batch',
+  },
+};
+assert.equal(
+  eventRevisionIdentity(originalTransport).fingerprint,
+  eventRevisionIdentity(transportRetry).fingerprint,
+  'transport metadata must not mutate a Canonical Revision fingerprint',
+);
+assert.notEqual(
+  eventRevisionIdentity(originalTransport).fingerprint,
+  eventRevisionIdentity({ ...transportRetry, reason: 'conflicting payload' }).fingerprint,
+  'same Revision with different Canonical Payload must be a conflict',
 );
 
 const cache = new Map();
@@ -90,9 +139,19 @@ assert.match(aggregation, /workspaceWindowFacts\([\s\S]*overlapEventIds/);
 assert.match(aggregation, /topologyWindowFacts\([\s\S]*overlapEventIds/);
 assert.match(clickhouse, /ingestedAt UInt64 DEFAULT at/);
 assert.match(clickhouse, /GROUP BY sourceId, collectorId/);
+assert.match(clickhouse, /FROM \$\{SOURCE_COMMIT_PROGRESS_TABLE\}/);
+assert.match(clickhouse, /maxMerge\(observedDurableThroughState\)/);
 assert.match(clickhouse, /committedProgress\(\): CommittedSourceProgress\[\]/);
 assert.match(judge, /isNewerEventRevision\(rec, current\)/);
 assert.doesNotMatch(judge, /function decisionIsNewer/);
+assert.match(
+  judge,
+  /requiresBusinessEffects\(event: JudgedEvent\)[\s\S]*event\.verdict !== 'allow'[\s\S]*!isIncompleteToolEvidence\(event\)/,
+);
+assert.match(
+  judge,
+  /if \(!notify \|\| !this\.requiresBusinessEffects\(effective\)\) return effective/,
+);
 assert.match(types, /commitProgress\?: QueryCommitProgress\[\]/);
 assert.match(page, /DASHBOARD_SNAPSHOT_QUANTUM_MS = 10_000/);
 assert.match(page, /function dashboardSnapshotAsOf\(\)/);

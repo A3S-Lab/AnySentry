@@ -14,6 +14,11 @@ const DEFAULT_JOB_OPTIONS: JobsOptions = {
   removeOnFail: { age: 7 * 24 * 60 * 60, count: 20_000 },
 };
 
+function resultApplyConcurrency(): number {
+  const parsed = Number(process.env.ANYSENTRY_RESULT_APPLY_CONCURRENCY || 128);
+  return Number.isFinite(parsed) ? Math.max(1, Math.min(512, Math.trunc(parsed))) : 128;
+}
+
 export function redisConnection(urlText = process.env.ANYSENTRY_REDIS_URL || 'redis://redis:6379/0'): ConnectionOptions {
   const url = new URL(urlText);
   const dbText = url.pathname.replace(/^\//, '');
@@ -75,7 +80,7 @@ export class JudgmentQueueService implements OnModuleDestroy {
     return new Worker<DecisionResultJob>(
       DECISION_RESULTS_QUEUE,
       async (job) => processor(job.data),
-      { connection: this.connection, concurrency: 8, ...options },
+      { connection: this.connection, concurrency: resultApplyConcurrency(), ...options },
     );
   }
 

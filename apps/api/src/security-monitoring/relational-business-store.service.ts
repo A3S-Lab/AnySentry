@@ -1,4 +1,5 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { Pool, PoolClient } from 'pg';
 import {
   AgentMetadataRecord,
@@ -10,6 +11,7 @@ import {
   NotificationChannelRecord,
   NotificationRouteRecord,
   ObjectiveRecord,
+  PlatformUserRecord,
   RemediationRecord,
   WorkspaceDirectoryRecord,
 } from './types';
@@ -24,6 +26,19 @@ const REMEDIATION_LIMIT = 20_000;
 const CONFIG_OBJECT_LIMIT = 20_000;
 const BUSINESS_WRITE_MAX_ATTEMPTS = 3;
 const BUSINESS_WRITE_BATCH_SIZE = 250;
+const EFFECT_LEASE_MS = 60_000;
+
+export type BusinessEffectLease =
+  | { status: 'acquired' }
+  | { status: 'duplicate' }
+  | { status: 'busy' }
+  | { status: 'conflict'; acceptedFingerprint: string }
+  | { status: 'unavailable' };
+
+export type WriterOwnership =
+  | { status: 'owned' }
+  | { status: 'conflict'; ownerWriterId: string; leaseExpiresAt: number }
+  | { status: 'unavailable' };
 
 function positiveInt(value: string | undefined, fallback: number, max: number): number {
   const parsed = Number.parseInt(value ?? '', 10);
@@ -47,6 +62,9 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   private pool?: Pool;
   private initializePromise?: Promise<boolean>;
   private ready = false;
+  private readonly effectOwnerId = `api:${process.pid}:${randomUUID()}`;
+  private readonly writerOwnershipCache = new Map<string, number>();
+  private readonly writerOwnershipInFlight = new Map<string, Promise<WriterOwnership>>();
 
   configured(): boolean {
     return Boolean(this.databaseUrl);
@@ -259,8 +277,9 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   async saveAgentWorkspaceBindings(records: AgentWorkspaceBindingRecord[]): Promise<boolean> {
     if (records.length === 0) return true;
     if (!(await this.initialize()) || !this.pool) return false;
-    const client = await this.pool.connect();
+    let client: PoolClient | undefined;
     try {
+      client = await this.pool.connect();
       await client.query('BEGIN');
       for (const record of records) {
         await client.query(
@@ -299,11 +318,11 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       await client.query('COMMIT');
       return true;
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined);
+      await client?.query('ROLLBACK').catch(() => undefined);
       this.markUnavailable('save Agent-Workspace bindings', error);
       return false;
     } finally {
-      client.release();
+      client?.release();
     }
   }
 
@@ -323,52 +342,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       records,
       'save Incidents',
       (record) => record.incidentId,
-      async (client, batch) => {
-        await client.query(
-          `WITH incoming AS (
-             SELECT
-               item AS record,
-               item->>'incidentId' AS incident_id,
-               item->>'status' AS status,
-               item->>'severity' AS severity,
-               item->>'agentId' AS agent_id,
-               item->>'workspacePath' AS workspace_path,
-               (item->>'openedAt')::bigint AS opened_at,
-               (item->>'updatedAt')::bigint AS updated_at
-             FROM jsonb_array_elements($1::jsonb) AS source(item)
-           )
-           INSERT INTO anysentry_incidents (
-             incident_id,
-             status,
-             severity,
-             agent_id,
-             workspace_path,
-             record,
-             opened_at,
-             updated_at
-           )
-           SELECT
-             incident_id,
-             status,
-             severity,
-             agent_id,
-             workspace_path,
-             record,
-             opened_at,
-             updated_at
-           FROM incoming
-           ON CONFLICT (incident_id) DO UPDATE SET
-             status = EXCLUDED.status,
-             severity = EXCLUDED.severity,
-             agent_id = EXCLUDED.agent_id,
-             workspace_path = EXCLUDED.workspace_path,
-             record = EXCLUDED.record,
-             opened_at = LEAST(anysentry_incidents.opened_at, EXCLUDED.opened_at),
-             updated_at = EXCLUDED.updated_at
-           WHERE EXCLUDED.updated_at >= anysentry_incidents.updated_at`,
-          [JSON.stringify(batch)],
-        );
-      },
+      (client, batch) => this.upsertIncidentRecords(client, batch),
     );
   }
 
@@ -388,57 +362,269 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       records,
       'save Alerts',
       (record) => record.alertId,
-      async (client, batch) => {
-        await client.query(
-          `WITH incoming AS (
-             SELECT
-               item AS record,
-               item->>'alertId' AS alert_id,
-               item->>'dedupeKey' AS dedupe_key,
-               item->>'status' AS status,
-               item->>'severity' AS severity,
-               item->>'kind' AS kind,
-               (item->>'firstSeenAt')::bigint AS first_seen_at,
-               (item->>'lastSeenAt')::bigint AS last_seen_at,
-               (item->>'updatedAt')::bigint AS updated_at
-             FROM jsonb_array_elements($1::jsonb) AS source(item)
-           )
-           INSERT INTO anysentry_alerts (
-             alert_id,
-             dedupe_key,
-             status,
-             severity,
-             kind,
-             record,
-             first_seen_at,
-             last_seen_at,
-             updated_at
-           )
-           SELECT
-             alert_id,
-             dedupe_key,
-             status,
-             severity,
-             kind,
-             record,
-             first_seen_at,
-             last_seen_at,
-             updated_at
-           FROM incoming
-           ON CONFLICT (alert_id) DO UPDATE SET
-             dedupe_key = EXCLUDED.dedupe_key,
-             status = EXCLUDED.status,
-             severity = EXCLUDED.severity,
-             kind = EXCLUDED.kind,
-             record = EXCLUDED.record,
-             first_seen_at = LEAST(anysentry_alerts.first_seen_at, EXCLUDED.first_seen_at),
-             last_seen_at = GREATEST(anysentry_alerts.last_seen_at, EXCLUDED.last_seen_at),
-             updated_at = EXCLUDED.updated_at
-           WHERE EXCLUDED.updated_at >= anysentry_alerts.updated_at`,
-          [JSON.stringify(batch)],
-        );
-      },
+      (client, batch) => this.upsertAlertRecords(client, batch),
     );
+  }
+
+  /**
+   * Commit the mutable business state and the idempotency ledger in one PostgreSQL transaction.
+   *
+   * ClickHouse copies are intentionally excluded: they are rebuildable projections and must not
+   * turn an analytics failure into a false negative durable receipt.
+   */
+  async commitBusinessEffect(
+    effectKey: string,
+    incidents: Incident[],
+    alerts: AlertRecord[],
+    at = Date.now(),
+  ): Promise<boolean> {
+    if (!(await this.initialize()) || !this.pool) return false;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= BUSINESS_WRITE_MAX_ATTEMPTS; attempt += 1) {
+      let client: PoolClient | undefined;
+      try {
+        client = await this.pool.connect();
+        await client.query('BEGIN');
+        const lease = await client.query<{ status: string; lease_owner: string | null }>(
+          `SELECT status, lease_owner
+             FROM anysentry_business_effects
+            WHERE effect_key = $1
+            FOR UPDATE`,
+          [effectKey],
+        );
+        const row = lease.rows[0];
+        if (!row || row.status !== 'pending' || row.lease_owner !== this.effectOwnerId) {
+          await client.query('ROLLBACK');
+          return false;
+        }
+        for (let offset = 0; offset < incidents.length; offset += BUSINESS_WRITE_BATCH_SIZE) {
+          await this.upsertIncidentRecords(
+            client,
+            incidents.slice(offset, offset + BUSINESS_WRITE_BATCH_SIZE),
+          );
+        }
+        for (let offset = 0; offset < alerts.length; offset += BUSINESS_WRITE_BATCH_SIZE) {
+          await this.upsertAlertRecords(
+            client,
+            alerts.slice(offset, offset + BUSINESS_WRITE_BATCH_SIZE),
+          );
+        }
+        const completed = await client.query(
+          `UPDATE anysentry_business_effects
+              SET status = 'applied',
+                  lease_expires_at = $3,
+                  applied_at = $2,
+                  updated_at = $2
+            WHERE effect_key = $1
+              AND status = 'pending'
+              AND lease_owner = $4`,
+          [effectKey, at, at, this.effectOwnerId],
+        );
+        if (completed.rowCount !== 1) throw new Error(`business effect lease lost for ${effectKey}`);
+        await client.query('COMMIT');
+        return true;
+      } catch (error) {
+        lastError = error;
+        await client?.query('ROLLBACK').catch(() => undefined);
+        if (!this.retryableTransactionError(error) || attempt === BUSINESS_WRITE_MAX_ATTEMPTS) break;
+        await new Promise((resolve) => setTimeout(resolve, attempt * 50));
+      } finally {
+        client?.release();
+      }
+    }
+    this.markUnavailable('commit business effect', lastError);
+    return false;
+  }
+
+  /**
+   * Acquire the right to apply one externally visible business effect.
+   *
+   * The logical key is stable across retries and API replicas. A short lease lets a replay recover
+   * work left pending by a crashed process; an applied row is never acquired again.
+   */
+  async acquireBusinessEffect(
+    effectKey: string,
+    effectType: string,
+    payloadFingerprint: string,
+    metadata: Record<string, unknown>,
+    at = Date.now(),
+  ): Promise<BusinessEffectLease> {
+    if (!(await this.initialize()) || !this.pool) return { status: 'unavailable' };
+    const leaseExpiresAt = at + EFFECT_LEASE_MS;
+    try {
+      const inserted = await this.pool.query<{ effect_key: string }>(
+        `INSERT INTO anysentry_business_effects (
+           effect_key, effect_type, payload_fingerprint, status, lease_owner,
+           lease_expires_at, attempts, metadata, created_at_ms, updated_at
+         ) VALUES ($1, $2, $3, 'pending', $4, $5, 1, $6::jsonb, $7, $7)
+         ON CONFLICT (effect_key) DO NOTHING
+         RETURNING effect_key`,
+        [
+          effectKey,
+          effectType,
+          payloadFingerprint,
+          this.effectOwnerId,
+          leaseExpiresAt,
+          JSON.stringify(metadata),
+          at,
+        ],
+      );
+      if (inserted.rowCount === 1) return { status: 'acquired' };
+
+      const reclaimed = await this.pool.query<{ effect_key: string }>(
+        `UPDATE anysentry_business_effects
+            SET lease_owner = $2,
+                lease_expires_at = $3,
+                attempts = attempts + 1,
+                updated_at = $4
+          WHERE effect_key = $1
+            AND status = 'pending'
+            AND lease_expires_at < $4
+            AND payload_fingerprint = $5
+         RETURNING effect_key`,
+        [effectKey, this.effectOwnerId, leaseExpiresAt, at, payloadFingerprint],
+      );
+      if (reclaimed.rowCount === 1) return { status: 'acquired' };
+
+      const existing = await this.pool.query<{
+        payload_fingerprint: string;
+        status: string;
+      }>(
+        `SELECT payload_fingerprint, status
+           FROM anysentry_business_effects
+          WHERE effect_key = $1`,
+        [effectKey],
+      );
+      const row = existing.rows[0];
+      if (!row) return { status: 'unavailable' };
+      if (row.payload_fingerprint !== payloadFingerprint) {
+        return { status: 'conflict', acceptedFingerprint: row.payload_fingerprint };
+      }
+      // A matching fingerprint is a completed no-op only after the first owner has marked the
+      // effect applied. A live pending lease may still fail, so acknowledging a concurrent replay
+      // here would create a false durable receipt.
+      return row.status === 'applied' ? { status: 'duplicate' } : { status: 'busy' };
+    } catch (error) {
+      this.markUnavailable('acquire business effect', error);
+      return { status: 'unavailable' };
+    }
+  }
+
+  async completeBusinessEffect(effectKey: string, at = Date.now()): Promise<boolean> {
+    if (!(await this.initialize()) || !this.pool) return false;
+    try {
+      const result = await this.pool.query(
+        `UPDATE anysentry_business_effects
+            SET status = 'applied',
+                lease_expires_at = $3,
+                applied_at = $2,
+                updated_at = $2
+          WHERE effect_key = $1
+            AND status = 'pending'
+            AND lease_owner = $4`,
+        [effectKey, at, at, this.effectOwnerId],
+      );
+      return result.rowCount === 1;
+    } catch (error) {
+      this.markUnavailable('complete business effect', error);
+      return false;
+    }
+  }
+
+  async acquireWriterOwnership(
+    sourceScope: string,
+    writerId: string,
+    writerVersion: string,
+    protocolVersion: string,
+    at = Date.now(),
+  ): Promise<WriterOwnership> {
+    if (!(await this.initialize()) || !this.pool) return { status: 'unavailable' };
+    const cacheKey = `${sourceScope}\0${writerId}`;
+    if ((this.writerOwnershipCache.get(cacheKey) ?? 0) > at + 15_000) {
+      return { status: 'owned' };
+    }
+    const current = this.writerOwnershipInFlight.get(cacheKey);
+    if (current) return current;
+    const acquisition = this.acquireWriterOwnershipUncached(
+      sourceScope,
+      writerId,
+      writerVersion,
+      protocolVersion,
+      cacheKey,
+      at,
+    );
+    this.writerOwnershipInFlight.set(cacheKey, acquisition);
+    try {
+      return await acquisition;
+    } finally {
+      if (this.writerOwnershipInFlight.get(cacheKey) === acquisition) {
+        this.writerOwnershipInFlight.delete(cacheKey);
+      }
+    }
+  }
+
+  private async acquireWriterOwnershipUncached(
+    sourceScope: string,
+    writerId: string,
+    writerVersion: string,
+    protocolVersion: string,
+    cacheKey: string,
+    at: number,
+  ): Promise<WriterOwnership> {
+    const pool = this.pool;
+    if (!pool) return { status: 'unavailable' };
+    const leaseMs = positiveInt(
+      process.env.ANYSENTRY_WRITER_OWNERSHIP_LEASE_MS,
+      90_000,
+      15 * 60_000,
+    );
+    const leaseExpiresAt = at + leaseMs;
+    try {
+      const result = await pool.query<{
+        writer_id: string;
+        lease_expires_at: string | number;
+      }>(
+        `INSERT INTO anysentry_writer_ownership (
+           source_scope, writer_id, writer_version, protocol_version,
+           lease_expires_at, first_seen_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $6)
+         ON CONFLICT (source_scope) DO UPDATE SET
+           writer_id = EXCLUDED.writer_id,
+           writer_version = EXCLUDED.writer_version,
+           protocol_version = EXCLUDED.protocol_version,
+           lease_expires_at = EXCLUDED.lease_expires_at,
+           updated_at = EXCLUDED.updated_at
+         WHERE anysentry_writer_ownership.writer_id = EXCLUDED.writer_id
+            OR anysentry_writer_ownership.lease_expires_at < EXCLUDED.updated_at
+         RETURNING writer_id, lease_expires_at`,
+        [sourceScope, writerId, writerVersion, protocolVersion, leaseExpiresAt, at],
+      );
+      const row = result.rows[0];
+      if (row?.writer_id === writerId) {
+        this.writerOwnershipCache.set(cacheKey, Number(row.lease_expires_at));
+        return { status: 'owned' };
+      }
+      const existing = await pool.query<{
+        writer_id: string;
+        lease_expires_at: string | number;
+      }>(
+        `SELECT writer_id, lease_expires_at
+           FROM anysentry_writer_ownership
+          WHERE source_scope = $1`,
+        [sourceScope],
+      );
+      const owner = existing.rows[0];
+      return owner
+        ? {
+            status: 'conflict',
+            ownerWriterId: owner.writer_id,
+            leaseExpiresAt: Number(owner.lease_expires_at),
+          }
+        : { status: 'unavailable' };
+    } catch (error) {
+      this.markUnavailable('acquire Writer ownership', error);
+      return { status: 'unavailable' };
+    }
   }
 
   async loadRemediations(): Promise<RemediationRecord[]> {
@@ -603,6 +789,26 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       records,
       (record) => record.objectiveId,
       'save Objectives',
+    );
+  }
+
+  async loadPlatformUsers(): Promise<PlatformUserRecord[]> {
+    return this.loadSimpleBusinessRecords(
+      'anysentry_platform_users',
+      'user_id',
+      (record: PlatformUserRecord) => record.userId,
+      'load Platform Users',
+    );
+  }
+
+  async savePlatformUsers(records: PlatformUserRecord[]): Promise<boolean> {
+    return this.saveSimpleBusinessRecords(
+      'anysentry_platform_users',
+      'user_id',
+      'userId',
+      records,
+      (record) => record.userId,
+      'save Platform Users',
     );
   }
 
@@ -779,6 +985,42 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
           ON anysentry_alerts (dedupe_key)
       `);
       await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_business_effects (
+          effect_key TEXT PRIMARY KEY,
+          effect_type TEXT NOT NULL,
+          payload_fingerprint TEXT NOT NULL,
+          status TEXT NOT NULL,
+          lease_owner TEXT NOT NULL,
+          lease_expires_at BIGINT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 1,
+          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+          created_at_ms BIGINT NOT NULL,
+          applied_at BIGINT,
+          updated_at BIGINT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_business_effects_status_lease_idx
+          ON anysentry_business_effects (status, lease_expires_at)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_writer_ownership (
+          source_scope TEXT PRIMARY KEY,
+          writer_id TEXT NOT NULL,
+          writer_version TEXT NOT NULL,
+          protocol_version TEXT NOT NULL,
+          lease_expires_at BIGINT NOT NULL,
+          first_seen_at BIGINT NOT NULL,
+          updated_at BIGINT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_writer_ownership_lease_idx
+          ON anysentry_writer_ownership (lease_expires_at)
+      `);
+      await pool.query(`
         CREATE TABLE IF NOT EXISTS anysentry_remediations (
           task_id TEXT PRIMARY KEY,
           source_type TEXT NOT NULL,
@@ -805,6 +1047,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         ['anysentry_notification_channels', 'channel_id'],
         ['anysentry_notification_routes', 'route_id'],
         ['anysentry_objectives', 'objective_id'],
+        ['anysentry_platform_users', 'user_id'],
       ] as const) {
         await pool.query(`
           CREATE TABLE IF NOT EXISTS ${table} (
@@ -921,6 +1164,106 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     });
   }
 
+  private async upsertIncidentRecords(client: PoolClient, records: Incident[]): Promise<void> {
+    if (records.length === 0) return;
+    await client.query(
+      `WITH incoming AS (
+         SELECT
+           item AS record,
+           item->>'incidentId' AS incident_id,
+           item->>'status' AS status,
+           item->>'severity' AS severity,
+           item->>'agentId' AS agent_id,
+           item->>'workspacePath' AS workspace_path,
+           (item->>'openedAt')::bigint AS opened_at,
+           (item->>'updatedAt')::bigint AS updated_at
+         FROM jsonb_array_elements($1::jsonb) AS source(item)
+       )
+       INSERT INTO anysentry_incidents (
+         incident_id,
+         status,
+         severity,
+         agent_id,
+         workspace_path,
+         record,
+         opened_at,
+         updated_at
+       )
+       SELECT
+         incident_id,
+         status,
+         severity,
+         agent_id,
+         workspace_path,
+         record,
+         opened_at,
+         updated_at
+       FROM incoming
+       ON CONFLICT (incident_id) DO UPDATE SET
+         status = EXCLUDED.status,
+         severity = EXCLUDED.severity,
+         agent_id = EXCLUDED.agent_id,
+         workspace_path = EXCLUDED.workspace_path,
+         record = EXCLUDED.record,
+         opened_at = LEAST(anysentry_incidents.opened_at, EXCLUDED.opened_at),
+         updated_at = EXCLUDED.updated_at
+       WHERE EXCLUDED.updated_at >= anysentry_incidents.updated_at`,
+      [JSON.stringify(records)],
+    );
+  }
+
+  private async upsertAlertRecords(client: PoolClient, records: AlertRecord[]): Promise<void> {
+    if (records.length === 0) return;
+    await client.query(
+      `WITH incoming AS (
+         SELECT
+           item AS record,
+           item->>'alertId' AS alert_id,
+           item->>'dedupeKey' AS dedupe_key,
+           item->>'status' AS status,
+           item->>'severity' AS severity,
+           item->>'kind' AS kind,
+           (item->>'firstSeenAt')::bigint AS first_seen_at,
+           (item->>'lastSeenAt')::bigint AS last_seen_at,
+           (item->>'updatedAt')::bigint AS updated_at
+         FROM jsonb_array_elements($1::jsonb) AS source(item)
+       )
+       INSERT INTO anysentry_alerts (
+         alert_id,
+         dedupe_key,
+         status,
+         severity,
+         kind,
+         record,
+         first_seen_at,
+         last_seen_at,
+         updated_at
+       )
+       SELECT
+         alert_id,
+         dedupe_key,
+         status,
+         severity,
+         kind,
+         record,
+         first_seen_at,
+         last_seen_at,
+         updated_at
+       FROM incoming
+       ON CONFLICT (alert_id) DO UPDATE SET
+         dedupe_key = EXCLUDED.dedupe_key,
+         status = EXCLUDED.status,
+         severity = EXCLUDED.severity,
+         kind = EXCLUDED.kind,
+         record = EXCLUDED.record,
+         first_seen_at = LEAST(anysentry_alerts.first_seen_at, EXCLUDED.first_seen_at),
+         last_seen_at = GREATEST(anysentry_alerts.last_seen_at, EXCLUDED.last_seen_at),
+         updated_at = EXCLUDED.updated_at
+       WHERE EXCLUDED.updated_at >= anysentry_alerts.updated_at`,
+      [JSON.stringify(records)],
+    );
+  }
+
   private async saveBusinessRecords<T>(
     records: T[],
     operation: string,
@@ -934,8 +1277,9 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       identity(left).localeCompare(identity(right)));
     let lastError: unknown;
     for (let attempt = 1; attempt <= BUSINESS_WRITE_MAX_ATTEMPTS; attempt += 1) {
-      const client = await this.pool.connect();
+      let client: PoolClient | undefined;
       try {
+        client = await this.pool.connect();
         await client.query('BEGIN');
         for (let offset = 0; offset < ordered.length; offset += BUSINESS_WRITE_BATCH_SIZE) {
           await upsert(client, ordered.slice(offset, offset + BUSINESS_WRITE_BATCH_SIZE));
@@ -944,13 +1288,13 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         return true;
       } catch (error) {
         lastError = error;
-        await client.query('ROLLBACK').catch(() => undefined);
+        await client?.query('ROLLBACK').catch(() => undefined);
         if (!this.retryableTransactionError(error) || attempt === BUSINESS_WRITE_MAX_ATTEMPTS) {
           break;
         }
         await new Promise((resolve) => setTimeout(resolve, attempt * 50));
       } finally {
-        client.release();
+        client?.release();
       }
     }
     this.markUnavailable(operation, lastError);

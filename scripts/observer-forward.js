@@ -12,12 +12,14 @@
 const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
+const os = require('node:os');
+const path = require('node:path');
 const readline = require('node:readline');
 const { AgentAttributor } = require('./observer-agent-attribution');
 const { AgentTemplateRegistry, loadTemplateDocument } = require('./observer-agent-templates');
 const { DockerDiscovery } = require('./observer-docker-discovery');
 const { BehavioralAgentDetector } = require('./observer-behavior-discovery');
-const { BoundedPriorityQueue } = require('./observer-priority-queue');
+const { DurableSpool, safeId, stableWriterId } = require('./observer-durable-spool');
 const { ToolExecDeduper } = require('./observer-event-dedup');
 const {
   behaviorDiscoveryEligible,
@@ -58,8 +60,15 @@ function boundedNumber(value, fallback, min, max) {
 const MAX_INFLIGHT = boundedNumber(process.env.FORWARD_MAX_INFLIGHT, 8, 1, 64);
 const BATCH_SIZE = boundedNumber(process.env.FORWARD_BATCH_SIZE, 32, 1, 256);
 const BATCH_FLUSH_MS = boundedNumber(process.env.FORWARD_BATCH_FLUSH_MS, 50, 1, 5_000);
-const MAX_QUEUE = boundedNumber(process.env.FORWARD_MAX_QUEUE, 4_096, BATCH_SIZE, 100_000);
+const BATCH_MAX_BYTES = boundedNumber(
+  process.env.FORWARD_BATCH_MAX_BYTES,
+  80 * 1024,
+  16 * 1024,
+  1024 * 1024,
+);
 const HTTP_TIMEOUT_MS = boundedNumber(process.env.FORWARD_HTTP_TIMEOUT_MS, 10_000, 1_000, 120_000);
+const RETRY_BASE_MS = boundedNumber(process.env.FORWARD_RETRY_BASE_MS, 250, 50, 30_000);
+const RETRY_MAX_MS = boundedNumber(process.env.FORWARD_RETRY_MAX_MS, 30_000, RETRY_BASE_MS, 300_000);
 function envBoolean(value, fallback) {
   if (value === undefined || value === '') return fallback;
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
@@ -84,6 +93,28 @@ const SOURCE_NAME = process.env.ANYSENTRY_SOURCE_NAME || '';
 const SOURCE_TYPE = process.env.ANYSENTRY_SOURCE_TYPE || 'observer';
 const SOURCE_TOKEN = process.env.ANYSENTRY_INGEST_TOKEN || '';
 const WORKSPACE_PATH = process.env.ANYSENTRY_WORKSPACE_PATH || '';
+const WRITER_VERSION = process.env.ANYSENTRY_WRITER_VERSION || 'observer-forwarder/1.0.0';
+const IDEMPOTENCY_PROTOCOL_VERSION =
+  process.env.ANYSENTRY_IDEMPOTENCY_PROTOCOL_VERSION || 'anysentry.idempotency.v1';
+const WRITER_ID = stableWriterId([
+  SOURCE_ID,
+  COLLECTOR_ID,
+  NODE_NAME,
+  SOURCE_TYPE,
+  process.env.A3S_OBSERVER_HOST_ID || '',
+  os.hostname(),
+]);
+const SPOOL_PATH = process.env.FORWARD_SPOOL_PATH ||
+  path.join(os.tmpdir(), 'anysentry-forwarder', safeId(WRITER_ID), 'spool.wal');
+const spool = new DurableSpool({
+  writerId: WRITER_ID,
+  filePath: SPOOL_PATH,
+  dlqPath: process.env.FORWARD_DLQ_PATH,
+  maxRecords: process.env.FORWARD_SPOOL_MAX_RECORDS,
+  maxBytes: process.env.FORWARD_SPOOL_MAX_BYTES,
+  fsyncMode: process.env.FORWARD_SPOOL_FSYNC,
+  fsyncMs: process.env.FORWARD_SPOOL_FSYNC_MS,
+});
 const HEARTBEAT_SECS = Math.max(0, Number(process.env.ANYSENTRY_HEARTBEAT_SECS || 30));
 const heartbeatTarget = new URL(process.env.ANYSENTRY_HEARTBEAT_URL || defaultHeartbeatUrl(target));
 const batchTarget = new URL(process.env.ANYSENTRY_BATCH_INGEST_URL || defaultBatchIngestUrl(target));
@@ -118,12 +149,14 @@ const toolExecDeduper = new ToolExecDeduper({
 });
 
 let inflight = 0;
-const pending = new BoundedPriorityQueue(MAX_QUEUE, 5);
+const inflightIds = new Set();
+const retryBatches = new Map();
 let outputDropped = 0;
 let errorCount = 0;
 let eventKindCounts = Object.create(null);
-const forwarderInstanceId = crypto.randomUUID();
-let sourceEventSequence = 0;
+let retryCount = 0;
+let durableAckCount = 0;
+let permanentRejectionCount = 0;
 let lastNonAgentSuppressedAt = '';
 let attributionCounts = {
   observed: 0,
@@ -150,6 +183,8 @@ let heartbeatTimer;
 let identitySnapshotTimer;
 let batchTimer;
 let rl;
+const writerSessionId = crypto.randomBytes(12).toString('hex');
+let writerEventSequence = 0;
 
 function isNoise(o) {
   const fa = o.event && o.event.FileAccess;
@@ -167,16 +202,16 @@ function bumpEventKind(o) {
   eventKindCounts[kind] = (eventKindCounts[kind] || 0) + 1;
 }
 
-function sourceEventId(line) {
-  sourceEventSequence += 1;
+function sourceEventId(line, observedAt) {
+  writerEventSequence += 1;
   return `ose_${crypto.createHash('sha256')
-    .update(COLLECTOR_ID)
+    .update(WRITER_ID)
     .update('\0')
-    .update(NODE_NAME)
+    .update(writerSessionId)
     .update('\0')
-    .update(forwarderInstanceId)
+    .update(String(observedAt))
     .update('\0')
-    .update(String(sourceEventSequence))
+    .update(String(writerEventSequence))
     .update('\0')
     .update(line)
     .digest('hex')
@@ -201,18 +236,22 @@ function sourceHeaders() {
 }
 
 function postJson(url, bodyObj, timeoutMs, done) {
+  postJsonDetailed(url, bodyObj, timeoutMs, (result) => done(!result.ok));
+}
+
+function postJsonDetailed(url, bodyObj, timeoutMs, done) {
   const isHttps = url.protocol === 'https:';
   const transport = isHttps ? https : http;
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    done(true);
+    done({ ok: false, retryable: false, error: `unsupported protocol ${url.protocol}` });
     return;
   }
   const body = JSON.stringify(bodyObj);
   let settled = false;
-  const finish = (failed) => {
+  const finish = (result) => {
     if (settled) return;
     settled = true;
-    done(Boolean(failed));
+    done(result);
   };
   const req = transport.request(
     {
@@ -228,13 +267,34 @@ function postJson(url, bodyObj, timeoutMs, done) {
       },
     },
     (res) => {
-      res.resume();
-      res.on('end', () => finish((res.statusCode || 500) >= 400));
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        if (data.length < 8 * 1024 * 1024) data += chunk;
+      });
+      res.on('end', () => {
+        const statusCode = res.statusCode || 500;
+        if (statusCode >= 400) {
+          finish({
+            ok: false,
+            retryable: statusCode === 408 || statusCode === 429 || statusCode >= 500,
+            statusCode,
+            error: data.slice(0, 2_000),
+          });
+          return;
+        }
+        try {
+          const parsed = data ? JSON.parse(data) : {};
+          finish({ ok: true, statusCode, data: parsed?.data ?? parsed });
+        } catch (error) {
+          finish({ ok: false, retryable: true, statusCode, error: error.message });
+        }
+      });
     },
   );
-  req.on('error', () => finish(true));
+  req.on('error', (error) => finish({ ok: false, retryable: true, error: error.message }));
   req.setTimeout(timeoutMs, () => {
-    finish(true);
+    finish({ ok: false, retryable: true, error: 'request timeout' });
     req.destroy();
   });
   req.end(body);
@@ -312,6 +372,10 @@ function sendHeartbeat(done = () => {}) {
   const behavior = behaviorDetector.metrics();
   const templates = templateRegistry.metrics();
   const processes = attributor.metrics();
+  const spoolStatus = spool.status();
+  const retries = retryCount;
+  const durableAcks = durableAckCount;
+  const permanentRejections = permanentRejectionCount;
   eventKindCounts = Object.create(null);
   attributionCounts = {
     observed: 0,
@@ -335,6 +399,9 @@ function sendHeartbeat(done = () => {}) {
   };
   outputDropped = 0;
   errorCount = 0;
+  retryCount = 0;
+  durableAckCount = 0;
+  permanentRejectionCount = 0;
   const status = dropped > 0 || errors > 0 ? 'degraded' : 'ok';
   postJson(
     heartbeatTarget,
@@ -345,7 +412,7 @@ function sendHeartbeat(done = () => {}) {
       status,
       intervalSecs: HEARTBEAT_SECS,
       eventKindCounts: counts,
-      queueDepth: pending.length,
+      queueDepth: spoolStatus.records,
       outputDropped: dropped,
       errorCount: errors,
       filterMetrics: {
@@ -371,6 +438,17 @@ function sendHeartbeat(done = () => {}) {
         queueDropped: classifications.queueDropped,
         batches: classifications.batches,
         batchEvents: classifications.batchEvents,
+        writerId: WRITER_ID,
+        writerVersion: WRITER_VERSION,
+        idempotencyProtocolVersion: IDEMPOTENCY_PROTOCOL_VERSION,
+        spoolRecords: spoolStatus.records,
+        spoolBytes: spoolStatus.logicalBytes,
+        spoolWalBytes: spoolStatus.walBytes,
+        spoolOldestMs: spoolStatus.oldestMs,
+        spoolAtCapacity: spoolStatus.atCapacity,
+        retryCount: retries,
+        durableAckCount: durableAcks,
+        permanentRejectionCount: permanentRejections,
         identitySnapshotReady: workload.ready,
         identitySnapshotVersion: workload.version,
         identitySnapshotAgeSeconds: workload.ageSeconds,
@@ -407,7 +485,7 @@ function sendHeartbeat(done = () => {}) {
         infrastructure: classifications.infrastructure,
         workspaceConflict: classifications.workspaceConflict,
       },
-      message: `filter_mode=${FILTER_MODE}; retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
+      message: `filter_mode=${FILTER_MODE}; retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; spool_records=${spoolStatus.records}; spool_bytes=${spoolStatus.logicalBytes}; spool_oldest_ms=${spoolStatus.oldestMs}; retries=${retries}; durable_acks=${durableAcks}; permanent_rejections=${permanentRejections}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
     },
     5000,
@@ -415,6 +493,11 @@ function sendHeartbeat(done = () => {}) {
       if (failed) {
         outputDropped++;
         errorCount++;
+      } else if (retryBatches.size > 0) {
+        for (const batch of retryBatches.values()) {
+          if (!batch.sending) batch.nextAttemptAt = Date.now();
+        }
+        pumpSpool();
       }
       done(Boolean(failed));
     },
@@ -438,60 +521,235 @@ function queuePriority(kind, classification) {
 }
 
 function scheduleBatch() {
-  if (batchTimer || pending.length === 0) return;
+  if (batchTimer || spool.records.size === 0) return;
   batchTimer = setTimeout(() => {
     batchTimer = undefined;
-    flushPending();
+    pumpSpool();
   }, BATCH_FLUSH_MS);
   batchTimer.unref();
 }
 
-function finishBatch(failed, batchLength) {
-  if (failed) {
-    outputDropped += batchLength;
-    errorCount++;
-  }
-  inflight = Math.max(0, inflight - 1);
-  while (pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
-  if (!closing && pending.length < MAX_QUEUE && inflight < MAX_INFLIGHT) rl.resume();
+function retryDelay(attempt) {
+  const ceiling = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * (2 ** Math.min(16, attempt)));
+  return Math.max(RETRY_BASE_MS, Math.round(ceiling * (0.75 + Math.random() * 0.5)));
 }
 
-function flushPending() {
-  if (pending.length === 0 || inflight >= MAX_INFLIGHT) return;
+function stableBatchId(records) {
+  const hash = crypto.createHash('sha256')
+    .update(WRITER_ID)
+    .update('\0')
+    .update(IDEMPOTENCY_PROTOCOL_VERSION);
+  for (const record of records) hash.update('\0').update(record.id);
+  return `ob_${hash.digest('hex').slice(0, 32)}`;
+}
+
+function applySpoolBackpressure() {
+  if (!rl || closing) return;
+  const status = spool.status();
+  if (status.atCapacity) {
+    rl.pause();
+    return;
+  }
+  if (
+    status.records < Math.floor(spool.maxRecords * 0.8) &&
+    status.logicalBytes < Math.floor(spool.maxBytes * 0.8)
+  ) rl.resume();
+}
+
+function scheduleNextRetry() {
+  if (batchTimer) clearTimeout(batchTimer);
+  const dueAt = [...retryBatches.values()].filter((batch) => !batch.sending).reduce(
+    (minimum, batch) => Math.min(minimum, batch.nextAttemptAt),
+    Number.POSITIVE_INFINITY,
+  );
+  if (!Number.isFinite(dueAt)) {
+    batchTimer = undefined;
+    return;
+  }
+  const delay = Math.max(1, dueAt - Date.now());
+  batchTimer = setTimeout(() => {
+    batchTimer = undefined;
+    pumpSpool();
+  }, delay);
+  batchTimer.unref();
+}
+
+function retainForRetry(batch, error) {
+  batch.attempt += 1;
+  batch.sending = false;
+  batch.lastError = String(error || 'batch not durably acknowledged').slice(0, 2_000);
+  batch.nextAttemptAt = Date.now() + retryDelay(batch.attempt);
+  retryBatches.set(batch.batchId, batch);
+  retryCount++;
+  errorCount++;
+  if (batch.attempt === 1 || (batch.attempt & (batch.attempt - 1)) === 0) {
+    console.warn(
+      `[observer-forward] batch retry scheduled: batch=${batch.batchId}; `
+      + `events=${batch.records.length}; attempt=${batch.attempt}; error=${batch.lastError}`,
+    );
+  }
+}
+
+function finishBatch(batch, result) {
+  if (!result.ok && result.statusCode === 413) {
+    for (const record of batch.records) inflightIds.delete(record.id);
+    retryBatches.delete(batch.batchId);
+    inflight = Math.max(0, inflight - 1);
+    if (batch.records.length === 1) {
+      spool.deadLetter(batch.records, 'single observer event exceeds API request-body limit');
+      permanentRejectionCount++;
+      outputDropped++;
+    } else {
+      const middle = Math.ceil(batch.records.length / 2);
+      for (const records of [
+        batch.records.slice(0, middle),
+        batch.records.slice(middle),
+      ]) {
+        const split = {
+          batchId: stableBatchId(records),
+          records,
+          attempt: batch.attempt + 1,
+          nextAttemptAt: Date.now(),
+          sending: false,
+          lastError: 'HTTP 413; batch split',
+        };
+        for (const record of records) inflightIds.add(record.id);
+        retryBatches.set(split.batchId, split);
+      }
+      retryCount++;
+    }
+    pumpSpool();
+    return;
+  }
+  const itemResults = result.ok && Array.isArray(result.data?.items) ? result.data.items : [];
+  const bySourceEventId = new Map(
+    itemResults
+      .filter((item) => item?.sourceEventId)
+      .map((item) => [String(item.sourceEventId), item]),
+  );
+  const acknowledged = [];
+  const rejected = [];
+  const retryRecords = [];
+  const retryErrors = [];
+  for (const record of batch.records) {
+    const item = bySourceEventId.get(record.id);
+    if (item?.accepted === true && item?.durable === true) {
+      acknowledged.push(record.id);
+    } else if (item?.retryable === false) {
+      rejected.push({ record, reason: item?.error || 'permanent ingest rejection' });
+    } else {
+      retryRecords.push(record);
+      if (item?.error) retryErrors.push(String(item.error));
+    }
+  }
+  if (acknowledged.length) {
+    durableAckCount += spool.ack(acknowledged);
+  }
+  for (const rejection of rejected) {
+    spool.deadLetter([rejection.record], rejection.reason);
+    permanentRejectionCount++;
+    outputDropped++;
+  }
+  for (const record of batch.records) inflightIds.delete(record.id);
+  retryBatches.delete(batch.batchId);
+  inflight = Math.max(0, inflight - 1);
+
+  if (retryRecords.length) {
+    const retryBatch = {
+      ...batch,
+      records: retryRecords,
+      batchId: stableBatchId(retryRecords),
+    };
+    for (const record of retryRecords) inflightIds.add(record.id);
+    retainForRetry(
+      retryBatch,
+      retryErrors[0]
+        || result.error
+        || `HTTP ${result.statusCode || 'unknown'} without durable item ack: `
+          + JSON.stringify(result.data ?? {}).slice(0, 1_000),
+    );
+  }
+  applySpoolBackpressure();
+  pumpSpool();
+}
+
+function submitBatch(batch) {
+  if (batch.sending || inflight >= MAX_INFLIGHT) return;
+  batch.sending = true;
+  inflight++;
+  attributionCounts.batches++;
+  attributionCounts.batchEvents += batch.records.length;
+  postJsonDetailed(
+    batchTarget,
+    {
+      schemaVersion: 'anysentry.observer_batch.v2',
+      batchId: batch.batchId,
+      writerId: WRITER_ID,
+      writerVersion: WRITER_VERSION,
+      idempotencyProtocolVersion: IDEMPOTENCY_PROTOCOL_VERSION,
+      events: batch.records.map((record) => record.body),
+    },
+    HTTP_TIMEOUT_MS,
+    (result) => finishBatch(batch, result),
+  );
+}
+
+function pumpSpool() {
   if (batchTimer) {
     clearTimeout(batchTimer);
     batchTimer = undefined;
   }
-  const adaptiveBatchSize =
-    pending.length >= BATCH_SIZE * 8
-      ? Math.min(256, BATCH_SIZE * 4)
-      : pending.length >= BATCH_SIZE * 2
-        ? Math.min(256, BATCH_SIZE * 2)
-        : BATCH_SIZE;
-  const batch = pending.take(adaptiveBatchSize);
-  inflight++;
-  attributionCounts.batches++;
-  attributionCounts.batchEvents += batch.length;
-  postJson(
-    batchTarget,
-    { events: batch.map((item) => item.body) },
-    HTTP_TIMEOUT_MS,
-    (failed) => finishBatch(failed, batch.length),
-  );
-  if (pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
+  const now = Date.now();
+  const pendingRetries = [...retryBatches.values()];
+  for (const batch of pendingRetries) {
+    if (inflight >= MAX_INFLIGHT) break;
+    if (!batch.sending && batch.nextAttemptAt <= now) submitBatch(batch);
+  }
+  // A poison event must not block unrelated evidence. Retry cardinality remains bounded by
+  // MAX_INFLIGHT; once all retry lanes are occupied, new observations stay durably spooled.
+  if (retryBatches.size >= MAX_INFLIGHT) {
+    scheduleNextRetry();
+    return;
+  }
+  while (inflight < MAX_INFLIGHT && retryBatches.size < MAX_INFLIGHT) {
+    const candidates = spool.available(inflightIds, BATCH_SIZE);
+    const records = [];
+    let batchBytes = 1024;
+    for (const candidate of candidates) {
+      if (records.length && batchBytes + candidate.bytes > BATCH_MAX_BYTES) break;
+      records.push(candidate);
+      batchBytes += candidate.bytes + 64;
+    }
+    if (!records.length) break;
+    for (const record of records) inflightIds.add(record.id);
+    submitBatch({
+      batchId: stableBatchId(records),
+      records,
+      attempt: 0,
+      nextAttemptAt: now,
+      sending: false,
+    });
+  }
+  if (spool.records.size > inflightIds.size) scheduleBatch();
 }
 
 function enqueue(body, priority) {
-  const result = pending.push({ body, priority }, priority);
-  if (!result.accepted || result.dropped) {
+  const id = body.sourceEventId;
+  try {
+    spool.put({ id, body, priority, queuedAt: Date.now() });
+  } catch (error) {
     outputDropped++;
     attributionCounts.queueDropped++;
+    errorCount++;
+    console.error(`[observer-forward] durable spool write failed; input paused: ${error.message}`);
+    if (rl) rl.pause();
+    process.exitCode = 1;
+    return;
   }
-  if (!result.accepted) return;
   attributionCounts.forwarded++;
-  if (pending.length >= BATCH_SIZE) flushPending();
+  if (spool.records.size >= BATCH_SIZE) pumpSpool();
   else scheduleBatch();
-  if (pending.length >= MAX_QUEUE || inflight >= MAX_INFLIGHT) rl.pause();
+  applySpoolBackpressure();
 }
 
 function flushAndClose() {
@@ -501,20 +759,16 @@ function flushAndClose() {
   if (identitySnapshotTimer) clearInterval(identitySnapshotTimer);
   if (batchTimer) clearTimeout(batchTimer);
   batchTimer = undefined;
-  while (pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
-  const deadline = Date.now() + Math.max(5_000, HTTP_TIMEOUT_MS + 1_000);
+  pumpSpool();
+  const deadline = Date.now() + Math.max(30_000, HTTP_TIMEOUT_MS + RETRY_BASE_MS + 1_000);
   const waitForInflight = () => {
-    while (pending.length > 0 && inflight < MAX_INFLIGHT) flushPending();
-    if ((inflight > 0 || pending.length > 0) && Date.now() < deadline) {
+    pumpSpool();
+    if ((inflight > 0 || spool.records.size > 0) && Date.now() < deadline) {
       setTimeout(waitForInflight, 50);
       return;
     }
-    if (pending.length > 0) {
-      const abandoned = pending.clear();
-      outputDropped += abandoned;
-      attributionCounts.queueDropped += abandoned;
-    }
     sendHeartbeat(() => {
+      spool.close();
       closeTransports();
     });
   };
@@ -526,6 +780,12 @@ function handleLine(raw) {
   if (!line) return;
   let o;
   try { o = JSON.parse(line); } catch { return; } // skip the collector's human log lines / partials
+  const kind = eventKind(o);
+  // The Forwarder emits its own live heartbeat with WAL depth, retry and durable-ack metrics.
+  // Spooling the Observer's periodic heartbeat makes an old cumulative snapshot compete with the
+  // current one during recovery, and the batch API cannot durably acknowledge that control-plane
+  // record. Keep the WAL exclusively for evidence events.
+  if (kind === 'CollectorHeartbeat') return;
   attributionCounts.observed++;
   if (toolExecDeduper.isDuplicate(o)) {
     attributionCounts.deduplicated++;
@@ -562,7 +822,6 @@ function handleLine(raw) {
   if (classification.workspaceConflict || classification.attribution?.conflict) {
     attributionCounts.workspaceConflict++;
   }
-  const kind = eventKind(o);
   let filterReason = '';
   if (classification.state === 'non_agent' && !RETAIN_NON_AGENT) {
     filterReason = 'non_agent';
@@ -592,10 +851,12 @@ function handleLine(raw) {
   }
   bumpEventKind(o);
 
+  const observedAt = Date.now();
   enqueue(
     {
       line,
-      sourceEventId: sourceEventId(line),
+      sourceEventId: sourceEventId(line, observedAt),
+      observedAt,
       ...(classification.attribution ? { attribution: classification.attribution } : {}),
       ...(COLLECTOR_ID ? { collectorId: COLLECTOR_ID } : {}),
       ...(NODE_NAME ? { nodeName: NODE_NAME } : {}),
@@ -624,6 +885,11 @@ async function start() {
   const dockerStarted = await dockerDiscovery.start((snapshot) => workloadCache.replace(snapshot, 'docker'));
   const docker = dockerDiscovery.metrics();
   console.error(`[observer-forward] docker discovery: enabled=${docker.enabled}; started=${dockerStarted}; socket=${dockerDiscovery.socketPath}`);
+  const spoolStatus = spool.status();
+  console.error(
+    `[observer-forward] durable spool: writer=${WRITER_ID}; path=${spoolStatus.filePath}; ` +
+    `recovered=${spoolStatus.records}; bytes=${spoolStatus.logicalBytes}; fsync=${spoolStatus.fsyncMode}`,
+  );
 
   if (HEARTBEAT_SECS > 0) {
     sendHeartbeat();
@@ -639,10 +905,14 @@ async function start() {
   rl = readline.createInterface({ input: process.stdin });
   rl.on('line', handleLine);
   rl.on('close', flushAndClose);
+  process.once('SIGTERM', () => rl.close());
+  process.once('SIGINT', () => rl.close());
+  pumpSpool();
 }
 
 void start().catch((error) => {
   console.error('[observer-forward] startup failed:', error instanceof Error ? error.message : String(error));
+  spool.close();
   closeTransports();
   process.exitCode = 1;
 });

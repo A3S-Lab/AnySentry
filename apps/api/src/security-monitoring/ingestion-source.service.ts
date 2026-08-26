@@ -145,13 +145,13 @@ function defaultTokenRotationDays(): number {
 
 @Injectable()
 export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
-  private readonly ch = new ClickHouseStore();
   private readonly sources = new Map<string, IngestionSourceRecord>();
   private persistTimer?: NodeJS.Timeout;
   private currentStateTimer?: NodeJS.Timeout;
   private initialized = false;
 
   constructor(
+    private readonly ch: ClickHouseStore,
     private readonly currentState: DistributedCurrentStateService,
     private readonly relational: RelationalBusinessStore,
   ) {}
@@ -179,7 +179,6 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     if (this.persistTimer) clearTimeout(this.persistTimer);
     if (this.currentStateTimer) clearInterval(this.currentStateTimer);
     await this.persist();
-    await this.ch.close();
   }
 
   stateStatus() {

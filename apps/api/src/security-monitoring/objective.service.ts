@@ -78,13 +78,13 @@ function countsTowardActiveAlertObjective(alert: { ruleId: string; status: Alert
 
 @Injectable()
 export class ObjectiveService implements OnModuleInit, OnModuleDestroy {
-  private readonly ch = new ClickHouseStore();
   private readonly objectives = new Map<string, ObjectiveRecord>();
   private persistTimer?: NodeJS.Timeout;
   private relationalRefreshTimer?: NodeJS.Timeout;
   private initialized = false;
 
   constructor(
+    private readonly ch: ClickHouseStore,
     private readonly agg: AggregationService,
     private readonly alerting: AlertingService,
     private readonly sources: IngestionSourceService,
@@ -113,7 +113,6 @@ export class ObjectiveService implements OnModuleInit, OnModuleDestroy {
     if (this.persistTimer) clearTimeout(this.persistTimer);
     if (this.relationalRefreshTimer) clearInterval(this.relationalRefreshTimer);
     await this.persist();
-    await this.ch.close();
   }
 
   stateStatus() {

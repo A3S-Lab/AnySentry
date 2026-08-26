@@ -111,22 +111,28 @@ export async function apiRawFetch(endpoint: string, init?: RequestInit): Promise
 async function request<T>(endpoint: string, init: RequestInit, timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const externalSignal = init.signal;
+  const abortFromExternal = () => controller.abort();
+  if (externalSignal?.aborted) controller.abort();
+  else externalSignal?.addEventListener("abort", abortFromExternal, { once: true });
 
   let response: Response;
   try {
     response = await fetch(withBase(endpoint), {
       ...init,
       headers: { "Content-Type": "application/json", ...adminAuthHeader(endpoint), ...(init.headers ?? {}) },
-      signal: init.signal ?? controller.signal,
+      signal: controller.signal,
     });
   } catch (error) {
     clearTimeout(timeoutId);
+    externalSignal?.removeEventListener("abort", abortFromExternal);
     if ((error as Error).name === "AbortError") {
-      throw new ApiError("请求超时", 408);
+      throw new ApiError(externalSignal?.aborted ? "请求已取消" : "请求超时", externalSignal?.aborted ? 499 : 408);
     }
     throw new ApiError("网络连接异常", 0);
   }
   clearTimeout(timeoutId);
+  externalSignal?.removeEventListener("abort", abortFromExternal);
 
   if (response.status === 204) {
     return undefined as T;
@@ -157,11 +163,12 @@ async function request<T>(endpoint: string, init: RequestInit, timeoutMs = REQUE
 }
 
 export const apiClient = {
-  get<T>(endpoint: string): Promise<T> {
-    return request<T>(endpoint, { method: "GET" });
+  get<T>(endpoint: string, init: RequestInit = {}): Promise<T> {
+    return request<T>(endpoint, { ...init, method: "GET" });
   },
-  post<T>(endpoint: string, body?: unknown): Promise<T> {
+  post<T>(endpoint: string, body?: unknown, init: RequestInit = {}): Promise<T> {
     return request<T>(endpoint, {
+      ...init,
       method: "POST",
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
@@ -179,8 +186,9 @@ export const apiClient = {
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
   },
-  put<T>(endpoint: string, body?: unknown): Promise<T> {
+  put<T>(endpoint: string, body?: unknown, init: RequestInit = {}): Promise<T> {
     return request<T>(endpoint, {
+      ...init,
       method: "PUT",
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });

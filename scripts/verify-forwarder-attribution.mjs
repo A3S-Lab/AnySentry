@@ -380,6 +380,52 @@ function attributor(procEntries = []) {
   assert.equal(child.state, 'agent');
   assert.equal(child.attribution.rootPid, 100);
   assert.equal(child.attribution.reason, 'process_lineage');
+
+  const helper = judge.classify(observerEvent({
+    pid: 102,
+    ppid: 100,
+    comm: 'codex',
+    exe: '/usr/local/bin/codex',
+    startTimeNs: '12',
+    argv: ['codex', '--codex-run-as-fs-helper'],
+  }));
+  assert.equal(helper.state, 'agent');
+  assert.equal(helper.attribution.rootPid, 100);
+  assert.equal(
+    helper.attribution.reason,
+    'process_lineage',
+    'a Codex filesystem helper inherits its terminal root instead of becoming another Agent',
+  );
+}
+
+{
+  const judge = attributor();
+  const orphanedHelper = judge.classify(observerEvent({
+    pid: 190,
+    ppid: 999_999,
+    comm: 'codex',
+    exe: '/usr/local/bin/codex',
+    startTimeNs: '19',
+    argv: ['codex', '--codex-run-as-fs-helper'],
+  }));
+  assert.notEqual(
+    orphanedHelper.state,
+    'agent',
+    'a helper with unavailable ancestry must not manufacture an independent Agent root',
+  );
+  const orphanedSandbox = judge.classify(observerEvent({
+    pid: 191,
+    ppid: 999_999,
+    comm: 'tokio-rt-worker',
+    exe: '/opt/codex/vendor/bin/codex',
+    startTimeNs: '191',
+    argv: ['/tmp/codex-arg0/codex-linux-sandbox', '--sandbox-policy-cwd', '/workspace'],
+  }));
+  assert.notEqual(
+    orphanedSandbox.state,
+    'agent',
+    'a Codex sandbox executor with unavailable ancestry must not become a separate window',
+  );
 }
 
 {

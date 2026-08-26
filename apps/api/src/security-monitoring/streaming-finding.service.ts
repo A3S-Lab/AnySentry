@@ -24,6 +24,7 @@ const PROFILE_DDL = `CREATE TABLE IF NOT EXISTS ${PROFILE_TABLE} (
   workspaceId String,
   workspacePath String,
   agentCorrelationId String,
+  agentInstanceId String,
   agentType String,
   windowStart UInt64,
   windowEnd UInt64,
@@ -48,6 +49,7 @@ const COMPOSITE_DDL = `CREATE TABLE IF NOT EXISTS ${COMPOSITE_TABLE} (
   workspaceId String,
   workspacePath String,
   agentCorrelationId String,
+  agentInstanceId String,
   agentType String,
   sessionId String,
   traceId String,
@@ -110,6 +112,14 @@ const compositeJudgmentAlters = (table: string) => [
   `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ruleVersion LowCardinality(String) AFTER error`,
   `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS decisionSource LowCardinality(String) AFTER ruleVersion`,
   `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS synthetic UInt8 AFTER decisionSource`,
+];
+
+const PROFILE_ALTERS = [
+  `ALTER TABLE ${PROFILE_TABLE} ADD COLUMN IF NOT EXISTS agentInstanceId String AFTER agentCorrelationId`,
+];
+
+const COMPOSITE_ALTERS = [
+  `ALTER TABLE ${COMPOSITE_TABLE} ADD COLUMN IF NOT EXISTS agentInstanceId String AFTER agentCorrelationId`,
 ];
 
 const COMPOSITE_JUDGMENT_COLUMNS = [
@@ -232,7 +242,13 @@ export class StreamFindingStore {
       await boot.close();
       this.client = createClient({ url, database, username, password });
       await this.client.command({ query: PROFILE_DDL });
+      for (const query of PROFILE_ALTERS) {
+        await this.client.command({ query });
+      }
       await this.client.command({ query: COMPOSITE_DDL });
+      for (const query of COMPOSITE_ALTERS) {
+        await this.client.command({ query });
+      }
       await this.client.command({
         query: compositeJudgmentDdl(LEGACY_COMPOSITE_JUDGMENT_TABLE, 'episodeId'),
       });
@@ -273,6 +289,7 @@ export class StreamFindingStore {
         table: PROFILE_TABLE,
         values: [{
           ...finding,
+          agentInstanceId: finding.agentInstanceId ?? '',
           features: JSON.stringify(finding.features),
           hitRules: JSON.stringify(finding.hitRules),
           shadow: 1,
@@ -288,6 +305,7 @@ export class StreamFindingStore {
         table: COMPOSITE_TABLE,
         values: [{
           ...finding,
+          agentInstanceId: finding.agentInstanceId ?? '',
           sessionId: finding.sessionId ?? '',
           traceId: finding.traceId ?? '',
           evidenceEventIds: JSON.stringify(finding.evidenceEventIds),
@@ -336,7 +354,9 @@ export class StreamFindingStore {
       this.client.query({
         query: `SELECT * FROM ${PROFILE_TABLE} FINAL
           WHERE calculatedAt >= {since:UInt64} AND calculatedAt <= {until:UInt64}
-          ORDER BY calculatedAt DESC LIMIT {limit:UInt32}`,
+          ORDER BY calculatedAt DESC
+          LIMIT 2 BY if(agentInstanceId != '', agentInstanceId, agentCorrelationId)
+          LIMIT {limit:UInt32}`,
         query_params: { since, until, limit: safeLimit },
         format: 'JSONEachRow',
       }),
@@ -378,6 +398,7 @@ export class StreamFindingStore {
       workspaceId: String(row.workspaceId ?? ''),
       workspacePath: String(row.workspacePath ?? ''),
       agentCorrelationId: String(row.agentCorrelationId ?? ''),
+      agentInstanceId: String(row.agentInstanceId ?? ''),
       agentType: String(row.agentType ?? ''),
       windowStart: num(row.windowStart),
       windowEnd: num(row.windowEnd),
@@ -401,6 +422,7 @@ export class StreamFindingStore {
       workspaceId: String(row.workspaceId ?? ''),
       workspacePath: String(row.workspacePath ?? ''),
       agentCorrelationId: String(row.agentCorrelationId ?? ''),
+      agentInstanceId: String(row.agentInstanceId ?? '') || undefined,
       agentType: String(row.agentType ?? ''),
       sessionId: String(row.sessionId ?? '') || undefined,
       traceId: String(row.traceId ?? '') || undefined,

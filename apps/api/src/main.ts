@@ -4,6 +4,7 @@ import { json } from 'express';
 import { AppModule } from './app.module';
 import { deploymentBasePath } from './deployment-base-path';
 import { ApiResponseInterceptor } from './shared/api-response.interceptor';
+import { PlatformMetricsInterceptor, PlatformMetricsService } from './security-monitoring/platform-metrics.service';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bodyParser: false });
@@ -22,7 +23,10 @@ async function bootstrap() {
     limit: process.env.ANYSENTRY_WORKSPACE_SCAN_BODY_LIMIT || '32mb',
   }));
   app.use(json({ type: ['application/json', 'application/*+json'] }));
-  app.useGlobalInterceptors(new ApiResponseInterceptor(app.get(Reflector)));
+  app.useGlobalInterceptors(
+    new PlatformMetricsInterceptor(app.get(PlatformMetricsService)),
+    new ApiResponseInterceptor(app.get(Reflector)),
+  );
   const port = Number(process.env.PORT ?? 29653);
   await app.listen(port, '0.0.0.0');
   // eslint-disable-next-line no-console

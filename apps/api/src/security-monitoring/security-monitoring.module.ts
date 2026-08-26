@@ -25,9 +25,12 @@ import { RuntimeModelConfigService } from './runtime-model-config';
 import { DistributedCurrentStateService } from './distributed-current-state.service';
 import { RelationalBusinessStore } from './relational-business-store.service';
 import { WorkspaceDirectoryService } from './workspace-directory.service';
+import { UserDirectoryService } from './user-directory.service';
+import { PlatformMetricsService } from './platform-metrics.service';
+import { ClickHouseStore } from './clickhouse-store';
 
 @Module({
   controllers: [SecurityMonitoringController],
-  providers: [AgentAttributionService, RelationalBusinessStore, AgentMetadataService, WorkspaceDirectoryService, AlertingService, AuditService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, DistributedCurrentStateService, SentryJudgeService, AggregationService, IdentityEvidenceService, RuntimeModelConfigService, IdentityReviewAgentService, RemediationService, KubeIdentityService, ManagementAuthGuard, JudgmentQueueService, DecisionResultApplyService, StreamingQueueService, StreamingFindingService, SupplyChainService, SecurityAssistantService],
+  providers: [ClickHouseStore, AgentAttributionService, RelationalBusinessStore, UserDirectoryService, AgentMetadataService, WorkspaceDirectoryService, AlertingService, AuditService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, DistributedCurrentStateService, SentryJudgeService, AggregationService, IdentityEvidenceService, RuntimeModelConfigService, IdentityReviewAgentService, RemediationService, KubeIdentityService, ManagementAuthGuard, JudgmentQueueService, DecisionResultApplyService, StreamingQueueService, StreamingFindingService, SupplyChainService, SecurityAssistantService, PlatformMetricsService],
 })
 export class SecurityMonitoringModule {}

@@ -70,13 +70,15 @@ function cleanLabels(labels: unknown): Record<string, string> {
 
 @Injectable()
 export class MaintenanceWindowService implements OnModuleInit, OnModuleDestroy {
-  private readonly ch = new ClickHouseStore();
   private readonly windows = new Map<string, MaintenanceWindowRecord>();
   private persistTimer?: NodeJS.Timeout;
   private relationalRefreshTimer?: NodeJS.Timeout;
   private initialized = false;
 
-  constructor(private readonly relational: RelationalBusinessStore) {}
+  constructor(
+    private readonly ch: ClickHouseStore,
+    private readonly relational: RelationalBusinessStore,
+  ) {}
 
   async onModuleInit(): Promise<void> {
     if (await this.ch.init()) {
@@ -99,7 +101,6 @@ export class MaintenanceWindowService implements OnModuleInit, OnModuleDestroy {
     if (this.persistTimer) clearTimeout(this.persistTimer);
     if (this.relationalRefreshTimer) clearInterval(this.relationalRefreshTimer);
     await this.persist();
-    await this.ch.close();
   }
 
   stateStatus() {

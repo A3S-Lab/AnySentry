@@ -122,7 +122,6 @@ export interface ResolvedAgentMetadata {
 
 @Injectable()
 export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
-  private readonly ch = new ClickHouseStore();
   private readonly records = new Map<string, AgentMetadataRecord>();
   private readonly reviewIndex = new Map<string, string | null>();
   private readonly identityIndex = new Map<string, string | null>();
@@ -135,7 +134,10 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
   private initialized = false;
   private reviewVersion = 0;
 
-  constructor(private readonly relational: RelationalBusinessStore) {}
+  constructor(
+    private readonly ch: ClickHouseStore,
+    private readonly relational: RelationalBusinessStore,
+  ) {}
 
   async onModuleInit(): Promise<void> {
     const [clickHouseReady, relationalReady] = await Promise.all([
@@ -176,7 +178,6 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
     if (this.persistTimer) clearTimeout(this.persistTimer);
     if (this.relationalRefreshTimer) clearInterval(this.relationalRefreshTimer);
     await this.persist();
-    await this.ch.close();
   }
 
   private async refreshRelationalRecords(): Promise<void> {

@@ -267,6 +267,28 @@ assert.equal(inventory.items[1].eventCount, 2, 'one Agent asset aggregates event
     false,
     'a claimed Agent label must not promote an unrelated process into a new Agent root',
   );
+  const helper = fallbackAttribution.attribute(
+    {
+      agentId: 'codex',
+      sessionId: 'helper-session',
+      workspacePath: '/home/user/security/AnySentry',
+      attributes: { argv: 'codex --codex-run-as-fs-helper' },
+    },
+    {
+      pid: 998_002,
+      ppid: 1,
+      startTimeTicks: '9980020',
+      comm: 'codex',
+      exe: '/usr/bin/codex',
+      cwd: '/home/user/security/AnySentry',
+    },
+    Date.now(),
+  );
+  assert.equal(
+    helper.monitored,
+    false,
+    'API fallback attribution must not promote a Codex filesystem helper into an Agent root',
+  );
 }
 assert.equal(inventory.items[1].instanceCount, 1);
 
@@ -328,8 +350,47 @@ assert.notEqual(
   'the first reviewed window instance ID must not be copied to later windows',
 );
 
+const internalFsHelper = structuredClone(windowOne);
+internalFsHelper.eventId = 'window-one-fs-helper';
+internalFsHelper.at = windowTwo.at + 500;
+internalFsHelper.sessionId = 'session-fs-helper';
+internalFsHelper.traceId = 'trace-fs-helper';
+internalFsHelper.spanId = 'span-fs-helper';
+internalFsHelper.runId = 'run-fs-helper';
+internalFsHelper.process.pid = 950;
+internalFsHelper.process.ppid = 1;
+internalFsHelper.process.startTimeTicks = '9500';
+internalFsHelper.process.comm = 'codex';
+internalFsHelper.process.exe = '/usr/bin/codex';
+internalFsHelper.attributes.argv = 'codex --codex-run-as-fs-helper';
+internalFsHelper.attribution.rootPid = 950;
+internalFsHelper.attribution.rootStartTime = 'fs-helper-start';
+internalFsHelper.attribution.source = 'manual_review';
+internalFsHelper.attribution.reason = 'human_confirmed';
+internalFsHelper.attribution.classification = 'confirmed_agent';
+internalFsHelper.attribution.evidence = [
+  'process_signature:command',
+  'manual_review:confirmed_agent',
+];
+
+const internalSandbox = structuredClone(internalFsHelper);
+internalSandbox.eventId = 'window-one-sandbox';
+internalSandbox.at += 100;
+internalSandbox.process.pid = 951;
+internalSandbox.process.startTimeTicks = '9510';
+internalSandbox.process.comm = 'tokio-rt-worker';
+internalSandbox.attributes.argv =
+  '/tmp/codex-arg0/codex-linux-sandbox --sandbox-policy-cwd /home/user/code';
+internalSandbox.attribution.rootPid = 951;
+internalSandbox.attribution.rootStartTime = 'sandbox-start';
+
 const multiWindowAggregation = new AggregationService({
-  query: () => [runtimeService.applyReview(windowOne), reviewedWindowTwo],
+  query: () => [
+    runtimeService.applyReview(windowOne),
+    reviewedWindowTwo,
+    internalFsHelper,
+    internalSandbox,
+  ],
   listIncidents: () => [],
   committedEventProgress: () => [],
 }, runtimeService, {}, {});
@@ -344,7 +405,7 @@ const a3sInstances = multiWindowInventory.items.filter((item) =>
 assert.equal(
   a3sInstances.length,
   2,
-  `two a3s code windows are displayed as two runtime instances: ${JSON.stringify(
+  `two a3s code windows are displayed as two runtime instances while the internal helper is hidden: ${JSON.stringify(
     multiWindowInventory.items.map((item) => ({
       agentId: item.agentId,
       displayName: item.displayName,

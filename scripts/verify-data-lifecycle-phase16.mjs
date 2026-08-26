@@ -73,7 +73,7 @@ const [clickhouse, helper, judge, controller, frontendApi, packageJson] = await 
 assert.match(clickhouse, /CREATE TABLE IF NOT EXISTS \$\{DASHBOARD_BUCKET_SNAPSHOT_TABLE\}/);
 assert.match(clickhouse, /ENGINE = MergeTree/);
 assert.match(clickhouse, /factsJson String/);
-assert.match(clickhouse, /tuple\(snapshotCommittedAt, snapshotEventId, snapshotDecisionRevision, snapshotVersion\)/);
+assert.match(clickhouse, /tuple\(snapshotCommittedAt, snapshotCommitBatchId, snapshotEventId, snapshotDecisionRevision, snapshotVersion\)/);
 assert.match(clickhouse, /validPersistedDashboardBuckets/);
 assert.match(clickhouse, /compareEventCommitCursor\(before, after\) === 0/);
 assert.match(clickhouse, /dashboard bucket snapshot write failed/);

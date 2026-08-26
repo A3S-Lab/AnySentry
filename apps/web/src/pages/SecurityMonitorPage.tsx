@@ -8,13 +8,18 @@ import {
   BellRing,
   Bot,
   CalendarClock,
+  ChartLine,
+  ChevronDown,
+  Cpu,
   EyeOff,
   FileCheck2,
   Gauge,
   GitBranch,
+  HardDrive,
   Layers3,
   LayoutDashboard,
   LoaderCircle,
+  MemoryStick,
   Megaphone,
   type LucideIcon,
   Network,
@@ -53,6 +58,7 @@ import {
   type AgentInstanceMetrics,
   type AgentObservability,
   type CollectorHealth,
+  type PlatformMetricsOverview,
   type SecurityDecisionFunnel,
   type SecurityDecisionTier,
   type SecurityExplainabilityScan,
@@ -77,6 +83,7 @@ import type { PolicyStatus } from "@/lib/api/security-center";
 import { settleAll } from "@/lib/settle-all";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
+import { WorkspaceAssetsView } from "@/pages/WorkspacesPage";
 
 type TimelineTierFilter = "all" | AgentEventListItem["tier"];
 
@@ -111,6 +118,8 @@ interface SecurityDashboardData {
 type TimelineScope = "agent" | "raw";
 type DashboardView =
   | "overview"
+  | "agentAssets"
+  | "agentInstances"
   | "risk"
   | "stream"
   | "supplyChain"
@@ -132,6 +141,8 @@ const DASHBOARD_VIEWS: Array<{
   icon: LucideIcon;
 }> = [
   { value: "overview", label: "运行总览", description: "平台健康与实时状态", icon: Activity },
+  { value: "agentAssets", label: "Agent 列表", description: "Agent 清单与运行状态", icon: Bot },
+  { value: "agentInstances", label: "Agent 态势", description: "实例活动与研判健康", icon: Activity },
   { value: "risk", label: "风险态势", description: "风险分类与趋势分布", icon: Siren },
   { value: "stream", label: "复合研判", description: "Flink 连续行为关联", icon: Sparkles },
   { value: "supplyChain", label: "供应链漏洞", description: "OSV 依赖漏洞资产", icon: ShieldAlert },
@@ -256,32 +267,64 @@ function formatRequestError(error: unknown) {
 
 async function loadSecurityDashboardData(
   filter: SecurityTimeFilter,
+  activeView: DashboardView,
   overviewScope: TimelineScope,
   scanScope: TimelineScope,
   riskBreakdownScope: TimelineScope,
   decisionFunnelScope: TimelineScope,
   workspaceRiskScope: TimelineScope,
 ): Promise<SecurityDashboardData> {
+  const empty: SecurityDashboardData = {
+    health: null,
+    scan: null,
+    performance: null,
+    riskSummary: null,
+    riskBreakdown: null,
+    highestRisk: null,
+    decisionFunnel: null,
+    workspaceRisk: null,
+    agentInventory: null,
+    streamFindings: null,
+    supplyChain: null,
+    errors: {},
+  };
   const overviewFilter = { ...filter, scope: overviewScope };
   const scanFilter = { ...filter, scope: scanScope, seriesPoints: 36 };
-  const { data, errors } = await settleAll(
-    {
+
+  if (activeView === "overview") {
+    const { data, errors } = await settleAll({
       health: securityCenterApi.healthCard(overviewFilter),
       scan: securityCenterApi.explainabilityScan(scanFilter),
       performance: securityCenterApi.performanceCard(overviewFilter),
+      decisionFunnel: securityCenterApi.decisionFunnel({ ...filter, scope: decisionFunnelScope }),
+    }, formatRequestError);
+    return enrichSecurityDashboardData({ ...empty, ...data, errors });
+  }
+
+  if (activeView === "risk") {
+    const { data, errors } = await settleAll({
       riskSummary: securityCenterApi.riskSummary(filter),
       riskBreakdown: securityCenterApi.riskBreakdown({ ...filter, scope: riskBreakdownScope }),
-      highestRisk: securityCenterApi.highestRiskSession(filter),
-      decisionFunnel: securityCenterApi.decisionFunnel({ ...filter, scope: decisionFunnelScope }),
-      workspaceRisk: securityCenterApi.workspaceRiskDistribution({ ...filter, scope: workspaceRiskScope }),
-      agentInventory: securityCenterApi.agentInventory({ ...filter, limit: 32 }),
-      streamFindings: securityCenterApi.streamFindings({ ...filter, limit: 30 }),
-      supplyChain: securityCenterApi.supplyChainOverview(500),
-    },
-    formatRequestError,
-  );
+    }, formatRequestError);
+    return enrichSecurityDashboardData({ ...empty, ...data, errors });
+  }
 
-  return enrichSecurityDashboardData({ ...data, errors });
+  if (activeView === "workspace") {
+    const { data, errors } = await settleAll({
+      highestRisk: securityCenterApi.highestRiskSession(filter),
+      workspaceRisk: securityCenterApi.workspaceRiskDistribution({ ...filter, scope: workspaceRiskScope }),
+    }, formatRequestError);
+    return enrichSecurityDashboardData({ ...empty, ...data, errors });
+  }
+
+  if (activeView === "supplyChain") {
+    const { data, errors } = await settleAll({
+      supplyChain: securityCenterApi.supplyChainOverview(500),
+    }, formatRequestError);
+    return enrichSecurityDashboardData({ ...empty, ...data, errors });
+  }
+
+  return empty;
 }
 
 function enrichSecurityDashboardData(data: SecurityDashboardData): SecurityDashboardData {
@@ -500,12 +543,14 @@ function verdictLevel(verdict?: SecurityVerdict): SecurityRiskLevel {
 
 function Panel({
   title,
+  subtitle,
   icon: Icon,
   action,
   children,
   className,
 }: {
   title: string;
+  subtitle?: ReactNode;
   icon: LucideIcon;
   action?: ReactNode;
   children: ReactNode;
@@ -520,6 +565,7 @@ function Panel({
             <Icon className="size-4" />
           </span>
           <h2 className="truncate text-sm font-semibold text-zinc-100">{t(title)}</h2>
+          {subtitle ? <span className="truncate text-[10px] text-zinc-600">{subtitle}</span> : null}
         </div>
         {action ? <div className="shrink-0">{action}</div> : null}
       </div>
@@ -642,10 +688,10 @@ function DashboardViewNavigation({
   const { t } = useI18n();
   const items = DASHBOARD_VIEWS.filter((item) => item.value !== "supplyChain" || supplyChainEnabled);
   const overviewItems = items.filter((item) =>
-    ["overview", "scan", "risk", "stream"].includes(item.value),
+    ["overview", "scan", "risk", "stream", "workspace"].includes(item.value),
   );
   const platformItems = items.filter((item) =>
-    ["events", "workspace"].includes(item.value),
+    item.value === "events",
   );
   const governanceItems = items.filter((item) => item.value === "supplyChain");
   const renderDesktopItem = (item: (typeof items)[number]) => {
@@ -715,7 +761,7 @@ function DashboardViewNavigation({
             <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
               <Bot className="size-3.5" />
             </span>
-            <span className="block text-xs font-semibold leading-[1.45]">{t("智能体资产")}</span>
+            <span className="block text-xs font-semibold leading-[1.45]">{t("Agent 列表")}</span>
           </Link>
           <Link
             to="/workspaces"
@@ -801,7 +847,7 @@ function DashboardViewNavigation({
           className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-[#232a37] bg-[#151a23] px-3 py-2 text-xs text-[#818a9c]"
         >
           <Bot className="size-3.5" />
-          {t("智能体资产")}
+          {t("Agent 列表")}
         </Link>
         <Link
           to="/workspaces"
@@ -1100,6 +1146,307 @@ function TopMetrics({ data, loading }: { data?: SecurityDashboardData; loading?:
   );
 }
 
+function PlatformMiniSparkline({ values, color }: { values: number[]; color: string }) {
+  const points = values.slice(-18);
+  if (points.length < 2) return null;
+  const min = Math.min(...points);
+  const max = Math.max(...points);
+  const range = Math.max(max - min, 1);
+  const width = 44;
+  const height = 18;
+  const padding = 2;
+  const path = points.map((value, index) => {
+    const x = padding + (index / (points.length - 1)) * (width - padding * 2);
+    const y = padding + ((max - value) / range) * (height - padding * 2);
+    return `${index === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      className="h-[18px] w-11 shrink-0 overflow-visible"
+      aria-hidden="true"
+    >
+      <path
+        d={path}
+        fill="none"
+        stroke={color}
+        strokeWidth="1.7"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        style={{ filter: `drop-shadow(0 0 4px ${color})` }}
+      />
+    </svg>
+  );
+}
+
+function PlatformTrendEndLabels({ data }: { data?: PlatformMetricsOverview }) {
+  const labels = [
+    {
+      key: "disk",
+      value: data?.summary.diskPercent,
+      tone: "border-amber-400/30 bg-amber-400/10 text-amber-200",
+    },
+    {
+      key: "cpu",
+      value: data?.summary.cpuPercent,
+      tone: "border-sky-400/30 bg-sky-400/10 text-sky-200",
+    },
+    {
+      key: "memory",
+      value: data?.summary.memoryPercent,
+      tone: "border-teal-400/30 bg-teal-400/10 text-teal-200",
+    },
+  ]
+    .flatMap((item) => typeof item.value === "number"
+      ? [{
+        ...item,
+        value: item.value,
+        top: clamp(8 + (100 - normalizePercent(item.value)) * 0.78, 8, 84),
+      }]
+      : [])
+    .sort((a, b) => a.top - b.top);
+
+  for (let index = 1; index < labels.length; index += 1) {
+    labels[index].top = Math.max(labels[index].top, labels[index - 1].top + 11);
+  }
+  const overflow = labels.length ? Math.max(0, labels[labels.length - 1].top - 84) : 0;
+
+  return (
+    <div className="pointer-events-none absolute inset-0" aria-hidden="true">
+      {labels.map((item) => (
+        <span
+          key={item.key}
+          className={cn(
+            "absolute right-1 -translate-y-1/2 rounded-md border px-2 py-1 font-mono text-[11px] font-semibold tabular-nums shadow-lg backdrop-blur-sm",
+            item.tone,
+          )}
+          style={{ top: `${item.top - overflow}%` }}
+        >
+          {formatPercent(item.value)}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function PlatformResourceSummary({
+  data,
+  loading,
+}: {
+  data?: PlatformMetricsOverview;
+  loading?: boolean;
+}) {
+  const chartTheme = useVChartTheme();
+  const seriesValues = useMemo(
+    () => Object.fromEntries(
+      (data?.series ?? []).map((series) => [
+        series.key,
+        series.points.map((point) => point.value),
+      ]),
+    ) as Record<string, number[]>,
+    [data],
+  );
+  const metrics = [
+    {
+      label: "节点",
+      value: data?.summary.nodeTotal === undefined ? "--" : `${data.summary.nodeReady ?? 0}/${data.summary.nodeTotal}`,
+      icon: Layers3,
+      iconTone: "border-sky-400/15 bg-sky-500/10 text-sky-300",
+      valueTone: "text-zinc-100",
+    },
+    {
+      label: "CPU",
+      value: formatPercent(data?.summary.cpuPercent),
+      icon: Cpu,
+      iconTone: "border-sky-400/15 bg-sky-500/10 text-sky-300",
+      valueTone: "text-zinc-100",
+      sparkline: seriesValues.cpu,
+      color: "#38bdf8",
+    },
+    {
+      label: "内存",
+      value: formatPercent(data?.summary.memoryPercent),
+      icon: MemoryStick,
+      iconTone: "border-teal-400/15 bg-teal-500/10 text-teal-300",
+      valueTone: "text-zinc-100",
+      sparkline: seriesValues.memory,
+      color: "#2dd4bf",
+    },
+    {
+      label: "磁盘",
+      value: formatPercent(data?.summary.diskPercent),
+      icon: HardDrive,
+      iconTone: "border-amber-400/15 bg-amber-500/10 text-amber-300",
+      valueTone: "text-zinc-100",
+      sparkline: seriesValues.disk,
+      color: "#fbbf24",
+    },
+    {
+      label: "API P95",
+      value: data?.summary.apiP95Ms === undefined ? "--" : `${formatNumber(data.summary.apiP95Ms, { maximumFractionDigits: 0 })}ms`,
+      icon: Gauge,
+      iconTone: "border-violet-400/15 bg-violet-500/10 text-violet-300",
+      valueTone: "text-zinc-100",
+      sparkline: seriesValues.api_p95,
+      color: "#8b5cf6",
+    },
+    {
+      label: "组件异常",
+      value: data ? formatNumber(data.summary.componentAnomalies) : "--",
+      icon: AlertTriangle,
+      iconTone: data?.summary.componentAnomalies
+        ? "border-rose-400/20 bg-rose-500/10 text-rose-300"
+        : "border-white/10 bg-white/[0.04] text-zinc-500",
+      valueTone: data?.summary.componentAnomalies ? "text-rose-400" : "text-zinc-100",
+    },
+  ];
+  const resourceTrendData = useMemo(() => {
+    const resourceSeries = data?.series.filter((series) => ["cpu", "memory", "disk"].includes(series.key)) ?? [];
+    const includesDate = data ? Date.parse(data.to) - Date.parse(data.from) > 6 * 60 * 60 * 1000 : false;
+    return resourceSeries.flatMap((series) => series.points.map((point) => ({
+      time: formatSecurityDateTime(point.at, includesDate ? "MM-DD HH:mm" : "HH:mm:ss", "--"),
+      metric: series.label,
+      value: Math.round(point.value * 10) / 10,
+    })));
+  }, [data]);
+  const resourceTrendSpec = useMemo<VChartSpec>(
+    () => ({
+      type: "line",
+      data: [{ id: "platform-resource-trend", values: resourceTrendData }],
+      xField: "time",
+      yField: "value",
+      seriesField: "metric",
+      color: ["#38bdf8", "#2dd4bf", "#fbbf24"],
+      padding: { top: 8, right: 72, bottom: 6, left: 2 },
+      animation: false,
+      tooltip: {
+        visible: true,
+        mark: { title: { value: "time" } },
+      },
+      legends: { visible: false },
+      axes: [
+        {
+          orient: "bottom",
+          tick: { visible: false },
+          domainLine: { visible: false },
+          label: { style: { fill: chartTheme.axisSubLabel, fontSize: 10 } },
+        },
+        {
+          orient: "left",
+          min: 0,
+          max: 100,
+          tick: { visible: false },
+          domainLine: { visible: false },
+          grid: {
+            visible: true,
+            style: { stroke: "#202938", lineWidth: 1, lineDash: [4, 4] },
+          },
+          label: {
+            formatMethod: (value: string | number) => `${value}%`,
+            style: { fill: chartTheme.axisSubLabel, fontSize: 10 },
+          },
+        },
+      ],
+      line: { style: { lineWidth: 2 } },
+      point: { visible: false },
+    }),
+    [chartTheme, resourceTrendData],
+  );
+  return (
+    <Panel
+      title="平台资源"
+      subtitle={data?.source === "prometheus" ? "Prometheus 实时指标" : "运行时局部指标"}
+      icon={ServerCog}
+      action={(
+        <Link to="/platform" className="text-[11px] font-medium text-teal-300 hover:text-teal-200">
+          查看平台监控 →
+        </Link>
+      )}
+      className="w-full min-w-0 max-w-full overflow-hidden shadow-[0_0_28px_rgba(56,189,248,0.025)]"
+    >
+      <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6">
+        {metrics.map((metric) => {
+          const Icon = metric.icon;
+          return (
+            <div
+              key={metric.label}
+              className="flex min-h-[88px] min-w-0 items-center gap-2.5 border-r border-[#232a37] px-3 py-3 last:border-r-0"
+            >
+              <span className={cn(
+                "inline-flex size-8 shrink-0 items-center justify-center rounded-md border",
+                metric.iconTone,
+              )}>
+                <Icon className="size-4" aria-hidden="true" />
+              </span>
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-[11px] font-medium text-zinc-500">{metric.label}</p>
+                <div className="mt-1 flex min-w-0 items-end justify-between gap-2">
+                  <p className={cn(
+                    "truncate font-mono text-lg font-semibold tabular-nums",
+                    metric.valueTone,
+                  )}>
+                    {loading && !data ? <span className="text-zinc-700">···</span> : metric.value}
+                  </p>
+                  {metric.sparkline?.length ? (
+                    <PlatformMiniSparkline values={metric.sparkline} color={metric.color ?? "#38bdf8"} />
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div className="border-t border-[#232a37] px-4 pb-3 pt-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <ChartLine className="size-4 text-sky-300" aria-hidden="true" />
+            <p className="text-xs font-semibold text-zinc-200">资源趋势</p>
+          </div>
+          <div className="flex items-center gap-4 text-[11px] text-zinc-400" aria-label="资源趋势图例">
+            {[
+              ["CPU", "bg-sky-400"],
+              ["内存", "bg-teal-400"],
+              ["磁盘", "bg-amber-400"],
+            ].map(([label, tone]) => (
+              <span key={label} className="inline-flex items-center gap-1.5">
+                <span className={cn("size-2 rounded-full", tone)} />
+                {label}
+              </span>
+            ))}
+            <span className="inline-flex items-center gap-1 text-zinc-500">
+              · 当前时间范围
+              <ChevronDown className="size-3" aria-hidden="true" />
+            </span>
+          </div>
+        </div>
+        <div
+          className="relative mt-2 h-[220px] min-h-0 w-full max-w-full overflow-hidden"
+          aria-label="平台 CPU、内存与磁盘使用率趋势"
+        >
+          {loading && !data ? (
+            <div className="flex h-full items-center justify-center text-[11px] text-zinc-600">
+              <LoaderCircle className="mr-2 size-3.5 animate-spin" />
+              加载平台资源趋势
+            </div>
+          ) : resourceTrendData.length > 3 ? (
+            <>
+              <VChartView spec={resourceTrendSpec} />
+              <PlatformTrendEndLabels data={data} />
+            </>
+          ) : (
+            <div className="flex h-full items-center justify-center text-[11px] text-zinc-600">
+              时间序列尚未就绪
+            </div>
+          )}
+        </div>
+      </div>
+      {data?.message ? (
+        <p className="border-t border-[#232a37] px-3 py-1.5 text-[10px] text-amber-200/70">{data.message}</p>
+      ) : null}
+    </Panel>
+  );
+}
+
 function LiveObservabilityPanel({
   observability,
   connected,
@@ -1124,7 +1471,7 @@ function LiveObservabilityPanel({
     {
       label: "错误率",
       value: formatPercent(observability?.health.errorRate),
-      sub: `${locale === "en" ? "Resource utilization" : "资源利用"} ${formatPercent(observability?.health.resourceUtil)}`,
+      sub: `${locale === "en" ? "Event activity" : "事件活跃度"} ${formatPercent(observability?.health.resourceUtil)}`,
       icon: AlertTriangle,
       tone: observability && observability.health.errorRate > 10 ? "medium" : "safe",
     },
@@ -1152,7 +1499,12 @@ function LiveObservabilityPanel({
   ];
 
   return (
-    <Panel title="实时智能体可观测性" icon={RadioTower} action={<StatusPill level={connected ? "safe" : "unknown"} label={statusLabel} />}>
+    <Panel
+      title="实时智能体可观测性"
+      icon={RadioTower}
+      action={<StatusPill level={connected ? "safe" : "unknown"} label={statusLabel} />}
+      className="w-full min-w-0 max-w-full"
+    >
       <div className="grid gap-3 p-4 md:grid-cols-2 xl:grid-cols-5">
         {items.map((item) => {
           const tone = riskTone(item.tone);
@@ -1968,6 +2320,23 @@ function AgentOverviewCard({ agent, filter }: { agent: AgentInventoryItem; filte
   );
 }
 
+function agentInstanceEventsHref(agent: AgentInventoryItem, filter: SecurityTimeFilter) {
+  const query = new URLSearchParams({
+    timeType: filter.timeType ?? "last_3h",
+    agentAssetId: agent.agentAssetId,
+  });
+  if (agent.agentInstanceId) query.set("agentInstanceId", agent.agentInstanceId);
+  if (filter.startTime) query.set("startTime", filter.startTime);
+  if (filter.endTime) query.set("endTime", filter.endTime);
+  return `/events?${query.toString()}`;
+}
+
+function agentRuntimeSelectionKey(agent: AgentInventoryItem): string {
+  return `${agent.agentAssetId}\0${agent.agentInstanceId ?? "metadata"}`;
+}
+
+type AgentInstanceView = "cards" | "trends";
+
 interface AgentMetricSeries {
   label: string;
   color: string;
@@ -2046,38 +2415,164 @@ function AgentInstanceLineChart({
         <h4 className="text-xs font-semibold text-zinc-200">{t(title)}</h4>
         <p className="mt-0.5 text-[10px] text-zinc-600">{t(subtitle)}</p>
       </div>
-      <div className="h-[220px] min-h-0 px-2 pb-2 pt-1">
+      <div
+        className="h-[220px] min-h-0 px-2 pb-2 pt-1"
+        aria-label={`${t(title)}：${t(subtitle)}`}
+      >
         {chartData.length > 0 ? <VChartView spec={spec} /> : <EmptyState label="暂无实例时间序列" />}
       </div>
     </div>
   );
 }
 
-function agentInstanceEventsHref(agent: AgentInventoryItem, filter: SecurityTimeFilter) {
-  const query = new URLSearchParams({
-    timeType: filter.timeType ?? "last_3h",
-    agentAssetId: agent.agentAssetId,
-  });
-  if (agent.agentInstanceId) query.set("agentInstanceId", agent.agentInstanceId);
-  if (filter.startTime) query.set("startTime", filter.startTime);
-  if (filter.endTime) query.set("endTime", filter.endTime);
-  return `/events?${query.toString()}`;
+const AGENT_INSTANCE_BEHAVIOR: Array<{
+  key: AgentEventCategory;
+  label: string;
+  color: string;
+}> = [
+  { key: "tool", label: "工具", color: "bg-teal-300" },
+  { key: "file", label: "文件", color: "bg-sky-300" },
+  { key: "network", label: "网络", color: "bg-orange-300" },
+  { key: "process", label: "进程", color: "bg-violet-300" },
+  { key: "llm", label: "LLM", color: "bg-pink-300" },
+];
+
+function agentInstanceLifecycleLabel(agent: AgentInventoryItem): string {
+  if (agent.lifecycleState === "current") return "当前窗口";
+  if (agent.lifecycleState === "terminated") return "已结束";
+  return "历史窗口";
 }
 
-function agentRuntimeSelectionKey(agent: AgentInventoryItem): string {
-  return `${agent.agentAssetId}\0${agent.agentInstanceId ?? "metadata"}`;
+function AgentInstanceOverviewCard({
+  agent,
+  filter,
+}: {
+  agent: AgentInventoryItem;
+  filter: SecurityTimeFilter;
+}) {
+  const { t } = useI18n();
+  const tone = riskTone(agent.riskLevel);
+  const behaviorTotal = AGENT_INSTANCE_BEHAVIOR.reduce(
+    (total, item) => total + (agent.eventCategoryCounts[item.key] ?? 0),
+    0,
+  );
+
+  return (
+    <article
+      className={cn(
+        "min-w-0 overflow-hidden rounded-lg border bg-white/[0.025]",
+        tone.border,
+      )}
+      style={{ contentVisibility: "auto", containIntrinsicSize: "300px" }}
+    >
+      <div className="flex items-start justify-between gap-3 border-b border-white/[0.07] px-3.5 py-3">
+        <AgentAssetIdentityInline agent={agent} showClassification className="min-w-0" />
+        <div className="flex shrink-0 flex-col items-end gap-1.5">
+          <StatusPill level={agent.riskLevel} label={agent.riskLevelText} />
+          <span className={cn(
+            "rounded border px-1.5 py-0.5 text-[9px] font-medium",
+            agent.lifecycleState === "current"
+              ? "border-teal-400/25 bg-teal-400/10 text-teal-200"
+              : agent.lifecycleState === "terminated"
+                ? "border-zinc-500/25 bg-zinc-500/10 text-zinc-400"
+                : "border-amber-400/25 bg-amber-400/10 text-amber-200",
+          )}>
+            {t(agentInstanceLifecycleLabel(agent))}
+          </span>
+        </div>
+      </div>
+
+      <div className="space-y-3 p-3.5">
+        <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-[10px]">
+          <div className="min-w-0">
+            <p className="text-zinc-600">{t("窗口实例")}</p>
+            <p className="mt-0.5 truncate font-mono text-zinc-400" title={agent.agentInstanceId || agent.agentAssetId}>
+              {agent.agentInstanceId || "metadata-only"}
+            </p>
+          </div>
+          <div>
+            <p className="text-zinc-600">{t("Root PID")}</p>
+            <p className="mt-0.5 font-mono text-zinc-400">{agent.rootPid ?? "--"}</p>
+          </div>
+          <div className="min-w-0">
+            <p className="text-zinc-600">{t("首次观测")}</p>
+            <p className="mt-0.5 truncate font-mono text-zinc-400">{formatDate(agent.firstSeen)}</p>
+          </div>
+          <div className="min-w-0">
+            <p className="text-zinc-600">{t("最近活动")}</p>
+            <p className="mt-0.5 truncate font-mono text-zinc-400">{formatDate(agent.lastSeen)}</p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-4 gap-1.5">
+          {[
+            { label: "事件", value: formatCompactNumber(agent.eventCount), tone: "text-zinc-100" },
+            { label: "风险", value: formatCompactNumber(agent.riskyEventCount), tone: "text-rose-200" },
+            { label: "延迟", value: `${formatNumber(agent.avgLatencyMs)}ms`, tone: "text-sky-200" },
+            { label: "Token", value: formatCompactNumber(agent.tokenCount), tone: "text-amber-200" },
+          ].map((item) => (
+            <div key={item.label} className="min-w-0 rounded-md border border-white/[0.07] bg-black/15 px-2 py-2">
+              <p className="truncate text-[9px] text-zinc-600">{t(item.label)}</p>
+              <p className={cn("mt-0.5 truncate text-sm font-semibold tabular-nums", item.tone)}>{item.value}</p>
+            </div>
+          ))}
+        </div>
+
+        <div className="rounded-md border border-white/[0.07] bg-black/15 p-2.5">
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <p className="text-[10px] font-medium text-zinc-400">{t("行为构成")}</p>
+            <p className="text-[9px] text-zinc-600">
+              {t("会话")} {formatNumber(agent.sessionCount)} · Trace {formatNumber(agent.traceCount)}
+            </p>
+          </div>
+          <div className="grid grid-cols-5 gap-1.5">
+            {AGENT_INSTANCE_BEHAVIOR.map((item) => {
+              const value = agent.eventCategoryCounts[item.key] ?? 0;
+              const width = behaviorTotal > 0 ? Math.max(value > 0 ? 5 : 0, (value / behaviorTotal) * 100) : 0;
+              return (
+                <div key={item.key} className="min-w-0">
+                  <div className="mb-1 flex items-center justify-between gap-1 text-[9px]">
+                    <span className="truncate text-zinc-600">{t(item.label)}</span>
+                    <span className="tabular-nums text-zinc-400">{formatCompactNumber(value)}</span>
+                  </div>
+                  <div className="h-1 overflow-hidden rounded-full bg-white/[0.06]">
+                    <div className={cn("h-full rounded-full", item.color)} style={{ width: `${width}%` }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="flex items-center justify-between gap-3 border-t border-white/[0.07] pt-3">
+          <p className="min-w-0 truncate text-[10px] text-zinc-600" title={agent.lastEventSubject || ""}>
+            {agent.lastEventSubject || t("暂无活动摘要")}
+          </p>
+          <Link
+            to={agentInstanceEventsHref(agent, filter)}
+            className="shrink-0 text-[10px] font-medium text-teal-300 hover:text-teal-200"
+          >
+            {t("查看窗口事件")} →
+          </Link>
+        </div>
+      </div>
+    </article>
+  );
 }
 
 function AgentInstanceTrendsPanel({
   inventory,
   inventoryError,
+  inventoryLoading,
   filter,
 }: {
   inventory?: AgentInventory | null;
   inventoryError?: string;
+  inventoryLoading?: boolean;
   filter: SecurityTimeFilter;
 }) {
   const { locale, t } = useI18n();
+  const [view, setView] = useState<AgentInstanceView>("cards");
   const agents = useMemo(
     () => (inventory?.items ?? [])
       .filter((agent) => agent.classification !== "non_agent")
@@ -2101,7 +2596,7 @@ function AgentInstanceTrendsPanel({
   }, [agents, selectedAgentKey]);
 
   const selectedAgent = agents.find((agent) => agentRuntimeSelectionKey(agent) === selectedAgentKey) ?? agents[0];
-  const { data: metrics, loading, error } = useRequest<AgentInstanceMetrics, []>(
+  const { data: metrics, loading: metricsLoading, error: metricsError } = useRequest<AgentInstanceMetrics, []>(
     () => securityCenterApi.agentInstanceMetrics({
       ...filter,
       scope: "agent",
@@ -2110,13 +2605,15 @@ function AgentInstanceTrendsPanel({
       seriesPoints: 36,
     }),
     {
-      ready: Boolean(selectedAgent?.agentAssetId),
+      ready: view === "trends" && Boolean(selectedAgent?.agentAssetId),
       refreshDeps: [
+        view,
         selectedAgent?.agentAssetId,
         selectedAgent?.agentInstanceId,
         filter.timeType,
         filter.startTime,
         filter.endTime,
+        filter.snapshotAsOf,
       ],
       pollingInterval: 15000,
       pollingWhenHidden: false,
@@ -2141,98 +2638,194 @@ function AgentInstanceTrendsPanel({
     { label: "异常", color: "#fb7185", value: (point) => point.failedCount + point.timeoutCount },
   ], []);
 
+  const currentCount = agents.filter((agent) => agent.lifecycleState === "current").length;
+  const riskyCount = agents.filter((agent) => agent.riskyEventCount > 0).length;
+  const eventCount = agents.reduce((total, agent) => total + agent.eventCount, 0);
+  const weightedLatency = eventCount > 0
+    ? Math.round(agents.reduce((total, agent) => total + agent.avgLatencyMs * agent.eventCount, 0) / eventCount)
+    : 0;
+
   return (
     <Panel
-      title="Agent 实例态势"
+      title="Agent 态势"
       icon={Bot}
-      action={selectedAgent ? (
-        <Link
-          to={agentInstanceEventsHref(selectedAgent, filter)}
-          className="text-xs font-medium text-teal-300 hover:text-teal-200"
-        >
-          {t("查看实例事件")} →
-        </Link>
-      ) : undefined}
+      action={(
+        <div className="flex items-center gap-2">
+          <span className="hidden text-[10px] text-zinc-500 sm:inline">
+            {t("每个运行窗口独立展示")} · {formatNumber(inventory?.total ?? agents.length)}
+          </span>
+          <div
+            role="group"
+            aria-label={t("Agent 态势视图")}
+            className="inline-flex rounded-md border border-white/10 bg-black/20 p-0.5"
+          >
+            {([
+              { value: "cards", label: "卡片", icon: LayoutDashboard },
+              { value: "trends", label: "趋势", icon: BarChart3 },
+            ] as const).map((item) => {
+              const Icon = item.icon;
+              const selected = view === item.value;
+              return (
+                <button
+                  key={item.value}
+                  type="button"
+                  aria-pressed={selected}
+                  onClick={() => setView(item.value)}
+                  className={cn(
+                    "inline-flex h-7 items-center gap-1.5 rounded px-2 text-[10px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300/60",
+                    selected
+                      ? "bg-teal-400/15 text-teal-200"
+                      : "text-zinc-500 hover:bg-white/[0.05] hover:text-zinc-300",
+                  )}
+                >
+                  <Icon className="size-3" aria-hidden="true" />
+                  {t(item.label)}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
     >
       <div className="space-y-4 p-4">
-        <InlineError message={inventoryError || (error ? formatRequestError(error) : undefined)} />
-        {agents.length === 0 ? (
+        <InlineError
+          message={inventoryError || (view === "trends" && metricsError
+            ? formatRequestError(metricsError)
+            : undefined)}
+        />
+        {inventoryLoading && !inventory ? (
+          <div className="flex min-h-32 items-center justify-center gap-2 text-xs text-zinc-500">
+            <LoaderCircle className="size-4 animate-spin" />
+            {t("正在加载 Agent 运行窗口…")}
+          </div>
+        ) : agents.length === 0 ? (
           <EmptyState label="暂无 Agent 实例数据" />
         ) : (
           <>
-            <div className="grid gap-3 lg:grid-cols-[minmax(260px,1.2fr)_repeat(4,minmax(118px,0.65fr))]">
-              <div className="rounded-lg border border-[#232a37] bg-black/10 p-3">
-                <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-zinc-600">
-                  {t("选择 Agent 实例")}
-                </p>
-                <Select value={selectedAgent ? agentRuntimeSelectionKey(selectedAgent) : ""} onValueChange={setSelectedAgentKey}>
-                  <SelectTrigger className="h-auto min-h-10 border-white/10 bg-[#151a23] py-2 text-left">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {agents.map((agent) => (
-                      <SelectItem key={agentRuntimeSelectionKey(agent)} value={agentRuntimeSelectionKey(agent)}>
-                        {(agent.displayName || agent.agentId)} · {agent.locationLabel || agent.workspacePath || agent.agentAssetId.slice(0, 12)}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                {selectedAgent && (
-                  <div className="mt-3">
-                    <AgentAssetIdentityInline agent={selectedAgent} showClassification className="min-w-0" />
-                  </div>
-                )}
-              </div>
+            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
               {[
-                { label: "总事件", value: metrics?.eventCount, tone: "text-zinc-50" },
-                { label: "风险事件", value: metrics?.riskyEventCount, tone: "text-rose-200" },
-                { label: "平均延迟", value: metrics ? `${formatNumber(metrics.avgLatencyMs)}ms` : "--", tone: "text-sky-200", raw: true },
-                { label: "Token", value: metrics?.tokenCount, tone: "text-amber-200" },
+                { label: "运行窗口", value: agents.length, detail: "每个终端 / Agent 进程独立" },
+                { label: "当前活跃", value: currentCount, detail: "仍在当前生命周期内" },
+                { label: "存在风险", value: riskyCount, detail: "窗口内包含风险事件" },
+                { label: "事件 / 平均延迟", value: formatCompactNumber(eventCount), detail: `${formatNumber(weightedLatency)}ms` },
               ].map((item) => (
-                <div key={item.label} className="rounded-lg border border-[#232a37] bg-black/10 p-3">
+                <div key={item.label} className="rounded-md border border-white/10 bg-white/[0.025] px-3 py-2.5">
                   <p className="text-[10px] text-zinc-600">{t(item.label)}</p>
-                  <p className={cn("mt-2 text-2xl font-semibold tabular-nums", item.tone)}>
-                    {loading ? "…" : item.raw ? item.value : formatCompactNumber(item.value as number | undefined)}
-                  </p>
+                  <p className="mt-1 text-lg font-semibold tabular-nums text-zinc-100">{item.value}</p>
+                  <p className="mt-0.5 text-[10px] text-zinc-600">{t(item.detail)}</p>
                 </div>
               ))}
             </div>
-            <div className="flex flex-wrap items-center gap-2 text-[10px] text-zinc-500">
-              <span className="rounded border border-white/10 bg-white/[0.03] px-2 py-1">
-                {t("阻断")} {formatNumber(metrics?.blockedCount)}
-              </span>
-              <span className="rounded border border-white/10 bg-white/[0.03] px-2 py-1">
-                {t("升级")} {formatNumber(metrics?.escalatedCount)}
-              </span>
-              <span className="rounded border border-white/10 bg-white/[0.03] px-2 py-1">
-                {t("异常")} {formatNumber((metrics?.failedCount ?? 0) + (metrics?.timeoutCount ?? 0))}
-              </span>
-              {metrics?.updateTime && (
-                <span className="ml-auto">
-                  {locale === "en" ? "Updated" : "更新"} {formatDate(metrics.updateTime)}
-                </span>
-              )}
-            </div>
-            <div className="grid gap-4 xl:grid-cols-3">
-              <AgentInstanceLineChart
-                title="活动与风险"
-                subtitle="实例事件量与风险事件变化"
-                points={metrics?.points ?? []}
-                series={activitySeries}
-              />
-              <AgentInstanceLineChart
-                title="行为构成"
-                subtitle="工具、文件、网络、进程与 LLM 活动"
-                points={metrics?.points ?? []}
-                series={behaviorSeries}
-              />
-              <AgentInstanceLineChart
-                title="研判链路"
-                subtitle="L1、L2、L3 与异常结果"
-                points={metrics?.points ?? []}
-                series={judgmentSeries}
-              />
-            </div>
+            {view === "cards" ? (
+              <div className="grid gap-3 xl:grid-cols-2 2xl:grid-cols-3">
+                {agents.map((agent) => (
+                  <AgentInstanceOverviewCard
+                    key={agentRuntimeSelectionKey(agent)}
+                    agent={agent}
+                    filter={filter}
+                  />
+                ))}
+              </div>
+            ) : (
+              <>
+                <div className="grid gap-3 lg:grid-cols-[minmax(260px,1.2fr)_repeat(4,minmax(118px,0.65fr))]">
+                  <div className="rounded-lg border border-[#232a37] bg-black/10 p-3">
+                    <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-zinc-600">
+                      {t("选择 Agent 实例")}
+                    </p>
+                    <Select
+                      value={selectedAgent ? agentRuntimeSelectionKey(selectedAgent) : ""}
+                      onValueChange={setSelectedAgentKey}
+                    >
+                      <SelectTrigger className="h-auto min-h-10 border-white/10 bg-[#151a23] py-2 text-left">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {agents.map((agent) => (
+                          <SelectItem
+                            key={agentRuntimeSelectionKey(agent)}
+                            value={agentRuntimeSelectionKey(agent)}
+                          >
+                            {(agent.displayName || agent.agentId)} · {agent.locationLabel || agent.workspacePath || agent.agentAssetId.slice(0, 12)}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    {selectedAgent && (
+                      <div className="mt-3">
+                        <AgentAssetIdentityInline agent={selectedAgent} showClassification className="min-w-0" />
+                      </div>
+                    )}
+                  </div>
+                  {[
+                    { label: "总事件", value: metrics?.eventCount, tone: "text-zinc-50" },
+                    { label: "风险事件", value: metrics?.riskyEventCount, tone: "text-rose-200" },
+                    {
+                      label: "平均延迟",
+                      value: metrics ? `${formatNumber(metrics.avgLatencyMs)}ms` : "--",
+                      tone: "text-sky-200",
+                      raw: true,
+                    },
+                    { label: "Token", value: metrics?.tokenCount, tone: "text-amber-200" },
+                  ].map((item) => (
+                    <div key={item.label} className="rounded-lg border border-[#232a37] bg-black/10 p-3">
+                      <p className="text-[10px] text-zinc-600">{t(item.label)}</p>
+                      <p className={cn("mt-2 text-2xl font-semibold tabular-nums", item.tone)}>
+                        {metricsLoading
+                          ? "…"
+                          : item.raw
+                            ? item.value
+                            : formatCompactNumber(item.value as number | undefined)}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex flex-wrap items-center gap-2 text-[10px] text-zinc-500">
+                  <span className="rounded border border-white/10 bg-white/[0.03] px-2 py-1">
+                    {t("阻断")} {formatNumber(metrics?.blockedCount)}
+                  </span>
+                  <span className="rounded border border-white/10 bg-white/[0.03] px-2 py-1">
+                    {t("升级")} {formatNumber(metrics?.escalatedCount)}
+                  </span>
+                  <span className="rounded border border-white/10 bg-white/[0.03] px-2 py-1">
+                    {t("异常")} {formatNumber((metrics?.failedCount ?? 0) + (metrics?.timeoutCount ?? 0))}
+                  </span>
+                  {selectedAgent && (
+                    <Link
+                      to={agentInstanceEventsHref(selectedAgent, filter)}
+                      className="font-medium text-teal-300 hover:text-teal-200 sm:ml-auto"
+                    >
+                      {t("查看窗口事件")} →
+                    </Link>
+                  )}
+                  {metrics?.updateTime && (
+                    <span className={cn(selectedAgent ? "" : "sm:ml-auto")}>
+                      {locale === "en" ? "Updated" : "更新"} {formatDate(metrics.updateTime)}
+                    </span>
+                  )}
+                </div>
+                <div className="grid gap-4 xl:grid-cols-3">
+                  <AgentInstanceLineChart
+                    title="活动与风险"
+                    subtitle="实例事件量与风险事件变化"
+                    points={metrics?.points ?? []}
+                    series={activitySeries}
+                  />
+                  <AgentInstanceLineChart
+                    title="行为构成"
+                    subtitle="工具、文件、网络、进程与 LLM 活动"
+                    points={metrics?.points ?? []}
+                    series={behaviorSeries}
+                  />
+                  <AgentInstanceLineChart
+                    title="研判链路"
+                    subtitle="L1、L2、L3 与异常结果"
+                    points={metrics?.points ?? []}
+                    series={judgmentSeries}
+                  />
+                </div>
+              </>
+            )}
           </>
         )}
       </div>
@@ -2251,7 +2844,11 @@ function streamWorkspaceName(path: string): string {
 }
 
 function streamProfileKey(profile: StreamFindingList["riskProfiles"][number]): string {
-  return [profile.environmentId, profile.agentType, streamWorkspacePath(profile.workspacePath) || "unassigned"].join(":");
+  return [
+    profile.tenantId,
+    profile.environmentId,
+    profile.agentInstanceId || `legacy:${profile.agentCorrelationId}`,
+  ].join(":");
 }
 
 function streamFeatureValue(features: Record<string, number>, key: string): number {
@@ -2347,13 +2944,17 @@ function AgentRiskOverviewPanel({
   findings,
   inventoryError,
   findingsError,
+  inventoryLoading = false,
   filter,
+  assetsOnly = false,
 }: {
   inventory?: AgentInventory | null;
   findings?: StreamFindingList | null;
   inventoryError?: string;
   findingsError?: string;
+  inventoryLoading?: boolean;
   filter: SecurityTimeFilter;
+  assetsOnly?: boolean;
 }) {
   const { locale, t } = useI18n();
   const [view, setView] = useState<AgentRiskView>("assets");
@@ -2371,6 +2972,11 @@ function AgentRiskOverviewPanel({
       || securityTimestampValue(b.lastSeen) - securityTimestampValue(a.lastSeen)), [inventory?.items]);
   const visibleAgentAssets = agentAssets.slice(0, visibleAgentCount);
   const agentAssetTotal = inventory?.summary.totalAgents ?? agentAssets.length;
+  const agentInstancesById = useMemo(() => new Map(
+    agentAssets
+      .filter((agent) => Boolean(agent.agentInstanceId))
+      .map((agent) => [agent.agentInstanceId as string, agent]),
+  ), [agentAssets]);
   const profileViews = useMemo(() => {
     const groups = new Map<string, StreamFindingList["riskProfiles"]>();
     for (const profile of findings?.riskProfiles ?? []) {
@@ -2432,8 +3038,8 @@ function AgentRiskOverviewPanel({
 
   return (
     <Panel
-      title="智能体风险概览"
-      icon={Sparkles}
+      title={assetsOnly ? "Agent 列表" : "智能体风险概览"}
+      icon={assetsOnly ? Bot : Sparkles}
       action={
         <Link to={allAgentsHref(filter)} className="text-xs text-teal-300 transition hover:text-teal-200">
           {t("查看全部智能体")} →
@@ -2443,28 +3049,30 @@ function AgentRiskOverviewPanel({
       <div className="space-y-4 p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <p className="text-xs text-zinc-500">{t("集中查看智能体身份、运行状态与近期关联风险")}</p>
-          <div className="inline-flex rounded-md border border-white/10 bg-black/20 p-1" aria-label="智能体风险概览视角">
-            {([
-              { key: "assets" as const, label: t("智能体资产"), count: agentAssetTotal },
-              { key: "window" as const, label: t("时间窗分析"), count: profileViews.length },
-            ]).map((item) => (
-              <button
-                key={item.key}
-                type="button"
-                onClick={() => setView(item.key)}
-                aria-pressed={view === item.key}
-                className={cn(
-                  "rounded px-3 py-1.5 text-xs transition",
-                  view === item.key ? "bg-teal-300/15 text-teal-100 shadow-sm" : "text-zinc-500 hover:text-zinc-300",
-                )}
-              >
-                {item.label} · {item.count}
-              </button>
-            ))}
-          </div>
+          {!assetsOnly && (
+            <div className="inline-flex rounded-md border border-white/10 bg-black/20 p-1" aria-label="智能体风险概览视角">
+              {([
+                { key: "assets" as const, label: t("Agent 列表"), count: agentAssetTotal },
+                { key: "window" as const, label: t("Flink 风险画像"), count: profileViews.length },
+              ]).map((item) => (
+                <button
+                  key={item.key}
+                  type="button"
+                  onClick={() => setView(item.key)}
+                  aria-pressed={view === item.key}
+                  className={cn(
+                    "rounded px-3 py-1.5 text-xs transition",
+                    view === item.key ? "bg-teal-300/15 text-teal-100 shadow-sm" : "text-zinc-500 hover:text-zinc-300",
+                  )}
+                >
+                  {item.label} · {item.count}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
 
-        {view === "assets" ? (
+        {assetsOnly || view === "assets" ? (
           <div className="space-y-4">
             <InlineError message={inventoryError} />
             <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
@@ -2476,13 +3084,20 @@ function AgentRiskOverviewPanel({
               ].map((item) => (
                 <div key={item.label} className="rounded-md border border-white/10 bg-white/[0.025] px-3 py-2.5">
                   <p className="text-[11px] text-zinc-500">{item.label}</p>
-                  <p className="mt-1 text-lg font-semibold tabular-nums text-zinc-100">{formatNumber(item.value)}</p>
+                  <p className="mt-1 text-lg font-semibold tabular-nums text-zinc-100">
+                    {inventoryLoading && !inventory ? "--" : formatNumber(item.value)}
+                  </p>
                   <p className="mt-0.5 text-[10px] text-zinc-600">{item.detail}</p>
                 </div>
               ))}
             </div>
 
-            {agentAssets.length === 0 ? (
+            {inventoryLoading && !inventory ? (
+              <div className="flex min-h-28 items-center justify-center gap-2 text-xs text-zinc-500">
+                <LoaderCircle className="size-4 animate-spin" />
+                正在加载精确 Agent 统计…
+              </div>
+            ) : agentAssets.length === 0 ? (
               <EmptyState label="暂无已确认或候选智能体" />
             ) : (
               <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-4">
@@ -2505,7 +3120,7 @@ function AgentRiskOverviewPanel({
                 </Button>
               )}
               <Link to={allAgentsHref(filter)} className="text-xs text-teal-300 hover:text-teal-200">
-                进入智能体资产 →
+                进入 Agent 列表 →
               </Link>
             </div>
           </div>
@@ -2521,8 +3136,8 @@ function AgentRiskOverviewPanel({
               <>
             <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
               {[
-                { label: "Agent 资产", value: profileViews.length, detail: "按 Agent + Workspace 聚合" },
-                { label: "风险资产", value: riskyProfiles.length, detail: locale === "en" ? `${safeProfiles.length} safe assets hidden` : `${safeProfiles.length} 个安全资产已折叠` },
+                { label: "Flink 风险画像实体", value: profileViews.length, detail: "每个 Agent 运行实例独立画像" },
+                { label: "风险画像", value: riskyProfiles.length, detail: locale === "en" ? `${safeProfiles.length} safe profiles hidden` : `${safeProfiles.length} 个安全画像已折叠` },
                 { label: "高风险攻击链", value: blockedEpisodes.length, detail: locale === "en" ? `${pendingEpisodes.length} pending / ${failedEpisodes.length} abnormal` : `${pendingEpisodes.length} 待研判 / ${failedEpisodes.length} 异常` },
                 { label: "最新计算", value: latestCalculatedAt ? dayjs(latestCalculatedAt).format("HH:mm:ss") : "--", detail: latestCalculatedAt ? dayjs(latestCalculatedAt).format("MM-DD") : "暂无结果" },
               ].map((item) => (
@@ -2554,8 +3169,8 @@ function AgentRiskOverviewPanel({
               <div className="space-y-3">
                 <div className="flex items-center justify-between gap-3">
                   <div>
-                    <p className="text-sm font-semibold text-zinc-100">{t("Agent 风险资产")}</p>
-                    <p className="mt-0.5 text-xs text-zinc-500">{t("同名 Agent 通过 Workspace 和环境区分，分数展示可解释贡献")}</p>
+                    <p className="text-sm font-semibold text-zinc-100">{t("Flink Agent 实例风险画像")}</p>
+                    <p className="mt-0.5 text-xs text-zinc-500">{t("每个运行窗口按稳定实例 ID 独立画像；同名、同 Workspace 不合并")}</p>
                   </div>
                   {safeProfiles.length > 0 && (
                     <button type="button" onClick={() => setShowSafe((value) => !value)} className="text-xs text-teal-300 hover:text-teal-200">
@@ -2569,24 +3184,32 @@ function AgentRiskOverviewPanel({
                   <div className="grid gap-3 xl:grid-cols-2">
                     {visibleProfiles.map(({ profile, previousScore }) => {
                       const workspacePath = streamWorkspacePath(profile.workspacePath);
+                      const agentInstance = agentInstancesById.get(profile.agentInstanceId);
                       const contributions = streamScoreContributions(profile);
                       const score = Math.max(0, profile.riskScore);
                       const delta = previousScore === undefined ? undefined : score - Math.max(0, previousScore);
                       const tone = riskTone(profile.riskLevel);
                       const query = new URLSearchParams({ agentId: profile.agentType });
                       if (workspacePath) query.set("workspacePath", workspacePath);
+                      if (profile.agentInstanceId) query.set("agentInstanceId", profile.agentInstanceId);
                       return (
                         <div key={streamProfileKey(profile)} className={cn("rounded-lg border bg-white/[0.025] p-4", tone.border)}>
                           <div className="flex items-start justify-between gap-4">
                             <div className="min-w-0">
                               <div className="flex items-center gap-2">
                                 <Bot className="size-4 text-teal-300" />
-                                <p className="truncate text-sm font-semibold text-zinc-100">{profile.agentType} · {t(streamWorkspaceName(workspacePath))}</p>
+                                <p className="truncate text-sm font-semibold text-zinc-100">
+                                  {agentInstance?.displayName || profile.agentType} · {t(streamWorkspaceName(workspacePath))}
+                                </p>
                               </div>
                               <p className="mt-1 truncate text-[11px] text-zinc-500" title={workspacePath || t("未绑定规范 Workspace")}>
                                 {workspacePath || t("未绑定规范 Workspace")}
                               </p>
-                              <p className="mt-0.5 text-[10px] text-zinc-700">{t("资产 ID")} {profile.agentCorrelationId.slice(0, 16)}</p>
+                              <p className="mt-0.5 truncate text-[10px] text-zinc-600" title={profile.agentInstanceId || profile.agentCorrelationId}>
+                                {profile.agentInstanceId
+                                  ? `${t("实例 ID")} ${profile.agentInstanceId.slice(0, 20)}${agentInstance?.rootPid ? ` · Root PID ${agentInstance.rootPid}` : ""}`
+                                  : `${t("旧版逻辑画像")} · ${profile.agentCorrelationId.slice(0, 16)}`}
+                              </p>
                             </div>
                             <div className="text-right">
                               <div className="flex items-baseline justify-end gap-1.5">
@@ -2983,14 +3606,15 @@ function TierStatusStrip({
   const collectorSummary = collectorHealth?.summary;
   const collectorTotal = collectorSummary?.totalCollectors ?? 0;
   const collectorOnline = (collectorSummary?.healthyCollectors ?? 0) + (collectorSummary?.quietCollectors ?? 0);
+  const collectorDown = collectorSummary?.downCollectors ?? 0;
   const collectorAbnormal = (collectorSummary?.degradedCollectors ?? 0)
     + (collectorSummary?.staleCollectors ?? 0)
-    + (collectorSummary?.downCollectors ?? 0);
+    + collectorDown;
   const observerState = collectorHealthLoading && !collectorHealth
     ? "loading"
     : collectorHealthError
       ? "unknown"
-      : collectorTotal === 0 || collectorOnline === 0 && collectorAbnormal > 0
+      : collectorTotal === 0 || collectorDown === collectorTotal
         ? "offline"
         : collectorAbnormal > 0
           ? "partial"
@@ -3258,8 +3882,21 @@ function TimelineScopeTabs({
   );
 }
 
+function timelineEventListFingerprint(events: AgentEventList): string {
+  return events.items
+    .map((event) => [
+      event.eventId,
+      event.decisionRevision ?? 0,
+      event.decisionStatus ?? "",
+      event.verdict,
+      event.riskScore,
+    ].join(":"))
+    .join("|");
+}
+
 function AgentEventTimelinePanel({
   events,
+  loading,
   error,
   scope,
   tier,
@@ -3270,6 +3907,7 @@ function AgentEventTimelinePanel({
   onIncludeUnknownChange,
 }: {
   events?: AgentEventList | null;
+  loading: boolean;
   error?: string;
   scope: TimelineScope;
   tier: TimelineTierFilter;
@@ -3280,7 +3918,33 @@ function AgentEventTimelinePanel({
   onIncludeUnknownChange: (value: boolean) => void;
 }) {
   const { locale, t } = useI18n();
-  const items = events?.items ?? [];
+  const [displayedEvents, setDisplayedEvents] = useState<AgentEventList | null>(events ?? null);
+  const [pendingEvents, setPendingEvents] = useState<AgentEventList | null>(null);
+  const visibleEvents = displayedEvents ?? events ?? null;
+  const items = visibleEvents?.items ?? [];
+  const pendingNewEventCount = useMemo(() => {
+    if (!pendingEvents) return 0;
+    const visibleIds = new Set(items.map((event) => event.eventId));
+    return pendingEvents.items.filter((event) => !visibleIds.has(event.eventId)).length;
+  }, [items, pendingEvents]);
+
+  useEffect(() => {
+    if (!events) return;
+    if (!displayedEvents) {
+      setDisplayedEvents(events);
+      setPendingEvents(null);
+      return;
+    }
+    if (timelineEventListFingerprint(events) !== timelineEventListFingerprint(displayedEvents)) {
+      setPendingEvents(events);
+    }
+  }, [displayedEvents, events]);
+
+  const loadPendingEvents = () => {
+    if (!pendingEvents) return;
+    setDisplayedEvents(pendingEvents);
+    setPendingEvents(null);
+  };
 
   return (
     <Panel
@@ -3315,8 +3979,20 @@ function AgentEventTimelinePanel({
               <SelectItem value="Agent">L3</SelectItem>
             </SelectContent>
           </Select>
+          {pendingEvents ? (
+            <button
+              type="button"
+              onClick={loadPendingEvents}
+              className="h-8 rounded-md border border-sky-400/30 bg-sky-400/10 px-2.5 text-xs font-semibold text-sky-200 transition-colors hover:bg-sky-400/15"
+              aria-live="polite"
+            >
+              {pendingNewEventCount > 0
+                ? `${pendingNewEventCount}${pendingNewEventCount === pendingEvents.items.length ? "+" : ""} 条新事件`
+                : "事件状态已更新"}
+            </button>
+          ) : null}
           <span className="text-xs text-zinc-500">
-            {events ? `${formatNumber(events.total)}${events.totalMode === "estimated" ? "+" : ""} ${locale === "en" ? "events" : "条"}` : "--"}
+            {visibleEvents ? `${formatNumber(visibleEvents.total)}${visibleEvents.totalMode === "estimated" ? "+" : ""} ${locale === "en" ? "events" : "条"}` : "--"}
           </span>
           <Link to="/events" className="text-xs text-teal-300 hover:text-teal-200">{t("查看全部")}</Link>
         </div>
@@ -3324,7 +4000,12 @@ function AgentEventTimelinePanel({
     >
       <div className="space-y-3 p-4">
         <InlineError message={error} />
-        {items.length === 0 ? (
+        {loading && !visibleEvents ? (
+          <div className="flex min-h-28 items-center justify-center gap-2 text-xs text-zinc-500">
+            <LoaderCircle className="size-4 animate-spin" />
+            正在加载所选时间范围的事件…
+          </div>
+        ) : items.length === 0 ? (
           <EmptyState label="暂无事件明细" />
         ) : (
           <div className="overflow-x-auto">
@@ -3486,10 +4167,13 @@ function WorkspaceRiskPanel({
 export default function SecurityMonitorPage() {
   const [searchParams] = useSearchParams();
   const requestedView = searchParams.get("view");
+  const normalizedRequestedView = requestedView === "agentMonitoring"
+    ? "agentAssets"
+    : requestedView;
   const { filter, refreshVersion } = useSecurityConsole();
   const activeView: DashboardView = (
-    DASHBOARD_VIEWS.some((item) => item.value === requestedView)
-      ? requestedView as DashboardView
+    DASHBOARD_VIEWS.some((item) => item.value === normalizedRequestedView)
+      ? normalizedRequestedView as DashboardView
       : "overview"
   );
   const [timelineScope, setTimelineScope] = useState<TimelineScope>("agent");
@@ -3504,6 +4188,19 @@ export default function SecurityMonitorPage() {
   const [observabilityConnected, setObservabilityConnected] = useState(false);
 
   const requestFilter = useMemo(() => filter, [filter]);
+  const timelineContextKey = [
+    requestFilter.timeType ?? "last_3h",
+    requestFilter.startTime ?? "",
+    requestFilter.endTime ?? "",
+    requestFilter.snapshotAsOf ?? "",
+    timelineScope,
+    timelineTier,
+    timelineIncludeUnknown ? "include-unknown" : "hide-unknown",
+    refreshVersion,
+  ].join("|");
+  const needsDashboardData = ["overview", "risk", "supplyChain", "workspace"].includes(activeView);
+  const needsAgentInventory = ["agentAssets", "agentInstances", "stream"].includes(activeView);
+  const needsStreamFindings = ["agentAssets", "stream", "supplyChain"].includes(activeView);
   const { data, loading } = useRequest(() => {
     // Relative ranges are live views. Keep one snapshot across every request in
     // this polling cycle, but advance it on the next cycle. Reusing the
@@ -3514,6 +4211,7 @@ export default function SecurityMonitorPage() {
       : { ...requestFilter, snapshotAsOf: dashboardSnapshotAsOf() };
     return loadSecurityDashboardData(
       cycleFilter,
+      activeView,
       overviewScope,
       scanScope,
       riskBreakdownScope,
@@ -3521,12 +4219,46 @@ export default function SecurityMonitorPage() {
       workspaceRiskScope,
     );
   }, {
-    refreshDeps: [requestFilter, refreshVersion, overviewScope, scanScope, riskBreakdownScope, decisionFunnelScope, workspaceRiskScope],
+    ready: needsDashboardData,
+    refreshDeps: [activeView, requestFilter, refreshVersion, overviewScope, scanScope, riskBreakdownScope, decisionFunnelScope, workspaceRiskScope],
     pollingInterval: 10000,
     pollingWhenHidden: false,
   });
   const {
-    data: timelineEvents,
+    data: agentInventory,
+    loading: agentInventoryLoading,
+    error: agentInventoryRequestError,
+  } = useRequest(() => {
+    const cycleFilter = requestFilter.timeType === "custom"
+      ? requestFilter
+      : { ...requestFilter, snapshotAsOf: dashboardSnapshotAsOf() };
+    return securityCenterApi.agentInventory({
+      ...cycleFilter,
+      limit: activeView === "agentInstances" ? 500 : 32,
+    });
+  }, {
+    ready: needsAgentInventory,
+    refreshDeps: [activeView, requestFilter, refreshVersion],
+    pollingInterval: 10000,
+    pollingWhenHidden: false,
+  });
+  const {
+    data: streamFindings,
+    error: streamFindingsRequestError,
+  } = useRequest(() => {
+    const cycleFilter = requestFilter.timeType === "custom"
+      ? requestFilter
+      : { ...requestFilter, snapshotAsOf: dashboardSnapshotAsOf() };
+    return securityCenterApi.streamFindings({ ...cycleFilter, limit: 100 });
+  }, {
+    ready: needsStreamFindings,
+    refreshDeps: [activeView, requestFilter, refreshVersion],
+    pollingInterval: 10000,
+    pollingWhenHidden: false,
+  });
+  const {
+    data: timelineResponse,
+    loading: timelineRequestLoading,
     error: timelineRequestError,
   } = useRequest(() => {
     const cycleFilter = requestFilter.timeType === "custom"
@@ -3536,22 +4268,32 @@ export default function SecurityMonitorPage() {
       ...cycleFilter,
       scope: timelineScope,
       includeUnknown: timelineIncludeUnknown,
-      preview: true,
       ...(timelineTier === "all" ? {} : { tier: timelineTier }),
       limit: 36,
-    });
+    }).then((events) => ({ contextKey: timelineContextKey, events }));
   }, {
     ready: activeView === "events",
-    refreshDeps: [requestFilter, refreshVersion, timelineScope, timelineTier, timelineIncludeUnknown],
+    refreshDeps: [timelineContextKey],
     pollingInterval: 10000,
     pollingWhenHidden: false,
   });
+  const timelineEvents = timelineResponse?.contextKey === timelineContextKey
+    ? timelineResponse.events
+    : undefined;
   useEffect(() => {
+    if (activeView !== "overview") {
+      setObservability(null);
+      setObservabilityConnected(false);
+      return;
+    }
     const controller = new AbortController();
     setObservability(null);
     setObservabilityConnected(false);
+    const streamFilter = requestFilter.timeType === "custom"
+      ? requestFilter
+      : { ...requestFilter, snapshotAsOf: undefined };
     streamAgentObservability(
-      { ...requestFilter, scope: overviewScope },
+      { ...streamFilter, scope: overviewScope },
       (next) => {
         setObservability(next);
         setObservabilityConnected(true);
@@ -3559,7 +4301,7 @@ export default function SecurityMonitorPage() {
       controller.signal,
     );
     return () => controller.abort();
-  }, [overviewScope, requestFilter]);
+  }, [activeView, overviewScope, requestFilter]);
   // Tier status drives conditional rendering for L2/L3 funnel rows. Polled so a
   // Save reflects without a full reload.
   const { data: policyConfig } = useRequest(() => securityCenterApi.getConfig(), {
@@ -3576,6 +4318,20 @@ export default function SecurityMonitorPage() {
     pollingInterval: 10000,
     pollingWhenHidden: false,
     refreshOnWindowFocus: true,
+  });
+  const platformRange = requestFilter.timeType === "custom"
+    || requestFilter.timeType === "last_7d"
+    || requestFilter.timeType === "last_30d"
+    ? "last_1d"
+    : requestFilter.timeType ?? "last_1h";
+  const {
+    data: platformMetrics,
+    loading: platformMetricsLoading,
+  } = useRequest(() => securityCenterApi.platformMetrics(platformRange), {
+    ready: activeView === "overview",
+    refreshDeps: [platformRange, refreshVersion],
+    pollingInterval: 15000,
+    pollingWhenHidden: false,
   });
   const status = policyConfig?.status ?? null;
   return (
@@ -3597,8 +4353,9 @@ export default function SecurityMonitorPage() {
                   icon={Activity}
                   action={<TimelineScopeTabs value={overviewScope} onChange={setOverviewScope} />}
                 >
-                  <div className="space-y-4">
+                  <div className="w-full min-w-0 max-w-full space-y-4">
                     <TopMetrics data={data} loading={loading && !data} />
+                    <PlatformResourceSummary data={platformMetrics} loading={platformMetricsLoading} />
                     <LiveObservabilityPanel observability={observability} connected={observabilityConnected} />
                     <div className="border-t border-[#232a37] pt-4">
                       <DashboardSection title="实时扫描" icon={Radar}>
@@ -3618,15 +4375,29 @@ export default function SecurityMonitorPage() {
                         </div>
                       </DashboardSection>
                     </div>
-                    <div className="border-t border-[#232a37] pt-4">
-                      <AgentInstanceTrendsPanel
-                        inventory={data?.agentInventory}
-                        inventoryError={data?.errors.agentInventory}
-                        filter={requestFilter}
-                      />
-                    </div>
                   </div>
                 </DashboardSection>
+              )}
+
+              {activeView === "agentAssets" && (
+                <AgentRiskOverviewPanel
+                  inventory={agentInventory}
+                  findings={streamFindings}
+                  inventoryError={agentInventoryRequestError ? formatRequestError(agentInventoryRequestError) : undefined}
+                  findingsError={streamFindingsRequestError ? formatRequestError(streamFindingsRequestError) : undefined}
+                  inventoryLoading={agentInventoryLoading}
+                  filter={filter}
+                  assetsOnly
+                />
+              )}
+
+              {activeView === "agentInstances" && (
+                <AgentInstanceTrendsPanel
+                  inventory={agentInventory}
+                  inventoryError={agentInventoryRequestError ? formatRequestError(agentInventoryRequestError) : undefined}
+                  inventoryLoading={agentInventoryLoading}
+                  filter={requestFilter}
+                />
               )}
 
               {activeView === "risk" && (
@@ -3641,10 +4412,11 @@ export default function SecurityMonitorPage() {
               {activeView === "stream" && (
                 <DashboardSection title="流式复合研判" icon={Sparkles}>
                   <AgentRiskOverviewPanel
-                    inventory={data?.agentInventory}
-                    findings={data?.streamFindings}
-                    inventoryError={data?.errors.agentInventory}
-                    findingsError={data?.errors.streamFindings}
+                    inventory={agentInventory}
+                    findings={streamFindings}
+                    inventoryError={agentInventoryRequestError ? formatRequestError(agentInventoryRequestError) : undefined}
+                    findingsError={streamFindingsRequestError ? formatRequestError(streamFindingsRequestError) : undefined}
+                    inventoryLoading={agentInventoryLoading}
                     filter={filter}
                   />
                 </DashboardSection>
@@ -3654,7 +4426,7 @@ export default function SecurityMonitorPage() {
                 <DashboardSection title="供应链漏洞资产" icon={ShieldAlert}>
                   <SupplyChainPanel
                     overview={data.supplyChain}
-                    streamFindings={data.streamFindings}
+                    streamFindings={streamFindings}
                     error={data.errors.supplyChain}
                   />
                 </DashboardSection>
@@ -3663,7 +4435,9 @@ export default function SecurityMonitorPage() {
               {activeView === "events" && (
                 <DashboardSection title="运行链路" icon={GitBranch}>
                   <AgentEventTimelinePanel
+                    key={timelineContextKey}
                     events={timelineEvents}
+                    loading={timelineRequestLoading}
                     error={timelineRequestError ? formatRequestError(timelineRequestError) : undefined}
                     scope={timelineScope}
                     tier={timelineTier}
@@ -3678,9 +4452,12 @@ export default function SecurityMonitorPage() {
 
               {activeView === "workspace" && (
                 <DashboardSection title="会话与工作区" icon={TerminalSquare}>
-                  <div className="grid gap-4 xl:grid-cols-[minmax(360px,0.9fr)_minmax(0,1.6fr)]">
-                    <HighestRiskPanel session={data?.highestRisk} />
-                    <WorkspaceRiskPanel workspaceRisk={data?.workspaceRisk} scope={workspaceRiskScope} onScopeChange={setWorkspaceRiskScope} />
+                  <div className="space-y-4">
+                    <div className="grid gap-4 xl:grid-cols-[minmax(360px,0.9fr)_minmax(0,1.6fr)]">
+                      <HighestRiskPanel session={data?.highestRisk} />
+                      <WorkspaceRiskPanel workspaceRisk={data?.workspaceRisk} scope={workspaceRiskScope} onScopeChange={setWorkspaceRiskScope} />
+                    </div>
+                    <WorkspaceAssetsView embedded timeFilter={requestFilter} />
                   </div>
                 </DashboardSection>
               )}

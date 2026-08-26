@@ -38,7 +38,7 @@ spec:
     spec:
       hostPID: true # resolve /proc/<pid> for host-process identity
       priorityClassName: system-node-critical
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 45
       containers:
         - name: a3s-observer
           # Replace with the forwarder image you built + pushed (see deploy/README.md).
@@ -73,12 +73,19 @@ spec:
             # Bound memory and amortize HTTP/JSON overhead without adding perceptible UI delay.
             - { name: FORWARD_BATCH_SIZE, value: "32" }
             - { name: FORWARD_BATCH_FLUSH_MS, value: "50" }
-            - { name: FORWARD_MAX_QUEUE, value: "4096" }
+            # Events are removed only after an item-level durable ack. The hostPath survives
+            # container/Pod restarts; when full, stdin is paused instead of dropping evidence.
+            - { name: FORWARD_SPOOL_PATH, value: "/var/lib/anysentry-forwarder/spool.wal" }
+            - { name: FORWARD_SPOOL_FSYNC, value: "periodic" }
+            - { name: FORWARD_SPOOL_FSYNC_MS, value: "250" }
+            - { name: FORWARD_SPOOL_MAX_RECORDS, value: "250000" }
+            - { name: FORWARD_SPOOL_MAX_BYTES, value: "2147483648" }
           command: ["/bin/sh", "-c"]
           args: ["a3s-observer-collector | node /opt/observer-forward.js"]
           volumeMounts:
             - { name: sys, mountPath: /sys, readOnly: true } # tracepoint ids under /sys
             - { name: agent-templates, mountPath: /etc/anysentry, readOnly: true }
+            - { name: forwarder-spool, mountPath: /var/lib/anysentry-forwarder }
           resources:
             requests: { cpu: 50m, memory: 128Mi }
             # 1Gi: full signal set (FILES high-volume + SSL uprobes) tracks more state, plus the
@@ -87,5 +94,6 @@ spec:
       volumes:
         - { name: sys, hostPath: { path: /sys } }
         - { name: agent-templates, configMap: { name: anysentry-agent-templates } }
+        - { name: forwarder-spool, hostPath: { path: /var/lib/anysentry-forwarder, type: DirectoryOrCreate } }
       tolerations:
         - operator: Exists # every node, including tainted/control-plane
