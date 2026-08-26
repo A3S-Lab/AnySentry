@@ -379,6 +379,26 @@ class AgentAttributor {
     return processKey(info, { hostId: this.hostId, bootId: this.bootId });
   }
 
+  stableProcessStartTime(observerEvent) {
+    const payload = eventPayload(observerEvent);
+    const processInfo = observerEvent?.process && typeof observerEvent.process === 'object'
+      ? observerEvent.process
+      : {};
+    const supplied = text(
+      processInfo.startTimeTicks ?? processInfo.start_time_ticks ??
+      processInfo.startTimeNs ?? processInfo.start_time_ns,
+    );
+    if (supplied) return supplied;
+    const pid = positiveInt(processInfo.pid) || positiveInt(payload.pid) || positiveInt(observerEvent?.identity?.task);
+    const cgroupId = text(processInfo.cgroupId) || text(processInfo.cgroup_id);
+    if (!pid || !cgroupId) return '';
+    const hostId = text(processInfo.hostId) || text(processInfo.host_id) || this.hostId;
+    const bootId = text(processInfo.bootId) || text(processInfo.boot_id) || this.bootId;
+    const cached = this.procs.get(pid, hostId, bootId);
+    if (!cached?.startTime || !cached.cgroupId || cached.cgroupId !== cgroupId) return '';
+    return cached.startTime;
+  }
+
   agentInstanceId(agentId, rootKey) {
     return `ari_${crypto.createHash('sha256')
       .update(text(agentId))

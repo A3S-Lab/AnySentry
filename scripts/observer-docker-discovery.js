@@ -4,8 +4,18 @@ const fs = require('node:fs');
 const http = require('node:http');
 
 const WORKLOAD_KIND_LABEL = 'anysentry.io/workload-kind';
+const WORKLOAD_ROLE_LABEL = 'anysentry.io/workload-role';
+const LEGACY_OBSERVE_LABEL = 'io.anysentry.observe';
 const AGENT_ID_LABEL = 'anysentry.io/agent-id';
 const SNAPSHOT_SCHEMA = 'anysentry.workload_identity_snapshot.v1';
+const WORKLOAD_ROLES = new Set([
+  'agent',
+  'anysentry_internal',
+  'platform_infrastructure',
+  'business_service',
+  'ordinary_process',
+  'unknown',
+]);
 
 function text(value) {
   return typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
@@ -32,6 +42,12 @@ function normalizedContainerId(value) {
   return text(value).replace(/^[a-z0-9._-]+:\/\//i, '');
 }
 
+function normalizedImageDigest(value) {
+  const normalized = text(value).toLowerCase().replace(/^[a-z0-9._-]+:\/\//i, '');
+  const match = normalized.match(/(?:^|@)(sha256:[a-f0-9]{64})$/u);
+  return match?.[1] || '';
+}
+
 function boundedArgv(value) {
   if (!Array.isArray(value) || value.length === 0 || value.length > 64) return undefined;
   if (value.some((item) => typeof item !== 'string' || item.length === 0 || item.length > 2_048)) {
@@ -54,13 +70,46 @@ function dockerHealthchecks(inspect) {
   return argv ? [{ activitySubtype: 'docker_healthcheck', argv }] : [];
 }
 
+function dockerRuntimeIdentity(inspect, options = {}) {
+  const hostPid = Number(inspect?.State?.Pid);
+  if (!Number.isSafeInteger(hostPid) || hostPid <= 0) return {};
+  const procRoot = text(options.procRoot) || '/proc';
+  const cgroupRoot = text(options.cgroupRoot) || '/sys/fs/cgroup';
+  try {
+    const membership = fs.readFileSync(`${procRoot}/${hostPid}/cgroup`, 'utf8');
+    const unifiedPath = membership
+      .split('\n')
+      .map((line) => line.match(/^0::(.+)$/u)?.[1])
+      .find(Boolean);
+    if (!unifiedPath || unifiedPath.includes('..')) return { hostPid };
+    const relative = unifiedPath.replace(/^\/+/, '');
+    const cgroupPath = relative ? `${cgroupRoot}/${relative}` : cgroupRoot;
+    const stat = fs.statSync(cgroupPath, { bigint: true });
+    const cgroupId = stat.ino > 0n ? stat.ino.toString() : '';
+    return {
+      hostPid,
+      cgroupPath: unifiedPath,
+      ...(cgroupId ? { cgroupId } : {}),
+    };
+  } catch {
+    return { hostPid };
+  }
+}
+
 function dockerEntry(container, options = {}) {
   const id = normalizedContainerId(container.Id || container.ID || container.id);
   if (!id) return undefined;
   const labels = boundedLabels(container.Labels || container.labels);
   const workloadKind = text(labels[WORKLOAD_KIND_LABEL]).toLowerCase();
+  // Inventory role is an exact deployment fact. Do not normalize arbitrary values into a known
+  // role, because a typo must remain visible as unresolved rather than silently changing capture.
+  const declaredRole = labels[WORKLOAD_ROLE_LABEL];
+  const workloadRole = WORKLOAD_ROLES.has(declaredRole) ? declaredRole : undefined;
   const selectedAgent = workloadKind === 'agent';
-  const explicitNonAgent = ['non-agent', 'non_agent', 'infrastructure'].includes(workloadKind);
+  const legacyInfrastructure = ['0', 'false', 'off', 'no', 'disabled']
+    .includes(text(labels[LEGACY_OBSERVE_LABEL]).toLowerCase());
+  const explicitNonAgent = ['non-agent', 'non_agent', 'infrastructure'].includes(workloadKind)
+    || legacyInfrastructure;
   const classification = selectedAgent
     ? 'confirmed_agent'
     : explicitNonAgent
@@ -78,8 +127,11 @@ function dockerEntry(container, options = {}) {
         `label:${AGENT_ID_LABEL}=${agentScopeId}`,
       ]
     : explicitNonAgent
-      ? [`label:${WORKLOAD_KIND_LABEL}=${workloadKind}`]
+      ? [legacyInfrastructure
+          ? `label:${LEGACY_OBSERVE_LABEL}=${text(labels[LEGACY_OBSERVE_LABEL]).toLowerCase()}`
+          : `label:${WORKLOAD_KIND_LABEL}=${workloadKind}`]
       : [`label_missing:${WORKLOAD_KIND_LABEL}`];
+  if (workloadRole) evidence.push(`label:${WORKLOAD_ROLE_LABEL}=${workloadRole}`);
   return {
     ids: [id, id.slice(0, 12)].filter(Boolean),
     classification,
@@ -89,7 +141,10 @@ function dockerEntry(container, options = {}) {
     nodeName: text(options.nodeName) || undefined,
     containerName: containerName || undefined,
     containerImage: text(container.Image || container.ImageID || container.image) || undefined,
+    imageDigest: normalizedImageDigest(container.ImageID || container.imageID) || undefined,
     labels,
+    ...(workloadRole ? { workloadRole } : {}),
+    ...(options.runtimeById?.get(id) ?? {}),
     ...(options.inspectById?.get(id)?.length
       ? { platformHealthchecks: options.inspectById.get(id).map((probe) => ({ ...probe, argv: [...probe.argv] })) }
       : {}),
@@ -183,6 +238,7 @@ class DockerDiscovery {
     this.ready = false;
     this.containers = [];
     this.inspectById = new Map();
+    this.runtimeById = new Map();
     this.inspectInFlight = new Map();
     this.inspectEpoch = new Map();
     this.inspectConcurrency = boundedNumber(options.inspectConcurrency, 4, 1, 16);
@@ -274,6 +330,7 @@ class DockerDiscovery {
       hostId: this.hostId,
       now: this.now,
       inspectById: this.inspectById,
+      runtimeById: this.runtimeById,
     });
   }
 
@@ -310,6 +367,7 @@ class DockerDiscovery {
       .then((inspect) => {
         if ((this.inspectEpoch.get(id) ?? 0) === epoch) {
           this.inspectById.set(id, dockerHealthchecks(inspect));
+          this.runtimeById.set(id, dockerRuntimeIdentity(inspect));
         }
       })
       .catch(() => {
@@ -329,6 +387,7 @@ class DockerDiscovery {
 
   invalidateInspect(id) {
     this.inspectById.delete(id);
+    this.runtimeById.delete(id);
     this.inspectEpoch.set(id, (this.inspectEpoch.get(id) ?? 0) + 1);
     if (!this.inspectInFlight.has(id)) this.inspectEpoch.delete(id);
   }
@@ -436,6 +495,7 @@ class DockerDiscovery {
       errors: this.errors,
       reconnects: this.reconnects,
       inspected: this.inspectById.size,
+      runtimeIdentities: this.runtimeById.size,
       healthchecks: [...this.inspectById.values()].reduce((total, probes) => total + probes.length, 0),
     };
   }
@@ -444,6 +504,8 @@ class DockerDiscovery {
 module.exports = {
   DockerDiscovery,
   dockerHealthchecks,
+  dockerRuntimeIdentity,
   dockerEntry,
   dockerSnapshot,
+  normalizedImageDigest,
 };

@@ -16,6 +16,7 @@ const fs = require('node:fs');
 const readline = require('node:readline');
 const { AgentAttributor, readProcStartTime } = require('./observer-agent-attribution');
 const { mergeAttributionClassifications } = require('./observer-attribution-merge');
+const { classificationSemanticsEnvelope } = require('./observer-classification-semantics');
 const { AgentTemplateRegistry, loadTemplateDocument } = require('./observer-agent-templates');
 const {
   RuntimeSignatureRegistry,
@@ -32,6 +33,13 @@ const {
   WorkloadIdentityCache,
 } = require('./observer-workload-filter');
 const { InfrastructureRootResolver } = require('./observer-infrastructure-roots');
+const { InfrastructurePolicyRegistry } = require('./observer-infrastructure-policy');
+const { alwaysKeepEventKind } = require('./observer-infrastructure-rules');
+const { FilterRulePublisher } = require('./observer-filter-rules');
+const { CaptureProfileReporter } = require('./observer-capture-profile-reporter');
+const { FileAccessAggregator } = require('./observer-file-aggregation');
+const { ForwarderPipelineAccounting } = require('./observer-pipeline-accounting');
+const { UnifiedFilterPolicyRegistry } = require('./observer-unified-filter-policy');
 
 const target = new URL(process.env.ANYSENTRY_INGEST_URL || 'http://localhost:29653/security-center/ingest');
 function defaultHeartbeatUrl(ingestUrl) {
@@ -46,6 +54,39 @@ function defaultIdentitySnapshotUrl(ingestUrl) {
   const url = new URL(ingestUrl.toString());
   const nextPath = url.pathname.replace(/\/ingest(?:\/.*)?$/, '/identity/snapshot');
   url.pathname = nextPath === url.pathname ? '/security-center/identity/snapshot' : nextPath;
+  url.hash = '';
+  return url;
+}
+
+function defaultInfrastructurePolicyUrl(ingestUrl) {
+  const url = new URL(ingestUrl.toString());
+  const nextPath = url.pathname.replace(/\/ingest(?:\/.*)?$/, '/infrastructure-rules/policy');
+  url.pathname = nextPath === url.pathname
+    ? '/security-center/infrastructure-rules/policy'
+    : nextPath;
+  url.hash = '';
+  return url;
+}
+
+function defaultInfrastructureMaterializationUrl(ingestUrl) {
+  const url = new URL(ingestUrl.toString());
+  const nextPath = url.pathname.replace(
+    /\/ingest(?:\/.*)?$/,
+    '/infrastructure-rules/materializations/report',
+  );
+  url.pathname = nextPath === url.pathname
+    ? '/security-center/infrastructure-rules/materializations/report'
+    : nextPath;
+  url.hash = '';
+  return url;
+}
+
+function defaultUnifiedFilterProjectionUrl(ingestUrl) {
+  const url = new URL(ingestUrl.toString());
+  const nextPath = url.pathname.replace(/\/ingest(?:\/.*)?$/, '/filter-rules/projections/forwarder');
+  url.pathname = nextPath === url.pathname
+    ? '/security-center/filter-rules/projections/forwarder'
+    : nextPath;
   url.hash = '';
   return url;
 }
@@ -111,6 +152,23 @@ const MAX_OUTSTANDING_BYTES = boundedNumber(
   1024,
   1024 * 1024 * 1024,
 );
+// Infrastructure noise must not consume every ownership slot before Agent and protected
+// lifecycle/security evidence reaches the Forwarder. This is a reservation inside the existing
+// hard cap, not extra memory: lower-priority traffic can use only the non-reserved share, while
+// Agent, ToolExec, ProcessExit and SecurityAction may use the full bounded budget.
+const PROTECTED_PRIORITY = 3;
+const PROTECTED_RESERVE_EVENTS = boundedNumber(
+  process.env.FORWARD_PROTECTED_RESERVE_EVENTS,
+  Math.floor(MAX_OUTSTANDING_EVENTS / 4),
+  0,
+  MAX_OUTSTANDING_EVENTS,
+);
+const PROTECTED_RESERVE_BYTES = boundedNumber(
+  process.env.FORWARD_PROTECTED_RESERVE_BYTES,
+  Math.floor(MAX_OUTSTANDING_BYTES / 4),
+  0,
+  MAX_OUTSTANDING_BYTES,
+);
 const RETRY_BASE_DELAY_MS = boundedNumber(process.env.FORWARD_RETRY_BASE_DELAY_MS, 250, 10, 2_000);
 const RETRY_MAX_DELAY_MS = boundedNumber(
   process.env.FORWARD_RETRY_MAX_DELAY_MS,
@@ -132,6 +190,24 @@ const IDENTITY_SNAPSHOT_MAX_BYTES = boundedNumber(
   4 * 1024 * 1024,
   64 * 1024,
   16 * 1024 * 1024,
+);
+const UNIFIED_FILTER_PROJECTION_MAX_BYTES = boundedNumber(
+  process.env.ANYSENTRY_FILTER_RULE_PROJECTION_MAX_BYTES,
+  16 * 1024 * 1024,
+  64 * 1024,
+  32 * 1024 * 1024,
+);
+const CAPTURE_PROFILE_REPORT_RESPONSE_MAX_BYTES = boundedNumber(
+  process.env.ANYSENTRY_CAPTURE_PROFILE_REPORT_RESPONSE_MAX_BYTES,
+  4 * 1024 * 1024,
+  64 * 1024,
+  16 * 1024 * 1024,
+);
+const CAPTURE_PROFILE_REPORT_TIMEOUT_MS = boundedNumber(
+  process.env.ANYSENTRY_CAPTURE_PROFILE_REPORT_TIMEOUT_MS,
+  8_000,
+  1_000,
+  30_000,
 );
 const SHUTDOWN_TIMEOUT_MS = boundedNumber(
   process.env.FORWARD_SHUTDOWN_TIMEOUT_MS,
@@ -173,21 +249,78 @@ const E2E_INGEST_MARKERS = new Set((!E2E_INGEST_MARKER_PREFIX
 const LEGACY_FORWARD_SCOPE = ['agent', 'all', 'shadow'].includes(process.env.FORWARD_SCOPE)
   ? process.env.FORWARD_SCOPE
   : undefined;
-const FILTER_MODE = ['enforce', 'shadow'].includes(process.env.FORWARD_FILTER_MODE)
+let FILTER_MODE = ['enforce', 'shadow'].includes(process.env.FORWARD_FILTER_MODE)
   ? process.env.FORWARD_FILTER_MODE
   : LEGACY_FORWARD_SCOPE === 'agent' ? 'enforce' : 'shadow';
-const RETAIN_UNKNOWN = envBoolean(process.env.FORWARD_RETAIN_UNKNOWN, true);
-const RETAIN_NON_AGENT = envBoolean(process.env.FORWARD_RETAIN_NON_AGENT, false);
-const NOISE_POLICY = ['balanced', 'include'].includes(process.env.FORWARD_NOISE_POLICY)
+// Unknown is evidence, not a negative identity decision. It is always retained; only exact
+// lossless aggregation may reduce repeated records. The legacy env remains accepted by manifests
+// but cannot authorize silent Unknown loss.
+const RETAIN_UNKNOWN = true;
+const OBSERVER_FILE_UNKNOWN_POLICY = text(process.env.A3S_OBSERVER_FILE_UNKNOWN_POLICY).toLowerCase() === 'sample'
+  ? 'sample'
+  : 'keep';
+let RETAIN_NON_AGENT = envBoolean(process.env.FORWARD_RETAIN_NON_AGENT, false);
+let NOISE_POLICY = ['balanced', 'include'].includes(process.env.FORWARD_NOISE_POLICY)
   ? process.env.FORWARD_NOISE_POLICY
   : 'balanced';
 const DROP_PATHS = (process.env.FORWARD_DROP_PATHS || '/sys/,/proc/,/run/,/dev/').split(',').map((s) => s.trim()).filter(Boolean);
+const FILTER_RULES_FILE = text(process.env.ANYSENTRY_FILTER_RULES_FILE);
+const CAPTURE_PROFILE_MODE = ['legacy', 'shadow', 'enforce'].includes(
+  text(process.env.ANYSENTRY_CAPTURE_PROFILE_MODE).toLowerCase(),
+)
+  ? text(process.env.ANYSENTRY_CAPTURE_PROFILE_MODE).toLowerCase()
+  : 'legacy';
+const FILTER_RULES_ACK_FILE = CAPTURE_PROFILE_MODE === 'legacy'
+  ? ''
+  : text(process.env.ANYSENTRY_FILTER_RULES_ACK_FILE)
+    || (FILTER_RULES_FILE ? `${FILTER_RULES_FILE}.ack.json` : '');
+const CAPTURE_PROFILE_ACK_POLL_MS = boundedNumber(
+  process.env.ANYSENTRY_CAPTURE_PROFILE_ACK_POLL_MS,
+  250,
+  50,
+  60_000,
+);
+let FILE_AGGREGATION_ENABLED = envBoolean(process.env.FORWARD_FILE_AGGREGATION, false);
+let FILE_AGGREGATION_WINDOW_MS = boundedNumber(
+  process.env.FORWARD_FILE_AGGREGATION_WINDOW_MS,
+  100,
+  10,
+  5_000,
+);
 const COLLECTOR_ID = process.env.A3S_OBSERVER_COLLECTOR_ID || process.env.COLLECTOR_ID || process.env.HOSTNAME || '';
 const NODE_NAME = process.env.A3S_NODE_NAME || process.env.NODE_NAME || '';
-const SOURCE_ID = process.env.ANYSENTRY_SOURCE_ID || '';
+function sourceCredentialsFromFile(file, collectorId, nodeName) {
+  const target = text(file);
+  if (!target) return {};
+  try {
+    const stat = fs.statSync(target);
+    if (!stat.isFile() || stat.size <= 0 || stat.size > 64 * 1024 || (stat.mode & 0o077) !== 0) return {};
+    const document = JSON.parse(fs.readFileSync(target, 'utf8'));
+    if (
+      document?.schemaVersion !== 'anysentry.observer_source_credentials.v1'
+      || !Array.isArray(document.credentials)
+      || document.credentials.length > 10_000
+    ) return {};
+    const expected = [text(collectorId), text(nodeName)].filter(Boolean);
+    const entry = document.credentials.find((candidate) =>
+      candidate && typeof candidate === 'object' && expected.includes(text(candidate.collectorId)));
+    const sourceId = text(entry?.sourceId);
+    const token = text(entry?.token);
+    if (!sourceId || sourceId.length > 160 || !token || token.length > 500) return {};
+    return { sourceId, token };
+  } catch {
+    return {};
+  }
+}
+const sourceCredentials = sourceCredentialsFromFile(
+  process.env.ANYSENTRY_SOURCE_CREDENTIALS_FILE,
+  COLLECTOR_ID,
+  NODE_NAME,
+);
+const SOURCE_ID = process.env.ANYSENTRY_SOURCE_ID || sourceCredentials.sourceId || '';
 const SOURCE_NAME = process.env.ANYSENTRY_SOURCE_NAME || '';
 const SOURCE_TYPE = process.env.ANYSENTRY_SOURCE_TYPE || 'observer';
-const SOURCE_TOKEN = process.env.ANYSENTRY_INGEST_TOKEN || '';
+const SOURCE_TOKEN = process.env.ANYSENTRY_INGEST_TOKEN || sourceCredentials.token || '';
 const WORKSPACE_PATH = process.env.ANYSENTRY_WORKSPACE_PATH || '';
 const HEARTBEAT_SECS = Math.max(0, Number(process.env.ANYSENTRY_HEARTBEAT_SECS || 30));
 const heartbeatTarget = new URL(process.env.ANYSENTRY_HEARTBEAT_URL || defaultHeartbeatUrl(target));
@@ -197,6 +330,25 @@ const identitySnapshotTarget = new URL(
   process.env.ANYSENTRY_IDENTITY_SNAPSHOT_URL || defaultIdentitySnapshotUrl(target),
 );
 if (NODE_NAME) identitySnapshotTarget.searchParams.set('nodeName', NODE_NAME);
+const INFRASTRUCTURE_POLICY_SECS = Math.max(
+  0,
+  Number(process.env.ANYSENTRY_INFRASTRUCTURE_POLICY_SECS || 5),
+);
+const infrastructurePolicyTarget = new URL(
+  process.env.ANYSENTRY_INFRASTRUCTURE_POLICY_URL || defaultInfrastructurePolicyUrl(target),
+);
+const infrastructureMaterializationTarget = new URL(
+  process.env.ANYSENTRY_INFRASTRUCTURE_MATERIALIZATION_URL
+    || defaultInfrastructureMaterializationUrl(target),
+);
+const INFRASTRUCTURE_POLICY_TOKEN = text(process.env.ANYSENTRY_INFRASTRUCTURE_POLICY_TOKEN);
+const UNIFIED_FILTER_PROJECTION_SECS = Math.max(
+  0,
+  Number(process.env.ANYSENTRY_FILTER_RULE_PROJECTION_SECS || 5),
+);
+const unifiedFilterProjectionTarget = new URL(
+  process.env.ANYSENTRY_FILTER_RULE_PROJECTION_URL || defaultUnifiedFilterProjectionUrl(target),
+);
 const RUNTIME_SNAPSHOT_SECS = boundedNumber(
   process.env.ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_SECS,
   10,
@@ -263,7 +415,7 @@ try {
   templateDocument = { templates: [], source: 'invalid' };
   console.error(`[observer-forward] agent templates ignored: ${error.message}`);
 }
-const templateRegistry = new AgentTemplateRegistry(templateDocument);
+let templateRegistry = new AgentTemplateRegistry(templateDocument);
 let signatureInitialLoadErrors = 0;
 const signatureRegistry = new RuntimeSignatureRegistry(undefined, { source: 'builtin' });
 try {
@@ -284,11 +436,106 @@ const dockerDiscovery = new DockerDiscovery({
   hostId: process.env.A3S_OBSERVER_HOST_ID || NODE_NAME,
 });
 const behaviorDetector = new BehavioralAgentDetector();
+const unifiedFilterPolicy = new UnifiedFilterPolicyRegistry();
 const infrastructureResolver = new InfrastructureRootResolver();
+const infrastructurePolicy = new InfrastructurePolicyRegistry({
+  hostGroup:
+    process.env.ANYSENTRY_INFRASTRUCTURE_HOST_GROUP ||
+    process.env.A3S_OBSERVER_HOST_ID ||
+    NODE_NAME ||
+    'local',
+  canaryEnabled: envBoolean(process.env.ANYSENTRY_INFRASTRUCTURE_CANARY, false),
+});
 const toolExecDeduper = new ToolExecDeduper({
   windowMs: process.env.FORWARD_DEDUP_WINDOW_MS,
   maxKeys: process.env.FORWARD_MAX_DEDUP_KEYS,
 });
+const filterRulePublisher = new FilterRulePublisher({
+  file: FILTER_RULES_FILE,
+  ackFile: FILTER_RULES_ACK_FILE,
+  captureProfileMode: CAPTURE_PROFILE_MODE,
+  nodeId: NODE_NAME || COLLECTOR_ID,
+  collectorId: COLLECTOR_ID || NODE_NAME,
+  hostBootId: attributor.bootId,
+  enforceDrops: CAPTURE_PROFILE_MODE === 'legacy' ? FILTER_MODE === 'enforce' : true,
+  ttlMs: process.env.FORWARD_FILTER_RULE_TTL_MS,
+  probableTtlMs: process.env.ANYSENTRY_PROBABLE_PROFILE_TTL_MS,
+  lkgTtlMs: process.env.ANYSENTRY_CAPTURE_PROFILE_LKG_TTL_MS,
+  riskPromotionTtlMs: process.env.ANYSENTRY_CAPTURE_PROFILE_PROMOTION_TTL_MS,
+  ackMaxAgeMs: process.env.ANYSENTRY_CAPTURE_PROFILE_ACK_MAX_AGE_MS,
+  flushIntervalMs: process.env.FORWARD_FILTER_RULE_FLUSH_MS,
+  maxEntries: process.env.FORWARD_FILTER_RULE_MAX_ENTRIES,
+  maxProbableEntries: process.env.ANYSENTRY_PROBABLE_PROFILE_MAX_ENTRIES,
+  maxSnapshotBytes: process.env.ANYSENTRY_CAPTURE_PROFILE_MAX_SNAPSHOT_BYTES,
+});
+let lastCaptureProfileReportError = '';
+const captureProfileReporter = new CaptureProfileReporter({
+  publisher: filterRulePublisher,
+  pollIntervalMs: CAPTURE_PROFILE_ACK_POLL_MS,
+  retryBaseMs: process.env.ANYSENTRY_CAPTURE_PROFILE_REPORT_RETRY_MS,
+  postReport(report, done) {
+    postJsonResponse(
+      infrastructureMaterializationTarget,
+      report,
+      CAPTURE_PROFILE_REPORT_TIMEOUT_MS,
+      done,
+      INFRASTRUCTURE_POLICY_TOKEN
+        ? { 'X-AnySentry-Management-Token': INFRASTRUCTURE_POLICY_TOKEN }
+        : {},
+      CAPTURE_PROFILE_REPORT_RESPONSE_MAX_BYTES,
+      // Capture grants are safety-critical and low frequency. A dedicated non-pooled connection
+      // cannot wait behind identity/runtime/policy sockets or reuse a stale keep-alive socket.
+      false,
+    );
+  },
+  onError(error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === lastCaptureProfileReportError) return;
+    lastCaptureProfileReportError = message;
+    console.error(`[observer-forward] Capture Profile materialization unavailable: ${message}`);
+  },
+});
+const fileAccessAggregator = new FileAccessAggregator({
+  windowMs: FILE_AGGREGATION_WINDOW_MS,
+  maxKeys: process.env.FORWARD_FILE_AGGREGATION_MAX_KEYS,
+});
+
+function emptyAttributionCounts() {
+  return {
+    observed: 0,
+    confirmedAgent: 0,
+    probableAgent: 0,
+    unknown: 0,
+    nonAgent: 0,
+    filteredNonAgent: 0,
+    wouldFilterNonAgent: 0,
+    filteredUnknown: 0,
+    wouldFilterUnknown: 0,
+    filteredNoise: 0,
+    wouldFilterNoise: 0,
+    discoveryBudgetDropped: 0,
+    wouldDiscoveryBudgetDrop: 0,
+    e2eMarkerScopedOut: 0,
+    forwarded: 0,
+    queueDropped: 0,
+    batches: 0,
+    batchEvents: 0,
+    retryQueued: 0,
+    retryAttempts: 0,
+    retryRecovered: 0,
+    retryExhausted: 0,
+    workspaceConflict: 0,
+    infrastructure: 0,
+    deduplicated: 0,
+    aggregatedFileEvents: 0,
+    aggregationOutputs: 0,
+    captureAggregateOutputs: 0,
+    captureAggregateDecisionAttempts: 0,
+    protectedQueueDropped: 0,
+    queueDroppedByClass: Object.create(null),
+    unknownReasons: Object.create(null),
+  };
+}
 
 let inflight = 0;
 let inflightEvents = 0;
@@ -307,37 +554,20 @@ let outputDropped = 0;
 let errorCount = 0;
 let eventKindCounts = Object.create(null);
 const forwarderInstanceId = crypto.randomUUID();
+const pipelineAccounting = new ForwarderPipelineAccounting({
+  producerInstanceId: forwarderInstanceId,
+});
 let sourceEventSequence = 0;
 let lastNonAgentSuppressedAt = '';
 let e2eFilterReceipts = [];
-let attributionCounts = {
-  observed: 0,
-  confirmedAgent: 0,
-  probableAgent: 0,
-  unknown: 0,
-  nonAgent: 0,
-  filteredNonAgent: 0,
-  wouldFilterNonAgent: 0,
-  filteredNoise: 0,
-  wouldFilterNoise: 0,
-  discoveryBudgetDropped: 0,
-  wouldDiscoveryBudgetDrop: 0,
-  e2eMarkerScopedOut: 0,
-  forwarded: 0,
-  queueDropped: 0,
-  batches: 0,
-  batchEvents: 0,
-  retryQueued: 0,
-  retryAttempts: 0,
-  retryRecovered: 0,
-  retryExhausted: 0,
-  workspaceConflict: 0,
-  infrastructure: 0,
-  deduplicated: 0,
-};
+let attributionCounts = emptyAttributionCounts();
 let closing = false;
 let heartbeatTimer;
+let heartbeatDeliveryInFlight = false;
+let pendingHeartbeatDelivery;
 let identitySnapshotTimer;
+let infrastructurePolicyTimer;
+let unifiedFilterProjectionTimer;
 let runtimeSnapshotTimer;
 let rootLivenessTimer;
 let batchTimer;
@@ -548,15 +778,46 @@ function postJson(url, bodyObj, timeoutMs, done) {
   req.end(body);
 }
 
-function invalidBatchAck(batchLength, reason) {
-  return { dropped: batchLength, errors: 1, retryItems: [], reason };
+function pipelineCount(stage, reason, count) {
+  return count > 0 ? [{ stage, reason, count }] : [];
 }
 
-function validateBatchAck(value, batch) {
+function invalidBatchAck(batchLength, reason) {
+  return {
+    dropped: batchLength,
+    errors: 1,
+    retryItems: [],
+    pipelineCounts: pipelineCount('api_rejected', 'invalid_ack', batchLength),
+    reason,
+  };
+}
+
+function eventBatchEnvelope(batch) {
+  const events = batch.map((item) => item.body);
+  const canonical = JSON.stringify(events);
+  const payloadDigest = crypto.createHash('sha256').update(canonical).digest('hex');
+  const batchId = `obat_${crypto.createHash('sha256')
+    .update(COLLECTOR_ID)
+    .update('\0')
+    .update(NODE_NAME)
+    .update('\0')
+    .update(payloadDigest)
+    .digest('hex')
+    .slice(0, 24)}`;
+  return { batchId, payloadDigest, events };
+}
+
+function validateBatchAck(value, batch, envelope = eventBatchEnvelope(batch)) {
   const batchLength = batch.length;
   const ack = value?.data ?? value;
   if (!ack || typeof ack !== 'object' || Array.isArray(ack)) {
     return invalidBatchAck(batchLength, 'batch endpoint returned no acknowledgement');
+  }
+  if (
+    (ack.batchId !== undefined && ack.batchId !== envelope.batchId)
+    || (ack.payloadDigest !== undefined && ack.payloadDigest !== envelope.payloadDigest)
+  ) {
+    return invalidBatchAck(batchLength, 'batch endpoint acknowledgement identity mismatch');
   }
   const acceptedEvents = ack.acceptedEvents;
   const rejectedEvents = ack.rejectedEvents;
@@ -582,6 +843,7 @@ function validateBatchAck(value, batch) {
   }
   let acceptedItems = 0;
   let retainedItems = 0;
+  let structuralItems = 0;
   let discardedItems = 0;
   let rejectedItems = 0;
   const retryItems = [];
@@ -600,10 +862,15 @@ function validateBatchAck(value, batch) {
       }
       acceptedItems++;
       if (item.disposition === undefined || item.disposition === 'retained') retainedItems++;
-      else if (item.disposition === 'discarded') discardedItems++;
+      else if (item.disposition === 'discarded') {
+        discardedItems++;
+        if (item.structuralConsumed === true || item.reasonCode === 'non_agent_structural_consumed') {
+          structuralItems++;
+        }
+      }
       else return invalidBatchAck(batchLength, 'batch endpoint returned an invalid accepted disposition');
     } else if (item.disposition === 'retryable') {
-      if (item.reasonCode !== 'clickhouse_event_buffer_full') {
+      if (!['clickhouse_event_buffer_full', 'delivery_incomplete', 'batch_commit_retryable'].includes(item.reasonCode)) {
         return invalidBatchAck(batchLength, 'batch endpoint returned an unrecognized retry reason');
       }
       sawRetryable = true;
@@ -626,8 +893,13 @@ function validateBatchAck(value, batch) {
   }
   if (
     (ack.retainedEvents !== undefined && (!Number.isSafeInteger(ack.retainedEvents) || ack.retainedEvents !== retainedItems))
+    || (ack.structuralEvents !== undefined && (!Number.isSafeInteger(ack.structuralEvents) || ack.structuralEvents !== structuralItems))
     || (ack.discardedEvents !== undefined && (!Number.isSafeInteger(ack.discardedEvents) || ack.discardedEvents !== discardedItems))
-    || (ack.retainedEvents !== undefined && ack.discardedEvents !== undefined && ack.retainedEvents + ack.discardedEvents !== acceptedEvents)
+    || (
+      ack.retainedEvents !== undefined
+      && ack.discardedEvents !== undefined
+      && ack.retainedEvents + ack.discardedEvents !== acceptedEvents
+    )
   ) {
     return invalidBatchAck(batchLength, 'batch endpoint disposition counts do not match its items');
   }
@@ -636,6 +908,13 @@ function validateBatchAck(value, batch) {
     errors: rejectedEvents > 0 ? 1 : 0,
     retryItems,
     retryAfterMs: ack.retryAfterMs,
+    pipelineCounts: [
+      ...pipelineCount('api_retained', 'ack', retainedItems),
+      ...pipelineCount('api_discarded', 'structural_consumed', structuralItems),
+      ...pipelineCount('api_discarded', 'ack', discardedItems - structuralItems),
+      ...pipelineCount('api_rejected', 'ack', rejectedItems),
+      ...pipelineCount('api_retryable', 'ack', retryItems.length),
+    ],
     reason: rejectedEvents > 0 ? `batch endpoint rejected ${rejectedEvents} event(s)` : '',
   };
 }
@@ -653,8 +932,10 @@ function postEventBatch(batch, timeoutMs, done) {
     return;
   }
   let body;
+  let envelope;
   try {
-    body = JSON.stringify({ events: batch.map((item) => item.body) });
+    envelope = eventBatchEnvelope(batch);
+    body = JSON.stringify(envelope);
   } catch (error) {
     done({ error: error instanceof Error ? error : new Error(String(error)) });
     return;
@@ -676,7 +957,7 @@ function postEventBatch(batch, timeoutMs, done) {
     settled = true;
     if (absoluteTimer) clearTimeout(absoluteTimer);
     activeEventRequests.delete(state);
-    done(result);
+    done({ ...result, envelope });
   };
   req = transport.request(
     {
@@ -748,18 +1029,29 @@ function combineBatchOutcomes(left, right, extraErrors = 0) {
     errors: left.errors + right.errors + extraErrors,
     retryItems: [...(left.retryItems ?? []), ...(right.retryItems ?? [])],
     retryAfterMs: Math.max(left.retryAfterMs ?? 0, right.retryAfterMs ?? 0),
+    pipelineCounts: [...(left.pipelineCounts ?? []), ...(right.pipelineCounts ?? [])],
   };
 }
 
 /** A 413 is safe to retry because Express rejects the body before the controller processes it. */
 function deliverEventBatch(batch, done, absoluteDeadline = 0) {
   if (eventRequestsAborted) {
-    done({ dropped: batch.length, errors: batch.length > 0 ? 1 : 0, retryItems: [] });
+    done({
+      dropped: batch.length,
+      errors: batch.length > 0 ? 1 : 0,
+      retryItems: [],
+      pipelineCounts: pipelineCount('api_rejected', 'shutdown', batch.length),
+    });
     return;
   }
   const remainingMs = absoluteDeadline > 0 ? absoluteDeadline - Date.now() : HTTP_TIMEOUT_MS;
   if (remainingMs <= 0) {
-    done({ dropped: batch.length, errors: batch.length > 0 ? 1 : 0, retryItems: [] });
+    done({
+      dropped: batch.length,
+      errors: batch.length > 0 ? 1 : 0,
+      retryItems: [],
+      pipelineCounts: pipelineCount('api_rejected', 'retry_deadline', batch.length),
+    });
     return;
   }
   postEventBatch(batch, Math.max(1, Math.min(HTTP_TIMEOUT_MS, remainingMs)), (result) => {
@@ -767,7 +1059,12 @@ function deliverEventBatch(batch, done, absoluteDeadline = 0) {
     // proxy-generated response body later truncates or aborts. Splitting remains safe and useful.
     if (result.statusCode === 413) {
       if (batch.length === 1) {
-        done({ dropped: 1, errors: 1, retryItems: [] });
+        done({
+          dropped: 1,
+          errors: 1,
+          retryItems: [],
+          pipelineCounts: pipelineCount('api_rejected', 'payload_too_large', 1),
+        });
         return;
       }
       const middle = Math.ceil(batch.length / 2);
@@ -781,21 +1078,45 @@ function deliverEventBatch(batch, done, absoluteDeadline = 0) {
       return;
     }
     if (result.error) {
-      done({ dropped: batch.length, errors: 1, retryItems: [] });
+      done({
+        dropped: 0,
+        errors: 0,
+        retryItems: batch,
+        pipelineCounts: pipelineCount('api_retryable', 'transport_error', batch.length),
+      });
       return;
     }
     if (result.statusCode < 200 || result.statusCode >= 300) {
-      done({ dropped: batch.length, errors: 1, retryItems: [] });
+      if (result.statusCode === 408 || result.statusCode === 425 || result.statusCode === 429 || result.statusCode >= 500) {
+        done({
+          dropped: 0,
+          errors: 0,
+          retryItems: batch,
+          pipelineCounts: pipelineCount('api_retryable', 'http_retryable', batch.length),
+        });
+      } else {
+        done({
+          dropped: batch.length,
+          errors: 1,
+          retryItems: [],
+          pipelineCounts: pipelineCount('api_rejected', 'http_rejected', batch.length),
+        });
+      }
       return;
     }
     let parsed;
     try {
       parsed = result.responseBody ? JSON.parse(result.responseBody) : undefined;
     } catch {
-      done({ dropped: batch.length, errors: 1, retryItems: [] });
+      done({
+        dropped: batch.length,
+        errors: 1,
+        retryItems: [],
+        pipelineCounts: pipelineCount('api_rejected', 'invalid_ack', batch.length),
+      });
       return;
     }
-    const outcome = validateBatchAck(parsed, batch);
+    const outcome = validateBatchAck(parsed, batch, result.envelope);
     if (outcome.reason) console.error(`[observer-forward] ${outcome.reason}`);
     done(outcome);
   });
@@ -813,7 +1134,15 @@ function abortActiveControlRequests(reason) {
 /**
  * POST a bounded JSON control-plane request and parse its business acknowledgement.
  */
-function postJsonResponse(url, bodyObj, timeoutMs, done) {
+function postJsonResponse(
+  url,
+  bodyObj,
+  timeoutMs,
+  done,
+  extraHeaders = {},
+  maxResponseBytes = 64 * 1024,
+  requestAgent,
+) {
   const isHttps = url.protocol === 'https:';
   const transport = isHttps ? https : http;
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
@@ -850,11 +1179,14 @@ function postJsonResponse(url, bodyObj, timeoutMs, done) {
       port: url.port || (isHttps ? 443 : 80),
       path: `${url.pathname}${url.search}`,
       method: 'POST',
-      agent: isHttps ? controlHttpsAgent : controlHttpAgent,
+      agent: requestAgent === false
+        ? false
+        : isHttps ? controlHttpsAgent : controlHttpAgent,
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body),
         ...sourceHeaders(),
+        ...extraHeaders,
       },
     },
     (res) => {
@@ -864,7 +1196,7 @@ function postJsonResponse(url, bodyObj, timeoutMs, done) {
       res.setEncoding('utf8');
       res.on('data', (chunk) => {
         if (oversized) return;
-        if (Buffer.byteLength(data) + Buffer.byteLength(chunk) > 64 * 1024) {
+        if (Buffer.byteLength(data) + Buffer.byteLength(chunk) > maxResponseBytes) {
           oversized = true;
           data = '';
           return;
@@ -879,7 +1211,7 @@ function postJsonResponse(url, bodyObj, timeoutMs, done) {
           return;
         }
         if (oversized) {
-          const error = new Error('control endpoint response exceeds 64 KiB');
+          const error = new Error(`control endpoint response exceeds ${maxResponseBytes} bytes`);
           error.retriable = false;
           finish(error);
           return;
@@ -913,7 +1245,7 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function getJson(url, timeoutMs, done) {
+function getJson(url, timeoutMs, done, extraHeaders = {}, requestAgent, maxResponseBytes = IDENTITY_SNAPSHOT_MAX_BYTES) {
   const isHttps = url.protocol === 'https:';
   const transport = isHttps ? https : http;
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
@@ -947,8 +1279,10 @@ function getJson(url, timeoutMs, done) {
       port: url.port || (isHttps ? 443 : 80),
       path: `${url.pathname}${url.search}`,
       method: 'GET',
-      agent: isHttps ? controlHttpsAgent : controlHttpAgent,
-      headers: sourceHeaders(),
+      agent: requestAgent === false
+        ? false
+        : isHttps ? controlHttpsAgent : controlHttpAgent,
+      headers: { ...sourceHeaders(), ...extraHeaders },
     },
     (res) => {
       response = res;
@@ -958,9 +1292,9 @@ function getJson(url, timeoutMs, done) {
       res.on('data', (chunk) => {
         if (settled) return;
         responseBytes += Buffer.byteLength(chunk);
-        if (responseBytes > IDENTITY_SNAPSHOT_MAX_BYTES) {
+        if (responseBytes > maxResponseBytes) {
           res.destroy();
-          finish(new Error(`identity snapshot response exceeds ${IDENTITY_SNAPSHOT_MAX_BYTES} bytes`));
+          finish(new Error(`control projection response exceeds ${maxResponseBytes} bytes`));
           return;
         }
         data += chunk;
@@ -998,8 +1332,165 @@ function refreshIdentitySnapshot() {
     if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) return;
     if (error || !workloadCache.replace(snapshot)) {
       if (error) workloadCache.errors++;
+      return;
     }
+    synchronizeInfrastructurePolicyRules();
   });
+}
+
+function synchronizeInfrastructurePolicyRules() {
+  const policyMetrics = infrastructurePolicy.metrics();
+  if (!policyMetrics.ready) return { removed: 0, applied: 0 };
+  const decisions = [];
+  const inventory = [
+    ...workloadCache.infrastructureInventory().map((facts) =>
+      infrastructurePolicy.resolveCgroupFacts(facts)),
+    ...infrastructurePolicy.hostInventory(),
+  ];
+  infrastructurePolicy.replaceMaterializedFacts(inventory);
+  for (const facts of inventory) {
+    if (CAPTURE_PROFILE_MODE === 'legacy') {
+      const evaluation = infrastructurePolicy.evaluateFacts(facts, 'FileAccess');
+      if (evaluation?.fileDecision) decisions.push(evaluation.fileDecision);
+      continue;
+    }
+    const captureDecision = infrastructurePolicy.materializeCaptureProfile(facts);
+    if (captureDecision) decisions.push(captureDecision);
+  }
+  const synchronized = filterRulePublisher.synchronizePolicyDecisions(
+    decisions,
+    policyMetrics.policyVersion,
+  );
+  if (CAPTURE_PROFILE_MODE !== 'legacy') filterRulePublisher.flush();
+  return synchronized;
+}
+
+let lastInfrastructurePolicyError = '';
+let lastLoggedInfrastructurePolicyVersion = -1;
+function refreshInfrastructurePolicy() {
+  if (!INFRASTRUCTURE_POLICY_SECS) return;
+  getJson(
+    infrastructurePolicyTarget,
+    5_000,
+    (error, policy) => {
+      if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) return;
+      if (error) {
+        infrastructurePolicy.recordLoadError();
+        filterRulePublisher.degradeToLastKnownGood(error.message);
+        if (error.message !== lastInfrastructurePolicyError) {
+          console.error(`[observer-forward] Infrastructure policy unavailable: ${error.message}`);
+          lastInfrastructurePolicyError = error.message;
+        }
+        return;
+      }
+      const loaded = infrastructurePolicy.replace(policy);
+      if (!loaded.ok) {
+        filterRulePublisher.degradeToLastKnownGood(loaded.error);
+        if (loaded.error !== lastInfrastructurePolicyError) {
+          console.error(`[observer-forward] Infrastructure policy ignored: ${loaded.error}`);
+          lastInfrastructurePolicyError = loaded.error;
+        }
+        return;
+      }
+      lastInfrastructurePolicyError = '';
+      filterRulePublisher.markControlPlaneReady();
+      const synchronized = synchronizeInfrastructurePolicyRules();
+      if (loaded.version !== lastLoggedInfrastructurePolicyVersion) {
+        console.error(
+          `[observer-forward] Infrastructure policy loaded: version=${loaded.version}; ` +
+          `rules=${loaded.rules}; materialized=${synchronized.applied}; removed=${synchronized.removed}`,
+        );
+        lastLoggedInfrastructurePolicyVersion = loaded.version;
+      }
+    },
+    INFRASTRUCTURE_POLICY_TOKEN
+      ? { 'X-AnySentry-Management-Token': INFRASTRUCTURE_POLICY_TOKEN }
+      : {},
+    // The low-frequency policy refresh must not reuse a server-expired control socket. Identity
+    // snapshots remain on the shared high-frequency pool.
+    false,
+  );
+}
+
+let lastUnifiedFilterProjectionError = '';
+let lastUnifiedFilterProjectionVersion = -1;
+function refreshUnifiedFilterProjection(done = () => {}) {
+  if (!UNIFIED_FILTER_PROJECTION_SECS) {
+    done();
+    return;
+  }
+  getJson(
+    unifiedFilterProjectionTarget,
+    5_000,
+    (error, projection) => {
+      if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) {
+        done();
+        return;
+      }
+      if (error) {
+        unifiedFilterPolicy.degrade(error.message);
+        if (error.message !== lastUnifiedFilterProjectionError) {
+          console.error(`[observer-forward] Unified Filter Rule projection unavailable: ${error.message}`);
+          lastUnifiedFilterProjectionError = error.message;
+        }
+        done();
+        return;
+      }
+      const loaded = unifiedFilterPolicy.replace(projection);
+      if (!loaded.ok) {
+        unifiedFilterPolicy.degrade(loaded.error);
+        if (loaded.error !== lastUnifiedFilterProjectionError) {
+          console.error(`[observer-forward] Unified Filter Rule projection ignored: ${loaded.error}`);
+          lastUnifiedFilterProjectionError = loaded.error;
+        }
+        done();
+        return;
+      }
+      lastUnifiedFilterProjectionError = '';
+      if (loaded.changed) {
+        const signatureResult = signatureRegistry.replaceSafely(
+          unifiedFilterPolicy.runtimeSignatureDocument(),
+          'unified-filter-rule-control-plane',
+        );
+        if (!signatureResult.ok) {
+          unifiedFilterPolicy.degrade(signatureResult.error);
+          console.error(`[observer-forward] Unified Agent Runtime signatures ignored: ${signatureResult.error}`);
+          done();
+          return;
+        }
+        templateRegistry = new AgentTemplateRegistry({
+          ...unifiedFilterPolicy.agentTemplateDocument(),
+          source: 'unified-filter-rule-control-plane',
+        });
+        workloadCache.templateRegistry = templateRegistry;
+        const settings = unifiedFilterPolicy.settings();
+        FILTER_MODE = settings.filterMode;
+        RETAIN_NON_AGENT = settings.retainNonAgent;
+        NOISE_POLICY = settings.noisePolicy;
+        FILE_AGGREGATION_ENABLED = settings.fileAggregationEnabled;
+        FILE_AGGREGATION_WINDOW_MS = settings.fileAggregationWindowMs;
+        fileAccessAggregator.windowMs = settings.fileAggregationWindowMs;
+        signatureReloader?.close();
+        if (signatureResult.matcherChanged) requestReconciliation();
+      }
+      if (loaded.catalogVersion !== lastUnifiedFilterProjectionVersion) {
+        const metrics = unifiedFilterPolicy.metrics();
+        console.error(
+          `[observer-forward] Unified Filter Rule projection loaded: catalog=${metrics.catalogVersion}; ` +
+          `identity=${metrics.domainVersions.identity}; capture=${metrics.domainVersions.capture}; ` +
+          `forwarder=${metrics.domainVersions.forwarder}; signatures=${metrics.runtimeSignatures}; ` +
+          `templates=${metrics.agentTemplates}; semantic_rules=${metrics.semanticRetentionRules}`,
+        );
+        lastUnifiedFilterProjectionVersion = loaded.catalogVersion;
+      }
+      done();
+    },
+    INFRASTRUCTURE_POLICY_TOKEN
+      ? { 'X-AnySentry-Management-Token': INFRASTRUCTURE_POLICY_TOKEN }
+      : {},
+    false,
+    UNIFIED_FILTER_PROJECTION_MAX_BYTES,
+  );
 }
 
 function runtimeLeaseRequest() {
@@ -1292,11 +1783,79 @@ function eventQueueMetrics(now = Date.now()) {
     outstandingOldestAgeMs: outstandingEvents > 0 ? Math.max(0, now - outstandingOldestAt) : 0,
     outstandingEventLimit: MAX_OUTSTANDING_EVENTS,
     outstandingByteLimit: MAX_OUTSTANDING_BYTES,
+    protectedReserveEvents: PROTECTED_RESERVE_EVENTS,
+    protectedReserveBytes: PROTECTED_RESERVE_BYTES,
   };
+}
+
+function deliverPendingHeartbeat(done, timeoutMs) {
+  const delivery = pendingHeartbeatDelivery;
+  if (!delivery) throw new Error('missing pending heartbeat delivery');
+  heartbeatDeliveryInFlight = true;
+  postJson(heartbeatTarget, delivery.body, timeoutMs, (failed, reason) => {
+    heartbeatDeliveryInFlight = false;
+    if (failed) {
+      pipelineAccounting.failDelivery();
+    } else {
+      pipelineAccounting.completeDelivery();
+      pendingHeartbeatDelivery = undefined;
+    }
+    const intentionallySuperseded = !delivery.shutdownFinal
+      && closing
+      && reason === GRACEFUL_SHUTDOWN_SUPERSEDE;
+    if (failed && !intentionallySuperseded) {
+      // The failed heartbeat window remains frozen for an exact retry. Its own transport failure
+      // belongs to the active next window, not to the payload whose delivery is uncertain.
+      outputDropped++;
+      errorCount++;
+    }
+    done(Boolean(failed));
+  });
 }
 
 function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false) {
   if (!HEARTBEAT_SECS) {
+    done(false);
+    return;
+  }
+  if (heartbeatDeliveryInFlight) {
+    // Periodic heartbeats may overlap a slow control request. Keep both active and frozen windows
+    // intact; a later interval will retry rather than duplicate the in-flight sequence.
+    done(false);
+    return;
+  }
+  if (shutdownFinal && pendingHeartbeatDelivery && !pendingHeartbeatDelivery.shutdownFinal) {
+    // Shutdown has already aborted the old in-flight control request, so its delivery is
+    // indeterminate. Do not rewrite or merge that sequence, and do not spend the final bounded
+    // control slot retrying it ahead of lifecycle evidence. Advancing the sequence makes the
+    // uncertainty an explicit API-visible gap while the final heartbeat reports only the active
+    // shutdown delta and always carries shutdownFinal=true.
+    pipelineAccounting.abandonPendingDelivery();
+    pendingHeartbeatDelivery = undefined;
+  }
+  if (pendingHeartbeatDelivery) {
+    const retriedWindow = pipelineAccounting.beginDelivery();
+    if (!retriedWindow) {
+      done(false);
+      return;
+    }
+    deliverPendingHeartbeat(done, timeoutMs);
+    return;
+  }
+  const eventQueues = eventQueueMetrics();
+  const accountingWindow = pipelineAccounting.beginDelivery({
+    queueEvents: eventQueues.queueDepth,
+    queueBytes: eventQueues.queueBytes,
+    inflightEvents: eventQueues.inflightEvents,
+    inflightBytes: eventQueues.inflightBytes,
+    retryEvents: eventQueues.retryOutstandingEvents,
+    retryBytes: eventQueues.retryOutstandingBytes,
+    outstandingEvents: eventQueues.outstandingEvents,
+    outstandingBytes: eventQueues.outstandingBytes,
+  });
+  // A slow heartbeat must not create concurrent deliveries for the same delta window. The next
+  // interval (or shutdown heartbeat after aborting the old request) retries the frozen payload.
+  if (!accountingWindow) {
     done(false);
     return;
   }
@@ -1310,35 +1869,15 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
   const behavior = behaviorDetector.metrics();
   const templates = templateRegistry.metrics();
   const processes = attributor.metrics();
+  const filterRules = filterRulePublisher.metrics();
+  const captureProfileReports = captureProfileReporter.metrics();
+  const infrastructureRules = infrastructurePolicy.metrics();
+  const unifiedRules = unifiedFilterPolicy.metrics();
+  const fileAggregation = fileAccessAggregator.metrics();
   const signatures = processes.runtimeSignatures || {};
   const reloader = signatureReloader?.metrics() || {};
-  const eventQueues = eventQueueMetrics();
   eventKindCounts = Object.create(null);
-  attributionCounts = {
-    observed: 0,
-    confirmedAgent: 0,
-    probableAgent: 0,
-    unknown: 0,
-    nonAgent: 0,
-    filteredNonAgent: 0,
-    wouldFilterNonAgent: 0,
-    filteredNoise: 0,
-    wouldFilterNoise: 0,
-    discoveryBudgetDropped: 0,
-    wouldDiscoveryBudgetDrop: 0,
-    e2eMarkerScopedOut: 0,
-    forwarded: 0,
-    queueDropped: 0,
-    batches: 0,
-    batchEvents: 0,
-    retryQueued: 0,
-    retryAttempts: 0,
-    retryRecovered: 0,
-    retryExhausted: 0,
-    workspaceConflict: 0,
-    infrastructure: 0,
-    deduplicated: 0,
-  };
+  attributionCounts = emptyAttributionCounts();
   e2eFilterReceipts = [];
   outputDropped = 0;
   errorCount = 0;
@@ -1346,9 +1885,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
   const e2eMarkerScopeMessage = E2E_INGEST_MARKER_PREFIX
     ? `e2e_marker_scope=enabled; e2e_marker_scoped_out=${classifications.e2eMarkerScopedOut}; `
     : '';
-  postJson(
-    heartbeatTarget,
-    {
+  const heartbeatBody = {
       collectorId: COLLECTOR_ID || undefined,
       nodeName: NODE_NAME || undefined,
       mode: `observer-forwarder:${FILTER_MODE}`,
@@ -1358,6 +1895,10 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
       queueDepth: eventQueues.queueDepth,
       outputDropped: dropped,
       errorCount: errors,
+      // These compatibility counters are reset per successfully frozen Forwarder window. They
+      // have never been process-lifetime cumulative counters; make that contract machine-readable.
+      legacyCounterTemporality: 'delta',
+      pipelineAccounting: accountingWindow,
       filterMetrics: {
         scope: LEGACY_FORWARD_SCOPE ?? 'decoupled',
         // A periodic heartbeat can race with shutdown. Mark only the heartbeat emitted after the
@@ -1373,14 +1914,102 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
         confirmedAgent: classifications.confirmedAgent,
         probableAgent: classifications.probableAgent,
         unknown: classifications.unknown,
+        unknownReasonCounts: classifications.unknownReasons,
         nonAgent: classifications.nonAgent,
         filteredNonAgent: classifications.filteredNonAgent,
         wouldFilterNonAgent: classifications.wouldFilterNonAgent,
+        filteredUnknown: classifications.filteredUnknown,
+        wouldFilterUnknown: classifications.wouldFilterUnknown,
         lastSuppressedAt: lastNonAgentSuppressedAt || undefined,
         filteredNoise: classifications.filteredNoise,
         wouldFilterNoise: classifications.wouldFilterNoise,
         discoveryBudgetDropped: classifications.discoveryBudgetDropped,
         wouldDiscoveryBudgetDrop: classifications.wouldDiscoveryBudgetDrop,
+        // This describes Collector pre-ring behavior, not merely Forwarder retention. A sampled
+        // Unknown stream must never be reported as lossless in the enriched heartbeat.
+        unknownFileLossless: OBSERVER_FILE_UNKNOWN_POLICY === 'keep',
+        unknownFileBudgetLimit: 0,
+        unknownFileGlobalBudgetLimit: 0,
+        unknownFileBudgetAllowed: 0,
+        unknownFileBudgetSuppressed: 0,
+        fileAggregationEnabled: FILE_AGGREGATION_ENABLED,
+        fileAggregationWindowMs: fileAggregation.windowMs,
+        fileAggregationPendingKeys: fileAggregation.pendingKeys,
+        fileAggregationCoalesced: fileAggregation.coalesced,
+        aggregatedFileEvents: classifications.aggregatedFileEvents,
+        aggregationOutputs: classifications.aggregationOutputs,
+        captureAggregateOutputs: classifications.captureAggregateOutputs,
+        // decision-op summary count; deliberately separate from physical Forwarder event counts.
+        captureAggregateDecisionAttempts: classifications.captureAggregateDecisionAttempts,
+        protectedQueueDropped: classifications.protectedQueueDropped,
+        queueDroppedByClass: classifications.queueDroppedByClass,
+        filterRulePublisherEnabled: filterRules.enabled,
+        filterRuleEnforceDrops: filterRules.enforceDrops,
+        captureProfileMode: filterRules.captureProfileMode,
+        captureProfileActivationMode: filterRules.activationMode,
+        captureProfileActivationReason: filterRules.activationReason,
+        captureProfileControlPlaneState: filterRules.controlPlaneState,
+        captureProfileAckEnabled: filterRules.ackEnabled,
+        captureProfileAckAccepted: filterRules.ackAccepted,
+        captureProfileAckRejected: filterRules.ackRejected,
+        captureProfileAckReplayIgnored: filterRules.ackReplayIgnored,
+        captureProfileCentralAccepted: filterRules.centralAccepted,
+        captureProfileCentralRejected: filterRules.centralRejected,
+        captureProfileActivationGrants: filterRules.activationGrants,
+        captureProfileActivationRevoked: filterRules.activationRevoked,
+        captureProfileIntentChanges: filterRules.intentChanges,
+        captureProfileTtlRefreshes: filterRules.ttlRefreshes,
+        captureProfileCoalescedTtlRefreshes: filterRules.coalescedTtlRefreshes,
+        captureProfileSemanticNoops: filterRules.semanticNoops,
+        captureProfileLkgDegraded: filterRules.lkgDegraded,
+        captureProfileCapacityEvicted: filterRules.capacityEvicted,
+        captureProfileCapacityAgentEvicted: filterRules.capacityAgentEvicted,
+        captureProfileOversizeSnapshots: filterRules.oversizeSnapshots,
+        captureProfileReportInFlight: captureProfileReports.inFlight,
+        captureProfileReportPosts: captureProfileReports.reports,
+        captureProfileReportErrors: captureProfileReports.reportErrors,
+        captureProfileReportAccepted: captureProfileReports.centralAccepted,
+        captureProfileReportRejected: captureProfileReports.centralRejected,
+        filterRuleVersion: filterRules.version,
+        filterRuleEntries: filterRules.entries,
+        filterRuleWrites: filterRules.writes,
+        filterRuleErrors: filterRules.errors,
+        filterRuleConflicts: filterRules.conflicts,
+        unifiedCatalogVersion: unifiedRules.catalogVersion,
+        unifiedIdentityVersion: unifiedRules.domainVersions.identity,
+        unifiedCaptureVersion: unifiedRules.domainVersions.capture,
+        unifiedForwarderVersion: unifiedRules.domainVersions.forwarder,
+        unifiedRetentionVersion: unifiedRules.domainVersions.retention,
+        unifiedProjectionState: unifiedRules.state,
+        unifiedProjectionHash: unifiedRules.contentHash || undefined,
+        unifiedProjectionIntentHash: unifiedRules.intentHash || undefined,
+        unifiedProjectionLoads: unifiedRules.loads,
+        unifiedProjectionLoadErrors: unifiedRules.loadErrors,
+        unifiedProjectionDegraded: unifiedRules.degraded,
+        unifiedIdentityRules: unifiedRules.identityRules,
+        unifiedCaptureRules: unifiedRules.captureProfileRules,
+        unifiedSemanticRules: unifiedRules.semanticRetentionRules,
+        unifiedRuntimeSignatures: unifiedRules.runtimeSignatures,
+        unifiedAgentTemplates: unifiedRules.agentTemplates,
+        unifiedIdentityIndexBuckets: unifiedRules.identityIndexBuckets,
+        unifiedCaptureIndexBuckets: unifiedRules.captureIndexBuckets,
+        unifiedSemanticIndexBuckets: unifiedRules.semanticIndexBuckets,
+        unifiedMaxIndexBucketSize: unifiedRules.maxIndexBucketSize,
+        unifiedIdentityMatches: unifiedRules.identityMatches,
+        unifiedCaptureMatches: unifiedRules.captureMatches,
+        unifiedSemanticMatches: unifiedRules.semanticMatches,
+        unifiedSampleSuppressed: unifiedRules.sampleSuppressed,
+        infrastructurePolicyReady: infrastructureRules.ready,
+        infrastructurePolicyVersion: infrastructureRules.policyVersion,
+        infrastructurePolicyRules: infrastructureRules.rules,
+        infrastructurePolicyLoads: infrastructureRules.loads,
+        infrastructurePolicyLoadErrors: infrastructureRules.loadErrors,
+        infrastructurePolicyMatches: infrastructureRules.matches,
+        infrastructurePolicyWouldDrop: infrastructureRules.wouldDrop,
+        infrastructurePolicyEnforced: infrastructureRules.enforced,
+        infrastructurePolicyAgentConflicts: infrastructureRules.agentConflicts,
+        infrastructurePolicyMaterialized: infrastructureRules.materialized,
+        infrastructurePolicyExpiresInSeconds: infrastructureRules.expiresInSeconds,
         ...(filterReceipts.length ? { e2eFilterReceipts: filterReceipts } : {}),
         deduplicated: classifications.deduplicated,
         queueDropped: classifications.queueDropped,
@@ -1404,8 +2033,12 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
         outstandingOldestAgeMs: eventQueues.outstandingOldestAgeMs,
         outstandingEventLimit: eventQueues.outstandingEventLimit,
         outstandingByteLimit: eventQueues.outstandingByteLimit,
+        protectedReserveEvents: eventQueues.protectedReserveEvents,
+        protectedReserveBytes: eventQueues.protectedReserveBytes,
         identitySnapshotReady: workload.ready,
         identitySnapshotVersion: workload.version,
+        identityKubernetesVersion: workload.sources?.kubernetes?.version,
+        identityDockerVersion: workload.sources?.docker?.version,
         identitySnapshotAgeSeconds: workload.ageSeconds,
         identityCacheEntries: workload.entries,
         identityCacheHits: workload.hits,
@@ -1483,21 +2116,11 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
         infrastructure: classifications.infrastructure,
         workspaceConflict: classifications.workspaceConflict,
       },
-      message: `filter_mode=${FILTER_MODE}; ${e2eMarkerScopeMessage}retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; retry_queued=${classifications.retryQueued}; retry_attempts=${classifications.retryAttempts}; retry_recovered=${classifications.retryRecovered}; retry_exhausted=${classifications.retryExhausted}; retry_queue_depth=${eventQueues.retryQueueDepth}; retry_outstanding=${eventQueues.retryOutstandingEvents}; outstanding_events=${eventQueues.outstandingEvents}; outstanding_bytes=${eventQueues.outstandingBytes}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
+      message: `filter_mode=${FILTER_MODE}; ${e2eMarkerScopeMessage}retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_unknown=${classifications.filteredUnknown}; would_filter_unknown=${classifications.wouldFilterUnknown}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; aggregated_file_events=${classifications.aggregatedFileEvents}; aggregation_outputs=${classifications.aggregationOutputs}; filter_rule_version=${filterRules.version}; filter_rule_entries=${filterRules.entries}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; retry_queued=${classifications.retryQueued}; retry_attempts=${classifications.retryAttempts}; retry_recovered=${classifications.retryRecovered}; retry_exhausted=${classifications.retryExhausted}; retry_queue_depth=${eventQueues.retryQueueDepth}; retry_outstanding=${eventQueues.retryOutstandingEvents}; outstanding_events=${eventQueues.outstandingEvents}; outstanding_bytes=${eventQueues.outstandingBytes}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
-    },
-    timeoutMs,
-    (failed, reason) => {
-      const intentionallySuperseded = !shutdownFinal
-        && closing
-        && reason === GRACEFUL_SHUTDOWN_SUPERSEDE;
-      if (failed && !intentionallySuperseded) {
-        outputDropped++;
-        errorCount++;
-      }
-      done(Boolean(failed));
-    },
-  );
+  };
+  pendingHeartbeatDelivery = { body: heartbeatBody, shutdownFinal };
+  deliverPendingHeartbeat(done, timeoutMs);
 }
 
 function closeTransports() {
@@ -1507,7 +2130,10 @@ function closeTransports() {
   retryTimer = undefined;
   if (reconcileTimer) clearTimeout(reconcileTimer);
   reconcileTimer = undefined;
+  captureProfileReporter.close();
   signatureReloader?.close();
+  if (infrastructurePolicyTimer) clearInterval(infrastructurePolicyTimer);
+  infrastructurePolicyTimer = undefined;
   dockerDiscovery.stop();
   infrastructureResolver.close();
   abortActiveEventRequests('event transport closed');
@@ -1521,12 +2147,23 @@ function closeTransports() {
 }
 
 function queuePriority(kind, classification) {
+  if (kind === 'CaptureAggregate') return 0;
   if (kind === 'SecurityAction') return 5;
+  if (kind === 'ToolExec' || kind === 'ProcessExit') return 4;
   if (classification.attribution?.classification === 'confirmed_agent') return 4;
   if (classification.state === 'agent') return 3;
   if (classification.state === 'unknown') return 2;
-  if (kind === 'ToolExec' || kind === 'ProcessExit') return 1;
   return 0;
+}
+
+function queueDropClass(kind, priority) {
+  if (kind === 'ToolExec') return 'tool_exec';
+  if (kind === 'ProcessExit') return 'process_exit';
+  if (kind === 'SecurityAction') return 'security';
+  if (kind === 'CollectorHeartbeat') return 'collector_heartbeat';
+  if (kind === 'CaptureAggregate') return 'capture_aggregate';
+  if (priority >= PROTECTED_PRIORITY) return 'agent';
+  return 'other';
 }
 
 function scheduleBatch() {
@@ -1540,6 +2177,12 @@ function scheduleBatch() {
 
 function itemsBytes(items) {
   return items.reduce((sum, item) => sum + item.bytes, 0);
+}
+
+function recordPipelineCounts(counts) {
+  for (const item of counts ?? []) {
+    pipelineAccounting.record(item.stage, item.reason, item.count);
+  }
 }
 
 function trackOutstanding(item) {
@@ -1586,11 +2229,12 @@ function markRetryOwned(items) {
   }
 }
 
-function recordRetryExhausted(items, operationalError = true) {
+function recordRetryExhausted(items, operationalError = true, reason = 'retry_exhausted') {
   const count = settleOutstanding(items);
   if (!count) return;
   attributionCounts.retryExhausted += count;
   outputDropped += count;
+  pipelineAccounting.record('queue_dropped', reason, count);
   if (operationalError) errorCount++;
 }
 
@@ -1622,7 +2266,7 @@ function scheduleRetryItems(items, retryAfterMs) {
   if (!items.length) return;
   markRetryOwned(items);
   if (eventRequestsAborted) {
-    recordRetryExhausted(items);
+    recordRetryExhausted(items, true, 'shutdown');
     return;
   }
   const now = Date.now();
@@ -1654,6 +2298,7 @@ function takeReadyRetryBatch(now = Date.now()) {
 function finishBatch(batch, outcome, retryDelivery) {
   outputDropped += outcome.dropped;
   errorCount += outcome.errors;
+  recordPipelineCounts(outcome.pipelineCounts);
   inflight = Math.max(0, inflight - 1);
   inflightEvents = Math.max(0, inflightEvents - batch.length);
   inflightBytes = Math.max(0, inflightBytes - itemsBytes(batch));
@@ -1736,22 +2381,38 @@ function flushPending() {
   pumpEventWork();
 }
 
-function dropQueuedItem(item) {
-  if (!item) return;
-  settleOutstanding([item]);
+function recordQueueDrop(kind, priority, reason) {
   outputDropped++;
   attributionCounts.queueDropped++;
+  const dropClass = queueDropClass(kind, priority);
+  attributionCounts.queueDroppedByClass[dropClass] =
+    (attributionCounts.queueDroppedByClass[dropClass] || 0) + 1;
+  if (priority >= PROTECTED_PRIORITY) attributionCounts.protectedQueueDropped++;
+  pipelineAccounting.record('queue_dropped', reason);
+}
+
+function dropQueuedItem(item, reason = 'priority_evicted') {
+  if (!item) return;
+  settleOutstanding([item]);
+  recordQueueDrop(item.kind, item.priority, reason);
 }
 
 function makeQueueRoom(bytes, priority) {
+  const protectedTraffic = priority >= PROTECTED_PRIORITY;
+  const eventLimit = protectedTraffic
+    ? MAX_OUTSTANDING_EVENTS
+    : Math.max(0, MAX_OUTSTANDING_EVENTS - PROTECTED_RESERVE_EVENTS);
+  const byteLimit = protectedTraffic
+    ? MAX_OUTSTANDING_BYTES
+    : Math.max(0, MAX_OUTSTANDING_BYTES - PROTECTED_RESERVE_BYTES);
   const exceedsOutstanding = () => (
-    outstandingEvents + 1 > MAX_OUTSTANDING_EVENTS
-    || outstandingBytes + bytes > MAX_OUTSTANDING_BYTES
+    outstandingEvents + 1 > eventLimit
+    || outstandingBytes + bytes > byteLimit
   );
   while (exceedsOutstanding()) {
     const lowest = pending.lowestPriority();
     if (lowest < 0 || priority <= lowest) return false;
-    dropQueuedItem(pending.dropLowest());
+    dropQueuedItem(pending.dropLowest(), 'priority_evicted');
   }
   return true;
 }
@@ -1769,27 +2430,29 @@ function updateInputFlow() {
   else rl.resume();
 }
 
-function enqueue(body, priority, countForwarded = true) {
+function enqueue(body, priority, countForwarded = true, kind = '') {
   let bytes;
   try {
     bytes = Buffer.byteLength(JSON.stringify(body));
   } catch {
-    outputDropped++;
-    attributionCounts.queueDropped++;
+    recordQueueDrop(kind, priority, 'serialization_error');
     return;
   }
   if (bytes > MAX_EVENT_BYTES) {
-    outputDropped++;
-    attributionCounts.queueDropped++;
+    recordQueueDrop(kind, priority, 'event_too_large');
     return;
   }
   if (!makeQueueRoom(bytes, priority)) {
-    outputDropped++;
-    attributionCounts.queueDropped++;
+    recordQueueDrop(
+      kind,
+      priority,
+      priority >= PROTECTED_PRIORITY ? 'outstanding_limit' : 'protected_reserve',
+    );
     return;
   }
   const item = {
     body,
+    kind,
     priority,
     bytes,
     createdAt: Date.now(),
@@ -1802,14 +2465,17 @@ function enqueue(body, priority, countForwarded = true) {
   };
   const result = pending.push(item, priority);
   if (!result.accepted) {
-    outputDropped++;
-    attributionCounts.queueDropped++;
+    recordQueueDrop(kind, priority, 'queue_rejected');
     return;
   }
   if (result.dropped && !result.droppedIncoming) {
     dropQueuedItem(result.dropped);
   }
   trackOutstanding(item);
+  pipelineAccounting.record(
+    'queue_admitted',
+    countForwarded ? 'event' : 'collector_heartbeat',
+  );
   if (countForwarded) attributionCounts.forwarded++;
   if (pending.length >= BATCH_SIZE) flushPending();
   else scheduleBatch();
@@ -1818,7 +2484,7 @@ function enqueue(body, priority, countForwarded = true) {
 
 function abandonPendingEvents() {
   if (pending.length === 0) return;
-  while (pending.length > 0) dropQueuedItem(pending.dropLowest());
+  while (pending.length > 0) dropQueuedItem(pending.dropLowest(), 'shutdown');
 }
 
 function abandonRetryEvents() {
@@ -1826,7 +2492,7 @@ function abandonRetryEvents() {
   retryTimer = undefined;
   if (retryTasks.length === 0) return;
   const abandoned = retryTasks.splice(0).flatMap((task) => task.items);
-  recordRetryExhausted(abandoned);
+  recordRetryExhausted(abandoned, true, 'shutdown');
 }
 
 function remainingShutdownMs() {
@@ -1864,11 +2530,16 @@ function flushAndClose() {
   closing = true;
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   if (identitySnapshotTimer) clearInterval(identitySnapshotTimer);
+  if (infrastructurePolicyTimer) clearInterval(infrastructurePolicyTimer);
+  if (unifiedFilterProjectionTimer) clearInterval(unifiedFilterProjectionTimer);
   if (runtimeSnapshotTimer) clearInterval(runtimeSnapshotTimer);
   if (rootLivenessTimer) clearInterval(rootLivenessTimer);
   if (reconcileTimer) clearTimeout(reconcileTimer);
   if (batchTimer) clearTimeout(batchTimer);
   batchTimer = undefined;
+  captureProfileReporter.close();
+  fileAccessAggregator.flushAll();
+  filterRulePublisher.close();
   shutdownDeadline = Date.now() + SHUTDOWN_TIMEOUT_MS;
   shutdownForceTimer = setTimeout(forceShutdown, SHUTDOWN_TIMEOUT_MS);
   const controlReserveMs = Math.min(5_000, Math.max(1_000, Math.floor(SHUTDOWN_TIMEOUT_MS / 3)));
@@ -1903,16 +2574,81 @@ function handleShutdownSignal(signal) {
   flushAndClose();
 }
 
+function enqueueClassifiedRecord(record) {
+  const {
+    observerEvent,
+    line,
+    classification,
+    activity,
+    classificationSemantics,
+    filterDecision: decision,
+    semanticDecision,
+    representedEvents = 1,
+  } = record;
+  const kind = eventKind(observerEvent);
+  const nextSourceEventId = sourceEventId(line);
+  const sourceSequence = sourceEventSequence;
+  bumpEventKind(observerEvent);
+  if (representedEvents > 1) {
+    attributionCounts.aggregatedFileEvents += representedEvents - 1;
+    attributionCounts.aggregationOutputs++;
+    pipelineAccounting.record('aggregated', 'file_access_coalesced', representedEvents - 1);
+  }
+  enqueue(
+    {
+      line,
+      sourceEventId: nextSourceEventId,
+      // S3 rollout-resolved view. It was computed once from the final internal classification and
+      // deliberately ignores any producer-supplied field with the same name.
+      ...classificationSemantics,
+      ...(classification.attribution ? { attribution: classification.attribution } : {}),
+      ...(activity ?? {}),
+      attributes: {
+        sourceSequence,
+        ...(decision ? {
+          filterAction: decision.action,
+          filterReasonCode: decision.reasonCode,
+          filterRuleVersion: decision.ruleVersion,
+          filterRuleAuthority: decision.authority,
+        } : {}),
+        ...(semanticDecision ? {
+          filterF2RuleId: semanticDecision.ruleId,
+          filterF2RuleRevision: semanticDecision.ruleRevision,
+          filterF2Action: semanticDecision.action,
+          filterF2ReasonCode: semanticDecision.reasonCode,
+          filterRuleCatalogVersion: semanticDecision.catalogVersion,
+          filterRuleForwarderVersion: semanticDecision.domainVersion,
+        } : {}),
+      },
+      ...(COLLECTOR_ID ? { collectorId: COLLECTOR_ID } : {}),
+      ...(NODE_NAME ? { nodeName: NODE_NAME } : {}),
+      ...sourceFields(classification.state === 'agent' ? classification.workspacePath : ''),
+    },
+    queuePriority(kind, classification),
+    true,
+    kind,
+  );
+}
+
 function handleLine(raw) {
   const line = raw.trim();
   if (!line) return;
+  pipelineAccounting.record('received', 'input');
   let o;
-  try { o = JSON.parse(line); } catch { return; } // skip the collector's human log lines / partials
+  try {
+    o = JSON.parse(line);
+  } catch {
+    // Collector human log lines and partial writes are intentionally ignored, but remain visible
+    // as an explicit parse boundary loss instead of disappearing from the conservation chain.
+    pipelineAccounting.record('parse_error', 'invalid_json');
+    return;
+  }
   const kind = eventKind(o);
   if (kind === 'CollectorHeartbeat') {
     // Collector health is control-plane telemetry, not Agent activity. It must reach the raw
     // heartbeat ingest seam even when Enforce suppresses unknown workloads, and it must not
     // inflate Agent observed/unknown/forwarded classification counters.
+    pipelineAccounting.record('classified', 'collector_heartbeat');
     enqueue(
       {
         line,
@@ -1923,21 +2659,81 @@ function handleLine(raw) {
       },
       5,
       false,
+      kind,
     );
+    return;
+  }
+  if (kind === 'CaptureAggregate') {
+    const summary = o.event.CaptureAggregate;
+    // Observer summaries use `count` as decision-op units. Older development fixtures used an
+    // attempted alias; accept it only as a compatibility fallback while never mixing the value
+    // into physical event/ring counters.
+    const attempted = Number(
+      summary?.count
+      ?? summary?.decisionAttempted
+      ?? summary?.decision_attempted
+      ?? summary?.attempted,
+    );
+    attributionCounts.captureAggregateOutputs++;
+    if (Number.isSafeInteger(attempted) && attempted >= 0) {
+      attributionCounts.captureAggregateDecisionAttempts += attempted;
+    }
+    // The summary is already a bounded capture decision output. Preserve its own profile metadata
+    // and do not run workload/PID classification, behavior discovery, identity counters, raw
+    // filtering, file coalescing, or profile learning a second time.
+    pipelineAccounting.record('classified', 'capture_aggregate');
+    const nextSourceEventId = sourceEventId(line);
+    const sourceSequence = sourceEventSequence;
+    bumpEventKind(o);
+    enqueue({
+      line,
+      sourceEventId: nextSourceEventId,
+      attributes: {
+        sourceSequence,
+        captureAggregate: true,
+        captureWindowStartUnixNs: String(
+          summary?.windowStartUnixNsExact
+          ?? summary?.window_start_unix_ns_exact
+          ?? summary?.windowStartUnixNs
+          ?? summary?.window_start_unix_ns
+          ?? '',
+        ),
+        captureWindowEndUnixNs: String(
+          summary?.windowEndUnixNsExact
+          ?? summary?.window_end_unix_ns_exact
+          ?? summary?.windowEndUnixNs
+          ?? summary?.window_end_unix_ns
+          ?? '',
+        ),
+        captureCgroupId: String(summary?.cgroupId ?? summary?.cgroup_id ?? ''),
+        captureProbe: summary?.probe,
+        captureEffectiveAction: summary?.effectiveAction ?? summary?.effective_action ?? summary?.action,
+        captureQualifier: summary?.qualifier,
+        captureProfile: summary?.profile,
+        captureEpoch: summary?.epoch,
+        capturePolicyVersion: summary?.policyVersion ?? summary?.policy_version,
+        captureCount: Number.isSafeInteger(attempted) && attempted >= 0 ? attempted : undefined,
+        captureBytes: Number.isSafeInteger(Number(summary?.bytes)) && Number(summary?.bytes) >= 0
+          ? Number(summary.bytes)
+          : undefined,
+        captureAuthority: summary?.authority,
+        captureReason: summary?.reason,
+        captureTerminal: summary?.terminal === true,
+      },
+      eventCategory: 'runtime',
+      ...(COLLECTOR_ID ? { collectorId: COLLECTOR_ID } : {}),
+      ...(NODE_NAME ? { nodeName: NODE_NAME } : {}),
+      ...sourceFields(''),
+    }, 0, true, kind);
     return;
   }
   attributionCounts.observed++;
   if (toolExecDeduper.isDuplicate(o)) {
     attributionCounts.deduplicated++;
+    pipelineAccounting.record('filtered', 'deduplicated');
     return;
   }
   const processClassification = attributor.classify(o);
-  // A trusted deployment label explicitly opts these process trees out. Infrastructure wins over
-  // templates and discovery caches and is dropped before ingest in every scope.
-  if (processClassification.state === 'infrastructure') {
-    attributionCounts.infrastructure++;
-    return;
-  }
   const workloadClassification = workloadCache.classify(o);
   const activity = classifyEventActivity(o, processClassification, workloadClassification);
   const templateClassification = templateRegistry.classifyEvent(o);
@@ -1946,11 +2742,54 @@ function handleLine(raw) {
     workloadClassification,
     templateClassification,
   ) ?? processClassification;
-  const classification =
-    (behaviorDiscoveryEligible(baseClassification)
-      ? behaviorDetector.observe(o, baseClassification.attribution)
+  let catalogClassification = baseClassification;
+  for (const candidate of unifiedFilterPolicy.identityCandidates(o, catalogClassification)) {
+    catalogClassification = mergeAttributionClassifications(catalogClassification, candidate)
+      ?? catalogClassification;
+  }
+  const infrastructureEvaluation = infrastructurePolicy.evaluate(o, workloadClassification);
+  // Stable authoritative inventory is resolved before heuristic behavior discovery. A weak
+  // high-volume file pattern must never promote ClickHouse/Postgres into a probable Agent and then
+  // defeat its exact Infrastructure rule. Existing positive Agent signatures/labels remain in
+  // baseClassification and still win during the merge below.
+  const authoritativeInfrastructure =
+    infrastructureEvaluation?.classification?.state === 'infrastructure';
+  const identityClassification =
+    (!authoritativeInfrastructure && behaviorDiscoveryEligible(catalogClassification)
+      ? behaviorDetector.observe(o, catalogClassification.attribution)
       : undefined) ??
-    baseClassification;
+    catalogClassification;
+  const classification = infrastructureEvaluation?.classification
+    ? mergeAttributionClassifications(
+        identityClassification,
+        infrastructureEvaluation.classification,
+      ) ?? identityClassification
+    : identityClassification;
+  const classificationSemantics = classificationSemanticsEnvelope(classification, o);
+  const unknownReason = classificationSemantics.classificationSemantics?.unknownReason;
+  if (unknownReason) {
+    attributionCounts.unknownReasons[unknownReason] =
+      (attributionCounts.unknownReasons[unknownReason] || 0) + 1;
+  }
+  if (
+    infrastructureEvaluation
+    && classification.state === 'agent'
+    && infrastructureEvaluation.resolution.role === 'infrastructure'
+  ) {
+    infrastructurePolicy.recordAgentConflict();
+  }
+  const catalogCaptureDecision = unifiedFilterPolicy.captureDecision(o, classification);
+  const resolvedCaptureDecision = catalogCaptureDecision?.captureProfile === 'investigation_full'
+    ? catalogCaptureDecision
+    : (CAPTURE_PROFILE_MODE === 'legacy'
+        ? infrastructureEvaluation?.fileDecision
+        : infrastructureEvaluation?.captureDecision)
+      ?? catalogCaptureDecision;
+  const decision = filterRulePublisher.observe(
+    o,
+    classification,
+    resolvedCaptureDecision,
+  );
   // Runtime lifecycle is rooted in ProcessKey, but placement/confirmation can come from Docker,
   // Kubernetes, or a trusted template. Enrich the root after field-level merge without replacing
   // its process-instance ID with a workload-level ID.
@@ -1958,66 +2797,128 @@ function handleLine(raw) {
   const classificationName = classification.attribution?.classification;
   if (classification.state === 'agent' && classificationName === 'confirmed_agent') {
     attributionCounts.confirmedAgent++;
+    pipelineAccounting.record('classified', 'confirmed_agent');
   } else if (classification.state === 'agent') {
     attributionCounts.probableAgent++;
+    pipelineAccounting.record('classified', 'probable_agent');
+  } else if (classification.state === 'infrastructure') {
+    attributionCounts.infrastructure++;
+    attributionCounts.nonAgent++;
+    pipelineAccounting.record('classified', 'infrastructure');
   } else if (classification.state === 'non_agent') {
     attributionCounts.nonAgent++;
+    pipelineAccounting.record('classified', 'non_agent');
   } else {
     attributionCounts.unknown++;
+    pipelineAccounting.record('classified', 'unknown');
   }
   if (classification.workspaceConflict || classification.attribution?.conflict) {
     attributionCounts.workspaceConflict++;
   }
   let filterReason = '';
-  if (classification.state === 'non_agent' && !RETAIN_NON_AGENT) {
-    filterReason = 'non_agent';
-  } else if (classification.state === 'unknown' && !RETAIN_UNKNOWN) {
-    filterReason = 'unknown';
-  } else if (NOISE_POLICY === 'balanced' && isNoise(o)) {
-    // Routine pseudo-filesystem writes are an independent, explainable noise rule. FileDelete is
-    // deliberately excluded because deletion remains high-value evidence.
-    filterReason = 'routine_noise';
+  // Control-plane, lifecycle and security evidence is protected independently of how the
+  // workload identity was learned. Exact self/manual non-Agent inventory may suppress routine
+  // syscall detail, but it must never suppress these event kinds merely because no central
+  // Infrastructure rule happened to materialize for the same workload.
+  const alwaysKeep = alwaysKeepEventKind(kind);
+  const semanticDecision = unifiedFilterPolicy.semanticDecision(o, classification);
+  if (!alwaysKeep && semanticDecision) {
+    if (semanticDecision.action === 'suppress') {
+      filterReason = semanticDecision.reasonCode || 'non_agent';
+    } else if (
+      semanticDecision.action === 'sample'
+      && !unifiedFilterPolicy.shouldKeepSample(
+        `${semanticDecision.ruleId}:${classification.attribution?.physicalWorkloadId || classification.attribution?.agentInstanceId || kind}`,
+      )
+    ) {
+      filterReason = 'semantic_sample';
+    }
+  } else if (!alwaysKeep && !unifiedFilterPolicy.active()) {
+    if (
+      (classification.state === 'non_agent' || classification.state === 'infrastructure')
+      && !RETAIN_NON_AGENT
+      && (
+        classification.state !== 'infrastructure'
+        || !infrastructureEvaluation
+        || infrastructureEvaluation.decision?.action === 'drop'
+      )
+    ) {
+      filterReason = 'non_agent';
+    } else if (
+      NOISE_POLICY === 'balanced'
+      && (classification.state === 'non_agent' || classification.state === 'infrastructure')
+      && isNoise(o)
+    ) {
+      // Paths may reduce an already proven non-Agent workload, but can never turn Unknown into a
+      // negative identity or silently suppress its evidence.
+      filterReason = 'routine_noise';
+    }
   }
   if (filterReason) {
     recordE2eFilterReceipt(o, classification, filterReason, line);
     if (FILTER_MODE === 'shadow') {
       if (filterReason === 'non_agent') attributionCounts.wouldFilterNonAgent++;
-      else if (filterReason === 'unknown') attributionCounts.wouldDiscoveryBudgetDrop++;
+      else if (filterReason === 'unknown') attributionCounts.wouldFilterUnknown++;
+      else if (filterReason === 'discovery_budget') attributionCounts.wouldDiscoveryBudgetDrop++;
       else attributionCounts.wouldFilterNoise++;
     } else {
       if (filterReason === 'non_agent') {
         attributionCounts.filteredNonAgent++;
         lastNonAgentSuppressedAt = new Date().toISOString();
       } else if (filterReason === 'unknown') {
+        attributionCounts.filteredUnknown++;
+      } else if (filterReason === 'discovery_budget') {
         attributionCounts.discoveryBudgetDropped++;
       } else {
         attributionCounts.filteredNoise++;
       }
+      pipelineAccounting.record('filtered', filterReason);
       return;
     }
   }
   if (!matchesE2eIngestMarkerScope(o)) {
     attributionCounts.e2eMarkerScopedOut++;
+    pipelineAccounting.record('filtered', 'e2e_scope');
     return;
   }
-  bumpEventKind(o);
-
-  enqueue(
-    {
-      line,
-      sourceEventId: sourceEventId(line),
-      ...(classification.attribution ? { attribution: classification.attribution } : {}),
-      ...(activity ?? {}),
-      ...(COLLECTOR_ID ? { collectorId: COLLECTOR_ID } : {}),
-      ...(NODE_NAME ? { nodeName: NODE_NAME } : {}),
-      ...sourceFields(classification.state === 'agent' ? classification.workspacePath : ''),
-    },
-    queuePriority(kind, classification),
-  );
+  const record = {
+    observerEvent: o,
+    line,
+    classification,
+    activity,
+    classificationSemantics,
+    filterDecision: decision,
+    semanticDecision,
+    processStartTime: attributor.stableProcessStartTime(o),
+  };
+  if (FILE_AGGREGATION_ENABLED && kind === 'FileAccess') {
+    fileAccessAggregator.push(record, enqueueClassifiedRecord);
+  } else {
+    enqueueClassifiedRecord(record);
+  }
 }
 
 async function start() {
   resolveObserverForwarderHostPid();
+  // Attach stdin before the first asynchronous startup step. A short-lived collector or a test
+  // pipe can write its complete NDJSON stream and close while infrastructure/Docker discovery is
+  // still initializing. Creating readline afterwards loses that already-ended stream and lets the
+  // process exit successfully without forwarding any evidence. Pausing the interface keeps the
+  // kernel pipe as the bounded startup buffer, so producers naturally see backpressure until the
+  // identity state is ready; resuming preserves the original line order without an unbounded JS
+  // queue.
+  rl = readline.createInterface({ input: process.stdin });
+  rl.pause();
+  rl.on('line', handleLine);
+  rl.on('close', flushAndClose);
+
+  // The central catalog is the authoritative definition source. ConfigMap signatures and
+  // deployment environment values above remain a bounded bootstrap/LKG path only; wait for one
+  // short control request before scanning existing processes so a newly enforced signature does
+  // not miss an Agent that started before the Forwarder.
+  await new Promise((resolve) => refreshUnifiedFilterProjection(resolve));
+  if (closing) return;
+
   const infrastructure = await infrastructureResolver.resolve();
   if (closing) return;
   attributor.setInfrastructureRoots(infrastructure.roots);
@@ -2035,7 +2936,7 @@ async function start() {
 
   console.error(`[observer-forward] agent templates: source=${templateRegistry.source}; loaded=${templateRegistry.metrics().loaded}; invalid=${templateRegistry.metrics().invalid + templateLoadErrors}`);
   const signatureFile = process.env.ANYSENTRY_AGENT_RUNTIME_SIGNATURES_FILE?.trim();
-  if (signatureFile) {
+  if (signatureFile && !unifiedFilterPolicy.active()) {
     signatureReloader = new RuntimeSignatureReloader({
       registry: signatureRegistry,
       filePath: signatureFile,
@@ -2064,7 +2965,25 @@ async function start() {
     `version=${signatureRegistry.version}; loaded=${signatureRegistry.metrics().loaded}; ` +
     `hash=${signatureRegistry.hash}`,
   );
-  const dockerStarted = await dockerDiscovery.start((snapshot) => workloadCache.replace(snapshot, 'docker'));
+  if (CAPTURE_PROFILE_MODE !== 'legacy') captureProfileReporter.start();
+  if (UNIFIED_FILTER_PROJECTION_SECS > 0) {
+    unifiedFilterProjectionTimer = setInterval(
+      refreshUnifiedFilterProjection,
+      UNIFIED_FILTER_PROJECTION_SECS * 1_000,
+    );
+    unifiedFilterProjectionTimer.unref();
+  }
+  refreshInfrastructurePolicy();
+  if (INFRASTRUCTURE_POLICY_SECS > 0) {
+    infrastructurePolicyTimer = setInterval(
+      refreshInfrastructurePolicy,
+      INFRASTRUCTURE_POLICY_SECS * 1_000,
+    );
+    infrastructurePolicyTimer.unref();
+  }
+  const dockerStarted = await dockerDiscovery.start((snapshot) => {
+    if (workloadCache.replace(snapshot, 'docker')) synchronizeInfrastructurePolicyRules();
+  });
   if (closing) return;
   const docker = dockerDiscovery.metrics();
   console.error(`[observer-forward] docker discovery: enabled=${docker.enabled}; started=${dockerStarted}; socket=${dockerDiscovery.socketPath}`);
@@ -2089,9 +3008,7 @@ async function start() {
   rootLivenessTimer = setInterval(() => attributor.checkRootLiveness(), ROOT_LIVENESS_SECS * 1_000);
   rootLivenessTimer.unref();
 
-  rl = readline.createInterface({ input: process.stdin });
-  rl.on('line', handleLine);
-  rl.on('close', flushAndClose);
+  rl.resume();
 }
 
 process.once('SIGINT', () => handleShutdownSignal('SIGINT'));
@@ -2099,6 +3016,9 @@ process.once('SIGTERM', () => handleShutdownSignal('SIGTERM'));
 
 void start().catch((error) => {
   console.error('[observer-forward] startup failed:', error instanceof Error ? error.message : String(error));
+  process.stdin.pause();
+  if (typeof process.stdin.unref === 'function') process.stdin.unref();
+  rl?.close();
   closeTransports();
   process.exitCode = 1;
 });

@@ -55,14 +55,37 @@ const SKIP_DIRECTORIES = new Set([
   '.git',
   '.gradle',
   '.idea',
+  '.local',
+  '.agents',
   '.next',
   '.venv',
+  'artifacts',
   'coverage',
   'dist',
   'node_modules',
   'target',
   'vendor',
 ]);
+
+export function sourceScanArguments(workspacePath) {
+  const exclusions = [...SKIP_DIRECTORIES]
+    .sort((left, right) => left.localeCompare(right))
+    .map((directory) => `--experimental-exclude=g:**/${directory}/**`);
+  return [
+    'scan',
+    'source',
+    '--recursive',
+    '--all-packages',
+    '--format=json',
+    ...exclusions,
+    workspacePath,
+  ];
+}
+
+export function osvScannerGeneralError(stderr, limit = 2_000) {
+  const detail = String(stderr || '').trim().replace(/\s+/gu, ' ').slice(0, Math.max(100, limit));
+  return `OSV-Scanner reported a general error (exit 127): ${detail || 'no diagnostic output'}`;
+}
 
 function sleep(ms) {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
@@ -535,7 +558,9 @@ async function runOsv(args, cwd) {
   }).finally(() => clearTimeout(timeout));
   if (killedForSize) throw new Error(`OSV-Scanner output exceeded ${maxOutputBytes} bytes`);
   if (exit.signal) throw new Error(`OSV-Scanner terminated by ${exit.signal}`);
-  if (exit.code === 127) throw new Error('OSV-Scanner reported a general error');
+  if (exit.code === 127) {
+    throw new Error(osvScannerGeneralError(Buffer.concat(stderr).toString('utf8')));
+  }
   if (exit.code !== 0 && exit.code !== 1 && exit.code !== 128) {
     throw new Error(`OSV-Scanner exited ${exit.code}: ${Buffer.concat(stderr).toString('utf8').slice(0, 500)}`);
   }
@@ -555,15 +580,7 @@ export function extractionStatusFromWarnings(warnings) {
 }
 
 async function runScanner(workspacePath) {
-  const args = [
-    'scan',
-    'source',
-    '--recursive',
-    '--all-packages',
-    '--format=json',
-    workspacePath,
-  ];
-  const result = await runOsv(args, workspacePath);
+  const result = await runOsv(sourceScanArguments(workspacePath), workspacePath);
   return {
     components: extractComponents(result.output, workspacePath),
     warnings: result.warnings,

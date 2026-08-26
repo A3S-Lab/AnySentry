@@ -31,6 +31,9 @@ const SPECIAL_ATTRIBUTION_FIELDS = new Set([
 const SPECIAL_RESULT_FIELDS = new Set([
   'state',
   'attribution',
+  // This is a Forwarder-resolved rollout view. Never inherit a producer/classifier copy through a
+  // merge because a later, more authoritative layer may change any of its three axes.
+  'classificationSemantics',
   'workspacePath',
   'workspaceSource',
   'workspaceConflict',
@@ -54,10 +57,6 @@ function cloneValue(value) {
     return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, cloneValue(nested)]));
   }
   return value;
-}
-
-function cloneResult(result) {
-  return Object.fromEntries(Object.entries(result).map(([key, value]) => [key, cloneValue(value)]));
 }
 
 function inferredClassification(result, attribution) {
@@ -97,8 +96,24 @@ function defaultSource(layer) {
 function candidate(layer, result, layerPriority) {
   const normalizedResult = object(result);
   if (!normalizedResult) return undefined;
-  const attribution = object(normalizedResult.attribution) || {};
-  const classification = inferredClassification(normalizedResult, attribution);
+  const rawAttribution = object(normalizedResult.attribution) || {};
+  const infrastructure = normalizedResult.state === 'infrastructure';
+  const attribution = infrastructure
+    ? {
+        ...rawAttribution,
+        monitored: false,
+        classification: 'non_agent',
+        confidence: 1,
+        source: text(rawAttribution.source) || text(normalizedResult.source) || 'configured_root',
+        reason: 'platform_infrastructure',
+        evidence: Array.isArray(rawAttribution.evidence)
+          ? rawAttribution.evidence
+          : [`infrastructure:${text(normalizedResult.serviceName) || 'configured-root'}`],
+      }
+    : rawAttribution;
+  const classification = infrastructure
+    ? 'non_agent'
+    : inferredClassification(normalizedResult, attribution);
   return {
     layer,
     layerPriority,
@@ -106,6 +121,7 @@ function candidate(layer, result, layerPriority) {
     attribution,
     classification,
     confidence: confidence(attribution, classification),
+    infrastructure,
   };
 }
 
@@ -119,11 +135,24 @@ function classificationStrength(classification) {
 }
 
 function decisionCandidate(candidates) {
+  // A positive Agent decision is fail-safe and always wins an Infrastructure/non-Agent match.
+  // The losing negative decision remains explicit conflict evidence below.
+  const agent = [...candidates]
+    .filter((entry) => entry.classification === 'confirmed_agent' || entry.classification === 'probable_agent')
+    .sort(
+      (left, right) =>
+        classificationStrength(right.classification) - classificationStrength(left.classification) ||
+        right.confidence - left.confidence ||
+        right.layerPriority - left.layerPriority,
+    )[0];
+  if (agent) return agent;
+
   // A template or workload confirmed/non-agent classification is an explicit deployment
-  // decision. Keep the existing template-before-workload tie break when both are authoritative.
+  // decision. Infrastructure roots are also authoritative only after Agent candidates are ruled
+  // out. Keep the existing template-before-workload tie break when both are negative decisions.
   const authoritative = candidates.find(
     (entry) =>
-      (entry.layer === 'template' || entry.layer === 'workload') &&
+      (entry.infrastructure || entry.layer === 'template' || entry.layer === 'workload') &&
       (entry.classification === 'confirmed_agent' || entry.classification === 'non_agent'),
   );
   if (authoritative) return authoritative;
@@ -198,12 +227,6 @@ function classificationState(classification) {
 }
 
 function mergeAttributionClassifications(processClassification, workloadClassification, templateClassification) {
-  const rawResults = [processClassification, workloadClassification, templateClassification];
-  const infrastructure = rawResults.find((result) => object(result)?.state === 'infrastructure');
-  // Infrastructure is a separate process-tree decision. It must remain an early-drop result and
-  // must never be promoted by a template or workload Agent classification.
-  if (infrastructure) return cloneResult(infrastructure);
-
   const process = candidate('process', processClassification, 1);
   const workload = candidate('workload', workloadClassification, 2);
   const template = candidate('template', templateClassification, 3);
@@ -238,8 +261,14 @@ function mergeAttributionClassifications(processClassification, workloadClassifi
   const scopeConflict = scopes.length > 1;
   const displayNameConflict = displayNames.length > 1;
   const conflictEvidence = [];
+  const agentNegativeConflict = candidates.some(
+    (entry) => entry.classification === 'confirmed_agent' || entry.classification === 'probable_agent',
+  ) && candidates.some((entry) => entry.classification === 'non_agent');
   if (scopeConflict) conflictEvidence.push(describedConflict('agentScopeId', candidates));
   if (displayNameConflict) conflictEvidence.push(describedConflict('agentDisplayName', candidates));
+  if (agentNegativeConflict) {
+    conflictEvidence.push('identity_conflict:agent_keep_vs_infrastructure_or_non_agent');
+  }
 
   const outputScope = preferredValue(identityPriority, 'agentScopeId');
   if (present(outputScope)) attribution.agentScopeId = outputScope;
@@ -295,7 +324,7 @@ function mergeAttributionClassifications(processClassification, workloadClassifi
     (entry) => entry?.result?.workspaceConflict === true,
   );
   const inheritedConflict = candidates.some((entry) => entry.attribution.conflict === true);
-  if (scopeConflict || displayNameConflict || workspaceConflict || inheritedConflict) {
+  if (scopeConflict || displayNameConflict || workspaceConflict || inheritedConflict || agentNegativeConflict) {
     attribution.conflict = true;
   }
   attribution.evidence = boundedEvidence(conflictEvidence, generalPriority);
@@ -307,7 +336,7 @@ function mergeAttributionClassifications(processClassification, workloadClassifi
       result[field] = cloneValue(value);
     }
   }
-  result.state = classificationState(decision.classification);
+  result.state = decision.infrastructure ? 'infrastructure' : classificationState(decision.classification);
   result.attribution = attribution;
   if (workspaceOwner) {
     if (present(workspaceOwner.result.workspacePath)) {
