@@ -5,6 +5,7 @@
 # Feed real events by piping an a3s-observer collector into scripts/observer-forward.js.
 x-anysentry-infrastructure-labels: &anysentry-infrastructure-labels
   io.anysentry.observe: "false"
+  anysentry.io/workload-role: "anysentry_internal"
 
 services:
   clickhouse:
@@ -73,8 +74,10 @@ services:
         condition: service_healthy
     environment:
       PORT: 29653
-      ANYSENTRY_HOT_EVENT_LIMIT: ${ANYSENTRY_HOT_EVENT_LIMIT:-10000}
+      NODE_OPTIONS: ${ANYSENTRY_API_NODE_OPTIONS:---max-old-space-size=1024}
+      ANYSENTRY_HOT_EVENT_LIMIT: ${ANYSENTRY_HOT_EVENT_LIMIT:-5000}
       ANYSENTRY_OBSERVER_BODY_LIMIT: ${ANYSENTRY_OBSERVER_BODY_LIMIT:-4mb}
+      ANYSENTRY_MANAGEMENT_TOKEN: ${ANYSENTRY_MANAGEMENT_TOKEN:-}
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-anysentry}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-anysentry}

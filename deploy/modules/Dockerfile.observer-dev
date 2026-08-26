@@ -1,0 +1,9 @@
+# Fast Docker-development layer: reuse the already validated Node/scripts wrapper and replace only
+# the Collector/eBPF binary image. The full immutable observer-wrapper target remains the release
+# gate; this target avoids rebuilding unrelated script layers for every Rust edit.
+ARG OBSERVER_WRAPPER_BASE=anysentry-observer-wrapper:infra-v1
+ARG OBSERVER_COLLECTOR_IMAGE=anysentry-observer-collector:infra-v2
+FROM ${OBSERVER_COLLECTOR_IMAGE} AS collector
+FROM ${OBSERVER_WRAPPER_BASE}
+COPY --from=collector /usr/local/bin/a3s-observer-collector /usr/local/bin/a3s-observer-collector
+ENTRYPOINT ["/usr/local/bin/node", "/opt/observer-supervisor.js"]

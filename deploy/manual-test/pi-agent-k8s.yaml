@@ -55,6 +55,14 @@ spec:
             - { name: PI_MODEL, value: bailian/deepseek-v4-flash }
             - { name: PI_THINKING, value: "off" }
             - { name: DEEPSEEK_API_KEY_FILE, value: /run/secrets/deepseek_api_key }
+            - { name: ANYSENTRY_PI_ADAPTER_URL, value: "http://anysentry.anysentry.svc.cluster.local:29653/security-center/ingest/events" }
+            - name: ANYSENTRY_ADAPTER_SOURCE_ID
+              valueFrom: { secretKeyRef: { name: pi-agent-adapter, key: source_id } }
+            - { name: ANYSENTRY_ADAPTER_TOKEN_FILE, value: /run/adapter/adapter_token }
+            - { name: ANYSENTRY_TENANT_ID, value: default }
+            - { name: ANYSENTRY_ENVIRONMENT_ID, value: manual-k8s }
+            - { name: ANYSENTRY_WORKSPACE_PATH, value: /workspace }
+            - { name: ANYSENTRY_AGENT_SCOPE_ID, value: k8s-pi-agent-manual }
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -70,6 +78,10 @@ spec:
             - name: llm-key
               mountPath: /run/secrets/deepseek_api_key
               subPath: deepseek_api_key
+              readOnly: true
+            - name: adapter-token
+              mountPath: /run/adapter/adapter_token
+              subPath: adapter_token
               readOnly: true
             - { name: tmp, mountPath: /tmp }
           readinessProbe:
@@ -101,6 +113,12 @@ spec:
             defaultMode: 0440
             items:
               - { key: deepseek_api_key, path: deepseek_api_key }
+        - name: adapter-token
+          secret:
+            secretName: pi-agent-adapter
+            defaultMode: 0440
+            items:
+              - { key: adapter_token, path: adapter_token }
         - name: tmp
           emptyDir:
             medium: Memory

@@ -53,7 +53,42 @@ keys (`A3S_SENTRY_LLM_URL`, `A3S_SENTRY_LLM_MODEL`, `A3S_SENTRY_LLM_KEY`, and th
 `A3S_SENTRY_L3_*` equivalents), or configure both profiles through the Policy page after rollout.
 Do not commit a Secret manifest.
 
-This repository includes three manual-test overlays. They leave the canonical manifests unchanged:
+The single-node `k8s-local-path` profile also runs PostgreSQL for durable mutable business state,
+an unprivileged Workspace Scanner for live OSV input, and a read-only OTel service-context probe.
+Create their Secrets before applying the overlay. Use a URL-safe generated password, keep shell
+tracing disabled, and never print any credential:
+
+```bash
+set +x
+kubectl create namespace anysentry --dry-run=client -o yaml | kubectl apply -f -
+db_password="$(openssl rand -hex 24)"
+db_url="postgresql://anysentry:${db_password}@postgres.anysentry.svc.cluster.local:5432/anysentry"
+kubectl -n anysentry create secret generic anysentry-database \
+  --from-literal=ANYSENTRY_DATABASE_URL="${db_url}" \
+  --from-literal=POSTGRES_USER=anysentry \
+  --from-literal=POSTGRES_PASSWORD="${db_password}" \
+  --from-literal=POSTGRES_DB=anysentry \
+  --dry-run=client -o yaml | kubectl apply -f -
+scanner_token="$(openssl rand -hex 32)"
+kubectl -n anysentry create secret generic anysentry-supply-chain \
+  --from-literal=ANYSENTRY_WORKSPACE_SCANNER_TOKEN="${scanner_token}" \
+  --dry-run=client -o yaml | kubectl apply -f -
+# Create one managed, token-required OTel Source in the Sources UI/API. Bind it exactly to
+# workspace /workspace, tag it system-context, and copy its one-time ID/token into shell variables.
+kubectl -n anysentry create secret generic anysentry-system-context-source \
+  --from-literal=source-id="${context_source_id}" \
+  --from-literal=source-token="${context_source_token}" \
+  --dry-run=client -o yaml | kubectl apply -f -
+unset db_password db_url scanner_token context_source_id context_source_token
+```
+
+The tracked Scanner is digest-pinned and mounts
+`/srv/anysentry/AnySentry` read-only. Place the checkout there or update the explicit hostPath before
+applying this manual one-node profile. Build/push the `workspace-scanner` target and update its exact digest
+in `k8s-local-path/kustomization.yaml` whenever the Scanner script or base image changes; do not
+replace it with a mutable tag.
+
+This repository includes six manual-test overlays. They leave the canonical manifests unchanged:
 
 - `k8s-observer` pins the Observer, switches the manual collector to `enforce`, disables behavior
   promotion, and loads the complete versioned runtime-signature document. The shared single-node
@@ -62,16 +97,28 @@ This repository includes three manual-test overlays. They leave the canonical ma
   caused real Forwarder loss. A read-only Docker socket mount lets this one node-level Observer
   enrich the retained Docker Agent and Kubernetes workloads into one AnySentry.
 - `k8s-core` rolls out the API and judges before Kafka/Flink are created.
-- `k8s-local-path` adds the streaming plane and changes only the manual checkpoint PVC from the
-  production RWX contract to `local-path`/RWO, which is required by the single-node test cluster.
+- `k8s-local-path` adds the streaming plane, local-path PostgreSQL, the read-only Workspace
+  Scanner, a digest-pinned System Context probe, and NodePort `32653`. The probe actively measures
+  AnySentry/ClickHouse/Redis/Postgres error rate and P95 latency every minute and publishes only
+  authenticated OTLP metrics; failures become non-zero error metrics rather than synthetic health.
+  Its Flink patch changes only the manual checkpoint PVC from the production RWX contract to
+  `local-path`/RWO, which is required by the single-node test cluster.
+- `k8s-observer-file-canary` is used only after the six filter/batch modules pass local and
+  component tests. It inherits the stable no-file manual profile, enables only the independently
+  split FileAccess probe, keeps Unknown discovery on, and restores transport batching. Do
+  not apply it before the filter-rule snapshot is being published and the Observer heartbeat
+  reports a ready Capture Profile control plane.
+- `k8s-observer-files-full` is the final, explicitly high-load profile. It enables both FileAccess
+  and FileDelete only after their independent gates pass, retains lossless Unknown discovery,
+  keeps all three rollout planes in `enforce`, batches 64 records, and attaches OpenSSL uprobes to
+  the exact read-only host `libssl.so.3` inode. This covers processes using that inode only; it does
+  not imply coverage for container-private OpenSSL, BoringSSL, Go TLS, or static TLS.
 
 Render with Kustomize's explicit parent-directory allowance and use client-side apply. Do not use
 server-side apply against the existing cluster because its historical field managers own several
 of the same resource fields:
 
 ```bash
-kubectl kustomize --load-restrictor=LoadRestrictionsNone \
-  deploy/manual-test/k8s-observer | kubectl apply -f -
 kubectl kustomize --load-restrictor=LoadRestrictionsNone \
   deploy/manual-test/k8s-core | kubectl apply -f -
 kubectl -n anysentry rollout status deployment/anysentry --timeout=10m
@@ -80,10 +127,47 @@ kubectl kustomize --load-restrictor=LoadRestrictionsNone \
 kubectl -n anysentry rollout status deployment/flink-jobmanager --timeout=10m
 kubectl -n anysentry rollout status deployment/flink-taskmanager --timeout=10m
 kubectl -n anysentry rollout status deployment/flink-job-submit --timeout=10m
+kubectl -n anysentry rollout status statefulset/postgres --timeout=10m
+kubectl -n anysentry rollout status deployment/workspace-scanner --timeout=10m
+kubectl -n anysentry rollout status deployment/system-context-probe --timeout=10m
+# The API was already running during the staged core rollout. Recreate it only after PostgreSQL is
+# ready so the final health state is PostgreSQL-backed instead of the migration fallback.
+kubectl -n anysentry rollout restart deployment/anysentry
+kubectl -n anysentry rollout status deployment/anysentry --timeout=10m
+kubectl kustomize --load-restrictor=LoadRestrictionsNone \
+  deploy/manual-test/k8s-observer | kubectl apply -f -
+kubectl -n anysentry rollout status daemonset/a3s-observer --timeout=10m
 ```
 
-After starting the `39653` port-forward, apply `policy.json` with the same curl command shown above
-but replace port `29653` with `39653`. The policy only controls tier routing;
+Keep the stable no-file Observer running while the API, Kafka/Flink, rules, Source credentials, and
+Capture Profile control plane become ready. Exercise high-volume file signals in this order:
+
+1. Apply `k8s-observer-file-canary` and observe at least two heartbeat/TTL windows. Require zero
+   FileAccess Ring, Collector inbox, writer queue, output, and retry-exhaustion loss.
+2. Return to `k8s-observer`. Run the repository's independent FileDelete-only gate with
+   `deploy/modules/observer-file-delete-canary.yml`; there is intentionally no second Kubernetes
+   canary that could be mistaken for the final full profile. Require the same zero-loss result.
+3. Apply `k8s-observer-files-full`, wait for the DaemonSet rollout, and repeat the zero-loss checks
+   for both file rings together. If any gate fails, immediately return to `k8s-observer`; do not
+   compensate by increasing Ring capacity.
+
+```bash
+kubectl kustomize --load-restrictor=LoadRestrictionsNone \
+  deploy/manual-test/k8s-observer-file-canary | kubectl apply -f -
+kubectl -n anysentry rollout status daemonset/a3s-observer --timeout=10m
+
+kubectl kustomize --load-restrictor=LoadRestrictionsNone \
+  deploy/manual-test/k8s-observer | kubectl apply -f -
+kubectl -n anysentry rollout status daemonset/a3s-observer --timeout=10m
+
+kubectl kustomize --load-restrictor=LoadRestrictionsNone \
+  deploy/manual-test/k8s-observer-files-full | kubectl apply -f -
+kubectl -n anysentry rollout status daemonset/a3s-observer --timeout=10m
+```
+
+The manual Service is pinned to NodePort `32653`, so the node is directly reachable at
+`http://${NODE_IP}:32653/` after replacing `NODE_IP` with the cluster node address. Apply `policy.json` through that URL, or start the optional `39653`
+port-forward and replace port `29653` with `39653` in the Docker command above. The policy only controls tier routing;
 credentials remain memory-only/Secret-backed. Supply-chain workspace discovery additionally needs
 a valid scanner token before external workspaces can publish dependency snapshots.
 
@@ -98,6 +182,7 @@ kubectl -n anysentry port-forward service/flink-jobmanager 38081:8081
 The dashboard URLs are:
 
 - Docker: `http://127.0.0.1:29653/`
+- Kubernetes NodePort: `http://${NODE_IP}:32653/`
 - Kubernetes: `http://127.0.0.1:39653/`
 - Agent instances: append `/agents`
 - Collector health: append `/collectors`
@@ -124,12 +209,19 @@ export ANYSENTRY_AGENT_UID="$(id -u)"
 export ANYSENTRY_AGENT_GID="$(id -g)"
 export ANYSENTRY_PI_WORKSPACE_DIR="$PWD/.local/real-llm/docker-pi/workspace"
 export ANYSENTRY_PI_STATE_DIR="$PWD/.local/real-llm/docker-pi/state"
+export ANYSENTRY_ADAPTER_SOURCE_ID='<managed-source-id>'
+export ANYSENTRY_ADAPTER_TOKEN_HOST_FILE="$PWD/.local/real-llm/secrets/anysentry-adapter-token"
 install -d -m 0700 "$ANYSENTRY_PI_WORKSPACE_DIR" "$ANYSENTRY_PI_STATE_DIR"
 ```
 
+Before launch, create a token-protected ingestion Source with correlation authority
+`agent_adapter`. Bind it to the intended tenant/environment and `/workspace`, copy its returned
+Source ID to `ANYSENTRY_ADAPTER_SOURCE_ID`, and write its token only to the mode-`0600` file named
+by `ANYSENTRY_ADAPTER_TOKEN_HOST_FILE`. Do not put the token in this document or a manifest.
+
 Do not replace the digest with a mutable tag for this test. Neither Compose nor the Kubernetes
-helper copies or prints the key. Both mount `models.json` at
-`/home/node/.pi/agent/models.json` and the key at `/run/secrets/deepseek_api_key`, read-only.
+helper copies or prints either credential. Both mount `models.json`, the model credential, and the
+Agent adapter Source token read-only.
 
 ### Docker agent
 
@@ -178,10 +270,10 @@ exec /opt/agent-lab/node_modules/.bin/pi \
 
 ### Kubernetes agent
 
-The helper creates `pi-agent-models` from the local `models.json` and `pi-agent-llm` directly from
-the local key file. The Secret is streamed to the API server; no Secret YAML is created on disk and
-the key is not printed. It then injects the required immutable image digest and applies a one-replica
-Deployment:
+The helper creates `pi-agent-models` from the local `models.json`, `pi-agent-llm` from the local
+model credential file, and `pi-agent-adapter` from the managed Source ID/token file. Secrets are
+streamed to the API server; no Secret YAML is created on disk and no credential is printed. It then
+injects the required immutable image digest and applies a one-replica Deployment:
 
 ```bash
 chmod 0755 deploy/manual-test/apply-pi-agent-k8s.sh

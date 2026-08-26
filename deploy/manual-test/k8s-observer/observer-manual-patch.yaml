@@ -17,21 +17,31 @@ spec:
             # disabled so unrelated host churn cannot become an unbounded ingest source.
             - { name: ANYSENTRY_BEHAVIOR_DISCOVERY, value: "off" }
             - { name: FORWARD_FILTER_MODE, value: "enforce" }
-            - { name: FORWARD_RETAIN_UNKNOWN, value: "false" }
+            # Keep all three rollout planes explicit in the reproducible manual profile. The
+            # canonical base is deliberately shadow-safe, so omitting either override here would
+            # silently regress S3 production or Ring-before enforcement on a later re-apply.
+            - { name: ANYSENTRY_UNKNOWN_RETENTION_MODE, value: "enforce" }
+            - { name: ANYSENTRY_CAPTURE_PROFILE_MODE, value: "enforce" }
+            # Unknown remains discoverable; only its high-volume FileAccess lane is budgeted.
+            - { name: FORWARD_RETAIN_UNKNOWN, value: "true" }
             - { name: FORWARD_RETAIN_NON_AGENT, value: "false" }
             # FileAccess/FileDelete overwhelms the upstream fixed FILE_EVENTS ring on this shared
             # single node even after the Docker AnySentry backend and duplicate Observer stop.
             # Keep the lossless ToolExec/Exit, Egress/DNS/process/security and SSL signal set.
             - { name: A3S_OBSERVER_FILES, value: "0" }
+            # These independent switches override the legacy combined switch. Set both explicitly
+            # so applying this stable profile really rolls back a prior Access/full-file canary.
+            - { name: A3S_OBSERVER_FILE_ACCESS, value: "0" }
+            - { name: A3S_OBSERVER_FILE_DELETE, value: "0" }
             - { name: A3S_OBSERVER_SSL, value: "1" }
             # This single host also runs the retained Docker Pi workload. Reuse the same Observer
             # and enrich its eBPF events from the Docker lifecycle/inspect stream.
             - { name: ANYSENTRY_DOCKER_DISCOVERY, value: "on" }
             - { name: ANYSENTRY_DOCKER_SOCKET, value: "/var/run/docker.sock" }
-            # The API currently persists judged events synchronously. Keep requests small so one
-            # slow insert cannot make a 128-event adaptive batch ambiguous, while the existing
-            # outstanding event/byte limits still bound total ownership.
-            - { name: FORWARD_BATCH_SIZE, value: "1" }
+            # The API now persists each immutable Observer batch as one ClickHouse block. Retain
+            # the canonical 32-event batch so protected Exec/Exit traffic can drain faster than the
+            # node emits it; byte, ownership, retry-age, and protected-reserve bounds remain hard.
+            - { name: FORWARD_BATCH_SIZE, value: "32" }
             - { name: FORWARD_HTTP_TIMEOUT_MS, value: "30000" }
             - { name: ANYSENTRY_BATCH_INGEST_URL, value: "http://anysentry:29653/security-center/ingest/batch" }
           volumeMounts:

@@ -1,0 +1,15 @@
+# FileDelete-only Docker canary. Run after FileAccess has a complete zero-loss window so the two
+# rings and load sources remain independently attributable.
+services:
+  observer:
+    environment:
+      A3S_OBSERVER_FILES: "0"
+      A3S_OBSERVER_FILE_ACCESS: "0"
+      A3S_OBSERVER_FILE_DELETE: "1"
+      A3S_OBSERVER_FILE_UNKNOWN_POLICY: "keep"
+      A3S_OBSERVER_SSL: "0"
+      FORWARD_FILTER_MODE: "enforce"
+      FORWARD_RETAIN_UNKNOWN: "true"
+      FORWARD_FILE_AGGREGATION: "true"
+      FORWARD_BATCH_SIZE: "64"
+      FORWARD_BATCH_FLUSH_MS: "50"

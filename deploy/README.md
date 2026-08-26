@@ -190,20 +190,30 @@ docker push <your-registry>/anysentry-observer:latest
 ```
 
 Set the `image:` in `deploy/observer.yaml` to that tag (or use the published
-`ghcr.io/a3s-lab/anysentry-observer:latest` if available), then:
+`ghcr.io/a3s-lab/anysentry-observer:latest` if available). The canonical DaemonSet intentionally
+requires `anysentry-control-auth` and `anysentry-observer-auth` Secrets: CaptureAggregate and
+Capture Profile grants must never rely on an anonymous/discovered Source. The integrated installer
+generates the management secret, creates one exact managed Observer Source per node, stores the
+credentials in a read-only Secret, and only then starts the DaemonSet:
 
 ```bash
-kubectl -n anysentry apply -f deploy/observer.yaml
+ANYSENTRY_INSTALL_MODE=kubernetes deploy/install.sh
 kubectl -n anysentry get pods -l app=a3s-observer -o wide
 ```
+
+For a manual deployment, follow the same order: create `anysentry-control-auth`, start the API,
+run `scripts/bootstrap-observer-sources.mjs` for the exact node names, create
+`anysentry-observer-auth` from its JSON output, then apply `deploy/observer.yaml`. The generated
+file is sensitive and must remain outside the repository with mode `0600`.
 
 Events appear on the dashboard within seconds as workloads on the nodes run tools, make egress,
 touch files, or escalate privileges.
 
 The DaemonSet sets `A3S_OBSERVER_COLLECTOR_ID` and `A3S_NODE_NAME` from Kubernetes `spec.nodeName`,
 so every node appears as a stable Collector. The bundled forwarder also emits source-aware
-heartbeats every `ANYSENTRY_HEARTBEAT_SECS` seconds; with no explicit `ANYSENTRY_SOURCE_ID`,
-AnySentry discovers one observer Source per node/collector automatically.
+heartbeats every `ANYSENTRY_HEARTBEAT_SECS` seconds. The Forwarder selects its exact node entry from
+`ANYSENTRY_SOURCE_CREDENTIALS_FILE`; a token for one Collector cannot publish trusted summaries as
+another Collector.
 
 The manifest initially configures `FORWARD_FILTER_MODE=shadow`,
 `FORWARD_RETAIN_UNKNOWN=true`, `FORWARD_RETAIN_NON_AGENT=false`, and
@@ -215,7 +225,12 @@ observable during this comparison. Events are sent in bounded batches (32 events
 heartbeats report classification, cache, queue, batch, filtered, and dropped counters.
 `FORWARD_MAX_OUTSTANDING_EVENTS` and `FORWARD_MAX_OUTSTANDING_BYTES` bound the combined pending,
 in-flight, and API-authorized retry states (the manifest uses 16,384 events / 64 MiB and a 45-second
-retry age). Only an explicit per-item `clickhouse_event_buffer_full` acknowledgement is retried;
+retry age). Within that same hard cap, `FORWARD_PROTECTED_RESERVE_EVENTS=4096` and
+`FORWARD_PROTECTED_RESERVE_BYTES=16777216` keep one quarter of the ownership budget available for
+Agent events and protected ToolExec, ProcessExit, SecurityAction, and Collector health evidence;
+ordinary Infrastructure and aggregate traffic cannot consume that reserve. Heartbeats expose the
+closed queue-loss class and a separate protected-loss counter without persisting dropped payloads.
+Only an explicit per-item `clickhouse_event_buffer_full` acknowledgement is retried;
 transport failures
 and ambiguous HTTP failures remain terminal to avoid duplicating events whose acceptance is
 unknown. Legacy `FORWARD_MAX_QUEUE` names are accepted as fallback aliases, but new deployments

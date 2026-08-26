@@ -36,6 +36,15 @@ services:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      # Optional first-party S6 semantic channel. All three values are required; otherwise the
+      # extension remains a no-op and the existing lab behavior is unchanged.
+      ANYSENTRY_PI_ADAPTER_URL: ${ANYSENTRY_PI_ADAPTER_URL:-}
+      ANYSENTRY_ADAPTER_SOURCE_ID: ${ANYSENTRY_ADAPTER_SOURCE_ID:-}
+      ANYSENTRY_ADAPTER_TOKEN: ${ANYSENTRY_ADAPTER_TOKEN:-}
+      ANYSENTRY_TENANT_ID: ${ANYSENTRY_TENANT_ID:-default}
+      ANYSENTRY_ENVIRONMENT_ID: ${ANYSENTRY_ENVIRONMENT_ID:-docker-lab}
+      ANYSENTRY_WORKSPACE_PATH: /workspace
+      ANYSENTRY_AGENT_SCOPE_ID: docker-pi-agent
     labels:
       anysentry.io/workload-kind: agent
       anysentry.io/agent-id: docker-pi-agent
@@ -52,6 +61,9 @@ services:
     privileged: true
     pid: host
     stop_grace_period: 30s
+    labels:
+      io.anysentry.observe: "false"
+      anysentry.io/workload-role: anysentry_internal
     entrypoint: ["/usr/local/bin/node"]
     command: ["/opt/observer-supervisor.js"]
     extra_hosts:
@@ -71,7 +83,8 @@ services:
       ANYSENTRY_IDENTITY_SNAPSHOT_SECS: "5"
       ANYSENTRY_DOCKER_DISCOVERY: "on"
       FORWARD_FILTER_MODE: ${FORWARD_FILTER_MODE:-shadow}
-      FORWARD_RETAIN_UNKNOWN: "false"
+      # Unknown is retained by the Forwarder; bounded discovery moves to the Collector profile.
+      FORWARD_RETAIN_UNKNOWN: "true"
       FORWARD_RETAIN_NON_AGENT: "false"
       FORWARD_NOISE_POLICY: balanced
     volumes:
@@ -83,6 +96,7 @@ services:
       - ../../scripts/observer-forward.js:/opt/observer-forward.js:ro
       - ../../scripts/observer-agent-attribution.js:/opt/observer-agent-attribution.js:ro
       - ../../scripts/observer-attribution-merge.js:/opt/observer-attribution-merge.js:ro
+      - ../../scripts/observer-classification-semantics.js:/opt/observer-classification-semantics.js:ro
       - ../../scripts/observer-agent-runtime-signatures.js:/opt/observer-agent-runtime-signatures.js:ro
       - ../../scripts/observer-agent-templates.js:/opt/observer-agent-templates.js:ro
       - ../../scripts/observer-docker-discovery.js:/opt/observer-docker-discovery.js:ro
@@ -91,6 +105,11 @@ services:
       - ../../scripts/observer-event-dedup.js:/opt/observer-event-dedup.js:ro
       - ../../scripts/observer-workload-filter.js:/opt/observer-workload-filter.js:ro
       - ../../scripts/observer-infrastructure-roots.js:/opt/observer-infrastructure-roots.js:ro
+      - ../../scripts/observer-infrastructure-policy.js:/opt/observer-infrastructure-policy.js:ro
+      - ../../scripts/observer-infrastructure-rules.js:/opt/observer-infrastructure-rules.js:ro
+      - ../../scripts/observer-filter-rules.js:/opt/observer-filter-rules.js:ro
+      - ../../scripts/observer-file-aggregation.js:/opt/observer-file-aggregation.js:ro
+      - ../../scripts/observer-pipeline-accounting.js:/opt/observer-pipeline-accounting.js:ro
 
 volumes:
   a3s-workspace:

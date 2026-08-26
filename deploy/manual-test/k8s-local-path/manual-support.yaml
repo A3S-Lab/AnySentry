@@ -1,0 +1,157 @@
+# Single-node manual-test support plane. Secret values are deliberately external to this file.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: anysentry
+  labels: { app: postgres }
+spec:
+  storageClassName: local-path
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests: { storage: 5Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: anysentry
+  labels: { app: postgres }
+spec:
+  clusterIP: None
+  selector: { app: postgres }
+  ports:
+    - { name: postgres, port: 5432, targetPort: 5432 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: anysentry
+  labels: { app: postgres, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          env:
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: anysentry-database, key: POSTGRES_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: anysentry-database, key: POSTGRES_PASSWORD } }
+            - name: POSTGRES_DB
+              valueFrom: { secretKeyRef: { name: anysentry-database, key: POSTGRES_DB } }
+          volumeMounts:
+            - { name: postgres-data, mountPath: /var/lib/postgresql/data }
+          startupProbe:
+            exec:
+              command: ["/bin/sh", "-ec", "pg_isready -h 127.0.0.1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 36
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-ec", "pg_isready -h 127.0.0.1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-ec", "pg_isready -h 127.0.0.1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 1Gi }
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: postgres-data
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: anysentry-workspace-scanner
+  namespace: anysentry
+data:
+  workspace-scanner.json: |
+    {
+      "scannerId": "manual-local-scanner",
+      "allowedRoots": ["/workspace"],
+      "workspaces": [
+        {
+          "repositoryId": "AnySentry-local",
+          "workspaceId": "manual-anysentry-workspace",
+          "displayName": "AnySentry Local Manual Test (K8s)",
+          "localPath": "/workspace/AnySentry",
+          "environmentId": "manual-k8s",
+          "deploymentImages": []
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workspace-scanner
+  namespace: anysentry
+  labels: { app: workspace-scanner, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: workspace-scanner }
+  template:
+    metadata:
+      labels: { app: workspace-scanner, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
+      annotations:
+        anysentry.io/manual-host-workspace: "/srv/anysentry/AnySentry"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: workspace-scanner
+          image: ghcr.io/a3s-lab/anysentry-workspace-scanner:latest
+          env:
+            - { name: ANYSENTRY_API_BASE, value: "http://anysentry:29653/security-center" }
+            - name: ANYSENTRY_WORKSPACE_SCANNER_TOKEN
+              valueFrom: { secretKeyRef: { name: anysentry-supply-chain, key: ANYSENTRY_WORKSPACE_SCANNER_TOKEN } }
+            - { name: ANYSENTRY_WORKSPACE_SCANNER_CONFIG, value: "/etc/anysentry/workspace-scanner.json" }
+            - { name: ANYSENTRY_WORKSPACE_SCANNER_POLL_MS, value: "5000" }
+            - { name: ANYSENTRY_DEPENDENCY_DESCRIPTOR_POLL_MS, value: "30000" }
+            - { name: ANYSENTRY_OSV_SCANNER_BIN, value: "/usr/local/bin/osv-scanner" }
+            - { name: ANYSENTRY_OSV_SCANNER_VERSION, value: "2.3.8" }
+            - { name: HOME, value: "/tmp/scanner-home" }
+            - { name: XDG_CACHE_HOME, value: "/tmp/scanner-cache" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: scanner-config, mountPath: /etc/anysentry, readOnly: true }
+            - { name: workspace, mountPath: /workspace/AnySentry, readOnly: true }
+            - { name: scanner-tmp, mountPath: /tmp }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+      volumes:
+        - { name: scanner-config, configMap: { name: anysentry-workspace-scanner } }
+        # Deliberately local to this one-node manual profile. Production scanners should use a
+        # reviewed source checkout volume rather than a developer-machine hostPath.
+        - name: workspace
+          hostPath: { path: /srv/anysentry/AnySentry, type: Directory }
+        - { name: scanner-tmp, emptyDir: { sizeLimit: 1Gi } }

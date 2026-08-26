@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: anysentry
+  namespace: anysentry
+spec:
+  type: NodePort
+  ports:
+    - port: 29653
+      targetPort: 29653
+      nodePort: 32653

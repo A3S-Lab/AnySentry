@@ -1,0 +1,16 @@
+# Full Docker validation profile, enabled only after independent FileAccess and FileDelete windows
+# have both met the zero-loss gate.
+services:
+  observer:
+    environment:
+      A3S_OBSERVER_FILES: "0"
+      A3S_OBSERVER_FILE_ACCESS: "1"
+      A3S_OBSERVER_FILE_DELETE: "1"
+      A3S_OBSERVER_FILE_UNKNOWN_POLICY: "keep"
+      A3S_OBSERVER_SSL: "0"
+      FORWARD_FILTER_MODE: "enforce"
+      FORWARD_RETAIN_UNKNOWN: "true"
+      FORWARD_RETAIN_NON_AGENT: "false"
+      FORWARD_FILE_AGGREGATION: "true"
+      FORWARD_BATCH_SIZE: "64"
+      FORWARD_BATCH_FLUSH_MS: "50"
