@@ -7,6 +7,7 @@ import { MaintenanceWindowService } from './maintenance-window.service';
 import { NotificationService } from './notification.service';
 import { RelationalBusinessStore } from './relational-business-store.service';
 import { cleanText } from './redaction';
+import { collectorHeartbeatFailureDelta } from './pipeline-accounting';
 import type { DecisionResultJob } from './async-judgment.types';
 import {
   AlertConfig,
@@ -617,18 +618,10 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
         alert.labels?.heartbeatOrigin === qualityOrigin ||
         (qualityOrigin === 'forwarder' && !alert.labels?.heartbeatOrigin)
       );
-    const counterDelta = (current: number, before: number | undefined): number => {
-      // Hydration seeds the previous value after an API restart. A genuinely new producer has no
-      // persisted baseline, so its current non-zero failure count is actionable rather than lost.
-      // Counter resets start a new baseline; raw-collector and forwarder counters never share one.
-      if (before === undefined) return current;
-      if (current < before) return current;
-      return current - before;
-    };
-    const droppedDelta =
-      counterDelta(heartbeat.droppedEvents, previous?.droppedEvents) +
-      counterDelta(heartbeat.outputDropped, previous?.outputDropped);
-    const errorDelta = counterDelta(heartbeat.errorCount, previous?.errorCount);
+    // The raw collector reports cumulative kernel/exporter counters. The Forwarder resets its
+    // output/error counters after every heartbeat snapshot. Keep the public fields and alert IDs,
+    // but use their source/explicit temporality so equal adjacent interval values are not erased.
+    const { droppedDelta, errorDelta } = collectorHeartbeatFailureDelta(heartbeat, previous);
     const degraded = heartbeat.status !== 'ok' || droppedDelta > 0 || errorDelta > 0;
     if (!degraded) {
       this.resolveWhere(

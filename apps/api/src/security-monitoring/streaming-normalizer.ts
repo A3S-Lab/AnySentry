@@ -10,6 +10,10 @@ import {
 } from './streaming.types';
 import { workspacePathFingerprint } from './supply-chain-normalizer';
 import { JudgedEvent } from './types';
+import { correlationCaptureRollout } from './correlation-rollout';
+import { parseTrustedCorrelation } from './trusted-correlation';
+import { visibleClassificationSemantics } from './classification-semantics';
+import { canonicalContainerId, canonicalProcessInstanceId } from './process-instance-identity';
 
 const SENSITIVE_PATH = /(?:^|\/)(?:etc\/(?:shadow|sudoers)|\.ssh\/(?:id_[^/]+|authorized_keys)|\.aws\/credentials|\.docker\/config\.json|\.env(?:\.[^/]+)?|credentials?|secrets?|tokens?|private[_-]?key)(?:$|[./_-])/i;
 const PERSISTENCE_PATH = /(?:^|\/)(?:etc\/(?:cron(?:\.d|\.daily|\.hourly|\.weekly|\.monthly)?|crontab|systemd\/system|init\.d)\/?|var\/spool\/cron\/|\.config\/autostart\/|\.ssh\/authorized_keys$|(?:\.bashrc|\.bash_profile|\.profile|\.zshrc)$)/i;
@@ -41,6 +45,39 @@ function text(value: unknown): string | undefined {
 function scalarText(value: unknown): string | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) return String(value);
   return text(value);
+}
+
+function numericAttribute(
+  event: JudgedEvent,
+  keys: readonly string[],
+  fallback: number,
+): number {
+  for (const key of keys) {
+    const raw = event.attributes[key];
+    const value = Number(raw);
+    if (Number.isFinite(value)) return value;
+    if (typeof raw === 'string') {
+      const parsed = Date.parse(raw);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return fallback;
+}
+
+function aggregationMetadata(event: JudgedEvent): {
+  repeatCount: number;
+  firstEventAt: number;
+  lastEventAt: number;
+  aggregationWindowMs: number;
+} {
+  const repeatCount = Math.max(1, Math.trunc(numericAttribute(event, ['repeatCount', 'repeat_count'], 1)));
+  const firstEventAt = Math.max(0, Math.trunc(numericAttribute(event, ['firstEventAt', 'first_event_at'], event.at)));
+  const lastEventAt = Math.max(firstEventAt, Math.trunc(numericAttribute(event, ['lastEventAt', 'last_event_at'], event.at)));
+  const aggregationWindowMs = Math.max(
+    0,
+    Math.trunc(numericAttribute(event, ['aggregationWindowMs', 'aggregation_window_ms'], 0)),
+  );
+  return { repeatCount, firstEventAt, lastEventAt, aggregationWindowMs };
 }
 function canonicalWorkspacePath(value: unknown): string {
   const workspacePath = text(value);
@@ -300,12 +337,6 @@ function privateAddress(value: string): boolean {
     || /^172\.(?:1[6-9]|2\d|3[01])\./.test(host);
 }
 
-function containerId(cgroup?: string): string | undefined {
-  if (!cgroup) return undefined;
-  return cgroup.match(/(?:docker[-/]|cri-containerd[-/])([a-f0-9]{12,64})/i)?.[1]
-    ?? cgroup.match(/([a-f0-9]{64})(?:\.scope)?$/i)?.[1];
-}
-
 function semantic(
   event: JudgedEvent,
   observerLine: string,
@@ -477,15 +508,28 @@ function sourceEventId(event: JudgedEvent): string {
 export function canonicalizeEvent(event: JudgedEvent, observerLine: string, receivedAt = Date.now()): CanonicalSecurityEvent {
   const trustedSourceId = event.sourceId ?? event.collectorId ?? 'local';
   const sourceId = sourceEventId(event);
+  // Only the resolver-owned attribution object may cross this canonical boundary. Raw producer
+  // attributes and top-level convenience claims are intentionally not consulted here.
+  const correlation = correlationCaptureRollout().trustedCorrelation === 'off'
+    ? undefined
+    : parseTrustedCorrelation(event.attribution?.correlation);
+  const classificationSemantics = visibleClassificationSemantics(event.classificationSemantics);
   const eventId = hash('evt', trustedSourceId, sourceId);
   const tenantId = text(event.attributes.tenantId) ?? process.env.ANYSENTRY_TENANT_ID ?? 'default';
   const environmentId = text(event.attributes.environmentId) ?? process.env.ANYSENTRY_ENVIRONMENT_ID ?? 'local';
   const agentType = event.attribution?.agentScopeId ?? event.agentId ?? 'unknown';
   const workspacePath = canonicalWorkspacePath(event.workspacePath);
   // Logical workspace identifiers such as repo://... remain valid for stream
-  // correlation, but only absolute local paths can be matched to a registered
-  // supply-chain scan workspace.
-  const localWorkspacePath = workspacePath.startsWith('/') ? workspacePath : '';
+  // correlation. Supply-chain matching may use an attested Observer process cwd as an additive,
+  // more-specific resource scope (for example Agent root `/repo` executing inside
+  // `/repo/service-a`), but never trusts an application/adapter producer's cwd claim.
+  const processWorkspacePath = (
+    correlation?.authority === 'attested_observer' ||
+    correlation?.authority === 'server_process_graph'
+  ) && event.process?.cwd?.startsWith('/')
+    ? canonicalWorkspacePath(event.process.cwd)
+    : '';
+  const localWorkspacePath = processWorkspacePath || (workspacePath.startsWith('/') ? workspacePath : '');
   const workspaceIdentity = workspacePath || 'unassigned:' + agentType;
   const workspaceId = text(event.attributes.workspaceId) ?? hash('ws', tenantId, environmentId, workspaceIdentity);
   const agentCorrelationId = hash('agc', tenantId, environmentId, workspaceId, agentType);
@@ -506,7 +550,7 @@ export function canonicalizeEvent(event: JudgedEvent, observerLine: string, rece
   const processIdentity: CanonicalProcessIdentity = {
     hostId: event.process?.hostId ?? text(event.attributes.collectorNode),
     bootId,
-    containerId: containerId(event.process?.cgroup),
+    containerId: canonicalContainerId(event.process?.cgroup),
     cgroupId: event.process?.cgroupId,
     pid: event.process?.pid,
     ppid: event.process?.ppid,
@@ -515,20 +559,21 @@ export function canonicalizeEvent(event: JudgedEvent, observerLine: string, rece
     startTimeTicks,
     startTimeNs,
     mountNamespace,
-    processInstanceId: hash(
-      'pri',
+    processInstanceId: canonicalProcessInstanceId({
       trustedSourceId,
       bootId,
-      event.process?.hostId ?? text(event.attributes.collectorNode),
-      containerId(event.process?.cgroup),
-      event.process?.cgroupId,
-      event.process?.pid,
-      stableStartTimeKind,
-      stableStartTime,
-    ),
+      hostId: event.process?.hostId,
+      collectorNode: event.attributes.collectorNode,
+      cgroup: event.process?.cgroup,
+      cgroupId: event.process?.cgroupId,
+      pid: event.process?.pid,
+      startTimeTicks,
+      startTimeNs,
+    }),
     identityConfidence: processIdentityConfidence,
   };
   const semantics = semantic(event, observerLine);
+  const aggregation = aggregationMetadata(event);
   let fileIdentity: CanonicalFileIdentity | undefined;
   if (semantics.resourceType === 'file' && semantics.resource?.startsWith('/')) {
     const device = scalarText(event.attributes.device);
@@ -611,9 +656,14 @@ export function canonicalizeEvent(event: JudgedEvent, observerLine: string, rece
       rootStartTime: processIdentity.rootStartTime,
     }),
     traceId: event.traceId,
+    ...(correlation?.invocationId ? { invocationId: correlation.invocationId } : {}),
+    ...(correlation?.toolCallId ? { toolCallId: correlation.toolCallId } : {}),
+    ...(correlation ? { correlation } : {}),
+    ...(classificationSemantics ? { classificationSemantics } : {}),
     spanId: event.spanId,
     eventKind: event.eventKind,
     ...semantics,
+    ...aggregation,
     subject: event.subject.slice(0, 500),
     processIdentity,
     fileIdentity,
