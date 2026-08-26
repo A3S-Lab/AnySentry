@@ -1,13 +1,15 @@
-import { createBrowserRouter, Outlet } from "react-router-dom";
+import { createBrowserRouter, Navigate, Outlet, useLocation } from "react-router-dom";
 import { SecurityAssistant } from "@/components/custom/security-assistant";
 import { SecurityConsoleProvider } from "@/components/custom/security-console-header";
 import { SecuritySidebar } from "@/components/custom/security-sidebar";
 import AgentEventsPage from "@/pages/AgentEventsPage";
 import AgentsPage from "@/pages/AgentsPage";
 import AlertsPage from "@/pages/AlertsPage";
+import AssetsPage from "@/pages/AssetsPage";
 import AuditPage from "@/pages/AuditPage";
 import CapabilitiesPage from "@/pages/CapabilitiesPage";
 import CollectorsPage from "@/pages/CollectorsPage";
+import FilterRulesPage from "@/pages/FilterRulesPage";
 import CoveragePage from "@/pages/CoveragePage";
 import EvidenceBundlePage from "@/pages/EvidenceBundlePage";
 import IncidentsPage from "@/pages/IncidentsPage";
@@ -36,6 +38,11 @@ function AppShell() {
   );
 }
 
+function LegacyCaptureRulesRedirect() {
+  const location = useLocation();
+  return <Navigate replace to={`/filter-rules${location.search}${location.hash}`} />;
+}
+
 export const router = createBrowserRouter(
   [{
     element: <AppShell />,
@@ -44,9 +51,13 @@ export const router = createBrowserRouter(
       { path: "/admin/security-monitor", element: <SecurityMonitorPage /> },
       { path: "/agents", element: <AgentsPage /> },
       { path: "/alerts", element: <AlertsPage /> },
+      { path: "/assets", element: <AssetsPage /> },
+      { path: "/assets/:assetId", element: <AssetsPage /> },
       { path: "/audit", element: <AuditPage /> },
       { path: "/capabilities", element: <CapabilitiesPage /> },
       { path: "/collectors", element: <CollectorsPage /> },
+      { path: "/filter-rules", element: <FilterRulesPage /> },
+      { path: "/capture-rules", element: <LegacyCaptureRulesRedirect /> },
       { path: "/coverage", element: <CoveragePage /> },
       { path: "/evidence", element: <EvidenceBundlePage /> },
       { path: "/events", element: <AgentEventsPage /> },

@@ -99,11 +99,6 @@ const SPECULATE_OPTIONS: Array<{ value: PolicyConfig["speculate"]; label: string
   { value: "high", label: "高 (high)" },
 ];
 
-const CANDIDATE_PIPELINE_OPTIONS: Array<{ value: PolicyConfig["identity"]["candidatePipeline"]; label: string }> = [
-  { value: "full", label: "完整分级研判（默认）" },
-  { value: "l1_only", label: "仅执行 L1" },
-];
-
 const TIME_OPTIONS: Array<{ value: SecurityTimeType; label: string }> = [
   { value: "last_30m", label: "近30分钟" },
   { value: "last_1h", label: "近1小时" },
@@ -223,10 +218,8 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
 
 function IdentityJudgmentSection({
   value,
-  onChange,
 }: {
   value: PolicyConfig["identity"];
-  onChange: (next: PolicyConfig["identity"]) => void;
 }) {
   return (
     <Panel title="身份研判路由" icon={Bot} description="身份保留、页面可见性与风险研判层级相互独立。">
@@ -236,13 +229,9 @@ function IdentityJudgmentSection({
           <p className="mt-1 text-xs text-zinc-500">固定使用完整分级链路；只有上一层升级时才进入已配置的 L2/L3。</p>
         </div>
         <div className="rounded-md border border-amber-400/20 bg-amber-400/5 p-3">
-          <Field label="候选 Agent" hint="默认完整分级；可在成本敏感环境限制为只执行确定性 L1。">
-            <SelectField
-              value={value.candidatePipeline}
-              onChange={(candidatePipeline) => onChange({ candidatePipeline })}
-              options={CANDIDATE_PIPELINE_OPTIONS}
-            />
-          </Field>
+          <p className="text-sm font-medium text-amber-100">候选 Agent</p>
+          <p className="mt-1 text-xs leading-5 text-zinc-500">F3 保留路由已迁入统一过滤规则系统；这里保留兼容值 {value.candidatePipeline}，不再作为权威写入口。</p>
+          <Link to="/filter-rules?view=category&category=api_retention" className="mt-3 inline-flex min-h-11 items-center text-xs font-semibold text-amber-200 underline decoration-amber-400/40 underline-offset-4">打开 API Retention 规则</Link>
         </div>
         <div className="rounded-md border border-zinc-400/20 bg-white/[0.03] p-3">
           <p className="text-sm font-medium text-zinc-200">尚未识别</p>
@@ -1419,7 +1408,7 @@ export default function PolicyConfigPage() {
               />
 
               <L1RulesSection rules={draft.rules} onChange={(next) => update("rules", next)} />
-              <IdentityJudgmentSection value={draft.identity} onChange={(next) => update("identity", next)} />
+              <IdentityJudgmentSection value={draft.identity} />
               <FastReviewSection
                 value={draft.llm}
                 onChange={(next) => update("llm", next)}

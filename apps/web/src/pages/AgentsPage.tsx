@@ -43,13 +43,15 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   type AgentEventCategory,
-  type AgentEventListItem,
   type AgentEventSource,
+  type AgentActionItem,
   type AgentClassification,
   type AgentCriticality,
   type AgentHealthState,
   type AgentInventoryItem,
+  type AgentInventory,
   type AgentInventoryQuery,
+  type QueryCoverage,
   type AgentRuntimeInstanceRecord,
   type AgentRuntimeState,
   type AgentActivityState,
@@ -68,6 +70,15 @@ const TIME_OPTIONS: Array<{ value: SecurityTimeType; label: string }> = [
   { value: "last_1d", label: "近一天" },
   { value: "last_7d", label: "近一周" },
   { value: "last_30d", label: "近一月" },
+];
+
+type AgentAssetRange = NonNullable<AgentInventoryQuery["assetRange"]>;
+const ASSET_RANGE_OPTIONS: Array<{ value: AgentAssetRange; label: string }> = [
+  { value: "current", label: "当前资产" },
+  { value: "recent", label: "最近出现" },
+  { value: "historical", label: "历史资产" },
+  { value: "archived", label: "已归档" },
+  { value: "all", label: "全部范围" },
 ];
 
 const HEALTH_OPTIONS: Array<{ value: AgentHealthState | "all"; label: string }> = [
@@ -129,7 +140,7 @@ interface AgentMetadataDraft {
   note: string;
 }
 
-type PendingReviewDecision = "confirmed_agent" | "unknown" | "non_agent";
+type PendingReviewDecision = "confirmed_agent" | "unknown" | "non_agent" | "clear";
 
 const CATEGORY_LABEL: Record<AgentEventCategory, string> = {
   tool: "工具",
@@ -156,6 +167,128 @@ function formatDate(value?: string | number) {
   if (!value) return "--";
   const parsed = dayjs(value);
   return parsed.isValid() ? parsed.format("MM-DD HH:mm:ss") : value;
+}
+
+function inventorySignature(data?: AgentInventory) {
+  if (!data) return "";
+  return [
+    data.total,
+    data.coverage.partial,
+    data.coverage.partialReason ?? "full",
+    data.coverage.source,
+    ...data.items.map((agent) => [
+      agent.agentAssetId,
+      agent.agentInstanceId ?? "metadata",
+      agent.classification,
+      agent.lifecycleState,
+      agent.eventCount,
+      agent.lastSeen,
+    ].join(":")),
+  ].join("|");
+}
+
+function mergeCountRecords<T extends string>(
+  items: AgentInventoryItem[],
+  select: (item: AgentInventoryItem) => Record<T, number>,
+) {
+  const result = {} as Record<T, number>;
+  for (const item of items) {
+    const counts = select(item);
+    for (const key of Object.keys(counts) as T[]) {
+      result[key] = (result[key] ?? 0) + counts[key];
+    }
+  }
+  return result;
+}
+
+function logicalAgentRows(items: AgentInventoryItem[]) {
+  const byAsset = new Map<string, AgentInventoryItem[]>();
+  for (const item of items) {
+    const group = byAsset.get(item.agentAssetId) ?? [];
+    group.push(item);
+    byAsset.set(item.agentAssetId, group);
+  }
+  const classificationRank: Record<AgentClassification, number> = {
+    confirmed_agent: 3,
+    probable_agent: 2,
+    unknown: 1,
+    non_agent: 0,
+  };
+  const healthRank: Record<AgentHealthState, number> = { risky: 3, active: 2, idle: 1, stale: 0 };
+  const riskRank: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1, safe: 0, unknown: -1 };
+  return [...byAsset.values()].map((group) => {
+    const latest = [...group].sort((left, right) => Date.parse(right.lastSeen) - Date.parse(left.lastSeen))[0];
+    const identity = [...group].sort((left, right) => classificationRank[right.classification] - classificationRank[left.classification])[0];
+    const health = [...group].sort((left, right) => healthRank[right.healthState] - healthRank[left.healthState])[0];
+    const risk = [...group].sort((left, right) => (riskRank[right.riskLevel] ?? -1) - (riskRank[left.riskLevel] ?? -1))[0];
+    const runtimeIds = new Set(group.map((item) => item.agentInstanceId).filter((value): value is string => Boolean(value)));
+    const firstSeen = Math.min(...group.map((item) => Date.parse(item.firstSeen)).filter(Number.isFinite));
+    const lastSeen = Math.max(...group.map((item) => Date.parse(item.lastSeen)).filter(Number.isFinite));
+    return {
+      ...latest,
+      classification: identity.classification,
+      detectedClassification: identity.detectedClassification,
+      healthState: health.healthState,
+      riskLevel: risk.riskLevel,
+      riskLevelText: risk.riskLevelText,
+      topRiskCategory: risk.topRiskCategory,
+      topRiskName: risk.topRiskName,
+      firstSeen: Number.isFinite(firstSeen) ? new Date(firstSeen).toISOString() : latest.firstSeen,
+      lastSeen: Number.isFinite(lastSeen) ? new Date(lastSeen).toISOString() : latest.lastSeen,
+      logicalInstanceCount: Math.max(runtimeIds.size, ...group.map((item) => item.logicalInstanceCount ?? 0)),
+      instanceCount: runtimeIds.size,
+      eventCount: group.reduce((total, item) => total + item.eventCount, 0),
+      riskyEventCount: group.reduce((total, item) => total + item.riskyEventCount, 0),
+      openIncidentCount: group.reduce((total, item) => total + item.openIncidentCount, 0),
+      sessionCount: group.reduce((total, item) => total + item.sessionCount, 0),
+      runCount: group.reduce((total, item) => total + item.runCount, 0),
+      traceCount: group.reduce((total, item) => total + item.traceCount, 0),
+      tokenCount: group.reduce((total, item) => total + item.tokenCount, 0),
+      avgLatencyMs: group.reduce((total, item) => total + item.avgLatencyMs * item.eventCount, 0)
+        / Math.max(1, group.reduce((total, item) => total + item.eventCount, 0)),
+      eventCategoryCounts: mergeCountRecords(group, (item) => item.eventCategoryCounts),
+      sourceCounts: mergeCountRecords(group, (item) => item.sourceCounts),
+      agentAssetAliases: [...new Set(group.flatMap((item) => item.agentAssetAliases ?? []))],
+      attributionEvidence: [...new Set(group.flatMap((item) => item.attributionEvidence))],
+      reviewIdentityKeys: [...new Set(group.flatMap((item) => item.reviewIdentityKeys))],
+    } satisfies AgentInventoryItem;
+  });
+}
+
+function InventoryCoverageBanner({
+  coverage,
+  directory,
+}: {
+  coverage?: QueryCoverage;
+  directory?: AgentInventory["directory"];
+}) {
+  if (!coverage && !directory) return null;
+  return (
+    <div className={cn(
+      "rounded-md border px-3 py-2 text-[11px] leading-5",
+      coverage?.partial || directory?.partial
+        ? "border-amber-400/20 bg-amber-500/[0.06] text-amber-100/80"
+        : "border-white/8 bg-white/[0.02] text-zinc-500",
+    )}>
+      {directory ? (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <span>{directory.partial ? "资产目录不完整" : "资产成员来自持久生命周期目录"}</span>
+          <span>{`目录 r${directory.snapshotRevision}`}</span>
+          <span>{`${directory.totalAssets} 个已保留 Agent 资产`}</span>
+          {directory.reasons.length ? <span>{`原因 ${directory.reasons.join("、")}`}</span> : null}
+        </div>
+      ) : null}
+      {coverage ? (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <span>{coverage.partial ? "行为统计覆盖不完整" : "行为统计覆盖完整"}</span>
+          <span>{`来源 ${coverage.source}`}</span>
+          <span>{`数据 ${formatDate(coverage.dataFrom)} → ${formatDate(coverage.dataTo)}`}</span>
+          <span>{`快照 ${formatDate(coverage.snapshotAsOf)}`}</span>
+          {coverage.partialReason ? <span>{`原因 ${coverage.partialReason}`}</span> : null}
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 function healthClass(health?: AgentHealthState) {
@@ -389,49 +522,144 @@ function agentNotificationHref(agent: AgentInventoryItem) {
   return `/notifications?${params.toString()}`;
 }
 
-function commandEventHref(
+function actionEventHref(
   agent: AgentInventoryItem,
-  event: AgentEventListItem,
+  eventId: string,
   timeType: SecurityTimeType,
   startTime?: string,
   endTime?: string,
 ) {
   const params = agentParams(agent, timeType);
-  params.set("eventId", event.eventId);
+  params.set("eventId", eventId);
   if (timeType === "custom" && startTime) params.set("startTime", startTime);
   if (timeType === "custom" && endTime) params.set("endTime", endTime);
   return `/events?${params.toString()}`;
 }
 
-function commandTierLabel(event: AgentEventListItem) {
-  if (event.tier === "Agent") return "L3";
-  if (event.tier === "Llm") return "L2";
-  return "L1";
+const ACTION_STATUS_LABEL: Record<AgentActionItem["status"], string> = {
+  running: "执行中",
+  succeeded: "已完成",
+  failed: "失败",
+  incomplete: "仅内核证据",
+};
+
+function actionStatusClass(status: AgentActionItem["status"]) {
+  if (status === "failed") return "border-rose-400/30 bg-rose-500/10 text-rose-100";
+  if (status === "succeeded") return "border-teal-400/30 bg-teal-500/10 text-teal-100";
+  if (status === "running") return "border-sky-400/30 bg-sky-500/10 text-sky-100";
+  return "border-amber-400/30 bg-amber-500/10 text-amber-100";
 }
 
-function commandDecision(event: AgentEventListItem) {
-  if (event.decisionStatus === "pending" || event.decisionStatus === "accepted" || event.decisionStatus === "running") {
-    return {
-      label: event.decisionStatus === "running" ? "研判中" : "待研判",
-      className: "border-sky-400/30 bg-sky-500/10 text-sky-100",
-    };
-  }
-  if (event.decisionStatus === "timeout") {
-    return { label: "研判超时", className: "border-orange-400/30 bg-orange-500/10 text-orange-100" };
-  }
-  if (event.decisionStatus === "failed") {
-    return { label: "研判失败", className: "border-rose-400/30 bg-rose-500/10 text-rose-100" };
-  }
-  if (event.verdict === "block") {
-    return { label: "阻断", className: "border-rose-400/30 bg-rose-500/10 text-rose-100" };
-  }
-  if (event.verdict === "allow") {
-    return { label: "放行", className: "border-teal-400/30 bg-teal-500/10 text-teal-100" };
-  }
-  return { label: "升级研判", className: "border-amber-400/30 bg-amber-500/10 text-amber-100" };
+function formatDuration(durationMs?: number) {
+  if (durationMs === undefined) return "--";
+  if (durationMs < 1_000) return `${durationMs}ms`;
+  return `${(durationMs / 1_000).toFixed(durationMs < 10_000 ? 1 : 0)}s`;
 }
 
-function AgentCommandTrace({
+function AgentActionEvidence({
+  action,
+  agent,
+  timeType,
+  startTime,
+  endTime,
+}: {
+  action: AgentActionItem;
+  agent: AgentInventoryItem;
+  timeType: SecurityTimeType;
+  startTime?: string;
+  endTime?: string;
+}) {
+  const semanticAction = Boolean(action.invocationId && action.toolCallId);
+  const { data, loading, error, refresh } = useRequest(
+    () => securityCenterApi.agentToolEvidence({
+      timeType,
+      startTime: timeType === "custom" ? startTime : undefined,
+      endTime: timeType === "custom" ? endTime : undefined,
+      scope: "agent",
+      durable: true,
+      agentAssetId: agent.agentAssetId,
+      agentInstanceId: action.agentRuntimeInstanceId ?? agent.agentInstanceId,
+      sourceId: action.sourceId,
+      invocationId: action.invocationId!,
+      toolCallId: action.toolCallId,
+      limit: 1_000,
+    }),
+    {
+      ready: semanticAction,
+      refreshDeps: [action.actionId, agent.agentAssetId, timeType, startTime, endTime],
+      loadingDelay: 160,
+    },
+  );
+  const evidence = data?.items.find((item) => item.toolCallId === action.toolCallId);
+
+  if (!semanticAction) {
+    return (
+      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/8 bg-amber-500/[0.035] px-4 py-3 text-xs leading-5 text-zinc-400">
+        <span>该行为由精确 Agent Runtime 下的内核事件推断，只能归因到 Runtime，未虚构 Invocation 或 ToolCall。</span>
+        {action.fallbackEventId ? (
+          <Link to={actionEventHref(agent, action.fallbackEventId, timeType, startTime, endTime)} className="shrink-0 font-medium text-teal-200 hover:text-teal-100">查看原始事件</Link>
+        ) : null}
+      </div>
+    );
+  }
+
+  return (
+    <div className="border-t border-white/8 bg-black/10 px-4 py-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <span className="font-medium text-zinc-300">关联证据</span>
+          {evidence ? (
+            <Pill className={cn(
+              evidence.status === "linked"
+                ? "border-teal-400/30 bg-teal-500/10 text-teal-100"
+                : evidence.status === "ambiguous"
+                  ? "border-rose-400/30 bg-rose-500/10 text-rose-100"
+                  : "border-amber-400/30 bg-amber-500/10 text-amber-100",
+            )}>
+              {evidence.status === "linked" ? "已严格关联" : evidence.status === "ambiguous" ? "证据冲突" : "仅语义记录"}
+            </Pill>
+          ) : null}
+          {data?.partial ? <Pill className="border-amber-400/30 bg-amber-500/10 text-amber-100">证据覆盖不完整</Pill> : null}
+          {data ? <span className="font-mono text-[11px] text-zinc-600">{data.dataSource}</span> : null}
+        </div>
+        <Button type="button" variant="ghost" size="sm" onClick={refresh} disabled={loading} className="h-7 text-zinc-400 hover:bg-white/5 hover:text-zinc-100">
+          <RefreshCw className={cn("size-3", loading && "animate-spin")} />
+          刷新证据
+        </Button>
+      </div>
+      {error ? (
+        <p className="mt-2 text-xs text-rose-200">{error.message || "证据关联加载失败"}</p>
+      ) : loading && !data ? (
+        <p className="mt-2 flex items-center gap-2 text-xs text-zinc-500"><LoaderCircle className="size-3.5 animate-spin" />正在按 Invocation、进程与资源强证据关联</p>
+      ) : !evidence ? (
+        <p className="mt-2 text-xs leading-5 text-zinc-500">
+          当前快照未返回该 ToolCall 的关联结果{data?.partialReasons?.length ? `：${data.partialReasons.join("、")}` : ""}。
+        </p>
+      ) : (
+        <div className="mt-2 space-y-2">
+          <p className="text-xs leading-5 text-zinc-500">
+            {evidence.status === "linked"
+              ? `通过 ${evidence.reason} 关联 ${evidence.kernelEvidence.length} 条内核证据；没有使用单独的时间邻近进行猜测。`
+              : evidence.status === "ambiguous"
+                ? "多个强声明竞争同一证据，系统保留冲突而不强行归因。"
+                : evidence.reason === "kernel_read_not_captured"
+                  ? "工具语义已确认，但当前读取能力或采集窗口没有提供对应内核 read-open 证据。"
+                  : "工具语义已确认，当前没有满足严格条件的本机内核证据。"}
+          </p>
+          {evidence.kernelEvidence.map((item) => (
+            <div key={item.eventId} className="grid gap-2 rounded border border-white/8 bg-white/[0.025] px-3 py-2 text-[11px] sm:grid-cols-[100px_minmax(0,1fr)_auto] sm:items-center">
+              <span className="font-mono text-zinc-500">{formatDate(item.at)}</span>
+              <span className="min-w-0 truncate text-zinc-300">{`${item.eventKind} · ${item.linkMethod} · confidence ${item.confidence.toFixed(2)}`}</span>
+              <Link to={actionEventHref(agent, item.eventId, timeType, startTime, endTime)} className="font-medium text-teal-200 hover:text-teal-100">查看原始事件</Link>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AgentActionTrace({
   agent,
   timeType,
   startTime,
@@ -442,8 +670,9 @@ function AgentCommandTrace({
   startTime?: string;
   endTime?: string;
 }) {
+  const [selectedAction, setSelectedAction] = useState<AgentActionItem>();
   const { data, loading, error, refresh } = useRequest(
-    () => securityCenterApi.agentEvents({
+    () => securityCenterApi.agentActions({
       timeType,
       startTime: timeType === "custom" ? startTime : undefined,
       endTime: timeType === "custom" ? endTime : undefined,
@@ -452,8 +681,6 @@ function AgentCommandTrace({
       noise: "hide",
       agentAssetId: agent.agentAssetId,
       agentInstanceId: agent.agentInstanceId,
-      eventKind: "ToolExec",
-      activityContext: "agent_action",
       limit: 80,
     }),
     {
@@ -461,8 +688,12 @@ function AgentCommandTrace({
       loadingDelay: 200,
     },
   );
-  const commands = data?.items ?? [];
+  const actions = data?.items ?? [];
   const toolEventCount = agent.eventCategoryCounts.tool ?? 0;
+
+  useEffect(() => {
+    setSelectedAction(undefined);
+  }, [agent.agentAssetId, agent.agentInstanceId, timeType, startTime, endTime]);
 
   return (
     <section className="overflow-hidden rounded-md border border-white/10 bg-white/[0.03]">
@@ -470,16 +701,16 @@ function AgentCommandTrace({
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <TerminalSquare className="size-4 shrink-0 text-teal-200" />
-            <h3 className="text-sm font-semibold text-zinc-100">命令追踪</h3>
-            <Pill className="border-white/10 bg-white/5 text-zinc-300">{`${toolEventCount} 条工具事件`}</Pill>
+            <h3 className="text-sm font-semibold text-zinc-100">Agent 行为追踪</h3>
+            <Pill className="border-white/10 bg-white/5 text-zinc-300">{`${toolEventCount} 条语义/工具事件`}</Pill>
           </div>
           <p className="mt-1 text-xs leading-5 text-zinc-500">
-            事件总数包含工具、网络、进程、文件和LLM等Observer信号，不等于不同命令数；相同命令产生的子进程和连接可能分别计数。
+            SDK/Adapter 的 ToolCall 是顶层行为，文件、进程和网络事件作为内核证据嵌套展示；无 Adapter 时只推断到精确 Runtime，不伪造 ToolCall。
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <span className="font-mono text-[11px] text-zinc-500">
-            {data ? `最近 ${commands.length}/${data.total}` : "--"}
+            {data ? `当前 ${actions.length}${data.totalMode === "exact" ? `/${data.total}` : "+"} 个行为` : "--"}
           </span>
           <Button
             type="button"
@@ -504,51 +735,67 @@ function AgentCommandTrace({
       {error ? (
         <div className="flex items-start gap-2 px-3 py-4 text-xs text-rose-200">
           <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
-          <span>{error.message || "命令追踪加载失败"}</span>
+          <span>{error.message || "Agent 行为加载失败"}</span>
         </div>
       ) : loading && !data ? (
         <div className="flex items-center justify-center gap-2 px-3 py-8 text-xs text-zinc-500">
           <LoaderCircle className="size-4 animate-spin" />
-          正在加载该Agent的命令与研判结果
+          正在聚合该 Agent 的语义行为与 Runtime 证据
         </div>
-      ) : commands.length === 0 ? (
-        <div className="px-3 py-8 text-center text-xs text-zinc-500">当前时间范围没有采集到工具命令</div>
+      ) : actions.length === 0 ? (
+        <div className="px-3 py-8 text-center text-xs text-zinc-500">当前行为窗口没有可聚合的 Agent 行为</div>
       ) : (
         <div className="max-h-[520px] divide-y divide-white/8 overflow-y-auto">
-          {commands.map((event) => {
-            const decision = commandDecision(event);
+          {data?.coverage?.partial ? (
+            <div className="flex items-start gap-2 bg-amber-500/[0.05] px-3 py-2 text-[11px] leading-5 text-amber-100/80">
+              <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+              <span>{`行为数据覆盖不完整：${data.coverage.partialReason ?? "存储或扫描范围受限"}；当前来源 ${data.coverage.source}。`}</span>
+            </div>
+          ) : null}
+          {actions.map((action) => {
+            const active = selectedAction?.actionId === action.actionId;
             return (
-              <article key={event.eventId} className="grid gap-2 px-3 py-3 hover:bg-white/[0.025] md:grid-cols-[92px_minmax(0,1fr)_auto]">
-                <div className="font-mono text-[11px] text-zinc-500">
-                  <p>{formatDate(event.at)}</p>
-                  {event.repeatCount && event.repeatCount > 1 ? (
-                    <p className="mt-1 text-amber-300/80">{`重复 ×${event.repeatCount}`}</p>
-                  ) : null}
-                </div>
-                <div className="min-w-0">
-                  <code className="block break-all text-xs leading-5 text-zinc-200" title={event.subject}>
-                    {event.subject}
-                  </code>
-                  <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-zinc-500">
-                    <span>{event.eventKind}</span>
-                    <span>{event.riskName}</span>
-                    <span>{`风险分 ${event.riskScore}`}</span>
-                    <span>{`延迟 ${event.latencyMs}ms`}</span>
+              <article key={action.actionId} className={cn("transition-colors", active && "bg-teal-400/[0.035]")}>
+                <button
+                  type="button"
+                  aria-expanded={active}
+                  onClick={() => setSelectedAction(active ? undefined : action)}
+                  className="grid min-h-14 w-full gap-2 px-3 py-3 text-left hover:bg-white/[0.025] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-teal-300/60 md:grid-cols-[110px_minmax(0,1fr)_auto]"
+                >
+                  <div className="font-mono text-[11px] text-zinc-500">
+                    <p>{formatDate(action.startedAt)}</p>
+                    <p className="mt-1">{formatDuration(action.durationMs)}</p>
                   </div>
-                  <p className="mt-1 line-clamp-2 text-[11px] leading-5 text-zinc-500" title={event.reason}>
-                    {event.reason}
-                  </p>
-                </div>
-                <div className="flex items-start gap-2 md:justify-end">
-                  <Pill className="border-violet-400/25 bg-violet-500/10 text-violet-100">{commandTierLabel(event)}</Pill>
-                  <Pill className={decision.className}>{decision.label}</Pill>
-                  <Link
-                    to={commandEventHref(agent, event, timeType, startTime, endTime)}
-                    className="inline-flex h-6 items-center gap-1 rounded border border-white/10 bg-white/5 px-2 text-[10px] font-semibold text-zinc-300 hover:bg-white/10 hover:text-white"
-                  >
-                    详情
-                  </Link>
-                </div>
+                  <div className="min-w-0">
+                    <div className="flex min-w-0 flex-wrap items-center gap-2">
+                      <code className="break-all text-xs font-semibold leading-5 text-zinc-100">{action.toolName}</code>
+                      <Pill className={action.origin === "semantic" ? "border-violet-400/25 bg-violet-500/10 text-violet-100" : "border-amber-400/25 bg-amber-500/10 text-amber-100"}>
+                        {action.origin === "semantic" ? "语义行为" : "内核推断"}
+                      </Pill>
+                    </div>
+                    <p className="mt-1 truncate text-[11px] text-zinc-500" title={action.targetSummary}>
+                      {action.targetSummary ?? (action.origin === "semantic" ? "工具未暴露目标摘要" : "Runtime 级执行证据")}
+                    </p>
+                    <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-zinc-600">
+                      {action.invocationId ? <span>{`inv ${action.invocationId}`}</span> : <span>invocation 未知</span>}
+                      {action.toolCallId ? <span>{`tool ${action.toolCallId}`}</span> : null}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 md:justify-end">
+                    <Pill className={actionStatusClass(action.status)}>{ACTION_STATUS_LABEL[action.status]}</Pill>
+                    <ChevronDown className={cn("size-4 text-zinc-500 transition-transform", active && "rotate-180")} />
+                  </div>
+                </button>
+                {active ? (
+                  <AgentActionEvidence
+                    key={action.actionId}
+                    action={selectedAction}
+                    agent={agent}
+                    timeType={timeType}
+                    startTime={startTime}
+                    endTime={endTime}
+                  />
+                ) : null}
               </article>
             );
           })}
@@ -667,21 +914,28 @@ function AgentDetail({
           action: "确认标记非 Agent",
           actionClassName: "bg-slate-200 text-slate-950 hover:bg-white",
         }
-      : pendingReview === "unknown"
+      : pendingReview === "clear"
+        ? {
+            title: "恢复自动识别",
+            description: "清除当前人工身份覆盖并保留审核历史。Inventory、签名、认证 Adapter 和 Behavior 会重新参与识别；若全局过滤规则仍匹配，采集档位可能不会立即变化。",
+            action: "确认恢复自动识别",
+            actionClassName: "bg-zinc-200 text-zinc-950 hover:bg-white",
+          }
+        : pendingReview === "unknown"
         ? {
             title:
               agent.classification === "probable_agent"
                 ? "证据不足，降为未知"
                 : agent.classification === "non_agent"
-                  ? "重新纳入观察"
-                  : "撤销确认，重新观察",
+                  ? "设为待确认"
+                  : "撤销确认，设为待确认",
             description:
               agent.classification === "non_agent"
-                ? "恢复后 Collector 将重新转发该稳定身份的事件，并从尚未识别状态继续观察。历史排除记录不会删除。"
+                ? "这会继续保留人工覆盖，只把当前结论改为待确认；它不等于恢复自动识别，也不保证改变 Ring 前采集档位。"
                 : "该身份将进入尚未识别状态并继续采集，已有事件、原始分类和人工审核记录保持不变。",
             action:
               agent.classification === "non_agent"
-                ? "确认重新观察"
+                ? "确认设为待确认"
                 : agent.classification === "probable_agent"
                   ? "确认降为未知"
                   : "确认撤销",
@@ -816,15 +1070,27 @@ function AgentDetail({
                   variant="ghost"
                   size="sm"
                   disabled={reviewing || Boolean(pendingReview)}
-                  onClick={() => onRequestReview("unknown")}
+                  onClick={() => onRequestReview(agent.classification === "non_agent" ? "clear" : "unknown")}
                   className="h-8 text-zinc-400 hover:bg-white/5 hover:text-zinc-100"
                 >
                   <RotateCcw className="size-3.5" />
                   {agent.classification === "probable_agent"
                     ? "证据不足，降为未知"
                     : agent.classification === "non_agent"
-                      ? "重新纳入观察"
+                      ? "恢复自动识别"
                       : "撤销确认，重新观察"}
+                </Button>
+              ) : null}
+              {agent.classification === "non_agent" ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  disabled={reviewing || Boolean(pendingReview)}
+                  onClick={() => onRequestReview("unknown")}
+                  className="h-8 text-zinc-500 hover:bg-white/5 hover:text-zinc-200"
+                >
+                  设为待确认
                 </Button>
               ) : null}
             </div>
@@ -968,7 +1234,7 @@ function AgentDetail({
           <FieldValue label="Risk Code" value={agent.topRiskCategory ?? "--"} />
         </div>
 
-        <AgentCommandTrace
+        <AgentActionTrace
           agent={agent}
           timeType={timeType}
           startTime={startTime}
@@ -1076,6 +1342,11 @@ export default function AgentsPage() {
   const routeStartTime = consoleTimeFilter.startTime ?? "";
   const routeEndTime = consoleTimeFilter.endTime ?? "";
   const [healthState, setHealthState] = useState<AgentHealthState | "all">((searchParams.get("healthState") as AgentHealthState) || "all");
+  const [assetRange, setAssetRange] = useState<AgentAssetRange>(
+    ASSET_RANGE_OPTIONS.some((option) => option.value === searchParams.get("assetRange"))
+      ? searchParams.get("assetRange") as AgentAssetRange
+      : "current",
+  );
   const [queryText, setQueryText] = useState(searchParams.get("q") ?? "");
   const selectedAgentAssetId = searchParams.get("selectedAgentAssetId") ?? searchParams.get("agentAssetId") ?? "";
   const selectedAgentInstanceId = searchParams.get("selectedAgentInstanceId") ?? searchParams.get("agentInstanceId") ?? "";
@@ -1089,12 +1360,16 @@ export default function AgentsPage() {
   const [pendingReview, setPendingReview] = useState<PendingReviewDecision | null>(null);
   const [reviewError, setReviewError] = useState("");
   const [reviewNotice, setReviewNotice] = useState("");
+  const [visibleData, setVisibleData] = useState<AgentInventory>();
+  const [pendingData, setPendingData] = useState<AgentInventory>();
+  const [selectedAgentSnapshot, setSelectedAgentSnapshot] = useState<AgentInventoryItem>();
   const reviewFocused = searchParams.get("focus") === "review";
   const reviewSourceEventId = searchParams.get("eventId") ?? "";
 
   const query = useMemo<AgentInventoryQuery>(() => ({
     timeType,
     scope,
+    assetRange,
     startTime: timeType === "custom" ? clean(routeStartTime) : undefined,
     endTime: timeType === "custom" ? clean(routeEndTime) : undefined,
     snapshotAsOf: consoleTimeFilter.snapshotAsOf,
@@ -1102,20 +1377,39 @@ export default function AgentsPage() {
     q: clean(queryText),
     userId: clean(userId),
     limit: 200,
-  }), [consoleTimeFilter.snapshotAsOf, healthState, queryText, routeEndTime, routeStartTime, scope, timeType, userId]);
+  }), [assetRange, consoleTimeFilter.snapshotAsOf, healthState, queryText, routeEndTime, routeStartTime, scope, timeType, userId]);
 
-  const { data, loading, error: listError, refresh: refreshList } = useRequest(() =>
-    securityCenterApi.agentInventory({
+  const queryKey = useMemo(() => JSON.stringify(query), [query]);
+  const { data: incomingSnapshot, loading, error: listError, refresh: refreshList } = useRequest(async () => ({
+    queryKey,
+    data: await securityCenterApi.agentDirectory({
       ...query,
       snapshotAsOf: liveSecuritySnapshotAsOf(
         timeType === "custom",
         consoleTimeFilter.snapshotAsOf,
       ),
-    }), {
+    }),
+  }), {
     refreshDeps: [query],
     pollingInterval: 10000,
     pollingWhenHidden: false,
   });
+
+  useEffect(() => {
+    setVisibleData(undefined);
+    setPendingData(undefined);
+  }, [queryKey]);
+
+  useEffect(() => {
+    if (!incomingSnapshot || incomingSnapshot.queryKey !== queryKey) return;
+    if (!visibleData) {
+      setVisibleData(incomingSnapshot.data);
+      return;
+    }
+    if (inventorySignature(incomingSnapshot.data) !== inventorySignature(visibleData)) {
+      setPendingData(incomingSnapshot.data);
+    }
+  }, [incomingSnapshot, queryKey, visibleData]);
 
   const {
     data: runtimeData,
@@ -1159,35 +1453,58 @@ export default function AgentsPage() {
     }), {
     ready: hasPinnedSelection,
     refreshDeps: [detailQuery],
-    pollingInterval: 10000,
-    pollingWhenHidden: false,
   });
 
+  const logicalAgents = useMemo(() => logicalAgentRows(visibleData?.items ?? []), [visibleData?.items]);
+  const pendingAgentCount = useMemo(() => {
+    if (!pendingData) return 0;
+    const visibleIds = new Set(logicalAgents.map((agent) => agent.agentAssetId));
+    return logicalAgentRows(pendingData.items).filter((agent) => !visibleIds.has(agent.agentAssetId)).length;
+  }, [logicalAgents, pendingData]);
   const selectedAgent = useMemo(() => {
-    const items = data?.items ?? [];
     if (hasPinnedSelection) {
       const detailAgent = detailData?.items?.[0];
-      return matchesSelectedAgent(
+      const exactDetail = matchesSelectedAgent(
         detailAgent,
         selectedAgentAssetId,
         selectedAgentInstanceId,
         legacySelectedAgentId,
         legacySelectedWorkspacePath,
       ) ? detailAgent : undefined;
+      const lastGood = matchesSelectedAgent(
+        selectedAgentSnapshot,
+        selectedAgentAssetId,
+        selectedAgentInstanceId,
+        legacySelectedAgentId,
+        legacySelectedWorkspacePath,
+      ) ? selectedAgentSnapshot : undefined;
+      const visible = logicalAgents.find((agent) => matchesSelectedAgent(
+        agent,
+        selectedAgentAssetId,
+        "",
+        legacySelectedAgentId,
+        legacySelectedWorkspacePath,
+      ));
+      return exactDetail ?? lastGood ?? visible;
     }
-    return items[0];
-  }, [data, detailData, hasPinnedSelection, legacySelectedAgentId, legacySelectedWorkspacePath, selectedAgentAssetId, selectedAgentInstanceId]);
+    return undefined;
+  }, [detailData, hasPinnedSelection, legacySelectedAgentId, legacySelectedWorkspacePath, logicalAgents, selectedAgentAssetId, selectedAgentInstanceId, selectedAgentSnapshot]);
   const selectedRuntime = useMemo(
     () => selectedAgent ? matchAgentRuntimeInstance(selectedAgent, runtimeLookup) : undefined,
     [runtimeLookup, selectedAgent],
   );
   const classificationCounts = useMemo(() => {
     const counts: Partial<Record<AgentClassification, number>> = {};
-    for (const item of data?.items ?? []) {
+    for (const item of logicalAgents) {
       counts[item.classification] = (counts[item.classification] ?? 0) + 1;
     }
     return counts;
-  }, [data?.items]);
+  }, [logicalAgents]);
+  const logicalHealthSummary = useMemo(() => ({
+    active: logicalAgents.filter((agent) => agent.healthState === "active").length,
+    risky: logicalAgents.filter((agent) => agent.healthState === "risky").length,
+    stale: logicalAgents.filter((agent) => agent.healthState === "stale").length,
+  }), [logicalAgents]);
   const reviewSourceEventHref = useMemo(() => {
     if (!reviewSourceEventId || !selectedAgent) return undefined;
     const params = new URLSearchParams({
@@ -1200,6 +1517,19 @@ export default function AgentsPage() {
     if (timeType === "custom" && routeEndTime) params.set("endTime", routeEndTime);
     return `/events?${params.toString()}`;
   }, [reviewSourceEventId, routeEndTime, routeStartTime, selectedAgent, timeType]);
+
+  useEffect(() => {
+    const detailAgent = detailData?.items?.[0];
+    if (detailAgent && matchesSelectedAgent(
+      detailAgent,
+      selectedAgentAssetId,
+      selectedAgentInstanceId,
+      legacySelectedAgentId,
+      legacySelectedWorkspacePath,
+    )) {
+      setSelectedAgentSnapshot(detailAgent);
+    }
+  }, [detailData, legacySelectedAgentId, legacySelectedWorkspacePath, selectedAgentAssetId, selectedAgentInstanceId]);
 
   useEffect(() => {
     if (
@@ -1250,6 +1580,7 @@ export default function AgentsPage() {
     setPendingReview(null);
     setReviewError("");
     setReviewNotice("");
+    setSelectedAgentSnapshot(agent);
     const next = new URLSearchParams(searchParams);
     next.set("timeType", timeType);
     next.set("scope", scope);
@@ -1265,6 +1596,7 @@ export default function AgentsPage() {
     if (agent.agentInstanceId) next.set("selectedAgentInstanceId", agent.agentInstanceId);
     else next.delete("selectedAgentInstanceId");
     if (healthState !== "all") next.set("healthState", healthState);
+    if (assetRange !== "current") next.set("assetRange", assetRange);
     if (clean(queryText)) next.set("q", queryText.trim());
     if (clean(userId)) next.set("userId", userId.trim());
     setSearchParams(next);
@@ -1273,6 +1605,7 @@ export default function AgentsPage() {
   const changeScope = (nextScope: "agent" | "raw") => {
     setScope(nextScope);
     setPendingReview(null);
+    setSelectedAgentSnapshot(undefined);
     const next = new URLSearchParams(searchParams);
     next.set("scope", nextScope);
     next.delete("agentId");
@@ -1287,12 +1620,37 @@ export default function AgentsPage() {
 
   const clearFilters = () => {
     setHealthState("all");
+    setAssetRange("current");
     setQueryText("");
     setUserId("");
     setPendingReview(null);
     setReviewError("");
     setReviewNotice("");
+    setSelectedAgentSnapshot(undefined);
+    setVisibleData(undefined);
+    setPendingData(undefined);
     setSearchParams({});
+  };
+
+  const loadPendingAssets = () => {
+    if (!pendingData) return;
+    setVisibleData(pendingData);
+    setPendingData(undefined);
+  };
+
+  const resumeAssetDirectory = () => {
+    setSelectedAgentSnapshot(undefined);
+    if (pendingData) loadPendingAssets();
+    const next = new URLSearchParams(searchParams);
+    next.delete("selectedAgentAssetId");
+    next.delete("selectedAgentInstanceId");
+    next.delete("agentAssetId");
+    next.delete("agentInstanceId");
+    next.delete("agentId");
+    next.delete("workspacePath");
+    next.delete("focus");
+    next.delete("eventId");
+    setSearchParams(next, { replace: true });
   };
 
   const saveMetadata = async () => {
@@ -1357,8 +1715,10 @@ export default function AgentsPage() {
           ? "已确认 Agent 身份，新的归因快照将同步给 Collector。"
           : decision === "non_agent"
             ? "已标记为非 Agent；历史事件保留，后续常规事件将按稳定身份抑制。"
-            : selectedAgent.classification === "non_agent"
-              ? "已重新纳入观察，Collector 将恢复转发该身份的事件。"
+            : decision === "clear"
+              ? "已清除人工覆盖并恢复自动识别；历史审核与观测缺口保留，当前采集档位仍以实际规则状态为准。"
+              : selectedAgent.classification === "non_agent"
+                ? "已设为待确认；人工覆盖仍存在，不等于恢复自动识别。"
               : "已降为尚未识别并继续采集，历史证据保持不变。",
       );
     } catch (error) {
@@ -1384,7 +1744,7 @@ export default function AgentsPage() {
                 <Bot className="size-5 shrink-0 text-teal-300" />
                 <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">智能体资产</h1>
               </div>
-              <p className="mt-0.5 truncate text-xs text-zinc-500">逻辑身份共享审核 · 每个运行窗口独立成实例 · 命令按实例追踪</p>
+              <p className="mt-0.5 truncate text-xs text-zinc-500">持久逻辑资产目录 · Runtime 分层 · 行为窗口只影响统计，不决定资产是否存在</p>
             </div>
           </div>
           <div className="flex items-center gap-2 text-xs text-zinc-500">
@@ -1394,12 +1754,13 @@ export default function AgentsPage() {
                 生命周期暂不可用
               </span>
             ) : null}
+            {listError && visibleData ? <span className="text-amber-300">目录更新失败，继续显示上次快照</span> : null}
             <Clock3 className="size-3.5" />
-            <span>{data?.updateTime ? formatDate(data.updateTime) : "等待刷新"}</span>
+            <span>{visibleData?.updateTime ? formatDate(visibleData.updateTime) : "等待刷新"}</span>
           </div>
         </div>
 
-        <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-[auto_120px_130px_minmax(160px,0.8fr)_minmax(180px,1fr)_auto_auto]">
+        <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-[auto_120px_120px_130px_minmax(160px,0.8fr)_minmax(180px,1fr)_auto_auto]">
           <div className="flex h-9 items-center rounded-md border border-white/10 bg-white/[0.03] p-1">
             <button type="button" onClick={() => changeScope("agent")} className={cn("h-7 rounded px-3 text-xs text-zinc-500", scope === "agent" && "bg-teal-500/15 text-teal-100")}>Agent 资产</button>
             <button type="button" onClick={() => changeScope("raw")} className={cn("h-7 rounded px-3 text-xs text-zinc-500", scope === "raw" && "bg-white/10 text-zinc-100")}>全部资产</button>
@@ -1409,6 +1770,12 @@ export default function AgentsPage() {
             <SelectContent>
               {TIME_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
               {timeType === "custom" ? <SelectItem value="custom">自定义范围</SelectItem> : null}
+            </SelectContent>
+          </Select>
+          <Select value={assetRange} onValueChange={(next) => setAssetRange(next as AgentAssetRange)}>
+            <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {ASSET_RANGE_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
             </SelectContent>
           </Select>
           <Select value={healthState} onValueChange={(next) => setHealthState(next as AgentHealthState | "all")}>
@@ -1425,40 +1792,56 @@ export default function AgentsPage() {
           </Button>
           <Button type="button" size="sm" onClick={() => { void Promise.all([refreshList(), refreshRuntime(), hasPinnedSelection ? refreshDetail() : Promise.resolve()]); }} disabled={loading || detailLoading} className="h-9 bg-teal-500 text-[#07100c] hover:bg-teal-400">
             {loading || detailLoading ? <LoaderCircle className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
-            刷新
+            检查更新
           </Button>
         </div>
       </header>
 
       <main className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
         <div className="mx-auto flex w-full max-w-[1800px] flex-col gap-4">
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
-            <MetricTile label="运行实例" value={data?.summary.totalAgents ?? 0} tone="border-white/10 bg-white/[0.03] text-zinc-100" />
-            <MetricTile label="活跃" value={data?.summary.activeAgents ?? 0} tone="border-teal-400/25 bg-teal-500/10 text-teal-100" />
-            <MetricTile label="风险" value={data?.summary.riskyAgents ?? 0} tone="border-rose-400/25 bg-rose-500/10 text-rose-100" />
-            <MetricTile label="失联" value={data?.summary.staleAgents ?? 0} tone="border-zinc-400/20 bg-zinc-500/10 text-zinc-100" />
-            <MetricTile label="事件" value={data?.summary.observedEventCount ?? 0} tone="border-amber-400/25 bg-amber-500/10 text-amber-100" />
+          <InventoryCoverageBanner coverage={visibleData?.coverage} directory={visibleData?.directory} />
+
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+            <MetricTile label="逻辑 Agent" value={logicalAgents.length} tone="border-violet-400/20 bg-violet-500/[0.07] text-violet-100" />
+            <MetricTile label="运行实例" value={visibleData?.summary.totalAgents ?? 0} tone="border-white/10 bg-white/[0.03] text-zinc-100" />
+            <MetricTile label="活跃" value={logicalHealthSummary.active} tone="border-teal-400/25 bg-teal-500/10 text-teal-100" />
+            <MetricTile label="风险" value={logicalHealthSummary.risky} tone="border-rose-400/25 bg-rose-500/10 text-rose-100" />
+            <MetricTile label="失联" value={logicalHealthSummary.stale} tone="border-zinc-400/20 bg-zinc-500/10 text-zinc-100" />
+            <MetricTile label="行为窗口事件" value={visibleData?.summary.observedEventCount ?? 0} tone="border-amber-400/25 bg-amber-500/10 text-amber-100" />
           </div>
 
           <div className="grid gap-4 xl:grid-cols-[minmax(460px,0.9fr)_minmax(0,1.4fr)]">
             <section className="min-h-[620px] rounded-[8px] border border-white/10 bg-[#111612]/92">
-              <div className="flex min-h-12 items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
+              <div className="flex min-h-12 flex-wrap items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
                 <div className="flex items-center gap-2">
                   <Activity className="size-4 text-teal-200" />
-                  <h2 className="text-sm font-semibold text-zinc-100">智能体运行实例</h2>
+                  <h2 className="text-sm font-semibold text-zinc-100">智能体资产目录</h2>
+                  <Pill className={hasPinnedSelection ? "border-amber-400/25 bg-amber-500/10 text-amber-100" : "border-teal-400/25 bg-teal-500/10 text-teal-100"}>
+                    {hasPinnedSelection ? "检查模式" : "实时监听"}
+                  </Pill>
                 </div>
-                <span className="text-xs text-zinc-500">{data ? `${data.total} 个实例` : "--"}</span>
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  {pendingData ? (
+                    <Button type="button" variant="secondary" size="sm" onClick={loadPendingAssets} className="h-8 border border-teal-400/25 bg-teal-500/10 text-teal-100 hover:bg-teal-500/15">
+                      {pendingAgentCount > 0 ? `${pendingAgentCount} 个新资产` : "资产快照已变化"} · 加载
+                    </Button>
+                  ) : null}
+                  {hasPinnedSelection ? (
+                    <Button type="button" variant="ghost" size="sm" onClick={resumeAssetDirectory} className="h-8 text-zinc-400 hover:bg-white/5 hover:text-zinc-100">退出检查</Button>
+                  ) : null}
+                  <span className="text-xs text-zinc-500">{visibleData ? `${logicalAgents.length} 个逻辑资产 · ${visibleData.total} 个实例` : "--"}</span>
+                </div>
               </div>
-              {loading && !data ? (
+              {loading && !visibleData ? (
                 <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">
                   <LoaderCircle className="mr-2 size-4 animate-spin" />
                   加载资产...
                 </div>
-              ) : listError ? (
+              ) : listError && !visibleData ? (
                 <div className="flex min-h-40 items-center justify-center px-6 text-center text-sm text-rose-300">
                   智能体资产加载失败，请刷新重试
                 </div>
-              ) : (data?.items?.length ?? 0) === 0 ? (
+              ) : logicalAgents.length === 0 ? (
                 <OperationalEmptyState
                   icon={Bot}
                   title={healthState !== "all" || clean(queryText) || clean(userId)
@@ -1472,11 +1855,11 @@ export default function AgentsPage() {
                 />
               ) : (
                 <div className="max-h-[calc(100vh-300px)] overflow-y-auto">
-                  {data?.items.map((agent, index, items) => {
+                  {logicalAgents.map((agent, index, items) => {
                     const previous = items[index - 1];
                     const startsSection = !previous || previous.classification !== agent.classification;
                     return (
-                      <div key={`${agent.agentAssetId}:${agent.agentInstanceId ?? "metadata"}`}>
+                      <div key={agent.agentAssetId}>
                         {startsSection ? (
                           <div className="sticky top-0 z-10 flex items-center justify-between border-b border-white/8 bg-[#111612]/95 px-3 py-2 backdrop-blur">
                             <span className={cn(
@@ -1497,10 +1880,7 @@ export default function AgentsPage() {
                         <AgentRow
                           agent={agent}
                           runtime={matchAgentRuntimeInstance(agent, runtimeLookup)}
-                          active={
-                            agent.agentAssetId === selectedAgent?.agentAssetId &&
-                            agent.agentInstanceId === selectedAgent?.agentInstanceId
-                          }
+                          active={agent.agentAssetId === selectedAgent?.agentAssetId}
                           onSelect={() => selectAgent(agent)}
                         />
                       </div>
@@ -1511,7 +1891,7 @@ export default function AgentsPage() {
             </section>
 
             <div className="space-y-4">
-              {hasPinnedSelection && detailError ? (
+              {hasPinnedSelection && detailError && !selectedAgent ? (
                 <section className="rounded-[8px] border border-rose-400/20 bg-[#111612]/92">
                   <div className="flex min-h-[360px] items-center justify-center px-6 text-center text-sm text-rose-300">指定智能体资产加载失败，请刷新重试</div>
                 </section>
@@ -1549,12 +1929,12 @@ export default function AgentsPage() {
                   <h2 className="text-sm font-semibold text-zinc-100">风险覆盖</h2>
                 </div>
                 <div className="grid gap-3 sm:grid-cols-3">
-                  <FieldValue label="Open Incident Agents" value={data?.summary.openIncidentAgents ?? 0} />
-                  <FieldValue label="Risk Events" value={data?.summary.riskyEventCount ?? 0} />
-                  <FieldValue label="Idle Agents" value={data?.summary.idleAgents ?? 0} />
-                  <FieldValue label="Managed Agents" value={data?.summary.managedAgents ?? 0} />
-                  <FieldValue label="Production Agents" value={data?.summary.productionAgents ?? 0} />
-                  <FieldValue label="High Criticality" value={data?.summary.highCriticalityAgents ?? 0} />
+                  <FieldValue label="Open Incident Agents" value={visibleData?.summary.openIncidentAgents ?? 0} />
+                  <FieldValue label="Risk Events" value={visibleData?.summary.riskyEventCount ?? 0} />
+                  <FieldValue label="Idle Agents" value={visibleData?.summary.idleAgents ?? 0} />
+                  <FieldValue label="Managed Agents" value={visibleData?.summary.managedAgents ?? 0} />
+                  <FieldValue label="Production Agents" value={visibleData?.summary.productionAgents ?? 0} />
+                  <FieldValue label="High Criticality" value={visibleData?.summary.highCriticalityAgents ?? 0} />
                 </div>
               </section>
             </div>

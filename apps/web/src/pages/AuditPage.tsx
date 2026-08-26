@@ -65,6 +65,25 @@ const ACTION_OPTIONS: Array<{ value: AuditAction | "all"; label: string }> = [
   { value: "incident.updated", label: "Incident 更新" },
   { value: "alert.updated", label: "告警更新" },
   { value: "remediation.updated", label: "处置更新" },
+  { value: "asset.review.updated", label: "资产身份裁决" },
+  { value: "asset.review.cleared", label: "资产裁决撤销" },
+  { value: "filter_rule.created", label: "过滤规则创建" },
+  { value: "filter_rule.shadowed", label: "过滤规则观察" },
+  { value: "filter_rule.promoted", label: "过滤规则生效" },
+  { value: "filter_rule.revoked", label: "过滤规则停用" },
+  { value: "filter_rule.previewed", label: "过滤规则预览" },
+  { value: "infrastructure_rule.created", label: "Infrastructure 过滤规则创建" },
+  { value: "infrastructure_rule.shadowed", label: "Infrastructure 过滤规则观察" },
+  { value: "infrastructure_rule.promoted", label: "Infrastructure 过滤规则生效" },
+  { value: "infrastructure_rule.revoked", label: "Infrastructure 过滤规则停用" },
+  { value: "infrastructure_rule.validated", label: "Infrastructure 过滤规则预览" },
+  { value: "infrastructure_rule.materialization_reported", label: "Infrastructure 规则物化" },
+  { value: "unknown_learning.reviewed", label: "Unknown 审核" },
+  { value: "unknown_learning.policy_updated", label: "Unknown 策略" },
+  { value: "unknown_learning.infrastructure_draft_created", label: "基础设施草稿创建" },
+  { value: "unknown_learning.infrastructure_draft_reused", label: "基础设施草稿复用" },
+  { value: "unknown_learning.infrastructure_draft_rejected", label: "基础设施草稿拒绝" },
+  { value: "unknown_learning.config_updated", label: "Unknown 配置" },
 ];
 
 const RESOURCE_OPTIONS: Array<{ value: AuditResourceType | "all"; label: string }> = [
@@ -79,6 +98,10 @@ const RESOURCE_OPTIONS: Array<{ value: AuditResourceType | "all"; label: string 
   { value: "incident", label: "Incident" },
   { value: "alert", label: "Alert" },
   { value: "remediation", label: "Remediation" },
+  { value: "asset", label: "Asset" },
+  { value: "infrastructure-rule", label: "Infrastructure Rule" },
+  { value: "unknown-learning", label: "Unknown Learning" },
+  { value: "supply-chain", label: "Supply Chain" },
 ];
 
 const ACTION_LABEL: Record<AuditAction, string> = {
@@ -98,10 +121,30 @@ const ACTION_LABEL: Record<AuditAction, string> = {
   "incident.updated": "Incident 更新",
   "alert.updated": "告警更新",
   "remediation.updated": "处置更新",
+  "asset.review.updated": "资产身份裁决",
+  "asset.review.cleared": "资产裁决撤销",
+  "filter_rule.created": "过滤规则创建",
+  "filter_rule.shadowed": "过滤规则进入观察",
+  "filter_rule.promoted": "过滤规则生效",
+  "filter_rule.revoked": "过滤规则停用",
+  "filter_rule.previewed": "过滤规则影响预览",
+  "infrastructure_rule.created": "Infrastructure 过滤规则创建",
+  "infrastructure_rule.shadowed": "Infrastructure 过滤规则进入观察",
+  "infrastructure_rule.promoted": "Infrastructure 过滤规则生效",
+  "infrastructure_rule.revoked": "Infrastructure 过滤规则停用",
+  "infrastructure_rule.validated": "Infrastructure 过滤规则影响预览",
+  "infrastructure_rule.materialization_reported": "Infrastructure 规则物化回报",
+  "unknown_learning.reviewed": "Unknown 人工审核",
+  "unknown_learning.policy_updated": "Unknown 策略更新",
+  "unknown_learning.infrastructure_draft_created": "基础设施草稿创建",
+  "unknown_learning.infrastructure_draft_reused": "基础设施草稿复用",
+  "unknown_learning.infrastructure_draft_rejected": "基础设施草稿拒绝",
+  "unknown_learning.config_updated": "Unknown 配置更新",
 };
 
 const RESOURCE_LABEL: Record<AuditResourceType, string> = {
   policy: "Policy",
+  "filter-rule": "Filter Rule",
   agent: "Agent",
   event: "Event",
   maintenance: "Maintenance",
@@ -111,6 +154,10 @@ const RESOURCE_LABEL: Record<AuditResourceType, string> = {
   incident: "Incident",
   alert: "Alert",
   remediation: "Remediation",
+  asset: "Asset",
+  "infrastructure-rule": "Infrastructure Rule",
+  "unknown-learning": "Unknown Learning",
+  "supply-chain": "Supply Chain",
 };
 
 function clean(value: string) {

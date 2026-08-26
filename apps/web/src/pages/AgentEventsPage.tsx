@@ -1,6 +1,7 @@
 import { useRequest } from "ahooks";
 import { formatSecurityDateTime, liveSecuritySnapshotAsOf } from "@/lib/date-time";
 import {
+  AlertTriangle,
   ArrowLeft,
   Clock3,
   FileText,
@@ -9,28 +10,35 @@ import {
   RefreshCw,
   Search,
   ShieldAlert,
+  SlidersHorizontal,
   TerminalSquare,
   UserCheck,
   X,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
 import { AgentIdentityInline, resolveAgentIdentity } from "@/components/custom/agent-identity";
+import { ClassificationViewControl } from "@/components/custom/classification-view-control";
 import { useSecurityConsole } from "@/components/custom/security-console-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { assetHref } from "@/lib/asset-routes";
 import {
   type AgentEventCategory,
+  type AgentEventList,
   type AgentEventListItem,
   type AgentEventQuery,
   type AgentTimeline,
+  type ClassificationView,
+  type QueryCoverage,
   type SecuritySeverity,
   type SecurityTimeType,
   type SecurityVerdict,
   securityCenterApi,
 } from "@/lib/api/security-center";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 const TIME_OPTIONS: Array<{ value: SecurityTimeType; label: string }> = [
@@ -49,7 +57,7 @@ const CATEGORY_OPTIONS: Array<{ value: AgentEventCategory | "all"; label: string
   { value: "network", label: "网络" },
   { value: "file", label: "文件" },
   { value: "llm", label: "LLM" },
-  { value: "security", label: "安全" },
+  { value: "security", label: "安全事件" },
   { value: "process", label: "进程" },
   { value: "runtime", label: "运行时" },
   { value: "unknown", label: "未知" },
@@ -67,7 +75,7 @@ const CATEGORY_LABEL: Record<AgentEventCategory, string> = {
   network: "网络",
   file: "文件",
   llm: "LLM",
-  security: "安全",
+  security: "安全事件",
   process: "进程",
   runtime: "运行时",
   unknown: "未知",
@@ -111,19 +119,51 @@ function verdictClass(verdict?: SecurityVerdict) {
 
 function Pill({ children, className }: { children: string; className?: string }) {
   return (
-    <span className={cn("inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold", className)}>
+    <span className={cn("inline-flex max-w-full items-center truncate rounded-full border px-2 py-0.5 text-[10px] font-semibold", className)}>
       {children}
     </span>
   );
 }
 
 function FieldValue({ label, value }: { label: string; value?: string | number }) {
+  const { t } = useI18n();
   return (
     <div className="min-w-0">
-      <p className="text-[11px] text-zinc-600">{label}</p>
+      <p className="text-[11px] text-zinc-600">{t(label)}</p>
       <p className="mt-1 truncate font-mono text-xs text-zinc-300" title={String(value ?? "")}>
         {value ?? "--"}
       </p>
+    </div>
+  );
+}
+
+function eventListSignature(data?: AgentEventList) {
+  if (!data) return "";
+  return [
+    data.total,
+    data.coverage.partial,
+    data.coverage.partialReason ?? "full",
+    data.coverage.source,
+    ...data.items.map((event) => `${event.eventId}:${event.decisionUpdatedAt ?? event.at}:${event.repeatCount ?? 1}`),
+  ].join("|");
+}
+
+function CoverageBanner({ coverage }: { coverage?: QueryCoverage }) {
+  if (!coverage) return null;
+  return (
+    <div className={cn(
+      "border-b px-3 py-2 text-[11px] leading-5",
+      coverage.partial
+        ? "border-amber-400/15 bg-amber-500/[0.06] text-amber-100/80"
+        : "border-white/8 bg-white/[0.02] text-zinc-500",
+    )}>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span>{coverage.partial ? "覆盖不完整" : "覆盖完整"}</span>
+        <span>{`来源 ${coverage.source}`}</span>
+        <span>{`数据 ${formatDate(coverage.dataFrom)} → ${formatDate(coverage.dataTo)}`}</span>
+        <span>{`快照 ${formatDate(coverage.snapshotAsOf)}`}</span>
+        {coverage.partialReason ? <span>{`原因 ${coverage.partialReason}`}</span> : null}
+      </div>
     </div>
   );
 }
@@ -137,36 +177,38 @@ function EventRow({
   active: boolean;
   onSelect: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <button
       type="button"
       onClick={onSelect}
       className={cn(
-        "grid w-full grid-cols-[88px_72px_minmax(0,1fr)_70px] items-center gap-3 border-b border-white/8 px-3 py-3 text-left transition hover:bg-white/[0.05]",
+        "grid min-w-0 w-full grid-cols-[68px_54px_minmax(0,1fr)_48px] items-center gap-2 overflow-hidden border-b border-white/8 px-3 py-3 text-left transition hover:bg-white/[0.05] sm:grid-cols-[88px_72px_minmax(0,1fr)_70px] sm:gap-3",
         active && "bg-teal-400/8",
       )}
     >
-      <span className="font-mono text-xs text-zinc-500">{formatDate(event.at)}</span>
-      <span>
-        <Pill className={severityClass(event.severity)}>{CATEGORY_LABEL[event.eventCategory] ?? event.eventCategory}</Pill>
+      <span className="min-w-0 font-mono text-xs text-zinc-500">{formatDate(event.at)}</span>
+      <span className="min-w-0">
+        <Pill className={severityClass(event.severity)}>{t(CATEGORY_LABEL[event.eventCategory] ?? event.eventCategory)}</Pill>
       </span>
       <span className="min-w-0">
-        <AgentIdentityInline event={event} className="flex" />
+        <AgentIdentityInline event={event} className="flex min-w-0" />
         <span className="mt-0.5 block truncate text-[11px] text-zinc-500" title={event.subject}>
           {event.subject}
         </span>
       </span>
-      <span className="flex justify-end">
-        <Pill className={verdictClass(event.verdict)}>{VERDICT_LABEL[event.verdict]}</Pill>
+      <span className="flex min-w-0 justify-end">
+        <Pill className={verdictClass(event.verdict)}>{t(VERDICT_LABEL[event.verdict])}</Pill>
       </span>
     </button>
   );
 }
 
 function AttributeList({ event }: { event?: AgentEventListItem }) {
+  const { t } = useI18n();
   const attrs = Object.entries(event?.attributes ?? {});
   if (attrs.length === 0) {
-    return <div className="rounded-md border border-white/10 px-3 py-5 text-center text-xs text-zinc-500">暂无属性</div>;
+    return <div className="rounded-md border border-white/10 px-3 py-5 text-center text-xs text-zinc-500">{t("暂无属性")}</div>;
   }
   return (
     <div className="grid gap-2 sm:grid-cols-2">
@@ -182,19 +224,27 @@ function AttributeList({ event }: { event?: AgentEventListItem }) {
 
 function EventDetail({
   event,
+  loading,
+  pinned,
   timeType,
   startTime,
   endTime,
 }: {
   event?: AgentEventListItem;
+  loading?: boolean;
+  pinned?: boolean;
   timeType: SecurityTimeType;
   startTime?: string;
   endTime?: string;
 }) {
+  const { t } = useI18n();
   if (!event) {
     return (
-      <section className="rounded-[8px] border border-white/10 bg-[#111612]/92">
-        <div className="flex min-h-[360px] items-center justify-center text-sm text-zinc-500">选择一个事件查看详情</div>
+      <section className="min-w-0 overflow-hidden rounded-[8px] border border-white/10 bg-[#0f131a]/92">
+        <div className="flex min-h-[360px] items-center justify-center gap-2 px-6 text-center text-sm text-zinc-500">
+          {loading ? <LoaderCircle className="size-4 animate-spin" /> : null}
+          {t(loading ? "正在按稳定 Event ID 加载详情" : pinned ? "该事件不在当前页，且当前持久存储无法返回详情" : "选择一个事件查看详情")}
+        </div>
       </section>
     );
   }
@@ -224,17 +274,17 @@ function EventDetail({
   evidenceQs.set("agentAssetId", event.agentAssetId);
   if (eventSourceId) evidenceQs.set("sourceId", eventSourceId);
   if (eventCollectorId) evidenceQs.set("collectorId", eventCollectorId);
-  const agentQs = new URLSearchParams({
+  const assetQs = new URLSearchParams({
     timeType,
-    selectedAgentAssetId: event.agentAssetId,
     focus: "review",
     eventId: event.eventId,
   });
-  if (startTime) agentQs.set("startTime", startTime);
-  if (endTime) agentQs.set("endTime", endTime);
+  if (startTime) assetQs.set("startTime", startTime);
+  if (endTime) assetQs.set("endTime", endTime);
+  const resolvedAssetId = event.subjectAssetId ?? (event.assetBindingQuality === undefined ? event.agentAssetId : undefined);
 
   return (
-    <section className="rounded-[8px] border border-white/10 bg-[#111612]/92">
+    <section className="min-w-0 overflow-hidden rounded-[8px] border border-white/10 bg-[#0f131a]/92">
       <div className="flex min-h-12 items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
         <div className="flex min-w-0 items-center gap-2">
           <FileText className="size-4 shrink-0 text-teal-200" />
@@ -243,7 +293,7 @@ function EventDetail({
             <p className="mt-0.5 truncate text-xs text-zinc-500" title={event.subject}>{event.subject}</p>
           </div>
         </div>
-        <Pill className={severityClass(event.severity)}>{SEVERITY_LABEL[event.severity]}</Pill>
+        <Pill className={severityClass(event.severity)}>{t(SEVERITY_LABEL[event.severity])}</Pill>
       </div>
       <div className="space-y-4 p-4">
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
@@ -268,11 +318,11 @@ function EventDetail({
 
         <div className="grid gap-3 sm:grid-cols-4">
           <div className="rounded-md border border-white/10 bg-white/[0.03] px-3 py-2">
-            <p className="text-[11px] text-zinc-600">处置</p>
-            <div className="mt-2"><Pill className={verdictClass(event.verdict)}>{VERDICT_LABEL[event.verdict]}</Pill></div>
+            <p className="text-[11px] text-zinc-600">{t("处置")}</p>
+            <div className="mt-2"><Pill className={verdictClass(event.verdict)}>{t(VERDICT_LABEL[event.verdict])}</Pill></div>
           </div>
           <div className="rounded-md border border-white/10 bg-white/[0.03] px-3 py-2">
-            <p className="text-[11px] text-zinc-600">风险分</p>
+            <p className="text-[11px] text-zinc-600">{t("风险分")}</p>
             <p className="mt-1 font-mono text-xl font-semibold text-zinc-100">{event.riskScore}</p>
           </div>
           <div className="rounded-md border border-white/10 bg-white/[0.03] px-3 py-2">
@@ -280,7 +330,7 @@ function EventDetail({
             <p className="mt-1 font-mono text-xl font-semibold text-zinc-100">{event.tokenCount}</p>
           </div>
           <div className="rounded-md border border-white/10 bg-white/[0.03] px-3 py-2">
-            <p className="text-[11px] text-zinc-600">延迟</p>
+            <p className="text-[11px] text-zinc-600">{t("延迟")}</p>
             <p className="mt-1 font-mono text-xl font-semibold text-zinc-100">{event.latencyMs}ms</p>
           </div>
         </div>
@@ -290,42 +340,49 @@ function EventDetail({
             <div className="flex items-center gap-2">
               <UserCheck className="size-4 shrink-0 text-teal-200" />
               <p className="text-sm font-semibold text-zinc-100">
-                {agentIdentity.classification === "unknown" ? "身份信息" : "归属智能体"}
+                {t(agentIdentity.classification === "unknown" ? "身份信息" : "归属智能体")}
               </p>
             </div>
             <p className="mt-1 text-xs leading-5 text-zinc-400">
-              {agentIdentity.classification === "unknown"
+              {t(agentIdentity.classification === "unknown"
                 ? "当前身份尚未确认，可前往身份审核查看完整运行证据。"
-                : "身份辅助审核与人工裁决在智能体资产中统一进行，本页保留采集时的单条事件证据。"}
+                : "身份辅助审核与人工裁决在关联资产中统一进行，本页保留采集时的单条事件证据。")}
             </p>
           </div>
-          <Button asChild type="button" size="sm" className="h-8 shrink-0 bg-teal-400 text-slate-950 hover:bg-teal-300">
-            <Link to={`/agents?${agentQs.toString()}`}>
-              {agentIdentity.classification === "unknown" ? "进入身份审核" : "查看智能体资产"}
-            </Link>
-          </Button>
+          {resolvedAssetId ? (
+            <Button asChild type="button" size="sm" className="h-8 shrink-0 bg-teal-400 text-slate-950 hover:bg-teal-300">
+              <Link to={assetHref(resolvedAssetId, assetQs)}>{t("查看关联资产")}</Link>
+            </Button>
+          ) : <span className="text-xs text-amber-200">{t("当前仅有 unassigned 调查分组")}</span>}
         </div>
 
         <div>
-          <p className="mb-2 text-xs font-medium text-zinc-400">Agent 归因详情</p>
+          <p className="mb-2 text-xs font-medium text-zinc-400">{t("Agent 归因详情")}</p>
           <div className="grid gap-3 rounded-md border border-white/10 bg-white/[0.03] px-3 py-3 sm:grid-cols-2 xl:grid-cols-4">
-            <FieldValue label="当前状态" value={agentIdentity.classificationLabel} />
+            <FieldValue label="当前状态" value={t(agentIdentity.classificationLabel)} />
+            <FieldValue label="发生时身份" value={event.asObservedClassification} />
+            <FieldValue label="当前有效身份" value={event.currentEffectiveClassification} />
+            <FieldValue label="资产绑定" value={`${event.assetBindingQuality ?? "unassigned"} · r${event.assetBindingRevision ?? 0}`} />
             <FieldValue label="自动检测状态" value={
               event.detectedClassification === "confirmed_agent"
-                ? "已确认 Agent"
+                ? t("已确认 Agent")
                 : event.detectedClassification === "probable_agent"
-                  ? "候选 Agent"
+                  ? t("候选 Agent")
                   : event.detectedClassification === "non_agent"
-                    ? "已排除"
-                    : "尚未识别"
+                    ? t("已排除")
+                    : t("尚未识别")
             } />
-            <FieldValue label="部署环境" value={agentIdentity.runtimeLabel ?? "未知"} />
+            <FieldValue label="部署环境" value={agentIdentity.runtimeLabel ? t(agentIdentity.runtimeLabel) : t("未知")} />
             <FieldValue label="识别来源" value={event.attribution?.source ?? "none"} />
             <FieldValue label="置信度" value={event.attribution ? `${Math.round(event.attribution.confidence * 100)}%` : "0%"} />
             <FieldValue label="Agent Scope ID" value={event.attribution?.agentScopeId ?? "non-agent"} />
             <FieldValue label="Agent Instance ID" value={event.attribution?.agentInstanceId} />
             <FieldValue label="物理工作负载" value={event.attribution?.physicalWorkloadId} />
             <FieldValue label="归因原因" value={event.attribution?.reason ?? "not_evaluated"} />
+            <FieldValue label="身份分类轴" value={event.classificationSemantics?.identityClassification} />
+            <FieldValue label="工作负载角色" value={event.classificationSemantics?.workloadRole} />
+            <FieldValue label="采集档位" value={event.classificationSemantics?.captureProfile} />
+            <FieldValue label="Unknown 原因" value={event.classificationSemantics?.unknownReason} />
             <FieldValue label="Namespace" value={workload?.namespace} />
             <FieldValue label="Pod" value={workload?.podName} />
             <FieldValue label="容器" value={workload?.containerName} />
@@ -341,15 +398,17 @@ function EventDetail({
             <FieldValue label="PPID" value={event.process?.ppid} />
             <FieldValue label="进程启动 Ticks" value={event.process?.startTimeTicks} />
             <FieldValue label="Cgroup ID" value={event.process?.cgroupId} />
+            <FieldValue label="生命周期事实" value={event.process?.lifecycleSource} />
+            <FieldValue label="生命周期缺口" value={event.process?.lifecycleReason} />
           </div>
         </div>
 
         {event.attribution?.evidence?.length ? (
           <div>
-            <p className="mb-2 text-xs font-medium text-zinc-400">Agent 识别证据</p>
+            <p className="mb-2 text-xs font-medium text-zinc-400">{t("Agent 识别证据")}</p>
             <div className="flex flex-wrap gap-2 rounded-md border border-white/10 bg-white/[0.03] px-3 py-3">
               {event.attribution.evidence.map((item) => (
-                <code key={item} className="rounded border border-white/10 bg-[#0b0f0c] px-2 py-1 text-[11px] text-zinc-400">
+                <code key={item} className="rounded border border-white/10 bg-[#0a0d12] px-2 py-1 text-[11px] text-zinc-400">
                   {item}
                 </code>
               ))}
@@ -358,7 +417,7 @@ function EventDetail({
         ) : null}
 
         <div>
-          <p className="mb-2 text-xs font-medium text-zinc-400">判定原因</p>
+          <p className="mb-2 text-xs font-medium text-zinc-400">{t("判定原因")}</p>
           <div className="rounded-md border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-zinc-300">{event.reason}</div>
         </div>
 
@@ -366,25 +425,25 @@ function EventDetail({
           <Button asChild size="sm" className="h-8 bg-teal-500 text-[#07100c] hover:bg-teal-400">
             <Link to={`/topology?${topologyQs.toString()}`}>
               <GitBranch className="size-3.5" />
-              拓扑
+              {t("拓扑")}
             </Link>
           </Button>
           <Button asChild variant="secondary" size="sm" className="h-8 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
             <Link to={`/evidence?${evidenceQs.toString()}`}>
               <FileText className="size-3.5" />
-              证据包
+              {t("证据包")}
             </Link>
           </Button>
         </div>
 
         <div>
-          <p className="mb-2 text-xs font-medium text-zinc-400">归一化属性</p>
+          <p className="mb-2 text-xs font-medium text-zinc-400">{t("归一化属性")}</p>
           <AttributeList event={event} />
         </div>
 
         <div>
           <p className="mb-2 text-xs font-medium text-zinc-400">Raw Preview</p>
-          <pre className="max-h-56 overflow-auto rounded-md border border-white/10 bg-[#0b0f0c] p-3 text-[11px] leading-relaxed text-zinc-400">
+          <pre className="max-h-56 overflow-auto rounded-md border border-white/10 bg-[#0a0d12] p-3 text-[11px] leading-relaxed text-zinc-400">
             {event.rawPreview || "--"}
           </pre>
         </div>
@@ -394,18 +453,20 @@ function EventDetail({
 }
 
 function TraceTimeline({ timeline, loading }: { timeline?: AgentTimeline; loading?: boolean }) {
+  const { t } = useI18n();
   const items = timeline?.items ?? [];
   return (
-    <section className="rounded-[8px] border border-white/10 bg-[#111612]/92">
+    <section className="min-w-0 overflow-hidden rounded-[8px] border border-white/10 bg-[#0f131a]/92">
       <div className="flex min-h-12 items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
         <div className="flex min-w-0 items-center gap-2">
           <GitBranch className="size-4 shrink-0 text-teal-200" />
-          <h2 className="truncate text-sm font-semibold text-zinc-100">Trace 时间线</h2>
+          <h2 className="truncate text-sm font-semibold text-zinc-100">{t("Trace 时间线")}</h2>
         </div>
-        {loading ? <LoaderCircle className="size-4 animate-spin text-zinc-500" /> : <span className="text-xs text-zinc-500">{items.length} 步</span>}
+        {loading ? <LoaderCircle className="size-4 animate-spin text-zinc-500" /> : <span className="text-xs text-zinc-500">{items.length} {t("步")}</span>}
       </div>
+      <CoverageBanner coverage={timeline?.coverage} />
       {items.length === 0 ? (
-        <div className="flex min-h-32 items-center justify-center text-sm text-zinc-500">暂无时间线</div>
+        <div className="flex min-h-32 items-center justify-center text-sm text-zinc-500">{t("暂无时间线")}</div>
       ) : (
         <div className="max-h-[520px] overflow-y-auto p-4">
           <div className="space-y-3">
@@ -423,8 +484,8 @@ function TraceTimeline({ timeline, loading }: { timeline?: AgentTimeline; loadin
                     <span className="shrink-0 font-mono text-[11px] text-zinc-500">{formatDate(event.at)}</span>
                   </div>
                   <div className="mt-2 flex flex-wrap items-center gap-2">
-                    <Pill className={severityClass(event.severity)}>{CATEGORY_LABEL[event.eventCategory]}</Pill>
-                    <Pill className={verdictClass(event.verdict)}>{VERDICT_LABEL[event.verdict]}</Pill>
+                    <Pill className={severityClass(event.severity)}>{t(CATEGORY_LABEL[event.eventCategory])}</Pill>
+                    <Pill className={verdictClass(event.verdict)}>{t(VERDICT_LABEL[event.verdict])}</Pill>
                     <span className="font-mono text-[11px] text-zinc-600">{shortId(event.spanId)}</span>
                   </div>
                 </div>
@@ -442,6 +503,7 @@ function clean(value: string) {
 }
 
 export default function AgentEventsPage() {
+  const { t } = useI18n();
   const [searchParams, setSearchParams] = useSearchParams();
   const { filter: consoleTimeFilter, setTimeFilter } = useSecurityConsole();
   const timeType = consoleTimeFilter.timeType ?? "last_3h";
@@ -452,6 +514,7 @@ export default function AgentEventsPage() {
   const [workspacePath, setWorkspacePath] = useState(searchParams.get("workspacePath") ?? "");
   const [agentId, setAgentId] = useState(searchParams.get("agentId") ?? "");
   const [agentAssetId, setAgentAssetId] = useState(searchParams.get("agentAssetId") ?? "");
+  const [subjectAssetId, setSubjectAssetId] = useState(searchParams.get("subjectAssetId") ?? "");
   const [agentInstanceId, setAgentInstanceId] = useState(searchParams.get("agentInstanceId") ?? "");
   const [sessionId, setSessionId] = useState(searchParams.get("sessionId") ?? "");
   const [traceId, setTraceId] = useState(searchParams.get("traceId") ?? "");
@@ -460,19 +523,34 @@ export default function AgentEventsPage() {
   const [eventCategory, setEventCategory] = useState<AgentEventCategory | "all">((searchParams.get("eventCategory") as AgentEventCategory) || "all");
   const [verdict, setVerdict] = useState<SecurityVerdict | "all">((searchParams.get("verdict") as SecurityVerdict) || "all");
   const [includeUnknown, setIncludeUnknown] = useState(searchParams.get("includeUnknown") !== "false");
+  const [classificationView, setClassificationView] = useState<ClassificationView>(
+    searchParams.get("classificationView") === "current_effective" ? "current_effective" : "as_observed",
+  );
   const [selectedEventId, setSelectedEventId] = useState(searchParams.get("eventId") ?? "");
+  const [selectedEventSnapshot, setSelectedEventSnapshot] = useState<AgentEventListItem>();
+  const [inspectMode, setInspectMode] = useState(Boolean(searchParams.get("eventId")));
+  const [visibleData, setVisibleData] = useState<AgentEventList>();
+  const [pendingData, setPendingData] = useState<AgentEventList>();
+  const [advancedFiltersOpen, setAdvancedFiltersOpen] = useState(() => [
+    "sourceId", "collectorId", "workspacePath", "agentId", "sessionId", "traceId", "runId", "eventKind", "eventCategory", "verdict",
+  ].some((key) => Boolean(searchParams.get(key))) || searchParams.get("includeUnknown") === "false");
+  const advancedFilterCount = [sourceId, collectorId, workspacePath, agentId, sessionId, traceId, runId, eventKind]
+    .filter((value) => value.trim()).length
+    + Number(eventCategory !== "all")
+    + Number(verdict !== "all")
+    + Number(!includeUnknown);
 
   const query = useMemo<AgentEventQuery>(() => ({
     timeType,
     startTime: timeType === "custom" ? clean(routeStartTime) : undefined,
     endTime: timeType === "custom" ? clean(routeEndTime) : undefined,
     snapshotAsOf: consoleTimeFilter.snapshotAsOf,
-    eventId: clean(selectedEventId),
     sourceId: clean(sourceId),
     collectorId: clean(collectorId),
     workspacePath: clean(workspacePath),
     agentId: clean(agentId),
     agentAssetId: clean(agentAssetId),
+    subjectAssetId: clean(subjectAssetId),
     agentInstanceId: clean(agentInstanceId),
     sessionId: clean(sessionId),
     traceId: clean(traceId),
@@ -481,28 +559,76 @@ export default function AgentEventsPage() {
     eventCategory: eventCategory === "all" ? undefined : eventCategory,
     verdict: verdict === "all" ? undefined : verdict,
     scope: "raw",
+    classificationView,
     includeUnknown,
     durable: true,
     limit: 120,
-  }), [agentAssetId, agentId, agentInstanceId, collectorId, consoleTimeFilter.snapshotAsOf, eventCategory, eventKind, includeUnknown, routeEndTime, routeStartTime, runId, selectedEventId, sessionId, sourceId, timeType, traceId, verdict, workspacePath]);
+  }), [agentAssetId, agentId, agentInstanceId, classificationView, collectorId, consoleTimeFilter.snapshotAsOf, eventCategory, eventKind, includeUnknown, routeEndTime, routeStartTime, runId, sessionId, sourceId, subjectAssetId, timeType, traceId, verdict, workspacePath]);
 
-  const { data, loading, refresh } = useRequest(() =>
-    securityCenterApi.agentEvents({
+  const queryKey = useMemo(() => JSON.stringify(query), [query]);
+  const { data: incomingSnapshot, loading, error, refresh } = useRequest(async () => ({
+    queryKey,
+    data: await securityCenterApi.agentEvents({
       ...query,
       snapshotAsOf: liveSecuritySnapshotAsOf(
         timeType === "custom",
         consoleTimeFilter.snapshotAsOf,
       ),
-    }), {
+    }),
+  }), {
     refreshDeps: [query],
     pollingInterval: 10000,
     pollingWhenHidden: false,
   });
 
-  const selectedEvent = useMemo(() => {
-    const items = data?.items ?? [];
-    return items.find((event) => event.eventId === selectedEventId) ?? items[0];
-  }, [data, selectedEventId]);
+  useEffect(() => {
+    setVisibleData(undefined);
+    setPendingData(undefined);
+  }, [queryKey]);
+
+  useEffect(() => {
+    if (!incomingSnapshot || incomingSnapshot.queryKey !== queryKey) return;
+    if (!visibleData) {
+      setVisibleData(incomingSnapshot.data);
+      return;
+    }
+    if (eventListSignature(incomingSnapshot.data) !== eventListSignature(visibleData)) {
+      setPendingData(incomingSnapshot.data);
+    }
+  }, [incomingSnapshot, queryKey, visibleData]);
+
+  const selectedEvent = selectedEventSnapshot?.eventId === selectedEventId
+    ? selectedEventSnapshot
+    : undefined;
+  const pendingEventCount = useMemo(() => {
+    if (!pendingData) return 0;
+    const visibleIds = new Set(visibleData?.items.map((event) => event.eventId) ?? []);
+    return pendingData.items.filter((event) => !visibleIds.has(event.eventId)).length;
+  }, [pendingData, visibleData]);
+
+  const { data: pinnedDetailData, loading: pinnedDetailLoading } = useRequest(
+    () => securityCenterApi.agentEvents({
+      timeType,
+      startTime: timeType === "custom" ? clean(routeStartTime) : undefined,
+      endTime: timeType === "custom" ? clean(routeEndTime) : undefined,
+      snapshotAsOf: visibleData?.coverage.snapshotAsOf ?? consoleTimeFilter.snapshotAsOf,
+      eventId: selectedEventId,
+      scope: "raw",
+      classificationView,
+      includeUnknown: true,
+      durable: true,
+      limit: 1,
+    }),
+    {
+      ready: Boolean(selectedEventId && !selectedEvent),
+      refreshDeps: [classificationView, selectedEventId, timeType, routeStartTime, routeEndTime],
+    },
+  );
+
+  useEffect(() => {
+    const event = pinnedDetailData?.items.find((item) => item.eventId === selectedEventId);
+    if (event) setSelectedEventSnapshot(event);
+  }, [pinnedDetailData, selectedEventId]);
 
   const { data: timeline, loading: timelineLoading } = useRequest(
     () => selectedEvent
@@ -510,12 +636,11 @@ export default function AgentEventsPage() {
           timeType,
           startTime: timeType === "custom" ? clean(routeStartTime) : undefined,
           endTime: timeType === "custom" ? clean(routeEndTime) : undefined,
-          snapshotAsOf: liveSecuritySnapshotAsOf(
-            timeType === "custom",
-            consoleTimeFilter.snapshotAsOf,
-          ),
+          snapshotAsOf: visibleData?.coverage.snapshotAsOf ?? consoleTimeFilter.snapshotAsOf,
           eventId: selectedEvent.eventId,
           traceId: selectedEvent.traceId,
+          subjectAssetId: clean(subjectAssetId),
+          classificationView,
           durable: true,
           limit: 240,
         })
@@ -533,46 +658,44 @@ export default function AgentEventsPage() {
             source: "memory_hot_ring" as const,
             totalMode: "exact" as const,
           },
+          classificationView,
+          reviewRevision: 0,
           updateTime: "",
         }),
     {
-      refreshDeps: [consoleTimeFilter.snapshotAsOf, routeEndTime, routeStartTime, selectedEvent?.traceId, timeType],
-      pollingInterval: 10000,
-      pollingWhenHidden: false,
+      refreshDeps: [classificationView, routeEndTime, routeStartTime, selectedEvent?.eventId, subjectAssetId, timeType, visibleData?.coverage.snapshotAsOf],
     },
   );
 
   const selectEvent = (event: AgentEventListItem) => {
-    const eventSourceId = event.sourceId ?? (typeof event.attributes.sourceId === "string" ? event.attributes.sourceId : undefined);
-    const eventCollectorId = event.collectorId ?? (typeof event.attributes.collectorId === "string" ? event.attributes.collectorId : undefined);
     setSelectedEventId(event.eventId);
-    const next = new URLSearchParams();
-    next.set("timeType", timeType);
-    if (timeType === "custom" && routeStartTime) next.set("startTime", routeStartTime);
-    if (timeType === "custom" && routeEndTime) next.set("endTime", routeEndTime);
+    setSelectedEventSnapshot(event);
+    setInspectMode(true);
+    const next = new URLSearchParams(searchParams);
     next.set("eventId", event.eventId);
-    next.set("traceId", event.traceId);
-    next.set("runId", event.runId);
-    next.set("eventKind", event.eventKind);
-    if (eventSourceId ?? sourceId) next.set("sourceId", eventSourceId ?? sourceId);
-    if (eventCollectorId ?? collectorId) next.set("collectorId", eventCollectorId ?? collectorId);
-    if (workspacePath) next.set("workspacePath", workspacePath);
-    if (agentId) next.set("agentId", agentId);
-    next.set("agentAssetId", event.agentAssetId);
-    if (agentInstanceId) next.set("agentInstanceId", agentInstanceId);
-    if (sessionId) next.set("sessionId", sessionId);
-    next.set("includeUnknown", String(includeUnknown));
-    if (eventSourceId) setSourceId(eventSourceId);
-    if (eventCollectorId) setCollectorId(eventCollectorId);
-    setAgentAssetId(event.agentAssetId);
-    setRunId(event.runId);
-    setEventKind(event.eventKind);
     setSearchParams(next);
+  };
+
+  const loadPendingEvents = () => {
+    if (!pendingData) return;
+    setVisibleData(pendingData);
+    setPendingData(undefined);
+  };
+
+  const resumeLive = () => {
+    setInspectMode(false);
+    setSelectedEventId("");
+    setSelectedEventSnapshot(undefined);
+    if (pendingData) loadPendingEvents();
+    const next = new URLSearchParams(searchParams);
+    next.delete("eventId");
+    setSearchParams(next, { replace: true });
   };
 
   const clearFilters = () => {
     setAgentId("");
     setAgentAssetId("");
+    setSubjectAssetId("");
     setAgentInstanceId("");
     setSourceId("");
     setCollectorId("");
@@ -584,116 +707,173 @@ export default function AgentEventsPage() {
     setEventCategory("all");
     setVerdict("all");
     setIncludeUnknown(true);
+    setClassificationView("as_observed");
     setSelectedEventId("");
+    setSelectedEventSnapshot(undefined);
+    setInspectMode(false);
+    setVisibleData(undefined);
+    setPendingData(undefined);
+    setAdvancedFiltersOpen(false);
     setSearchParams({});
   };
 
+  const changeClassificationView = (value: ClassificationView) => {
+    setClassificationView(value);
+    if (selectedEventId) setSelectedEventSnapshot(undefined);
+    const next = new URLSearchParams(searchParams);
+    next.set("classificationView", value);
+    setSearchParams(next, { replace: true });
+  };
+
   return (
-    <div className="flex h-full w-full flex-col overflow-hidden bg-[#0b0f0c] text-zinc-100">
-      <header className="shrink-0 border-b border-white/10 bg-[#0b0f0c] px-4 py-3">
+    <div className="flex h-full w-full flex-col overflow-hidden bg-[#0a0d12] text-zinc-100">
+      <header className="shrink-0 border-b border-white/10 bg-[#0a0d12] px-4 py-3">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex min-w-0 items-center gap-3">
-            <Button asChild variant="secondary" size="sm" className="h-9 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
+            <Button asChild variant="secondary" size="sm" className="h-11 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10 sm:h-9">
               <Link to="/">
                 <ArrowLeft className="size-3.5" />
-                返回
+                {t("返回")}
               </Link>
             </Button>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <TerminalSquare className="size-5 shrink-0 text-teal-300" />
-                <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">事件检索</h1>
+                <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">{t("事件检索")}</h1>
               </div>
-              <p className="mt-0.5 truncate text-xs text-zinc-500">旁路事件 · Trace 时间线 · 风险证据</p>
+              <p className="mt-0.5 truncate text-xs text-zinc-500">{t("统一资产关联 · Trace 时间线 · 风险结论保持不可变")}</p>
             </div>
           </div>
-          <div className="flex items-center gap-2 text-xs text-zinc-500">
+          <div className="flex flex-wrap items-start gap-3 text-xs text-zinc-500">
+            <ClassificationViewControl value={classificationView} onChange={changeClassificationView} />
             <AdminTokenControl compact />
-            <Clock3 className="size-3.5" />
-            <span>{data?.updateTime ? formatDate(data.updateTime) : "等待刷新"}</span>
+            {error && visibleData ? <span className="inline-flex min-h-9 items-center text-amber-200">后台更新失败，继续显示上次快照</span> : null}
+            <span className="inline-flex min-h-9 items-center gap-1"><Clock3 className="size-3.5" />{visibleData?.updateTime ? formatDate(visibleData.updateTime) : t("等待刷新")}</span>
           </div>
         </div>
 
         <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-6">
           <Select value={timeType} onValueChange={(next) => setTimeFilter({ timeType: next as SecurityTimeType })}>
-            <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
+            <SelectTrigger className="h-11 border-white/10 bg-white/5 text-xs text-zinc-100 sm:h-9"><SelectValue /></SelectTrigger>
             <SelectContent>
-              {TIME_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
-              {timeType === "custom" ? <SelectItem value="custom">自定义范围</SelectItem> : null}
+              {TIME_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{t(option.label)}</SelectItem>)}
+              {timeType === "custom" ? <SelectItem value="custom">{t("自定义范围")}</SelectItem> : null}
             </SelectContent>
           </Select>
-          <Input value={sourceId} onChange={(event) => setSourceId(event.target.value)} placeholder="sourceId" className="h-9 border-white/10 bg-white/5 font-mono text-xs" />
-          <Input value={collectorId} onChange={(event) => setCollectorId(event.target.value)} placeholder="collectorId" className="h-9 border-white/10 bg-white/5 font-mono text-xs" />
-          <Input value={workspacePath} onChange={(event) => setWorkspacePath(event.target.value)} placeholder="workspacePath" className="h-9 border-white/10 bg-white/5 font-mono text-xs" />
-          <Input value={agentId} onChange={(event) => setAgentId(event.target.value)} placeholder="agentId" className="h-9 border-white/10 bg-white/5 font-mono text-xs" />
-          <Input value={sessionId} onChange={(event) => setSessionId(event.target.value)} placeholder="sessionId" className="h-9 border-white/10 bg-white/5 font-mono text-xs" />
-          <Input value={traceId} onChange={(event) => setTraceId(event.target.value)} placeholder="traceId" className="h-9 border-white/10 bg-white/5 font-mono text-xs" />
-          <Input value={runId} onChange={(event) => setRunId(event.target.value)} placeholder="runId" className="h-9 border-white/10 bg-white/5 font-mono text-xs" />
-          <Input value={eventKind} onChange={(event) => setEventKind(event.target.value)} placeholder="eventKind" className="h-9 border-white/10 bg-white/5 font-mono text-xs" />
-          <Select value={eventCategory} onValueChange={(next) => setEventCategory(next as AgentEventCategory | "all")}>
-            <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              {CATEGORY_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
-            </SelectContent>
-          </Select>
-          <Select value={verdict} onValueChange={(next) => setVerdict(next as SecurityVerdict | "all")}>
-            <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              {VERDICT_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
-            </SelectContent>
-          </Select>
-          <Button
-            type="button"
-            variant="secondary"
-            size="sm"
-            aria-pressed={includeUnknown}
-            onClick={() => setIncludeUnknown((value) => !value)}
-            className={cn(
-              "h-9 border text-xs",
-              includeUnknown
-                ? "border-teal-400/30 bg-teal-400/10 text-teal-100 hover:bg-teal-400/15"
-                : "border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10",
-            )}
+          <Input value={subjectAssetId} onChange={(event) => setSubjectAssetId(event.target.value)} placeholder="subjectAssetId" className="h-11 border-white/10 bg-white/5 font-mono text-xs sm:h-9" />
+          <div className="grid grid-cols-2 gap-2 md:contents">
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              aria-expanded={advancedFiltersOpen}
+              aria-controls="event-advanced-filters"
+              onClick={() => setAdvancedFiltersOpen((value) => !value)}
+              className="min-h-11 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10 md:hidden"
+            >
+              <SlidersHorizontal className="size-3.5" />
+              {t("更多筛选")}{advancedFilterCount ? ` ${advancedFilterCount}` : ""}
+            </Button>
+            <Button type="button" size="sm" onClick={refresh} disabled={loading} className="min-h-11 bg-teal-500 text-[#07100c] hover:bg-teal-400 md:min-h-9">
+              {loading ? <LoaderCircle className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+              {t("检查更新")}
+            </Button>
+          </div>
+          <div
+            id="event-advanced-filters"
+            className={advancedFiltersOpen
+              ? "grid max-h-[45dvh] gap-2 overflow-y-auto overscroll-contain pr-1 md:contents"
+              : "hidden md:contents"}
           >
-            {includeUnknown ? "包含 Unknown" : "隐藏 Unknown"}
-          </Button>
-          <Button type="button" variant="secondary" size="sm" onClick={clearFilters} className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
-            <X className="size-3.5" />
-            清除
-          </Button>
-          <Button type="button" size="sm" onClick={refresh} disabled={loading} className="h-9 bg-teal-500 text-[#07100c] hover:bg-teal-400">
-            {loading ? <LoaderCircle className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
-            刷新
-          </Button>
+            <Input value={sourceId} onChange={(event) => setSourceId(event.target.value)} placeholder="sourceId" className="h-11 border-white/10 bg-white/5 font-mono text-xs sm:h-9" />
+            <Input value={collectorId} onChange={(event) => setCollectorId(event.target.value)} placeholder="collectorId" className="h-11 border-white/10 bg-white/5 font-mono text-xs sm:h-9" />
+            <Input value={workspacePath} onChange={(event) => setWorkspacePath(event.target.value)} placeholder="workspacePath" className="h-11 border-white/10 bg-white/5 font-mono text-xs sm:h-9" />
+            <Input value={agentId} onChange={(event) => setAgentId(event.target.value)} placeholder="agentId" className="h-11 border-white/10 bg-white/5 font-mono text-xs sm:h-9" />
+            <Input value={sessionId} onChange={(event) => setSessionId(event.target.value)} placeholder="sessionId" className="h-11 border-white/10 bg-white/5 font-mono text-xs sm:h-9" />
+            <Input value={traceId} onChange={(event) => setTraceId(event.target.value)} placeholder="traceId" className="h-11 border-white/10 bg-white/5 font-mono text-xs sm:h-9" />
+            <Input value={runId} onChange={(event) => setRunId(event.target.value)} placeholder="runId" className="h-11 border-white/10 bg-white/5 font-mono text-xs sm:h-9" />
+            <Input value={eventKind} onChange={(event) => setEventKind(event.target.value)} placeholder="eventKind" className="h-11 border-white/10 bg-white/5 font-mono text-xs sm:h-9" />
+            <Select value={eventCategory} onValueChange={(next) => setEventCategory(next as AgentEventCategory | "all")}>
+              <SelectTrigger className="h-11 border-white/10 bg-white/5 text-xs text-zinc-100 sm:h-9"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {CATEGORY_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{t(option.label)}</SelectItem>)}
+              </SelectContent>
+            </Select>
+            <Select value={verdict} onValueChange={(next) => setVerdict(next as SecurityVerdict | "all")}>
+              <SelectTrigger className="h-11 border-white/10 bg-white/5 text-xs text-zinc-100 sm:h-9"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {VERDICT_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{t(option.label)}</SelectItem>)}
+              </SelectContent>
+            </Select>
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              aria-pressed={includeUnknown}
+              onClick={() => setIncludeUnknown((value) => !value)}
+              className={cn(
+                "h-11 border text-xs sm:h-9",
+                includeUnknown
+                  ? "border-teal-400/30 bg-teal-400/10 text-teal-100 hover:bg-teal-400/15"
+                  : "border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10",
+              )}
+            >
+              {t(includeUnknown ? "包含 Unknown" : "隐藏 Unknown")}
+            </Button>
+            <Button type="button" variant="secondary" size="sm" onClick={clearFilters} className="h-11 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10 sm:h-9">
+              <X className="size-3.5" />
+              {t("清除")}
+            </Button>
+          </div>
         </div>
       </header>
 
-      <main className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
-        <div className="mx-auto grid w-full max-w-[1800px] gap-4 xl:grid-cols-[minmax(420px,0.9fr)_minmax(0,1.25fr)_minmax(360px,0.8fr)]">
-          <section className="min-h-[620px] rounded-[8px] border border-white/10 bg-[#111612]/92">
-            <div className="flex min-h-12 items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
+      <main className="min-h-0 min-w-0 flex-1 overflow-y-auto px-4 py-4">
+        <div className="mx-auto grid min-w-0 w-full max-w-[1800px] gap-4 xl:grid-cols-[minmax(420px,0.9fr)_minmax(0,1.25fr)_minmax(360px,0.8fr)]">
+          <section className="min-h-[620px] min-w-0 overflow-hidden rounded-[8px] border border-white/10 bg-[#0f131a]/92">
+            <div className="flex min-h-12 flex-wrap items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
               <div className="flex items-center gap-2">
                 <Search className="size-4 text-teal-200" />
-                <h2 className="text-sm font-semibold text-zinc-100">事件</h2>
+                <h2 className="text-sm font-semibold text-zinc-100">{t("事件")}</h2>
+                <Pill className={inspectMode ? "border-amber-400/25 bg-amber-500/10 text-amber-100" : "border-teal-400/25 bg-teal-500/10 text-teal-100"}>
+                  {inspectMode ? t("检查模式") : t("实时监听")}
+                </Pill>
               </div>
-              <span
-                className="text-xs text-zinc-500"
-                title={data?.totalApproximate ? "大窗口使用有界近似去重统计" : undefined}
-                aria-label={data ? `${data.totalApproximate ? "约 " : ""}${data.total} 条事件` : undefined}
-              >
-                {data ? `${data.totalApproximate ? "≈" : ""}${data.total} 条` : "--"}
-              </span>
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                {pendingData ? (
+                  <Button type="button" variant="secondary" size="sm" onClick={loadPendingEvents} className="h-8 border border-teal-400/25 bg-teal-500/10 text-teal-100 hover:bg-teal-500/15">
+                    {pendingEventCount > 0 ? `${pendingEventCount} 条新事件` : "快照已变化"} · 加载
+                  </Button>
+                ) : null}
+                {inspectMode ? (
+                  <Button type="button" variant="ghost" size="sm" onClick={resumeLive} className="h-8 text-zinc-400 hover:bg-white/5 hover:text-zinc-100">退出检查</Button>
+                ) : null}
+                <span
+                  className="text-xs text-zinc-500"
+                  title={visibleData?.totalApproximate ? t("大窗口使用有界近似去重统计") : undefined}
+                  aria-label={visibleData ? `${visibleData.totalApproximate ? `${t("约")} ` : ""}${visibleData.total} ${t("条事件")}` : undefined}
+                >
+                  {visibleData ? `${visibleData.totalApproximate ? "≈" : ""}${visibleData.total} ${t("条")}` : "--"}
+                </span>
+              </div>
             </div>
-            {loading && !data ? (
+            <CoverageBanner coverage={visibleData?.coverage} />
+            {loading && !visibleData ? (
               <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">
                 <LoaderCircle className="mr-2 size-4 animate-spin" />
-                加载事件...
+                {t("加载事件...")}
               </div>
-            ) : (data?.items?.length ?? 0) === 0 ? (
-              <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">暂无事件</div>
+            ) : error && !visibleData ? (
+              <div className="flex min-h-40 flex-col items-center justify-center px-6 text-center">
+                <AlertTriangle className="size-5 text-rose-300" />
+                <p className="mt-2 text-sm text-rose-200">{t("事件加载失败")}</p>
+                <p className="mt-1 text-xs leading-5 text-zinc-500">{t(error.message || "请检查 API 与采集链路")}</p>
+              </div>
+            ) : (visibleData?.items?.length ?? 0) === 0 ? (
+              <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">{t("暂无事件")}</div>
             ) : (
               <div className="max-h-[calc(100vh-220px)] overflow-y-auto">
-                {data?.items.map((event) => (
+                {visibleData?.items.map((event) => (
                   <EventRow
                     key={event.eventId}
                     event={event}
@@ -707,25 +887,27 @@ export default function AgentEventsPage() {
 
           <EventDetail
             event={selectedEvent}
+            loading={Boolean(selectedEventId && !selectedEvent && pinnedDetailLoading)}
+            pinned={Boolean(selectedEventId)}
             timeType={timeType}
             startTime={timeType === "custom" ? routeStartTime : undefined}
             endTime={timeType === "custom" ? routeEndTime : undefined}
           />
 
           <div className="space-y-4">
-            <section className="rounded-[8px] border border-white/10 bg-[#111612]/92 p-4">
+            <section className="rounded-[8px] border border-white/10 bg-[#0f131a]/92 p-4">
               <div className="mb-3 flex items-center gap-2">
                 <ShieldAlert className="size-4 text-rose-200" />
-                <h2 className="text-sm font-semibold text-zinc-100">当前证据</h2>
+                <h2 className="text-sm font-semibold text-zinc-100">{t("当前证据")}</h2>
               </div>
               <div className="grid gap-3">
                 <FieldValue label="风险分类" value={selectedEvent?.riskCategory} />
-                <FieldValue label="风险名称" value={selectedEvent?.riskName} />
+                <FieldValue label="风险名称" value={selectedEvent?.riskName ? t(selectedEvent.riskName) : undefined} />
                 <FieldValue label="研判层级" value={selectedEvent?.tier} />
                 <FieldValue label="父 Span" value={selectedEvent?.parentSpanId} />
               </div>
             </section>
-            <TraceTimeline timeline={timeline} loading={timelineLoading} />
+            <TraceTimeline timeline={selectedEvent && timeline?.traceId === selectedEvent.traceId ? timeline : undefined} loading={Boolean(selectedEvent && timelineLoading)} />
           </div>
         </div>
       </main>
