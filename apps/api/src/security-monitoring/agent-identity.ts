@@ -5,11 +5,19 @@ import {
   AgentWorkloadRef,
   JudgedEvent,
 } from './types';
+import { projectAgentSemanticIdentity } from './agent-semantic-identity';
 
 export type AgentRuntime = 'kubernetes' | 'docker' | 'host' | 'unknown';
 
 export interface DetectedAgentIdentity {
   agentAssetId: string;
+  agentAssetAliases: string[];
+  agentRuntimeInstanceId: string;
+  agentRuntimeInstanceAliases: string[];
+  agentProduct?: string;
+  bindingQuality: 'exact' | 'weak';
+  identityReasonCode: string;
+  identityResolutionRank: number;
   detectedClassification: AgentClassification;
   detectedName?: string;
   rawAgentId: string;
@@ -101,36 +109,14 @@ function detectedNameFor(event: Pick<JudgedEvent, 'agentId' | 'attribution'>): s
   );
 }
 
-function localInstanceKey(event: Pick<JudgedEvent, 'workspacePath' | 'process' | 'attribution'>): string | undefined {
-  const rootPid = event.attribution?.rootPid;
-  if (!rootPid) return undefined;
-  return [
-    'host-root',
-    event.process?.hostId ?? 'host',
-    event.process?.bootId ?? 'boot',
-    rootPid,
-    event.attribution?.rootStartTime ?? 'start-unknown',
-  ].join(':');
+export function agentIdentityKeyForEvent(event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'process' | 'attribution'>): string {
+  return projectAgentSemanticIdentity({ ...event, sessionId: '', attributes: {} }).canonicalIdentityKey;
 }
 
-export function agentIdentityKeyForEvent(event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'process' | 'attribution'>): string {
-  const attribution = event.attribution;
-  const workload = attribution?.workloadRef;
-  return (
-    text(attribution?.physicalWorkloadId) ??
-    text(attribution?.agentInstanceId) ??
-    (
-      workload?.podUid
-        ? `k8s:${workload.podUid}:${workload.containerName ?? workload.name ?? 'container'}`
-        : undefined
-    ) ??
-    localInstanceKey(event) ??
-    [
-      'logical',
-      event.workspacePath,
-      attribution?.agentScopeId ?? attribution?.agentDisplayName ?? event.agentId,
-    ].join(':')
-  );
+export function agentIdentityKeysForEvent(
+  event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'sessionId' | 'attributes' | 'process' | 'attribution'>,
+): string[] {
+  return projectAgentSemanticIdentity(event).identityAliases;
 }
 
 /**
@@ -142,57 +128,27 @@ export function agentIdentityKeyForEvent(event: Pick<JudgedEvent, 'agentId' | 'w
  * agentInstanceId. Container orchestrator identities remain authoritative when present.
  */
 export function agentRuntimeInstanceIdForEvent(
-  event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'sessionId' | 'process' | 'attribution'>,
+  event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'sessionId' | 'process' | 'attribution'> & Partial<Pick<JudgedEvent, 'attributes'>>,
 ): string {
-  const attribution = event.attribution;
-  const workload = attribution?.workloadRef;
-  if (workload?.podUid) {
-    return `k8s:${workload.podUid}:${workload.containerName ?? workload.name ?? 'container'}`;
-  }
+  return projectAgentSemanticIdentity({ ...event, attributes: event.attributes ?? {} }).canonicalRuntimeInstanceId;
+}
 
-  const physical = text(attribution?.physicalWorkloadId);
-  const attributedInstance = text(attribution?.agentInstanceId);
-  const containerIdentity = [attributedInstance, physical].find((value) =>
-    /^(?:container|docker|k8s):/u.test(value ?? ''),
-  );
-  if (containerIdentity) return containerIdentity;
-
-  const rootPid = attribution?.rootPid;
-  if (rootPid) {
-    const rootStartTime =
-      text(attribution?.rootStartTime) ??
-      (
-        event.process?.pid === rootPid
-          ? text(event.process.startTimeNs) ?? text(event.process.startTimeTicks)
-          : undefined
-      );
-    return [
-      'host-root',
-      event.process?.hostId ?? 'host',
-      event.process?.bootId ?? 'boot',
-      rootPid,
-      rootStartTime ?? 'start-unknown',
-    ].join(':');
-  }
-
-  if (attributedInstance) return attributedInstance;
-  if (physical) return physical;
-  if (event.process?.pid) {
-    return [
-      'host-process',
-      event.process.hostId ?? 'host',
-      event.process.bootId ?? 'boot',
-      event.process.pid,
-      event.process.startTimeNs ?? event.process.startTimeTicks ?? 'start-unknown',
-    ].join(':');
-  }
-  return `session:${event.sessionId}:${event.agentId}`;
+export function agentRuntimeInstanceIdsForEvent(
+  event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'sessionId' | 'attributes' | 'process' | 'attribution'>,
+): string[] {
+  return projectAgentSemanticIdentity(event).runtimeInstanceAliases;
 }
 
 export function agentAssetIdForEvent(
   event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'process' | 'attribution'>,
 ): string {
   return agentAssetIdForIdentityKey(agentIdentityKeyForEvent(event));
+}
+
+export function agentAssetIdAliasesForEvent(
+  event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'sessionId' | 'attributes' | 'process' | 'attribution'>,
+): string[] {
+  return agentIdentityKeysForEvent(event).map(agentAssetIdForIdentityKey);
 }
 
 export function agentAssetIdForIdentityKey(identityKey: string): string {
@@ -237,11 +193,28 @@ export function locationLabelFor(
 }
 
 export function detectedAgentIdentity(
-  event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'process' | 'attribution'>,
+  event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'process' | 'attribution'> & Partial<Pick<JudgedEvent, 'sessionId' | 'attributes'>>,
 ): DetectedAgentIdentity {
   const runtime = runtimeFor(event);
+  const semantic = projectAgentSemanticIdentity({
+    ...event,
+    sessionId: event.sessionId ?? '',
+    attributes: event.attributes ?? {},
+  });
   return {
-    agentAssetId: agentAssetIdForEvent(event),
+    agentAssetId: agentAssetIdForIdentityKey(semantic.canonicalIdentityKey),
+    agentAssetAliases: semantic.identityAliases.map(agentAssetIdForIdentityKey),
+    agentRuntimeInstanceId: semantic.canonicalRuntimeInstanceId,
+    agentRuntimeInstanceAliases: semantic.runtimeInstanceAliases,
+    agentProduct: semantic.agentProduct,
+    bindingQuality: semantic.bindingQuality,
+    identityReasonCode: semantic.reasonCode,
+    identityResolutionRank: semantic.canonicalIdentityKey.startsWith('k8s-agent-logical:v1:')
+      || semantic.canonicalIdentityKey.startsWith('docker-agent-logical:v1:')
+      ? 4
+      : semantic.agentRootInstanceId
+        ? 3
+        : semantic.bindingQuality === 'exact' ? 2 : 1,
     detectedClassification: event.attribution?.classification ?? 'unknown',
     detectedName: detectedNameFor(event),
     rawAgentId: event.agentId,

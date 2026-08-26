@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { createHash } from 'node:crypto';
 import { managementAuthHeaders, safeProbeId } from './probe-id.mjs';
 
 const baseUrl = (process.env.ANYSENTRY_API_BASE ?? process.env.API_BASE ?? `http://127.0.0.1:${process.env.PORT ?? '29653'}/security-center`).replace(/\/$/, '');
@@ -49,8 +50,88 @@ async function rawJsonStatus(path, body) {
   return res.status;
 }
 
-function observerLine(identity, event, process) {
-  return JSON.stringify({ identity, ...(process ? { process } : {}), event });
+function observerLine(identity, event, process, envelope = {}) {
+  return JSON.stringify({ ...envelope, identity, ...(process ? { process } : {}), event });
+}
+
+function captureProbeMetrics(probe, overrides = {}) {
+  return {
+    probe,
+    attempted: 0,
+    fullSelected: 0,
+    aggregateSelected: 0,
+    sampleSelected: 0,
+    sampleRejected: 0,
+    dropSelected: 0,
+    decisionError: 0,
+    probeError: 0,
+    payloadSelected: 0,
+    payloadError: 0,
+    ringSubmitted: 0,
+    ringDropped: 0,
+    wouldFull: 0,
+    wouldAggregate: 0,
+    wouldSample: 0,
+    wouldDrop: 0,
+    ruleHit: 0,
+    ruleMiss: 0,
+    staleRule: 0,
+    promotionHit: 0,
+    promotionError: 0,
+    aggregateError: 0,
+    ...overrides,
+  };
+}
+
+function captureProfileMetricsFixture() {
+  const probes = [
+    captureProbeMetrics('exec', {
+      attempted: 3, fullSelected: 3, payloadSelected: 3, ringSubmitted: 9,
+    }),
+    captureProbeMetrics('exit', {
+      attempted: 3, fullSelected: 3, payloadSelected: 3, ringSubmitted: 3,
+    }),
+    captureProbeMetrics('tls'),
+    captureProbeMetrics('connect'),
+    captureProbeMetrics('dns'),
+    captureProbeMetrics('file_access', {
+      attempted: 100,
+      aggregateSelected: 70,
+      sampleSelected: 10,
+      sampleRejected: 10,
+      dropSelected: 5,
+      decisionError: 5,
+      payloadSelected: 10,
+      payloadError: 1,
+      ringSubmitted: 8,
+      ringDropped: 1,
+      ruleHit: 80,
+      ruleMiss: 20,
+      aggregateError: 2,
+    }),
+    captureProbeMetrics('file_delete'),
+    captureProbeMetrics('llm'),
+    captureProbeMetrics('ssl'),
+    captureProbeMetrics('security'),
+  ];
+  return {
+    mode: 'enforce',
+    activeEpoch: 7001,
+    destructiveEnabled: true,
+    decisionUnit: 'decision_op',
+    payloadUnit: 'single_record_candidate',
+    deliveryUnit: 'physical_record',
+    sampleNodeLimitPerWindow: 1000,
+    aggregateKeys: 4096,
+    aggregateEmitted: 88,
+    aggregateOutputRetried: 2,
+    aggregateCleaned: 7,
+    aggregateReadErrors: 0,
+    // The server derives degradation from per-probe aggregateError even if a stale producer flag
+    // incorrectly says false.
+    aggregateLedgerDegraded: false,
+    probes,
+  };
 }
 
 function sourceHeaders(sourceId, token) {
@@ -177,6 +258,104 @@ async function verifyCollectorMetricFreshnessContract() {
     sameMillisecondHealth,
   );
 
+  const durableRaw = heartbeat({
+    at: at - 10,
+    origin: 'raw_collector',
+    nodeName: `${runId}-durable-raw-node`,
+    namespace: `${runId}-durable-raw-namespace`,
+    podName: `${runId}-durable-raw-pod`,
+    version: 'collector-1.2.3',
+    mode: 'observe+extensions',
+    attachedProbes: 27,
+    enabledFeatures: ['exec', 'network', 'dns', 'security', 'files', 'file_access', 'file_delete', 'ssl'],
+    fileFilterMetricsReportedAt: at - 10,
+    fileFilterMetrics: { fileAccess: 11, accessSuppressed: 99, enabled: true, epoch: 42 },
+  });
+  const durableForwarder = heartbeat({
+    at,
+    origin: 'forwarder',
+    nodeName: `${runId}-durable-forwarder-node`,
+    version: undefined,
+    mode: 'observer-forwarder:enforce',
+    attachedProbes: 0,
+    enabledFeatures: [],
+    filterMetricsReportedAt: at,
+    filterMetrics: { scope: 'shadow', observed: 12 },
+  });
+  const durableChannelAggregation = new AggregationService({}, {}, {}, {});
+  const durableChannelHealth = durableChannelAggregation.collectorHealth(
+    { timeType: 'last_30d', collectorId: durableRaw.collectorId },
+    {
+      heartbeats: [durableRaw, durableForwarder],
+      // This is the real ClickHouse latest shape: only the newer Forwarder row survives here.
+      latest: [durableForwarder],
+      source: 'clickhouse',
+    },
+  );
+  assert(
+    'newer Forwarder heartbeat cannot erase raw Collector identity, capabilities, or file-filter state',
+    durableChannelHealth.items?.[0]?.nodeName === `${runId}-durable-raw-node` &&
+      durableChannelHealth.items?.[0]?.namespace === `${runId}-durable-raw-namespace` &&
+      durableChannelHealth.items?.[0]?.podName === `${runId}-durable-raw-pod` &&
+      durableChannelHealth.items?.[0]?.version === 'collector-1.2.3' &&
+      durableChannelHealth.items?.[0]?.mode === 'observe+extensions' &&
+      durableChannelHealth.items?.[0]?.attachedProbes === 27 &&
+      durableChannelHealth.items?.[0]?.enabledFeatures?.includes('file_access') &&
+      durableChannelHealth.items?.[0]?.enabledFeatures?.includes('ssl') &&
+      durableChannelHealth.items?.[0]?.filterMetricsReported === true &&
+      durableChannelHealth.items?.[0]?.fileFilterMetricsReported === true &&
+      durableChannelHealth.items?.[0]?.fileFilterMetrics?.fileAccess === 11 &&
+      durableChannelHealth.items?.[0]?.fileFilterMetrics?.accessSuppressed === 99 &&
+      durableChannelHealth.items?.[0]?.fileFilterMetrics?.epoch === 42,
+    durableChannelHealth,
+  );
+
+  const staleMetadataRaw = heartbeat({
+    collectorId: `${runId}-stale-metadata-collector`,
+    at: at - 4 * 60_000,
+    origin: 'raw_collector',
+    nodeName: `${runId}-stale-raw-node`,
+    version: 'collector-stale',
+    mode: 'observe+extensions',
+    attachedProbes: 27,
+    enabledFeatures: ['exec', 'file_access'],
+  });
+  const freshMetadataForwarder = heartbeat({
+    collectorId: staleMetadataRaw.collectorId,
+    at: at - 1_000,
+    origin: 'forwarder',
+    nodeName: `${runId}-fresh-forwarder-node`,
+    mode: 'observer-forwarder:enforce',
+    attachedProbes: 0,
+    enabledFeatures: [],
+    filterMetricsReportedAt: at - 1_000,
+    filterMetrics: { scope: 'decoupled', observed: 3 },
+  });
+  const staleMetadataAggregation = new AggregationService({
+    query: () => [],
+    queryCollectorHeartbeats: () => [staleMetadataRaw, freshMetadataForwarder],
+    collectorHeartbeatHeads: () => ({
+      latest: [freshMetadataForwarder],
+      latestMetrics: [freshMetadataForwarder],
+      latestRaw: [staleMetadataRaw],
+      latestForwarder: [freshMetadataForwarder],
+      latestCaptureProfile: [],
+    }),
+  }, {}, {}, {});
+  const staleMetadataHealth = staleMetadataAggregation.collectorHealth({
+    timeType: 'last_30d', collectorId: staleMetadataRaw.collectorId,
+  });
+  assert(
+    'stale raw Collector metadata does not masquerade as the currently reporting Forwarder capability set',
+    staleMetadataHealth.items?.[0]?.nodeName === `${runId}-fresh-forwarder-node` &&
+      staleMetadataHealth.items?.[0]?.mode === 'observer-forwarder:enforce' &&
+      staleMetadataHealth.items?.[0]?.attachedProbes === 0 &&
+      staleMetadataHealth.items?.[0]?.enabledFeatures?.length === 0 &&
+      staleMetadataHealth.items?.[0]?.filterMetricsReported === true &&
+      staleMetadataHealth.items?.[0]?.filterMetrics?.observed === 3,
+    staleMetadataHealth,
+  );
+
   const historicalInside = heartbeat({
     at: at - 2_000,
     origin: 'raw_collector',
@@ -298,6 +477,59 @@ async function verifyCollectorMetricFreshnessContract() {
       noFilterHealth.items?.[0]?.filterMetrics?.scope === 'decoupled',
     noFilterHealth,
   );
+
+  const currentOperational = heartbeat({
+    collectorId: `${runId}-current-operational`,
+    at: at - 1_000,
+    origin: 'forwarder',
+  });
+  const archivedTest = heartbeat({
+    collectorId: `s3-enforce-${at}-12345-collector`,
+    at: at - 4 * 60 * 60_000,
+    origin: 'forwarder',
+  });
+  const expiredGeneric = heartbeat({
+    collectorId: `${runId}-expired-generic`,
+    at: at - 2 * 24 * 60 * 60_000,
+    origin: 'forwarder',
+  });
+  const recentlyDown = heartbeat({
+    collectorId: `${runId}-recently-down`,
+    at: at - 4 * 60 * 60_000,
+    origin: 'forwarder',
+  });
+  const currentViewAggregation = new AggregationService({
+    query: () => [],
+    queryCollectorHeartbeats: () => [currentOperational],
+    collectorHeartbeatHeads: () => ({
+      latest: [currentOperational, recentlyDown, archivedTest, expiredGeneric],
+      latestMetrics: [],
+      latestRaw: [],
+      latestForwarder: [currentOperational, recentlyDown, archivedTest, expiredGeneric],
+    }),
+  }, {}, {}, {});
+  const currentView = currentViewAggregation.collectorHealth({ timeType: 'last_3h' });
+  assert(
+    'current Collector summary excludes archived latest heads outside the requested window',
+    currentView.total === 2 &&
+      currentView.summary?.totalCollectors === 2 &&
+      currentView.summary?.downCollectors === 1 &&
+      currentView.items?.some((item) => item.collectorId === currentOperational.collectorId) &&
+      currentView.items?.some((item) => item.collectorId === recentlyDown.collectorId && item.state === 'down') &&
+      !currentView.items?.some((item) =>
+        item.collectorId === archivedTest.collectorId || item.collectorId === expiredGeneric.collectorId),
+    currentView,
+  );
+  const archivedDeepLink = currentViewAggregation.collectorHealth({
+    timeType: 'last_3h',
+    collectorId: archivedTest.collectorId,
+  });
+  assert(
+    'an explicit archived Collector deep link remains queryable',
+    archivedDeepLink.items?.[0]?.collectorId === archivedTest.collectorId &&
+      archivedDeepLink.items?.[0]?.state === 'down',
+    archivedDeepLink,
+  );
 }
 
 async function verifyHotRingCapacityContract() {
@@ -367,6 +599,24 @@ async function verifyCollectorHeartbeatProvenanceContract() {
       shutdownFinal: true,
     },
     filterMetrics: { scope: 'shadow', shutdownFinal: true, observed: 99 },
+    fileFilterMetrics: {
+      fileAccess: 10,
+      fileDelete: 2,
+      accessKept: 4,
+      accessSampled: 2,
+      accessDropped: 1,
+      accessSuppressed: 3,
+      deleteKept: 2,
+      deleteDropped: 0,
+      ruleHits: 6,
+      ruleMisses: 4,
+      staleRules: 1,
+      accessRingDropped: 2,
+      deleteRingDropped: 1,
+      enabled: true,
+      epoch: 7,
+    },
+    captureProfileMetrics: captureProfileMetricsFixture(),
   }, 1_000, 'raw_collector');
   assert(
     'server-assigned raw provenance separates exec quality from operational health',
@@ -379,6 +629,17 @@ async function verifyCollectorHeartbeatProvenanceContract() {
       raw.filterMetricsReportedAt === undefined &&
       raw.filterMetrics.scope === 'decoupled' &&
       raw.filterMetrics.shutdownFinal === false &&
+      raw.fileFilterMetricsReportedAt === 1_000 &&
+      raw.fileFilterMetrics?.fileAccess === 10 &&
+      raw.fileFilterMetrics?.accessSuppressed === 3 &&
+      raw.fileFilterMetrics?.accessRingDropped === 2 &&
+      raw.fileFilterMetrics?.enabled === true &&
+      raw.fileFilterMetrics?.epoch === 7 &&
+      raw.captureProfileMetricsReportedAt === 1_000 &&
+      raw.captureProfileMetrics?.probes.length === 11 &&
+      raw.captureProfileMetrics?.probes.find((probe) => probe.probe === 'file_read')?.decisionConserved === true &&
+      raw.captureProfileMetrics?.decisionConserved === true &&
+      raw.captureProfileMetrics?.aggregateLedgerDegraded === true &&
       observed.at(-1)?.errorCount === 0,
     { raw, observed },
   );
@@ -393,6 +654,24 @@ async function verifyCollectorHeartbeatProvenanceContract() {
       shutdownFinal: true,
     },
     filterMetrics: { scope: 'shadow', shutdownFinal: true, observed: 1 },
+    fileFilterMetrics: {
+      fileAccess: 999,
+      fileDelete: 999,
+      accessKept: 999,
+      accessSampled: 999,
+      accessDropped: 999,
+      accessSuppressed: 999,
+      deleteKept: 999,
+      deleteDropped: 999,
+      ruleHits: 999,
+      ruleMisses: 999,
+      staleRules: 999,
+      accessRingDropped: 999,
+      deleteRingDropped: 999,
+      enabled: true,
+      epoch: 999,
+    },
+    captureProfileMetrics: captureProfileMetricsFixture(),
   }, 2_000, 'forwarder');
   assert(
     'server-assigned forwarder provenance ignores raw-only evidence',
@@ -401,6 +680,10 @@ async function verifyCollectorHeartbeatProvenanceContract() {
       forwarder.activitySubtype === 'observer_heartbeat' &&
       forwarder.errorCount === 2 &&
       forwarder.execEvidence === undefined &&
+      forwarder.fileFilterMetrics === undefined &&
+      forwarder.fileFilterMetricsReportedAt === undefined &&
+      forwarder.captureProfileMetrics === undefined &&
+      forwarder.captureProfileMetricsReportedAt === undefined &&
       forwarder.filterMetricsReportedAt === 2_000 &&
       forwarder.filterMetrics.shutdownFinal === true,
     forwarder,
@@ -423,6 +706,8 @@ async function verifyCollectorHeartbeatProvenanceContract() {
       legacyRaw.activityContext === 'collector_heartbeat' &&
       legacyRaw.activitySubtype === 'observer_heartbeat' &&
       legacyRaw.errorCount === 0 &&
+      legacyRaw.captureProfileMetricsReportedAt === 1_000 &&
+      legacyRaw.captureProfileMetrics?.activeEpoch === 7001 &&
       observed.length === notificationsBeforeHydration &&
       seeded.at(-1)?.collectorId === legacyRaw.collectorId,
     { legacyRaw, observed: observed.length, notificationsBeforeHydration, seeded },
@@ -432,6 +717,10 @@ async function verifyCollectorHeartbeatProvenanceContract() {
     collectorId: `${runId}-legacy-forwarder-no-metrics`,
     origin: undefined,
     filterMetricsReportedAt: undefined,
+    fileFilterMetricsReportedAt: undefined,
+    fileFilterMetrics: undefined,
+    captureProfileMetricsReportedAt: undefined,
+    captureProfileMetrics: undefined,
     mode: 'observer-forwarder:shadow',
     status: 'error',
     errorCount: 2,
@@ -444,7 +733,9 @@ async function verifyCollectorHeartbeatProvenanceContract() {
     legacyForwarder.origin === 'forwarder' &&
       legacyForwarder.errorCount === 2 &&
       hydratedHeads.latestForwarder.some((item) =>
-        item.collectorId === legacyForwarder.collectorId && item.errorCount === 2),
+        item.collectorId === legacyForwarder.collectorId && item.errorCount === 2) &&
+      hydratedHeads.latestCaptureProfile.some((item) =>
+        item.collectorId === legacyRaw.collectorId && item.captureProfileMetrics?.activeEpoch === 7001),
     { legacyForwarder, hydratedHeads },
   );
 
@@ -464,6 +755,22 @@ async function verifyCollectorHeartbeatProvenanceContract() {
     'raw evidence whose quality counters exceed ToolExec count is not reported',
     inconsistentRaw.execEvidence === undefined,
     inconsistentRaw,
+  );
+
+  const clampedCapture = captureProfileMetricsFixture();
+  clampedCapture.probes[0].attempted = Number.MAX_VALUE;
+  clampedCapture.probes[0].fullSelected = Number.MAX_VALUE;
+  const clampedRaw = judge.recordCollectorHeartbeat({
+    collectorId: `${runId}-clamped-capture-profile`,
+    mode: 'observe+extensions',
+    captureProfileMetrics: clampedCapture,
+  }, 3_100, 'raw_collector');
+  assert(
+    'unsafe raw capture counters are bounded and can never claim exact conservation',
+    clampedRaw.captureProfileMetrics?.countersClamped === true &&
+      clampedRaw.captureProfileMetrics?.decisionConserved === false &&
+      clampedRaw.captureProfileMetrics?.probes[0]?.attempted === Number.MAX_SAFE_INTEGER,
+    clampedRaw.captureProfileMetrics,
   );
 
   const alerting = new AlertingService(
@@ -564,7 +871,11 @@ async function verifyJudgeDispositionContract() {
         evidence: [`test:${runId}`],
       },
     };
-    const discarded = await judge.acceptWithDisposition('{}', meta);
+    const discarded = await judge.acceptWithDisposition('{}', {
+      ...meta,
+      eventKind: 'FileAccess',
+      eventCategory: 'file',
+    });
     assert(
       `Judge ${enabled ? 'queued' : 'synchronous'} path distinguishes policy discard`,
       discarded.disposition === 'discarded' && discarded.reasonCode === 'non_agent_discarded',
@@ -672,7 +983,7 @@ async function verifyObserverDiscardDisposition() {
   const discardedEvent = (suffix) => ({
     line: observerLine(
       { agent: `${marker}-${suffix}`, session: marker, task: suffix },
-      { ToolExec: { pid: 48_000 + suffix.length, uid: 1000, cwd: `/workspace/${marker}`, argv: ['/usr/bin/true', marker, suffix] } },
+      { FileAccess: { pid: 48_000 + suffix.length, uid: 1000, path: `/tmp/${marker}-${suffix}`, write: false } },
     ),
     sourceEventId: `${marker}-${suffix}`,
     collectorId,
@@ -756,6 +1067,10 @@ async function verifyObserverToolEvent(sourceId, token) {
   const workspacePath = `repo://${runId}/observer-tool`;
   const secret = `${runId}-observer-password`;
   const apiKey = `sk-${runId.replace(/[^a-z0-9]/gi, '').padEnd(18, 'd')}`;
+  const eventAt = Date.now() - 1_000;
+  const eventAtUnixNs = (BigInt(eventAt) * 1_000_000n + 123_456n).toString();
+  const receivedAtUnixNs = (BigInt(eventAt) * 1_000_000n + 165_456n).toString();
+  const captureEpoch = '18446744073709551000';
   const line = observerLine(
     { agent: agentId, session: `${runId}-tool-session`, task: 'task-tool' },
     {
@@ -786,6 +1101,17 @@ async function verifyObserverToolEvent(sourceId, token) {
       cgroup_id: 18412,
       cgroup: '0::/user.slice/agent.scope',
     },
+    {
+      eventAtUnixNs,
+      receivedAtUnixNs,
+      captureEpoch,
+      captureProfile: 1,
+      captureAction: 1,
+      captureAuthority: 2,
+      captureDisposition: 1,
+      captureSelected: true,
+      captureFlags: 3,
+    },
   );
   const result = await request('/ingest', 'POST', {
     line,
@@ -805,6 +1131,9 @@ async function verifyObserverToolEvent(sourceId, token) {
     event.activityContext === 'agent_action' &&
     event.activitySubtype === undefined &&
     event.agentId === agentId &&
+    event.subjectAssetType === 'ephemeral_process' &&
+    event.assetBindingQuality === 'ephemeral' &&
+    event.assetBindingRevision === 1 &&
     event.workspacePath === workspacePath &&
     event.sessionId === `${runId}-tool-session` &&
     event.runId === `${runId}-tool-session` &&
@@ -821,6 +1150,17 @@ async function verifyObserverToolEvent(sourceId, token) {
     event.process?.bootId === `${runId}-boot` &&
     event.process?.startTimeTicks === '998877' &&
     event.process?.cgroupId === '18412' &&
+    Math.abs(Date.parse(`${event.at.replace(' ', 'T')}Z`) - eventAt) < 1_000 &&
+    event.eventAtUnixNs === eventAtUnixNs &&
+    event.receivedAtUnixNs === receivedAtUnixNs &&
+    event.eventTimeQuality === 'collector_calibrated' &&
+    event.captureEpoch === captureEpoch &&
+    event.captureProfileCode === 1 &&
+    event.captureActionCode === 1 &&
+    event.captureAuthorityCode === 2 &&
+    event.captureDispositionCode === 1 &&
+    event.captureSelected === true &&
+    event.captureFlags === 3 &&
     String(event.attributes?.argv ?? '').includes('observer-ok') &&
     String(event.attributes?.argv ?? '').includes('[redacted]') &&
     event.attributes?.password === '[redacted]' &&
@@ -829,7 +1169,132 @@ async function verifyObserverToolEvent(sourceId, token) {
     !leaks(event, [secret, apiKey]) &&
     (event.rawPreview ?? '').includes('ToolExec'),
   );
+
+  const rejectedClockAt = Date.now();
+  const rejectedClockLine = observerLine(
+    { agent: agentId, session: `${runId}-clock-session`, task: 'task-clock-boundary' },
+    { FileAccess: { pid: 1312, path: '/workspace/project/clock-boundary', write: false } },
+    {
+      host_id: `${runId}-host`,
+      boot_id: `${runId}-boot`,
+      pid: 1312,
+      ppid: 1200,
+      start_time_ticks: 998877,
+      comm: 'bash',
+      exe: '/usr/bin/bash',
+    },
+    {
+      eventAtUnixNs: (BigInt(rejectedClockAt) * 1_000_000n).toString(),
+      receivedAtUnixNs: (BigInt(rejectedClockAt + 10 * 60_000) * 1_000_000n).toString(),
+      captureEpoch: '99',
+      captureProfile: 0,
+      captureAction: 0,
+      captureAuthority: 0,
+      captureDisposition: 0,
+      captureSelected: false,
+      captureFlags: 0,
+    },
+  );
+  const rejectedClock = await request('/ingest', 'POST', {
+    line: rejectedClockLine,
+    collectorId: `${runId}-collector`,
+    nodeName: `${runId}-node`,
+    sourceName: `${runId} observer forwarder`,
+    sourceType: 'observer',
+    workspacePath,
+  }, sourceHeaders(sourceId, token));
+  assert('observer /ingest falls back safely for an impossible Collector receive time', rejectedClock.accepted === true, rejectedClock);
+  await assertEvent('impossible Collector time cannot smuggle capture decisions or rewrite event time', rejectedClock.eventId, (event) =>
+    event.eventTimeQuality === 'api_received' &&
+    event.eventAtUnixNs === undefined &&
+    event.receivedAtUnixNs === undefined &&
+    event.captureEpoch === undefined &&
+    event.captureSelected === undefined &&
+    Math.abs(Date.parse(`${event.at.replace(' ', 'T')}Z`) - Date.now()) < 10_000,
+  );
+
+  const envelopeLine = observerLine(
+    { agent: agentId, session: `${runId}-envelope-session`, task: 'task-envelope-boundary' },
+    { FileAccess: { pid: 1312, path: '/workspace/project/envelope-boundary', write: false } },
+    {
+      host_id: `${runId}-host`,
+      boot_id: `${runId}-boot`,
+      pid: 1312,
+      ppid: 1200,
+      start_time_ticks: 998877,
+      comm: 'bash',
+      exe: '/usr/bin/bash',
+    },
+  );
+  const envelopeSmuggle = await request('/ingest', 'POST', {
+    line: envelopeLine,
+    collectorId: `${runId}-collector`,
+    nodeName: `${runId}-node`,
+    sourceName: `${runId} observer forwarder`,
+    sourceType: 'observer',
+    workspacePath,
+    eventAtUnixNs: Number.MAX_SAFE_INTEGER + 10_000,
+    receivedAtUnixNs: Number.MAX_SAFE_INTEGER + 20_000,
+    captureEpoch: Number.MAX_SAFE_INTEGER + 30_000,
+    captureProfileCode: 999,
+    captureActionCode: -1,
+    captureSelected: true,
+    process: {
+      hostId: 'envelope-host-must-not-win',
+      bootId: 'envelope-boot-must-not-win',
+      pid: 9999,
+      startTimeTicks: '9999',
+    },
+  }, sourceHeaders(sourceId, token));
+  assert('observer /ingest accepts a record while ignoring envelope-only capture evidence', envelopeSmuggle.accepted === true, envelopeSmuggle);
+  await assertEvent('raw Observer envelope cannot replace line-bound event time or Ring decision', envelopeSmuggle.eventId, (event) =>
+    event.eventTimeQuality === 'api_received' &&
+    event.eventAtUnixNs === undefined &&
+    event.receivedAtUnixNs === undefined &&
+    event.captureEpoch === undefined &&
+    event.captureSelected === undefined &&
+    event.process?.hostId === `${runId}-host` &&
+    event.process?.pid === 1312,
+  );
   return result.eventId;
+}
+
+async function verifyAggregatedFileAccess(sourceId, token) {
+  const firstEventAt = Date.now() - 1_000;
+  const lastEventAt = firstEventAt + 900;
+  const line = observerLine(
+    { agent: `${runId}-file-agent`, session: `${runId}-file-session`, task: 'file-aggregate' },
+    {
+      FileAccess: {
+        pid: 13_130,
+        uid: 1000,
+        cwd: '/workspace/project',
+        path: '/workspace/project/.cache/state.json',
+        write: true,
+        repeat_count: 27,
+        first_event_at: firstEventAt,
+        lastEventAt,
+        aggregation_window_ms: 1_000,
+      },
+    },
+  );
+  const result = await request('/ingest', 'POST', {
+    line,
+    sourceEventId: `${runId}-file-aggregate`,
+    collectorId: `${runId}-collector`,
+    nodeName: `${runId}-node`,
+  }, sourceHeaders(sourceId, token));
+  assert('aggregated FileAccess is accepted', result.accepted === true && result.eventId, result);
+  await assertEvent('aggregated FileAccess preserves canonical and legacy aggregation fields', result.eventId, (event) =>
+    event.eventKind === 'FileAccess' &&
+    event.attributes?.repeat_count === 27 &&
+    event.attributes?.repeatCount === 27 &&
+    event.attributes?.first_event_at === firstEventAt &&
+    event.attributes?.firstEventAt === firstEventAt &&
+    event.attributes?.lastEventAt === lastEventAt &&
+    event.attributes?.aggregation_window_ms === 1_000 &&
+    event.attributes?.aggregationWindowMs === 1_000,
+  );
 }
 
 async function verifyPlatformHealthcheckEvent(sourceId, token) {
@@ -972,12 +1437,20 @@ async function verifyObserverBatch(sourceId, token) {
     'observer batch regression payload exceeds the old Express 100 KiB default',
     Buffer.byteLength(JSON.stringify({ events })) > 100 * 1024,
   );
-  const result = await request('/ingest/batch', 'POST', { events }, sourceHeaders(sourceId, token));
+  const batchId = `${runId}-observer-batch`;
+  const payloadDigest = createHash('sha256').update(JSON.stringify(events)).digest('hex');
+  const result = await request('/ingest/batch', 'POST', {
+    batchId,
+    payloadDigest,
+    events,
+  }, sourceHeaders(sourceId, token));
   assert(
     'observer batch ingest accepts and accounts for every envelope',
     result.accepted === true &&
       result.acceptedEvents === events.length &&
       result.rejectedEvents === 0 &&
+      result.batchId === batchId &&
+      result.payloadDigest === payloadDigest &&
       result.items?.length === events.length &&
       result.items.every((item) => item.accepted === true),
     result,
@@ -1121,6 +1594,23 @@ async function verifyRawCollectorHeartbeat(sourceId, token) {
         filter_metrics: { scope: 'shadow', shutdownFinal: true, runtimeSnapshotPosts: 999 },
         dns: 2,
         egress: 1,
+        file: 99,
+        file_access: 11,
+        file_delete: 2,
+        file_prefilter_access_kept: 7,
+        file_prefilter_access_sampled: 2,
+        file_prefilter_access_dropped: 1,
+        file_prefilter_access_suppressed: 3,
+        file_prefilter_delete_kept: 2,
+        file_prefilter_delete_dropped: 0,
+        file_prefilter_rule_hits: 13,
+        file_prefilter_rule_misses: 4,
+        file_prefilter_stale_rules: 1,
+        file_access_ring_dropped: 5,
+        file_delete_ring_dropped: 1,
+        file_filter_enabled: true,
+        file_filter_epoch: 42,
+        captureProfile: captureProfileMetricsFixture(),
         observed_agents: 2,
       },
     },
@@ -1142,8 +1632,8 @@ async function verifyRawCollectorHeartbeat(sourceId, token) {
     'raw CollectorHeartbeat appears in Collector health with event counts',
     health.total === 1 &&
       health.items?.[0]?.collectorId === `${runId}-collector` &&
-      health.items?.[0]?.state === 'healthy' &&
-      health.items?.[0]?.eventCount === 6 &&
+      health.items?.[0]?.state === 'degraded' &&
+      health.items?.[0]?.eventCount === 19 &&
       health.items?.[0]?.errorCount === 0 &&
       health.items?.[0]?.windowErrorMaxima?.errorCount === 0 &&
       health.items?.[0]?.observedAgentCount === 2 &&
@@ -1159,7 +1649,35 @@ async function verifyRawCollectorHeartbeat(sourceId, token) {
       health.items?.[0]?.execEvidence?.window?.intervalSecs === 30 &&
       health.items?.[0]?.execEvidence?.window?.shutdownFinalCount === 0 &&
       health.items?.[0]?.filterMetrics?.scope === 'decoupled' &&
-      health.items?.[0]?.filterMetrics?.shutdownFinal === false,
+      health.items?.[0]?.filterMetrics?.shutdownFinal === false &&
+      health.items?.[0]?.fileFilterMetricsReported === true &&
+      health.items?.[0]?.fileFilterMetrics?.fileAccess === 11 &&
+      health.items?.[0]?.fileFilterMetrics?.fileDelete === 2 &&
+      health.items?.[0]?.fileFilterMetrics?.accessKept === 7 &&
+      health.items?.[0]?.fileFilterMetrics?.accessSampled === 2 &&
+      health.items?.[0]?.fileFilterMetrics?.accessDropped === 1 &&
+      health.items?.[0]?.fileFilterMetrics?.accessSuppressed === 3 &&
+      health.items?.[0]?.fileFilterMetrics?.deleteKept === 2 &&
+      health.items?.[0]?.fileFilterMetrics?.ruleHits === 13 &&
+      health.items?.[0]?.fileFilterMetrics?.ruleMisses === 4 &&
+      health.items?.[0]?.fileFilterMetrics?.staleRules === 1 &&
+      health.items?.[0]?.fileFilterMetrics?.accessRingDropped === 5 &&
+      health.items?.[0]?.fileFilterMetrics?.deleteRingDropped === 1 &&
+      health.items?.[0]?.fileFilterMetrics?.enabled === true &&
+      health.items?.[0]?.fileFilterMetrics?.epoch === 42 &&
+      health.items?.[0]?.captureProfileMetricsReported === true &&
+      health.items?.[0]?.captureProfileMetrics?.mode === 'enforce' &&
+      health.items?.[0]?.captureProfileMetrics?.activeEpoch === 7001 &&
+      health.items?.[0]?.captureProfileMetrics?.destructiveEnabled === true &&
+      health.items?.[0]?.captureProfileMetrics?.aggregateLedgerDegraded === true &&
+      health.items?.[0]?.captureProfileMetrics?.decisionConserved === true &&
+      health.items?.[0]?.captureProfileMetrics?.payloadConserved === true &&
+      health.items?.[0]?.captureProfileMetrics?.probes?.length === 11 &&
+      health.items?.[0]?.captureProfileMetrics?.probes?.find((probe) => probe.probe === 'file_read')?.decisionConserved === true &&
+      health.items?.[0]?.captureProfileMetrics?.probes?.find((probe) => probe.probe === 'file_access')?.decisionResidual === 0 &&
+      health.items?.[0]?.captureProfileMetrics?.probes?.find((probe) => probe.probe === 'file_access')?.payloadResidual === 0 &&
+      health.items?.[0]?.captureProfileMetrics?.probes?.find((probe) => probe.probe === 'file_access')?.aggregateError === 2 &&
+      health.items?.[0]?.captureProfileMetrics?.probes?.find((probe) => probe.probe === 'exec')?.payloadResidual === undefined,
     health,
   );
 }
@@ -1199,10 +1717,56 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       nonAgent: 3,
       filteredNonAgent: 0,
       wouldFilterNonAgent: 3,
+      filteredUnknown: 2,
+      wouldFilterUnknown: 4,
       filteredNoise: 0,
       wouldFilterNoise: 1,
       discoveryBudgetDropped: 0,
       wouldDiscoveryBudgetDrop: 1,
+      unknownFileLossless: true,
+      fileAggregationEnabled: true,
+      fileAggregationWindowMs: 100,
+      fileAggregationCoalesced: 12,
+      captureAggregateOutputs: 4,
+      captureAggregateDecisionAttempts: 123,
+      captureProfileMode: 'enforce',
+      captureProfileActivationMode: 'preview',
+      captureProfileActivationReason: 'ttl_refresh_requires_preview',
+      captureProfileControlPlaneState: 'lkg_degraded',
+      captureProfileAckEnabled: true,
+      captureProfileAckAccepted: 9,
+      captureProfileAckRejected: 2,
+      captureProfileAckReplayIgnored: 3,
+      captureProfileCentralAccepted: 4,
+      captureProfileCentralRejected: 1,
+      captureProfileActivationGrants: 4,
+      captureProfileActivationRevoked: 3,
+      captureProfileIntentChanges: 2,
+      captureProfileTtlRefreshes: 5,
+      captureProfileCoalescedTtlRefreshes: 11,
+      captureProfileSemanticNoops: 29,
+      captureProfileLkgDegraded: 2,
+      captureProfileCapacityEvicted: 8,
+      captureProfileCapacityAgentEvicted: 1,
+      captureProfileOversizeSnapshots: 2,
+      captureProfileReportInFlight: true,
+      captureProfileReportPosts: 7,
+      captureProfileReportErrors: 2,
+      captureProfileReportAccepted: 4,
+      captureProfileReportRejected: 1,
+      filterRulePublisherEnabled: true,
+      filterRuleEnforceDrops: false,
+      filterRuleVersion: 42,
+      filterRuleEntries: 16,
+      infrastructure: 5,
+      infrastructurePolicyReady: true,
+      infrastructurePolicyVersion: 7,
+      infrastructurePolicyRules: 16,
+      infrastructurePolicyMatches: 21,
+      infrastructurePolicyWouldDrop: 4,
+      infrastructurePolicyEnforced: 0,
+      infrastructurePolicyAgentConflicts: 0,
+      infrastructurePolicyMaterialized: 14,
       e2eFilterReceipts: [
         {
           schema: 'anysentry.e2e_filter_receipt.v1',
@@ -1225,7 +1789,15 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
         },
       ],
       deduplicated: 0,
-      queueDropped: 0,
+      queueDropped: 6,
+      protectedQueueDropped: 3,
+      queueDroppedByClass: {
+        tool_exec: 2,
+        process_exit: 1,
+        capture_aggregate: 2,
+        other: 1,
+        unbounded_untrusted_key: 99,
+      },
       batches: 1,
       batchEvents: 9,
       retryQueued: 5,
@@ -1246,6 +1818,8 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       outstandingOldestAgeMs: 654,
       outstandingEventLimit: 16_384,
       outstandingByteLimit: 64 * 1024 * 1024,
+      protectedReserveEvents: 4_096,
+      protectedReserveBytes: 16 * 1024 * 1024,
       identitySnapshotReady: true,
       identitySnapshotVersion: 7,
       identitySnapshotAgeSeconds: 2,
@@ -1289,6 +1863,36 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
 
   assert('direct forwarder heartbeat accepts Source token and updates collector', result.accepted === true && result.collectorId === `${runId}-collector` && result.sourceId === sourceId, result);
   const health = await request('/collectors/health', 'POST', { timeType: 'last_30d', collectorId: `${runId}-collector`, limit: 5 });
+  const captureMetrics = health.items?.[0]?.filterMetrics;
+  const captureMetricsPreserved = Object.entries({
+    captureAggregateOutputs: 4,
+    captureAggregateDecisionAttempts: 123,
+    captureProfileMode: 'enforce',
+    captureProfileActivationMode: 'preview',
+    captureProfileActivationReason: 'ttl_refresh_requires_preview',
+    captureProfileControlPlaneState: 'lkg_degraded',
+    captureProfileAckEnabled: true,
+    captureProfileAckAccepted: 9,
+    captureProfileAckRejected: 2,
+    captureProfileAckReplayIgnored: 3,
+    captureProfileCentralAccepted: 4,
+    captureProfileCentralRejected: 1,
+    captureProfileActivationGrants: 4,
+    captureProfileActivationRevoked: 3,
+    captureProfileIntentChanges: 2,
+    captureProfileTtlRefreshes: 5,
+    captureProfileCoalescedTtlRefreshes: 11,
+    captureProfileSemanticNoops: 29,
+    captureProfileLkgDegraded: 2,
+    captureProfileCapacityEvicted: 8,
+    captureProfileCapacityAgentEvicted: 1,
+    captureProfileOversizeSnapshots: 2,
+    captureProfileReportInFlight: true,
+    captureProfileReportPosts: 7,
+    captureProfileReportErrors: 2,
+    captureProfileReportAccepted: 4,
+    captureProfileReportRejected: 1,
+  }).every(([key, value]) => captureMetrics?.[key] === value);
   assert(
     'direct forwarder heartbeat can mark Collector degraded',
     health.total === 1 &&
@@ -1303,6 +1907,21 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       health.items?.[0]?.windowErrorMaxima?.errorCount === 1 &&
       health.items?.[0]?.filterMetrics?.scope === 'shadow' &&
       health.items?.[0]?.filterMetrics?.wouldFilterNonAgent === 3 &&
+      health.items?.[0]?.filterMetrics?.filteredUnknown === 2 &&
+      health.items?.[0]?.filterMetrics?.wouldFilterUnknown === 4 &&
+      health.items?.[0]?.filterMetrics?.unknownFileLossless === true &&
+      health.items?.[0]?.filterMetrics?.fileAggregationCoalesced === 12 &&
+      captureMetricsPreserved &&
+      health.items?.[0]?.captureProfileMetricsReported === true &&
+      health.items?.[0]?.captureProfileMetrics?.activeEpoch === 7001 &&
+      health.items?.[0]?.captureProfileMetrics?.aggregateLedgerDegraded === true &&
+      health.items?.[0]?.filterMetrics?.filterRuleVersion === 42 &&
+      health.items?.[0]?.filterMetrics?.infrastructure === 5 &&
+      health.items?.[0]?.filterMetrics?.infrastructurePolicyReady === true &&
+      health.items?.[0]?.filterMetrics?.infrastructurePolicyVersion === 7 &&
+      health.items?.[0]?.filterMetrics?.infrastructurePolicyRules === 16 &&
+      health.items?.[0]?.filterMetrics?.infrastructurePolicyMatches === 21 &&
+      health.items?.[0]?.filterMetrics?.infrastructurePolicyMaterialized === 14 &&
       health.items?.[0]?.filterMetrics?.e2eFilterReceipts?.length === 1 &&
       health.items?.[0]?.filterMetrics?.e2eFilterReceipts?.[0]?.markerSha256 === 'a'.repeat(64) &&
       health.items?.[0]?.filterMetrics?.e2eFilterReceipts?.[0]?.lineSha256 === 'b'.repeat(64) &&
@@ -1328,6 +1947,17 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       health.items?.[0]?.filterMetrics?.outstandingOldestAgeMs === 654 &&
       health.items?.[0]?.filterMetrics?.outstandingEventLimit === 16_384 &&
       health.items?.[0]?.filterMetrics?.outstandingByteLimit === 64 * 1024 * 1024 &&
+      health.items?.[0]?.filterMetrics?.protectedReserveEvents === 4_096 &&
+      health.items?.[0]?.filterMetrics?.protectedReserveBytes === 16 * 1024 * 1024 &&
+      health.items?.[0]?.filterMetrics?.protectedQueueDropped === 3 &&
+      health.items?.[0]?.filterMetrics?.queueDroppedByClass?.tool_exec === 2 &&
+      health.items?.[0]?.filterMetrics?.queueDroppedByClass?.process_exit === 1 &&
+      health.items?.[0]?.filterMetrics?.queueDroppedByClass?.capture_aggregate === 2 &&
+      health.items?.[0]?.filterMetrics?.queueDroppedByClass?.other === 1 &&
+      !Object.prototype.hasOwnProperty.call(
+        health.items?.[0]?.filterMetrics?.queueDroppedByClass ?? {},
+        'unbounded_untrusted_key',
+      ) &&
       health.items?.[0]?.filterMetrics?.runtimeSnapshotRetries === 2 &&
       health.items?.[0]?.filterMetrics?.runtimeSnapshotRecovered === 1 &&
       health.items?.[0]?.filterMetrics?.lastRuntimeSnapshotFailureAt === '2026-08-14T00:00:01.000Z' &&
@@ -1367,9 +1997,11 @@ async function verifyShutdownFinalHeartbeatIsPreserved(sourceId, token) {
   assert('enriched shutdown-final heartbeat is accepted', result.accepted === true, result);
   const health = await request('/collectors/health', 'POST', { timeType: 'last_30d', collectorId: `${runId}-collector`, limit: 5 });
   assert(
-    'Collector health preserves an explicit shutdown-final marker',
+    'Collector health preserves an explicit Forwarder shutdown-final marker without replacing raw metadata',
     health.total === 1 &&
-      health.items?.[0]?.nodeName === `${runId}-node-shutdown-final` &&
+      health.items?.[0]?.nodeName === `${runId}-node-raw-after-direct` &&
+      health.items?.[0]?.mode === 'observe' &&
+      health.items?.[0]?.attachedProbes === 11 &&
       health.items?.[0]?.filterMetrics?.shutdownFinal === true,
     health,
   );
@@ -1627,7 +2259,7 @@ async function verifyCollectorSourceIsolation(sourceId) {
     { longSource, longRaw, canonicalLongCollectorId },
   );
 
-  const identityLikeCollectorId = `${runId}-token=sk-collectoridentity1234`;
+  const identityLikeCollectorId = `${runId}-token=example-redacted-token`;
   const identityLikeSource = await request('/sources', 'POST', {
     name: `${runId}-identity-like-collector-source`,
     type: 'observer',
@@ -1731,10 +2363,13 @@ async function verifyExplicitForwarderMetricsReplacePrevious(sourceId, token) {
   assert('new enriched heartbeat with explicit zero metrics is accepted', result.accepted === true, result);
   const health = await request('/collectors/health', 'POST', { timeType: 'last_30d', collectorId: `${runId}-collector`, limit: 5 });
   assert(
-    'new enriched heartbeat replaces prior non-zero metrics and receipts',
+    'new enriched heartbeat replaces Forwarder metrics without erasing raw Collector capability or Capture Profile quality',
     health.total === 1 &&
-      health.items?.[0]?.nodeName === `${runId}-node-explicit-zero` &&
-      health.items?.[0]?.state === 'healthy' &&
+      health.items?.[0]?.nodeName === `${runId}-node-raw-after-direct` &&
+      health.items?.[0]?.mode === 'observe' &&
+      health.items?.[0]?.attachedProbes === 11 &&
+      health.items?.[0]?.enabledFeatures?.includes('exec') &&
+      health.items?.[0]?.state === 'degraded' &&
       health.items?.[0]?.droppedEvents === 0 &&
       health.items?.[0]?.outputDropped === 0 &&
       health.items?.[0]?.errorCount === 0 &&
@@ -1744,6 +2379,8 @@ async function verifyExplicitForwarderMetricsReplacePrevious(sourceId, token) {
       health.items?.[0]?.windowErrorMaxima?.droppedEvents === 2 &&
       health.items?.[0]?.windowErrorMaxima?.outputDropped === 1 &&
       health.items?.[0]?.windowErrorMaxima?.errorCount === 1 &&
+      health.items?.[0]?.captureProfileMetricsReported === true &&
+      health.items?.[0]?.captureProfileMetrics?.aggregateLedgerDegraded === true &&
       !health.items?.[0]?.filterMetrics?.e2eFilterReceipts?.length,
     health,
   );
@@ -1783,6 +2420,7 @@ async function main() {
   await verifyRejectedObserverToken(source.sourceId);
   await verifyObserverDiscardDisposition();
   await verifyObserverToolEvent(source.sourceId, token);
+  await verifyAggregatedFileAccess(source.sourceId, token);
   await verifyPlatformHealthcheckEvent(source.sourceId, token);
   await verifyIncompleteObserverEvidence(source.sourceId, token);
   await verifyObserverBatch(source.sourceId, token);

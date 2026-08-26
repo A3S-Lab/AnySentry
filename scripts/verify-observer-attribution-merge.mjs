@@ -142,8 +142,8 @@ function probableProcess(overrides = {}) {
   assert.equal(result.attribution.registryVersion, 7);
 }
 
-// Truth table: an explicit workload non-agent decision cannot be promoted by a probable process
-// signature. Root facts remain auditable but monitored/state follow the authoritative decision.
+// Truth table: a positive Agent decision is fail-safe and wins an explicit workload non-agent
+// decision. The workload placement remains auditable and the negative decision becomes conflict.
 {
   const workload = {
     state: 'non_agent',
@@ -159,12 +159,14 @@ function probableProcess(overrides = {}) {
     },
   };
   const result = mergeAttributionClassifications(probableProcess(), workload, undefined);
-  assert.equal(result.state, 'non_agent');
-  assert.equal(result.attribution.monitored, false);
-  assert.equal(result.attribution.classification, 'non_agent');
-  assert.equal(result.attribution.confidence, 1);
-  assert.equal(result.attribution.source, 'docker');
-  assert.equal(result.attribution.reason, 'not_agent');
+  assert.equal(result.state, 'agent');
+  assert.equal(result.attribution.monitored, true);
+  assert.equal(result.attribution.classification, 'probable_agent');
+  assert.equal(result.attribution.source, 'process_graph');
+  assert.equal(result.attribution.reason, 'process_lineage');
+  assert.equal(result.attribution.conflict, true);
+  assert.ok(result.attribution.evidence.includes('identity_conflict:agent_keep_vs_infrastructure_or_non_agent'));
+  assert.equal(result.attribution.physicalWorkloadId, 'docker:host-a:database-1');
   assert.equal(result.attribution.rootPid, 4_200);
   assert.equal(result.attribution.agentInstanceId, 'ari_process_codex_1');
 }
@@ -224,7 +226,8 @@ function probableProcess(overrides = {}) {
   assert.equal(result.attribution.conflict, true);
 }
 
-// Infrastructure remains a separate, unconditional drop decision.
+// Infrastructure is authoritative only when no positive Agent rule matches. A confirmed Agent
+// always wins and records the attempted Infrastructure match as conflict evidence.
 {
   const infrastructure = {
     state: 'infrastructure',
@@ -243,10 +246,11 @@ function probableProcess(overrides = {}) {
       reason: 'authoritative_anchor',
     },
   };
-  assert.deepEqual(
-    mergeAttributionClassifications(infrastructure, workload, undefined),
-    infrastructure,
-  );
+  const merged = mergeAttributionClassifications(infrastructure, workload, undefined);
+  assert.equal(merged.state, 'agent');
+  assert.equal(merged.attribution.classification, 'confirmed_agent');
+  assert.equal(merged.attribution.conflict, true);
+  assert.ok(merged.attribution.evidence.includes('identity_conflict:agent_keep_vs_infrastructure_or_non_agent'));
 }
 
 assert.equal(mergeAttributionClassifications(undefined, undefined, undefined), undefined);

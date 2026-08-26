@@ -194,12 +194,15 @@ function main() {
     }
     beginShutdown();
     if (state.role === 'forwarder') {
-      collector.stdout?.unpipe(forwarder.stdin);
-      if (forwarder.stdin && !forwarder.stdin.destroyed) forwarder.stdin.destroy();
       if (!firstExternalSignal) {
+        // Deliver the lifecycle signal before tearing down the failed pipeline. Otherwise the
+        // collector can observe stdout closure and exit first, making orderly shutdown depend on
+        // a stream-error race rather than the supervisor-owned signal path.
         signalChild(states.collector, 'SIGTERM');
         scheduleCollectorForce();
       }
+      collector.stdout?.unpipe(forwarder.stdin);
+      if (forwarder.stdin && !forwarder.stdin.destroyed) forwarder.stdin.destroy();
     }
   }
 
@@ -236,12 +239,12 @@ function main() {
     console.error(`[observer-supervisor] collector-forwarder stream error: ${error.message}`);
     latchOutcome(1, 'pipeline-error');
     beginShutdown();
-    collector.stdout?.unpipe(forwarder.stdin);
-    if (forwarder.stdin && !forwarder.stdin.destroyed) forwarder.stdin.destroy();
     if (!firstExternalSignal) {
       signalChild(states.collector, 'SIGTERM');
       scheduleCollectorForce();
     }
+    collector.stdout?.unpipe(forwarder.stdin);
+    if (forwarder.stdin && !forwarder.stdin.destroyed) forwarder.stdin.destroy();
   }
   function processExternalSignal(signal) {
     externalSignalCount += 1;

@@ -86,7 +86,7 @@ kind: Deployment
 metadata:
   name: clickhouse
   namespace: anysentry
-  labels: { app: clickhouse }
+  labels: { app: clickhouse, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
   strategy:
@@ -95,7 +95,7 @@ spec:
     matchLabels: { app: clickhouse }
   template:
     metadata:
-      labels: { app: clickhouse }
+      labels: { app: clickhouse, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
       annotations:
         anysentry.io/clickhouse-config-revision: "memory-and-merge-v3"
         anysentry.io/clickhouse-base-config-revision: "server-users-v1"
@@ -176,7 +176,7 @@ kind: StatefulSet
 metadata:
   name: redis
   namespace: anysentry
-  labels: { app: redis, io.anysentry.observe: "false" }
+  labels: { app: redis, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   serviceName: redis
   replicas: 1
@@ -184,7 +184,7 @@ spec:
     matchLabels: { app: redis }
   template:
     metadata:
-      labels: { app: redis, io.anysentry.observe: "false" }
+      labels: { app: redis, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       terminationGracePeriodSeconds: 30
       containers:
@@ -240,6 +240,9 @@ data:
   CLICKHOUSE_URL: "http://clickhouse:8123"
   CLICKHOUSE_DB: "anysentry"
   ANYSENTRY_ASYNC_JUDGE: "on"
+  ANYSENTRY_TRUSTED_CORRELATION_MODE: "shadow"
+  ANYSENTRY_CAPTURE_PROFILE_MODE: "shadow"
+  ANYSENTRY_UNKNOWN_RETENTION_MODE: "shadow"
   ANYSENTRY_REDIS_URL: "redis://redis:6379/0"
   # The streaming resources remain available in deploy/streaming.yaml, but production operators
   # opt in explicitly after Kafka/Flink capacity and retention have been reviewed.
@@ -276,7 +279,10 @@ metadata:
   name: anysentry-pod-reader
 rules:
   - apiGroups: [""]
-    resources: ["pods"]
+    resources: ["pods", "services", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -302,14 +308,14 @@ kind: Deployment
 metadata:
   name: anysentry
   namespace: anysentry
-  labels: { app: anysentry }
+  labels: { app: anysentry, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
   selector:
     matchLabels: { app: anysentry }
   template:
     metadata:
-      labels: { app: anysentry, io.anysentry.observe: "false" }
+      labels: { app: anysentry, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       terminationGracePeriodSeconds: 30
       serviceAccountName: anysentry
@@ -332,9 +338,21 @@ spec:
                 optional: true
           env:
             - { name: PORT, value: "29653" }
-            # Keep the synchronous dashboard hot set within the 512 MiB API memory budget.
-            - { name: ANYSENTRY_HOT_EVENT_LIMIT, value: "10000" }
+            # Keep V8 below the 2 GiB cgroup boundary so major GC runs before the kernel OOM killer;
+            # native buffers, code pages and response serialization retain the remaining headroom.
+            - { name: NODE_OPTIONS, value: "--max-old-space-size=1024" }
+            # Keep the synchronous dashboard hot set bounded; durable history remains in ClickHouse.
+            - { name: ANYSENTRY_HOT_EVENT_LIMIT, value: "5000" }
             - { name: ANYSENTRY_OBSERVER_BODY_LIMIT, value: "4mb" }
+            # The installer creates this independently from image/manifests. It protects Source
+            # bootstrap and Capture Profile policy/materialization endpoints without committing a
+            # credential to Git.
+            - name: ANYSENTRY_MANAGEMENT_TOKEN
+              valueFrom: { secretKeyRef: { name: anysentry-control-auth, key: management-token } }
+            # ManagementAuthGuard keeps the historical ADMIN alias first; bind both aliases to the
+            # same generated secret so an optional legacy envFrom Secret cannot shadow bootstrap.
+            - name: ANYSENTRY_ADMIN_TOKEN
+              valueFrom: { secretKeyRef: { name: anysentry-control-auth, key: management-token } }
             # Bundled ClickHouse (namespace-local Service DNS). Point this at an external server to
             # use your own ClickHouse instead — then delete the ClickHouse objects above.
             - { name: CLICKHOUSE_URL, value: "http://clickhouse:8123" }
@@ -403,14 +421,14 @@ kind: Deployment
 metadata:
   name: fast-judge
   namespace: anysentry
-  labels: { app: fast-judge, io.anysentry.observe: "false" }
+  labels: { app: fast-judge, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
   selector:
     matchLabels: { app: fast-judge }
   template:
     metadata:
-      labels: { app: fast-judge, io.anysentry.observe: "false" }
+      labels: { app: fast-judge, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       containers:
         - name: fast-judge
@@ -435,14 +453,14 @@ kind: Deployment
 metadata:
   name: l3-worker
   namespace: anysentry
-  labels: { app: l3-worker, io.anysentry.observe: "false" }
+  labels: { app: l3-worker, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
   selector:
     matchLabels: { app: l3-worker }
   template:
     metadata:
-      labels: { app: l3-worker, io.anysentry.observe: "false" }
+      labels: { app: l3-worker, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       terminationGracePeriodSeconds: 30
       containers:

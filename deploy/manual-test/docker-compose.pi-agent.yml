@@ -22,6 +22,13 @@ services:
       PI_MODEL: bailian/deepseek-v4-flash
       PI_THINKING: "off"
       DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek_api_key
+      ANYSENTRY_PI_ADAPTER_URL: ${ANYSENTRY_PI_ADAPTER_URL:-http://anysentry:29653/security-center/ingest/events}
+      ANYSENTRY_ADAPTER_SOURCE_ID: ${ANYSENTRY_ADAPTER_SOURCE_ID:?Create a managed agent_adapter Source and set ANYSENTRY_ADAPTER_SOURCE_ID}
+      ANYSENTRY_ADAPTER_TOKEN_FILE: /run/secrets/anysentry_adapter_token
+      ANYSENTRY_TENANT_ID: ${ANYSENTRY_TENANT_ID:-default}
+      ANYSENTRY_ENVIRONMENT_ID: ${ANYSENTRY_ENVIRONMENT_ID:-manual-docker}
+      ANYSENTRY_WORKSPACE_PATH: /workspace
+      ANYSENTRY_AGENT_SCOPE_ID: docker-pi-agent-manual
     labels:
       anysentry.io/workload-kind: agent
       anysentry.io/agent-id: docker-pi-agent-manual
@@ -40,6 +47,10 @@ services:
       - type: bind
         source: ${ANYSENTRY_LLM_KEY_FILE:?Set ANYSENTRY_LLM_KEY_FILE to the absolute API-key file path}
         target: /run/secrets/deepseek_api_key
+        read_only: true
+      - type: bind
+        source: ${ANYSENTRY_ADAPTER_TOKEN_HOST_FILE:?Set ANYSENTRY_ADAPTER_TOKEN_HOST_FILE to the managed Source token file}
+        target: /run/secrets/anysentry_adapter_token
         read_only: true
     read_only: true
     tmpfs:

@@ -22,6 +22,16 @@ export type SecurityRiskLevel = "safe" | "low" | "medium" | "high" | "critical" 
 export type SecurityPolicyAction = "allow" | "review" | "block" | string;
 
 export type AgentClassification = "confirmed_agent" | "probable_agent" | "unknown" | "non_agent";
+export type WorkloadRole = "agent" | "anysentry_internal" | "platform_infrastructure" | "business_service" | "ordinary_process" | "unknown";
+export type CaptureProfile = "agent_full" | "probable_investigation" | "security_full" | "investigation_full" | "business_context" | "infrastructure_aggregate" | "unknown_discovery" | "self_health";
+export type UnknownReason = "snapshot_not_ready" | "snapshot_miss" | "container_identity_missing" | "container_name_missing" | "parent_missing" | "process_exited_before_enrichment" | "ancestry_incomplete" | "pid_reuse_ambiguous" | "signature_miss" | "template_conflict" | "policy_expired" | "shared_scope_ambiguous" | "unsupported_agent_adapter";
+export interface ClassificationSemanticsV1 {
+  schemaVersion: "anysentry.classification_semantics.v1";
+  identityClassification: AgentClassification;
+  workloadRole: WorkloadRole;
+  captureProfile: CaptureProfile;
+  unknownReason?: UnknownReason;
+}
 export interface EventJudgmentMetadata {
   classification: AgentClassification;
   profile: "full" | "l1_only" | "discard";
@@ -52,6 +62,8 @@ export interface ProcessContext {
   cgroup?: string;
   cgroupId?: string;
   systemdUnit?: string;
+  lifecycleSource?: "exec_process_key" | "exec_tombstone";
+  lifecycleReason?: UnknownReason;
 }
 
 export interface AgentWorkloadRef {
@@ -96,7 +108,9 @@ export interface SecurityTimeFilter {
   endTime?: string;
   snapshotAsOf?: string;
   scope?: "agent" | "raw";
+  classificationView?: ClassificationView;
 }
+export type ClassificationView = "as_observed" | "current_effective";
 export type QueryTotalMode = "exact" | "estimated" | "omitted";
 export type QueryDataSource = "clickhouse" | "clickhouse+hot_delta" | "clickhouse+redis_current" | "memory_hot_ring";
 export interface QueryCommitProgress {
@@ -119,7 +133,7 @@ export interface QueryCoverage {
   commitProgress?: QueryCommitProgress[];
   commitProgressScope?: "all_sources" | "query_sources";
   lateDataPolicy?: "commit_journal_revision_repair";
-  completeness?: "exact_as_observed" | "partial";
+  completeness?: "exact_as_observed" | "exact_current_effective" | "partial";
   watermark?: string;
   partial: boolean;
   partialReason?: "hot_ring_only" | "scan_limit" | "storage_unavailable";
@@ -145,6 +159,10 @@ export interface SecurityAssistantContext {
   workspacePath?: string;
   eventId?: string;
   traceId?: string;
+  invocationId?: string;
+  toolCallId?: string;
+  agentAssetId?: string;
+  agentInstanceId?: string;
   incidentId?: string;
   alertId?: string;
 }
@@ -164,6 +182,16 @@ export interface SecurityAssistantReference {
   href: string;
 }
 
+export interface SecurityAssistantSystemContextSummary {
+  status: "complete" | "partial";
+  requested: boolean;
+  agentAssetId?: string;
+  bundleId?: string;
+  confidence?: number;
+  estimatedBytes?: number;
+  reasonCodes: string[];
+}
+
 export interface SecurityAssistantAnswer {
   sessionId: string;
   answer: string;
@@ -171,11 +199,19 @@ export interface SecurityAssistantAnswer {
   elapsedMs: number;
   totalTokens: number;
   evidenceSummary: string;
+  systemContext?: SecurityAssistantSystemContextSummary;
   references: SecurityAssistantReference[];
   readOnly: true;
 }
 
-export interface SecurityHealthCard {
+export interface ClassifiedResponseMeta {
+  classificationView: ClassificationView;
+  reviewRevision: number;
+  assetBindingRevision?: number;
+  coverage?: QueryCoverage;
+}
+
+export interface SecurityHealthCard extends ClassifiedResponseMeta {
   healthScore: number;
   healthStatusText: string;
   tokenConsumptionTotal: number;
@@ -193,7 +229,7 @@ export interface SecurityWaveSeries {
   riskSeries: SecurityWaveSeriesPoint[];
 }
 
-export interface SecurityExplainabilityScan {
+export interface SecurityExplainabilityScan extends ClassifiedResponseMeta {
   waveSeries: SecurityWaveSeries[];
   threatInterception: string;
   sessionActiveCount: string;
@@ -211,7 +247,7 @@ export interface SecurityLatencyMetric {
   unit: string;
 }
 
-export interface SecurityPerformanceCard {
+export interface SecurityPerformanceCard extends ClassifiedResponseMeta {
   componentRequestCount: SecurityPerformanceMetric;
   tps: SecurityPerformanceMetric;
   avgLatency: SecurityLatencyMetric;
@@ -224,7 +260,7 @@ export interface SecurityRiskSummaryCard {
   eventCount: number;
 }
 
-export interface SecurityRiskSummary {
+export interface SecurityRiskSummary extends ClassifiedResponseMeta {
   summaryCards: SecurityRiskSummaryCard[];
   updateTime: string;
 }
@@ -242,7 +278,7 @@ export interface SecurityRiskCategory {
   items: SecurityRiskBreakdownItem[];
 }
 
-export interface SecurityRiskBreakdown {
+export interface SecurityRiskBreakdown extends ClassifiedResponseMeta {
   systemRisks: SecurityRiskCategory;
   communicationRisks: SecurityRiskCategory;
   singleAgentRisks: SecurityRiskCategory;
@@ -255,7 +291,7 @@ export interface SecurityRiskDimension {
   score: number;
 }
 
-export interface SecurityHighestRiskSession {
+export interface SecurityHighestRiskSession extends ClassifiedResponseMeta {
   sessionId: string;
   userId: string;
   workspacePath: string;
@@ -275,7 +311,7 @@ export interface SecurityDecisionTier {
   slaDesc: string;
 }
 
-export interface SecurityDecisionFunnel {
+export interface SecurityDecisionFunnel extends ClassifiedResponseMeta {
   tiers: SecurityDecisionTier[];
   finalBlock: {
     count: number;
@@ -285,10 +321,11 @@ export interface SecurityDecisionFunnel {
 }
 
 // 智能体可观测性:Agent Observability = Infra Metrics + Behavior Analytics。
-export interface AgentObservability {
+export interface AgentObservability extends ClassifiedResponseMeta {
   health: { heartbeatOk: boolean; resourceUtil: number; errorRate: number; decisionLatencyMs: number };
   behavioral: { actionRate: number; decisionPattern: "baseline" | "drift"; stateTransitions: number; goalProgress: number };
   system: { agentCount: number; commThroughput: number; infraHealthy: boolean };
+  coverage?: QueryCoverage;
   updateTime: string;
 }
 
@@ -300,7 +337,7 @@ export interface SecurityWorkspaceRiskItem {
   riskLevelText: string;
 }
 
-export interface SecurityWorkspaceRiskDistribution {
+export interface SecurityWorkspaceRiskDistribution extends ClassifiedResponseMeta {
   list: SecurityWorkspaceRiskItem[];
   updateTime: string;
 }
@@ -391,6 +428,8 @@ export type AuditAction =
   | "agent.metadata.updated"
   | "agent.review.updated"
   | "agent.review.cleared"
+  | "asset.review.updated"
+  | "asset.review.cleared"
   | "agent.identity_ai_review.completed"
   | "maintenance.window.updated"
   | "notification.channel.updated"
@@ -398,8 +437,25 @@ export type AuditAction =
   | "notification.delivery_failed"
   | "objective.updated"
   | "source.updated"
-  | "source.token_rotated";
-export type AuditResourceType = "policy" | "incident" | "alert" | "remediation" | "agent" | "event" | "maintenance" | "notification" | "objective" | "source";
+  | "source.token_rotated"
+  | "infrastructure_rule.created"
+  | "infrastructure_rule.shadowed"
+  | "infrastructure_rule.promoted"
+  | "infrastructure_rule.revoked"
+  | "infrastructure_rule.validated"
+  | "infrastructure_rule.materialization_reported"
+  | "filter_rule.created"
+  | "filter_rule.shadowed"
+  | "filter_rule.promoted"
+  | "filter_rule.revoked"
+  | "filter_rule.previewed"
+  | "unknown_learning.reviewed"
+  | "unknown_learning.policy_updated"
+  | "unknown_learning.infrastructure_draft_created"
+  | "unknown_learning.infrastructure_draft_reused"
+  | "unknown_learning.infrastructure_draft_rejected"
+  | "unknown_learning.config_updated";
+export type AuditResourceType = "policy" | "filter-rule" | "infrastructure-rule" | "unknown-learning" | "supply-chain" | "incident" | "alert" | "remediation" | "agent" | "asset" | "event" | "maintenance" | "notification" | "objective" | "source";
 export type AuditResult = "success" | "failure";
 export type CoverageIssueType =
   | "collector_down"
@@ -429,10 +485,15 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   collectorId?: string;
   agentId?: string;
   agentAssetId?: string;
+  subjectAssetId?: string;
   agentInstanceId?: string;
   sessionId?: string;
   workspacePath?: string;
   traceId?: string;
+  /** Independent trusted-invocation predicate; traceId keeps its legacy meaning. */
+  invocationId?: string;
+  /** Independent authenticated ToolCall predicate; it never aliases taskId. */
+  toolCallId?: string;
   runId?: string;
   eventKind?: string;
   eventCategory?: AgentEventCategory;
@@ -449,6 +510,18 @@ export interface AgentEventListItem {
   eventId: string;
   sourceEventId?: string;
   at: string;
+  eventAtUnixNs?: string;
+  receivedAtUnixNs?: string;
+  receivedAt?: string;
+  eventTimeQuality?: "collector_calibrated" | "producer_supplied" | "api_received";
+  captureEpoch?: string;
+  captureProfileCode?: number;
+  captureActionCode?: number;
+  captureAuthorityCode?: number;
+  captureDispositionCode?: number;
+  captureSelected?: boolean;
+  captureFlags?: number;
+  capturePolicyVersion?: number;
   eventKind: string;
   eventCategory: AgentEventCategory;
   activityContext?: ActivityContext;
@@ -458,10 +531,26 @@ export interface AgentEventListItem {
   workspacePath: string;
   agentId: string;
   agentAssetId: string;
+  agentAssetAliases?: string[];
+  agentProduct?: string;
+  agentRuntimeInstanceId?: string;
+  agentRuntimeInstanceAliases?: string[];
+  identityBindingQuality?: "exact" | "weak";
+  identityReasonCode?: string;
+  subjectAssetId?: string;
+  subjectAssetType?: "agent" | "service" | "infrastructure" | "workload" | "ephemeral_process";
+  assetBindingQuality?: "exact" | "logical" | "ephemeral" | "weak" | "conflict" | "unassigned";
+  assetBindingRevision?: number;
+  assetBindingReason?: string;
+  asObservedIdentityRevision?: number;
   displayName?: string;
   detectedName?: string;
   detectedClassification: AgentClassification;
+  asObservedClassification: AgentClassification;
+  currentEffectiveClassification: AgentClassification;
   effectiveClassification: AgentClassification;
+  currentReviewRevision?: number;
+  currentReviewEffectiveAt?: string;
   runtime: "kubernetes" | "docker" | "host" | "unknown";
   locationLabel?: string;
   collectorId?: string;
@@ -469,6 +558,8 @@ export interface AgentEventListItem {
   sessionId: string;
   userId: string;
   traceId: string;
+  invocationId?: string;
+  toolCallId?: string;
   spanId: string;
   parentSpanId?: string;
   runId: string;
@@ -488,6 +579,7 @@ export interface AgentEventListItem {
   tokenCount: number;
   latencyMs: number;
   attributes: Record<string, AgentEventAttributeValue>;
+  classificationSemantics?: ClassificationSemanticsV1;
   process?: ProcessContext;
   attribution?: AgentAttribution;
   judgment?: EventJudgmentMetadata;
@@ -504,6 +596,9 @@ export interface AgentEventList {
   /** Compatibility signal emitted by the bounded hot-ring query path. */
   totalApproximate?: boolean;
   storageFallback?: "hot_ring";
+  classificationView: ClassificationView;
+  reviewRevision: number;
+  assetBindingRevision?: number;
   updateTime: string;
 }
 
@@ -807,6 +902,70 @@ export interface AgentTimeline {
   total: number;
   hasMore: boolean;
   coverage: QueryCoverage;
+  classificationView: ClassificationView;
+  reviewRevision: number;
+  assetBindingRevision?: number;
+  updateTime: string;
+}
+
+export type AgentActionOrigin = "semantic" | "kernel_inferred";
+export type AgentActionStatus = "running" | "succeeded" | "failed" | "incomplete";
+export interface AgentActionItem {
+  actionId: string;
+  origin: AgentActionOrigin;
+  status: AgentActionStatus;
+  agentAssetId: string;
+  agentAssetAliases?: string[];
+  sourceId?: string;
+  agentProduct?: string;
+  agentRuntimeInstanceId?: string;
+  invocationId?: string;
+  toolCallId?: string;
+  toolName: string;
+  operation: "execute_tool" | "kernel_exec" | "file_access" | "file_read" | "file_write" | "file_delete" | "network_connect";
+  targetSummary?: string;
+  startedAt: string;
+  endedAt?: string;
+  durationMs?: number;
+  semanticEventIds: string[];
+  fallbackEventId?: string;
+  evidenceState: "available_on_demand" | "runtime_level";
+}
+export interface AgentActionList extends ClassifiedResponseMeta {
+  items: AgentActionItem[];
+  total: number;
+  totalMode: QueryTotalMode;
+  coverage: QueryCoverage;
+  updateTime: string;
+}
+export interface ToolEvidenceItem {
+  invocationId: string;
+  toolCallId: string;
+  toolName: string;
+  startedAt?: number;
+  endedAt?: number;
+  status: "linked" | "semantic_only" | "ambiguous";
+  reason: "exact_process_and_resource" | "exact_child_and_command" | "overlapping_exact_claims" | "kernel_read_not_captured" | "no_matching_kernel_evidence";
+  adapterEventIds: string[];
+  kernelEvidence: Array<{
+    eventId: string;
+    eventKind: string;
+    at: number;
+    linkMethod: "same_process_resource" | "direct_child_command";
+    confidence: number;
+  }>;
+  ambiguousKernelEventIds?: string[];
+}
+export interface ToolEvidenceResponse {
+  schemaVersion: "anysentry.tool_evidence.v1";
+  items: ToolEvidenceItem[];
+  ignoredUntrustedAdapterEvents: number;
+  truncated: boolean;
+  invocationId: string;
+  toolCallId?: string;
+  dataSource: "clickhouse_relation" | "clickhouse+hot_delta" | "memory_hot_ring";
+  partial: boolean;
+  partialReasons?: Array<"trusted_correlation_off" | "storage_unavailable" | "scan_limit" | "process_scope_limit">;
   updateTime: string;
 }
 
@@ -825,6 +984,7 @@ export interface EvidenceBundleQuery extends SecurityTimeFilter {
   windowId?: string;
   workspacePath?: string;
   agentId?: string;
+  subjectAssetId?: string;
   collectorId?: string;
   sourceId?: string;
   traceId?: string;
@@ -848,6 +1008,7 @@ export interface EvidenceBundleScope {
   windowId?: string;
   workspacePath?: string;
   agentId?: string;
+  subjectAssetId?: string;
   collectorId?: string;
   sourceId?: string;
   traceId?: string;
@@ -881,7 +1042,7 @@ export interface EvidenceBundleSummary {
   riskCategories: EvidenceBundleRiskCategory[];
 }
 
-export interface EvidenceBundle {
+export interface EvidenceBundle extends ClassifiedResponseMeta {
   schemaVersion: "anysentry.evidence_bundle.v1";
   bundleId: string;
   generatedAt: string;
@@ -922,7 +1083,7 @@ export interface EvidenceBundleExportQuery extends EvidenceBundleQuery {
   format?: EvidenceBundleExportFormat;
 }
 
-export interface EvidenceBundleExport {
+export interface EvidenceBundleExport extends ClassifiedResponseMeta {
   schemaVersion: "anysentry.evidence_export.v1";
   bundleId: string;
   generatedAt: string;
@@ -1404,6 +1565,7 @@ export interface AgentRuntimeStateList {
 }
 
 export interface AgentInventoryQuery extends SecurityTimeFilter {
+  assetRange?: "current" | "recent" | "historical" | "archived" | "all";
   healthState?: AgentHealthState | "all";
   criticality?: AgentCriticality | "all";
   owner?: string;
@@ -1423,6 +1585,7 @@ export interface AgentInventoryItem {
   agentId: string;
   agentAssetId: string;
   agentAssetAliases?: string[];
+  agentProduct?: string;
   workspacePath: string;
   userId: string;
   displayName?: string;
@@ -1444,6 +1607,9 @@ export interface AgentInventoryItem {
   attributionEvidence: string[];
   physicalWorkloadId?: string;
   agentInstanceId?: string;
+  agentInstanceAliases?: string[];
+  identityBindingQuality?: "exact" | "weak";
+  identityReasonCode?: string;
   logicalInstanceCount?: number;
   hostId?: string;
   bootId?: string;
@@ -1556,7 +1722,202 @@ export interface AgentInventory {
   total: number;
   summary: AgentInventorySummary;
   coverage: QueryCoverage;
+  directory?: {
+    source: "observed_asset_lifecycle";
+    snapshotRevision: number;
+    totalAssets: number;
+    partial: boolean;
+    reasons: string[];
+    reconciledAt: string;
+  };
   updateTime: string;
+}
+
+export type SubjectAssetType = "agent" | "service" | "infrastructure" | "workload" | "ephemeral_process";
+export type AssetExistenceState = "discovered" | "active" | "inactive" | "retired";
+export type AssetBindingQuality = "exact" | "logical" | "ephemeral" | "weak" | "conflict" | "unassigned";
+export type ObservationState = "full" | "structural" | "aggregate" | "sample" | "suppressed" | "degraded" | "gap";
+export type ObservedRuntimeState = "starting" | "current" | "idle" | "exited" | "lost" | "unknown";
+
+export interface ObservedAsset {
+  schemaVersion: "anysentry.observed_asset.v1";
+  subjectAssetId: string;
+  subjectAssetType: SubjectAssetType;
+  displayName: string;
+  aliases: string[];
+  scope: {
+    workspacePath?: string;
+    clusterId?: string;
+    namespace?: string;
+    ownerKind?: string;
+    ownerName?: string;
+    containerName?: string;
+    hostId?: string;
+    systemdUnit?: string;
+  };
+  existenceState: AssetExistenceState;
+  identity: { classification: AgentClassification; revision: number; source: string; effectiveAt: string };
+  role: { role: WorkloadRole; revision: number; source: string; effectiveAt: string };
+  bindingQuality: AssetBindingQuality;
+  bindingRevision: number;
+  observationState: ObservationState;
+  captureProfile?: string;
+  runtimeSummary: Record<ObservedRuntimeState | "total", number>;
+  eventSummary: { eventCount: number; lastEventAt?: string; eventKindCounts: Record<string, number> };
+  firstSeenAt: string;
+  lastInventoryAt?: string;
+  lastActivityAt?: string;
+  sources: string[];
+  modelRevision: number;
+  updatedAt: string;
+}
+
+export interface ObservedAssetReadStatus {
+  schemaVersion: "anysentry.observed_asset_read_status.v1";
+  partial: boolean;
+  reasons: string[];
+  modelRevision: number;
+  reconciledAt: string;
+}
+
+export interface ObservedAssetListQuery {
+  subjectAssetType?: SubjectAssetType | "all";
+  existenceState?: AssetExistenceState | "all";
+  identity?: AgentClassification | "all";
+  role?: WorkloadRole | "all";
+  observationState?: ObservationState | "all";
+  bindingQuality?: AssetBindingQuality | "all";
+  q?: string;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface ObservedAssetSummary {
+  totalAssets: number;
+  byType: Record<SubjectAssetType, number>;
+  byExistence: Record<AssetExistenceState, number>;
+  byIdentity: Record<AgentClassification, number>;
+  byRole: Record<WorkloadRole, number>;
+  byObservation: Record<ObservationState, number>;
+  byBindingQuality: Record<AssetBindingQuality, number>;
+  runtimeStates: Record<ObservedRuntimeState, number>;
+  totalEvents: number;
+  unassignedEvents: number;
+  degradedOrGapAssets: number;
+  modelRevision: number;
+  updateTime: string;
+}
+
+export interface ObservedAssetList extends ClassifiedResponseMeta {
+  schemaVersion: "anysentry.observed_asset_list.v1";
+  items: ObservedAsset[];
+  total: number;
+  nextCursor?: string;
+  snapshotRevision: number;
+  summary: ObservedAssetSummary;
+  readStatus: ObservedAssetReadStatus;
+  updateTime: string;
+}
+
+export interface ObservedRuntime {
+  runtimeInstanceId: string;
+  subjectAssetId: string;
+  placement: "kubernetes" | "docker" | "host" | "process" | "unknown";
+  state: ObservedRuntimeState;
+  physicalWorkloadId?: string;
+  processInstanceKey?: string;
+  startedAt: string;
+  lastInventoryAt: string;
+  endedAt?: string;
+  reasonCode: string;
+  revision: number;
+  updatedAt: string;
+}
+
+export interface AssetLifecycleFact {
+  factId: string;
+  factKind: string;
+  subjectAssetId: string;
+  runtimeInstanceId?: string;
+  effectiveAt: string;
+  source: string;
+  reasonCode: string;
+  previousState?: string;
+  nextState?: string;
+  capturePolicyVersion?: number;
+  captureEpoch?: string;
+}
+
+export interface ObservationCoverageInterval {
+  intervalId: string;
+  subjectAssetId: string;
+  runtimeInstanceId?: string;
+  state: "active" | "closed";
+  startAt: string;
+  endAt?: string;
+  captureProfile: string;
+  observationState: ObservationState;
+  completeness: "complete" | "bounded" | "partial" | "degraded" | "gap";
+  signalCoverage: Record<"exec" | "exit" | "security" | "file" | "network" | "llm", string> & { fileRead?: string };
+  reasonCode: string;
+  ruleRefs: string[];
+}
+
+export interface ObservedAssetDetail extends ClassifiedResponseMeta {
+  schemaVersion: "anysentry.observed_asset_detail.v1";
+  asset: ObservedAsset;
+  runtimes: ObservedRuntime[];
+  bindings: Array<{
+    bindingId: string;
+    quality: AssetBindingQuality;
+    revision: number;
+    physicalWorkloadId?: string;
+    processInstanceKey?: string;
+    source: string;
+    reasonCode: string;
+    validFrom: string;
+    validTo?: string;
+  }>;
+  lifecycleFacts: AssetLifecycleFact[];
+  observationCoverage: ObservationCoverageInterval[];
+  readStatus: ObservedAssetReadStatus;
+  updateTime: string;
+}
+
+export interface ObservedAssetReviewImpact {
+  schemaVersion: "anysentry.observed_asset_review_impact.v1";
+  assetId: string;
+  assetRevision: number;
+  bindingRevision: number;
+  reviewRevision: number;
+  canReview: boolean;
+  reasons: string[];
+  scopeLabel: string;
+  bindingQuality: string;
+  currentIdentity: AgentClassification;
+  runtimeInstances: number;
+  recentWindowEvents: number;
+  observationState: ObservationState;
+  matchedRules: number;
+  actions: { markNonAgent: boolean; setPending: boolean; restoreAutomatic: boolean };
+  warning: string;
+  updateTime: string;
+}
+
+export interface ObservedAssetReviewResult {
+  review: {
+    assetId: string;
+    revision: number;
+    globalRevision: number;
+    decision: "non_agent" | "unknown" | "clear";
+    effectiveAt: number;
+    reviewedAt: number;
+    reviewedBy: string;
+    reason: string;
+    durable: boolean;
+  };
+  asset?: ObservedAsset;
+  impact?: ObservedAssetReviewImpact;
 }
 
 export interface AgentInstanceMetricsQuery extends SecurityTimeFilter {
@@ -1874,6 +2235,7 @@ export interface CollectorHeartbeatRequest {
   errorCount?: number;
   observedAgents?: number;
   filterMetrics?: CollectorFilterMetrics;
+  fileFilterMetrics?: CollectorFileFilterMetrics;
   message?: string;
 }
 
@@ -1891,9 +2253,12 @@ export interface CollectorFilterMetrics {
   confirmedAgent: number;
   probableAgent: number;
   unknown: number;
+  unknownReasonCounts?: Partial<Record<UnknownReason, number>>;
   nonAgent: number;
   filteredNonAgent: number;
   wouldFilterNonAgent: number;
+  filteredUnknown: number;
+  wouldFilterUnknown: number;
   filteredNoise: number;
   wouldFilterNoise: number;
   discoveryBudgetDropped: number;
@@ -1911,6 +2276,11 @@ export interface CollectorFilterMetrics {
   }>;
   deduplicated: number;
   queueDropped: number;
+  protectedQueueDropped?: number;
+  queueDroppedByClass?: Partial<Record<
+    "tool_exec" | "process_exit" | "security" | "collector_heartbeat" | "capture_aggregate" | "agent" | "other",
+    number
+  >>;
   batches: number;
   batchEvents: number;
   retryQueued?: number;
@@ -1931,6 +2301,8 @@ export interface CollectorFilterMetrics {
   outstandingOldestAgeMs?: number;
   outstandingEventLimit?: number;
   outstandingByteLimit?: number;
+  protectedReserveEvents?: number;
+  protectedReserveBytes?: number;
   identitySnapshotReady: boolean;
   identitySnapshotVersion: number;
   identitySnapshotAgeSeconds: number;
@@ -1971,6 +2343,24 @@ export interface CollectorFilterMetrics {
   lastRuntimeSnapshotFailureVersion?: number;
   lastRuntimeSnapshotRetryAt?: string;
   lastRuntimeSnapshotRetryReason?: string;
+}
+
+export interface CollectorFileFilterMetrics {
+  fileAccess: number;
+  fileDelete: number;
+  accessKept: number;
+  accessSampled: number;
+  accessDropped: number;
+  accessSuppressed: number;
+  deleteKept: number;
+  deleteDropped: number;
+  ruleHits: number;
+  ruleMisses: number;
+  staleRules: number;
+  accessRingDropped: number;
+  deleteRingDropped: number;
+  enabled: boolean;
+  epoch: number;
 }
 
 export interface CollectorHeartbeatAck {
@@ -2021,6 +2411,8 @@ export interface CollectorHealthItem {
   execEvidence: CollectorExecEvidenceHealth;
   filterMetricsReported: boolean;
   filterMetrics: CollectorFilterMetrics;
+  fileFilterMetricsReported: boolean;
+  fileFilterMetrics: CollectorFileFilterMetrics;
   message?: string;
   eventCategoryCounts: Record<AgentEventCategory, number>;
 }
@@ -2641,7 +3033,7 @@ export interface PolicySimulationSummary {
   affectedWorkspaces: number;
 }
 
-export interface PolicySimulationResult {
+export interface PolicySimulationResult extends ClassifiedResponseMeta {
   summary: PolicySimulationSummary;
   diffs: PolicySimulationDiff[];
   byAgent: PolicySimulationGroup[];
@@ -2961,6 +3353,7 @@ export interface PlatformHealth {
     exactRanges: number;
     writtenBuckets: number;
     fallbackErrors: number;
+    rangeRejects: number;
   };
   policy: PolicyStatus;
 }
@@ -2993,6 +3386,25 @@ export const securityCenterApi = {
     dashboardPost<SecurityWorkspaceRiskDistribution>("/security-center/sessions/workspaceRiskDistribution", filter),
   agentEvents: (filter: AgentEventQuery) =>
     dashboardPost<AgentEventList>("/security-center/events/list", filter),
+  agentActions: (filter: AgentEventQuery) =>
+    apiClient.post<AgentActionList>("/security-center/agents/actions", filter),
+  agentToolEvidence: (filter: AgentEventQuery & { invocationId: string }) =>
+    apiClient.post<ToolEvidenceResponse>("/security-center/events/tool-evidence", filter),
+  observedAssets: (query: ObservedAssetListQuery) =>
+    apiClient.post<ObservedAssetList>("/security-center/assets/list", query),
+  observedAsset: (assetId: string) =>
+    apiClient.get<ObservedAssetDetail>(`/security-center/assets/${encodeURIComponent(assetId)}`),
+  observedAssetReviewImpact: (assetId: string) =>
+    apiClient.post<ObservedAssetReviewImpact>(`/security-center/assets/${encodeURIComponent(assetId)}/review-impact`, {}),
+  reviewObservedAsset: (
+    assetId: string,
+    body: {
+      decision: "non_agent" | "unknown" | "clear";
+      expectedReviewRevision: number;
+      expectedBindingRevision: number;
+      reason: string;
+    },
+  ) => apiClient.put<ObservedAssetReviewResult>(`/security-center/assets/${encodeURIComponent(assetId)}/review`, body),
   runIdentityAiReview: (body: IdentityAiReviewRequest) =>
     apiClient.post<IdentityAiReviewRecord>("/security-center/identity/ai-review", body),
   identityAiReviews: (query: { targetType?: IdentityAiReviewTargetType; eventId?: string; agentAssetId?: string }) => {
@@ -3131,6 +3543,8 @@ export const securityCenterApi = {
     apiClient.put<RemediationListItem>(`/security-center/remediations/${encodeURIComponent(taskId)}`, body),
   agentInventory: (filter: AgentInventoryQuery) =>
     apiClient.post<AgentInventory>("/security-center/agents/inventory", filter),
+  agentDirectory: (filter: AgentInventoryQuery) =>
+    apiClient.post<AgentInventory>("/security-center/agents/directory", filter),
   agentInstanceMetrics: (filter: AgentInstanceMetricsQuery) =>
     apiClient.post<AgentInstanceMetrics>("/security-center/agents/instance-metrics", filter),
   agentRuntimeInstances: (query: AgentRuntimeStateQuery = {}) =>

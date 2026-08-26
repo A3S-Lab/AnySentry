@@ -1,0 +1,14 @@
+# Optional Docker-development bridge to the host Kubernetes API. It is intentionally separate from
+# the normal modular overlay because it mounts host cluster credentials read-only. The generated
+# AnySentry images never contain those credentials.
+services:
+  anysentry:
+    environment:
+      ANYSENTRY_KUBECONFIG: /etc/anysentry/kubeconfig
+      ANYSENTRY_KUBE_SERVER: ${ANYSENTRY_KUBE_SERVER:-https://host.docker.internal:6443}
+      ANYSENTRY_CLUSTER_ID: ${ANYSENTRY_CLUSTER_ID:-default}
+      ANYSENTRY_IDENTITY_NAMESPACES: ${ANYSENTRY_IDENTITY_NAMESPACES:-*}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - ${ANYSENTRY_KUBECONFIG_HOST_PATH:-/etc/rancher/k3s/k3s.yaml}:/etc/anysentry/kubeconfig:ro

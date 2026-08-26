@@ -1,0 +1,181 @@
+# Development overlay. Always place the canonical Compose file first so all relative paths resolve
+# from the repository root:
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.modules.yml ...
+
+x-anysentry-worker-build: &anysentry-worker-build
+  context: .
+  dockerfile: Dockerfile.modules
+  target: worker
+
+services:
+  anysentry:
+    image: ${ANYSENTRY_API_IMAGE:-anysentry-api:modules}
+    build:
+      context: .
+      dockerfile: Dockerfile.modules
+      target: api
+    environment:
+      NODE_OPTIONS: ${ANYSENTRY_API_NODE_OPTIONS:---max-old-space-size=1024}
+      ANYSENTRY_WEB_DIR: /app/empty-web
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:29653/security-center/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 5s
+      timeout: 5s
+      retries: 36
+
+  fast-judge:
+    image: ${ANYSENTRY_WORKER_IMAGE:-anysentry-worker:modules}
+    build: *anysentry-worker-build
+
+  l3-worker:
+    image: ${ANYSENTRY_WORKER_IMAGE:-anysentry-worker:modules}
+    build: *anysentry-worker-build
+
+  stream-worker:
+    image: ${ANYSENTRY_WORKER_IMAGE:-anysentry-worker:modules}
+    build: *anysentry-worker-build
+
+  composite-judge:
+    image: ${ANYSENTRY_WORKER_IMAGE:-anysentry-worker:modules}
+    build: *anysentry-worker-build
+
+  supply-chain-assessment:
+    image: ${ANYSENTRY_WORKER_IMAGE:-anysentry-worker:modules}
+    build: *anysentry-worker-build
+
+  web:
+    image: ${ANYSENTRY_WEB_IMAGE:-anysentry-web:modules}
+    build:
+      context: .
+      dockerfile: Dockerfile.modules
+      target: web
+      args:
+        PUBLIC_BASE_PATH: ${PUBLIC_BASE_PATH:-}
+    labels:
+      io.anysentry.observe: "false"
+      anysentry.io/workload-role: "anysentry_internal"
+    depends_on:
+      anysentry:
+        condition: service_healthy
+    ports:
+      - "${ANYSENTRY_WEB_PORT:-29654}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+    restart: unless-stopped
+
+  observer:
+    profiles: ["observer"]
+    image: ${ANYSENTRY_OBSERVER_WRAPPER_IMAGE:-anysentry-observer-wrapper:modules}
+    labels:
+      io.anysentry.observe: "false"
+      anysentry.io/workload-role: "anysentry_internal"
+    build:
+      context: .
+      dockerfile: Dockerfile.modules
+      target: observer-wrapper
+      args:
+        OBSERVER_COLLECTOR_IMAGE: ${ANYSENTRY_OBSERVER_COLLECTOR_IMAGE:-ghcr.io/a3s-lab/observer:latest}
+    privileged: true
+    pid: host
+    cgroup: host
+    stop_grace_period: 30s
+    depends_on:
+      anysentry:
+        condition: service_healthy
+    entrypoint: ["/usr/local/bin/node", "/opt/anysentry-forwarder-dev/observer-supervisor.js"]
+    # `scripts/bootstrap-observer-sources.mjs` writes this gitignored 0600 file. It carries the
+    # managed Source ID/token plus the management token used only for policy/report calls.
+    env_file:
+      - path: ${ANYSENTRY_OBSERVER_AUTH_ENV_FILE:-.local/observer-auth.env}
+        required: false
+    environment:
+      A3S_OBSERVER_JSON: "1"
+      A3S_OBSERVER_FILES: ${A3S_OBSERVER_FILES:-0}
+      A3S_OBSERVER_FILE_ACCESS: ${A3S_OBSERVER_FILE_ACCESS:-0}
+      A3S_OBSERVER_FILE_DELETE: ${A3S_OBSERVER_FILE_DELETE:-0}
+      A3S_OBSERVER_FILE_UNKNOWN_POLICY: ${A3S_OBSERVER_FILE_UNKNOWN_POLICY:-keep}
+      A3S_OBSERVER_SSL: ${A3S_OBSERVER_SSL:-1}
+      A3S_OBSERVER_COLLECTOR_ID: ${A3S_OBSERVER_COLLECTOR_ID:-modules-observer}
+      A3S_NODE_NAME: ${A3S_NODE_NAME:-modules-docker-host}
+      ANYSENTRY_INGEST_URL: http://anysentry:29653/security-center/ingest
+      ANYSENTRY_BATCH_INGEST_URL: http://anysentry:29653/security-center/ingest/batch
+      ANYSENTRY_IDENTITY_SNAPSHOT_URL: http://anysentry:29653/security-center/identity/snapshot
+      ANYSENTRY_INFRASTRUCTURE_POLICY_URL: http://anysentry:29653/security-center/infrastructure-rules/policy
+      ANYSENTRY_INFRASTRUCTURE_MATERIALIZATION_URL: http://anysentry:29653/security-center/infrastructure-rules/materializations/report
+      ANYSENTRY_INFRASTRUCTURE_POLICY_SECS: ${ANYSENTRY_INFRASTRUCTURE_POLICY_SECS:-5}
+      ANYSENTRY_INFRASTRUCTURE_HOST_GROUP: ${ANYSENTRY_INFRASTRUCTURE_HOST_GROUP:-modules-docker-host}
+      ANYSENTRY_AGENT_RUNTIME_LEASE_URL: http://anysentry:29653/security-center/runtime/lease
+      ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL: http://anysentry:29653/security-center/runtime/snapshot
+      ANYSENTRY_AGENT_RUNTIME_SIGNATURES_FILE: /etc/anysentry/agent-runtime-signatures.json
+      ANYSENTRY_FILTER_RULES_FILE: /run/anysentry-filter/filter-rules.json
+      ANYSENTRY_FILTER_RULES_ACK_FILE: /run/anysentry-filter/filter-rules.ack.json
+      # Both supervisor children inherit one mode; base remains legacy for S0 compatibility.
+      ANYSENTRY_CAPTURE_PROFILE_MODE: ${ANYSENTRY_CAPTURE_PROFILE_MODE:-legacy}
+      ANYSENTRY_UNKNOWN_RETENTION_MODE: ${ANYSENTRY_UNKNOWN_RETENTION_MODE:-legacy}
+      ANYSENTRY_CAPTURE_PROFILE_ACK_POLL_MS: ${ANYSENTRY_CAPTURE_PROFILE_ACK_POLL_MS:-250}
+      ANYSENTRY_FILTER_RULE_PROJECTION_URL: http://anysentry:29653/security-center/filter-rules/projections/forwarder
+      ANYSENTRY_FILTER_RULE_PROJECTION_SECS: ${ANYSENTRY_FILTER_RULE_PROJECTION_SECS:-5}
+      ANYSENTRY_FILTER_RULE_PROJECTION_MAX_BYTES: ${ANYSENTRY_FILTER_RULE_PROJECTION_MAX_BYTES:-16777216}
+      ANYSENTRY_DOCKER_DISCOVERY: ${ANYSENTRY_DOCKER_DISCOVERY:-on}
+      ANYSENTRY_DOCKER_SOCKET: /var/run/docker.sock
+      FORWARD_FILTER_MODE: ${FORWARD_FILTER_MODE:-enforce}
+      FORWARD_RETAIN_UNKNOWN: ${FORWARD_RETAIN_UNKNOWN:-true}
+      FORWARD_RETAIN_NON_AGENT: ${FORWARD_RETAIN_NON_AGENT:-false}
+      FORWARD_NOISE_POLICY: ${FORWARD_NOISE_POLICY:-balanced}
+      FORWARD_FILE_AGGREGATION: ${FORWARD_FILE_AGGREGATION:-true}
+      FORWARD_BATCH_SIZE: ${FORWARD_BATCH_SIZE:-32}
+      FORWARD_BATCH_FLUSH_MS: ${FORWARD_BATCH_FLUSH_MS:-50}
+      FORWARD_MAX_OUTSTANDING_EVENTS: ${FORWARD_MAX_OUTSTANDING_EVENTS:-16384}
+      FORWARD_MAX_OUTSTANDING_BYTES: ${FORWARD_MAX_OUTSTANDING_BYTES:-67108864}
+      FORWARD_PROTECTED_RESERVE_EVENTS: ${FORWARD_PROTECTED_RESERVE_EVENTS:-4096}
+      FORWARD_PROTECTED_RESERVE_BYTES: ${FORWARD_PROTECTED_RESERVE_BYTES:-16777216}
+      FORWARD_SHUTDOWN_TIMEOUT_MS: ${FORWARD_SHUTDOWN_TIMEOUT_MS:-15000}
+      OBSERVER_SUPERVISOR_SHUTDOWN_TIMEOUT_MS: ${OBSERVER_SUPERVISOR_SHUTDOWN_TIMEOUT_MS:-20000}
+      OBSERVER_SUPERVISOR_FORWARDER_ARGS_JSON: '["/opt/anysentry-forwarder-dev/observer-forward.js"]'
+    volumes:
+      - /sys:/sys:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./scripts:/opt/anysentry-forwarder-dev:ro
+      - ${ANYSENTRY_RUNTIME_RULES_DIR:-./.local/observer-rules}:/etc/anysentry:ro
+      - observer-filter-rules:/run/anysentry-filter
+    restart: unless-stopped
+
+  flink-checkpoint-init:
+    build: !reset null
+    image: ${ANYSENTRY_FLINK_RUNTIME_IMAGE:-flink:2.2.1-java17}
+
+  flink-jobmanager:
+    build: !reset null
+    image: ${ANYSENTRY_FLINK_RUNTIME_IMAGE:-flink:2.2.1-java17}
+
+  flink-taskmanager:
+    build: !reset null
+    image: ${ANYSENTRY_FLINK_RUNTIME_IMAGE:-flink:2.2.1-java17}
+
+  flink-job-submit:
+    image: ${ANYSENTRY_FLINK_JOB_IMAGE:-anysentry-flink-job:modules}
+    build:
+      context: .
+      dockerfile: Dockerfile.modules
+      target: flink-job
+      args:
+        FLINK_RUNTIME_IMAGE: ${ANYSENTRY_FLINK_RUNTIME_IMAGE:-flink:2.2.1-java17}
+    entrypoint: ["/bin/bash", "/opt/anysentry/flink-job-replace.sh"]
+    command: []
+    environment:
+      ANYSENTRY_FLINK_JOBMANAGER: flink-jobmanager:8081
+      ANYSENTRY_FLINK_JOB_NAME: ${ANYSENTRY_FLINK_JOB_NAME:-AnySentry Flink Shadow Risk}
+      ANYSENTRY_FLINK_REPLACE_EXISTING_JOB: ${ANYSENTRY_FLINK_REPLACE_EXISTING_JOB:-true}
+      ANYSENTRY_FLINK_RESTORE_PATH: ${ANYSENTRY_FLINK_RESTORE_PATH:-}
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+
+volumes:
+  observer-filter-rules:

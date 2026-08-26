@@ -7,6 +7,7 @@ import type {
 } from "@/lib/api/security-center";
 import { formatSecurityDateTime } from "@/lib/date-time";
 import { cn } from "@/lib/utils";
+import { useI18n } from "@/lib/i18n";
 
 export type AgentRuntimeKind = "kubernetes" | "docker" | "local" | "unknown";
 
@@ -211,17 +212,19 @@ export function AgentIdentityInline({
   showLocation?: boolean;
   className?: string;
 }) {
+  const { locale, t } = useI18n();
   const identity = resolveAgentIdentity(event);
+  const identityName = t(identity.name);
   const classification = CLASSIFICATION_META[identity.classification];
   const runtime = identity.runtime === "unknown" ? undefined : RUNTIME_META[identity.runtime];
   const title = [
-    identity.name,
-    identity.classificationLabel,
-    runtime?.label,
+    identityName,
+    t(identity.classificationLabel),
+    runtime?.label ? t(runtime.label) : undefined,
     identity.locationLabel,
-    identity.detectedName && identity.detectedName !== identity.name ? `采集时：${identity.detectedName}` : undefined,
-    identity.rawAgentId !== identity.name ? `原始：${identity.rawAgentId}` : undefined,
-    event.attribution?.source ? `来源：${event.attribution.source}` : undefined,
+    identity.detectedName && identity.detectedName !== identity.name ? `${t("采集时")}：${identity.detectedName}` : undefined,
+    identity.rawAgentId !== identity.name ? `${t("原始")}：${identity.rawAgentId}` : undefined,
+    event.attribution?.source ? `${t("来源")}：${event.attribution.source}` : undefined,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -231,17 +234,17 @@ export function AgentIdentityInline({
       <span className="flex min-w-0 max-w-full items-center gap-1.5">
         <span className={cn("size-1.5 shrink-0 rounded-full", classification.dotClassName)} />
         <span className={cn("min-w-0 truncate font-semibold", classification.nameClassName)}>
-          {identity.name}
-          <span className="sr-only">（{identity.classificationLabel}）</span>
+          {identityName}
+          <span className="sr-only">{locale === "en" ? ` (${t(identity.classificationLabel)})` : `（${t(identity.classificationLabel)}）`}</span>
         </span>
         {showClassification ? (
           <span className={cn("shrink-0 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold", classification.badgeClassName)}>
-            {identity.classificationLabel}
+            {t(identity.classificationLabel)}
           </span>
         ) : null}
         {runtime ? (
           <span className={cn("shrink-0 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold", runtime.className)}>
-            {runtime.label}
+            {t(runtime.label)}
           </span>
         ) : null}
       </span>

@@ -1304,6 +1304,23 @@ function attributor(procEntries = []) {
 }
 
 {
+  let now = 2_000;
+  const budget = new DiscoveryBudget({ limit: 10, globalLimit: 2, windowMs: 1_000, now: () => now });
+  const first = observerEvent({ pid: 921, ppid: 1, comm: 'worker', exe: '/usr/bin/worker' });
+  first.identity.session = 'container-global-a';
+  first.event = { FileAccess: { pid: 921, path: '/tmp/a', write: true } };
+  const second = structuredClone(first);
+  second.identity.session = 'container-global-b';
+  second.process.cgroup = '/docker/container-global-b';
+  assert.equal(budget.allow(first), true);
+  assert.equal(budget.allow(second), true);
+  assert.equal(budget.allow(structuredClone(second)), false, 'node-global discovery budget must bound aggregate unknown load');
+  assert.equal(budget.metrics().suppressed, 1);
+  now += 1_001;
+  assert.equal(budget.allow(first, 1), true, 'pressure-adjusted budget must recover in the next window');
+}
+
+{
   let now = 1000;
   const deduper = new ToolExecDeduper({ windowMs: 5000, now: () => now });
   const event = observerEvent({ pid: 800, ppid: 700, comm: 'bash', exe: '/usr/bin/bash', argv: ['bash', '-c', 'echo one'] });

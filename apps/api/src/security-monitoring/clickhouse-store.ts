@@ -13,7 +13,10 @@ import { ClickHouseClient, createClient, type ClickHouseSettings } from '@clickh
 import { createHash, randomUUID } from 'node:crypto';
 import { agentIdentityKeyForEvent, agentRuntimeInstanceIdForEvent, hasDirectAgentRootEvidence } from './agent-identity';
 import { eventActivityContext, eventActivitySubtype, normalizeActivitySemantics } from './activity-context';
+import { correlationCaptureRollout } from './correlation-rollout';
+import { visibleClassificationSemantics, visibleProcessContext } from './classification-semantics';
 import { foldLatestEventRevisions } from './event-revision';
+import type { ProcessLifecycleFact } from './process-lifecycle';
 import {
   BucketCommitCursor,
   compareEventCommitCursor,
@@ -21,6 +24,12 @@ import {
   validPersistedDashboardBuckets,
 } from './persisted-dashboard-bucket';
 import { PolicyConfig } from './policy-config';
+import { parseTrustedCorrelation } from './trusted-correlation';
+import {
+  TOOL_EVIDENCE_RELATION_VERSION,
+  toolEvidenceIndexFields,
+  type ToolEvidenceItem,
+} from './tool-evidence-linker';
 import { AgentAttribution, AgentMetadataRecord, AlertRecord, AuditRecord, CollectorHeartbeatRecord, IdentityAiReviewRecord, Incident, IngestionSourceRecord, JudgedEvent, MaintenanceWindowRecord, NotificationDeliveryRecord, NotificationState, ObjectiveRecord, ProcessContext, RemediationRecord } from './types';
 
 function boundedPositiveInt(
@@ -46,6 +55,18 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   eventId String,
   sourceEventId String DEFAULT '',
   at UInt64,
+  eventAtUnixNs String DEFAULT '',
+  receivedAtUnixNs String DEFAULT '',
+  receivedAt UInt64 DEFAULT 0,
+  eventTimeQuality LowCardinality(String) DEFAULT 'api_received',
+  captureEpoch UInt64 DEFAULT 0,
+  captureProfileCode UInt8 DEFAULT 0,
+  captureActionCode UInt8 DEFAULT 0,
+  captureAuthorityCode UInt8 DEFAULT 0,
+  captureDispositionCode UInt8 DEFAULT 0,
+  captureSelected UInt8 DEFAULT 0,
+  captureFlags UInt8 DEFAULT 0,
+  capturePolicyVersion UInt64 DEFAULT 0,
   ingestedAt UInt64 DEFAULT at,
   eventKind LowCardinality(String),
   eventCategory LowCardinality(String),
@@ -55,11 +76,22 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   subject String,
   workspacePath String,
   agentId LowCardinality(String),
+  subjectAssetId String DEFAULT '',
+  subjectAssetType LowCardinality(String) DEFAULT '',
+  assetBindingQuality LowCardinality(String) DEFAULT '',
+  assetBindingRevision UInt64 DEFAULT 0,
+  assetBindingReason LowCardinality(String) DEFAULT '',
+  identityRevision UInt64 DEFAULT 0,
   collectorId String,
   sourceId String,
   sessionId String,
   userId String,
   traceId String,
+  invocationId String DEFAULT '',
+  toolCallId String DEFAULT '',
+  processInstanceKey String DEFAULT '',
+  correlationMethod LowCardinality(String) DEFAULT '',
+  correlationConfidence Float32 DEFAULT 0,
   spanId String,
   parentSpanId String,
   runId String,
@@ -82,7 +114,28 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   tokenCount UInt64,
   latencyMs Float64,
   attributes String,
+  classificationSemantics String DEFAULT '{}',
   process String DEFAULT '{}',
+  processHostId String DEFAULT JSONExtractString(process, 'hostId'),
+  processBootId String DEFAULT JSONExtractString(process, 'bootId'),
+  processPid UInt64 DEFAULT JSONExtractUInt(process, 'pid'),
+  processPpid UInt64 DEFAULT JSONExtractUInt(process, 'ppid'),
+  processPidNamespace String DEFAULT JSONExtractString(process, 'pidNamespace'),
+  processNamespacePid UInt64 DEFAULT JSONExtractUInt(process, 'namespacePid'),
+  processNamespacePpid UInt64 DEFAULT JSONExtractUInt(process, 'namespacePpid'),
+  processStartTimeTicks String DEFAULT JSONExtractString(process, 'startTimeTicks'),
+  processStartTimeNs String DEFAULT JSONExtractString(process, 'startTimeNs'),
+  evidenceResourceHash String DEFAULT multiIf(
+    eventKind = 'AgentTool', JSONExtractString(attributes, 'anysentry.tool.resource_hash'),
+    eventKind IN ('FileAccess', 'FileDelete') AND startsWith(JSONExtractString(attributes, 'path'), '/'),
+      lower(hex(SHA256(JSONExtractString(attributes, 'path')))),
+    ''
+  ),
+  evidenceCommandHash String DEFAULT multiIf(
+    eventKind = 'AgentTool', JSONExtractString(attributes, 'anysentry.tool.command_hash'),
+    eventKind = 'ToolExec', JSONExtractString(attributes, 'anysentry.kernel.command_hash'),
+    ''
+  ),
   attribution String DEFAULT '{}',
   agentIdentityKey String DEFAULT '',
   agentInstanceKey String DEFAULT '',
@@ -91,6 +144,19 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   agentHasRootIdentity UInt8 DEFAULT 0,
   judgment String DEFAULT '{}',
   rawPreview String,
+  INDEX idx_event_id eventId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_invocation_id invocationId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_tool_call_id toolCallId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_trace_id traceId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_session_id sessionId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_run_id runId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_subject_asset_id subjectAssetId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_agent_instance_key agentInstanceKey TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_process_boot_id processBootId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_process_pid_namespace processPidNamespace TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_process_host_id processHostId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_evidence_resource_hash evidenceResourceHash TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_evidence_command_hash evidenceCommandHash TYPE bloom_filter(0.01) GRANULARITY 1,
   ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000))
 ) ENGINE = MergeTree
 ORDER BY at
@@ -106,7 +172,10 @@ const EVENT_WRITE_BATCH_BYTES = 4 * 1024 * 1024;
 const EVENT_WRITE_MAX_BUFFERED_ROWS = 5_000;
 const EVENT_WRITE_MAX_BUFFERED_BYTES = 32 * 1024 * 1024;
 const EVENT_WRITE_RETRY_DEADLINE_MS = 15_000;
-const EVENT_WRITE_ATTEMPT_TIMEOUT_MS = 5_000;
+// Full-file live validation observed rare successful local inserts at 5.8–6.7s. Aborting them at
+// 5s creates an unnecessary ambiguous retry just before QueryFinish. Keep one attempt below the
+// Forwarder 10s request deadline and the writer's independent 15s total retry deadline.
+const EVENT_WRITE_ATTEMPT_TIMEOUT_MS = 8_000;
 const EVENT_WRITE_RETRY_COOLDOWN_MS = 2_000;
 const EVENT_WRITE_CLOSE_DEADLINE_MS = 20_000;
 const EVENT_WRITE_BACKOFF_BASE_MS = 250;
@@ -117,13 +186,36 @@ const EVENT_ALTERS = [
   'ADD COLUMN IF NOT EXISTS eventId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS sourceEventId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS ingestedAt UInt64 DEFAULT at',
+  "ADD COLUMN IF NOT EXISTS eventAtUnixNs String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS receivedAtUnixNs String DEFAULT ''",
+  'ADD COLUMN IF NOT EXISTS receivedAt UInt64 DEFAULT 0',
+  "ADD COLUMN IF NOT EXISTS eventTimeQuality LowCardinality(String) DEFAULT 'api_received'",
+  'ADD COLUMN IF NOT EXISTS captureEpoch UInt64 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS captureProfileCode UInt8 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS captureActionCode UInt8 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS captureAuthorityCode UInt8 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS captureDispositionCode UInt8 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS captureSelected UInt8 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS captureFlags UInt8 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS capturePolicyVersion UInt64 DEFAULT 0',
   'ADD COLUMN IF NOT EXISTS eventCategory LowCardinality(String) DEFAULT \'unknown\'',
   "ADD COLUMN IF NOT EXISTS activityContext LowCardinality(String) DEFAULT if(eventKind = 'ToolExec', 'agent_action', '')",
   "ADD COLUMN IF NOT EXISTS activitySubtype LowCardinality(String) DEFAULT ''",
   'ADD COLUMN IF NOT EXISTS source LowCardinality(String) DEFAULT \'observer\'',
   'ADD COLUMN IF NOT EXISTS collectorId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS sourceId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS subjectAssetId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS subjectAssetType LowCardinality(String) DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS assetBindingQuality LowCardinality(String) DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS assetBindingRevision UInt64 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS assetBindingReason LowCardinality(String) DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS identityRevision UInt64 DEFAULT 0',
   'ADD COLUMN IF NOT EXISTS traceId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS invocationId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS toolCallId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS processInstanceKey String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS correlationMethod LowCardinality(String) DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS correlationConfidence Float32 DEFAULT 0',
   'ADD COLUMN IF NOT EXISTS spanId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS parentSpanId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS runId String DEFAULT \'\'',
@@ -134,7 +226,28 @@ const EVENT_ALTERS = [
   'ADD COLUMN IF NOT EXISTS decisionRevision UInt32 DEFAULT 1',
   'ADD COLUMN IF NOT EXISTS decisionUpdatedAt UInt64 DEFAULT at',
   'ADD COLUMN IF NOT EXISTS attributes String DEFAULT \'{}\'',
+  'ADD COLUMN IF NOT EXISTS classificationSemantics String DEFAULT \'{}\'',
   'ADD COLUMN IF NOT EXISTS process String DEFAULT \'{}\'',
+  "ADD COLUMN IF NOT EXISTS processHostId String DEFAULT JSONExtractString(process, 'hostId')",
+  "ADD COLUMN IF NOT EXISTS processBootId String DEFAULT JSONExtractString(process, 'bootId')",
+  "ADD COLUMN IF NOT EXISTS processPid UInt64 DEFAULT JSONExtractUInt(process, 'pid')",
+  "ADD COLUMN IF NOT EXISTS processPpid UInt64 DEFAULT JSONExtractUInt(process, 'ppid')",
+  "ADD COLUMN IF NOT EXISTS processPidNamespace String DEFAULT JSONExtractString(process, 'pidNamespace')",
+  "ADD COLUMN IF NOT EXISTS processNamespacePid UInt64 DEFAULT JSONExtractUInt(process, 'namespacePid')",
+  "ADD COLUMN IF NOT EXISTS processNamespacePpid UInt64 DEFAULT JSONExtractUInt(process, 'namespacePpid')",
+  "ADD COLUMN IF NOT EXISTS processStartTimeTicks String DEFAULT JSONExtractString(process, 'startTimeTicks')",
+  "ADD COLUMN IF NOT EXISTS processStartTimeNs String DEFAULT JSONExtractString(process, 'startTimeNs')",
+  `ADD COLUMN IF NOT EXISTS evidenceResourceHash String DEFAULT multiIf(
+    eventKind = 'AgentTool', JSONExtractString(attributes, 'anysentry.tool.resource_hash'),
+    eventKind IN ('FileAccess', 'FileDelete') AND startsWith(JSONExtractString(attributes, 'path'), '/'),
+      lower(hex(SHA256(JSONExtractString(attributes, 'path')))),
+    ''
+  )`,
+  `ADD COLUMN IF NOT EXISTS evidenceCommandHash String DEFAULT multiIf(
+    eventKind = 'AgentTool', JSONExtractString(attributes, 'anysentry.tool.command_hash'),
+    eventKind = 'ToolExec', JSONExtractString(attributes, 'anysentry.kernel.command_hash'),
+    ''
+  )`,
   'ADD COLUMN IF NOT EXISTS attribution String DEFAULT \'{}\'',
   `ADD COLUMN IF NOT EXISTS agentIdentityKey String DEFAULT multiIf(
     JSONExtractString(attribution, 'physicalWorkloadId') != '', JSONExtractString(attribution, 'physicalWorkloadId'),
@@ -194,7 +307,36 @@ const EVENT_ALTERS = [
   )`,
   'ADD COLUMN IF NOT EXISTS judgment String DEFAULT \'{}\'',
   'ADD COLUMN IF NOT EXISTS rawPreview String DEFAULT \'\'',
+  'ADD INDEX IF NOT EXISTS idx_event_id eventId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_invocation_id invocationId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_tool_call_id toolCallId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_trace_id traceId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_session_id sessionId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_run_id runId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_subject_asset_id subjectAssetId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_agent_instance_key agentInstanceKey TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_process_boot_id processBootId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_process_pid_namespace processPidNamespace TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_process_host_id processHostId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_evidence_resource_hash evidenceResourceHash TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_evidence_command_hash evidenceCommandHash TYPE bloom_filter(0.01) GRANULARITY 1',
 ];
+const EVENT_EVIDENCE_INDEX_NAMES = [
+  'idx_event_id',
+  'idx_invocation_id',
+  'idx_tool_call_id',
+  'idx_trace_id',
+  'idx_session_id',
+  'idx_run_id',
+  'idx_subject_asset_id',
+  'idx_agent_instance_key',
+  'idx_process_boot_id',
+  'idx_process_pid_namespace',
+  'idx_process_host_id',
+  'idx_evidence_resource_hash',
+  'idx_evidence_command_hash',
+] as const;
+const EVENT_EVIDENCE_INDEX_MIGRATION_KEY = 'schema.events.evidence_indexes.v3';
 
 const COLLECTOR_HEARTBEAT_TABLE = 'collector_heartbeats';
 const COLLECTOR_HEARTBEAT_DDL = `CREATE TABLE IF NOT EXISTS ${COLLECTOR_HEARTBEAT_TABLE} (
@@ -278,6 +420,82 @@ AS SELECT
   collectorId
 FROM ${TABLE}`;
 
+const TOOL_EVIDENCE_RELATION_TABLE = 'tool_evidence_relations';
+const TOOL_EVIDENCE_RELATION_DDL = `CREATE TABLE IF NOT EXISTS ${TOOL_EVIDENCE_RELATION_TABLE} (
+  invocationId String,
+  toolCallId String,
+  workspacePath String,
+  sourceId String,
+  agentInstanceId String,
+  relationVersion UInt32,
+  evidenceVersion String,
+  itemCount UInt32,
+  updatedAt UInt64,
+  payload String,
+  ts DateTime MATERIALIZED toDateTime(intDiv(updatedAt, 1000))
+) ENGINE = ReplacingMergeTree(updatedAt)
+ORDER BY (invocationId, workspacePath, sourceId, agentInstanceId, toolCallId, relationVersion)
+TTL ts + INTERVAL 90 DAY`;
+
+const PROCESS_LIFECYCLE_FACT_TABLE = 'process_lifecycle_facts';
+const PROCESS_LIFECYCLE_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${PROCESS_LIFECYCLE_FACT_TABLE} (
+  factId String,
+  eventId String,
+  sourceEventId String,
+  factKind LowCardinality(String),
+  at UInt64,
+  receivedAt UInt64,
+  source LowCardinality(String),
+  sourceId String,
+  collectorId String,
+  workspacePath String,
+  subjectAssetId String DEFAULT '',
+  subjectAssetType LowCardinality(String) DEFAULT '',
+  assetBindingQuality LowCardinality(String) DEFAULT '',
+  assetBindingRevision UInt64 DEFAULT 0,
+  assetBindingReason LowCardinality(String) DEFAULT '',
+  runtimeInstanceId String DEFAULT '',
+  rootProcess UInt8 DEFAULT 0,
+  identityRevision UInt64 DEFAULT 0,
+  processInstanceKey String,
+  physicalWorkloadId String,
+  hostId String,
+  bootId String,
+  pid UInt64,
+  ppid UInt64,
+  pidNamespace String,
+  namespacePid UInt64,
+  namespacePpid UInt64,
+  startTime String,
+  lifecycleSource LowCardinality(String),
+  exitStatus UInt32 DEFAULT 0,
+  exitStatusPresent UInt8 DEFAULT 0,
+  exitSignal UInt32 DEFAULT 0,
+  exitSignalPresent UInt8 DEFAULT 0,
+  executableHash String,
+  commandHash String,
+  ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000)),
+  INDEX idx_process_lifecycle_instance processInstanceKey TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_process_lifecycle_workload physicalWorkloadId TYPE bloom_filter(0.01) GRANULARITY 1
+) ENGINE = ReplacingMergeTree(receivedAt)
+ORDER BY (processInstanceKey, factKind, at, eventId)
+TTL ts + INTERVAL 30 DAY`;
+
+const PROCESS_LIFECYCLE_FACT_ALTERS = [
+  'MODIFY COLUMN exitStatus UInt32 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS exitStatusPresent UInt8 DEFAULT 0 AFTER exitStatus',
+  'ADD COLUMN IF NOT EXISTS exitSignal UInt32 DEFAULT 0 AFTER exitStatusPresent',
+  'ADD COLUMN IF NOT EXISTS exitSignalPresent UInt8 DEFAULT 0 AFTER exitSignal',
+  'ADD COLUMN IF NOT EXISTS subjectAssetId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS subjectAssetType LowCardinality(String) DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS assetBindingQuality LowCardinality(String) DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS assetBindingRevision UInt64 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS assetBindingReason LowCardinality(String) DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS runtimeInstanceId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS rootProcess UInt8 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS identityRevision UInt64 DEFAULT 0',
+];
+
 // Startup progress hydration must stay independent of the cardinality of the 90-day event table.
 // The commit journal is ordered by committedAt, so this compatibility sample reads a deterministic
 // recent prefix even when the materialized view was added after an older events table already
@@ -287,6 +505,18 @@ const EVENT_COMMIT_PROGRESS_HYDRATE_ROWS = 100_000;
 // These are complete, commit-cursor-qualified bucket snapshots. Revisions replace the complete
 // snapshot rather than incrementing a counter, which keeps late judgment updates exact.
 const DASHBOARD_BUCKET_SNAPSHOT_TABLE = 'dashboard_bucket_snapshots';
+// Cold dashboard snapshots are built from the raw, revisioned event table. At production
+// full-file volume a ten-minute fold can approach 400 MiB and monopolise ClickHouse long enough to
+// delay ingestion and the Observer control plane. A request only schedules a single-flight worker
+// over a few one-minute chunks, returns an explicit hot/partial response immediately, and later
+// refreshes resume from the durable buckets already written by earlier workers.
+const DASHBOARD_BUCKET_BUILD_CHUNK_MS = 60_000;
+const DASHBOARD_BUCKET_BUILD_MAX_CHUNKS = 1;
+// DashboardHistory asks for current + previous comparison windows. More than one hour of absolute
+// 10-second facts expands tens of MiB of factsJson in Node and can stall health/control requests.
+// Longer presets remain available through durable Event search and return an explicit hot/partial
+// dashboard until a compact window-level snapshot format is introduced.
+const DASHBOARD_PERSISTED_READ_MAX_BUCKETS = 360;
 const DASHBOARD_BUCKET_SNAPSHOT_DDL = `CREATE TABLE IF NOT EXISTS ${DASHBOARD_BUCKET_SNAPSHOT_TABLE} (
   bucketStart UInt64,
   bucketMs UInt32,
@@ -321,6 +551,19 @@ const BOUNDED_DASHBOARD_READ_SETTINGS: ClickHouseSettings = {
   max_execution_time: 25,
 };
 
+// Raw snapshot bootstrap is lower priority than both event ingestion and already-materialised
+// dashboard reads. A one-minute chunk fits this tighter budget under the sustained full-file test;
+// if it does not, the caller returns the bounded hot view instead of raising the budget or retrying
+// another raw scan in the same request.
+const BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS: ClickHouseSettings = {
+  max_threads: 1,
+  max_memory_usage: String(128 * 1024 * 1024),
+  max_bytes_before_external_group_by: String(32 * 1024 * 1024),
+  max_bytes_before_external_sort: String(32 * 1024 * 1024),
+  min_bytes_to_use_direct_io: String(1024 * 1024),
+  max_execution_time: 5,
+};
+
 // Session/workspace queries materialize wider per-event state. Small blocks keep each below its
 // query budget; running only these two one-thread reads together keeps the cold dashboard under
 // the browser deadline without restoring the previous four-query fan-out.
@@ -329,14 +572,6 @@ const BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS: ClickHouseSettings = {
   max_threads: 1,
   max_block_size: '1024',
   preferred_block_size_bytes: String(1024 * 1024),
-};
-
-// Hydration reads wide rows rather than compact aggregates. A single read thread and small blocks
-// keep both ClickHouse and the API startup peak bounded, while a separate 640 MiB query budget
-// leaves measured headroom above the roughly 341 MiB production query peak.
-const BOUNDED_HYDRATE_READ_SETTINGS: ClickHouseSettings = {
-  ...BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
-  max_memory_usage: String(640 * 1024 * 1024),
 };
 
 // Recent event reads also materialize wide rows. Moving-window production samples exceeded the
@@ -362,15 +597,31 @@ const BOUNDED_BOOTSTRAP_PROGRESS_READ_SETTINGS: ClickHouseSettings = {
   max_execution_time: 15,
 };
 
+const BOUNDED_TOOL_EVIDENCE_RELATION_SETTINGS: ClickHouseSettings = {
+  max_threads: 1,
+  max_memory_usage: String(64 * 1024 * 1024),
+  max_execution_time: 2,
+};
+
+// Startup restores only the latest bounded structural facts. The production 30-minute window was
+// measured just above the 64 MiB point-lookup budget, so keep a separate one-thread ceiling rather
+// than weakening ToolEvidence's 2-second/64 MiB query contract.
+const BOUNDED_PROCESS_LIFECYCLE_READ_SETTINGS: ClickHouseSettings = {
+  max_threads: 1,
+  max_memory_usage: String(96 * 1024 * 1024),
+  max_execution_time: 5,
+};
+
 const MAX_DURABLE_EVENT_SEARCH_ROWS = 10_000;
 
-type Row = Omit<JudgedEvent, 'activityContext' | 'activitySubtype' | 'actionKind' | 'actionTarget' | 'attributes' | 'process' | 'attribution' | 'judgment' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview'> & {
+type Row = Omit<JudgedEvent, 'activityContext' | 'activitySubtype' | 'actionKind' | 'actionTarget' | 'attributes' | 'classificationSemantics' | 'process' | 'attribution' | 'judgment' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview' | 'invocationId' | 'toolCallId' | 'captureSelected' | 'subjectAssetType' | 'assetBindingQuality'> & {
   ingestedAt: number;
   activityContext: string;
   activitySubtype: string;
   actionKind: string;
   actionTarget: string;
   attributes: string;
+  classificationSemantics: string;
   process: string;
   attribution: string;
   agentIdentityKey: string;
@@ -381,6 +632,25 @@ type Row = Omit<JudgedEvent, 'activityContext' | 'activitySubtype' | 'actionKind
   judgment: string;
   collectorId: string;
   sourceId: string;
+  subjectAssetType: string;
+  assetBindingQuality: string;
+  invocationId: string;
+  toolCallId: string;
+  processInstanceKey: string;
+  processHostId: string;
+  processBootId: string;
+  processPid: number;
+  processPpid: number;
+  processPidNamespace: string;
+  processNamespacePid: number;
+  processNamespacePpid: number;
+  processStartTimeTicks: string;
+  processStartTimeNs: string;
+  evidenceResourceHash: string;
+  evidenceCommandHash: string;
+  correlationMethod: string;
+  correlationConfidence: number;
+  captureSelected: number;
   parentSpanId: string;
   taskId: string;
   rawPreview: string;
@@ -408,6 +678,10 @@ interface EventWriteBatch {
   lastError?: Error;
 }
 
+const EVENT_REVISION_DIGEST_CACHE_SIZE = 20_000;
+const EVENT_REVISION_CONFLICT = 'ANYSENTRY_EVENT_REVISION_CONFLICT';
+const EVENT_WRITE_BATCH_TOO_LARGE = 'ANYSENTRY_CLICKHOUSE_EVENT_BATCH_TOO_LARGE';
+
 interface EventWriteErrorDecision {
   retryable: boolean;
   ambiguous: boolean;
@@ -418,15 +692,34 @@ export interface StoredEventQuery {
   sinceMs: number;
   untilMs: number;
   monitoredOnly?: boolean;
+  /** Narrow locator/revision candidates scanned before full evidence rows are materialised. */
+  candidateLimit?: number;
   eventId?: string;
   sourceId?: string;
   collectorId?: string;
   agentId?: string;
+  subjectAssetId?: string;
   /** Stable concrete runtime identity. Unlike display agentId, this is safe to push down. */
   agentInstanceId?: string;
   sessionId?: string;
   workspacePath?: string;
   traceId?: string;
+  /** Trusted invocation identity. This is independent from the legacy traceId predicate. */
+  invocationId?: string;
+  /** Authenticated Agent adapter ToolCall identity. */
+  toolCallId?: string;
+  /** Bounded S6 evidence lookup predicates over server-derived scalar columns. */
+  processHostId?: string;
+  processBootId?: string;
+  processPid?: number;
+  processPpid?: number;
+  processPidNamespace?: string;
+  processNamespacePid?: number;
+  processNamespacePpid?: number;
+  processStartTimeTicks?: string;
+  processStartTimeNs?: string;
+  evidenceResourceHashes?: string[];
+  evidenceCommandHashes?: string[];
   runId?: string;
   eventKind?: string;
   eventCategory?: string;
@@ -441,6 +734,18 @@ export interface StoredEventSearchResult {
   committedCutoffMs?: number;
   /** The durable query failed; callers must not interpret the empty page as an exact zero. */
   unavailable?: boolean;
+}
+
+export interface StoredToolEvidenceRelations {
+  items: ToolEvidenceItem[];
+  evidenceVersion?: string;
+  updatedAt?: number;
+}
+
+export interface ToolEvidenceRelationScope {
+  workspacePath?: string;
+  sourceId?: string;
+  agentInstanceId?: string;
 }
 
 export interface CommittedSourceProgress {
@@ -504,17 +809,58 @@ async function runClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promis
       ...credentials,
     });
     await schema.command({ query: DDL(TABLE) });
-    for (const alter of EVENT_ALTERS) await schema.command({ query: `ALTER TABLE ${TABLE} ${alter}` });
+    // One metadata transaction is materially cheaper than dozens of sequential ALTERs on a busy
+    // MergeTree. Every operation is idempotent, so rolling versions retain the same compatibility.
+    await schema.command({ query: `ALTER TABLE ${TABLE} ${EVENT_ALTERS.join(', ')}` });
     await schema.command({
       query: `ALTER TABLE ${TABLE} MODIFY SETTING non_replicated_deduplication_window = ${EVENT_DEDUPLICATION_WINDOW}`,
     });
-    await schema.command({ query: COLLECTOR_HEARTBEAT_DDL });
     await schema.command({ query: CONFIG_DDL });
+    try {
+      const migrationResult = await schema.query({
+        query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = {key:String} LIMIT 1`,
+        query_params: { key: EVENT_EVIDENCE_INDEX_MIGRATION_KEY },
+        clickhouse_settings: BOUNDED_BOOTSTRAP_PROGRESS_READ_SETTINGS,
+        format: 'JSONEachRow',
+      });
+      const migrationRows = (await migrationResult.json()) as Array<{ value?: string }>;
+      if (!['scheduled', 'complete'].includes(migrationRows[0]?.value ?? '')) {
+        await schema.command({
+          query: `ALTER TABLE ${TABLE} ${EVENT_EVIDENCE_INDEX_NAMES
+            .map((name) => `MATERIALIZE INDEX ${name}`)
+            .join(', ')}`,
+          // Backfilling ninety days of parts is a server-side mutation and may take minutes. The
+          // indexed query remains correct while it runs, so bootstrap must schedule it once rather
+          // than blocking every API replica behind the HTTP command timeout.
+          clickhouse_settings: { mutations_sync: '0' },
+        });
+        await schema.insert({
+          table: CONFIG_TABLE,
+          values: [{
+            key: EVENT_EVIDENCE_INDEX_MIGRATION_KEY,
+            value: 'scheduled',
+            updated_at: Date.now(),
+          }],
+          format: 'JSONEachRow',
+        });
+      }
+    } catch (error) {
+      // Existing data remains queryable without materialized skipping indexes. Do not claim the
+      // migration complete; a later healthy bootstrap retries it.
+      console.warn('[clickhouse] evidence index backfill deferred:',
+        error instanceof Error ? error.message : String(error));
+    }
+    await schema.command({ query: COLLECTOR_HEARTBEAT_DDL });
     await schema.command({ query: NOTIFICATION_DELIVERY_DDL });
     await schema.command({ query: IDENTITY_AI_REVIEW_DDL });
     await schema.command({ query: AUDIT_FACT_DDL });
     await schema.command({ query: EVENT_COMMIT_FACT_DDL });
     await schema.command({ query: EVENT_COMMIT_FACT_MV_DDL });
+    await schema.command({ query: TOOL_EVIDENCE_RELATION_DDL });
+    await schema.command({ query: PROCESS_LIFECYCLE_FACT_DDL });
+    await schema.command({
+      query: `ALTER TABLE ${PROCESS_LIFECYCLE_FACT_TABLE} ${PROCESS_LIFECYCLE_FACT_ALTERS.join(', ')}`,
+    });
     await schema.command({ query: DASHBOARD_BUCKET_SNAPSHOT_DDL });
 
     // A materialized view does not retroactively populate rows that predate its creation. Read only
@@ -777,14 +1123,35 @@ function attrString(attributes: JudgedEvent['attributes'], key: string): string 
 }
 
 function toRow(e: JudgedEvent): Row {
-  const attribution = e.attribution;
+  const rawAttribution = e.attribution;
+  const correlation = parseTrustedCorrelation(rawAttribution?.correlation);
+  const attribution = !rawAttribution
+    ? undefined
+    : correlation
+      ? { ...rawAttribution, correlation }
+      : (({ correlation: _invalidCorrelation, ...legacyAttribution }) => legacyAttribution)(rawAttribution);
   const physical = attribution?.physicalWorkloadId?.trim();
   const instance = attribution?.agentInstanceId?.trim();
+  const classificationSemantics = visibleClassificationSemantics(e.classificationSemantics);
+  const process = visibleProcessContext(e.process);
+  const evidenceIndex = toolEvidenceIndexFields(e);
   return {
     schemaVersion: e.schemaVersion,
     eventId: e.eventId,
     sourceEventId: e.sourceEventId ?? '',
     at: e.at,
+    eventAtUnixNs: e.eventAtUnixNs ?? '',
+    receivedAtUnixNs: e.receivedAtUnixNs ?? '',
+    receivedAt: e.receivedAt ?? 0,
+    eventTimeQuality: e.eventTimeQuality ?? 'api_received',
+    captureEpoch: e.captureEpoch ?? '0',
+    captureProfileCode: e.captureProfileCode ?? 0,
+    captureActionCode: e.captureActionCode ?? 0,
+    captureAuthorityCode: e.captureAuthorityCode ?? 0,
+    captureDispositionCode: e.captureDispositionCode ?? 0,
+    captureSelected: e.captureSelected === true ? 1 : 0,
+    captureFlags: e.captureFlags ?? 0,
+    capturePolicyVersion: e.capturePolicyVersion ?? 0,
     ingestedAt: Date.now(),
     eventKind: e.eventKind,
     eventCategory: e.eventCategory,
@@ -794,11 +1161,37 @@ function toRow(e: JudgedEvent): Row {
     subject: e.subject,
     workspacePath: e.workspacePath,
     agentId: e.agentId,
+    subjectAssetId: e.subjectAssetId ?? '',
+    subjectAssetType: e.subjectAssetType ?? '',
+    assetBindingQuality: e.assetBindingQuality ?? '',
+    assetBindingRevision: e.assetBindingRevision ?? 0,
+    assetBindingReason: e.assetBindingReason ?? '',
+    identityRevision: e.identityRevision ?? 0,
     collectorId: e.collectorId?.trim() || attrString(e.attributes, 'collectorId'),
     sourceId: e.sourceId?.trim() || attrString(e.attributes, 'sourceId'),
     sessionId: e.sessionId,
     userId: e.userId,
     traceId: e.traceId,
+    // These query columns are projections of the server-resolved correlation object. Producer
+    // convenience fields are deliberately not an independent authority at the persistence edge.
+    invocationId: correlation?.invocationId?.trim() ?? '',
+    toolCallId: correlation?.toolCallId?.trim() ?? '',
+    processInstanceKey: correlation?.processInstanceId?.trim() ?? '',
+    processHostId: process?.hostId?.trim() ?? '',
+    processBootId: process?.bootId?.trim() ?? '',
+    processPid: process?.pid ?? 0,
+    processPpid: process?.ppid ?? 0,
+    processPidNamespace: process?.pidNamespace?.trim() ?? '',
+    processNamespacePid: process?.namespacePid ?? 0,
+    processNamespacePpid: process?.namespacePpid ?? 0,
+    processStartTimeTicks: process?.startTimeTicks?.trim() ?? '',
+    processStartTimeNs: process?.startTimeNs?.trim() ?? '',
+    evidenceResourceHash: evidenceIndex.resourceHash ?? '',
+    evidenceCommandHash: evidenceIndex.commandHash ?? '',
+    correlationMethod: correlation?.method ?? '',
+    correlationConfidence: typeof correlation?.confidence === 'number' && Number.isFinite(correlation.confidence)
+      ? correlation.confidence
+      : 0,
     spanId: e.spanId,
     parentSpanId: e.parentSpanId ?? '',
     runId: e.runId,
@@ -821,7 +1214,8 @@ function toRow(e: JudgedEvent): Row {
     tokenCount: e.tokenCount,
     latencyMs: e.latencyMs,
     attributes: JSON.stringify(e.attributes ?? {}),
-    process: JSON.stringify(e.process ?? {}),
+    classificationSemantics: JSON.stringify(classificationSemantics ?? {}),
+    process: JSON.stringify(process ?? {}),
     attribution: JSON.stringify(attribution ?? {}),
     agentIdentityKey: agentIdentityKeyForEvent(e),
     agentInstanceKey: agentRuntimeInstanceIdForEvent(e),
@@ -862,11 +1256,49 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
   const activity = normalizeActivitySemantics(eventKind, rawActivityContext, rawActivitySubtype);
   const collectorId = str(r.collectorId) || attrString(attributes, 'collectorId') || undefined;
   const sourceId = str(r.sourceId) || attrString(attributes, 'sourceId') || undefined;
+  const rawAttribution = parseObject<AgentAttribution>(r.attribution);
+  const parsedCorrelation = parseTrustedCorrelation(rawAttribution?.correlation);
+  // Rows written before the additive columns existed may contain producer-controlled JSON under
+  // attribution.correlation. Treat the server-written narrow projection as the persistence trust
+  // marker, and make the kill switch restore the exact legacy read shape without rewriting data.
+  const correlation = correlationCaptureRollout().trustedCorrelation !== 'off' &&
+    parsedCorrelation &&
+    str(r.correlationMethod) === parsedCorrelation.method &&
+    str(r.invocationId) === (parsedCorrelation.invocationId ?? '') &&
+    str(r.toolCallId) === (parsedCorrelation.toolCallId ?? '') &&
+    str(r.processInstanceKey) === (parsedCorrelation.processInstanceId ?? '') &&
+    Math.abs(num(r.correlationConfidence) - parsedCorrelation.confidence) <= 0.000_01
+    ? parsedCorrelation
+    : undefined;
+  const attribution = !rawAttribution
+    ? undefined
+    : correlation
+      ? { ...rawAttribution, correlation }
+      : (({ correlation: _invalidCorrelation, ...legacyAttribution }) => legacyAttribution)(rawAttribution);
+  const invocationId = correlation?.invocationId;
+  const toolCallId = correlation?.toolCallId;
+  const classificationSemantics = visibleClassificationSemantics(
+    parseObject(r.classificationSemantics),
+  );
+  const captureEpoch = str(r.captureEpoch);
+  const hasCaptureDecision = captureEpoch !== '' && captureEpoch !== '0';
   return {
     schemaVersion: (str(r.schemaVersion) || 'anysentry.agent_event.v1') as JudgedEvent['schemaVersion'],
     eventId: str(r.eventId) || `evt_${at}_${agentId}_${eventKind}`,
     sourceEventId: str(r.sourceEventId) || undefined,
     at,
+    eventAtUnixNs: str(r.eventAtUnixNs) || undefined,
+    receivedAtUnixNs: str(r.receivedAtUnixNs) || undefined,
+    receivedAt: num(r.receivedAt) || undefined,
+    eventTimeQuality: (str(r.eventTimeQuality) || 'api_received') as JudgedEvent['eventTimeQuality'],
+    captureEpoch: hasCaptureDecision ? captureEpoch : undefined,
+    captureProfileCode: hasCaptureDecision ? num(r.captureProfileCode) : undefined,
+    captureActionCode: hasCaptureDecision ? num(r.captureActionCode) : undefined,
+    captureAuthorityCode: hasCaptureDecision ? num(r.captureAuthorityCode) : undefined,
+    captureDispositionCode: hasCaptureDecision ? num(r.captureDispositionCode) : undefined,
+    captureSelected: hasCaptureDecision ? num(r.captureSelected) > 0 : undefined,
+    captureFlags: hasCaptureDecision ? num(r.captureFlags) : undefined,
+    capturePolicyVersion: num(r.capturePolicyVersion) || undefined,
     eventKind,
     eventCategory: (str(r.eventCategory) || 'unknown') as JudgedEvent['eventCategory'],
     activityContext: activity.activityContext,
@@ -875,11 +1307,19 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
     subject: str(r.subject),
     workspacePath: str(r.workspacePath),
     agentId,
+    subjectAssetId: str(r.subjectAssetId) || undefined,
+    subjectAssetType: str(r.subjectAssetType) as JudgedEvent['subjectAssetType'] || undefined,
+    assetBindingQuality: str(r.assetBindingQuality) as JudgedEvent['assetBindingQuality'] || undefined,
+    assetBindingRevision: num(r.assetBindingRevision) || undefined,
+    assetBindingReason: str(r.assetBindingReason) || undefined,
+    identityRevision: num(r.identityRevision) || undefined,
     collectorId,
     sourceId,
     sessionId,
     userId: str(r.userId),
     traceId: str(r.traceId) || `tr_${agentId}_${sessionId}`,
+    ...(invocationId ? { invocationId } : {}),
+    ...(toolCallId ? { toolCallId } : {}),
     spanId: str(r.spanId) || `sp_${at}_${eventKind}`,
     parentSpanId: str(r.parentSpanId) || undefined,
     runId: str(r.runId) || sessionId,
@@ -902,10 +1342,43 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
     tokenCount: num(r.tokenCount),
     latencyMs: num(r.latencyMs),
     attributes,
-    process: parseObject<ProcessContext>(r.process),
-    attribution: parseObject<AgentAttribution>(r.attribution),
+    ...(classificationSemantics ? { classificationSemantics } : {}),
+    process: visibleProcessContext(parseObject<ProcessContext>(r.process)),
+    attribution,
     judgment: parseObject<NonNullable<JudgedEvent['judgment']>>(r.judgment),
     rawPreview: str(r.rawPreview) || undefined,
+  };
+}
+
+function storedToolEvidenceItem(
+  payload: unknown,
+  invocationId: string,
+  toolCallId: string,
+  evidenceVersion: string,
+  updatedAt: number,
+): ToolEvidenceItem | undefined {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined;
+  const item = payload as Partial<ToolEvidenceItem>;
+  if (item.invocationId !== invocationId || item.toolCallId !== toolCallId) return undefined;
+  if (typeof item.toolName !== 'string' || item.toolName.length > 120) return undefined;
+  if (!['linked', 'semantic_only', 'ambiguous'].includes(item.status ?? '')) return undefined;
+  if (![
+    'exact_process_and_resource',
+    'exact_child_and_command',
+    'overlapping_exact_claims',
+    'kernel_read_not_captured',
+    'no_matching_kernel_evidence',
+  ].includes(item.reason ?? '')) return undefined;
+  if (!Array.isArray(item.adapterEventIds) || item.adapterEventIds.length > 2_000) return undefined;
+  if (!Array.isArray(item.kernelEvidence) || item.kernelEvidence.length > 256) return undefined;
+  return {
+    ...(item as ToolEvidenceItem),
+    relation: {
+      schemaVersion: 'anysentry.tool_evidence_relation.v1',
+      relationVersion: TOOL_EVIDENCE_RELATION_VERSION,
+      evidenceVersion,
+      updatedAt,
+    },
   };
 }
 
@@ -920,6 +1393,12 @@ export class ClickHouseStore {
   private eventWriteBytes = 0;
   private eventWriteBatches: EventWriteBatch[] = [];
   private eventWriteBatchesByToken = new Map<string, EventWriteBatch>();
+  // This is a bounded process-local guard, not a durable idempotency registry. ClickHouse's stable
+  // insert token protects replay across ambiguous writes; this cache additionally rejects two
+  // different semantic payloads that claim the same (eventId, decisionRevision) while the API is
+  // running. A durable cross-restart conflict registry belongs to the later outbox phase.
+  private eventRevisionDigests = new Map<string, string>();
+  private committedEventRevisionDigests = new Map<string, string>();
   private eventWriteDrainInFlight?: Promise<void>;
   private eventWriteRetryWakeTimer?: NodeJS.Timeout;
   private eventWriteRetrySleep?: { timer: NodeJS.Timeout; wake: () => void };
@@ -933,6 +1412,8 @@ export class ClickHouseStore {
   private connectInFlight?: Promise<boolean>;
   private flushInFlight?: Promise<void>;
   private immediateWritesInFlight = 0;
+  /** ReplacingMergeTree versions must remain distinct across rapid consecutive S8 snapshots. */
+  private unknownLearningStateVersion = 0;
   private ready = false;
   private closed = false;
   private committedThroughMs?: number;
@@ -946,6 +1427,7 @@ export class ClickHouseStore {
     value: Promise<EventCommitCursor | null>;
   };
   private dashboardSnapshotSequence = 0;
+  private dashboardSnapshotWarmInFlight?: Promise<void>;
   private readonly dashboardSnapshotStats = {
     hits: 0,
     misses: 0,
@@ -953,6 +1435,7 @@ export class ClickHouseStore {
     exactRanges: 0,
     writtenBuckets: 0,
     fallbackErrors: 0,
+    rangeRejects: 0,
   };
 
   // Instance fields make the retry clock/delays replaceable by the standalone deterministic
@@ -1149,7 +1632,12 @@ export class ClickHouseStore {
     if (!this.ready) return;
     if (this.eventWritePermanentError) throw this.eventWritePermanentError;
     const queued = this.queuedEventRow(toRow(e));
+    this.assertEventRevisionConsistency([queued.row]);
+    const revisionKey = this.eventRevisionKey(queued.row);
+    const revisionDigest = this.eventRevisionDigest(queued.row);
+    if (this.eventRevisionDigests.get(revisionKey) === revisionDigest) return;
     this.assertEventWriteCapacity(queued.bytes);
+    this.rememberEventRevisionDigests([queued.row]);
     this.buf.push(queued);
     this.bufferedEventBytes += queued.bytes;
     this.eventWriteRows += 1;
@@ -1159,30 +1647,93 @@ export class ClickHouseStore {
   }
 
   /** Persist one lifecycle revision before acknowledging queue work. */
-  async insertNow(e: JudgedEvent): Promise<void> {
+  async insertNow(e: JudgedEvent, idempotencyKey?: string): Promise<void> {
+    return this.insertManyNow([e], idempotencyKey);
+  }
+
+  async eventById(eventId: string, eventAt?: number): Promise<JudgedEvent | undefined> {
+    const normalized = eventId.trim();
+    if (!normalized) return undefined;
+    const boundedAt = Number.isSafeInteger(eventAt) && Number(eventAt) >= 0
+      ? Number(eventAt)
+      : undefined;
+    return (await this.eventsByIds([normalized], boundedAt, boundedAt))[0];
+  }
+
+  /**
+   * Persist one bounded set of event revisions as one ClickHouse block.
+   *
+   * `idempotencyKey` identifies the immutable upstream batch. Retrying the same key and payload
+   * joins an in-flight write or reuses the same ClickHouse deduplication token. Callers must not
+   * mutate a batch while retaining its key.
+   */
+  async insertManyNow(events: readonly JudgedEvent[], idempotencyKey?: string): Promise<void> {
+    if (events.length === 0) return;
     if (!this.client || !this.ready || this.closing) throw new Error('ClickHouse is not ready');
     if (this.eventWritePermanentError) throw this.eventWritePermanentError;
-    const queued = this.queuedEventRow(toRow(e));
-    const token = this.directEventWriteToken(queued.row);
-    const existing = this.eventWriteBatchesByToken.get(token);
-    if (existing) {
-      const completion = new Promise<void>((resolve, reject) => existing.waiters.push({ resolve, reject }));
-      this.startEventWriteDrain();
-      return completion;
+    let queued = events.map((event) => this.queuedEventRow(toRow(event)));
+    this.assertEventRevisionConsistency(queued.map(({ row }) => row));
+    const uniqueRevisions = new Map<string, QueuedEventRow>();
+    for (const item of queued) {
+      const key = this.eventRevisionKey(item.row);
+      if (!uniqueRevisions.has(key)) uniqueRevisions.set(key, item);
+    }
+    queued = [...uniqueRevisions.values()];
+    const requestedBytes = queued.reduce((sum, row) => sum + row.bytes, 0);
+    if (queued.length > EVENT_WRITE_BATCH_ROWS || requestedBytes > EVENT_WRITE_BATCH_BYTES) {
+      throw Object.assign(
+        new Error(
+          `ClickHouse direct event batch exceeds ${EVENT_WRITE_BATCH_ROWS} rows or ${EVENT_WRITE_BATCH_BYTES} bytes`,
+        ),
+        {
+          code: EVENT_WRITE_BATCH_TOO_LARGE,
+          rows: queued.length,
+          bytes: requestedBytes,
+          maxRows: EVENT_WRITE_BATCH_ROWS,
+          maxBytes: EVENT_WRITE_BATCH_BYTES,
+        },
+      );
     }
 
-    this.assertEventWriteCapacity(queued.bytes);
-    // Preserve global event-write FIFO: a direct lifecycle revision may not jump over a partial
-    // buffered batch that was accepted earlier merely because the two-second timer has not fired.
+    // A direct durability waiter may overlap an earlier buffered delivery of the same immutable
+    // revision. Seal that tail, join its batch, and insert only genuinely new revisions.
     this.sealBufferedEventBatches(true);
-    const batch = this.createEventWriteBatch([queued], token, 'direct');
-    this.eventWriteRows += 1;
-    this.eventWriteBytes += queued.bytes;
+    const pendingByRevision = new Map<string, EventWriteBatch>();
+    for (const batch of this.eventWriteBatches) {
+      for (const row of batch.rows) pendingByRevision.set(this.eventRevisionKey(row), batch);
+    }
+    const joinedBatches = new Set<EventWriteBatch>();
+    queued = queued.filter(({ row }) => {
+      const key = this.eventRevisionKey(row);
+      const digest = this.eventRevisionDigest(row);
+      if (this.committedEventRevisionDigests.get(key) === digest) return false;
+      const pending = pendingByRevision.get(key);
+      if (!pending) return true;
+      joinedBatches.add(pending);
+      return false;
+    });
+    const completions = [...joinedBatches].map((batch) => (
+      new Promise<void>((resolve, reject) => batch.waiters.push({ resolve, reject }))
+    ));
+    if (queued.length === 0) {
+      this.startEventWriteDrain();
+      await Promise.all(completions);
+      return;
+    }
+
+    const bytes = queued.reduce((sum, row) => sum + row.bytes, 0);
+    const token = this.directEventWriteToken(queued.map(({ row }) => row), idempotencyKey);
+    this.assertEventWriteBatchCapacity(queued.length, bytes);
+    const batch = this.createEventWriteBatch(queued, token, 'direct');
+    this.rememberEventRevisionDigests(batch.rows);
+    this.eventWriteRows += queued.length;
+    this.eventWriteBytes += bytes;
     this.eventWriteBatches.push(batch);
     this.eventWriteBatchesByToken.set(token, batch);
     const completion = new Promise<void>((resolve, reject) => batch.waiters.push({ resolve, reject }));
+    completions.push(completion);
     this.startEventWriteDrain();
-    return completion;
+    await Promise.all(completions);
   }
 
   async flush(): Promise<void> {
@@ -1240,8 +1791,12 @@ export class ClickHouseStore {
   }
 
   private assertEventWriteCapacity(additionalBytes: number): void {
+    this.assertEventWriteBatchCapacity(1, additionalBytes);
+  }
+
+  private assertEventWriteBatchCapacity(additionalRows: number, additionalBytes: number): void {
     if (
-      this.eventWriteRows + 1 <= EVENT_WRITE_MAX_BUFFERED_ROWS &&
+      this.eventWriteRows + additionalRows <= EVENT_WRITE_MAX_BUFFERED_ROWS &&
       this.eventWriteBytes + additionalBytes <= EVENT_WRITE_MAX_BUFFERED_BYTES
     ) return;
     const error = Object.assign(
@@ -1310,12 +1865,174 @@ export class ClickHouseStore {
     return sealed;
   }
 
-  private directEventWriteToken(row: Row): string {
-    // `ingestedAt` is assigned for each attempt and must not split two callers persisting the same
-    // lifecycle revision into distinct batches. The stable evidence/revision payload defines the
-    // idempotency token; ClickHouse still stores the timestamp from the first accepted caller.
-    const { ingestedAt: _ingestedAt, ...stableRevision } = row;
-    return `event-${createHash('sha256').update(JSON.stringify(stableRevision)).digest('hex')}`;
+  private stableEventRevision(row: Row): Record<string, unknown> {
+    // Keep the legacy property order byte-for-byte when correlation is absent: rolling upgrades
+    // must calculate the same ClickHouse deduplication token for the same old event. Deleting the
+    // additive query projections leaves all pre-existing keys in their original insertion order.
+    const stableRevision = { ...row } as Record<string, unknown>;
+    delete stableRevision.ingestedAt;
+    delete stableRevision.invocationId;
+    delete stableRevision.toolCallId;
+    delete stableRevision.processInstanceKey;
+    delete stableRevision.processHostId;
+    delete stableRevision.processBootId;
+    delete stableRevision.processPid;
+    delete stableRevision.processPpid;
+    delete stableRevision.processPidNamespace;
+    delete stableRevision.processNamespacePid;
+    delete stableRevision.processNamespacePpid;
+    delete stableRevision.processStartTimeTicks;
+    delete stableRevision.processStartTimeNs;
+    delete stableRevision.evidenceResourceHash;
+    delete stableRevision.evidenceCommandHash;
+    delete stableRevision.correlationMethod;
+    delete stableRevision.correlationConfidence;
+    delete stableRevision.classificationSemantics;
+    const process = String(stableRevision.process ?? '');
+    try {
+      const parsed = JSON.parse(process) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        delete parsed.lifecycleSource;
+        delete parsed.lifecycleReason;
+        stableRevision.process = JSON.stringify(parsed);
+      }
+    } catch {
+      // Preserve malformed legacy payloads byte-for-byte in the token.
+    }
+    const attribution = String(stableRevision.attribution ?? '');
+    try {
+      const parsed = JSON.parse(attribution) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && 'correlation' in parsed) {
+        delete parsed.correlation;
+        // Reassigning an existing property does not change its insertion order.
+        stableRevision.attribution = JSON.stringify(parsed);
+      }
+    } catch {
+      // Preserve malformed legacy payloads byte-for-byte in the token.
+    }
+    return stableRevision;
+  }
+
+  private eventRevisionKey(row: Row): string {
+    return `${row.eventId}\0${Math.max(1, Math.trunc(Number(row.decisionRevision) || 1))}`;
+  }
+
+  private eventRevisionDigest(row: Row): string {
+    // Receipt timestamps and generated span ids may legitimately change when an old observer client
+    // retries a sourceEventId. They do not change the semantic revision. Every decision/evidence
+    // field remains covered so a real revision conflict is still rejected.
+    const {
+      ingestedAt: _ingestedAt,
+      at: _at,
+      decisionUpdatedAt: _decisionUpdatedAt,
+      spanId: _spanId,
+      invocationId: _invocationId,
+      toolCallId: _toolCallId,
+      processInstanceKey: _processInstanceKey,
+      processHostId: _processHostId,
+      processBootId: _processBootId,
+      processPid: _processPid,
+      processPpid: _processPpid,
+      processPidNamespace: _processPidNamespace,
+      processNamespacePid: _processNamespacePid,
+      processNamespacePpid: _processNamespacePpid,
+      processStartTimeTicks: _processStartTimeTicks,
+      processStartTimeNs: _processStartTimeNs,
+      evidenceResourceHash: _evidenceResourceHash,
+      evidenceCommandHash: _evidenceCommandHash,
+      correlationMethod: _correlationMethod,
+      correlationConfidence: _correlationConfidence,
+      classificationSemantics: _classificationSemantics,
+      attribution,
+      ...semanticRevision
+    } = row;
+    const process = String(semanticRevision.process ?? '');
+    try {
+      const parsed = JSON.parse(process) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        delete parsed.lifecycleSource;
+        delete parsed.lifecycleReason;
+        // Reassigning preserves the legacy Row property order used by rolling versions.
+        semanticRevision.process = JSON.stringify(parsed);
+      }
+    } catch {
+      // Preserve malformed legacy payloads byte-for-byte in the digest.
+    }
+    // Correlation is a rollout-derived, additive view. The same immutable source/decision revision
+    // may legitimately be retried while a node moves between off and shadow. Exclude only that
+    // nested view (and its query projections) from the revision digest; every pre-existing
+    // attribution, decision, evidence, and payload field remains conflict-protected.
+    let stableAttribution = attribution;
+    try {
+      const parsed = JSON.parse(attribution) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        delete parsed.correlation;
+        stableAttribution = JSON.stringify(parsed);
+      }
+    } catch {
+      // Preserve malformed legacy payloads byte-for-byte in the digest.
+    }
+    return createHash('sha256')
+      .update(JSON.stringify({ ...semanticRevision, attribution: stableAttribution }))
+      .digest('hex');
+  }
+
+  private assertEventRevisionConsistency(rows: readonly Row[]): void {
+    const pending = new Map<string, string>();
+    for (const row of rows) {
+      const key = this.eventRevisionKey(row);
+      const digest = this.eventRevisionDigest(row);
+      const existing = pending.get(key) ?? this.eventRevisionDigests.get(key);
+      if (existing && existing !== digest) {
+        throw Object.assign(
+          new Error(`event revision conflict for ${row.eventId} revision ${row.decisionRevision}`),
+          {
+            code: EVENT_REVISION_CONFLICT,
+            eventId: row.eventId,
+            decisionRevision: row.decisionRevision,
+          },
+        );
+      }
+      pending.set(key, digest);
+    }
+  }
+
+  private rememberEventRevisionDigests(rows: readonly Row[]): void {
+    for (const row of rows) {
+      const key = this.eventRevisionKey(row);
+      if (this.eventRevisionDigests.has(key)) this.eventRevisionDigests.delete(key);
+      this.eventRevisionDigests.set(key, this.eventRevisionDigest(row));
+    }
+    while (this.eventRevisionDigests.size > EVENT_REVISION_DIGEST_CACHE_SIZE) {
+      const oldest = this.eventRevisionDigests.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.eventRevisionDigests.delete(oldest);
+    }
+  }
+
+  private rememberCommittedEventRevisionDigests(rows: readonly Row[]): void {
+    for (const row of rows) {
+      const key = this.eventRevisionKey(row);
+      if (this.committedEventRevisionDigests.has(key)) this.committedEventRevisionDigests.delete(key);
+      this.committedEventRevisionDigests.set(key, this.eventRevisionDigest(row));
+    }
+    while (this.committedEventRevisionDigests.size > EVENT_REVISION_DIGEST_CACHE_SIZE) {
+      const oldest = this.committedEventRevisionDigests.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.committedEventRevisionDigests.delete(oldest);
+    }
+  }
+
+  private directEventWriteToken(rows: readonly Row[], idempotencyKey?: string): string {
+    const hash = createHash('sha256');
+    if (idempotencyKey) hash.update('upstream\0').update(idempotencyKey);
+    else {
+      hash.update('revisions\0');
+      for (const row of rows) {
+        hash.update(JSON.stringify(this.stableEventRevision(row))).update('\n');
+      }
+    }
+    return `event-${hash.digest('hex')}`;
   }
 
   private startEventWriteDrain(): void {
@@ -1364,6 +2081,7 @@ export class ClickHouseStore {
           ...batch.rows.map((row) => Number(row.at) || 0),
         );
         this.noteCommittedRows(batch.rows);
+        this.rememberCommittedEventRevisionDigests(batch.rows);
         this.eventWriteBatches.shift();
         this.eventWriteBatchesByToken.delete(batch.token);
         this.eventWriteRows = Math.max(0, this.eventWriteRows - batch.rows.length);
@@ -1635,44 +2353,16 @@ export class ClickHouseStore {
   /** Load the most-recent `limit` events at/after `sinceMs`, oldest-first (to seed the hot ring). */
 
   async hydrate(sinceMs: number, limit: number): Promise<JudgedEvent[]> {
-    if (!this.client) return [];
-    const safeLimit = Math.max(1, Math.min(100_000, Math.round(limit)));
-    try {
-      const rs = await this.client.query({
-        // Bound the primary-key scan before revision ordering, but keep every row at the cutoff
-        // timestamp so lifecycle revisions cannot be split. Server-side dedup means the API parses
-        // only the hot-ring result instead of three times as many wide JSON rows during startup.
-        query: `
-          SELECT *
-          FROM (
-            SELECT *
-            FROM ${TABLE}
-            PREWHERE at >= {since:UInt64}
-            ORDER BY at DESC
-            LIMIT {scanLimit:UInt32} WITH TIES
-          )
-          ORDER BY at DESC, decisionUpdatedAt DESC
-          LIMIT 1 BY eventId
-          LIMIT {limit:UInt32}`,
-        query_params: {
-          since: sinceMs,
-          scanLimit: Math.min(safeLimit * 3, 300_000),
-          limit: safeLimit,
-        },
-        clickhouse_settings: BOUNDED_HYDRATE_READ_SETTINGS,
-        format: 'JSONEachRow',
-      });
-      const rows = (await rs.json()) as Array<Record<string, unknown>>;
-      const latest = new Map<string, JudgedEvent>();
-      for (const event of rows.map(fromRow)) {
-        const previous = latest.get(event.eventId);
-        if (!previous || (event.decisionUpdatedAt ?? event.at) >= (previous.decisionUpdatedAt ?? previous.at)) latest.set(event.eventId, event);
-      }
-      return [...latest.values()].sort((a, b) => a.at - b.at).slice(-safeLimit);
-    } catch (err) {
-      console.error('[clickhouse] hydrate failed:', (err as Error).message);
-      return [];
-    }
+    const safeLimit = Math.max(1, Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, Math.round(limit)));
+    // Reuse the durable search's narrow locator sort and late materialization. The former
+    // SELECT-* Top-N hydration path could exhaust 640 MiB merely reading `attributes` from a busy
+    // 30-day part, leaving the API healthy but its hot cache empty after every restart.
+    const events = await this.searchEvents({
+      sinceMs,
+      untilMs: Date.now(),
+      limit: safeLimit,
+    });
+    return (events ?? []).sort((left, right) => left.at - right.at).slice(-safeLimit);
   }
 
   /** Read the latest persisted events from a bounded interval for dashboard timelines. */
@@ -1876,7 +2566,7 @@ export class ClickHouseStore {
 
   /**
    * Read the complete persisted tail without an arbitrary row limit. The interval is intentionally
-   * short (the Dashboard uses 60 seconds), and the latest decision revision is selected before the
+   * short (the Dashboard uses one absolute bucket), and the latest decision revision is selected before the
    * result is merged with the in-process hot ring.
    */
   async dashboardTailEvents(startMs: number, endMs: number): Promise<JudgedEvent[] | null> {
@@ -1885,19 +2575,32 @@ export class ClickHouseStore {
     try {
       const result = await this.client.query({
         query: `
-          SELECT *
-          FROM (
-            SELECT *
-            FROM ${TABLE}
-            WHERE at >= {start:UInt64} AND at <= {end:UInt64}
-            ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
-            LIMIT 1 BY eventId
-          )
-          ORDER BY at, eventId`,
+          SELECT sourceEvent.*
+          FROM ${TABLE} AS sourceEvent
+          PREWHERE
+            sourceEvent.at >= {start:UInt64}
+            AND sourceEvent.at <= {end:UInt64}
+            AND tuple(sourceEvent.at, sourceEvent._part, sourceEvent._part_offset) IN (
+              SELECT
+                tupleElement(locator, 1),
+                tupleElement(locator, 2),
+                tupleElement(locator, 3)
+              FROM (
+                SELECT argMax(
+                  tuple(at, _part, _part_offset),
+                  tuple(decisionRevision, decisionUpdatedAt, at)
+                ) AS locator
+                FROM ${TABLE}
+                PREWHERE at >= {start:UInt64} AND at <= {end:UInt64}
+                GROUP BY eventId
+              )
+            )
+          ORDER BY sourceEvent.at, sourceEvent.eventId`,
         query_params: {
           start: Math.max(0, Math.trunc(startMs)),
           end: Math.max(0, Math.trunc(endMs)),
         },
+        clickhouse_settings: BOUNDED_EVENT_SEARCH_READ_SETTINGS,
         format: 'JSONEachRow',
       });
       return (await result.json() as Array<Record<string, unknown>>).map(fromRow);
@@ -1921,7 +2624,17 @@ export class ClickHouseStore {
       process.env.ANYSENTRY_PERSISTED_DASHBOARD_BUCKETS !== 'off' &&
       start % size === 0 &&
       end % size === 0;
-    if (!canPersist) return this.queryDashboardAggregateBucketFactsRaw(start, end, size);
+    if (!canPersist) {
+      // Cache boundary slices are at most one bucket wide. Refuse an accidentally unaligned wide
+      // scan instead of bypassing the persisted-snapshot admission control.
+      if (end - start > DASHBOARD_BUCKET_BUILD_CHUNK_MS) return null;
+      return this.queryDashboardAggregateBucketFactsRaw(start, end, size);
+    }
+    const requestedBuckets = Math.ceil((end - start) / size);
+    if (requestedBuckets > DASHBOARD_PERSISTED_READ_MAX_BUCKETS) {
+      this.dashboardSnapshotStats.rangeRejects += 1;
+      return null;
+    }
 
     try {
       const stored = await this.readPersistedDashboardBuckets(start, end, size);
@@ -1941,44 +2654,24 @@ export class ClickHouseStore {
         }
       }
 
-      // A very fragmented retained snapshot set should not turn into a query fan-out. Recompute
-      // one bounded span and replace all buckets in it instead.
-      const ranges = missingRanges.length > 8
-        ? [{ start: missingRanges[0].start, end: missingRanges.at(-1)!.end }]
-        : missingRanges;
-      for (const range of ranges) {
-        this.dashboardSnapshotStats.exactRanges += 1;
-        const before = await this.latestEventCommitCursor();
-        const rows = await this.queryDashboardAggregateBucketFactsRaw(
-          range.start,
-          range.end,
-          size,
-        );
-        if (rows === null) return null;
-        const grouped = new Map<number, DashboardAggregateBucketFact[]>();
-        for (const row of rows) {
-          const bucketRows = grouped.get(row.bucketStartMs) ?? [];
-          bucketRows.push(row);
-          grouped.set(row.bucketStartMs, bucketRows);
+      // Cold bootstrap must not fold several hours of high-cardinality events in one query. Split
+      // missing history into fixed absolute chunks and build only a bounded number per request.
+      // Successful chunks are durable, so later polls resume instead of repeating prior work.
+      const chunkMs = Math.max(size, Math.floor(DASHBOARD_BUCKET_BUILD_CHUNK_MS / size) * size);
+      const buildRanges = missingRanges.flatMap((range) => {
+        const chunks: Array<{ start: number; end: number }> = [];
+        for (let chunkStart = range.start; chunkStart < range.end; chunkStart += chunkMs) {
+          chunks.push({ start: chunkStart, end: Math.min(range.end, chunkStart + chunkMs) });
         }
-        for (let bucket = range.start; bucket < range.end; bucket += size) {
-          byBucket.set(bucket, grouped.get(bucket) ?? []);
-        }
-
-        const after = await this.latestEventCommitCursor();
-        if (
-          before &&
-          after &&
-          compareEventCommitCursor(before, after) === 0
-        ) {
-          await this.writePersistedDashboardBuckets(
-            range.start,
-            range.end,
-            size,
-            after,
-            grouped,
-          );
-        }
+        return chunks;
+      });
+      if (buildRanges.length > 0) {
+        // Snapshot warming is deliberately detached from the HTTP request. The dashboard can show
+        // its bounded hot/partial view immediately, while one single-flight worker materialises a
+        // few small durable chunks for subsequent refreshes. Additional requests never create a
+        // queue of raw scans.
+        this.scheduleDashboardBucketWarm(buildRanges, size);
+        return null;
       }
 
       const result: DashboardAggregateBucketFact[] = [];
@@ -1989,11 +2682,62 @@ export class ClickHouseStore {
     } catch (error) {
       this.dashboardSnapshotStats.fallbackErrors += 1;
       console.warn(
-        '[clickhouse] persisted dashboard bucket cache unavailable; using exact raw aggregation:',
+        '[clickhouse] persisted dashboard bucket cache unavailable; returning bounded hot fallback:',
         (error as Error).message,
       );
-      return this.queryDashboardAggregateBucketFactsRaw(start, end, size);
+      return null;
     }
+  }
+
+  private scheduleDashboardBucketWarm(
+    buildRanges: ReadonlyArray<{ start: number; end: number }>,
+    bucketMs: number,
+  ): void {
+    if (this.dashboardSnapshotWarmInFlight || buildRanges.length === 0 || this.closing) return;
+    const ranges = buildRanges.slice(0, DASHBOARD_BUCKET_BUILD_MAX_CHUNKS);
+    let tracked!: Promise<void>;
+    tracked = (async () => {
+      for (const range of ranges) {
+        if (this.closing || !this.ready) return;
+        const before = await this.latestEventCommitCursor();
+        if (!before) return;
+        this.dashboardSnapshotStats.exactRanges += 1;
+        const rows = await this.queryDashboardAggregateBucketFactsRaw(
+          range.start,
+          range.end,
+          bucketMs,
+        );
+        if (rows === null) return;
+        const grouped = new Map<number, DashboardAggregateBucketFact[]>();
+        for (const row of rows) {
+          const bucketRows = grouped.get(row.bucketStartMs) ?? [];
+          bucketRows.push(row);
+          grouped.set(row.bucketStartMs, bucketRows);
+        }
+        // The snapshot is fenced by the cursor captured before the query. Commits racing this
+        // build have a later journal cursor, so readers invalidate only their affected buckets.
+        await this.writePersistedDashboardBuckets(
+          range.start,
+          range.end,
+          bucketMs,
+          before,
+          grouped,
+        );
+        // Yield between chunks so ingestion continuations and control-plane HTTP work are not
+        // starved even when ClickHouse answers several warm-up queries immediately.
+        await delay(25);
+      }
+    })()
+      .catch((error) => {
+        this.dashboardSnapshotStats.fallbackErrors += 1;
+        console.warn('[clickhouse] dashboard bucket background warm failed:', (error as Error).message);
+      })
+      .finally(() => {
+        if (this.dashboardSnapshotWarmInFlight === tracked) {
+          this.dashboardSnapshotWarmInFlight = undefined;
+        }
+      });
+    this.dashboardSnapshotWarmInFlight = tracked;
   }
 
   /**
@@ -2013,8 +2757,8 @@ export class ClickHouseStore {
       const result = await this.client.query({
         query: `
           SELECT
-            intDiv(at, {bucketMs:UInt64}) * {bucketMs:UInt64} AS bucketStart,
-            JSONExtractBool(attribution, 'monitored') AS monitored,
+            intDiv(eventAt, {bucketMs:UInt64}) * {bucketMs:UInt64} AS bucketStart,
+            monitored,
             decisionStatus,
             verdict,
             tier,
@@ -2022,25 +2766,9 @@ export class ClickHouseStore {
             riskCategory,
             riskName,
             multiIf(severity = 'critical', 4, severity = 'high', 3, severity = 'medium', 2, severity = 'low', 1, 0) AS severityRank,
-            if(
-              JSONExtractString(attribution, 'agentSessionId') != '',
-              JSONExtractString(attribution, 'agentSessionId'),
-              if(
-                JSONExtractString(attribution, 'agentDisplayName') != '',
-                JSONExtractString(attribution, 'agentDisplayName'),
-                if(JSONExtractString(attribution, 'agentScopeId') != '', JSONExtractString(attribution, 'agentScopeId'), agentId)
-              )
-            ) AS sessionKey,
+            if(agentSessionId != '', agentSessionId, if(agentDisplayName != '', agentDisplayName, if(agentScopeId != '', agentScopeId, agentId))) AS sessionKey,
             userId,
-            if(
-              JSONExtractString(process, 'cwd') != '',
-              JSONExtractString(process, 'cwd'),
-              if(
-                JSONExtractString(attribution, 'agentScopeId') != '',
-                concat('agent://', JSONExtractString(attribution, 'agentScopeId')),
-                workspacePath
-              )
-            ) AS resolvedWorkspacePath,
+            if(processCwd != '', processCwd, if(agentScopeId != '', concat('agent://', agentScopeId), workspacePath)) AS resolvedWorkspacePath,
             count() AS eventCount,
             countIf(verdict = 'block' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS blockedCount,
             countIf(verdict = 'escalate' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS escalatedCount,
@@ -2051,18 +2779,37 @@ export class ClickHouseStore {
             sumIf(tokenCount, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS tokenCount,
             sumIf(latencyMs, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS latencyTotal,
             sumIf(riskScore, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS riskScoreTotal,
-            max(at) AS lastEventAt,
+            max(eventAt) AS lastEventAt,
             countIf(verdict != 'allow' AND riskCategory = 'command_danger') AS commandDangerCount,
             countIf(verdict != 'allow' AND riskCategory = 'prompt_injection') AS promptInjectionCount,
             countIf(verdict != 'allow' AND riskCategory IN ('data_leak', 'secret_exfil')) AS dataLeakCount,
             countIf(verdict != 'allow' AND riskCategory = 'communication_risk') AS communicationRiskCount,
             countIf(verdict != 'allow' AND riskCategory IN ('systemic_risk', 'privilege_escalation')) AS systemicRiskCount
           FROM (
-            SELECT *
+            SELECT
+              eventId,
+              argMax(at, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventAt,
+              argMax(JSONExtractBool(attribution, 'monitored'), tuple(decisionRevision, decisionUpdatedAt, at)) AS monitored,
+              argMax(JSONExtractString(attribution, 'agentSessionId'), tuple(decisionRevision, decisionUpdatedAt, at)) AS agentSessionId,
+              argMax(JSONExtractString(attribution, 'agentDisplayName'), tuple(decisionRevision, decisionUpdatedAt, at)) AS agentDisplayName,
+              argMax(JSONExtractString(attribution, 'agentScopeId'), tuple(decisionRevision, decisionUpdatedAt, at)) AS agentScopeId,
+              argMax(JSONExtractString(process, 'cwd'), tuple(decisionRevision, decisionUpdatedAt, at)) AS processCwd,
+              argMax(decisionStatus, tuple(decisionRevision, decisionUpdatedAt, at)) AS decisionStatus,
+              argMax(verdict, tuple(decisionRevision, decisionUpdatedAt, at)) AS verdict,
+              argMax(tier, tuple(decisionRevision, decisionUpdatedAt, at)) AS tier,
+              argMax(riskType, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskType,
+              argMax(riskCategory, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskCategory,
+              argMax(riskName, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskName,
+              argMax(severity, tuple(decisionRevision, decisionUpdatedAt, at)) AS severity,
+              argMax(agentId, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentId,
+              argMax(userId, tuple(decisionRevision, decisionUpdatedAt, at)) AS userId,
+              argMax(workspacePath, tuple(decisionRevision, decisionUpdatedAt, at)) AS workspacePath,
+              argMax(tokenCount, tuple(decisionRevision, decisionUpdatedAt, at)) AS tokenCount,
+              argMax(latencyMs, tuple(decisionRevision, decisionUpdatedAt, at)) AS latencyMs,
+              argMax(riskScore, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskScore
             FROM ${TABLE}
-            WHERE at >= {start:UInt64} AND at < {end:UInt64}
-            ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
-            LIMIT 1 BY eventId
+            PREWHERE at >= {start:UInt64} AND at < {end:UInt64}
+            GROUP BY eventId
           )
           GROUP BY
             bucketStart, monitored, decisionStatus, verdict, tier, riskType, riskCategory, riskName,
@@ -2073,6 +2820,7 @@ export class ClickHouseStore {
           end: Math.max(0, Math.trunc(endExclusiveMs)),
           bucketMs: size,
         },
+        clickhouse_settings: BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS,
         format: 'JSONEachRow',
       });
       const num = (value: unknown): number => Number(value) || 0;
@@ -2497,16 +3245,19 @@ export class ClickHouseStore {
     const sampleConditions: string[] = [];
     const latestConditions: string[] = [];
     const activeMutableColumns: string[] = [];
-    const queryParams: Record<string, string | number> = { since: input.sinceMs, until: input.untilMs };
+    const queryParams: Record<string, unknown> = { since: input.sinceMs, until: input.untilMs };
     const stableFields: Array<[keyof StoredEventQuery, string]> = [
       ['eventId', 'eventId'],
       ['sourceId', 'sourceId'],
       ['collectorId', 'collectorId'],
       ['agentId', 'agentId'],
+      ['subjectAssetId', 'subjectAssetId'],
       ['agentInstanceId', 'agentInstanceKey'],
       ['sessionId', 'sessionId'],
       ['workspacePath', 'workspacePath'],
       ['traceId', 'traceId'],
+      ['invocationId', 'invocationId'],
+      ['toolCallId', 'toolCallId'],
       ['runId', 'runId'],
       ['eventKind', 'eventKind'],
       ['eventCategory', 'eventCategory'],
@@ -2520,6 +3271,48 @@ export class ClickHouseStore {
       if (typeof value !== 'string' || !value.trim()) continue;
       sampleConditions.push(`${column} = {${String(key)}:String}`);
       queryParams[String(key)] = value.trim();
+    }
+    const processStringPredicates: Array<[
+      'processHostId' | 'processBootId' | 'processPidNamespace' | 'processStartTimeTicks' | 'processStartTimeNs',
+      string,
+    ]> = [
+      ['processHostId', 'processHostId'],
+      ['processBootId', 'processBootId'],
+      ['processPidNamespace', 'processPidNamespace'],
+      ['processStartTimeTicks', 'processStartTimeTicks'],
+      ['processStartTimeNs', 'processStartTimeNs'],
+    ];
+    for (const [queryKey, column] of processStringPredicates) {
+      const value = input[queryKey];
+      if (typeof value !== 'string' || !value.trim()) continue;
+      sampleConditions.push(`${column} = {${queryKey}:String}`);
+      queryParams[queryKey] = value.trim();
+    }
+    for (const [queryKey, column] of [
+      ['processPid', 'processPid'],
+      ['processPpid', 'processPpid'],
+      ['processNamespacePid', 'processNamespacePid'],
+      ['processNamespacePpid', 'processNamespacePpid'],
+    ] as const) {
+      const value = input[queryKey];
+      if (!Number.isSafeInteger(value) || Number(value) <= 0) continue;
+      sampleConditions.push(`${column} = {${queryKey}:UInt64}`);
+      queryParams[queryKey] = Number(value);
+    }
+    const boundedEvidenceHashes = (values: string[] | undefined): string[] => [...new Set(
+      (values ?? [])
+        .map((value) => value.trim().toLowerCase())
+        .filter((value) => /^[a-f0-9]{64}$/u.test(value)),
+    )].slice(0, 1_000);
+    const resourceHashes = boundedEvidenceHashes(input.evidenceResourceHashes);
+    const commandHashes = boundedEvidenceHashes(input.evidenceCommandHashes);
+    if (resourceHashes.length > 0) {
+      sampleConditions.push('evidenceResourceHash IN {evidenceResourceHashes:Array(String)}');
+      queryParams.evidenceResourceHashes = resourceHashes;
+    }
+    if (commandHashes.length > 0) {
+      sampleConditions.push('evidenceCommandHash IN {evidenceCommandHashes:Array(String)}');
+      queryParams.evidenceCommandHashes = commandHashes;
     }
     const activityContext = input.activityContext?.trim();
     if (activityContext) {
@@ -2552,8 +3345,16 @@ export class ClickHouseStore {
     }
     const rowLimit = Math.max(1, Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, Math.round(input.limit)));
     queryParams.limit = rowLimit;
-    queryParams.scanLimit = Math.min(300_000, Math.max(rowLimit * 3, latestConditions.length ? 15_000 : 0));
-    const queryKey = JSON.stringify({ queryParams, monitoredOnly: input.monitoredOnly === true });
+    const requestedCandidateLimit = Number(input.candidateLimit);
+    queryParams.scanLimit = Math.min(300_000, Math.max(
+      rowLimit,
+      Number.isFinite(requestedCandidateLimit) ? Math.round(requestedCandidateLimit) : rowLimit * 3,
+      latestConditions.length ? 15_000 : 0,
+    ));
+    const queryKey = JSON.stringify({
+      queryParams,
+      monitoredOnly: input.monitoredOnly === true,
+    });
     const current = this.eventSearchInFlight;
     if (current) {
       if (current.key !== queryKey) return null;
@@ -2650,6 +3451,293 @@ export class ClickHouseStore {
     };
   }
 
+  async readToolEvidenceRelations(
+    invocationIdInput: string,
+    toolCallIdInput?: string,
+    scope: ToolEvidenceRelationScope = {},
+  ): Promise<StoredToolEvidenceRelations | null> {
+    const invocationId = invocationIdInput.trim();
+    const toolCallId = toolCallIdInput?.trim();
+    if (!this.client || !this.ready || !invocationId || invocationId.length > 512) return null;
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT invocationId, toolCallId, workspacePath, sourceId, agentInstanceId,
+            relationVersion, evidenceVersion, itemCount, updatedAt, payload
+          FROM ${TOOL_EVIDENCE_RELATION_TABLE} FINAL
+          WHERE invocationId = {invocationId:String}
+            ${toolCallId ? 'AND toolCallId = {toolCallId:String}' : ''}
+            ${scope.workspacePath ? 'AND workspacePath = {workspacePath:String}' : ''}
+            ${scope.sourceId ? 'AND sourceId = {sourceId:String}' : ''}
+            ${scope.agentInstanceId ? 'AND agentInstanceId = {agentInstanceId:String}' : ''}
+            AND relationVersion = ${TOOL_EVIDENCE_RELATION_VERSION}
+          ORDER BY toolCallId
+          LIMIT 1000`,
+        query_params: {
+          invocationId,
+          ...(toolCallId ? { toolCallId } : {}),
+          ...(scope.workspacePath ? { workspacePath: scope.workspacePath } : {}),
+          ...(scope.sourceId ? { sourceId: scope.sourceId } : {}),
+          ...(scope.agentInstanceId ? { agentInstanceId: scope.agentInstanceId } : {}),
+        },
+        clickhouse_settings: BOUNDED_TOOL_EVIDENCE_RELATION_SETTINGS,
+        format: 'JSONEachRow',
+      });
+      const rows = (await result.json()) as Array<Record<string, unknown>>;
+      const items: ToolEvidenceItem[] = [];
+      let evidenceVersion: string | undefined;
+      let updatedAt: number | undefined;
+      let expectedCount: number | undefined;
+      let relationScopeKey: string | undefined;
+      for (const row of rows) {
+        const rowInvocationId = String(row.invocationId ?? '');
+        const rowToolCallId = String(row.toolCallId ?? '');
+        const rowEvidenceVersion = String(row.evidenceVersion ?? '');
+        const rowUpdatedAt = Number(row.updatedAt);
+        const rowCount = Number(row.itemCount);
+        const rowScopeKey = [row.workspacePath, row.sourceId, row.agentInstanceId].map(String).join('\0');
+        if (
+          rowInvocationId !== invocationId ||
+          !rowToolCallId ||
+          !/^[a-f0-9]{64}$/u.test(rowEvidenceVersion) ||
+          !Number.isFinite(rowUpdatedAt) ||
+          !Number.isSafeInteger(rowCount) ||
+          rowCount < 1 ||
+          rowCount > 1_000
+        ) continue;
+        if (evidenceVersion && evidenceVersion !== rowEvidenceVersion) return { items: [] };
+        if (expectedCount !== undefined && expectedCount !== rowCount) return { items: [] };
+        if (relationScopeKey && relationScopeKey !== rowScopeKey) return { items: [] };
+        let payload: unknown;
+        try {
+          payload = JSON.parse(String(row.payload ?? '')) as unknown;
+        } catch {
+          continue;
+        }
+        const item = storedToolEvidenceItem(
+          payload,
+          rowInvocationId,
+          rowToolCallId,
+          rowEvidenceVersion,
+          rowUpdatedAt,
+        );
+        if (!item) continue;
+        items.push(item);
+        evidenceVersion = rowEvidenceVersion;
+        expectedCount = rowCount;
+        relationScopeKey = rowScopeKey;
+        updatedAt = Math.max(updatedAt ?? 0, rowUpdatedAt);
+      }
+      if (!toolCallId && expectedCount !== undefined && items.length !== expectedCount) {
+        return { items: [] };
+      }
+      return { items, evidenceVersion, updatedAt };
+    } catch (error) {
+      console.error('[clickhouse] ToolEvidence relation query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  async writeToolEvidenceRelations(
+    items: readonly ToolEvidenceItem[],
+    evidenceVersion: string,
+    scope: Required<ToolEvidenceRelationScope>,
+    updatedAt = Date.now(),
+  ): Promise<boolean> {
+    if (!this.client || !this.ready || items.length === 0 || items.length > 1_000) return false;
+    if (!/^[a-f0-9]{64}$/u.test(evidenceVersion)) return false;
+    const invocationIds = new Set(items.map((item) => item.invocationId));
+    if (
+      invocationIds.size !== 1 ||
+      items.some((item) => !item.toolCallId) ||
+      !scope.workspacePath ||
+      !scope.sourceId ||
+      !scope.agentInstanceId
+    ) return false;
+    try {
+      await this.client.insert({
+        table: TOOL_EVIDENCE_RELATION_TABLE,
+        values: items.map(({ relation: _relation, ...item }) => ({
+          invocationId: item.invocationId,
+          toolCallId: item.toolCallId,
+          workspacePath: scope.workspacePath,
+          sourceId: scope.sourceId,
+          agentInstanceId: scope.agentInstanceId,
+          relationVersion: TOOL_EVIDENCE_RELATION_VERSION,
+          evidenceVersion,
+          itemCount: items.length,
+          updatedAt,
+          payload: JSON.stringify(item),
+        })),
+        format: 'JSONEachRow',
+      });
+      return true;
+    } catch (error) {
+      console.error('[clickhouse] ToolEvidence relation insert failed:', (error as Error).message);
+      return false;
+    }
+  }
+
+  private processLifecycleFactFromRow(row: Record<string, unknown>): ProcessLifecycleFact {
+    return {
+      schemaVersion: 'anysentry.process_lifecycle_fact.v1',
+      factId: String(row.factId ?? ''),
+      eventId: String(row.eventId ?? ''),
+      ...(String(row.sourceEventId ?? '') ? { sourceEventId: String(row.sourceEventId) } : {}),
+      factKind: row.factKind === 'exit' ? 'exit' : 'exec',
+      at: Number(row.at),
+      receivedAt: Number(row.receivedAt),
+      source: String(row.source ?? 'observer') as ProcessLifecycleFact['source'],
+      ...(String(row.sourceId ?? '') ? { sourceId: String(row.sourceId) } : {}),
+      ...(String(row.collectorId ?? '') ? { collectorId: String(row.collectorId) } : {}),
+      workspacePath: String(row.workspacePath ?? ''),
+      ...(String(row.subjectAssetId ?? '') ? { subjectAssetId: String(row.subjectAssetId) } : {}),
+      ...(String(row.subjectAssetType ?? '')
+        ? { subjectAssetType: String(row.subjectAssetType) as ProcessLifecycleFact['subjectAssetType'] }
+        : {}),
+      ...(String(row.assetBindingQuality ?? '')
+        ? { assetBindingQuality: String(row.assetBindingQuality) as ProcessLifecycleFact['assetBindingQuality'] }
+        : {}),
+      ...(Number(row.assetBindingRevision) > 0 ? { assetBindingRevision: Number(row.assetBindingRevision) } : {}),
+      ...(String(row.assetBindingReason ?? '') ? { assetBindingReason: String(row.assetBindingReason) } : {}),
+      ...(String(row.runtimeInstanceId ?? '') ? { runtimeInstanceId: String(row.runtimeInstanceId) } : {}),
+      ...(Number(row.rootProcess) > 0 ? { rootProcess: true } : {}),
+      ...(Number(row.identityRevision) > 0 ? { identityRevision: Number(row.identityRevision) } : {}),
+      processInstanceKey: String(row.processInstanceKey ?? ''),
+      ...(String(row.physicalWorkloadId ?? '') ? { physicalWorkloadId: String(row.physicalWorkloadId) } : {}),
+      ...(String(row.hostId ?? '') ? { hostId: String(row.hostId) } : {}),
+      bootId: String(row.bootId ?? ''),
+      pid: Number(row.pid),
+      ...(Number(row.ppid) > 0 ? { ppid: Number(row.ppid) } : {}),
+      ...(String(row.pidNamespace ?? '') ? { pidNamespace: String(row.pidNamespace) } : {}),
+      ...(Number(row.namespacePid) > 0 ? { namespacePid: Number(row.namespacePid) } : {}),
+      ...(Number(row.namespacePpid) > 0 ? { namespacePpid: Number(row.namespacePpid) } : {}),
+      startTime: String(row.startTime ?? ''),
+      ...(String(row.lifecycleSource ?? '')
+        ? { lifecycleSource: String(row.lifecycleSource) as ProcessLifecycleFact['lifecycleSource'] }
+        : {}),
+      ...(row.factKind === 'exit' && Number(row.exitStatusPresent) > 0
+        ? { exitStatus: Number(row.exitStatus) }
+        : {}),
+      ...(row.factKind === 'exit' && Number(row.exitSignalPresent) > 0
+        ? { exitSignal: Number(row.exitSignal) }
+        : {}),
+      ...(String(row.executableHash ?? '') ? { executableHash: String(row.executableHash) } : {}),
+      ...(String(row.commandHash ?? '') ? { commandHash: String(row.commandHash) } : {}),
+    };
+  }
+
+  async writeProcessLifecycleFacts(facts: readonly ProcessLifecycleFact[]): Promise<boolean> {
+    if (facts.length === 0) return true;
+    if (!this.client || !this.ready || facts.length > 5_000) return false;
+    try {
+      await this.client.insert({
+        table: PROCESS_LIFECYCLE_FACT_TABLE,
+        values: facts.map((fact) => ({
+          factId: fact.factId,
+          eventId: fact.eventId,
+          sourceEventId: fact.sourceEventId ?? '',
+          factKind: fact.factKind,
+          at: fact.at,
+          receivedAt: fact.receivedAt,
+          source: fact.source,
+          sourceId: fact.sourceId ?? '',
+          collectorId: fact.collectorId ?? '',
+          workspacePath: fact.workspacePath,
+          subjectAssetId: fact.subjectAssetId ?? '',
+          subjectAssetType: fact.subjectAssetType ?? '',
+          assetBindingQuality: fact.assetBindingQuality ?? '',
+          assetBindingRevision: fact.assetBindingRevision ?? 0,
+          assetBindingReason: fact.assetBindingReason ?? '',
+          runtimeInstanceId: fact.runtimeInstanceId ?? '',
+          rootProcess: fact.rootProcess === true ? 1 : 0,
+          identityRevision: fact.identityRevision ?? 0,
+          processInstanceKey: fact.processInstanceKey,
+          physicalWorkloadId: fact.physicalWorkloadId ?? '',
+          hostId: fact.hostId ?? '',
+          bootId: fact.bootId,
+          pid: fact.pid,
+          ppid: fact.ppid ?? 0,
+          pidNamespace: fact.pidNamespace ?? '',
+          namespacePid: fact.namespacePid ?? 0,
+          namespacePpid: fact.namespacePpid ?? 0,
+          startTime: fact.startTime,
+          lifecycleSource: fact.lifecycleSource ?? '',
+          exitStatus: fact.exitStatus ?? 0,
+          exitStatusPresent: fact.exitStatus !== undefined ? 1 : 0,
+          exitSignal: fact.exitSignal ?? 0,
+          exitSignalPresent: fact.exitSignal !== undefined ? 1 : 0,
+          executableHash: fact.executableHash ?? '',
+          commandHash: fact.commandHash ?? '',
+        })),
+        format: 'JSONEachRow',
+      });
+      return true;
+    } catch (error) {
+      console.error('[clickhouse] Process lifecycle fact insert failed:', (error as Error).message);
+      return false;
+    }
+  }
+
+  async readProcessLifecycleFacts(
+    processInstanceKeyInput: string,
+    sinceMs: number,
+    untilMs: number,
+    limit = 1_000,
+  ): Promise<ProcessLifecycleFact[] | null> {
+    const processInstanceKey = processInstanceKeyInput.trim();
+    if (!this.client || !this.ready || !/^pri_[a-f0-9]{24}$/u.test(processInstanceKey)) return null;
+    const rowLimit = Math.max(1, Math.min(5_000, Math.round(limit)));
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT *
+          FROM ${PROCESS_LIFECYCLE_FACT_TABLE} FINAL
+          WHERE processInstanceKey = {processInstanceKey:String}
+            AND at >= {sinceMs:UInt64}
+            AND at <= {untilMs:UInt64}
+          ORDER BY at, factKind, eventId
+          LIMIT {rowLimit:UInt32}`,
+        query_params: { processInstanceKey, sinceMs, untilMs, rowLimit },
+        clickhouse_settings: BOUNDED_TOOL_EVIDENCE_RELATION_SETTINGS,
+        format: 'JSONEachRow',
+      });
+      const rows = (await result.json()) as Array<Record<string, unknown>>;
+      return rows.map((row) => this.processLifecycleFactFromRow(row));
+    } catch (error) {
+      console.error('[clickhouse] Process lifecycle fact query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  async readRecentProcessLifecycleFacts(
+    sinceMs: number,
+    untilMs: number,
+    limit = 5_000,
+  ): Promise<ProcessLifecycleFact[] | null> {
+    if (!this.client || !this.ready) return null;
+    const rowLimit = Math.max(1, Math.min(10_000, Math.round(limit)));
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT *
+          FROM ${PROCESS_LIFECYCLE_FACT_TABLE} FINAL
+          WHERE at >= {sinceMs:UInt64}
+            AND at <= {untilMs:UInt64}
+          ORDER BY at DESC, factKind, eventId
+          LIMIT {rowLimit:UInt32}`,
+        query_params: { sinceMs, untilMs, rowLimit },
+        clickhouse_settings: BOUNDED_PROCESS_LIFECYCLE_READ_SETTINGS,
+        format: 'JSONEachRow',
+      });
+      const rows = (await result.json()) as Array<Record<string, unknown>>;
+      return rows.map((row) => this.processLifecycleFactFromRow(row)).reverse();
+    } catch (error) {
+      console.error('[clickhouse] Recent Process lifecycle fact query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
   async agentWindowFacts(
     sinceMs: number,
     untilMs: number,
@@ -2658,7 +3746,7 @@ export class ClickHouseStore {
   ): Promise<StoredAgentWindowFact[] | null> {
     if (!this.client || !this.ready) return null;
     const monitoredClause = monitoredOnly
-      ? 'AND agentMonitored = 1'
+      ? 'AND raw.agentMonitored = 1'
       : '';
     const latestEvents = `
       SELECT
@@ -2686,11 +3774,12 @@ export class ClickHouseStore {
         argMax(agentMonitored, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentMonitored,
         argMax(agentHasPhysicalIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasPhysicalIdentity,
         argMax(agentHasRootIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasRootIdentity
-      FROM ${TABLE}
+      FROM ${TABLE} AS raw
       WHERE at >= {since:UInt64} AND at <= {until:UInt64}
         AND eventId NOT IN {excludedEventIds:Array(String)}
+        ${monitoredClause}
       GROUP BY eventId
-      HAVING 1 ${monitoredClause}`;
+      HAVING 1`;
     try {
       const result = await this.client.query({
         query: `
@@ -2707,7 +3796,7 @@ export class ClickHouseStore {
             groupUniqArray(runId) AS runKeys,
             groupUniqArray(traceId) AS traceKeys,
             groupUniqArrayIf(collectorId, collectorId != '') AS collectorKeys,
-            countIf(collectorId = '') AS eventsWithoutCollector,
+            countIf(collectorId = '' AND eventKind NOT IN ('AgentTool', 'AgentInvocation', 'SystemContext')) AS eventsWithoutCollector,
             sum(tokenCount) AS tokenCount,
             sum(latencyMs) AS latencyTotal,
             uniqExact(instanceKey) AS instanceCount,
@@ -2736,6 +3825,7 @@ export class ClickHouseStore {
           FROM (${latestEvents})
           GROUP BY identityKey, instanceKey`,
         query_params: { since: sinceMs, until: untilMs, excludedEventIds },
+        clickhouse_settings: BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS,
         format: 'JSONEachRow',
       });
       const rows = await result.json() as Array<Record<string, unknown>>;
@@ -2813,7 +3903,7 @@ export class ClickHouseStore {
     monitoredOnly: boolean,
   ): Promise<StoredAgentBucketFact[] | null> {
     if (!this.client || !this.ready) return null;
-    const monitoredClause = monitoredOnly ? 'AND agentMonitored = 1' : '';
+    const monitoredClause = monitoredOnly ? 'AND raw.agentMonitored = 1' : '';
     try {
       const result = await this.client.query({
         query: `
@@ -2828,7 +3918,7 @@ export class ClickHouseStore {
             groupUniqArray(runId) AS runKeys,
             groupUniqArray(traceId) AS traceKeys,
             groupUniqArrayIf(collectorId, collectorId != '') AS collectorKeys,
-            countIf(collectorId = '') AS eventsWithoutCollector,
+            countIf(collectorId = '' AND eventKind NOT IN ('AgentTool', 'AgentInvocation', 'SystemContext')) AS eventsWithoutCollector,
             sum(tokenCount) AS tokenCount,
             sum(latencyMs) AS latencyTotal,
             groupUniqArray(instanceKey) AS instanceKeys,
@@ -2857,6 +3947,7 @@ export class ClickHouseStore {
             SELECT
               eventId,
               argMax(at, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventAt,
+              argMax(eventKind, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventKind,
               argMax(eventCategory, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventCategory,
               argMax(source, tuple(decisionRevision, decisionUpdatedAt, at)) AS source,
               argMax(sessionId, tuple(decisionRevision, decisionUpdatedAt, at)) AS sessionId,
@@ -2874,10 +3965,11 @@ export class ClickHouseStore {
               argMax(agentMonitored, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentMonitored,
               argMax(agentHasPhysicalIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasPhysicalIdentity,
               argMax(agentHasRootIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasRootIdentity
-            FROM ${TABLE}
+            FROM ${TABLE} AS raw
             WHERE at >= {since:UInt64} AND at < {endExclusive:UInt64}
+              ${monitoredClause}
             GROUP BY eventId
-            HAVING 1 ${monitoredClause}
+            HAVING 1
           )
           GROUP BY bucketStartMs, identityKey, instanceKey`,
         query_params: {
@@ -2885,6 +3977,7 @@ export class ClickHouseStore {
           endExclusive: endExclusiveMs,
           bucketMs: Math.max(1, Math.trunc(bucketMs)),
         },
+        clickhouse_settings: BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS,
         format: 'JSONEachRow',
       });
       const rows = await result.json() as Array<Record<string, unknown>>;
@@ -3510,6 +4603,37 @@ export class ClickHouseStore {
     return this.committedBoundaryComplete ? this.committedThroughMs : undefined;
   }
 
+  /**
+   * Return only process-local event revisions that have not completed the ClickHouse FIFO yet.
+   *
+   * This is intentionally different from the dashboard hot ring: the hot ring also contains
+   * already committed rows and cannot be added to a full durable-window query without forcing
+   * every historical aggregate to remain uncached. Pending rows stay in `buf` or a sealed batch
+   * until the insert succeeds, so a durable full-window read plus this overlay is complete for the
+   * current API process even while ingestion never becomes momentarily idle.
+   */
+  pendingEvents(sinceMs: number, untilMs: number): JudgedEvent[] {
+    const latest = new Map<string, JudgedEvent>();
+    const accept = (row: Row) => {
+      if (row.at < sinceMs || row.at > untilMs) return;
+      const event = fromRow(row as unknown as Record<string, unknown>);
+      const current = latest.get(event.eventId);
+      if (
+        !current
+        || (event.decisionRevision ?? 1) > (current.decisionRevision ?? 1)
+        || (
+          (event.decisionRevision ?? 1) === (current.decisionRevision ?? 1)
+          && (event.decisionUpdatedAt ?? event.at) > (current.decisionUpdatedAt ?? current.at)
+        )
+      ) latest.set(event.eventId, event);
+    };
+    for (const queued of this.buf) accept(queued.row);
+    for (const batch of this.eventWriteBatches) {
+      for (const row of batch.rows) accept(row);
+    }
+    return [...latest.values()];
+  }
+
   committedProgress(): CommittedSourceProgress[] {
     return [...this.committedSourceProgress.values()]
       .map((entry) => ({ ...entry }))
@@ -4021,25 +5145,124 @@ export class ClickHouseStore {
     }
   }
 
-  async loadCollectorHeartbeats(): Promise<CollectorHeartbeatRecord[]> {
-    if (!this.client) return [];
+  async loadPlatformConfig<T>(configKeyInput: string): Promise<{ record: T; updatedAt: number } | undefined> {
+    if (!this.client) return undefined;
+    const configKey = configKeyInput.trim().slice(0, 160);
+    if (!configKey || !/^[a-z0-9_.:-]+$/iu.test(configKey)) return undefined;
     try {
       const rs = await this.client.query({
-        query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'collector_heartbeats' LIMIT 1`,
+        query: `SELECT value, updated_at FROM ${CONFIG_TABLE} FINAL WHERE key = {configKey:String} LIMIT 1`,
+        query_params: { configKey },
         format: 'JSONEachRow',
       });
-      const rows = (await rs.json()) as Array<{ value: string }>;
-      const parsed = rows.length ? (JSON.parse(rows[0].value) as unknown) : [];
-      const records = Array.isArray(parsed) ? (parsed as CollectorHeartbeatRecord[]) : [];
-      // One-time compatibility bridge from the former config snapshot. Queries deduplicate by
-      // collectorId+at, so retrying this after an interrupted startup remains safe.
-      if (records.length) {
-        const countResult = await this.client.query({
-          query: `SELECT count() AS count FROM ${COLLECTOR_HEARTBEAT_TABLE}`,
+      const rows = await rs.json() as Array<{ value: string; updated_at?: number | string }>;
+      if (!rows.length) return undefined;
+      const updatedAt = Number(rows[0].updated_at);
+      const record = JSON.parse(rows[0].value) as T;
+      return { record, updatedAt: Number.isSafeInteger(updatedAt) ? updatedAt : 0 };
+    } catch (err) {
+      console.error(`[clickhouse] loadPlatformConfig ${configKey} failed:`, (err as Error).message);
+      return undefined;
+    }
+  }
+
+  async savePlatformConfig<T>(configKeyInput: string, record: T, updatedAtInput = Date.now()): Promise<boolean> {
+    if (!this.client) return false;
+    const configKey = configKeyInput.trim().slice(0, 160);
+    if (!configKey || !/^[a-z0-9_.:-]+$/iu.test(configKey)) return false;
+    try {
+      const value = JSON.stringify(record);
+      if (Buffer.byteLength(value, 'utf8') > 16 * 1024 * 1024) {
+        throw new Error('platform config exceeds the 16 MiB persistence bound');
+      }
+      const updatedAt = Number.isSafeInteger(updatedAtInput) && updatedAtInput >= 0
+        ? updatedAtInput
+        : Date.now();
+      await this.client.insert({
+        table: CONFIG_TABLE,
+        values: [{ key: configKey, value, updated_at: updatedAt }],
+        format: 'JSONEachRow',
+      });
+      return true;
+    } catch (err) {
+      console.error(`[clickhouse] savePlatformConfig ${configKey} failed:`, (err as Error).message);
+      return false;
+    }
+  }
+
+  async loadUnknownLearningState(): Promise<unknown | undefined> {
+    if (!this.client) return undefined;
+    try {
+      const rs = await this.client.query({
+        query: `SELECT value, updated_at FROM ${CONFIG_TABLE} FINAL WHERE key = 'unknown_learning_state_v1' LIMIT 1`,
+        format: 'JSONEachRow',
+      });
+      const rows = (await rs.json()) as Array<{ value: string; updated_at?: number | string }>;
+      const persistedVersion = Number(rows[0]?.updated_at);
+      if (Number.isSafeInteger(persistedVersion) && persistedVersion > this.unknownLearningStateVersion) {
+        this.unknownLearningStateVersion = persistedVersion;
+      }
+      return rows.length ? JSON.parse(rows[0].value) as unknown : undefined;
+    } catch (err) {
+      console.error('[clickhouse] loadUnknownLearningState failed:', (err as Error).message);
+      return undefined;
+    }
+  }
+
+  async saveUnknownLearningState(state: unknown): Promise<boolean> {
+    if (!this.client) return false;
+    try {
+      const value = JSON.stringify(state);
+      // The runtime service exports a stricter configured bound. This last storage guard prevents
+      // a programming error from turning one config row into an unbounded ClickHouse insert.
+      if (Buffer.byteLength(value, 'utf8') > 16 * 1024 * 1024) {
+        throw new Error('Unknown learning state exceeds the 16 MiB persistence bound');
+      }
+      const updatedAt = Math.max(Date.now(), this.unknownLearningStateVersion + 1);
+      this.unknownLearningStateVersion = updatedAt;
+      await this.client.insert({
+        table: CONFIG_TABLE,
+        values: [{ key: 'unknown_learning_state_v1', value, updated_at: updatedAt }],
+        format: 'JSONEachRow',
+      });
+      return true;
+    } catch (err) {
+      console.error('[clickhouse] saveUnknownLearningState failed:', (err as Error).message);
+      return false;
+    }
+  }
+
+  async loadCollectorHeartbeats(limit = 1_000): Promise<CollectorHeartbeatRecord[]> {
+    if (!this.client) return [];
+    const safeLimit = Math.max(128, Math.min(2_000, Math.trunc(limit) || 1_000));
+    try {
+      const existenceResult = await this.client.query({
+        query: `SELECT 1 AS present FROM ${COLLECTOR_HEARTBEAT_TABLE} LIMIT 1`,
+        format: 'JSONEachRow',
+      });
+      const existenceRows = await existenceResult.json() as Array<{ present?: string | number }>;
+      if (Number(existenceRows[0]?.present ?? 0) !== 1) {
+        // One-time compatibility bridge. Slice the legacy JSON array inside ClickHouse so a large
+        // historical snapshot is never transferred and expanded in the Node.js heap merely to
+        // keep the newest bounded working set.
+        const legacyResult = await this.client.query({
+          query: `
+            SELECT arraySlice(JSONExtractArrayRaw(value), -{limit:Int32}) AS records
+            FROM ${CONFIG_TABLE} FINAL
+            WHERE key = 'collector_heartbeats'
+            LIMIT 1`,
+          query_params: { limit: safeLimit },
           format: 'JSONEachRow',
         });
-        const countRows = await countResult.json() as Array<{ count?: string | number }>;
-        if (Number(countRows[0]?.count ?? 0) === 0) {
+        const legacyRows = await legacyResult.json() as Array<{ records?: string[] }>;
+        const records = (legacyRows[0]?.records ?? []).flatMap((value) => {
+          try {
+            return [JSON.parse(value) as CollectorHeartbeatRecord];
+          } catch {
+            return [];
+          }
+        });
+        if (records.length > 0) {
           await this.client.insert({
             table: COLLECTOR_HEARTBEAT_TABLE,
             values: records.map((record) => ({
@@ -4051,24 +5274,41 @@ export class ClickHouseStore {
           });
         }
       }
-      return records;
+
+      const recentResult = await this.client.query({
+        query: `
+          SELECT collectorId, at, payload
+          FROM (
+            SELECT collectorId, at, payload
+            FROM ${COLLECTOR_HEARTBEAT_TABLE}
+            ORDER BY at DESC
+            LIMIT {scanLimit:UInt32}
+          )
+          ORDER BY at DESC
+          LIMIT {scanLimit:UInt32}`,
+        query_params: { scanLimit: safeLimit * 2 },
+        format: 'JSONEachRow',
+      });
+      const recentRows = await recentResult.json() as Array<{
+        collectorId?: string;
+        at?: string | number;
+        payload?: string;
+      }>;
+      const unique = new Map<string, CollectorHeartbeatRecord>();
+      for (const row of recentRows) {
+        try {
+          if (!row.payload) continue;
+          const record = JSON.parse(row.payload) as CollectorHeartbeatRecord;
+          unique.set(`${String(row.collectorId ?? record.collectorId)}\u0000${Number(row.at ?? record.at)}`, record);
+        } catch {
+          // A malformed legacy row must not prevent later valid heartbeats from hydrating.
+        }
+        if (unique.size >= safeLimit) break;
+      }
+      return [...unique.values()].reverse();
     } catch (err) {
       console.error('[clickhouse] loadCollectorHeartbeats failed:', (err as Error).message);
       return [];
-    }
-  }
-
-  async saveCollectorHeartbeats(records: CollectorHeartbeatRecord[], abortSignal?: AbortSignal): Promise<void> {
-    if (!this.client) return;
-    try {
-      await this.client.insert({
-        table: CONFIG_TABLE,
-        values: [{ key: 'collector_heartbeats', value: JSON.stringify(records), updated_at: Date.now() }],
-        format: 'JSONEachRow',
-        abort_signal: abortSignal,
-      });
-    } catch (err) {
-      console.error('[clickhouse] saveCollectorHeartbeats failed:', (err as Error).message);
     }
   }
 

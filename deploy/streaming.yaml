@@ -41,7 +41,7 @@ kind: StatefulSet
 metadata:
   name: kafka
   namespace: anysentry
-  labels: { app: kafka, io.anysentry.observe: "false" }
+  labels: { app: kafka, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   serviceName: kafka
   replicas: 1
@@ -49,7 +49,7 @@ spec:
     matchLabels: { app: kafka }
   template:
     metadata:
-      labels: { app: kafka, io.anysentry.observe: "false" }
+      labels: { app: kafka, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       securityContext:
         fsGroup: 1000
@@ -105,14 +105,14 @@ kind: Deployment
 metadata:
   name: kafka-topic-manager
   namespace: anysentry
-  labels: { app: kafka-topic-manager, io.anysentry.observe: "false" }
+  labels: { app: kafka-topic-manager, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
   selector:
     matchLabels: { app: kafka-topic-manager }
   template:
     metadata:
-      labels: { app: kafka-topic-manager, io.anysentry.observe: "false" }
+      labels: { app: kafka-topic-manager, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       containers:
         - name: topic-manager
@@ -175,7 +175,7 @@ kind: Deployment
 metadata:
   name: flink-jobmanager
   namespace: anysentry
-  labels: { app: flink-jobmanager, io.anysentry.observe: "false" }
+  labels: { app: flink-jobmanager, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
   strategy:
@@ -184,7 +184,7 @@ spec:
     matchLabels: { app: flink-jobmanager }
   template:
     metadata:
-      labels: { app: flink-jobmanager, io.anysentry.observe: "false" }
+      labels: { app: flink-jobmanager, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       initContainers:
         - name: checkpoint-permissions
@@ -237,14 +237,14 @@ kind: Deployment
 metadata:
   name: flink-taskmanager
   namespace: anysentry
-  labels: { app: flink-taskmanager, io.anysentry.observe: "false" }
+  labels: { app: flink-taskmanager, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
   selector:
     matchLabels: { app: flink-taskmanager }
   template:
     metadata:
-      labels: { app: flink-taskmanager, io.anysentry.observe: "false" }
+      labels: { app: flink-taskmanager, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       initContainers:
         - name: checkpoint-permissions
@@ -280,7 +280,7 @@ kind: Deployment
 metadata:
   name: flink-job-submit
   namespace: anysentry
-  labels: { app: flink-job-submit, io.anysentry.observe: "false" }
+  labels: { app: flink-job-submit, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
   strategy:
@@ -289,7 +289,7 @@ spec:
     matchLabels: { app: flink-job-submit }
   template:
     metadata:
-      labels: { app: flink-job-submit, io.anysentry.observe: "false" }
+      labels: { app: flink-job-submit, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       containers:
         - name: job-submit
@@ -332,14 +332,14 @@ kind: Deployment
 metadata:
   name: stream-worker
   namespace: anysentry
-  labels: { app: stream-worker, io.anysentry.observe: "false" }
+  labels: { app: stream-worker, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
   selector:
     matchLabels: { app: stream-worker }
   template:
     metadata:
-      labels: { app: stream-worker, io.anysentry.observe: "false" }
+      labels: { app: stream-worker, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       containers:
         - name: stream-worker
@@ -368,14 +368,14 @@ kind: Deployment
 metadata:
   name: composite-judge
   namespace: anysentry
-  labels: { app: composite-judge, io.anysentry.observe: "false" }
+  labels: { app: composite-judge, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
   selector:
     matchLabels: { app: composite-judge }
   template:
     metadata:
-      labels: { app: composite-judge, io.anysentry.observe: "false" }
+      labels: { app: composite-judge, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       containers:
         - name: composite-judge
@@ -405,14 +405,14 @@ kind: Deployment
 metadata:
   name: supply-chain-assessment
   namespace: anysentry
-  labels: { app: supply-chain-assessment, io.anysentry.observe: "false" }
+  labels: { app: supply-chain-assessment, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
   selector:
     matchLabels: { app: supply-chain-assessment }
   template:
     metadata:
-      labels: { app: supply-chain-assessment, io.anysentry.observe: "false" }
+      labels: { app: supply-chain-assessment, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       containers:
         - name: supply-chain-assessment

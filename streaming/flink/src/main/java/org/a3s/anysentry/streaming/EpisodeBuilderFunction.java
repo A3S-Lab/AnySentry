@@ -195,12 +195,14 @@ public class EpisodeBuilderFunction extends KeyedProcessFunction<String, Behavio
         if (items.size() > MAX_EVENTS) items = new ArrayList<>(items.subList(items.size() - MAX_EVENTS, items.size()));
         String candidateType = candidateType(items);
         if (candidateType == null) {
+            retainCarryover(items);
             dirty.update(false);
             return;
         }
 
         String fingerprint = fingerprint(items);
         if (fingerprint.equals(lastFingerprint.value())) {
+            retainCarryover(items);
             dirty.update(false);
             return;
         }

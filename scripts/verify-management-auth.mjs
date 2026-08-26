@@ -41,6 +41,11 @@ const expectedProtectedRoutes = [
   'PUT config/model-connections/:profile',
   'POST config/model-connections/:profile/clear',
   'POST config/simulate',
+  'PUT unknown-learning/families/:familyId/review',
+  'POST unknown-learning/policies',
+  'PUT unknown-learning/policies/:policyId',
+  'POST unknown-learning/policies/:policyId/infrastructure-draft',
+  'PUT unknown-learning/config',
 ];
 
 function fail(message, details) {
@@ -146,6 +151,11 @@ function protectedWriteProbes(id) {
     { route: 'PUT config/model-connections/:profile', label: 'model connection apply', method: 'PUT', path: '/config/model-connections/fast_review', body: { testToken: 'invalid-auth-probe' } },
     { route: 'POST config/model-connections/:profile/clear', label: 'model credential clear', method: 'POST', path: '/config/model-connections/fast_review/clear' },
     { route: 'POST config/simulate', label: 'policy simulation', method: 'POST', path: '/config/simulate', body: { timeType: 'last_30d', limit: 1, policy: {} } },
+    { route: 'PUT unknown-learning/families/:familyId/review', label: 'Unknown family review', method: 'PUT', path: `/unknown-learning/families/${id}-missing-family/review`, body: { decision: 'non_agent', expectedRevision: 0, reason: 'auth guard probe' } },
+    { route: 'POST unknown-learning/policies', label: 'Unknown policy candidate', method: 'POST', path: '/unknown-learning/policies', body: { familyId: `${id}-missing-family`, desiredAction: 'sample', reason: 'auth guard probe' } },
+    { route: 'PUT unknown-learning/policies/:policyId', label: 'Unknown policy transition', method: 'PUT', path: `/unknown-learning/policies/${id}-missing-policy`, body: { expectedRevision: 1, to: 'rolled_back', reason: 'auth guard probe' } },
+    { route: 'POST unknown-learning/policies/:policyId/infrastructure-draft', label: 'Unknown recommendation Infrastructure draft', method: 'POST', path: `/unknown-learning/policies/${id}-missing-policy/infrastructure-draft`, body: { expectedPolicyRevision: 1, expectedReviewRevision: 1, reason: 'auth guard probe', workload: { placement: 'docker', composeProject: id, serviceName: 'probe', physicalWorkloadId: `${id}-workload`, classification: 'non_agent' } } },
+    { route: 'PUT unknown-learning/config', label: 'Unknown learning config', method: 'PUT', path: '/unknown-learning/config', body: { enabled: false, reason: 'auth guard probe' } },
   ];
 }
 

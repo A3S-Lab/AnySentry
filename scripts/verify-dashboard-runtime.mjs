@@ -13,6 +13,10 @@ const managementRoutes = [
   '/events?eventId=dashboard-smoke-missing',
   '/events?runId=dashboard-smoke-run',
   '/events?eventKind=ToolExec',
+  '/assets',
+  '/assets/asset_service_dashboard-smoke',
+  '/capture-rules',
+  '/filter-rules',
   '/agents?agentId=dashboard-smoke-agent&workspacePath=repo://dashboard-smoke',
   '/agents?timeType=last_1d&agentId=dashboard-smoke-agent&workspacePath=repo://dashboard-smoke&focus=review&eventId=dashboard-smoke-event',
   '/agents?userId=dashboard-smoke-user',
@@ -249,6 +253,7 @@ async function verifyIndexAndAssets() {
 async function verifyDashboardSourceContracts() {
   const agentEventsPage = await readFile('apps/web/src/pages/AgentEventsPage.tsx', 'utf8');
   const agentsPage = await readFile('apps/web/src/pages/AgentsPage.tsx', 'utf8');
+  const assetsPage = await readFile('apps/web/src/pages/AssetsPage.tsx', 'utf8');
   const agentIdentity = await readFile('apps/web/src/components/custom/agent-identity.tsx', 'utf8');
   const alertingService = await readFile('apps/api/src/security-monitoring/alerting.service.ts', 'utf8');
   const alertsPage = await readFile('apps/web/src/pages/AlertsPage.tsx', 'utf8');
@@ -288,32 +293,32 @@ async function verifyDashboardSourceContracts() {
       objectiveService.includes("sourceId: record.targetType === 'source' ? record.targetId : undefined"),
   };
   assert(
-    'dashboard Events deep links preserve run and event-kind selector scope',
+    'dashboard Events deep links preserve run and event-kind query scope without coupling selection',
     agentEventsPage.includes('const [runId, setRunId] = useState(searchParams.get("runId") ?? "")') &&
       agentEventsPage.includes('const [eventKind, setEventKind] = useState(searchParams.get("eventKind") ?? "")') &&
       agentEventsPage.includes('runId: clean(runId)') &&
       agentEventsPage.includes('eventKind: clean(eventKind)') &&
-      agentEventsPage.includes('next.set("runId", event.runId)') &&
-      agentEventsPage.includes('next.set("eventKind", event.eventKind)'),
+      !agentEventsPage.includes('next.set("runId", event.runId)') &&
+      !agentEventsPage.includes('next.set("eventKind", event.eventKind)'),
     {
       hasRouteRunId: agentEventsPage.includes('const [runId, setRunId] = useState(searchParams.get("runId") ?? "")'),
       hasRouteEventKind: agentEventsPage.includes('const [eventKind, setEventKind] = useState(searchParams.get("eventKind") ?? "")'),
       hasQueryRunId: agentEventsPage.includes('runId: clean(runId)'),
       hasQueryEventKind: agentEventsPage.includes('eventKind: clean(eventKind)'),
-      hasSelectedRunId: agentEventsPage.includes('next.set("runId", event.runId)'),
-      hasSelectedEventKind: agentEventsPage.includes('next.set("eventKind", event.eventKind)'),
+      selectionMutatesRunId: agentEventsPage.includes('next.set("runId", event.runId)'),
+      selectionMutatesEventKind: agentEventsPage.includes('next.set("eventKind", event.eventKind)'),
     },
   );
   assert(
-    'dashboard Event handoffs preserve selected source and collector scope',
+    'dashboard Event handoffs preserve source and collector scope without coupling selection',
     agentEventsPage.includes('const eventSourceId = event.sourceId ?? (typeof event.attributes.sourceId === "string" ? event.attributes.sourceId : undefined)') &&
       agentEventsPage.includes('const eventCollectorId = event.collectorId ?? (typeof event.attributes.collectorId === "string" ? event.attributes.collectorId : undefined)') &&
       agentEventsPage.includes('if (eventSourceId) topologyQs.set("sourceId", eventSourceId)') &&
       agentEventsPage.includes('if (eventCollectorId) topologyQs.set("collectorId", eventCollectorId)') &&
       agentEventsPage.includes('if (eventSourceId) evidenceQs.set("sourceId", eventSourceId)') &&
       agentEventsPage.includes('if (eventCollectorId) evidenceQs.set("collectorId", eventCollectorId)') &&
-      agentEventsPage.includes('if (eventSourceId ?? sourceId) next.set("sourceId", eventSourceId ?? sourceId)') &&
-      agentEventsPage.includes('if (eventCollectorId ?? collectorId) next.set("collectorId", eventCollectorId ?? collectorId)'),
+      !agentEventsPage.includes('if (eventSourceId ?? sourceId) next.set("sourceId", eventSourceId ?? sourceId)') &&
+      !agentEventsPage.includes('if (eventCollectorId ?? collectorId) next.set("collectorId", eventCollectorId ?? collectorId)'),
     {
       hasEventSourceFallback: agentEventsPage.includes('const eventSourceId = event.sourceId ?? (typeof event.attributes.sourceId === "string" ? event.attributes.sourceId : undefined)'),
       hasEventCollectorFallback: agentEventsPage.includes('const eventCollectorId = event.collectorId ?? (typeof event.attributes.collectorId === "string" ? event.attributes.collectorId : undefined)'),
@@ -321,6 +326,8 @@ async function verifyDashboardSourceContracts() {
       hasTopologyCollector: agentEventsPage.includes('if (eventCollectorId) topologyQs.set("collectorId", eventCollectorId)'),
       hasEvidenceSource: agentEventsPage.includes('if (eventSourceId) evidenceQs.set("sourceId", eventSourceId)'),
       hasEvidenceCollector: agentEventsPage.includes('if (eventCollectorId) evidenceQs.set("collectorId", eventCollectorId)'),
+      selectionMutatesSource: agentEventsPage.includes('if (eventSourceId ?? sourceId) next.set("sourceId", eventSourceId ?? sourceId)'),
+      selectionMutatesCollector: agentEventsPage.includes('if (eventCollectorId ?? collectorId) next.set("collectorId", eventCollectorId ?? collectorId)'),
     },
   );
   assert(
@@ -400,16 +407,19 @@ async function verifyDashboardSourceContracts() {
       agentsPage.includes('标记为非 Agent') &&
       agentsPage.includes('证据不足，降为未知') &&
       agentsPage.includes('撤销确认，重新观察') &&
-      agentsPage.includes('重新纳入观察') &&
+      agentsPage.includes('恢复自动识别') &&
+      agentsPage.includes('设为待确认') &&
+      !agentsPage.includes('重新纳入观察') &&
       agentsPage.includes('人工身份裁决') &&
       agentsPage.includes('aria-label="确认人工身份裁决"') &&
       agentsPage.includes('<details className="group rounded-md') &&
       agentsPage.includes('身份信息配置') &&
       !agentsPage.includes('window.confirm') &&
       !agentsPage.includes('Codex') &&
-      agentEventsPage.includes('focus: "review"') &&
-      agentEventsPage.includes('进入身份审核') &&
-      agentEventsPage.includes('查看智能体资产') &&
+      agentEventsPage.includes('assetHref(resolvedAssetId, assetQs)') &&
+      agentEventsPage.includes('查看关联资产') &&
+      assetsPage.includes('focus=review') &&
+      assetsPage.includes('打开 Agent 审核') &&
       !agentEventsPage.includes('<IdentityAiReview') &&
       securityMonitorPage.includes('if (event.agentId) qs.set("agentId", event.agentId)') &&
       securityMonitorPage.includes('详情 →') &&
@@ -426,7 +436,9 @@ async function verifyDashboardSourceContracts() {
         agentsPage.includes('标记为非 Agent') &&
         agentsPage.includes('证据不足，降为未知') &&
         agentsPage.includes('撤销确认，重新观察') &&
-        agentsPage.includes('重新纳入观察') &&
+        agentsPage.includes('恢复自动识别') &&
+        agentsPage.includes('设为待确认') &&
+        !agentsPage.includes('重新纳入观察') &&
         agentsPage.includes('人工身份裁决'),
       hasInlineReviewConfirmation:
         agentsPage.includes('aria-label="确认人工身份裁决"') &&
@@ -436,9 +448,10 @@ async function verifyDashboardSourceContracts() {
         agentsPage.includes('<details className="group rounded-md') &&
         agentsPage.includes('身份信息配置'),
       hasReviewHandoff:
-        agentEventsPage.includes('focus: "review"') &&
-        agentEventsPage.includes('进入身份审核') &&
-        agentEventsPage.includes('查看智能体资产') &&
+        agentEventsPage.includes('assetHref(resolvedAssetId, assetQs)') &&
+        agentEventsPage.includes('查看关联资产') &&
+        assetsPage.includes('focus=review') &&
+        assetsPage.includes('打开 Agent 审核') &&
         !agentEventsPage.includes('<IdentityAiReview'),
       hasRuntimeEventHandoff:
         securityMonitorPage.includes('if (event.agentId) qs.set("agentId", event.agentId)') &&

@@ -4,9 +4,11 @@ import { connect } from 'node:net';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
+import { deliverInvocationFallback } from './pi-invocation-fallback.mjs';
 
 const appDir = path.dirname(fileURLToPath(import.meta.url));
 const piBin = path.resolve(appDir, '../node_modules/.bin/pi');
+const anySentryAdapter = path.resolve(appDir, 'anysentry-pi-adapter.mjs');
 const workspace = process.env.AGENT_WORKSPACE || '/workspace';
 
 function durationMs(value, fallbackSeconds, minSeconds, maxSeconds) {
@@ -90,6 +92,8 @@ function childArgs(round) {
   const common = [
     '--no-session',
     '--no-extensions',
+    '--extension',
+    anySentryAdapter,
     '--no-skills',
     '--no-prompt-templates',
     '--no-context-files',
@@ -169,8 +173,19 @@ async function runPi(round) {
       finish(127);
     });
     spawned.once('exit', (code, signal) => {
-      log('pi_process_exited', { round, code, signal });
-      finish(code ?? 1);
+      void (async () => {
+        const fallback = await deliverInvocationFallback(spawned.pid, process.env);
+        if (fallback.reason !== 'fallback_absent') {
+          log('pi_invocation_fallback', {
+            round,
+            delivered: fallback.delivered,
+            reason: fallback.reason,
+            attempt: fallback.attempt,
+          });
+        }
+        log('pi_process_exited', { round, code, signal });
+        finish(code ?? 1);
+      })();
     });
 
     writeFile('/tmp/agent-ready', `${Date.now()}\n`, 'utf8').catch((error) => {

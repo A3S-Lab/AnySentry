@@ -166,14 +166,21 @@ async function startConsumer(): Promise<void> {
   await consumer.subscribe({ topic: findingsTopic, fromBeginning: true });
   void consumer.run({
     autoCommit: false,
-    eachMessage: async ({ topic, partition, message }) => {
-      const finding = streamFinding(message.value);
-      await store!.upsert(finding);
+    eachBatchAutoResolve: false,
+    eachBatch: async ({ batch, resolveOffset, heartbeat, isRunning, isStale }) => {
+      if (!isRunning() || isStale() || batch.messages.length === 0) return;
+      const findings = batch.messages.map((message) => streamFinding(message.value));
+      // One Kafka fetch becomes at most one ClickHouse block per finding table. Offsets advance only
+      // after the whole group is durable, so a crash replays the batch instead of losing a suffix.
+      await store!.upsertMany(findings);
+      for (const message of batch.messages) resolveOffset(message.offset);
+      const last = batch.messages[batch.messages.length - 1];
       await consumer!.commitOffsets([{
-        topic,
-        partition,
-        offset: (BigInt(message.offset) + 1n).toString(),
+        topic: batch.topic,
+        partition: batch.partition,
+        offset: (BigInt(last.offset) + 1n).toString(),
       }]);
+      await heartbeat();
     },
   }).catch((error) => {
     if (!closing) {

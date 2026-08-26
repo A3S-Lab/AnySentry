@@ -267,26 +267,29 @@ export class StreamFindingStore {
   }
 
   async upsert(finding: PersistedStreamFinding): Promise<void> {
+    await this.upsertMany([finding]);
+  }
+
+  async upsertMany(findings: readonly PersistedStreamFinding[]): Promise<void> {
+    if (findings.length === 0) return;
     if (!this.client || !this.ready) throw new Error('stream finding store is unavailable');
-    if (finding.findingType === 'risk_profile') {
-      await this.client.insert({
-        table: PROFILE_TABLE,
-        values: [{
+    const profileRows: Record<string, unknown>[] = [];
+    const compositeRows: Record<string, unknown>[] = [];
+    const judgmentRows: Record<string, unknown>[] = [];
+    for (const finding of findings) {
+      if (finding.findingType === 'risk_profile') {
+        profileRows.push({
           ...finding,
           features: JSON.stringify(finding.features),
           hitRules: JSON.stringify(finding.hitRules),
           shadow: 1,
           schemaVersion: undefined,
           findingType: undefined,
-        }],
-        format: 'JSONEachRow',
-      });
-      return;
-    }
-    if (finding.findingType === 'composite_risk') {
-      await this.client.insert({
-        table: COMPOSITE_TABLE,
-        values: [{
+        });
+        continue;
+      }
+      if (finding.findingType === 'composite_risk') {
+        compositeRows.push({
           ...finding,
           sessionId: finding.sessionId ?? '',
           traceId: finding.traceId ?? '',
@@ -295,14 +298,10 @@ export class StreamFindingStore {
           shadow: 1,
           schemaVersion: undefined,
           findingType: undefined,
-        }],
-        format: 'JSONEachRow',
-      });
-      return;
-    }
-    await this.client.insert({
-      table: COMPOSITE_JUDGMENT_TABLE,
-      values: [{
+        });
+        continue;
+      }
+      judgmentRows.push({
         ...finding,
         recordVersion: finding.judgedAt,
         traceIds: JSON.stringify(finding.traceIds),
@@ -321,9 +320,29 @@ export class StreamFindingStore {
         shadow: 1,
         schemaVersion: undefined,
         findingType: undefined,
-      }],
-      format: 'JSONEachRow',
-    });
+      });
+    }
+    if (profileRows.length) {
+      await this.client.insert({
+        table: PROFILE_TABLE,
+        values: profileRows,
+        format: 'JSONEachRow',
+      });
+    }
+    if (compositeRows.length) {
+      await this.client.insert({
+        table: COMPOSITE_TABLE,
+        values: compositeRows,
+        format: 'JSONEachRow',
+      });
+    }
+    if (judgmentRows.length) {
+      await this.client.insert({
+        table: COMPOSITE_JUDGMENT_TABLE,
+        values: judgmentRows,
+        format: 'JSONEachRow',
+      });
+    }
   }
 
   async list(filter: SecurityTimeFilter, limit = 30): Promise<StreamFindingList> {

@@ -12,13 +12,20 @@ namespace="anysentry-agent-test"
 models_file="${ANYSENTRY_LLM_MODELS_FILE:-${repo_root}/.local/real-llm/models.json}"
 key_file="${ANYSENTRY_LLM_KEY_FILE:-${repo_root}/.local/real-llm/secrets/api-key}"
 image="${ANYSENTRY_AGENT_LAB_IMAGE:-}"
+adapter_source_id="${ANYSENTRY_ADAPTER_SOURCE_ID:-}"
+adapter_token_file="${ANYSENTRY_ADAPTER_TOKEN_HOST_FILE:-${repo_root}/.local/real-llm/secrets/anysentry-adapter-token}"
 
 if [[ ! "${image}" =~ ^[A-Za-z0-9._/:@-]+@sha256:[0-9a-f]{64}$ ]]; then
   echo "ANYSENTRY_AGENT_LAB_IMAGE must be an immutable image@sha256:<64 lowercase hex> reference" >&2
   exit 64
 fi
 
-for required_file in "${models_file}" "${key_file}"; do
+if [[ ! "${adapter_source_id}" =~ ^[A-Za-z0-9._:-]{1,240}$ ]]; then
+  echo "ANYSENTRY_ADAPTER_SOURCE_ID must identify a managed agent_adapter Source" >&2
+  exit 64
+fi
+
+for required_file in "${models_file}" "${key_file}" "${adapter_token_file}"; do
   if [[ ! -f "${required_file}" || ! -r "${required_file}" || ! -s "${required_file}" ]]; then
     echo "Required non-empty file is not readable: ${required_file}" >&2
     exit 66
@@ -34,6 +41,11 @@ kubectl -n "${namespace}" create configmap pi-agent-models \
 
 kubectl -n "${namespace}" create secret generic pi-agent-llm \
   --from-file="deepseek_api_key=${key_file}" \
+  --dry-run=client -o json | kubectl apply -f -
+
+kubectl -n "${namespace}" create secret generic pi-agent-adapter \
+  --from-literal="source_id=${adapter_source_id}" \
+  --from-file="adapter_token=${adapter_token_file}" \
   --dry-run=client -o json | kubectl apply -f -
 
 sed "s|__ANYSENTRY_AGENT_LAB_IMAGE__|${image}|g" \

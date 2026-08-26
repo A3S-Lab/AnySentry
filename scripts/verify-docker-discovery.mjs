@@ -27,6 +27,7 @@ async function eventually(predicate, message) {
 const clawId = 'd'.repeat(64);
 const unknownId = 'e'.repeat(64);
 const infraId = 'f'.repeat(64);
+const legacyInfraId = '1'.repeat(64);
 const containers = [
   {
     Id: clawId,
@@ -38,13 +39,23 @@ const containers = [
     Id: unknownId,
     Names: ['/new-runtime'],
     Image: 'company/new-runtime:v1',
-    Labels: {},
+    ImageID: `sha256:${'2'.repeat(64)}`,
+    Labels: { 'anysentry.io/workload-role': 'BUSINESS_SERVICE' },
   },
   {
     Id: infraId,
     Names: ['/metrics'],
     Image: 'prom/node-exporter:latest',
     Labels: { 'anysentry.io/workload-kind': 'non-agent' },
+  },
+  {
+    Id: legacyInfraId,
+    Names: ['/clickhouse'],
+    Image: 'clickhouse/clickhouse-server:24.8',
+    Labels: {
+      'io.anysentry.observe': 'false',
+      'anysentry.io/workload-role': 'anysentry_internal',
+    },
   },
 ];
 
@@ -69,9 +80,20 @@ const snapshot = dockerSnapshot(containers, {
   now: () => Date.UTC(2026, 6, 30),
 });
 assert.equal(snapshot.ready, true);
-assert.equal(snapshot.entries.length, 3);
+assert.equal(snapshot.entries.length, 4);
 assert.equal(snapshot.entries.find((entry) => entry.ids.includes(unknownId))?.classification, 'unknown');
+assert.equal(
+  snapshot.entries.find((entry) => entry.ids.includes(unknownId))?.imageDigest,
+  `sha256:${'2'.repeat(64)}`,
+);
 assert.equal(snapshot.entries.find((entry) => entry.ids.includes(infraId))?.classification, 'non_agent');
+assert.equal(snapshot.entries.find((entry) => entry.ids.includes(legacyInfraId))?.classification, 'non_agent');
+assert.equal(snapshot.entries.find((entry) => entry.ids.includes(legacyInfraId))?.workloadRole, 'anysentry_internal');
+assert.equal(
+  snapshot.entries.find((entry) => entry.ids.includes(unknownId))?.workloadRole,
+  undefined,
+  'Docker role labels are exact closed-set inventory facts',
+);
 assert.equal(
   snapshot.entries.find((entry) => entry.ids.includes(clawId))?.physicalWorkloadId,
   `docker:host-a:${clawId}`,
@@ -200,7 +222,7 @@ const discovery = new DockerDiscovery({
 assert.equal(await discovery.start((value) => {
   callbackSnapshot = value;
 }), true);
-assert.equal(callbackSnapshot.entries.length, 3);
+assert.equal(callbackSnapshot.entries.length, 4);
 assert.equal(discovery.metrics().ready, true);
 assert.equal(discovery.metrics().version, 1);
 assert.equal(discovery.metrics().inspected, containers.length);

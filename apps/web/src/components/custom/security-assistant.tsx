@@ -63,6 +63,10 @@ function pageContext(pathname: string, search: string): SecurityAssistantContext
     workspacePath: query.get("workspacePath") || undefined,
     eventId: query.get("eventId") || undefined,
     traceId: query.get("traceId") || undefined,
+    agentAssetId: query.get("agentAssetId") || query.get("selectedAgentAssetId") || undefined,
+    agentInstanceId: query.get("agentInstanceId") || undefined,
+    invocationId: query.get("invocationId") || undefined,
+    toolCallId: query.get("toolCallId") || undefined,
     incidentId: query.get("incidentId") || undefined,
     alertId: query.get("alertId") || undefined,
   };
@@ -72,6 +76,8 @@ function contextLabels(context: SecurityAssistantContext, locale: "en" | "zh-CN"
   const page = context.view || context.path?.split("?")[0] || "/";
   const labels = [locale === "zh-CN" ? `页面 ${page}` : `Page ${page}`];
   if (context.agentId) labels.push(`Agent ${context.agentId}`);
+  if (context.agentAssetId) labels.push(`Asset ${context.agentAssetId}`);
+  if (context.invocationId) labels.push(`Invocation ${context.invocationId}`);
   if (context.workspacePath) labels.push(`Workspace ${context.workspacePath}`);
   if (context.eventId) labels.push(`Event ${context.eventId}`);
   if (context.traceId) labels.push(`Trace ${context.traceId}`);
