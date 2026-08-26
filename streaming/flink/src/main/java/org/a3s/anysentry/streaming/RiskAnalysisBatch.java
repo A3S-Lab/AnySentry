@@ -49,6 +49,10 @@ public class RiskAnalysisBatch implements Serializable {
         public boolean argvTruncated;
         public String argvSource;
         public String behaviorStage;
+        public long repeatCount = 1L;
+        public long firstEventAt;
+        public long lastEventAt;
+        public long aggregationWindowMs;
         public boolean platformRuntime;
         public boolean synthetic;
         public CanonicalEvent.ProcessIdentity processIdentity;
@@ -79,6 +83,10 @@ public class RiskAnalysisBatch implements Serializable {
             evidence.argvTruncated = signal.argvTruncated;
             evidence.argvSource = signal.argvSource;
             evidence.behaviorStage = signal.behaviorStage;
+            evidence.repeatCount = signal.repeatCount <= 0 ? 1L : signal.repeatCount;
+            evidence.firstEventAt = signal.firstEventAt;
+            evidence.lastEventAt = signal.lastEventAt;
+            evidence.aggregationWindowMs = signal.aggregationWindowMs;
             evidence.platformRuntime = signal.platformRuntime;
             evidence.synthetic = signal.synthetic;
             evidence.processIdentity = signal.processIdentity;

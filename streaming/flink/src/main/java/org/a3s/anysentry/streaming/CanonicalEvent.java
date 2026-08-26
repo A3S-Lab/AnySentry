@@ -39,6 +39,10 @@ public class CanonicalEvent implements Serializable {
     public boolean argvTruncated;
     public String argvSource;
     public String behaviorStage;
+    public long repeatCount = 1L;
+    public long firstEventAt;
+    public long lastEventAt;
+    public long aggregationWindowMs;
     public boolean platformRuntime;
     public boolean synthetic;
     public ProcessIdentity processIdentity;

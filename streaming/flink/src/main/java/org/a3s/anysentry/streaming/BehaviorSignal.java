@@ -34,6 +34,10 @@ public class BehaviorSignal implements Serializable {
     public boolean argvTruncated;
     public String argvSource;
     public String behaviorStage;
+    public long repeatCount = 1L;
+    public long firstEventAt;
+    public long lastEventAt;
+    public long aggregationWindowMs;
     public boolean platformRuntime;
     public boolean synthetic;
     public CanonicalEvent.ProcessIdentity processIdentity;
@@ -73,6 +77,10 @@ public class BehaviorSignal implements Serializable {
         signal.argvTruncated = event.argvTruncated;
         signal.argvSource = event.argvSource;
         signal.behaviorStage = event.behaviorStage;
+        signal.repeatCount = event.repeatCount <= 0 ? 1L : event.repeatCount;
+        signal.firstEventAt = event.firstEventAt;
+        signal.lastEventAt = event.lastEventAt;
+        signal.aggregationWindowMs = event.aggregationWindowMs;
         signal.platformRuntime = event.platformRuntime;
         signal.synthetic = event.synthetic;
         signal.processIdentity = event.processIdentity;
