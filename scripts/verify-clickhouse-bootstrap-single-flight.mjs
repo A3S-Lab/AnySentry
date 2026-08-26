@@ -80,8 +80,11 @@ function fakeCreateClient(options) {
       const { key, target } = databaseTargetFor(options);
       client.role = 'schema';
       state.queries.push({ clientId: client.id, key, ...queryOptions });
+      if (/FROM config FINAL/u.test(queryOptions.query)) {
+        return { async json() { return []; } };
+      }
       assert.match(queryOptions.query, /FROM event_commit_facts/u,
-        'startup hydration may only query the bounded commit journal');
+        'startup hydration may only query the bounded commit journal or an exact schema marker');
       if (target.failProgressRuns > 0) {
         target.failProgressRuns -= 1;
         throw new Error('synthetic bounded progress hydration failure');
@@ -138,7 +141,7 @@ function commandCount(config, pattern) {
 
 function queryCount(config) {
   const key = JSON.stringify([config.url, config.database, config.username, config.password]);
-  return state.queries.filter((call) => call.key === key).length;
+  return state.queries.filter((call) => call.key === key && /FROM event_commit_facts/u.test(call.query)).length;
 }
 
 const concurrentConfig = {
@@ -181,7 +184,7 @@ assert.equal(commandCount(concurrentConfig, /CREATE TABLE IF NOT EXISTS events/u
 assert.equal(queryCount(concurrentConfig), 1,
   'eleven concurrent stores must share one progress hydration');
 const hydrationQuery = state.queries.find((call) =>
-  call.key === JSON.stringify([
+  /FROM event_commit_facts/u.test(call.query) && call.key === JSON.stringify([
     concurrentConfig.url,
     concurrentConfig.database,
     concurrentConfig.username,

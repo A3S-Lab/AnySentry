@@ -137,6 +137,8 @@ const FORWARDER_MODULES = [
   'observer-event-dedup.js',
   'observer-workload-filter.js',
   'observer-infrastructure-roots.js',
+  'observer-filter-rules.js',
+  'observer-file-aggregation.js',
   'observer-e2e-witness.js',
 ];
 
@@ -3593,7 +3595,8 @@ function aggregateHeartbeatSamples(samples, finalHeartbeat = samples.at(-1)) {
   }
   const sumFields = [
     'observed', 'forwarded', 'confirmedAgent', 'probableAgent', 'unknown', 'nonAgent',
-    'filteredNonAgent', 'wouldFilterNonAgent', 'filteredNoise', 'wouldFilterNoise',
+    'filteredNonAgent', 'wouldFilterNonAgent', 'filteredUnknown', 'wouldFilterUnknown',
+    'filteredNoise', 'wouldFilterNoise',
     'discoveryBudgetDropped', 'wouldDiscoveryBudgetDrop', 'queueDropped', 'batches',
     'batchEvents', 'processRootsDiscovered', 'processRootsExited', 'processRootsLost',
   ];
@@ -3738,10 +3741,12 @@ function assertPhaseMetrics(phase, metrics, environment) {
   }
   if (phase === 'shadow') {
     assert.equal(metrics.totals.filteredNonAgent, 0, 'shadow mode performed non-Agent filtering');
+    assert.equal(metrics.totals.filteredUnknown, 0, 'shadow mode performed broad Unknown filtering');
     assert.equal(metrics.totals.filteredNoise, 0, 'shadow mode performed noise filtering');
     assert.equal(metrics.totals.discoveryBudgetDropped, 0, 'shadow mode dropped unknown events');
   } else {
     assert.equal(metrics.totals.wouldFilterNonAgent, 0, 'enforce mode emitted shadow non-Agent counters');
+    assert.equal(metrics.totals.wouldFilterUnknown, 0, 'enforce mode emitted shadow Unknown counters');
     assert.equal(metrics.totals.wouldFilterNoise, 0, 'enforce mode emitted shadow noise counters');
     assert.equal(metrics.totals.wouldDiscoveryBudgetDrop, 0, 'enforce mode emitted shadow unknown counters');
   }
@@ -4954,7 +4959,7 @@ function filterCanaryContract(environment, phase) {
   const host = environment === 'host';
   const metrics = host
     ? { shadow: 'wouldFilterNonAgent', enforce: 'filteredNonAgent' }
-    : { shadow: 'wouldDiscoveryBudgetDrop', enforce: 'discoveryBudgetDropped' };
+    : { shadow: 'wouldFilterUnknown', enforce: 'filteredUnknown' };
   return {
     classification: host ? 'non_agent' : 'unknown',
     filterReason: host ? 'non_agent' : 'unknown',
@@ -8085,9 +8090,9 @@ function phaseComparison(results) {
       l1RoutedEvents: phase.l1.routedEvents,
       confirmedAgentEvents: phase.metrics.totals.confirmedAgent,
       probableAgentEvents: phase.metrics.totals.probableAgent,
-      actualDrops: phase.metrics.totals.filteredNonAgent + phase.metrics.totals.filteredNoise +
+      actualDrops: phase.metrics.totals.filteredNonAgent + phase.metrics.totals.filteredUnknown + phase.metrics.totals.filteredNoise +
         phase.metrics.totals.discoveryBudgetDropped,
-      wouldDrop: phase.metrics.totals.wouldFilterNonAgent + phase.metrics.totals.wouldFilterNoise +
+      wouldDrop: phase.metrics.totals.wouldFilterNonAgent + phase.metrics.totals.wouldFilterUnknown + phase.metrics.totals.wouldFilterNoise +
         phase.metrics.totals.wouldDiscoveryBudgetDrop,
       unexpectedAgentInstances: phase.runtime.unexpected.length,
       filterCanary: phase.filterCanary ? {
@@ -10096,11 +10101,11 @@ async function selfTest() {
     shadowVisible: false, shadowApiDisposition: 'non_agent_discarded',
   });
   assert.deepEqual(filterCanaryContract('docker', 'shadow'), {
-    classification: 'unknown', filterReason: 'unknown', metricName: 'wouldDiscoveryBudgetDrop',
+    classification: 'unknown', filterReason: 'unknown', metricName: 'wouldFilterUnknown',
     shadowVisible: true, shadowApiDisposition: 'retained',
   });
   assert.deepEqual(filterCanaryContract('k8s', 'enforce'), {
-    classification: 'unknown', filterReason: 'unknown', metricName: 'discoveryBudgetDropped',
+    classification: 'unknown', filterReason: 'unknown', metricName: 'filteredUnknown',
     shadowVisible: true, shadowApiDisposition: 'retained',
   });
   assert.ok(matchingFilterReceipt(receiptHeartbeat, {

@@ -86,8 +86,9 @@ function forwarderEnv(source, fixture) {
     A3S_NODE_NAME: fixture.nodeName,
     FORWARD_DROP_PATHS: '/sys/,/proc/,/run/,/dev/',
     FORWARD_MAX_INFLIGHT: '4',
-    // Exercise the production observation-filter path here. The recovery-mode `all` semantics
-    // (including routine-noise pass-through) are covered by verify-filter-pipeline.mjs.
+    // Exercise the production observation-filter path here. This unsigned fixture remains
+    // Unknown, so even a routine-noise path must be retained for discovery; authoritative
+    // non-Agent/Infrastructure suppression is covered by verify-filter-pipeline.mjs.
     FORWARD_SCOPE: 'agent',
     ANYSENTRY_INFRA_ROOT_PIDS: '2299:fixture-infrastructure',
   };
@@ -158,6 +159,11 @@ async function createSource(fixture) {
 async function eventsFor(fixture) {
   return request('/events/list', 'POST', {
     timeType: 'last_30d',
+    // The fixture intentionally uses a unique, unsigned Agent claim so this test exercises the
+    // transport contract without teaching attribution to trust arbitrary identity.agent values.
+    // Such evidence is retained as Unknown and is therefore visible only in the explicit raw view.
+    scope: 'raw',
+    includeUnknown: true,
     collectorId: fixture.collectorId,
     workspacePath: fixture.workspacePath,
     limit: 20,
@@ -178,6 +184,7 @@ async function sourceFor(sourceId) {
 
 async function verifyForwarder(entry, source, fixture) {
   const output = await runForwarderProcess(entry, source, fixture);
+  const retainsUnknownNoise = entry.label === 'node';
   const unexpectedStderr = output.stderr
     .split('\n')
     .filter((line) =>
@@ -185,6 +192,9 @@ async function verifyForwarder(entry, source, fixture) {
       !line.startsWith('[observer-forward] process snapshot:') &&
       !line.startsWith('[observer-forward] agent templates:') &&
       !line.startsWith('[observer-forward] Agent runtime signatures:') &&
+      !line.startsWith('[observer-forward] Unified Filter Rule projection loaded:') &&
+      !line.startsWith('[observer-forward] Agent runtime reconciliation:') &&
+      !line.startsWith('[observer-forward] Infrastructure policy loaded:') &&
       !line.startsWith('[observer-forward] docker discovery:'),
     )
     .join('\n');
@@ -194,12 +204,19 @@ async function verifyForwarder(entry, source, fixture) {
     const list = await eventsFor(fixture);
     const hasTool = list.items?.some((event) => event.eventKind === 'ToolExec' && event.agentId === fixture.agentId);
     const hasLlm = list.items?.some((event) => event.eventKind === 'LlmCall' && event.agentId === fixture.agentId && event.subject.includes('api.openai.com'));
-    const hasNoise = list.items?.some((event) => event.eventKind === 'FileAccess' || event.attributes?.path === `/proc/${fixture.label}/status`);
-    return list.total >= 2 && hasTool && hasLlm && !hasNoise ? list : undefined;
+    const hasUnknownNoise = list.items?.some((event) =>
+      event.eventKind === 'FileAccess' && event.attributes?.path === `/proc/${fixture.label}/status`,
+    );
+    const expectedTotal = retainsUnknownNoise ? 3 : 2;
+    const noiseMatchesContract = retainsUnknownNoise ? hasUnknownNoise : !hasUnknownNoise;
+    return list.total >= expectedTotal && hasTool && hasLlm && noiseMatchesContract ? list : undefined;
   });
+  const expectedTotal = retainsUnknownNoise ? 3 : 2;
   assert(
-    `${fixture.label} forwarder sends observer events with Source and Collector identity while dropping noise`,
-    eventList.total === 2 &&
+    retainsUnknownNoise
+      ? `${fixture.label} forwarder sends observer events with Source and Collector identity while retaining Unknown discovery evidence`
+      : `${fixture.label} compatibility forwarder preserves legacy routine-noise filtering`,
+    eventList.total === expectedTotal &&
       eventList.items.every((event) =>
         event.workspacePath === fixture.workspacePath &&
         event.attributes?.sourceId === source.source.sourceId &&

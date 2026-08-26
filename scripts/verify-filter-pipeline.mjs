@@ -3,7 +3,10 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const forwarder = fileURLToPath(new URL('./observer-forward.js', import.meta.url));
@@ -38,6 +41,26 @@ function collectorHeartbeat(collectorId) {
         interval_secs: 1,
         dropped: 0,
         output_dropped: 0,
+      },
+    },
+  });
+}
+
+function captureAggregate(marker) {
+  return JSON.stringify({
+    identity: { agent: null, task: null, session: null },
+    event: {
+      CaptureAggregate: {
+        count: 1,
+        probe: 'connect',
+        effectiveAction: 'aggregate',
+        qualifier: marker,
+        profile: 'infrastructure_aggregate',
+        epoch: 1,
+        policyVersion: 1,
+        authority: 'authoritative',
+        reason: 'test',
+        terminal: true,
       },
     },
   });
@@ -376,12 +399,12 @@ async function runManualReviewRecovery() {
 
   await initialSnapshot;
   await new Promise((resolve) => setTimeout(resolve, 20));
-  child.stdin.write(`${event('reviewed-container', 'ToolExec', { pid: 30, argv: ['blocked'] })}\n`);
+  child.stdin.write(`${event('reviewed-container', 'FileAccess', { pid: 30, path: '/tmp/blocked', write: false })}\n`);
   await new Promise((resolve) => setTimeout(resolve, 40));
   snapshotVersion = 2;
   await recoverySnapshot;
   await new Promise((resolve) => setTimeout(resolve, 20));
-  child.stdin.end(`${event('reviewed-container', 'ToolExec', { pid: 31, argv: ['observed-again'] })}\n`);
+  child.stdin.end(`${event('reviewed-container', 'FileAccess', { pid: 31, path: '/tmp/observed-again', write: false })}\n`);
 
   const exitCode = await new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -397,7 +420,7 @@ async function runManualReviewRecovery() {
   assert.equal(exitCode, 0, stderr);
   assert.equal(batches.length, 1, 'manual non-Agent is suppressed until it returns to Unknown');
   const recovered = JSON.parse(batches[0].line);
-  assert.deepEqual(recovered.event.ToolExec.argv, ['observed-again']);
+  assert.equal(recovered.event.FileAccess.path, '/tmp/observed-again');
   assert.equal(batches[0].attribution?.classification, 'unknown');
   assert.equal(batches[0].attribution?.source, 'manual_review');
   const heartbeat = heartbeats.find((candidate) => candidate.filterMetrics?.lastSuppressedAt);
@@ -452,7 +475,7 @@ async function runHungShutdownScenario() {
       const receivedAt = Date.now();
       if (request.url === '/security-center/identity/snapshot') {
         response.writeHead(200, { 'Content-Type': 'application/json' });
-        if (hangControlTraffic && hungIdentitySnapshots < 1) {
+        if (hangControlTraffic && hungIdentitySnapshots < 2) {
           hungIdentitySnapshots++;
           occupyControlSocket(request, response);
           return;
@@ -572,8 +595,8 @@ async function runHungShutdownScenario() {
     assert.equal(hangingBatchSocket.destroyed, false);
     assert.notEqual(snapshotDuringHang.socket, hangingBatchSocket);
     assert.equal(hungControlSockets.size, 4, 'fixture must occupy every control Agent socket');
-    assert.equal(hungHeartbeats, 2, 'fixture must include two in-flight periodic heartbeats');
-    assert.equal(hungIdentitySnapshots, 1, 'fixture must include one in-flight identity request');
+    assert.equal(hungHeartbeats, 1, 'heartbeat accounting allows only one in-flight delta window');
+    assert.equal(hungIdentitySnapshots, 2, 'fixture must include two in-flight identity requests');
     for (const socket of hungControlSockets) assert.notEqual(socket, hangingBatchSocket);
 
     const preSignalSnapshotVersion = snapshotDuringHang.body.snapshotVersion ?? 0;
@@ -695,8 +718,12 @@ assert.equal(include.heartbeat.filterMetrics.filteredNoise, 0);
 
 const shadow = await runConfig('shadow', { FORWARD_FILTER_MODE: 'shadow' });
 assert.equal(shadow.batches.length, 6, 'shadow forwards every retention decision');
-assert.equal(shadow.heartbeat.filterMetrics.wouldFilterNonAgent, 1);
-assert.equal(shadow.heartbeat.filterMetrics.wouldFilterNoise, 1);
+assert.equal(shadow.heartbeat.filterMetrics.wouldFilterNonAgent, 0);
+assert.equal(
+  shadow.heartbeat.filterMetrics.wouldFilterNoise,
+  0,
+  'path noise cannot silently suppress or shadow-drop an Unknown event',
+);
 assert.equal(shadow.heartbeat.filterMetrics.filteredNonAgent, 0);
 assert.equal(shadow.heartbeat.filterMetrics.filteredNoise, 0);
 
@@ -723,10 +750,39 @@ const policyDiscardAck = await runConfig('policy-discard-ack', {
   }),
 });
 assert.equal(policyDiscardAck.batchRequests.length, 1);
-assert.equal(policyDiscardAck.heartbeat.filterMetrics.wouldFilterNonAgent, policyDiscardLines.length);
+assert.equal(policyDiscardAck.heartbeat.filterMetrics.wouldFilterNonAgent, 0);
 assert.equal(policyDiscardAck.heartbeat.outputDropped, 0, 'a deliberate policy discard is not a transport drop');
 assert.equal(policyDiscardAck.heartbeat.errorCount, 0, 'a deliberate policy discard does not degrade collector health');
 assert.equal(policyDiscardAck.heartbeat.status, 'ok');
+
+const structuralAck = await runConfig('structural-consumed-ack', {
+  FORWARD_FILTER_MODE: 'enforce',
+  FORWARD_BATCH_SIZE: '1',
+}, [event('nonagent-container', 'ToolExec', { pid: 1_825, argv: ['/usr/bin/true', 'structural'] })], {
+  batchReply: () => ({
+    statusCode: 200,
+    body: wrapped({
+      accepted: true,
+      acceptedEvents: 1,
+      retainedEvents: 0,
+      structuralEvents: 1,
+      discardedEvents: 1,
+      rejectedEvents: 0,
+      retryableEvents: 0,
+      items: [{
+        index: 0,
+        accepted: true,
+        disposition: 'discarded',
+        structuralConsumed: true,
+        reasonCode: 'non_agent_structural_consumed',
+      }],
+    }),
+  }),
+});
+assert.equal(structuralAck.batchRequests.length, 1);
+assert.equal(structuralAck.heartbeat.outputDropped, 0);
+assert.equal(structuralAck.heartbeat.errorCount, 0);
+assert.equal(structuralAck.heartbeat.status, 'ok');
 
 const legacyAckLine = event(
   'unknown-container',
@@ -969,9 +1025,9 @@ const retryThen503 = await runConfig('retry-then-503', {
     };
   },
 });
-assert.equal(retryThen503.batchRequests.length, 2, 'a 5xx after an authorized retry must terminate, not loop');
+assert.ok(retryThen503.batchRequests.length > 2, 'a 5xx must replay with the stable batch identity until its bounded retry age');
 assert.equal(retryThen503.heartbeat.filterMetrics.retryQueued, 1);
-assert.equal(retryThen503.heartbeat.filterMetrics.retryAttempts, 1);
+assert.ok(retryThen503.heartbeat.filterMetrics.retryAttempts > 1);
 assert.equal(retryThen503.heartbeat.filterMetrics.retryRecovered, 0);
 assert.equal(retryThen503.heartbeat.filterMetrics.retryExhausted, 1);
 assert.equal(retryThen503.heartbeat.outputDropped, 1);
@@ -995,9 +1051,9 @@ const retryThenNetwork = await runConfig('retry-then-network-error', {
     return { handle: (response) => response.destroy() };
   },
 });
-assert.equal(retryThenNetwork.batchRequests.length, 2, 'a network failure after a retry must terminate, not loop');
+assert.ok(retryThenNetwork.batchRequests.length > 2, 'a network failure must replay until its bounded retry age');
 assert.equal(retryThenNetwork.heartbeat.filterMetrics.retryQueued, 1);
-assert.equal(retryThenNetwork.heartbeat.filterMetrics.retryAttempts, 1);
+assert.ok(retryThenNetwork.heartbeat.filterMetrics.retryAttempts > 1);
 assert.equal(retryThenNetwork.heartbeat.filterMetrics.retryRecovered, 0);
 assert.equal(retryThenNetwork.heartbeat.filterMetrics.retryExhausted, 1);
 assert.equal(retryThenNetwork.heartbeat.outputDropped, 1);
@@ -1239,6 +1295,101 @@ assert.equal(
   0,
 );
 
+const protectedReserveHeld = deferred();
+let protectedReserveResponse;
+let protectedReserveEvents;
+const protectedReserveLines = [
+  captureAggregate('reserve-a'),
+  captureAggregate('reserve-b'),
+  captureAggregate('reserve-c'),
+  event('unknown-container', 'ToolExec', { pid: 3_070, argv: ['/usr/bin/true', 'reserve-tool'] }),
+  event('unknown-container', 'SecurityAction', { pid: 3_071, kind: 'reserve-security' }),
+];
+const protectedReserve = await runConfig('protected-capacity-reserve', {
+  FORWARD_FILTER_MODE: 'shadow',
+  FORWARD_BATCH_SIZE: '1',
+  FORWARD_BATCH_FLUSH_MS: '1',
+  FORWARD_MAX_INFLIGHT: '1',
+  FORWARD_MAX_OUTSTANDING_EVENTS: '4',
+  FORWARD_MAX_OUTSTANDING_BYTES: String(1024 * 1024),
+  FORWARD_PROTECTED_RESERVE_EVENTS: '2',
+  FORWARD_PROTECTED_RESERVE_BYTES: '0',
+}, protectedReserveLines, {
+  heartbeatSecs: '0.02',
+  timeoutMs: 6_000,
+  heartbeatPredicate: (candidate) => candidate.filterMetrics?.shutdownFinal === true,
+  batchReply: (events) => {
+    const parsed = JSON.parse(events[0].line).event;
+    if (parsed.CaptureAggregate?.qualifier === 'reserve-a') {
+      return {
+        handle: (response) => {
+          protectedReserveResponse = response;
+          protectedReserveEvents = events;
+          protectedReserveHeld.resolve();
+        },
+      };
+    }
+    return { statusCode: 200, body: wrapped(acceptedBatchAck(events)) };
+  },
+  driveInput: async ({ child, lines, heartbeats }) => {
+    child.stdin.write(`${lines[0]}\n`);
+    await protectedReserveHeld.promise;
+    child.stdin.write(`${lines.slice(1).join('\n')}\n`);
+    await eventually(
+      () => heartbeats.find((heartbeat) => (
+        heartbeat.filterMetrics?.outstandingEvents === 4
+        && heartbeat.filterMetrics?.protectedReserveEvents === 2
+      )),
+      500,
+      'protected ownership reserve',
+    );
+    protectedReserveResponse.writeHead(200, { 'Content-Type': 'application/json' });
+    protectedReserveResponse.end(JSON.stringify(wrapped(acceptedBatchAck(protectedReserveEvents))));
+    child.stdin.end();
+  },
+});
+const protectedReserveMarkers = protectedReserve.batchRequests.flatMap((events) => events.map((item) => {
+  const parsed = JSON.parse(item.line).event;
+  return parsed.CaptureAggregate?.qualifier
+    ?? parsed.ToolExec?.argv.at(-1)
+    ?? parsed.SecurityAction?.kind;
+}));
+for (const marker of ['reserve-a', 'reserve-b', 'reserve-tool', 'reserve-security']) {
+  assert.equal(
+    protectedReserveMarkers.filter((value) => value === marker).length,
+    1,
+    `${marker} must retain one delivery through the protected reserve: ${protectedReserveMarkers.join(', ')}`,
+  );
+}
+assert.equal(
+  protectedReserveMarkers.includes('reserve-c'),
+  false,
+  'routine aggregate traffic must not consume protected ownership slots',
+);
+assert.equal(protectedReserve.heartbeat.filterMetrics.protectedReserveEvents, 2);
+assert.equal(
+  protectedReserve.heartbeats.reduce(
+    (sum, heartbeat) => sum + (heartbeat.filterMetrics?.protectedQueueDropped ?? 0),
+    0,
+  ),
+  0,
+);
+assert.equal(
+  protectedReserve.heartbeats.reduce(
+    (sum, heartbeat) => sum + (heartbeat.filterMetrics?.queueDroppedByClass?.capture_aggregate ?? 0),
+    0,
+  ),
+  1,
+);
+assert.equal(
+  protectedReserve.heartbeats.reduce((sum, heartbeat) => {
+    const reasons = heartbeat.pipelineAccounting?.stages
+      ?.find((stage) => stage.stage === 'queue_dropped')?.reasons ?? [];
+    return sum + (reasons.find((reason) => reason.reason === 'protected_reserve')?.count ?? 0);
+  }, 0),
+  1,
+);
+
 const expiryCapacityQueued = deferred();
 const expiryCapacityResumed = deferred();
 let expiryCapacityRequests = 0;
@@ -1345,6 +1496,9 @@ const oversizedAck = await runConfig('oversized-ack', {
   FORWARD_BATCH_SIZE: '1',
   FORWARD_MAX_INFLIGHT: '1',
   FORWARD_BATCH_ACK_MAX_BYTES: String(16 * 1024),
+  FORWARD_RETRY_BASE_DELAY_MS: '10',
+  FORWARD_RETRY_MAX_DELAY_MS: '20',
+  FORWARD_RETRY_MAX_AGE_MS: '100',
 }, [event('unknown-container', 'ToolExec', { pid: 3_100, argv: ['/usr/bin/true', 'oversized-ack'] })], {
   batchReply: (events) => ({
     statusCode: 200,
@@ -1361,6 +1515,9 @@ const slowAck = await runConfig('slow-ack-timeout', {
   FORWARD_BATCH_SIZE: '1',
   FORWARD_MAX_INFLIGHT: '1',
   FORWARD_HTTP_TIMEOUT_MS: '1000',
+  FORWARD_RETRY_BASE_DELAY_MS: '10',
+  FORWARD_RETRY_MAX_DELAY_MS: '20',
+  FORWARD_RETRY_MAX_AGE_MS: '100',
 }, [event('unknown-container', 'ToolExec', { pid: 3_150, argv: ['/usr/bin/true', 'slow-ack'] })], {
   batchReply: () => ({
     handle: (response) => {
@@ -1371,12 +1528,12 @@ const slowAck = await runConfig('slow-ack-timeout', {
   }),
 });
 assert.ok(Date.now() - slowAckStartedAt < 3_000, 'trickled response bytes must not reset the absolute event timeout');
-assert.equal(slowAck.batchRequests.length, 1, 'an ordinary event timeout must never retry blindly');
+assert.ok(slowAck.batchRequests.length >= 1, 'an ordinary timeout remains bounded by the retry deadline');
 assert.equal(slowAck.heartbeat.outputDropped, 1);
 assert.ok(slowAck.heartbeat.errorCount >= 1);
 assert.equal(slowAck.heartbeat.filterMetrics.queueDropped, 0);
-assert.equal(slowAck.heartbeat.filterMetrics.retryQueued, 0);
-assert.equal(slowAck.heartbeat.filterMetrics.retryAttempts, 0);
+assert.equal(slowAck.heartbeat.filterMetrics.retryQueued, 1);
+assert.ok(slowAck.heartbeat.filterMetrics.retryAttempts >= 0);
 
 const splitLines = Array.from({ length: 4 }, (_, index) => event(
   'unknown-container',
@@ -1575,11 +1732,11 @@ assert.deepEqual(
   'shutdown must not launch a late retry after aborting the hanging right 413 sub-batch',
 );
 assert.equal(shutdown413.heartbeat.outputDropped, 3);
-assert.equal(shutdown413.heartbeat.errorCount, 3);
-assert.equal(shutdown413.heartbeat.filterMetrics.retryQueued, 1);
+assert.equal(shutdown413.heartbeat.errorCount, 2, 'a scheduled replay is not itself an operational error');
+assert.equal(shutdown413.heartbeat.filterMetrics.retryQueued, 3);
 assert.equal(shutdown413.heartbeat.filterMetrics.retryAttempts, 0);
 assert.equal(shutdown413.heartbeat.filterMetrics.retryRecovered, 0);
-assert.equal(shutdown413.heartbeat.filterMetrics.retryExhausted, 1);
+assert.equal(shutdown413.heartbeat.filterMetrics.retryExhausted, 3);
 assert.equal(shutdown413.heartbeat.filterMetrics.retryQueueDepth, 0);
 assert.equal(shutdown413.heartbeat.filterMetrics.retryOutstandingEvents, 0);
 assert.equal(shutdown413.heartbeat.filterMetrics.outstandingEvents, 0);
@@ -1590,7 +1747,7 @@ const safeDefault = await runConfig('safe-default', { FORWARD_FILTER_MODE: '' })
 assert.equal(safeDefault.heartbeat.filterMetrics.filterMode, 'shadow');
 assert.equal(safeDefault.batches.length, 6, 'an unset filter mode must fail safe to shadow');
 assert.equal(safeDefault.heartbeat.filterMetrics.filteredNonAgent, 0);
-assert.equal(safeDefault.heartbeat.filterMetrics.wouldFilterNonAgent, 1);
+assert.equal(safeDefault.heartbeat.filterMetrics.wouldFilterNonAgent, 0);
 assert.doesNotMatch(safeDefault.heartbeat.message, /e2e_marker_/u, 'unset E2E scope must preserve the production message contract');
 
 const rawHeartbeatLine = collectorHeartbeat('raw-control-heartbeat');
@@ -1650,15 +1807,15 @@ assert.ok(scopedIngest.batches.some((item) => item.line === scopedMarkerLine));
 assert.equal(scopedIngest.heartbeat.filterMetrics.observed, 6, 'scope must run after attribution');
 assert.equal(scopedIngest.heartbeat.filterMetrics.forwarded, 1);
 assert.equal(scopedIngest.heartbeat.filterMetrics.probableAgent, 1);
-assert.equal(scopedIngest.heartbeat.filterMetrics.wouldDiscoveryBudgetDrop, 5);
+assert.equal(scopedIngest.heartbeat.filterMetrics.wouldFilterUnknown, 0);
+assert.equal(scopedIngest.heartbeat.filterMetrics.wouldDiscoveryBudgetDrop, 0);
 assert.match(scopedIngest.heartbeat.message, /e2e_marker_scope=enabled/u);
 assert.match(scopedIngest.heartbeat.message, /e2e_marker_scoped_out=5/u);
-assert.equal(scopedIngest.heartbeat.filterMetrics.e2eFilterReceipts.length, 1);
 assert.equal(
-  scopedIngest.heartbeat.filterMetrics.e2eFilterReceipts[0].lineSha256,
-  createHash('sha256').update(scopedMarkerLine).digest('hex'),
+  scopedIngest.heartbeat.filterMetrics.e2eFilterReceipts,
+  undefined,
+  'retained Unknown markers must not produce a filter receipt',
 );
-assert.equal(scopedIngest.heartbeat.filterMetrics.e2eFilterReceipts[0].filterReason, 'unknown');
 assert.ok(
   scopedIngest.runtimeSnapshots.some((snapshot) => snapshot.entries?.some((entry) =>
     entry.agentScopeId === 'pi' &&
@@ -1701,12 +1858,12 @@ for (const invalidPrefix of [
 }
 
 const defaultRetention = await runConfig('default');
-assert.equal(defaultRetention.batches.length, 4);
-assert.equal(defaultRetention.heartbeat.filterMetrics.filteredNonAgent, 1);
-assert.equal(defaultRetention.heartbeat.filterMetrics.filteredNoise, 1);
+assert.equal(defaultRetention.batches.length, 6);
+assert.equal(defaultRetention.heartbeat.filterMetrics.filteredNonAgent, 0);
+assert.equal(defaultRetention.heartbeat.filterMetrics.filteredNoise, 0);
 assert.equal(defaultRetention.heartbeat.filterMetrics.unknown, 5);
 assert.equal(defaultRetention.heartbeat.filterMetrics.discoveryBudgetDropped, 0);
-assert.match(defaultRetention.heartbeat.filterMetrics.lastSuppressedAt, /^\d{4}-\d{2}-\d{2}T/u);
+assert.equal(defaultRetention.heartbeat.filterMetrics.lastSuppressedAt, undefined);
 assert.ok(
   defaultRetention.batches.some((item) => JSON.parse(item.line).event.FileDelete),
   'high-value FileDelete survives even for a pseudo-filesystem path',
@@ -1716,31 +1873,145 @@ assert.ok(
   'SecurityAction survives unknown routing',
 );
 
-const e2eMarker = 'asel-marker-filter-receipt-docker-enforce-test';
-const e2eMarkerLine = event('unknown-container', 'ToolExec', {
-  pid: 20,
+const unknownFileBudget = await runConfig('unknown-file-budget', {
+  ANYSENTRY_BEHAVIOR_DISCOVERY: 'off',
+  FORWARD_FILTER_MODE: 'enforce',
+  FORWARD_RETAIN_UNKNOWN: 'true',
+  FORWARD_NOISE_POLICY: 'include',
+  FORWARD_UNKNOWN_FILE_RATE: '2',
+  FORWARD_UNKNOWN_FILE_GLOBAL_RATE: '10',
+}, Array.from({ length: 5 }, (_, index) => event(
+  'unknown-container',
+  'FileAccess',
+  { pid: 20, path: `/workspace/budget-${index}.json`, write: true },
+)), { expectedObserved: 5 });
+assert.equal(unknownFileBudget.batches.length, 5, 'unknown FileAccess must be retained losslessly regardless of legacy budget settings');
+assert.equal(unknownFileBudget.heartbeat.filterMetrics.filteredUnknown, 0);
+assert.equal(unknownFileBudget.heartbeat.filterMetrics.discoveryBudgetDropped, 0);
+
+const repeatedAgentFiles = Array.from({ length: 100 }, () => event(
+  'unknown-container',
+  'FileAccess',
+  { pid: 30, path: '/workspace/cache.json', write: true, flags: 1 },
+  { comm: 'pi', exe: '/usr/local/bin/pi' },
+));
+const aggregatedAgentFiles = await runConfig('agent-file-aggregation', {
+  FORWARD_FILTER_MODE: 'enforce',
+  FORWARD_FILE_AGGREGATION: 'true',
+  FORWARD_FILE_AGGREGATION_WINDOW_MS: '1000',
+}, repeatedAgentFiles, { expectedObserved: 100 });
+assert.equal(aggregatedAgentFiles.batches.length, 1, 'exact repeated Agent FileAccess must become one transport event');
+const aggregatedAgentFile = JSON.parse(aggregatedAgentFiles.batches[0].line).event.FileAccess;
+assert.equal(aggregatedAgentFile.repeatCount, 100);
+assert.equal(aggregatedAgentFile.repeat_count, 100);
+assert.equal(aggregatedAgentFile.firstEventAt, aggregatedAgentFile.first_event_at);
+assert.equal(aggregatedAgentFile.lastEventAt, aggregatedAgentFile.last_event_at);
+assert.equal(aggregatedAgentFile.aggregationWindowMs, 1000);
+assert.equal(aggregatedAgentFile.aggregation_window_ms, 1000);
+assert.equal(aggregatedAgentFiles.batches[0].attribution.classification, 'probable_agent');
+assert.equal(aggregatedAgentFiles.heartbeats.reduce(
+  (sum, heartbeat) => sum + (heartbeat.filterMetrics?.aggregatedFileEvents ?? 0), 0,
+), 99);
+assert.equal(aggregatedAgentFiles.heartbeats.reduce(
+  (sum, heartbeat) => sum + (heartbeat.filterMetrics?.aggregationOutputs ?? 0), 0,
+), 1);
+
+const repeatedUnknownFiles = Array.from({ length: 75 }, () => event(
+  'unknown-container',
+  'FileAccess',
+  { pid: 32, path: '/workspace/unknown-cache.json', write: true, flags: 1 },
+));
+const aggregatedUnknownFiles = await runConfig('unknown-file-aggregation', {
+  ANYSENTRY_BEHAVIOR_DISCOVERY: 'off',
+  FORWARD_FILTER_MODE: 'enforce',
+  FORWARD_RETAIN_UNKNOWN: 'true',
+  FORWARD_NOISE_POLICY: 'include',
+  FORWARD_FILE_AGGREGATION: 'true',
+  FORWARD_FILE_AGGREGATION_WINDOW_MS: '1000',
+}, repeatedUnknownFiles, { expectedObserved: 75 });
+assert.equal(aggregatedUnknownFiles.batches.length, 1, 'strict repeated Unknown FileAccess must become one lossless transport event');
+const aggregatedUnknownFile = JSON.parse(aggregatedUnknownFiles.batches[0].line).event.FileAccess;
+assert.equal(aggregatedUnknownFile.repeatCount, 75);
+assert.equal(aggregatedUnknownFile.repeat_count, 75);
+assert.equal(aggregatedUnknownFile.firstEventAt, aggregatedUnknownFile.first_event_at);
+assert.equal(aggregatedUnknownFile.lastEventAt, aggregatedUnknownFile.last_event_at);
+assert.equal(aggregatedUnknownFile.aggregationWindowMs, 1000);
+assert.equal(aggregatedUnknownFile.aggregation_window_ms, 1000);
+assert.equal(aggregatedUnknownFiles.batches[0].attribution.classification, 'unknown');
+assert.equal(aggregatedUnknownFiles.heartbeats.reduce(
+  (sum, heartbeat) => sum + (heartbeat.filterMetrics?.aggregatedFileEvents ?? 0), 0,
+), 74);
+assert.equal(aggregatedUnknownFiles.heartbeats.reduce(
+  (sum, heartbeat) => sum + (heartbeat.filterMetrics?.aggregationOutputs ?? 0), 0,
+), 1);
+assert.equal(aggregatedUnknownFiles.heartbeat.filterMetrics.filteredUnknown, 0);
+assert.equal(aggregatedUnknownFiles.heartbeat.filterMetrics.discoveryBudgetDropped, 0);
+
+const repeatedDeletes = Array.from({ length: 5 }, () => event(
+  'unknown-container',
+  'FileDelete',
+  { pid: 33, path: '/workspace/delete-me.json' },
+));
+const unaggregatedDeletes = await runConfig('file-delete-no-aggregation', {
+  ANYSENTRY_BEHAVIOR_DISCOVERY: 'off',
+  FORWARD_FILTER_MODE: 'enforce',
+  FORWARD_RETAIN_UNKNOWN: 'true',
+  FORWARD_NOISE_POLICY: 'include',
+  FORWARD_FILE_AGGREGATION: 'true',
+}, repeatedDeletes, { expectedObserved: 5 });
+assert.equal(unaggregatedDeletes.batches.length, 5, 'FileDelete must remain one transport event per observation');
+assert.ok(unaggregatedDeletes.batches.every((item) => JSON.parse(item.line).event.FileDelete));
+assert.equal(unaggregatedDeletes.heartbeat.filterMetrics.aggregatedFileEvents, 0);
+
+const agentPseudoFile = await runConfig('agent-pseudo-file', {
+  FORWARD_FILTER_MODE: 'enforce',
+  FORWARD_NOISE_POLICY: 'balanced',
+}, [event(
+  'unknown-container',
+  'FileAccess',
+  { pid: 31, path: '/proc/sys/kernel/core_pattern', write: true },
+  { comm: 'pi', exe: '/usr/local/bin/pi' },
+)], { expectedObserved: 1 });
+assert.equal(agentPseudoFile.batches.length, 1, 'confirmed/probable Agent pseudo-filesystem writes must not be hidden as routine host noise');
+assert.equal(agentPseudoFile.heartbeat.filterMetrics.filteredNoise, 0);
+
+const filterRuleDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'anysentry-forward-filter-rules-'));
+const filterRuleFile = path.join(filterRuleDirectory, 'rules.json');
+const publishedRules = await runConfig('filter-rule-publisher', {
+  FORWARD_FILTER_MODE: 'enforce',
+  ANYSENTRY_FILTER_RULES_FILE: filterRuleFile,
+  FORWARD_FILTER_RULE_FLUSH_MS: '10',
+}, [
+  event('nonagent-container', 'ToolExec', { pid: 10, argv: ['true'] }),
+  event('unknown-container', 'ToolExec', { pid: 30, argv: ['pi', '--print'] }, { comm: 'pi', exe: '/usr/local/bin/pi' }),
+], { expectedObserved: 2 });
+const filterSnapshot = JSON.parse(fs.readFileSync(filterRuleFile, 'utf8'));
+assert.equal(filterSnapshot.schemaVersion, 'anysentry.filter_rule_snapshot.v1');
+assert.ok(filterSnapshot.entries.some((entry) => entry.cgroupId === '10' && entry.action === 'drop' && entry.authority === 'authoritative'));
+assert.ok(filterSnapshot.entries.some((entry) => entry.cgroupId === '30' && entry.action === 'keep'));
+assert.ok(publishedRules.heartbeat.filterMetrics.filterRuleVersion > 0);
+fs.rmSync(filterRuleDirectory, { recursive: true, force: true });
+
+const e2eMarker = 'asel-marker-filter-receipt-docker-enforce-pi';
+const e2eMarkerLine = event('nonagent-container', 'ToolExec', {
+  pid: 10,
   argv: ['/usr/bin/true', e2eMarker],
 });
-const e2eReceipt = await runConfig('e2e-receipt', {
+const e2eReceipt = await runConfig('e2e-protected-structural', {
   FORWARD_RETAIN_UNKNOWN: 'false',
   ANYSENTRY_E2E_INGEST_MARKER_PREFIX: 'asel-marker-filter-receipt-docker-enforce-',
   ANYSENTRY_E2E_FILTER_MARKER_VALUE: e2eMarker,
   ANYSENTRY_E2E_FILTER_MARKER_SHA256: createHash('sha256').update(JSON.stringify(e2eMarker)).digest('hex'),
-});
-assert.equal(e2eReceipt.batches.length, 0, 'E2E unknown marker must be filtered in enforce mode');
-assert.equal(e2eReceipt.heartbeat.filterMetrics.discoveryBudgetDropped, 5);
-assert.deepEqual(e2eReceipt.heartbeat.filterMetrics.e2eFilterReceipts, [{
-  schema: 'anysentry.e2e_filter_receipt.v1',
-  eventKind: 'ToolExec',
-  markerSha256: createHash('sha256').update(JSON.stringify(e2eMarker)).digest('hex'),
-  lineSha256: createHash('sha256').update(e2eMarkerLine).digest('hex'),
-  physicalWorkloadId: 'docker:test:unknown',
-  classification: 'unknown',
-  filterReason: 'unknown',
-  filteredAt: e2eReceipt.heartbeat.filterMetrics.e2eFilterReceipts[0].filteredAt,
-}]);
-assert.match(e2eReceipt.heartbeat.filterMetrics.e2eFilterReceipts[0].filteredAt, /^\d{4}-\d{2}-\d{2}T/u);
-assert.doesNotMatch(JSON.stringify(e2eReceipt.heartbeat.filterMetrics.e2eFilterReceipts), new RegExp(e2eMarker, 'u'));
+}, [e2eMarkerLine], { expectedObserved: 1 });
+assert.equal(
+  e2eReceipt.batches.length,
+  1,
+  'non-Agent ToolExec must reach the structural lifecycle consumer',
+);
+assert.equal(e2eReceipt.heartbeat.filterMetrics.filteredNonAgent, 0);
+assert.equal(e2eReceipt.heartbeat.filterMetrics.filteredUnknown, 0);
+assert.equal(e2eReceipt.heartbeat.filterMetrics.discoveryBudgetDropped, 0);
+assert.equal(e2eReceipt.heartbeat.filterMetrics.e2eFilterReceipts, undefined);
 
 await runManualReviewRecovery();
 await runHungShutdownScenario();

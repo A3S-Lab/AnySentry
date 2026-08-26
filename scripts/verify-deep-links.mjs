@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { createHash } from 'node:crypto';
 import { managementAuthHeaders, safeProbeId } from './probe-id.mjs';
 
 const baseUrl = (process.env.ANYSENTRY_API_BASE ?? process.env.API_BASE ?? `http://127.0.0.1:${process.env.PORT ?? '29653'}/security-center`).replace(/\/$/, '');
@@ -296,12 +297,14 @@ async function verifyAgentsAndWorkspaces() {
     [workspaceAgentB, ids.workspaceB, `${runId} Workspace B`, undefined],
   ];
   for (const [agentId, workspacePath, displayName, owner] of fixtures) {
-    const physicalWorkloadId = `deep-link:${workspacePath}:${agentId}`;
+    const containerId = createHash('sha256').update(`${workspacePath}\0${agentId}`).digest('hex');
+    const physicalWorkloadId = `container:${containerId}`;
+    const agentInstanceId = `docker:${containerId}`;
     const metadata = await request(`/agents/${encodeURIComponent(agentId)}/metadata`, 'PUT', {
       workspacePath,
-      identityKeys: [agentId, physicalWorkloadId],
+      identityKeys: [containerId, physicalWorkloadId],
       physicalWorkloadId,
-      agentInstanceId: `deep-link:${agentId}`,
+      agentInstanceId,
       displayName,
       owner,
       environment: 'dev',
@@ -313,14 +316,15 @@ async function verifyAgentsAndWorkspaces() {
       agentAssetId: metadata.agentAssetId,
       decision: 'confirmed_agent',
       currentClassification: 'unknown',
-      identityKeys: [agentId],
-      agentInstanceId: `deep-link:${agentId}`,
+      identityKeys: [containerId],
+      agentInstanceId,
       physicalWorkloadId,
       workloadRef: {
-        environment: 'host',
-        kind: 'process',
+        environment: 'docker',
+        kind: 'container',
         name: agentId,
-        processName: agentId,
+        containerName: agentId,
+        containerImage: 'anysentry/deep-link-fixture:local',
       },
       note: 'confirmed by deep-link verifier',
     });

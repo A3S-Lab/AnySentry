@@ -27,7 +27,7 @@ assert.match(clickhouse, /GROUP BY bucketIndex, identityKey/);
 assert.match(clickhouse, /GROUP BY workspacePath/);
 assert.match(clickhouse, /JSONExtractString\(process, 'cwd'\)/);
 assert.match(clickhouse, /groupUniqArrayIf\(collectorId, collectorId != ''\) AS collectorKeys/);
-assert.match(clickhouse, /countIf\(collectorId = ''\) AS eventsWithoutCollector/);
+assert.match(clickhouse, /countIf\(collectorId = '' AND eventKind NOT IN \('AgentTool', 'AgentInvocation', 'SystemContext'\)\) AS eventsWithoutCollector/);
 assert.match(clickhouse, /tuple\(decisionRevision, decisionUpdatedAt, at\)/);
 assert.match(clickhouse, /eventId NOT IN \{excludedEventIds:Array\(String\)\}/);
 assert.match(clickhouse, /if \(input\.monitoredOnly\) conditions\.push\('agentMonitored = 1'\)/);

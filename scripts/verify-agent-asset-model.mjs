@@ -23,7 +23,7 @@ function event({
   agentId,
   pid,
   rootPid,
-  rootStartTime = `root-${rootPid}`,
+  rootStartTime = String(rootPid * 10),
   workspacePath = '/home/user/security/AnySentry',
 }) {
   return {
@@ -98,7 +98,7 @@ const reusedRootPid = event({
   agentId: 'bash',
   pid: 104,
   rootPid: 100,
-  rootStartTime: 'new-root-100',
+  rootStartTime: '1001',
 });
 
 assert.equal(
@@ -274,7 +274,7 @@ const windowOne = event({
   agentId: 'a3s code',
   pid: 801,
   rootPid: 800,
-  rootStartTime: 'window-one-start',
+  rootStartTime: '8000',
   workspacePath: '/home/user/code',
 });
 windowOne.eventId = 'window-one-event';
@@ -285,6 +285,8 @@ windowOne.process.pid = 800;
 windowOne.process.ppid = 1;
 windowOne.process.comm = 'a3s';
 windowOne.process.exe = '/usr/bin/a3s';
+windowOne.process.systemdUnit = 'a3s-agent.service';
+windowOne.attribution.workloadRef.systemdUnit = 'a3s-agent.service';
 
 const windowTwo = structuredClone(windowOne);
 windowTwo.eventId = 'window-two-event';
@@ -296,7 +298,7 @@ windowTwo.runId = 'run-window-two';
 windowTwo.process.pid = 900;
 windowTwo.process.startTimeTicks = '9000';
 windowTwo.attribution.rootPid = 900;
-windowTwo.attribution.rootStartTime = 'window-two-start';
+windowTwo.attribution.rootStartTime = '9000';
 
 const windowOneRuntimeId = agentRuntimeInstanceIdForEvent(windowOne);
 const windowTwoRuntimeId = agentRuntimeInstanceIdForEvent(windowTwo);

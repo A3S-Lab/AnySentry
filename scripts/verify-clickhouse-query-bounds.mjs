@@ -2,10 +2,29 @@
 
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { AggregationService } from '../apps/api/dist/security-monitoring/aggregation.service.js';
+import {
+  AggregationService,
+  BoundedHistoryQueryGate,
+} from '../apps/api/dist/security-monitoring/aggregation.service.js';
 import { ClickHouseStore } from '../apps/api/dist/security-monitoring/clickhouse-store.js';
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+// Historical reads fail closed instead of queueing, so a burst of dashboard tabs cannot turn
+// ClickHouse pressure into API heap growth or continue work after the browser request times out.
+{
+  const gate = new BoundedHistoryQueryGate(1);
+  let releaseFirst;
+  const first = gate.run(() => new Promise((resolve) => {
+    releaseFirst = () => resolve('first');
+  }));
+  await delay(0);
+  assert.equal(await gate.run(async () => 'overflow'), null);
+  assert.deepEqual(gate.status(), { active: 1, concurrency: 1, rejected: 1 });
+  releaseFirst();
+  assert.equal(await first, 'first');
+  assert.equal(await gate.run(async () => 'second'), 'second');
+}
 
 function fakeClient() {
   const state = {
@@ -59,7 +78,7 @@ function assertBoundedSettings(call, { maxThreads = 2, smallBlocks = false, maxM
 
 function assertHydrateSettings(call) {
   assert.equal(call.clickhouse_settings?.max_threads, 1);
-  assert.equal(call.clickhouse_settings?.max_memory_usage, String(640 * 1024 * 1024));
+  assert.equal(call.clickhouse_settings?.max_memory_usage, String(512 * 1024 * 1024));
   assert.equal(call.clickhouse_settings?.max_block_size, '1024');
   assert.equal(call.clickhouse_settings?.preferred_block_size_bytes, String(1024 * 1024));
   assert.equal(call.clickhouse_settings?.min_bytes_to_use_direct_io, String(1024 * 1024));
@@ -79,13 +98,25 @@ store.ready = true;
 const fake = fakeClient();
 store.client = fake.client;
 
+assert.equal(
+  await store.dashboardAggregateBucketFacts(0, 3_610_000, 10_000),
+  null,
+  'a comparison range wider than one hour must fail closed before loading factsJson into Node',
+);
+assert.equal(fake.state.calls.length, 0);
+
 const hydrated = await store.hydrate(100, 10_000);
 assert.deepEqual(hydrated, []);
 assert.equal(fake.state.calls.length, 1);
 const hydrateCall = fake.state.calls[0];
 assertHydrateSettings(hydrateCall);
-assert.match(hydrateCall.query, /PREWHERE at >= \{since:UInt64\}[\s\S]*ORDER BY at DESC\s+LIMIT \{scanLimit:UInt32\} WITH TIES/u);
-assert.match(hydrateCall.query, /ORDER BY at DESC, decisionUpdatedAt DESC\s+LIMIT 1 BY eventId\s+LIMIT \{limit:UInt32\}/u);
+assert.equal(hydrateCall.query_params.limit, 10_000);
+assert.equal(hydrateCall.query_params.scanLimit, 30_000);
+assert.match(hydrateCall.query, /PREWHERE at >= \{since:UInt64\} AND at <= \{until:UInt64\}/u);
+assert.match(hydrateCall.query, /_part AS selectedPart/u);
+assert.match(hydrateCall.query, /tuple\(e\.at, e\._part, e\._part_offset\) IN/u);
+assert.doesNotMatch(hydrateCall.query, /SELECT \*\s+FROM events\s+PREWHERE/u,
+  'startup hydration must not sort complete wide event rows');
 assert.doesNotMatch(hydrateCall.query, /ORDER BY at ASC/u);
 assert.equal(fake.state.active, 0);
 
@@ -163,6 +194,61 @@ assert.ok(searchResultLimit > searchSelectedLimit,
   'the same bound must be re-applied after complete rows are materialized');
 assert.equal(searchCall.query.match(/LIMIT \{limit:UInt32\}/gu)?.length, 2,
   'durable search must bound both the locator set and the final complete-row result');
+assert.equal(fake.state.active, 0);
+
+fake.state.calls.length = 0;
+const processScoped = await store.searchEvents({
+  sinceMs: 100,
+  untilMs: 200,
+  invocationId: 'invocation-s6',
+  toolCallId: 'tool-call-s6',
+  processHostId: 'host-s6',
+  processBootId: 'boot-s6',
+  processPid: 42,
+  processPpid: 41,
+  processStartTimeTicks: '9001',
+  evidenceResourceHashes: ['a'.repeat(64)],
+  evidenceCommandHashes: ['b'.repeat(64)],
+  limit: 200,
+});
+assert.deepEqual(processScoped, []);
+assert.equal(fake.state.calls.length, 1);
+const processScopedCall = fake.state.calls[0];
+assert.match(processScopedCall.query, /invocationId = \{invocationId:String\}/u);
+assert.match(processScopedCall.query, /toolCallId = \{toolCallId:String\}/u);
+assert.match(processScopedCall.query, /processHostId = \{processHostId:String\}/u);
+assert.match(processScopedCall.query, /processBootId = \{processBootId:String\}/u);
+assert.match(processScopedCall.query, /processStartTimeTicks = \{processStartTimeTicks:String\}/u);
+assert.match(processScopedCall.query, /processPid = \{processPid:UInt64\}/u);
+assert.match(processScopedCall.query, /processPpid = \{processPpid:UInt64\}/u);
+assert.match(processScopedCall.query, /evidenceResourceHash IN \{evidenceResourceHashes:Array\(String\)\}/u);
+assert.match(processScopedCall.query, /evidenceCommandHash IN \{evidenceCommandHashes:Array\(String\)\}/u);
+assert.deepEqual(processScopedCall.query_params.evidenceResourceHashes, ['a'.repeat(64)]);
+assert.deepEqual(processScopedCall.query_params.evidenceCommandHashes, ['b'.repeat(64)]);
+assert.equal(processScopedCall.query_params.processPid, 42);
+assert.equal(processScopedCall.query_params.processPpid, 41);
+assert.equal(fake.state.active, 0);
+
+fake.state.calls.length = 0;
+const namespaceScoped = await store.searchEvents({
+  sinceMs: 100,
+  untilMs: 200,
+  processBootId: 'boot-s6',
+  processPidNamespace: '4026532441',
+  processNamespacePid: 1,
+  processNamespacePpid: 1,
+  processStartTimeTicks: '9001',
+  limit: 200,
+});
+assert.deepEqual(namespaceScoped, []);
+assert.equal(fake.state.calls.length, 1);
+const namespaceScopedCall = fake.state.calls[0];
+assert.match(namespaceScopedCall.query, /processPidNamespace = \{processPidNamespace:String\}/u);
+assert.match(namespaceScopedCall.query, /processNamespacePid = \{processNamespacePid:UInt64\}/u);
+assert.match(namespaceScopedCall.query, /processNamespacePpid = \{processNamespacePpid:UInt64\}/u);
+assert.equal(namespaceScopedCall.query_params.processPidNamespace, '4026532441');
+assert.equal(namespaceScopedCall.query_params.processNamespacePid, 1);
+assert.equal(namespaceScopedCall.query_params.processNamespacePpid, 1);
 assert.equal(fake.state.active, 0);
 
 fake.state.calls.length = 0;
@@ -382,15 +468,46 @@ const aggregationSource = await readFile(
   new URL('../apps/api/src/security-monitoring/aggregation.service.ts', import.meta.url),
   'utf8',
 );
+const clickhouseSource = await readFile(
+  new URL('../apps/api/src/security-monitoring/clickhouse-store.ts', import.meta.url),
+  'utf8',
+);
+assert.match(clickhouseSource, /BOUNDED_PROCESS_LIFECYCLE_READ_SETTINGS/);
+assert.match(clickhouseSource, /max_memory_usage: String\(96 \* 1024 \* 1024\)/);
+assert.match(
+  clickhouseSource,
+  /async readRecentProcessLifecycleFacts[\s\S]*?clickhouse_settings: BOUNDED_PROCESS_LIFECYCLE_READ_SETTINGS/u,
+);
 const eventWindowMethod = aggregationSource.slice(
   aggregationSource.indexOf('async agentEventsForWindow'),
   aggregationSource.indexOf('async storedAgentEvents'),
 );
 assert.match(eventWindowMethod, /filter\.agentAssetId/u);
 assert.match(eventWindowMethod, /filter\.q/u);
-assert.match(eventWindowMethod, /const history = hasDetailedFilter \? null : await this\.history\(filter\)/u);
+assert.match(eventWindowMethod, /const needsCurrentIdentityOverlay = filter\.scope === 'agent'[\s\S]{0,160}resolvedClassificationView\(filter\) === 'current_effective'/u);
+assert.match(eventWindowMethod, /const history = hasDetailedFilter \|\| needsCurrentIdentityOverlay \? null : await this\.history\(filter\)/u);
 assert.match(eventWindowMethod, /const totalApproximate = hasDetailedFilter \|\| !history/u);
 assert.match(eventWindowMethod, /persisted\.length >= persistedLimit/u);
+
+const storedEventMethod = aggregationSource.slice(
+  aggregationSource.indexOf('private async computeStoredAgentEvents'),
+  aggregationSource.indexOf('async storedAgentTimeline'),
+);
+assert.match(storedEventMethod, /needsWidePostFilter/u);
+assert.match(storedEventMethod, /needsWidePostFilter \? 2_000 : 1_000/u);
+assert.match(storedEventMethod, /limit \* \(needsWidePostFilter \? 10 : 4\)/u);
+assert.match(storedEventMethod, /const candidateLimit = pinnedEventId/u);
+assert.match(storedEventMethod, /Math\.max\(scanLimit \* 3, limit \* \(needsWidePostFilter \? 100 : 12\)\)/u);
+assert.match(
+  aggregationSource,
+  /monitoredOnly: !pinnedEventId &&[\s\S]*?filter\.scope === 'agent' &&[\s\S]*?resolvedClassificationView\(filter\) === 'as_observed'/u,
+  'as-observed Agent pages must narrow on the legacy monitored membership before wide-row materialisation',
+);
+assert.match(
+  aggregationSource,
+  /agentScoped && classificationView === 'as_observed'[\s\S]*?isMonitoredAgentEvent\(e\)/u,
+  'hot and durable Agent event lists must use the same occurrence-time monitored membership',
+);
 
 const apiTypesSource = await readFile(
   new URL('../apps/api/src/security-monitoring/types.ts', import.meta.url),
@@ -412,7 +529,7 @@ assert.match(apiTypesSource, /interface AgentEventList[\s\S]*totalApproximate\?:
 assert.match(apiTypesSource, /interface AgentEventList[\s\S]*storageFallback\?: 'hot_ring'/u);
 assert.match(webApiSource, /interface AgentEventList[\s\S]*totalApproximate\?: boolean/u);
 assert.match(webApiSource, /interface AgentEventList[\s\S]*storageFallback\?: "hot_ring"/u);
-assert.match(agentEventsPageSource, /data\.totalApproximate \? "≈"/u);
+assert.match(agentEventsPageSource, /visibleData\.totalApproximate \? "≈"/u);
 assert.match(monitorPageSource, /events\.totalApproximate \? "≈"/u);
 assert.match(webApiSource, /const DASHBOARD_HISTORY_TIMEOUT_MS = 45_000/u);
 assert.match(webApiSource, /dashboardPost<SecurityExplainabilityScan>\("\/security-center\/top\/explainabilityScan", filter\)/u);
@@ -466,6 +583,17 @@ store.client = fake.client;
 assert.ok(await store.dashboardWindowHistory(1_300, 1_400, 8), 'the slot must release after both detail siblings settle');
 
 let historyCalls = 0;
+const agentMetadataStub = {
+  identitySnapshotVersion: () => 0,
+  canonicalAgentAssetId: (value) => value,
+  resolveEvent: (event) => ({
+    agentAssetId: event?.agentId ?? 'asset-unknown',
+    displayName: event?.agentId ?? 'Unknown',
+    detectedName: event?.agentId ?? 'Unknown',
+    detectedClassification: event?.attribution?.classification ?? 'unknown',
+    effectiveClassification: event?.attribution?.classification ?? 'unknown',
+  }),
+};
 const aggregation = new AggregationService(
   {
     dashboardWindowHistory() {
@@ -473,12 +601,17 @@ const aggregation = new AggregationService(
       return Promise.resolve(null);
     },
   },
-  {},
+  agentMetadataStub,
   {},
   {},
 );
-await aggregation.history({ timeType: 'last_1d' });
-await aggregation.history({ timeType: 'last_1d' });
+const failedExactFilter = {
+  timeType: 'custom',
+  startTime: '2026-08-22T00:00:00.000Z',
+  endTime: '2026-08-22T00:01:00.000Z',
+};
+await aggregation.history(failedExactFilter);
+await aggregation.history(failedExactFilter);
 assert.equal(historyCalls, 1, 'a failed history query must be negatively cached for a short backoff');
 
 let uniqueHistoryCalls = 0;
@@ -489,7 +622,7 @@ const unresolvedAggregation = new AggregationService(
       return new Promise(() => {});
     },
   },
-  {},
+  agentMetadataStub,
   {},
   {},
 );
@@ -511,7 +644,7 @@ const detailedAggregation = new AggregationService(
       return Promise.resolve(null);
     },
   },
-  {},
+  agentMetadataStub,
   {},
   {},
 );
@@ -531,7 +664,7 @@ const failedDurableAggregation = new AggregationService(
     searchStoredEvents: async () => null,
     queryRange: () => [],
   },
-  {},
+  agentMetadataStub,
   {},
   {},
 );
@@ -548,7 +681,7 @@ const unavailableDurableAggregation = new AggregationService(
     storageStatus: () => ({ clickhouseReady: false }),
     query: () => [],
   },
-  {},
+  agentMetadataStub,
   {},
   {},
 );
@@ -560,6 +693,8 @@ assert.equal(unavailableDurable.storageFallback, 'hot_ring',
   'an unavailable durable store must identify its fallback source');
 
 let timelineQuery;
+const previousTrustedCorrelationMode = process.env.ANYSENTRY_TRUSTED_CORRELATION_MODE;
+process.env.ANYSENTRY_TRUSTED_CORRELATION_MODE = 'shadow';
 const timelineAggregation = new AggregationService(
   {
     storageStatus: () => ({ clickhouseReady: true }),
@@ -570,22 +705,33 @@ const timelineAggregation = new AggregationService(
     },
     queryRange: () => [],
   },
-  {},
+  agentMetadataStub,
   {},
   {},
 );
 await timelineAggregation.storedAgentTimeline({
   timeType: 'last_30d',
   agentInstanceId: 'instance-a',
+  invocationId: 'invocation-a',
   eventKind: 'ToolExec',
   eventCategory: 'tool',
   activityContext: 'agent_action',
   limit: 25,
 });
 assert.equal(timelineQuery.agentInstanceId, 'instance-a');
+assert.equal(
+  timelineQuery.invocationId,
+  'invocation-a',
+  'durable timeline must push Invocation into ClickHouse before its result limit can be consumed by unrelated noise',
+);
 assert.equal(timelineQuery.eventKind, 'ToolExec');
 assert.equal(timelineQuery.eventCategory, 'tool');
 assert.equal(timelineQuery.activityContext, 'agent_action');
+if (previousTrustedCorrelationMode === undefined) {
+  delete process.env.ANYSENTRY_TRUSTED_CORRELATION_MODE;
+} else {
+  process.env.ANYSENTRY_TRUSTED_CORRELATION_MODE = previousTrustedCorrelationMode;
+}
 
 let durableAggregationCalls = 0;
 let markDurableAggregationStarted;
@@ -604,7 +750,7 @@ const coalescingDurableAggregation = new AggregationService(
     },
     queryRange: () => [],
   },
-  {},
+  agentMetadataStub,
   {},
   {},
 );
@@ -684,7 +830,7 @@ const recoveringDurableAggregation = new AggregationService(
     },
     queryRange: () => [],
   },
-  {},
+  agentMetadataStub,
   {},
   {},
 );
@@ -742,6 +888,7 @@ const pinnedAggregation = new AggregationService(
     queryRange: () => [],
   },
   {
+    identitySnapshotVersion: () => 0,
     canonicalAgentAssetId: (value) => value,
     resolveEvent: () => ({
       agentAssetId: 'asset-a',
@@ -751,7 +898,7 @@ const pinnedAggregation = new AggregationService(
       effectiveClassification: 'probable_agent',
     }),
   },
-  {},
+  agentMetadataStub,
   {},
 );
 const pinnedResult = await pinnedAggregation.storedAgentEvents({
@@ -783,7 +930,7 @@ const customWindowAggregation = new AggregationService(
       return [];
     },
   },
-  {},
+  agentMetadataStub,
   {},
   {},
 );
