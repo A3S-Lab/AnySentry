@@ -640,9 +640,10 @@ async function runHungShutdownScenario() {
       identityErrors: item.body.filterMetrics?.identityErrors,
       runtimeSnapshotErrors: item.body.filterMetrics?.runtimeSnapshotErrors,
     })))}`);
-    assert.equal(finalHeartbeat.body.outputDropped, 1);
+    assert.equal(finalHeartbeat.body.outputDropped, 0);
     assert.equal(finalHeartbeat.body.errorCount, 1);
     assert.equal(finalHeartbeat.body.filterMetrics?.queueDropped, 0);
+    assert.equal(finalHeartbeat.body.filterMetrics?.retryParked, 1);
     assert.equal(finalHeartbeat.body.filterMetrics?.identityErrors, 0);
     assert.equal(finalHeartbeat.body.filterMetrics?.runtimeSnapshotErrors, 0);
     assert.equal(finalHeartbeat.body.filterMetrics?.runtimeLeaseErrors, 0);
@@ -986,7 +987,8 @@ const wrongRetryReason = await runConfig('wrong-retry-reason', {
 assert.equal(wrongRetryReason.batchRequests.length, 1, 'an unrecognized retry reason must never replay');
 assert.equal(wrongRetryReason.heartbeat.filterMetrics.retryQueued, 0);
 assert.equal(wrongRetryReason.heartbeat.filterMetrics.retryAttempts, 0);
-assert.equal(wrongRetryReason.heartbeat.outputDropped, 1);
+assert.equal(wrongRetryReason.heartbeat.outputDropped, 0);
+assert.equal(wrongRetryReason.heartbeat.filterMetrics.queueParked, 1);
 assert.ok(wrongRetryReason.heartbeat.errorCount >= 1);
 
 const nonSuffixRetryLines = Array.from({ length: 2 }, (_, index) => event(
@@ -1021,7 +1023,8 @@ const nonSuffixRetry = await runConfig('non-suffix-retry', {
   }),
 });
 assert.equal(nonSuffixRetry.batchRequests.length, 1, 'retryable items must be a contiguous ACK suffix');
-assert.equal(nonSuffixRetry.heartbeat.outputDropped, 2);
+assert.equal(nonSuffixRetry.heartbeat.outputDropped, 0);
+assert.equal(nonSuffixRetry.heartbeat.filterMetrics.queueParked, 2);
 assert.equal(nonSuffixRetry.heartbeat.filterMetrics.retryQueued, 0);
 
 let retryThen503Requests = 0;
@@ -1050,7 +1053,8 @@ assert.equal(retryThen503.heartbeat.filterMetrics.retryQueued, 1);
 assert.ok(retryThen503.heartbeat.filterMetrics.retryAttempts > 1);
 assert.equal(retryThen503.heartbeat.filterMetrics.retryRecovered, 0);
 assert.equal(retryThen503.heartbeat.filterMetrics.retryExhausted, 1);
-assert.equal(retryThen503.heartbeat.outputDropped, 1);
+assert.equal(retryThen503.heartbeat.filterMetrics.retryParked, 1);
+assert.equal(retryThen503.heartbeat.outputDropped, 0);
 assert.ok(retryThen503.heartbeat.errorCount >= 1);
 
 let retryThenNetworkRequests = 0;
@@ -1076,10 +1080,11 @@ assert.equal(retryThenNetwork.heartbeat.filterMetrics.retryQueued, 1);
 assert.ok(retryThenNetwork.heartbeat.filterMetrics.retryAttempts > 1);
 assert.equal(retryThenNetwork.heartbeat.filterMetrics.retryRecovered, 0);
 assert.equal(retryThenNetwork.heartbeat.filterMetrics.retryExhausted, 1);
-assert.equal(retryThenNetwork.heartbeat.outputDropped, 1);
+assert.equal(retryThenNetwork.heartbeat.filterMetrics.retryParked, 1);
+assert.equal(retryThenNetwork.heartbeat.outputDropped, 0);
 assert.ok(retryThenNetwork.heartbeat.errorCount >= 1);
 
-const retryAgeStartedAt = Date.now();
+let retryAgeFirstRequestAt = 0;
 const retryAge = await runConfig('retry-max-age', {
   FORWARD_FILTER_MODE: 'shadow',
   FORWARD_BATCH_SIZE: '1',
@@ -1089,20 +1094,24 @@ const retryAge = await runConfig('retry-max-age', {
   FORWARD_RETRY_MAX_AGE_MS: '100',
 }, [event('unknown-container', 'ToolExec', { pid: 3_045, argv: ['/usr/bin/true', 'retry-max-age'] })], {
   heartbeatSecs: '60',
-  batchReply: (events) => ({ statusCode: 200, body: wrapped(retryableBatchAck(events, 0)) }),
+  batchReply: (events) => {
+    retryAgeFirstRequestAt ||= Date.now();
+    return { statusCode: 200, body: wrapped(retryableBatchAck(events, 0)) };
+  },
 });
 assert.ok(retryAge.batchRequests.length >= 2, 'an explicitly retryable item must be attempted');
 assert.ok(retryAge.batchRequests.length < 20, 'retry age must bound the number of attempts');
-assert.ok(Date.now() - retryAgeStartedAt < 1_000, 'the configured retry age is an end-to-end deadline');
+assert.ok(Date.now() - retryAgeFirstRequestAt < 1_000, 'the configured retry age is an end-to-end deadline');
 assert.equal(retryAge.heartbeat.filterMetrics.retryQueued, 1);
 assert.equal(retryAge.heartbeat.filterMetrics.retryAttempts, retryAge.batchRequests.length - 1);
 assert.equal(retryAge.heartbeat.filterMetrics.retryRecovered, 0);
 assert.equal(retryAge.heartbeat.filterMetrics.retryExhausted, 1);
-assert.equal(retryAge.heartbeat.outputDropped, 1);
+assert.equal(retryAge.heartbeat.filterMetrics.retryParked, 1);
+assert.equal(retryAge.heartbeat.outputDropped, 0);
 assert.ok(retryAge.heartbeat.errorCount >= 1);
 
 let slowRetryDeadlineRequests = 0;
-const slowRetryDeadlineStartedAt = Date.now();
+let slowRetryDeadlineFirstRequestAt = 0;
 const slowRetryDeadline = await runConfig('retry-request-absolute-deadline', {
   FORWARD_FILTER_MODE: 'shadow',
   FORWARD_BATCH_SIZE: '1',
@@ -1110,10 +1119,11 @@ const slowRetryDeadline = await runConfig('retry-request-absolute-deadline', {
   FORWARD_RETRY_BASE_DELAY_MS: '10',
   FORWARD_RETRY_MAX_DELAY_MS: '20',
   FORWARD_RETRY_MAX_AGE_MS: '150',
-  FORWARD_HTTP_TIMEOUT_MS: '4000',
+  FORWARD_HTTP_TIMEOUT_MS: '10000',
 }, [event('unknown-container', 'ToolExec', { pid: 3_046, argv: ['/usr/bin/true', 'slow-retry-deadline'] })], {
   heartbeatSecs: '60',
   batchReply: (events) => {
+    slowRetryDeadlineFirstRequestAt ||= Date.now();
     slowRetryDeadlineRequests++;
     if (slowRetryDeadlineRequests === 1) {
       return { statusCode: 200, body: wrapped(retryableBatchAck(events)) };
@@ -1129,16 +1139,15 @@ const slowRetryDeadline = await runConfig('retry-request-absolute-deadline', {
 });
 assert.equal(slowRetryDeadline.batchRequests.length, 2);
 assert.ok(
-  // Keep the gate well below the erroneous 4 s HTTP timeout while allowing host-level image and
-  // database I/O to pause the verifier event loop during the full contract suite.
-  Date.now() - slowRetryDeadlineStartedAt < 2_000,
+  Date.now() - slowRetryDeadlineFirstRequestAt < 2_000,
   'an in-flight authorized retry must use the remaining retry age, not reset the HTTP timeout',
 );
 assert.equal(slowRetryDeadline.heartbeat.filterMetrics.retryQueued, 1);
 assert.equal(slowRetryDeadline.heartbeat.filterMetrics.retryAttempts, 1);
 assert.equal(slowRetryDeadline.heartbeat.filterMetrics.retryRecovered, 0);
 assert.equal(slowRetryDeadline.heartbeat.filterMetrics.retryExhausted, 1);
-assert.equal(slowRetryDeadline.heartbeat.outputDropped, 1);
+assert.equal(slowRetryDeadline.heartbeat.filterMetrics.retryParked, 1);
+assert.equal(slowRetryDeadline.heartbeat.outputDropped, 0);
 assert.ok(slowRetryDeadline.heartbeat.errorCount >= 1);
 
 const sigtermRetryStarted = deferred();
@@ -1310,6 +1319,10 @@ assert.equal(
 );
 assert.equal(
   capacity.heartbeats.reduce((sum, heartbeat) => sum + (heartbeat.outputDropped ?? 0), 0),
+  0,
+);
+assert.equal(
+  capacity.heartbeats.reduce((sum, heartbeat) => sum + (heartbeat.filterMetrics?.queueParked ?? 0), 0),
   1,
 );
 assert.equal(
@@ -1475,6 +1488,10 @@ assert.equal(
 );
 assert.equal(
   expiryCapacity.heartbeats.reduce((sum, heartbeat) => sum + (heartbeat.outputDropped ?? 0), 0),
+  0,
+);
+assert.equal(
+  expiryCapacity.heartbeats.reduce((sum, heartbeat) => sum + (heartbeat.filterMetrics?.retryParked ?? 0), 0),
   1,
 );
 assert.equal(expiryCapacity.heartbeat.filterMetrics.outstandingEvents, 0);
@@ -1493,7 +1510,8 @@ assert.equal(byteCapacity.batchRequests.length, 0, 'an event exceeding the unifi
 assert.equal(byteCapacity.heartbeat.filterMetrics.outstandingByteLimit, 1024);
 assert.equal(byteCapacity.heartbeat.filterMetrics.outstandingBytes, 0);
 assert.equal(byteCapacity.heartbeat.filterMetrics.queueDropped, 1);
-assert.equal(byteCapacity.heartbeat.outputDropped, 1);
+assert.equal(byteCapacity.heartbeat.filterMetrics.queueParked, 1);
+assert.equal(byteCapacity.heartbeat.outputDropped, 0);
 
 const contradictoryDisposition = await runConfig('contradictory-disposition', {
   FORWARD_FILTER_MODE: 'shadow',
@@ -1510,7 +1528,8 @@ const contradictoryDisposition = await runConfig('contradictory-disposition', {
     }),
   }),
 });
-assert.equal(contradictoryDisposition.heartbeat.outputDropped, 1, 'a contradictory ACK disposition fails closed');
+assert.equal(contradictoryDisposition.heartbeat.outputDropped, 0, 'an uncertain ACK remains recoverable in the spool');
+assert.equal(contradictoryDisposition.heartbeat.filterMetrics.queueParked, 1);
 assert.ok(contradictoryDisposition.heartbeat.errorCount >= 1);
 
 const oversizedAck = await runConfig('oversized-ack', {
@@ -1527,11 +1546,12 @@ const oversizedAck = await runConfig('oversized-ack', {
     body: { ...wrapped(acceptedBatchAck(events)), padding: 'x'.repeat(20 * 1024) },
   }),
 });
-assert.equal(oversizedAck.heartbeat.outputDropped, 1, 'an oversized batch ACK must fail within its memory bound');
+assert.equal(oversizedAck.heartbeat.outputDropped, 0, 'an oversized ACK leaves the event recoverable in the spool');
+assert.equal(oversizedAck.heartbeat.filterMetrics.retryParked, 1);
 assert.ok(oversizedAck.heartbeat.errorCount >= 1);
 assert.equal(oversizedAck.heartbeat.filterMetrics.queueDropped, 0);
 
-const slowAckStartedAt = Date.now();
+let slowAckFirstRequestAt = 0;
 const slowAck = await runConfig('slow-ack-timeout', {
   FORWARD_FILTER_MODE: 'shadow',
   FORWARD_BATCH_SIZE: '1',
@@ -1543,15 +1563,20 @@ const slowAck = await runConfig('slow-ack-timeout', {
 }, [event('unknown-container', 'ToolExec', { pid: 3_150, argv: ['/usr/bin/true', 'slow-ack'] })], {
   batchReply: () => ({
     handle: (response) => {
+      slowAckFirstRequestAt ||= Date.now();
       response.writeHead(200, { 'Content-Type': 'application/json' });
       const timer = setInterval(() => response.write(' '), 100);
       response.once('close', () => clearInterval(timer));
     },
   }),
 });
-assert.ok(Date.now() - slowAckStartedAt < 3_000, 'trickled response bytes must not reset the absolute event timeout');
+assert.ok(
+  Date.now() - slowAckFirstRequestAt < 3_000,
+  'trickled response bytes must not reset the absolute event timeout',
+);
 assert.ok(slowAck.batchRequests.length >= 1, 'an ordinary timeout remains bounded by the retry deadline');
-assert.equal(slowAck.heartbeat.outputDropped, 1);
+assert.equal(slowAck.heartbeat.outputDropped, 0);
+assert.equal(slowAck.heartbeat.filterMetrics.retryParked, 1);
 assert.ok(slowAck.heartbeat.errorCount >= 1);
 assert.equal(slowAck.heartbeat.filterMetrics.queueDropped, 0);
 assert.equal(slowAck.heartbeat.filterMetrics.retryQueued, 1);
@@ -1753,12 +1778,13 @@ assert.deepEqual(
   ],
   'shutdown must not launch a late retry after aborting the hanging right 413 sub-batch',
 );
-assert.equal(shutdown413.heartbeat.outputDropped, 3);
+assert.equal(shutdown413.heartbeat.outputDropped, 0);
 assert.equal(shutdown413.heartbeat.errorCount, 2, 'a scheduled replay is not itself an operational error');
 assert.equal(shutdown413.heartbeat.filterMetrics.retryQueued, 3);
 assert.equal(shutdown413.heartbeat.filterMetrics.retryAttempts, 0);
 assert.equal(shutdown413.heartbeat.filterMetrics.retryRecovered, 0);
 assert.equal(shutdown413.heartbeat.filterMetrics.retryExhausted, 3);
+assert.equal(shutdown413.heartbeat.filterMetrics.retryParked, 3);
 assert.equal(shutdown413.heartbeat.filterMetrics.retryQueueDepth, 0);
 assert.equal(shutdown413.heartbeat.filterMetrics.retryOutstandingEvents, 0);
 assert.equal(shutdown413.heartbeat.filterMetrics.outstandingEvents, 0);

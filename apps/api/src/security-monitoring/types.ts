@@ -2189,8 +2189,11 @@ export interface CollectorFilterMetrics {
     filteredAt: string;
   }>;
   deduplicated: number;
+  /** Live queue admissions that could not proceed but remain recoverable in the durable spool. */
   queueDropped: number;
-  /** Protected Agent/lifecycle/security evidence lost after the ownership reserve was exhausted. */
+  /** Queue-pressure records parked durably instead of being counted as permanent output loss. */
+  queueParked?: number;
+  /** Protected Agent/lifecycle/security evidence that could not enter the live queue. */
   protectedQueueDropped?: number;
   /** Closed, low-cardinality queue-loss classes; never contains an asset, path, PID or rule ID. */
   queueDroppedByClass?: Partial<Record<
@@ -2205,8 +2208,25 @@ export interface CollectorFilterMetrics {
   retryAttempts?: number;
   /** Retried events accepted or policy-discarded by the API in this heartbeat interval. */
   retryRecovered?: number;
-  /** Retried events that reached a terminal outcome or exceeded their retry deadline. */
+  /** Retried events that reached a terminal outcome or exhausted their current online retry cycle. */
   retryExhausted?: number;
+  /** Retry-exhausted events retained in the spool for a later bounded replay cycle. */
+  retryParked?: number;
+  /** Durable replay records examined/admitted/deferred during this heartbeat delta. */
+  spoolReplayAttempts?: number;
+  spoolReplayAdmitted?: number;
+  spoolReplayDeferred?: number;
+  /** Heartbeat delivery failures; intentionally separate from event output loss. */
+  heartbeatDeliveryFailures?: number;
+  /** Current durable ownership state, including live and parked records. */
+  spoolRecords?: number;
+  spoolActiveRecords?: number;
+  spoolParkedRecords?: number;
+  spoolBytes?: number;
+  spoolWalBytes?: number;
+  spoolOldestAgeMs?: number;
+  spoolAtCapacity?: boolean;
+  spoolFsyncMode?: 'always' | 'periodic';
   /** Serialized bytes currently waiting in the ordinary priority queue. */
   queueBytes?: number;
   /** Events currently owned by active event-delivery requests. */

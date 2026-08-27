@@ -651,7 +651,13 @@ function verifyObserverManifest() {
       /\{\s*name:\s*FORWARD_RETRY_BASE_DELAY_MS,\s*value:\s*"250"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_RETRY_MAX_DELAY_MS,\s*value:\s*"2000"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_RETRY_MAX_AGE_MS,\s*value:\s*"45000"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_SPOOL_REPLAY_INTERVAL_MS,\s*value:\s*"500"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_SPOOL_REPLAY_BATCH_SIZE,\s*value:\s*"256"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_SPOOL_DEGRADED_AGE_MS,\s*value:\s*"60000"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_SHUTDOWN_TIMEOUT_MS,\s*value:\s*"15000"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_SPOOL_PATH,\s*value:\s*"\/var\/lib\/anysentry-forwarder\/spool\.wal"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /name:\s*forwarder-spool[\s\S]*mountPath:\s*\/var\/lib\/anysentry-forwarder/u.test(daemonSet?.source ?? '') &&
+      /name:\s*forwarder-spool[\s\S]*hostPath:\s*\{\s*path:\s*\/var\/lib\/anysentry-forwarder,\s*type:\s*DirectoryOrCreate\s*\}/u.test(daemonSet?.source ?? '') &&
       !/\{\s*name:\s*FORWARD_MAX_QUEUE(?:_BYTES)?,/u.test(daemonSet?.source ?? ''),
     daemonSet?.source,
   );

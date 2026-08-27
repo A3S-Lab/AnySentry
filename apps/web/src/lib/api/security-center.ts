@@ -2349,6 +2349,7 @@ export interface CollectorFilterMetrics {
   }>;
   deduplicated: number;
   queueDropped: number;
+  queueParked?: number;
   protectedQueueDropped?: number;
   queueDroppedByClass?: Partial<Record<
     "tool_exec" | "process_exit" | "security" | "collector_heartbeat" | "capture_aggregate" | "agent" | "other",
@@ -2360,6 +2361,19 @@ export interface CollectorFilterMetrics {
   retryAttempts?: number;
   retryRecovered?: number;
   retryExhausted?: number;
+  retryParked?: number;
+  spoolReplayAttempts?: number;
+  spoolReplayAdmitted?: number;
+  spoolReplayDeferred?: number;
+  heartbeatDeliveryFailures?: number;
+  spoolRecords?: number;
+  spoolActiveRecords?: number;
+  spoolParkedRecords?: number;
+  spoolBytes?: number;
+  spoolWalBytes?: number;
+  spoolOldestAgeMs?: number;
+  spoolAtCapacity?: boolean;
+  spoolFsyncMode?: "always" | "periodic";
   queueBytes?: number;
   inflightEvents?: number;
   inflightBytes?: number;

@@ -181,6 +181,24 @@ const RETRY_MAX_DELAY_MS = boundedNumber(
 );
 const RETRY_MAX_AGE_MS = boundedNumber(process.env.FORWARD_RETRY_MAX_AGE_MS, 45_000, 100, 45_000);
 const RETRY_JITTER_RATIO = 0.2;
+const SPOOL_REPLAY_INTERVAL_MS = boundedNumber(
+  process.env.FORWARD_SPOOL_REPLAY_INTERVAL_MS,
+  1_000,
+  100,
+  60_000,
+);
+const SPOOL_REPLAY_BATCH_SIZE = boundedNumber(
+  process.env.FORWARD_SPOOL_REPLAY_BATCH_SIZE,
+  256,
+  1,
+  4_096,
+);
+const SPOOL_DEGRADED_AGE_MS = boundedNumber(
+  process.env.FORWARD_SPOOL_DEGRADED_AGE_MS,
+  60_000,
+  1_000,
+  3_600_000,
+);
 const HTTP_TIMEOUT_MS = boundedNumber(process.env.FORWARD_HTTP_TIMEOUT_MS, 10_000, 1_000, 120_000);
 const BATCH_ACK_MAX_BYTES = boundedNumber(
   process.env.FORWARD_BATCH_ACK_MAX_BYTES,
@@ -543,12 +561,18 @@ function emptyAttributionCounts() {
     e2eMarkerScopedOut: 0,
     forwarded: 0,
     queueDropped: 0,
+    queueParked: 0,
     batches: 0,
     batchEvents: 0,
     retryQueued: 0,
     retryAttempts: 0,
     retryRecovered: 0,
     retryExhausted: 0,
+    retryParked: 0,
+    spoolReplayAttempts: 0,
+    spoolReplayAdmitted: 0,
+    spoolReplayDeferred: 0,
+    heartbeatDeliveryFailures: 0,
     workspaceConflict: 0,
     infrastructure: 0,
     deduplicated: 0,
@@ -570,6 +594,7 @@ let outstandingBytes = 0;
 let retryOutstandingEvents = 0;
 let retryOutstandingBytes = 0;
 const outstandingItems = new Set();
+const activeSpoolIds = new Set();
 const pending = new BoundedPriorityQueue(MAX_OUTSTANDING_EVENTS, 5, (item) => item.bytes);
 const retryTasks = [];
 const activeEventRequests = new Set();
@@ -597,6 +622,7 @@ let runtimeSnapshotTimer;
 let rootLivenessTimer;
 let batchTimer;
 let retryTimer;
+let spoolReplayTimer;
 let shutdownForceTimer;
 let shutdownDeadline = 0;
 let eventDrainDeadline = 0;
@@ -1839,6 +1865,20 @@ function eventQueueMetrics(now = Date.now()) {
   };
 }
 
+function durableSpoolMetrics() {
+  const status = spool.status();
+  return {
+    records: status.records,
+    activeRecords: activeSpoolIds.size,
+    parkedRecords: Math.max(0, status.records - activeSpoolIds.size),
+    logicalBytes: status.logicalBytes,
+    walBytes: status.walBytes,
+    oldestAgeMs: status.oldestMs,
+    atCapacity: status.atCapacity,
+    fsyncMode: status.fsyncMode,
+  };
+}
+
 function deliverPendingHeartbeat(done, timeoutMs) {
   const delivery = pendingHeartbeatDelivery;
   if (!delivery) throw new Error('missing pending heartbeat delivery');
@@ -1856,8 +1896,9 @@ function deliverPendingHeartbeat(done, timeoutMs) {
       && reason === GRACEFUL_SHUTDOWN_SUPERSEDE;
     if (failed && !intentionallySuperseded) {
       // The failed heartbeat window remains frozen for an exact retry. Its own transport failure
-      // belongs to the active next window, not to the payload whose delivery is uncertain.
-      outputDropped++;
+      // belongs to the active next window, not to the payload whose delivery is uncertain. A
+      // heartbeat transport failure is control evidence, not an event-output loss.
+      attributionCounts.heartbeatDeliveryFailures++;
       errorCount++;
     }
     done(Boolean(failed));
@@ -1894,6 +1935,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
     return;
   }
   const eventQueues = eventQueueMetrics();
+  const spoolMetrics = durableSpoolMetrics();
   const accountingWindow = pipelineAccounting.beginDelivery({
     queueEvents: eventQueues.queueDepth,
     queueBytes: eventQueues.queueBytes,
@@ -1932,7 +1974,13 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
   e2eFilterReceipts = [];
   outputDropped = 0;
   errorCount = 0;
-  const status = dropped > 0 || errors > 0 ? 'degraded' : 'ok';
+  const status = (
+    dropped > 0
+    || errors > 0
+    || spoolMetrics.parkedRecords > 0
+    || spoolMetrics.oldestAgeMs > SPOOL_DEGRADED_AGE_MS
+    || spoolMetrics.atCapacity
+  ) ? 'degraded' : 'ok';
   const e2eMarkerScopeMessage = E2E_INGEST_MARKER_PREFIX
     ? `e2e_marker_scope=enabled; e2e_marker_scoped_out=${classifications.e2eMarkerScopedOut}; `
     : '';
@@ -2064,12 +2112,26 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
         ...(filterReceipts.length ? { e2eFilterReceipts: filterReceipts } : {}),
         deduplicated: classifications.deduplicated,
         queueDropped: classifications.queueDropped,
+        queueParked: classifications.queueParked,
         batches: classifications.batches,
         batchEvents: classifications.batchEvents,
         retryQueued: classifications.retryQueued,
         retryAttempts: classifications.retryAttempts,
         retryRecovered: classifications.retryRecovered,
         retryExhausted: classifications.retryExhausted,
+        retryParked: classifications.retryParked,
+        spoolReplayAttempts: classifications.spoolReplayAttempts,
+        spoolReplayAdmitted: classifications.spoolReplayAdmitted,
+        spoolReplayDeferred: classifications.spoolReplayDeferred,
+        heartbeatDeliveryFailures: classifications.heartbeatDeliveryFailures,
+        spoolRecords: spoolMetrics.records,
+        spoolActiveRecords: spoolMetrics.activeRecords,
+        spoolParkedRecords: spoolMetrics.parkedRecords,
+        spoolBytes: spoolMetrics.logicalBytes,
+        spoolWalBytes: spoolMetrics.walBytes,
+        spoolOldestAgeMs: spoolMetrics.oldestAgeMs,
+        spoolAtCapacity: spoolMetrics.atCapacity,
+        spoolFsyncMode: spoolMetrics.fsyncMode,
         queueBytes: eventQueues.queueBytes,
         inflightEvents: eventQueues.inflightEvents,
         inflightBytes: eventQueues.inflightBytes,
@@ -2167,7 +2229,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
         infrastructure: classifications.infrastructure,
         workspaceConflict: classifications.workspaceConflict,
       },
-      message: `filter_mode=${FILTER_MODE}; ${e2eMarkerScopeMessage}retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_unknown=${classifications.filteredUnknown}; would_filter_unknown=${classifications.wouldFilterUnknown}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; aggregated_file_events=${classifications.aggregatedFileEvents}; aggregation_outputs=${classifications.aggregationOutputs}; filter_rule_version=${filterRules.version}; filter_rule_entries=${filterRules.entries}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; retry_queued=${classifications.retryQueued}; retry_attempts=${classifications.retryAttempts}; retry_recovered=${classifications.retryRecovered}; retry_exhausted=${classifications.retryExhausted}; retry_queue_depth=${eventQueues.retryQueueDepth}; retry_outstanding=${eventQueues.retryOutstandingEvents}; outstanding_events=${eventQueues.outstandingEvents}; outstanding_bytes=${eventQueues.outstandingBytes}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
+      message: `filter_mode=${FILTER_MODE}; ${e2eMarkerScopeMessage}retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_unknown=${classifications.filteredUnknown}; would_filter_unknown=${classifications.wouldFilterUnknown}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; aggregated_file_events=${classifications.aggregatedFileEvents}; aggregation_outputs=${classifications.aggregationOutputs}; filter_rule_version=${filterRules.version}; filter_rule_entries=${filterRules.entries}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; queue_parked=${classifications.queueParked}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; retry_queued=${classifications.retryQueued}; retry_attempts=${classifications.retryAttempts}; retry_recovered=${classifications.retryRecovered}; retry_exhausted=${classifications.retryExhausted}; retry_parked=${classifications.retryParked}; heartbeat_delivery_failures=${classifications.heartbeatDeliveryFailures}; spool_records=${spoolMetrics.records}; spool_parked=${spoolMetrics.parkedRecords}; spool_oldest_ms=${spoolMetrics.oldestAgeMs}; retry_queue_depth=${eventQueues.retryQueueDepth}; retry_outstanding=${eventQueues.retryOutstandingEvents}; outstanding_events=${eventQueues.outstandingEvents}; outstanding_bytes=${eventQueues.outstandingBytes}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
   };
   pendingHeartbeatDelivery = { body: heartbeatBody, shutdownFinal };
@@ -2179,6 +2241,8 @@ function closeTransports() {
   transportsClosed = true;
   if (retryTimer) clearTimeout(retryTimer);
   retryTimer = undefined;
+  if (spoolReplayTimer) clearTimeout(spoolReplayTimer);
+  spoolReplayTimer = undefined;
   if (reconcileTimer) clearTimeout(reconcileTimer);
   reconcileTimer = undefined;
   captureProfileReporter.close();
@@ -2240,6 +2304,7 @@ function recordPipelineCounts(counts) {
 function trackOutstanding(item) {
   item.settled = false;
   outstandingItems.add(item);
+  if (item.spoolId) activeSpoolIds.add(item.spoolId);
   outstandingEvents++;
   outstandingBytes += item.bytes;
 }
@@ -2254,6 +2319,7 @@ function settleOutstanding(items) {
     item.settled = true;
     item.inflightSince = 0;
     outstandingItems.delete(item);
+    if (item.spoolId) activeSpoolIds.delete(item.spoolId);
     settled++;
     bytes += item.bytes;
     if (item.retryOwned) {
@@ -2265,6 +2331,7 @@ function settleOutstanding(items) {
   outstandingBytes = Math.max(0, outstandingBytes - bytes);
   retryOutstandingEvents = Math.max(0, retryOutstandingEvents - retrySettled);
   retryOutstandingBytes = Math.max(0, retryOutstandingBytes - retryBytes);
+  if (settled > 0 && !closing) scheduleSpoolReplay(0);
   return settled;
 }
 
@@ -2282,12 +2349,16 @@ function markRetryOwned(items) {
 }
 
 function recordRetryExhausted(items, operationalError = true, reason = 'retry_exhausted') {
-  const count = settleOutstanding(items);
+  const unsettled = items.filter((item) => !item.settled);
+  const parked = unsettled.filter((item) => item.spoolId).length;
+  const count = settleOutstanding(unsettled);
   if (!count) return;
   attributionCounts.retryExhausted += count;
-  outputDropped += count;
+  attributionCounts.retryParked += parked;
+  outputDropped += Math.max(0, count - parked);
   pipelineAccounting.record('queue_dropped', reason, count);
   if (operationalError) errorCount++;
+  scheduleSpoolReplay();
 }
 
 function retryDelayMs(item, retryAfterMs) {
@@ -2348,7 +2419,6 @@ function takeReadyRetryBatch(now = Date.now()) {
 }
 
 function finishBatch(batch, outcome, retryDelivery) {
-  outputDropped += outcome.dropped;
   errorCount += outcome.errors;
   recordPipelineCounts(outcome.pipelineCounts);
   inflight = Math.max(0, inflight - 1);
@@ -2361,6 +2431,19 @@ function finishBatch(batch, outcome, retryDelivery) {
   const terminalItems = batch.filter((item) => !retrySet.has(item));
   const acceptedItems = outcome.acceptedItems ?? [];
   const rejectedItems = outcome.rejectedItems ?? [];
+  const acceptedSet = new Set(acceptedItems);
+  const rejectedSet = new Set(rejectedItems);
+  const unresolvedTerminalItems = terminalItems.filter((item) =>
+    !acceptedSet.has(item) && !rejectedSet.has(item));
+  const parkedDropped = Math.min(
+    outcome.dropped,
+    unresolvedTerminalItems.filter((item) => item.spoolId).length,
+  );
+  outputDropped += Math.max(0, outcome.dropped - parkedDropped);
+  if (parkedDropped > 0) {
+    if (retryDelivery) attributionCounts.retryParked += parkedDropped;
+    else attributionCounts.queueParked += parkedDropped;
+  }
   if (acceptedItems.length) {
     spool.ack(acceptedItems.map((item) => item.spoolId).filter(Boolean));
   }
@@ -2451,8 +2534,9 @@ function flushPending() {
   pumpEventWork();
 }
 
-function recordQueueDrop(kind, priority, reason) {
-  outputDropped++;
+function recordQueueDrop(kind, priority, reason, durablyParked = false) {
+  if (durablyParked) attributionCounts.queueParked++;
+  else outputDropped++;
   attributionCounts.queueDropped++;
   const dropClass = queueDropClass(kind, priority);
   attributionCounts.queueDroppedByClass[dropClass] =
@@ -2464,7 +2548,8 @@ function recordQueueDrop(kind, priority, reason) {
 function dropQueuedItem(item, reason = 'priority_evicted') {
   if (!item) return;
   settleOutstanding([item]);
-  recordQueueDrop(item.kind, item.priority, reason);
+  recordQueueDrop(item.kind, item.priority, reason, Boolean(item.spoolId));
+  scheduleSpoolReplay();
 }
 
 function makeQueueRoom(bytes, priority) {
@@ -2509,11 +2594,11 @@ function enqueue(body, priority, countForwarded = true, kind = '', recovered = f
     bytes = Buffer.byteLength(JSON.stringify(durableBody));
   } catch {
     recordQueueDrop(kind, priority, 'serialization_error');
-    return;
+    return false;
   }
   if (bytes > MAX_EVENT_BYTES) {
     recordQueueDrop(kind, priority, 'event_too_large');
-    return;
+    return false;
   }
   const spoolId = kind === 'CollectorHeartbeat'
     ? undefined
@@ -2531,16 +2616,19 @@ function enqueue(body, priority, countForwarded = true, kind = '', recovered = f
       console.error(`[observer-forward] durable spool write failed: ${error.message}`);
       if (rl) rl.pause();
       process.exitCode = 1;
-      return;
+      return false;
     }
   }
   if (!makeQueueRoom(bytes, priority)) {
-    recordQueueDrop(
+    if (recovered) attributionCounts.spoolReplayDeferred++;
+    else recordQueueDrop(
       kind,
       priority,
       priority >= PROTECTED_PRIORITY ? 'outstanding_limit' : 'protected_reserve',
+      Boolean(spoolId),
     );
-    return;
+    scheduleSpoolReplay();
+    return false;
   }
   const item = {
     body: durableBody,
@@ -2558,21 +2646,68 @@ function enqueue(body, priority, countForwarded = true, kind = '', recovered = f
   };
   const result = pending.push(item, priority);
   if (!result.accepted) {
-    recordQueueDrop(kind, priority, 'queue_rejected');
-    return;
+    if (recovered) attributionCounts.spoolReplayDeferred++;
+    else recordQueueDrop(kind, priority, 'queue_rejected', Boolean(spoolId));
+    scheduleSpoolReplay();
+    return false;
   }
   if (result.dropped && !result.droppedIncoming) {
     dropQueuedItem(result.dropped);
   }
   trackOutstanding(item);
-  pipelineAccounting.record(
-    'queue_admitted',
-    countForwarded ? 'event' : 'collector_heartbeat',
-  );
+  if (!recovered) {
+    pipelineAccounting.record(
+      'queue_admitted',
+      countForwarded ? 'event' : 'collector_heartbeat',
+    );
+  }
   if (countForwarded) attributionCounts.forwarded++;
   if (pending.length >= BATCH_SIZE) flushPending();
   else scheduleBatch();
   updateInputFlow();
+  return true;
+}
+
+function scheduleSpoolReplay(delayMs = SPOOL_REPLAY_INTERVAL_MS) {
+  if (closing || transportsClosed || spoolReplayTimer) return;
+  spoolReplayTimer = setTimeout(() => {
+    spoolReplayTimer = undefined;
+    pumpDurableSpool();
+  }, Math.max(0, delayMs));
+  spoolReplayTimer.unref();
+}
+
+function pumpDurableSpool() {
+  if (closing || transportsClosed) return;
+  const spoolStatus = spool.status();
+  if (spoolStatus.records <= activeSpoolIds.size) {
+    scheduleSpoolReplay();
+    return;
+  }
+  const availableSlots = Math.max(0, MAX_OUTSTANDING_EVENTS - outstandingEvents);
+  if (availableSlots <= 0 || outstandingBytes >= MAX_OUTSTANDING_BYTES) {
+    scheduleSpoolReplay();
+    return;
+  }
+  const records = spool.available(
+    activeSpoolIds,
+    Math.min(SPOOL_REPLAY_BATCH_SIZE, availableSlots),
+  );
+  let admitted = 0;
+  for (const record of records) {
+    attributionCounts.spoolReplayAttempts++;
+    if (!enqueue(
+      record.body,
+      record.priority,
+      false,
+      durableRecordKind(record.body),
+      true,
+    )) break;
+    admitted++;
+    attributionCounts.spoolReplayAdmitted++;
+  }
+  if (admitted > 0) pumpEventWork();
+  scheduleSpoolReplay(admitted > 0 ? 0 : SPOOL_REPLAY_INTERVAL_MS);
 }
 
 function abandonPendingEvents() {
@@ -3004,22 +3139,13 @@ async function start() {
   rl.pause();
   rl.on('line', handleLine);
   rl.on('close', flushAndClose);
-  const recoveredRecords = spool.available(new Set(), MAX_OUTSTANDING_EVENTS);
-  for (const record of recoveredRecords) {
-    enqueue(
-      record.body,
-      record.priority,
-      false,
-      durableRecordKind(record.body),
-      true,
-    );
-  }
   const spoolStatus = spool.status();
   console.error(
     `[observer-forward] durable spool: writer=${WRITER_ID}; path=${spoolStatus.filePath}; `
     + `recovered=${spoolStatus.records}; bytes=${spoolStatus.logicalBytes}; `
     + `fsync=${spoolStatus.fsyncMode}`,
   );
+  pumpDurableSpool();
 
   // The central catalog is the authoritative definition source. ConfigMap signatures and
   // deployment environment values above remain a bounded bootstrap/LKG path only; wait for one

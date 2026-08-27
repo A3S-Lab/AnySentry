@@ -169,7 +169,15 @@ try {
   assert.equal(heartbeats[3].eventKindCounts.ToolExec, 1);
   assert.equal(heartbeats[3].filterMetrics.observed, 1);
   assert.equal(heartbeats[3].legacyCounterTemporality, 'delta');
-  assert.ok(heartbeats[3].outputDropped >= 1, 'failed heartbeat transport is counted in the next delta');
+  assert.equal(
+    heartbeats[3].outputDropped,
+    0,
+    'failed heartbeat transport must not be reported as event output loss',
+  );
+  assert.ok(
+    heartbeats[3].filterMetrics.heartbeatDeliveryFailures >= 1,
+    'failed heartbeat transport is reported on its dedicated control metric',
+  );
   assert.ok(heartbeats[3].errorCount >= 1, 'failed heartbeat error is counted in the next delta');
 
   await eventually('forwarded raw collector heartbeat', () =>

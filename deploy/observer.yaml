@@ -137,6 +137,11 @@ spec:
             - { name: FORWARD_SPOOL_FSYNC_MS, value: "250" }
             - { name: FORWARD_SPOOL_MAX_RECORDS, value: "250000" }
             - { name: FORWARD_SPOOL_MAX_BYTES, value: "2147483648" }
+            # A retry deadline parks evidence in the WAL; the same process continuously redrives
+            # bounded priority batches, so recovery never depends on a container restart.
+            - { name: FORWARD_SPOOL_REPLAY_INTERVAL_MS, value: "500" }
+            - { name: FORWARD_SPOOL_REPLAY_BATCH_SIZE, value: "256" }
+            - { name: FORWARD_SPOOL_DEGRADED_AGE_MS, value: "60000" }
             - { name: FORWARD_BATCH_MAX_BYTES, value: "524288" }
             - { name: FORWARD_MAX_EVENT_BYTES, value: "3145728" }
             - { name: FORWARD_MAX_OUTSTANDING_EVENTS, value: "16384" }

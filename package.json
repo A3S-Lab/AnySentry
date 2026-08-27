@@ -102,6 +102,7 @@
     "verify:forwarders": "node scripts/verify-forwarders.mjs",
     "verify:forwarder-attribution": "node scripts/verify-forwarder-attribution.mjs",
     "verify:forwarder-durability": "node scripts/verify-forwarder-durability.mjs",
+    "verify:forwarder-spool-replay": "node scripts/verify-forwarder-spool-replay.mjs",
     "reconcile:noop-business-effects": "node scripts/reconcile-noop-business-effects.mjs",
     "verify:agent-templates": "node scripts/verify-agent-templates.mjs",
     "verify:agent-runtime-signatures": "node scripts/verify-agent-runtime-signatures.mjs",
