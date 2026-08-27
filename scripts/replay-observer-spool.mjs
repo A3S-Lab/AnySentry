@@ -92,6 +92,7 @@ function batchEnvelope(writerId, records) {
     schemaVersion: 'anysentry.observer_batch.v2',
     batchId,
     payloadDigest,
+    durableReplay: true,
     writerId,
     writerVersion: 'observer-spool-replay/1.0.0',
     idempotencyProtocolVersion: 'anysentry.idempotency.v1',

@@ -378,6 +378,7 @@ const spool = new DurableSpool({
   dlqPath: process.env.FORWARD_DLQ_PATH,
   maxRecords: process.env.FORWARD_SPOOL_MAX_RECORDS,
   maxBytes: process.env.FORWARD_SPOOL_MAX_BYTES,
+  compactMaxLiveRecords: process.env.FORWARD_SPOOL_COMPACT_MAX_LIVE_RECORDS,
   fsyncMode: process.env.FORWARD_SPOOL_FSYNC,
   fsyncMs: process.env.FORWARD_SPOOL_FSYNC_MS,
 });
@@ -1988,6 +1989,9 @@ function durableSpoolMetrics() {
     oldestAgeMs: status.oldestMs,
     atCapacity: status.atCapacity,
     fsyncMode: status.fsyncMode,
+    compactionDeferred: status.compactionDeferred,
+    compactions: status.compactions,
+    compactMaxLiveRecords: status.compactMaxLiveRecords,
   };
 }
 
@@ -2249,6 +2253,9 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         spoolOldestAgeMs: spoolMetrics.oldestAgeMs,
         spoolAtCapacity: spoolMetrics.atCapacity,
         spoolFsyncMode: spoolMetrics.fsyncMode,
+        spoolCompactionDeferred: spoolMetrics.compactionDeferred,
+        spoolCompactions: spoolMetrics.compactions,
+        spoolCompactMaxLiveRecords: spoolMetrics.compactMaxLiveRecords,
         queueBytes: eventQueues.queueBytes,
         inflightEvents: eventQueues.inflightEvents,
         inflightBytes: eventQueues.inflightBytes,

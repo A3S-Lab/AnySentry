@@ -29,6 +29,7 @@ class DurableSpool {
     this.fsyncMode = options.fsyncMode === 'always' ? 'always' : 'periodic';
     this.fsyncMs = boundedNumber(options.fsyncMs, 250, 10, 60_000);
     this.compactMinBytes = boundedNumber(options.compactMinBytes, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024 * 1024);
+    this.compactMaxLiveRecords = boundedNumber(options.compactMaxLiveRecords, 16_384, 1, 250_000);
     this.filePath = path.resolve(options.filePath);
     this.dlqPath = path.resolve(options.dlqPath || `${this.filePath}.dlq`);
     this.records = new Map();
@@ -38,6 +39,8 @@ class DurableSpool {
     this.appendedOperations = 0;
     this.ackedRecords = 0;
     this.deadLetterRecords = 0;
+    this.compactionDeferred = 0;
+    this.compactions = 0;
     this.closed = false;
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
     this.load();
@@ -183,6 +186,13 @@ class DurableSpool {
   compactIfNeeded() {
     const liveEstimate = this.logicalBytes + this.records.size * 160;
     if (this.walBytes < this.compactMinBytes || this.walBytes < liveEstimate * 2) return false;
+    // Rewriting a large live snapshot synchronously would stop the Forwarder from draining the
+    // Collector pipe. Defer space reclamation until ACK progress makes the bounded rewrite small;
+    // puts and ACKs remain append-only and crash-safe in the meantime.
+    if (this.records.size > this.compactMaxLiveRecords) {
+      this.compactionDeferred += 1;
+      return false;
+    }
     const temporary = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
     const fd = fs.openSync(temporary, 'wx', 0o600);
     try {
@@ -205,6 +215,7 @@ class DurableSpool {
     if (this.fd !== undefined) fs.closeSync(this.fd);
     this.fd = fs.openSync(this.filePath, 'a', 0o600);
     this.walBytes = fs.fstatSync(this.fd).size;
+    this.compactions += 1;
     return true;
   }
 
@@ -225,6 +236,9 @@ class DurableSpool {
       fsyncMode: this.fsyncMode,
       ackedRecords: this.ackedRecords,
       deadLetterRecords: this.deadLetterRecords,
+      compactionDeferred: this.compactionDeferred,
+      compactions: this.compactions,
+      compactMaxLiveRecords: this.compactMaxLiveRecords,
     };
   }
 

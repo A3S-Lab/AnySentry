@@ -153,6 +153,7 @@ spec:
             - { name: FORWARD_SPOOL_REPLAY_INTERVAL_MS, value: "500" }
             - { name: FORWARD_SPOOL_REPLAY_BATCH_SIZE, value: "256" }
             - { name: FORWARD_SPOOL_DEGRADED_AGE_MS, value: "60000" }
+            - { name: FORWARD_SPOOL_COMPACT_MAX_LIVE_RECORDS, value: "16384" }
             - { name: FORWARD_BATCH_MAX_BYTES, value: "524288" }
             - { name: FORWARD_MAX_EVENT_BYTES, value: "3145728" }
             - { name: FORWARD_MAX_OUTSTANDING_EVENTS, value: "16384" }

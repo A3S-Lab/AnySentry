@@ -7,6 +7,10 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const { DurableSpool } = require('./observer-durable-spool.js');
 
 const repoRoot = fileURLToPath(new URL('../', import.meta.url));
 const temporary = mkdtempSync(path.join(os.tmpdir(), 'anysentry-spool-replay-'));
@@ -92,6 +96,7 @@ try {
   assert.equal(firstReport.acknowledgedRecords, 1);
   assert.equal(firstReport.remainingRecords, 1);
   assert.equal(received[0].events[0].sourceEventId, 'evt-high', 'priority evidence replays first');
+  assert.equal(received[0].durableReplay, true, 'offline rescue uses event-level durable replay semantics');
   assert.match(readFileSync(output, 'utf8'), /evt-low/u);
   assert.doesNotMatch(readFileSync(output, 'utf8'), /evt-high|evt-acked/u);
 
@@ -102,6 +107,31 @@ try {
   const secondReport = JSON.parse(second.stdout);
   assert.equal(secondReport.remainingRecords, 0);
   assert.equal(readFileSync(finalOutput, 'utf8'), '');
+
+  const compactPath = path.join(temporary, 'bounded-compaction.wal');
+  const compactSpool = new DurableSpool({
+    writerId: 'bounded-compaction-test',
+    filePath: compactPath,
+    compactMinBytes: 1024 * 1024,
+    compactMaxLiveRecords: 1,
+    fsyncMode: 'periodic',
+    fsyncMs: 60_000,
+  });
+  const largeBody = (id) => ({ sourceEventId: id, line: 'x'.repeat(400 * 1024) });
+  for (const id of ['compact-a', 'compact-b', 'compact-c', 'compact-d', 'compact-e']) {
+    compactSpool.put({ id, body: largeBody(id), priority: 1, queuedAt: 1 });
+  }
+  compactSpool.ack(['compact-a', 'compact-b', 'compact-c']);
+  const deferred = compactSpool.status();
+  assert.equal(deferred.records, 2);
+  assert.equal(deferred.compactions, 0);
+  assert.equal(deferred.compactionDeferred, 1);
+  compactSpool.ack(['compact-d']);
+  const compacted = compactSpool.status();
+  assert.equal(compacted.records, 1);
+  assert.equal(compacted.compactions, 1);
+  assert.ok(compacted.walBytes < deferred.walBytes, 'small live set should compact the deferred WAL');
+  compactSpool.close();
   console.log('Observer spool replay rescue verification passed');
 } finally {
   await new Promise((resolve) => server.close(resolve));
