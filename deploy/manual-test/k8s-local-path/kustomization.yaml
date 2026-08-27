@@ -13,10 +13,10 @@ resources:
 images:
   - name: ghcr.io/a3s-lab/anysentry
     newName: 127.0.0.1:5000/anysentry
-    digest: sha256:71b09d8920fbf11c10787289fe67d3b0c8741bef7ae5f56ea39e6c7fa44dc799
+    digest: sha256:907f69b302a6adc7bab51ba982de5976ffea570dd038c5cebd0939df6aa14fc6
   - name: ghcr.io/a3s-lab/anysentry-flink-streaming
     newName: 127.0.0.1:5000/anysentry-flink-streaming
-    digest: sha256:f20ea8e7fa447aedfab07df90c6a5387ad3df696e73318c9f2b281e77eababb3
+    digest: sha256:c7c78c92399cad11868ee3c022bdd3cafd17da1c8a8ff1ea501f02957b3c580a
   - name: ghcr.io/a3s-lab/anysentry-workspace-scanner
     newName: 127.0.0.1:5000/anysentry-workspace-scanner
     digest: sha256:6d70223604cad8ee030a1e7eec90385b7c854f0829977dd4565d0a91fb223799

@@ -10,7 +10,7 @@ resources:
 images:
   - name: ghcr.io/a3s-lab/anysentry
     newName: 127.0.0.1:5000/anysentry
-    digest: sha256:71b09d8920fbf11c10787289fe67d3b0c8741bef7ae5f56ea39e6c7fa44dc799
+    digest: sha256:907f69b302a6adc7bab51ba982de5976ffea570dd038c5cebd0939df6aa14fc6
 
 patches:
   - path: ../runtime-on.yaml
