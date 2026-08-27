@@ -1507,7 +1507,7 @@ function refreshIdentitySnapshot() {
     }
     markControlPlaneSuccess('identity');
     synchronizeInfrastructurePolicyRules();
-  });
+  }, {}, false);
 }
 
 function synchronizeInfrastructurePolicyRules() {
@@ -1774,7 +1774,7 @@ function runtimeSnapshotBody(ready = true) {
   };
 }
 
-function sendRuntimeSnapshot(ready = true, done = () => {}, timeoutMs = 5_000) {
+function sendRuntimeSnapshot(ready = true, done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS) {
   if (runtimeLeaseFenced) {
     done(true);
     return;
