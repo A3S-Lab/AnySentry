@@ -87,6 +87,7 @@ const EVENT_REVISION_CONFLICT = 'ANYSENTRY_EVENT_REVISION_CONFLICT';
 const OBSERVER_BATCH_RETRY_AFTER_MS = 1_000;
 const OBSERVER_BATCH_MAX_EVENTS = 256;
 const OBSERVER_BATCH_MAX_BYTES = 4 * 1024 * 1024;
+const OBSERVER_BATCH_CONTROL_YIELD_EVERY = 32;
 const OBSERVER_BATCH_ID_MAX_LENGTH = 200;
 const OBSERVER_BATCH_DIGEST = /^[a-f0-9]{64}$/u;
 const OBSERVER_BATCH_ID_DIGEST_CACHE_SIZE = 10_000;
@@ -98,6 +99,11 @@ const observerBatchResults = new Map<string, {
   result: T.ObserverBatchIngestResult;
   bytes: number;
 }>();
+
+function yieldObserverBatchControl(index: number): Promise<void> | undefined {
+  if (index === 0 || index % OBSERVER_BATCH_CONTROL_YIELD_EVERY !== 0) return undefined;
+  return new Promise((resolve) => setImmediate(resolve));
+}
 let observerBatchResultBytes = 0;
 const UNIVERSAL_EVENT_IDEMPOTENCY_CACHE_SIZE = 20_000;
 const universalEventIdempotency = new Map<string, {
@@ -7506,6 +7512,7 @@ export class SecurityMonitoringController {
     // judgment jobs, and canonical jobs. Source resolution may refresh its discovery registry, but
     // only after the global count/byte/digest checks above have completed.
     for (let index = 0; index < events.length; index += 1) {
+      await yieldObserverBatchControl(index);
       const event = events[index];
       if (!event || typeof event.line !== 'string' || !event.line.trim()) {
         immediate.set(index, {
@@ -7789,6 +7796,7 @@ export class SecurityMonitoringController {
     }
     let retainedCommitted = 0;
     for (let index = 0; index < events.length; index += 1) {
+      await yieldObserverBatchControl(index);
       if (deliveryRetryFrom >= 0 && index >= deliveryRetryFrom) break;
       const precomputed = immediate.get(index);
       if (precomputed) {

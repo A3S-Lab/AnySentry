@@ -130,6 +130,9 @@ spec:
             # states; the retry window plus this budget covers a bounded ClickHouse restart.
             - { name: FORWARD_BATCH_SIZE, value: "32" }
             - { name: FORWARD_BATCH_FLUSH_MS, value: "50" }
+            # Four concurrent bounded batches cover measured throughput while leaving the single
+            # API event loop responsive to identity/rule/runtime control requests.
+            - { name: FORWARD_MAX_INFLIGHT, value: "4" }
             # Events are removed only after an item-level durable ack. The hostPath survives
             # container/Pod restarts; when full, stdin is paused instead of dropping evidence.
             - { name: FORWARD_SPOOL_PATH, value: "/var/lib/anysentry-forwarder/spool.wal" }
