@@ -300,15 +300,21 @@ async function runConfig(label, env = {}, inputLines, options = {}) {
       resolve(code);
     });
   });
-  await new Promise((resolve) => server.close(resolve));
-  fs.rmSync(spoolDirectory, { recursive: true, force: true });
-  assert.equal(exitCode, 0, stderr);
   const expectedObserved = options.expectedObserved ?? lines.length;
-  const heartbeat = options.heartbeatPredicate
+  const matchingHeartbeat = () => options.heartbeatPredicate
     ? [...heartbeats].reverse().find(options.heartbeatPredicate)
     : [...heartbeats]
       .reverse()
       .find((candidate) => candidate.filterMetrics?.observed === expectedObserved);
+  // The child can exit immediately after the HTTP client has written its final heartbeat while the
+  // verifier server callback is still queued. Give that already-sent request one bounded event-loop
+  // turn before closing the listener; this does not manufacture or relax any heartbeat assertion.
+  await eventually(() => Boolean(matchingHeartbeat()), 750, `${label} final structured heartbeat`)
+    .catch(() => undefined);
+  await new Promise((resolve) => server.close(resolve));
+  fs.rmSync(spoolDirectory, { recursive: true, force: true });
+  assert.equal(exitCode, 0, stderr);
+  const heartbeat = matchingHeartbeat();
   assert.ok(heartbeat, `missing structured ${label} heartbeat: ${JSON.stringify(heartbeats)}`);
   return { batches, batchRequests, batchRequestBytes, heartbeat, heartbeats, runtimeSnapshots };
 }
