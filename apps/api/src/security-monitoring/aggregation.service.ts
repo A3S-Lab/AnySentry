@@ -4574,9 +4574,22 @@ export class AggregationService {
       const recentForwarder = freshForwarderHeartbeat
         ? recentHeartbeatLane(laneHeartbeats, 'forwarder')
         : [];
+      const captureEvaluations = recentRaw.map(captureEvaluation);
+      if (captureEvaluations.length && freshCaptureProfileHeartbeat?.captureProfileMetrics) {
+        const profileEvaluation = captureEvaluation(freshCaptureProfileHeartbeat);
+        if (profileEvaluation.severity > captureEvaluations[0].severity) {
+          captureEvaluations[0] = {
+            severity: profileEvaluation.severity,
+            reasons: [...new Set([
+              ...captureEvaluations[0].reasons,
+              ...profileEvaluation.reasons,
+            ])],
+          };
+        }
+      }
       const healthChannels = {
         capture: stabilizeCollectorHealthChannel(
-          recentRaw.map(captureEvaluation),
+          captureEvaluations,
           'capture_recovering_after_recent_failure',
         ),
         delivery: stabilizeCollectorHealthChannel(

@@ -32,7 +32,7 @@ function sleep(ms) {
   });
 }
 
-async function eventually(label, fn, timeoutMs = 8000) {
+async function eventually(label, fn, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   let lastValue;
   while (Date.now() < deadline) {
@@ -114,7 +114,7 @@ function runForwarderProcess({ label, command, args }, source, fixture) {
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       finish(new Error(`${label} forwarder timed out. stdout=${stdout} stderr=${stderr}`));
-    }, 10000);
+    }, 30_000);
 
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');

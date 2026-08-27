@@ -2343,7 +2343,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       heartbeatDeliveryFailures: clamp(rawFilter.heartbeatDeliveryFailures),
       controlPlaneState: ['starting', 'healthy', 'degraded'].includes(rawFilter.controlPlaneState ?? '')
         ? rawFilter.controlPlaneState as import('./types').CollectorFilterMetrics['controlPlaneState']
-        : 'starting',
+        : undefined,
       controlPlaneFailedLanes,
       controlPlaneStartingLanes,
       controlPlaneLanes,

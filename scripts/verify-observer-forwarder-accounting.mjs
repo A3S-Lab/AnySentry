@@ -42,6 +42,7 @@ function stage(envelope, name) {
 
 const heartbeats = [];
 const batches = [];
+let failedShutdownFinal = false;
 const server = http.createServer(async (req, res) => {
   try {
     const body = await requestJson(req);
@@ -49,7 +50,10 @@ const server = http.createServer(async (req, res) => {
       heartbeats.push(body);
       // Establish one clean baseline, fail a non-empty delta, then accept its exact retry and the
       // following active window.
-      json(res, heartbeats.length === 2 ? 503 : 200, { accepted: heartbeats.length !== 2 });
+      const failFinal = body.filterMetrics?.shutdownFinal === true && !failedShutdownFinal;
+      if (failFinal) failedShutdownFinal = true;
+      const failed = heartbeats.length === 2 || failFinal;
+      json(res, failed ? 503 : 200, { accepted: !failed });
       return;
     }
     if (req.url === '/security-center/ingest/batch') {
@@ -99,6 +103,7 @@ const child = spawn(process.execPath, ['scripts/observer-forward.js'], {
     ANYSENTRY_HEARTBEAT_SECS: '0.2',
     ANYSENTRY_IDENTITY_SNAPSHOT_SECS: '0',
     ANYSENTRY_INFRASTRUCTURE_POLICY_SECS: '0',
+    ANYSENTRY_FILTER_RULE_PROJECTION_SECS: '0',
     ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_SECS: '300',
     ANYSENTRY_AGENT_RUNTIME_LIVENESS_SECS: '300',
     ANYSENTRY_DOCKER_SOCKET: '/tmp/anysentry-accounting-no-docker.sock',
@@ -106,7 +111,7 @@ const child = spawn(process.execPath, ['scripts/observer-forward.js'], {
     A3S_NODE_NAME: 'accounting-node',
     FORWARD_FILTER_MODE: 'shadow',
     FORWARD_BATCH_FLUSH_MS: '5',
-    FORWARD_SHUTDOWN_TIMEOUT_MS: '5000',
+    FORWARD_SHUTDOWN_TIMEOUT_MS: '15000',
   },
   stdio: ['pipe', 'ignore', 'pipe'],
 });
@@ -193,15 +198,22 @@ try {
   );
 
   child.stdin.end();
-  const exit = await Promise.race([
-    new Promise((resolve, reject) => {
-      child.once('error', reject);
-      child.once('exit', (code, signal) => resolve({ code, signal }));
-    }),
-    sleep(8_000).then(() => ({ timeout: true })),
-  ]);
+  const exit = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve({ timeout: true }), 20_000);
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    });
+  });
   if (exit.timeout) child.kill('SIGKILL');
   assert.deepEqual(exit, { code: 0, signal: null }, `forwarder failed: ${stderr}`);
+  const finalHeartbeats = heartbeats.filter((heartbeat) => heartbeat.filterMetrics?.shutdownFinal === true);
+  assert.equal(finalHeartbeats.length, 2, 'failed shutdown-final heartbeat must be retried once');
+  assert.deepEqual(finalHeartbeats[1], finalHeartbeats[0], 'shutdown-final retry must preserve its exact payload');
 } finally {
   if (!child.killed && child.exitCode === null) child.kill('SIGKILL');
   await new Promise((resolve) => server.close(resolve));

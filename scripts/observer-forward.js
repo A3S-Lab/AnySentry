@@ -2799,6 +2799,21 @@ function remainingShutdownMs() {
   return Math.max(100, shutdownDeadline - Date.now());
 }
 
+function sendFinalHeartbeat(done) {
+  const attempt = () => {
+    const remainingMs = remainingShutdownMs();
+    const timeoutMs = Math.min(5_000, remainingMs);
+    sendHeartbeat((failed) => {
+      if (failed && Date.now() + 100 < shutdownDeadline) {
+        setTimeout(attempt, 50);
+        return;
+      }
+      done(Boolean(failed));
+    }, timeoutMs, true);
+  };
+  attempt();
+}
+
 function finishShutdownControlPlane() {
   if (shutdownFinalizing || transportsClosed) return;
   shutdownFinalizing = true;
@@ -2812,8 +2827,7 @@ function finishShutdownControlPlane() {
   // The API derives `unobserved` when this forwarder stops reporting. A ready snapshot is
   // intentionally monotonic, so do not attempt to regress it during graceful shutdown.
   sendRuntimeSnapshot(true, () => {
-    const heartbeatTimeout = Math.min(5_000, remainingShutdownMs());
-    sendHeartbeat(() => closeTransports(), heartbeatTimeout, true);
+    sendFinalHeartbeat(() => closeTransports());
   }, snapshotTimeout);
 }
 
@@ -2842,7 +2856,11 @@ function flushAndClose() {
   filterRulePublisher.close();
   shutdownDeadline = Date.now() + SHUTDOWN_TIMEOUT_MS;
   shutdownForceTimer = setTimeout(forceShutdown, SHUTDOWN_TIMEOUT_MS);
-  const controlReserveMs = Math.min(5_000, Math.max(1_000, Math.floor(SHUTDOWN_TIMEOUT_MS / 3)));
+  // Event evidence is already durable in the WAL, while the final runtime snapshot and heartbeat
+  // are the only lifecycle proof that the API can use during a rollout. Reserve half of the
+  // Forwarder budget for those two serial control requests instead of leaving them an exact,
+  // scheduler-fragile five-second tail.
+  const controlReserveMs = Math.min(10_000, Math.max(2_000, Math.floor(SHUTDOWN_TIMEOUT_MS / 2)));
   eventDrainDeadline = shutdownDeadline - controlReserveMs;
   pumpEventWork();
   const waitForInflight = () => {
