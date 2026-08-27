@@ -209,6 +209,18 @@ const SPOOL_DEGRADED_AGE_MS = boundedNumber(
   1_000,
   3_600_000,
 );
+const WAL_PENDING_MAX_EVENTS = boundedNumber(
+  process.env.FORWARD_WAL_PENDING_MAX_EVENTS,
+  65_536,
+  1_024,
+  250_000,
+);
+const WAL_PENDING_MAX_BYTES = boundedNumber(
+  process.env.FORWARD_WAL_PENDING_MAX_BYTES,
+  256 * 1024 * 1024,
+  16 * 1024 * 1024,
+  2 * 1024 * 1024 * 1024,
+);
 const HTTP_TIMEOUT_MS = boundedNumber(process.env.FORWARD_HTTP_TIMEOUT_MS, 10_000, 1_000, 120_000);
 const CONTROL_HTTP_TIMEOUT_MS = boundedNumber(
   process.env.FORWARD_CONTROL_HTTP_TIMEOUT_MS,
@@ -381,6 +393,11 @@ const spool = new DurableSpool({
   compactMaxLiveRecords: process.env.FORWARD_SPOOL_COMPACT_MAX_LIVE_RECORDS,
   fsyncMode: process.env.FORWARD_SPOOL_FSYNC,
   fsyncMs: process.env.FORWARD_SPOOL_FSYNC_MS,
+  onAsyncError(error) {
+    console.error(`[observer-forward] durable spool async operation failed: ${error.message}`);
+    if (rl) rl.pause();
+    process.exitCode = 1;
+  },
 });
 const HEARTBEAT_SECS = Math.max(0, Number(process.env.ANYSENTRY_HEARTBEAT_SECS || 30));
 const heartbeatTarget = new URL(process.env.ANYSENTRY_HEARTBEAT_URL || defaultHeartbeatUrl(target));
@@ -610,6 +627,8 @@ let outstandingEvents = 0;
 let outstandingBytes = 0;
 let retryOutstandingEvents = 0;
 let retryOutstandingBytes = 0;
+let walPendingEvents = 0;
+let walPendingBytes = 0;
 const outstandingItems = new Set();
 const activeSpoolIds = new Set();
 const pending = new BoundedPriorityQueue(MAX_OUTSTANDING_EVENTS, 5, (item) => item.bytes);
@@ -1975,6 +1994,10 @@ function eventQueueMetrics(now = Date.now()) {
     outstandingByteLimit: MAX_OUTSTANDING_BYTES,
     protectedReserveEvents: PROTECTED_RESERVE_EVENTS,
     protectedReserveBytes: PROTECTED_RESERVE_BYTES,
+    walPendingEvents,
+    walPendingBytes,
+    walPendingEventLimit: WAL_PENDING_MAX_EVENTS,
+    walPendingByteLimit: WAL_PENDING_MAX_BYTES,
   };
 }
 
@@ -1992,6 +2015,10 @@ function durableSpoolMetrics() {
     compactionDeferred: status.compactionDeferred,
     compactions: status.compactions,
     compactMaxLiveRecords: status.compactMaxLiveRecords,
+    pendingPutRecords: status.pendingPutRecords,
+    pendingPutBytes: status.pendingPutBytes,
+    pendingOperations: status.pendingOperations,
+    asyncSyncActive: status.asyncSyncActive,
   };
 }
 
@@ -2256,6 +2283,9 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         spoolCompactionDeferred: spoolMetrics.compactionDeferred,
         spoolCompactions: spoolMetrics.compactions,
         spoolCompactMaxLiveRecords: spoolMetrics.compactMaxLiveRecords,
+        spoolPendingPutRecords: spoolMetrics.pendingPutRecords,
+        spoolPendingPutBytes: spoolMetrics.pendingPutBytes,
+        spoolPendingOperations: spoolMetrics.pendingOperations,
         queueBytes: eventQueues.queueBytes,
         inflightEvents: eventQueues.inflightEvents,
         inflightBytes: eventQueues.inflightBytes,
@@ -2272,6 +2302,10 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         outstandingByteLimit: eventQueues.outstandingByteLimit,
         protectedReserveEvents: eventQueues.protectedReserveEvents,
         protectedReserveBytes: eventQueues.protectedReserveBytes,
+        walPendingEvents: eventQueues.walPendingEvents,
+        walPendingBytes: eventQueues.walPendingBytes,
+        walPendingEventLimit: eventQueues.walPendingEventLimit,
+        walPendingByteLimit: eventQueues.walPendingByteLimit,
         identitySnapshotReady: workload.ready,
         identitySnapshotVersion: workload.version,
         identityKubernetesVersion: workload.sources?.kubernetes?.version,
@@ -2381,7 +2415,12 @@ function closeTransports() {
   eventHttpsAgent.destroy();
   controlHttpAgent.destroy();
   controlHttpsAgent.destroy();
-  spool.close();
+  try {
+    spool.close();
+  } catch (error) {
+    console.error(`[observer-forward] durable spool close failed: ${error.message}`);
+    process.exitCode = 1;
+  }
   if (shutdownForceTimer) clearTimeout(shutdownForceTimer);
   shutdownForceTimer = undefined;
 }
@@ -2475,12 +2514,14 @@ function markRetryOwned(items) {
 function recordRetryExhausted(items, operationalError = true, reason = 'retry_exhausted') {
   const unsettled = items.filter((item) => !item.settled);
   const parked = unsettled.filter((item) => item.spoolId).length;
+  const durableIds = unsettled.map((item) => item.spoolId).filter(Boolean);
   const count = settleOutstanding(unsettled);
   if (!count) return;
   attributionCounts.retryExhausted += count;
   attributionCounts.retryParked += parked;
   outputDropped += Math.max(0, count - parked);
   pipelineAccounting.record('queue_dropped', reason, count);
+  spool.defer(durableIds);
   if (operationalError) errorCount++;
   scheduleSpoolReplay();
 }
@@ -2569,7 +2610,7 @@ function finishBatch(batch, outcome, retryDelivery) {
     else attributionCounts.queueParked += parkedDropped;
   }
   if (acceptedItems.length) {
-    spool.ack(acceptedItems.map((item) => item.spoolId).filter(Boolean));
+    spool.ackAsync(acceptedItems.map((item) => item.spoolId).filter(Boolean));
   }
   if (rejectedItems.length) {
     spool.deadLetter(
@@ -2698,8 +2739,8 @@ function makeQueueRoom(bytes, priority) {
 
 function inputAtCapacity() {
   return (
-    outstandingEvents >= MAX_OUTSTANDING_EVENTS
-    || outstandingBytes >= MAX_OUTSTANDING_BYTES
+    walPendingEvents >= WAL_PENDING_MAX_EVENTS
+    || walPendingBytes >= WAL_PENDING_MAX_BYTES
     || spool.atCapacity()
   );
 }
@@ -2710,39 +2751,15 @@ function updateInputFlow() {
   else rl.resume();
 }
 
-function enqueue(body, priority, countForwarded = true, kind = '', recovered = false) {
-  const observedAt = Number(body.observedAt) || Date.now();
-  const durableBody = body.observedAt ? body : { ...body, observedAt };
-  let bytes;
-  try {
-    bytes = Buffer.byteLength(JSON.stringify(durableBody));
-  } catch {
-    recordQueueDrop(kind, priority, 'serialization_error');
-    return false;
-  }
-  if (bytes > MAX_EVENT_BYTES) {
-    recordQueueDrop(kind, priority, 'event_too_large');
-    return false;
-  }
-  const spoolId = kind === 'CollectorHeartbeat'
-    ? undefined
-    : String(durableBody.sourceEventId || '');
-  if (spoolId && !recovered) {
-    try {
-      spool.put({
-        id: spoolId,
-        body: durableBody,
-        priority,
-        queuedAt: observedAt,
-      });
-    } catch (error) {
-      recordQueueDrop(kind, priority, 'durable_spool_error');
-      console.error(`[observer-forward] durable spool write failed: ${error.message}`);
-      if (rl) rl.pause();
-      process.exitCode = 1;
-      return false;
-    }
-  }
+function admitDurableEvent(
+  durableBody,
+  bytes,
+  spoolId,
+  priority,
+  countForwarded,
+  kind,
+  recovered,
+) {
   if (!makeQueueRoom(bytes, priority)) {
     if (recovered) attributionCounts.spoolReplayDeferred++;
     else recordQueueDrop(
@@ -2789,6 +2806,75 @@ function enqueue(body, priority, countForwarded = true, kind = '', recovered = f
   if (countForwarded) attributionCounts.forwarded++;
   if (pending.length >= BATCH_SIZE) flushPending();
   else scheduleBatch();
+  updateInputFlow();
+  return true;
+}
+
+function enqueue(body, priority, countForwarded = true, kind = '', recovered = false) {
+  const observedAt = Number(body.observedAt) || Date.now();
+  const durableBody = body.observedAt ? body : { ...body, observedAt };
+  let bytes;
+  try {
+    bytes = Buffer.byteLength(JSON.stringify(durableBody));
+  } catch {
+    recordQueueDrop(kind, priority, 'serialization_error');
+    return false;
+  }
+  if (bytes > MAX_EVENT_BYTES) {
+    recordQueueDrop(kind, priority, 'event_too_large');
+    return false;
+  }
+  const spoolId = kind === 'CollectorHeartbeat'
+    ? undefined
+    : String(durableBody.sourceEventId || '');
+  if (!spoolId || recovered) {
+    return admitDurableEvent(
+      durableBody,
+      bytes,
+      spoolId,
+      priority,
+      countForwarded,
+      kind,
+      recovered,
+    );
+  }
+  if (
+    walPendingEvents + 1 > WAL_PENDING_MAX_EVENTS
+    || walPendingBytes + bytes > WAL_PENDING_MAX_BYTES
+    || spool.atCapacity()
+  ) {
+    recordQueueDrop(kind, priority, 'wal_pending_capacity');
+    updateInputFlow();
+    return false;
+  }
+  walPendingEvents += 1;
+  walPendingBytes += bytes;
+  spool.putAsync({
+    id: spoolId,
+    body: durableBody,
+    priority,
+    queuedAt: observedAt,
+  }, (error, inserted) => {
+    walPendingEvents = Math.max(0, walPendingEvents - 1);
+    walPendingBytes = Math.max(0, walPendingBytes - bytes);
+    if (error) {
+      recordQueueDrop(kind, priority, 'durable_spool_error');
+      updateInputFlow();
+      return;
+    }
+    if (inserted) {
+      admitDurableEvent(
+        durableBody,
+        bytes,
+        spoolId,
+        priority,
+        countForwarded,
+        kind,
+        false,
+      );
+    }
+    updateInputFlow();
+  });
   updateInputFlow();
   return true;
 }
@@ -2918,7 +3004,13 @@ function flushAndClose() {
   pumpEventWork();
   const waitForInflight = () => {
     pumpEventWork();
-    const hasEventWork = inflight > 0 || pending.length > 0 || retryTasks.length > 0;
+    const spoolStatus = spool.status();
+    const hasEventWork = inflight > 0
+      || pending.length > 0
+      || retryTasks.length > 0
+      || walPendingEvents > 0
+      || spoolStatus.pendingOperations > 0
+      || spoolStatus.asyncSyncActive;
     if (hasEventWork && Date.now() < eventDrainDeadline) {
       setTimeout(waitForInflight, 50);
       return;

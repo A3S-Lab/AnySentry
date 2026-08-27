@@ -1512,16 +1512,20 @@ const expiryCapacity = await runConfig('retry-expiry-releases-capacity', {
       'retry item occupying the unified one-event cap',
     );
     child.stdin.write(`${lines[1]}\n`);
-    await within(expiryCapacityResumed.promise, 500, 'stdin resume after retry age expiry');
+    await within(expiryCapacityResumed.promise, 5_000, 'durable replay after retry age expiry');
     child.stdin.end();
   },
 });
 const expiryCapacityMarkers = expiryCapacity.batchRequests.flatMap((events) => events.map((item) =>
   JSON.parse(item.line).event.ToolExec.argv.at(-1)));
 assert.deepEqual(
-  expiryCapacityMarkers,
+  expiryCapacityMarkers.slice(0, 2),
   ['expiry-capacity-a', 'expiry-capacity-b'],
-  'age expiry without an HTTP callback must resume stdin and admit the buffered next event',
+  'age expiry without an HTTP callback must release capacity and replay the next durable event',
+);
+assert.ok(
+  expiryCapacityMarkers.slice(2).every((marker) => marker === 'expiry-capacity-a'),
+  'the older durable retry may resume only after the next same-priority event gets a fair turn',
 );
 assert.equal(
   expiryCapacity.heartbeats.reduce((sum, heartbeat) => sum + (heartbeat.filterMetrics?.retryAttempts ?? 0), 0),
@@ -1530,7 +1534,7 @@ assert.equal(
 );
 assert.equal(
   expiryCapacity.heartbeats.reduce((sum, heartbeat) => sum + (heartbeat.filterMetrics?.retryExhausted ?? 0), 0),
-  1,
+  expiryCapacityMarkers.filter((marker) => marker === 'expiry-capacity-a').length,
 );
 assert.equal(
   expiryCapacity.heartbeats.reduce((sum, heartbeat) => sum + (heartbeat.outputDropped ?? 0), 0),
@@ -1538,7 +1542,7 @@ assert.equal(
 );
 assert.equal(
   expiryCapacity.heartbeats.reduce((sum, heartbeat) => sum + (heartbeat.filterMetrics?.retryParked ?? 0), 0),
-  1,
+  expiryCapacityMarkers.filter((marker) => marker === 'expiry-capacity-a').length,
 );
 assert.equal(expiryCapacity.heartbeat.filterMetrics.outstandingEvents, 0);
 

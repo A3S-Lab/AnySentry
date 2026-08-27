@@ -161,6 +161,54 @@ try {
   assert.equal(streamingSpool.status().records, 1);
   assert.equal(streamingSpool.available(new Set(), 1)[0].body.line, unicodeLine);
   streamingSpool.close();
+
+  const asyncPath = path.join(temporary, 'async-put.wal');
+  const heldWrites = [];
+  const asyncSpool = new DurableSpool({
+    writerId: 'async-put-test',
+    filePath: asyncPath,
+    fsyncMode: 'periodic',
+    fsyncMs: 60_000,
+    writeAsync(fd, buffer, offset, length, position, callback) {
+      heldWrites.push({ fd, buffer, offset, length, position, callback });
+    },
+  });
+  let putCompleted = false;
+  const putResult = new Promise((resolve, reject) => {
+    asyncSpool.putAsync({
+      id: 'async-record',
+      body: { sourceEventId: 'async-record', line: '{}' },
+      priority: 3,
+      queuedAt: 20,
+    }, (error, inserted) => {
+      if (error) reject(error);
+      else {
+        putCompleted = true;
+        resolve(inserted);
+      }
+    });
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(putCompleted, false, 'putAsync must not block the event loop on the WAL write');
+  assert.equal(asyncSpool.status().pendingPutRecords, 1);
+  assert.equal(asyncSpool.status().records, 0, 'HTTP-visible live state starts only after durable put');
+  const putWrite = heldWrites.shift();
+  putWrite.callback(undefined, putWrite.length);
+  assert.equal(await putResult, true);
+  assert.equal(asyncSpool.status().records, 1);
+
+  const ackResult = new Promise((resolve, reject) => {
+    asyncSpool.ackAsync(['async-record'], (error, acknowledged) => {
+      if (error) reject(error);
+      else resolve(acknowledged);
+    });
+  });
+  assert.equal(asyncSpool.status().records, 0, 'ACK removes the live record without blocking');
+  const ackWrite = heldWrites.shift();
+  ackWrite.callback(undefined, ackWrite.length);
+  assert.equal(await ackResult, 1);
+  assert.equal(asyncSpool.status().pendingOperations, 0);
+  asyncSpool.close();
   console.log('Observer spool replay rescue verification passed');
 } finally {
   await new Promise((resolve) => server.close(resolve));

@@ -32,6 +32,8 @@ class DurableSpool {
     this.compactMinBytes = boundedNumber(options.compactMinBytes, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024 * 1024);
     this.compactMaxLiveRecords = boundedNumber(options.compactMaxLiveRecords, 16_384, 1, 250_000);
     this.loadChunkBytes = boundedNumber(options.loadChunkBytes, 1024 * 1024, 64, 4 * 1024 * 1024);
+    this.writeAsync = options.writeAsync || fs.write.bind(fs);
+    this.onAsyncError = typeof options.onAsyncError === 'function' ? options.onAsyncError : () => {};
     this.filePath = path.resolve(options.filePath);
     this.dlqPath = path.resolve(options.dlqPath || `${this.filePath}.dlq`);
     this.records = new Map();
@@ -43,13 +45,18 @@ class DurableSpool {
     this.deadLetterRecords = 0;
     this.compactionDeferred = 0;
     this.compactions = 0;
+    this.asyncOperations = [];
+    this.asyncWriteActive = false;
+    this.pendingPutIds = new Set();
+    this.pendingPutBytes = 0;
+    this.asyncSyncActive = false;
     this.closed = false;
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
     this.load();
     this.fd = fs.openSync(this.filePath, 'a', 0o600);
     this.walBytes = fs.fstatSync(this.fd).size;
     if (this.fsyncMode === 'periodic') {
-      this.fsyncTimer = setInterval(() => this.sync(), this.fsyncMs);
+      this.fsyncTimer = setInterval(() => this.syncAsync(), this.fsyncMs);
       this.fsyncTimer.unref();
     }
   }
@@ -136,9 +143,79 @@ class DurableSpool {
     if (forceSync || this.fsyncMode === 'always') this.sync();
   }
 
+  appendAsync(operation, forceSync, done) {
+    if (this.closed) {
+      done(new Error('Observer spool is closed'));
+      return;
+    }
+    const buffer = Buffer.from(`${JSON.stringify(operation)}\n`);
+    this.asyncOperations.push({ buffer, offset: 0, forceSync, done });
+    this.pumpAsyncWrites();
+  }
+
+  pumpAsyncWrites() {
+    if (this.asyncWriteActive || this.closed) return;
+    const entry = this.asyncOperations[0];
+    if (!entry) return;
+    this.asyncWriteActive = true;
+    const finish = (error) => {
+      this.asyncWriteActive = false;
+      this.asyncOperations.shift();
+      if (!error) {
+        this.walBytes += entry.buffer.length;
+        this.appendedOperations += 1;
+      }
+      try {
+        entry.done(error);
+      } finally {
+        if (error) this.onAsyncError(error);
+        this.pumpAsyncWrites();
+      }
+    };
+    const writeRemaining = () => {
+      this.writeAsync(
+        this.fd,
+        entry.buffer,
+        entry.offset,
+        entry.buffer.length - entry.offset,
+        null,
+        (error, written = 0) => {
+          if (error) {
+            finish(error);
+            return;
+          }
+          if (written <= 0) {
+            finish(new Error('Observer spool async append made no progress'));
+            return;
+          }
+          entry.offset += written;
+          if (entry.offset < entry.buffer.length) {
+            writeRemaining();
+            return;
+          }
+          if (entry.forceSync || this.fsyncMode === 'always') {
+            fs.fsync(this.fd, finish);
+          } else {
+            finish();
+          }
+        },
+      );
+    };
+    writeRemaining();
+  }
+
   sync() {
     if (this.closed || this.fd === undefined) return;
     fs.fsyncSync(this.fd);
+  }
+
+  syncAsync() {
+    if (this.closed || this.fd === undefined || this.asyncSyncActive) return;
+    this.asyncSyncActive = true;
+    fs.fsync(this.fd, (error) => {
+      this.asyncSyncActive = false;
+      if (error) this.onAsyncError(error);
+    });
   }
 
   put(record) {
@@ -158,6 +235,48 @@ class DurableSpool {
     return true;
   }
 
+  putAsync(record, done) {
+    if (!record?.id || !record?.body) {
+      done(new Error('Spool record requires id and body'));
+      return;
+    }
+    const id = String(record.id);
+    if (this.records.has(id) || this.pendingPutIds.has(id)) {
+      queueMicrotask(() => done(undefined, false));
+      return;
+    }
+    const normalized = {
+      id,
+      body: record.body,
+      priority: boundedNumber(record.priority, 0, 0, 5),
+      queuedAt: boundedNumber(record.queuedAt, Date.now(), 0, Number.MAX_SAFE_INTEGER),
+    };
+    const bytes = Buffer.byteLength(JSON.stringify(normalized.body));
+    if (
+      this.records.size + this.pendingPutIds.size + 1 > this.maxRecords
+      || this.logicalBytes + this.pendingPutBytes + bytes > this.maxBytes
+    ) {
+      queueMicrotask(() => done(Object.assign(new Error('Observer spool capacity reached'), {
+        code: 'ANYSENTRY_SPOOL_CAPACITY',
+      })));
+      return;
+    }
+    this.pendingPutIds.add(id);
+    this.pendingPutBytes += bytes;
+    this.appendAsync({ op: 'put', record: normalized }, false, (error) => {
+      this.pendingPutIds.delete(id);
+      this.pendingPutBytes = Math.max(0, this.pendingPutBytes - bytes);
+      if (error) {
+        done(error);
+        return;
+      }
+      this.records.set(id, { ...normalized, bytes });
+      this.prioritySets[normalized.priority].add(id);
+      this.logicalBytes += bytes;
+      done(undefined, true);
+    });
+  }
+
   ack(ids) {
     const acknowledged = [...new Set(ids)].filter((id) => this.records.has(id));
     if (!acknowledged.length) return 0;
@@ -172,6 +291,40 @@ class DurableSpool {
     }
     this.ackedRecords += acknowledged.length;
     this.compactIfNeeded();
+    return acknowledged.length;
+  }
+
+  ackAsync(ids, done = () => {}) {
+    const acknowledged = [...new Set(ids)].filter((id) => this.records.has(id));
+    if (!acknowledged.length) {
+      queueMicrotask(() => done(undefined, 0));
+      return 0;
+    }
+    const removed = [];
+    for (const id of acknowledged) {
+      const previous = this.records.get(id);
+      if (!previous) continue;
+      removed.push(previous);
+      this.logicalBytes -= previous.bytes;
+      this.records.delete(id);
+      this.prioritySets[previous.priority].delete(id);
+    }
+    this.appendAsync({ op: 'ack', ids: acknowledged }, false, (error) => {
+      if (error) {
+        // The durable put still exists. Restore the in-memory live view so later replay is safe.
+        for (const record of removed) {
+          if (this.records.has(record.id)) continue;
+          this.records.set(record.id, record);
+          this.prioritySets[record.priority].add(record.id);
+          this.logicalBytes += record.bytes;
+        }
+        done(error, 0);
+        return;
+      }
+      this.ackedRecords += acknowledged.length;
+      this.compactIfNeeded();
+      done(undefined, acknowledged.length);
+    });
     return acknowledged.length;
   }
 
@@ -210,8 +363,22 @@ class DurableSpool {
     return available;
   }
 
+  defer(ids) {
+    let deferred = 0;
+    for (const id of ids) {
+      const record = this.records.get(id);
+      if (!record) continue;
+      const lane = this.prioritySets[record.priority];
+      if (!lane.delete(id)) continue;
+      lane.add(id);
+      deferred += 1;
+    }
+    return deferred;
+  }
+
   atCapacity() {
-    return this.records.size >= this.maxRecords || this.logicalBytes >= this.maxBytes;
+    return this.records.size + this.pendingPutIds.size >= this.maxRecords
+      || this.logicalBytes + this.pendingPutBytes >= this.maxBytes;
   }
 
   compactIfNeeded() {
@@ -220,7 +387,12 @@ class DurableSpool {
     // Rewriting a large live snapshot synchronously would stop the Forwarder from draining the
     // Collector pipe. Defer space reclamation until ACK progress makes the bounded rewrite small;
     // puts and ACKs remain append-only and crash-safe in the meantime.
-    if (this.records.size > this.compactMaxLiveRecords) {
+    if (
+      this.records.size > this.compactMaxLiveRecords
+      || this.asyncWriteActive
+      || this.asyncOperations.length > 0
+      || this.asyncSyncActive
+    ) {
       this.compactionDeferred += 1;
       return false;
     }
@@ -260,6 +432,10 @@ class DurableSpool {
       writerId: this.writerId,
       filePath: this.filePath,
       records: this.records.size,
+      pendingPutRecords: this.pendingPutIds.size,
+      pendingPutBytes: this.pendingPutBytes,
+      pendingOperations: this.asyncOperations.length,
+      asyncSyncActive: this.asyncSyncActive,
       logicalBytes: Math.max(0, this.logicalBytes),
       walBytes: this.walBytes,
       oldestMs: Number.isFinite(oldest) ? Math.max(0, Date.now() - oldest) : 0,
@@ -276,6 +452,9 @@ class DurableSpool {
   close() {
     if (this.closed) return;
     if (this.fsyncTimer) clearInterval(this.fsyncTimer);
+    if (this.asyncWriteActive || this.asyncOperations.length > 0 || this.asyncSyncActive) {
+      throw new Error('Observer spool closed with pending async operations');
+    }
     this.sync();
     this.closed = true;
     if (this.fd !== undefined) fs.closeSync(this.fd);
