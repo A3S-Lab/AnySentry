@@ -11,7 +11,7 @@ resources:
 images:
   - name: ghcr.io/a3s-lab/anysentry-observer
     newName: 127.0.0.1:5000/anysentry-observer
-    digest: sha256:7cc4c7084f5dedf022174e39c7364cccb65d0ee9bc1587d224ee360f54e28970
+    digest: sha256:b2ffe8f64b994a73adfea7ee4d7da069967a587d1b175f63203abf8aea1b2d04
 
 patches:
   - path: observer-manual-patch.yaml
