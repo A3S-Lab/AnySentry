@@ -2017,7 +2017,7 @@ function deliverPendingHeartbeat(done, timeoutMs) {
   });
 }
 
-function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false) {
+function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shutdownFinal = false) {
   if (!HEARTBEAT_SECS) {
     done(false);
     return;

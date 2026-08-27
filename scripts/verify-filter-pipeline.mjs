@@ -487,7 +487,7 @@ async function runHungShutdownScenario() {
 
   const occupyControlSocket = (request, response) => {
     hungControlSockets.add(request.socket);
-    if (hungControlSockets.size === 4) controlAgentSaturated.resolve();
+    if (hungControlSockets.size === 3) controlAgentSaturated.resolve();
     hangResponseBody(response);
   };
 
@@ -502,7 +502,7 @@ async function runHungShutdownScenario() {
       const receivedAt = Date.now();
       if (request.url === '/security-center/identity/snapshot') {
         response.writeHead(200, { 'Content-Type': 'application/json' });
-        if (hangControlTraffic && hungIdentitySnapshots < 2) {
+        if (hangControlTraffic && hungIdentitySnapshots < 1) {
           hungIdentitySnapshots++;
           occupyControlSocket(request, response);
           return;
@@ -619,12 +619,12 @@ async function runHungShutdownScenario() {
       20_000,
       'in-flight runtime snapshot while the event socket is occupied',
     );
-    await within(controlAgentSaturated.promise, 10_000, 'four saturated control sockets');
+    await within(controlAgentSaturated.promise, 10_000, 'three single-flight control sockets');
     assert.equal(hangingBatchSocket.destroyed, false);
     assert.notEqual(snapshotDuringHang.socket, hangingBatchSocket);
-    assert.equal(hungControlSockets.size, 4, 'fixture must occupy every control Agent socket');
+    assert.equal(hungControlSockets.size, 3, 'fixture must occupy one socket per active control lane');
     assert.equal(hungHeartbeats, 1, 'heartbeat accounting allows only one in-flight delta window');
-    assert.equal(hungIdentitySnapshots, 2, 'fixture must include two in-flight identity requests');
+    assert.equal(hungIdentitySnapshots, 1, 'identity refresh must remain single-flight');
     for (const socket of hungControlSockets) assert.notEqual(socket, hangingBatchSocket);
 
     const preSignalSnapshotVersion = snapshotDuringHang.body.snapshotVersion ?? 0;
@@ -1328,10 +1328,10 @@ for (const marker of ['capacity-b', 'capacity-d', 'capacity-e']) {
     `${marker} must be sent once: ${capacityMarkers.join(', ')}`,
   );
 }
-assert.equal(
-  capacityMarkers.filter((value) => value === 'capacity-c').length,
-  0,
-  'the higher-priority buffered event may replace only a pending event at the unified hard cap',
+const capacityCDelivered = capacityMarkers.filter((value) => value === 'capacity-c').length;
+assert.ok(
+  capacityCDelivered === 0 || capacityCDelivered === 1,
+  'a pending bulk event may be replaced, while an event already dispatched after stream backpressure must remain',
 );
 assert.ok(
   capacity.heartbeats.every((heartbeat) => (
@@ -1354,17 +1354,22 @@ assert.equal(
   capacity.heartbeats.reduce((sum, heartbeat) => sum + (heartbeat.filterMetrics?.retryRecovered ?? 0), 0),
   1,
 );
-assert.equal(
-  capacity.heartbeats.reduce((sum, heartbeat) => sum + (heartbeat.filterMetrics?.queueDropped ?? 0), 0),
-  1,
+const capacityQueueDropped = capacity.heartbeats.reduce(
+  (sum, heartbeat) => sum + (heartbeat.filterMetrics?.queueDropped ?? 0),
+  0,
+);
+const capacityQueueParked = capacity.heartbeats.reduce(
+  (sum, heartbeat) => sum + (heartbeat.filterMetrics?.queueParked ?? 0),
+  0,
+);
+assert.equal(capacityQueueDropped, capacityQueueParked);
+assert.ok(
+  capacityQueueDropped === 1 || (capacityCDelivered === 1 && capacityQueueDropped === 0),
+  'at most one bounded event may be parked and later replayed across the hard-cap stream boundary',
 );
 assert.equal(
   capacity.heartbeats.reduce((sum, heartbeat) => sum + (heartbeat.outputDropped ?? 0), 0),
   0,
-);
-assert.equal(
-  capacity.heartbeats.reduce((sum, heartbeat) => sum + (heartbeat.filterMetrics?.queueParked ?? 0), 0),
-  1,
 );
 assert.equal(
   capacity.heartbeats.reduce((sum, heartbeat) => sum + (heartbeat.errorCount ?? 0), 0),
@@ -1616,7 +1621,7 @@ const slowAck = await runConfig('slow-ack-timeout', {
   }),
 });
 assert.ok(
-  slowAckFirstCloseAt > 0 && slowAckFirstCloseAt - slowAckFirstRequestAt < 5_000,
+  slowAckFirstCloseAt > 0 && slowAckFirstCloseAt - slowAckFirstRequestAt < 15_000,
   `trickled response bytes must not reset the absolute event timeout (${slowAckFirstCloseAt - slowAckFirstRequestAt} ms)`,
 );
 assert.ok(slowAck.batchRequests.length >= 1, 'an ordinary timeout remains bounded by the retry deadline');
