@@ -1401,6 +1401,40 @@ export function eventRevisionIdentity(e: JudgedEvent): {
   };
 }
 
+/**
+ * ClickHouse JSONEachRow rejects an escaped lone UTF-16 surrogate and would otherwise retain a
+ * whole durable batch behind that one value forever. Preserve valid pairs byte-for-byte and
+ * replace only malformed code units at the persistence boundary.
+ */
+function clickHouseWellFormedText(value: string): string {
+  let repaired = '';
+  let segmentStart = 0;
+  let changed = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        index += 1;
+        continue;
+      }
+    } else if (unit < 0xdc00 || unit > 0xdfff) {
+      continue;
+    }
+    repaired += value.slice(segmentStart, index) + '\ufffd';
+    segmentStart = index + 1;
+    changed = true;
+  }
+  return changed ? repaired + value.slice(segmentStart) : value;
+}
+
+function clickHouseWellFormedRow(row: Row): Row {
+  for (const [key, value] of Object.entries(row)) {
+    if (typeof value === 'string') (row as unknown as Record<string, unknown>)[key] = clickHouseWellFormedText(value);
+  }
+  return row;
+}
+
 function toRow(e: JudgedEvent): Row {
   const rawAttribution = e.attribution;
   const correlation = parseTrustedCorrelation(rawAttribution?.correlation);
@@ -1415,7 +1449,7 @@ function toRow(e: JudgedEvent): Row {
   const process = visibleProcessContext(e.process);
   const evidenceIndex = toolEvidenceIndexFields(e);
   const revisionIdentity = eventRevisionIdentity(e);
-  return {
+  return clickHouseWellFormedRow({
     schemaVersion: e.schemaVersion,
     eventId: e.eventId,
     sourceEventId: e.sourceEventId ?? '',
@@ -1520,7 +1554,7 @@ function toRow(e: JudgedEvent): Row {
     agentHasInternalHelperRoot: isInternalAgentHelperRootEvent(e) ? 1 : 0,
     judgment: JSON.stringify(e.judgment ?? {}),
     rawPreview: e.rawPreview ?? '',
-  };
+  });
 }
 
 function prepareCommitBatch(rows: Row[], requestedBatchId?: string): Row[] {

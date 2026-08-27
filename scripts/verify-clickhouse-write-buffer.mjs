@@ -1025,6 +1025,27 @@ await withoutExpectedErrorLogs(async () => {
   await store.close();
 });
 
+await withoutExpectedErrorLogs(async () => {
+  const fake = fakeClickHouse({
+    onInsert(call) {
+      assert.doesNotMatch(
+        JSON.stringify(call.values),
+        /\\u(?:d[89ab][0-9a-f]{2})(?!\\u(?:d[cdef][0-9a-f]{2}))|(?<!\\u(?:d[89ab][0-9a-f]{2}))\\u(?:d[cdef][0-9a-f]{2})/iu,
+        'ClickHouse JSONEachRow must not receive an unpaired UTF-16 surrogate',
+      );
+    },
+  });
+  const store = storeFor(fake);
+  await store.insertNow(event(2_450, {
+    subject: `valid \ud83d\udee1 malformed-high \ud800 malformed-low \udfff`,
+    rawPreview: `before\ud800after`,
+  }), 'unicode-well-formed');
+  const row = fake.state.calls[0].values[0];
+  assert.equal(row.subject, 'valid 🛡 malformed-high � malformed-low �');
+  assert.equal(row.rawPreview, 'before�after');
+  await store.close();
+});
+
 const [storeSource, judgeSource, mainSource, manifestSource] = await Promise.all([
   readFile(new URL('../apps/api/src/security-monitoring/clickhouse-store.ts', import.meta.url), 'utf8'),
   readFile(new URL('../apps/api/src/security-monitoring/sentry-judge.service.ts', import.meta.url), 'utf8'),
