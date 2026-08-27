@@ -34,6 +34,7 @@ export const FILTER_RULE_CATEGORY_LABELS: Record<FilterRuleCategory, string> = {
 
 export const FILTER_RULE_KIND_LABELS: Record<FilterRuleRecord['ruleKind'], string> = {
   runtime_signature: 'Runtime Signature',
+  non_agent_runtime_signature: 'Non-Agent Runtime Signature',
   agent_template: 'Agent Template',
   deployment_binding: 'Deployment Binding',
   reviewed_identity_binding: '人工身份绑定',
@@ -50,6 +51,7 @@ export const FILTER_RULE_KIND_LABELS: Record<FilterRuleRecord['ruleKind'], strin
 
 export const FILTER_RULE_KIND_CATEGORIES: Record<FilterRuleRecord['ruleKind'], FilterRuleCategory> = {
   runtime_signature: 'agent_identity',
+  non_agent_runtime_signature: 'agent_identity',
   agent_template: 'agent_identity',
   deployment_binding: 'agent_identity',
   reviewed_identity_binding: 'agent_identity',

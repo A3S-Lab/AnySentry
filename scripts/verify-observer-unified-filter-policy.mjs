@@ -28,6 +28,21 @@ assert.equal(registry.settings().retainUnknown, true);
 assert.equal(registry.settings().retainNonAgent, false);
 assert.equal(registry.settings().fileAggregationEnabled, true);
 
+const samplerCandidates = registry.identityCandidates(
+  {
+    event: { ToolExec: { pid: 77, argv: ['/opt/vscode/cpuUsage.sh'] } },
+    process: { comm: 'cpuUsage.sh', exe: '/opt/vscode/cpuUsage.sh' },
+  },
+  {
+    state: 'unknown',
+    attribution: { monitored: false, classification: 'unknown', confidence: 0, source: 'none' },
+  },
+);
+const samplerIdentity = samplerCandidates.find((candidate) =>
+  candidate.ruleId === 'fr_builtin_non_agent_runtime_vscode_cpu_sampler');
+assert.equal(samplerIdentity?.attribution.classification, 'non_agent');
+assert.equal(samplerIdentity?.attribution.confidence, 1);
+
 const signatures = registry.runtimeSignatureDocument();
 assert.equal(signatures.runtimes.length, 6);
 const signatureRegistry = new RuntimeSignatureRegistry(signatures, { source: 'unified-filter-rule' });
@@ -94,6 +109,42 @@ assert.equal(nonAgentDecision.action, 'suppress');
 assert.equal(nonAgentDecision.ruleId, 'fr_builtin_f2_non_agent_suppress');
 assert.equal(nonAgentDecision.decisionReceipt.stage, 'f2');
 assert.equal(nonAgentDecision.decisionReceipt.winner.ruleId, nonAgentDecision.ruleId);
+const infrastructureLifecycleDecision = registry.semanticDecision(
+  { event: { ProcessExit: { pid: 101 } }, process: { comm: 'kafka-run-class' } },
+  infrastructure,
+);
+assert.equal(infrastructureLifecycleDecision.action, 'suppress');
+assert.equal(
+  infrastructureLifecycleDecision.ruleId,
+  'fr_builtin_f2_trusted_infrastructure_lifecycle_suppress',
+);
+const unknownInfrastructureLifecycleDecision = registry.semanticDecision(
+  { event: { ProcessExit: { pid: 102 } }, process: { comm: 'unresolved-helper' } },
+  { ...baseUnknown, workloadRole: 'anysentry_internal' },
+);
+assert.equal(unknownInfrastructureLifecycleDecision.action, 'priority');
+assert.equal(unknownInfrastructureLifecycleDecision.ruleId, 'fr_guardrail_lifecycle_structure');
+const confirmedInfrastructureLifecycleDecision = registry.semanticDecision(
+  { event: { ToolExec: { pid: 103, argv: ['agent'] } }, process: { comm: 'agent' } },
+  {
+    state: 'agent', workloadRole: 'anysentry_internal',
+    attribution: { monitored: true, classification: 'confirmed_agent', confidence: 1, source: 'kubernetes' },
+  },
+);
+assert.equal(confirmedInfrastructureLifecycleDecision.action, 'priority');
+assert.equal(confirmedInfrastructureLifecycleDecision.ruleId, 'fr_guardrail_lifecycle_structure');
+const samplerLifecycleDecision = registry.semanticDecision(
+  { event: { ToolExec: { pid: 104, argv: ['tr'] } }, process: { comm: 'tr' } },
+  {
+    state: 'non_agent',
+    attribution: {
+      monitored: false, classification: 'non_agent', confidence: 1, source: 'process_graph',
+      evidence: ['filter_rule:fr_builtin_non_agent_runtime_vscode_cpu_sampler:r1'],
+    },
+  },
+);
+assert.equal(samplerLifecycleDecision.action, 'suppress');
+assert.equal(samplerLifecycleDecision.ruleId, 'fr_builtin_f2_trusted_non_agent_family_lifecycle_suppress');
 const unknownDecision = registry.semanticDecision(
   { event: { FileAccess: { path: '/home/user/a' } }, process: { comm: 'cat' } },
   baseUnknown,

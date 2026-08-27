@@ -99,43 +99,42 @@ spec:
           persistentVolumeClaim:
             claimName: kafka-data
 ---
-# Reconciles required topics after Kafka starts and after later broker/PVC recovery.
-apiVersion: apps/v1
-kind: Deployment
+# Creates the closed topic set once per install/upgrade. Repeated CLI/JVM startup was observable as
+# thousands of short-lived internal lifecycle events; Kafka retains topics durably after this Job.
+apiVersion: batch/v1
+kind: Job
 metadata:
   name: kafka-topic-manager
   namespace: anysentry
   labels: { app: kafka-topic-manager, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
-  replicas: 1
-  selector:
-    matchLabels: { app: kafka-topic-manager }
+  backoffLimit: 20
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 600
   template:
     metadata:
       labels: { app: kafka-topic-manager, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
+      restartPolicy: OnFailure
       containers:
         - name: topic-manager
           image: apache/kafka:4.1.1
           command: ["/bin/bash", "-ec"]
           args:
             - |
-              while true; do
-                for topic in \
-                  anysentry.events.canonical.v1 \
-                  anysentry.judgments.v1 \
-                  anysentry.risk-analysis-batches.v1 \
-                  anysentry.stream.findings.v1 \
-                  anysentry.supply-chain.context.v1 \
-                  anysentry.stream.dlq.v1; do
-                  /opt/kafka/bin/kafka-topics.sh \
-                    --bootstrap-server kafka:9092 \
-                    --create --if-not-exists \
-                    --topic "${topic}" \
-                    --partitions 2 \
-                    --replication-factor 1 || true
-                done
-                sleep 60
+              for topic in \
+                anysentry.events.canonical.v1 \
+                anysentry.judgments.v1 \
+                anysentry.risk-analysis-batches.v1 \
+                anysentry.stream.findings.v1 \
+                anysentry.supply-chain.context.v1 \
+                anysentry.stream.dlq.v1; do
+                /opt/kafka/bin/kafka-topics.sh \
+                  --bootstrap-server kafka:9092 \
+                  --create --if-not-exists \
+                  --topic "${topic}" \
+                  --partitions 2 \
+                  --replication-factor 1
               done
           resources:
             requests: { cpu: 50m, memory: 128Mi }

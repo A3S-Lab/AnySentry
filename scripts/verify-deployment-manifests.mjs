@@ -454,7 +454,7 @@ function verifyStreamingManifest() {
   const docs = documentsFromYaml(readText('deploy/streaming.yaml'));
   const kafka = docFor(docs, 'StatefulSet', 'kafka');
   const kafkaService = docFor(docs, 'Service', 'kafka');
-  const topicManager = docFor(docs, 'Deployment', 'kafka-topic-manager');
+  const topicManager = docFor(docs, 'Job', 'kafka-topic-manager');
   const checkpointPvc = docFor(docs, 'PersistentVolumeClaim', 'flink-checkpoints');
   const jobManagerService = docFor(docs, 'Service', 'flink-jobmanager');
   const jobManager = docFor(docs, 'Deployment', 'flink-jobmanager');
@@ -491,7 +491,7 @@ function verifyStreamingManifest() {
     kafka?.source,
   );
   assert(
-    'Kafka topic manager reconciles all required event topics',
+    'Kafka topic manager creates all required topics once without a permanent process loop',
     [
       'anysentry.events.canonical.v1',
       'anysentry.judgments.v1',
@@ -499,7 +499,11 @@ function verifyStreamingManifest() {
       'anysentry.stream.findings.v1',
       'anysentry.supply-chain.context.v1',
       'anysentry.stream.dlq.v1',
-    ].every((topic) => topicManager?.source.includes(topic)),
+    ].every((topic) => topicManager?.source.includes(topic)) &&
+      /restartPolicy:\s*OnFailure/u.test(topicManager?.source ?? '') &&
+      /backoffLimit:\s*20/u.test(topicManager?.source ?? '') &&
+      /ttlSecondsAfterFinished:\s*600/u.test(topicManager?.source ?? '') &&
+      !/while\s+true|sleep\s+60/u.test(topicManager?.source ?? ''),
     topicManager?.source,
   );
   assert(

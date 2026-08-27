@@ -44,6 +44,16 @@ const { FileAccessAggregator } = require('./observer-file-aggregation');
 const { ForwarderPipelineAccounting } = require('./observer-pipeline-accounting');
 const { UnifiedFilterPolicyRegistry } = require('./observer-unified-filter-policy');
 
+// Only immutable, software-versioned rules may override the generic lifecycle discovery
+// guardrail. User-created SUPPRESS rules can never add an ID to this closed set.
+const PROTECTED_LIFECYCLE_SUPPRESSION_RULES = new Set([
+  'fr_builtin_f2_trusted_infrastructure_lifecycle_suppress',
+  'fr_builtin_f2_trusted_non_agent_family_lifecycle_suppress',
+]);
+const TRUSTED_NON_AGENT_PROCESS_FAMILY_RULES = new Set([
+  'fr_builtin_non_agent_runtime_vscode_cpu_sampler',
+]);
+
 const target = new URL(process.env.ANYSENTRY_INGEST_URL || 'http://localhost:29653/security-center/ingest');
 function defaultHeartbeatUrl(ingestUrl) {
   const url = new URL(ingestUrl.toString());
@@ -2971,9 +2981,24 @@ function handleLine(raw) {
     templateClassification,
   ) ?? processClassification;
   let catalogClassification = baseClassification;
+  let trustedNonAgentRuleId = '';
   for (const candidate of unifiedFilterPolicy.identityCandidates(o, catalogClassification)) {
+    if (
+      candidate.attribution?.classification === 'non_agent'
+      && TRUSTED_NON_AGENT_PROCESS_FAMILY_RULES.has(candidate.ruleId)
+    ) {
+      trustedNonAgentRuleId = candidate.ruleId;
+    }
     catalogClassification = mergeAttributionClassifications(catalogClassification, candidate)
       ?? catalogClassification;
+  }
+  if (
+    trustedNonAgentRuleId
+    && catalogClassification.state === 'non_agent'
+    && catalogClassification.attribution?.classification === 'non_agent'
+    && catalogClassification.attribution?.conflict !== true
+  ) {
+    attributor.rememberTrustedNonAgent(o, trustedNonAgentRuleId);
   }
   const infrastructureEvaluation = infrastructurePolicy.evaluate(o, workloadClassification);
   // Stable authoritative inventory is resolved before heuristic behavior discovery. A weak
@@ -3048,8 +3073,13 @@ function handleLine(raw) {
   // workload identity was learned. Exact self/manual non-Agent inventory may suppress routine
   // syscall detail, but it must never suppress these event kinds merely because no central
   // Infrastructure rule happened to materialize for the same workload.
-  const alwaysKeep = alwaysKeepEventKind(kind);
   const semanticDecision = unifiedFilterPolicy.semanticDecision(o, classification);
+  const trustedLifecycleSuppression = (
+    (kind === 'ToolExec' || kind === 'ProcessExit')
+    && semanticDecision?.action === 'suppress'
+    && PROTECTED_LIFECYCLE_SUPPRESSION_RULES.has(semanticDecision.ruleId)
+  );
+  const alwaysKeep = alwaysKeepEventKind(kind) && !trustedLifecycleSuppression;
   if (!alwaysKeep && semanticDecision) {
     if (semanticDecision.action === 'suppress') {
       filterReason = semanticDecision.reasonCode || 'non_agent';

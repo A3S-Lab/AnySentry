@@ -102,6 +102,10 @@ install_kubernetes() {
   }
 
   render_core_manifest "$ROOT_DIR/deploy/anysentry.yaml" | kubectl -n "$NAMESPACE" apply -f -
+  # Migrate the legacy minute-loop Deployment and rerun the idempotent one-shot Job on every
+  # install/upgrade. Kafka topic creation is durable and safe to repeat with --if-not-exists.
+  kubectl -n "$NAMESPACE" delete deployment kafka-topic-manager --ignore-not-found --wait=true
+  kubectl -n "$NAMESPACE" delete job kafka-topic-manager --ignore-not-found --wait=true
   render_streaming_manifest "$ROOT_DIR/deploy/streaming.yaml" | kubectl -n "$NAMESPACE" apply -f -
   # Environment-backed Secret values are read only at process start. This also makes an explicit
   # token rotation deterministic on reinstall before the bootstrap client authenticates.
@@ -162,7 +166,7 @@ install_kubernetes() {
   fi
 
   kubectl -n "$NAMESPACE" rollout status statefulset/kafka --timeout=600s
-  kubectl -n "$NAMESPACE" rollout status deploy/kafka-topic-manager --timeout=300s
+  kubectl -n "$NAMESPACE" wait --for=condition=complete job/kafka-topic-manager --timeout=600s
   kubectl -n "$NAMESPACE" rollout status deploy/flink-jobmanager --timeout=600s
   kubectl -n "$NAMESPACE" rollout status deploy/flink-taskmanager --timeout=600s
   kubectl -n "$NAMESPACE" rollout status deploy/flink-job-submit --timeout=600s
