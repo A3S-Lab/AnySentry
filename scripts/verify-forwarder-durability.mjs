@@ -12,7 +12,35 @@ const repoRoot = fileURLToPath(new URL('../', import.meta.url));
 const temporary = mkdtempSync(path.join(os.tmpdir(), 'anysentry-forwarder-durable-'));
 const spoolPath = path.join(temporary, 'observer.wal');
 const requests = [];
+const requestModes = [];
 let responseMode = 'disconnect-once';
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function eventually(label, predicate, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = predicate();
+    if (value) return value;
+    await sleep(20);
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+
+function liveSpoolIds() {
+  const live = new Set();
+  for (const line of readFileSync(spoolPath, 'utf8').split('\n')) {
+    if (!line) continue;
+    const operation = JSON.parse(line);
+    if (operation.op === 'put' && operation.record?.id) live.add(operation.record.id);
+    if (operation.op === 'ack' && Array.isArray(operation.ids)) {
+      for (const id of operation.ids) live.delete(id);
+    }
+  }
+  return live;
+}
 
 function observerLine(marker) {
   return JSON.stringify({
@@ -64,6 +92,7 @@ const server = http.createServer((request, response) => {
   request.on('end', () => {
     const body = JSON.parse(raw || '{}');
     requests.push(body);
+    requestModes.push(responseMode);
     if (responseMode === 'disconnect-once') {
       responseMode = 'accept';
       request.socket.destroy();
@@ -84,7 +113,7 @@ const address = server.address();
 assert(address && typeof address === 'object');
 const batchUrl = `http://127.0.0.1:${address.port}/security-center/ingest/batch`;
 
-function runForwarder({ line, killAfterRequest = false }) {
+function runForwarder({ line, killAfterRequest = false, afterStart, extraEnv = {} }) {
   return new Promise((resolve, reject) => {
     const requestStart = requests.length;
     const child = spawn(process.execPath, ['scripts/observer-forward.js'], {
@@ -100,11 +129,12 @@ function runForwarder({ line, killAfterRequest = false }) {
         FORWARD_SPOOL_FSYNC: 'always',
         FORWARD_BATCH_SIZE: '1',
         FORWARD_BATCH_FLUSH_MS: '1',
-        FORWARD_RETRY_BASE_MS: '50',
-        FORWARD_RETRY_MAX_MS: '100',
+        FORWARD_RETRY_BASE_DELAY_MS: '50',
+        FORWARD_RETRY_MAX_DELAY_MS: '100',
         FORWARD_HTTP_TIMEOUT_MS: '1000',
         FORWARD_FILTER_MODE: 'shadow',
         FORWARD_NOISE_POLICY: 'include',
+        ...extraEnv,
       },
       stdio: ['pipe', 'ignore', 'pipe'],
     });
@@ -119,7 +149,7 @@ function runForwarder({ line, killAfterRequest = false }) {
     const timeout = setTimeout(() => {
       child.kill('SIGKILL');
       reject(new Error(`forwarder durability test timed out: ${stderr}`));
-    }, 12_000);
+    }, 20_000);
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk) => {
       stderr += chunk;
@@ -133,7 +163,14 @@ function runForwarder({ line, killAfterRequest = false }) {
       else reject(new Error(`forwarder exited with ${signal ?? code}: ${stderr}`));
     });
     if (line) child.stdin.write(`${line}\n`);
-    child.stdin.end();
+    if (afterStart) {
+      void Promise.resolve(afterStart({ child, requestStart }))
+        .then(() => child.stdin.end())
+        .catch((error) => {
+          child.kill('SIGKILL');
+          finish(error);
+        });
+    } else child.stdin.end();
   });
 }
 
@@ -187,10 +224,42 @@ try {
   assert(recovered.length >= 1, 'restart must replay the durable spool');
   assert.equal(recovered[0].events[0].sourceEventId, sourceEventId);
   assert.equal(recovered[0].batchId, beforeRestart[0].batchId);
+  assert.equal(beforeRestart[0].durableReplay, false);
+  assert.equal(recovered[0].durableReplay, true);
+
+  responseMode = 'unavailable';
+  let parkedSourceEventId = '';
+  const parkedStart = requests.length;
+  await runForwarder({
+    line: observerLine('same-process-spool-redrive'),
+    extraEnv: {
+      FORWARD_HTTP_TIMEOUT_MS: '100',
+      FORWARD_RETRY_MAX_AGE_MS: '200',
+      FORWARD_SPOOL_REPLAY_INTERVAL_MS: '100',
+      FORWARD_SPOOL_REPLAY_BATCH_SIZE: '1',
+    },
+    afterStart: async () => {
+      await eventually('online retry exhaustion', () => requests.length >= parkedStart + 2);
+      parkedSourceEventId = requests[parkedStart].events[0].sourceEventId;
+      await sleep(350);
+      assert(
+        liveSpoolIds().has(parkedSourceEventId),
+        'retry-exhausted evidence remains live in the durable spool',
+      );
+      responseMode = 'accept';
+      await eventually('same-process durable redrive', () => requests.some((request, index) =>
+        index >= parkedStart
+        && requestModes[index] === 'accept'
+        && request.events?.some((event) => event.sourceEventId === parkedSourceEventId)));
+      await eventually('durable acknowledgement clears parked record', () =>
+        !liveSpoolIds().has(parkedSourceEventId));
+    },
+  });
 
   console.log('PASS Forwarder retries the same stable batch after a transport failure');
   console.log('PASS Forwarder assigns distinct IDs to equal source text observed twice');
   console.log('PASS Forwarder replays an unacknowledged WAL record after process death');
+  console.log('PASS Forwarder continuously redrives retry-exhausted WAL records without restart');
   console.log('PASS Forwarder deletes records only after item-level durable acknowledgement');
 } finally {
   await new Promise((resolve) => server.close(resolve));

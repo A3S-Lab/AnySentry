@@ -6,6 +6,7 @@ const COLLECTOR_INDEX_KEY = 'anysentry:current:collectors';
 const COLLECTOR_KEY_PREFIX = 'anysentry:current:collector:';
 const SOURCE_INDEX_KEY = 'anysentry:current:sources';
 const SOURCE_KEY_PREFIX = 'anysentry:current:source:';
+const SOURCE_ACTIVITY_MAX_PENDING = 4_096;
 const RECORD_COLLECTOR_HEARTBEAT = `
 local current = redis.call('GET', KEYS[1])
 if current then
@@ -49,6 +50,12 @@ function ttlSeconds(): number {
   return Math.max(10 * 60, Math.min(7 * 24 * 60 * 60, Math.round(configured)));
 }
 
+function sourceActivityFlushMs(): number {
+  const configured = Number(process.env.ANYSENTRY_CURRENT_STATE_SOURCE_FLUSH_MS);
+  if (!Number.isFinite(configured)) return 1_000;
+  return Math.max(100, Math.min(60_000, Math.round(configured)));
+}
+
 function collectorKey(collectorId: string): string {
   return `${COLLECTOR_KEY_PREFIX}${encodeURIComponent(collectorId)}`;
 }
@@ -80,6 +87,28 @@ function sourceActivity(value: unknown): IngestionSourceCurrentActivity | undefi
   };
 }
 
+function mergeSourceActivity(
+  current: IngestionSourceCurrentActivity | undefined,
+  incoming: IngestionSourceCurrentActivity,
+): IngestionSourceCurrentActivity {
+  if (!current) return incoming;
+  const incomingIsLatest = incoming.lastSeenAt >= current.lastSeenAt;
+  const lastEventAt = Math.max(current.lastEventAt ?? 0, incoming.lastEventAt ?? 0) || undefined;
+  const lastHeartbeatAt = Math.max(current.lastHeartbeatAt ?? 0, incoming.lastHeartbeatAt ?? 0) || undefined;
+  return {
+    sourceId: incoming.sourceId,
+    lastSeenAt: Math.max(current.lastSeenAt, incoming.lastSeenAt),
+    lastEventAt,
+    lastHeartbeatAt,
+    collectorId: incomingIsLatest
+      ? incoming.collectorId ?? current.collectorId
+      : current.collectorId ?? incoming.collectorId,
+    workspacePath: incomingIsLatest
+      ? incoming.workspacePath ?? current.workspacePath
+      : current.workspacePath ?? incoming.workspacePath,
+  };
+}
+
 /**
  * Distributed, short-lived current state.
  *
@@ -92,6 +121,10 @@ export class DistributedCurrentStateService implements OnModuleInit, OnModuleDes
   private redis?: IORedis;
   private ready = false;
   private readonly ttl = ttlSeconds();
+  private readonly sourceFlushMs = sourceActivityFlushMs();
+  private readonly pendingSourceActivities = new Map<string, IngestionSourceCurrentActivity>();
+  private sourceActivityFlushTimer?: NodeJS.Timeout;
+  private sourceActivityFlushInFlight?: Promise<void>;
 
   async onModuleInit(): Promise<void> {
     const url = process.env.ANYSENTRY_REDIS_URL?.trim();
@@ -116,6 +149,9 @@ export class DistributedCurrentStateService implements OnModuleInit, OnModuleDes
   }
 
   async onModuleDestroy(): Promise<void> {
+    if (this.sourceActivityFlushTimer) clearTimeout(this.sourceActivityFlushTimer);
+    this.sourceActivityFlushTimer = undefined;
+    await this.flushSourceActivities();
     this.ready = false;
     if (this.redis) await this.redis.quit().catch(() => this.redis?.disconnect());
     this.redis = undefined;
@@ -169,10 +205,46 @@ export class DistributedCurrentStateService implements OnModuleInit, OnModuleDes
   }
 
   async recordSourceActivity(record: IngestionSourceCurrentActivity): Promise<void> {
+    if (!this.redis || !this.ready) return;
+    const normalized = sourceActivity(record);
+    if (!normalized) return;
+    if (
+      !this.pendingSourceActivities.has(normalized.sourceId) &&
+      this.pendingSourceActivities.size >= SOURCE_ACTIVITY_MAX_PENDING
+    ) {
+      const oldest = this.pendingSourceActivities.keys().next().value as string | undefined;
+      if (oldest) this.pendingSourceActivities.delete(oldest);
+    }
+    this.pendingSourceActivities.set(
+      normalized.sourceId,
+      mergeSourceActivity(this.pendingSourceActivities.get(normalized.sourceId), normalized),
+    );
+    this.scheduleSourceActivityFlush();
+  }
+
+  private scheduleSourceActivityFlush(): void {
+    if (this.sourceActivityFlushTimer || !this.ready) return;
+    this.sourceActivityFlushTimer = setTimeout(() => {
+      this.sourceActivityFlushTimer = undefined;
+      void this.flushSourceActivities();
+    }, this.sourceFlushMs);
+    this.sourceActivityFlushTimer.unref();
+  }
+
+  private flushSourceActivities(): Promise<void> {
+    const active = this.sourceActivityFlushInFlight;
+    if (active) {
+      return active.then(() => (
+        this.pendingSourceActivities.size > 0 ? this.flushSourceActivities() : undefined
+      ));
+    }
     const redis = this.redis;
-    if (!redis || !this.ready) return;
-    try {
-      await redis.eval(
+    if (!redis || !this.ready || this.pendingSourceActivities.size === 0) return Promise.resolve();
+    const batch = [...this.pendingSourceActivities.values()];
+    this.pendingSourceActivities.clear();
+    const pipeline = redis.pipeline();
+    for (const record of batch) {
+      pipeline.eval(
         RECORD_SOURCE_ACTIVITY,
         2,
         sourceKey(record.sourceId),
@@ -183,9 +255,17 @@ export class DistributedCurrentStateService implements OnModuleInit, OnModuleDes
         String(record.lastSeenAt),
         String(Date.now() - this.ttl * 1_000),
       );
-    } catch {
-      // Source configuration and durable activity history remain available while Redis recovers.
     }
+    let tracked!: Promise<void>;
+    tracked = pipeline.exec()
+      .then(() => undefined)
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.sourceActivityFlushInFlight === tracked) this.sourceActivityFlushInFlight = undefined;
+        if (this.pendingSourceActivities.size > 0) this.scheduleSourceActivityFlush();
+      });
+    this.sourceActivityFlushInFlight = tracked;
+    return tracked;
   }
 
   async latestSourceActivities(untilMs: number): Promise<IngestionSourceCurrentActivity[]> {

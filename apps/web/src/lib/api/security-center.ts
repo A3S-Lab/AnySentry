@@ -467,6 +467,14 @@ export type AgentHealthState = "active" | "idle" | "stale" | "risky";
 export type AgentLifecycleState = "current" | "historical" | "terminated";
 export type AgentCriticality = "low" | "medium" | "high" | "critical";
 export type CollectorHealthState = "healthy" | "quiet" | "degraded" | "stale" | "down";
+export type CollectorHealthChannelState = "healthy" | "warning" | "degraded" | "unknown";
+export interface CollectorHealthChannel {
+  state: CollectorHealthChannelState;
+  stateText: string;
+  reasons: string[];
+  consecutiveBad: number;
+  consecutiveClean: number;
+}
 export type CollectorReportedStatus = "ok" | "degraded" | "error";
 export type AlertStatus = "open" | "acknowledged" | "resolved" | "silenced";
 export type AlertKind = "incident" | "collector" | "agent" | "event" | "judgment" | "source" | "coverage" | "objective" | "remediation";
@@ -2349,6 +2357,7 @@ export interface CollectorFilterMetrics {
   }>;
   deduplicated: number;
   queueDropped: number;
+  queueParked?: number;
   protectedQueueDropped?: number;
   queueDroppedByClass?: Partial<Record<
     "tool_exec" | "process_exit" | "security" | "collector_heartbeat" | "capture_aggregate" | "agent" | "other",
@@ -2360,6 +2369,26 @@ export interface CollectorFilterMetrics {
   retryAttempts?: number;
   retryRecovered?: number;
   retryExhausted?: number;
+  retryParked?: number;
+  spoolReplayAttempts?: number;
+  spoolReplayAdmitted?: number;
+  spoolReplayDeferred?: number;
+  heartbeatDeliveryFailures?: number;
+  controlPlaneState?: "starting" | "healthy" | "degraded";
+  controlPlaneFailedLanes?: Array<"identity" | "filter_rules" | "infrastructure_policy" | "runtime_snapshot">;
+  controlPlaneStartingLanes?: Array<"identity" | "filter_rules" | "infrastructure_policy" | "runtime_snapshot">;
+  controlPlaneLanes?: Partial<Record<
+    "identity" | "filter_rules" | "infrastructure_policy" | "runtime_snapshot",
+    { lastSuccessAt?: string; lastFailureAt?: string; lastFailure?: string }
+  >>;
+  spoolRecords?: number;
+  spoolActiveRecords?: number;
+  spoolParkedRecords?: number;
+  spoolBytes?: number;
+  spoolWalBytes?: number;
+  spoolOldestAgeMs?: number;
+  spoolAtCapacity?: boolean;
+  spoolFsyncMode?: "always" | "periodic";
   queueBytes?: number;
   inflightEvents?: number;
   inflightBytes?: number;
@@ -2461,6 +2490,11 @@ export interface CollectorHealthItem {
   mode?: string;
   state: CollectorHealthState;
   stateText: string;
+  healthChannels: {
+    capture: CollectorHealthChannel;
+    delivery: CollectorHealthChannel;
+    control: CollectorHealthChannel;
+  };
   firstSeen?: string;
   lastEventAt?: string;
   lastHeartbeatAt?: string;
@@ -2494,6 +2528,7 @@ export interface CollectorHealthSummary {
   totalCollectors: number;
   healthyCollectors: number;
   quietCollectors: number;
+  warningCollectors: number;
   degradedCollectors: number;
   staleCollectors: number;
   downCollectors: number;

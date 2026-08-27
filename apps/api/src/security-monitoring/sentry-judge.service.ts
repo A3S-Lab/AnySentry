@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { Sentry, dns, egress, fileAccess, securityAction, sslContent, toolExec } from '@a3s-lab/sentry';
 import { AgentAttributionService } from './agent-attribution.service';
 import { AlertingService, type DurableAlertMutation } from './alerting.service';
-import { ClickHouseStore, DashboardWindowHistory, IncidentState, StoredAgentBucketFact, StoredAgentMetricBucketFact, StoredAgentObservabilityFact, StoredAgentWindowFact, StoredEventQuery, StoredEventSearchResult, StoredToolEvidenceRelations, ToolEvidenceRelationScope, StoredTopologyBucketFact, StoredTopologyWindowFact, StoredWorkspaceBucketFact, StoredWorkspaceWindowFact, eventRevisionIdentity } from './clickhouse-store';
+import { ClickHouseStore, DashboardWindowHistory, DurableReplayEventStatus, IncidentState, StoredAgentBucketFact, StoredAgentMetricBucketFact, StoredAgentObservabilityFact, StoredAgentWindowFact, StoredEventQuery, StoredEventSearchResult, StoredToolEvidenceRelations, ToolEvidenceRelationScope, StoredTopologyBucketFact, StoredTopologyWindowFact, StoredWorkspaceBucketFact, StoredWorkspaceWindowFact, eventRevisionIdentity } from './clickhouse-store';
 import type { ToolEvidenceItem } from './tool-evidence-linker';
 import { DEFAULT_POLICY, PolicyConfig, buildFastAcl, policyConfigError, sanitizePolicy, tierStatus } from './policy-config';
 import { cleanText } from './redaction';
@@ -735,6 +735,36 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return this.ch.eventById(eventId, eventAt);
   }
 
+  async classifyDurableReplayEvents(
+    events: readonly JudgedEvent[],
+  ): Promise<DurableReplayEventStatus[] | null> {
+    const statuses = new Array<DurableReplayEventStatus>(events.length);
+    const missing: JudgedEvent[] = [];
+    const missingIndexes: number[] = [];
+    for (let index = 0; index < events.length; index += 1) {
+      const incoming = events[index];
+      const existing = this.findEvent(incoming.eventId);
+      if (!existing) {
+        missing.push(incoming);
+        missingIndexes.push(index);
+        continue;
+      }
+      const incomingIdentity = eventRevisionIdentity(incoming);
+      const existingIdentity = eventRevisionIdentity(existing);
+      statuses[index] = incomingIdentity.logicalKey === existingIdentity.logicalKey
+        && incomingIdentity.fingerprint === existingIdentity.fingerprint
+        ? 'duplicate'
+        : 'conflict';
+    }
+    if (missing.length === 0) return statuses;
+    const durable = await this.ch.classifyDurableReplayEvents(missing);
+    if (!durable) return null;
+    for (let index = 0; index < durable.length; index += 1) {
+      statuses[missingIndexes[index]] = durable[index];
+    }
+    return statuses;
+  }
+
   async readStoredToolEvidenceRelations(
     invocationId: string,
     toolCallId?: string,
@@ -1237,6 +1267,24 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private fullRouteNeedsAsyncJudgment(
+    line: string,
+    routing: NonNullable<JudgedEvent['judgment']>,
+  ): boolean {
+    if (routing.profile !== 'full' || routing.maxTier === 'L1') return false;
+    const evaluateL1 = (this.sentry as Sentry & {
+      evaluateL1?: (event: string) => { nextTierEligible?: boolean } | null;
+    }).evaluateL1;
+    if (typeof evaluateL1 !== 'function') return true;
+    try {
+      return evaluateL1.call(this.sentry, line)?.nextTierEligible === true;
+    } catch {
+      // A local rules failure must fail over to the existing durable asynchronous path. It must
+      // never turn a potentially risky full-route event into a terminal allow decision.
+      return true;
+    }
+  }
+
   prepareAcceptWithDisposition(line: string, meta: EventMeta, at = Date.now()): PreparedJudgeAcceptOutcome {
     const base = this.eventBase(line, meta, at);
     if (!SECURITY_JUDGED_KINDS.has(base.eventKind) && !OBSERVER_KINDS.has(base.eventKind) && base.source !== 'api') {
@@ -1261,6 +1309,16 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     }
     const routing = this.routingForBase(base, protectedRoute);
     if (routing.profile === 'discard') return { disposition: 'discarded', reasonCode: routing.reason };
+    // `l1_only` is a terminal routing decision, not a request to spend a BullMQ round trip on the
+    // local deterministic rules engine. High-rate Unknown telemetry must remain retained and
+    // classified without multiplying every event into queue/AOF writes. Full Agent and protected
+    // security routes continue through the asynchronous L2/L3 pipeline below.
+    if (routing.profile === 'l1_only') {
+      const event = this.prepareSynchronousJudgment(line, meta, at, base);
+      return event
+        ? { disposition: 'retained', event, notify: true }
+        : { disposition: 'rejected', reasonCode: 'unsupported_or_unparseable' };
+    }
     if (!this.queues.enabled) {
       const event = this.prepareSynchronousJudgment(line, meta, at, base);
       return event
@@ -1307,6 +1365,12 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         }),
         notify: true,
       };
+    }
+    if (!this.fullRouteNeedsAsyncJudgment(line, routing)) {
+      const event = this.prepareSynchronousJudgment(line, meta, at, base);
+      return event
+        ? { disposition: 'retained', event, notify: true }
+        : { disposition: 'rejected', reasonCode: 'unsupported_or_unparseable' };
     }
 
     const policyVersion = this.policyVersion();
@@ -2114,6 +2178,27 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       clamp(rawQueueDroppedByClass[key]),
     ])) as NonNullable<import('./types').CollectorFilterMetrics['queueDroppedByClass']>;
     const captureProfileFilterMetrics: Partial<import('./types').CollectorFilterMetrics> = {};
+    const controlPlaneLaneNames = [
+      'identity', 'filter_rules', 'infrastructure_policy', 'runtime_snapshot',
+    ] as const;
+    const controlPlaneFailedLanes = controlPlaneLaneNames.filter((lane) =>
+      Array.isArray(rawFilter.controlPlaneFailedLanes) && rawFilter.controlPlaneFailedLanes.includes(lane));
+    const controlPlaneStartingLanes = controlPlaneLaneNames.filter((lane) =>
+      Array.isArray(rawFilter.controlPlaneStartingLanes) && rawFilter.controlPlaneStartingLanes.includes(lane));
+    const rawControlPlaneLanes = rawFilter.controlPlaneLanes && typeof rawFilter.controlPlaneLanes === 'object'
+      ? rawFilter.controlPlaneLanes
+      : {};
+    const controlPlaneLanes = Object.fromEntries(controlPlaneLaneNames.flatMap((lane) => {
+      const raw = rawControlPlaneLanes[lane];
+      if (!raw || typeof raw !== 'object') return [];
+      const success = cleanText(raw.lastSuccessAt, 80);
+      const failure = cleanText(raw.lastFailureAt, 80);
+      return [[lane, {
+        ...(success && Number.isFinite(Date.parse(success)) ? { lastSuccessAt: success } : {}),
+        ...(failure && Number.isFinite(Date.parse(failure)) ? { lastFailureAt: failure } : {}),
+        ...(cleanText(raw.lastFailure, 500) ? { lastFailure: cleanText(raw.lastFailure, 500) } : {}),
+      }]];
+    })) as NonNullable<import('./types').CollectorFilterMetrics['controlPlaneLanes']>;
     const captureCounter = (value: unknown): number | undefined =>
       typeof value === 'number' && Number.isFinite(value)
         ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.round(value)))
@@ -2272,6 +2357,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         : undefined,
       deduplicated: clamp(rawFilter.deduplicated),
       queueDropped: clamp(rawFilter.queueDropped),
+      queueParked: clamp(rawFilter.queueParked),
       protectedQueueDropped: clamp(rawFilter.protectedQueueDropped),
       queueDroppedByClass,
       batches: clamp(rawFilter.batches),
@@ -2280,6 +2366,25 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       retryAttempts: clamp(rawFilter.retryAttempts),
       retryRecovered: clamp(rawFilter.retryRecovered),
       retryExhausted: clamp(rawFilter.retryExhausted),
+      retryParked: clamp(rawFilter.retryParked),
+      spoolReplayAttempts: clamp(rawFilter.spoolReplayAttempts),
+      spoolReplayAdmitted: clamp(rawFilter.spoolReplayAdmitted),
+      spoolReplayDeferred: clamp(rawFilter.spoolReplayDeferred),
+      heartbeatDeliveryFailures: clamp(rawFilter.heartbeatDeliveryFailures),
+      controlPlaneState: ['starting', 'healthy', 'degraded'].includes(rawFilter.controlPlaneState ?? '')
+        ? rawFilter.controlPlaneState as import('./types').CollectorFilterMetrics['controlPlaneState']
+        : undefined,
+      controlPlaneFailedLanes,
+      controlPlaneStartingLanes,
+      controlPlaneLanes,
+      spoolRecords: clamp(rawFilter.spoolRecords),
+      spoolActiveRecords: clamp(rawFilter.spoolActiveRecords),
+      spoolParkedRecords: clamp(rawFilter.spoolParkedRecords),
+      spoolBytes: clamp(rawFilter.spoolBytes),
+      spoolWalBytes: clamp(rawFilter.spoolWalBytes),
+      spoolOldestAgeMs: clamp(rawFilter.spoolOldestAgeMs),
+      spoolAtCapacity: rawFilter.spoolAtCapacity === true,
+      spoolFsyncMode: rawFilter.spoolFsyncMode === 'always' ? 'always' : 'periodic',
       queueBytes: clamp(rawFilter.queueBytes),
       inflightEvents: clamp(rawFilter.inflightEvents),
       inflightBytes: clamp(rawFilter.inflightBytes),
