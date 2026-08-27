@@ -63,7 +63,7 @@ spec:
             # F0 reduces steady-state bulk traffic before Ring reservation; this bounded lane
             # absorbs startup/profile convergence and short host-disk stalls without borrowing
             # Critical or Semantic capacity. The Collector hard-caps the value at 262144.
-            - { name: A3S_OBSERVER_JSON_BULK_QUEUE_CAPACITY, value: "65536" }
+            - { name: A3S_OBSERVER_JSON_BULK_QUEUE_CAPACITY, value: "131072" }
             - { name: A3S_OBSERVER_BULK_INBOX_CAPACITY, value: "65536" }
             # Full signal set: file writes/deletes (FileAccess/FileDelete) + OpenSSL plaintext
             # (SslContent → prompt-injection / secret-exfil rules + LlmApi model/token usage).
