@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { Sentry, dns, egress, fileAccess, securityAction, sslContent, toolExec } from '@a3s-lab/sentry';
 import { AgentAttributionService } from './agent-attribution.service';
 import { AlertingService, type DurableAlertMutation } from './alerting.service';
-import { ClickHouseStore, DashboardWindowHistory, IncidentState, StoredAgentBucketFact, StoredAgentMetricBucketFact, StoredAgentObservabilityFact, StoredAgentWindowFact, StoredEventQuery, StoredEventSearchResult, StoredToolEvidenceRelations, ToolEvidenceRelationScope, StoredTopologyBucketFact, StoredTopologyWindowFact, StoredWorkspaceBucketFact, StoredWorkspaceWindowFact, eventRevisionIdentity } from './clickhouse-store';
+import { ClickHouseStore, DashboardWindowHistory, DurableReplayEventStatus, IncidentState, StoredAgentBucketFact, StoredAgentMetricBucketFact, StoredAgentObservabilityFact, StoredAgentWindowFact, StoredEventQuery, StoredEventSearchResult, StoredToolEvidenceRelations, ToolEvidenceRelationScope, StoredTopologyBucketFact, StoredTopologyWindowFact, StoredWorkspaceBucketFact, StoredWorkspaceWindowFact, eventRevisionIdentity } from './clickhouse-store';
 import type { ToolEvidenceItem } from './tool-evidence-linker';
 import { DEFAULT_POLICY, PolicyConfig, buildFastAcl, policyConfigError, sanitizePolicy, tierStatus } from './policy-config';
 import { cleanText } from './redaction';
@@ -733,6 +733,36 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
 
   async storedEventById(eventId: string, eventAt?: number): Promise<JudgedEvent | undefined> {
     return this.ch.eventById(eventId, eventAt);
+  }
+
+  async classifyDurableReplayEvents(
+    events: readonly JudgedEvent[],
+  ): Promise<DurableReplayEventStatus[] | null> {
+    const statuses = new Array<DurableReplayEventStatus>(events.length);
+    const missing: JudgedEvent[] = [];
+    const missingIndexes: number[] = [];
+    for (let index = 0; index < events.length; index += 1) {
+      const incoming = events[index];
+      const existing = this.findEvent(incoming.eventId);
+      if (!existing) {
+        missing.push(incoming);
+        missingIndexes.push(index);
+        continue;
+      }
+      const incomingIdentity = eventRevisionIdentity(incoming);
+      const existingIdentity = eventRevisionIdentity(existing);
+      statuses[index] = incomingIdentity.logicalKey === existingIdentity.logicalKey
+        && incomingIdentity.fingerprint === existingIdentity.fingerprint
+        ? 'duplicate'
+        : 'conflict';
+    }
+    if (missing.length === 0) return statuses;
+    const durable = await this.ch.classifyDurableReplayEvents(missing);
+    if (!durable) return null;
+    for (let index = 0; index < durable.length; index += 1) {
+      statuses[missingIndexes[index]] = durable[index];
+    }
+    return statuses;
   }
 
   async readStoredToolEvidenceRelations(

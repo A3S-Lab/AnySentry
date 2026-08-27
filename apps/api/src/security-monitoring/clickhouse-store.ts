@@ -54,6 +54,8 @@ function delay(ms: number): Promise<void> {
 }
 
 const TABLE = 'events';
+const OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE = 'anysentry.observer.source_payload_sha256';
+const SHA256_HEX = /^[a-f0-9]{64}$/u;
 // `at` is raw epoch-ms (matches the aggregator); `ts` is a derived DateTime only for TTL/partitioning.
 const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   schemaVersion LowCardinality(String),
@@ -1103,6 +1105,8 @@ export interface EventCommitCursor {
   decisionRevision: number;
 }
 
+export type DurableReplayEventStatus = 'new' | 'duplicate' | 'conflict';
+
 export interface EventCommitChange {
   cursor: EventCommitCursor;
   eventAtMs: number;
@@ -1395,9 +1399,12 @@ export function eventRevisionIdentity(e: JudgedEvent): {
   delete canonicalAttributes.writerVersion;
   delete canonicalAttributes.idempotencyProtocolVersion;
   canonicalPayload.attributes = canonicalAttributes;
+  const sourcePayloadDigest = attrString(e.attributes, OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE);
   return {
     logicalKey,
-    fingerprint: createHash('sha256').update(canonicalJson(canonicalPayload)).digest('hex'),
+    fingerprint: SHA256_HEX.test(sourcePayloadDigest)
+      ? sourcePayloadDigest
+      : createHash('sha256').update(canonicalJson(canonicalPayload)).digest('hex'),
   };
 }
 
@@ -2408,6 +2415,36 @@ export class ClickHouseStore {
   }
 
   /**
+   * Resolve authenticated Forwarder WAL replay at event granularity. A restart may regroup WAL
+   * records into a new HTTP batch, so the batch cache alone cannot prove an already-durable event.
+   */
+  async classifyDurableReplayEvents(
+    events: readonly JudgedEvent[],
+  ): Promise<DurableReplayEventStatus[] | null> {
+    if (!this.client || !this.ready || this.closing || this.eventWritePermanentError) return null;
+    const existingEvents = await this.eventsByIds(events.map((event) => event.eventId));
+    const existingById = new Map(existingEvents.map((event) => [event.eventId, event]));
+    return events.map((event) => {
+      const existing = existingById.get(event.eventId);
+      if (!existing) return 'new';
+      if (
+        Math.max(1, Math.trunc(existing.decisionRevision ?? 1))
+        !== Math.max(1, Math.trunc(event.decisionRevision ?? 1))
+      ) return 'conflict';
+      const incomingRow = toRow(event);
+      const existingRow = toRow(existing);
+      const incomingSourceDigest = this.eventRevisionSourcePayloadDigest(incomingRow);
+      const existingSourceDigest = this.eventRevisionSourcePayloadDigest(existingRow);
+      if (incomingSourceDigest && existingSourceDigest) {
+        return incomingSourceDigest === existingSourceDigest ? 'duplicate' : 'conflict';
+      }
+      return this.eventRevisionDigest(incomingRow, false) === this.eventRevisionDigest(existingRow, false)
+        ? 'duplicate'
+        : 'conflict';
+    });
+  }
+
+  /**
    * Persist one bounded set of event revisions as one ClickHouse block.
    *
    * `idempotencyKey` identifies the immutable upstream batch. Retrying the same key and payload
@@ -2670,7 +2707,19 @@ export class ClickHouseStore {
     return `${row.eventId}\0${Math.max(1, Math.trunc(Number(row.decisionRevision) || 1))}`;
   }
 
-  private eventRevisionDigest(row: Row): string {
+  private eventRevisionSourcePayloadDigest(row: Row): string {
+    try {
+      const attributes = JSON.parse(String(row.attributes ?? '{}')) as Record<string, unknown>;
+      const digest = String(attributes?.[OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE] ?? '').trim();
+      return SHA256_HEX.test(digest) ? digest : '';
+    } catch {
+      return '';
+    }
+  }
+
+  private eventRevisionDigest(row: Row, preferSourcePayload = true): string {
+    const sourcePayloadDigest = this.eventRevisionSourcePayloadDigest(row);
+    if (preferSourcePayload && sourcePayloadDigest) return `observer-source:${sourcePayloadDigest}`;
     // Receipt timestamps and generated span ids may legitimately change when an old observer client
     // retries a sourceEventId. They do not change the semantic revision. Every decision/evidence
     // field remains covered so a real revision conflict is still rejected.
@@ -2682,6 +2731,7 @@ export class ClickHouseStore {
       payloadFingerprintVersion: _payloadFingerprintVersion,
       payloadFingerprint: _payloadFingerprint,
       at: _at,
+      receivedAt: _receivedAt,
       decisionUpdatedAt: _decisionUpdatedAt,
       spanId: _spanId,
       invocationId: _invocationId,
@@ -2704,6 +2754,16 @@ export class ClickHouseStore {
       attribution,
       ...semanticRevision
     } = row;
+    const attributes = String(semanticRevision.attributes ?? '');
+    try {
+      const parsed = JSON.parse(attributes) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        delete parsed[OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE];
+        semanticRevision.attributes = JSON.stringify(parsed);
+      }
+    } catch {
+      // Preserve malformed legacy payloads byte-for-byte in the digest.
+    }
     const process = String(semanticRevision.process ?? '');
     try {
       const parsed = JSON.parse(process) as Record<string, unknown>;

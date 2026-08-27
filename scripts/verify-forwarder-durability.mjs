@@ -224,6 +224,8 @@ try {
   assert(recovered.length >= 1, 'restart must replay the durable spool');
   assert.equal(recovered[0].events[0].sourceEventId, sourceEventId);
   assert.equal(recovered[0].batchId, beforeRestart[0].batchId);
+  assert.equal(beforeRestart[0].durableReplay, false);
+  assert.equal(recovered[0].durableReplay, true);
 
   responseMode = 'unavailable';
   let parkedSourceEventId = '';

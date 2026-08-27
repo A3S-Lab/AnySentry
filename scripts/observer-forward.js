@@ -935,6 +935,7 @@ function eventBatchEnvelope(batch) {
     schemaVersion: 'anysentry.observer_batch.v2',
     batchId,
     payloadDigest,
+    durableReplay: batch.some((item) => item.recovered === true),
     writerId: WRITER_ID,
     writerVersion: WRITER_VERSION,
     idempotencyProtocolVersion: IDEMPOTENCY_PROTOCOL_VERSION,
@@ -2758,6 +2759,7 @@ function enqueue(body, priority, countForwarded = true, kind = '', recovered = f
     retryStartedAt: 0,
     retryDeadlineAt: 0,
     inflightSince: 0,
+    recovered,
     settled: false,
   };
   const result = pending.push(item, priority);

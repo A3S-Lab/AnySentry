@@ -1486,7 +1486,7 @@ async function verifyObserverBatch(sourceId, token) {
     source: 'kubernetes',
     evidence: ['label:anysentry.io/workload-kind=agent'],
   };
-  const events = Array.from({ length: 24 }, (_, index) => 1711 + index).map((pid) => ({
+  const events = Array.from({ length: 24 }, (_, index) => 1711 + index).map((pid, index) => ({
     line: observerLine(
       { agent: 'pod-batch', session: 'container-batch', task: String(pid) },
       {
@@ -1503,6 +1503,7 @@ async function verifyObserverBatch(sourceId, token) {
     collectorId: `${runId}-collector`,
     nodeName: `${runId}-node`,
     sourceType: 'observer',
+    sourceEventId: `${runId}-observer-batch-event-${index}`,
     attribution,
   }));
   assert(
@@ -1529,6 +1530,25 @@ async function verifyObserverBatch(sourceId, token) {
   );
   const eventId = result.items?.[0]?.eventId;
   if (!eventId) return;
+  const replayEvents = events.slice(0, 6);
+  const replayPayloadDigest = createHash('sha256').update(JSON.stringify(replayEvents)).digest('hex');
+  const replay = await request('/ingest/batch', 'POST', {
+    batchId: `${runId}-observer-regrouped-replay`,
+    payloadDigest: replayPayloadDigest,
+    durableReplay: true,
+    events: replayEvents,
+  }, sourceHeaders(sourceId, token));
+  assert(
+    'regrouped durable WAL replay acknowledges already-committed source events item by item',
+    replay.accepted === true &&
+      replay.acceptedEvents === replayEvents.length &&
+      replay.retainedEvents === replayEvents.length &&
+      replay.rejectedEvents === 0 &&
+      replay.retryableEvents === 0 &&
+      replay.items?.every((item) =>
+        item.accepted === true && item.reasonCode === 'durable_replay_duplicate'),
+    replay,
+  );
   await assertEvent('observer batch preserves workload-first attribution evidence', eventId, (event) =>
     event.attribution?.classification === 'confirmed_agent' &&
     event.attribution?.agentScopeId === `${runId}-batch-agent` &&
