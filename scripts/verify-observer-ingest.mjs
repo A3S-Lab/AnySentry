@@ -852,7 +852,7 @@ async function verifyJudgeDispositionContract() {
       { observeEvent: () => undefined, observeIncident: () => undefined },
       { attribute: () => undefined },
       { enabled, enqueueFast: async () => { enqueued += 1; } },
-      { get: () => undefined },
+      { get: () => undefined, isCallable: (profile) => profile === 'fast_review' },
     );
     judge.applyPolicy(DEFAULT_POLICY);
     const meta = {
@@ -926,7 +926,7 @@ async function verifyJudgeDispositionContract() {
           enqueued === 0,
         { platform, enqueued },
       );
-      const full = await judge.acceptWithDisposition('{}', {
+      const fullTerminal = await judge.acceptWithDisposition('{}', {
         ...meta,
         attribution: {
           ...meta.attribution,
@@ -937,12 +937,46 @@ async function verifyJudgeDispositionContract() {
         },
       });
       assert(
-        'confirmed Agent full routing still enters the asynchronous judgment queue',
-        full.disposition === 'retained' &&
-          full.event?.decisionStatus === 'pending' &&
-          full.event?.judgment?.profile === 'full' &&
+        'confirmed Agent full routing terminates locally when L1 has no escalation',
+        fullTerminal.disposition === 'retained' &&
+          fullTerminal.event?.decisionStatus === 'succeeded' &&
+          fullTerminal.event?.judgment?.profile === 'full' &&
+          enqueued === 0,
+        { fullTerminal, enqueued },
+      );
+      judge.applyPolicy({
+        ...DEFAULT_POLICY,
+        rules: [{
+          name: 'queued escalation contract',
+          on: 'ToolExec',
+          match: 'queue-escalation-contract',
+          verdict: 'escalate',
+          severity: 'high',
+          reason: 'queued escalation contract',
+        }],
+        llm: { url: 'http://127.0.0.1:9/v1', model: 'contract-model', timeoutS: 1 },
+      });
+      const fullEscalation = await judge.acceptWithDisposition(observerLine(
+        { agent: `${runId}-judge-agent`, session: `${runId}-judge-session`, task: 'queue-escalation' },
+        { ToolExec: { pid: 41_001, uid: 1000, cwd: `/workspace/${runId}/judge`, argv: ['queue-escalation-contract'] } },
+        { pid: 41_001, ppid: 1, comm: 'queue-escalation-contract', exe: '/usr/bin/queue-escalation-contract' },
+      ), {
+        ...meta,
+        attribution: {
+          ...meta.attribution,
+          monitored: true,
+          classification: 'confirmed_agent',
+          reason: 'authoritative_anchor',
+          confidence: 1,
+        },
+      });
+      assert(
+        'confirmed Agent full routing queues only an unresolved L1 escalation',
+        fullEscalation.disposition === 'retained' &&
+          fullEscalation.event?.decisionStatus === 'pending' &&
+          fullEscalation.event?.judgment?.profile === 'full' &&
           enqueued === 1,
-        { full, enqueued },
+        { fullEscalation, enqueued },
       );
     }
   }

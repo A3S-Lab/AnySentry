@@ -1237,6 +1237,24 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private fullRouteNeedsAsyncJudgment(
+    line: string,
+    routing: NonNullable<JudgedEvent['judgment']>,
+  ): boolean {
+    if (routing.profile !== 'full' || routing.maxTier === 'L1') return false;
+    const evaluateL1 = (this.sentry as Sentry & {
+      evaluateL1?: (event: string) => { nextTierEligible?: boolean } | null;
+    }).evaluateL1;
+    if (typeof evaluateL1 !== 'function') return true;
+    try {
+      return evaluateL1.call(this.sentry, line)?.nextTierEligible === true;
+    } catch {
+      // A local rules failure must fail over to the existing durable asynchronous path. It must
+      // never turn a potentially risky full-route event into a terminal allow decision.
+      return true;
+    }
+  }
+
   prepareAcceptWithDisposition(line: string, meta: EventMeta, at = Date.now()): PreparedJudgeAcceptOutcome {
     const base = this.eventBase(line, meta, at);
     if (!SECURITY_JUDGED_KINDS.has(base.eventKind) && !OBSERVER_KINDS.has(base.eventKind) && base.source !== 'api') {
@@ -1317,6 +1335,12 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         }),
         notify: true,
       };
+    }
+    if (!this.fullRouteNeedsAsyncJudgment(line, routing)) {
+      const event = this.prepareSynchronousJudgment(line, meta, at, base);
+      return event
+        ? { disposition: 'retained', event, notify: true }
+        : { disposition: 'rejected', reasonCode: 'unsupported_or_unparseable' };
     }
 
     const policyVersion = this.policyVersion();
