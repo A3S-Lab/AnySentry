@@ -11,6 +11,12 @@ const {
 function service() {
   return new IngestionSourceService(
     {
+      enabled: false,
+      init: async () => false,
+      loadIngestionSources: async () => [],
+      saveIngestionSources: async () => false,
+    },
+    {
       recordSourceActivity: async () => undefined,
       latestSourceActivities: async () => [],
     },

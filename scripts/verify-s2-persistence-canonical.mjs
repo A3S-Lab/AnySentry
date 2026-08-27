@@ -450,6 +450,14 @@ await shadowStore.insertNow(event({ attribution: { ...event().attribution, corre
 const token = (item) => item.inserts[0].clickhouse_settings.insert_deduplication_token;
 const offPersisted = structuredClone(offFake.state.inserts[0].values[0]);
 delete offPersisted.ingestedAt;
+// Commit coordination and query-acceleration projections are storage metadata. They were added
+// after the original event revision contract and must not change the retry identity of an
+// otherwise identical legacy event.
+delete offPersisted.commitBatchId;
+delete offPersisted.logicalKeyVersion;
+delete offPersisted.eventLogicalKey;
+delete offPersisted.payloadFingerprintVersion;
+delete offPersisted.payloadFingerprint;
 delete offPersisted.invocationId;
 delete offPersisted.toolCallId;
 delete offPersisted.processInstanceKey;
