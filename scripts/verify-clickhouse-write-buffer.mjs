@@ -1125,6 +1125,15 @@ await withoutExpectedErrorLogs(async () => {
   const judge = Object.create(SentryJudgeService.prototype);
   Object.assign(judge, {
     policy: {},
+    sentry: {
+      evaluateL1() {
+        return {
+          l1Decision: { verdict: 'escalate' },
+          nextTierEligible: true,
+          stopReason: 'unresolved_l1_escalation',
+        };
+      },
+    },
     queues: {
       enabled: true,
       async enqueueFast() { throw queueError; },
@@ -1154,7 +1163,7 @@ await withoutExpectedErrorLogs(async () => {
         attribution: { classification: 'confirmed_agent' },
       };
     },
-    availableTiers() { return { l1: true, l2: false, l3: false }; },
+    availableTiers() { return { l1: true, l2: true, l3: false }; },
     policyVersion() { return 'fixture-policy'; },
     isInternalL3Invocation() { return false; },
     upsertMemory(record) { memoryStates.push(record); },
