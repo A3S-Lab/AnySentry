@@ -1,7 +1,12 @@
 **/node_modules
 **/dist
+**/target
 .git
 *.log
 .DS_Store
 .env
 .env.local
+.local
+.agents
+artifacts
+examples/agent-runtime-lab/config/models.deepseek.json

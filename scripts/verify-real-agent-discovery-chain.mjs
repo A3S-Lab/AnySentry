@@ -297,10 +297,9 @@ async function startCollector(snapshotPort, nodeName) {
       '-e',
       'ANYSENTRY_SOURCE_NAME=real-agent-filter-chain',
       '--entrypoint',
-      '/bin/sh',
+      '/usr/local/bin/node',
       image,
-      '-c',
-      'a3s-observer-collector | node /opt/observer-forward.js',
+      '/opt/observer-supervisor.js',
     ],
     { timeoutMs: 120_000 },
   );

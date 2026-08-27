@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: a3s-observer
+  namespace: anysentry
+spec:
+  template:
+    metadata:
+      annotations:
+        anysentry.io/manual-observer-profile: "agent-prefilter-files-full-v1"
+    spec:
+      containers:
+        - name: a3s-observer
+          env:
+            # Keep the combined legacy switch off so Access and Delete remain independently
+            # observable even though this final capacity profile enables both.
+            - { name: A3S_OBSERVER_FILES, value: "0" }
+            - { name: A3S_OBSERVER_FILE_ACCESS, value: "1" }
+            - { name: A3S_OBSERVER_FILE_DELETE, value: "1" }
+            - { name: A3S_OBSERVER_FILE_UNKNOWN_POLICY, value: "keep" }
+            - { name: FORWARD_FILTER_MODE, value: "enforce" }
+            - { name: ANYSENTRY_UNKNOWN_RETENTION_MODE, value: "enforce" }
+            - { name: ANYSENTRY_CAPTURE_PROFILE_MODE, value: "enforce" }
+            - { name: FORWARD_RETAIN_UNKNOWN, value: "true" }
+            - { name: FORWARD_RETAIN_NON_AGENT, value: "false" }
+            - { name: FORWARD_FILE_AGGREGATION, value: "true" }
+            - { name: FORWARD_BATCH_SIZE, value: "64" }
+            - { name: FORWARD_BATCH_FLUSH_MS, value: "50" }
+            # A uprobe binds to one exact inode. Mount the host OpenSSL library used by the
+            # single-node test workload instead of attaching to an unused image-private copy.
+            - { name: A3S_OBSERVER_HOST_LIBSSL, value: "/usr/lib/x86_64-linux-gnu/libssl.so.3" }
+            - { name: A3S_OBSERVER_SSL, value: "/opt/host-libs/libssl.so.3" }
+          volumeMounts:
+            - { name: host-libssl, mountPath: /opt/host-libs/libssl.so.3, readOnly: true }
+      volumes:
+        - name: host-libssl
+          hostPath: { path: /usr/lib/x86_64-linux-gnu/libssl.so.3, type: File }

@@ -13,6 +13,10 @@ const managementRoutes = [
   '/events?eventId=dashboard-smoke-missing',
   '/events?runId=dashboard-smoke-run',
   '/events?eventKind=ToolExec',
+  '/assets',
+  '/assets/asset_service_dashboard-smoke',
+  '/capture-rules',
+  '/filter-rules',
   '/agents?agentId=dashboard-smoke-agent&workspacePath=repo://dashboard-smoke',
   '/agents?timeType=last_1d&agentId=dashboard-smoke-agent&workspacePath=repo://dashboard-smoke&focus=review&eventId=dashboard-smoke-event',
   '/agents?userId=dashboard-smoke-user',
@@ -108,6 +112,29 @@ function countOccurrences(haystack, needle) {
   return haystack.split(needle).length - 1;
 }
 
+function runtimeAsyncAssets(sources) {
+  const assets = new Set();
+  for (const source of sources) {
+    let cursor = 0;
+    while (cursor < source.length) {
+      const marker = source.indexOf('static/js/async/', cursor);
+      if (marker < 0) break;
+      const mapStart = source.indexOf('{', marker);
+      const mapEnd = mapStart < 0 ? -1 : source.indexOf('})[e]', mapStart);
+      if (mapStart < 0 || mapEnd < 0) {
+        cursor = marker + 1;
+        continue;
+      }
+      const chunkMap = source.slice(mapStart + 1, mapEnd);
+      for (const match of chunkMap.matchAll(/"?(\d+)"?\s*:\s*"([a-f0-9]+)"/gu)) {
+        assets.add(`static/js/async/${match[1]}.${match[2]}.js`);
+      }
+      cursor = mapEnd + 1;
+    }
+  }
+  return [...assets];
+}
+
 function urlFor(path) {
   const base = new URL(webBase);
   const prefix = base.pathname.replace(/\/$/, '');
@@ -165,7 +192,8 @@ async function verifyIndexAndAssets() {
       asyncJsAssets = [];
     }
   }
-  assert('dashboard build manifest exposes code-split route assets', asyncJsAssets.length >= 1, {
+  asyncJsAssets = [...new Set([...asyncJsAssets, ...runtimeAsyncAssets(jsText)])];
+  assert('dashboard runtime exposes code-split route assets', asyncJsAssets.length >= 1, {
     status: manifestResponse.res.status,
     asyncJsAssets: asyncJsAssets.length,
   });
@@ -275,6 +303,7 @@ async function verifyIndexAndAssets() {
 async function verifyDashboardSourceContracts() {
   const agentEventsPage = await readFile('apps/web/src/pages/AgentEventsPage.tsx', 'utf8');
   const agentsPage = await readFile('apps/web/src/pages/AgentsPage.tsx', 'utf8');
+  const assetsPage = await readFile('apps/web/src/pages/AssetsPage.tsx', 'utf8');
   const agentIdentity = await readFile('apps/web/src/components/custom/agent-identity.tsx', 'utf8');
   const alertingService = await readFile('apps/api/src/security-monitoring/alerting.service.ts', 'utf8');
   const alertsPage = await readFile('apps/web/src/pages/AlertsPage.tsx', 'utf8');
@@ -293,6 +322,7 @@ async function verifyDashboardSourceContracts() {
   const remediationPage = await readFile('apps/web/src/pages/RemediationPage.tsx', 'utf8');
   const securityController = await readFile('apps/api/src/security-monitoring/security-monitoring.controller.ts', 'utf8');
   const securityMonitorPage = await readFile('apps/web/src/pages/SecurityMonitorPage.tsx', 'utf8');
+  const securitySidebar = await readFile('apps/web/src/components/custom/security-sidebar.tsx', 'utf8');
   const sourcesPage = await readFile('apps/web/src/pages/SourcesPage.tsx', 'utf8');
   const topologyPage = await readFile('apps/web/src/pages/TopologyPage.tsx', 'utf8');
   const aggregationService = await readFile('apps/api/src/security-monitoring/aggregation.service.ts', 'utf8');
@@ -313,32 +343,32 @@ async function verifyDashboardSourceContracts() {
       objectiveService.includes("sourceId: record.targetType === 'source' ? record.targetId : undefined"),
   };
   assert(
-    'dashboard Events deep links preserve run and event-kind selector scope',
+    'dashboard Events deep links preserve run and event-kind query scope without coupling selection',
     agentEventsPage.includes('const [runId, setRunId] = useState(searchParams.get("runId") ?? "")') &&
       agentEventsPage.includes('const [eventKind, setEventKind] = useState(searchParams.get("eventKind") ?? "")') &&
       agentEventsPage.includes('runId: clean(runId)') &&
       agentEventsPage.includes('eventKind: clean(eventKind)') &&
-      agentEventsPage.includes('next.set("runId", event.runId)') &&
-      agentEventsPage.includes('next.set("eventKind", event.eventKind)'),
+      !agentEventsPage.includes('next.set("runId", event.runId)') &&
+      !agentEventsPage.includes('next.set("eventKind", event.eventKind)'),
     {
       hasRouteRunId: agentEventsPage.includes('const [runId, setRunId] = useState(searchParams.get("runId") ?? "")'),
       hasRouteEventKind: agentEventsPage.includes('const [eventKind, setEventKind] = useState(searchParams.get("eventKind") ?? "")'),
       hasQueryRunId: agentEventsPage.includes('runId: clean(runId)'),
       hasQueryEventKind: agentEventsPage.includes('eventKind: clean(eventKind)'),
-      hasSelectedRunId: agentEventsPage.includes('next.set("runId", event.runId)'),
-      hasSelectedEventKind: agentEventsPage.includes('next.set("eventKind", event.eventKind)'),
+      selectionMutatesRunId: agentEventsPage.includes('next.set("runId", event.runId)'),
+      selectionMutatesEventKind: agentEventsPage.includes('next.set("eventKind", event.eventKind)'),
     },
   );
   assert(
-    'dashboard Event handoffs preserve selected source and collector scope',
+    'dashboard Event handoffs preserve source and collector scope without coupling selection',
     agentEventsPage.includes('const eventSourceId = event.sourceId ?? (typeof event.attributes.sourceId === "string" ? event.attributes.sourceId : undefined)') &&
       agentEventsPage.includes('const eventCollectorId = event.collectorId ?? (typeof event.attributes.collectorId === "string" ? event.attributes.collectorId : undefined)') &&
       agentEventsPage.includes('if (eventSourceId) topologyQs.set("sourceId", eventSourceId)') &&
       agentEventsPage.includes('if (eventCollectorId) topologyQs.set("collectorId", eventCollectorId)') &&
       agentEventsPage.includes('if (eventSourceId) evidenceQs.set("sourceId", eventSourceId)') &&
       agentEventsPage.includes('if (eventCollectorId) evidenceQs.set("collectorId", eventCollectorId)') &&
-      agentEventsPage.includes('if (eventSourceId ?? sourceId) next.set("sourceId", eventSourceId ?? sourceId)') &&
-      agentEventsPage.includes('if (eventCollectorId ?? collectorId) next.set("collectorId", eventCollectorId ?? collectorId)'),
+      !agentEventsPage.includes('if (eventSourceId ?? sourceId) next.set("sourceId", eventSourceId ?? sourceId)') &&
+      !agentEventsPage.includes('if (eventCollectorId ?? collectorId) next.set("collectorId", eventCollectorId ?? collectorId)'),
     {
       hasEventSourceFallback: agentEventsPage.includes('const eventSourceId = event.sourceId ?? (typeof event.attributes.sourceId === "string" ? event.attributes.sourceId : undefined)'),
       hasEventCollectorFallback: agentEventsPage.includes('const eventCollectorId = event.collectorId ?? (typeof event.attributes.collectorId === "string" ? event.attributes.collectorId : undefined)'),
@@ -346,6 +376,8 @@ async function verifyDashboardSourceContracts() {
       hasTopologyCollector: agentEventsPage.includes('if (eventCollectorId) topologyQs.set("collectorId", eventCollectorId)'),
       hasEvidenceSource: agentEventsPage.includes('if (eventSourceId) evidenceQs.set("sourceId", eventSourceId)'),
       hasEvidenceCollector: agentEventsPage.includes('if (eventCollectorId) evidenceQs.set("collectorId", eventCollectorId)'),
+      selectionMutatesSource: agentEventsPage.includes('if (eventSourceId ?? sourceId) next.set("sourceId", eventSourceId ?? sourceId)'),
+      selectionMutatesCollector: agentEventsPage.includes('if (eventCollectorId ?? collectorId) next.set("collectorId", eventCollectorId ?? collectorId)'),
     },
   );
   assert(
@@ -425,16 +457,19 @@ async function verifyDashboardSourceContracts() {
       agentsPage.includes('标记为非 Agent') &&
       agentsPage.includes('证据不足，降为未知') &&
       agentsPage.includes('撤销确认，重新观察') &&
-      agentsPage.includes('重新纳入观察') &&
+      agentsPage.includes('恢复自动识别') &&
+      agentsPage.includes('设为待确认') &&
+      !agentsPage.includes('重新纳入观察') &&
       agentsPage.includes('人工身份裁决') &&
       agentsPage.includes('aria-label="确认人工身份裁决"') &&
       agentsPage.includes('<details className="group rounded-md') &&
       agentsPage.includes('身份信息配置') &&
       !agentsPage.includes('window.confirm') &&
       !agentsPage.includes('Codex') &&
-      agentEventsPage.includes('focus: "review"') &&
-      agentEventsPage.includes('进入身份审核') &&
-      agentEventsPage.includes('查看智能体资产') &&
+      agentEventsPage.includes('assetHref(resolvedAssetId, assetQs)') &&
+      agentEventsPage.includes('查看关联资产') &&
+      assetsPage.includes('focus=review') &&
+      assetsPage.includes('打开 Agent 审核') &&
       !agentEventsPage.includes('<IdentityAiReview') &&
       securityMonitorPage.includes('if (event.agentId) qs.set("agentId", event.agentId)') &&
       securityMonitorPage.includes('详情 →') &&
@@ -451,7 +486,9 @@ async function verifyDashboardSourceContracts() {
         agentsPage.includes('标记为非 Agent') &&
         agentsPage.includes('证据不足，降为未知') &&
         agentsPage.includes('撤销确认，重新观察') &&
-        agentsPage.includes('重新纳入观察') &&
+        agentsPage.includes('恢复自动识别') &&
+        agentsPage.includes('设为待确认') &&
+        !agentsPage.includes('重新纳入观察') &&
         agentsPage.includes('人工身份裁决'),
       hasInlineReviewConfirmation:
         agentsPage.includes('aria-label="确认人工身份裁决"') &&
@@ -461,9 +498,10 @@ async function verifyDashboardSourceContracts() {
         agentsPage.includes('<details className="group rounded-md') &&
         agentsPage.includes('身份信息配置'),
       hasReviewHandoff:
-        agentEventsPage.includes('focus: "review"') &&
-        agentEventsPage.includes('进入身份审核') &&
-        agentEventsPage.includes('查看智能体资产') &&
+        agentEventsPage.includes('assetHref(resolvedAssetId, assetQs)') &&
+        agentEventsPage.includes('查看关联资产') &&
+        assetsPage.includes('focus=review') &&
+        assetsPage.includes('打开 Agent 审核') &&
         !agentEventsPage.includes('<IdentityAiReview'),
       hasRuntimeEventHandoff:
         securityMonitorPage.includes('if (event.agentId) qs.set("agentId", event.agentId)') &&
@@ -473,24 +511,24 @@ async function verifyDashboardSourceContracts() {
   );
   assert(
     'dashboard presents Agent assets first and exposes implementation-neutral time-window analysis',
-    securityMonitorPage.includes('title="智能体风险概览"') &&
-      securityMonitorPage.includes('{ key: "assets" as const, label: "智能体资产"') &&
-      securityMonitorPage.includes('{ key: "window" as const, label: "时间窗分析"') &&
-      securityMonitorPage.includes('securityCenterApi.agentInventory({ ...filter, limit: 32 })') &&
+    securityMonitorPage.includes('title={assetsOnly ? "Agent 列表" : "智能体风险概览"}') &&
+      securityMonitorPage.includes('{ key: "assets" as const, label: t("Agent 列表")') &&
+      securityMonitorPage.includes('{ key: "window" as const, label: t("Flink 风险画像")') &&
+      securityMonitorPage.includes('limit: activeView === "agentInstances" ? 500 : 32') &&
       securityMonitorPage.includes('const [visibleAgentCount, setVisibleAgentCount] = useState(8)') &&
-      securityMonitorPage.includes('<AgentOverviewCard key={agent.agentAssetId}') &&
-      securityMonitorPage.includes('进入智能体资产 →') &&
+      securityMonitorPage.includes('<AgentOverviewCard key={agentRuntimeSelectionKey(agent)}') &&
+      securityMonitorPage.includes('进入 Agent 列表 →') &&
       securityMonitorPage.includes('观察模式 · 不影响系统操作') &&
       !securityMonitorPage.includes('title="Flink 实时风险关联"') &&
       !securityMonitorPage.includes('Flink 聚合连续行为') &&
       !securityMonitorPage.includes('value: "Shadow"'),
     {
-      hasOverviewTitle: securityMonitorPage.includes('title="智能体风险概览"'),
-      hasAssetFirstView: securityMonitorPage.includes('{ key: "assets" as const, label: "智能体资产"'),
-      hasWindowView: securityMonitorPage.includes('{ key: "window" as const, label: "时间窗分析"'),
-      hasInventoryQuery: securityMonitorPage.includes('securityCenterApi.agentInventory({ ...filter, limit: 32 })'),
+      hasOverviewTitle: securityMonitorPage.includes('title={assetsOnly ? "Agent 列表" : "智能体风险概览"}'),
+      hasAssetFirstView: securityMonitorPage.includes('{ key: "assets" as const, label: t("Agent 列表")'),
+      hasWindowView: securityMonitorPage.includes('{ key: "window" as const, label: t("Flink 风险画像")'),
+      hasInventoryQuery: securityMonitorPage.includes('limit: activeView === "agentInstances" ? 500 : 32'),
       hasEightItemDisclosure: securityMonitorPage.includes('const [visibleAgentCount, setVisibleAgentCount] = useState(8)'),
-      hasAssetCards: securityMonitorPage.includes('<AgentOverviewCard key={agent.agentAssetId}'),
+      hasAssetCards: securityMonitorPage.includes('<AgentOverviewCard key={agentRuntimeSelectionKey(agent)}'),
       hidesImplementationTerms:
         !securityMonitorPage.includes('title="Flink 实时风险关联"') &&
         !securityMonitorPage.includes('Flink 聚合连续行为') &&
@@ -540,7 +578,8 @@ async function verifyDashboardSourceContracts() {
       apiClient.includes('operation: "buildEvidenceBundle"') &&
       securityController.includes("operation.name === 'planNextActions'") &&
       securityController.includes("operation.name === 'buildEvidenceBundle'") &&
-      securityMonitorPage.includes('<Link to="/operator">'),
+      securitySidebar.includes('label: "AI Operator"') &&
+      securitySidebar.includes('href: "/operator"'),
     {
       hasProgressiveApiCall: operatorPage.includes('securityCenterApi.nextActionPlan(params)'),
       hasProgressiveEvidenceCall: operatorPage.includes('securityCenterApi.evidenceBundleCapability(evidenceBundleParams(action.evidence.bundleHint, action, timeType))'),
@@ -559,7 +598,9 @@ async function verifyDashboardSourceContracts() {
         operatorPage.includes('const routeText = searchParams.toString()') &&
         operatorPage.includes('setSearchParams(next, { replace: true })') &&
         operatorPage.includes('setSearchParams(operatorRouteParams({'),
-      hasDashboardEntry: securityMonitorPage.includes('<Link to="/operator">'),
+      hasDashboardEntry:
+        securitySidebar.includes('label: "AI Operator"') &&
+        securitySidebar.includes('href: "/operator"'),
     },
   );
   assert(
@@ -599,7 +640,8 @@ async function verifyDashboardSourceContracts() {
       !capabilitiesPage.includes('const SAMPLE_PARAMS') &&
       capabilitiesPage.includes('schemaConstString(bodyProperties.action, "execute")') &&
       capabilitiesPage.includes('schemaConstString(bodyProperties.module, "security-center")') &&
-      securityMonitorPage.includes('<Link to="/capabilities">'),
+      securitySidebar.includes('label: "Agent 安全接入"') &&
+      securitySidebar.includes('href: "/capabilities"'),
     {
       hasList: capabilitiesPage.includes('securityCenterApi.securityCapabilities({ action: "list" })'),
       hasSearch: capabilitiesPage.includes('securityCenterApi.securityCapabilities({ action: "search", query: nextQuery })'),
@@ -640,7 +682,9 @@ async function verifyDashboardSourceContracts() {
         capabilitiesPage.includes('const routeAction = capabilityRouteAction(searchParams.get("action"))') &&
         capabilitiesPage.includes('const [query, setQuery] = useState(routeQuery)') &&
         capabilitiesPage.includes('void refreshModules(routeModule, routeOperation, false, routeAction)'),
-      hasDashboardEntry: securityMonitorPage.includes('<Link to="/capabilities">'),
+      hasDashboardEntry:
+        securitySidebar.includes('label: "Agent 安全接入"') &&
+        securitySidebar.includes('href: "/capabilities"'),
     },
   );
   assert(

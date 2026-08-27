@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: a3s-observer
+  namespace: anysentry
+spec:
+  template:
+    metadata:
+      annotations:
+        anysentry.io/manual-observer-profile: "agent-prefilter-file-canary-v1"
+    spec:
+      containers:
+        - name: a3s-observer
+          env:
+            # The legacy combined switch stays off. Independent overrides exercise the split
+            # access/delete rings only after the versioned cgroup filter snapshot is mounted.
+            - { name: A3S_OBSERVER_FILES, value: "0" }
+            - { name: A3S_OBSERVER_FILE_ACCESS, value: "1" }
+            - { name: A3S_OBSERVER_FILE_DELETE, value: "0" }
+            - { name: A3S_OBSERVER_FILE_UNKNOWN_POLICY, value: "keep" }
+            - { name: FORWARD_FILTER_MODE, value: "enforce" }
+            - { name: FORWARD_RETAIN_UNKNOWN, value: "true" }
+            - { name: FORWARD_FILE_AGGREGATION, value: "true" }
+            - { name: FORWARD_BATCH_SIZE, value: "64" }
+            - { name: FORWARD_BATCH_FLUSH_MS, value: "50" }

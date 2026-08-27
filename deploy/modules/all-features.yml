@@ -1,0 +1,77 @@
+# Full modular Docker validation profile. This enables every non-legacy AnySentry subsystem while
+# keeping deprecated compatibility correlation paths disabled.
+services:
+  anysentry:
+    environment:
+      ANYSENTRY_ASYNC_JUDGE: "on"
+      ANYSENTRY_STREAMING: "on"
+      ANYSENTRY_STREAM_AGENT_ONLY: "on"
+      ANYSENTRY_SUPPLY_CHAIN: "on"
+      ANYSENTRY_SUPPLY_CHAIN_RUNTIME: "on"
+      ANYSENTRY_ASSISTANT: "on"
+      ANYSENTRY_TRUSTED_CORRELATION_MODE: "enabled"
+      ANYSENTRY_UNKNOWN_RETENTION_MODE: "enforce"
+      ANYSENTRY_UNKNOWN_LEARNING_ENABLED: "true"
+      ANYSENTRY_UNKNOWN_LEARNING_PERSIST_INTERVAL_MS: "30000"
+      ANYSENTRY_WORKSPACE_SCANNER_TOKEN: ${ANYSENTRY_WORKSPACE_SCANNER_TOKEN:?set a 32+ character Workspace Scanner token}
+
+  supply-chain-assessment:
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      ANYSENTRY_SUPPLY_CHAIN_RUNTIME: "on"
+      ANYSENTRY_OSV_INTELLIGENCE_MODE: "online"
+
+  workspace-scanner:
+    image: ${ANYSENTRY_WORKSPACE_SCANNER_IMAGE:-anysentry-workspace-scanner:modules}
+    build:
+      context: .
+      dockerfile: Dockerfile.modules
+      target: workspace-scanner
+    labels:
+      io.anysentry.observe: "false"
+      anysentry.io/workload-role: "anysentry_internal"
+    depends_on:
+      anysentry:
+        condition: service_healthy
+    environment:
+      ANYSENTRY_API_BASE: http://anysentry:29653/security-center
+      ANYSENTRY_WORKSPACE_SCANNER_TOKEN: ${ANYSENTRY_WORKSPACE_SCANNER_TOKEN:?set a 32+ character Workspace Scanner token}
+      ANYSENTRY_WORKSPACE_SCANNER_CONFIG: /etc/anysentry/workspace-scanner.json
+      ANYSENTRY_WORKSPACE_SCANNER_POLL_MS: "5000"
+      ANYSENTRY_DEPENDENCY_DESCRIPTOR_POLL_MS: "30000"
+      ANYSENTRY_OSV_SCANNER_BIN: /usr/local/bin/osv-scanner
+      ANYSENTRY_OSV_SCANNER_VERSION: 2.3.8
+    volumes:
+      - .:/workspace/AnySentry:ro
+      - ./deploy/modules/workspace-scanner.docker.json:/etc/anysentry/workspace-scanner.json:ro
+    restart: unless-stopped
+
+  observer:
+    build: !reset null
+    entrypoint: ["/usr/local/bin/node", "/opt/observer-supervisor.js"]
+    environment:
+      A3S_OBSERVER_FILES: "0"
+      A3S_OBSERVER_FILE_ACCESS: "1"
+      A3S_OBSERVER_FILE_DELETE: "1"
+      # Attach to the host OpenSSL inode. Container-specific or statically linked TLS runtimes need
+      # additional library-specific probe instances and are outside this single-library uprobe.
+      A3S_OBSERVER_SSL: /opt/host-libs/libssl.so.3
+      A3S_OBSERVER_FILE_UNKNOWN_POLICY: "keep"
+      ANYSENTRY_CAPTURE_PROFILE_MODE: "enforce"
+      ANYSENTRY_UNKNOWN_RETENTION_MODE: "enforce"
+      ANYSENTRY_FILTER_RULES_ACK_FILE: /run/anysentry-filter/filter-rules.ack.json
+      FORWARD_FILTER_MODE: "enforce"
+      FORWARD_RETAIN_UNKNOWN: "true"
+      FORWARD_RETAIN_NON_AGENT: "false"
+      FORWARD_FILE_AGGREGATION: "true"
+      FORWARD_BATCH_SIZE: "64"
+      FORWARD_BATCH_FLUSH_MS: "50"
+      OBSERVER_SUPERVISOR_FORWARDER_ARGS_JSON: '["/opt/observer-forward.js"]'
+    volumes: !override
+      - /sys:/sys:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${ANYSENTRY_RUNTIME_RULES_DIR:-./.local/observer-rules}:/etc/anysentry:ro
+      - observer-filter-rules:/run/anysentry-filter
+      - ${A3S_OBSERVER_HOST_LIBSSL:-/usr/lib/x86_64-linux-gnu/libssl.so.3}:/opt/host-libs/libssl.so.3:ro

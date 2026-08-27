@@ -14,9 +14,13 @@ const DEFAULT_JOB_OPTIONS: JobsOptions = {
   removeOnFail: { age: 7 * 24 * 60 * 60, count: 20_000 },
 };
 
-function resultApplyConcurrency(): number {
-  const parsed = Number(process.env.ANYSENTRY_RESULT_APPLY_CONCURRENCY || 128);
-  return Number.isFinite(parsed) ? Math.max(1, Math.min(512, Math.trunc(parsed))) : 128;
+export function decisionResultWorkerConcurrency(
+  value = process.env.ANYSENTRY_RESULT_APPLY_CONCURRENCY
+    ?? process.env.ANYSENTRY_DECISION_RESULT_CONCURRENCY,
+): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 64;
+  return Math.max(8, Math.min(128, Math.trunc(parsed)));
 }
 
 export function redisConnection(urlText = process.env.ANYSENTRY_REDIS_URL || 'redis://redis:6379/0'): ConnectionOptions {
@@ -57,6 +61,20 @@ export class JudgmentQueueService implements OnModuleDestroy {
     });
   }
 
+  async enqueueFastBatch(jobs: readonly FastJudgeJob[]): Promise<void> {
+    if (!jobs.length) return;
+    if (!this.fastQueue) throw new Error('asynchronous judgment queue is disabled');
+    await this.fastQueue.addBulk(jobs.map((job) => ({
+      name: 'judge-by-identity-route',
+      data: job,
+      opts: {
+        jobId: job.evaluationId,
+        attempts: 2,
+        backoff: { type: 'exponential' as const, delay: 5_000 },
+      },
+    })));
+  }
+
   async enqueueL3(job: L3JudgeJob): Promise<void> {
     if (!this.l3Queue) throw new Error('L3 queue is disabled');
     await this.l3Queue.add('deep-investigation', job, {
@@ -80,7 +98,10 @@ export class JudgmentQueueService implements OnModuleDestroy {
     return new Worker<DecisionResultJob>(
       DECISION_RESULTS_QUEUE,
       async (job) => processor(job.data),
-      { connection: this.connection, concurrency: resultApplyConcurrency(), ...options },
+      // Each result job waits for the durable revision microbatch. Concurrency must be at least the
+      // 64-row ClickHouse batch target; with the old value of eight the timer could only ever seal
+      // eight-row parts because all workers were blocked waiting for that same flush.
+      { connection: this.connection, concurrency: decisionResultWorkerConcurrency(), ...options },
     );
   }
 

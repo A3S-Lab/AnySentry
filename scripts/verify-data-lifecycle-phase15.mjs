@@ -269,10 +269,13 @@ const [aggregation, clickhouse, commitCache, dashboardCache, controller, fronten
   read('apps/web/src/lib/api/security-center.ts'),
   read('package.json'),
 ]);
-assert.match(aggregation, /DASHBOARD_HOT_TAIL_MS = 60_000/);
+assert.match(aggregation, /DASHBOARD_HOT_TAIL_MS = REUSABLE_BUCKET_MS/);
 assert.match(aggregation, /dashboardTailEvents/);
 assert.match(aggregation, /foldLatestEventRevisions/);
 assert.match(aggregation, /readWithTail/);
+assert.match(clickhouse, /argMax\([\s\S]*?tuple\(at, _part, _part_offset\)/u);
+assert.match(clickhouse, /argMax\(at, tuple\(decisionRevision, decisionUpdatedAt, at\)\) AS eventAt/u);
+assert.doesNotMatch(clickhouse, /argMax\(at, tuple\(decisionRevision, decisionUpdatedAt, at\)\) AS at/u);
 assert.match(clickhouse, /earliestEventCommitCursor/);
 assert.match(clickhouse, /LIMIT 1 BY eventId/);
 assert.match(commitCache, /maxFacts = 100_000/);

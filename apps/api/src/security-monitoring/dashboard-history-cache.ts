@@ -21,7 +21,6 @@ export interface DashboardHistoryProvider {
 function compareCursor(left: EventCommitCursor, right: EventCommitCursor): number {
   return (
     left.committedAtMs - right.committedAtMs ||
-    (left.commitBatchId ?? '').localeCompare(right.commitBatchId ?? '') ||
     left.eventId.localeCompare(right.eventId) ||
     left.decisionRevision - right.decisionRevision
   );

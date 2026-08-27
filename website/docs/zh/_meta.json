@@ -1,0 +1,9 @@
+[
+  { "type": "dir", "name": "guide", "label": "快速开始" },
+  { "type": "dir", "name": "safety-loop", "label": "安全闭环" },
+  { "type": "dir", "name": "ai-native", "label": "AI-Native 智能体" },
+  { "type": "dir", "name": "judgment", "label": "分层研判" },
+  { "type": "dir", "name": "evidence", "label": "事件与证据" },
+  { "type": "dir", "name": "architecture", "label": "架构" },
+  { "type": "dir", "name": "scenarios", "label": "场景" }
+]

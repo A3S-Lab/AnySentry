@@ -65,6 +65,8 @@ export class WorkspaceDirectoryService implements OnModuleInit, OnModuleDestroy 
   private readonly dirtyBindingIds = new Set<string>();
   private persistTimer?: NodeJS.Timeout;
   private refreshTimer?: NodeJS.Timeout;
+  private persistInFlight?: Promise<void>;
+  private persistRequested = false;
 
   constructor(
     private readonly relational: RelationalBusinessStore,
@@ -332,19 +334,47 @@ export class WorkspaceDirectoryService implements OnModuleInit, OnModuleDestroy 
     this.persistTimer.unref();
   }
 
-  private async persist(): Promise<void> {
-    const workspaces = [...this.dirtyWorkspaceIds]
-      .map((id) => this.workspaces.get(id))
-      .filter((record): record is WorkspaceDirectoryRecord => Boolean(record));
-    const bindings = [...this.dirtyBindingIds]
-      .map((id) => this.bindings.get(id))
-      .filter((record): record is AgentWorkspaceBindingRecord => Boolean(record));
-    const [workspaceSaved, bindingSaved] = await Promise.all([
-      this.relational.saveWorkspaceDirectory(workspaces),
-      this.relational.saveAgentWorkspaceBindings(bindings),
-    ]);
-    if (workspaceSaved) for (const record of workspaces) this.dirtyWorkspaceIds.delete(record.workspaceId);
-    if (bindingSaved) for (const record of bindings) this.dirtyBindingIds.delete(record.bindingId);
+  private persist(): Promise<void> {
+    this.persistRequested = true;
+    if (!this.persistInFlight) {
+      this.persistInFlight = this.drainPersistence().finally(() => {
+        this.persistInFlight = undefined;
+        if (this.persistRequested) void this.persist();
+      });
+    }
+    return this.persistInFlight;
+  }
+
+  private async drainPersistence(): Promise<void> {
+    do {
+      this.persistRequested = false;
+      const workspaces = [...this.dirtyWorkspaceIds]
+        .map((id) => this.workspaces.get(id))
+        .filter((record): record is WorkspaceDirectoryRecord => Boolean(record));
+      const bindings = [...this.dirtyBindingIds]
+        .map((id) => this.bindings.get(id))
+        .filter((record): record is AgentWorkspaceBindingRecord => Boolean(record));
+      const [workspaceSaved, bindingSaved] = await Promise.all([
+        this.relational.saveWorkspaceDirectory(workspaces),
+        this.relational.saveAgentWorkspaceBindings(bindings),
+      ]);
+      if (workspaceSaved) {
+        for (const record of workspaces) {
+          const current = this.workspaces.get(record.workspaceId);
+          if (!current || current.updatedAt <= record.updatedAt) {
+            this.dirtyWorkspaceIds.delete(record.workspaceId);
+          }
+        }
+      }
+      if (bindingSaved) {
+        for (const record of bindings) {
+          const current = this.bindings.get(record.bindingId);
+          if (!current || current.updatedAt <= record.updatedAt) {
+            this.dirtyBindingIds.delete(record.bindingId);
+          }
+        }
+      }
+    } while (this.persistRequested);
   }
 
   private async refresh(): Promise<void> {

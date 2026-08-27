@@ -49,7 +49,10 @@ function durableResponse(body) {
 }
 
 const server = http.createServer((request, response) => {
-  if (request.method !== 'POST') {
+  if (
+    request.method !== 'POST' ||
+    !request.url?.startsWith('/security-center/ingest/batch')
+  ) {
     response.writeHead(404).end();
     return;
   }

@@ -4,8 +4,13 @@ import { ClickHouseStore } from './clickhouse-store';
 import { DistributedCurrentStateService } from './distributed-current-state.service';
 import { RelationalBusinessStore } from './relational-business-store.service';
 import {
+  CorrelationClaimAuthority,
+  CorrelationClaimAuthorizationReason,
   IngestionSourceCheckInAck,
   IngestionSourceCheckInRequest,
+  IngestionSourceCorrelationClaimBindings,
+  IngestionSourceCorrelationClaimsPolicy,
+  IngestionSourceCorrelationClaimsPolicyInput,
   IngestionSourceCurrentActivity,
   IngestionSourceItem,
   IngestionSourceList,
@@ -18,6 +23,7 @@ import {
   SourceTokenRotationStatus,
 } from './types';
 import { cleanText } from './redaction';
+import { correlationCaptureRollout } from './correlation-rollout';
 
 const RETAIN_LIMIT = 2_000;
 const STALE_AFTER_MS = 10 * 60_000;
@@ -27,6 +33,23 @@ export interface IngestionSourceResolution {
   accepted: boolean;
   reason?: string;
   source?: IngestionSourceRecord;
+  authenticated: boolean;
+  authentication: 'token' | 'none';
+  claimAuthorization: boolean;
+  claimAuthorizationReason: CorrelationClaimAuthorizationReason;
+  claimAuthority?: CorrelationClaimAuthority;
+}
+
+export interface IngestionSourceCorrelationClaimRequest {
+  authority?: CorrelationClaimAuthority;
+  /** Raw identity values; authorization performs strict, non-truncating validation. */
+  tenantId?: unknown;
+  environmentId?: unknown;
+  workspaceId?: unknown;
+  workspacePath?: unknown;
+  collectorId?: unknown;
+  physicalWorkloadId?: unknown;
+  agentScopeId?: unknown;
 }
 
 export interface IngestionSourceResolveInput {
@@ -36,6 +59,7 @@ export interface IngestionSourceResolveInput {
   workspacePath?: string;
   sourceName?: string;
   type?: IngestionSourceType;
+  correlationClaim?: IngestionSourceCorrelationClaimRequest;
 }
 
 export type IngestionActivityKind = 'event' | 'heartbeat';
@@ -80,6 +104,197 @@ function cleanType(value: unknown): IngestionSourceType {
 function cleanTags(tags: unknown): string[] {
   if (!Array.isArray(tags)) return [];
   return [...new Set(tags.map((tag) => cleanText(tag, 48)).filter((tag): tag is string => Boolean(tag)))].slice(0, 24);
+}
+
+const CLAIM_BINDING_LIMIT = 64;
+
+function strictClaimIdentity(value: unknown, limit: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  if (!normalized || normalized.length > limit || /[\u0000-\u001f\u007f]/u.test(normalized)) {
+    return undefined;
+  }
+  return normalized;
+}
+
+const CORRELATION_AUTHORITY_SOURCE_TYPES: Readonly<Record<CorrelationClaimAuthority, readonly IngestionSourceType[]>> = {
+  application: ['otel', 'webhook', 'custom'],
+  agent_adapter: ['forwarder', 'otel', 'webhook', 'custom'],
+  observer_runtime: ['observer', 'forwarder'],
+};
+
+function cleanClaimAuthority(value: unknown): CorrelationClaimAuthority | undefined {
+  return value === 'application' || value === 'agent_adapter' || value === 'observer_runtime' ? value : undefined;
+}
+
+function cleanBindingList(value: unknown, limit: number): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map((item) => strictClaimIdentity(item, limit)).filter((item): item is string => Boolean(item)))].slice(0, CLAIM_BINDING_LIMIT);
+}
+
+function emptyClaimBindings(): IngestionSourceCorrelationClaimBindings {
+  return {
+    tenantIds: [],
+    environmentIds: [],
+    workspaceIds: [],
+    workspacePaths: [],
+    collectorIds: [],
+    physicalWorkloadIds: [],
+    agentScopeIds: [],
+  };
+}
+
+export function normalizeCorrelationClaimsPolicy(
+  input: IngestionSourceCorrelationClaimsPolicyInput | IngestionSourceCorrelationClaimsPolicy | undefined,
+  current?: IngestionSourceCorrelationClaimsPolicy,
+): IngestionSourceCorrelationClaimsPolicy {
+  const prior = current?.bindings ?? emptyClaimBindings();
+  const incoming = input?.bindings;
+  const binding = (key: keyof IngestionSourceCorrelationClaimBindings, limit: number): string[] =>
+    incoming && Object.prototype.hasOwnProperty.call(incoming, key)
+      ? cleanBindingList(incoming[key], limit)
+      : cleanBindingList(prior[key], limit);
+  const hasEnabled = Boolean(input && Object.prototype.hasOwnProperty.call(input, 'enabled'));
+  const hasAuthority = Boolean(input && Object.prototype.hasOwnProperty.call(input, 'authority'));
+  return {
+    enabled: hasEnabled ? input?.enabled === true : current?.enabled === true,
+    authority: hasAuthority ? cleanClaimAuthority(input?.authority) : cleanClaimAuthority(current?.authority),
+    bindings: {
+      tenantIds: binding('tenantIds', 160),
+      environmentIds: binding('environmentIds', 80),
+      workspaceIds: binding('workspaceIds', 180),
+      workspacePaths: binding('workspacePaths', 500),
+      collectorIds: binding('collectorIds', 180),
+      physicalWorkloadIds: binding('physicalWorkloadIds', 240),
+      agentScopeIds: binding('agentScopeIds', 160),
+    },
+  };
+}
+
+function scopeFailure(
+  requested: string | undefined,
+  bindings: readonly string[],
+  missingReason: CorrelationClaimAuthorizationReason,
+  mismatchReason: CorrelationClaimAuthorizationReason,
+): CorrelationClaimAuthorizationReason | undefined {
+  if (!requested) return undefined;
+  if (!bindings.length) return missingReason;
+  return bindings.includes(requested) ? undefined : mismatchReason;
+}
+
+export function authorizeCorrelationClaims(input: {
+  source?: IngestionSourceRecord;
+  tokenProvided: boolean;
+  tokenMatched: boolean;
+  sourceIdMismatch?: boolean;
+  claim?: IngestionSourceCorrelationClaimRequest;
+}): Pick<IngestionSourceResolution, 'claimAuthorization' | 'claimAuthorizationReason' | 'claimAuthority'> {
+  const source = input.source;
+  const authority = cleanClaimAuthority(input.claim?.authority);
+  const denied = (reason: CorrelationClaimAuthorizationReason) => ({
+    claimAuthorization: false as const,
+    claimAuthorizationReason: reason,
+    claimAuthority: authority,
+  });
+  if (!source) return denied('source_unresolved');
+  if (!source.enabled) return denied('source_disabled');
+  if (source.discovered) return denied('source_discovered');
+  const policy = normalizeCorrelationClaimsPolicy(source.correlationClaims);
+  if (!policy.enabled) return denied('policy_disabled');
+  if (!policy.authority) return denied('policy_invalid');
+  if (!source.requireToken) return denied('protected_source_required');
+  if (!input.tokenProvided) return denied('token_missing');
+  if (!input.tokenMatched) return denied('token_invalid');
+  if (input.sourceIdMismatch) return denied('source_id_mismatch');
+  if (!authority) return denied('authority_missing');
+  if (policy.authority !== authority) return denied('authority_mismatch');
+  if (!CORRELATION_AUTHORITY_SOURCE_TYPES[authority].includes(source.type)) return denied('source_type_not_allowed');
+
+  const claim = input.claim ?? {};
+  const bindings = policy.bindings;
+  const requestedScopes = {
+    tenantId: strictClaimIdentity(claim.tenantId, 160),
+    environmentId: strictClaimIdentity(claim.environmentId, 80),
+    workspaceId: strictClaimIdentity(claim.workspaceId, 180),
+    workspacePath: strictClaimIdentity(claim.workspacePath, 500),
+    collectorId: strictClaimIdentity(claim.collectorId, 180),
+    physicalWorkloadId: strictClaimIdentity(claim.physicalWorkloadId, 240),
+    agentScopeId: strictClaimIdentity(claim.agentScopeId, 160),
+  };
+  const workspacePolicyConfigured = bindings.workspaceIds.length > 0 || bindings.workspacePaths.length > 0;
+  const workspaceRequested = Boolean(requestedScopes.workspaceId || requestedScopes.workspacePath);
+  const workloadPolicyConfigured = bindings.physicalWorkloadIds.length > 0;
+  const workloadRequested = Boolean(requestedScopes.physicalWorkloadId);
+  const agentPolicyConfigured = bindings.agentScopeIds.length > 0;
+  const agentRequested = Boolean(requestedScopes.agentScopeId);
+  const invalidProvidedScope = (
+    raw: unknown,
+    parsed: string | undefined,
+    configured: boolean,
+    reason: CorrelationClaimAuthorizationReason,
+  ): CorrelationClaimAuthorizationReason | undefined =>
+    configured && raw !== undefined && parsed === undefined ? reason : undefined;
+  const invalidScope = [
+    invalidProvidedScope(claim.tenantId, requestedScopes.tenantId, bindings.tenantIds.length > 0, 'tenant_binding_mismatch'),
+    invalidProvidedScope(claim.environmentId, requestedScopes.environmentId, bindings.environmentIds.length > 0, 'environment_binding_mismatch'),
+    invalidProvidedScope(claim.workspaceId, requestedScopes.workspaceId, bindings.workspaceIds.length > 0, 'workspace_binding_mismatch'),
+    invalidProvidedScope(claim.workspacePath, requestedScopes.workspacePath, bindings.workspacePaths.length > 0, 'workspace_binding_mismatch'),
+    invalidProvidedScope(claim.collectorId, requestedScopes.collectorId, bindings.collectorIds.length > 0, 'collector_binding_mismatch'),
+    invalidProvidedScope(claim.physicalWorkloadId, requestedScopes.physicalWorkloadId, bindings.physicalWorkloadIds.length > 0, 'workload_binding_mismatch'),
+    invalidProvidedScope(claim.agentScopeId, requestedScopes.agentScopeId, bindings.agentScopeIds.length > 0, 'agent_binding_mismatch'),
+  ].find((reason): reason is CorrelationClaimAuthorizationReason => Boolean(reason));
+  if (invalidScope) return denied(invalidScope);
+  if (authority === 'application' || authority === 'agent_adapter') {
+    if (!bindings.tenantIds.length || !bindings.environmentIds.length || (!workspacePolicyConfigured && !workloadPolicyConfigured && !agentPolicyConfigured)) {
+      return denied('policy_invalid');
+    }
+    if (!requestedScopes.tenantId || !requestedScopes.environmentId || (!workspaceRequested && !workloadRequested && !agentRequested)) {
+      return denied('required_scope_missing');
+    }
+  } else if (!bindings.collectorIds.length) {
+    return denied('policy_invalid');
+  } else if (!requestedScopes.collectorId) {
+    return denied('required_scope_missing');
+  } else if (!bindings.collectorIds.includes(requestedScopes.collectorId)) {
+    return denied('collector_binding_mismatch');
+  }
+
+  const workspaceFailure = (): CorrelationClaimAuthorizationReason | undefined => {
+    if (!workspaceRequested) return undefined;
+    if (requestedScopes.workspaceId) {
+      if (!bindings.workspaceIds.length) return 'workspace_binding_missing';
+      if (!bindings.workspaceIds.includes(requestedScopes.workspaceId)) return 'workspace_binding_mismatch';
+    }
+    if (requestedScopes.workspacePath) {
+      if (!bindings.workspacePaths.length) return 'workspace_binding_missing';
+      if (!bindings.workspacePaths.includes(requestedScopes.workspacePath)) return 'workspace_binding_mismatch';
+    }
+    return undefined;
+  };
+  const failures: Array<CorrelationClaimAuthorizationReason | undefined> = [
+    scopeFailure(requestedScopes.tenantId, bindings.tenantIds, 'tenant_binding_missing', 'tenant_binding_mismatch'),
+    scopeFailure(requestedScopes.environmentId, bindings.environmentIds, 'environment_binding_missing', 'environment_binding_mismatch'),
+    workspaceFailure(),
+    scopeFailure(requestedScopes.collectorId, bindings.collectorIds, 'collector_binding_missing', 'collector_binding_mismatch'),
+    scopeFailure(requestedScopes.physicalWorkloadId, bindings.physicalWorkloadIds, 'workload_binding_missing', 'workload_binding_mismatch'),
+    scopeFailure(requestedScopes.agentScopeId, bindings.agentScopeIds, 'agent_binding_missing', 'agent_binding_mismatch'),
+  ];
+  if (bindings.tenantIds.length && !requestedScopes.tenantId) failures[0] = 'tenant_binding_missing';
+  if (bindings.environmentIds.length && !requestedScopes.environmentId) failures[1] = 'environment_binding_missing';
+  if (bindings.collectorIds.length && !requestedScopes.collectorId) failures[3] = 'collector_binding_missing';
+  if (authority === 'observer_runtime') {
+    if (bindings.workspaceIds.length && !requestedScopes.workspaceId) failures[2] = 'workspace_binding_missing';
+    if (bindings.workspacePaths.length && !requestedScopes.workspacePath) failures[2] = 'workspace_binding_missing';
+    if (bindings.physicalWorkloadIds.length && !requestedScopes.physicalWorkloadId) failures[4] = 'workload_binding_missing';
+    if (bindings.agentScopeIds.length && !requestedScopes.agentScopeId) failures[5] = 'agent_binding_missing';
+  }
+  const failure = failures.find((reason): reason is CorrelationClaimAuthorizationReason => Boolean(reason));
+  if (failure) return denied(failure);
+  return {
+    claimAuthorization: true,
+    claimAuthorizationReason: 'authorized',
+    claimAuthority: authority,
+  };
 }
 
 type VerificationSourceIdentity = Pick<
@@ -148,6 +363,8 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
   private readonly sources = new Map<string, IngestionSourceRecord>();
   private persistTimer?: NodeJS.Timeout;
   private currentStateTimer?: NodeJS.Timeout;
+  private persistInFlight?: Promise<void>;
+  private persistRequested = false;
   private initialized = false;
 
   constructor(
@@ -217,12 +434,17 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       .map((record) => this.item(record))
       .filter((item) => {
         const matchesSourceId = Boolean(sourceId && item.sourceId === sourceId);
-        if (!query.includeVerification && !matchesSourceId && isVerificationSource(item)) return false;
+        const matchesCollectorId = Boolean(collectorId && item.collectorId === collectorId);
+        const matchesWorkspacePath = Boolean(workspacePath && item.workspacePath === workspacePath);
+        // Verification sources stay out of broad inventory views, but an operator's exact
+        // identity selector must remain authoritative and auditable.
+        const matchesExactIdentity = matchesSourceId || matchesCollectorId || matchesWorkspacePath;
+        if (!query.includeVerification && !matchesExactIdentity && isVerificationSource(item)) return false;
         const matchesFilter =
           (!query.status || query.status === 'all' || item.status === query.status) &&
           (!query.type || query.type === 'all' || item.type === query.type) &&
-          (!collectorId || item.collectorId === collectorId) &&
-          (!workspacePath || item.workspacePath === workspacePath) &&
+          (!collectorId || matchesCollectorId) &&
+          (!workspacePath || matchesWorkspacePath) &&
           (!q || [item.sourceId, item.name, item.type, item.collectorId, item.workspacePath, item.owner, item.team, item.environment, item.note, ...(item.tags ?? [])].some((value) => (value ?? '').toLowerCase().includes(q)));
         if (sourceId && !hasFilter) return matchesSourceId;
         return matchesSourceId || matchesFilter;
@@ -250,7 +472,13 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
   }
 
   snapshot(): IngestionSourceRecord[] {
-    return [...this.sources.values()].map((record) => ({ ...record, tags: [...record.tags] }));
+    return [...this.sources.values()].map((record) => ({
+      ...record,
+      tags: [...record.tags],
+      ...(record.correlationClaims
+        ? { correlationClaims: normalizeCorrelationClaimsPolicy(record.correlationClaims) }
+        : {}),
+    }));
   }
 
   resolve(input: IngestionSourceResolveInput): IngestionSourceResolution {
@@ -259,31 +487,60 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     const collectorId = clean(input.collectorId, 180);
     const sourceName = cleanText(input.sourceName, 180);
     let source: IngestionSourceRecord | undefined;
+    let tokenMatched = false;
+    const finish = (
+      result: Pick<IngestionSourceResolution, 'accepted' | 'reason' | 'source'>,
+      sourceIdMismatch = false,
+    ): IngestionSourceResolution => ({
+      ...result,
+      authenticated: tokenMatched,
+      authentication: tokenMatched ? 'token' : 'none',
+      ...(correlationCaptureRollout().trustedCorrelation === 'off'
+        ? {
+            claimAuthorization: false as const,
+            claimAuthorizationReason: 'policy_disabled' as const,
+            claimAuthority: cleanClaimAuthority(input.correlationClaim?.authority),
+          }
+        : authorizeCorrelationClaims({
+            source: result.source,
+            tokenProvided: Boolean(token),
+            tokenMatched,
+            sourceIdMismatch,
+            claim: input.correlationClaim
+              ? {
+                  ...input.correlationClaim,
+                  collectorId: input.correlationClaim.collectorId ?? input.collectorId,
+                  workspacePath: input.correlationClaim.workspacePath ?? input.workspacePath,
+                }
+              : undefined,
+          })),
+    });
 
     if (token) {
       const hashed = tokenHash(token);
       source = [...this.sources.values()].find((item) => item.tokenHash === hashed);
       if (!source) {
         const hinted = sourceId ? this.sources.get(sourceId) : undefined;
-        return { accepted: false, source: hinted, reason: 'invalid source token' };
+        return finish({ accepted: false, source: hinted, reason: 'invalid source token' });
       }
+      tokenMatched = true;
       if (sourceId && source.sourceId !== sourceId) {
-        return { accepted: false, source, reason: 'source id does not match token' };
+        return finish({ accepted: false, source, reason: 'source id does not match token' }, true);
       }
     }
 
     if (!source && sourceId) source = this.sources.get(sourceId);
     if (!source) source = this.findExistingIdentity(input);
     if (!source && (collectorId || sourceName)) source = this.discover({ ...input, collectorId, sourceName });
-    if (!source) return { accepted: true };
+    if (!source) return finish({ accepted: true });
 
     if (!source.enabled) {
-      return { accepted: false, source, reason: 'source disabled' };
+      return finish({ accepted: false, source, reason: 'source disabled' });
     }
     if (source.requireToken && !token) {
-      return { accepted: false, source, reason: 'source token required' };
+      return finish({ accepted: false, source, reason: 'source token required' });
     }
-    return { accepted: true, source };
+    return finish({ accepted: true, source });
   }
 
   private findExistingIdentity(input: IngestionSourceResolveInput): IngestionSourceRecord | undefined {
@@ -403,6 +660,11 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       tokenPreview: token ? tokenPreview(token) : cur?.tokenPreview,
       tokenIssuedAt: token ? at : cur?.tokenIssuedAt,
       tokenRotationDays: 'tokenRotationDays' in input ? cleanRotationDays(input.tokenRotationDays, cur?.tokenRotationDays ?? defaultTokenRotationDays()) : cur?.tokenRotationDays ?? defaultTokenRotationDays(),
+      ...(correlationCaptureRollout().trustedCorrelation !== 'off' && input.correlationClaims !== undefined
+        ? { correlationClaims: normalizeCorrelationClaimsPolicy(input.correlationClaims, cur?.correlationClaims) }
+        : cur?.correlationClaims
+          ? { correlationClaims: normalizeCorrelationClaimsPolicy(cur.correlationClaims) }
+          : {}),
       collectorId: 'collectorId' in input ? clean(input.collectorId, 180) : cur?.collectorId,
       workspacePath: 'workspacePath' in input ? clean(input.workspacePath, 500) : cur?.workspacePath,
       owner: 'owner' in input ? cleanText(input.owner, 160) : cur?.owner,
@@ -485,6 +747,9 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       tokenPreview: clean(record.tokenPreview, 32),
       tokenIssuedAt: Number(record.tokenIssuedAt) || (record.tokenHash ? Number(record.createdAt) || Date.now() : undefined),
       tokenRotationDays: cleanRotationDays(record.tokenRotationDays, defaultTokenRotationDays()),
+      ...(record.correlationClaims
+        ? { correlationClaims: normalizeCorrelationClaimsPolicy(record.correlationClaims) }
+        : {}),
       collectorId: clean(record.collectorId, 180),
       workspacePath: clean(record.workspacePath, 500),
       owner: cleanText(record.owner, 160),
@@ -536,6 +801,9 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       tokenIssuedAt: record.tokenIssuedAt ? iso(record.tokenIssuedAt) : undefined,
       tokenRotationDueAt: rotationDueAt ? iso(rotationDueAt) : undefined,
       tokenRotationDays: record.tokenRotationDays,
+      ...(correlationCaptureRollout().trustedCorrelation !== 'off' && record.correlationClaims
+        ? { correlationClaims: normalizeCorrelationClaimsPolicy(record.correlationClaims) }
+        : {}),
       tokenAgeSecs: record.tokenIssuedAt ? Math.max(0, Math.round((Date.now() - record.tokenIssuedAt) / 1000)) : undefined,
       tokenRotationStatus: rotationStatus,
       collectorId: record.collectorId,
@@ -579,14 +847,28 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     }, 500);
   }
 
-  private async persist(): Promise<void> {
-    const records = [...this.sources.values()]
-      .sort((a, b) => b.updatedAt - a.updatedAt)
-      .slice(0, RETAIN_LIMIT);
-    await Promise.all([
-      this.ch.saveIngestionSources(records),
-      this.relational.saveIngestionSources(records),
-    ]);
+  private persist(): Promise<void> {
+    this.persistRequested = true;
+    if (!this.persistInFlight) {
+      this.persistInFlight = this.drainPersistence().finally(() => {
+        this.persistInFlight = undefined;
+        if (this.persistRequested) void this.persist();
+      });
+    }
+    return this.persistInFlight;
+  }
+
+  private async drainPersistence(): Promise<void> {
+    do {
+      this.persistRequested = false;
+      const records = [...this.sources.values()]
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, RETAIN_LIMIT);
+      await Promise.all([
+        this.ch.saveIngestionSources(records),
+        this.relational.saveIngestionSources(records),
+      ]);
+    } while (this.persistRequested);
   }
 
   private mergePersisted(record: IngestionSourceRecord): void {

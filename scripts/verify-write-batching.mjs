@@ -33,7 +33,7 @@ assert.match(
   'pending or replayed event time must not hide facts that are already durable',
 );
 assert.match(queueSource, /ANYSENTRY_RESULT_APPLY_CONCURRENCY/);
-assert.match(queueSource, /Math\.max\(1, Math\.min\(512/);
+assert.match(queueSource, /Math\.max\(8, Math\.min\(128/);
 
 const base = {
   schemaVersion: 'anysentry.agent_event.v1',

@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { KeyRound, LockKeyhole } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { createPortal } from "react-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -12,15 +12,18 @@ import { cn } from "@/lib/utils";
 export function AdminTokenControl({
   compact = false,
   navigation = false,
+  inlineNavigationPanel = false,
 }: {
   compact?: boolean;
   navigation?: boolean;
+  inlineNavigationPanel?: boolean;
 }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState("");
   const [saved, setSaved] = useState(false);
   const [navigationPanelPosition, setNavigationPanelPosition] = useState({ left: 228, top: 12 });
+  const panelId = useId();
   const { data: platformHealth } = useQuery({
     queryKey: ["platform-health"],
     queryFn: ({ signal }) => securityCenterApi.healthz(signal),
@@ -64,10 +67,13 @@ export function AdminTokenControl({
   const panel = (
     <div
       className={cn(
-        "z-50 w-[360px] max-w-[calc(100vw-2rem)] rounded-[7px] border border-white/10 bg-[#101511] p-3 text-zinc-100 shadow-2xl shadow-black/40",
-        navigation ? "fixed" : "absolute right-0 top-11",
+        "z-[100] w-[360px] max-w-[calc(100vw-2rem)] rounded-[7px] border border-white/10 bg-[#101511] p-3 text-zinc-100 shadow-2xl shadow-black/40",
+        inlineNavigationPanel
+          ? "relative mt-2 w-full max-w-none"
+          : navigation ? "fixed" : "absolute right-0 top-11",
       )}
-      style={navigation ? navigationPanelPosition : undefined}
+      id={panelId}
+      style={navigation && !inlineNavigationPanel ? navigationPanelPosition : undefined}
     >
       <div className="mb-2 flex items-center justify-between gap-3">
         <div className="min-w-0">
@@ -84,6 +90,7 @@ export function AdminTokenControl({
         type="password"
         value={draft}
         onChange={(event) => setDraft(event.target.value)}
+        autoFocus={inlineNavigationPanel}
         placeholder="ANYSENTRY_ADMIN_TOKEN"
         className="h-9 border-white/10 bg-white/5 font-mono text-xs text-zinc-100"
       />
@@ -106,20 +113,24 @@ export function AdminTokenControl({
         size={compact ? "icon-sm" : "sm"}
         title={t(enabled ? (saved ? "管理密钥已设置" : "需要管理密钥") : "管理密钥")}
         aria-expanded={open}
+        aria-controls={panelId}
         onClick={(event) => {
-          if (navigation && !open) {
+          if (navigation && !inlineNavigationPanel && !open) {
             const rect = event.currentTarget.getBoundingClientRect();
             const panelHeight = 174;
+            const panelWidth = Math.min(360, window.innerWidth - 24);
+            const preferredLeft = rect.right + 8;
             setNavigationPanelPosition({
-              left: rect.right + 8,
+              left: Math.max(12, Math.min(preferredLeft, window.innerWidth - panelWidth - 12)),
               top: Math.max(12, Math.min(rect.top, window.innerHeight - panelHeight - 12)),
             });
           }
           setOpen((value) => !value);
         }}
         className={cn(
-          compact ? "h-8 w-8" : "h-9",
+          compact ? "h-11 w-11 sm:h-8 sm:w-8" : "h-9",
           navigation && "h-auto w-full justify-start gap-2.5 rounded-md border-transparent bg-transparent px-2.5 py-2 text-left shadow-none hover:bg-[#151a23]",
+          inlineNavigationPanel && "min-h-12",
           tone,
         )}
       >
@@ -132,7 +143,7 @@ export function AdminTokenControl({
           <span className={cn(navigation && "text-xs font-semibold leading-[1.45]")}>{t("管理密钥")}</span>
         )}
       </Button>
-      {open ? (navigation ? createPortal(panel, document.body) : panel) : null}
+      {open ? (navigation && !inlineNavigationPanel ? createPortal(panel, document.body) : panel) : null}
     </div>
   );
 }

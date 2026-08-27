@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: system-context-probe
+  namespace: anysentry
+  labels:
+    app: system-context-probe
+    anysentry.io/workload-role: anysentry_internal
+    io.anysentry.observe: "false"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: system-context-probe
+  template:
+    metadata:
+      labels:
+        app: system-context-probe
+        anysentry.io/workload-role: anysentry_internal
+        io.anysentry.observe: "false"
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: probe
+          image: 127.0.0.1:5000/anysentry-context-probe:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: PROBE_INTERVAL_MS, value: "60000" }
+            - { name: PROBE_SAMPLE_COUNT, value: "5" }
+            - { name: ANYSENTRY_CONTEXT_URL, value: "http://anysentry:29653/security-center/ingest/otlp/v1/metrics" }
+            - name: ANYSENTRY_CONTEXT_SOURCE_ID
+              valueFrom: { secretKeyRef: { name: anysentry-system-context-source, key: source-id } }
+            - name: ANYSENTRY_CONTEXT_TOKEN
+              valueFrom: { secretKeyRef: { name: anysentry-system-context-source, key: source-token } }
+            - { name: CLICKHOUSE_URL, value: "http://clickhouse:8123" }
+            - name: CLICKHOUSE_USER
+              valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_USER } }
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_PASSWORD } }
+            - { name: REDIS_URL, value: "redis://redis:6379" }
+            - name: ANYSENTRY_DATABASE_URL
+              valueFrom: { secretKeyRef: { name: anysentry-database, key: ANYSENTRY_DATABASE_URL } }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: 25m, memory: 64Mi }
+            limits: { cpu: 250m, memory: 256Mi }

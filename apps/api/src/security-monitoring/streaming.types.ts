@@ -1,5 +1,5 @@
 import { DecisionResultJob, DecisionStage } from './async-judgment.types';
-import { JudgedEvent } from './types';
+import { JudgedEvent, type ClassificationSemanticsV1, type TrustedCorrelationV1 } from './types';
 
 export const STREAM_PUBLISH_QUEUE = 'anysentry-stream-publish';
 export const COMPOSITE_JUDGE_QUEUE = 'anysentry-composite-judge';
@@ -111,6 +111,11 @@ export interface CanonicalSecurityEvent {
   agentCorrelationId: string;
   sessionId: string;
   traceId: string;
+  /** Additive trusted identity; never aliases or replaces the legacy traceId. */
+  invocationId?: string;
+  toolCallId?: string;
+  correlation?: TrustedCorrelationV1;
+  classificationSemantics?: ClassificationSemanticsV1;
   spanId: string;
   eventKind: string;
   operation: CanonicalOperation;
@@ -127,6 +132,10 @@ export interface CanonicalSecurityEvent {
   argvTruncated: boolean;
   argvSource?: string;
   behaviorStage: CanonicalBehaviorStage;
+  repeatCount: number;
+  firstEventAt: number;
+  lastEventAt: number;
+  aggregationWindowMs: number;
   platformRuntime: boolean;
   synthetic: boolean;
   processIdentity: CanonicalProcessIdentity;

@@ -99,6 +99,17 @@ function isWrappedResponse(value: unknown): value is ApiResponse<unknown> {
   );
 }
 
+function unwrappedErrorMessage(value: unknown): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const message = (value as { message?: unknown }).message;
+  if (typeof message === "string" && message.trim()) return message.trim().slice(0, 500);
+  if (Array.isArray(message)) {
+    const joined = message.filter((item): item is string => typeof item === "string" && Boolean(item.trim())).join("; ");
+    return joined ? joined.slice(0, 500) : undefined;
+  }
+  return undefined;
+}
+
 /**
  * Low-level fetch against the backend. Relative paths only (the dev proxy
  * forwards `/security-center`, `/open`, `/api`). Kept public for the SSE
@@ -156,7 +167,10 @@ async function request<T>(endpoint: string, init: RequestInit, timeoutMs = REQUE
   }
 
   if (!response.ok) {
-    throw new ApiError("请求失败", response.status);
+    // Nest's framework-level 401/400 responses are intentionally not wrapped by the normal API
+    // interceptor. Preserve their bounded message so management pages can distinguish a missing
+    // token from an unavailable rule service instead of reporting every failure as "请求失败".
+    throw new ApiError(unwrappedErrorMessage(body) ?? "请求失败", response.status);
   }
 
   return body as T;

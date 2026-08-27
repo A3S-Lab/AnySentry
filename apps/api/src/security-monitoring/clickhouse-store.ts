@@ -1,14 +1,15 @@
-// Durable event store backed by ClickHouse — the system of record for judged events.
+// ClickHouse persistence for judged events. The dashboard serves reads from an in-memory hot ring;
+// this store adds a bounded in-memory write queue, retry-safe batch tokens, server-side deduplication
+// for ambiguous outcomes, and graceful shutdown drain. Persisted rows hydrate the ring on boot so
+// ordinary restarts and rollouts preserve date windows.
 //
-// ClickHouse is the durable event and judgment fact store. Historical lists and aggregates query it
-// directly; the bounded in-memory ring only contributes uncommitted low-latency facts and fallback
-// reads while ClickHouse is unavailable. It must never decide whether historical data still exists.
+// This queue is not a WAL/outbox: a process or host failure can still lose rows that had not reached
+// ClickHouse. Crash-durable delivery would require a persistent WAL/outbox and upstream replay.
 //
 // Connection comes from env (CLICKHOUSE_URL/USER/PASSWORD/DB). If ClickHouse is unreachable the store
-// degrades to in-memory-only (the dashboard keeps working; just no durability) rather than crashing.
+// degrades to in-memory-only (the dashboard keeps working; just no persistence) rather than crashing.
 
-import { ClickHouseClient, createClient } from '@clickhouse/client';
-import { Injectable, OnModuleDestroy } from '@nestjs/common';
+import { ClickHouseClient, createClient, type ClickHouseSettings } from '@clickhouse/client';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   agentIdentityKeyForEvent,
@@ -16,7 +17,11 @@ import {
   hasDirectAgentRootEvidence,
   isInternalAgentHelperRootEvent,
 } from './agent-identity';
+import { eventActivityContext, eventActivitySubtype, normalizeActivitySemantics } from './activity-context';
+import { correlationCaptureRollout } from './correlation-rollout';
+import { visibleClassificationSemantics, visibleProcessContext } from './classification-semantics';
 import { foldLatestEventRevisions } from './event-revision';
+import type { ProcessLifecycleFact } from './process-lifecycle';
 import {
   BucketCommitCursor,
   compareEventCommitCursor,
@@ -24,6 +29,12 @@ import {
   validPersistedDashboardBuckets,
 } from './persisted-dashboard-bucket';
 import { PolicyConfig } from './policy-config';
+import { parseTrustedCorrelation } from './trusted-correlation';
+import {
+  TOOL_EVIDENCE_RELATION_VERSION,
+  toolEvidenceIndexFields,
+  type ToolEvidenceItem,
+} from './tool-evidence-linker';
 import { AgentAttribution, AgentMetadataRecord, AlertRecord, AuditRecord, CollectorHeartbeatRecord, IdentityAiReviewRecord, Incident, IngestionSourceRecord, JudgedEvent, MaintenanceWindowRecord, NotificationDeliveryRecord, NotificationState, ObjectiveRecord, ProcessContext, RemediationRecord } from './types';
 
 function boundedPositiveInt(
@@ -49,6 +60,18 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   eventId String,
   sourceEventId String DEFAULT '',
   at UInt64,
+  eventAtUnixNs String DEFAULT '',
+  receivedAtUnixNs String DEFAULT '',
+  receivedAt UInt64 DEFAULT 0,
+  eventTimeQuality LowCardinality(String) DEFAULT 'api_received',
+  captureEpoch UInt64 DEFAULT 0,
+  captureProfileCode UInt8 DEFAULT 0,
+  captureActionCode UInt8 DEFAULT 0,
+  captureAuthorityCode UInt8 DEFAULT 0,
+  captureDispositionCode UInt8 DEFAULT 0,
+  captureSelected UInt8 DEFAULT 0,
+  captureFlags UInt8 DEFAULT 0,
+  capturePolicyVersion UInt64 DEFAULT 0,
   ingestedAt UInt64 DEFAULT at,
   commitBatchId String DEFAULT '',
   logicalKeyVersion UInt16 DEFAULT 1,
@@ -57,15 +80,28 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   payloadFingerprint String DEFAULT '',
   eventKind LowCardinality(String),
   eventCategory LowCardinality(String),
+  activityContext LowCardinality(String) DEFAULT if(eventKind = 'ToolExec', 'agent_action', ''),
+  activitySubtype LowCardinality(String) DEFAULT '',
   source LowCardinality(String),
   subject String,
   workspacePath String,
   agentId LowCardinality(String),
+  subjectAssetId String DEFAULT '',
+  subjectAssetType LowCardinality(String) DEFAULT '',
+  assetBindingQuality LowCardinality(String) DEFAULT '',
+  assetBindingRevision UInt64 DEFAULT 0,
+  assetBindingReason LowCardinality(String) DEFAULT '',
+  identityRevision UInt64 DEFAULT 0,
   collectorId String,
   sourceId String,
   sessionId String,
   userId String,
   traceId String,
+  invocationId String DEFAULT '',
+  toolCallId String DEFAULT '',
+  processInstanceKey String DEFAULT '',
+  correlationMethod LowCardinality(String) DEFAULT '',
+  correlationConfidence Float32 DEFAULT 0,
   spanId String,
   parentSpanId String,
   runId String,
@@ -88,7 +124,28 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   tokenCount UInt64,
   latencyMs Float64,
   attributes String,
+  classificationSemantics String DEFAULT '{}',
   process String DEFAULT '{}',
+  processHostId String DEFAULT JSONExtractString(process, 'hostId'),
+  processBootId String DEFAULT JSONExtractString(process, 'bootId'),
+  processPid UInt64 DEFAULT JSONExtractUInt(process, 'pid'),
+  processPpid UInt64 DEFAULT JSONExtractUInt(process, 'ppid'),
+  processPidNamespace String DEFAULT JSONExtractString(process, 'pidNamespace'),
+  processNamespacePid UInt64 DEFAULT JSONExtractUInt(process, 'namespacePid'),
+  processNamespacePpid UInt64 DEFAULT JSONExtractUInt(process, 'namespacePpid'),
+  processStartTimeTicks String DEFAULT JSONExtractString(process, 'startTimeTicks'),
+  processStartTimeNs String DEFAULT JSONExtractString(process, 'startTimeNs'),
+  evidenceResourceHash String DEFAULT multiIf(
+    eventKind = 'AgentTool', JSONExtractString(attributes, 'anysentry.tool.resource_hash'),
+    eventKind IN ('FileAccess', 'FileDelete') AND startsWith(JSONExtractString(attributes, 'path'), '/'),
+      lower(hex(SHA256(JSONExtractString(attributes, 'path')))),
+    ''
+  ),
+  evidenceCommandHash String DEFAULT multiIf(
+    eventKind = 'AgentTool', JSONExtractString(attributes, 'anysentry.tool.command_hash'),
+    eventKind = 'ToolExec', JSONExtractString(attributes, 'anysentry.kernel.command_hash'),
+    ''
+  ),
   attribution String DEFAULT '{}',
   agentIdentityKey String DEFAULT '',
   agentInstanceKey String DEFAULT '',
@@ -100,10 +157,42 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   agentHasInternalHelperRoot UInt8 DEFAULT 0,
   judgment String DEFAULT '{}',
   rawPreview String,
+  INDEX idx_event_id eventId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_invocation_id invocationId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_tool_call_id toolCallId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_trace_id traceId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_session_id sessionId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_run_id runId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_subject_asset_id subjectAssetId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_agent_instance_key agentInstanceKey TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_process_boot_id processBootId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_process_pid_namespace processPidNamespace TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_process_host_id processHostId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_evidence_resource_hash evidenceResourceHash TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_evidence_command_hash evidenceCommandHash TYPE bloom_filter(0.01) GRANULARITY 1,
   ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000))
 ) ENGINE = MergeTree
 ORDER BY at
-TTL ts + INTERVAL 90 DAY`;
+TTL ts + INTERVAL 90 DAY
+SETTINGS non_replicated_deduplication_window = 1000`;
+
+const EVENT_DEDUPLICATION_WINDOW = 1_000;
+const EVENT_WRITE_BATCH_ROWS = 500;
+const EVENT_WRITE_BATCH_BYTES = 4 * 1024 * 1024;
+// The API pod has a 512 MiB cgroup limit and already retains a wide 10k-event hot ring. Bound the
+// asynchronous ClickHouse payload separately by both rows and serialized bytes; JavaScript object
+// overhead is intentionally not claimed as an exact heap measurement.
+const EVENT_WRITE_MAX_BUFFERED_ROWS = 5_000;
+const EVENT_WRITE_MAX_BUFFERED_BYTES = 32 * 1024 * 1024;
+const EVENT_WRITE_RETRY_DEADLINE_MS = 15_000;
+// Full-file live validation observed rare successful local inserts at 5.8–6.7s. Aborting them at
+// 5s creates an unnecessary ambiguous retry just before QueryFinish. Keep one attempt below the
+// Forwarder 10s request deadline and the writer's independent 15s total retry deadline.
+const EVENT_WRITE_ATTEMPT_TIMEOUT_MS = 8_000;
+const EVENT_WRITE_RETRY_COOLDOWN_MS = 2_000;
+const EVENT_WRITE_CLOSE_DEADLINE_MS = 20_000;
+const EVENT_WRITE_BACKOFF_BASE_MS = 250;
+const EVENT_WRITE_BACKOFF_MAX_MS = 2_000;
 
 const EVENT_ALTERS = [
   'ADD COLUMN IF NOT EXISTS schemaVersion LowCardinality(String) DEFAULT \'anysentry.agent_event.v1\'',
@@ -115,11 +204,36 @@ const EVENT_ALTERS = [
   'ADD COLUMN IF NOT EXISTS eventLogicalKey String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS payloadFingerprintVersion UInt16 DEFAULT 1',
   'ADD COLUMN IF NOT EXISTS payloadFingerprint String DEFAULT \'\'',
+  "ADD COLUMN IF NOT EXISTS eventAtUnixNs String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS receivedAtUnixNs String DEFAULT ''",
+  'ADD COLUMN IF NOT EXISTS receivedAt UInt64 DEFAULT 0',
+  "ADD COLUMN IF NOT EXISTS eventTimeQuality LowCardinality(String) DEFAULT 'api_received'",
+  'ADD COLUMN IF NOT EXISTS captureEpoch UInt64 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS captureProfileCode UInt8 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS captureActionCode UInt8 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS captureAuthorityCode UInt8 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS captureDispositionCode UInt8 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS captureSelected UInt8 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS captureFlags UInt8 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS capturePolicyVersion UInt64 DEFAULT 0',
   'ADD COLUMN IF NOT EXISTS eventCategory LowCardinality(String) DEFAULT \'unknown\'',
+  "ADD COLUMN IF NOT EXISTS activityContext LowCardinality(String) DEFAULT if(eventKind = 'ToolExec', 'agent_action', '')",
+  "ADD COLUMN IF NOT EXISTS activitySubtype LowCardinality(String) DEFAULT ''",
   'ADD COLUMN IF NOT EXISTS source LowCardinality(String) DEFAULT \'observer\'',
   'ADD COLUMN IF NOT EXISTS collectorId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS sourceId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS subjectAssetId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS subjectAssetType LowCardinality(String) DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS assetBindingQuality LowCardinality(String) DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS assetBindingRevision UInt64 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS assetBindingReason LowCardinality(String) DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS identityRevision UInt64 DEFAULT 0',
   'ADD COLUMN IF NOT EXISTS traceId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS invocationId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS toolCallId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS processInstanceKey String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS correlationMethod LowCardinality(String) DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS correlationConfidence Float32 DEFAULT 0',
   'ADD COLUMN IF NOT EXISTS spanId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS parentSpanId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS runId String DEFAULT \'\'',
@@ -130,7 +244,28 @@ const EVENT_ALTERS = [
   'ADD COLUMN IF NOT EXISTS decisionRevision UInt32 DEFAULT 1',
   'ADD COLUMN IF NOT EXISTS decisionUpdatedAt UInt64 DEFAULT at',
   'ADD COLUMN IF NOT EXISTS attributes String DEFAULT \'{}\'',
+  'ADD COLUMN IF NOT EXISTS classificationSemantics String DEFAULT \'{}\'',
   'ADD COLUMN IF NOT EXISTS process String DEFAULT \'{}\'',
+  "ADD COLUMN IF NOT EXISTS processHostId String DEFAULT JSONExtractString(process, 'hostId')",
+  "ADD COLUMN IF NOT EXISTS processBootId String DEFAULT JSONExtractString(process, 'bootId')",
+  "ADD COLUMN IF NOT EXISTS processPid UInt64 DEFAULT JSONExtractUInt(process, 'pid')",
+  "ADD COLUMN IF NOT EXISTS processPpid UInt64 DEFAULT JSONExtractUInt(process, 'ppid')",
+  "ADD COLUMN IF NOT EXISTS processPidNamespace String DEFAULT JSONExtractString(process, 'pidNamespace')",
+  "ADD COLUMN IF NOT EXISTS processNamespacePid UInt64 DEFAULT JSONExtractUInt(process, 'namespacePid')",
+  "ADD COLUMN IF NOT EXISTS processNamespacePpid UInt64 DEFAULT JSONExtractUInt(process, 'namespacePpid')",
+  "ADD COLUMN IF NOT EXISTS processStartTimeTicks String DEFAULT JSONExtractString(process, 'startTimeTicks')",
+  "ADD COLUMN IF NOT EXISTS processStartTimeNs String DEFAULT JSONExtractString(process, 'startTimeNs')",
+  `ADD COLUMN IF NOT EXISTS evidenceResourceHash String DEFAULT multiIf(
+    eventKind = 'AgentTool', JSONExtractString(attributes, 'anysentry.tool.resource_hash'),
+    eventKind IN ('FileAccess', 'FileDelete') AND startsWith(JSONExtractString(attributes, 'path'), '/'),
+      lower(hex(SHA256(JSONExtractString(attributes, 'path')))),
+    ''
+  )`,
+  `ADD COLUMN IF NOT EXISTS evidenceCommandHash String DEFAULT multiIf(
+    eventKind = 'AgentTool', JSONExtractString(attributes, 'anysentry.tool.command_hash'),
+    eventKind = 'ToolExec', JSONExtractString(attributes, 'anysentry.kernel.command_hash'),
+    ''
+  )`,
   'ADD COLUMN IF NOT EXISTS attribution String DEFAULT \'{}\'',
   `ADD COLUMN IF NOT EXISTS agentIdentityKey String DEFAULT multiIf(
     JSONExtractString(attribution, 'physicalWorkloadId') != '', JSONExtractString(attribution, 'physicalWorkloadId'),
@@ -213,16 +348,38 @@ const EVENT_ALTERS = [
     )
     AND JSONExtractUInt(process, 'pid') = JSONExtractUInt(attribution, 'rootPid')
   )`,
-  `MODIFY COLUMN IF EXISTS agentHasInternalHelperRoot UInt8 DEFAULT toUInt8(
-    (
-      positionCaseInsensitive(attributes, '--codex-run-as-fs-helper') > 0
-      OR positionCaseInsensitive(attributes, 'codex-linux-sandbox') > 0
-    )
-    AND JSONExtractUInt(process, 'pid') = JSONExtractUInt(attribution, 'rootPid')
-  )`,
   'ADD COLUMN IF NOT EXISTS judgment String DEFAULT \'{}\'',
   'ADD COLUMN IF NOT EXISTS rawPreview String DEFAULT \'\'',
+  'ADD INDEX IF NOT EXISTS idx_event_id eventId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_invocation_id invocationId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_tool_call_id toolCallId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_trace_id traceId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_session_id sessionId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_run_id runId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_subject_asset_id subjectAssetId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_agent_instance_key agentInstanceKey TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_process_boot_id processBootId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_process_pid_namespace processPidNamespace TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_process_host_id processHostId TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_evidence_resource_hash evidenceResourceHash TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_evidence_command_hash evidenceCommandHash TYPE bloom_filter(0.01) GRANULARITY 1',
 ];
+const EVENT_EVIDENCE_INDEX_NAMES = [
+  'idx_event_id',
+  'idx_invocation_id',
+  'idx_tool_call_id',
+  'idx_trace_id',
+  'idx_session_id',
+  'idx_run_id',
+  'idx_subject_asset_id',
+  'idx_agent_instance_key',
+  'idx_process_boot_id',
+  'idx_process_pid_namespace',
+  'idx_process_host_id',
+  'idx_evidence_resource_hash',
+  'idx_evidence_command_hash',
+] as const;
+const EVENT_EVIDENCE_INDEX_MIGRATION_KEY = 'schema.events.evidence_indexes.v3';
 
 const COLLECTOR_HEARTBEAT_TABLE = 'collector_heartbeats';
 const COLLECTOR_HEARTBEAT_DDL = `CREATE TABLE IF NOT EXISTS ${COLLECTOR_HEARTBEAT_TABLE} (
@@ -280,10 +437,8 @@ const AUDIT_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${AUDIT_FACT_TABLE} (
 ORDER BY (auditId, at, ingestedAt)
 TTL ts + INTERVAL 365 DAY`;
 
-// A compact, append-only invalidation journal maintained by ClickHouse itself. Because the
-// materialized view is part of the event insert pipeline it also observes revisions written by
-// Fast Judge/L3 processes; an API-local generation counter would miss those cross-process writes.
-// The table is not an event store and is safe to retain for a much shorter period than evidence.
+// The journal observes inserts from every judge process, so cache invalidation is not limited to
+// this API process's local write queue.
 const EVENT_COMMIT_FACT_TABLE = 'event_commit_facts_v2';
 const EVENT_COMMIT_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_COMMIT_FACT_TABLE} (
   eventId String,
@@ -358,10 +513,6 @@ AS SELECT
 FROM ${TABLE}
 WHERE eventLogicalKey != '' AND payloadFingerprint != ''`;
 
-// Source progress is deliberately separate from the event store. It describes only the greatest
-// business event time that ClickHouse has observed for each source/collector pair; it is not an
-// arrival-completeness watermark. Aggregating states make the one-off historical backfill and the
-// live MV overlap idempotently, so startup never needs to GROUP BY the events table again.
 const SOURCE_COMMIT_PROGRESS_TABLE = 'source_commit_progress';
 const SOURCE_COMMIT_PROGRESS_DDL = `CREATE TABLE IF NOT EXISTS ${SOURCE_COMMIT_PROGRESS_TABLE} (
   sourceId String,
@@ -383,11 +534,103 @@ AS SELECT
 FROM ${EVENT_COMMIT_FACT_TABLE}
 GROUP BY sourceId, collectorId`;
 
-// Complete aggregate snapshots, not incrementally accumulated counters. One JSON payload represents
-// the whole event-time bucket at a proven commit cursor, so a later revision can replace the bucket
-// without leaving the previous decision counted. The commit journal remains the authority that
-// determines whether a stored snapshot is still reusable.
+const TOOL_EVIDENCE_RELATION_TABLE = 'tool_evidence_relations';
+const TOOL_EVIDENCE_RELATION_DDL = `CREATE TABLE IF NOT EXISTS ${TOOL_EVIDENCE_RELATION_TABLE} (
+  invocationId String,
+  toolCallId String,
+  workspacePath String,
+  sourceId String,
+  agentInstanceId String,
+  relationVersion UInt32,
+  evidenceVersion String,
+  itemCount UInt32,
+  updatedAt UInt64,
+  payload String,
+  ts DateTime MATERIALIZED toDateTime(intDiv(updatedAt, 1000))
+) ENGINE = ReplacingMergeTree(updatedAt)
+ORDER BY (invocationId, workspacePath, sourceId, agentInstanceId, toolCallId, relationVersion)
+TTL ts + INTERVAL 90 DAY`;
+
+const PROCESS_LIFECYCLE_FACT_TABLE = 'process_lifecycle_facts';
+const PROCESS_LIFECYCLE_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${PROCESS_LIFECYCLE_FACT_TABLE} (
+  factId String,
+  eventId String,
+  sourceEventId String,
+  factKind LowCardinality(String),
+  at UInt64,
+  receivedAt UInt64,
+  source LowCardinality(String),
+  sourceId String,
+  collectorId String,
+  workspacePath String,
+  subjectAssetId String DEFAULT '',
+  subjectAssetType LowCardinality(String) DEFAULT '',
+  assetBindingQuality LowCardinality(String) DEFAULT '',
+  assetBindingRevision UInt64 DEFAULT 0,
+  assetBindingReason LowCardinality(String) DEFAULT '',
+  runtimeInstanceId String DEFAULT '',
+  rootProcess UInt8 DEFAULT 0,
+  identityRevision UInt64 DEFAULT 0,
+  processInstanceKey String,
+  physicalWorkloadId String,
+  hostId String,
+  bootId String,
+  pid UInt64,
+  ppid UInt64,
+  pidNamespace String,
+  namespacePid UInt64,
+  namespacePpid UInt64,
+  startTime String,
+  lifecycleSource LowCardinality(String),
+  exitStatus UInt32 DEFAULT 0,
+  exitStatusPresent UInt8 DEFAULT 0,
+  exitSignal UInt32 DEFAULT 0,
+  exitSignalPresent UInt8 DEFAULT 0,
+  executableHash String,
+  commandHash String,
+  ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000)),
+  INDEX idx_process_lifecycle_instance processInstanceKey TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_process_lifecycle_workload physicalWorkloadId TYPE bloom_filter(0.01) GRANULARITY 1
+) ENGINE = ReplacingMergeTree(receivedAt)
+ORDER BY (processInstanceKey, factKind, at, eventId)
+TTL ts + INTERVAL 30 DAY`;
+
+const PROCESS_LIFECYCLE_FACT_ALTERS = [
+  'MODIFY COLUMN exitStatus UInt32 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS exitStatusPresent UInt8 DEFAULT 0 AFTER exitStatus',
+  'ADD COLUMN IF NOT EXISTS exitSignal UInt32 DEFAULT 0 AFTER exitStatusPresent',
+  'ADD COLUMN IF NOT EXISTS exitSignalPresent UInt8 DEFAULT 0 AFTER exitSignal',
+  'ADD COLUMN IF NOT EXISTS subjectAssetId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS subjectAssetType LowCardinality(String) DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS assetBindingQuality LowCardinality(String) DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS assetBindingRevision UInt64 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS assetBindingReason LowCardinality(String) DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS runtimeInstanceId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS rootProcess UInt8 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS identityRevision UInt64 DEFAULT 0',
+];
+
+// Startup progress hydration must stay independent of the cardinality of the 90-day event table.
+// The commit journal is ordered by committedAt, so this compatibility sample reads a deterministic
+// recent prefix even when the materialized view was added after an older events table already
+// existed. It deliberately remains an observed-progress sample, never a completeness claim.
+const EVENT_COMMIT_PROGRESS_HYDRATE_ROWS = 100_000;
+
+// These are complete, commit-cursor-qualified bucket snapshots. Revisions replace the complete
+// snapshot rather than incrementing a counter, which keeps late judgment updates exact.
 const DASHBOARD_BUCKET_SNAPSHOT_TABLE = 'dashboard_bucket_snapshots';
+// Cold dashboard snapshots are built from the raw, revisioned event table. At production
+// full-file volume a ten-minute fold can approach 400 MiB and monopolise ClickHouse long enough to
+// delay ingestion and the Observer control plane. A request only schedules a single-flight worker
+// over a few one-minute chunks, returns an explicit hot/partial response immediately, and later
+// refreshes resume from the durable buckets already written by earlier workers.
+const DASHBOARD_BUCKET_BUILD_CHUNK_MS = 60_000;
+const DASHBOARD_BUCKET_BUILD_MAX_CHUNKS = 1;
+// DashboardHistory asks for current + previous comparison windows. More than one hour of absolute
+// 10-second facts expands tens of MiB of factsJson in Node and can stall health/control requests.
+// Longer presets remain available through durable Event search and return an explicit hot/partial
+// dashboard until a compact window-level snapshot format is introduced.
+const DASHBOARD_PERSISTED_READ_MAX_BUCKETS = 360;
 const DASHBOARD_BUCKET_SNAPSHOT_DDL = `CREATE TABLE IF NOT EXISTS ${DASHBOARD_BUCKET_SNAPSHOT_TABLE} (
   bucketStart UInt64,
   bucketMs UInt32,
@@ -414,16 +657,95 @@ ORDER BY (
 )
 TTL ts + INTERVAL 14 DAY`;
 
-type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'process' | 'attribution' | 'judgment' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview'> & {
+// Dashboard reads must coexist with sustained Observer writes inside the bundled 2 GiB
+// ClickHouse budget. Large window aggregations spill early and use at most two read threads;
+// otherwise several dashboard panels can collectively consume the server budget and evict one
+// another before any result is returned.
+const BOUNDED_DASHBOARD_READ_SETTINGS: ClickHouseSettings = {
+  max_threads: 2,
+  max_memory_usage: String(384 * 1024 * 1024),
+  max_bytes_before_external_group_by: String(64 * 1024 * 1024),
+  max_bytes_before_external_sort: String(64 * 1024 * 1024),
+  min_bytes_to_use_direct_io: String(1024 * 1024),
+  max_execution_time: 25,
+};
+
+// Raw snapshot bootstrap is lower priority than both event ingestion and already-materialised
+// dashboard reads. A one-minute chunk fits this tighter budget under the sustained full-file test;
+// if it does not, the caller returns the bounded hot view instead of raising the budget or retrying
+// another raw scan in the same request.
+const BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS: ClickHouseSettings = {
+  max_threads: 1,
+  max_memory_usage: String(128 * 1024 * 1024),
+  max_bytes_before_external_group_by: String(32 * 1024 * 1024),
+  max_bytes_before_external_sort: String(32 * 1024 * 1024),
+  min_bytes_to_use_direct_io: String(1024 * 1024),
+  max_execution_time: 5,
+};
+
+// Session/workspace queries materialize wider per-event state. Small blocks keep each below its
+// query budget; running only these two one-thread reads together keeps the cold dashboard under
+// the browser deadline without restoring the previous four-query fan-out.
+const BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS: ClickHouseSettings = {
+  ...BOUNDED_DASHBOARD_READ_SETTINGS,
+  max_threads: 1,
+  max_block_size: '1024',
+  preferred_block_size_bytes: String(1024 * 1024),
+};
+
+// Recent event reads also materialize wide rows. Moving-window production samples exceeded the
+// shared 384 MiB budget by up to 2.5 MiB, so only this path gets a measured 448 MiB ceiling while
+// retaining one thread and small blocks.
+const BOUNDED_RECENT_READ_SETTINGS: ClickHouseSettings = {
+  ...BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
+  max_memory_usage: String(448 * 1024 * 1024),
+};
+
+// Durable searches manually late-materialize wide rows: the candidate sort carries only row
+// locators and judgment keys, then the outer PREWHERE fetches the selected physical revisions.
+// A 512 MiB ceiling bounds the locator set and at most 10k final JSON rows without restoring the
+// former 640 MiB SELECT-* sort budget.
+const BOUNDED_EVENT_SEARCH_READ_SETTINGS: ClickHouseSettings = {
+  ...BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
+  max_memory_usage: String(512 * 1024 * 1024),
+};
+
+const BOUNDED_BOOTSTRAP_PROGRESS_READ_SETTINGS: ClickHouseSettings = {
+  max_threads: 1,
+  max_memory_usage: String(128 * 1024 * 1024),
+  max_execution_time: 15,
+};
+
+const BOUNDED_TOOL_EVIDENCE_RELATION_SETTINGS: ClickHouseSettings = {
+  max_threads: 1,
+  max_memory_usage: String(64 * 1024 * 1024),
+  max_execution_time: 2,
+};
+
+// Startup restores only the latest bounded structural facts. The production 30-minute window was
+// measured just above the 64 MiB point-lookup budget, so keep a separate one-thread ceiling rather
+// than weakening ToolEvidence's 2-second/64 MiB query contract.
+const BOUNDED_PROCESS_LIFECYCLE_READ_SETTINGS: ClickHouseSettings = {
+  max_threads: 1,
+  max_memory_usage: String(96 * 1024 * 1024),
+  max_execution_time: 5,
+};
+
+const MAX_DURABLE_EVENT_SEARCH_ROWS = 10_000;
+
+type Row = Omit<JudgedEvent, 'activityContext' | 'activitySubtype' | 'actionKind' | 'actionTarget' | 'attributes' | 'classificationSemantics' | 'process' | 'attribution' | 'judgment' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview' | 'invocationId' | 'toolCallId' | 'captureSelected' | 'subjectAssetType' | 'assetBindingQuality'> & {
   ingestedAt: number;
   commitBatchId: string;
   logicalKeyVersion: number;
   eventLogicalKey: string;
   payloadFingerprintVersion: number;
   payloadFingerprint: string;
+  activityContext: string;
+  activitySubtype: string;
   actionKind: string;
   actionTarget: string;
   attributes: string;
+  classificationSemantics: string;
   process: string;
   attribution: string;
   agentIdentityKey: string;
@@ -437,10 +759,52 @@ type Row = Omit<JudgedEvent, 'actionKind' | 'actionTarget' | 'attributes' | 'pro
   judgment: string;
   collectorId: string;
   sourceId: string;
+  subjectAssetType: string;
+  assetBindingQuality: string;
+  invocationId: string;
+  toolCallId: string;
+  processInstanceKey: string;
+  processHostId: string;
+  processBootId: string;
+  processPid: number;
+  processPpid: number;
+  processPidNamespace: string;
+  processNamespacePid: number;
+  processNamespacePpid: number;
+  processStartTimeTicks: string;
+  processStartTimeNs: string;
+  evidenceResourceHash: string;
+  evidenceCommandHash: string;
+  correlationMethod: string;
+  correlationConfidence: number;
+  captureSelected: number;
   parentSpanId: string;
   taskId: string;
   rawPreview: string;
 };
+
+interface QueuedEventRow {
+  row: Row;
+  bytes: number;
+}
+
+interface EventWriteWaiter {
+  resolve: () => void;
+  reject: (error: Error) => void;
+}
+
+interface EventWriteBatch {
+  rows: Row[];
+  bytes: number;
+  token: string;
+  settings: ClickHouseSettings;
+  source: 'buffered' | 'direct';
+  waiters: EventWriteWaiter[];
+  retryNotBefore: number;
+  createdAt: number;
+  lastError?: Error;
+}
+
 interface ImmediateWrite {
   row: Row;
   eventAt: number;
@@ -468,44 +832,52 @@ export interface EventBatchReceipt {
   };
 }
 
-export interface EventWriteBatchStatus {
-  schemaVersion: 'anysentry.event-write-batch.v1';
-  enabled: boolean;
-  revisionImmutabilityEnforced: boolean;
-  maxRows: number;
-  maxDelayMs: number;
-  maxBytes: number;
-  queuedRows: number;
-  queuedBytes: number;
-  pendingReceipts: number;
-  oldestQueuedMs: number;
-  inFlight: boolean;
-  batches: number;
-  rows: number;
-  bytes: number;
-  retries: number;
-  failures: number;
-  conflicts: number;
-  backpressureRejects: number;
-  lastDurableAt?: number;
+const EVENT_REVISION_DIGEST_CACHE_SIZE = 20_000;
+const EVENT_REVISION_CONFLICT = 'ANYSENTRY_EVENT_REVISION_CONFLICT';
+const EVENT_WRITE_BATCH_TOO_LARGE = 'ANYSENTRY_CLICKHOUSE_EVENT_BATCH_TOO_LARGE';
+
+interface EventWriteErrorDecision {
+  retryable: boolean;
+  ambiguous: boolean;
+  code: string;
 }
 export type IncidentState = Pick<Incident, 'incidentId' | 'status' | 'owner' | 'note' | 'acknowledgedAt' | 'resolvedAt' | 'updatedAt'>;
 export interface StoredEventQuery {
   sinceMs: number;
   untilMs: number;
   monitoredOnly?: boolean;
+  /** Narrow locator/revision candidates scanned before full evidence rows are materialised. */
+  candidateLimit?: number;
   eventId?: string;
   sourceId?: string;
   collectorId?: string;
   agentId?: string;
+  subjectAssetId?: string;
   /** Stable concrete runtime identity. Unlike display agentId, this is safe to push down. */
   agentInstanceId?: string;
   sessionId?: string;
   workspacePath?: string;
   traceId?: string;
+  /** Trusted invocation identity. This is independent from the legacy traceId predicate. */
+  invocationId?: string;
+  /** Authenticated Agent adapter ToolCall identity. */
+  toolCallId?: string;
+  /** Bounded S6 evidence lookup predicates over server-derived scalar columns. */
+  processHostId?: string;
+  processBootId?: string;
+  processPid?: number;
+  processPpid?: number;
+  processPidNamespace?: string;
+  processNamespacePid?: number;
+  processNamespacePpid?: number;
+  processStartTimeTicks?: string;
+  processStartTimeNs?: string;
+  evidenceResourceHashes?: string[];
+  evidenceCommandHashes?: string[];
   runId?: string;
   eventKind?: string;
   eventCategory?: string;
+  activityContext?: string;
   verdict?: string;
   tier?: string;
   limit: number;
@@ -518,11 +890,210 @@ export interface StoredEventSearchResult {
   unavailable?: boolean;
 }
 
+export interface StoredToolEvidenceRelations {
+  items: ToolEvidenceItem[];
+  evidenceVersion?: string;
+  updatedAt?: number;
+}
+
+export interface ToolEvidenceRelationScope {
+  workspacePath?: string;
+  sourceId?: string;
+  agentInstanceId?: string;
+}
+
 export interface CommittedSourceProgress {
   sourceId?: string;
   collectorId?: string;
   committedEventTimeMs: number;
   committedAtMs: number;
+}
+
+interface ClickHouseBootstrapConfig {
+  url: string;
+  database: string;
+  username: string;
+  password: string;
+}
+
+interface ClickHouseBootstrapState {
+  committedSourceProgress: CommittedSourceProgress[];
+}
+
+// Nest can construct several services that each own a ClickHouseStore. Schema work and startup
+// progress hydration belong to the process/database target, not to an individual writer. Share only
+// the active operation: a later reconnect must validate/rebuild schema against the current server
+// and hydrate fresh journal progress rather than reusing a successful but stale snapshot forever.
+// The target digest includes credentials without retaining a plaintext password in a module-level
+// map key.
+const clickHouseBootstrapByTarget = new Map<string, Promise<ClickHouseBootstrapState>>();
+
+function clickHouseBootstrapTargetKey(config: ClickHouseBootstrapConfig): string {
+  return createHash('sha256')
+    .update(JSON.stringify([config.url, config.database, config.username, config.password]))
+    .digest('hex');
+}
+
+function sharedClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promise<ClickHouseBootstrapState> {
+  const key = clickHouseBootstrapTargetKey(config);
+  const current = clickHouseBootstrapByTarget.get(key);
+  if (current) return current;
+
+  const operation = runClickHouseBootstrap(config);
+  clickHouseBootstrapByTarget.set(key, operation);
+  void operation.finally(() => {
+    if (clickHouseBootstrapByTarget.get(key) === operation) clickHouseBootstrapByTarget.delete(key);
+  }).catch(() => undefined);
+  return operation;
+}
+
+async function runClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promise<ClickHouseBootstrapState> {
+  const credentials = { username: config.username, password: config.password };
+  let boot: ClickHouseClient | undefined;
+  let schema: ClickHouseClient | undefined;
+  try {
+    boot = createClient({ url: config.url, ...credentials });
+    await boot.command({ query: `CREATE DATABASE IF NOT EXISTS ${config.database}` });
+    await boot.close();
+    boot = undefined;
+
+    schema = createClient({
+      url: config.url,
+      database: config.database,
+      ...credentials,
+    });
+    await schema.command({ query: DDL(TABLE) });
+    // One metadata transaction is materially cheaper than dozens of sequential ALTERs on a busy
+    // MergeTree. Every operation is idempotent, so rolling versions retain the same compatibility.
+    await schema.command({ query: `ALTER TABLE ${TABLE} ${EVENT_ALTERS.join(', ')}` });
+    await schema.command({
+      query: `ALTER TABLE ${TABLE} MODIFY SETTING non_replicated_deduplication_window = ${EVENT_DEDUPLICATION_WINDOW}`,
+    });
+    await schema.command({ query: CONFIG_DDL });
+    try {
+      const migrationResult = await schema.query({
+        query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = {key:String} LIMIT 1`,
+        query_params: { key: EVENT_EVIDENCE_INDEX_MIGRATION_KEY },
+        clickhouse_settings: BOUNDED_BOOTSTRAP_PROGRESS_READ_SETTINGS,
+        format: 'JSONEachRow',
+      });
+      const migrationRows = (await migrationResult.json()) as Array<{ value?: string }>;
+      if (!['scheduled', 'complete'].includes(migrationRows[0]?.value ?? '')) {
+        await schema.command({
+          query: `ALTER TABLE ${TABLE} ${EVENT_EVIDENCE_INDEX_NAMES
+            .map((name) => `MATERIALIZE INDEX ${name}`)
+            .join(', ')}`,
+          // Backfilling ninety days of parts is a server-side mutation and may take minutes. The
+          // indexed query remains correct while it runs, so bootstrap must schedule it once rather
+          // than blocking every API replica behind the HTTP command timeout.
+          clickhouse_settings: { mutations_sync: '0' },
+        });
+        await schema.insert({
+          table: CONFIG_TABLE,
+          values: [{
+            key: EVENT_EVIDENCE_INDEX_MIGRATION_KEY,
+            value: 'scheduled',
+            updated_at: Date.now(),
+          }],
+          format: 'JSONEachRow',
+        });
+      }
+    } catch (error) {
+      // Existing data remains queryable without materialized skipping indexes. Do not claim the
+      // migration complete; a later healthy bootstrap retries it.
+      console.warn('[clickhouse] evidence index backfill deferred:',
+        error instanceof Error ? error.message : String(error));
+    }
+    await schema.command({ query: COLLECTOR_HEARTBEAT_DDL });
+    await schema.command({ query: NOTIFICATION_DELIVERY_DDL });
+    await schema.command({ query: IDENTITY_AI_REVIEW_DDL });
+    await schema.command({ query: AUDIT_FACT_DDL });
+    await schema.command({ query: EVENT_COMMIT_FACT_DDL });
+    await schema.command({ query: EVENT_COMMIT_FACT_MV_DDL });
+    await schema.command({ query: EVENT_REVISION_CONFLICT_DDL });
+    await schema.command({ query: EVENT_REVISION_IDENTITY_DDL });
+    await schema.command({ query: EVENT_REVISION_IDENTITY_MV_DDL });
+    await schema.command({ query: SOURCE_COMMIT_PROGRESS_DDL });
+    await schema.command({ query: SOURCE_COMMIT_PROGRESS_MV_DDL });
+    await schema.command({ query: TOOL_EVIDENCE_RELATION_DDL });
+    await schema.command({ query: PROCESS_LIFECYCLE_FACT_DDL });
+    await schema.command({
+      query: `ALTER TABLE ${PROCESS_LIFECYCLE_FACT_TABLE} ${PROCESS_LIFECYCLE_FACT_ALTERS.join(', ')}`,
+    });
+    await schema.command({ query: DASHBOARD_BUCKET_SNAPSHOT_DDL });
+    await schema.command({
+      query: `ALTER TABLE ${DASHBOARD_BUCKET_SNAPSHOT_TABLE}
+        ADD COLUMN IF NOT EXISTS snapshotCommitBatchId String DEFAULT ''
+        AFTER snapshotCommittedAt`,
+    });
+    await schema.command({
+      query: `ALTER TABLE ${DASHBOARD_BUCKET_SNAPSHOT_TABLE}
+        ADD COLUMN IF NOT EXISTS snapshotSchemaVersion LowCardinality(String)
+        DEFAULT 'anysentry.dashboard-bucket-snapshot.v2' AFTER snapshotVersion`,
+    });
+    await schema.command({
+      query: `ALTER TABLE ${DASHBOARD_BUCKET_SNAPSHOT_TABLE}
+        ADD COLUMN IF NOT EXISTS status LowCardinality(String) DEFAULT 'ready'
+        AFTER snapshotSchemaVersion`,
+    });
+    await schema.command({
+      query: `ALTER TABLE ${DASHBOARD_BUCKET_SNAPSHOT_TABLE}
+        ADD COLUMN IF NOT EXISTS payloadChecksum String DEFAULT ''
+        AFTER factsJson`,
+    });
+
+    // A materialized view does not retroactively populate rows that predate its creation. Read only
+    // a bounded recent journal prefix for per-source observed progress. Missing older sources stay
+    // absent instead of being presented as complete coverage. In particular this partial journal
+    // must not initialize the global committed cutoff: without an explicit full-backfill marker the
+    // dashboard safely performs its ordinary durable query rather than truncating at a false split.
+    let committedSourceProgress: CommittedSourceProgress[] = [];
+    try {
+      const progress = await schema.query({
+        query: `
+          SELECT
+            sourceId,
+            collectorId,
+            max(eventAt) AS committedThrough,
+            max(committedAt) AS committedAt
+          FROM (
+            SELECT sourceId, collectorId, eventAt, committedAt
+            FROM ${EVENT_COMMIT_FACT_TABLE}
+            ORDER BY committedAt DESC, commitBatchId DESC, eventId DESC, decisionRevision DESC
+            LIMIT {journalRows:UInt32}
+          )
+          GROUP BY sourceId, collectorId`,
+        query_params: { journalRows: EVENT_COMMIT_PROGRESS_HYDRATE_ROWS },
+        clickhouse_settings: BOUNDED_BOOTSTRAP_PROGRESS_READ_SETTINGS,
+        format: 'JSONEachRow',
+      });
+      const progressRows = (await progress.json()) as Array<{
+        sourceId?: string;
+        collectorId?: string;
+        committedThrough?: string | number;
+        committedAt?: string | number;
+      }>;
+      committedSourceProgress = progressRows.flatMap((row): CommittedSourceProgress[] => {
+        const committedEventTimeMs = Number(row.committedThrough);
+        if (!Number.isFinite(committedEventTimeMs) || committedEventTimeMs <= 0) return [];
+        return [{
+          sourceId: row.sourceId?.trim() || undefined,
+          collectorId: row.collectorId?.trim() || undefined,
+          committedEventTimeMs,
+          committedAtMs: Number(row.committedAt) || committedEventTimeMs,
+        }];
+      });
+    } catch (error) {
+      // Progress is query metadata, not a prerequisite for durable reads/writes. Failing closed to
+      // no boundary is correct and lets a healthy schema/client become ready under read pressure.
+      console.warn('[clickhouse] bounded startup progress hydration unavailable:',
+        error instanceof Error ? error.message : String(error));
+    }
+    return { committedSourceProgress };
+  } finally {
+    await boot?.close().catch(() => undefined);
+    await schema?.close().catch(() => undefined);
+  }
 }
 
 export interface EventCommitCursor {
@@ -621,36 +1192,32 @@ function eligibleAgentRuntimeRows(
       ? `instance\u0000${instances.join('\u0001')}`
       : `identity\u0000${String(row.identityKey ?? '')}`;
   };
-  const runtimeEvidence = new Map<
+  const evidenceByRuntime = new Map<
     string,
-    { hasPhysicalIdentity: boolean; hasRootIdentity: boolean; hasInternalHelperRoot: boolean }
+    { physical: boolean; root: boolean; helper: boolean }
   >();
   for (const row of rows) {
     const key = groupFor(row);
-    const current = runtimeEvidence.get(key) ?? {
-      hasPhysicalIdentity: false,
-      hasRootIdentity: false,
-      hasInternalHelperRoot: false,
+    const evidence = evidenceByRuntime.get(key) ?? {
+      physical: false,
+      root: false,
+      helper: false,
     };
-    current.hasPhysicalIdentity ||= Boolean(Number(row.hasPhysicalIdentity) || 0);
-    current.hasRootIdentity ||= Boolean(Number(row.hasRootIdentity) || 0);
-    current.hasInternalHelperRoot ||= Boolean(Number(row.hasInternalHelperRootFlag) || 0);
-    runtimeEvidence.set(key, current);
+    evidence.physical ||= Boolean(Number(row.hasPhysicalIdentity) || 0);
+    evidence.root ||= Boolean(Number(row.hasRootIdentity) || 0);
+    evidence.helper ||= Boolean(Number(row.hasInternalHelperRootFlag) || 0);
+    evidenceByRuntime.set(key, evidence);
   }
   return rows.filter((row) => {
-    const evidence = runtimeEvidence.get(groupFor(row));
-    return Boolean(
-      evidence &&
-      (evidence.hasPhysicalIdentity || evidence.hasRootIdentity) &&
-      !evidence.hasInternalHelperRoot
-    );
+    const evidence = evidenceByRuntime.get(groupFor(row));
+    return Boolean(evidence && (evidence.physical || evidence.root) && !evidence.helper);
   });
 }
 
 export interface StoredAgentMetricBucketFact {
   bucketIndex: number;
   identityKey: string;
-  agentId: string;
+  agentId?: string;
   representativeEvent?: JudgedEvent;
   eventCount: number;
   riskyEventCount: number;
@@ -757,6 +1324,8 @@ export interface DashboardWindowBucketRow {
 }
 
 export interface DashboardWindowHistory {
+  /** Distinct counts use ClickHouse's bounded approximate aggregate to avoid an unbounded hash set. */
+  countsApproximate?: true;
   dimensions: DashboardWindowDimensionRow[];
   buckets: DashboardWindowBucketRow[];
   topSession?: {
@@ -793,6 +1362,13 @@ function canonicalJson(value: unknown): string {
     .join(',')}}`;
 }
 
+/**
+ * Return the durable identity of one immutable Canonical Revision.
+ *
+ * Transport retries may change writer and commit metadata, but they must retain the same
+ * fingerprint. A real semantic change must advance decisionRevision instead of silently replacing
+ * the payload claimed by the existing logical key.
+ */
 export function eventRevisionIdentity(e: JudgedEvent): {
   logicalKey: string;
   fingerprint: string;
@@ -807,18 +1383,13 @@ export function eventRevisionIdentity(e: JudgedEvent): {
     e.eventId,
     String(revision),
   ].join('\u0000');
-  // Transport and store-owned metadata are not part of a Canonical Revision. Keeping this
-  // explicit prevents retries from acquiring a different fingerprint merely because they were
-  // committed in another batch or received at another wall-clock time.
   const canonicalPayload = { ...e } as Record<string, unknown>;
   delete canonicalPayload.ingestedAt;
   delete canonicalPayload.storeCommittedAt;
   delete canonicalPayload.commitBatchId;
   delete canonicalPayload.kafkaOffset;
   delete canonicalPayload.deliveryAttempt;
-  const canonicalAttributes = {
-    ...(e.attributes ?? {}),
-  } as Record<string, unknown>;
+  const canonicalAttributes = { ...(e.attributes ?? {}) } as Record<string, unknown>;
   delete canonicalAttributes.commitRequestBatchId;
   delete canonicalAttributes.writerId;
   delete canonicalAttributes.writerVersion;
@@ -826,22 +1397,41 @@ export function eventRevisionIdentity(e: JudgedEvent): {
   canonicalPayload.attributes = canonicalAttributes;
   return {
     logicalKey,
-    fingerprint: createHash('sha256')
-      .update(canonicalJson(canonicalPayload))
-      .digest('hex'),
+    fingerprint: createHash('sha256').update(canonicalJson(canonicalPayload)).digest('hex'),
   };
 }
 
 function toRow(e: JudgedEvent): Row {
-  const attribution = e.attribution;
+  const rawAttribution = e.attribution;
+  const correlation = parseTrustedCorrelation(rawAttribution?.correlation);
+  const attribution = !rawAttribution
+    ? undefined
+    : correlation
+      ? { ...rawAttribution, correlation }
+      : (({ correlation: _invalidCorrelation, ...legacyAttribution }) => legacyAttribution)(rawAttribution);
   const physical = attribution?.physicalWorkloadId?.trim();
   const instance = attribution?.agentInstanceId?.trim();
+  const classificationSemantics = visibleClassificationSemantics(e.classificationSemantics);
+  const process = visibleProcessContext(e.process);
+  const evidenceIndex = toolEvidenceIndexFields(e);
   const revisionIdentity = eventRevisionIdentity(e);
   return {
     schemaVersion: e.schemaVersion,
     eventId: e.eventId,
     sourceEventId: e.sourceEventId ?? '',
     at: e.at,
+    eventAtUnixNs: e.eventAtUnixNs ?? '',
+    receivedAtUnixNs: e.receivedAtUnixNs ?? '',
+    receivedAt: e.receivedAt ?? 0,
+    eventTimeQuality: e.eventTimeQuality ?? 'api_received',
+    captureEpoch: e.captureEpoch ?? '0',
+    captureProfileCode: e.captureProfileCode ?? 0,
+    captureActionCode: e.captureActionCode ?? 0,
+    captureAuthorityCode: e.captureAuthorityCode ?? 0,
+    captureDispositionCode: e.captureDispositionCode ?? 0,
+    captureSelected: e.captureSelected === true ? 1 : 0,
+    captureFlags: e.captureFlags ?? 0,
+    capturePolicyVersion: e.capturePolicyVersion ?? 0,
     ingestedAt: Date.now(),
     commitBatchId: '',
     logicalKeyVersion: 1,
@@ -850,15 +1440,43 @@ function toRow(e: JudgedEvent): Row {
     payloadFingerprint: revisionIdentity.fingerprint,
     eventKind: e.eventKind,
     eventCategory: e.eventCategory,
+    activityContext: eventActivityContext(e) ?? '',
+    activitySubtype: eventActivitySubtype(e) ?? '',
     source: e.source,
     subject: e.subject,
     workspacePath: e.workspacePath,
     agentId: e.agentId,
+    subjectAssetId: e.subjectAssetId ?? '',
+    subjectAssetType: e.subjectAssetType ?? '',
+    assetBindingQuality: e.assetBindingQuality ?? '',
+    assetBindingRevision: e.assetBindingRevision ?? 0,
+    assetBindingReason: e.assetBindingReason ?? '',
+    identityRevision: e.identityRevision ?? 0,
     collectorId: e.collectorId?.trim() || attrString(e.attributes, 'collectorId'),
     sourceId: e.sourceId?.trim() || attrString(e.attributes, 'sourceId'),
     sessionId: e.sessionId,
     userId: e.userId,
     traceId: e.traceId,
+    // These query columns are projections of the server-resolved correlation object. Producer
+    // convenience fields are deliberately not an independent authority at the persistence edge.
+    invocationId: correlation?.invocationId?.trim() ?? '',
+    toolCallId: correlation?.toolCallId?.trim() ?? '',
+    processInstanceKey: correlation?.processInstanceId?.trim() ?? '',
+    processHostId: process?.hostId?.trim() ?? '',
+    processBootId: process?.bootId?.trim() ?? '',
+    processPid: process?.pid ?? 0,
+    processPpid: process?.ppid ?? 0,
+    processPidNamespace: process?.pidNamespace?.trim() ?? '',
+    processNamespacePid: process?.namespacePid ?? 0,
+    processNamespacePpid: process?.namespacePpid ?? 0,
+    processStartTimeTicks: process?.startTimeTicks?.trim() ?? '',
+    processStartTimeNs: process?.startTimeNs?.trim() ?? '',
+    evidenceResourceHash: evidenceIndex.resourceHash ?? '',
+    evidenceCommandHash: evidenceIndex.commandHash ?? '',
+    correlationMethod: correlation?.method ?? '',
+    correlationConfidence: typeof correlation?.confidence === 'number' && Number.isFinite(correlation.confidence)
+      ? correlation.confidence
+      : 0,
     spanId: e.spanId,
     parentSpanId: e.parentSpanId ?? '',
     runId: e.runId,
@@ -881,7 +1499,8 @@ function toRow(e: JudgedEvent): Row {
     tokenCount: e.tokenCount,
     latencyMs: e.latencyMs,
     attributes: JSON.stringify(e.attributes ?? {}),
-    process: JSON.stringify(e.process ?? {}),
+    classificationSemantics: JSON.stringify(classificationSemantics ?? {}),
+    process: JSON.stringify(process ?? {}),
     attribution: JSON.stringify(attribution ?? {}),
     agentIdentityKey: agentIdentityKeyForEvent(e),
     agentInstanceKey: agentRuntimeInstanceIdForEvent(e),
@@ -892,7 +1511,7 @@ function toRow(e: JudgedEvent): Row {
       || attribution?.agentScopeId?.trim()
       || e.agentId,
     resolvedWorkspacePath:
-      e.process?.cwd?.trim()
+      process?.cwd?.trim()
       || (attribution?.agentScopeId?.trim()
         ? `agent://${attribution.agentScopeId.trim()}`
         : e.workspacePath),
@@ -904,9 +1523,9 @@ function toRow(e: JudgedEvent): Row {
   };
 }
 
-function prepareCommitBatch(rows: Row[]): Row[] {
+function prepareCommitBatch(rows: Row[], requestedBatchId?: string): Row[] {
   const existingBatchId = rows.find((row) => row.commitBatchId)?.commitBatchId;
-  const commitBatchId = existingBatchId || randomUUID();
+  const commitBatchId = existingBatchId || requestedBatchId || randomUUID();
   for (const row of rows) {
     if (!row.commitBatchId) row.commitBatchId = commitBatchId;
   }
@@ -937,24 +1556,75 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
   const agentId = str(r.agentId);
   const sessionId = str(r.sessionId);
   const eventKind = str(r.eventKind);
+  const rawActivityContext = str(r.activityContext);
+  const rawActivitySubtype = str(r.activitySubtype);
+  const activity = normalizeActivitySemantics(eventKind, rawActivityContext, rawActivitySubtype);
   const collectorId = str(r.collectorId) || attrString(attributes, 'collectorId') || undefined;
   const sourceId = str(r.sourceId) || attrString(attributes, 'sourceId') || undefined;
+  const rawAttribution = parseObject<AgentAttribution>(r.attribution);
+  const parsedCorrelation = parseTrustedCorrelation(rawAttribution?.correlation);
+  // Rows written before the additive columns existed may contain producer-controlled JSON under
+  // attribution.correlation. Treat the server-written narrow projection as the persistence trust
+  // marker, and make the kill switch restore the exact legacy read shape without rewriting data.
+  const correlation = correlationCaptureRollout().trustedCorrelation !== 'off' &&
+    parsedCorrelation &&
+    str(r.correlationMethod) === parsedCorrelation.method &&
+    str(r.invocationId) === (parsedCorrelation.invocationId ?? '') &&
+    str(r.toolCallId) === (parsedCorrelation.toolCallId ?? '') &&
+    str(r.processInstanceKey) === (parsedCorrelation.processInstanceId ?? '') &&
+    Math.abs(num(r.correlationConfidence) - parsedCorrelation.confidence) <= 0.000_01
+    ? parsedCorrelation
+    : undefined;
+  const attribution = !rawAttribution
+    ? undefined
+    : correlation
+      ? { ...rawAttribution, correlation }
+      : (({ correlation: _invalidCorrelation, ...legacyAttribution }) => legacyAttribution)(rawAttribution);
+  const invocationId = correlation?.invocationId;
+  const toolCallId = correlation?.toolCallId;
+  const classificationSemantics = visibleClassificationSemantics(
+    parseObject(r.classificationSemantics),
+  );
+  const captureEpoch = str(r.captureEpoch);
+  const hasCaptureDecision = captureEpoch !== '' && captureEpoch !== '0';
   return {
     schemaVersion: (str(r.schemaVersion) || 'anysentry.agent_event.v1') as JudgedEvent['schemaVersion'],
     eventId: str(r.eventId) || `evt_${at}_${agentId}_${eventKind}`,
     sourceEventId: str(r.sourceEventId) || undefined,
     at,
+    eventAtUnixNs: str(r.eventAtUnixNs) || undefined,
+    receivedAtUnixNs: str(r.receivedAtUnixNs) || undefined,
+    receivedAt: num(r.receivedAt) || undefined,
+    eventTimeQuality: (str(r.eventTimeQuality) || 'api_received') as JudgedEvent['eventTimeQuality'],
+    captureEpoch: hasCaptureDecision ? captureEpoch : undefined,
+    captureProfileCode: hasCaptureDecision ? num(r.captureProfileCode) : undefined,
+    captureActionCode: hasCaptureDecision ? num(r.captureActionCode) : undefined,
+    captureAuthorityCode: hasCaptureDecision ? num(r.captureAuthorityCode) : undefined,
+    captureDispositionCode: hasCaptureDecision ? num(r.captureDispositionCode) : undefined,
+    captureSelected: hasCaptureDecision ? num(r.captureSelected) > 0 : undefined,
+    captureFlags: hasCaptureDecision ? num(r.captureFlags) : undefined,
+    capturePolicyVersion: num(r.capturePolicyVersion) || undefined,
     eventKind,
     eventCategory: (str(r.eventCategory) || 'unknown') as JudgedEvent['eventCategory'],
+    activityContext: activity.activityContext,
+    activitySubtype: activity.activitySubtype,
     source: (str(r.source) || 'observer') as JudgedEvent['source'],
     subject: str(r.subject),
     workspacePath: str(r.workspacePath),
     agentId,
+    subjectAssetId: str(r.subjectAssetId) || undefined,
+    subjectAssetType: str(r.subjectAssetType) as JudgedEvent['subjectAssetType'] || undefined,
+    assetBindingQuality: str(r.assetBindingQuality) as JudgedEvent['assetBindingQuality'] || undefined,
+    assetBindingRevision: num(r.assetBindingRevision) || undefined,
+    assetBindingReason: str(r.assetBindingReason) || undefined,
+    identityRevision: num(r.identityRevision) || undefined,
     collectorId,
     sourceId,
     sessionId,
     userId: str(r.userId),
     traceId: str(r.traceId) || `tr_${agentId}_${sessionId}`,
+    ...(invocationId ? { invocationId } : {}),
+    ...(toolCallId ? { toolCallId } : {}),
     spanId: str(r.spanId) || `sp_${at}_${eventKind}`,
     parentSpanId: str(r.parentSpanId) || undefined,
     runId: str(r.runId) || sessionId,
@@ -977,29 +1647,82 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
     tokenCount: num(r.tokenCount),
     latencyMs: num(r.latencyMs),
     attributes,
-    process: parseObject<ProcessContext>(r.process),
-    attribution: parseObject<AgentAttribution>(r.attribution),
+    ...(classificationSemantics ? { classificationSemantics } : {}),
+    process: visibleProcessContext(parseObject<ProcessContext>(r.process)),
+    attribution,
     judgment: parseObject<NonNullable<JudgedEvent['judgment']>>(r.judgment),
     rawPreview: str(r.rawPreview) || undefined,
   };
 }
 
-@Injectable()
-export class ClickHouseStore implements OnModuleDestroy {
+function storedToolEvidenceItem(
+  payload: unknown,
+  invocationId: string,
+  toolCallId: string,
+  evidenceVersion: string,
+  updatedAt: number,
+): ToolEvidenceItem | undefined {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined;
+  const item = payload as Partial<ToolEvidenceItem>;
+  if (item.invocationId !== invocationId || item.toolCallId !== toolCallId) return undefined;
+  if (typeof item.toolName !== 'string' || item.toolName.length > 120) return undefined;
+  if (!['linked', 'semantic_only', 'ambiguous'].includes(item.status ?? '')) return undefined;
+  if (![
+    'exact_process_and_resource',
+    'exact_child_and_command',
+    'overlapping_exact_claims',
+    'kernel_read_not_captured',
+    'no_matching_kernel_evidence',
+  ].includes(item.reason ?? '')) return undefined;
+  if (!Array.isArray(item.adapterEventIds) || item.adapterEventIds.length > 2_000) return undefined;
+  if (!Array.isArray(item.kernelEvidence) || item.kernelEvidence.length > 256) return undefined;
+  return {
+    ...(item as ToolEvidenceItem),
+    relation: {
+      schemaVersion: 'anysentry.tool_evidence_relation.v1',
+      relationVersion: TOOL_EVIDENCE_RELATION_VERSION,
+      evidenceVersion,
+      updatedAt,
+    },
+  };
+}
+
+export class ClickHouseStore {
   private client?: ClickHouseClient;
-  private buf: Row[] = [];
+  private buf: QueuedEventRow[] = [];
   private collectorHeartbeatBuf: Array<{ collectorId: string; at: number; payload: string }> = [];
+  private bufferedEventBytes = 0;
+  // Includes unsealed rows plus sealed/active batches. Keeping the active batch in these totals
+  // prevents a slow HTTP request from becoming hidden memory outside the advertised buffer bound.
+  private eventWriteRows = 0;
+  private eventWriteBytes = 0;
+  private eventWriteBatches: EventWriteBatch[] = [];
+  private eventWriteBatchesByToken = new Map<string, EventWriteBatch>();
+  // This is a bounded process-local guard, not a durable idempotency registry. ClickHouse's stable
+  // insert token protects replay across ambiguous writes; this cache additionally rejects two
+  // different semantic payloads that claim the same (eventId, decisionRevision) while the API is
+  // running. A durable cross-restart conflict registry belongs to the later outbox phase.
+  private eventRevisionDigests = new Map<string, string>();
+  private committedEventRevisionDigests = new Map<string, string>();
+  private eventWriteDrainInFlight?: Promise<void>;
+  private eventWriteRetryWakeTimer?: NodeJS.Timeout;
+  private eventWriteRetrySleep?: { timer: NodeJS.Timeout; wake: () => void };
+  private eventWriteAbortController?: AbortController;
+  private eventWritePermanentError?: Error;
+  private eventWriteClosingDeadline?: number;
+  private closeInFlight?: Promise<void>;
+  private closing = false;
   private flushTimer?: NodeJS.Timeout;
   private reconnectTimer?: NodeJS.Timeout;
   private connectInFlight?: Promise<boolean>;
   private flushInFlight?: Promise<void>;
-  private flushBatchMinEventTimeMs?: number;
+  private immediateWritesInFlight = 0;
   private immediateWriteQueue: ImmediateWrite[] = [];
   private immediateWriteQueueBytes = 0;
   private immediateWriteTimer?: NodeJS.Timeout;
   private immediateWriteInFlight?: Promise<void>;
   private readonly immediateWriteEventTimes = new Map<number, number>();
-  private readonly eventWriteStats = {
+  private readonly eventWriteReceiptStats = {
     batches: 0,
     rows: 0,
     bytes: 0,
@@ -1009,16 +1732,22 @@ export class ClickHouseStore implements OnModuleDestroy {
     backpressureRejects: 0,
     lastDurableAt: undefined as number | undefined,
   };
+  /** ReplacingMergeTree versions must remain distinct across rapid consecutive S8 snapshots. */
+  private unknownLearningStateVersion = 0;
   private ready = false;
-  private closing = false;
   private closed = false;
   private committedThroughMs?: number;
+  // event_commit_facts can start after an existing events table and expires sooner than events.
+  // Until an explicit, durable full-backfill marker exists, no journal-derived/local maximum may
+  // be exposed as a global read split: doing so could hide persisted rows above a partial boundary.
+  private committedBoundaryComplete = false;
   private readonly committedSourceProgress = new Map<string, CommittedSourceProgress>();
   private earliestCommitCursorCache?: {
     expiresAt: number;
     value: Promise<EventCommitCursor | null>;
   };
   private dashboardSnapshotSequence = 0;
+  private dashboardSnapshotWarmInFlight?: Promise<void>;
   private readonly dashboardSnapshotStats = {
     hits: 0,
     misses: 0,
@@ -1026,10 +1755,54 @@ export class ClickHouseStore implements OnModuleDestroy {
     exactRanges: 0,
     writtenBuckets: 0,
     fallbackErrors: 0,
+    rangeRejects: 0,
   };
 
+  // Instance fields make the retry clock/delays replaceable by the standalone deterministic
+  // verifier without exposing a production API or relying on Node-version-specific fake timers.
+  private eventWriteNow = (): number => Date.now();
+  private eventWriteRetryDeadlineMs = EVENT_WRITE_RETRY_DEADLINE_MS;
+  private eventWriteAttemptTimeoutMs = EVENT_WRITE_ATTEMPT_TIMEOUT_MS;
+  private eventWriteCloseDeadlineMs = EVENT_WRITE_CLOSE_DEADLINE_MS;
+  private eventWriteRetryDelayMs = (failedAttempt: number): number => {
+    const exponential = Math.min(
+      EVENT_WRITE_BACKOFF_MAX_MS,
+      EVENT_WRITE_BACKOFF_BASE_MS * (2 ** Math.max(0, failedAttempt - 1)),
+    );
+    return Math.max(1, Math.round(exponential * (0.8 + Math.random() * 0.4)));
+  };
+  // All three dashboard paths below read or aggregate wide event rows. Keep one shared slot so a
+  // durable search cannot overlap a recent/history read and collectively exceed the 2 GiB server
+  // budget. Equivalent recent/durable requests still coalesce through their per-path in-flight
+  // promise before attempting to acquire this slot.
+  private wideEventReadActive = false;
+  // Share one equivalent wide read, but fail a different window closed to the hot-ring fallback.
+  // This is an in-flight guard only: completed results are never cached here.
+  private recentQueryInFlight?: {
+    key: string;
+    value: Promise<JudgedEvent[] | null>;
+  };
+  // Durable event searches materialize the same wide rows as the recent dashboard read. Share an
+  // equivalent request and fail a different one closed to the hot-ring fallback so concurrent API
+  // callers cannot multiply the per-query memory budget.
+  private eventSearchInFlight?: {
+    key: string;
+    value: Promise<JudgedEvent[] | null>;
+  };
+
+  private tryAcquireWideEventReadSlot(): (() => void) | null {
+    if (this.wideEventReadActive) return null;
+    this.wideEventReadActive = true;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.wideEventReadActive = false;
+    };
+  }
+
   get enabled(): boolean {
-    return this.ready;
+    return this.ready && !this.closing && !this.eventWritePermanentError;
   }
 
   dashboardBucketSnapshotStatus() {
@@ -1047,7 +1820,7 @@ export class ClickHouseStore implements OnModuleDestroy {
   private eventBatchMaxRows(): number {
     return boundedPositiveInt(
       process.env.ANYSENTRY_CLICKHOUSE_BATCH_MAX_ROWS,
-      this.eventMicrobatchEnabled() ? 1_000 : 500,
+      this.eventMicrobatchEnabled() ? 1_000 : EVENT_WRITE_BATCH_ROWS,
       1,
       10_000,
     );
@@ -1071,23 +1844,38 @@ export class ClickHouseStore implements OnModuleDestroy {
     );
   }
 
-  eventWriteBatchStatus(): EventWriteBatchStatus {
-    const oldestQueuedAt = this.immediateWriteQueue[0]?.queuedAt;
+  eventWriteBatchStatus() {
+    const head = this.eventWriteBatches[0];
+    const receiptHead = this.immediateWriteQueue[0];
     return {
-      schemaVersion: 'anysentry.event-write-batch.v1',
+      schemaVersion: 'anysentry.event-write-batch.v1' as const,
       enabled: this.eventMicrobatchEnabled(),
       revisionImmutabilityEnforced:
         process.env.ANYSENTRY_REVISION_IMMUTABILITY === 'enforce',
       maxRows: this.eventBatchMaxRows(),
       maxDelayMs: this.eventBatchMaxDelayMs(),
       maxBytes: this.eventBatchMaxBytes(),
-      queuedRows: this.immediateWriteQueue.length,
-      queuedBytes: this.immediateWriteQueueBytes,
+      maxBufferedRows: EVENT_WRITE_MAX_BUFFERED_ROWS,
+      maxBufferedBytes: EVENT_WRITE_MAX_BUFFERED_BYTES,
+      queuedRows: this.eventWriteRows + this.immediateWriteQueue.length,
+      queuedBytes: this.eventWriteBytes + this.immediateWriteQueueBytes,
+      bufferedRows: this.buf.length,
+      sealedBatches: this.eventWriteBatches.length,
       pendingReceipts: [...this.immediateWriteEventTimes.values()]
         .reduce((sum, count) => sum + count, 0),
-      oldestQueuedMs: oldestQueuedAt ? Math.max(0, Date.now() - oldestQueuedAt) : 0,
-      inFlight: Boolean(this.immediateWriteInFlight),
-      ...this.eventWriteStats,
+      oldestQueuedMs: head || receiptHead
+        ? Math.max(
+            0,
+            this.eventWriteNow() - Math.min(
+              head?.createdAt ?? Number.POSITIVE_INFINITY,
+              receiptHead?.queuedAt ?? Number.POSITIVE_INFINITY,
+            ),
+          )
+        : 0,
+      inFlight: Boolean(this.eventWriteDrainInFlight || this.immediateWriteInFlight),
+      retrying: Boolean(head?.lastError),
+      permanentError: this.eventWritePermanentError?.message,
+      ...this.eventWriteReceiptStats,
     };
   }
 
@@ -1102,7 +1890,6 @@ export class ClickHouseStore implements OnModuleDestroy {
   async init(): Promise<boolean> {
     const url = process.env.CLICKHOUSE_URL;
     if (!url) return false;
-    this.closing = false;
     this.closed = false;
     const attempts = boundedPositiveInt(
       process.env.ANYSENTRY_CLICKHOUSE_INIT_ATTEMPTS,
@@ -1158,93 +1945,37 @@ export class ClickHouseStore implements OnModuleDestroy {
       username: process.env.CLICKHOUSE_USER || 'default',
       password: process.env.CLICKHOUSE_PASSWORD || '',
     };
-    let boot: ClickHouseClient | undefined;
     let nextClient: ClickHouseClient | undefined;
     try {
-      // Create the database with a bootstrap client (no db bound), then connect to it.
-      boot = createClient({ url, ...credentials });
-      await boot.command({ query: `CREATE DATABASE IF NOT EXISTS ${database}` });
-      await boot.close();
-      boot = undefined;
+      const bootstrap = await sharedClickHouseBootstrap({ url, database, ...credentials });
+      if (this.closed) throw new Error('ClickHouse store closed during bootstrap');
+
+      // Schema/progress state is shared, while every store keeps its own client, buffers, retry
+      // lane, and shutdown lifecycle.
       nextClient = createClient({ url, database, ...credentials });
-      await nextClient.command({ query: DDL(TABLE) });
-      for (const alter of EVENT_ALTERS) await nextClient.command({ query: `ALTER TABLE ${TABLE} ${alter}` });
-      await nextClient.command({ query: COLLECTOR_HEARTBEAT_DDL });
-      await nextClient.command({ query: CONFIG_DDL });
-      await nextClient.command({ query: NOTIFICATION_DELIVERY_DDL });
-      await nextClient.command({ query: IDENTITY_AI_REVIEW_DDL });
-      await nextClient.command({ query: AUDIT_FACT_DDL });
-      await nextClient.command({ query: EVENT_COMMIT_FACT_DDL });
-      await nextClient.command({ query: EVENT_COMMIT_FACT_MV_DDL });
-      await nextClient.command({ query: EVENT_REVISION_CONFLICT_DDL });
-      await nextClient.command({ query: EVENT_REVISION_IDENTITY_DDL });
-      await nextClient.command({ query: EVENT_REVISION_IDENTITY_MV_DDL });
-      await nextClient.command({ query: SOURCE_COMMIT_PROGRESS_DDL });
-      await nextClient.command({ query: SOURCE_COMMIT_PROGRESS_MV_DDL });
-      await nextClient.command({ query: DASHBOARD_BUCKET_SNAPSHOT_DDL });
-      await nextClient.command({
-        query: `ALTER TABLE ${DASHBOARD_BUCKET_SNAPSHOT_TABLE}
-          ADD COLUMN IF NOT EXISTS snapshotCommitBatchId String DEFAULT ''
-          AFTER snapshotCommittedAt`,
-      });
-      await nextClient.command({
-        query: `ALTER TABLE ${DASHBOARD_BUCKET_SNAPSHOT_TABLE}
-          ADD COLUMN IF NOT EXISTS snapshotSchemaVersion LowCardinality(String)
-          DEFAULT 'anysentry.dashboard-bucket-snapshot.v2' AFTER snapshotVersion`,
-      });
-      await nextClient.command({
-        query: `ALTER TABLE ${DASHBOARD_BUCKET_SNAPSHOT_TABLE}
-          ADD COLUMN IF NOT EXISTS status LowCardinality(String) DEFAULT 'ready'
-          AFTER snapshotSchemaVersion`,
-      });
-      await nextClient.command({
-        query: `ALTER TABLE ${DASHBOARD_BUCKET_SNAPSHOT_TABLE}
-          ADD COLUMN IF NOT EXISTS payloadChecksum String DEFAULT ''
-          AFTER factsJson`,
-      });
-      const committed = await nextClient.query({
-        query: `
-          SELECT
-            sourceId,
-            collectorId,
-            maxMerge(observedDurableThroughState) AS committedThrough,
-            maxMerge(lastStoreCommittedAtState) AS committedAt
-          FROM ${SOURCE_COMMIT_PROGRESS_TABLE}
-          GROUP BY sourceId, collectorId
-        `,
-        format: 'JSONEachRow',
-      });
-      const committedRows = (await committed.json()) as Array<{
-        sourceId?: string;
-        collectorId?: string;
-        committedThrough?: string | number;
-        committedAt?: string | number;
-      }>;
-      this.committedSourceProgress.clear();
-      for (const row of committedRows) {
-        const committedEventTimeMs = Number(row.committedThrough);
-        if (!Number.isFinite(committedEventTimeMs) || committedEventTimeMs <= 0) continue;
-        const sourceId = row.sourceId?.trim() || undefined;
-        const collectorId = row.collectorId?.trim() || undefined;
-        this.committedSourceProgress.set(`${sourceId ?? ''}\u0000${collectorId ?? ''}`, {
-          sourceId,
-          collectorId,
-          committedEventTimeMs,
-          committedAtMs: Number(row.committedAt) || committedEventTimeMs,
+      const ping = await nextClient.ping({ select: true });
+      if (!ping.success) throw ping.error;
+      for (const entry of bootstrap.committedSourceProgress) {
+        const key = `${entry.sourceId ?? ''}\0${entry.collectorId ?? ''}`;
+        const previous = this.committedSourceProgress.get(key);
+        this.committedSourceProgress.set(key, {
+          sourceId: entry.sourceId,
+          collectorId: entry.collectorId,
+          committedEventTimeMs: Math.max(
+            previous?.committedEventTimeMs ?? 0,
+            entry.committedEventTimeMs,
+          ),
+          committedAtMs: Math.max(previous?.committedAtMs ?? 0, entry.committedAtMs),
         });
       }
-      const committedThrough = committedRows.reduce(
-        (maximum, row) => Math.max(maximum, Number(row.committedThrough) || 0),
-        0,
-      );
-      this.committedThroughMs = Number.isFinite(committedThrough) && committedThrough > 0
-        ? committedThrough
-        : undefined;
       await this.client?.close().catch(() => undefined);
       this.client = nextClient;
       nextClient = undefined;
+      this.closing = false;
       if (this.flushTimer) clearInterval(this.flushTimer);
-      this.flushTimer = setInterval(() => void this.flush(), 2_000);
+      this.flushTimer = setInterval(() => {
+        void this.flush().catch(() => undefined);
+      }, 2000);
       if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
       this.ready = true;
@@ -1252,7 +1983,6 @@ export class ClickHouseStore implements OnModuleDestroy {
       return { ok: true, error: '' };
     } catch (error) {
       this.ready = false;
-      await boot?.close().catch(() => undefined);
       await nextClient?.close().catch(() => undefined);
       return {
         ok: false,
@@ -1284,33 +2014,41 @@ export class ClickHouseStore implements OnModuleDestroy {
 
   /** Buffer one event; flush opportunistically when the batch is large. */
   enqueue(e: JudgedEvent): void {
+    if (this.closing) throw new Error('ClickHouse event writer is closing');
     if (!this.ready) return;
-    this.buf.push(toRow(e));
-    if (this.buf.length >= 500) void this.flush();
+    if (this.eventWritePermanentError) throw this.eventWritePermanentError;
+    const queued = this.queuedEventRow(toRow(e));
+    this.assertEventRevisionConsistency([queued.row]);
+    const revisionKey = this.eventRevisionKey(queued.row);
+    const revisionDigest = this.eventRevisionDigest(queued.row);
+    if (this.eventRevisionDigests.get(revisionKey) === revisionDigest) return;
+    this.assertEventWriteCapacity(queued.bytes);
+    this.rememberEventRevisionDigests([queued.row]);
+    this.buf.push(queued);
+    this.bufferedEventBytes += queued.bytes;
+    this.eventWriteRows += 1;
+    this.eventWriteBytes += queued.bytes;
+    const sealed = this.sealBufferedEventBatches(false);
+    if (sealed) this.startEventWriteDrain();
   }
+
   /** Persist one lifecycle revision before acknowledging queue work. */
-  async insertNow(e: JudgedEvent): Promise<void> {
-    const receipt = await this.insertNowWithReceipt(e);
-    if (receipt.result === 'durable_dlq') {
-      throw new Error(
-        `Immutable Revision conflict for ${receipt.conflict?.eventLogicalKey ?? e.eventId}`,
-      );
-    }
+  async insertNow(e: JudgedEvent, idempotencyKey?: string): Promise<void> {
+    return this.insertManyNow([e], idempotencyKey);
   }
 
   /**
-   * Persist one lifecycle revision and return the durable batch receipt.
+   * Persist one immutable Revision through the configurable receipt microbatch lane.
    *
-   * Queue admission is deliberately bounded. Callers that require durability must observe a
-   * rejected promise and apply their transport-specific backpressure instead of accumulating an
-   * unbounded number of pending promises while ClickHouse is unavailable.
+   * This is used by durability-aware producers that need a stable commit batch receipt rather
+   * than the void compatibility contract of insertNow/insertManyNow.
    */
   async insertNowWithReceipt(e: JudgedEvent): Promise<EventBatchReceipt> {
     if (!this.client || !this.ready || this.closed || this.closing) {
       throw new Error('ClickHouse is not ready');
     }
     const row = toRow(e);
-    const bytes = Buffer.byteLength(JSON.stringify(row));
+    const bytes = Buffer.byteLength(JSON.stringify(row), 'utf8') + 1;
     const maxQueuedRows = boundedPositiveInt(
       process.env.ANYSENTRY_CLICKHOUSE_MAX_QUEUED_ROWS,
       20_000,
@@ -1324,10 +2062,10 @@ export class ClickHouseStore implements OnModuleDestroy {
       1024 * 1024 * 1024,
     );
     if (
-      this.immediateWriteQueue.length >= maxQueuedRows ||
-      this.immediateWriteQueueBytes + bytes > maxQueuedBytes
+      this.immediateWriteQueue.length >= maxQueuedRows
+      || this.immediateWriteQueueBytes + bytes > maxQueuedBytes
     ) {
-      this.eventWriteStats.backpressureRejects += 1;
+      this.eventWriteReceiptStats.backpressureRejects += 1;
       throw new Error(
         `ClickHouse event queue is full (${this.immediateWriteQueue.length} rows, `
         + `${this.immediateWriteQueueBytes} bytes)`,
@@ -1348,8 +2086,8 @@ export class ClickHouseStore implements OnModuleDestroy {
       });
       this.immediateWriteQueueBytes += bytes;
       if (
-        this.immediateWriteQueue.length >= this.eventBatchMaxRows() ||
-        this.immediateWriteQueueBytes >= this.eventBatchMaxBytes()
+        this.immediateWriteQueue.length >= this.eventBatchMaxRows()
+        || this.immediateWriteQueueBytes >= this.eventBatchMaxBytes()
       ) {
         void this.drainImmediateWrites();
         return;
@@ -1359,15 +2097,17 @@ export class ClickHouseStore implements OnModuleDestroy {
   }
 
   private scheduleImmediateWriteDrain(): void {
-    if (this.immediateWriteTimer || !this.immediateWriteQueue.length) return;
+    if (
+      this.immediateWriteTimer
+      || this.immediateWriteInFlight
+      || !this.immediateWriteQueue.length
+      || this.closing
+    ) return;
     const oldest = this.immediateWriteQueue[0]?.queuedAt ?? Date.now();
     const waitMs = Math.max(
       0,
       this.eventBatchMaxDelayMs() - Math.max(0, Date.now() - oldest),
     );
-    // A lifecycle revision remains synchronous from the caller's perspective: every promise
-    // resolves only after ClickHouse and its critical synchronous materialized views accept the
-    // block. The configurable coalescing window only changes how many receipts share one INSERT.
     this.immediateWriteTimer = setTimeout(() => {
       this.immediateWriteTimer = undefined;
       void this.drainImmediateWrites();
@@ -1380,25 +2120,28 @@ export class ClickHouseStore implements OnModuleDestroy {
     if (this.immediateWriteInFlight) return this.immediateWriteInFlight;
     if (!this.immediateWriteQueue.length) return Promise.resolve();
 
-    const operation = this.flushImmediateWrites();
-    this.immediateWriteInFlight = operation;
-    return operation.finally(() => {
-      if (this.immediateWriteInFlight === operation) this.immediateWriteInFlight = undefined;
-      if (
-        this.immediateWriteQueue.length >= this.eventBatchMaxRows() ||
-        this.immediateWriteQueueBytes >= this.eventBatchMaxBytes()
+    let tracked!: Promise<void>;
+    tracked = this.flushImmediateWrites().finally(() => {
+      if (this.immediateWriteInFlight === tracked) this.immediateWriteInFlight = undefined;
+      if (this.closing && this.immediateWriteQueue.length) {
+        void this.drainImmediateWrites();
+      } else if (
+        this.immediateWriteQueue.length >= this.eventBatchMaxRows()
+        || this.immediateWriteQueueBytes >= this.eventBatchMaxBytes()
       ) {
         void this.drainImmediateWrites();
       } else {
         this.scheduleImmediateWriteDrain();
       }
     });
+    this.immediateWriteInFlight = tracked;
+    return tracked;
   }
 
   private async existingRevisionFingerprints(
     logicalKeys: string[],
   ): Promise<Map<string, string>> {
-    if (!this.client || !this.ready || !logicalKeys.length) return new Map();
+    if (!this.client || this.closed || !logicalKeys.length) return new Map();
     const result = await this.client.query({
       query: `
         SELECT
@@ -1414,220 +2157,301 @@ export class ClickHouseStore implements OnModuleDestroy {
       eventLogicalKey?: string;
       acceptedFingerprint?: string;
     }>;
-    return new Map(rows.flatMap((row) => {
-      const key = row.eventLogicalKey?.trim();
-      const fingerprint = row.acceptedFingerprint?.trim();
+    return new Map(rows.flatMap((entry) => {
+      const key = entry.eventLogicalKey?.trim();
+      const fingerprint = entry.acceptedFingerprint?.trim();
       return key && fingerprint ? [[key, fingerprint] as const] : [];
     }));
   }
 
   private async flushImmediateWrites(): Promise<void> {
-    if (this.immediateWriteQueue.length) {
-      const batch: ImmediateWrite[] = [];
-      let batchBytes = 0;
-      const maxRows = this.eventBatchMaxRows();
-      const maxBytes = this.eventBatchMaxBytes();
-      while (this.immediateWriteQueue.length && batch.length < maxRows) {
-        const next = this.immediateWriteQueue[0];
-        if (batch.length && batchBytes + next.bytes > maxBytes) break;
-        batch.push(this.immediateWriteQueue.shift()!);
-        batchBytes += next.bytes;
-        this.immediateWriteQueueBytes = Math.max(0, this.immediateWriteQueueBytes - next.bytes);
-      }
+    if (!this.immediateWriteQueue.length) return;
+    const batch: ImmediateWrite[] = [];
+    let batchBytes = 0;
+    const maxRows = this.eventBatchMaxRows();
+    const maxBytes = this.eventBatchMaxBytes();
+    while (this.immediateWriteQueue.length && batch.length < maxRows) {
+      const next = this.immediateWriteQueue[0];
+      if (batch.length && batchBytes + next.bytes > maxBytes) break;
+      batch.push(this.immediateWriteQueue.shift()!);
+      batchBytes += next.bytes;
+      this.immediateWriteQueueBytes = Math.max(
+        0,
+        this.immediateWriteQueueBytes - next.bytes,
+      );
+    }
 
-      const enforceRevisionImmutability =
-        process.env.ANYSENTRY_REVISION_IMMUTABILITY === 'enforce';
-      let existingFingerprints = new Map<string, string>();
-      if (enforceRevisionImmutability) {
-        try {
-          existingFingerprints = await this.existingRevisionFingerprints(
-            batch.map((entry) => entry.row.eventLogicalKey),
-          );
-        } catch (error) {
-          this.eventWriteStats.failures += 1;
-          for (const entry of batch) entry.reject(error);
-          for (const entry of batch) {
-            const remainingAtTime =
-              (this.immediateWriteEventTimes.get(entry.eventAt) ?? 1) - 1;
-            if (remainingAtTime > 0) {
-              this.immediateWriteEventTimes.set(entry.eventAt, remainingAtTime);
-            } else {
-              this.immediateWriteEventTimes.delete(entry.eventAt);
-            }
-          }
-          return;
-        }
+    const enforceRevisionImmutability =
+      process.env.ANYSENTRY_REVISION_IMMUTABILITY === 'enforce';
+    let existingFingerprints = new Map<string, string>();
+    if (enforceRevisionImmutability) {
+      try {
+        existingFingerprints = await this.existingRevisionFingerprints(
+          batch.map((entry) => entry.row.eventLogicalKey),
+        );
+      } catch (error) {
+        this.eventWriteReceiptStats.failures += 1;
+        for (const entry of batch) entry.reject(error);
+        this.finishImmediateWriteAccounting(batch);
+        return;
       }
-      const factEntries: ImmediateWrite[] = [];
-      const physicalEntries: ImmediateWrite[] = [];
-      const conflictEntries: Array<{
-        entry: ImmediateWrite;
-        acceptedFingerprint: string;
-      }> = [];
-      const firstByLogicalKey = new Map<string, ImmediateWrite>();
-      for (const entry of batch) {
-        if (!enforceRevisionImmutability) {
-          factEntries.push(entry);
-          physicalEntries.push(entry);
-          continue;
-        }
-        const existingFingerprint = existingFingerprints.get(entry.row.eventLogicalKey);
-        if (existingFingerprint) {
-          if (existingFingerprint === entry.row.payloadFingerprint) {
-            factEntries.push(entry);
-          } else {
-            conflictEntries.push({
-              entry,
-              acceptedFingerprint: existingFingerprint,
-            });
-          }
-          continue;
-        }
-        const first = firstByLogicalKey.get(entry.row.eventLogicalKey);
-        if (!first) {
-          firstByLogicalKey.set(entry.row.eventLogicalKey, entry);
-          factEntries.push(entry);
-          physicalEntries.push(entry);
-        } else if (first.row.payloadFingerprint === entry.row.payloadFingerprint) {
-          // The caller still receives a durable receipt, but one physical row is enough for
-          // identical deliveries of the same immutable Revision within this batch.
-          factEntries.push(entry);
-        } else {
-          conflictEntries.push({
-            entry,
-            acceptedFingerprint: first.row.payloadFingerprint,
+    }
+
+    const factEntries: ImmediateWrite[] = [];
+    const physicalEntries: ImmediateWrite[] = [];
+    const conflictEntries: Array<{
+      entry: ImmediateWrite;
+      acceptedFingerprint: string;
+    }> = [];
+    const firstByLogicalKey = new Map<string, ImmediateWrite>();
+    for (const entry of batch) {
+      if (!enforceRevisionImmutability) {
+        factEntries.push(entry);
+        physicalEntries.push(entry);
+        continue;
+      }
+      const existingFingerprint = existingFingerprints.get(entry.row.eventLogicalKey);
+      if (existingFingerprint) {
+        if (existingFingerprint === entry.row.payloadFingerprint) factEntries.push(entry);
+        else conflictEntries.push({ entry, acceptedFingerprint: existingFingerprint });
+        continue;
+      }
+      const first = firstByLogicalKey.get(entry.row.eventLogicalKey);
+      if (!first) {
+        firstByLogicalKey.set(entry.row.eventLogicalKey, entry);
+        factEntries.push(entry);
+        physicalEntries.push(entry);
+      } else if (first.row.payloadFingerprint === entry.row.payloadFingerprint) {
+        factEntries.push(entry);
+      } else {
+        conflictEntries.push({
+          entry,
+          acceptedFingerprint: first.row.payloadFingerprint,
+        });
+      }
+    }
+
+    const rows = prepareCommitBatch(physicalEntries.map((entry) => entry.row));
+    const batchId = rows[0]?.commitBatchId ?? randomUUID();
+    const flushStartedAt = Date.now();
+    const maxAttempts = boundedPositiveInt(
+      process.env.ANYSENTRY_CLICKHOUSE_BATCH_MAX_ATTEMPTS,
+      5,
+      1,
+      20,
+    );
+    let attempts = 0;
+    let finalError: unknown;
+    while (attempts < maxAttempts) {
+      attempts += 1;
+      try {
+        if (!this.client || this.closed) throw new Error('ClickHouse is not ready');
+        if (conflictEntries.length) {
+          await this.client.insert({
+            table: EVENT_REVISION_CONFLICT_TABLE,
+            values: conflictEntries.map(({ entry, acceptedFingerprint }) => ({
+              logicalKeyVersion: entry.row.logicalKeyVersion,
+              eventLogicalKey: entry.row.eventLogicalKey,
+              payloadFingerprintVersion: entry.row.payloadFingerprintVersion,
+              acceptedFingerprint,
+              conflictingFingerprint: entry.row.payloadFingerprint,
+              eventId: entry.row.eventId,
+              decisionRevision: entry.row.decisionRevision,
+              sourceId: entry.row.sourceId,
+              collectorId: entry.row.collectorId,
+              commitBatchId: batchId,
+              observedAt: Date.now(),
+              payloadPreview: JSON.stringify(entry.row).slice(0, 64 * 1024),
+            })),
+            format: 'JSONEachRow',
           });
         }
-      }
-      const rows = prepareCommitBatch(physicalEntries.map((entry) => entry.row));
-      const batchId = rows[0]?.commitBatchId ?? randomUUID();
-      const flushStartedAt = Date.now();
-      const maxAttempts = boundedPositiveInt(
-        process.env.ANYSENTRY_CLICKHOUSE_BATCH_MAX_ATTEMPTS,
-        5,
-        1,
-        20,
-      );
-      let attempts = 0;
-      let finalError: unknown;
-      while (attempts < maxAttempts) {
-        attempts += 1;
-        try {
-          if (!this.client || !this.ready || this.closed) throw new Error('ClickHouse is not ready');
-          if (conflictEntries.length) {
-            await this.client.insert({
-              table: EVENT_REVISION_CONFLICT_TABLE,
-              values: conflictEntries.map(({ entry, acceptedFingerprint }) => ({
-                logicalKeyVersion: entry.row.logicalKeyVersion,
-                eventLogicalKey: entry.row.eventLogicalKey,
-                payloadFingerprintVersion: entry.row.payloadFingerprintVersion,
-                acceptedFingerprint,
-                conflictingFingerprint: entry.row.payloadFingerprint,
-                eventId: entry.row.eventId,
-                decisionRevision: entry.row.decisionRevision,
-                sourceId: entry.row.sourceId,
-                collectorId: entry.row.collectorId,
-                commitBatchId: batchId,
-                observedAt: Date.now(),
-                payloadPreview: JSON.stringify(entry.row).slice(0, 64 * 1024),
-              })),
-              format: 'JSONEachRow',
-            });
-          }
-          if (rows.length) {
-            await this.client.insert({ table: TABLE, values: rows, format: 'JSONEachRow' });
-          }
-          const durableAt = Date.now();
-          if (rows.length) {
-            this.committedThroughMs = Math.max(
-              this.committedThroughMs ?? 0,
-              ...physicalEntries.map((entry) => entry.eventAt),
-            );
-            this.noteCommittedRows(rows);
-          }
-          this.eventWriteStats.batches += 1;
-          this.eventWriteStats.rows += rows.length;
-          this.eventWriteStats.bytes += batchBytes;
-          this.eventWriteStats.lastDurableAt = durableAt;
-          const commitCursor: EventCommitCursor | undefined = rows.length
-            ? {
-                committedAtMs: durableAt,
-                commitBatchId: batchId,
-                eventId: rows.at(-1)?.eventId ?? '',
-                decisionRevision: rows.at(-1)?.decisionRevision ?? 0,
-              }
-            : undefined;
-          for (const entry of factEntries) {
-            entry.resolve({
-              schemaVersion: 'anysentry.event-batch-receipt.v1',
-              batchId,
-              result: 'durable_fact',
-              rowCount: rows.length,
-              byteCount: batchBytes,
-              queuedAt: entry.queuedAt,
-              flushStartedAt,
-              durableAt,
-              attempts,
-              ...(commitCursor ? { commitCursor } : {}),
-            });
-          }
-          for (const { entry, acceptedFingerprint } of conflictEntries) {
-            entry.resolve({
-              schemaVersion: 'anysentry.event-batch-receipt.v1',
-              batchId,
-              result: 'durable_dlq',
-              rowCount: 0,
-              byteCount: entry.bytes,
-              queuedAt: entry.queuedAt,
-              flushStartedAt,
-              durableAt,
-              attempts,
-              conflict: {
-                eventLogicalKey: entry.row.eventLogicalKey,
-                acceptedFingerprint,
-                conflictingFingerprint: entry.row.payloadFingerprint,
-              },
-            });
-          }
-          this.eventWriteStats.conflicts += conflictEntries.length;
-          finalError = undefined;
-          break;
-        } catch (error) {
-          finalError = error;
-          if (attempts >= maxAttempts || this.closed) break;
-          this.eventWriteStats.retries += 1;
-          const baseMs = boundedPositiveInt(
-            process.env.ANYSENTRY_CLICKHOUSE_BATCH_RETRY_BASE_MS,
-            200,
-            10,
-            10_000,
+        if (rows.length) {
+          await this.client.insert({
+            table: TABLE,
+            values: rows,
+            format: 'JSONEachRow',
+            clickhouse_settings: {
+              insert_deduplicate: 1,
+              insert_deduplication_token: `receipt-${batchId}`,
+            },
+          });
+        }
+        const durableAt = Date.now();
+        if (rows.length) {
+          this.committedThroughMs = Math.max(
+            this.committedThroughMs ?? 0,
+            ...physicalEntries.map((entry) => entry.eventAt),
           );
-          const waitMs = Math.min(5_000, baseMs * 2 ** (attempts - 1));
-          await delay(waitMs + Math.floor(Math.random() * Math.max(1, waitMs / 4)));
+          this.noteCommittedRows(rows);
         }
-      }
-      if (finalError !== undefined) {
-        this.eventWriteStats.failures += 1;
-        for (const entry of batch) entry.reject(finalError);
-      }
-      {
-        for (const entry of batch) {
-          const remainingAtTime =
-            (this.immediateWriteEventTimes.get(entry.eventAt) ?? 1) - 1;
-          if (remainingAtTime > 0) {
-            this.immediateWriteEventTimes.set(entry.eventAt, remainingAtTime);
-          } else {
-            this.immediateWriteEventTimes.delete(entry.eventAt);
-          }
+        this.eventWriteReceiptStats.batches += 1;
+        this.eventWriteReceiptStats.rows += rows.length;
+        this.eventWriteReceiptStats.bytes += batchBytes;
+        this.eventWriteReceiptStats.lastDurableAt = durableAt;
+        const commitCursor: EventCommitCursor | undefined = rows.length
+          ? {
+              committedAtMs: durableAt,
+              commitBatchId: batchId,
+              eventId: rows.at(-1)?.eventId ?? '',
+              decisionRevision: rows.at(-1)?.decisionRevision ?? 0,
+            }
+          : undefined;
+        for (const entry of factEntries) {
+          entry.resolve({
+            schemaVersion: 'anysentry.event-batch-receipt.v1',
+            batchId,
+            result: 'durable_fact',
+            rowCount: rows.length,
+            byteCount: batchBytes,
+            queuedAt: entry.queuedAt,
+            flushStartedAt,
+            durableAt,
+            attempts,
+            ...(commitCursor ? { commitCursor } : {}),
+          });
         }
+        for (const { entry, acceptedFingerprint } of conflictEntries) {
+          entry.resolve({
+            schemaVersion: 'anysentry.event-batch-receipt.v1',
+            batchId,
+            result: 'durable_dlq',
+            rowCount: 0,
+            byteCount: entry.bytes,
+            queuedAt: entry.queuedAt,
+            flushStartedAt,
+            durableAt,
+            attempts,
+            conflict: {
+              eventLogicalKey: entry.row.eventLogicalKey,
+              acceptedFingerprint,
+              conflictingFingerprint: entry.row.payloadFingerprint,
+            },
+          });
+        }
+        this.eventWriteReceiptStats.conflicts += conflictEntries.length;
+        finalError = undefined;
+        break;
+      } catch (error) {
+        finalError = error;
+        if (attempts >= maxAttempts || this.closed) break;
+        this.eventWriteReceiptStats.retries += 1;
+        const baseMs = boundedPositiveInt(
+          process.env.ANYSENTRY_CLICKHOUSE_BATCH_RETRY_BASE_MS,
+          200,
+          10,
+          10_000,
+        );
+        const waitMs = Math.min(5_000, baseMs * 2 ** (attempts - 1));
+        await delay(waitMs + Math.floor(Math.random() * Math.max(1, waitMs / 4)));
+      }
+    }
+    if (finalError !== undefined) {
+      this.eventWriteReceiptStats.failures += 1;
+      for (const entry of batch) entry.reject(finalError);
+    }
+    this.finishImmediateWriteAccounting(batch);
+  }
+
+  private finishImmediateWriteAccounting(batch: ImmediateWrite[]): void {
+    for (const entry of batch) {
+      const remainingAtTime = (this.immediateWriteEventTimes.get(entry.eventAt) ?? 1) - 1;
+      if (remainingAtTime > 0) {
+        this.immediateWriteEventTimes.set(entry.eventAt, remainingAtTime);
+      } else {
+        this.immediateWriteEventTimes.delete(entry.eventAt);
       }
     }
   }
 
+  async eventById(eventId: string, eventAt?: number): Promise<JudgedEvent | undefined> {
+    const normalized = eventId.trim();
+    if (!normalized) return undefined;
+    const boundedAt = Number.isSafeInteger(eventAt) && Number(eventAt) >= 0
+      ? Number(eventAt)
+      : undefined;
+    return (await this.eventsByIds([normalized], boundedAt, boundedAt))[0];
+  }
+
+  /**
+   * Persist one bounded set of event revisions as one ClickHouse block.
+   *
+   * `idempotencyKey` identifies the immutable upstream batch. Retrying the same key and payload
+   * joins an in-flight write or reuses the same ClickHouse deduplication token. Callers must not
+   * mutate a batch while retaining its key.
+   */
+  async insertManyNow(events: readonly JudgedEvent[], idempotencyKey?: string): Promise<void> {
+    if (events.length === 0) return;
+    if (!this.client || !this.ready || this.closing) throw new Error('ClickHouse is not ready');
+    if (this.eventWritePermanentError) throw this.eventWritePermanentError;
+    let queued = events.map((event) => this.queuedEventRow(toRow(event)));
+    this.assertEventRevisionConsistency(queued.map(({ row }) => row));
+    const uniqueRevisions = new Map<string, QueuedEventRow>();
+    for (const item of queued) {
+      const key = this.eventRevisionKey(item.row);
+      if (!uniqueRevisions.has(key)) uniqueRevisions.set(key, item);
+    }
+    queued = [...uniqueRevisions.values()];
+    const requestedBytes = queued.reduce((sum, row) => sum + row.bytes, 0);
+    if (queued.length > EVENT_WRITE_BATCH_ROWS || requestedBytes > EVENT_WRITE_BATCH_BYTES) {
+      throw Object.assign(
+        new Error(
+          `ClickHouse direct event batch exceeds ${EVENT_WRITE_BATCH_ROWS} rows or ${EVENT_WRITE_BATCH_BYTES} bytes`,
+        ),
+        {
+          code: EVENT_WRITE_BATCH_TOO_LARGE,
+          rows: queued.length,
+          bytes: requestedBytes,
+          maxRows: EVENT_WRITE_BATCH_ROWS,
+          maxBytes: EVENT_WRITE_BATCH_BYTES,
+        },
+      );
+    }
+
+    // A direct durability waiter may overlap an earlier buffered delivery of the same immutable
+    // revision. Seal that tail, join its batch, and insert only genuinely new revisions.
+    this.sealBufferedEventBatches(true);
+    const pendingByRevision = new Map<string, EventWriteBatch>();
+    for (const batch of this.eventWriteBatches) {
+      for (const row of batch.rows) pendingByRevision.set(this.eventRevisionKey(row), batch);
+    }
+    const joinedBatches = new Set<EventWriteBatch>();
+    queued = queued.filter(({ row }) => {
+      const key = this.eventRevisionKey(row);
+      const digest = this.eventRevisionDigest(row);
+      if (this.committedEventRevisionDigests.get(key) === digest) return false;
+      const pending = pendingByRevision.get(key);
+      if (!pending) return true;
+      joinedBatches.add(pending);
+      return false;
+    });
+    const completions = [...joinedBatches].map((batch) => (
+      new Promise<void>((resolve, reject) => batch.waiters.push({ resolve, reject }))
+    ));
+    if (queued.length === 0) {
+      this.startEventWriteDrain();
+      await Promise.all(completions);
+      return;
+    }
+
+    const bytes = queued.reduce((sum, row) => sum + row.bytes, 0);
+    const token = this.directEventWriteToken(queued.map(({ row }) => row), idempotencyKey);
+    this.assertEventWriteBatchCapacity(queued.length, bytes);
+    const batch = this.createEventWriteBatch(queued, token, 'direct');
+    this.rememberEventRevisionDigests(batch.rows);
+    this.eventWriteRows += queued.length;
+    this.eventWriteBytes += bytes;
+    this.eventWriteBatches.push(batch);
+    this.eventWriteBatchesByToken.set(token, batch);
+    const completion = new Promise<void>((resolve, reject) => batch.waiters.push({ resolve, reject }));
+    completions.push(completion);
+    this.startEventWriteDrain();
+    await Promise.all(completions);
+  }
+
   async flush(): Promise<void> {
-    // Chain flushes instead of allowing two callers to drain the buffers concurrently. A caller
-    // arriving during an insert receives its own pass after that insert, so rows appended while
-    // the first batch is in flight are not stranded (including during close()).
+    // Serialize the heartbeat side buffer with event draining. The event queue has its own FIFO
+    // retry state, while this outer chain prevents two heartbeat inserts from racing.
     const previous = this.flushInFlight ?? Promise.resolve();
     const operation = previous
       .catch(() => undefined)
@@ -1641,45 +2465,552 @@ export class ClickHouseStore implements OnModuleDestroy {
   }
 
   private async flushBatch(): Promise<void> {
-    if (!this.client) return;
-    const values = prepareCommitBatch(this.buf);
-    this.buf = [];
-    if (values.length) {
-      this.flushBatchMinEventTimeMs = Math.min(
-        ...values.map((row) => Number(row.at) || Number.MAX_SAFE_INTEGER),
-      );
-      try {
-        await this.client.insert({ table: TABLE, values, format: 'JSONEachRow' });
-        this.committedThroughMs = Math.max(
-          this.committedThroughMs ?? 0,
-          ...values.map((row) => Number(row.at) || 0),
-        );
-        this.noteCommittedRows(values);
-      } catch (err) {
-        // A transient durable-store failure must not leave the hot ring as the only remaining
-        // copy. Put the failed batch before rows that arrived while the insert was in flight.
-        this.buf = [...values, ...this.buf];
-        console.error('[clickhouse] insert failed (batch queued for retry):', (err as Error).message);
-      } finally {
-        this.flushBatchMinEventTimeMs = undefined;
-      }
-    }
+    const client = this.client;
+    if (!client) return;
+    this.sealBufferedEventBatches(true);
+    if (this.eventWriteBatches.length) await this.ensureEventWriteDrain();
+
     const heartbeatValues = this.collectorHeartbeatBuf;
     this.collectorHeartbeatBuf = [];
-    if (heartbeatValues.length) {
-      try {
-        await this.client.insert({
-          table: COLLECTOR_HEARTBEAT_TABLE,
-          values: heartbeatValues,
-          format: 'JSONEachRow',
-        });
-      } catch (err) {
-        this.collectorHeartbeatBuf = [...heartbeatValues, ...this.collectorHeartbeatBuf];
-        console.error('[clickhouse] collector heartbeat insert failed (batch queued for retry):', (err as Error).message);
-      }
+    if (!heartbeatValues.length) return;
+    try {
+      await client.insert({
+        table: COLLECTOR_HEARTBEAT_TABLE,
+        values: heartbeatValues,
+        format: 'JSONEachRow',
+      });
+    } catch (error) {
+      this.collectorHeartbeatBuf = [...heartbeatValues, ...this.collectorHeartbeatBuf];
+      console.error('[clickhouse] collector heartbeat insert failed (batch queued for retry):', (error as Error).message);
     }
   }
 
+  private queuedEventRow(row: Row): QueuedEventRow {
+    const bytes = Buffer.byteLength(JSON.stringify(row), 'utf8') + 1;
+    if (bytes > EVENT_WRITE_BATCH_BYTES) {
+      const error = Object.assign(
+        new Error(`ClickHouse event row is ${bytes} bytes, above the ${EVENT_WRITE_BATCH_BYTES}-byte insert bound`),
+        { code: 'ANYSENTRY_CLICKHOUSE_EVENT_ROW_TOO_LARGE' },
+      );
+      console.error('[clickhouse] event write rejected:', {
+        code: error.code,
+        eventId: row.eventId,
+        bytes,
+        maxBytes: EVENT_WRITE_BATCH_BYTES,
+      });
+      throw error;
+    }
+    return { row, bytes };
+  }
+
+  private assertEventWriteCapacity(additionalBytes: number): void {
+    this.assertEventWriteBatchCapacity(1, additionalBytes);
+  }
+
+  private assertEventWriteBatchCapacity(additionalRows: number, additionalBytes: number): void {
+    if (
+      this.eventWriteRows + additionalRows <= EVENT_WRITE_MAX_BUFFERED_ROWS &&
+      this.eventWriteBytes + additionalBytes <= EVENT_WRITE_MAX_BUFFERED_BYTES
+    ) return;
+    const error = Object.assign(
+      new Error('ClickHouse event write buffer is full; retry the ingest request'),
+      // Capacity is checked before the row joins any batch or enters an HTTP request. Callers may
+      // expose this exact failure as retryable only while they can still prove no earlier stage
+      // accepted the event.
+      { code: 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL', retrySafe: true as const },
+    );
+    // enqueue() intentionally remains synchronous for the existing judge path. Throwing is the
+    // only available backpressure signal; silently dropping here would falsely claim durability.
+    console.error('[clickhouse] event write buffer capacity reached:', {
+      code: error.code,
+      rows: this.eventWriteRows,
+      bytes: this.eventWriteBytes,
+      maxRows: EVENT_WRITE_MAX_BUFFERED_ROWS,
+      maxBytes: EVENT_WRITE_MAX_BUFFERED_BYTES,
+    });
+    throw error;
+  }
+
+  private createEventWriteBatch(
+    queued: QueuedEventRow[],
+    token: string,
+    source: EventWriteBatch['source'],
+  ): EventWriteBatch {
+    const rows = prepareCommitBatch(queued.map(({ row }) => row), token);
+    return {
+      rows,
+      bytes: queued.reduce((sum, row) => sum + row.bytes, 0),
+      token,
+      settings: {
+        insert_deduplicate: 1,
+        insert_deduplication_token: token,
+      },
+      source,
+      waiters: [],
+      retryNotBefore: 0,
+      createdAt: this.eventWriteNow(),
+    };
+  }
+
+  /** Seal every eligible buffered chunk, retaining arrival order and a stable retry token. */
+  private sealBufferedEventBatches(forceTail: boolean): boolean {
+    let sealed = false;
+    while (
+      this.buf.length > 0 &&
+      (forceTail || this.buf.length >= EVENT_WRITE_BATCH_ROWS || this.bufferedEventBytes >= EVENT_WRITE_BATCH_BYTES)
+    ) {
+      let count = 0;
+      let bytes = 0;
+      for (const queued of this.buf) {
+        if (count >= EVENT_WRITE_BATCH_ROWS) break;
+        if (count > 0 && bytes + queued.bytes > EVENT_WRITE_BATCH_BYTES) break;
+        count += 1;
+        bytes += queued.bytes;
+      }
+      if (count === 0) break;
+      const queued = this.buf.splice(0, count);
+      this.bufferedEventBytes = Math.max(0, this.bufferedEventBytes - bytes);
+      const token = `events-${randomUUID()}`;
+      const batch = this.createEventWriteBatch(queued, token, 'buffered');
+      this.eventWriteBatches.push(batch);
+      this.eventWriteBatchesByToken.set(token, batch);
+      sealed = true;
+    }
+    return sealed;
+  }
+
+  private stableEventRevision(row: Row): Record<string, unknown> {
+    // Keep the legacy property order byte-for-byte when correlation is absent: rolling upgrades
+    // must calculate the same ClickHouse deduplication token for the same old event. Deleting the
+    // additive query projections leaves all pre-existing keys in their original insertion order.
+    const stableRevision = { ...row } as Record<string, unknown>;
+    delete stableRevision.ingestedAt;
+    delete stableRevision.commitBatchId;
+    delete stableRevision.logicalKeyVersion;
+    delete stableRevision.eventLogicalKey;
+    delete stableRevision.payloadFingerprintVersion;
+    delete stableRevision.payloadFingerprint;
+    delete stableRevision.invocationId;
+    delete stableRevision.toolCallId;
+    delete stableRevision.processInstanceKey;
+    delete stableRevision.processHostId;
+    delete stableRevision.processBootId;
+    delete stableRevision.processPid;
+    delete stableRevision.processPpid;
+    delete stableRevision.processPidNamespace;
+    delete stableRevision.processNamespacePid;
+    delete stableRevision.processNamespacePpid;
+    delete stableRevision.processStartTimeTicks;
+    delete stableRevision.processStartTimeNs;
+    delete stableRevision.evidenceResourceHash;
+    delete stableRevision.evidenceCommandHash;
+    delete stableRevision.correlationMethod;
+    delete stableRevision.correlationConfidence;
+    delete stableRevision.classificationSemantics;
+    const process = String(stableRevision.process ?? '');
+    try {
+      const parsed = JSON.parse(process) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        delete parsed.lifecycleSource;
+        delete parsed.lifecycleReason;
+        stableRevision.process = JSON.stringify(parsed);
+      }
+    } catch {
+      // Preserve malformed legacy payloads byte-for-byte in the token.
+    }
+    const attribution = String(stableRevision.attribution ?? '');
+    try {
+      const parsed = JSON.parse(attribution) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && 'correlation' in parsed) {
+        delete parsed.correlation;
+        // Reassigning an existing property does not change its insertion order.
+        stableRevision.attribution = JSON.stringify(parsed);
+      }
+    } catch {
+      // Preserve malformed legacy payloads byte-for-byte in the token.
+    }
+    return stableRevision;
+  }
+
+  private eventRevisionKey(row: Row): string {
+    return `${row.eventId}\0${Math.max(1, Math.trunc(Number(row.decisionRevision) || 1))}`;
+  }
+
+  private eventRevisionDigest(row: Row): string {
+    // Receipt timestamps and generated span ids may legitimately change when an old observer client
+    // retries a sourceEventId. They do not change the semantic revision. Every decision/evidence
+    // field remains covered so a real revision conflict is still rejected.
+    const {
+      ingestedAt: _ingestedAt,
+      commitBatchId: _commitBatchId,
+      logicalKeyVersion: _logicalKeyVersion,
+      eventLogicalKey: _eventLogicalKey,
+      payloadFingerprintVersion: _payloadFingerprintVersion,
+      payloadFingerprint: _payloadFingerprint,
+      at: _at,
+      decisionUpdatedAt: _decisionUpdatedAt,
+      spanId: _spanId,
+      invocationId: _invocationId,
+      toolCallId: _toolCallId,
+      processInstanceKey: _processInstanceKey,
+      processHostId: _processHostId,
+      processBootId: _processBootId,
+      processPid: _processPid,
+      processPpid: _processPpid,
+      processPidNamespace: _processPidNamespace,
+      processNamespacePid: _processNamespacePid,
+      processNamespacePpid: _processNamespacePpid,
+      processStartTimeTicks: _processStartTimeTicks,
+      processStartTimeNs: _processStartTimeNs,
+      evidenceResourceHash: _evidenceResourceHash,
+      evidenceCommandHash: _evidenceCommandHash,
+      correlationMethod: _correlationMethod,
+      correlationConfidence: _correlationConfidence,
+      classificationSemantics: _classificationSemantics,
+      attribution,
+      ...semanticRevision
+    } = row;
+    const process = String(semanticRevision.process ?? '');
+    try {
+      const parsed = JSON.parse(process) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        delete parsed.lifecycleSource;
+        delete parsed.lifecycleReason;
+        // Reassigning preserves the legacy Row property order used by rolling versions.
+        semanticRevision.process = JSON.stringify(parsed);
+      }
+    } catch {
+      // Preserve malformed legacy payloads byte-for-byte in the digest.
+    }
+    // Correlation is a rollout-derived, additive view. The same immutable source/decision revision
+    // may legitimately be retried while a node moves between off and shadow. Exclude only that
+    // nested view (and its query projections) from the revision digest; every pre-existing
+    // attribution, decision, evidence, and payload field remains conflict-protected.
+    let stableAttribution = attribution;
+    try {
+      const parsed = JSON.parse(attribution) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        delete parsed.correlation;
+        stableAttribution = JSON.stringify(parsed);
+      }
+    } catch {
+      // Preserve malformed legacy payloads byte-for-byte in the digest.
+    }
+    return createHash('sha256')
+      .update(JSON.stringify({ ...semanticRevision, attribution: stableAttribution }))
+      .digest('hex');
+  }
+
+  private assertEventRevisionConsistency(rows: readonly Row[]): void {
+    const pending = new Map<string, string>();
+    for (const row of rows) {
+      const key = this.eventRevisionKey(row);
+      const digest = this.eventRevisionDigest(row);
+      const existing = pending.get(key) ?? this.eventRevisionDigests.get(key);
+      if (existing && existing !== digest) {
+        throw Object.assign(
+          new Error(`event revision conflict for ${row.eventId} revision ${row.decisionRevision}`),
+          {
+            code: EVENT_REVISION_CONFLICT,
+            eventId: row.eventId,
+            decisionRevision: row.decisionRevision,
+          },
+        );
+      }
+      pending.set(key, digest);
+    }
+  }
+
+  private rememberEventRevisionDigests(rows: readonly Row[]): void {
+    for (const row of rows) {
+      const key = this.eventRevisionKey(row);
+      if (this.eventRevisionDigests.has(key)) this.eventRevisionDigests.delete(key);
+      this.eventRevisionDigests.set(key, this.eventRevisionDigest(row));
+    }
+    while (this.eventRevisionDigests.size > EVENT_REVISION_DIGEST_CACHE_SIZE) {
+      const oldest = this.eventRevisionDigests.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.eventRevisionDigests.delete(oldest);
+    }
+  }
+
+  private rememberCommittedEventRevisionDigests(rows: readonly Row[]): void {
+    for (const row of rows) {
+      const key = this.eventRevisionKey(row);
+      if (this.committedEventRevisionDigests.has(key)) this.committedEventRevisionDigests.delete(key);
+      this.committedEventRevisionDigests.set(key, this.eventRevisionDigest(row));
+    }
+    while (this.committedEventRevisionDigests.size > EVENT_REVISION_DIGEST_CACHE_SIZE) {
+      const oldest = this.committedEventRevisionDigests.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.committedEventRevisionDigests.delete(oldest);
+    }
+  }
+
+  private directEventWriteToken(rows: readonly Row[], idempotencyKey?: string): string {
+    const hash = createHash('sha256');
+    if (idempotencyKey) hash.update('upstream\0').update(idempotencyKey);
+    else {
+      hash.update('revisions\0');
+      for (const row of rows) {
+        hash.update(JSON.stringify(this.stableEventRevision(row))).update('\n');
+      }
+    }
+    return `event-${hash.digest('hex')}`;
+  }
+
+  private startEventWriteDrain(): void {
+    void this.ensureEventWriteDrain().catch(() => undefined);
+  }
+
+  private ensureEventWriteDrain(): Promise<void> {
+    if (this.eventWriteDrainInFlight) return this.eventWriteDrainInFlight;
+    let tracked!: Promise<void>;
+    tracked = this.drainEventWrites().finally(() => {
+      if (this.eventWriteDrainInFlight !== tracked) return;
+      this.eventWriteDrainInFlight = undefined;
+      // A direct-write waiter is resolved before the owner promise's finalizer runs. Its caller may
+      // enqueue the next lifecycle revision in that continuation and observe this just-completed
+      // owner. Re-check after clearing it so the newly queued head cannot remain stranded until the
+      // periodic timer. Respect retry cooldowns to avoid a rejected-drain microtask spin.
+      const head = this.eventWriteBatches[0];
+      const now = this.eventWriteNow();
+      const mayRestart = this.closing
+        ? this.eventWriteClosingDeadline !== undefined && now < this.eventWriteClosingDeadline
+        : Boolean(head && head.retryNotBefore <= now);
+      if (
+        head &&
+        this.client &&
+        !this.eventWritePermanentError &&
+        mayRestart
+      ) this.startEventWriteDrain();
+    });
+    this.eventWriteDrainInFlight = tracked;
+    return tracked;
+  }
+
+  private async drainEventWrites(): Promise<void> {
+    while (this.eventWriteBatches.length > 0) {
+      if (this.eventWritePermanentError) throw this.eventWritePermanentError;
+      const batch = this.eventWriteBatches[0];
+      const now = this.eventWriteNow();
+      if (!this.closing && batch.retryNotBefore > now) {
+        this.scheduleEventWriteRetry(batch.retryNotBefore);
+        throw batch.lastError ?? new Error('ClickHouse event batch is waiting for its retry cooldown');
+      }
+      const outcome = await this.insertEventWriteBatch(batch);
+      if (outcome.status === 'success') {
+        this.committedThroughMs = Math.max(
+          this.committedThroughMs ?? 0,
+          ...batch.rows.map((row) => Number(row.at) || 0),
+        );
+        this.noteCommittedRows(batch.rows);
+        this.rememberCommittedEventRevisionDigests(batch.rows);
+        this.eventWriteBatches.shift();
+        this.eventWriteBatchesByToken.delete(batch.token);
+        this.eventWriteRows = Math.max(0, this.eventWriteRows - batch.rows.length);
+        this.eventWriteBytes = Math.max(0, this.eventWriteBytes - batch.bytes);
+        for (const waiter of batch.waiters.splice(0)) waiter.resolve();
+        continue;
+      }
+
+      batch.lastError = outcome.error;
+      if (outcome.status === 'permanent') {
+        this.eventWritePermanentError = outcome.error;
+        for (const waiter of batch.waiters.splice(0)) waiter.reject(outcome.error);
+        console.error('[clickhouse] event insert permanently blocked; batch retained:', {
+          token: batch.token,
+          rows: batch.rows.length,
+          bytes: batch.bytes,
+          code: outcome.decision.code,
+          ambiguous: outcome.decision.ambiguous,
+          message: outcome.error.message,
+        });
+        throw outcome.error;
+      }
+
+      // The active retry cycle is bounded. Keep the exact sealed batch and any direct-write
+      // waiters at the head, then retry after a cooldown rather than spinning. Rejecting a waiter
+      // here while retaining and later applying the batch would let its caller advance lifecycle
+      // work under the false belief that this revision was never persisted.
+      batch.retryNotBefore = this.closing ? 0 : this.eventWriteNow() + EVENT_WRITE_RETRY_COOLDOWN_MS;
+      if (!this.closing) this.scheduleEventWriteRetry(batch.retryNotBefore);
+      console.error('[clickhouse] event insert retry deadline reached; batch retained:', {
+        token: batch.token,
+        rows: batch.rows.length,
+        bytes: batch.bytes,
+        code: outcome.decision.code,
+        ambiguous: outcome.decision.ambiguous,
+        message: outcome.error.message,
+      });
+      throw outcome.error;
+    }
+  }
+
+  private async insertEventWriteBatch(batch: EventWriteBatch): Promise<
+    | { status: 'success' }
+    | { status: 'retry_later'; error: Error; decision: EventWriteErrorDecision }
+    | { status: 'permanent'; error: Error; decision: EventWriteErrorDecision }
+  > {
+    const cycleDeadline = this.eventWriteNow() + this.eventWriteRetryDeadlineMs;
+    const activeDeadline = (): number => Math.min(
+      cycleDeadline,
+      this.eventWriteClosingDeadline ?? Number.POSITIVE_INFINITY,
+    );
+    let failedAttempts = 0;
+    let lastError = new Error('ClickHouse event insert retry deadline reached');
+    let lastDecision: EventWriteErrorDecision = { retryable: true, ambiguous: true, code: 'DEADLINE' };
+
+    while (this.eventWriteNow() < activeDeadline()) {
+      try {
+        await this.insertEventWriteAttempt(batch, activeDeadline());
+        return { status: 'success' };
+      } catch (error) {
+        lastError = this.asEventWriteError(error);
+        lastDecision = this.classifyEventWriteError(lastError);
+        if (!lastDecision.retryable) {
+          return { status: 'permanent', error: lastError, decision: lastDecision };
+        }
+        failedAttempts += 1;
+        const delayMs = this.eventWriteRetryDelayMs(failedAttempts);
+        console.error('[clickhouse] event insert retrying:', {
+          token: batch.token,
+          attempt: failedAttempts,
+          delayMs,
+          code: lastDecision.code,
+          ambiguous: lastDecision.ambiguous,
+          message: lastError.message,
+        });
+        if (this.eventWriteNow() + delayMs >= activeDeadline()) break;
+        await this.sleepBeforeEventWriteRetry(delayMs);
+      }
+    }
+    return { status: 'retry_later', error: lastError, decision: lastDecision };
+  }
+
+  private async insertEventWriteAttempt(batch: EventWriteBatch, cycleDeadline: number): Promise<void> {
+    const client = this.client;
+    if (!client) throw new Error('ClickHouse client is unavailable');
+    const controller = new AbortController();
+    this.eventWriteAbortController = controller;
+    let attemptTimedOut = false;
+    const remainingMs = Math.max(1, cycleDeadline - this.eventWriteNow());
+    const timer = setTimeout(() => {
+      attemptTimedOut = true;
+      controller.abort('ClickHouse event insert attempt timed out');
+    }, Math.min(this.eventWriteAttemptTimeoutMs, remainingMs));
+    try {
+      await client.insert({
+        table: TABLE,
+        values: batch.rows,
+        format: 'JSONEachRow',
+        clickhouse_settings: batch.settings,
+        abort_signal: controller.signal,
+      });
+    } catch (error) {
+      const normalized = this.asEventWriteError(error);
+      if (attemptTimedOut) Object.assign(normalized, { eventWriteAttemptTimedOut: true });
+      throw normalized;
+    } finally {
+      clearTimeout(timer);
+      if (this.eventWriteAbortController === controller) this.eventWriteAbortController = undefined;
+    }
+  }
+
+  private asEventWriteError(error: unknown): Error {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+
+  private classifyEventWriteError(error: Error): EventWriteErrorDecision {
+    const detail = error as Error & {
+      code?: string | number;
+      type?: string;
+      status?: string | number;
+      statusCode?: string | number;
+      eventWriteAttemptTimedOut?: boolean;
+    };
+    const code = detail.code == null ? '' : String(detail.code);
+    const type = detail.type ?? '';
+    if (detail.eventWriteAttemptTimedOut) return { retryable: true, ambiguous: true, code: 'ATTEMPT_TIMEOUT' };
+
+    const status = Number(detail.status ?? detail.statusCode);
+    const retryableHttpStatuses = new Set([408, 425, 429, 502, 503, 504]);
+    if (retryableHttpStatuses.has(status)) {
+      // A 408 may be returned after an upstream accepted bytes; the remaining explicit gateway/
+      // overload responses are known unsuccessful responses rather than ambiguous applications.
+      return { retryable: true, ambiguous: status === 408, code: `HTTP_${status}` };
+    }
+
+    const transientServerTypes = new Set([
+      'MEMORY_LIMIT_EXCEEDED',
+      'TOO_MANY_SIMULTANEOUS_QUERIES',
+      'TOO_MANY_PARTS',
+    ]);
+    if (code === '241' || transientServerTypes.has(type)) {
+      return { retryable: true, ambiguous: false, code: type || code };
+    }
+    const ambiguousServerTypes = new Set([
+      'TIMEOUT_EXCEEDED',
+      'NETWORK_ERROR',
+      'SOCKET_TIMEOUT',
+      'UNKNOWN_STATUS_OF_INSERT',
+    ]);
+    if (ambiguousServerTypes.has(type)) return { retryable: true, ambiguous: true, code: type };
+
+    const transportCodes = new Set([
+      'ECONNREFUSED',
+      'ENOTFOUND',
+      'EHOSTUNREACH',
+      'ENETUNREACH',
+      'EAI_AGAIN',
+      'ECONNRESET',
+      'EPIPE',
+      'ETIMEDOUT',
+      'UND_ERR_CONNECT_TIMEOUT',
+    ]);
+    if (transportCodes.has(code)) {
+      const definitelyBeforeApply = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH', 'EAI_AGAIN']);
+      return { retryable: true, ambiguous: !definitelyBeforeApply.has(code), code };
+    }
+    if (/timeout error|socket hang up|aborted a request/i.test(error.message)) {
+      return { retryable: true, ambiguous: true, code: code || 'TRANSPORT_TIMEOUT' };
+    }
+    return { retryable: false, ambiguous: false, code: type || code || 'PERMANENT_OR_UNKNOWN' };
+  }
+
+  private sleepBeforeEventWriteRetry(milliseconds: number): Promise<void> {
+    if (milliseconds <= 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer!: NodeJS.Timeout;
+      const wake = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (this.eventWriteRetrySleep?.wake === wake) this.eventWriteRetrySleep = undefined;
+        resolve();
+      };
+      timer = setTimeout(wake, milliseconds);
+      this.eventWriteRetrySleep = { timer, wake };
+    });
+  }
+
+  private wakeEventWriteRetrySleep(): void {
+    this.eventWriteRetrySleep?.wake();
+  }
+
+  private scheduleEventWriteRetry(at: number): void {
+    if (this.closing || this.eventWritePermanentError) return;
+    if (this.eventWriteRetryWakeTimer) clearTimeout(this.eventWriteRetryWakeTimer);
+    const delayMs = Math.max(0, at - this.eventWriteNow());
+    this.eventWriteRetryWakeTimer = setTimeout(() => {
+      this.eventWriteRetryWakeTimer = undefined;
+      this.startEventWriteDrain();
+    }, delayMs);
+    this.eventWriteRetryWakeTimer.unref?.();
+  }
+
+  /** Load the most-recent `limit` events at/after `sinceMs`, oldest-first (to seed the hot ring). */
   enqueueCollectorHeartbeat(record: CollectorHeartbeatRecord): void {
     if (!this.ready) return;
     this.collectorHeartbeatBuf.push({
@@ -1744,20 +3075,18 @@ export class ClickHouseStore implements OnModuleDestroy {
   }
 
   /** Load the most-recent `limit` events at/after `sinceMs`, oldest-first (to seed the hot ring). */
+
   async hydrate(sinceMs: number, limit: number): Promise<JudgedEvent[]> {
-    if (!this.client) return [];
-    try {
-      const rs = await this.client.query({
-        query: `SELECT * FROM (SELECT * FROM ${TABLE} WHERE at >= {since:UInt64} ORDER BY at DESC LIMIT {lim:UInt32}) ORDER BY at ASC`,
-        query_params: { since: sinceMs, lim: Math.min(limit * 3, 300_000) },
-        format: 'JSONEachRow',
-      });
-      const rows = (await rs.json()) as Array<Record<string, unknown>>;
-      return foldLatestEventRevisions(rows.map(fromRow)).sort((a, b) => a.at - b.at).slice(-limit);
-    } catch (err) {
-      console.error('[clickhouse] hydrate failed:', (err as Error).message);
-      return [];
-    }
+    const safeLimit = Math.max(1, Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, Math.round(limit)));
+    // Reuse the durable search's narrow locator sort and late materialization. The former
+    // SELECT-* Top-N hydration path could exhaust 640 MiB merely reading `attributes` from a busy
+    // 30-day part, leaving the API healthy but its hot cache empty after every restart.
+    const events = await this.searchEvents({
+      sinceMs,
+      untilMs: Date.now(),
+      limit: safeLimit,
+    });
+    return (events ?? []).sort((left, right) => left.at - right.at).slice(-safeLimit);
   }
 
   /** Read the latest persisted events from a bounded interval for dashboard timelines. */
@@ -1768,37 +3097,68 @@ export class ClickHouseStore implements OnModuleDestroy {
     options: { monitoredOnly?: boolean; tier?: string } = {},
   ): Promise<JudgedEvent[] | null> {
     if (!this.client || !this.ready) return null;
+    const client = this.client;
     const safeLimit = Math.max(1, Math.min(5_000, Math.round(limit)));
-    const clauses = ['at >= {since:UInt64}', 'at <= {until:UInt64}'];
-    if (options.monitoredOnly) clauses.push('agentMonitored = 1');
-    if (options.tier) clauses.push('tier = {tier:String}');
-    try {
-      const rs = await this.client.query({
-        query: `
+    const monitoredOnly = Boolean(options.monitoredOnly);
+    const tier = options.tier ?? '';
+    const queryKey = JSON.stringify([String(sinceMs), String(untilMs), safeLimit, monitoredOnly, tier]);
+    const current = this.recentQueryInFlight;
+    if (current) {
+      if (current.key !== queryKey) return null;
+      const shared = await current.value;
+      return shared ? [...shared] : null;
+    }
+    const release = this.tryAcquireWideEventReadSlot();
+    if (!release) return null;
+    // Attribution is copied unchanged into every judgment revision, so monitored can safely narrow
+    // the primary-key sample. Tier changes across L1/L2/L3 and must be filtered only after the
+    // latest revision is selected.
+    const scanFilters = monitoredOnly ? ["JSONExtractBool(attribution, 'monitored')"] : [];
+    const latestFilters = tier ? ['tier = {tier:String}'] : [];
+    const value = (async (): Promise<JudgedEvent[] | null> => {
+      try {
+        const rs = await client.query({
+          query: `
           SELECT *
           FROM (
             SELECT *
-            FROM ${TABLE}
-            WHERE ${clauses.join(' AND ')}
-            ORDER BY at DESC, decisionRevision DESC, decisionUpdatedAt DESC
-            LIMIT {scanLimit:UInt32}
+            FROM (
+              SELECT *
+              FROM ${TABLE}
+              PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}
+              ${scanFilters.length ? `WHERE ${scanFilters.join(' AND ')}` : ''}
+              ORDER BY at DESC
+              LIMIT {scanLimit:UInt32} WITH TIES
+            )
+            ORDER BY at DESC, decisionUpdatedAt DESC
+            LIMIT 1 BY eventId
           )
-          ORDER BY at DESC, decisionRevision DESC, decisionUpdatedAt DESC
-          LIMIT 1 BY eventId
+          ${latestFilters.length ? `WHERE ${latestFilters.join(' AND ')}` : ''}
+          ORDER BY at DESC, decisionUpdatedAt DESC
           LIMIT {limit:UInt32}`,
-        query_params: {
-          since: sinceMs,
-          until: untilMs,
-          tier: options.tier ?? '',
-          scanLimit: Math.min(15_000, safeLimit * 3),
-          limit: safeLimit,
-        },
-        format: 'JSONEachRow',
-      });
-      return (await rs.json() as Array<Record<string, unknown>>).map(fromRow);
-    } catch (error) {
-      console.error('[clickhouse] recent dashboard events query failed:', (error as Error).message);
-      return null;
+          query_params: {
+            since: sinceMs,
+            until: untilMs,
+            tier,
+            scanLimit: tier ? 15_000 : Math.min(15_000, safeLimit * 3),
+            limit: safeLimit,
+          },
+          clickhouse_settings: BOUNDED_RECENT_READ_SETTINGS,
+          format: 'JSONEachRow',
+        });
+        return (await rs.json() as Array<Record<string, unknown>>).map(fromRow);
+      } catch (error) {
+        console.error('[clickhouse] recent dashboard events query failed:', (error as Error).message);
+        return null;
+      }
+    })();
+    this.recentQueryInFlight = { key: queryKey, value };
+    try {
+      const rows = await value;
+      return rows ? [...rows] : null;
+    } finally {
+      if (this.recentQueryInFlight?.value === value) this.recentQueryInFlight = undefined;
+      release();
     }
   }
 
@@ -1814,10 +3174,6 @@ export class ClickHouseStore implements OnModuleDestroy {
   ): Promise<EventCommitChanges | null> {
     if (!this.client || !this.ready) return null;
     const safeLimit = Math.max(1, Math.min(100_000, Math.trunc(limit)));
-    // Replay a short server-commit-time boundary on every page. ClickHouse assigns committedAt in
-    // the MV, while commitBatchId disambiguates batches sharing the same millisecond. Replaying is
-    // intentional: cache invalidation is idempotent and this closes the race where a concurrent
-    // insert becomes visible just after a reader advanced within the same server millisecond.
     const replayMs = boundedPositiveInt(
       process.env.ANYSENTRY_COMMIT_CURSOR_REPLAY_MS,
       250,
@@ -1947,7 +3303,7 @@ export class ClickHouseStore implements OnModuleDestroy {
 
   /**
    * Read the complete persisted tail without an arbitrary row limit. The interval is intentionally
-   * short (the Dashboard uses 60 seconds), and the latest decision revision is selected before the
+   * short (the Dashboard uses one absolute bucket), and the latest decision revision is selected before the
    * result is merged with the in-process hot ring.
    */
   async dashboardTailEvents(startMs: number, endMs: number): Promise<JudgedEvent[] | null> {
@@ -1956,19 +3312,32 @@ export class ClickHouseStore implements OnModuleDestroy {
     try {
       const result = await this.client.query({
         query: `
-          SELECT *
-          FROM (
-            SELECT *
-            FROM ${TABLE}
-            WHERE at >= {start:UInt64} AND at <= {end:UInt64}
-            ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
-            LIMIT 1 BY eventId
-          )
-          ORDER BY at, eventId`,
+          SELECT sourceEvent.*
+          FROM ${TABLE} AS sourceEvent
+          PREWHERE
+            sourceEvent.at >= {start:UInt64}
+            AND sourceEvent.at <= {end:UInt64}
+            AND tuple(sourceEvent.at, sourceEvent._part, sourceEvent._part_offset) IN (
+              SELECT
+                tupleElement(locator, 1),
+                tupleElement(locator, 2),
+                tupleElement(locator, 3)
+              FROM (
+                SELECT argMax(
+                  tuple(at, _part, _part_offset),
+                  tuple(decisionRevision, decisionUpdatedAt, at)
+                ) AS locator
+                FROM ${TABLE}
+                PREWHERE at >= {start:UInt64} AND at <= {end:UInt64}
+                GROUP BY eventId
+              )
+            )
+          ORDER BY sourceEvent.at, sourceEvent.eventId`,
         query_params: {
           start: Math.max(0, Math.trunc(startMs)),
           end: Math.max(0, Math.trunc(endMs)),
         },
+        clickhouse_settings: BOUNDED_EVENT_SEARCH_READ_SETTINGS,
         format: 'JSONEachRow',
       });
       return (await result.json() as Array<Record<string, unknown>>).map(fromRow);
@@ -1992,7 +3361,17 @@ export class ClickHouseStore implements OnModuleDestroy {
       process.env.ANYSENTRY_PERSISTED_DASHBOARD_BUCKETS !== 'off' &&
       start % size === 0 &&
       end % size === 0;
-    if (!canPersist) return this.queryDashboardAggregateBucketFactsRaw(start, end, size);
+    if (!canPersist) {
+      // Cache boundary slices are at most one bucket wide. Refuse an accidentally unaligned wide
+      // scan instead of bypassing the persisted-snapshot admission control.
+      if (end - start > DASHBOARD_BUCKET_BUILD_CHUNK_MS) return null;
+      return this.queryDashboardAggregateBucketFactsRaw(start, end, size);
+    }
+    const requestedBuckets = Math.ceil((end - start) / size);
+    if (requestedBuckets > DASHBOARD_PERSISTED_READ_MAX_BUCKETS) {
+      this.dashboardSnapshotStats.rangeRejects += 1;
+      return null;
+    }
 
     try {
       const stored = await this.readPersistedDashboardBuckets(start, end, size);
@@ -2012,79 +3391,24 @@ export class ClickHouseStore implements OnModuleDestroy {
         }
       }
 
-      // A very fragmented retained snapshot set should not turn into a query fan-out. Recompute
-      // one bounded span and replace all buckets in it instead.
-      // Once persisted snapshots are populated, late revisions usually leave a small number of
-      // sparse dirty buckets. Collapsing 9-20 isolated buckets into one hour-wide envelope defeats
-      // the cache and rescans hundreds of thousands of unrelated rows. Keep bounded point ranges
-      // until fragmentation is genuinely pathological.
-      const ranges = missingRanges.length > 32
-        ? [{ start: missingRanges[0].start, end: missingRanges.at(-1)!.end }]
-        : missingRanges;
-      if (ranges.length) {
-        const envelopeStart = ranges[0].start;
-        const envelopeEnd = ranges.at(-1)!.end;
-        const missingBuckets = new Set<number>();
-        for (const range of ranges) {
-          for (let bucket = range.start; bucket < range.end; bucket += size) {
-            missingBuckets.add(bucket);
-          }
+      // Cold bootstrap must not fold several hours of high-cardinality events in one query. Split
+      // missing history into fixed absolute chunks and build only a bounded number per request.
+      // Successful chunks are durable, so later polls resume instead of repeating prior work.
+      const chunkMs = Math.max(size, Math.floor(DASHBOARD_BUCKET_BUILD_CHUNK_MS / size) * size);
+      const buildRanges = missingRanges.flatMap((range) => {
+        const chunks: Array<{ start: number; end: number }> = [];
+        for (let chunkStart = range.start; chunkStart < range.end; chunkStart += chunkMs) {
+          chunks.push({ start: chunkStart, end: Math.min(range.end, chunkStart + chunkMs) });
         }
-        const beforeByBucket = await this.eventCommitCursorsForBuckets(
-          envelopeStart,
-          envelopeEnd,
-          size,
-        );
-        const beforeGlobal = await this.latestEventCommitCursor();
-        const grouped = new Map<number, DashboardAggregateBucketFact[]>();
-        for (const range of ranges) {
-          this.dashboardSnapshotStats.exactRanges += 1;
-          const rows = await this.queryDashboardAggregateBucketFactsRaw(
-            range.start,
-            range.end,
-            size,
-          );
-          if (rows === null) return null;
-          for (const row of rows) {
-            const bucketRows = grouped.get(row.bucketStartMs) ?? [];
-            bucketRows.push(row);
-            grouped.set(row.bucketStartMs, bucketRows);
-          }
-          for (let bucket = range.start; bucket < range.end; bucket += size) {
-            byBucket.set(bucket, grouped.get(bucket) ?? []);
-          }
-        }
-
-        const afterByBucket = await this.eventCommitCursorsForBuckets(
-          envelopeStart,
-          envelopeEnd,
-          size,
-        );
-        const afterGlobal = await this.latestEventCommitCursor();
-        if (beforeGlobal && afterGlobal) {
-          const stableCursors = new Map<number, EventCommitCursor>();
-          const globalStable =
-            compareEventCommitCursor(beforeGlobal, afterGlobal) === 0;
-          for (const bucket of missingBuckets) {
-            const before = beforeByBucket.get(bucket);
-            const after = afterByBucket.get(bucket);
-            if (before && after && compareEventCommitCursor(before, after) === 0) {
-              stableCursors.set(bucket, after);
-            } else if (!before && !after && globalStable) {
-              // Empty buckets need a global fence: no bucket-local cursor exists until the first
-              // late event arrives. A later event then advances the bucket cursor and invalidates
-              // this snapshot on the next read.
-              stableCursors.set(bucket, afterGlobal);
-            }
-          }
-          await this.writePersistedDashboardBuckets(
-            envelopeStart,
-            envelopeEnd,
-            size,
-            stableCursors,
-            grouped,
-          );
-        }
+        return chunks;
+      });
+      if (buildRanges.length > 0) {
+        // Snapshot warming is deliberately detached from the HTTP request. The dashboard can show
+        // its bounded hot/partial view immediately, while one single-flight worker materialises a
+        // few small durable chunks for subsequent refreshes. Additional requests never create a
+        // queue of raw scans.
+        this.scheduleDashboardBucketWarm(buildRanges, size);
+        return null;
       }
 
       const result: DashboardAggregateBucketFact[] = [];
@@ -2095,11 +3419,89 @@ export class ClickHouseStore implements OnModuleDestroy {
     } catch (error) {
       this.dashboardSnapshotStats.fallbackErrors += 1;
       console.warn(
-        '[clickhouse] persisted dashboard bucket cache unavailable; using exact raw aggregation:',
+        '[clickhouse] persisted dashboard bucket cache unavailable; returning bounded hot fallback:',
         (error as Error).message,
       );
-      return this.queryDashboardAggregateBucketFactsRaw(start, end, size);
+      return null;
     }
+  }
+
+  private scheduleDashboardBucketWarm(
+    buildRanges: ReadonlyArray<{ start: number; end: number }>,
+    bucketMs: number,
+  ): void {
+    if (this.dashboardSnapshotWarmInFlight || buildRanges.length === 0 || this.closing) return;
+    const ranges = buildRanges.slice(0, DASHBOARD_BUCKET_BUILD_MAX_CHUNKS);
+    let tracked!: Promise<void>;
+    tracked = (async () => {
+      for (const range of ranges) {
+        if (this.closing || !this.ready) return;
+        const before = await this.eventCommitCursorsForBuckets(
+          range.start,
+          range.end,
+          bucketMs,
+        );
+        const beforeGlobal = await this.latestEventCommitCursor();
+        if (!beforeGlobal) return;
+        this.dashboardSnapshotStats.exactRanges += 1;
+        const rows = await this.queryDashboardAggregateBucketFactsRaw(
+          range.start,
+          range.end,
+          bucketMs,
+        );
+        if (rows === null) return;
+        const grouped = new Map<number, DashboardAggregateBucketFact[]>();
+        for (const row of rows) {
+          const bucketRows = grouped.get(row.bucketStartMs) ?? [];
+          bucketRows.push(row);
+          grouped.set(row.bucketStartMs, bucketRows);
+        }
+        const after = await this.eventCommitCursorsForBuckets(
+          range.start,
+          range.end,
+          bucketMs,
+        );
+        const afterGlobal = await this.latestEventCommitCursor();
+        if (!afterGlobal) return;
+        const stableCursors = new Map<number, EventCommitCursor>();
+        const globalStable = compareEventCommitCursor(beforeGlobal, afterGlobal) === 0;
+        for (let bucket = range.start; bucket < range.end; bucket += bucketMs) {
+          const beforeCursor = before.get(bucket);
+          const afterCursor = after.get(bucket);
+          if (
+            beforeCursor
+            && afterCursor
+            && compareEventCommitCursor(beforeCursor, afterCursor) === 0
+          ) {
+            stableCursors.set(bucket, afterCursor);
+          } else if (!beforeCursor && !afterCursor && globalStable) {
+            stableCursors.set(bucket, afterGlobal);
+          }
+        }
+        // Only buckets whose complete commit cursor stayed stable across the raw aggregation are
+        // published. A concurrent late event leaves that bucket missing for the next warm pass.
+        await this.writePersistedDashboardBuckets(
+          range.start,
+          range.end,
+          bucketMs,
+          stableCursors,
+          grouped,
+        );
+        // Yield between chunks so ingestion continuations and control-plane HTTP work are not
+        // starved even when ClickHouse answers several warm-up queries immediately.
+        await delay(25);
+      }
+    })()
+      .catch((error) => {
+        this.dashboardSnapshotStats.fallbackErrors += 1;
+        console.warn('[clickhouse] dashboard bucket background warm failed:', (error as Error).message);
+      })
+      .finally(() => {
+        if (this.dashboardSnapshotWarmInFlight === tracked) {
+          this.dashboardSnapshotWarmInFlight = undefined;
+        }
+      });
+    this.dashboardSnapshotWarmInFlight = tracked;
   }
 
   /**
@@ -2119,8 +3521,8 @@ export class ClickHouseStore implements OnModuleDestroy {
       const result = await this.client.query({
         query: `
           SELECT
-            intDiv(at, {bucketMs:UInt64}) * {bucketMs:UInt64} AS bucketStart,
-            agentMonitored AS monitored,
+            intDiv(eventAt, {bucketMs:UInt64}) * {bucketMs:UInt64} AS bucketStart,
+            monitored,
             decisionStatus,
             verdict,
             tier,
@@ -2128,9 +3530,9 @@ export class ClickHouseStore implements OnModuleDestroy {
             riskCategory,
             riskName,
             multiIf(severity = 'critical', 4, severity = 'high', 3, severity = 'medium', 2, severity = 'low', 1, 0) AS severityRank,
-            agentSessionKey AS sessionKey,
+            if(agentSessionId != '', agentSessionId, if(agentDisplayName != '', agentDisplayName, if(agentScopeId != '', agentScopeId, agentId))) AS sessionKey,
             userId,
-            resolvedWorkspacePath,
+            if(processCwd != '', processCwd, if(agentScopeId != '', concat('agent://', agentScopeId), workspacePath)) AS resolvedWorkspacePath,
             count() AS eventCount,
             countIf(verdict = 'block' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS blockedCount,
             countIf(verdict = 'escalate' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS escalatedCount,
@@ -2141,18 +3543,37 @@ export class ClickHouseStore implements OnModuleDestroy {
             sumIf(tokenCount, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS tokenCount,
             sumIf(latencyMs, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS latencyTotal,
             sumIf(riskScore, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS riskScoreTotal,
-            max(at) AS lastEventAt,
+            max(eventAt) AS lastEventAt,
             countIf(verdict != 'allow' AND riskCategory = 'command_danger') AS commandDangerCount,
             countIf(verdict != 'allow' AND riskCategory = 'prompt_injection') AS promptInjectionCount,
             countIf(verdict != 'allow' AND riskCategory IN ('data_leak', 'secret_exfil')) AS dataLeakCount,
             countIf(verdict != 'allow' AND riskCategory = 'communication_risk') AS communicationRiskCount,
             countIf(verdict != 'allow' AND riskCategory IN ('systemic_risk', 'privilege_escalation')) AS systemicRiskCount
           FROM (
-            SELECT *
+            SELECT
+              eventId,
+              argMax(at, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventAt,
+              argMax(JSONExtractBool(attribution, 'monitored'), tuple(decisionRevision, decisionUpdatedAt, at)) AS monitored,
+              argMax(JSONExtractString(attribution, 'agentSessionId'), tuple(decisionRevision, decisionUpdatedAt, at)) AS agentSessionId,
+              argMax(JSONExtractString(attribution, 'agentDisplayName'), tuple(decisionRevision, decisionUpdatedAt, at)) AS agentDisplayName,
+              argMax(JSONExtractString(attribution, 'agentScopeId'), tuple(decisionRevision, decisionUpdatedAt, at)) AS agentScopeId,
+              argMax(JSONExtractString(process, 'cwd'), tuple(decisionRevision, decisionUpdatedAt, at)) AS processCwd,
+              argMax(decisionStatus, tuple(decisionRevision, decisionUpdatedAt, at)) AS decisionStatus,
+              argMax(verdict, tuple(decisionRevision, decisionUpdatedAt, at)) AS verdict,
+              argMax(tier, tuple(decisionRevision, decisionUpdatedAt, at)) AS tier,
+              argMax(riskType, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskType,
+              argMax(riskCategory, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskCategory,
+              argMax(riskName, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskName,
+              argMax(severity, tuple(decisionRevision, decisionUpdatedAt, at)) AS severity,
+              argMax(agentId, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentId,
+              argMax(userId, tuple(decisionRevision, decisionUpdatedAt, at)) AS userId,
+              argMax(workspacePath, tuple(decisionRevision, decisionUpdatedAt, at)) AS workspacePath,
+              argMax(tokenCount, tuple(decisionRevision, decisionUpdatedAt, at)) AS tokenCount,
+              argMax(latencyMs, tuple(decisionRevision, decisionUpdatedAt, at)) AS latencyMs,
+              argMax(riskScore, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskScore
             FROM ${TABLE}
-            WHERE at >= {start:UInt64} AND at < {end:UInt64}
-            ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
-            LIMIT 1 BY eventId
+            PREWHERE at >= {start:UInt64} AND at < {end:UInt64}
+            GROUP BY eventId
           )
           GROUP BY
             bucketStart, monitored, decisionStatus, verdict, tier, riskType, riskCategory, riskName,
@@ -2163,6 +3584,7 @@ export class ClickHouseStore implements OnModuleDestroy {
           end: Math.max(0, Math.trunc(endExclusiveMs)),
           bucketMs: size,
         },
+        clickhouse_settings: BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS,
         format: 'JSONEachRow',
       });
       const num = (value: unknown): number => Number(value) || 0;
@@ -2279,8 +3701,8 @@ export class ClickHouseStore implements OnModuleDestroy {
           const factsJson = String(row.latestFactsJson ?? '[]');
           const expectedChecksum = String(row.latestPayloadChecksum ?? '');
           if (
-            expectedChecksum &&
-            createHash('sha256').update(factsJson).digest('hex') !== expectedChecksum
+            expectedChecksum
+            && createHash('sha256').update(factsJson).digest('hex') !== expectedChecksum
           ) {
             this.dashboardSnapshotStats.invalidated += 1;
             return [];
@@ -2446,69 +3868,73 @@ export class ClickHouseStore implements OnModuleDestroy {
         argMax(sourceEvent.riskCategory, tuple(sourceEvent.decisionRevision, sourceEvent.decisionUpdatedAt, sourceEvent.at)) AS riskCategory,
         argMax(sourceEvent.riskScore, tuple(sourceEvent.decisionRevision, sourceEvent.decisionUpdatedAt, sourceEvent.at)) AS riskScore,
         argMax(sourceEvent.process, tuple(sourceEvent.decisionRevision, sourceEvent.decisionUpdatedAt, sourceEvent.at)) AS process,
-        argMax(sourceEvent.attribution, tuple(sourceEvent.decisionRevision, sourceEvent.decisionUpdatedAt, sourceEvent.at)) AS attribution,
-        argMax(sourceEvent.agentMonitored, tuple(sourceEvent.decisionRevision, sourceEvent.decisionUpdatedAt, sourceEvent.at)) AS monitored
+        argMax(sourceEvent.attribution, tuple(sourceEvent.decisionRevision, sourceEvent.decisionUpdatedAt, sourceEvent.at)) AS attribution
       FROM ${TABLE} AS sourceEvent
-      WHERE sourceEvent.at >= {start:UInt64} AND sourceEvent.at <= {end:UInt64}
-        AND sourceEvent.agentMonitored = 1
+      PREWHERE sourceEvent.at >= {start:UInt64} AND sourceEvent.at <= {end:UInt64}
+      WHERE JSONExtractBool(sourceEvent.attribution, 'monitored')
       GROUP BY eventId
-      HAVING monitored = 1`;
+      HAVING JSONExtractBool(attribution, 'monitored')`;
+    // AggregationService already coalesces the same window. A different concurrent full-window
+    // request must fall back to the hot ring instead of building an unbounded queue of heavy reads.
+    const release = this.tryAcquireWideEventReadSlot();
+    if (!release) return null;
     try {
-      const [dimensionResult, bucketResult, sessionResult, workspaceResult] = await Promise.all([
-        this.client.query({
-          query: `
+      const queryRows = async (
+        query: string,
+        queryParams: Record<string, string | number>,
+        settings = BOUNDED_DASHBOARD_READ_SETTINGS,
+      ): Promise<Array<Record<string, unknown>>> => {
+        const result = await this.client!.query({
+          query,
+          query_params: queryParams,
+          clickhouse_settings: settings,
+          format: 'JSONEachRow',
+        });
+        return await result.json() as Array<Record<string, unknown>>;
+      };
+      const dimensionRows = await queryRows(
+        `
             SELECT
               if(at < {start:UInt64}, 'previous', 'current') AS period,
-              agentMonitored AS monitored,
+              JSONExtractBool(attribution, 'monitored') AS monitored,
               verdict,
               tier,
               riskType,
               riskCategory,
-              riskName,
-              uniqExact(eventId) AS eventCount,
+              argMax(riskName, decisionUpdatedAt) AS riskName,
+              uniqCombined64(eventId) AS eventCount,
               sum(tokenCount) AS tokenCount,
               sum(latencyMs) AS latencyTotal,
               sum(riskScore) AS riskScoreTotal
-            FROM (
-              SELECT *
-              FROM ${TABLE}
-              WHERE at >= {queryStart:UInt64} AND at <= {end:UInt64}
-              ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
-              LIMIT 1 BY eventId
-            )
+            FROM ${TABLE}
+            PREWHERE at >= {queryStart:UInt64} AND at <= {end:UInt64}
             WHERE decisionStatus IN ('succeeded', 'failed', 'timeout')
-            GROUP BY period, monitored, verdict, tier, riskType, riskCategory, riskName`,
-          query_params: { queryStart: queryStartMs, start: startMs, end: endMs },
-          format: 'JSONEachRow',
-        }),
-        this.client.query({
-          query: `
+            GROUP BY period, monitored, verdict, tier, riskType, riskCategory`,
+        { queryStart: queryStartMs, start: startMs, end: endMs },
+      );
+      const bucketRowsRaw = await queryRows(
+        `
             SELECT
               least({bucketCount:UInt32} - 1, intDiv(at - {start:UInt64}, {bucketMs:UInt64})) AS bucketIndex,
-              agentMonitored AS monitored,
-              uniqExact(eventId) AS eventCount,
-              uniqExactIf(eventId, verdict = 'block' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS blockedCount,
-              uniqExactIf(eventId, verdict = 'escalate' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS escalatedCount,
-              uniqExactIf(eventId, tier IN ('Llm', 'Agent') AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS l2Count,
-              uniqExactIf(eventId, tier = 'Agent' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS l3Count,
-              uniqExactIf(eventId, verdict != 'allow' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS riskActivationCount,
+              JSONExtractBool(attribution, 'monitored') AS monitored,
+              uniqCombined64(eventId) AS eventCount,
+              uniqCombined64If(eventId, verdict = 'block' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS blockedCount,
+              uniqCombined64If(eventId, verdict = 'escalate' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS escalatedCount,
+              uniqCombined64If(eventId, tier IN ('Llm', 'Agent') AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS l2Count,
+              uniqCombined64If(eventId, tier = 'Agent' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS l3Count,
+              uniqCombined64If(eventId, verdict != 'allow' AND decisionStatus IN ('succeeded', 'failed', 'timeout')) AS riskActivationCount,
               sumIf(tokenCount, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS tokenCount,
               sumIf(latencyMs, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS latencyTotal,
               sumIf(riskScore, decisionStatus IN ('succeeded', 'failed', 'timeout')) AS riskScoreTotal
-            FROM (
-              SELECT *
-              FROM ${TABLE}
-              WHERE at >= {start:UInt64} AND at <= {end:UInt64}
-              ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
-              LIMIT 1 BY eventId
-            )
+            FROM ${TABLE}
+            PREWHERE at >= {start:UInt64} AND at <= {end:UInt64}
             GROUP BY bucketIndex, monitored
             ORDER BY bucketIndex`,
-          query_params: { queryStart: queryStartMs, start: startMs, end: endMs, bucketCount: buckets, bucketMs },
-          format: 'JSONEachRow',
-        }),
-        this.client.query({
-          query: `
+        { queryStart: queryStartMs, start: startMs, end: endMs, bucketCount: buckets, bucketMs },
+      );
+      const [sessionResult, workspaceResult] = await Promise.allSettled([
+        queryRows(
+          `
             SELECT
               if(
                 JSONExtractString(attribution, 'agentSessionId') != '',
@@ -2545,11 +3971,11 @@ export class ClickHouseStore implements OnModuleDestroy {
             GROUP BY sessionLabel
             ORDER BY riskScoreTotal DESC
             LIMIT 1`,
-          query_params: { start: startMs, end: endMs },
-          format: 'JSONEachRow',
-        }),
-        this.client.query({
-          query: `
+          { start: startMs, end: endMs },
+          BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
+        ),
+        queryRows(
+          `
             SELECT
               if(
                 JSONExtractString(process, 'cwd') != '',
@@ -2560,7 +3986,7 @@ export class ClickHouseStore implements OnModuleDestroy {
                   workspacePath
                 )
               ) AS resolvedWorkspacePath,
-              uniqExact(
+              uniqCombined64(
                 if(
                   JSONExtractString(attribution, 'agentSessionId') != '',
                   JSONExtractString(attribution, 'agentSessionId'),
@@ -2576,12 +4002,16 @@ export class ClickHouseStore implements OnModuleDestroy {
             GROUP BY resolvedWorkspacePath
             ORDER BY totalRiskScore DESC
             LIMIT 500`,
-          query_params: { start: startMs, end: endMs },
-          format: 'JSONEachRow',
-        }),
+          { start: startMs, end: endMs },
+          BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
+        ),
       ]);
+      if (sessionResult.status === 'rejected') throw sessionResult.reason;
+      if (workspaceResult.status === 'rejected') throw workspaceResult.reason;
+      const sessionRows = sessionResult.value;
+      const workspaceRows = workspaceResult.value;
       const num = (value: unknown): number => Number(value) || 0;
-      const dimensions = (await dimensionResult.json() as Array<Record<string, unknown>>).map<DashboardWindowDimensionRow>((row) => ({
+      const dimensions = dimensionRows.map<DashboardWindowDimensionRow>((row) => ({
         period: String(row.period) === 'previous' ? 'previous' : 'current',
         monitored: Boolean(num(row.monitored)),
         verdict: String(row.verdict ?? ''),
@@ -2594,7 +4024,7 @@ export class ClickHouseStore implements OnModuleDestroy {
         latencyTotal: num(row.latencyTotal),
         riskScoreTotal: num(row.riskScoreTotal),
       }));
-      const bucketRows = (await bucketResult.json() as Array<Record<string, unknown>>).map<DashboardWindowBucketRow>((row) => ({
+      const bucketRows = bucketRowsRaw.map<DashboardWindowBucketRow>((row) => ({
         bucketIndex: num(row.bucketIndex),
         monitored: Boolean(num(row.monitored)),
         eventCount: num(row.eventCount),
@@ -2607,7 +4037,6 @@ export class ClickHouseStore implements OnModuleDestroy {
         latencyTotal: num(row.latencyTotal),
         riskScoreTotal: num(row.riskScoreTotal),
       }));
-      const sessionRows = await sessionResult.json() as Array<Record<string, unknown>>;
       const top = sessionRows[0];
       const topSession = top ? {
         sessionId: String(top.sessionLabel ?? ''),
@@ -2626,87 +4055,221 @@ export class ClickHouseStore implements OnModuleDestroy {
           systemic_risk: num(top.systemicRisk),
         },
       } : undefined;
-      const workspaces = (await workspaceResult.json() as Array<Record<string, unknown>>).map((row) => ({
+      const workspaces = workspaceRows.map((row) => ({
         workspacePath: String(row.resolvedWorkspacePath ?? ''),
         sessionCount: num(row.sessionCount),
         totalRiskScore: num(row.totalRiskScore),
         worstSeverityRank: num(row.worstSeverityRank),
       }));
-      return { dimensions, buckets: bucketRows, topSession, workspaces };
+      return { countsApproximate: true, dimensions, buckets: bucketRows, topSession, workspaces };
     } catch (error) {
       console.error('[clickhouse] dashboard window aggregation failed:', (error as Error).message);
       return null;
+    } finally {
+      release();
     }
   }
 
   /** Query durable event history. Identity visibility is deliberately applied by the service
    * after current human-review metadata is resolved; a mutable review decision must never be
    * baked into this immutable evidence query. */
-  async searchEvents(input: StoredEventQuery): Promise<JudgedEvent[]> {
-    return (await this.searchEventsPage(input)).events;
-  }
-
-  /** Query the durable history as latest-per-event facts. Request one extra row so callers can
-   * expose pagination completeness without loading the full raw event history into memory. */
-  async searchEventsPage(input: StoredEventQuery): Promise<StoredEventSearchResult> {
-    if (!this.client) {
-      return {
-        events: [],
-        hasMore: false,
-        committedCutoffMs: this.committedCutoffMs(),
-        unavailable: true,
-      };
-    }
-    const conditions = ['at >= {since:UInt64}', 'at <= {until:UInt64}'];
-    const queryParams: Record<string, string | number> = { since: input.sinceMs, until: input.untilMs };
-    const fields: Array<[keyof StoredEventQuery, string]> = [
+  async searchEvents(input: StoredEventQuery): Promise<JudgedEvent[] | null> {
+    if (!this.client) return null;
+    const sampleConditions: string[] = [];
+    const latestConditions: string[] = [];
+    const activeMutableColumns: string[] = [];
+    const queryParams: Record<string, unknown> = { since: input.sinceMs, until: input.untilMs };
+    const stableFields: Array<[keyof StoredEventQuery, string]> = [
       ['eventId', 'eventId'],
       ['sourceId', 'sourceId'],
       ['collectorId', 'collectorId'],
       ['agentId', 'agentId'],
+      ['subjectAssetId', 'subjectAssetId'],
       ['agentInstanceId', 'agentInstanceKey'],
       ['sessionId', 'sessionId'],
       ['workspacePath', 'workspacePath'],
       ['traceId', 'traceId'],
+      ['invocationId', 'invocationId'],
+      ['toolCallId', 'toolCallId'],
       ['runId', 'runId'],
       ['eventKind', 'eventKind'],
       ['eventCategory', 'eventCategory'],
+    ];
+    const mutableFields: Array<[keyof StoredEventQuery, string]> = [
       ['verdict', 'verdict'],
       ['tier', 'tier'],
     ];
-    for (const [key, column] of fields) {
+    for (const [key, column] of stableFields) {
       const value = input[key];
       if (typeof value !== 'string' || !value.trim()) continue;
-      conditions.push(`${column} = {${String(key)}:String}`);
+      sampleConditions.push(`${column} = {${String(key)}:String}`);
       queryParams[String(key)] = value.trim();
     }
+    const processStringPredicates: Array<[
+      'processHostId' | 'processBootId' | 'processPidNamespace' | 'processStartTimeTicks' | 'processStartTimeNs',
+      string,
+    ]> = [
+      ['processHostId', 'processHostId'],
+      ['processBootId', 'processBootId'],
+      ['processPidNamespace', 'processPidNamespace'],
+      ['processStartTimeTicks', 'processStartTimeTicks'],
+      ['processStartTimeNs', 'processStartTimeNs'],
+    ];
+    for (const [queryKey, column] of processStringPredicates) {
+      const value = input[queryKey];
+      if (typeof value !== 'string' || !value.trim()) continue;
+      sampleConditions.push(`${column} = {${queryKey}:String}`);
+      queryParams[queryKey] = value.trim();
+    }
+    for (const [queryKey, column] of [
+      ['processPid', 'processPid'],
+      ['processPpid', 'processPpid'],
+      ['processNamespacePid', 'processNamespacePid'],
+      ['processNamespacePpid', 'processNamespacePpid'],
+    ] as const) {
+      const value = input[queryKey];
+      if (!Number.isSafeInteger(value) || Number(value) <= 0) continue;
+      sampleConditions.push(`${column} = {${queryKey}:UInt64}`);
+      queryParams[queryKey] = Number(value);
+    }
+    const boundedEvidenceHashes = (values: string[] | undefined): string[] => [...new Set(
+      (values ?? [])
+        .map((value) => value.trim().toLowerCase())
+        .filter((value) => /^[a-f0-9]{64}$/u.test(value)),
+    )].slice(0, 1_000);
+    const resourceHashes = boundedEvidenceHashes(input.evidenceResourceHashes);
+    const commandHashes = boundedEvidenceHashes(input.evidenceCommandHashes);
+    if (resourceHashes.length > 0) {
+      sampleConditions.push('evidenceResourceHash IN {evidenceResourceHashes:Array(String)}');
+      queryParams.evidenceResourceHashes = resourceHashes;
+    }
+    if (commandHashes.length > 0) {
+      sampleConditions.push('evidenceCommandHash IN {evidenceCommandHashes:Array(String)}');
+      queryParams.evidenceCommandHashes = commandHashes;
+    }
+    const activityContext = input.activityContext?.trim();
+    if (activityContext) {
+      sampleConditions.push(`multiIf(
+        eventKind != 'ToolExec', '',
+        activityContext = 'platform_healthcheck'
+          AND activitySubtype IN (
+            'docker_healthcheck',
+            'k8s_exec_probe',
+            'k8s_liveness_probe',
+            'k8s_readiness_probe',
+            'k8s_startup_probe'
+          ),
+        'platform_healthcheck',
+        'agent_action'
+      ) = {activityContext:String}`);
+      queryParams.activityContext = activityContext;
+    }
+    // Stable predicates are applied before lifecycle revision collapse. Keep the generic name for
+    // compatibility with the durable-query contract checks while retaining the late-materialized
+    // split between stable and mutable filters.
+    const conditions = sampleConditions;
     if (input.monitoredOnly) conditions.push('agentMonitored = 1');
-    const rowLimit = Math.max(1, Math.min(20_000, input.limit));
-    queryParams.limit = rowLimit + 1;
+    for (const [key, column] of mutableFields) {
+      const value = input[key];
+      if (typeof value !== 'string' || !value.trim()) continue;
+      latestConditions.push(`${column} = {${String(key)}:String}`);
+      activeMutableColumns.push(column);
+      queryParams[String(key)] = value.trim();
+    }
+    const rowLimit = Math.max(1, Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, Math.round(input.limit)));
+    queryParams.limit = rowLimit;
+    const requestedCandidateLimit = Number(input.candidateLimit);
+    queryParams.scanLimit = Math.min(300_000, Math.max(
+      rowLimit,
+      Number.isFinite(requestedCandidateLimit) ? Math.round(requestedCandidateLimit) : rowLimit * 3,
+      latestConditions.length ? 15_000 : 0,
+    ));
+    const queryKey = JSON.stringify({
+      queryParams,
+      monitoredOnly: input.monitoredOnly === true,
+    });
+    const current = this.eventSearchInFlight;
+    if (current) {
+      if (current.key !== queryKey) return null;
+      const shared = await current.value;
+      return shared ? [...shared] : null;
+    }
+    const release = this.tryAcquireWideEventReadSlot();
+    if (!release) return null;
+    const client = this.client;
+    const value = (async (): Promise<JudgedEvent[] | null> => {
+      try {
+        const rs = await client.query({
+          // Sort only narrow candidate columns, then use ClickHouse's physical row locators to
+          // fetch the selected full revisions. This preserves primary-key pruning and lifecycle
+          // semantics without making rawPreview/attributes/process part of the Top-N workspace.
+          // Verdict and tier can change between revisions, so filter them only after LIMIT 1 BY.
+          query: `
+            SELECT e.*
+            FROM ${TABLE} AS e
+            PREWHERE
+              e.at >= {since:UInt64}
+              AND e.at <= {until:UInt64}
+              AND tuple(e.at, e._part, e._part_offset) IN (
+                SELECT at, selectedPart, selectedPartOffset
+                FROM (
+                  SELECT *
+                  FROM (
+                    SELECT
+                      eventId,
+                      at,
+                      decisionUpdatedAt,
+                      _part AS selectedPart,
+                      _part_offset AS selectedPartOffset
+                      ${activeMutableColumns.length ? `, ${activeMutableColumns.join(', ')}` : ''}
+                    FROM ${TABLE}
+                    PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}
+                    ${sampleConditions.length ? `WHERE ${sampleConditions.join(' AND ')}` : ''}
+                    ORDER BY at DESC
+                    LIMIT {scanLimit:UInt32} WITH TIES
+                  )
+                  ORDER BY at DESC, decisionUpdatedAt DESC
+                  LIMIT 1 BY eventId
+                )
+                ${latestConditions.length ? `WHERE ${latestConditions.join(' AND ')}` : ''}
+                ORDER BY at DESC, decisionUpdatedAt DESC
+                LIMIT {limit:UInt32}
+              )
+            ORDER BY e.at DESC, e.decisionUpdatedAt DESC
+            LIMIT {limit:UInt32}`,
+          query_params: queryParams,
+          clickhouse_settings: BOUNDED_EVENT_SEARCH_READ_SETTINGS,
+          format: 'JSONEachRow',
+        });
+        const rows = (await rs.json()) as Array<Record<string, unknown>>;
+        const latest = new Map<string, JudgedEvent>();
+        for (const row of rows) {
+          const event = fromRow(row);
+          if (!latest.has(event.eventId)) latest.set(event.eventId, event);
+        }
+        return [...latest.values()].sort((a, b) => b.at - a.at);
+      } catch (err) {
+        console.error('[clickhouse] event search failed:', (err as Error).message);
+        return null;
+      }
+    })();
+    this.eventSearchInFlight = { key: queryKey, value };
     try {
-      const rs = await this.client.query({
-        query: `SELECT *
-          FROM (
-            SELECT *
-            FROM ${TABLE}
-            WHERE ${conditions.join(' AND ')}
-            ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
-            LIMIT 1 BY eventId
-          )
-          ORDER BY at DESC, eventId DESC
-          LIMIT {limit:UInt32}`,
-        query_params: queryParams,
-        format: 'JSONEachRow',
-      });
-      const rows = (await rs.json()) as Array<Record<string, unknown>>;
-      const hasMore = rows.length > rowLimit;
-      return {
-        events: rows.slice(0, rowLimit).map(fromRow),
-        hasMore,
-        committedCutoffMs: this.committedCutoffMs(),
-      };
-    } catch (err) {
-      console.error('[clickhouse] event search failed:', (err as Error).message);
+      const rows = await value;
+      return rows ? [...rows] : null;
+    } finally {
+      if (this.eventSearchInFlight?.value === value) this.eventSearchInFlight = undefined;
+      release();
+    }
+  }
+
+  /** Return durable latest-per-event facts with an explicit completeness marker. The optimized
+   * late-materialized search remains the single query implementation; one extra row supplies the
+   * bounded pagination signal without loading the full historical result. */
+  async searchEventsPage(input: StoredEventQuery): Promise<StoredEventSearchResult> {
+    const rowLimit = Math.max(1, Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, Math.round(input.limit)));
+    const events = await this.searchEvents({ ...input, limit: Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, rowLimit + 1) });
+    if (!events) {
       return {
         events: [],
         hasMore: false,
@@ -2714,14 +4277,300 @@ export class ClickHouseStore implements OnModuleDestroy {
         unavailable: true,
       };
     }
+    return {
+      events: events.slice(0, rowLimit),
+      hasMore: events.length > rowLimit,
+      committedCutoffMs: this.committedCutoffMs(),
+    };
   }
 
-  /**
-   * Return one aggregate fact per logical identity and concrete runtime instance for the complete
-   * persisted interval.
-   * The inner query first collapses judgment revisions by eventId. This keeps the response bounded
-   * by Agent identities rather than raw event volume while preserving exact counters.
-   */
+  async readToolEvidenceRelations(
+    invocationIdInput: string,
+    toolCallIdInput?: string,
+    scope: ToolEvidenceRelationScope = {},
+  ): Promise<StoredToolEvidenceRelations | null> {
+    const invocationId = invocationIdInput.trim();
+    const toolCallId = toolCallIdInput?.trim();
+    if (!this.client || !this.ready || !invocationId || invocationId.length > 512) return null;
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT invocationId, toolCallId, workspacePath, sourceId, agentInstanceId,
+            relationVersion, evidenceVersion, itemCount, updatedAt, payload
+          FROM ${TOOL_EVIDENCE_RELATION_TABLE} FINAL
+          WHERE invocationId = {invocationId:String}
+            ${toolCallId ? 'AND toolCallId = {toolCallId:String}' : ''}
+            ${scope.workspacePath ? 'AND workspacePath = {workspacePath:String}' : ''}
+            ${scope.sourceId ? 'AND sourceId = {sourceId:String}' : ''}
+            ${scope.agentInstanceId ? 'AND agentInstanceId = {agentInstanceId:String}' : ''}
+            AND relationVersion = ${TOOL_EVIDENCE_RELATION_VERSION}
+          ORDER BY toolCallId
+          LIMIT 1000`,
+        query_params: {
+          invocationId,
+          ...(toolCallId ? { toolCallId } : {}),
+          ...(scope.workspacePath ? { workspacePath: scope.workspacePath } : {}),
+          ...(scope.sourceId ? { sourceId: scope.sourceId } : {}),
+          ...(scope.agentInstanceId ? { agentInstanceId: scope.agentInstanceId } : {}),
+        },
+        clickhouse_settings: BOUNDED_TOOL_EVIDENCE_RELATION_SETTINGS,
+        format: 'JSONEachRow',
+      });
+      const rows = (await result.json()) as Array<Record<string, unknown>>;
+      const items: ToolEvidenceItem[] = [];
+      let evidenceVersion: string | undefined;
+      let updatedAt: number | undefined;
+      let expectedCount: number | undefined;
+      let relationScopeKey: string | undefined;
+      for (const row of rows) {
+        const rowInvocationId = String(row.invocationId ?? '');
+        const rowToolCallId = String(row.toolCallId ?? '');
+        const rowEvidenceVersion = String(row.evidenceVersion ?? '');
+        const rowUpdatedAt = Number(row.updatedAt);
+        const rowCount = Number(row.itemCount);
+        const rowScopeKey = [row.workspacePath, row.sourceId, row.agentInstanceId].map(String).join('\0');
+        if (
+          rowInvocationId !== invocationId ||
+          !rowToolCallId ||
+          !/^[a-f0-9]{64}$/u.test(rowEvidenceVersion) ||
+          !Number.isFinite(rowUpdatedAt) ||
+          !Number.isSafeInteger(rowCount) ||
+          rowCount < 1 ||
+          rowCount > 1_000
+        ) continue;
+        if (evidenceVersion && evidenceVersion !== rowEvidenceVersion) return { items: [] };
+        if (expectedCount !== undefined && expectedCount !== rowCount) return { items: [] };
+        if (relationScopeKey && relationScopeKey !== rowScopeKey) return { items: [] };
+        let payload: unknown;
+        try {
+          payload = JSON.parse(String(row.payload ?? '')) as unknown;
+        } catch {
+          continue;
+        }
+        const item = storedToolEvidenceItem(
+          payload,
+          rowInvocationId,
+          rowToolCallId,
+          rowEvidenceVersion,
+          rowUpdatedAt,
+        );
+        if (!item) continue;
+        items.push(item);
+        evidenceVersion = rowEvidenceVersion;
+        expectedCount = rowCount;
+        relationScopeKey = rowScopeKey;
+        updatedAt = Math.max(updatedAt ?? 0, rowUpdatedAt);
+      }
+      if (!toolCallId && expectedCount !== undefined && items.length !== expectedCount) {
+        return { items: [] };
+      }
+      return { items, evidenceVersion, updatedAt };
+    } catch (error) {
+      console.error('[clickhouse] ToolEvidence relation query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  async writeToolEvidenceRelations(
+    items: readonly ToolEvidenceItem[],
+    evidenceVersion: string,
+    scope: Required<ToolEvidenceRelationScope>,
+    updatedAt = Date.now(),
+  ): Promise<boolean> {
+    if (!this.client || !this.ready || items.length === 0 || items.length > 1_000) return false;
+    if (!/^[a-f0-9]{64}$/u.test(evidenceVersion)) return false;
+    const invocationIds = new Set(items.map((item) => item.invocationId));
+    if (
+      invocationIds.size !== 1 ||
+      items.some((item) => !item.toolCallId) ||
+      !scope.workspacePath ||
+      !scope.sourceId ||
+      !scope.agentInstanceId
+    ) return false;
+    try {
+      await this.client.insert({
+        table: TOOL_EVIDENCE_RELATION_TABLE,
+        values: items.map(({ relation: _relation, ...item }) => ({
+          invocationId: item.invocationId,
+          toolCallId: item.toolCallId,
+          workspacePath: scope.workspacePath,
+          sourceId: scope.sourceId,
+          agentInstanceId: scope.agentInstanceId,
+          relationVersion: TOOL_EVIDENCE_RELATION_VERSION,
+          evidenceVersion,
+          itemCount: items.length,
+          updatedAt,
+          payload: JSON.stringify(item),
+        })),
+        format: 'JSONEachRow',
+      });
+      return true;
+    } catch (error) {
+      console.error('[clickhouse] ToolEvidence relation insert failed:', (error as Error).message);
+      return false;
+    }
+  }
+
+  private processLifecycleFactFromRow(row: Record<string, unknown>): ProcessLifecycleFact {
+    return {
+      schemaVersion: 'anysentry.process_lifecycle_fact.v1',
+      factId: String(row.factId ?? ''),
+      eventId: String(row.eventId ?? ''),
+      ...(String(row.sourceEventId ?? '') ? { sourceEventId: String(row.sourceEventId) } : {}),
+      factKind: row.factKind === 'exit' ? 'exit' : 'exec',
+      at: Number(row.at),
+      receivedAt: Number(row.receivedAt),
+      source: String(row.source ?? 'observer') as ProcessLifecycleFact['source'],
+      ...(String(row.sourceId ?? '') ? { sourceId: String(row.sourceId) } : {}),
+      ...(String(row.collectorId ?? '') ? { collectorId: String(row.collectorId) } : {}),
+      workspacePath: String(row.workspacePath ?? ''),
+      ...(String(row.subjectAssetId ?? '') ? { subjectAssetId: String(row.subjectAssetId) } : {}),
+      ...(String(row.subjectAssetType ?? '')
+        ? { subjectAssetType: String(row.subjectAssetType) as ProcessLifecycleFact['subjectAssetType'] }
+        : {}),
+      ...(String(row.assetBindingQuality ?? '')
+        ? { assetBindingQuality: String(row.assetBindingQuality) as ProcessLifecycleFact['assetBindingQuality'] }
+        : {}),
+      ...(Number(row.assetBindingRevision) > 0 ? { assetBindingRevision: Number(row.assetBindingRevision) } : {}),
+      ...(String(row.assetBindingReason ?? '') ? { assetBindingReason: String(row.assetBindingReason) } : {}),
+      ...(String(row.runtimeInstanceId ?? '') ? { runtimeInstanceId: String(row.runtimeInstanceId) } : {}),
+      ...(Number(row.rootProcess) > 0 ? { rootProcess: true } : {}),
+      ...(Number(row.identityRevision) > 0 ? { identityRevision: Number(row.identityRevision) } : {}),
+      processInstanceKey: String(row.processInstanceKey ?? ''),
+      ...(String(row.physicalWorkloadId ?? '') ? { physicalWorkloadId: String(row.physicalWorkloadId) } : {}),
+      ...(String(row.hostId ?? '') ? { hostId: String(row.hostId) } : {}),
+      bootId: String(row.bootId ?? ''),
+      pid: Number(row.pid),
+      ...(Number(row.ppid) > 0 ? { ppid: Number(row.ppid) } : {}),
+      ...(String(row.pidNamespace ?? '') ? { pidNamespace: String(row.pidNamespace) } : {}),
+      ...(Number(row.namespacePid) > 0 ? { namespacePid: Number(row.namespacePid) } : {}),
+      ...(Number(row.namespacePpid) > 0 ? { namespacePpid: Number(row.namespacePpid) } : {}),
+      startTime: String(row.startTime ?? ''),
+      ...(String(row.lifecycleSource ?? '')
+        ? { lifecycleSource: String(row.lifecycleSource) as ProcessLifecycleFact['lifecycleSource'] }
+        : {}),
+      ...(row.factKind === 'exit' && Number(row.exitStatusPresent) > 0
+        ? { exitStatus: Number(row.exitStatus) }
+        : {}),
+      ...(row.factKind === 'exit' && Number(row.exitSignalPresent) > 0
+        ? { exitSignal: Number(row.exitSignal) }
+        : {}),
+      ...(String(row.executableHash ?? '') ? { executableHash: String(row.executableHash) } : {}),
+      ...(String(row.commandHash ?? '') ? { commandHash: String(row.commandHash) } : {}),
+    };
+  }
+
+  async writeProcessLifecycleFacts(facts: readonly ProcessLifecycleFact[]): Promise<boolean> {
+    if (facts.length === 0) return true;
+    if (!this.client || !this.ready || facts.length > 5_000) return false;
+    try {
+      await this.client.insert({
+        table: PROCESS_LIFECYCLE_FACT_TABLE,
+        values: facts.map((fact) => ({
+          factId: fact.factId,
+          eventId: fact.eventId,
+          sourceEventId: fact.sourceEventId ?? '',
+          factKind: fact.factKind,
+          at: fact.at,
+          receivedAt: fact.receivedAt,
+          source: fact.source,
+          sourceId: fact.sourceId ?? '',
+          collectorId: fact.collectorId ?? '',
+          workspacePath: fact.workspacePath,
+          subjectAssetId: fact.subjectAssetId ?? '',
+          subjectAssetType: fact.subjectAssetType ?? '',
+          assetBindingQuality: fact.assetBindingQuality ?? '',
+          assetBindingRevision: fact.assetBindingRevision ?? 0,
+          assetBindingReason: fact.assetBindingReason ?? '',
+          runtimeInstanceId: fact.runtimeInstanceId ?? '',
+          rootProcess: fact.rootProcess === true ? 1 : 0,
+          identityRevision: fact.identityRevision ?? 0,
+          processInstanceKey: fact.processInstanceKey,
+          physicalWorkloadId: fact.physicalWorkloadId ?? '',
+          hostId: fact.hostId ?? '',
+          bootId: fact.bootId,
+          pid: fact.pid,
+          ppid: fact.ppid ?? 0,
+          pidNamespace: fact.pidNamespace ?? '',
+          namespacePid: fact.namespacePid ?? 0,
+          namespacePpid: fact.namespacePpid ?? 0,
+          startTime: fact.startTime,
+          lifecycleSource: fact.lifecycleSource ?? '',
+          exitStatus: fact.exitStatus ?? 0,
+          exitStatusPresent: fact.exitStatus !== undefined ? 1 : 0,
+          exitSignal: fact.exitSignal ?? 0,
+          exitSignalPresent: fact.exitSignal !== undefined ? 1 : 0,
+          executableHash: fact.executableHash ?? '',
+          commandHash: fact.commandHash ?? '',
+        })),
+        format: 'JSONEachRow',
+      });
+      return true;
+    } catch (error) {
+      console.error('[clickhouse] Process lifecycle fact insert failed:', (error as Error).message);
+      return false;
+    }
+  }
+
+  async readProcessLifecycleFacts(
+    processInstanceKeyInput: string,
+    sinceMs: number,
+    untilMs: number,
+    limit = 1_000,
+  ): Promise<ProcessLifecycleFact[] | null> {
+    const processInstanceKey = processInstanceKeyInput.trim();
+    if (!this.client || !this.ready || !/^pri_[a-f0-9]{24}$/u.test(processInstanceKey)) return null;
+    const rowLimit = Math.max(1, Math.min(5_000, Math.round(limit)));
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT *
+          FROM ${PROCESS_LIFECYCLE_FACT_TABLE} FINAL
+          WHERE processInstanceKey = {processInstanceKey:String}
+            AND at >= {sinceMs:UInt64}
+            AND at <= {untilMs:UInt64}
+          ORDER BY at, factKind, eventId
+          LIMIT {rowLimit:UInt32}`,
+        query_params: { processInstanceKey, sinceMs, untilMs, rowLimit },
+        clickhouse_settings: BOUNDED_TOOL_EVIDENCE_RELATION_SETTINGS,
+        format: 'JSONEachRow',
+      });
+      const rows = (await result.json()) as Array<Record<string, unknown>>;
+      return rows.map((row) => this.processLifecycleFactFromRow(row));
+    } catch (error) {
+      console.error('[clickhouse] Process lifecycle fact query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  async readRecentProcessLifecycleFacts(
+    sinceMs: number,
+    untilMs: number,
+    limit = 5_000,
+  ): Promise<ProcessLifecycleFact[] | null> {
+    if (!this.client || !this.ready) return null;
+    const rowLimit = Math.max(1, Math.min(10_000, Math.round(limit)));
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT *
+          FROM ${PROCESS_LIFECYCLE_FACT_TABLE} FINAL
+          WHERE at >= {sinceMs:UInt64}
+            AND at <= {untilMs:UInt64}
+          ORDER BY at DESC, factKind, eventId
+          LIMIT {rowLimit:UInt32}`,
+        query_params: { sinceMs, untilMs, rowLimit },
+        clickhouse_settings: BOUNDED_PROCESS_LIFECYCLE_READ_SETTINGS,
+        format: 'JSONEachRow',
+      });
+      const rows = (await result.json()) as Array<Record<string, unknown>>;
+      return rows.map((row) => this.processLifecycleFactFromRow(row)).reverse();
+    } catch (error) {
+      console.error('[clickhouse] Recent Process lifecycle fact query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
   async agentWindowFacts(
     sinceMs: number,
     untilMs: number,
@@ -2730,24 +4579,7 @@ export class ClickHouseStore implements OnModuleDestroy {
   ): Promise<StoredAgentWindowFact[] | null> {
     if (!this.client || !this.ready) return null;
     const monitoredClause = monitoredOnly
-      ? 'AND agentMonitored = 1'
-      : '';
-    const validInstanceClause = monitoredOnly
-      ? `
-        AND agentInstanceKey IN (
-          SELECT agentInstanceKey
-          FROM ${TABLE}
-          WHERE at >= {since:UInt64} AND at <= {until:UInt64}
-            AND agentMonitored = 1
-            AND agentInstanceKey != ''
-          GROUP BY agentInstanceKey
-          HAVING
-            max(agentHasPhysicalIdentity) = 1
-            OR maxIf(
-              agentHasRootIdentity,
-              eventKind != 'ProcessExit' AND agentHasInternalHelperRoot = 0
-            ) = 1
-        )`
+      ? 'AND raw.agentMonitored = 1'
       : '';
     const latestEvents = `
       SELECT
@@ -2768,30 +4600,25 @@ export class ClickHouseStore implements OnModuleDestroy {
         argMax(riskName, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskName,
         argMax(tokenCount, tuple(decisionRevision, decisionUpdatedAt, at)) AS tokenCount,
         argMax(latencyMs, tuple(decisionRevision, decisionUpdatedAt, at)) AS latencyMs,
+        argMax(process, tuple(decisionRevision, decisionUpdatedAt, at)) AS process,
+        argMax(attribution, tuple(decisionRevision, decisionUpdatedAt, at)) AS attribution,
         argMax(agentIdentityKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS identityKey,
         argMax(agentInstanceKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS instanceKey,
         argMax(agentMonitored, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentMonitored,
         argMax(agentHasPhysicalIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasPhysicalIdentity,
-        argMax(
-          agentHasRootIdentity,
-          tuple(decisionRevision, decisionUpdatedAt, at)
-        ) AS storedHasRootIdentity,
-        argMax(
-          agentHasInternalHelperRoot,
-          tuple(decisionRevision, decisionUpdatedAt, at)
-        ) AS hasInternalHelperRoot
-      FROM ${TABLE}
+        argMax(agentHasRootIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS storedHasRootIdentity,
+        argMax(agentHasInternalHelperRoot, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasInternalHelperRoot
+      FROM ${TABLE} AS raw
       WHERE at >= {since:UInt64} AND at <= {until:UInt64}
-        ${validInstanceClause}
         AND eventId NOT IN {excludedEventIds:Array(String)}
+        ${monitoredClause}
       GROUP BY eventId
-      HAVING 1 ${monitoredClause}`;
+      HAVING 1`;
     try {
       const result = await this.client.query({
         query: `
           SELECT
             identityKey,
-            instanceKey,
             min(eventAt) AS firstSeenAt,
             max(eventAt) AS lastSeenAt,
             count() AS eventCount,
@@ -2803,7 +4630,7 @@ export class ClickHouseStore implements OnModuleDestroy {
             groupUniqArray(runId) AS runKeys,
             groupUniqArray(traceId) AS traceKeys,
             groupUniqArrayIf(collectorId, collectorId != '') AS collectorKeys,
-            countIf(collectorId = '') AS eventsWithoutCollector,
+            countIf(collectorId = '' AND eventKind NOT IN ('AgentTool', 'AgentInvocation', 'SystemContext')) AS eventsWithoutCollector,
             sum(tokenCount) AS tokenCount,
             sum(latencyMs) AS latencyTotal,
             uniqExact(instanceKey) AS instanceCount,
@@ -2836,26 +4663,15 @@ export class ClickHouseStore implements OnModuleDestroy {
           FROM (${latestEvents})
           GROUP BY identityKey, instanceKey`,
         query_params: { since: sinceMs, until: untilMs, excludedEventIds },
+        clickhouse_settings: BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS,
         format: 'JSONEachRow',
       });
-      const rows = eligibleAgentRuntimeRows(
-        await result.json() as Array<Record<string, unknown>>,
-      );
+      const rawRows = await result.json() as Array<Record<string, unknown>>;
+      const rows = monitoredOnly ? eligibleAgentRuntimeRows(rawRows) : rawRows;
       const representativeIds = rows
         .map((row) => String(row.representativeEventId ?? ''))
         .filter(Boolean);
-      const representativeEventTimes = new Map(
-        rows.map((row) => [
-          String(row.representativeEventId ?? ''),
-          Number(row.lastSeenAt) || 0,
-        ] as const),
-      );
-      const representativeEvents = await this.eventsByIds(
-        representativeIds,
-        sinceMs,
-        untilMs,
-        representativeEventTimes,
-      );
+      const representativeEvents = await this.eventsByIds(representativeIds, sinceMs, untilMs);
       const byId = new Map(representativeEvents.map((event) => [event.eventId, event]));
       const num = (value: unknown): number => Number(value) || 0;
       return rows.flatMap((row): StoredAgentWindowFact[] => {
@@ -2927,24 +4743,7 @@ export class ClickHouseStore implements OnModuleDestroy {
     monitoredOnly: boolean,
   ): Promise<StoredAgentBucketFact[] | null> {
     if (!this.client || !this.ready) return null;
-    const monitoredClause = monitoredOnly ? 'AND agentMonitored = 1' : '';
-    const validInstanceClause = monitoredOnly
-      ? `
-              AND agentInstanceKey IN (
-                SELECT agentInstanceKey
-                FROM ${TABLE}
-                WHERE at >= {since:UInt64} AND at < {endExclusive:UInt64}
-                  AND agentMonitored = 1
-                  AND agentInstanceKey != ''
-                GROUP BY agentInstanceKey
-                HAVING
-                  max(agentHasPhysicalIdentity) = 1
-                  OR maxIf(
-                    agentHasRootIdentity,
-                    eventKind != 'ProcessExit' AND agentHasInternalHelperRoot = 0
-                  ) = 1
-              )`
-      : '';
+    const monitoredClause = monitoredOnly ? 'AND raw.agentMonitored = 1' : '';
     try {
       const result = await this.client.query({
         query: `
@@ -2959,7 +4758,7 @@ export class ClickHouseStore implements OnModuleDestroy {
             groupUniqArray(runId) AS runKeys,
             groupUniqArray(traceId) AS traceKeys,
             groupUniqArrayIf(collectorId, collectorId != '') AS collectorKeys,
-            countIf(collectorId = '') AS eventsWithoutCollector,
+            countIf(collectorId = '' AND eventKind NOT IN ('AgentTool', 'AgentInvocation', 'SystemContext')) AS eventsWithoutCollector,
             sum(tokenCount) AS tokenCount,
             sum(latencyMs) AS latencyTotal,
             groupUniqArray(instanceKey) AS instanceKeys,
@@ -3009,19 +4808,13 @@ export class ClickHouseStore implements OnModuleDestroy {
               argMax(agentInstanceKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS instanceKey,
               argMax(agentMonitored, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentMonitored,
               argMax(agentHasPhysicalIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasPhysicalIdentity,
-              argMax(
-                agentHasRootIdentity,
-                tuple(decisionRevision, decisionUpdatedAt, at)
-              ) AS storedHasRootIdentity,
-              argMax(
-                agentHasInternalHelperRoot,
-                tuple(decisionRevision, decisionUpdatedAt, at)
-              ) AS hasInternalHelperRoot
-            FROM ${TABLE}
+              argMax(agentHasRootIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS storedHasRootIdentity,
+              argMax(agentHasInternalHelperRoot, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasInternalHelperRoot
+            FROM ${TABLE} AS raw
             WHERE at >= {since:UInt64} AND at < {endExclusive:UInt64}
-              ${validInstanceClause}
+              ${monitoredClause}
             GROUP BY eventId
-            HAVING 1 ${monitoredClause}
+            HAVING 1
           )
           GROUP BY bucketStartMs, identityKey, instanceKey`,
         query_params: {
@@ -3029,25 +4822,18 @@ export class ClickHouseStore implements OnModuleDestroy {
           endExclusive: endExclusiveMs,
           bucketMs: Math.max(1, Math.trunc(bucketMs)),
         },
+        clickhouse_settings: BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS,
         format: 'JSONEachRow',
       });
-      const rows = eligibleAgentRuntimeRows(
-        await result.json() as Array<Record<string, unknown>>,
-      );
+      const rawRows = await result.json() as Array<Record<string, unknown>>;
+      const rows = monitoredOnly ? eligibleAgentRuntimeRows(rawRows) : rawRows;
       const representativeIds = rows
         .map((row) => String(row.representativeEventId ?? ''))
         .filter(Boolean);
-      const representativeEventTimes = new Map(
-        rows.map((row) => [
-          String(row.representativeEventId ?? ''),
-          Number(row.lastSeenAt) || 0,
-        ] as const),
-      );
       const representativeEvents = await this.eventsByIds(
         representativeIds,
         sinceMs,
         Math.max(sinceMs, endExclusiveMs - 1),
-        representativeEventTimes,
       );
       const byId = new Map(representativeEvents.map((event) => [event.eventId, event]));
       const num = (value: unknown): number => Number(value) || 0;
@@ -3272,9 +5058,8 @@ export class ClickHouseStore implements OnModuleDestroy {
   }
 
   /**
-   * Return the global values needed by the overview observability strip. Unlike the per-agent
-   * metric query above, this intentionally aggregates in ClickHouse before crossing the process
-   * boundary: the overview needs exact totals and distinct IDs, not one row per identity/instance.
+   * Aggregate the overview observability strip in ClickHouse so the API does not hydrate one
+   * representative event for every Agent instance merely to compute global totals.
    */
   async agentObservabilityFact(
     sinceMs: number,
@@ -3325,10 +5110,10 @@ export class ClickHouseStore implements OnModuleDestroy {
           until: untilMs,
           recentSince: Math.max(sinceMs, untilMs - 60_000),
         },
+        clickhouse_settings: BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
         format: 'JSONEachRow',
       });
-      const rows = await result.json() as Array<Record<string, unknown>>;
-      const row = rows[0] ?? {};
+      const row = ((await result.json()) as Array<Record<string, unknown>>)[0] ?? {};
       const num = (value: unknown): number => Number(value) || 0;
       return {
         eventCount: num(row.eventCount),
@@ -3384,7 +5169,7 @@ export class ClickHouseStore implements OnModuleDestroy {
               argMax(at, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventAt,
               argMax(
                 if(
-                  agentMonitored = 1
+                  JSONExtractBool(attribution, 'monitored')
                     AND JSONExtractString(process, 'cwd') != '',
                   JSONExtractString(process, 'cwd'),
                   workspacePath
@@ -3490,7 +5275,7 @@ export class ClickHouseStore implements OnModuleDestroy {
               argMax(at, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventAt,
               argMax(
                 if(
-                  agentMonitored = 1
+                  JSONExtractBool(attribution, 'monitored')
                     AND JSONExtractString(process, 'cwd') != '',
                   JSONExtractString(process, 'cwd'),
                   workspacePath
@@ -3575,29 +5360,18 @@ export class ClickHouseStore implements OnModuleDestroy {
   ): Promise<StoredTopologyWindowFact[] | null> {
     if (!this.client || !this.ready) return null;
     const monitoredClause = monitoredOnly ? 'HAVING agentMonitored = 1' : '';
-    const validInstanceClause = monitoredOnly
-      ? `
-              AND agentInstanceKey IN (
-                SELECT agentInstanceKey
-                FROM ${TABLE}
-                WHERE at >= {since:UInt64} AND at <= {until:UInt64}
-                  AND agentMonitored = 1
-                  AND agentInstanceKey != ''
-                GROUP BY agentInstanceKey
-                HAVING
-                  max(agentHasPhysicalIdentity) = 1
-                  OR maxIf(
-                    agentHasRootIdentity,
-                    eventKind != 'ProcessExit' AND agentHasInternalHelperRoot = 0
-                  ) = 1
-              )`
-      : '';
     try {
       const result = await this.client.query({
         query: `
           SELECT
             identityKey,
             instanceKey,
+            max(hasPhysicalIdentity) AS hasPhysicalIdentity,
+            maxIf(
+              storedHasRootIdentity,
+              hasInternalHelperRoot = 0 AND eventKind != 'ProcessExit'
+            ) AS hasRootIdentity,
+            max(hasInternalHelperRoot) AS hasInternalHelperRootFlag,
             min(eventAt) AS firstSeenAt,
             max(eventAt) AS lastSeenAt,
             count() AS eventCount,
@@ -3608,12 +5382,6 @@ export class ClickHouseStore implements OnModuleDestroy {
             ) AS worstSeverityRank,
             riskCategory,
             argMax(riskName, eventAt) AS riskName,
-            max(hasPhysicalIdentity) AS hasPhysicalIdentity,
-            maxIf(
-              storedHasRootIdentity,
-              hasInternalHelperRoot = 0 AND eventKind != 'ProcessExit'
-            ) AS hasRootIdentity,
-            max(hasInternalHelperRoot) AS hasInternalHelperRootFlag,
             argMax(eventId, eventAt) AS representativeEventId
           FROM (
             SELECT
@@ -3633,17 +5401,10 @@ export class ClickHouseStore implements OnModuleDestroy {
               argMax(agentInstanceKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS instanceKey,
               argMax(agentMonitored, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentMonitored,
               argMax(agentHasPhysicalIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasPhysicalIdentity,
-              argMax(
-                agentHasRootIdentity,
-                tuple(decisionRevision, decisionUpdatedAt, at)
-              ) AS storedHasRootIdentity,
-              argMax(
-                agentHasInternalHelperRoot,
-                tuple(decisionRevision, decisionUpdatedAt, at)
-              ) AS hasInternalHelperRoot
+              argMax(agentHasRootIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS storedHasRootIdentity,
+              argMax(agentHasInternalHelperRoot, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasInternalHelperRoot
             FROM ${TABLE}
             WHERE at >= {since:UInt64} AND at <= {until:UInt64}
-              ${validInstanceClause}
               AND eventId NOT IN {excludedEventIds:Array(String)}
             GROUP BY eventId
             ${monitoredClause}
@@ -3660,7 +5421,8 @@ export class ClickHouseStore implements OnModuleDestroy {
         query_params: { since: sinceMs, until: untilMs, excludedEventIds },
         format: 'JSONEachRow',
       });
-      const rows = await result.json() as Array<Record<string, unknown>>;
+      const rawRows = await result.json() as Array<Record<string, unknown>>;
+      const rows = monitoredOnly ? eligibleAgentRuntimeRows(rawRows) : rawRows;
       const representativeIds = rows
         .map((row) => String(row.representativeEventId ?? ''))
         .filter(Boolean);
@@ -3701,23 +5463,6 @@ export class ClickHouseStore implements OnModuleDestroy {
   ): Promise<StoredTopologyBucketFact[] | null> {
     if (!this.client || !this.ready) return null;
     const monitoredClause = monitoredOnly ? 'HAVING agentMonitored = 1' : '';
-    const validInstanceClause = monitoredOnly
-      ? `
-              AND agentInstanceKey IN (
-                SELECT agentInstanceKey
-                FROM ${TABLE}
-                WHERE at >= {since:UInt64} AND at < {endExclusive:UInt64}
-                  AND agentMonitored = 1
-                  AND agentInstanceKey != ''
-                GROUP BY agentInstanceKey
-                HAVING
-                  max(agentHasPhysicalIdentity) = 1
-                  OR maxIf(
-                    agentHasRootIdentity,
-                    eventKind != 'ProcessExit' AND agentHasInternalHelperRoot = 0
-                  ) = 1
-              )`
-      : '';
     try {
       const result = await this.client.query({
         query: `
@@ -3725,6 +5470,12 @@ export class ClickHouseStore implements OnModuleDestroy {
             intDiv(eventAt, {bucketMs:UInt64}) * {bucketMs:UInt64} AS bucketStartMs,
             identityKey,
             instanceKey,
+            max(hasPhysicalIdentity) AS hasPhysicalIdentity,
+            maxIf(
+              storedHasRootIdentity,
+              hasInternalHelperRoot = 0 AND eventKind != 'ProcessExit'
+            ) AS hasRootIdentity,
+            max(hasInternalHelperRoot) AS hasInternalHelperRootFlag,
             min(eventAt) AS firstSeenAt,
             max(eventAt) AS lastSeenAt,
             count() AS eventCount,
@@ -3735,12 +5486,6 @@ export class ClickHouseStore implements OnModuleDestroy {
             ) AS worstSeverityRank,
             riskCategory,
             argMax(riskName, eventAt) AS riskName,
-            max(hasPhysicalIdentity) AS hasPhysicalIdentity,
-            maxIf(
-              storedHasRootIdentity,
-              hasInternalHelperRoot = 0 AND eventKind != 'ProcessExit'
-            ) AS hasRootIdentity,
-            max(hasInternalHelperRoot) AS hasInternalHelperRootFlag,
             argMax(eventId, eventAt) AS representativeEventId
           FROM (
             SELECT
@@ -3759,17 +5504,10 @@ export class ClickHouseStore implements OnModuleDestroy {
               argMax(agentInstanceKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS instanceKey,
               argMax(agentMonitored, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentMonitored,
               argMax(agentHasPhysicalIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasPhysicalIdentity,
-              argMax(
-                agentHasRootIdentity,
-                tuple(decisionRevision, decisionUpdatedAt, at)
-              ) AS storedHasRootIdentity,
-              argMax(
-                agentHasInternalHelperRoot,
-                tuple(decisionRevision, decisionUpdatedAt, at)
-              ) AS hasInternalHelperRoot
+              argMax(agentHasRootIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS storedHasRootIdentity,
+              argMax(agentHasInternalHelperRoot, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasInternalHelperRoot
             FROM ${TABLE}
             WHERE at >= {since:UInt64} AND at < {endExclusive:UInt64}
-              ${validInstanceClause}
             GROUP BY eventId
             ${monitoredClause}
           )
@@ -3790,7 +5528,8 @@ export class ClickHouseStore implements OnModuleDestroy {
         },
         format: 'JSONEachRow',
       });
-      const rows = await result.json() as Array<Record<string, unknown>>;
+      const rawRows = await result.json() as Array<Record<string, unknown>>;
+      const rows = monitoredOnly ? eligibleAgentRuntimeRows(rawRows) : rawRows;
       const representativeIds = rows
         .map((row) => String(row.representativeEventId ?? ''))
         .filter(Boolean);
@@ -3834,19 +5573,10 @@ export class ClickHouseStore implements OnModuleDestroy {
     eventAtById?: ReadonlyMap<string, number>,
   ): Promise<JudgedEvent[]> {
     if (!this.client || eventIds.length === 0) return [];
-    // ClickHouse's HTTP interface limits the size of one form field. Topology aggregation can
-    // legitimately produce thousands of representative event IDs, so a single Array(String)
-    // parameter eventually fails with "HTML Form Exception: Field value too long". Keep each
-    // request bounded and use only a small amount of concurrency to avoid replacing one memory
-    // spike with many simultaneous scans.
     const uniqueEventIds = [...new Set(eventIds.filter(Boolean))];
     const batches: string[][] = [];
-    // Keep both the UUID-like ID parameter and the optional exact event-time parameter below
-    // ClickHouse's per-form-field limit. Exact-time lookup makes each scan narrow enough that four
-    // smaller requests are cheaper and more reliable than one oversized HTTP form.
-    const batchSize = 200;
-    for (let index = 0; index < uniqueEventIds.length; index += batchSize) {
-      batches.push(uniqueEventIds.slice(index, index + batchSize));
+    for (let index = 0; index < uniqueEventIds.length; index += 200) {
+      batches.push(uniqueEventIds.slice(index, index + 200));
     }
     const events: JudgedEvent[] = [];
     for (let index = 0; index < batches.length; index += 2) {
@@ -3878,6 +5608,7 @@ export class ClickHouseStore implements OnModuleDestroy {
               since: sinceMs ?? 0,
               until: untilMs ?? Number.MAX_SAFE_INTEGER,
             },
+            clickhouse_settings: BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
             format: 'JSONEachRow',
           });
           return await result.json() as Array<Record<string, unknown>>;
@@ -3890,11 +5621,41 @@ export class ClickHouseStore implements OnModuleDestroy {
 
   committedCutoffMs(): number | undefined {
     // This is only the greatest event time already observed in a successful durable insert, not
-    // an arrival-completeness watermark. An older event or Revision waiting in the writer must not
-    // move this value backwards: doing so hides newer facts that are already queryable in
-    // ClickHouse (especially while replaying a backlog). Once the pending write succeeds, the
-    // commit journal invalidates every affected historical bucket.
-    return this.committedThroughMs;
+    // an arrival-completeness watermark. Pending or replayed older rows must not move it backwards
+    // and hide newer facts that are already queryable; affected historical buckets are invalidated
+    // by the server-side commit journal when those writes later succeed.
+    return this.committedBoundaryComplete ? this.committedThroughMs : undefined;
+  }
+
+  /**
+   * Return only process-local event revisions that have not completed the ClickHouse FIFO yet.
+   *
+   * This is intentionally different from the dashboard hot ring: the hot ring also contains
+   * already committed rows and cannot be added to a full durable-window query without forcing
+   * every historical aggregate to remain uncached. Pending rows stay in `buf` or a sealed batch
+   * until the insert succeeds, so a durable full-window read plus this overlay is complete for the
+   * current API process even while ingestion never becomes momentarily idle.
+   */
+  pendingEvents(sinceMs: number, untilMs: number): JudgedEvent[] {
+    const latest = new Map<string, JudgedEvent>();
+    const accept = (row: Row) => {
+      if (row.at < sinceMs || row.at > untilMs) return;
+      const event = fromRow(row as unknown as Record<string, unknown>);
+      const current = latest.get(event.eventId);
+      if (
+        !current
+        || (event.decisionRevision ?? 1) > (current.decisionRevision ?? 1)
+        || (
+          (event.decisionRevision ?? 1) === (current.decisionRevision ?? 1)
+          && (event.decisionUpdatedAt ?? event.at) > (current.decisionUpdatedAt ?? current.at)
+        )
+      ) latest.set(event.eventId, event);
+    };
+    for (const queued of this.buf) accept(queued.row);
+    for (const batch of this.eventWriteBatches) {
+      for (const row of batch.rows) accept(row);
+    }
+    return [...latest.values()];
   }
 
   committedProgress(): CommittedSourceProgress[] {
@@ -4408,25 +6169,124 @@ export class ClickHouseStore implements OnModuleDestroy {
     }
   }
 
-  async loadCollectorHeartbeats(): Promise<CollectorHeartbeatRecord[]> {
-    if (!this.client) return [];
+  async loadPlatformConfig<T>(configKeyInput: string): Promise<{ record: T; updatedAt: number } | undefined> {
+    if (!this.client) return undefined;
+    const configKey = configKeyInput.trim().slice(0, 160);
+    if (!configKey || !/^[a-z0-9_.:-]+$/iu.test(configKey)) return undefined;
     try {
       const rs = await this.client.query({
-        query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'collector_heartbeats' LIMIT 1`,
+        query: `SELECT value, updated_at FROM ${CONFIG_TABLE} FINAL WHERE key = {configKey:String} LIMIT 1`,
+        query_params: { configKey },
         format: 'JSONEachRow',
       });
-      const rows = (await rs.json()) as Array<{ value: string }>;
-      const parsed = rows.length ? (JSON.parse(rows[0].value) as unknown) : [];
-      const records = Array.isArray(parsed) ? (parsed as CollectorHeartbeatRecord[]) : [];
-      // One-time compatibility bridge from the former config snapshot. Queries deduplicate by
-      // collectorId+at, so retrying this after an interrupted startup remains safe.
-      if (records.length) {
-        const countResult = await this.client.query({
-          query: `SELECT count() AS count FROM ${COLLECTOR_HEARTBEAT_TABLE}`,
+      const rows = await rs.json() as Array<{ value: string; updated_at?: number | string }>;
+      if (!rows.length) return undefined;
+      const updatedAt = Number(rows[0].updated_at);
+      const record = JSON.parse(rows[0].value) as T;
+      return { record, updatedAt: Number.isSafeInteger(updatedAt) ? updatedAt : 0 };
+    } catch (err) {
+      console.error(`[clickhouse] loadPlatformConfig ${configKey} failed:`, (err as Error).message);
+      return undefined;
+    }
+  }
+
+  async savePlatformConfig<T>(configKeyInput: string, record: T, updatedAtInput = Date.now()): Promise<boolean> {
+    if (!this.client) return false;
+    const configKey = configKeyInput.trim().slice(0, 160);
+    if (!configKey || !/^[a-z0-9_.:-]+$/iu.test(configKey)) return false;
+    try {
+      const value = JSON.stringify(record);
+      if (Buffer.byteLength(value, 'utf8') > 16 * 1024 * 1024) {
+        throw new Error('platform config exceeds the 16 MiB persistence bound');
+      }
+      const updatedAt = Number.isSafeInteger(updatedAtInput) && updatedAtInput >= 0
+        ? updatedAtInput
+        : Date.now();
+      await this.client.insert({
+        table: CONFIG_TABLE,
+        values: [{ key: configKey, value, updated_at: updatedAt }],
+        format: 'JSONEachRow',
+      });
+      return true;
+    } catch (err) {
+      console.error(`[clickhouse] savePlatformConfig ${configKey} failed:`, (err as Error).message);
+      return false;
+    }
+  }
+
+  async loadUnknownLearningState(): Promise<unknown | undefined> {
+    if (!this.client) return undefined;
+    try {
+      const rs = await this.client.query({
+        query: `SELECT value, updated_at FROM ${CONFIG_TABLE} FINAL WHERE key = 'unknown_learning_state_v1' LIMIT 1`,
+        format: 'JSONEachRow',
+      });
+      const rows = (await rs.json()) as Array<{ value: string; updated_at?: number | string }>;
+      const persistedVersion = Number(rows[0]?.updated_at);
+      if (Number.isSafeInteger(persistedVersion) && persistedVersion > this.unknownLearningStateVersion) {
+        this.unknownLearningStateVersion = persistedVersion;
+      }
+      return rows.length ? JSON.parse(rows[0].value) as unknown : undefined;
+    } catch (err) {
+      console.error('[clickhouse] loadUnknownLearningState failed:', (err as Error).message);
+      return undefined;
+    }
+  }
+
+  async saveUnknownLearningState(state: unknown): Promise<boolean> {
+    if (!this.client) return false;
+    try {
+      const value = JSON.stringify(state);
+      // The runtime service exports a stricter configured bound. This last storage guard prevents
+      // a programming error from turning one config row into an unbounded ClickHouse insert.
+      if (Buffer.byteLength(value, 'utf8') > 16 * 1024 * 1024) {
+        throw new Error('Unknown learning state exceeds the 16 MiB persistence bound');
+      }
+      const updatedAt = Math.max(Date.now(), this.unknownLearningStateVersion + 1);
+      this.unknownLearningStateVersion = updatedAt;
+      await this.client.insert({
+        table: CONFIG_TABLE,
+        values: [{ key: 'unknown_learning_state_v1', value, updated_at: updatedAt }],
+        format: 'JSONEachRow',
+      });
+      return true;
+    } catch (err) {
+      console.error('[clickhouse] saveUnknownLearningState failed:', (err as Error).message);
+      return false;
+    }
+  }
+
+  async loadCollectorHeartbeats(limit = 1_000): Promise<CollectorHeartbeatRecord[]> {
+    if (!this.client) return [];
+    const safeLimit = Math.max(128, Math.min(2_000, Math.trunc(limit) || 1_000));
+    try {
+      const existenceResult = await this.client.query({
+        query: `SELECT 1 AS present FROM ${COLLECTOR_HEARTBEAT_TABLE} LIMIT 1`,
+        format: 'JSONEachRow',
+      });
+      const existenceRows = await existenceResult.json() as Array<{ present?: string | number }>;
+      if (Number(existenceRows[0]?.present ?? 0) !== 1) {
+        // One-time compatibility bridge. Slice the legacy JSON array inside ClickHouse so a large
+        // historical snapshot is never transferred and expanded in the Node.js heap merely to
+        // keep the newest bounded working set.
+        const legacyResult = await this.client.query({
+          query: `
+            SELECT arraySlice(JSONExtractArrayRaw(value), -{limit:Int32}) AS records
+            FROM ${CONFIG_TABLE} FINAL
+            WHERE key = 'collector_heartbeats'
+            LIMIT 1`,
+          query_params: { limit: safeLimit },
           format: 'JSONEachRow',
         });
-        const countRows = await countResult.json() as Array<{ count?: string | number }>;
-        if (Number(countRows[0]?.count ?? 0) === 0) {
+        const legacyRows = await legacyResult.json() as Array<{ records?: string[] }>;
+        const records = (legacyRows[0]?.records ?? []).flatMap((value) => {
+          try {
+            return [JSON.parse(value) as CollectorHeartbeatRecord];
+          } catch {
+            return [];
+          }
+        });
+        if (records.length > 0) {
           await this.client.insert({
             table: COLLECTOR_HEARTBEAT_TABLE,
             values: records.map((record) => ({
@@ -4438,69 +6298,181 @@ export class ClickHouseStore implements OnModuleDestroy {
           });
         }
       }
-      return records;
+
+      const recentResult = await this.client.query({
+        query: `
+          SELECT collectorId, at, payload
+          FROM (
+            SELECT collectorId, at, payload
+            FROM ${COLLECTOR_HEARTBEAT_TABLE}
+            ORDER BY at DESC
+            LIMIT {scanLimit:UInt32}
+          )
+          ORDER BY at DESC
+          LIMIT {scanLimit:UInt32}`,
+        query_params: { scanLimit: safeLimit * 2 },
+        format: 'JSONEachRow',
+      });
+      const recentRows = await recentResult.json() as Array<{
+        collectorId?: string;
+        at?: string | number;
+        payload?: string;
+      }>;
+      const unique = new Map<string, CollectorHeartbeatRecord>();
+      for (const row of recentRows) {
+        try {
+          if (!row.payload) continue;
+          const record = JSON.parse(row.payload) as CollectorHeartbeatRecord;
+          unique.set(`${String(row.collectorId ?? record.collectorId)}\u0000${Number(row.at ?? record.at)}`, record);
+        } catch {
+          // A malformed legacy row must not prevent later valid heartbeats from hydrating.
+        }
+        if (unique.size >= safeLimit) break;
+      }
+      return [...unique.values()].reverse();
     } catch (err) {
       console.error('[clickhouse] loadCollectorHeartbeats failed:', (err as Error).message);
       return [];
     }
   }
 
-  async saveCollectorHeartbeats(records: CollectorHeartbeatRecord[]): Promise<void> {
-    if (!this.client) return;
-    try {
-      await this.client.insert({
-        table: CONFIG_TABLE,
-        values: [{ key: 'collector_heartbeats', value: JSON.stringify(records), updated_at: Date.now() }],
-        format: 'JSONEachRow',
-      });
-    } catch (err) {
-      console.error('[clickhouse] saveCollectorHeartbeats failed:', (err as Error).message);
-    }
-  }
-
-  async close(): Promise<void> {
-    if (this.closed || this.closing) return;
+  close(): Promise<void> {
+    if (this.closeInFlight) return this.closeInFlight;
+    // Change the externally visible state before the first await so a concurrent enqueue cannot
+    // slip into the shutdown tail after it was sealed.
     this.closing = true;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = undefined;
+    this.ready = false;
     if (this.flushTimer) clearInterval(this.flushTimer);
     this.flushTimer = undefined;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    if (this.eventWriteRetryWakeTimer) clearTimeout(this.eventWriteRetryWakeTimer);
+    this.eventWriteRetryWakeTimer = undefined;
     if (this.immediateWriteTimer) clearTimeout(this.immediateWriteTimer);
     this.immediateWriteTimer = undefined;
-    const timeoutMs = boundedPositiveInt(
+    this.eventWriteCloseDeadlineMs = boundedPositiveInt(
       process.env.ANYSENTRY_CLICKHOUSE_SHUTDOWN_FLUSH_MS,
-      10_000,
+      EVENT_WRITE_CLOSE_DEADLINE_MS,
       100,
       60_000,
     );
-    let timeout: NodeJS.Timeout | undefined;
-    try {
-      await Promise.race([
-        this.flush(),
-        new Promise<never>((_, reject) => {
-          timeout = setTimeout(
-            () => reject(new Error(`ClickHouse shutdown flush exceeded ${timeoutMs}ms`)),
-            timeoutMs,
-          );
-        }),
-      ]);
-    } catch (error) {
-      console.error('[clickhouse] bounded shutdown flush failed:', (error as Error).message);
-    } finally {
-      if (timeout) clearTimeout(timeout);
-      this.closed = true;
-      const shutdownError = new Error('ClickHouse store closed before event receipt became durable');
-      for (const entry of this.immediateWriteQueue.splice(0)) entry.reject(shutdownError);
-      this.immediateWriteQueueBytes = 0;
-      this.immediateWriteEventTimes.clear();
-    }
-    await this.client?.close().catch(() => undefined);
-    this.client = undefined;
-    this.ready = false;
-    this.closing = false;
+    this.eventWriteClosingDeadline = this.eventWriteNow() + this.eventWriteCloseDeadlineMs;
+    this.wakeEventWriteRetrySleep();
+    this.sealBufferedEventBatches(true);
+    const value = this.finishClose();
+    this.closeInFlight = value;
+    return value;
   }
 
-  async onModuleDestroy(): Promise<void> {
-    await this.close();
+  private async finishClose(): Promise<void> {
+    const client = this.client;
+    let closeError: Error | undefined;
+    try {
+      while (
+        this.immediateWriteQueue.length > 0
+        && this.eventWriteNow() < (this.eventWriteClosingDeadline ?? 0)
+      ) {
+        try {
+          await this.drainImmediateWrites();
+        } catch {
+          break;
+        }
+      }
+      while (
+        this.eventWriteBatches.length > 0 &&
+        !this.eventWritePermanentError &&
+        this.eventWriteNow() < (this.eventWriteClosingDeadline ?? 0)
+      ) {
+        this.eventWriteBatches[0].retryNotBefore = 0;
+        try {
+          await this.waitForEventWriteDrainUntilCloseDeadline();
+        } catch (error) {
+          if (this.eventWritePermanentError) break;
+        }
+      }
+
+      if (this.eventWriteBatches.length > 0 || this.buf.length > 0) {
+        const head = this.eventWriteBatches[0];
+        closeError = Object.assign(
+          new Error(
+            `ClickHouse event writer closed with ${this.eventWriteRows} undrained rows` +
+            (head?.lastError ? `: ${head.lastError.message}` : ''),
+          ),
+          { code: 'ANYSENTRY_CLICKHOUSE_EVENT_SHUTDOWN_UNDRAINED' },
+        );
+        console.error('[clickhouse] event writer shutdown deadline/terminal failure:', {
+          code: (closeError as Error & { code?: string }).code,
+          rows: this.eventWriteRows,
+          bytes: this.eventWriteBytes,
+          oldestBatchAgeMs: head ? Math.max(0, this.eventWriteNow() - head.createdAt) : 0,
+          token: head?.token,
+          cause: head?.lastError?.message ?? this.eventWritePermanentError?.message,
+        });
+      }
+    } finally {
+      this.closed = true;
+      this.eventWriteAbortController?.abort('ClickHouse event writer is closing');
+      this.wakeEventWriteRetrySleep();
+      for (const batch of this.eventWriteBatches) {
+        for (const waiter of batch.waiters.splice(0)) {
+          waiter.reject(closeError ?? new Error('ClickHouse event writer closed before the direct write completed'));
+        }
+      }
+      const receiptShutdownError =
+        closeError ?? new Error('ClickHouse store closed before event receipt became durable');
+      for (const entry of this.immediateWriteQueue.splice(0)) entry.reject(receiptShutdownError);
+      this.immediateWriteQueueBytes = 0;
+      this.immediateWriteEventTimes.clear();
+      // A periodic flush may already own the heartbeat side buffer. Let it finish first, then
+      // persist any tail accepted after its snapshot before closing the shared client.
+      await this.flushInFlight?.catch((error) => {
+        console.error('[clickhouse] collector heartbeat shutdown flush failed:', (error as Error).message);
+      });
+      const heartbeatValues = this.collectorHeartbeatBuf;
+      this.collectorHeartbeatBuf = [];
+      if (client && heartbeatValues.length > 0) {
+        try {
+          await client.insert({
+            table: COLLECTOR_HEARTBEAT_TABLE,
+            values: heartbeatValues,
+            format: 'JSONEachRow',
+          });
+        } catch (error) {
+          this.collectorHeartbeatBuf = [...heartbeatValues, ...this.collectorHeartbeatBuf];
+          console.error('[clickhouse] collector heartbeat shutdown insert failed:', (error as Error).message);
+        }
+      }
+      try {
+        await client?.close();
+      } catch (error) {
+        closeError ??= this.asEventWriteError(error);
+      }
+      this.client = undefined;
+      this.eventWriteClosingDeadline = undefined;
+    }
+    if (closeError) throw closeError;
+  }
+
+  private async waitForEventWriteDrainUntilCloseDeadline(): Promise<void> {
+    const deadline = this.eventWriteClosingDeadline ?? this.eventWriteNow();
+    const remainingMs = Math.max(0, deadline - this.eventWriteNow());
+    if (remainingMs === 0) throw new Error('ClickHouse event writer shutdown deadline reached');
+    const drain = this.ensureEventWriteDrain();
+    // A fake/misbehaving client may ignore AbortSignal. The outer wall-clock timer prevents Nest's
+    // shutdown hook from consuming the full Kubernetes grace period before client.close destroys it.
+    let timer!: NodeJS.Timeout;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        this.eventWriteAbortController?.abort('ClickHouse event writer shutdown deadline reached');
+        reject(new Error('ClickHouse event writer shutdown deadline reached'));
+      }, remainingMs);
+    });
+    try {
+      await Promise.race([drain, timeout]);
+    } finally {
+      clearTimeout(timer);
+      // If the outer deadline won, ensure a later rejection from the tracked drain is observed.
+      void drain.catch(() => undefined);
+    }
   }
 }

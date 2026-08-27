@@ -7,6 +7,7 @@ import { MaintenanceWindowService } from './maintenance-window.service';
 import { NotificationService } from './notification.service';
 import { RelationalBusinessStore } from './relational-business-store.service';
 import { cleanText } from './redaction';
+import { collectorHeartbeatFailureDelta } from './pipeline-accounting';
 import type { DecisionResultJob } from './async-judgment.types';
 import {
   AlertConfig,
@@ -252,6 +253,8 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
   private readonly alerts = new Map<string, AlertRecord>();
   private readonly incidents = new Map<string, Incident>();
   private readonly latestCollectorHeartbeat = new Map<string, CollectorHeartbeatRecord>();
+  /** Cumulative quality counters belong to one producer channel, not merely one collector ID. */
+  private readonly latestCollectorQualityHeartbeat = new Map<string, CollectorHeartbeatRecord>();
   private persistTimer?: NodeJS.Timeout;
   private collectorTimer?: NodeJS.Timeout;
   private sourceTimer?: NodeJS.Timeout;
@@ -674,9 +677,16 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
   }
 
   observeCollectorHeartbeat(heartbeat: CollectorHeartbeatRecord): void {
-    const previous = this.latestCollectorHeartbeat.get(heartbeat.collectorId);
-    if (previous && heartbeat.at <= previous.at) return;
-    this.latestCollectorHeartbeat.set(heartbeat.collectorId, heartbeat);
+    const qualityOrigin = heartbeat.origin === 'raw_collector' ? 'raw_collector' : 'forwarder';
+    const qualityKey = `${heartbeat.collectorId}\0${qualityOrigin}`;
+    const previousQuality = this.latestCollectorQualityHeartbeat.get(qualityKey);
+    if (!previousQuality || heartbeat.at >= previousQuality.at) {
+      this.latestCollectorQualityHeartbeat.set(qualityKey, heartbeat);
+    }
+    const latest = this.latestCollectorHeartbeat.get(heartbeat.collectorId);
+    if (!latest || heartbeat.at >= latest.at) {
+      this.latestCollectorHeartbeat.set(heartbeat.collectorId, heartbeat);
+    }
     if (!this.config.enabled) return;
 
     this.resolveWhere(
@@ -685,21 +695,25 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       'collector heartbeat recovered',
     );
 
-    const counterDelta = (current: number, before: number | undefined): number => {
-      // The first heartbeat establishes a restart baseline. Its cumulative counters are history,
-      // not failures that happened after this service started observing the collector.
-      if (before === undefined) return 0;
-      if (current < before) return current;
-      return current - before;
-    };
-    const droppedDelta =
-      counterDelta(heartbeat.droppedEvents, previous?.droppedEvents) +
-      counterDelta(heartbeat.outputDropped, previous?.outputDropped);
-    const errorDelta = counterDelta(heartbeat.errorCount, previous?.errorCount);
+    const matchesQualityOrigin = (alert: AlertRecord) =>
+      alert.kind === 'collector' &&
+      alert.collectorId === heartbeat.collectorId &&
+      alert.ruleId === 'collector.quality' &&
+      (
+        alert.labels?.heartbeatOrigin === qualityOrigin ||
+        (qualityOrigin === 'forwarder' && !alert.labels?.heartbeatOrigin)
+      );
+    // The raw collector reports cumulative kernel/exporter counters. The Forwarder resets its
+    // output/error counters after every heartbeat snapshot. Keep the public fields and alert IDs,
+    // but use their source/explicit temporality so equal adjacent interval values are not erased.
+    const { droppedDelta, errorDelta } = collectorHeartbeatFailureDelta(
+      heartbeat,
+      previousQuality,
+    );
     const degraded = heartbeat.status !== 'ok' || droppedDelta > 0 || errorDelta > 0;
     if (!degraded) {
       this.resolveWhere(
-        (alert) => alert.kind === 'collector' && alert.collectorId === heartbeat.collectorId && alert.ruleId === 'collector.quality',
+        matchesQualityOrigin,
         heartbeat.at,
         'collector quality recovered',
       );
@@ -722,7 +736,11 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       heartbeat.queueDepth > 0 ? `queue=${heartbeat.queueDepth}` : '',
     ].filter(Boolean).join(', ');
     this.upsert({
-      dedupeKey: ['collector', heartbeat.collectorId, 'quality'].join(':'),
+      // Preserve the historical Forwarder alert ID for compatibility with external references;
+      // only the newly separated raw-Collector quality channel needs an origin suffix.
+      dedupeKey: qualityOrigin === 'forwarder'
+        ? ['collector', heartbeat.collectorId, 'quality'].join(':')
+        : ['collector', heartbeat.collectorId, 'quality', qualityOrigin].join(':'),
       ruleId: 'collector.quality',
       kind: 'collector',
       severity,
@@ -732,6 +750,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       nodeName: heartbeat.nodeName,
       sourceSummary: heartbeat.message || reason || heartbeat.status,
       labels: {
+        heartbeatOrigin: qualityOrigin,
         status: heartbeat.status,
         droppedEvents: String(heartbeat.droppedEvents),
         outputDropped: String(heartbeat.outputDropped),
@@ -741,6 +760,20 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       },
       at: heartbeat.at,
     });
+  }
+
+  /** Restore liveness heads without replaying historical resolve/open notifications. */
+  seedCollectorHeartbeat(heartbeat: CollectorHeartbeatRecord): void {
+    const current = this.latestCollectorHeartbeat.get(heartbeat.collectorId);
+    if (!current || heartbeat.at >= current.at) {
+      this.latestCollectorHeartbeat.set(heartbeat.collectorId, heartbeat);
+    }
+    const qualityOrigin = heartbeat.origin === 'raw_collector' ? 'raw_collector' : 'forwarder';
+    const qualityKey = `${heartbeat.collectorId}\0${qualityOrigin}`;
+    const currentQuality = this.latestCollectorQualityHeartbeat.get(qualityKey);
+    if (!currentQuality || heartbeat.at >= currentQuality.at) {
+      this.latestCollectorQualityHeartbeat.set(qualityKey, heartbeat);
+    }
   }
 
   observeJudgmentResult(result: DecisionResultJob): void {

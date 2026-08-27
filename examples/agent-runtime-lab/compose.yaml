@@ -36,6 +36,15 @@ services:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      # Optional first-party S6 semantic channel. All three values are required; otherwise the
+      # extension remains a no-op and the existing lab behavior is unchanged.
+      ANYSENTRY_PI_ADAPTER_URL: ${ANYSENTRY_PI_ADAPTER_URL:-}
+      ANYSENTRY_ADAPTER_SOURCE_ID: ${ANYSENTRY_ADAPTER_SOURCE_ID:-}
+      ANYSENTRY_ADAPTER_TOKEN: ${ANYSENTRY_ADAPTER_TOKEN:-}
+      ANYSENTRY_TENANT_ID: ${ANYSENTRY_TENANT_ID:-default}
+      ANYSENTRY_ENVIRONMENT_ID: ${ANYSENTRY_ENVIRONMENT_ID:-docker-lab}
+      ANYSENTRY_WORKSPACE_PATH: /workspace
+      ANYSENTRY_AGENT_SCOPE_ID: docker-pi-agent
     labels:
       anysentry.io/workload-kind: agent
       anysentry.io/agent-id: docker-pi-agent
@@ -51,8 +60,12 @@ services:
     restart: unless-stopped
     privileged: true
     pid: host
-    entrypoint: ["/bin/sh", "-c"]
-    command: ["a3s-observer-collector | node /opt/observer-forward.js"]
+    stop_grace_period: 30s
+    labels:
+      io.anysentry.observe: "false"
+      anysentry.io/workload-role: anysentry_internal
+    entrypoint: ["/usr/local/bin/node"]
+    command: ["/opt/observer-supervisor.js"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -62,13 +75,16 @@ services:
       ANYSENTRY_INGEST_URL: ${ANYSENTRY_DOCKER_INGEST_URL:-http://host.docker.internal:29653/security-center/ingest}
       ANYSENTRY_BATCH_INGEST_URL: ${ANYSENTRY_DOCKER_BATCH_INGEST_URL:-http://host.docker.internal:29653/security-center/ingest/batch}
       ANYSENTRY_IDENTITY_SNAPSHOT_URL: ${ANYSENTRY_DOCKER_IDENTITY_URL:-http://host.docker.internal:29653/security-center/identity/snapshot}
+      ANYSENTRY_AGENT_RUNTIME_LEASE_URL: ${ANYSENTRY_DOCKER_RUNTIME_LEASE_URL:-http://host.docker.internal:29653/security-center/runtime/lease}
+      ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL: ${ANYSENTRY_DOCKER_RUNTIME_SNAPSHOT_URL:-http://host.docker.internal:29653/security-center/runtime/snapshot}
       ANYSENTRY_SOURCE_TYPE: observer
       ANYSENTRY_SOURCE_NAME: agent-runtime-lab-docker-native-observer
       ANYSENTRY_HEARTBEAT_SECS: "5"
       ANYSENTRY_IDENTITY_SNAPSHOT_SECS: "5"
       ANYSENTRY_DOCKER_DISCOVERY: "on"
-      FORWARD_FILTER_MODE: enforce
-      FORWARD_RETAIN_UNKNOWN: "false"
+      FORWARD_FILTER_MODE: ${FORWARD_FILTER_MODE:-shadow}
+      # Unknown is retained by the Forwarder; bounded discovery moves to the Collector profile.
+      FORWARD_RETAIN_UNKNOWN: "true"
       FORWARD_RETAIN_NON_AGENT: "false"
       FORWARD_NOISE_POLICY: balanced
     volumes:
@@ -76,8 +92,12 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       # Keep the lab on the current checkout even when Docker's image builder
       # is unavailable or an older observer image is already cached locally.
+      - ../../scripts/observer-supervisor.js:/opt/observer-supervisor.js:ro
       - ../../scripts/observer-forward.js:/opt/observer-forward.js:ro
       - ../../scripts/observer-agent-attribution.js:/opt/observer-agent-attribution.js:ro
+      - ../../scripts/observer-attribution-merge.js:/opt/observer-attribution-merge.js:ro
+      - ../../scripts/observer-classification-semantics.js:/opt/observer-classification-semantics.js:ro
+      - ../../scripts/observer-agent-runtime-signatures.js:/opt/observer-agent-runtime-signatures.js:ro
       - ../../scripts/observer-agent-templates.js:/opt/observer-agent-templates.js:ro
       - ../../scripts/observer-docker-discovery.js:/opt/observer-docker-discovery.js:ro
       - ../../scripts/observer-behavior-discovery.js:/opt/observer-behavior-discovery.js:ro
@@ -85,6 +105,11 @@ services:
       - ../../scripts/observer-event-dedup.js:/opt/observer-event-dedup.js:ro
       - ../../scripts/observer-workload-filter.js:/opt/observer-workload-filter.js:ro
       - ../../scripts/observer-infrastructure-roots.js:/opt/observer-infrastructure-roots.js:ro
+      - ../../scripts/observer-infrastructure-policy.js:/opt/observer-infrastructure-policy.js:ro
+      - ../../scripts/observer-infrastructure-rules.js:/opt/observer-infrastructure-rules.js:ro
+      - ../../scripts/observer-filter-rules.js:/opt/observer-filter-rules.js:ro
+      - ../../scripts/observer-file-aggregation.js:/opt/observer-file-aggregation.js:ro
+      - ../../scripts/observer-pipeline-accounting.js:/opt/observer-pipeline-accounting.js:ro
 
 volumes:
   a3s-workspace:

@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 
 const baseUrl = (process.env.ANYSENTRY_API_BASE
   ?? 'http://127.0.0.1:29653/security-center').replace(/\/$/, '');
+const adminToken = process.env.ANYSENTRY_ADMIN_TOKEN?.trim();
 const runId = `flink-${Date.now()}-${randomUUID().slice(0, 8)}`;
 const agentId = `${runId}-agent`;
 const sessionId = `${runId}-session`;
@@ -13,7 +14,10 @@ const workspacePath = `repo://${runId}/workspace`;
 async function request(path, body) {
   const response = await fetch(`${baseUrl}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      ...(adminToken && path !== '/ingest' ? { authorization: `Bearer ${adminToken}` } : {}),
+    },
     body: JSON.stringify(body),
   });
   const text = await response.text();

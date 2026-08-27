@@ -122,6 +122,8 @@ try {
   assert.equal(ingested.probable_agent.accepted, true);
   assert.equal(ingested.unknown.accepted, true);
   assert.equal(ingested.non_agent.accepted, false);
+  assert.equal(ingested.non_agent.disposition, 'discarded');
+  assert.equal(ingested.non_agent.reasonCode, 'non_agent_discarded');
 
   const deadline = Date.now() + Number(process.env.ANYSENTRY_IDENTITY_ROUTE_VERIFY_TIMEOUT_MS ?? 30_000);
   let raw;

@@ -318,7 +318,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       await client.query('COMMIT');
       return true;
     } catch (error) {
-      await client?.query('ROLLBACK').catch(() => undefined);
+      if (client) await client.query('ROLLBACK').catch(() => undefined);
       this.markUnavailable('save Agent-Workspace bindings', error);
       return false;
     } finally {
@@ -851,6 +851,89 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  async loadPlatformConfig<T>(configKey: string): Promise<{ record: T; updatedAt: number } | undefined> {
+    if (!(await this.initialize()) || !this.pool) return undefined;
+    try {
+      const result = await this.pool.query<{
+        record: T | string;
+        updated_at: string | number;
+      }>(
+        `SELECT record, updated_at
+           FROM anysentry_platform_configs
+          WHERE config_key = $1`,
+        [configKey.slice(0, 160)],
+      );
+      const row = result.rows[0];
+      const record = row ? this.parseRecord<T>(row.record) : undefined;
+      return record ? { record, updatedAt: Number(row.updated_at) } : undefined;
+    } catch (error) {
+      this.markUnavailable(`load Platform Config ${configKey}`, error);
+      return undefined;
+    }
+  }
+
+  async savePlatformConfig<T>(configKey: string, record: T, updatedAt = Date.now()): Promise<boolean> {
+    if (!(await this.initialize()) || !this.pool) return false;
+    try {
+      await this.pool.query(
+        `INSERT INTO anysentry_platform_configs (config_key, record, updated_at)
+         VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT (config_key) DO UPDATE SET
+           record = EXCLUDED.record,
+           updated_at = EXCLUDED.updated_at
+         WHERE EXCLUDED.updated_at >= anysentry_platform_configs.updated_at`,
+        [configKey.slice(0, 160), JSON.stringify(record), updatedAt],
+      );
+      return true;
+    } catch (error) {
+      this.markUnavailable(`save Platform Config ${configKey}`, error);
+      return false;
+    }
+  }
+
+  async compareAndSwapPlatformConfig<T extends { globalRevision?: number }>(
+    configKey: string,
+    expectedGlobalRevision: number,
+    record: T,
+    updatedAt = Date.now(),
+  ): Promise<'saved' | 'conflict' | 'unavailable'> {
+    if (!(await this.initialize()) || !this.pool) return 'unavailable';
+    let client: PoolClient | undefined;
+    try {
+      client = await this.pool.connect();
+      await client.query('BEGIN');
+      // A missing row cannot be protected by SELECT ... FOR UPDATE. Serialize the first insert and
+      // all later revisions on the logical config key as well.
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [configKey.slice(0, 160)]);
+      const current = await client.query<{ record: T | string }>(
+        `SELECT record FROM anysentry_platform_configs WHERE config_key = $1 FOR UPDATE`,
+        [configKey.slice(0, 160)],
+      );
+      const parsed = current.rows[0] ? this.parseRecord<T>(current.rows[0].record) : undefined;
+      const currentRevision = Number(parsed?.globalRevision) || 0;
+      if (currentRevision !== expectedGlobalRevision) {
+        await client.query('ROLLBACK');
+        return 'conflict';
+      }
+      await client.query(
+        `INSERT INTO anysentry_platform_configs (config_key, record, updated_at)
+         VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT (config_key) DO UPDATE SET
+           record = EXCLUDED.record,
+           updated_at = EXCLUDED.updated_at`,
+        [configKey.slice(0, 160), JSON.stringify(record), updatedAt],
+      );
+      await client.query('COMMIT');
+      return 'saved';
+    } catch (error) {
+      if (client) await client.query('ROLLBACK').catch(() => undefined);
+      this.markUnavailable(`compare-and-swap Platform Config ${configKey}`, error);
+      return 'unavailable';
+    } finally {
+      client?.release();
+    }
+  }
+
   private async connect(): Promise<boolean> {
     const pool = new Pool({
       connectionString: this.databaseUrl,
@@ -868,6 +951,12 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       ssl: process.env.ANYSENTRY_DATABASE_SSL === 'on'
         ? { rejectUnauthorized: process.env.ANYSENTRY_DATABASE_SSL_REJECT_UNAUTHORIZED !== 'off' }
         : undefined,
+    });
+    // node-postgres emits idle-client failures on the Pool itself. Without a listener, a
+    // transient PostgreSQL restart or network reset becomes an uncaught EventEmitter error and
+    // terminates the API process even though the ClickHouse migration fallback remains usable.
+    pool.on('error', (error) => {
+      this.markUnavailable('handle an idle PostgreSQL client failure', error);
     });
 
     try {
@@ -1288,7 +1377,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         return true;
       } catch (error) {
         lastError = error;
-        await client?.query('ROLLBACK').catch(() => undefined);
+        if (client) await client.query('ROLLBACK').catch(() => undefined);
         if (!this.retryableTransactionError(error) || attempt === BUSINESS_WRITE_MAX_ATTEMPTS) {
           break;
         }

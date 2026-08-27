@@ -10,6 +10,7 @@ const {
   isServiceDataFile,
   isWorkspaceFile,
 } = require('./observer-behavior-discovery');
+const { behaviorDiscoveryEligible } = require('./observer-workload-filter');
 
 let now = 1_000_000;
 const detector = new BehavioralAgentDetector({
@@ -125,6 +126,29 @@ assert.equal(
   'service data is not Agent workspace evidence',
 );
 assert.equal(isWorkspaceFile({ path: '/workspace/src/index.ts' }), true);
+
+for (const role of ['anysentry_internal', 'platform_infrastructure', 'business_service']) {
+  assert.equal(behaviorDiscoveryEligible({
+    state: 'unknown',
+    workloadRole: role,
+    attribution: { classification: 'unknown', source: 'kubernetes' },
+  }), false, `${role} inventory cannot enter weak behavior promotion`);
+}
+assert.equal(behaviorDiscoveryEligible({
+  state: 'unknown',
+  attribution: { classification: 'unknown', source: 'docker' },
+  infrastructureFacts: { labels: { 'anysentry.io/workload-role': 'platform_infrastructure' } },
+}), false, 'role carried only by inventory labels still blocks behavior promotion');
+assert.equal(behaviorDiscoveryEligible({
+  state: 'unknown',
+  workloadRole: 'unknown',
+  attribution: { classification: 'unknown', source: 'kubernetes' },
+  infrastructureFacts: { workloadRole: 'anysentry_internal' },
+}), false, 'an early unknown placeholder cannot mask a later authoritative inventory role');
+assert.equal(behaviorDiscoveryEligible({
+  state: 'unknown',
+  attribution: { classification: 'unknown', source: 'none' },
+}), true, 'role-unknown workloads remain eligible for Agent discovery');
 
 const sequenceDetector = new BehavioralAgentDetector({
   now: () => now,

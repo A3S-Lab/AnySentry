@@ -116,8 +116,28 @@ assert.match(aggregation, /new CommitAwareFactBucketCache<StoredAgentBucketFact>
 assert.match(aggregation, /new CommitAwareFactBucketCache<StoredTopologyBucketFact>/);
 assert.match(aggregation, /function reusableFactSlices\(/);
 assert.match(aggregation, /fullEndExclusiveMs/);
-assert.match(aggregation, /using exact fallback/);
+assert.match(aggregation, /using bounded hot fallback/);
+assert.match(aggregation, /boundedHotDashboardOverlay/);
+assert.match(aggregation, /partialReason: 'hot_ring_only'/);
+assert.match(aggregation, /DASHBOARD_EXACT_COMPARISON_MAX_BUCKETS = 360/);
+assert.match(aggregation, /Math\.ceil\(\(window\.spanMs \* 2\) \/ REUSABLE_BUCKET_MS\)/);
+assert.match(
+  aggregation,
+  /failed reusable read[\s\S]*?return null/u,
+  'a reusable history failure must not launch a second exact full-window scan',
+);
 assert.match(clickhouse, /async agentWindowBucketFacts\(/);
+const agentBucketQuery = clickhouse.slice(
+  clickhouse.indexOf('async agentWindowBucketFacts('),
+  clickhouse.indexOf('async workspaceWindowFacts('),
+);
+assert.match(agentBucketQuery, /argMax\(eventKind, tuple\(decisionRevision, decisionUpdatedAt, at\)\) AS eventKind/u);
+assert.match(agentBucketQuery, /countIf\(collectorId = '' AND eventKind NOT IN/u,
+  'Agent bucket query projects eventKind for collector-coverage aggregation');
+assert.match(agentBucketQuery, /clickhouse_settings: BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS/u,
+  'Agent cold bucket builds are bounded instead of blocking the asset directory indefinitely');
+assert.match(agentBucketQuery, /WHERE at >= \{since:UInt64\} AND at < \{endExclusive:UInt64\}[\s\S]*?\$\{monitoredClause\}[\s\S]*?GROUP BY eventId/u,
+  'Agent membership is narrowed before event revision aggregation');
 assert.match(clickhouse, /async topologyWindowBucketFacts\(/);
 assert.match(clickhouse, /intDiv\(eventAt, \{bucketMs:UInt64\}\)/);
 assert.match(clickhouse, /argMax\(at, tuple\(decisionRevision, decisionUpdatedAt, at\)\)/);

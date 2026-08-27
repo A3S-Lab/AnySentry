@@ -222,14 +222,17 @@ public final class AnySentryStreamJob {
         return OffsetsInitializer.committedOffsets(OffsetResetStrategy.LATEST);
     }
 
-    private static boolean episodeRelevant(CanonicalEvent event) {
-        return !event.platformRuntime
-                && event.behaviorStage != null
-                && !"none".equals(event.behaviorStage);
+    static boolean episodeRelevant(CanonicalEvent event) {
+        if (event.platformRuntime || event.behaviorStage == null) return false;
+        return switch (event.behaviorStage) {
+            case "credential_access", "staging", "transform", "external_egress",
+                    "dangerous_exec", "destructive_action" -> true;
+            default -> false;
+        };
     }
 
-    private static boolean profileRelevant(CanonicalEvent event) {
-        return !event.platformRuntime && !event.synthetic;
+    static boolean profileRelevant(CanonicalEvent event) {
+        return RiskCorrelationFunction.relevant(event);
     }
 
     static String riskProfileEntityKey(CanonicalEvent event) {

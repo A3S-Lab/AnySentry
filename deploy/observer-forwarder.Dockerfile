@@ -9,14 +9,6 @@ ARG NODE_IMAGE=node:20-bookworm-slim
 FROM ${NODE_IMAGE} AS nodebin
 FROM ${OBSERVER_IMAGE}
 COPY --from=nodebin /usr/local/bin/node /usr/local/bin/node
-COPY scripts/observer-forward.js /opt/observer-forward.js
-COPY scripts/observer-durable-spool.js /opt/observer-durable-spool.js
-COPY scripts/observer-agent-attribution.js /opt/observer-agent-attribution.js
-COPY scripts/observer-agent-templates.js /opt/observer-agent-templates.js
-COPY scripts/observer-docker-discovery.js /opt/observer-docker-discovery.js
-COPY scripts/observer-behavior-discovery.js /opt/observer-behavior-discovery.js
-COPY scripts/observer-priority-queue.js /opt/observer-priority-queue.js
-COPY scripts/observer-event-dedup.js /opt/observer-event-dedup.js
-COPY scripts/observer-workload-filter.js /opt/observer-workload-filter.js
-COPY scripts/observer-infrastructure-roots.js /opt/observer-infrastructure-roots.js
-# The DaemonSet supplies the command: a3s-observer-collector | node /opt/observer-forward.js
+COPY scripts/observer-*.js /opt/
+# The DaemonSet runs observer-supervisor.js as PID 1; it owns the collector/forwarder stream.
+ENTRYPOINT ["/usr/local/bin/node", "/opt/observer-supervisor.js"]

@@ -1,4 +1,4 @@
-import { createBrowserRouter, Outlet } from "react-router-dom";
+import { createBrowserRouter, Navigate, Outlet, useLocation } from "react-router-dom";
 import {
   SecurityAssistant,
   SecurityAssistantProvider,
@@ -24,6 +24,11 @@ function AppShell() {
   );
 }
 
+function LegacyCaptureRulesRedirect() {
+  const location = useLocation();
+  return <Navigate replace to={`/filter-rules${location.search}${location.hash}`} />;
+}
+
 export const router = createBrowserRouter(
   [{
     element: <AppShell />,
@@ -33,6 +38,8 @@ export const router = createBrowserRouter(
       { path: "/ai/chat", lazy: lazyRoute("/ai/chat") },
       { path: "/agents", lazy: lazyRoute("/agents") },
       { path: "/alerts", lazy: lazyRoute("/alerts") },
+      { path: "/assets", lazy: lazyRoute("/assets") },
+      { path: "/assets/:assetId", lazy: lazyRoute("/assets") },
       { path: "/audit", lazy: lazyRoute("/audit") },
       { path: "/capabilities", lazy: lazyRoute("/capabilities") },
       { path: "/collectors", lazy: lazyRoute("/collectors") },
@@ -40,6 +47,8 @@ export const router = createBrowserRouter(
       { path: "/coverage", lazy: lazyRoute("/coverage") },
       { path: "/evidence", lazy: lazyRoute("/evidence") },
       { path: "/events", lazy: lazyRoute("/events") },
+      { path: "/filter-rules", lazy: lazyRoute("/filter-rules") },
+      { path: "/capture-rules", element: <LegacyCaptureRulesRedirect /> },
       { path: "/incidents", lazy: lazyRoute("/incidents") },
       { path: "/maintenance", lazy: lazyRoute("/maintenance") },
       { path: "/notifications", lazy: lazyRoute("/notifications") },

@@ -1,12 +1,46 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   extractionStatusFromWarnings,
+  osvScannerGeneralError,
   scanInstalledEnvironments,
+  sourceScanArguments,
 } from './workspace-scanner.mjs';
+
+const sourceArgs = sourceScanArguments('/workspace/AnySentry');
+assert.deepEqual(sourceArgs.slice(0, 5), [
+  'scan',
+  'source',
+  '--recursive',
+  '--all-packages',
+  '--format=json',
+]);
+assert.equal(sourceArgs.at(-1), '/workspace/AnySentry');
+for (const directory of ['artifacts', '.local', '.agents', 'node_modules', 'target']) {
+  assert.ok(
+    sourceArgs.includes(`--experimental-exclude=g:**/${directory}/**`),
+    `OSV source scan must exclude ${directory}`,
+  );
+}
+assert.ok(sourceArgs.slice(5, -1).every((arg) => arg.startsWith('--experimental-exclude=g:**/')));
+
+const permissionDiagnostic = osvScannerGeneralError(
+  'open workspace/AnySentry/artifacts/private/.gitignore: permission denied\nsecond line',
+);
+assert.match(permissionDiagnostic, /exit 127/u);
+assert.match(permissionDiagnostic, /artifacts\/private\/\.gitignore: permission denied/u);
+assert.equal(permissionDiagnostic.includes('\n'), false);
+assert.match(osvScannerGeneralError(''), /no diagnostic output/u);
+
+const modulesDockerfile = await readFile(new URL('../Dockerfile.modules', import.meta.url), 'utf8');
+assert.match(
+  modulesDockerfile,
+  /FROM \$\{NODE_BUILD_IMAGE\} AS workspace-scanner[\s\S]*?apt-get install -y --no-install-recommends ca-certificates/u,
+  'workspace-scanner image must contain the system CA bundle required by deps.dev and OSV',
+);
 
 const root = await mkdtemp(join(tmpdir(), 'anysentry-installed-inventory-'));
 try {

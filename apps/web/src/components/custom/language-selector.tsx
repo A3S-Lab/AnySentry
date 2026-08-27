@@ -9,7 +9,7 @@ export function LanguageSelector({ className }: { className?: string }) {
   return (
     <Select value={locale} onValueChange={(value) => setLocale(value as AppLocale)}>
       <SelectTrigger
-        className={cn("h-9 w-[142px] border-[#2e3645] bg-[#151a23] text-xs text-[#b6bdcc]", className)}
+        className={cn("h-11 w-[142px] border-[#2e3645] bg-[#151a23] text-xs text-[#b6bdcc] sm:h-9", className)}
         aria-label={t("语言")}
       >
         <Globe2 className="mr-2 size-3.5 shrink-0 text-[#818a9c]" />

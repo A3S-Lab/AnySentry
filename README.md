@@ -128,7 +128,7 @@ Judgment can run in two deployment modes:
 
 L1 rules are enabled by default. L2 and L3 remain inactive until their policy and model backends are explicitly configured; L3 follows an unresolved L2 escalation rather than severity alone.
 
-The policy page provides independent **快速研判模型** and **深度研判模型** connections. A key is
+The policy page provides independent **Fast Review** and **Deep Investigation** model connections. A key is
 accepted only for a bounded A3S Code connection test and, after explicit apply, remains in process
 memory; it is never saved in PolicyConfig, ClickHouse, Redis data structures, logs, responses or
 browser storage. Applied credentials are delivered to workers through non-persistent Redis Pub/Sub

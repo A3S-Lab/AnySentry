@@ -162,7 +162,10 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
 
     const summary = {
       totalRecords: items.length,
-      policyActions: items.filter((record) => record.resourceType === 'policy').length,
+      policyActions: items.filter((record) =>
+        record.resourceType === 'policy' ||
+        record.resourceType === 'infrastructure-rule' ||
+        record.resourceType === 'unknown-learning').length,
       agentActions: items.filter((record) => record.resourceType === 'agent').length,
       maintenanceActions: items.filter((record) => record.resourceType === 'maintenance').length,
       notificationActions: items.filter((record) => record.resourceType === 'notification').length,

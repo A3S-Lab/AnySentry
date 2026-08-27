@@ -34,9 +34,6 @@ export default defineConfig({
     },
   },
   output: {
-    // Runtime verification follows this manifest so code-split route chunks
-    // remain covered without forcing them back into the initial HTML.
-    manifest: true,
     distPath: {
       root: "dist",
     },

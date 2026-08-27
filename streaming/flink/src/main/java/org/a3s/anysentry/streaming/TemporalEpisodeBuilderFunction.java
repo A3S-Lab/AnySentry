@@ -7,6 +7,7 @@ import org.apache.flink.api.common.state.StateTtlConfig;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.metrics.Counter;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
 import org.apache.flink.streaming.api.TimeDomain;
 import org.apache.flink.util.Collector;
@@ -31,6 +32,10 @@ public class TemporalEpisodeBuilderFunction
     static final int MAX_FACTS = 64;
     static final long ALLOWED_LATENESS_MS = 30_000L;
     static final long AMBIGUOUS_SETTLE_MS = 30_000L;
+    static final String FILE_CANDIDATE_SUPPRESSION_METRIC =
+            "temporal_file_candidate_suppressed_total";
+    static final String AMBIGUOUS_CANDIDATE_SUPPRESSION_METRIC =
+            "temporal_ambiguous_candidate_suppressed_total";
     public static final OutputTag<String> REJECTED_FACTS =
             new OutputTag<>("temporal-episode-rejected-facts", TypeInformation.of(String.class));
 
@@ -41,6 +46,8 @@ public class TemporalEpisodeBuilderFunction
     private transient MapState<String, Boolean> activeFiles;
     private transient MapState<String, Long> pendingAmbiguousCandidates;
     private transient ValueState<Long> maximumEventTime;
+    private transient Counter fileCandidateSuppressions;
+    private transient Counter ambiguousCandidateSuppressions;
 
     @Override
     public void open(OpenContext openContext) throws Exception {
@@ -58,6 +65,10 @@ public class TemporalEpisodeBuilderFunction
                 new ValueStateDescriptor<>("temporal-maximum-event-time", Long.class);
         maximumDescriptor.enableTimeToLive(ttl);
         maximumEventTime = getRuntimeContext().getState(maximumDescriptor);
+        fileCandidateSuppressions = getRuntimeContext().getMetricGroup()
+                .counter(FILE_CANDIDATE_SUPPRESSION_METRIC);
+        ambiguousCandidateSuppressions = getRuntimeContext().getMetricGroup()
+                .counter(AMBIGUOUS_CANDIDATE_SUPPRESSION_METRIC);
     }
 
     private <T> MapState<String, T> mapState(
@@ -88,7 +99,7 @@ public class TemporalEpisodeBuilderFunction
         if (boundedFileCandidate(signal) && !fileId.isBlank() && !activeFiles.contains(fileId)) {
             if (!candidateSeed(signal)) return;
             if (stateSize(activeFiles) >= MAX_ACTIVE_FILE_CANDIDATES) {
-                reject(context, signal, "active temporal file candidate limit exceeded");
+                fileCandidateSuppressions.inc();
                 return;
             }
             activeFiles.put(fileId, true);
@@ -111,7 +122,7 @@ public class TemporalEpisodeBuilderFunction
                     || matchedTerminals.contains(terminalKey)
                     || pendingAmbiguousCandidates.contains(terminalKey)) continue;
             if (stateSize(pendingAmbiguousCandidates) >= MAX_AMBIGUOUS_CANDIDATES) {
-                reject(context, signal, "active ambiguous temporal candidate limit exceeded");
+                ambiguousCandidateSuppressions.inc();
                 break;
             }
             long dueAt = context.timerService().currentProcessingTime() + AMBIGUOUS_SETTLE_MS;
@@ -283,11 +294,7 @@ public class TemporalEpisodeBuilderFunction
     }
 
     private static boolean candidateSeed(BehaviorSignal signal) {
-        if (opensCandidate(signal)) return true;
-        String path = signal.fileIdentity == null ? "" : value(signal.fileIdentity.path);
-        return path.startsWith("/tmp/")
-                || path.startsWith("/var/tmp/")
-                || path.startsWith("/dev/shm/");
+        return opensCandidate(signal);
     }
 
     private static boolean boundedFileCandidate(BehaviorSignal signal) {
@@ -312,6 +319,14 @@ public class TemporalEpisodeBuilderFunction
         int count = 0;
         for (String ignored : state.keys()) count += 1;
         return count;
+    }
+
+    long fileCandidateSuppressionCount() {
+        return fileCandidateSuppressions == null ? 0L : fileCandidateSuppressions.getCount();
+    }
+
+    long ambiguousCandidateSuppressionCount() {
+        return ambiguousCandidateSuppressions == null ? 0L : ambiguousCandidateSuppressions.getCount();
     }
 
     private void reject(Context context, BehaviorSignal signal, String reason) {

@@ -1,0 +1,31 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Single-node full-function overlay. It keeps canonical production manifests unchanged while
+# binding checkpoints and Postgres to local-path, adding the read-only local Workspace Scanner,
+# and preserving the manual NodePort contract.
+resources:
+  - ../../anysentry.yaml
+  - ../../streaming.yaml
+  - manual-support.yaml
+  - service-context-probe.yaml
+
+images:
+  - name: ghcr.io/a3s-lab/anysentry
+    newName: 127.0.0.1:5000/anysentry
+    digest: sha256:71b09d8920fbf11c10787289fe67d3b0c8741bef7ae5f56ea39e6c7fa44dc799
+  - name: ghcr.io/a3s-lab/anysentry-flink-streaming
+    newName: 127.0.0.1:5000/anysentry-flink-streaming
+    digest: sha256:f20ea8e7fa447aedfab07df90c6a5387ad3df696e73318c9f2b281e77eababb3
+  - name: ghcr.io/a3s-lab/anysentry-workspace-scanner
+    newName: 127.0.0.1:5000/anysentry-workspace-scanner
+    digest: sha256:6d70223604cad8ee030a1e7eec90385b7c854f0829977dd4565d0a91fb223799
+  - name: 127.0.0.1:5000/anysentry-context-probe
+    newName: 127.0.0.1:5000/anysentry-context-probe
+    digest: sha256:362c26fc8c2bc50a711815ef5111db48edbd349829b2fc1776c280e5667a2c58
+
+patches:
+  - path: ../runtime-on.yaml
+  - path: flink-checkpoints-rwo.yaml
+  - path: anysentry-nodeport-patch.yaml
+  - path: full-load-capacity-patch.yaml

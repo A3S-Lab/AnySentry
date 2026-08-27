@@ -1,0 +1,17 @@
+# Explicit local canary only. Layer this after docker-compose.modules.yml and enable the observer
+# profile; the ordinary modular stack keeps the legacy combined file switch off.
+services:
+  observer:
+    environment:
+      A3S_OBSERVER_FILES: "0"
+      A3S_OBSERVER_FILE_ACCESS: "1"
+      A3S_OBSERVER_FILE_DELETE: "0"
+      A3S_OBSERVER_FILE_UNKNOWN_POLICY: "keep"
+      A3S_OBSERVER_SSL: "0"
+      FORWARD_FILTER_MODE: "enforce"
+      FORWARD_RETAIN_UNKNOWN: "true"
+      FORWARD_FILE_AGGREGATION: "true"
+      # One Forwarder block is aligned with the 64-row judgment result micro-batch. Unknown remains
+      # lossless; capacity is obtained from authoritative prefiltering and exact aggregation.
+      FORWARD_BATCH_SIZE: "64"
+      FORWARD_BATCH_FLUSH_MS: "50"

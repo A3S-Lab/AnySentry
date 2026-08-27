@@ -9,6 +9,7 @@ import {
   KeyRound,
   Layers3,
   LayoutDashboard,
+  ListFilter,
   Megaphone,
   MessageSquareText,
   Network,
@@ -35,7 +36,7 @@ import { useI18n } from "@/lib/i18n";
 import { prefetchRoute } from "@/lib/performance/route-loaders";
 import { cn } from "@/lib/utils";
 
-interface NavigationItem {
+export interface SecurityNavigationItem {
   label: string;
   description?: string;
   href: string;
@@ -43,7 +44,7 @@ interface NavigationItem {
   dashboardView?: string;
 }
 
-const GROUPS: Array<{ label: string; icon: LucideIcon; items: NavigationItem[] }> = [
+export const SECURITY_NAVIGATION_GROUPS: Array<{ label: string; icon: LucideIcon; items: SecurityNavigationItem[] }> = [
   {
     label: "AI 平台",
     icon: Sparkles,
@@ -78,6 +79,7 @@ const GROUPS: Array<{ label: string; icon: LucideIcon; items: NavigationItem[] }
     icon: Bot,
     items: [
       { label: "Agent 列表", description: "Agent 清单与运行状态", href: "/?view=agentAssets", icon: Bot, dashboardView: "agentAssets" },
+      { label: "资产与身份", description: "Agent、服务与待识别对象", href: "/assets", icon: ShieldCheck },
       { label: "Agent 态势", description: "实例活动与研判健康", href: "/?view=agentInstances", icon: Activity, dashboardView: "agentInstances" },
       { label: "Agent 拓扑", description: "Agent 运行时安全关系", href: "/topology", icon: Network },
       { label: "对话追踪", description: "Agent 对话与上下文追踪", href: "/conversations", icon: MessageSquareText },
@@ -95,6 +97,7 @@ const GROUPS: Array<{ label: string; icon: LucideIcon; items: NavigationItem[] }
       { label: "维护窗口", description: "维护窗口与告警抑制", href: "/maintenance", icon: CalendarClock },
       { label: "覆盖盲区", description: "采集与监控盲区", href: "/coverage", icon: EyeOff },
       { label: "监控目标", description: "持续监控目标", href: "/objectives", icon: Target },
+      { label: "过滤规则", description: "F0/F1/F2/F3 统一规则治理", href: "/filter-rules", icon: ListFilter },
       { label: "审计日志", description: "管理操作审计记录", href: "/audit", icon: KeyRound },
     ],
   },
@@ -107,7 +110,7 @@ const GROUPS: Array<{ label: string; icon: LucideIcon; items: NavigationItem[] }
   },
 ];
 
-function isNavigationItemActive(pathname: string, search: string, item: NavigationItem): boolean {
+export function isSecurityNavigationItemActive(pathname: string, search: string, item: SecurityNavigationItem): boolean {
   if (item.dashboardView) {
     if (pathname !== "/" && pathname !== "/admin/security-monitor") return false;
     const view = new URLSearchParams(search).get("view") || "overview";
@@ -129,7 +132,7 @@ export function SecuritySidebar() {
       <div className="flex h-full min-h-0 flex-col">
         <div className="mr-1 min-h-0 flex-1 overflow-y-auto p-1.5">
           <nav className="space-y-1" aria-label={t("安全监控模块")}>
-            {GROUPS.map((group, groupIndex) => {
+            {SECURITY_NAVIGATION_GROUPS.map((group, groupIndex) => {
               const GroupIcon = group.icon;
               return (
                 <div key={group.label}>
@@ -146,7 +149,7 @@ export function SecuritySidebar() {
                   </p>
                   {group.items.map((item) => {
                     const Icon = item.icon;
-                    const active = isNavigationItemActive(pathname, search, item);
+                    const active = isSecurityNavigationItemActive(pathname, search, item);
                     return (
                       <Link
                         key={item.href}

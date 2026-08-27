@@ -5,6 +5,7 @@
 # Feed real events by piping an a3s-observer collector into scripts/observer-forward.js.
 x-anysentry-infrastructure-labels: &anysentry-infrastructure-labels
   io.anysentry.observe: "false"
+  anysentry.io/workload-role: "anysentry_internal"
 
 services:
   prometheus:
@@ -66,13 +67,17 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-anysentry}
     volumes:
       - clickhouse-data:/var/lib/clickhouse
-      - ./config/clickhouse/anysentry-server.xml:/etc/clickhouse-server/config.d/anysentry-server.xml:ro
-      - ./config/clickhouse/anysentry-users.xml:/etc/clickhouse-server/users.d/anysentry-users.xml:ro
+      - ./config/clickhouse/anysentry-server.xml:/etc/clickhouse-server/config.d/10-anysentry-server.xml:ro
+      - ./deploy/clickhouse-memory.xml:/etc/clickhouse-server/config.d/20-anysentry-memory.xml:ro
+      - ./config/clickhouse/anysentry-users.xml:/etc/clickhouse-server/users.d/10-anysentry-users.xml:ro
+    mem_limit: 4g
+    memswap_limit: 4g
     healthcheck:
       test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 24
+    stop_grace_period: 30s
     restart: unless-stopped
 
   redis:
@@ -98,10 +103,12 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 5s
       timeout: 3s
       retries: 24
+      start_period: 10s
+    stop_grace_period: 30s
     restart: unless-stopped
 
   anysentry:
@@ -117,6 +124,10 @@ services:
         condition: service_healthy
     environment:
       PORT: 29653
+      NODE_OPTIONS: ${ANYSENTRY_API_NODE_OPTIONS:---max-old-space-size=1024}
+      ANYSENTRY_HOT_EVENT_LIMIT: ${ANYSENTRY_HOT_EVENT_LIMIT:-5000}
+      ANYSENTRY_OBSERVER_BODY_LIMIT: ${ANYSENTRY_OBSERVER_BODY_LIMIT:-4mb}
+      ANYSENTRY_MANAGEMENT_TOKEN: ${ANYSENTRY_MANAGEMENT_TOKEN:-}
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-anysentry}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-anysentry}
@@ -172,6 +183,7 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - "29653:29653"
+    stop_grace_period: 30s
     restart: unless-stopped
 
   fast-judge:
@@ -408,9 +420,11 @@ services:
     environment:
       ANYSENTRY_STREAM_WORKER_ROLE: judge
       ANYSENTRY_REDIS_URL: redis://redis:6379/0
-      ANYSENTRY_COMPOSITE_LLM_URL: ${ANYSENTRY_COMPOSITE_LLM_URL:-http://host.docker.internal:18051/v1}
-      ANYSENTRY_COMPOSITE_LLM_KEY: ${ANYSENTRY_COMPOSITE_LLM_KEY:-proxy-managed}
-      ANYSENTRY_COMPOSITE_MODEL: ${ANYSENTRY_COMPOSITE_MODEL:-glm-5.2}
+      ANYSENTRY_COMPOSITE_LLM_URL: ${ANYSENTRY_COMPOSITE_LLM_URL:-}
+      ANYSENTRY_COMPOSITE_LLM_KEY: ${ANYSENTRY_COMPOSITE_LLM_KEY:-}
+      # Empty means: follow the Deep Investigation runtime model/Secret; the worker keeps the
+      # historical glm fallback only when neither runtime nor A3S model configuration exists.
+      ANYSENTRY_COMPOSITE_MODEL: ${ANYSENTRY_COMPOSITE_MODEL:-}
       ANYSENTRY_COMPOSITE_TIMEOUT_MS: ${ANYSENTRY_COMPOSITE_TIMEOUT_MS:-60000}
       ANYSENTRY_COMPOSITE_CONCURRENCY: ${ANYSENTRY_COMPOSITE_CONCURRENCY:-2}
       ANYSENTRY_COMPOSITE_MAX_EVENT_AGE_MS: ${ANYSENTRY_COMPOSITE_MAX_EVENT_AGE_MS:-900000}

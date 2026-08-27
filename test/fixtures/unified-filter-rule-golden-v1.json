@@ -1,0 +1,38 @@
+{
+  "schemaVersion": "anysentry.filter_rule_golden.v1",
+  "projectionInput": {
+    "catalogVersion": 11,
+    "domainVersions": {
+      "identity": 2,
+      "capture": 3,
+      "forwarder": 4,
+      "retention": 5
+    },
+    "now": "2026-08-25T12:00:00.000Z",
+    "ttlMs": 120000
+  },
+  "projection": {
+    "contentHash": "c77878f7ed98d555c41c7ca1bb0ddbeb283501782d2b86e79d2db378db0b38b3",
+    "intentHash": "ca04b23be42c55cc034d1c18b1128dd5d4976fbd055e536278ca1b696529a824",
+    "counts": {
+      "runtimeSignatures": 6,
+      "agentTemplates": 0,
+      "identityRules": 10,
+      "captureProfileRules": 8,
+      "signalEnablementRules": 1,
+      "semanticRetentionRules": 5,
+      "persistenceRetentionRules": 5,
+      "safetyGuardrails": 5
+    }
+  },
+  "expected": {
+    "codexRuntime": "codex",
+    "agentLabelClassification": "confirmed_agent",
+    "agentLabelRole": "agent",
+    "probableCaptureProfile": "probable_investigation",
+    "infrastructureCaptureProfile": "infrastructure_aggregate",
+    "securityF2RuleId": "fr_guardrail_security_full",
+    "nonAgentF2RuleId": "fr_builtin_f2_non_agent_suppress",
+    "unknownF2RuleId": "fr_builtin_f2_unknown_keep"
+  }
+}

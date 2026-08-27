@@ -52,8 +52,30 @@ export class StreamingQueueService implements OnModuleDestroy {
 
   async enqueueCanonical(event: JudgedEvent, observerLine: string): Promise<boolean> {
     if (!this.queue || (this.agentOnly && !isAgentStreamEvent(event))) return false;
+    const job = this.canonicalJob(event, observerLine);
+    await this.queue.add('publish-canonical-event', job, { jobId: `canonical-${job.messageId}` });
+    return true;
+  }
+
+  async enqueueCanonicalBatch(
+    events: ReadonlyArray<{ event: JudgedEvent; observerLine: string }>,
+  ): Promise<number> {
+    if (!this.queue) return 0;
+    const jobs = events
+      .filter(({ event }) => !this.agentOnly || isAgentStreamEvent(event))
+      .map(({ event, observerLine }) => this.canonicalJob(event, observerLine));
+    if (!jobs.length) return 0;
+    await this.queue.addBulk(jobs.map((job) => ({
+      name: 'publish-canonical-event',
+      data: job,
+      opts: { jobId: `canonical-${job.messageId}` },
+    })));
+    return jobs.length;
+  }
+
+  private canonicalJob(event: JudgedEvent, observerLine: string): StreamPublishJob {
     const payload = canonicalizeEvent(event, observerLine);
-    const job: StreamPublishJob = {
+    return {
       schemaVersion: 'anysentry.stream_publish_job.v1',
       topic: this.canonicalTopic,
       key: [payload.tenantId, payload.environmentId, payload.agentCorrelationId].join(':'),
@@ -61,8 +83,6 @@ export class StreamingQueueService implements OnModuleDestroy {
       payload,
       queuedAt: Date.now(),
     };
-    await this.queue.add('publish-canonical-event', job, { jobId: `canonical-${payload.eventId}` });
-    return true;
   }
 
   async enqueueJudgment(result: DecisionResultJob): Promise<boolean> {

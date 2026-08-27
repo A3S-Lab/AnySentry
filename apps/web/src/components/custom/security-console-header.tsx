@@ -2,6 +2,7 @@ import dayjs from "dayjs";
 import { ChevronLeft, ChevronRight, Clock3, LoaderCircle, RefreshCw, ShieldCheck } from "lucide-react";
 import {
   createContext,
+  type CSSProperties,
   type Dispatch,
   type ReactNode,
   type SetStateAction,
@@ -12,6 +13,7 @@ import {
 } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { LanguageSelector } from "@/components/custom/language-selector";
+import { MobileSecurityNavigation } from "@/components/custom/mobile-security-navigation";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -236,12 +238,18 @@ export function SecurityConsoleProvider({ children }: { children: ReactNode }) {
         <header className="shrink-0 border-b border-[#232a37] bg-[#0f131a] text-zinc-100">
           <div className="flex min-h-16 items-center">
             <div
-              className={`relative flex h-16 shrink-0 items-center gap-2 border-r border-[#303948] ${sidebarCollapsed ? "px-2" : "px-4"}`}
-              style={{ width: sidebarCollapsed ? COLLAPSED_SECURITY_SIDEBAR_WIDTH : sidebarWidth }}
+              className={cn(
+                "relative flex h-16 w-auto shrink-0 items-center gap-2 border-r border-[#303948] px-2 lg:w-[var(--security-sidebar-width)]",
+                sidebarCollapsed ? "lg:px-2" : "lg:px-4",
+              )}
+              style={{
+                "--security-sidebar-width": `${sidebarCollapsed ? COLLAPSED_SECURITY_SIDEBAR_WIDTH : sidebarWidth}px`,
+              } as CSSProperties}
             >
-              <ShieldCheck className="size-5 shrink-0 text-teal-300" />
+              <MobileSecurityNavigation />
+              <ShieldCheck className="hidden size-5 shrink-0 text-teal-300 sm:block" />
               {!sidebarCollapsed ? (
-                <h1 className="min-w-0 truncate pr-6 text-sm font-semibold tracking-normal text-zinc-50">
+                <h1 className="hidden min-w-0 truncate pr-6 text-sm font-semibold tracking-normal text-zinc-50 sm:block">
                   {t("Agent态势感知")} <span className="text-zinc-300">AnySentry</span>
                 </h1>
               ) : null}
@@ -251,7 +259,7 @@ export function SecurityConsoleProvider({ children }: { children: ReactNode }) {
                 title={sidebarCollapsed ? t("展开左侧导航") : t("收起左侧导航")}
                 aria-label={sidebarCollapsed ? t("展开左侧导航") : t("收起左侧导航")}
                 className={cn(
-                  "absolute z-40 inline-flex items-center justify-center rounded text-[#788296] transition-colors hover:bg-white/5 hover:text-teal-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-teal-400",
+                  "absolute z-40 hidden items-center justify-center rounded text-[#788296] transition-colors hover:bg-white/5 hover:text-teal-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-teal-400 lg:inline-flex",
                   sidebarCollapsed
                     ? "right-1 top-1/2 size-6 -translate-y-1/2"
                     : "right-1 top-1/2 size-7 -translate-y-1/2",
@@ -266,7 +274,7 @@ export function SecurityConsoleProvider({ children }: { children: ReactNode }) {
                 value={filter.timeType ?? "last_3h"}
                 onValueChange={(value) => handleTimeTypeChange(value as SecurityTimeType)}
               >
-                <SelectTrigger className="h-9 w-[132px] border-white/10 bg-white/5 text-xs text-zinc-100">
+                <SelectTrigger className="h-11 w-[132px] border-white/10 bg-white/5 text-xs text-zinc-100 sm:h-9">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -283,7 +291,7 @@ export function SecurityConsoleProvider({ children }: { children: ReactNode }) {
                     value={customStart}
                     max={dayjs().format("YYYY-MM-DD")}
                     onChange={(event) => setCustomStart(event.target.value)}
-                    className="h-9 w-[145px] border-white/10 bg-white/5 text-xs text-zinc-100"
+                    className="h-11 w-[145px] border-white/10 bg-white/5 text-xs text-zinc-100 sm:h-9"
                   />
                   <span className="text-xs text-zinc-500">{t("至")}</span>
                   <Input
@@ -291,14 +299,14 @@ export function SecurityConsoleProvider({ children }: { children: ReactNode }) {
                     value={customEnd}
                     max={dayjs().format("YYYY-MM-DD")}
                     onChange={(event) => setCustomEnd(event.target.value)}
-                    className="h-9 w-[145px] border-white/10 bg-white/5 text-xs text-zinc-100"
+                    className="h-11 w-[145px] border-white/10 bg-white/5 text-xs text-zinc-100 sm:h-9"
                   />
                   <Button
                     type="button"
                     size="sm"
                     disabled={Boolean(customError)}
                     onClick={applyCustomTime}
-                    className="h-9 bg-teal-500 text-[#07100c] hover:bg-teal-400"
+                    className="h-11 bg-teal-500 text-[#07100c] hover:bg-teal-400 sm:h-9"
                   >
                     {t("应用")}
                   </Button>
@@ -310,7 +318,7 @@ export function SecurityConsoleProvider({ children }: { children: ReactNode }) {
                 variant="secondary"
                 size="sm"
                 onClick={requestRefresh}
-                className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+                className="h-11 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10 sm:h-9"
               >
                 {refreshing ? <LoaderCircle className="mr-1.5 size-3.5 animate-spin" /> : <RefreshCw className="mr-1.5 size-3.5" />}
                 {t("刷新")}

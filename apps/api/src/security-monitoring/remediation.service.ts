@@ -310,7 +310,15 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
         alert.status !== 'resolved' &&
         alert.status !== 'silenced')
       .map((alert) => this.fromAlert(alert));
-    const coverageIssues = this.agg.coverageOverview({ ...filter, limit: 500 }).issues;
+    const coverageIssues = this.agg.coverageOverview({
+      ...filter,
+      issueId: query.issueId,
+      sourceId: query.sourceId,
+      collectorId: query.collectorId,
+      workspacePath: query.workspacePath,
+      agentId: query.agentId,
+      limit: 500,
+    }).issues;
     this.alerting.observeCoverageList(coverageIssues);
     const coverage = coverageIssues
       .filter((issue) =>

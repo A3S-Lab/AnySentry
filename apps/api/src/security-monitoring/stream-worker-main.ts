@@ -3,6 +3,7 @@ import IORedis from 'ioredis';
 import { Kafka, logLevel, Producer, Consumer, SASLOptions } from 'kafkajs';
 import { redisConnection } from './judgment-queue.service';
 import { jsonObjects } from './l3-decision-parser';
+import { RuntimeModelClient } from './runtime-model-config';
 import { StreamFindingStore } from './streaming-finding.service';
 import {
   COMPOSITE_JUDGE_QUEUE,
@@ -30,7 +31,6 @@ const episodeGroupId = process.env.ANYSENTRY_STREAM_EPISODE_CONSUMER_GROUP || 'a
 const legacyCompositeEnabled = /^(?:1|true|on|yes)$/i.test(
   process.env.ANYSENTRY_LEGACY_COMPOSITE_ENABLED || 'off',
 );
-const compositeModel = process.env.ANYSENTRY_COMPOSITE_MODEL || 'glm-5.2';
 const compositeTimeoutMs = Math.max(1_000, Number(process.env.ANYSENTRY_COMPOSITE_TIMEOUT_MS || 60_000));
 const compositeMaxEventAgeMs = Math.max(
   60_000,
@@ -94,6 +94,34 @@ let compositeWorker: Worker<CompositeJudgeJob> | undefined;
 let rateRedis: IORedis | undefined;
 let store: StreamFindingStore | undefined;
 let closing = false;
+const compositeRuntimeModel = new RuntimeModelClient('deep_investigation');
+
+type CompositeModelConnection = {
+  url: string;
+  model: string;
+  apiKey: string;
+};
+
+function compositeModelConnection(): CompositeModelConnection {
+  const runtime = compositeRuntimeModel.get();
+  return {
+    url: runtime?.url
+      || process.env.ANYSENTRY_COMPOSITE_LLM_URL
+      || process.env.A3S_SENTRY_L3_URL
+      || process.env.A3S_SENTRY_LLM_URL
+      || 'http://host.docker.internal:18051/v1',
+    model: runtime?.model
+      || process.env.ANYSENTRY_COMPOSITE_MODEL
+      || process.env.A3S_SENTRY_L3_MODEL
+      || process.env.A3S_SENTRY_LLM_MODEL
+      || 'glm-5.2',
+    apiKey: runtime?.apiKey
+      || process.env.ANYSENTRY_COMPOSITE_LLM_KEY
+      || process.env.A3S_SENTRY_L3_KEY
+      || process.env.A3S_SENTRY_LLM_KEY
+      || 'proxy-managed',
+  };
+}
 
 async function startPublisher(): Promise<void> {
   producer = kafka.producer({ idempotent: true, maxInFlightRequests: 1 });
@@ -138,14 +166,21 @@ async function startConsumer(): Promise<void> {
   await consumer.subscribe({ topic: findingsTopic, fromBeginning: true });
   void consumer.run({
     autoCommit: false,
-    eachMessage: async ({ topic, partition, message }) => {
-      const finding = streamFinding(message.value);
-      await store!.upsert(finding);
+    eachBatchAutoResolve: false,
+    eachBatch: async ({ batch, resolveOffset, heartbeat, isRunning, isStale }) => {
+      if (!isRunning() || isStale() || batch.messages.length === 0) return;
+      const findings = batch.messages.map((message) => streamFinding(message.value));
+      // One Kafka fetch becomes at most one ClickHouse block per finding table. Offsets advance only
+      // after the whole group is durable, so a crash replays the batch instead of losing a suffix.
+      await store!.upsertMany(findings);
+      for (const message of batch.messages) resolveOffset(message.offset);
+      const last = batch.messages[batch.messages.length - 1];
       await consumer!.commitOffsets([{
-        topic,
-        partition,
-        offset: (BigInt(message.offset) + 1n).toString(),
+        topic: batch.topic,
+        partition: batch.partition,
+        offset: (BigInt(last.offset) + 1n).toString(),
       }]);
+      await heartbeat();
     },
   }).catch((error) => {
     if (!closing) {
@@ -276,10 +311,8 @@ async function startEpisodeConsumer(): Promise<void> {
   });
 }
 
-function compositeEndpoint(): string {
-  const base = (process.env.ANYSENTRY_COMPOSITE_LLM_URL
-    || process.env.A3S_SENTRY_L3_URL
-    || 'http://host.docker.internal:18051/v1').replace(/\/+$/, '');
+function compositeEndpoint(connection: CompositeModelConnection): string {
+  const base = connection.url.replace(/\/+$/, '');
   return base.endsWith('/chat/completions') ? base : `${base}/chat/completions`;
 }
 
@@ -348,6 +381,7 @@ export type CompositeModelDecision = {
   attackType: string;
   reason: string;
   evidenceEventIds: string[];
+  model?: string;
 };
 
 export function deterministicSupplyChainDecision(batch: RiskAnalysisBatch): CompositeModelDecision {
@@ -753,17 +787,18 @@ export function deterministicSyntheticDecision(batch: RiskAnalysisBatch): Compos
 
 async function callCompositeModel(batch: RiskAnalysisBatch): Promise<CompositeModelDecision> {
   if (batch.synthetic) return deterministicSyntheticDecision(batch);
+  const connection = compositeModelConnection();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), compositeTimeoutMs);
   try {
-    const response = await fetch(compositeEndpoint(), {
+    const response = await fetch(compositeEndpoint(connection), {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        authorization: `Bearer ${process.env.ANYSENTRY_COMPOSITE_LLM_KEY || process.env.A3S_SENTRY_LLM_KEY || 'proxy-managed'}`,
+        authorization: `Bearer ${connection.apiKey}`,
       },
       body: JSON.stringify({
-        model: compositeModel,
+        model: connection.model,
         messages: [
           {
             role: 'system',
@@ -778,7 +813,10 @@ async function callCompositeModel(batch: RiskAnalysisBatch): Promise<CompositeMo
     const text = await response.text();
     if (!response.ok) throw new Error(`Composite Judge HTTP ${response.status}: ${text.slice(0, 500)}`);
     const payload = JSON.parse(text) as { choices?: Array<{ message?: { content?: unknown } }> };
-    return parseCompositeDecision(payload.choices?.[0]?.message?.content, batch);
+    return {
+      ...parseCompositeDecision(payload.choices?.[0]?.message?.content, batch),
+      model: connection.model,
+    };
   } finally {
     clearTimeout(timer);
   }
@@ -834,7 +872,7 @@ function compositeFinding(
         ? 'synthetic-verifier'
       : batch.decisionPath === 'deterministic_rule'
         ? 'deterministic-rule'
-        : compositeModel,
+        : decision?.model || compositeModelConnection().model,
     latencyMs: Date.now() - startedAt,
     error: failure?.error,
     ruleVersion: batch.ruleVersion,
@@ -845,6 +883,7 @@ function compositeFinding(
 }
 
 async function startCompositeJudge(): Promise<void> {
+  await compositeRuntimeModel.initialize();
   store = new StreamFindingStore();
   if (!(await store.init())) throw new Error('ClickHouse composite judgment store is unavailable');
   compositeWorker = new Worker<CompositeJudgeJob>(
@@ -893,6 +932,7 @@ async function close(): Promise<void> {
     compositeQueue?.close(),
     compositeWorker?.close(),
     store?.close(),
+    compositeRuntimeModel.close(),
   ]);
   rateRedis?.disconnect();
 }

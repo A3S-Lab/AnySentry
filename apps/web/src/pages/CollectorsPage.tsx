@@ -1,5 +1,4 @@
 import { useRequest } from "ahooks";
-import dayjs from "dayjs";
 import { formatSecurityDateTime } from "@/lib/date-time";
 import {
   BellRing,
@@ -277,7 +276,15 @@ function CollectorDetail({ collector, timeType }: { collector?: CollectorHealthI
           </div>
           <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <FieldValue label="Filtered Non-Agent" value={collector.filterMetrics.filteredNonAgent} />
-            <FieldValue label="Shadow Would Filter" value={collector.filterMetrics.wouldFilterNonAgent + collector.filterMetrics.wouldFilterNoise + collector.filterMetrics.wouldDiscoveryBudgetDrop} />
+            <FieldValue label="Filtered Unknown" value={collector.filterMetrics.filteredUnknown} />
+            <FieldValue
+              label="Unknown Reasons"
+              value={Object.entries(collector.filterMetrics.unknownReasonCounts ?? {})
+                .filter(([, count]) => Number(count) > 0)
+                .map(([reason, count]) => `${reason}=${count}`)
+                .join(" · ") || "not reported"}
+            />
+            <FieldValue label="Shadow Would Filter" value={collector.filterMetrics.wouldFilterNonAgent + collector.filterMetrics.wouldFilterUnknown + collector.filterMetrics.wouldFilterNoise + collector.filterMetrics.wouldDiscoveryBudgetDrop} />
             <FieldValue label="Discovery Budget Drop" value={collector.filterMetrics.discoveryBudgetDropped} />
             <FieldValue label="Deduplicated / Queue Drop" value={`${collector.filterMetrics.deduplicated} / ${collector.filterMetrics.queueDropped}`} />
             <FieldValue label="Identity Cache" value={`${collector.filterMetrics.identityCacheEntries} identities · ${collector.filterMetrics.identityCgroupHits}/${collector.filterMetrics.identityCgroupMisses} cgroup hit/miss`} />
@@ -286,6 +293,18 @@ function CollectorDetail({ collector, timeType }: { collector?: CollectorHealthI
             <FieldValue
               label="Process Cache / Tombstone"
               value={`${collector.filterMetrics.processCacheEntries} / ${collector.filterMetrics.processTombstones} · proc ${collector.filterMetrics.processBootstrapProcReads} bootstrap + ${collector.filterMetrics.processFallbackProcReads + collector.filterMetrics.processAncestryProcReads} hot`}
+            />
+            <FieldValue
+              label="File Prefilter"
+              value={collector.fileFilterMetricsReported
+                ? `${collector.fileFilterMetrics.enabled ? `epoch ${collector.fileFilterMetrics.epoch}` : "off"} · access ${collector.fileFilterMetrics.accessKept} keep / ${collector.fileFilterMetrics.accessSampled} sample / ${collector.fileFilterMetrics.accessDropped + collector.fileFilterMetrics.accessSuppressed} suppress`
+                : "not reported"}
+            />
+            <FieldValue
+              label="File Ring / Rule"
+              value={collector.fileFilterMetricsReported
+                ? `ring ${collector.fileFilterMetrics.accessRingDropped}/${collector.fileFilterMetrics.deleteRingDropped} drop · rule ${collector.fileFilterMetrics.ruleHits}/${collector.fileFilterMetrics.ruleMisses} hit/miss`
+                : "not reported"}
             />
           </div>
         </div>

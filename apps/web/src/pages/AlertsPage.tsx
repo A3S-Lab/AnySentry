@@ -688,6 +688,18 @@ export default function AlertsPage() {
     setNote(alert.note ?? "");
     const next = queueSearchParams();
     next.set("alertId", alert.alertId);
+    for (const selector of ["incidentId", "eventId", "taskId", "objectiveId", "issueId", "agentId", "workspacePath", "collectorId", "sourceId"]) {
+      next.delete(selector);
+    }
+    if (alert.incidentId) next.set("incidentId", alert.incidentId);
+    if (alert.eventId) next.set("eventId", alert.eventId);
+    if (alert.labels?.taskId) next.set("taskId", alert.labels.taskId);
+    if (alert.labels?.objectiveId) next.set("objectiveId", alert.labels.objectiveId);
+    if (alert.labels?.issueId) next.set("issueId", alert.labels.issueId);
+    if (alert.agentId) next.set("agentId", alert.agentId);
+    if (alert.workspacePath) next.set("workspacePath", alert.workspacePath);
+    if (alert.collectorId) next.set("collectorId", alert.collectorId);
+    if (alert.sourceId) next.set("sourceId", alert.sourceId);
     setSearchParams(next);
   };
 

@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: anysentry-runtime
+  namespace: anysentry
+data:
+  CLICKHOUSE_URL: "http://clickhouse:8123"
+  CLICKHOUSE_DB: "anysentry"
+  ANYSENTRY_ASYNC_JUDGE: "on"
+  ANYSENTRY_REDIS_URL: "redis://redis:6379/0"
+  ANYSENTRY_STREAMING: "on"
+  ANYSENTRY_STREAM_AGENT_ONLY: "on"
+  ANYSENTRY_STREAM_BOOTSTRAP_SERVERS: "kafka:9092"
+  ANYSENTRY_STREAM_CANONICAL_TOPIC: "anysentry.events.canonical.v1"
+  ANYSENTRY_STREAM_JUDGMENTS_TOPIC: "anysentry.judgments.v1"
+  ANYSENTRY_STREAM_EPISODES_TOPIC: "anysentry.risk-analysis-batches.v1"
+  ANYSENTRY_STREAM_FINDINGS_TOPIC: "anysentry.stream.findings.v1"
+  ANYSENTRY_STREAM_DLQ_TOPIC: "anysentry.stream.dlq.v1"
+  ANYSENTRY_SUPPLY_CHAIN_CONTEXT_TOPIC: "anysentry.supply-chain.context.v1"
+  ANYSENTRY_FLINK_REST_URL: "http://flink-jobmanager:8081"
+  ANYSENTRY_FLINK_JOB_NAME: "AnySentry Flink Shadow Risk"
+  ANYSENTRY_SUPPLY_CHAIN: "on"
+  ANYSENTRY_SUPPLY_CHAIN_RUNTIME: "on"
+  ANYSENTRY_ASSISTANT: "on"
+  ANYSENTRY_TRUSTED_CORRELATION_MODE: "enabled"
+  ANYSENTRY_CAPTURE_PROFILE_MODE: "enforce"
+  ANYSENTRY_UNKNOWN_RETENTION_MODE: "enforce"
+  ANYSENTRY_UNKNOWN_LEARNING_ENABLED: "true"
+  ANYSENTRY_UNKNOWN_LEARNING_PERSIST_INTERVAL_MS: "30000"

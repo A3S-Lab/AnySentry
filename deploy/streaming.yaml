@@ -27,6 +27,10 @@ metadata:
   labels: { app: kafka }
 spec:
   clusterIP: None
+  # A single-node KRaft broker resolves its advertised controller address through this Service
+  # before the broker can become Ready. Publishing the StatefulSet endpoint during bootstrap avoids
+  # a readiness/DNS cycle where kafka:9093 cannot resolve until Kafka has already started.
+  publishNotReadyAddresses: true
   selector: { app: kafka }
   ports:
     - { name: broker, port: 9092, targetPort: 9092 }
@@ -37,7 +41,7 @@ kind: StatefulSet
 metadata:
   name: kafka
   namespace: anysentry
-  labels: { app: kafka, io.anysentry.observe: "false" }
+  labels: { app: kafka, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   serviceName: kafka
   replicas: 1
@@ -45,7 +49,7 @@ spec:
     matchLabels: { app: kafka }
   template:
     metadata:
-      labels: { app: kafka, io.anysentry.observe: "false" }
+      labels: { app: kafka, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       securityContext:
         fsGroup: 1000
@@ -101,14 +105,14 @@ kind: Deployment
 metadata:
   name: kafka-topic-manager
   namespace: anysentry
-  labels: { app: kafka-topic-manager, io.anysentry.observe: "false" }
+  labels: { app: kafka-topic-manager, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
   selector:
     matchLabels: { app: kafka-topic-manager }
   template:
     metadata:
-      labels: { app: kafka-topic-manager, io.anysentry.observe: "false" }
+      labels: { app: kafka-topic-manager, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       containers:
         - name: topic-manager
@@ -163,6 +167,7 @@ spec:
   selector: { app: flink-jobmanager }
   ports:
     - { name: rpc, port: 6123, targetPort: 6123 }
+    - { name: blob, port: 6124, targetPort: 6124 }
     - { name: rest, port: 8081, targetPort: 8081 }
 ---
 apiVersion: apps/v1
@@ -170,7 +175,7 @@ kind: Deployment
 metadata:
   name: flink-jobmanager
   namespace: anysentry
-  labels: { app: flink-jobmanager, io.anysentry.observe: "false" }
+  labels: { app: flink-jobmanager, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
   strategy:
@@ -179,7 +184,7 @@ spec:
     matchLabels: { app: flink-jobmanager }
   template:
     metadata:
-      labels: { app: flink-jobmanager, io.anysentry.observe: "false" }
+      labels: { app: flink-jobmanager, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       initContainers:
         - name: checkpoint-permissions
@@ -194,6 +199,7 @@ spec:
           args: ["jobmanager"]
           ports:
             - { name: rpc, containerPort: 6123 }
+            - { name: blob, containerPort: 6124 }
             - { name: rest, containerPort: 8081 }
           env:
             - { name: JOB_MANAGER_RPC_ADDRESS, value: "flink-jobmanager" }
@@ -231,14 +237,14 @@ kind: Deployment
 metadata:
   name: flink-taskmanager
   namespace: anysentry
-  labels: { app: flink-taskmanager, io.anysentry.observe: "false" }
+  labels: { app: flink-taskmanager, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
   selector:
     matchLabels: { app: flink-taskmanager }
   template:
     metadata:
-      labels: { app: flink-taskmanager, io.anysentry.observe: "false" }
+      labels: { app: flink-taskmanager, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       initContainers:
         - name: checkpoint-permissions
@@ -274,14 +280,16 @@ kind: Deployment
 metadata:
   name: flink-job-submit
   namespace: anysentry
-  labels: { app: flink-job-submit, io.anysentry.observe: "false" }
+  labels: { app: flink-job-submit, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels: { app: flink-job-submit }
   template:
     metadata:
-      labels: { app: flink-job-submit, io.anysentry.observe: "false" }
+      labels: { app: flink-job-submit, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       containers:
         - name: job-submit
@@ -292,7 +300,7 @@ spec:
               until flink list -m flink-jobmanager:8081 >/dev/null 2>&1; do sleep 2; done
               while true; do
                 if flink list -m flink-jobmanager:8081 2>/dev/null \
-                  | grep -Fq "AnySentry Flink Shadow Risk (RUNNING)"; then
+                  | grep -Eq ' : AnySentry Flink Shadow Risk \([[:upper:]_]+\)$'; then
                   sleep 15
                   continue
                 fi
@@ -324,14 +332,14 @@ kind: Deployment
 metadata:
   name: stream-worker
   namespace: anysentry
-  labels: { app: stream-worker, io.anysentry.observe: "false" }
+  labels: { app: stream-worker, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
   selector:
     matchLabels: { app: stream-worker }
   template:
     metadata:
-      labels: { app: stream-worker, io.anysentry.observe: "false" }
+      labels: { app: stream-worker, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       containers:
         - name: stream-worker
@@ -360,14 +368,14 @@ kind: Deployment
 metadata:
   name: composite-judge
   namespace: anysentry
-  labels: { app: composite-judge, io.anysentry.observe: "false" }
+  labels: { app: composite-judge, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
   selector:
     matchLabels: { app: composite-judge }
   template:
     metadata:
-      labels: { app: composite-judge, io.anysentry.observe: "false" }
+      labels: { app: composite-judge, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       containers:
         - name: composite-judge
@@ -381,7 +389,6 @@ spec:
                 optional: true
           env:
             - { name: ANYSENTRY_STREAM_WORKER_ROLE, value: "judge" }
-            - { name: ANYSENTRY_COMPOSITE_MODEL, value: "glm-5.2" }
             - { name: ANYSENTRY_COMPOSITE_TIMEOUT_MS, value: "60000" }
             - { name: ANYSENTRY_COMPOSITE_CONCURRENCY, value: "2" }
             - { name: ANYSENTRY_COMPOSITE_MAX_EVENT_AGE_MS, value: "900000" }
@@ -398,14 +405,14 @@ kind: Deployment
 metadata:
   name: supply-chain-assessment
   namespace: anysentry
-  labels: { app: supply-chain-assessment, io.anysentry.observe: "false" }
+  labels: { app: supply-chain-assessment, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   replicas: 1
   selector:
     matchLabels: { app: supply-chain-assessment }
   template:
     metadata:
-      labels: { app: supply-chain-assessment, io.anysentry.observe: "false" }
+      labels: { app: supply-chain-assessment, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
       containers:
         - name: supply-chain-assessment

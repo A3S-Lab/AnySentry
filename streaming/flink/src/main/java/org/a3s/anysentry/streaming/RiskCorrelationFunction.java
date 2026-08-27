@@ -23,9 +23,9 @@ import java.util.Objects;
 public class RiskCorrelationFunction extends KeyedProcessFunction<String, CanonicalEvent, StreamFinding> {
     private static final long MINUTE = 60_000L;
     private static final long FIVE_MINUTES = 5 * MINUTE;
-    private static final long HOUR = 60 * MINUTE;
     private static final long COMPOSITE_WINDOW = 3 * MINUTE;
     private static final String PROFILE_RULE_VERSION = "risk-profile-v2";
+    private static final int MAX_HISTORY_EVENTS = 10_000;
 
     private transient MapState<String, Long> seenEvents;
     private transient MapState<String, Long> emittedCorrelations;
@@ -67,6 +67,9 @@ public class RiskCorrelationFunction extends KeyedProcessFunction<String, Canoni
         List<CanonicalEvent> events = retainedEvents(maximum);
         events.add(event);
         events.sort(Comparator.comparingLong(candidate -> candidate.eventTime));
+        if (events.size() > MAX_HISTORY_EVENTS) {
+            events = new ArrayList<>(events.subList(events.size() - MAX_HISTORY_EVENTS, events.size()));
+        }
         history.update(events);
 
         output.collect(profile(event, events, maximum));
@@ -74,7 +77,9 @@ public class RiskCorrelationFunction extends KeyedProcessFunction<String, Canoni
 
     private List<CanonicalEvent> retainedEvents(long maximum) throws Exception {
         List<CanonicalEvent> retained = new ArrayList<>();
-        long cutoff = maximum - HOUR;
+        // Every current profile feature has a maximum five-minute lookback. Retaining a full hour
+        // multiplied ordinary high-rate telemetry into heap state without changing the result.
+        long cutoff = maximum - FIVE_MINUTES;
         for (CanonicalEvent candidate : history.get()) {
             if (candidate.eventTime >= cutoff) retained.add(candidate);
         }
@@ -255,6 +260,15 @@ public class RiskCorrelationFunction extends KeyedProcessFunction<String, Canoni
 
     private static boolean transform(String operation) {
         return "encode".equals(operation) || "compress".equals(operation) || "copy".equals(operation);
+    }
+
+    static boolean relevant(CanonicalEvent event) {
+        if (event.platformRuntime || event.synthetic) return false;
+        if ("ToolExec".equals(event.eventKind) || event.dangerous || event.failed || event.sensitiveResource) {
+            return true;
+        }
+        return transform(event.operation)
+                || ("egress".equals(event.operation) && event.externalDestination);
     }
 
     private static String riskLevel(int score) {
