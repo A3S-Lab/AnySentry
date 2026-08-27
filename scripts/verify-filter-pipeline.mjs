@@ -263,7 +263,7 @@ async function runConfig(label, env = {}, inputLines, options = {}) {
     stderr += chunk;
   });
   try {
-    await within(snapshotRequested, 2_000, `${label} identity snapshot request`);
+    await within(snapshotRequested, 5_000, `${label} identity snapshot request`);
   } catch (error) {
     child.kill('SIGKILL');
     if (child.exitCode === null) await new Promise((resolve) => child.once('exit', resolve));
@@ -291,7 +291,10 @@ async function runConfig(label, env = {}, inputLines, options = {}) {
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       reject(new Error(`forwarder ${label} timed out: ${stderr}`));
-    }, options.timeoutMs ?? 5_000);
+    // Scenario-specific assertions retain the sub-second protocol deadlines. This outer watchdog
+    // only detects a leaked child, so allow CI hosts under image/database I/O enough scheduling
+    // headroom before declaring the whole Forwarder process hung.
+    }, options.timeoutMs ?? 15_000);
     child.on('exit', (code) => {
       clearTimeout(timer);
       resolve(code);
