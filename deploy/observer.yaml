@@ -60,6 +60,10 @@ spec:
             privileged: true # eBPF load + tracepoint attach. OBSERVE path only — cannot block.
           env:
             - { name: A3S_OBSERVER_JSON, value: "1" }
+            # F0 reduces steady-state bulk traffic before Ring reservation; this bounded lane
+            # absorbs startup/profile convergence and short host-disk stalls without borrowing
+            # Critical or Semantic capacity. The Collector hard-caps the value at 262144.
+            - { name: A3S_OBSERVER_JSON_BULK_QUEUE_CAPACITY, value: "65536" }
             # Full signal set: file writes/deletes (FileAccess/FileDelete) + OpenSSL plaintext
             # (SslContent → prompt-injection / secret-exfil rules + LlmApi model/token usage).
             # Set to "0" to reduce footprint on a busy node.
