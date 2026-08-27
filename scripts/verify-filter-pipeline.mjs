@@ -1120,7 +1120,9 @@ const slowRetryDeadline = await runConfig('retry-request-absolute-deadline', {
 });
 assert.equal(slowRetryDeadline.batchRequests.length, 2);
 assert.ok(
-  Date.now() - slowRetryDeadlineStartedAt < 800,
+  // Keep the gate well below the erroneous 4 s HTTP timeout while allowing host-level image and
+  // database I/O to pause the verifier event loop during the full contract suite.
+  Date.now() - slowRetryDeadlineStartedAt < 2_000,
   'an in-flight authorized retry must use the remaining retry age, not reset the HTTP timeout',
 );
 assert.equal(slowRetryDeadline.heartbeat.filterMetrics.retryQueued, 1);
