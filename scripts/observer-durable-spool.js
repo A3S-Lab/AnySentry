@@ -3,6 +3,7 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+const { StringDecoder } = require('node:string_decoder');
 
 function boundedNumber(value, fallback, min, max) {
   const parsed = Number(value);
@@ -30,6 +31,7 @@ class DurableSpool {
     this.fsyncMs = boundedNumber(options.fsyncMs, 250, 10, 60_000);
     this.compactMinBytes = boundedNumber(options.compactMinBytes, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024 * 1024);
     this.compactMaxLiveRecords = boundedNumber(options.compactMaxLiveRecords, 16_384, 1, 250_000);
+    this.loadChunkBytes = boundedNumber(options.loadChunkBytes, 1024 * 1024, 64, 4 * 1024 * 1024);
     this.filePath = path.resolve(options.filePath);
     this.dlqPath = path.resolve(options.dlqPath || `${this.filePath}.dlq`);
     this.records = new Map();
@@ -52,47 +54,76 @@ class DurableSpool {
     }
   }
 
+  applyLoadedOperation(operation) {
+    if (operation.op === 'put' && operation.record?.id && operation.record?.body) {
+      const previous = this.records.get(operation.record.id);
+      if (previous) {
+        this.logicalBytes -= previous.bytes;
+        this.prioritySets[previous.priority].delete(previous.id);
+      }
+      const record = {
+        id: String(operation.record.id),
+        body: operation.record.body,
+        priority: boundedNumber(operation.record.priority, 0, 0, 5),
+        queuedAt: boundedNumber(operation.record.queuedAt, Date.now(), 0, Number.MAX_SAFE_INTEGER),
+        bytes: Buffer.byteLength(JSON.stringify(operation.record.body)),
+      };
+      this.records.set(record.id, record);
+      this.prioritySets[record.priority].add(record.id);
+      this.logicalBytes += record.bytes;
+    } else if (operation.op === 'ack' && Array.isArray(operation.ids)) {
+      for (const id of operation.ids) {
+        const previous = this.records.get(id);
+        if (!previous) continue;
+        this.logicalBytes -= previous.bytes;
+        this.records.delete(id);
+        this.prioritySets[previous.priority].delete(id);
+      }
+    }
+  }
+
   load() {
     if (!fs.existsSync(this.filePath)) return;
-    const contents = fs.readFileSync(this.filePath, 'utf8');
-    const lines = contents.split('\n');
-    for (let index = 0; index < lines.length; index += 1) {
-      const line = lines[index];
-      if (!line) continue;
-      let operation;
+    const fd = fs.openSync(this.filePath, 'r');
+    const buffer = Buffer.allocUnsafe(this.loadChunkBytes);
+    const decoder = new StringDecoder('utf8');
+    let pending = '';
+    let lineNumber = 0;
+    const applyLine = (line) => {
+      lineNumber += 1;
+      if (!line) return;
       try {
-        operation = JSON.parse(line);
+        this.applyLoadedOperation(JSON.parse(line));
       } catch (error) {
-        // A process or host crash can leave only the final append torn. Earlier corruption is not
-        // safe to ignore because doing so could silently discard durable evidence.
-        if (index === lines.length - 1) break;
-        throw new Error(`Observer spool is corrupt at line ${index + 1}: ${error.message}`);
+        throw new Error(`Observer spool is corrupt at line ${lineNumber}: ${error.message}`);
       }
-      if (operation.op === 'put' && operation.record?.id && operation.record?.body) {
-        const previous = this.records.get(operation.record.id);
-        if (previous) {
-          this.logicalBytes -= previous.bytes;
-          this.prioritySets[previous.priority].delete(previous.id);
+    };
+    try {
+      while (true) {
+        const bytes = fs.readSync(fd, buffer, 0, buffer.length, null);
+        if (bytes === 0) break;
+        pending += decoder.write(buffer.subarray(0, bytes));
+        let start = 0;
+        while (true) {
+          const newline = pending.indexOf('\n', start);
+          if (newline < 0) break;
+          applyLine(pending.slice(start, newline));
+          start = newline + 1;
         }
-        const record = {
-          id: String(operation.record.id),
-          body: operation.record.body,
-          priority: boundedNumber(operation.record.priority, 0, 0, 5),
-          queuedAt: boundedNumber(operation.record.queuedAt, Date.now(), 0, Number.MAX_SAFE_INTEGER),
-          bytes: Buffer.byteLength(JSON.stringify(operation.record.body)),
-        };
-        this.records.set(record.id, record);
-        this.prioritySets[record.priority].add(record.id);
-        this.logicalBytes += record.bytes;
-      } else if (operation.op === 'ack' && Array.isArray(operation.ids)) {
-        for (const id of operation.ids) {
-          const previous = this.records.get(id);
-          if (!previous) continue;
-          this.logicalBytes -= previous.bytes;
-          this.records.delete(id);
-          this.prioritySets[previous.priority].delete(id);
+        pending = pending.slice(start);
+      }
+      pending += decoder.end();
+      if (pending) {
+        // A process or host crash can leave only the final, non-newline-terminated append torn.
+        // A complete final operation is still applied; malformed trailing bytes are ignored.
+        try {
+          this.applyLoadedOperation(JSON.parse(pending));
+        } catch {
+          // Safe replay boundary: every preceding newline-terminated operation was validated.
         }
       }
+    } finally {
+      fs.closeSync(fd);
     }
   }
 

@@ -132,6 +132,35 @@ try {
   assert.equal(compacted.compactions, 1);
   assert.ok(compacted.walBytes < deferred.walBytes, 'small live set should compact the deferred WAL');
   compactSpool.close();
+
+  const streamingPath = path.join(temporary, 'streaming-load.wal');
+  const unicodeLine = `prefix-${'界'.repeat(80)}-suffix`;
+  writeFileSync(streamingPath, [
+    JSON.stringify({ op: 'put', record: {
+      id: 'stream-unicode',
+      body: { sourceEventId: 'stream-unicode', line: unicodeLine },
+      priority: 2,
+      queuedAt: 10,
+    } }),
+    JSON.stringify({ op: 'put', record: {
+      id: 'stream-acked',
+      body: { sourceEventId: 'stream-acked', line: '{}' },
+      priority: 1,
+      queuedAt: 11,
+    } }),
+    JSON.stringify({ op: 'ack', ids: ['stream-acked'] }),
+    '{"op":"put","record":',
+  ].join('\n'), { mode: 0o600 });
+  const streamingSpool = new DurableSpool({
+    writerId: 'streaming-load-test',
+    filePath: streamingPath,
+    loadChunkBytes: 64,
+    fsyncMode: 'periodic',
+    fsyncMs: 60_000,
+  });
+  assert.equal(streamingSpool.status().records, 1);
+  assert.equal(streamingSpool.available(new Set(), 1)[0].body.line, unicodeLine);
+  streamingSpool.close();
   console.log('Observer spool replay rescue verification passed');
 } finally {
   await new Promise((resolve) => server.close(resolve));
