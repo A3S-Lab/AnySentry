@@ -135,7 +135,7 @@ spec:
             - { name: FORWARD_MAX_INFLIGHT, value: "4" }
             # A deadline is still strict, but an already-arrived response gets one I/O turn before
             # an overdue timer aborts it after a synchronous data-plane burst.
-            - { name: FORWARD_CONTROL_HTTP_TIMEOUT_MS, value: "5000" }
+            - { name: FORWARD_CONTROL_HTTP_TIMEOUT_MS, value: "15000" }
             # Events are removed only after an item-level durable ack. The hostPath survives
             # container/Pod restarts; when full, stdin is paused instead of dropping evidence.
             - { name: FORWARD_SPOOL_PATH, value: "/var/lib/anysentry-forwarder/spool.wal" }

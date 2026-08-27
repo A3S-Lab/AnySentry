@@ -212,7 +212,7 @@ const SPOOL_DEGRADED_AGE_MS = boundedNumber(
 const HTTP_TIMEOUT_MS = boundedNumber(process.env.FORWARD_HTTP_TIMEOUT_MS, 10_000, 1_000, 120_000);
 const CONTROL_HTTP_TIMEOUT_MS = boundedNumber(
   process.env.FORWARD_CONTROL_HTTP_TIMEOUT_MS,
-  5_000,
+  15_000,
   100,
   120_000,
 );
@@ -1491,8 +1491,12 @@ function getJson(url, timeoutMs, done, extraHeaders = {}, requestAgent, maxRespo
   return state;
 }
 
+let identitySnapshotRefreshInFlight = false;
 function refreshIdentitySnapshot() {
+  if (identitySnapshotRefreshInFlight) return;
+  identitySnapshotRefreshInFlight = true;
   getJson(identitySnapshotTarget, CONTROL_HTTP_TIMEOUT_MS, (error, snapshot) => {
+    identitySnapshotRefreshInFlight = false;
     if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) return;
     if (error || !workloadCache.replace(snapshot)) {
       if (error) workloadCache.errors++;
@@ -1533,12 +1537,16 @@ function synchronizeInfrastructurePolicyRules() {
 
 let lastInfrastructurePolicyError = '';
 let lastLoggedInfrastructurePolicyVersion = -1;
+let infrastructurePolicyRefreshInFlight = false;
 function refreshInfrastructurePolicy() {
   if (!INFRASTRUCTURE_POLICY_SECS) return;
+  if (infrastructurePolicyRefreshInFlight) return;
+  infrastructurePolicyRefreshInFlight = true;
   getJson(
     infrastructurePolicyTarget,
     CONTROL_HTTP_TIMEOUT_MS,
     (error, policy) => {
+      infrastructurePolicyRefreshInFlight = false;
       if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) return;
       if (error) {
         markControlPlaneFailure('infrastructure_policy', error.message);
@@ -1583,15 +1591,22 @@ function refreshInfrastructurePolicy() {
 
 let lastUnifiedFilterProjectionError = '';
 let lastUnifiedFilterProjectionVersion = -1;
+let unifiedFilterProjectionRefreshInFlight = false;
 function refreshUnifiedFilterProjection(done = () => {}) {
   if (!UNIFIED_FILTER_PROJECTION_SECS) {
     done();
     return;
   }
+  if (unifiedFilterProjectionRefreshInFlight) {
+    done();
+    return;
+  }
+  unifiedFilterProjectionRefreshInFlight = true;
   getJson(
     unifiedFilterProjectionTarget,
     CONTROL_HTTP_TIMEOUT_MS,
     (error, projection) => {
+      unifiedFilterProjectionRefreshInFlight = false;
       if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) {
         done();
         return;

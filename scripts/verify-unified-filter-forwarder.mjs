@@ -40,6 +40,9 @@ const batches = [];
 const heartbeats = [];
 let pauseNextProjection = false;
 let pausedProjectionResumed = false;
+let holdNextProjection = false;
+let projectionRequestsInFlight = 0;
+let maxProjectionRequestsInFlight = 0;
 let child;
 const temporary = mkdtempSync(path.join(os.tmpdir(), 'anysentry-unified-forwarder-'));
 const internalContainerId = 'a'.repeat(64);
@@ -50,17 +53,28 @@ const server = http.createServer(async (request, response) => {
   const body = raw ? JSON.parse(raw) : undefined;
   if (request.url === '/security-center/filter-rules/projections/forwarder') {
     projectionHeaders.push(request.headers);
+    projectionRequestsInFlight += 1;
+    maxProjectionRequestsInFlight = Math.max(maxProjectionRequestsInFlight, projectionRequestsInFlight);
+    const finishProjection = () => {
+      json(response, 200, projection);
+      projectionRequestsInFlight -= 1;
+    };
     if (pauseNextProjection && child?.pid) {
       pauseNextProjection = false;
       process.kill(child.pid, 'SIGSTOP');
-      json(response, 200, projection);
+      finishProjection();
       setTimeout(() => {
         if (child?.exitCode === null) process.kill(child.pid, 'SIGCONT');
         pausedProjectionResumed = true;
-      }, 250);
+      }, 750);
       return;
     }
-    json(response, 200, projection);
+    if (holdNextProjection) {
+      holdNextProjection = false;
+      setTimeout(finishProjection, 250);
+      return;
+    }
+    finishProjection();
     return;
   }
   if (request.url?.startsWith('/security-center/identity/snapshot')) {
@@ -154,7 +168,7 @@ child = spawn(process.execPath, ['scripts/observer-forward.js'], {
     ANYSENTRY_AGENT_RUNTIME_LEASE_URL: `${base}/runtime/lease`,
     ANYSENTRY_FILTER_RULE_PROJECTION_URL: `${base}/filter-rules/projections/forwarder`,
     ANYSENTRY_FILTER_RULE_PROJECTION_SECS: '0.05',
-    FORWARD_CONTROL_HTTP_TIMEOUT_MS: '100',
+    FORWARD_CONTROL_HTTP_TIMEOUT_MS: '500',
     ANYSENTRY_UNKNOWN_RETENTION_MODE: 'enforce',
     ANYSENTRY_INFRASTRUCTURE_POLICY_TOKEN: 'unified-control-token',
     ANYSENTRY_INFRASTRUCTURE_POLICY_SECS: '0',
@@ -372,6 +386,19 @@ try {
   assert.equal(postPauseHeartbeat.errorCount, 0);
   assert.equal(postPauseHeartbeat.filterMetrics.unifiedProjectionLoadErrors, 0);
   assert.equal(postPauseHeartbeat.filterMetrics.controlPlaneLanes.filter_rules.lastFailureAt, undefined);
+
+  await eventually('no active projection request before the single-flight check', () =>
+    projectionRequestsInFlight === 0);
+  maxProjectionRequestsInFlight = 0;
+  const projectionCountBeforeHold = projectionHeaders.length;
+  holdNextProjection = true;
+  await eventually('held projection response completes', () =>
+    projectionHeaders.length > projectionCountBeforeHold && projectionRequestsInFlight === 0);
+  assert.equal(
+    maxProjectionRequestsInFlight,
+    1,
+    'a refresh interval shorter than response latency must not overlap control requests',
+  );
 
   child.stdin.end();
   const exit = await Promise.race([

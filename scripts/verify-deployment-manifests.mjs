@@ -647,7 +647,7 @@ function verifyObserverManifest() {
       /\{\s*name:\s*FORWARD_IDENTITY_SNAPSHOT_MAX_BYTES,\s*value:\s*"4194304"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_BATCH_SIZE,\s*value:\s*"32"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_MAX_INFLIGHT,\s*value:\s*"4"\s*\}/u.test(daemonSet?.source ?? '') &&
-      /\{\s*name:\s*FORWARD_CONTROL_HTTP_TIMEOUT_MS,\s*value:\s*"5000"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_CONTROL_HTTP_TIMEOUT_MS,\s*value:\s*"15000"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_BATCH_MAX_BYTES,\s*value:\s*"524288"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_MAX_EVENT_BYTES,\s*value:\s*"3145728"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_MAX_OUTSTANDING_EVENTS,\s*value:\s*"16384"\s*\}/u.test(daemonSet?.source ?? '') &&
