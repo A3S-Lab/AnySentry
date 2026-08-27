@@ -126,12 +126,13 @@ async function within(promise, message, milliseconds = 1_000) {
   }
 }
 
-function fakeClickHouse({ behaviors = [], onInsert } = {}) {
+function fakeClickHouse({ behaviors = [], onInsert, onQuery } = {}) {
   const state = {
     calls: [],
     active: 0,
     maxActive: 0,
     closeCalls: 0,
+    queries: [],
     appliedByToken: new Map(),
   };
   const pendingBehaviors = [...behaviors];
@@ -161,6 +162,11 @@ function fakeClickHouse({ behaviors = [], onInsert } = {}) {
       async close() {
         assert.equal(state.active, 0, 'client.close must not overlap an active insert');
         state.closeCalls += 1;
+      },
+      async query(options) {
+        state.queries.push(structuredClone(options));
+        const rows = onQuery ? await onQuery(options, state) : [];
+        return { json: async () => structuredClone(rows) };
       },
     },
   };
@@ -1043,6 +1049,45 @@ await withoutExpectedErrorLogs(async () => {
   const row = fake.state.calls[0].values[0];
   assert.equal(row.subject, 'valid 🛡 malformed-high � malformed-low �');
   assert.equal(row.rawPreview, 'before�after');
+  await store.close();
+});
+
+await withoutExpectedErrorLogs(async () => {
+  const digestA = 'a'.repeat(64);
+  const digestB = 'b'.repeat(64);
+  const fake = fakeClickHouse({
+    onQuery(options) {
+      const keys = options.query_params.logicalKeys;
+      assert.match(options.query, /FROM event_revision_identities/u);
+      assert.doesNotMatch(options.query, /FROM events\b/u);
+      assert.equal(options.clickhouse_settings.max_threads, 1);
+      assert.equal(options.clickhouse_settings.max_memory_usage, String(32 * 1024 * 1024));
+      assert.equal(options.clickhouse_settings.max_execution_time, 5);
+      return [
+        { eventLogicalKey: keys[0], acceptedFingerprint: `observer-source:${digestA}` },
+        { eventLogicalKey: keys[1], acceptedFingerprint: `observer-source:${digestB}` },
+        { eventLogicalKey: keys[2], acceptedFingerprint: 'legacy-pre-source-payload-fingerprint' },
+      ];
+    },
+  });
+  const store = storeFor(fake);
+  const replay = (index, digest) => event(index, {
+    attributes: {
+      sequence: index,
+      'anysentry.observer.source_payload_sha256': digest,
+    },
+  });
+  assert.deepEqual(
+    await store.classifyDurableReplayEvents([
+      replay(2_460, digestA),
+      replay(2_461, digestA),
+      replay(2_462, digestA),
+      replay(2_463, digestA),
+    ]),
+    ['duplicate', 'conflict', 'duplicate', 'new'],
+    'durable replay must use compact identity facts, reject new-fingerprint conflicts, and migrate legacy facts',
+  );
+  assert.equal(fake.state.queries.length, 1);
   await store.close();
 });
 

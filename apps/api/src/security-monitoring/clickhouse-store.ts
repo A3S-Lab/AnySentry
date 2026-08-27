@@ -1403,7 +1403,7 @@ export function eventRevisionIdentity(e: JudgedEvent): {
   return {
     logicalKey,
     fingerprint: SHA256_HEX.test(sourcePayloadDigest)
-      ? sourcePayloadDigest
+      ? `observer-source:${sourcePayloadDigest}`
       : createHash('sha256').update(canonicalJson(canonicalPayload)).digest('hex'),
   };
 }
@@ -2192,6 +2192,11 @@ export class ClickHouseStore {
         WHERE eventLogicalKey IN {logicalKeys:Array(String)}
         GROUP BY eventLogicalKey`,
       query_params: { logicalKeys: [...new Set(logicalKeys)] },
+      clickhouse_settings: {
+        max_threads: 1,
+        max_memory_usage: String(32 * 1024 * 1024),
+        max_execution_time: 5,
+      },
       format: 'JSONEachRow',
     });
     const rows = await result.json() as Array<{
@@ -2422,25 +2427,20 @@ export class ClickHouseStore {
     events: readonly JudgedEvent[],
   ): Promise<DurableReplayEventStatus[] | null> {
     if (!this.client || !this.ready || this.closing || this.eventWritePermanentError) return null;
-    const existingEvents = await this.eventsByIds(events.map((event) => event.eventId));
-    const existingById = new Map(existingEvents.map((event) => [event.eventId, event]));
-    return events.map((event) => {
-      const existing = existingById.get(event.eventId);
-      if (!existing) return 'new';
-      if (
-        Math.max(1, Math.trunc(existing.decisionRevision ?? 1))
-        !== Math.max(1, Math.trunc(event.decisionRevision ?? 1))
-      ) return 'conflict';
-      const incomingRow = toRow(event);
-      const existingRow = toRow(existing);
-      const incomingSourceDigest = this.eventRevisionSourcePayloadDigest(incomingRow);
-      const existingSourceDigest = this.eventRevisionSourcePayloadDigest(existingRow);
-      if (incomingSourceDigest && existingSourceDigest) {
-        return incomingSourceDigest === existingSourceDigest ? 'duplicate' : 'conflict';
+    const incomingRows = events.map(toRow);
+    const existing = await this.existingRevisionFingerprints(
+      incomingRows.map((row) => row.eventLogicalKey),
+    );
+    return incomingRows.map((row) => {
+      const existingFingerprint = existing.get(row.eventLogicalKey);
+      if (!existingFingerprint) return 'new';
+      // New writers bind the exact authenticated Forwarder body into a namespaced fingerprint.
+      // Old rows predate that field; their durable logical key plus the hot-cache comparison in
+      // SentryJudge is the bounded migration proof. Never run a wide events-table scan in ingest.
+      if (existingFingerprint.startsWith('observer-source:')) {
+        return existingFingerprint === row.payloadFingerprint ? 'duplicate' : 'conflict';
       }
-      return this.eventRevisionDigest(incomingRow, false) === this.eventRevisionDigest(existingRow, false)
-        ? 'duplicate'
-        : 'conflict';
+      return 'duplicate';
     });
   }
 
