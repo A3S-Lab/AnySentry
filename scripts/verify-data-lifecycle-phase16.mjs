@@ -73,7 +73,7 @@ const [clickhouse, helper, judge, controller, frontendApi, packageJson] = await 
 assert.match(clickhouse, /CREATE TABLE IF NOT EXISTS \$\{DASHBOARD_BUCKET_SNAPSHOT_TABLE\}/);
 assert.match(clickhouse, /ENGINE = MergeTree/);
 assert.match(clickhouse, /factsJson String/);
-assert.match(clickhouse, /tuple\(snapshotCommittedAt, snapshotEventId, snapshotDecisionRevision, snapshotVersion\)/);
+assert.match(clickhouse, /tuple\(snapshotCommittedAt, snapshotCommitBatchId, snapshotEventId, snapshotDecisionRevision, snapshotVersion\)/);
 assert.match(clickhouse, /validPersistedDashboardBuckets/);
 assert.match(clickhouse, /DASHBOARD_BUCKET_BUILD_CHUNK_MS = 60_000/);
 assert.match(clickhouse, /DASHBOARD_BUCKET_BUILD_MAX_CHUNKS = 1/);
@@ -86,7 +86,10 @@ assert.match(clickhouse, /persisted dashboard bucket cache unavailable; returnin
 assert.match(clickhouse, /BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS/);
 assert.match(clickhouse, /max_memory_usage: String\(128 \* 1024 \* 1024\)/);
 assert.match(clickhouse, /max_execution_time: 5/);
-assert.match(clickhouse, /writePersistedDashboardBuckets\([\s\S]*?before,[\s\S]*?grouped/u);
+assert.match(
+  clickhouse,
+  /writePersistedDashboardBuckets\([\s\S]*?stableCursors,[\s\S]*?grouped/u,
+);
 assert.match(clickhouse, /dashboard bucket snapshot write failed/);
 assert.match(clickhouse, /schemaVersion: 'anysentry\.dashboard-bucket-snapshots\.v1'/);
 assert.match(helper, /Snapshots older than the retained commit journal are rejected/);

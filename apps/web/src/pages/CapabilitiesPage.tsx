@@ -1,7 +1,6 @@
 import { formatSecurityDateTime } from "@/lib/date-time";
 import {
   AlertTriangle,
-  ArrowLeft,
   Braces,
   CheckCircle2,
   Copy,
@@ -15,7 +14,7 @@ import {
   Terminal,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -28,6 +27,7 @@ import {
   type SecurityCapabilityResponse,
   securityCenterApi,
 } from "@/lib/api/security-center";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 type JsonObject = Record<string, unknown>;
@@ -367,6 +367,7 @@ function OperationRow({
 }
 
 export default function CapabilitiesPage() {
+  const { t } = useI18n();
   const [searchParams, setSearchParams] = useSearchParams();
   const routeQuery = searchParams.get("query") ?? searchParams.get("q") ?? "runtime guard";
   const routeModule = searchParams.get("module") ?? "security-center";
@@ -544,18 +545,12 @@ export default function CapabilitiesPage() {
       <header className="shrink-0 border-b border-white/10 bg-[#0b0f0c] px-4 py-3">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex min-w-0 items-center gap-3">
-            <Button asChild variant="secondary" size="sm" className="h-9 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
-              <Link to="/">
-                <ArrowLeft className="size-3.5" />
-                返回
-              </Link>
-            </Button>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <Sparkles className="size-5 shrink-0 text-teal-300" />
-                <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">Progressive API</h1>
+                <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">{t("Agent 安全接入")}</h1>
               </div>
-              <p className="mt-0.5 truncate text-xs text-zinc-500">list · search · describe · execute</p>
+              <p className="mt-0.5 truncate text-xs text-zinc-500">{t("执行前防护、事件上报与安全能力调用")}</p>
             </div>
           </div>
           <div className="flex items-center gap-2 text-xs text-zinc-500">

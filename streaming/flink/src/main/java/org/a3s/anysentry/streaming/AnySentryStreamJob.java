@@ -122,7 +122,7 @@ public final class AnySentryStreamJob {
         DataStream<StreamFinding> findings = enrichedCanonical
                 .filter(AnySentryStreamJob::profileRelevant)
                 .name("profile-relevant-events")
-                .keyBy(event -> event.agentCorrelationId)
+                .keyBy(AnySentryStreamJob::riskProfileEntityKey)
                 .process(new RiskCorrelationFunction())
                 .name("risk-profile-and-composite-correlation");
 
@@ -233,6 +233,12 @@ public final class AnySentryStreamJob {
 
     static boolean profileRelevant(CanonicalEvent event) {
         return RiskCorrelationFunction.relevant(event);
+    }
+
+    static String riskProfileEntityKey(CanonicalEvent event) {
+        return event.agentInstanceId == null || event.agentInstanceId.isBlank()
+                ? event.agentCorrelationId
+                : event.agentInstanceId;
     }
 
     private static boolean temporalRelevant(CanonicalEvent event) {

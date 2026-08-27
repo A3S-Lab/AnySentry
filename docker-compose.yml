@@ -8,6 +8,56 @@ x-anysentry-infrastructure-labels: &anysentry-infrastructure-labels
   anysentry.io/workload-role: "anysentry_internal"
 
 services:
+  prometheus:
+    image: prom/prometheus:v3.12.0
+    labels: *anysentry-infrastructure-labels
+    mem_limit: 768m
+    mem_reservation: 128m
+    command:
+      - --config.file=/etc/prometheus/anysentry.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ./config/prometheus/anysentry.yml:/etc/prometheus/anysentry.yml:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+
+  node-exporter:
+    image: quay.io/prometheus/node-exporter:v1.12.1
+    labels: *anysentry-infrastructure-labels
+    mem_limit: 128m
+    mem_reservation: 32m
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/containers/storage/.+)($|/)
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    restart: unless-stopped
+
+  cadvisor:
+    image: ghcr.io/google/cadvisor:v0.60.2
+    labels: *anysentry-infrastructure-labels
+    mem_limit: 512m
+    mem_reservation: 128m
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=15s
+      - --global_housekeeping_interval=1m
+      - --store_container_labels=true
+      - --enable_metrics=cpu,memory,oom_event
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    restart: unless-stopped
+
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
     labels: *anysentry-infrastructure-labels
@@ -82,9 +132,20 @@ services:
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-anysentry}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-anysentry}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-anysentry}
+      ANYSENTRY_CLICKHOUSE_MICROBATCH: ${ANYSENTRY_CLICKHOUSE_MICROBATCH:-off}
+      ANYSENTRY_CLICKHOUSE_BATCH_MAX_ROWS: ${ANYSENTRY_CLICKHOUSE_BATCH_MAX_ROWS:-1000}
+      ANYSENTRY_CLICKHOUSE_BATCH_MAX_DELAY_MS: ${ANYSENTRY_CLICKHOUSE_BATCH_MAX_DELAY_MS:-1000}
+      ANYSENTRY_CLICKHOUSE_BATCH_MAX_BYTES: ${ANYSENTRY_CLICKHOUSE_BATCH_MAX_BYTES:-1048576}
+      ANYSENTRY_OBSERVER_BATCH_CONCURRENCY: ${ANYSENTRY_OBSERVER_BATCH_CONCURRENCY:-24}
+      ANYSENTRY_CLICKHOUSE_MAX_QUEUED_ROWS: ${ANYSENTRY_CLICKHOUSE_MAX_QUEUED_ROWS:-20000}
+      ANYSENTRY_CLICKHOUSE_MAX_QUEUED_BYTES: ${ANYSENTRY_CLICKHOUSE_MAX_QUEUED_BYTES:-67108864}
+      ANYSENTRY_CLICKHOUSE_SHUTDOWN_FLUSH_MS: ${ANYSENTRY_CLICKHOUSE_SHUTDOWN_FLUSH_MS:-10000}
+      ANYSENTRY_REVISION_IMMUTABILITY: ${ANYSENTRY_REVISION_IMMUTABILITY:-audit}
       ANYSENTRY_ASYNC_JUDGE: "on"
       ANYSENTRY_REDIS_URL: redis://redis:6379/0
       ANYSENTRY_DATABASE_URL: ${ANYSENTRY_DATABASE_URL:-postgresql://${ANYSENTRY_POSTGRES_USER:-anysentry}:${ANYSENTRY_POSTGRES_PASSWORD:-anysentry}@postgres:5432/${ANYSENTRY_POSTGRES_DB:-anysentry}}
+      ANYSENTRY_PROMETHEUS_URL: ${ANYSENTRY_PROMETHEUS_URL:-http://prometheus:9090}
+      ANYSENTRY_METRICS_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-anysentry}
       ANYSENTRY_SUPPLY_CHAIN: ${ANYSENTRY_SUPPLY_CHAIN:-off}
       ANYSENTRY_SUPPLY_CHAIN_RUNTIME: ${ANYSENTRY_SUPPLY_CHAIN_RUNTIME:-off}
       ANYSENTRY_WORKSPACE_SCANNER_TOKEN: ${ANYSENTRY_WORKSPACE_SCANNER_TOKEN:-}
@@ -403,6 +464,7 @@ services:
     restart: unless-stopped
 
 volumes:
+  prometheus-data:
   clickhouse-data:
   redis-data:
   postgres-data:

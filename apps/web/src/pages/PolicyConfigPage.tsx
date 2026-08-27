@@ -2,7 +2,6 @@ import { useRequest } from "ahooks";
 import {
   Activity,
   AlertTriangle,
-  ArrowLeft,
   BarChart3,
   BellRing,
   Bot,
@@ -1318,17 +1317,6 @@ export default function PolicyConfigPage() {
       <header className="shrink-0 border-b border-white/10 bg-[#0b0f0c] px-4 py-3">
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <div className="flex min-w-0 items-center gap-3">
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/">
-                <ArrowLeft className="size-3.5" />
-                返回
-              </Link>
-            </Button>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <Sparkles className="size-5 shrink-0 text-teal-300" />

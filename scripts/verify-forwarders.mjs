@@ -195,7 +195,8 @@ async function verifyForwarder(entry, source, fixture) {
       !line.startsWith('[observer-forward] Unified Filter Rule projection loaded:') &&
       !line.startsWith('[observer-forward] Agent runtime reconciliation:') &&
       !line.startsWith('[observer-forward] Infrastructure policy loaded:') &&
-      !line.startsWith('[observer-forward] docker discovery:'),
+      !line.startsWith('[observer-forward] docker discovery:') &&
+      !line.startsWith('[observer-forward] durable spool:'),
     )
     .join('\n');
   assert(`${fixture.label} forwarder exits cleanly`, unexpectedStderr === '', unexpectedStderr);

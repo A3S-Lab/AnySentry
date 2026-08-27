@@ -28,6 +28,9 @@ import { RuntimeModelConfigService } from './runtime-model-config';
 import { DistributedCurrentStateService } from './distributed-current-state.service';
 import { RelationalBusinessStore } from './relational-business-store.service';
 import { WorkspaceDirectoryService } from './workspace-directory.service';
+import { UserDirectoryService } from './user-directory.service';
+import { PlatformMetricsService } from './platform-metrics.service';
+import { ClickHouseStore } from './clickhouse-store';
 import { SystemContextService } from './system-context.service';
 import { PrometheusContextService } from './prometheus-context.service';
 import { UnknownLearningRuntimeService } from './unknown-learning-runtime.service';
@@ -42,6 +45,6 @@ import { FilterRuleController } from './filter-rule.controller';
 
 @Module({
   controllers: [SecurityMonitoringController, InfrastructureRuleController, FilterRuleController, ObservedAssetLifecycleController],
-  providers: [AgentRuntimeStateService, AgentAttributionService, RelationalBusinessStore, AgentMetadataService, WorkspaceDirectoryService, AlertingService, AuditService, InfrastructureRuleService, FilterRuleCatalogService, FilterRuleSystemService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, DistributedCurrentStateService, SentryJudgeService, AggregationService, IdentityEvidenceService, RuntimeModelConfigService, IdentityReviewAgentService, RemediationService, KubeIdentityService, PrometheusContextService, ManagementAuthGuard, JudgmentQueueService, DecisionResultApplyService, StreamingQueueService, StreamingFindingService, SupplyChainService, SecurityAssistantService, SystemContextService, UnknownLearningRuntimeService, ObservedAssetLifecycleService, ObservedAssetReviewService, InfrastructureAssetSnapshotService, { provide: INFRASTRUCTURE_ASSET_SNAPSHOT_PROVIDER, useExisting: InfrastructureAssetSnapshotService }],
+  providers: [ClickHouseStore, AgentRuntimeStateService, AgentAttributionService, RelationalBusinessStore, UserDirectoryService, AgentMetadataService, WorkspaceDirectoryService, AlertingService, AuditService, InfrastructureRuleService, FilterRuleCatalogService, FilterRuleSystemService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, DistributedCurrentStateService, SentryJudgeService, AggregationService, IdentityEvidenceService, RuntimeModelConfigService, IdentityReviewAgentService, RemediationService, KubeIdentityService, PrometheusContextService, ManagementAuthGuard, JudgmentQueueService, DecisionResultApplyService, StreamingQueueService, StreamingFindingService, SupplyChainService, SecurityAssistantService, PlatformMetricsService, SystemContextService, UnknownLearningRuntimeService, ObservedAssetLifecycleService, ObservedAssetReviewService, InfrastructureAssetSnapshotService, { provide: INFRASTRUCTURE_ASSET_SNAPSHOT_PROVIDER, useExisting: InfrastructureAssetSnapshotService }],
 })
 export class SecurityMonitoringModule {}

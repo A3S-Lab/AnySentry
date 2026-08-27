@@ -43,13 +43,33 @@ function canonicalAgentName(value?: string): string | undefined {
   return normalized;
 }
 
+export function isInternalAgentHelperRootEvent(
+  event: Pick<JudgedEvent, 'process' | 'attribution' | 'attributes'>,
+): boolean {
+  const argv = String(event.attributes?.argv ?? '').toLowerCase();
+  const tokens = argv.split(/\s+/u).filter(Boolean);
+  return Boolean(
+    event.process?.pid &&
+    event.attribution?.rootPid === event.process.pid &&
+    (
+      tokens.includes('--codex-run-as-fs-helper') ||
+      basename(tokens[0]) === 'codex-linux-sandbox' ||
+      tokens.includes('--sandbox-policy-cwd')
+    )
+  );
+}
+
 export function hasDirectAgentRootEvidence(
-  event: Pick<JudgedEvent, 'process' | 'attribution'>,
+  event: Pick<JudgedEvent, 'eventKind' | 'process' | 'attribution' | 'attributes'>,
 ): boolean {
   // A process signature is only a discovery hint. A short-lived `codex ...` command can be
   // observed after its parent has exited and must not become a standalone Agent asset until
   // process-graph or workload evidence confirms the runtime root.
-  if (event.attribution?.source === 'process_signature') return false;
+  if (
+    event.eventKind === 'ProcessExit' ||
+    event.attribution?.source === 'process_signature' ||
+    isInternalAgentHelperRootEvent(event)
+  ) return false;
   const rootPid = event.attribution?.rootPid;
   if (!rootPid || event.process?.pid !== rootPid) return false;
   const scope = canonicalAgentName(
@@ -62,6 +82,24 @@ export function hasDirectAgentRootEvidence(
     canonicalAgentName(basename(event.process?.exe)),
   ].filter((value): value is string => Boolean(value)));
   return executableNames.has(scope);
+}
+
+export function hasAgentRuntimeLineageEvidence(
+  event: Pick<JudgedEvent, 'eventKind' | 'process' | 'attribution' | 'attributes'>,
+): boolean {
+  if (!event.attribution?.rootStartTime) return false;
+  if (hasDirectAgentRootEvidence(event)) return true;
+  return Boolean(
+    event.attribution.rootPid &&
+    event.process?.pid &&
+    event.attribution.rootPid !== event.process.pid &&
+    (
+      event.attribution.source === 'process_graph' ||
+      event.attribution.evidence?.some((item) =>
+        item.startsWith('process_lineage:')
+      )
+    )
+  );
 }
 
 function shortWorkspace(value?: string): string | undefined {

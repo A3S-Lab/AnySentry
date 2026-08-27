@@ -8,6 +8,7 @@ import {
   DashboardWindowHistory,
   StoredAgentBucketFact,
   StoredAgentMetricBucketFact,
+  StoredAgentObservabilityFact,
   StoredAgentWindowFact,
   StoredEventQuery,
   StoredEventSearchResult,
@@ -20,7 +21,9 @@ import {
   agentRuntimeInstanceIdForEvent,
   agentRuntimeInstanceIdsForEvent,
   detectedAgentIdentity,
+  hasAgentRuntimeLineageEvidence,
   hasDirectAgentRootEvidence,
+  isInternalAgentHelperRootEvent,
   isAgentAssetClassification,
 } from './agent-identity';
 import { AgentMetadataService } from './agent-metadata.service';
@@ -605,12 +608,18 @@ export class AggregationService {
     at: number;
     value: T.AgentInstanceMetrics;
   }>();
+  private readonly agentInventoryInFlight = new Map<string, Promise<T.AgentInventory>>();
+  private readonly agentObservabilityInFlight = new Map<string, Promise<T.AgentObservability>>();
+  private readonly agentObservabilityRecent = new Map<string, T.AgentObservability>();
   private dashboardHistoryBuckets?: DashboardHistoryBucketCache;
   private readonly agentHistoryBuckets = new Map<
     'agent' | 'all',
     CommitAwareFactBucketCache<StoredAgentBucketFact>
   >();
-  private topologyHistoryBuckets?: CommitAwareFactBucketCache<StoredTopologyBucketFact>;
+  private readonly topologyHistoryBuckets = new Map<
+    'agent' | 'all',
+    CommitAwareFactBucketCache<StoredTopologyBucketFact>
+  >();
   private readonly workspaceHistoryBuckets = new Map<
     'agent' | 'all',
     CommitAwareFactBucketCache<StoredWorkspaceBucketFact>
@@ -638,15 +647,17 @@ export class AggregationService {
       scope,
       ...cache.stats(),
     }));
+    const topology = [...this.topologyHistoryBuckets.entries()].map(([scope, cache]) => ({
+      scope,
+      ...cache.stats(),
+    }));
     const caches = [
       ...(this.dashboardHistoryBuckets
         ? [{ name: 'dashboard', ...this.dashboardHistoryBuckets.stats() }]
         : []),
       ...agents.map((stats) => ({ name: `agents:${stats.scope}`, ...stats })),
       ...workspaces.map((stats) => ({ name: `workspaces:${stats.scope}`, ...stats })),
-      ...(this.topologyHistoryBuckets
-        ? [{ name: 'topology', ...this.topologyHistoryBuckets.stats() }]
-        : []),
+      ...topology.map((stats) => ({ name: `topology:${stats.scope}`, ...stats })),
     ];
     return {
       schemaVersion: 'anysentry.history-cache.v1',
@@ -2253,6 +2264,7 @@ export class AggregationService {
         event.attribution?.workloadRef?.podUid,
       ),
       hasRootIdentity: Boolean(event.attribution?.rootStartTime) && hasDirectAgentRootEvidence(event),
+      hasInternalHelperRoot: isInternalAgentHelperRootEvent(event),
     };
   }
 
@@ -2303,10 +2315,43 @@ export class AggregationService {
       sourceCounts,
       hasPhysicalIdentity: a.hasPhysicalIdentity || b.hasPhysicalIdentity,
       hasRootIdentity: a.hasRootIdentity || b.hasRootIdentity,
+      hasInternalHelperRoot: a.hasInternalHelperRoot || b.hasInternalHelperRoot,
     };
   }
 
   async storedAgentInventory(filter: T.AgentInventoryQuery): Promise<T.AgentInventory> {
+    const window = resolveTimeWindow(filter);
+    const key = JSON.stringify([
+      window.custom ? window.cacheKey : ['relative', filter.timeType ?? 'last_1h'],
+      filter.scope ?? 'all',
+      filter.healthState ?? 'all',
+      filter.criticality ?? 'all',
+      filter.owner ?? '',
+      filter.environment ?? '',
+      filter.tag ?? '',
+      filter.q ?? '',
+      filter.agentId ?? '',
+      filter.agentAssetId ?? '',
+      filter.agentInstanceId ?? '',
+      filter.workspacePath ?? '',
+      filter.userId ?? '',
+      filter.includeUnclassified === true,
+      filter.limit ?? 120,
+    ]);
+    const current = this.agentInventoryInFlight.get(key);
+    if (current) return current;
+    const request = this.computeStoredAgentInventory(filter);
+    this.agentInventoryInFlight.set(key, request);
+    try {
+      return await request;
+    } finally {
+      if (this.agentInventoryInFlight.get(key) === request) {
+        this.agentInventoryInFlight.delete(key);
+      }
+    }
+  }
+
+  private async computeStoredAgentInventory(filter: T.AgentInventoryQuery): Promise<T.AgentInventory> {
     const lkgKey = JSON.stringify({
       timeType: filter.timeType,
       startTime: filter.startTime,
@@ -2513,11 +2558,34 @@ export class AggregationService {
 
     const t = now();
     const visibleAgentGroups = [...byAgent.entries()].filter(([groupKey, evs]) => {
-      if (shouldScopeExactAgent) return true;
       const identityEvent =
         [...evs].reverse().find((event) => Boolean(event.attribution?.classification)) ??
         evs.at(-1);
       if (!identityEvent) return false;
+      const fact = factsByInstance?.get(groupKey);
+      // Durable aggregate facts are authoritative for one concrete runtime. Falling back to the
+      // representative event's inherited `process_lineage` would resurrect historical helper
+      // processes that the aggregate correctly classified as lacking root evidence.
+      const hasPhysicalRuntime = fact
+        ? fact.hasPhysicalIdentity
+        : evs.some((event) =>
+            Boolean(
+              event.attribution?.physicalWorkloadId ||
+              event.attribution?.agentInstanceId ||
+              event.attribution?.workloadRef?.podUid,
+            )
+          );
+      const hasStrongRootRuntime = fact
+        ? fact.hasRootIdentity
+        : evs.some(hasAgentRuntimeLineageEvidence);
+      if (
+        fact?.hasInternalHelperRoot ||
+        evs.some(isInternalAgentHelperRootEvent)
+      ) return false;
+      // Human/AI review classifies a logical identity; it cannot manufacture a runtime instance.
+      // A concrete row still needs workload identity or a directly observed root lifetime.
+      if (!hasPhysicalRuntime && !hasStrongRootRuntime) return false;
+      if (shouldScopeExactAgent) return true;
       const resolved = this.agentMetadata.resolveEvent(identityEvent);
       if (resolved.effectiveClassification !== 'probable_agent') return true;
       if (resolved.metadata?.reviewDecision) return true;
@@ -2529,28 +2597,7 @@ export class AggregationService {
         resolved.metadata?.note ||
         resolved.metadata?.tags?.length
       ) return true;
-      const fact = factsByInstance?.get(groupKey);
-      if (fact?.hasPhysicalIdentity || evs.some((event) =>
-        Boolean(
-          event.attribution?.physicalWorkloadId ||
-          event.attribution?.agentInstanceId ||
-          event.attribution?.workloadRef?.podUid,
-        )
-      )) return true;
-      if (
-        (
-          fact?.hasRootIdentity &&
-          Boolean(fact.representativeEvent.attribution?.rootStartTime) &&
-          hasDirectAgentRootEvidence(fact.representativeEvent)
-        ) ||
-        evs.some((event) =>
-          Boolean(event.attribution?.rootStartTime) && hasDirectAgentRootEvidence(event)
-        )
-      ) return true;
-      return evs.some((event) =>
-        ['self_register', 'manual_review']
-          .includes(event.attribution?.source ?? '')
-      );
+      return hasPhysicalRuntime || hasStrongRootRuntime;
     });
 
     const logicalInstanceCounts = new Map<string, number>();
@@ -2990,6 +3037,7 @@ export class AggregationService {
     return {
       bucketIndex,
       identityKey: event.eventId,
+      agentId: event.agentId,
       representativeEvent: event,
       eventCount: 1,
       riskyEventCount: event.verdict !== 'allow' ? 1 : 0,
@@ -3015,9 +3063,80 @@ export class AggregationService {
     };
   }
 
+  private observabilityFactForEvents(
+    events: T.JudgedEvent[],
+    recentSinceMs: number,
+  ): StoredAgentObservabilityFact {
+    const recent = events.filter((event) => event.at > recentSinceMs);
+    return {
+      eventCount: events.length,
+      riskyEventCount: events.filter((event) => event.verdict !== 'allow').length,
+      latencyTotal: events.reduce((sum, event) => sum + event.latencyMs, 0),
+      agentIds: [...new Set(events.map((event) => event.agentId).filter(Boolean))],
+      recentEventCount: recent.length,
+      recentCommCount: recent.filter(
+        (event) => event.eventKind === 'Egress' || event.eventKind === 'Dns',
+      ).length,
+      recentSessionKeys: [...new Set(recent.map((event) => event.sessionId).filter(Boolean))],
+    };
+  }
+
+  private async storedAgentObservabilityFact(
+    filter: T.SecurityTimeFilter,
+  ): Promise<{
+    fact: StoredAgentObservabilityFact;
+    coverage: T.QueryCoverage;
+  } | null> {
+    if (!this.judge.storageStatus().clickhouseReady) return null;
+    const window = resolveTimeWindow(filter);
+    const committedCutoffMs = this.judge.committedEventCutoffMs();
+    if (committedCutoffMs === undefined) return null;
+    const plan = planDashboardRead(window.startMs, window.endMs, committedCutoffMs);
+    const persistedUntilMs = Math.min(
+      plan.persistedUntilMs ?? window.endMs,
+      Math.max(window.startMs - 1, plan.hotFromMs - 1),
+    );
+    const hotEvents = foldLatestEventRevisions(
+      this.judge.queryRange(plan.hotFromMs, window.endMs)
+        .filter((event) => filter.scope !== 'agent' || isMonitoredAgentEvent(event)),
+    );
+    const persisted = await this.judge.agentObservabilityFact(
+      window.startMs,
+      persistedUntilMs,
+      filter.scope === 'agent',
+    );
+    if (!persisted) return null;
+    const hot = this.observabilityFactForEvents(
+      hotEvents,
+      Math.max(window.startMs, window.endMs - 60_000),
+    );
+    return {
+      fact: {
+        eventCount: persisted.eventCount + hot.eventCount,
+        riskyEventCount: persisted.riskyEventCount + hot.riskyEventCount,
+        latencyTotal: persisted.latencyTotal + hot.latencyTotal,
+        agentIds: [...new Set([...persisted.agentIds, ...hot.agentIds])],
+        recentEventCount: persisted.recentEventCount + hot.recentEventCount,
+        recentCommCount: persisted.recentCommCount + hot.recentCommCount,
+        recentSessionKeys: [
+          ...new Set([...persisted.recentSessionKeys, ...hot.recentSessionKeys]),
+        ],
+      },
+      coverage: this.queryCoverage(filter, [], {
+        source: hotEvents.length ? 'clickhouse+hot_delta' : 'clickhouse',
+        totalMode: 'exact',
+        partial: false,
+        committedCutoffMs,
+        dataFromMs: window.startMs,
+        dataToMs: window.endMs,
+      }),
+    };
+  }
+
   private async storedAgentMetricFacts(
     filter: T.SecurityTimeFilter,
     bucketCount: number,
+    hydrateRepresentatives = true,
   ): Promise<{
     facts: StoredAgentMetricBucketFact[];
     coverage: T.QueryCoverage;
@@ -3029,20 +3148,25 @@ export class AggregationService {
     const committedCutoffMs = this.judge.committedEventCutoffMs();
     if (committedCutoffMs === undefined) return null;
     const plan = planDashboardRead(window.startMs, window.endMs, committedCutoffMs);
-    const persistedUntilMs = plan.persistedUntilMs ?? window.endMs;
+    // Keep the durable and hot sources disjoint by construction. Passing every overlap event ID
+    // through ClickHouse HTTP eventually exceeds its form-field limit during sustained ingestion;
+    // ending the durable range immediately before the complete hot tail is exact and needs no
+    // exclusion parameter.
+    const persistedUntilMs = Math.min(
+      plan.persistedUntilMs ?? window.endMs,
+      Math.max(window.startMs - 1, plan.hotFromMs - 1),
+    );
     const hotEvents = foldLatestEventRevisions(
       this.judge.queryRange(plan.hotFromMs, window.endMs)
         .filter((event) => filter.scope !== 'agent' || isMonitoredAgentEvent(event)),
     );
-    const overlapEventIds = hotEvents
-      .filter((event) => event.at <= persistedUntilMs)
-      .map((event) => event.eventId);
     const persisted = await this.judge.agentMetricBucketFacts(
       window.startMs,
       persistedUntilMs,
       pointCount,
       filter.scope === 'agent',
-      overlapEventIds,
+      [],
+      hydrateRepresentatives,
     );
     if (!persisted) return null;
     const recentSinceMs = Math.max(window.startMs, window.endMs - 60_000);
@@ -3054,12 +3178,18 @@ export class AggregationService {
     const facts = [...persisted, ...hotFacts];
     return {
       facts,
-      coverage: this.queryCoverage(filter, facts.map((fact) => fact.representativeEvent), {
-        source: hotEvents.length ? 'clickhouse+hot_delta' : 'clickhouse',
-        totalMode: 'exact',
-        partial: false,
-        committedCutoffMs,
-      }),
+      coverage: this.queryCoverage(
+        filter,
+        facts.flatMap((fact) => fact.representativeEvent ? [fact.representativeEvent] : []),
+        {
+          source: hotEvents.length ? 'clickhouse+hot_delta' : 'clickhouse',
+          totalMode: 'exact',
+          partial: false,
+          committedCutoffMs,
+          dataFromMs: window.startMs,
+          dataToMs: window.endMs,
+        },
+      ),
     };
   }
 
@@ -3088,6 +3218,7 @@ export class AggregationService {
     const bucketSize = window.spanMs / pointCount || 1;
     const selected = durable.facts.filter((fact) =>
       agentAssetId &&
+      fact.representativeEvent &&
       this.agentMetadata.resolveEvent(fact.representativeEvent).agentAssetId === agentAssetId &&
       matchesAgentRuntimeInstance(fact.representativeEvent, agentInstanceId),
     );
@@ -3592,13 +3723,17 @@ export class AggregationService {
     const committed = this.judge.committedEventCutoffMs();
     if (committed === undefined) return this.agentTopology(filter);
     const plan = planDashboardRead(window.startMs, window.endMs, committed);
-    const persistedUntilMs = plan.persistedUntilMs ?? window.endMs;
+    // Topology uses the same single-owner overlap rule as Agent inventory. It avoids oversized
+    // NOT IN parameters when Observer emits thousands of events during one refresh interval.
+    const persistedUntilMs = Math.min(
+      plan.persistedUntilMs ?? window.endMs,
+      Math.max(window.startMs - 1, plan.hotFromMs - 1),
+    );
     const hotEvents = foldLatestEventRevisions(
       this.judge.queryRange(plan.hotFromMs, window.endMs),
     );
-    const overlapEventIds = hotEvents
-      .filter((event) => event.at <= persistedUntilMs)
-      .map((event) => event.eventId);
+    const monitoredOnly = filter.scope === 'agent';
+    const overlapEventIds: string[] = [];
     const slices = reusableFactSlices(window.startMs, persistedUntilMs, plan.hotFromMs);
     let persisted: StoredTopologyWindowFact[] | null;
     if (
@@ -3606,17 +3741,27 @@ export class AggregationService {
       window.spanMs <= 24 * HOUR &&
       slices.fullEndExclusiveMs > slices.fullStartMs
     ) {
-      this.topologyHistoryBuckets ??= new CommitAwareFactBucketCache<StoredTopologyBucketFact>({
-        latestCursor: () => this.judge.latestEventCommitCursor(),
-        earliestCursor: () => this.judge.earliestEventCommitCursor(),
-        changes: (after) => this.judge.eventCommitChanges(after),
-        facts: (startMs, endExclusiveMs, bucketMs) =>
-          this.historyQueryGate.run(() =>
-            this.judge.topologyWindowBucketFacts(startMs, endExclusiveMs, bucketMs),
-          ),
-      });
+      const topologyScope = monitoredOnly ? 'agent' : 'all';
+      let topologyCache = this.topologyHistoryBuckets.get(topologyScope);
+      if (!topologyCache) {
+        topologyCache = new CommitAwareFactBucketCache<StoredTopologyBucketFact>({
+          latestCursor: () => this.judge.latestEventCommitCursor(),
+          earliestCursor: () => this.judge.earliestEventCommitCursor(),
+          changes: (after) => this.judge.eventCommitChanges(after),
+          facts: (startMs, endExclusiveMs, bucketMs) =>
+            this.historyQueryGate.run(() =>
+            this.judge.topologyWindowBucketFacts(
+              startMs,
+              endExclusiveMs,
+              bucketMs,
+              monitoredOnly,
+            ),
+            ),
+        });
+        this.topologyHistoryBuckets.set(topologyScope, topologyCache);
+      }
       const [stableFacts, headFacts, tailFacts] = await Promise.all([
-        this.topologyHistoryBuckets.read(
+        topologyCache.read(
           slices.fullStartMs,
           slices.fullEndExclusiveMs,
         ).catch((error) => {
@@ -3632,6 +3777,7 @@ export class AggregationService {
               this.judge.topologyWindowFacts(
                 slices.head!.startMs,
                 slices.head!.endMs,
+                monitoredOnly,
                 overlapEventIds,
               ),
             )
@@ -3641,6 +3787,7 @@ export class AggregationService {
               this.judge.topologyWindowFacts(
                 slices.tail!.startMs,
                 slices.tail!.endMs,
+                monitoredOnly,
                 overlapEventIds,
               ),
             )
@@ -3654,6 +3801,7 @@ export class AggregationService {
         this.judge.topologyWindowFacts(
           window.startMs,
           persistedUntilMs,
+          monitoredOnly,
           overlapEventIds,
         ),
       );
@@ -3671,7 +3819,17 @@ export class AggregationService {
     const pinnedEvent = pinnedPage?.events[0] ?? (pinnedEventId ? this.judge.findEvent(pinnedEventId) : undefined);
     const hotFacts: StoredTopologyWindowFact[] = hotEvents.map((event) => ({
       identityKey: event.eventId,
+      instanceKey: agentRuntimeInstanceIdForEvent(event),
       representativeEvent: event,
+      hasPhysicalIdentity: Boolean(
+        event.attribution?.physicalWorkloadId ||
+        event.attribution?.agentInstanceId ||
+        event.attribution?.workloadRef?.podUid,
+      ),
+      hasRootIdentity:
+        Boolean(event.attribution?.rootStartTime) &&
+        hasDirectAgentRootEvidence(event),
+      hasInternalHelperRoot: isInternalAgentHelperRootEvent(event),
       firstSeenAt: event.at,
       lastSeenAt: event.at,
       eventCount: 1,
@@ -3684,7 +3842,17 @@ export class AggregationService {
     if (pinnedEvent && !facts.some((fact) => fact.representativeEvent.eventId === pinnedEvent.eventId)) {
       facts.push({
         identityKey: pinnedEvent.eventId,
+        instanceKey: agentRuntimeInstanceIdForEvent(pinnedEvent),
         representativeEvent: pinnedEvent,
+        hasPhysicalIdentity: Boolean(
+          pinnedEvent.attribution?.physicalWorkloadId ||
+          pinnedEvent.attribution?.agentInstanceId ||
+          pinnedEvent.attribution?.workloadRef?.podUid,
+        ),
+        hasRootIdentity:
+          Boolean(pinnedEvent.attribution?.rootStartTime) &&
+          hasDirectAgentRootEvidence(pinnedEvent),
+        hasInternalHelperRoot: isInternalAgentHelperRootEvent(pinnedEvent),
         firstSeenAt: pinnedEvent.at,
         lastSeenAt: pinnedEvent.at,
         eventCount: 1,
@@ -3720,10 +3888,32 @@ export class AggregationService {
       resolvedEvents.set(event.eventId, resolved);
       return resolved;
     };
-    const isAgentRelatedEvent = (event: T.JudgedEvent) =>
-      isAgentAssetClassification(resolveAgent(event).effectiveClassification);
     const topologyFacts = durable?.facts;
     const factByEventId = new Map((topologyFacts ?? []).map((fact) => [fact.representativeEvent.eventId, fact]));
+    const invalidHelperInstances = new Set(
+      (topologyFacts ?? [])
+        .filter((fact) => fact.hasInternalHelperRoot)
+        .map((fact) => fact.instanceKey),
+    );
+    const isAgentRelatedEvent = (event: T.JudgedEvent) => {
+      if (!isAgentAssetClassification(resolveAgent(event).effectiveClassification)) return false;
+      const fact = factByEventId.get(event.eventId);
+      const instanceKey = fact?.instanceKey ?? agentRuntimeInstanceIdForEvent(event);
+      if (
+        invalidHelperInstances.has(instanceKey) ||
+        fact?.hasInternalHelperRoot ||
+        isInternalAgentHelperRootEvent(event)
+      ) return false;
+      if (fact) {
+        return fact.hasPhysicalIdentity || fact.hasRootIdentity;
+      }
+      return Boolean(
+        event.attribution?.physicalWorkloadId ||
+        event.attribution?.agentInstanceId ||
+        event.attribution?.workloadRef?.podUid ||
+        hasAgentRuntimeLineageEvidence(event)
+      );
+    };
     const rawWindowedEvents = topologyFacts
       ? topologyFacts.map((fact) => fact.representativeEvent)
       : this.win(filter).events;
@@ -5246,43 +5436,72 @@ export class AggregationService {
     if (this.needsCurrentAgentOverlay(filter)) {
       return this.agentObservability(filter, await this.currentEffectiveOverlay(filter));
     }
-    const durable = await this.storedAgentMetricFacts(filter, 60);
+    const durable = await this.storedAgentObservabilityFact(filter);
     if (!durable) return this.agentObservability(filter);
     const window = resolveTimeWindow(filter);
-    const facts = durable.facts;
-    const eventCount = facts.reduce((sum, fact) => sum + fact.eventCount, 0);
-    const riskyEventCount = facts.reduce((sum, fact) => sum + fact.riskyEventCount, 0);
-    const recentEventCount = facts.reduce((sum, fact) => sum + fact.recentEventCount, 0);
-    const recentCommCount = facts.reduce((sum, fact) => sum + fact.recentCommCount, 0);
-    const recentSessionKeys = new Set(facts.flatMap((fact) => fact.recentSessionKeys));
-    const agentAssetIds = new Set(facts.map((fact) =>
-      this.agentMetadata.resolveEvent(fact.representativeEvent).agentAssetId,
-    ));
-    const errorRate = round1((riskyEventCount / (eventCount || 1)) * 100);
+    const fact = durable.fact;
+    const eventCount = fact.eventCount;
+    const errorRate = round1((fact.riskyEventCount / (eventCount || 1)) * 100);
     return {
       health: {
-        heartbeatOk: recentEventCount > 0,
-        resourceUtil: Math.min(99, 20 + recentEventCount * 3),
+        heartbeatOk: fact.recentEventCount > 0,
+        resourceUtil: Math.min(99, 20 + fact.recentEventCount * 3),
         errorRate,
-        decisionLatencyMs: Math.round(
-          facts.reduce((sum, fact) => sum + fact.latencyTotal, 0) / (eventCount || 1),
-        ),
+        decisionLatencyMs: Math.round(fact.latencyTotal / (eventCount || 1)),
       },
       behavioral: {
-        actionRate: recentEventCount,
+        actionRate: fact.recentEventCount,
         decisionPattern: errorRate > 25 ? 'drift' : 'baseline',
-        stateTransitions: recentSessionKeys.size,
+        stateTransitions: fact.recentSessionKeys.length,
         goalProgress: Math.max(0, 100 - Math.round(errorRate)),
       },
       system: {
-        agentCount: agentAssetIds.size,
-        commThroughput: recentCommCount,
+        agentCount: fact.agentIds.length,
+        commThroughput: fact.recentCommCount,
         infraHealthy: true,
       },
       coverage: durable.coverage,
       ...this.classificationResponseMeta(filter),
       updateTime: iso(window.endMs),
     };
+  }
+
+  async sharedAgentObservabilityForWindow(filter: T.SecurityTimeFilter): Promise<T.AgentObservability> {
+    const window = resolveTimeWindow(filter);
+    const key = JSON.stringify([
+      window.custom ? window.cacheKey : ['relative', filter.timeType ?? 'last_3h'],
+      filter.scope ?? 'all',
+    ]);
+    const effectiveFilter = window.custom || filter.snapshotAsOf
+      ? filter
+      : {
+          ...filter,
+          snapshotAsOf: new Date(Math.floor(now() / 3_000) * 3_000).toISOString(),
+        };
+    const completedKey = JSON.stringify([
+      resolveTimeWindow(effectiveFilter).cacheKey,
+      effectiveFilter.scope ?? 'all',
+    ]);
+    const recent = this.agentObservabilityRecent.get(completedKey);
+    if (recent) return recent;
+    const current = this.agentObservabilityInFlight.get(key);
+    if (current) return current;
+    const request = this.agentObservabilityForWindow(effectiveFilter);
+    this.agentObservabilityInFlight.set(key, request);
+    try {
+      const value = await request;
+      this.agentObservabilityRecent.set(completedKey, value);
+      while (this.agentObservabilityRecent.size > 64) {
+        const oldestKey = this.agentObservabilityRecent.keys().next().value as string | undefined;
+        if (!oldestKey) break;
+        this.agentObservabilityRecent.delete(oldestKey);
+      }
+      return value;
+    } finally {
+      if (this.agentObservabilityInFlight.get(key) === request) {
+        this.agentObservabilityInFlight.delete(key);
+      }
+    }
   }
 
   workspaceRiskDistribution(

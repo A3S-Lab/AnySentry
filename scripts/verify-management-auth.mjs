@@ -32,6 +32,8 @@ const expectedProtectedRoutes = [
   'PUT notifications/routes/:routeId',
   'POST objectives',
   'PUT objectives/:objectiveId',
+  'POST users',
+  'PUT users/:userId',
   'PUT supply-chain/config',
   'POST supply-chain/workspaces/:workspaceId/scan',
   'POST supply-chain/workspaces/:workspaceId/assess',
@@ -131,6 +133,8 @@ function protectedWriteProbes(id) {
     { route: 'PUT notifications/routes/:routeId', label: 'notification route update', method: 'PUT', path: `/notifications/routes/${id}-missing-route`, body: { name: `${id} route updated`, enabled: false, channelIds: [], kinds: ['source'] } },
     { route: 'POST objectives', label: 'objective create', method: 'POST', path: '/objectives', body: { name: `${id} objective`, enabled: true, targetType: 'source', targetId: `${id}-source`, metric: 'active_alerts', comparator: 'lte', threshold: 0, severity: 'medium' } },
     { route: 'PUT objectives/:objectiveId', label: 'objective update', method: 'PUT', path: `/objectives/${id}-missing-objective`, body: { name: `${id} objective updated`, enabled: false, threshold: 1 } },
+    { route: 'POST users', label: 'user create', method: 'POST', path: '/users', body: { username: `${id}-user`, displayName: `${id} user`, role: 'viewer', enabled: true } },
+    { route: 'PUT users/:userId', label: 'user update', method: 'PUT', path: `/users/${id}-missing-user`, body: { displayName: `${id} user updated`, enabled: false } },
     {
       route: 'PUT supply-chain/config',
       label: 'supply-chain config update',

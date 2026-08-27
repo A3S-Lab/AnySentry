@@ -133,26 +133,46 @@ export class CommitAwareFactBucketCache<T extends TimeBucketFact> {
   }
 
   private async loadMissing(startMs: number, endExclusiveMs: number): Promise<void> {
+    const ranges: Array<{ startMs: number; endExclusiveMs: number }> = [];
     let rangeStart: number | undefined;
     for (let bucket = startMs; bucket <= endExclusiveMs; bucket += this.bucketMs) {
       const missing = bucket < endExclusiveMs && !this.bucketFacts.has(bucket);
       if (missing && rangeStart === undefined) rangeStart = bucket;
       if ((!missing || bucket === endExclusiveMs) && rangeStart !== undefined) {
-        const rangeEnd = bucket;
-        const rows = await this.provider.facts(rangeStart, rangeEnd, this.bucketMs);
-        if (rows === null) throw new Error('bucket facts unavailable');
-        const grouped = new Map<number, T[]>();
-        for (const row of rows) {
-          const list = grouped.get(row.bucketStartMs) ?? [];
-          list.push(row);
-          grouped.set(row.bucketStartMs, list);
-        }
-        for (let current = rangeStart; current < rangeEnd; current += this.bucketMs) {
-          const facts = grouped.get(current) ?? [];
-          this.bucketFacts.set(current, facts);
-          this.budget.record(current, facts);
-        }
+        ranges.push({ startMs: rangeStart, endExclusiveMs: bucket });
         rangeStart = undefined;
+      }
+    }
+    // A recovery burst or delayed L2/L3 completions can invalidate many disjoint buckets. Issuing
+    // one aggregation per gap repeatedly scans the same MergeTree marks and is much slower than a
+    // single exact envelope read. Replacing already-valid buckets from that same snapshot is safe.
+    const reads = ranges.length > 2
+      ? [{
+          startMs: ranges[0].startMs,
+          endExclusiveMs: ranges[ranges.length - 1].endExclusiveMs,
+        }]
+      : ranges;
+    for (const range of reads) {
+      const rows = await this.provider.facts(
+        range.startMs,
+        range.endExclusiveMs,
+        this.bucketMs,
+      );
+      if (rows === null) throw new Error('bucket facts unavailable');
+      const grouped = new Map<number, T[]>();
+      for (const row of rows) {
+        const list = grouped.get(row.bucketStartMs) ?? [];
+        list.push(row);
+        grouped.set(row.bucketStartMs, list);
+      }
+      for (
+        let current = range.startMs;
+        current < range.endExclusiveMs;
+        current += this.bucketMs
+      ) {
+        const facts = grouped.get(current) ?? [];
+        this.bucketFacts.set(current, facts);
+        this.budget.record(current, facts);
       }
     }
   }

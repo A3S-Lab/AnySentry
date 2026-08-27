@@ -83,7 +83,7 @@ function clearScheduledPersistence(service) {
       return true;
     },
   };
-  const sourceService = new IngestionSourceService({}, relational);
+  const sourceService = new IngestionSourceService({}, {}, relational);
   sourceService.ch = { saveIngestionSources: async () => undefined };
 
   const created = sourceService.create({

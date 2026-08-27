@@ -118,7 +118,6 @@ function pinFirst<T>(items: T[], pinnedId: string | undefined, idOf: (item: T) =
 
 @Injectable()
 export class NotificationService implements OnModuleInit, OnModuleDestroy {
-  private readonly ch = new ClickHouseStore();
   private readonly channels = new Map<string, NotificationChannelRecord>();
   private readonly routes = new Map<string, NotificationRouteRecord>();
   private readonly deliveries = new Map<string, NotificationDeliveryRecord>();
@@ -130,6 +129,7 @@ export class NotificationService implements OnModuleInit, OnModuleDestroy {
   private readonly legacyWebhookUrl = process.env.ANYSENTRY_ALERT_WEBHOOK_URL?.trim();
 
   constructor(
+    private readonly ch: ClickHouseStore,
     private readonly audit: AuditService,
     private readonly relational: RelationalBusinessStore,
   ) {}
@@ -160,7 +160,6 @@ export class NotificationService implements OnModuleInit, OnModuleDestroy {
     if (this.persistTimer) clearTimeout(this.persistTimer);
     if (this.relationalRefreshTimer) clearInterval(this.relationalRefreshTimer);
     await this.persist();
-    await this.ch.close();
   }
 
   stateStatus() {

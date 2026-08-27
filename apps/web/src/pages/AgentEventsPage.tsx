@@ -21,6 +21,7 @@ import { AdminTokenControl } from "@/components/custom/admin-token-control";
 import { AgentIdentityInline, resolveAgentIdentity } from "@/components/custom/agent-identity";
 import { ClassificationViewControl } from "@/components/custom/classification-view-control";
 import { useSecurityConsole } from "@/components/custom/security-console-header";
+import { AdaptiveVirtualList } from "@/components/performance/adaptive-virtual-list";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -872,16 +873,20 @@ export default function AgentEventsPage() {
             ) : (visibleData?.items?.length ?? 0) === 0 ? (
               <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">{t("暂无事件")}</div>
             ) : (
-              <div className="max-h-[calc(100vh-220px)] overflow-y-auto">
-                {visibleData?.items.map((event) => (
+              <AdaptiveVirtualList
+                items={visibleData?.items ?? []}
+                getKey={(event) => event.eventId}
+                estimateSize={76}
+                threshold={100}
+                className="max-h-[calc(100vh-220px)] overflow-y-auto"
+                renderItem={(event) => (
                   <EventRow
-                    key={event.eventId}
                     event={event}
                     active={event.eventId === selectedEvent?.eventId}
                     onSelect={() => selectEvent(event)}
                   />
-                ))}
-              </div>
+                )}
+              />
             )}
           </section>
 

@@ -130,6 +130,13 @@ spec:
             # states; the retry window plus this budget covers a bounded ClickHouse restart.
             - { name: FORWARD_BATCH_SIZE, value: "32" }
             - { name: FORWARD_BATCH_FLUSH_MS, value: "50" }
+            # Events are removed only after an item-level durable ack. The hostPath survives
+            # container/Pod restarts; when full, stdin is paused instead of dropping evidence.
+            - { name: FORWARD_SPOOL_PATH, value: "/var/lib/anysentry-forwarder/spool.wal" }
+            - { name: FORWARD_SPOOL_FSYNC, value: "periodic" }
+            - { name: FORWARD_SPOOL_FSYNC_MS, value: "250" }
+            - { name: FORWARD_SPOOL_MAX_RECORDS, value: "250000" }
+            - { name: FORWARD_SPOOL_MAX_BYTES, value: "2147483648" }
             - { name: FORWARD_BATCH_MAX_BYTES, value: "524288" }
             - { name: FORWARD_MAX_EVENT_BYTES, value: "3145728" }
             - { name: FORWARD_MAX_OUTSTANDING_EVENTS, value: "16384" }
@@ -149,6 +156,7 @@ spec:
             - { name: agent-templates, mountPath: /etc/anysentry, readOnly: true }
             - { name: observer-auth, mountPath: /etc/anysentry-auth, readOnly: true }
             - { name: filter-rules, mountPath: /run/anysentry-filter }
+            - { name: forwarder-spool, mountPath: /var/lib/anysentry-forwarder }
           resources:
             requests: { cpu: 50m, memory: 128Mi }
             # 1Gi: full signal set (FILES high-volume + SSL uprobes) tracks more state, plus the
@@ -157,6 +165,7 @@ spec:
       volumes:
         - { name: sys, hostPath: { path: /sys } }
         - { name: agent-templates, configMap: { name: anysentry-agent-templates } }
+        - { name: forwarder-spool, hostPath: { path: /var/lib/anysentry-forwarder, type: DirectoryOrCreate } }
         - name: observer-auth
           secret:
             secretName: anysentry-observer-auth

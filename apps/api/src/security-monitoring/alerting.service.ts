@@ -89,6 +89,14 @@ interface CoverageAlertScope {
   sourceId?: string;
 }
 
+type AlertNotificationAction = 'opened' | 'reopened' | 'resolved';
+
+export interface DurableAlertMutation {
+  records: AlertRecord[];
+  commit(): void;
+  rollback(): void;
+}
+
 function hashId(prefix: string, parts: Array<string | number | undefined>): string {
   const h = createHash('sha1');
   for (const p of parts) h.update(String(p ?? '')).update('\0');
@@ -242,7 +250,6 @@ const JUDGMENT_FAILURE_TEXT: Record<JudgmentFailureType, { title: string; descri
 
 @Injectable()
 export class AlertingService implements OnModuleInit, OnModuleDestroy {
-  private readonly ch = new ClickHouseStore();
   private readonly alerts = new Map<string, AlertRecord>();
   private readonly incidents = new Map<string, Incident>();
   private readonly latestCollectorHeartbeat = new Map<string, CollectorHeartbeatRecord>();
@@ -255,6 +262,10 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
   private persistInFlight?: Promise<void>;
   private persistRequested = false;
   private initialized = false;
+  private durableMutationHolds = 0;
+  private effectCapture?: {
+    notifications: Array<{ alert: AlertRecord; action: AlertNotificationAction }>;
+  };
 
   private readonly config: AlertConfig = {
     enabled: process.env.ANYSENTRY_ALERTS !== 'off',
@@ -270,6 +281,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
   };
 
   constructor(
+    private readonly ch: ClickHouseStore,
     private readonly maintenance: MaintenanceWindowService,
     private readonly notifications: NotificationService,
     private readonly sources: IngestionSourceService,
@@ -308,7 +320,6 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     if (this.sourceTimer) clearInterval(this.sourceTimer);
     if (this.relationalRefreshTimer) clearInterval(this.relationalRefreshTimer);
     await this.persist();
-    await this.ch.close();
   }
 
   getConfig(): AlertConfig {
@@ -593,11 +604,85 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     this.recomputeAgentIncidentAlert(incident.workspacePath, incident.agentId, incident.updatedAt);
   }
 
+  /**
+   * Apply one event's alert mutations synchronously, but hold persistence and notifications until
+   * the caller atomically commits the Incident, Alerts and business-effect ledger in PostgreSQL.
+   */
+  prepareDurableBusinessEffects(event: JudgedEvent, incident: Incident | null): DurableAlertMutation {
+    if (this.effectCapture) throw new Error('nested durable alert mutation is not supported');
+    const beforeAlerts = new Map(this.alerts);
+    const beforeIncident = incident ? this.incidents.get(incident.incidentId) : undefined;
+    if (this.durableMutationHolds === 0 && this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = undefined;
+      this.persistRequested = true;
+    }
+    this.durableMutationHolds += 1;
+    const capture = { notifications: [] as Array<{ alert: AlertRecord; action: AlertNotificationAction }> };
+    this.effectCapture = capture;
+    try {
+      this.observeEvent(event, incident?.incidentId);
+      if (incident) this.observeIncident(incident);
+    } catch (error) {
+      this.effectCapture = undefined;
+      for (const alertId of this.alerts.keys()) {
+        if (!beforeAlerts.has(alertId)) this.alerts.delete(alertId);
+      }
+      for (const [alertId, alert] of beforeAlerts) this.alerts.set(alertId, alert);
+      if (incident) {
+        if (beforeIncident) this.incidents.set(incident.incidentId, beforeIncident);
+        else this.incidents.delete(incident.incidentId);
+      }
+      this.durableMutationHolds -= 1;
+      if (this.durableMutationHolds === 0) this.persistSoon();
+      throw error;
+    }
+    this.effectCapture = undefined;
+
+    const changes = [...this.alerts.entries()]
+      .filter(([alertId, alert]) => beforeAlerts.get(alertId) !== alert)
+      .map(([alertId, after]) => ({ alertId, before: beforeAlerts.get(alertId), after }));
+    let settled = false;
+    const release = (): void => {
+      this.durableMutationHolds = Math.max(0, this.durableMutationHolds - 1);
+      if (this.durableMutationHolds === 0) this.persistSoon();
+    };
+    return {
+      records: changes.map(({ after }) => after),
+      commit: () => {
+        if (settled) return;
+        settled = true;
+        release();
+        for (const notification of capture.notifications) {
+          if (this.alerts.get(notification.alert.alertId) === notification.alert) {
+            void this.notify(notification.alert, notification.action);
+          }
+        }
+      },
+      rollback: () => {
+        if (settled) return;
+        settled = true;
+        for (const { alertId, before, after } of changes) {
+          if (this.alerts.get(alertId) !== after) continue;
+          if (before) this.alerts.set(alertId, before);
+          else this.alerts.delete(alertId);
+        }
+        if (incident && this.incidents.get(incident.incidentId) === incident) {
+          if (beforeIncident) this.incidents.set(incident.incidentId, beforeIncident);
+          else this.incidents.delete(incident.incidentId);
+        }
+        release();
+      },
+    };
+  }
+
   observeCollectorHeartbeat(heartbeat: CollectorHeartbeatRecord): void {
     const qualityOrigin = heartbeat.origin === 'raw_collector' ? 'raw_collector' : 'forwarder';
     const qualityKey = `${heartbeat.collectorId}\0${qualityOrigin}`;
-    const previous = this.latestCollectorQualityHeartbeat.get(qualityKey);
-    this.latestCollectorQualityHeartbeat.set(qualityKey, heartbeat);
+    const previousQuality = this.latestCollectorQualityHeartbeat.get(qualityKey);
+    if (!previousQuality || heartbeat.at >= previousQuality.at) {
+      this.latestCollectorQualityHeartbeat.set(qualityKey, heartbeat);
+    }
     const latest = this.latestCollectorHeartbeat.get(heartbeat.collectorId);
     if (!latest || heartbeat.at >= latest.at) {
       this.latestCollectorHeartbeat.set(heartbeat.collectorId, heartbeat);
@@ -621,7 +706,10 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     // The raw collector reports cumulative kernel/exporter counters. The Forwarder resets its
     // output/error counters after every heartbeat snapshot. Keep the public fields and alert IDs,
     // but use their source/explicit temporality so equal adjacent interval values are not erased.
-    const { droppedDelta, errorDelta } = collectorHeartbeatFailureDelta(heartbeat, previous);
+    const { droppedDelta, errorDelta } = collectorHeartbeatFailureDelta(
+      heartbeat,
+      previousQuality,
+    );
     const degraded = heartbeat.status !== 'ok' || droppedDelta > 0 || errorDelta > 0;
     if (!degraded) {
       this.resolveWhere(
@@ -1199,8 +1287,8 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     };
     this.alerts.set(alertId, next);
     this.persistSoon();
-    if (shouldNotifyResolved) void this.notify(next, 'resolved');
-    if (shouldNotifyReopened) void this.notify(next, 'reopened');
+    if (shouldNotifyResolved) this.scheduleNotification(next, 'resolved');
+    if (shouldNotifyReopened) this.scheduleNotification(next, 'reopened');
     return this.item(next);
   }
 
@@ -1286,7 +1374,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     this.alerts.set(alertId, next);
     this.persistSoon();
     if (status === 'open' && (reopened || !prev || SEVERITY_RANK[next.severity] > SEVERITY_RANK[prev.severity])) {
-      void this.notify(next, prev ? 'reopened' : 'opened');
+      this.scheduleNotification(next, prev ? 'reopened' : 'opened');
     }
     return next;
   }
@@ -1451,7 +1539,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
         note: alert.note ?? reason,
       };
       this.alerts.set(alert.alertId, resolved);
-      if (notify) void this.notify(resolved, 'resolved');
+      if (notify) this.scheduleNotification(resolved, 'resolved');
       changed = true;
     }
     if (changed) this.persistSoon();
@@ -1535,7 +1623,15 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
-  private async notify(alert: AlertRecord, action: 'opened' | 'reopened' | 'resolved'): Promise<void> {
+  private scheduleNotification(alert: AlertRecord, action: AlertNotificationAction): void {
+    if (this.effectCapture) {
+      this.effectCapture.notifications.push({ alert, action });
+      return;
+    }
+    void this.notify(alert, action);
+  }
+
+  private async notify(alert: AlertRecord, action: AlertNotificationAction): Promise<void> {
     if (action === 'resolved' ? alert.status !== 'resolved' : alert.status !== 'open') return;
     const at = Date.now();
     if (action === 'opened' && alert.lastNotificationAt && at - alert.lastNotificationAt < this.config.webhookCooldownSecs * 1000) return;
@@ -1566,6 +1662,10 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
 
   private persistSoon(): void {
     if (!this.initialized) return;
+    if (this.durableMutationHolds > 0) {
+      this.persistRequested = true;
+      return;
+    }
     if (this.persistTimer) return;
     this.persistTimer = setTimeout(() => {
       this.persistTimer = undefined;

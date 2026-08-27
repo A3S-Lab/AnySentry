@@ -2,8 +2,8 @@ import { Injectable, OnModuleDestroy, OnModuleInit, Optional } from '@nestjs/com
 import { createHash } from 'node:crypto';
 import { Sentry, dns, egress, fileAccess, securityAction, sslContent, toolExec } from '@a3s-lab/sentry';
 import { AgentAttributionService } from './agent-attribution.service';
-import { AlertingService } from './alerting.service';
-import { ClickHouseStore, DashboardWindowHistory, IncidentState, StoredAgentBucketFact, StoredAgentMetricBucketFact, StoredAgentWindowFact, StoredEventQuery, StoredEventSearchResult, StoredToolEvidenceRelations, ToolEvidenceRelationScope, StoredTopologyBucketFact, StoredTopologyWindowFact, StoredWorkspaceBucketFact, StoredWorkspaceWindowFact } from './clickhouse-store';
+import { AlertingService, type DurableAlertMutation } from './alerting.service';
+import { ClickHouseStore, DashboardWindowHistory, IncidentState, StoredAgentBucketFact, StoredAgentMetricBucketFact, StoredAgentObservabilityFact, StoredAgentWindowFact, StoredEventQuery, StoredEventSearchResult, StoredToolEvidenceRelations, ToolEvidenceRelationScope, StoredTopologyBucketFact, StoredTopologyWindowFact, StoredWorkspaceBucketFact, StoredWorkspaceWindowFact, eventRevisionIdentity } from './clickhouse-store';
 import type { ToolEvidenceItem } from './tool-evidence-linker';
 import { DEFAULT_POLICY, PolicyConfig, buildFastAcl, policyConfigError, sanitizePolicy, tierStatus } from './policy-config';
 import { cleanText } from './redaction';
@@ -501,6 +501,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   private readonly store: JudgedEvent[] = [];
   private readonly storeById = new Map<string, JudgedEvent>();
   private readonly resultApplyLocks = new Map<string, Promise<void>>();
+  private businessEffectApplyTail: Promise<void> = Promise.resolve();
   private readonly decisionRevisionWrites: PendingDecisionRevisionWrite[] = [];
   private decisionRevisionWriteTimer?: NodeJS.Timeout;
   private decisionRevisionWriteDrain?: Promise<void>;
@@ -647,6 +648,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       try {
         await this.drainDecisionRevisionWrites();
       } finally {
+        await (this.businessEffectApplyTail ?? Promise.resolve()).catch(() => undefined);
         await this.ch.close();
       }
     }
@@ -711,6 +713,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
 
   dashboardBucketSnapshotStatus() {
     return this.ch.dashboardBucketSnapshotStatus();
+  }
+
+  eventWriteBatchStatus() {
+    return this.ch.eventWriteBatchStatus();
   }
 
   async searchStoredEvents(query: StoredEventQuery): Promise<JudgedEvent[] | null> {
@@ -782,8 +788,24 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     bucketCount: number,
     monitoredOnly: boolean,
     excludedEventIds: string[] = [],
+    hydrateRepresentatives = true,
   ): Promise<StoredAgentMetricBucketFact[] | null> {
-    return this.ch.agentMetricBucketFacts(sinceMs, untilMs, bucketCount, monitoredOnly, excludedEventIds);
+    return this.ch.agentMetricBucketFacts(
+      sinceMs,
+      untilMs,
+      bucketCount,
+      monitoredOnly,
+      excludedEventIds,
+      hydrateRepresentatives,
+    );
+  }
+
+  agentObservabilityFact(
+    sinceMs: number,
+    untilMs: number,
+    monitoredOnly: boolean,
+  ): Promise<StoredAgentObservabilityFact | null> {
+    return this.ch.agentObservabilityFact(sinceMs, untilMs, monitoredOnly);
   }
 
   workspaceWindowFacts(
@@ -807,17 +829,19 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   topologyWindowFacts(
     sinceMs: number,
     untilMs: number,
+    monitoredOnly: boolean,
     excludedEventIds: string[] = [],
   ): Promise<StoredTopologyWindowFact[] | null> {
-    return this.ch.topologyWindowFacts(sinceMs, untilMs, excludedEventIds);
+    return this.ch.topologyWindowFacts(sinceMs, untilMs, monitoredOnly, excludedEventIds);
   }
 
   topologyWindowBucketFacts(
     sinceMs: number,
     endExclusiveMs: number,
     bucketMs: number,
+    monitoredOnly: boolean,
   ): Promise<StoredTopologyBucketFact[] | null> {
-    return this.ch.topologyWindowBucketFacts(sinceMs, endExclusiveMs, bucketMs);
+    return this.ch.topologyWindowBucketFacts(sinceMs, endExclusiveMs, bucketMs, monitoredOnly);
   }
 
   storedCollectorHeartbeats(sinceMs: number, untilMs: number): Promise<CollectorHeartbeatRecord[] | null> {
@@ -1392,9 +1416,9 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     for (const fact of keep) this.processLifecycleById.set(fact.factId, fact);
   }
 
-  commitPreparedBatch(
+  async commitPreparedBatch(
     prepared: readonly Extract<PreparedJudgeAcceptOutcome, { disposition: 'retained' }>[],
-  ): void {
+  ): Promise<void> {
     for (const item of prepared) {
       const current = this.storeById.get(item.event.eventId);
       const currentRevision = Math.max(1, Math.trunc(current?.decisionRevision ?? 1));
@@ -1403,7 +1427,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       // duplicate pending revision's receipt timestamp: doing so can make a valid result look older
       // than the replay even though that result belongs to the same evaluation.
       if (current && currentRevision === incomingRevision) continue;
-      this.upsertMemory(item.event, item.notify);
+      await this.upsertDurableMemory(item.event, item.notify);
     }
   }
 
@@ -1453,7 +1477,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
           { code: 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL', retrySafe: true as const },
         );
       }
-      this.upsertMemory(event, prepared.notify);
+      if (durability === 'durable') await this.upsertDurableMemory(event, prepared.notify);
+      else this.upsertMemory(event, prepared.notify);
       return {
         disposition: 'retained',
         event,
@@ -1656,7 +1681,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       };
     }
     await this.persistDecisionRevision(next);
-    this.upsertMemory(next, !awaitingL3 && result.status === 'succeeded');
+    await this.upsertDurableMemory(next, !awaitingL3 && result.status === 'succeeded');
     this.alerting.observeJudgmentResult(result);
   }
 
@@ -1790,12 +1815,109 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const effective = current ?? rec;
     // Replaying a durably committed batch may carry a newer receipt timestamp for the same immutable
     // revision. Refresh the cache, but do not recreate incidents or alerts for that duplicate.
-    if (notify && advancesRevision) {
-      const incident = this.ingestIncident(effective);
-      this.alerting.observeEvent(effective, incident?.incidentId);
-      if (incident) this.alerting.observeIncident(incident);
-    }
+    if (notify && advancesRevision) this.applyBusinessEffects(effective);
     return effective;
+  }
+
+  private applyBusinessEffects(event: JudgedEvent): void {
+    const incident = this.ingestIncident(event);
+    this.alerting.observeEvent(event, incident?.incidentId);
+    if (incident) this.alerting.observeIncident(incident);
+  }
+
+  private idempotencyProtocol(event: JudgedEvent): string {
+    const value = event.attributes.idempotencyProtocolVersion;
+    return typeof value === 'string' ? value.trim() : '';
+  }
+
+  private requiresBusinessEffects(event: JudgedEvent): boolean {
+    return event.verdict !== 'allow' && !isIncompleteToolEvidence(event);
+  }
+
+  private async upsertDurableMemory(rec: JudgedEvent, notify: boolean): Promise<JudgedEvent> {
+    const current = this.storeById.get(rec.eventId);
+    const advancesRevision = !current || Math.max(1, Math.trunc(rec.decisionRevision ?? 1))
+      > Math.max(1, Math.trunc(current.decisionRevision ?? 1));
+    const effective = this.upsertMemory(rec, false);
+    if (!advancesRevision) return effective;
+    if (!notify || !this.requiresBusinessEffects(effective)) return effective;
+    if (this.idempotencyProtocol(effective) !== 'anysentry.idempotency.v1') {
+      this.applyBusinessEffects(effective);
+      return effective;
+    }
+    const previous = this.businessEffectApplyTail;
+    const currentApply = previous
+      .catch(() => undefined)
+      .then(() => this.applyDurableBusinessEffects(effective));
+    this.businessEffectApplyTail = currentApply.then(() => undefined, () => undefined);
+    await currentApply;
+    return effective;
+  }
+
+  private async applyDurableBusinessEffects(effective: JudgedEvent): Promise<void> {
+    const revision = Math.max(1, Math.trunc(effective.decisionRevision ?? 1));
+    const sourceScope = effective.sourceId?.trim() || effective.source;
+    const effectKey = `incident-alert:${sourceScope}:${effective.eventId}:${revision}`;
+    const identity = eventRevisionIdentity(effective);
+    const lease = await this.relational.acquireBusinessEffect(
+      effectKey,
+      'incident-alert',
+      identity.fingerprint,
+      {
+        sourceId: sourceScope,
+        eventId: effective.eventId,
+        decisionRevision: revision,
+        verdict: effective.verdict,
+        severity: effective.severity,
+        eventKind: effective.eventKind,
+        tier: effective.tier,
+        writerId: typeof effective.attributes.writerId === 'string' ? effective.attributes.writerId : undefined,
+        writerVersion: typeof effective.attributes.writerVersion === 'string' ? effective.attributes.writerVersion : undefined,
+        idempotencyProtocolVersion: this.idempotencyProtocol(effective),
+      },
+    );
+    if (lease.status === 'duplicate') return;
+    if (lease.status === 'busy') {
+      throw new Error(`Business effect is still pending for ${identity.logicalKey}`);
+    }
+    if (lease.status === 'conflict') {
+      throw new Error(
+        `Business effect Revision conflict for ${identity.logicalKey}; accepted fingerprint `
+        + `${lease.acceptedFingerprint}`,
+      );
+    }
+    if (lease.status === 'unavailable') {
+      throw new Error(`Business effect ledger unavailable for ${identity.logicalKey}`);
+    }
+
+    const incidentId = this.incidentId(effective);
+    const previousIncident = this.incidents.get(incidentId);
+    const incident = this.ingestIncident(effective, false);
+    let alertMutation: DurableAlertMutation;
+    try {
+      alertMutation = this.alerting.prepareDurableBusinessEffects(effective, incident);
+    } catch (error) {
+      if (incident && this.incidents.get(incident.incidentId) === incident) {
+        if (previousIncident) this.incidents.set(incident.incidentId, previousIncident);
+        else this.incidents.delete(incident.incidentId);
+      }
+      throw error;
+    }
+    const committed = await this.relational.commitBusinessEffect(
+      effectKey,
+      incident ? [incident] : [],
+      alertMutation.records,
+    );
+    if (!committed) {
+      alertMutation.rollback();
+      if (incident && this.incidents.get(incident.incidentId) === incident) {
+        if (previousIncident) this.incidents.set(incident.incidentId, previousIncident);
+        else this.incidents.delete(incident.incidentId);
+      }
+      throw new Error(`Business effect transaction failed for ${identity.logicalKey}`);
+    }
+    alertMutation.commit();
+    if (incident) void this.ch.saveIncidentState([...this.incidents.values()]);
   }
 
   private normalizeEvent(rec: JudgedEvent): JudgedEvent {
@@ -1819,7 +1941,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     return hashId('inc', [e.workspacePath, canonicalAgentId, e.sessionId, e.traceId, e.runId, e.riskCategory]);
   }
 
-  private ingestIncident(e: JudgedEvent): Incident | null {
+  private ingestIncident(e: JudgedEvent, persist = true): Incident | null {
     if (e.verdict === 'allow' || isIncompleteToolEvidence(e)) return null;
     const canonicalAgentId = e.attribution?.agentScopeId?.trim() || e.agentId;
     const incidentId = this.incidentId(e);
@@ -1872,7 +1994,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
           agentScopeId: e.attribution?.agentScopeId,
         };
     this.incidents.set(incidentId, next);
-    if (this.incidentPersistenceReady) void this.persistIncidentState([next]);
+    if (persist && this.incidentPersistenceReady) void this.persistIncidentState([next]);
     return next;
   }
 

@@ -13,6 +13,8 @@ const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const readline = require('node:readline');
 const { AgentAttributor, readProcStartTime } = require('./observer-agent-attribution');
 const { mergeAttributionClassifications } = require('./observer-attribution-merge');
@@ -25,6 +27,7 @@ const {
 } = require('./observer-agent-runtime-signatures');
 const { DockerDiscovery } = require('./observer-docker-discovery');
 const { BehavioralAgentDetector } = require('./observer-behavior-discovery');
+const { DurableSpool, safeId, stableWriterId } = require('./observer-durable-spool');
 const { BoundedPriorityQueue } = require('./observer-priority-queue');
 const { ToolExecDeduper } = require('./observer-event-dedup');
 const {
@@ -322,6 +325,28 @@ const SOURCE_NAME = process.env.ANYSENTRY_SOURCE_NAME || '';
 const SOURCE_TYPE = process.env.ANYSENTRY_SOURCE_TYPE || 'observer';
 const SOURCE_TOKEN = process.env.ANYSENTRY_INGEST_TOKEN || sourceCredentials.token || '';
 const WORKSPACE_PATH = process.env.ANYSENTRY_WORKSPACE_PATH || '';
+const WRITER_VERSION = process.env.ANYSENTRY_WRITER_VERSION || 'observer-forwarder/2.0.0';
+const IDEMPOTENCY_PROTOCOL_VERSION =
+  process.env.ANYSENTRY_IDEMPOTENCY_PROTOCOL_VERSION || 'anysentry.idempotency.v1';
+const WRITER_ID = stableWriterId([
+  SOURCE_ID,
+  COLLECTOR_ID,
+  NODE_NAME,
+  SOURCE_TYPE,
+  process.env.A3S_OBSERVER_HOST_ID || '',
+  os.hostname(),
+]);
+const SPOOL_PATH = process.env.FORWARD_SPOOL_PATH ||
+  path.join(os.tmpdir(), 'anysentry-forwarder', safeId(WRITER_ID), 'spool.wal');
+const spool = new DurableSpool({
+  writerId: WRITER_ID,
+  filePath: SPOOL_PATH,
+  dlqPath: process.env.FORWARD_DLQ_PATH,
+  maxRecords: process.env.FORWARD_SPOOL_MAX_RECORDS,
+  maxBytes: process.env.FORWARD_SPOOL_MAX_BYTES,
+  fsyncMode: process.env.FORWARD_SPOOL_FSYNC,
+  fsyncMs: process.env.FORWARD_SPOOL_FSYNC_MS,
+});
 const HEARTBEAT_SECS = Math.max(0, Number(process.env.ANYSENTRY_HEARTBEAT_SECS || 30));
 const heartbeatTarget = new URL(process.env.ANYSENTRY_HEARTBEAT_URL || defaultHeartbeatUrl(target));
 const batchTarget = new URL(process.env.ANYSENTRY_BATCH_INGEST_URL || defaultBatchIngestUrl(target));
@@ -649,6 +674,14 @@ function eventKind(o) {
   return Object.keys(o.event)[0] || '';
 }
 
+function durableRecordKind(body) {
+  try {
+    return eventKind(JSON.parse(String(body?.line || '')));
+  } catch {
+    return '';
+  }
+}
+
 function bumpEventKind(o) {
   const kind = eventKind(o);
   if (!kind || kind === 'CollectorHeartbeat') return;
@@ -664,9 +697,7 @@ function matchesE2eIngestMarkerScope(o) {
 function sourceEventId(line) {
   sourceEventSequence += 1;
   return `ose_${crypto.createHash('sha256')
-    .update(COLLECTOR_ID)
-    .update('\0')
-    .update(NODE_NAME)
+    .update(WRITER_ID)
     .update('\0')
     .update(forwarderInstanceId)
     .update('\0')
@@ -787,6 +818,8 @@ function invalidBatchAck(batchLength, reason) {
     dropped: batchLength,
     errors: 1,
     retryItems: [],
+    acceptedItems: [],
+    rejectedItems: [],
     pipelineCounts: pipelineCount('api_rejected', 'invalid_ack', batchLength),
     reason,
   };
@@ -797,14 +830,20 @@ function eventBatchEnvelope(batch) {
   const canonical = JSON.stringify(events);
   const payloadDigest = crypto.createHash('sha256').update(canonical).digest('hex');
   const batchId = `obat_${crypto.createHash('sha256')
-    .update(COLLECTOR_ID)
-    .update('\0')
-    .update(NODE_NAME)
+    .update(WRITER_ID)
     .update('\0')
     .update(payloadDigest)
     .digest('hex')
     .slice(0, 24)}`;
-  return { batchId, payloadDigest, events };
+  return {
+    schemaVersion: 'anysentry.observer_batch.v2',
+    batchId,
+    payloadDigest,
+    writerId: WRITER_ID,
+    writerVersion: WRITER_VERSION,
+    idempotencyProtocolVersion: IDEMPOTENCY_PROTOCOL_VERSION,
+    events,
+  };
 }
 
 function validateBatchAck(value, batch, envelope = eventBatchEnvelope(batch)) {
@@ -846,6 +885,8 @@ function validateBatchAck(value, batch, envelope = eventBatchEnvelope(batch)) {
   let structuralItems = 0;
   let discardedItems = 0;
   let rejectedItems = 0;
+  const acceptedBatchItems = [];
+  const rejectedBatchItems = [];
   const retryItems = [];
   let sawRetryable = false;
   for (let index = 0; index < items.length; index++) {
@@ -861,6 +902,7 @@ function validateBatchAck(value, batch, envelope = eventBatchEnvelope(batch)) {
         return invalidBatchAck(batchLength, 'batch endpoint retryable items are not a contiguous suffix');
       }
       acceptedItems++;
+      acceptedBatchItems.push(batch[index]);
       if (item.disposition === undefined || item.disposition === 'retained') retainedItems++;
       else if (item.disposition === 'discarded') {
         discardedItems++;
@@ -880,6 +922,7 @@ function validateBatchAck(value, batch, envelope = eventBatchEnvelope(batch)) {
         return invalidBatchAck(batchLength, 'batch endpoint retryable items are not a contiguous suffix');
       }
       rejectedItems++;
+      rejectedBatchItems.push(batch[index]);
     } else {
       return invalidBatchAck(batchLength, 'batch endpoint returned an invalid rejected disposition');
     }
@@ -906,6 +949,8 @@ function validateBatchAck(value, batch, envelope = eventBatchEnvelope(batch)) {
   return {
     dropped: rejectedEvents,
     errors: rejectedEvents > 0 ? 1 : 0,
+    acceptedItems: acceptedBatchItems,
+    rejectedItems: rejectedBatchItems,
     retryItems,
     retryAfterMs: ack.retryAfterMs,
     pipelineCounts: [
@@ -1027,6 +1072,8 @@ function combineBatchOutcomes(left, right, extraErrors = 0) {
   return {
     dropped: left.dropped + right.dropped,
     errors: left.errors + right.errors + extraErrors,
+    acceptedItems: [...(left.acceptedItems ?? []), ...(right.acceptedItems ?? [])],
+    rejectedItems: [...(left.rejectedItems ?? []), ...(right.rejectedItems ?? [])],
     retryItems: [...(left.retryItems ?? []), ...(right.retryItems ?? [])],
     retryAfterMs: Math.max(left.retryAfterMs ?? 0, right.retryAfterMs ?? 0),
     pipelineCounts: [...(left.pipelineCounts ?? []), ...(right.pipelineCounts ?? [])],
@@ -1062,6 +1109,8 @@ function deliverEventBatch(batch, done, absoluteDeadline = 0) {
         done({
           dropped: 1,
           errors: 1,
+          acceptedItems: [],
+          rejectedItems: batch,
           retryItems: [],
           pipelineCounts: pipelineCount('api_rejected', 'payload_too_large', 1),
         });
@@ -1098,6 +1147,8 @@ function deliverEventBatch(batch, done, absoluteDeadline = 0) {
         done({
           dropped: batch.length,
           errors: 1,
+          acceptedItems: [],
+          rejectedItems: batch,
           retryItems: [],
           pipelineCounts: pipelineCount('api_rejected', 'http_rejected', batch.length),
         });
@@ -2142,6 +2193,7 @@ function closeTransports() {
   eventHttpsAgent.destroy();
   controlHttpAgent.destroy();
   controlHttpsAgent.destroy();
+  spool.close();
   if (shutdownForceTimer) clearTimeout(shutdownForceTimer);
   shutdownForceTimer = undefined;
 }
@@ -2307,6 +2359,24 @@ function finishBatch(batch, outcome, retryDelivery) {
   const retryItems = outcome.retryItems ?? [];
   const retrySet = new Set(retryItems);
   const terminalItems = batch.filter((item) => !retrySet.has(item));
+  const acceptedItems = outcome.acceptedItems ?? [];
+  const rejectedItems = outcome.rejectedItems ?? [];
+  if (acceptedItems.length) {
+    spool.ack(acceptedItems.map((item) => item.spoolId).filter(Boolean));
+  }
+  if (rejectedItems.length) {
+    spool.deadLetter(
+      rejectedItems
+        .filter((item) => item.spoolId)
+        .map((item) => ({
+          id: item.spoolId,
+          body: item.body,
+          priority: item.priority,
+          queuedAt: item.createdAt,
+        })),
+      outcome.reason || 'permanent ingest rejection',
+    );
+  }
   if (retryDelivery) {
     const exhausted = Math.min(terminalItems.length, outcome.dropped);
     const recovered = Math.max(0, terminalItems.length - exhausted);
@@ -2421,6 +2491,7 @@ function inputAtCapacity() {
   return (
     outstandingEvents >= MAX_OUTSTANDING_EVENTS
     || outstandingBytes >= MAX_OUTSTANDING_BYTES
+    || spool.atCapacity()
   );
 }
 
@@ -2430,10 +2501,12 @@ function updateInputFlow() {
   else rl.resume();
 }
 
-function enqueue(body, priority, countForwarded = true, kind = '') {
+function enqueue(body, priority, countForwarded = true, kind = '', recovered = false) {
+  const observedAt = Number(body.observedAt) || Date.now();
+  const durableBody = body.observedAt ? body : { ...body, observedAt };
   let bytes;
   try {
-    bytes = Buffer.byteLength(JSON.stringify(body));
+    bytes = Buffer.byteLength(JSON.stringify(durableBody));
   } catch {
     recordQueueDrop(kind, priority, 'serialization_error');
     return;
@@ -2441,6 +2514,25 @@ function enqueue(body, priority, countForwarded = true, kind = '') {
   if (bytes > MAX_EVENT_BYTES) {
     recordQueueDrop(kind, priority, 'event_too_large');
     return;
+  }
+  const spoolId = kind === 'CollectorHeartbeat'
+    ? undefined
+    : String(durableBody.sourceEventId || '');
+  if (spoolId && !recovered) {
+    try {
+      spool.put({
+        id: spoolId,
+        body: durableBody,
+        priority,
+        queuedAt: observedAt,
+      });
+    } catch (error) {
+      recordQueueDrop(kind, priority, 'durable_spool_error');
+      console.error(`[observer-forward] durable spool write failed: ${error.message}`);
+      if (rl) rl.pause();
+      process.exitCode = 1;
+      return;
+    }
   }
   if (!makeQueueRoom(bytes, priority)) {
     recordQueueDrop(
@@ -2451,7 +2543,8 @@ function enqueue(body, priority, countForwarded = true, kind = '') {
     return;
   }
   const item = {
-    body,
+    body: durableBody,
+    spoolId,
     kind,
     priority,
     bytes,
@@ -2911,6 +3004,22 @@ async function start() {
   rl.pause();
   rl.on('line', handleLine);
   rl.on('close', flushAndClose);
+  const recoveredRecords = spool.available(new Set(), MAX_OUTSTANDING_EVENTS);
+  for (const record of recoveredRecords) {
+    enqueue(
+      record.body,
+      record.priority,
+      false,
+      durableRecordKind(record.body),
+      true,
+    );
+  }
+  const spoolStatus = spool.status();
+  console.error(
+    `[observer-forward] durable spool: writer=${WRITER_ID}; path=${spoolStatus.filePath}; `
+    + `recovered=${spoolStatus.records}; bytes=${spoolStatus.logicalBytes}; `
+    + `fsync=${spoolStatus.fsyncMode}`,
+  );
 
   // The central catalog is the authoritative definition source. ConfigMap signatures and
   // deployment environment values above remain a bounded bootstrap/LKG path only; wait for one

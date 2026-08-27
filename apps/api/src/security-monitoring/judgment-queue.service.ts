@@ -14,7 +14,10 @@ const DEFAULT_JOB_OPTIONS: JobsOptions = {
   removeOnFail: { age: 7 * 24 * 60 * 60, count: 20_000 },
 };
 
-export function decisionResultWorkerConcurrency(value = process.env.ANYSENTRY_DECISION_RESULT_CONCURRENCY): number {
+export function decisionResultWorkerConcurrency(
+  value = process.env.ANYSENTRY_RESULT_APPLY_CONCURRENCY
+    ?? process.env.ANYSENTRY_DECISION_RESULT_CONCURRENCY,
+): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return 64;
   return Math.max(8, Math.min(128, Math.trunc(parsed)));

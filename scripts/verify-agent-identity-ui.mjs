@@ -52,13 +52,16 @@ assert.match(monitoring, /if \(event\.agentAssetId\) qs\.set\("agentAssetId", ev
 assert.match(monitoring, /if \(event\.workspacePath\) qs\.set\("workspacePath", event\.workspacePath\)/u);
 assert.match(monitoring, /if \(event\.runId\) qs\.set\("runId", event\.runId\)/u);
 assert.match(monitoring, /详情 →/u);
-assert.match(monitoring, /title="智能体风险概览"/u);
-assert.match(monitoring, /label: "智能体资产"/u);
-assert.match(monitoring, /label: "时间窗分析"/u);
-assert.match(monitoring, /\{t\(item\.label\)\}/u);
+assert.match(monitoring, /title=\{assetsOnly \? "Agent 列表" : "智能体风险概览"\}/u);
+assert.match(monitoring, /label: t\("Agent 列表"\)/u);
+assert.match(monitoring, /label: t\("Flink 风险画像"\)/u);
+assert.match(monitoring, /\{item\.label\}/u);
 assert.match(monitoring, /const \[visibleAgentCount, setVisibleAgentCount\] = useState\(8\)/u);
 assert.match(monitoring, /<AgentOverviewCard key=\{agentRuntimeSelectionKey\(agent\)\}/u);
-assert.match(monitoring, /securityCenterApi\.agentInventory\(\{ \.\.\.filter, limit: 32 \}\)/u);
+assert.match(
+  monitoring,
+  /securityCenterApi\.agentInventory\(\{[\s\S]{0,120}\.\.\.cycleFilter,[\s\S]{0,120}limit: activeView === "agentInstances" \? 500 : 32/u,
+);
 assert.match(monitoring, /function AgentRiskOverviewPanel/u);
 assert.match(monitoring, /groupCompositeIncidents/u);
 assert.match(monitoring, /productionCompositeIncidents/u);

@@ -1,4 +1,4 @@
-import { useRequest } from "ahooks";
+import { useQuery } from "@tanstack/react-query";
 import { formatSecurityDateTime } from "@/lib/date-time";
 import {
   Activity,
@@ -33,6 +33,7 @@ import {
 import { useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import { AdaptiveVirtualList } from "@/components/performance/adaptive-virtual-list";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -645,11 +646,18 @@ export default function AlertsPage() {
     limit: 200,
   }), [kind, queryText, routeAgentId, routeCollectorId, routeEventId, routeIncidentId, routeIssueId, routeObjectiveId, routeSourceId, routeTaskId, routeWorkspacePath, scope, selectedAlertId, severity, status, timeMode, timeType]);
 
-  const { data, loading, refresh } = useRequest(() => securityCenterApi.alerts(query), {
-    refreshDeps: [query],
-    pollingInterval: 10000,
-    pollingWhenHidden: false,
+  const {
+    data,
+    isFetching: loading,
+    refetch,
+  } = useQuery({
+    queryKey: ["alerts", query],
+    queryFn: ({ signal }) => securityCenterApi.alerts(query, signal),
+    staleTime: 5_000,
+    refetchInterval: 10_000,
+    refetchIntervalInBackground: false,
   });
+  const refresh = async () => { await refetch(); };
 
   const selectedAlert = useMemo(() => {
     if (!selectedAlertId) return undefined;
@@ -784,7 +792,7 @@ export default function AlertsPage() {
               <BellRing className="size-3.5" />
             </span>
             <span className="min-w-0">
-              <span className="block text-xs font-semibold leading-[1.45]">{t("告警")}</span>
+              <span className="block text-xs font-semibold leading-[1.45]">{t("告警列表")}</span>
               <span className="mt-0.5 block text-[10.5px] leading-4 text-[#818a9c]">{t("活跃告警与处置")}</span>
             </span>
           </div>
@@ -848,7 +856,7 @@ export default function AlertsPage() {
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <Siren className="size-5 shrink-0 text-rose-300" />
-                <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">{t("告警中心")}</h1>
+                <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">{t("告警列表")}</h1>
               </div>
               <p className="mt-0.5 truncate text-xs text-zinc-500">Incident · Agent · L2/L3 · Collector · Source · Governance</p>
             </div>
@@ -937,16 +945,20 @@ export default function AlertsPage() {
               ) : (data?.items?.length ?? 0) === 0 ? (
                 <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">{t("暂无告警")}</div>
               ) : (
-                <div className="max-h-[calc(100vh-300px)] overflow-y-auto">
-                  {data?.items.map((alert) => (
+                <AdaptiveVirtualList
+                  items={data?.items ?? []}
+                  getKey={(alert) => alert.alertId}
+                  estimateSize={74}
+                  threshold={100}
+                  className="max-h-[calc(100vh-300px)] overflow-y-auto"
+                  renderItem={(alert) => (
                     <AlertRow
-                      key={alert.alertId}
                       alert={alert}
                       active={alert.alertId === selectedAlertId}
                       onSelect={() => selectAlert(alert)}
                     />
-                  ))}
-                </div>
+                  )}
+                />
               )}
             </section>
 

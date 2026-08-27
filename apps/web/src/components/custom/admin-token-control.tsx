@@ -1,4 +1,4 @@
-import { useRequest } from "ahooks";
+import { useQuery } from "@tanstack/react-query";
 import { KeyRound, LockKeyhole } from "lucide-react";
 import { useEffect, useId, useState } from "react";
 import { createPortal } from "react-dom";
@@ -24,10 +24,12 @@ export function AdminTokenControl({
   const [saved, setSaved] = useState(false);
   const [navigationPanelPosition, setNavigationPanelPosition] = useState({ left: 228, top: 12 });
   const panelId = useId();
-  const { data: platformHealth } = useRequest(() => securityCenterApi.healthz(), {
-    pollingInterval: 30000,
-    pollingWhenHidden: false,
-    refreshOnWindowFocus: true,
+  const { data: platformHealth } = useQuery({
+    queryKey: ["platform-health"],
+    queryFn: ({ signal }) => securityCenterApi.healthz(signal),
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+    refetchIntervalInBackground: false,
   });
   const enabled = platformHealth?.managementAuth?.enabled;
 

@@ -11,7 +11,12 @@
 
 import { ClickHouseClient, createClient, type ClickHouseSettings } from '@clickhouse/client';
 import { createHash, randomUUID } from 'node:crypto';
-import { agentIdentityKeyForEvent, agentRuntimeInstanceIdForEvent, hasDirectAgentRootEvidence } from './agent-identity';
+import {
+  agentIdentityKeyForEvent,
+  agentRuntimeInstanceIdForEvent,
+  hasDirectAgentRootEvidence,
+  isInternalAgentHelperRootEvent,
+} from './agent-identity';
 import { eventActivityContext, eventActivitySubtype, normalizeActivitySemantics } from './activity-context';
 import { correlationCaptureRollout } from './correlation-rollout';
 import { visibleClassificationSemantics, visibleProcessContext } from './classification-semantics';
@@ -68,6 +73,11 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   captureFlags UInt8 DEFAULT 0,
   capturePolicyVersion UInt64 DEFAULT 0,
   ingestedAt UInt64 DEFAULT at,
+  commitBatchId String DEFAULT '',
+  logicalKeyVersion UInt16 DEFAULT 1,
+  eventLogicalKey String DEFAULT '',
+  payloadFingerprintVersion UInt16 DEFAULT 1,
+  payloadFingerprint String DEFAULT '',
   eventKind LowCardinality(String),
   eventCategory LowCardinality(String),
   activityContext LowCardinality(String) DEFAULT if(eventKind = 'ToolExec', 'agent_action', ''),
@@ -140,8 +150,11 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   agentIdentityKey String DEFAULT '',
   agentInstanceKey String DEFAULT '',
   agentMonitored UInt8 DEFAULT 0,
+  agentSessionKey String DEFAULT '',
+  resolvedWorkspacePath String DEFAULT '',
   agentHasPhysicalIdentity UInt8 DEFAULT 0,
   agentHasRootIdentity UInt8 DEFAULT 0,
+  agentHasInternalHelperRoot UInt8 DEFAULT 0,
   judgment String DEFAULT '{}',
   rawPreview String,
   INDEX idx_event_id eventId TYPE bloom_filter(0.01) GRANULARITY 1,
@@ -186,6 +199,11 @@ const EVENT_ALTERS = [
   'ADD COLUMN IF NOT EXISTS eventId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS sourceEventId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS ingestedAt UInt64 DEFAULT at',
+  'ADD COLUMN IF NOT EXISTS commitBatchId String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS logicalKeyVersion UInt16 DEFAULT 1',
+  'ADD COLUMN IF NOT EXISTS eventLogicalKey String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS payloadFingerprintVersion UInt16 DEFAULT 1',
+  'ADD COLUMN IF NOT EXISTS payloadFingerprint String DEFAULT \'\'',
   "ADD COLUMN IF NOT EXISTS eventAtUnixNs String DEFAULT ''",
   "ADD COLUMN IF NOT EXISTS receivedAtUnixNs String DEFAULT ''",
   'ADD COLUMN IF NOT EXISTS receivedAt UInt64 DEFAULT 0',
@@ -296,6 +314,24 @@ const EVENT_ALTERS = [
     concat(sessionId, ':', agentId)
   )`,
   "ADD COLUMN IF NOT EXISTS agentMonitored UInt8 DEFAULT toUInt8(JSONExtractBool(attribution, 'monitored'))",
+  `ADD COLUMN IF NOT EXISTS agentSessionKey String DEFAULT if(
+    JSONExtractString(attribution, 'agentSessionId') != '',
+    JSONExtractString(attribution, 'agentSessionId'),
+    if(
+      JSONExtractString(attribution, 'agentDisplayName') != '',
+      JSONExtractString(attribution, 'agentDisplayName'),
+      if(JSONExtractString(attribution, 'agentScopeId') != '', JSONExtractString(attribution, 'agentScopeId'), agentId)
+    )
+  )`,
+  `ADD COLUMN IF NOT EXISTS resolvedWorkspacePath String DEFAULT if(
+    JSONExtractString(process, 'cwd') != '',
+    JSONExtractString(process, 'cwd'),
+    if(
+      JSONExtractString(attribution, 'agentScopeId') != '',
+      concat('agent://', JSONExtractString(attribution, 'agentScopeId')),
+      workspacePath
+    )
+  )`,
   `ADD COLUMN IF NOT EXISTS agentHasPhysicalIdentity UInt8 DEFAULT toUInt8(
     JSONExtractString(attribution, 'physicalWorkloadId') != ''
     OR JSONExtractString(attribution, 'agentInstanceId') != ''
@@ -304,6 +340,13 @@ const EVENT_ALTERS = [
   `ADD COLUMN IF NOT EXISTS agentHasRootIdentity UInt8 DEFAULT toUInt8(
     JSONExtractUInt(attribution, 'rootPid') > 0
     AND JSONExtractString(attribution, 'rootStartTime') != ''
+  )`,
+  `ADD COLUMN IF NOT EXISTS agentHasInternalHelperRoot UInt8 DEFAULT toUInt8(
+    (
+      positionCaseInsensitive(attributes, '--codex-run-as-fs-helper') > 0
+      OR positionCaseInsensitive(attributes, 'codex-linux-sandbox') > 0
+    )
+    AND JSONExtractUInt(process, 'pid') = JSONExtractUInt(attribution, 'rootPid')
   )`,
   'ADD COLUMN IF NOT EXISTS judgment String DEFAULT \'{}\'',
   'ADD COLUMN IF NOT EXISTS rawPreview String DEFAULT \'\'',
@@ -396,29 +439,100 @@ TTL ts + INTERVAL 365 DAY`;
 
 // The journal observes inserts from every judge process, so cache invalidation is not limited to
 // this API process's local write queue.
-const EVENT_COMMIT_FACT_TABLE = 'event_commit_facts';
+const EVENT_COMMIT_FACT_TABLE = 'event_commit_facts_v2';
 const EVENT_COMMIT_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_COMMIT_FACT_TABLE} (
   eventId String,
   decisionRevision UInt32,
   eventAt UInt64,
   committedAt UInt64,
+  commitBatchId String,
   sourceId String,
   collectorId String,
   ts DateTime MATERIALIZED toDateTime(intDiv(committedAt, 1000))
 ) ENGINE = MergeTree
-ORDER BY (committedAt, eventId, decisionRevision)
+ORDER BY (committedAt, commitBatchId, eventId, decisionRevision)
 TTL ts + INTERVAL 7 DAY`;
-const EVENT_COMMIT_FACT_MV = 'event_commit_facts_mv';
+const EVENT_COMMIT_FACT_MV = 'event_commit_facts_v2_mv';
 const EVENT_COMMIT_FACT_MV_DDL = `CREATE MATERIALIZED VIEW IF NOT EXISTS ${EVENT_COMMIT_FACT_MV}
 TO ${EVENT_COMMIT_FACT_TABLE}
 AS SELECT
   eventId,
   decisionRevision,
   at AS eventAt,
-  ingestedAt AS committedAt,
+  toUInt64(toUnixTimestamp64Milli(now64(3))) AS committedAt,
+  commitBatchId,
   sourceId,
   collectorId
 FROM ${TABLE}`;
+
+const EVENT_REVISION_CONFLICT_TABLE = 'event_revision_conflicts';
+const EVENT_REVISION_CONFLICT_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_REVISION_CONFLICT_TABLE} (
+  logicalKeyVersion UInt16,
+  eventLogicalKey String,
+  payloadFingerprintVersion UInt16,
+  acceptedFingerprint String,
+  conflictingFingerprint String,
+  eventId String,
+  decisionRevision UInt32,
+  sourceId String,
+  collectorId String,
+  commitBatchId String,
+  observedAt UInt64,
+  payloadPreview String,
+  ts DateTime MATERIALIZED toDateTime(intDiv(observedAt, 1000))
+) ENGINE = MergeTree
+ORDER BY (eventLogicalKey, observedAt, commitBatchId)
+TTL ts + INTERVAL 90 DAY`;
+
+const EVENT_REVISION_IDENTITY_TABLE = 'event_revision_identities';
+const EVENT_REVISION_IDENTITY_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_REVISION_IDENTITY_TABLE} (
+  eventLogicalKey String,
+  payloadFingerprint String,
+  eventId String,
+  decisionRevision UInt32,
+  sourceId String,
+  collectorId String,
+  committedAt UInt64,
+  commitBatchId String,
+  ts DateTime MATERIALIZED toDateTime(intDiv(committedAt, 1000))
+) ENGINE = MergeTree
+ORDER BY (eventLogicalKey, committedAt, commitBatchId)
+TTL ts + INTERVAL 90 DAY`;
+const EVENT_REVISION_IDENTITY_MV = 'event_revision_identities_mv';
+const EVENT_REVISION_IDENTITY_MV_DDL = `CREATE MATERIALIZED VIEW IF NOT EXISTS ${EVENT_REVISION_IDENTITY_MV}
+TO ${EVENT_REVISION_IDENTITY_TABLE}
+AS SELECT
+  eventLogicalKey,
+  payloadFingerprint,
+  eventId,
+  decisionRevision,
+  sourceId,
+  collectorId,
+  toUInt64(toUnixTimestamp64Milli(now64(3))) AS committedAt,
+  commitBatchId
+FROM ${TABLE}
+WHERE eventLogicalKey != '' AND payloadFingerprint != ''`;
+
+const SOURCE_COMMIT_PROGRESS_TABLE = 'source_commit_progress';
+const SOURCE_COMMIT_PROGRESS_DDL = `CREATE TABLE IF NOT EXISTS ${SOURCE_COMMIT_PROGRESS_TABLE} (
+  sourceId String,
+  collectorId String,
+  observedDurableThroughState AggregateFunction(max, UInt64),
+  lastStoreCommittedAtState AggregateFunction(max, UInt64),
+  commitGenerationState AggregateFunction(uniq, UInt64)
+) ENGINE = AggregatingMergeTree
+ORDER BY (sourceId, collectorId)`;
+const SOURCE_COMMIT_PROGRESS_MV = 'source_commit_progress_mv';
+const SOURCE_COMMIT_PROGRESS_MV_DDL = `CREATE MATERIALIZED VIEW IF NOT EXISTS ${SOURCE_COMMIT_PROGRESS_MV}
+TO ${SOURCE_COMMIT_PROGRESS_TABLE}
+AS SELECT
+  sourceId,
+  collectorId,
+  maxState(eventAt) AS observedDurableThroughState,
+  maxState(committedAt) AS lastStoreCommittedAtState,
+  uniqState(cityHash64(eventId, decisionRevision)) AS commitGenerationState
+FROM ${EVENT_COMMIT_FACT_TABLE}
+GROUP BY sourceId, collectorId`;
 
 const TOOL_EVIDENCE_RELATION_TABLE = 'tool_evidence_relations';
 const TOOL_EVIDENCE_RELATION_DDL = `CREATE TABLE IF NOT EXISTS ${TOOL_EVIDENCE_RELATION_TABLE} (
@@ -521,10 +635,14 @@ const DASHBOARD_BUCKET_SNAPSHOT_DDL = `CREATE TABLE IF NOT EXISTS ${DASHBOARD_BU
   bucketStart UInt64,
   bucketMs UInt32,
   snapshotCommittedAt UInt64,
+  snapshotCommitBatchId String DEFAULT '',
   snapshotEventId String,
   snapshotDecisionRevision UInt32,
   snapshotVersion UInt64,
+  snapshotSchemaVersion LowCardinality(String) DEFAULT 'anysentry.dashboard-bucket-snapshot.v2',
+  status LowCardinality(String) DEFAULT 'ready',
   factsJson String,
+  payloadChecksum String DEFAULT '',
   computedAt UInt64,
   ts DateTime MATERIALIZED toDateTime(intDiv(computedAt, 1000))
 ) ENGINE = MergeTree
@@ -532,6 +650,7 @@ ORDER BY (
   bucketMs,
   bucketStart,
   snapshotCommittedAt,
+  snapshotCommitBatchId,
   snapshotEventId,
   snapshotDecisionRevision,
   snapshotVersion
@@ -616,6 +735,11 @@ const MAX_DURABLE_EVENT_SEARCH_ROWS = 10_000;
 
 type Row = Omit<JudgedEvent, 'activityContext' | 'activitySubtype' | 'actionKind' | 'actionTarget' | 'attributes' | 'classificationSemantics' | 'process' | 'attribution' | 'judgment' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview' | 'invocationId' | 'toolCallId' | 'captureSelected' | 'subjectAssetType' | 'assetBindingQuality'> & {
   ingestedAt: number;
+  commitBatchId: string;
+  logicalKeyVersion: number;
+  eventLogicalKey: string;
+  payloadFingerprintVersion: number;
+  payloadFingerprint: string;
   activityContext: string;
   activitySubtype: string;
   actionKind: string;
@@ -627,8 +751,11 @@ type Row = Omit<JudgedEvent, 'activityContext' | 'activitySubtype' | 'actionKind
   agentIdentityKey: string;
   agentInstanceKey: string;
   agentMonitored: number;
+  agentSessionKey: string;
+  resolvedWorkspacePath: string;
   agentHasPhysicalIdentity: number;
   agentHasRootIdentity: number;
+  agentHasInternalHelperRoot: number;
   judgment: string;
   collectorId: string;
   sourceId: string;
@@ -676,6 +803,33 @@ interface EventWriteBatch {
   retryNotBefore: number;
   createdAt: number;
   lastError?: Error;
+}
+
+interface ImmediateWrite {
+  row: Row;
+  eventAt: number;
+  bytes: number;
+  queuedAt: number;
+  resolve: (receipt: EventBatchReceipt) => void;
+  reject: (error: unknown) => void;
+}
+
+export interface EventBatchReceipt {
+  schemaVersion: 'anysentry.event-batch-receipt.v1';
+  batchId: string;
+  result: 'durable_fact' | 'durable_dlq';
+  rowCount: number;
+  byteCount: number;
+  queuedAt: number;
+  flushStartedAt: number;
+  durableAt: number;
+  attempts: number;
+  commitCursor?: EventCommitCursor;
+  conflict?: {
+    eventLogicalKey: string;
+    acceptedFingerprint: string;
+    conflictingFingerprint: string;
+  };
 }
 
 const EVENT_REVISION_DIGEST_CACHE_SIZE = 20_000;
@@ -856,12 +1010,37 @@ async function runClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promis
     await schema.command({ query: AUDIT_FACT_DDL });
     await schema.command({ query: EVENT_COMMIT_FACT_DDL });
     await schema.command({ query: EVENT_COMMIT_FACT_MV_DDL });
+    await schema.command({ query: EVENT_REVISION_CONFLICT_DDL });
+    await schema.command({ query: EVENT_REVISION_IDENTITY_DDL });
+    await schema.command({ query: EVENT_REVISION_IDENTITY_MV_DDL });
+    await schema.command({ query: SOURCE_COMMIT_PROGRESS_DDL });
+    await schema.command({ query: SOURCE_COMMIT_PROGRESS_MV_DDL });
     await schema.command({ query: TOOL_EVIDENCE_RELATION_DDL });
     await schema.command({ query: PROCESS_LIFECYCLE_FACT_DDL });
     await schema.command({
       query: `ALTER TABLE ${PROCESS_LIFECYCLE_FACT_TABLE} ${PROCESS_LIFECYCLE_FACT_ALTERS.join(', ')}`,
     });
     await schema.command({ query: DASHBOARD_BUCKET_SNAPSHOT_DDL });
+    await schema.command({
+      query: `ALTER TABLE ${DASHBOARD_BUCKET_SNAPSHOT_TABLE}
+        ADD COLUMN IF NOT EXISTS snapshotCommitBatchId String DEFAULT ''
+        AFTER snapshotCommittedAt`,
+    });
+    await schema.command({
+      query: `ALTER TABLE ${DASHBOARD_BUCKET_SNAPSHOT_TABLE}
+        ADD COLUMN IF NOT EXISTS snapshotSchemaVersion LowCardinality(String)
+        DEFAULT 'anysentry.dashboard-bucket-snapshot.v2' AFTER snapshotVersion`,
+    });
+    await schema.command({
+      query: `ALTER TABLE ${DASHBOARD_BUCKET_SNAPSHOT_TABLE}
+        ADD COLUMN IF NOT EXISTS status LowCardinality(String) DEFAULT 'ready'
+        AFTER snapshotSchemaVersion`,
+    });
+    await schema.command({
+      query: `ALTER TABLE ${DASHBOARD_BUCKET_SNAPSHOT_TABLE}
+        ADD COLUMN IF NOT EXISTS payloadChecksum String DEFAULT ''
+        AFTER factsJson`,
+    });
 
     // A materialized view does not retroactively populate rows that predate its creation. Read only
     // a bounded recent journal prefix for per-source observed progress. Missing older sources stay
@@ -880,7 +1059,7 @@ async function runClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promis
           FROM (
             SELECT sourceId, collectorId, eventAt, committedAt
             FROM ${EVENT_COMMIT_FACT_TABLE}
-            ORDER BY committedAt DESC, eventId DESC, decisionRevision DESC
+            ORDER BY committedAt DESC, commitBatchId DESC, eventId DESC, decisionRevision DESC
             LIMIT {journalRows:UInt32}
           )
           GROUP BY sourceId, collectorId`,
@@ -919,6 +1098,7 @@ async function runClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promis
 
 export interface EventCommitCursor {
   committedAtMs: number;
+  commitBatchId?: string;
   eventId: string;
   decisionRevision: number;
 }
@@ -994,16 +1174,51 @@ export interface StoredAgentWindowFact {
   sourceCounts: Record<string, number>;
   hasPhysicalIdentity: boolean;
   hasRootIdentity: boolean;
+  hasInternalHelperRoot: boolean;
 }
 
 export interface StoredAgentBucketFact extends StoredAgentWindowFact {
   bucketStartMs: number;
 }
 
+function eligibleAgentRuntimeRows(
+  rows: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  const groupFor = (row: Record<string, unknown>): string => {
+    const instances = Array.isArray(row.instanceKeys)
+      ? row.instanceKeys.map(String).filter(Boolean)
+      : [String(row.instanceKey ?? '')].filter(Boolean);
+    return instances.length
+      ? `instance\u0000${instances.join('\u0001')}`
+      : `identity\u0000${String(row.identityKey ?? '')}`;
+  };
+  const evidenceByRuntime = new Map<
+    string,
+    { physical: boolean; root: boolean; helper: boolean }
+  >();
+  for (const row of rows) {
+    const key = groupFor(row);
+    const evidence = evidenceByRuntime.get(key) ?? {
+      physical: false,
+      root: false,
+      helper: false,
+    };
+    evidence.physical ||= Boolean(Number(row.hasPhysicalIdentity) || 0);
+    evidence.root ||= Boolean(Number(row.hasRootIdentity) || 0);
+    evidence.helper ||= Boolean(Number(row.hasInternalHelperRootFlag) || 0);
+    evidenceByRuntime.set(key, evidence);
+  }
+  return rows.filter((row) => {
+    const evidence = evidenceByRuntime.get(groupFor(row));
+    return Boolean(evidence && (evidence.physical || evidence.root) && !evidence.helper);
+  });
+}
+
 export interface StoredAgentMetricBucketFact {
   bucketIndex: number;
   identityKey: string;
-  representativeEvent: JudgedEvent;
+  agentId?: string;
+  representativeEvent?: JudgedEvent;
   eventCount: number;
   riskyEventCount: number;
   blockedCount: number;
@@ -1022,6 +1237,16 @@ export interface StoredAgentMetricBucketFact {
   latencyTotal: number;
   maxRiskScore: number;
   sessionKeys: string[];
+  recentEventCount: number;
+  recentCommCount: number;
+  recentSessionKeys: string[];
+}
+
+export interface StoredAgentObservabilityFact {
+  eventCount: number;
+  riskyEventCount: number;
+  latencyTotal: number;
+  agentIds: string[];
   recentEventCount: number;
   recentCommCount: number;
   recentSessionKeys: string[];
@@ -1052,7 +1277,11 @@ export interface StoredWorkspaceBucketFact extends StoredWorkspaceWindowFact {
 
 export interface StoredTopologyWindowFact {
   identityKey: string;
+  instanceKey: string;
   representativeEvent: JudgedEvent;
+  hasPhysicalIdentity: boolean;
+  hasRootIdentity: boolean;
+  hasInternalHelperRoot: boolean;
   firstSeenAt: number;
   lastSeenAt: number;
   eventCount: number;
@@ -1122,6 +1351,56 @@ function attrString(attributes: JudgedEvent['attributes'], key: string): string 
   return value == null ? '' : String(value).trim();
 }
 
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .filter((key) => record[key] !== undefined)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+    .join(',')}}`;
+}
+
+/**
+ * Return the durable identity of one immutable Canonical Revision.
+ *
+ * Transport retries may change writer and commit metadata, but they must retain the same
+ * fingerprint. A real semantic change must advance decisionRevision instead of silently replacing
+ * the payload claimed by the existing logical key.
+ */
+export function eventRevisionIdentity(e: JudgedEvent): {
+  logicalKey: string;
+  fingerprint: string;
+} {
+  const sourceId = e.sourceId?.trim() || attrString(e.attributes, 'sourceId');
+  const collectorId = e.collectorId?.trim() || attrString(e.attributes, 'collectorId');
+  const tenantId = attrString(e.attributes, 'tenantId');
+  const revision = Math.max(1, Math.trunc(e.decisionRevision ?? 1));
+  const logicalKey = [
+    tenantId,
+    sourceId || `${e.source}:${collectorId}`,
+    e.eventId,
+    String(revision),
+  ].join('\u0000');
+  const canonicalPayload = { ...e } as Record<string, unknown>;
+  delete canonicalPayload.ingestedAt;
+  delete canonicalPayload.storeCommittedAt;
+  delete canonicalPayload.commitBatchId;
+  delete canonicalPayload.kafkaOffset;
+  delete canonicalPayload.deliveryAttempt;
+  const canonicalAttributes = { ...(e.attributes ?? {}) } as Record<string, unknown>;
+  delete canonicalAttributes.commitRequestBatchId;
+  delete canonicalAttributes.writerId;
+  delete canonicalAttributes.writerVersion;
+  delete canonicalAttributes.idempotencyProtocolVersion;
+  canonicalPayload.attributes = canonicalAttributes;
+  return {
+    logicalKey,
+    fingerprint: createHash('sha256').update(canonicalJson(canonicalPayload)).digest('hex'),
+  };
+}
+
 function toRow(e: JudgedEvent): Row {
   const rawAttribution = e.attribution;
   const correlation = parseTrustedCorrelation(rawAttribution?.correlation);
@@ -1135,6 +1414,7 @@ function toRow(e: JudgedEvent): Row {
   const classificationSemantics = visibleClassificationSemantics(e.classificationSemantics);
   const process = visibleProcessContext(e.process);
   const evidenceIndex = toolEvidenceIndexFields(e);
+  const revisionIdentity = eventRevisionIdentity(e);
   return {
     schemaVersion: e.schemaVersion,
     eventId: e.eventId,
@@ -1153,6 +1433,11 @@ function toRow(e: JudgedEvent): Row {
     captureFlags: e.captureFlags ?? 0,
     capturePolicyVersion: e.capturePolicyVersion ?? 0,
     ingestedAt: Date.now(),
+    commitBatchId: '',
+    logicalKeyVersion: 1,
+    eventLogicalKey: revisionIdentity.logicalKey,
+    payloadFingerprintVersion: 1,
+    payloadFingerprint: revisionIdentity.fingerprint,
     eventKind: e.eventKind,
     eventCategory: e.eventCategory,
     activityContext: eventActivityContext(e) ?? '',
@@ -1220,11 +1505,31 @@ function toRow(e: JudgedEvent): Row {
     agentIdentityKey: agentIdentityKeyForEvent(e),
     agentInstanceKey: agentRuntimeInstanceIdForEvent(e),
     agentMonitored: attribution?.monitored === true ? 1 : 0,
+    agentSessionKey:
+      attribution?.agentSessionId?.trim()
+      || attribution?.agentDisplayName?.trim()
+      || attribution?.agentScopeId?.trim()
+      || e.agentId,
+    resolvedWorkspacePath:
+      process?.cwd?.trim()
+      || (attribution?.agentScopeId?.trim()
+        ? `agent://${attribution.agentScopeId.trim()}`
+        : e.workspacePath),
     agentHasPhysicalIdentity: physical || instance || attribution?.workloadRef?.podUid ? 1 : 0,
     agentHasRootIdentity: attribution?.rootStartTime && hasDirectAgentRootEvidence(e) ? 1 : 0,
+    agentHasInternalHelperRoot: isInternalAgentHelperRootEvent(e) ? 1 : 0,
     judgment: JSON.stringify(e.judgment ?? {}),
     rawPreview: e.rawPreview ?? '',
   };
+}
+
+function prepareCommitBatch(rows: Row[], requestedBatchId?: string): Row[] {
+  const existingBatchId = rows.find((row) => row.commitBatchId)?.commitBatchId;
+  const commitBatchId = existingBatchId || requestedBatchId || randomUUID();
+  for (const row of rows) {
+    if (!row.commitBatchId) row.commitBatchId = commitBatchId;
+  }
+  return rows;
 }
 
 function parseObject<T extends object>(value: unknown): T | undefined {
@@ -1412,6 +1717,21 @@ export class ClickHouseStore {
   private connectInFlight?: Promise<boolean>;
   private flushInFlight?: Promise<void>;
   private immediateWritesInFlight = 0;
+  private immediateWriteQueue: ImmediateWrite[] = [];
+  private immediateWriteQueueBytes = 0;
+  private immediateWriteTimer?: NodeJS.Timeout;
+  private immediateWriteInFlight?: Promise<void>;
+  private readonly immediateWriteEventTimes = new Map<number, number>();
+  private readonly eventWriteReceiptStats = {
+    batches: 0,
+    rows: 0,
+    bytes: 0,
+    retries: 0,
+    failures: 0,
+    conflicts: 0,
+    backpressureRejects: 0,
+    lastDurableAt: undefined as number | undefined,
+  };
   /** ReplacingMergeTree versions must remain distinct across rapid consecutive S8 snapshots. */
   private unknownLearningStateVersion = 0;
   private ready = false;
@@ -1490,6 +1810,72 @@ export class ClickHouseStore {
       schemaVersion: 'anysentry.dashboard-bucket-snapshots.v1' as const,
       enabled: process.env.ANYSENTRY_PERSISTED_DASHBOARD_BUCKETS !== 'off',
       ...this.dashboardSnapshotStats,
+    };
+  }
+
+  private eventMicrobatchEnabled(): boolean {
+    return process.env.ANYSENTRY_CLICKHOUSE_MICROBATCH === 'on';
+  }
+
+  private eventBatchMaxRows(): number {
+    return boundedPositiveInt(
+      process.env.ANYSENTRY_CLICKHOUSE_BATCH_MAX_ROWS,
+      this.eventMicrobatchEnabled() ? 1_000 : EVENT_WRITE_BATCH_ROWS,
+      1,
+      10_000,
+    );
+  }
+
+  private eventBatchMaxDelayMs(): number {
+    return boundedPositiveInt(
+      process.env.ANYSENTRY_CLICKHOUSE_BATCH_MAX_DELAY_MS,
+      this.eventMicrobatchEnabled() ? 1_000 : 10,
+      1,
+      10_000,
+    );
+  }
+
+  private eventBatchMaxBytes(): number {
+    return boundedPositiveInt(
+      process.env.ANYSENTRY_CLICKHOUSE_BATCH_MAX_BYTES,
+      1024 * 1024,
+      16 * 1024,
+      16 * 1024 * 1024,
+    );
+  }
+
+  eventWriteBatchStatus() {
+    const head = this.eventWriteBatches[0];
+    const receiptHead = this.immediateWriteQueue[0];
+    return {
+      schemaVersion: 'anysentry.event-write-batch.v1' as const,
+      enabled: this.eventMicrobatchEnabled(),
+      revisionImmutabilityEnforced:
+        process.env.ANYSENTRY_REVISION_IMMUTABILITY === 'enforce',
+      maxRows: this.eventBatchMaxRows(),
+      maxDelayMs: this.eventBatchMaxDelayMs(),
+      maxBytes: this.eventBatchMaxBytes(),
+      maxBufferedRows: EVENT_WRITE_MAX_BUFFERED_ROWS,
+      maxBufferedBytes: EVENT_WRITE_MAX_BUFFERED_BYTES,
+      queuedRows: this.eventWriteRows + this.immediateWriteQueue.length,
+      queuedBytes: this.eventWriteBytes + this.immediateWriteQueueBytes,
+      bufferedRows: this.buf.length,
+      sealedBatches: this.eventWriteBatches.length,
+      pendingReceipts: [...this.immediateWriteEventTimes.values()]
+        .reduce((sum, count) => sum + count, 0),
+      oldestQueuedMs: head || receiptHead
+        ? Math.max(
+            0,
+            this.eventWriteNow() - Math.min(
+              head?.createdAt ?? Number.POSITIVE_INFINITY,
+              receiptHead?.queuedAt ?? Number.POSITIVE_INFINITY,
+            ),
+          )
+        : 0,
+      inFlight: Boolean(this.eventWriteDrainInFlight || this.immediateWriteInFlight),
+      retrying: Boolean(head?.lastError),
+      permanentError: this.eventWritePermanentError?.message,
+      ...this.eventWriteReceiptStats,
     };
   }
 
@@ -1651,6 +2037,333 @@ export class ClickHouseStore {
     return this.insertManyNow([e], idempotencyKey);
   }
 
+  /**
+   * Persist one immutable Revision through the configurable receipt microbatch lane.
+   *
+   * This is used by durability-aware producers that need a stable commit batch receipt rather
+   * than the void compatibility contract of insertNow/insertManyNow.
+   */
+  async insertNowWithReceipt(e: JudgedEvent): Promise<EventBatchReceipt> {
+    if (!this.client || !this.ready || this.closed || this.closing) {
+      throw new Error('ClickHouse is not ready');
+    }
+    const row = toRow(e);
+    const bytes = Buffer.byteLength(JSON.stringify(row), 'utf8') + 1;
+    const maxQueuedRows = boundedPositiveInt(
+      process.env.ANYSENTRY_CLICKHOUSE_MAX_QUEUED_ROWS,
+      20_000,
+      100,
+      1_000_000,
+    );
+    const maxQueuedBytes = boundedPositiveInt(
+      process.env.ANYSENTRY_CLICKHOUSE_MAX_QUEUED_BYTES,
+      64 * 1024 * 1024,
+      1024 * 1024,
+      1024 * 1024 * 1024,
+    );
+    if (
+      this.immediateWriteQueue.length >= maxQueuedRows
+      || this.immediateWriteQueueBytes + bytes > maxQueuedBytes
+    ) {
+      this.eventWriteReceiptStats.backpressureRejects += 1;
+      throw new Error(
+        `ClickHouse event queue is full (${this.immediateWriteQueue.length} rows, `
+        + `${this.immediateWriteQueueBytes} bytes)`,
+      );
+    }
+    this.immediateWriteEventTimes.set(
+      e.at,
+      (this.immediateWriteEventTimes.get(e.at) ?? 0) + 1,
+    );
+    return new Promise<EventBatchReceipt>((resolve, reject) => {
+      this.immediateWriteQueue.push({
+        row,
+        eventAt: e.at,
+        bytes,
+        queuedAt: Date.now(),
+        resolve,
+        reject,
+      });
+      this.immediateWriteQueueBytes += bytes;
+      if (
+        this.immediateWriteQueue.length >= this.eventBatchMaxRows()
+        || this.immediateWriteQueueBytes >= this.eventBatchMaxBytes()
+      ) {
+        void this.drainImmediateWrites();
+        return;
+      }
+      this.scheduleImmediateWriteDrain();
+    });
+  }
+
+  private scheduleImmediateWriteDrain(): void {
+    if (
+      this.immediateWriteTimer
+      || this.immediateWriteInFlight
+      || !this.immediateWriteQueue.length
+      || this.closing
+    ) return;
+    const oldest = this.immediateWriteQueue[0]?.queuedAt ?? Date.now();
+    const waitMs = Math.max(
+      0,
+      this.eventBatchMaxDelayMs() - Math.max(0, Date.now() - oldest),
+    );
+    this.immediateWriteTimer = setTimeout(() => {
+      this.immediateWriteTimer = undefined;
+      void this.drainImmediateWrites();
+    }, waitMs);
+  }
+
+  private drainImmediateWrites(): Promise<void> {
+    if (this.immediateWriteTimer) clearTimeout(this.immediateWriteTimer);
+    this.immediateWriteTimer = undefined;
+    if (this.immediateWriteInFlight) return this.immediateWriteInFlight;
+    if (!this.immediateWriteQueue.length) return Promise.resolve();
+
+    let tracked!: Promise<void>;
+    tracked = this.flushImmediateWrites().finally(() => {
+      if (this.immediateWriteInFlight === tracked) this.immediateWriteInFlight = undefined;
+      if (this.closing && this.immediateWriteQueue.length) {
+        void this.drainImmediateWrites();
+      } else if (
+        this.immediateWriteQueue.length >= this.eventBatchMaxRows()
+        || this.immediateWriteQueueBytes >= this.eventBatchMaxBytes()
+      ) {
+        void this.drainImmediateWrites();
+      } else {
+        this.scheduleImmediateWriteDrain();
+      }
+    });
+    this.immediateWriteInFlight = tracked;
+    return tracked;
+  }
+
+  private async existingRevisionFingerprints(
+    logicalKeys: string[],
+  ): Promise<Map<string, string>> {
+    if (!this.client || this.closed || !logicalKeys.length) return new Map();
+    const result = await this.client.query({
+      query: `
+        SELECT
+          eventLogicalKey,
+          argMin(payloadFingerprint, tuple(committedAt, commitBatchId)) AS acceptedFingerprint
+        FROM ${EVENT_REVISION_IDENTITY_TABLE}
+        WHERE eventLogicalKey IN {logicalKeys:Array(String)}
+        GROUP BY eventLogicalKey`,
+      query_params: { logicalKeys: [...new Set(logicalKeys)] },
+      format: 'JSONEachRow',
+    });
+    const rows = await result.json() as Array<{
+      eventLogicalKey?: string;
+      acceptedFingerprint?: string;
+    }>;
+    return new Map(rows.flatMap((entry) => {
+      const key = entry.eventLogicalKey?.trim();
+      const fingerprint = entry.acceptedFingerprint?.trim();
+      return key && fingerprint ? [[key, fingerprint] as const] : [];
+    }));
+  }
+
+  private async flushImmediateWrites(): Promise<void> {
+    if (!this.immediateWriteQueue.length) return;
+    const batch: ImmediateWrite[] = [];
+    let batchBytes = 0;
+    const maxRows = this.eventBatchMaxRows();
+    const maxBytes = this.eventBatchMaxBytes();
+    while (this.immediateWriteQueue.length && batch.length < maxRows) {
+      const next = this.immediateWriteQueue[0];
+      if (batch.length && batchBytes + next.bytes > maxBytes) break;
+      batch.push(this.immediateWriteQueue.shift()!);
+      batchBytes += next.bytes;
+      this.immediateWriteQueueBytes = Math.max(
+        0,
+        this.immediateWriteQueueBytes - next.bytes,
+      );
+    }
+
+    const enforceRevisionImmutability =
+      process.env.ANYSENTRY_REVISION_IMMUTABILITY === 'enforce';
+    let existingFingerprints = new Map<string, string>();
+    if (enforceRevisionImmutability) {
+      try {
+        existingFingerprints = await this.existingRevisionFingerprints(
+          batch.map((entry) => entry.row.eventLogicalKey),
+        );
+      } catch (error) {
+        this.eventWriteReceiptStats.failures += 1;
+        for (const entry of batch) entry.reject(error);
+        this.finishImmediateWriteAccounting(batch);
+        return;
+      }
+    }
+
+    const factEntries: ImmediateWrite[] = [];
+    const physicalEntries: ImmediateWrite[] = [];
+    const conflictEntries: Array<{
+      entry: ImmediateWrite;
+      acceptedFingerprint: string;
+    }> = [];
+    const firstByLogicalKey = new Map<string, ImmediateWrite>();
+    for (const entry of batch) {
+      if (!enforceRevisionImmutability) {
+        factEntries.push(entry);
+        physicalEntries.push(entry);
+        continue;
+      }
+      const existingFingerprint = existingFingerprints.get(entry.row.eventLogicalKey);
+      if (existingFingerprint) {
+        if (existingFingerprint === entry.row.payloadFingerprint) factEntries.push(entry);
+        else conflictEntries.push({ entry, acceptedFingerprint: existingFingerprint });
+        continue;
+      }
+      const first = firstByLogicalKey.get(entry.row.eventLogicalKey);
+      if (!first) {
+        firstByLogicalKey.set(entry.row.eventLogicalKey, entry);
+        factEntries.push(entry);
+        physicalEntries.push(entry);
+      } else if (first.row.payloadFingerprint === entry.row.payloadFingerprint) {
+        factEntries.push(entry);
+      } else {
+        conflictEntries.push({
+          entry,
+          acceptedFingerprint: first.row.payloadFingerprint,
+        });
+      }
+    }
+
+    const rows = prepareCommitBatch(physicalEntries.map((entry) => entry.row));
+    const batchId = rows[0]?.commitBatchId ?? randomUUID();
+    const flushStartedAt = Date.now();
+    const maxAttempts = boundedPositiveInt(
+      process.env.ANYSENTRY_CLICKHOUSE_BATCH_MAX_ATTEMPTS,
+      5,
+      1,
+      20,
+    );
+    let attempts = 0;
+    let finalError: unknown;
+    while (attempts < maxAttempts) {
+      attempts += 1;
+      try {
+        if (!this.client || this.closed) throw new Error('ClickHouse is not ready');
+        if (conflictEntries.length) {
+          await this.client.insert({
+            table: EVENT_REVISION_CONFLICT_TABLE,
+            values: conflictEntries.map(({ entry, acceptedFingerprint }) => ({
+              logicalKeyVersion: entry.row.logicalKeyVersion,
+              eventLogicalKey: entry.row.eventLogicalKey,
+              payloadFingerprintVersion: entry.row.payloadFingerprintVersion,
+              acceptedFingerprint,
+              conflictingFingerprint: entry.row.payloadFingerprint,
+              eventId: entry.row.eventId,
+              decisionRevision: entry.row.decisionRevision,
+              sourceId: entry.row.sourceId,
+              collectorId: entry.row.collectorId,
+              commitBatchId: batchId,
+              observedAt: Date.now(),
+              payloadPreview: JSON.stringify(entry.row).slice(0, 64 * 1024),
+            })),
+            format: 'JSONEachRow',
+          });
+        }
+        if (rows.length) {
+          await this.client.insert({
+            table: TABLE,
+            values: rows,
+            format: 'JSONEachRow',
+            clickhouse_settings: {
+              insert_deduplicate: 1,
+              insert_deduplication_token: `receipt-${batchId}`,
+            },
+          });
+        }
+        const durableAt = Date.now();
+        if (rows.length) {
+          this.committedThroughMs = Math.max(
+            this.committedThroughMs ?? 0,
+            ...physicalEntries.map((entry) => entry.eventAt),
+          );
+          this.noteCommittedRows(rows);
+        }
+        this.eventWriteReceiptStats.batches += 1;
+        this.eventWriteReceiptStats.rows += rows.length;
+        this.eventWriteReceiptStats.bytes += batchBytes;
+        this.eventWriteReceiptStats.lastDurableAt = durableAt;
+        const commitCursor: EventCommitCursor | undefined = rows.length
+          ? {
+              committedAtMs: durableAt,
+              commitBatchId: batchId,
+              eventId: rows.at(-1)?.eventId ?? '',
+              decisionRevision: rows.at(-1)?.decisionRevision ?? 0,
+            }
+          : undefined;
+        for (const entry of factEntries) {
+          entry.resolve({
+            schemaVersion: 'anysentry.event-batch-receipt.v1',
+            batchId,
+            result: 'durable_fact',
+            rowCount: rows.length,
+            byteCount: batchBytes,
+            queuedAt: entry.queuedAt,
+            flushStartedAt,
+            durableAt,
+            attempts,
+            ...(commitCursor ? { commitCursor } : {}),
+          });
+        }
+        for (const { entry, acceptedFingerprint } of conflictEntries) {
+          entry.resolve({
+            schemaVersion: 'anysentry.event-batch-receipt.v1',
+            batchId,
+            result: 'durable_dlq',
+            rowCount: 0,
+            byteCount: entry.bytes,
+            queuedAt: entry.queuedAt,
+            flushStartedAt,
+            durableAt,
+            attempts,
+            conflict: {
+              eventLogicalKey: entry.row.eventLogicalKey,
+              acceptedFingerprint,
+              conflictingFingerprint: entry.row.payloadFingerprint,
+            },
+          });
+        }
+        this.eventWriteReceiptStats.conflicts += conflictEntries.length;
+        finalError = undefined;
+        break;
+      } catch (error) {
+        finalError = error;
+        if (attempts >= maxAttempts || this.closed) break;
+        this.eventWriteReceiptStats.retries += 1;
+        const baseMs = boundedPositiveInt(
+          process.env.ANYSENTRY_CLICKHOUSE_BATCH_RETRY_BASE_MS,
+          200,
+          10,
+          10_000,
+        );
+        const waitMs = Math.min(5_000, baseMs * 2 ** (attempts - 1));
+        await delay(waitMs + Math.floor(Math.random() * Math.max(1, waitMs / 4)));
+      }
+    }
+    if (finalError !== undefined) {
+      this.eventWriteReceiptStats.failures += 1;
+      for (const entry of batch) entry.reject(finalError);
+    }
+    this.finishImmediateWriteAccounting(batch);
+  }
+
+  private finishImmediateWriteAccounting(batch: ImmediateWrite[]): void {
+    for (const entry of batch) {
+      const remainingAtTime = (this.immediateWriteEventTimes.get(entry.eventAt) ?? 1) - 1;
+      if (remainingAtTime > 0) {
+        this.immediateWriteEventTimes.set(entry.eventAt, remainingAtTime);
+      } else {
+        this.immediateWriteEventTimes.delete(entry.eventAt);
+      }
+    }
+  }
+
   async eventById(eventId: string, eventAt?: number): Promise<JudgedEvent | undefined> {
     const normalized = eventId.trim();
     if (!normalized) return undefined;
@@ -1745,7 +2458,7 @@ export class ClickHouseStore {
       .then(() => this.flushBatch());
     this.flushInFlight = operation;
     try {
-      await operation;
+      await Promise.all([operation, this.drainImmediateWrites()]);
     } finally {
       if (this.flushInFlight === operation) this.flushInFlight = undefined;
     }
@@ -1823,8 +2536,9 @@ export class ClickHouseStore {
     token: string,
     source: EventWriteBatch['source'],
   ): EventWriteBatch {
+    const rows = prepareCommitBatch(queued.map(({ row }) => row), token);
     return {
-      rows: queued.map(({ row }) => row),
+      rows,
       bytes: queued.reduce((sum, row) => sum + row.bytes, 0),
       token,
       settings: {
@@ -1871,6 +2585,11 @@ export class ClickHouseStore {
     // additive query projections leaves all pre-existing keys in their original insertion order.
     const stableRevision = { ...row } as Record<string, unknown>;
     delete stableRevision.ingestedAt;
+    delete stableRevision.commitBatchId;
+    delete stableRevision.logicalKeyVersion;
+    delete stableRevision.eventLogicalKey;
+    delete stableRevision.payloadFingerprintVersion;
+    delete stableRevision.payloadFingerprint;
     delete stableRevision.invocationId;
     delete stableRevision.toolCallId;
     delete stableRevision.processInstanceKey;
@@ -1923,6 +2642,11 @@ export class ClickHouseStore {
     // field remains covered so a real revision conflict is still rejected.
     const {
       ingestedAt: _ingestedAt,
+      commitBatchId: _commitBatchId,
+      logicalKeyVersion: _logicalKeyVersion,
+      eventLogicalKey: _eventLogicalKey,
+      payloadFingerprintVersion: _payloadFingerprintVersion,
+      payloadFingerprint: _payloadFingerprint,
       at: _at,
       decisionUpdatedAt: _decisionUpdatedAt,
       spanId: _spanId,
@@ -2450,19 +3174,23 @@ export class ClickHouseStore {
   ): Promise<EventCommitChanges | null> {
     if (!this.client || !this.ready) return null;
     const safeLimit = Math.max(1, Math.min(100_000, Math.trunc(limit)));
+    const replayMs = boundedPositiveInt(
+      process.env.ANYSENTRY_COMMIT_CURSOR_REPLAY_MS,
+      250,
+      1,
+      5_000,
+    );
+    const replayFrom = Math.max(0, (after?.committedAtMs ?? 0) - replayMs);
     try {
       const result = await this.client.query({
         query: `
-          SELECT eventId, decisionRevision, eventAt, committedAt, sourceId, collectorId
+          SELECT eventId, decisionRevision, eventAt, committedAt, commitBatchId, sourceId, collectorId
           FROM ${EVENT_COMMIT_FACT_TABLE}
-          WHERE tuple(committedAt, eventId, decisionRevision) >
-            tuple({committedAt:UInt64}, {eventId:String}, {decisionRevision:UInt32})
-          ORDER BY committedAt, eventId, decisionRevision
+          PREWHERE committedAt >= {replayFrom:UInt64}
+          ORDER BY committedAt, commitBatchId, eventId, decisionRevision
           LIMIT {limit:UInt32}`,
         query_params: {
-          committedAt: after?.committedAtMs ?? 0,
-          eventId: after?.eventId ?? '',
-          decisionRevision: after?.decisionRevision ?? 0,
+          replayFrom,
           limit: safeLimit + 1,
         },
         format: 'JSONEachRow',
@@ -2473,6 +3201,7 @@ export class ClickHouseStore {
       const changes = selected.map<EventCommitChange>((row) => ({
         cursor: {
           committedAtMs: Number(row.committedAt) || 0,
+          commitBatchId: String(row.commitBatchId ?? ''),
           eventId: String(row.eventId ?? ''),
           decisionRevision: Math.max(1, Number(row.decisionRevision) || 1),
         },
@@ -2480,9 +3209,15 @@ export class ClickHouseStore {
         sourceId: String(row.sourceId ?? '').trim() || undefined,
         collectorId: String(row.collectorId ?? '').trim() || undefined,
       }));
+      const selectedCursor = changes.at(-1)?.cursor;
+      const cursor = selectedCursor && (
+        !after || compareEventCommitCursor(selectedCursor, after) >= 0
+      )
+        ? selectedCursor
+        : after;
       return {
         changes,
-        cursor: changes.at(-1)?.cursor ?? after,
+        cursor,
         hasMore,
       };
     } catch (error) {
@@ -2496,9 +3231,9 @@ export class ClickHouseStore {
     try {
       const result = await this.client.query({
         query: `
-          SELECT committedAt, eventId, decisionRevision
+          SELECT committedAt, commitBatchId, eventId, decisionRevision
           FROM ${EVENT_COMMIT_FACT_TABLE}
-          ORDER BY committedAt DESC, eventId DESC, decisionRevision DESC
+          ORDER BY committedAt DESC, commitBatchId DESC, eventId DESC, decisionRevision DESC
           LIMIT 1`,
         format: 'JSONEachRow',
       });
@@ -2506,6 +3241,7 @@ export class ClickHouseStore {
       if (!row) return { committedAtMs: 0, eventId: '', decisionRevision: 0 };
       return {
         committedAtMs: Number(row.committedAt) || 0,
+        commitBatchId: String(row.commitBatchId ?? ''),
         eventId: String(row.eventId ?? ''),
         decisionRevision: Math.max(1, Number(row.decisionRevision) || 1),
       };
@@ -2545,9 +3281,9 @@ export class ClickHouseStore {
     try {
       const result = await this.client.query({
         query: `
-          SELECT committedAt, eventId, decisionRevision
+          SELECT committedAt, commitBatchId, eventId, decisionRevision
           FROM ${EVENT_COMMIT_FACT_TABLE}
-          ORDER BY committedAt, eventId, decisionRevision
+          ORDER BY committedAt, commitBatchId, eventId, decisionRevision
           LIMIT 1`,
         format: 'JSONEachRow',
       });
@@ -2555,6 +3291,7 @@ export class ClickHouseStore {
       if (!row) return { committedAtMs: 0, eventId: '', decisionRevision: 0 };
       return {
         committedAtMs: Number(row.committedAt) || 0,
+        commitBatchId: String(row.commitBatchId ?? ''),
         eventId: String(row.eventId ?? ''),
         decisionRevision: Math.max(1, Number(row.decisionRevision) || 1),
       };
@@ -2699,8 +3436,13 @@ export class ClickHouseStore {
     tracked = (async () => {
       for (const range of ranges) {
         if (this.closing || !this.ready) return;
-        const before = await this.latestEventCommitCursor();
-        if (!before) return;
+        const before = await this.eventCommitCursorsForBuckets(
+          range.start,
+          range.end,
+          bucketMs,
+        );
+        const beforeGlobal = await this.latestEventCommitCursor();
+        if (!beforeGlobal) return;
         this.dashboardSnapshotStats.exactRanges += 1;
         const rows = await this.queryDashboardAggregateBucketFactsRaw(
           range.start,
@@ -2714,13 +3456,35 @@ export class ClickHouseStore {
           bucketRows.push(row);
           grouped.set(row.bucketStartMs, bucketRows);
         }
-        // The snapshot is fenced by the cursor captured before the query. Commits racing this
-        // build have a later journal cursor, so readers invalidate only their affected buckets.
+        const after = await this.eventCommitCursorsForBuckets(
+          range.start,
+          range.end,
+          bucketMs,
+        );
+        const afterGlobal = await this.latestEventCommitCursor();
+        if (!afterGlobal) return;
+        const stableCursors = new Map<number, EventCommitCursor>();
+        const globalStable = compareEventCommitCursor(beforeGlobal, afterGlobal) === 0;
+        for (let bucket = range.start; bucket < range.end; bucket += bucketMs) {
+          const beforeCursor = before.get(bucket);
+          const afterCursor = after.get(bucket);
+          if (
+            beforeCursor
+            && afterCursor
+            && compareEventCommitCursor(beforeCursor, afterCursor) === 0
+          ) {
+            stableCursors.set(bucket, afterCursor);
+          } else if (!beforeCursor && !afterCursor && globalStable) {
+            stableCursors.set(bucket, afterGlobal);
+          }
+        }
+        // Only buckets whose complete commit cursor stayed stable across the raw aggregation are
+        // published. A concurrent late event leaves that bucket missing for the next warm pass.
         await this.writePersistedDashboardBuckets(
           range.start,
           range.end,
           bucketMs,
-          before,
+          stableCursors,
           grouped,
         );
         // Yield between chunks so ingestion continuations and control-plane HTTP work are not
@@ -2874,24 +3638,33 @@ export class ClickHouseStore {
             bucketMs,
             argMax(
               snapshotCommittedAt,
-              tuple(snapshotCommittedAt, snapshotEventId, snapshotDecisionRevision, snapshotVersion)
+              tuple(snapshotCommittedAt, snapshotCommitBatchId, snapshotEventId, snapshotDecisionRevision, snapshotVersion)
             ) AS latestSnapshotCommittedAt,
             argMax(
+              snapshotCommitBatchId,
+              tuple(snapshotCommittedAt, snapshotCommitBatchId, snapshotEventId, snapshotDecisionRevision, snapshotVersion)
+            ) AS latestSnapshotCommitBatchId,
+            argMax(
               snapshotEventId,
-              tuple(snapshotCommittedAt, snapshotEventId, snapshotDecisionRevision, snapshotVersion)
+              tuple(snapshotCommittedAt, snapshotCommitBatchId, snapshotEventId, snapshotDecisionRevision, snapshotVersion)
             ) AS latestSnapshotEventId,
             argMax(
               snapshotDecisionRevision,
-              tuple(snapshotCommittedAt, snapshotEventId, snapshotDecisionRevision, snapshotVersion)
+              tuple(snapshotCommittedAt, snapshotCommitBatchId, snapshotEventId, snapshotDecisionRevision, snapshotVersion)
             ) AS latestSnapshotDecisionRevision,
             argMax(
               factsJson,
-              tuple(snapshotCommittedAt, snapshotEventId, snapshotDecisionRevision, snapshotVersion)
-            ) AS latestFactsJson
+              tuple(snapshotCommittedAt, snapshotCommitBatchId, snapshotEventId, snapshotDecisionRevision, snapshotVersion)
+            ) AS latestFactsJson,
+            argMax(
+              payloadChecksum,
+              tuple(snapshotCommittedAt, snapshotCommitBatchId, snapshotEventId, snapshotDecisionRevision, snapshotVersion)
+            ) AS latestPayloadChecksum
           FROM ${DASHBOARD_BUCKET_SNAPSHOT_TABLE}
           WHERE bucketMs = {bucketMs:UInt32}
             AND bucketStart >= {start:UInt64}
             AND bucketStart < {end:UInt64}
+            AND status = 'ready'
           GROUP BY bucketStart, bucketMs
           ORDER BY bucketStart`,
         query_params: {
@@ -2905,9 +3678,10 @@ export class ClickHouseStore {
         query: `
           SELECT
             intDiv(eventAt, {bucketMs:UInt64}) * {bucketMs:UInt64} AS bucketStart,
-            argMax(committedAt, tuple(committedAt, eventId, decisionRevision)) AS latestCommittedAt,
-            argMax(eventId, tuple(committedAt, eventId, decisionRevision)) AS latestEventId,
-            argMax(decisionRevision, tuple(committedAt, eventId, decisionRevision)) AS latestDecisionRevision
+            argMax(committedAt, tuple(committedAt, commitBatchId, eventId, decisionRevision)) AS latestCommittedAt,
+            argMax(commitBatchId, tuple(committedAt, commitBatchId, eventId, decisionRevision)) AS latestCommitBatchId,
+            argMax(eventId, tuple(committedAt, commitBatchId, eventId, decisionRevision)) AS latestEventId,
+            argMax(decisionRevision, tuple(committedAt, commitBatchId, eventId, decisionRevision)) AS latestDecisionRevision
           FROM ${EVENT_COMMIT_FACT_TABLE}
           WHERE eventAt >= {start:UInt64} AND eventAt < {end:UInt64}
           GROUP BY bucketStart`,
@@ -2924,13 +3698,23 @@ export class ClickHouseStore {
     const snapshots = (await snapshotResult.json() as Array<Record<string, unknown>>)
       .flatMap<PersistedDashboardBucket>((row) => {
         try {
-          const facts = JSON.parse(String(row.latestFactsJson ?? '[]')) as unknown;
+          const factsJson = String(row.latestFactsJson ?? '[]');
+          const expectedChecksum = String(row.latestPayloadChecksum ?? '');
+          if (
+            expectedChecksum
+            && createHash('sha256').update(factsJson).digest('hex') !== expectedChecksum
+          ) {
+            this.dashboardSnapshotStats.invalidated += 1;
+            return [];
+          }
+          const facts = JSON.parse(factsJson) as unknown;
           if (!Array.isArray(facts)) return [];
           return [{
             bucketStartMs: Number(row.bucketStart) || 0,
             bucketMs: Number(row.bucketMs) || bucketMs,
             cursor: {
               committedAtMs: Number(row.latestSnapshotCommittedAt) || 0,
+              commitBatchId: String(row.latestSnapshotCommitBatchId ?? ''),
               eventId: String(row.latestSnapshotEventId ?? ''),
               decisionRevision: Number(row.latestSnapshotDecisionRevision) || 0,
             },
@@ -2945,6 +3729,7 @@ export class ClickHouseStore {
         bucketStartMs: Number(row.bucketStart) || 0,
         cursor: {
           committedAtMs: Number(row.latestCommittedAt) || 0,
+          commitBatchId: String(row.latestCommitBatchId ?? ''),
           eventId: String(row.latestEventId ?? ''),
           decisionRevision: Number(row.latestDecisionRevision) || 0,
         },
@@ -2960,11 +3745,47 @@ export class ClickHouseStore {
     return valid;
   }
 
+  private async eventCommitCursorsForBuckets(
+    startMs: number,
+    endExclusiveMs: number,
+    bucketMs: number,
+  ): Promise<Map<number, EventCommitCursor>> {
+    if (!this.client || !this.ready || endExclusiveMs <= startMs) return new Map();
+    const result = await this.client.query({
+      query: `
+        SELECT
+          intDiv(eventAt, {bucketMs:UInt64}) * {bucketMs:UInt64} AS bucketStart,
+          argMax(committedAt, tuple(committedAt, commitBatchId, eventId, decisionRevision)) AS latestCommittedAt,
+          argMax(commitBatchId, tuple(committedAt, commitBatchId, eventId, decisionRevision)) AS latestCommitBatchId,
+          argMax(eventId, tuple(committedAt, commitBatchId, eventId, decisionRevision)) AS latestEventId,
+          argMax(decisionRevision, tuple(committedAt, commitBatchId, eventId, decisionRevision)) AS latestDecisionRevision
+        FROM ${EVENT_COMMIT_FACT_TABLE}
+        WHERE eventAt >= {start:UInt64} AND eventAt < {end:UInt64}
+        GROUP BY bucketStart`,
+      query_params: {
+        start: startMs,
+        end: endExclusiveMs,
+        bucketMs,
+      },
+      format: 'JSONEachRow',
+    });
+    const rows = await result.json() as Array<Record<string, unknown>>;
+    return new Map(rows.map((row) => [
+      Number(row.bucketStart) || 0,
+      {
+        committedAtMs: Number(row.latestCommittedAt) || 0,
+        commitBatchId: String(row.latestCommitBatchId ?? ''),
+        eventId: String(row.latestEventId ?? ''),
+        decisionRevision: Number(row.latestDecisionRevision) || 0,
+      },
+    ]));
+  }
+
   private async writePersistedDashboardBuckets(
     startMs: number,
     endExclusiveMs: number,
     bucketMs: number,
-    cursor: EventCommitCursor,
+    cursorsByBucket: Map<number, EventCommitCursor>,
     factsByBucket: Map<number, DashboardAggregateBucketFact[]>,
   ): Promise<void> {
     if (!this.client || !this.ready || endExclusiveMs <= startMs) return;
@@ -2975,24 +3796,36 @@ export class ClickHouseStore {
       bucketStart: number;
       bucketMs: number;
       snapshotCommittedAt: number;
+      snapshotCommitBatchId: string;
       snapshotEventId: string;
       snapshotDecisionRevision: number;
       snapshotVersion: number;
+      snapshotSchemaVersion: string;
+      status: 'ready';
       factsJson: string;
+      payloadChecksum: string;
       computedAt: number;
     }> = [];
     for (let bucket = startMs; bucket < endExclusiveMs; bucket += bucketMs) {
+      const cursor = cursorsByBucket.get(bucket);
+      if (!cursor) continue;
+      const factsJson = JSON.stringify(factsByBucket.get(bucket) ?? []);
       values.push({
         bucketStart: bucket,
         bucketMs,
         snapshotCommittedAt: cursor.committedAtMs,
+        snapshotCommitBatchId: cursor.commitBatchId ?? '',
         snapshotEventId: cursor.eventId,
         snapshotDecisionRevision: cursor.decisionRevision,
         snapshotVersion: baseVersion,
-        factsJson: JSON.stringify(factsByBucket.get(bucket) ?? []),
+        snapshotSchemaVersion: 'anysentry.dashboard-bucket-snapshot.v2',
+        status: 'ready',
+        factsJson,
+        payloadChecksum: createHash('sha256').update(factsJson).digest('hex'),
         computedAt,
       });
     }
+    if (!values.length) return;
     try {
       await this.client.insert({
         table: DASHBOARD_BUCKET_SNAPSHOT_TABLE,
@@ -3773,7 +4606,8 @@ export class ClickHouseStore {
         argMax(agentInstanceKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS instanceKey,
         argMax(agentMonitored, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentMonitored,
         argMax(agentHasPhysicalIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasPhysicalIdentity,
-        argMax(agentHasRootIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasRootIdentity
+        argMax(agentHasRootIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS storedHasRootIdentity,
+        argMax(agentHasInternalHelperRoot, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasInternalHelperRoot
       FROM ${TABLE} AS raw
       WHERE at >= {since:UInt64} AND at <= {until:UInt64}
         AND eventId NOT IN {excludedEventIds:Array(String)}
@@ -3820,7 +4654,11 @@ export class ClickHouseStore {
             countIf(source = 'api') AS apiCount,
             countIf(source = 'synthetic') AS syntheticCount,
             max(hasPhysicalIdentity) AS hasPhysicalIdentity,
-            max(hasRootIdentity) AS hasRootIdentity,
+            maxIf(
+              storedHasRootIdentity,
+              hasInternalHelperRoot = 0 AND eventKind != 'ProcessExit'
+            ) AS hasRootIdentity,
+            max(hasInternalHelperRoot) AS hasInternalHelperRootFlag,
             argMax(eventId, eventAt) AS representativeEventId
           FROM (${latestEvents})
           GROUP BY identityKey, instanceKey`,
@@ -3828,7 +4666,8 @@ export class ClickHouseStore {
         clickhouse_settings: BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS,
         format: 'JSONEachRow',
       });
-      const rows = await result.json() as Array<Record<string, unknown>>;
+      const rawRows = await result.json() as Array<Record<string, unknown>>;
+      const rows = monitoredOnly ? eligibleAgentRuntimeRows(rawRows) : rawRows;
       const representativeIds = rows
         .map((row) => String(row.representativeEventId ?? ''))
         .filter(Boolean);
@@ -3883,6 +4722,7 @@ export class ClickHouseStore {
           },
           hasPhysicalIdentity: Boolean(num(row.hasPhysicalIdentity)),
           hasRootIdentity: Boolean(num(row.hasRootIdentity)),
+          hasInternalHelperRoot: Boolean(num(row.hasInternalHelperRootFlag)),
         }];
       });
     } catch (error) {
@@ -3941,7 +4781,11 @@ export class ClickHouseStore {
             countIf(source = 'api') AS apiCount,
             countIf(source = 'synthetic') AS syntheticCount,
             max(hasPhysicalIdentity) AS hasPhysicalIdentity,
-            max(hasRootIdentity) AS hasRootIdentity,
+            maxIf(
+              storedHasRootIdentity,
+              hasInternalHelperRoot = 0 AND eventKind != 'ProcessExit'
+            ) AS hasRootIdentity,
+            max(hasInternalHelperRoot) AS hasInternalHelperRootFlag,
             argMax(eventId, eventAt) AS representativeEventId
           FROM (
             SELECT
@@ -3964,7 +4808,8 @@ export class ClickHouseStore {
               argMax(agentInstanceKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS instanceKey,
               argMax(agentMonitored, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentMonitored,
               argMax(agentHasPhysicalIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasPhysicalIdentity,
-              argMax(agentHasRootIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasRootIdentity
+              argMax(agentHasRootIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS storedHasRootIdentity,
+              argMax(agentHasInternalHelperRoot, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasInternalHelperRoot
             FROM ${TABLE} AS raw
             WHERE at >= {since:UInt64} AND at < {endExclusive:UInt64}
               ${monitoredClause}
@@ -3980,7 +4825,8 @@ export class ClickHouseStore {
         clickhouse_settings: BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS,
         format: 'JSONEachRow',
       });
-      const rows = await result.json() as Array<Record<string, unknown>>;
+      const rawRows = await result.json() as Array<Record<string, unknown>>;
+      const rows = monitoredOnly ? eligibleAgentRuntimeRows(rawRows) : rawRows;
       const representativeIds = rows
         .map((row) => String(row.representativeEventId ?? ''))
         .filter(Boolean);
@@ -4040,6 +4886,7 @@ export class ClickHouseStore {
           },
           hasPhysicalIdentity: Boolean(num(row.hasPhysicalIdentity)),
           hasRootIdentity: Boolean(num(row.hasRootIdentity)),
+          hasInternalHelperRoot: Boolean(num(row.hasInternalHelperRootFlag)),
         }];
       });
     } catch (error) {
@@ -4059,6 +4906,7 @@ export class ClickHouseStore {
     bucketCount: number,
     monitoredOnly: boolean,
     excludedEventIds: string[] = [],
+    hydrateRepresentatives = true,
   ): Promise<StoredAgentMetricBucketFact[] | null> {
     if (!this.client || !this.ready) return null;
     const buckets = Math.max(1, Math.min(72, Math.round(bucketCount)));
@@ -4071,6 +4919,7 @@ export class ClickHouseStore {
             least({bucketCount:UInt32} - 1, intDiv(eventAt - {since:UInt64}, {bucketMs:UInt64})) AS bucketIndex,
             identityKey,
             instanceKey,
+            argMax(agentId, eventAt) AS agentId,
             count() AS eventCount,
             countIf(verdict != 'allow') AS riskyEventCount,
             countIf(verdict = 'block') AS blockedCount,
@@ -4092,6 +4941,7 @@ export class ClickHouseStore {
             countIf(eventAt > {recentSince:UInt64}) AS recentEventCount,
             countIf(eventAt > {recentSince:UInt64} AND eventKind IN ('Egress', 'Dns')) AS recentCommCount,
             groupUniqArrayIf(sessionId, eventAt > {recentSince:UInt64}) AS recentSessionKeys,
+            max(eventAt) AS representativeEventAt,
             argMax(eventId, eventAt) AS representativeEventId
           FROM (
             SELECT
@@ -4106,6 +4956,7 @@ export class ClickHouseStore {
               argMax(tokenCount, tuple(decisionRevision, decisionUpdatedAt, at)) AS tokenCount,
               argMax(latencyMs, tuple(decisionRevision, decisionUpdatedAt, at)) AS latencyMs,
               argMax(riskScore, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskScore,
+              argMax(agentId, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentId,
               argMax(agentIdentityKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS identityKey,
               argMax(agentInstanceKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS instanceKey,
               argMax(agentMonitored, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentMonitored
@@ -4128,19 +4979,53 @@ export class ClickHouseStore {
         format: 'JSONEachRow',
       });
       const rows = await result.json() as Array<Record<string, unknown>>;
-      const representativeIds = rows
+      const groupFor = (row: Record<string, unknown>): string =>
+        `${String(row.identityKey ?? '')}\u0000${String(row.instanceKey ?? '')}`;
+      const representativeRowByGroup = new Map<string, Record<string, unknown>>();
+      for (const row of rows) {
+        const key = groupFor(row);
+        const current = representativeRowByGroup.get(key);
+        if (
+          !current ||
+          Number(row.representativeEventAt) >= Number(current.representativeEventAt)
+        ) {
+          representativeRowByGroup.set(key, row);
+        }
+      }
+      const representativeRows = hydrateRepresentatives
+        ? [...representativeRowByGroup.values()]
+        : [];
+      const representativeIds = representativeRows
         .map((row) => String(row.representativeEventId ?? ''))
         .filter(Boolean);
-      const representativeEvents = await this.eventsByIds(representativeIds, sinceMs, untilMs);
+      const representativeEventTimes = new Map(
+        representativeRows.map((row) => [
+          String(row.representativeEventId ?? ''),
+          Number(row.representativeEventAt) || 0,
+        ] as const),
+      );
+      const representativeEvents = await this.eventsByIds(
+        representativeIds,
+        sinceMs,
+        untilMs,
+        representativeEventTimes,
+      );
       const byId = new Map(representativeEvents.map((event) => [event.eventId, event]));
+      const representativeEventByGroup = new Map(
+        representativeRows.flatMap((row) => {
+          const event = byId.get(String(row.representativeEventId ?? ''));
+          return event ? [[groupFor(row), event] as const] : [];
+        }),
+      );
       const num = (value: unknown): number => Number(value) || 0;
       return rows.flatMap((row): StoredAgentMetricBucketFact[] => {
-        const representativeEvent = byId.get(String(row.representativeEventId ?? ''));
-        if (!representativeEvent) return [];
+        const representativeEvent = representativeEventByGroup.get(groupFor(row));
+        if (hydrateRepresentatives && !representativeEvent) return [];
         return [{
           bucketIndex: num(row.bucketIndex),
           identityKey: String(row.identityKey ?? ''),
-          representativeEvent,
+          agentId: String(row.agentId ?? ''),
+          ...(representativeEvent ? { representativeEvent } : {}),
           eventCount: num(row.eventCount),
           riskyEventCount: num(row.riskyEventCount),
           blockedCount: num(row.blockedCount),
@@ -4168,6 +5053,81 @@ export class ClickHouseStore {
       });
     } catch (error) {
       console.error('[clickhouse] agent metric bucket query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  /**
+   * Aggregate the overview observability strip in ClickHouse so the API does not hydrate one
+   * representative event for every Agent instance merely to compute global totals.
+   */
+  async agentObservabilityFact(
+    sinceMs: number,
+    untilMs: number,
+    monitoredOnly: boolean,
+  ): Promise<StoredAgentObservabilityFact | null> {
+    if (!this.client || !this.ready) return null;
+    if (untilMs < sinceMs) {
+      return {
+        eventCount: 0,
+        riskyEventCount: 0,
+        latencyTotal: 0,
+        agentIds: [],
+        recentEventCount: 0,
+        recentCommCount: 0,
+        recentSessionKeys: [],
+      };
+    }
+    const monitoredClause = monitoredOnly ? 'AND agentMonitored = 1' : '';
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT
+            count() AS eventCount,
+            countIf(verdict != 'allow') AS riskyEventCount,
+            sum(latencyMs) AS latencyTotal,
+            groupUniqArray(agentId) AS agentIds,
+            countIf(eventAt > {recentSince:UInt64}) AS recentEventCount,
+            countIf(eventAt > {recentSince:UInt64} AND eventKind IN ('Egress', 'Dns')) AS recentCommCount,
+            groupUniqArrayIf(sessionId, eventAt > {recentSince:UInt64}) AS recentSessionKeys
+          FROM (
+            SELECT
+              at AS eventAt,
+              eventKind,
+              sessionId,
+              verdict,
+              latencyMs,
+              agentId,
+              agentMonitored
+            FROM ${TABLE}
+            PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}
+            ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
+            LIMIT 1 BY eventId
+          )
+          WHERE 1 ${monitoredClause}`,
+        query_params: {
+          since: sinceMs,
+          until: untilMs,
+          recentSince: Math.max(sinceMs, untilMs - 60_000),
+        },
+        clickhouse_settings: BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
+        format: 'JSONEachRow',
+      });
+      const row = ((await result.json()) as Array<Record<string, unknown>>)[0] ?? {};
+      const num = (value: unknown): number => Number(value) || 0;
+      return {
+        eventCount: num(row.eventCount),
+        riskyEventCount: num(row.riskyEventCount),
+        latencyTotal: num(row.latencyTotal),
+        agentIds: Array.isArray(row.agentIds) ? row.agentIds.map(String).filter(Boolean) : [],
+        recentEventCount: num(row.recentEventCount),
+        recentCommCount: num(row.recentCommCount),
+        recentSessionKeys: Array.isArray(row.recentSessionKeys)
+          ? row.recentSessionKeys.map(String).filter(Boolean)
+          : [],
+      };
+    } catch (error) {
+      console.error('[clickhouse] agent observability query failed:', (error as Error).message);
       return null;
     }
   }
@@ -4395,14 +5355,23 @@ export class ClickHouseStore {
   async topologyWindowFacts(
     sinceMs: number,
     untilMs: number,
+    monitoredOnly: boolean,
     excludedEventIds: string[] = [],
   ): Promise<StoredTopologyWindowFact[] | null> {
     if (!this.client || !this.ready) return null;
+    const monitoredClause = monitoredOnly ? 'HAVING agentMonitored = 1' : '';
     try {
       const result = await this.client.query({
         query: `
           SELECT
             identityKey,
+            instanceKey,
+            max(hasPhysicalIdentity) AS hasPhysicalIdentity,
+            maxIf(
+              storedHasRootIdentity,
+              hasInternalHelperRoot = 0 AND eventKind != 'ProcessExit'
+            ) AS hasRootIdentity,
+            max(hasInternalHelperRoot) AS hasInternalHelperRootFlag,
             min(eventAt) AS firstSeenAt,
             max(eventAt) AS lastSeenAt,
             count() AS eventCount,
@@ -4429,11 +5398,16 @@ export class ClickHouseStore {
               argMax(riskCategory, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskCategory,
               argMax(riskName, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskName,
               argMax(agentIdentityKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS identityKey,
-              argMax(agentInstanceKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS instanceKey
+              argMax(agentInstanceKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS instanceKey,
+              argMax(agentMonitored, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentMonitored,
+              argMax(agentHasPhysicalIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasPhysicalIdentity,
+              argMax(agentHasRootIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS storedHasRootIdentity,
+              argMax(agentHasInternalHelperRoot, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasInternalHelperRoot
             FROM ${TABLE}
             WHERE at >= {since:UInt64} AND at <= {until:UInt64}
               AND eventId NOT IN {excludedEventIds:Array(String)}
             GROUP BY eventId
+            ${monitoredClause}
           )
           GROUP BY
             identityKey,
@@ -4447,7 +5421,8 @@ export class ClickHouseStore {
         query_params: { since: sinceMs, until: untilMs, excludedEventIds },
         format: 'JSONEachRow',
       });
-      const rows = await result.json() as Array<Record<string, unknown>>;
+      const rawRows = await result.json() as Array<Record<string, unknown>>;
+      const rows = monitoredOnly ? eligibleAgentRuntimeRows(rawRows) : rawRows;
       const representativeIds = rows
         .map((row) => String(row.representativeEventId ?? ''))
         .filter(Boolean);
@@ -4459,7 +5434,11 @@ export class ClickHouseStore {
         if (!representativeEvent) return [];
         return [{
           identityKey: String(row.identityKey ?? ''),
+          instanceKey: String(row.instanceKey ?? ''),
           representativeEvent,
+          hasPhysicalIdentity: Boolean(num(row.hasPhysicalIdentity)),
+          hasRootIdentity: Boolean(num(row.hasRootIdentity)),
+          hasInternalHelperRoot: Boolean(num(row.hasInternalHelperRootFlag)),
           firstSeenAt: num(row.firstSeenAt),
           lastSeenAt: num(row.lastSeenAt),
           eventCount: num(row.eventCount),
@@ -4480,14 +5459,23 @@ export class ClickHouseStore {
     sinceMs: number,
     endExclusiveMs: number,
     bucketMs: number,
+    monitoredOnly: boolean,
   ): Promise<StoredTopologyBucketFact[] | null> {
     if (!this.client || !this.ready) return null;
+    const monitoredClause = monitoredOnly ? 'HAVING agentMonitored = 1' : '';
     try {
       const result = await this.client.query({
         query: `
           SELECT
             intDiv(eventAt, {bucketMs:UInt64}) * {bucketMs:UInt64} AS bucketStartMs,
             identityKey,
+            instanceKey,
+            max(hasPhysicalIdentity) AS hasPhysicalIdentity,
+            maxIf(
+              storedHasRootIdentity,
+              hasInternalHelperRoot = 0 AND eventKind != 'ProcessExit'
+            ) AS hasRootIdentity,
+            max(hasInternalHelperRoot) AS hasInternalHelperRootFlag,
             min(eventAt) AS firstSeenAt,
             max(eventAt) AS lastSeenAt,
             count() AS eventCount,
@@ -4513,10 +5501,15 @@ export class ClickHouseStore {
               argMax(riskCategory, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskCategory,
               argMax(riskName, tuple(decisionRevision, decisionUpdatedAt, at)) AS riskName,
               argMax(agentIdentityKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS identityKey,
-              argMax(agentInstanceKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS instanceKey
+              argMax(agentInstanceKey, tuple(decisionRevision, decisionUpdatedAt, at)) AS instanceKey,
+              argMax(agentMonitored, tuple(decisionRevision, decisionUpdatedAt, at)) AS agentMonitored,
+              argMax(agentHasPhysicalIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasPhysicalIdentity,
+              argMax(agentHasRootIdentity, tuple(decisionRevision, decisionUpdatedAt, at)) AS storedHasRootIdentity,
+              argMax(agentHasInternalHelperRoot, tuple(decisionRevision, decisionUpdatedAt, at)) AS hasInternalHelperRoot
             FROM ${TABLE}
             WHERE at >= {since:UInt64} AND at < {endExclusive:UInt64}
             GROUP BY eventId
+            ${monitoredClause}
           )
           GROUP BY
             bucketStartMs,
@@ -4535,7 +5528,8 @@ export class ClickHouseStore {
         },
         format: 'JSONEachRow',
       });
-      const rows = await result.json() as Array<Record<string, unknown>>;
+      const rawRows = await result.json() as Array<Record<string, unknown>>;
+      const rows = monitoredOnly ? eligibleAgentRuntimeRows(rawRows) : rawRows;
       const representativeIds = rows
         .map((row) => String(row.representativeEventId ?? ''))
         .filter(Boolean);
@@ -4552,7 +5546,11 @@ export class ClickHouseStore {
         return [{
           bucketStartMs: num(row.bucketStartMs),
           identityKey: String(row.identityKey ?? ''),
+          instanceKey: String(row.instanceKey ?? ''),
           representativeEvent,
+          hasPhysicalIdentity: Boolean(num(row.hasPhysicalIdentity)),
+          hasRootIdentity: Boolean(num(row.hasRootIdentity)),
+          hasInternalHelperRoot: Boolean(num(row.hasInternalHelperRootFlag)),
           firstSeenAt: num(row.firstSeenAt),
           lastSeenAt: num(row.lastSeenAt),
           eventCount: num(row.eventCount),
@@ -4568,38 +5566,64 @@ export class ClickHouseStore {
     }
   }
 
-  private async eventsByIds(eventIds: string[], sinceMs?: number, untilMs?: number): Promise<JudgedEvent[]> {
+  private async eventsByIds(
+    eventIds: string[],
+    sinceMs?: number,
+    untilMs?: number,
+    eventAtById?: ReadonlyMap<string, number>,
+  ): Promise<JudgedEvent[]> {
     if (!this.client || eventIds.length === 0) return [];
-    const timeClause = sinceMs === undefined || untilMs === undefined
-      ? ''
-      : 'AND at >= {since:UInt64} AND at <= {until:UInt64}';
-    const result = await this.client.query({
-      query: `
-        SELECT *
-        FROM (
-          SELECT *
-          FROM ${TABLE}
-          WHERE eventId IN {eventIds:Array(String)}
-            ${timeClause}
-          ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
-          LIMIT 1 BY eventId
-        )`,
-      query_params: { eventIds, since: sinceMs ?? 0, until: untilMs ?? Number.MAX_SAFE_INTEGER },
-      format: 'JSONEachRow',
-    });
-    return (await result.json() as Array<Record<string, unknown>>).map(fromRow);
+    const uniqueEventIds = [...new Set(eventIds.filter(Boolean))];
+    const batches: string[][] = [];
+    for (let index = 0; index < uniqueEventIds.length; index += 200) {
+      batches.push(uniqueEventIds.slice(index, index + 200));
+    }
+    const events: JudgedEvent[] = [];
+    for (let index = 0; index < batches.length; index += 2) {
+      const rows = await Promise.all(
+        batches.slice(index, index + 2).map(async (batch) => {
+          const exactEventTimes = eventAtById
+            ? [...new Set(batch.map((eventId) => eventAtById.get(eventId) ?? 0))]
+                .filter((at) => at > 0)
+            : [];
+          const prewhereClause = exactEventTimes.length
+            ? 'PREWHERE at IN {eventTimes:Array(UInt64)}'
+            : sinceMs === undefined || untilMs === undefined
+              ? ''
+              : 'PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}';
+          const result = await this.client!.query({
+            query: `
+              SELECT *
+              FROM (
+                SELECT *
+                FROM ${TABLE}
+                ${prewhereClause}
+                WHERE eventId IN {eventIds:Array(String)}
+                ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
+                LIMIT 1 BY eventId
+              )`,
+            query_params: {
+              eventIds: batch,
+              eventTimes: exactEventTimes,
+              since: sinceMs ?? 0,
+              until: untilMs ?? Number.MAX_SAFE_INTEGER,
+            },
+            clickhouse_settings: BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
+            format: 'JSONEachRow',
+          });
+          return await result.json() as Array<Record<string, unknown>>;
+        }),
+      );
+      events.push(...rows.flat().map(fromRow));
+    }
+    return events;
   }
 
   committedCutoffMs(): number | undefined {
-    // This is an observed durable high-water mark, not an event-time watermark. While a batch is
-    // buffered, retrying, or in flight, omit it. Readers retain an overlap and deduplicate stable
-    // eventId/revision facts because late collector events can still fall below this timestamp.
-    if (
-      this.buf.length > 0 ||
-      this.collectorHeartbeatBuf.length > 0 ||
-      this.flushInFlight ||
-      this.immediateWritesInFlight > 0
-    ) return undefined;
+    // This is only the greatest event time already observed in a successful durable insert, not
+    // an arrival-completeness watermark. Pending or replayed older rows must not move it backwards
+    // and hide newer facts that are already queryable; affected historical buckets are invalidated
+    // by the server-side commit journal when those writes later succeed.
     return this.committedBoundaryComplete ? this.committedThroughMs : undefined;
   }
 
@@ -5316,7 +6340,6 @@ export class ClickHouseStore {
     if (this.closeInFlight) return this.closeInFlight;
     // Change the externally visible state before the first await so a concurrent enqueue cannot
     // slip into the shutdown tail after it was sealed.
-    this.closed = true;
     this.closing = true;
     this.ready = false;
     if (this.flushTimer) clearInterval(this.flushTimer);
@@ -5325,6 +6348,14 @@ export class ClickHouseStore {
     this.reconnectTimer = undefined;
     if (this.eventWriteRetryWakeTimer) clearTimeout(this.eventWriteRetryWakeTimer);
     this.eventWriteRetryWakeTimer = undefined;
+    if (this.immediateWriteTimer) clearTimeout(this.immediateWriteTimer);
+    this.immediateWriteTimer = undefined;
+    this.eventWriteCloseDeadlineMs = boundedPositiveInt(
+      process.env.ANYSENTRY_CLICKHOUSE_SHUTDOWN_FLUSH_MS,
+      EVENT_WRITE_CLOSE_DEADLINE_MS,
+      100,
+      60_000,
+    );
     this.eventWriteClosingDeadline = this.eventWriteNow() + this.eventWriteCloseDeadlineMs;
     this.wakeEventWriteRetrySleep();
     this.sealBufferedEventBatches(true);
@@ -5337,6 +6368,16 @@ export class ClickHouseStore {
     const client = this.client;
     let closeError: Error | undefined;
     try {
+      while (
+        this.immediateWriteQueue.length > 0
+        && this.eventWriteNow() < (this.eventWriteClosingDeadline ?? 0)
+      ) {
+        try {
+          await this.drainImmediateWrites();
+        } catch {
+          break;
+        }
+      }
       while (
         this.eventWriteBatches.length > 0 &&
         !this.eventWritePermanentError &&
@@ -5369,6 +6410,7 @@ export class ClickHouseStore {
         });
       }
     } finally {
+      this.closed = true;
       this.eventWriteAbortController?.abort('ClickHouse event writer is closing');
       this.wakeEventWriteRetrySleep();
       for (const batch of this.eventWriteBatches) {
@@ -5376,6 +6418,11 @@ export class ClickHouseStore {
           waiter.reject(closeError ?? new Error('ClickHouse event writer closed before the direct write completed'));
         }
       }
+      const receiptShutdownError =
+        closeError ?? new Error('ClickHouse store closed before event receipt became durable');
+      for (const entry of this.immediateWriteQueue.splice(0)) entry.reject(receiptShutdownError);
+      this.immediateWriteQueueBytes = 0;
+      this.immediateWriteEventTimes.clear();
       // A periodic flush may already own the heartbeat side buffer. Let it finish first, then
       // persist any tail accepted after its snapshot before closing the shared client.
       await this.flushInFlight?.catch((error) => {

@@ -1,7 +1,6 @@
 import { useRequest } from "ahooks";
 import { formatSecurityDateTime, liveSecuritySnapshotAsOf, securityTimestampValue } from "@/lib/date-time";
 import {
-  ArrowLeft,
   Bot,
   BrainCircuit,
   Clock3,
@@ -823,7 +822,7 @@ export default function TopologyPage() {
     searchParams.get("eventScope") === "raw" ? "raw" : "agent",
   );
   const timeType = consoleTimeFilter.timeType ?? "last_3h";
-  const [scope, setScope] = useState<"all" | "risk">((searchParams.get("scope") as "all" | "risk") || "risk");
+  const [scope, setScope] = useState<"all" | "risk">((searchParams.get("scope") as "all" | "risk") || "all");
   const [queryText, setQueryText] = useState(searchParams.get("q") ?? "");
   const [selectedEdgeId, setSelectedEdgeId] = useState(searchParams.get("edgeId") ?? "");
   const [selectedAgentNodeId, setSelectedAgentNodeId] = useState("");
@@ -950,7 +949,7 @@ export default function TopologyPage() {
   };
 
   const clearFilters = () => {
-    setScope("risk");
+    setScope("all");
     setQueryText("");
     setSelectedAgentNodeId("");
     setSelectedEdgeId("");
@@ -962,12 +961,6 @@ export default function TopologyPage() {
       <header className="shrink-0 border-b border-white/10 bg-[#0b0f0c] px-4 py-3">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex min-w-0 items-center gap-3">
-            <Button asChild variant="secondary" size="sm" className="h-9 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
-              <Link to="/">
-                <ArrowLeft className="size-3.5" />
-                返回
-              </Link>
-            </Button>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <GitBranch className="size-5 shrink-0 text-teal-300" />

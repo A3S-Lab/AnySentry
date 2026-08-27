@@ -45,7 +45,7 @@ assert.deepEqual(
 const aggregation = await read(
   'apps/api/src/security-monitoring/aggregation.service.ts',
 );
-assert.match(aggregation, /new BoundedHistoryQueryGate\(2\)/);
+assert.match(aggregation, /new BoundedHistoryQueryGate\(4\)/);
 assert.equal(
   [...aggregation.matchAll(/const slices = reusableFactSlices\(/g)].length,
   3,

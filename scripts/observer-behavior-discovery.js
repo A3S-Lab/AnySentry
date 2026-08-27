@@ -21,6 +21,16 @@ const DEFAULT_SERVICE_DATA_PATHS = [
   '/var/lib/postgresql/',
   '/var/lib/mysql/',
   '/var/lib/redis/',
+  '/var/lib/kafka/',
+  '/bitnami/kafka/',
+  '/opt/kafka/',
+  '/opt/apache-doris/',
+];
+
+const DEFAULT_INFRASTRUCTURE_NAME_PATTERNS = [
+  /(?:^|[-_.:/])(?:kafka|clickhouse|doris(?:-fe|-be)?|postgres(?:ql)?|redis|mysql|mariadb|zookeeper)(?:[-_.:/]|$)/i,
+  /(?:^|[-_.:/])flink(?:-jobmanager|-taskmanager)?(?:[-_.:/]|$)/i,
+  /(?:^|[-_.:/])ai-apm(?:[-_.:/]|$)/i,
 ];
 
 function text(value) {
@@ -156,6 +166,22 @@ function workloadDisplayName(ref) {
   );
 }
 
+function isKnownInfrastructureWorkload(ref, attribution) {
+  const values = [
+    attribution?.physicalWorkloadId,
+    ref?.name,
+    ref?.podName,
+    ref?.containerName,
+    ref?.containerImage,
+    ref?.systemdUnit,
+    ref?.processName,
+    ref?.executable,
+  ].map(text).filter(Boolean);
+  return values.some((value) =>
+    DEFAULT_INFRASTRUCTURE_NAME_PATTERNS.some((pattern) => pattern.test(value)),
+  );
+}
+
 function isLlmEvent(kind, payload) {
   if (['LlmApi', 'LlmCall'].includes(kind)) return true;
   const target = targetText(payload);
@@ -236,7 +262,10 @@ function qualifies(record, threshold) {
   return record.score >= threshold && (llmToolPattern || autonomousToolPattern);
 }
 
-function strongInfrastructurePattern(record, now, minAgeMs) {
+function strongInfrastructurePattern(record, now, minAgeMs, ref, attribution) {
+  if (record.llmEvents === 0 && isKnownInfrastructureWorkload(ref, attribution)) {
+    return 'known_infrastructure_workload';
+  }
   const fileEvents = record.workspaceFiles + record.serviceDataFiles;
   const serviceDataDominant =
     record.serviceDataFiles >= 4 &&
@@ -254,7 +283,7 @@ function strongInfrastructurePattern(record, now, minAgeMs) {
     serviceDataDominant &&
     executableDominant &&
     lacksAgentCycle
-  );
+  ) ? 'service_data_pattern' : '';
 }
 
 class BehavioralAgentDetector {
@@ -402,7 +431,14 @@ class BehavioralAgentDetector {
       record.probableUntil = now + this.probableTtlMs;
       this.stats.promoted++;
     }
-    const negative = strongInfrastructurePattern(record, now, this.negativeMinAgeMs);
+    const candidateWorkload = workloadRef(observerEvent, attribution);
+    const negative = strongInfrastructurePattern(
+      record,
+      now,
+      this.negativeMinAgeMs,
+      candidateWorkload,
+      attribution,
+    );
     if (negative) {
       if (record.probableUntil > now) {
         record.probableUntil = 0;
@@ -410,7 +446,6 @@ class BehavioralAgentDetector {
       }
       this.stats.negativeEvidenceEvents++;
       if (attribution?.classification === 'non_agent') return undefined;
-      const candidateWorkload = workloadRef(observerEvent, attribution);
       return {
         state: 'unknown',
         attribution: {
@@ -423,7 +458,7 @@ class BehavioralAgentDetector {
           source: 'behavior',
           evidence: [
             ...(Array.isArray(attribution?.evidence) ? attribution.evidence : []),
-            'behavior:negative=service_data_pattern',
+            `behavior:negative=${negative}`,
             `behavior:service_data_files=${record.serviceDataFiles}`,
             `behavior:service_data_directories=${record.serviceDataDirectories.size}`,
             `behavior:dominant_executable_ratio=${(
@@ -437,7 +472,6 @@ class BehavioralAgentDetector {
     }
     if (record.probableUntil <= now) return undefined;
     this.stats.probableEvents++;
-    const candidateWorkload = workloadRef(observerEvent, attribution);
     return {
       state: 'agent',
       attribution: {

@@ -91,6 +91,16 @@ function argvText(value) {
   return text(value);
 }
 
+function isInternalAgentHelper(info) {
+  const argv = argvText(info?.argv).toLowerCase();
+  const tokens = argv.split(/\s+/).filter(Boolean);
+  return (
+    tokens.includes('--codex-run-as-fs-helper') ||
+    basename(tokens[0]) === 'codex-linux-sandbox' ||
+    tokens.includes('--sandbox-policy-cwd')
+  );
+}
+
 function containerIdFromCgroup(value) {
   const cgroup = text(value);
   if (!cgroup) return undefined;
@@ -760,7 +770,7 @@ class AgentAttributor {
     let signatureDescendants = 0;
     for (const info of snapshot.values()) {
       if (positiveInt(info.tgid) && positiveInt(info.tgid) !== info.pid) continue;
-      const directAgent = this.matchAgentExecutable(info);
+      const directAgent = this.matchAgent(info);
       if (!directAgent) continue;
       const before = this.rootsByKey.size;
       const ancestor = this.resolveSameScopeAncestor(info.ppid, directAgent, snapshot);
@@ -860,7 +870,7 @@ class AgentAttributor {
     for (let offset = 0; offset < all.length; offset += batchSize) {
       for (const info of all.slice(offset, offset + batchSize)) {
         if (positiveInt(info.tgid) && positiveInt(info.tgid) !== info.pid) continue;
-        const directAgent = this.matchAgentExecutable(info);
+        const directAgent = this.matchAgent(info);
         if (!directAgent) continue;
         const before = this.rootsByKey.size;
         const ancestor = this.resolveSameScopeAncestor(info.ppid, directAgent, snapshot);
@@ -1376,10 +1386,28 @@ class AgentAttributor {
   }
 
   matchAgent(info) {
-    return this.matchAgentExecutable(info);
+    // Codex starts short-lived filesystem helpers whose executable/comm is also `codex`.
+    // They are descendants of a real Agent root, not independent terminal/window instances.
+    // If their ancestry is temporarily unavailable, leave them unknown instead of inventing a
+    // new root that later becomes a permanent Agent asset.
+    if (isInternalAgentHelper(info)) return undefined;
+    const executableMatch = this.matchAgentExecutable(info);
+    if (executableMatch) return executableMatch;
+    if (!this.builtinHintsEnabled) return undefined;
+    const argv = text(info.argv).toLowerCase();
+    if (!argv) return undefined;
+    // Only the command prefix is identity evidence. Scanning every argument lets untrusted
+    // prompts such as "Actor: a3s code" misclassify an ordinary node process as an Agent.
+    const tokens = argv.split(/\s+/).filter(Boolean);
+    const command = basename(tokens[0]);
+    if (command === 'codex') return 'codex';
+    if (command === 'a3s-code' || (command === 'a3s' && tokens[1] === 'code')) return 'a3s code';
+    if (command === 'claude' || command === 'claude-code' || (command === 'claude' && tokens[1] === 'code')) return 'Claude Code';
+    return undefined;
   }
 
   matchAgentExecutable(info) {
+    if (isInternalAgentHelper(info)) return undefined;
     return this.signatureRegistry.match(info);
   }
 

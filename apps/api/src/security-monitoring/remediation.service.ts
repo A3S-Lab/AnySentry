@@ -136,7 +136,6 @@ function actionKindForText(text: string): RemediationActionKind {
 
 @Injectable()
 export class RemediationService implements OnModuleInit, OnModuleDestroy {
-  private readonly ch = new ClickHouseStore();
   private readonly state = new Map<string, RemediationRecord>();
   private readonly overdueScanIntervalMs = envInt('ANYSENTRY_REMEDIATION_OVERDUE_SCAN_SECS', 60, 5, 86_400) * 1000;
   private readonly minimumSeverity = envSeverity('ANYSENTRY_REMEDIATION_MIN_SEVERITY', 'medium');
@@ -149,6 +148,7 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
   private initialized = false;
 
   constructor(
+    private readonly ch: ClickHouseStore,
     private readonly agg: AggregationService,
     private readonly alerting: AlertingService,
     private readonly relational: RelationalBusinessStore,
@@ -171,7 +171,6 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
     if (this.overdueTimer) clearTimeout(this.overdueTimer);
     if (this.relationalRefreshTimer) clearInterval(this.relationalRefreshTimer);
     await this.persist();
-    await this.ch.close();
   }
 
   stateStatus(): { recordCount: number; postgresqlBacked: boolean } {

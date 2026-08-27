@@ -256,6 +256,7 @@ export interface RiskProfileFinding {
   workspaceId: string;
   workspacePath: string;
   agentCorrelationId: string;
+  agentInstanceId: string;
   agentType: string;
   windowStart: number;
   windowEnd: number;
@@ -288,6 +289,7 @@ export interface CompositeRiskFinding {
   workspaceId: string;
   workspacePath: string;
   agentCorrelationId: string;
+  agentInstanceId?: string;
   agentType: string;
   sessionId?: string;
   traceId?: string;

@@ -225,6 +225,7 @@ async function runConfig(label, env = {}, inputLines, options = {}) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   const api = `http://127.0.0.1:${address.port}/security-center/ingest`;
+  const spoolDirectory = fs.mkdtempSync(path.join(os.tmpdir(), `anysentry-filter-${label}-`));
   const childEnv = {
       ...process.env,
       FORWARD_FILTER_MODE: 'enforce',
@@ -240,8 +241,11 @@ async function runConfig(label, env = {}, inputLines, options = {}) {
       ANYSENTRY_IDENTITY_SNAPSHOT_URL: api.replace(/\/ingest$/u, '/identity/snapshot'),
       ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL: api.replace(/\/ingest$/u, '/runtime/snapshot'),
       ANYSENTRY_AGENT_RUNTIME_LEASE_URL: api.replace(/\/ingest$/u, '/runtime/lease'),
+      FORWARD_SPOOL_PATH: path.join(spoolDirectory, 'spool.wal'),
       ANYSENTRY_IDENTITY_SNAPSHOT_SECS: '0.05',
-      ANYSENTRY_HEARTBEAT_SECS: options.heartbeatSecs ?? '0.05',
+      // Most fixtures assert one closed accounting window. Keep periodic delivery outside the
+      // short-lived fixture unless a scenario explicitly tests overlapping heartbeat behavior.
+      ANYSENTRY_HEARTBEAT_SECS: options.heartbeatSecs ?? '60',
       ANYSENTRY_DOCKER_DISCOVERY: 'off',
       ANYSENTRY_BEHAVIOR_DISCOVERY: 'off',
       ANYSENTRY_AGENT_TEMPLATES_JSON: '[]',
@@ -264,6 +268,7 @@ async function runConfig(label, env = {}, inputLines, options = {}) {
     child.kill('SIGKILL');
     if (child.exitCode === null) await new Promise((resolve) => child.once('exit', resolve));
     await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(spoolDirectory, { recursive: true, force: true });
     throw new Error(`${error.message}: ${stderr}`);
   }
   await new Promise((resolve) => setTimeout(resolve, 20));
@@ -293,6 +298,7 @@ async function runConfig(label, env = {}, inputLines, options = {}) {
     });
   });
   await new Promise((resolve) => server.close(resolve));
+  fs.rmSync(spoolDirectory, { recursive: true, force: true });
   assert.equal(exitCode, 0, stderr);
   const expectedObserved = options.expectedObserved ?? lines.length;
   const heartbeat = options.heartbeatPredicate
@@ -429,6 +435,7 @@ async function runManualReviewRecovery() {
 }
 
 async function runHungShutdownScenario() {
+  const spoolDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'anysentry-filter-hung-shutdown-'));
   const initialRuntimeSnapshot = deferred();
   const batchStarted = deferred();
   const snapshotWhileBatchOpen = deferred();
@@ -565,6 +572,7 @@ async function runHungShutdownScenario() {
         ANYSENTRY_HEARTBEAT_SECS: '0.05',
         ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_SECS: '1',
         ANYSENTRY_AGENT_RUNTIME_LIVENESS_SECS: '300',
+        FORWARD_SPOOL_PATH: path.join(spoolDirectory, 'spool.wal'),
         ANYSENTRY_DOCKER_DISCOVERY: 'off',
         ANYSENTRY_BEHAVIOR_DISCOVERY: 'off',
         ANYSENTRY_AGENT_TEMPLATES_JSON: '[]',
@@ -643,6 +651,7 @@ async function runHungShutdownScenario() {
     if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
     for (const socket of sockets) socket.destroy();
     await closed;
+    fs.rmSync(spoolDirectory, { recursive: true, force: true });
   }
 }
 
@@ -838,7 +847,9 @@ const byteBound = await runConfig('byte-bound', {
   FORWARD_MAX_EVENT_BYTES: String(64 * 1024),
   FORWARD_MAX_QUEUE: '20',
   FORWARD_MAX_QUEUE_BYTES: String(1024 * 1024),
-}, byteBoundLines);
+}, byteBoundLines, {
+  heartbeatSecs: '60',
+});
 assert.equal(byteBound.batches.length, byteBoundLines.length);
 assert.ok(byteBound.batchRequestBytes.length >= 4, 'large events must be split into multiple HTTP batches');
 assert.ok(

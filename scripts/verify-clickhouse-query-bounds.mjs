@@ -530,7 +530,10 @@ assert.match(apiTypesSource, /interface AgentEventList[\s\S]*storageFallback\?: 
 assert.match(webApiSource, /interface AgentEventList[\s\S]*totalApproximate\?: boolean/u);
 assert.match(webApiSource, /interface AgentEventList[\s\S]*storageFallback\?: "hot_ring"/u);
 assert.match(agentEventsPageSource, /visibleData\.totalApproximate \? "≈"/u);
-assert.match(monitorPageSource, /events\.totalApproximate \? "≈"/u);
+assert.match(
+  monitorPageSource,
+  /const totalApproximate = Boolean\([\s\S]*visibleEvents\?\.totalApproximate[\s\S]*visibleEvents\?\.totalMode === "estimated"[\s\S]*totalApproximate \? "≈"/u,
+);
 assert.match(webApiSource, /const DASHBOARD_HISTORY_TIMEOUT_MS = 45_000/u);
 assert.match(webApiSource, /dashboardPost<SecurityExplainabilityScan>\("\/security-center\/top\/explainabilityScan", filter\)/u);
 assert.match(webApiSource, /dashboardPost<AgentEventList>\("\/security-center\/events\/list", filter\)/u);

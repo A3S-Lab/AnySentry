@@ -1734,7 +1734,7 @@ export default function AgentsPage() {
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex min-w-0 items-center gap-3">
             <Button asChild variant="secondary" size="sm" className="h-9 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
-              <Link to="/">
+              <Link to="/?view=agentAssets">
                 <ArrowLeft className="size-3.5" />
                 返回
               </Link>

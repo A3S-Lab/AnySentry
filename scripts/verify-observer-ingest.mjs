@@ -774,10 +774,12 @@ async function verifyCollectorHeartbeatProvenanceContract() {
   );
 
   const alerting = new AlertingService(
+    {},
     { activeFor: () => false },
     { dispatch: async () => 0, config: () => ({ summary: { enabledChannels: 0 } }) },
     { snapshot: () => [] },
     { get: () => undefined },
+    {},
   );
   alerting.config.enabled = true;
   const alertCollector = `${runId}-origin-alert-collector`;

@@ -1,7 +1,7 @@
-import { BadRequestException, Body, ConflictException, Controller, Get, Headers, HttpCode, NotFoundException, Param, PayloadTooLargeException, Post, Put, Query, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, Get, Header, Headers, HttpCode, NotFoundException, Param, PayloadTooLargeException, Post, Put, Query, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { Observable, map, mergeMap, timer } from 'rxjs';
+import { Observable, exhaustMap, map, mergeMap, timer } from 'rxjs';
 import { SkipWrap } from '../shared/api-response.interceptor';
 import { AgentMetadataService } from './agent-metadata.service';
 import { AgentRuntimeStateService } from './agent-runtime-state.service';
@@ -39,7 +39,9 @@ import { StreamingFindingService } from './streaming-finding.service';
 import { RuntimeModelConfigService, RuntimeModelProfile, sanitizeRuntimeModelConnection } from './runtime-model-config';
 import { StreamingQueueService } from './streaming-queue.service';
 import { SupplyChainService } from './supply-chain.service';
+import { UserDirectoryService } from './user-directory.service';
 import { WorkspaceDirectoryService } from './workspace-directory.service';
+import { PlatformMetricsService } from './platform-metrics.service';
 import { SystemContextService, type SystemContextQuery } from './system-context.service';
 import { UnknownLearningRuntimeService } from './unknown-learning-runtime.service';
 import type { UnknownLearnedAction, UnknownPolicyStage } from './unknown-learning';
@@ -287,6 +289,31 @@ const LLM_ENDPOINTS = (process.env.ANYSENTRY_LLM_ENDPOINTS ?? 'api.anthropic.com
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
+const OBSERVER_BATCH_CONCURRENCY = Math.max(
+  1,
+  Math.min(64, Number.parseInt(process.env.ANYSENTRY_OBSERVER_BATCH_CONCURRENCY ?? '24', 10) || 24),
+);
+
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  work: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from(
+    { length: Math.min(items.length, Math.max(1, concurrency)) },
+    async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        results[index] = await work(items[index], index);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return results;
+}
 
 function isLlmEndpoint(inner: Record<string, unknown>): boolean {
   const a = inner as { peer?: string; sni?: string; query?: string };
@@ -4085,6 +4112,8 @@ export class SecurityMonitoringController {
     private readonly unknownLearning: UnknownLearningRuntimeService,
     private readonly infrastructureRules: InfrastructureRuleService,
     private readonly observedAssets: ObservedAssetLifecycleService,
+    private readonly users: UserDirectoryService,
+    private readonly platformMetrics: PlatformMetricsService,
   ) {}
 
   private bindObservedAssetMeta(meta: T.EventMeta, eventAt?: number): T.EventMeta {
@@ -4403,7 +4432,7 @@ export class SecurityMonitoringController {
   @Post('sessions/agentObservability')
   @HttpCode(200)
   agentObservability(@Body() f: T.SecurityTimeFilter) {
-    return this.agg.agentObservabilityForWindow(f);
+    return this.agg.sharedAgentObservabilityForWindow(f);
   }
 
   @Post('sessions/workspaceRiskDistribution')
@@ -5605,6 +5634,63 @@ export class SecurityMonitoringController {
     return this.audit.list(f);
   }
 
+  @Post('users/list')
+  @HttpCode(200)
+  usersList(@Body() query: T.PlatformUserQuery) {
+    return this.users.list(query);
+  }
+
+  @Post('users')
+  @RequireManagementAuth()
+  createUser(@Body() body: T.PlatformUserUpdateRequest, @Headers() headers: HeaderBag) {
+    const actor = auditActor(headers);
+    const updated = this.users.upsert(undefined, body, actor.id);
+    this.audit.record({
+      actor,
+      action: 'user.updated',
+      resourceType: 'user',
+      resourceId: updated.userId,
+      summary: `Platform user created: ${updated.username}`,
+      details: {
+        userId: updated.userId,
+        username: updated.username,
+        displayName: updated.displayName,
+        role: updated.role,
+        status: updated.status,
+        team: updated.team,
+      },
+    });
+    return updated;
+  }
+
+  @Put('users/:userId')
+  @RequireManagementAuth()
+  updateUser(
+    @Param('userId') userId: string,
+    @Body() body: T.PlatformUserUpdateRequest,
+    @Headers() headers: HeaderBag,
+  ) {
+    if (!this.users.has(userId)) throw new NotFoundException('platform user not found');
+    const actor = auditActor(headers);
+    const updated = this.users.upsert(userId, body, actor.id);
+    this.audit.record({
+      actor,
+      action: 'user.updated',
+      resourceType: 'user',
+      resourceId: updated.userId,
+      summary: `Platform user updated: ${updated.username}`,
+      details: {
+        userId: updated.userId,
+        username: updated.username,
+        displayName: updated.displayName,
+        role: updated.role,
+        status: updated.status,
+        team: updated.team,
+      },
+    });
+    return updated;
+  }
+
   @Post('evidence/bundle')
   @HttpCode(200)
   async evidenceBundle(@Body() query: T.EvidenceBundleQuery = {}): Promise<T.EvidenceBundle> {
@@ -6432,7 +6518,12 @@ export class SecurityMonitoringController {
   @Sse('sessions/agentObservability/stream')
   @SkipWrap()
   stream(@Query() q: T.SecurityTimeFilter): Observable<{ data: T.AgentObservability }> {
-    return timer(0, 3000).pipe(mergeMap(async () => ({ data: await this.agg.agentObservabilityForWindow(q) })));
+    // A slow durable read must never stack another full-window query behind itself. Every result
+    // still covers the complete requested window as of its own snapshot, so coalescing timer ticks
+    // drops duplicate work rather than events or query dimensions.
+    return timer(0, 3000).pipe(
+      exhaustMap(async () => ({ data: await this.agg.sharedAgentObservabilityForWindow(q) })),
+    );
   }
 
   /** The editable judge policy (L1 rules / L2 LLM / L3 a3s-code) + which tiers are active. The
@@ -6650,6 +6741,7 @@ export class SecurityMonitoringController {
         maintenanceWindows: this.maintenance.stateStatus(),
         notifications: this.notifications.stateStatus(),
         objectives: this.objectives.stateStatus(),
+        users: this.users.stateStatus(),
         policyConfig: this.judge.policyStateStatus(),
       },
       managementAuth: {
@@ -6661,6 +6753,7 @@ export class SecurityMonitoringController {
         distinctSessions: stats.distinctSessions,
       },
       historyFactCache: this.agg.historyFactCacheStatus(),
+      eventWriteBatch: this.judge.eventWriteBatchStatus(),
       dashboardBucketSnapshots: this.judge.dashboardBucketSnapshotStatus(),
       policy: policy.status,
       streaming: {
@@ -6671,6 +6764,18 @@ export class SecurityMonitoringController {
         enabled: this.supplyChain.enabled,
       },
     };
+  }
+
+  @Get('platform/metrics')
+  platformMetricsOverview(@Query('range') range?: string): Promise<T.PlatformMetricsOverview> {
+    return this.platformMetrics.overview(range);
+  }
+
+  @Get('platform/metrics/prometheus')
+  @SkipWrap()
+  @Header('Content-Type', 'text/plain; version=0.0.4; charset=utf-8')
+  platformMetricsPrometheus(): string {
+    return this.platformMetrics.prometheusText();
   }
 
   /** Versioned, node-filtered workload identity data for observation-only forwarders. */
@@ -7650,7 +7755,7 @@ export class SecurityMonitoringController {
       }
     }
     if (!revisionConflict && retainedPrepared.length > 0) {
-      this.judge.commitPreparedBatch(retainedPrepared);
+      await this.judge.commitPreparedBatch(retainedPrepared);
     }
     // The binding pass above is side-effect free. Publish only facts/events that crossed their
     // ClickHouse durability fence; a failed block therefore cannot create a ghost Asset/Runtime.

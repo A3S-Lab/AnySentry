@@ -112,6 +112,29 @@ function countOccurrences(haystack, needle) {
   return haystack.split(needle).length - 1;
 }
 
+function runtimeAsyncAssets(sources) {
+  const assets = new Set();
+  for (const source of sources) {
+    let cursor = 0;
+    while (cursor < source.length) {
+      const marker = source.indexOf('static/js/async/', cursor);
+      if (marker < 0) break;
+      const mapStart = source.indexOf('{', marker);
+      const mapEnd = mapStart < 0 ? -1 : source.indexOf('})[e]', mapStart);
+      if (mapStart < 0 || mapEnd < 0) {
+        cursor = marker + 1;
+        continue;
+      }
+      const chunkMap = source.slice(mapStart + 1, mapEnd);
+      for (const match of chunkMap.matchAll(/"?(\d+)"?\s*:\s*"([a-f0-9]+)"/gu)) {
+        assets.add(`static/js/async/${match[1]}.${match[2]}.js`);
+      }
+      cursor = mapEnd + 1;
+    }
+  }
+  return [...assets];
+}
+
 function urlFor(path) {
   const base = new URL(webBase);
   const prefix = base.pathname.replace(/\/$/, '');
@@ -159,6 +182,33 @@ async function verifyIndexAndAssets() {
   }
 
   assert('dashboard HTML does not embed a dev API origin', !index.text.includes('127.0.0.1:29653') && !index.text.includes('localhost:29653'), index.text.slice(0, 500));
+  const manifestResponse = await fetchText('/manifest.json');
+  let asyncJsAssets = [];
+  if (manifestResponse.res.ok) {
+    try {
+      const manifest = JSON.parse(manifestResponse.text);
+      asyncJsAssets = manifest?.entries?.index?.async?.js ?? [];
+    } catch {
+      asyncJsAssets = [];
+    }
+  }
+  asyncJsAssets = [...new Set([...asyncJsAssets, ...runtimeAsyncAssets(jsText)])];
+  assert('dashboard runtime exposes code-split route assets', asyncJsAssets.length >= 1, {
+    status: manifestResponse.res.status,
+    asyncJsAssets: asyncJsAssets.length,
+  });
+  for (const asset of asyncJsAssets) {
+    const assetUrl = new URL(asset, `${webBase}/`).toString();
+    const res = await fetch(assetUrl);
+    const bytes = await res.arrayBuffer();
+    const type = res.headers.get('content-type') ?? '';
+    if (res.ok && bytes.byteLength > 0) jsText.push(new TextDecoder().decode(bytes));
+    assert(
+      `dashboard lazy asset is served: ${asset}`,
+      res.ok && bytes.byteLength > 0 && type.toLowerCase().includes('javascript'),
+      { assetUrl, status: res.status, contentType: type, bytes: bytes.byteLength },
+    );
+  }
   const jsBundle = jsText.join('\n');
   assert('dashboard bundle supports browser-local management auth token', jsBundle.includes('anysentry.adminToken') && jsBundle.includes('X-AnySentry-Admin-Token'), { jsAssetCount: jsText.length });
   assert('dashboard bundle exposes management auth control UI', jsBundle.includes('管理密钥') && jsBundle.includes('控制面密钥'), { jsAssetCount: jsText.length });
@@ -461,22 +511,22 @@ async function verifyDashboardSourceContracts() {
   );
   assert(
     'dashboard presents Agent assets first and exposes implementation-neutral time-window analysis',
-    securityMonitorPage.includes('title="智能体风险概览"') &&
-      securityMonitorPage.includes('{ key: "assets" as const, label: "智能体资产"') &&
-      securityMonitorPage.includes('{ key: "window" as const, label: "时间窗分析"') &&
-      securityMonitorPage.includes('securityCenterApi.agentInventory({ ...filter, limit: 32 })') &&
+    securityMonitorPage.includes('title={assetsOnly ? "Agent 列表" : "智能体风险概览"}') &&
+      securityMonitorPage.includes('{ key: "assets" as const, label: t("Agent 列表")') &&
+      securityMonitorPage.includes('{ key: "window" as const, label: t("Flink 风险画像")') &&
+      securityMonitorPage.includes('limit: activeView === "agentInstances" ? 500 : 32') &&
       securityMonitorPage.includes('const [visibleAgentCount, setVisibleAgentCount] = useState(8)') &&
       securityMonitorPage.includes('<AgentOverviewCard key={agentRuntimeSelectionKey(agent)}') &&
-      securityMonitorPage.includes('进入智能体资产 →') &&
+      securityMonitorPage.includes('进入 Agent 列表 →') &&
       securityMonitorPage.includes('观察模式 · 不影响系统操作') &&
       !securityMonitorPage.includes('title="Flink 实时风险关联"') &&
       !securityMonitorPage.includes('Flink 聚合连续行为') &&
       !securityMonitorPage.includes('value: "Shadow"'),
     {
-      hasOverviewTitle: securityMonitorPage.includes('title="智能体风险概览"'),
-      hasAssetFirstView: securityMonitorPage.includes('{ key: "assets" as const, label: "智能体资产"'),
-      hasWindowView: securityMonitorPage.includes('{ key: "window" as const, label: "时间窗分析"'),
-      hasInventoryQuery: securityMonitorPage.includes('securityCenterApi.agentInventory({ ...filter, limit: 32 })'),
+      hasOverviewTitle: securityMonitorPage.includes('title={assetsOnly ? "Agent 列表" : "智能体风险概览"}'),
+      hasAssetFirstView: securityMonitorPage.includes('{ key: "assets" as const, label: t("Agent 列表")'),
+      hasWindowView: securityMonitorPage.includes('{ key: "window" as const, label: t("Flink 风险画像")'),
+      hasInventoryQuery: securityMonitorPage.includes('limit: activeView === "agentInstances" ? 500 : 32'),
       hasEightItemDisclosure: securityMonitorPage.includes('const [visibleAgentCount, setVisibleAgentCount] = useState(8)'),
       hasAssetCards: securityMonitorPage.includes('<AgentOverviewCard key={agentRuntimeSelectionKey(agent)}'),
       hidesImplementationTerms:
@@ -528,7 +578,8 @@ async function verifyDashboardSourceContracts() {
       apiClient.includes('operation: "buildEvidenceBundle"') &&
       securityController.includes("operation.name === 'planNextActions'") &&
       securityController.includes("operation.name === 'buildEvidenceBundle'") &&
-      securitySidebar.includes('{ label: "AI Operator", description: "辅助生成处置计划", href: "/operator"'),
+      securitySidebar.includes('label: "AI Operator"') &&
+      securitySidebar.includes('href: "/operator"'),
     {
       hasProgressiveApiCall: operatorPage.includes('securityCenterApi.nextActionPlan(params)'),
       hasProgressiveEvidenceCall: operatorPage.includes('securityCenterApi.evidenceBundleCapability(evidenceBundleParams(action.evidence.bundleHint, action, timeType))'),
@@ -547,7 +598,9 @@ async function verifyDashboardSourceContracts() {
         operatorPage.includes('const routeText = searchParams.toString()') &&
         operatorPage.includes('setSearchParams(next, { replace: true })') &&
         operatorPage.includes('setSearchParams(operatorRouteParams({'),
-      hasDashboardEntry: securitySidebar.includes('{ label: "AI Operator", description: "辅助生成处置计划", href: "/operator"'),
+      hasDashboardEntry:
+        securitySidebar.includes('label: "AI Operator"') &&
+        securitySidebar.includes('href: "/operator"'),
     },
   );
   assert(
@@ -587,7 +640,8 @@ async function verifyDashboardSourceContracts() {
       !capabilitiesPage.includes('const SAMPLE_PARAMS') &&
       capabilitiesPage.includes('schemaConstString(bodyProperties.action, "execute")') &&
       capabilitiesPage.includes('schemaConstString(bodyProperties.module, "security-center")') &&
-      securitySidebar.includes('{ label: "API", description: "Progressive API 能力", href: "/capabilities"'),
+      securitySidebar.includes('label: "Agent 安全接入"') &&
+      securitySidebar.includes('href: "/capabilities"'),
     {
       hasList: capabilitiesPage.includes('securityCenterApi.securityCapabilities({ action: "list" })'),
       hasSearch: capabilitiesPage.includes('securityCenterApi.securityCapabilities({ action: "search", query: nextQuery })'),
@@ -628,7 +682,9 @@ async function verifyDashboardSourceContracts() {
         capabilitiesPage.includes('const routeAction = capabilityRouteAction(searchParams.get("action"))') &&
         capabilitiesPage.includes('const [query, setQuery] = useState(routeQuery)') &&
         capabilitiesPage.includes('void refreshModules(routeModule, routeOperation, false, routeAction)'),
-      hasDashboardEntry: securitySidebar.includes('{ label: "API", description: "Progressive API 能力", href: "/capabilities"'),
+      hasDashboardEntry:
+        securitySidebar.includes('label: "Agent 安全接入"') &&
+        securitySidebar.includes('href: "/capabilities"'),
     },
   );
   assert(
@@ -644,6 +700,29 @@ async function verifyDashboardSourceContracts() {
       hasSkipWrap: securityController.includes('@SkipWrap()'),
       hasClientStream: apiClient.includes('export function streamAgentObservability') && apiClient.includes('Accept: "text/event-stream"'),
       hasDashboardPanel: securityMonitorPage.includes('<LiveObservabilityPanel observability={observability} connected={observabilityConnected} />'),
+    },
+  );
+  assert(
+    'dashboard isolates view data and prevents overlapping observability reads',
+    securityMonitorPage.includes('const needsAgentInventory = ["agentAssets", "agentInstances", "stream"].includes(activeView)') &&
+      securityMonitorPage.includes('const needsStreamFindings = ["agentAssets", "stream", "supplyChain"].includes(activeView)') &&
+      securityMonitorPage.includes('if (activeView !== "overview")') &&
+      securityController.includes('exhaustMap(async () =>') &&
+      securityController.includes('sharedAgentObservabilityForWindow(q)') &&
+      aggregationService.includes('private readonly agentInventoryInFlight') &&
+      aggregationService.includes('private readonly agentObservabilityInFlight'),
+    {
+      hasViewScopedInventory:
+        securityMonitorPage.includes('const needsAgentInventory = ["agentAssets", "agentInstances", "stream"].includes(activeView)'),
+      hasViewScopedFindings:
+        securityMonitorPage.includes('const needsStreamFindings = ["agentAssets", "stream", "supplyChain"].includes(activeView)'),
+      hasOverviewOnlyStream: securityMonitorPage.includes('if (activeView !== "overview")'),
+      hasNonOverlappingSse:
+        securityController.includes('exhaustMap(async () =>') &&
+        securityController.includes('sharedAgentObservabilityForWindow(q)'),
+      hasServerSingleFlight:
+        aggregationService.includes('private readonly agentInventoryInFlight') &&
+        aggregationService.includes('private readonly agentObservabilityInFlight'),
     },
   );
   assert(

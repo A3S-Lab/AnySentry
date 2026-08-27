@@ -24,7 +24,7 @@ public class RiskCorrelationFunction extends KeyedProcessFunction<String, Canoni
     private static final long MINUTE = 60_000L;
     private static final long FIVE_MINUTES = 5 * MINUTE;
     private static final long COMPOSITE_WINDOW = 3 * MINUTE;
-    private static final String PROFILE_RULE_VERSION = "risk-profile-v1";
+    private static final String PROFILE_RULE_VERSION = "risk-profile-v2";
     private static final int MAX_HISTORY_EVENTS = 10_000;
 
     private transient MapState<String, Long> seenEvents;
@@ -107,7 +107,12 @@ public class RiskCorrelationFunction extends KeyedProcessFunction<String, Canoni
         long windowEnd = (maximum / MINUTE) * MINUTE + MINUTE;
         long calculatedAt = System.currentTimeMillis();
         StreamFinding finding = base(current, "risk_profile", calculatedAt);
-        finding.profileId = hash("profile", current.agentCorrelationId, String.valueOf(windowEnd), PROFILE_RULE_VERSION);
+        finding.profileId = hash(
+                "profile",
+                profileEntityId(current),
+                String.valueOf(windowEnd),
+                PROFILE_RULE_VERSION
+        );
         finding.findingId = finding.profileId;
         finding.windowStart = maximum - FIVE_MINUTES;
         finding.windowEnd = windowEnd;
@@ -227,8 +232,15 @@ public class RiskCorrelationFunction extends KeyedProcessFunction<String, Canoni
         finding.workspaceId = event.workspaceId;
         finding.workspacePath = event.workspacePath;
         finding.agentCorrelationId = event.agentCorrelationId;
+        finding.agentInstanceId = event.agentInstanceId;
         finding.agentType = event.agentType;
         return finding;
+    }
+
+    private static String profileEntityId(CanonicalEvent event) {
+        return event.agentInstanceId == null || event.agentInstanceId.isBlank()
+                ? event.agentCorrelationId
+                : event.agentInstanceId;
     }
 
     private static int count(List<CanonicalEvent> events, long cutoff, Predicate predicate) {

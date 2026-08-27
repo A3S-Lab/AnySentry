@@ -33,6 +33,10 @@ function parsedTime(value?: string): number | undefined {
 export function resolveTimeWindow(filter: SecurityTimeFilter, clockMs = Date.now()): ResolvedTimeWindow {
   const requestedSnapshot = parsedTime(filter.snapshotAsOf);
   const snapshotMs = Math.min(requestedSnapshot ?? clockMs, clockMs);
+  // A future client clock is semantically the same as an omitted snapshot: both clamp to server
+  // "now". Keep the relative cache key so concurrent callers share one in-flight history query
+  // instead of producing a distinct millisecond key for every request.
+  const hasFixedSnapshot = requestedSnapshot !== undefined && requestedSnapshot <= clockMs;
   if (filter.timeType === 'custom') {
     const requestedStart = parsedTime(filter.startTime);
     const requestedEnd = parsedTime(filter.endTime);
@@ -56,6 +60,6 @@ export function resolveTimeWindow(filter: SecurityTimeFilter, clockMs = Date.now
     endMs: snapshotMs,
     spanMs,
     custom: false,
-    cacheKey: requestedSnapshot === undefined ? timeType : `${timeType}|${snapshotMs}`,
+    cacheKey: hasFixedSnapshot ? `${timeType}|${snapshotMs}` : timeType,
   };
 }

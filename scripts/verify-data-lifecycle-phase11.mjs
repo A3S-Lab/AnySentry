@@ -157,8 +157,11 @@ const [aggregation, clickhouse, judge] = await Promise.all([
 assert.match(aggregation, /new DashboardHistoryBucketCache/);
 assert.match(aggregation, /dashboardAggregateBucketFacts/);
 assert.match(clickhouse, /CREATE MATERIALIZED VIEW IF NOT EXISTS \$\{EVENT_COMMIT_FACT_MV\}/);
+assert.match(clickhouse, /toUInt64\(toUnixTimestamp64Milli\(now64\(3\)\)\) AS committedAt/);
+assert.match(clickhouse, /commitBatchId/);
+assert.match(clickhouse, /ANYSENTRY_COMMIT_CURSOR_REPLAY_MS/);
 assert.match(clickhouse, /LIMIT 1 BY eventId/);
-assert.match(clickhouse, /ORDER BY \(committedAt, eventId, decisionRevision\)/);
+assert.match(clickhouse, /ORDER BY \(committedAt, commitBatchId, eventId, decisionRevision\)/);
 assert.match(judge, /eventCommitChanges/);
 assert.match(judge, /latestEventCommitCursor/);
 

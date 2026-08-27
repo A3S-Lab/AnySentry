@@ -8,6 +8,7 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const read = (path) => readFileSync(`${root}/${path}`, 'utf8');
 
 const router = read('apps/web/src/router.tsx');
+const routeLoaders = read('apps/web/src/lib/performance/route-loaders.ts');
 const assetRoutes = read('apps/web/src/lib/asset-routes.ts');
 const assetsPage = read('apps/web/src/pages/AssetsPage.tsx');
 const filterRulesPage = read('apps/web/src/pages/FilterRulesPage.tsx');
@@ -28,7 +29,8 @@ assert.match(router, /path: "\/assets"/u);
 assert.match(router, /path: "\/assets\/:assetId"/u);
 assert.match(router, /path: "\/filter-rules"/u);
 assert.match(router, /path: "\/capture-rules"/u);
-assert.match(router, /<FilterRulesPage \/>/u);
+assert.match(router, /\{ path: "\/filter-rules", lazy: lazyRoute\("\/filter-rules"\) \}/u);
+assert.match(routeLoaders, /"\/filter-rules": \(\) => import\("@\/pages\/FilterRulesPage"\)/u);
 assert.match(router, /LegacyCaptureRulesRedirect/u);
 assert.match(router, /Navigate replace to=\{`\/filter-rules\$\{location\.search\}\$\{location\.hash\}`\}/u);
 

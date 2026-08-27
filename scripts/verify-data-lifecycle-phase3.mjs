@@ -47,8 +47,8 @@ assert.match(controller, /(?:await\s+)?this\.agg\.storedWorkspaceInventory\(f\)/
 assert.match(controller, /await this\.agg\.storedCoverageOverview\(f\)/);
 assert.match(controller, /await this\.agg\.storedPolicySimulation\(body\)/);
 assert.match(controller, /(?:await\s+)?this\.agg\.storedAgentInstanceMetrics\(f\)/);
-assert.match(controller, /(?:await\s+)?this\.agg\.agentObservabilityForWindow\(f\)/);
-assert.match(controller, /mergeMap\(async \(\) => \(\{ data: await this\.agg\.agentObservabilityForWindow\(q\) \}\)\)/);
+assert.match(controller, /this\.agg\.sharedAgentObservabilityForWindow\(f\)/);
+assert.match(controller, /exhaustMap\(async \(\) => \(\{ data: await this\.agg\.sharedAgentObservabilityForWindow\(q\) \}\)\)/);
 
 assert.match(types, /coverage\?: QueryCoverage;/);
 assert.match(types, /collectorIds\?: string\[\];/);

@@ -329,6 +329,72 @@ export interface AgentObservability extends ClassifiedResponseMeta {
   updateTime: string;
 }
 
+export type PlatformMetricStatus = "healthy" | "warning" | "critical" | "unknown";
+export type PlatformMetricSource = "prometheus" | "runtime_fallback";
+
+export interface PlatformMetricPoint {
+  at: string;
+  value: number;
+}
+
+export interface PlatformMetricSeries {
+  key: "cpu" | "memory" | "disk" | "network_rx" | "network_tx" | "api_p95" | "api_error_rate";
+  label: string;
+  unit: "%" | "B/s" | "ms";
+  points: PlatformMetricPoint[];
+}
+
+export interface PlatformComponentMetric {
+  id: string;
+  name: string;
+  kind: "service" | "node" | "scrape_target";
+  status: PlatformMetricStatus;
+  cpuPercent?: number;
+  memoryBytes?: number;
+  memoryLimitBytes?: number;
+  memoryPercent?: number;
+  lastSeen?: string;
+  message?: string;
+}
+
+export interface PlatformMetricAnomaly {
+  id: string;
+  severity: "warning" | "critical";
+  metric: string;
+  subject: string;
+  value: number;
+  unit: "%" | "ms";
+  threshold: number;
+  message: string;
+}
+
+export interface PlatformMetricsOverview {
+  schemaVersion: "anysentry.platform_metrics.v1";
+  status: "ready" | "partial" | "unavailable";
+  source: PlatformMetricSource;
+  from: string;
+  to: string;
+  stepSeconds: number;
+  updatedAt: string;
+  summary: {
+    nodeReady?: number;
+    nodeTotal?: number;
+    cpuPercent?: number;
+    memoryPercent?: number;
+    diskPercent?: number;
+    networkRxBytesPerSecond?: number;
+    networkTxBytesPerSecond?: number;
+    apiP95Ms?: number;
+    apiErrorRatePercent?: number;
+    apiRequestRate?: number;
+    componentAnomalies: number;
+  };
+  series: PlatformMetricSeries[];
+  components: PlatformComponentMetric[];
+  anomalies: PlatformMetricAnomaly[];
+  message?: string;
+}
+
 export interface SecurityWorkspaceRiskItem {
   workspacePath: string;
   sessionCount: number;
@@ -418,6 +484,9 @@ export type ObjectiveStatus = "ok" | "breach" | "disabled";
 export type IngestionSourceType = "observer" | "forwarder" | "webhook" | "otel" | "custom";
 export type IngestionSourceStatus = "active" | "stale" | "unused" | "disabled";
 export type SourceTokenRotationStatus = "untracked" | "fresh" | "overdue";
+export type PlatformUserRole = "administrator" | "security_analyst" | "operator" | "viewer";
+export type PlatformUserStatus = "active" | "disabled";
+export type PlatformUserSource = "local";
 export type AuditActorType = "system" | "operator" | "api";
 export type AuditAction =
   | "policy.updated"
@@ -438,6 +507,7 @@ export type AuditAction =
   | "objective.updated"
   | "source.updated"
   | "source.token_rotated"
+  | "user.updated"
   | "infrastructure_rule.created"
   | "infrastructure_rule.shadowed"
   | "infrastructure_rule.promoted"
@@ -455,7 +525,7 @@ export type AuditAction =
   | "unknown_learning.infrastructure_draft_reused"
   | "unknown_learning.infrastructure_draft_rejected"
   | "unknown_learning.config_updated";
-export type AuditResourceType = "policy" | "filter-rule" | "infrastructure-rule" | "unknown-learning" | "supply-chain" | "incident" | "alert" | "remediation" | "agent" | "asset" | "event" | "maintenance" | "notification" | "objective" | "source";
+export type AuditResourceType = "policy" | "filter-rule" | "infrastructure-rule" | "unknown-learning" | "supply-chain" | "incident" | "alert" | "remediation" | "agent" | "asset" | "event" | "maintenance" | "notification" | "objective" | "source" | "user";
 export type AuditResult = "success" | "failure";
 export type CoverageIssueType =
   | "collector_down"
@@ -567,6 +637,7 @@ export interface AgentEventListItem {
   decisionStatus?: AgentDecisionStatus;
   evaluationId?: string;
   policyVersion?: string;
+  decisionRevision?: number;
   decisionUpdatedAt?: number;
   verdict: SecurityVerdict;
   tier: "Rules" | "Llm" | "Agent";
@@ -613,6 +684,7 @@ export interface StreamRiskProfileFinding {
   workspaceId: string;
   workspacePath: string;
   agentCorrelationId: string;
+  agentInstanceId: string;
   agentType: string;
   windowStart: number;
   windowEnd: number;
@@ -692,6 +764,7 @@ export interface StreamCompositeRiskFinding {
   workspaceId: string;
   workspacePath: string;
   agentCorrelationId: string;
+  agentInstanceId?: string;
   agentType: string;
   sessionId?: string;
   traceId?: string;
@@ -3134,6 +3207,64 @@ export interface RemediationUpdateRequest {
   completedStepIds?: string[];
 }
 
+export interface PlatformUserItem {
+  schemaVersion: "anysentry.platform_user.v1";
+  userId: string;
+  username: string;
+  displayName: string;
+  email?: string;
+  team?: string;
+  role: PlatformUserRole;
+  status: PlatformUserStatus;
+  source: PlatformUserSource;
+  note?: string;
+  createdAt: string;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+export interface PlatformRoleDefinition {
+  role: PlatformUserRole;
+  label: string;
+  description: string;
+  permissions: string[];
+  userCount: number;
+}
+
+export interface PlatformUserQuery {
+  q?: string;
+  role?: PlatformUserRole | "all";
+  status?: PlatformUserStatus | "all";
+  limit?: number;
+}
+
+export interface PlatformUserSummary {
+  totalUsers: number;
+  activeUsers: number;
+  disabledUsers: number;
+  administratorUsers: number;
+}
+
+export interface PlatformUserList {
+  items: PlatformUserItem[];
+  roles: PlatformRoleDefinition[];
+  total: number;
+  summary: PlatformUserSummary;
+  authenticationRequired: false;
+  authorizationEnforced: false;
+  updateTime: string;
+}
+
+export interface PlatformUserUpdateRequest {
+  username?: string;
+  displayName?: string;
+  email?: string;
+  team?: string;
+  role?: PlatformUserRole;
+  status?: PlatformUserStatus;
+  note?: string;
+}
+
 export interface AuditActor {
   type: AuditActorType;
   id: string;
@@ -3173,6 +3304,7 @@ export interface AuditSummary {
   notificationActions: number;
   objectiveActions: number;
   sourceActions: number;
+  userActions: number;
   incidentActions: number;
   alertActions: number;
   remediationActions: number;
@@ -3363,7 +3495,10 @@ const dashboardPost = <T>(endpoint: string, body: unknown) =>
   apiClient.postLong<T>(endpoint, body, DASHBOARD_HISTORY_TIMEOUT_MS);
 
 export const securityCenterApi = {
-  healthz: () => apiClient.get<PlatformHealth>("/security-center/healthz"),
+  healthz: (signal?: AbortSignal) =>
+    apiClient.get<PlatformHealth>("/security-center/healthz", { signal }),
+  platformMetrics: (range: SecurityTimeType = "last_1h") =>
+    apiClient.get<PlatformMetricsOverview>(`/security-center/platform/metrics${querySuffix({ range })}`),
   assistantQuery: (body: SecurityAssistantQuery) =>
     apiClient.postLong<SecurityAssistantAnswer>("/security-center/assistant/query", body),
   healthCard: (filter: SecurityTimeFilter) =>
@@ -3506,8 +3641,8 @@ export const securityCenterApi = {
     apiClient.put<AgentMetadataListItem>(`/security-center/agents/${encodeURIComponent(agentId)}/metadata`, body),
   reviewAgent: (agentId: string, body: AgentReviewRequest) =>
     apiClient.put<AgentMetadataListItem>(`/security-center/agents/${encodeURIComponent(agentId)}/review`, body),
-  alerts: (filter: AlertListQuery) =>
-    apiClient.post<AlertList>("/security-center/alerts/list", filter),
+  alerts: (filter: AlertListQuery, signal?: AbortSignal) =>
+    apiClient.post<AlertList>("/security-center/alerts/list", filter, { signal }),
   updateAlert: (alertId: string, body: AlertUpdateRequest) =>
     apiClient.put<AlertListItem>(`/security-center/alerts/${encodeURIComponent(alertId)}`, body),
   alertConfig: () => apiClient.get<AlertConfig>("/security-center/alerts/config"),
@@ -3527,6 +3662,12 @@ export const securityCenterApi = {
     apiClient.post<ObjectiveItem>("/security-center/objectives", body),
   updateObjective: (objectiveId: string, body: ObjectiveUpdateRequest) =>
     apiClient.put<ObjectiveItem>(`/security-center/objectives/${encodeURIComponent(objectiveId)}`, body),
+  platformUsers: (filter: PlatformUserQuery = {}) =>
+    apiClient.post<PlatformUserList>("/security-center/users/list", filter),
+  createPlatformUser: (body: PlatformUserUpdateRequest) =>
+    apiClient.post<PlatformUserItem>("/security-center/users", body),
+  updatePlatformUser: (userId: string, body: PlatformUserUpdateRequest) =>
+    apiClient.put<PlatformUserItem>(`/security-center/users/${encodeURIComponent(userId)}`, body),
   ingestionSources: (filter: IngestionSourceQuery) =>
     apiClient.post<IngestionSourceList>("/security-center/sources/list", filter),
   createIngestionSource: (body: IngestionSourceUpdateRequest) =>
@@ -3565,8 +3706,8 @@ export const securityCenterApi = {
     apiClient.post<MaintenanceWindowItem>("/security-center/maintenance/windows", body),
   updateMaintenanceWindow: (windowId: string, body: MaintenanceWindowUpdateRequest) =>
     apiClient.put<MaintenanceWindowItem>(`/security-center/maintenance/windows/${encodeURIComponent(windowId)}`, body),
-  auditLog: (filter: AuditQuery) =>
-    apiClient.post<AuditList>("/security-center/audit/list", filter),
+  auditLog: (filter: AuditQuery, signal?: AbortSignal) =>
+    apiClient.post<AuditList>("/security-center/audit/list", filter, { signal }),
   explainabilityHealth: () => apiClient.get<SecurityExplainabilityHealth>("/open/security/explainability/health"),
   explainabilityAudit: (body: SecurityExplainabilityAuditRequest) =>
     apiClient.post<SecurityExplainabilityAuditResult>("/open/security/explainability/audit", body),

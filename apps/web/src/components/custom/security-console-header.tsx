@@ -250,7 +250,7 @@ export function SecurityConsoleProvider({ children }: { children: ReactNode }) {
               <ShieldCheck className="hidden size-5 shrink-0 text-teal-300 sm:block" />
               {!sidebarCollapsed ? (
                 <h1 className="hidden min-w-0 truncate pr-6 text-sm font-semibold tracking-normal text-zinc-50 sm:block">
-                  {t("安全监控中台")} <span className="text-zinc-300">AnySentry</span>
+                  {t("Agent态势感知")} <span className="text-zinc-300">AnySentry</span>
                 </h1>
               ) : null}
               <button

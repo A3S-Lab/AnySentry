@@ -1022,6 +1022,72 @@ export interface AgentObservability extends ClassifiedResponseMeta {
   coverage?: QueryCoverage;
   updateTime: string;
 }
+export type PlatformMetricStatus = 'healthy' | 'warning' | 'critical' | 'unknown';
+export type PlatformMetricSource = 'prometheus' | 'runtime_fallback';
+
+export interface PlatformMetricPoint {
+  at: string;
+  value: number;
+}
+
+export interface PlatformMetricSeries {
+  key: 'cpu' | 'memory' | 'disk' | 'network_rx' | 'network_tx' | 'api_p95' | 'api_error_rate';
+  label: string;
+  unit: '%' | 'B/s' | 'ms';
+  points: PlatformMetricPoint[];
+}
+
+export interface PlatformComponentMetric {
+  id: string;
+  name: string;
+  kind: 'service' | 'node' | 'scrape_target';
+  status: PlatformMetricStatus;
+  cpuPercent?: number;
+  memoryBytes?: number;
+  memoryLimitBytes?: number;
+  memoryPercent?: number;
+  lastSeen?: string;
+  message?: string;
+}
+
+export interface PlatformMetricAnomaly {
+  id: string;
+  severity: 'warning' | 'critical';
+  metric: string;
+  subject: string;
+  value: number;
+  unit: '%' | 'ms';
+  threshold: number;
+  message: string;
+}
+
+export interface PlatformMetricsOverview {
+  schemaVersion: 'anysentry.platform_metrics.v1';
+  status: 'ready' | 'partial' | 'unavailable';
+  source: PlatformMetricSource;
+  from: string;
+  to: string;
+  stepSeconds: number;
+  updatedAt: string;
+  summary: {
+    nodeReady?: number;
+    nodeTotal?: number;
+    cpuPercent?: number;
+    memoryPercent?: number;
+    diskPercent?: number;
+    networkRxBytesPerSecond?: number;
+    networkTxBytesPerSecond?: number;
+    apiP95Ms?: number;
+    apiErrorRatePercent?: number;
+    apiRequestRate?: number;
+    componentAnomalies: number;
+  };
+  series: PlatformMetricSeries[];
+  components: PlatformComponentMetric[];
+  anomalies: PlatformMetricAnomaly[];
+  message?: string;
+}
+
 export interface SecurityWorkspaceRiskDistribution extends ClassifiedResponseMeta {
   list: Array<{ workspacePath: string; sessionCount: number; totalRiskScore: number; riskLevel: string; riskLevelText: string }>;
   updateTime: string;
@@ -3238,6 +3304,66 @@ export interface RemediationUpdateRequest {
   completedStepIds?: string[];
 }
 
+export type PlatformUserRole = 'administrator' | 'security_analyst' | 'operator' | 'viewer';
+export type PlatformUserStatus = 'active' | 'disabled';
+export type PlatformUserSource = 'local';
+export interface PlatformUserRecord {
+  schemaVersion: 'anysentry.platform_user.v1';
+  userId: string;
+  username: string;
+  displayName: string;
+  email?: string;
+  team?: string;
+  role: PlatformUserRole;
+  status: PlatformUserStatus;
+  source: PlatformUserSource;
+  note?: string;
+  createdAt: number;
+  updatedAt: number;
+  updatedBy: string;
+}
+export interface PlatformUserItem extends Omit<PlatformUserRecord, 'createdAt' | 'updatedAt'> {
+  createdAt: string;
+  updatedAt: string;
+}
+export interface PlatformRoleDefinition {
+  role: PlatformUserRole;
+  label: string;
+  description: string;
+  permissions: string[];
+  userCount: number;
+}
+export interface PlatformUserQuery {
+  q?: string;
+  role?: PlatformUserRole | 'all';
+  status?: PlatformUserStatus | 'all';
+  limit?: number;
+}
+export interface PlatformUserSummary {
+  totalUsers: number;
+  activeUsers: number;
+  disabledUsers: number;
+  administratorUsers: number;
+}
+export interface PlatformUserList {
+  items: PlatformUserItem[];
+  roles: PlatformRoleDefinition[];
+  total: number;
+  summary: PlatformUserSummary;
+  authenticationRequired: false;
+  authorizationEnforced: false;
+  updateTime: string;
+}
+export interface PlatformUserUpdateRequest {
+  username?: string;
+  displayName?: string;
+  email?: string;
+  team?: string;
+  role?: PlatformUserRole;
+  status?: PlatformUserStatus;
+  note?: string;
+}
+
 export type AuditActorType = 'system' | 'operator' | 'api';
 export type AuditAction =
   | 'policy.updated'
@@ -3259,6 +3385,7 @@ export type AuditAction =
   | 'objective.updated'
   | 'source.updated'
   | 'source.token_rotated'
+  | 'user.updated'
   | 'infrastructure_rule.created'
   | 'infrastructure_rule.shadowed'
   | 'infrastructure_rule.promoted'
@@ -3276,7 +3403,7 @@ export type AuditAction =
   | 'unknown_learning.infrastructure_draft_reused'
   | 'unknown_learning.infrastructure_draft_rejected'
   | 'unknown_learning.config_updated';
-export type AuditResourceType = 'policy' | 'filter-rule' | 'infrastructure-rule' | 'unknown-learning' | 'supply-chain' | 'incident' | 'alert' | 'remediation' | 'agent' | 'asset' | 'event' | 'maintenance' | 'notification' | 'objective' | 'source';
+export type AuditResourceType = 'policy' | 'filter-rule' | 'infrastructure-rule' | 'unknown-learning' | 'supply-chain' | 'incident' | 'alert' | 'remediation' | 'agent' | 'asset' | 'event' | 'maintenance' | 'notification' | 'objective' | 'source' | 'user';
 export type AuditResult = 'success' | 'failure';
 export interface AuditActor {
   type: AuditActorType;
@@ -3317,6 +3444,7 @@ export interface AuditSummary {
   notificationActions: number;
   objectiveActions: number;
   sourceActions: number;
+  userActions: number;
   incidentActions: number;
   alertActions: number;
   remediationActions: number;

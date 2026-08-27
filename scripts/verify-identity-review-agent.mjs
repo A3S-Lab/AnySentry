@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { readFile, stat } from 'node:fs/promises';
 import process from 'node:process';
 import {
+  blocksAutomaticInfrastructureConfirmation,
   buildIdentityReviewMessages,
   IdentityReviewAgentService,
   identityReviewModelConfig,
@@ -125,6 +126,50 @@ const event = {
   attributes: {},
   process: { pid: process.pid, bootId, startTimeTicks },
 };
+const infrastructureCandidateEvent = {
+  ...event,
+  eventId: 'evt_identity_review_infrastructure',
+  agentId: 'discovered-ai-apm-web',
+  attribution: {
+    monitored: true,
+    classification: 'probable_agent',
+    agentScopeId: 'discovered-ai-apm-web',
+    agentDisplayName: 'ai-apm-web',
+    physicalWorkloadId: 'docker:local:ai-apm-web',
+    workloadRef: {
+      environment: 'docker',
+      kind: 'container',
+      name: 'ai-apm-web',
+      containerName: 'ai-apm-web',
+      containerImage: 'databuffhub/ai-apm-web:test',
+    },
+    confidence: 0.88,
+    reason: 'hint_only',
+    source: 'behavior',
+    evidence: [
+      'behavior:score=18',
+      'behavior:llm=0',
+      'behavior:tools=28',
+      'behavior:agent_sequences=11',
+    ],
+  },
+};
+assert.equal(
+  blocksAutomaticInfrastructureConfirmation(infrastructureCandidateEvent),
+  true,
+  'a no-LLM observability service must never be auto-confirmed as an Agent',
+);
+assert.equal(
+  blocksAutomaticInfrastructureConfirmation({
+    ...infrastructureCandidateEvent,
+    attribution: {
+      ...infrastructureCandidateEvent.attribution,
+      evidence: ['behavior:llm=1'],
+    },
+  }),
+  false,
+  'observed model activity prevents the no-LLM infrastructure gate from making a terminal decision',
+);
 const fakeAggregation = {
   storedAgentEvents: async () => ({ items: [event], total: 1, updateTime: new Date().toISOString() }),
   storedAgentInventory: async () => ({
@@ -197,12 +242,22 @@ const automaticRuntime = {
   }),
 };
 const automaticMetadata = {
-  resolveEvent: () => ({
-    agentAssetId: 'agent_auto_fixture',
-    detectedClassification: 'probable_agent',
-    effectiveClassification: automaticApplied ? 'confirmed_agent' : 'probable_agent',
-  }),
-  logicalIdentityKeysForEvent: () => ['logical:host:test:codex'],
+  resolveEvent: (candidateEvent) => {
+    const infrastructure =
+      candidateEvent.attribution?.workloadRef?.containerName === 'ai-apm-web';
+    return {
+      agentAssetId: infrastructure ? 'agent_auto_infrastructure' : 'agent_auto_fixture',
+      detectedClassification: 'probable_agent',
+      effectiveClassification: infrastructure
+        ? 'probable_agent'
+        : automaticApplied ? 'confirmed_agent' : 'probable_agent',
+    };
+  },
+  logicalIdentityKeysForEvent: (candidateEvent) => [
+    candidateEvent.attribution?.workloadRef?.containerName === 'ai-apm-web'
+      ? 'logical:docker:test:ai-apm-web'
+      : 'logical:host:test:codex',
+  ],
   identityKeysForEvent: () => ['instance:host:test:pid:1'],
   review: () => {
     automaticReviewCalls += 1;
@@ -254,6 +309,11 @@ try {
   });
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(automaticModelCalls, 1, 'a trusted replacement instance inherits the stored logical identity');
+
+  automaticService.considerCandidate(infrastructureCandidateEvent);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(automaticModelCalls, 1, 'explicit no-LLM infrastructure evidence skips automatic model review');
+  assert.equal(automaticReviewCalls, 1, 'explicit infrastructure evidence cannot be persisted as Agent confirmation');
 } finally {
   await automaticService.onModuleDestroy();
   globalThis.fetch = originalFetch;
