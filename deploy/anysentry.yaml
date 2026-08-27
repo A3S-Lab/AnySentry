@@ -211,8 +211,10 @@ spec:
             timeoutSeconds: 2
             failureThreshold: 3
           resources:
-            requests: { cpu: 100m, memory: 128Mi }
-            limits: { cpu: "1", memory: 1Gi }
+            # The durable AOF base can approach 1 GiB before replay overhead. Reserve its steady
+            # working set and leave bounded startup headroom so recovery is not OOM-killed.
+            requests: { cpu: 100m, memory: 1Gi }
+            limits: { cpu: "1", memory: 2Gi }
       volumes:
         - name: data
           persistentVolumeClaim:
