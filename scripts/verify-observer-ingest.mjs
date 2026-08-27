@@ -254,6 +254,9 @@ async function verifyCollectorMetricFreshnessContract() {
       sameMillisecondHealth.items?.[0]?.windowErrorMaxima?.droppedEvents === 2 &&
       sameMillisecondHealth.items?.[0]?.windowErrorMaxima?.outputDropped === 3 &&
       sameMillisecondHealth.items?.[0]?.windowErrorMaxima?.errorCount === 4 &&
+      sameMillisecondHealth.items?.[0]?.healthChannels?.capture?.state === 'healthy' &&
+      sameMillisecondHealth.items?.[0]?.healthChannels?.delivery?.state === 'degraded' &&
+      sameMillisecondHealth.items?.[0]?.healthChannels?.control?.state === 'warning' &&
       sameMillisecondHealth.items?.[0]?.filterMetricsReported === true,
     sameMillisecondHealth,
   );
@@ -471,9 +474,12 @@ async function verifyCollectorMetricFreshnessContract() {
     timeType: 'last_30d', collectorId: noFilterForwarder.collectorId,
   });
   assert(
-    'Forwarder heartbeat without filter metrics still drives operational health',
-    noFilterHealth.items?.[0]?.state === 'degraded' &&
+    'legacy Forwarder errors remain visible as a channel warning without masquerading as probe failure',
+    noFilterHealth.items?.[0]?.state === 'quiet' &&
       noFilterHealth.items?.[0]?.errorCount === 2 &&
+      noFilterHealth.items?.[0]?.healthChannels?.capture?.state === 'unknown' &&
+      noFilterHealth.items?.[0]?.healthChannels?.delivery?.state === 'healthy' &&
+      noFilterHealth.items?.[0]?.healthChannels?.control?.state === 'warning' &&
       noFilterHealth.items?.[0]?.filterMetrics?.scope === 'decoupled',
     noFilterHealth,
   );
@@ -802,8 +808,17 @@ async function verifyCollectorHeartbeatProvenanceContract() {
   });
   const alertAt = Date.now();
   alerting.observeCollectorHeartbeat(heartbeat('forwarder', alertAt, { errorCount: 1 }));
-  alerting.observeCollectorHeartbeat(heartbeat('raw_collector', alertAt + 1));
   let qualityAlerts = alerting.list({
+    timeType: 'last_30d', collectorId: alertCollector, kind: 'collector', limit: 10,
+  }).items.filter((item) => item.ruleId === 'collector.quality');
+  assert(
+    'one transient Forwarder error remains a warning and does not open a quality alert',
+    qualityAlerts.length === 0,
+    qualityAlerts,
+  );
+  alerting.observeCollectorHeartbeat(heartbeat('forwarder', alertAt + 1, { errorCount: 1 }));
+  alerting.observeCollectorHeartbeat(heartbeat('raw_collector', alertAt + 2));
+  qualityAlerts = alerting.list({
     timeType: 'last_30d', collectorId: alertCollector, kind: 'collector', limit: 10,
   }).items.filter((item) => item.ruleId === 'collector.quality');
   assert(
@@ -812,8 +827,9 @@ async function verifyCollectorHeartbeatProvenanceContract() {
       item.status === 'open' && item.labels?.heartbeatOrigin === 'forwarder'),
     qualityAlerts,
   );
-  alerting.observeCollectorHeartbeat(heartbeat('raw_collector', alertAt + 2, { droppedEvents: 1 }));
-  alerting.observeCollectorHeartbeat(heartbeat('forwarder', alertAt + 3));
+  alerting.observeCollectorHeartbeat(heartbeat('raw_collector', alertAt + 3, { droppedEvents: 1 }));
+  alerting.observeCollectorHeartbeat(heartbeat('forwarder', alertAt + 4));
+  alerting.observeCollectorHeartbeat(heartbeat('forwarder', alertAt + 5));
   qualityAlerts = alerting.list({
     timeType: 'last_30d', collectorId: alertCollector, kind: 'collector', limit: 10,
   }).items.filter((item) => item.ruleId === 'collector.quality');
@@ -1846,6 +1862,7 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       ],
       deduplicated: 0,
       queueDropped: 6,
+      queueParked: 4,
       protectedQueueDropped: 3,
       queueDroppedByClass: {
         tool_exec: 2,
@@ -1860,6 +1877,30 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       retryAttempts: 4,
       retryRecovered: 3,
       retryExhausted: 1,
+      retryParked: 1,
+      spoolReplayAttempts: 8,
+      spoolReplayAdmitted: 7,
+      spoolReplayDeferred: 1,
+      heartbeatDeliveryFailures: 2,
+      spoolRecords: 11,
+      spoolActiveRecords: 7,
+      spoolParkedRecords: 4,
+      spoolBytes: 4096,
+      spoolWalBytes: 8192,
+      spoolOldestAgeMs: 65_000,
+      spoolAtCapacity: false,
+      spoolFsyncMode: 'always',
+      controlPlaneState: 'degraded',
+      controlPlaneFailedLanes: ['runtime_snapshot', 'untrusted_lane'],
+      controlPlaneStartingLanes: [],
+      controlPlaneLanes: {
+        runtime_snapshot: {
+          lastSuccessAt: '2026-08-14T00:00:00.000Z',
+          lastFailureAt: '2026-08-14T00:00:01.000Z',
+          lastFailure: 'snapshot transport timed out',
+        },
+        untrusted_lane: { lastFailure: 'must be removed' },
+      },
       queueBytes: 1234,
       inflightEvents: 2,
       inflightBytes: 567,
@@ -1989,6 +2030,19 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       health.items?.[0]?.filterMetrics?.retryAttempts === 4 &&
       health.items?.[0]?.filterMetrics?.retryRecovered === 3 &&
       health.items?.[0]?.filterMetrics?.retryExhausted === 1 &&
+      health.items?.[0]?.filterMetrics?.queueParked === 4 &&
+      health.items?.[0]?.filterMetrics?.retryParked === 1 &&
+      health.items?.[0]?.filterMetrics?.spoolReplayAdmitted === 7 &&
+      health.items?.[0]?.filterMetrics?.heartbeatDeliveryFailures === 2 &&
+      health.items?.[0]?.filterMetrics?.spoolRecords === 11 &&
+      health.items?.[0]?.filterMetrics?.spoolParkedRecords === 4 &&
+      health.items?.[0]?.filterMetrics?.spoolOldestAgeMs === 65_000 &&
+      health.items?.[0]?.filterMetrics?.spoolFsyncMode === 'always' &&
+      health.items?.[0]?.filterMetrics?.controlPlaneState === 'degraded' &&
+      health.items?.[0]?.filterMetrics?.controlPlaneFailedLanes?.[0] === 'runtime_snapshot' &&
+      health.items?.[0]?.filterMetrics?.controlPlaneFailedLanes?.length === 1 &&
+      health.items?.[0]?.filterMetrics?.controlPlaneLanes?.runtime_snapshot?.lastFailure === 'snapshot transport timed out' &&
+      !Object.prototype.hasOwnProperty.call(health.items?.[0]?.filterMetrics?.controlPlaneLanes ?? {}, 'untrusted_lane') &&
       health.items?.[0]?.filterMetrics?.queueBytes === 1234 &&
       health.items?.[0]?.filterMetrics?.inflightEvents === 2 &&
       health.items?.[0]?.filterMetrics?.inflightBytes === 567 &&

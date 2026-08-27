@@ -117,6 +117,14 @@ export type AgentRuntimeAckReasonCode =
   | 'awaiting_ready';
 export type AgentCriticality = 'low' | 'medium' | 'high' | 'critical';
 export type CollectorHealthState = 'healthy' | 'quiet' | 'degraded' | 'stale' | 'down';
+export type CollectorHealthChannelState = 'healthy' | 'warning' | 'degraded' | 'unknown';
+export interface CollectorHealthChannel {
+  state: CollectorHealthChannelState;
+  stateText: string;
+  reasons: string[];
+  consecutiveBad: number;
+  consecutiveClean: number;
+}
 export type CollectorReportedStatus = 'ok' | 'degraded' | 'error';
 export type AlertStatus = 'open' | 'acknowledged' | 'resolved' | 'silenced';
 export type AlertKind = 'incident' | 'collector' | 'agent' | 'event' | 'judgment' | 'source' | 'coverage' | 'objective' | 'remediation';
@@ -2218,6 +2226,14 @@ export interface CollectorFilterMetrics {
   spoolReplayDeferred?: number;
   /** Heartbeat delivery failures; intentionally separate from event output loss. */
   heartbeatDeliveryFailures?: number;
+  /** Current independent control-plane lane state; counters remain cumulative diagnostics only. */
+  controlPlaneState?: 'starting' | 'healthy' | 'degraded';
+  controlPlaneFailedLanes?: Array<'identity' | 'filter_rules' | 'infrastructure_policy' | 'runtime_snapshot'>;
+  controlPlaneStartingLanes?: Array<'identity' | 'filter_rules' | 'infrastructure_policy' | 'runtime_snapshot'>;
+  controlPlaneLanes?: Partial<Record<
+    'identity' | 'filter_rules' | 'infrastructure_policy' | 'runtime_snapshot',
+    { lastSuccessAt?: string; lastFailureAt?: string; lastFailure?: string }
+  >>;
   /** Current durable ownership state, including live and parked records. */
   spoolRecords?: number;
   spoolActiveRecords?: number;
@@ -2484,6 +2500,12 @@ export interface CollectorHealthItem {
   mode?: string;
   state: CollectorHealthState;
   stateText: string;
+  /** Current channel health; requested-window maxima remain independent historical evidence. */
+  healthChannels: {
+    capture: CollectorHealthChannel;
+    delivery: CollectorHealthChannel;
+    control: CollectorHealthChannel;
+  };
   firstSeen?: string;
   lastEventAt?: string;
   lastHeartbeatAt?: string;
@@ -2524,6 +2546,7 @@ export interface CollectorHealthSummary {
   totalCollectors: number;
   healthyCollectors: number;
   quietCollectors: number;
+  warningCollectors: number;
   degradedCollectors: number;
   staleCollectors: number;
   downCollectors: number;

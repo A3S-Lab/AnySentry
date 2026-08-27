@@ -98,6 +98,8 @@
     "verify:ingest-protocols": "node scripts/verify-ingest-protocols.mjs",
     "verify:ingest-protocols:local": "pnpm build:api && node scripts/verify-deep-links-local.mjs scripts/verify-ingest-protocols.mjs",
     "verify:observer-ingest": "node scripts/verify-observer-ingest.mjs",
+    "verify:collector-health-channels": "pnpm build:api && node scripts/verify-collector-health-channels.mjs",
+    "verify:collector-health-ui": "pnpm build:web && node scripts/verify-collector-health-ui.mjs",
     "verify:observer-ingest:local": "pnpm build:api && node scripts/verify-deep-links-local.mjs scripts/verify-observer-ingest.mjs",
     "verify:forwarders": "node scripts/verify-forwarders.mjs",
     "verify:forwarder-attribution": "node scripts/verify-forwarder-attribution.mjs",

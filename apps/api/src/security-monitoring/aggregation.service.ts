@@ -137,6 +137,103 @@ function legacyEphemeralCollector(collectorId: string): boolean {
   return /^s3-enforce-\d{10,}-\d+-(?:collector|untrusted-heartbeat)$/u.test(collectorId);
 }
 
+type CollectorChannelEvaluation = { severity: 0 | 1 | 2; reasons: string[] };
+
+const CHANNEL_STATE_TEXT: Record<T.CollectorHealthChannelState, string> = {
+  healthy: '健康', warning: '提醒', degraded: '降级', unknown: '未知',
+};
+
+function recentHeartbeatLane(
+  heartbeats: readonly T.CollectorHeartbeatRecord[],
+  origin: T.CollectorHeartbeatOrigin,
+  limit = 4,
+): T.CollectorHeartbeatRecord[] {
+  const unique = new Map<string, T.CollectorHeartbeatRecord>();
+  for (const heartbeat of heartbeats) {
+    if (heartbeat.origin !== origin) continue;
+    const accounting = heartbeat.pipelineAccounting;
+    const key = accounting?.producerInstanceId && Number.isSafeInteger(accounting.sequence)
+      ? `${accounting.producerInstanceId}:${accounting.sequence}`
+      : `${heartbeat.at}:${heartbeat.filterMetricsReportedAt ?? ''}`;
+    const current = unique.get(key);
+    if (!current || heartbeat.at > current.at) unique.set(key, heartbeat);
+  }
+  return [...unique.values()].sort((left, right) => right.at - left.at).slice(0, limit);
+}
+
+export function stabilizeCollectorHealthChannel(
+  evaluations: readonly CollectorChannelEvaluation[],
+  recoveryReason: string,
+): T.CollectorHealthChannel {
+  if (!evaluations.length) {
+    return { state: 'unknown', stateText: CHANNEL_STATE_TEXT.unknown, reasons: ['heartbeat_unavailable'], consecutiveBad: 0, consecutiveClean: 0 };
+  }
+  const consecutiveBad = evaluations.findIndex((item) => item.severity === 0);
+  const bad = consecutiveBad < 0 ? evaluations.length : consecutiveBad;
+  const consecutiveClean = evaluations.findIndex((item) => item.severity > 0);
+  const clean = consecutiveClean < 0 ? evaluations.length : consecutiveClean;
+  const current = evaluations[0];
+  let state: T.CollectorHealthChannelState;
+  let reasons = [...current.reasons];
+  if (current.severity === 2) state = 'degraded';
+  else if (current.severity === 1) state = bad >= 2 ? 'degraded' : 'warning';
+  else if (clean < 2 && evaluations.slice(clean).some((item) => item.severity > 0)) {
+    state = 'warning';
+    reasons = [recoveryReason];
+  } else state = 'healthy';
+  return { state, stateText: CHANNEL_STATE_TEXT[state], reasons, consecutiveBad: bad, consecutiveClean: clean };
+}
+
+function captureEvaluation(heartbeat: T.CollectorHeartbeatRecord): CollectorChannelEvaluation {
+  const reasons: string[] = [];
+  const rings = heartbeat.pipelineAccounting?.rings ?? [];
+  const ringLoss = rings.some((ring) =>
+    ring.ringDropped > 0 || (ring.collectorDropped ?? 0) > 0 || ring.queueDropped > 0);
+  const capture = heartbeat.captureProfileMetrics;
+  if (heartbeat.status !== 'ok') reasons.push(`raw_status_${heartbeat.status}`);
+  if (heartbeat.droppedEvents > 0 || ringLoss) reasons.push('capture_pipeline_loss');
+  if (capture?.aggregateLedgerDegraded) reasons.push('capture_aggregate_ledger_degraded');
+  if (capture?.decisionConserved === false || capture?.payloadConserved === false) reasons.push('capture_accounting_not_conserved');
+  return { severity: reasons.length ? 2 : 0, reasons };
+}
+
+function deliveryEvaluation(heartbeat: T.CollectorHeartbeatRecord): CollectorChannelEvaluation {
+  const metrics = heartbeat.filterMetrics ?? {} as T.CollectorFilterMetrics;
+  const hard: string[] = [];
+  const soft: string[] = [];
+  if (heartbeat.outputDropped > 0) hard.push('permanent_output_loss');
+  if ((metrics.protectedQueueDropped ?? 0) > 0) hard.push('protected_queue_pressure');
+  if (metrics.spoolAtCapacity) hard.push('spool_at_capacity');
+  if ((metrics.spoolRecords ?? 0) > 0 && (metrics.spoolOldestAgeMs ?? 0) >= 60_000) {
+    hard.push('spool_backlog_over_slo');
+  }
+  if ((metrics.queueParked ?? 0) > 0) soft.push('queue_parked');
+  if ((metrics.retryParked ?? 0) > 0) soft.push('retry_parked');
+  if ((metrics.heartbeatDeliveryFailures ?? 0) > 0) soft.push('heartbeat_delivery_failed');
+  if ((metrics.spoolParkedRecords ?? 0) > 0) soft.push('spool_backlog');
+  if ((metrics.outstandingOldestAgeMs ?? 0) >= 30_000) soft.push('delivery_backlog_aged');
+  return hard.length
+    ? { severity: 2, reasons: hard }
+    : soft.length
+      ? { severity: 1, reasons: soft }
+      : { severity: 0, reasons: [] };
+}
+
+function controlEvaluation(heartbeat: T.CollectorHeartbeatRecord): CollectorChannelEvaluation {
+  const metrics = heartbeat.filterMetrics ?? {} as T.CollectorFilterMetrics;
+  const reasons: string[] = [];
+  if (metrics.controlPlaneState === 'degraded') {
+    reasons.push(...(metrics.controlPlaneFailedLanes ?? []).map((lane) => `control_${lane}_failed`));
+    if (!reasons.length) reasons.push('control_plane_degraded');
+  }
+  if (metrics.controlPlaneState === 'starting') reasons.push('control_plane_starting');
+  if (metrics.controlPlaneState === undefined && heartbeat.errorCount > 0) reasons.push('legacy_forwarder_error');
+  if (metrics.captureProfileControlPlaneState === 'lkg_degraded') reasons.push('capture_profile_lkg_degraded');
+  if (metrics.unifiedProjectionState === 'degraded') reasons.push('filter_projection_degraded');
+  if (metrics.controlPlaneLanes?.identity && !metrics.identitySnapshotReady) reasons.push('identity_snapshot_not_ready');
+  return { severity: reasons.includes('capture_profile_lkg_degraded') ? 2 : reasons.length ? 1 : 0, reasons };
+}
+
 export function resolvedClassificationView(
   filter: Pick<T.SecurityTimeFilter, 'classificationView'>,
 ): T.ClassificationView {
@@ -4407,6 +4504,10 @@ export class AggregationService {
         t - latestRawHeartbeat.at <= COLLECTOR_STALE_MS
         ? latestRawHeartbeat
         : undefined;
+      const freshForwarderHeartbeat = latestForwarderHeartbeat !== undefined &&
+        t - latestForwarderHeartbeat.at <= COLLECTOR_STALE_MS
+        ? latestForwarderHeartbeat
+        : undefined;
       const collectorMetadataHeartbeat = freshRawHeartbeat ?? latest;
       const freshFileFilterHeartbeat = latestRawHeartbeat?.fileFilterMetricsReportedAt !== undefined &&
         t - latestRawHeartbeat.fileFilterMetricsReportedAt <= COLLECTOR_STALE_MS
@@ -4461,6 +4562,32 @@ export class AggregationService {
       }
       const age = latest ? t - latest.at : Infinity;
       const pipelineAccounting = summarizePipelineAccounting(hbs);
+      const laneHeartbeats = [
+        ...hbs,
+        ...(freshRawHeartbeat ? [freshRawHeartbeat] : []),
+        ...(freshForwarderHeartbeat ? [freshForwarderHeartbeat] : []),
+        ...(freshCaptureProfileHeartbeat ? [freshCaptureProfileHeartbeat] : []),
+      ];
+      const recentRaw = freshRawHeartbeat
+        ? recentHeartbeatLane(laneHeartbeats, 'raw_collector')
+        : [];
+      const recentForwarder = freshForwarderHeartbeat
+        ? recentHeartbeatLane(laneHeartbeats, 'forwarder')
+        : [];
+      const healthChannels = {
+        capture: stabilizeCollectorHealthChannel(
+          recentRaw.map(captureEvaluation),
+          'capture_recovering_after_recent_failure',
+        ),
+        delivery: stabilizeCollectorHealthChannel(
+          recentForwarder.map(deliveryEvaluation),
+          'delivery_recovering_after_recent_failure',
+        ),
+        control: stabilizeCollectorHealthChannel(
+          recentForwarder.map(controlEvaluation),
+          'control_recovering_after_recent_failure',
+        ),
+      };
       // Raw Collector and enriched Forwarder heartbeats are independent operational producers.
       // A clean record from one must not erase the latest error/drop reported by the other.
       const operationalHeads = [latestRawHeartbeat, latestForwarderHeartbeat].filter(
@@ -4478,15 +4605,7 @@ export class AggregationService {
       const currentQueueDepth = operationalHeads.reduce(
         (value, heartbeat) => Math.max(value, heartbeat.queueDepth), 0,
       );
-      const degraded = operationalHeads.some((heartbeat) =>
-        heartbeat.status !== 'ok' ||
-        heartbeat.droppedEvents > 0 ||
-        heartbeat.outputDropped > 0 ||
-        heartbeat.errorCount > 0,
-      ) || freshCaptureProfileHeartbeat?.captureProfileMetrics?.aggregateLedgerDegraded === true
-        || freshCaptureProfileHeartbeat?.captureProfileMetrics?.decisionConserved === false
-        || freshCaptureProfileHeartbeat?.captureProfileMetrics?.payloadConserved === false
-        || freshMetricsHeartbeat?.filterMetrics.captureProfileControlPlaneState === 'lkg_degraded';
+      const degraded = Object.values(healthChannels).some((channel) => channel.state === 'degraded');
       const state: T.CollectorHealthState = age > COLLECTOR_DOWN_MS
         ? 'down'
         : age > COLLECTOR_STALE_MS
@@ -4505,6 +4624,7 @@ export class AggregationService {
         mode: collectorMetadataHeartbeat?.mode,
         state,
         stateText: stateText[state],
+        healthChannels,
         firstSeen: hbs.length ? iso(Math.min(...hbs.map((hb) => hb.at))) : undefined,
         lastHeartbeatAt: latest ? iso(latest.at) : undefined,
         lastSeenAt: latest ? iso(latest.at) : undefined,
@@ -4650,6 +4770,9 @@ export class AggregationService {
       totalCollectors: filtered.length,
       healthyCollectors: filtered.filter((item) => item.state === 'healthy').length,
       quietCollectors: filtered.filter((item) => item.state === 'quiet').length,
+      warningCollectors: filtered.filter((item) =>
+        !['degraded', 'stale', 'down'].includes(item.state) &&
+        Object.values(item.healthChannels).some((channel) => channel.state === 'warning')).length,
       degradedCollectors: filtered.filter((item) => item.state === 'degraded').length,
       staleCollectors: filtered.filter((item) => item.state === 'stale').length,
       downCollectors: filtered.filter((item) => item.state === 'down').length,

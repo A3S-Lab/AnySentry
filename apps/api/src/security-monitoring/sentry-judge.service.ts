@@ -2148,6 +2148,27 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       clamp(rawQueueDroppedByClass[key]),
     ])) as NonNullable<import('./types').CollectorFilterMetrics['queueDroppedByClass']>;
     const captureProfileFilterMetrics: Partial<import('./types').CollectorFilterMetrics> = {};
+    const controlPlaneLaneNames = [
+      'identity', 'filter_rules', 'infrastructure_policy', 'runtime_snapshot',
+    ] as const;
+    const controlPlaneFailedLanes = controlPlaneLaneNames.filter((lane) =>
+      Array.isArray(rawFilter.controlPlaneFailedLanes) && rawFilter.controlPlaneFailedLanes.includes(lane));
+    const controlPlaneStartingLanes = controlPlaneLaneNames.filter((lane) =>
+      Array.isArray(rawFilter.controlPlaneStartingLanes) && rawFilter.controlPlaneStartingLanes.includes(lane));
+    const rawControlPlaneLanes = rawFilter.controlPlaneLanes && typeof rawFilter.controlPlaneLanes === 'object'
+      ? rawFilter.controlPlaneLanes
+      : {};
+    const controlPlaneLanes = Object.fromEntries(controlPlaneLaneNames.flatMap((lane) => {
+      const raw = rawControlPlaneLanes[lane];
+      if (!raw || typeof raw !== 'object') return [];
+      const success = cleanText(raw.lastSuccessAt, 80);
+      const failure = cleanText(raw.lastFailureAt, 80);
+      return [[lane, {
+        ...(success && Number.isFinite(Date.parse(success)) ? { lastSuccessAt: success } : {}),
+        ...(failure && Number.isFinite(Date.parse(failure)) ? { lastFailureAt: failure } : {}),
+        ...(cleanText(raw.lastFailure, 500) ? { lastFailure: cleanText(raw.lastFailure, 500) } : {}),
+      }]];
+    })) as NonNullable<import('./types').CollectorFilterMetrics['controlPlaneLanes']>;
     const captureCounter = (value: unknown): number | undefined =>
       typeof value === 'number' && Number.isFinite(value)
         ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.round(value)))
@@ -2320,6 +2341,12 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       spoolReplayAdmitted: clamp(rawFilter.spoolReplayAdmitted),
       spoolReplayDeferred: clamp(rawFilter.spoolReplayDeferred),
       heartbeatDeliveryFailures: clamp(rawFilter.heartbeatDeliveryFailures),
+      controlPlaneState: ['starting', 'healthy', 'degraded'].includes(rawFilter.controlPlaneState ?? '')
+        ? rawFilter.controlPlaneState as import('./types').CollectorFilterMetrics['controlPlaneState']
+        : 'starting',
+      controlPlaneFailedLanes,
+      controlPlaneStartingLanes,
+      controlPlaneLanes,
       spoolRecords: clamp(rawFilter.spoolRecords),
       spoolActiveRecords: clamp(rawFilter.spoolActiveRecords),
       spoolParkedRecords: clamp(rawFilter.spoolParkedRecords),

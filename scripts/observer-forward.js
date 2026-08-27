@@ -664,6 +664,53 @@ let runtimeSnapshotOperation = 0;
 let reconcileTimer;
 let reconcileRunning = false;
 let reconcilePending = false;
+const controlPlaneLanes = Object.fromEntries(
+  ['identity', 'filter_rules', 'infrastructure_policy', 'runtime_snapshot'].map((lane) => [
+    lane,
+    { lastSuccessAt: 0, lastFailureAt: 0, lastFailure: '' },
+  ]),
+);
+const enabledControlPlaneLanes = new Set([
+  ...(IDENTITY_SNAPSHOT_SECS > 0 ? ['identity'] : []),
+  ...(UNIFIED_FILTER_PROJECTION_SECS > 0 ? ['filter_rules'] : []),
+  ...(INFRASTRUCTURE_POLICY_SECS > 0 ? ['infrastructure_policy'] : []),
+  'runtime_snapshot',
+]);
+
+function markControlPlaneSuccess(lane) {
+  if (!controlPlaneLanes[lane]) return;
+  controlPlaneLanes[lane].lastSuccessAt = Date.now();
+}
+
+function markControlPlaneFailure(lane, reason) {
+  if (!controlPlaneLanes[lane]) return;
+  controlPlaneLanes[lane].lastFailureAt = Date.now();
+  controlPlaneLanes[lane].lastFailure = String(reason || 'control plane failure').slice(0, 500);
+}
+
+function controlPlaneMetrics() {
+  const failedLanes = [];
+  const startingLanes = [];
+  const lanes = {};
+  for (const [lane, state] of Object.entries(controlPlaneLanes)) {
+    if (!enabledControlPlaneLanes.has(lane)) continue;
+    if (!state.lastSuccessAt && !state.lastFailureAt) startingLanes.push(lane);
+    if (state.lastFailureAt > state.lastSuccessAt) failedLanes.push(lane);
+    lanes[lane] = {
+      ...(state.lastSuccessAt ? { lastSuccessAt: new Date(state.lastSuccessAt).toISOString() } : {}),
+      ...(state.lastFailureAt ? {
+        lastFailureAt: new Date(state.lastFailureAt).toISOString(),
+        lastFailure: state.lastFailure,
+      } : {}),
+    };
+  }
+  return {
+    state: failedLanes.length ? 'degraded' : startingLanes.length ? 'starting' : 'healthy',
+    failedLanes,
+    startingLanes,
+    lanes,
+  };
+}
 
 function recordRuntimeSnapshotFailure(reason, snapshotVersion = runtimeSnapshotVersion) {
   lastRuntimeSnapshotFailureAt = new Date().toISOString();
@@ -671,6 +718,7 @@ function recordRuntimeSnapshotFailure(reason, snapshotVersion = runtimeSnapshotV
   lastRuntimeSnapshotFailureVersion = Number.isSafeInteger(snapshotVersion) && snapshotVersion > 0
     ? snapshotVersion
     : 0;
+  markControlPlaneFailure('runtime_snapshot', lastRuntimeSnapshotFailure);
 }
 
 function retryableRuntimeSnapshotError(error) {
@@ -1419,8 +1467,10 @@ function refreshIdentitySnapshot() {
     if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) return;
     if (error || !workloadCache.replace(snapshot)) {
       if (error) workloadCache.errors++;
+      markControlPlaneFailure('identity', error?.message || 'identity snapshot rejected');
       return;
     }
+    markControlPlaneSuccess('identity');
     synchronizeInfrastructurePolicyRules();
   });
 }
@@ -1462,6 +1512,7 @@ function refreshInfrastructurePolicy() {
     (error, policy) => {
       if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) return;
       if (error) {
+        markControlPlaneFailure('infrastructure_policy', error.message);
         infrastructurePolicy.recordLoadError();
         filterRulePublisher.degradeToLastKnownGood(error.message);
         if (error.message !== lastInfrastructurePolicyError) {
@@ -1472,6 +1523,7 @@ function refreshInfrastructurePolicy() {
       }
       const loaded = infrastructurePolicy.replace(policy);
       if (!loaded.ok) {
+        markControlPlaneFailure('infrastructure_policy', loaded.error);
         filterRulePublisher.degradeToLastKnownGood(loaded.error);
         if (loaded.error !== lastInfrastructurePolicyError) {
           console.error(`[observer-forward] Infrastructure policy ignored: ${loaded.error}`);
@@ -1480,6 +1532,7 @@ function refreshInfrastructurePolicy() {
         return;
       }
       lastInfrastructurePolicyError = '';
+      markControlPlaneSuccess('infrastructure_policy');
       filterRulePublisher.markControlPlaneReady();
       const synchronized = synchronizeInfrastructurePolicyRules();
       if (loaded.version !== lastLoggedInfrastructurePolicyVersion) {
@@ -1515,6 +1568,7 @@ function refreshUnifiedFilterProjection(done = () => {}) {
         return;
       }
       if (error) {
+        markControlPlaneFailure('filter_rules', error.message);
         unifiedFilterPolicy.degrade(error.message);
         if (error.message !== lastUnifiedFilterProjectionError) {
           console.error(`[observer-forward] Unified Filter Rule projection unavailable: ${error.message}`);
@@ -1525,6 +1579,7 @@ function refreshUnifiedFilterProjection(done = () => {}) {
       }
       const loaded = unifiedFilterPolicy.replace(projection);
       if (!loaded.ok) {
+        markControlPlaneFailure('filter_rules', loaded.error);
         unifiedFilterPolicy.degrade(loaded.error);
         if (loaded.error !== lastUnifiedFilterProjectionError) {
           console.error(`[observer-forward] Unified Filter Rule projection ignored: ${loaded.error}`);
@@ -1534,6 +1589,7 @@ function refreshUnifiedFilterProjection(done = () => {}) {
         return;
       }
       lastUnifiedFilterProjectionError = '';
+      markControlPlaneSuccess('filter_rules');
       if (loaded.changed) {
         const signatureResult = signatureRegistry.replaceSafely(
           unifiedFilterPolicy.runtimeSignatureDocument(),
@@ -1776,6 +1832,7 @@ function sendRuntimeSnapshot(ready = true, done = () => {}, timeoutMs = 5_000) {
         if (attempt > 1) runtimeSnapshotRecovered++;
         lastRuntimeSnapshotAt = new Date().toISOString();
         lastRuntimeSnapshotError = '';
+        markControlPlaneSuccess('runtime_snapshot');
         finish(false);
       });
     };
@@ -1946,6 +2003,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
   }
   const eventQueues = eventQueueMetrics();
   const spoolMetrics = durableSpoolMetrics();
+  const controlPlane = controlPlaneMetrics();
   const accountingWindow = pipelineAccounting.beginDelivery({
     queueEvents: eventQueues.queueDepth,
     queueBytes: eventQueues.queueBytes,
@@ -2134,6 +2192,10 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
         spoolReplayAdmitted: classifications.spoolReplayAdmitted,
         spoolReplayDeferred: classifications.spoolReplayDeferred,
         heartbeatDeliveryFailures: classifications.heartbeatDeliveryFailures,
+        controlPlaneState: controlPlane.state,
+        controlPlaneFailedLanes: controlPlane.failedLanes,
+        controlPlaneStartingLanes: controlPlane.startingLanes,
+        controlPlaneLanes: controlPlane.lanes,
         spoolRecords: spoolMetrics.records,
         spoolActiveRecords: spoolMetrics.activeRecords,
         spoolParkedRecords: spoolMetrics.parkedRecords,
