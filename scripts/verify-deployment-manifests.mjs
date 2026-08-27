@@ -186,6 +186,12 @@ function verifyAnySentryManifest() {
     anySentryComposeService,
   );
   assert(
+    'Redis Source current-state projection is explicitly coalesced in Kubernetes and Compose',
+    /ANYSENTRY_CURRENT_STATE_SOURCE_FLUSH_MS:\s*"1000"/u.test(runtimeConfig?.source ?? '') &&
+      /^      ANYSENTRY_CURRENT_STATE_SOURCE_FLUSH_MS:\s*\$\{ANYSENTRY_CURRENT_STATE_SOURCE_FLUSH_MS:-1000\}\s*$/mu.test(anySentryComposeService),
+    { runtimeConfig: runtimeConfig?.source, compose: anySentryComposeService },
+  );
+  assert(
     'API V8 heap is fenced below the container memory limit',
     /\{\s*name:\s*NODE_OPTIONS,\s*value:\s*"--max-old-space-size=1024"\s*\}/u.test(anySentryDeployment?.source ?? '') &&
       /^      NODE_OPTIONS:\s*\$\{ANYSENTRY_API_NODE_OPTIONS:---max-old-space-size=1024\}\s*$/mu.test(anySentryComposeService),
@@ -402,6 +408,12 @@ function verifyAnySentryManifest() {
       /startupProbe:/u.test(redisStatefulSet?.source ?? '') &&
       /readinessProbe:/u.test(redisStatefulSet?.source ?? '') &&
       /livenessProbe:/u.test(redisStatefulSet?.source ?? ''),
+    redisStatefulSet?.source,
+  );
+  assert(
+    'Redis reserves its recovered working set and bounded AOF replay headroom',
+    /requests:\s*\{\s*cpu:\s*100m,\s*memory:\s*1Gi\s*\}/u.test(redisStatefulSet?.source ?? '') &&
+      /limits:\s*\{\s*cpu:\s*"1",\s*memory:\s*2Gi\s*\}/u.test(redisStatefulSet?.source ?? ''),
     redisStatefulSet?.source,
   );
   assert(

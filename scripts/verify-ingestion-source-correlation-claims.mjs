@@ -1,12 +1,75 @@
 import assert from 'node:assert/strict';
 
 process.env.ANYSENTRY_TRUSTED_CORRELATION_MODE = 'shadow';
+process.env.ANYSENTRY_CURRENT_STATE_SOURCE_FLUSH_MS = '100';
 
 const {
   IngestionSourceService,
   authorizeCorrelationClaims,
   normalizeCorrelationClaimsPolicy,
 } = await import('../apps/api/dist/security-monitoring/ingestion-source.service.js');
+const { DistributedCurrentStateService } = await import(
+  '../apps/api/dist/security-monitoring/distributed-current-state.service.js'
+);
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+{
+  const evaluations = [];
+  const currentState = new DistributedCurrentStateService();
+  currentState.redis = {
+    pipeline() {
+      const pipeline = {
+        eval(...args) {
+          evaluations.push(args);
+          return pipeline;
+        },
+        async exec() {
+          return [];
+        },
+      };
+      return pipeline;
+    },
+    async quit() {},
+    disconnect() {},
+  };
+  currentState.ready = true;
+
+  await Promise.all(Array.from({ length: 20_000 }, (_, index) => currentState.recordSourceActivity({
+    sourceId: 'high-rate-observer',
+    lastSeenAt: 10_000 + index,
+    lastEventAt: 10_000 + index,
+    collectorId: 'collector-a',
+    workspacePath: '/workspace/a',
+  })));
+  assert.equal(evaluations.length, 0, 'high-rate Source activity is buffered before the flush window');
+  await wait(150);
+  assert.equal(evaluations.length, 1, '20,000 events for one Source produce one Redis projection');
+  const firstProjection = JSON.parse(evaluations[0][4]);
+  assert.equal(firstProjection.lastSeenAt, 29_999);
+  assert.equal(firstProjection.lastEventAt, 29_999);
+
+  await currentState.recordSourceActivity({
+    sourceId: 'high-rate-observer',
+    lastSeenAt: 30_000,
+    lastHeartbeatAt: 30_000,
+    collectorId: 'collector-a',
+  });
+  await currentState.recordSourceActivity({
+    sourceId: 'high-rate-observer',
+    lastSeenAt: 30_001,
+    lastEventAt: 30_001,
+    workspacePath: '/workspace/b',
+  });
+  await wait(150);
+  assert.equal(evaluations.length, 2, 'the next window emits only the latest merged Source state');
+  const secondProjection = JSON.parse(evaluations[1][4]);
+  assert.equal(secondProjection.lastEventAt, 30_001);
+  assert.equal(secondProjection.lastHeartbeatAt, 30_000);
+  assert.equal(secondProjection.collectorId, 'collector-a');
+  assert.equal(secondProjection.workspacePath, '/workspace/b');
+  await currentState.onModuleDestroy();
+}
 
 function service() {
   return new IngestionSourceService(

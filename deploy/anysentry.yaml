@@ -246,6 +246,9 @@ data:
   ANYSENTRY_CAPTURE_PROFILE_MODE: "shadow"
   ANYSENTRY_UNKNOWN_RETENTION_MODE: "shadow"
   ANYSENTRY_REDIS_URL: "redis://redis:6379/0"
+  # Redis carries only the latest Source cursor. Coalesce high-rate events before projection so
+  # Observer throughput cannot become equivalent AOF write throughput.
+  ANYSENTRY_CURRENT_STATE_SOURCE_FLUSH_MS: "1000"
   # The streaming resources remain available in deploy/streaming.yaml, but production operators
   # opt in explicitly after Kafka/Flink capacity and retention have been reviewed.
   ANYSENTRY_STREAMING: "off"
