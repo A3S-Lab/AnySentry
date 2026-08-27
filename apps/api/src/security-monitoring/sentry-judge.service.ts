@@ -1261,6 +1261,16 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     }
     const routing = this.routingForBase(base, protectedRoute);
     if (routing.profile === 'discard') return { disposition: 'discarded', reasonCode: routing.reason };
+    // `l1_only` is a terminal routing decision, not a request to spend a BullMQ round trip on the
+    // local deterministic rules engine. High-rate Unknown telemetry must remain retained and
+    // classified without multiplying every event into queue/AOF writes. Full Agent and protected
+    // security routes continue through the asynchronous L2/L3 pipeline below.
+    if (routing.profile === 'l1_only') {
+      const event = this.prepareSynchronousJudgment(line, meta, at, base);
+      return event
+        ? { disposition: 'retained', event, notify: true }
+        : { disposition: 'rejected', reasonCode: 'unsupported_or_unparseable' };
+    }
     if (!this.queues.enabled) {
       const event = this.prepareSynchronousJudgment(line, meta, at, base);
       return event

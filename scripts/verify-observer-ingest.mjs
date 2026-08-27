@@ -900,11 +900,12 @@ async function verifyJudgeDispositionContract() {
         attribution: { ...meta.attribution, classification: 'unknown', reason: 'not_evaluated', confidence: 0 },
       });
       assert(
-        'Judge queued path retains and enqueues a supported event',
+        'Unknown l1_only routing is retained and completed without BullMQ amplification',
         retained.disposition === 'retained' &&
-          retained.event?.decisionStatus === 'pending' &&
+          retained.event?.decisionStatus === 'succeeded' &&
           retained.event?.activityContext === 'agent_action' &&
-          enqueued === 1,
+          retained.event?.judgment?.profile === 'l1_only' &&
+          enqueued === 0,
         { retained, enqueued },
       );
       const platform = await judge.acceptWithDisposition('{}', {
@@ -914,15 +915,34 @@ async function verifyJudgeDispositionContract() {
         attribution: { ...meta.attribution, classification: 'unknown', reason: 'not_evaluated', confidence: 0 },
       });
       assert(
-        'platform healthcheck keeps ToolExec and still enters the security judgment queue',
+        'platform healthcheck keeps ToolExec but terminates at local L1',
         platform.disposition === 'retained' &&
           platform.event?.eventKind === 'ToolExec' &&
           platform.event?.eventCategory === 'runtime' &&
           platform.event?.activityContext === 'platform_healthcheck' &&
           platform.event?.activitySubtype === 'k8s_readiness_probe' &&
-          platform.event?.decisionStatus === 'pending' &&
-          enqueued === 2,
+          platform.event?.decisionStatus === 'succeeded' &&
+          platform.event?.judgment?.profile === 'l1_only' &&
+          enqueued === 0,
         { platform, enqueued },
+      );
+      const full = await judge.acceptWithDisposition('{}', {
+        ...meta,
+        attribution: {
+          ...meta.attribution,
+          monitored: true,
+          classification: 'confirmed_agent',
+          reason: 'authoritative_anchor',
+          confidence: 1,
+        },
+      });
+      assert(
+        'confirmed Agent full routing still enters the asynchronous judgment queue',
+        full.disposition === 'retained' &&
+          full.event?.decisionStatus === 'pending' &&
+          full.event?.judgment?.profile === 'full' &&
+          enqueued === 1,
+        { full, enqueued },
       );
     }
   }
