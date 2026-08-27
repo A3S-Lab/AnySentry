@@ -210,6 +210,12 @@ const SPOOL_DEGRADED_AGE_MS = boundedNumber(
   3_600_000,
 );
 const HTTP_TIMEOUT_MS = boundedNumber(process.env.FORWARD_HTTP_TIMEOUT_MS, 10_000, 1_000, 120_000);
+const CONTROL_HTTP_TIMEOUT_MS = boundedNumber(
+  process.env.FORWARD_CONTROL_HTTP_TIMEOUT_MS,
+  5_000,
+  100,
+  120_000,
+);
 const BATCH_ACK_MAX_BYTES = boundedNumber(
   process.env.FORWARD_BATCH_ACK_MAX_BYTES,
   1024 * 1024,
@@ -842,6 +848,7 @@ function postJson(url, bodyObj, timeoutMs, done) {
   const body = JSON.stringify(bodyObj);
   let settled = false;
   let absoluteTimer;
+  let timeoutAbortImmediate;
   let req;
   let response;
   let abortReason = '';
@@ -858,6 +865,7 @@ function postJson(url, bodyObj, timeoutMs, done) {
     if (settled) return;
     settled = true;
     if (absoluteTimer) clearTimeout(absoluteTimer);
+    if (timeoutAbortImmediate) clearImmediate(timeoutAbortImmediate);
     activeControlRequests.delete(state);
     done(Boolean(failed), abortReason || reason);
   };
@@ -888,7 +896,11 @@ function postJson(url, bodyObj, timeoutMs, done) {
   activeControlRequests.add(state);
   req.on('error', () => finish(true));
   absoluteTimer = setTimeout(() => {
-    state.abort();
+    absoluteTimer = undefined;
+    timeoutAbortImmediate = setImmediate(() => {
+      timeoutAbortImmediate = undefined;
+      state.abort();
+    });
   }, timeoutMs);
   req.end(body);
 }
@@ -1289,6 +1301,7 @@ function postJsonResponse(
   const body = JSON.stringify(bodyObj);
   let settled = false;
   let absoluteTimer;
+  let timeoutAbortImmediate;
   let req;
   let response;
   let abortReason = '';
@@ -1305,6 +1318,7 @@ function postJsonResponse(
     if (settled) return;
     settled = true;
     if (absoluteTimer) clearTimeout(absoluteTimer);
+    if (timeoutAbortImmediate) clearImmediate(timeoutAbortImmediate);
     activeControlRequests.delete(state);
     done(abortReason ? new Error(abortReason) : error, value);
   };
@@ -1370,7 +1384,14 @@ function postJsonResponse(
   activeControlRequests.add(state);
   req.on('error', (error) => finish(error));
   absoluteTimer = setTimeout(() => {
-    state.abort('control endpoint request timed out');
+    absoluteTimer = undefined;
+    // A synchronous WAL or classification burst can resume the event loop after both the
+    // deadline and the HTTP response are already ready. Give the poll phase one turn to consume
+    // that on-time response before an overdue timer destroys its socket.
+    timeoutAbortImmediate = setImmediate(() => {
+      timeoutAbortImmediate = undefined;
+      state.abort('control endpoint request timed out');
+    });
   }, timeoutMs);
   req.end(body);
   return state;
@@ -1389,6 +1410,7 @@ function getJson(url, timeoutMs, done, extraHeaders = {}, requestAgent, maxRespo
   }
   let settled = false;
   let absoluteTimer;
+  let timeoutAbortImmediate;
   let req;
   let response;
   let abortReason = '';
@@ -1405,6 +1427,7 @@ function getJson(url, timeoutMs, done, extraHeaders = {}, requestAgent, maxRespo
     if (settled) return;
     settled = true;
     if (absoluteTimer) clearTimeout(absoluteTimer);
+    if (timeoutAbortImmediate) clearImmediate(timeoutAbortImmediate);
     activeControlRequests.delete(state);
     done(abortReason ? new Error(abortReason) : error, value);
   };
@@ -1456,14 +1479,20 @@ function getJson(url, timeoutMs, done, extraHeaders = {}, requestAgent, maxRespo
   activeControlRequests.add(state);
   req.on('error', (error) => finish(error));
   absoluteTimer = setTimeout(() => {
-    state.abort('identity snapshot timeout');
+    absoluteTimer = undefined;
+    // See postJsonResponse: an expired timer must not outrank response bytes that arrived while
+    // the Forwarder event loop was briefly occupied by the data plane.
+    timeoutAbortImmediate = setImmediate(() => {
+      timeoutAbortImmediate = undefined;
+      state.abort('control endpoint request timed out');
+    });
   }, timeoutMs);
   req.end();
   return state;
 }
 
 function refreshIdentitySnapshot() {
-  getJson(identitySnapshotTarget, 5000, (error, snapshot) => {
+  getJson(identitySnapshotTarget, CONTROL_HTTP_TIMEOUT_MS, (error, snapshot) => {
     if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) return;
     if (error || !workloadCache.replace(snapshot)) {
       if (error) workloadCache.errors++;
@@ -1508,7 +1537,7 @@ function refreshInfrastructurePolicy() {
   if (!INFRASTRUCTURE_POLICY_SECS) return;
   getJson(
     infrastructurePolicyTarget,
-    5_000,
+    CONTROL_HTTP_TIMEOUT_MS,
     (error, policy) => {
       if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) return;
       if (error) {
@@ -1561,7 +1590,7 @@ function refreshUnifiedFilterProjection(done = () => {}) {
   }
   getJson(
     unifiedFilterProjectionTarget,
-    5_000,
+    CONTROL_HTTP_TIMEOUT_MS,
     (error, projection) => {
       if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) {
         done();
@@ -1650,7 +1679,7 @@ function runtimeLeaseRequest() {
         forwarderPid: processIdentity.pid,
         forwarderStartTimeTicks: processIdentity.startTimeTicks,
       },
-      5_000,
+      CONTROL_HTTP_TIMEOUT_MS,
       (error, ack) => {
         if (error) {
           resolve({ ok: false, reason: error.message, transient: true });

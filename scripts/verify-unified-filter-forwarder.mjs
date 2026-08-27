@@ -38,6 +38,9 @@ const projection = compileFilterRuleProjection({
 const projectionHeaders = [];
 const batches = [];
 const heartbeats = [];
+let pauseNextProjection = false;
+let pausedProjectionResumed = false;
+let child;
 const temporary = mkdtempSync(path.join(os.tmpdir(), 'anysentry-unified-forwarder-'));
 const internalContainerId = 'a'.repeat(64);
 const agentContainerId = 'b'.repeat(64);
@@ -47,6 +50,16 @@ const server = http.createServer(async (request, response) => {
   const body = raw ? JSON.parse(raw) : undefined;
   if (request.url === '/security-center/filter-rules/projections/forwarder') {
     projectionHeaders.push(request.headers);
+    if (pauseNextProjection && child?.pid) {
+      pauseNextProjection = false;
+      process.kill(child.pid, 'SIGSTOP');
+      json(response, 200, projection);
+      setTimeout(() => {
+        if (child?.exitCode === null) process.kill(child.pid, 'SIGCONT');
+        pausedProjectionResumed = true;
+      }, 250);
+      return;
+    }
     json(response, 200, projection);
     return;
   }
@@ -130,7 +143,7 @@ await new Promise((resolve, reject) => {
 const address = server.address();
 assert(address && typeof address === 'object');
 const base = `http://127.0.0.1:${address.port}/security-center`;
-const child = spawn(process.execPath, ['scripts/observer-forward.js'], {
+child = spawn(process.execPath, ['scripts/observer-forward.js'], {
   env: {
     ...process.env,
     ANYSENTRY_INGEST_URL: `${base}/ingest`,
@@ -141,6 +154,7 @@ const child = spawn(process.execPath, ['scripts/observer-forward.js'], {
     ANYSENTRY_AGENT_RUNTIME_LEASE_URL: `${base}/runtime/lease`,
     ANYSENTRY_FILTER_RULE_PROJECTION_URL: `${base}/filter-rules/projections/forwarder`,
     ANYSENTRY_FILTER_RULE_PROJECTION_SECS: '0.05',
+    FORWARD_CONTROL_HTTP_TIMEOUT_MS: '100',
     ANYSENTRY_UNKNOWN_RETENTION_MODE: 'enforce',
     ANYSENTRY_INFRASTRUCTURE_POLICY_TOKEN: 'unified-control-token',
     ANYSENTRY_INFRASTRUCTURE_POLICY_SECS: '0',
@@ -337,6 +351,27 @@ try {
   assert.equal(heartbeat.filterMetrics.unifiedForwarderVersion, 9);
   assert.equal(heartbeat.filterMetrics.unifiedRuntimeSignatures, 6);
   assert.equal(heartbeat.filterMetrics.unifiedProjectionLoadErrors, 0);
+
+  const projectionCountBeforePause = projectionHeaders.length;
+  const heartbeatCountBeforePause = heartbeats.length;
+  pauseNextProjection = true;
+  await eventually(
+    'control response queued while the Forwarder event loop is paused past its deadline',
+    () => pausedProjectionResumed && projectionHeaders.length > projectionCountBeforePause,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.doesNotMatch(
+    stderr,
+    /Unified Filter Rule projection unavailable: control endpoint request timed out/u,
+    'an overdue timer must let an already-arrived control response complete first',
+  );
+  const postPauseHeartbeat = await eventually('healthy control lane after delayed event-loop turn', () =>
+    [...heartbeats.slice(heartbeatCountBeforePause)].reverse().find((item) =>
+      item.filterMetrics?.controlPlaneState === 'healthy'
+      && item.filterMetrics?.controlPlaneFailedLanes?.length === 0));
+  assert.equal(postPauseHeartbeat.errorCount, 0);
+  assert.equal(postPauseHeartbeat.filterMetrics.unifiedProjectionLoadErrors, 0);
+  assert.equal(postPauseHeartbeat.filterMetrics.controlPlaneLanes.filter_rules.lastFailureAt, undefined);
 
   child.stdin.end();
   const exit = await Promise.race([
