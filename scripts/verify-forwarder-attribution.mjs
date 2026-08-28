@@ -342,6 +342,33 @@ function attributor(procEntries = []) {
 }
 
 {
+  // A same-product CLI launched through an Agent-owned shell is still a new session/root. Only
+  // the uninterrupted Node-launcher -> native-binary implementation chain may share a root.
+  const judge = attributor([
+    { pid: 1_450, tgid: 1_450, ppid: 1, startTime: '145', comm: 'codex', exe: '/vendor/codex', argv: '/vendor/codex exec', cwd: '/workspace/parent' },
+    { pid: 1_451, tgid: 1_451, ppid: 1_450, startTime: '146', comm: 'bash', exe: '/usr/bin/bash', argv: 'bash -lc codex', cwd: '/workspace/child' },
+    { pid: 1_452, tgid: 1_452, ppid: 1_451, startTime: '147', comm: 'codex', exe: '/vendor/codex', argv: '/vendor/codex exec', cwd: '/workspace/child' },
+  ]);
+  const parent = judge.classify(observerEvent({
+    pid: 1_450, ppid: 1, comm: 'codex', exe: '/vendor/codex', startTimeNs: '145',
+    cwd: '/workspace/parent', argv: ['/vendor/codex', 'exec'],
+  }));
+  judge.classify(observerEvent({
+    pid: 1_451, ppid: 1_450, comm: 'bash', exe: '/usr/bin/bash', startTimeNs: '146',
+    cwd: '/workspace/child', argv: ['bash', '-lc', 'codex'],
+  }));
+  const child = judge.classify(observerEvent({
+    pid: 1_452, ppid: 1_451, comm: 'codex', exe: '/vendor/codex', startTimeNs: '147',
+    cwd: '/workspace/child', argv: ['/vendor/codex', 'exec'],
+  }));
+  assert.equal(parent.attribution.agentScopeId, 'codex');
+  assert.equal(child.attribution.agentScopeId, 'codex');
+  assert.notEqual(child.attribution.agentInstanceId, parent.attribution.agentInstanceId);
+  assert.equal(child.attribution.rootPid, 1_452);
+  assert.equal(judge.runtimeSnapshot().entries.length, 2);
+}
+
+{
   let reads = 0;
   const cyclic = new Map([
     [1_501, { pid: 1_501, tgid: 1_501, ppid: 1_502, startTime: '151', comm: 'bash', exe: '/usr/bin/bash', argv: 'bash' }],

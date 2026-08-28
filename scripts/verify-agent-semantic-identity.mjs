@@ -246,6 +246,70 @@ assert.equal(detectedAgentIdentity(codexTwo).agentProduct, 'codex');
 assert.notEqual(agentAssetIdForEvent(codexOne), agentAssetIdForEvent(codexTwo));
 assert.notEqual(agentRuntimeInstanceIdForEvent(codexOne), agentRuntimeInstanceIdForEvent(codexTwo));
 
+const dockerContainerId = 'f9896b781d94d050a6211e07248b69fb9576966f4b7ac7170045f5c1c2fa616b';
+const dockerPhysical = `docker:node-a:${dockerContainerId}`;
+const dockerAgent = (product, pid, startTime) => baseEvent({
+  eventId: `docker-${product}-${pid}`,
+  agentId: product,
+  workspacePath: '/opt/agent-lab',
+  attributes: {},
+  process: {
+    hostId: 'node-a', bootId: 'boot-a', pid, ppid: 1,
+    startTimeTicks: startTime, comm: product.toLowerCase(),
+    exe: `/opt/${product.toLowerCase()}/agent`, cwd: '/opt/agent-lab',
+    cgroup: `0::/system.slice/docker-${dockerContainerId}.scope`,
+  },
+  attribution: {
+    monitored: true, classification: 'probable_agent', agentScopeId: product,
+    agentDisplayName: product, agentInstanceId: dockerPhysical,
+    physicalWorkloadId: dockerPhysical,
+    rootPid: pid, rootStartTime: startTime, confidence: 0.95,
+    reason: 'runtime_signature', source: 'process_signature',
+    evidence: [`runtime_signature:commExact=${product.toLowerCase()}`],
+  },
+});
+const dockerCodex = dockerAgent('Codex', 300, '3000');
+const dockerClaude = dockerAgent('Claude Code', 400, '4000');
+const dockerCodexRestarted = dockerAgent('Codex', 500, '5000');
+const dockerCodexChild = structuredClone(dockerCodex);
+dockerCodexChild.eventId = 'docker-codex-child';
+dockerCodexChild.process.pid = 301;
+dockerCodexChild.process.ppid = 300;
+dockerCodexChild.process.startTimeTicks = '3001';
+dockerCodexChild.process.comm = 'worker';
+dockerCodexChild.attribution.source = 'process_graph';
+dockerCodexChild.attribution.evidence = ['process_lineage:cached_agent_root'];
+
+assert.match(
+  projectAgentSemanticIdentity(dockerCodex).canonicalIdentityKey,
+  /^docker-agent-root:v1:/u,
+);
+assert.notEqual(
+  agentAssetIdForEvent(dockerCodex),
+  agentAssetIdForEvent(dockerClaude),
+  'two exact Agent products in one Docker container remain distinct logical assets',
+);
+assert.equal(
+  agentAssetIdForEvent(dockerCodex),
+  agentAssetIdForEvent(dockerCodexRestarted),
+  'one Agent product keeps its logical asset across process restarts in the same container',
+);
+assert.notEqual(
+  agentRuntimeInstanceIdForEvent(dockerCodex),
+  agentRuntimeInstanceIdForEvent(dockerCodexRestarted),
+  'a Docker Agent process restart still creates a new runtime instance',
+);
+assert.equal(agentAssetIdForEvent(dockerCodex), agentAssetIdForEvent(dockerCodexChild));
+assert.equal(agentRuntimeInstanceIdForEvent(dockerCodex), agentRuntimeInstanceIdForEvent(dockerCodexChild));
+const dockerMetadata = new AgentMetadataService(relationalStub);
+const resolvedDockerCodex = dockerMetadata.resolveEvent(dockerCodex);
+const resolvedDockerClaude = dockerMetadata.resolveEvent(dockerClaude);
+assert.notEqual(
+  resolvedDockerCodex.agentAssetId,
+  resolvedDockerClaude.agentAssetId,
+  'the shared physical-container alias must not collapse two equally strong logical Agent assets',
+);
+
 const judge = {
   query: () => [observerEvent, adapterEvent],
   listIncidents: () => [],

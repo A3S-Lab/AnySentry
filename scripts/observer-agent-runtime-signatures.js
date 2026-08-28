@@ -102,6 +102,16 @@ const BUILTIN_RUNTIMES = [
     ],
   },
   {
+    id: 'langchain-service',
+    agentScopeId: 'langchain',
+    displayName: 'LangChain',
+    variants: [
+      { argvPrefix: ['python /opt/anysentry-langchain-service/service.py'] },
+      { argvPrefix: ['python3 /opt/anysentry-langchain-service/service.py'] },
+      { argvPrefix: ['/opt/anysentry-langchain-service/.venv/bin/python /opt/anysentry-langchain-service/service.py'] },
+    ],
+  },
+  {
     id: 'kimi-cli',
     displayName: 'Kimi Code CLI',
     variants: [

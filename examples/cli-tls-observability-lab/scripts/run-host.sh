@@ -40,6 +40,10 @@ done
 curl --fail --silent --cacert "$tls_dir/ca.crt" \
   "https://127.0.0.1:$CLI_LAB_HTTPS_PORT/healthz" >/dev/null
 curl --fail --silent "http://127.0.0.1:$CLI_LAB_HTTP_PORT/healthz" >/dev/null
+# Codex checks SSL_CERT_FILE/CODEX_CA_CERTIFICATE itself and deliberately switches reqwest to
+# Rustls when either is set. A hashed SSL_CERT_DIR is consumed by the embedded native OpenSSL
+# path instead, which is the exact TLS boundary exercised by this lab/profile.
+openssl rehash "$tls_dir" >/dev/null
 
 for product in "${products[@]}"; do
   node "$lab_root/app/run-cli.mjs" "$product"

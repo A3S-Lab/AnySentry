@@ -58,6 +58,11 @@ if (product === 'codex') {
   command = await codexBinary();
   prompt = 'Run the model-requested fixture command, then finish. CODEX_FINAL_PROMPT_SENTINEL_20260827';
   const protocol = process.env.CLI_LAB_CODEX_PROTOCOL === 'https' ? 'https' : 'http';
+  if (protocol === 'https') {
+    delete env.SSL_CERT_FILE;
+    delete env.CODEX_CA_CERTIFICATE;
+    env.SSL_CERT_DIR = tlsDirectory;
+  }
   const providerPort = protocol === 'https' ? port : httpPort;
   const provider = `{ name = "AnySentry fixture", base_url = "${protocol}://127.0.0.1:${providerPort}/v1", env_key = "CLI_LAB_API_KEY", wire_api = "responses", supports_websockets = false, request_max_retries = 0, stream_max_retries = 0 }`;
   args = [

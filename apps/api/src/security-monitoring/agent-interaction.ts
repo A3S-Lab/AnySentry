@@ -213,6 +213,20 @@ export function parseObserverAgentInteraction(
     : [];
   const statusCode = integer(input.statusCode, 0, 999) ?? 0;
   const receivedAt = meta.receivedAt ?? Date.now();
+  const runtimeSessionId = string(meta.sessionId, 512);
+  const providerConversationId = string(input.providerConversationId, 512);
+  const providerResponseId = string(input.providerResponseId, 512);
+  const providerPreviousResponseId = string(input.providerPreviousResponseId, 512);
+  const conversationId = string(input.conversationId, 512);
+  const conversationIdSource = input.conversationIdSource === 'provider'
+    || input.conversationIdSource === 'runtime'
+    || input.conversationIdSource === 'inferred'
+    ? input.conversationIdSource
+    : undefined;
+  const rootPid = meta.attribution?.rootPid;
+  const runtimeRole = process?.pid && rootPid && process.pid !== rootPid
+    ? 'network_runtime'
+    : 'agent_root';
   return {
     schemaVersion: 'anysentry.agent_interaction.v1',
     interactionId,
@@ -224,6 +238,16 @@ export function parseObserverAgentInteraction(
     agentAssetId,
     agentInstanceId: semanticIdentity.agentRuntimeInstanceId,
     agentProduct: semanticIdentity.agentProduct ?? meta.attribution?.agentDisplayName ?? meta.agentId,
+    ...(runtimeSessionId ? { runtimeSessionId } : {}),
+    ...(providerConversationId ? { providerConversationId } : {}),
+    ...(providerResponseId ? { providerResponseId } : {}),
+    ...(providerPreviousResponseId ? { providerPreviousResponseId } : {}),
+    ...(conversationId ? { conversationId } : {}),
+    ...(conversationIdSource ? { conversationIdSource } : {}),
+    runtimeRole,
+    correlationQuality: meta.subjectAssetId && semanticIdentity.agentRuntimeInstanceId
+      ? 'exact'
+      : meta.subjectAssetId ? 'strong' : 'inferred',
     detectedClassification: detected,
     currentEffectiveClassification: detected,
     process,

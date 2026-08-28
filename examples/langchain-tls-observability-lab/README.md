@@ -29,3 +29,14 @@ Test-only dependencies are pinned in the Dockerfile (`langchain==1.3.17` and
 statement remains transport-specific: Python runtime with a verified dynamic OpenSSL ABI,
 HTTP/1.1, JSON and SSE. A LangChain deployment using HTTP/2, a different TLS implementation, or a
 remote sidecar/gateway must report its own coverage state.
+
+## HTTP service fixture
+
+`app/service.py` exposes `GET /health` and `POST /invoke` for testing a long-running LangChain
+Agent entered through HTTP rather than a one-shot CLI. It uses one deterministic
+`lookup_fixture(key="canary")` tool and sends every model call through the configured HTTPS
+OpenAI-compatible base URL. Provider URL and credentials are required runtime environment values;
+they are never embedded in this source or returned by the service.
+
+The service-only dependencies are pinned in `requirements-service.txt`. They remain a manual lab
+environment and do not become AnySentry production dependencies.

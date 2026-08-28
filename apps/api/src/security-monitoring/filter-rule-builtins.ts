@@ -72,10 +72,20 @@ export interface BuiltinRuntimeSignature {
   variants: Array<Partial<Record<'commExact' | 'exeBasename' | 'argv0Basename' | 'argvPrefix', string[]>>>;
 }
 
-export const BUILTIN_RUNTIME_SIGNATURE_VERSION = 2;
+export const BUILTIN_RUNTIME_SIGNATURE_VERSION = 3;
 export const BUILTIN_RUNTIME_SIGNATURES: BuiltinRuntimeSignature[] = [
   { id: 'codex', displayName: 'Codex', variants: [{ commExact: ['codex'] }, { argv0Basename: ['codex'] }] },
   { id: 'pi', displayName: 'Pi', variants: [{ commExact: ['pi'] }, { argv0Basename: ['pi'] }] },
+  {
+    id: 'langchain-service', agentScopeId: 'langchain', displayName: 'LangChain',
+    variants: [{
+      argvPrefix: [
+        'python /opt/anysentry-langchain-service/service.py',
+        'python3 /opt/anysentry-langchain-service/service.py',
+        '/opt/anysentry-langchain-service/.venv/bin/python /opt/anysentry-langchain-service/service.py',
+      ],
+    }],
+  },
   {
     id: 'a3s-code', agentScopeId: 'a3s code', displayName: 'A3S Code',
     variants: [{ commExact: ['a3s', 'a3s-code', 'a3s code'] }, { argvPrefix: ['a3s code', 'a3s-code'] }],

@@ -249,6 +249,7 @@ export function detectedAgentIdentity(
     identityReasonCode: semantic.reasonCode,
     identityResolutionRank: semantic.canonicalIdentityKey.startsWith('k8s-agent-logical:v1:')
       || semantic.canonicalIdentityKey.startsWith('docker-agent-logical:v1:')
+      || semantic.canonicalIdentityKey.startsWith('docker-agent-root:v1:')
       ? 4
       : semantic.agentRootInstanceId
         ? 3

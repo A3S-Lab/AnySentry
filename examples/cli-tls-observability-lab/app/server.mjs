@@ -18,6 +18,7 @@ const CODEX_PROMPT = 'CODEX_FINAL_PROMPT_SENTINEL_20260827';
 const CODEX_TOOL = 'CODEX_TOOL_RESULT_SENTINEL_20260827';
 const CLAUDE_PROMPT = 'CLAUDE_FINAL_PROMPT_SENTINEL_20260827';
 const CLAUDE_TOOL = 'CLAUDE_TOOL_RESULT_SENTINEL_20260827';
+const LANGCHAIN_TOOL = 'LANGCHAIN_HTTP_TOOL_RESULT_20260829';
 let writeChain = Promise.resolve();
 
 function record(value) {
@@ -171,6 +172,50 @@ function claudeEvents(body) {
   ];
 }
 
+function langchainResponse(body) {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const hasToolResult = messages.some((message) =>
+    message?.role === 'tool' && message?.tool_call_id === 'call_langchain_fixture');
+  if (!hasToolResult) {
+    return {
+      id: `chatcmpl_fixture_${Date.now()}`,
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1_000),
+      model: 'fixture-chat-model',
+      choices: [{
+        index: 0,
+        finish_reason: 'tool_calls',
+        message: {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_langchain_fixture',
+            type: 'function',
+            function: { name: 'lookup_fixture', arguments: JSON.stringify({ key: 'canary' }) },
+          }],
+        },
+      }],
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+    };
+  }
+  const prompt = [...messages].reverse().find((message) => message?.role === 'user')?.content ?? '';
+  return {
+    id: `chatcmpl_fixture_${Date.now()}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1_000),
+    model: 'fixture-chat-model',
+    choices: [{
+      index: 0,
+      finish_reason: 'stop',
+      message: {
+        role: 'assistant',
+        content: `${String(prompt)}\n\n${LANGCHAIN_TOOL}`,
+      },
+    }],
+    usage: { prompt_tokens: 15, completion_tokens: 10, total_tokens: 25 },
+  };
+}
+
 await mkdir(resultsDirectory, { recursive: true, mode: 0o700 });
 const certificates = await ensureTestCertificates(tlsDirectory);
 const [key, cert] = await Promise.all([readFile(certificates.serverKey), readFile(certificates.serverCert)]);
@@ -181,7 +226,11 @@ const handler = async (request, response) => {
       sendJson(response, 200, { ok: true });
       return;
     }
-    if (request.method !== 'POST' || !['/v1/responses', '/v1/messages'].includes(url.pathname)) {
+    if (request.method !== 'POST' || ![
+      '/v1/responses',
+      '/v1/messages',
+      '/v1/chat/completions',
+    ].includes(url.pathname)) {
       sendJson(response, 404, { error: { message: 'fixture route not found' } });
       return;
     }
@@ -194,10 +243,14 @@ const handler = async (request, response) => {
     }
     const rawBody = await collectBody(request);
     const body = JSON.parse(rawBody);
-    const product = url.pathname.endsWith('/responses') ? 'codex' : 'claude';
+    const product = url.pathname.endsWith('/responses')
+      ? 'codex'
+      : url.pathname.endsWith('/chat/completions') ? 'langchain' : 'claude';
     const stage = product === 'codex'
       ? (Array.isArray(body.input) && body.input.some((item) => item?.type === 'function_call_output') ? 'final' : 'tool')
-      : (Array.isArray(body.messages) && body.messages.some((message) => Array.isArray(message?.content) && message.content.some((block) => block?.type === 'tool_result')) ? 'final' : 'tool');
+      : product === 'langchain'
+        ? (Array.isArray(body.messages) && body.messages.some((message) => message?.role === 'tool') ? 'final' : 'tool')
+        : (Array.isArray(body.messages) && body.messages.some((message) => Array.isArray(message?.content) && message.content.some((block) => block?.type === 'tool_result')) ? 'final' : 'tool');
     await record({
       event: 'request_received',
       product,
@@ -211,6 +264,12 @@ const handler = async (request, response) => {
       rawBody,
       body,
     });
+    if (product === 'langchain') {
+      const chatResponse = langchainResponse(body);
+      sendJson(response, 200, chatResponse);
+      await record({ event: 'response_completed', product, stage, response: chatResponse });
+      return;
+    }
     const events = product === 'codex' ? codexEvents(body) : claudeEvents(body);
     sendSse(response, events);
     await record({ event: 'response_completed', product, stage, events });

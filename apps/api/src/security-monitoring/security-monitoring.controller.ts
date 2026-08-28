@@ -4492,7 +4492,6 @@ export class SecurityMonitoringController {
 
   @Post('agents/interactions')
   @HttpCode(200)
-  @RequireManagementAuth()
   async agentInteractions(
     @Body() f: T.AgentInteractionQuery,
     @Headers() headers: HeaderBag,
@@ -4530,6 +4529,92 @@ export class SecurityMonitoringController {
         requestedLimit: f?.limit,
         classificationView: f?.classificationView,
         scope: f?.scope,
+      },
+    });
+    return result;
+  }
+
+  @Post('agents/conversations')
+  @HttpCode(200)
+  async agentConversations(
+    @Body() f: T.AgentConversationQuery,
+    @Headers() headers: HeaderBag,
+  ) {
+    const agentAssetId = f?.agentAssetId === undefined
+      ? undefined
+      : strictIdentityText(f.agentAssetId, 512);
+    const agentInstanceId = f?.agentInstanceId === undefined
+      ? undefined
+      : strictIdentityText(f.agentInstanceId, 512);
+    const conversationId = f?.conversationId === undefined
+      ? undefined
+      : strictIdentityText(f.conversationId, 512);
+    if (f?.agentAssetId !== undefined && !agentAssetId) {
+      throw new BadRequestException('agentAssetId is invalid');
+    }
+    if (f?.agentInstanceId !== undefined && !agentInstanceId) {
+      throw new BadRequestException('agentInstanceId is invalid');
+    }
+    if (f?.conversationId !== undefined && !conversationId) {
+      throw new BadRequestException('conversationId is invalid');
+    }
+    const result = await this.agg.agentConversations({
+      ...f,
+      agentAssetId,
+      agentInstanceId,
+      conversationId,
+    });
+    this.audit.record({
+      actor: auditActor(headers),
+      action: 'agent.conversation.content.list',
+      resourceType: 'agent',
+      resourceId: agentAssetId ?? 'conversation-query',
+      summary: `Read ${result.items.length} Agent conversation summary record(s)`,
+      details: {
+        agentAssetId,
+        agentInstanceId,
+        resultCount: result.items.length,
+        requestedLimit: f?.limit,
+        classificationView: f?.classificationView,
+        scope: f?.scope,
+      },
+    });
+    return result;
+  }
+
+  @Post('agents/conversations/timeline')
+  @HttpCode(200)
+  async agentConversationTimeline(
+    @Body() f: T.AgentConversationQuery,
+    @Headers() headers: HeaderBag,
+  ) {
+    const conversationId = strictIdentityText(f?.conversationId, 512);
+    if (!conversationId) {
+      throw new BadRequestException('a valid conversationId is required');
+    }
+    const agentAssetId = f?.agentAssetId === undefined
+      ? undefined
+      : strictIdentityText(f.agentAssetId, 512);
+    if (f?.agentAssetId !== undefined && !agentAssetId) {
+      throw new BadRequestException('agentAssetId is invalid');
+    }
+    const result = await this.agg.agentConversationTimeline({
+      ...f,
+      conversationId,
+      agentAssetId,
+    });
+    this.audit.record({
+      actor: auditActor(headers),
+      action: 'agent.conversation.content.read',
+      resourceType: 'agent',
+      resourceId: agentAssetId ?? conversationId,
+      summary: `Read Agent conversation timeline with ${result.items.length} event(s)`,
+      details: {
+        agentAssetId,
+        conversationId,
+        resultCount: result.items.length,
+        interactionCount: result.interactionIds.length,
+        classificationView: f?.classificationView,
       },
     });
     return result;

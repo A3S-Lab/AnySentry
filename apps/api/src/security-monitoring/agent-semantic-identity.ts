@@ -235,6 +235,32 @@ function authoritativeAgentScope(event: IdentityEvent): string | undefined {
   return authoritative ? scope : undefined;
 }
 
+/**
+ * An exact process signature plus a generation-stable root is sufficient to distinguish two
+ * Agent products that happen to share one Docker container. The container remains the physical
+ * workload and a compatibility alias; it is not, however, the logical Agent when (for example)
+ * Codex and LangChain are both running inside the same diagnostics container.
+ *
+ * We deliberately require root evidence here. A bare product-looking argv or a descendant whose
+ * lineage was not resolved must never split a container into a new logical asset.
+ */
+function observedRuntimeRootScope(event: IdentityEvent, root?: string): string | undefined {
+  if (!root) return undefined;
+  const source = event.attribution?.source;
+  if (source !== 'process_signature' && source !== 'process_graph') return undefined;
+  const evidence = event.attribution?.evidence ?? [];
+  const hasTrustedEvidence = source === 'process_signature'
+    ? evidence.some((item) => item.startsWith('runtime_signature:'))
+      || evidence.some((item) => item.startsWith('process_signature:'))
+    : evidence.some((item) => item.startsWith('process_lineage:'));
+  if (!hasTrustedEvidence) return undefined;
+  return normalizedAgentProduct(
+    event.attribution?.agentScopeId
+    ?? event.attribution?.agentDisplayName
+    ?? event.agentId,
+  );
+}
+
 function identityPart(value: unknown, fallback = 'unknown'): string {
   return encodeURIComponent(lower(value) ?? fallback);
 }
@@ -273,6 +299,7 @@ export function projectAgentSemanticIdentity(event: IdentityEvent): AgentSemanti
   const root = hostRootInstanceId(event);
   const product = agentProduct(event);
   const logicalScope = authoritativeAgentScope(event);
+  const runtimeRootScope = observedRuntimeRootScope(event, root);
 
   const kubernetes = kubernetesContainerIdentity(event);
   if (kubernetes) {
@@ -329,20 +356,30 @@ export function projectAgentSemanticIdentity(event: IdentityEvent): AgentSemanti
     const logicalIdentity = logicalScope && dockerHost
       ? ['docker-agent-logical:v1', identityPart(dockerHost), identityPart(logicalScope)].join(':')
       : undefined;
-    const canonical = logicalIdentity ?? docker.physicalWorkloadId;
+    const observedRootIdentity = runtimeRootScope
+      ? [
+          'docker-agent-root:v1',
+          identityPart(docker.physicalWorkloadId),
+          identityPart(runtimeRootScope),
+        ].join(':')
+      : undefined;
+    const canonical = logicalIdentity ?? observedRootIdentity ?? docker.physicalWorkloadId;
+    const runtimeCanonical = observedRootIdentity && root ? root : docker.physicalWorkloadId;
     return {
       schemaVersion: AGENT_SEMANTIC_IDENTITY_VERSION,
       canonicalIdentityKey: canonical,
       identityAliases: distinct([
         canonical,
+        observedRootIdentity,
         docker.physicalWorkloadId,
         physical,
         attributedInstance,
         `container:${docker.containerId}`,
         root,
       ]),
-      canonicalRuntimeInstanceId: docker.physicalWorkloadId,
+      canonicalRuntimeInstanceId: runtimeCanonical,
       runtimeInstanceAliases: distinct([
+        runtimeCanonical,
         docker.physicalWorkloadId,
         physical,
         attributedInstance,
@@ -350,7 +387,7 @@ export function projectAgentSemanticIdentity(event: IdentityEvent): AgentSemanti
       ]),
       normalizedPhysicalWorkloadId: docker.physicalWorkloadId,
       agentRootInstanceId: root,
-      agentProduct: product,
+      agentProduct: product ?? runtimeRootScope,
       bindingQuality: 'exact',
       reasonCode: 'exact_docker_container',
     };

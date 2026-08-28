@@ -291,6 +291,13 @@ calls. Disable it with `ANYSENTRY_BEHAVIOR_DISCOVERY=off` or tune the matching
   any workload. (Enforcement is a separate, opt-in deployment.)
 - `A3S_OBSERVER_SSL` / `A3S_OBSERVER_FILES` are on by default for full signal; set them to `0` to
   drop plaintext capture and the high-volume file-write stream for a smaller footprint.
+- `A3S_OBSERVER_TLS_STATIC_TARGETS` accepts comma-separated host-visible absolute paths for known
+  Codex/Claude executables or TLS libraries used by Python/LangChain/Dify. Static CLIs must match
+  an embedded whole-file profile (size, hashes and instruction prefixes); named TLS libraries use
+  standard exported symbols. The collector attaches once per inode to close the first-request
+  race, but content still requires an identity-verified PID/cgroup and an exact LLM route/schema.
+  A host-PID DaemonSet can address host or container files through `/proc/<host-pid>/root/...`.
+  Keep local user, container and credential paths in deployment overrides, not this base manifest.
 - Additive: the manifests only add the `anysentry` namespace and its objects; nothing touches
   kubelet/containerd or existing workloads.
 

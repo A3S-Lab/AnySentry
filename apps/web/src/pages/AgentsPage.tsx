@@ -732,6 +732,13 @@ function AgentInteractionTrace({
     setSelectedId(undefined);
   }, [agent.agentAssetId, agent.agentInstanceId, timeType, startTime, endTime]);
 
+  const conversationParams = new URLSearchParams({
+    timeType,
+    agentAssetId: agent.agentAssetId,
+  });
+  if (timeType === "custom" && startTime) conversationParams.set("startTime", startTime);
+  if (timeType === "custom" && endTime) conversationParams.set("endTime", endTime);
+
   return (
     <section className="overflow-hidden rounded-md border border-sky-400/15 bg-sky-500/[0.025]">
       <div className="flex flex-col gap-3 border-b border-white/10 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
@@ -747,10 +754,18 @@ function AgentInteractionTrace({
             展示 TLS/HTTP 传输边界实际发送的最终模型请求、模型可见响应，以及显式准入的外部工具请求/结果；未进入最终请求的内部 RAG 中间态不会补入。
           </p>
         </div>
-        <Button type="button" variant="ghost" size="sm" onClick={refresh} disabled={loading} className="h-8 text-zinc-400 hover:bg-white/5 hover:text-zinc-100">
-          <RefreshCw className={cn("size-3.5", loading && "animate-spin")} />
-          刷新
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button asChild variant="secondary" size="sm" className="h-9 border border-sky-400/15 bg-sky-500/[0.06] text-sky-100 hover:bg-sky-500/10">
+            <Link to={`/conversations?${conversationParams.toString()}`}>
+              <Route className="size-3.5" />
+              进入对话追踪
+            </Link>
+          </Button>
+          <Button type="button" variant="ghost" size="sm" onClick={refresh} disabled={loading} className="h-9 text-zinc-400 hover:bg-white/5 hover:text-zinc-100">
+            <RefreshCw className={cn("size-3.5", loading && "animate-spin")} />
+            刷新
+          </Button>
+        </div>
       </div>
 
       {error ? (

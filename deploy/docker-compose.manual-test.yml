@@ -67,6 +67,7 @@ services:
       A3S_OBSERVER_JSON: "1"
       A3S_OBSERVER_FILES: "1"
       A3S_OBSERVER_SSL: "1"
+      A3S_OBSERVER_TLS_STATIC_TARGETS: ${A3S_OBSERVER_TLS_STATIC_TARGETS:-}
       A3S_OBSERVER_COLLECTOR_ID: manual-docker-observer
       A3S_NODE_NAME: manual-docker-host
       ANYSENTRY_INGEST_URL: http://anysentry:29653/security-center/ingest

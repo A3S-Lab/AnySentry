@@ -57,6 +57,10 @@ import {
   toolEvidenceIndexFields,
   ToolEvidenceResponse,
 } from './tool-evidence-linker';
+import {
+  projectAgentConversations,
+  projectConversationTimeline,
+} from './agent-conversation';
 import * as T from './types';
 
 const SEV_RANK: Record<T.Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
@@ -1900,6 +1904,117 @@ export class AggregationService {
         totalMode: durable && items.length <= limit ? 'exact' : 'omitted',
       },
       dataSource: durable ? 'clickhouse' : 'hot_ring',
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  private async agentConversationProjection(filter: T.AgentConversationQuery): Promise<{
+    projection: ReturnType<typeof projectAgentConversations>;
+    interactions: T.AgentInteractionList;
+    inventory: T.AgentInventory;
+  }> {
+    const interactionQuery: T.AgentInteractionQuery = {
+      timeType: filter.timeType,
+      startTime: filter.startTime,
+      endTime: filter.endTime,
+      scope: 'agent',
+      classificationView: filter.classificationView,
+      agentAssetId: filter.agentAssetId,
+      agentInstanceId: filter.agentInstanceId,
+      model: filter.model,
+      limit: 500,
+    };
+    const inventoryQuery: T.AgentInventoryQuery = {
+      timeType: filter.timeType,
+      startTime: filter.startTime,
+      endTime: filter.endTime,
+      scope: 'agent',
+      classificationView: filter.classificationView,
+      agentAssetId: filter.agentAssetId,
+      agentInstanceId: filter.agentInstanceId,
+      includeUnclassified: false,
+      limit: 500,
+    };
+    const preciseContentQuery = Boolean(
+      filter.agentAssetId
+      || filter.agentInstanceId
+      || filter.conversationId
+      || filter.q
+      || filter.model
+      || filter.product,
+    );
+    let inventoryTimer: NodeJS.Timeout | undefined;
+    const inventoryPromise = preciseContentQuery
+      ? Promise.resolve(this.agentInventory(inventoryQuery))
+      : Promise.race([
+          this.storedAgentInventory(inventoryQuery).catch(() => this.agentInventory(inventoryQuery)),
+          new Promise<T.AgentInventory>((resolve) => {
+            inventoryTimer = setTimeout(() => resolve(this.agentInventory(inventoryQuery)), 1_500);
+            inventoryTimer.unref();
+          }),
+        ]);
+    const [interactions, inventory] = await Promise.all([
+      this.agentInteractions(interactionQuery),
+      inventoryPromise,
+    ]).finally(() => {
+      if (inventoryTimer) clearTimeout(inventoryTimer);
+    });
+    return {
+      projection: projectAgentConversations(interactions.items, inventory.items, filter),
+      interactions,
+      inventory,
+    };
+  }
+
+  async agentConversations(filter: T.AgentConversationQuery): Promise<T.AgentConversationList> {
+    const { projection, interactions, inventory } = await this.agentConversationProjection(filter);
+    const limit = Math.max(1, Math.min(200, filter.limit ?? 80));
+    const items = projection.summaries.slice(0, limit);
+    const partial = interactions.coverage.partial || inventory.coverage.partial;
+    return {
+      items,
+      total: projection.summaries.length,
+      totalMode: projection.summaries.length > limit || interactions.totalMode === 'omitted'
+        ? 'omitted'
+        : 'exact',
+      coverage: {
+        ...interactions.coverage,
+        partial,
+        partialReason: interactions.coverage.partialReason
+          ?? inventory.coverage.partialReason,
+      },
+      dataSource: interactions.dataSource,
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  async agentConversationTimeline(
+    filter: T.AgentConversationQuery,
+  ): Promise<T.AgentConversationTimeline> {
+    const { projection, interactions, inventory } = await this.agentConversationProjection(filter);
+    const conversation = projection.summaries.find((item) =>
+      item.conversationId === filter.conversationId);
+    const records = filter.conversationId
+      ? projection.interactionsByConversation.get(filter.conversationId) ?? []
+      : [];
+    const items = conversation?.hasContent
+      ? projectConversationTimeline(conversation, records)
+      : [];
+    const partial = interactions.coverage.partial || inventory.coverage.partial;
+    return {
+      conversation,
+      items,
+      interactionIds: records.map((item) => item.interactionId),
+      total: items.length,
+      coverage: {
+        ...interactions.coverage,
+        partial,
+        partialReason: interactions.coverage.partialReason
+          ?? inventory.coverage.partialReason,
+      },
+      dataSource: interactions.dataSource,
       ...this.classificationResponseMeta(filter),
       updateTime: iso(),
     };

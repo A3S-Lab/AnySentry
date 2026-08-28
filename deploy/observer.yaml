@@ -70,6 +70,10 @@ spec:
             # Set to "0" to reduce footprint on a busy node.
             - { name: A3S_OBSERVER_FILES, value: "1" }
             - { name: A3S_OBSERVER_SSL, value: "1" }
+            # Optional comma-separated host-visible CLI/libssl paths. Exact profiles or standard
+            # exported TLS symbols are attached once per inode; verified PID + LLM route gates
+            # still decide whether plaintext may enter the ring.
+            - { name: A3S_OBSERVER_TLS_STATIC_TARGETS, value: "" }
             # Stable node-scoped Collector identity for the AnySentry Collector and Source consoles.
             - name: A3S_OBSERVER_COLLECTOR_ID
               valueFrom: { fieldRef: { fieldPath: spec.nodeName } }

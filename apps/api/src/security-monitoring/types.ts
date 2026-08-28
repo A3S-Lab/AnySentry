@@ -1329,6 +1329,17 @@ export interface AgentInteractionRecord {
   agentAssetId: string;
   agentInstanceId?: string;
   agentProduct?: string;
+  runtimeSessionId?: string;
+  providerConversationId?: string;
+  providerResponseId?: string;
+  providerPreviousResponseId?: string;
+  conversationId?: string;
+  conversationIdSource?: 'provider' | 'runtime' | 'inferred';
+  turnId?: string;
+  modelCallId?: string;
+  attemptId?: string;
+  runtimeRole?: 'agent_root' | 'network_runtime' | 'tool_runtime';
+  correlationQuality?: 'exact' | 'strong' | 'inferred' | 'unlinked';
   detectedClassification: AgentClassification;
   currentEffectiveClassification: AgentClassification;
   process?: ProcessContext;
@@ -1371,6 +1382,113 @@ export interface AgentInteractionList extends ClassifiedResponseMeta {
   items: AgentInteractionRecord[];
   total: number;
   totalMode: QueryTotalMode;
+  coverage: QueryCoverage;
+  dataSource: 'clickhouse' | 'hot_ring';
+  updateTime: string;
+}
+
+export type AgentConversationCoverageStatus =
+  | 'complete'
+  | 'partial'
+  | 'attach_pending'
+  | 'unsupported_tls_profile'
+  | 'unsupported_protocol'
+  | 'no_final_response'
+  | 'asset_only'
+  | 'no_activity';
+
+export interface AgentConversationCoverage {
+  status: AgentConversationCoverageStatus;
+  reasons: string[];
+  completeInteractions: number;
+  partialInteractions: number;
+  lastEvidenceAt?: string;
+}
+
+export interface AgentConversationQuery extends SecurityTimeFilter {
+  agentAssetId?: string;
+  agentInstanceId?: string;
+  conversationId?: string;
+  product?: string;
+  classification?: AgentClassification;
+  coverageStatus?: AgentConversationCoverageStatus;
+  model?: string;
+  q?: string;
+  limit?: number;
+}
+
+export interface AgentConversationSummary {
+  conversationId: string;
+  idSource: 'provider' | 'runtime' | 'inferred';
+  hasContent: boolean;
+  agentAssetId: string;
+  agentInstanceIds: string[];
+  agentProduct: string;
+  displayName: string;
+  environment: 'kubernetes' | 'docker' | 'host' | 'unknown';
+  classification: AgentClassification;
+  workspacePath: string;
+  startedAtUnixNs?: string;
+  lastActivityAtUnixNs?: string;
+  firstPromptPreview?: string;
+  turnCount: number;
+  modelCallCount: number;
+  toolCallCount: number;
+  toolResultCount: number;
+  errorCount: number;
+  models: string[];
+  coverage: AgentConversationCoverage;
+}
+
+export interface AgentConversationList extends ClassifiedResponseMeta {
+  items: AgentConversationSummary[];
+  total: number;
+  totalMode: QueryTotalMode;
+  coverage: QueryCoverage;
+  dataSource: 'clickhouse' | 'hot_ring';
+  updateTime: string;
+}
+
+export type AgentConversationEventKind =
+  | 'tool_result'
+  | 'model_request'
+  | 'model_response'
+  | 'tool_call'
+  | 'external_tool'
+  | 'retry'
+  | 'error';
+
+export interface AgentConversationEvent {
+  eventId: string;
+  kind: AgentConversationEventKind;
+  sequence: number;
+  atUnixNs: string;
+  turnId: string;
+  modelCallId?: string;
+  attemptId?: string;
+  attemptNumber?: number;
+  interactionId?: string;
+  parentEventId?: string;
+  toolCallId?: string;
+  title: string;
+  contentPreview?: string;
+  model?: string;
+  toolName?: string;
+  arguments?: unknown;
+  result?: unknown;
+  isError?: boolean;
+  statusCode?: number;
+  durationNs?: string;
+  completeness: AgentInteractionCompleteness;
+  correlationQuality: 'exact' | 'strong' | 'inferred' | 'unlinked';
+  evidenceEventIds: string[];
+}
+
+export interface AgentConversationTimeline extends ClassifiedResponseMeta {
+  conversation?: AgentConversationSummary;
+  items: AgentConversationEvent[];
+  interactionIds: string[];
+  total: number;
   coverage: QueryCoverage;
   dataSource: 'clickhouse' | 'hot_ring';
   updateTime: string;
@@ -3526,6 +3644,8 @@ export type AuditAction =
   | 'asset.review.cleared'
   | 'agent.identity_ai_review.completed'
   | 'agent.interaction.content.read'
+  | 'agent.conversation.content.list'
+  | 'agent.conversation.content.read'
   | 'maintenance.window.updated'
   | 'notification.channel.updated'
   | 'notification.route.updated'

@@ -2,7 +2,13 @@
 
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { managementAuthHeaders, safeProbeId } from './probe-id.mjs';
+
+const require = createRequire(import.meta.url);
+const { projectAgentConversations, projectConversationTimeline } = require(
+  '../apps/api/dist/security-monitoring/agent-conversation.js',
+);
 
 const baseUrl = (process.env.ANYSENTRY_API_BASE
   ?? `http://127.0.0.1:${process.env.PORT ?? '29653'}/security-center`).replace(/\/$/u, '');
@@ -17,6 +23,18 @@ async function request(path, method = 'GET', body, headers = {}) {
   const text = await response.text();
   const payload = text ? JSON.parse(text) : undefined;
   if (!response.ok) throw new Error(`${method} ${path} -> ${response.status}: ${text}`);
+  return payload?.data ?? payload;
+}
+
+async function requestWithoutManagementToken(path, body) {
+  const response = await fetch(`${baseUrl}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  const payload = text ? JSON.parse(text) : undefined;
+  if (!response.ok) throw new Error(`POST ${path} -> ${response.status}: ${text}`);
   return payload?.data ?? payload;
 }
 
@@ -87,6 +105,8 @@ const line = JSON.stringify({
       path: '/v1/chat/completions',
       statusCode: 200,
       model: 'fixture-model',
+      providerConversationId: `${runId}-provider-conversation`,
+      providerResponseId: `${runId}-provider-response`,
       startedAtUnixNs: String(nowNs),
       requestCompleteAtUnixNs: String(nowNs + 1_000_000n),
       firstResponseAtUnixNs: String(nowNs + 2_000_000n),
@@ -174,6 +194,40 @@ assert.equal(item.toolResults[0].content, 'TOOL_RESULT_SENTINEL');
 assert.equal(item.completeness, 'complete');
 assert.equal(item.captureSource, 'tls_uprobe');
 assert.ok(!JSON.stringify(item).includes('authorization'), 'transport credentials must not enter interaction content');
+
+const noTokenInteraction = await requestWithoutManagementToken('/agents/interactions', {
+  timeType: 'last_30d', scope: 'raw', interactionId, limit: 10,
+});
+assert.equal(noTokenInteraction.items.length, 1, 'read-only interaction content must not require a management token');
+
+const conversations = await requestWithoutManagementToken('/agents/conversations', {
+  timeType: 'last_30d',
+  scope: 'agent',
+  agentAssetId: item.agentAssetId,
+  classificationView: 'current_effective',
+  limit: 20,
+});
+const conversation = conversations.items.find((entry) => entry.hasContent);
+assert.ok(conversation, JSON.stringify(conversations));
+assert.equal(conversation.idSource, 'provider');
+assert.equal(conversation.modelCallCount, 1);
+assert.equal(conversation.toolCallCount, 1);
+assert.equal(conversation.toolResultCount, 1);
+assert.match(conversation.firstPromptPreview, /FINAL_REQUEST_SENTINEL/u);
+
+const timeline = await requestWithoutManagementToken('/agents/conversations/timeline', {
+  timeType: 'last_30d',
+  scope: 'agent',
+  agentAssetId: item.agentAssetId,
+  conversationId: conversation.conversationId,
+  classificationView: 'current_effective',
+});
+assert.equal(timeline.conversation.conversationId, conversation.conversationId);
+assert.deepEqual(
+  [...new Set(timeline.items.map((entry) => entry.kind))].sort(),
+  ['model_request', 'model_response', 'tool_call', 'tool_result'],
+);
+assert.equal(timeline.interactionIds.includes(interactionId), true);
 
 const modelOnly = await request('/agents/interactions', 'POST', {
   timeType: 'last_30d', scope: 'raw', interactionType: 'model', interactionId, limit: 10,
@@ -277,6 +331,107 @@ const unknown = await request('/agents/interactions', 'POST', {
 });
 assert.equal(unknown.items.length, 0, 'unknown/non-Agent plaintext must never enter the interaction store');
 
+// A Docker runtime id is physical workload evidence, not an application conversation id. One
+// long-running HTTP Agent must split independent invocations while retaining the two model calls
+// connected by a tool_call_id inside one invocation.
+const containerId = 'f9896b781d94d050a6211e07248b69fb9576966f4b7ac7170045f5c1c2fa616b';
+const projectionRecord = (id, at, prompt, overrides = {}) => {
+  const record = structuredClone(item);
+  Object.assign(record, {
+    interactionId: `mi_${digest(`${runId}\0${id}`).slice(0, 24)}`,
+    at,
+    startedAtUnixNs: String(BigInt(at) * 1_000_000n),
+    requestCompleteAtUnixNs: String(BigInt(at + 1) * 1_000_000n),
+    firstResponseAtUnixNs: String(BigInt(at + 2) * 1_000_000n),
+    endedAtUnixNs: String(BigInt(at + 3) * 1_000_000n),
+    durationNs: '3000000',
+    agentAssetId: 'agent_langchain_projection',
+    agentInstanceId: `docker:node-a:${containerId}`,
+    agentProduct: 'LangChain',
+    runtimeSessionId: containerId.slice(0, 12),
+    process: {
+      hostId: 'node-a', bootId: 'boot-a', pid: 700, startTimeTicks: '7000',
+      comm: 'python', exe: '/usr/bin/python3', cwd: '/srv/agent',
+      cgroup: `0::/system.slice/docker-${containerId}.scope`,
+    },
+    request: {
+      ...record.request,
+      body: JSON.stringify({ messages: [{ role: 'user', content: prompt }] }),
+      structured: { messages: [{ role: 'user', content: prompt }] },
+      messages: [{ role: 'user', content: prompt }],
+      sha256: digest(`request:${id}:${prompt}`),
+    },
+    response: {
+      ...record.response,
+      body: JSON.stringify({ choices: [{ message: { role: 'assistant', content: `response:${id}` } }] }),
+      text: `response:${id}`,
+      structured: { choices: [{ message: { role: 'assistant', content: `response:${id}` } }] },
+      sha256: digest(`response:${id}`),
+    },
+    toolCalls: [],
+    toolResults: [],
+    ...overrides,
+  });
+  for (const field of [
+    'conversationId', 'conversationIdSource', 'turnId', 'modelCallId', 'attemptId',
+    'providerConversationId', 'providerResponseId', 'providerPreviousResponseId',
+  ]) if (!(field in overrides)) delete record[field];
+  return record;
+};
+const projectionAt = Date.now() - 10_000;
+const invokeOneCall = projectionRecord('invoke-one-call', projectionAt, 'LANGCHAIN_INVOKE_ONE', {
+  toolCalls: [{
+    toolCallId: 'call-projection-1', name: 'lookup_fixture', arguments: { key: 'canary' },
+    issuedAtUnixNs: String(BigInt(projectionAt + 2) * 1_000_000n),
+  }],
+});
+const invokeOneFinal = projectionRecord('invoke-one-final', projectionAt + 5, 'LANGCHAIN_INVOKE_ONE', {
+  toolResults: [{
+    toolCallId: 'call-projection-1', content: 'LANGCHAIN_TOOL_RESULT', isError: false,
+    observedAtUnixNs: String(BigInt(projectionAt + 5) * 1_000_000n),
+  }],
+});
+const invokeTwo = projectionRecord('invoke-two', projectionAt + 10, 'LANGCHAIN_INVOKE_TWO');
+const inferredProjection = projectAgentConversations(
+  [invokeOneCall, invokeOneFinal, invokeTwo],
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 20 },
+);
+assert.equal(inferredProjection.summaries.length, 2,
+  'independent HTTP invocations in one container/process must not collapse into one conversation');
+assert.deepEqual(
+  inferredProjection.summaries.map((summary) => summary.modelCallCount).sort(),
+  [1, 2],
+);
+const toolConversation = inferredProjection.summaries.find((summary) => summary.modelCallCount === 2);
+assert.equal(toolConversation?.toolCallCount, 1);
+assert.equal(toolConversation?.toolResultCount, 1);
+const projectedTimeline = projectConversationTimeline(
+  toolConversation,
+  inferredProjection.interactionsByConversation.get(toolConversation.conversationId),
+);
+assert.deepEqual(
+  projectedTimeline.map((event) => event.kind),
+  ['model_request', 'model_response', 'tool_call', 'tool_result', 'model_request', 'model_response'],
+  'Agent-facing order must show the tool result before it is sent in the next model request',
+);
+
+const responseRoot = projectionRecord('response-root', projectionAt + 20, 'CHAIN_ROOT', {
+  providerResponseId: 'resp-projection-root',
+});
+const responseChild = projectionRecord('response-child', projectionAt + 30, 'CHAIN_CHILD', {
+  providerResponseId: 'resp-projection-child',
+  providerPreviousResponseId: 'resp-projection-root',
+});
+const providerProjection = projectAgentConversations(
+  [responseRoot, responseChild],
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 20 },
+);
+assert.equal(providerProjection.summaries.length, 1);
+assert.equal(providerProjection.summaries[0].idSource, 'provider');
+assert.equal(providerProjection.summaries[0].modelCallCount, 2);
+
 console.log('Agent interaction ingest/query verification passed');
 console.log(JSON.stringify({
   interactionId,
@@ -285,5 +440,8 @@ console.log(JSON.stringify({
   responseBytes: item.response.decodedBytes,
   toolCalls: item.toolCalls.length,
   toolResults: item.toolResults.length,
+  conversationId: conversation.conversationId,
+  conversationEvents: timeline.items.length,
+  managementTokenRequiredForRead: false,
   multimodalBytes: Buffer.byteLength(multimodalBody),
 }));

@@ -650,16 +650,32 @@ class AgentAttributor {
         if (scope?.state === 'agent' && scope.agentId === agentId) return scope;
         highestSameScope = { info: live, match: ancestorMatch };
       } else if (cached?.state === 'agent') {
-        const scope = this.agentScope(cached);
-        if (scope.state === 'agent') {
-          return scope.agentId === agentId ? scope : establishHighest();
-        }
+        // A shell/tool process attributed to an existing Codex is an ownership edge, not an
+        // implementation-wrapper edge. Crossing it would collapse a newly launched same-product
+        // CLI into the ancestor session. Only an uninterrupted chain of exact same-scope
+        // signatures (for example npm Node launcher -> native Codex) may share one root.
+        return establishHighest();
+      } else {
+        return establishHighest();
       }
       if (cached?.state === 'infrastructure') return establishHighest();
 
       pid = positiveInt(live.ppid);
     }
     return establishHighest();
+  }
+
+  directParentMatchesAgentScope(info, match, ancestry) {
+    const parentPid = positiveInt(info?.ppid);
+    if (!parentPid || parentPid !== positiveInt(ancestry?.rootPid)) return false;
+    const parent = this.procs.get(parentPid) || this.readProcess(parentPid, 'ancestry');
+    if (!parent) return false;
+    const parentMatch = this.matchAgentExecutable(parent);
+    return Boolean(
+      parentMatch
+      && text(parentMatch.agentId) === text(match?.agentId)
+      && text(parentMatch.agentId) === text(ancestry?.agentId),
+    );
   }
 
   pruneRoots() {
@@ -1170,7 +1186,13 @@ class AgentAttributor {
     // Pi launched by Codex), so it may establish an independent root below the owner.
     const ancestry = this.resolveAncestry(current.ppid, now);
     if (ancestry.state === 'agent') {
-      if (directAgent && text(directAgent.agentId) !== text(ancestry.agentId)) {
+      const directImplementationChild = directAgent
+        ? this.directParentMatchesAgentScope(current, directAgent, ancestry)
+        : false;
+      if (directAgent && (
+        text(directAgent.agentId) !== text(ancestry.agentId)
+        || !directImplementationChild
+      )) {
         return this.finish(
           pid,
           this.rememberAgent(

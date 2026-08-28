@@ -126,6 +126,7 @@
     "verify:agent-interactions": "pnpm build:api && node scripts/verify-deep-links-local.mjs scripts/verify-agent-interactions.mjs",
     "verify:agent-interactions:real-forwarder": "pnpm build:api && node scripts/verify-deep-links-local.mjs scripts/verify-real-agent-interaction-forwarder.mjs",
     "verify:agent-interactions:browser": "pnpm build && node scripts/verify-agent-interaction-browser.mjs",
+    "verify:conversation-tracking:browser": "pnpm build && node scripts/verify-conversation-tracking-browser.mjs",
     "verify:agent-inventory-durable-overlay": "pnpm build:api && node scripts/verify-agent-inventory-durable-overlay.mjs",
     "verify:agent-persistent-directory": "pnpm build:api && node scripts/verify-agent-persistent-directory.mjs",
     "verify:agent-asset-capacity-isolation": "pnpm build:api && node scripts/verify-agent-asset-capacity-isolation.mjs",
