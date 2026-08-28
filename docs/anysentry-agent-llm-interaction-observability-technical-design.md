@@ -553,7 +553,7 @@ cargo test -p a3s-observer \
   -p a3s-observer-collector --release
 ```
 
-结果为 145 项通过：library 28、workload contract 6、collector 104、common 7。`cargo test --workspace` 会尝试把无 `main` 的 eBPF bin 链成宿主 test executable，并因 undefined `main` 失败；这是 target 选择问题，不是 eBPF build 失败。Collector build script 已成功为 BPF target 构建并在内核加载。[E012]
+结果为 146 项通过：library 28、workload contract 7、collector 104、common 7。`cargo test --workspace` 会尝试把无 `main` 的 eBPF bin 链成宿主 test executable，并因 undefined `main` 失败；这是 target 选择问题，不是 eBPF build 失败。Collector build script 已成功为 BPF target 构建并在内核加载。[E012]
 
 交互专项覆盖：fragment、keep-alive、Content-Length、chunked、gzip/deflate、SSE、Chat/Responses/Anthropic tool、external tool route、HTTP/2 fail-closed、invalid UTF-8、RAG 边界和多片 inline multimodal。
 
@@ -564,10 +564,15 @@ cargo test -p a3s-observer \
 - `pnpm build`；
 - `pnpm verify:agent-interactions`；
 - `pnpm verify:observer-ingest:local`；
-- `pnpm verify:filter-pipeline`；
+- `pnpm verify:deployment-manifests`；
 - `pnpm verify:s5-capture-profile`；
 - `pnpm verify:s6-tool-evidence`；
-- `pnpm verify:deployment-manifests`。
+- `pnpm verify:forwarder-spool-replay`。
+
+当前宿主机持续处于高 I/O wait、块设备 100% util 时，`verify:filter-pipeline` 与
+`verify:forwarder-durability` 均在进程关闭阶段报告 WAL 尚有异步操作；未合入 TLS 的
+`fix/observer-delivery-health-20260827@d139a25` 对照分支可复现同一错误。现有证据不支持把它
+归因为 TLS 合并回归，但正式发布前必须在无磁盘饱和环境重新通过，不能以对照失败替代验收。
 
 Interaction verifier 同时验证：声明 hash 被篡改时拒绝、Unknown classification 拒绝、model/tool 查询 filter、超过旧 4 MiB envelope 的 inline multimodal、raw content management auth。[E010][E012]
 
@@ -713,7 +718,7 @@ P5：Go TLS/Rustls 专项；需要稳定 hook 点、版本兼容清单和 fail-c
 | E009 | `AgentInteractionTrace` | confirmed_fact | model/tool UI fields |
 | E010 | interaction verifier | confirmed_fact | tamper/Unknown/filter/multimodal tests |
 | E011 | 受控 fixture 本地运行记录 | confirmed_fact | 固定版本运行、bytes/hash/tool/result；原始环境快照不入库 |
-| E012 | 同一受控运行的 automated checks | confirmed_fact | 145 Observer tests 与 AnySentry 回归 |
+| E012 | 同一受控运行的 automated checks | confirmed_fact | 146 Observer tests 与 AnySentry 回归；两项 WAL close 测试受当前磁盘饱和阻塞 |
 | E013 | browser verifier | confirmed_fact | 1440/390 UI 状态 |
 | E014 | Observer manifest | confirmed_fact | privileged/hostPID/forwarder bounds |
 | E015 | AnySentry manifest与 ingest test | confirmed_fact | 16/15 MiB route/controller bounds |

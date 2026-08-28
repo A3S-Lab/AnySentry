@@ -306,10 +306,10 @@ FR-043：每条记录显示 `captureSource`，例如 `tls_uprobe`、`tcp_plainte
 
 | 验收项 | 结果 | 说明 |
 | --- | --- | --- |
-| Observer library/workload/collector/common | 145 项通过 | 包含 HTTP/SSE、gzip、chunked、keep-alive、tool route、Responses item、multimodal、fail-closed |
+| Observer library/workload/collector/common | 146 项通过 | library 28、workload contract 7、collector 104、common 7；包含 HTTP/SSE、gzip、chunked、keep-alive、tool route、Responses item、multimodal、fail-closed |
 | AnySentry API/Web build | 通过 | Nest API 与 Rsbuild Web |
 | Interaction ingest/query | 通过 | hash、Unknown、model/tool filter、2 MiB inline multimodal、管理鉴权 |
-| Existing regressions | 通过 | Observer ingest、filter pipeline、S5、S6、deployment manifests |
+| Existing regressions | 部分通过，发布前需复跑 | Observer ingest、deployment manifests、spool replay、S5、S6 通过；当前宿主机持续 100% I/O 时，filter pipeline 与 forwarder durability 均在 WAL close 等待超时，同一 `d139a25` 基线可复现，未发现 TLS 差异导致的数据错误 |
 | Pi host | 3/3 complete | `read → bash`，result 0→1→2，22/22 fixture |
 | Pi Docker | 3/3 complete | namespace PID 与 host PID/cgroup 归因正确，22/22 fixture |
 | LangChain Docker | 3/3 complete | `bind_tools`，内部 RAG sentinel 缺席 |
@@ -331,7 +331,7 @@ FR-043：每条记录显示 `captureSource`，例如 `tls_uprobe`、`tcp_plainte
 - [x] Pi host/container、LangChain、Dify、Claude Code、Codex HTTP 完成受控运行验证；
 - [x] ClickHouse migration、durable query、model/tool filter 通过；
 - [x] 桌面/移动端正文和工具详情通过真实浏览器验证；
-- [x] 既有 Filter/S5/S6/Observer ingest/manifest 回归通过；
+- [ ] 既有 Filter/S5/S6/Observer ingest/manifest 回归全部通过；当前 S5、S6、ingest、manifest、spool replay 已通过，Filter/durability 须在无磁盘饱和环境重跑；
 - [ ] 生产正文采集开关、管理员范围和 30 天保留由安全负责人确认；
 - [ ] 生产容量/性能压测达到部署环境批准阈值；
 - [ ] 发布说明明确 Codex HTTPS、通用 Go/Rustls 和 HTTP/2/WS/QUIC 不支持。
