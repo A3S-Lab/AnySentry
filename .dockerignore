@@ -1,6 +1,8 @@
 **/node_modules
 **/dist
 **/target
+**/.runtime
+**/__pycache__
 .git
 *.log
 .DS_Store

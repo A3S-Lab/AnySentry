@@ -177,7 +177,7 @@ function verifyAnySentryManifest() {
   assert(
     'AnySentry Deployment bounds its event hot set and Observer request bodies',
     /\{\s*name:\s*ANYSENTRY_HOT_EVENT_LIMIT,\s*value:\s*"5000"\s*\}/u.test(anySentryDeployment?.source ?? '') &&
-      /\{\s*name:\s*ANYSENTRY_OBSERVER_BODY_LIMIT,\s*value:\s*"4mb"\s*\}/u.test(anySentryDeployment?.source ?? ''),
+      /\{\s*name:\s*ANYSENTRY_OBSERVER_BODY_LIMIT,\s*value:\s*"16mb"\s*\}/u.test(anySentryDeployment?.source ?? ''),
     anySentryDeployment?.source,
   );
   assert(
@@ -656,7 +656,7 @@ function verifyObserverManifest() {
       /requests:\s*\{\s*cpu:\s*50m,\s*memory:\s*256Mi\s*\}/u.test(daemonSet?.source ?? '') &&
       /limits:\s*\{\s*memory:\s*2Gi\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_BATCH_MAX_BYTES,\s*value:\s*"524288"\s*\}/u.test(daemonSet?.source ?? '') &&
-      /\{\s*name:\s*FORWARD_MAX_EVENT_BYTES,\s*value:\s*"3145728"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_MAX_EVENT_BYTES,\s*value:\s*"12582912"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_MAX_OUTSTANDING_EVENTS,\s*value:\s*"16384"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_MAX_OUTSTANDING_BYTES,\s*value:\s*"67108864"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_PROTECTED_RESERVE_EVENTS,\s*value:\s*"4096"\s*\}/u.test(daemonSet?.source ?? '') &&

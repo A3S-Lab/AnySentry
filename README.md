@@ -108,6 +108,21 @@ Use the returned `eventId` to open the exact event or build an Evidence Bundle. 
 
 The Agent inventory is discovered from runtime evidence and can be enriched with platform-side owner, team, environment, criticality, tags, and notes. No metadata overlay requires changing the monitored agent.
 
+### Opt-in Agent conversation evidence
+
+On explicitly supported Linux runtimes, the Observer can also reconstruct the final HTTP/1.1
+request an Agent sent to an LLM, the response visible to the Agent, parsed tool instructions and
+later tool results. This plaintext path is off by default and uses three gates: verified Agent
+PID/cgroup, an admitted POST route, and a userspace protocol/semantic check. Raw interaction
+queries require management authentication and are audited.
+
+Compatibility is product-, version-, TLS-implementation-, and protocol-specific. The current
+verified matrix includes Pi on the host and in Docker, pinned LangChain and Dify fixtures, Claude
+Code 2.1.170 over TLS, and Codex CLI 0.150.1 over explicit HTTP. Generic Go/Rustls, Codex HTTPS,
+HTTP/2, WebSocket and QUIC are not claimed. See the
+[product requirements](docs/anysentry-agent-llm-interaction-observability-prd.md) and
+[technical design](docs/anysentry-agent-llm-interaction-observability-technical-design.md).
+
 ## How it works
 
 <p align="center">
@@ -325,6 +340,8 @@ skills/l3/                   L3 investigation prompts
 
 - [Deployment runbook](deploy/README.md)
 - [Agent discovery and workload-aware filtering](docs/agent-discovery-filter.md)
+- [Agent–LLM and external-tool plaintext observability PRD](docs/anysentry-agent-llm-interaction-observability-prd.md)
+- [Agent–LLM and external-tool plaintext observability technical design](docs/anysentry-agent-llm-interaction-observability-technical-design.md)
 - [Performance testing](docs/performance-testing.md)
 - [AnySentry Progressive API Skill](integrations/skills/anysentry-api/SKILL.md)
 

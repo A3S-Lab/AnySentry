@@ -51,6 +51,7 @@ import {
   type AgentInventoryItem,
   type AgentInventory,
   type AgentInventoryQuery,
+  type AgentInteractionRecord,
   type QueryCoverage,
   type AgentRuntimeInstanceRecord,
   type AgentRuntimeState,
@@ -659,6 +660,242 @@ function AgentActionEvidence({
   );
 }
 
+function unixNsDate(value?: string) {
+  if (!value || !/^\d+$/u.test(value)) return "--";
+  try {
+    return formatDate(Number(BigInt(value) / 1_000_000n));
+  } catch {
+    return "--";
+  }
+}
+
+function unixNsDuration(start?: string, end?: string) {
+  if (!start || !end || !/^\d+$/u.test(start) || !/^\d+$/u.test(end)) return undefined;
+  try {
+    const milliseconds = Number((BigInt(end) - BigInt(start)) / 1_000_000n);
+    return milliseconds >= 0 ? milliseconds : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readableContent(value: unknown) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value ?? "");
+  }
+}
+
+function AgentInteractionTrace({
+  agent,
+  timeType,
+  startTime,
+  endTime,
+}: {
+  agent: AgentInventoryItem;
+  timeType: SecurityTimeType;
+  startTime?: string;
+  endTime?: string;
+}) {
+  const [selectedId, setSelectedId] = useState<string>();
+  const { data, loading, error, refresh } = useRequest(
+    () => securityCenterApi.agentInteractions({
+      timeType,
+      startTime: timeType === "custom" ? startTime : undefined,
+      endTime: timeType === "custom" ? endTime : undefined,
+      scope: "agent",
+      classificationView: "current_effective",
+      agentAssetId: agent.agentAssetId,
+      agentInstanceId: agent.agentInstanceId,
+      limit: 100,
+    }),
+    {
+      refreshDeps: [agent.agentAssetId, agent.agentInstanceId, timeType, startTime, endTime],
+      loadingDelay: 200,
+    },
+  );
+  const interactions = data?.items ?? [];
+  const modelInteractionCount = interactions.filter((item) => item.interactionType === "model").length;
+  const toolInteractionCount = interactions.filter((item) => item.interactionType === "tool").length;
+  const selected = interactions.find((item) => item.interactionId === selectedId);
+  const resultByToolCall = useMemo(() => {
+    const results = new Map<string, { interaction: AgentInteractionRecord; result: AgentInteractionRecord["toolResults"][number] }>();
+    for (const interaction of interactions) {
+      for (const result of interaction.toolResults) results.set(result.toolCallId, { interaction, result });
+    }
+    return results;
+  }, [interactions]);
+
+  useEffect(() => {
+    setSelectedId(undefined);
+  }, [agent.agentAssetId, agent.agentInstanceId, timeType, startTime, endTime]);
+
+  return (
+    <section className="overflow-hidden rounded-md border border-sky-400/15 bg-sky-500/[0.025]">
+      <div className="flex flex-col gap-3 border-b border-white/10 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <Bot className="size-4 shrink-0 text-sky-200" />
+            <h3 className="text-sm font-semibold text-zinc-100">Agent 与 LLM 交互</h3>
+            <Pill className="border-sky-400/20 bg-sky-500/10 text-sky-100">{`${modelInteractionCount} 次模型调用`}</Pill>
+            {toolInteractionCount ? <Pill className="border-violet-400/20 bg-violet-500/10 text-violet-100">{`${toolInteractionCount} 次外部工具调用`}</Pill> : null}
+            {data ? <Pill className="border-white/10 bg-white/5 text-zinc-400">{data.dataSource}</Pill> : null}
+          </div>
+          <p className="mt-1 text-xs leading-5 text-zinc-500">
+            展示 TLS/HTTP 传输边界实际发送的最终模型请求、模型可见响应，以及显式准入的外部工具请求/结果；未进入最终请求的内部 RAG 中间态不会补入。
+          </p>
+        </div>
+        <Button type="button" variant="ghost" size="sm" onClick={refresh} disabled={loading} className="h-8 text-zinc-400 hover:bg-white/5 hover:text-zinc-100">
+          <RefreshCw className={cn("size-3.5", loading && "animate-spin")} />
+          刷新
+        </Button>
+      </div>
+
+      {error ? (
+        <div className="flex items-start gap-2 px-3 py-4 text-xs text-rose-200">
+          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+          <span>{error.message || "Agent 交互加载失败"}</span>
+        </div>
+      ) : loading && !data ? (
+        <div className="flex items-center justify-center gap-2 px-3 py-8 text-xs text-zinc-500">
+          <LoaderCircle className="size-4 animate-spin" />
+          正在读取模型交互与正文
+        </div>
+      ) : interactions.length === 0 ? (
+        <div className="px-3 py-8 text-center text-xs leading-5 text-zinc-500">
+          当前窗口没有模型或显式准入的外部工具交互。请检查该 Runtime 的 TLS/HTTP coverage、attach 生效时间和协议支持状态。
+        </div>
+      ) : (
+        <div className="grid min-h-0 lg:grid-cols-[minmax(300px,0.8fr)_minmax(0,1.5fr)]">
+          <div className="max-h-[680px] divide-y divide-white/8 overflow-y-auto border-b border-white/10 lg:border-b-0 lg:border-r">
+            {data?.coverage.partial ? (
+              <div className="flex gap-2 bg-amber-500/[0.05] px-3 py-2 text-[11px] leading-5 text-amber-100/80">
+                <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+                <span>{`正文历史覆盖不完整：${data.coverage.partialReason ?? "存储不可用"}`}</span>
+              </div>
+            ) : null}
+            {interactions.map((interaction, index) => {
+              const active = interaction.interactionId === selectedId;
+              const duration = unixNsDuration(interaction.startedAtUnixNs, interaction.endedAtUnixNs);
+              return (
+                <button
+                  key={interaction.interactionId}
+                  type="button"
+                  onClick={() => setSelectedId(active ? undefined : interaction.interactionId)}
+                  className={cn("w-full px-3 py-3 text-left transition-colors hover:bg-white/[0.035]", active && "bg-sky-400/[0.07]")}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-mono text-[11px] text-zinc-500">{`#${interactions.length - index} · ${unixNsDate(interaction.startedAtUnixNs)}`}</span>
+                    <Pill className={interaction.completeness === "complete" ? "border-teal-400/25 bg-teal-500/10 text-teal-100" : "border-amber-400/25 bg-amber-500/10 text-amber-100"}>
+                      {interaction.completeness}
+                    </Pill>
+                  </div>
+                  <p className="mt-2 truncate text-xs font-semibold text-zinc-100">{interaction.interactionType === "tool" ? `外部工具 · ${interaction.path}` : interaction.model ?? "未知模型"}</p>
+                  <p className="mt-1 truncate font-mono text-[10px] text-zinc-500">{`${interaction.transport.toUpperCase()} · ${interaction.endpoint}${interaction.path}`}</p>
+                  <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-zinc-500">
+                    <span>{`HTTP ${interaction.statusCode}`}</span>
+                    <span>{formatDuration(duration)}</span>
+                    <span>{`${interaction.request.decodedBytes}B → ${interaction.response.decodedBytes}B`}</span>
+                    <span>{`${interaction.toolCalls.length} 指令 / ${interaction.toolResults.length} 结果`}</span>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="max-h-[680px] overflow-y-auto p-3">
+            {!selected ? (
+              <div className="flex min-h-48 items-center justify-center text-center text-xs leading-5 text-zinc-500">选择一次交互查看完整请求、响应、工具链和采集证据。</div>
+            ) : (
+              <div className="space-y-3">
+                <div className="grid gap-2 rounded border border-white/8 bg-black/10 p-3 text-[11px] sm:grid-cols-2">
+                  <FieldValue label="Interaction" value={selected.interactionId} />
+                  <FieldValue label="Connection" value={selected.connectionId} />
+                  <FieldValue label="Request start" value={unixNsDate(selected.startedAtUnixNs)} />
+                  <FieldValue label="First response" value={unixNsDate(selected.firstResponseAtUnixNs)} />
+                  <FieldValue label="Response end" value={unixNsDate(selected.endedAtUnixNs)} />
+                  <FieldValue label="Capture" value={`${selected.captureSource} · ${selected.timeQuality}`} />
+                </div>
+
+                {selected.partialReasons.length ? (
+                  <div className="rounded border border-amber-400/20 bg-amber-500/[0.06] px-3 py-2 text-xs leading-5 text-amber-100/80">
+                    {`内容不完整：${selected.partialReasons.join("、")}`}
+                  </div>
+                ) : null}
+
+                <details open className="rounded border border-white/8 bg-black/10">
+                  <summary className="cursor-pointer px-3 py-2 text-xs font-semibold text-zinc-200">{selected.interactionType === "tool" ? "Agent 发送给外部工具的指令" : "最终发送给 LLM 的请求"}</summary>
+                  <div className="border-t border-white/8 p-3">
+                    <div className="mb-2 flex flex-wrap gap-2 text-[10px] text-zinc-500">
+                      <span>{selected.request.contentType}</span>
+                      <span>{`${selected.request.decodedBytes} bytes`}</span>
+                      <span className="font-mono">{`sha256 ${selected.request.sha256}`}</span>
+                    </div>
+                    <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words rounded bg-black/30 p-3 font-mono text-[11px] leading-5 text-zinc-300">{selected.request.body}</pre>
+                  </div>
+                </details>
+
+                <details open className="rounded border border-white/8 bg-black/10">
+                  <summary className="cursor-pointer px-3 py-2 text-xs font-semibold text-zinc-200">{selected.interactionType === "tool" ? "外部工具返回给 Agent 的结果" : "LLM 返回给 Agent 的内容"}</summary>
+                  <div className="border-t border-white/8 p-3">
+                    <div className="mb-2 flex flex-wrap gap-2 text-[10px] text-zinc-500">
+                      <span>{selected.response.contentType}</span>
+                      <span>{`${selected.response.decodedBytes} bytes`}</span>
+                      <span className="font-mono">{`sha256 ${selected.response.sha256}`}</span>
+                    </div>
+                    <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words rounded bg-black/30 p-3 font-mono text-[11px] leading-5 text-zinc-300">{selected.response.text ?? selected.response.body}</pre>
+                  </div>
+                </details>
+
+                <div className="rounded border border-white/8 bg-black/10">
+                  <div className="border-b border-white/8 px-3 py-2 text-xs font-semibold text-zinc-200">工具调用顺序与结果</div>
+                  {selected.toolCalls.length === 0 ? (
+                    <p className="px-3 py-4 text-xs text-zinc-500">该响应没有可解析的工具指令。</p>
+                  ) : (
+                    <div className="divide-y divide-white/8">
+                      {selected.toolCalls.map((call, index) => {
+                        const matched = resultByToolCall.get(call.toolCallId);
+                        const duration = unixNsDuration(call.issuedAtUnixNs, matched?.result.observedAtUnixNs);
+                        return (
+                          <div key={`${call.toolCallId}-${index}`} className="p-3">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-mono text-[10px] text-zinc-500">{`#${index + 1}`}</span>
+                              <code className="text-xs font-semibold text-violet-100">{call.name}</code>
+                              <Pill className={matched?.result.isError ? "border-rose-400/25 bg-rose-500/10 text-rose-100" : matched ? "border-teal-400/25 bg-teal-500/10 text-teal-100" : "border-amber-400/25 bg-amber-500/10 text-amber-100"}>
+                                {matched?.result.isError ? "执行失败" : matched ? "已有结果" : "等待后续请求中的结果"}
+                              </Pill>
+                            </div>
+                            <div className="mt-1 flex flex-wrap gap-x-3 font-mono text-[10px] text-zinc-600">
+                              <span>{call.toolCallId}</span>
+                              <span>{`指令 ${unixNsDate(call.issuedAtUnixNs)}`}</span>
+                              {matched ? <span>{`结果 ${unixNsDate(matched.result.observedAtUnixNs)}`}</span> : null}
+                              {duration !== undefined ? <span>{`边界耗时 ${formatDuration(duration)}`}</span> : null}
+                            </div>
+                            <p className="mt-2 text-[10px] font-medium text-zinc-500">参数</p>
+                            <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-black/30 p-2 font-mono text-[11px] leading-5 text-zinc-300">{readableContent(call.arguments)}</pre>
+                            {matched ? (
+                              <>
+                                <p className="mt-2 text-[10px] font-medium text-zinc-500">执行结果</p>
+                                <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-black/30 p-2 font-mono text-[11px] leading-5 text-zinc-300">{readableContent(matched.result.content)}</pre>
+                              </>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function AgentActionTrace({
   agent,
   timeType,
@@ -1233,6 +1470,13 @@ function AgentDetail({
           <FieldValue label="Top Risk" value={agent.topRiskName ?? "--"} />
           <FieldValue label="Risk Code" value={agent.topRiskCategory ?? "--"} />
         </div>
+
+        <AgentInteractionTrace
+          agent={agent}
+          timeType={timeType}
+          startTime={startTime}
+          endTime={endTime}
+        />
 
         <AgentActionTrace
           agent={agent}

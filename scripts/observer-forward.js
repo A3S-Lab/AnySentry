@@ -136,7 +136,8 @@ function boundedNumber(value, fallback, min, max) {
 const MAX_INFLIGHT = boundedNumber(process.env.FORWARD_MAX_INFLIGHT, 8, 1, 64);
 const BATCH_SIZE = boundedNumber(process.env.FORWARD_BATCH_SIZE, 32, 1, 256);
 const BATCH_FLUSH_MS = boundedNumber(process.env.FORWARD_BATCH_FLUSH_MS, 50, 1, 5_000);
-// Leave at least 1 MiB for the batch envelope below the API route's default 4 MiB parser ceiling.
+// Most batches stay small for latency. `takeWeighted` still admits one oversized first item so an
+// explicitly allowed inline multimodal request can use the separate per-event ceiling below.
 const BATCH_MAX_BYTES = boundedNumber(
   process.env.FORWARD_BATCH_MAX_BYTES,
   512 * 1024,
@@ -145,9 +146,9 @@ const BATCH_MAX_BYTES = boundedNumber(
 );
 const MAX_EVENT_BYTES = boundedNumber(
   process.env.FORWARD_MAX_EVENT_BYTES,
-  3 * 1024 * 1024,
+  12 * 1024 * 1024,
   64 * 1024,
-  3 * 1024 * 1024,
+  12 * 1024 * 1024,
 );
 // This cap covers every event owned by the forwarder, regardless of whether it is waiting in the
 // priority queue, inside an HTTP request, or waiting for an API-authorized retry. Keeping the
@@ -2428,7 +2429,7 @@ function closeTransports() {
 function queuePriority(kind, classification) {
   if (kind === 'CaptureAggregate') return 0;
   if (kind === 'SecurityAction') return 5;
-  if (kind === 'ToolExec' || kind === 'ProcessExit') return 4;
+  if (kind === 'ToolExec' || kind === 'ProcessExit' || kind === 'LlmInteraction') return 4;
   if (classification.attribution?.classification === 'confirmed_agent') return 4;
   if (classification.state === 'agent') return 3;
   if (classification.state === 'unknown') return 2;

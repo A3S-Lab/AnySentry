@@ -1272,6 +1272,110 @@ export interface AgentActionList extends ClassifiedResponseMeta {
   updateTime: string;
 }
 
+export type AgentInteractionCompleteness =
+  | 'complete'
+  | 'partial'
+  | 'truncated'
+  | 'redacted'
+  | 'reference_only'
+  | 'unavailable'
+  | 'unsupported';
+
+export interface AgentInteractionMessage {
+  role: string;
+  content: unknown;
+  name?: string;
+  toolCallId?: string;
+}
+
+export interface AgentInteractionToolCall {
+  toolCallId: string;
+  name: string;
+  arguments: unknown;
+  issuedAtUnixNs?: string;
+}
+
+export interface AgentInteractionToolResult {
+  toolCallId: string;
+  name?: string;
+  content: unknown;
+  isError: boolean;
+  observedAtUnixNs?: string;
+}
+
+export interface AgentInteractionContent {
+  body: string;
+  encoding: 'utf8' | 'base64';
+  contentType: string;
+  capturedBytes: number;
+  decodedBytes: number;
+  sha256: string;
+  completeness: AgentInteractionCompleteness;
+  messages?: AgentInteractionMessage[];
+  text?: string;
+  structured?: unknown;
+}
+
+export interface AgentInteractionRecord {
+  schemaVersion: 'anysentry.agent_interaction.v1';
+  interactionId: string;
+  interactionType: 'model' | 'tool';
+  at: number;
+  tenantId?: string;
+  environmentId?: string;
+  workspacePath: string;
+  sourceId?: string;
+  collectorId?: string;
+  agentAssetId: string;
+  agentInstanceId?: string;
+  agentProduct?: string;
+  detectedClassification: AgentClassification;
+  currentEffectiveClassification: AgentClassification;
+  process?: ProcessContext;
+  connectionId: string;
+  transport: 'http' | 'tls';
+  protocol: string;
+  endpoint: string;
+  method: string;
+  path: string;
+  statusCode: number;
+  model?: string;
+  startedAtUnixNs: string;
+  requestCompleteAtUnixNs: string;
+  firstResponseAtUnixNs: string;
+  endedAtUnixNs: string;
+  durationNs: string;
+  timeQuality: string;
+  request: AgentInteractionContent;
+  response: AgentInteractionContent;
+  toolCalls: AgentInteractionToolCall[];
+  toolResults: AgentInteractionToolResult[];
+  completeness: AgentInteractionCompleteness;
+  partialReasons: string[];
+  captureSource: string;
+  receivedAt: number;
+}
+
+export interface AgentInteractionQuery extends SecurityTimeFilter {
+  agentAssetId?: string;
+  agentInstanceId?: string;
+  interactionId?: string;
+  interactionType?: 'model' | 'tool';
+  model?: string;
+  transport?: 'http' | 'tls';
+  completeness?: AgentInteractionCompleteness;
+  limit?: number;
+}
+
+export interface AgentInteractionList extends ClassifiedResponseMeta {
+  items: AgentInteractionRecord[];
+  total: number;
+  totalMode: QueryTotalMode;
+  coverage: QueryCoverage;
+  dataSource: 'clickhouse' | 'hot_ring';
+  updateTime: string;
+}
+
 export type EvidenceBundlePrimaryType = 'event' | 'incident' | 'alert' | 'remediation' | 'objective' | 'coverage' | 'notification' | 'maintenance' | 'audit' | 'topology' | 'scope';
 export interface EvidenceBundleQuery extends SecurityTimeFilter {
   auditId?: string;
@@ -3421,6 +3525,7 @@ export type AuditAction =
   | 'asset.review.updated'
   | 'asset.review.cleared'
   | 'agent.identity_ai_review.completed'
+  | 'agent.interaction.content.read'
   | 'maintenance.window.updated'
   | 'notification.channel.updated'
   | 'notification.route.updated'

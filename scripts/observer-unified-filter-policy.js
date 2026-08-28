@@ -126,7 +126,7 @@ function eventProbe(kind, payload = {}) {
   if (kind === 'Dns') return 'dns';
   if (kind === 'Egress') return 'connect';
   if (kind === 'SslContent') return 'ssl';
-  if (kind === 'LlmCall' || kind === 'AgentTool' || kind === 'AgentInvocation') return 'llm';
+  if (kind === 'LlmCall' || kind === 'LlmInteraction' || kind === 'AgentTool' || kind === 'AgentInvocation') return 'llm';
   if (kind === 'SecurityAction') return 'security';
   return '';
 }

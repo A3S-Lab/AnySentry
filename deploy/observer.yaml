@@ -157,7 +157,7 @@ spec:
             - { name: FORWARD_WAL_PENDING_MAX_EVENTS, value: "65536" }
             - { name: FORWARD_WAL_PENDING_MAX_BYTES, value: "268435456" }
             - { name: FORWARD_BATCH_MAX_BYTES, value: "524288" }
-            - { name: FORWARD_MAX_EVENT_BYTES, value: "3145728" }
+            - { name: FORWARD_MAX_EVENT_BYTES, value: "12582912" }
             - { name: FORWARD_MAX_OUTSTANDING_EVENTS, value: "16384" }
             - { name: FORWARD_MAX_OUTSTANDING_BYTES, value: "67108864" }
             - { name: FORWARD_PROTECTED_RESERVE_EVENTS, value: "4096" }

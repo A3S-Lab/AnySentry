@@ -348,7 +348,7 @@ spec:
             - { name: NODE_OPTIONS, value: "--max-old-space-size=1024" }
             # Keep the synchronous dashboard hot set bounded; durable history remains in ClickHouse.
             - { name: ANYSENTRY_HOT_EVENT_LIMIT, value: "5000" }
-            - { name: ANYSENTRY_OBSERVER_BODY_LIMIT, value: "4mb" }
+            - { name: ANYSENTRY_OBSERVER_BODY_LIMIT, value: "16mb" }
             # The installer creates this independently from image/manifests. It protects Source
             # bootstrap and Capture Profile policy/materialization endpoints without committing a
             # credential to Git.

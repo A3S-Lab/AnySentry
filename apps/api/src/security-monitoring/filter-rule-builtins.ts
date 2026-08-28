@@ -120,27 +120,27 @@ export const CAPTURE_PROFILE_ACTIONS: Record<CaptureProfile, CaptureProbeActions
   },
   probable_investigation: {
     exec: 'full', exit: 'full', tls: 'sample', connect: 'sample', dns: 'sample',
-    file_access: 'sample', file_delete: 'sample', llm: 'full', ssl: 'sample', security: 'full', file_read: 'full',
+    file_access: 'sample', file_delete: 'sample', llm: 'full', ssl: 'full', security: 'full', file_read: 'full',
   },
   security_full: {
     exec: 'full', exit: 'full', tls: 'sample', connect: 'full', dns: 'sample',
-    file_access: 'sample', file_delete: 'full', llm: 'full', ssl: 'sample', security: 'full', file_read: 'not_enabled',
+    file_access: 'sample', file_delete: 'full', llm: 'full', ssl: 'not_enabled', security: 'full', file_read: 'not_enabled',
   },
   business_context: {
     exec: 'full', exit: 'full', tls: 'aggregate', connect: 'aggregate', dns: 'aggregate',
-    file_access: 'aggregate', file_delete: 'sample', llm: 'aggregate', ssl: 'aggregate', security: 'full', file_read: 'not_enabled',
+    file_access: 'aggregate', file_delete: 'sample', llm: 'aggregate', ssl: 'not_enabled', security: 'full', file_read: 'not_enabled',
   },
   infrastructure_aggregate: {
     exec: 'full', exit: 'full', tls: 'aggregate', connect: 'aggregate', dns: 'aggregate',
-    file_access: 'aggregate', file_delete: 'sample', llm: 'aggregate', ssl: 'aggregate', security: 'full', file_read: 'not_enabled',
+    file_access: 'aggregate', file_delete: 'sample', llm: 'aggregate', ssl: 'not_enabled', security: 'full', file_read: 'not_enabled',
   },
   unknown_discovery: {
     exec: 'full', exit: 'full', tls: 'sample', connect: 'sample', dns: 'sample',
-    file_access: 'sample', file_delete: 'sample', llm: 'full', ssl: 'sample', security: 'full', file_read: 'not_enabled',
+    file_access: 'sample', file_delete: 'sample', llm: 'full', ssl: 'not_enabled', security: 'full', file_read: 'not_enabled',
   },
   self_health: {
     exec: 'full', exit: 'full', tls: 'aggregate', connect: 'aggregate', dns: 'aggregate',
-    file_access: 'aggregate', file_delete: 'sample', llm: 'aggregate', ssl: 'aggregate', security: 'full', file_read: 'not_enabled',
+    file_access: 'aggregate', file_delete: 'sample', llm: 'aggregate', ssl: 'not_enabled', security: 'full', file_read: 'not_enabled',
   },
 };
 

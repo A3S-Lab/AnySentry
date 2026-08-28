@@ -35,7 +35,7 @@ import {
   toolEvidenceIndexFields,
   type ToolEvidenceItem,
 } from './tool-evidence-linker';
-import { AgentAttribution, AgentMetadataRecord, AlertRecord, AuditRecord, CollectorHeartbeatRecord, IdentityAiReviewRecord, Incident, IngestionSourceRecord, JudgedEvent, MaintenanceWindowRecord, NotificationDeliveryRecord, NotificationState, ObjectiveRecord, ProcessContext, RemediationRecord } from './types';
+import { AgentAttribution, AgentInteractionQuery, AgentInteractionRecord, AgentMetadataRecord, AlertRecord, AuditRecord, CollectorHeartbeatRecord, IdentityAiReviewRecord, Incident, IngestionSourceRecord, JudgedEvent, MaintenanceWindowRecord, NotificationDeliveryRecord, NotificationState, ObjectiveRecord, ProcessContext, RemediationRecord } from './types';
 
 function boundedPositiveInt(
   raw: string | undefined,
@@ -56,6 +56,38 @@ function delay(ms: number): Promise<void> {
 const TABLE = 'events';
 const OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE = 'anysentry.observer.source_payload_sha256';
 const SHA256_HEX = /^[a-f0-9]{64}$/u;
+const AGENT_INTERACTION_TABLE = 'agent_interactions_v1';
+const AGENT_INTERACTION_DDL = `CREATE TABLE IF NOT EXISTS ${AGENT_INTERACTION_TABLE} (
+  interactionId String,
+  revision UInt64,
+  at UInt64,
+  ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000)),
+  tenantId LowCardinality(String) DEFAULT '',
+  environmentId LowCardinality(String) DEFAULT '',
+  workspacePath String,
+  sourceId LowCardinality(String) DEFAULT '',
+  collectorId LowCardinality(String) DEFAULT '',
+  agentAssetId String,
+  agentInstanceId String DEFAULT '',
+  agentProduct LowCardinality(String) DEFAULT '',
+  classification LowCardinality(String),
+  interactionType LowCardinality(String) DEFAULT 'model',
+  transport LowCardinality(String),
+  protocol LowCardinality(String),
+  endpoint String,
+  model LowCardinality(String) DEFAULT '',
+  completeness LowCardinality(String),
+  startedAtUnixNs String,
+  endedAtUnixNs String,
+  requestSha256 FixedString(64),
+  responseSha256 FixedString(64),
+  toolCallIds Array(String),
+  payload String
+)
+ENGINE = ReplacingMergeTree(revision)
+PARTITION BY toYYYYMM(ts)
+ORDER BY (tenantId, environmentId, agentAssetId, at, interactionId)
+TTL ts + INTERVAL 30 DAY DELETE`;
 // `at` is raw epoch-ms (matches the aggregator); `ts` is a derived DateTime only for TTL/partitioning.
 const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   schemaVersion LowCardinality(String),
@@ -965,6 +997,11 @@ async function runClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promis
       ...credentials,
     });
     await schema.command({ query: DDL(TABLE) });
+    await schema.command({ query: AGENT_INTERACTION_DDL });
+    await schema.command({
+      query: `ALTER TABLE ${AGENT_INTERACTION_TABLE}
+        ADD COLUMN IF NOT EXISTS interactionType LowCardinality(String) DEFAULT 'model' AFTER classification`,
+    });
     // One metadata transaction is materially cheaper than dozens of sequential ALTERs on a busy
     // MergeTree. Every operation is idempotent, so rolling versions retain the same compatibility.
     await schema.command({ query: `ALTER TABLE ${TABLE} ${EVENT_ALTERS.join(', ')}` });
@@ -6427,6 +6464,113 @@ export class ClickHouseStore {
     } catch (err) {
       console.error('[clickhouse] loadCollectorHeartbeats failed:', (err as Error).message);
       return [];
+    }
+  }
+
+  async insertAgentInteraction(record: AgentInteractionRecord): Promise<boolean> {
+    if (!this.client || !this.ready || this.closing) return false;
+    try {
+      await this.client.insert({
+        table: AGENT_INTERACTION_TABLE,
+        values: [{
+          interactionId: record.interactionId,
+          revision: Math.max(record.receivedAt, Date.now()),
+          at: record.at,
+          tenantId: record.tenantId ?? '',
+          environmentId: record.environmentId ?? '',
+          workspacePath: record.workspacePath,
+          sourceId: record.sourceId ?? '',
+          collectorId: record.collectorId ?? '',
+          agentAssetId: record.agentAssetId,
+          agentInstanceId: record.agentInstanceId ?? '',
+          agentProduct: record.agentProduct ?? '',
+          classification: record.currentEffectiveClassification,
+          interactionType: record.interactionType,
+          transport: record.transport,
+          protocol: record.protocol,
+          endpoint: record.endpoint,
+          model: record.model ?? '',
+          completeness: record.completeness,
+          startedAtUnixNs: record.startedAtUnixNs,
+          endedAtUnixNs: record.endedAtUnixNs,
+          requestSha256: record.request.sha256,
+          responseSha256: record.response.sha256,
+          toolCallIds: [...new Set([
+            ...record.toolCalls.map((item) => item.toolCallId),
+            ...record.toolResults.map((item) => item.toolCallId),
+          ])],
+          payload: JSON.stringify(record),
+        }],
+        format: 'JSONEachRow',
+        clickhouse_settings: {
+          insert_deduplication_token: `agent-interaction:${record.interactionId}:${record.response.sha256}`,
+        },
+      });
+      return true;
+    } catch (error) {
+      console.error('[clickhouse] agent interaction insert failed:', (error as Error).message);
+      return false;
+    }
+  }
+
+  async queryAgentInteractions(input: AgentInteractionQuery & {
+    startMs: number;
+    endMs: number;
+  }): Promise<AgentInteractionRecord[] | null> {
+    if (!this.client || !this.ready) return null;
+    const limit = Math.max(1, Math.min(500, input.limit ?? 100));
+    const conditions = [
+      'at >= {start:UInt64}',
+      'at <= {end:UInt64}',
+      ...(input.agentAssetId ? ['agentAssetId = {agentAssetId:String}'] : []),
+      ...(input.agentInstanceId ? ['agentInstanceId = {agentInstanceId:String}'] : []),
+      ...(input.interactionId ? ['interactionId = {interactionId:String}'] : []),
+      ...(input.interactionType ? ['interactionType = {interactionType:String}'] : []),
+      ...(input.model ? ['model = {model:String}'] : []),
+      ...(input.transport ? ['transport = {transport:String}'] : []),
+      ...(input.completeness ? ['completeness = {completeness:String}'] : []),
+    ];
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT interactionId, argMax(payload, revision) AS payload, max(at) AS latestAt
+          FROM ${AGENT_INTERACTION_TABLE}
+          WHERE ${conditions.join(' AND ')}
+          GROUP BY interactionId
+          ORDER BY latestAt DESC, interactionId DESC
+          LIMIT {limit:UInt32}`,
+        query_params: {
+          start: Math.max(0, Math.trunc(input.startMs)),
+          end: Math.max(0, Math.trunc(input.endMs)),
+          limit,
+          ...(input.agentAssetId ? { agentAssetId: input.agentAssetId } : {}),
+          ...(input.agentInstanceId ? { agentInstanceId: input.agentInstanceId } : {}),
+          ...(input.interactionId ? { interactionId: input.interactionId } : {}),
+          ...(input.interactionType ? { interactionType: input.interactionType } : {}),
+          ...(input.model ? { model: input.model } : {}),
+          ...(input.transport ? { transport: input.transport } : {}),
+          ...(input.completeness ? { completeness: input.completeness } : {}),
+        },
+        clickhouse_settings: {
+          max_execution_time: 10,
+          max_result_rows: String(limit),
+          result_overflow_mode: 'break',
+        },
+        format: 'JSONEachRow',
+      });
+      const rows = await result.json() as Array<{ payload?: string }>;
+      return rows.flatMap((row) => {
+        try {
+          if (!row.payload) return [];
+          const parsed = JSON.parse(row.payload) as AgentInteractionRecord;
+          return parsed.schemaVersion === 'anysentry.agent_interaction.v1' ? [parsed] : [];
+        } catch {
+          return [];
+        }
+      });
+    } catch (error) {
+      console.error('[clickhouse] agent interaction query failed:', (error as Error).message);
+      return null;
     }
   }
 

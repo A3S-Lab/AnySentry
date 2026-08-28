@@ -154,7 +154,7 @@ const CLUSTER_REVIEWS = new Set<UnknownClusterReview>(['unreviewed', 'agent', 'n
 const LEARNED_ACTIONS = new Set<UnknownLearnedAction>(['keep', 'sample', 'aggregate']);
 const AGENT_CLASSIFICATIONS = new Set<AgentClassification>(['confirmed_agent', 'probable_agent']);
 const CANONICAL_EVENT_KINDS = new Set([
-  'Exec', 'ToolExec', 'Exit', 'FileAccess', 'FileDelete', 'Egress', 'Dns', 'Tls', 'LlmCall',
+  'Exec', 'ToolExec', 'Exit', 'FileAccess', 'FileDelete', 'Egress', 'Dns', 'Tls', 'LlmCall', 'LlmInteraction',
   'SslContent', 'SecurityAction', 'Other',
 ]);
 /** Operational summaries/context belong to their own bounded data planes, never to Unknown learning. */
@@ -334,7 +334,7 @@ function canonicalEventKind(raw: unknown): string | undefined {
   const aliases: Record<string, string> = {
     exec: 'Exec', processexec: 'Exec', toolexec: 'ToolExec', exit: 'Exit', processexit: 'Exit',
     fileaccess: 'FileAccess', filedelete: 'FileDelete', egress: 'Egress', connect: 'Egress', dns: 'Dns',
-    tls: 'Tls', llm: 'LlmCall', llmcall: 'LlmCall', ssl: 'SslContent', sslcontent: 'SslContent',
+    tls: 'Tls', llm: 'LlmCall', llmcall: 'LlmCall', llminteraction: 'LlmInteraction', ssl: 'SslContent', sslcontent: 'SslContent',
     security: 'SecurityAction', securityaction: 'SecurityAction',
   };
   return aliases[value] ?? 'Other';

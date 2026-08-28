@@ -34,7 +34,7 @@ import {
   serverTrustedCorrelationContext,
   type TrustedCorrelationBindingScope,
 } from './trusted-correlation';
-import { CollectorHeartbeatOrigin, CollectorHeartbeatRecord, CollectorHeartbeatRequest, CollectorRawHeartbeatRequest, EventCategory, EventMeta, IdentityAiReviewRecord, Incident, IncidentStatus, JudgedEvent, JudgmentRouteReason, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
+import { AgentInteractionQuery, AgentInteractionRecord, CollectorHeartbeatOrigin, CollectorHeartbeatRecord, CollectorHeartbeatRequest, CollectorRawHeartbeatRequest, EventCategory, EventMeta, IdentityAiReviewRecord, Incident, IncidentStatus, JudgedEvent, JudgmentRouteReason, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
 import { FilterRuleCatalogService } from './filter-rule-catalog.service';
 import type { FilterRuleDecisionReceipt } from './filter-rule.types';
 
@@ -158,7 +158,7 @@ function eventCategory(kind: string): EventCategory {
   if (kind === 'ToolExec' || kind === 'AgentTool') return 'tool';
   if (kind === 'Egress' || kind === 'Dns' || kind === 'SslContent') return 'network';
   if (kind === 'FileAccess' || kind === 'FileDelete') return 'file';
-  if (kind === 'LlmCall' || kind === 'LlmApi') return 'llm';
+  if (kind === 'LlmCall' || kind === 'LlmApi' || kind === 'LlmInteraction') return 'llm';
   if (kind === 'SecurityAction') return 'security';
   if (kind === 'ProcessExit') return 'process';
   if (kind === 'RuntimeEvent' || kind === 'AgentInvocation' || kind === 'SystemContext') return 'runtime';
@@ -183,7 +183,7 @@ const FLEET = [
 type Sample = { line: string; eventKind: string; subject: string };
 
 const HOT_PROTECTED_EVENT_KINDS = new Set([
-  'AgentTool', 'AgentInvocation', 'SecurityAction', 'FileDelete',
+  'AgentTool', 'AgentInvocation', 'LlmInteraction', 'SecurityAction', 'FileDelete',
 ]);
 
 export function isHotProtectedEvent(
@@ -255,6 +255,7 @@ const OBSERVER_KINDS = new Set([
   'FileDelete',
   'SslContent',
   'LlmApi',
+  'LlmInteraction',
   'SecurityAction',
   'RuntimeEvent',
   'CaptureAggregate',
@@ -780,6 +781,17 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     updatedAt?: number,
   ): Promise<boolean> {
     return this.ch.writeToolEvidenceRelations(items, evidenceVersion, scope, updatedAt);
+  }
+
+  async persistAgentInteraction(record: AgentInteractionRecord): Promise<boolean> {
+    return this.ch.insertAgentInteraction(record);
+  }
+
+  async storedAgentInteractions(input: AgentInteractionQuery & {
+    startMs: number;
+    endMs: number;
+  }): Promise<AgentInteractionRecord[] | null> {
+    return this.ch.queryAgentInteractions(input);
   }
 
   committedEventCutoffMs(): number | undefined {

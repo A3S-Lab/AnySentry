@@ -1,0 +1,53 @@
+services:
+  fake-llm:
+    image: ${PI_LAB_IMAGE:-anysentry-pi-tls-observability-lab:0.1.0}
+    build:
+      context: ../pi-tls-observability-lab
+    command: ["fake-llm"]
+    environment:
+      FIXTURE_API_KEY: fixture-key-not-secret
+      FIXTURE_HTTP_HOST: 0.0.0.0
+      FIXTURE_HTTP_PORT: "18080"
+      FIXTURE_HTTPS_PORT: "18443"
+      FIXTURE_TLS_DIR: /tls
+      FIXTURE_TRANSCRIPT_PATH: /results/fake-llm.ndjson
+      FIXTURE_WORKSPACE: /workspace
+    healthcheck:
+      test: ["CMD", "node", "/opt/pi-tls-lab/app/healthcheck.mjs", "https://localhost:18443/healthz", "/tls/ca.crt"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+    labels:
+      io.anysentry.observe: "false"
+      anysentry.io/workload-role: test_fixture
+    volumes:
+      - ${LANGCHAIN_LAB_RUNTIME_DIR:-./.runtime}/tls:/tls
+      - ${LANGCHAIN_LAB_RUNTIME_DIR:-./.runtime}/results:/results
+      - ${LANGCHAIN_LAB_RUNTIME_DIR:-./.runtime}/workspace:/workspace
+
+  langchain-agent:
+    image: ${LANGCHAIN_LAB_IMAGE:-anysentry-langchain-tls-observability-lab:0.1.0}
+    build:
+      context: .
+    depends_on:
+      fake-llm:
+        condition: service_healthy
+    environment:
+      LANGCHAIN_LAB_BASE_URL: https://fake-llm:18443/v1
+      LANGCHAIN_LAB_API_KEY: fixture-key-not-secret
+      LANGCHAIN_LAB_MODEL: fixture-tool-model
+      LANGCHAIN_LAB_WORKSPACE: /workspace
+      LANGCHAIN_LAB_RESULTS: /results
+      LANGCHAIN_LAB_ATTACH_GRACE_SECONDS: ${LANGCHAIN_LAB_ATTACH_GRACE_SECONDS:-10}
+      SSL_CERT_FILE: /tls/ca.crt
+      REQUESTS_CA_BUNDLE: /tls/ca.crt
+    labels:
+      anysentry.io/workload-kind: agent
+      anysentry.io/agent-id: docker-langchain-tls-fixture
+      anysentry.io/agent-runtime: langchain
+      anysentry.io/test-protocol: tls-http
+    volumes:
+      - ${LANGCHAIN_LAB_RUNTIME_DIR:-./.runtime}/tls:/tls:ro
+      - ${LANGCHAIN_LAB_RUNTIME_DIR:-./.runtime}/results:/results
+      - ${LANGCHAIN_LAB_RUNTIME_DIR:-./.runtime}/workspace:/workspace

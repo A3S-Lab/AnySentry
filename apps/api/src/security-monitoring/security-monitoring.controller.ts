@@ -47,6 +47,7 @@ import { UnknownLearningRuntimeService } from './unknown-learning-runtime.servic
 import type { UnknownLearnedAction, UnknownPolicyStage } from './unknown-learning';
 import { InfrastructureRuleError, InfrastructureRuleService } from './infrastructure-rule.service';
 import { ObservedAssetLifecycleService } from './observed-asset-lifecycle.read.service';
+import { parseObserverAgentInteraction } from './agent-interaction';
 import type { UnknownInfrastructureDraftRequest } from './infrastructure-rule.types';
 import {
   bindServerTrustedCorrelationContext,
@@ -87,7 +88,7 @@ const CLICKHOUSE_EVENT_BUFFER_FULL = 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL';
 const EVENT_REVISION_CONFLICT = 'ANYSENTRY_EVENT_REVISION_CONFLICT';
 const OBSERVER_BATCH_RETRY_AFTER_MS = 1_000;
 const OBSERVER_BATCH_MAX_EVENTS = 256;
-const OBSERVER_BATCH_MAX_BYTES = 4 * 1024 * 1024;
+const OBSERVER_BATCH_MAX_BYTES = 15 * 1024 * 1024;
 const OBSERVER_BATCH_CONTROL_YIELD_EVERY = 32;
 const OBSERVER_BATCH_ID_MAX_LENGTH = 200;
 const OBSERVER_BATCH_DIGEST = /^[a-f0-9]{64}$/u;
@@ -277,6 +278,7 @@ interface PreparedObserverBatchEvent {
   sourceResolution: IngestionSourceResolution;
   meta: T.EventMeta;
   prepared: PreparedJudgeAcceptOutcome;
+  interaction?: T.AgentInteractionRecord;
 }
 
 interface RejectedIngestContext {
@@ -335,7 +337,7 @@ function eventCategory(kind: string): T.EventCategory {
   if (kind === 'ToolExec' || kind === 'AgentTool') return 'tool';
   if (kind === 'Egress' || kind === 'Dns' || kind === 'SslContent') return 'network';
   if (kind === 'FileAccess' || kind === 'FileDelete') return 'file';
-  if (kind === 'LlmCall' || kind === 'LlmApi') return 'llm';
+  if (kind === 'LlmCall' || kind === 'LlmApi' || kind === 'LlmInteraction') return 'llm';
   if (kind === 'SecurityAction') return 'security';
   if (kind === 'ProcessExit') return 'process';
   if (kind === 'RuntimeEvent' || kind === 'AgentInvocation' || kind === 'SystemContext') return 'runtime';
@@ -550,7 +552,7 @@ function trustedCollectorEventTime(meta: T.EventMeta, trusted: boolean): number 
 }
 
 function summarize(kind: string, inner: Record<string, unknown>): string {
-  const a = inner as { argv?: string[]; peer?: string; port?: number; query?: string; path?: string; sni?: string; kind?: string };
+  const a = inner as { argv?: string[]; peer?: string; port?: number; query?: string; path?: string; sni?: string; kind?: string; model?: string; endpoint?: string };
   if (kind === 'ToolExec') return redact((a.argv ?? []).join(' ')).slice(0, 80) || 'exec';
   if (kind === 'Egress') return `egress → ${a.peer ?? '?'}${a.port ? `:${a.port}` : ''}`;
   if (kind === 'Dns') return `dns ${a.query ?? ''}`;
@@ -558,6 +560,7 @@ function summarize(kind: string, inner: Record<string, unknown>): string {
   if (kind === 'SslContent') return 'ssl content';
   if (kind === 'SecurityAction') return `security ${a.kind ?? ''}`;
   if (kind === 'LlmCall') return `llm ${a.sni ?? ''}`;
+  if (kind === 'LlmInteraction') return `llm interaction ${a.model ?? ''} ${a.endpoint ?? ''}`.trim();
   return kind;
 }
 
@@ -1512,6 +1515,8 @@ function canonicalEventKind(input: T.UniversalIngestEvent): string {
     llmcall: 'LlmCall',
     llm_api: 'LlmApi',
     llmapi: 'LlmApi',
+    llm_interaction: 'LlmInteraction',
+    llminteraction: 'LlmInteraction',
     ssl: 'SslContent',
     ssl_content: 'SslContent',
     sslcontent: 'SslContent',
@@ -4483,6 +4488,51 @@ export class SecurityMonitoringController {
   @HttpCode(200)
   agentActions(@Body() f: T.AgentEventQuery) {
     return this.agg.storedAgentActions(f);
+  }
+
+  @Post('agents/interactions')
+  @HttpCode(200)
+  @RequireManagementAuth()
+  async agentInteractions(
+    @Body() f: T.AgentInteractionQuery,
+    @Headers() headers: HeaderBag,
+  ) {
+    const agentAssetId = f?.agentAssetId === undefined
+      ? undefined
+      : strictIdentityText(f.agentAssetId, 512);
+    const agentInstanceId = f?.agentInstanceId === undefined
+      ? undefined
+      : strictIdentityText(f.agentInstanceId, 512);
+    const interactionId = f?.interactionId === undefined
+      ? undefined
+      : strictIdentityText(f.interactionId, 160);
+    if (f?.agentAssetId !== undefined && !agentAssetId) {
+      throw new BadRequestException('agentAssetId is invalid');
+    }
+    if (f?.agentInstanceId !== undefined && !agentInstanceId) {
+      throw new BadRequestException('agentInstanceId is invalid');
+    }
+    if (f?.interactionId !== undefined && !interactionId) {
+      throw new BadRequestException('interactionId is invalid');
+    }
+    const result = await this.agg.agentInteractions({ ...f, agentAssetId, agentInstanceId, interactionId });
+    this.audit.record({
+      actor: auditActor(headers),
+      action: 'agent.interaction.content.read',
+      resourceType: 'agent',
+      resourceId: agentAssetId ?? interactionId ?? 'interaction-query',
+      summary: `Read ${result.items.length} Agent interaction content record(s)`,
+      details: {
+        agentAssetId,
+        agentInstanceId,
+        interactionId,
+        resultCount: result.items.length,
+        requestedLimit: f?.limit,
+        classificationView: f?.classificationView,
+        scope: f?.scope,
+      },
+    });
+    return result;
   }
 
   @Post('events/tool-evidence')
@@ -7683,6 +7733,7 @@ export class SecurityMonitoringController {
         Boolean(requestToken),
       ), collectorEventAt);
       const prepared = this.judge.prepareAcceptWithDisposition(line, meta, collectorEventAt ?? Date.now());
+      const interaction = parseObserverAgentInteraction(line, meta);
       const context: PreparedObserverBatchEvent = {
         index,
         body: event,
@@ -7695,6 +7746,7 @@ export class SecurityMonitoringController {
         sourceResolution,
         meta,
         prepared,
+        ...(interaction ? { interaction } : {}),
       };
       preparedByIndex.set(index, context);
       if (prepared.disposition === 'retained') retained.push(context);
@@ -7970,6 +8022,7 @@ export class SecurityMonitoringController {
       }
 
       try {
+        if (context.interaction) await this.agg.storeAgentInteraction(context.interaction);
         await this.observeSupplyChainInstall(prepared.event, context.line);
         this.observeWorkspaceAssociation(prepared.event);
         this.identityReview.considerCandidate(prepared.event, () => this.agg.invalidateWindowCache());
@@ -8274,6 +8327,8 @@ export class SecurityMonitoringController {
     if (outcome.durability === 'durable') {
       this.materializeCommittedObservedAsset(rec, collectorEventAt);
     }
+    const interaction = parseObserverAgentInteraction(line, meta);
+    if (interaction) await this.agg.storeAgentInteraction(interaction);
     await this.enqueueCanonicalShadow(rec, line);
     await this.observeSupplyChainInstall(rec, line);
     this.observeWorkspaceAssociation(rec);

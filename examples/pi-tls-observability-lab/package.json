@@ -1,0 +1,21 @@
+{
+  "name": "anysentry-pi-tls-observability-lab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Deterministic host and Docker Pi workload for non-invasive TLS/HTTP observability tests",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "fake-llm": "node app/fake-openai-server.mjs",
+    "run:pi": "node app/run-pi-fixture.mjs",
+    "verify": "node app/verify-run.mjs",
+    "test:host": "./scripts/run-host.sh",
+    "test:docker": "./scripts/run-docker.sh",
+    "cleanup": "./scripts/cleanup.sh all"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.83.0"
+  }
+}

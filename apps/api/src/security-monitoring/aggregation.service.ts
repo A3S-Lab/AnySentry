@@ -398,7 +398,7 @@ function eventCategory(kind: string): T.EventCategory {
   if (kind === 'ToolExec') return 'tool';
   if (kind === 'Egress' || kind === 'Dns' || kind === 'SslContent') return 'network';
   if (kind === 'FileAccess' || kind === 'FileDelete') return 'file';
-  if (kind === 'LlmCall' || kind === 'LlmApi') return 'llm';
+  if (kind === 'LlmCall' || kind === 'LlmApi' || kind === 'LlmInteraction') return 'llm';
   if (kind === 'SecurityAction') return 'security';
   if (kind === 'ProcessExit') return 'process';
   if (kind === 'RuntimeEvent') return 'runtime';
@@ -734,6 +734,10 @@ export class AggregationService {
     key: string;
     value: Promise<T.AgentEventList>;
   };
+  private readonly interactionHot = new Map<string, { record: T.AgentInteractionRecord; bytes: number }>();
+  private interactionHotBytes = 0;
+  private readonly interactionHotMaxRecords = 2_000;
+  private readonly interactionHotMaxBytes = 64 * 1024 * 1024;
 
   historyFactCacheStatus() {
     const agents = [...this.agentHistoryBuckets.entries()].map(([scope, cache]) => ({
@@ -1811,6 +1815,91 @@ export class AggregationService {
         partialReason: hasMore ? 'scan_limit' : undefined,
         committedCutoffMs: persistentPage.committedCutoffMs,
       }),
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  async storeAgentInteraction(record: T.AgentInteractionRecord): Promise<{ durable: boolean }> {
+    const bytes = Buffer.byteLength(JSON.stringify(record));
+    const previous = this.interactionHot.get(record.interactionId);
+    if (previous) {
+      this.interactionHotBytes = Math.max(0, this.interactionHotBytes - previous.bytes);
+      this.interactionHot.delete(record.interactionId);
+    }
+    this.interactionHot.set(record.interactionId, { record, bytes });
+    this.interactionHotBytes += bytes;
+    while (
+      this.interactionHot.size > this.interactionHotMaxRecords
+      || this.interactionHotBytes > this.interactionHotMaxBytes
+    ) {
+      const oldest = this.interactionHot.entries().next().value as
+        | [string, { record: T.AgentInteractionRecord; bytes: number }]
+        | undefined;
+      if (!oldest) break;
+      this.interactionHot.delete(oldest[0]);
+      this.interactionHotBytes = Math.max(0, this.interactionHotBytes - oldest[1].bytes);
+    }
+    return { durable: await this.judge.persistAgentInteraction(record) };
+  }
+
+  async agentInteractions(filter: T.AgentInteractionQuery): Promise<T.AgentInteractionList> {
+    const window = resolveTimeWindow(filter);
+    const requestedAsset = filter.agentAssetId?.trim();
+    const agentAssetId = requestedAsset
+      ? this.agentMetadata.canonicalAgentAssetId(requestedAsset)
+      : undefined;
+    const query = { ...filter, agentAssetId, startMs: window.startMs, endMs: window.endMs };
+    const persisted = await this.judge.storedAgentInteractions(query);
+    const merged = new Map<string, T.AgentInteractionRecord>();
+    for (const item of persisted ?? []) merged.set(item.interactionId, item);
+    for (const { record } of this.interactionHot.values()) {
+      if (record.at < window.startMs || record.at > window.endMs) continue;
+      merged.set(record.interactionId, record);
+    }
+    const currentView = resolvedClassificationView(filter) === 'current_effective';
+    const items = [...merged.values()]
+      .map((item): T.AgentInteractionRecord => {
+        const review = currentView ? this.assetReviews?.current(item.agentAssetId) : undefined;
+        return review ? { ...item, currentEffectiveClassification: review.decision } : item;
+      })
+      .filter((item) =>
+        (!agentAssetId || item.agentAssetId === agentAssetId)
+        && (!filter.agentInstanceId || item.agentInstanceId === filter.agentInstanceId)
+        && (!filter.interactionId || item.interactionId === filter.interactionId)
+        && (!filter.interactionType || item.interactionType === filter.interactionType)
+        && (!filter.model || item.model === filter.model)
+        && (!filter.transport || item.transport === filter.transport)
+        && (!filter.completeness || item.completeness === filter.completeness)
+        && (filter.scope === 'raw' || ['confirmed_agent', 'probable_agent'].includes(
+          currentView ? item.currentEffectiveClassification : item.detectedClassification,
+        )))
+      .sort((left, right) => right.at - left.at || right.interactionId.localeCompare(left.interactionId));
+    const limit = Math.max(1, Math.min(500, filter.limit ?? 100));
+    const visible = items.slice(0, limit);
+    const snapshotAsOf = new Date(window.endMs).toISOString();
+    const dataTimes = visible.map((item) => item.at);
+    const durable = persisted !== null;
+    return {
+      items: visible,
+      total: items.length,
+      totalMode: durable && items.length <= limit ? 'exact' : 'omitted',
+      coverage: {
+        requestedFrom: new Date(window.startMs).toISOString(),
+        requestedTo: snapshotAsOf,
+        snapshotAsOf,
+        asOf: snapshotAsOf,
+        dataFrom: dataTimes.length ? new Date(Math.min(...dataTimes)).toISOString() : undefined,
+        dataTo: dataTimes.length ? new Date(Math.max(...dataTimes)).toISOString() : undefined,
+        completeness: durable
+          ? currentView ? 'exact_current_effective' : 'exact_as_observed'
+          : 'partial',
+        partial: !durable,
+        partialReason: durable ? undefined : 'hot_ring_only',
+        source: durable ? 'clickhouse+hot_delta' : 'memory_hot_ring',
+        totalMode: durable && items.length <= limit ? 'exact' : 'omitted',
+      },
+      dataSource: durable ? 'clickhouse' : 'hot_ring',
       ...this.classificationResponseMeta(filter),
       updateTime: iso(),
     };

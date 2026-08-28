@@ -19,6 +19,7 @@ const EVENT_POLICY_KEYS = new Set([
   'Dns',
   'SslContent',
   'LlmCall',
+  'LlmInteraction',
   'SecurityAction',
   'CollectorHeartbeat',
   'RuntimeSnapshot',
@@ -35,6 +36,7 @@ const ALWAYS_KEEP_EVENT_KINDS = new Set([
   // the durable Process generation/tombstone before omitting the large non-Agent raw payload.
   'ToolExec',
   'ProcessExit',
+  'LlmInteraction',
 ]);
 const DEFAULT_INFRASTRUCTURE_EVENT_POLICY = Object.freeze({
   default: 'drop',
@@ -44,6 +46,7 @@ const DEFAULT_INFRASTRUCTURE_EVENT_POLICY = Object.freeze({
   Dns: 'drop',
   SslContent: 'drop',
   LlmCall: 'drop',
+  LlmInteraction: 'drop',
 });
 
 function object(value) {
@@ -506,6 +509,7 @@ function policyRuleDocument(value, options = {}) {
             Dns: 'drop',
             SslContent: 'drop',
             LlmCall: 'drop',
+            LlmInteraction: 'drop',
             ...(object(rule.eventPolicies) ?? {}),
           },
       source: text(rule.source?.type, 120) || 'platform_inventory',

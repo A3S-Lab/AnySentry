@@ -26,9 +26,10 @@ async function bootstrap() {
     '/security-center/runtime/snapshot',
   ], json({
     type: ['application/json', 'application/*+json'],
-    // Observer batches and runtime snapshots are bounded by their controllers, but regularly
-    // exceed Express' 100 KiB default. Keep a route-scoped ceiling instead of widening every API.
-    limit: process.env.ANYSENTRY_OBSERVER_BODY_LIMIT || '4mb',
+    // Observer batches and runtime snapshots are bounded by their controllers, but an admitted
+    // inline multimodal model request can be several MiB. Keep the larger ceiling route-scoped
+    // instead of widening every API endpoint.
+    limit: process.env.ANYSENTRY_OBSERVER_BODY_LIMIT || '16mb',
   }));
   app.use('/security-center/supply-chain/tasks', json({
     type: ['application/json', 'application/*+json'],

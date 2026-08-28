@@ -113,6 +113,7 @@ function captureProfileMetricsFixture() {
     captureProbeMetrics('llm'),
     captureProbeMetrics('ssl'),
     captureProbeMetrics('security'),
+    captureProbeMetrics('file_read'),
   ];
   return {
     mode: 'enforce',
@@ -1016,12 +1017,22 @@ async function verifyRouteScopedBodyLimits() {
     { status: snapshotStatus },
   );
 
-  const oversizedBatchStatus = await rawJsonStatus(
+  const multimodalSizedBatchStatus = await rawJsonStatus(
     '/ingest/batch',
     JSON.stringify({ events: [], padding: 'x'.repeat(5 * 1024 * 1024) }),
   );
   assert(
-    'observer batch body limit rejects payloads above 4 MiB',
+    'observer batch route admits an inline-multimodal-sized envelope above 4 MiB',
+    multimodalSizedBatchStatus !== 413,
+    { status: multimodalSizedBatchStatus },
+  );
+
+  const oversizedBatchStatus = await rawJsonStatus(
+    '/ingest/batch',
+    JSON.stringify({ events: [], padding: 'x'.repeat(17 * 1024 * 1024) }),
+  );
+  assert(
+    'observer batch body limit rejects payloads above 16 MiB',
     oversizedBatchStatus === 413,
     { status: oversizedBatchStatus },
   );

@@ -183,7 +183,7 @@ function isKnownInfrastructureWorkload(ref, attribution) {
 }
 
 function isLlmEvent(kind, payload) {
-  if (['LlmApi', 'LlmCall'].includes(kind)) return true;
+  if (['LlmApi', 'LlmCall', 'LlmInteraction'].includes(kind)) return true;
   const target = targetText(payload);
   return Boolean(target && LLM_HOST_HINTS.some((hint) => target.includes(hint)));
 }
