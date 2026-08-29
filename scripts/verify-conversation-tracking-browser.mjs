@@ -90,6 +90,17 @@ if (!conversation) {
   }
 }
 assert.ok(conversation?.conversationId, `conversation fixture not found: ${JSON.stringify(conversations)}`);
+const scopedTimeline = await api('/agents/conversations/timeline', {
+  timeType: 'last_30d',
+  scope: 'agent',
+  classificationView: 'current_effective',
+  agentAssetId: conversation.agentAssetId,
+  conversationId: conversation.conversationId,
+});
+assert.ok(scopedTimeline.items.length > 0,
+  'conversationId must remain resolvable when its owning agentAssetId is supplied');
+assert.ok(JSON.stringify(scopedTimeline).includes(marker),
+  'scoped conversation timeline must retain the selected plaintext marker');
 
 const port = await freePort();
 const chrome = spawn(chromeBinary, [

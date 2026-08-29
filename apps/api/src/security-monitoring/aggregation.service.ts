@@ -1929,15 +1929,20 @@ export class AggregationService {
     interactions: T.AgentInteractionList;
     inventory: T.AgentInventory;
   }> {
+    // An inferred conversation ID is anchored in the globally ordered projection. Applying an
+    // asset, instance, or model prefilter can change the first record in that projection and thus
+    // produce a different ID. Once a conversationId is present, keep those values as post-
+    // projection consistency filters instead of changing the record set used to resolve the ID.
+    const resolveConversationId = Boolean(filter.conversationId);
     const interactionQuery: T.AgentInteractionQuery = {
       timeType: filter.timeType,
       startTime: filter.startTime,
       endTime: filter.endTime,
       scope: 'agent',
       classificationView: filter.classificationView,
-      agentAssetId: filter.agentAssetId,
-      agentInstanceId: filter.agentInstanceId,
-      model: filter.model,
+      agentAssetId: resolveConversationId ? undefined : filter.agentAssetId,
+      agentInstanceId: resolveConversationId ? undefined : filter.agentInstanceId,
+      model: resolveConversationId ? undefined : filter.model,
       limit: 500,
     };
     const inventoryQuery: T.AgentInventoryQuery = {
@@ -1946,8 +1951,8 @@ export class AggregationService {
       endTime: filter.endTime,
       scope: 'agent',
       classificationView: filter.classificationView,
-      agentAssetId: filter.agentAssetId,
-      agentInstanceId: filter.agentInstanceId,
+      agentAssetId: resolveConversationId ? undefined : filter.agentAssetId,
+      agentInstanceId: resolveConversationId ? undefined : filter.agentInstanceId,
       includeUnclassified: false,
       limit: 500,
     };
