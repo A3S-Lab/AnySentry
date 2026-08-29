@@ -41,7 +41,13 @@ const conversation = ({
   coverage: coverage(status),
 });
 
-const runtime = (agentInstanceId, runtimeState, product = 'codex') => ({
+const runtime = (
+  agentInstanceId,
+  runtimeState,
+  product = 'codex',
+  workspacePath = '/workspace/repo',
+  physicalWorkloadId,
+) => ({
   agentScopeId: 'scope-' + agentInstanceId,
   agentDisplayName: product,
   agentInstanceId,
@@ -51,7 +57,8 @@ const runtime = (agentInstanceId, runtimeState, product = 'codex') => ({
   rootGeneration: 1,
   hostId: 'fixture-host',
   bootId: 'fixture-boot',
-  workspacePath: '/workspace/repo',
+  workspacePath,
+  physicalWorkloadId,
   discoveredAt: 1,
   lastSeenAt: 2,
   collectorId: 'fixture-collector',
@@ -141,5 +148,66 @@ const aliasFallback = projectAgentConversationDirectory([
 ], [runtime('current-runtime-id', 'running')], 'all');
 assert.equal(aliasFallback[0].lifecycleState, 'running');
 assert.equal(aliasFallback[0].activeInstanceCount, 1);
+
+const syntheticDify = projectAgentConversationDirectory([
+  conversation({
+    conversationId: 'cv-dify-a',
+    agentAssetId: 'asset-dify-a',
+    agentInstanceIds: ['dify-instance-a'],
+    product: 'dify-worker',
+    workspacePath: 'agent://container-a',
+    environment: 'docker',
+    at: '1788000000000000005',
+  }),
+  conversation({
+    conversationId: 'cv-dify-b',
+    agentAssetId: 'asset-dify-b',
+    agentInstanceIds: ['dify-instance-b'],
+    product: 'Dify',
+    workspacePath: 'agent://container-b',
+    environment: 'docker',
+    at: '1788000000000000006',
+  }),
+], [
+  runtime('dify-instance-a', 'running', 'Dify', null, 'docker:container-a'),
+  runtime('dify-instance-b', 'running', 'dify-worker', null, 'docker:container-b'),
+  runtime('dify-instance-c', 'running', 'Dify', null, 'docker:container-c'),
+  runtime('dify-instance-d', 'running', 'Dify', null, 'docker:container-d'),
+], 'all');
+assert.equal(syntheticDify.length, 1);
+assert.equal(syntheticDify[0].product, 'Dify');
+assert.equal(syntheticDify[0].workspacePath, 'agent-scope:dify');
+assert.equal(syntheticDify[0].environment, 'docker');
+assert.equal(syntheticDify[0].groupingQuality, 'inferred');
+assert.equal(syntheticDify[0].lifecycleState, 'running');
+assert.equal(syntheticDify[0].activeInstanceCount, 4);
+assert.equal(syntheticDify[0].totalInstanceCount, 4);
+assert.equal(syntheticDify[0].conversationCount, 2);
+
+const realWorkspaceIsolation = projectAgentConversationDirectory([
+  conversation({
+    conversationId: 'cv-dify-project-a',
+    agentAssetId: 'asset-dify-project-a',
+    agentInstanceIds: ['dify-project-a'],
+    product: 'Dify',
+    workspacePath: '/srv/project-a',
+    environment: 'docker',
+    at: '1788000000000000007',
+  }),
+  conversation({
+    conversationId: 'cv-dify-project-b',
+    agentAssetId: 'asset-dify-project-b',
+    agentInstanceIds: ['dify-project-b'],
+    product: 'Dify',
+    workspacePath: '/srv/project-b',
+    environment: 'docker',
+    at: '1788000000000000008',
+  }),
+], [], 'all');
+assert.equal(realWorkspaceIsolation.length, 2);
+assert.deepEqual(
+  realWorkspaceIsolation.map((item) => item.workspacePath).sort(),
+  ['/srv/project-a', '/srv/project-b'],
+);
 
 console.log('agent conversation directory verification passed');

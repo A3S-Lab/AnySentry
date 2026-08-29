@@ -17,9 +17,21 @@ function canonicalProduct(value?: string): string {
   return value?.trim() || 'Unknown Agent';
 }
 
-function canonicalWorkspace(value?: string): string {
+function isSyntheticWorkspace(value?: string): boolean {
+  const workspace = value?.trim() ?? '';
+  return !workspace
+    || workspace === 'workspace:unknown'
+    || workspace.startsWith('agent://')
+    || workspace.startsWith('agent-scope:');
+}
+
+function canonicalWorkspace(value: string | undefined, product: string): string {
   const workspace = value?.trim().replace(/\/+$/u, '') ?? '';
-  return workspace || 'workspace:unknown';
+  if (!isSyntheticWorkspace(workspace)) return workspace;
+  const productScope = normalized(product)
+    .replace(/[^a-z0-9]+/gu, '-')
+    .replace(/^-+|-+$/gu, '') || 'unknown-agent';
+  return 'agent-scope:' + productScope;
 }
 
 function canonicalEnvironment(
@@ -94,10 +106,11 @@ function runtimeEnvironment(
   return 'host';
 }
 
-function runtimeWorkspace(instance: T.AgentRuntimeInstanceRecord): string {
+function runtimeWorkspace(instance: T.AgentRuntimeInstanceRecord, product: string): string {
   return canonicalWorkspace(
     instance.workspacePath
       ?? (instance.agentScopeId ? 'agent-scope:' + instance.agentScopeId : undefined),
+    product,
   );
 }
 
@@ -113,8 +126,9 @@ export function projectAgentConversationDirectory(
   const groups = new Map<string, T.AgentConversationSummary[]>();
   for (const conversation of conversations) {
     const product = canonicalProduct(conversation.agentProduct);
-    const workspacePath = canonicalWorkspace(conversation.workspacePath);
-    const environment = canonicalEnvironment(conversation.environment, workspacePath);
+    const rawWorkspacePath = conversation.workspacePath?.trim().replace(/\/+$/u, '') ?? '';
+    const environment = canonicalEnvironment(conversation.environment, rawWorkspacePath);
+    const workspacePath = canonicalWorkspace(rawWorkspacePath, product);
     const id = logicalAgentId(product, environment, workspacePath);
     const items = groups.get(id) ?? [];
     items.push(conversation);
@@ -128,18 +142,19 @@ export function projectAgentConversationDirectory(
       || left.conversationId.localeCompare(right.conversationId));
     const first = conversations[0];
     const product = canonicalProduct(first.agentProduct);
-    const workspacePath = canonicalWorkspace(first.workspacePath);
-    const environment = canonicalEnvironment(first.environment, workspacePath);
+    const rawWorkspacePath = first.workspacePath?.trim().replace(/\/+$/u, '') ?? '';
+    const environment = canonicalEnvironment(first.environment, rawWorkspacePath);
+    const workspacePath = canonicalWorkspace(rawWorkspacePath, product);
     const agentInstanceIds = [...new Set(conversations.flatMap((item) => item.agentInstanceIds))];
     const agentAssetIds = [...new Set(conversations.map((item) => item.agentAssetId))];
     const instanceSet = new Set(agentInstanceIds);
-    let matchingRuntime = runtimeInstances.filter((instance) =>
-      instanceSet.has(instance.agentInstanceId));
-    if (matchingRuntime.length === 0) {
-      matchingRuntime = runtimeInstances.filter((instance) =>
-        runtimeWorkspace(instance) === workspacePath
-        && canonicalProduct(instance.agentDisplayName) === product);
-    }
+    const matchingRuntime = runtimeInstances.filter((instance) => {
+      if (instanceSet.has(instance.agentInstanceId)) return true;
+      const runtimeProduct = canonicalProduct(instance.agentDisplayName);
+      return runtimeProduct === product
+        && runtimeEnvironment(instance) === environment
+        && runtimeWorkspace(instance, runtimeProduct) === workspacePath;
+    });
     for (const instance of matchingRuntime) {
       instanceSet.add(instance.agentInstanceId);
       consumedRuntime.add(instance.agentInstanceId);
@@ -151,7 +166,7 @@ export function projectAgentConversationDirectory(
       : unobserved.length ? 'unobserved' : 'historical';
     return {
       logicalAgentId: id,
-      groupingQuality: workspacePath === 'workspace:unknown' ? 'inferred' : 'strong',
+      groupingQuality: isSyntheticWorkspace(workspacePath) ? 'inferred' : 'strong',
       product,
       displayName: first.displayName || product + ' · ' + workspacePath,
       environment,
@@ -176,7 +191,7 @@ export function projectAgentConversationDirectory(
     if (consumedRuntime.has(instance.agentInstanceId)) continue;
     const product = canonicalProduct(instance.agentDisplayName);
     const environment = runtimeEnvironment(instance);
-    const workspacePath = runtimeWorkspace(instance);
+    const workspacePath = runtimeWorkspace(instance, product);
     const id = logicalAgentId(product, environment, workspacePath);
     const items = runtimeGroups.get(id) ?? [];
     items.push(instance);
@@ -186,7 +201,7 @@ export function projectAgentConversationDirectory(
     const first = instances[0];
     const product = canonicalProduct(first.agentDisplayName);
     const environment = runtimeEnvironment(first);
-    const workspacePath = runtimeWorkspace(first);
+    const workspacePath = runtimeWorkspace(first, product);
     const running = instances.filter((instance) => instance.runtimeState === 'running');
     const unobserved = instances.filter((instance) => instance.runtimeState === 'unobserved');
     const lifecycleState: T.LogicalAgentConversationDirectoryItem['lifecycleState'] = running.length
@@ -197,7 +212,7 @@ export function projectAgentConversationDirectory(
       .sort((left, right) => compareUnixNs(left, right))[0];
     directory.push({
       logicalAgentId: id,
-      groupingQuality: workspacePath === 'workspace:unknown' ? 'inferred' : 'strong',
+      groupingQuality: isSyntheticWorkspace(workspacePath) ? 'inferred' : 'strong',
       product,
       displayName: first.agentDisplayName || product + ' · ' + workspacePath,
       environment,
