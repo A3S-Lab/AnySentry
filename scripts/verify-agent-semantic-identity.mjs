@@ -271,6 +271,15 @@ const dockerAgent = (product, pid, startTime) => baseEvent({
 const dockerCodex = dockerAgent('Codex', 300, '3000');
 const dockerClaude = dockerAgent('Claude Code', 400, '4000');
 const dockerCodexRestarted = dockerAgent('Codex', 500, '5000');
+const mergedDockerCodex = structuredClone(dockerCodex);
+mergedDockerCodex.eventId = 'docker-codex-merged-decision';
+mergedDockerCodex.attribution.classification = 'confirmed_agent';
+mergedDockerCodex.attribution.source = 'docker';
+mergedDockerCodex.attribution.reason = 'authoritative_anchor';
+mergedDockerCodex.attribution.evidence = [
+  'label:anysentry.io/workload-kind=agent',
+  'runtime_signature:commExact=codex',
+];
 const dockerCodexChild = structuredClone(dockerCodex);
 dockerCodexChild.eventId = 'docker-codex-child';
 dockerCodexChild.process.pid = 301;
@@ -284,6 +293,16 @@ assert.match(
   projectAgentSemanticIdentity(dockerCodex).canonicalIdentityKey,
   /^docker-agent-root:v1:/u,
 );
+assert.match(
+  projectAgentSemanticIdentity(mergedDockerCodex).canonicalIdentityKey,
+  /^docker-agent-root:v1:/u,
+  'a Docker-owned decision retains the narrower process root when trusted evidence survives merge',
+);
+assert.equal(
+  agentRuntimeInstanceIdForEvent(mergedDockerCodex),
+  projectAgentSemanticIdentity(mergedDockerCodex).agentRootInstanceId,
+);
+assert.equal(detectedAgentIdentity(mergedDockerCodex).agentProduct, 'codex');
 assert.notEqual(
   agentAssetIdForEvent(dockerCodex),
   agentAssetIdForEvent(dockerClaude),

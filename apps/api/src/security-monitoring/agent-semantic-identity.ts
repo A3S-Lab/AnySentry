@@ -246,13 +246,14 @@ function authoritativeAgentScope(event: IdentityEvent): string | undefined {
  */
 function observedRuntimeRootScope(event: IdentityEvent, root?: string): string | undefined {
   if (!root) return undefined;
-  const source = event.attribution?.source;
-  if (source !== 'process_signature' && source !== 'process_graph') return undefined;
   const evidence = event.attribution?.evidence ?? [];
-  const hasTrustedEvidence = source === 'process_signature'
-    ? evidence.some((item) => item.startsWith('runtime_signature:'))
-      || evidence.some((item) => item.startsWith('process_signature:'))
-    : evidence.some((item) => item.startsWith('process_lineage:'));
+  // The field-level merge deliberately lets Docker/Kubernetes own the authoritative
+  // classification decision, so its source may replace `process_signature` even though the exact
+  // process-root evidence remains present. Trust that bounded evidence rather than requiring the
+  // decision source to describe both independent axes.
+  const hasTrustedEvidence = evidence.some((item) => item.startsWith('runtime_signature:'))
+    || evidence.some((item) => item.startsWith('process_signature:'))
+    || evidence.some((item) => item.startsWith('process_lineage:'));
   if (!hasTrustedEvidence) return undefined;
   return normalizedAgentProduct(
     event.attribution?.agentScopeId
