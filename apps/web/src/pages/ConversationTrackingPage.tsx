@@ -787,11 +787,15 @@ export default function ConversationTrackingPage() {
     pollingWhenHidden: false,
   });
 
-  const selectedLogicalAgent = useMemo(() => (
-    directory?.items.find((item) => item.logicalAgentId === selectedLogicalAgentId)
-    ?? directory?.items.find((item) =>
-      item.conversations.some((conversation) => conversation.conversationId === selectedConversationId))
-  ), [directory?.items, selectedConversationId, selectedLogicalAgentId]);
+  const selectedLogicalAgent = useMemo(() => {
+    const conversationOwner = selectedConversationId
+      ? directory?.items.find((item) =>
+          item.conversations.some((conversation) =>
+            conversation.conversationId === selectedConversationId))
+      : undefined;
+    return conversationOwner
+      ?? directory?.items.find((item) => item.logicalAgentId === selectedLogicalAgentId);
+  }, [directory?.items, selectedConversationId, selectedLogicalAgentId]);
   const selectedConversation = useMemo(() => (
     selectedLogicalAgent?.conversations.find((item) => item.conversationId === selectedConversationId)
     ?? directory?.items.flatMap((item) => item.conversations)
@@ -832,9 +836,18 @@ export default function ConversationTrackingPage() {
   useEffect(() => {
     const top = directory?.items[0];
     if (!top) return;
+    const conversationOwner = selectedConversationId
+      ? directory.items.find((item) =>
+          item.conversations.some((conversation) =>
+            conversation.conversationId === selectedConversationId))
+      : undefined;
+    if (conversationOwner && conversationOwner.logicalAgentId !== selectedLogicalAgentId) {
+      updateRoute((next) => next.set("logicalAgentId", conversationOwner.logicalAgentId), true);
+      previousTopConversation.current = top.logicalAgentId;
+      return;
+    }
     const selectedExists = directory.items.some((item) =>
-      item.logicalAgentId === selectedLogicalAgentId
-      || item.conversations.some((conversation) => conversation.conversationId === selectedConversationId));
+      item.logicalAgentId === selectedLogicalAgentId);
     const followedPreviousTop = selectedLogicalAgentId
       && selectedLogicalAgentId === previousTopConversation.current;
     if (
