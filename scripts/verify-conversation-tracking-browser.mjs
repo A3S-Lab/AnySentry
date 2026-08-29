@@ -14,6 +14,7 @@ const dashboardUrl = (process.env.ANYSENTRY_DASHBOARD_URL
 const marker = process.env.ANYSENTRY_CONVERSATION_MARKER ?? 'FINAL_REQUEST_SENTINEL';
 const responseMarker = process.env.ANYSENTRY_CONVERSATION_RESPONSE_MARKER ?? 'VISIBLE_RESPONSE_SENTINEL';
 const toolMarker = process.env.ANYSENTRY_CONVERSATION_TOOL_MARKER ?? 'TOOL_RESULT_SENTINEL';
+const requestedConversationId = process.env.ANYSENTRY_CONVERSATION_ID?.trim();
 const chromeBinary = process.env.CHROME_BIN ?? '/usr/bin/google-chrome';
 const profile = mkdtempSync(path.join(tmpdir(), 'anysentry-conversation-chrome-'));
 const outputDirectory = path.join(tmpdir(), `anysentry-conversation-view-${process.pid}`);
@@ -57,10 +58,14 @@ let conversations = await api('/agents/conversations', {
   timeType: 'last_30d',
   scope: 'agent',
   classificationView: 'current_effective',
-  q: marker,
+  ...(requestedConversationId ? { conversationId: requestedConversationId } : { q: marker }),
   limit: 50,
 });
-let conversation = conversations.items.find((item) => item.hasContent && item.firstPromptPreview?.includes(marker));
+let conversation = conversations.items.find((item) => item.hasContent && (
+  requestedConversationId
+    ? item.conversationId === requestedConversationId
+    : item.firstPromptPreview?.includes(marker)
+));
 if (!conversation) {
   const interactions = await api('/agents/interactions', {
     timeType: 'last_30d', scope: 'agent', classificationView: 'current_effective', limit: 500,
