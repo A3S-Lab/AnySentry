@@ -22,6 +22,16 @@ function canonicalWorkspace(value?: string): string {
   return workspace || 'workspace:unknown';
 }
 
+function canonicalEnvironment(
+  environment: T.AgentConversationSummary['environment'],
+  workspacePath: string,
+): T.AgentConversationSummary['environment'] {
+  if (environment !== 'unknown') return environment;
+  if (workspacePath.startsWith('agent://')) return 'docker';
+  if (workspacePath.startsWith('/')) return 'host';
+  return 'unknown';
+}
+
 function logicalAgentId(
   product: string,
   environment: T.AgentConversationSummary['environment'],
@@ -104,7 +114,8 @@ export function projectAgentConversationDirectory(
   for (const conversation of conversations) {
     const product = canonicalProduct(conversation.agentProduct);
     const workspacePath = canonicalWorkspace(conversation.workspacePath);
-    const id = logicalAgentId(product, conversation.environment, workspacePath);
+    const environment = canonicalEnvironment(conversation.environment, workspacePath);
+    const id = logicalAgentId(product, environment, workspacePath);
     const items = groups.get(id) ?? [];
     items.push(conversation);
     groups.set(id, items);
@@ -118,6 +129,7 @@ export function projectAgentConversationDirectory(
     const first = conversations[0];
     const product = canonicalProduct(first.agentProduct);
     const workspacePath = canonicalWorkspace(first.workspacePath);
+    const environment = canonicalEnvironment(first.environment, workspacePath);
     const agentInstanceIds = [...new Set(conversations.flatMap((item) => item.agentInstanceIds))];
     const agentAssetIds = [...new Set(conversations.map((item) => item.agentAssetId))];
     const instanceSet = new Set(agentInstanceIds);
@@ -142,7 +154,7 @@ export function projectAgentConversationDirectory(
       groupingQuality: workspacePath === 'workspace:unknown' ? 'inferred' : 'strong',
       product,
       displayName: first.displayName || product + ' · ' + workspacePath,
-      environment: first.environment,
+      environment,
       workspacePath,
       lifecycleState,
       activeInstanceCount: running.length + unobserved.length,

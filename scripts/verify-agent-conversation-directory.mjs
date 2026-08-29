@@ -68,12 +68,14 @@ const items = projectAgentConversationDirectory([
     conversationId: 'cv-codex-a',
     agentAssetId: 'asset-codex-a',
     agentInstanceIds: ['instance-a'],
+    environment: 'host',
     at: '1788000000000000001',
   }),
   conversation({
     conversationId: 'cv-codex-b',
     agentAssetId: 'asset-codex-b',
     agentInstanceIds: ['instance-b'],
+    environment: 'unknown',
     at: '1788000000000000002',
   }),
   conversation({
@@ -102,6 +104,7 @@ assert(codex);
 assert(claude);
 assert(langchain);
 assert.equal(codex.lifecycleState, 'running');
+assert.equal(codex.environment, 'host');
 assert.equal(codex.activeInstanceCount, 2);
 assert.equal(codex.totalInstanceCount, 2);
 assert.equal(codex.conversationCount, 2);
