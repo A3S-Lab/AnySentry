@@ -65,6 +65,17 @@ function closedValue<TValue extends string>(value: unknown, allowed: Set<TValue>
   return typeof value === 'string' && allowed.has(value as TValue) ? value as TValue : undefined;
 }
 
+function interactionAgentAssetId(
+  meta: T.EventMeta,
+  semanticIdentity: ReturnType<typeof detectedAgentIdentity>,
+): string {
+  const exactProcessRoot = semanticIdentity.agentRuntimeInstanceId.startsWith('host-root:')
+    && Boolean(semanticIdentity.agentProduct);
+  return exactProcessRoot
+    ? semanticIdentity.agentAssetId
+    : meta.subjectAssetId ?? semanticIdentity.agentAssetId;
+}
+
 function boundedJson(value: unknown, maxBytes = MAX_DERIVED_JSON_BYTES): unknown {
   if (value === undefined) return undefined;
   try {
@@ -246,7 +257,7 @@ function parsePlaintextEvidence(
     workspacePath: meta.workspacePath,
     sourceId: typeof meta.attributes?.sourceId === 'string' ? meta.attributes.sourceId : undefined,
     collectorId: typeof meta.attributes?.collectorId === 'string' ? meta.attributes.collectorId : undefined,
-    agentAssetId: meta.subjectAssetId ?? semanticIdentity.agentAssetId,
+    agentAssetId: interactionAgentAssetId(meta, semanticIdentity),
     agentInstanceId: semanticIdentity.agentRuntimeInstanceId,
     agentProduct: semanticIdentity.agentProduct ?? meta.attribution?.agentDisplayName ?? meta.agentId,
     ...(runtimeSessionId ? { runtimeSessionId } : {}),
@@ -344,7 +355,7 @@ export function parseObserverAgentInteraction(
     process,
     attribution: meta.attribution,
   });
-  const agentAssetId = meta.subjectAssetId ?? semanticIdentity.agentAssetId;
+  const agentAssetId = interactionAgentAssetId(meta, semanticIdentity);
   const partialReasons = Array.isArray(input.partialReasons)
     ? [...new Set(input.partialReasons
         .map((reason) => string(reason, 240))

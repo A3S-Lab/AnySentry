@@ -304,14 +304,15 @@ export function projectAgentSemanticIdentity(event: IdentityEvent): AgentSemanti
 
   const kubernetes = kubernetesContainerIdentity(event);
   if (kubernetes) {
-    const runtimeCanonical = `${kubernetes.podUid}/${kubernetes.containerId}`;
-    const legacyLogicalRuntime = logicalScope ? `k8s-agent:${runtimeCanonical}:${logicalScope}` : undefined;
+    const physicalRuntime = `${kubernetes.podUid}/${kubernetes.containerId}`;
+    const runtimeCanonical = runtimeRootScope && root ? root : physicalRuntime;
+    const legacyLogicalRuntime = logicalScope ? `k8s-agent:${physicalRuntime}:${logicalScope}` : undefined;
     const logicalIdentity = kubernetesLogicalIdentity(event, kubernetes, logicalScope);
     const canonical = logicalIdentity
       ? logicalIdentity
       : root
-        ? `${runtimeCanonical}:${root}`
-        : runtimeCanonical;
+        ? `${physicalRuntime}:${root}`
+        : physicalRuntime;
     const normalizedPhysical = kubernetes.clusterId
       ? `k8s:${kubernetes.clusterId}:${kubernetes.podUid}:${kubernetes.containerId}`
       : physical;
@@ -325,7 +326,7 @@ export function projectAgentSemanticIdentity(event: IdentityEvent): AgentSemanti
         canonical,
         logicalIdentity,
         legacyLogicalRuntime,
-        runtimeCanonical,
+        physicalRuntime,
         physical,
         attributedInstance,
         normalizedPhysical,
@@ -336,6 +337,7 @@ export function projectAgentSemanticIdentity(event: IdentityEvent): AgentSemanti
       canonicalRuntimeInstanceId: runtimeCanonical,
       runtimeInstanceAliases: distinct([
         runtimeCanonical,
+        physicalRuntime,
         physical,
         attributedInstance,
         normalizedPhysical,

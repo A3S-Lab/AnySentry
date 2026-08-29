@@ -9,6 +9,12 @@ const require = createRequire(import.meta.url);
 const { projectAgentConversations, projectConversationTimeline } = require(
   '../apps/api/dist/security-monitoring/agent-conversation.js',
 );
+const { parseObserverAgentInteraction } = require(
+  '../apps/api/dist/security-monitoring/agent-interaction.js',
+);
+const { agentAssetIdForIdentityKey } = require(
+  '../apps/api/dist/security-monitoring/agent-identity.js',
+);
 
 const baseUrl = (process.env.ANYSENTRY_API_BASE
   ?? `http://127.0.0.1:${process.env.PORT ?? '29653'}/security-center`).replace(/\/$/u, '');
@@ -148,6 +154,57 @@ const line = JSON.stringify({
     },
   },
 });
+
+const sharedContainerId = 'f9896b781d94d050a6211e07248b69fb9576966f4b7ac7170045f5c1c2fa616b';
+const sharedPhysicalWorkload = `docker:node-a:${sharedContainerId}`;
+const legacyContainerAsset = agentAssetIdForIdentityKey(sharedPhysicalWorkload);
+const processRootInteraction = parseObserverAgentInteraction(line, {
+  workspacePath: '/root',
+  agentId: 'codex',
+  sessionId: '',
+  userId: '',
+  attributes: {},
+  subjectAssetId: legacyContainerAsset,
+  subjectAssetType: 'agent',
+  classificationSemantics: {
+    schemaVersion: 'anysentry.classification_semantics.v1',
+    identityClassification: 'confirmed_agent',
+    workloadRole: 'agent',
+    captureProfile: 'agent_full',
+  },
+  process: {
+    hostId: 'node-a',
+    bootId: 'boot-a',
+    pid: 4242,
+    ppid: 1,
+    startTimeTicks: '424200',
+    comm: 'codex',
+    exe: '/opt/codex/bin/codex',
+    cwd: '/root',
+    cgroup: `0::/system.slice/docker-${sharedContainerId}.scope`,
+  },
+  attribution: {
+    monitored: true,
+    classification: 'confirmed_agent',
+    confidence: 1,
+    source: 'docker',
+    reason: 'authoritative_anchor',
+    agentScopeId: 'codex',
+    agentDisplayName: 'Codex',
+    agentInstanceId: sharedPhysicalWorkload,
+    physicalWorkloadId: sharedPhysicalWorkload,
+    rootPid: 4242,
+    rootStartTime: '424200',
+    evidence: [
+      'label:anysentry.io/workload-kind=agent',
+      'runtime_signature:commExact=codex',
+    ],
+  },
+});
+assert.ok(processRootInteraction, 'strong process-root interaction must parse');
+assert.notEqual(processRootInteraction.agentAssetId, legacyContainerAsset);
+assert.match(processRootInteraction.agentInstanceId ?? '', /^host-root:/u);
+assert.equal(processRootInteraction.agentProduct, 'codex');
 
 const ingest = await request('/ingest/batch', 'POST', {
   events: [{
