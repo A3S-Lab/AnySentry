@@ -71,6 +71,8 @@ const MAX_HISTORY_CACHE_ENTRIES = 64;
 const LEVEL_BY_RANK = ['safe', 'low', 'medium', 'high', 'critical'];
 const LEVEL_TEXT: Record<string, string> = { safe: '安全', low: '低危', medium: '中危', high: '高危', critical: '严重', unknown: '未知' };
 const TOOL_EVIDENCE_RELATION_SETTLE_MS = 10_000;
+const CONVERSATION_INTERACTIONS_PER_AGENT = 64;
+const CONVERSATION_INTERACTIONS_TOTAL = 2_000;
 const CATEGORY_COLOR: Record<string, string> = {
   command_danger: '#fb7185', data_leak: '#f59e0b', secret_exfil: '#f59e0b', prompt_injection: '#a855f7',
   communication_risk: '#38bdf8', systemic_risk: '#f43f5e', privilege_escalation: '#fb7185', other: '#94a3b8',
@@ -1859,6 +1861,13 @@ export class AggregationService {
   }
 
   async agentInteractions(filter: T.AgentInteractionQuery): Promise<T.AgentInteractionList> {
+    return this.readAgentInteractions(filter);
+  }
+
+  private async readAgentInteractions(
+    filter: T.AgentInteractionQuery,
+    options: { fairPerAgentLimit?: number; totalLimit?: number } = {},
+  ): Promise<T.AgentInteractionList> {
     const window = resolveTimeWindow(filter);
     const requestedAsset = filter.agentAssetId?.trim();
     const agentAssetId = requestedAsset
@@ -1873,6 +1882,10 @@ export class AggregationService {
       agentAssetId: filter.interactionId ? undefined : agentAssetId,
       startMs: window.startMs,
       endMs: window.endMs,
+      ...(options.fairPerAgentLimit
+        ? { fairPerAgentLimit: options.fairPerAgentLimit }
+        : {}),
+      ...(options.totalLimit ? { limit: options.totalLimit } : {}),
     };
     const persisted = await this.judge.storedAgentInteractions(query);
     const merged = new Map<string, T.AgentInteractionRecord>();
@@ -1905,15 +1918,34 @@ export class AggregationService {
           currentView ? item.currentEffectiveClassification : item.detectedClassification,
         )))
       .sort((left, right) => right.at - left.at || right.interactionId.localeCompare(left.interactionId));
-    const limit = Math.max(1, Math.min(500, filter.limit ?? 100));
-    const visible = items.slice(0, limit);
+    const limit = options.totalLimit
+      ? Math.max(1, Math.min(CONVERSATION_INTERACTIONS_TOTAL, options.totalLimit))
+      : Math.max(1, Math.min(500, filter.limit ?? 100));
+    const visible = options.fairPerAgentLimit
+      ? (() => {
+          const perAgent = Math.max(1, Math.min(256, options.fairPerAgentLimit));
+          const counts = new Map<string, number>();
+          const selected: T.AgentInteractionRecord[] = [];
+          for (const item of items) {
+            const identity = this.agentMetadata.canonicalAgentAssetId(item.agentAssetId);
+            const count = counts.get(identity) ?? 0;
+            if (count >= perAgent) continue;
+            counts.set(identity, count + 1);
+            selected.push(item);
+            if (selected.length >= limit) break;
+          }
+          return selected;
+        })()
+      : items.slice(0, limit);
     const snapshotAsOf = new Date(window.endMs).toISOString();
     const dataTimes = visible.map((item) => item.at);
     const durable = persisted !== null;
     return {
       items: visible,
       total: items.length,
-      totalMode: durable && items.length <= limit ? 'exact' : 'omitted',
+      totalMode: durable && !options.fairPerAgentLimit && items.length <= limit
+        ? 'exact'
+        : 'omitted',
       coverage: {
         requestedFrom: new Date(window.startMs).toISOString(),
         requestedTo: snapshotAsOf,
@@ -1921,13 +1953,17 @@ export class AggregationService {
         asOf: snapshotAsOf,
         dataFrom: dataTimes.length ? new Date(Math.min(...dataTimes)).toISOString() : undefined,
         dataTo: dataTimes.length ? new Date(Math.max(...dataTimes)).toISOString() : undefined,
-        completeness: durable
+        completeness: durable && !options.fairPerAgentLimit
           ? currentView ? 'exact_current_effective' : 'exact_as_observed'
           : 'partial',
-        partial: !durable,
-        partialReason: durable ? undefined : 'hot_ring_only',
+        partial: !durable || Boolean(options.fairPerAgentLimit),
+        partialReason: !durable
+          ? 'hot_ring_only'
+          : options.fairPerAgentLimit ? 'scan_limit' : undefined,
         source: durable ? 'clickhouse+hot_delta' : 'memory_hot_ring',
-        totalMode: durable && items.length <= limit ? 'exact' : 'omitted',
+        totalMode: durable && !options.fairPerAgentLimit && items.length <= limit
+          ? 'exact'
+          : 'omitted',
       },
       dataSource: durable ? 'clickhouse' : 'hot_ring',
       ...this.classificationResponseMeta(filter),
@@ -1985,8 +2021,16 @@ export class AggregationService {
             inventoryTimer.unref();
           }),
         ]);
+    const fairHistoryRead = resolveConversationId || (
+      !filter.agentAssetId
+      && !filter.agentInstanceId
+      && !filter.model
+    );
     const [interactions, inventory] = await Promise.all([
-      this.agentInteractions(interactionQuery),
+      this.readAgentInteractions(interactionQuery, fairHistoryRead ? {
+        fairPerAgentLimit: CONVERSATION_INTERACTIONS_PER_AGENT,
+        totalLimit: CONVERSATION_INTERACTIONS_TOTAL,
+      } : undefined),
       inventoryPromise,
     ]).finally(() => {
       if (inventoryTimer) clearTimeout(inventoryTimer);

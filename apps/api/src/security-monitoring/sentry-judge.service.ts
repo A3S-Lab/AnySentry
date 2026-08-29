@@ -791,6 +791,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   async storedAgentInteractions(input: AgentInteractionQuery & {
     startMs: number;
     endMs: number;
+    fairPerAgentLimit?: number;
   }): Promise<AgentInteractionRecord[] | null> {
     return this.ch.queryAgentInteractions(input);
   }

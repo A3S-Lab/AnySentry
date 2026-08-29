@@ -6528,9 +6528,15 @@ export class ClickHouseStore {
   async queryAgentInteractions(input: AgentInteractionQuery & {
     startMs: number;
     endMs: number;
+    fairPerAgentLimit?: number;
   }): Promise<AgentInteractionRecord[] | null> {
     if (!this.client || !this.ready) return null;
-    const limit = Math.max(1, Math.min(500, input.limit ?? 100));
+    const fairPerAgentLimit = input.fairPerAgentLimit === undefined
+      ? undefined
+      : Math.max(1, Math.min(256, Math.trunc(input.fairPerAgentLimit)));
+    const limit = fairPerAgentLimit
+      ? Math.max(1, Math.min(2_000, input.limit ?? 2_000))
+      : Math.max(1, Math.min(500, input.limit ?? 100));
     const conditions = [
       'at >= {start:UInt64}',
       'at <= {end:UInt64}',
@@ -6546,39 +6552,83 @@ export class ClickHouseStore {
       ...(input.parseState ? ['parseState = {parseState:String}'] : []),
       ...(input.completeness ? ['completeness = {completeness:String}'] : []),
     ];
+    const queryParams = {
+      start: Math.max(0, Math.trunc(input.startMs)),
+      end: Math.max(0, Math.trunc(input.endMs)),
+      limit,
+      ...(fairPerAgentLimit ? { fairPerAgentLimit } : {}),
+      ...(input.agentAssetId ? { agentAssetId: input.agentAssetId } : {}),
+      ...(input.agentInstanceId ? { agentInstanceId: input.agentInstanceId } : {}),
+      ...(input.interactionId ? { interactionId: input.interactionId } : {}),
+      ...(input.interactionType ? { interactionType: input.interactionType } : {}),
+      ...(input.model ? { model: input.model } : {}),
+      ...(input.transport ? { transport: input.transport } : {}),
+      ...(input.tlsAdapterId ? { tlsAdapterId: input.tlsAdapterId } : {}),
+      ...(input.transportProtocol ? { transportProtocol: input.transportProtocol } : {}),
+      ...(input.wireTemplateId ? { wireTemplateId: input.wireTemplateId } : {}),
+      ...(input.parseState ? { parseState: input.parseState } : {}),
+      ...(input.completeness ? { completeness: input.completeness } : {}),
+    };
+    const settings = {
+      max_execution_time: 10,
+      max_result_rows: String(limit),
+      result_overflow_mode: 'break' as const,
+    };
     try {
-      const result = await this.client.query({
-        query: `
-          SELECT interactionId, argMax(payload, revision) AS payload, max(at) AS latestAt
-          FROM ${AGENT_INTERACTION_TABLE}
-          WHERE ${conditions.join(' AND ')}
-          GROUP BY interactionId
-          ORDER BY latestAt DESC, interactionId DESC
-          LIMIT {limit:UInt32}`,
-        query_params: {
-          start: Math.max(0, Math.trunc(input.startMs)),
-          end: Math.max(0, Math.trunc(input.endMs)),
-          limit,
-          ...(input.agentAssetId ? { agentAssetId: input.agentAssetId } : {}),
-          ...(input.agentInstanceId ? { agentInstanceId: input.agentInstanceId } : {}),
-          ...(input.interactionId ? { interactionId: input.interactionId } : {}),
-          ...(input.interactionType ? { interactionType: input.interactionType } : {}),
-          ...(input.model ? { model: input.model } : {}),
-          ...(input.transport ? { transport: input.transport } : {}),
-          ...(input.tlsAdapterId ? { tlsAdapterId: input.tlsAdapterId } : {}),
-          ...(input.transportProtocol ? { transportProtocol: input.transportProtocol } : {}),
-          ...(input.wireTemplateId ? { wireTemplateId: input.wireTemplateId } : {}),
-          ...(input.parseState ? { parseState: input.parseState } : {}),
-          ...(input.completeness ? { completeness: input.completeness } : {}),
-        },
-        clickhouse_settings: {
-          max_execution_time: 10,
-          max_result_rows: String(limit),
-          result_overflow_mode: 'break',
-        },
-        format: 'JSONEachRow',
-      });
-      const rows = await result.json() as Array<{ payload?: string }>;
+      let rows: Array<{ payload?: string }>;
+      if (fairPerAgentLimit) {
+        // Keep large request/response payloads out of the LIMIT BY sort. Resolve a bounded set of
+        // lightweight IDs first, then fetch only those payloads in a second query.
+        const indexResult = await this.client.query({
+          query: `
+            SELECT interactionId, latestAt, latestAgentAssetId
+            FROM (
+              SELECT interactionId,
+                max(at) AS latestAt,
+                argMax(agentAssetId, revision) AS latestAgentAssetId
+              FROM ${AGENT_INTERACTION_TABLE}
+              WHERE ${conditions.join(' AND ')}
+              GROUP BY interactionId
+            )
+            ORDER BY latestAt DESC, interactionId DESC
+            LIMIT {fairPerAgentLimit:UInt32} BY latestAgentAssetId
+            LIMIT {limit:UInt32}`,
+          query_params: queryParams,
+          clickhouse_settings: settings,
+          format: 'JSONEachRow',
+        });
+        const indexRows = await indexResult.json() as Array<{ interactionId?: string }>;
+        const interactionIds = indexRows
+          .map((row) => row.interactionId)
+          .filter((value): value is string => Boolean(value));
+        if (interactionIds.length === 0) return [];
+        const payloadResult = await this.client.query({
+          query: `
+            SELECT interactionId, argMax(payload, revision) AS payload
+            FROM ${AGENT_INTERACTION_TABLE}
+            WHERE interactionId IN {interactionIds:Array(String)}
+            GROUP BY interactionId
+            LIMIT {limit:UInt32}`,
+          query_params: { interactionIds, limit },
+          clickhouse_settings: settings,
+          format: 'JSONEachRow',
+        });
+        rows = await payloadResult.json() as Array<{ payload?: string }>;
+      } else {
+        const result = await this.client.query({
+          query: `
+            SELECT interactionId, argMax(payload, revision) AS payload, max(at) AS latestAt
+            FROM ${AGENT_INTERACTION_TABLE}
+            WHERE ${conditions.join(' AND ')}
+            GROUP BY interactionId
+            ORDER BY latestAt DESC, interactionId DESC
+            LIMIT {limit:UInt32}`,
+          query_params: queryParams,
+          clickhouse_settings: settings,
+          format: 'JSONEachRow',
+        });
+        rows = await result.json() as Array<{ payload?: string }>;
+      }
       return rows.flatMap((row) => {
         try {
           if (!row.payload) return [];
