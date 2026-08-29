@@ -235,9 +235,13 @@ function mergeAttributionClassifications(processClassification, workloadClassifi
 
   const decision = decisionCandidate(candidates);
   const generalPriority = uniqueCandidates([decision, template, workload, process]);
-  // Let an authoritative decision own conflicting identity fields. Otherwise retain the
-  // template/workload/process specificity order used by the current classification chain.
-  const identityPriority = uniqueCandidates([decision, template, workload, process]);
+  // Logical Agent identity and physical placement are different axes. A self-registered template
+  // owns the most specific identity; otherwise an exact Agent process root is narrower than its
+  // container or Pod. The workload can still supply the authoritative classification decision and
+  // always remains the sole owner of physicalWorkloadId/workloadRef below. This ordering lets one
+  // container host Codex, Claude and other Agent roots without collapsing every conversation into
+  // the container name.
+  const identityPriority = uniqueCandidates([template, process, workload, decision]);
   const attribution = {};
 
   // Preserve forward-compatible supplemental fields without allowing them to overwrite the
@@ -283,9 +287,10 @@ function mergeAttributionClassifications(processClassification, workloadClassifi
   );
   if (present(displayName)) attribution.agentDisplayName = displayName;
 
-  // A workload instance is preferred, but a process instance remains valuable when the workload
-  // has no instance. During a Scope conflict, only an instance explicitly belonging to the chosen
-  // Scope is safe; this prevents combining two sessions merely because their names look related.
+  // The logical runtime instance follows the selected Agent Scope. Physical container/Pod identity
+  // is retained separately below; it must not replace a process-root instance when multiple Agent
+  // roots share one workload. During a Scope conflict, accept only an instance explicitly owned by
+  // the selected Scope.
   const instanceId = preferredValue(
     identityPriority,
     'agentInstanceId',
@@ -298,7 +303,7 @@ function mergeAttributionClassifications(processClassification, workloadClassifi
   if (present(instanceId)) attribution.agentInstanceId = instanceId;
 
   for (const field of ['rootPid', 'rootKey', 'rootGeneration']) {
-    const value = preferredValue([workload, process, template].filter(Boolean), field);
+    const value = preferredValue([process, template, workload].filter(Boolean), field);
     if (present(value)) attribution[field] = value;
   }
 

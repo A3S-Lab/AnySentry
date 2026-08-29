@@ -75,8 +75,8 @@ function probableProcess(overrides = {}) {
   assert.equal(docker.attribution.workloadRef.name, 'codex-agent', 'the merge must not alias nested input data');
 }
 
-// Truth table: a Kubernetes instance is authoritative for the instance/workload fields; process
-// root coordinates remain available because Kubernetes does not provide them.
+// Truth table: Kubernetes remains authoritative physical placement, while the narrower process
+// root owns the logical Agent instance so multiple Agent roots can share one Pod.
 {
   const process = probableProcess();
   const kubernetes = {
@@ -103,7 +103,7 @@ function probableProcess(overrides = {}) {
     },
   };
   const result = mergeAttributionClassifications(process, kubernetes, undefined);
-  assert.equal(result.attribution.agentInstanceId, 'pod-uid-1/agent-container-id');
+  assert.equal(result.attribution.agentInstanceId, 'ari_process_codex_1');
   assert.equal(result.attribution.rootPid, 4_200);
   assert.equal(result.attribution.rootKey, '["host-a","boot-a",4200,"420"]');
   assert.equal(result.attribution.rootGeneration, 1);
@@ -171,8 +171,8 @@ function probableProcess(overrides = {}) {
   assert.equal(result.attribution.agentInstanceId, 'ari_process_codex_1');
 }
 
-// Truth table: conflicting Agent scopes/display names are explicit. The authoritative workload
-// Scope wins, and the process instance is not attached to that different Scope.
+// Truth table: conflicting Agent scopes/display names are explicit. The process Scope is the
+// narrower logical identity; workload placement remains authoritative and separately auditable.
 {
   const workloadEvidence = Array.from({ length: 20 }, (_, index) => `workload:evidence:${index}`);
   const workload = {
@@ -191,14 +191,54 @@ function probableProcess(overrides = {}) {
     },
   };
   const result = mergeAttributionClassifications(probableProcess(), workload, undefined);
-  assert.equal(result.attribution.agentScopeId, 'research-agent');
-  assert.equal(result.attribution.agentDisplayName, 'Research Agent');
-  assert.equal(result.attribution.agentInstanceId, undefined);
+  assert.equal(result.attribution.agentScopeId, 'codex');
+  assert.equal(result.attribution.agentDisplayName, 'Codex');
+  assert.equal(result.attribution.agentInstanceId, 'ari_process_codex_1');
   assert.equal(result.attribution.conflict, true);
   assert.ok(result.attribution.evidence.some((entry) => entry.startsWith('identity_conflict:agentScopeId:')));
   assert.ok(result.attribution.evidence.some((entry) => entry.startsWith('identity_conflict:agentDisplayName:')));
   assert.ok(result.attribution.evidence.length <= 16);
   assert.equal(new Set(result.attribution.evidence).size, result.attribution.evidence.length);
+  assert.equal(result.attribution.physicalWorkloadId, 'k8s:node-a:pod-2:container-2');
+}
+
+// Two exact Agent roots in one confirmed container retain distinct logical products/instances and
+// share only the physical workload placement.
+{
+  const workload = {
+    state: 'agent',
+    attribution: {
+      monitored: true,
+      classification: 'confirmed_agent',
+      confidence: 1,
+      source: 'docker',
+      reason: 'authoritative_anchor',
+      agentScopeId: 'shared-agent-lab',
+      agentDisplayName: 'Shared Agent Lab',
+      agentInstanceId: 'docker:host-a:shared-container',
+      physicalWorkloadId: 'docker:host-a:shared-container',
+      workloadRef: { environment: 'docker', kind: 'container', name: 'shared-agent-lab' },
+      evidence: ['label:anysentry.io/workload-kind=agent'],
+    },
+  };
+  const codex = mergeAttributionClassifications(probableProcess(), workload, undefined);
+  const claude = mergeAttributionClassifications(
+    probableProcess({
+      agentScopeId: 'claude-code',
+      agentDisplayName: 'Claude Code',
+      agentInstanceId: 'ari_process_claude_1',
+      rootPid: 4_300,
+      rootKey: '["host-a","boot-a",4300,"430"]',
+    }),
+    workload,
+    undefined,
+  );
+  assert.equal(codex.attribution.agentScopeId, 'codex');
+  assert.equal(codex.attribution.agentInstanceId, 'ari_process_codex_1');
+  assert.equal(claude.attribution.agentScopeId, 'claude-code');
+  assert.equal(claude.attribution.agentInstanceId, 'ari_process_claude_1');
+  assert.equal(codex.attribution.physicalWorkloadId, 'docker:host-a:shared-container');
+  assert.equal(claude.attribution.physicalWorkloadId, 'docker:host-a:shared-container');
 }
 
 // Workspace conflicts survive an otherwise authoritative container classification.

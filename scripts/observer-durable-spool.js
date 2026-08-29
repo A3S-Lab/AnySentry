@@ -449,9 +449,14 @@ class DurableSpool {
     };
   }
 
+  prepareClose() {
+    if (this.fsyncTimer) clearInterval(this.fsyncTimer);
+    this.fsyncTimer = undefined;
+  }
+
   close() {
     if (this.closed) return;
-    if (this.fsyncTimer) clearInterval(this.fsyncTimer);
+    this.prepareClose();
     if (this.asyncWriteActive || this.asyncOperations.length > 0 || this.asyncSyncActive) {
       throw new Error('Observer spool closed with pending async operations');
     }

@@ -612,9 +612,14 @@ assert.deepEqual(
 const {
   classificationSemantics: _shadowOnly,
   sourceEventId: _shadowProcessScopedId,
+  observedAt: _shadowObservedAt,
   ...shadowLegacyFields
 } = shadowForwarded;
-const { sourceEventId: _legacyProcessScopedId, ...legacyComparableFields } = legacyForwarded;
+const {
+  sourceEventId: _legacyProcessScopedId,
+  observedAt: _legacyObservedAt,
+  ...legacyComparableFields
+} = legacyForwarded;
 assert.deepEqual(
   shadowLegacyFields,
   legacyComparableFields,

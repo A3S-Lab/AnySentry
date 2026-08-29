@@ -2982,6 +2982,10 @@ function forceShutdown() {
 function flushAndClose() {
   if (closing) return;
   closing = true;
+  // Stop scheduling new periodic WAL fsync operations before the bounded drain checks the current
+  // async operation set. Otherwise a timer can start between the final status read and close(),
+  // turning a clean shutdown into a false pending-operation failure.
+  spool.prepareClose();
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   if (identitySnapshotTimer) clearInterval(identitySnapshotTimer);
   if (infrastructurePolicyTimer) clearInterval(infrastructurePolicyTimer);
