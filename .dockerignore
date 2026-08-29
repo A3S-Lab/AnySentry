@@ -12,3 +12,7 @@
 .agents
 artifacts
 examples/agent-runtime-lab/config/models.deepseek.json
+Snipaste_*.png
+docs/agent-llm-observability-validation-*.json
+docs/technical-report.md
+docs/technical-report-assets
