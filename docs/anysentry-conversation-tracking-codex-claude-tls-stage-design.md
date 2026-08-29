@@ -1,5 +1,7 @@
 # AnySentry 对话追踪与 Codex / Claude Code TLS 明文观测阶段设计
 
+> **后续阶段提示（2026-08-29）：** 本文记录 v1.1 已实现基线。面向 Codex、Claude Code、Kimi Code、Dify、LangChain 等产品的 [discovery-first Agent TLS 全链路观测与 Agent 目录 v2.1 设计](./anysentry-discovery-first-agent-tls-observability-v2-design.md) 已审核，当前按该方案实施和验收。
+
 > 状态：已审核并完成本阶段开发；进入持续回归与镜像固化
 >
 > 文档版本：v1.1-implemented

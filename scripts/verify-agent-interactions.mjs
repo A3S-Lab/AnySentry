@@ -100,6 +100,15 @@ const line = JSON.stringify({
       connectionId: 'tls:feedbeef',
       transport: 'tls',
       protocol: 'http/1.1',
+      tlsAdapterId: 'openssl-ex',
+      transportProtocol: 'http/1.1',
+      wireTemplateId: 'openai-chat-completions',
+      parseState: 'parsed',
+      llmLikelihood: 'confirmed',
+      schemaFingerprint: 'sf_' + digest('fixture-chat-schema').slice(0, 24),
+      transportCompleteness: 'complete',
+      wireCompleteness: 'complete',
+      conversationCompleteness: 'complete',
       endpoint: 'api.fixture.invalid',
       method: 'POST',
       path: '/v1/chat/completions',
@@ -186,6 +195,14 @@ const item = list.items[0];
 assert.equal(item.interactionId, interactionId);
 assert.equal(item.interactionType, 'model');
 assert.equal(item.transport, 'tls');
+assert.equal(item.tlsAdapterId, 'openssl-ex');
+assert.equal(item.transportProtocol, 'http/1.1');
+assert.equal(item.wireTemplateId, 'openai-chat-completions');
+assert.equal(item.parseState, 'parsed');
+assert.equal(item.llmLikelihood, 'confirmed');
+assert.equal(item.transportCompleteness, 'complete');
+assert.equal(item.wireCompleteness, 'complete');
+assert.equal(item.conversationCompleteness, 'complete');
 assert.equal(item.request.body, requestBody);
 assert.equal(item.response.text, 'VISIBLE_RESPONSE_SENTINEL');
 assert.equal(item.toolCalls[0].toolCallId, 'call-fixture-2');
@@ -199,6 +216,17 @@ const noTokenInteraction = await requestWithoutManagementToken('/agents/interact
   timeType: 'last_30d', scope: 'raw', interactionId, limit: 10,
 });
 assert.equal(noTokenInteraction.items.length, 1, 'read-only interaction content must not require a management token');
+
+const directory = await requestWithoutManagementToken('/agents/conversation-directory', {
+  timeType: 'last_30d',
+  scope: 'agent',
+  classificationView: 'current_effective',
+  lifecycleScope: 'all',
+});
+assert(directory.items.some((entry) =>
+  entry.agentAssetIds.includes(item.agentAssetId)
+  && entry.conversations.some((candidate) => candidate.conversationId)),
+  JSON.stringify(directory));
 
 const conversations = await requestWithoutManagementToken('/agents/conversations', {
   timeType: 'last_30d',
@@ -237,6 +265,77 @@ const toolOnly = await request('/agents/interactions', 'POST', {
   timeType: 'last_30d', scope: 'raw', interactionType: 'tool', interactionId, limit: 10,
 });
 assert.equal(toolOnly.items.length, 0, 'interactionType=tool must exclude model records');
+
+const evidenceSuffix = digest(runId + '\0plaintext-evidence').slice(0, 24);
+const evidenceId = 'pe_' + evidenceSuffix;
+const evidenceInteractionId = 'mi_' + evidenceSuffix;
+const evidenceEnvelope = {
+  eventAtUnixNs: String(nowNs + 5_000_000n),
+  receivedAtUnixNs: String(nowNs + 6_000_000n),
+  identity: { agent: 'pi', task: '4242', session: null },
+  process: { pid: 4242, ppid: 1, comm: 'pi', exe: '/usr/bin/node', cgroup_id: 77 },
+  event: {
+    AgentPlaintextEvidence: {
+      schemaVersion: 'anysentry.agent_plaintext_evidence.v1',
+      evidenceId,
+      pid: 4242,
+      connectionId: 'tls:evidence',
+      direction: 'write',
+      tlsAdapterId: 'openssl-ex',
+      transportProtocol: 'http/2',
+      parseState: 'unparsed',
+      llmLikelihood: 'unknown',
+      observedAtUnixNs: String(nowNs + 5_000_000n),
+      capturedBytes: 24,
+      encoding: 'metadata_only',
+      sampleSha256: digest('http2-metadata-only'),
+      reasons: ['transport_decoder_unavailable'],
+      captureSource: 'tls_uprobe',
+    },
+  },
+};
+const evidenceIngest = await request('/ingest/batch', 'POST', {
+  events: [{
+    line: JSON.stringify(evidenceEnvelope),
+    collectorId,
+    sourceId: source.source.sourceId,
+    token: source.token,
+    workspacePath: 'repo://' + runId + '/workspace',
+    classificationSemantics: {
+      schemaVersion: 'anysentry.classification_semantics.v1',
+      identityClassification: 'confirmed_agent',
+      workloadRole: 'agent',
+      captureProfile: 'agent_full',
+    },
+    attribution: {
+      monitored: true,
+      classification: 'confirmed_agent',
+      agentScopeId: runId + '-agent',
+      agentDisplayName: 'Pi interaction fixture',
+      agentInstanceId: runId + '-instance',
+      confidence: 1,
+      reason: 'authoritative_anchor',
+      source: 'self_register',
+      evidence: ['verifier:confirmed-agent'],
+    },
+  }],
+});
+assert.equal(evidenceIngest.acceptedEvents, 1, JSON.stringify(evidenceIngest));
+const unparsed = await requestWithoutManagementToken('/agents/interactions', {
+  timeType: 'last_30d',
+  scope: 'raw',
+  interactionId: evidenceInteractionId,
+  interactionType: 'unparsed',
+  tlsAdapterId: 'openssl-ex',
+  transportProtocol: 'http/2',
+  parseState: 'unparsed',
+  limit: 10,
+});
+assert.equal(unparsed.items.length, 1, JSON.stringify(unparsed));
+assert.equal(unparsed.items[0].request.body, '');
+assert.equal(unparsed.items[0].parseState, 'unparsed');
+assert.equal(unparsed.items[0].transportProtocol, 'http/2');
+assert.equal(unparsed.items[0].partialReasons.includes('unparsed_plaintext_evidence'), true);
 
 // A final inline image is transport evidence, not an internal RAG artifact. This payload makes
 // the observer envelope larger than the former 4 MiB ingress ceiling and verifies that the raw

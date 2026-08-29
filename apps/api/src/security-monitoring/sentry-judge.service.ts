@@ -158,7 +158,7 @@ function eventCategory(kind: string): EventCategory {
   if (kind === 'ToolExec' || kind === 'AgentTool') return 'tool';
   if (kind === 'Egress' || kind === 'Dns' || kind === 'SslContent') return 'network';
   if (kind === 'FileAccess' || kind === 'FileDelete') return 'file';
-  if (kind === 'LlmCall' || kind === 'LlmApi' || kind === 'LlmInteraction') return 'llm';
+  if (kind === 'LlmCall' || kind === 'LlmApi' || kind === 'LlmInteraction' || kind === 'AgentPlaintextEvidence') return 'llm';
   if (kind === 'SecurityAction') return 'security';
   if (kind === 'ProcessExit') return 'process';
   if (kind === 'RuntimeEvent' || kind === 'AgentInvocation' || kind === 'SystemContext') return 'runtime';
@@ -183,7 +183,7 @@ const FLEET = [
 type Sample = { line: string; eventKind: string; subject: string };
 
 const HOT_PROTECTED_EVENT_KINDS = new Set([
-  'AgentTool', 'AgentInvocation', 'LlmInteraction', 'SecurityAction', 'FileDelete',
+  'AgentTool', 'AgentInvocation', 'LlmInteraction', 'AgentPlaintextEvidence', 'SecurityAction', 'FileDelete',
 ]);
 
 export function isHotProtectedEvent(
@@ -256,6 +256,7 @@ const OBSERVER_KINDS = new Set([
   'SslContent',
   'LlmApi',
   'LlmInteraction',
+  'AgentPlaintextEvidence',
   'SecurityAction',
   'RuntimeEvent',
   'CaptureAggregate',

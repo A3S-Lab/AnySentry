@@ -6,6 +6,7 @@ import { SkipWrap } from '../shared/api-response.interceptor';
 import { AgentMetadataService } from './agent-metadata.service';
 import { AgentRuntimeStateService } from './agent-runtime-state.service';
 import { currentAgentSubjectAssetIds, mergePersistentAgentDirectory } from './agent-directory';
+import { projectAgentConversationDirectory } from './agent-conversation-directory';
 import { AggregationService } from './aggregation.service';
 import { AlertingService } from './alerting.service';
 import { AuditService } from './audit.service';
@@ -337,7 +338,7 @@ function eventCategory(kind: string): T.EventCategory {
   if (kind === 'ToolExec' || kind === 'AgentTool') return 'tool';
   if (kind === 'Egress' || kind === 'Dns' || kind === 'SslContent') return 'network';
   if (kind === 'FileAccess' || kind === 'FileDelete') return 'file';
-  if (kind === 'LlmCall' || kind === 'LlmApi' || kind === 'LlmInteraction') return 'llm';
+  if (kind === 'LlmCall' || kind === 'LlmApi' || kind === 'LlmInteraction' || kind === 'AgentPlaintextEvidence') return 'llm';
   if (kind === 'SecurityAction') return 'security';
   if (kind === 'ProcessExit') return 'process';
   if (kind === 'RuntimeEvent' || kind === 'AgentInvocation' || kind === 'SystemContext') return 'runtime';
@@ -1517,6 +1518,8 @@ function canonicalEventKind(input: T.UniversalIngestEvent): string {
     llmapi: 'LlmApi',
     llm_interaction: 'LlmInteraction',
     llminteraction: 'LlmInteraction',
+    agent_plaintext_evidence: 'AgentPlaintextEvidence',
+    agentplaintextevidence: 'AgentPlaintextEvidence',
     ssl: 'SslContent',
     ssl_content: 'SslContent',
     sslcontent: 'SslContent',
@@ -4618,6 +4621,53 @@ export class SecurityMonitoringController {
       },
     });
     return result;
+  }
+
+  @Post('agents/conversation-directory')
+  @HttpCode(200)
+  async agentConversationDirectory(
+    @Body() f: T.AgentConversationDirectoryQuery,
+    @Headers() headers: HeaderBag,
+  ): Promise<T.AgentConversationDirectoryList> {
+    const conversations = await this.agentConversations(
+      { ...f, limit: 200 },
+      headers,
+    );
+    const runtime = this.agentRuntimeState.list({ includeShadow: true, limit: 100_000 });
+    const items = projectAgentConversationDirectory(
+      conversations.items,
+      runtime.items,
+      f?.lifecycleScope ?? 'all',
+    );
+    const runningCount = items.filter((item) => item.lifecycleState !== 'historical').length;
+    const historicalCount = items.length - runningCount;
+    this.audit.record({
+      actor: auditActor(headers),
+      action: 'agent.conversation.content.list',
+      resourceType: 'agent',
+      resourceId: 'logical-agent-directory',
+      summary: 'Read ' + items.length + ' logical Agent conversation directory record(s)',
+      details: {
+        runningCount,
+        historicalCount,
+        lifecycleScope: f?.lifecycleScope ?? 'all',
+      },
+    });
+    return {
+      items,
+      runningCount,
+      historicalCount,
+      total: items.length,
+      totalMode: conversations.totalMode,
+      coverage: conversations.coverage,
+      dataSource: conversations.dataSource,
+      classificationView: conversations.classificationView,
+      reviewRevision: conversations.reviewRevision,
+      ...(conversations.assetBindingRevision !== undefined
+        ? { assetBindingRevision: conversations.assetBindingRevision }
+        : {}),
+      updateTime: conversations.updateTime,
+    };
   }
 
   @Post('events/tool-evidence')

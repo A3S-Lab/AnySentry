@@ -1319,7 +1319,7 @@ export interface AgentInteractionContent {
 export interface AgentInteractionRecord {
   schemaVersion: 'anysentry.agent_interaction.v1';
   interactionId: string;
-  interactionType: 'model' | 'tool';
+  interactionType: 'model' | 'tool' | 'unparsed';
   at: number;
   tenantId?: string;
   environmentId?: string;
@@ -1346,6 +1346,15 @@ export interface AgentInteractionRecord {
   connectionId: string;
   transport: 'http' | 'tls';
   protocol: string;
+  tlsAdapterId?: string;
+  transportProtocol?: string;
+  wireTemplateId?: string;
+  parseState?: 'parsed' | 'partial' | 'unparsed' | 'ambiguous';
+  llmLikelihood?: 'confirmed' | 'likely' | 'unknown' | 'unlikely';
+  schemaFingerprint?: string;
+  transportCompleteness?: 'complete' | 'partial';
+  wireCompleteness?: 'complete' | 'error' | 'unknown' | 'partial';
+  conversationCompleteness?: 'complete' | 'tool_pending' | 'response_pending' | 'partial';
   endpoint: string;
   method: string;
   path: string;
@@ -1371,9 +1380,13 @@ export interface AgentInteractionQuery extends SecurityTimeFilter {
   agentAssetId?: string;
   agentInstanceId?: string;
   interactionId?: string;
-  interactionType?: 'model' | 'tool';
+  interactionType?: 'model' | 'tool' | 'unparsed';
   model?: string;
   transport?: 'http' | 'tls';
+  tlsAdapterId?: string;
+  transportProtocol?: string;
+  wireTemplateId?: string;
+  parseState?: 'parsed' | 'partial' | 'unparsed' | 'ambiguous';
   completeness?: AgentInteractionCompleteness;
   limit?: number;
 }
@@ -1393,6 +1406,11 @@ export type AgentConversationCoverageStatus =
   | 'attach_pending'
   | 'unsupported_tls_profile'
   | 'unsupported_protocol'
+  | 'discovery_pending'
+  | 'metadata_only'
+  | 'transport_unparsed'
+  | 'template_unparsed'
+  | 'budget_limited'
   | 'no_final_response'
   | 'asset_only'
   | 'no_activity';
@@ -1442,6 +1460,39 @@ export interface AgentConversationSummary {
 
 export interface AgentConversationList extends ClassifiedResponseMeta {
   items: AgentConversationSummary[];
+  total: number;
+  totalMode: QueryTotalMode;
+  coverage: QueryCoverage;
+  dataSource: 'clickhouse' | 'hot_ring';
+  updateTime: string;
+}
+
+export interface AgentConversationDirectoryQuery extends AgentConversationQuery {
+  lifecycleScope?: 'running' | 'history' | 'all';
+}
+
+export interface LogicalAgentConversationDirectoryItem {
+  logicalAgentId: string;
+  groupingQuality: 'exact' | 'strong' | 'inferred' | 'unresolved';
+  product: string;
+  displayName: string;
+  environment: 'kubernetes' | 'docker' | 'host' | 'unknown';
+  workspacePath: string;
+  lifecycleState: 'running' | 'unobserved' | 'historical';
+  activeInstanceCount: number;
+  totalInstanceCount: number;
+  conversationCount: number;
+  lastActivityAtUnixNs?: string;
+  agentAssetIds: string[];
+  agentInstanceIds: string[];
+  conversations: AgentConversationSummary[];
+  coverage: AgentConversationCoverage;
+}
+
+export interface AgentConversationDirectoryList extends ClassifiedResponseMeta {
+  items: LogicalAgentConversationDirectoryItem[];
+  runningCount: number;
+  historicalCount: number;
   total: number;
   totalMode: QueryTotalMode;
   coverage: QueryCoverage;

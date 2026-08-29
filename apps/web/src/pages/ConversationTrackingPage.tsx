@@ -48,6 +48,7 @@ import {
   type AgentConversationEventKind,
   type AgentConversationSummary,
   type AgentInteractionRecord,
+  type LogicalAgentConversationDirectoryItem,
   securityCenterApi,
 } from "@/lib/api/security-center";
 import { useI18n } from "@/lib/i18n";
@@ -61,6 +62,11 @@ const COVERAGE_OPTIONS: Array<{ value: AgentConversationCoverageStatus | "all"; 
   { value: "attach_pending", label: "等待 Attach" },
   { value: "unsupported_tls_profile", label: "TLS Profile 不支持" },
   { value: "unsupported_protocol", label: "协议不支持" },
+  { value: "discovery_pending", label: "正在发现 TLS" },
+  { value: "metadata_only", label: "仅连接元数据" },
+  { value: "transport_unparsed", label: "传输待解析" },
+  { value: "template_unparsed", label: "模板待解析" },
+  { value: "budget_limited", label: "采集预算受限" },
   { value: "asset_only", label: "仅资产证据" },
   { value: "no_activity", label: "无调用活动" },
 ];
@@ -77,6 +83,11 @@ const COVERAGE_LABEL: Record<AgentConversationCoverageStatus, string> = {
   attach_pending: "等待 Attach",
   unsupported_tls_profile: "Profile 不支持",
   unsupported_protocol: "协议不支持",
+  discovery_pending: "正在发现",
+  metadata_only: "仅元数据",
+  transport_unparsed: "传输待解析",
+  template_unparsed: "模板待解析",
+  budget_limited: "预算受限",
   no_final_response: "响应未结束",
   asset_only: "仅资产",
   no_activity: "无活动",
@@ -152,10 +163,10 @@ function Pill({ children, className }: { children: ReactNode; className?: string
 
 function coverageClass(status: AgentConversationCoverageStatus) {
   if (status === "complete") return "border-teal-400/25 bg-teal-500/10 text-teal-100";
-  if (status === "partial" || status === "no_final_response" || status === "attach_pending") {
+  if (status === "partial" || status === "no_final_response" || status === "attach_pending" || status === "discovery_pending" || status === "metadata_only") {
     return "border-amber-400/25 bg-amber-500/10 text-amber-100";
   }
-  if (status === "unsupported_tls_profile" || status === "unsupported_protocol") {
+  if (status === "unsupported_tls_profile" || status === "unsupported_protocol" || status === "transport_unparsed" || status === "template_unparsed" || status === "budget_limited") {
     return "border-rose-400/25 bg-rose-500/10 text-rose-100";
   }
   return "border-zinc-500/25 bg-zinc-500/10 text-zinc-300";
@@ -192,44 +203,118 @@ function eventTone(kind: AgentConversationEventKind) {
   return "border-amber-400/20 bg-amber-500/[0.055] text-amber-100";
 }
 
-function SessionRail({
+function LogicalAgentDirectoryRail({
   items,
-  selectedId,
+  selectedLogicalAgentId,
   loading,
   error,
   onSelect,
 }: {
-  items: AgentConversationSummary[];
-  selectedId?: string;
+  items: LogicalAgentConversationDirectoryItem[];
+  selectedLogicalAgentId?: string;
   loading: boolean;
   error?: Error;
-  onSelect: (item: AgentConversationSummary) => void;
+  onSelect: (item: LogicalAgentConversationDirectoryItem) => void;
 }) {
   const refs = useRef(new Map<string, HTMLButtonElement>());
+  const ordered = useMemo(() => [
+    ...items.filter((item) => item.lifecycleState !== "historical"),
+    ...items.filter((item) => item.lifecycleState === "historical"),
+  ], [items]);
   const moveSelection = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
     const nextIndex = event.key === "Home"
       ? 0
       : event.key === "End"
-        ? items.length - 1
-        : Math.min(items.length - 1, Math.max(0, index + (event.key === "ArrowDown" ? 1 : -1)));
-    const next = items[nextIndex];
+        ? ordered.length - 1
+        : Math.min(ordered.length - 1, Math.max(0, index + (event.key === "ArrowDown" ? 1 : -1)));
+    const next = ordered[nextIndex];
     if (!next) return;
     onSelect(next);
-    window.requestAnimationFrame(() => refs.current.get(next.conversationId)?.focus());
+    window.requestAnimationFrame(() => refs.current.get(next.logicalAgentId)?.focus());
   };
+  const running = ordered.filter((item) => item.lifecycleState !== "historical");
+  const history = ordered.filter((item) => item.lifecycleState === "historical");
+  const renderSection = (
+    title: string,
+    sectionItems: LogicalAgentConversationDirectoryItem[],
+    startIndex: number,
+  ) => (
+    <div>
+      <div className="sticky top-0 z-10 flex h-9 items-center justify-between border-y border-white/8 bg-[#0d120f]/95 px-3 backdrop-blur">
+        <span className="text-[11px] font-semibold text-zinc-300">{title}</span>
+        <span className="font-mono text-[10px] text-zinc-500">{sectionItems.length}</span>
+      </div>
+      <div className="divide-y divide-white/8">
+        {sectionItems.map((item, sectionIndex) => {
+          const index = startIndex + sectionIndex;
+          const active = item.logicalAgentId === selectedLogicalAgentId;
+          const runningState = item.lifecycleState === "running";
+          return (
+            <button
+              key={item.logicalAgentId}
+              ref={(node) => {
+                if (node) refs.current.set(item.logicalAgentId, node);
+                else refs.current.delete(item.logicalAgentId);
+              }}
+              type="button"
+              role="option"
+              aria-selected={active}
+              tabIndex={active || (!selectedLogicalAgentId && index === 0) ? 0 : -1}
+              onKeyDown={(event) => moveSelection(event, index)}
+              onClick={() => onSelect(item)}
+              className={cn(
+                "min-h-[108px] w-full cursor-pointer px-3 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-teal-400/70",
+                active ? "bg-teal-400/[0.08]" : "hover:bg-white/[0.035]",
+              )}
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className={cn(
+                    "flex size-8 shrink-0 items-center justify-center rounded border",
+                    runningState
+                      ? "border-teal-400/25 bg-teal-500/10 text-teal-200"
+                      : "border-zinc-500/20 bg-zinc-500/10 text-zinc-400",
+                  )}>
+                    <Bot className="size-4" aria-hidden="true" />
+                  </span>
+                  <div className="min-w-0">
+                    <p className="truncate text-xs font-semibold text-zinc-100">{item.displayName}</p>
+                    <p className="mt-0.5 truncate font-mono text-[10px] text-zinc-500">{item.product} · {item.environment}</p>
+                  </div>
+                </div>
+                <CoverageBadge status={item.coverage.status} />
+              </div>
+              <p className="mt-2 truncate text-[11px] text-zinc-400" title={item.workspacePath}>{item.workspacePath}</p>
+              <div className="mt-2 flex items-center justify-between gap-2 text-[10px] text-zinc-500">
+                <span className="flex min-w-0 items-center gap-1.5 truncate">
+                  <span className={cn("size-1.5 shrink-0 rounded-full", runningState ? "bg-teal-300" : item.lifecycleState === "unobserved" ? "bg-amber-300" : "bg-zinc-600")} />
+                  {runningState ? "运行中" : item.lifecycleState === "unobserved" ? "连接待确认" : "历史"}
+                  <span>·</span>
+                  {item.activeInstanceCount}/{item.totalInstanceCount} 实例
+                  <span>·</span>
+                  {item.conversationCount} 会话
+                </span>
+                <time className="shrink-0 font-mono">{nsDate(item.lastActivityAtUnixNs, "HH:mm:ss")}</time>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
 
   return (
-    <section className="h-full min-h-0 overflow-hidden border-r border-white/10 bg-[#0d120f]" aria-label="Agent 会话列表">
+    <section className="h-full min-h-0 overflow-hidden border-r border-white/10 bg-[#0d120f]" aria-label="逻辑 Agent 目录">
       <div className="flex h-12 items-center justify-between border-b border-white/10 px-3">
         <div className="flex items-center gap-2">
           <ListTree className="size-4 text-zinc-400" aria-hidden="true" />
-          <h2 className="text-xs font-semibold text-zinc-200">会话与资产</h2>
+          <h2 className="text-xs font-semibold text-zinc-200">Agent 目录</h2>
         </div>
         <span className="font-mono text-[10px] text-zinc-500">{items.length}</span>
       </div>
-      <div className="h-[calc(100%-3rem)] overflow-y-auto" role="listbox" aria-label="Agent 会话">
+      <div className="h-[calc(100%-3rem)] overflow-y-auto" role="listbox" aria-label="运行中与历史 Agent">
         {loading && items.length === 0 ? (
           <div className="space-y-2 p-3" aria-label="正在加载会话">
             {[0, 1, 2, 3, 4].map((index) => (
@@ -248,58 +333,10 @@ function SessionRail({
             <p className="mt-1 text-xs leading-5 text-zinc-500">扩大时间范围或清除覆盖状态筛选后重试。</p>
           </div>
         ) : (
-          <div className="divide-y divide-white/8">
-            {items.map((item, index) => {
-              const active = item.conversationId === selectedId;
-              return (
-                <button
-                  key={item.conversationId}
-                  ref={(node) => {
-                    if (node) refs.current.set(item.conversationId, node);
-                    else refs.current.delete(item.conversationId);
-                  }}
-                  type="button"
-                  role="option"
-                  aria-selected={active}
-                  tabIndex={active || (!selectedId && index === 0) ? 0 : -1}
-                  onKeyDown={(event) => moveSelection(event, index)}
-                  onClick={() => onSelect(item)}
-                  className={cn(
-                    "min-h-[108px] w-full cursor-pointer px-3 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-teal-400/70",
-                    active ? "bg-teal-400/[0.08]" : "hover:bg-white/[0.035]",
-                  )}
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="flex min-w-0 items-center gap-2">
-                      <span className={cn(
-                        "flex size-7 shrink-0 items-center justify-center rounded border",
-                        item.hasContent
-                          ? "border-teal-400/20 bg-teal-500/10 text-teal-200"
-                          : "border-zinc-500/20 bg-zinc-500/10 text-zinc-400",
-                      )}>
-                        <Bot className="size-3.5" aria-hidden="true" />
-                      </span>
-                      <div className="min-w-0">
-                        <p className="truncate text-xs font-semibold text-zinc-100">{item.displayName}</p>
-                        <p className="mt-0.5 truncate font-mono text-[10px] text-zinc-500">{item.agentProduct} · {item.environment}</p>
-                      </div>
-                    </div>
-                    <CoverageBadge status={item.coverage.status} />
-                  </div>
-                  <p className={cn(
-                    "mt-2 line-clamp-2 min-h-8 text-xs leading-4",
-                    item.hasContent ? "text-zinc-300" : "text-zinc-500",
-                  )}>
-                    {item.firstPromptPreview ?? "尚无可显示的模型正文"}
-                  </p>
-                  <div className="mt-2 flex items-center justify-between gap-2 text-[10px] text-zinc-500">
-                    <span className="truncate">{`${item.turnCount} 轮 · ${item.modelCallCount} 模型 · ${item.toolCallCount} 工具`}</span>
-                    <time className="shrink-0 font-mono">{nsDate(item.lastActivityAtUnixNs, "HH:mm:ss")}</time>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
+          <>
+            {renderSection("运行中", running, 0)}
+            {renderSection("历史 Agent", history, running.length)}
+          </>
         )}
       </div>
     </section>
@@ -307,6 +344,8 @@ function SessionRail({
 }
 
 function AssetOnlyState({ conversation }: { conversation: AgentConversationSummary }) {
+  const observedPlaintext = ["metadata_only", "transport_unparsed", "template_unparsed", "budget_limited"]
+    .includes(conversation.coverage.status);
   const agentParams = new URLSearchParams({
     timeType: "last_30d",
     selectedAgentAssetId: conversation.agentAssetId,
@@ -322,9 +361,13 @@ function AssetOnlyState({ conversation }: { conversation: AgentConversationSumma
       <span className="flex size-12 items-center justify-center rounded-lg border border-amber-400/20 bg-amber-500/[0.07] text-amber-200">
         <AlertTriangle className="size-5" aria-hidden="true" />
       </span>
-      <h3 className="mt-4 text-sm font-semibold text-zinc-100">Agent 资产已识别，但没有模型明文</h3>
+      <h3 className="mt-4 text-sm font-semibold text-zinc-100">
+        {observedPlaintext ? "已观察到 Agent 明文流，等待进一步解析" : "Agent 资产已识别，但没有模型明文"}
+      </h3>
       <p className="mt-2 max-w-lg text-xs leading-5 text-zinc-500">
-        当前窗口只有资产或行为证据。可能原因包括首次请求早于 attach、TLS 二进制 profile 不匹配、使用了尚未支持的 WebSocket/H2/QUIC，或确实没有模型调用。
+        {observedPlaintext
+          ? "采集层已经看到 TLS 加密前/解密后的字节，但当前 transport 或 wire template 尚未完成。原始证据保持有界且不伪造模型会话。"
+          : "当前窗口只有资产或行为证据。可能尚未发生 TLS 调用、候选函数仍在验证、采集预算受限，或确实没有模型调用。"}
       </p>
       <div className="mt-3 flex flex-wrap justify-center gap-2">
         {conversation.coverage.reasons.map((reason) => (
@@ -344,6 +387,7 @@ function AssetOnlyState({ conversation }: { conversation: AgentConversationSumma
 }
 
 function Timeline({
+  agent,
   conversation,
   events,
   selectedEventId,
@@ -351,7 +395,9 @@ function Timeline({
   error,
   onBack,
   onSelect,
+  onSelectConversation,
 }: {
+  agent?: LogicalAgentConversationDirectoryItem;
   conversation?: AgentConversationSummary;
   events: AgentConversationEvent[];
   selectedEventId?: string;
@@ -359,6 +405,7 @@ function Timeline({
   error?: Error;
   onBack: () => void;
   onSelect: (event: AgentConversationEvent) => void;
+  onSelectConversation: (conversation: AgentConversationSummary) => void;
 }) {
   const turns = useMemo(() => {
     const grouped = new Map<string, AgentConversationEvent[]>();
@@ -389,7 +436,7 @@ function Timeline({
         </Button>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <h2 className="truncate text-sm font-semibold text-zinc-100">{conversation.displayName}</h2>
+            <h2 className="truncate text-sm font-semibold text-zinc-100">{agent?.displayName ?? conversation.displayName}</h2>
             <Pill className={conversation.classification === "confirmed_agent"
               ? "border-teal-400/20 bg-teal-500/[0.07] text-teal-100"
               : "border-amber-400/20 bg-amber-500/[0.07] text-amber-100"}>
@@ -401,6 +448,23 @@ function Timeline({
             {conversation.workspacePath} · {conversation.turnCount} 轮 · {conversation.modelCallCount} 次模型调用
           </p>
         </div>
+        {agent && agent.conversations.length > 1 ? (
+          <Select value={conversation.conversationId} onValueChange={(value) => {
+            const next = agent.conversations.find((item) => item.conversationId === value);
+            if (next) onSelectConversation(next);
+          }}>
+            <SelectTrigger className="hidden h-9 w-[220px] border-white/10 bg-white/[0.035] text-xs text-zinc-200 lg:flex" aria-label="切换当前 Agent 的会话">
+              <SelectValue placeholder="选择会话" />
+            </SelectTrigger>
+            <SelectContent>
+              {agent.conversations.map((item, index) => (
+                <SelectItem key={item.conversationId} value={item.conversationId}>
+                  {`会话 ${agent.conversations.length - index} · ${nsDate(item.startedAtUnixNs, "MM-DD HH:mm")} · ${item.firstPromptPreview ?? "无正文"}`}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        ) : null}
         <CoverageBadge status={conversation.coverage.status} />
       </div>
 
@@ -620,6 +684,12 @@ function InteractionInspector({
               <EvidenceField label="Runtime Role" value={interaction?.runtimeRole ?? "agent_root"} />
               <EvidenceField label="Process" value={interaction?.process ? `pid ${interaction.process.pid} · ${interaction.process.comm ?? "--"}` : undefined} />
               <EvidenceField label="Transport" value={interaction ? `${interaction.transport} · ${interaction.protocol} · ${interaction.captureSource}` : undefined} />
+              <EvidenceField label="TLS Adapter" value={interaction?.tlsAdapterId} />
+              <EvidenceField label="Transport Decoder" value={interaction?.transportProtocol} />
+              <EvidenceField label="Wire Template" value={interaction?.wireTemplateId ?? interaction?.parseState} />
+              <EvidenceField label="Parse / Likelihood" value={interaction ? `${interaction.parseState ?? "legacy"} · ${interaction.llmLikelihood ?? "unknown"}` : undefined} />
+              <EvidenceField label="Completeness" value={interaction ? `transport=${interaction.transportCompleteness ?? interaction.completeness} · wire=${interaction.wireCompleteness ?? interaction.completeness} · conversation=${interaction.conversationCompleteness ?? interaction.completeness}` : undefined} />
+              <EvidenceField label="Schema Fingerprint" value={interaction?.schemaFingerprint} />
               <EvidenceField label="Endpoint" value={interaction ? `${interaction.endpoint}${interaction.path}` : undefined} />
               <EvidenceField label="Request Start" value={interaction ? nsDate(interaction.startedAtUnixNs) : nsDate(event.atUnixNs)} />
               <EvidenceField label="Request Complete" value={interaction ? nsDate(interaction.requestCompleteAtUnixNs) : undefined} />
@@ -650,6 +720,7 @@ export default function ConversationTrackingPage() {
   const coverageStatus = (searchParams.get("coverage") as AgentConversationCoverageStatus | null) ?? "all";
   const classification = (searchParams.get("classification") as AgentClassification | null) ?? "all";
   const scopedAgentAssetId = searchParams.get("agentAssetId") ?? "";
+  const selectedLogicalAgentId = searchParams.get("logicalAgentId") ?? "";
   const selectedConversationId = searchParams.get("conversationId") ?? "";
   const selectedEventId = searchParams.get("eventId") ?? "";
   const selectedInteractionId = searchParams.get("interactionId") ?? "";
@@ -666,21 +737,31 @@ export default function ConversationTrackingPage() {
     coverageStatus: coverageStatus === "all" ? undefined : coverageStatus,
     classification: classification === "all" ? undefined : classification,
     q: clean(query),
-    limit: 50,
+    lifecycleScope: "all" as const,
+    limit: 200,
   }), [classification, consoleTimeFilter.endTime, consoleTimeFilter.snapshotAsOf, consoleTimeFilter.startTime, coverageStatus, query, scopedAgentAssetId, timeType]);
 
   const {
-    data: conversations,
+    data: directory,
     loading: conversationsLoading,
     error: conversationsError,
     refresh: refreshConversations,
-  } = useRequest(() => securityCenterApi.agentConversations(conversationQuery), {
+  } = useRequest(() => securityCenterApi.agentConversationDirectory(conversationQuery), {
     refreshDeps: [conversationQuery, refreshVersion],
     pollingInterval: 10_000,
     pollingWhenHidden: false,
   });
 
-  const selectedConversation = useMemo(() => conversations?.items.find((item) => item.conversationId === selectedConversationId), [conversations?.items, selectedConversationId]);
+  const selectedLogicalAgent = useMemo(() => (
+    directory?.items.find((item) => item.logicalAgentId === selectedLogicalAgentId)
+    ?? directory?.items.find((item) =>
+      item.conversations.some((conversation) => conversation.conversationId === selectedConversationId))
+  ), [directory?.items, selectedConversationId, selectedLogicalAgentId]);
+  const selectedConversation = useMemo(() => (
+    selectedLogicalAgent?.conversations.find((item) => item.conversationId === selectedConversationId)
+    ?? directory?.items.flatMap((item) => item.conversations)
+      .find((item) => item.conversationId === selectedConversationId)
+  ), [directory?.items, selectedConversationId, selectedLogicalAgent?.conversations]);
 
   const updateRoute = (mutate: (next: URLSearchParams) => void, replace = false) => {
     const next = new URLSearchParams(searchParams);
@@ -690,20 +771,43 @@ export default function ConversationTrackingPage() {
 
   const selectConversation = (conversation: AgentConversationSummary, replace = false) => {
     updateRoute((next) => {
+      const owner = directory?.items.find((item) =>
+        item.conversations.some((candidate) => candidate.conversationId === conversation.conversationId));
+      if (owner) next.set("logicalAgentId", owner.logicalAgentId);
       next.set("conversationId", conversation.conversationId);
+      next.delete("eventId");
+      next.delete("interactionId");
+    }, replace);
+  };
+  const selectLogicalAgent = (
+    agent: LogicalAgentConversationDirectoryItem,
+    replace = false,
+  ) => {
+    const nextConversation = agent.conversations.find((item) => item.hasContent)
+      ?? agent.conversations[0];
+    updateRoute((next) => {
+      next.set("logicalAgentId", agent.logicalAgentId);
+      if (nextConversation) next.set("conversationId", nextConversation.conversationId);
+      else next.delete("conversationId");
       next.delete("eventId");
       next.delete("interactionId");
     }, replace);
   };
 
   useEffect(() => {
-    const top = conversations?.items[0];
+    const top = directory?.items[0];
     if (!top) return;
-    const selectedExists = conversations.items.some((item) => item.conversationId === selectedConversationId);
-    const followedPreviousTop = selectedConversationId && selectedConversationId === previousTopConversation.current;
-    if (!selectedExists || (liveFollow && followedPreviousTop && top.conversationId !== selectedConversationId)) selectConversation(top, true);
-    previousTopConversation.current = top.conversationId;
-  }, [conversations?.items, liveFollow, selectedConversationId]);
+    const selectedExists = directory.items.some((item) =>
+      item.logicalAgentId === selectedLogicalAgentId
+      || item.conversations.some((conversation) => conversation.conversationId === selectedConversationId));
+    const followedPreviousTop = selectedLogicalAgentId
+      && selectedLogicalAgentId === previousTopConversation.current;
+    if (
+      !selectedExists
+      || (liveFollow && followedPreviousTop && top.logicalAgentId !== selectedLogicalAgentId)
+    ) selectLogicalAgent(top, true);
+    previousTopConversation.current = top.logicalAgentId;
+  }, [directory?.items, liveFollow, selectedConversationId, selectedLogicalAgentId]);
 
   const {
     data: timeline,
@@ -755,6 +859,7 @@ export default function ConversationTrackingPage() {
     next.delete("interactionId");
   }, true);
   const clearSelectionOnMobile = () => updateRoute((next) => {
+    next.delete("logicalAgentId");
     next.delete("conversationId");
     next.delete("eventId");
     next.delete("interactionId");
@@ -776,13 +881,13 @@ export default function ConversationTrackingPage() {
   const clearFilters = () => {
     setQueryText("");
     updateRoute((next) => {
-      for (const key of ["coverage", "classification", "agentAssetId", "conversationId", "eventId", "interactionId"]) next.delete(key);
+      for (const key of ["coverage", "classification", "agentAssetId", "logicalAgentId", "conversationId", "eventId", "interactionId"]) next.delete(key);
     }, true);
   };
 
-  const completeCount = conversations?.items.filter((item) => item.coverage.status === "complete").length ?? 0;
-  const assetOnlyCount = conversations?.items.filter((item) => !item.hasContent).length ?? 0;
-  const abnormalCount = conversations?.items.filter((item) => !["complete", "asset_only", "no_activity"].includes(item.coverage.status)).length ?? 0;
+  const completeCount = directory?.items.filter((item) => item.coverage.status === "complete").length ?? 0;
+  const assetOnlyCount = directory?.items.filter((item) => item.conversationCount === 0).length ?? 0;
+  const abnormalCount = directory?.items.filter((item) => !["complete", "asset_only", "no_activity"].includes(item.coverage.status)).length ?? 0;
 
   return (
     <div className="flex h-full w-full flex-col overflow-hidden bg-[#0b0f0c] text-zinc-100">
@@ -792,7 +897,7 @@ export default function ConversationTrackingPage() {
             <div className="flex items-center gap-2">
               <MessageSquareText className="size-5 shrink-0 text-teal-300" aria-hidden="true" />
               <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">{t("对话追踪")}</h1>
-              <Pill className="border-white/10 bg-white/[0.035] text-zinc-400">{conversations?.dataSource ?? "loading"}</Pill>
+              <Pill className="border-white/10 bg-white/[0.035] text-zinc-400">{directory?.dataSource ?? "loading"}</Pill>
             </div>
             <p className="mt-1 truncate text-xs text-zinc-500">以 Agent 视角还原模型请求、回复、工具指令、工具结果与 TLS 证据</p>
           </div>
@@ -834,17 +939,17 @@ export default function ConversationTrackingPage() {
           <span className="flex items-center gap-1.5"><CircleCheck className="size-3.5 text-teal-300" />正文完整 <strong className="font-mono font-medium text-zinc-300">{completeCount}</strong></span>
           <span className="flex items-center gap-1.5"><CircleDashed className="size-3.5 text-zinc-500" />仅资产 <strong className="font-mono font-medium text-zinc-300">{assetOnlyCount}</strong></span>
           <span className="flex items-center gap-1.5"><AlertTriangle className="size-3.5 text-amber-300" />异常/部分 <strong className="font-mono font-medium text-zinc-300">{abnormalCount}</strong></span>
-          <span className="ml-auto flex items-center gap-1.5"><Clock3 className="size-3.5" />{conversations?.updateTime ? dayjs(conversations.updateTime).format("MM-DD HH:mm:ss") : "等待数据"}</span>
+          <span className="ml-auto flex items-center gap-1.5"><Clock3 className="size-3.5" />{directory?.updateTime ? dayjs(directory.updateTime).format("MM-DD HH:mm:ss") : "等待数据"}</span>
         </div>
       </header>
 
       <main id="conversation-workspace" className="relative min-h-0 flex-1 overflow-hidden" aria-label="Agent 对话追踪工作区">
         <div className="grid h-full min-h-0 grid-cols-1 md:grid-cols-[320px_minmax(0,1fr)] xl:grid-cols-[320px_minmax(420px,1fr)_minmax(360px,0.78fr)]">
           <div className={cn("min-h-0", selectedConversationId ? "hidden md:block" : "block")}>
-            <SessionRail items={conversations?.items ?? []} selectedId={selectedConversationId} loading={conversationsLoading} error={conversationsError} onSelect={selectConversation} />
+            <LogicalAgentDirectoryRail items={directory?.items ?? []} selectedLogicalAgentId={selectedLogicalAgent?.logicalAgentId} loading={conversationsLoading} error={conversationsError} onSelect={selectLogicalAgent} />
           </div>
           <div className={cn("min-h-0", selectedConversationId ? "block" : "hidden md:block")}>
-            <Timeline conversation={selectedConversation} events={timeline?.items ?? []} selectedEventId={selectedEvent?.eventId} loading={timelineLoading} error={timelineError} onBack={clearSelectionOnMobile} onSelect={selectEvent} />
+            <Timeline agent={selectedLogicalAgent} conversation={selectedConversation} events={timeline?.items ?? []} selectedEventId={selectedEvent?.eventId} loading={timelineLoading} error={timelineError} onBack={clearSelectionOnMobile} onSelect={selectEvent} onSelectConversation={selectConversation} />
           </div>
           <InteractionInspector event={selectedEvent} interaction={selectedInteraction} loading={interactionLoading} onClose={closeInspector} />
         </div>

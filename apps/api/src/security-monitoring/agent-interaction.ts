@@ -10,6 +10,21 @@ const MAX_MESSAGES = 4_096;
 const COMPLETENESS = new Set<T.AgentInteractionCompleteness>([
   'complete', 'partial', 'truncated', 'redacted', 'reference_only', 'unavailable', 'unsupported',
 ]);
+const PARSE_STATES = new Set<NonNullable<T.AgentInteractionRecord['parseState']>>([
+  'parsed', 'partial', 'unparsed', 'ambiguous',
+]);
+const LLM_LIKELIHOODS = new Set<NonNullable<T.AgentInteractionRecord['llmLikelihood']>>([
+  'confirmed', 'likely', 'unknown', 'unlikely',
+]);
+const TRANSPORT_COMPLETENESS = new Set<NonNullable<T.AgentInteractionRecord['transportCompleteness']>>([
+  'complete', 'partial',
+]);
+const WIRE_COMPLETENESS = new Set<NonNullable<T.AgentInteractionRecord['wireCompleteness']>>([
+  'complete', 'error', 'unknown', 'partial',
+]);
+const CONVERSATION_COMPLETENESS = new Set<NonNullable<T.AgentInteractionRecord['conversationCompleteness']>>([
+  'complete', 'tool_pending', 'response_pending', 'partial',
+]);
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -44,6 +59,10 @@ function completeness(value: unknown): T.AgentInteractionCompleteness {
   return typeof value === 'string' && COMPLETENESS.has(value as T.AgentInteractionCompleteness)
     ? value as T.AgentInteractionCompleteness
     : 'partial';
+}
+
+function closedValue<TValue extends string>(value: unknown, allowed: Set<TValue>): TValue | undefined {
+  return typeof value === 'string' && allowed.has(value as TValue) ? value as TValue : undefined;
 }
 
 function boundedJson(value: unknown, maxBytes = MAX_DERIVED_JSON_BYTES): unknown {
@@ -157,6 +176,123 @@ function unixNsToMs(value: string): number {
   }
 }
 
+function parsePlaintextEvidence(
+  input: Record<string, unknown>,
+  meta: T.EventMeta,
+): T.AgentInteractionRecord | undefined {
+  if (input.schemaVersion !== 'anysentry.agent_plaintext_evidence.v1') return undefined;
+  const evidenceId = string(input.evidenceId, 160);
+  const connectionId = string(input.connectionId, 240);
+  const observedAtUnixNs = unixNs(input.observedAtUnixNs);
+  const tlsAdapterId = string(input.tlsAdapterId, 160);
+  const transportProtocol = string(input.transportProtocol, 80);
+  const parseState = closedValue(input.parseState, PARSE_STATES);
+  const llmLikelihood = closedValue(input.llmLikelihood, LLM_LIKELIHOODS);
+  const schemaFingerprint = string(input.schemaFingerprint, 160);
+  const capturedBytes = integer(input.capturedBytes, 0, MAX_BODY_BYTES * 8);
+  const redactedSample = exactString(input.redactedSample, 64 * 1024);
+  const sampleSha256 = string(input.sampleSha256, 64);
+  if (
+    !evidenceId || !/^pe_[a-f0-9]{24,64}$/u.test(evidenceId)
+    || !connectionId || !observedAtUnixNs || !tlsAdapterId || !transportProtocol
+    || parseState !== 'unparsed' || !llmLikelihood || capturedBytes === undefined
+    || !sampleSha256 || !/^[a-f0-9]{64}$/u.test(sampleSha256)
+  ) return undefined;
+
+  const detected = meta.classificationSemantics?.identityClassification
+    ?? meta.attribution?.classification
+    ?? 'unknown';
+  if (detected !== 'confirmed_agent' && detected !== 'probable_agent') return undefined;
+  const semanticIdentity = detectedAgentIdentity({
+    agentId: meta.agentId,
+    workspacePath: meta.workspacePath,
+    sessionId: meta.sessionId,
+    attributes: meta.attributes ?? {},
+    process: meta.process,
+    attribution: meta.attribution,
+  });
+  const body = redactedSample ?? '';
+  const bodyBytes = Buffer.from(body, 'utf8');
+  const emptyBytes = Buffer.alloc(0);
+  const content = (
+    bytes: Buffer,
+    observedBytes: number,
+  ): T.AgentInteractionContent => ({
+    body: bytes.toString('utf8'),
+    encoding: 'utf8',
+    contentType: redactedSample === undefined ? 'application/octet-stream' : 'application/json',
+    capturedBytes: observedBytes,
+    decodedBytes: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    completeness: 'unsupported',
+  });
+  const direction = input.direction === 'read' ? 'read' : 'write';
+  const reasons = Array.isArray(input.reasons)
+    ? input.reasons
+        .map((reason) => string(reason, 240))
+        .filter((reason): reason is string => Boolean(reason))
+        .slice(0, 64)
+    : [];
+  const rootPid = meta.attribution?.rootPid;
+  const runtimeRole = meta.process?.pid && rootPid && meta.process.pid !== rootPid
+    ? 'network_runtime'
+    : 'agent_root';
+  const runtimeSessionId = string(meta.sessionId, 512);
+  return {
+    schemaVersion: 'anysentry.agent_interaction.v1',
+    interactionId: 'mi_' + evidenceId.slice(3),
+    interactionType: 'unparsed',
+    at: unixNsToMs(observedAtUnixNs),
+    workspacePath: meta.workspacePath,
+    sourceId: typeof meta.attributes?.sourceId === 'string' ? meta.attributes.sourceId : undefined,
+    collectorId: typeof meta.attributes?.collectorId === 'string' ? meta.attributes.collectorId : undefined,
+    agentAssetId: meta.subjectAssetId ?? semanticIdentity.agentAssetId,
+    agentInstanceId: semanticIdentity.agentRuntimeInstanceId,
+    agentProduct: semanticIdentity.agentProduct ?? meta.attribution?.agentDisplayName ?? meta.agentId,
+    ...(runtimeSessionId ? { runtimeSessionId } : {}),
+    runtimeRole,
+    correlationQuality: meta.subjectAssetId && semanticIdentity.agentRuntimeInstanceId
+      ? 'exact'
+      : meta.subjectAssetId ? 'strong' : 'inferred',
+    detectedClassification: detected,
+    currentEffectiveClassification: detected,
+    process: meta.process,
+    connectionId,
+    transport: input.captureSource === 'tcp_plaintext' ? 'http' : 'tls',
+    protocol: transportProtocol,
+    tlsAdapterId,
+    transportProtocol,
+    parseState,
+    llmLikelihood,
+    ...(schemaFingerprint ? { schemaFingerprint } : {}),
+    transportCompleteness: 'partial',
+    wireCompleteness: 'unknown',
+    conversationCompleteness: 'partial',
+    endpoint: 'unknown',
+    method: 'UNKNOWN',
+    path: 'unknown',
+    statusCode: 0,
+    startedAtUnixNs: observedAtUnixNs,
+    requestCompleteAtUnixNs: observedAtUnixNs,
+    firstResponseAtUnixNs: observedAtUnixNs,
+    endedAtUnixNs: observedAtUnixNs,
+    durationNs: '0',
+    timeQuality: 'collector_calibrated',
+    request: direction === 'write'
+      ? content(bodyBytes, capturedBytes)
+      : content(emptyBytes, 0),
+    response: direction === 'read'
+      ? content(bodyBytes, capturedBytes)
+      : content(emptyBytes, 0),
+    toolCalls: [],
+    toolResults: [],
+    completeness: 'unsupported',
+    partialReasons: [...new Set(['unparsed_plaintext_evidence', ...reasons])],
+    captureSource: string(input.captureSource, 120) ?? 'unknown',
+    receivedAt: meta.receivedAt ?? Date.now(),
+  };
+}
+
 export function parseObserverAgentInteraction(
   line: string,
   meta: T.EventMeta,
@@ -170,7 +306,11 @@ export function parseObserverAgentInteraction(
   }
   const event = record(envelope.event);
   const input = record(event?.LlmInteraction);
-  if (!input || input.schemaVersion !== 'anysentry.agent_interaction.v1') return undefined;
+  if (!input) {
+    const evidence = record(event?.AgentPlaintextEvidence);
+    return evidence ? parsePlaintextEvidence(evidence, meta) : undefined;
+  }
+  if (input.schemaVersion !== 'anysentry.agent_interaction.v1') return undefined;
 
   const interactionId = string(input.interactionId, 160);
   const connectionId = string(input.connectionId, 240);
@@ -217,6 +357,18 @@ export function parseObserverAgentInteraction(
   const providerConversationId = string(input.providerConversationId, 512);
   const providerResponseId = string(input.providerResponseId, 512);
   const providerPreviousResponseId = string(input.providerPreviousResponseId, 512);
+  const tlsAdapterId = string(input.tlsAdapterId, 160);
+  const transportProtocol = string(input.transportProtocol, 80);
+  const wireTemplateId = string(input.wireTemplateId, 160);
+  const parseState = closedValue(input.parseState, PARSE_STATES);
+  const llmLikelihood = closedValue(input.llmLikelihood, LLM_LIKELIHOODS);
+  const schemaFingerprint = string(input.schemaFingerprint, 160);
+  const transportCompleteness = closedValue(input.transportCompleteness, TRANSPORT_COMPLETENESS);
+  const wireCompleteness = closedValue(input.wireCompleteness, WIRE_COMPLETENESS);
+  const conversationCompleteness = closedValue(
+    input.conversationCompleteness,
+    CONVERSATION_COMPLETENESS,
+  );
   const conversationId = string(input.conversationId, 512);
   const conversationIdSource = input.conversationIdSource === 'provider'
     || input.conversationIdSource === 'runtime'
@@ -230,7 +382,9 @@ export function parseObserverAgentInteraction(
   return {
     schemaVersion: 'anysentry.agent_interaction.v1',
     interactionId,
-    interactionType: input.interactionType === 'tool' ? 'tool' : 'model',
+    interactionType: input.interactionType === 'tool'
+      ? 'tool'
+      : input.interactionType === 'unparsed' ? 'unparsed' : 'model',
     at: unixNsToMs(startedAtUnixNs),
     workspacePath: meta.workspacePath,
     sourceId: typeof meta.attributes?.sourceId === 'string' ? meta.attributes.sourceId : undefined,
@@ -254,6 +408,15 @@ export function parseObserverAgentInteraction(
     connectionId,
     transport: input.transport === 'tls' ? 'tls' : 'http',
     protocol: string(input.protocol, 80) ?? 'unknown',
+    ...(tlsAdapterId ? { tlsAdapterId } : {}),
+    ...(transportProtocol ? { transportProtocol } : {}),
+    ...(wireTemplateId ? { wireTemplateId } : {}),
+    ...(parseState ? { parseState } : {}),
+    ...(llmLikelihood ? { llmLikelihood } : {}),
+    ...(schemaFingerprint ? { schemaFingerprint } : {}),
+    ...(transportCompleteness ? { transportCompleteness } : {}),
+    ...(wireCompleteness ? { wireCompleteness } : {}),
+    ...(conversationCompleteness ? { conversationCompleteness } : {}),
     endpoint,
     method,
     path,

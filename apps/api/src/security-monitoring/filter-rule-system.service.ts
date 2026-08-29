@@ -116,7 +116,7 @@ function probeForEventKind(kind: string | undefined): FilterRuleEvaluationContex
   if (kind === 'Dns') return 'dns';
   if (kind === 'Egress') return 'connect';
   if (kind === 'SslContent') return 'ssl';
-  if (kind === 'LlmCall' || kind === 'LlmInteraction' || kind === 'AgentTool' || kind === 'AgentInvocation') return 'llm';
+  if (kind === 'LlmCall' || kind === 'LlmInteraction' || kind === 'AgentPlaintextEvidence' || kind === 'AgentTool' || kind === 'AgentInvocation') return 'llm';
   if (kind === 'SecurityAction') return 'security';
   return undefined;
 }

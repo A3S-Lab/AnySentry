@@ -74,6 +74,10 @@ const AGENT_INTERACTION_DDL = `CREATE TABLE IF NOT EXISTS ${AGENT_INTERACTION_TA
   interactionType LowCardinality(String) DEFAULT 'model',
   transport LowCardinality(String),
   protocol LowCardinality(String),
+  tlsAdapterId LowCardinality(String) DEFAULT '',
+  transportProtocol LowCardinality(String) DEFAULT '',
+  wireTemplateId LowCardinality(String) DEFAULT '',
+  parseState LowCardinality(String) DEFAULT '',
   endpoint String,
   model LowCardinality(String) DEFAULT '',
   completeness LowCardinality(String),
@@ -1000,7 +1004,11 @@ async function runClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promis
     await schema.command({ query: AGENT_INTERACTION_DDL });
     await schema.command({
       query: `ALTER TABLE ${AGENT_INTERACTION_TABLE}
-        ADD COLUMN IF NOT EXISTS interactionType LowCardinality(String) DEFAULT 'model' AFTER classification`,
+        ADD COLUMN IF NOT EXISTS interactionType LowCardinality(String) DEFAULT 'model' AFTER classification,
+        ADD COLUMN IF NOT EXISTS tlsAdapterId LowCardinality(String) DEFAULT '' AFTER protocol,
+        ADD COLUMN IF NOT EXISTS transportProtocol LowCardinality(String) DEFAULT '' AFTER tlsAdapterId,
+        ADD COLUMN IF NOT EXISTS wireTemplateId LowCardinality(String) DEFAULT '' AFTER transportProtocol,
+        ADD COLUMN IF NOT EXISTS parseState LowCardinality(String) DEFAULT '' AFTER wireTemplateId`,
     });
     // One metadata transaction is materially cheaper than dozens of sequential ALTERs on a busy
     // MergeTree. Every operation is idempotent, so rolling versions retain the same compatibility.
@@ -6488,6 +6496,10 @@ export class ClickHouseStore {
           interactionType: record.interactionType,
           transport: record.transport,
           protocol: record.protocol,
+          tlsAdapterId: record.tlsAdapterId ?? '',
+          transportProtocol: record.transportProtocol ?? '',
+          wireTemplateId: record.wireTemplateId ?? '',
+          parseState: record.parseState ?? '',
           endpoint: record.endpoint,
           model: record.model ?? '',
           completeness: record.completeness,
@@ -6528,6 +6540,10 @@ export class ClickHouseStore {
       ...(input.interactionType ? ['interactionType = {interactionType:String}'] : []),
       ...(input.model ? ['model = {model:String}'] : []),
       ...(input.transport ? ['transport = {transport:String}'] : []),
+      ...(input.tlsAdapterId ? ['tlsAdapterId = {tlsAdapterId:String}'] : []),
+      ...(input.transportProtocol ? ['transportProtocol = {transportProtocol:String}'] : []),
+      ...(input.wireTemplateId ? ['wireTemplateId = {wireTemplateId:String}'] : []),
+      ...(input.parseState ? ['parseState = {parseState:String}'] : []),
       ...(input.completeness ? ['completeness = {completeness:String}'] : []),
     ];
     try {
@@ -6549,6 +6565,10 @@ export class ClickHouseStore {
           ...(input.interactionType ? { interactionType: input.interactionType } : {}),
           ...(input.model ? { model: input.model } : {}),
           ...(input.transport ? { transport: input.transport } : {}),
+          ...(input.tlsAdapterId ? { tlsAdapterId: input.tlsAdapterId } : {}),
+          ...(input.transportProtocol ? { transportProtocol: input.transportProtocol } : {}),
+          ...(input.wireTemplateId ? { wireTemplateId: input.wireTemplateId } : {}),
+          ...(input.parseState ? { parseState: input.parseState } : {}),
           ...(input.completeness ? { completeness: input.completeness } : {}),
         },
         clickhouse_settings: {

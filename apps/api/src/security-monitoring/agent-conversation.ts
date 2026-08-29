@@ -350,7 +350,14 @@ function conversationCoverage(
   const partialInteractions = interactions.length - completeInteractions;
   const reasons = [...new Set(interactions.flatMap((item) => item.partialReasons))];
   let status: T.AgentConversationCoverageStatus = partialInteractions ? 'partial' : 'complete';
-  if (interactions.some((item) => item.completeness === 'unsupported')) {
+  if (interactions.every((item) => item.interactionType === 'unparsed')) {
+    status = interactions.some((item) =>
+      ['http/2', 'websocket', 'quic', 'unknown'].includes(
+        item.transportProtocol ?? item.protocol,
+      ))
+      ? 'transport_unparsed'
+      : 'template_unparsed';
+  } else if (interactions.some((item) => item.completeness === 'unsupported')) {
     status = interactions.some((item) => /(?:http\/2|websocket|quic)/iu.test(item.protocol))
       ? 'unsupported_protocol'
       : 'unsupported_tls_profile';
@@ -408,7 +415,10 @@ function summaryForConversation(
   };
 }
 
-function assetOnlySummary(asset: T.AgentInventoryItem): T.AgentConversationSummary {
+function assetOnlySummary(
+  asset: T.AgentInventoryItem,
+  evidence: T.AgentInteractionRecord[] = [],
+): T.AgentConversationSummary {
   return {
     conversationId: stableId('asset', `asset-only\u0000${asset.agentAssetId}`),
     idSource: 'inferred',
@@ -421,14 +431,16 @@ function assetOnlySummary(asset: T.AgentInventoryItem): T.AgentConversationSumma
     classification: asset.classification,
     workspacePath: asset.workspacePath,
     lastActivityAtUnixNs: (BigInt(Date.parse(asset.lastSeen)) * 1_000_000n).toString(),
-    firstPromptPreview: 'Agent 资产已识别，但当前时间范围没有可读取的模型明文交互。',
+    firstPromptPreview: evidence.length
+      ? '已观察到 Agent 明文流，但 transport 或 wire template 尚未解析。'
+      : 'Agent 资产已识别，但当前时间范围没有可读取的模型明文交互。',
     turnCount: 0,
     modelCallCount: 0,
     toolCallCount: 0,
     toolResultCount: 0,
     errorCount: 0,
     models: [],
-    coverage: conversationCoverage([]),
+    coverage: conversationCoverage(evidence),
   };
 }
 
@@ -463,14 +475,22 @@ export function projectAgentConversations(
   query: T.AgentConversationQuery,
 ): AgentConversationProjection {
   const assetsById = new Map(assets.map((asset) => [asset.agentAssetId, asset]));
+  const evidenceByAsset = new Map<string, T.AgentInteractionRecord[]>();
+  const semanticInteractions = interactions.filter((record) => {
+    if (record.interactionType !== 'unparsed') return true;
+    const evidence = evidenceByAsset.get(record.agentAssetId) ?? [];
+    evidence.push(record);
+    evidenceByAsset.set(record.agentAssetId, evidence);
+    return false;
+  });
   const grouped = new Map<string, {
     source: 'provider' | 'runtime' | 'inferred';
     records: T.AgentInteractionRecord[];
   }>();
   const inferredByRoot = new Map<string, T.AgentInteractionRecord[]>();
-  const providerChains = providerResponseChains(interactions);
+  const providerChains = providerResponseChains(semanticInteractions);
 
-  for (const record of [...interactions].sort(compareInteraction)) {
+  for (const record of [...semanticInteractions].sort(compareInteraction)) {
     const explicit = explicitConversation(record, providerChains);
     if (explicit) {
       const group = grouped.get(explicit.conversationId) ?? {
@@ -521,7 +541,9 @@ export function projectAgentConversations(
     summaries.push(summary);
   }
   for (const asset of assets) {
-    if (!assetsWithContent.has(asset.agentAssetId)) summaries.push(assetOnlySummary(asset));
+    if (!assetsWithContent.has(asset.agentAssetId)) {
+      summaries.push(assetOnlySummary(asset, evidenceByAsset.get(asset.agentAssetId)));
+    }
   }
 
   const visible = summaries

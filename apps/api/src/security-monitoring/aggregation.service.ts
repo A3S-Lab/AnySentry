@@ -413,7 +413,7 @@ function eventCategory(kind: string): T.EventCategory {
   if (kind === 'ToolExec') return 'tool';
   if (kind === 'Egress' || kind === 'Dns' || kind === 'SslContent') return 'network';
   if (kind === 'FileAccess' || kind === 'FileDelete') return 'file';
-  if (kind === 'LlmCall' || kind === 'LlmApi' || kind === 'LlmInteraction') return 'llm';
+  if (kind === 'LlmCall' || kind === 'LlmApi' || kind === 'LlmInteraction' || kind === 'AgentPlaintextEvidence') return 'llm';
   if (kind === 'SecurityAction') return 'security';
   if (kind === 'ProcessExit') return 'process';
   if (kind === 'RuntimeEvent') return 'runtime';
@@ -1885,6 +1885,10 @@ export class AggregationService {
         && (!filter.interactionType || item.interactionType === filter.interactionType)
         && (!filter.model || item.model === filter.model)
         && (!filter.transport || item.transport === filter.transport)
+        && (!filter.tlsAdapterId || item.tlsAdapterId === filter.tlsAdapterId)
+        && (!filter.transportProtocol || item.transportProtocol === filter.transportProtocol)
+        && (!filter.wireTemplateId || item.wireTemplateId === filter.wireTemplateId)
+        && (!filter.parseState || item.parseState === filter.parseState)
         && (!filter.completeness || item.completeness === filter.completeness)
         && (filter.scope === 'raw' || ['confirmed_agent', 'probable_agent'].includes(
           currentView ? item.currentEffectiveClassification : item.detectedClassification,

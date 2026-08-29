@@ -21,6 +21,10 @@ jobs:
         run: |
           pnpm --filter @anysentry/api exec tsc --noEmit
           pnpm --filter @anysentry/web exec tsc --noEmit
+      - name: Agent conversation directory contract
+        run: pnpm verify:agent-conversation-directory
+      - name: Repository privacy and junk hygiene
+        run: pnpm verify:repository-hygiene
 
   docker:
     runs-on: ubuntu-latest
