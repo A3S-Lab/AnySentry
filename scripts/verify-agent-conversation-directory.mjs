@@ -153,26 +153,26 @@ const syntheticDify = projectAgentConversationDirectory([
   conversation({
     conversationId: 'cv-dify-a',
     agentAssetId: 'asset-dify-a',
-    agentInstanceIds: ['dify-instance-a'],
+    agentInstanceIds: ['docker:fixture:dify-a'],
     product: 'dify-worker',
     workspacePath: 'agent://container-a',
-    environment: 'docker',
+    environment: 'host',
     at: '1788000000000000005',
   }),
   conversation({
     conversationId: 'cv-dify-b',
     agentAssetId: 'asset-dify-b',
-    agentInstanceIds: ['dify-instance-b'],
+    agentInstanceIds: ['docker:fixture:dify-b'],
     product: 'Dify',
     workspacePath: 'agent://container-b',
     environment: 'docker',
     at: '1788000000000000006',
   }),
 ], [
-  runtime('dify-instance-a', 'running', 'Dify', null, 'docker:container-a'),
-  runtime('dify-instance-b', 'running', 'dify-worker', null, 'docker:container-b'),
-  runtime('dify-instance-c', 'running', 'Dify', null, 'docker:container-c'),
-  runtime('dify-instance-d', 'running', 'Dify', null, 'docker:container-d'),
+  runtime('docker:fixture:dify-a', 'running', 'Dify', null, 'docker:container-a'),
+  runtime('docker:fixture:dify-b', 'running', 'dify-worker', null, 'docker:container-b'),
+  runtime('docker:fixture:dify-c', 'running', 'Dify', null, 'docker:container-c'),
+  runtime('docker:fixture:dify-d', 'running', 'Dify', null, 'docker:container-d'),
 ], 'all');
 assert.equal(syntheticDify.length, 1);
 assert.equal(syntheticDify[0].product, 'Dify');

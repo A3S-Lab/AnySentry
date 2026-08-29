@@ -1144,6 +1144,8 @@ Host/path，不读取模型名决定 TLS attach，也不因自定义 base URL �
 7. **目录占位路径归并**：`agent://<container>`、`agent-scope:*` 和未知 workspace 是发现阶段的
    系统占位值，不是用户工作区。目录按 `canonical product + environment + product scope` 将其
    归并为一个 logical Agent，并在实例层保留容器/PID 差异；真实项目目录仍按 workspace 分组。
+   若历史 Interaction 的 environment 与 `docker:/kubernetes:` 强实例身份冲突，实例身份优先，
+   避免身份迁移期间把同一运行时拆成两行。
 8. **历史读取公平性**：Conversation Directory 不再直接取全局最近 500 条 Interaction。持久层
    先按存储的 Agent asset ID 各取最近 64 条、全局最多 2,000 条，合并热增量后再按 canonical
    asset alias 执行同一上限；高频 Agent 因此不能挤掉其他 Agent 的历史会话，同时读取保持有界

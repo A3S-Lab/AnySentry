@@ -37,7 +37,15 @@ function canonicalWorkspace(value: string | undefined, product: string): string 
 function canonicalEnvironment(
   environment: T.AgentConversationSummary['environment'],
   workspacePath: string,
+  agentInstanceIds: string[] = [],
 ): T.AgentConversationSummary['environment'] {
+  const instanceIdentities = agentInstanceIds.map(normalized);
+  if (instanceIdentities.some((value) => /^(?:docker|container):/u.test(value))) {
+    return 'docker';
+  }
+  if (instanceIdentities.some((value) => /^(?:kubernetes|k8s|pod):/u.test(value))) {
+    return 'kubernetes';
+  }
   if (environment !== 'unknown') return environment;
   if (workspacePath.startsWith('agent://')) return 'docker';
   if (workspacePath.startsWith('/')) return 'host';
@@ -127,7 +135,11 @@ export function projectAgentConversationDirectory(
   for (const conversation of conversations) {
     const product = canonicalProduct(conversation.agentProduct);
     const rawWorkspacePath = conversation.workspacePath?.trim().replace(/\/+$/u, '') ?? '';
-    const environment = canonicalEnvironment(conversation.environment, rawWorkspacePath);
+    const environment = canonicalEnvironment(
+      conversation.environment,
+      rawWorkspacePath,
+      conversation.agentInstanceIds,
+    );
     const workspacePath = canonicalWorkspace(rawWorkspacePath, product);
     const id = logicalAgentId(product, environment, workspacePath);
     const items = groups.get(id) ?? [];
@@ -143,7 +155,11 @@ export function projectAgentConversationDirectory(
     const first = conversations[0];
     const product = canonicalProduct(first.agentProduct);
     const rawWorkspacePath = first.workspacePath?.trim().replace(/\/+$/u, '') ?? '';
-    const environment = canonicalEnvironment(first.environment, rawWorkspacePath);
+    const environment = canonicalEnvironment(
+      first.environment,
+      rawWorkspacePath,
+      first.agentInstanceIds,
+    );
     const workspacePath = canonicalWorkspace(rawWorkspacePath, product);
     const agentInstanceIds = [...new Set(conversations.flatMap((item) => item.agentInstanceIds))];
     const agentAssetIds = [...new Set(conversations.map((item) => item.agentAssetId))];
