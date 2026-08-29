@@ -1,0 +1,10 @@
+# Immutable AnySentry script overlay for a digest-pinned composite Observer runtime.
+#
+# The base already contains Node, the supervisor, Forwarder dependencies and the validated
+# Collector/eBPF binary. This layer updates only the auditable JavaScript runtime closure.
+ARG OBSERVER_RUNTIME_BASE=invalid.invalid/anysentry-observer-runtime:must-be-overridden
+FROM ${OBSERVER_RUNTIME_BASE}
+
+COPY scripts/observer-*.js /opt/
+
+ENTRYPOINT ["/usr/local/bin/node", "/opt/observer-supervisor.js"]
