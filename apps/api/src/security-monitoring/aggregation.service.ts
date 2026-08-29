@@ -44,7 +44,10 @@ import { CommitAwareFactBucketCache } from './commit-aware-fact-cache';
 import { foldLatestEventRevisions } from './event-revision';
 import { eventActivityContext, eventActivitySubtype } from './activity-context';
 import { resolveTimeWindow } from './time-window';
-import { summarizePipelineAccounting } from './pipeline-accounting';
+import {
+  collectorHeartbeatFailureDelta,
+  summarizePipelineAccounting,
+} from './pipeline-accounting';
 import { correlationCaptureRollout } from './correlation-rollout';
 import {
   visibleClassificationSemantics,
@@ -188,14 +191,22 @@ export function stabilizeCollectorHealthChannel(
   return { state, stateText: CHANNEL_STATE_TEXT[state], reasons, consecutiveBad: bad, consecutiveClean: clean };
 }
 
-function captureEvaluation(heartbeat: T.CollectorHeartbeatRecord): CollectorChannelEvaluation {
+export function evaluateCollectorCaptureHeartbeat(
+  heartbeat: T.CollectorHeartbeatRecord,
+  previous?: T.CollectorHeartbeatRecord,
+): CollectorChannelEvaluation {
   const reasons: string[] = [];
   const rings = heartbeat.pipelineAccounting?.rings ?? [];
   const ringLoss = rings.some((ring) =>
     ring.ringDropped > 0 || (ring.collectorDropped ?? 0) > 0 || ring.queueDropped > 0);
+  // Raw Collector compatibility counters are process-lifetime cumulative, while Forwarder
+  // compatibility counters are per-window deltas. Reuse the same source-aware arithmetic as
+  // collector quality alerting so an old, unchanged raw drop count does not keep the current
+  // capture channel degraded forever. The typed ring accounting remains window-scoped evidence.
+  const { droppedDelta } = collectorHeartbeatFailureDelta(heartbeat, previous);
   const capture = heartbeat.captureProfileMetrics;
   if (heartbeat.status !== 'ok') reasons.push(`raw_status_${heartbeat.status}`);
-  if (heartbeat.droppedEvents > 0 || ringLoss) reasons.push('capture_pipeline_loss');
+  if (droppedDelta > 0 || ringLoss) reasons.push('capture_pipeline_loss');
   if (capture?.aggregateLedgerDegraded) reasons.push('capture_aggregate_ledger_degraded');
   if (capture?.decisionConserved === false || capture?.payloadConserved === false) reasons.push('capture_accounting_not_conserved');
   return { severity: reasons.length ? 2 : 0, reasons };
@@ -4778,9 +4789,15 @@ export class AggregationService {
       const recentForwarder = freshForwarderHeartbeat
         ? recentHeartbeatLane(laneHeartbeats, 'forwarder')
         : [];
-      const captureEvaluations = recentRaw.map(captureEvaluation);
+      const captureEvaluations = recentRaw.map((heartbeat, index) =>
+        evaluateCollectorCaptureHeartbeat(heartbeat, recentRaw[index + 1]));
       if (captureEvaluations.length && freshCaptureProfileHeartbeat?.captureProfileMetrics) {
-        const profileEvaluation = captureEvaluation(freshCaptureProfileHeartbeat);
+        const previousProfileHeartbeat = recentRaw.find((heartbeat) =>
+          heartbeat.at < freshCaptureProfileHeartbeat.at);
+        const profileEvaluation = evaluateCollectorCaptureHeartbeat(
+          freshCaptureProfileHeartbeat,
+          previousProfileHeartbeat,
+        );
         if (profileEvaluation.severity > captureEvaluations[0].severity) {
           captureEvaluations[0] = {
             severity: profileEvaluation.severity,
