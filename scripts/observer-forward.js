@@ -515,6 +515,7 @@ const workloadCache = new WorkloadIdentityCache({ templateRegistry });
 const dockerDiscovery = new DockerDiscovery({
   nodeName: NODE_NAME,
   hostId: process.env.A3S_OBSERVER_HOST_ID || NODE_NAME,
+  bootId: attributor.bootId,
 });
 const behaviorDetector = new BehavioralAgentDetector();
 const unifiedFilterPolicy = new UnifiedFilterPolicyRegistry();
@@ -1786,8 +1787,16 @@ async function acquireRuntimeLease(maxAttempts = 1) {
 
 function runtimeSnapshotBody(ready = true) {
   runtimeSnapshotVersion += 1;
+  const processSnapshot = attributor.runtimeSnapshot();
+  const rootedWorkloads = new Set(
+    processSnapshot.entries.map((entry) => entry.physicalWorkloadId).filter(Boolean),
+  );
+  const workloadRuntimes = workloadCache
+    .agentRuntimeInventory()
+    .filter((entry) => !rootedWorkloads.has(entry.physicalWorkloadId));
   return {
-    ...attributor.runtimeSnapshot(),
+    ...processSnapshot,
+    entries: [...processSnapshot.entries, ...workloadRuntimes],
     collectorId: COLLECTOR_ID || NODE_NAME || 'observer-forwarder',
     forwarderInstanceId,
     leaseEpoch: runtimeLeaseEpoch,

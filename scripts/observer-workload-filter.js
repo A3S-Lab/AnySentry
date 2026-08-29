@@ -511,6 +511,59 @@ class WorkloadIdentityCache {
     return result;
   }
 
+  agentRuntimeInventory() {
+    const now = this.now();
+    const observedAt = new Date(now).toISOString();
+    const seen = new Set();
+    const result = [];
+    for (const entry of [...this.sources.values()].flat()) {
+      if (
+        entry.classification !== 'confirmed_agent'
+        || entry.environment !== 'docker'
+        || text(entry.containerState).toLowerCase() !== 'running'
+      ) continue;
+      const physicalWorkloadId = text(entry.physicalWorkloadId);
+      const agentScopeId = text(entry.agentScopeId);
+      const rootPid = Number(entry.hostPid);
+      const rootStartTimeTicks = text(entry.rootStartTimeTicks);
+      const hostId = text(entry.hostId)
+        || physicalWorkloadId.split(':').slice(1, -1).join(':');
+      const bootId = text(entry.bootId);
+      if (
+        !physicalWorkloadId || seen.has(physicalWorkloadId) || !agentScopeId
+        || !Number.isSafeInteger(rootPid) || rootPid <= 0 || !rootStartTimeTicks
+        || !hostId || !bootId
+      ) continue;
+      seen.add(physicalWorkloadId);
+      result.push({
+        agentScopeId,
+        agentDisplayName: text(entry.agentDisplayName) || agentScopeId,
+        agentInstanceId: physicalWorkloadId,
+        physicalWorkloadId,
+        classification: 'confirmed_agent',
+        runtimeState: 'running',
+        rootPid,
+        rootStartTimeTicks,
+        rootGeneration: 1,
+        hostId,
+        bootId,
+        discoveredAt: observedAt,
+        lastSeenAt: observedAt,
+        confidence: 1,
+        source: 'docker',
+        evidence: Array.isArray(entry.evidence) ? entry.evidence.slice(0, 16) : [],
+        workloadRef: {
+          environment: 'docker',
+          kind: 'container',
+          name: text(entry.containerName) || physicalWorkloadId,
+          containerName: text(entry.containerName) || undefined,
+          containerImage: text(entry.containerImage) || undefined,
+        },
+      });
+    }
+    return result;
+  }
+
   metrics() {
     return {
       ready: this.ready,

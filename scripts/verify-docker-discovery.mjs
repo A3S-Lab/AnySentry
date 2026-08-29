@@ -153,6 +153,58 @@ const labeledSnapshot = dockerSnapshot([
   nodeName: 'node-a',
   hostId: 'host-a',
 });
+const runningLabeledSnapshot = dockerSnapshot([
+  {
+    Id: labeledContainerId,
+    Names: ['/a3s-code-agent'],
+    Image: 'anysentry-agent-runtime-lab:0.1.0',
+    State: 'running',
+    Labels: {
+      'anysentry.io/workload-kind': 'agent',
+      'anysentry.io/agent-id': 'docker-a3s-code-loop',
+    },
+  },
+], {
+  version: 9,
+  nodeName: 'node-a',
+  hostId: 'host-a',
+  bootId: 'boot-a',
+  runtimeById: new Map([[
+    labeledContainerId,
+    { hostPid: 42, rootStartTimeTicks: '4242', cgroupId: '987654' },
+  ]]),
+});
+const runtimeInventoryAt = Date.UTC(2026, 7, 30, 1, 2, 3);
+const runtimeInventoryCache = new WorkloadIdentityCache({ now: () => runtimeInventoryAt });
+assert.equal(runtimeInventoryCache.replace(runningLabeledSnapshot, 'docker'), true);
+assert.deepEqual(runtimeInventoryCache.agentRuntimeInventory(), [{
+  agentScopeId: 'docker-a3s-code-loop',
+  agentDisplayName: 'docker-a3s-code-loop',
+  agentInstanceId: `docker:host-a:${labeledContainerId}`,
+  physicalWorkloadId: `docker:host-a:${labeledContainerId}`,
+  classification: 'confirmed_agent',
+  runtimeState: 'running',
+  rootPid: 42,
+  rootStartTimeTicks: '4242',
+  rootGeneration: 1,
+  hostId: 'host-a',
+  bootId: 'boot-a',
+  discoveredAt: new Date(runtimeInventoryAt).toISOString(),
+  lastSeenAt: new Date(runtimeInventoryAt).toISOString(),
+  confidence: 1,
+  source: 'docker',
+  evidence: [
+    'label:anysentry.io/workload-kind=agent',
+    'label:anysentry.io/agent-id=docker-a3s-code-loop',
+  ],
+  workloadRef: {
+    environment: 'docker',
+    kind: 'container',
+    name: 'a3s-code-agent',
+    containerName: 'a3s-code-agent',
+    containerImage: 'anysentry-agent-runtime-lab:0.1.0',
+  },
+}]);
 const legacyCollectorCache = new WorkloadIdentityCache({
   readProcCgroup(pid) {
     procCgroupReads += 1;

@@ -86,10 +86,15 @@ function dockerRuntimeIdentity(inspect, options = {}) {
     const cgroupPath = relative ? `${cgroupRoot}/${relative}` : cgroupRoot;
     const stat = fs.statSync(cgroupPath, { bigint: true });
     const cgroupId = stat.ino > 0n ? stat.ino.toString() : '';
+    const statLine = fs.readFileSync(`${procRoot}/${hostPid}/stat`, 'utf8').trim();
+    const close = statLine.lastIndexOf(')');
+    const fields = close >= 0 ? statLine.slice(close + 1).trim().split(/\s+/u) : [];
+    const rootStartTimeTicks = fields[19] && /^\d+$/u.test(fields[19]) ? fields[19] : undefined;
     return {
       hostPid,
       cgroupPath: unifiedPath,
       ...(cgroupId ? { cgroupId } : {}),
+      ...(rootStartTimeTicks ? { rootStartTimeTicks } : {}),
     };
   } catch {
     return { hostPid };
@@ -138,6 +143,9 @@ function dockerEntry(container, options = {}) {
     physicalWorkloadId: `docker:${hostId}:${id}`,
     source: 'docker',
     environment: 'docker',
+    hostId,
+    bootId: text(options.bootId) || undefined,
+    containerState: text(container.State || container.state).toLowerCase() || undefined,
     nodeName: text(options.nodeName) || undefined,
     containerName: containerName || undefined,
     containerImage: text(container.Image || container.ImageID || container.image) || undefined,
@@ -219,6 +227,7 @@ class DockerDiscovery {
     }
     this.nodeName = text(options.nodeName);
     this.hostId = text(options.hostId || this.nodeName) || 'local';
+    this.bootId = text(options.bootId);
     this.requestJson =
       options.requestJson ||
       ((requestPath) => defaultRequestJson(this.socketPath, requestPath, this.timeoutMs));
@@ -328,6 +337,7 @@ class DockerDiscovery {
       errors: this.errors,
       nodeName: this.nodeName,
       hostId: this.hostId,
+      bootId: this.bootId,
       now: this.now,
       inspectById: this.inspectById,
       runtimeById: this.runtimeById,
