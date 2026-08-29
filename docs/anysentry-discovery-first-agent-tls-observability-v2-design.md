@@ -1057,11 +1057,11 @@ AnySentry 主要范围：
 | --- | --- | --- | --- |
 | E001 | confirmed fact | 用户本轮确认 | 新中转配置可完成真实文本与工具调用，且不得保存秘密 |
 | E002 | confirmed fact | CLI/config 无泄密检查 | 三个目标的版本、provider 类型和 HTTPS 模式 |
-| E003 | confirmed fact | `tls-profiles.json` | 当前四个精确 profile 的 ABI 与版本边界 |
+| E003 | superseded bootstrap fact | 原 `tls-profiles.json`，现 `tls-signature-families.json` | 产品/版本/hash profile 已移除，只保留 TLS 实现族锚点、ABI 与相对关系 |
 | E004 | confirmed fact | 本机/容器 ELF 有界签名扫描 | Codex 两版唯一锚点对；Claude 三版前缀与近邻关系 |
 | E005 | confirmed fact | Observer attach 日志 | Codex attach、Claude 2.1.251 fingerprint 拒绝 |
 | E006 | confirmed fact | tender Codex 受控工具运行与临时 uprobe | 工具成功、目标 `_ex` ABI 和 HTTP/1 POST 实际命中 |
-| E007 | confirmed fact | host Codex 受控运行与临时 uprobe | 官网登录 Codex 使用同一函数族/HTTP/1，平台 sentinel 缺失 |
+| E007 | corrected by implementation evidence | host Codex 官方发布符号、GDB 有界分类与正式 uprobe | 官网登录 Codex 的模型链使用 Rustls + 压缩 WebSocket；MCP 等旁路仍可能使用 OpenSSL |
 | E008 | confirmed fact | tender Claude 受控工具运行与临时 uprobe | tool_use/result/final 成功，BoringSSL classic/HTTP1 命中，平台缺失 |
 | E009 | confirmed fact | 配置内存解析 | 两个中转模型路径带非默认前缀；未公开实际 path |
 | E010 | confirmed fact | eBPF route 源码 | 当前完整 path hash 和 64 字节 request-line gate |
@@ -1081,3 +1081,87 @@ AnySentry 主要范围：
 ## 附录 B：现场证据清理
 
 本轮创建的临时 uprobe、tracefs instance、bind mount、perf 文件、CLI 结构化输出和 stderr 已全部删除；复核结果：动态诊断 probe=0、临时 trace instance=0、TLS 诊断临时路径=0。真实 Key、URL、认证内容和对话正文未进入本文或 Git。[E019]
+
+## 附录 C：实现与实机验收记录（2026-08-30）
+
+### C.1 最终实现链
+
+```text
+已识别 Agent 进程 / 已确认 Agent workload label
+  ├─ 名称与 ELF 实现族发现（启动加速，不是产品门槛）
+  └─ Docker label → Forwarder 原子 cgroup 清单 → Collector 现存 PID 扫描
+                                      │
+                                      ▼
+动态 OpenSSL/BoringSSL 符号或静态 TLS 实现族边界
+  ├─ SSL_read/write(_ex)
+  └─ Rustls CommonState read/write（实现族锚点 + 相对关系）
+                                      │
+                                      ▼
+有界 Ring → 异步 Collector → Transport Adapter
+  ├─ HTTP/1.1、chunked、gzip、SSE
+  └─ WebSocket upgrade、mask、跨 TLS 分片、permessage-deflate context takeover
+                                      │
+                                      ▼
+Wire Template（与 Agent 产品、URL、模型配置正交）
+  ├─ OpenAI Responses / Chat Completions
+  ├─ Anthropic Messages / Gemini / MCP JSON-RPC
+  ├─ Responses custom_tool_call / custom_tool_call_output
+  └─ generic-http-tool / unknown evidence
+                                      │
+                                      ▼
+Interaction + 三层完整性 + 四个时间边界
+  → Forwarder/WAL → AnySentry/ClickHouse
+  → product-aware Agent Directory → Conversation Timeline / Inspector
+```
+
+最终运行时不检查 Codex/Claude/Kimi 的产品版本，不检查整文件或头部 hash，不要求官网
+Host/path，不读取模型名决定 TLS attach，也不因自定义 base URL 拒绝正文。静态签名清单中只
+保留 `implementationFamily/readAnchor/writeAnchor/ABI/writeAfterReadOffsets`；两个 Codex 发布
+样本只用于证明 Rustls 锚点和 `-5248` 关系稳定，不成为运行时条件。
+
+### C.2 关键实现纠偏
+
+1. **Rustls WebSocket**：真实 Codex 先发送 HTTP/1.1 Upgrade，随后使用客户端 mask、服务端
+   非 mask 和 permessage-deflate context takeover。Transport Adapter 支持帧跨 TLS 调用、
+   context 跨 message、控制帧和硬上限。
+2. **移动的 Rustls 对象**：同一连接在握手写、101 读和应用帧阶段出现不同 `CommonState`
+   地址。Collector 用同 PID/cgroup 下唯一 GET/101/合法帧关系建立有界 alias；存在多个候选
+   时不猜测、不合并。
+3. **复合镜像**：Observer 生产镜像必须保留 Node supervisor、Forwarder、WAL、身份和控制面
+   脚本。Collector artifact 与 scripts artifact 都有单独 Dockerfile；本地镜像固定 digest，
+   不再用纯 Collector 镜像覆盖复合运行时。
+4. **同容器多 Agent**：模板优先、精确进程根次之、workload 只拥有物理 placement。Codex、
+   Claude、Pi 等即使共用一个 Docker 容器，也获得不同 logical asset/root instance；旧物理
+   asset 仅作为 alias。
+5. **预存 Python worker**：Forwarder 从精确 Docker Agent label 原子发布观察专用 cgroup
+   清单；Collector 严格解析并每 2 秒扫描现存/新增 PID。该清单只能增加 TLS 观察，不能授予
+   enforcement，也不能绕过正文预算和模板校验。
+6. **深链优先级**：URL 中已有 `conversationId` 时，页面先反查所属 logical Agent，再同步
+   `logicalAgentId`；初始 hot-ring 不完整时也不会永久锁定第一个运行中 asset-only Agent。
+
+### C.3 实机矩阵
+
+| 对象 | TLS / Transport | Wire / Tool | 实测结果 |
+| --- | --- | --- | --- |
+| 宿主机 Codex（官方登录） | Rustls / 压缩 WebSocket | Responses + custom tool | 两轮完整：请求、回复、tool call、同 callId result、四个时间边界 |
+| 容器 Codex（自定义中转） | 静态 OpenSSL `_ex` / HTTP/1.1 | Responses | 自定义 URL 正常；成功回复和额度错误重试均可见 |
+| 容器 Claude Code（自定义中转） | BoringSSL classic / HTTP/1.1 | Anthropic Messages | 成功回复与 HTTP 429 错误链均可见，时间/内容完整 |
+| Pi 交互 CLI | Node/OpenSSL / HTTP/1.1 | Chat Completions | 稳定交互进程请求/回复完整；短于身份建立窗口的 2 秒一次性进程不作为负结论 |
+| LangChain HTTP Agent | Python/OpenSSL / HTTP/1.1 | Chat Completions tool lifecycle | 同一 asset/root 下 tool_pending → result/final 两轮，时间与 callId 对齐 |
+| Dify workflow | Python/OpenSSL / HTTP/1.1 | Chat Completions + generic HTTP tool | 预存 worker 无需重启；最终上下文进入模型请求，HTTPS tool 指令/结果/时间完整 |
+
+当前没有宣称 Kimi CLI 实机通过。Kimi 继续复用 `Agent Scope → TLS implementation family →
+Transport → Wire Template` 的 Phase 0 流程；未命中的实现族/HTTP2/QUIC 保留 metadata evidence，
+而不是新增产品版本或 URL 白名单。
+
+### C.4 验收结果
+
+- Observer：120 项 Collector 测试、核心/公共 ABI/契约测试、`clippy -D warnings`、release build、
+  双版本 Rustls 实二进制扫描和仓库卫生检查通过；
+- AnySentry：Agent semantic identity、Interaction、Conversation Directory、Forwarder accounting、
+  supervisor、deployment manifest、TLS cgroup publication和仓库卫生检查通过；
+- 浏览器：真实历史 Codex conversation deep link；1440/1024/390 px timeline/Inspector 通过，
+  页面级横向溢出=false，runtime exception=0，network failure=0；
+- 读取权限：Interaction/Conversation/Timeline 不需要 management token；
+- 部署：AnySentry 与 Observer 均使用 registry digest，最终 Pod Ready 且重启数为 0；
+- 内容安全：仓库/镜像不包含测试 Key、实际中转 URL、私有评审文稿、验证 JSON 或截图源文件。
