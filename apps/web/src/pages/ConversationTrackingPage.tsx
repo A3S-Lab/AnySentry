@@ -418,6 +418,41 @@ function Timeline({
   }, [events]);
 
   if (!conversation) {
+    if (agent) {
+      return (
+        <section className="h-full min-h-0 bg-[#0b0f0c]" aria-label="运行中 Agent 诊断">
+          <div className="flex min-h-16 items-center gap-3 border-b border-white/10 px-3 py-2 sm:px-4">
+            <Button type="button" variant="ghost" size="icon" onClick={onBack} aria-label="返回 Agent 目录" className="size-11 text-zinc-400 hover:bg-white/5 hover:text-zinc-100 md:hidden">
+              <ArrowLeft className="size-4" />
+            </Button>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <h2 className="truncate text-sm font-semibold text-zinc-100">{agent.displayName}</h2>
+                <Pill className="border-teal-400/20 bg-teal-500/[0.07] text-teal-100">
+                  {agent.lifecycleState === "running" ? "运行中" : "连接待确认"}
+                </Pill>
+              </div>
+              <p className="mt-1 truncate font-mono text-[10px] text-zinc-500">{agent.workspacePath}</p>
+            </div>
+            <CoverageBadge status={agent.coverage.status} />
+          </div>
+          <div className="flex h-[calc(100%-4rem)] items-center justify-center px-6 text-center">
+            <div className="max-w-lg">
+              <CircleDashed className="mx-auto size-9 text-zinc-600" aria-hidden="true" />
+              <h3 className="mt-4 text-sm font-semibold text-zinc-100">Agent 正在运行，尚无可展示的模型会话</h3>
+              <p className="mt-2 text-xs leading-5 text-zinc-500">
+                当前目录由 runtime snapshot 直接确认，不会为了填充页面伪造会话。发生模型调用后，会话会自动出现在这里；若只看到明文 metadata，覆盖状态会明确显示 transport 或 template 待解析。
+              </p>
+              <div className="mt-4 flex flex-wrap justify-center gap-2">
+                <Pill className="border-white/10 bg-white/[0.035] text-zinc-300">{agent.activeInstanceCount} 个活动实例</Pill>
+                <Pill className="border-white/10 bg-white/[0.035] text-zinc-300">{agent.product}</Pill>
+                <Pill className="border-white/10 bg-white/[0.035] text-zinc-300">{agent.environment}</Pill>
+              </div>
+            </div>
+          </div>
+        </section>
+      );
+    }
     return (
       <section className="flex h-full min-h-0 items-center justify-center bg-[#0b0f0c] px-6 text-center">
         <div>

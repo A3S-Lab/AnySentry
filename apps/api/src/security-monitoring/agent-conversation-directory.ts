@@ -74,6 +74,27 @@ function compareUnixNs(left?: string, right?: string): number {
   return leftNs === rightNs ? 0 : leftNs > rightNs ? -1 : 1;
 }
 
+function runtimeEnvironment(
+  instance: T.AgentRuntimeInstanceRecord,
+): T.LogicalAgentConversationDirectoryItem['environment'] {
+  if (instance.workloadRef?.environment) return instance.workloadRef.environment;
+  const physical = normalized(instance.physicalWorkloadId);
+  if (physical.includes('docker') || physical.includes('container')) return 'docker';
+  if (physical.includes('kubernetes') || physical.includes('pod')) return 'kubernetes';
+  return 'host';
+}
+
+function runtimeWorkspace(instance: T.AgentRuntimeInstanceRecord): string {
+  return canonicalWorkspace(
+    instance.workspacePath
+      ?? (instance.agentScopeId ? 'agent-scope:' + instance.agentScopeId : undefined),
+  );
+}
+
+function runtimeActivityUnixNs(instance: T.AgentRuntimeInstanceRecord): string {
+  return (BigInt(instance.lastActivityAt ?? instance.lastSeenAt) * 1_000_000n).toString();
+}
+
 export function projectAgentConversationDirectory(
   conversations: T.AgentConversationSummary[],
   runtimeInstances: T.AgentRuntimeInstanceRecord[],
@@ -89,6 +110,7 @@ export function projectAgentConversationDirectory(
     groups.set(id, items);
   }
 
+  const consumedRuntime = new Set<string>();
   const directory = [...groups.entries()].map(([id, grouped]) => {
     const conversations = [...grouped].sort((left, right) =>
       compareUnixNs(left.lastActivityAtUnixNs, right.lastActivityAtUnixNs)
@@ -99,14 +121,17 @@ export function projectAgentConversationDirectory(
     const agentInstanceIds = [...new Set(conversations.flatMap((item) => item.agentInstanceIds))];
     const agentAssetIds = [...new Set(conversations.map((item) => item.agentAssetId))];
     const instanceSet = new Set(agentInstanceIds);
-    const matchingRuntime = runtimeInstances.filter((instance) =>
-      instanceSet.has(instance.agentInstanceId)
-      || (
-        instanceSet.size === 0
-        && canonicalWorkspace(instance.workspacePath) === workspacePath
-        && canonicalProduct(instance.agentDisplayName) === product
-      ));
-    for (const instance of matchingRuntime) instanceSet.add(instance.agentInstanceId);
+    let matchingRuntime = runtimeInstances.filter((instance) =>
+      instanceSet.has(instance.agentInstanceId));
+    if (matchingRuntime.length === 0) {
+      matchingRuntime = runtimeInstances.filter((instance) =>
+        runtimeWorkspace(instance) === workspacePath
+        && canonicalProduct(instance.agentDisplayName) === product);
+    }
+    for (const instance of matchingRuntime) {
+      instanceSet.add(instance.agentInstanceId);
+      consumedRuntime.add(instance.agentInstanceId);
+    }
     const running = matchingRuntime.filter((instance) => instance.runtimeState === 'running');
     const unobserved = matchingRuntime.filter((instance) => instance.runtimeState === 'unobserved');
     const lifecycleState: T.LogicalAgentConversationDirectoryItem['lifecycleState'] = running.length
@@ -133,6 +158,57 @@ export function projectAgentConversationDirectory(
       coverage: coverageRollup(conversations),
     } satisfies T.LogicalAgentConversationDirectoryItem;
   });
+
+  const runtimeGroups = new Map<string, T.AgentRuntimeInstanceRecord[]>();
+  for (const instance of runtimeInstances) {
+    if (consumedRuntime.has(instance.agentInstanceId)) continue;
+    const product = canonicalProduct(instance.agentDisplayName);
+    const environment = runtimeEnvironment(instance);
+    const workspacePath = runtimeWorkspace(instance);
+    const id = logicalAgentId(product, environment, workspacePath);
+    const items = runtimeGroups.get(id) ?? [];
+    items.push(instance);
+    runtimeGroups.set(id, items);
+  }
+  for (const [id, instances] of runtimeGroups) {
+    const first = instances[0];
+    const product = canonicalProduct(first.agentDisplayName);
+    const environment = runtimeEnvironment(first);
+    const workspacePath = runtimeWorkspace(first);
+    const running = instances.filter((instance) => instance.runtimeState === 'running');
+    const unobserved = instances.filter((instance) => instance.runtimeState === 'unobserved');
+    const lifecycleState: T.LogicalAgentConversationDirectoryItem['lifecycleState'] = running.length
+      ? 'running'
+      : unobserved.length ? 'unobserved' : 'historical';
+    const lastActivityAtUnixNs = instances
+      .map(runtimeActivityUnixNs)
+      .sort((left, right) => compareUnixNs(left, right))[0];
+    directory.push({
+      logicalAgentId: id,
+      groupingQuality: workspacePath === 'workspace:unknown' ? 'inferred' : 'strong',
+      product,
+      displayName: first.agentDisplayName || product + ' · ' + workspacePath,
+      environment,
+      workspacePath,
+      lifecycleState,
+      activeInstanceCount: running.length + unobserved.length,
+      totalInstanceCount: instances.length,
+      conversationCount: 0,
+      lastActivityAtUnixNs,
+      agentAssetIds: [],
+      agentInstanceIds: instances.map((instance) => instance.agentInstanceId),
+      conversations: [],
+      coverage: {
+        status: 'asset_only',
+        reasons: ['runtime_instance_without_conversation'],
+        completeInteractions: 0,
+        partialInteractions: 0,
+        lastEvidenceAt: new Date(
+          Math.max(...instances.map((instance) => instance.lastSeenAt)),
+        ).toISOString(),
+      },
+    });
+  }
 
   return directory
     .filter((item) =>

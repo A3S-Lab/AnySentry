@@ -87,13 +87,20 @@ const items = projectAgentConversationDirectory([
   runtime('instance-a', 'running'),
   runtime('instance-b', 'running'),
   runtime('instance-claude', 'exited', 'claude'),
+  {
+    ...runtime('instance-langchain', 'running', 'LangChain'),
+    workspacePath: undefined,
+    agentScopeId: 'langchain-runtime',
+  },
 ], 'all');
 
-assert.equal(items.length, 2);
+assert.equal(items.length, 3);
 const codex = items.find((item) => item.product === 'Codex');
 const claude = items.find((item) => item.product === 'Claude Code');
+const langchain = items.find((item) => item.product === 'LangChain');
 assert(codex);
 assert(claude);
+assert(langchain);
 assert.equal(codex.lifecycleState, 'running');
 assert.equal(codex.activeInstanceCount, 2);
 assert.equal(codex.totalInstanceCount, 2);
@@ -101,13 +108,35 @@ assert.equal(codex.conversationCount, 2);
 assert.deepEqual(codex.agentAssetIds.sort(), ['asset-codex-a', 'asset-codex-b']);
 assert.equal(codex.conversations[0].conversationId, 'cv-codex-b');
 assert.equal(claude.lifecycleState, 'historical');
+assert.equal(langchain.lifecycleState, 'running');
+assert.equal(langchain.conversationCount, 0);
+assert.equal(langchain.conversations.length, 0);
 
 const runningOnly = projectAgentConversationDirectory(
   items.flatMap((item) => item.conversations),
-  [runtime('instance-a', 'running'), runtime('instance-b', 'running')],
+  [
+    runtime('instance-a', 'running'),
+    runtime('instance-b', 'running'),
+    {
+      ...runtime('instance-langchain', 'running', 'LangChain'),
+      workspacePath: undefined,
+      agentScopeId: 'langchain-runtime',
+    },
+  ],
   'running',
 );
-assert.equal(runningOnly.length, 1);
-assert.equal(runningOnly[0].product, 'Codex');
+assert.equal(runningOnly.length, 2);
+assert.deepEqual(runningOnly.map((item) => item.product).sort(), ['Codex', 'LangChain']);
+
+const aliasFallback = projectAgentConversationDirectory([
+  conversation({
+    conversationId: 'cv-codex-legacy',
+    agentAssetId: 'asset-codex-legacy',
+    agentInstanceIds: ['legacy-instance-id'],
+    at: '1788000000000000004',
+  }),
+], [runtime('current-runtime-id', 'running')], 'all');
+assert.equal(aliasFallback[0].lifecycleState, 'running');
+assert.equal(aliasFallback[0].activeInstanceCount, 1);
 
 console.log('agent conversation directory verification passed');
