@@ -1864,7 +1864,16 @@ export class AggregationService {
     const agentAssetId = requestedAsset
       ? this.agentMetadata.canonicalAgentAssetId(requestedAsset)
       : undefined;
-    const query = { ...filter, agentAssetId, startMs: window.startMs, endMs: window.endMs };
+    // interactionId is globally unique and is the stronger lookup key. An asset recorded before
+    // identity reconciliation may now resolve to a newer canonical ID, so prefiltering durable
+    // rows by that canonical ID can hide the exact historical interaction. Resolve the strong ID
+    // first, then enforce canonical asset equivalence below.
+    const query = {
+      ...filter,
+      agentAssetId: filter.interactionId ? undefined : agentAssetId,
+      startMs: window.startMs,
+      endMs: window.endMs,
+    };
     const persisted = await this.judge.storedAgentInteractions(query);
     const merged = new Map<string, T.AgentInteractionRecord>();
     for (const item of persisted ?? []) merged.set(item.interactionId, item);
@@ -1879,7 +1888,9 @@ export class AggregationService {
         return review ? { ...item, currentEffectiveClassification: review.decision } : item;
       })
       .filter((item) =>
-        (!agentAssetId || item.agentAssetId === agentAssetId)
+        (!agentAssetId
+          || item.agentAssetId === requestedAsset
+          || this.agentMetadata.canonicalAgentAssetId(item.agentAssetId) === agentAssetId)
         && (!filter.agentInstanceId || item.agentInstanceId === filter.agentInstanceId)
         && (!filter.interactionId || item.interactionId === filter.interactionId)
         && (!filter.interactionType || item.interactionType === filter.interactionType)

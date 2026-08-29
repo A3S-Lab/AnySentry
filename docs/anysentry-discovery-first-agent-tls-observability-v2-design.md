@@ -1139,7 +1139,8 @@ Host/path，不读取模型名决定 TLS attach，也不因自定义 base URL �
 6. **深链优先级**：URL 中已有 `conversationId` 时，页面先反查所属 logical Agent，再同步
    `logicalAgentId`；API 以 conversation ID 的全局有界投影为解析基准，asset/instance/model 只做
    投影后的归属校验，避免预过滤改变 inferred conversation 的首条锚点；初始 hot-ring 不完整时
-   也不会永久锁定第一个运行中 asset-only Agent。
+   也不会永久锁定第一个运行中 asset-only Agent。Inspector 同样先按全局唯一 interaction ID
+   读取，再对新旧 asset alias 做 canonical 等价校验，避免身份归并后历史正文不可见。
 7. **目录占位路径归并**：`agent://<container>`、`agent-scope:*` 和未知 workspace 是发现阶段的
    系统占位值，不是用户工作区。目录按 `canonical product + environment + product scope` 将其
    归并为一个 logical Agent，并在实例层保留容器/PID 差异；真实项目目录仍按 workspace 分组。

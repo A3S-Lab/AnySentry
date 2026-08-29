@@ -101,6 +101,18 @@ assert.ok(scopedTimeline.items.length > 0,
   'conversationId must remain resolvable when its owning agentAssetId is supplied');
 assert.ok(JSON.stringify(scopedTimeline).includes(marker),
   'scoped conversation timeline must retain the selected plaintext marker');
+const scopedInteractionId = scopedTimeline.interactionIds.at(-1);
+assert.ok(scopedInteractionId, 'conversation timeline must retain its Interaction references');
+const scopedInteraction = await api('/agents/interactions', {
+  timeType: 'last_30d',
+  scope: 'agent',
+  classificationView: 'current_effective',
+  agentAssetId: conversation.agentAssetId,
+  interactionId: scopedInteractionId,
+  limit: 1,
+});
+assert.equal(scopedInteraction.items[0]?.interactionId, scopedInteractionId,
+  'interactionId must remain resolvable through a reconciled Agent asset alias');
 
 const port = await freePort();
 const chrome = spawn(chromeBinary, [
