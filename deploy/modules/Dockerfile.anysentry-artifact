@@ -1,0 +1,7 @@
+# Fast immutable delivery layer for a source tree whose dependency lockfile is unchanged.
+# The caller stages only freshly built `apps/api/dist` and `apps/web/dist` as `api-dist/` and
+# `web-dist/`; no source, local configuration, review artifact, or dependency tree enters context.
+ARG ANYSENTRY_RUNTIME_BASE=anysentry:latest
+FROM ${ANYSENTRY_RUNTIME_BASE}
+COPY api-dist/ /app/dist/
+COPY web-dist/ /app/web/
