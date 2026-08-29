@@ -104,6 +104,9 @@ spec:
             # Atomically published decisions feed the Collector's observation-only cgroup map.
             - { name: ANYSENTRY_FILTER_RULES_FILE, value: "/run/anysentry-filter/filter-rules.json" }
             - { name: ANYSENTRY_FILTER_RULES_ACK_FILE, value: "/run/anysentry-filter/filter-rules.ack.json" }
+            # Docker label discovery publishes a separate observation-only TLS admission scope.
+            # It never grants enforcement or bypasses the bounded plaintext/protocol gates.
+            - { name: ANYSENTRY_TLS_AGENT_CGROUPS_FILE, value: "/run/anysentry-filter/tls-agent-cgroups.json" }
             # The co-located Collector and Forwarder inherit the same rollout mode. Shadow emits
             # desired intent/ACK telemetry while keeping every probe FULL.
             - { name: ANYSENTRY_CAPTURE_PROFILE_MODE, value: "shadow" }

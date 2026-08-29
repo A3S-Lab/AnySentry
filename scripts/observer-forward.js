@@ -43,6 +43,7 @@ const { CaptureProfileReporter } = require('./observer-capture-profile-reporter'
 const { FileAccessAggregator } = require('./observer-file-aggregation');
 const { ForwarderPipelineAccounting } = require('./observer-pipeline-accounting');
 const { UnifiedFilterPolicyRegistry } = require('./observer-unified-filter-policy');
+const { TlsAgentCgroupPublisher } = require('./observer-tls-agent-cgroups');
 
 // Only immutable, software-versioned rules may override the generic lifecycle discovery
 // guardrail. User-created SUPPRESS rules can never add an ID to this closed set.
@@ -315,6 +316,8 @@ let NOISE_POLICY = ['balanced', 'include'].includes(process.env.FORWARD_NOISE_PO
   : 'balanced';
 const DROP_PATHS = (process.env.FORWARD_DROP_PATHS || '/sys/,/proc/,/run/,/dev/').split(',').map((s) => s.trim()).filter(Boolean);
 const FILTER_RULES_FILE = text(process.env.ANYSENTRY_FILTER_RULES_FILE);
+const TLS_AGENT_CGROUPS_FILE = text(process.env.ANYSENTRY_TLS_AGENT_CGROUPS_FILE)
+  || (FILTER_RULES_FILE ? path.join(path.dirname(FILTER_RULES_FILE), 'tls-agent-cgroups.json') : '');
 const CAPTURE_PROFILE_MODE = ['legacy', 'shadow', 'enforce'].includes(
   text(process.env.ANYSENTRY_CAPTURE_PROFILE_MODE).toLowerCase(),
 )
@@ -546,6 +549,7 @@ const filterRulePublisher = new FilterRulePublisher({
   maxProbableEntries: process.env.ANYSENTRY_PROBABLE_PROFILE_MAX_ENTRIES,
   maxSnapshotBytes: process.env.ANYSENTRY_CAPTURE_PROFILE_MAX_SNAPSHOT_BYTES,
 });
+const tlsAgentCgroupPublisher = new TlsAgentCgroupPublisher({ file: TLS_AGENT_CGROUPS_FILE });
 let lastCaptureProfileReportError = '';
 const captureProfileReporter = new CaptureProfileReporter({
   publisher: filterRulePublisher,
@@ -3477,6 +3481,7 @@ async function start() {
     infrastructurePolicyTimer.unref();
   }
   const dockerStarted = await dockerDiscovery.start((snapshot) => {
+    tlsAgentCgroupPublisher.publish(snapshot);
     if (workloadCache.replace(snapshot, 'docker')) synchronizeInfrastructurePolicyRules();
   });
   if (closing) return;

@@ -632,6 +632,7 @@ function verifyObserverManifest() {
       /ANYSENTRY_FILTER_RULE_PROJECTION_URL[\s\S]*?filter-rules\/projections\/forwarder/u.test(daemonSet?.source ?? '') &&
       /ANYSENTRY_FILTER_RULE_PROJECTION_SECS,\s*value:\s*"5"/u.test(daemonSet?.source ?? '') &&
       /ANYSENTRY_FILTER_RULE_PROJECTION_MAX_BYTES,\s*value:\s*"16777216"/u.test(daemonSet?.source ?? '') &&
+      /ANYSENTRY_TLS_AGENT_CGROUPS_FILE[\s\S]*?tls-agent-cgroups\.json/u.test(daemonSet?.source ?? '') &&
       /ANYSENTRY_CAPTURE_PROFILE_ACK_POLL_MS,\s*value:\s*"250"/u.test(daemonSet?.source ?? ''),
     daemonSet?.source,
   );
