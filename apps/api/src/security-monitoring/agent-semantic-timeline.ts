@@ -200,10 +200,32 @@ export function semanticItemsForInteraction(
   return items;
 }
 
-function preview(value: unknown, limit = 320): string | undefined {
+function preview(value: unknown, limit = 320, depth = 0): string | undefined {
+  if (depth > 5) return undefined;
   let output: string | undefined;
   if (typeof value === 'string') output = value.replace(/\s+/gu, ' ').trim();
-  else if (value !== undefined) {
+  else if (Array.isArray(value)) {
+    output = value
+      .map((item) => preview(item, limit, depth + 1))
+      .filter((item): item is string => Boolean(item))
+      .join(' ');
+  } else if (value && typeof value === 'object') {
+    const item = value as Record<string, unknown>;
+    const direct = item.text
+      ?? item.input_text
+      ?? item.output_text
+      ?? item.content
+      ?? item.result
+      ?? item.output;
+    if (direct !== undefined && direct !== value) output = preview(direct, limit, depth + 1);
+    else {
+      try {
+        output = JSON.stringify(value);
+      } catch {
+        output = undefined;
+      }
+    }
+  } else if (value !== undefined) {
     try {
       output = JSON.stringify(value);
     } catch {

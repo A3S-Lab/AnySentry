@@ -1,6 +1,6 @@
 import dayjs from "dayjs";
 import { Bot, Boxes, ChevronRight, Cpu, MessageSquareText } from "lucide-react";
-import { type KeyboardEvent, useMemo, useRef, useState } from "react";
+import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 
 import type {
   AgentConversationSummary,
@@ -86,6 +86,13 @@ export function LogicalAgentNavigator({
     ...items.filter((item) => item.lifecycleState !== "historical"),
     ...items.filter((item) => item.lifecycleState === "historical"),
   ], [items]);
+  useEffect(() => {
+    if (!selectedLogicalAgentId) return;
+    const frame = window.requestAnimationFrame(() => {
+      refs.current.get(selectedLogicalAgentId)?.scrollIntoView({ block: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [selectedLogicalAgentId]);
   const move = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
