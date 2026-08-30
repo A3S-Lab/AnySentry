@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 const { IngestionSourceService } = await import(
   '../apps/api/dist/security-monitoring/ingestion-source.service.js'
@@ -153,5 +154,12 @@ function clearScheduledPersistence(service) {
   assert.equal(directory.dirtyWorkspaceIds.size, 0);
   assert.equal(directory.dirtyBindingIds.size, 0);
 }
+
+const relationalSource = readFileSync(
+  new URL('../apps/api/src/security-monitoring/relational-business-store.service.ts', import.meta.url),
+  'utf8',
+);
+assert.match(relationalSource, /pool\.on\('connect',[\s\S]*client\.on\('error'/u,
+  'every physical PostgreSQL client must retain an error listener while checked out');
 
 console.log('Persistence single-flight verification passed');

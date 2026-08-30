@@ -1270,6 +1270,16 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     pool.on('error', (error) => {
       this.markUnavailable('handle an idle PostgreSQL client failure', error);
     });
+    // Pool-level errors cover idle clients only. While a client is checked out for a transaction,
+    // node-postgres emits connection termination on the Client itself; without a permanent
+    // listener PostgreSQL restart/failover becomes an uncaught EventEmitter error and exits the
+    // whole API process. Attach once when each physical client is created and keep query-level
+    // rollback/fallback handling unchanged.
+    pool.on('connect', (client) => {
+      client.on('error', (error) => {
+        this.markUnavailable('handle an active PostgreSQL client failure', error);
+      });
+    });
 
     try {
       await pool.query('SELECT 1');
