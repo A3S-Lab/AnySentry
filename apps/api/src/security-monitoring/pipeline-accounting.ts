@@ -42,6 +42,8 @@ export const PIPELINE_STAGE_REASONS: Readonly<Record<string, readonly string[]>>
     'serialization_error',
     'event_too_large',
     'outstanding_limit',
+    'protected_reserve',
+    'wal_pending_capacity',
     'priority_evicted',
     'queue_rejected',
     'retry_exhausted',

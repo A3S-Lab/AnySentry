@@ -118,6 +118,8 @@ const normalizedForwarder = normalizePipelineAccounting(forwarder(1, {
 assert.equal(normalizedForwarder.backlog.outstandingEvents, 4);
 assert.equal(normalizedForwarder.stages.length, 2);
 assert.equal(isKnownPipelineStageReason('received', 'input'), true);
+assert.equal(isKnownPipelineStageReason('queue_dropped', 'protected_reserve'), true);
+assert.equal(isKnownPipelineStageReason('queue_dropped', 'wal_pending_capacity'), true);
 assert.equal(isKnownPipelineStageReason('future_bounded_stage', 'future_reason'), false);
 const unknownExtensionHealth = summarizePipelineAccounting([{
   at: 1_700_000_011_000,

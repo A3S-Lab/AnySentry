@@ -25,6 +25,7 @@ accounting.record('filtered', 'deduplicated');
 accounting.record('aggregated', 'file_access_coalesced', 2);
 accounting.record('queue_admitted', 'event', 2);
 accounting.record('queue_dropped', 'outstanding_limit');
+accounting.record('queue_dropped', 'wal_pending_capacity');
 accounting.record('api_retained', 'ack');
 accounting.record('api_discarded', 'ack');
 accounting.record('api_rejected', 'ack');
@@ -53,6 +54,12 @@ assert.equal(first.stages.find((stage) => stage.stage === 'received').count, 5);
 assert.equal(first.stages.find((stage) => stage.stage === 'parse_error').count, 1);
 assert.equal(first.stages.find((stage) => stage.stage === 'aggregated').count, 2);
 assert.equal(first.stages.find((stage) => stage.stage === 'queue_admitted').count, 2);
+assert.equal(first.stages.find((stage) => stage.stage === 'queue_dropped').count, 2);
+assert.equal(
+  first.stages.find((stage) => stage.stage === 'queue_dropped')
+    .reasons.find((reason) => reason.reason === 'wal_pending_capacity').count,
+  1,
+);
 assert.equal(first.stages.find((stage) => stage.stage === 'api_retained').count, 1);
 assert.equal(first.stages.find((stage) => stage.stage === 'api_discarded').count, 1);
 assert.equal(first.stages.find((stage) => stage.stage === 'api_rejected').count, 1);

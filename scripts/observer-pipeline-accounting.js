@@ -31,6 +31,7 @@ const STAGE_REASONS = Object.freeze({
     'event_too_large',
     'outstanding_limit',
     'protected_reserve',
+    'wal_pending_capacity',
     'priority_evicted',
     'queue_rejected',
     'retry_exhausted',
