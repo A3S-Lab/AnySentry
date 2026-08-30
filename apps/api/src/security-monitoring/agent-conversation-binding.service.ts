@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 
 import type * as T from './types';
 import type { AgentConversationProjection } from './agent-conversation';
+import { humanVisibleUserContent } from './agent-semantic-timeline';
 import { RelationalBusinessStore } from './relational-business-store.service';
 
 export const AGENT_CONVERSATION_RESOLVER_VERSION = 1;
@@ -23,18 +24,10 @@ function canonicalJson(value: unknown): string {
     `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(',')}}`;
 }
 
-function visibleUserContent(content: unknown): unknown {
-  if (!Array.isArray(content)) return content;
-  const visible = content.filter((part) =>
-    !part || typeof part !== 'object' || Array.isArray(part)
-    || (part as Record<string, unknown>).type !== 'tool_result');
-  return visible.length ? visible : undefined;
-}
-
 function userLineage(record: T.AgentInteractionRecord): string[] {
   return (record.request.messages ?? [])
     .filter((message) => ['user', 'human'].includes(message.role.toLowerCase()))
-    .map((message) => visibleUserContent(message.content))
+    .map((message) => humanVisibleUserContent(message.content))
     .filter((content) => content !== undefined)
     .map((content) => createHash('sha256').update(canonicalJson(content)).digest('hex'));
 }

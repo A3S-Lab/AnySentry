@@ -107,9 +107,19 @@ function semanticItemId(interactionId: string, kind: string, sequence: number): 
     .slice(0, 24)}`;
 }
 
-function userVisibleContent(content: unknown): unknown {
-  if (!Array.isArray(content)) return content;
-  const visible = content.filter((part) => record(part)?.type !== 'tool_result');
+function runtimeContextPart(value: unknown): boolean {
+  const item = record(value);
+  const valueText = typeof value === 'string'
+    ? value.trim()
+    : typeof item?.text === 'string' ? item.text.trim() : undefined;
+  return Boolean(valueText && ['environment_context', 'system-reminder'].some((tag) =>
+    valueText.startsWith(`<${tag}>`) && valueText.endsWith(`</${tag}>`)));
+}
+
+export function humanVisibleUserContent(content: unknown): unknown {
+  if (!Array.isArray(content)) return runtimeContextPart(content) ? undefined : content;
+  const visible = content.filter((part) =>
+    record(part)?.type !== 'tool_result' && !runtimeContextPart(part));
   return visible.length ? visible : undefined;
 }
 
@@ -117,7 +127,13 @@ function userVisibleContent(content: unknown): unknown {
 export function semanticItemsForInteraction(
   interaction: T.AgentInteractionRecord,
 ): T.AgentInteractionSemanticItem[] {
-  if (interaction.semanticItems?.length) return interaction.semanticItems;
+  if (interaction.semanticItems?.length) {
+    return interaction.semanticItems.flatMap((item) => {
+      if (item.kind !== 'user_message') return [item];
+      const content = humanVisibleUserContent(item.content);
+      return content === undefined ? [] : [{ ...item, content }];
+    });
+  }
   const items: T.AgentInteractionSemanticItem[] = [];
   const push = (
     actor: T.AgentInteractionSemanticActor,
@@ -146,7 +162,7 @@ export function semanticItemsForInteraction(
 
   for (const message of interaction.request.messages ?? []) {
     if (!['user', 'human'].includes(message.role.toLowerCase())) continue;
-    const content = userVisibleContent(message.content);
+    const content = humanVisibleUserContent(message.content);
     if (content !== undefined) {
       push('user', 'user_message', 'request', interaction.startedAtUnixNs, content);
     }

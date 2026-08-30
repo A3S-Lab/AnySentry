@@ -1,7 +1,10 @@
 import { createHash } from 'node:crypto';
 
 import type * as T from './types';
-import { normalizedModelResponseText } from './agent-semantic-timeline';
+import {
+  humanVisibleUserContent,
+  normalizedModelResponseText,
+} from './agent-semantic-timeline';
 
 const PREVIEW_CHARACTERS = 320;
 const GENERIC_SESSION_IDS = new Set([
@@ -242,13 +245,7 @@ function deduplicateToolEvidence(
 function userMessageLineage(record: T.AgentInteractionRecord): string[] {
   return requestMessages(record)
     .filter((message) => message.role.toLowerCase() === 'user')
-    .map((message) => {
-      if (!Array.isArray(message.content)) return message.content;
-      const visible = message.content.filter((part) =>
-        !part || typeof part !== 'object' || Array.isArray(part)
-        || (part as Record<string, unknown>).type !== 'tool_result');
-      return visible.length ? visible : undefined;
-    })
+    .map((message) => humanVisibleUserContent(message.content))
     .filter((content) => content !== undefined)
     .map((message) => createHash('sha256')
       .update(JSON.stringify(message ?? null))

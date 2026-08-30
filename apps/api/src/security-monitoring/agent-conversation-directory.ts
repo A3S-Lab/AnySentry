@@ -291,7 +291,8 @@ export function enrichAgentConversationDirectoryV2(
     const instances = runtimeInstances
       .filter((instance) => runtimeIdentityIds(instance).some((identity) => identities.has(identity)))
       .sort((left, right) => right.lastSeenAt - left.lastSeenAt);
-    const activeConversations = agent.conversations.filter((conversation) => {
+    const contentConversations = agent.conversations.filter((conversation) => conversation.hasContent);
+    const activeConversations = contentConversations.filter((conversation) => {
       if (!conversation.lastActivityAtUnixNs) return false;
       try {
         return now - Number(BigInt(conversation.lastActivityAtUnixNs) / 1_000_000n) <= 5 * 60_000;
@@ -313,10 +314,10 @@ export function enrichAgentConversationDirectoryV2(
       },
       conversationCounts: {
         active: activeConversations,
-        dormant: Math.max(0, agent.conversationCount - activeConversations),
-        incomplete: agent.conversations.filter((conversation) =>
+        dormant: Math.max(0, contentConversations.length - activeConversations),
+        incomplete: contentConversations.filter((conversation) =>
           conversation.coverage.status !== 'complete').length,
-        total: agent.conversationCount,
+        total: contentConversations.length,
       },
       recentInstances: instances.slice(0, 100),
     };

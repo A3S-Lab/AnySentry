@@ -5,7 +5,10 @@ import {
   projectAgentConversations,
   projectConversationTimeline,
 } from '../apps/api/dist/security-monitoring/agent-conversation.js';
-import { projectSemanticConversationTimeline } from '../apps/api/dist/security-monitoring/agent-semantic-timeline.js';
+import {
+  projectSemanticConversationTimeline,
+  semanticItemsForInteraction,
+} from '../apps/api/dist/security-monitoring/agent-semantic-timeline.js';
 
 const coverage = (status = 'complete') => ({
   status,
@@ -443,6 +446,43 @@ const pollutedTimeline = projectConversationTimeline(
 assert.equal(pollutedTimeline.some((item) => item.kind === 'model_response'), false,
   'historical custom-tool delta bytes must not be displayed as a model reply');
 assert.equal(pollutedTimeline.some((item) => item.kind === 'tool_call'), true);
+
+const injectedContextInteraction = projectionInteraction({
+  interactionId: 'mi-injected-context-filter',
+  at: 1_788_060_080_000,
+  requestBody: 'VISIBLE_HUMAN_PROMPT',
+  responseText: 'VISIBLE_MODEL_REPLY',
+  requestMessages: [
+    { role: 'user', content: [{ type: 'input_text', text: '<environment_context>injected</environment_context>' }] },
+    { role: 'user', content: [{ type: 'input_text', text: 'VISIBLE_HUMAN_PROMPT' }] },
+  ],
+});
+injectedContextInteraction.semanticItems = [{
+  semanticItemId: 'si_111111111111111111111111',
+  actor: 'user',
+  kind: 'user_message',
+  phase: 'final',
+  origin: 'request',
+  atUnixNs: injectedContextInteraction.startedAtUnixNs,
+  content: [{ type: 'input_text', text: '<environment_context>injected</environment_context>' }],
+  completeness: 'complete',
+  partialReasons: [],
+}, {
+  semanticItemId: 'si_222222222222222222222222',
+  actor: 'user',
+  kind: 'user_message',
+  phase: 'final',
+  origin: 'request',
+  atUnixNs: injectedContextInteraction.startedAtUnixNs,
+  content: [{ type: 'input_text', text: 'VISIBLE_HUMAN_PROMPT' }],
+  completeness: 'complete',
+  partialReasons: [],
+}];
+const visibleUserItems = semanticItemsForInteraction(injectedContextInteraction)
+  .filter((item) => item.kind === 'user_message');
+assert.equal(visibleUserItems.length, 1,
+  'framework-injected environment_context must not be displayed as a human message');
+assert.match(JSON.stringify(visibleUserItems[0].content), /VISIBLE_HUMAN_PROMPT/u);
 
 const crossDaySameProcess = projectAgentConversations([
   projectionInteraction({
