@@ -584,5 +584,17 @@ assert.equal(
   ).at(-1).kind,
   'error',
 );
+const unresolvedSemanticTimeline = projectSemanticConversationTimeline(
+  unresolvedSummary,
+  unresolvedToolLoop.interactionsByConversation.get(unresolvedSummary.conversationId),
+  [],
+);
+assert.equal(
+  unresolvedSemanticTimeline.flatMap((turn) => turn.diagnostics)
+    .some((diagnostic) => diagnostic.type === 'capture_gap'
+      && diagnostic.message.includes('90 秒')),
+  true,
+  'a stale unresolved tool call must become an explicit capture gap',
+);
 
 console.log('agent conversation directory verification passed');

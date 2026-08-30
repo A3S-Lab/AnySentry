@@ -4,6 +4,7 @@ import type * as T from './types';
 
 export const SEMANTIC_PROJECTION_PARSER_ID = 'anysentry.agent-semantic-timeline';
 export const SEMANTIC_PROJECTION_PARSER_VERSION = 1;
+const UNRESOLVED_TOOL_GAP_GRACE_MS = 90_000;
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -315,6 +316,7 @@ export function projectSemanticConversationTimeline(
 
   const calls = new Map<string, T.AgentSemanticEvent>();
   const resultKeys = new Set<string>();
+  const observedResultIds = new Set<string>();
   const resolvedToolCallIds = new Set(ordered.flatMap((interaction) =>
     interaction.toolResults.map((result) => result.toolCallId)));
   let previousUserLineage: string[] = [];
@@ -354,6 +356,7 @@ export function projectSemanticConversationTimeline(
         const resultKey = `${item.toolCallId ?? 'unlinked'}\u0000${semanticHash(item.content)}`;
         if (resultKeys.has(resultKey)) continue;
         resultKeys.add(resultKey);
+        if (item.toolCallId) observedResultIds.add(item.toolCallId);
       }
       if (item.kind === 'tool_call' && item.toolCallId && calls.has(item.toolCallId)) continue;
       const segmentId = segmentByInteraction.get(interaction.interactionId)
@@ -430,6 +433,30 @@ export function projectSemanticConversationTimeline(
           ? `模型请求失败（HTTP ${interaction.statusCode}）`
           : interaction.partialReasons.join('、') || '该次交互的采集证据不完整',
         interactionId: interaction.interactionId,
+      });
+    }
+  }
+
+  const lastInteraction = ordered.at(-1);
+  const conversationStale = lastInteraction
+    ? Date.now() - Number(BigInt(lastInteraction.endedAtUnixNs) / 1_000_000n)
+      >= UNRESOLVED_TOOL_GAP_GRACE_MS
+    : false;
+  if (conversationStale) {
+    for (const [toolCallId, event] of calls) {
+      if (observedResultIds.has(toolCallId)) continue;
+      const turn = turns.get(event.turnId);
+      if (!turn) continue;
+      turn.diagnostics.push({
+        diagnosticId: `diag_tool_gap_${createHash('sha256')
+          .update(`${conversation.conversationId}\u0000${toolCallId}`)
+          .digest('hex')
+          .slice(0, 24)}`,
+        type: 'capture_gap',
+        severity: 'warning',
+        message: `工具 ${event.toolName ?? toolCallId} 超过 90 秒仍未观察到返回结果`,
+        attachedToEventId: event.semanticEventId,
+        interactionId: event.sourceInteractionIds[0],
       });
     }
   }
