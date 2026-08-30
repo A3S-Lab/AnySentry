@@ -148,6 +148,58 @@ const line = JSON.stringify({
         isError: false,
         observedAtUnixNs: String(nowNs + 1_000_000n),
       }],
+      semanticParserId: 'observer.agent-interaction',
+      semanticParserVersion: 1,
+      semanticItems: [{
+        semanticItemId: `si_${digest(`${runId}\0semantic-user`).slice(0, 24)}`,
+        actor: 'user',
+        kind: 'user_message',
+        phase: 'final',
+        origin: 'request',
+        atUnixNs: String(nowNs),
+        content: 'FINAL_REQUEST_SENTINEL',
+        sourceItemId: 'request.messages[0]',
+        sequenceNumber: 0,
+        completeness: 'complete',
+        partialReasons: [],
+      }, {
+        semanticItemId: `si_${digest(`${runId}\0semantic-model`).slice(0, 24)}`,
+        actor: 'model',
+        kind: 'model_progress',
+        phase: 'progress',
+        origin: 'response',
+        atUnixNs: String(nowNs + 2_000_000n),
+        content: 'VISIBLE_RESPONSE_SENTINEL',
+        sequenceNumber: 1,
+        completeness: 'complete',
+        partialReasons: [],
+      }, {
+        semanticItemId: `si_${digest(`${runId}\0semantic-tool-result`).slice(0, 24)}`,
+        actor: 'tool',
+        kind: 'tool_result',
+        phase: 'final',
+        origin: 'request',
+        atUnixNs: String(nowNs + 1_000_000n),
+        content: 'TOOL_RESULT_SENTINEL',
+        toolCallId: 'call-fixture-1',
+        toolName: 'bash',
+        sequenceNumber: 2,
+        completeness: 'complete',
+        partialReasons: [],
+      }, {
+        semanticItemId: `si_${digest(`${runId}\0semantic-tool-call`).slice(0, 24)}`,
+        actor: 'tool',
+        kind: 'tool_call',
+        phase: 'final',
+        origin: 'response',
+        atUnixNs: String(nowNs + 2_000_000n),
+        content: { path: 'canary.txt' },
+        toolCallId: 'call-fixture-2',
+        toolName: 'read',
+        sequenceNumber: 3,
+        completeness: 'complete',
+        partialReasons: [],
+      }],
       completeness: 'complete',
       partialReasons: [],
       captureSource: 'tls_uprobe',
@@ -205,6 +257,17 @@ assert.ok(processRootInteraction, 'strong process-root interaction must parse');
 assert.notEqual(processRootInteraction.agentAssetId, legacyContainerAsset);
 assert.match(processRootInteraction.agentInstanceId ?? '', /^host-root:/u);
 assert.equal(processRootInteraction.agentProduct, 'codex');
+assert.equal(processRootInteraction.semanticParserId, 'observer.agent-interaction');
+assert.equal(processRootInteraction.semanticParserVersion, 1);
+assert.deepEqual(
+  processRootInteraction.semanticItems?.map((item) => [item.actor, item.kind]),
+  [
+    ['user', 'user_message'],
+    ['model', 'model_progress'],
+    ['tool', 'tool_result'],
+    ['tool', 'tool_call'],
+  ],
+);
 
 const ingest = await request('/ingest/batch', 'POST', {
   events: [{
@@ -313,6 +376,20 @@ assert.deepEqual(
   ['error', 'model_request', 'model_response', 'tool_call', 'tool_result'],
 );
 assert.equal(timeline.interactionIds.includes(interactionId), true);
+const semanticTimeline = await requestWithoutManagementToken('/agents/conversations/timeline-v2', {
+  timeType: 'last_30d',
+  scope: 'agent',
+  classificationView: 'current_effective',
+  agentAssetId: item.agentAssetId,
+  conversationId: conversation.conversationId,
+});
+assert.equal(semanticTimeline.thread.conversationId, conversation.conversationId);
+assert.deepEqual(
+  [...new Set(semanticTimeline.turns.flatMap((turn) =>
+    turn.events.map((event) => event.actor)))].sort(),
+  ['model', 'tool', 'user'],
+);
+assert.equal(semanticTimeline.parserVersion, 1);
 
 const modelOnly = await request('/agents/interactions', 'POST', {
   timeType: 'last_30d', scope: 'raw', interactionType: 'model', interactionId, limit: 10,

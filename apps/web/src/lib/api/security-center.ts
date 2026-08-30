@@ -1042,6 +1042,25 @@ export interface AgentInteractionToolResult {
   isError: boolean;
   observedAtUnixNs?: string;
 }
+export type AgentInteractionSemanticActor = "user" | "model" | "tool";
+export type AgentInteractionSemanticKind = "user_message" | "model_progress" | "model_final" | "tool_call" | "tool_result";
+export interface AgentInteractionSemanticItem {
+  semanticItemId: string;
+  actor: AgentInteractionSemanticActor;
+  kind: AgentInteractionSemanticKind;
+  phase?: "progress" | "final";
+  origin: "request" | "response";
+  atUnixNs: string;
+  content?: unknown;
+  toolCallId?: string;
+  toolName?: string;
+  sourceItemId?: string;
+  outputIndex?: number;
+  contentIndex?: number;
+  sequenceNumber?: number;
+  completeness: "complete" | "partial" | "missing";
+  partialReasons: string[];
+}
 export interface AgentInteractionContent {
   body: string;
   encoding: "utf8" | "base64";
@@ -1106,6 +1125,9 @@ export interface AgentInteractionRecord {
   response: AgentInteractionContent;
   toolCalls: AgentInteractionToolCall[];
   toolResults: AgentInteractionToolResult[];
+  semanticParserId?: string;
+  semanticParserVersion?: number;
+  semanticItems?: AgentInteractionSemanticItem[];
   completeness: AgentInteractionCompleteness;
   partialReasons: string[];
   captureSource: string;
@@ -1212,6 +1234,27 @@ export interface AgentConversationDirectoryList extends ClassifiedResponseMeta {
   dataSource: "clickhouse" | "hot_ring";
   updateTime: string;
 }
+export interface LogicalAgentConversationDirectoryItemV2 extends LogicalAgentConversationDirectoryItem {
+  instanceCounts: {
+    active: number;
+    idle: number;
+    unobserved: number;
+    exited: number;
+    lost: number;
+    total: number;
+  };
+  conversationCounts: {
+    active: number;
+    dormant: number;
+    incomplete: number;
+    total: number;
+  };
+  recentInstances: AgentRuntimeInstanceRecord[];
+}
+export interface AgentConversationDirectoryListV2 extends Omit<AgentConversationDirectoryList, "items"> {
+  apiVersion: 2;
+  items: LogicalAgentConversationDirectoryItemV2[];
+}
 export type AgentConversationEventKind = "tool_result" | "model_request" | "model_response" | "tool_call" | "external_tool" | "retry" | "error";
 export interface AgentConversationEvent {
   eventId: string;
@@ -1245,6 +1288,76 @@ export interface AgentConversationTimeline extends ClassifiedResponseMeta {
   total: number;
   coverage: QueryCoverage;
   dataSource: "clickhouse" | "hot_ring";
+  updateTime: string;
+}
+export type AgentConversationActor = "user" | "model" | "tool";
+export type AgentSemanticEventKind = "user_message" | "model_progress" | "model_final" | "tool_call" | "tool_result";
+export type AgentToolKind = "bash" | "read" | "write" | "search" | "mcp" | "skill" | "http" | "code" | "other";
+export interface AgentSemanticEvent {
+  semanticEventId: string;
+  conversationId: string;
+  segmentId: string;
+  turnId: string;
+  actor: AgentConversationActor;
+  kind: AgentSemanticEventKind;
+  phase?: "progress" | "final";
+  atUnixNs: string;
+  endedAtUnixNs?: string;
+  content?: unknown;
+  contentPreview?: string;
+  toolCallId?: string;
+  toolName?: string;
+  toolKind?: AgentToolKind;
+  status?: "pending" | "running" | "succeeded" | "failed" | "unknown";
+  sourceInteractionIds: string[];
+  sourceItemIds?: string[];
+  parserId: string;
+  parserVersion: number;
+  correlationQuality: "exact" | "strong" | "inferred" | "unlinked";
+  completeness: "complete" | "partial" | "missing";
+  partialReasons: string[];
+}
+export interface AgentTimelineDiagnostic {
+  diagnosticId: string;
+  type: "retry" | "capture_gap" | "parse_gap" | "correlation_gap";
+  severity: "info" | "warning" | "error";
+  message: string;
+  attachedToEventId?: string;
+  interactionId?: string;
+}
+export interface ConversationInstanceSegment {
+  schemaVersion: "anysentry.agent_conversation_segment.v1";
+  segmentId: string;
+  conversationId: string;
+  agentInstanceId: string;
+  ordinal: number;
+  startedAtUnixNs: string;
+  endedAtUnixNs?: string;
+  firstInteractionId: string;
+  lastInteractionId: string;
+  interactionCount: number;
+  correlationQuality: "exact" | "strong" | "inferred" | "unlinked";
+  resolverVersion: number;
+  updatedAt: number;
+}
+export interface AgentConversationTurnV2 {
+  turnId: string;
+  ordinal: number;
+  state: "active" | "complete" | "incomplete";
+  startedAtUnixNs: string;
+  endedAtUnixNs?: string;
+  events: AgentSemanticEvent[];
+  diagnostics: AgentTimelineDiagnostic[];
+}
+export interface AgentConversationTimelineV2 extends ClassifiedResponseMeta {
+  thread?: AgentConversationSummary;
+  segments: ConversationInstanceSegment[];
+  turns: AgentConversationTurnV2[];
+  interactionIds: string[];
+  parserId: string;
+  parserVersion: number;
+  dataSource: "clickhouse" | "hot_ring";
+  coverage: QueryCoverage;
   updateTime: string;
 }
 export interface ToolEvidenceItem {
@@ -1809,6 +1922,8 @@ export interface AgentRuntimeInstanceRecord {
   agentScopeId: string;
   agentDisplayName?: string;
   agentInstanceId: string;
+  canonicalAgentInstanceId?: string;
+  agentInstanceAliases?: string[];
   physicalWorkloadId?: string;
   classification?: AgentClassification;
   runtimeState: AgentRuntimeState;
@@ -3792,8 +3907,12 @@ export const securityCenterApi = {
     apiClient.post<AgentConversationList>("/security-center/agents/conversations", filter),
   agentConversationDirectory: (filter: AgentConversationDirectoryQuery) =>
     apiClient.post<AgentConversationDirectoryList>("/security-center/agents/conversation-directory", filter),
+  agentConversationDirectoryV2: (filter: AgentConversationDirectoryQuery) =>
+    apiClient.post<AgentConversationDirectoryListV2>("/security-center/agents/conversation-directory-v2", filter),
   agentConversationTimeline: (filter: AgentConversationQuery & { conversationId: string }) =>
     apiClient.post<AgentConversationTimeline>("/security-center/agents/conversations/timeline", filter),
+  agentConversationTimelineV2: (filter: AgentConversationQuery & { conversationId: string }) =>
+    apiClient.post<AgentConversationTimelineV2>("/security-center/agents/conversations/timeline-v2", filter),
   agentToolEvidence: (filter: AgentEventQuery & { invocationId: string }) =>
     apiClient.post<ToolEvidenceResponse>("/security-center/events/tool-evidence", filter),
   observedAssets: (query: ObservedAssetListQuery) =>

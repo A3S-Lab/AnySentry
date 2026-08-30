@@ -1,5 +1,7 @@
-import { Inject, Injectable, OnModuleDestroy, Optional } from '@nestjs/common';
+import { Inject, Injectable, OnModuleDestroy, OnModuleInit, Optional } from '@nestjs/common';
 import { createHash } from 'node:crypto';
+import { hostRootInstanceIdFromAtoms } from './agent-semantic-identity';
+import { RelationalBusinessStore } from './relational-business-store.service';
 import {
   AgentActivityState,
   AgentAttributionSource,
@@ -48,6 +50,7 @@ export interface AgentRuntimeStateServiceOptions {
   pruneIntervalMs?: number;
   unobservedIntervals?: number;
   leaseTtlMs?: number;
+  durableHistory?: boolean;
 }
 
 interface SanitizedRuntimeEntry
@@ -253,8 +256,31 @@ function instanceKey(collectorId: string, agentInstanceId: string): string {
   return `${collectorId}\0${agentInstanceId}`;
 }
 
+function canonicalRuntimeInstanceId(
+  entry: Pick<SanitizedRuntimeEntry, 'agentInstanceId' | 'hostId' | 'bootId' | 'rootPid' | 'rootStartTimeTicks'>,
+): string {
+  return hostRootInstanceIdFromAtoms({
+    agentInstanceId: entry.agentInstanceId,
+    hostId: entry.hostId,
+    bootId: entry.bootId,
+    rootPid: entry.rootPid,
+    rootStartTime: entry.rootStartTimeTicks,
+  }) ?? entry.agentInstanceId;
+}
+
+function strongRuntimeAliases(
+  entry: Pick<SanitizedRuntimeEntry, 'agentInstanceId' | 'physicalWorkloadId' | 'hostId' | 'bootId' | 'rootPid' | 'rootStartTimeTicks'>,
+): string[] {
+  const canonical = canonicalRuntimeInstanceId(entry);
+  const reported = entry.agentInstanceId.trim();
+  return [...new Set([
+    canonical,
+    ...(reported && reported !== entry.physicalWorkloadId ? [reported] : []),
+  ])];
+}
+
 @Injectable()
-export class AgentRuntimeStateService implements OnModuleDestroy {
+export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
   private readonly clock: () => number;
   private readonly maxForwarders: number;
   private readonly maxRetiredForwarders: number;
@@ -266,6 +292,7 @@ export class AgentRuntimeStateService implements OnModuleDestroy {
   private readonly activityIdleMs: number;
   private readonly unobservedIntervals: number;
   private readonly leaseTtlMs: number;
+  private readonly durableHistoryEnabled: boolean;
   private readonly forwarders = new Map<string, ForwarderRecord>();
   /** Collector-scoped high-water marks outlive detail records and expire only after full inactivity. */
   private readonly collectorLeases = new Map<string, CollectorLeaseRecord>();
@@ -273,6 +300,8 @@ export class AgentRuntimeStateService implements OnModuleDestroy {
   /** Bounded fencing tombstones; a superseded forwarder ID cannot become authoritative again. */
   private readonly retiredForwarders = new Map<string, number>();
   private readonly instances = new Map<string, StoredRuntimeInstance>();
+  private readonly history = new Map<string, AgentRuntimeInstanceRecord>();
+  private historyWriteChain: Promise<void> = Promise.resolve();
   private pruneTimer?: NodeJS.Timeout;
   private closed = false;
 
@@ -280,6 +309,8 @@ export class AgentRuntimeStateService implements OnModuleDestroy {
     @Optional()
     @Inject(AGENT_RUNTIME_STATE_OPTIONS)
     options: AgentRuntimeStateServiceOptions = {},
+    @Optional()
+    private readonly relationalStore?: RelationalBusinessStore,
   ) {
     this.clock = options.now ?? Date.now;
     this.maxForwarders = boundedInteger(options.maxForwarders, DEFAULT_MAX_FORWARDERS, 1, 100_000);
@@ -300,6 +331,8 @@ export class AgentRuntimeStateService implements OnModuleDestroy {
     this.activityIdleMs = boundedInteger(options.activityIdleMs, DEFAULT_ACTIVITY_IDLE_MS, 1, 24 * 60 * 60_000);
     this.unobservedIntervals = boundedInteger(options.unobservedIntervals, DEFAULT_UNOBSERVED_INTERVALS, 1, 100);
     this.leaseTtlMs = boundedInteger(options.leaseTtlMs, DEFAULT_LEASE_TTL_MS, 1_000, 24 * 60 * 60_000);
+    this.durableHistoryEnabled = options.durableHistory
+      ?? Boolean(this.relationalStore?.configured());
     const pruneIntervalMs = boundedInteger(options.pruneIntervalMs, DEFAULT_PRUNE_INTERVAL_MS, 0, 24 * 60 * 60_000);
     if (pruneIntervalMs > 0) {
       this.pruneTimer = setInterval(() => this.prune(), pruneIntervalMs);
@@ -307,8 +340,35 @@ export class AgentRuntimeStateService implements OnModuleDestroy {
     }
   }
 
-  onModuleDestroy(): void {
+  async onModuleInit(): Promise<void> {
+    if (!this.durableHistoryEnabled || !this.relationalStore) return;
+    const restored = await this.relationalStore.loadAgentRuntimeInstances();
+    for (const record of restored) {
+      const canonical = record.canonicalAgentInstanceId ?? hostRootInstanceIdFromAtoms({
+        agentInstanceId: record.agentInstanceId,
+        hostId: record.hostId,
+        bootId: record.bootId,
+        rootPid: record.rootPid,
+        rootStartTime: record.rootStartTimeTicks,
+      }) ?? record.agentInstanceId;
+      const aliases = [...new Set([
+        canonical,
+        record.agentInstanceId,
+        ...(record.agentInstanceAliases ?? []),
+      ])];
+      this.history.set(canonical, this.clonePublicRecord({
+        ...record,
+        canonicalAgentInstanceId: canonical,
+        agentInstanceAliases: aliases,
+        runtimeState: record.runtimeState === 'running' ? 'unobserved' : record.runtimeState,
+        activityState: undefined,
+      }));
+    }
+  }
+
+  async onModuleDestroy(): Promise<void> {
     this.close();
+    await this.historyWriteChain;
   }
 
   close(): void {
@@ -508,7 +568,10 @@ export class AgentRuntimeStateService implements OnModuleDestroy {
 
     const additionalInstances = snapshot.ready
       ? snapshot.entries.reduce(
-          (count, entry) => count + Number(!this.instances.has(instanceKey(snapshot.collectorId, entry.agentInstanceId))),
+          (count, entry) => count + Number(!this.instances.has(instanceKey(
+            snapshot.collectorId,
+            canonicalRuntimeInstanceId(entry),
+          ))),
           0,
         )
       : 0;
@@ -557,7 +620,14 @@ export class AgentRuntimeStateService implements OnModuleDestroy {
       this.retireForwarder(active.key, receivedAt);
     }
     this.activeForwarderByCollector.set(snapshot.collectorId, key);
-    this.applyReadySnapshot(nextForwarder, snapshot, hash, receivedAt, takeoverKeys);
+    const changedRecords = this.applyReadySnapshot(
+      nextForwarder,
+      snapshot,
+      hash,
+      receivedAt,
+      takeoverKeys,
+    );
+    this.rememberRuntimeHistory(changedRecords);
     if (active && active.key !== key) this.forwarders.delete(active.key);
     for (const candidate of [...this.forwarders.values()]) {
       if (candidate.collectorId !== snapshot.collectorId || candidate.key === key) continue;
@@ -592,13 +662,24 @@ export class AgentRuntimeStateService implements OnModuleDestroy {
     const runtimeState = input.runtimeState && input.runtimeState !== 'all' ? input.runtimeState : undefined;
     const activityState = input.activityState && input.activityState !== 'all' ? input.activityState : undefined;
 
-    const all = [...this.instances.values()]
-      .map((record) => this.publicRecord(record, at))
+    const hotRecords = [...this.instances.values()].map((record) => this.publicRecord(record, at));
+    const byCanonical = new Map<string, AgentRuntimeInstanceRecord>();
+    for (const record of hotRecords) {
+      const canonical = record.canonicalAgentInstanceId ?? record.agentInstanceId;
+      const current = byCanonical.get(canonical);
+      if (!current || record.receivedAt > current.receivedAt) byCanonical.set(canonical, record);
+    }
+    if (this.durableHistoryEnabled) {
+      for (const [canonical, record] of this.history) {
+        if (!byCanonical.has(canonical)) byCanonical.set(canonical, this.clonePublicRecord(record));
+      }
+    }
+    const all = [...byCanonical.values()]
       .filter((record) =>
         (!collectorId || record.collectorId === collectorId) &&
         (!forwarderInstanceId || record.forwarderInstanceId === forwarderInstanceId) &&
         (!agentScopeId || record.agentScopeId.toLowerCase() === agentScopeId) &&
-        (!agentInstanceId || record.agentInstanceId === agentInstanceId) &&
+        (!agentInstanceId || this.recordMatchesInstance(record, agentInstanceId)) &&
         (!physicalWorkloadId || record.physicalWorkloadId === physicalWorkloadId) &&
         (!runtimeState || record.runtimeState === runtimeState) &&
         (!activityState || record.activityState === activityState) &&
@@ -627,8 +708,15 @@ export class AgentRuntimeStateService implements OnModuleDestroy {
     if (collectorId) {
       const normalizedCollector = cleanString(collectorId, 180);
       if (!normalizedCollector) return undefined;
-      const record = this.instances.get(instanceKey(normalizedCollector, normalizedInstance));
-      return record ? this.publicRecord(record, at) : undefined;
+      const record = [...this.instances.values()].find((candidate) =>
+        candidate.collectorId === normalizedCollector
+        && this.recordMatchesInstance(candidate, normalizedInstance));
+      if (record) return this.publicRecord(record, at);
+      const historical = this.history.get(normalizedInstance)
+        ?? [...this.history.values()].find((candidate) =>
+          candidate.collectorId === normalizedCollector
+          && this.recordMatchesInstance(candidate, normalizedInstance));
+      return historical ? this.clonePublicRecord(historical) : undefined;
     }
     return this.list({ agentInstanceId: normalizedInstance, includeShadow: true, limit: this.maxInstances }, at).items[0];
   }
@@ -707,10 +795,11 @@ export class AgentRuntimeStateService implements OnModuleDestroy {
     for (let index = 0; index < value.entries.length; index += 1) {
       const result = this.sanitizeEntry(value.entries[index], index);
       if ('reason' in result) return result;
-      if (seenInstances.has(result.entry.agentInstanceId)) {
+      const canonical = canonicalRuntimeInstanceId(result.entry);
+      if (seenInstances.has(canonical)) {
         return { reason: `entries[${index}].agentInstanceId is duplicated` };
       }
-      seenInstances.add(result.entry.agentInstanceId);
+      seenInstances.add(canonical);
       entries.push(result.entry);
     }
 
@@ -859,7 +948,12 @@ export class AgentRuntimeStateService implements OnModuleDestroy {
   private validateTransitions(snapshot: SanitizedRuntimeSnapshot): TransitionValidationError | undefined {
     const ownerKey = forwarderKey(snapshot.collectorId, snapshot.forwarderInstanceId);
     for (const entry of snapshot.entries) {
-      const existing = this.instances.get(instanceKey(snapshot.collectorId, entry.agentInstanceId));
+      const existing = this.instances.get(instanceKey(
+        snapshot.collectorId,
+        canonicalRuntimeInstanceId(entry),
+      )) ?? [...this.instances.values()].find((candidate) =>
+        candidate.collectorId === snapshot.collectorId
+        && this.recordMatchesInstance(candidate, entry.agentInstanceId));
       if (!existing) continue;
       if (
         existing.rootPid !== entry.rootPid ||
@@ -904,10 +998,12 @@ export class AgentRuntimeStateService implements OnModuleDestroy {
     hash: string,
     receivedAt: number,
     takeoverKeys?: Set<string>,
-  ): void {
+  ): AgentRuntimeInstanceRecord[] {
+    const changed: AgentRuntimeInstanceRecord[] = [];
     const previousKeys = new Set([...forwarder.instanceKeys, ...(takeoverKeys ?? [])]);
     for (const entry of snapshot.entries) {
-      const key = instanceKey(snapshot.collectorId, entry.agentInstanceId);
+      const canonicalAgentInstanceId = canonicalRuntimeInstanceId(entry);
+      const key = instanceKey(snapshot.collectorId, canonicalAgentInstanceId);
       previousKeys.delete(key);
       const previousOwner = this.instances.get(key)?.forwarderKey;
       const previous = this.instances.get(key);
@@ -933,6 +1029,8 @@ export class AgentRuntimeStateService implements OnModuleDestroy {
         agentScopeId: entry.agentScopeId,
         agentDisplayName: entry.agentDisplayName,
         agentInstanceId: entry.agentInstanceId,
+        canonicalAgentInstanceId,
+        agentInstanceAliases: strongRuntimeAliases(entry),
         physicalWorkloadId: entry.physicalWorkloadId,
         classification: entry.classification,
         rootPid: entry.rootPid,
@@ -961,6 +1059,7 @@ export class AgentRuntimeStateService implements OnModuleDestroy {
       };
       this.instances.set(key, record);
       forwarder.instanceKeys.add(key);
+      changed.push(this.publicRecord(record, receivedAt));
     }
 
     // A ready snapshot is a complete view. If an earlier running root disappears without an
@@ -972,7 +1071,7 @@ export class AgentRuntimeStateService implements OnModuleDestroy {
       this.forwarders.get(record.forwarderKey)?.instanceKeys.delete(key);
       forwarder.instanceKeys.add(key);
       if (record.reportedRuntimeState === 'running') {
-        this.instances.set(key, {
+        const lost: StoredRuntimeInstance = {
           ...record,
           forwarderKey: forwarder.key,
           forwarderInstanceId: snapshot.forwarderInstanceId,
@@ -987,12 +1086,15 @@ export class AgentRuntimeStateService implements OnModuleDestroy {
           endedAt: receivedAt,
           receivedAt,
           terminalAt: receivedAt,
-        });
+        };
+        this.instances.set(key, lost);
+        changed.push(this.publicRecord(lost, receivedAt));
       } else if (record.forwarderKey !== forwarder.key) {
         // Retain the original public reporter metadata while transferring internal ownership.
         this.instances.set(key, { ...record, forwarderKey: forwarder.key });
       }
     }
+    return changed;
   }
 
   private effectiveRuntimeState(record: StoredRuntimeInstance, at: number): AgentRuntimeState {
@@ -1030,6 +1132,54 @@ export class AgentRuntimeStateService implements OnModuleDestroy {
       runtimeState,
       activityState,
     };
+  }
+
+  private clonePublicRecord(record: AgentRuntimeInstanceRecord): AgentRuntimeInstanceRecord {
+    return {
+      ...record,
+      agentInstanceAliases: record.agentInstanceAliases
+        ? [...record.agentInstanceAliases]
+        : undefined,
+      evidence: record.evidence ? [...record.evidence] : undefined,
+      workloadRef: cloneWorkloadRef(record.workloadRef),
+    };
+  }
+
+  private recordMatchesInstance(
+    record: Pick<AgentRuntimeInstanceRecord, 'agentInstanceId' | 'canonicalAgentInstanceId' | 'agentInstanceAliases'>,
+    instanceId: string,
+  ): boolean {
+    return record.agentInstanceId === instanceId
+      || record.canonicalAgentInstanceId === instanceId
+      || Boolean(record.agentInstanceAliases?.includes(instanceId));
+  }
+
+  private rememberRuntimeHistory(records: AgentRuntimeInstanceRecord[]): void {
+    if (!this.durableHistoryEnabled || records.length === 0) return;
+    const persisted: AgentRuntimeInstanceRecord[] = [];
+    for (const record of records) {
+      const canonical = record.canonicalAgentInstanceId ?? record.agentInstanceId;
+      const normalizedRecord = this.clonePublicRecord({
+        ...record,
+        canonicalAgentInstanceId: canonical,
+        agentInstanceAliases: [...new Set([
+          canonical,
+          record.agentInstanceId,
+          ...(record.agentInstanceAliases ?? []),
+        ])],
+      });
+      const previous = this.history.get(canonical);
+      if (!previous || normalizedRecord.receivedAt >= previous.receivedAt) {
+        this.history.set(canonical, normalizedRecord);
+        persisted.push(normalizedRecord);
+      }
+    }
+    if (!this.relationalStore || persisted.length === 0) return;
+    this.historyWriteChain = this.historyWriteChain
+      .then(async () => {
+        await this.relationalStore!.saveAgentRuntimeInstances(persisted);
+      })
+      .catch(() => undefined);
   }
 
   private touchLease(lease: CollectorLeaseRecord, forwarder: ForwarderRecord, at: number): void {

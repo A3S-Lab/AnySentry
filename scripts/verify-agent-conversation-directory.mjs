@@ -5,6 +5,7 @@ import {
   projectAgentConversations,
   projectConversationTimeline,
 } from '../apps/api/dist/security-monitoring/agent-conversation.js';
+import { projectSemanticConversationTimeline } from '../apps/api/dist/security-monitoring/agent-semantic-timeline.js';
 
 const coverage = (status = 'complete') => ({
   status,
@@ -229,21 +230,26 @@ const projectionInteraction = ({
   at,
   requestBody,
   responseText,
+  responseStructured,
   providerResponseId,
   providerPreviousResponseId,
   toolCalls = [],
   toolResults = [],
   completeness = 'complete',
   partialReasons = [],
+  agentInstanceId = 'host-root:fixture:codex',
+  agentProduct = 'Codex',
+  workspacePath = '/workspace/codex',
+  requestMessages,
 }) => ({
   schemaVersion: 'anysentry.agent_interaction.v1',
   interactionId,
   interactionType: 'model',
   at,
-  workspacePath: '/workspace/codex',
+  workspacePath,
   agentAssetId: 'agent-codex-projection',
-  agentInstanceId: 'host-root:fixture:codex',
-  agentProduct: 'Codex',
+  agentInstanceId,
+  agentProduct,
   detectedClassification: 'confirmed_agent',
   currentEffectiveClassification: 'confirmed_agent',
   connectionId: 'tls:codex-projection',
@@ -266,12 +272,16 @@ const projectionInteraction = ({
   endedAtUnixNs: String(BigInt(at + 3) * 1_000_000n),
   durationNs: '3000000',
   timeQuality: 'collector_calibrated',
-  request: content(requestBody, [{
-    role: toolResults.length ? 'custom_tool_call_output' : 'user',
-    content: requestBody,
-    ...(toolResults[0] ? { toolCallId: toolResults[0].toolCallId } : {}),
-  }]),
-  response: { ...content(responseText), text: responseText },
+  request: content(requestBody, requestMessages ?? [{
+      role: toolResults.length ? 'custom_tool_call_output' : 'user',
+      content: requestBody,
+      ...(toolResults[0] ? { toolCallId: toolResults[0].toolCallId } : {}),
+    }]),
+  response: {
+    ...content(responseText),
+    text: responseText,
+    ...(responseStructured ? { structured: responseStructured } : {}),
+  },
   toolCalls,
   toolResults,
   completeness,
@@ -326,6 +336,185 @@ assert.deepEqual(
   ).map((item) => item.kind),
   ['model_request', 'model_response', 'tool_call', 'tool_result', 'model_request', 'model_response'],
 );
+const semanticToolLoop = projectSemanticConversationTimeline(
+  resolvedToolLoop,
+  projectedToolLoop.interactionsByConversation.get(resolvedToolLoop.conversationId),
+  [{
+    schemaVersion: 'anysentry.agent_conversation_segment.v1',
+    segmentId: 'seg-semantic-fixture',
+    conversationId: resolvedToolLoop.conversationId,
+    agentInstanceId: 'host-root:fixture:codex',
+    ordinal: 1,
+    startedAtUnixNs: '1788060000000000000',
+    endedAtUnixNs: '1788060000013000000',
+    firstInteractionId: 'mi-tool-pending',
+    lastInteractionId: 'mi-tool-result-final',
+    interactionCount: 2,
+    correlationQuality: 'exact',
+    resolverVersion: 1,
+    updatedAt: 1_788_060_000_014,
+  }],
+);
+assert.deepEqual(
+  semanticToolLoop.flatMap((turn) => turn.events.map((event) => event.kind)),
+  ['user_message', 'model_progress', 'tool_call', 'tool_result', 'model_final'],
+  'the semantic timeline must keep the final model reply separate from the tool result',
+);
+assert.deepEqual(
+  [...new Set(semanticToolLoop.flatMap((turn) => turn.events.map((event) => event.actor)))].sort(),
+  ['model', 'tool', 'user'],
+);
+
+const cumulativeClaudeResults = projectAgentConversations([
+  projectionInteraction({
+    interactionId: 'mi-claude-result-first',
+    at: 1_788_060_050_000,
+    requestBody: 'CLAUDE_TOOL_RESULT_FIRST',
+    responseText: 'CLAUDE_CONTINUES',
+    providerResponseId: 'msg-claude-first',
+    toolResults: [{
+      toolCallId: 'toolu-cumulative-1',
+      content: [{ type: 'text', text: 'CUMULATIVE_RESULT' }],
+      isError: false,
+      observedAtUnixNs: '1788060050000000000',
+    }],
+  }),
+  projectionInteraction({
+    interactionId: 'mi-claude-result-repeated',
+    at: 1_788_060_050_010,
+    requestBody: 'CLAUDE_TOOL_RESULT_REPEATED',
+    responseText: 'CLAUDE_FINAL',
+    providerResponseId: 'msg-claude-final',
+    providerPreviousResponseId: 'msg-claude-first',
+    toolResults: [{
+      toolCallId: 'toolu-cumulative-1',
+      content: [{ type: 'text', text: 'CUMULATIVE_RESULT' }],
+      isError: false,
+      observedAtUnixNs: '1788060050010000000',
+    }],
+  }),
+], [], { timeType: 'last_30d', scope: 'agent', limit: 20 });
+assert.equal(cumulativeClaudeResults.summaries.length, 1);
+assert.equal(cumulativeClaudeResults.summaries[0].toolResultCount, 1,
+  'a cumulative provider request must not duplicate an identical tool result');
+assert.equal(
+  projectConversationTimeline(
+    cumulativeClaudeResults.summaries[0],
+    cumulativeClaudeResults.interactionsByConversation.get(
+      cumulativeClaudeResults.summaries[0].conversationId,
+    ),
+  ).filter((item) => item.kind === 'tool_result').length,
+  1,
+);
+
+const pollutedResponsesProjection = projectAgentConversations([
+  projectionInteraction({
+    interactionId: 'mi-old-responses-tool-delta',
+    at: 1_788_060_075_000,
+    requestBody: 'RUN_OLD_CUSTOM_TOOL',
+    responseText: 'tools.exec_command({"cmd":"pwd"})',
+    responseStructured: [{
+      type: 'response.output_item.added',
+      output_index: 0,
+      item: { type: 'custom_tool_call', call_id: 'call-old-delta', name: 'exec' },
+    }, {
+      type: 'response.custom_tool_call_input.delta',
+      output_index: 0,
+      delta: 'tools.exec_command({"cmd":"pwd"})',
+    }, {
+      type: 'response.completed',
+      response: { id: 'resp-old-delta' },
+    }],
+    providerResponseId: 'resp-old-delta',
+    toolCalls: [{
+      toolCallId: 'call-old-delta',
+      name: 'exec',
+      arguments: 'tools.exec_command({"cmd":"pwd"})',
+      issuedAtUnixNs: '1788060075002000000',
+    }],
+  }),
+], [], { timeType: 'last_30d', scope: 'agent', limit: 20 });
+const pollutedTimeline = projectConversationTimeline(
+  pollutedResponsesProjection.summaries[0],
+  pollutedResponsesProjection.interactionsByConversation.get(
+    pollutedResponsesProjection.summaries[0].conversationId,
+  ),
+);
+assert.equal(pollutedTimeline.some((item) => item.kind === 'model_response'), false,
+  'historical custom-tool delta bytes must not be displayed as a model reply');
+assert.equal(pollutedTimeline.some((item) => item.kind === 'tool_call'), true);
+
+const crossDaySameProcess = projectAgentConversations([
+  projectionInteraction({
+    interactionId: 'mi-cross-day-first',
+    at: 1_788_100_000_000,
+    requestBody: 'CROSS_DAY_FIRST',
+    responseText: 'FIRST_REPLY',
+    requestMessages: [{ role: 'user', content: 'CROSS_DAY_FIRST' }],
+  }),
+  projectionInteraction({
+    interactionId: 'mi-cross-day-second',
+    at: 1_788_100_000_000 + 25 * 60 * 60 * 1_000,
+    requestBody: 'CROSS_DAY_SECOND',
+    responseText: 'SECOND_REPLY',
+    requestMessages: [
+      { role: 'user', content: 'CROSS_DAY_FIRST' },
+      { role: 'user', content: 'CROSS_DAY_SECOND' },
+    ],
+  }),
+], [], { timeType: 'last_30d', scope: 'agent', limit: 20 });
+assert.equal(crossDaySameProcess.summaries.length, 1,
+  'idle time alone must not split a still-running CLI thread');
+assert.equal(crossDaySameProcess.summaries[0].turnCount, 2);
+
+const resumedAcrossProcesses = projectAgentConversations([
+  projectionInteraction({
+    interactionId: 'mi-resume-old-process',
+    at: 1_788_200_000_000,
+    requestBody: 'RESUME_FIRST',
+    responseText: 'OLD_PROCESS_REPLY',
+    agentInstanceId: 'host-root:fixture:old-process',
+    requestMessages: [{ role: 'user', content: 'RESUME_FIRST' }],
+  }),
+  projectionInteraction({
+    interactionId: 'mi-resume-new-process',
+    at: 1_788_200_100_000,
+    requestBody: 'RESUME_SECOND',
+    responseText: 'NEW_PROCESS_REPLY',
+    agentInstanceId: 'host-root:fixture:new-process',
+    requestMessages: [
+      { role: 'user', content: 'RESUME_FIRST' },
+      { role: 'user', content: 'RESUME_SECOND' },
+    ],
+  }),
+], [], { timeType: 'last_30d', scope: 'agent', limit: 20 });
+assert.equal(resumedAcrossProcesses.summaries.length, 1,
+  'a strictly extended CLI lineage must resume the prior Thread across process generations');
+assert.deepEqual(
+  resumedAcrossProcesses.summaries[0].agentInstanceIds.sort(),
+  ['host-root:fixture:new-process', 'host-root:fixture:old-process'],
+);
+
+const freshRestartSamePrompt = projectAgentConversations([
+  projectionInteraction({
+    interactionId: 'mi-fresh-old-process',
+    at: 1_788_300_000_000,
+    requestBody: 'REPEATED_FIRST_PROMPT',
+    responseText: 'OLD_FRESH_REPLY',
+    agentInstanceId: 'host-root:fixture:fresh-old',
+    requestMessages: [{ role: 'user', content: 'REPEATED_FIRST_PROMPT' }],
+  }),
+  projectionInteraction({
+    interactionId: 'mi-fresh-new-process',
+    at: 1_788_300_100_000,
+    requestBody: 'REPEATED_FIRST_PROMPT',
+    responseText: 'NEW_FRESH_REPLY',
+    agentInstanceId: 'host-root:fixture:fresh-new',
+    requestMessages: [{ role: 'user', content: 'REPEATED_FIRST_PROMPT' }],
+  }),
+], [], { timeType: 'last_30d', scope: 'agent', limit: 20 });
+assert.equal(freshRestartSamePrompt.summaries.length, 2,
+  'an equal one-message lineage is ambiguous and must not merge two process generations');
 
 const unresolvedToolLoop = projectAgentConversations([
   projectionInteraction({

@@ -598,6 +598,62 @@ const numericStringPid = transitions.recordSnapshot(snapshot('transition-forward
 assert.equal(numericStringPid.accepted, false);
 assert.equal(numericStringPid.reasonCode, 'validation_error');
 
+// Durable history keeps exact process generations after hot terminal retention and restores them
+// as historical/unobserved state after an API restart.
+const durableRows = new Map();
+const fakeRelationalStore = {
+  configured: () => true,
+  loadAgentRuntimeInstances: async () => [...durableRows.values()].map((record) => ({ ...record })),
+  saveAgentRuntimeInstances: async (records) => {
+    for (const record of records) {
+      durableRows.set(record.canonicalAgentInstanceId, structuredClone(record));
+    }
+    return true;
+  },
+};
+let durableNow = 6_000_000;
+now = durableNow;
+const durable = new AgentRuntimeStateService({
+  now: () => durableNow,
+  terminalTtlMs: 40,
+  pruneIntervalMs: 0,
+  durableHistory: true,
+}, fakeRelationalStore);
+await durable.onModuleInit();
+const durableLease = issueLease(durable, 'durable-forwarder', {
+  forwarderPid: 36_001,
+  forwarderStartTimeTicks: '1000',
+});
+const durableRoot = runtimeEntry('901', 'exited', { rootGeneration: 2 });
+assert.equal(durable.recordSnapshot(snapshot('durable-forwarder', 1, [durableRoot], {
+  leaseEpoch: durableLease.leaseEpoch,
+})).applied, true);
+const canonicalDurableId = `host-root:${durableRoot.hostId}:${durableRoot.bootId}:${durableRoot.rootPid}:${durableRoot.rootStartTimeTicks}`;
+assert.equal(durable.get(durableRoot.agentInstanceId)?.canonicalAgentInstanceId, canonicalDurableId);
+assert.equal(
+  durable.get(durableRoot.agentInstanceId)?.agentInstanceAliases.includes(durableRoot.physicalWorkloadId),
+  false,
+  'a physical workload is a placement relation, not a one-to-one Runtime alias',
+);
+durableNow += 41;
+durable.prune();
+assert.equal(durable.get(durableRoot.agentInstanceId)?.runtimeState, 'exited',
+  'durable terminal history must survive hot-state pruning');
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(durableRows.has(canonicalDurableId), true);
+
+const restored = new AgentRuntimeStateService({
+  now: () => durableNow,
+  pruneIntervalMs: 0,
+  durableHistory: true,
+}, fakeRelationalStore);
+await restored.onModuleInit();
+assert.equal(restored.get(canonicalDurableId)?.runtimeState, 'exited');
+assert.equal(restored.get(durableRoot.agentInstanceId)?.canonicalAgentInstanceId, canonicalDurableId,
+  'a persisted strong alias must resolve to the canonical Runtime after API restart');
+restored.close();
+durable.close();
+
 const typesSource = readFileSync(`${root}/apps/api/src/security-monitoring/types.ts`, 'utf8');
 assert.match(
   typesSource,

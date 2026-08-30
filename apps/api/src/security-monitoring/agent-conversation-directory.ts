@@ -126,6 +126,18 @@ function runtimeActivityUnixNs(instance: T.AgentRuntimeInstanceRecord): string {
   return (BigInt(instance.lastActivityAt ?? instance.lastSeenAt) * 1_000_000n).toString();
 }
 
+function runtimeCanonicalId(instance: T.AgentRuntimeInstanceRecord): string {
+  return instance.canonicalAgentInstanceId ?? instance.agentInstanceId;
+}
+
+function runtimeIdentityIds(instance: T.AgentRuntimeInstanceRecord): string[] {
+  return [...new Set([
+    runtimeCanonicalId(instance),
+    instance.agentInstanceId,
+    ...(instance.agentInstanceAliases ?? []),
+  ])];
+}
+
 export function projectAgentConversationDirectory(
   conversations: T.AgentConversationSummary[],
   runtimeInstances: T.AgentRuntimeInstanceRecord[],
@@ -165,15 +177,15 @@ export function projectAgentConversationDirectory(
     const agentAssetIds = [...new Set(conversations.map((item) => item.agentAssetId))];
     const instanceSet = new Set(agentInstanceIds);
     const matchingRuntime = runtimeInstances.filter((instance) => {
-      if (instanceSet.has(instance.agentInstanceId)) return true;
+      if (runtimeIdentityIds(instance).some((identity) => instanceSet.has(identity))) return true;
       const runtimeProduct = canonicalProduct(instance.agentDisplayName);
       return runtimeProduct === product
         && runtimeEnvironment(instance) === environment
         && runtimeWorkspace(instance, runtimeProduct) === workspacePath;
     });
     for (const instance of matchingRuntime) {
-      instanceSet.add(instance.agentInstanceId);
-      consumedRuntime.add(instance.agentInstanceId);
+      instanceSet.add(runtimeCanonicalId(instance));
+      consumedRuntime.add(runtimeCanonicalId(instance));
     }
     const running = matchingRuntime.filter((instance) => instance.runtimeState === 'running');
     const unobserved = matchingRuntime.filter((instance) => instance.runtimeState === 'unobserved');
@@ -204,7 +216,7 @@ export function projectAgentConversationDirectory(
 
   const runtimeGroups = new Map<string, T.AgentRuntimeInstanceRecord[]>();
   for (const instance of runtimeInstances) {
-    if (consumedRuntime.has(instance.agentInstanceId)) continue;
+    if (consumedRuntime.has(runtimeCanonicalId(instance))) continue;
     const product = canonicalProduct(instance.agentDisplayName);
     const environment = runtimeEnvironment(instance);
     const workspacePath = runtimeWorkspace(instance, product);
@@ -239,7 +251,7 @@ export function projectAgentConversationDirectory(
       conversationCount: 0,
       lastActivityAtUnixNs,
       agentAssetIds: [],
-      agentInstanceIds: instances.map((instance) => instance.agentInstanceId),
+      agentInstanceIds: [...new Set(instances.map(runtimeCanonicalId))],
       conversations: [],
       coverage: {
         status: 'asset_only',
@@ -267,4 +279,46 @@ export function projectAgentConversationDirectory(
         || compareUnixNs(left.lastActivityAtUnixNs, right.lastActivityAtUnixNs)
         || left.logicalAgentId.localeCompare(right.logicalAgentId);
     });
+}
+
+export function enrichAgentConversationDirectoryV2(
+  directory: T.LogicalAgentConversationDirectoryItem[],
+  runtimeInstances: T.AgentRuntimeInstanceRecord[],
+  now = Date.now(),
+): T.LogicalAgentConversationDirectoryItemV2[] {
+  return directory.map((agent) => {
+    const identities = new Set(agent.agentInstanceIds);
+    const instances = runtimeInstances
+      .filter((instance) => runtimeIdentityIds(instance).some((identity) => identities.has(identity)))
+      .sort((left, right) => right.lastSeenAt - left.lastSeenAt);
+    const activeConversations = agent.conversations.filter((conversation) => {
+      if (!conversation.lastActivityAtUnixNs) return false;
+      try {
+        return now - Number(BigInt(conversation.lastActivityAtUnixNs) / 1_000_000n) <= 5 * 60_000;
+      } catch {
+        return false;
+      }
+    }).length;
+    return {
+      ...agent,
+      instanceCounts: {
+        active: instances.filter((instance) =>
+          instance.runtimeState === 'running' && instance.activityState === 'active').length,
+        idle: instances.filter((instance) =>
+          instance.runtimeState === 'running' && instance.activityState === 'idle').length,
+        unobserved: instances.filter((instance) => instance.runtimeState === 'unobserved').length,
+        exited: instances.filter((instance) => instance.runtimeState === 'exited').length,
+        lost: instances.filter((instance) => instance.runtimeState === 'lost').length,
+        total: instances.length,
+      },
+      conversationCounts: {
+        active: activeConversations,
+        dormant: Math.max(0, agent.conversationCount - activeConversations),
+        incomplete: agent.conversations.filter((conversation) =>
+          conversation.coverage.status !== 'complete').length,
+        total: agent.conversationCount,
+      },
+      recentInstances: instances.slice(0, 100),
+    };
+  });
 }

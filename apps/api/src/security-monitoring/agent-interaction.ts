@@ -7,6 +7,7 @@ const MAX_LINE_BYTES = 14 * 1024 * 1024;
 const MAX_DERIVED_JSON_BYTES = 512 * 1024;
 const MAX_TOOL_ITEMS = 2_048;
 const MAX_MESSAGES = 4_096;
+const MAX_SEMANTIC_ITEMS = 4_096;
 const COMPLETENESS = new Set<T.AgentInteractionCompleteness>([
   'complete', 'partial', 'truncated', 'redacted', 'reference_only', 'unavailable', 'unsupported',
 ]);
@@ -24,6 +25,19 @@ const WIRE_COMPLETENESS = new Set<NonNullable<T.AgentInteractionRecord['wireComp
 ]);
 const CONVERSATION_COMPLETENESS = new Set<NonNullable<T.AgentInteractionRecord['conversationCompleteness']>>([
   'complete', 'tool_pending', 'response_pending', 'partial',
+]);
+const SEMANTIC_ACTORS = new Set<T.AgentInteractionSemanticActor>(['user', 'model', 'tool']);
+const SEMANTIC_KINDS = new Set<T.AgentInteractionSemanticKind>([
+  'user_message', 'model_progress', 'model_final', 'tool_call', 'tool_result',
+]);
+const SEMANTIC_PHASES = new Set<NonNullable<T.AgentInteractionSemanticItem['phase']>>([
+  'progress', 'final',
+]);
+const SEMANTIC_ORIGINS = new Set<T.AgentInteractionSemanticItem['origin']>([
+  'request', 'response',
+]);
+const SEMANTIC_COMPLETENESS = new Set<T.AgentInteractionSemanticItem['completeness']>([
+  'complete', 'partial', 'missing',
 ]);
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -177,6 +191,53 @@ function toolResults(value: unknown): T.AgentInteractionToolResult[] {
         : {}),
     };
   }).filter((item): item is T.AgentInteractionToolResult => Boolean(item));
+}
+
+function semanticItems(value: unknown): T.AgentInteractionSemanticItem[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, MAX_SEMANTIC_ITEMS)
+    .map((item): T.AgentInteractionSemanticItem | undefined => {
+      const input = record(item);
+      const semanticItemId = string(input?.semanticItemId, 160);
+      const actor = closedValue(input?.actor, SEMANTIC_ACTORS);
+      const kind = closedValue(input?.kind, SEMANTIC_KINDS);
+      const phase = closedValue(input?.phase, SEMANTIC_PHASES);
+      const origin = closedValue(input?.origin, SEMANTIC_ORIGINS);
+      const atUnixNs = unixNs(input?.atUnixNs);
+      const itemCompleteness = closedValue(input?.completeness, SEMANTIC_COMPLETENESS);
+      if (
+        !input || !semanticItemId || !/^si_[a-f0-9]{24,64}$/u.test(semanticItemId)
+        || !actor || !kind || !origin || !atUnixNs || !itemCompleteness
+      ) return undefined;
+      const content = boundedJson(input.content);
+      const outputIndex = integer(input.outputIndex, 0, Number.MAX_SAFE_INTEGER);
+      const contentIndex = integer(input.contentIndex, 0, Number.MAX_SAFE_INTEGER);
+      const sequenceNumber = integer(input.sequenceNumber, 0, Number.MAX_SAFE_INTEGER);
+      const partialReasons = Array.isArray(input.partialReasons)
+        ? [...new Set(input.partialReasons
+            .map((reason) => string(reason, 240))
+            .filter((reason): reason is string => Boolean(reason)))]
+            .slice(0, 64)
+        : [];
+      return {
+        semanticItemId,
+        actor,
+        kind,
+        ...(phase ? { phase } : {}),
+        origin,
+        atUnixNs,
+        ...(content !== undefined ? { content } : {}),
+        ...(string(input.toolCallId, 512) ? { toolCallId: string(input.toolCallId, 512) } : {}),
+        ...(string(input.toolName, 240) ? { toolName: string(input.toolName, 240) } : {}),
+        ...(string(input.sourceItemId, 512) ? { sourceItemId: string(input.sourceItemId, 512) } : {}),
+        ...(outputIndex !== undefined ? { outputIndex } : {}),
+        ...(contentIndex !== undefined ? { contentIndex } : {}),
+        ...(sequenceNumber !== undefined ? { sequenceNumber } : {}),
+        completeness: itemCompleteness,
+        partialReasons,
+      };
+    })
+    .filter((item): item is T.AgentInteractionSemanticItem => Boolean(item));
 }
 
 function unixNsToMs(value: string): number {
@@ -443,6 +504,13 @@ export function parseObserverAgentInteraction(
     response,
     toolCalls: toolCalls(input.toolCalls),
     toolResults: toolResults(input.toolResults),
+    ...(string(input.semanticParserId, 160)
+      ? { semanticParserId: string(input.semanticParserId, 160) }
+      : {}),
+    ...(integer(input.semanticParserVersion, 1, 1_000_000) !== undefined
+      ? { semanticParserVersion: integer(input.semanticParserVersion, 1, 1_000_000) }
+      : {}),
+    semanticItems: semanticItems(input.semanticItems),
     completeness: completeness(input.completeness),
     partialReasons,
     captureSource: string(input.captureSource, 120) ?? 'unknown',

@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 
 import type * as T from './types';
+import { normalizedModelResponseText } from './agent-semantic-timeline';
 
-const INFERRED_CONVERSATION_IDLE_MS = 30 * 60_000;
 const PREVIEW_CHARACTERS = 320;
 const GENERIC_SESSION_IDS = new Set([
   '', '-', 'none', 'null', 'unknown', 'legacy', 'default',
@@ -97,7 +97,8 @@ function explicitConversation(
   conversationId: string;
   source: 'provider' | 'runtime';
 } | undefined {
-  if (record.conversationId && record.conversationIdSource !== 'inferred') {
+  if (record.conversationId
+    && (record.conversationIdSource !== 'inferred' || record.conversationBindingVersion)) {
     return {
       conversationId: record.conversationId,
       source: record.conversationIdSource === 'runtime' ? 'runtime' : 'provider',
@@ -165,11 +166,92 @@ function compareInteraction(
   return left.at - right.at || left.interactionId.localeCompare(right.interactionId);
 }
 
+function canonicalSemanticJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'undefined';
+  if (Array.isArray(value)) return `[${value.map(canonicalSemanticJson).join(',')}]`;
+  const object = value as Record<string, unknown>;
+  return `{${Object.keys(object).sort().map((key) =>
+    `${JSON.stringify(key)}:${canonicalSemanticJson(object[key])}`).join(',')}}`;
+}
+
+function semanticValueHash(value: unknown): string {
+  return createHash('sha256').update(canonicalSemanticJson(value)).digest('hex');
+}
+
+/**
+ * Claude and other cumulative-message APIs resend prior tool results in every later model request.
+ * Keep the immutable Interaction evidence untouched, but normalize the conversation projection so
+ * an identical call/result is displayed and counted once. A changed result body remains visible as
+ * a distinct observation because the semantic hash is part of its identity.
+ */
+function deduplicateToolEvidence(
+  records: T.AgentInteractionRecord[],
+): T.AgentInteractionRecord[] {
+  const normalizedRecords = [...records].sort(compareInteraction).map((record) => ({
+    ...record,
+    toolCalls: [...record.toolCalls],
+    toolResults: [...record.toolResults],
+    semanticItems: record.semanticItems ? [...record.semanticItems] : undefined,
+  }));
+  const calls = new Map<string, { recordIndex: number; itemIndex: number; richness: number }>();
+  const results = new Map<string, { recordIndex: number; itemIndex: number }>();
+
+  normalizedRecords.forEach((record, recordIndex) => {
+    const retainedCalls: T.AgentInteractionToolCall[] = [];
+    for (const call of record.toolCalls) {
+      const richness = canonicalSemanticJson(call.arguments).length
+        + (normalized(call.name) === 'unknown' ? 0 : call.name.length);
+      const prior = calls.get(call.toolCallId);
+      if (!prior) {
+        calls.set(call.toolCallId, {
+          recordIndex,
+          itemIndex: retainedCalls.length,
+          richness,
+        });
+        retainedCalls.push(call);
+        continue;
+      }
+      if (richness > prior.richness) {
+        normalizedRecords[prior.recordIndex].toolCalls[prior.itemIndex] = call;
+        prior.richness = richness;
+      }
+    }
+    record.toolCalls = retainedCalls;
+
+    const retainedResults: T.AgentInteractionToolResult[] = [];
+    for (const result of record.toolResults) {
+      const key = `${result.toolCallId}\u0000${semanticValueHash({
+        content: result.content,
+        isError: result.isError,
+      })}`;
+      const prior = results.get(key);
+      if (prior) {
+        const existing = normalizedRecords[prior.recordIndex].toolResults[prior.itemIndex];
+        if (!existing.name && result.name) existing.name = result.name;
+        continue;
+      }
+      results.set(key, { recordIndex, itemIndex: retainedResults.length });
+      retainedResults.push(result);
+    }
+    record.toolResults = retainedResults;
+  });
+
+  return normalizedRecords;
+}
+
 function userMessageLineage(record: T.AgentInteractionRecord): string[] {
   return requestMessages(record)
     .filter((message) => message.role.toLowerCase() === 'user')
+    .map((message) => {
+      if (!Array.isArray(message.content)) return message.content;
+      const visible = message.content.filter((part) =>
+        !part || typeof part !== 'object' || Array.isArray(part)
+        || (part as Record<string, unknown>).type !== 'tool_result');
+      return visible.length ? visible : undefined;
+    })
+    .filter((content) => content !== undefined)
     .map((message) => createHash('sha256')
-      .update(JSON.stringify(message.content ?? null))
+      .update(JSON.stringify(message ?? null))
       .digest('hex'));
 }
 
@@ -177,12 +259,44 @@ function isPrefix(left: string[], right: string[]): boolean {
   return left.length <= right.length && left.every((value, index) => value === right[index]);
 }
 
+function isProperPrefix(left: string[], right: string[]): boolean {
+  return left.length > 0 && left.length < right.length && isPrefix(left, right);
+}
+
+function isCliAgent(record: T.AgentInteractionRecord): boolean {
+  const product = normalized(record.agentProduct);
+  return ['codex', 'codex-cli', 'claude', 'claude-code', 'pi', 'kimi', 'kimi-cli', 'kimi-code']
+    .some((candidate) => product === candidate || product.includes(candidate));
+}
+
+function inferredThreadScope(record: T.AgentInteractionRecord): string {
+  return [
+    normalized(displayProduct(record.agentProduct) ?? record.agentProduct),
+    normalized(record.workspacePath),
+    normalized(record.process?.hostId),
+  ].join('\u0000');
+}
+
+function clusterContinuesPriorThread(
+  prior: T.AgentInteractionRecord[],
+  current: T.AgentInteractionRecord[],
+): boolean {
+  const issuedCalls = new Set(prior.flatMap((record) =>
+    record.toolCalls.map((call) => call.toolCallId)));
+  if (current.some((record) =>
+    record.toolResults.some((result) => issuedCalls.has(result.toolCallId)))) return true;
+  if (!isCliAgent(current[0])) return false;
+  const priorLineage = userMessageLineage(prior.at(-1)!);
+  const currentLineage = userMessageLineage(current.at(-1)!);
+  return isProperPrefix(priorLineage, currentLineage);
+}
+
 function continuesInferredConversation(
   cluster: T.AgentInteractionRecord[],
   current: T.AgentInteractionRecord,
 ): boolean {
   const previous = cluster.at(-1);
-  if (!previous || current.at - previous.at > INFERRED_CONVERSATION_IDLE_MS) return false;
+  if (!previous) return false;
   if (current.providerPreviousResponseId && cluster.some((record) =>
     record.providerResponseId === current.providerPreviousResponseId)) return true;
 
@@ -524,6 +638,7 @@ export function projectAgentConversations(
     records: T.AgentInteractionRecord[];
   }>();
   const inferredByRoot = new Map<string, T.AgentInteractionRecord[]>();
+  const inferredClusters: Array<{ root: string; records: T.AgentInteractionRecord[] }> = [];
   const providerChains = providerResponseChains(semanticInteractions);
 
   for (const record of [...semanticInteractions].sort(compareInteraction)) {
@@ -547,11 +662,7 @@ export function projectAgentConversations(
     let cluster: T.AgentInteractionRecord[] = [];
     const flush = () => {
       if (cluster.length === 0) return;
-      const conversationId = stableId(
-        'cv',
-        `inferred\u0000${root}\u0000${cluster[0].interactionId}`,
-      );
-      grouped.set(conversationId, { source: 'inferred', records: cluster });
+      inferredClusters.push({ root, records: cluster });
       cluster = [];
     };
     for (const record of records.sort(compareInteraction)) {
@@ -561,11 +672,42 @@ export function projectAgentConversations(
     flush();
   }
 
+  const inferredThreads: Array<{
+    root: string;
+    scope: string;
+    records: T.AgentInteractionRecord[];
+  }> = [];
+  for (const cluster of inferredClusters.sort((left, right) =>
+    compareInteraction(left.records[0], right.records[0]))) {
+    const scope = inferredThreadScope(cluster.records[0]);
+    const candidate = inferredThreads
+      .filter((thread) => thread.scope === scope && thread.root !== cluster.root)
+      .filter((thread) => clusterContinuesPriorThread(thread.records, cluster.records))
+      .sort((left, right) =>
+        userMessageLineage(right.records.at(-1)!).length
+        - userMessageLineage(left.records.at(-1)!).length)[0];
+    if (candidate) {
+      candidate.records.push(...cluster.records);
+    } else {
+      inferredThreads.push({ root: cluster.root, scope, records: [...cluster.records] });
+    }
+  }
+  for (const thread of inferredThreads) {
+    const conversationId = stableId(
+      'cv',
+      `inferred\u0000${thread.root}\u0000${thread.records[0].interactionId}`,
+    );
+    grouped.set(conversationId, { source: 'inferred', records: thread.records });
+  }
+
   const interactionsByConversation = new Map<string, T.AgentInteractionRecord[]>();
   const summaries: T.AgentConversationSummary[] = [];
   const assetsWithContent = new Set<string>();
   for (const [conversationId, group] of grouped) {
-    const projected = annotateTurns(conversationId, group.records);
+    const projected = annotateTurns(
+      conversationId,
+      deduplicateToolEvidence(group.records),
+    );
     interactionsByConversation.set(conversationId, projected);
     const summary = summaryForConversation(
       conversationId,
@@ -703,24 +845,27 @@ export function projectConversationTimeline(
       attemptNumber,
     });
 
-    const responseEvent = eventId('model_response', interaction.interactionId);
-    pending.push({
-      ...common,
-      eventId: responseEvent,
-      kind: 'model_response',
-      sequence: 0,
-      sortOrder: 30,
-      atUnixNs: interaction.firstResponseAtUnixNs,
-      parentEventId: requestEvent,
-      title: 'LLM 返回给 Agent',
-      contentPreview: jsonPreview(
-        interaction.response.text ?? interaction.response.structured ?? interaction.response.body,
-      ),
-      model: interaction.model,
-      statusCode: interaction.statusCode,
-      durationNs: interaction.durationNs,
-      attemptNumber,
-    });
+    const modelText = normalizedModelResponseText(interaction);
+    const responseEvent = modelText
+      ? eventId('model_response', interaction.interactionId)
+      : undefined;
+    if (modelText) {
+      pending.push({
+        ...common,
+        eventId: responseEvent!,
+        kind: 'model_response',
+        sequence: 0,
+        sortOrder: 30,
+        atUnixNs: interaction.firstResponseAtUnixNs,
+        parentEventId: requestEvent,
+        title: interaction.toolCalls.length ? '模型过程说明' : '模型最终回复',
+        contentPreview: jsonPreview(modelText),
+        model: interaction.model,
+        statusCode: interaction.statusCode,
+        durationNs: interaction.durationNs,
+        attemptNumber,
+      });
+    }
 
     for (const call of interaction.toolCalls) {
       pending.push({
@@ -731,7 +876,7 @@ export function projectConversationTimeline(
         sequence: 0,
         sortOrder: 40,
         atUnixNs: call.issuedAtUnixNs ?? interaction.endedAtUnixNs,
-        parentEventId: responseEvent,
+        parentEventId: responseEvent ?? requestEvent,
         toolCallId: call.toolCallId,
         title: `${call.name} 工具指令`,
         contentPreview: jsonPreview(call.arguments),
@@ -748,7 +893,7 @@ export function projectConversationTimeline(
         sequence: 0,
         sortOrder: 50,
         atUnixNs: interaction.endedAtUnixNs,
-        parentEventId: responseEvent,
+        parentEventId: responseEvent ?? requestEvent,
         title: interaction.statusCode >= 400
           ? `模型调用失败 · HTTP ${interaction.statusCode}`
           : '模型交互内容不完整',

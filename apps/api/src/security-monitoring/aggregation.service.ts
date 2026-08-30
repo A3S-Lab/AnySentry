@@ -64,6 +64,12 @@ import {
   projectAgentConversations,
   projectConversationTimeline,
 } from './agent-conversation';
+import { AgentConversationBindingService } from './agent-conversation-binding.service';
+import {
+  projectSemanticConversationTimeline,
+  SEMANTIC_PROJECTION_PARSER_ID,
+  SEMANTIC_PROJECTION_PARSER_VERSION,
+} from './agent-semantic-timeline';
 import * as T from './types';
 
 const SEV_RANK: Record<T.Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
@@ -706,6 +712,7 @@ export class AggregationService {
     private readonly maintenance: MaintenanceWindowService,
     private readonly sources: IngestionSourceService,
     @Optional() private readonly assetReviews?: ObservedAssetReviewService,
+    @Optional() private readonly conversationBindings?: AgentConversationBindingService,
   ) {}
 
   // The dashboard polls 9 endpoints with the same filter near-simultaneously; cache the windowed
@@ -2035,8 +2042,13 @@ export class AggregationService {
     ]).finally(() => {
       if (inventoryTimer) clearTimeout(inventoryTimer);
     });
+    const boundInteractions = this.conversationBindings
+      ? await this.conversationBindings.applyPersistedBindings(interactions.items)
+      : interactions.items;
+    const projection = projectAgentConversations(boundInteractions, inventory.items, filter);
+    if (this.conversationBindings) await this.conversationBindings.persistProjection(projection);
     return {
-      projection: projectAgentConversations(interactions.items, inventory.items, filter),
+      projection,
       interactions,
       inventory,
     };
@@ -2083,6 +2095,41 @@ export class AggregationService {
       items,
       interactionIds: records.map((item) => item.interactionId),
       total: items.length,
+      coverage: {
+        ...interactions.coverage,
+        partial,
+        partialReason: interactions.coverage.partialReason
+          ?? inventory.coverage.partialReason,
+      },
+      dataSource: interactions.dataSource,
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  async agentConversationTimelineV2(
+    filter: T.AgentConversationQuery,
+  ): Promise<T.AgentConversationTimelineV2> {
+    const { projection, interactions, inventory } = await this.agentConversationProjection(filter);
+    const thread = projection.summaries.find((item) =>
+      item.conversationId === filter.conversationId);
+    const records = filter.conversationId
+      ? projection.interactionsByConversation.get(filter.conversationId) ?? []
+      : [];
+    const segments = filter.conversationId && this.conversationBindings
+      ? this.conversationBindings.segmentsForConversation(filter.conversationId)
+      : [];
+    const turns = thread?.hasContent
+      ? projectSemanticConversationTimeline(thread, records, segments)
+      : [];
+    const partial = interactions.coverage.partial || inventory.coverage.partial;
+    return {
+      thread,
+      segments,
+      turns,
+      interactionIds: records.map((item) => item.interactionId),
+      parserId: SEMANTIC_PROJECTION_PARSER_ID,
+      parserVersion: SEMANTIC_PROJECTION_PARSER_VERSION,
       coverage: {
         ...interactions.coverage,
         partial,

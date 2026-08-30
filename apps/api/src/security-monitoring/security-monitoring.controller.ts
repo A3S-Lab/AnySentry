@@ -6,7 +6,10 @@ import { SkipWrap } from '../shared/api-response.interceptor';
 import { AgentMetadataService } from './agent-metadata.service';
 import { AgentRuntimeStateService } from './agent-runtime-state.service';
 import { currentAgentSubjectAssetIds, mergePersistentAgentDirectory } from './agent-directory';
-import { projectAgentConversationDirectory } from './agent-conversation-directory';
+import {
+  enrichAgentConversationDirectoryV2,
+  projectAgentConversationDirectory,
+} from './agent-conversation-directory';
 import { AggregationService } from './aggregation.service';
 import { AlertingService } from './alerting.service';
 import { AuditService } from './audit.service';
@@ -4623,6 +4626,45 @@ export class SecurityMonitoringController {
     return result;
   }
 
+  @Post('agents/conversations/timeline-v2')
+  @HttpCode(200)
+  async agentConversationTimelineV2(
+    @Body() f: T.AgentConversationQuery,
+    @Headers() headers: HeaderBag,
+  ) {
+    const conversationId = strictIdentityText(f?.conversationId, 512);
+    if (!conversationId) {
+      throw new BadRequestException('a valid conversationId is required');
+    }
+    const agentAssetId = f?.agentAssetId === undefined
+      ? undefined
+      : strictIdentityText(f.agentAssetId, 512);
+    if (f?.agentAssetId !== undefined && !agentAssetId) {
+      throw new BadRequestException('agentAssetId is invalid');
+    }
+    const result = await this.agg.agentConversationTimelineV2({
+      ...f,
+      conversationId,
+      agentAssetId,
+    });
+    this.audit.record({
+      actor: auditActor(headers),
+      action: 'agent.conversation.content.read',
+      resourceType: 'agent',
+      resourceId: agentAssetId ?? conversationId,
+      summary: `Read Agent semantic conversation timeline with ${result.turns.length} turn(s)`,
+      details: {
+        agentAssetId,
+        conversationId,
+        turnCount: result.turns.length,
+        interactionCount: result.interactionIds.length,
+        parserVersion: result.parserVersion,
+        classificationView: f?.classificationView,
+      },
+    });
+    return result;
+  }
+
   @Post('agents/conversation-directory')
   @HttpCode(200)
   async agentConversationDirectory(
@@ -4667,6 +4709,21 @@ export class SecurityMonitoringController {
         ? { assetBindingRevision: conversations.assetBindingRevision }
         : {}),
       updateTime: conversations.updateTime,
+    };
+  }
+
+  @Post('agents/conversation-directory-v2')
+  @HttpCode(200)
+  async agentConversationDirectoryV2(
+    @Body() f: T.AgentConversationDirectoryQuery,
+    @Headers() headers: HeaderBag,
+  ): Promise<T.AgentConversationDirectoryListV2> {
+    const legacy = await this.agentConversationDirectory(f, headers);
+    const runtime = this.agentRuntimeState.list({ includeShadow: true, limit: 100_000 });
+    return {
+      ...legacy,
+      apiVersion: 2,
+      items: enrichAgentConversationDirectoryV2(legacy.items, runtime.items),
     };
   }
 

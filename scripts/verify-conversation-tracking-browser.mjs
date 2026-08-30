@@ -118,6 +118,19 @@ const scopedInteraction = await api('/agents/interactions', {
 });
 assert.equal(scopedInteraction.items[0]?.interactionId, scopedInteractionId,
   'interactionId must remain resolvable through a reconciled Agent asset alias');
+const semanticTimeline = await api('/agents/conversations/timeline-v2', {
+  timeType: 'last_30d',
+  scope: 'agent',
+  classificationView: 'current_effective',
+  agentAssetId: conversation.agentAssetId,
+  conversationId: conversation.conversationId,
+});
+assert.ok(semanticTimeline.turns.length > 0, 'V2 timeline must expose semantic turns');
+assert.deepEqual(
+  [...new Set(semanticTimeline.turns.flatMap((turn) => turn.events.map((event) => event.actor)))].sort(),
+  ['model', 'tool', 'user'],
+  'the visible actor contract must contain only User, Model and Tool',
+);
 
 const port = await freePort();
 const chrome = spawn(chromeBinary, [
@@ -193,21 +206,44 @@ try {
   const bodyText = await waitFor('conversation timeline', () => evaluate('document.body?.innerText ?? ""'),
     (text) => text.includes('对话追踪')
       && text.includes(marker)
-      && text.includes('Agent 发送给 LLM')
-      && text.includes('LLM 返回给 Agent')
-      && text.includes('工具指令')
-      && text.includes('工具结果'), 60_000);
+      && text.includes('用户')
+      && text.includes('模型')
+      && text.includes('工具')
+      && text.includes(toolMarker), 60_000);
   assert(!bodyText.includes('management token required'));
   assert.equal(await evaluate('document.querySelectorAll("[role=option]").length > 0'), true);
+  const panelSeparators = await evaluate(`[...document.querySelectorAll('[role="separator"]')]
+    .map((node) => ({ label: node.getAttribute('aria-label'), display: getComputedStyle(node).display }))`);
+  assert.equal(
+    panelSeparators.filter((item) => [
+      '调整 Agent 目录宽度',
+      '调整事件检查器宽度',
+    ].includes(item.label)).length,
+    2,
+    `resizable panel separators: ${JSON.stringify(panelSeparators)}`,
+  );
+  const resized = await evaluate(`(() => new Promise((resolve) => {
+    const workspace = document.querySelector('#conversation-workspace > div');
+    const separator = document.querySelector('[role="separator"][aria-label="调整 Agent 目录宽度"]');
+    if (!workspace || !separator) { resolve(false); return; }
+    const before = getComputedStyle(workspace).getPropertyValue('--conversation-left');
+    separator.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    requestAnimationFrame(() => {
+      const after = getComputedStyle(workspace).getPropertyValue('--conversation-left');
+      resolve(before !== after);
+    });
+  }))()`);
+  assert.equal(resized, true, 'keyboard resizing must update the left panel width');
   await assertNoOverflow('conversation 1440');
   await screenshot('conversation-tracking-1440.png');
 
   await evaluate(`(() => {
     const button = [...document.querySelectorAll('button')]
-      .find((node) => node.textContent?.includes('LLM 返回给 Agent')
+      .find((node) => node.textContent?.includes('模型')
         && node.textContent?.includes(${JSON.stringify(responseMarker)}))
       ?? [...document.querySelectorAll('button')]
-        .find((node) => node.textContent?.includes('Agent 发送给 LLM'));
+        .find((node) => node.textContent?.includes('用户')
+          && node.textContent?.includes(${JSON.stringify(marker)}));
     button?.click();
   })()`);
   await waitFor('interaction inspector', () => evaluate('document.body?.innerText ?? ""'),
@@ -248,6 +284,8 @@ try {
     screenshots: outputDirectory,
     conversationId: conversation.conversationId,
     managementTokenRequiredForRead: false,
+    semanticActors: ['user', 'model', 'tool'],
+    resizablePanels: true,
     desktopTimelineVisible: true,
     inspectorStructuredRawEvidence: true,
     responsiveViewports: [1440, 1024, 390],

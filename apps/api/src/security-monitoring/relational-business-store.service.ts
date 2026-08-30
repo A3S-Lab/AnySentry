@@ -3,6 +3,10 @@ import { randomUUID } from 'node:crypto';
 import { Pool, PoolClient } from 'pg';
 import {
   AgentMetadataRecord,
+  AgentRuntimeInstanceRecord,
+  AgentConversationBindingRecord,
+  AgentConversationThreadRecord,
+  ConversationInstanceSegment,
   AgentWorkspaceBindingRecord,
   AlertRecord,
   IngestionSourceRecord,
@@ -20,6 +24,8 @@ import { PolicyConfig } from './policy-config';
 const AGENT_METADATA_LIMIT = 10_000;
 const WORKSPACE_DIRECTORY_LIMIT = 10_000;
 const AGENT_WORKSPACE_BINDING_LIMIT = 100_000;
+const AGENT_RUNTIME_INSTANCE_LIMIT = 100_000;
+const AGENT_CONVERSATION_BINDING_LIMIT = 100_000;
 const INCIDENT_LIMIT = 20_000;
 const ALERT_LIMIT = 20_000;
 const REMEDIATION_LIMIT = 20_000;
@@ -320,6 +326,312 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     } catch (error) {
       if (client) await client.query('ROLLBACK').catch(() => undefined);
       this.markUnavailable('save Agent-Workspace bindings', error);
+      return false;
+    } finally {
+      client?.release();
+    }
+  }
+
+  async loadAgentRuntimeInstances(): Promise<AgentRuntimeInstanceRecord[]> {
+    if (!(await this.initialize()) || !this.pool) return [];
+    try {
+      const result = await this.pool.query<{ record: AgentRuntimeInstanceRecord | string }>(
+        `SELECT record
+           FROM anysentry_agent_runtime_instances_v2
+          ORDER BY updated_at DESC
+          LIMIT $1`,
+        [AGENT_RUNTIME_INSTANCE_LIMIT],
+      );
+      return result.rows
+        .map(({ record }) => this.parseRecord<AgentRuntimeInstanceRecord>(record))
+        .filter((record): record is AgentRuntimeInstanceRecord => Boolean(
+          record?.agentInstanceId
+          && record.canonicalAgentInstanceId
+          && record.rootPid
+          && record.rootStartTimeTicks,
+        ));
+    } catch (error) {
+      this.markUnavailable('load Agent Runtime instances', error);
+      return [];
+    }
+  }
+
+  async saveAgentRuntimeInstances(records: AgentRuntimeInstanceRecord[]): Promise<boolean> {
+    if (records.length === 0) return true;
+    if (!(await this.initialize()) || !this.pool) return false;
+    let client: PoolClient | undefined;
+    try {
+      client = await this.pool.connect();
+      await client.query('BEGIN');
+      const normalizedRecords = records.map((record) => {
+        const canonical = record.canonicalAgentInstanceId ?? record.agentInstanceId;
+        const aliases = [...new Set([
+          canonical,
+          record.agentInstanceId,
+          ...(record.agentInstanceAliases ?? []),
+        ])].filter(Boolean);
+        const updatedAt = Math.max(
+          record.receivedAt,
+          record.lastSeenAt,
+          record.endedAt ?? 0,
+        );
+        return {
+          ...record,
+          canonicalAgentInstanceId: canonical,
+          agentInstanceAliases: aliases,
+          updatedAt,
+        };
+      });
+      await client.query(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         INSERT INTO anysentry_agent_runtime_instances_v2 (
+           canonical_instance_id, agent_scope_id, runtime_state, last_seen_at,
+           ended_at, record, updated_at
+         )
+         SELECT
+           record->>'canonicalAgentInstanceId',
+           record->>'agentScopeId',
+           record->>'runtimeState',
+           (record->>'lastSeenAt')::bigint,
+           NULLIF(record->>'endedAt', '')::bigint,
+           record - 'updatedAt',
+           (record->>'updatedAt')::bigint
+         FROM incoming
+         ON CONFLICT (canonical_instance_id) DO UPDATE SET
+           agent_scope_id = EXCLUDED.agent_scope_id,
+           runtime_state = EXCLUDED.runtime_state,
+           last_seen_at = GREATEST(
+             anysentry_agent_runtime_instances_v2.last_seen_at,
+             EXCLUDED.last_seen_at
+           ),
+           ended_at = COALESCE(EXCLUDED.ended_at, anysentry_agent_runtime_instances_v2.ended_at),
+           record = EXCLUDED.record,
+           updated_at = EXCLUDED.updated_at
+         WHERE EXCLUDED.updated_at >= anysentry_agent_runtime_instances_v2.updated_at`,
+        [JSON.stringify(normalizedRecords)],
+      );
+      const aliasRows = normalizedRecords.flatMap((record) =>
+        record.agentInstanceAliases.map((alias) => ({
+          alias,
+          canonical: record.canonicalAgentInstanceId,
+          firstSeenAt: record.discoveredAt,
+          lastSeenAt: record.lastSeenAt,
+        })));
+      await client.query(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         INSERT INTO anysentry_agent_runtime_instance_aliases_v1 (
+           alias_instance_id, canonical_instance_id, first_seen_at, last_seen_at
+         )
+         SELECT
+           record->>'alias',
+           record->>'canonical',
+           (record->>'firstSeenAt')::bigint,
+           (record->>'lastSeenAt')::bigint
+         FROM incoming
+         ON CONFLICT (alias_instance_id) DO UPDATE SET
+           canonical_instance_id = EXCLUDED.canonical_instance_id,
+           first_seen_at = LEAST(
+             anysentry_agent_runtime_instance_aliases_v1.first_seen_at,
+             EXCLUDED.first_seen_at
+           ),
+           last_seen_at = GREATEST(
+             anysentry_agent_runtime_instance_aliases_v1.last_seen_at,
+             EXCLUDED.last_seen_at
+           )`,
+        [JSON.stringify(aliasRows)],
+      );
+      await client.query('COMMIT');
+      return true;
+    } catch (error) {
+      await client?.query('ROLLBACK').catch(() => undefined);
+      this.markUnavailable('save Agent Runtime instances', error);
+      return false;
+    } finally {
+      client?.release();
+    }
+  }
+
+  async loadAgentConversationBindings(
+    interactionIds: string[],
+  ): Promise<AgentConversationBindingRecord[]> {
+    if (interactionIds.length === 0 || !(await this.initialize()) || !this.pool) return [];
+    try {
+      const result = await this.pool.query<{ record: AgentConversationBindingRecord | string }>(
+        `SELECT record
+           FROM anysentry_agent_conversation_bindings_v1
+          WHERE interaction_id = ANY($1::text[])
+          LIMIT $2`,
+        [interactionIds.slice(0, AGENT_CONVERSATION_BINDING_LIMIT), AGENT_CONVERSATION_BINDING_LIMIT],
+      );
+      return result.rows
+        .map(({ record }) => this.parseRecord<AgentConversationBindingRecord>(record))
+        .filter((record): record is AgentConversationBindingRecord => Boolean(
+          record?.interactionId && record.conversationId && record.segmentId,
+        ));
+    } catch (error) {
+      this.markUnavailable('load Agent Conversation bindings', error);
+      return [];
+    }
+  }
+
+  async loadAgentConversationThreads(
+    logicalScopeKeys: string[],
+  ): Promise<AgentConversationThreadRecord[]> {
+    if (logicalScopeKeys.length === 0 || !(await this.initialize()) || !this.pool) return [];
+    try {
+      const result = await this.pool.query<{ record: AgentConversationThreadRecord | string }>(
+        `SELECT record
+           FROM anysentry_agent_conversation_threads_v1
+          WHERE logical_scope_key = ANY($1::text[])
+          ORDER BY last_activity_at DESC
+          LIMIT $2`,
+        [[...new Set(logicalScopeKeys)], AGENT_CONVERSATION_BINDING_LIMIT],
+      );
+      return result.rows
+        .map(({ record }) => this.parseRecord<AgentConversationThreadRecord>(record))
+        .filter((record): record is AgentConversationThreadRecord => Boolean(
+          record?.conversationId && record.logicalScopeKey,
+        ));
+    } catch (error) {
+      this.markUnavailable('load Agent Conversation threads', error);
+      return [];
+    }
+  }
+
+  async loadAgentConversationSegments(
+    conversationIds: string[],
+  ): Promise<ConversationInstanceSegment[]> {
+    if (conversationIds.length === 0 || !(await this.initialize()) || !this.pool) return [];
+    try {
+      const result = await this.pool.query<{ record: ConversationInstanceSegment | string }>(
+        `SELECT record
+           FROM anysentry_agent_conversation_segments_v1
+          WHERE conversation_id = ANY($1::text[])
+          ORDER BY conversation_id, ordinal
+          LIMIT $2`,
+        [[...new Set(conversationIds)], AGENT_CONVERSATION_BINDING_LIMIT],
+      );
+      return result.rows
+        .map(({ record }) => this.parseRecord<ConversationInstanceSegment>(record))
+        .filter((record): record is ConversationInstanceSegment => Boolean(
+          record?.segmentId && record.conversationId && record.agentInstanceId,
+        ));
+    } catch (error) {
+      this.markUnavailable('load Agent Conversation segments', error);
+      return [];
+    }
+  }
+
+  async saveAgentConversationResolution(
+    threads: AgentConversationThreadRecord[],
+    segments: ConversationInstanceSegment[],
+    bindings: AgentConversationBindingRecord[],
+  ): Promise<boolean> {
+    if (threads.length === 0 && segments.length === 0 && bindings.length === 0) return true;
+    if (!(await this.initialize()) || !this.pool) return false;
+    let client: PoolClient | undefined;
+    try {
+      client = await this.pool.connect();
+      await client.query('BEGIN');
+      if (threads.length) {
+        await client.query(
+          `WITH incoming AS (
+             SELECT item AS record
+               FROM jsonb_array_elements($1::jsonb) AS source(item)
+           )
+           INSERT INTO anysentry_agent_conversation_threads_v1 (
+             conversation_id, logical_scope_key, id_source, last_activity_at, record, updated_at
+           )
+           SELECT
+             record->>'conversationId',
+             record->>'logicalScopeKey',
+             record->>'idSource',
+             (record->>'lastActivityAtUnixNs')::numeric,
+             record,
+             (record->>'updatedAt')::bigint
+           FROM incoming
+           ON CONFLICT (conversation_id) DO UPDATE SET
+             logical_scope_key = EXCLUDED.logical_scope_key,
+             id_source = EXCLUDED.id_source,
+             last_activity_at = GREATEST(
+               anysentry_agent_conversation_threads_v1.last_activity_at,
+               EXCLUDED.last_activity_at
+             ),
+             record = EXCLUDED.record,
+             updated_at = EXCLUDED.updated_at
+           WHERE EXCLUDED.updated_at >= anysentry_agent_conversation_threads_v1.updated_at`,
+          [JSON.stringify(threads)],
+        );
+      }
+      if (segments.length) {
+        await client.query(
+          `WITH incoming AS (
+             SELECT item AS record
+               FROM jsonb_array_elements($1::jsonb) AS source(item)
+           )
+           INSERT INTO anysentry_agent_conversation_segments_v1 (
+             segment_id, conversation_id, agent_instance_id, ordinal,
+             started_at, ended_at, record, updated_at
+           )
+           SELECT
+             record->>'segmentId',
+             record->>'conversationId',
+             record->>'agentInstanceId',
+             (record->>'ordinal')::integer,
+             (record->>'startedAtUnixNs')::numeric,
+             NULLIF(record->>'endedAtUnixNs', '')::numeric,
+             record,
+             (record->>'updatedAt')::bigint
+           FROM incoming
+           ON CONFLICT (segment_id) DO UPDATE SET
+             ended_at = EXCLUDED.ended_at,
+             record = EXCLUDED.record,
+             updated_at = EXCLUDED.updated_at
+           WHERE EXCLUDED.updated_at >= anysentry_agent_conversation_segments_v1.updated_at`,
+          [JSON.stringify(segments)],
+        );
+      }
+      if (bindings.length) {
+        await client.query(
+          `WITH incoming AS (
+             SELECT item AS record
+               FROM jsonb_array_elements($1::jsonb) AS source(item)
+           )
+           INSERT INTO anysentry_agent_conversation_bindings_v1 (
+             interaction_id, conversation_id, segment_id, logical_scope_key,
+             record, updated_at
+           )
+           SELECT
+             record->>'interactionId',
+             record->>'conversationId',
+             record->>'segmentId',
+             record->>'logicalScopeKey',
+             record,
+             (record->>'updatedAt')::bigint
+           FROM incoming
+           ON CONFLICT (interaction_id) DO UPDATE SET
+             conversation_id = EXCLUDED.conversation_id,
+             segment_id = EXCLUDED.segment_id,
+             logical_scope_key = EXCLUDED.logical_scope_key,
+             record = EXCLUDED.record,
+             updated_at = EXCLUDED.updated_at
+           WHERE (EXCLUDED.record->>'resolverVersion')::integer >= (
+             anysentry_agent_conversation_bindings_v1.record->>'resolverVersion'
+           )::integer`,
+          [JSON.stringify(bindings)],
+        );
+      }
+      await client.query('COMMIT');
+      return true;
+    } catch (error) {
+      await client?.query('ROLLBACK').catch(() => undefined);
+      this.markUnavailable('save Agent Conversation resolution', error);
       return false;
     } finally {
       client?.release();
@@ -1029,6 +1341,94 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         CREATE UNIQUE INDEX IF NOT EXISTS anysentry_agent_workspace_bindings_active_idx
           ON anysentry_agent_workspace_bindings (agent_asset_id)
           WHERE valid_to IS NULL
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_agent_runtime_instances_v2 (
+          canonical_instance_id TEXT PRIMARY KEY,
+          agent_scope_id TEXT NOT NULL,
+          runtime_state TEXT NOT NULL,
+          last_seen_at BIGINT NOT NULL,
+          ended_at BIGINT,
+          record JSONB NOT NULL,
+          updated_at BIGINT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_agent_runtime_instances_v2_scope_time_idx
+          ON anysentry_agent_runtime_instances_v2 (agent_scope_id, last_seen_at DESC)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_agent_runtime_instances_v2_state_time_idx
+          ON anysentry_agent_runtime_instances_v2 (runtime_state, last_seen_at DESC)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_agent_runtime_instance_aliases_v1 (
+          alias_instance_id TEXT PRIMARY KEY,
+          canonical_instance_id TEXT NOT NULL REFERENCES
+            anysentry_agent_runtime_instances_v2(canonical_instance_id) ON DELETE CASCADE,
+          first_seen_at BIGINT NOT NULL,
+          last_seen_at BIGINT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_agent_runtime_instance_aliases_v1_canonical_idx
+          ON anysentry_agent_runtime_instance_aliases_v1 (canonical_instance_id)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_agent_conversation_threads_v1 (
+          conversation_id TEXT PRIMARY KEY,
+          logical_scope_key TEXT NOT NULL,
+          id_source TEXT NOT NULL,
+          last_activity_at NUMERIC(40, 0) NOT NULL,
+          record JSONB NOT NULL,
+          updated_at BIGINT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_agent_conversation_threads_v1_scope_time_idx
+          ON anysentry_agent_conversation_threads_v1 (logical_scope_key, last_activity_at DESC)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_agent_conversation_segments_v1 (
+          segment_id TEXT PRIMARY KEY,
+          conversation_id TEXT NOT NULL REFERENCES
+            anysentry_agent_conversation_threads_v1(conversation_id) ON DELETE CASCADE,
+          agent_instance_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL,
+          started_at NUMERIC(40, 0) NOT NULL,
+          ended_at NUMERIC(40, 0),
+          record JSONB NOT NULL,
+          updated_at BIGINT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_agent_conversation_segments_v1_thread_idx
+          ON anysentry_agent_conversation_segments_v1 (conversation_id, ordinal)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_agent_conversation_segments_v1_instance_time_idx
+          ON anysentry_agent_conversation_segments_v1 (agent_instance_id, started_at DESC)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_agent_conversation_bindings_v1 (
+          interaction_id TEXT PRIMARY KEY,
+          conversation_id TEXT NOT NULL REFERENCES
+            anysentry_agent_conversation_threads_v1(conversation_id) ON DELETE CASCADE,
+          segment_id TEXT NOT NULL REFERENCES
+            anysentry_agent_conversation_segments_v1(segment_id) ON DELETE CASCADE,
+          logical_scope_key TEXT NOT NULL,
+          record JSONB NOT NULL,
+          updated_at BIGINT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_agent_conversation_bindings_v1_thread_idx
+          ON anysentry_agent_conversation_bindings_v1 (conversation_id)
       `);
       await pool.query(`
         CREATE TABLE IF NOT EXISTS anysentry_incidents (
