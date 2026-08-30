@@ -271,7 +271,7 @@ export function ConversationSemanticTimeline({
           <div className="mx-auto max-w-4xl space-y-3" aria-label="正在加载语义时间线">
             {[0, 1, 2, 3].map((index) => <div key={index} className="h-24 animate-pulse rounded border border-white/5 bg-white/[0.025]" />)}
           </div>
-        ) : error ? (
+        ) : error && turns.length === 0 ? (
           <div className="mx-auto max-w-2xl rounded border border-rose-400/20 bg-rose-500/[0.06] p-4 text-xs leading-5 text-rose-100">
             <p className="font-semibold">语义时间线加载失败</p>
             <p className="mt-1 text-rose-200/70">{error.message}</p>

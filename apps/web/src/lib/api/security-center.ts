@@ -3902,17 +3902,17 @@ export const securityCenterApi = {
   agentActions: (filter: AgentEventQuery) =>
     apiClient.post<AgentActionList>("/security-center/agents/actions", filter),
   agentInteractions: (filter: AgentInteractionQuery) =>
-    apiClient.post<AgentInteractionList>("/security-center/agents/interactions", filter),
+    apiClient.postLong<AgentInteractionList>("/security-center/agents/interactions", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
   agentConversations: (filter: AgentConversationQuery) =>
-    apiClient.post<AgentConversationList>("/security-center/agents/conversations", filter),
+    apiClient.postLong<AgentConversationList>("/security-center/agents/conversations", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
   agentConversationDirectory: (filter: AgentConversationDirectoryQuery) =>
-    apiClient.post<AgentConversationDirectoryList>("/security-center/agents/conversation-directory", filter),
+    apiClient.postLong<AgentConversationDirectoryList>("/security-center/agents/conversation-directory", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
   agentConversationDirectoryV2: (filter: AgentConversationDirectoryQuery) =>
-    apiClient.post<AgentConversationDirectoryListV2>("/security-center/agents/conversation-directory-v2", filter),
+    apiClient.postLong<AgentConversationDirectoryListV2>("/security-center/agents/conversation-directory-v2", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
   agentConversationTimeline: (filter: AgentConversationQuery & { conversationId: string }) =>
-    apiClient.post<AgentConversationTimeline>("/security-center/agents/conversations/timeline", filter),
+    apiClient.postLong<AgentConversationTimeline>("/security-center/agents/conversations/timeline", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
   agentConversationTimelineV2: (filter: AgentConversationQuery & { conversationId: string }) =>
-    apiClient.post<AgentConversationTimelineV2>("/security-center/agents/conversations/timeline-v2", filter),
+    apiClient.postLong<AgentConversationTimelineV2>("/security-center/agents/conversations/timeline-v2", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
   agentToolEvidence: (filter: AgentEventQuery & { invocationId: string }) =>
     apiClient.post<ToolEvidenceResponse>("/security-center/events/tool-evidence", filter),
   observedAssets: (query: ObservedAssetListQuery) =>

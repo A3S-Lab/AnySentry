@@ -246,8 +246,11 @@ try {
           && node.textContent?.includes(${JSON.stringify(marker)}));
     button?.click();
   })()`);
-  await waitFor('interaction inspector', () => evaluate('document.body?.innerText ?? ""'),
-    (text) => text.includes('结构化') && text.includes('原始') && text.includes('证据'));
+  await waitFor(
+    'interaction inspector',
+    () => evaluate('document.querySelectorAll("[role=tab]").length'),
+    (count) => count === 3,
+  );
   await waitFor(
     'interaction deep link',
     () => evaluate('location.search.includes("interactionId=")'),
