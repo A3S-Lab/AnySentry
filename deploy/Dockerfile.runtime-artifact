@@ -1,0 +1,10 @@
+# Immutable application overlay for an already validated AnySentry production runtime.
+#
+# Use only when package manifests and lockfiles are unchanged: the digest-pinned base owns Node,
+# production dependencies, component manifests and the startup contract; this artifact replaces
+# the compiled API and dashboard produced from the reviewed source commit.
+ARG ANYSENTRY_RUNTIME_BASE=invalid.invalid/anysentry-runtime:must-be-overridden
+FROM ${ANYSENTRY_RUNTIME_BASE}
+
+COPY api-dist/ /app/dist/
+COPY web-dist/ /app/web/
