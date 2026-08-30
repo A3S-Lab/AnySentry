@@ -1,6 +1,6 @@
 import dayjs from "dayjs";
 import { Bot, Boxes, ChevronRight, Cpu, MessageSquareText } from "lucide-react";
-import { type KeyboardEvent, useMemo, useRef } from "react";
+import { type KeyboardEvent, useMemo, useRef, useState } from "react";
 
 import type {
   AgentConversationSummary,
@@ -81,6 +81,7 @@ export function LogicalAgentNavigator({
   onSelectConversation: (conversation: AgentConversationSummary) => void;
 }) {
   const refs = useRef(new Map<string, HTMLButtonElement>());
+  const [expandedHistory, setExpandedHistory] = useState<Set<string>>(() => new Set());
   const ordered = useMemo(() => [
     ...items.filter((item) => item.lifecycleState !== "historical"),
     ...items.filter((item) => item.lifecycleState === "historical"),
@@ -110,6 +111,15 @@ export function LogicalAgentNavigator({
           const index = ordered.indexOf(agent);
           const active = agent.logicalAgentId === selectedLogicalAgentId;
           const instances = matchingInstances(agent, runtimeInstances);
+          const currentInstances = instances.filter((instance) =>
+            instance.runtimeState === "running" || instance.runtimeState === "unobserved");
+          const historicalInstances = instances.filter((instance) =>
+            instance.runtimeState !== "running" && instance.runtimeState !== "unobserved");
+          const historyExpanded = expandedHistory.has(agent.logicalAgentId);
+          const displayedInstances = historyExpanded
+            ? instances
+            : [...currentInstances, ...historicalInstances.slice(0, 8)];
+          const hiddenHistoryCount = Math.max(0, historicalInstances.length - 8);
           const visibleConversations = selectedInstanceId
             ? agent.conversations.filter((conversation) =>
                 conversation.agentInstanceIds.includes(selectedInstanceId))
@@ -162,7 +172,7 @@ export function LogicalAgentNavigator({
                     <span>{instances.length || agent.totalInstanceCount}</span>
                   </div>
                   <div className="space-y-1">
-                    {instances.length ? instances.map((instance) => {
+                    {displayedInstances.length ? displayedInstances.map((instance) => {
                       const canonical = runtimeId(instance);
                       const selected = selectedInstanceId === canonical;
                       return (
@@ -192,6 +202,21 @@ export function LogicalAgentNavigator({
                     }) : (
                       <p className="px-2 py-2 text-[10px] leading-4 text-zinc-600">实例历史正在恢复；会话正文仍可按 Thread 查看。</p>
                     )}
+                    {hiddenHistoryCount > 0 || historyExpanded && historicalInstances.length > 8 ? (
+                      <button
+                        type="button"
+                        aria-expanded={historyExpanded}
+                        onClick={() => setExpandedHistory((current) => {
+                          const next = new Set(current);
+                          if (next.has(agent.logicalAgentId)) next.delete(agent.logicalAgentId);
+                          else next.add(agent.logicalAgentId);
+                          return next;
+                        })}
+                        className="min-h-11 w-full cursor-pointer rounded border border-dashed border-white/10 px-2 text-[10px] text-zinc-500 transition-colors hover:border-violet-400/25 hover:bg-violet-500/[0.04] hover:text-zinc-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70"
+                      >
+                        {historyExpanded ? "收起较早历史实例" : `展开另外 ${hiddenHistoryCount} 个历史实例`}
+                      </button>
+                    ) : null}
                   </div>
 
                   <div className="mb-1.5 mt-3 flex items-center justify-between px-1 text-[10px] font-medium text-zinc-500">
