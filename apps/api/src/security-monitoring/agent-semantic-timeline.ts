@@ -293,6 +293,8 @@ export function projectSemanticConversationTimeline(
 
   const calls = new Map<string, T.AgentSemanticEvent>();
   const resultKeys = new Set<string>();
+  const resolvedToolCallIds = new Set(ordered.flatMap((interaction) =>
+    interaction.toolResults.map((result) => result.toolCallId)));
   let previousUserLineage: string[] = [];
   const turns = new Map<string, {
     ordinal: number;
@@ -382,7 +384,22 @@ export function projectSemanticConversationTimeline(
         interactionId: interaction.interactionId,
       });
     }
-    if (interaction.statusCode >= 400 || interaction.completeness !== 'complete') {
+    const unresolvedToolCall = interaction.toolCalls.some((call) =>
+      !resolvedToolCallIds.has(call.toolCallId));
+    const resolvedToolPending = interaction.statusCode < 400
+      && interaction.toolCalls.length > 0
+      && !unresolvedToolCall
+      && (
+        interaction.conversationCompleteness === 'tool_pending'
+        || interaction.partialReasons.includes('tool_result_pending')
+      )
+      && interaction.transportCompleteness !== 'partial'
+      && (interaction.wireCompleteness === undefined || interaction.wireCompleteness === 'complete')
+      && interaction.partialReasons.every((reason) => reason === 'tool_result_pending');
+    if (
+      interaction.statusCode >= 400
+      || (interaction.completeness !== 'complete' && !resolvedToolPending)
+    ) {
       turn.diagnostics.push({
         diagnosticId: `diag_gap_${interaction.interactionId}`,
         type: interaction.parseState && interaction.parseState !== 'parsed' ? 'parse_gap' : 'capture_gap',

@@ -367,6 +367,8 @@ assert.deepEqual(
   [...new Set(semanticToolLoop.flatMap((turn) => turn.events.map((event) => event.actor)))].sort(),
   ['model', 'tool', 'user'],
 );
+assert.equal(semanticToolLoop.flatMap((turn) => turn.diagnostics).length, 0,
+  'a later matching tool result must resolve the earlier tool-pending diagnostic');
 
 const cumulativeClaudeResults = projectAgentConversations([
   projectionInteraction({
