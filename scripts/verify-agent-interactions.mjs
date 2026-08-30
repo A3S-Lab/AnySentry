@@ -310,7 +310,7 @@ const timeline = await requestWithoutManagementToken('/agents/conversations/time
 assert.equal(timeline.conversation.conversationId, conversation.conversationId);
 assert.deepEqual(
   [...new Set(timeline.items.map((entry) => entry.kind))].sort(),
-  ['model_request', 'model_response', 'tool_call', 'tool_result'],
+  ['error', 'model_request', 'model_response', 'tool_call', 'tool_result'],
 );
 assert.equal(timeline.interactionIds.includes(interactionId), true);
 

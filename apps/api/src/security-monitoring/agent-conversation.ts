@@ -350,13 +350,17 @@ function effectiveInteractionState(
     !resolvedResults.has(call.toolCallId));
   const reasons = interaction.partialReasons.filter((reason) =>
     reason !== 'tool_result_pending' || unresolvedToolCall);
+  if (unresolvedToolCall && !reasons.includes('tool_result_pending')) {
+    reasons.push('tool_result_pending');
+  }
   const pendingResolved = interaction.completeness === 'partial'
     && interaction.partialReasons.includes('tool_result_pending')
     && !unresolvedToolCall
     && reasons.length === 0
     && interaction.statusCode < 400;
   return {
-    complete: interaction.completeness === 'complete' || pendingResolved,
+    complete: (interaction.completeness === 'complete' && !unresolvedToolCall)
+      || pendingResolved,
     reasons,
   };
 }

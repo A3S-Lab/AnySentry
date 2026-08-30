@@ -1154,7 +1154,9 @@ Host/path，不读取模型名决定 TLS attach，也不因自定义 base URL �
 9. **Responses 工具状态回补**：`tool_result_pending` 描述的是一次模型 Interaction 在结束时尚未
    携带工具结果，不等于整个 Conversation 失败。Conversation 投影按 `call_id` 扫描后续
    `custom_tool_call_output`；若结果已经出现且没有其他 partial reason，摘要、coverage 和时间线按
-   完成展示，原始 Interaction 仍保留当时的传输状态。
+   完成展示；若任一新 `call_id` 在整个 Conversation 中仍无结果，即使原始 Interaction 因同时
+   携带上一工具结果而标成 complete，会话层仍保留 `tool_result_pending`。原始 Interaction 始终
+   保留当时的传输状态。
 10. **Rustls 移动指针续帧**：Codex 同一 PID 可保留多个活跃 WebSocket，Rustls `CommonState`
     指针还可能在完整帧、半帧和 opcode `0` continuation 之间变化。归并优先选择方向上等待续接的
     decoder；完整新帧存在多个候选时选择最近且具备 pending request 的语义兼容连接，避免明文字节

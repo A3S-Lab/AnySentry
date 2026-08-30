@@ -327,4 +327,31 @@ assert.deepEqual(
   ['model_request', 'model_response', 'tool_call', 'tool_result', 'model_request', 'model_response'],
 );
 
+const unresolvedToolLoop = projectAgentConversations([
+  projectionInteraction({
+    interactionId: 'mi-unresolved-tool-call',
+    at: 1_788_060_100_000,
+    requestBody: 'UNRESOLVED_TOOL_REQUEST',
+    responseText: 'UNRESOLVED_TOOL_WILL_RUN',
+    providerResponseId: 'resp-unresolved-tool',
+    toolCalls: [{
+      toolCallId: 'call-still-pending',
+      name: 'exec',
+      arguments: { cmd: 'printf pending' },
+      issuedAtUnixNs: '1788060100002000000',
+    }],
+  }),
+], [], { timeType: 'last_30d', scope: 'agent', limit: 20 });
+const unresolvedSummary = unresolvedToolLoop.summaries[0];
+assert.equal(unresolvedSummary.errorCount, 1);
+assert.equal(unresolvedSummary.coverage.status, 'partial');
+assert.deepEqual(unresolvedSummary.coverage.reasons, ['tool_result_pending']);
+assert.equal(
+  projectConversationTimeline(
+    unresolvedSummary,
+    unresolvedToolLoop.interactionsByConversation.get(unresolvedSummary.conversationId),
+  ).at(-1).kind,
+  'error',
+);
+
 console.log('agent conversation directory verification passed');
