@@ -540,6 +540,9 @@ const invokeOneCall = projectionRecord('invoke-one-call', projectionAt, 'LANGCHA
     toolCallId: 'call-projection-1', name: 'lookup_fixture', arguments: { key: 'canary' },
     issuedAtUnixNs: String(BigInt(projectionAt + 2) * 1_000_000n),
   }],
+  completeness: 'partial',
+  partialReasons: ['tool_result_pending'],
+  conversationCompleteness: 'tool_pending',
 });
 const invokeOneFinal = projectionRecord('invoke-one-final', projectionAt + 5, 'LANGCHAIN_INVOKE_ONE', {
   toolResults: [{
@@ -562,6 +565,9 @@ assert.deepEqual(
 const toolConversation = inferredProjection.summaries.find((summary) => summary.modelCallCount === 2);
 assert.equal(toolConversation?.toolCallCount, 1);
 assert.equal(toolConversation?.toolResultCount, 1);
+assert.equal(toolConversation?.errorCount, 0);
+assert.equal(toolConversation?.coverage.status, 'complete');
+assert.deepEqual(toolConversation?.coverage.reasons, []);
 const projectedTimeline = projectConversationTimeline(
   toolConversation,
   inferredProjection.interactionsByConversation.get(toolConversation.conversationId),

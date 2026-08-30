@@ -1151,6 +1151,14 @@ Host/path，不读取模型名决定 TLS attach，也不因自定义 base URL �
    asset alias 执行同一上限；高频 Agent 因此不能挤掉其他 Agent 的历史会话，同时读取保持有界
    并明确返回 partial coverage。ClickHouse 先仅对 ID/asset/time 轻量索引执行 `LIMIT BY`，再按
    已选 ID 读取正文；大 payload 不参与公平排序，避免排序阶段放大内存。
+9. **Responses 工具状态回补**：`tool_result_pending` 描述的是一次模型 Interaction 在结束时尚未
+   携带工具结果，不等于整个 Conversation 失败。Conversation 投影按 `call_id` 扫描后续
+   `custom_tool_call_output`；若结果已经出现且没有其他 partial reason，摘要、coverage 和时间线按
+   完成展示，原始 Interaction 仍保留当时的传输状态。
+10. **Rustls 移动指针续帧**：Codex 同一 PID 可保留多个活跃 WebSocket，Rustls `CommonState`
+    指针还可能在完整帧、半帧和 opcode `0` continuation 之间变化。归并优先选择方向上等待续接的
+    decoder；完整新帧存在多个候选时选择最近且具备 pending request 的语义兼容连接，避免明文字节
+    被误送进 HTTP decoder。该规则不读取产品版本、URL 或模型配置。
 
 ### C.3 实机矩阵
 

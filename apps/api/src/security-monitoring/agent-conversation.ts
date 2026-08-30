@@ -335,6 +335,32 @@ function firstPromptPreview(record: T.AgentInteractionRecord): string | undefine
   return userPreview ?? jsonPreview(developer?.content) ?? requestPreview(record);
 }
 
+function resolvedToolResultIds(
+  interactions: T.AgentInteractionRecord[],
+): Set<string> {
+  return new Set(interactions.flatMap((item) =>
+    item.toolResults.map((result) => result.toolCallId)));
+}
+
+function effectiveInteractionState(
+  interaction: T.AgentInteractionRecord,
+  resolvedResults: Set<string>,
+): { complete: boolean; reasons: string[] } {
+  const unresolvedToolCall = interaction.toolCalls.some((call) =>
+    !resolvedResults.has(call.toolCallId));
+  const reasons = interaction.partialReasons.filter((reason) =>
+    reason !== 'tool_result_pending' || unresolvedToolCall);
+  const pendingResolved = interaction.completeness === 'partial'
+    && interaction.partialReasons.includes('tool_result_pending')
+    && !unresolvedToolCall
+    && reasons.length === 0
+    && interaction.statusCode < 400;
+  return {
+    complete: interaction.completeness === 'complete' || pendingResolved,
+    reasons,
+  };
+}
+
 function conversationCoverage(
   interactions: T.AgentInteractionRecord[],
 ): T.AgentConversationCoverage {
@@ -346,9 +372,11 @@ function conversationCoverage(
       partialInteractions: 0,
     };
   }
-  const completeInteractions = interactions.filter((item) => item.completeness === 'complete').length;
+  const resolvedResults = resolvedToolResultIds(interactions);
+  const states = interactions.map((item) => effectiveInteractionState(item, resolvedResults));
+  const completeInteractions = states.filter((state) => state.complete).length;
   const partialInteractions = interactions.length - completeInteractions;
-  const reasons = [...new Set(interactions.flatMap((item) => item.partialReasons))];
+  const reasons = [...new Set(states.flatMap((state) => state.reasons))];
   let status: T.AgentConversationCoverageStatus = partialInteractions ? 'partial' : 'complete';
   if (interactions.every((item) => item.interactionType === 'unparsed')) {
     status = interactions.some((item) =>
@@ -361,7 +389,8 @@ function conversationCoverage(
     status = interactions.some((item) => /(?:http\/2|websocket|quic)/iu.test(item.protocol))
       ? 'unsupported_protocol'
       : 'unsupported_tls_profile';
-  } else if (interactions.some((item) => item.statusCode === 0 || item.partialReasons.includes('stream_incomplete'))) {
+  } else if (interactions.some((item, index) =>
+    item.statusCode === 0 || states[index].reasons.includes('stream_incomplete'))) {
     status = 'no_final_response';
   }
   return {
@@ -389,6 +418,7 @@ function summaryForConversation(
   const agentProduct = displayProduct(
     first.agentProduct ?? asset?.agentProduct ?? asset?.detectedName,
   ) ?? 'Agent';
+  const resolvedResults = resolvedToolResultIds(interactions);
   return {
     conversationId,
     idSource: source,
@@ -407,7 +437,9 @@ function summaryForConversation(
     modelCallCount: interactions.filter((item) => item.interactionType === 'model').length,
     toolCallCount: interactions.reduce((sum, item) => sum + item.toolCalls.length, 0),
     toolResultCount: interactions.reduce((sum, item) => sum + item.toolResults.length, 0),
-    errorCount: interactions.filter((item) => item.statusCode >= 400 || item.completeness !== 'complete').length,
+    errorCount: interactions.filter((item) =>
+      item.statusCode >= 400
+      || !effectiveInteractionState(item, resolvedResults).complete).length,
     models: [...new Set(interactions
       .map((item) => item.model)
       .filter((value): value is string => Boolean(value)))],
@@ -568,6 +600,7 @@ export function projectConversationTimeline(
   interactions: T.AgentInteractionRecord[],
 ): T.AgentConversationEvent[] {
   const ordered = [...interactions].sort(compareInteraction);
+  const resolvedResults = resolvedToolResultIds(ordered);
   const callEventIds = new Map<string, string>();
   for (const interaction of ordered) {
     for (const call of interaction.toolCalls) {
@@ -579,6 +612,7 @@ export function projectConversationTimeline(
   const pending: Array<T.AgentConversationEvent & { sortOrder: number }> = [];
   let previous: T.AgentInteractionRecord | undefined;
   for (const interaction of ordered) {
+    const effectiveState = effectiveInteractionState(interaction, resolvedResults);
     const turnId = interaction.turnId ?? `${conversation.conversationId}:turn:1`;
     const modelCallId = interaction.modelCallId ?? stableId('mc', interaction.interactionId);
     const attemptNumber = (attempts.get(modelCallId) ?? 0) + 1;
@@ -589,7 +623,7 @@ export function projectConversationTimeline(
       modelCallId,
       attemptId: interaction.attemptId ?? `${modelCallId}:attempt:${attemptNumber}`,
       interactionId: interaction.interactionId,
-      completeness: interaction.completeness,
+      completeness: effectiveState.complete ? 'complete' : interaction.completeness,
       correlationQuality: quality,
       evidenceEventIds: [] as string[],
     };
@@ -702,7 +736,7 @@ export function projectConversationTimeline(
       });
     }
 
-    if (interaction.statusCode >= 400 || interaction.completeness !== 'complete') {
+    if (interaction.statusCode >= 400 || !effectiveState.complete) {
       pending.push({
         ...common,
         eventId: eventId('error', interaction.interactionId),
@@ -714,7 +748,7 @@ export function projectConversationTimeline(
         title: interaction.statusCode >= 400
           ? `模型调用失败 · HTTP ${interaction.statusCode}`
           : '模型交互内容不完整',
-        contentPreview: interaction.partialReasons.join('、') || undefined,
+        contentPreview: effectiveState.reasons.join('、') || undefined,
         isError: true,
         statusCode: interaction.statusCode,
       });

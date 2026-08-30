@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 
 import { projectAgentConversationDirectory } from '../apps/api/dist/security-monitoring/agent-conversation-directory.js';
+import {
+  projectAgentConversations,
+  projectConversationTimeline,
+} from '../apps/api/dist/security-monitoring/agent-conversation.js';
 
 const coverage = (status = 'complete') => ({
   status,
@@ -208,6 +212,119 @@ assert.equal(realWorkspaceIsolation.length, 2);
 assert.deepEqual(
   realWorkspaceIsolation.map((item) => item.workspacePath).sort(),
   ['/srv/project-a', '/srv/project-b'],
+);
+
+const content = (body, messages = []) => ({
+  body,
+  encoding: 'utf8',
+  contentType: 'application/json',
+  capturedBytes: body.length,
+  decodedBytes: body.length,
+  sha256: body.padEnd(64, '0').slice(0, 64),
+  completeness: 'complete',
+  messages,
+});
+const projectionInteraction = ({
+  interactionId,
+  at,
+  requestBody,
+  responseText,
+  providerResponseId,
+  providerPreviousResponseId,
+  toolCalls = [],
+  toolResults = [],
+  completeness = 'complete',
+  partialReasons = [],
+}) => ({
+  schemaVersion: 'anysentry.agent_interaction.v1',
+  interactionId,
+  interactionType: 'model',
+  at,
+  workspacePath: '/workspace/codex',
+  agentAssetId: 'agent-codex-projection',
+  agentInstanceId: 'host-root:fixture:codex',
+  agentProduct: 'Codex',
+  detectedClassification: 'confirmed_agent',
+  currentEffectiveClassification: 'confirmed_agent',
+  connectionId: 'tls:codex-projection',
+  transport: 'tls',
+  protocol: 'websocket-json',
+  transportProtocol: 'websocket',
+  wireTemplateId: 'openai-responses',
+  parseState: 'parsed',
+  llmLikelihood: 'confirmed',
+  endpoint: 'fixture.invalid',
+  method: 'POST',
+  path: '/v1/responses',
+  statusCode: 200,
+  model: 'fixture-model',
+  providerResponseId,
+  providerPreviousResponseId,
+  startedAtUnixNs: String(BigInt(at) * 1_000_000n),
+  requestCompleteAtUnixNs: String(BigInt(at + 1) * 1_000_000n),
+  firstResponseAtUnixNs: String(BigInt(at + 2) * 1_000_000n),
+  endedAtUnixNs: String(BigInt(at + 3) * 1_000_000n),
+  durationNs: '3000000',
+  timeQuality: 'collector_calibrated',
+  request: content(requestBody, [{
+    role: toolResults.length ? 'custom_tool_call_output' : 'user',
+    content: requestBody,
+    ...(toolResults[0] ? { toolCallId: toolResults[0].toolCallId } : {}),
+  }]),
+  response: { ...content(responseText), text: responseText },
+  toolCalls,
+  toolResults,
+  completeness,
+  partialReasons,
+  captureSource: 'tls_uprobe_rustls',
+  receivedAt: at + 4,
+});
+
+const callId = 'call-cross-interaction';
+const projectedToolLoop = projectAgentConversations([
+  projectionInteraction({
+    interactionId: 'mi-tool-pending',
+    at: 1_788_060_000_000,
+    requestBody: 'USER_TOOL_REQUEST',
+    responseText: 'TOOL_WILL_RUN',
+    providerResponseId: 'resp-tool-pending',
+    toolCalls: [{
+      toolCallId: callId,
+      name: 'exec',
+      arguments: { cmd: 'printf fixture' },
+      issuedAtUnixNs: '1788060000002000000',
+    }],
+    completeness: 'partial',
+    partialReasons: ['tool_result_pending'],
+  }),
+  projectionInteraction({
+    interactionId: 'mi-tool-result-final',
+    at: 1_788_060_000_010,
+    requestBody: 'TOOL_RESULT_FIXTURE',
+    responseText: 'FINAL_RESPONSE_FIXTURE',
+    providerResponseId: 'resp-tool-final',
+    providerPreviousResponseId: 'resp-tool-pending',
+    toolResults: [{
+      toolCallId: callId,
+      content: 'TOOL_RESULT_FIXTURE',
+      isError: false,
+      observedAtUnixNs: '1788060000010000000',
+    }],
+  }),
+], [], { timeType: 'last_30d', scope: 'agent', limit: 20 });
+assert.equal(projectedToolLoop.summaries.length, 1);
+const resolvedToolLoop = projectedToolLoop.summaries[0];
+assert.equal(resolvedToolLoop.toolCallCount, 1);
+assert.equal(resolvedToolLoop.toolResultCount, 1);
+assert.equal(resolvedToolLoop.errorCount, 0);
+assert.equal(resolvedToolLoop.coverage.status, 'complete');
+assert.deepEqual(resolvedToolLoop.coverage.reasons, []);
+assert.deepEqual(
+  projectConversationTimeline(
+    resolvedToolLoop,
+    projectedToolLoop.interactionsByConversation.get(resolvedToolLoop.conversationId),
+  ).map((item) => item.kind),
+  ['model_request', 'model_response', 'tool_call', 'tool_result', 'model_request', 'model_response'],
 );
 
 console.log('agent conversation directory verification passed');
