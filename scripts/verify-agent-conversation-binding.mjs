@@ -144,6 +144,20 @@ const freshProjection = await resolveAndPersist(service, [fresh]);
 assert.notEqual(freshProjection.projection.summaries[0].conversationId, conversationId,
   'an equal first prompt is insufficient evidence to merge a fresh process');
 
+const firstStoredSegment = [...storedSegments.values()].find((segment) =>
+  segment.conversationId === conversationId
+  && segment.agentInstanceId === first.agentInstanceId);
+assert.ok(firstStoredSegment);
+storedSegments.set('seg_legacy_contained_subset', {
+  ...structuredClone(firstStoredSegment),
+  segmentId: 'seg_legacy_contained_subset',
+  ordinal: 99,
+  startedAtUnixNs: nextDay.startedAtUnixNs,
+  firstInteractionId: nextDay.interactionId,
+  interactionCount: 1,
+  updatedAt: nextDay.receivedAt - 1,
+});
+
 const restartedService = new AgentConversationBindingService(fakeStore);
 const resumedAfterApiRestart = interaction({
   id: 'mi_binding_after_api_restart',
@@ -155,6 +169,9 @@ const restartedProjection = await resolveAndPersist(restartedService, [resumedAf
 assert.equal(restartedProjection.bound[0].conversationId, conversationId,
   'PostgreSQL Thread state must recover resume attribution after an API restart');
 assert.equal(restartedService.segmentsForConversation(conversationId).length, 3);
+assert.ok(!restartedService.segmentsForConversation(conversationId).some((segment) =>
+  segment.segmentId === 'seg_legacy_contained_subset'),
+  'a contained historical segment must not duplicate its complete Runtime segment');
 assert.equal(storedBindings.size, 5);
 
 console.log('Agent Conversation durable Thread/Segment binding verification passed');

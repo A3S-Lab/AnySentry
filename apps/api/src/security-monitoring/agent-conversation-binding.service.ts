@@ -74,6 +74,57 @@ function threadRank(source: T.AgentConversationThreadRecord['idSource']): number
   return source === 'provider' ? 3 : source === 'runtime' ? 2 : 1;
 }
 
+function segmentEnd(segment: T.ConversationInstanceSegment): bigint {
+  return BigInt(segment.endedAtUnixNs ?? segment.startedAtUnixNs);
+}
+
+function segmentContains(
+  outer: T.ConversationInstanceSegment,
+  inner: T.ConversationInstanceSegment,
+): boolean {
+  return outer.agentInstanceId === inner.agentInstanceId
+    && BigInt(outer.startedAtUnixNs) <= BigInt(inner.startedAtUnixNs)
+    && segmentEnd(outer) >= segmentEnd(inner);
+}
+
+function segmentPreferred(
+  left: T.ConversationInstanceSegment,
+  right: T.ConversationInstanceSegment,
+): boolean {
+  const leftDuration = segmentEnd(left) - BigInt(left.startedAtUnixNs);
+  const rightDuration = segmentEnd(right) - BigInt(right.startedAtUnixNs);
+  return leftDuration > rightDuration
+    || (leftDuration === rightDuration && left.interactionCount > right.interactionCount)
+    || (leftDuration === rightDuration
+      && left.interactionCount === right.interactionCount
+      && left.updatedAt > right.updatedAt)
+    || (leftDuration === rightDuration
+      && left.interactionCount === right.interactionCount
+      && left.updatedAt === right.updatedAt
+      && left.segmentId < right.segmentId);
+}
+
+function collapseContainedSegments(
+  segments: T.ConversationInstanceSegment[],
+): T.ConversationInstanceSegment[] {
+  return segments
+    .filter((candidate) => !segments.some((other) =>
+      other.segmentId !== candidate.segmentId
+      && segmentContains(other, candidate)
+      && (
+        !segmentContains(candidate, other)
+        || segmentPreferred(other, candidate)
+      )))
+    .sort((left, right) => {
+      const leftStart = BigInt(left.startedAtUnixNs);
+      const rightStart = BigInt(right.startedAtUnixNs);
+      return leftStart === rightStart
+        ? left.ordinal - right.ordinal || left.segmentId.localeCompare(right.segmentId)
+        : leftStart < rightStart ? -1 : 1;
+    })
+    .map((segment, index) => ({ ...segment, ordinal: index + 1 }));
+}
+
 @Injectable()
 export class AgentConversationBindingService {
   private readonly bindings = new Map<string, T.AgentConversationBindingRecord>();
@@ -381,10 +432,8 @@ export class AgentConversationBindingService {
 
   segmentsForConversation(conversationId: string): T.ConversationInstanceSegment[] {
     const canonical = this.canonicalConversationId(conversationId);
-    return [...this.segments.values()]
-      .filter((segment) => segment.conversationId === canonical)
-      .sort((left, right) => left.ordinal - right.ordinal)
-      .map((segment) => ({ ...segment }));
+    return collapseContainedSegments([...this.segments.values()]
+      .filter((segment) => segment.conversationId === canonical));
   }
 
   routeAlias(conversationId: string): ConversationRouteAliasV1 | undefined {
