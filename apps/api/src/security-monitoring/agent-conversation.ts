@@ -55,6 +55,11 @@ function interactionEnvironment(
   const cgroup = record.process?.cgroup?.toLowerCase() ?? '';
   if (cgroup.includes('kubepods')) return 'kubernetes';
   if (/(?:docker|containerd|crio|libpod)/u.test(cgroup)) return 'docker';
+  // Interactions normalized before the additive `environment` field retain Observer's legacy
+  // container workspace (`agent://<container-id>`) even when cgroup text was unavailable. This is
+  // the same compatibility signal already used by the directory projector; it lets historical
+  // Docker Threads migrate without rewriting immutable Interaction facts.
+  if (record.workspacePath.startsWith('agent://')) return 'docker';
   return record.process ? 'host' : asset?.runtime ?? 'unknown';
 }
 

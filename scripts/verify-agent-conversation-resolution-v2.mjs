@@ -439,6 +439,18 @@ assert.deepEqual(
   ['模型请求发生重试 · Attempt 2', '模型请求发生重试 · Attempt 3'],
 );
 
+const legacyDockerProjection = projectAgentConversations([
+  interaction({
+    id: 'mi_v2_legacy_docker', at: base + 3_500, instance: 'host-root:legacy-docker:one',
+    agentProduct: 'Pi', workspacePath: 'agent://0123456789ab',
+    providerConversationId: 'legacy-docker-thread',
+    request: { model: 'fixture', messages: [{ role: 'user', content: 'legacy container' }] },
+    responseId: 'legacy-docker-response',
+  }),
+], [], { timeType: 'last_30d', scope: 'agent', limit: 100 });
+assert.equal(legacyDockerProjection.summaries[0].environment, 'docker',
+  'legacy agent:// container workspaces must migrate to the Docker environment');
+
 const assertOneThread = (records, label) => {
   const resolved = resolveAgentConversationsV2(records);
   assert.equal(new Set(resolved.conversationRecords.map((item) => item.conversationId)).size, 1, label);
