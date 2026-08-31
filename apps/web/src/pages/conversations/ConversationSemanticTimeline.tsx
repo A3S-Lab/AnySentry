@@ -22,7 +22,7 @@ import type {
   AgentRunTechnicalActivitySummary,
   AgentSemanticEvent,
   ConversationInstanceSegment,
-  LogicalAgentConversationDirectoryItem,
+  LogicalAgentConversationDirectoryItemV3,
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
 
@@ -206,7 +206,7 @@ export function ConversationSemanticTimeline({
   onSelect,
   onSelectConversation,
 }: {
-  agent?: LogicalAgentConversationDirectoryItem;
+  agent?: LogicalAgentConversationDirectoryItemV3;
   conversation?: AgentConversationSummary;
   turns: AgentConversationTurnV2[];
   segments: ConversationInstanceSegment[];
@@ -269,18 +269,18 @@ export function ConversationSemanticTimeline({
             {conversation.workspacePath} · {conversation.turnCount} 轮 · {conversation.modelCallCount} 次模型调用
           </p>
         </div>
-        {agent && agent.conversations.length > 1 ? (
+        {agent && agent.userThreads.length > 1 ? (
           <Select value={conversation.conversationId} onValueChange={(value) => {
-            const next = agent.conversations.find((item) => item.conversationId === value);
+            const next = agent.userThreads.find((item) => item.conversationId === value);
             if (next) onSelectConversation(next);
           }}>
             <SelectTrigger className="hidden h-9 w-[220px] border-white/10 bg-white/[0.035] text-xs text-zinc-200 lg:flex" aria-label="切换当前 Agent 的会话">
               <SelectValue placeholder="选择会话" />
             </SelectTrigger>
             <SelectContent>
-              {agent.conversations.map((item, index) => (
+              {agent.userThreads.map((item, index) => (
                 <SelectItem key={item.conversationId} value={item.conversationId}>
-                  {`会话 ${agent.conversations.length - index} · ${nsDate(item.startedAtUnixNs, "MM-DD HH:mm")} · ${item.firstPromptPreview ?? "无正文"}`}
+                  {`会话 ${agent.userThreads.length - index} · ${nsDate(item.startedAtUnixNs, "MM-DD HH:mm")} · ${item.firstPromptPreview ?? "无正文"}`}
                 </SelectItem>
               ))}
             </SelectContent>

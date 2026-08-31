@@ -135,17 +135,17 @@ export default function ConversationTrackingPage() {
 
   const selectedLogicalAgent = useMemo(() => {
     const conversationOwner = selectedConversationId
-      ? directory?.items.find((item) => item.conversations.some((conversation) =>
+      ? directory?.items.find((item) => item.userThreads.some((conversation) =>
           conversation.conversationId === selectedConversationId))
       : undefined;
     return conversationOwner
       ?? directory?.items.find((item) => item.logicalAgentId === selectedLogicalAgentId);
   }, [directory?.items, selectedConversationId, selectedLogicalAgentId]);
   const selectedConversation = useMemo(() => (
-    selectedLogicalAgent?.conversations.find((item) => item.conversationId === selectedConversationId)
-    ?? directory?.items.flatMap((item) => item.conversations)
+    selectedLogicalAgent?.userThreads.find((item) => item.conversationId === selectedConversationId)
+    ?? directory?.items.flatMap((item) => item.userThreads)
       .find((item) => item.conversationId === selectedConversationId)
-  ), [directory?.items, selectedConversationId, selectedLogicalAgent?.conversations]);
+  ), [directory?.items, selectedConversationId, selectedLogicalAgent?.userThreads]);
 
   const updateRoute = (mutate: (next: URLSearchParams) => void, replace = false) => {
     const next = new URLSearchParams(searchParams);
@@ -160,7 +160,7 @@ export default function ConversationTrackingPage() {
   const selectConversation = (conversation: AgentConversationSummary, replace = false) => {
     if (!replace) setLiveFollow(false);
     updateRoute((next) => {
-      const owner = directory?.items.find((item) => item.conversations.some((candidate) =>
+      const owner = directory?.items.find((item) => item.userThreads.some((candidate) =>
         candidate.conversationId === conversation.conversationId));
       if (owner) next.set("logicalAgentId", owner.logicalAgentId);
       next.set("conversationId", conversation.conversationId);
@@ -203,7 +203,7 @@ export default function ConversationTrackingPage() {
     const top = directory?.items[0];
     if (!top) return;
     const conversationOwner = selectedConversationId
-      ? directory.items.find((item) => item.conversations.some((conversation) =>
+      ? directory.items.find((item) => item.userThreads.some((conversation) =>
           conversation.conversationId === selectedConversationId))
       : undefined;
     if (conversationOwner && conversationOwner.logicalAgentId !== selectedLogicalAgentId) {

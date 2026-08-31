@@ -275,6 +275,15 @@ const toolsList = interaction({
   path: '/mcp',
   request: { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} },
 });
+const staleCanonicalControl = interaction({
+  id: 'mi_v2_stale_canonical_control',
+  at: base + 25,
+  instance: 'host-root:v2:one',
+  conversationId: 'cv_seed_existing',
+  interactionType: 'tool',
+  path: '/mcp',
+  request: { jsonrpc: '2.0', id: 2, method: 'ping', params: {} },
+});
 const bootstrap = interaction({
   id: 'mi_v2_bootstrap',
   at: base + 30,
@@ -291,6 +300,7 @@ const bootstrap = interaction({
 const resolution = resolveAgentConversationsV2([
   initialize,
   toolsList,
+  staleCanonicalControl,
   bootstrap,
   seed,
   oldTurn,
@@ -300,7 +310,7 @@ const resolution = resolveAgentConversationsV2([
 ], 42);
 
 assert.equal(resolution.conversationRecords.length, 5);
-assert.equal(resolution.technicalRecords.length, 3);
+assert.equal(resolution.technicalRecords.length, 4);
 assert.deepEqual(
   [...new Set(resolution.technicalRecords.map((item) => item.trafficRole))].sort(),
   ['bootstrap', 'control'],
@@ -313,6 +323,9 @@ assert.equal(resolution.aliases.find((item) =>
   item.aliasConversationId === 'cv_resume_existing')?.canonicalConversationId, 'cv_seed_existing');
 assert.equal(resolution.aliases.find((item) =>
   item.aliasConversationId === 'cv_initialize_noise')?.targetType, 'technical_activity');
+assert.equal(resolution.aliases.find((item) =>
+  item.aliasConversationId === 'cv_seed_existing')?.targetType, 'conversation',
+  'a proven Canonical Thread must outrank a stale control-flow alias using the same id');
 
 const projection = projectAgentConversations(
   resolution.records,

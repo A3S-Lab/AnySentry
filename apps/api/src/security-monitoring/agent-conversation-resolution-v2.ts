@@ -701,6 +701,7 @@ export function resolveAgentConversationsV2(
 
   const aliases: ConversationRouteAliasV1[] = [];
   const memberships: ConversationMembershipV2[] = [];
+  const userConversationRouteIds = new Set<string>();
   for (const indexes of groupIndexes(set, visibleIndexes).values()) {
     indexes.sort((left, right) =>
       records[left].at - records[right].at
@@ -709,8 +710,24 @@ export function resolveAgentConversationsV2(
     const existingIds = [...new Set(indexes
       .map((index) => records[index].conversationId)
       .filter((value): value is string => Boolean(value)))];
+    userConversationRouteIds.add(canonical.conversationId);
+    for (const existingId of existingIds) userConversationRouteIds.add(existingId);
     const evidence = indexes.flatMap((index) =>
       (records[index].conversationAnchors ?? []).map((anchor) => anchor.kind));
+    // Persist an authoritative self-route so a newer resolution can repair an older control-flow
+    // alias that accidentally reused this now-proven Canonical Thread id.
+    aliases.push({
+      schemaVersion: 'anysentry.agent_conversation_route_alias.v1',
+      aliasConversationId: canonical.conversationId,
+      targetType: 'conversation',
+      targetId: canonical.conversationId,
+      canonicalConversationId: canonical.conversationId,
+      reason: 'provider_chain_merge',
+      evidence: ['canonical_thread'],
+      resolverVersion: AGENT_CONVERSATION_RESOLVER_V2,
+      resolutionRevision,
+      createdAt: decidedAt,
+    });
     for (const alias of existingIds) {
       if (alias === canonical.conversationId) continue;
       aliases.push({
@@ -762,7 +779,7 @@ export function resolveAgentConversationsV2(
 
   for (const item of technicalRecords) {
     const activityId = technicalActivityId(item);
-    if (item.conversationId) {
+    if (item.conversationId && !userConversationRouteIds.has(item.conversationId)) {
       aliases.push({
         schemaVersion: 'anysentry.agent_conversation_route_alias.v1',
         aliasConversationId: item.conversationId,

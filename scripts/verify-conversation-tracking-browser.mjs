@@ -243,14 +243,21 @@ try {
   await assertNoOverflow('conversation 1440');
   await waitFor(
     'selectable semantic timeline event',
-    () => evaluate(`(() => {
-      const buttons = [...document.querySelectorAll('button[data-semantic-kind]')];
-      return Boolean(buttons.find((node) => node.dataset.semanticKind === 'model_final'
-        && node.textContent?.includes(${JSON.stringify(responseMarker)}))
-        ?? buttons.find((node) => node.dataset.semanticKind === 'user_message'
-          && node.textContent?.includes(${JSON.stringify(marker)})));
-    })()`),
-    Boolean,
+    () => evaluate(`({
+      routeConversationId: new URLSearchParams(location.search).get('conversationId'),
+      timelineConversationId: document
+        .querySelector('[aria-label="Agent 对话时间线"][data-conversation-id]')
+        ?.getAttribute('data-conversation-id'),
+      bodyHasMarker: (document.body?.innerText ?? '').includes(${JSON.stringify(marker)}),
+      events: [...document.querySelectorAll('button[data-semantic-kind]')].map((node) => ({
+        kind: node.dataset.semanticKind,
+        text: (node.textContent ?? '').slice(0, 500)
+      }))
+    })`),
+    (value) => value.events.some((item) =>
+      (item.kind === 'model_final' && item.text.includes(responseMarker))
+      || (item.kind === 'user_message' && item.text.includes(marker))
+      || (item.kind === 'tool_call' && item.text.includes(toolMarker))),
     60_000,
   );
   await screenshot('conversation-tracking-1440.png');
@@ -323,7 +330,10 @@ try {
         && node.textContent?.includes(${JSON.stringify(responseMarker)}))
       ?? [...document.querySelectorAll('button[data-semantic-kind]')]
         .find((node) => node.dataset.semanticKind === 'user_message'
-          && node.textContent?.includes(${JSON.stringify(marker)}));
+          && node.textContent?.includes(${JSON.stringify(marker)}))
+      ?? [...document.querySelectorAll('button[data-semantic-kind]')]
+        .find((node) => node.dataset.semanticKind === 'tool_call'
+          && node.textContent?.includes(${JSON.stringify(toolMarker)}));
     button?.click();
   })()`);
   await waitFor(
