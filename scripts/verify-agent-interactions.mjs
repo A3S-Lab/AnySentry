@@ -447,6 +447,16 @@ const toolOnly = await request('/agents/interactions', 'POST', {
   timeType: 'last_30d', scope: 'raw', interactionType: 'tool', interactionId, limit: 10,
 });
 assert.equal(toolOnly.items.length, 0, 'interactionType=tool must exclude model records');
+const exactWithStaleIdentityHints = await request('/agents/interactions', 'POST', {
+  timeType: 'last_30d',
+  scope: 'raw',
+  interactionId,
+  agentAssetId: 'agent_stale_identity_hint',
+  agentInstanceId: 'runtime-stale-identity-hint',
+  limit: 10,
+});
+assert.equal(exactWithStaleIdentityHints.items[0]?.interactionId, interactionId,
+  'the immutable interactionId must outrank stale asset and Runtime attribution hints');
 
 const evidenceSuffix = digest(runId + '\0plaintext-evidence').slice(0, 24);
 const evidenceId = 'pe_' + evidenceSuffix;

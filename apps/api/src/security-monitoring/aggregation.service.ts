@@ -1915,10 +1915,17 @@ export class AggregationService {
         return review ? { ...item, currentEffectiveClassification: review.decision } : item;
       })
       .filter((item) =>
-        (!agentAssetId
+        // `interactionId` is the globally unique immutable fact key. Asset and Runtime instance
+        // ids are mutable attribution hints: a resumed canonical Thread can legitimately contain
+        // Interactions emitted before and after identity reconciliation. Once the exact fact id
+        // matches, stale identity hints must not hide it.
+        (filter.interactionId
+          || !agentAssetId
           || item.agentAssetId === requestedAsset
           || this.agentMetadata.canonicalAgentAssetId(item.agentAssetId) === agentAssetId)
-        && (!filter.agentInstanceId || item.agentInstanceId === filter.agentInstanceId)
+        && (filter.interactionId
+          || !filter.agentInstanceId
+          || item.agentInstanceId === filter.agentInstanceId)
         && (!filter.interactionId || item.interactionId === filter.interactionId)
         && (!filter.interactionType || item.interactionType === filter.interactionType)
         && (!filter.model || item.model === filter.model)
