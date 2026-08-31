@@ -18,6 +18,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import type {
   AgentConversationSummary,
   AgentConversationTurnV2,
+  AgentContextReplaySummary,
+  AgentRunTechnicalActivitySummary,
   AgentSemanticEvent,
   ConversationInstanceSegment,
   LogicalAgentConversationDirectoryItem,
@@ -90,6 +92,7 @@ function ActorCard({
   return (
     <button
       type="button"
+      data-semantic-kind={event.kind}
       onClick={() => onSelect(event)}
       className={cn(
         "relative flex min-h-[76px] w-full cursor-pointer gap-3 rounded border px-3 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70",
@@ -138,6 +141,7 @@ function ToolStepCard({
   return (
     <button
       type="button"
+      data-semantic-kind={call ? "tool_call" : "tool_result"}
       onClick={() => onSelect(result ?? call!)}
       className={cn(
         "relative flex min-h-[84px] w-full cursor-pointer gap-3 rounded border border-violet-400/25 bg-violet-500/[0.055] px-3 py-3 text-left text-violet-100 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70",
@@ -193,6 +197,8 @@ export function ConversationSemanticTimeline({
   conversation,
   turns,
   segments,
+  contextReplaySummaries,
+  technicalActivities,
   selectedEventId,
   loading,
   error,
@@ -204,6 +210,8 @@ export function ConversationSemanticTimeline({
   conversation?: AgentConversationSummary;
   turns: AgentConversationTurnV2[];
   segments: ConversationInstanceSegment[];
+  contextReplaySummaries: AgentContextReplaySummary[];
+  technicalActivities: AgentRunTechnicalActivitySummary[];
   selectedEventId?: string;
   loading: boolean;
   error?: Error;
@@ -219,6 +227,16 @@ export function ConversationSemanticTimeline({
     .filter((event) => event.kind === "tool_result" && event.toolCallId)
     .map((event) => [event.toolCallId!, event])), [allEvents]);
 
+  if (!conversation && loading) {
+    return (
+      <section className="h-full min-h-0 bg-[#0b0f0c] px-5 py-4" aria-label="正在切换 Agent 对话">
+        <div className="mx-auto max-w-4xl space-y-3">
+          {[0, 1, 2, 3].map((index) => <div key={index} className="h-24 animate-pulse rounded border border-white/5 bg-white/[0.025]" />)}
+        </div>
+      </section>
+    );
+  }
+
   if (!conversation) {
     return (
       <section className="flex h-full min-h-0 items-center justify-center bg-[#0b0f0c] px-6 text-center" aria-label="Agent 对话时间线">
@@ -232,7 +250,11 @@ export function ConversationSemanticTimeline({
   }
 
   return (
-    <section className="h-full min-h-0 overflow-hidden bg-[#0b0f0c]" aria-label="Agent 对话时间线">
+    <section
+      className="h-full min-h-0 overflow-hidden bg-[#0b0f0c]"
+      aria-label="Agent 对话时间线"
+      data-conversation-id={conversation.conversationId}
+    >
       <div className="flex min-h-16 items-center gap-3 border-b border-white/10 px-3 py-2 sm:px-4">
         <Button type="button" variant="ghost" size="icon" onClick={onBack} aria-label="返回 Agent 目录" className="size-11 text-zinc-400 hover:bg-white/5 hover:text-zinc-100 md:hidden">
           <ArrowLeft className="size-4" />
@@ -267,6 +289,32 @@ export function ConversationSemanticTimeline({
       </div>
 
       <div className="h-[calc(100%-4rem)] overflow-y-auto px-3 py-4 sm:px-5">
+        {technicalActivities.length || contextReplaySummaries.length ? (
+          <div className="mx-auto mb-4 max-w-4xl space-y-2">
+            {technicalActivities.length ? (
+              <details className="rounded border border-violet-400/15 bg-violet-500/[0.035] px-3 py-2 text-[11px] text-zinc-400">
+                <summary className="min-h-7 cursor-pointer text-violet-100/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70">
+                  启动与能力协商 · {technicalActivities.reduce((sum, item) => sum + item.interactionIds.length, 0)} 条技术活动
+                </summary>
+                <div className="mt-2 space-y-1 border-t border-violet-300/10 pt-2 font-mono text-[10px] text-zinc-500">
+                  {technicalActivities.map((activity) => (
+                    <p key={activity.technicalActivityId} className="break-all">
+                      {activity.role} · {activity.methods.join(", ")} · {activity.paths.join(" · ")}
+                    </p>
+                  ))}
+                </div>
+              </details>
+            ) : null}
+            {contextReplaySummaries.map((summary) => (
+              <div key={summary.interactionId} className="rounded border border-sky-400/15 bg-sky-500/[0.035] px-3 py-2 text-[11px] leading-5 text-sky-100/80">
+                <span className="font-medium">恢复上下文</span>
+                <span className="ml-2 text-zinc-500">
+                  已加载 {summary.replayedUserMessages} 条历史用户消息、{summary.replayedToolResults} 个工具结果；这些内容未重复计为新事件
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : null}
         {loading && turns.length === 0 ? (
           <div className="mx-auto max-w-4xl space-y-3" aria-label="正在加载语义时间线">
             {[0, 1, 2, 3].map((index) => <div key={index} className="h-24 animate-pulse rounded border border-white/5 bg-white/[0.025]" />)}

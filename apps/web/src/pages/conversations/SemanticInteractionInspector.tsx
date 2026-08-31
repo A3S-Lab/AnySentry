@@ -1,9 +1,13 @@
-import { Braces, Check, Copy, FileJson, LoaderCircle, ShieldCheck, X } from "lucide-react";
+import { Activity, Braces, Check, Copy, FileJson, LoaderCircle, ShieldAlert, X } from "lucide-react";
 import { type KeyboardEvent, type ReactNode, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { Button } from "@/components/ui/button";
-import type { AgentInteractionRecord, AgentSemanticEvent } from "@/lib/api/security-center";
+import type {
+  AgentInteractionRecord,
+  AgentSemanticEvent,
+  AgentSemanticEvidenceResponse,
+} from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
 
 function safeJson(value: unknown) {
@@ -66,24 +70,137 @@ function EvidenceField({ label, value }: { label: string; value?: ReactNode }) {
   );
 }
 
+function eventHref(eventId: string, interaction?: AgentInteractionRecord) {
+  return "/events?" + new URLSearchParams({
+    timeType: "last_30d",
+    scope: "agent",
+    eventId,
+    ...(interaction?.agentAssetId ? { agentAssetId: interaction.agentAssetId } : {}),
+    ...(interaction?.agentInstanceId ? { agentInstanceId: interaction.agentInstanceId } : {}),
+  }).toString();
+}
+
+function KernelEvidenceView({
+  event,
+  interaction,
+  evidence,
+  loading,
+}: {
+  event: AgentSemanticEvent;
+  interaction?: AgentInteractionRecord;
+  evidence?: AgentSemanticEvidenceResponse;
+  loading: boolean;
+}) {
+  if (loading && !evidence) {
+    return <div className="flex min-h-40 items-center justify-center gap-2 text-xs text-zinc-500"><LoaderCircle className="size-4 animate-spin" />正在关联内核事实</div>;
+  }
+  return (
+    <div className="space-y-3">
+      <dl className="rounded border border-white/8 bg-black/15 px-3">
+        <EvidenceField label="Relation Status" value={evidence?.relationStatus ?? (event.actor === "tool" ? "semantic_only" : "not_applicable")} />
+        <EvidenceField label="Tool Invocation" value={evidence?.toolInvocationId} />
+        <EvidenceField label="Interaction Event" value={(evidence?.interactionEvidenceEventIds ?? event.evidenceEventIds).join(", ")} />
+        <EvidenceField label="Agent Instance" value={interaction?.agentInstanceId} />
+        <EvidenceField label="Correlation" value={event.correlationQuality} />
+      </dl>
+      {evidence?.relations.some((relation) => relation.kernelEventId) ? (
+        <div className="divide-y divide-white/8 rounded border border-white/8 bg-black/15">
+          {evidence.relations.filter((relation) => relation.kernelEventId).map((relation) => {
+            const kernel = evidence.kernelEvents.find((item) => item.eventId === relation.kernelEventId);
+            return (
+              <div key={relation.relationId} className="px-3 py-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="rounded border border-teal-400/20 bg-teal-500/[0.07] px-1.5 py-1 text-[10px] text-teal-100">{relation.status}</span>
+                  <span className="rounded border border-white/10 px-1.5 py-1 font-mono text-[10px] text-zinc-400">{relation.linkMethod}</span>
+                  <span className="font-mono text-[10px] text-zinc-600">confidence {relation.confidence.toFixed(2)}</span>
+                </div>
+                <p className="mt-2 text-xs leading-5 text-zinc-300">{kernel?.eventKind ?? "Kernel Event"} · {kernel?.subject ?? relation.kernelEventId}</p>
+                <Link className="mt-2 inline-flex min-h-9 items-center text-xs font-medium text-teal-200 hover:text-teal-100" to={eventHref(relation.kernelEventId!, interaction)}>
+                  查看原始内核事件
+                </Link>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="rounded border border-amber-400/15 bg-amber-500/[0.035] px-3 py-3 text-xs leading-5 text-amber-100/75">
+          {evidence?.relationStatus === "coverage_gap"
+            ? "当前内核采集窗口不完整，保留语义工具事实但不猜测执行事件。"
+            : "已确认工具语义，但没有满足运行实例、进程祖先和命令、资源或网络强条件的内核事件。"}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RiskEvidenceView({
+  interaction,
+  evidence,
+  loading,
+}: {
+  interaction?: AgentInteractionRecord;
+  evidence?: AgentSemanticEvidenceResponse;
+  loading: boolean;
+}) {
+  if (loading && !evidence) {
+    return <div className="flex min-h-40 items-center justify-center gap-2 text-xs text-zinc-500"><LoaderCircle className="size-4 animate-spin" />正在读取既有风险研判</div>;
+  }
+  const risky = evidence?.relations.filter((relation) => relation.kernelEventId && relation.risk) ?? [];
+  if (!risky.length) {
+    return (
+      <div className="rounded border border-white/8 bg-black/15 px-4 py-8 text-center text-xs leading-5 text-zinc-500">
+        当前没有已关联的 Kernel Judgment。页面不会根据工具文字重新生成一套风险分数。
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-3">
+      {risky.map((relation) => (
+        <div key={relation.relationId} className="rounded border border-white/8 bg-black/15 p-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className={cn(
+              "rounded border px-1.5 py-1 text-[10px]",
+              relation.risk!.verdict === "allow"
+                ? "border-teal-400/20 bg-teal-500/[0.07] text-teal-100"
+                : "border-rose-400/25 bg-rose-500/[0.08] text-rose-100",
+            )}>{relation.risk!.verdict}</span>
+            <span className="font-mono text-xs font-semibold text-zinc-100">风险 {relation.risk!.riskScore}</span>
+            <span className="text-[10px] text-zinc-500">{relation.risk!.tier} · {relation.risk!.severity}</span>
+          </div>
+          <p className="mt-2 text-xs font-medium text-zinc-200">{relation.risk!.riskName}</p>
+          <p className="mt-1 text-[11px] leading-5 text-zinc-500">{relation.risk!.reason}</p>
+          <Link className="mt-2 inline-flex min-h-9 items-center text-xs font-medium text-violet-200 hover:text-violet-100" to={eventHref(relation.kernelEventId!, interaction)}>
+            打开风险事件与 Evidence Bundle
+          </Link>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function SemanticInteractionInspector({
   event,
   interaction,
   loading,
+  semanticEvidence,
+  evidenceLoading,
   onClose,
 }: {
   event?: AgentSemanticEvent;
   interaction?: AgentInteractionRecord;
   loading: boolean;
+  semanticEvidence?: AgentSemanticEvidenceResponse;
+  evidenceLoading: boolean;
   onClose: () => void;
 }) {
-  const [tab, setTab] = useState<"structured" | "raw" | "evidence">("structured");
-  useEffect(() => setTab("structured"), [event?.semanticEventId]);
+  const [tab, setTab] = useState<"content" | "kernel" | "risk" | "raw">("content");
+  useEffect(() => setTab("content"), [event?.semanticEventId]);
   const structured = useMemo(() => event ? safeJson(event.content ?? event.contentPreview) : "", [event]);
   const tabs = [
-    ["structured", "结构化", Braces],
+    ["content", "内容", Braces],
+    ["kernel", "内核证据", Activity],
+    ["risk", "风险研判", ShieldAlert],
     ["raw", "原始", FileJson],
-    ["evidence", "证据", ShieldCheck],
   ] as const;
   const moveTab = (keyboardEvent: KeyboardEvent<HTMLButtonElement>, index: number) => {
     if (keyboardEvent.key !== "ArrowLeft" && keyboardEvent.key !== "ArrowRight") return;
@@ -131,7 +248,7 @@ export function SemanticInteractionInspector({
               onKeyDown={(keyboardEvent) => moveTab(keyboardEvent, index)}
               onClick={() => setTab(value)}
               className={cn(
-                "flex h-9 min-w-24 cursor-pointer items-center justify-center gap-1.5 border-b text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70",
+                "flex h-9 min-w-0 flex-1 cursor-pointer items-center justify-center gap-1 border-b whitespace-nowrap text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70 sm:gap-1.5 sm:text-xs",
                 tab === value ? "border-violet-300 text-violet-100" : "border-transparent text-zinc-500 hover:text-zinc-200",
               )}
             >
@@ -141,9 +258,9 @@ export function SemanticInteractionInspector({
         </div>
 
         <div className="h-[calc(100%-6.25rem)] overflow-y-auto p-3">
-          {loading && !interaction ? (
+          {loading && !interaction && (tab === "content" || tab === "raw") ? (
             <div className="flex min-h-40 items-center justify-center gap-2 text-xs text-zinc-500"><LoaderCircle className="size-4 animate-spin" />正在读取完整 Interaction</div>
-          ) : tab === "structured" ? (
+          ) : tab === "content" ? (
             <div>
               <div className="mb-2 flex items-center justify-between gap-2">
                 <div className="flex flex-wrap gap-2">
@@ -155,6 +272,10 @@ export function SemanticInteractionInspector({
               <pre className="max-h-[calc(100dvh-14rem)] overflow-auto whitespace-pre-wrap break-words rounded border border-white/8 bg-black/20 p-3 font-mono text-[11px] leading-5 text-zinc-300">{browserPreview(structured || "该事件没有结构化正文。")}</pre>
               {event.kind === "tool_result" ? <p className="mt-3 text-[11px] leading-5 text-zinc-500">工具结果时间表示该结果重新进入模型请求的明文边界；框架内部精确结束时间仅在有独立工具传输证据时展示。</p> : null}
             </div>
+          ) : tab === "kernel" ? (
+            <KernelEvidenceView event={event} interaction={interaction} evidence={semanticEvidence} loading={evidenceLoading} />
+          ) : tab === "risk" ? (
+            <RiskEvidenceView interaction={interaction} evidence={semanticEvidence} loading={evidenceLoading} />
           ) : tab === "raw" ? (
             <div className="space-y-3">
               {!interaction ? <p className="py-12 text-center text-xs text-zinc-500">该事件没有关联的原始 Interaction。</p> : (

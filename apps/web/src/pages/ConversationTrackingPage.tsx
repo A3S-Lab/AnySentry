@@ -25,12 +25,13 @@ import {
   type AgentConversationSummary,
   type AgentRuntimeInstanceRecord,
   type AgentSemanticEvent,
-  type LogicalAgentConversationDirectoryItem,
+  type LogicalAgentConversationDirectoryItemV3,
   securityCenterApi,
 } from "@/lib/api/security-center";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import { ConversationSemanticTimeline } from "./conversations/ConversationSemanticTimeline";
+import { ConversationOverview } from "./conversations/ConversationOverview";
 import { LogicalAgentNavigator } from "./conversations/LogicalAgentNavigator";
 import { SemanticInteractionInspector } from "./conversations/SemanticInteractionInspector";
 import { useResizableConversationPanels } from "./conversations/useResizableConversationPanels";
@@ -89,7 +90,7 @@ export default function ConversationTrackingPage() {
   const selectedConversationId = searchParams.get("conversationId") ?? "";
   const selectedEventId = searchParams.get("semanticEventId") ?? searchParams.get("eventId") ?? "";
   const selectedInteractionId = searchParams.get("interactionId") ?? "";
-  const previousTopConversation = useRef<string>();
+  const previousTopAgent = useRef<string>();
   const {
     containerRef: panelContainerRef,
     panelStyle,
@@ -126,7 +127,7 @@ export default function ConversationTrackingPage() {
     loading: conversationsLoading,
     error: conversationsError,
     refresh: refreshConversations,
-  } = useRequest(() => securityCenterApi.agentConversationDirectoryV2(conversationQuery), {
+  } = useRequest(() => securityCenterApi.agentConversationDirectoryV3(conversationQuery), {
     refreshDeps: [conversationQuery, refreshVersion],
     pollingInterval: 10_000,
     pollingWhenHidden: false,
@@ -157,11 +158,13 @@ export default function ConversationTrackingPage() {
     next.delete("interactionId");
   };
   const selectConversation = (conversation: AgentConversationSummary, replace = false) => {
+    if (!replace) setLiveFollow(false);
     updateRoute((next) => {
       const owner = directory?.items.find((item) => item.conversations.some((candidate) =>
         candidate.conversationId === conversation.conversationId));
       if (owner) next.set("logicalAgentId", owner.logicalAgentId);
       next.set("conversationId", conversation.conversationId);
+      next.delete("technicalActivityId");
       if (selectedInstanceId && !conversation.agentInstanceIds.includes(selectedInstanceId)) {
         next.delete("instanceId");
       }
@@ -169,32 +172,29 @@ export default function ConversationTrackingPage() {
     }, replace);
   };
   const selectLogicalAgent = (
-    agent: LogicalAgentConversationDirectoryItem,
+    agent: LogicalAgentConversationDirectoryItemV3,
     replace = false,
   ) => {
-    const nextConversation = agent.conversations.find((item) => item.hasContent)
-      ?? agent.conversations[0];
+    if (!replace) setLiveFollow(false);
     updateRoute((next) => {
       next.set("logicalAgentId", agent.logicalAgentId);
       next.delete("instanceId");
-      if (nextConversation) next.set("conversationId", nextConversation.conversationId);
-      else next.delete("conversationId");
+      next.delete("conversationId");
+      next.delete("technicalActivityId");
       clearEventSelection(next);
     }, replace);
   };
   const selectRuntimeInstance = (
-    agent: LogicalAgentConversationDirectoryItem,
+    agent: LogicalAgentConversationDirectoryItemV3,
     instance: AgentRuntimeInstanceRecord,
   ) => {
+    setLiveFollow(false);
     const canonical = instance.canonicalAgentInstanceId ?? instance.agentInstanceId;
-    const aliases = new Set([canonical, instance.agentInstanceId, ...(instance.agentInstanceAliases ?? [])]);
-    const conversation = agent.conversations.find((candidate) =>
-      candidate.agentInstanceIds.some((identity) => aliases.has(identity)));
     updateRoute((next) => {
       next.set("logicalAgentId", agent.logicalAgentId);
       next.set("instanceId", canonical);
-      if (conversation) next.set("conversationId", conversation.conversationId);
-      else next.delete("conversationId");
+      next.delete("conversationId");
+      next.delete("technicalActivityId");
       clearEventSelection(next);
     });
   };
@@ -208,28 +208,55 @@ export default function ConversationTrackingPage() {
       : undefined;
     if (conversationOwner && conversationOwner.logicalAgentId !== selectedLogicalAgentId) {
       updateRoute((next) => next.set("logicalAgentId", conversationOwner.logicalAgentId), true);
-      previousTopConversation.current = top.logicalAgentId;
+      previousTopAgent.current = top.logicalAgentId;
       return;
     }
     const selectedExists = directory.items.some((item) => item.logicalAgentId === selectedLogicalAgentId);
-    const followedPreviousTop = selectedLogicalAgentId === previousTopConversation.current;
-    if (!selectedExists || (liveFollow && followedPreviousTop && top.logicalAgentId !== selectedLogicalAgentId)) {
+    const followedPreviousTop = selectedLogicalAgentId === previousTopAgent.current;
+    if (!selectedExists || (
+      liveFollow
+      && !selectedConversationId
+      && !selectedInstanceId
+      && followedPreviousTop
+      && top.logicalAgentId !== selectedLogicalAgentId
+    )) {
       selectLogicalAgent(top, true);
     }
-    previousTopConversation.current = top.logicalAgentId;
-  }, [directory?.items, liveFollow, selectedConversationId, selectedLogicalAgentId]);
+    previousTopAgent.current = top.logicalAgentId;
+  }, [directory?.items, liveFollow, selectedConversationId, selectedInstanceId, selectedLogicalAgentId]);
 
+  const timelineClientKey = useMemo(() => JSON.stringify({
+    conversationId: selectedConversationId,
+    agentAssetId: selectedConversation?.agentAssetId ?? clean(scopedAgentAssetId),
+    timeType,
+    startTime: conversationQuery.startTime,
+    endTime: conversationQuery.endTime,
+    snapshotAsOf: conversationQuery.snapshotAsOf,
+    refreshVersion,
+  }), [
+    conversationQuery.endTime,
+    conversationQuery.snapshotAsOf,
+    conversationQuery.startTime,
+    refreshVersion,
+    scopedAgentAssetId,
+    selectedConversation?.agentAssetId,
+    selectedConversationId,
+    timeType,
+  ]);
   const {
-    data: timeline,
+    data: timelineEnvelope,
     loading: timelineLoading,
     error: timelineError,
     refresh: refreshTimeline,
-  } = useRequest(() => securityCenterApi.agentConversationTimelineV2({
-    ...conversationQuery,
-    conversationId: selectedConversationId,
-    agentAssetId: selectedConversation?.agentAssetId ?? clean(scopedAgentAssetId),
+  } = useRequest(async () => ({
+    clientKey: timelineClientKey,
+    timeline: await securityCenterApi.agentConversationTimelineV3({
+      ...conversationQuery,
+      conversationId: selectedConversationId,
+      agentAssetId: selectedConversation?.agentAssetId ?? clean(scopedAgentAssetId),
+    }),
   }), {
-    ready: Boolean(selectedConversationId && selectedConversation?.hasContent),
+    ready: Boolean(selectedConversationId),
     refreshDeps: [
       conversationQuery,
       refreshVersion,
@@ -240,24 +267,67 @@ export default function ConversationTrackingPage() {
     pollingInterval: 10_000,
     pollingWhenHidden: false,
   });
+  const timeline = timelineEnvelope?.clientKey === timelineClientKey
+    && (
+      timelineEnvelope.timeline.requestedConversationId === selectedConversationId
+      || timelineEnvelope.timeline.canonicalConversationId === selectedConversationId
+    )
+    ? timelineEnvelope.timeline
+    : undefined;
+  const timelinePending = Boolean(selectedConversationId && !timeline) || timelineLoading;
+  useEffect(() => {
+    const canonical = timeline?.canonicalConversationId;
+    if (!canonical || canonical === selectedConversationId) return;
+    updateRoute((next) => {
+      next.set("conversationId", canonical);
+      clearEventSelection(next);
+    }, true);
+  }, [selectedConversationId, timeline?.canonicalConversationId]);
+  useEffect(() => {
+    if (timeline?.redirectTarget?.type !== "technical_activity") return;
+    const activity = directory?.items
+      .flatMap((item) => item.technicalActivities.map((technical) => ({ item, technical })))
+      .find(({ technical }) => technical.technicalActivityId === timeline.redirectTarget?.id);
+    updateRoute((next) => {
+      next.delete("conversationId");
+      clearEventSelection(next);
+      next.set("technicalActivityId", timeline.redirectTarget!.id);
+      if (activity) {
+        next.set("logicalAgentId", activity.item.logicalAgentId);
+        if (activity.technical.agentInstanceId) {
+          next.set("instanceId", activity.technical.agentInstanceId);
+        }
+      }
+    }, true);
+  }, [directory?.items, timeline?.redirectTarget?.id, timeline?.redirectTarget?.type]);
   const selectedEvent = useMemo(() => {
     const events = timeline?.turns.flatMap((turn) => turn.events) ?? [];
     return events.find((event) => event.semanticEventId === selectedEventId)
       ?? events.find((event) => event.sourceInteractionIds.includes(selectedInteractionId));
   }, [selectedEventId, selectedInteractionId, timeline?.turns]);
+  const interactionClientKey = [
+    selectedConversation?.agentAssetId ?? "",
+    selectedEvent?.sourceInteractionIds[0] ?? "",
+    timeType,
+    consoleTimeFilter.startTime ?? "",
+    consoleTimeFilter.endTime ?? "",
+  ].join("\u0000");
   const {
-    data: interactionList,
+    data: interactionEnvelope,
     loading: interactionLoading,
     refresh: refreshInteraction,
-  } = useRequest(() => securityCenterApi.agentInteractions({
-    timeType,
-    startTime: timeType === "custom" ? consoleTimeFilter.startTime : undefined,
-    endTime: timeType === "custom" ? consoleTimeFilter.endTime : undefined,
-    scope: "agent",
-    classificationView: "current_effective",
-    agentAssetId: selectedConversation?.agentAssetId,
-    interactionId: selectedEvent?.sourceInteractionIds[0],
-    limit: 1,
+  } = useRequest(async () => ({
+    clientKey: interactionClientKey,
+    list: await securityCenterApi.agentInteractions({
+      timeType,
+      startTime: timeType === "custom" ? consoleTimeFilter.startTime : undefined,
+      endTime: timeType === "custom" ? consoleTimeFilter.endTime : undefined,
+      scope: "agent",
+      classificationView: "current_effective",
+      agentAssetId: selectedConversation?.agentAssetId,
+      interactionId: selectedEvent?.sourceInteractionIds[0],
+      limit: 1,
+    }),
   }), {
     ready: Boolean(selectedEvent?.sourceInteractionIds[0]),
     refreshDeps: [
@@ -269,7 +339,39 @@ export default function ConversationTrackingPage() {
     ],
   });
 
-  const selectedInteraction = interactionList?.items[0];
+  const selectedInteraction = interactionEnvelope?.clientKey === interactionClientKey
+    ? interactionEnvelope.list.items[0]
+    : undefined;
+  const evidenceClientKey = [
+    timeline?.canonicalConversationId ?? selectedConversationId,
+    selectedEvent?.semanticEventId ?? "",
+    timeType,
+  ].join("\u0000");
+  const {
+    data: evidenceEnvelope,
+    loading: evidenceLoading,
+  } = useRequest(async () => ({
+    clientKey: evidenceClientKey,
+    evidence: await securityCenterApi.agentSemanticEvidence({
+      timeType,
+      startTime: timeType === "custom" ? consoleTimeFilter.startTime : undefined,
+      endTime: timeType === "custom" ? consoleTimeFilter.endTime : undefined,
+      scope: "agent",
+      classificationView: "current_effective",
+      conversationId: timeline?.canonicalConversationId ?? selectedConversationId,
+      semanticEventId: selectedEvent!.semanticEventId,
+    }),
+  }), {
+    ready: Boolean(
+      selectedEvent?.actor === "tool"
+      && selectedConversationId
+      && (timeline?.canonicalConversationId ?? selectedConversationId),
+    ),
+    refreshDeps: [evidenceClientKey],
+  });
+  const semanticEvidence = evidenceEnvelope?.clientKey === evidenceClientKey
+    ? evidenceEnvelope.evidence
+    : undefined;
   const selectEvent = (event: AgentSemanticEvent) => updateRoute((next) => {
     next.set("semanticEventId", event.semanticEventId);
     next.delete("eventId");
@@ -284,13 +386,13 @@ export default function ConversationTrackingPage() {
   const setCoverage = (value: AgentConversationCoverageStatus | "all") => updateRoute((next) => {
     if (value === "all") next.delete("coverage");
     else next.set("coverage", value);
-    for (const key of ["instanceId", "conversationId"]) next.delete(key);
+    for (const key of ["instanceId", "conversationId", "technicalActivityId"]) next.delete(key);
     clearEventSelection(next);
   }, true);
   const setClassification = (value: AgentClassification | "all") => updateRoute((next) => {
     if (value === "all") next.delete("classification");
     else next.set("classification", value);
-    for (const key of ["instanceId", "conversationId"]) next.delete(key);
+    for (const key of ["instanceId", "conversationId", "technicalActivityId"]) next.delete(key);
     clearEventSelection(next);
   }, true);
   const clearFilters = () => {
@@ -298,7 +400,7 @@ export default function ConversationTrackingPage() {
     updateRoute((next) => {
       for (const key of [
         "coverage", "classification", "agentAssetId", "logicalAgentId", "instanceId",
-        "conversationId", "semanticEventId", "eventId", "interactionId",
+        "conversationId", "technicalActivityId", "semanticEventId", "eventId", "interactionId",
       ]) next.delete(key);
     }, true);
   };
@@ -316,7 +418,7 @@ export default function ConversationTrackingPage() {
             <div className="flex items-center gap-2">
               <MessageSquareText className="size-5 shrink-0 text-violet-300" aria-hidden="true" />
               <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">{t("对话追踪")}</h1>
-              <Pill className="border-white/10 bg-white/[0.035] text-zinc-400">semantic v{timeline?.parserVersion ?? 1}</Pill>
+              <Pill className="border-white/10 bg-white/[0.035] text-zinc-400">semantic v{timeline?.parserVersion ?? 2}</Pill>
             </div>
             <p className="mt-1 truncate text-xs text-zinc-500">按逻辑 Agent、运行实例和 Thread 还原用户、模型、工具三类完整链路</p>
           </div>
@@ -343,13 +445,13 @@ export default function ConversationTrackingPage() {
               size="sm"
               onClick={() => void Promise.all([
                 refreshConversations(),
-                selectedConversation?.hasContent ? refreshTimeline() : Promise.resolve(),
+                selectedConversationId ? refreshTimeline() : Promise.resolve(),
                 selectedEvent?.sourceInteractionIds[0] ? refreshInteraction() : Promise.resolve(),
               ])}
-              disabled={conversationsLoading || timelineLoading || interactionLoading}
+              disabled={conversationsLoading || timelinePending || interactionLoading}
               className="h-11 bg-violet-500 text-white hover:bg-violet-400 sm:h-9"
             >
-              {conversationsLoading || timelineLoading || interactionLoading
+              {conversationsLoading || timelinePending || interactionLoading
                 ? <LoaderCircle className="size-3.5 animate-spin" />
                 : <RefreshCw className="size-3.5" />}刷新
             </Button>
@@ -370,7 +472,10 @@ export default function ConversationTrackingPage() {
           style={panelStyle}
           className="grid h-full min-h-0 grid-cols-1 md:grid-cols-[var(--conversation-left)_minmax(0,1fr)] xl:grid-cols-[var(--conversation-left)_minmax(480px,1fr)_var(--conversation-right)]"
         >
-          <div className={cn("relative min-h-0", selectedConversationId ? "hidden md:block" : "block")}>
+          <div className={cn(
+            "relative min-h-0",
+            selectedLogicalAgentId || selectedInstanceId || selectedConversationId ? "hidden md:block" : "block",
+          )}>
             <LogicalAgentNavigator
               items={directory?.items ?? []}
               runtimeInstances={directory?.items.flatMap((item) => item.recentInstances) ?? []}
@@ -387,25 +492,47 @@ export default function ConversationTrackingPage() {
               <span className="h-full w-px bg-transparent transition-colors group-hover:bg-violet-400/50 group-focus-visible:bg-violet-300" />
             </div>
           </div>
-          <div className={cn("min-h-0", selectedConversationId ? "block" : "hidden md:block")}>
-            <ConversationSemanticTimeline
-              agent={selectedLogicalAgent}
-              conversation={selectedConversation}
-              turns={timeline?.turns ?? []}
-              segments={timeline?.segments ?? []}
-              selectedEventId={selectedEvent?.semanticEventId}
-              loading={timelineLoading}
-              error={timelineError}
-              onBack={clearSelectionOnMobile}
-              onSelect={selectEvent}
-              onSelectConversation={selectConversation}
-            />
+          <div className={cn(
+            "min-h-0",
+            selectedLogicalAgentId || selectedInstanceId || selectedConversationId ? "block" : "hidden md:block",
+            !selectedConversationId && "xl:col-span-2",
+          )}>
+            {selectedConversationId ? (
+              <ConversationSemanticTimeline
+                agent={selectedLogicalAgent}
+                conversation={selectedConversation ?? timeline?.thread}
+                turns={timeline?.turns ?? []}
+                segments={timeline?.segments ?? []}
+                selectedEventId={selectedEvent?.semanticEventId}
+                loading={timelinePending}
+                error={!timeline ? timelineError : undefined}
+                contextReplaySummaries={timeline?.contextReplaySummaries ?? []}
+                technicalActivities={timeline?.technicalActivitySummaries ?? []}
+                onBack={clearSelectionOnMobile}
+                onSelect={selectEvent}
+                onSelectConversation={selectConversation}
+              />
+            ) : (
+              <ConversationOverview
+                agent={selectedLogicalAgent}
+                instanceId={selectedInstanceId}
+                onSelectConversation={selectConversation}
+                onBack={clearSelectionOnMobile}
+              />
+            )}
           </div>
-          <div className="relative min-h-0">
+          <div className={cn("relative min-h-0", !selectedConversationId && "hidden")}>
             <div {...rightSeparatorProps} className="group absolute -left-1.5 top-0 z-30 hidden h-full w-3 cursor-col-resize touch-none items-center justify-center xl:flex">
               <span className="h-full w-px bg-transparent transition-colors group-hover:bg-violet-400/50 group-focus-visible:bg-violet-300" />
             </div>
-            <SemanticInteractionInspector event={selectedEvent} interaction={selectedInteraction} loading={interactionLoading} onClose={closeInspector} />
+            <SemanticInteractionInspector
+              event={selectedEvent}
+              interaction={selectedInteraction}
+              loading={interactionLoading}
+              semanticEvidence={semanticEvidence}
+              evidenceLoading={evidenceLoading}
+              onClose={closeInspector}
+            />
           </div>
         </div>
       </main>

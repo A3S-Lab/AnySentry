@@ -249,6 +249,68 @@ try {
   );
   await screenshot('conversation-tracking-1440.png');
 
+  await evaluate(`document.querySelector('button[role="option"][aria-selected="true"]')?.click()`);
+  await waitFor(
+    'Agent overview selection',
+    () => evaluate(`({
+      route: new URLSearchParams(location.search).get('conversationId'),
+      text: document.body?.innerText ?? ''
+    })`),
+    (value) => value.route === null && value.text.includes('Agent 整体概览'),
+    60_000,
+  );
+  await screenshot('conversation-overview-1440.png');
+  await evaluate(`document.querySelector('button[data-conversation-id=${JSON.stringify(conversation.conversationId)}]')?.click()`);
+  await waitFor(
+    'restore fixture after Agent overview',
+    () => evaluate(`({
+      route: new URLSearchParams(location.search).get('conversationId'),
+      timeline: document.querySelector('[aria-label="Agent 对话时间线"][data-conversation-id]')?.getAttribute('data-conversation-id'),
+      text: document.body?.innerText ?? ''
+    })`),
+    (value) => value.route === conversation.conversationId
+      && value.timeline === conversation.conversationId
+      && value.text.includes(marker),
+    60_000,
+  );
+
+  const rapidSwitch = await evaluate(`(() => new Promise(async (resolve) => {
+    const ids = [...new Set([...document.querySelectorAll('[data-conversation-id]')]
+      .map((node) => node.getAttribute('data-conversation-id')).filter(Boolean))];
+    if (ids.length < 2) { resolve({ tested: false }); return; }
+    const targets = ids.slice(0, 2);
+    for (let index = 0; index < 100; index += 1) {
+      const id = targets[index % targets.length];
+      document.querySelector('button[data-conversation-id="' + CSS.escape(id) + '"]')?.click();
+      await new Promise((next) => setTimeout(next, 5));
+    }
+    resolve({ tested: true, finalId: targets[99 % targets.length] });
+  }))()`);
+  if (rapidSwitch.tested) {
+    await waitFor(
+      'rapid Thread selection consistency',
+      () => evaluate(`({
+        route: new URLSearchParams(location.search).get('conversationId'),
+        timeline: document.querySelector('[aria-label="Agent 对话时间线"][data-conversation-id]')?.getAttribute('data-conversation-id')
+      })`),
+      (value) => value.route === rapidSwitch.finalId && value.timeline === rapidSwitch.finalId,
+      60_000,
+    );
+    await evaluate(`document.querySelector('button[data-conversation-id=${JSON.stringify(conversation.conversationId)}]')?.click()`);
+    await waitFor(
+      'restore browser fixture Thread',
+      () => evaluate(`({
+        route: new URLSearchParams(location.search).get('conversationId'),
+        timeline: document.querySelector('[aria-label="Agent 对话时间线"][data-conversation-id]')?.getAttribute('data-conversation-id'),
+        text: document.body?.innerText ?? ''
+      })`),
+      (value) => value.route === conversation.conversationId
+        && value.timeline === conversation.conversationId
+        && value.text.includes(marker),
+      60_000,
+    );
+  }
+
   await evaluate(`(() => {
     const button = [...document.querySelectorAll('button')]
       .find((node) => node.textContent?.includes('模型')
@@ -261,7 +323,7 @@ try {
   await waitFor(
     'interaction inspector',
     () => evaluate('document.querySelectorAll("[role=tab]").length'),
-    (count) => count === 3,
+    (count) => count === 4,
   );
   await waitFor(
     'interaction deep link',
@@ -280,6 +342,41 @@ try {
       && text.includes(responseMarker));
   assert(rawText.includes(toolMarker));
   await screenshot('conversation-inspector-1440.png');
+
+  const selectedToolCall = await evaluate(`(() => {
+    const button = document.querySelector('button[data-semantic-kind="tool_call"]');
+    button?.click();
+    return button?.textContent ?? '';
+  })()`);
+  assert.ok(selectedToolCall, 'the semantic timeline must expose a selectable tool_call event');
+  await waitFor(
+    'semantic Tool inspector',
+    () => evaluate('document.body?.innerText ?? ""'),
+    (text) => text.includes('工具 ·') && text.includes('内核证据'),
+  );
+  await evaluate(`([...document.querySelectorAll('[role=tab]')]
+    .find((node) => node.textContent?.trim() === '内核证据'))?.click()`);
+  await waitFor(
+    'semantic Kernel evidence relation',
+    () => evaluate('document.body?.innerText ?? ""'),
+    (text) => text.toLowerCase().includes('relation status')
+      && (text.includes('semantic_only') || text.includes('coverage_gap') || text.includes('linked_'))
+      && !text.includes('TOOL INVOCATION\n--'),
+    60_000,
+  );
+  await screenshot('conversation-kernel-evidence-1440.png');
+  await evaluate(`([...document.querySelectorAll('[role=tab]')]
+    .find((node) => node.textContent?.trim() === '风险研判'))?.click()`);
+  await waitFor(
+    'existing Kernel risk view',
+    () => evaluate('document.body?.innerText ?? ""'),
+    (text) => text.includes('Kernel Judgment') || text.includes('风险 '),
+  );
+  await screenshot('conversation-risk-1440.png');
+  await evaluate(`([...document.querySelectorAll('[role=tab]')]
+    .find((node) => node.textContent?.trim() === '原始'))?.click()`);
+  await waitFor('restore raw inspector', () => evaluate('document.body?.innerText ?? ""'),
+    (text) => text.includes('最终发送给 LLM / 工具的请求'));
 
   await viewport(1024, 900);
   await assertNoOverflow('conversation 1024');
@@ -308,6 +405,7 @@ try {
     desktopTimelineVisible: true,
     inspectorStructuredRawEvidence: true,
     responsiveViewports: [1440, 1024, 390],
+    rapidThreadSwitches: rapidSwitch.tested ? 100 : 0,
     horizontalOverflow: false,
     runtimeExceptions: 0,
     networkFailures: 0,

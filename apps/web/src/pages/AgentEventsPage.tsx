@@ -667,6 +667,13 @@ export default function AgentEventsPage() {
       refreshDeps: [classificationView, routeEndTime, routeStartTime, selectedEvent?.eventId, subjectAssetId, timeType, visibleData?.coverage.snapshotAsOf],
     },
   );
+  const { data: semanticContext, loading: semanticContextLoading } = useRequest(
+    () => securityCenterApi.agentKernelSemanticContext(selectedEvent!.eventId),
+    {
+      ready: Boolean(selectedEvent?.eventId),
+      refreshDeps: [selectedEvent?.eventId],
+    },
+  );
 
   const selectEvent = (event: AgentEventListItem) => {
     setSelectedEventId(event.eventId);
@@ -910,6 +917,28 @@ export default function AgentEventsPage() {
                 <FieldValue label="风险名称" value={selectedEvent?.riskName ? t(selectedEvent.riskName) : undefined} />
                 <FieldValue label="研判层级" value={selectedEvent?.tier} />
                 <FieldValue label="父 Span" value={selectedEvent?.parentSpanId} />
+                {semanticContextLoading ? (
+                  <p className="flex items-center gap-2 text-xs text-zinc-500"><LoaderCircle className="size-3.5 animate-spin" />正在读取关联 Agent 对话</p>
+                ) : semanticContext?.conversationLinks.length ? (
+                  <div className="rounded border border-violet-400/15 bg-violet-500/[0.04] p-3">
+                    <p className="text-[10px] uppercase tracking-[0.08em] text-zinc-600">关联 Agent 对话</p>
+                    <div className="mt-2 space-y-1">
+                      {semanticContext.conversationLinks.map((link) => (
+                        <Link
+                          key={`${link.conversationId}:${link.semanticEventId}`}
+                          to={`/conversations?${new URLSearchParams({
+                            timeType,
+                            conversationId: link.conversationId,
+                            semanticEventId: link.semanticEventId,
+                          }).toString()}`}
+                          className="flex min-h-9 items-center text-xs font-medium text-violet-200 hover:text-violet-100"
+                        >
+                          查看触发该内核行为的 Thread / Turn
+                        </Link>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
               </div>
             </section>
             <TraceTimeline timeline={selectedEvent && timeline?.traceId === selectedEvent.traceId ? timeline : undefined} loading={Boolean(selectedEvent && timelineLoading)} />

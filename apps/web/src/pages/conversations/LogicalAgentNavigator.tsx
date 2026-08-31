@@ -5,7 +5,7 @@ import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react"
 import type {
   AgentConversationSummary,
   AgentRuntimeInstanceRecord,
-  LogicalAgentConversationDirectoryItem,
+  LogicalAgentConversationDirectoryItemV3,
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
 
@@ -28,7 +28,7 @@ function shortId(value: string) {
 }
 
 function matchingInstances(
-  agent: LogicalAgentConversationDirectoryItem,
+  agent: LogicalAgentConversationDirectoryItemV3,
   instances: AgentRuntimeInstanceRecord[],
 ) {
   const expected = new Set(agent.agentInstanceIds);
@@ -69,15 +69,15 @@ export function LogicalAgentNavigator({
   onSelectInstance,
   onSelectConversation,
 }: {
-  items: LogicalAgentConversationDirectoryItem[];
+  items: LogicalAgentConversationDirectoryItemV3[];
   runtimeInstances: AgentRuntimeInstanceRecord[];
   selectedLogicalAgentId?: string;
   selectedInstanceId?: string;
   selectedConversationId?: string;
   loading: boolean;
   error?: Error;
-  onSelectAgent: (item: LogicalAgentConversationDirectoryItem) => void;
-  onSelectInstance: (agent: LogicalAgentConversationDirectoryItem, instance: AgentRuntimeInstanceRecord) => void;
+  onSelectAgent: (item: LogicalAgentConversationDirectoryItemV3) => void;
+  onSelectInstance: (agent: LogicalAgentConversationDirectoryItemV3, instance: AgentRuntimeInstanceRecord) => void;
   onSelectConversation: (conversation: AgentConversationSummary) => void;
 }) {
   const refs = useRef(new Map<string, HTMLButtonElement>());
@@ -230,11 +230,18 @@ export function LogicalAgentNavigator({
                     <span className="flex items-center gap-1.5"><MessageSquareText className="size-3" />对话线程</span>
                     <span>{visibleConversations.length}</span>
                   </div>
+                  {agent.technicalActivityCount > 0 ? (
+                    <p className="mb-2 px-2 text-[10px] leading-4 text-zinc-600">
+                      启动与能力协商 {agent.technicalActivityCount} 条，已从用户会话计数中折叠。
+                    </p>
+                  ) : null}
                   <div className="space-y-1">
                     {visibleConversations.slice(0, 20).map((conversation, conversationIndex) => (
                       <button
                         key={conversation.conversationId}
                         type="button"
+                        data-conversation-id={conversation.conversationId}
+                        aria-pressed={selectedConversationId === conversation.conversationId}
                         onClick={() => onSelectConversation(conversation)}
                         className={cn(
                           "flex min-h-11 w-full cursor-pointer items-center gap-2 rounded border px-2 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400/70",
