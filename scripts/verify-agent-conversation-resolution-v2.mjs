@@ -75,6 +75,9 @@ function interaction({
   path = '/backend-api/codex/responses',
   agentProduct = 'Codex',
   workspacePath = '/workspace/resolver-v2',
+  statusCode = 200,
+  completeness = 'complete',
+  partialReasons = [],
 }) {
   const messages = (request.input ?? request.messages ?? []).map((item) => ({
     role: item.role ?? item.type ?? 'input',
@@ -118,7 +121,7 @@ function interaction({
     endpoint: 'gateway.invalid',
     method: 'POST',
     path,
-    statusCode: 200,
+    statusCode,
     model: interactionType === 'model' ? 'fixture-model' : undefined,
     startedAtUnixNs: String(BigInt(at) * 1_000_000n),
     requestCompleteAtUnixNs: String(BigInt(at + 1) * 1_000_000n),
@@ -132,8 +135,8 @@ function interaction({
     toolResults,
     semanticParserId: 'observer.agent-interaction',
     semanticParserVersion: 1,
-    completeness: 'complete',
-    partialReasons: [],
+    completeness,
+    partialReasons,
     captureSource: 'tls_uprobe_rustls',
     receivedAt: at + 4,
   };
@@ -386,6 +389,55 @@ const cumulative = resolveAgentConversationsV2([
 ]);
 assert.equal(new Set(cumulative.conversationRecords.map((item) => item.conversationId)).size, 1,
   'product-neutral cumulative human lineage must survive a process restart without product rules');
+
+const retryRequest = {
+  model: 'claude-fixture',
+  messages: [{ role: 'user', content: 'one request that the provider retries' }],
+};
+const retries = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_retry_a', at: base + 3_200, instance: 'host-root:retry:one',
+    agentProduct: 'Claude Code', workspacePath: '/workspace/retry', request: retryRequest,
+    providerConversationId: 'retry-thread',
+    statusCode: 429, responseText: 'rate limited', completeness: 'partial',
+    partialReasons: ['http_error'],
+  }),
+  interaction({
+    id: 'mi_v2_retry_b', at: base + 3_300, instance: 'host-root:retry:one',
+    agentProduct: 'Claude Code', workspacePath: '/workspace/retry', request: retryRequest,
+    providerConversationId: 'retry-thread',
+    statusCode: 429, responseText: 'rate limited', completeness: 'partial',
+    partialReasons: ['http_error'],
+  }),
+  interaction({
+    id: 'mi_v2_retry_c', at: base + 3_400, instance: 'host-root:retry:one',
+    agentProduct: 'Claude Code', workspacePath: '/workspace/retry', request: retryRequest,
+    providerConversationId: 'retry-thread',
+    statusCode: 429, responseText: 'rate limited', completeness: 'partial',
+    partialReasons: ['http_error'],
+  }),
+]);
+const retryProjection = projectAgentConversations(
+  retries.records,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(retryProjection.summaries.length, 1);
+assert.equal(retryProjection.summaries[0].turnCount, 1,
+  'byte-identical failed provider retries must remain one user Turn');
+const retryTimeline = projectSemanticConversationTimeline(
+  retryProjection.summaries[0],
+  retryProjection.interactionsByConversation.get(retryProjection.summaries[0].conversationId),
+  [],
+);
+assert.equal(retryTimeline.length, 1);
+assert.equal(retryTimeline[0].events.filter((event) => event.kind === 'user_message').length, 1);
+assert.deepEqual(
+  retryTimeline[0].diagnostics
+    .filter((diagnostic) => diagnostic.type === 'retry')
+    .map((diagnostic) => diagnostic.message),
+  ['模型请求发生重试 · Attempt 2', '模型请求发生重试 · Attempt 3'],
+);
 
 const assertOneThread = (records, label) => {
   const resolved = resolveAgentConversationsV2(records);

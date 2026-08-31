@@ -50,6 +50,7 @@ function interactionEnvironment(
   record: T.AgentInteractionRecord,
   asset?: T.AgentInventoryItem,
 ): T.AgentConversationSummary['environment'] {
+  if (record.environment && record.environment !== 'unknown') return record.environment;
   if (asset?.runtime && asset.runtime !== 'unknown') return asset.runtime;
   const cgroup = record.process?.cgroup?.toLowerCase() ?? '';
   if (cgroup.includes('kubepods')) return 'kubernetes';
@@ -329,7 +330,19 @@ function annotateTurns(
       previous
       && (record.toolResults.length > 0 || previous.toolCalls.length > 0),
     );
-    if (!previous || (!continuesToolLoop && !stableTurnAnchor)) turn += 1;
+    // A provider/CLI retry commonly replays the byte-identical request after an HTTP error. Older
+    // payloads do not carry a stable message/turn id, so without this evidence the projection
+    // incorrectly creates one empty user Turn per retry. Reuse the prior Turn only when the
+    // immediately preceding attempt failed and the full request hash is identical; two successful
+    // user turns that happen to contain the same prompt therefore remain distinct.
+    const retriesPreviousRequest = Boolean(
+      previous
+      && previous.interactionType === 'model'
+      && record.interactionType === 'model'
+      && previous.statusCode >= 400
+      && record.request.sha256 === previous.request.sha256,
+    );
+    if (!previous || (!continuesToolLoop && !retriesPreviousRequest && !stableTurnAnchor)) turn += 1;
     const turnId = stableTurnAnchor
       ? stableId('trn', [
           normalized(record.tenantId),
@@ -339,7 +352,7 @@ function annotateTurns(
           normalized(record.process?.hostId),
           stableTurnAnchor,
         ].join('\u0000'))
-      : previous && continuesToolLoop && previous.turnId
+      : previous && (continuesToolLoop || retriesPreviousRequest) && previous.turnId
         ? previous.turnId
         : `${conversationId}:turn:${turn}`;
     const modelCallId = stableId(

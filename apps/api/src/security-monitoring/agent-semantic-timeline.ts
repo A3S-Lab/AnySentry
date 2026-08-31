@@ -514,12 +514,13 @@ export function projectSemanticConversationTimeline(
       if (item.kind === 'tool_call' && item.toolCallId) calls.set(item.toolCallId, event);
     }
 
-    if (interaction.attemptId?.endsWith(':attempt:2')) {
+    const attemptNumber = Number(interaction.attemptId?.match(/:attempt:(\d+)$/u)?.[1]);
+    if (Number.isSafeInteger(attemptNumber) && attemptNumber > 1) {
       turn.diagnostics.push({
         diagnosticId: `diag_retry_${interaction.interactionId}`,
         type: 'retry',
         severity: 'info',
-        message: '模型请求发生重试',
+        message: `模型请求发生重试 · Attempt ${attemptNumber}`,
         interactionId: interaction.interactionId,
       });
     }

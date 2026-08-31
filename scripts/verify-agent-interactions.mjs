@@ -399,6 +399,9 @@ const directoryV3 = await requestWithoutManagementToken('/agents/conversation-di
 });
 assert.equal(directoryV3.apiVersion, 3);
 assert.ok(Number.isSafeInteger(directoryV3.resolutionRevision));
+assert.ok(directoryV3.items.every((entry) =>
+  entry.userThreads.every((thread) => thread.hasContent)),
+  'the V3 user Thread directory must exclude asset-only placeholders');
 const v3Owner = directoryV3.items.find((entry) =>
   entry.userThreads.some((thread) => thread.conversationId === conversation.conversationId));
 assert.ok(v3Owner, JSON.stringify(directoryV3));

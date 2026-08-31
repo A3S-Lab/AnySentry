@@ -4844,7 +4844,10 @@ export class SecurityMonitoringController {
           activity.agentInstanceId && instanceIds.has(activity.agentInstanceId));
         return {
           ...item,
-          userThreads: item.conversations,
+          // V3 presents only human-visible conversation Threads. Asset-only placeholders remain
+          // available through the legacy `conversations` compatibility field but must not pollute
+          // the operator's Thread list.
+          userThreads: item.conversations.filter((conversation) => conversation.hasContent),
           technicalActivities,
           technicalActivityCount: technicalActivities.reduce(
             (sum, activity) => sum + activity.interactionIds.length,

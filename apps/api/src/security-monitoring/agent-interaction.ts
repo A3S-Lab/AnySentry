@@ -104,6 +104,13 @@ function interactionAgentAssetId(
     : meta.subjectAssetId ?? semanticIdentity.agentAssetId;
 }
 
+function interactionEnvironment(meta: T.EventMeta): T.AgentInteractionRecord['environment'] {
+  const environment = meta.attribution?.workloadRef?.environment;
+  return environment === 'kubernetes' || environment === 'docker' || environment === 'host'
+    ? environment
+    : 'unknown';
+}
+
 function boundedJson(value: unknown, maxBytes = MAX_DERIVED_JSON_BYTES): unknown {
   if (value === undefined) return undefined;
   try {
@@ -381,6 +388,7 @@ function parsePlaintextEvidence(
     agentAssetId: interactionAgentAssetId(meta, semanticIdentity),
     agentInstanceId: semanticIdentity.agentRuntimeInstanceId,
     agentProduct: semanticIdentity.agentProduct ?? meta.attribution?.agentDisplayName ?? meta.agentId,
+    environment: interactionEnvironment(meta),
     ...(runtimeSessionId ? { runtimeSessionId } : {}),
     runtimeRole,
     correlationQuality: meta.subjectAssetId && semanticIdentity.agentRuntimeInstanceId
@@ -526,6 +534,7 @@ export function parseObserverAgentInteraction(
     agentAssetId,
     agentInstanceId: semanticIdentity.agentRuntimeInstanceId,
     agentProduct: semanticIdentity.agentProduct ?? meta.attribution?.agentDisplayName ?? meta.agentId,
+    environment: interactionEnvironment(meta),
     ...(runtimeSessionId ? { runtimeSessionId } : {}),
     ...(providerConversationId ? { providerConversationId } : {}),
     ...(providerResponseId ? { providerResponseId } : {}),
