@@ -1606,3 +1606,31 @@ Provider usage
 - 当前 Agent 默认只显示 running / unobserved 实例；lost / exited 实例折叠在显式按钮后。
 - 深链接选中的历史实例即使处于折叠状态仍单独保留可见，避免 URL 与页面选择失配。
 - Agent Overview、Instance Overview、Thread Header 和单次 Interaction Inspector 分层展示用量；没有 provider usage 时明确显示“未报告”，不显示伪造的 0 Token。
+
+### 25.4 生产验收记录（2026-09-01）
+
+| 项目 | Runtime Revision | 生产镜像 |
+|---|---|---|
+| AnySentry | `b42612c`（功能主体 `706dcf7`） | `127.0.0.1:5000/anysentry@sha256:fd785ffc42e57f0703a4e545faf3b52d67bc0ab4681bd5fb80e4e58796e88985` |
+| Observer | `6fa8e17` | `127.0.0.1:5000/anysentry-observer@sha256:7446d14b0dcb7fd4944e9eb5d6e67a6f72b45c5a8be3624aad6880eb608f8b94` |
+
+使用 Host Codex `v0.151.0`、官方登录和真实 Responses WebSocket 执行一次包含 shell 工具的独立验收，结果为：
+
+- Canonical Thread：`cv_1475ff41b3eef916a01f6cd5`；
+- 一轮时间线：User → Tool call → Tool result → Model final；
+- 两次模型 Interaction 均为 `websocket-json / openai-responses / status 200`；
+- `modelCallCount=2`、`toolCallCount=1`、`toolResultCount=1`、`errorCount=0`；
+- provider usage：input `43,895`、output `150`、total `44,045`、cached input `21,248`、reasoning output `72`；
+- Thread 与 Instance 汇总完全一致，`tokenCoverage=complete`；
+- Timeline diagnostic 为 0，Conversation coverage 为 complete。
+
+生产浏览器门禁通过 1440、1024、390、375 四个 viewport，并验证：
+
+- Thread、实例、Logical Agent 与单次 Interaction 的 Token 信息；
+- 历史 Logical Agent 默认折叠；
+- lost/exited 实例默认折叠且可展开后再次收起；
+- 100 次快速 Thread 切换；
+- 面板键盘调宽、移动端 44px 命中区和 reduced motion；
+- 横向溢出、运行时异常和网络失败均为 0。
+
+对部署前已经存在的 Host Codex 长连接，首个恢复帧确认是带上下文接管的 `permessage-deflate`；缺少握手前的压缩字典时，单帧解压会得到 `Z_DATA_ERROR`，历史正文无法从 TLS 密文边界逆向补造。该连接已留下 `websocket_handshake_recovered` 覆盖证据，但必须在自然重连后才进入完整解析。新连接从 HTTP 101 开始建立状态，之后空闲 WebSocket 最多保留 24 小时，因此不再因原来的 90 秒 HTTP 超时丢失后续对话。
