@@ -23,12 +23,19 @@ const content = (body, messages = []) => ({
   completeness: 'complete',
   messages,
 });
-const interaction = ({ id, at, instance, users }) => ({
+const interaction = ({
+  id,
+  at,
+  instance,
+  users,
+  workspacePath = '/workspace/thread-fixture',
+  conversationAnchors = [],
+}) => ({
   schemaVersion: 'anysentry.agent_interaction.v1',
   interactionId: id,
   interactionType: 'model',
   at,
-  workspacePath: '/workspace/thread-fixture',
+  workspacePath,
   agentAssetId: 'agent-thread-fixture',
   agentInstanceId: instance,
   agentProduct: 'Codex',
@@ -42,7 +49,7 @@ const interaction = ({ id, at, instance, users }) => ({
     startTimeTicks: String(at),
     comm: 'codex',
     exe: '/usr/bin/codex',
-    cwd: '/workspace/thread-fixture',
+    cwd: workspacePath,
   },
   connectionId: `tls:${id}`,
   transport: 'tls',
@@ -65,6 +72,7 @@ const interaction = ({ id, at, instance, users }) => ({
   response: { ...content(`reply:${users.at(-1)}`), text: `reply:${users.at(-1)}` },
   toolCalls: [],
   toolResults: [],
+  conversationAnchors,
   completeness: 'complete',
   partialReasons: [],
   captureSource: 'tls_uprobe_rustls',
@@ -74,6 +82,8 @@ const interaction = ({ id, at, instance, users }) => ({
 const storedBindings = new Map();
 const storedThreads = new Map();
 const storedSegments = new Map();
+const storedAnchors = [];
+const storedMemberships = new Map();
 const fakeStore = {
   configured: () => true,
   loadAgentConversationBindings: async (ids) => ids.flatMap((id) =>
@@ -81,13 +91,44 @@ const fakeStore = {
   loadAgentConversationThreads: async (scopes) => [...storedThreads.values()]
     .filter((thread) => scopes.includes(thread.logicalScopeKey))
     .map((thread) => structuredClone(thread)),
+  loadAgentConversationThreadsByIds: async (ids) => [...storedThreads.values()]
+    .filter((thread) => ids.includes(thread.conversationId))
+    .map((thread) => structuredClone(thread)),
   loadAgentConversationSegments: async (conversationIds) => [...storedSegments.values()]
     .filter((segment) => conversationIds.includes(segment.conversationId))
     .map((segment) => structuredClone(segment)),
+  loadAgentConversationMembershipsV2: async (ids) => ids.flatMap((id) =>
+    storedMemberships.has(id) ? [structuredClone(storedMemberships.get(id))] : []),
+  loadAgentConversationMembershipsByAnchors: async (anchors) => {
+    const keys = new Set(anchors.map((anchor) => `${anchor.namespace}\0${anchor.valueHash}`));
+    return storedAnchors.flatMap((stored) => {
+      const membership = storedMemberships.get(stored.interactionId);
+      return keys.has(`${stored.anchor.namespace}\0${stored.anchor.valueHash}`)
+        && membership?.canonicalConversationId
+        ? [{ anchor: structuredClone(stored), membership: structuredClone(membership) }]
+        : [];
+    });
+  },
   saveAgentConversationResolution: async (threads, segments, bindings) => {
     for (const thread of threads) storedThreads.set(thread.conversationId, structuredClone(thread));
     for (const segment of segments) storedSegments.set(segment.segmentId, structuredClone(segment));
     for (const binding of bindings) storedBindings.set(binding.interactionId, structuredClone(binding));
+    return true;
+  },
+  saveAgentConversationResolutionV2: async (anchors, memberships) => {
+    for (const anchor of anchors) {
+      const key = `${anchor.interactionId}\0${anchor.anchor.kind}\0${anchor.anchor.namespace}\0${anchor.anchor.valueHash}`;
+      const index = storedAnchors.findIndex((item) =>
+        `${item.interactionId}\0${item.anchor.kind}\0${item.anchor.namespace}\0${item.anchor.valueHash}` === key);
+      if (index >= 0) storedAnchors[index] = structuredClone(anchor);
+      else storedAnchors.push(structuredClone(anchor));
+    }
+    for (const membership of memberships) {
+      const previous = storedMemberships.get(membership.interactionId);
+      if (!previous || membership.resolutionRevision >= previous.resolutionRevision) {
+        storedMemberships.set(membership.interactionId, structuredClone(membership));
+      }
+    }
     return true;
   },
 };
@@ -101,11 +142,19 @@ const resolveAndPersist = async (service, records) => {
 };
 
 const service = new AgentConversationBindingService(fakeStore);
+const continuityAnchor = {
+  kind: 'continuity_key',
+  namespace: 'provider',
+  valueHash: 'a'.repeat(64),
+  strength: 'strong',
+  sourcePath: 'fixture.continuity',
+};
 const first = interaction({
   id: 'mi_binding_first',
   at: 1_788_400_000_000,
   instance: 'host-root:thread:one',
   users: ['first'],
+  conversationAnchors: [continuityAnchor],
 });
 const firstProjection = await resolveAndPersist(service, [first]);
 const conversationId = firstProjection.projection.summaries[0].conversationId;
@@ -173,5 +222,24 @@ assert.ok(!restartedService.segmentsForConversation(conversationId).some((segmen
   segment.segmentId === 'seg_legacy_contained_subset'),
   'a contained historical segment must not duplicate its complete Runtime segment');
 assert.equal(storedBindings.size, 5);
+
+const anchorRestartService = new AgentConversationBindingService(fakeStore);
+const resumedFromAnchorOnly = interaction({
+  id: 'mi_binding_anchor_only_resume',
+  at: resumedAfterApiRestart.at + 25 * 60 * 60 * 1_000,
+  instance: 'host-root:thread:five',
+  workspacePath: 'agent://runtime-worker',
+  users: ['first', 'next day', 'resumed', 'after restart', 'anchor-only resume'],
+  conversationAnchors: [continuityAnchor],
+});
+const anchorProjection = await resolveAndPersist(anchorRestartService, [resumedFromAnchorOnly]);
+assert.equal(anchorProjection.bound[0].conversationId, conversationId,
+  'a persisted continuity Anchor must recover the canonical Thread without an old in-window Interaction');
+assert.equal(anchorProjection.bound[0].workspacePath, '/workspace/thread-fixture',
+  'a weak resumed workspace must inherit the Thread\'s remembered explicit workspace');
+assert.equal(storedThreads.get(conversationId).workspacePath, '/workspace/thread-fixture',
+  'a short-window projection must not downgrade persisted Thread workspace evidence');
+assert.equal(anchorRestartService.segmentsForConversation(conversationId).length, 4);
+assert.equal(storedBindings.size, 6);
 
 console.log('Agent Conversation durable Thread/Segment binding verification passed');

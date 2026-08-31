@@ -10,6 +10,7 @@ import {
   type ConversationResolutionV2,
   type ConversationRouteAliasV1,
   type TechnicalActivityProjection,
+  conversationAnchorsForInteraction,
   conversationLogicalScopeKeyV2,
   resolveAgentConversationsV2,
 } from './agent-conversation-resolution-v2';
@@ -72,6 +73,64 @@ function compareInteraction(left: T.AgentInteractionRecord, right: T.AgentIntera
 
 function threadRank(source: T.AgentConversationThreadRecord['idSource']): number {
   return source === 'provider' ? 3 : source === 'runtime' ? 2 : 1;
+}
+
+function syntheticWorkspace(value?: string): boolean {
+  const workspace = value?.trim().replace(/\/+$/u, '') ?? '';
+  return !workspace
+    || workspace === 'workspace:unknown'
+    || workspace.startsWith('agent://')
+    || workspace.startsWith('agent-scope:');
+}
+
+function preferredWorkspace(current: string, remembered?: string): string {
+  return remembered && !syntheticWorkspace(remembered) && syntheticWorkspace(current)
+    ? remembered
+    : current;
+}
+
+function anchorKindsCompatible(
+  current: T.AgentConversationAnchorKind,
+  stored: T.AgentConversationAnchorKind,
+): boolean {
+  if (current === 'previous_response_id' && stored === 'response_id') return true;
+  return current === stored && [
+    'provider_conversation',
+    'continuity_key',
+    'response_id',
+    'message_item_id',
+    'turn_id',
+    'tool_call_id',
+  ].includes(current);
+}
+
+function anchorScore(kind: T.AgentConversationAnchorKind): number {
+  switch (kind) {
+    case 'provider_conversation': return 140;
+    case 'previous_response_id':
+    case 'response_id': return 130;
+    case 'tool_call_id': return 120;
+    case 'continuity_key': return 100;
+    case 'turn_id': return 90;
+    case 'message_item_id': return 80;
+    default: return 0;
+  }
+}
+
+function sameThreadDomain(
+  record: T.AgentInteractionRecord,
+  thread: T.AgentConversationThreadRecord,
+): boolean {
+  if (normalized(record.tenantId) && normalized(thread.tenantId)
+    && normalized(record.tenantId) !== normalized(thread.tenantId)) return false;
+  if (normalized(record.environmentId) && normalized(thread.environmentId)
+    && normalized(record.environmentId) !== normalized(thread.environmentId)) return false;
+  if (normalized(record.agentProduct) !== normalized(thread.agentProduct)) return false;
+  if (normalized(record.process?.hostId) && normalized(thread.hostId)
+    && normalized(record.process?.hostId) !== normalized(thread.hostId)) return false;
+  return syntheticWorkspace(record.workspacePath)
+    || syntheticWorkspace(thread.workspacePath)
+    || normalized(record.workspacePath) === normalized(thread.workspacePath);
 }
 
 function segmentEnd(segment: T.ConversationInstanceSegment): bigint {
@@ -140,6 +199,90 @@ export class AgentConversationBindingService {
     @Optional() private readonly relationalStore?: RelationalBusinessStore,
   ) {}
 
+  private async bindByPersistedAnchors(
+    records: T.AgentInteractionRecord[],
+  ): Promise<void> {
+    if (!records.length || !this.relationalStore?.configured()) return;
+    for (const record of records) {
+      record.conversationAnchors = conversationAnchorsForInteraction(record);
+    }
+    const matches = await this.relationalStore.loadAgentConversationMembershipsByAnchors(
+      records.flatMap((record) => record.conversationAnchors ?? []),
+    );
+    const conversationIds = [...new Set(matches
+      .map((match) => match.membership.canonicalConversationId)
+      .filter((value): value is string => Boolean(value)))];
+    for (const thread of await this.relationalStore.loadAgentConversationThreadsByIds(
+      conversationIds,
+    )) this.threads.set(thread.conversationId, thread);
+    for (const segment of await this.relationalStore.loadAgentConversationSegments(
+      conversationIds,
+    )) this.segments.set(segment.segmentId, segment);
+    const byHash = new Map<string, typeof matches>();
+    for (const match of matches) {
+      const anchor = match.anchor.anchor;
+      const key = `${anchor.namespace}\u0000${anchor.valueHash}`;
+      const values = byHash.get(key) ?? [];
+      values.push(match);
+      byHash.set(key, values);
+    }
+    for (const record of records) {
+      const candidates = new Map<string, {
+        thread: T.AgentConversationThreadRecord;
+        anchors: Map<string, number>;
+        evidence: Set<string>;
+        exact: boolean;
+      }>();
+      for (const current of record.conversationAnchors ?? []) {
+        const key = `${current.namespace}\u0000${current.valueHash}`;
+        for (const match of byHash.get(key) ?? []) {
+          const stored = match.anchor.anchor;
+          if (!anchorKindsCompatible(current.kind, stored.kind)) continue;
+          const canonical = this.canonicalConversationId(
+            match.membership.canonicalConversationId!,
+          );
+          const thread = this.threads.get(canonical);
+          if (!thread || !sameThreadDomain(record, thread)) continue;
+          const candidate = candidates.get(canonical) ?? {
+            thread,
+            anchors: new Map<string, number>(),
+            evidence: new Set<string>(),
+            exact: false,
+          };
+          const anchorKey = `${current.kind}\u0000${current.namespace}\u0000${current.valueHash}`;
+          candidate.anchors.set(
+            anchorKey,
+            Math.max(candidate.anchors.get(anchorKey) ?? 0, anchorScore(current.kind)),
+          );
+          candidate.evidence.add(
+            current.kind === 'previous_response_id' && stored.kind === 'response_id'
+              ? 'previous_response_id:response_id'
+              : current.kind,
+          );
+          candidate.exact ||= current.strength === 'exact' && stored.strength === 'exact';
+          candidates.set(canonical, candidate);
+        }
+      }
+      const ranked = [...candidates.entries()].map(([conversationId, candidate]) => ({
+        conversationId,
+        ...candidate,
+        score: [...candidate.anchors.values()].reduce((sum, score) => sum + score, 0),
+      })).sort((left, right) =>
+        right.score - left.score
+        || right.anchors.size - left.anchors.size
+        || left.conversationId.localeCompare(right.conversationId));
+      const best = ranked[0];
+      const tied = best && ranked[1]?.score === best.score
+        && ranked[1].anchors.size === best.anchors.size;
+      if (!best || tied || best.score < 80) continue;
+      record.conversationId = best.conversationId;
+      record.conversationIdSource = best.thread.idSource;
+      record.conversationBindingVersion = AGENT_CONVERSATION_RESOLVER_VERSION;
+      record.correlationQuality = best.exact ? 'exact' : 'strong';
+      record.workspacePath = preferredWorkspace(record.workspacePath, best.thread.workspacePath);
+    }
+  }
+
   async applyPersistedBindings(
     interactions: T.AgentInteractionRecord[],
   ): Promise<T.AgentInteractionRecord[]> {
@@ -158,6 +301,12 @@ export class AgentConversationBindingService {
       for (const thread of await this.relationalStore.loadAgentConversationThreads(
         loadedBindings.map((binding) => binding.logicalScopeKey),
       )) this.threads.set(thread.conversationId, thread);
+      for (const thread of await this.relationalStore.loadAgentConversationThreadsByIds([
+        ...loadedBindings.map((binding) => binding.conversationId),
+        ...loadedMemberships
+          .map((membership) => membership.canonicalConversationId)
+          .filter((value): value is string => Boolean(value)),
+      ])) this.threads.set(thread.conversationId, thread);
       for (const segment of await this.relationalStore.loadAgentConversationSegments(
         loadedBindings.map((binding) => binding.conversationId),
       )) this.segments.set(segment.segmentId, segment);
@@ -181,8 +330,14 @@ export class AgentConversationBindingService {
       const canonicalConversationId = boundConversationId
         ? this.canonicalConversationId(boundConversationId)
         : undefined;
+      const thread = canonicalConversationId
+        ? this.threads.get(canonicalConversationId)
+        : undefined;
       return {
         ...record,
+        ...(thread ? {
+          workspacePath: preferredWorkspace(record.workspacePath, thread.workspacePath),
+        } : {}),
         ...(canonicalConversationId ? { conversationId: canonicalConversationId } : {}),
         ...(canonicalConversationId ? { conversationIdSource: 'inferred' as const } : {}),
         ...(membership?.role ? { trafficRole: membership.role } : {}),
@@ -195,7 +350,9 @@ export class AgentConversationBindingService {
       };
     });
     const unbound = projected.filter((record) => !record.conversationId);
-    const scopeKeys = [...new Set(unbound.map(conversationLogicalScopeKey))];
+    await this.bindByPersistedAnchors(unbound);
+    const remainingUnbound = unbound.filter((record) => !record.conversationId);
+    const scopeKeys = [...new Set(remainingUnbound.map(conversationLogicalScopeKey))];
     if (scopeKeys.length && this.relationalStore?.configured()) {
       const loadedThreads = await this.relationalStore.loadAgentConversationThreads(scopeKeys);
       for (const thread of loadedThreads) {
@@ -206,7 +363,7 @@ export class AgentConversationBindingService {
       )) this.segments.set(segment.segmentId, segment);
     }
 
-    for (const record of unbound.sort(compareInteraction)) {
+    for (const record of remainingUnbound.sort(compareInteraction)) {
       const scope = conversationLogicalScopeKey(record);
       const lineage = userLineage(record);
       const resultIds = new Set(record.toolResults.map((result) => result.toolCallId));
@@ -283,7 +440,6 @@ export class AgentConversationBindingService {
       if (records.length === 0) continue;
       const first = records[0];
       const last = records.at(-1)!;
-      const logicalScopeKey = conversationLogicalScopeKey(first);
       const resolvedResultIds = new Set(records.flatMap((record) =>
         record.toolResults.map((result) => result.toolCallId)));
       const pendingToolCallIds = [...new Set(records.flatMap((record) =>
@@ -291,6 +447,8 @@ export class AgentConversationBindingService {
           .map((call) => call.toolCallId)
           .filter((callId) => !resolvedResultIds.has(callId))))];
       const priorThread = this.threads.get(summary.conversationId);
+      const workspacePath = preferredWorkspace(summary.workspacePath, priorThread?.workspacePath);
+      const logicalScopeKey = conversationLogicalScopeKey({ ...first, workspacePath });
       const latestLineage = userLineage(last);
       const thread: T.AgentConversationThreadRecord = {
         schemaVersion: 'anysentry.agent_conversation_thread.v1',
@@ -299,9 +457,17 @@ export class AgentConversationBindingService {
         idSource: priorThread && threadRank(priorThread.idSource) > threadRank(summary.idSource)
           ? priorThread.idSource
           : summary.idSource,
+        ...(first.tenantId ?? priorThread?.tenantId
+          ? { tenantId: first.tenantId ?? priorThread?.tenantId }
+          : {}),
+        ...(first.environmentId ?? priorThread?.environmentId
+          ? { environmentId: first.environmentId ?? priorThread?.environmentId }
+          : {}),
         agentProduct: summary.agentProduct,
-        workspacePath: summary.workspacePath,
-        ...(first.process?.hostId ? { hostId: first.process.hostId } : {}),
+        workspacePath,
+        ...(first.process?.hostId ?? priorThread?.hostId
+          ? { hostId: first.process?.hostId ?? priorThread?.hostId }
+          : {}),
         agentInstanceIds: [...new Set([
           ...(priorThread?.agentInstanceIds ?? []),
           ...summary.agentInstanceIds,

@@ -1490,6 +1490,8 @@ export interface AgentConversationThreadRecord {
   conversationId: string;
   logicalScopeKey: string;
   idSource: 'provider' | 'runtime' | 'inferred';
+  tenantId?: string;
+  environmentId?: string;
   agentProduct: string;
   workspacePath: string;
   hostId?: string;

@@ -60,6 +60,11 @@ export interface AgentConversationAnchorPersistence {
   anchor: AgentConversationAnchor;
 }
 
+export interface AgentConversationAnchorMembershipMatch {
+  anchor: AgentConversationAnchorPersistence;
+  membership: ConversationMembershipV2;
+}
+
 function positiveInt(value: string | undefined, fallback: number, max: number): number {
   const parsed = Number.parseInt(value ?? '', 10);
   return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, max) : fallback;
@@ -518,6 +523,29 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  async loadAgentConversationThreadsByIds(
+    conversationIds: string[],
+  ): Promise<AgentConversationThreadRecord[]> {
+    if (conversationIds.length === 0 || !(await this.initialize()) || !this.pool) return [];
+    try {
+      const result = await this.pool.query<{ record: AgentConversationThreadRecord | string }>(
+        `SELECT record
+           FROM anysentry_agent_conversation_threads_v1
+          WHERE conversation_id = ANY($1::text[])
+          LIMIT $2`,
+        [[...new Set(conversationIds)], AGENT_CONVERSATION_BINDING_LIMIT],
+      );
+      return result.rows
+        .map(({ record }) => this.parseRecord<AgentConversationThreadRecord>(record))
+        .filter((record): record is AgentConversationThreadRecord => Boolean(
+          record?.conversationId && record.logicalScopeKey,
+        ));
+    } catch (error) {
+      this.markUnavailable('load Agent Conversation threads by id', error);
+      return [];
+    }
+  }
+
   async loadAgentConversationSegments(
     conversationIds: string[],
   ): Promise<ConversationInstanceSegment[]> {
@@ -562,6 +590,82 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         ));
     } catch (error) {
       this.markUnavailable('load Agent Conversation V2 memberships', error);
+      return [];
+    }
+  }
+
+  async loadAgentConversationMembershipsByAnchors(
+    anchors: AgentConversationAnchor[],
+  ): Promise<AgentConversationAnchorMembershipMatch[]> {
+    if (anchors.length === 0 || !(await this.initialize()) || !this.pool) return [];
+    const lookup = [...new Map(anchors
+      .filter((anchor) => anchor.namespace && anchor.valueHash)
+      .map((anchor) => [`${anchor.namespace}\u0000${anchor.valueHash}`, {
+        namespace: anchor.namespace,
+        valueHash: anchor.valueHash,
+      }])).values()].slice(0, 4_096);
+    if (lookup.length === 0) return [];
+    try {
+      const result = await this.pool.query<{
+        anchor_record: (AgentConversationAnchorPersistence & AgentConversationAnchor) | string;
+        membership_record: ConversationMembershipV2 | string;
+      }>(
+        `WITH incoming AS (
+           SELECT DISTINCT item->>'namespace' AS namespace,
+                           item->>'valueHash' AS value_hash
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         SELECT anchor.record AS anchor_record,
+                membership.record AS membership_record
+           FROM incoming
+           JOIN anysentry_agent_conversation_anchors_v1 AS anchor
+             ON anchor.anchor_namespace = incoming.namespace
+            AND anchor.value_hash = incoming.value_hash
+           JOIN LATERAL (
+             SELECT candidate.record
+               FROM anysentry_agent_conversation_memberships_v2 AS candidate
+              WHERE candidate.interaction_id = anchor.interaction_id
+                AND candidate.canonical_conversation_id IS NOT NULL
+              ORDER BY candidate.resolution_revision DESC
+              LIMIT 1
+           ) AS membership ON TRUE
+          ORDER BY anchor.observed_at DESC
+          LIMIT $2`,
+        [JSON.stringify(lookup), AGENT_CONVERSATION_BINDING_LIMIT],
+      );
+      return result.rows.flatMap((row) => {
+        const stored = this.parseRecord<AgentConversationAnchorPersistence & AgentConversationAnchor>(
+          row.anchor_record,
+        );
+        const membership = this.parseRecord<ConversationMembershipV2>(row.membership_record);
+        if (
+          !stored?.interactionId
+          || !stored.logicalScopeKey
+          || !stored.kind
+          || !stored.namespace
+          || !stored.valueHash
+          || !membership?.canonicalConversationId
+        ) {
+          return [];
+        }
+        return [{
+          anchor: {
+            interactionId: stored.interactionId,
+            logicalScopeKey: stored.logicalScopeKey,
+            observedAt: Number(stored.observedAt),
+            anchor: {
+              kind: stored.kind,
+              namespace: stored.namespace,
+              valueHash: stored.valueHash,
+              strength: stored.strength,
+              sourcePath: stored.sourcePath,
+            },
+          },
+          membership,
+        }];
+      });
+    } catch (error) {
+      this.markUnavailable('load Agent Conversation memberships by Anchor', error);
       return [];
     }
   }
@@ -1793,6 +1897,12 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         CREATE INDEX IF NOT EXISTS anysentry_agent_conversation_anchors_v1_lookup_idx
           ON anysentry_agent_conversation_anchors_v1 (
             logical_scope_key, anchor_kind, anchor_namespace, value_hash
+          )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_agent_conversation_anchors_v1_hash_lookup_idx
+          ON anysentry_agent_conversation_anchors_v1 (
+            anchor_namespace, value_hash, anchor_kind, observed_at DESC
           )
       `);
       await pool.query(`
