@@ -1,4 +1,4 @@
-import { Injectable, Optional } from '@nestjs/common';
+import { Injectable, Optional, ServiceUnavailableException } from '@nestjs/common';
 import { Sentry } from '@a3s-lab/sentry';
 import { createHash } from 'node:crypto';
 import {
@@ -85,6 +85,7 @@ const LEVEL_TEXT: Record<string, string> = { safe: '安全', low: '低危', medi
 const TOOL_EVIDENCE_RELATION_SETTLE_MS = 10_000;
 const CONVERSATION_INTERACTIONS_PER_AGENT = 64;
 const CONVERSATION_INTERACTIONS_TOTAL = 2_000;
+const CONVERSATION_PROJECTION_CONCURRENCY = 4;
 const CATEGORY_COLOR: Record<string, string> = {
   command_danger: '#fb7185', data_leak: '#f59e0b', secret_exfil: '#f59e0b', prompt_injection: '#a855f7',
   communication_risk: '#38bdf8', systemic_risk: '#f43f5e', privilege_escalation: '#fb7185', other: '#94a3b8',
@@ -686,6 +687,15 @@ function compactIssueId(type: T.CoverageIssueType, ...parts: Array<string | numb
 
 type SimulatedDecision = { verdict: string; tier: string; severity: string; reason: string };
 
+type AgentConversationProjectionResult = {
+  projection: ReturnType<typeof projectAgentConversations>;
+  interactions: T.AgentInteractionList;
+  inventory: T.AgentInventory;
+  routeAlias?: ReturnType<AgentConversationBindingService['routeAlias']>;
+  requestedConversationId?: string;
+  canonicalConversationId?: string;
+};
+
 function normalizeSimulationDecision(decision: SimulatedDecision | null): T.PolicySimulationDecision {
   if (!decision) return { verdict: 'allow', tier: 'Rules', severity: 'info', reason: 'observed' };
   let verdict = decision.verdict as T.Verdict;
@@ -769,6 +779,13 @@ export class AggregationService {
   private interactionHotBytes = 0;
   private readonly interactionHotMaxRecords = 2_000;
   private readonly interactionHotMaxBytes = 64 * 1024 * 1024;
+  private readonly conversationProjectionGate = new BoundedHistoryQueryGate(
+    CONVERSATION_PROJECTION_CONCURRENCY,
+  );
+  private readonly conversationProjectionInFlight = new Map<
+    string,
+    Promise<AgentConversationProjectionResult>
+  >();
 
   historyFactCacheStatus() {
     const agents = [...this.agentHistoryBuckets.entries()].map(([scope, cache]) => ({
@@ -1992,14 +2009,52 @@ export class AggregationService {
     };
   }
 
-  private async agentConversationProjection(filter: T.AgentConversationQuery): Promise<{
-    projection: ReturnType<typeof projectAgentConversations>;
-    interactions: T.AgentInteractionList;
-    inventory: T.AgentInventory;
-    routeAlias?: ReturnType<AgentConversationBindingService['routeAlias']>;
-    requestedConversationId?: string;
-    canonicalConversationId?: string;
-  }> {
+  private conversationProjectionKey(filter: T.AgentConversationQuery): string {
+    return JSON.stringify({
+      timeType: filter.timeType,
+      startTime: filter.startTime,
+      endTime: filter.endTime,
+      snapshotAsOf: filter.snapshotAsOf,
+      scope: filter.scope,
+      classificationView: filter.classificationView,
+      agentAssetId: filter.agentAssetId,
+      agentInstanceId: filter.agentInstanceId,
+      conversationId: filter.conversationId,
+      product: filter.product,
+      classification: filter.classification,
+      coverageStatus: filter.coverageStatus,
+      model: filter.model,
+      q: filter.q,
+      limit: filter.limit,
+    });
+  }
+
+  private async agentConversationProjection(
+    filter: T.AgentConversationQuery,
+  ): Promise<AgentConversationProjectionResult> {
+    const key = this.conversationProjectionKey(filter);
+    const existing = this.conversationProjectionInFlight.get(key);
+    if (existing) return existing;
+    const operation = this.conversationProjectionGate
+      .run(() => this.computeAgentConversationProjection(filter))
+      .then((result) => {
+        if (result) return result;
+        throw new ServiceUnavailableException(
+          'Agent conversation projection is busy; retry the latest selection',
+        );
+      })
+      .finally(() => {
+        if (this.conversationProjectionInFlight.get(key) === operation) {
+          this.conversationProjectionInFlight.delete(key);
+        }
+      });
+    this.conversationProjectionInFlight.set(key, operation);
+    return operation;
+  }
+
+  private async computeAgentConversationProjection(
+    filter: T.AgentConversationQuery,
+  ): Promise<AgentConversationProjectionResult> {
     // An inferred conversation ID is anchored in the globally ordered projection. Applying an
     // asset, instance, or model prefilter can change the first record in that projection and thus
     // produce a different ID. Once a conversationId is present, keep those values as post-

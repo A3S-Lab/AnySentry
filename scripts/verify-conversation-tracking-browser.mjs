@@ -15,6 +15,7 @@ const marker = process.env.ANYSENTRY_CONVERSATION_MARKER ?? 'FINAL_REQUEST_SENTI
 const responseMarker = process.env.ANYSENTRY_CONVERSATION_RESPONSE_MARKER ?? 'VISIBLE_RESPONSE_SENTINEL';
 const toolMarker = process.env.ANYSENTRY_CONVERSATION_TOOL_MARKER ?? 'TOOL_RESULT_SENTINEL';
 const requestedConversationId = process.env.ANYSENTRY_CONVERSATION_ID?.trim();
+const timeType = process.env.ANYSENTRY_CONVERSATION_TIME_TYPE?.trim() || 'last_30d';
 const chromeBinary = process.env.CHROME_BIN ?? '/usr/bin/google-chrome';
 const profile = mkdtempSync(path.join(tmpdir(), 'anysentry-conversation-chrome-'));
 const outputDirectory = path.join(tmpdir(), `anysentry-conversation-view-${process.pid}`);
@@ -55,7 +56,7 @@ async function waitFor(label, read, accept, timeoutMs = 45_000) {
 }
 
 let conversations = await api('/agents/conversations', {
-  timeType: 'last_30d',
+  timeType,
   scope: 'agent',
   classificationView: 'current_effective',
   ...(requestedConversationId ? { conversationId: requestedConversationId } : { q: marker }),
@@ -68,12 +69,12 @@ let conversation = conversations.items.find((item) => item.hasContent && (
 ));
 if (!conversation) {
   const interactions = await api('/agents/interactions', {
-    timeType: 'last_30d', scope: 'agent', classificationView: 'current_effective', limit: 500,
+    timeType, scope: 'agent', classificationView: 'current_effective', limit: 500,
   });
   const interaction = interactions.items.find((item) => JSON.stringify(item).includes(marker));
   if (interaction?.agentAssetId) {
     conversations = await api('/agents/conversations', {
-      timeType: 'last_30d',
+      timeType,
       scope: 'agent',
       classificationView: 'current_effective',
       agentAssetId: interaction.agentAssetId,
@@ -81,7 +82,7 @@ if (!conversation) {
     });
     for (const candidate of conversations.items.filter((item) => item.hasContent)) {
       const timeline = await api('/agents/conversations/timeline', {
-        timeType: 'last_30d',
+        timeType,
         scope: 'agent',
         classificationView: 'current_effective',
         agentAssetId: interaction.agentAssetId,
@@ -96,7 +97,7 @@ if (!conversation) {
 }
 assert.ok(conversation?.conversationId, `conversation fixture not found: ${JSON.stringify(conversations)}`);
 const scopedTimeline = await api('/agents/conversations/timeline', {
-  timeType: 'last_30d',
+  timeType,
   scope: 'agent',
   classificationView: 'current_effective',
   agentAssetId: conversation.agentAssetId,
@@ -109,7 +110,7 @@ assert.ok(JSON.stringify(scopedTimeline).includes(marker),
 const scopedInteractionId = scopedTimeline.interactionIds.at(-1);
 assert.ok(scopedInteractionId, 'conversation timeline must retain its Interaction references');
 const scopedInteraction = await api('/agents/interactions', {
-  timeType: 'last_30d',
+  timeType,
   scope: 'agent',
   classificationView: 'current_effective',
   agentAssetId: conversation.agentAssetId,
@@ -119,7 +120,7 @@ const scopedInteraction = await api('/agents/interactions', {
 assert.equal(scopedInteraction.items[0]?.interactionId, scopedInteractionId,
   'interactionId must remain resolvable through a reconciled Agent asset alias');
 const semanticTimeline = await api('/agents/conversations/timeline-v2', {
-  timeType: 'last_30d',
+  timeType,
   scope: 'agent',
   classificationView: 'current_effective',
   agentAssetId: conversation.agentAssetId,
@@ -201,7 +202,7 @@ try {
   await command('Runtime.enable');
   await command('Network.enable');
   await viewport(1440, 1000);
-  const url = `${dashboardUrl}/conversations?timeType=last_30d&conversationId=${encodeURIComponent(conversation.conversationId)}`;
+  const url = `${dashboardUrl}/conversations?timeType=${encodeURIComponent(timeType)}&conversationId=${encodeURIComponent(conversation.conversationId)}`;
   await command('Page.navigate', { url });
   const bodyText = await waitFor('conversation timeline', () => evaluate('document.body?.innerText ?? ""'),
     (text) => text.includes('对话追踪')
@@ -211,7 +212,12 @@ try {
       && text.includes('工具')
       && text.includes(toolMarker), 60_000);
   assert(!bodyText.includes('management token required'));
-  assert.equal(await evaluate('document.querySelectorAll("[role=option]").length > 0'), true);
+  await waitFor(
+    'Agent directory options',
+    () => evaluate('document.querySelectorAll("[role=option]").length > 0'),
+    Boolean,
+    60_000,
+  );
   const panelSeparators = await evaluate(`[...document.querySelectorAll('[role="separator"]')]
     .map((node) => ({ label: node.getAttribute('aria-label'), display: getComputedStyle(node).display }))`);
   assert.equal(
@@ -238,10 +244,10 @@ try {
   await waitFor(
     'selectable semantic timeline event',
     () => evaluate(`(() => {
-      const buttons = [...document.querySelectorAll('button')];
-      return Boolean(buttons.find((node) => node.textContent?.includes('模型')
+      const buttons = [...document.querySelectorAll('button[data-semantic-kind]')];
+      return Boolean(buttons.find((node) => node.dataset.semanticKind === 'model_final'
         && node.textContent?.includes(${JSON.stringify(responseMarker)}))
-        ?? buttons.find((node) => node.textContent?.includes('用户')
+        ?? buttons.find((node) => node.dataset.semanticKind === 'user_message'
           && node.textContent?.includes(${JSON.stringify(marker)})));
     })()`),
     Boolean,
@@ -312,11 +318,11 @@ try {
   }
 
   await evaluate(`(() => {
-    const button = [...document.querySelectorAll('button')]
-      .find((node) => node.textContent?.includes('模型')
+    const button = [...document.querySelectorAll('button[data-semantic-kind]')]
+      .find((node) => node.dataset.semanticKind === 'model_final'
         && node.textContent?.includes(${JSON.stringify(responseMarker)}))
-      ?? [...document.querySelectorAll('button')]
-        .find((node) => node.textContent?.includes('用户')
+      ?? [...document.querySelectorAll('button[data-semantic-kind]')]
+        .find((node) => node.dataset.semanticKind === 'user_message'
           && node.textContent?.includes(${JSON.stringify(marker)}));
     button?.click();
   })()`);

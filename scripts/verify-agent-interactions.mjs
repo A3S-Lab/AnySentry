@@ -420,6 +420,16 @@ assert.equal(semanticTimelineV3.canonicalConversationId, conversation.conversati
 assert.equal(semanticTimelineV3.requestedConversationId, conversation.conversationId);
 assert.match(semanticTimelineV3.requestKey, /^[a-f0-9]{32}$/u);
 assert.deepEqual(semanticTimelineV3.contextReplaySummaries, []);
+const timelineBurst = await Promise.all(Array.from({ length: 20 }, () =>
+  requestWithoutManagementToken('/agents/conversations/timeline-v3', {
+    timeType: 'last_30d',
+    scope: 'agent',
+    classificationView: 'current_effective',
+    agentAssetId: item.agentAssetId,
+    conversationId: conversation.conversationId,
+  })));
+assert.equal(new Set(timelineBurst.map((entry) => entry.requestKey)).size, 1,
+  'identical concurrent Timeline reads must share one stable projection result');
 const semanticToolEvent = semanticTimelineV3.turns
   .flatMap((turn) => turn.events)
   .find((event) => event.kind === 'tool_call');

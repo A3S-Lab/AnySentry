@@ -257,6 +257,10 @@ export default function ConversationTrackingPage() {
     }),
   }), {
     ready: Boolean(selectedConversationId),
+    // Selection and URL state change immediately, while the client-key guard below removes the
+    // prior Thread body. Debounce only the expensive server projection so rapid keyboard/mouse
+    // switching produces one request for the final Thread instead of an unbounded request burst.
+    debounceWait: 120,
     refreshDeps: [
       conversationQuery,
       refreshVersion,
