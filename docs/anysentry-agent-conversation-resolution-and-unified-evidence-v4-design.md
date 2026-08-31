@@ -1,6 +1,6 @@
 # AnySentry 通用 Agent 会话归因、控制流折叠与统一证据链 V4 设计
 
-> 状态：Approved · Implementation in progress
+> 状态：Approved · Implemented · Production validated
 >
 > 日期：2026-08-31
 >
@@ -1489,3 +1489,71 @@ Conversation Membership
 8. 对话页面通过 Relation 读取并展示已有风险，不建立第二套评分；
 9. 不确定会话与内核关系显式显示 strong、ambiguous、semantic_only 或 coverage_gap；
 10. Codex、Claude Code、Pi 是首批验收样本，不是产品硬编码边界。
+
+---
+
+## 24. 实施与生产验收结果
+
+### 24.1 最终实现版本
+
+| 项目 | 分支 / Revision | 生产镜像 |
+|---|---|---|
+| AnySentry | `feat/agent-tls-interaction-observability` / `05597c5` | `127.0.0.1:5000/anysentry@sha256:e1607bf36b9d153233f36a5b742b11c4d60bdaf71ab3012fc58f711cc7e55d97` |
+| Observer | `feat/agent-tls-interaction-observability` / `7a65836` | `127.0.0.1:5000/anysentry-observer@sha256:ffe7e30141ff8d1f21f6610a876ee4040204004b6f5fea79d0b2c085ddba494a` |
+
+生产入口：`http://10.1.48.28:32653/conversations`。
+
+### 24.2 真实 Agent 验收
+
+| 样本 | 实际结果 | 结论 |
+|---|---|---|
+| Host Codex 跨进程恢复 | 同一 Session 经四个真实根进程恢复后仍为 `cv_d501eec5538991966e9be42e`；形成四个 Segment；窗口内每轮均为 User → Model progress → Tool call → Tool result → Model final | 通过 |
+| Codex 窄窗口 Anchor 恢复 | 新 Interaction 入库时 Membership 为 0；只查询新请求所在的六分钟窗口后，通过持久 continuity/message/tool Anchor 找回原 Canonical Thread，并写入 V2 Membership | 通过 |
+| Context Replay | 窗口外历史用户消息和工具结果只进入恢复摘要；不重复形成用户事件、工具结果或 Turn | 通过 |
+| Docker Pi 跨进程恢复 | 两个进程实例归入同一 Thread 的两个 Segment、两个 Turn；Bash 调用、结果和最终回复齐全 | 通过 |
+| Claude Code 中转模型调用 | `glm-5.3` 真实请求得到 User、Bash tool_use、Tool result、Model final；两个实测 Thread 均为 `coverage=complete`、`errorCount=0`、无 Timeline diagnostic | 通过 |
+| Claude Bash 内建命令 | Bash 内建 `printf` 没有独立 execve，关系保留为 `semantic_only` | 符合事实，不猜测 |
+| Claude 外部子进程 | `/usr/bin/printf` 产生内核 ToolExec；通过 PID→PPID 到已验证 Claude Runtime 的父链与精确命令匹配，形成 `linked_strong / confidence 0.99` | 通过 |
+| Codex / Pi 直接 Bash | TLS 工具语义与内核 ToolExec 精确命令、Runtime、时间窗一致，形成 `linked_exact / confidence 1.0` | 通过 |
+| Kimi、Dify、LangChain | 使用产品无关 Provider ID、累计消息、工具 ID、Logical Scope 和冲突屏障 fixture 验证，不包含域名或版本白名单 | 通过 |
+
+Claude Code 容器当前默认模型配置带有额外模型后缀时，上游返回 HTTP 429；验收使用一次性 CLI `--model glm-5.3` 覆盖后成功。该差异属于上游模型配置/额度，不进入采集、Resolver 或产品白名单，仓库没有保存中转 URL、Token 或 Key。
+
+### 24.3 会话目录与前端验收
+
+- V3 用户目录只读取 `userThreads`；`asset_only`、initialize、tools/list、Bootstrap 和能力协商不进入用户 Thread 列表或计数。
+- Logical Agent 与 Runtime Instance 默认进入各自 Overview；只有点击 Thread 才进入 Timeline。
+- Client Key、Canonical URL 替换和 120ms 最终选择防抖共同保证标题、URL、选中项和正文一致。
+- 相同投影请求使用 single-flight，不同投影并发限制为 4；生产 100 次快速 Thread 切换后 Pod `restartCount=0`，未复现 V8 heap OOM。
+- 三类视觉合同固定为用户、模型、工具；工具卡显示 Bash、Read、Write、Search、MCP、Skill 等具体名称。
+- Inspector 提供内容、内核证据、风险研判、原始四个 tab；风险读取已有 Kernel JudgedEvent，不重新评分。
+- 最终浏览器矩阵覆盖 1440、1024、390、375、键盘调栏、44px 移动命中区、`prefers-reduced-motion`、100 次 Thread 切换；页面横向溢出、运行时异常和网络失败均为 0。
+
+### 24.4 持久化与双向证据
+
+生产 PostgreSQL 已启用并写入：
+
+- `anysentry_agent_conversation_anchors_v1`；
+- `anysentry_agent_conversation_memberships_v2`；
+- `anysentry_agent_conversation_route_aliases_v1`；
+- `anysentry_agent_run_technical_activities_v1`；
+- `anysentry_agent_semantic_kernel_relations_v1`。
+
+Canonical Thread 自路由优先于历史控制流 Alias，旧深链接不会再被误导向 Technical Activity。Kernel Event 可反向查询 Conversation、Turn 和 stable Semantic Event；Conversation 工具事件可正向查看 Kernel Event、原有 Verdict、Tier、风险分数、Alert / Incident / Remediation 入口。
+
+### 24.5 自动化与运行门禁
+
+以下门禁在最终分支通过：
+
+- API / Web production build；
+- API / Web strict TypeScript；
+- Agent Interaction ingest/query 与无 Management Token 读取；
+- Resolver V2、持久 Anchor、Thread/Segment Binding、Directory；
+- Context Replay 窗口边界；
+- Semantic Tool ↔ Kernel Relation；
+- Repository privacy / hygiene；
+- production browser View；
+- AnySentry CI：`https://github.com/A3S-Lab/AnySentry/actions/runs/33404147137`；
+- Observer CI：`https://github.com/A3S-Lab/Observer/actions/runs/33374623192`。
+
+ClickHouse 在大历史窗口上仍可能返回 `scan_limit` 或受限查询回退；API 会明确报告 partial coverage，不将缺失证据伪装成完整链路。该状态不改变已持久化的 Thread、Membership、Alias 或 Semantic-Kernel Relation。
