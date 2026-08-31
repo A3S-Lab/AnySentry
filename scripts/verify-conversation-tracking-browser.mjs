@@ -235,6 +235,18 @@ try {
   }))()`);
   assert.equal(resized, true, 'keyboard resizing must update the left panel width');
   await assertNoOverflow('conversation 1440');
+  await waitFor(
+    'selectable semantic timeline event',
+    () => evaluate(`(() => {
+      const buttons = [...document.querySelectorAll('button')];
+      return Boolean(buttons.find((node) => node.textContent?.includes('模型')
+        && node.textContent?.includes(${JSON.stringify(responseMarker)}))
+        ?? buttons.find((node) => node.textContent?.includes('用户')
+          && node.textContent?.includes(${JSON.stringify(marker)})));
+    })()`),
+    Boolean,
+    60_000,
+  );
   await screenshot('conversation-tracking-1440.png');
 
   await evaluate(`(() => {
