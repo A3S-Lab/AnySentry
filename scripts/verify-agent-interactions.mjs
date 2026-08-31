@@ -389,7 +389,52 @@ assert.deepEqual(
     turn.events.map((event) => event.actor)))].sort(),
   ['model', 'tool', 'user'],
 );
-assert.equal(semanticTimeline.parserVersion, 1);
+assert.equal(semanticTimeline.parserVersion, 2);
+
+const directoryV3 = await requestWithoutManagementToken('/agents/conversation-directory-v3', {
+  timeType: 'last_30d',
+  scope: 'agent',
+  classificationView: 'current_effective',
+  lifecycleScope: 'all',
+});
+assert.equal(directoryV3.apiVersion, 3);
+assert.ok(Number.isSafeInteger(directoryV3.resolutionRevision));
+const v3Owner = directoryV3.items.find((entry) =>
+  entry.userThreads.some((thread) => thread.conversationId === conversation.conversationId));
+assert.ok(v3Owner, JSON.stringify(directoryV3));
+assert.equal(v3Owner.conversationCount, v3Owner.userThreads.length);
+
+const semanticTimelineV3 = await requestWithoutManagementToken('/agents/conversations/timeline-v3', {
+  timeType: 'last_30d',
+  scope: 'agent',
+  classificationView: 'current_effective',
+  agentAssetId: item.agentAssetId,
+  conversationId: conversation.conversationId,
+});
+assert.equal(semanticTimelineV3.apiVersion, 3);
+assert.equal(semanticTimelineV3.timelineVersion, 3);
+assert.equal(semanticTimelineV3.canonicalConversationId, conversation.conversationId);
+assert.equal(semanticTimelineV3.requestedConversationId, conversation.conversationId);
+assert.match(semanticTimelineV3.requestKey, /^[a-f0-9]{32}$/u);
+assert.deepEqual(semanticTimelineV3.contextReplaySummaries, []);
+const semanticToolEvent = semanticTimelineV3.turns
+  .flatMap((turn) => turn.events)
+  .find((event) => event.kind === 'tool_call');
+assert.ok(semanticToolEvent, JSON.stringify(semanticTimelineV3));
+const semanticEvidence = await requestWithoutManagementToken('/agents/semantic-events/evidence', {
+  timeType: 'last_30d',
+  scope: 'agent',
+  classificationView: 'current_effective',
+  conversationId: conversation.conversationId,
+  semanticEventId: semanticToolEvent.semanticEventId,
+});
+assert.equal(semanticEvidence.schemaVersion, 'anysentry.agent_semantic_evidence.v1');
+assert.equal(semanticEvidence.semanticEventId, semanticToolEvent.semanticEventId);
+assert.match(semanticEvidence.toolInvocationId, /^ti_[a-f0-9]{24}$/u);
+assert.ok(semanticEvidence.interactionEvidenceEventIds.length >= 1,
+  'the TLS Interaction must retain its source JudgedEvent identity');
+assert(['semantic_only', 'coverage_gap'].includes(semanticEvidence.relationStatus),
+  JSON.stringify(semanticEvidence));
 
 const modelOnly = await request('/agents/interactions', 'POST', {
   timeType: 'last_30d', scope: 'raw', interactionType: 'model', interactionId, limit: 10,

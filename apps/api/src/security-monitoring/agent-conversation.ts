@@ -5,6 +5,10 @@ import {
   humanVisibleUserContent,
   normalizedModelResponseText,
 } from './agent-semantic-timeline';
+import {
+  interactionHumanMessages,
+  trafficRoleForInteraction,
+} from './agent-conversation-resolution-v2';
 
 const PREVIEW_CHARACTERS = 320;
 const GENERIC_SESSION_IDS = new Set([
@@ -15,6 +19,7 @@ const GENERIC_SESSION_IDS = new Set([
 export interface AgentConversationProjection {
   summaries: T.AgentConversationSummary[];
   interactionsByConversation: Map<string, T.AgentInteractionRecord[]>;
+  sourceInteractionsByConversation: Map<string, T.AgentInteractionRecord[]>;
 }
 
 function stableId(prefix: string, value: string): string {
@@ -98,13 +103,13 @@ function explicitConversation(
   providerChains: Map<string, string>,
 ): {
   conversationId: string;
-  source: 'provider' | 'runtime';
+  source: 'provider' | 'runtime' | 'inferred';
 } | undefined {
   if (record.conversationId
     && (record.conversationIdSource !== 'inferred' || record.conversationBindingVersion)) {
     return {
       conversationId: record.conversationId,
-      source: record.conversationIdSource === 'runtime' ? 'runtime' : 'provider',
+      source: record.conversationIdSource ?? 'inferred',
     };
   }
   if (record.providerConversationId) {
@@ -318,20 +323,32 @@ function annotateTurns(
   let turn = 0;
   let previous: T.AgentInteractionRecord | undefined;
   return ordered.map((record) => {
+    const latestHuman = interactionHumanMessages(record).at(-1);
+    const stableTurnAnchor = latestHuman?.turnId ?? latestHuman?.sourceItemId;
     const continuesToolLoop = Boolean(
       previous
       && (record.toolResults.length > 0 || previous.toolCalls.length > 0),
     );
-    if (!previous || !continuesToolLoop) turn += 1;
-    const turnId = `${conversationId}:turn:${turn}`;
+    if (!previous || (!continuesToolLoop && !stableTurnAnchor)) turn += 1;
+    const turnId = stableTurnAnchor
+      ? stableId('trn', [
+          normalized(record.tenantId),
+          normalized(record.environmentId),
+          normalized(record.agentProduct),
+          normalized(record.workspacePath),
+          normalized(record.process?.hostId),
+          stableTurnAnchor,
+        ].join('\u0000'))
+      : previous && continuesToolLoop && previous.turnId
+        ? previous.turnId
+        : `${conversationId}:turn:${turn}`;
     const modelCallId = stableId(
       'mc',
-      `${conversationId}\u0000${turnId}\u0000${record.request.sha256}`,
+      `${turnId}\u0000${record.request.sha256}`,
     );
     const attempt = (attempts.get(modelCallId) ?? 0) + 1;
     attempts.set(modelCallId, attempt);
-    previous = record;
-    return {
+    const annotated: T.AgentInteractionRecord = {
       ...record,
       conversationId,
       turnId,
@@ -339,6 +356,8 @@ function annotateTurns(
       attemptId: `${modelCallId}:attempt:${attempt}`,
       correlationQuality: record.correlationQuality ?? 'inferred',
     };
+    previous = annotated;
+    return annotated;
   });
 }
 
@@ -629,7 +648,9 @@ export function projectAgentConversations(
     evidence.push(record);
     evidenceByAsset.set(record.agentAssetId, evidence);
     return false;
-  });
+  }).filter((record) => ['conversation', 'context_replay'].includes(
+    trafficRoleForInteraction(record),
+  ));
   const grouped = new Map<string, {
     source: 'provider' | 'runtime' | 'inferred';
     records: T.AgentInteractionRecord[];
@@ -698,9 +719,14 @@ export function projectAgentConversations(
   }
 
   const interactionsByConversation = new Map<string, T.AgentInteractionRecord[]>();
+  const sourceInteractionsByConversation = new Map<string, T.AgentInteractionRecord[]>();
   const summaries: T.AgentConversationSummary[] = [];
   const assetsWithContent = new Set<string>();
   for (const [conversationId, group] of grouped) {
+    sourceInteractionsByConversation.set(
+      conversationId,
+      annotateTurns(conversationId, group.records),
+    );
     const projected = annotateTurns(
       conversationId,
       deduplicateToolEvidence(group.records),
@@ -731,7 +757,7 @@ export function projectAgentConversations(
         : leftAt > rightAt ? -1 : 1;
     });
 
-  return { summaries: visible, interactionsByConversation };
+  return { summaries: visible, interactionsByConversation, sourceInteractionsByConversation };
 }
 
 function eventId(kind: T.AgentConversationEventKind, interactionId: string, suffix = ''): string {

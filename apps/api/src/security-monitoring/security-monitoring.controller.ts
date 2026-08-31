@@ -4665,6 +4665,105 @@ export class SecurityMonitoringController {
     return result;
   }
 
+  @Post('agents/conversations/timeline-v3')
+  @HttpCode(200)
+  async agentConversationTimelineV3(
+    @Body() f: T.AgentConversationQuery,
+    @Headers() headers: HeaderBag,
+  ): Promise<T.AgentConversationTimelineV3> {
+    const conversationId = strictIdentityText(f?.conversationId, 512);
+    if (!conversationId) {
+      throw new BadRequestException('a valid conversationId is required');
+    }
+    const agentAssetId = f?.agentAssetId === undefined
+      ? undefined
+      : strictIdentityText(f.agentAssetId, 512);
+    if (f?.agentAssetId !== undefined && !agentAssetId) {
+      throw new BadRequestException('agentAssetId is invalid');
+    }
+    const result = await this.agg.agentConversationTimelineV3({
+      ...f,
+      conversationId,
+      agentAssetId,
+    });
+    this.audit.record({
+      actor: auditActor(headers),
+      action: 'agent.conversation.content.read',
+      resourceType: 'agent',
+      resourceId: result.canonicalConversationId ?? conversationId,
+      summary: `Read Agent canonical conversation timeline with ${result.turns.length} turn(s)`,
+      details: {
+        agentAssetId,
+        requestedConversationId: conversationId,
+        canonicalConversationId: result.canonicalConversationId,
+        resolutionRevision: result.resolutionRevision,
+        turnCount: result.turns.length,
+        interactionCount: result.interactionIds.length,
+        replaySummaryCount: result.contextReplaySummaries.length,
+        classificationView: f?.classificationView,
+      },
+    });
+    return result;
+  }
+
+  @Post('agents/semantic-events/evidence')
+  @HttpCode(200)
+  async agentSemanticEvidence(
+    @Body() f: T.AgentSemanticEvidenceQuery,
+    @Headers() headers: HeaderBag,
+  ): Promise<T.AgentSemanticEvidenceResponse> {
+    const conversationId = strictIdentityText(f?.conversationId, 512);
+    const semanticEventId = strictIdentityText(f?.semanticEventId, 512);
+    if (!conversationId || !semanticEventId) {
+      throw new BadRequestException('valid conversationId and semanticEventId are required');
+    }
+    const result = await this.agg.agentSemanticEvidence({
+      ...f,
+      conversationId,
+      semanticEventId,
+    });
+    if (!result) throw new NotFoundException('semantic tool event was not found');
+    this.audit.record({
+      actor: auditActor(headers),
+      action: 'agent.semantic_evidence.read',
+      resourceType: 'event',
+      resourceId: semanticEventId,
+      summary: `Read semantic tool evidence with ${result.relations.length} relation(s)`,
+      details: {
+        conversationId: result.conversationId,
+        semanticEventId,
+        toolInvocationId: result.toolInvocationId,
+        relationStatus: result.relationStatus,
+        kernelEventCount: result.kernelEvents.length,
+      },
+    });
+    return result;
+  }
+
+  @Post('agents/kernel-events/semantic-context')
+  @HttpCode(200)
+  async agentKernelSemanticContext(
+    @Body() body: { eventId?: string },
+    @Headers() headers: HeaderBag,
+  ): Promise<T.AgentKernelSemanticContextResponse> {
+    const eventId = strictIdentityText(body?.eventId, 512);
+    if (!eventId) throw new BadRequestException('a valid eventId is required');
+    const result = await this.agg.agentKernelSemanticContext(eventId);
+    this.audit.record({
+      actor: auditActor(headers),
+      action: 'agent.semantic_evidence.read',
+      resourceType: 'event',
+      resourceId: eventId,
+      summary: `Read Kernel event semantic context with ${result.relations.length} relation(s)`,
+      details: {
+        eventId,
+        relationCount: result.relations.length,
+        conversationCount: result.conversationLinks.length,
+      },
+    });
+    return result;
+  }
+
   @Post('agents/conversation-directory')
   @HttpCode(200)
   async agentConversationDirectory(
@@ -4724,6 +4823,35 @@ export class SecurityMonitoringController {
       ...legacy,
       apiVersion: 2,
       items: enrichAgentConversationDirectoryV2(legacy.items, runtime.items),
+    };
+  }
+
+  @Post('agents/conversation-directory-v3')
+  @HttpCode(200)
+  async agentConversationDirectoryV3(
+    @Body() f: T.AgentConversationDirectoryQuery,
+    @Headers() headers: HeaderBag,
+  ): Promise<T.AgentConversationDirectoryListV3> {
+    const legacy = await this.agentConversationDirectoryV2(f, headers);
+    const technical = this.agg.agentRunTechnicalActivities();
+    return {
+      ...legacy,
+      apiVersion: 3,
+      resolutionRevision: this.agg.agentConversationResolutionRevision(),
+      items: legacy.items.map((item) => {
+        const instanceIds = new Set(item.agentInstanceIds);
+        const technicalActivities = technical.filter((activity) =>
+          activity.agentInstanceId && instanceIds.has(activity.agentInstanceId));
+        return {
+          ...item,
+          userThreads: item.conversations,
+          technicalActivities,
+          technicalActivityCount: technicalActivities.reduce(
+            (sum, activity) => sum + activity.interactionIds.length,
+            0,
+          ),
+        };
+      }),
     };
   }
 
@@ -8214,7 +8342,15 @@ export class SecurityMonitoringController {
       }
 
       try {
-        if (context.interaction) await this.agg.storeAgentInteraction(context.interaction);
+        if (context.interaction) {
+          await this.agg.storeAgentInteraction({
+            ...context.interaction,
+            evidenceEventIds: [...new Set([
+              ...(context.interaction.evidenceEventIds ?? []),
+              prepared.event.eventId,
+            ])],
+          });
+        }
         await this.observeSupplyChainInstall(prepared.event, context.line);
         this.observeWorkspaceAssociation(prepared.event);
         this.identityReview.considerCandidate(prepared.event, () => this.agg.invalidateWindowCache());
@@ -8520,7 +8656,12 @@ export class SecurityMonitoringController {
       this.materializeCommittedObservedAsset(rec, collectorEventAt);
     }
     const interaction = parseObserverAgentInteraction(line, meta);
-    if (interaction) await this.agg.storeAgentInteraction(interaction);
+    if (interaction) {
+      await this.agg.storeAgentInteraction({
+        ...interaction,
+        evidenceEventIds: [...new Set([...(interaction.evidenceEventIds ?? []), rec.eventId])],
+      });
+    }
     await this.enqueueCanonicalShadow(rec, line);
     await this.observeSupplyChainInstall(rec, line);
     this.observeWorkspaceAssociation(rec);

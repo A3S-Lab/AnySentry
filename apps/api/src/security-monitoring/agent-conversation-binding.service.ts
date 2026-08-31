@@ -4,9 +4,18 @@ import { createHash } from 'node:crypto';
 import type * as T from './types';
 import type { AgentConversationProjection } from './agent-conversation';
 import { humanVisibleUserContent } from './agent-semantic-timeline';
+import {
+  AGENT_CONVERSATION_RESOLVER_V2,
+  type ConversationMembershipV2,
+  type ConversationResolutionV2,
+  type ConversationRouteAliasV1,
+  type TechnicalActivityProjection,
+  conversationLogicalScopeKeyV2,
+  resolveAgentConversationsV2,
+} from './agent-conversation-resolution-v2';
 import { RelationalBusinessStore } from './relational-business-store.service';
 
-export const AGENT_CONVERSATION_RESOLVER_VERSION = 1;
+export const AGENT_CONVERSATION_RESOLVER_VERSION = AGENT_CONVERSATION_RESOLVER_V2;
 
 function normalized(value?: string): string {
   return value?.trim().toLowerCase().replace(/\s+/gu, ' ') ?? '';
@@ -70,6 +79,11 @@ export class AgentConversationBindingService {
   private readonly bindings = new Map<string, T.AgentConversationBindingRecord>();
   private readonly threads = new Map<string, T.AgentConversationThreadRecord>();
   private readonly segments = new Map<string, T.ConversationInstanceSegment>();
+  private readonly routeAliases = new Map<string, ConversationRouteAliasV1>();
+  private readonly technicalActivities = new Map<string, TechnicalActivityProjection>();
+  private readonly membershipsV2 = new Map<string, ConversationMembershipV2>();
+  private pendingResolution?: ConversationResolutionV2;
+  private resolutionRevision = 0;
 
   constructor(
     @Optional() private readonly relationalStore?: RelationalBusinessStore,
@@ -81,6 +95,11 @@ export class AgentConversationBindingService {
     if (interactions.length === 0) return [];
     const interactionIds = interactions.map((record) => record.interactionId);
     if (this.relationalStore?.configured()) {
+      const loadedMemberships = await this.relationalStore
+        .loadAgentConversationMembershipsV2?.(interactionIds) ?? [];
+      for (const membership of loadedMemberships) {
+        this.membershipsV2.set(membership.interactionId, membership);
+      }
       const loadedBindings = await this.relationalStore.loadAgentConversationBindings(interactionIds);
       for (const binding of loadedBindings) {
         this.bindings.set(binding.interactionId, binding);
@@ -91,19 +110,38 @@ export class AgentConversationBindingService {
       for (const segment of await this.relationalStore.loadAgentConversationSegments(
         loadedBindings.map((binding) => binding.conversationId),
       )) this.segments.set(segment.segmentId, segment);
+      const aliasIds = [...new Set([
+        ...loadedBindings.map((binding) => binding.conversationId),
+        ...loadedMemberships
+          .map((membership) => membership.canonicalConversationId)
+          .filter((value): value is string => Boolean(value)),
+      ])];
+      for (const alias of await this.relationalStore
+        .loadAgentConversationRouteAliases?.(aliasIds) ?? []) {
+        this.routeAliases.set(alias.aliasConversationId, alias);
+      }
     }
 
     const projected = interactions.map((record) => {
       const binding = this.bindings.get(record.interactionId);
-      return binding
-        ? {
-            ...record,
-            conversationId: binding.conversationId,
-            conversationIdSource: 'inferred' as const,
-            conversationBindingVersion: binding.resolverVersion,
-            correlationQuality: binding.correlationQuality,
-          }
-        : { ...record };
+      const membership = this.membershipsV2.get(record.interactionId);
+      const boundConversationId = membership?.canonicalConversationId
+        ?? binding?.conversationId;
+      const canonicalConversationId = boundConversationId
+        ? this.canonicalConversationId(boundConversationId)
+        : undefined;
+      return {
+        ...record,
+        ...(canonicalConversationId ? { conversationId: canonicalConversationId } : {}),
+        ...(canonicalConversationId ? { conversationIdSource: 'inferred' as const } : {}),
+        ...(membership?.role ? { trafficRole: membership.role } : {}),
+        ...(membership || binding
+          ? {
+              conversationBindingVersion: membership?.resolverVersion ?? binding!.resolverVersion,
+              correlationQuality: membership?.confidence ?? binding!.correlationQuality,
+            }
+          : {}),
+      };
     });
     const unbound = projected.filter((record) => !record.conversationId);
     const scopeKeys = [...new Set(unbound.map(conversationLogicalScopeKey))];
@@ -169,7 +207,17 @@ export class AgentConversationBindingService {
       record.conversationBindingVersion = AGENT_CONVERSATION_RESOLVER_VERSION;
       record.correlationQuality = best.evidence.includes('tool_call_id') ? 'exact' : 'strong';
     }
-    return projected;
+    const resolution = resolveAgentConversationsV2(projected);
+    this.pendingResolution = resolution;
+    this.resolutionRevision = Math.max(this.resolutionRevision, resolution.resolutionRevision);
+    for (const alias of resolution.aliases) this.routeAliases.set(alias.aliasConversationId, alias);
+    for (const activity of resolution.technicalActivities) {
+      this.technicalActivities.set(activity.technicalActivityId, activity);
+    }
+    for (const membership of resolution.memberships) {
+      this.membershipsV2.set(membership.interactionId, membership);
+    }
+    return resolution.records;
   }
 
   async persistProjection(projection: AgentConversationProjection): Promise<void> {
@@ -298,13 +346,85 @@ export class AgentConversationBindingService {
     for (const binding of bindings) this.bindings.set(binding.interactionId, binding);
     if (this.relationalStore?.configured()) {
       await this.relationalStore.saveAgentConversationResolution(threads, segments, bindings);
+      const pending = this.pendingResolution;
+      if (pending) {
+        const bindingByInteraction = new Map(bindings.map((binding) => [
+          binding.interactionId,
+          binding,
+        ]));
+        const memberships = pending.memberships.map((membership) => {
+          const binding = bindingByInteraction.get(membership.interactionId);
+          return binding && membership.canonicalConversationId
+            ? {
+                ...membership,
+                canonicalConversationId: binding.conversationId,
+                segmentId: binding.segmentId,
+              }
+            : membership;
+        });
+        const anchors = pending.records.flatMap((record) =>
+          (record.conversationAnchors ?? []).map((anchor) => ({
+            interactionId: record.interactionId,
+            logicalScopeKey: conversationLogicalScopeKeyV2(record),
+            observedAt: record.receivedAt,
+            anchor,
+          })));
+        await this.relationalStore.saveAgentConversationResolutionV2?.(
+          anchors,
+          memberships,
+          pending.aliases,
+          pending.technicalActivities,
+        );
+      }
     }
   }
 
   segmentsForConversation(conversationId: string): T.ConversationInstanceSegment[] {
+    const canonical = this.canonicalConversationId(conversationId);
     return [...this.segments.values()]
-      .filter((segment) => segment.conversationId === conversationId)
+      .filter((segment) => segment.conversationId === canonical)
       .sort((left, right) => left.ordinal - right.ordinal)
       .map((segment) => ({ ...segment }));
+  }
+
+  routeAlias(conversationId: string): ConversationRouteAliasV1 | undefined {
+    const alias = this.routeAliases.get(conversationId);
+    return alias ? { ...alias, evidence: [...alias.evidence] } : undefined;
+  }
+
+  async resolveRouteAlias(conversationId: string): Promise<ConversationRouteAliasV1 | undefined> {
+    const remembered = this.routeAlias(conversationId);
+    if (remembered || !this.relationalStore?.configured()) return remembered;
+    const loaded = await this.relationalStore.loadAgentConversationRouteAliases?.([conversationId]) ?? [];
+    for (const alias of loaded) this.routeAliases.set(alias.aliasConversationId, alias);
+    return this.routeAlias(conversationId);
+  }
+
+  canonicalConversationId(conversationId: string): string {
+    let current = conversationId;
+    const seen = new Set<string>();
+    while (!seen.has(current)) {
+      seen.add(current);
+      const alias = this.routeAliases.get(current);
+      if (!alias || alias.targetType !== 'conversation' || !alias.canonicalConversationId) break;
+      current = alias.canonicalConversationId;
+    }
+    return current;
+  }
+
+  listTechnicalActivities(agentInstanceId?: string): TechnicalActivityProjection[] {
+    return [...this.technicalActivities.values()]
+      .filter((activity) => !agentInstanceId || activity.agentInstanceId === agentInstanceId)
+      .sort((left, right) => BigInt(left.startedAtUnixNs) < BigInt(right.startedAtUnixNs) ? -1 : 1)
+      .map((activity) => ({
+        ...activity,
+        interactionIds: [...activity.interactionIds],
+        methods: [...activity.methods],
+        paths: [...activity.paths],
+      }));
+  }
+
+  currentResolutionRevision(): number {
+    return this.resolutionRevision;
   }
 }

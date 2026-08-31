@@ -8,6 +8,7 @@ const MAX_DERIVED_JSON_BYTES = 512 * 1024;
 const MAX_TOOL_ITEMS = 2_048;
 const MAX_MESSAGES = 4_096;
 const MAX_SEMANTIC_ITEMS = 4_096;
+const MAX_CONVERSATION_ANCHORS = 512;
 const COMPLETENESS = new Set<T.AgentInteractionCompleteness>([
   'complete', 'partial', 'truncated', 'redacted', 'reference_only', 'unavailable', 'unsupported',
 ]);
@@ -38,6 +39,19 @@ const SEMANTIC_ORIGINS = new Set<T.AgentInteractionSemanticItem['origin']>([
 ]);
 const SEMANTIC_COMPLETENESS = new Set<T.AgentInteractionSemanticItem['completeness']>([
   'complete', 'partial', 'missing',
+]);
+const MESSAGE_ORIGINS = new Set<NonNullable<T.AgentInteractionMessage['messageOrigin']>>([
+  'human_input', 'agent_context', 'developer_instruction', 'assistant_history', 'tool_history',
+]);
+const TRAFFIC_ROLES = new Set<NonNullable<T.AgentInteractionRecord['trafficRole']>>([
+  'conversation', 'bootstrap', 'control', 'context_replay', 'background', 'unclassified',
+]);
+const ANCHOR_KINDS = new Set<T.AgentConversationAnchorKind>([
+  'provider_conversation', 'response_id', 'previous_response_id', 'continuity_key',
+  'message_item_id', 'turn_id', 'tool_call_id',
+]);
+const ANCHOR_STRENGTHS = new Set<T.AgentConversationAnchor['strength']>([
+  'exact', 'strong', 'supporting',
 ]);
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -138,6 +152,19 @@ function content(value: unknown): T.AgentInteractionContent | undefined {
           content: messageContent,
           ...(string(message.name, 240) ? { name: string(message.name, 240) } : {}),
           ...(string(message.toolCallId, 512) ? { toolCallId: string(message.toolCallId, 512) } : {}),
+          ...(string(message.sourceItemId, 512) ? { sourceItemId: string(message.sourceItemId, 512) } : {}),
+          ...(string(message.turnId, 512) ? { turnId: string(message.turnId, 512) } : {}),
+          ...(Array.isArray(message.contentItemKinds)
+            ? {
+                contentItemKinds: [...new Set(message.contentItemKinds
+                  .map((kind) => string(kind, 160))
+                  .filter((kind): kind is string => Boolean(kind)))]
+                  .slice(0, 32),
+              }
+            : {}),
+          ...(closedValue(message.messageOrigin, MESSAGE_ORIGINS)
+            ? { messageOrigin: closedValue(message.messageOrigin, MESSAGE_ORIGINS) }
+            : {}),
         };
       }).filter((item): item is T.AgentInteractionMessage => Boolean(item))
     : undefined;
@@ -230,6 +257,18 @@ function semanticItems(value: unknown): T.AgentInteractionSemanticItem[] {
         ...(string(input.toolCallId, 512) ? { toolCallId: string(input.toolCallId, 512) } : {}),
         ...(string(input.toolName, 240) ? { toolName: string(input.toolName, 240) } : {}),
         ...(string(input.sourceItemId, 512) ? { sourceItemId: string(input.sourceItemId, 512) } : {}),
+        ...(string(input.turnId, 512) ? { turnId: string(input.turnId, 512) } : {}),
+        ...(Array.isArray(input.contentItemKinds)
+          ? {
+              contentItemKinds: [...new Set(input.contentItemKinds
+                .map((item) => string(item, 160))
+                .filter((item): item is string => Boolean(item)))]
+                .slice(0, 32),
+            }
+          : {}),
+        ...(closedValue(input.messageOrigin, MESSAGE_ORIGINS)
+          ? { messageOrigin: closedValue(input.messageOrigin, MESSAGE_ORIGINS) }
+          : {}),
         ...(outputIndex !== undefined ? { outputIndex } : {}),
         ...(contentIndex !== undefined ? { contentIndex } : {}),
         ...(sequenceNumber !== undefined ? { sequenceNumber } : {}),
@@ -238,6 +277,27 @@ function semanticItems(value: unknown): T.AgentInteractionSemanticItem[] {
       };
     })
     .filter((item): item is T.AgentInteractionSemanticItem => Boolean(item));
+}
+
+function conversationAnchors(value: unknown): T.AgentConversationAnchor[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  return value.slice(0, MAX_CONVERSATION_ANCHORS)
+    .map((item): T.AgentConversationAnchor | undefined => {
+      const input = record(item);
+      const kind = closedValue(input?.kind, ANCHOR_KINDS);
+      const namespace = string(input?.namespace, 160);
+      const valueHash = string(input?.valueHash, 64);
+      const strength = closedValue(input?.strength, ANCHOR_STRENGTHS);
+      const sourcePath = string(input?.sourcePath, 240);
+      if (!kind || !namespace || !valueHash || !/^[a-f0-9]{64}$/u.test(valueHash)
+        || !strength || !sourcePath) return undefined;
+      const key = `${kind}\u0000${namespace}\u0000${valueHash}`;
+      if (seen.has(key)) return undefined;
+      seen.add(key);
+      return { kind, namespace, valueHash, strength, sourcePath };
+    })
+    .filter((item): item is T.AgentConversationAnchor => Boolean(item));
 }
 
 function unixNsToMs(value: string): number {
@@ -429,6 +489,8 @@ export function parseObserverAgentInteraction(
   const providerConversationId = string(input.providerConversationId, 512);
   const providerResponseId = string(input.providerResponseId, 512);
   const providerPreviousResponseId = string(input.providerPreviousResponseId, 512);
+  const trafficRole = closedValue(input.trafficRole, TRAFFIC_ROLES);
+  const anchors = conversationAnchors(input.conversationAnchors);
   const tlsAdapterId = string(input.tlsAdapterId, 160);
   const transportProtocol = string(input.transportProtocol, 80);
   const wireTemplateId = string(input.wireTemplateId, 160);
@@ -468,6 +530,8 @@ export function parseObserverAgentInteraction(
     ...(providerConversationId ? { providerConversationId } : {}),
     ...(providerResponseId ? { providerResponseId } : {}),
     ...(providerPreviousResponseId ? { providerPreviousResponseId } : {}),
+    ...(trafficRole ? { trafficRole } : {}),
+    ...(anchors.length ? { conversationAnchors: anchors } : {}),
     ...(conversationId ? { conversationId } : {}),
     ...(conversationIdSource ? { conversationIdSource } : {}),
     runtimeRole,

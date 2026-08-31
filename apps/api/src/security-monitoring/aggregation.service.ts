@@ -65,7 +65,13 @@ import {
   projectConversationTimeline,
 } from './agent-conversation';
 import { AgentConversationBindingService } from './agent-conversation-binding.service';
+import { RelationalBusinessStore } from './relational-business-store.service';
 import {
+  buildSemanticKernelRelations,
+  toolInvocationId,
+} from './agent-semantic-kernel-relation';
+import {
+  projectContextReplaySummaries,
   projectSemanticConversationTimeline,
   SEMANTIC_PROJECTION_PARSER_ID,
   SEMANTIC_PROJECTION_PARSER_VERSION,
@@ -713,6 +719,7 @@ export class AggregationService {
     private readonly sources: IngestionSourceService,
     @Optional() private readonly assetReviews?: ObservedAssetReviewService,
     @Optional() private readonly conversationBindings?: AgentConversationBindingService,
+    @Optional() private readonly relationalStore?: RelationalBusinessStore,
   ) {}
 
   // The dashboard polls 9 endpoints with the same filter near-simultaneously; cache the windowed
@@ -1982,12 +1989,22 @@ export class AggregationService {
     projection: ReturnType<typeof projectAgentConversations>;
     interactions: T.AgentInteractionList;
     inventory: T.AgentInventory;
+    routeAlias?: ReturnType<AgentConversationBindingService['routeAlias']>;
+    requestedConversationId?: string;
+    canonicalConversationId?: string;
   }> {
     // An inferred conversation ID is anchored in the globally ordered projection. Applying an
     // asset, instance, or model prefilter can change the first record in that projection and thus
     // produce a different ID. Once a conversationId is present, keep those values as post-
     // projection consistency filters instead of changing the record set used to resolve the ID.
-    const resolveConversationId = Boolean(filter.conversationId);
+    const requestedConversationId = filter.conversationId?.trim();
+    const persistedAlias = requestedConversationId
+      ? await this.conversationBindings?.resolveRouteAlias(requestedConversationId)
+      : undefined;
+    const initialConversationId = persistedAlias?.targetType === 'conversation'
+      ? persistedAlias.canonicalConversationId
+      : requestedConversationId;
+    const resolveConversationId = Boolean(initialConversationId);
     const interactionQuery: T.AgentInteractionQuery = {
       timeType: filter.timeType,
       startTime: filter.startTime,
@@ -2045,12 +2062,24 @@ export class AggregationService {
     const boundInteractions = this.conversationBindings
       ? await this.conversationBindings.applyPersistedBindings(interactions.items)
       : interactions.items;
-    const projection = projectAgentConversations(boundInteractions, inventory.items, filter);
+    const routeAlias = requestedConversationId
+      ? this.conversationBindings?.routeAlias(requestedConversationId) ?? persistedAlias
+      : undefined;
+    const canonicalConversationId = routeAlias?.targetType === 'conversation'
+      ? routeAlias.canonicalConversationId
+      : initialConversationId;
+    const projection = projectAgentConversations(boundInteractions, inventory.items, {
+      ...filter,
+      ...(canonicalConversationId ? { conversationId: canonicalConversationId } : {}),
+    });
     if (this.conversationBindings) await this.conversationBindings.persistProjection(projection);
     return {
       projection,
       interactions,
       inventory,
+      routeAlias,
+      requestedConversationId,
+      canonicalConversationId,
     };
   }
 
@@ -2080,11 +2109,17 @@ export class AggregationService {
   async agentConversationTimeline(
     filter: T.AgentConversationQuery,
   ): Promise<T.AgentConversationTimeline> {
-    const { projection, interactions, inventory } = await this.agentConversationProjection(filter);
+    const {
+      projection,
+      interactions,
+      inventory,
+      canonicalConversationId,
+    } = await this.agentConversationProjection(filter);
+    const resolvedConversationId = canonicalConversationId ?? filter.conversationId;
     const conversation = projection.summaries.find((item) =>
-      item.conversationId === filter.conversationId);
-    const records = filter.conversationId
-      ? projection.interactionsByConversation.get(filter.conversationId) ?? []
+      item.conversationId === resolvedConversationId);
+    const records = resolvedConversationId
+      ? projection.interactionsByConversation.get(resolvedConversationId) ?? []
       : [];
     const items = conversation?.hasContent
       ? projectConversationTimeline(conversation, records)
@@ -2110,14 +2145,20 @@ export class AggregationService {
   async agentConversationTimelineV2(
     filter: T.AgentConversationQuery,
   ): Promise<T.AgentConversationTimelineV2> {
-    const { projection, interactions, inventory } = await this.agentConversationProjection(filter);
+    const {
+      projection,
+      interactions,
+      inventory,
+      canonicalConversationId,
+    } = await this.agentConversationProjection(filter);
+    const resolvedConversationId = canonicalConversationId ?? filter.conversationId;
     const thread = projection.summaries.find((item) =>
-      item.conversationId === filter.conversationId);
-    const records = filter.conversationId
-      ? projection.interactionsByConversation.get(filter.conversationId) ?? []
+      item.conversationId === resolvedConversationId);
+    const records = resolvedConversationId
+      ? projection.interactionsByConversation.get(resolvedConversationId) ?? []
       : [];
-    const segments = filter.conversationId && this.conversationBindings
-      ? this.conversationBindings.segmentsForConversation(filter.conversationId)
+    const segments = resolvedConversationId && this.conversationBindings
+      ? this.conversationBindings.segmentsForConversation(resolvedConversationId)
       : [];
     const turns = thread?.hasContent
       ? projectSemanticConversationTimeline(thread, records, segments)
@@ -2138,6 +2179,226 @@ export class AggregationService {
       },
       dataSource: interactions.dataSource,
       ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  async agentConversationTimelineV3(
+    filter: T.AgentConversationQuery,
+  ): Promise<T.AgentConversationTimelineV3> {
+    const {
+      projection,
+      interactions,
+      inventory,
+      routeAlias,
+      requestedConversationId,
+      canonicalConversationId,
+    } = await this.agentConversationProjection(filter);
+    const resolvedConversationId = canonicalConversationId ?? filter.conversationId;
+    const thread = projection.summaries.find((item) =>
+      item.conversationId === resolvedConversationId);
+    const records = resolvedConversationId
+      ? projection.interactionsByConversation.get(resolvedConversationId) ?? []
+      : [];
+    const segments = resolvedConversationId && this.conversationBindings
+      ? this.conversationBindings.segmentsForConversation(resolvedConversationId)
+      : [];
+    const turns = thread?.hasContent
+      ? projectSemanticConversationTimeline(thread, records, segments)
+      : [];
+    const instanceIds = new Set(segments.map((segment) => segment.agentInstanceId));
+    const technicalActivitySummaries = this.conversationBindings
+      ? this.conversationBindings.listTechnicalActivities()
+        .filter((activity) => activity.agentInstanceId && instanceIds.has(activity.agentInstanceId))
+      : [];
+    const resolutionRevision = this.conversationBindings?.currentResolutionRevision() ?? 0;
+    const requestKey = createHash('sha256').update([
+      resolvedConversationId ?? requestedConversationId ?? '',
+      filter.timeType ?? '',
+      filter.startTime ?? '',
+      filter.endTime ?? '',
+      filter.snapshotAsOf ?? '',
+      String(resolutionRevision),
+    ].join('\u0000')).digest('hex').slice(0, 32);
+    const partial = interactions.coverage.partial || inventory.coverage.partial;
+    return {
+      apiVersion: 3,
+      requestKey,
+      requestedConversationId: requestedConversationId ?? filter.conversationId ?? '',
+      ...(resolvedConversationId ? { canonicalConversationId: resolvedConversationId } : {}),
+      ...(requestedConversationId && resolvedConversationId
+        && requestedConversationId !== resolvedConversationId
+        ? { aliasFrom: requestedConversationId }
+        : {}),
+      resolutionRevision,
+      timelineVersion: 3,
+      thread,
+      segments,
+      turns,
+      interactionIds: records.map((item) => item.interactionId),
+      parserId: SEMANTIC_PROJECTION_PARSER_ID,
+      parserVersion: SEMANTIC_PROJECTION_PARSER_VERSION,
+      contextReplaySummaries: projectContextReplaySummaries(
+        resolvedConversationId
+          ? projection.sourceInteractionsByConversation.get(resolvedConversationId) ?? records
+          : records,
+        segments,
+      ),
+      technicalActivitySummaries,
+      ...(routeAlias?.targetType === 'technical_activity'
+        ? {
+            redirectTarget: {
+              type: 'technical_activity' as const,
+              id: routeAlias.technicalActivityId ?? routeAlias.targetId,
+            },
+          }
+        : routeAlias?.targetType === 'conversation'
+          ? {
+              redirectTarget: {
+                type: 'conversation' as const,
+                id: routeAlias.canonicalConversationId ?? routeAlias.targetId,
+              },
+            }
+          : {}),
+      coverage: {
+        ...interactions.coverage,
+        partial,
+        partialReason: interactions.coverage.partialReason
+          ?? inventory.coverage.partialReason,
+      },
+      dataSource: interactions.dataSource,
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  agentConversationResolutionRevision(): number {
+    return this.conversationBindings?.currentResolutionRevision() ?? 0;
+  }
+
+  agentRunTechnicalActivities(agentInstanceId?: string): T.AgentRunTechnicalActivitySummary[] {
+    return this.conversationBindings?.listTechnicalActivities(agentInstanceId) ?? [];
+  }
+
+  async agentSemanticEvidence(
+    query: T.AgentSemanticEvidenceQuery,
+  ): Promise<T.AgentSemanticEvidenceResponse | undefined> {
+    const {
+      projection,
+      interactions,
+      inventory,
+      canonicalConversationId,
+    } = await this.agentConversationProjection(query);
+    const conversationId = canonicalConversationId ?? query.conversationId;
+    const thread = projection.summaries.find((item) => item.conversationId === conversationId);
+    const records = projection.interactionsByConversation.get(conversationId) ?? [];
+    const segments = this.conversationBindings?.segmentsForConversation(conversationId) ?? [];
+    if (!thread?.hasContent || records.length === 0) return undefined;
+    const turns = projectSemanticConversationTimeline(thread, records, segments);
+    const events = turns.flatMap((turn) => turn.events);
+    const selected = events.find((event) => event.semanticEventId === query.semanticEventId);
+    if (!selected || selected.actor !== 'tool') return undefined;
+    const call = selected.kind === 'tool_result' && selected.toolCallId
+      ? events.find((event) => event.kind === 'tool_call'
+          && event.toolCallId === selected.toolCallId)
+      : selected;
+    if (!call || call.kind !== 'tool_call') return undefined;
+    const result = call.toolCallId
+      ? events.find((event) => event.kind === 'tool_result'
+          && event.toolCallId === call.toolCallId)
+      : undefined;
+    const interaction = call.sourceInteractionIds
+      .map((interactionId) => records.find((record) => record.interactionId === interactionId))
+      .find((record): record is T.AgentInteractionRecord => Boolean(record));
+    if (!interaction) return undefined;
+    const callAt = Number(BigInt(call.atUnixNs) / 1_000_000n);
+    const resultAt = result ? Number(BigInt(result.atUnixNs) / 1_000_000n) : undefined;
+    const kernel = await this.storedAgentEvents({
+      timeType: 'custom',
+      startTime: new Date(Math.max(0, callAt - 2_000)).toISOString(),
+      endTime: new Date((resultAt ?? (callAt + 30 * 60_000)) + 2_000).toISOString(),
+      scope: 'agent',
+      classificationView: query.classificationView,
+      agentInstanceId: interaction.agentInstanceId,
+      durable: true,
+      limit: 1_000,
+    });
+    const resolutionRevision = this.conversationBindings?.currentResolutionRevision() ?? 0;
+    let relations = buildSemanticKernelRelations(
+      call,
+      result,
+      interaction,
+      kernel.items,
+      resolutionRevision,
+      kernel.coverage.partial,
+    );
+    const persistedRelations = this.relationalStore?.configured()
+      ? await this.relationalStore.loadAgentSemanticKernelRelations(call.semanticEventId)
+      : [];
+    if (kernel.coverage.partial
+      && !relations.some((relation) => relation.kernelEventId)
+      && persistedRelations.some((relation) => relation.kernelEventId)) {
+      relations = persistedRelations;
+    } else if (this.relationalStore?.configured()) {
+      await this.relationalStore.saveAgentSemanticKernelRelations(relations);
+    }
+    const linkedEventIds = new Set(relations
+      .map((relation) => relation.kernelEventId)
+      .filter((eventId): eventId is string => Boolean(eventId)));
+    const relationStatus = relations.some((relation) => relation.status === 'linked_exact')
+      ? 'linked_exact'
+      : relations.some((relation) => relation.status === 'linked_strong')
+        ? 'linked_strong'
+        : relations[0]?.status ?? 'semantic_only';
+    const partial = interactions.coverage.partial || inventory.coverage.partial || kernel.coverage.partial;
+    return {
+      schemaVersion: 'anysentry.agent_semantic_evidence.v1',
+      semanticEventId: selected.semanticEventId,
+      conversationId,
+      toolInvocationId: toolInvocationId(call, interaction),
+      interactionIds: [...new Set([
+        ...call.sourceInteractionIds,
+        ...(result?.sourceInteractionIds ?? []),
+      ])],
+      interactionEvidenceEventIds: [...new Set([
+        ...(interaction.evidenceEventIds ?? []),
+        ...call.evidenceEventIds,
+        ...(result?.evidenceEventIds ?? []),
+      ])],
+      relations,
+      kernelEvents: kernel.items.filter((event) => linkedEventIds.has(event.eventId)),
+      relationStatus,
+      evidenceBundleEventIds: [...linkedEventIds],
+      coverage: {
+        ...kernel.coverage,
+        partial,
+        partialReason: kernel.coverage.partialReason
+          ?? interactions.coverage.partialReason
+          ?? inventory.coverage.partialReason,
+      },
+      ...this.classificationResponseMeta(query),
+      updateTime: iso(),
+    };
+  }
+
+  async agentKernelSemanticContext(
+    eventId: string,
+  ): Promise<T.AgentKernelSemanticContextResponse> {
+    const relations = this.relationalStore?.configured()
+      ? await this.relationalStore.loadAgentSemanticRelationsForKernelEvent(eventId)
+      : [];
+    return {
+      schemaVersion: 'anysentry.agent_kernel_semantic_context.v1',
+      eventId,
+      relations,
+      conversationLinks: [...new Map(relations.map((relation) => [
+        [relation.conversationId, relation.turnId, relation.stableSemanticEventId].join('\u0000'),
+        {
+          conversationId: relation.conversationId,
+          turnId: relation.turnId,
+          semanticEventId: relation.stableSemanticEventId,
+        },
+      ])).values()],
       updateTime: iso(),
     };
   }

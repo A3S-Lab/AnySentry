@@ -128,6 +128,8 @@
     "verify:agent-interactions:browser": "pnpm build && node scripts/verify-agent-interaction-browser.mjs",
     "verify:conversation-tracking:browser": "pnpm build && node scripts/verify-conversation-tracking-browser.mjs",
     "verify:agent-conversation-directory": "pnpm build:api && node scripts/verify-agent-conversation-directory.mjs && node scripts/verify-agent-conversation-binding.mjs",
+    "verify:agent-conversation-resolution-v2": "pnpm build:api && node scripts/verify-agent-conversation-resolution-v2.mjs && node scripts/verify-agent-conversation-directory.mjs && node scripts/verify-agent-conversation-binding.mjs",
+    "verify:agent-semantic-kernel-relation": "pnpm build:api && node scripts/verify-agent-semantic-kernel-relation.mjs",
     "verify:repository-hygiene": "node scripts/verify-repository-hygiene.mjs",
     "verify:agent-inventory-durable-overlay": "pnpm build:api && node scripts/verify-agent-inventory-durable-overlay.mjs",
     "verify:agent-persistent-directory": "pnpm build:api && node scripts/verify-agent-persistent-directory.mjs",

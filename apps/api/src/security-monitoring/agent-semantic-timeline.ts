@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
 
 import type * as T from './types';
+import { interactionHumanMessages } from './agent-conversation-resolution-v2';
 
 export const SEMANTIC_PROJECTION_PARSER_ID = 'anysentry.agent-semantic-timeline';
-export const SEMANTIC_PROJECTION_PARSER_VERSION = 1;
+export const SEMANTIC_PROJECTION_PARSER_VERSION = 2;
 const UNRESOLVED_TOOL_GAP_GRACE_MS = 90_000;
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -129,11 +130,29 @@ export function semanticItemsForInteraction(
   interaction: T.AgentInteractionRecord,
 ): T.AgentInteractionSemanticItem[] {
   if (interaction.semanticItems?.length) {
-    return interaction.semanticItems.flatMap((item) => {
+    const retained = interaction.semanticItems.flatMap((item) => {
       if (item.kind !== 'user_message') return [item];
+      if ((interaction.semanticParserVersion ?? 1) < 2) return [];
       const content = humanVisibleUserContent(item.content);
       return content === undefined ? [] : [{ ...item, content }];
     });
+    if ((interaction.semanticParserVersion ?? 1) >= 2) return retained;
+    const users = interactionHumanMessages(interaction).map((message, index) => ({
+      semanticItemId: semanticItemId(interaction.interactionId, 'user_message', index),
+      actor: 'user' as const,
+      kind: 'user_message' as const,
+      phase: 'final' as const,
+      origin: 'request' as const,
+      atUnixNs: interaction.startedAtUnixNs,
+      content: message.content,
+      ...(message.sourceItemId ? { sourceItemId: message.sourceItemId } : {}),
+      ...(message.turnId ? { turnId: message.turnId } : {}),
+      messageOrigin: 'human_input' as const,
+      sequenceNumber: index,
+      completeness: interaction.completeness === 'complete' ? 'complete' as const : 'partial' as const,
+      partialReasons: [...interaction.partialReasons],
+    }));
+    return [...users, ...retained];
   }
   const items: T.AgentInteractionSemanticItem[] = [];
   const push = (
@@ -143,6 +162,12 @@ export function semanticItemsForInteraction(
     atUnixNs: string,
     content?: unknown,
     tool?: { toolCallId: string; toolName?: string },
+    identity?: {
+      sourceItemId?: string;
+      turnId?: string;
+      contentItemKinds?: string[];
+      messageOrigin?: T.AgentInteractionMessage['messageOrigin'];
+    },
   ) => {
     const sequenceNumber = items.length;
     items.push({
@@ -155,17 +180,34 @@ export function semanticItemsForInteraction(
       ...(content !== undefined ? { content } : {}),
       ...(tool?.toolCallId ? { toolCallId: tool.toolCallId } : {}),
       ...(tool?.toolName ? { toolName: tool.toolName } : {}),
+      ...(identity?.sourceItemId ? { sourceItemId: identity.sourceItemId } : {}),
+      ...(identity?.turnId ? { turnId: identity.turnId } : {}),
+      ...(identity?.contentItemKinds?.length
+        ? { contentItemKinds: [...identity.contentItemKinds] }
+        : {}),
+      ...(identity?.messageOrigin ? { messageOrigin: identity.messageOrigin } : {}),
       sequenceNumber,
       completeness: interaction.completeness === 'complete' ? 'complete' : 'partial',
       partialReasons: [...interaction.partialReasons],
     });
   };
 
-  for (const message of interaction.request.messages ?? []) {
-    if (!['user', 'human'].includes(message.role.toLowerCase())) continue;
+  for (const message of interactionHumanMessages(interaction)) {
     const content = humanVisibleUserContent(message.content);
     if (content !== undefined) {
-      push('user', 'user_message', 'request', interaction.startedAtUnixNs, content);
+      push(
+        'user',
+        'user_message',
+        'request',
+        interaction.startedAtUnixNs,
+        content,
+        undefined,
+        {
+          sourceItemId: message.sourceItemId,
+          turnId: message.turnId,
+          messageOrigin: 'human_input',
+        },
+      );
     }
   }
   for (const result of interaction.toolResults) {
@@ -241,6 +283,68 @@ function semanticHash(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value) ?? 'undefined').digest('hex');
 }
 
+export function projectContextReplaySummaries(
+  interactions: T.AgentInteractionRecord[],
+  segments: T.ConversationInstanceSegment[],
+): T.AgentContextReplaySummary[] {
+  const seenUsers = new Set<string>();
+  const seenCalls = new Set<string>();
+  const seenResults = new Set<string>();
+  const summaries: T.AgentContextReplaySummary[] = [];
+  for (const interaction of [...interactions].sort((left, right) =>
+    left.at - right.at || left.interactionId.localeCompare(right.interactionId))) {
+    let replayedUserMessages = 0;
+    let replayedToolCalls = 0;
+    let replayedToolResults = 0;
+    let newUserMessages = 0;
+    const users = semanticItemsForInteraction(interaction)
+      .filter((item) => item.kind === 'user_message');
+    for (const user of users) {
+      const key = user.sourceItemId
+        ? `item:${user.sourceItemId}`
+        : user.turnId
+          ? `turn:${user.turnId}:${semanticHash(user.content)}`
+          : `legacy:${semanticHash(user.content)}`;
+      if (seenUsers.has(key)) replayedUserMessages += 1;
+      else {
+        seenUsers.add(key);
+        newUserMessages += 1;
+      }
+    }
+    for (const call of interaction.toolCalls) {
+      if (seenCalls.has(call.toolCallId)) replayedToolCalls += 1;
+      else seenCalls.add(call.toolCallId);
+    }
+    for (const result of interaction.toolResults) {
+      const key = `${result.toolCallId}\u0000${semanticHash({
+        content: result.content,
+        isError: result.isError,
+      })}`;
+      if (seenResults.has(key)) replayedToolResults += 1;
+      else seenResults.add(key);
+    }
+    if (!replayedUserMessages && !replayedToolCalls && !replayedToolResults) continue;
+    const matchingSegments = segments.filter((segment) =>
+      segment.agentInstanceId === interaction.agentInstanceId);
+    const at = BigInt(interaction.startedAtUnixNs);
+    const segment = matchingSegments.find((candidate) => {
+      const startedAt = BigInt(candidate.startedAtUnixNs);
+      const endedAt = candidate.endedAtUnixNs ? BigInt(candidate.endedAtUnixNs) : undefined;
+      return at >= startedAt && (endedAt === undefined || at <= endedAt);
+    }) ?? matchingSegments.at(-1);
+    summaries.push({
+      interactionId: interaction.interactionId,
+      ...(segment ? { segmentId: segment.segmentId } : {}),
+      atUnixNs: interaction.startedAtUnixNs,
+      replayedUserMessages,
+      replayedToolCalls,
+      replayedToolResults,
+      newUserMessages,
+    });
+  }
+  return summaries;
+}
+
 function toolIdentity(name: string | undefined, content: unknown): {
   toolName: string;
   toolKind: T.AgentToolKind;
@@ -269,12 +373,11 @@ function toolIdentity(name: string | undefined, content: unknown): {
 }
 
 function semanticEventId(
-  conversationId: string,
   interactionId: string,
   item: T.AgentInteractionSemanticItem,
 ): string {
   return `se_${createHash('sha256')
-    .update(`${conversationId}\u0000${interactionId}\u0000${item.semanticItemId}`)
+    .update(`${interactionId}\u0000${item.sourceItemId ?? item.semanticItemId}\u0000${item.kind}`)
     .digest('hex')
     .slice(0, 24)}`;
 }
@@ -291,6 +394,10 @@ function compareSemanticEvent(left: T.AgentSemanticEvent, right: T.AgentSemantic
     tool_call: 40,
   };
   return rank[left.kind] - rank[right.kind]
+    || (left.sourceInteractionIds[0] === right.sourceInteractionIds[0]
+      ? (left.sequenceNumber ?? Number.MAX_SAFE_INTEGER)
+        - (right.sequenceNumber ?? Number.MAX_SAFE_INTEGER)
+      : 0)
     || left.semanticEventId.localeCompare(right.semanticEventId);
 }
 
@@ -317,6 +424,7 @@ export function projectSemanticConversationTimeline(
   const calls = new Map<string, T.AgentSemanticEvent>();
   const resultKeys = new Set<string>();
   const observedResultIds = new Set<string>();
+  const observedUserItemIds = new Set<string>();
   const resolvedToolCallIds = new Set(ordered.flatMap((interaction) =>
     interaction.toolResults.map((result) => result.toolCallId)));
   let previousUserLineage: string[] = [];
@@ -352,6 +460,10 @@ export function projectSemanticConversationTimeline(
 
     for (const item of semanticItems) {
       if (item.kind === 'user_message' && userItems.indexOf(item) < firstNewUser) continue;
+      if (item.kind === 'user_message' && item.sourceItemId) {
+        if (observedUserItemIds.has(item.sourceItemId)) continue;
+        observedUserItemIds.add(item.sourceItemId);
+      }
       if (item.kind === 'tool_result') {
         const resultKey = `${item.toolCallId ?? 'unlinked'}\u0000${semanticHash(item.content)}`;
         if (resultKeys.has(resultKey)) continue;
@@ -370,7 +482,7 @@ export function projectSemanticConversationTimeline(
             result.toolCallId === item.toolCallId))
         : false;
       const event: T.AgentSemanticEvent = {
-        semanticEventId: semanticEventId(conversation.conversationId, interaction.interactionId, item),
+        semanticEventId: semanticEventId(interaction.interactionId, item),
         conversationId: conversation.conversationId,
         segmentId,
         turnId,
@@ -390,6 +502,8 @@ export function projectSemanticConversationTimeline(
             : {}),
         sourceInteractionIds: [interaction.interactionId],
         sourceItemIds: [item.sourceItemId ?? item.semanticItemId],
+        ...(item.sequenceNumber !== undefined ? { sequenceNumber: item.sequenceNumber } : {}),
+        evidenceEventIds: [...(interaction.evidenceEventIds ?? [])],
         parserId: interaction.semanticParserId ?? SEMANTIC_PROJECTION_PARSER_ID,
         parserVersion: interaction.semanticParserVersion ?? SEMANTIC_PROJECTION_PARSER_VERSION,
         correlationQuality: interaction.correlationQuality ?? 'inferred',

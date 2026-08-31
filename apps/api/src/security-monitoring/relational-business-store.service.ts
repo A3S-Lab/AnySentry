@@ -4,8 +4,10 @@ import { Pool, PoolClient } from 'pg';
 import {
   AgentMetadataRecord,
   AgentRuntimeInstanceRecord,
+  AgentSemanticKernelRelation,
   AgentConversationBindingRecord,
   AgentConversationThreadRecord,
+  AgentConversationAnchor,
   ConversationInstanceSegment,
   AgentWorkspaceBindingRecord,
   AlertRecord,
@@ -19,6 +21,11 @@ import {
   RemediationRecord,
   WorkspaceDirectoryRecord,
 } from './types';
+import type {
+  ConversationMembershipV2,
+  ConversationRouteAliasV1,
+  TechnicalActivityProjection,
+} from './agent-conversation-resolution-v2';
 import { PolicyConfig } from './policy-config';
 
 const AGENT_METADATA_LIMIT = 10_000;
@@ -45,6 +52,13 @@ export type WriterOwnership =
   | { status: 'owned' }
   | { status: 'conflict'; ownerWriterId: string; leaseExpiresAt: number }
   | { status: 'unavailable' };
+
+export interface AgentConversationAnchorPersistence {
+  interactionId: string;
+  logicalScopeKey: string;
+  observedAt: number;
+  anchor: AgentConversationAnchor;
+}
 
 function positiveInt(value: string | undefined, fallback: number, max: number): number {
   const parsed = Number.parseInt(value ?? '', 10);
@@ -528,6 +542,77 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  async loadAgentConversationMembershipsV2(
+    interactionIds: string[],
+  ): Promise<ConversationMembershipV2[]> {
+    if (interactionIds.length === 0 || !(await this.initialize()) || !this.pool) return [];
+    try {
+      const result = await this.pool.query<{ record: ConversationMembershipV2 | string }>(
+        `SELECT DISTINCT ON (interaction_id) record
+           FROM anysentry_agent_conversation_memberships_v2
+          WHERE interaction_id = ANY($1::text[])
+          ORDER BY interaction_id, resolution_revision DESC
+          LIMIT $2`,
+        [interactionIds.slice(0, AGENT_CONVERSATION_BINDING_LIMIT), AGENT_CONVERSATION_BINDING_LIMIT],
+      );
+      return result.rows
+        .map(({ record }) => this.parseRecord<ConversationMembershipV2>(record))
+        .filter((record): record is ConversationMembershipV2 => Boolean(
+          record?.interactionId && record.membershipId && record.resolutionRevision,
+        ));
+    } catch (error) {
+      this.markUnavailable('load Agent Conversation V2 memberships', error);
+      return [];
+    }
+  }
+
+  async loadAgentConversationRouteAliases(
+    conversationIds: string[],
+  ): Promise<ConversationRouteAliasV1[]> {
+    if (conversationIds.length === 0 || !(await this.initialize()) || !this.pool) return [];
+    try {
+      const result = await this.pool.query<{ record: ConversationRouteAliasV1 | string }>(
+        `SELECT record
+           FROM anysentry_agent_conversation_route_aliases_v1
+          WHERE alias_conversation_id = ANY($1::text[])
+          LIMIT $2`,
+        [[...new Set(conversationIds)], AGENT_CONVERSATION_BINDING_LIMIT],
+      );
+      return result.rows
+        .map(({ record }) => this.parseRecord<ConversationRouteAliasV1>(record))
+        .filter((record): record is ConversationRouteAliasV1 => Boolean(
+          record?.aliasConversationId && record.targetType && record.targetId,
+        ));
+    } catch (error) {
+      this.markUnavailable('load Agent Conversation route aliases', error);
+      return [];
+    }
+  }
+
+  async loadAgentRunTechnicalActivities(
+    agentInstanceIds: string[],
+  ): Promise<TechnicalActivityProjection[]> {
+    if (agentInstanceIds.length === 0 || !(await this.initialize()) || !this.pool) return [];
+    try {
+      const result = await this.pool.query<{ record: TechnicalActivityProjection | string }>(
+        `SELECT record
+           FROM anysentry_agent_run_technical_activities_v1
+          WHERE agent_instance_id = ANY($1::text[])
+          ORDER BY started_at DESC
+          LIMIT $2`,
+        [[...new Set(agentInstanceIds)], AGENT_CONVERSATION_BINDING_LIMIT],
+      );
+      return result.rows
+        .map(({ record }) => this.parseRecord<TechnicalActivityProjection>(record))
+        .filter((record): record is TechnicalActivityProjection => Boolean(
+          record?.technicalActivityId && record.interactionIds?.length,
+        ));
+    } catch (error) {
+      this.markUnavailable('load Agent Run technical activities', error);
+      return [];
+    }
+  }
+
   async saveAgentConversationResolution(
     threads: AgentConversationThreadRecord[],
     segments: ConversationInstanceSegment[],
@@ -635,6 +720,255 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       return false;
     } finally {
       client?.release();
+    }
+  }
+
+  async saveAgentConversationResolutionV2(
+    anchors: AgentConversationAnchorPersistence[],
+    memberships: ConversationMembershipV2[],
+    aliases: ConversationRouteAliasV1[],
+    technicalActivities: TechnicalActivityProjection[],
+  ): Promise<boolean> {
+    if (!anchors.length && !memberships.length && !aliases.length && !technicalActivities.length) {
+      return true;
+    }
+    if (!(await this.initialize()) || !this.pool) return false;
+    let client: PoolClient | undefined;
+    try {
+      client = await this.pool.connect();
+      await client.query('BEGIN');
+      if (anchors.length) {
+        const rows = anchors.map((item) => ({
+          interactionId: item.interactionId,
+          logicalScopeKey: item.logicalScopeKey,
+          observedAt: item.observedAt,
+          ...item.anchor,
+        }));
+        await client.query(
+          `WITH incoming AS (
+             SELECT item AS record
+               FROM jsonb_array_elements($1::jsonb) AS source(item)
+           )
+           INSERT INTO anysentry_agent_conversation_anchors_v1 (
+             interaction_id, logical_scope_key, anchor_kind, anchor_namespace,
+             value_hash, strength, source_path, observed_at, record
+           )
+           SELECT
+             record->>'interactionId',
+             record->>'logicalScopeKey',
+             record->>'kind',
+             record->>'namespace',
+             record->>'valueHash',
+             record->>'strength',
+             record->>'sourcePath',
+             (record->>'observedAt')::bigint,
+             record
+           FROM incoming
+           ON CONFLICT (interaction_id, anchor_kind, anchor_namespace, value_hash)
+           DO UPDATE SET
+             strength = EXCLUDED.strength,
+             source_path = EXCLUDED.source_path,
+             observed_at = EXCLUDED.observed_at,
+             record = EXCLUDED.record`,
+          [JSON.stringify(rows)],
+        );
+      }
+      if (memberships.length) {
+        await client.query(
+          `WITH incoming AS (
+             SELECT item AS record
+               FROM jsonb_array_elements($1::jsonb) AS source(item)
+           )
+           INSERT INTO anysentry_agent_conversation_memberships_v2 (
+             interaction_id, resolution_revision, logical_scope_key, role,
+             canonical_conversation_id, technical_activity_id, record, decided_at
+           )
+           SELECT
+             record->>'interactionId',
+             (record->>'resolutionRevision')::bigint,
+             record->>'logicalScopeKey',
+             record->>'role',
+             NULLIF(record->>'canonicalConversationId', ''),
+             NULLIF(record->>'technicalActivityId', ''),
+             record,
+             (record->>'decidedAt')::bigint
+           FROM incoming
+           ON CONFLICT (interaction_id, resolution_revision) DO UPDATE SET
+             logical_scope_key = EXCLUDED.logical_scope_key,
+             role = EXCLUDED.role,
+             canonical_conversation_id = EXCLUDED.canonical_conversation_id,
+             technical_activity_id = EXCLUDED.technical_activity_id,
+             record = EXCLUDED.record,
+             decided_at = EXCLUDED.decided_at`,
+          [JSON.stringify(memberships)],
+        );
+      }
+      if (aliases.length) {
+        await client.query(
+          `WITH incoming AS (
+             SELECT item AS record
+               FROM jsonb_array_elements($1::jsonb) AS source(item)
+           )
+           INSERT INTO anysentry_agent_conversation_route_aliases_v1 (
+             alias_conversation_id, target_type, target_id, resolution_revision,
+             record, updated_at
+           )
+           SELECT
+             record->>'aliasConversationId',
+             record->>'targetType',
+             record->>'targetId',
+             (record->>'resolutionRevision')::bigint,
+             record,
+             (record->>'createdAt')::bigint
+           FROM incoming
+           ON CONFLICT (alias_conversation_id) DO UPDATE SET
+             target_type = EXCLUDED.target_type,
+             target_id = EXCLUDED.target_id,
+             resolution_revision = EXCLUDED.resolution_revision,
+             record = EXCLUDED.record,
+             updated_at = EXCLUDED.updated_at
+           WHERE EXCLUDED.resolution_revision >=
+             anysentry_agent_conversation_route_aliases_v1.resolution_revision`,
+          [JSON.stringify(aliases)],
+        );
+      }
+      if (technicalActivities.length) {
+        const rows = technicalActivities.map((item) => ({
+          ...item,
+          updatedAt: Number(BigInt(item.endedAtUnixNs) / 1_000_000n),
+        }));
+        await client.query(
+          `WITH incoming AS (
+             SELECT item AS record
+               FROM jsonb_array_elements($1::jsonb) AS source(item)
+           )
+           INSERT INTO anysentry_agent_run_technical_activities_v1 (
+             technical_activity_id, agent_instance_id, started_at, ended_at,
+             record, updated_at
+           )
+           SELECT
+             record->>'technicalActivityId',
+             NULLIF(record->>'agentInstanceId', ''),
+             (record->>'startedAtUnixNs')::numeric,
+             (record->>'endedAtUnixNs')::numeric,
+             record,
+             (record->>'updatedAt')::bigint
+           FROM incoming
+           ON CONFLICT (technical_activity_id) DO UPDATE SET
+             agent_instance_id = EXCLUDED.agent_instance_id,
+             started_at = LEAST(
+               anysentry_agent_run_technical_activities_v1.started_at, EXCLUDED.started_at
+             ),
+             ended_at = GREATEST(
+               anysentry_agent_run_technical_activities_v1.ended_at, EXCLUDED.ended_at
+             ),
+             record = EXCLUDED.record,
+             updated_at = EXCLUDED.updated_at
+           WHERE EXCLUDED.updated_at >=
+             anysentry_agent_run_technical_activities_v1.updated_at`,
+          [JSON.stringify(rows)],
+        );
+      }
+      await client.query('COMMIT');
+      return true;
+    } catch (error) {
+      await client?.query('ROLLBACK').catch(() => undefined);
+      this.markUnavailable('save Agent Conversation V2 resolution', error);
+      return false;
+    } finally {
+      client?.release();
+    }
+  }
+
+  async loadAgentSemanticKernelRelations(
+    semanticEventId: string,
+  ): Promise<AgentSemanticKernelRelation[]> {
+    if (!semanticEventId || !(await this.initialize()) || !this.pool) return [];
+    try {
+      const result = await this.pool.query<{ record: AgentSemanticKernelRelation | string }>(
+        `SELECT record
+           FROM anysentry_agent_semantic_kernel_relations_v1
+          WHERE stable_semantic_event_id = $1
+          ORDER BY resolution_revision DESC, relation_id
+          LIMIT 1_000`,
+        [semanticEventId],
+      );
+      return result.rows
+        .map(({ record }) => this.parseRecord<AgentSemanticKernelRelation>(record))
+        .filter((record): record is AgentSemanticKernelRelation => Boolean(
+          record?.relationId && record.stableSemanticEventId === semanticEventId,
+        ));
+    } catch (error) {
+      this.markUnavailable('load Agent Semantic Kernel relations', error);
+      return [];
+    }
+  }
+
+  async loadAgentSemanticRelationsForKernelEvent(
+    kernelEventId: string,
+  ): Promise<AgentSemanticKernelRelation[]> {
+    if (!kernelEventId || !(await this.initialize()) || !this.pool) return [];
+    try {
+      const result = await this.pool.query<{ record: AgentSemanticKernelRelation | string }>(
+        `SELECT record
+           FROM anysentry_agent_semantic_kernel_relations_v1
+          WHERE kernel_event_id = $1
+          ORDER BY resolution_revision DESC, relation_id
+          LIMIT 1_000`,
+        [kernelEventId],
+      );
+      return result.rows
+        .map(({ record }) => this.parseRecord<AgentSemanticKernelRelation>(record))
+        .filter((record): record is AgentSemanticKernelRelation => Boolean(
+          record?.kernelEventId === kernelEventId && record.stableSemanticEventId,
+        ));
+    } catch (error) {
+      this.markUnavailable('load semantic context for Kernel event', error);
+      return [];
+    }
+  }
+
+  async saveAgentSemanticKernelRelations(
+    relations: AgentSemanticKernelRelation[],
+  ): Promise<boolean> {
+    if (!relations.length) return true;
+    if (!(await this.initialize()) || !this.pool) return false;
+    try {
+      const updatedAt = Date.now();
+      const rows = relations.map((relation) => ({ ...relation, updatedAt }));
+      await this.pool.query(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         INSERT INTO anysentry_agent_semantic_kernel_relations_v1 (
+           relation_id, stable_semantic_event_id, tool_invocation_id,
+           kernel_event_id, relation_status, resolution_revision, record, updated_at
+         )
+         SELECT
+           record->>'relationId',
+           record->>'stableSemanticEventId',
+           record->>'toolInvocationId',
+           NULLIF(record->>'kernelEventId', ''),
+           record->>'status',
+           (record->>'resolutionRevision')::bigint,
+           record,
+           (record->>'updatedAt')::bigint
+         FROM incoming
+         ON CONFLICT (relation_id) DO UPDATE SET
+           kernel_event_id = EXCLUDED.kernel_event_id,
+           relation_status = EXCLUDED.relation_status,
+           resolution_revision = EXCLUDED.resolution_revision,
+           record = EXCLUDED.record,
+           updated_at = EXCLUDED.updated_at
+         WHERE EXCLUDED.resolution_revision >=
+           anysentry_agent_semantic_kernel_relations_v1.resolution_revision`,
+        [JSON.stringify(rows)],
+      );
+      return true;
+    } catch (error) {
+      this.markUnavailable('save Agent Semantic Kernel relations', error);
+      return false;
     }
   }
 
@@ -1439,6 +1773,106 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       await pool.query(`
         CREATE INDEX IF NOT EXISTS anysentry_agent_conversation_bindings_v1_thread_idx
           ON anysentry_agent_conversation_bindings_v1 (conversation_id)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_agent_conversation_anchors_v1 (
+          interaction_id TEXT NOT NULL,
+          logical_scope_key TEXT NOT NULL,
+          anchor_kind TEXT NOT NULL,
+          anchor_namespace TEXT NOT NULL,
+          value_hash TEXT NOT NULL,
+          strength TEXT NOT NULL,
+          source_path TEXT NOT NULL,
+          observed_at BIGINT NOT NULL,
+          record JSONB NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (interaction_id, anchor_kind, anchor_namespace, value_hash)
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_agent_conversation_anchors_v1_lookup_idx
+          ON anysentry_agent_conversation_anchors_v1 (
+            logical_scope_key, anchor_kind, anchor_namespace, value_hash
+          )
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_agent_conversation_memberships_v2 (
+          interaction_id TEXT NOT NULL,
+          resolution_revision BIGINT NOT NULL,
+          logical_scope_key TEXT NOT NULL,
+          role TEXT NOT NULL,
+          canonical_conversation_id TEXT,
+          technical_activity_id TEXT,
+          record JSONB NOT NULL,
+          decided_at BIGINT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (interaction_id, resolution_revision)
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_agent_conversation_memberships_v2_current_idx
+          ON anysentry_agent_conversation_memberships_v2 (
+            interaction_id, resolution_revision DESC
+          )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_agent_conversation_memberships_v2_thread_idx
+          ON anysentry_agent_conversation_memberships_v2 (
+            canonical_conversation_id, resolution_revision DESC
+          )
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_agent_conversation_route_aliases_v1 (
+          alias_conversation_id TEXT PRIMARY KEY,
+          target_type TEXT NOT NULL,
+          target_id TEXT NOT NULL,
+          resolution_revision BIGINT NOT NULL,
+          record JSONB NOT NULL,
+          updated_at BIGINT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_agent_conversation_route_aliases_v1_target_idx
+          ON anysentry_agent_conversation_route_aliases_v1 (target_type, target_id)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_agent_run_technical_activities_v1 (
+          technical_activity_id TEXT PRIMARY KEY,
+          agent_instance_id TEXT,
+          started_at NUMERIC(40, 0) NOT NULL,
+          ended_at NUMERIC(40, 0) NOT NULL,
+          record JSONB NOT NULL,
+          updated_at BIGINT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_agent_run_technical_activities_v1_instance_idx
+          ON anysentry_agent_run_technical_activities_v1 (agent_instance_id, started_at DESC)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_agent_semantic_kernel_relations_v1 (
+          relation_id TEXT PRIMARY KEY,
+          stable_semantic_event_id TEXT NOT NULL,
+          tool_invocation_id TEXT NOT NULL,
+          kernel_event_id TEXT,
+          relation_status TEXT NOT NULL,
+          resolution_revision BIGINT NOT NULL,
+          record JSONB NOT NULL,
+          updated_at BIGINT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_agent_semantic_kernel_relations_v1_semantic_idx
+          ON anysentry_agent_semantic_kernel_relations_v1 (
+            stable_semantic_event_id, resolution_revision DESC
+          )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_agent_semantic_kernel_relations_v1_kernel_idx
+          ON anysentry_agent_semantic_kernel_relations_v1 (kernel_event_id)
       `);
       await pool.query(`
         CREATE TABLE IF NOT EXISTS anysentry_incidents (
