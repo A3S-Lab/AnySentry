@@ -2,9 +2,9 @@
 
 > 审核状态：已通过。首批实现对象为 Codex、Claude Code 与 Pi；协议、身份、Thread/Segment 和前端合同均按通用 Agent 能力设计。本文同时作为本阶段 PRD、开发设计与验收基线。
 
-> - 状态：Draft for Review
+> - 状态：已审核通过，本阶段实现与验收完成
 > - 日期：2026-08-30
-> - 首批范围：Codex CLI、Claude Code CLI；抽象同时适用于 Kimi CLI、Pi、Dify、LangChain 及其他 Agent 运行时
+> - 首批范围：Codex CLI、Claude Code CLI、Pi；抽象同时适用于 Kimi CLI、Dify、LangChain 及其他 Agent 运行时
 > - 前置设计：[`anysentry-discovery-first-agent-tls-observability-v2-design.md`](./anysentry-discovery-first-agent-tls-observability-v2-design.md)
 > - 本文性质：PRD、生命周期与归因架构、数据模型、API、前端交互、开发计划和验收标准一体化文档
 
