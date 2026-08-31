@@ -440,6 +440,56 @@ function anchorValues(
     .map((anchor) => anchor.valueHash));
 }
 
+function groupAnchorValues(
+  indexes: number[],
+  records: T.AgentInteractionRecord[],
+  kinds: T.AgentConversationAnchorKind[],
+): Set<string> {
+  return new Set(indexes.flatMap((index) =>
+    (records[index].conversationAnchors ?? [])
+      .filter((anchor) => kinds.includes(anchor.kind))
+      .map((anchor) => `${anchor.kind}\u0000${anchor.valueHash}`)));
+}
+
+function setsIntersect(left: Set<string>, right: Set<string>): boolean {
+  return [...left].some((value) => right.has(value));
+}
+
+function representativeHumanHistory(
+  indexes: number[],
+  records: T.AgentInteractionRecord[],
+): string[] {
+  return indexes
+    .map((index) => humanContentHashes(records[index]))
+    .filter((history) => history.length > 0)
+    .sort((left, right) => right.length - left.length)[0] ?? [];
+}
+
+function historyPrefix(left: string[], right: string[]): boolean {
+  return left.length <= right.length && left.every((value, index) => value === right[index]);
+}
+
+function continuityHistoriesCompatible(
+  left: number[],
+  right: number[],
+  records: T.AgentInteractionRecord[],
+): boolean {
+  const stableKinds: T.AgentConversationAnchorKind[] = [
+    'message_item_id',
+    'turn_id',
+    'tool_call_id',
+  ];
+  if (setsIntersect(
+    groupAnchorValues(left, records, stableKinds),
+    groupAnchorValues(right, records, stableKinds),
+  )) return true;
+
+  const leftHistory = representativeHumanHistory(left, records);
+  const rightHistory = representativeHumanHistory(right, records);
+  if (leftHistory.length === 0 || rightHistory.length === 0) return true;
+  return historyPrefix(leftHistory, rightHistory) || historyPrefix(rightHistory, leftHistory);
+}
+
 function canMerge(
   left: number[],
   right: number[],
@@ -478,11 +528,16 @@ function unionGroupsIfAllowed(
   rightIndex: number,
   indexes: number[],
   records: T.AgentInteractionRecord[],
+  continuityConflictIndexes?: Set<number>,
 ): boolean {
   const groups = groupIndexes(set, indexes);
   const left = groups.get(set.find(leftIndex)) ?? [leftIndex];
   const right = groups.get(set.find(rightIndex)) ?? [rightIndex];
   if (!canMerge(left, right, records)) return false;
+  if (continuityConflictIndexes && !continuityHistoriesCompatible(left, right, records)) {
+    for (const index of [...left, ...right]) continuityConflictIndexes.add(index);
+    return false;
+  }
   set.union(leftIndex, rightIndex);
   return true;
 }
@@ -500,10 +555,18 @@ function unionCompatiblePrior(
   index: number,
   visibleIndexes: number[],
   records: T.AgentInteractionRecord[],
+  continuityConflictIndexes?: Set<number>,
 ): boolean {
   const candidates = map.get(key) ?? [];
   for (let offset = candidates.length - 1; offset >= 0; offset -= 1) {
-    if (unionGroupsIfAllowed(set, candidates[offset], index, visibleIndexes, records)) return true;
+    if (unionGroupsIfAllowed(
+      set,
+      candidates[offset],
+      index,
+      visibleIndexes,
+      records,
+      continuityConflictIndexes,
+    )) return true;
   }
   return false;
 }
@@ -511,6 +574,7 @@ function unionCompatiblePrior(
 function canonicalConversationId(
   indexes: number[],
   records: T.AgentInteractionRecord[],
+  continuityConflictIndexes?: Set<number>,
 ): { conversationId: string; idSource: T.AgentConversationSummary['idSource'] } {
   const existing = new Map<string, { at: number; human: boolean; source: T.AgentConversationSummary['idSource'] }>();
   const sourceRank: Record<T.AgentConversationSummary['idSource'], number> = {
@@ -559,7 +623,7 @@ function canonicalConversationId(
     .map((index) => records[index].conversationAnchors?.find((anchor) =>
       anchor.kind === 'continuity_key'))
     .find(Boolean);
-  if (continuity) {
+  if (continuity && !indexes.some((index) => continuityConflictIndexes?.has(index))) {
     return {
       conversationId: stableId('cv', 'v2\u0000' + scope + '\u0000continuity\u0000' + continuity.valueHash),
       idSource: 'runtime',
@@ -664,6 +728,7 @@ export function resolveAgentConversationsV2(
   const response = new Map<string, number[]>();
   const continuity = new Map<string, number[]>();
   const toolCalls = new Map<string, number[]>();
+  const continuityConflictIndexes = new Set<number>();
 
   for (const index of visibleIndexes) {
     const item = records[index];
@@ -688,7 +753,15 @@ export function resolveAgentConversationsV2(
     for (const anchor of item.conversationAnchors ?? []) {
       if (anchor.kind !== 'continuity_key') continue;
       const key = scope + '\u0000' + anchor.namespace + '\u0000' + anchor.valueHash;
-      unionCompatiblePrior(set, continuity, key, index, visibleIndexes, records);
+      unionCompatiblePrior(
+        set,
+        continuity,
+        key,
+        index,
+        visibleIndexes,
+        records,
+        continuityConflictIndexes,
+      );
       rememberIndex(continuity, key, index);
     }
     for (const call of item.toolCalls) {
@@ -735,7 +808,7 @@ export function resolveAgentConversationsV2(
     indexes.sort((left, right) =>
       records[left].at - records[right].at
       || records[left].interactionId.localeCompare(records[right].interactionId));
-    const canonical = canonicalConversationId(indexes, records);
+    const canonical = canonicalConversationId(indexes, records, continuityConflictIndexes);
     const existingIds = [...new Set(indexes
       .map((index) => records[index].conversationId)
       .filter((value): value is string => Boolean(value)))];
@@ -777,15 +850,23 @@ export function resolveAgentConversationsV2(
       });
     }
     for (const index of indexes) {
-      const itemEvidence = (records[index].conversationAnchors ?? []).map((anchor) => anchor.kind);
+      const continuityConflict = continuityConflictIndexes.has(index);
+      const itemEvidence = [
+        ...(records[index].conversationAnchors ?? []).map((anchor) => anchor.kind),
+        ...(continuityConflict ? ['continuity_collision_without_shared_history'] : []),
+      ];
       records[index] = {
         ...records[index],
         conversationId: canonical.conversationId,
         conversationIdSource: canonical.idSource,
         conversationBindingVersion: AGENT_CONVERSATION_RESOLVER_V2,
+        // The collision only rejects this continuity edge. It must not erase an independent
+        // exact Provider/message binding that already proves membership inside this group.
         correlationQuality: records[index].correlationQuality === 'exact'
           ? 'exact'
-          : evidence.includes('continuity_key') ? 'strong' : 'inferred',
+          : continuityConflict
+            ? 'unlinked'
+            : evidence.includes('continuity_key') ? 'strong' : 'inferred',
       };
       memberships.push({
         schemaVersion: 'anysentry.agent_conversation_membership.v2',

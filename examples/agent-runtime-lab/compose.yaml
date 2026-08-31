@@ -95,6 +95,9 @@ services:
       - ../../scripts/observer-supervisor.js:/opt/observer-supervisor.js:ro
       - ../../scripts/observer-forward.js:/opt/observer-forward.js:ro
       - ../../scripts/observer-agent-attribution.js:/opt/observer-agent-attribution.js:ro
+      - ../../scripts/observer-launch-context.js:/opt/observer-launch-context.js:ro
+      - ../../scripts/observer-systemd-enrichment.js:/opt/observer-systemd-enrichment.js:ro
+      - ../../scripts/observer-attribution-repair.js:/opt/observer-attribution-repair.js:ro
       - ../../scripts/observer-attribution-merge.js:/opt/observer-attribution-merge.js:ro
       - ../../scripts/observer-classification-semantics.js:/opt/observer-classification-semantics.js:ro
       - ../../scripts/observer-agent-runtime-signatures.js:/opt/observer-agent-runtime-signatures.js:ro

@@ -1,6 +1,11 @@
 import { createHash } from 'node:crypto';
 import { parseTrustedCorrelation } from './trusted-correlation';
-import type { AgentAttribution, EventSource, ProcessContext } from './types';
+import type {
+  AgentAttribution,
+  EventSource,
+  ProcessContext,
+  ProcessGenerationLinkAuthority,
+} from './types';
 
 export const PROCESS_LIFECYCLE_FACT_SCHEMA = 'anysentry.process_lifecycle_fact.v1' as const;
 
@@ -48,6 +53,9 @@ export interface ProcessLifecycleFact {
   runtimeInstanceId?: string;
   rootProcess?: boolean;
   processInstanceKey: string;
+  processGenerationKey?: string;
+  parentProcessGenerationKey?: string;
+  parentLinkAuthority?: ProcessGenerationLinkAuthority;
   physicalWorkloadId?: string;
   hostId?: string;
   bootId: string;
@@ -89,6 +97,11 @@ function trustedStart(process: ProcessContext): string | undefined {
   const ns = text(process.startTimeNs, 160);
   if (ns && /^[1-9][0-9]*$/u.test(ns)) return `ns:${ns}`;
   return undefined;
+}
+
+function trustedProcessGenerationKey(value: unknown): string | undefined {
+  const key = text(value, 64);
+  return key && /^pgk_[a-f0-9]{24}$/u.test(key) ? key : undefined;
 }
 
 export interface CanonicalProcessLifecycleIdentity {
@@ -152,6 +165,20 @@ export function processLifecycleFact(input: ProcessLifecycleFactInput): ProcessL
   const executable = text(input.process.exe, 4_096);
   const commandHash = text(input.attributes?.['anysentry.kernel.command_hash'], 128);
   const physicalWorkloadId = text(input.attribution?.physicalWorkloadId, 1_024);
+  const correlation = parseTrustedCorrelation(input.attribution?.correlation);
+  const graphAuthority = correlation && !correlation.inferred && (
+    correlation.authority === 'attested_observer' || correlation.authority === 'server_process_graph'
+  );
+  const processGenerationKey = graphAuthority
+    ? trustedProcessGenerationKey(input.attribution?.processGenerationKey)
+    : undefined;
+  const parentLinkAuthority = graphAuthority &&
+    input.attribution?.parentLinkAuthority === 'forwarder_process_graph'
+    ? input.attribution.parentLinkAuthority
+    : undefined;
+  const parentProcessGenerationKey = parentLinkAuthority
+    ? trustedProcessGenerationKey(input.attribution?.parentProcessGenerationKey)
+    : undefined;
   const exitStatus = factKind === 'exit'
     ? unsigned32(
         input.attributes?.exit_code
@@ -183,6 +210,9 @@ export function processLifecycleFact(input: ProcessLifecycleFactInput): ProcessL
       ? { rootProcess: input.attribution.rootPid === input.process.pid }
       : {}),
     processInstanceKey,
+    ...(processGenerationKey ? { processGenerationKey } : {}),
+    ...(parentProcessGenerationKey ? { parentProcessGenerationKey } : {}),
+    ...(parentProcessGenerationKey && parentLinkAuthority ? { parentLinkAuthority } : {}),
     ...(physicalWorkloadId ? { physicalWorkloadId } : {}),
     ...(hostId ? { hostId } : {}),
     bootId,

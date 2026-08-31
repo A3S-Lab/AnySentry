@@ -4,6 +4,8 @@ import { hostRootInstanceIdFromAtoms } from './agent-semantic-identity';
 import { RelationalBusinessStore } from './relational-business-store.service';
 import {
   AgentActivityState,
+  AgentLaunchContext,
+  AgentLaunchOriginType,
   AgentAttributionSource,
   AgentClassification,
   AgentRuntimeAckReasonCode,
@@ -222,6 +224,143 @@ function cleanWorkloadRef(value: unknown): AgentWorkloadRef | undefined {
   return Object.values(result).some((item) => item !== undefined) ? result : undefined;
 }
 
+const LAUNCH_ORIGIN_TYPES = new Set<AgentLaunchOriginType>([
+  'service_manager',
+  'systemd_unit',
+  'ssh_session',
+  'shell',
+  'supervisor',
+  'cron',
+  'container',
+]);
+const LAUNCH_COMPLETENESS = new Set<AgentLaunchContext['completeness']>([
+  'complete',
+  'missing_parent',
+  'cycle',
+  'depth_limit',
+  'process_domain_conflict',
+]);
+
+function generationKey(value: unknown): string | undefined {
+  const key = cleanString(value, 64);
+  return key && /^pgk_[a-f0-9]{24}$/u.test(key) ? key : undefined;
+}
+
+function cleanLaunchContext(value: unknown, rootPid: number): AgentLaunchContext | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const input = value as Record<string, unknown>;
+  if (input.schemaVersion !== 'anysentry.agent_launch_context.v1') return undefined;
+  const rootProcessGenerationKey = generationKey(input.rootProcessGenerationKey);
+  const observedAt = cleanString(input.observedAt, 80);
+  const completeness = input.completeness as AgentLaunchContext['completeness'];
+  if (
+    !rootProcessGenerationKey ||
+    !observedAt ||
+    timestamp(observedAt) === undefined ||
+    !LAUNCH_COMPLETENESS.has(completeness) ||
+    !Array.isArray(input.path) ||
+    input.path.length === 0 ||
+    input.path.length > 32 ||
+    !Array.isArray(input.origins) ||
+    input.origins.length > 32
+  ) return undefined;
+
+  const path = input.path.map((raw) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    const node = raw as Record<string, unknown>;
+    const pid = integer(node.pid, 1, 4_194_304);
+    const ppid = integer(node.ppid, 0, 4_194_304);
+    const command = cleanString(node.command, 240);
+    const processGenerationKey = node.processGenerationKey === undefined
+      ? undefined
+      : generationKey(node.processGenerationKey);
+    if (!pid || ppid === undefined || !command || (
+      node.processGenerationKey !== undefined && !processGenerationKey
+    )) return undefined;
+    return {
+      processGenerationKey,
+      pid,
+      ppid,
+      command,
+      exe: cleanString(node.exe, 1_000),
+      systemdUnit: cleanString(node.systemdUnit, 240),
+    };
+  });
+  if (
+    path.some((node) => !node) ||
+    path.at(-1)?.pid !== rootPid ||
+    path.at(-1)?.processGenerationKey !== rootProcessGenerationKey
+  ) return undefined;
+  const cleanPath = path as AgentLaunchContext['path'];
+  const pathByPid = new Map(cleanPath.map((node) => [node.pid, node]));
+  if (
+    pathByPid.size !== cleanPath.length ||
+    cleanPath.slice(1).some((node, index) => node.ppid !== cleanPath[index].pid)
+  ) return undefined;
+
+  const origins = input.origins.map((raw) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    const origin = raw as Record<string, unknown>;
+    const type = origin.type as AgentLaunchOriginType;
+    const pid = integer(origin.pid, 1, 4_194_304);
+    const name = cleanString(origin.name, 240);
+    const processGenerationKey = origin.processGenerationKey === undefined
+      ? undefined
+      : generationKey(origin.processGenerationKey);
+    const restartCount = origin.restartCount === undefined
+      ? undefined
+      : integer(origin.restartCount, 0, Number.MAX_SAFE_INTEGER);
+    const remotePort = origin.remotePort === undefined
+      ? undefined
+      : integer(origin.remotePort, 1, 65_535);
+    const localPort = origin.localPort === undefined
+      ? undefined
+      : integer(origin.localPort, 1, 65_535);
+    const terminalSession = origin.terminalSession === 'tmux' || origin.terminalSession === 'screen'
+      ? origin.terminalSession
+      : undefined;
+    if (
+      !LAUNCH_ORIGIN_TYPES.has(type) ||
+      !pid ||
+      !name ||
+      (origin.processGenerationKey !== undefined && !processGenerationKey) ||
+      (origin.restartCount !== undefined && restartCount === undefined) ||
+      (origin.remotePort !== undefined && remotePort === undefined) ||
+      (origin.localPort !== undefined && localPort === undefined) ||
+      (origin.terminalSession !== undefined && terminalSession === undefined)
+    ) return undefined;
+    const originProcess = pathByPid.get(pid);
+    if (!originProcess || (
+      processGenerationKey && originProcess.processGenerationKey !== processGenerationKey
+    )) return undefined;
+    return {
+      type,
+      processGenerationKey,
+      pid,
+      name,
+      description: cleanString(origin.description, 500),
+      unitFile: cleanString(origin.unitFile, 1_000),
+      restartCount,
+      schedule: cleanString(origin.schedule, 500),
+      remoteAddress: cleanString(origin.remoteAddress, 200),
+      remotePort,
+      localAddress: cleanString(origin.localAddress, 200),
+      localPort,
+      tty: cleanString(origin.tty, 500),
+      terminalSession,
+    };
+  });
+  if (origins.some((origin) => !origin)) return undefined;
+  return {
+    schemaVersion: 'anysentry.agent_launch_context.v1',
+    rootProcessGenerationKey,
+    observedAt,
+    completeness,
+    path: cleanPath,
+    origins: origins as AgentLaunchContext['origins'],
+  };
+}
+
 function stableValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stableValue);
   if (!value || typeof value !== 'object') return value;
@@ -246,6 +385,14 @@ function snapshotHash(snapshot: SanitizedRuntimeSnapshot): string {
 
 function cloneWorkloadRef(value?: AgentWorkloadRef): AgentWorkloadRef | undefined {
   return value ? { ...value } : undefined;
+}
+
+function cloneLaunchContext(value?: AgentLaunchContext): AgentLaunchContext | undefined {
+  return value ? {
+    ...value,
+    path: value.path.map((node) => ({ ...node })),
+    origins: value.origins.map((origin) => ({ ...origin })),
+  } : undefined;
 }
 
 function forwarderKey(collectorId: string, forwarderInstanceId: string): string {
@@ -914,6 +1061,12 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
     if (value.workloadRef !== undefined && (!value.workloadRef || typeof value.workloadRef !== 'object' || Array.isArray(value.workloadRef))) {
       return { reason: `${prefix}.workloadRef must be an object` };
     }
+    const launchContext = value.launchContext === undefined
+      ? undefined
+      : cleanLaunchContext(value.launchContext, rootPid);
+    if (value.launchContext !== undefined && !launchContext) {
+      return { reason: `${prefix}.launchContext is invalid` };
+    }
 
     return {
       entry: {
@@ -941,6 +1094,7 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
         source,
         evidence,
         workloadRef: cleanWorkloadRef(value.workloadRef),
+        launchContext,
       },
     };
   }
@@ -1051,6 +1205,7 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
         source: entry.source,
         evidence: entry.evidence ? [...entry.evidence] : undefined,
         workloadRef: cloneWorkloadRef(entry.workloadRef),
+        launchContext: cloneLaunchContext(entry.launchContext),
         receivedAt,
         forwarderKey: forwarder.key,
         reportedRuntimeState: entry.runtimeState,
@@ -1129,6 +1284,7 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
       ...rest,
       evidence: rest.evidence ? [...rest.evidence] : undefined,
       workloadRef: cloneWorkloadRef(rest.workloadRef),
+      launchContext: cloneLaunchContext(rest.launchContext),
       runtimeState,
       activityState,
     };
@@ -1142,6 +1298,7 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
         : undefined,
       evidence: record.evidence ? [...record.evidence] : undefined,
       workloadRef: cloneWorkloadRef(record.workloadRef),
+      launchContext: cloneLaunchContext(record.launchContext),
     };
   }
 

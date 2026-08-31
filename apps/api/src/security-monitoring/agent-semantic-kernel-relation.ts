@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 
 import type * as T from './types';
 
-export const AGENT_SEMANTIC_KERNEL_RELATION_VERSION = 1;
+export const AGENT_SEMANTIC_KERNEL_RELATION_VERSION = 2;
 const CLOCK_SKEW_MS = 2_000;
 const OPEN_TOOL_WINDOW_MS = 30 * 60_000;
 
@@ -134,37 +134,165 @@ function sameRuntime(
   return candidate.agentRuntimeInstanceAliases?.includes(interaction.agentInstanceId) === true;
 }
 
-function sameProcessDomain(
-  left: T.AgentEventListItem,
-  right: T.AgentEventListItem,
-): boolean {
-  if (left.process?.hostId && right.process?.hostId
-    && left.process.hostId !== right.process.hostId) return false;
-  if (left.process?.bootId && right.process?.bootId
-    && left.process.bootId !== right.process.bootId) return false;
-  return true;
+type RuntimeLink = 'direct_runtime' | 'generation_parent' | 'legacy_pid_parent';
+
+interface CandidateIndex {
+  byGeneration: Map<string, T.AgentEventListItem[]>;
+  byPidDomain: Map<string, T.AgentEventListItem[]>;
 }
 
-function runtimeMatch(
+export interface SemanticKernelRelationInput {
+  event: T.AgentSemanticEvent;
+  result?: T.AgentSemanticEvent;
+  interaction: T.AgentInteractionRecord;
+}
+
+export interface SemanticKernelRelationBatchResult {
+  relationsBySemanticEventId: Map<string, T.AgentSemanticKernelRelation[]>;
+  allRelations: T.AgentSemanticKernelRelation[];
+}
+
+export interface SemanticKernelRelationWindow {
+  startMs: number;
+  endMs: number;
+}
+
+function semanticEventAtMs(event: T.AgentSemanticEvent): number {
+  return Number(BigInt(event.atUnixNs) / 1_000_000n);
+}
+
+/** Cover every competing Tool interval so a complete batch can safely replace persisted owners. */
+export function semanticKernelRelationBatchWindow(
+  inputs: SemanticKernelRelationInput[],
+  fallback: SemanticKernelRelationInput,
+): SemanticKernelRelationWindow {
+  const bounded = inputs.length ? inputs.slice(0, 1_000) : [fallback];
+  return {
+    startMs: Math.max(0, Math.min(...bounded.map(({ event }) => semanticEventAtMs(event))) - CLOCK_SKEW_MS),
+    endMs: Math.max(...bounded.map(({ event, result }) => result
+      ? semanticEventAtMs(result)
+      : semanticEventAtMs(event) + OPEN_TOOL_WINDOW_MS)) + CLOCK_SKEW_MS,
+  };
+}
+
+function trustedProcessGenerationKey(
+  event: T.AgentEventListItem,
+  field: 'processGenerationKey' | 'parentProcessGenerationKey',
+): string | undefined {
+  const correlation = event.correlation ?? event.attribution?.correlation;
+  if (
+    !correlation ||
+    correlation.inferred ||
+    !['attested_observer', 'server_process_graph'].includes(correlation.authority)
+  ) return undefined;
+  if (
+    field === 'parentProcessGenerationKey' &&
+    event.attribution?.parentLinkAuthority !== 'forwarder_process_graph'
+  ) return undefined;
+  const value = text(event.attribution?.[field], 64);
+  return value && /^pgk_[a-f0-9]{24}$/u.test(value) ? value : undefined;
+}
+
+function processDomainPidKey(event: T.AgentEventListItem, pid = event.process?.pid): string | undefined {
+  if (!Number.isSafeInteger(pid) || Number(pid) <= 0) return undefined;
+  const hostId = text(event.process?.hostId, 512);
+  const bootId = text(event.process?.bootId, 512);
+  if (!hostId || !bootId) return undefined;
+  return [hostId, bootId, Number(pid)].join('\u0000');
+}
+
+function addIndex(
+  index: Map<string, T.AgentEventListItem[]>,
+  key: string | undefined,
+  event: T.AgentEventListItem,
+): void {
+  if (!key) return;
+  const values = index.get(key) ?? [];
+  values.push(event);
+  index.set(key, values);
+}
+
+function buildCandidateIndex(candidates: T.AgentEventListItem[]): CandidateIndex {
+  const index: CandidateIndex = {
+    byGeneration: new Map(),
+    byPidDomain: new Map(),
+  };
+  for (const candidate of candidates) {
+    addIndex(
+      index.byGeneration,
+      trustedProcessGenerationKey(candidate, 'processGenerationKey'),
+      candidate,
+    );
+    addIndex(index.byPidDomain, processDomainPidKey(candidate), candidate);
+  }
+  return index;
+}
+
+function hasGenerationEvidence(event: T.AgentEventListItem): boolean {
+  return Boolean(
+    trustedProcessGenerationKey(event, 'processGenerationKey') ||
+    trustedProcessGenerationKey(event, 'parentProcessGenerationKey') ||
+    text(event.process?.startTimeTicks, 512) ||
+    text(event.process?.startTimeNs, 512),
+  );
+}
+
+function generationRuntimeMatch(
   interaction: T.AgentInteractionRecord,
   candidate: T.AgentEventListItem,
-  candidates: T.AgentEventListItem[],
-): 'direct' | 'ancestry' | undefined {
-  if (sameRuntime(interaction, candidate)) return 'direct';
-  let current = candidate;
-  const seen = new Set<number>();
+  index: CandidateIndex,
+): RuntimeLink | undefined {
+  let parentKey = trustedProcessGenerationKey(candidate, 'parentProcessGenerationKey');
+  if (!parentKey) return undefined;
+  const seen = new Set<string>();
   for (let depth = 0; depth < 8; depth += 1) {
-    const parentPid = current.process?.ppid;
-    if (!parentPid || seen.has(parentPid)) return undefined;
-    seen.add(parentPid);
-    const parents = candidates.filter((event) =>
-      event.process?.pid === parentPid && sameProcessDomain(current, event));
-    if (parents.some((parent) => sameRuntime(interaction, parent))) return 'ancestry';
+    if (seen.has(parentKey)) return undefined;
+    seen.add(parentKey);
+    const parents = index.byGeneration.get(parentKey) ?? [];
+    if (parents.some((parent) => sameRuntime(interaction, parent))) return 'generation_parent';
+    parentKey = parents
+      .map((parent) => trustedProcessGenerationKey(parent, 'parentProcessGenerationKey'))
+      .find((value): value is string => Boolean(value));
+    if (!parentKey) return undefined;
+  }
+  return undefined;
+}
+
+function legacyPidRuntimeMatch(
+  interaction: T.AgentInteractionRecord,
+  candidate: T.AgentEventListItem,
+  index: CandidateIndex,
+): RuntimeLink | undefined {
+  let current = candidate;
+  const seen = new Set<string>();
+  for (let depth = 0; depth < 8; depth += 1) {
+    const parentKey = processDomainPidKey(current, current.process?.ppid);
+    if (!parentKey || seen.has(parentKey)) return undefined;
+    seen.add(parentKey);
+    const parents = (index.byPidDomain.get(parentKey) ?? [])
+      .filter((parent) => !hasGenerationEvidence(parent));
+    if (parents.some((parent) => sameRuntime(interaction, parent))) return 'legacy_pid_parent';
     const parent = parents.find((event) => event.process?.ppid);
     if (!parent) return undefined;
     current = parent;
   }
   return undefined;
+}
+
+function runtimeMatch(
+  interaction: T.AgentInteractionRecord,
+  candidate: T.AgentEventListItem,
+  index: CandidateIndex,
+): RuntimeLink | undefined {
+  if (sameRuntime(interaction, candidate)) return 'direct_runtime';
+  const exact = generationRuntimeMatch(interaction, candidate, index);
+  if (exact) return exact;
+  // A current-generation fact without a verified parent key is a coverage gap. Falling back to a
+  // same-PID event would cross PID reuse and recreate the false ancestry this relation is meant to
+  // prevent. Legacy rows with no generation evidence retain the old bounded PID walk at lower
+  // confidence.
+  if (hasGenerationEvidence(candidate)) return undefined;
+  return legacyPidRuntimeMatch(interaction, candidate, index);
 }
 
 function withinWindow(
@@ -204,14 +332,13 @@ export function toolInvocationId(
   ].join('\u0000'));
 }
 
-export function buildSemanticKernelRelations(
-  event: T.AgentSemanticEvent,
-  result: T.AgentSemanticEvent | undefined,
-  interaction: T.AgentInteractionRecord,
-  candidates: T.AgentEventListItem[],
+function potentialRelation(
+  input: SemanticKernelRelationInput,
+  candidate: T.AgentEventListItem,
+  index: CandidateIndex,
   resolutionRevision: number,
-  coveragePartial = false,
-): T.AgentSemanticKernelRelation[] {
+): T.AgentSemanticKernelRelation | undefined {
+  const { event, result, interaction } = input;
   const invocationId = toolInvocationId(event, interaction);
   const command = toolCommand(event);
   const resource = toolResource(event);
@@ -224,72 +351,164 @@ export function buildSemanticKernelRelations(
       : /search|http|fetch|network/u.test(normalizedTool)
         ? new Set(['Egress', 'Dns', 'Tls'])
         : new Set(['ToolExec', 'FileAccess', 'FileDelete', 'Egress', 'Dns', 'Tls']);
-  const relations: T.AgentSemanticKernelRelation[] = [];
-  for (const candidate of candidates) {
-    if (!acceptedKinds.has(candidate.eventKind) || !withinWindow(event, result, candidate)) continue;
-    const runtimeLink = runtimeMatch(interaction, candidate, candidates);
-    if (!runtimeLink) continue;
-    let linkMethod: T.AgentSemanticKernelRelation['linkMethod'];
-    let confidence = 0;
-    if (command && candidate.eventKind === 'ToolExec') {
-      const expected = normalizedCommand(command);
-      const observed = normalizedCommand(candidate.subject);
-      if (expected && observed && (
-        expected === observed || observed.includes(expected) || expected.includes(observed)
-      )) {
-        linkMethod = 'command';
-        confidence = expected === observed ? 1 : 0.98;
-      }
-    }
-    if (!linkMethod && resource && ['FileAccess', 'FileDelete'].includes(candidate.eventKind)) {
-      const expected = resource.replace(/\/+/gu, '/');
-      const observed = candidatePath(candidate)?.replace(/\/+/gu, '/');
-      if (observed && observed === expected) {
-        linkMethod = 'resource';
-        confidence = 1;
-      }
-    }
-    if (!linkMethod && host && ['Egress', 'Dns', 'Tls'].includes(candidate.eventKind)) {
-      const observed = candidateHost(candidate);
-      if (observed && (observed === host || observed.endsWith('.' + host) || host.endsWith('.' + observed))) {
-        linkMethod = 'network';
-        confidence = 0.98;
-      }
-    }
-    if (!linkMethod) continue;
-    if (runtimeLink === 'ancestry') confidence = Math.min(confidence, 0.99);
-    relations.push({
-      schemaVersion: 'anysentry.agent_semantic_kernel_relation.v1',
-      relationId: stableId('skr', event.semanticEventId + '\u0000' + candidate.eventId),
-      stableSemanticEventId: event.semanticEventId,
-      conversationId: event.conversationId,
-      turnId: event.turnId,
-      toolInvocationId: invocationId,
-      kernelEventId: candidate.eventId,
-      status: confidence === 1 ? 'linked_exact' : 'linked_strong',
-      linkMethod,
-      confidence,
-      authority: 'attested_tls_plaintext',
-      relationVersion: AGENT_SEMANTIC_KERNEL_RELATION_VERSION,
-      resolutionRevision,
-      risk: risk(candidate),
-    });
+  if (!acceptedKinds.has(candidate.eventKind) || !withinWindow(event, result, candidate)) {
+    return undefined;
   }
-  if (relations.length) return relations.sort((left, right) =>
-    (right.risk?.riskScore ?? 0) - (left.risk?.riskScore ?? 0)
-    || (right.confidence - left.confidence)
-    || (left.kernelEventId ?? '').localeCompare(right.kernelEventId ?? ''));
-  return [{
+
+  // Content is cheaper and more selective than ancestry. Filter it first so generation-safe
+  // lineage does not turn a bounded query into repeated full-candidate scans.
+  let linkMethod: T.AgentSemanticKernelRelation['linkMethod'];
+  let confidence = 0;
+  if (command && candidate.eventKind === 'ToolExec') {
+    const expected = normalizedCommand(command);
+    const observed = normalizedCommand(candidate.subject);
+    if (expected && observed && (
+      expected === observed || observed.includes(expected) || expected.includes(observed)
+    )) {
+      linkMethod = 'command';
+      confidence = expected === observed ? 1 : 0.98;
+    }
+  }
+  if (!linkMethod && resource && ['FileAccess', 'FileDelete'].includes(candidate.eventKind)) {
+    const expected = resource.replace(/\/+/gu, '/');
+    const observed = candidatePath(candidate)?.replace(/\/+/gu, '/');
+    if (observed && observed === expected) {
+      linkMethod = 'resource';
+      confidence = 1;
+    }
+  }
+  if (!linkMethod && host && ['Egress', 'Dns', 'Tls'].includes(candidate.eventKind)) {
+    const observed = candidateHost(candidate);
+    if (observed && (observed === host || observed.endsWith('.' + host) || host.endsWith('.' + observed))) {
+      linkMethod = 'network';
+      confidence = 0.98;
+    }
+  }
+  if (!linkMethod) return undefined;
+
+  const runtimeLink = runtimeMatch(interaction, candidate, index);
+  if (!runtimeLink) return undefined;
+  if (runtimeLink === 'generation_parent') confidence = Math.min(confidence, 0.99);
+  if (runtimeLink === 'legacy_pid_parent') confidence = Math.min(confidence, 0.75);
+  return {
     schemaVersion: 'anysentry.agent_semantic_kernel_relation.v1',
-    relationId: stableId('skr', event.semanticEventId + '\u0000unlinked'),
+    relationId: stableId('skr', event.semanticEventId + '\u0000' + candidate.eventId),
     stableSemanticEventId: event.semanticEventId,
     conversationId: event.conversationId,
     turnId: event.turnId,
+    toolInvocationId: invocationId,
+    kernelEventId: candidate.eventId,
+    status: confidence === 1 ? 'linked_exact' : 'linked_strong',
+    linkMethod,
+    lineageMethod: runtimeLink,
+    confidence,
+    authority: 'attested_tls_plaintext',
+    relationVersion: AGENT_SEMANTIC_KERNEL_RELATION_VERSION,
+    resolutionRevision,
+    risk: risk(candidate),
+  };
+}
+
+function unlinkedRelation(
+  input: SemanticKernelRelationInput,
+  resolutionRevision: number,
+  coveragePartial: boolean,
+): T.AgentSemanticKernelRelation {
+  const invocationId = toolInvocationId(input.event, input.interaction);
+  return {
+    schemaVersion: 'anysentry.agent_semantic_kernel_relation.v1',
+    relationId: stableId('skr', input.event.semanticEventId + '\u0000unlinked'),
+    stableSemanticEventId: input.event.semanticEventId,
+    conversationId: input.event.conversationId,
+    turnId: input.event.turnId,
     toolInvocationId: invocationId,
     status: coveragePartial ? 'coverage_gap' : 'semantic_only',
     confidence: 0,
     authority: 'attested_tls_plaintext',
     relationVersion: AGENT_SEMANTIC_KERNEL_RELATION_VERSION,
     resolutionRevision,
-  }];
+  };
+}
+
+function sortRelations(relations: T.AgentSemanticKernelRelation[]): T.AgentSemanticKernelRelation[] {
+  return relations.sort((left, right) =>
+    (right.risk?.riskScore ?? 0) - (left.risk?.riskScore ?? 0)
+    || (right.confidence - left.confidence)
+    || (left.kernelEventId ?? '').localeCompare(right.kernelEventId ?? ''));
+}
+
+export function buildSemanticKernelRelationBatch(
+  inputs: SemanticKernelRelationInput[],
+  candidates: T.AgentEventListItem[],
+  resolutionRevision: number,
+  coveragePartial = false,
+): SemanticKernelRelationBatchResult {
+  const boundedInputs = inputs.slice(0, 1_000);
+  const index = buildCandidateIndex(candidates);
+  const potentialBySemantic = new Map<string, T.AgentSemanticKernelRelation[]>();
+  const ownersByKernel = new Map<string, Set<string>>();
+  const invocationBySemantic = new Map<string, string>();
+
+  for (const input of boundedInputs) {
+    const semanticId = input.event.semanticEventId;
+    invocationBySemantic.set(semanticId, toolInvocationId(input.event, input.interaction));
+    const relations = candidates
+      .map((candidate) => potentialRelation(input, candidate, index, resolutionRevision))
+      .filter((relation): relation is T.AgentSemanticKernelRelation => Boolean(relation));
+    potentialBySemantic.set(semanticId, relations);
+    for (const relation of relations) {
+      if (!relation.kernelEventId) continue;
+      const owners = ownersByKernel.get(relation.kernelEventId) ?? new Set<string>();
+      owners.add(semanticId);
+      ownersByKernel.set(relation.kernelEventId, owners);
+    }
+  }
+
+  const relationsBySemanticEventId = new Map<string, T.AgentSemanticKernelRelation[]>();
+  for (const input of boundedInputs) {
+    const semanticId = input.event.semanticEventId;
+    const resolved = (potentialBySemantic.get(semanticId) ?? []).map((relation) => {
+      const owners = relation.kernelEventId
+        ? ownersByKernel.get(relation.kernelEventId) ?? new Set<string>()
+        : new Set<string>();
+      if (owners.size <= 1) return relation;
+      return {
+        ...relation,
+        status: 'ambiguous' as const,
+        confidence: 0,
+        risk: undefined,
+        competingToolInvocationIds: [...owners]
+          .map((owner) => invocationBySemantic.get(owner))
+          .filter((value): value is string => Boolean(value))
+          .sort(),
+      };
+    });
+    relationsBySemanticEventId.set(
+      semanticId,
+      resolved.length
+        ? sortRelations(resolved)
+        : [unlinkedRelation(input, resolutionRevision, coveragePartial)],
+    );
+  }
+
+  return {
+    relationsBySemanticEventId,
+    allRelations: [...relationsBySemanticEventId.values()].flat(),
+  };
+}
+
+export function buildSemanticKernelRelations(
+  event: T.AgentSemanticEvent,
+  result: T.AgentSemanticEvent | undefined,
+  interaction: T.AgentInteractionRecord,
+  candidates: T.AgentEventListItem[],
+  resolutionRevision: number,
+  coveragePartial = false,
+): T.AgentSemanticKernelRelation[] {
+  return buildSemanticKernelRelationBatch(
+    [{ event, result, interaction }],
+    candidates,
+    resolutionRevision,
+    coveragePartial,
+  ).relationsBySemanticEventId.get(event.semanticEventId) ?? [];
 }

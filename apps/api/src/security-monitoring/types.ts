@@ -182,6 +182,7 @@ export interface ClassificationSemanticsV1 {
   unknownReason?: UnknownReason;
 }
 export type ProcessLifecycleSource = 'exec_process_key' | 'exec_tombstone';
+export type ProcessGenerationLinkAuthority = 'forwarder_process_graph';
 export type AgentReviewDecision = 'confirmed_agent' | 'unknown' | 'non_agent';
 export interface AgentReviewRevisionRecord {
   revision: number;
@@ -294,6 +295,11 @@ export interface AgentAttribution {
   workloadRef?: AgentWorkloadRef;
   rootPid?: number;
   rootStartTime?: string;
+  /** Forwarder-observed concrete Process generation; trusted only after Source authentication. */
+  processGenerationKey?: string;
+  /** Exact parent generation observed by the Forwarder process graph. */
+  parentProcessGenerationKey?: string;
+  parentLinkAuthority?: ProcessGenerationLinkAuthority;
   confidence: number;
   reason: AgentAttributionReason;
   source: AgentAttributionSource;
@@ -345,6 +351,51 @@ export interface WorkloadIdentitySnapshot {
   errors: number;
 }
 
+export type AgentLaunchOriginType =
+  | 'service_manager'
+  | 'systemd_unit'
+  | 'ssh_session'
+  | 'shell'
+  | 'supervisor'
+  | 'cron'
+  | 'container';
+
+export interface AgentLaunchPathNode {
+  processGenerationKey?: string;
+  pid: number;
+  ppid: number;
+  command: string;
+  exe?: string;
+  systemdUnit?: string;
+}
+
+export interface AgentLaunchOrigin {
+  type: AgentLaunchOriginType;
+  processGenerationKey?: string;
+  pid: number;
+  name: string;
+  description?: string;
+  unitFile?: string;
+  restartCount?: number;
+  schedule?: string;
+  /** SSH allowlist projection only; the Forwarder never transmits the complete environment. */
+  remoteAddress?: string;
+  remotePort?: number;
+  localAddress?: string;
+  localPort?: number;
+  tty?: string;
+  terminalSession?: 'tmux' | 'screen';
+}
+
+export interface AgentLaunchContext {
+  schemaVersion: 'anysentry.agent_launch_context.v1';
+  rootProcessGenerationKey: string;
+  observedAt: string;
+  completeness: 'complete' | 'missing_parent' | 'cycle' | 'depth_limit' | 'process_domain_conflict';
+  path: AgentLaunchPathNode[];
+  origins: AgentLaunchOrigin[];
+}
+
 /**
  * One root-process instance reported by an observer forwarder.
  *
@@ -376,6 +427,7 @@ export interface AgentRuntimeSnapshotEntry {
   source?: AgentAttributionSource;
   evidence?: string[];
   workloadRef?: AgentWorkloadRef;
+  launchContext?: AgentLaunchContext;
 }
 
 export interface AgentRuntimeLeaseRequest {
@@ -1865,9 +1917,11 @@ export interface AgentSemanticKernelRelation {
   kernelEventId?: string;
   status: AgentSemanticKernelRelationStatus;
   linkMethod?: 'command' | 'resource' | 'network';
+  lineageMethod?: 'direct_runtime' | 'generation_parent' | 'legacy_pid_parent';
+  competingToolInvocationIds?: string[];
   confidence: number;
   authority: 'attested_tls_plaintext';
-  relationVersion: 1;
+  relationVersion: 1 | 2;
   resolutionRevision: number;
   risk?: {
     verdict: Verdict;
@@ -2942,6 +2996,12 @@ export interface CollectorFilterMetrics {
   processBootstrapProcReads: number;
   processFallbackProcReads: number;
   processAncestryProcReads: number;
+  processLaunchContextProcReads?: number;
+  processLaunchContextEnvironmentReads?: number;
+  launchSystemdQueries?: number;
+  launchSystemdCacheHits?: number;
+  launchSystemdErrors?: number;
+  launchSystemdCacheEntries?: number;
   processRootsDiscovered?: number;
   processRootsExited?: number;
   processRootsLost?: number;

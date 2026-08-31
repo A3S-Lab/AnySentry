@@ -610,6 +610,9 @@ const PROCESS_LIFECYCLE_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${PROCESS_LIFECYC
   rootProcess UInt8 DEFAULT 0,
   identityRevision UInt64 DEFAULT 0,
   processInstanceKey String,
+  processGenerationKey String DEFAULT '',
+  parentProcessGenerationKey String DEFAULT '',
+  parentLinkAuthority LowCardinality(String) DEFAULT '',
   physicalWorkloadId String,
   hostId String,
   bootId String,
@@ -646,6 +649,9 @@ const PROCESS_LIFECYCLE_FACT_ALTERS = [
   'ADD COLUMN IF NOT EXISTS runtimeInstanceId String DEFAULT \'\'',
   'ADD COLUMN IF NOT EXISTS rootProcess UInt8 DEFAULT 0',
   'ADD COLUMN IF NOT EXISTS identityRevision UInt64 DEFAULT 0',
+  'ADD COLUMN IF NOT EXISTS processGenerationKey String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS parentProcessGenerationKey String DEFAULT \'\'',
+  'ADD COLUMN IF NOT EXISTS parentLinkAuthority LowCardinality(String) DEFAULT \'\'',
 ];
 
 // Startup progress hydration must stay independent of the cardinality of the 90-day event table.
@@ -4576,6 +4582,15 @@ export class ClickHouseStore {
       ...(Number(row.rootProcess) > 0 ? { rootProcess: true } : {}),
       ...(Number(row.identityRevision) > 0 ? { identityRevision: Number(row.identityRevision) } : {}),
       processInstanceKey: String(row.processInstanceKey ?? ''),
+      ...(String(row.processGenerationKey ?? '')
+        ? { processGenerationKey: String(row.processGenerationKey) }
+        : {}),
+      ...(String(row.parentProcessGenerationKey ?? '')
+        ? { parentProcessGenerationKey: String(row.parentProcessGenerationKey) }
+        : {}),
+      ...(row.parentLinkAuthority === 'forwarder_process_graph'
+        ? { parentLinkAuthority: row.parentLinkAuthority }
+        : {}),
       ...(String(row.physicalWorkloadId ?? '') ? { physicalWorkloadId: String(row.physicalWorkloadId) } : {}),
       ...(String(row.hostId ?? '') ? { hostId: String(row.hostId) } : {}),
       bootId: String(row.bootId ?? ''),
@@ -4625,6 +4640,9 @@ export class ClickHouseStore {
           rootProcess: fact.rootProcess === true ? 1 : 0,
           identityRevision: fact.identityRevision ?? 0,
           processInstanceKey: fact.processInstanceKey,
+          processGenerationKey: fact.processGenerationKey ?? '',
+          parentProcessGenerationKey: fact.parentProcessGenerationKey ?? '',
+          parentLinkAuthority: fact.parentLinkAuthority ?? '',
           physicalWorkloadId: fact.physicalWorkloadId ?? '',
           hostId: fact.hostId ?? '',
           bootId: fact.bootId,

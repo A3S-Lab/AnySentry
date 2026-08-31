@@ -67,7 +67,9 @@ import {
 import { AgentConversationBindingService } from './agent-conversation-binding.service';
 import { RelationalBusinessStore } from './relational-business-store.service';
 import {
+  buildSemanticKernelRelationBatch,
   buildSemanticKernelRelations,
+  semanticKernelRelationBatchWindow,
   toolInvocationId,
 } from './agent-semantic-kernel-relation';
 import {
@@ -2375,10 +2377,36 @@ export class AggregationService {
     if (!interaction) return undefined;
     const callAt = Number(BigInt(call.atUnixNs) / 1_000_000n);
     const resultAt = result ? Number(BigInt(result.atUnixNs) / 1_000_000n) : undefined;
+    const relationInputs = events
+      .filter((event) => event.kind === 'tool_call')
+      .map((event) => {
+        const owner = event.sourceInteractionIds
+          .map((interactionId) => records.find((record) => record.interactionId === interactionId))
+          .find((record): record is T.AgentInteractionRecord => Boolean(record));
+        if (!owner) return undefined;
+        const eventResult = event.toolCallId
+          ? events.find((candidate) => candidate.kind === 'tool_result'
+              && candidate.toolCallId === event.toolCallId)
+          : undefined;
+        const eventAt = Number(BigInt(event.atUnixNs) / 1_000_000n);
+        const eventResultAt = eventResult
+          ? Number(BigInt(eventResult.atUnixNs) / 1_000_000n)
+          : eventAt + 30 * 60_000;
+        const selectedWindowStart = callAt - 2_000;
+        const selectedWindowEnd = (resultAt ?? (callAt + 30 * 60_000)) + 2_000;
+        if (eventAt > selectedWindowEnd || eventResultAt < selectedWindowStart) return undefined;
+        return { event, result: eventResult, interaction: owner };
+      })
+      .filter((item): item is NonNullable<typeof item> => Boolean(item))
+      .slice(0, 1_000);
+    const relationWindow = semanticKernelRelationBatchWindow(
+      relationInputs,
+      { event: call, result, interaction },
+    );
     let kernel = await this.storedAgentEvents({
       timeType: 'custom',
-      startTime: new Date(Math.max(0, callAt - 2_000)).toISOString(),
-      endTime: new Date((resultAt ?? (callAt + 30 * 60_000)) + 2_000).toISOString(),
+      startTime: new Date(relationWindow.startMs).toISOString(),
+      endTime: new Date(relationWindow.endMs).toISOString(),
       scope: 'agent',
       classificationView: query.classificationView,
       agentInstanceId: interaction.agentInstanceId,
@@ -2386,35 +2414,43 @@ export class AggregationService {
       limit: 1_000,
     });
     const resolutionRevision = this.conversationBindings?.currentResolutionRevision() ?? 0;
-    let relations = buildSemanticKernelRelations(
-      call,
-      result,
-      interaction,
+    let relationBatch = buildSemanticKernelRelationBatch(
+      relationInputs,
       kernel.items,
       resolutionRevision,
       kernel.coverage.partial,
     );
+    let relations = relationBatch.relationsBySemanticEventId.get(call.semanticEventId)
+      ?? buildSemanticKernelRelations(
+        call,
+        result,
+        interaction,
+        kernel.items,
+        resolutionRevision,
+        kernel.coverage.partial,
+      );
     if (!relations.some((relation) => relation.kernelEventId)) {
       const ancestryKernel = await this.storedAgentEvents({
         timeType: 'custom',
-        startTime: new Date(Math.max(0, callAt - 2_000)).toISOString(),
-        endTime: new Date((resultAt ?? (callAt + 30_000)) + 2_000).toISOString(),
+        startTime: new Date(relationWindow.startMs).toISOString(),
+        endTime: new Date(relationWindow.endMs).toISOString(),
         scope: 'agent',
         classificationView: query.classificationView,
         durable: true,
         limit: 1_000,
       });
-      const ancestryRelations = buildSemanticKernelRelations(
-        call,
-        result,
-        interaction,
+      const ancestryBatch = buildSemanticKernelRelationBatch(
+        relationInputs,
         ancestryKernel.items,
         resolutionRevision,
         ancestryKernel.coverage.partial,
       );
+      const ancestryRelations = ancestryBatch.relationsBySemanticEventId.get(call.semanticEventId)
+        ?? [];
       if (ancestryRelations.some((relation) => relation.kernelEventId)) {
         kernel = ancestryKernel;
         relations = ancestryRelations;
+        relationBatch = ancestryBatch;
       }
     }
     const persistedRelations = this.relationalStore?.configured()
@@ -2424,8 +2460,8 @@ export class AggregationService {
       && !relations.some((relation) => relation.kernelEventId)
       && persistedRelations.some((relation) => relation.kernelEventId)) {
       relations = persistedRelations;
-    } else if (this.relationalStore?.configured()) {
-      await this.relationalStore.saveAgentSemanticKernelRelations(relations);
+    } else if (this.relationalStore?.configured() && !kernel.coverage.partial) {
+      await this.relationalStore.saveAgentSemanticKernelRelations(relationBatch.allRelations);
     }
     const linkedEventIds = new Set(relations
       .map((relation) => relation.kernelEventId)

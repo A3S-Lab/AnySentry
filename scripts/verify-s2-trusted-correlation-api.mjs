@@ -2,6 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { canonicalizeEvent } from '../apps/api/dist/security-monitoring/streaming-normalizer.js';
+import { processLifecycleFact } from '../apps/api/dist/security-monitoring/process-lifecycle.js';
 import { managementAuthHeaders, safeProbeId } from './probe-id.mjs';
 
 const baseUrl = (
@@ -1305,6 +1306,11 @@ async function ingestRuntimeEvent(observer, spec) {
       reason: 'authoritative_anchor',
       source: 'process_graph',
       evidence: ['observer:verified-runtime-root'],
+      ...(spec.processGenerationKey ? { processGenerationKey: spec.processGenerationKey } : {}),
+      ...(spec.parentProcessGenerationKey ? {
+        parentProcessGenerationKey: spec.parentProcessGenerationKey,
+        parentLinkAuthority: 'forwarder_process_graph',
+      } : {}),
     },
   }, sourceHeaders(observer.source.sourceId, observer.token));
   check(
@@ -1316,6 +1322,7 @@ async function ingestRuntimeEvent(observer, spec) {
 }
 
 async function verifyRuntimeSeparation(observer) {
+  const rootAGenerationKey = `pgk_${'1'.repeat(24)}`;
   const [rootA, rootB, pidReuse] = await Promise.all([
     ingestRuntimeEvent(observer, {
       suffix: 'root-a',
@@ -1325,6 +1332,7 @@ async function verifyRuntimeSeparation(observer) {
       rootPid: 61_001,
       startTimeTicks: '100001',
       rootStartTime: '100001',
+      processGenerationKey: rootAGenerationKey,
     }),
     ingestRuntimeEvent(observer, {
       suffix: 'root-b',
@@ -1374,6 +1382,36 @@ async function verifyRuntimeSeparation(observer) {
     'trusted correlation references the existing Canonical ProcessInstance identity',
     aCorrelation?.processInstanceId === canonicalA.processIdentity.processInstanceId,
     { correlation: aCorrelation, processIdentity: canonicalA.processIdentity },
+  );
+
+  const childGenerationKey = `pgk_${'2'.repeat(24)}`;
+  const childResult = await ingestRuntimeEvent(observer, {
+    suffix: 'root-a-child-generation-link',
+    agentScopeId: `${runId}-agent-a`,
+    sessionId: `${runId}-root-a-session`,
+    pid: 61_002,
+    rootPid: 61_001,
+    startTimeTicks: '100002',
+    rootStartTime: '100001',
+    processGenerationKey: childGenerationKey,
+    parentProcessGenerationKey: rootAGenerationKey,
+  });
+  const child = childResult.event;
+  check(
+    'authenticated Observer ingest preserves the exact child-to-parent generation edge',
+    correlationOf(child)?.authority === 'attested_observer' &&
+      child.attribution?.processGenerationKey === childGenerationKey &&
+      child.attribution?.parentProcessGenerationKey === rootAGenerationKey &&
+      child.attribution?.parentLinkAuthority === 'forwarder_process_graph',
+    child,
+  );
+  const childFact = processLifecycleFact(toJudgedEvent(child));
+  check(
+    'the authenticated edge survives the API event-to-lifecycle fact boundary',
+    childFact?.processGenerationKey === childGenerationKey &&
+      childFact?.parentProcessGenerationKey === rootAGenerationKey &&
+      childFact?.parentLinkAuthority === 'forwarder_process_graph',
+    childFact,
   );
 }
 

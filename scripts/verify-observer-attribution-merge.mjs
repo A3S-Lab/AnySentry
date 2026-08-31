@@ -24,6 +24,9 @@ function probableProcess(overrides = {}) {
       rootPid: 4_200,
       rootKey: '["host-a","boot-a",4200,"420"]',
       rootGeneration: 1,
+      processGenerationKey: `pgk_${'a'.repeat(24)}`,
+      parentProcessGenerationKey: `pgk_${'b'.repeat(24)}`,
+      parentLinkAuthority: 'forwarder_process_graph',
       evidence: ['process_lineage:agent_root', 'shared:evidence'],
       ...overrides,
     },
@@ -64,6 +67,9 @@ function probableProcess(overrides = {}) {
   assert.equal(result.attribution.rootPid, 4_200);
   assert.equal(result.attribution.rootKey, '["host-a","boot-a",4200,"420"]');
   assert.equal(result.attribution.rootGeneration, 1);
+  assert.equal(result.attribution.processGenerationKey, process.attribution.processGenerationKey);
+  assert.equal(result.attribution.parentProcessGenerationKey, process.attribution.parentProcessGenerationKey);
+  assert.equal(result.attribution.parentLinkAuthority, 'forwarder_process_graph');
   assert.equal(result.attribution.physicalWorkloadId, 'docker:host-a:container-123');
   assert.deepEqual(result.attribution.workloadRef, docker.attribution.workloadRef);
   assert.equal(result.workspacePath, '/workspace/repository');

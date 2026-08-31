@@ -36,6 +36,7 @@ const {
   WorkloadIdentityCache,
 } = require('./observer-workload-filter');
 const { InfrastructureRootResolver } = require('./observer-infrastructure-roots');
+const { SystemdLaunchEnricher } = require('./observer-systemd-enrichment');
 const { InfrastructurePolicyRegistry } = require('./observer-infrastructure-policy');
 const { alwaysKeepEventKind } = require('./observer-infrastructure-rules');
 const { FilterRulePublisher } = require('./observer-filter-rules');
@@ -520,6 +521,7 @@ const dockerDiscovery = new DockerDiscovery({
 const behaviorDetector = new BehavioralAgentDetector();
 const unifiedFilterPolicy = new UnifiedFilterPolicyRegistry();
 const infrastructureResolver = new InfrastructureRootResolver();
+const systemdLaunchEnricher = new SystemdLaunchEnricher();
 const infrastructurePolicy = new InfrastructurePolicyRegistry({
   hostGroup:
     process.env.ANYSENTRY_INFRASTRUCTURE_HOST_GROUP ||
@@ -1785,18 +1787,19 @@ async function acquireRuntimeLease(maxAttempts = 1) {
   }
 }
 
-function runtimeSnapshotBody(ready = true) {
+async function runtimeSnapshotBody(ready = true) {
   runtimeSnapshotVersion += 1;
   const processSnapshot = attributor.runtimeSnapshot();
+  const enrichedProcessEntries = await systemdLaunchEnricher.enrichEntries(processSnapshot.entries);
   const rootedWorkloads = new Set(
-    processSnapshot.entries.map((entry) => entry.physicalWorkloadId).filter(Boolean),
+    enrichedProcessEntries.map((entry) => entry.physicalWorkloadId).filter(Boolean),
   );
   const workloadRuntimes = workloadCache
     .agentRuntimeInventory()
     .filter((entry) => !rootedWorkloads.has(entry.physicalWorkloadId));
   return {
     ...processSnapshot,
-    entries: [...processSnapshot.entries, ...workloadRuntimes],
+    entries: [...enrichedProcessEntries, ...workloadRuntimes],
     collectorId: COLLECTOR_ID || NODE_NAME || 'observer-forwarder',
     forwarderInstanceId,
     leaseEpoch: runtimeLeaseEpoch,
@@ -1833,7 +1836,7 @@ function sendRuntimeSnapshot(ready = true, done = () => {}, timeoutMs = CONTROL_
       finish(true);
       return;
     }
-    const body = runtimeSnapshotBody(ready);
+    const body = await runtimeSnapshotBody(ready);
     const deadline = Date.now() + Math.max(100, timeoutMs);
     const maxAttempts = 2;
     const postSnapshot = (attempt, retryReason = '') => {
@@ -2120,6 +2123,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
   const behavior = behaviorDetector.metrics();
   const templates = templateRegistry.metrics();
   const processes = attributor.metrics();
+  const launchSystemd = systemdLaunchEnricher.metrics();
   const filterRules = filterRulePublisher.metrics();
   const captureProfileReports = captureProfileReporter.metrics();
   const infrastructureRules = infrastructurePolicy.metrics();
@@ -2355,6 +2359,12 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         processBootstrapProcReads: processes.bootstrapProcReads,
         processFallbackProcReads: processes.fallbackProcReads,
         processAncestryProcReads: processes.ancestryProcReads,
+        processLaunchContextProcReads: processes.launchContextProcReads,
+        processLaunchContextEnvironmentReads: processes.launchContextEnvironmentReads,
+        launchSystemdQueries: launchSystemd.queries,
+        launchSystemdCacheHits: launchSystemd.cacheHits,
+        launchSystemdErrors: launchSystemd.errors,
+        launchSystemdCacheEntries: launchSystemd.cacheEntries,
         processRootsDiscovered: processes.rootsDiscovered,
         processRootsExited: processes.rootsExited,
         processRootsLost: processes.rootsLost,
@@ -2401,7 +2411,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         infrastructure: classifications.infrastructure,
         workspaceConflict: classifications.workspaceConflict,
       },
-      message: `filter_mode=${FILTER_MODE}; ${e2eMarkerScopeMessage}retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_unknown=${classifications.filteredUnknown}; would_filter_unknown=${classifications.wouldFilterUnknown}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; aggregated_file_events=${classifications.aggregatedFileEvents}; aggregation_outputs=${classifications.aggregationOutputs}; filter_rule_version=${filterRules.version}; filter_rule_entries=${filterRules.entries}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; queue_parked=${classifications.queueParked}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; retry_queued=${classifications.retryQueued}; retry_attempts=${classifications.retryAttempts}; retry_recovered=${classifications.retryRecovered}; retry_exhausted=${classifications.retryExhausted}; retry_parked=${classifications.retryParked}; heartbeat_delivery_failures=${classifications.heartbeatDeliveryFailures}; spool_records=${spoolMetrics.records}; spool_parked=${spoolMetrics.parkedRecords}; spool_oldest_ms=${spoolMetrics.oldestAgeMs}; retry_queue_depth=${eventQueues.retryQueueDepth}; retry_outstanding=${eventQueues.retryOutstandingEvents}; outstanding_events=${eventQueues.outstandingEvents}; outstanding_bytes=${eventQueues.outstandingBytes}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
+      message: `filter_mode=${FILTER_MODE}; ${e2eMarkerScopeMessage}retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_unknown=${classifications.filteredUnknown}; would_filter_unknown=${classifications.wouldFilterUnknown}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; aggregated_file_events=${classifications.aggregatedFileEvents}; aggregation_outputs=${classifications.aggregationOutputs}; filter_rule_version=${filterRules.version}; filter_rule_entries=${filterRules.entries}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; queue_parked=${classifications.queueParked}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; retry_queued=${classifications.retryQueued}; retry_attempts=${classifications.retryAttempts}; retry_recovered=${classifications.retryRecovered}; retry_exhausted=${classifications.retryExhausted}; retry_parked=${classifications.retryParked}; heartbeat_delivery_failures=${classifications.heartbeatDeliveryFailures}; spool_records=${spoolMetrics.records}; spool_parked=${spoolMetrics.parkedRecords}; spool_oldest_ms=${spoolMetrics.oldestAgeMs}; retry_queue_depth=${eventQueues.retryQueueDepth}; retry_outstanding=${eventQueues.retryOutstandingEvents}; outstanding_events=${eventQueues.outstandingEvents}; outstanding_bytes=${eventQueues.outstandingBytes}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; process_launch_context_proc_reads=${processes.launchContextProcReads}; process_launch_context_environment_reads=${processes.launchContextEnvironmentReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
   };
   pendingHeartbeatDelivery = { body: heartbeatBody, shutdownFinal };

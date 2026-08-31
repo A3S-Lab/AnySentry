@@ -597,6 +597,30 @@ const numericStringPid = transitions.recordSnapshot(snapshot('transition-forward
 }], { leaseEpoch: transitionLease.leaseEpoch }));
 assert.equal(numericStringPid.accepted, false);
 assert.equal(numericStringPid.reasonCode, 'validation_error');
+const mismatchedLaunchRoot = {
+  ...transitionRoot,
+  launchContext: {
+    schemaVersion: 'anysentry.agent_launch_context.v1',
+    rootProcessGenerationKey: `pgk_${'1'.repeat(24)}`,
+    observedAt: new Date(now).toISOString(),
+    completeness: 'complete',
+    path: [{
+      processGenerationKey: `pgk_${'2'.repeat(24)}`,
+      pid: transitionRoot.rootPid,
+      ppid: 1,
+      command: 'codex',
+    }],
+    origins: [],
+  },
+};
+const mismatchedLaunchContext = transitions.recordSnapshot(snapshot(
+  'transition-forwarder',
+  2,
+  [mismatchedLaunchRoot],
+  { leaseEpoch: transitionLease.leaseEpoch },
+));
+assert.equal(mismatchedLaunchContext.accepted, false);
+assert.equal(mismatchedLaunchContext.reasonCode, 'validation_error');
 
 // Durable history keeps exact process generations after hot terminal retention and restores them
 // as historical/unobserved state after an API restart.
@@ -624,12 +648,50 @@ const durableLease = issueLease(durable, 'durable-forwarder', {
   forwarderPid: 36_001,
   forwarderStartTimeTicks: '1000',
 });
-const durableRoot = runtimeEntry('901', 'exited', { rootGeneration: 2 });
+const durableRoot = runtimeEntry('901', 'exited', {
+  rootGeneration: 2,
+  launchContext: {
+    schemaVersion: 'anysentry.agent_launch_context.v1',
+    rootProcessGenerationKey: `pgk_${'a'.repeat(24)}`,
+    observedAt: new Date(durableNow - 20).toISOString(),
+    completeness: 'complete',
+    path: [
+      { processGenerationKey: `pgk_${'b'.repeat(24)}`, pid: 1, ppid: 0, command: 'systemd' },
+      { processGenerationKey: `pgk_${'c'.repeat(24)}`, pid: 200, ppid: 1, command: 'sshd' },
+      {
+        processGenerationKey: `pgk_${'a'.repeat(24)}`,
+        pid: Number('901'),
+        ppid: 200,
+        command: 'codex',
+        exe: '/usr/bin/codex',
+      },
+    ],
+    origins: [
+      { type: 'service_manager', processGenerationKey: `pgk_${'b'.repeat(24)}`, pid: 1, name: 'systemd' },
+      {
+        type: 'ssh_session',
+        processGenerationKey: `pgk_${'c'.repeat(24)}`,
+        pid: 200,
+        name: 'sshd',
+        remoteAddress: '203.0.113.8',
+        remotePort: 52144,
+        localAddress: '10.0.0.5',
+        localPort: 22,
+        tty: '/dev/pts/7',
+        terminalSession: 'tmux',
+      },
+    ],
+  },
+});
 assert.equal(durable.recordSnapshot(snapshot('durable-forwarder', 1, [durableRoot], {
   leaseEpoch: durableLease.leaseEpoch,
 })).applied, true);
 const canonicalDurableId = `host-root:${durableRoot.hostId}:${durableRoot.bootId}:${durableRoot.rootPid}:${durableRoot.rootStartTimeTicks}`;
 assert.equal(durable.get(durableRoot.agentInstanceId)?.canonicalAgentInstanceId, canonicalDurableId);
+assert.deepEqual(
+  durable.get(durableRoot.agentInstanceId)?.launchContext?.path.map((node) => node.command),
+  ['systemd', 'sshd', 'codex'],
+);
 assert.equal(
   durable.get(durableRoot.agentInstanceId)?.agentInstanceAliases.includes(durableRoot.physicalWorkloadId),
   false,
@@ -651,6 +713,16 @@ await restored.onModuleInit();
 assert.equal(restored.get(canonicalDurableId)?.runtimeState, 'exited');
 assert.equal(restored.get(durableRoot.agentInstanceId)?.canonicalAgentInstanceId, canonicalDurableId,
   'a persisted strong alias must resolve to the canonical Runtime after API restart');
+assert.deepEqual(
+  restored.get(durableRoot.agentInstanceId)?.launchContext?.origins.map((origin) => origin.type),
+  ['service_manager', 'ssh_session'],
+  'Launch Context must survive durable Runtime history and API restart',
+);
+assert.equal(
+  restored.get(durableRoot.agentInstanceId)?.launchContext?.origins
+    .find((origin) => origin.type === 'ssh_session')?.terminalSession,
+  'tmux',
+);
 restored.close();
 durable.close();
 

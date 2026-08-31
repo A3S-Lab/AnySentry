@@ -1044,6 +1044,23 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         `WITH incoming AS (
            SELECT item AS record
              FROM jsonb_array_elements($1::jsonb) AS source(item)
+         ), latest_incoming AS (
+           SELECT
+             record->>'stableSemanticEventId' AS stable_semantic_event_id,
+             MAX((record->>'resolutionRevision')::bigint) AS resolution_revision
+           FROM incoming
+           GROUP BY record->>'stableSemanticEventId'
+         ), pruned AS (
+           DELETE FROM anysentry_agent_semantic_kernel_relations_v1 AS existing
+           USING latest_incoming
+           WHERE existing.stable_semantic_event_id = latest_incoming.stable_semantic_event_id
+             AND existing.resolution_revision <= latest_incoming.resolution_revision
+             AND NOT EXISTS (
+               SELECT 1
+               FROM incoming
+               WHERE incoming.record->>'relationId' = existing.relation_id
+             )
+           RETURNING existing.relation_id
          )
          INSERT INTO anysentry_agent_semantic_kernel_relations_v1 (
            relation_id, stable_semantic_event_id, tool_invocation_id,
@@ -1059,6 +1076,12 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
            record,
            (record->>'updatedAt')::bigint
          FROM incoming
+         WHERE NOT EXISTS (
+           SELECT 1
+           FROM anysentry_agent_semantic_kernel_relations_v1 AS newer
+           WHERE newer.stable_semantic_event_id = incoming.record->>'stableSemanticEventId'
+             AND newer.resolution_revision > (incoming.record->>'resolutionRevision')::bigint
+         )
          ON CONFLICT (relation_id) DO UPDATE SET
            kernel_event_id = EXCLUDED.kernel_event_id,
            relation_status = EXCLUDED.relation_status,

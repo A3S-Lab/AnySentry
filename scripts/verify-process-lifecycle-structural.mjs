@@ -2,9 +2,10 @@
 
 import assert from 'node:assert/strict';
 
-const [{ SentryJudgeService }, { DEFAULT_POLICY }] = await Promise.all([
+const [{ SentryJudgeService }, { DEFAULT_POLICY }, { processLifecycleFact }] = await Promise.all([
   import('../apps/api/dist/security-monitoring/sentry-judge.service.js'),
   import('../apps/api/dist/security-monitoring/policy-config.js'),
+  import('../apps/api/dist/security-monitoring/process-lifecycle.js'),
 ]);
 
 const judge = new SentryJudgeService(
@@ -125,5 +126,69 @@ const degraded = judge.prepareAcceptWithDisposition(
 );
 assert.equal(degraded.disposition, 'retained', 'lifecycle-store degradation must retain the raw event');
 assert.equal(degraded.event?.judgment?.reason, 'non_agent_structural_fallback');
+
+const trustedGraphAttribution = {
+  ...baseMeta.attribution,
+  processGenerationKey: 'pgk_111111111111111111111111',
+  parentProcessGenerationKey: 'pgk_222222222222222222222222',
+  parentLinkAuthority: 'forwarder_process_graph',
+  correlation: {
+    schemaVersion: 'anysentry.trusted_correlation.v1',
+    identityVersion: 'trusted_correlation.v1',
+    method: 'runtime_root',
+    scope: 'runtime',
+    confidence: 0.92,
+    authority: 'server_process_graph',
+    inferred: false,
+    traceOrigin: 'none',
+    provenance: ['runtime_root_key', 'process_tuple'],
+    agentRootInstanceId: `agent-root:v1:${'a'.repeat(64)}`,
+    processInstanceId: `pri_${'b'.repeat(24)}`,
+  },
+};
+const linkedFact = processLifecycleFact({
+  eventId: 'event-process-generation-link',
+  eventKind: 'ToolExec',
+  at: 1_007,
+  source: 'observer',
+  workspacePath: baseMeta.workspacePath,
+  process: baseMeta.process,
+  attribution: trustedGraphAttribution,
+});
+assert.equal(linkedFact?.processGenerationKey, trustedGraphAttribution.processGenerationKey);
+assert.equal(linkedFact?.parentProcessGenerationKey, trustedGraphAttribution.parentProcessGenerationKey);
+assert.equal(linkedFact?.parentLinkAuthority, 'forwarder_process_graph');
+
+const missingParentAuthorityFact = processLifecycleFact({
+  eventId: 'event-process-generation-link-without-parent-authority',
+  eventKind: 'ToolExec',
+  at: 1_007,
+  source: 'observer',
+  workspacePath: baseMeta.workspacePath,
+  process: baseMeta.process,
+  attribution: {
+    ...trustedGraphAttribution,
+    parentLinkAuthority: undefined,
+  },
+});
+assert.equal(missingParentAuthorityFact?.processGenerationKey, trustedGraphAttribution.processGenerationKey);
+assert.equal(missingParentAuthorityFact?.parentProcessGenerationKey, undefined,
+  'an exact parent generation must retain its declared graph authority');
+assert.equal(missingParentAuthorityFact?.parentLinkAuthority, undefined);
+
+const untrustedGraphFact = processLifecycleFact({
+  eventId: 'event-untrusted-process-generation-link',
+  eventKind: 'ToolExec',
+  at: 1_008,
+  source: 'api',
+  workspacePath: baseMeta.workspacePath,
+  process: baseMeta.process,
+  attribution: {
+    ...trustedGraphAttribution,
+    correlation: undefined,
+  },
+});
+assert.equal(untrustedGraphFact?.processGenerationKey, undefined);
+assert.equal(untrustedGraphFact?.parentProcessGenerationKey, undefined);
 
 console.log('PASS protected non-Agent API routing and structural lifecycle consumption');

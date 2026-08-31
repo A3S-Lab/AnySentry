@@ -8,6 +8,10 @@ const {
   defaultSignatureDocument,
   legacyRootNameDocument,
 } = require('./observer-agent-runtime-signatures');
+const {
+  buildLaunchContext,
+  readProcEnvironmentAllowlist,
+} = require('./observer-launch-context');
 
 const DEFAULT_ROOT_NAMES = 'codex,a3s,a3s-code,a3s code,claude,claude-code,claude code';
 const DEFAULT_MAX_PROCS = 20_000;
@@ -296,6 +300,17 @@ class AgentAttributor {
     this.maxAncestors = positiveInt(options.maxAncestors) || DEFAULT_MAX_ANCESTORS;
     this.now = typeof options.now === 'function' ? options.now : Date.now;
     this.readProc = typeof options.readProc === 'function' ? options.readProc : (pid) => readProcInfo(pid, this.procRoot);
+    this.launchSessionEnrichmentEnabled = enabledValue(
+      options.launchSessionEnrichmentEnabled ?? process.env.ANYSENTRY_LAUNCH_SESSION_ENRICHMENT,
+      true,
+    );
+    this.readLaunchEnvironment = !this.launchSessionEnrichmentEnabled
+      ? () => ({})
+      : typeof options.readLaunchEnvironment === 'function'
+        ? options.readLaunchEnvironment
+        : typeof options.readProc === 'function'
+          ? () => ({})
+          : (pid) => readProcEnvironmentAllowlist(pid, this.procRoot);
     this.listPids = typeof options.listPids === 'function' ? options.listPids : () => listProcPids(this.procRoot);
     this.findWorkspaceRoot = typeof options.findWorkspaceRoot === 'function'
       ? options.findWorkspaceRoot
@@ -356,6 +371,8 @@ class AgentAttributor {
       bootstrapProcReads: 0,
       fallbackProcReads: 0,
       ancestryProcReads: 0,
+      launchContextProcReads: 0,
+      launchContextEnvironmentReads: 0,
       rootsDiscovered: 0,
       rootsExited: 0,
       rootsLost: 0,
@@ -374,6 +391,7 @@ class AgentAttributor {
     this.stats.procReads++;
     if (reason === 'bootstrap') this.stats.bootstrapProcReads++;
     else if (reason === 'ancestry') this.stats.ancestryProcReads++;
+    else if (reason === 'launch_context') this.stats.launchContextProcReads++;
     else this.stats.fallbackProcReads++;
     const info = this.readProc(pid);
     return info
@@ -387,6 +405,41 @@ class AgentAttributor {
 
   processKey(info) {
     return processKey(info, { hostId: this.hostId, bootId: this.bootId });
+  }
+
+  processGenerationKey(info) {
+    const key = this.processKey(info);
+    return key
+      ? `pgk_${crypto.createHash('sha256').update(key).digest('hex').slice(0, 24)}`
+      : undefined;
+  }
+
+  parentProcessGenerationKey(info) {
+    const ppid = positiveInt(info?.ppid);
+    if (!ppid) return undefined;
+    const parent = this.procs.get(
+      ppid,
+      text(info?.hostId) || this.hostId,
+      text(info?.bootId) || this.bootId,
+    );
+    return this.processGenerationKey(parent);
+  }
+
+  resolveLaunchContext(info) {
+    const hostId = text(info?.hostId) || this.hostId;
+    const bootId = text(info?.bootId) || this.bootId;
+    return buildLaunchContext(info, {
+      now: this.now,
+      maxAncestors: this.maxAncestors,
+      generationKey: (process) => this.processGenerationKey(process),
+      getProcess: (pid) => this.procs.get(pid, hostId, bootId) ?? this.readProcess(pid, 'launch_context'),
+      getEnvironment: this.launchSessionEnrichmentEnabled
+        ? (pid) => {
+            this.stats.launchContextEnvironmentReads++;
+            return this.readLaunchEnvironment(pid);
+          }
+        : () => ({}),
+    });
   }
 
   stableProcessStartTime(observerEvent) {
@@ -544,6 +597,7 @@ class AgentAttributor {
       existing.lastSeenAt = now;
       existing.lastActivityAt = now;
       existing.missedLivenessChecks = 0;
+      existing.launchContext ??= this.resolveLaunchContext(existing);
       return existing;
     }
     this.pruneRoots();
@@ -560,6 +614,7 @@ class AgentAttributor {
       hostId: normalized.hostId,
       bootId: normalized.bootId,
       pid: normalized.pid,
+      ppid: normalized.ppid,
       rootPid: normalized.pid,
       startTime: normalized.startTime,
       comm: text(normalized.comm),
@@ -581,6 +636,7 @@ class AgentAttributor {
       lastActivityAt: now,
       missedLivenessChecks: 0,
     };
+    root.launchContext = this.resolveLaunchContext(root);
     this.rootsByKey.set(rootKey, root);
     this.stats.rootsDiscovered++;
     this.transitions.push({
@@ -758,6 +814,13 @@ class AgentAttributor {
         source: root.attributionSource || 'process_signature',
         evidence: root.evidence,
         workloadRef: root.workloadRef ? { ...root.workloadRef } : undefined,
+        launchContext: root.launchContext
+          ? {
+              ...root.launchContext,
+              path: root.launchContext.path.map((node) => ({ ...node })),
+              origins: root.launchContext.origins.map((origin) => ({ ...origin })),
+            }
+          : undefined,
       })),
     };
   }
@@ -1287,6 +1350,20 @@ class AgentAttributor {
   }
 
   finish(pid, result, exiting, current) {
+    if (result?.attribution) {
+      const processGenerationKey = this.processGenerationKey(current);
+      const parentProcessGenerationKey = this.parentProcessGenerationKey(current);
+      result = {
+        ...result,
+        attribution: {
+          ...result.attribution,
+          ...(processGenerationKey ? { processGenerationKey } : {}),
+          ...(parentProcessGenerationKey
+            ? { parentProcessGenerationKey, parentLinkAuthority: 'forwarder_process_graph' }
+            : {}),
+        },
+      };
+    }
     if (exiting) {
       const record = this.procs.getFor(current, true) || (
         result.state === 'agent'

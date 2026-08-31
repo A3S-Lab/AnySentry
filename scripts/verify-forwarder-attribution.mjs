@@ -586,11 +586,16 @@ function attributor(procEntries = []) {
   const root = judge.classify(observerEvent({ pid: 100, ppid: 1, comm: 'codex', exe: '/usr/local/bin/codex', startTimeNs: '10', argv: ['codex'] }));
   assert.equal(root.state, 'agent');
   assert.equal(root.attribution.agentScopeId, 'codex');
+  assert.match(root.attribution.processGenerationKey, /^pgk_[a-f0-9]{24}$/u);
+  assert.equal(root.attribution.parentProcessGenerationKey, undefined);
 
   const child = judge.classify(observerEvent({ pid: 101, ppid: 100, comm: 'bash', exe: '/usr/bin/bash', startTimeNs: '11', argv: ['bash', '-lc', 'rm /tmp/file'] }));
   assert.equal(child.state, 'agent');
   assert.equal(child.attribution.rootPid, 100);
   assert.equal(child.attribution.reason, 'process_lineage');
+  assert.match(child.attribution.processGenerationKey, /^pgk_[a-f0-9]{24}$/u);
+  assert.equal(child.attribution.parentProcessGenerationKey, root.attribution.processGenerationKey);
+  assert.equal(child.attribution.parentLinkAuthority, 'forwarder_process_graph');
 
   const helper = judge.classify(observerEvent({
     pid: 102,
@@ -742,6 +747,7 @@ function attributor(procEntries = []) {
   assert.equal(judge.classify(observerEvent({ pid: 400, ppid: 1, comm: 'codex', exe: '/usr/bin/codex', startTimeNs: 'old', argv: ['codex'] })).state, 'agent');
   const reused = judge.classify(observerEvent({ pid: 400, ppid: 1, comm: 'worker', exe: '/usr/bin/worker', startTimeNs: 'new', argv: ['worker'] }));
   assert.equal(reused.state, 'non_agent');
+  assert.notEqual(reused.attribution.processGenerationKey, undefined);
 }
 
 {
@@ -1432,6 +1438,44 @@ function attributor(procEntries = []) {
 
   now += 5001;
   assert.equal(deduper.isDuplicate(event), false);
+}
+
+{
+  const processTable = new Map([
+    [1, { pid: 1, ppid: 0, startTime: '1', comm: 'systemd', exe: '/usr/lib/systemd/systemd', argv: 'systemd' }],
+    [200, { pid: 200, ppid: 1, startTime: '200', comm: 'sshd', exe: '/usr/sbin/sshd', argv: 'sshd: user@pts/1' }],
+    [300, { pid: 300, ppid: 200, startTime: '300', comm: 'bash', exe: '/usr/bin/bash', argv: 'bash' }],
+    [400, { pid: 400, ppid: 300, startTime: '400', comm: 'codex', exe: '/usr/bin/codex', argv: 'codex' }],
+    [500, { pid: 500, ppid: 400, startTime: '500', comm: 'bash', exe: '/usr/bin/bash', argv: 'bash -lc id' }],
+  ]);
+  const judge = new AgentAttributor({
+    hostId: 'host-launch-context',
+    bootId: 'boot-launch-context',
+    now: () => 10_000,
+    readProc: (pid) => processTable.get(pid),
+    listPids: () => [],
+  });
+  const child = judge.classify(observerEvent({
+    pid: 500,
+    ppid: 400,
+    comm: 'bash',
+    exe: '/usr/bin/bash',
+    startTimeNs: '500',
+    argv: ['bash', '-lc', 'id'],
+  }));
+  assert.equal(child.state, 'agent');
+  const runtime = judge.runtimeSnapshot().entries[0];
+  assert.deepEqual(
+    runtime.launchContext.path.map((node) => node.command),
+    ['systemd', 'sshd', 'bash', 'codex'],
+    'Root launch context must retain the service/session/shell path above the Agent root',
+  );
+  assert.deepEqual(
+    runtime.launchContext.origins.map((origin) => origin.type),
+    ['service_manager', 'ssh_session', 'shell'],
+  );
+  assert.equal(runtime.launchContext.completeness, 'complete');
+  assert.match(runtime.launchContext.rootProcessGenerationKey, /^pgk_[a-f0-9]{24}$/u);
 }
 
 console.log('Forwarder attribution and deduplication verification passed.');

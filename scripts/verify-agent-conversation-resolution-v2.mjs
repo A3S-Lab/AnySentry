@@ -661,6 +661,62 @@ assert.equal(new Set(conflictingExplicitWorkspaces.conversationRecords
   .map((item) => item.conversationId)).size, 2,
   'different explicit workspaces must remain a hard Thread boundary');
 
+const conflictingContinuityHistories = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_continuity_history_a', at: base + 3_920,
+    instance: 'host-root:continuity-history:a', workspacePath: '/workspace/shared',
+    request: {
+      model: 'fixture', prompt_cache_key: 'shared-but-not-unique-continuity',
+      input: [human('continuity-msg-a', 'continuity-turn-a', 'investigate service A')],
+    }, responseId: 'continuity-history-a',
+  }),
+  interaction({
+    id: 'mi_v2_continuity_history_b', at: base + 3_930,
+    instance: 'host-root:continuity-history:b', workspacePath: '/workspace/shared',
+    request: {
+      model: 'fixture', prompt_cache_key: 'shared-but-not-unique-continuity',
+      input: [human('continuity-msg-b', 'continuity-turn-b', 'deploy service B')],
+    }, responseId: 'continuity-history-b',
+  }),
+]);
+assert.equal(new Set(conflictingContinuityHistories.conversationRecords
+  .map((item) => item.conversationId)).size, 2,
+  'continuity alone must not merge divergent Human histories');
+assert(conflictingContinuityHistories.memberships.every((membership) =>
+  membership.evidence.includes('continuity_collision_without_shared_history')),
+'both sides of a blocked continuity merge must preserve auditable conflict evidence');
+
+const exactCollisionMember = {
+  ...interaction({
+    id: 'mi_v2_continuity_exact_a', at: base + 3_940,
+    instance: 'host-root:continuity-exact:a', workspacePath: '/workspace/shared-exact',
+    request: {
+      model: 'fixture', prompt_cache_key: 'shared-continuity-with-independent-proof',
+      input: [human('continuity-exact-msg-a', 'continuity-exact-turn-a', 'inspect service A')],
+    }, responseId: 'continuity-exact-a',
+  }),
+  correlationQuality: 'exact',
+};
+const mixedQualityCollision = resolveAgentConversationsV2([
+  exactCollisionMember,
+  interaction({
+    id: 'mi_v2_continuity_exact_b', at: base + 3_950,
+    instance: 'host-root:continuity-exact:b', workspacePath: '/workspace/shared-exact',
+    request: {
+      model: 'fixture', prompt_cache_key: 'shared-continuity-with-independent-proof',
+      input: [human('continuity-exact-msg-b', 'continuity-exact-turn-b', 'deploy service B')],
+    }, responseId: 'continuity-exact-b',
+  }),
+]);
+assert.equal(new Set(mixedQualityCollision.conversationRecords
+  .map((item) => item.conversationId)).size, 2);
+assert.equal(mixedQualityCollision.memberships.find((membership) =>
+  membership.interactionId === exactCollisionMember.interactionId)?.confidence, 'exact',
+'a rejected continuity edge must not downgrade independent exact membership evidence');
+assert.equal(mixedQualityCollision.memberships.find((membership) =>
+  membership.interactionId === 'mi_v2_continuity_exact_b')?.confidence, 'unlinked',
+'a continuity-only divergent history must remain explicitly unlinked');
+
 const assertOneThread = (records, label) => {
   const resolved = resolveAgentConversationsV2(records);
   assert.equal(new Set(resolved.conversationRecords.map((item) => item.conversationId)).size, 1, label);
