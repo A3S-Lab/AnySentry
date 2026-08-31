@@ -482,6 +482,18 @@ const legacyDockerProjection = projectAgentConversations([
 assert.equal(legacyDockerProjection.summaries[0].environment, 'docker',
   'legacy agent:// container workspaces must migrate to the Docker environment');
 
+const legacyHostWorkerProjection = projectAgentConversations([
+  interaction({
+    id: 'mi_v2_legacy_host_worker', at: base + 3_550, instance: 'host-root:legacy-host:one',
+    agentProduct: 'Generic CLI', workspacePath: 'agent://runtime-worker',
+    providerConversationId: 'legacy-host-worker-thread',
+    request: { model: 'fixture', messages: [{ role: 'user', content: 'legacy host worker' }] },
+    responseId: 'legacy-host-worker-response',
+  }),
+], [], { timeType: 'last_30d', scope: 'agent', limit: 100 });
+assert.equal(legacyHostWorkerProjection.summaries[0].environment, 'host',
+  'a non-container agent:// workspace with host-root evidence must remain Host');
+
 const hostResumeAcrossMissingWorkspace = resolveAgentConversationsV2([
   interaction({
     id: 'mi_v2_host_resume_explicit', at: base + 3_600, instance: 'host-root:resume:one',

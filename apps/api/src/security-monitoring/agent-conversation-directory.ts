@@ -47,7 +47,8 @@ function canonicalEnvironment(
     return 'kubernetes';
   }
   if (environment !== 'unknown') return environment;
-  if (workspacePath.startsWith('agent://')) return 'docker';
+  if (instanceIdentities.some((value) => value.startsWith('host-root:'))) return 'host';
+  if (/^agent:\/\/[a-f0-9]{12,64}$/iu.test(workspacePath)) return 'docker';
   if (workspacePath.startsWith('/')) return 'host';
   return 'unknown';
 }

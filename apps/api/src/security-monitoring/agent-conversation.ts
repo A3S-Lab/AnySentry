@@ -56,10 +56,11 @@ function interactionEnvironment(
   if (cgroup.includes('kubepods')) return 'kubernetes';
   if (/(?:docker|containerd|crio|libpod)/u.test(cgroup)) return 'docker';
   // Interactions normalized before the additive `environment` field retain Observer's legacy
-  // container workspace (`agent://<container-id>`) even when cgroup text was unavailable. This is
-  // the same compatibility signal already used by the directory projector; it lets historical
-  // Docker Threads migrate without rewriting immutable Interaction facts.
-  if (record.workspacePath.startsWith('agent://')) return 'docker';
+  // container workspace (`agent://<container-id>`) even when cgroup text was unavailable. Host
+  // TLS workers can also use the `agent://` namespace, so only a real short/full hexadecimal
+  // container identity is Docker evidence; a generation-stable host root remains Host evidence.
+  if (/^agent:\/\/[a-f0-9]{12,64}$/iu.test(record.workspacePath)) return 'docker';
+  if (record.agentInstanceId?.startsWith('host-root:')) return 'host';
   return record.process ? 'host' : asset?.runtime ?? 'unknown';
 }
 
