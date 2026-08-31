@@ -503,10 +503,15 @@ function effectiveInteractionState(
     reasons.push('tool_result_pending');
   }
   const pendingResolved = interaction.completeness === 'partial'
-    && interaction.partialReasons.includes('tool_result_pending')
     && !unresolvedToolCall
     && reasons.length === 0
-    && interaction.statusCode < 400;
+    && interaction.statusCode < 400
+    && (
+      interaction.partialReasons.includes('tool_result_pending')
+      || interaction.conversationCompleteness === 'tool_pending'
+    )
+    && interaction.transportCompleteness !== 'partial'
+    && (interaction.wireCompleteness === undefined || interaction.wireCompleteness === 'complete');
   return {
     complete: (interaction.completeness === 'complete' && !unresolvedToolCall)
       || pendingResolved,

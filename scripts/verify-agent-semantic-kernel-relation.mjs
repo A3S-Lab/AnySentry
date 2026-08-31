@@ -155,4 +155,36 @@ const coverageGap = buildSemanticKernelRelations(
 );
 assert.equal(coverageGap[0].status, 'coverage_gap');
 
+const shellParent = {
+  ...kernelEvent,
+  eventId: 'evt_shell_parent',
+  subject: '/bin/bash -c source shell-snapshot',
+  process: { pid: 220, ppid: 100, hostId: 'host-semantic', bootId: 'boot-semantic' },
+};
+const externalChild = {
+  ...kernelEvent,
+  eventId: 'evt_external_child',
+  subject: '/usr/bin/printf ancestry-marker',
+  agentRuntimeInstanceId: 'docker:physical-workload',
+  process: { pid: 221, ppid: 220, hostId: 'host-semantic', bootId: 'boot-semantic' },
+};
+const ancestryCall = {
+  ...toolCall,
+  semanticEventId: 'se_ancestry_tool',
+  toolCallId: 'call-ancestry',
+  content: { command: '/usr/bin/printf ancestry-marker' },
+};
+const ancestryRelations = buildSemanticKernelRelations(
+  ancestryCall,
+  toolResult,
+  interaction,
+  [externalChild, shellParent],
+  16,
+  false,
+);
+assert.equal(ancestryRelations[0].status, 'linked_strong');
+assert.equal(ancestryRelations[0].confidence, 0.99);
+assert.equal(ancestryRelations[0].kernelEventId, externalChild.eventId);
+assert.equal(ancestryRelations[0].linkMethod, 'command');
+
 console.log('Agent Semantic Tool to Kernel relation verification passed');

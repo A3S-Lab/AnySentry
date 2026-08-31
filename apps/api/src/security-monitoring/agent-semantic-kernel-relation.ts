@@ -134,6 +134,39 @@ function sameRuntime(
   return candidate.agentRuntimeInstanceAliases?.includes(interaction.agentInstanceId) === true;
 }
 
+function sameProcessDomain(
+  left: T.AgentEventListItem,
+  right: T.AgentEventListItem,
+): boolean {
+  if (left.process?.hostId && right.process?.hostId
+    && left.process.hostId !== right.process.hostId) return false;
+  if (left.process?.bootId && right.process?.bootId
+    && left.process.bootId !== right.process.bootId) return false;
+  return true;
+}
+
+function runtimeMatch(
+  interaction: T.AgentInteractionRecord,
+  candidate: T.AgentEventListItem,
+  candidates: T.AgentEventListItem[],
+): 'direct' | 'ancestry' | undefined {
+  if (sameRuntime(interaction, candidate)) return 'direct';
+  let current = candidate;
+  const seen = new Set<number>();
+  for (let depth = 0; depth < 8; depth += 1) {
+    const parentPid = current.process?.ppid;
+    if (!parentPid || seen.has(parentPid)) return undefined;
+    seen.add(parentPid);
+    const parents = candidates.filter((event) =>
+      event.process?.pid === parentPid && sameProcessDomain(current, event));
+    if (parents.some((parent) => sameRuntime(interaction, parent))) return 'ancestry';
+    const parent = parents.find((event) => event.process?.ppid);
+    if (!parent) return undefined;
+    current = parent;
+  }
+  return undefined;
+}
+
 function withinWindow(
   event: T.AgentSemanticEvent,
   result: T.AgentSemanticEvent | undefined,
@@ -193,9 +226,9 @@ export function buildSemanticKernelRelations(
         : new Set(['ToolExec', 'FileAccess', 'FileDelete', 'Egress', 'Dns', 'Tls']);
   const relations: T.AgentSemanticKernelRelation[] = [];
   for (const candidate of candidates) {
-    if (!acceptedKinds.has(candidate.eventKind)
-      || !sameRuntime(interaction, candidate)
-      || !withinWindow(event, result, candidate)) continue;
+    if (!acceptedKinds.has(candidate.eventKind) || !withinWindow(event, result, candidate)) continue;
+    const runtimeLink = runtimeMatch(interaction, candidate, candidates);
+    if (!runtimeLink) continue;
     let linkMethod: T.AgentSemanticKernelRelation['linkMethod'];
     let confidence = 0;
     if (command && candidate.eventKind === 'ToolExec') {
@@ -224,6 +257,7 @@ export function buildSemanticKernelRelations(
       }
     }
     if (!linkMethod) continue;
+    if (runtimeLink === 'ancestry') confidence = Math.min(confidence, 0.99);
     relations.push({
       schemaVersion: 'anysentry.agent_semantic_kernel_relation.v1',
       relationId: stableId('skr', event.semanticEventId + '\u0000' + candidate.eventId),

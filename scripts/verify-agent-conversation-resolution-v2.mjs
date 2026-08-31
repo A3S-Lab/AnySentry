@@ -78,6 +78,7 @@ function interaction({
   statusCode = 200,
   completeness = 'complete',
   partialReasons = [],
+  conversationCompleteness,
 }) {
   const messages = (request.input ?? request.messages ?? []).map((item) => ({
     role: item.role ?? item.type ?? 'input',
@@ -118,6 +119,7 @@ function interaction({
     wireTemplateId: interactionType === 'tool' ? 'mcp-jsonrpc' : 'openai-responses',
     parseState: 'parsed',
     llmLikelihood: 'confirmed',
+    conversationCompleteness,
     endpoint: 'gateway.invalid',
     method: 'POST',
     path,
@@ -204,6 +206,9 @@ const oldToolCall = interaction({
     arguments: { cmd: 'printf resolver-v2' },
     issuedAtUnixNs: String(BigInt(base + 202) * 1_000_000n),
   }],
+  completeness: 'partial',
+  partialReasons: [],
+  conversationCompleteness: 'tool_pending',
   responseText: 'running a tool',
 });
 const oldToolResult = interaction({
@@ -337,6 +342,9 @@ assert.equal(projection.summaries[0].conversationId, 'cv_seed_existing');
 assert.equal(projection.summaries[0].turnCount, 4);
 assert.equal(projection.summaries[0].toolCallCount, 1);
 assert.equal(projection.summaries[0].toolResultCount, 1);
+assert.equal(projection.summaries[0].errorCount, 0);
+assert.equal(projection.summaries[0].coverage.status, 'complete',
+  'a later matching tool result must complete a tool_pending model Interaction');
 
 const timeline = projectSemanticConversationTimeline(
   projection.summaries[0],

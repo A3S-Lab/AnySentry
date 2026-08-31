@@ -2375,7 +2375,7 @@ export class AggregationService {
     if (!interaction) return undefined;
     const callAt = Number(BigInt(call.atUnixNs) / 1_000_000n);
     const resultAt = result ? Number(BigInt(result.atUnixNs) / 1_000_000n) : undefined;
-    const kernel = await this.storedAgentEvents({
+    let kernel = await this.storedAgentEvents({
       timeType: 'custom',
       startTime: new Date(Math.max(0, callAt - 2_000)).toISOString(),
       endTime: new Date((resultAt ?? (callAt + 30 * 60_000)) + 2_000).toISOString(),
@@ -2394,6 +2394,29 @@ export class AggregationService {
       resolutionRevision,
       kernel.coverage.partial,
     );
+    if (!relations.some((relation) => relation.kernelEventId)) {
+      const ancestryKernel = await this.storedAgentEvents({
+        timeType: 'custom',
+        startTime: new Date(Math.max(0, callAt - 2_000)).toISOString(),
+        endTime: new Date((resultAt ?? (callAt + 30_000)) + 2_000).toISOString(),
+        scope: 'agent',
+        classificationView: query.classificationView,
+        durable: true,
+        limit: 1_000,
+      });
+      const ancestryRelations = buildSemanticKernelRelations(
+        call,
+        result,
+        interaction,
+        ancestryKernel.items,
+        resolutionRevision,
+        ancestryKernel.coverage.partial,
+      );
+      if (ancestryRelations.some((relation) => relation.kernelEventId)) {
+        kernel = ancestryKernel;
+        relations = ancestryRelations;
+      }
+    }
     const persistedRelations = this.relationalStore?.configured()
       ? await this.relationalStore.loadAgentSemanticKernelRelations(call.semanticEventId)
       : [];
