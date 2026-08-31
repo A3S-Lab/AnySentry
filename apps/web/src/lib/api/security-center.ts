@@ -1438,9 +1438,9 @@ export interface AgentSemanticKernelRelation {
   relationVersion: 1;
   resolutionRevision: number;
   risk?: {
-    verdict: Verdict;
-    tier: Tier;
-    severity: Severity;
+    verdict: SecurityVerdict;
+    tier: "Rules" | "Llm" | "Agent";
+    severity: SecuritySeverity;
     riskScore: number;
     riskName: string;
     riskCategory: string;

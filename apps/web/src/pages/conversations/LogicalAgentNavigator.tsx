@@ -107,7 +107,7 @@ export function LogicalAgentNavigator({
     window.requestAnimationFrame(() => refs.current.get(next.logicalAgentId)?.focus());
   };
 
-  const renderSection = (title: string, agents: LogicalAgentConversationDirectoryItem[]) => (
+  const renderSection = (title: string, agents: LogicalAgentConversationDirectoryItemV3[]) => (
     <section aria-labelledby={`agent-section-${title}`}>
       <div className="sticky top-0 z-10 flex h-9 items-center justify-between border-y border-white/8 bg-[#0d120f]/95 px-3 backdrop-blur">
         <h3 id={`agent-section-${title}`} className="text-[11px] font-semibold text-zinc-300">{title}</h3>
