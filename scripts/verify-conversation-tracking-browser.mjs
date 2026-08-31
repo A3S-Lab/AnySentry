@@ -136,6 +136,7 @@ assert.deepEqual(
 const port = await freePort();
 const chrome = spawn(chromeBinary, [
   '--headless=new', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--hide-scrollbars',
+  '--no-proxy-server',
   `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, 'about:blank',
 ], { stdio: ['ignore', 'ignore', 'pipe'] });
 let socket;
@@ -348,6 +349,12 @@ try {
     () => evaluate('location.search.includes("interactionId=")'),
     Boolean,
   );
+  await waitFor(
+    'per-call token usage',
+    () => evaluate('document.body?.innerText ?? ""'),
+    (text) => /总 token/iu.test(text) && text.includes('输入') && text.includes('输出'),
+  );
+  await screenshot('conversation-usage-inspector-1440.png');
   await evaluate(`(() => {
     const raw = [...document.querySelectorAll('[role=tab]')]
       .find((node) => node.textContent?.trim() === '原始');
@@ -423,13 +430,18 @@ try {
   await waitFor(
     'reduced-motion conversation timeline',
     () => evaluate('document.body?.innerText ?? ""'),
-    (text) => text.includes(marker) && text.includes('恢复上下文'),
+    (text) => text.includes(marker) && text.includes('第 1 轮'),
   );
   await assertNoOverflow('conversation reduced-motion 375');
-  const runningTimelineAnimations = await evaluate(`document
-    .querySelector('[aria-label="Agent 对话时间线"]')
-    ?.getAnimations({ subtree: true })
-    .filter((animation) => animation.playState === 'running').length ?? 0`);
+  const runningTimelineAnimations = await waitFor(
+    'reduced-motion animations settle',
+    () => evaluate(`document
+      .querySelector('[aria-label="Agent 对话时间线"]')
+      ?.getAnimations({ subtree: true })
+      .filter((animation) => animation.playState === 'running').length ?? 0`),
+    (count) => count === 0,
+    10_000,
+  );
   assert.equal(runningTimelineAnimations, 0,
     `reduced-motion timeline animations: ${runningTimelineAnimations}`);
   await screenshot('conversation-timeline-375-reduced-motion.png');
@@ -484,10 +496,19 @@ try {
       (value) => value.expanded === 'true' && value.visibleHistory > 0,
     );
     historicalInstanceCollapseVerified = true;
+    await evaluate(`document.querySelector('button[data-instance-history-toggle]')?.click()`);
+    await waitFor(
+      'historical instances collapse again',
+      () => evaluate(`({
+        expanded: document.querySelector('button[data-instance-history-toggle]')?.getAttribute('aria-expanded'),
+        visibleHistory: document.querySelectorAll('button[data-runtime-state="lost"], button[data-runtime-state="exited"]').length
+      })`),
+      (value) => value.expanded === 'false' && value.visibleHistory === 0,
+    );
   }
   const overviewText = await evaluate('document.body?.innerText ?? ""');
-  assert(overviewText.includes('Token 用量') && overviewText.includes('模型调用'),
-    'Agent overview must expose token and model-call summaries');
+  assert(/token 用量/iu.test(overviewText) && overviewText.includes('模型调用'),
+    `Agent overview must expose token and model-call summaries: ${overviewText.slice(0, 2_000)}`);
   await assertNoOverflow('conversation collapsed history 1440');
   await screenshot('conversation-history-collapsed-1440.png');
 
