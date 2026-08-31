@@ -347,6 +347,37 @@ assert.equal(replay[0].replayedUserMessages, 3);
 assert.equal(replay[0].replayedToolResults, 1);
 assert.equal(replay[0].newUserMessages, 1);
 
+const boundaryProjection = projectAgentConversations(
+  [resumed],
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+const boundarySummary = boundaryProjection.summaries.find((item) => item.hasContent);
+assert.ok(boundarySummary);
+const boundaryTimeline = projectSemanticConversationTimeline(
+  boundarySummary,
+  boundaryProjection.interactionsByConversation.get(boundarySummary.conversationId),
+  [],
+);
+assert.deepEqual(
+  boundaryTimeline.flatMap((turn) => turn.events)
+    .filter((event) => event.kind === 'user_message')
+    .map((event) => event.contentPreview),
+  ['resume the terminal session'],
+  'the first cumulative request inside a bounded window must not replay older user Turns',
+);
+assert.equal(boundaryTimeline.flatMap((turn) => turn.events)
+  .filter((event) => event.kind === 'tool_result').length, 0,
+  'tool results attached to boundary replay context must stay folded');
+const boundaryReplay = projectContextReplaySummaries(
+  boundaryProjection.sourceInteractionsByConversation.get(boundarySummary.conversationId),
+  [],
+);
+assert.equal(boundaryReplay.length, 1);
+assert.equal(boundaryReplay[0].replayedUserMessages, 3);
+assert.equal(boundaryReplay[0].replayedToolResults, 1);
+assert.equal(boundaryReplay[0].newUserMessages, 1);
+
 const explicitConflict = resolveAgentConversationsV2([
   interaction({
     id: 'mi_v2_conflict_a',

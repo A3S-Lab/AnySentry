@@ -299,17 +299,24 @@ export function projectContextReplaySummaries(
     let newUserMessages = 0;
     const users = semanticItemsForInteraction(interaction)
       .filter((item) => item.kind === 'user_message');
-    for (const user of users) {
+    // A bounded query can begin at a resumed/cumulative request whose original earlier Turns are
+    // outside the window. Multiple human messages in that first visible request are strong
+    // product-neutral evidence that every item except the latest is restored context.
+    const boundaryReplayUserCount = seenUsers.size === 0 && users.length > 1
+      ? users.length - 1
+      : 0;
+    for (const [index, user] of users.entries()) {
       const key = user.sourceItemId
         ? `item:${user.sourceItemId}`
         : user.turnId
           ? `turn:${user.turnId}:${semanticHash(user.content)}`
           : `legacy:${semanticHash(user.content)}`;
-      if (seenUsers.has(key)) replayedUserMessages += 1;
+      if (index < boundaryReplayUserCount || seenUsers.has(key)) replayedUserMessages += 1;
       else {
         seenUsers.add(key);
         newUserMessages += 1;
       }
+      if (index < boundaryReplayUserCount) seenUsers.add(key);
     }
     for (const call of interaction.toolCalls) {
       if (seenCalls.has(call.toolCallId)) replayedToolCalls += 1;
@@ -320,8 +327,9 @@ export function projectContextReplaySummaries(
         content: result.content,
         isError: result.isError,
       })}`;
-      if (seenResults.has(key)) replayedToolResults += 1;
+      if (boundaryReplayUserCount > 0 || seenResults.has(key)) replayedToolResults += 1;
       else seenResults.add(key);
+      if (boundaryReplayUserCount > 0) seenResults.add(key);
     }
     if (!replayedUserMessages && !replayedToolCalls && !replayedToolResults) continue;
     const matchingSegments = segments.filter((segment) =>
@@ -450,12 +458,15 @@ export function projectSemanticConversationTimeline(
     const semanticItems = semanticItemsForInteraction(interaction);
     const userItems = semanticItems.filter((item) => item.kind === 'user_message');
     const userHashes = userItems.map((item) => semanticHash(item.content));
-    let firstNewUser = 0;
-    while (
-      firstNewUser < previousUserLineage.length
-      && firstNewUser < userHashes.length
-      && previousUserLineage[firstNewUser] === userHashes[firstNewUser]
-    ) firstNewUser += 1;
+    const boundaryContextReplay = previousUserLineage.length === 0 && userHashes.length > 1;
+    let firstNewUser = boundaryContextReplay ? userHashes.length - 1 : 0;
+    if (!boundaryContextReplay) {
+      while (
+        firstNewUser < previousUserLineage.length
+        && firstNewUser < userHashes.length
+        && previousUserLineage[firstNewUser] === userHashes[firstNewUser]
+      ) firstNewUser += 1;
+    }
     if (userHashes.length) previousUserLineage = userHashes;
 
     for (const item of semanticItems) {
@@ -469,6 +480,7 @@ export function projectSemanticConversationTimeline(
         if (resultKeys.has(resultKey)) continue;
         resultKeys.add(resultKey);
         if (item.toolCallId) observedResultIds.add(item.toolCallId);
+        if (boundaryContextReplay) continue;
       }
       if (item.kind === 'tool_call' && item.toolCallId && calls.has(item.toolCallId)) continue;
       const segmentId = segmentByInteraction.get(interaction.interactionId)
