@@ -1087,6 +1087,17 @@ export interface AgentInteractionContent {
   text?: string;
   structured?: unknown;
 }
+export interface AgentInteractionTokenUsage {
+  source: "provider_reported";
+  completeness: "complete" | "partial";
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  cachedInputTokens?: number;
+  cacheCreationInputTokens?: number;
+  reasoningOutputTokens?: number;
+  totalTokensDerived: boolean;
+}
 export interface AgentInteractionRecord {
   schemaVersion: "anysentry.agent_interaction.v1";
   interactionId: string;
@@ -1140,6 +1151,7 @@ export interface AgentInteractionRecord {
   timeQuality: string;
   request: AgentInteractionContent;
   response: AgentInteractionContent;
+  usage?: AgentInteractionTokenUsage;
   toolCalls: AgentInteractionToolCall[];
   toolResults: AgentInteractionToolResult[];
   semanticParserId?: string;
@@ -1211,7 +1223,27 @@ export interface AgentConversationSummary {
   toolResultCount: number;
   errorCount: number;
   models: string[];
+  usage: AgentUsageSummary;
+  instanceUsage: AgentInstanceUsageSummary[];
   coverage: AgentConversationCoverage;
+}
+export interface AgentUsageSummary {
+  modelCallCount: number;
+  successfulModelCallCount: number;
+  failedModelCallCount: number;
+  tokenReportedModelCallCount: number;
+  tokenCoverage: "complete" | "partial" | "unavailable";
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cachedInputTokens: number;
+  cacheCreationInputTokens: number;
+  reasoningOutputTokens: number;
+  totalDurationMs: number;
+  averageDurationMs?: number;
+}
+export interface AgentInstanceUsageSummary extends AgentUsageSummary {
+  agentInstanceId: string;
 }
 export interface AgentConversationList extends ClassifiedResponseMeta {
   items: AgentConversationSummary[];
@@ -1239,6 +1271,8 @@ export interface LogicalAgentConversationDirectoryItem {
   agentAssetIds: string[];
   agentInstanceIds: string[];
   conversations: AgentConversationSummary[];
+  usage: AgentUsageSummary;
+  instanceUsage: AgentInstanceUsageSummary[];
   coverage: AgentConversationCoverage;
 }
 export interface AgentConversationDirectoryList extends ClassifiedResponseMeta {

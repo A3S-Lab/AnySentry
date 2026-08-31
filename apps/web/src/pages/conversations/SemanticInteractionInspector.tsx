@@ -9,6 +9,7 @@ import type {
   AgentSemanticEvidenceResponse,
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
+import { formatTokenCount } from "./agentUsage";
 
 function safeJson(value: unknown) {
   if (typeof value === "string") return value;
@@ -270,6 +271,31 @@ export function SemanticInteractionInspector({
                 {structured ? <CopyAction value={structured} label="复制结构化内容" /> : null}
               </div>
               <pre className="max-h-[calc(100dvh-14rem)] overflow-auto whitespace-pre-wrap break-words rounded border border-white/8 bg-black/20 p-3 font-mono text-[11px] leading-5 text-zinc-300">{browserPreview(structured || "该事件没有结构化正文。")}</pre>
+              {interaction?.interactionType === "model" ? (
+                interaction.usage ? (
+                  <dl className="mt-3 grid grid-cols-2 rounded border border-teal-400/15 bg-teal-500/[0.035] sm:grid-cols-3">
+                    {[
+                      ["总 Token", interaction.usage.totalTokens],
+                      ["输入", interaction.usage.inputTokens],
+                      ["输出", interaction.usage.outputTokens],
+                      ["缓存输入", interaction.usage.cachedInputTokens],
+                      ["推理输出", interaction.usage.reasoningOutputTokens],
+                      ["覆盖", interaction.usage.completeness],
+                    ].map(([label, value]) => (
+                      <div key={String(label)} className="border-b border-r border-white/8 px-3 py-2 last:border-r-0">
+                        <dt className="text-[9px] uppercase tracking-[0.08em] text-zinc-600">{String(label)}</dt>
+                        <dd className="mt-1 font-mono text-[11px] text-zinc-300">
+                          {typeof value === "number" ? formatTokenCount(value, false) : value ?? "--"}
+                        </dd>
+                      </div>
+                    ))}
+                  </dl>
+                ) : (
+                  <p className="mt-3 rounded border border-white/8 bg-black/15 px-3 py-2 text-[11px] text-zinc-500">
+                    本次模型调用没有返回可核验的 Token usage；页面不会用文本长度估算。
+                  </p>
+                )
+              ) : null}
               {event.kind === "tool_result" ? <p className="mt-3 text-[11px] leading-5 text-zinc-500">工具结果时间表示该结果重新进入模型请求的明文边界；框架内部精确结束时间仅在有独立工具传输证据时展示。</p> : null}
             </div>
           ) : tab === "kernel" ? (

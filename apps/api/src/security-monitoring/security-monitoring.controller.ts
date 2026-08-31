@@ -457,6 +457,44 @@ function compactAttributes(kind: string, inner: Record<string, unknown>, id: { t
   return attrs;
 }
 
+function interactionUsageCounters(
+  kind: string,
+  inner: Record<string, unknown>,
+): { attributes: Record<string, number>; total?: number } {
+  if (kind !== 'LlmInteraction') return { attributes: {} };
+  const usage = obj(inner.usage);
+  if (!usage || usage.source !== 'provider_reported') return { attributes: {} };
+  const counter = (key: string) => {
+    const value = finiteNumber(usage[key]);
+    return value !== undefined && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+  };
+  const input = counter('inputTokens');
+  const output = counter('outputTokens');
+  const reportedTotal = counter('totalTokens');
+  const total = reportedTotal ?? (
+    input !== undefined && output !== undefined && input + output <= Number.MAX_SAFE_INTEGER
+      ? input + output
+      : undefined
+  );
+  return {
+    attributes: {
+      ...(input !== undefined ? { 'llm.usage.input_tokens': input } : {}),
+      ...(output !== undefined ? { 'llm.usage.output_tokens': output } : {}),
+      ...(total !== undefined ? { 'llm.usage.total_tokens': total } : {}),
+      ...(counter('cachedInputTokens') !== undefined
+        ? { 'llm.usage.cached_input_tokens': counter('cachedInputTokens')! }
+        : {}),
+      ...(counter('cacheCreationInputTokens') !== undefined
+        ? { 'llm.usage.cache_creation_input_tokens': counter('cacheCreationInputTokens')! }
+        : {}),
+      ...(counter('reasoningOutputTokens') !== undefined
+        ? { 'llm.usage.reasoning_output_tokens': counter('reasoningOutputTokens')! }
+        : {}),
+    },
+    total,
+  };
+}
+
 function processFromObserverLine(process: unknown): T.ProcessContext | undefined {
   if (!process || typeof process !== 'object') return undefined;
   const p = process as Record<string, unknown>;
@@ -622,6 +660,7 @@ function deriveMeta(line: string, given: Partial<T.EventMeta>): T.EventMeta {
   // public provider (internal/self-hosted endpoints, plain HTTP).
   const isLlm = (eventKey === 'Egress' || eventKey === 'Dns') && isLlmEndpoint(inner);
   const peer = (inner as { peer?: string; query?: string }).peer ?? (inner as { query?: string }).query ?? '';
+  const usage = interactionUsageCounters(eventKey, inner);
   return {
     agentId,
     workspacePath: given.workspacePath ?? cwd ?? `agent://${agentId}`,
@@ -656,7 +695,11 @@ function deriveMeta(line: string, given: Partial<T.EventMeta>): T.EventMeta {
     captureFlags,
     // Envelope attributes may add producer context, but cannot replace fields decoded from the raw
     // record (notably ProcessExit status/signal and command hashes).
-    attributes: { ...sanitizeEventAttributes(given.attributes), ...compactAttributes(eventKey, inner, id) },
+    attributes: {
+      ...sanitizeEventAttributes(given.attributes),
+      ...compactAttributes(eventKey, inner, id),
+      ...usage.attributes,
+    },
     classificationSemantics: given.classificationSemantics,
     // Process generation is structural evidence and therefore shares the raw-record trust boundary
     // with event time and capture decisions.
@@ -664,7 +707,7 @@ function deriveMeta(line: string, given: Partial<T.EventMeta>): T.EventMeta {
     attribution: given.attribution,
     rawPreview: given.rawPreview ?? redact(line).slice(0, 1800),
     subject: given.subject ?? (isLlm ? `LLM 调用 → ${peer}` : summarize(eventKey, inner)),
-    tokenCount: given.tokenCount,
+    tokenCount: given.tokenCount ?? usage.total,
     latencyMs: given.latencyMs,
   };
 }

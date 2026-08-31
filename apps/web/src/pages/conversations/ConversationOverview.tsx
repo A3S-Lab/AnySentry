@@ -18,6 +18,13 @@ import type {
   LogicalAgentConversationDirectoryItemV3,
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
+import {
+  formatDuration,
+  formatTokenCount,
+  formatTokenTotal,
+  tokenCoverageText,
+  usageForInstance,
+} from "./agentUsage";
 
 function runtimeId(instance: AgentRuntimeInstanceRecord) {
   return instance.canonicalAgentInstanceId ?? instance.agentInstanceId;
@@ -80,6 +87,8 @@ function ThreadRow({
         <span className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-zinc-600">
           <span>{nsDate(thread.lastActivityAtUnixNs)}</span>
           <span>{thread.turnCount} 轮</span>
+          <span>{thread.usage.modelCallCount} 调用</span>
+          <span>{formatTokenTotal(thread.usage)} tokens</span>
           <span>{thread.toolCallCount} 工具</span>
           <span>{thread.coverage.status}</span>
         </span>
@@ -130,6 +139,8 @@ export function ConversationOverview({
     ? agent.technicalActivities.filter((activity) =>
         activity.agentInstanceId && instanceAliases.has(activity.agentInstanceId))
     : agent.technicalActivities;
+  const usage = instance ? usageForInstance(agent.instanceUsage, instanceAliases) : agent.usage;
+  const toolCallCount = threads.reduce((sum, thread) => sum + thread.toolCallCount, 0);
   const title = instance ? "运行实例概览" : "Agent 整体概览";
   const subtitle = instance
     ? "一次真实根进程承载的 Thread Segment、启动协商与覆盖状态"
@@ -167,13 +178,19 @@ export function ConversationOverview({
 
       <div className="grid border-b border-white/8 sm:grid-cols-2 xl:grid-cols-4">
         <Metric
-          label="运行实例"
-          value={instance ? 1 : agent.totalInstanceCount}
-          detail={instance ? instance.runtimeState : agent.activeInstanceCount + " 个当前可观察"}
+          label="Token 用量"
+          value={formatTokenTotal(usage, false)}
+          detail={usage.tokenCoverage === "unavailable"
+            ? tokenCoverageText(usage)
+            : `输入 ${formatTokenCount(usage.inputTokens)} · 输出 ${formatTokenCount(usage.outputTokens)} · ${tokenCoverageText(usage)}`}
+        />
+        <Metric
+          label="模型调用"
+          value={usage.modelCallCount}
+          detail={`${usage.successfulModelCallCount} 成功 · ${usage.failedModelCallCount} 异常 · 均值 ${formatDuration(usage.averageDurationMs)}`}
         />
         <Metric label="用户 Thread" value={threads.length} detail="不包含 initialize 与 tools/list" />
-        <Metric label="技术活动" value={technical.reduce((sum, item) => sum + item.interactionIds.length, 0)} detail="启动、能力协商与工具发现" />
-        <Metric label="采集覆盖" value={agent.coverage.status} detail={agent.coverage.reasons.join("、") || "当前无缺口原因"} />
+        <Metric label="工具调用" value={toolCallCount} detail={`${technical.reduce((sum, item) => sum + item.interactionIds.length, 0)} 条启动/协商活动另行折叠`} />
       </div>
 
       <div className="grid min-h-0 xl:grid-cols-[minmax(0,1.25fr)_minmax(300px,0.75fr)]">

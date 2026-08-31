@@ -25,6 +25,7 @@ import type {
   LogicalAgentConversationDirectoryItemV3,
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
+import { formatDuration, formatTokenTotal, tokenCoverageText } from "./agentUsage";
 
 function nsDate(value?: string, format = "MM-DD HH:mm:ss.SSS") {
   if (!value || !/^\d+$/u.test(value)) return "--";
@@ -266,7 +267,7 @@ export function ConversationSemanticTimeline({
             <Badge className="border-sky-400/20 bg-sky-500/[0.06] text-sky-100">{segments.length} 实例段</Badge>
           </div>
           <p className="mt-1 truncate font-mono text-[10px] text-zinc-500" title={conversation.workspacePath}>
-            {conversation.workspacePath} · {conversation.turnCount} 轮 · {conversation.modelCallCount} 次模型调用
+            {conversation.workspacePath} · {conversation.turnCount} 轮 · {conversation.modelCallCount} 次模型调用 · {formatTokenTotal(conversation.usage, false)} tokens · 平均 {formatDuration(conversation.usage.averageDurationMs)} · {tokenCoverageText(conversation.usage)}
           </p>
         </div>
         {agent && agent.userThreads.length > 1 ? (

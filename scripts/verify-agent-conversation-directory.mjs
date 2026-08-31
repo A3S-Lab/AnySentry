@@ -26,7 +26,24 @@ const conversation = ({
   environment = 'docker',
   at,
   status = 'complete',
-}) => ({
+}) => {
+  const modelCallCount = status === 'complete' ? 1 : 0;
+  const usage = {
+    modelCallCount,
+    successfulModelCallCount: modelCallCount,
+    failedModelCallCount: 0,
+    tokenReportedModelCallCount: modelCallCount,
+    tokenCoverage: modelCallCount ? 'complete' : 'unavailable',
+    inputTokens: modelCallCount ? 80 : 0,
+    outputTokens: modelCallCount ? 20 : 0,
+    totalTokens: modelCallCount ? 100 : 0,
+    cachedInputTokens: modelCallCount ? 10 : 0,
+    cacheCreationInputTokens: 0,
+    reasoningOutputTokens: modelCallCount ? 5 : 0,
+    totalDurationMs: modelCallCount ? 1_000 : 0,
+    ...(modelCallCount ? { averageDurationMs: 1_000 } : {}),
+  };
+  return ({
   conversationId,
   idSource: 'inferred',
   hasContent: status === 'complete',
@@ -41,13 +58,16 @@ const conversation = ({
   lastActivityAtUnixNs: at,
   firstPromptPreview: 'fixture prompt',
   turnCount: 1,
-  modelCallCount: status === 'complete' ? 1 : 0,
+  modelCallCount,
   toolCallCount: 0,
   toolResultCount: 0,
   errorCount: status === 'complete' ? 0 : 1,
   models: status === 'complete' ? ['fixture-model'] : [],
+  usage,
+  instanceUsage: agentInstanceIds.map((agentInstanceId) => ({ agentInstanceId, ...usage })),
   coverage: coverage(status),
-});
+  });
+};
 
 const runtime = (
   agentInstanceId,
@@ -123,6 +143,10 @@ assert.equal(codex.environment, 'host');
 assert.equal(codex.activeInstanceCount, 2);
 assert.equal(codex.totalInstanceCount, 2);
 assert.equal(codex.conversationCount, 2);
+assert.equal(codex.usage.modelCallCount, 2);
+assert.equal(codex.usage.totalTokens, 200);
+assert.equal(codex.usage.tokenCoverage, 'complete');
+assert.equal(codex.instanceUsage.length, 2);
 assert.deepEqual(codex.agentAssetIds.sort(), ['asset-codex-a', 'asset-codex-b']);
 assert.equal(codex.conversations[0].conversationId, 'cv-codex-b');
 assert.equal(claude.lifecycleState, 'historical');

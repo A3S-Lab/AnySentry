@@ -143,6 +143,8 @@ const pending = new Map();
 let commandId = 0;
 const runtimeExceptions = [];
 const failedRequests = [];
+let historicalAgentCollapseVerified = false;
+let historicalInstanceCollapseVerified = false;
 
 try {
   await waitFor('Chrome DevTools endpoint',
@@ -432,6 +434,63 @@ try {
     `reduced-motion timeline animations: ${runningTimelineAnimations}`);
   await screenshot('conversation-timeline-375-reduced-motion.png');
 
+  await viewport(1440, 1000);
+  await command('Page.navigate', {
+    url: `${dashboardUrl}/conversations?timeType=${encodeURIComponent(timeType)}`,
+  });
+  await waitFor(
+    'clean Agent overview route',
+    () => evaluate(`({
+      ready: (document.body?.innerText ?? '').includes('Agent 整体概览'),
+      history: document.querySelector('button[data-agent-history-toggle]')?.getAttribute('aria-expanded')
+    })`),
+    (value) => value.ready,
+    60_000,
+  );
+  const collapsedHistory = await evaluate(`(() => {
+    const toggle = document.querySelector('button[data-agent-history-toggle]');
+    if (!toggle) return { available: false };
+    const target = document.getElementById(toggle.getAttribute('aria-controls'));
+    return {
+      available: true,
+      expanded: toggle.getAttribute('aria-expanded'),
+      hidden: target?.hidden,
+    };
+  })()`);
+  if (collapsedHistory.available) {
+    assert.equal(collapsedHistory.expanded, 'false', JSON.stringify(collapsedHistory));
+    assert.equal(collapsedHistory.hidden, true, JSON.stringify(collapsedHistory));
+    historicalAgentCollapseVerified = true;
+  }
+  const instanceCollapse = await evaluate(`(() => {
+    const toggle = document.querySelector('button[data-instance-history-toggle]');
+    if (!toggle) return { available: false };
+    return {
+      available: true,
+      expanded: toggle.getAttribute('aria-expanded'),
+      visibleHistory: document.querySelectorAll('button[data-runtime-state="lost"], button[data-runtime-state="exited"]').length,
+    };
+  })()`);
+  if (instanceCollapse.available) {
+    assert.equal(instanceCollapse.expanded, 'false', JSON.stringify(instanceCollapse));
+    assert.equal(instanceCollapse.visibleHistory, 0, JSON.stringify(instanceCollapse));
+    await evaluate(`document.querySelector('button[data-instance-history-toggle]')?.click()`);
+    await waitFor(
+      'historical instances expand',
+      () => evaluate(`({
+        expanded: document.querySelector('button[data-instance-history-toggle]')?.getAttribute('aria-expanded'),
+        visibleHistory: document.querySelectorAll('button[data-runtime-state="lost"], button[data-runtime-state="exited"]').length
+      })`),
+      (value) => value.expanded === 'true' && value.visibleHistory > 0,
+    );
+    historicalInstanceCollapseVerified = true;
+  }
+  const overviewText = await evaluate('document.body?.innerText ?? ""');
+  assert(overviewText.includes('Token 用量') && overviewText.includes('模型调用'),
+    'Agent overview must expose token and model-call summaries');
+  await assertNoOverflow('conversation collapsed history 1440');
+  await screenshot('conversation-history-collapsed-1440.png');
+
   assert.deepEqual(runtimeExceptions, [], `browser runtime exceptions: ${runtimeExceptions.join('; ')}`);
   assert.deepEqual(failedRequests, [], `browser network failures: ${failedRequests.join('; ')}`);
   console.log(JSON.stringify({
@@ -445,6 +504,9 @@ try {
     inspectorStructuredRawEvidence: true,
     responsiveViewports: [1440, 1024, 390, 375],
     reducedMotion: true,
+    tokenUsageSummary: true,
+    historicalAgentCollapseVerified,
+    historicalInstanceCollapseVerified,
     mobileTouchTargets: true,
     rapidThreadSwitches: rapidSwitch.tested ? 100 : 0,
     horizontalOverflow: false,

@@ -1,4 +1,3 @@
-import dayjs from "dayjs";
 import { Bot, Boxes, ChevronRight, Cpu, MessageSquareText } from "lucide-react";
 import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 
@@ -8,6 +7,7 @@ import type {
   LogicalAgentConversationDirectoryItemV3,
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
+import { formatTokenTotal, usageForInstance } from "./agentUsage";
 
 function runtimeId(instance: AgentRuntimeInstanceRecord) {
   return instance.canonicalAgentInstanceId ?? instance.agentInstanceId;
@@ -82,10 +82,25 @@ export function LogicalAgentNavigator({
 }) {
   const refs = useRef(new Map<string, HTMLButtonElement>());
   const [expandedHistory, setExpandedHistory] = useState<Set<string>>(() => new Set());
+  const [historicalAgentsExpanded, setHistoricalAgentsExpanded] = useState(false);
+  const currentAgents = useMemo(
+    () => items.filter((item) => item.lifecycleState !== "historical"),
+    [items],
+  );
+  const historicalAgents = useMemo(
+    () => items.filter((item) => item.lifecycleState === "historical"),
+    [items],
+  );
   const ordered = useMemo(() => [
-    ...items.filter((item) => item.lifecycleState !== "historical"),
-    ...items.filter((item) => item.lifecycleState === "historical"),
-  ], [items]);
+    ...currentAgents,
+    ...(historicalAgentsExpanded ? historicalAgents : []),
+  ], [currentAgents, historicalAgents, historicalAgentsExpanded]);
+  useEffect(() => {
+    if (selectedLogicalAgentId && historicalAgents.some((item) =>
+      item.logicalAgentId === selectedLogicalAgentId)) {
+      setHistoricalAgentsExpanded(true);
+    }
+  }, [historicalAgents, selectedLogicalAgentId]);
   useEffect(() => {
     if (!selectedLogicalAgentId) return;
     const frame = window.requestAnimationFrame(() => {
@@ -107,13 +122,37 @@ export function LogicalAgentNavigator({
     window.requestAnimationFrame(() => refs.current.get(next.logicalAgentId)?.focus());
   };
 
-  const renderSection = (title: string, agents: LogicalAgentConversationDirectoryItemV3[]) => (
-    <section aria-labelledby={`agent-section-${title}`}>
-      <div className="sticky top-0 z-10 flex h-9 items-center justify-between border-y border-white/8 bg-[#0d120f]/95 px-3 backdrop-blur">
-        <h3 id={`agent-section-${title}`} className="text-[11px] font-semibold text-zinc-300">{title}</h3>
-        <span className="font-mono text-[10px] text-zinc-500">{agents.length}</span>
-      </div>
-      <div className="divide-y divide-white/8">
+  const renderSection = (
+    sectionId: "current" | "history",
+    title: string,
+    agents: LogicalAgentConversationDirectoryItemV3[],
+    collapsible = false,
+  ) => {
+    const expanded = !collapsible || historicalAgentsExpanded;
+    return (
+    <section aria-labelledby={`agent-section-${sectionId}`}>
+      {collapsible ? (
+        <button
+          type="button"
+          data-agent-history-toggle
+          aria-expanded={expanded}
+          aria-controls={`agent-section-${sectionId}-items`}
+          onClick={() => setHistoricalAgentsExpanded((value) => !value)}
+          className="sticky top-0 z-10 flex min-h-11 w-full cursor-pointer items-center justify-between border-y border-white/8 bg-[#0d120f]/95 px-3 text-left backdrop-blur transition-colors hover:bg-white/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-violet-400/70"
+        >
+          <span className="flex items-center gap-2">
+            <ChevronRight className={cn("size-3.5 text-zinc-500 transition-transform", expanded && "rotate-90")} aria-hidden="true" />
+            <span id={`agent-section-${sectionId}`} className="text-[11px] font-semibold text-zinc-300">{title}</span>
+          </span>
+          <span className="font-mono text-[10px] text-zinc-500">{agents.length}</span>
+        </button>
+      ) : (
+        <div className="sticky top-0 z-10 flex min-h-11 items-center justify-between border-y border-white/8 bg-[#0d120f]/95 px-3 backdrop-blur">
+          <h3 id={`agent-section-${sectionId}`} className="text-[11px] font-semibold text-zinc-300">{title}</h3>
+          <span className="font-mono text-[10px] text-zinc-500">{agents.length}</span>
+        </div>
+      )}
+      <div id={`agent-section-${sectionId}-items`} hidden={!expanded} className="divide-y divide-white/8">
         {agents.map((agent) => {
           const index = ordered.indexOf(agent);
           const active = agent.logicalAgentId === selectedLogicalAgentId;
@@ -123,13 +162,25 @@ export function LogicalAgentNavigator({
           const historicalInstances = instances.filter((instance) =>
             instance.runtimeState !== "running" && instance.runtimeState !== "unobserved");
           const historyExpanded = expandedHistory.has(agent.logicalAgentId);
+          const selectedRuntime = selectedInstanceId
+            ? instances.find((instance) => runtimeAliases(instance).has(selectedInstanceId))
+            : undefined;
+          const selectedRuntimeAliases = selectedRuntime
+            ? runtimeAliases(selectedRuntime)
+            : new Set(selectedInstanceId ? [selectedInstanceId] : []);
+          const selectedHistoricalInstance = Boolean(selectedRuntime
+            && selectedRuntime.runtimeState !== "running"
+            && selectedRuntime.runtimeState !== "unobserved");
           const displayedInstances = historyExpanded
             ? instances
-            : [...currentInstances, ...historicalInstances.slice(0, 8)];
-          const hiddenHistoryCount = Math.max(0, historicalInstances.length - 8);
+            : [
+                ...currentInstances,
+                ...(selectedHistoricalInstance && selectedRuntime ? [selectedRuntime] : []),
+              ];
+          const hiddenHistoryCount = historicalInstances.length;
           const visibleConversations = selectedInstanceId
             ? agent.userThreads.filter((conversation) =>
-                conversation.agentInstanceIds.includes(selectedInstanceId))
+                conversation.agentInstanceIds.some((identity) => selectedRuntimeAliases.has(identity)))
             : agent.userThreads;
           return (
             <div key={agent.logicalAgentId} className={cn(active && "bg-white/[0.018]")}>
@@ -166,7 +217,7 @@ export function LogicalAgentNavigator({
                     <span className="mt-0.5 block truncate font-mono text-[10px] text-zinc-500">{agent.product} · {agent.environment}</span>
                     <span className="mt-1.5 flex items-center justify-between gap-2 text-[10px] text-zinc-500">
                       <span className="truncate">{agent.workspacePath}</span>
-                      <span className="shrink-0">{agent.conversationCount} 会话</span>
+                      <span className="shrink-0">{agent.usage.modelCallCount} 调用 · {formatTokenTotal(agent.usage)} tokens</span>
                     </span>
                   </span>
                 </span>
@@ -181,11 +232,14 @@ export function LogicalAgentNavigator({
                   <div className="space-y-1">
                     {displayedInstances.length ? displayedInstances.map((instance) => {
                       const canonical = runtimeId(instance);
-                      const selected = selectedInstanceId === canonical;
+                      const aliases = runtimeAliases(instance);
+                      const selected = Boolean(selectedInstanceId && aliases.has(selectedInstanceId));
+                      const instanceUsage = usageForInstance(agent.instanceUsage, aliases);
                       return (
                         <button
                           key={canonical}
                           type="button"
+                          data-runtime-state={instance.runtimeState}
                           onClick={() => onSelectInstance(agent, instance)}
                           className={cn(
                             "flex min-h-11 w-full cursor-pointer items-center gap-2 rounded border px-2 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/70",
@@ -201,7 +255,7 @@ export function LogicalAgentNavigator({
                               <span className="text-[10px] text-zinc-500">{lifecycleText(instance)}</span>
                             </span>
                             <span className="mt-0.5 block truncate text-[10px] text-zinc-600">
-                              pid {instance.rootPid} · {dayjs(instance.lastSeenAt).format("MM-DD HH:mm")}
+                              pid {instance.rootPid} · {instanceUsage.modelCallCount} 调用 · {formatTokenTotal(instanceUsage)} tokens
                             </span>
                           </span>
                         </button>
@@ -209,9 +263,10 @@ export function LogicalAgentNavigator({
                     }) : (
                       <p className="px-2 py-2 text-[10px] leading-4 text-zinc-600">实例历史正在恢复；会话正文仍可按 Thread 查看。</p>
                     )}
-                    {hiddenHistoryCount > 0 || historyExpanded && historicalInstances.length > 8 ? (
+                    {historicalInstances.length > 0 ? (
                       <button
                         type="button"
+                        data-instance-history-toggle
                         aria-expanded={historyExpanded}
                         onClick={() => setExpandedHistory((current) => {
                           const next = new Set(current);
@@ -221,7 +276,7 @@ export function LogicalAgentNavigator({
                         })}
                         className="min-h-11 w-full cursor-pointer rounded border border-dashed border-white/10 px-2 text-[10px] text-zinc-500 transition-colors hover:border-violet-400/25 hover:bg-violet-500/[0.04] hover:text-zinc-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70"
                       >
-                        {historyExpanded ? "收起较早历史实例" : `展开另外 ${hiddenHistoryCount} 个历史实例`}
+                        {historyExpanded ? "收起失联/退出实例" : `展开 ${hiddenHistoryCount} 个失联/退出实例`}
                       </button>
                     ) : null}
                   </div>
@@ -257,7 +312,7 @@ export function LogicalAgentNavigator({
                             {conversation.agentInstanceIds.length > 1 ? ` · ${conversation.agentInstanceIds.length} 段` : ""}
                           </span>
                           <span className="mt-0.5 block truncate text-[10px] text-zinc-600">
-                            {conversation.firstPromptPreview ?? "无正文"}
+                            {conversation.firstPromptPreview ?? "无正文"} · {formatTokenTotal(conversation.usage)} tokens
                           </span>
                         </span>
                         <ChevronRight className="size-3 shrink-0 text-zinc-700" aria-hidden="true" />
@@ -274,7 +329,8 @@ export function LogicalAgentNavigator({
         })}
       </div>
     </section>
-  );
+    );
+  };
 
   return (
     <section className="h-full min-h-0 overflow-hidden border-r border-white/10 bg-[#0d120f]" aria-label="逻辑 Agent、运行实例与对话线程">
@@ -303,8 +359,10 @@ export function LogicalAgentNavigator({
           </div>
         ) : (
           <>
-            {renderSection("当前运行", ordered.filter((item) => item.lifecycleState !== "historical"))}
-            {renderSection("历史 Agent", ordered.filter((item) => item.lifecycleState === "historical"))}
+            {renderSection("current", "当前运行", currentAgents)}
+            {historicalAgents.length
+              ? renderSection("history", "历史 Agent", historicalAgents, true)
+              : null}
           </>
         )}
       </div>

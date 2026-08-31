@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
 
 import type * as T from './types';
+import {
+  emptyAgentUsageSummary,
+  rollupAgentUsageSummaries,
+} from './agent-conversation';
 
 function normalized(value?: string): string {
   return (value ?? '').trim().toLowerCase().replace(/\s+/gu, ' ');
@@ -139,6 +143,23 @@ function runtimeIdentityIds(instance: T.AgentRuntimeInstanceRecord): string[] {
   ])];
 }
 
+function rollupInstanceUsage(
+  conversations: readonly T.AgentConversationSummary[],
+): T.AgentInstanceUsageSummary[] {
+  const byInstance = new Map<string, T.AgentUsageSummary[]>();
+  for (const conversation of conversations) {
+    for (const usage of conversation.instanceUsage ?? []) {
+      const summaries = byInstance.get(usage.agentInstanceId) ?? [];
+      summaries.push(usage);
+      byInstance.set(usage.agentInstanceId, summaries);
+    }
+  }
+  return [...byInstance.entries()].map(([agentInstanceId, summaries]) => ({
+    agentInstanceId,
+    ...rollupAgentUsageSummaries(summaries),
+  }));
+}
+
 export function projectAgentConversationDirectory(
   conversations: T.AgentConversationSummary[],
   runtimeInstances: T.AgentRuntimeInstanceRecord[],
@@ -211,6 +232,9 @@ export function projectAgentConversationDirectory(
       agentAssetIds,
       agentInstanceIds: [...instanceSet],
       conversations,
+      usage: rollupAgentUsageSummaries(conversations.map((item) =>
+        item.usage ?? emptyAgentUsageSummary())),
+      instanceUsage: rollupInstanceUsage(conversations),
       coverage: coverageRollup(conversations),
     } satisfies T.LogicalAgentConversationDirectoryItem;
   });
@@ -254,6 +278,8 @@ export function projectAgentConversationDirectory(
       agentAssetIds: [],
       agentInstanceIds: [...new Set(instances.map(runtimeCanonicalId))],
       conversations: [],
+      usage: emptyAgentUsageSummary(),
+      instanceUsage: [],
       coverage: {
         status: 'asset_only',
         reasons: ['runtime_instance_without_conversation'],

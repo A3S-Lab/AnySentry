@@ -560,6 +560,118 @@ function conversationCoverage(
   };
 }
 
+export function emptyAgentUsageSummary(): T.AgentUsageSummary {
+  return {
+    modelCallCount: 0,
+    successfulModelCallCount: 0,
+    failedModelCallCount: 0,
+    tokenReportedModelCallCount: 0,
+    tokenCoverage: 'unavailable',
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    cachedInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    reasoningOutputTokens: 0,
+    totalDurationMs: 0,
+  };
+}
+
+function durationMs(record: T.AgentInteractionRecord): number {
+  try {
+    const duration = BigInt(record.durationNs) / 1_000_000n;
+    return Number(duration > BigInt(Number.MAX_SAFE_INTEGER)
+      ? BigInt(Number.MAX_SAFE_INTEGER)
+      : duration);
+  } catch {
+    return 0;
+  }
+}
+
+export function summarizeAgentUsage(
+  records: readonly T.AgentInteractionRecord[],
+): T.AgentUsageSummary {
+  const modelCalls = records.filter((record) => record.interactionType === 'model');
+  if (modelCalls.length === 0) return emptyAgentUsageSummary();
+  const reported = modelCalls.filter((record) => Boolean(record.usage));
+  const totalDurationMs = modelCalls.reduce((sum, record) => sum + durationMs(record), 0);
+  const successfulModelCallCount = modelCalls.filter((record) =>
+    record.statusCode >= 200
+    && record.statusCode < 400
+    && record.wireCompleteness !== 'error').length;
+  const tokenCoverage: T.AgentUsageSummary['tokenCoverage'] = reported.length === 0
+    ? 'unavailable'
+    : reported.length === modelCalls.length
+      && reported.every((record) => record.usage?.completeness === 'complete')
+      ? 'complete'
+      : 'partial';
+  const sum = (select: (usage: T.AgentInteractionTokenUsage) => number | undefined) =>
+    reported.reduce((total, record) => total + (record.usage ? select(record.usage) ?? 0 : 0), 0);
+  return {
+    modelCallCount: modelCalls.length,
+    successfulModelCallCount,
+    failedModelCallCount: modelCalls.length - successfulModelCallCount,
+    tokenReportedModelCallCount: reported.length,
+    tokenCoverage,
+    inputTokens: sum((usage) => usage.inputTokens),
+    outputTokens: sum((usage) => usage.outputTokens),
+    totalTokens: sum((usage) => usage.totalTokens),
+    cachedInputTokens: sum((usage) => usage.cachedInputTokens),
+    cacheCreationInputTokens: sum((usage) => usage.cacheCreationInputTokens),
+    reasoningOutputTokens: sum((usage) => usage.reasoningOutputTokens),
+    totalDurationMs,
+    averageDurationMs: totalDurationMs / modelCalls.length,
+  };
+}
+
+export function rollupAgentUsageSummaries(
+  summaries: readonly T.AgentUsageSummary[],
+): T.AgentUsageSummary {
+  const nonEmpty = summaries.filter((summary) => summary.modelCallCount > 0);
+  if (nonEmpty.length === 0) return emptyAgentUsageSummary();
+  const sum = (select: (summary: T.AgentUsageSummary) => number) =>
+    nonEmpty.reduce((total, summary) => total + select(summary), 0);
+  const modelCallCount = sum((summary) => summary.modelCallCount);
+  const tokenReportedModelCallCount = sum((summary) => summary.tokenReportedModelCallCount);
+  const totalDurationMs = sum((summary) => summary.totalDurationMs);
+  return {
+    modelCallCount,
+    successfulModelCallCount: sum((summary) => summary.successfulModelCallCount),
+    failedModelCallCount: sum((summary) => summary.failedModelCallCount),
+    tokenReportedModelCallCount,
+    tokenCoverage: tokenReportedModelCallCount === 0
+      ? 'unavailable'
+      : tokenReportedModelCallCount === modelCallCount
+        && nonEmpty.every((summary) => summary.tokenCoverage === 'complete')
+        ? 'complete'
+        : 'partial',
+    inputTokens: sum((summary) => summary.inputTokens),
+    outputTokens: sum((summary) => summary.outputTokens),
+    totalTokens: sum((summary) => summary.totalTokens),
+    cachedInputTokens: sum((summary) => summary.cachedInputTokens),
+    cacheCreationInputTokens: sum((summary) => summary.cacheCreationInputTokens),
+    reasoningOutputTokens: sum((summary) => summary.reasoningOutputTokens),
+    totalDurationMs,
+    averageDurationMs: totalDurationMs / modelCallCount,
+  };
+}
+
+function summarizeInstanceUsage(
+  records: readonly T.AgentInteractionRecord[],
+): T.AgentInstanceUsageSummary[] {
+  const byInstance = new Map<string, T.AgentInteractionRecord[]>();
+  for (const record of records) {
+    if (!record.agentInstanceId) continue;
+    const instance = byInstance.get(record.agentInstanceId) ?? [];
+    instance.push(record);
+    byInstance.set(record.agentInstanceId, instance);
+  }
+  return [...byInstance.entries()].map(([agentInstanceId, interactions]) => ({
+    agentInstanceId,
+    ...summarizeAgentUsage(interactions),
+  }));
+}
+
 function summaryForConversation(
   conversationId: string,
   source: 'provider' | 'runtime' | 'inferred',
@@ -577,6 +689,7 @@ function summaryForConversation(
     first.agentProduct ?? asset?.agentProduct ?? asset?.detectedName,
   ) ?? 'Agent';
   const resolvedResults = resolvedToolResultIds(interactions);
+  const usage = summarizeAgentUsage(interactions);
   return {
     conversationId,
     idSource: source,
@@ -592,7 +705,7 @@ function summaryForConversation(
     lastActivityAtUnixNs: last.endedAtUnixNs,
     firstPromptPreview: firstPromptPreview(first),
     turnCount: turnIds.size,
-    modelCallCount: interactions.filter((item) => item.interactionType === 'model').length,
+    modelCallCount: usage.modelCallCount,
     toolCallCount: interactions.reduce((sum, item) => sum + item.toolCalls.length, 0),
     toolResultCount: interactions.reduce((sum, item) => sum + item.toolResults.length, 0),
     errorCount: interactions.filter((item) =>
@@ -601,6 +714,8 @@ function summaryForConversation(
     models: [...new Set(interactions
       .map((item) => item.model)
       .filter((value): value is string => Boolean(value)))],
+    usage,
+    instanceUsage: summarizeInstanceUsage(interactions),
     coverage: conversationCoverage(interactions),
   };
 }
@@ -630,6 +745,8 @@ function assetOnlySummary(
     toolResultCount: 0,
     errorCount: 0,
     models: [],
+    usage: emptyAgentUsageSummary(),
+    instanceUsage: [],
     coverage: conversationCoverage(evidence),
   };
 }

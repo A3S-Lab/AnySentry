@@ -227,6 +227,39 @@ function toolResults(value: unknown): T.AgentInteractionToolResult[] {
   }).filter((item): item is T.AgentInteractionToolResult => Boolean(item));
 }
 
+function tokenUsage(value: unknown): T.AgentInteractionTokenUsage | undefined {
+  const input = record(value);
+  if (
+    !input
+    || input.source !== 'provider_reported'
+    || (input.completeness !== 'complete' && input.completeness !== 'partial')
+    || typeof input.totalTokensDerived !== 'boolean'
+  ) return undefined;
+  const counters = {
+    inputTokens: integer(input.inputTokens, 0, Number.MAX_SAFE_INTEGER),
+    outputTokens: integer(input.outputTokens, 0, Number.MAX_SAFE_INTEGER),
+    totalTokens: integer(input.totalTokens, 0, Number.MAX_SAFE_INTEGER),
+    cachedInputTokens: integer(input.cachedInputTokens, 0, Number.MAX_SAFE_INTEGER),
+    cacheCreationInputTokens: integer(
+      input.cacheCreationInputTokens,
+      0,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    reasoningOutputTokens: integer(input.reasoningOutputTokens, 0, Number.MAX_SAFE_INTEGER),
+  };
+  if (
+    counters.inputTokens === undefined
+    && counters.outputTokens === undefined
+    && counters.totalTokens === undefined
+  ) return undefined;
+  return {
+    source: 'provider_reported',
+    completeness: input.completeness,
+    ...Object.fromEntries(Object.entries(counters).filter(([, counter]) => counter !== undefined)),
+    totalTokensDerived: input.totalTokensDerived,
+  } as T.AgentInteractionTokenUsage;
+}
+
 function semanticItems(value: unknown): T.AgentInteractionSemanticItem[] {
   if (!Array.isArray(value)) return [];
   return value.slice(0, MAX_SEMANTIC_ITEMS)
@@ -464,6 +497,7 @@ export function parseObserverAgentInteraction(
   const durationNs = unixNs(input.durationNs);
   const request = content(input.request);
   const response = content(input.response);
+  const usage = tokenUsage(input.usage);
   if (
     !interactionId || !/^mi_[a-f0-9]{24,64}$/u.test(interactionId)
     || !connectionId || !endpoint || !method || !path
@@ -575,6 +609,7 @@ export function parseObserverAgentInteraction(
     timeQuality: string(input.timeQuality, 80) ?? 'unknown',
     request,
     response,
+    ...(usage ? { usage } : {}),
     toolCalls: toolCalls(input.toolCalls),
     toolResults: toolResults(input.toolResults),
     ...(string(input.semanticParserId, 160)

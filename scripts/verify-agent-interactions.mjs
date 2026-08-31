@@ -135,6 +135,16 @@ const line = JSON.stringify({
         ],
       }),
       response: content(responseBody, { text: 'VISIBLE_RESPONSE_SENTINEL' }),
+      usage: {
+        source: 'provider_reported',
+        completeness: 'complete',
+        inputTokens: 120,
+        outputTokens: 30,
+        totalTokens: 150,
+        cachedInputTokens: 40,
+        reasoningOutputTokens: 12,
+        totalTokensDerived: false,
+      },
       toolCalls: [{
         toolCallId: 'call-fixture-2',
         name: 'read',
@@ -325,12 +335,31 @@ assert.equal(item.wireCompleteness, 'complete');
 assert.equal(item.conversationCompleteness, 'complete');
 assert.equal(item.request.body, requestBody);
 assert.equal(item.response.text, 'VISIBLE_RESPONSE_SENTINEL');
+assert.deepEqual(item.usage, {
+  source: 'provider_reported',
+  completeness: 'complete',
+  inputTokens: 120,
+  outputTokens: 30,
+  totalTokens: 150,
+  cachedInputTokens: 40,
+  reasoningOutputTokens: 12,
+  totalTokensDerived: false,
+});
 assert.equal(item.toolCalls[0].toolCallId, 'call-fixture-2');
 assert.deepEqual(item.toolCalls[0].arguments, { path: 'canary.txt' });
 assert.equal(item.toolResults[0].content, 'TOOL_RESULT_SENTINEL');
 assert.equal(item.completeness, 'complete');
 assert.equal(item.captureSource, 'tls_uprobe');
 assert.ok(!JSON.stringify(item).includes('authorization'), 'transport credentials must not enter interaction content');
+const usageEvent = await request('/events/list', 'POST', {
+  timeType: 'last_30d',
+  scope: 'raw',
+  eventId: item.evidenceEventIds?.[0],
+  limit: 10,
+});
+assert.equal(usageEvent.items[0]?.tokenCount, 150);
+assert.equal(usageEvent.items[0]?.attributes?.['llm.usage.input_tokens'], 120);
+assert.equal(usageEvent.items[0]?.attributes?.['llm.usage.output_tokens'], 30);
 
 const noTokenInteraction = await requestWithoutManagementToken('/agents/interactions', {
   timeType: 'last_30d', scope: 'raw', interactionId, limit: 10,
@@ -361,6 +390,13 @@ assert.equal(conversation.idSource, 'provider');
 assert.equal(conversation.modelCallCount, 1);
 assert.equal(conversation.toolCallCount, 1);
 assert.equal(conversation.toolResultCount, 1);
+assert.equal(conversation.usage.totalTokens, 150);
+assert.equal(conversation.usage.inputTokens, 120);
+assert.equal(conversation.usage.outputTokens, 30);
+assert.equal(conversation.usage.tokenCoverage, 'complete');
+assert.equal(conversation.usage.tokenReportedModelCallCount, 1);
+assert.equal(conversation.instanceUsage.length, 1);
+assert.equal(conversation.instanceUsage[0].totalTokens, 150);
 assert.match(conversation.firstPromptPreview, /FINAL_REQUEST_SENTINEL/u);
 
 const timeline = await requestWithoutManagementToken('/agents/conversations/timeline', {
@@ -406,6 +442,8 @@ const v3Owner = directoryV3.items.find((entry) =>
   entry.userThreads.some((thread) => thread.conversationId === conversation.conversationId));
 assert.ok(v3Owner, JSON.stringify(directoryV3));
 assert.equal(v3Owner.conversationCount, v3Owner.userThreads.length);
+assert.ok(v3Owner.usage.totalTokens >= 150);
+assert.ok(v3Owner.instanceUsage.some((usage) => usage.totalTokens >= 150));
 
 const semanticTimelineV3 = await requestWithoutManagementToken('/agents/conversations/timeline-v3', {
   timeType: 'last_30d',

@@ -1557,3 +1557,52 @@ Canonical Thread 自路由优先于历史控制流 Alias，旧深链接不会再
 - Observer CI：`https://github.com/A3S-Lab/Observer/actions/runs/33374623192`。
 
 ClickHouse 在大历史窗口上仍可能返回 `scan_limit` 或受限查询回退；API 会明确报告 partial coverage，不将缺失证据伪装成完整链路。该状态不改变已持久化的 Thread、Membership、Alias 或 Semantic-Kernel Relation。
+
+---
+
+## 25. V4.1：Token 用量、长连接恢复与历史渐进披露
+
+### 25.1 用量事实合同
+
+Token 只采用模型服务在响应 `usage` 中返回的事实，不根据字符数、字节数或模型词表估算。单次 Interaction 支持：
+
+- input / output / total tokens；
+- cached input tokens；
+- cache creation input tokens；
+- reasoning output tokens；
+- `complete / partial` 用量完整度；
+- total 是否由已报告的 input + output 精确相加得到。
+
+流式 SSE 和 WebSocket 可能多次携带累计 usage，因此同一次模型调用按字段取累计最大值，不能逐事件求和。缓存和推理字段分别是 input/output 的子集，也不能再次加到 total。
+
+聚合路径为：
+
+```text
+Provider usage
+  -> Model Interaction
+  -> Canonical Conversation Thread
+  -> Runtime Instance
+  -> Logical Agent
+```
+
+每层同时展示模型调用数、成功/异常数、Token 覆盖度、总耗时和平均耗时。跨实例恢复的 Thread 通过 `instanceUsage[]` 保留每个真实根进程的份额；Logical Agent 再对互斥 Thread 求和，避免同一 Interaction 被 Alias、Replay 或页面筛选重复计算。
+
+### 25.2 SSH Codex 长连接恢复
+
+运行态证据显示，Host Codex 已被识别且 Rustls 探针命中 WebSocket Upgrade，但模型帧在握手后没有形成 Interaction。直接原因是 HTTP 重组状态统一在 90 秒空闲后过期，而 Codex 会长期复用 Responses WebSocket。
+
+修复后的边界：
+
+- 普通 HTTP、半包和存在 pending request 的连接仍使用 90 秒超时；
+- 已完成一轮且当前无 pending/buffer 的 WebSocket 状态最多保留 24 小时；
+- Collector 重启或握手早于采集窗口时，可由“客户端 masked data frame + JSON/压缩帧强特征”恢复 WebSocket 模式；
+- Rustls 指针被新连接复用且出现明确 HTTP request prefix 时，旧 WebSocket 状态立即重置；
+- 未观察到握手的恢复链路标记 `websocket_handshake_recovered`，不伪装为完整传输证据；
+- 连接表仍受全局容量和最旧连接淘汰约束，不形成无界缓存。
+
+### 25.3 页面渐进披露
+
+- 历史 Logical Agent 默认整组折叠，只显示数量；深链接选中历史 Agent 时自动展开。
+- 当前 Agent 默认只显示 running / unobserved 实例；lost / exited 实例折叠在显式按钮后。
+- 深链接选中的历史实例即使处于折叠状态仍单独保留可见，避免 URL 与页面选择失配。
+- Agent Overview、Instance Overview、Thread Header 和单次 Interaction Inspector 分层展示用量；没有 provider usage 时明确显示“未报告”，不显示伪造的 0 Token。
