@@ -451,6 +451,56 @@ const legacyDockerProjection = projectAgentConversations([
 assert.equal(legacyDockerProjection.summaries[0].environment, 'docker',
   'legacy agent:// container workspaces must migrate to the Docker environment');
 
+const hostResumeAcrossMissingWorkspace = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_host_resume_explicit', at: base + 3_600, instance: 'host-root:resume:one',
+    workspacePath: '/tmp/explicit-workspace', conversationId: 'cv_host_resume_explicit',
+    request: {
+      model: 'fixture', prompt_cache_key: 'host-resume-continuity',
+      input: [human('host-resume-h0', 'host-resume-t0', 'first host turn')],
+    },
+    responseId: 'host-resume-response-1',
+  }),
+  interaction({
+    id: 'mi_v2_host_resume_synthetic', at: base + 3_700, instance: 'host-root:resume:two',
+    workspacePath: 'agent://runtime-worker', conversationId: 'cv_host_resume_synthetic',
+    previousResponseId: 'host-resume-response-1', responseId: 'host-resume-response-2',
+    request: {
+      model: 'fixture', prompt_cache_key: 'host-resume-continuity',
+      input: [
+        human('host-resume-h0', 'host-resume-t0', 'first host turn'),
+        human('host-resume-h1', 'host-resume-t1', 'resumed host turn'),
+      ],
+    },
+  }),
+]);
+assert.equal(new Set(hostResumeAcrossMissingWorkspace.conversationRecords
+  .map((item) => item.conversationId)).size, 1,
+  'strong continuity evidence must bridge one missing/synthetic workspace');
+assert.equal(hostResumeAcrossMissingWorkspace.aliases.find((item) =>
+  item.aliasConversationId === 'cv_host_resume_synthetic')?.canonicalConversationId,
+  'cv_host_resume_explicit');
+
+const conflictingExplicitWorkspaces = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_workspace_a', at: base + 3_800, instance: 'host-root:workspace:a',
+    workspacePath: '/workspace/a', request: {
+      model: 'fixture', prompt_cache_key: 'colliding-continuity',
+      messages: [{ role: 'user', content: 'workspace A' }],
+    }, responseId: 'workspace-a',
+  }),
+  interaction({
+    id: 'mi_v2_workspace_b', at: base + 3_900, instance: 'host-root:workspace:b',
+    workspacePath: '/workspace/b', request: {
+      model: 'fixture', prompt_cache_key: 'colliding-continuity',
+      messages: [{ role: 'user', content: 'workspace B' }],
+    }, responseId: 'workspace-b',
+  }),
+]);
+assert.equal(new Set(conflictingExplicitWorkspaces.conversationRecords
+  .map((item) => item.conversationId)).size, 2,
+  'different explicit workspaces must remain a hard Thread boundary');
+
 const assertOneThread = (records, label) => {
   const resolved = resolveAgentConversationsV2(records);
   assert.equal(new Set(resolved.conversationRecords.map((item) => item.conversationId)).size, 1, label);

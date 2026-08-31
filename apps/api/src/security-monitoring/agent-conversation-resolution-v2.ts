@@ -351,6 +351,26 @@ export function conversationLogicalScopeKeyV2(record: T.AgentInteractionRecord):
   ].join('\u0000'));
 }
 
+function anchorScopeKey(record: T.AgentInteractionRecord): string {
+  return stableId('as', [
+    normalized(record.tenantId),
+    normalized(record.environmentId),
+    normalized(record.agentProduct),
+    normalized(record.process?.hostId),
+  ].join('\u0000'));
+}
+
+function explicitWorkspace(record: T.AgentInteractionRecord): string | undefined {
+  const workspace = normalized(record.workspacePath).replace(/\/+$/u, '');
+  if (
+    !workspace
+    || workspace === 'workspace:unknown'
+    || workspace.startsWith('agent://')
+    || workspace.startsWith('agent-scope:')
+  ) return undefined;
+  return workspace;
+}
+
 class DisjointSet {
   private readonly parents: number[];
 
@@ -410,9 +430,18 @@ function canMerge(
 ): boolean {
   const leftProvider = explicitProviderIds(left, records);
   const rightProvider = explicitProviderIds(right, records);
-  return leftProvider.size === 0
+  const providerCompatible = leftProvider.size === 0
     || rightProvider.size === 0
     || [...leftProvider].some((value) => rightProvider.has(value));
+  if (!providerCompatible) return false;
+  // A synthetic/unknown workspace is missing evidence, not a contradictory identity. Strong
+  // provider, response-chain, continuity, tool or replay anchors may bridge it to one explicit
+  // workspace. Two different explicit workspaces remain a hard conflict so an anchor collision
+  // cannot merge unrelated projects.
+  const explicitWorkspaces = new Set([...left, ...right]
+    .map((index) => explicitWorkspace(records[index]))
+    .filter((value): value is string => Boolean(value)));
+  return explicitWorkspaces.size <= 1;
 }
 
 function groupIndexes(set: DisjointSet, indexes: number[]): Map<number, number[]> {
@@ -439,6 +468,27 @@ function unionGroupsIfAllowed(
   if (!canMerge(left, right, records)) return false;
   set.union(leftIndex, rightIndex);
   return true;
+}
+
+function rememberIndex(map: Map<string, number[]>, key: string, index: number): void {
+  const indexes = map.get(key) ?? [];
+  indexes.push(index);
+  map.set(key, indexes);
+}
+
+function unionCompatiblePrior(
+  set: DisjointSet,
+  map: Map<string, number[]>,
+  key: string,
+  index: number,
+  visibleIndexes: number[],
+  records: T.AgentInteractionRecord[],
+): boolean {
+  const candidates = map.get(key) ?? [];
+  for (let offset = candidates.length - 1; offset >= 0; offset -= 1) {
+    if (unionGroupsIfAllowed(set, candidates[offset], index, visibleIndexes, records)) return true;
+  }
+  return false;
 }
 
 function canonicalConversationId(
@@ -580,49 +630,50 @@ export function resolveAgentConversationsV2(
   const technicalRecords = records.filter((_, index) => !visibleSet.has(index));
   const set = new DisjointSet(records.length);
 
-  const existing = new Map<string, number>();
-  const provider = new Map<string, number>();
-  const response = new Map<string, number>();
-  const continuity = new Map<string, number>();
-  const toolCalls = new Map<string, number>();
+  const existing = new Map<string, number[]>();
+  const provider = new Map<string, number[]>();
+  const response = new Map<string, number[]>();
+  const continuity = new Map<string, number[]>();
+  const toolCalls = new Map<string, number[]>();
 
   for (const index of visibleIndexes) {
     const item = records[index];
-    const scope = conversationLogicalScopeKeyV2(item);
+    const scope = anchorScopeKey(item);
     if (item.conversationId) {
       const key = scope + '\u0000' + item.conversationId;
-      const prior = existing.get(key);
-      if (prior !== undefined) set.union(prior, index);
-      else existing.set(key, index);
+      unionCompatiblePrior(set, existing, key, index, visibleIndexes, records);
+      rememberIndex(existing, key, index);
     }
     if (item.providerConversationId) {
       const key = scope + '\u0000' + item.providerConversationId;
-      const prior = provider.get(key);
-      if (prior !== undefined) set.union(prior, index);
-      else provider.set(key, index);
+      unionCompatiblePrior(set, provider, key, index, visibleIndexes, records);
+      rememberIndex(provider, key, index);
     }
-    if (item.providerResponseId) response.set(scope + '\u0000' + item.providerResponseId, index);
     if (item.providerPreviousResponseId) {
-      const prior = response.get(scope + '\u0000' + item.providerPreviousResponseId);
-      if (prior !== undefined) unionGroupsIfAllowed(set, prior, index, visibleIndexes, records);
+      const key = scope + '\u0000' + item.providerPreviousResponseId;
+      unionCompatiblePrior(set, response, key, index, visibleIndexes, records);
+    }
+    if (item.providerResponseId) {
+      rememberIndex(response, scope + '\u0000' + item.providerResponseId, index);
     }
     for (const anchor of item.conversationAnchors ?? []) {
       if (anchor.kind !== 'continuity_key') continue;
       const key = scope + '\u0000' + anchor.namespace + '\u0000' + anchor.valueHash;
-      const prior = continuity.get(key);
-      if (prior !== undefined) unionGroupsIfAllowed(set, prior, index, visibleIndexes, records);
-      else continuity.set(key, index);
+      unionCompatiblePrior(set, continuity, key, index, visibleIndexes, records);
+      rememberIndex(continuity, key, index);
     }
-    for (const call of item.toolCalls) toolCalls.set(scope + '\u0000' + call.toolCallId, index);
+    for (const call of item.toolCalls) {
+      rememberIndex(toolCalls, scope + '\u0000' + call.toolCallId, index);
+    }
     for (const result of item.toolResults) {
-      const prior = toolCalls.get(scope + '\u0000' + result.toolCallId);
-      if (prior !== undefined) unionGroupsIfAllowed(set, prior, index, visibleIndexes, records);
+      const key = scope + '\u0000' + result.toolCallId;
+      unionCompatiblePrior(set, toolCalls, key, index, visibleIndexes, records);
     }
   }
 
   const byScope = new Map<string, number[]>();
   for (const index of visibleIndexes) {
-    const scope = conversationLogicalScopeKeyV2(records[index]);
+    const scope = anchorScopeKey(records[index]);
     const indexes = byScope.get(scope) ?? [];
     indexes.push(index);
     byScope.set(scope, indexes);
