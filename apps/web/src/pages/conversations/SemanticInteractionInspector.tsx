@@ -248,7 +248,7 @@ export function SemanticInteractionInspector({
               onKeyDown={(keyboardEvent) => moveTab(keyboardEvent, index)}
               onClick={() => setTab(value)}
               className={cn(
-                "flex h-9 min-w-0 flex-1 cursor-pointer items-center justify-center gap-1 border-b whitespace-nowrap text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70 sm:gap-1.5 sm:text-xs",
+                "flex h-11 min-w-0 flex-1 cursor-pointer items-center justify-center gap-1 border-b whitespace-nowrap text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70 sm:gap-1.5 sm:text-xs",
                 tab === value ? "border-violet-300 text-violet-100" : "border-transparent text-zinc-500 hover:text-zinc-200",
               )}
             >

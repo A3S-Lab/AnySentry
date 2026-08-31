@@ -390,6 +390,11 @@ try {
 
   await viewport(390, 844);
   await assertNoOverflow('conversation inspector 390');
+  const mobileTabHeights = await evaluate(`[...document.querySelectorAll('[role="tab"]')]
+    .map((node) => node.getBoundingClientRect().height)`);
+  assert.equal(mobileTabHeights.length, 4, `mobile inspector tabs: ${JSON.stringify(mobileTabHeights)}`);
+  assert.ok(mobileTabHeights.every((height) => height >= 44),
+    `mobile inspector tab targets must be at least 44px: ${JSON.stringify(mobileTabHeights)}`);
   await screenshot('conversation-inspector-390.png');
   await evaluate(`(() => {
     const controls = [...document.querySelectorAll('[aria-label="关闭事件检查器"]')];
@@ -398,6 +403,24 @@ try {
   await waitFor('mobile inspector close', () => evaluate('document.querySelectorAll("[role=tab]").length'), (count) => count === 0);
   await assertNoOverflow('conversation timeline 390');
   await screenshot('conversation-timeline-390.png');
+
+  await command('Emulation.setEmulatedMedia', {
+    features: [{ name: 'prefers-reduced-motion', value: 'reduce' }],
+  });
+  await viewport(375, 812);
+  await waitFor(
+    'reduced-motion conversation timeline',
+    () => evaluate('document.body?.innerText ?? ""'),
+    (text) => text.includes(marker) && text.includes('恢复上下文'),
+  );
+  await assertNoOverflow('conversation reduced-motion 375');
+  const runningTimelineAnimations = await evaluate(`document
+    .querySelector('[aria-label="Agent 对话时间线"]')
+    ?.getAnimations({ subtree: true })
+    .filter((animation) => animation.playState === 'running').length ?? 0`);
+  assert.equal(runningTimelineAnimations, 0,
+    `reduced-motion timeline animations: ${runningTimelineAnimations}`);
+  await screenshot('conversation-timeline-375-reduced-motion.png');
 
   assert.deepEqual(runtimeExceptions, [], `browser runtime exceptions: ${runtimeExceptions.join('; ')}`);
   assert.deepEqual(failedRequests, [], `browser network failures: ${failedRequests.join('; ')}`);
@@ -410,7 +433,9 @@ try {
     resizablePanels: true,
     desktopTimelineVisible: true,
     inspectorStructuredRawEvidence: true,
-    responsiveViewports: [1440, 1024, 390],
+    responsiveViewports: [1440, 1024, 390, 375],
+    reducedMotion: true,
+    mobileTouchTargets: true,
     rapidThreadSwitches: rapidSwitch.tested ? 100 : 0,
     horizontalOverflow: false,
     runtimeExceptions: 0,
