@@ -15,6 +15,7 @@ const {
 } = require('../apps/api/dist/security-monitoring/relational-business-store.service.js');
 const {
   AggregationService,
+  toolEvidenceHotPathTesting,
 } = require('../apps/api/dist/security-monitoring/aggregation.service.js');
 const {
   projectAgentConversations,
@@ -151,6 +152,7 @@ assert.equal(resourceRelations[0].status, 'linked_exact');
 assert.equal(resourceRelations[0].linkMethod, 'resource');
 assert.equal(resourceRelations[0].kernelEventId, fileEvent.eventId);
 assert.equal(resourceRelations[0].timeQuality, 'bounded');
+assert.equal(toolEvidenceHotPathTesting.semanticKernelEventCategory(resourceCall), 'file');
 
 const httpToolInteraction = {
   ...interaction,
@@ -181,6 +183,7 @@ const httpToolRelations = buildSemanticKernelRelations(
   false,
 );
 assert.equal(httpToolRelations[0].status, 'linked_strong');
+assert.equal(toolEvidenceHotPathTesting.semanticKernelEventCategory(httpToolCall), 'network');
 assert.equal(httpToolRelations[0].linkMethod, 'network');
 assert.equal(httpToolRelations[0].kernelEventId, sandboxEgress.eventId);
 const resolvedServiceEgress = {
@@ -237,6 +240,7 @@ const shellBootstrapRelations = buildSemanticKernelRelations(
   false,
 );
 assert.equal(shellBootstrapRelations[0].status, 'linked_strong');
+assert.equal(toolEvidenceHotPathTesting.semanticKernelEventCategory(toolCall), 'tool');
 assert.equal(shellBootstrapRelations[0].linkMethod, 'shell_bootstrap');
 assert.equal(shellBootstrapRelations[0].lineageMethod, 'direct_runtime');
 assert.equal(shellBootstrapRelations[0].confidence, 0.95);

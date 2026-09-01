@@ -321,7 +321,23 @@ function toolKernelEventInProcessScope(
   });
 }
 
-export const toolEvidenceHotPathTesting = { toolKernelEventInProcessScope };
+function semanticKernelEventCategory(
+  event: T.AgentSemanticEvent,
+): T.EventCategory | undefined {
+  const kind = [event.toolKind, event.toolName]
+    .filter((value): value is string => Boolean(value))
+    .join(' ')
+    .toLowerCase();
+  if (/(?:^|[\s._-])(?:bash|exec|shell)(?:$|[\s._-])/u.test(kind)) return 'tool';
+  if (/(?:^|[\s._-])(?:read|write|edit|file)(?:$|[\s._-])/u.test(kind)) return 'file';
+  if (/(?:^|[\s._-])(?:search|http|fetch|network)(?:$|[\s._-])/u.test(kind)) return 'network';
+  return undefined;
+}
+
+export const toolEvidenceHotPathTesting = {
+  toolKernelEventInProcessScope,
+  semanticKernelEventCategory,
+};
 
 export interface ReusableFactSlices {
   fullStartMs: number;
@@ -2700,6 +2716,7 @@ export class AggregationService {
       relationInputs,
       { event: call, result, interaction },
     );
+    const relationEventCategory = semanticKernelEventCategory(call);
     let kernel = await this.storedAgentEvents({
       timeType: 'custom',
       startTime: new Date(relationWindow.startMs).toISOString(),
@@ -2707,6 +2724,7 @@ export class AggregationService {
       scope: 'agent',
       classificationView: query.classificationView,
       agentInstanceId: interaction.agentInstanceId,
+      ...(relationEventCategory ? { eventCategory: relationEventCategory } : {}),
       durable: true,
       limit: 1_000,
     });
@@ -2733,6 +2751,7 @@ export class AggregationService {
         endTime: new Date(relationWindow.endMs).toISOString(),
         scope: 'agent',
         classificationView: query.classificationView,
+        ...(relationEventCategory ? { eventCategory: relationEventCategory } : {}),
         durable: true,
         limit: 1_000,
       });

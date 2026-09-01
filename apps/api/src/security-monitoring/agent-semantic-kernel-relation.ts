@@ -5,6 +5,9 @@ import type * as T from './types';
 export const AGENT_SEMANTIC_KERNEL_RELATION_VERSION = 2;
 const CLOCK_SKEW_MS = 2_000;
 const OPEN_TOOL_WINDOW_MS = 30 * 60_000;
+const SHELL_TOOL_PATTERN = /(?:^|[\s._-])(?:bash|exec|shell)(?:$|[\s._-])/u;
+const FILE_TOOL_PATTERN = /(?:^|[\s._-])(?:read|write|edit|file)(?:$|[\s._-])/u;
+const NETWORK_TOOL_PATTERN = /(?:^|[\s._-])(?:search|http|fetch|network)(?:$|[\s._-])/u;
 
 function stableId(prefix: string, value: string): string {
   return prefix + '_' + createHash('sha256').update(value).digest('hex').slice(0, 24);
@@ -351,7 +354,7 @@ function shellBootstrapCandidate(
   candidate: T.AgentEventListItem,
 ): boolean {
   const normalizedTool = (input.event.toolKind ?? input.event.toolName ?? '').toLowerCase();
-  if (!input.result || !/bash|exec|shell/u.test(normalizedTool)) return false;
+  if (!input.result || !SHELL_TOOL_PATTERN.test(normalizedTool)) return false;
   if (candidate.eventKind !== 'ToolExec') return false;
   const shell = (candidate.process?.comm ?? '').toLowerCase();
   if (!['bash', 'sh', 'dash', 'zsh', 'fish'].includes(shell)) return false;
@@ -402,12 +405,15 @@ function potentialRelation(
   const resource = toolResource(event);
   const host = toolHost(event) ?? interactionEndpointHost(interaction);
   const endpointPort = interactionEndpointPort(interaction);
-  const normalizedTool = (event.toolKind ?? event.toolName ?? 'other').toLowerCase();
-  const acceptedKinds = /bash|exec|shell/u.test(normalizedTool)
+  const normalizedTool = [event.toolKind, event.toolName]
+    .filter((value): value is string => Boolean(value))
+    .join(' ')
+    .toLowerCase() || 'other';
+  const acceptedKinds = SHELL_TOOL_PATTERN.test(normalizedTool)
     ? new Set(['ToolExec'])
-    : /read|write|edit|file/u.test(normalizedTool)
+    : FILE_TOOL_PATTERN.test(normalizedTool)
       ? new Set(['FileAccess', 'FileDelete'])
-      : /search|http|fetch|network/u.test(normalizedTool)
+      : NETWORK_TOOL_PATTERN.test(normalizedTool)
         ? new Set(['Egress', 'Dns', 'Tls'])
         : new Set(['ToolExec', 'FileAccess', 'FileDelete', 'Egress', 'Dns', 'Tls']);
   if (!acceptedKinds.has(candidate.eventKind) || !withinWindow(event, result, candidate)) {
