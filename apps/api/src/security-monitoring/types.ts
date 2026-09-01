@@ -1755,6 +1755,17 @@ export interface AgentConversationDirectoryListV3
   items: LogicalAgentConversationDirectoryItemV3[];
 }
 
+export type LogicalAgentConversationDirectoryItemV4 = Omit<
+  LogicalAgentConversationDirectoryItemV3,
+  'conversations'
+>;
+
+export interface AgentConversationDirectoryListV4
+  extends Omit<AgentConversationDirectoryListV3, 'apiVersion' | 'items'> {
+  apiVersion: 4;
+  items: LogicalAgentConversationDirectoryItemV4[];
+}
+
 export type AgentConversationEventKind =
   | 'tool_result'
   | 'model_request'
@@ -1917,10 +1928,14 @@ export interface AgentSemanticKernelRelation {
   turnId: string;
   toolInvocationId: string;
   kernelEventId?: string;
+  kernelEventAt?: string;
+  kernelEventKind?: string;
+  kernelEventDecisionRevision?: number;
   status: AgentSemanticKernelRelationStatus;
   linkMethod?: 'command' | 'resource' | 'network';
   lineageMethod?: 'direct_runtime' | 'generation_parent' | 'legacy_pid_parent';
   competingToolInvocationIds?: string[];
+  timeQuality?: 'exact' | 'bounded';
   confidence: number;
   authority: 'attested_tls_plaintext';
   relationVersion: 1 | 2;

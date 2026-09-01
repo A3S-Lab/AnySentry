@@ -11,6 +11,9 @@ const { AgentConversationBindingService } = require(
 const { projectAgentConversations } = require(
   '../apps/api/dist/security-monitoring/agent-conversation.js',
 );
+const { AggregationService } = require(
+  '../apps/api/dist/security-monitoring/aggregation.service.js',
+);
 
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 const content = (body, messages = []) => ({
@@ -84,6 +87,8 @@ const storedThreads = new Map();
 const storedSegments = new Map();
 const storedAnchors = [];
 const storedMemberships = new Map();
+let persistedV1Items = 0;
+let persistedV2Items = 0;
 const fakeStore = {
   configured: () => true,
   loadAgentConversationBindings: async (ids) => ids.flatMap((id) =>
@@ -110,12 +115,14 @@ const fakeStore = {
     });
   },
   saveAgentConversationResolution: async (threads, segments, bindings) => {
+    persistedV1Items += threads.length + segments.length + bindings.length;
     for (const thread of threads) storedThreads.set(thread.conversationId, structuredClone(thread));
     for (const segment of segments) storedSegments.set(segment.segmentId, structuredClone(segment));
     for (const binding of bindings) storedBindings.set(binding.interactionId, structuredClone(binding));
     return true;
   },
   saveAgentConversationResolutionV2: async (anchors, memberships) => {
+    persistedV2Items += anchors.length + memberships.length;
     for (const anchor of anchors) {
       const key = `${anchor.interactionId}\0${anchor.anchor.kind}\0${anchor.anchor.namespace}\0${anchor.anchor.valueHash}`;
       const index = storedAnchors.findIndex((item) =>
@@ -159,6 +166,10 @@ const first = interaction({
 const firstProjection = await resolveAndPersist(service, [first]);
 const conversationId = firstProjection.projection.summaries[0].conversationId;
 assert.ok(conversationId.startsWith('cv_'));
+const persistedAfterFirstProjection = persistedV1Items + persistedV2Items;
+await resolveAndPersist(service, [structuredClone(first)]);
+assert.equal(persistedV1Items + persistedV2Items, persistedAfterFirstProjection,
+  'an unchanged read-time projection must not write duplicate Conversation rows');
 
 const nextDay = interaction({
   id: 'mi_binding_next_day',
@@ -241,5 +252,49 @@ assert.equal(storedThreads.get(conversationId).workspacePath, '/workspace/thread
   'a short-window projection must not downgrade persisted Thread workspace evidence');
 assert.equal(anchorRestartService.segmentsForConversation(conversationId).length, 4);
 assert.equal(storedBindings.size, 6);
+
+let projectionComputations = 0;
+const cacheAggregation = new AggregationService(
+  { persistAgentInteraction: async () => true },
+  {
+    identitySnapshotVersion: () => 0,
+    canonicalAgentAssetId: (value) => value,
+  },
+  {},
+  {},
+  {},
+);
+const cachedProjectionResult = {
+  projection: { summaries: [], interactionsByConversation: new Map() },
+  interactions: { items: [] },
+  inventory: { items: [] },
+};
+cacheAggregation.computeAgentConversationProjection = async () => {
+  projectionComputations += 1;
+  return cachedProjectionResult;
+};
+const fixedProjectionQuery = {
+  timeType: 'custom',
+  startTime: new Date(first.at - 1_000).toISOString(),
+  endTime: new Date(first.at + 1_000).toISOString(),
+  snapshotAsOf: new Date(first.at + 1_000).toISOString(),
+  scope: 'agent',
+  classificationView: 'current_effective',
+  limit: 100,
+};
+assert.strictEqual(
+  await cacheAggregation.agentConversationProjection(fixedProjectionQuery),
+  cachedProjectionResult,
+);
+assert.strictEqual(
+  await cacheAggregation.agentConversationProjection(fixedProjectionQuery),
+  cachedProjectionResult,
+);
+assert.equal(projectionComputations, 1,
+  'unchanged directory/timeline reads must share one materialized projection');
+await cacheAggregation.storeAgentInteraction(structuredClone(first));
+await cacheAggregation.agentConversationProjection(fixedProjectionQuery);
+assert.equal(projectionComputations, 2,
+  'a newly stored Interaction must invalidate the projection cache immediately');
 
 console.log('Agent Conversation durable Thread/Segment binding verification passed');

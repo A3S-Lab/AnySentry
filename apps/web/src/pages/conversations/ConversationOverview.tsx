@@ -15,7 +15,7 @@ import {
 import type {
   AgentConversationSummary,
   AgentRuntimeInstanceRecord,
-  LogicalAgentConversationDirectoryItemV3,
+  LogicalAgentConversationDirectoryItemV4,
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
 import {
@@ -104,7 +104,7 @@ export function ConversationOverview({
   onSelectConversation,
   onBack,
 }: {
-  agent?: LogicalAgentConversationDirectoryItemV3;
+  agent?: LogicalAgentConversationDirectoryItemV4;
   instanceId?: string;
   onSelectConversation: (thread: AgentConversationSummary) => void;
   onBack: () => void;

@@ -22,7 +22,7 @@ import type {
   AgentRunTechnicalActivitySummary,
   AgentSemanticEvent,
   ConversationInstanceSegment,
-  LogicalAgentConversationDirectoryItemV3,
+  LogicalAgentConversationDirectoryItemV4,
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
 import { formatDuration, formatTokenTotal, tokenCoverageText } from "./agentUsage";
@@ -207,7 +207,7 @@ export function ConversationSemanticTimeline({
   onSelect,
   onSelectConversation,
 }: {
-  agent?: LogicalAgentConversationDirectoryItemV3;
+  agent?: LogicalAgentConversationDirectoryItemV4;
   conversation?: AgentConversationSummary;
   turns: AgentConversationTurnV2[];
   segments: ConversationInstanceSegment[];

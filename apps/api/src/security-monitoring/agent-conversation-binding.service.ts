@@ -192,12 +192,44 @@ export class AgentConversationBindingService {
   private readonly routeAliases = new Map<string, ConversationRouteAliasV1>();
   private readonly technicalActivities = new Map<string, TechnicalActivityProjection>();
   private readonly membershipsV2 = new Map<string, ConversationMembershipV2>();
+  private readonly persistenceFingerprints = new Map<string, string>();
+  private readonly maxPersistenceFingerprints = 200_000;
   private pendingResolution?: ConversationResolutionV2;
   private resolutionRevision = 0;
 
   constructor(
     @Optional() private readonly relationalStore?: RelationalBusinessStore,
   ) {}
+
+  private changedForPersistence<Item>(
+    namespace: string,
+    items: Item[],
+    identity: (item: Item) => string,
+  ): Item[] {
+    return items.filter((item) => {
+      const key = `${namespace}\u0000${identity(item)}`;
+      const fingerprint = createHash('sha256').update(canonicalJson(item)).digest('hex');
+      return this.persistenceFingerprints.get(key) !== fingerprint;
+    });
+  }
+
+  private rememberPersisted<Item>(
+    namespace: string,
+    items: Item[],
+    identity: (item: Item) => string,
+  ): void {
+    for (const item of items) {
+      const key = `${namespace}\u0000${identity(item)}`;
+      const fingerprint = createHash('sha256').update(canonicalJson(item)).digest('hex');
+      if (this.persistenceFingerprints.has(key)) this.persistenceFingerprints.delete(key);
+      this.persistenceFingerprints.set(key, fingerprint);
+    }
+    while (this.persistenceFingerprints.size > this.maxPersistenceFingerprints) {
+      const oldest = this.persistenceFingerprints.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.persistenceFingerprints.delete(oldest);
+    }
+  }
 
   private async bindByPersistedAnchors(
     records: T.AgentInteractionRecord[],
@@ -562,7 +594,25 @@ export class AgentConversationBindingService {
     for (const segment of segments) this.segments.set(segment.segmentId, segment);
     for (const binding of bindings) this.bindings.set(binding.interactionId, binding);
     if (this.relationalStore?.configured()) {
-      await this.relationalStore.saveAgentConversationResolution(threads, segments, bindings);
+      const changedThreads = this.changedForPersistence(
+        'thread', threads, (item) => item.conversationId,
+      );
+      const changedSegments = this.changedForPersistence(
+        'segment', segments, (item) => item.segmentId,
+      );
+      const changedBindings = this.changedForPersistence(
+        'binding', bindings, (item) => item.interactionId,
+      );
+      const savedV1 = await this.relationalStore.saveAgentConversationResolution(
+        changedThreads,
+        changedSegments,
+        changedBindings,
+      );
+      if (savedV1) {
+        this.rememberPersisted('thread', changedThreads, (item) => item.conversationId);
+        this.rememberPersisted('segment', changedSegments, (item) => item.segmentId);
+        this.rememberPersisted('binding', changedBindings, (item) => item.interactionId);
+      }
       const pending = this.pendingResolution;
       if (pending) {
         const bindingByInteraction = new Map(bindings.map((binding) => [
@@ -586,12 +636,43 @@ export class AgentConversationBindingService {
             observedAt: record.receivedAt,
             anchor,
           })));
-        await this.relationalStore.saveAgentConversationResolutionV2?.(
-          anchors,
-          memberships,
-          pending.aliases,
-          pending.technicalActivities,
+        const changedAnchors = this.changedForPersistence(
+          'anchor', anchors,
+          (item) => [
+            item.interactionId,
+            item.anchor.kind,
+            item.anchor.namespace,
+            item.anchor.valueHash,
+          ].join('\u0000'),
         );
+        const changedMemberships = this.changedForPersistence(
+          'membership', memberships,
+          (item) => `${item.interactionId}\u0000${item.resolutionRevision}`,
+        );
+        const changedAliases = this.changedForPersistence(
+          'alias', pending.aliases, (item) => item.aliasConversationId,
+        );
+        const changedActivities = this.changedForPersistence(
+          'technical', pending.technicalActivities, (item) => item.technicalActivityId,
+        );
+        const savedV2 = await this.relationalStore.saveAgentConversationResolutionV2?.(
+          changedAnchors,
+          changedMemberships,
+          changedAliases,
+          changedActivities,
+        );
+        if (savedV2) {
+          this.rememberPersisted('anchor', changedAnchors, (item) => [
+            item.interactionId,
+            item.anchor.kind,
+            item.anchor.namespace,
+            item.anchor.valueHash,
+          ].join('\u0000'));
+          this.rememberPersisted('membership', changedMemberships,
+            (item) => `${item.interactionId}\u0000${item.resolutionRevision}`);
+          this.rememberPersisted('alias', changedAliases, (item) => item.aliasConversationId);
+          this.rememberPersisted('technical', changedActivities, (item) => item.technicalActivityId);
+        }
       }
     }
   }

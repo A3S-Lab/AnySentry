@@ -25,7 +25,7 @@ import {
   type AgentConversationSummary,
   type AgentRuntimeInstanceRecord,
   type AgentSemanticEvent,
-  type LogicalAgentConversationDirectoryItemV3,
+  type LogicalAgentConversationDirectoryItemV4,
   securityCenterApi,
 } from "@/lib/api/security-center";
 import { useI18n } from "@/lib/i18n";
@@ -127,7 +127,7 @@ export default function ConversationTrackingPage() {
     loading: conversationsLoading,
     error: conversationsError,
     refresh: refreshConversations,
-  } = useRequest(() => securityCenterApi.agentConversationDirectoryV3(conversationQuery), {
+  } = useRequest(() => securityCenterApi.agentConversationDirectoryV4(conversationQuery), {
     refreshDeps: [conversationQuery, refreshVersion],
     pollingInterval: 10_000,
     pollingWhenHidden: false,
@@ -172,7 +172,7 @@ export default function ConversationTrackingPage() {
     }, replace);
   };
   const selectLogicalAgent = (
-    agent: LogicalAgentConversationDirectoryItemV3,
+    agent: LogicalAgentConversationDirectoryItemV4,
     replace = false,
   ) => {
     if (!replace) setLiveFollow(false);
@@ -185,7 +185,7 @@ export default function ConversationTrackingPage() {
     }, replace);
   };
   const selectRuntimeInstance = (
-    agent: LogicalAgentConversationDirectoryItemV3,
+    agent: LogicalAgentConversationDirectoryItemV4,
     instance: AgentRuntimeInstanceRecord,
   ) => {
     setLiveFollow(false);

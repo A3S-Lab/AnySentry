@@ -13,6 +13,9 @@ const {
 const {
   RelationalBusinessStore,
 } = require('../apps/api/dist/security-monitoring/relational-business-store.service.js');
+const {
+  AggregationService,
+} = require('../apps/api/dist/security-monitoring/aggregation.service.js');
 
 const instanceId = 'host-root:semantic:100:200';
 const interaction = {
@@ -46,6 +49,7 @@ const kernelEvent = {
   eventId: 'evt_kernel_exec',
   at: new Date(callAt + 100).toISOString(),
   eventKind: 'ToolExec',
+  decisionRevision: 3,
   subject: '/bin/bash -lc "rg -n resolver-v2 /tmp/canary.txt"',
   agentRuntimeInstanceId: instanceId,
   agentRuntimeInstanceAliases: [],
@@ -81,6 +85,10 @@ assert.equal(relations.length, 1);
 assert.equal(relations[0].status, 'linked_exact');
 assert.equal(relations[0].linkMethod, 'command');
 assert.equal(relations[0].kernelEventId, kernelEvent.eventId);
+assert.equal(relations[0].kernelEventAt, kernelEvent.at);
+assert.equal(relations[0].kernelEventKind, 'ToolExec');
+assert.equal(relations[0].kernelEventDecisionRevision, 3);
+assert.equal(relations[0].timeQuality, 'exact');
 assert.equal(relations[0].risk.riskScore, 86);
 assert.equal(relations[0].risk.verdict, 'block');
 assert.equal(relations[0].authority, 'attested_tls_plaintext');
@@ -136,6 +144,7 @@ const resourceRelations = buildSemanticKernelRelations(
 assert.equal(resourceRelations[0].status, 'linked_exact');
 assert.equal(resourceRelations[0].linkMethod, 'resource');
 assert.equal(resourceRelations[0].kernelEventId, fileEvent.eventId);
+assert.equal(resourceRelations[0].timeQuality, 'bounded');
 
 const timeOnly = buildSemanticKernelRelations(
   toolCall,
@@ -332,5 +341,122 @@ assert.match(replacementQuery, /NOT EXISTS/u);
 assert.match(replacementQuery, /newer\.resolution_revision > \(incoming\.record->>'resolutionRevision'\)::bigint/u);
 assert.equal(JSON.parse(replacementParameters[0]).length, 2,
   'one persistence call must atomically replace both competing semantic relation sets');
+
+const captured = (structured, messages = [], text) => {
+  const body = JSON.stringify(structured);
+  return {
+    body,
+    encoding: 'utf8',
+    contentType: 'application/json',
+    capturedBytes: Buffer.byteLength(body),
+    decodedBytes: Buffer.byteLength(body),
+    sha256: 'a'.repeat(64),
+    completeness: 'complete',
+    messages,
+    structured,
+    ...(text === undefined ? {} : { text }),
+  };
+};
+const projectedInteraction = {
+  schemaVersion: 'anysentry.agent_interaction.v1',
+  interactionId: 'mi_incremental_relation_projection',
+  interactionType: 'model',
+  at: callAt,
+  workspacePath: '/workspace',
+  agentAssetId: 'agent-semantic',
+  agentInstanceId: instanceId,
+  agentProduct: 'Codex',
+  detectedClassification: 'confirmed_agent',
+  currentEffectiveClassification: 'confirmed_agent',
+  process: {
+    hostId: 'host-semantic', bootId: 'boot-semantic', pid: 100, ppid: 1,
+    startTimeTicks: '200', comm: 'codex', exe: '/usr/bin/codex', cwd: '/workspace',
+  },
+  connectionId: 'tls:incremental',
+  transport: 'tls',
+  protocol: 'websocket-json',
+  wireTemplateId: 'openai-responses',
+  parseState: 'parsed',
+  llmLikelihood: 'confirmed',
+  endpoint: 'gateway.invalid',
+  method: 'POST',
+  path: '/responses',
+  statusCode: 200,
+  model: 'fixture-model',
+  startedAtUnixNs: String(BigInt(callAt) * 1_000_000n),
+  requestCompleteAtUnixNs: String(BigInt(callAt + 1) * 1_000_000n),
+  firstResponseAtUnixNs: String(BigInt(callAt + 2) * 1_000_000n),
+  endedAtUnixNs: String(BigInt(callAt + 3) * 1_000_000n),
+  durationNs: '3000000',
+  timeQuality: 'collector_calibrated',
+  request: captured(
+    { model: 'fixture-model', input: [{ role: 'user', content: 'run the command' }] },
+    [{ role: 'user', content: 'run the command', messageOrigin: 'human_input' }],
+  ),
+  response: captured({
+    id: 'resp-incremental', object: 'response', status: 'completed', output: [],
+  }),
+  toolCalls: [{
+    toolCallId: toolCall.toolCallId,
+    name: 'exec_command',
+    arguments: toolCall.content,
+    issuedAtUnixNs: toolCall.atUnixNs,
+  }],
+  toolResults: [],
+  semanticParserId: 'observer.agent-interaction',
+  semanticParserVersion: 2,
+  completeness: 'partial',
+  conversationCompleteness: 'tool_pending',
+  partialReasons: ['tool_result_pending'],
+  captureSource: 'tls_uprobe_rustls',
+  receivedAt: callAt + 4,
+};
+let projectionPersisted = 0;
+let incrementallySavedRelations = [];
+const bindingStub = {
+  applyPersistedBindings: async (items) => items,
+  persistProjection: async () => { projectionPersisted += 1; },
+  segmentsForConversation: () => [],
+  currentResolutionRevision: () => 22,
+};
+const incrementalStore = {
+  configured: () => true,
+  saveAgentSemanticKernelRelations: async (items) => {
+    incrementallySavedRelations = items;
+    return true;
+  },
+};
+const aggregate = new AggregationService(
+  {},
+  { canonicalAgentAssetId: (value) => value },
+  {},
+  {},
+  {},
+  undefined,
+  bindingStub,
+  incrementalStore,
+);
+aggregate.readAgentInteractions = async () => ({
+  items: [projectedInteraction],
+  total: 1,
+  totalMode: 'exact',
+  coverage: { partial: false },
+  dataSource: 'clickhouse',
+  updateTime: new Date(callAt).toISOString(),
+});
+aggregate.storedAgentEvents = async () => ({
+  items: [kernelEvent],
+  total: 1,
+  totalMode: 'exact',
+  coverage: { partial: false },
+  dataSource: 'clickhouse',
+  updateTime: new Date(callAt).toISOString(),
+});
+await aggregate.projectSemanticKernelRelationsFor(projectedInteraction);
+assert.equal(projectionPersisted, 1,
+  'incremental relation work must persist the Conversation projection outside the read path');
+assert.equal(incrementallySavedRelations.length, 1);
+assert.equal(incrementallySavedRelations[0].kernelEventId, kernelEvent.eventId);
+assert.equal(incrementallySavedRelations[0].kernelEventAt, kernelEvent.at);
 
 console.log('Agent Semantic Tool to Kernel relation verification passed');

@@ -4901,6 +4901,42 @@ export class SecurityMonitoringController {
     };
   }
 
+  @Post('agents/conversation-directory-v4')
+  @HttpCode(200)
+  async agentConversationDirectoryV4(
+    @Body() f: T.AgentConversationDirectoryQuery,
+    @Headers() headers: HeaderBag,
+  ): Promise<T.AgentConversationDirectoryListV4> {
+    const legacy = await this.agentConversationDirectoryV3(f, headers);
+    return {
+      ...legacy,
+      apiVersion: 4,
+      items: legacy.items.map((item) => {
+        const {
+          conversations: _legacyDuplicateThreads,
+          recentInstances,
+          technicalActivities,
+          ...thin
+        } = item;
+        return {
+          ...thin,
+          // V3 duplicated every Thread under both `conversations` and `userThreads` and embedded
+          // up to one hundred full Runtime records per Agent. V4 is the page read model: the
+          // canonical user Thread list is sent once; detailed historical instances remain a
+          // separate runtime concern while the most recent records preserve immediate navigation.
+          recentInstances: recentInstances.slice(0, 32),
+          technicalActivities: [...technicalActivities]
+            .sort((left, right) => {
+              const leftAt = BigInt(left.endedAtUnixNs);
+              const rightAt = BigInt(right.endedAtUnixNs);
+              return leftAt === rightAt ? 0 : leftAt > rightAt ? -1 : 1;
+            })
+            .slice(0, 32),
+        };
+      }),
+    };
+  }
+
   @Post('events/tool-evidence')
   @HttpCode(200)
   agentToolEvidence(@Body() f: T.AgentEventQuery) {

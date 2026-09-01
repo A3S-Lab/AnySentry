@@ -65,6 +65,7 @@ import {
   projectConversationTimeline,
 } from './agent-conversation';
 import { AgentConversationBindingService } from './agent-conversation-binding.service';
+import { trafficRoleForInteraction } from './agent-conversation-resolution-v2';
 import { RelationalBusinessStore } from './relational-business-store.service';
 import {
   buildSemanticKernelRelationBatch,
@@ -788,6 +789,18 @@ export class AggregationService {
     string,
     Promise<AgentConversationProjectionResult>
   >();
+  private readonly conversationProjectionRecent = new Map<
+    string,
+    AgentConversationProjectionResult
+  >();
+  private conversationInteractionRevision = 0;
+  private readonly semanticRelationProjectionTimers = new Map<string, {
+    timer: NodeJS.Timeout;
+    firstQueuedAt: number;
+    record: T.AgentInteractionRecord;
+  }>();
+  private readonly semanticRelationProjectionActive = new Set<string>();
+  private readonly semanticRelationProjectionMaxKeys = 512;
 
   historyFactCacheStatus() {
     const agents = [...this.agentHistoryBuckets.entries()].map(([scope, cache]) => ({
@@ -1873,6 +1886,11 @@ export class AggregationService {
   async storeAgentInteraction(record: T.AgentInteractionRecord): Promise<{ durable: boolean }> {
     const bytes = Buffer.byteLength(JSON.stringify(record));
     const previous = this.interactionHot.get(record.interactionId);
+    const projectionChanged = !previous
+      || previous.record.request.sha256 !== record.request.sha256
+      || previous.record.response.sha256 !== record.response.sha256
+      || previous.record.endedAtUnixNs !== record.endedAtUnixNs
+      || previous.record.trafficRole !== record.trafficRole;
     if (previous) {
       this.interactionHotBytes = Math.max(0, this.interactionHotBytes - previous.bytes);
       this.interactionHot.delete(record.interactionId);
@@ -1890,7 +1908,164 @@ export class AggregationService {
       this.interactionHot.delete(oldest[0]);
       this.interactionHotBytes = Math.max(0, this.interactionHotBytes - oldest[1].bytes);
     }
-    return { durable: await this.judge.persistAgentInteraction(record) };
+    if (projectionChanged) {
+      this.conversationInteractionRevision += 1;
+      this.conversationProjectionRecent.clear();
+    }
+    const durable = await this.judge.persistAgentInteraction(record);
+    if (durable) this.scheduleSemanticRelationProjection(record);
+    return { durable };
+  }
+
+  private scheduleSemanticRelationProjection(record: T.AgentInteractionRecord): void {
+    if (
+      !this.relationalStore?.configured?.()
+      || trafficRoleForInteraction(record) !== 'conversation'
+      || (record.toolCalls.length === 0 && record.toolResults.length === 0)
+    ) return;
+    const key = record.agentInstanceId?.trim() || record.agentAssetId;
+    const now = Date.now();
+    const current = this.semanticRelationProjectionTimers.get(key);
+    if (current) clearTimeout(current.timer);
+    if (!current && this.semanticRelationProjectionTimers.size >= this.semanticRelationProjectionMaxKeys) {
+      const oldest = this.semanticRelationProjectionTimers.entries().next().value as
+        | [string, { timer: NodeJS.Timeout }]
+        | undefined;
+      if (oldest) {
+        clearTimeout(oldest[1].timer);
+        this.semanticRelationProjectionTimers.delete(oldest[0]);
+      }
+    }
+    const firstQueuedAt = current?.firstQueuedAt ?? now;
+    // Debounce a normal Tool loop until Kernel/ToolResult facts settle, but force progress for an
+    // Agent that continuously emits calls so one active session cannot postpone projection forever.
+    const delayMs = Math.max(0, Math.min(
+      TOOL_EVIDENCE_RELATION_SETTLE_MS,
+      60_000 - (now - firstQueuedAt),
+    ));
+    const timer = setTimeout(() => {
+      this.semanticRelationProjectionTimers.delete(key);
+      if (this.semanticRelationProjectionActive.has(key)) {
+        this.scheduleSemanticRelationProjection(record);
+        return;
+      }
+      this.semanticRelationProjectionActive.add(key);
+      void this.projectSemanticKernelRelationsFor(record)
+        .catch((error) => {
+          console.error('[agent-relation] incremental projection failed:', (error as Error).message);
+        })
+        .finally(() => this.semanticRelationProjectionActive.delete(key));
+    }, delayMs);
+    timer.unref();
+    this.semanticRelationProjectionTimers.set(key, { timer, firstQueuedAt, record });
+  }
+
+  private async projectSemanticKernelRelationsFor(
+    trigger: T.AgentInteractionRecord,
+  ): Promise<void> {
+    if (!this.conversationBindings || !this.relationalStore?.configured?.()) return;
+    const now = Date.now();
+    const startMs = Math.max(0, trigger.at - 30 * 60_000);
+    const endMs = Math.max(now, trigger.at + TOOL_EVIDENCE_RELATION_SETTLE_MS);
+    const interactionList = await this.readAgentInteractions({
+      timeType: 'custom',
+      startTime: new Date(startMs).toISOString(),
+      endTime: new Date(endMs).toISOString(),
+      scope: 'agent',
+      classificationView: 'current_effective',
+      agentAssetId: trigger.agentAssetId,
+      ...(trigger.agentInstanceId ? { agentInstanceId: trigger.agentInstanceId } : {}),
+      limit: 500,
+    }, { totalLimit: 500 });
+    const bound = await this.conversationBindings.applyPersistedBindings(interactionList.items);
+    const projection = projectAgentConversations(bound, [], {
+      timeType: 'custom',
+      startTime: new Date(startMs).toISOString(),
+      endTime: new Date(endMs).toISOString(),
+      scope: 'agent',
+      classificationView: 'current_effective',
+      agentAssetId: trigger.agentAssetId,
+      limit: 200,
+    });
+    await this.conversationBindings.persistProjection(projection);
+
+    const relationInputs = projection.summaries
+      .filter((summary) => summary.hasContent)
+      .flatMap((summary) => {
+        const records = projection.interactionsByConversation.get(summary.conversationId) ?? [];
+        const segments = this.conversationBindings!.segmentsForConversation(summary.conversationId);
+        const events = projectSemanticConversationTimeline(summary, records, segments)
+          .flatMap((turn) => turn.events);
+        return events
+          .filter((event) => event.kind === 'tool_call')
+          .map((event) => {
+            const owner = event.sourceInteractionIds
+              .map((interactionId) => records.find((item) => item.interactionId === interactionId))
+              .find((item): item is T.AgentInteractionRecord => Boolean(item));
+            if (!owner) return undefined;
+            const result = event.toolCallId
+              ? events.find((candidate) => candidate.kind === 'tool_result'
+                  && candidate.toolCallId === event.toolCallId)
+              : undefined;
+            return { event, result, interaction: owner };
+          })
+          .filter((item): item is NonNullable<typeof item> => Boolean(item));
+      })
+      .slice(0, 1_000);
+    if (relationInputs.length === 0) return;
+
+    const fallback = relationInputs[0];
+    const window = semanticKernelRelationBatchWindow(relationInputs, fallback);
+    const candidateEnd = Math.min(window.endMs, Date.now());
+    const instanceIds = [...new Set(relationInputs
+      .map((input) => input.interaction.agentInstanceId)
+      .filter((value): value is string => Boolean(value)))];
+    let kernel = await this.storedAgentEvents({
+      timeType: 'custom',
+      startTime: new Date(window.startMs).toISOString(),
+      endTime: new Date(Math.max(window.startMs, candidateEnd)).toISOString(),
+      scope: 'agent',
+      classificationView: 'current_effective',
+      ...(instanceIds.length === 1 ? { agentInstanceId: instanceIds[0] } : {}),
+      durable: true,
+      limit: 1_000,
+    });
+    const resolutionRevision = this.conversationBindings.currentResolutionRevision();
+    let batch = buildSemanticKernelRelationBatch(
+      relationInputs,
+      kernel.items,
+      resolutionRevision,
+      kernel.coverage.partial,
+    );
+    if (!batch.allRelations.some((relation) => relation.kernelEventId)) {
+      const ancestryKernel = await this.storedAgentEvents({
+        timeType: 'custom',
+        startTime: new Date(window.startMs).toISOString(),
+        endTime: new Date(Math.max(window.startMs, candidateEnd)).toISOString(),
+        scope: 'agent',
+        classificationView: 'current_effective',
+        durable: true,
+        limit: 1_000,
+      });
+      const ancestryBatch = buildSemanticKernelRelationBatch(
+        relationInputs,
+        ancestryKernel.items,
+        resolutionRevision,
+        ancestryKernel.coverage.partial,
+      );
+      if (ancestryBatch.allRelations.some((relation) => relation.kernelEventId)) {
+        kernel = ancestryKernel;
+        batch = ancestryBatch;
+      }
+    }
+    if (kernel.coverage.partial) return;
+    const everyCallClosed = relationInputs.every((input) => Boolean(input.result));
+    const persistable = everyCallClosed
+      ? batch.allRelations
+      : batch.allRelations.filter((relation) => Boolean(relation.kernelEventId));
+    if (persistable.length > 0) {
+      await this.relationalStore.saveAgentSemanticKernelRelations(persistable);
+    }
   }
 
   async agentInteractions(filter: T.AgentInteractionQuery): Promise<T.AgentInteractionList> {
@@ -2028,6 +2203,12 @@ export class AggregationService {
       model: filter.model,
       q: filter.q,
       limit: filter.limit,
+      interactionRevision: this.conversationInteractionRevision,
+      identityRevision: this.agentMetadata.identitySnapshotVersion(),
+      reviewRevision: this.assetReviews?.version() ?? 0,
+      relativeWindowBucket: filter.timeType === 'custom' || filter.snapshotAsOf
+        ? undefined
+        : Math.floor(Date.now() / 60_000),
     });
   }
 
@@ -2035,12 +2216,25 @@ export class AggregationService {
     filter: T.AgentConversationQuery,
   ): Promise<AgentConversationProjectionResult> {
     const key = this.conversationProjectionKey(filter);
+    const recent = this.conversationProjectionRecent.get(key);
+    if (recent) return recent;
     const existing = this.conversationProjectionInFlight.get(key);
     if (existing) return existing;
     const operation = this.conversationProjectionGate
       .run(() => this.computeAgentConversationProjection(filter))
       .then((result) => {
-        if (result) return result;
+        if (result) {
+          if (this.conversationProjectionRecent.has(key)) {
+            this.conversationProjectionRecent.delete(key);
+          }
+          this.conversationProjectionRecent.set(key, result);
+          while (this.conversationProjectionRecent.size > 64) {
+            const oldest = this.conversationProjectionRecent.keys().next().value as string | undefined;
+            if (!oldest) break;
+            this.conversationProjectionRecent.delete(oldest);
+          }
+          return result;
+        }
         throw new ServiceUnavailableException(
           'Agent conversation projection is busy; retry the latest selection',
         );

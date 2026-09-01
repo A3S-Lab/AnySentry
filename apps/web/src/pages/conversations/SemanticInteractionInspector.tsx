@@ -71,14 +71,29 @@ function EvidenceField({ label, value }: { label: string; value?: ReactNode }) {
   );
 }
 
-function eventHref(eventId: string, interaction?: AgentInteractionRecord) {
-  return "/events?" + new URLSearchParams({
-    timeType: "last_30d",
-    scope: "agent",
-    eventId,
-    ...(interaction?.agentAssetId ? { agentAssetId: interaction.agentAssetId } : {}),
-    ...(interaction?.agentInstanceId ? { agentInstanceId: interaction.agentInstanceId } : {}),
-  }).toString();
+function eventHref(
+  eventId: string,
+  interaction?: AgentInteractionRecord,
+  eventAt?: string,
+  semantic?: Pick<AgentSemanticEvent, "conversationId" | "semanticEventId">,
+) {
+  const at = eventAt ? Date.parse(eventAt) : Number.NaN;
+  const params = new URLSearchParams({ scope: "agent", eventId });
+  if (Number.isFinite(at)) {
+    params.set("timeType", "custom");
+    params.set("startTime", new Date(Math.max(0, at - 5_000)).toISOString());
+    params.set("endTime", new Date(at + 5_000).toISOString());
+    params.set("snapshotAsOf", new Date(at + 5_000).toISOString());
+  } else {
+    params.set("timeType", "last_30d");
+  }
+  if (semantic) {
+    params.set("conversationId", semantic.conversationId);
+    params.set("semanticEventId", semantic.semanticEventId);
+  }
+  if (interaction?.agentAssetId) params.set("agentAssetId", interaction.agentAssetId);
+  if (interaction?.agentInstanceId) params.set("agentInstanceId", interaction.agentInstanceId);
+  return "/events?" + params.toString();
 }
 
 function KernelEvidenceView({
@@ -116,7 +131,7 @@ function KernelEvidenceView({
                   <span className="font-mono text-[10px] text-zinc-600">confidence {relation.confidence.toFixed(2)}</span>
                 </div>
                 <p className="mt-2 text-xs leading-5 text-zinc-300">{kernel?.eventKind ?? "Kernel Event"} · {kernel?.subject ?? relation.kernelEventId}</p>
-                <Link className="mt-2 inline-flex min-h-9 items-center text-xs font-medium text-teal-200 hover:text-teal-100" to={eventHref(relation.kernelEventId!, interaction)}>
+                <Link className="mt-2 inline-flex min-h-9 items-center text-xs font-medium text-teal-200 hover:text-teal-100" to={eventHref(relation.kernelEventId!, interaction, kernel?.at ?? relation.kernelEventAt, event)}>
                   查看原始内核事件
                 </Link>
               </div>
@@ -170,7 +185,10 @@ function RiskEvidenceView({
           </div>
           <p className="mt-2 text-xs font-medium text-zinc-200">{relation.risk!.riskName}</p>
           <p className="mt-1 text-[11px] leading-5 text-zinc-500">{relation.risk!.reason}</p>
-          <Link className="mt-2 inline-flex min-h-9 items-center text-xs font-medium text-violet-200 hover:text-violet-100" to={eventHref(relation.kernelEventId!, interaction)}>
+          <Link className="mt-2 inline-flex min-h-9 items-center text-xs font-medium text-violet-200 hover:text-violet-100" to={eventHref(relation.kernelEventId!, interaction, relation.kernelEventAt, {
+            conversationId: relation.conversationId,
+            semanticEventId: relation.stableSemanticEventId,
+          })}>
             打开风险事件与 Evidence Bundle
           </Link>
         </div>

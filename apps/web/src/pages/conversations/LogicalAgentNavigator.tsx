@@ -4,7 +4,7 @@ import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react"
 import type {
   AgentConversationSummary,
   AgentRuntimeInstanceRecord,
-  LogicalAgentConversationDirectoryItemV3,
+  LogicalAgentConversationDirectoryItemV4,
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
 import { formatTokenTotal, usageForInstance } from "./agentUsage";
@@ -28,7 +28,7 @@ function shortId(value: string) {
 }
 
 function matchingInstances(
-  agent: LogicalAgentConversationDirectoryItemV3,
+  agent: LogicalAgentConversationDirectoryItemV4,
   instances: AgentRuntimeInstanceRecord[],
 ) {
   const expected = new Set(agent.agentInstanceIds);
@@ -69,15 +69,15 @@ export function LogicalAgentNavigator({
   onSelectInstance,
   onSelectConversation,
 }: {
-  items: LogicalAgentConversationDirectoryItemV3[];
+  items: LogicalAgentConversationDirectoryItemV4[];
   runtimeInstances: AgentRuntimeInstanceRecord[];
   selectedLogicalAgentId?: string;
   selectedInstanceId?: string;
   selectedConversationId?: string;
   loading: boolean;
   error?: Error;
-  onSelectAgent: (item: LogicalAgentConversationDirectoryItemV3) => void;
-  onSelectInstance: (agent: LogicalAgentConversationDirectoryItemV3, instance: AgentRuntimeInstanceRecord) => void;
+  onSelectAgent: (item: LogicalAgentConversationDirectoryItemV4) => void;
+  onSelectInstance: (agent: LogicalAgentConversationDirectoryItemV4, instance: AgentRuntimeInstanceRecord) => void;
   onSelectConversation: (conversation: AgentConversationSummary) => void;
 }) {
   const refs = useRef(new Map<string, HTMLButtonElement>());
@@ -125,7 +125,7 @@ export function LogicalAgentNavigator({
   const renderSection = (
     sectionId: "current" | "history",
     title: string,
-    agents: LogicalAgentConversationDirectoryItemV3[],
+    agents: LogicalAgentConversationDirectoryItemV4[],
     collapsible = false,
   ) => {
     const expanded = !collapsible || historicalAgentsExpanded;

@@ -1330,6 +1330,11 @@ export interface AgentConversationDirectoryListV3 extends Omit<AgentConversation
   resolutionRevision: number;
   items: LogicalAgentConversationDirectoryItemV3[];
 }
+export type LogicalAgentConversationDirectoryItemV4 = Omit<LogicalAgentConversationDirectoryItemV3, "conversations">;
+export interface AgentConversationDirectoryListV4 extends Omit<AgentConversationDirectoryListV3, "apiVersion" | "items"> {
+  apiVersion: 4;
+  items: LogicalAgentConversationDirectoryItemV4[];
+}
 export type AgentConversationEventKind = "tool_result" | "model_request" | "model_response" | "tool_call" | "external_tool" | "retry" | "error";
 export interface AgentConversationEvent {
   eventId: string;
@@ -1467,11 +1472,17 @@ export interface AgentSemanticKernelRelation {
   turnId: string;
   toolInvocationId: string;
   kernelEventId?: string;
+  kernelEventAt?: string;
+  kernelEventKind?: string;
+  kernelEventDecisionRevision?: number;
   status: AgentSemanticKernelRelationStatus;
   linkMethod?: "command" | "resource" | "network";
+  lineageMethod?: "direct_runtime" | "generation_parent" | "legacy_pid_parent";
+  competingToolInvocationIds?: string[];
+  timeQuality?: "exact" | "bounded";
   confidence: number;
   authority: "attested_tls_plaintext";
-  relationVersion: 1;
+  relationVersion: 1 | 2;
   resolutionRevision: number;
   risk?: {
     verdict: SecurityVerdict;
@@ -4059,6 +4070,8 @@ export const securityCenterApi = {
     apiClient.postLong<AgentConversationDirectoryListV2>("/security-center/agents/conversation-directory-v2", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
   agentConversationDirectoryV3: (filter: AgentConversationDirectoryQuery) =>
     apiClient.postLong<AgentConversationDirectoryListV3>("/security-center/agents/conversation-directory-v3", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
+  agentConversationDirectoryV4: (filter: AgentConversationDirectoryQuery) =>
+    apiClient.postLong<AgentConversationDirectoryListV4>("/security-center/agents/conversation-directory-v4", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
   agentConversationTimeline: (filter: AgentConversationQuery & { conversationId: string }) =>
     apiClient.postLong<AgentConversationTimeline>("/security-center/agents/conversations/timeline", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
   agentConversationTimelineV2: (filter: AgentConversationQuery & { conversationId: string }) =>

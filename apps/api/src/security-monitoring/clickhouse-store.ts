@@ -54,6 +54,23 @@ function delay(ms: number): Promise<void> {
 }
 
 const TABLE = 'events';
+const EVENT_LOCATOR_TABLE = 'event_locators_v1';
+const EVENT_LOCATOR_MV = 'event_locators_v1_mv';
+const EVENT_LOCATOR_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_LOCATOR_TABLE} (
+  eventId String,
+  at UInt64,
+  decisionRevision UInt32 DEFAULT 1,
+  decisionUpdatedAt UInt64 DEFAULT at,
+  ingestedAt UInt64 DEFAULT at,
+  ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000))
+)
+ENGINE = ReplacingMergeTree(decisionUpdatedAt)
+PARTITION BY toYYYYMM(ts)
+ORDER BY eventId
+TTL ts + INTERVAL 90 DAY DELETE`;
+const EVENT_LOCATOR_MV_DDL = `CREATE MATERIALIZED VIEW IF NOT EXISTS ${EVENT_LOCATOR_MV}
+TO ${EVENT_LOCATOR_TABLE}
+AS SELECT eventId, at, decisionRevision, decisionUpdatedAt, ingestedAt FROM ${TABLE}`;
 const OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE = 'anysentry.observer.source_payload_sha256';
 const SHA256_HEX = /^[a-f0-9]{64}$/u;
 const AGENT_INTERACTION_TABLE = 'agent_interactions_v1';
@@ -1007,6 +1024,8 @@ async function runClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promis
       ...credentials,
     });
     await schema.command({ query: DDL(TABLE) });
+    await schema.command({ query: EVENT_LOCATOR_DDL });
+    await schema.command({ query: EVENT_LOCATOR_MV_DDL });
     await schema.command({ query: AGENT_INTERACTION_DDL });
     await schema.command({
       query: `ALTER TABLE ${AGENT_INTERACTION_TABLE}
@@ -4220,10 +4239,26 @@ export class ClickHouseStore {
    * baked into this immutable evidence query. */
   async searchEvents(input: StoredEventQuery): Promise<JudgedEvent[] | null> {
     if (!this.client) return null;
+    let effectiveSinceMs = input.sinceMs;
+    let effectiveUntilMs = input.untilMs;
+    if (input.eventId && effectiveUntilMs - effectiveSinceMs > 2_000) {
+      const location = await this.locateEvent(input.eventId);
+      if (
+        location
+        && location.at >= effectiveSinceMs
+        && location.at <= effectiveUntilMs
+      ) {
+        effectiveSinceMs = Math.max(effectiveSinceMs, location.at - 1);
+        effectiveUntilMs = Math.min(effectiveUntilMs, location.at + 1);
+      }
+    }
     const sampleConditions: string[] = [];
     const latestConditions: string[] = [];
     const activeMutableColumns: string[] = [];
-    const queryParams: Record<string, unknown> = { since: input.sinceMs, until: input.untilMs };
+    const queryParams: Record<string, unknown> = {
+      since: effectiveSinceMs,
+      until: effectiveUntilMs,
+    };
     const stableFields: Array<[keyof StoredEventQuery, string]> = [
       ['eventId', 'eventId'],
       ['sourceId', 'sourceId'],
@@ -4405,6 +4440,54 @@ export class ClickHouseStore {
     } finally {
       if (this.eventSearchInFlight?.value === value) this.eventSearchInFlight = undefined;
       release();
+    }
+  }
+
+  async locateEvent(
+    eventId: string,
+  ): Promise<{ eventId: string; at: number; decisionRevision: number } | undefined> {
+    const normalized = eventId.trim();
+    if (!this.client || !normalized || normalized.length > 512) return undefined;
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT eventId,
+            argMax(at, tuple(decisionRevision, decisionUpdatedAt, ingestedAt)) AS at,
+            max(decisionRevision) AS decisionRevision
+          FROM ${EVENT_LOCATOR_TABLE}
+          WHERE eventId = {eventId:String}
+          GROUP BY eventId
+          LIMIT 1`,
+        query_params: { eventId: normalized },
+        clickhouse_settings: {
+          max_threads: 1,
+          max_execution_time: 2,
+          max_result_rows: '1',
+          result_overflow_mode: 'break',
+          max_memory_usage: String(32 * 1024 * 1024),
+        },
+        format: 'JSONEachRow',
+      });
+      const rows = await result.json() as Array<{
+        eventId?: string;
+        at?: number | string;
+        decisionRevision?: number | string;
+      }>;
+      const row = rows[0];
+      const at = Number(row?.at);
+      const decisionRevision = Number(row?.decisionRevision);
+      return row?.eventId === normalized && Number.isSafeInteger(at) && at >= 0
+        ? {
+            eventId: normalized,
+            at,
+            decisionRevision: Number.isSafeInteger(decisionRevision)
+              ? decisionRevision
+              : 0,
+          }
+        : undefined;
+    } catch (error) {
+      console.error('[clickhouse] event locator query failed:', (error as Error).message);
+      return undefined;
     }
   }
 

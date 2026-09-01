@@ -120,6 +120,44 @@ assert.doesNotMatch(hydrateCall.query, /SELECT \*\s+FROM events\s+PREWHERE/u,
 assert.doesNotMatch(hydrateCall.query, /ORDER BY at ASC/u);
 assert.equal(fake.state.active, 0);
 
+{
+  const calls = [];
+  const locatorStore = new ClickHouseStore();
+  locatorStore.ready = true;
+  locatorStore.client = {
+    async query(options) {
+      calls.push(options);
+      const locator = options.query.includes('FROM event_locators_v1');
+      return {
+        async json() {
+          return locator
+            ? [{ eventId: 'event-by-locator', at: 150_000, decisionRevision: 4 }]
+            : [];
+        },
+      };
+    },
+  };
+  assert.deepEqual(await locatorStore.locateEvent('event-by-locator'), {
+    eventId: 'event-by-locator',
+    at: 150_000,
+    decisionRevision: 4,
+  });
+  assert.equal(calls[0].clickhouse_settings.max_execution_time, 2);
+  calls.length = 0;
+  assert.deepEqual(await locatorStore.searchEvents({
+    sinceMs: 0,
+    untilMs: 30 * 24 * 60 * 60_000,
+    eventId: 'event-by-locator',
+    limit: 1,
+  }), []);
+  assert.equal(calls.length, 2,
+    'a wide pinned Event lookup must resolve the narrow locator before materialising the Event');
+  assert.match(calls[0].query, /FROM event_locators_v1/u);
+  assert.equal(calls[1].query_params.since, 149_999);
+  assert.equal(calls[1].query_params.until, 150_001);
+  assert.equal(calls[1].query_params.eventId, 'event-by-locator');
+}
+
 fake.state.calls.length = 0;
 const recent = await store.recentWindowEvents(100, 200, 1_000, { monitoredOnly: true, tier: 'Llm' });
 assert.deepEqual(recent, []);

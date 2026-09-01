@@ -445,6 +445,23 @@ assert.equal(v3Owner.conversationCount, v3Owner.userThreads.length);
 assert.ok(v3Owner.usage.totalTokens >= 150);
 assert.ok(v3Owner.instanceUsage.some((usage) => usage.totalTokens >= 150));
 
+const directoryV4 = await requestWithoutManagementToken('/agents/conversation-directory-v4', {
+  timeType: 'last_30d',
+  scope: 'agent',
+  classificationView: 'current_effective',
+  lifecycleScope: 'all',
+});
+assert.equal(directoryV4.apiVersion, 4);
+assert.equal(directoryV4.resolutionRevision, directoryV3.resolutionRevision);
+assert.ok(directoryV4.items.every((entry) => !Object.hasOwn(entry, 'conversations')),
+  'the V4 read model must not duplicate user Threads under a legacy field');
+assert.ok(directoryV4.items.every((entry) => entry.recentInstances.length <= 32));
+assert.ok(directoryV4.items.every((entry) => entry.technicalActivities.length <= 32));
+const v4Owner = directoryV4.items.find((entry) =>
+  entry.userThreads.some((thread) => thread.conversationId === conversation.conversationId));
+assert.ok(v4Owner, JSON.stringify(directoryV4));
+assert.deepEqual(v4Owner.userThreads, v3Owner.userThreads);
+
 const semanticTimelineV3 = await requestWithoutManagementToken('/agents/conversations/timeline-v3', {
   timeType: 'last_30d',
   scope: 'agent',

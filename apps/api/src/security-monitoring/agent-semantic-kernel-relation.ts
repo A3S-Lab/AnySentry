@@ -398,9 +398,15 @@ function potentialRelation(
     turnId: event.turnId,
     toolInvocationId: invocationId,
     kernelEventId: candidate.eventId,
+    kernelEventAt: candidate.at,
+    kernelEventKind: candidate.eventKind,
+    ...(candidate.decisionRevision !== undefined
+      ? { kernelEventDecisionRevision: candidate.decisionRevision }
+      : {}),
     status: confidence === 1 ? 'linked_exact' : 'linked_strong',
     linkMethod,
     lineageMethod: runtimeLink,
+    timeQuality: result ? 'exact' : 'bounded',
     confidence,
     authority: 'attested_tls_plaintext',
     relationVersion: AGENT_SEMANTIC_KERNEL_RELATION_VERSION,
