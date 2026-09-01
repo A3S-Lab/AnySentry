@@ -4452,11 +4452,23 @@ export class ClickHouseStore {
       const result = await this.client.query({
         query: `
           SELECT eventId,
-            argMax(at, tuple(decisionRevision, decisionUpdatedAt, ingestedAt)) AS at,
-            max(decisionRevision) AS decisionRevision
-          FROM ${EVENT_LOCATOR_TABLE}
-          WHERE eventId = {eventId:String}
-          GROUP BY eventId
+            locatedAt AS at,
+            locatedDecisionRevision AS decisionRevision
+          FROM (
+            SELECT locator.eventId AS eventId,
+              argMax(
+                locator.at,
+                tuple(
+                  locator.decisionRevision,
+                  locator.decisionUpdatedAt,
+                  locator.ingestedAt
+                )
+              ) AS locatedAt,
+              max(locator.decisionRevision) AS locatedDecisionRevision
+            FROM ${EVENT_LOCATOR_TABLE} AS locator
+            WHERE locator.eventId = {eventId:String}
+            GROUP BY locator.eventId
+          )
           LIMIT 1`,
         query_params: { eventId: normalized },
         clickhouse_settings: {

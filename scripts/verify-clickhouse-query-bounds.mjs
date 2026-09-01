@@ -164,6 +164,10 @@ assert.equal(fake.state.active, 0);
     at: 150_000,
     decisionRevision: 4,
   });
+  assert.match(calls[0].query, /FROM event_locators_v1 AS locator/u);
+  assert.match(calls[0].query, /max\(locator\.decisionRevision\) AS locatedDecisionRevision/u);
+  assert.doesNotMatch(calls[0].query, /AS decisionRevision\s+FROM event_locators_v1/u,
+    'locator aggregation aliases must not shadow source columns inside argMax');
   assert.equal(calls[0].clickhouse_settings.max_execution_time, 2);
   calls.length = 0;
   assert.deepEqual(await locatorStore.searchEvents({
