@@ -72,6 +72,7 @@ import {
   buildSemanticKernelRelations,
   semanticKernelRelationBatchWindow,
   toolInvocationId,
+  type SemanticKernelRelationInput,
 } from './agent-semantic-kernel-relation';
 import {
   projectContextReplaySummaries,
@@ -86,6 +87,7 @@ const MAX_HISTORY_CACHE_ENTRIES = 64;
 const LEVEL_BY_RANK = ['safe', 'low', 'medium', 'high', 'critical'];
 const LEVEL_TEXT: Record<string, string> = { safe: '安全', low: '低危', medium: '中危', high: '高危', critical: '严重', unknown: '未知' };
 const TOOL_EVIDENCE_RELATION_SETTLE_MS = 10_000;
+const TOOL_EVIDENCE_INCREMENTAL_LOOKBACK_MS = 60_000;
 const CONVERSATION_INTERACTIONS_PER_AGENT = 64;
 const CONVERSATION_INTERACTIONS_TOTAL = 2_000;
 const CONVERSATION_PROJECTION_CONCURRENCY = 4;
@@ -332,6 +334,42 @@ function semanticKernelEventCategory(
   if (/(?:^|[\s._-])(?:read|write|edit|file)(?:$|[\s._-])/u.test(kind)) return 'file';
   if (/(?:^|[\s._-])(?:search|http|fetch|network)(?:$|[\s._-])/u.test(kind)) return 'network';
   return undefined;
+}
+
+function semanticAtMs(event: T.AgentSemanticEvent): number {
+  try {
+    return Number(BigInt(event.atUnixNs) / 1_000_000n);
+  } catch {
+    return Number.NaN;
+  }
+}
+
+function interactionEndedAtMs(interaction: T.AgentInteractionRecord): number {
+  try {
+    return Number(BigInt(interaction.endedAtUnixNs) / 1_000_000n);
+  } catch {
+    return interaction.at;
+  }
+}
+
+function semanticRelationInputNearTrigger(
+  input: SemanticKernelRelationInput,
+  trigger: T.AgentInteractionRecord,
+): boolean {
+  const exactSource = input.event.sourceInteractionIds.includes(trigger.interactionId)
+    || input.result?.sourceInteractionIds.includes(trigger.interactionId) === true;
+  if (exactSource) return true;
+  const eventAt = semanticAtMs(input.event);
+  if (!Number.isFinite(eventAt)) return false;
+  const resultAt = input.result ? semanticAtMs(input.result) : eventAt;
+  const triggerStart = trigger.at - TOOL_EVIDENCE_INCREMENTAL_LOOKBACK_MS;
+  const triggerEnd = Math.max(
+    trigger.at,
+    trigger.receivedAt,
+    interactionEndedAtMs(trigger),
+  ) + TOOL_EVIDENCE_RELATION_SETTLE_MS;
+  return eventAt <= triggerEnd
+    && (Number.isFinite(resultAt) ? resultAt : eventAt) >= triggerStart;
 }
 
 export const toolEvidenceHotPathTesting = {
@@ -2026,7 +2064,12 @@ export class AggregationService {
           })
           .filter((item): item is NonNullable<typeof item> => Boolean(item));
       })
-      .slice(0, 1_000);
+      // Incremental work is triggered by one newly durable interaction. Replaying every Tool call
+      // from the 30-minute identity hydration window turns one short command into a 30-minute
+      // Kernel scan and prevents eager persistence under active sessions. Retain exact source
+      // membership plus a bounded overlap for a call/result pair split across adjacent requests.
+      .filter((input) => semanticRelationInputNearTrigger(input, trigger))
+      .slice(0, 200);
     if (relationInputs.length === 0) return;
 
     const fallback = relationInputs[0];
@@ -2035,6 +2078,11 @@ export class AggregationService {
     const instanceIds = [...new Set(relationInputs
       .map((input) => input.interaction.agentInstanceId)
       .filter((value): value is string => Boolean(value)))];
+    const relationCategories = relationInputs.map(({ event }) => semanticKernelEventCategory(event));
+    const relationEventCategory = relationCategories[0]
+      && relationCategories.every((category) => category === relationCategories[0])
+      ? relationCategories[0]
+      : undefined;
     let kernel = await this.storedAgentEvents({
       timeType: 'custom',
       startTime: new Date(window.startMs).toISOString(),
@@ -2042,6 +2090,7 @@ export class AggregationService {
       scope: 'agent',
       classificationView: 'current_effective',
       ...(instanceIds.length === 1 ? { agentInstanceId: instanceIds[0] } : {}),
+      ...(relationEventCategory ? { eventCategory: relationEventCategory } : {}),
       durable: true,
       limit: 1_000,
     });
@@ -2059,6 +2108,7 @@ export class AggregationService {
         endTime: new Date(Math.max(window.startMs, candidateEnd)).toISOString(),
         scope: 'agent',
         classificationView: 'current_effective',
+        ...(relationEventCategory ? { eventCategory: relationEventCategory } : {}),
         durable: true,
         limit: 1_000,
       });

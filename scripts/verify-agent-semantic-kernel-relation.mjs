@@ -667,6 +667,7 @@ assert.equal(fastEvidence.coverage.partial, false);
 
 let projectionPersisted = 0;
 let incrementallySavedRelations = [];
+const incrementalKernelQueries = [];
 const bindingStub = {
   applyPersistedBindings: async (items) => items,
   persistProjection: async () => { projectionPersisted += 1; },
@@ -690,27 +691,51 @@ const aggregate = new AggregationService(
   bindingStub,
   incrementalStore,
 );
+const staleProjectedInteraction = {
+  ...projectedInteraction,
+  interactionId: 'mi_stale_incremental_relation_projection',
+  at: callAt - 20 * 60_000,
+  startedAtUnixNs: String(BigInt(callAt - 20 * 60_000) * 1_000_000n),
+  requestCompleteAtUnixNs: String(BigInt(callAt - 20 * 60_000 + 1) * 1_000_000n),
+  firstResponseAtUnixNs: String(BigInt(callAt - 20 * 60_000 + 2) * 1_000_000n),
+  endedAtUnixNs: String(BigInt(callAt - 20 * 60_000 + 3) * 1_000_000n),
+  receivedAt: callAt - 20 * 60_000 + 4,
+  toolCalls: [{
+    toolCallId: 'call-stale-incremental',
+    name: 'exec_command',
+    arguments: { cmd: 'printf stale-incremental-command' },
+    issuedAtUnixNs: String(BigInt(callAt - 20 * 60_000 + 2) * 1_000_000n),
+  }],
+};
 aggregate.readAgentInteractions = async () => ({
-  items: [projectedInteraction],
+  items: [staleProjectedInteraction, projectedInteraction],
   total: 1,
   totalMode: 'exact',
   coverage: { partial: false },
   dataSource: 'clickhouse',
   updateTime: new Date(callAt).toISOString(),
 });
-aggregate.storedAgentEvents = async () => ({
-  items: [kernelEvent],
-  total: 1,
-  totalMode: 'exact',
-  coverage: { partial: false },
-  dataSource: 'clickhouse',
-  updateTime: new Date(callAt).toISOString(),
-});
+aggregate.storedAgentEvents = async (query) => {
+  incrementalKernelQueries.push(query);
+  return {
+    items: [kernelEvent],
+    total: 1,
+    totalMode: 'exact',
+    coverage: { partial: false },
+    dataSource: 'clickhouse',
+    updateTime: new Date(callAt).toISOString(),
+  };
+};
 await aggregate.projectSemanticKernelRelationsFor(projectedInteraction);
 assert.equal(projectionPersisted, 1,
   'incremental relation work must persist the Conversation projection outside the read path');
 assert.equal(incrementallySavedRelations.length, 1);
 assert.equal(incrementallySavedRelations[0].kernelEventId, kernelEvent.eventId);
 assert.equal(incrementallySavedRelations[0].kernelEventAt, kernelEvent.at);
+assert.equal(incrementalKernelQueries.length, 1,
+  'a trigger-local exact match must not require the unscoped ancestry fallback');
+assert.equal(incrementalKernelQueries[0].eventCategory, 'tool');
+assert.ok(Date.parse(incrementalKernelQueries[0].startTime) >= callAt - 5_000,
+  'a stale Tool call in the hydration window must not widen incremental Kernel evidence work');
 
 console.log('Agent Semantic Tool to Kernel relation verification passed');
