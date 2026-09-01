@@ -33,6 +33,21 @@ function unixNsToMs(value: string): number {
   }
 }
 
+function candidateEventAtMs(event: T.AgentEventListItem): number {
+  if (event.eventAtUnixNs) {
+    const precise = unixNsToMs(event.eventAtUnixNs);
+    if (Number.isFinite(precise)) return precise;
+  }
+  const at = text(event.at, 128);
+  if (!at) return Number.NaN;
+  // ClickHouse's historical display field is `YYYY-MM-DD HH:mm:ss` without a zone. It denotes
+  // UTC, but Date.parse otherwise interprets it in the API process's local timezone.
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/u.test(at)
+    ? at.replace(' ', 'T') + 'Z'
+    : at;
+  return Date.parse(normalized);
+}
+
 function normalizedCommand(value: string): string {
   return value
     .trim()
@@ -354,7 +369,7 @@ function withinWindow(
   const start = unixNsToMs(event.atUnixNs);
   const resultAt = result ? unixNsToMs(result.atUnixNs) : Number.NaN;
   const end = Number.isFinite(resultAt) ? resultAt : start + OPEN_TOOL_WINDOW_MS;
-  const at = Date.parse(candidate.at);
+  const at = candidateEventAtMs(candidate);
   return Number.isFinite(start) && Number.isFinite(at)
     && at >= start - CLOCK_SKEW_MS
     && at <= end + CLOCK_SKEW_MS;
@@ -373,7 +388,7 @@ function shellBootstrapCandidate(
   if (!Number.isSafeInteger(rootPid) || candidate.process?.ppid !== rootPid) return false;
   const callAt = unixNsToMs(input.event.atUnixNs);
   const resultAt = unixNsToMs(input.result.atUnixNs);
-  const candidateAt = Date.parse(candidate.at);
+  const candidateAt = candidateEventAtMs(candidate);
   return Number.isFinite(callAt)
     && Number.isFinite(resultAt)
     && Number.isFinite(candidateAt)

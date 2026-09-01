@@ -158,6 +158,23 @@ assert.equal(truncatedArgvRelations[0].status, 'semantic_only');
 assert.equal(truncatedArgvRelations[0].kernelEventId, undefined,
   'an explicitly truncated argv must never be promoted into exact command evidence');
 
+const preciseKernelTimeRelations = buildSemanticKernelRelations(
+  toolCall,
+  toolResult,
+  interaction,
+  [{
+    ...kernelEvent,
+    eventId: 'evt_precise_kernel_time',
+    at: '1970-01-01 00:00:00',
+    eventAtUnixNs: String(BigInt(callAt + 100) * 1_000_000n),
+  }],
+  12,
+  false,
+);
+assert.equal(preciseKernelTimeRelations[0].status, 'linked_exact');
+assert.equal(preciseKernelTimeRelations[0].kernelEventId, 'evt_precise_kernel_time',
+  'the attested nanosecond event time must take precedence over a coarse or zone-less display time');
+
 const resourceCall = {
   ...toolCall,
   semanticEventId: 'se_semantic_resource',
