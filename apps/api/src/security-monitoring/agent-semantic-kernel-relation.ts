@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 
 import type * as T from './types';
 
-export const AGENT_SEMANTIC_KERNEL_RELATION_VERSION = 2;
+export const AGENT_SEMANTIC_KERNEL_RELATION_VERSION = 3;
 const CLOCK_SKEW_MS = 2_000;
 const OPEN_TOOL_WINDOW_MS = 30 * 60_000;
 const SHELL_TOOL_PATTERN = /(?:^|[\s._-])(?:bash|exec|shell)(?:$|[\s._-])/u;
@@ -458,7 +458,11 @@ function potentialRelation(
       expected === observed || observed.includes(expected) || expected.includes(observed)
     )) {
       linkMethod = 'command';
-      confidence = expected === observed ? 1 : 0.98;
+      confidence = expected === observed
+        ? 1
+        : observed.includes(expected)
+          ? 0.98
+          : 0.85;
     }
   }
   if (!linkMethod && resource && ['FileAccess', 'FileDelete'].includes(candidate.eventKind)) {
@@ -573,8 +577,17 @@ export function buildSemanticKernelRelationBatch(
       !['shell_bootstrap', 'network_endpoint'].includes(relation.linkMethod ?? ''));
     const boundedFallbacks = potential.filter((relation) =>
       ['shell_bootstrap', 'network_endpoint'].includes(relation.linkMethod ?? ''));
+    const strongestContentConfidence = contentRelations.reduce(
+      (highest, relation) => Math.max(highest, relation.confidence),
+      0,
+    );
+    const strongestContent = contentRelations.filter((relation) =>
+      relation.confidence === strongestContentConfidence);
     const relations = contentRelations.length > 0
-      ? contentRelations
+      // One semantic Tool action has one primary Kernel owner. A complete command match outranks
+      // descendant subcommands; equal-strength competing process generations remain unlinked
+      // instead of presenting several events as if each were the same invocation.
+      ? strongestContent.length === 1 ? strongestContent : []
       : boundedFallbacks.length === 1
         ? boundedFallbacks
         : [];

@@ -68,6 +68,7 @@ import { AgentConversationBindingService } from './agent-conversation-binding.se
 import { trafficRoleForInteraction } from './agent-conversation-resolution-v2';
 import { RelationalBusinessStore } from './relational-business-store.service';
 import {
+  AGENT_SEMANTIC_KERNEL_RELATION_VERSION,
   buildSemanticKernelRelationBatch,
   buildSemanticKernelRelations,
   semanticKernelRelationBatchWindow,
@@ -2700,7 +2701,8 @@ export class AggregationService {
       Number.NEGATIVE_INFINITY,
     );
     const persistedRelations = loadedPersistedRelations.filter((relation) =>
-      relation.resolutionRevision === latestPersistedRevision);
+      relation.resolutionRevision === latestPersistedRevision
+      && relation.relationVersion === AGENT_SEMANTIC_KERNEL_RELATION_VERSION);
     const persistedLinked = persistedRelations.length > 0
       && persistedRelations.every((relation) =>
         Boolean(relation.kernelEventId)

@@ -101,6 +101,38 @@ assert.equal(relations[0].risk.verdict, 'block');
 assert.equal(relations[0].authority, 'attested_tls_plaintext');
 assert.equal(relations[0].toolInvocationId, toolInvocationId(toolCall, interaction));
 
+const nestedSubcommandEvent = {
+  ...kernelEvent,
+  eventId: 'evt_nested_subcommand',
+  subject: 'rg -n resolver-v2',
+  process: { pid: 102, ppid: 101, comm: 'rg' },
+};
+const primaryCommandRelations = buildSemanticKernelRelations(
+  toolCall,
+  toolResult,
+  interaction,
+  [kernelEvent, nestedSubcommandEvent],
+  12,
+  false,
+);
+assert.equal(primaryCommandRelations.length, 1);
+assert.equal(primaryCommandRelations[0].kernelEventId, kernelEvent.eventId,
+  'the complete Tool command must uniquely outrank one nested subcommand process');
+assert.equal(primaryCommandRelations[0].confidence, 1);
+
+const equalCommandCandidates = buildSemanticKernelRelations(
+  toolCall,
+  toolResult,
+  interaction,
+  [kernelEvent, { ...kernelEvent, eventId: 'evt_equal_command_generation' }],
+  12,
+  false,
+);
+assert.equal(equalCommandCandidates.length, 1);
+assert.equal(equalCommandCandidates[0].status, 'semantic_only');
+assert.equal(equalCommandCandidates[0].kernelEventId, undefined,
+  'equal-strength competing Kernel generations must remain explicit instead of producing two owners');
+
 const codexCustomToolCall = {
   ...toolCall,
   semanticEventId: 'se_codex_custom_tool',

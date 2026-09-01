@@ -1965,7 +1965,7 @@ export interface AgentSemanticKernelRelation {
   timeQuality?: 'exact' | 'bounded';
   confidence: number;
   authority: 'attested_tls_plaintext';
-  relationVersion: 1 | 2;
+  relationVersion: 1 | 2 | 3;
   resolutionRevision: number;
   risk?: {
     verdict: Verdict;
