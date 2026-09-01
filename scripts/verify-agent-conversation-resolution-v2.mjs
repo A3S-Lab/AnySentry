@@ -399,6 +399,102 @@ assert.equal(boundaryReplay[0].replayedUserMessages, 3);
 assert.equal(boundaryReplay[0].replayedToolResults, 1);
 assert.equal(boundaryReplay[0].newUserMessages, 1);
 
+const clientMetadataSessionId = 'session-observed-after-resume';
+const h4 = human('msg-h4', 'turn-h4', 'continue from the first observed turn');
+const clientMetadataResume = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_client_metadata_prewarm',
+    at: base + 1_050,
+    instance: 'host-root:v2:resume-one',
+    request: {
+      type: 'response.create',
+      generate: false,
+      model: 'fixture-model',
+      client_metadata: {
+        session_id: clientMetadataSessionId,
+        thread_id: clientMetadataSessionId,
+        turn_id: '',
+      },
+      input: [
+        developer('msg-resume-prewarm', 'resumed Thread instructions'),
+        h0,
+        h1,
+        h2,
+      ],
+    },
+    responseId: 'resp-client-metadata-prewarm',
+    responseText: '',
+  }),
+  interaction({
+    id: 'mi_v2_client_metadata_first_observed',
+    at: base + 1_100,
+    instance: 'host-root:v2:resume-one',
+    request: {
+      type: 'response.create',
+      model: 'fixture-model',
+      client_metadata: {
+        session_id: clientMetadataSessionId,
+        thread_id: clientMetadataSessionId,
+        turn_id: 'turn-h3',
+      },
+      // The earlier portion was never observed by AnySentry. Only h3 is new at this boundary.
+      input: [h0, h1, h2, h3],
+    },
+    responseId: 'resp-client-metadata-one',
+    responseText: 'first observed response',
+  }),
+  interaction({
+    id: 'mi_v2_client_metadata_next_observed',
+    at: base + 1_200,
+    instance: 'host-root:v2:resume-two',
+    request: {
+      type: 'response.create',
+      model: 'fixture-model',
+      client_metadata: {
+        session_id: clientMetadataSessionId,
+        thread_id: clientMetadataSessionId,
+        turn_id: 'turn-h4',
+      },
+      input: [h0, h1, h2, h3, h4],
+    },
+    responseId: 'resp-client-metadata-two',
+    responseText: 'next observed response',
+  }),
+]);
+assert.equal(clientMetadataResume.technicalRecords.length, 1);
+assert.equal(clientMetadataResume.technicalRecords[0].trafficRole, 'bootstrap',
+  'a generate=false resume prewarm must stay outside the user-visible Thread');
+assert.deepEqual(
+  [...new Set(clientMetadataResume.conversationRecords
+    .map((item) => item.providerConversationId))],
+  [clientMetadataSessionId],
+  'Responses client_metadata session/thread identity must become a provider Conversation anchor',
+);
+assert.equal(new Set(clientMetadataResume.conversationRecords
+  .map((item) => item.conversationId)).size, 1,
+  'a resumed session first observed mid-history must remain one Thread across Runtime instances');
+const clientMetadataProjection = projectAgentConversations(
+  clientMetadataResume.records,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(clientMetadataProjection.summaries.length, 1);
+assert.equal(clientMetadataProjection.summaries[0].idSource, 'provider');
+const clientMetadataTimeline = projectSemanticConversationTimeline(
+  clientMetadataProjection.summaries[0],
+  clientMetadataProjection.interactionsByConversation.get(
+    clientMetadataProjection.summaries[0].conversationId,
+  ),
+  [],
+);
+assert.deepEqual(
+  clientMetadataTimeline.flatMap((turn) => turn.events)
+    .filter((event) => event.kind === 'user_message')
+    .map((event) => event.contentPreview),
+  ['resume the terminal session', 'continue from the first observed turn'],
+  'only content observed after the collection boundary should become visible user Turns',
+);
+
 const explicitConflict = resolveAgentConversationsV2([
   interaction({
     id: 'mi_v2_conflict_a',

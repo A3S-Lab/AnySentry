@@ -244,6 +244,7 @@ export function interactionHumanMessages(
 function providerConversationValue(request: Record<string, unknown> | undefined): string | undefined {
   if (!request) return undefined;
   const conversation = request.conversation;
+  const clientMetadata = record(request.client_metadata);
   return text(request.conversation_id)
     ?? text(request.thread_id)
     ?? text(request.session_id)
@@ -251,7 +252,13 @@ function providerConversationValue(request: Record<string, unknown> | undefined)
     ?? text(record(conversation)?.id)
     ?? text(record(request.metadata)?.conversation_id)
     ?? text(record(request.metadata)?.thread_id)
-    ?? text(record(request.metadata)?.session_id);
+    ?? text(record(request.metadata)?.session_id)
+    // Responses WebSocket clients can carry the resumable product Thread in client_metadata,
+    // including a generate=false prewarm followed by later generated turns. Treat the protocol
+    // field generically; no Codex version, executable, or provider URL is required.
+    ?? text(clientMetadata?.conversation_id)
+    ?? text(clientMetadata?.thread_id)
+    ?? text(clientMetadata?.session_id);
 }
 
 function continuityValue(request: Record<string, unknown> | undefined): string | undefined {
@@ -301,6 +308,12 @@ export function conversationAnchorsForInteraction(
     'previous_response_id',
   );
   push('continuity_key', continuityValue(request), 'strong', 'prompt_cache_key|cache_key');
+  push(
+    'turn_id',
+    text(record(request?.client_metadata)?.turn_id),
+    'exact',
+    'client_metadata.turn_id',
+  );
   for (const message of structuredMessages(interaction)) {
     push('message_item_id', message.sourceItemId, 'strong', 'input[].id|messages[].id');
     push('turn_id', message.turnId, 'strong', 'message.metadata.turn_id');
@@ -322,6 +335,10 @@ function jsonRpcMethod(interaction: T.AgentInteractionRecord): string | undefine
 export function trafficRoleForInteraction(
   interaction: T.AgentInteractionRecord,
 ): ConversationMembershipRole {
+  const request = requestObject(interaction);
+  if (interaction.interactionType === 'model' && request?.generate === false) {
+    return 'bootstrap';
+  }
   if (interaction.trafficRole && interaction.trafficRole !== 'unclassified') {
     return interaction.trafficRole;
   }
@@ -615,11 +632,23 @@ export function resolveAgentConversationsV2(
   ) * 100 + AGENT_CONVERSATION_RESOLVER_V2,
 ): ConversationResolutionV2 {
   const records = interactions
-    .map((item) => ({
-      ...item,
-      trafficRole: trafficRoleForInteraction(item),
-      conversationAnchors: conversationAnchorsForInteraction(item),
-    }))
+    .map((item) => {
+      const request = requestObject(item);
+      const providerConversationId = item.providerConversationId
+        ?? providerConversationValue(request);
+      const providerPreviousResponseId = item.providerPreviousResponseId
+        ?? text(request?.previous_response_id);
+      const normalizedItem: T.AgentInteractionRecord = {
+        ...item,
+        ...(providerConversationId ? { providerConversationId } : {}),
+        ...(providerPreviousResponseId ? { providerPreviousResponseId } : {}),
+      };
+      return {
+        ...normalizedItem,
+        trafficRole: trafficRoleForInteraction(normalizedItem),
+        conversationAnchors: conversationAnchorsForInteraction(normalizedItem),
+      };
+    })
     .sort((left, right) => left.at - right.at || left.interactionId.localeCompare(right.interactionId));
   const decidedAt = Math.max(1, ...records.map((record) => record.receivedAt));
   const visibleIndexes = records
