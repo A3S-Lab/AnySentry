@@ -24,7 +24,7 @@ const {
 const BASE = 1_788_600_000_000;
 const RUNTIME_ID = 'host-root:study:100:1000';
 const baselineResults = JSON.parse(readFileSync(
-  new URL('../../docs/witr-attribution-evidence-chain-assets/study-results.json', import.meta.url),
+  new URL('../../test/fixtures/witr-attribution-baseline.v1.json', import.meta.url),
   'utf8',
 ));
 
@@ -670,7 +670,7 @@ const result = {
     speedupAgainstSavedBaseline: Number((baselineMedianMs / benchmark.implementationMedianMs).toFixed(2)),
   },
   notes: [
-    'The baseline object is preserved in study-results.json; this output exercises the native implementation.',
+    'The minimal pre-implementation baseline is preserved as a test fixture; this output exercises the native implementation.',
     'The timing result is a local synthetic command-linking microbenchmark, not a production capacity claim.',
     'LaunchContext is stored once per Agent Root; the final Tool process is connected by its parent generation edge rather than duplicating the full path on every event.',
   ],

@@ -1,0 +1,51 @@
+{
+  "schemaVersion": "anysentry.witr_attribution_baseline.v1",
+  "baselineCommit": "05597c5109ebef999cf1fcbcc78a50d301516f81",
+  "scenes": {
+    "continuityCollision": {
+      "current": {
+        "conversationCount": 1,
+        "outcome": "two divergent human conversations merged by continuity key alone"
+      }
+    },
+    "reusedParentPid": {
+      "current": {
+        "status": "linked_strong",
+        "linkedKernelEventId": "evt-child-of-reused-parent",
+        "outcome": "old Agent parent generation satisfied a new child ancestry walk"
+      }
+    },
+    "duplicateToolOwnership": {
+      "current": {
+        "toolAStatus": "linked_exact",
+        "toolBStatus": "linked_exact",
+        "sharedKernelEventId": "evt-one-exec-two-tools"
+      }
+    },
+    "launchContext": {
+      "current": {
+        "agentRootPid": 400,
+        "attributionSource": "process_graph",
+        "evidence": [
+          "process_lineage:agent_root"
+        ],
+        "launchPathAvailable": false
+      }
+    },
+    "lifecycleParentIdentity": {
+      "current": {
+        "processInstanceKey": "pri_dd5a5e8094bac5366a0dfeae",
+        "ppid": 220,
+        "parentProcessInstanceKey": null,
+        "jsonBytes": 554
+      },
+      "proposed": {
+        "additiveFieldBytes": 57
+      }
+    }
+  },
+  "benchmark": {
+    "candidateCount": 1501,
+    "currentMedianMs": 42.7
+  }
+}
