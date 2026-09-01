@@ -23,7 +23,7 @@ import {
   type AgentClassification,
   type AgentConversationCoverageStatus,
   type AgentConversationSummary,
-  type AgentRuntimeInstanceRecord,
+  type AgentRuntimeDirectoryInstance,
   type AgentSemanticEvent,
   type LogicalAgentConversationDirectoryItemV4,
   securityCenterApi,
@@ -186,7 +186,7 @@ export default function ConversationTrackingPage() {
   };
   const selectRuntimeInstance = (
     agent: LogicalAgentConversationDirectoryItemV4,
-    instance: AgentRuntimeInstanceRecord,
+    instance: AgentRuntimeDirectoryInstance,
   ) => {
     setLiveFollow(false);
     const canonical = instance.canonicalAgentInstanceId ?? instance.agentInstanceId;

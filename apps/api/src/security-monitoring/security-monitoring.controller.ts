@@ -4918,13 +4918,43 @@ export class SecurityMonitoringController {
           technicalActivities,
           ...thin
         } = item;
+        const directoryInstances: T.AgentRuntimeDirectoryInstance[] = recentInstances
+          .slice(0, 12)
+          .map((instance) => ({
+            agentInstanceId: instance.agentInstanceId,
+            ...(instance.canonicalAgentInstanceId
+              ? { canonicalAgentInstanceId: instance.canonicalAgentInstanceId }
+              : {}),
+            ...(instance.agentInstanceAliases?.length
+              ? { agentInstanceAliases: [...instance.agentInstanceAliases] }
+              : {}),
+            runtimeState: instance.runtimeState,
+            ...(instance.activityState ? { activityState: instance.activityState } : {}),
+            rootPid: instance.rootPid,
+            rootStartTimeTicks: instance.rootStartTimeTicks,
+            lastSeenAt: instance.lastSeenAt,
+            ...(instance.lastActivityAt !== undefined
+              ? { lastActivityAt: instance.lastActivityAt }
+              : {}),
+            ...(instance.workspacePath ? { workspacePath: instance.workspacePath } : {}),
+            ...(instance.workloadRef ? { workloadRef: { ...instance.workloadRef } } : {}),
+          }));
+        const visibleInstanceIds = [...new Set([
+          ...thin.userThreads.flatMap((thread) => thread.agentInstanceIds),
+          ...directoryInstances.flatMap((instance) => [
+            instance.canonicalAgentInstanceId,
+            instance.agentInstanceId,
+            ...(instance.agentInstanceAliases ?? []),
+          ].filter((value): value is string => Boolean(value))),
+        ])].slice(0, 256);
         return {
           ...thin,
           // V3 duplicated every Thread under both `conversations` and `userThreads` and embedded
           // up to one hundred full Runtime records per Agent. V4 is the page read model: the
           // canonical user Thread list is sent once; detailed historical instances remain a
           // separate runtime concern while the most recent records preserve immediate navigation.
-          recentInstances: recentInstances.slice(0, 32),
+          agentInstanceIds: visibleInstanceIds,
+          recentInstances: directoryInstances,
           technicalActivities: [...technicalActivities]
             .sort((left, right) => {
               const leftAt = BigInt(left.endedAtUnixNs);

@@ -1755,10 +1755,27 @@ export interface AgentConversationDirectoryListV3
   items: LogicalAgentConversationDirectoryItemV3[];
 }
 
+export type AgentRuntimeDirectoryInstance = Pick<
+  AgentRuntimeInstanceRecord,
+  | 'agentInstanceId'
+  | 'canonicalAgentInstanceId'
+  | 'agentInstanceAliases'
+  | 'runtimeState'
+  | 'activityState'
+  | 'rootPid'
+  | 'rootStartTimeTicks'
+  | 'lastSeenAt'
+  | 'lastActivityAt'
+  | 'workspacePath'
+  | 'workloadRef'
+>;
+
 export type LogicalAgentConversationDirectoryItemV4 = Omit<
   LogicalAgentConversationDirectoryItemV3,
-  'conversations'
->;
+  'conversations' | 'recentInstances'
+> & {
+  recentInstances: AgentRuntimeDirectoryInstance[];
+};
 
 export interface AgentConversationDirectoryListV4
   extends Omit<AgentConversationDirectoryListV3, 'apiVersion' | 'items'> {

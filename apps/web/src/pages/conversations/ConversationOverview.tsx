@@ -14,7 +14,7 @@ import {
 
 import type {
   AgentConversationSummary,
-  AgentRuntimeInstanceRecord,
+  AgentRuntimeDirectoryInstance,
   LogicalAgentConversationDirectoryItemV4,
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
@@ -26,7 +26,7 @@ import {
   usageForInstance,
 } from "./agentUsage";
 
-function runtimeId(instance: AgentRuntimeInstanceRecord) {
+function runtimeId(instance: AgentRuntimeDirectoryInstance) {
   return instance.canonicalAgentInstanceId ?? instance.agentInstanceId;
 }
 

@@ -455,7 +455,7 @@ assert.equal(directoryV4.apiVersion, 4);
 assert.equal(directoryV4.resolutionRevision, directoryV3.resolutionRevision);
 assert.ok(directoryV4.items.every((entry) => !Object.hasOwn(entry, 'conversations')),
   'the V4 read model must not duplicate user Threads under a legacy field');
-assert.ok(directoryV4.items.every((entry) => entry.recentInstances.length <= 32));
+assert.ok(directoryV4.items.every((entry) => entry.recentInstances.length <= 12));
 assert.ok(directoryV4.items.every((entry) => entry.technicalActivities.length <= 32));
 const v4Owner = directoryV4.items.find((entry) =>
   entry.userThreads.some((thread) => thread.conversationId === conversation.conversationId));

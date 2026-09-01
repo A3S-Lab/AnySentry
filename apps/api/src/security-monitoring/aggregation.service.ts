@@ -1920,8 +1920,7 @@ export class AggregationService {
   private scheduleSemanticRelationProjection(record: T.AgentInteractionRecord): void {
     if (
       !this.relationalStore?.configured?.()
-      || trafficRoleForInteraction(record) !== 'conversation'
-      || (record.toolCalls.length === 0 && record.toolResults.length === 0)
+      || trafficRoleForInteraction(record) === 'unclassified'
     ) return;
     const key = record.agentInstanceId?.trim() || record.agentAssetId;
     const now = Date.now();
@@ -2330,7 +2329,8 @@ export class AggregationService {
       ...filter,
       ...(canonicalConversationId ? { conversationId: canonicalConversationId } : {}),
     });
-    if (this.conversationBindings) await this.conversationBindings.persistProjection(projection);
+    // Read APIs are pure projections. Durable Thread/Segment/Relation state is updated by the
+    // bounded post-ingest materializer; polling this page must never create PostgreSQL WAL churn.
     return {
       projection,
       interactions,

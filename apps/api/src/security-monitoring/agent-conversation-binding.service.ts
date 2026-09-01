@@ -244,12 +244,12 @@ export class AgentConversationBindingService {
     const conversationIds = [...new Set(matches
       .map((match) => match.membership.canonicalConversationId)
       .filter((value): value is string => Boolean(value)))];
-    for (const thread of await this.relationalStore.loadAgentConversationThreadsByIds(
-      conversationIds,
-    )) this.threads.set(thread.conversationId, thread);
-    for (const segment of await this.relationalStore.loadAgentConversationSegments(
-      conversationIds,
-    )) this.segments.set(segment.segmentId, segment);
+    const [threads, segments] = await Promise.all([
+      this.relationalStore.loadAgentConversationThreadsByIds(conversationIds),
+      this.relationalStore.loadAgentConversationSegments(conversationIds),
+    ]);
+    for (const thread of threads) this.threads.set(thread.conversationId, thread);
+    for (const segment of segments) this.segments.set(segment.segmentId, segment);
     const byHash = new Map<string, typeof matches>();
     for (const match of matches) {
       const anchor = match.anchor.anchor;
@@ -321,35 +321,34 @@ export class AgentConversationBindingService {
     if (interactions.length === 0) return [];
     const interactionIds = interactions.map((record) => record.interactionId);
     if (this.relationalStore?.configured()) {
-      const loadedMemberships = await this.relationalStore
-        .loadAgentConversationMembershipsV2?.(interactionIds) ?? [];
+      const [loadedMemberships, loadedBindings] = await Promise.all([
+        this.relationalStore.loadAgentConversationMembershipsV2?.(interactionIds) ?? [],
+        this.relationalStore.loadAgentConversationBindings(interactionIds),
+      ]);
       for (const membership of loadedMemberships) {
         this.membershipsV2.set(membership.interactionId, membership);
       }
-      const loadedBindings = await this.relationalStore.loadAgentConversationBindings(interactionIds);
       for (const binding of loadedBindings) {
         this.bindings.set(binding.interactionId, binding);
       }
-      for (const thread of await this.relationalStore.loadAgentConversationThreads(
-        loadedBindings.map((binding) => binding.logicalScopeKey),
-      )) this.threads.set(thread.conversationId, thread);
-      for (const thread of await this.relationalStore.loadAgentConversationThreadsByIds([
-        ...loadedBindings.map((binding) => binding.conversationId),
-        ...loadedMemberships
-          .map((membership) => membership.canonicalConversationId)
-          .filter((value): value is string => Boolean(value)),
-      ])) this.threads.set(thread.conversationId, thread);
-      for (const segment of await this.relationalStore.loadAgentConversationSegments(
-        loadedBindings.map((binding) => binding.conversationId),
-      )) this.segments.set(segment.segmentId, segment);
-      const aliasIds = [...new Set([
+      const conversationIds = [...new Set([
         ...loadedBindings.map((binding) => binding.conversationId),
         ...loadedMemberships
           .map((membership) => membership.canonicalConversationId)
           .filter((value): value is string => Boolean(value)),
       ])];
-      for (const alias of await this.relationalStore
-        .loadAgentConversationRouteAliases?.(aliasIds) ?? []) {
+      const logicalScopeKeys = [...new Set(loadedBindings.map((binding) => binding.logicalScopeKey))];
+      const [scopeThreads, idThreads, segments, aliases] = await Promise.all([
+        this.relationalStore.loadAgentConversationThreads(logicalScopeKeys),
+        this.relationalStore.loadAgentConversationThreadsByIds(conversationIds),
+        this.relationalStore.loadAgentConversationSegments(conversationIds),
+        this.relationalStore.loadAgentConversationRouteAliases?.(conversationIds) ?? [],
+      ]);
+      for (const thread of [...scopeThreads, ...idThreads]) {
+        this.threads.set(thread.conversationId, thread);
+      }
+      for (const segment of segments) this.segments.set(segment.segmentId, segment);
+      for (const alias of aliases) {
         this.routeAliases.set(alias.aliasConversationId, alias);
       }
     }

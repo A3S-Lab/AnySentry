@@ -1330,7 +1330,22 @@ export interface AgentConversationDirectoryListV3 extends Omit<AgentConversation
   resolutionRevision: number;
   items: LogicalAgentConversationDirectoryItemV3[];
 }
-export type LogicalAgentConversationDirectoryItemV4 = Omit<LogicalAgentConversationDirectoryItemV3, "conversations">;
+export type AgentRuntimeDirectoryInstance = Pick<AgentRuntimeInstanceRecord,
+  | "agentInstanceId"
+  | "canonicalAgentInstanceId"
+  | "agentInstanceAliases"
+  | "runtimeState"
+  | "activityState"
+  | "rootPid"
+  | "rootStartTimeTicks"
+  | "lastSeenAt"
+  | "lastActivityAt"
+  | "workspacePath"
+  | "workloadRef"
+>;
+export type LogicalAgentConversationDirectoryItemV4 = Omit<LogicalAgentConversationDirectoryItemV3, "conversations" | "recentInstances"> & {
+  recentInstances: AgentRuntimeDirectoryInstance[];
+};
 export interface AgentConversationDirectoryListV4 extends Omit<AgentConversationDirectoryListV3, "apiVersion" | "items"> {
   apiVersion: 4;
   items: LogicalAgentConversationDirectoryItemV4[];

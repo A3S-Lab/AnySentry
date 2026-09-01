@@ -3,17 +3,17 @@ import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react"
 
 import type {
   AgentConversationSummary,
-  AgentRuntimeInstanceRecord,
+  AgentRuntimeDirectoryInstance,
   LogicalAgentConversationDirectoryItemV4,
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
 import { formatTokenTotal, usageForInstance } from "./agentUsage";
 
-function runtimeId(instance: AgentRuntimeInstanceRecord) {
+function runtimeId(instance: AgentRuntimeDirectoryInstance) {
   return instance.canonicalAgentInstanceId ?? instance.agentInstanceId;
 }
 
-function runtimeAliases(instance: AgentRuntimeInstanceRecord) {
+function runtimeAliases(instance: AgentRuntimeDirectoryInstance) {
   return new Set([
     runtimeId(instance),
     instance.agentInstanceId,
@@ -29,27 +29,27 @@ function shortId(value: string) {
 
 function matchingInstances(
   agent: LogicalAgentConversationDirectoryItemV4,
-  instances: AgentRuntimeInstanceRecord[],
+  instances: AgentRuntimeDirectoryInstance[],
 ) {
   const expected = new Set(agent.agentInstanceIds);
   return instances
     .filter((instance) => [...runtimeAliases(instance)].some((alias) => expected.has(alias)))
     .sort((left, right) => {
-      const rank = (value: AgentRuntimeInstanceRecord) => value.runtimeState === "running"
+      const rank = (value: AgentRuntimeDirectoryInstance) => value.runtimeState === "running"
         ? value.activityState === "active" ? 0 : 1
         : value.runtimeState === "unobserved" ? 2 : 3;
       return rank(left) - rank(right) || right.lastSeenAt - left.lastSeenAt;
     });
 }
 
-function lifecycleText(instance: AgentRuntimeInstanceRecord) {
+function lifecycleText(instance: AgentRuntimeDirectoryInstance) {
   if (instance.runtimeState === "running") return instance.activityState === "active" ? "活动" : "空闲";
   if (instance.runtimeState === "unobserved") return "待确认";
   if (instance.runtimeState === "lost") return "失联";
   return "已退出";
 }
 
-function lifecycleTone(instance: AgentRuntimeInstanceRecord) {
+function lifecycleTone(instance: AgentRuntimeDirectoryInstance) {
   if (instance.runtimeState === "running" && instance.activityState === "active") return "bg-teal-300";
   if (instance.runtimeState === "running") return "bg-sky-300";
   if (instance.runtimeState === "unobserved") return "bg-amber-300";
@@ -70,14 +70,14 @@ export function LogicalAgentNavigator({
   onSelectConversation,
 }: {
   items: LogicalAgentConversationDirectoryItemV4[];
-  runtimeInstances: AgentRuntimeInstanceRecord[];
+  runtimeInstances: AgentRuntimeDirectoryInstance[];
   selectedLogicalAgentId?: string;
   selectedInstanceId?: string;
   selectedConversationId?: string;
   loading: boolean;
   error?: Error;
   onSelectAgent: (item: LogicalAgentConversationDirectoryItemV4) => void;
-  onSelectInstance: (agent: LogicalAgentConversationDirectoryItemV4, instance: AgentRuntimeInstanceRecord) => void;
+  onSelectInstance: (agent: LogicalAgentConversationDirectoryItemV4, instance: AgentRuntimeDirectoryInstance) => void;
   onSelectConversation: (conversation: AgentConversationSummary) => void;
 }) {
   const refs = useRef(new Map<string, HTMLButtonElement>());
