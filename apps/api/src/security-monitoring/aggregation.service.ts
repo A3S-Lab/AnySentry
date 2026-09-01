@@ -2602,7 +2602,6 @@ export class AggregationService {
     const {
       projection,
       interactions,
-      inventory,
       canonicalConversationId,
     } = await this.agentConversationProjection(query);
     const conversationId = canonicalConversationId ?? query.conversationId;
@@ -2627,6 +2626,52 @@ export class AggregationService {
       .map((interactionId) => records.find((record) => record.interactionId === interactionId))
       .find((record): record is T.AgentInteractionRecord => Boolean(record));
     if (!interaction) return undefined;
+    const loadedPersistedRelations = this.relationalStore?.configured()
+      ? await this.relationalStore.loadAgentSemanticKernelRelations(call.semanticEventId)
+      : [];
+    const latestPersistedRevision = loadedPersistedRelations.reduce(
+      (latest, relation) => Math.max(latest, relation.resolutionRevision),
+      Number.NEGATIVE_INFINITY,
+    );
+    const persistedRelations = loadedPersistedRelations.filter((relation) =>
+      relation.resolutionRevision === latestPersistedRevision);
+    const persistedLinked = persistedRelations.length > 0
+      && persistedRelations.every((relation) =>
+        Boolean(relation.kernelEventId)
+        && ['linked_exact', 'linked_strong'].includes(relation.status));
+    if (persistedLinked) {
+      const linkedEventIds = [...new Set(persistedRelations
+        .map((relation) => relation.kernelEventId)
+        .filter((eventId): eventId is string => Boolean(eventId)))];
+      return {
+        schemaVersion: 'anysentry.agent_semantic_evidence.v1',
+        semanticEventId: selected.semanticEventId,
+        conversationId,
+        toolInvocationId: persistedRelations[0]?.toolInvocationId
+          ?? toolInvocationId(call, interaction),
+        interactionIds: [...new Set([
+          ...call.sourceInteractionIds,
+          ...(result?.sourceInteractionIds ?? []),
+        ])],
+        interactionEvidenceEventIds: [...new Set([
+          ...(interaction.evidenceEventIds ?? []),
+          ...call.evidenceEventIds,
+          ...(result?.evidenceEventIds ?? []),
+        ])],
+        relations: persistedRelations,
+        // The persisted relation already carries the immutable judgment snapshot and exact Event
+        // locator. Hydrating the complete Kernel row belongs to the explicit deep-link request;
+        // doing it here would turn every inspector open back into an Event-table query.
+        kernelEvents: [],
+        relationStatus: persistedRelations.some((relation) => relation.status === 'linked_exact')
+          ? 'linked_exact'
+          : 'linked_strong',
+        evidenceBundleEventIds: linkedEventIds,
+        coverage: { ...interactions.coverage },
+        ...this.classificationResponseMeta(query),
+        updateTime: iso(),
+      };
+    }
     const callAt = Number(BigInt(call.atUnixNs) / 1_000_000n);
     const resultAt = result ? Number(BigInt(result.atUnixNs) / 1_000_000n) : undefined;
     const relationInputs = events
@@ -2705,9 +2750,6 @@ export class AggregationService {
         relationBatch = ancestryBatch;
       }
     }
-    const persistedRelations = this.relationalStore?.configured()
-      ? await this.relationalStore.loadAgentSemanticKernelRelations(call.semanticEventId)
-      : [];
     if (kernel.coverage.partial
       && !relations.some((relation) => relation.kernelEventId)
       && persistedRelations.some((relation) => relation.kernelEventId)) {

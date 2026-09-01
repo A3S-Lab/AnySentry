@@ -16,6 +16,12 @@ const {
 const {
   AggregationService,
 } = require('../apps/api/dist/security-monitoring/aggregation.service.js');
+const {
+  projectAgentConversations,
+} = require('../apps/api/dist/security-monitoring/agent-conversation.js');
+const {
+  projectSemanticConversationTimeline,
+} = require('../apps/api/dist/security-monitoring/agent-semantic-timeline.js');
 
 const instanceId = 'host-root:semantic:100:200';
 const interaction = {
@@ -411,6 +417,89 @@ const projectedInteraction = {
   captureSource: 'tls_uprobe_rustls',
   receivedAt: callAt + 4,
 };
+
+const fastConversationId = 'cv_persisted_evidence_fast_path';
+const fastInteraction = {
+  ...projectedInteraction,
+  conversationId: fastConversationId,
+  conversationIdSource: 'provider',
+  conversationBindingVersion: 2,
+  trafficRole: 'conversation',
+};
+const fastQuery = {
+  timeType: 'last_30d',
+  scope: 'agent',
+  classificationView: 'current_effective',
+  conversationId: fastConversationId,
+  limit: 200,
+};
+const fastProjection = projectAgentConversations([fastInteraction], [], fastQuery);
+const fastThread = fastProjection.summaries.find((item) =>
+  item.conversationId === fastConversationId);
+const fastRecords = fastProjection.interactionsByConversation.get(fastConversationId) ?? [];
+assert.ok(fastThread?.hasContent);
+const fastToolCall = projectSemanticConversationTimeline(fastThread, fastRecords, [])
+  .flatMap((turn) => turn.events)
+  .find((event) => event.kind === 'tool_call');
+assert.ok(fastToolCall);
+const persistedFastRelation = {
+  ...relations[0],
+  relationId: 'skr_persisted_fast_path',
+  stableSemanticEventId: fastToolCall.semanticEventId,
+  conversationId: fastConversationId,
+  turnId: fastToolCall.turnId,
+  toolInvocationId: 'ti_persisted_fast_path',
+  resolutionRevision: 99,
+};
+let fastKernelQueries = 0;
+const fastEvidenceAggregate = new AggregationService(
+  {},
+  {
+    identitySnapshotVersion: () => 0,
+    canonicalAgentAssetId: (value) => value,
+  },
+  {},
+  {},
+  {},
+  undefined,
+  {
+    segmentsForConversation: () => [],
+    currentResolutionRevision: () => 99,
+  },
+  {
+    configured: () => true,
+    loadAgentSemanticKernelRelations: async () => [persistedFastRelation],
+  },
+);
+fastEvidenceAggregate.agentConversationProjection = async () => ({
+  projection: fastProjection,
+  interactions: {
+    items: [fastInteraction],
+    coverage: {
+      partial: false,
+      completeness: 'exact_current_effective',
+      source: 'clickhouse+hot_delta',
+      totalMode: 'exact',
+    },
+  },
+  inventory: { items: [], coverage: { partial: true, partialReason: 'hot_ring_only' } },
+  canonicalConversationId: fastConversationId,
+});
+fastEvidenceAggregate.storedAgentEvents = async () => {
+  fastKernelQueries += 1;
+  throw new Error('persisted evidence fast path must not query the Event table');
+};
+const fastEvidence = await fastEvidenceAggregate.agentSemanticEvidence({
+  ...fastQuery,
+  semanticEventId: fastToolCall.semanticEventId,
+});
+assert.equal(fastKernelQueries, 0);
+assert.equal(fastEvidence.relationStatus, 'linked_exact');
+assert.equal(fastEvidence.relations[0].kernelEventId, kernelEvent.eventId);
+assert.deepEqual(fastEvidence.kernelEvents, []);
+assert.deepEqual(fastEvidence.evidenceBundleEventIds, [kernelEvent.eventId]);
+assert.equal(fastEvidence.coverage.partial, false);
+
 let projectionPersisted = 0;
 let incrementallySavedRelations = [];
 const bindingStub = {
