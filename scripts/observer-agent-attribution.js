@@ -124,6 +124,7 @@ function readProcInfo(pid, procRoot = '/proc') {
     const startTime = fields[19] || undefined;
     const comm = fs.readFileSync(path.join(base, 'comm'), 'utf8').trim();
     let tgid;
+    let namespacePid;
     let exe = '';
     let argv = '';
     let cgroup = '';
@@ -131,12 +132,15 @@ function readProcInfo(pid, procRoot = '/proc') {
     try {
       const status = fs.readFileSync(path.join(base, 'status'), 'utf8');
       tgid = positiveInt(status.match(/^Tgid:\s+(\d+)/m)?.[1]);
+      const namespacePids = status.match(/^NSpid:\s+(.+)$/m)?.[1]
+        ?.trim().split(/\s+/).map(positiveInt).filter(Boolean) ?? [];
+      namespacePid = namespacePids.at(-1);
     } catch {}
     try { exe = fs.readlinkSync(path.join(base, 'exe')); } catch {}
     try { argv = fs.readFileSync(path.join(base, 'cmdline'), 'utf8').split('\0').filter(Boolean).join(' '); } catch {}
     try { cgroup = fs.readFileSync(path.join(base, 'cgroup'), 'utf8'); } catch {}
     try { cwd = fs.readlinkSync(path.join(base, 'cwd')); } catch {}
-    return { pid, tgid, ppid, startTime, comm, exe, argv, cgroup, cwd };
+    return { pid, tgid, ppid, startTime, namespacePid, comm, exe, argv, cgroup, cwd };
   } catch {
     return undefined;
   }
@@ -341,6 +345,7 @@ class AgentAttributor {
     // get(pid) resolves through a scoped PID index to the ProcessKey record.
     this.procs = this.processesByKey;
     this.rootsByKey = new Map();
+    this.workloadRuntimeProcesses = new Map();
     this.transitions = [];
     this.maxRoots = positiveInt(options.maxRoots) || DEFAULT_MAX_ROOTS;
     this.maxTransitions = positiveInt(options.maxTransitions) || DEFAULT_MAX_TRANSITIONS;
@@ -412,6 +417,75 @@ class AgentAttributor {
     return key
       ? `pgk_${crypto.createHash('sha256').update(key).digest('hex').slice(0, 24)}`
       : undefined;
+  }
+
+  /**
+   * Resolve the concrete host process for an exact container inventory entry.
+   *
+   * Kubernetes metadata owns the Agent identity, while `/proc` owns the process generation. The
+   * join is deliberately container-id based and never promotes a generic Python/Node process by
+   * name. Namespace PID 1 is preferred; otherwise the first process whose parent is outside the
+   * same container is the root. The result is cached by physical workload and fenced by startTime.
+   */
+  resolveWorkloadRuntimeProcess(entry = {}) {
+    const physicalWorkloadId = text(entry.physicalWorkloadId);
+    const ids = [...new Set([
+      ...(Array.isArray(entry.ids) ? entry.ids : []),
+      physicalWorkloadId.split(':').at(-1),
+    ].map((value) => text(value).replace(/^[a-z0-9._-]+:\/\//i, '').toLowerCase())
+      .filter((value) => /^[a-f0-9]{12,64}$/.test(value)))];
+    if (!physicalWorkloadId || ids.length === 0) return undefined;
+
+    const cachedKey = this.workloadRuntimeProcesses.get(physicalWorkloadId);
+    const cached = cachedKey ? this.procs.getByKey(cachedKey) : undefined;
+    if (
+      cached
+      && ids.some((id) => text(cached.cgroup).toLowerCase().includes(id))
+      && text(this.readStartTime(cached.pid)) === text(cached.startTime)
+    ) {
+      return { ...cached };
+    }
+    this.workloadRuntimeProcesses.delete(physicalWorkloadId);
+
+    const matchesContainer = (info) => {
+      const cgroup = text(info?.cgroup).toLowerCase();
+      return Boolean(cgroup && ids.some((id) => cgroup.includes(id)));
+    };
+    const candidates = new Map();
+    for (const info of this.procs.values()) {
+      if (matchesContainer(info) && text(this.readStartTime(info.pid)) === text(info.startTime)) {
+        candidates.set(this.processKey(info), info);
+      }
+    }
+    if (candidates.size === 0) {
+      for (const pid of this.listPids().slice(0, this.maxProcs)) {
+        const info = this.readProcess(pid, 'bootstrap');
+        if (!matchesContainer(info)) continue;
+        const stored = this.procs.set(info);
+        if (stored) candidates.set(stored.processKey, stored);
+      }
+    }
+    if (candidates.size === 0) return undefined;
+
+    const values = [...candidates.values()];
+    const pids = new Set(values.map((info) => positiveInt(info.pid)).filter(Boolean));
+    values.sort((left, right) => {
+      const namespaceRoot = Number(positiveInt(right.namespacePid) === 1)
+        - Number(positiveInt(left.namespacePid) === 1);
+      if (namespaceRoot) return namespaceRoot;
+      const leftParentOutside = !pids.has(positiveInt(left.ppid));
+      const rightParentOutside = !pids.has(positiveInt(right.ppid));
+      if (leftParentOutside !== rightParentOutside) return leftParentOutside ? -1 : 1;
+      try {
+        const startOrder = BigInt(left.startTime) - BigInt(right.startTime);
+        if (startOrder !== 0n) return startOrder < 0n ? -1 : 1;
+      } catch {}
+      return positiveInt(left.pid) - positiveInt(right.pid);
+    });
+    const root = values[0];
+    const rootKey = this.processKey(root);
+    if (rootKey) this.workloadRuntimeProcesses.set(physicalWorkloadId, rootKey);
+    return root ? { ...root } : undefined;
   }
 
   parentProcessGenerationKey(info) {

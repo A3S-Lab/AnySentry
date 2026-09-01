@@ -1478,4 +1478,122 @@ function attributor(procEntries = []) {
   assert.match(runtime.launchContext.rootProcessGenerationKey, /^pgk_[a-f0-9]{24}$/u);
 }
 
+{
+  const containerId = '9'.repeat(64);
+  const podUid = 'pod-langgraph-fixture';
+  const cgroup = `0::/kubepods.slice/pod-fixture/cri-containerd-${containerId}.scope`;
+  const processTable = new Map([
+    [3_000, {
+      pid: 3_000,
+      ppid: 1,
+      startTime: '30000',
+      namespacePid: 1,
+      comm: 'python',
+      exe: '/usr/bin/python3',
+      argv: 'python -m uvicorn agent.service:app',
+      cwd: '/srv/agent',
+      cgroup,
+    }],
+    [3_001, {
+      pid: 3_001,
+      ppid: 3_000,
+      startTime: '30001',
+      namespacePid: 8,
+      comm: 'python',
+      exe: '/usr/bin/python3',
+      argv: 'python worker',
+      cwd: '/srv/agent',
+      cgroup,
+    }],
+  ]);
+  const judge = new AgentAttributor({
+    hostId: 'host-kubernetes-runtime',
+    bootId: 'boot-kubernetes-runtime',
+    now: () => 20_000,
+    readProc: (pid) => processTable.get(pid),
+    readStartTime: (pid) => processTable.get(pid)?.startTime,
+    listPids: () => [...processTable.keys()],
+  });
+  judge.seedFromProc();
+  assert.equal(judge.runtimeSnapshot().entries.length, 0,
+    'a generic uvicorn command must not become an Agent from process naming alone');
+
+  const inventoryEntry = {
+    ids: [containerId, containerId.slice(0, 12)],
+    classification: 'confirmed_agent',
+    environment: 'kubernetes',
+    source: 'kubernetes',
+    physicalWorkloadId: `k8s:test-cluster:${podUid}:${containerId}`,
+    agentScopeId: 'langgraph-workflow-sandbox-agent',
+    agentDisplayName: 'langgraph-workflow-sandbox-agent',
+    agentInstanceId: `${podUid}/${containerId}`,
+    namespace: 'agent-lab',
+    podName: 'langgraph-workflow-agent-fixture',
+    podUid,
+    nodeName: 'node-fixture',
+    containerName: 'agent',
+    containerImage: 'fixture/langgraph-agent:1',
+    ownerKind: 'Deployment',
+    ownerName: 'langgraph-workflow-agent',
+    evidence: [
+      'label:anysentry.io/workload-kind=agent',
+      'label:anysentry.io/agent-id=langgraph-workflow-sandbox-agent',
+    ],
+  };
+  const resolvedRoot = judge.resolveWorkloadRuntimeProcess(inventoryEntry);
+  assert.equal(resolvedRoot?.pid, 3_000);
+  assert.equal(resolvedRoot?.namespacePid, 1);
+
+  const cache = new WorkloadIdentityCache({
+    now: () => 20_000,
+    hostId: judge.hostId,
+    bootId: judge.bootId,
+    resolveRuntimeProcess: (entry) => judge.resolveWorkloadRuntimeProcess(entry),
+  });
+  assert.equal(cache.replace({
+    schemaVersion: 'anysentry.workload_identity_snapshot.v1',
+    version: 1,
+    generatedAt: new Date(20_000).toISOString(),
+    ready: true,
+    entries: [inventoryEntry],
+    errors: 0,
+  }), true);
+  const runtime = cache.agentRuntimeInventory();
+  assert.equal(runtime.length, 1);
+  assert.deepEqual(runtime[0], {
+    agentScopeId: 'langgraph-workflow-sandbox-agent',
+    agentDisplayName: 'langgraph-workflow-sandbox-agent',
+    agentInstanceId: `${podUid}/${containerId}`,
+    physicalWorkloadId: `k8s:test-cluster:${podUid}:${containerId}`,
+    classification: 'confirmed_agent',
+    runtimeState: 'running',
+    rootPid: 3_000,
+    rootStartTimeTicks: '30000',
+    rootGeneration: 1,
+    hostId: 'host-kubernetes-runtime',
+    bootId: 'boot-kubernetes-runtime',
+    comm: 'python',
+    exe: '/usr/bin/python3',
+    workspacePath: '/srv/agent',
+    discoveredAt: new Date(20_000).toISOString(),
+    lastSeenAt: new Date(20_000).toISOString(),
+    confidence: 1,
+    source: 'kubernetes',
+    evidence: inventoryEntry.evidence,
+    workloadRef: {
+      environment: 'kubernetes',
+      kind: 'container',
+      name: 'langgraph-workflow-agent-fixture',
+      namespace: 'agent-lab',
+      podName: 'langgraph-workflow-agent-fixture',
+      podUid,
+      nodeName: 'node-fixture',
+      containerName: 'agent',
+      containerImage: 'fixture/langgraph-agent:1',
+      ownerKind: 'Deployment',
+      ownerName: 'langgraph-workflow-agent',
+    },
+  });
+}
+
 console.log('Forwarder attribution and deduplication verification passed.');

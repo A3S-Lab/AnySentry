@@ -512,7 +512,12 @@ const attributor = new AgentAttributor({
   signatureRegistry,
   hostId: process.env.A3S_OBSERVER_HOST_ID || NODE_NAME,
 });
-const workloadCache = new WorkloadIdentityCache({ templateRegistry });
+const workloadCache = new WorkloadIdentityCache({
+  templateRegistry,
+  hostId: attributor.hostId,
+  bootId: attributor.bootId,
+  resolveRuntimeProcess: (entry) => attributor.resolveWorkloadRuntimeProcess(entry),
+});
 const dockerDiscovery = new DockerDiscovery({
   nodeName: NODE_NAME,
   hostId: process.env.A3S_OBSERVER_HOST_ID || NODE_NAME,

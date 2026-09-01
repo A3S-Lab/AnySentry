@@ -274,6 +274,11 @@ class WorkloadIdentityCache {
       typeof options.readProcCgroup === 'function'
         ? options.readProcCgroup
         : (pid) => readProcCgroup(pid, options.procRoot);
+    this.resolveRuntimeProcess = typeof options.resolveRuntimeProcess === 'function'
+      ? options.resolveRuntimeProcess
+      : () => undefined;
+    this.hostId = text(options.hostId);
+    this.bootId = text(options.bootId);
     this.sources = new Map();
     this.sourceMetrics = new Map();
     this.candidateCache = new Map();
@@ -517,18 +522,29 @@ class WorkloadIdentityCache {
     const seen = new Set();
     const result = [];
     for (const entry of [...this.sources.values()].flat()) {
-      if (
-        entry.classification !== 'confirmed_agent'
-        || entry.environment !== 'docker'
-        || text(entry.containerState).toLowerCase() !== 'running'
-      ) continue;
+      if (entry.classification !== 'confirmed_agent') continue;
+      const environment = text(entry.environment).toLowerCase()
+        || (entry.source === 'kubernetes' ? 'kubernetes' : entry.source === 'docker' ? 'docker' : '');
+      if (!['docker', 'kubernetes'].includes(environment)) continue;
+      if (environment === 'docker' && text(entry.containerState).toLowerCase() !== 'running') continue;
+      if (environment === 'kubernetes') {
+        if (Array.isArray(entry.evidence) && entry.evidence.includes('kubernetes:deleted')) continue;
+        // Pod fallbacks and ambiguous sidecars do not identify one process domain. Only an exact
+        // CRI container entry may become a process-backed Runtime instance.
+        if (!Array.isArray(entry.ids)
+          || !entry.ids.some((id) => /^[a-f0-9]{32,64}$/i.test(normalizedContainerId(id)))) continue;
+      }
       const physicalWorkloadId = text(entry.physicalWorkloadId);
       const agentScopeId = text(entry.agentScopeId);
-      const rootPid = Number(entry.hostPid);
-      const rootStartTimeTicks = text(entry.rootStartTimeTicks);
-      const hostId = text(entry.hostId)
+      const resolvedProcess = environment === 'kubernetes'
+        ? this.resolveRuntimeProcess(entry)
+        : undefined;
+      const rootPid = Number(entry.hostPid ?? resolvedProcess?.pid);
+      const rootStartTimeTicks = text(entry.rootStartTimeTicks ?? resolvedProcess?.startTime);
+      const hostId = text(entry.hostId ?? resolvedProcess?.hostId)
+        || this.hostId
         || physicalWorkloadId.split(':').slice(1, -1).join(':');
-      const bootId = text(entry.bootId);
+      const bootId = text(entry.bootId ?? resolvedProcess?.bootId) || this.bootId;
       if (
         !physicalWorkloadId || seen.has(physicalWorkloadId) || !agentScopeId
         || !Number.isSafeInteger(rootPid) || rootPid <= 0 || !rootStartTimeTicks
@@ -538,7 +554,9 @@ class WorkloadIdentityCache {
       result.push({
         agentScopeId,
         agentDisplayName: text(entry.agentDisplayName) || agentScopeId,
-        agentInstanceId: physicalWorkloadId,
+        agentInstanceId: environment === 'kubernetes'
+          ? text(entry.agentInstanceId) || physicalWorkloadId
+          : physicalWorkloadId,
         physicalWorkloadId,
         classification: 'confirmed_agent',
         runtimeState: 'running',
@@ -547,17 +565,38 @@ class WorkloadIdentityCache {
         rootGeneration: 1,
         hostId,
         bootId,
+        ...(text(resolvedProcess?.comm) ? { comm: text(resolvedProcess.comm) } : {}),
+        ...(text(resolvedProcess?.exe) ? { exe: text(resolvedProcess.exe) } : {}),
+        ...(text(resolvedProcess?.cwd) ? { workspacePath: text(resolvedProcess.cwd) } : {}),
         discoveredAt: observedAt,
         lastSeenAt: observedAt,
         confidence: 1,
-        source: 'docker',
+        source: environment,
         evidence: Array.isArray(entry.evidence) ? entry.evidence.slice(0, 16) : [],
         workloadRef: {
-          environment: 'docker',
+          environment,
           kind: 'container',
-          name: text(entry.containerName) || physicalWorkloadId,
+          name: text(entry.podName) || text(entry.containerName) || physicalWorkloadId,
+          ...(environment === 'kubernetes' && text(entry.namespace)
+            ? { namespace: text(entry.namespace) }
+            : {}),
+          ...(environment === 'kubernetes' && text(entry.podName)
+            ? { podName: text(entry.podName) }
+            : {}),
+          ...(environment === 'kubernetes' && text(entry.podUid)
+            ? { podUid: text(entry.podUid) }
+            : {}),
+          ...(environment === 'kubernetes' && text(entry.nodeName)
+            ? { nodeName: text(entry.nodeName) }
+            : {}),
           containerName: text(entry.containerName) || undefined,
           containerImage: text(entry.containerImage) || undefined,
+          ...(environment === 'kubernetes' && text(entry.ownerKind)
+            ? { ownerKind: text(entry.ownerKind) }
+            : {}),
+          ...(environment === 'kubernetes' && text(entry.ownerName)
+            ? { ownerName: text(entry.ownerName) }
+            : {}),
         },
       });
     }
