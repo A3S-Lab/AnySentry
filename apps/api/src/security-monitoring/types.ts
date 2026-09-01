@@ -1475,6 +1475,10 @@ export interface AgentInteractionRecord {
   agentProduct?: string;
   environment?: 'kubernetes' | 'docker' | 'host' | 'unknown';
   runtimeSessionId?: string;
+  traceId?: string;
+  runId?: string;
+  sessionId?: string;
+  invocationId?: string;
   providerConversationId?: string;
   providerResponseId?: string;
   providerPreviousResponseId?: string;

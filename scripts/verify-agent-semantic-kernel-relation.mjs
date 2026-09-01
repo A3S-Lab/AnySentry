@@ -152,6 +152,38 @@ assert.equal(resourceRelations[0].linkMethod, 'resource');
 assert.equal(resourceRelations[0].kernelEventId, fileEvent.eventId);
 assert.equal(resourceRelations[0].timeQuality, 'bounded');
 
+const httpToolInteraction = {
+  ...interaction,
+  interactionType: 'tool',
+  endpoint: 'python-sandbox:8080',
+};
+const httpToolCall = {
+  ...toolCall,
+  semanticEventId: 'se_http_tool_call',
+  toolCallId: 'sandbox-execution-1',
+  toolName: 'http.code.execute',
+  toolKind: 'other',
+  content: { code: 'print(42)', timeout_ms: 4_000 },
+};
+const sandboxEgress = {
+  ...kernelEvent,
+  eventId: 'evt_sandbox_egress',
+  eventKind: 'Egress',
+  subject: 'python-sandbox:8080',
+  attributes: { host: 'python-sandbox' },
+};
+const httpToolRelations = buildSemanticKernelRelations(
+  httpToolCall,
+  toolResult,
+  httpToolInteraction,
+  [sandboxEgress],
+  13,
+  false,
+);
+assert.equal(httpToolRelations[0].status, 'linked_strong');
+assert.equal(httpToolRelations[0].linkMethod, 'network');
+assert.equal(httpToolRelations[0].kernelEventId, sandboxEgress.eventId);
+
 const shellBootstrapEvent = {
   ...kernelEvent,
   eventId: 'evt_shell_bootstrap',

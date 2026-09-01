@@ -111,6 +111,17 @@ function toolHost(event: T.AgentSemanticEvent): string | undefined {
   }
 }
 
+function interactionEndpointHost(interaction: T.AgentInteractionRecord): string | undefined {
+  if (interaction.interactionType !== 'tool') return undefined;
+  const endpoint = text(interaction.endpoint, 1_000);
+  if (!endpoint || endpoint === 'unknown') return undefined;
+  try {
+    return new URL(endpoint.includes('://') ? endpoint : `http://${endpoint}`).hostname.toLowerCase();
+  } catch {
+    return undefined;
+  }
+}
+
 function candidatePath(event: T.AgentEventListItem): string | undefined {
   return text(event.attributes.path, 4_096)
     ?? text(event.attributes.filePath, 4_096)
@@ -363,7 +374,7 @@ function potentialRelation(
   const invocationId = toolInvocationId(event, interaction);
   const command = toolCommand(event);
   const resource = toolResource(event);
-  const host = toolHost(event);
+  const host = toolHost(event) ?? interactionEndpointHost(interaction);
   const normalizedTool = (event.toolKind ?? event.toolName ?? 'other').toLowerCase();
   const acceptedKinds = /bash|exec|shell/u.test(normalizedTool)
     ? new Set(['ToolExec'])

@@ -120,6 +120,10 @@ const line = JSON.stringify({
       path: '/v1/chat/completions',
       statusCode: 200,
       model: 'fixture-model',
+      traceId: digest(`${runId}\0trace`).slice(0, 32),
+      runId: `${runId}-workflow-run`,
+      sessionId: `${runId}-workflow-session`,
+      invocationId: `${runId}-workflow-run`,
       providerConversationId: `${runId}-provider-conversation`,
       providerResponseId: `${runId}-provider-response`,
       startedAtUnixNs: String(nowNs),
@@ -269,6 +273,10 @@ assert.match(processRootInteraction.agentInstanceId ?? '', /^host-root:/u);
 assert.equal(processRootInteraction.agentProduct, 'codex');
 assert.equal(processRootInteraction.semanticParserId, 'observer.agent-interaction');
 assert.equal(processRootInteraction.semanticParserVersion, 1);
+assert.equal(processRootInteraction.traceId, digest(`${runId}\0trace`).slice(0, 32));
+assert.equal(processRootInteraction.runId, `${runId}-workflow-run`);
+assert.equal(processRootInteraction.sessionId, `${runId}-workflow-session`);
+assert.equal(processRootInteraction.invocationId, `${runId}-workflow-run`);
 assert.deepEqual(
   processRootInteraction.semanticItems?.map((item) => [item.actor, item.kind]),
   [
@@ -277,6 +285,44 @@ assert.deepEqual(
     ['tool', 'tool_result'],
     ['tool', 'tool_call'],
   ],
+);
+const transportSessionEnvelope = structuredClone(JSON.parse(line));
+transportSessionEnvelope.event.LlmInteraction.interactionId = `mi_${digest(`${runId}\0transport-session`).slice(0, 24)}`;
+delete transportSessionEnvelope.event.LlmInteraction.providerConversationId;
+const transportSessionInteraction = parseObserverAgentInteraction(
+  JSON.stringify(transportSessionEnvelope),
+  {
+    workspacePath: '/root',
+    agentId: 'langgraph-workflow-sandbox-agent',
+    sessionId: '',
+    userId: '',
+    attributes: {},
+    classificationSemantics: {
+      schemaVersion: 'anysentry.classification_semantics.v1',
+      identityClassification: 'confirmed_agent',
+      workloadRole: 'agent',
+      captureProfile: 'agent_full',
+    },
+    process: processRootInteraction.process,
+    attribution: {
+      monitored: true,
+      classification: 'confirmed_agent',
+      confidence: 1,
+      source: 'kubernetes',
+      reason: 'workload_label',
+      agentScopeId: 'langgraph-workflow-sandbox-agent',
+      agentDisplayName: 'LangGraph',
+      agentInstanceId: processRootInteraction.agentInstanceId,
+      rootPid: 4242,
+      rootStartTime: '424200',
+      evidence: ['label:anysentry.io/workload-kind=agent'],
+    },
+  },
+);
+assert.equal(
+  transportSessionInteraction?.providerConversationId,
+  `${runId}-workflow-session`,
+  'a trusted plaintext session header must become the product Conversation anchor',
 );
 
 const ingest = await request('/ingest/batch', 'POST', {
@@ -324,6 +370,10 @@ assert.equal(list.items?.length, 1, JSON.stringify(list));
 const item = list.items[0];
 assert.equal(item.interactionId, interactionId);
 assert.equal(item.interactionType, 'model');
+assert.equal(item.traceId, digest(`${runId}\0trace`).slice(0, 32));
+assert.equal(item.runId, `${runId}-workflow-run`);
+assert.equal(item.sessionId, `${runId}-workflow-session`);
+assert.equal(item.invocationId, `${runId}-workflow-run`);
 assert.equal(item.transport, 'tls');
 assert.equal(item.tlsAdapterId, 'openssl-ex');
 assert.equal(item.transportProtocol, 'http/1.1');

@@ -529,7 +529,11 @@ export function parseObserverAgentInteraction(
   const statusCode = integer(input.statusCode, 0, 999) ?? 0;
   const receivedAt = meta.receivedAt ?? Date.now();
   const runtimeSessionId = string(meta.sessionId, 512);
-  const providerConversationId = string(input.providerConversationId, 512);
+  const traceId = string(input.traceId, 64);
+  const runId = string(input.runId, 512);
+  const sessionId = string(input.sessionId, 512);
+  const invocationId = string(input.invocationId, 512);
+  const providerConversationId = string(input.providerConversationId, 512) ?? sessionId;
   const providerResponseId = string(input.providerResponseId, 512);
   const providerPreviousResponseId = string(input.providerPreviousResponseId, 512);
   const trafficRole = closedValue(input.trafficRole, TRAFFIC_ROLES);
@@ -571,6 +575,10 @@ export function parseObserverAgentInteraction(
     agentProduct: semanticIdentity.agentProduct ?? meta.attribution?.agentDisplayName ?? meta.agentId,
     environment: interactionEnvironment(meta),
     ...(runtimeSessionId ? { runtimeSessionId } : {}),
+    ...(traceId ? { traceId } : {}),
+    ...(runId ? { runId } : {}),
+    ...(sessionId ? { sessionId } : {}),
+    ...(invocationId ? { invocationId } : {}),
     ...(providerConversationId ? { providerConversationId } : {}),
     ...(providerResponseId ? { providerResponseId } : {}),
     ...(providerPreviousResponseId ? { providerPreviousResponseId } : {}),

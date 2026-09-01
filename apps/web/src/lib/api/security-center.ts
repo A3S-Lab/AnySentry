@@ -1116,6 +1116,10 @@ export interface AgentInteractionRecord {
   agentInstanceId?: string;
   agentProduct?: string;
   runtimeSessionId?: string;
+  traceId?: string;
+  runId?: string;
+  sessionId?: string;
+  invocationId?: string;
   providerConversationId?: string;
   providerResponseId?: string;
   providerPreviousResponseId?: string;
