@@ -119,6 +119,45 @@ assert.equal(codexRelations[0].status, 'linked_exact',
   'Codex custom-tool JavaScript wrappers must expose their bounded cmd field generically');
 assert.equal(codexRelations[0].kernelEventId, kernelEvent.eventId);
 
+const completeArgvEvent = {
+  ...kernelEvent,
+  eventId: 'evt_complete_argv_after_short_subject',
+  subject: '/bin/bash -c source /tmp/agent-shell-snapshot',
+  attributes: {
+    argv: "/bin/bash -c source /tmp/agent-shell-snapshot && eval 'rg -n resolver-v2 /tmp/canary.txt'",
+    argv_truncated: false,
+    argv_incomplete: false,
+  },
+};
+const completeArgvRelations = buildSemanticKernelRelations(
+  toolCall,
+  toolResult,
+  interaction,
+  [completeArgvEvent],
+  12,
+  false,
+);
+assert.equal(completeArgvRelations[0].status, 'linked_strong');
+assert.equal(completeArgvRelations[0].linkMethod, 'command');
+assert.equal(completeArgvRelations[0].kernelEventId, completeArgvEvent.eventId,
+  'a complete eBPF argv must recover a command that the bounded Event subject omits');
+
+const truncatedArgvRelations = buildSemanticKernelRelations(
+  toolCall,
+  toolResult,
+  interaction,
+  [{
+    ...completeArgvEvent,
+    eventId: 'evt_truncated_argv_after_short_subject',
+    attributes: { ...completeArgvEvent.attributes, argv_truncated: true },
+  }],
+  12,
+  false,
+);
+assert.equal(truncatedArgvRelations[0].status, 'semantic_only');
+assert.equal(truncatedArgvRelations[0].kernelEventId, undefined,
+  'an explicitly truncated argv must never be promoted into exact command evidence');
+
 const resourceCall = {
   ...toolCall,
   semanticEventId: 'se_semantic_resource',

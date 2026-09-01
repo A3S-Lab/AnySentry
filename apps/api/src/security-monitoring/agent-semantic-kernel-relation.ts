@@ -42,6 +42,17 @@ function normalizedCommand(value: string): string {
     .trim();
 }
 
+function candidateCommand(event: T.AgentEventListItem): string | undefined {
+  // `subject` is deliberately a short dashboard summary and can end before an Agent shell's
+  // actual `eval <tool command>` suffix. The observer keeps the bounded execve argv separately;
+  // use it only when the collector explicitly says that no argument bytes or fragments are
+  // missing, otherwise retain the conservative summary-only behavior.
+  const argvComplete = event.attributes.argv_truncated !== true
+    && event.attributes.argv_incomplete !== true;
+  return (argvComplete ? text(event.attributes.argv, 65_536) : undefined)
+    ?? text(event.subject, 65_536);
+}
+
 function nestedString(value: unknown, keys: string[], depth = 0): string | undefined {
   if (depth > 6) return undefined;
   const object = record(value);
@@ -426,7 +437,8 @@ function potentialRelation(
   let confidence = 0;
   if (command && candidate.eventKind === 'ToolExec') {
     const expected = normalizedCommand(command);
-    const observed = normalizedCommand(candidate.subject);
+    const observedCommand = candidateCommand(candidate);
+    const observed = observedCommand ? normalizedCommand(observedCommand) : '';
     if (expected && observed && (
       expected === observed || observed.includes(expected) || expected.includes(observed)
     )) {
