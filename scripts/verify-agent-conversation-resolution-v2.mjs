@@ -566,6 +566,105 @@ assert.deepEqual(
 );
 assert.equal(backgroundOperationResolution.technicalActivities.length, 2);
 
+const claudeToolCallId = 'toolu_fixture_1';
+const claudeToolLoop = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_claude_tool_call',
+    at: base + 1_500,
+    instance: 'host-root:v2:claude-one',
+    agentProduct: 'Claude Code',
+    wireTemplateId: 'anthropic-messages',
+    request: {
+      model: 'fixture-model',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: '<system-reminder>runtime context</system-reminder>' },
+          { type: 'text', text: 'run the fixture tool' },
+        ],
+      }],
+    },
+    toolCalls: [{
+      toolCallId: claudeToolCallId,
+      name: 'Bash',
+      arguments: { command: 'printf fixture' },
+      issuedAtUnixNs: String(BigInt(base + 1_502) * 1_000_000n),
+    }],
+    responseText: 'I will run the fixture tool.',
+    conversationCompleteness: 'tool_pending',
+    completeness: 'partial',
+  }),
+  interaction({
+    id: 'mi_v2_claude_tool_result_final',
+    at: base + 1_600,
+    instance: 'host-root:v2:claude-one',
+    agentProduct: 'Claude Code',
+    wireTemplateId: 'anthropic-messages',
+    request: {
+      model: 'fixture-model',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: '<system-reminder>runtime context</system-reminder>' },
+            { type: 'text', text: 'run the fixture tool' },
+          ],
+        },
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: claudeToolCallId, name: 'Bash' }],
+        },
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: claudeToolCallId, content: 'fixture ok' }],
+        },
+      ],
+    },
+    toolResults: [{
+      toolCallId: claudeToolCallId,
+      name: 'Bash',
+      content: 'fixture ok',
+      isError: false,
+      observedAtUnixNs: String(BigInt(base + 1_600) * 1_000_000n),
+    }],
+    responseText: 'The fixture tool completed successfully.',
+  }),
+]);
+assert.equal(new Set(claudeToolLoop.conversationRecords
+  .map((item) => item.conversationId)).size, 1,
+  'an Anthropic cumulative Tool loop must remain one Thread');
+const claudeProjection = projectAgentConversations(
+  claudeToolLoop.records,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(claudeProjection.summaries.length, 1);
+const claudeTimeline = projectSemanticConversationTimeline(
+  claudeProjection.summaries[0],
+  claudeProjection.interactionsByConversation.get(
+    claudeProjection.summaries[0].conversationId,
+  ),
+  [],
+);
+const claudeEvents = claudeTimeline.flatMap((turn) => turn.events);
+assert.deepEqual(
+  claudeEvents.filter((event) => event.kind === 'user_message')
+    .map((event) => event.contentPreview),
+  ['run the fixture tool'],
+  'runtime context and replayed Human history must not become duplicate user events',
+);
+assert.equal(claudeEvents.filter((event) => event.kind === 'tool_call').length, 1);
+assert.equal(claudeEvents.filter((event) => event.kind === 'tool_result').length, 1);
+assert.deepEqual(
+  claudeEvents.filter((event) => event.actor === 'model')
+    .map((event) => [event.kind, event.contentPreview]),
+  [
+    ['model_progress', 'I will run the fixture tool.'],
+    ['model_final', 'The fixture tool completed successfully.'],
+  ],
+  'the final model reply after a Tool Result must remain a separate model event',
+);
+
 const explicitConflict = resolveAgentConversationsV2([
   interaction({
     id: 'mi_v2_conflict_a',
