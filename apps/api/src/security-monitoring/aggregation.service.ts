@@ -2434,7 +2434,9 @@ export class AggregationService {
     const items = conversation?.hasContent
       ? projectConversationTimeline(conversation, records)
       : [];
-    const partial = interactions.coverage.partial || inventory.coverage.partial;
+    const inventoryRequired = !conversation?.hasContent;
+    const partial = interactions.coverage.partial
+      || (inventoryRequired && inventory.coverage.partial);
     return {
       conversation,
       items,
@@ -2444,7 +2446,7 @@ export class AggregationService {
         ...interactions.coverage,
         partial,
         partialReason: interactions.coverage.partialReason
-          ?? inventory.coverage.partialReason,
+          ?? (inventoryRequired ? inventory.coverage.partialReason : undefined),
       },
       dataSource: interactions.dataSource,
       ...this.classificationResponseMeta(filter),
@@ -2473,7 +2475,9 @@ export class AggregationService {
     const turns = thread?.hasContent
       ? projectSemanticConversationTimeline(thread, records, segments)
       : [];
-    const partial = interactions.coverage.partial || inventory.coverage.partial;
+    const inventoryRequired = !thread?.hasContent;
+    const partial = interactions.coverage.partial
+      || (inventoryRequired && inventory.coverage.partial);
     return {
       thread,
       segments,
@@ -2485,7 +2489,7 @@ export class AggregationService {
         ...interactions.coverage,
         partial,
         partialReason: interactions.coverage.partialReason
-          ?? inventory.coverage.partialReason,
+          ?? (inventoryRequired ? inventory.coverage.partialReason : undefined),
       },
       dataSource: interactions.dataSource,
       ...this.classificationResponseMeta(filter),
@@ -2530,7 +2534,9 @@ export class AggregationService {
       filter.snapshotAsOf ?? '',
       String(resolutionRevision),
     ].join('\u0000')).digest('hex').slice(0, 32);
-    const partial = interactions.coverage.partial || inventory.coverage.partial;
+    const inventoryRequired = !thread?.hasContent;
+    const partial = interactions.coverage.partial
+      || (inventoryRequired && inventory.coverage.partial);
     return {
       apiVersion: 3,
       requestKey,
@@ -2574,7 +2580,7 @@ export class AggregationService {
         ...interactions.coverage,
         partial,
         partialReason: interactions.coverage.partialReason
-          ?? inventory.coverage.partialReason,
+          ?? (inventoryRequired ? inventory.coverage.partialReason : undefined),
       },
       dataSource: interactions.dataSource,
       ...this.classificationResponseMeta(filter),
@@ -2717,7 +2723,9 @@ export class AggregationService {
       : relations.some((relation) => relation.status === 'linked_strong')
         ? 'linked_strong'
         : relations[0]?.status ?? 'semantic_only';
-    const partial = interactions.coverage.partial || inventory.coverage.partial || kernel.coverage.partial;
+    // Inventory decorates a materialized Thread with display metadata; it is not evidence of
+    // whether this selected Tool call, its result, or the linked Kernel fact is complete.
+    const partial = interactions.coverage.partial || kernel.coverage.partial;
     return {
       schemaVersion: 'anysentry.agent_semantic_evidence.v1',
       semanticEventId: selected.semanticEventId,
@@ -2740,8 +2748,7 @@ export class AggregationService {
         ...kernel.coverage,
         partial,
         partialReason: kernel.coverage.partialReason
-          ?? interactions.coverage.partialReason
-          ?? inventory.coverage.partialReason,
+          ?? interactions.coverage.partialReason,
       },
       ...this.classificationResponseMeta(query),
       updateTime: iso(),

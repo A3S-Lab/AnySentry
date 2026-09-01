@@ -368,8 +368,8 @@ const exactMembershipAggregation = new AggregationService(
 exactMembershipAggregation.agentInventory = async () => ({
   items: [],
   total: 0,
-  totalMode: 'exact',
-  coverage: { partial: false },
+  totalMode: 'omitted',
+  coverage: { partial: true, partialReason: 'hot_ring_only' },
   dataSource: 'hot_ring',
 });
 const longTimeline = await exactMembershipAggregation.agentConversationTimelineV2({
@@ -387,6 +387,8 @@ assert.equal(exactMembershipQuery.fairPerAgentLimit, undefined);
 assert.equal(longTimeline.interactionIds.length, 80,
   'a selected Thread with more than 64 Interactions must return every durable member');
 assert.equal(longTimeline.coverage.partial, false);
+assert.equal(longTimeline.coverage.partialReason, undefined,
+  'partial inventory decoration must not downgrade exact selected-Thread content');
 
 // Keep the SQL contract executable without requiring PostgreSQL in the local verifier.
 let membershipSql;
