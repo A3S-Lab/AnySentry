@@ -6630,17 +6630,25 @@ export class ClickHouseStore {
     startMs: number;
     endMs: number;
     fairPerAgentLimit?: number;
+    interactionIds?: readonly string[];
   }): Promise<AgentInteractionRecord[] | null> {
     if (!this.client || !this.ready) return null;
-    const fairPerAgentLimit = input.fairPerAgentLimit === undefined
+    const interactionIds = [...new Set((input.interactionIds ?? [])
+      .map((value) => value.trim())
+      .filter(Boolean))].slice(0, 5_000);
+    const exactMembershipRead = interactionIds.length > 0;
+    const fairPerAgentLimit = exactMembershipRead || input.fairPerAgentLimit === undefined
       ? undefined
       : Math.max(1, Math.min(256, Math.trunc(input.fairPerAgentLimit)));
-    const limit = fairPerAgentLimit
+    const limit = exactMembershipRead
+      ? Math.max(1, Math.min(5_000, input.limit ?? interactionIds.length))
+      : fairPerAgentLimit
       ? Math.max(1, Math.min(2_000, input.limit ?? 2_000))
       : Math.max(1, Math.min(500, input.limit ?? 100));
     const conditions = [
-      'at >= {start:UInt64}',
-      'at <= {end:UInt64}',
+      ...(exactMembershipRead
+        ? ['interactionId IN {interactionIds:Array(String)}']
+        : ['at >= {start:UInt64}', 'at <= {end:UInt64}']),
       ...(input.agentAssetId ? ['agentAssetId = {agentAssetId:String}'] : []),
       ...(input.agentInstanceId ? ['agentInstanceId = {agentInstanceId:String}'] : []),
       ...(input.interactionId ? ['interactionId = {interactionId:String}'] : []),
@@ -6654,8 +6662,10 @@ export class ClickHouseStore {
       ...(input.completeness ? ['completeness = {completeness:String}'] : []),
     ];
     const queryParams = {
-      start: Math.max(0, Math.trunc(input.startMs)),
-      end: Math.max(0, Math.trunc(input.endMs)),
+      ...(exactMembershipRead ? { interactionIds } : {
+        start: Math.max(0, Math.trunc(input.startMs)),
+        end: Math.max(0, Math.trunc(input.endMs)),
+      }),
       limit,
       ...(fairPerAgentLimit ? { fairPerAgentLimit } : {}),
       ...(input.agentAssetId ? { agentAssetId: input.agentAssetId } : {}),

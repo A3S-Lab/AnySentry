@@ -98,6 +98,28 @@ store.ready = true;
 const fake = fakeClient();
 store.client = fake.client;
 
+const exactMembershipIds = Array.from(
+  { length: 5_002 },
+  (_, index) => `mi_membership_${String(index).padStart(5, '0')}`,
+);
+assert.deepEqual(await store.queryAgentInteractions({
+  timeType: 'custom',
+  startMs: 100,
+  endMs: 200,
+  interactionIds: exactMembershipIds,
+  limit: 6_000,
+}), []);
+assert.equal(fake.state.calls.length, 1);
+const exactMembershipCall = fake.state.calls[0];
+assert.match(exactMembershipCall.query, /interactionId IN \{interactionIds:Array\(String\)\}/u);
+assert.doesNotMatch(exactMembershipCall.query, /at >= \{start:UInt64\}/u,
+  'a selected Thread hydrates its exact durable membership across Runtime and time-window boundaries');
+assert.equal(exactMembershipCall.query_params.interactionIds.length, 5_000);
+assert.equal(exactMembershipCall.query_params.limit, 5_000);
+assert.equal(exactMembershipCall.clickhouse_settings.max_result_rows, '5000');
+assert.equal(fake.state.active, 0);
+fake.state.calls.length = 0;
+
 assert.equal(
   await store.dashboardAggregateBucketFacts(0, 3_610_000, 10_000),
   null,

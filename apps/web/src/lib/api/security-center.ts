@@ -136,7 +136,13 @@ export interface QueryCoverage {
   completeness?: "exact_as_observed" | "exact_current_effective" | "partial";
   watermark?: string;
   partial: boolean;
-  partialReason?: "hot_ring_only" | "scan_limit" | "storage_unavailable";
+  partialReason?:
+    | "hot_ring_only"
+    | "scan_limit"
+    | "storage_unavailable"
+    | "membership_store_unavailable"
+    | "membership_limit"
+    | "membership_records_missing";
   source: QueryDataSource;
   totalMode: QueryTotalMode;
 }

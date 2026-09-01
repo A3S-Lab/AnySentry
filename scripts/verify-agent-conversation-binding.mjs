@@ -14,6 +14,9 @@ const { projectAgentConversations } = require(
 const { AggregationService } = require(
   '../apps/api/dist/security-monitoring/aggregation.service.js',
 );
+const { RelationalBusinessStore } = require(
+  '../apps/api/dist/security-monitoring/relational-business-store.service.js',
+);
 
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 const content = (body, messages = []) => ({
@@ -104,6 +107,17 @@ const fakeStore = {
     .map((segment) => structuredClone(segment)),
   loadAgentConversationMembershipsV2: async (ids) => ids.flatMap((id) =>
     storedMemberships.has(id) ? [structuredClone(storedMemberships.get(id))] : []),
+  loadAgentConversationInteractionIds: async (id, limit = 5_000) => {
+    const ids = [...new Set([
+      ...[...storedMemberships.values()]
+        .filter((membership) => membership.canonicalConversationId === id)
+        .map((membership) => membership.interactionId),
+      ...[...storedBindings.values()]
+        .filter((binding) => binding.conversationId === id)
+        .map((binding) => binding.interactionId),
+    ])].sort();
+    return { interactionIds: ids.slice(0, limit), truncated: ids.length > limit };
+  },
   loadAgentConversationMembershipsByAnchors: async (anchors) => {
     const keys = new Set(anchors.map((anchor) => `${anchor.namespace}\0${anchor.valueHash}`));
     return storedAnchors.flatMap((stored) => {
@@ -252,6 +266,16 @@ assert.equal(storedThreads.get(conversationId).workspacePath, '/workspace/thread
   'a short-window projection must not downgrade persisted Thread workspace evidence');
 assert.equal(anchorRestartService.segmentsForConversation(conversationId).length, 4);
 assert.equal(storedBindings.size, 6);
+const persistedMembership = await anchorRestartService.interactionIdsForConversation(conversationId);
+assert.equal(persistedMembership.durable, true);
+assert.equal(persistedMembership.truncated, false);
+assert.deepEqual(new Set(persistedMembership.interactionIds), new Set([
+  first.interactionId,
+  nextDay.interactionId,
+  resumed.interactionId,
+  resumedAfterApiRestart.interactionId,
+  resumedFromAnchorOnly.interactionId,
+]));
 
 let projectionComputations = 0;
 const cacheAggregation = new AggregationService(
@@ -296,5 +320,93 @@ await cacheAggregation.storeAgentInteraction(structuredClone(first));
 await cacheAggregation.agentConversationProjection(fixedProjectionQuery);
 assert.equal(projectionComputations, 2,
   'a newly stored Interaction must invalidate the projection cache immediately');
+
+// A selected long Thread must hydrate from durable membership instead of the 64-per-Agent
+// directory sample. The selected time range intentionally excludes the early records: once a
+// Thread is selected, its strong membership IDs define the complete resumable product session.
+const longConversationId = 'cv_exact_membership_long_thread';
+const longRecords = Array.from({ length: 80 }, (_, index) => ({
+  ...interaction({
+    id: `mi_exact_member_${String(index).padStart(3, '0')}`,
+    at: first.at + index * 1_000,
+    instance: index < 40 ? 'host-root:thread:long-a' : 'host-root:thread:long-b',
+    users: [`long prompt ${index}`],
+  }),
+  conversationId: longConversationId,
+  conversationIdSource: 'provider',
+  conversationBindingVersion: 2,
+  trafficRole: 'conversation',
+}));
+let exactMembershipQuery;
+const exactMembershipAggregation = new AggregationService(
+  {
+    storedAgentInteractions: async (queryInput) => {
+      exactMembershipQuery = queryInput;
+      return longRecords;
+    },
+  },
+  {
+    identitySnapshotVersion: () => 0,
+    canonicalAgentAssetId: (value) => value,
+  },
+  {},
+  {},
+  {},
+  undefined,
+  {
+    resolveRouteAlias: async () => undefined,
+    interactionIdsForConversation: async () => ({
+      interactionIds: longRecords.map((record) => record.interactionId),
+      truncated: false,
+      durable: true,
+    }),
+    applyPersistedBindings: async (records) => records,
+    routeAlias: () => undefined,
+    segmentsForConversation: () => [],
+  },
+);
+exactMembershipAggregation.agentInventory = async () => ({
+  items: [],
+  total: 0,
+  totalMode: 'exact',
+  coverage: { partial: false },
+  dataSource: 'hot_ring',
+});
+const longTimeline = await exactMembershipAggregation.agentConversationTimelineV2({
+  timeType: 'custom',
+  startTime: new Date(longRecords.at(-2).at).toISOString(),
+  endTime: new Date(longRecords.at(-1).at + 10).toISOString(),
+  snapshotAsOf: new Date(longRecords.at(-1).at + 10).toISOString(),
+  scope: 'agent',
+  classificationView: 'current_effective',
+  conversationId: longConversationId,
+  limit: 100,
+});
+assert.equal(exactMembershipQuery.interactionIds.length, 80);
+assert.equal(exactMembershipQuery.fairPerAgentLimit, undefined);
+assert.equal(longTimeline.interactionIds.length, 80,
+  'a selected Thread with more than 64 Interactions must return every durable member');
+assert.equal(longTimeline.coverage.partial, false);
+
+// Keep the SQL contract executable without requiring PostgreSQL in the local verifier.
+let membershipSql;
+let membershipParams;
+const relationalStore = new RelationalBusinessStore();
+relationalStore.initialize = async () => true;
+relationalStore.pool = {
+  query: async (sql, params) => {
+    membershipSql = sql;
+    membershipParams = params;
+    return { rows: [{ interaction_id: 'mi_sql_member' }] };
+  },
+};
+assert.deepEqual(
+  await relationalStore.loadAgentConversationInteractionIds(longConversationId, 5_000),
+  { interactionIds: ['mi_sql_member'], truncated: false },
+);
+assert.match(membershipSql, /WITH RECURSIVE thread_ids/u);
+assert.match(membershipSql, /newer\.resolution_revision > candidate\.resolution_revision/u);
+assert.match(membershipSql, /NOT EXISTS[\s\S]*current\.interaction_id = binding\.interaction_id/u);
+assert.deepEqual(membershipParams, [longConversationId, 5_001]);
 
 console.log('Agent Conversation durable Thread/Segment binding verification passed');

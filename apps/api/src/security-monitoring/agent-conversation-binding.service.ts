@@ -14,9 +14,17 @@ import {
   conversationLogicalScopeKeyV2,
   resolveAgentConversationsV2,
 } from './agent-conversation-resolution-v2';
-import { RelationalBusinessStore } from './relational-business-store.service';
+import {
+  RelationalBusinessStore,
+  type AgentConversationInteractionMembershipSlice,
+} from './relational-business-store.service';
 
 export const AGENT_CONVERSATION_RESOLVER_VERSION = AGENT_CONVERSATION_RESOLVER_V2;
+
+export interface AgentConversationInteractionSelection
+  extends AgentConversationInteractionMembershipSlice {
+  durable: boolean;
+}
 
 function normalized(value?: string): string {
   return value?.trim().toLowerCase().replace(/\s+/gu, ' ') ?? '';
@@ -693,6 +701,41 @@ export class AgentConversationBindingService {
     const loaded = await this.relationalStore.loadAgentConversationRouteAliases?.([conversationId]) ?? [];
     for (const alias of loaded) this.routeAliases.set(alias.aliasConversationId, alias);
     return this.routeAlias(conversationId);
+  }
+
+  /**
+   * Resolve the exact current membership used to hydrate a selected Thread Timeline.
+   *
+   * PostgreSQL is authoritative when available. The in-memory maps are only a bounded hot fallback
+   * and are therefore explicitly marked non-durable so callers cannot claim complete coverage.
+   */
+  async interactionIdsForConversation(
+    conversationId: string,
+    limit = 5_000,
+  ): Promise<AgentConversationInteractionSelection> {
+    const boundedLimit = Math.max(1, Math.min(10_000, Math.trunc(limit)));
+    const canonical = this.canonicalConversationId(conversationId);
+    if (this.relationalStore?.configured()) {
+      const stored = await this.relationalStore.loadAgentConversationInteractionIds(
+        canonical,
+        boundedLimit,
+      );
+      if (stored) return { ...stored, durable: true };
+    }
+    const interactionIds = [...new Set([
+      ...[...this.membershipsV2.values()]
+        .filter((membership) => membership.canonicalConversationId
+          && this.canonicalConversationId(membership.canonicalConversationId) === canonical)
+        .map((membership) => membership.interactionId),
+      ...[...this.bindings.values()]
+        .filter((binding) => this.canonicalConversationId(binding.conversationId) === canonical)
+        .map((binding) => binding.interactionId),
+    ])].sort();
+    return {
+      interactionIds: interactionIds.slice(0, boundedLimit),
+      truncated: interactionIds.length > boundedLimit,
+      durable: false,
+    };
   }
 
   canonicalConversationId(conversationId: string): string {

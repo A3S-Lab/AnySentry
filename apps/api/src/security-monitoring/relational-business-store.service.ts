@@ -65,6 +65,11 @@ export interface AgentConversationAnchorMembershipMatch {
   membership: ConversationMembershipV2;
 }
 
+export interface AgentConversationInteractionMembershipSlice {
+  interactionIds: string[];
+  truncated: boolean;
+}
+
 function positiveInt(value: string | undefined, fallback: number, max: number): number {
   const parsed = Number.parseInt(value ?? '', 10);
   return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, max) : fallback;
@@ -591,6 +596,83 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     } catch (error) {
       this.markUnavailable('load Agent Conversation V2 memberships', error);
       return [];
+    }
+  }
+
+  /**
+   * Load the current durable Interaction membership of one canonical Conversation Thread.
+   *
+   * A Thread can absorb an older inferred Thread after stronger Provider/continuity evidence is
+   * observed. The recursive alias set therefore remains part of the read model until the next
+   * resolver pass rewrites every old membership. V2 rows are considered only when no newer
+   * resolution exists for the same Interaction; otherwise an obsolete revision could resurrect a
+   * record that was deliberately moved to another Thread or folded into technical activity.
+   */
+  async loadAgentConversationInteractionIds(
+    conversationId: string,
+    limit = 5_000,
+  ): Promise<AgentConversationInteractionMembershipSlice | null> {
+    const normalizedConversationId = conversationId.trim();
+    if (!normalizedConversationId || !(await this.initialize()) || !this.pool) return null;
+    const boundedLimit = Math.max(1, Math.min(10_000, Math.trunc(limit)));
+    try {
+      const result = await this.pool.query<{ interaction_id: string }>(
+        `WITH RECURSIVE thread_ids(conversation_id) AS (
+           SELECT $1::text
+           UNION
+           SELECT alias.alias_conversation_id
+             FROM anysentry_agent_conversation_route_aliases_v1 AS alias
+             JOIN thread_ids AS target
+               ON alias.target_type = 'conversation'
+              AND alias.target_id = target.conversation_id
+         ),
+         current_v2 AS (
+           SELECT candidate.interaction_id,
+                  candidate.decided_at
+             FROM anysentry_agent_conversation_memberships_v2 AS candidate
+             JOIN thread_ids AS thread
+               ON thread.conversation_id = candidate.canonical_conversation_id
+            WHERE NOT EXISTS (
+              SELECT 1
+                FROM anysentry_agent_conversation_memberships_v2 AS newer
+               WHERE newer.interaction_id = candidate.interaction_id
+                 AND newer.resolution_revision > candidate.resolution_revision
+            )
+         ),
+         legacy_v1 AS (
+           SELECT binding.interaction_id,
+                  binding.updated_at AS decided_at
+             FROM anysentry_agent_conversation_bindings_v1 AS binding
+             JOIN thread_ids AS thread
+               ON thread.conversation_id = binding.conversation_id
+            WHERE NOT EXISTS (
+              SELECT 1
+                FROM anysentry_agent_conversation_memberships_v2 AS current
+               WHERE current.interaction_id = binding.interaction_id
+            )
+         ),
+         members AS (
+           SELECT interaction_id, decided_at FROM current_v2
+           UNION ALL
+           SELECT interaction_id, decided_at FROM legacy_v1
+         )
+         SELECT interaction_id
+           FROM members
+          GROUP BY interaction_id
+          ORDER BY MAX(decided_at), interaction_id
+          LIMIT $2`,
+        [normalizedConversationId, boundedLimit + 1],
+      );
+      const interactionIds = result.rows
+        .map((row) => row.interaction_id?.trim())
+        .filter((value): value is string => Boolean(value));
+      return {
+        interactionIds: interactionIds.slice(0, boundedLimit),
+        truncated: interactionIds.length > boundedLimit,
+      };
+    } catch (error) {
+      this.markUnavailable('load Agent Conversation Interaction membership', error);
+      return null;
     }
   }
 

@@ -2073,9 +2073,19 @@ export class AggregationService {
 
   private async readAgentInteractions(
     filter: T.AgentInteractionQuery,
-    options: { fairPerAgentLimit?: number; totalLimit?: number } = {},
+    options: {
+      fairPerAgentLimit?: number;
+      totalLimit?: number;
+      interactionIds?: readonly string[];
+      membershipTruncated?: boolean;
+      membershipDurable?: boolean;
+    } = {},
   ): Promise<T.AgentInteractionList> {
     const window = resolveTimeWindow(filter);
+    const exactInteractionIds = new Set((options.interactionIds ?? [])
+      .map((value) => value.trim())
+      .filter(Boolean));
+    const exactMembershipRead = exactInteractionIds.size > 0;
     const requestedAsset = filter.agentAssetId?.trim();
     const agentAssetId = requestedAsset
       ? this.agentMetadata.canonicalAgentAssetId(requestedAsset)
@@ -2086,9 +2096,11 @@ export class AggregationService {
     // first, then enforce canonical asset equivalence below.
     const query = {
       ...filter,
-      agentAssetId: filter.interactionId ? undefined : agentAssetId,
+      agentAssetId: filter.interactionId || exactMembershipRead ? undefined : agentAssetId,
+      agentInstanceId: exactMembershipRead ? undefined : filter.agentInstanceId,
       startMs: window.startMs,
       endMs: window.endMs,
+      ...(exactMembershipRead ? { interactionIds: [...exactInteractionIds] } : {}),
       ...(options.fairPerAgentLimit
         ? { fairPerAgentLimit: options.fairPerAgentLimit }
         : {}),
@@ -2098,7 +2110,9 @@ export class AggregationService {
     const merged = new Map<string, T.AgentInteractionRecord>();
     for (const item of persisted ?? []) merged.set(item.interactionId, item);
     for (const { record } of this.interactionHot.values()) {
-      if (record.at < window.startMs || record.at > window.endMs) continue;
+      if (exactMembershipRead) {
+        if (!exactInteractionIds.has(record.interactionId)) continue;
+      } else if (record.at < window.startMs || record.at > window.endMs) continue;
       merged.set(record.interactionId, record);
     }
     const currentView = resolvedClassificationView(filter) === 'current_effective';
@@ -2113,12 +2127,15 @@ export class AggregationService {
         // Interactions emitted before and after identity reconciliation. Once the exact fact id
         // matches, stale identity hints must not hide it.
         (filter.interactionId
+          || exactMembershipRead
           || !agentAssetId
           || item.agentAssetId === requestedAsset
           || this.agentMetadata.canonicalAgentAssetId(item.agentAssetId) === agentAssetId)
         && (filter.interactionId
+          || exactMembershipRead
           || !filter.agentInstanceId
           || item.agentInstanceId === filter.agentInstanceId)
+        && (!exactMembershipRead || exactInteractionIds.has(item.interactionId))
         && (!filter.interactionId || item.interactionId === filter.interactionId)
         && (!filter.interactionType || item.interactionType === filter.interactionType)
         && (!filter.model || item.model === filter.model)
@@ -2154,10 +2171,28 @@ export class AggregationService {
     const snapshotAsOf = new Date(window.endMs).toISOString();
     const dataTimes = visible.map((item) => item.at);
     const durable = persisted !== null;
+    const missingMembershipRecords = exactMembershipRead
+      ? [...exactInteractionIds].filter((interactionId) => !merged.has(interactionId)).length
+      : 0;
+    const membershipPartial = exactMembershipRead && (
+      options.membershipDurable === false
+      || options.membershipTruncated === true
+      || missingMembershipRecords > 0
+    );
+    const partial = !durable || Boolean(options.fairPerAgentLimit) || membershipPartial;
+    const partialReason = !durable
+      ? 'hot_ring_only'
+      : options.membershipDurable === false
+        ? 'membership_store_unavailable'
+        : options.membershipTruncated
+          ? 'membership_limit'
+          : missingMembershipRecords > 0
+            ? 'membership_records_missing'
+            : options.fairPerAgentLimit ? 'scan_limit' : undefined;
     return {
       items: visible,
       total: items.length,
-      totalMode: durable && !options.fairPerAgentLimit && items.length <= limit
+      totalMode: !partial && items.length <= limit
         ? 'exact'
         : 'omitted',
       coverage: {
@@ -2167,15 +2202,13 @@ export class AggregationService {
         asOf: snapshotAsOf,
         dataFrom: dataTimes.length ? new Date(Math.min(...dataTimes)).toISOString() : undefined,
         dataTo: dataTimes.length ? new Date(Math.max(...dataTimes)).toISOString() : undefined,
-        completeness: durable && !options.fairPerAgentLimit
+        completeness: !partial
           ? currentView ? 'exact_current_effective' : 'exact_as_observed'
           : 'partial',
-        partial: !durable || Boolean(options.fairPerAgentLimit),
-        partialReason: !durable
-          ? 'hot_ring_only'
-          : options.fairPerAgentLimit ? 'scan_limit' : undefined,
+        partial,
+        partialReason,
         source: durable ? 'clickhouse+hot_delta' : 'memory_hot_ring',
-        totalMode: durable && !options.fairPerAgentLimit && items.length <= limit
+        totalMode: !partial && items.length <= limit
           ? 'exact'
           : 'omitted',
       },
@@ -2262,6 +2295,15 @@ export class AggregationService {
       ? persistedAlias.canonicalConversationId
       : requestedConversationId;
     const resolveConversationId = Boolean(initialConversationId);
+    const membershipSelection = initialConversationId && this.conversationBindings
+      ? await this.conversationBindings.interactionIdsForConversation(
+          initialConversationId,
+          5_000,
+        )
+      : undefined;
+    const exactMembershipIds = membershipSelection?.interactionIds.length
+      ? membershipSelection.interactionIds
+      : undefined;
     const interactionQuery: T.AgentInteractionQuery = {
       timeType: filter.timeType,
       startTime: filter.startTime,
@@ -2302,16 +2344,26 @@ export class AggregationService {
             inventoryTimer.unref();
           }),
         ]);
-    const fairHistoryRead = resolveConversationId || (
+    const fairHistoryRead = !exactMembershipIds && (resolveConversationId || (
       !filter.agentAssetId
       && !filter.agentInstanceId
       && !filter.model
-    );
+    ));
+    const interactionReadOptions = exactMembershipIds
+      ? {
+          interactionIds: exactMembershipIds,
+          membershipTruncated: membershipSelection!.truncated,
+          membershipDurable: membershipSelection!.durable,
+          totalLimit: exactMembershipIds.length,
+        }
+      : fairHistoryRead
+        ? {
+            fairPerAgentLimit: CONVERSATION_INTERACTIONS_PER_AGENT,
+            totalLimit: CONVERSATION_INTERACTIONS_TOTAL,
+          }
+        : undefined;
     const [interactions, inventory] = await Promise.all([
-      this.readAgentInteractions(interactionQuery, fairHistoryRead ? {
-        fairPerAgentLimit: CONVERSATION_INTERACTIONS_PER_AGENT,
-        totalLimit: CONVERSATION_INTERACTIONS_TOTAL,
-      } : undefined),
+      this.readAgentInteractions(interactionQuery, interactionReadOptions),
       inventoryPromise,
     ]).finally(() => {
       if (inventoryTimer) clearTimeout(inventoryTimer);

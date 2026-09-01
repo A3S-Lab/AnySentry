@@ -792,6 +792,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     startMs: number;
     endMs: number;
     fairPerAgentLimit?: number;
+    interactionIds?: readonly string[];
   }): Promise<AgentInteractionRecord[] | null> {
     return this.ch.queryAgentInteractions(input);
   }
