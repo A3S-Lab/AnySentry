@@ -1472,7 +1472,8 @@ export interface AgentInteractionRecord {
   providerConversationId?: string;
   providerResponseId?: string;
   providerPreviousResponseId?: string;
-  trafficRole?: 'conversation' | 'bootstrap' | 'control' | 'context_replay' | 'background' | 'unclassified';
+  trafficRole?: 'conversation' | 'bootstrap' | 'control' | 'context_replay'
+    | 'tool_backend' | 'derived_metadata' | 'retry' | 'background' | 'unclassified';
   conversationAnchors?: AgentConversationAnchor[];
   evidenceEventIds?: string[];
   conversationId?: string;
@@ -1730,7 +1731,8 @@ export interface AgentRunTechnicalActivitySummary {
   technicalActivityId: string;
   agentAssetId: string;
   agentInstanceId?: string;
-  role: 'bootstrap' | 'control' | 'background' | 'unclassified';
+  role: 'bootstrap' | 'control' | 'tool_backend' | 'derived_metadata'
+    | 'retry' | 'background' | 'unclassified';
   interactionIds: string[];
   startedAtUnixNs: string;
   endedAtUnixNs: string;

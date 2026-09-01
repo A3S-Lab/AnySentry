@@ -72,8 +72,11 @@ function interaction({
   toolCalls = [],
   toolResults = [],
   responseText = 'ok',
+  responseStructured,
+  trafficRole,
   path = '/backend-api/codex/responses',
   agentProduct = 'Codex',
+  wireTemplateId,
   workspacePath = '/workspace/resolver-v2',
   statusCode = 200,
   completeness = 'complete',
@@ -98,6 +101,7 @@ function interaction({
     providerConversationId,
     providerResponseId: responseId,
     providerPreviousResponseId: previousResponseId,
+    trafficRole,
     conversationId,
     conversationIdSource: conversationId ? 'provider' : undefined,
     conversationBindingVersion: conversationId ? 1 : undefined,
@@ -116,7 +120,8 @@ function interaction({
     connectionId: 'tls:' + id,
     transport: 'tls',
     protocol: interactionType === 'tool' ? 'http/1.1' : 'websocket-json',
-    wireTemplateId: interactionType === 'tool' ? 'mcp-jsonrpc' : 'openai-responses',
+    wireTemplateId: wireTemplateId
+      ?? (interactionType === 'tool' ? 'mcp-jsonrpc' : 'openai-responses'),
     parseState: 'parsed',
     llmLikelihood: 'confirmed',
     conversationCompleteness,
@@ -132,7 +137,11 @@ function interaction({
     durationNs: '3000000',
     timeQuality: 'collector_calibrated',
     request: content(request, messages),
-    response: content(responseId ? { id: responseId, output: [] } : { result: {} }, [], responseText),
+    response: content(
+      responseStructured ?? (responseId ? { id: responseId, output: [] } : { result: {} }),
+      [],
+      responseText,
+    ),
     toolCalls,
     toolResults,
     semanticParserId: 'observer.agent-interaction',
@@ -494,6 +503,68 @@ assert.deepEqual(
   ['resume the terminal session', 'continue from the first observed turn'],
   'only content observed after the collection boundary should become visible user Turns',
 );
+
+const backgroundOperationResolution = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_model_search_backend',
+    at: base + 1_300,
+    instance: 'host-root:v2:resume-two',
+    trafficRole: 'conversation',
+    request: {
+      id: 'search-fixture',
+      model: 'fixture-model',
+      commands: [{ name: 'search', arguments: { query: 'fixture' } }],
+      input: [h4],
+      settings: { mode: 'balanced' },
+      max_output_tokens: 128,
+    },
+    responseStructured: {
+      encrypted_output: 'opaque-fixture',
+      output: [],
+      results: [{ title: 'fixture result' }],
+    },
+    responseText: '',
+    path: '/arbitrary/model-assisted-operation',
+  }),
+  interaction({
+    id: 'mi_v2_session_title',
+    at: base + 1_400,
+    instance: 'host-root:v2:resume-two',
+    trafficRole: 'conversation',
+    wireTemplateId: 'anthropic-messages',
+    agentProduct: 'Claude Code',
+    request: {
+      model: 'fixture-model',
+      system: [{
+        type: 'text',
+        text: 'Generate a concise title. The session content is provided inside <session> tags. Return JSON with a single "title" field.',
+      }],
+      messages: [{
+        role: 'user',
+        content: [{ type: 'text', text: '<session>debug the fixture</session>' }],
+      }],
+      output_config: {
+        format: { type: 'json_schema', schema: { properties: { title: { type: 'string' } } } },
+      },
+    },
+    responseStructured: {
+      id: 'message-title-fixture',
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'text', text: '{"title":"Debug fixture"}' }],
+    },
+    responseText: '{"title":"Debug fixture"}',
+    path: '/arbitrary/messages',
+  }),
+]);
+assert.equal(backgroundOperationResolution.conversationRecords.length, 0,
+  'model-assisted backend and derived metadata calls must not create user Threads');
+assert.deepEqual(
+  backgroundOperationResolution.technicalRecords.map((item) => item.trafficRole).sort(),
+  ['derived_metadata', 'tool_backend'],
+  'stored legacy conversation roles must be reclassified from wire semantics',
+);
+assert.equal(backgroundOperationResolution.technicalActivities.length, 2);
 
 const explicitConflict = resolveAgentConversationsV2([
   interaction({

@@ -44,7 +44,8 @@ const MESSAGE_ORIGINS = new Set<NonNullable<T.AgentInteractionMessage['messageOr
   'human_input', 'agent_context', 'developer_instruction', 'assistant_history', 'tool_history',
 ]);
 const TRAFFIC_ROLES = new Set<NonNullable<T.AgentInteractionRecord['trafficRole']>>([
-  'conversation', 'bootstrap', 'control', 'context_replay', 'background', 'unclassified',
+  'conversation', 'bootstrap', 'control', 'context_replay', 'tool_backend',
+  'derived_metadata', 'retry', 'background', 'unclassified',
 ]);
 const ANCHOR_KINDS = new Set<T.AgentConversationAnchorKind>([
   'provider_conversation', 'response_id', 'previous_response_id', 'continuity_key',

@@ -9,6 +9,9 @@ export type ConversationMembershipRole =
   | 'bootstrap'
   | 'control'
   | 'context_replay'
+  | 'tool_backend'
+  | 'derived_metadata'
+  | 'retry'
   | 'background'
   | 'unclassified';
 
@@ -136,6 +139,54 @@ function requestObject(interaction: T.AgentInteractionRecord): Record<string, un
   } catch {
     return undefined;
   }
+}
+
+function responseObject(interaction: T.AgentInteractionRecord): Record<string, unknown> | undefined {
+  return record(interaction.response.structured);
+}
+
+function valueContainsText(value: unknown, expected: string, depth = 0): boolean {
+  if (depth > 8) return false;
+  if (typeof value === 'string') return value.toLowerCase().includes(expected);
+  if (Array.isArray(value)) {
+    return value.slice(0, 256).some((item) => valueContainsText(item, expected, depth + 1));
+  }
+  const object = record(value);
+  return Boolean(object && Object.entries(object).slice(0, 256).some(([key, item]) =>
+    key.toLowerCase().includes(expected) || valueContainsText(item, expected, depth + 1)));
+}
+
+function modelSearchBackendExchange(
+  request: Record<string, unknown> | undefined,
+  response: Record<string, unknown> | undefined,
+): boolean {
+  return Boolean(
+    request
+    && response
+    && Array.isArray(request.commands)
+    && Array.isArray(request.input)
+    && record(request.settings)
+    && text(request.model)
+    && request.type === undefined
+    && response.results !== undefined
+    && response.output !== undefined
+    && response.encrypted_output !== undefined,
+  );
+}
+
+function sessionTitleRequest(request: Record<string, unknown> | undefined): boolean {
+  if (!request) return false;
+  const messageInput = request.messages ?? request.input;
+  const wrappedSession = valueContainsText(messageInput, '<session>')
+    && valueContainsText(messageInput, '</session>');
+  if (!wrappedSession) return false;
+  const titleInstruction = valueContainsText(request.system, 'title')
+    && valueContainsText(request.system, '<session>')
+    && (
+      valueContainsText(request.system, 'return json')
+      || valueContainsText(request.system, 'single "title" field')
+    );
+  return titleInstruction || valueContainsText(request.output_config, 'title');
 }
 
 function metadataObject(item: Record<string, unknown>): Record<string, unknown> | undefined {
@@ -336,6 +387,13 @@ export function trafficRoleForInteraction(
   interaction: T.AgentInteractionRecord,
 ): ConversationMembershipRole {
   const request = requestObject(interaction);
+  if (interaction.interactionType === 'model'
+    && modelSearchBackendExchange(request, responseObject(interaction))) {
+    return 'tool_backend';
+  }
+  if (interaction.interactionType === 'model' && sessionTitleRequest(request)) {
+    return 'derived_metadata';
+  }
   if (interaction.interactionType === 'model' && request?.generate === false) {
     return 'bootstrap';
   }
