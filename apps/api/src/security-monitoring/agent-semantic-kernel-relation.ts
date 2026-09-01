@@ -309,6 +309,27 @@ function withinWindow(
     && at <= end + CLOCK_SKEW_MS;
 }
 
+function shellBootstrapCandidate(
+  input: SemanticKernelRelationInput,
+  candidate: T.AgentEventListItem,
+): boolean {
+  const normalizedTool = (input.event.toolKind ?? input.event.toolName ?? '').toLowerCase();
+  if (!input.result || !/bash|exec|shell/u.test(normalizedTool)) return false;
+  if (candidate.eventKind !== 'ToolExec') return false;
+  const shell = (candidate.process?.comm ?? '').toLowerCase();
+  if (!['bash', 'sh', 'dash', 'zsh', 'fish'].includes(shell)) return false;
+  const rootPid = candidate.attribution?.rootPid;
+  if (!Number.isSafeInteger(rootPid) || candidate.process?.ppid !== rootPid) return false;
+  const callAt = unixNsToMs(input.event.atUnixNs);
+  const resultAt = unixNsToMs(input.result.atUnixNs);
+  const candidateAt = Date.parse(candidate.at);
+  return Number.isFinite(callAt)
+    && Number.isFinite(resultAt)
+    && Number.isFinite(candidateAt)
+    && candidateAt >= callAt - CLOCK_SKEW_MS
+    && candidateAt <= resultAt + CLOCK_SKEW_MS;
+}
+
 function risk(event: T.AgentEventListItem): NonNullable<T.AgentSemanticKernelRelation['risk']> {
   return {
     verdict: event.verdict,
@@ -384,6 +405,14 @@ function potentialRelation(
       confidence = 0.98;
     }
   }
+  if (!linkMethod && command && shellBootstrapCandidate(input, candidate)) {
+    // Some Agent shells receive the actual command over stdin after an exec-time environment
+    // snapshot. Builtins therefore have no second execve containing the semantic command. Admit
+    // only the exact direct-child shell here; the batch resolver below requires it to be the sole
+    // fallback candidate for this Tool invocation.
+    linkMethod = 'shell_bootstrap';
+    confidence = 0.95;
+  }
   if (!linkMethod) return undefined;
 
   const runtimeLink = runtimeMatch(interaction, candidate, index);
@@ -458,9 +487,18 @@ export function buildSemanticKernelRelationBatch(
   for (const input of boundedInputs) {
     const semanticId = input.event.semanticEventId;
     invocationBySemantic.set(semanticId, toolInvocationId(input.event, input.interaction));
-    const relations = candidates
+    const potential = candidates
       .map((candidate) => potentialRelation(input, candidate, index, resolutionRevision))
       .filter((relation): relation is T.AgentSemanticKernelRelation => Boolean(relation));
+    const contentRelations = potential.filter((relation) =>
+      relation.linkMethod !== 'shell_bootstrap');
+    const shellFallbacks = potential.filter((relation) =>
+      relation.linkMethod === 'shell_bootstrap');
+    const relations = contentRelations.length > 0
+      ? contentRelations
+      : shellFallbacks.length === 1
+        ? shellFallbacks
+        : [];
     potentialBySemantic.set(semanticId, relations);
     for (const relation of relations) {
       if (!relation.kernelEventId) continue;

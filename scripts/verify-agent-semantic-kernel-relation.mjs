@@ -152,6 +152,49 @@ assert.equal(resourceRelations[0].linkMethod, 'resource');
 assert.equal(resourceRelations[0].kernelEventId, fileEvent.eventId);
 assert.equal(resourceRelations[0].timeQuality, 'bounded');
 
+const shellBootstrapEvent = {
+  ...kernelEvent,
+  eventId: 'evt_shell_bootstrap',
+  at: new Date(callAt + 200).toISOString(),
+  subject: '/bin/bash -c source /tmp/agent-shell-snapshot',
+  process: {
+    pid: 101,
+    ppid: 100,
+    comm: 'bash',
+    hostId: 'host-semantic',
+    bootId: 'boot-semantic',
+  },
+  attribution: { rootPid: 100 },
+};
+const shellBootstrapRelations = buildSemanticKernelRelations(
+  toolCall,
+  toolResult,
+  interaction,
+  [shellBootstrapEvent],
+  13,
+  false,
+);
+assert.equal(shellBootstrapRelations[0].status, 'linked_strong');
+assert.equal(shellBootstrapRelations[0].linkMethod, 'shell_bootstrap');
+assert.equal(shellBootstrapRelations[0].lineageMethod, 'direct_runtime');
+assert.equal(shellBootstrapRelations[0].confidence, 0.95);
+assert.equal(shellBootstrapRelations[0].kernelEventId, shellBootstrapEvent.eventId);
+
+const ambiguousShellBootstrap = buildSemanticKernelRelations(
+  toolCall,
+  toolResult,
+  interaction,
+  [
+    shellBootstrapEvent,
+    { ...shellBootstrapEvent, eventId: 'evt_second_shell_bootstrap' },
+  ],
+  13,
+  false,
+);
+assert.equal(ambiguousShellBootstrap[0].status, 'semantic_only');
+assert.equal(ambiguousShellBootstrap[0].kernelEventId, undefined,
+  'multiple direct-child shells must not be guessed from time and Runtime alone');
+
 const timeOnly = buildSemanticKernelRelations(
   toolCall,
   toolResult,

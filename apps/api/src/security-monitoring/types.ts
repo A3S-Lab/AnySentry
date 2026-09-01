@@ -1955,7 +1955,7 @@ export interface AgentSemanticKernelRelation {
   kernelEventKind?: string;
   kernelEventDecisionRevision?: number;
   status: AgentSemanticKernelRelationStatus;
-  linkMethod?: 'command' | 'resource' | 'network';
+  linkMethod?: 'command' | 'resource' | 'network' | 'shell_bootstrap';
   lineageMethod?: 'direct_runtime' | 'generation_parent' | 'legacy_pid_parent';
   competingToolInvocationIds?: string[];
   timeQuality?: 'exact' | 'bounded';
