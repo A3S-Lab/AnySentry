@@ -15,6 +15,7 @@ const marker = process.env.ANYSENTRY_CONVERSATION_MARKER ?? 'FINAL_REQUEST_SENTI
 const responseMarker = process.env.ANYSENTRY_CONVERSATION_RESPONSE_MARKER ?? 'VISIBLE_RESPONSE_SENTINEL';
 const toolMarker = process.env.ANYSENTRY_CONVERSATION_TOOL_MARKER ?? 'TOOL_RESULT_SENTINEL';
 const requestedConversationId = process.env.ANYSENTRY_CONVERSATION_ID?.trim();
+const alternateConversationId = process.env.ANYSENTRY_ALTERNATE_CONVERSATION_ID?.trim();
 const timeType = process.env.ANYSENTRY_CONVERSATION_TIME_TYPE?.trim() || 'last_30d';
 const chromeBinary = process.env.CHROME_BIN ?? '/usr/bin/google-chrome';
 const profile = mkdtempSync(path.join(tmpdir(), 'anysentry-conversation-chrome-'));
@@ -293,11 +294,25 @@ try {
   const rapidSwitch = await evaluate(`(() => new Promise(async (resolve) => {
     const ids = [...new Set([...document.querySelectorAll('[data-conversation-id]')]
       .map((node) => node.getAttribute('data-conversation-id')).filter(Boolean))];
-    if (ids.length < 2) { resolve({ tested: false }); return; }
-    const targets = ids.slice(0, 2);
+    const configured = [
+      ${JSON.stringify(conversation.conversationId)},
+      ${JSON.stringify(alternateConversationId ?? '')}
+    ].filter(Boolean);
+    const targets = ids.length >= 2 ? ids.slice(0, 2) : [...new Set(configured)].slice(0, 2);
+    if (targets.length < 2) { resolve({ tested: false }); return; }
     for (let index = 0; index < 100; index += 1) {
       const id = targets[index % targets.length];
-      document.querySelector('button[data-conversation-id="' + CSS.escape(id) + '"]')?.click();
+      const button = document.querySelector('button[data-conversation-id="' + CSS.escape(id) + '"]');
+      if (button) {
+        button.click();
+      } else {
+        const next = new URL(location.href);
+        next.searchParams.set('conversationId', id);
+        next.searchParams.delete('interactionId');
+        next.searchParams.delete('semanticEventId');
+        history.pushState({}, '', next);
+        dispatchEvent(new PopStateEvent('popstate'));
+      }
       await new Promise((next) => setTimeout(next, 5));
     }
     resolve({ tested: true, finalId: targets[99 % targets.length] });
@@ -312,7 +327,17 @@ try {
       (value) => value.route === rapidSwitch.finalId && value.timeline === rapidSwitch.finalId,
       60_000,
     );
-    await evaluate(`document.querySelector('button[data-conversation-id=${JSON.stringify(conversation.conversationId)}]')?.click()`);
+    await evaluate(`(() => {
+      const id = ${JSON.stringify(conversation.conversationId)};
+      const button = document.querySelector('button[data-conversation-id="' + CSS.escape(id) + '"]');
+      if (button) { button.click(); return; }
+      const next = new URL(location.href);
+      next.searchParams.set('conversationId', id);
+      next.searchParams.delete('interactionId');
+      next.searchParams.delete('semanticEventId');
+      history.pushState({}, '', next);
+      dispatchEvent(new PopStateEvent('popstate'));
+    })()`);
     await waitFor(
       'restore browser fixture Thread',
       () => evaluate(`({
