@@ -781,6 +781,7 @@ const projectionRecord = (id, at, prompt, overrides = {}) => {
   for (const field of [
     'conversationId', 'conversationIdSource', 'turnId', 'modelCallId', 'attemptId',
     'providerConversationId', 'providerResponseId', 'providerPreviousResponseId',
+    'traceId', 'runId', 'sessionId', 'invocationId',
   ]) if (!(field in overrides)) delete record[field];
   return record;
 };
@@ -843,6 +844,57 @@ const providerProjection = projectAgentConversations(
 assert.equal(providerProjection.summaries.length, 1);
 assert.equal(providerProjection.summaries[0].idSource, 'provider');
 assert.equal(providerProjection.summaries[0].modelCallCount, 2);
+
+const workflowSession = 'workflow-session-fixture';
+const workflowRun = 'workflow-run-fixture';
+const workflowRecords = [
+  projectionRecord('workflow-plan', projectionAt + 40, 'WORKFLOW_GOAL', {
+    providerConversationId: workflowSession,
+    sessionId: workflowSession,
+    runId: workflowRun,
+    traceId: digest(workflowRun).slice(0, 32),
+    invocationId: workflowRun,
+  }),
+  projectionRecord('workflow-tool', projectionAt + 50, 'FRAMEWORK_CONTEXT', {
+    interactionType: 'tool',
+    providerConversationId: workflowSession,
+    sessionId: workflowSession,
+    runId: workflowRun,
+    traceId: digest(workflowRun).slice(0, 32),
+    invocationId: workflowRun,
+    request: {
+      ...item.request,
+      body: JSON.stringify({ code: 'print(42)', timeout_ms: 4_000 }),
+      structured: { code: 'print(42)', timeout_ms: 4_000 },
+      messages: [],
+      sha256: digest('workflow-tool-request'),
+    },
+    toolCalls: [{
+      toolCallId: 'sandbox-workflow-1', name: 'http.code.execute', arguments: { code: 'print(42)' },
+      issuedAtUnixNs: String(BigInt(projectionAt + 50) * 1_000_000n),
+    }],
+    toolResults: [{
+      toolCallId: 'sandbox-workflow-1', name: 'http.code.execute', content: { exit_code: 0 },
+      isError: false, observedAtUnixNs: String(BigInt(projectionAt + 51) * 1_000_000n),
+    }],
+  }),
+  projectionRecord('workflow-final', projectionAt + 60, 'FRAMEWORK_CONTEXT', {
+    providerConversationId: workflowSession,
+    sessionId: workflowSession,
+    runId: workflowRun,
+    traceId: digest(workflowRun).slice(0, 32),
+    invocationId: workflowRun,
+  }),
+];
+const workflowProjection = projectAgentConversations(
+  workflowRecords,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 20 },
+);
+assert.equal(workflowProjection.summaries.length, 1);
+assert.equal(workflowProjection.summaries[0].modelCallCount, 2);
+assert.equal(workflowProjection.summaries[0].turnCount, 1,
+  'one external workflow Run must remain one Turn across model and HTTP Tool interactions');
 
 console.log('Agent interaction ingest/query verification passed');
 console.log(JSON.stringify({

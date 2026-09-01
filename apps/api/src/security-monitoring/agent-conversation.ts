@@ -331,7 +331,9 @@ function annotateTurns(
   let previous: T.AgentInteractionRecord | undefined;
   return ordered.map((record) => {
     const latestHuman = interactionHumanMessages(record).at(-1);
-    const stableTurnAnchor = latestHuman?.turnId ?? latestHuman?.sourceItemId;
+    const stableTurnAnchor = record.runId
+      ? `run:${record.runId}`
+      : latestHuman?.turnId ?? latestHuman?.sourceItemId;
     const continuesToolLoop = Boolean(
       previous
       && (record.toolResults.length > 0 || previous.toolCalls.length > 0),

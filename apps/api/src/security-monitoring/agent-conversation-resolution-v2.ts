@@ -361,6 +361,7 @@ export function conversationAnchorsForInteraction(
   push('continuity_key', continuityValue(request), 'strong', 'prompt_cache_key|cache_key');
   push('continuity_key', interaction.runId, 'strong', 'http.x-anysentry-run-id');
   push('continuity_key', interaction.traceId, 'strong', 'http.traceparent.trace-id');
+  push('turn_id', interaction.runId, 'exact', 'http.x-anysentry-run-id');
   push(
     'turn_id',
     text(record(request?.client_metadata)?.turn_id),

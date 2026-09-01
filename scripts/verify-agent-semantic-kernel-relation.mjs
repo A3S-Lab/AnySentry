@@ -183,6 +183,36 @@ const httpToolRelations = buildSemanticKernelRelations(
 assert.equal(httpToolRelations[0].status, 'linked_strong');
 assert.equal(httpToolRelations[0].linkMethod, 'network');
 assert.equal(httpToolRelations[0].kernelEventId, sandboxEgress.eventId);
+const resolvedServiceEgress = {
+  ...sandboxEgress,
+  eventId: 'evt_sandbox_cluster_ip_egress',
+  subject: 'egress → 10.43.62.211:8080',
+  attributes: { peer: '10.43.62.211', port: 8080 },
+};
+const resolvedServiceRelations = buildSemanticKernelRelations(
+  httpToolCall,
+  toolResult,
+  httpToolInteraction,
+  [resolvedServiceEgress],
+  13,
+  false,
+);
+assert.equal(resolvedServiceRelations[0].status, 'linked_strong');
+assert.equal(resolvedServiceRelations[0].linkMethod, 'network_endpoint');
+assert.equal(resolvedServiceRelations[0].kernelEventId, resolvedServiceEgress.eventId);
+const ambiguousServiceEndpoint = buildSemanticKernelRelations(
+  httpToolCall,
+  toolResult,
+  httpToolInteraction,
+  [
+    resolvedServiceEgress,
+    { ...resolvedServiceEgress, eventId: 'evt_second_cluster_ip_egress' },
+  ],
+  13,
+  false,
+);
+assert.equal(ambiguousServiceEndpoint[0].status, 'semantic_only');
+assert.equal(ambiguousServiceEndpoint[0].kernelEventId, undefined);
 
 const shellBootstrapEvent = {
   ...kernelEvent,

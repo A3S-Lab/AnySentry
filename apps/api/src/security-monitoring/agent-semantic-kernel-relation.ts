@@ -122,6 +122,32 @@ function interactionEndpointHost(interaction: T.AgentInteractionRecord): string 
   }
 }
 
+function interactionEndpointPort(interaction: T.AgentInteractionRecord): number | undefined {
+  if (interaction.interactionType !== 'tool') return undefined;
+  const endpoint = text(interaction.endpoint, 1_000);
+  if (!endpoint || endpoint === 'unknown') return undefined;
+  try {
+    const parsed = new URL(endpoint.includes('://') ? endpoint : `http://${endpoint}`);
+    const port = Number(parsed.port);
+    return Number.isSafeInteger(port) && port > 0 && port <= 65_535 ? port : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function candidatePort(event: T.AgentEventListItem): number | undefined {
+  for (const value of [
+    event.attributes.port,
+    event.attributes.serverPort,
+    event.attributes.destinationPort,
+  ]) {
+    const port = Number(value);
+    if (Number.isSafeInteger(port) && port > 0 && port <= 65_535) return port;
+  }
+  const port = Number(event.subject.match(/:(\d{1,5})(?:\s|$)/u)?.[1]);
+  return Number.isSafeInteger(port) && port > 0 && port <= 65_535 ? port : undefined;
+}
+
 function candidatePath(event: T.AgentEventListItem): string | undefined {
   return text(event.attributes.path, 4_096)
     ?? text(event.attributes.filePath, 4_096)
@@ -375,6 +401,7 @@ function potentialRelation(
   const command = toolCommand(event);
   const resource = toolResource(event);
   const host = toolHost(event) ?? interactionEndpointHost(interaction);
+  const endpointPort = interactionEndpointPort(interaction);
   const normalizedTool = (event.toolKind ?? event.toolName ?? 'other').toLowerCase();
   const acceptedKinds = /bash|exec|shell/u.test(normalizedTool)
     ? new Set(['ToolExec'])
@@ -415,6 +442,14 @@ function potentialRelation(
       linkMethod = 'network';
       confidence = 0.98;
     }
+  }
+  if (!linkMethod && endpointPort && candidate.eventKind === 'Egress'
+    && candidatePort(candidate) === endpointPort) {
+    // Kubernetes/service-mesh Egress observes a resolved ClusterIP while HTTP preserves the
+    // logical service name. Exact endpoint port plus Runtime and unique-candidate arbitration is
+    // the strongest transport fact available without depending on cluster DNS configuration.
+    linkMethod = 'network_endpoint';
+    confidence = 0.95;
   }
   if (!linkMethod && command && shellBootstrapCandidate(input, candidate)) {
     // Some Agent shells receive the actual command over stdin after an exec-time environment
@@ -502,13 +537,13 @@ export function buildSemanticKernelRelationBatch(
       .map((candidate) => potentialRelation(input, candidate, index, resolutionRevision))
       .filter((relation): relation is T.AgentSemanticKernelRelation => Boolean(relation));
     const contentRelations = potential.filter((relation) =>
-      relation.linkMethod !== 'shell_bootstrap');
-    const shellFallbacks = potential.filter((relation) =>
-      relation.linkMethod === 'shell_bootstrap');
+      !['shell_bootstrap', 'network_endpoint'].includes(relation.linkMethod ?? ''));
+    const boundedFallbacks = potential.filter((relation) =>
+      ['shell_bootstrap', 'network_endpoint'].includes(relation.linkMethod ?? ''));
     const relations = contentRelations.length > 0
       ? contentRelations
-      : shellFallbacks.length === 1
-        ? shellFallbacks
+      : boundedFallbacks.length === 1
+        ? boundedFallbacks
         : [];
     potentialBySemantic.set(semanticId, relations);
     for (const relation of relations) {
