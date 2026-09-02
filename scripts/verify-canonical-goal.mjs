@@ -1029,7 +1029,7 @@ async function main() {
   ]);
   const ssh = inspectSsh();
   const environments = {
-    host: { ...host, summary: host.checks.apiHealth.message },
+    host: { ...host, summary: host.checks.storage?.status === STATUS.PARTIAL ? host.checks.storage.message : host.checks.apiHealth.message },
     ssh: { ...ssh, summary: ssh.checks.runtime.message },
     docker: { ...docker, summary: docker.checks.apiHealth?.message || docker.checks.daemon.message },
     kubernetes: { ...kubernetes, summary: kubernetes.checks.nodePortHealth?.message || kubernetes.checks.api?.message },
