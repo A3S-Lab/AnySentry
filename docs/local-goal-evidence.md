@@ -42,6 +42,14 @@ node scripts/verify-canonical-goal.mjs --run-tests --json-out /tmp/canonical-goa
 
 14 项本地测试全部 `pass`（AnySentry build、双端 TypeScript、部署清单、Canonical contract/identity、会话/目录/绑定、Asset、Semantic-Kernel、Runtime、Templates、Observer cargo）；静态合同和 streaming optional boundary 也为 `pass`，`fail=0`。环境仍为 Host/Docker/Kubernetes `partial`、SSH `unexecuted`，四类代表对象 runtime evidence `unexecuted`，凭据扫描 `blocked`（既有 untracked/protected 文件，tracked=0），所以该结果是“本地代码与 QA 门禁通过”，不是代表性真实 E2E 完成。
 
+在 Observer checkpoint `3d50246…` 和 AnySentry QA checkpoint `0e17df8…` 均稳定后，最终复核再次执行：
+
+```text
+node scripts/verify-canonical-goal.mjs --run-tests --json-out /tmp/canonical-goal-final-round6.json
+```
+
+Round6 记录：14 项本地测试全部 `pass`；`fail=0`，tracked diff 前后为空，remote-write guard=`pass`。Host API 仅 memory fallback，Docker 没有本分支 API 容器，Kubernetes NodePort/ClickHouse/PostgreSQL 可用但存在 workspace-scanner 与 kind 降级，SSH 和四类代表对象真实 runtime evidence 仍分别为 `unexecuted`。该轮只验证本地代码/合同/运行时健康和回归，不替代代表性真实连续对话验收。
+
 ## 已确认事实
 
 ### 仓库与工作树
