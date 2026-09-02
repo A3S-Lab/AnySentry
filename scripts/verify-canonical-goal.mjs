@@ -807,6 +807,7 @@ async function inspectCanonicalContracts() {
     : result(STATUS.FAIL, 'product-name branch found in a forbidden core module', { files: forbiddenHits });
   checks.observerAbiAlignment = inspectObserverAbiAlignment();
   checks.streamingBoundary = inspectStreamingBoundary();
+  checks.boundedStateGuard = inspectBoundedStateGuard();
   return { checks, markers: matches };
 }
 
@@ -851,6 +852,25 @@ function inspectStreamingBoundary() {
     streamingProfile,
     apiDependsOnStreaming,
     streamingDefaultOff,
+  });
+}
+
+function inspectBoundedStateGuard() {
+  const attribution = readText('apps/api/src/security-monitoring/agent-attribution.service.ts');
+  const rememberStart = attribution.indexOf('private remember(');
+  const remember = rememberStart >= 0 ? attribution.slice(rememberStart, rememberStart + 2_400) : '';
+  const observerMain = readText('a3s-observer-collector/src/main.rs', observerRoot);
+  const attributionSafe = remember.length > 0
+    && !/this\.procs\.clear\(\)/u.test(remember)
+    && /evicted/u.test(attribution)
+    && /expired/u.test(attribution);
+  const observerSafe = !/(?:peers|llm_meta)[\s\S]{0,500}\.clear\(\)/u.test(observerMain);
+  if (attributionSafe && observerSafe) {
+    return result(STATUS.PASS, 'pressure paths use bounded eviction/TTL counters instead of global clear');
+  }
+  return result(STATUS.FAIL, 'a pressure path may globally clear state or lacks eviction accounting', {
+    attributionRememberSafe: attributionSafe,
+    observerSocketStateSafe: observerSafe,
   });
 }
 
