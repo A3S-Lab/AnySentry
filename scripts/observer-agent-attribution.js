@@ -113,6 +113,22 @@ function containerIdFromCgroup(value) {
     || cgroup.match(/(?:^|\/)([a-f0-9]{64})(?:\.scope)?(?:$|\/)/i)?.[1];
 }
 
+function cgroupIdFromCgroup(value) {
+  const relative = text(value)
+    .split(/\r?\n/u)
+    .map((line) => line.match(/^0::(.*)$/u)?.[1])
+    .find((candidate) => candidate !== undefined)
+    ?.trim()
+    .replace(/^\/+|\/+$/gu, '');
+  if (relative === undefined || relative.includes('..')) return undefined;
+  try {
+    const stat = fs.statSync(path.join('/sys/fs/cgroup', relative));
+    return stat.ino > 0 ? String(stat.ino) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function readProcInfo(pid, procRoot = '/proc') {
   try {
     const base = path.join(procRoot, String(pid));
@@ -140,7 +156,11 @@ function readProcInfo(pid, procRoot = '/proc') {
     try { argv = fs.readFileSync(path.join(base, 'cmdline'), 'utf8').split('\0').filter(Boolean).join(' '); } catch {}
     try { cgroup = fs.readFileSync(path.join(base, 'cgroup'), 'utf8'); } catch {}
     try { cwd = fs.readlinkSync(path.join(base, 'cwd')); } catch {}
-    return { pid, tgid, ppid, startTime, namespacePid, comm, exe, argv, cgroup, cwd };
+    const cgroupId = cgroupIdFromCgroup(cgroup);
+    return {
+      pid, tgid, ppid, startTime, namespacePid, comm, exe, argv, cgroup, cwd,
+      ...(cgroupId ? { cgroupId } : {}),
+    };
   } catch {
     return undefined;
   }
