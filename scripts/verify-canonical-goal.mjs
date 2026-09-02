@@ -523,7 +523,13 @@ function summarizeKubePods(pods) {
     phase: pod.status?.phase,
     ready: readyPod(pod),
     restarts: (pod.status?.containerStatuses || []).reduce((sum, item) => sum + Number(item.restartCount || 0), 0),
-    containers: (pod.status?.containerStatuses || []).map((item) => ({ name: item.name, ready: Boolean(item.ready), state: Object.keys(item.state || {})[0] || 'unknown' })),
+    containers: (pod.status?.containerStatuses || []).map((item) => ({
+      name: item.name,
+      ready: Boolean(item.ready),
+      state: Object.keys(item.state || {})[0] || 'unknown',
+      image: item.image,
+      imageId: typeof item.imageID === 'string' ? item.imageID.replace(/^.*@sha256:/u, 'sha256:').slice(0, 80) : undefined,
+    })),
   }));
 }
 
