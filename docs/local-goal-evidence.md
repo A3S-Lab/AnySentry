@@ -171,8 +171,9 @@ node scripts/verify-canonical-goal.mjs --json-out /tmp/anysentry-canonical-goal.
 3. Codex、Claude Code、Dify、LangChain/LangGraph fixture 存在性与显式 runtime evidence envelope；
 4. RawObservation、KernelFact/Process/Connection、SemanticRecord/LLM、Identity、EvidenceLink/RelationRevision、CoverageGap 合同 marker；
 5. 禁止产品名分支的核心文件扫描；
-6. 高置信度凭据字面量扫描（仅报告文件/类别，不报告值）；
-7. 不执行远程写入或 `git push`，并在执行前后比较工作树。
+6. bounded state pressure path 扫描（禁止 Agent attribution/Observer socket state 通过整体 `clear()` 止压，并要求淘汰/过期计数）；
+7. 高置信度凭据字面量扫描（仅报告文件/类别，不报告值）；
+8. 不执行远程写入或 `git push`，并在执行前后比较工作树。
 
 `--strict` 适合最终门禁：任何 blocked、partial 或 unexecuted 都会以非零退出；默认模式允许 QA 在环境尚未准备好时获得完整报告，而不是把缺口隐藏成失败或通过。`--run-tests` 还会运行 canonical contract/identity 脚本与 `verify-agent-asset-model`；后者若与新 unresolved-candidate 语义的旧断言不一致，会明确报告 `fail`，不会被忽略。
 
