@@ -325,6 +325,71 @@ assert.equal(
   'a trusted plaintext session header must become the product Conversation anchor',
 );
 
+const claudeMetadataRequest = {
+  model: 'claude-opus',
+  metadata: {
+    user_id: JSON.stringify({
+      device_id: 'fixture-device',
+      account_uuid: '',
+      session_id: 'claude-resume-session-fixture',
+    }),
+  },
+  messages: [{ role: 'user', content: [{ type: 'text', text: 'continued Claude turn' }] }],
+};
+const claudeMetadataEnvelope = structuredClone(transportSessionEnvelope);
+claudeMetadataEnvelope.event.LlmInteraction.interactionId =
+  `mi_${digest(`${runId}\0claude-metadata`).slice(0, 24)}`;
+delete claudeMetadataEnvelope.event.LlmInteraction.sessionId;
+claudeMetadataEnvelope.event.LlmInteraction.request = content(
+  JSON.stringify(claudeMetadataRequest),
+  { messages: [{ role: 'user', content: claudeMetadataRequest.messages[0].content }] },
+);
+claudeMetadataEnvelope.event.LlmInteraction.response = content(
+  JSON.stringify({
+    id: 'msg-claude-resume-fixture',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'continued' }],
+  }),
+  { text: 'continued' },
+);
+delete claudeMetadataEnvelope.event.LlmInteraction.providerConversationId;
+const claudeMetadataInteraction = parseObserverAgentInteraction(
+  JSON.stringify(claudeMetadataEnvelope),
+  {
+    workspacePath: '/root',
+    agentId: 'claude-code',
+    sessionId: '',
+    userId: '',
+    attributes: {},
+    classificationSemantics: {
+      schemaVersion: 'anysentry.classification_semantics.v1',
+      identityClassification: 'confirmed_agent',
+      workloadRole: 'agent',
+      captureProfile: 'agent_full',
+    },
+    process: processRootInteraction.process,
+    attribution: {
+      monitored: true,
+      classification: 'confirmed_agent',
+      confidence: 1,
+      source: 'host',
+      reason: 'authoritative_anchor',
+      agentScopeId: 'claude-code',
+      agentDisplayName: 'Claude Code',
+      agentInstanceId: processRootInteraction.agentInstanceId,
+      rootPid: 4242,
+      rootStartTime: '424200',
+      evidence: ['runtime_signature:commExact=claude'],
+    },
+  },
+);
+assert.equal(
+  claudeMetadataInteraction?.providerConversationId,
+  'claude-resume-session-fixture',
+  'Claude metadata.user_id JSON must become a durable provider Conversation anchor',
+);
+
 const ingest = await request('/ingest/batch', 'POST', {
   events: [{
     line,

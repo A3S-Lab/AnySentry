@@ -292,24 +292,76 @@ export function interactionHumanMessages(
     }));
 }
 
-function providerConversationValue(request: Record<string, unknown> | undefined): string | undefined {
-  if (!request) return undefined;
+function providerConversationValue(
+  request: Record<string, unknown> | undefined,
+  depth = 0,
+): string | undefined {
+  if (!request || depth > 3) return undefined;
+  for (const key of ['conversation_id', 'thread_id', 'session_id']) {
+    const direct = text(request[key]);
+    if (direct) return direct;
+  }
   const conversation = request.conversation;
-  const clientMetadata = record(request.client_metadata);
-  return text(request.conversation_id)
-    ?? text(request.thread_id)
-    ?? text(request.session_id)
-    ?? text(conversation)
-    ?? text(record(conversation)?.id)
-    ?? text(record(request.metadata)?.conversation_id)
-    ?? text(record(request.metadata)?.thread_id)
-    ?? text(record(request.metadata)?.session_id)
-    // Responses WebSocket clients can carry the resumable product Thread in client_metadata,
-    // including a generate=false prewarm followed by later generated turns. Treat the protocol
-    // field generically; no Codex version, executable, or provider URL is required.
-    ?? text(clientMetadata?.conversation_id)
-    ?? text(clientMetadata?.thread_id)
-    ?? text(clientMetadata?.session_id);
+  const conversationText = text(conversation)
+    ?? text(record(conversation)?.id);
+  if (conversationText) return conversationText;
+
+  // Claude Code sends metadata.user_id as a JSON-encoded object containing its resumable
+  // session_id. Codex-compatible clients may likewise put the same identity in a serialized
+  // turn-metadata field. Parse only these bounded, named metadata envelopes; never scan arbitrary
+  // prompt text for UUIDs.
+  for (const containerKey of ['metadata', 'client_metadata']) {
+    const container = record(request[containerKey]);
+    if (!container) continue;
+    const direct = providerConversationValue(container, depth + 1);
+    if (direct) return direct;
+  }
+  for (const encodedKey of ['user_id', 'x-codex-turn-metadata', 'turn_metadata']) {
+    const encoded = request[encodedKey];
+    if (record(encoded)) {
+      const nested = providerConversationValue(record(encoded), depth + 1);
+      if (nested) return nested;
+    }
+    if (typeof encoded === 'string' && Buffer.byteLength(encoded) <= 4 * 1024) {
+      try {
+        const nested = providerConversationValue(record(JSON.parse(encoded)), depth + 1);
+        if (nested) return nested;
+      } catch {
+        // Auxiliary metadata is optional; malformed values do not invalidate a conversation.
+      }
+    }
+  }
+  return undefined;
+}
+
+function providerTurnValue(
+  request: Record<string, unknown> | undefined,
+  depth = 0,
+): string | undefined {
+  if (!request || depth > 3) return undefined;
+  const direct = text(request.turn_id);
+  if (direct) return direct;
+  for (const containerKey of ['metadata', 'client_metadata']) {
+    const container = record(request[containerKey]);
+    const nested = providerTurnValue(container, depth + 1);
+    if (nested) return nested;
+  }
+  for (const encodedKey of ['x-codex-turn-metadata', 'turn_metadata']) {
+    const encoded = request[encodedKey];
+    if (record(encoded)) {
+      const nested = providerTurnValue(record(encoded), depth + 1);
+      if (nested) return nested;
+    }
+    if (typeof encoded === 'string' && Buffer.byteLength(encoded) <= 4 * 1024) {
+      try {
+        const nested = providerTurnValue(record(JSON.parse(encoded)), depth + 1);
+        if (nested) return nested;
+      } catch {
+        // Optional auxiliary metadata must not invalidate an otherwise valid request.
+      }
+    }
+  }
+  return undefined;
 }
 
 function continuityValue(request: Record<string, unknown> | undefined): string | undefined {
@@ -364,7 +416,7 @@ export function conversationAnchorsForInteraction(
   push('turn_id', interaction.runId, 'exact', 'http.x-anysentry-run-id');
   push(
     'turn_id',
-    text(record(request?.client_metadata)?.turn_id),
+    providerTurnValue(request),
     'exact',
     'client_metadata.turn_id',
   );

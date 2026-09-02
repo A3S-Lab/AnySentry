@@ -558,6 +558,12 @@ const filterRulePublisher = new FilterRulePublisher({
   maxSnapshotBytes: process.env.ANYSENTRY_CAPTURE_PROFILE_MAX_SNAPSHOT_BYTES,
 });
 const tlsAgentCgroupPublisher = new TlsAgentCgroupPublisher({ file: TLS_AGENT_CGROUPS_FILE });
+// Keep the most recent Docker inventory so the product-neutral TLS scope file can be refreshed
+// together with host/SSH runtime snapshots. A host CLI is not present in Docker inventory, but it
+// still has a stable process-root/cgroup identity for the lifetime of the session.
+let latestDockerIdentitySnapshot = { entries: [], version: 0, generatedAt: '' };
+let lastTlsScopeFingerprint = '';
+let tlsScopeProjectionVersion = 0;
 let lastCaptureProfileReportError = '';
 const captureProfileReporter = new CaptureProfileReporter({
   publisher: filterRulePublisher,
@@ -1795,6 +1801,7 @@ async function acquireRuntimeLease(maxAttempts = 1) {
 async function runtimeSnapshotBody(ready = true) {
   runtimeSnapshotVersion += 1;
   const processSnapshot = attributor.runtimeSnapshot();
+  publishTlsAgentRuntimeScope(processSnapshot);
   const enrichedProcessEntries = await systemdLaunchEnricher.enrichEntries(processSnapshot.entries);
   const rootedWorkloads = new Set(
     enrichedProcessEntries.map((entry) => entry.physicalWorkloadId).filter(Boolean),
@@ -1813,6 +1820,37 @@ async function runtimeSnapshotBody(ready = true) {
     intervalSecs: RUNTIME_SNAPSHOT_SECS,
     filterMode: FILTER_MODE,
   };
+}
+
+function publishTlsAgentRuntimeScope(processSnapshot = attributor.runtimeSnapshot()) {
+  const processEntries = Array.isArray(processSnapshot?.entries) ? processSnapshot.entries : [];
+  const dockerEntries = Array.isArray(latestDockerIdentitySnapshot?.entries)
+    ? latestDockerIdentitySnapshot.entries
+    : [];
+  const entries = [...dockerEntries, ...processEntries];
+  // Compare only the local admission facts. generatedAt/snapshotVersion are deliberately omitted
+  // from the fingerprint so the 5-second liveness timer does not rewrite an unchanged scope and
+  // make the Collector churn its TLS allowlist.
+  const fingerprint = JSON.stringify(entries.map((entry) => ({
+    cgroupId: text(entry?.cgroupId),
+    agentScopeId: text(entry?.agentScopeId),
+    agentInstanceId: text(entry?.agentInstanceId),
+    physicalWorkloadId: text(entry?.physicalWorkloadId),
+    classification: text(entry?.classification),
+    runtimeState: text(entry?.runtimeState),
+  })).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))));
+  if (fingerprint === lastTlsScopeFingerprint) return false;
+  lastTlsScopeFingerprint = fingerprint;
+  tlsScopeProjectionVersion += 1;
+  tlsAgentCgroupPublisher.publish({
+    version: Math.max(
+      Number(latestDockerIdentitySnapshot.version) || 0,
+      tlsScopeProjectionVersion,
+    ),
+    generatedAt: text(processSnapshot?.generatedAt) || new Date().toISOString(),
+    entries,
+  });
+  return true;
 }
 
 function sendRuntimeSnapshot(ready = true, done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS) {
@@ -3505,6 +3543,10 @@ async function start() {
     infrastructurePolicyTimer.unref();
   }
   const dockerStarted = await dockerDiscovery.start((snapshot) => {
+    latestDockerIdentitySnapshot = snapshot;
+    // Include already-discovered host/SSH roots whenever Docker inventory changes, while keeping
+    // the local projection idempotent when neither side's admission facts changed.
+    lastTlsScopeFingerprint = '';
     tlsAgentCgroupPublisher.publish(snapshot);
     if (workloadCache.replace(snapshot, 'docker')) synchronizeInfrastructurePolicyRules();
   });
@@ -3529,7 +3571,10 @@ async function start() {
   });
   runtimeSnapshotTimer = setInterval(() => sendRuntimeSnapshot(true), RUNTIME_SNAPSHOT_SECS * 1_000);
   runtimeSnapshotTimer.unref();
-  rootLivenessTimer = setInterval(() => attributor.checkRootLiveness(), ROOT_LIVENESS_SECS * 1_000);
+  rootLivenessTimer = setInterval(() => {
+    attributor.checkRootLiveness();
+    publishTlsAgentRuntimeScope();
+  }, ROOT_LIVENESS_SECS * 1_000);
   rootLivenessTimer.unref();
 
   rl.resume();

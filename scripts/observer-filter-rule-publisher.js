@@ -169,13 +169,18 @@ function captureEntryPriority(entry, captureProfileMode) {
 }
 
 function implicitDiscoveryDefault(entry) {
+  const hasStableRootIdentity = Number.isSafeInteger(Number(entry?.rootPid))
+    && Number(entry.rootPid) > 0
+    && Boolean(text(entry?.rootProcessKey));
   return (
     !text(entry?.ruleId)
     && entry?.conflict !== true
     && !text(entry?.promotionReason)
-    && !(Number.isSafeInteger(Number(entry?.rootPid))
-      && Number(entry.rootPid) > 0
-      && text(entry?.rootExecIdExact ?? entry?.rootExecId))
+    // A root ProcessKey is stable for the lifetime of the Agent process. Do not collapse such a
+    // candidate back to the Unknown/default matrix merely because an exec-generation field was
+    // absent on a network event; doing so makes a long-lived CLI lose later TLS turns when the
+    // short profile lease expires. PID/start-time fencing remains the authority for reuse.
+    && !hasStableRootIdentity
     && !isAgentKeepDecision(entry)
     && entry?.captureProfile !== 'investigation_full'
     && !(entry?.captureProfile === 'probable_investigation'

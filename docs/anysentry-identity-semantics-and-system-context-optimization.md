@@ -520,7 +520,7 @@ probable_agent 代表候选身份，但当前等同于 agent_full，容易让误
 | 身份和状态 | 默认档位 | 保留行为 |
 |---|---|---|
 | confirmed_agent | agent_full | Tool、关键 File/Network、Exec/Exit、安全证据高保真 |
-| probable_agent | probable_investigation | root Exec/Exit、安全事件 FULL；File/Network 有界 SAMPLE；短 TTL |
+| probable_agent | probable_investigation | root Exec/Exit、安全事件 FULL；普通 File/Network 有界 SAMPLE；TLS 明文交互 FULL；短 TTL |
 | unknown | unknown_discovery | 关键生命周期、首批样本、周期样本、精确计数 |
 | business_service | business_context | 指标、依赖、变化；syscall 聚合 |
 | platform / infrastructure | infrastructure_aggregate | 重复信号聚合；安全和生命周期保留 |

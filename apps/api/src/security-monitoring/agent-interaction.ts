@@ -121,6 +121,40 @@ function boundedJson(value: unknown, maxBytes = MAX_DERIVED_JSON_BYTES): unknown
   }
 }
 
+function providerConversationFromStructured(
+  value: unknown,
+  depth = 0,
+): string | undefined {
+  if (depth > 3) return undefined;
+  const object = record(value);
+  if (!object) return undefined;
+  for (const key of ['conversation_id', 'thread_id', 'session_id']) {
+    const candidate = string(object[key], 512);
+    if (candidate) return candidate;
+  }
+  const metadata = record(object.metadata) ?? record(object.client_metadata);
+  if (metadata) {
+    const direct = providerConversationFromStructured(metadata, depth + 1);
+    if (direct) return direct;
+  }
+  for (const key of ['user_id', 'x-codex-turn-metadata', 'turn_metadata']) {
+    const nested = object[key];
+    if (nested && typeof nested === 'object') {
+      const candidate = providerConversationFromStructured(nested, depth + 1);
+      if (candidate) return candidate;
+    }
+    if (typeof nested === 'string' && Buffer.byteLength(nested) <= 4 * 1024) {
+      try {
+        const candidate = providerConversationFromStructured(JSON.parse(nested), depth + 1);
+        if (candidate) return candidate;
+      } catch {
+        // Metadata strings are optional; malformed auxiliary metadata must not reject the body.
+      }
+    }
+  }
+  return undefined;
+}
+
 function decodedBody(body: string, encoding: 'utf8' | 'base64'): Buffer | undefined {
   if (encoding === 'utf8') return Buffer.from(body, 'utf8');
   if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(body)) {
@@ -533,7 +567,9 @@ export function parseObserverAgentInteraction(
   const runId = string(input.runId, 512);
   const sessionId = string(input.sessionId, 512);
   const invocationId = string(input.invocationId, 512);
-  const providerConversationId = string(input.providerConversationId, 512) ?? sessionId;
+  const providerConversationId = string(input.providerConversationId, 512)
+    ?? providerConversationFromStructured(request.structured)
+    ?? sessionId;
   const providerResponseId = string(input.providerResponseId, 512);
   const providerPreviousResponseId = string(input.providerPreviousResponseId, 512);
   const trafficRole = closedValue(input.trafficRole, TRAFFIC_ROLES);

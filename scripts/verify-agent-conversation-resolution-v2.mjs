@@ -504,6 +504,58 @@ assert.deepEqual(
   'only content observed after the collection boundary should become visible user Turns',
 );
 
+const claudeResumeSessionId = '7bbe3df2-b63a-46ad-9137-cfaa84f8cb25';
+const claudeResumeMetadata = {
+  user_id: JSON.stringify({
+    device_id: 'fixture-device',
+    account_uuid: '',
+    session_id: claudeResumeSessionId,
+  }),
+};
+const claudeResumeResolution = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_claude_resume_first',
+    at: base + 1_400,
+    instance: 'host-root:v2:claude-resume-one',
+    agentProduct: 'Claude Code',
+    path: '/v1/messages',
+    request: {
+      model: 'claude-opus',
+      metadata: claudeResumeMetadata,
+      messages: [{
+        role: 'user',
+        content: [{ type: 'text', text: 'first Claude turn' }],
+      }],
+    },
+    responseId: 'msg-claude-resume-first',
+  }),
+  interaction({
+    id: 'mi_v2_claude_resume_next',
+    at: base + 1_500,
+    instance: 'host-root:v2:claude-resume-two',
+    agentProduct: 'Claude Code',
+    path: '/v1/messages',
+    request: {
+      model: 'claude-opus',
+      metadata: claudeResumeMetadata,
+      messages: [{
+        role: 'user',
+        content: [{ type: 'text', text: 'continued Claude turn' }],
+      }],
+    },
+    responseId: 'msg-claude-resume-next',
+  }),
+]);
+assert.deepEqual(
+  [...new Set(claudeResumeResolution.conversationRecords
+    .map((item) => item.providerConversationId))],
+  [claudeResumeSessionId],
+  'Claude metadata.user_id JSON must become a provider Conversation anchor',
+);
+assert.equal(new Set(claudeResumeResolution.conversationRecords
+  .map((item) => item.conversationId)).size, 1,
+  'Claude resume turns must remain one Conversation across runtime instances');
+
 const backgroundOperationResolution = resolveAgentConversationsV2([
   interaction({
     id: 'mi_v2_model_search_backend',

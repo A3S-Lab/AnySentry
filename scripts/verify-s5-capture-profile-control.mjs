@@ -207,7 +207,7 @@ assert.equal(probable.expiresAt, new Date(fixedNow + 120_000).toISOString(),
   'probable investigation cannot inherit an unbounded or ordinary long-lived profile TTL');
 assert.deepEqual(probable.desiredProbeActions, {
   exec: 'full', exit: 'full', tls: 'sample', connect: 'sample', dns: 'sample',
-  file_access: 'sample', file_delete: 'sample', llm: 'full', ssl: 'sample', security: 'full', file_read: 'not_enabled',
+  file_access: 'sample', file_delete: 'sample', llm: 'full', ssl: 'full', security: 'full', file_read: 'not_enabled',
 });
 
 const implicitDiscovery = publisher('implicit-discovery-default', 'enforce');
@@ -224,6 +224,25 @@ const probableDefault = implicitDiscovery.observe(
 assert.equal(probableDefault.captureProfile, 'probable_investigation');
 assert.equal(probableDefault.implicitDefault, true);
 assert.equal(implicitDiscovery.entries.size, 0, 'probable investigation shares the bounded kernel default without epoch churn');
+const stablePublisher = publisher('stable-probable-root', 'enforce');
+const stableProbable = stablePublisher.observe(
+  { process: { pid: 81, cgroupId: '81' }, event: { Egress: { pid: 81 } } },
+  {
+    state: 'agent',
+    attribution: {
+      classification: 'probable_agent',
+      source: 'process_graph',
+      rootPid: 81,
+      rootKey: 'host:boot:81:1',
+      agentInstanceId: 'ari-stable-81',
+    },
+  },
+);
+assert.equal(stableProbable.implicitDefault, undefined,
+  'a live Agent root must keep a dedicated profile entry across lease refreshes');
+assert.equal(stablePublisher.entries.size, 1);
+assert.equal(stableProbable.desiredProbeActions.ssl, 'full',
+  'probable Agent TLS content must remain lossless after the first turn');
 const probableSecurityDefault = implicitDiscovery.observe(
   { process: { cgroupId: '82' }, event: { SecurityAction: { pid: 82, kind: 'setuid' } } },
   { state: 'agent', attribution: { classification: 'probable_agent', source: 'process_graph' } },

@@ -25,7 +25,15 @@ function cgroupId(value) {
 function tlsAgentCgroupDocument(snapshot) {
   const byCgroup = new Map();
   for (const entry of Array.isArray(snapshot?.entries) ? snapshot.entries.slice(0, MAX_ENTRIES) : []) {
-    if (entry?.classification !== 'confirmed_agent') continue;
+    // Docker inventory remains authoritative when it labels a cgroup confirmed_agent. The
+    // forwarder also supplies a generation-fenced process snapshot for host/SSH CLIs; keep a
+    // running runtime entry when it has an explicit cgroup and instance identity, even if it is
+    // still probable_agent. This local admission file is what lets TLS capture continue across a
+    // long idle period while the short control-plane lease is renewed.
+    const runtimeEntry = entry?.runtimeState === 'running'
+      && text(entry?.agentInstanceId)
+      && cgroupId(entry?.cgroupId);
+    if (entry?.classification !== 'confirmed_agent' && !runtimeEntry) continue;
     const id = cgroupId(entry.cgroupId);
     if (!id || byCgroup.has(id)) continue;
     const agentScopeId = text(entry.agentScopeId).slice(0, 160);

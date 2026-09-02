@@ -30,7 +30,11 @@ const PROFILE_PROBE_ACTIONS = Object.freeze({
   investigation_full: ALL_FULL_PROBE_ACTIONS,
   probable_investigation: Object.freeze({
     exec: 'full', exit: 'full', tls: 'sample', connect: 'sample', dns: 'sample',
-    file_access: 'sample', file_delete: 'sample', llm: 'full', ssl: 'sample', security: 'full', file_read: 'full',
+    // Once a process signature identifies an Agent, TLS plaintext is the primary observable. A
+    // streamed Rustls conversation can consume the shared sample budget on its first response;
+    // sampling here therefore makes later turns disappear even though the process remains alive.
+    // Keep this one content channel lossless for the bounded candidate profile.
+    file_access: 'sample', file_delete: 'sample', llm: 'full', ssl: 'full', security: 'full', file_read: 'full',
   }),
   security_full: Object.freeze({
     exec: 'full', exit: 'full', tls: 'sample', connect: 'full', dns: 'sample',

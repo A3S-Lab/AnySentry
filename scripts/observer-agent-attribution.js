@@ -873,6 +873,9 @@ class AgentAttributor {
         rootPid: root.pid,
         rootStartTimeTicks: root.startTime,
         rootGeneration: root.generation,
+        // Kept as a local scope hint for the TLS collector. The API sanitizer intentionally does
+        // not expose this kernel cgroup inode as part of the public runtime identity contract.
+        cgroupId: root.cgroupId || undefined,
         hostId: root.hostId,
         bootId: root.bootId,
         comm: root.comm || undefined,

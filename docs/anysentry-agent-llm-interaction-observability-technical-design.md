@@ -496,7 +496,7 @@ Codex 0.150.1 使用 custom Responses provider、`supports_websockets=false`。�
 `CAPTURE_PROFILE_ACTIONS` 当前行为：
 
 - `agent_full`、`investigation_full`：SSL full；
-- `probable_investigation`：SSL full，使 Candidate 在识别后的有效窗口逐次采集；
+- `probable_investigation`：SSL full，使 Candidate 在识别后逐次采集；进程代际和本地 TLS scope 维持资格，避免短期租约/空闲导致后续轮次缺失；
 - `security_full`、`business_context`、`infrastructure_aggregate`、`unknown_discovery`、`self_health`：SSL `not_enabled`。
 
 即使 profile 选择 full，内核仍需 process map 和 route Gate。Unknown profile 的 `llm` 元数据可以 full，但不等于允许 SSL body。

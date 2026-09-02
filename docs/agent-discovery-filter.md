@@ -284,7 +284,7 @@ Routing policy:
 | Classification | Lifecycle | Security signal | Normal Agent-relevant event | Routine noise |
 |---|---:|---:|---:|---:|
 | confirmed_agent | keep | keep | keep | aggregate/deduplicate |
-| probable_agent | keep | keep | keep within budget | sample |
+| probable_agent | keep | keep | keep within budget（TLS 明文交互 FULL） | sample |
 | unknown | keep | keep | keep within discovery budget | sample |
 | non_agent | cleanup only | keep | filter in `agent` mode | aggregate/filter |
 
