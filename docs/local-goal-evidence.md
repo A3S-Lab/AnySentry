@@ -40,11 +40,13 @@ Conversation Tracking browser (4 viewports)       PASS (temporary API, synthetic
 Agent/Event + Tool Inspector browser               PASS (temporary API, synthetic model/tool)
 ```
 
-最新 `verify-canonical-goal.mjs --run-tests` 结果为 `pass=57`、`partial=5`、`blocked=4`、
-`unexecuted=7`、`fail=0`（73 个状态）。静态 raw/kernel/semantic/identity/correlation/
-coverage、产品分支、Observer ABI、Kafka/Flink optional boundary 和 bounded-state guard
-均为 pass；credential scan 仍为 blocked（10 个既有 untracked/protected 文件，tracked
-finding=0），remote-write guard 为 pass。
+固定 API 短验收回合的结果为 `pass=57`、`partial=5`、`blocked=4`、`unexecuted=7`、
+`fail=0`（73 个状态）。在 API 已按清理流程停止后再次执行提交后总门禁，环境探针如实变为
+`pass=56`、`partial=3`、`blocked=7`、`unexecuted=7`、`fail=0`；新增的 blocked 主要是
+故意关闭的 Host API 和无本分支容器，而不是代码测试失败。两回合的静态 raw/kernel/semantic/
+identity/correlation/coverage、产品分支、Observer ABI、Kafka/Flink optional boundary 和
+bounded-state guard 均为 pass；credential scan 仍为 blocked（10 个既有 untracked/protected
+文件，tracked finding=0），remote-write guard 为 pass。
 
 验证脚本创建的 Source（包括 negative-path 自动发现的 Source）在最终固定 API 上均已设为
 `enabled=false`；Source 记录保留用于审计，没有删除业务数据。最终临时 API 进程已停止，
