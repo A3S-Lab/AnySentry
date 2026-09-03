@@ -10,6 +10,7 @@
 - AnySentry/Observer 构建、类型、单元/回放和 BPF object load smoke 仍通过；这不等于当前头 Observer 已在目标 workload 上完成独占 attach、转发和持久部署。
 - 临时 k3s API/Web OCI overlay `anysentry:goal-current-oci-20260904` 已构建成功并通过本机 registry manifest GET 200（digest 前缀 `043180…`）；namespace `anysentry-goal-oci-web-20260904` 以 Secret/no-hostPath 完成 health、`/v1/observability/contracts`、representative replay 13/4 families/0 gap、S6、S2 shadow 后已清理。基座仍是旧 runtime + current dist overlay，非原始 Dockerfile 全链；Observer scripts overlay 也已构建并推入本机 registry（digest 前缀 `7d3b…`），但 existing formal deployment 未切换。
 - `tender_jang` 已确认安装 Codex CLI 0.149.1、Claude Code 2.1.251，并包含 LangChain/LangGraph 库；产品级 fixture 闭环不自动等同于被动 eBPF 观测。
+- `tender_jang` 内新 CA 的临时 HTTPS fixture + LangChain 副本已 `/invoke=200`，`lookup_fixture` 一次调用/结果匹配；现有常驻服务仍因过期测试证书 502，临时目录/进程已清理。
 - Dify LLM/tool 两个 workflow 本回合均 HTTP 200、脚本 rc=0；durable `dify-observation-lab` 快照有 55 条事件，但测试 CA 校验失败使 debug hash 对账为 partial，correlation method 全部 unassigned。
 - LangGraph 在本地 k3s 的真实 `/runs` 调用与 durable API 查询已经产生可审计事件；但语义 lane 与 Kernel lane 当前仍有 `correlation unassigned`/`agent_adapter` 缺口，不能写成全链路统一通过。
 - 当前 SSH Codex 初始 durable 快照有 60 条 `LlmInteraction`（model 56、tool 4），后续异步 `agents/interactions` 重查可到 model 57、tool 4；4 个 tool 均 parsed/complete（toolCall4/toolResult4），model57 parsed 且 request/response wire complete，但 conversation complete 仅 2、tool_pending 55，选定 Tool 的 EvidenceLink inspector 返回 404。另有 2 条 metadata-only/unparsed Rustls plaintext evidence，identity/session/run 仍是 runtime/probable 提示；不能声称当前对话正文原文已完整落盘或已确认归属。
@@ -36,7 +37,8 @@
 | 旧 k3s 身份反例 | 旧 k3s API image digest/revision 下，同一 Docker cgroup 的历史 LangChain 与 Claude Code 均有 `LlmInteraction`，却被合并到同一旧 agentAsset/session/run；Observer source/profile 可见但 cgroup map 仍把 Codex/Claude/LangChain 标为同一 `langchain` scope | 这是旧部署的真实混合身份/误合并反例；current-head 尚未部署，必须用 ProcessGeneration + Adapter/definition fence 拆分，不能把旧 asset 当 confirmed LogicalAgent |
 | Codex/Claude 本地 fixture | 本回合各完成两阶段请求—ToolCall—ToolResult—最终回复闭环 | 证明产品级协议/适配器闭环；不是当前 Observer 被动 eBPF 捕获证明 |
 | LangChain 临时 HTTP 副本 | 本地 HTTP 服务的工具闭环返回 HTTP 200 | 证明 HTTP transport、工具路由和结果回传可验证；不外推到常驻 HTTPS |
-| LangChain 常驻 HTTPS 服务 | 请求返回 HTTP 502；服务使用的本地测试证书已过期且为自签名 CA | 这是 TLS 信任/证书生命周期问题，不是把 502 当作解析通过；尚未轮换测试证书后重跑 |
+| LangChain 临时 HTTPS 重试 | 新 CA 的临时 HTTPS fixture + LangChain 副本 `/invoke=200`，`lookup_fixture` tool/result 成功，临时资源已清理 | HTTPS transport/Parser/工具闭环通过；不外推到常驻服务 |
+| LangChain 常驻 HTTPS 服务 | 请求返回 HTTP 502；服务使用的本地测试证书已过期且为自签名 CA | 这是既有服务的证书生命周期问题；需要轮换常驻 fixture 证书后再做该服务的被动观测验收 |
 | Dify 实际重跑 | LLM 与 tool 两个 workflow 均 HTTP 200，脚本 rc=0；仅用于诊断的本地 CA-bypass 读取看到 llm-mock 3 条 `/v1/chat/completions`、tool-mock 2 条 `/tool/execute`，均 status200/HTTP1.1 且有 hash 字段，RAG selected marker=1、internal sentinel=0；官方 debug reconciliation curl 因测试 CA 校验失败 | workflow 调用与边界 marker 通过；hash 对账仍 partial，CA-bypass 不作为安全通过 |
 | Dify Durable API | `detectedName=dify-observation-lab` 当前快照 55 事件：`Egress=44`、`ToolExec=8`、`LlmInteraction=3`；`captureSelected=55`，`identity exact=54/weak=1` | correlation method 全部 `unassigned`，两条 lane 尚未统一 |
 | k3s LangGraph `/runs` | 本地 namespace `anysentry-observability-lab` 的 LangGraph workflow Pod（本地镜像、服务端口 8000）`/healthz=200`，OpenAPI 暴露 `/runs` POST 和 `/runs/{run_id}` GET；同一 Session 连续两次 Run 均 `completed`；阶段包含 `planner`、`code_generator`、`verifier`、`finalizer`；sandbox exit code=0，verification=pass；每次 `telemetry accepted=10` | 真实本地 k3s 服务调用，不等同于所有 KernelFact 已和语义事件唯一关联 |
@@ -55,7 +57,7 @@
 ### 推断（不作为通过条件）
 
 - `tender_jang` 中的二进制和库足以支撑受控产品级调用，但没有 Docker CLI/socket，不能把它写成“Docker 编排或当前头 AnySentry 容器已运行”。
-- LangChain 临时 HTTP 200 说明通用 HTTP/工具适配链可回放；常驻 HTTPS 的 502 已定位到过期自签名测试证书，不能推断 Parser、Observer 或业务 Run 已失败/成功。
+- LangChain 临时 HTTP/新 CA HTTPS 均能完成工具闭环；常驻 HTTPS 的 502 已定位到过期自签名测试证书，不能推断 Parser、Observer 或业务 Run 已失败/成功。
 - LangGraph 的 19 条耐久事件和每次 telemetry 10 条说明 API/存储链确实接收了记录；`correlation unassigned` 与 `agent_adapter` 计数说明语义 lane 与 Kernel lane 仍未完成统一 EvidenceLink，不能把事件数当作全链路闭环数。
 - 当前 SSH durable 查询已经证明 Observer 协议层可解析 Interaction，且 request roles 证明本次 SSH 对话进入 semantic lane；初始窗口 60 条与后续约 63 条是异步耐久写入的不同时点快照，不应把任一计数当成不可变总数。2 条 Rustls plaintext evidence 仍为 metadata-only/unparsed，identity/session/run 只是 runtime/probable 提示，EvidenceLink inspector 仍 404；早期 Egress-only 是旧时间窗快照，不能覆盖当前结果。
 
@@ -74,7 +76,7 @@
 | Codex CLI | `tender_jang` 0.149.1；本地 fixture 两阶段 ToolCall/Result 闭环；SSH durable custom-window 初始快照 60（model 56/tool 4），后续异步 `agents/interactions` 约 63 records（model 57/tool 4 + 2 unsupported/unparsed） | Observer 解析通过；tool4 parsed/complete、toolCall4/toolResult4；conversation complete2/tool_pending55；2 条 Rustls plaintext evidence metadata-only/unparsed，identity/session/run 非 authenticated/confirmed，选定 Tool inspector 404 | partial |
 | Claude Code | `tender_jang` 2.1.251；本地 fixture 两阶段 ToolCall/Result 闭环 | 本回合未取得该容器进程的被动 LLM Interaction | partial |
 | Dify Workflow/Chatflow | LLM/tool 两个 workflow 本回合均 HTTP 200、脚本 rc=0；debug reconciliation curl 因测试 CA 校验失败 | durable snapshot `detectedName=dify-observation-lab` 共 55 事件（Egress44/ToolExec8/LlmInteraction3，captureSelected55，identity exact54/weak1）；correlation method 全 unassigned；hash 对账 partial | partial |
-| LangChain/LangGraph | LangChain HTTP 临时副本 200；常驻 HTTPS 502；k3s LangGraph 两次同 Session 成功 + 一次 RuntimeError 仍上报 3 事件 | durable LangGraph 19 事件，但 `unassigned=13`、`agent_adapter=6`，两 lane 未统一 | partial |
+| LangChain/LangGraph | LangChain HTTP 临时副本 200；新 CA HTTPS 临时副本 200/tool loop；常驻 HTTPS 502（过期证书）；k3s LangGraph 两次同 Session 成功 + 一次 RuntimeError 仍上报 3 事件 | durable LangGraph 19 事件，但 `unassigned=13`、`agent_adapter=6`，两 lane 未统一 | partial |
 
 ## 上一轮冻结 QA 回合（2026-09-03，历史 dirty 工作树快照）
 
@@ -327,7 +329,7 @@ node scripts/verify-canonical-goal.mjs --json-out /tmp/anysentry-canonical-goal.
 ## 真正未决项与下一步
 
 - 当前文档与 v2/V4 历史设计仍有少量旧现场数字/镜像/入口声明；这些声明不作为本轮通过证据，后续应继续以最新脱敏 gate JSON 和本地 checkpoint 替换或明确标注历史。
-- `tender_jang` 的 Codex/Claude 产品级 fixture 与 LangChain HTTP 副本已通过，但尚未证明这些进程经过当前头 Observer 被动捕获并进入 canonical API；LangChain 常驻 HTTPS 还需轮换过期自签名测试证书后重试。
+- `tender_jang` 的 Codex/Claude 产品级 fixture 与 LangChain HTTP/新 CA HTTPS 临时副本已通过，但尚未证明这些进程经过当前头 Observer 被动捕获并进入 canonical API；常驻 HTTPS 仍需轮换过期自签名测试证书后重试。
 - Dify 两个 workflow 已重跑成功，durable `dify-observation-lab` 也有 55 条事件；但 debug hash reconciliation 因测试 CA 校验失败，且全部 correlation method 为 `unassigned`，所以 hash 对账和两 lane 关联仍是 partial。
 - k3s LangGraph `/runs` 已有同 Session 的两次成功 Run、失败 Run 的 3 事件保留和 19 条耐久记录，但 `correlation unassigned=13`、`agent_adapter=6` 表明两条 lane 尚未统一，需补 Adapter/Relation revision 与双向查询验证。
 - 当前 SSH Codex（native PID 1101287）的初始 custom-window 快照有 60 条 parsed/confirmed/complete `LlmInteraction`（model 56、tool 4），后续异步 `agents/interactions` 可到约 63 records（model57/tool4 + 2 unsupported/unparsed）；request roles 已证明 semantic lane 进入，但 2 条 Rustls plaintext evidence 为 metadata-only/unparsed，identity/session/run 未达到 authenticated AgentAdapter/confirmed Session，且选定 Tool 的 EvidenceLink inspector 404。没有证据表明本助手对话正文已按 Canonical contract 完整落盘或可按业务会话确认归属。
