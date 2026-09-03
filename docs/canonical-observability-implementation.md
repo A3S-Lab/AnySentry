@@ -62,7 +62,7 @@ k3s Pod 中以 Aya `Program::load` 逐项加载了
 | 旧 k3s 身份反例 | 旧 k3s API image digest/revision 下，同一 Docker cgroup 的历史 LangChain 与 Claude Code 均有 `LlmInteraction`，却被合并到同一旧 agentAsset/session/run；Observer source/profile 可见但 cgroup map 仍把 Codex/Claude/LangChain 标为同一 `langchain` scope | 这是旧部署的真实混合身份/误合并反例；current-head 尚未部署，必须用 ProcessGeneration + Adapter/definition fence 拆分，不能把旧 asset 当 confirmed LogicalAgent |
 | Codex/Claude fixture | 本回合各完成两阶段请求、ToolCall、ToolResult、最终回复 | 产品级协议/适配闭环通过；不等于被动 eBPF 捕获或 durable API 投影通过 |
 | LangChain 临时 HTTP 副本 | 工具闭环返回 HTTP 200 | 证明本地 HTTP transport/工具路由可运行；不外推到 HTTPS 或生产服务 |
-| LangChain 常驻 HTTPS | 返回 HTTP 502，根因是客户端未信任自签名证书 | 属于 TLS 信任/部署失败路径；尚未在修复信任链后重试，不能把 502 当作 parser 通过或 parser 失败 |
+| LangChain 常驻 HTTPS | 返回 HTTP 502；服务使用的本地测试证书已过期且为自签名 CA | 属于 TLS 信任/证书生命周期失败路径；尚未轮换测试证书后重试，不能把 502 当作 parser 通过或 parser 失败 |
 | Dify 实际重跑 | LLM/tool 两个 workflow 均 HTTP 200、脚本 rc=0；debug reconciliation curl 因测试 CA 校验失败 | workflow 调用通过；hash 对账仍 partial |
 | Dify Durable API | exact `detectedName=dify-observation-lab` 当前快照 55 事件：Egress44、ToolExec8、LlmInteraction3；captureSelected55；identity exact54/weak1 | correlation method 全 `unassigned`，两条 lane 未统一 |
 | k3s LangGraph | namespace `anysentry-observability-lab` 的本地 LangGraph workflow Pod（服务端口 8000，`/healthz=200`；OpenAPI 有 `/runs` POST 和 `/runs/{run_id}` GET）；同一 Session 的 `/runs` 连续两次 `completed`；阶段有 `planner`、`code_generator`、`verifier`、`finalizer`；sandbox exit=0、verification=pass；每次 telemetry accepted=10 | 真实本地 k3s 服务证据；仍需逐事件核对 KernelFact/EvidenceLink |
@@ -81,7 +81,7 @@ k3s Pod 中以 Aya `Program::load` 逐项加载了
 ### 推断（非通过条件）
 
 - `tender_jang` 的安装内容足以运行受控 CLI/框架 fixture，但因无 Docker CLI/socket，不能将它描述为可从容器内启动或管理 Docker Agent。
-- LangChain 临时 HTTP 200 说明通用 HTTP/工具路径可验证；常驻 HTTPS 502 更可能是自签名 CA 未进入客户端信任链，必须在修复后重新取得证据。
+- LangChain 临时 HTTP 200 说明通用 HTTP/工具路径可验证；常驻 HTTPS 502 已定位到过期自签名测试证书，必须轮换证书后重新取得证据。
 - LangGraph 的 19 条耐久记录和两次每次 10 条 telemetry 表明 API/存储至少接收了这些事件；`unassigned` 与 `agent_adapter` 计数则表明语义 lane、Kernel lane 与 Adapter 关联仍未完成。
 - 当前 SSH durable 查询已经证明协议层可解析 Interaction，request roles 也证明本次 SSH 对话进入 semantic lane；初始 60 条与后续约 63 条是不同时点的异步耐久快照，不应当作不可变总数。`metadata_only/unparsed` 的两条 AgentPlaintextEvidence、运行时级 identity/session/run、未确认的 Adapter 和 EvidenceLink inspector 404 仍限制正文与统一证据结论；早期 Egress-only 只是旧时间窗快照。
 
@@ -353,7 +353,7 @@ workload 转发仍按环境矩阵标记为未验证。
 | `tender_jang` 运行时盘点 | `node:24-bookworm`；Codex 0.149.1、Claude Code 2.1.251；LangChain 1.3.17、LangGraph 1.2.11 | 容器无 published port、Docker socket、Docker CLI；可运行库不等于容器编排或 Observer 接入 |
 | Codex/Claude 本地 fixture | 各两阶段请求—ToolCall—ToolResult—final 成功 | 协议/适配器闭环；非被动 eBPF 证据 |
 | LangChain 临时 HTTP 副本 | 工具闭环 HTTP 200 | HTTP transport 与工具结果回传可验证 |
-| LangChain 常驻 HTTPS | HTTP 502；客户端未信任自签名证书 | TLS trust/deployment gap；修复信任链后未重跑 |
+| LangChain 常驻 HTTPS | HTTP 502；本地测试证书已过期且为自签名 CA | TLS trust/certificate-lifecycle gap；轮换证书后未重跑 |
 | Dify 实际重跑 | LLM/tool 两个 workflow 均 HTTP200、脚本 rc0；debug reconciliation curl 因测试 CA 校验失败 | workflow 运行通过，hash reconciliation partial |
 | Dify Durable API | exact `detectedName=dify-observation-lab` 当前快照 55 事件（Egress44/ToolExec8/LlmInteraction3）；captureSelected55；identity exact54/weak1 | correlation method 全 unassigned；统一证据 partial |
 | k3s LangGraph `/runs` | namespace `anysentry-observability-lab` 的本地服务 `/healthz=200`；同一 Session 两次 `completed`；`planner → code_generator → verifier → finalizer`；sandbox exit0、verification pass；每次 telemetry accepted10 | 真实服务 Run 语义通过；Kernel 关系仍需单独验证 |
@@ -411,7 +411,7 @@ Kafka/Flink 只在已有可选 profile 中保留，未成为 Canonical 主链前
 5. Host 当前没有 durable ClickHouse/PostgreSQL，Canonical hot state 可查但重启后不等价于持久化验证；
 6. Relational sink 的兼容 bool 返回值尚未细分 conflict 与 unavailable；
 7. `tender_jang` 虽有 CLI/框架运行库，但无 Docker CLI/socket；容器内产品级 fixture 不能替代当前头镜像和 Observer 端到端部署；
-8. LangChain 常驻 HTTPS 当前因自签名证书未受信而返回 502，尚未完成信任链修复后的重试；
+8. LangChain 常驻 HTTPS 当前因过期自签名测试证书返回 502，尚未完成证书轮换后的重试；
 9. k3s LangGraph 已有真实 `/runs` 和耐久事件，但 `correlation unassigned=13`、`agent_adapter=6`，两条证据 lane 尚未统一；
 10. 当前 SSH Codex durable custom-window 初始快照为 60 条 parsed/confirmed/complete `LlmInteraction`（model 56、tool 4），后续异步 `agents/interactions` 可到约 63 records（model57/tool4 + 2 unsupported/unparsed；complete6/partial55/unsupported2）；identity/session/run 仍为 runtime/probable 提示，2 条 Rustls plaintext evidence 是 metadata-only/unparsed，且 conversation complete2/tool_pending55、选定 Tool inspector 404；普通 SSH `CapEff=0` 且 `unprivileged_bpf_disabled=2`，不能据此声称正文原文完整可见；
 11. existing formal AnySentry 仍为旧 image digest、canonical GET 未切换正式部署，`critical_inbox_dropped` 约 1.89M（最近观测且继续上涨），且 static signature warnings 仍存在；这些运行可靠性缺口和风险尚未消除；

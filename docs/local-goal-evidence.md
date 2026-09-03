@@ -36,7 +36,7 @@
 | 旧 k3s 身份反例 | 旧 k3s API image digest/revision 下，同一 Docker cgroup 的历史 LangChain 与 Claude Code 均有 `LlmInteraction`，却被合并到同一旧 agentAsset/session/run；Observer source/profile 可见但 cgroup map 仍把 Codex/Claude/LangChain 标为同一 `langchain` scope | 这是旧部署的真实混合身份/误合并反例；current-head 尚未部署，必须用 ProcessGeneration + Adapter/definition fence 拆分，不能把旧 asset 当 confirmed LogicalAgent |
 | Codex/Claude 本地 fixture | 本回合各完成两阶段请求—ToolCall—ToolResult—最终回复闭环 | 证明产品级协议/适配器闭环；不是当前 Observer 被动 eBPF 捕获证明 |
 | LangChain 临时 HTTP 副本 | 本地 HTTP 服务的工具闭环返回 HTTP 200 | 证明 HTTP transport、工具路由和结果回传可验证；不外推到常驻 HTTPS |
-| LangChain 常驻 HTTPS 服务 | 请求返回 HTTP 502，直接原因是客户端未信任自签名证书 | 这是 TLS 信任/部署问题，不是把 502 当作解析通过；尚未在修复信任链后重跑 |
+| LangChain 常驻 HTTPS 服务 | 请求返回 HTTP 502；服务使用的本地测试证书已过期且为自签名 CA | 这是 TLS 信任/证书生命周期问题，不是把 502 当作解析通过；尚未轮换测试证书后重跑 |
 | Dify 实际重跑 | LLM 与 tool 两个 workflow 均 HTTP 200，脚本 rc=0；仅用于诊断的本地 CA-bypass 读取看到 llm-mock 3 条 `/v1/chat/completions`、tool-mock 2 条 `/tool/execute`，均 status200/HTTP1.1 且有 hash 字段，RAG selected marker=1、internal sentinel=0；官方 debug reconciliation curl 因测试 CA 校验失败 | workflow 调用与边界 marker 通过；hash 对账仍 partial，CA-bypass 不作为安全通过 |
 | Dify Durable API | `detectedName=dify-observation-lab` 当前快照 55 事件：`Egress=44`、`ToolExec=8`、`LlmInteraction=3`；`captureSelected=55`，`identity exact=54/weak=1` | correlation method 全部 `unassigned`，两条 lane 尚未统一 |
 | k3s LangGraph `/runs` | 本地 namespace `anysentry-observability-lab` 的 LangGraph workflow Pod（本地镜像、服务端口 8000）`/healthz=200`，OpenAPI 暴露 `/runs` POST 和 `/runs/{run_id}` GET；同一 Session 连续两次 Run 均 `completed`；阶段包含 `planner`、`code_generator`、`verifier`、`finalizer`；sandbox exit code=0，verification=pass；每次 `telemetry accepted=10` | 真实本地 k3s 服务调用，不等同于所有 KernelFact 已和语义事件唯一关联 |
@@ -55,7 +55,7 @@
 ### 推断（不作为通过条件）
 
 - `tender_jang` 中的二进制和库足以支撑受控产品级调用，但没有 Docker CLI/socket，不能把它写成“Docker 编排或当前头 AnySentry 容器已运行”。
-- LangChain 临时 HTTP 200 说明通用 HTTP/工具适配链可回放；常驻 HTTPS 的 502 更接近证书信任配置缺口，不能推断 Parser、Observer 或业务 Run 已失败/成功。
+- LangChain 临时 HTTP 200 说明通用 HTTP/工具适配链可回放；常驻 HTTPS 的 502 已定位到过期自签名测试证书，不能推断 Parser、Observer 或业务 Run 已失败/成功。
 - LangGraph 的 19 条耐久事件和每次 telemetry 10 条说明 API/存储链确实接收了记录；`correlation unassigned` 与 `agent_adapter` 计数说明语义 lane 与 Kernel lane 仍未完成统一 EvidenceLink，不能把事件数当作全链路闭环数。
 - 当前 SSH durable 查询已经证明 Observer 协议层可解析 Interaction，且 request roles 证明本次 SSH 对话进入 semantic lane；初始窗口 60 条与后续约 63 条是异步耐久写入的不同时点快照，不应把任一计数当成不可变总数。2 条 Rustls plaintext evidence 仍为 metadata-only/unparsed，identity/session/run 只是 runtime/probable 提示，EvidenceLink inspector 仍 404；早期 Egress-only 是旧时间窗快照，不能覆盖当前结果。
 
@@ -327,7 +327,7 @@ node scripts/verify-canonical-goal.mjs --json-out /tmp/anysentry-canonical-goal.
 ## 真正未决项与下一步
 
 - 当前文档与 v2/V4 历史设计仍有少量旧现场数字/镜像/入口声明；这些声明不作为本轮通过证据，后续应继续以最新脱敏 gate JSON 和本地 checkpoint 替换或明确标注历史。
-- `tender_jang` 的 Codex/Claude 产品级 fixture 与 LangChain HTTP 副本已通过，但尚未证明这些进程经过当前头 Observer 被动捕获并进入 canonical API；LangChain 常驻 HTTPS 还需先解决自签名证书信任。
+- `tender_jang` 的 Codex/Claude 产品级 fixture 与 LangChain HTTP 副本已通过，但尚未证明这些进程经过当前头 Observer 被动捕获并进入 canonical API；LangChain 常驻 HTTPS 还需轮换过期自签名测试证书后重试。
 - Dify 两个 workflow 已重跑成功，durable `dify-observation-lab` 也有 55 条事件；但 debug hash reconciliation 因测试 CA 校验失败，且全部 correlation method 为 `unassigned`，所以 hash 对账和两 lane 关联仍是 partial。
 - k3s LangGraph `/runs` 已有同 Session 的两次成功 Run、失败 Run 的 3 事件保留和 19 条耐久记录，但 `correlation unassigned=13`、`agent_adapter=6` 表明两条 lane 尚未统一，需补 Adapter/Relation revision 与双向查询验证。
 - 当前 SSH Codex（native PID 1101287）的初始 custom-window 快照有 60 条 parsed/confirmed/complete `LlmInteraction`（model 56、tool 4），后续异步 `agents/interactions` 可到约 63 records（model57/tool4 + 2 unsupported/unparsed）；request roles 已证明 semantic lane 进入，但 2 条 Rustls plaintext evidence 为 metadata-only/unparsed，identity/session/run 未达到 authenticated AgentAdapter/confirmed Session，且选定 Tool 的 EvidenceLink inspector 404。没有证据表明本助手对话正文已按 Canonical contract 完整落盘或可按业务会话确认归属。
