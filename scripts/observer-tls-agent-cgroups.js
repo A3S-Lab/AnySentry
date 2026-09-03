@@ -22,6 +22,35 @@ function cgroupId(value) {
   }
 }
 
+function positivePid(value) {
+  const normalized = text(value);
+  if (!/^\d{1,20}$/u.test(normalized)) return undefined;
+  const parsed = Number(normalized);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function rootStartTimeTicks(value) {
+  const normalized = text(value);
+  return /^\d{1,32}$/u.test(normalized) && BigInt(normalized) > 0n
+    ? normalized
+    : undefined;
+}
+
+function processFence(entry) {
+  const rootPid = positivePid(entry?.rootPid);
+  const rootStart = rootStartTimeTicks(entry?.rootStartTimeTicks ?? entry?.rootStartTime);
+  // A half-present fence is not an admission proof. Keep the entry as legacy only when no
+  // competing identity exists; the Collector treats any mixed fenced/legacy cgroup as a
+  // conflict and will not perform a broad cgroup admission.
+  if (!rootPid || !rootStart) return undefined;
+  return {
+    rootPid,
+    rootStartTimeTicks: rootStart,
+    ...(text(entry?.rootProcessKey) ? { rootProcessKey: text(entry.rootProcessKey).slice(0, 512) } : {}),
+    ...(text(entry?.agentInstanceId) ? { agentInstanceId: text(entry.agentInstanceId).slice(0, 512) } : {}),
+  };
+}
+
 function tlsAgentCgroupDocument(snapshot) {
   const byCgroup = new Map();
   for (const entry of Array.isArray(snapshot?.entries) ? snapshot.entries.slice(0, MAX_ENTRIES) : []) {
@@ -35,20 +64,35 @@ function tlsAgentCgroupDocument(snapshot) {
       && cgroupId(entry?.cgroupId);
     if (entry?.classification !== 'confirmed_agent' && !runtimeEntry) continue;
     const id = cgroupId(entry.cgroupId);
-    if (!id || byCgroup.has(id)) continue;
+    if (!id) continue;
     const agentScopeId = text(entry.agentScopeId).slice(0, 160);
     const physicalWorkloadId = text(entry.physicalWorkloadId).slice(0, 512);
-    byCgroup.set(id, {
+    const fence = processFence(entry);
+    const candidate = {
       cgroupId: id,
       ...(agentScopeId ? { agentScopeId } : {}),
       ...(physicalWorkloadId ? { physicalWorkloadId } : {}),
-    });
+      ...(fence ?? {}),
+    };
+    const group = byCgroup.get(id) ?? [];
+    // Keep distinct process generations and identities. The Collector must see the competing
+    // entries so it can fail closed for a mixed cgroup instead of accepting whichever entry was
+    // enumerated first. Exact duplicates remain idempotent.
+    const fingerprint = JSON.stringify(candidate);
+    if (!group.some((item) => JSON.stringify(item) === fingerprint)) group.push(candidate);
+    byCgroup.set(id, group);
   }
-  const entries = [...byCgroup.values()].sort((left, right) => {
-    const a = BigInt(left.cgroupId);
-    const b = BigInt(right.cgroupId);
-    return a < b ? -1 : a > b ? 1 : 0;
-  });
+  const entries = [...byCgroup.entries()]
+    .flatMap(([, group]) => group)
+    .sort((left, right) => {
+      const a = BigInt(left.cgroupId);
+      const b = BigInt(right.cgroupId);
+      if (a !== b) return a < b ? -1 : 1;
+      const leftPid = Number(left.rootPid ?? 0);
+      const rightPid = Number(right.rootPid ?? 0);
+      if (leftPid !== rightPid) return leftPid - rightPid;
+      return JSON.stringify(left).localeCompare(JSON.stringify(right));
+    });
   return {
     schemaVersion: TLS_AGENT_CGROUPS_SCHEMA,
     version: Number.isSafeInteger(snapshot?.version) && snapshot.version >= 0 ? snapshot.version : 0,
