@@ -17,7 +17,10 @@ ToolCall/ToolResult，也可以复核 Dify 本地 mock 的 LLM/tool HTTP exchang
 这些结果不能写成 Observer eBPF 被动 attach 的四环境端到端通过：本机 UID 没有可用的 eBPF
 能力，Docker 无法创建当前工作树容器，Kubernetes 的正式 Deployment 仍是旧镜像（只做过
 独立 hostPath fallback），SSH 没有 Agent 目标，
-LangChain/LangGraph 的受控真实调用未完成。
+LangChain/LangGraph 的受控真实调用未完成。Observer BPF 对象还在特权本地 k3s Pod 中以
+Aya `Program::load` 逐项加载了 `tls_write`、`tls_sendto`、`http_writev` 和 `exec`，验证了
+此前的 1,000,001-instruction verifier 状态爆炸已由 `bpf_loop` 路径 hash 修复；由于节点上
+已有 Observer 占用同类 tracepoint，不能把这次 load smoke 扩写为当前 workload 的完整 attach。
 
 本文使用四种标记，避免把设计、推断和实测混写：
 
@@ -240,6 +243,13 @@ release build 和 clippy 通过。`a3s-observer-ebpf` 是 no_std/no_main 的专�
 Collector 的 `aya_build`（本次 workspace build/test 已生成 BPF object），不能把该宿主链接
 命令写成 eBPF attach 通过。
 
+额外的本地特权 load smoke 使用当前 Collector 构建产出的 BPF object，通过 Aya `Program::load`
+逐项加载 `tls_write`、`tls_sendto`、`http_writev` 和 `exec`，结果全部成功；旧实现曾在
+`http_request_route_kind` 的内联路径扫描/hash 上报 `BPF program is too large. Processed 1000001
+insn`。修复提交为 Observer `20a8aa4`，只把有界路径 hash 移到 `bpf_loop` callback，未改变固定
+ABI 或产品识别。该 smoke 不执行 tracepoint attach；现有节点已有 Observer，实际完整 attach/目标
+workload 转发仍按环境矩阵标记为未验证。
+
 ### 5.2 AnySentry API 和回放
 
 使用当前源码构建的本地 API（loopback、memory fallback、专用 session hash secret）复核：
@@ -291,7 +301,7 @@ Kafka/Flink 只在已有可选 profile 中保留，未成为 Canonical 主链前
 
 ### 6.1 已知限制
 
-1. 本机 eBPF 权限不足；真实 Observer attach、Ring/WAL 丢失率和生产性能没有通过证据；
+1. 当前 host shell eBPF 权限不足；BPF object 的特权 load smoke 已通过，但真实 Observer attach、目标 workload 的 Ring/WAL 丢失率和生产性能没有通过证据；
 2. Codex 当前 HTTPS/Rustls 路径没有可发布的被动明文保证；HTTP/2、QUIC 及协议特定边界仍需独立项目；
 3. 运行器对超大 body、断流或 declared limit 可能只有 drop/truncation Coverage，尚未为所有情况生成 metadata-only partial interaction；
 4. 无 Hook/Trace Adapter 时，Dify 内部 node、LangGraph checkpoint 和进程内工具开始/结束只能是 partial/semantic_only；

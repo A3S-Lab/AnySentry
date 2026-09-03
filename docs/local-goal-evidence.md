@@ -13,7 +13,7 @@ LangChain/LangGraph 真实受控调用仍未满足发布条件。
 
 因此，本轮状态是 **部分完成（代码与受控替代链路通过，代表性被动观测和部分环境待完成）**：
 
-- Host AnySentry API 已用当前源码构建并在 loopback 运行，health 200，但使用 memory fallback；interaction、ingest、S2 off/shadow、S6、canonical representative replay 和 persistence single-flight 均已在该入口复核；
+- Host AnySentry API 已用当前源码构建并在 loopback 运行，health 200，但使用 memory fallback；interaction、ingest、S2 off/shadow、S6、canonical representative replay 和 persistence single-flight 均已在该入口复核；Observer BPF 对象另在特权本地 k3s Pod 中通过 Aya `Program::load` 复核，关键 route/exec 程序不再触发 verifier 超限；
 - SSH 没有提供可安全执行的本地/远端 Agent 目标，脚本只检查本地客户端和配置，运行链路为 unexecuted；
 - Docker daemon 与 Dify 1.14.2 手工栈可用；本地 mock workflow 的两次 LLM HTTP/1.1 stream 与一次 `/tool/execute` 均返回 200，RAG sentinel 边界通过，但当前没有运行中的本分支 AnySentry API 容器；
 - 当前 `kubectl` context 指向单节点 k3s；既存 `anysentry` 核心/Observer Pod 和 NodePort 健康检查通过，但镜像不是当前 dirty 工作树，且可选 `workspace-scanner` 存在不稳定副本，故环境标为 partial；
@@ -30,6 +30,7 @@ pnpm build                                      PASS
 API/Web tsc --noEmit                            PASS
 Observer fmt/build/test/clippy                  PASS
 Observer tests                                   32 + 7 + 155 + 8 = 202 PASS
+Observer privileged BPF load smoke               PASS (tls_write/tls_sendto/http_writev/exec; no verifier overflow)
 canonical representative replay                 PASS (13 synthetic authenticated events)
 S2 trusted-correlation (temporary off/shadow)    PASS (5/5, 70/70)
 S2 trusted-correlation (fixed API shadow)        PASS (70/70)
@@ -123,7 +124,7 @@ Round6 记录：14 项本地测试全部 `pass`；`fail=0`，tracked diff 前后
 | 仓库 | 分支 | HEAD | 工作树 |
 | --- | --- | --- | --- |
 | AnySentry | `goal/canonical-observability-20260903` | `a1cda4d…`（工作树含本地未提交重构） | 保留用户已有修改和未跟踪报告/资产；本轮新增 QA 脚本与本文件 |
-| Observer | `goal/canonical-observability-20260903` | `10cebf5…` | 本地 checkpoint，工作树 clean；未 push |
+| Observer | `goal/canonical-observability-20260903` | `20a8aa4…` | 本地 checkpoint（含 eBPF verifier 修复），工作树 clean；未 push |
 
 远程地址仅作只读基线记录；本轮未执行 `git push`、远程分支/PR 操作或镜像远程发布。脚本在运行前后比较 tracked worktree，并以不输出凭据的方式报告 remote host、ahead/behind 和变更路径。
 
@@ -210,7 +211,7 @@ EvidenceLink/Correlation → Sentry → Conversation/Evidence/Coverage projectio
 
 | 环境 | 状态 | 证据 |
 | --- | --- | --- |
-| Host | partial | API health 200 但 memory fallback；Observer collector release artifact 存在；当前 shell 非 root，不能直接宣称 eBPF attach |
+| Host | partial | API health 200 但 memory fallback；当前 shell UID 1001 无直接 eBPF attach 能力；特权本地 k3s Pod 的 Observer BPF load smoke（`tls_write`/`tls_sendto`/`http_writev`/`exec`）通过，但现有 Observer 已占用 tracepoint，未把当前 workload 的完整 attach/转发链写成通过 |
 | SSH | unexecuted | 本地 `ssh`/`ssh -G` 可用；没有执行远端命令 |
 | Docker | partial | daemon 与 canonical/module Compose config 通过；Dify 容器健康；未发现本分支 AnySentry API 容器 |
 | Kubernetes | partial | `kubectl` API、AnySentry NodePort health、核心 workload ready；workspace-scanner 1/2 Ready 且重启频繁；既存镜像不是当前 dirty 工作树 |
