@@ -1526,6 +1526,39 @@ function toRow(e: JudgedEvent): Row {
   const process = visibleProcessContext(e.process);
   const evidenceIndex = toolEvidenceIndexFields(e);
   const revisionIdentity = eventRevisionIdentity(e);
+  // Canonical observability fields are additive and intentionally kept under namespaced
+  // attributes until the rolling ClickHouse schema migration adds dedicated columns.  This keeps
+  // old readers byte-compatible while allowing a durable event lookup to recover the raw-fact and
+  // identity provenance instead of silently dropping it at the persistence boundary.
+  const canonicalAttributes = {
+    ...(e.attributes ?? {}),
+    ...(e.sessionIdentityQuality
+      ? { 'anysentry.session.identity_quality': e.sessionIdentityQuality }
+      : {}),
+    ...(e.sessionIdSource ? { 'anysentry.session.id_source': e.sessionIdSource } : {}),
+    ...(e.legacySessionId ? { 'anysentry.session.legacy_id': e.legacySessionId } : {}),
+    ...(e.parentSessionId ? { 'anysentry.session.parent_id': e.parentSessionId } : {}),
+    ...(e.sessionMode ? { 'anysentry.session.mode': e.sessionMode } : {}),
+    ...(e.sessionLifecycle ? { 'anysentry.session.lifecycle': e.sessionLifecycle } : {}),
+    ...(e.runIdSource ? { 'anysentry.run.id_source': e.runIdSource } : {}),
+    ...(e.rawObservationId ? { 'anysentry.raw_observation_id': e.rawObservationId } : {}),
+    ...(e.rawObservationRevision !== undefined
+      ? { 'anysentry.raw_observation_revision': e.rawObservationRevision }
+      : {}),
+    ...(e.kernelFactId ? { 'anysentry.kernel_fact_id': e.kernelFactId } : {}),
+    ...(e.logicalAgentId ? { 'anysentry.logical_agent_id': e.logicalAgentId } : {}),
+    ...(e.logicalIdentityAuthority
+      ? { 'anysentry.logical_identity_authority': e.logicalIdentityAuthority } : {}),
+    ...(e.logicalAgentCandidateId
+      ? { 'anysentry.logical_agent_candidate_id': e.logicalAgentCandidateId }
+      : {}),
+    ...(e.logicalDefinitionId ? { 'anysentry.logical_definition_id': e.logicalDefinitionId } : {}),
+    ...(e.logicalScopeMode ? { 'anysentry.logical_scope_mode': e.logicalScopeMode } : {}),
+    ...(e.deploymentId ? { 'anysentry.deployment_id': e.deploymentId } : {}),
+    ...(e.deploymentRevision ? { 'anysentry.deployment_revision': e.deploymentRevision } : {}),
+    ...(e.environmentId ? { 'anysentry.environment_id': e.environmentId } : {}),
+    ...(e.terminalContextId ? { 'anysentry.terminal_context_id': e.terminalContextId } : {}),
+  } as JudgedEvent['attributes'];
   return clickHouseWellFormedRow({
     schemaVersion: e.schemaVersion,
     eventId: e.eventId,
@@ -1609,7 +1642,7 @@ function toRow(e: JudgedEvent): Row {
     riskScore: e.riskScore,
     tokenCount: e.tokenCount,
     latencyMs: e.latencyMs,
-    attributes: JSON.stringify(e.attributes ?? {}),
+    attributes: JSON.stringify(canonicalAttributes),
     classificationSemantics: JSON.stringify(classificationSemantics ?? {}),
     process: JSON.stringify(process ?? {}),
     attribution: JSON.stringify(attribution ?? {}),
@@ -1666,6 +1699,52 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
   const at = num(r.at);
   const agentId = str(r.agentId);
   const sessionId = str(r.sessionId);
+  const rawSessionIdentityQuality = str(attributes['anysentry.session.identity_quality']);
+  const sessionIdentityQuality = ['confirmed', 'strong', 'inferred', 'unresolved', 'ephemeral', 'unknown', 'conflict']
+    .includes(rawSessionIdentityQuality)
+    ? rawSessionIdentityQuality as JudgedEvent['sessionIdentityQuality']
+    : undefined;
+  const rawSessionIdSource = str(attributes['anysentry.session.id_source']);
+  const sessionIdSource = ['provider', 'authenticated_adapter', 'legacy_observer_session', 'legacy_agent_fallback', 'legacy_task_fallback', 'per_request', 'unresolved']
+    .includes(rawSessionIdSource)
+    ? rawSessionIdSource as JudgedEvent['sessionIdSource']
+    : undefined;
+  const legacySessionId = str(attributes['anysentry.session.legacy_id']) || undefined;
+  const parentSessionId = str(attributes['anysentry.session.parent_id']) || undefined;
+  const rawSessionMode = str(attributes['anysentry.session.mode']);
+  const sessionMode = ['resumable', 'conversation', 'per_request', 'ephemeral', 'unknown']
+    .includes(rawSessionMode)
+    ? rawSessionMode as JudgedEvent['sessionMode']
+    : undefined;
+  const rawSessionLifecycle = str(attributes['anysentry.session.lifecycle']);
+  const sessionLifecycle = ['new', 'resume', 'fork'].includes(rawSessionLifecycle)
+    ? rawSessionLifecycle as JudgedEvent['sessionLifecycle']
+    : undefined;
+  const rawRunIdSource = str(attributes['anysentry.run.id_source']);
+  const runIdSource = ['producer', 'derived_ephemeral', 'legacy'].includes(rawRunIdSource)
+    ? rawRunIdSource as JudgedEvent['runIdSource']
+    : undefined;
+  const rawObservationId = str(attributes['anysentry.raw_observation_id']) || undefined;
+  const kernelFactId = str(attributes['anysentry.kernel_fact_id']) || undefined;
+  const parsedRawObservationRevision = Number(attributes['anysentry.raw_observation_revision']);
+  const rawObservationRevision = Number.isSafeInteger(parsedRawObservationRevision)
+    && parsedRawObservationRevision > 0 ? parsedRawObservationRevision : undefined;
+  const logicalAgentId = str(attributes['anysentry.logical_agent_id']) || undefined;
+  const rawLogicalIdentityAuthority = str(attributes['anysentry.logical_identity_authority']);
+  const logicalIdentityAuthority = ['management_registration', 'authenticated_adapter', 'inferred', 'unknown']
+    .includes(rawLogicalIdentityAuthority)
+    ? rawLogicalIdentityAuthority as JudgedEvent['logicalIdentityAuthority'] : undefined;
+  const logicalAgentCandidateId = str(attributes['anysentry.logical_agent_candidate_id']) || undefined;
+  const logicalDefinitionId = str(attributes['anysentry.logical_definition_id']) || undefined;
+  const rawLogicalScopeMode = str(attributes['anysentry.logical_scope_mode']);
+  const logicalScopeMode = ['registered_definition', 'workflow_definition', 'service_definition', 'terminal', 'unresolved']
+    .includes(rawLogicalScopeMode)
+    ? rawLogicalScopeMode as JudgedEvent['logicalScopeMode']
+    : undefined;
+  const terminalContextId = str(attributes['anysentry.terminal_context_id']) || undefined;
+  const deploymentId = str(attributes['anysentry.deployment_id']) || undefined;
+  const deploymentRevision = str(attributes['anysentry.deployment_revision']) || undefined;
+  const environmentId = str(attributes['anysentry.environment_id']) || undefined;
   const eventKind = str(r.eventKind);
   const rawActivityContext = str(r.activityContext);
   const rawActivitySubtype = str(r.activitySubtype);
@@ -1732,13 +1811,32 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
     collectorId,
     sourceId,
     sessionId,
+    ...(sessionIdentityQuality ? { sessionIdentityQuality } : {}),
+    ...(sessionIdSource ? { sessionIdSource } : {}),
+    ...(legacySessionId ? { legacySessionId } : {}),
+    ...(parentSessionId ? { parentSessionId } : {}),
+    ...(sessionMode ? { sessionMode } : {}),
+    ...(sessionLifecycle ? { sessionLifecycle } : {}),
+    ...(rawObservationId ? { rawObservationId } : {}),
+    ...(rawObservationRevision !== undefined ? { rawObservationRevision } : {}),
+    ...(kernelFactId ? { kernelFactId } : {}),
+    ...(logicalAgentId ? { logicalAgentId } : {}),
+    ...(logicalIdentityAuthority ? { logicalIdentityAuthority } : {}),
+    ...(logicalAgentCandidateId ? { logicalAgentCandidateId } : {}),
+    ...(logicalDefinitionId ? { logicalDefinitionId } : {}),
+    ...(logicalScopeMode ? { logicalScopeMode } : {}),
+    ...(terminalContextId ? { terminalContextId } : {}),
+    ...(deploymentId ? { deploymentId } : {}),
+    ...(deploymentRevision ? { deploymentRevision } : {}),
+    ...(environmentId ? { environmentId } : {}),
     userId: str(r.userId),
     traceId: str(r.traceId) || `tr_${agentId}_${sessionId}`,
     ...(invocationId ? { invocationId } : {}),
     ...(toolCallId ? { toolCallId } : {}),
     spanId: str(r.spanId) || `sp_${at}_${eventKind}`,
     parentSpanId: str(r.parentSpanId) || undefined,
-    runId: str(r.runId) || sessionId,
+    runId: str(r.runId) || `legacy-run_${at}_${eventKind}`,
+    runIdSource: runIdSource ?? (str(r.runId) ? 'legacy' : 'legacy'),
     taskId: str(r.taskId) || undefined,
     decisionStatus: (str(r.decisionStatus) || 'succeeded') as JudgedEvent['decisionStatus'],
     evaluationId: str(r.evaluationId) || undefined,

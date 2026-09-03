@@ -25,6 +25,7 @@ import {
   type AgentConversationSummary,
   type AgentRuntimeDirectoryInstance,
   type AgentSemanticEvent,
+  type CanonicalEvidenceLink,
   type LogicalAgentConversationDirectoryItemV4,
   securityCenterApi,
 } from "@/lib/api/security-center";
@@ -82,6 +83,16 @@ export default function ConversationTrackingPage() {
   const [queryText, setQueryText] = useState("");
   const query = useDebounce(queryText, { wait: 300 });
   const [liveFollow, setLiveFollow] = useState(true);
+  // Preserve whether the initial URL explicitly selected a historical object.  Follow mode may
+  // auto-select the newest directory item, but that synthetic selection must not expand the
+  // historical section; a real deep link or user selection is allowed to reveal it.
+  const initialSelectionRef = useRef(Boolean(
+    searchParams.get("logicalAgentId")
+      || searchParams.get("instanceId")
+      || searchParams.get("conversationId")
+      || searchParams.get("semanticEventId")
+      || searchParams.get("eventId"),
+  ));
   const coverageStatus = (searchParams.get("coverage") as AgentConversationCoverageStatus | null) ?? "all";
   const classification = (searchParams.get("classification") as AgentClassification | null) ?? "all";
   const scopedAgentAssetId = searchParams.get("agentAssetId") ?? "";
@@ -224,6 +235,10 @@ export default function ConversationTrackingPage() {
     }
     previousTopAgent.current = top.logicalAgentId;
   }, [directory?.items, liveFollow, selectedConversationId, selectedInstanceId, selectedLogicalAgentId]);
+
+  const allowHistoricalSelectionExpansion = initialSelectionRef.current
+    || !liveFollow
+    || Boolean(selectedConversationId || selectedInstanceId);
 
   const timelineClientKey = useMemo(() => JSON.stringify({
     conversationId: selectedConversationId,
@@ -376,6 +391,19 @@ export default function ConversationTrackingPage() {
   const semanticEvidence = evidenceEnvelope?.clientKey === evidenceClientKey
     ? evidenceEnvelope.evidence
     : undefined;
+  const canonicalLinkId = semanticEvidence?.relations.find((relation) => relation.evidenceLinkId)?.evidenceLinkId;
+  const canonicalLinkRevision = semanticEvidence?.relations.find((relation) => relation.evidenceLinkId)?.relationRevision;
+  const canonicalLinkClientKey = `${canonicalLinkId ?? ""}:${canonicalLinkRevision ?? ""}`;
+  const { data: canonicalLinkEnvelope, loading: canonicalLinkLoading } = useRequest(async () => ({
+    clientKey: canonicalLinkClientKey,
+    link: await securityCenterApi.canonicalEvidenceLink(canonicalLinkId!, canonicalLinkRevision),
+  }), {
+    ready: Boolean(canonicalLinkId),
+    refreshDeps: [canonicalLinkClientKey],
+  });
+  const canonicalLink = canonicalLinkEnvelope?.clientKey === canonicalLinkClientKey
+    ? canonicalLinkEnvelope.link.item as CanonicalEvidenceLink
+    : undefined;
   const selectEvent = (event: AgentSemanticEvent) => updateRoute((next) => {
     next.set("semanticEventId", event.semanticEventId);
     next.delete("eventId");
@@ -486,6 +514,7 @@ export default function ConversationTrackingPage() {
               selectedLogicalAgentId={selectedLogicalAgent?.logicalAgentId}
               selectedInstanceId={selectedInstanceId}
               selectedConversationId={selectedConversationId}
+              allowHistoricalSelectionExpansion={allowHistoricalSelectionExpansion}
               loading={conversationsLoading}
               error={conversationsError}
               onSelectAgent={selectLogicalAgent}
@@ -535,6 +564,8 @@ export default function ConversationTrackingPage() {
               loading={interactionLoading}
               semanticEvidence={semanticEvidence}
               evidenceLoading={evidenceLoading}
+              canonicalEvidenceLink={canonicalLink}
+              canonicalEvidenceLinkLoading={canonicalLinkLoading}
               onClose={closeInspector}
             />
           </div>

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set +x
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="${ANYSENTRY_INSTALL_MODE:-${1:-docker}}"
@@ -11,6 +12,7 @@ ANYSENTRY_IMAGE="${ANYSENTRY_IMAGE:-ghcr.io/a3s-lab/anysentry:latest}"
 FLINK_IMAGE="${ANYSENTRY_FLINK_IMAGE:-}"
 APPLY_INGRESS="${ANYSENTRY_APPLY_INGRESS:-0}"
 MANAGEMENT_TOKEN="${ANYSENTRY_MANAGEMENT_TOKEN:-}"
+SESSION_HASH_SECRET="${ANYSENTRY_SESSION_HASH_SECRET:-}"
 BOOTSTRAP_PORT="${ANYSENTRY_OBSERVER_BOOTSTRAP_PORT:-29654}"
 
 usage() {
@@ -30,6 +32,7 @@ Environment:
   ANYSENTRY_FLINK_IMAGE=<registry>/anysentry-flink-streaming:<version>  (required for Kubernetes)
   ANYSENTRY_OBSERVER_IMAGE=<registry>/anysentry-observer:latest
   ANYSENTRY_MANAGEMENT_TOKEN=<random high-entropy token>  (generated when omitted in Kubernetes)
+  ANYSENTRY_SESSION_HASH_SECRET=<separate random secret>  (generated/preserved in Kubernetes)
   ANYSENTRY_OBSERVER_BOOTSTRAP_PORT=29654
   ANYSENTRY_APPLY_INGRESS=1
 
@@ -75,16 +78,47 @@ install_kubernetes() {
   echo "Installing the complete AnySentry stack in namespace ${NAMESPACE}..."
 
   kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-  kubectl -n "$NAMESPACE" create secret generic anysentry-clickhouse \
-    --from-literal=CLICKHOUSE_USER="$CLICKHOUSE_USER" \
-    --from-literal=CLICKHOUSE_PASSWORD="$CLICKHOUSE_PASSWORD" \
-    --dry-run=client -o yaml | kubectl apply -f -
   if [[ -z "$MANAGEMENT_TOKEN" ]]; then
     MANAGEMENT_TOKEN="$(openssl rand -hex 32)"
   fi
-  kubectl -n "$NAMESPACE" create secret generic anysentry-control-auth \
-    --from-literal=management-token="$MANAGEMENT_TOKEN" \
+  if [[ -z "$SESSION_HASH_SECRET" ]]; then
+    existing_session_secret_b64="$(kubectl -n "$NAMESPACE" get secret anysentry-control-auth \
+      -o jsonpath='{.data.session-hash-secret}' 2>/dev/null || true)"
+    if [[ -n "$existing_session_secret_b64" ]]; then
+      SESSION_HASH_SECRET="$(printf '%s' "$existing_session_secret_b64" | base64 --decode)"
+    else
+      SESSION_HASH_SECRET="$(openssl rand -hex 32)"
+    fi
+  fi
+  # Keep secret values out of kubectl argv and shell/process listings.  `--from-literal` is
+  # convenient but exposes the value to any local observer of the short-lived kubectl command;
+  # use a 0700/0600 material directory and --from-file instead, then remove it on every exit path.
+  secret_material_dir="$(mktemp -d)"
+  chmod 700 "$secret_material_dir"
+  secret_material_cleanup() {
+    if [[ -n "${secret_material_dir:-}" && -d "$secret_material_dir" ]]; then
+      rm -rf -- "$secret_material_dir"
+    fi
+  }
+  trap secret_material_cleanup EXIT
+  umask 077
+  printf '%s' "$CLICKHOUSE_USER" >"$secret_material_dir/clickhouse-user"
+  printf '%s' "$CLICKHOUSE_PASSWORD" >"$secret_material_dir/clickhouse-password"
+  printf '%s' "$MANAGEMENT_TOKEN" >"$secret_material_dir/management-token"
+  printf '%s' "$SESSION_HASH_SECRET" >"$secret_material_dir/session-hash-secret"
+  kubectl -n "$NAMESPACE" create secret generic anysentry-clickhouse \
+    --from-file=CLICKHOUSE_USER="$secret_material_dir/clickhouse-user" \
+    --from-file=CLICKHOUSE_PASSWORD="$secret_material_dir/clickhouse-password" \
     --dry-run=client -o yaml | kubectl apply -f -
+  kubectl -n "$NAMESPACE" create secret generic anysentry-control-auth \
+    --from-file=management-token="$secret_material_dir/management-token" \
+    --from-file=session-hash-secret="$secret_material_dir/session-hash-secret" \
+    --dry-run=client -o yaml | kubectl apply -f -
+  # The two Secret objects now own the values; remove the local material before any long-running
+  # rollout/port-forward work.  The EXIT trap above still covers failures during creation.
+  secret_material_cleanup
+  secret_material_dir=""
+  trap - EXIT
 
   render_core_manifest() {
     sed \

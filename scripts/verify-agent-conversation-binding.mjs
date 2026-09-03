@@ -3,10 +3,14 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
 
 const require = createRequire(import.meta.url);
-const { AgentConversationBindingService } = require(
+const { AgentConversationBindingService, conversationLogicalScopeKey } = require(
   '../apps/api/dist/security-monitoring/agent-conversation-binding.service.js',
+);
+const { conversationLogicalScopeKeyV2 } = require(
+  '../apps/api/dist/security-monitoring/agent-conversation-resolution-v2.js',
 );
 const { projectAgentConversations } = require(
   '../apps/api/dist/security-monitoring/agent-conversation.js',
@@ -118,11 +122,13 @@ const fakeStore = {
     ])].sort();
     return { interactionIds: ids.slice(0, limit), truncated: ids.length > limit };
   },
-  loadAgentConversationMembershipsByAnchors: async (anchors) => {
+  loadAgentConversationMembershipsByAnchors: async (anchors, logicalScopeKeys = []) => {
     const keys = new Set(anchors.map((anchor) => `${anchor.namespace}\0${anchor.valueHash}`));
+    const scopes = new Set(logicalScopeKeys);
     return storedAnchors.flatMap((stored) => {
       const membership = storedMemberships.get(stored.interactionId);
       return keys.has(`${stored.anchor.namespace}\0${stored.anchor.valueHash}`)
+        && (scopes.size === 0 || scopes.has(stored.logicalScopeKey))
         && membership?.canonicalConversationId
         ? [{ anchor: structuredClone(stored), membership: structuredClone(membership) }]
         : [];
@@ -277,6 +283,110 @@ assert.deepEqual(new Set(persistedMembership.interactionIds), new Set([
   resumedFromAnchorOnly.interactionId,
 ]));
 
+// A shared provider/continuity hash is not a LogicalAgent identity.  Persisted anchor lookup must
+// retain the candidate row but refuse a Thread whose definition fingerprint differs.
+const scopeAnchor = { ...continuityAnchor, valueHash: 'b'.repeat(64), strength: 'exact' };
+const scopeRecord = {
+  ...interaction({
+    id: 'mi_binding_scope_mismatch',
+    at: resumedFromAnchorOnly.at + 1_000,
+    instance: 'host-root:scope-a',
+    workspacePath: '/workspace/scope-a',
+    users: ['scope mismatch'],
+    conversationAnchors: [scopeAnchor],
+  }),
+  tenantId: 'tenant-scope',
+  logicalAgentId: 'logical-scope-a',
+  logicalDefinitionFingerprint: 'definition-scope-a',
+  logicalScopeMode: 'registered_definition',
+  logicalIdentityAuthority: 'management_registration',
+};
+const wrongDefinitionThread = {
+  ...structuredClone(storedThreads.get(conversationId)),
+  conversationId: 'cv_scope_wrong_definition',
+  logicalScopeKey: conversationLogicalScopeKey(scopeRecord),
+  logicalAgentId: 'logical-scope-a',
+  definitionFingerprint: 'definition-scope-b',
+  logicalScopeMode: 'registered_definition',
+  tenantId: 'tenant-scope',
+  workspacePath: '/workspace/scope-b',
+  agentInstanceIds: ['host-root:scope-b'],
+};
+storedThreads.set(wrongDefinitionThread.conversationId, wrongDefinitionThread);
+storedAnchors.push({
+  interactionId: 'mi_binding_scope_anchor',
+  logicalScopeKey: conversationLogicalScopeKeyV2(scopeRecord),
+  observedAt: scopeRecord.receivedAt,
+  anchor: scopeAnchor,
+});
+storedMemberships.set('mi_binding_scope_anchor', {
+  ...structuredClone(storedMemberships.get(first.interactionId)),
+  interactionId: 'mi_binding_scope_anchor',
+  canonicalConversationId: wrongDefinitionThread.conversationId,
+});
+const scopeIsolationService = new AgentConversationBindingService(fakeStore);
+const scopeIsolationResult = await scopeIsolationService.applyPersistedBindings([scopeRecord]);
+assert.notEqual(scopeIsolationResult[0].conversationId, wrongDefinitionThread.conversationId,
+  'a shared anchor must not cross-bind a different definition fingerprint');
+
+// Workflow/service definitions additionally fence deployment/environment revisions even when the
+// LogicalAgent and definition fingerprint are the same.
+const deploymentAnchor = { ...continuityAnchor, valueHash: 'c'.repeat(64), strength: 'exact' };
+const deploymentRecord = {
+  ...interaction({
+    id: 'mi_binding_deployment_mismatch',
+    at: scopeRecord.at + 1_000,
+    instance: 'k8s:workflow:v1',
+    workspacePath: '/workspace/workflow',
+    users: ['deployment mismatch'],
+    conversationAnchors: [deploymentAnchor],
+  }),
+  tenantId: 'tenant-workflow',
+  logicalAgentId: 'logical-workflow',
+  logicalDefinitionFingerprint: 'definition-workflow',
+  logicalScopeMode: 'workflow_definition',
+  logicalIdentityAuthority: 'management_registration',
+  environment: 'kubernetes',
+  environmentId: 'cluster-prod',
+  deploymentId: 'workflow-revision-a',
+};
+const deploymentThreadRecord = { ...deploymentRecord, deploymentId: 'workflow-revision-b' };
+assert.equal(
+  conversationLogicalScopeKey(deploymentRecord).includes('\0'),
+  false,
+  'deployment-fenced LogicalAgent scope keys must remain PostgreSQL TEXT/JSONB safe',
+);
+const wrongDeploymentThread = {
+  ...structuredClone(wrongDefinitionThread),
+  conversationId: 'cv_scope_wrong_deployment',
+  logicalScopeKey: conversationLogicalScopeKey(deploymentThreadRecord),
+  logicalAgentId: 'logical-workflow',
+  definitionFingerprint: 'definition-workflow',
+  logicalScopeMode: 'workflow_definition',
+  tenantId: 'tenant-workflow',
+  environment: 'kubernetes',
+  environmentId: 'cluster-prod',
+  deploymentId: 'workflow-revision-b',
+  workspacePath: '/workspace/workflow',
+  agentInstanceIds: ['k8s:workflow:v2'],
+};
+storedThreads.set(wrongDeploymentThread.conversationId, wrongDeploymentThread);
+storedAnchors.push({
+  interactionId: 'mi_binding_deployment_anchor',
+  logicalScopeKey: conversationLogicalScopeKeyV2(deploymentRecord),
+  observedAt: deploymentRecord.receivedAt,
+  anchor: deploymentAnchor,
+});
+storedMemberships.set('mi_binding_deployment_anchor', {
+  ...structuredClone(storedMemberships.get(first.interactionId)),
+  interactionId: 'mi_binding_deployment_anchor',
+  canonicalConversationId: wrongDeploymentThread.conversationId,
+});
+const deploymentIsolationService = new AgentConversationBindingService(fakeStore);
+const deploymentIsolationResult = await deploymentIsolationService.applyPersistedBindings([deploymentRecord]);
+assert.notEqual(deploymentIsolationResult[0].conversationId, wrongDeploymentThread.conversationId,
+  'a workflow anchor must not cross-bind a different deployment revision');
+
 let projectionComputations = 0;
 const cacheAggregation = new AggregationService(
   { persistAgentInteraction: async () => true },
@@ -410,5 +520,50 @@ assert.match(membershipSql, /WITH RECURSIVE thread_ids/u);
 assert.match(membershipSql, /newer\.resolution_revision > candidate\.resolution_revision/u);
 assert.match(membershipSql, /NOT EXISTS[\s\S]*current\.interaction_id = binding\.interaction_id/u);
 assert.deepEqual(membershipParams, [longConversationId, 5_001]);
+
+// V2 memberships/anchors are historical decisions. Keep a source-level guard alongside the
+// executable SQL mock so a future migration cannot reintroduce an in-place DO UPDATE that erases
+// a same-revision correlation decision.
+const relationalSource = readFileSync(
+  new URL('../apps/api/src/security-monitoring/relational-business-store.service.ts', import.meta.url),
+  'utf8',
+);
+const v1Start = relationalSource.indexOf('async saveAgentConversationResolution(');
+const v2Start = relationalSource.indexOf('async saveAgentConversationResolutionV2(');
+const v2End = relationalSource.indexOf('async loadAgentSemanticKernelRelations(', v2Start);
+assert(v1Start >= 0 && v2Start > v1Start, 'V1 compatibility resolution writer source region is present');
+const v1Writer = relationalSource.slice(v1Start, v2Start);
+assert.match(v1Writer, /CONVERSATION_RESOLUTION_V1_MAX_THREADS/iu,
+  'legacy Thread projection persistence has an explicit row bound');
+assert.match(v1Writer, /CONVERSATION_RESOLUTION_V1_MAX_BYTES/iu,
+  'legacy conversation projection persistence has an aggregate byte bound');
+assert.match(v1Writer, /boundedJsonRows/iu,
+  'legacy compatibility rows are size checked before PostgreSQL allocation');
+assert(v2Start >= 0 && v2End > v2Start, 'V2 resolution writer source region is present');
+const v2Writer = relationalSource.slice(v2Start, v2End);
+assert.doesNotMatch(v2Writer, /ON CONFLICT \(interaction_id, resolution_revision\)\s+DO UPDATE/iu,
+  'same-revision memberships must never be updated in place');
+assert.match(v2Writer, /ON CONFLICT \(interaction_id, resolution_revision\)\s+DO NOTHING/iu,
+  'same-revision memberships use immutable insert semantics');
+assert.match(v2Writer, /ON CONFLICT \(interaction_id, anchor_kind, anchor_namespace, value_hash\)[\s\S]*?DO NOTHING/iu,
+  'conversation anchors use immutable insert semantics');
+assert.match(v2Writer, /COUNT\(DISTINCT record\)\s*>\s*1/iu,
+  'V2 writer detects conflicting duplicate keys inside one incoming batch');
+assert.match(v2Writer, /existing\.record\s*<>\s*incoming\.record/iu,
+  'V2 writer detects a changed payload at an existing immutable key');
+assert.match(v2Writer, /const technicalRows\s*=\s*technicalActivities\.map/iu,
+  'technical activity rows receive a bounded storage timestamp before JSON serialization');
+assert.match(v2Writer, /const technicalJson\s*=\s*boundedJsonRows\(\s*technicalRows/iu,
+  'technical activity payload bounds include the storage timestamp field');
+assert.match(v2Writer, /batchHasConflictingRecords\(aliases/iu,
+  'V2 latest alias projection rejects conflicting duplicate aliases in one batch');
+assert.match(v2Writer, /batchHasConflictingRecords\(technicalActivities/iu,
+  'V2 latest technical projection rejects conflicting duplicate activities in one batch');
+
+assert.match(
+  readFileSync(new URL('../apps/api/src/security-monitoring/agent-conversation-binding.service.ts', import.meta.url), 'utf8'),
+  /correlationQuality\s*===\s*'coverage_gap'[\s\S]{0,320}'unresolved'/u,
+  'a coverage-gap correlation remains a queryable unresolved Session membership instead of being dropped as an invalid unknown quality',
+);
 
 console.log('Agent Conversation durable Thread/Segment binding verification passed');

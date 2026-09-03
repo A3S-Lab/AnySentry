@@ -5,6 +5,56 @@
 import type { TrustedCorrelationV1 } from './trusted-correlation';
 
 export type {
+  AgentInstance,
+  AgentAdapter,
+  AgentAdapterManifest,
+  ConnectionIdentity,
+  CoverageGap,
+  EvidenceLink,
+  LogicalAgentDefinition,
+  ProcessGeneration,
+  ProcessGenerationKey,
+  RawObservation,
+  RelationRevision,
+  RuntimeContext,
+  RuntimeInstance,
+  SemanticRecord,
+  SessionMembership,
+  TransportDecoderContract,
+  LlmFormatAdapterContract,
+  RuntimeAdapterContract,
+  KernelFact,
+  KernelFactStoreOptions,
+  KernelFactStoreStats,
+  SemanticRecordStoreOptions,
+  SemanticRecordStoreStats,
+  EvidenceLinkStoreOptions,
+  EvidenceLinkStoreStats,
+  SessionMembershipStoreOptions,
+  SessionMembershipStoreStats,
+} from './canonical-observability';
+
+export {
+  AgentAdapterRegistry,
+  CANONICAL_SCHEMA_VERSIONS,
+  RawObservationStore,
+  KernelFactStore,
+  SemanticRecordStore,
+  EvidenceLinkStore,
+  SessionMembershipStore,
+  deriveConnectionIdentity,
+  deriveProcessGenerationKey,
+  normalizeKernelFact,
+  rawObservationFromLine,
+  resolveLogicalAgentDefinition,
+  resolveSessionIdentity,
+  validateCanonicalContract,
+  validateRawObservation,
+  validateKernelFact,
+  validateRelationRevision,
+} from './canonical-observability';
+
+export type {
   TrustedCorrelationAuthority,
   TrustedCorrelationClaimReceipt,
   TrustedCorrelationMethod,
@@ -149,6 +199,22 @@ export type IngestionSourceType = 'observer' | 'forwarder' | 'webhook' | 'otel' 
 export type IngestionSourceStatus = 'active' | 'stale' | 'unused' | 'disabled';
 export type SourceTokenRotationStatus = 'untracked' | 'fresh' | 'overdue';
 export type AgentClassification = 'confirmed_agent' | 'probable_agent' | 'unknown' | 'non_agent';
+export type SessionIdentityQuality =
+  | 'confirmed'
+  | 'strong'
+  | 'inferred'
+  | 'unresolved'
+  | 'ephemeral'
+  | 'unknown'
+  | 'conflict';
+export type SessionIdSource =
+  | 'provider'
+  | 'authenticated_adapter'
+  | 'legacy_observer_session'
+  | 'legacy_agent_fallback'
+  | 'legacy_task_fallback'
+  | 'per_request'
+  | 'unresolved';
 export type WorkloadRole =
   | 'agent'
   | 'anysentry_internal'
@@ -254,6 +320,9 @@ export interface ProcessContext {
   namespacePpid?: number;
   startTimeTicks?: string;
   startTimeNs?: string;
+  /** Canonical PID-reuse-safe identity emitted by a trusted Observer/Forwarder. */
+  processGenerationKey?: string;
+  parentProcessGenerationKey?: string;
   mountNamespace?: number;
   eventTimeNs?: string;
   comm?: string;
@@ -263,6 +332,9 @@ export interface ProcessContext {
   cgroup?: string;
   cgroupId?: string;
   systemdUnit?: string;
+  /** Runtime/Segment evidence. It is not a LogicalAgent key unless policy explicitly says so. */
+  terminalContextId?: string;
+  sshConnectionId?: string;
   /** Collector-resolved lifecycle provenance for short-lived ProcessExit facts. */
   lifecycleSource?: ProcessLifecycleSource;
   /** Closed reason when lifecycle ancestry deliberately remained unresolved. */
@@ -412,6 +484,23 @@ export interface AgentRuntimeSnapshotEntry {
   agentScopeId: string;
   agentDisplayName?: string;
   agentInstanceId: string;
+  /** Additive canonical definition identity; absent for unresolved runtime candidates. */
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  /** Runtime identity authority; producer snapshots are candidates until management binding. */
+  logicalIdentityAuthority?: 'management_registration' | 'candidate' | 'legacy';
+  tenantId?: string;
+  ownerId?: string;
+  profile?: string;
+  profileVersion?: string;
+  /** Application deployment/revision boundary; distinct from LogicalAgent definition identity. */
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  terminalContextId?: string;
+  sshConnectionId?: string;
   physicalWorkloadId?: string;
   classification?: AgentClassification;
   runtimeState: AgentRuntimeReportedState;
@@ -599,6 +688,43 @@ export interface JudgedEvent {
   collectorId?: string;
   sourceId?: string;
   sessionId: string;
+  /** Additive migration metadata: old required sessionId remains byte-compatible. */
+  sessionIdentityQuality?: SessionIdentityQuality;
+  sessionIdSource?: SessionIdSource;
+  legacySessionId?: string;
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  sessionResolutionRevision?: number;
+  sessionMode?: 'resumable' | 'conversation' | 'per_request' | 'ephemeral' | 'unknown';
+  sessionLifecycle?: 'new' | 'resume' | 'fork';
+  rawObservationId?: string;
+  rawObservationRevision?: number;
+  /** Canonical machine-side fact derived from the immutable raw observation, when applicable. */
+  kernelFactId?: string;
+  /** Functional/deployment generation.  This is distinct from the physical runtime process. */
+  canonicalAgentInstanceId?: string;
+  /** Physical process/container/Pod generation used for Kernel correlation. */
+  runtimeInstanceId?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  sessionKey?: string;
+  /** Opaque canonical Session ID used by the new evidence lane. */
+  canonicalSessionId?: string;
+  /** Opaque namespace used to keep parent/fork references stable without exposing tenant data. */
+  sessionNamespaceKey?: string;
+  providerSessionIdHash?: string;
+  logicalDefinitionFingerprint?: string;
+  tenantId?: string;
+  ownerId?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  terminalContextId?: string;
   userId: string;
   traceId: string;
   /** Additive trusted invocation identity; never aliases or replaces traceId. */
@@ -607,6 +733,9 @@ export interface JudgedEvent {
   spanId: string;
   parentSpanId?: string;
   runId: string;
+  turnId?: string;
+  /** Additive provenance for the required legacy runId field; Session is never used as a fallback. */
+  runIdSource?: 'producer' | 'derived_ephemeral' | 'legacy';
   taskId?: string;
   decisionStatus?: DecisionStatus;
   evaluationId?: string;
@@ -639,6 +768,37 @@ export interface EventMeta {
   workspacePath: string;
   agentId: string;
   sessionId: string;
+  sessionIdentityQuality?: SessionIdentityQuality;
+  sessionIdSource?: SessionIdSource;
+  legacySessionId?: string;
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  sessionResolutionRevision?: number;
+  sessionMode?: 'resumable' | 'conversation' | 'per_request' | 'ephemeral' | 'unknown';
+  sessionLifecycle?: 'new' | 'resume' | 'fork';
+  rawObservationId?: string;
+  rawObservationRevision?: number;
+  kernelFactId?: string;
+  canonicalAgentInstanceId?: string;
+  runtimeInstanceId?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  sessionKey?: string;
+  canonicalSessionId?: string;
+  sessionNamespaceKey?: string;
+  providerSessionIdHash?: string;
+  logicalDefinitionFingerprint?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  tenantId?: string;
+  ownerId?: string;
+  profile?: string;
+  profileVersion?: string;
+  terminalContextId?: string;
   userId: string;
   source?: EventSource;
   eventCategory?: EventCategory;
@@ -651,6 +811,9 @@ export interface EventMeta {
   spanId?: string;
   parentSpanId?: string;
   runId?: string;
+  turnId?: string;
+  /** Distinguishes an Adapter-provided Run from the compatibility event-local fallback. */
+  runIdSource?: 'producer' | 'derived_ephemeral' | 'legacy';
   taskId?: string;
   attributes?: Record<string, EventAttributeValue>;
   /** Forwarder-resolved S3 view; the server validates its closed schema before persistence. */
@@ -712,6 +875,13 @@ export interface UniversalIngestEvent extends Partial<EventMeta> {
   signal?: string | number;
   runtimeKind?: string;
   raw?: unknown;
+  /** Product-neutral provider/session anchors; never treated as an OS/runtime identity. */
+  providerSessionId?: string;
+  conversationId?: string;
+  threadId?: string;
+  serviceStateful?: boolean;
+  resume?: boolean;
+  fork?: boolean;
 }
 export interface UniversalIngestRequest extends Partial<EventMeta> {
   event?: UniversalIngestEvent;
@@ -730,6 +900,12 @@ export interface UniversalIngestRequest extends Partial<EventMeta> {
   sourceName?: string;
   sourceType?: IngestionSourceType;
   token?: string;
+  providerSessionId?: string;
+  conversationId?: string;
+  threadId?: string;
+  serviceStateful?: boolean;
+  resume?: boolean;
+  fork?: boolean;
 }
 export type UniversalIngestBody = UniversalIngestRequest | Array<UniversalIngestRequest & Record<string, unknown>>;
 export interface UniversalIngestResultItem {
@@ -1248,7 +1424,31 @@ export interface AgentEventListItem {
   locationLabel?: string;
   collectorId?: string;
   sourceId?: string;
+  rawObservationId?: string;
+  rawObservationRevision?: number;
+  kernelFactId?: string;
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  logicalAgentId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalDefinitionFingerprint?: string;
+  canonicalAgentInstanceId?: string;
+  runtimeInstanceId?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
   sessionId: string;
+  sessionIdentityQuality?: SessionIdentityQuality;
+  sessionIdSource?: SessionIdSource;
+  legacySessionId?: string;
+  canonicalSessionId?: string;
+  sessionKey?: string;
+  sessionNamespaceKey?: string;
+  providerSessionIdHash?: string;
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  sessionMode?: 'resumable' | 'conversation' | 'per_request' | 'ephemeral' | 'unknown';
+  sessionLifecycle?: 'new' | 'resume' | 'fork';
+  sessionResolutionRevision?: number;
   userId: string;
   traceId: string;
   invocationId?: string;
@@ -1257,6 +1457,8 @@ export interface AgentEventListItem {
   spanId: string;
   parentSpanId?: string;
   runId: string;
+  /** Additive provenance for the required legacy runId field; Session is never used as a fallback. */
+  runIdSource?: 'producer' | 'derived_ephemeral' | 'legacy';
   taskId?: string;
   decisionStatus?: DecisionStatus;
   evaluationId?: string;
@@ -1464,20 +1666,55 @@ export interface AgentInteractionRecord {
   schemaVersion: 'anysentry.agent_interaction.v1';
   interactionId: string;
   interactionType: 'model' | 'tool' | 'unparsed';
+  /** True for an application/OTLP semantic projection synthesized without a transport body. */
+  semanticOnly?: boolean;
   at: number;
   tenantId?: string;
+  ownerId?: string;
   environmentId?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
   workspacePath: string;
   sourceId?: string;
   collectorId?: string;
   agentAssetId: string;
+  /** Legacy compatibility field; existing readers use this as the physical runtime alias. */
   agentInstanceId?: string;
+  /** Canonical functional AgentInstance (deployment/root-start generation). */
+  canonicalAgentInstanceId?: string;
+  /** Canonical physical RuntimeInstance used for Kernel correlation. */
+  runtimeInstanceId?: string;
   agentProduct?: string;
   environment?: 'kubernetes' | 'docker' | 'host' | 'unknown';
   runtimeSessionId?: string;
+  rawObservationId?: string;
+  sourceObservationIds?: string[];
+  kernelFactId?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  logicalDefinitionFingerprint?: string;
+  terminalContextId?: string;
+  sessionIdentityQuality?: SessionIdentityQuality;
+  sessionIdSource?: SessionIdSource;
+  sessionMode?: 'resumable' | 'conversation' | 'per_request' | 'ephemeral' | 'unknown';
+  sessionLifecycle?: 'new' | 'resume' | 'fork';
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  sessionResolutionRevision?: number;
   traceId?: string;
   runId?: string;
+  runIdSource?: 'producer' | 'derived_ephemeral' | 'legacy';
   sessionId?: string;
+  /** Canonical scope-qualified Session key; native IDs remain compatibility aliases. */
+  sessionKey?: string;
+  canonicalSessionId?: string;
+  sessionNamespaceKey?: string;
+  providerSessionIdHash?: string;
   invocationId?: string;
   providerConversationId?: string;
   providerResponseId?: string;
@@ -1493,7 +1730,7 @@ export interface AgentInteractionRecord {
   modelCallId?: string;
   attemptId?: string;
   runtimeRole?: 'agent_root' | 'network_runtime' | 'tool_runtime';
-  correlationQuality?: 'exact' | 'strong' | 'inferred' | 'unlinked';
+  correlationQuality?: 'exact' | 'strong' | 'inferred' | 'ambiguous' | 'coverage_gap' | 'unlinked';
   detectedClassification: AgentClassification;
   currentEffectiveClassification: AgentClassification;
   process?: ProcessContext;
@@ -1585,9 +1822,29 @@ export interface AgentConversationThreadRecord {
   schemaVersion: 'anysentry.agent_conversation_thread.v1';
   conversationId: string;
   logicalScopeKey: string;
+  logicalAgentId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  definitionFingerprint?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  sessionId?: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  sessionIdentityQuality?: SessionIdentityQuality;
+  sessionMode?: 'resumable' | 'conversation' | 'per_request' | 'ephemeral' | 'unknown';
+  sessionLifecycle?: 'new' | 'resume' | 'fork';
+  parentSessionId?: string;
+  /** Opaque canonical parent for fork lineage; the native parent remains source evidence. */
+  canonicalParentSessionId?: string;
+  terminalContextId?: string;
   idSource: 'provider' | 'runtime' | 'inferred';
   tenantId?: string;
   environmentId?: string;
+  environment?: 'kubernetes' | 'docker' | 'host' | 'unknown';
   agentProduct: string;
   workspacePath: string;
   hostId?: string;
@@ -1606,13 +1863,17 @@ export interface ConversationInstanceSegment {
   segmentId: string;
   conversationId: string;
   agentInstanceId: string;
+  /** Functional AgentInstance when available; agentInstanceId remains the legacy runtime key. */
+  canonicalAgentInstanceId?: string;
+  runtimeInstanceId?: string;
+  terminalContextId?: string;
   ordinal: number;
   startedAtUnixNs: string;
   endedAtUnixNs?: string;
   firstInteractionId: string;
   lastInteractionId: string;
   interactionCount: number;
-  correlationQuality: 'exact' | 'strong' | 'inferred' | 'unlinked';
+  correlationQuality: 'exact' | 'strong' | 'inferred' | 'ambiguous' | 'coverage_gap' | 'unlinked';
   resolverVersion: number;
   updatedAt: number;
 }
@@ -1623,12 +1884,34 @@ export interface AgentConversationBindingRecord {
   conversationId: string;
   segmentId: string;
   agentInstanceId: string;
+  canonicalAgentInstanceId?: string;
+  runtimeInstanceId?: string;
   logicalScopeKey: string;
+  logicalAgentId?: string;
+  logicalDefinitionId?: string;
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
   evidence: string[];
-  correlationQuality: 'exact' | 'strong' | 'inferred';
+  correlationQuality: 'exact' | 'strong' | 'inferred' | 'ambiguous' | 'coverage_gap';
   resolverVersion: number;
   decidedAt: number;
   updatedAt: number;
+  sessionId?: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  canonicalSessionId?: string;
+  sessionNamespaceKey?: string;
+  sessionIdentityQuality?: SessionIdentityQuality;
+  sessionMode?: 'resumable' | 'conversation' | 'per_request' | 'ephemeral' | 'unknown';
+  sessionLifecycle?: 'new' | 'resume' | 'fork';
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  sessionResolutionRevision?: number;
 }
 
 export interface AgentConversationQuery extends SecurityTimeFilter {
@@ -1646,6 +1929,27 @@ export interface AgentConversationQuery extends SecurityTimeFilter {
 export interface AgentConversationSummary {
   conversationId: string;
   idSource: 'provider' | 'runtime' | 'inferred';
+  tenantId?: string;
+  ownerId?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  logicalDefinitionFingerprint?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  terminalContextIds?: string[];
+  sessionIdentityQuality?: SessionIdentityQuality;
+  sessionMode?: 'resumable' | 'conversation' | 'per_request' | 'ephemeral' | 'unknown';
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  sessionId?: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  sessionLifecycle?: 'new' | 'resume' | 'fork';
   hasContent: boolean;
   agentAssetId: string;
   agentInstanceIds: string[];
@@ -1684,6 +1988,11 @@ export interface AgentConversationDirectoryQuery extends AgentConversationQuery 
 export interface LogicalAgentConversationDirectoryItem {
   logicalAgentId: string;
   groupingQuality: 'exact' | 'strong' | 'inferred' | 'unresolved';
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  definitionFingerprint?: string;
+  candidateId?: string;
+  terminalContextIds?: string[];
   product: string;
   displayName: string;
   environment: 'kubernetes' | 'docker' | 'host' | 'unknown';
@@ -1778,7 +2087,7 @@ export type AgentRuntimeDirectoryInstance = Pick<
   | 'lastActivityAt'
   | 'workspacePath'
   | 'workloadRef'
->;
+> & Pick<AgentRuntimeInstanceRecord, 'logicalAgentId' | 'logicalDefinitionId' | 'logicalScopeMode' | 'terminalContextId' | 'sshConnectionId'>;
 
 export type LogicalAgentConversationDirectoryItemV4 = Omit<
   LogicalAgentConversationDirectoryItemV3,
@@ -1824,7 +2133,7 @@ export interface AgentConversationEvent {
   statusCode?: number;
   durationNs?: string;
   completeness: AgentInteractionCompleteness;
-  correlationQuality: 'exact' | 'strong' | 'inferred' | 'unlinked';
+  correlationQuality: 'exact' | 'strong' | 'inferred' | 'ambiguous' | 'coverage_gap' | 'unlinked';
   evidenceEventIds: string[];
 }
 
@@ -1878,7 +2187,7 @@ export interface AgentSemanticEvent {
   evidenceEventIds: string[];
   parserId: string;
   parserVersion: number;
-  correlationQuality: 'exact' | 'strong' | 'inferred' | 'unlinked';
+  correlationQuality: 'exact' | 'strong' | 'inferred' | 'ambiguous' | 'coverage_gap' | 'unlinked';
   completeness: 'complete' | 'partial' | 'missing';
   partialReasons: string[];
 }
@@ -1955,6 +2264,8 @@ export interface AgentSemanticKernelRelation {
   turnId: string;
   toolInvocationId: string;
   kernelEventId?: string;
+  /** Canonical KernelFact identity; kernelEventId remains the legacy event projection alias. */
+  kernelFactId?: string;
   kernelEventAt?: string;
   kernelEventKind?: string;
   kernelEventDecisionRevision?: number;
@@ -1966,7 +2277,16 @@ export interface AgentSemanticKernelRelation {
   confidence: number;
   authority: 'attested_tls_plaintext';
   relationVersion: 1 | 2 | 3;
+  /** All equally strong Kernel candidates retained when ownership is ambiguous. */
+  competingKernelEventIds?: string[];
   resolutionRevision: number;
+  /** Additive canonical EvidenceLink projection; legacy relation fields remain authoritative. */
+  evidenceLinkId?: string;
+  algorithmVersion?: string;
+  sourceRefs?: string[];
+  validFromUnixNs?: string;
+  validToUnixNs?: string;
+  relationRevision?: number;
   risk?: {
     verdict: Verdict;
     tier: Tier;
@@ -2210,6 +2530,23 @@ export interface AgentMetadataRecord {
   agentId: string;
   agentAssetId: string;
   agentAssetAliases?: string[];
+  /** Stable management-plane definition identity (never inferred from PID/Pod). */
+  logicalAgentId?: string;
+  logicalDefinitionId?: string;
+  logicalDefinitionType?: 'registered' | 'workflow' | 'service' | 'graph' | 'application' | 'candidate';
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalIdentityAuthority?: 'management_registration';
+  registrationRef?: string;
+  /** Optional management binding: only this authenticated Source may claim the definition. */
+  ingestionSourceId?: string;
+  tenantId?: string;
+  ownerId?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  terminalContextId?: string;
   workspacePath: string;
   displayName?: string;
   owner?: string;
@@ -2247,6 +2584,21 @@ export interface AgentInventoryItem {
   agentId: string;
   agentAssetId: string;
   agentAssetAliases?: string[];
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalDefinitionType?: AgentMetadataRecord['logicalDefinitionType'];
+  logicalScopeMode?: AgentMetadataRecord['logicalScopeMode'];
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  ingestionSourceId?: string;
+  tenantId?: string;
+  ownerId?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  terminalContextId?: string;
   /** Product/runtime family such as codex or pi; never a unique Asset key. */
   agentProduct?: string;
   workspacePath: string;
@@ -2507,6 +2859,21 @@ export interface WorkspaceInventory {
 export interface AgentMetadataUpdateRequest {
   workspacePath: string;
   agentAssetId?: string;
+  logicalAgentId?: string;
+  logicalDefinitionId?: string;
+  logicalDefinitionType?: AgentMetadataRecord['logicalDefinitionType'];
+  logicalScopeMode?: AgentMetadataRecord['logicalScopeMode'];
+  registrationRef?: string;
+  /** Bind a registered definition to one managed ingestion Source when multiple definitions share a workspace. */
+  ingestionSourceId?: string;
+  tenantId?: string;
+  ownerId?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  terminalContextId?: string;
   displayName?: string;
   owner?: string;
   team?: string;

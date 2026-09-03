@@ -135,6 +135,8 @@ function readProcIdentity(pid?: number): ProcIdentity | undefined {
 @Injectable()
 export class AgentAttributionService {
   private readonly procs = new Map<number, ProcRecord>();
+  private evicted = 0;
+  private expired = 0;
 
   attribute(meta: EventMeta, process: ProcessContext | undefined, at: number): AgentAttribution {
     const attributes = meta.attributes ?? {};
@@ -283,11 +285,28 @@ export class AgentAttributionService {
     if (this.procs.size >= MAX_PROCS) {
       const cutoff = Date.now() - 30 * 60_000;
       for (const [pid, item] of this.procs) {
-        if (item.lastSeen < cutoff) this.procs.delete(pid);
+        if (item.lastSeen < cutoff) {
+          this.procs.delete(pid);
+          this.expired += 1;
+        }
       }
-      if (this.procs.size >= MAX_PROCS) this.procs.clear();
+      // Never clear the complete attribution map under pressure: doing so would erase live
+      // parent identities and make subsequent child events look unrelated. Evict the oldest,
+      // lowest-confidence records one at a time and expose the count for Coverage/operations.
+      while (this.procs.size >= MAX_PROCS) {
+        const oldest = [...this.procs.entries()]
+          .sort((left, right) => left[1].lastSeen - right[1].lastSeen
+            || left[1].confidence - right[1].confidence)[0];
+        if (!oldest) break;
+        this.procs.delete(oldest[0]);
+        this.evicted += 1;
+      }
     }
     this.procs.set(rec.pid, rec);
+  }
+
+  attributionStats(): { entries: number; maxEntries: number; evicted: number; expired: number } {
+    return { entries: this.procs.size, maxEntries: MAX_PROCS, evicted: this.evicted, expired: this.expired };
   }
 
   private notAgent(reason: 'not_evaluated' | 'not_agent'): AgentAttribution {

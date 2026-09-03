@@ -116,10 +116,12 @@ later tool results. This plaintext path is off by default and uses three gates: 
 PID/cgroup, an admitted POST route, and a userspace protocol/semantic check. Raw interaction
 queries require management authentication and are audited.
 
-Compatibility is product-, version-, TLS-implementation-, and protocol-specific. The current
-verified matrix includes Pi on the host and in Docker, pinned LangChain and Dify fixtures, Claude
-Code 2.1.170 over TLS, and Codex CLI 0.150.1 over explicit HTTP. Generic Go/Rustls, Codex HTTPS,
-HTTP/2, WebSocket and QUIC are not claimed. See the
+Compatibility is product-, version-, TLS-implementation-, and protocol-specific. Existing
+historical fixtures include Pi, pinned LangChain and Dify scenarios, Claude Code 2.1.170 over TLS,
+and Codex CLI 0.150.1 over explicit HTTP; the current architecture acceptance focus is Codex,
+Claude Code, Dify, and LangChain/LangGraph. Pi, Kimi, Z.ai, and other future Agents are not
+current release-gate targets. Generic Go/Rustls, Codex HTTPS, HTTP/2, WebSocket and QUIC are not
+claimed. See the
 [product requirements](docs/anysentry-agent-llm-interaction-observability-prd.md) and
 [technical design](docs/anysentry-agent-llm-interaction-observability-technical-design.md).
 
@@ -339,6 +341,9 @@ skills/l3/                   L3 investigation prompts
 ## Documentation
 
 - [Deployment runbook](deploy/README.md)
+- [通用智能体全链路可观测架构 v2](docs/anysentry-agent-observability-architecture-v2.md)
+- [Canonical Observability 本地实现与验收](docs/canonical-observability-implementation.md)
+- [多智能体开发工程师执行提示词](docs/anysentry-multiagent-refactor-execution-prompt.md)
 - [Agent discovery and workload-aware filtering](docs/agent-discovery-filter.md)
 - [Agent–LLM and external-tool plaintext observability PRD](docs/anysentry-agent-llm-interaction-observability-prd.md)
 - [Agent–LLM and external-tool plaintext observability technical design](docs/anysentry-agent-llm-interaction-observability-technical-design.md)

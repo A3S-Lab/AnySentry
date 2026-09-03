@@ -7,6 +7,7 @@ import type {
   AgentInteractionRecord,
   AgentSemanticEvent,
   AgentSemanticEvidenceResponse,
+  CanonicalEvidenceLink,
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
 import { formatTokenCount } from "./agentUsage";
@@ -101,11 +102,15 @@ function KernelEvidenceView({
   interaction,
   evidence,
   loading,
+  canonicalEvidenceLink,
+  canonicalEvidenceLinkLoading,
 }: {
   event: AgentSemanticEvent;
   interaction?: AgentInteractionRecord;
   evidence?: AgentSemanticEvidenceResponse;
   loading: boolean;
+  canonicalEvidenceLink?: CanonicalEvidenceLink;
+  canonicalEvidenceLinkLoading: boolean;
 }) {
   if (loading && !evidence) {
     return <div className="flex min-h-40 items-center justify-center gap-2 text-xs text-zinc-500"><LoaderCircle className="size-4 animate-spin" />正在关联内核事实</div>;
@@ -118,6 +123,10 @@ function KernelEvidenceView({
         <EvidenceField label="Interaction Event" value={(evidence?.interactionEvidenceEventIds ?? event.evidenceEventIds).join(", ")} />
         <EvidenceField label="Agent Instance" value={interaction?.agentInstanceId} />
         <EvidenceField label="Correlation" value={event.correlationQuality} />
+        <EvidenceField label="Canonical EvidenceLink" value={canonicalEvidenceLink?.linkId} />
+        <EvidenceField label="Link Revision / Authority" value={canonicalEvidenceLink ? `${canonicalEvidenceLink.resolutionRevision} · ${canonicalEvidenceLink.authority}` : undefined} />
+        <EvidenceField label="Link Source Refs" value={canonicalEvidenceLink?.evidenceRefs.join(", ")} />
+        {canonicalEvidenceLinkLoading ? <EvidenceField label="Canonical Link" value="loading" /> : null}
       </dl>
       {evidence?.relations.some((relation) => relation.kernelEventId) ? (
         <div className="divide-y divide-white/8 rounded border border-white/8 bg-black/15">
@@ -203,6 +212,8 @@ export function SemanticInteractionInspector({
   loading,
   semanticEvidence,
   evidenceLoading,
+  canonicalEvidenceLink,
+  canonicalEvidenceLinkLoading,
   onClose,
 }: {
   event?: AgentSemanticEvent;
@@ -210,6 +221,8 @@ export function SemanticInteractionInspector({
   loading: boolean;
   semanticEvidence?: AgentSemanticEvidenceResponse;
   evidenceLoading: boolean;
+  canonicalEvidenceLink?: CanonicalEvidenceLink;
+  canonicalEvidenceLinkLoading: boolean;
   onClose: () => void;
 }) {
   const [tab, setTab] = useState<"content" | "kernel" | "risk" | "raw">("content");
@@ -317,7 +330,7 @@ export function SemanticInteractionInspector({
               {event.kind === "tool_result" ? <p className="mt-3 text-[11px] leading-5 text-zinc-500">工具结果时间表示该结果重新进入模型请求的明文边界；框架内部精确结束时间仅在有独立工具传输证据时展示。</p> : null}
             </div>
           ) : tab === "kernel" ? (
-            <KernelEvidenceView event={event} interaction={interaction} evidence={semanticEvidence} loading={evidenceLoading} />
+            <KernelEvidenceView event={event} interaction={interaction} evidence={semanticEvidence} loading={evidenceLoading} canonicalEvidenceLink={canonicalEvidenceLink} canonicalEvidenceLinkLoading={canonicalEvidenceLinkLoading} />
           ) : tab === "risk" ? (
             <RiskEvidenceView interaction={interaction} evidence={semanticEvidence} loading={evidenceLoading} />
           ) : tab === "raw" ? (
@@ -345,6 +358,12 @@ export function SemanticInteractionInspector({
               <EvidenceField label="Turn" value={event.turnId} />
               <EvidenceField label="Semantic Event" value={event.semanticEventId} />
               <EvidenceField label="Interaction" value={event.sourceInteractionIds.join(", ")} />
+              <EvidenceField label="Raw Observation" value={interaction?.rawObservationId} />
+              <EvidenceField label="Kernel Fact" value={interaction?.kernelFactId} />
+              <EvidenceField label="Session Key" value={interaction?.sessionKey} />
+              <EvidenceField label="Provider Session Hash" value={interaction?.providerSessionIdHash} />
+              <EvidenceField label="Logical Agent / Definition" value={interaction?.logicalAgentId ? `${interaction.logicalAgentId} · ${interaction.logicalDefinitionId ?? "--"}` : interaction?.logicalAgentCandidateId} />
+              <EvidenceField label="Deployment / Revision" value={interaction?.deploymentId ? `${interaction.deploymentId} · ${interaction.deploymentRevision ?? "--"}` : undefined} />
               <EvidenceField label="Agent Asset" value={interaction?.agentAssetId} />
               <EvidenceField label="Agent Instance" value={interaction?.agentInstanceId} />
               <EvidenceField label="Process" value={interaction?.process ? `pid ${interaction.process.pid} · ${interaction.process.comm ?? "--"}` : undefined} />

@@ -19,6 +19,8 @@ const { agentAssetIdForIdentityKey } = require(
 const baseUrl = (process.env.ANYSENTRY_API_BASE
   ?? `http://127.0.0.1:${process.env.PORT ?? '29653'}/security-center`).replace(/\/$/u, '');
 const runId = safeProbeId('interaction');
+const createdSourceIds = new Set();
+let sourceCleanupFinished = false;
 
 async function request(path, method = 'GET', body, headers = {}) {
   const response = await fetch(`${baseUrl}${path}`, {
@@ -31,6 +33,23 @@ async function request(path, method = 'GET', body, headers = {}) {
   if (!response.ok) throw new Error(`${method} ${path} -> ${response.status}: ${text}`);
   return payload?.data ?? payload;
 }
+
+async function disableCreatedSources() {
+  if (sourceCleanupFinished) return;
+  sourceCleanupFinished = true;
+  for (const sourceId of createdSourceIds) {
+    await request(`/sources/${encodeURIComponent(sourceId)}`, 'PUT', { enabled: false }).catch(() => undefined);
+  }
+}
+
+const cleanupOnFailure = (error) => {
+  void disableCreatedSources().finally(() => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+};
+process.once('uncaughtException', cleanupOnFailure);
+process.once('unhandledRejection', cleanupOnFailure);
 
 async function requestWithoutManagementToken(path, body) {
   const response = await fetch(`${baseUrl}${path}`, {
@@ -90,6 +109,7 @@ const source = await request('/sources', 'POST', {
   owner: 'verify-agent-interactions',
   tags: [runId, 'interaction-verifier'],
 });
+if (source.source?.sourceId) createdSourceIds.add(source.source.sourceId);
 assert.ok(source.source?.sourceId && source.token, 'managed Observer Source token is required');
 
 const line = JSON.stringify({
@@ -974,3 +994,4 @@ console.log(JSON.stringify({
   managementTokenRequiredForRead: false,
   multimodalBytes: Buffer.byteLength(multimodalBody),
 }));
+await disableCreatedSources();

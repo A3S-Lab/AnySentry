@@ -1,4 +1,4 @@
-import { Injectable, Optional } from '@nestjs/common';
+import { Injectable, OnModuleDestroy, Optional } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 
 import type * as T from './types';
@@ -12,14 +12,24 @@ import {
   type TechnicalActivityProjection,
   conversationAnchorsForInteraction,
   conversationLogicalScopeKeyV2,
+  conversationDeploymentScopeKey,
+  trafficRoleForInteraction,
   resolveAgentConversationsV2,
 } from './agent-conversation-resolution-v2';
+import { canonicalParentSessionIdForMembership, canonicalSessionIdForMembership } from './canonical-observability';
 import {
   RelationalBusinessStore,
   type AgentConversationInteractionMembershipSlice,
 } from './relational-business-store.service';
+import { CanonicalObservabilityService } from './canonical-observability.service';
 
 export const AGENT_CONVERSATION_RESOLVER_VERSION = AGENT_CONVERSATION_RESOLVER_V2;
+const CANONICAL_SESSION_REVISION_MAX = Number.MAX_SAFE_INTEGER;
+const V2_PERSIST_MAX_ANCHORS = 50_000;
+const V2_PERSIST_MAX_MEMBERSHIPS = 20_000;
+const V2_PERSIST_MAX_ALIASES = 20_000;
+const V2_PERSIST_MAX_TECHNICAL = 20_000;
+const V2_PERSIST_MAX_CATEGORY_BYTES = 16 * 1024 * 1024;
 
 export interface AgentConversationInteractionSelection
   extends AgentConversationInteractionMembershipSlice {
@@ -62,17 +72,12 @@ function equalLineage(left: string[], right: string[]): boolean {
     && left.every((value, index) => value === right[index]);
 }
 
-function cliProduct(value?: string): boolean {
-  const product = normalized(value);
-  return ['codex', 'claude', 'pi', 'kimi'].some((candidate) => product.includes(candidate));
-}
-
 export function conversationLogicalScopeKey(record: T.AgentInteractionRecord): string {
-  return stableId('ls', [
-    normalized(record.agentProduct),
-    normalized(record.workspacePath),
-    normalized(record.process?.hostId),
-  ].join('\u0000'));
+  const logical = conversationLogicalScopeKeyV2(record);
+  const deployment = conversationDeploymentScopeKey(record);
+  // PostgreSQL TEXT/JSONB cannot contain a NUL byte. Keep the deployment fence opaque and
+  // storage-safe while retaining the base logical scope for compatibility checks below.
+  return deployment ? `${logical}|deployment:${deployment}` : logical;
 }
 
 function compareInteraction(left: T.AgentInteractionRecord, right: T.AgentInteractionRecord): number {
@@ -89,6 +94,119 @@ function syntheticWorkspace(value?: string): boolean {
     || workspace === 'workspace:unknown'
     || workspace.startsWith('agent://')
     || workspace.startsWith('agent-scope:');
+}
+
+function applicationScopeMode(value?: string): boolean {
+  return value === 'workflow_definition' || value === 'service_definition';
+}
+
+function canonicalScopeMode(value?: string): boolean {
+  return Boolean(value) && value !== 'unresolved';
+}
+
+function threadDeploymentScopeKey(thread: T.AgentConversationThreadRecord): string {
+  // The persisted Thread does not retain arbitrary adapter attributes, so its deployment scope
+  // uses the canonical fields and the same opaque digest as conversationDeploymentScopeKey().
+  const parts = [
+    thread.environment,
+    thread.environmentId,
+    thread.profile,
+    thread.profileVersion,
+    thread.deploymentId,
+    thread.deploymentRevision,
+  ].map(normalized);
+  if (parts.every((value) => !value)) return '';
+  return stableId('dps', parts.join('\u0000'));
+}
+
+function scopeBase(value?: string): string {
+  const scope = value?.trim() ?? '';
+  for (const marker of ['|deployment:', '\u0000deployment:']) {
+    const markerIndex = scope.indexOf(marker);
+    if (markerIndex >= 0) return scope.slice(0, markerIndex);
+  }
+  return scope;
+}
+
+function sameDefinitionFingerprint(
+  record: T.AgentInteractionRecord,
+  thread: T.AgentConversationThreadRecord,
+): boolean {
+  const recordFingerprint = normalized(record.logicalDefinitionFingerprint);
+  // An unresolved legacy Thread may carry a candidate fingerprint derived from a workspace that
+  // was later replaced by a synthetic runtime path.  Until the incoming record supplies its own
+  // canonical fingerprint, that candidate must not defeat the legacy anchor resume bridge.
+  const threadFingerprint = recordFingerprint || canonicalScopeMode(thread.logicalScopeMode)
+    ? normalized(thread.definitionFingerprint)
+    : '';
+  return !recordFingerprint || !threadFingerprint || recordFingerprint === threadFingerprint;
+}
+
+function exactDefinitionFingerprint(
+  record: T.AgentInteractionRecord,
+  thread: T.AgentConversationThreadRecord,
+): boolean {
+  const recordFingerprint = normalized(record.logicalDefinitionFingerprint);
+  const threadFingerprint = recordFingerprint || canonicalScopeMode(thread.logicalScopeMode)
+    ? normalized(thread.definitionFingerprint)
+    : '';
+  return Boolean(recordFingerprint && threadFingerprint && recordFingerprint === threadFingerprint);
+}
+
+/**
+ * Verify that a persisted anchor belongs to the same canonical scope as the candidate Thread.
+ * Stable CLI definitions may resume from a synthetic workspace, but an application/workflow
+ * anchor must never cross a definition or deployment boundary merely because its provider hash
+ * happens to be reused.
+ */
+function anchorScopeCompatible(
+  record: T.AgentInteractionRecord,
+  thread: T.AgentConversationThreadRecord,
+  storedAnchorScope: string,
+): boolean {
+  const currentScope = conversationLogicalScopeKey(record);
+  const persistedThreadScope = thread.logicalScopeKey.trim();
+  const storedScope = storedAnchorScope.trim();
+  // The anchor row and the membership's Thread must agree first.  Checking only the incoming
+  // scope would allow a corrupt/legacy membership pointer to attach an anchor from definition A
+  // to Thread B when both happen to expose the same provider hash.
+  if (!storedScope || !persistedThreadScope) return false;
+  if (storedScope === persistedThreadScope && storedScope === currentScope) return true;
+
+  // The only intentional scope mismatch is a CLI/runtime resume where one side has a synthetic
+  // workspace.  A real definition fingerprint (when available) still has to agree.
+  const application = applicationScopeMode(record.logicalScopeMode)
+    || applicationScopeMode(thread.logicalScopeMode);
+  if (application) {
+    // Application/workflow scopes are never allowed to use the CLI synthetic-workspace bridge.
+    // Require the persisted anchor, Thread and incoming deployment fence to be identical; an old
+    // row without deployment metadata is intentionally treated as a coverage gap rather than
+    // guessed into test or production.
+    return storedScope === persistedThreadScope
+      && storedScope === currentScope
+      && exactDefinitionFingerprint(record, thread)
+      && conversationDeploymentScopeKey(record) === threadDeploymentScopeKey(thread);
+  }
+  if (scopeBase(storedScope) !== scopeBase(persistedThreadScope)) return false;
+  if (storedScope === currentScope || scopeBase(storedScope) === scopeBase(currentScope)) return true;
+  // Legacy rows may have no canonical LogicalAgent fields at all.  Keep the pre-canonical
+  // synthetic-workspace resume bridge, but only after requiring the persisted anchor to belong to
+  // this exact Thread scope above; this cannot join two unrelated anchor namespaces.
+  if (!record.logicalAgentId && !thread.logicalAgentId
+    && !record.logicalDefinitionFingerprint
+    && !(thread.definitionFingerprint && canonicalScopeMode(thread.logicalScopeMode))
+    && !canonicalScopeMode(record.logicalScopeMode)
+    && !canonicalScopeMode(thread.logicalScopeMode)) {
+    return syntheticWorkspace(record.workspacePath) || syntheticWorkspace(thread.workspacePath);
+  }
+  return Boolean(
+    record.logicalAgentId
+    && thread.logicalAgentId
+    && record.logicalAgentId === thread.logicalAgentId
+    && (exactDefinitionFingerprint(record, thread)
+      || syntheticWorkspace(record.workspacePath)
+      || syntheticWorkspace(thread.workspacePath)),
+  );
 }
 
 function preferredWorkspace(current: string, remembered?: string): string {
@@ -131,6 +249,56 @@ function sameThreadDomain(
 ): boolean {
   if (normalized(record.tenantId) && normalized(thread.tenantId)
     && normalized(record.tenantId) !== normalized(thread.tenantId)) return false;
+
+  const recordScope = conversationLogicalScopeKey(record);
+  const threadScope = thread.logicalScopeKey.trim();
+  const application = applicationScopeMode(record.logicalScopeMode)
+    || applicationScopeMode(thread.logicalScopeMode);
+  const sameLogicalAgent = Boolean(
+    record.logicalAgentId
+    && thread.logicalAgentId
+    && record.logicalAgentId === thread.logicalAgentId,
+  );
+  if (record.logicalAgentId && thread.logicalAgentId
+    && record.logicalAgentId !== thread.logicalAgentId) return false;
+  if (!sameDefinitionFingerprint(record, thread)) return false;
+
+  // Explicit terminal scope is an opt-in LogicalAgent boundary.  A missing terminal context is
+  // not evidence that two terminal-scoped records are the same object.
+  if (record.logicalScopeMode === 'terminal' || thread.logicalScopeMode === 'terminal') {
+    if (!record.terminalContextId || !thread.terminalContextId
+      || normalized(record.terminalContextId) !== normalized(thread.terminalContextId)) return false;
+  }
+
+  // Do this check before the logicalScopeKey equality fast path.  Persisted rows are untrusted
+  // compatibility data; a stale/malformed key must not be able to override the explicit
+  // deployment fields that fence workflow/service Sessions.
+  if (application
+    && conversationDeploymentScopeKey(record) !== threadDeploymentScopeKey(thread)) return false;
+
+  if (recordScope === threadScope) return true;
+
+  // A registered definition is the durable business boundary. It may move between host/SSH/
+  // Docker/Kubernetes runtimes for CLI resume, but application/workflow Sessions are fenced by
+  // deployment/environment/profile/revision. Explicit terminal-scoped IDs remain distinct.
+  if (record.logicalAgentId && thread.logicalAgentId) {
+    if (application) {
+      return exactDefinitionFingerprint(record, thread)
+        && conversationDeploymentScopeKey(record) === threadDeploymentScopeKey(thread);
+    }
+    return sameLogicalAgent
+      && (exactDefinitionFingerprint(record, thread)
+        || syntheticWorkspace(record.workspacePath)
+        || syntheticWorkspace(thread.workspacePath));
+  }
+
+  // Records without a complete registered identity can only use an exact persisted scope.  The
+  // legacy product/host fallback below remains for old rows that predate canonical scope fields.
+  if (record.logicalAgentId || thread.logicalAgentId
+    || record.logicalDefinitionFingerprint
+    || (thread.definitionFingerprint && canonicalScopeMode(thread.logicalScopeMode))
+    || canonicalScopeMode(record.logicalScopeMode)
+    || canonicalScopeMode(thread.logicalScopeMode)) return false;
   if (normalized(record.environmentId) && normalized(thread.environmentId)
     && normalized(record.environmentId) !== normalized(thread.environmentId)) return false;
   if (normalized(record.agentProduct) !== normalized(thread.agentProduct)) return false;
@@ -193,31 +361,175 @@ function collapseContainedSegments(
 }
 
 @Injectable()
-export class AgentConversationBindingService {
+export class AgentConversationBindingService implements OnModuleDestroy {
   private readonly bindings = new Map<string, T.AgentConversationBindingRecord>();
   private readonly threads = new Map<string, T.AgentConversationThreadRecord>();
   private readonly segments = new Map<string, T.ConversationInstanceSegment>();
   private readonly routeAliases = new Map<string, ConversationRouteAliasV1>();
   private readonly technicalActivities = new Map<string, TechnicalActivityProjection>();
   private readonly membershipsV2 = new Map<string, ConversationMembershipV2>();
-  private readonly persistenceFingerprints = new Map<string, string>();
+  private readonly persistenceFingerprints = new Map<string, {
+    fingerprint: string;
+    bytes: number;
+    touchedAt: number;
+  }>();
   private readonly maxPersistenceFingerprints = 200_000;
+  private readonly maxPersistenceFingerprintBytes = 32 * 1024 * 1024;
+  private readonly persistenceFingerprintTtlMs = 24 * 60 * 60_000;
+  private persistenceFingerprintBytes = 0;
+  private persistenceFingerprintEvictions = 0;
+  private persistenceFingerprintExpired = 0;
+  private persistenceFingerprintDropped = 0;
+  private readonly hotStateTtlMs = 24 * 60 * 60_000;
+  private readonly hotStateMaxEntries = 100_000;
+  private readonly hotStateMaxBytes = 64 * 1024 * 1024;
+  private hotStateEvictions = 0;
   private pendingResolution?: ConversationResolutionV2;
   private resolutionRevision = 0;
+  private resolutionInputFingerprint?: string;
 
   constructor(
     @Optional() private readonly relationalStore?: RelationalBusinessStore,
+    @Optional() private readonly canonicalObservability?: CanonicalObservabilityService,
   ) {}
+
+  onModuleDestroy(): void {
+    this.bindings.clear();
+    this.threads.clear();
+    this.segments.clear();
+    this.routeAliases.clear();
+    this.technicalActivities.clear();
+    this.membershipsV2.clear();
+    this.persistenceFingerprints.clear();
+    this.persistenceFingerprintBytes = 0;
+    this.pendingResolution = undefined;
+    this.resolutionInputFingerprint = undefined;
+    this.resolutionRevision = 0;
+  }
+
+  private prunePersistenceFingerprints(now = Date.now()): void {
+    for (const [key, entry] of this.persistenceFingerprints) {
+      if (now - entry.touchedAt <= this.persistenceFingerprintTtlMs) continue;
+      this.persistenceFingerprints.delete(key);
+      this.persistenceFingerprintBytes = Math.max(0, this.persistenceFingerprintBytes - entry.bytes);
+      this.persistenceFingerprintExpired += 1;
+    }
+    while (
+      this.persistenceFingerprints.size > this.maxPersistenceFingerprints
+      || this.persistenceFingerprintBytes > this.maxPersistenceFingerprintBytes
+    ) {
+      const oldest = this.persistenceFingerprints.entries().next().value as
+        | [string, { fingerprint: string; bytes: number; touchedAt: number }]
+        | undefined;
+      if (!oldest) break;
+      this.persistenceFingerprints.delete(oldest[0]);
+      this.persistenceFingerprintBytes = Math.max(0, this.persistenceFingerprintBytes - oldest[1].bytes);
+      this.persistenceFingerprintEvictions += 1;
+    }
+  }
+
+  private pruneHotState(now = Date.now()): void {
+    const nsMillis = (value?: string): number => {
+      if (!value || !/^\d+$/u.test(value)) return 0;
+      try { return Number(BigInt(value) / 1_000_000n); } catch { return 0; }
+    };
+    const prune = <V>(map: Map<string, V>, at: (value: V) => number): void => {
+      for (const [key, value] of map) {
+        const timestamp = at(value);
+        if (timestamp > 0 && now - timestamp > this.hotStateTtlMs) {
+          map.delete(key);
+          this.hotStateEvictions += 1;
+        }
+      }
+      while (map.size > this.hotStateMaxEntries) {
+        const oldest = [...map.entries()].sort((left, right) => at(left[1]) - at(right[1]))[0]?.[0];
+        if (oldest === undefined) break;
+        map.delete(oldest);
+        this.hotStateEvictions += 1;
+      }
+    };
+    prune(this.bindings, (value) => value.updatedAt);
+    prune(this.threads, (value) => nsMillis(value.lastActivityAtUnixNs));
+    prune(this.segments, (value) => value.updatedAt);
+    prune(this.routeAliases, (value) => value.createdAt);
+    prune(this.technicalActivities, (value) => nsMillis(value.endedAtUnixNs));
+    prune(this.membershipsV2, (value) => value.decidedAt);
+    const maps: Array<Map<string, unknown>> = [
+      this.bindings as Map<string, unknown>, this.threads as Map<string, unknown>,
+      this.segments as Map<string, unknown>, this.routeAliases as Map<string, unknown>,
+      this.technicalActivities as Map<string, unknown>, this.membershipsV2 as Map<string, unknown>,
+    ];
+    const estimate = () => maps.reduce<number>((sum, map) => sum + [...map.values()].reduce<number>((inner, value) => {
+      try { return inner + Buffer.byteLength(JSON.stringify(value), 'utf8'); } catch { return inner + 1_024; }
+    }, 0), 0);
+    let bytes = estimate();
+    while (bytes > this.hotStateMaxBytes) {
+      const largest = maps.sort((left, right) => right.size - left.size)[0];
+      if (!largest || largest.size === 0) break;
+      largest.delete(largest.keys().next().value as string);
+      this.hotStateEvictions += 1;
+      bytes = estimate();
+    }
+  }
+
+  hotStateStats(): {
+    entries: number;
+    estimatedBytes: number;
+    maxEntries: number;
+    maxBytes: number;
+    ttlMs: number;
+    evictions: number;
+    persistenceDedupe: {
+      entries: number;
+      bytes: number;
+      maxEntries: number;
+      maxBytes: number;
+      ttlMs: number;
+      evicted: number;
+      expired: number;
+      dropped: number;
+    };
+  } {
+    this.pruneHotState();
+    this.prunePersistenceFingerprints();
+    const maps: Array<Map<string, unknown>> = [
+      this.bindings as Map<string, unknown>, this.threads as Map<string, unknown>,
+      this.segments as Map<string, unknown>, this.routeAliases as Map<string, unknown>,
+      this.technicalActivities as Map<string, unknown>, this.membershipsV2 as Map<string, unknown>,
+    ];
+    const estimatedBytes = maps.reduce<number>((sum, map) => sum + [...map.values()].reduce<number>((inner, value) => {
+      try { return inner + Buffer.byteLength(JSON.stringify(value), 'utf8'); } catch { return inner + 1_024; }
+    }, 0), 0);
+    return {
+      entries: maps.reduce((sum, map) => sum + map.size, 0),
+      estimatedBytes,
+      maxEntries: this.hotStateMaxEntries,
+      maxBytes: this.hotStateMaxBytes,
+      ttlMs: this.hotStateTtlMs,
+      evictions: this.hotStateEvictions,
+      persistenceDedupe: {
+        entries: this.persistenceFingerprints.size,
+        bytes: this.persistenceFingerprintBytes,
+        maxEntries: this.maxPersistenceFingerprints,
+        maxBytes: this.maxPersistenceFingerprintBytes,
+        ttlMs: this.persistenceFingerprintTtlMs,
+        evicted: this.persistenceFingerprintEvictions,
+        expired: this.persistenceFingerprintExpired,
+        dropped: this.persistenceFingerprintDropped,
+      },
+    };
+  }
 
   private changedForPersistence<Item>(
     namespace: string,
     items: Item[],
     identity: (item: Item) => string,
   ): Item[] {
+    this.prunePersistenceFingerprints();
     return items.filter((item) => {
       const key = `${namespace}\u0000${identity(item)}`;
       const fingerprint = createHash('sha256').update(canonicalJson(item)).digest('hex');
-      return this.persistenceFingerprints.get(key) !== fingerprint;
+      return this.persistenceFingerprints.get(key)?.fingerprint !== fingerprint;
     });
   }
 
@@ -226,28 +538,76 @@ export class AgentConversationBindingService {
     items: Item[],
     identity: (item: Item) => string,
   ): void {
+    const now = Date.now();
+    this.prunePersistenceFingerprints(now);
     for (const item of items) {
       const key = `${namespace}\u0000${identity(item)}`;
       const fingerprint = createHash('sha256').update(canonicalJson(item)).digest('hex');
-      if (this.persistenceFingerprints.has(key)) this.persistenceFingerprints.delete(key);
-      this.persistenceFingerprints.set(key, fingerprint);
+      const bytes = Buffer.byteLength(key, 'utf8') + Buffer.byteLength(fingerprint, 'utf8') + 24;
+      if (bytes > this.maxPersistenceFingerprintBytes) {
+        this.persistenceFingerprintDropped += 1;
+        continue;
+      }
+      const previous = this.persistenceFingerprints.get(key);
+      if (previous) {
+        this.persistenceFingerprints.delete(key);
+        this.persistenceFingerprintBytes = Math.max(0, this.persistenceFingerprintBytes - previous.bytes);
+      }
+      this.persistenceFingerprints.set(key, { fingerprint, bytes, touchedAt: now });
+      this.persistenceFingerprintBytes += bytes;
     }
-    while (this.persistenceFingerprints.size > this.maxPersistenceFingerprints) {
-      const oldest = this.persistenceFingerprints.keys().next().value as string | undefined;
-      if (!oldest) break;
-      this.persistenceFingerprints.delete(oldest);
+    this.prunePersistenceFingerprints(now);
+  }
+
+  private boundV2PersistenceItems<Item>(
+    items: readonly Item[],
+    maxEntries: number,
+    maxBytes = V2_PERSIST_MAX_CATEGORY_BYTES,
+  ): { items: Item[]; truncated: boolean } {
+    const bounded: Item[] = [];
+    let bytes = 2;
+    let truncated = false;
+    for (const item of items) {
+      if (bounded.length >= maxEntries) {
+        truncated = true;
+        break;
+      }
+      const itemBytes = Buffer.byteLength(canonicalJson(item), 'utf8') + 1;
+      if (bytes + itemBytes > maxBytes) {
+        truncated = true;
+        break;
+      }
+      bounded.push(item);
+      bytes += itemBytes;
     }
+    if (bounded.length < items.length) truncated = true;
+    return { items: bounded, truncated };
   }
 
   private async bindByPersistedAnchors(
     records: T.AgentInteractionRecord[],
   ): Promise<void> {
+    this.pruneHotState();
     if (!records.length || !this.relationalStore?.configured()) return;
     for (const record of records) {
       record.conversationAnchors = conversationAnchorsForInteraction(record);
     }
+    // A stable CLI definition may resume after the collector reports a synthetic workspace.  In
+    // that case an SQL scope predicate would hide the very anchor needed for the resume bridge;
+    // fetch broadly and apply the stricter per-Thread fence below.  Application/workflow records
+    // (and records without a registered identity) use the database scope index as an early gate.
+    const hasCrossRuntimeDefinition = records.some((record) =>
+      syntheticWorkspace(record.workspacePath)
+      || (Boolean(record.logicalAgentId) && !applicationScopeMode(record.logicalScopeMode)));
+    const logicalScopeKeys = hasCrossRuntimeDefinition
+      ? []
+      : [...new Set(records.flatMap((record) => [
+          conversationLogicalScopeKey(record),
+          conversationLogicalScopeKeyV2(record), // additive bridge for pre-deployment-fence rows
+        ]))].slice(0, 4_096);
     const matches = await this.relationalStore.loadAgentConversationMembershipsByAnchors(
       records.flatMap((record) => record.conversationAnchors ?? []),
+      logicalScopeKeys,
     );
     const conversationIds = [...new Set(matches
       .map((match) => match.membership.canonicalConversationId)
@@ -283,6 +643,7 @@ export class AgentConversationBindingService {
           );
           const thread = this.threads.get(canonical);
           if (!thread || !sameThreadDomain(record, thread)) continue;
+          if (!anchorScopeCompatible(record, thread, match.anchor.logicalScopeKey)) continue;
           const candidate = candidates.get(canonical) ?? {
             thread,
             anchors: new Map<string, number>(),
@@ -326,6 +687,7 @@ export class AgentConversationBindingService {
   async applyPersistedBindings(
     interactions: T.AgentInteractionRecord[],
   ): Promise<T.AgentInteractionRecord[]> {
+    this.pruneHotState();
     if (interactions.length === 0) return [];
     const interactionIds = interactions.map((record) => record.interactionId);
     if (this.relationalStore?.configured()) {
@@ -374,8 +736,41 @@ export class AgentConversationBindingService {
         : undefined;
       return {
         ...record,
+        ...(binding ? {
+          ...(binding.logicalAgentId ? { logicalAgentId: binding.logicalAgentId } : {}),
+          ...(binding.logicalDefinitionId ? { logicalDefinitionId: binding.logicalDefinitionId } : {}),
+          ...(binding.logicalScopeMode ? { logicalScopeMode: binding.logicalScopeMode } : {}),
+          ...(binding.logicalIdentityAuthority ? { logicalIdentityAuthority: binding.logicalIdentityAuthority } : {}),
+          ...(binding.profile ? { profile: binding.profile } : {}),
+          ...(binding.profileVersion ? { profileVersion: binding.profileVersion } : {}),
+          ...(binding.deploymentId ? { deploymentId: binding.deploymentId } : {}),
+          ...(binding.deploymentRevision ? { deploymentRevision: binding.deploymentRevision } : {}),
+          ...(binding.environmentId ? { environmentId: binding.environmentId } : {}),
+          ...(binding.sessionKey ? { sessionKey: binding.sessionKey } : {}),
+          ...(binding.providerSessionIdHash ? { providerSessionIdHash: binding.providerSessionIdHash } : {}),
+          ...(binding.canonicalSessionId ? { canonicalSessionId: binding.canonicalSessionId } : {}),
+          ...(binding.sessionNamespaceKey ? { sessionNamespaceKey: binding.sessionNamespaceKey } : {}),
+          ...(binding.sessionMode ? { sessionMode: binding.sessionMode } : {}),
+          ...(binding.sessionLifecycle ? { sessionLifecycle: binding.sessionLifecycle } : {}),
+          ...(binding.parentSessionId ? { parentSessionId: binding.parentSessionId } : {}),
+          ...(binding.canonicalParentSessionId
+            ? { canonicalParentSessionId: binding.canonicalParentSessionId }
+            : {}),
+        } : {}),
         ...(thread ? {
           workspacePath: preferredWorkspace(record.workspacePath, thread.workspacePath),
+          ...(thread.logicalAgentId ? { logicalAgentId: thread.logicalAgentId } : {}),
+          ...(thread.logicalDefinitionId ? { logicalDefinitionId: thread.logicalDefinitionId } : {}),
+          ...(thread.logicalScopeMode ? { logicalScopeMode: thread.logicalScopeMode } : {}),
+          ...(thread.logicalIdentityAuthority ? { logicalIdentityAuthority: thread.logicalIdentityAuthority } : {}),
+          ...(thread.profile ? { profile: thread.profile } : {}),
+          ...(thread.profileVersion ? { profileVersion: thread.profileVersion } : {}),
+          ...(thread.deploymentId ? { deploymentId: thread.deploymentId } : {}),
+          ...(thread.deploymentRevision ? { deploymentRevision: thread.deploymentRevision } : {}),
+          ...(thread.environmentId ? { environmentId: thread.environmentId } : {}),
+          ...(thread.environment ? { environment: thread.environment } : {}),
+          ...(thread.sessionKey ? { sessionKey: thread.sessionKey } : {}),
+          ...(thread.providerSessionIdHash ? { providerSessionIdHash: thread.providerSessionIdHash } : {}),
         } : {}),
         ...(canonicalConversationId ? { conversationId: canonicalConversationId } : {}),
         ...(canonicalConversationId ? { conversationIdSource: 'inferred' as const } : {}),
@@ -425,7 +820,9 @@ export class AgentConversationBindingService {
             score += 80;
             evidence.push('request_sha256');
           }
-          if (extendedLineage && (sameInstance || cliProduct(record.agentProduct))) {
+          const resumableLineage = record.sessionMode !== 'per_request'
+            && record.sessionIdentityQuality !== 'ephemeral';
+          if (extendedLineage && (sameInstance || resumableLineage)) {
             score += sameInstance ? 70 : 60;
             evidence.push(sameInstance ? 'same_instance_lineage' : 'cli_resume_lineage');
           } else if (sameInstance && repeatedLineage) {
@@ -454,9 +851,54 @@ export class AgentConversationBindingService {
       record.conversationBindingVersion = AGENT_CONVERSATION_RESOLVER_VERSION;
       record.correlationQuality = best.evidence.includes('tool_call_id') ? 'exact' : 'strong';
     }
-    const resolution = resolveAgentConversationsV2(projected);
+    // Resolver revisions are logical projection versions. Keep a compact monotonic counter per
+    // distinct input snapshot instead of deriving one from Unix milliseconds (which previously
+    // produced values near 1e14 and then collapsed to the 1e6 safety cap in the canonical lane).
+    // The fingerprint intentionally includes only bounded identity/anchor fields, never prompt or
+    // response bodies.
+    const resolutionInput = projected
+      .map((record) => {
+        const stableLogicalAuthority = record.logicalIdentityAuthority === 'management_registration'
+          || record.logicalIdentityAuthority === 'authenticated_adapter';
+        return {
+          interactionId: record.interactionId,
+          ...(stableLogicalAuthority ? {
+            logicalAgentId: record.logicalAgentId,
+            logicalDefinitionId: record.logicalDefinitionId,
+            logicalScopeMode: record.logicalScopeMode,
+          } : {}),
+          sessionId: record.sessionId,
+          canonicalSessionId: record.canonicalSessionId,
+          sessionNamespaceKey: record.sessionNamespaceKey,
+          sessionLifecycle: record.sessionLifecycle,
+          parentSessionId: record.parentSessionId,
+          canonicalParentSessionId: record.canonicalParentSessionId,
+          trafficRole: trafficRoleForInteraction(record),
+          conversationAnchors: (record.conversationAnchors ?? []).map((anchor) => ({
+            kind: anchor.kind,
+            namespace: anchor.namespace,
+            valueHash: anchor.valueHash,
+            strength: anchor.strength,
+          })),
+        };
+      })
+      .sort((left, right) => left.interactionId.localeCompare(right.interactionId));
+    const nextFingerprint = createHash('sha256').update(canonicalJson(resolutionInput)).digest('hex');
+    if (this.resolutionInputFingerprint !== nextFingerprint) {
+      this.resolutionInputFingerprint = nextFingerprint;
+      this.resolutionRevision = Math.min(
+        CANONICAL_SESSION_REVISION_MAX,
+        Math.max(1, this.resolutionRevision + 1),
+      );
+    }
+    const resolution = resolveAgentConversationsV2(projected, this.resolutionRevision || 1);
     this.pendingResolution = resolution;
     this.resolutionRevision = Math.max(this.resolutionRevision, resolution.resolutionRevision);
+    for (const aliasId of resolution.aliasConflicts ?? []) {
+      this.canonicalObservability?.recordGap('correlation', 'relation_ambiguous', aliasId, {
+        alias: 'competing_conversation_targets',
+      });
+    }
     for (const alias of resolution.aliases) this.routeAliases.set(alias.aliasConversationId, alias);
     for (const activity of resolution.technicalActivities) {
       this.technicalActivities.set(activity.technicalActivityId, activity);
@@ -467,7 +909,174 @@ export class AgentConversationBindingService {
     return resolution.records;
   }
 
+  /**
+   * Ingest-time canonical Session projection.  Conversation/segment grouping is intentionally
+   * deferred, but the Session identity and its source references are available on the interaction
+   * itself and must not wait for a later read or PostgreSQL-enabled materializer.
+   */
+  async commitInteractionMembership(record: T.AgentInteractionRecord): Promise<void> {
+    if (!this.canonicalObservability) return;
+    const sessionKey = record.sessionKey;
+    const rawSession = record.sessionId;
+    const sessionId = sessionKey ?? rawSession ?? `sess_${createHash('sha256').update(record.interactionId).digest('hex').slice(0, 24)}`;
+    const baseQuality: T.SessionIdentityQuality = record.sessionIdentityQuality === 'confirmed'
+      ? 'confirmed'
+      : record.sessionIdentityQuality === 'strong' ? 'strong'
+        : record.sessionIdentityQuality === 'ephemeral' ? 'ephemeral' : 'inferred';
+    const confidence: T.SessionIdentityQuality = !sessionKey
+      && (baseQuality === 'confirmed' || baseQuality === 'strong') ? 'inferred' : baseQuality;
+    const rawResolutionRevision = Number(
+      record.sessionResolutionRevision ?? record.conversationBindingVersion ?? 1,
+    );
+    const resolutionRevision = Number.isSafeInteger(rawResolutionRevision) && rawResolutionRevision >= 1
+      ? Math.min(CANONICAL_SESSION_REVISION_MAX, rawResolutionRevision) : 1;
+    const role = record.trafficRole === 'bootstrap' ? 'bootstrap'
+      : record.trafficRole === 'control' ? 'control'
+        : record.trafficRole === 'background' ? 'background'
+          : record.trafficRole === 'tool_backend' ? 'tool_backend' : 'conversation';
+    const sourceRefs = [...new Set([
+      record.interactionId,
+      record.rawObservationId,
+      ...(record.sourceObservationIds ?? []),
+      ...(record.evidenceEventIds ?? []),
+    ].filter((value): value is string => Boolean(value)))].slice(0, 128);
+    const membership = {
+      schemaVersion: 'anysentry.session_membership.v1' as const,
+      membershipId: `sm_${createHash('sha256').update([
+        record.interactionId, sessionKey ?? rawSession ?? '', String(resolutionRevision),
+      ].join('\0')).digest('hex').slice(0, 24)}`,
+      sessionId: record.canonicalSessionId
+        ?? canonicalSessionIdForMembership(
+          rawSession ?? sessionId,
+          record.sessionNamespaceKey,
+          record.interactionId,
+        ),
+      ...(sessionKey ? { sessionKey } : {}),
+      ...(record.providerSessionIdHash ? { providerSessionIdHash: record.providerSessionIdHash } : {}),
+      ...(record.sessionNamespaceKey ? { sessionNamespaceKey: record.sessionNamespaceKey } : {}),
+      ...(record.sessionMode ? { sessionMode: record.sessionMode } : {}),
+      ...(record.sessionLifecycle ? { sessionLifecycle: record.sessionLifecycle } : {}),
+      ...(() => {
+        const canonicalParentSessionId = record.canonicalParentSessionId
+          ?? canonicalParentSessionIdForMembership(
+            record.parentSessionId,
+            record.sessionNamespaceKey,
+          );
+        if (record.parentSessionId && !canonicalParentSessionId) {
+          this.canonicalObservability?.recordGap('session', 'identity_unknown', record.interactionId, {
+            parent: 'namespace_unavailable',
+          });
+        }
+        return canonicalParentSessionId
+          ? { parentSessionId: canonicalParentSessionId, canonicalParentSessionId }
+          : record.parentSessionId ? { parentSessionId: record.parentSessionId } : {};
+      })(),
+      interactionId: record.interactionId,
+      ...(record.logicalAgentId ? { logicalAgentId: record.logicalAgentId } : {}),
+      ...(record.canonicalAgentInstanceId
+        ? { agentInstanceId: record.canonicalAgentInstanceId }
+        : {}),
+      ...(record.runtimeInstanceId ?? record.agentInstanceId
+        ? { runtimeInstanceId: record.runtimeInstanceId ?? record.agentInstanceId }
+        : {}),
+      role,
+      confidence,
+      evidence: sourceRefs,
+      resolverVersion: 'canonical-session-membership.v1',
+      resolutionRevision,
+      validFromUnixNs: record.startedAtUnixNs,
+      sourceRefs,
+    };
+    const result = await this.canonicalObservability.commitSessionMemberships([membership]);
+    if (result.rejected > 0) {
+      this.canonicalObservability.recordGap('projection', 'dropped', record.interactionId, {
+        projection: 'session_membership', rejected: result.rejected,
+      });
+    }
+  }
+
+  async commitEventMembership(event: T.JudgedEvent): Promise<void> {
+    if (!this.canonicalObservability) return;
+    const sessionKey = event.sessionKey;
+    const rawSession = event.sessionId;
+    const sessionId = sessionKey ?? rawSession;
+    if (!sessionId) return;
+    const baseQuality: T.SessionIdentityQuality = event.sessionIdentityQuality === 'confirmed'
+      ? 'confirmed'
+      : event.sessionIdentityQuality === 'strong' ? 'strong'
+        : event.sessionIdentityQuality === 'ephemeral' ? 'ephemeral' : 'inferred';
+    const confidence: T.SessionIdentityQuality = !sessionKey
+      && (baseQuality === 'confirmed' || baseQuality === 'strong') ? 'inferred' : baseQuality;
+    const rawResolutionRevision = Number(event.sessionResolutionRevision ?? 1);
+    const resolutionRevision = Number.isSafeInteger(rawResolutionRevision) && rawResolutionRevision >= 1
+      ? Math.min(CANONICAL_SESSION_REVISION_MAX, rawResolutionRevision) : 1;
+    const normalizedKind = event.eventKind.trim().toLowerCase();
+    const role = normalizedKind.includes('tool') ? 'tool_backend'
+      : normalizedKind.includes('bootstrap') ? 'bootstrap'
+        : normalizedKind.includes('control') ? 'control'
+          : normalizedKind.includes('background') ? 'background' : 'conversation';
+    const sourceRefs = [...new Set([
+      event.eventId,
+      event.rawObservationId,
+      event.sourceEventId,
+    ].filter((value): value is string => Boolean(value)))].slice(0, 128);
+    const membership = {
+      schemaVersion: 'anysentry.session_membership.v1' as const,
+      membershipId: `sm_${createHash('sha256').update([
+        event.eventId, sessionKey ?? rawSession, String(resolutionRevision),
+      ].join('\0')).digest('hex').slice(0, 24)}`,
+      sessionId: event.canonicalSessionId
+        ?? canonicalSessionIdForMembership(
+          rawSession ?? sessionId,
+          event.sessionNamespaceKey,
+          event.eventId,
+        ),
+      ...(sessionKey ? { sessionKey } : {}),
+      ...(event.providerSessionIdHash ? { providerSessionIdHash: event.providerSessionIdHash } : {}),
+      ...(event.sessionNamespaceKey ? { sessionNamespaceKey: event.sessionNamespaceKey } : {}),
+      ...(event.sessionMode ? { sessionMode: event.sessionMode } : {}),
+      ...(event.sessionLifecycle ? { sessionLifecycle: event.sessionLifecycle } : {}),
+      ...(() => {
+        const canonicalParentSessionId = event.canonicalParentSessionId
+          ?? canonicalParentSessionIdForMembership(
+            event.parentSessionId,
+            event.sessionNamespaceKey,
+          );
+        if (event.parentSessionId && !canonicalParentSessionId) {
+          this.canonicalObservability?.recordGap('session', 'identity_unknown', event.eventId, {
+            parent: 'namespace_unavailable',
+          });
+        }
+        return canonicalParentSessionId
+          ? { parentSessionId: canonicalParentSessionId, canonicalParentSessionId }
+          : event.parentSessionId ? { parentSessionId: event.parentSessionId } : {};
+      })(),
+      interactionId: event.eventId,
+      ...(event.logicalAgentId ? { logicalAgentId: event.logicalAgentId } : {}),
+      ...(event.canonicalAgentInstanceId
+        ? { agentInstanceId: event.canonicalAgentInstanceId }
+        : {}),
+      ...(event.runtimeInstanceId ?? event.attribution?.agentInstanceId
+        ? { runtimeInstanceId: event.runtimeInstanceId ?? event.attribution?.agentInstanceId }
+        : {}),
+      role,
+      confidence,
+      evidence: sourceRefs,
+      resolverVersion: 'canonical-session-membership.v1',
+      resolutionRevision,
+      validFromUnixNs: event.eventAtUnixNs ?? (BigInt(Math.max(1, Math.trunc(event.at))) * 1_000_000n).toString(),
+      sourceRefs,
+    };
+    const result = await this.canonicalObservability.commitSessionMemberships([membership]);
+    if (result.rejected > 0) {
+      this.canonicalObservability.recordGap('projection', 'dropped', event.eventId, {
+        projection: 'session_membership', rejected: result.rejected,
+      });
+    }
+  }
+
   async persistProjection(projection: AgentConversationProjection): Promise<void> {
+    this.pruneHotState();
     const threads: T.AgentConversationThreadRecord[] = [];
     const segments: T.ConversationInstanceSegment[] = [];
     const bindings: T.AgentConversationBindingRecord[] = [];
@@ -493,6 +1102,32 @@ export class AgentConversationBindingService {
         schemaVersion: 'anysentry.agent_conversation_thread.v1',
         conversationId: summary.conversationId,
         logicalScopeKey,
+        ...(first.logicalAgentId ? { logicalAgentId: first.logicalAgentId } : {}),
+        ...(first.logicalDefinitionId ? { logicalDefinitionId: first.logicalDefinitionId } : {}),
+        ...(first.logicalScopeMode ? { logicalScopeMode: first.logicalScopeMode } : {}),
+        ...(first.logicalIdentityAuthority ? { logicalIdentityAuthority: first.logicalIdentityAuthority } : {}),
+        ...(first.logicalDefinitionFingerprint
+          ? { definitionFingerprint: first.logicalDefinitionFingerprint } : {}),
+        ...(first.profile ? { profile: first.profile } : {}),
+        ...(first.profileVersion ? { profileVersion: first.profileVersion } : {}),
+        ...(first.deploymentId ? { deploymentId: first.deploymentId } : {}),
+        ...(first.deploymentRevision ? { deploymentRevision: first.deploymentRevision } : {}),
+        ...((summary.sessionId ?? first.sessionId ?? priorThread?.sessionId)
+          ? { sessionId: summary.sessionId ?? first.sessionId ?? priorThread?.sessionId } : {}),
+        ...((first.sessionKey ?? priorThread?.sessionKey)
+          ? { sessionKey: first.sessionKey ?? priorThread?.sessionKey } : {}),
+        ...((first.providerSessionIdHash ?? priorThread?.providerSessionIdHash)
+          ? { providerSessionIdHash: first.providerSessionIdHash ?? priorThread?.providerSessionIdHash } : {}),
+        ...((summary.sessionIdentityQuality ?? priorThread?.sessionIdentityQuality)
+          ? { sessionIdentityQuality: summary.sessionIdentityQuality ?? priorThread?.sessionIdentityQuality } : {}),
+        ...((summary.sessionMode ?? priorThread?.sessionMode)
+          ? { sessionMode: summary.sessionMode ?? priorThread?.sessionMode } : {}),
+        ...((summary.sessionLifecycle ?? priorThread?.sessionLifecycle)
+          ? { sessionLifecycle: summary.sessionLifecycle ?? priorThread?.sessionLifecycle } : {}),
+        ...((summary.parentSessionId ?? priorThread?.parentSessionId)
+          ? { parentSessionId: summary.parentSessionId ?? priorThread?.parentSessionId } : {}),
+        ...((summary.canonicalParentSessionId ?? priorThread?.canonicalParentSessionId)
+          ? { canonicalParentSessionId: summary.canonicalParentSessionId ?? priorThread?.canonicalParentSessionId } : {}),
         idSource: priorThread && threadRank(priorThread.idSource) > threadRank(summary.idSource)
           ? priorThread.idSource
           : summary.idSource,
@@ -501,6 +1136,9 @@ export class AgentConversationBindingService {
           : {}),
         ...(first.environmentId ?? priorThread?.environmentId
           ? { environmentId: first.environmentId ?? priorThread?.environmentId }
+          : {}),
+        ...(first.environment ?? priorThread?.environment
+          ? { environment: first.environment ?? priorThread?.environment }
           : {}),
         agentProduct: summary.agentProduct,
         workspacePath,
@@ -560,6 +1198,11 @@ export class AgentConversationBindingService {
             ),
             conversationId: summary.conversationId,
             agentInstanceId: instanceId,
+            ...(record.canonicalAgentInstanceId
+              ? { canonicalAgentInstanceId: record.canonicalAgentInstanceId }
+              : {}),
+            runtimeInstanceId: record.runtimeInstanceId ?? instanceId,
+            ...(record.terminalContextId ? { terminalContextId: record.terminalContextId } : {}),
             ordinal: nextOrdinal,
             startedAtUnixNs: record.startedAtUnixNs,
             firstInteractionId: record.interactionId,
@@ -581,7 +1224,22 @@ export class AgentConversationBindingService {
           conversationId: summary.conversationId,
           segmentId: segment.segmentId,
           agentInstanceId: instanceId,
+          ...(record.canonicalAgentInstanceId
+            ? { canonicalAgentInstanceId: record.canonicalAgentInstanceId }
+            : {}),
+          ...(record.runtimeInstanceId
+            ? { runtimeInstanceId: record.runtimeInstanceId }
+            : {}),
           logicalScopeKey,
+          ...(record.logicalAgentId ? { logicalAgentId: record.logicalAgentId } : {}),
+          ...(record.logicalDefinitionId ? { logicalDefinitionId: record.logicalDefinitionId } : {}),
+          ...(record.logicalIdentityAuthority ? { logicalIdentityAuthority: record.logicalIdentityAuthority } : {}),
+          ...(record.logicalScopeMode ? { logicalScopeMode: record.logicalScopeMode } : {}),
+          ...(record.profile ? { profile: record.profile } : {}),
+          ...(record.profileVersion ? { profileVersion: record.profileVersion } : {}),
+          ...(record.deploymentId ? { deploymentId: record.deploymentId } : {}),
+          ...(record.deploymentRevision ? { deploymentRevision: record.deploymentRevision } : {}),
+          ...(record.environmentId ? { environmentId: record.environmentId } : {}),
           evidence: summary.idSource === 'provider'
             ? ['provider_conversation_or_response_chain']
             : summary.idSource === 'runtime'
@@ -593,6 +1251,33 @@ export class AgentConversationBindingService {
           resolverVersion: AGENT_CONVERSATION_RESOLVER_VERSION,
           decidedAt: record.receivedAt,
           updatedAt: record.receivedAt,
+          ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+          ...(record.sessionKey ? { sessionKey: record.sessionKey } : {}),
+          ...(record.providerSessionIdHash ? { providerSessionIdHash: record.providerSessionIdHash } : {}),
+          ...(record.canonicalSessionId ? { canonicalSessionId: record.canonicalSessionId } : {}),
+          ...(record.sessionNamespaceKey ? { sessionNamespaceKey: record.sessionNamespaceKey } : {}),
+          ...(record.sessionIdentityQuality
+            ? { sessionIdentityQuality: record.sessionIdentityQuality } : {}),
+          ...(record.sessionResolutionRevision !== undefined
+            ? { sessionResolutionRevision: record.sessionResolutionRevision }
+            : {}),
+          ...(record.sessionMode ? { sessionMode: record.sessionMode } : {}),
+          ...(record.sessionLifecycle ? { sessionLifecycle: record.sessionLifecycle } : {}),
+          ...(() => {
+            const canonicalParentSessionId = record.canonicalParentSessionId
+              ?? canonicalParentSessionIdForMembership(
+                record.parentSessionId,
+                record.sessionNamespaceKey,
+              );
+            if (record.parentSessionId && !canonicalParentSessionId) {
+              this.canonicalObservability?.recordGap('session', 'identity_unknown', record.interactionId, {
+                parent: 'namespace_unavailable',
+              });
+            }
+            return canonicalParentSessionId
+              ? { parentSessionId: canonicalParentSessionId, canonicalParentSessionId }
+              : record.parentSessionId ? { parentSessionId: record.parentSessionId } : {};
+          })(),
         });
       }
       if (segment) segments.push(segment);
@@ -600,6 +1285,123 @@ export class AgentConversationBindingService {
 
     for (const segment of segments) this.segments.set(segment.segmentId, segment);
     for (const binding of bindings) this.bindings.set(binding.interactionId, binding);
+    // Materialize the versioned canonical SessionMembership projection independently of the
+    // legacy V1/V2 conversation tables.  This keeps the Session contract queryable in the
+    // memory-only profile as well as when PostgreSQL is configured; raw/provider IDs remain
+    // compatibility fields while `sessionKey`/hash carry the namespaced identity.
+    if (this.canonicalObservability && bindings.length) {
+      const pendingByInteraction = new Map(
+        [...(this.pendingResolution?.memberships ?? [])].map((membership) => [membership.interactionId, membership]),
+      );
+      const recordByInteraction = new Map(
+        [...projection.interactionsByConversation.values()].flat().map((record) => [record.interactionId, record]),
+      );
+      const canonicalMemberships = bindings.map((binding) => {
+        const pending = pendingByInteraction.get(binding.interactionId);
+        const record = recordByInteraction.get(binding.interactionId);
+        // Canonical SessionMembership revisions belong to the interaction's Session resolution.
+        // Prefer the explicit ingest-time revision; the resolver's batch revision may advance when
+        // another interaction arrives and must not manufacture a duplicate row for an unchanged
+        // interaction merely because a projection query used a different subset.
+        const pendingRevision = Number(record?.sessionResolutionRevision ?? pending?.resolutionRevision ?? 1);
+        const baseRevision = Number.isSafeInteger(pendingRevision) && pendingRevision >= 1
+          ? Math.min(CANONICAL_SESSION_REVISION_MAX, pendingRevision) : 1;
+        // Ingest commits the minimal SessionMembership before a conversation/segment is known.
+        // The later binding is an additive projection revision (not an in-place enrichment), which
+        // keeps the raw membership immutable and avoids same-key fingerprint conflicts on every
+        // read-time projection. Re-reading the same binding deterministically produces revision
+        // `base+1` and therefore a duplicate, not a conflict.
+        const resolutionRevision = baseRevision >= CANONICAL_SESSION_REVISION_MAX
+          ? baseRevision
+          : baseRevision + 1;
+        const confidence: T.SessionIdentityQuality = binding.correlationQuality === 'exact'
+          ? 'confirmed'
+          : binding.correlationQuality === 'strong'
+            ? 'strong'
+            : binding.correlationQuality === 'ambiguous'
+              ? 'conflict'
+            // Canonical IdentityQuality intentionally has no `unknown` member; retain the
+            // evidence-level coverage gap in the binding while representing the Session identity
+            // as unresolved so the canonical membership validator cannot drop the whole record.
+            : binding.correlationQuality === 'coverage_gap' ? 'unresolved' : 'inferred';
+        const validFromUnixNs = (BigInt(Math.max(1, Math.trunc(binding.decidedAt || Date.now()))) * 1_000_000n).toString();
+        const sessionKey = binding.sessionKey;
+        const canonicalConfidence: T.SessionIdentityQuality = !sessionKey
+          && (confidence === 'confirmed' || confidence === 'strong')
+          ? 'inferred'
+          : confidence;
+        // The canonical lane never exposes a provider's raw session identifier as its primary
+        // key.  Prefer the opaque Session ID materialized at ingest; legacy bindings fall back to
+        // the namespaced key or an interaction-scoped HMAC value.
+        const sessionId = record?.canonicalSessionId
+          ?? binding.canonicalSessionId
+          ?? canonicalSessionIdForMembership(
+            record?.sessionId ?? binding.sessionId ?? binding.conversationId,
+            record?.sessionNamespaceKey ?? binding.sessionNamespaceKey,
+            binding.interactionId,
+          );
+        return {
+          schemaVersion: 'anysentry.session_membership.v1' as const,
+          membershipId: `sm_${createHash('sha256').update([
+            binding.interactionId,
+            binding.sessionKey ?? binding.sessionId ?? '',
+            String(resolutionRevision),
+          ].join('\0')).digest('hex').slice(0, 24)}`,
+          sessionId,
+          ...(sessionKey ? { sessionKey } : {}),
+          ...(binding.providerSessionIdHash ? { providerSessionIdHash: binding.providerSessionIdHash } : {}),
+          ...(binding.sessionNamespaceKey ? { sessionNamespaceKey: binding.sessionNamespaceKey } : {}),
+          ...(() => {
+            const canonicalParentSessionId = record?.canonicalParentSessionId
+              ?? binding.canonicalParentSessionId
+              ?? canonicalParentSessionIdForMembership(
+                record?.parentSessionId ?? binding.parentSessionId,
+                record?.sessionNamespaceKey ?? binding.sessionNamespaceKey,
+              );
+            const rawParentSessionId = record?.parentSessionId ?? binding.parentSessionId;
+            if (rawParentSessionId && !canonicalParentSessionId) {
+              this.canonicalObservability?.recordGap('session', 'identity_unknown', binding.interactionId, {
+                parent: 'namespace_unavailable',
+              });
+            }
+            return canonicalParentSessionId
+              ? { parentSessionId: canonicalParentSessionId, canonicalParentSessionId }
+              : rawParentSessionId ? { parentSessionId: rawParentSessionId } : {};
+          })(),
+          interactionId: binding.interactionId,
+          logicalAgentId: binding.logicalAgentId,
+          ...(binding.canonicalAgentInstanceId
+            ? { agentInstanceId: binding.canonicalAgentInstanceId }
+            : {}),
+          ...(binding.runtimeInstanceId
+            ? { runtimeInstanceId: binding.runtimeInstanceId }
+            : {}),
+          segmentId: binding.segmentId,
+          role: pending?.role ?? 'conversation',
+          confidence: canonicalConfidence,
+          evidence: [...new Set([
+            ...binding.evidence,
+            ...(record?.rawObservationId ? [record.rawObservationId] : []),
+          ])].slice(0, 128),
+          resolverVersion: 'canonical-session-membership.v1',
+          resolutionRevision,
+          validFromUnixNs,
+          sourceRefs: [...new Set([
+            binding.interactionId,
+            ...(record?.rawObservationId ? [record.rawObservationId] : []),
+          ])].slice(0, 128),
+        };
+      });
+      const canonicalCommit = await this.canonicalObservability.commitSessionMemberships(canonicalMemberships);
+      if (canonicalCommit.rejected > 0) {
+        this.canonicalObservability.recordGap(
+          'projection',
+          'dropped',
+          'session_membership',
+          { rejected: canonicalCommit.rejected },
+        );
+      }
+    }
     if (this.relationalStore?.configured()) {
       const changedThreads = this.changedForPersistence(
         'thread', threads, (item) => item.conversationId,
@@ -636,15 +1438,42 @@ export class AgentConversationBindingService {
               }
             : membership;
         });
-        const anchors = pending.records.flatMap((record) =>
+        const rawAnchors = pending.records.flatMap((record) =>
           (record.conversationAnchors ?? []).map((anchor) => ({
             interactionId: record.interactionId,
-            logicalScopeKey: conversationLogicalScopeKeyV2(record),
+            logicalScopeKey: conversationLogicalScopeKey(record),
             observedAt: record.receivedAt,
             anchor,
           })));
+        const boundedAnchors = this.boundV2PersistenceItems(rawAnchors, V2_PERSIST_MAX_ANCHORS);
+        const boundedMemberships = this.boundV2PersistenceItems(
+          memberships,
+          V2_PERSIST_MAX_MEMBERSHIPS,
+        );
+        const boundedAliases = this.boundV2PersistenceItems(
+          pending.aliases,
+          V2_PERSIST_MAX_ALIASES,
+        );
+        const boundedActivities = this.boundV2PersistenceItems(
+          pending.technicalActivities,
+          V2_PERSIST_MAX_TECHNICAL,
+        );
+        if (boundedAnchors.truncated || boundedMemberships.truncated
+          || boundedAliases.truncated || boundedActivities.truncated) {
+          this.canonicalObservability?.recordGap(
+            'projection',
+            'truncated',
+            'conversation_resolution_v2',
+            {
+              anchors: rawAnchors.length,
+              memberships: memberships.length,
+              aliases: pending.aliases.length,
+              technicalActivities: pending.technicalActivities.length,
+            },
+          );
+        }
         const changedAnchors = this.changedForPersistence(
-          'anchor', anchors,
+          'anchor', boundedAnchors.items,
           (item) => [
             item.interactionId,
             item.anchor.kind,
@@ -653,14 +1482,14 @@ export class AgentConversationBindingService {
           ].join('\u0000'),
         );
         const changedMemberships = this.changedForPersistence(
-          'membership', memberships,
+          'membership', boundedMemberships.items,
           (item) => `${item.interactionId}\u0000${item.resolutionRevision}`,
         );
         const changedAliases = this.changedForPersistence(
-          'alias', pending.aliases, (item) => item.aliasConversationId,
+          'alias', boundedAliases.items, (item) => item.aliasConversationId,
         );
         const changedActivities = this.changedForPersistence(
-          'technical', pending.technicalActivities, (item) => item.technicalActivityId,
+          'technical', boundedActivities.items, (item) => item.technicalActivityId,
         );
         const savedV2 = await this.relationalStore.saveAgentConversationResolutionV2?.(
           changedAnchors,
@@ -668,6 +1497,19 @@ export class AgentConversationBindingService {
           changedAliases,
           changedActivities,
         );
+        if (savedV2 === false) {
+          this.canonicalObservability?.recordGap(
+            'projection',
+            'storage_unavailable',
+            'conversation_resolution_v2',
+            {
+              anchors: changedAnchors.length,
+              memberships: changedMemberships.length,
+              aliases: changedAliases.length,
+              technicalActivities: changedActivities.length,
+            },
+          );
+        }
         if (savedV2) {
           this.rememberPersisted('anchor', changedAnchors, (item) => [
             item.interactionId,
@@ -682,15 +1524,18 @@ export class AgentConversationBindingService {
         }
       }
     }
+    this.pruneHotState();
   }
 
   segmentsForConversation(conversationId: string): T.ConversationInstanceSegment[] {
+    this.pruneHotState();
     const canonical = this.canonicalConversationId(conversationId);
     return collapseContainedSegments([...this.segments.values()]
       .filter((segment) => segment.conversationId === canonical));
   }
 
   routeAlias(conversationId: string): ConversationRouteAliasV1 | undefined {
+    this.pruneHotState();
     const alias = this.routeAliases.get(conversationId);
     return alias ? { ...alias, evidence: [...alias.evidence] } : undefined;
   }
@@ -763,6 +1608,6 @@ export class AgentConversationBindingService {
   }
 
   currentResolutionRevision(): number {
-    return this.resolutionRevision;
+    return Math.max(1, this.resolutionRevision);
   }
 }

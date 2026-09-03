@@ -1,10 +1,13 @@
 import type { JudgedEvent } from './types';
+import { resolveLogicalAgentDefinition } from './canonical-observability';
 
 export const AGENT_SEMANTIC_IDENTITY_VERSION = 'agent_semantic_identity.v1' as const;
 
 type IdentityEvent = Pick<
   JudgedEvent,
   'agentId' | 'workspacePath' | 'sessionId' | 'attributes' | 'process' | 'attribution'
+  | 'logicalAgentId' | 'logicalAgentCandidateId' | 'logicalDefinitionId'
+  | 'logicalScopeMode' | 'logicalIdentityAuthority' | 'terminalContextId'
 >;
 
 export interface AgentSemanticIdentityProjection {
@@ -16,6 +19,13 @@ export interface AgentSemanticIdentityProjection {
   normalizedPhysicalWorkloadId?: string;
   agentRootInstanceId?: string;
   agentProduct?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  logicalDefinitionFingerprint?: string;
+  terminalContextId?: string;
   bindingQuality: 'exact' | 'weak';
   reasonCode:
     | 'exact_kubernetes_container'
@@ -284,6 +294,82 @@ function kubernetesLogicalIdentity(
   ].join(':');
 }
 
+function withLogicalDefinition(
+  event: IdentityEvent,
+  projection: AgentSemanticIdentityProjection,
+): AgentSemanticIdentityProjection {
+  const attributes = event.attributes ?? {};
+  const attr = (key: string): string | undefined => text(attributes[key]);
+  const resolved = resolveLogicalAgentDefinition({
+    logicalAgentId: event.logicalAgentId ?? attr('logical_agent_id') ?? attr('anysentry.logical_agent_id'),
+    family: projection.agentProduct ?? attr('agent.product') ?? attr('agent.runtime.family') ?? event.agentId,
+    tenantId: attr('tenantId') ?? attr('tenant_id') ?? attr('tenant'),
+    ownerId: attr('ownerId') ?? attr('owner_id') ?? attr('owner'),
+    workspacePath: event.workspacePath,
+    repositoryId: attr('repositoryId') ?? attr('repository_id'),
+    profile: attr('profile') ?? attr('config.profile') ?? attr('agent.profile'),
+    profileVersion: attr('profileVersion') ?? attr('profile_version'),
+    definitionId: event.logicalDefinitionId ?? attr('logical_definition_id') ?? attr('workflow_id') ?? attr('service_id'),
+    definitionType: event.logicalScopeMode === 'workflow_definition'
+      ? 'workflow'
+      : event.logicalScopeMode === 'service_definition' ? 'service'
+        : event.logicalDefinitionId ? 'registered' : undefined,
+    logicalScopeMode: event.logicalScopeMode,
+    terminalContextId: event.terminalContextId ?? event.process?.terminalContextId
+      ?? attr('terminal_context_id'),
+    sourceRefs: [
+      attr('rawObservationId') ?? attr('raw_observation_id'),
+      attr('sourceEventId') ?? attr('source_event_id'),
+      attr('sourceId') ?? attr('source_id'),
+    ].filter((value): value is string => Boolean(value)),
+    authority: event.logicalIdentityAuthority === 'management_registration'
+      || event.logicalIdentityAuthority === 'authenticated_adapter'
+      ? event.logicalIdentityAuthority : 'inferred',
+  });
+  const terminalContextId = event.terminalContextId ?? event.process?.terminalContextId
+    ?? attr('terminal_context_id');
+  // `agentScopeId` is an attribution/logical-scope label, not necessarily the product family.
+  // Once the management plane has supplied a LogicalAgent ID it is common for an authoritative
+  // registration to reuse that value as the scope label; do not leak it into the product field.
+  // Adapter/runtime family attributes and the legacy agent ID remain the product projection.
+  const attributionScope = text(event.attribution?.agentScopeId);
+  const managementRegistered = event.logicalIdentityAuthority === 'management_registration';
+  const resolvedProduct = normalizedAgentProduct(
+    attr('agent.product') ?? attr('agent.runtime.family')
+      ?? (managementRegistered
+        ? event.agentId
+        : event.logicalAgentId && attributionScope === event.logicalAgentId
+        ? undefined
+        : attributionScope)
+      ?? event.agentId,
+  );
+  return {
+    ...projection,
+    ...(resolved.stable && !projection.agentProduct && resolvedProduct
+      ? { agentProduct: resolvedProduct } : {}),
+    ...(resolved.definition.logicalAgentId ? { logicalAgentId: resolved.definition.logicalAgentId } : {}),
+    logicalIdentityAuthority: resolved.definition.logicalIdentityAuthority,
+    ...(!resolved.stable && resolved.candidateId
+      ? { logicalAgentCandidateId: resolved.candidateId } : {}),
+    ...(event.logicalDefinitionId ?? resolved.definition.definitionId
+      ? { logicalDefinitionId: event.logicalDefinitionId ?? resolved.definition.definitionId } : {}),
+    logicalScopeMode: resolved.definition.logicalScopeMode,
+    logicalDefinitionFingerprint: resolved.definition.definitionFingerprint,
+    ...(terminalContextId ? { terminalContextId } : {}),
+    // A registered definition is the business identity. Runtime/process aliases remain available
+    // for machine-side correlation and are never replaced by this projection.
+    ...(resolved.stable && resolved.logicalScopeKey
+      ? {
+          canonicalIdentityKey: `logical-agent:${resolved.logicalScopeKey}`,
+          identityAliases: distinct([
+            `logical-agent:${resolved.logicalScopeKey}`,
+            ...projection.identityAliases,
+          ]),
+        }
+      : {}),
+  };
+}
+
 /**
  * Produce a typed, deterministic identity projection without changing any producer field.
  *
@@ -292,7 +378,7 @@ function kubernetesLogicalIdentity(
  * derive that shape, so current `agent_f3...` assets remain stable while `agent_7fc...` becomes a
  * compatibility alias instead of creating a third canonical ID.
  */
-export function projectAgentSemanticIdentity(event: IdentityEvent): AgentSemanticIdentityProjection {
+function projectAgentSemanticIdentityBase(event: IdentityEvent): AgentSemanticIdentityProjection {
   const attribution = event.attribution;
   const physical = text(attribution?.physicalWorkloadId);
   const attributedInstance = text(attribution?.agentInstanceId);
@@ -479,4 +565,9 @@ export function projectAgentSemanticIdentity(event: IdentityEvent): AgentSemanti
     bindingQuality: 'weak',
     reasonCode: 'legacy_session',
   };
+}
+
+/** Add the canonical LogicalAgent definition view without changing legacy runtime identity atoms. */
+export function projectAgentSemanticIdentity(event: IdentityEvent): AgentSemanticIdentityProjection {
+  return withLogicalDefinition(event, projectAgentSemanticIdentityBase(event));
 }

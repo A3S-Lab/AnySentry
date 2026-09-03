@@ -378,7 +378,9 @@ function inspectHost() {
     claude: binaryProbe('claude'),
     pi: binaryProbe('pi'),
     ssh: binaryProbe('ssh', ['-V']),
-    kubectl: binaryProbe('kubectl', ['version', '--client=true', '--short']),
+    // `--short` was removed from newer kubectl/k3s clients; JSON output is supported by both
+    // upstream kubectl and the local k3s build and remains a read-only capability probe.
+    kubectl: binaryProbe('kubectl', ['version', '--client=true', '-o', 'json']),
     docker: binaryProbe('docker', ['--version']),
   };
   const kernel = command('uname', ['-srvm']);
@@ -979,6 +981,7 @@ async function runLocalTests() {
     { id: 'conversation-resolution', cwd: repoRoot, command: 'node', args: ['scripts/verify-agent-conversation-resolution-v2.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'conversation-directory', cwd: repoRoot, command: 'node', args: ['scripts/verify-agent-conversation-directory.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'conversation-binding', cwd: repoRoot, command: 'node', args: ['scripts/verify-agent-conversation-binding.mjs'], timeout: TEST_TIMEOUT_MS },
+    { id: 'agent-metadata-boundaries', cwd: repoRoot, command: 'node', args: ['scripts/verify-agent-metadata-boundaries.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'agent-asset-model', cwd: repoRoot, command: 'node', args: ['scripts/verify-agent-asset-model.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'semantic-kernel-relation', cwd: repoRoot, command: 'node', args: ['scripts/verify-agent-semantic-kernel-relation.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'runtime-state', cwd: repoRoot, command: 'node', args: ['scripts/verify-agent-runtime-state.mjs'], timeout: TEST_TIMEOUT_MS },
@@ -1017,7 +1020,7 @@ function summarizeStatuses(report) {
 }
 
 function printHumanSummary(report) {
-  console.log(`Canonical goal verifier · ${report.generatedAt}`);
+  console.log(`Canonical goal verifier · ${report.generatedAt} · status=${report.status || 'pending'}`);
   console.log(`Repositories: AnySentry ${report.repositories.anysentry.head} (${report.repositories.anysentry.branch}), Observer ${report.repositories.observer?.head || 'missing'} (${report.repositories.observer?.branch || 'missing'})`);
   console.log('\nEnvironment matrix:');
   for (const [name, environment] of Object.entries(report.environments)) {
@@ -1089,9 +1092,15 @@ async function main() {
     capabilityMatrix: buildCapabilityMatrix(objects, environments),
     tests,
     hygiene: { credentials, remoteWrite },
+    status: undefined,
     summary: undefined,
   };
   report.summary = summarizeStatuses(report);
+  report.status = report.summary.fail > 0
+    ? STATUS.FAIL
+    : report.summary.partial > 0 || report.summary.blocked > 0 || report.summary.unexecuted > 0
+      ? STATUS.PARTIAL
+      : STATUS.PASS;
   printHumanSummary(report);
   if (options.json) console.log(JSON.stringify(report, null, 2));
   if (options.jsonOut) {

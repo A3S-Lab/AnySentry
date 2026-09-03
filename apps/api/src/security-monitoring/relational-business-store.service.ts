@@ -20,12 +20,26 @@ import {
   PlatformUserRecord,
   RemediationRecord,
   WorkspaceDirectoryRecord,
+  RawObservation,
+  KernelFact,
+  SemanticRecord,
+  CoverageGap,
+  EvidenceLink,
+  SessionMembership,
 } from './types';
 import type {
   ConversationMembershipV2,
   ConversationRouteAliasV1,
   TechnicalActivityProjection,
 } from './agent-conversation-resolution-v2';
+import {
+  validateCoverageGap,
+  validateEvidenceLink,
+  validateKernelFact,
+  validateRawObservation,
+  validateSemanticRecord,
+  validateSessionMembership,
+} from './canonical-observability';
 import { PolicyConfig } from './policy-config';
 
 const AGENT_METADATA_LIMIT = 10_000;
@@ -33,6 +47,10 @@ const WORKSPACE_DIRECTORY_LIMIT = 10_000;
 const AGENT_WORKSPACE_BINDING_LIMIT = 100_000;
 const AGENT_RUNTIME_INSTANCE_LIMIT = 100_000;
 const AGENT_CONVERSATION_BINDING_LIMIT = 100_000;
+const RAW_OBSERVATION_LIMIT = 100_000;
+const KERNEL_FACT_LIMIT = 200_000;
+const SEMANTIC_RECORD_LIMIT = 200_000;
+const SESSION_MEMBERSHIP_LIMIT = 200_000;
 const INCIDENT_LIMIT = 20_000;
 const ALERT_LIMIT = 20_000;
 const REMEDIATION_LIMIT = 20_000;
@@ -40,6 +58,69 @@ const CONFIG_OBJECT_LIMIT = 20_000;
 const BUSINESS_WRITE_MAX_ATTEMPTS = 3;
 const BUSINESS_WRITE_BATCH_SIZE = 250;
 const EFFECT_LEASE_MS = 60_000;
+const WRITER_OWNERSHIP_CACHE_MAX_ENTRIES = 10_000;
+const WRITER_OWNERSHIP_CACHE_MAX_BYTES = 2 * 1024 * 1024;
+const WRITER_OWNERSHIP_IN_FLIGHT_MAX_ENTRIES = 1_024;
+const WRITER_OWNERSHIP_IN_FLIGHT_TIMEOUT_MS = 30_000;
+// Conversation resolution is a derived projection, but it can fan out one interaction into many
+// anchors. Keep each transactional JSON payload bounded independently of the canonical event
+// stores; callers receive `false` and retain the hot projection when a batch exceeds these caps.
+const CONVERSATION_RESOLUTION_V2_MAX_ANCHORS = 50_000;
+const CONVERSATION_RESOLUTION_V2_MAX_MEMBERSHIPS = 20_000;
+const CONVERSATION_RESOLUTION_V2_MAX_ALIASES = 20_000;
+const CONVERSATION_RESOLUTION_V2_MAX_TECHNICAL = 20_000;
+const CONVERSATION_RESOLUTION_V2_MAX_BYTES = 32 * 1024 * 1024;
+const CONVERSATION_RESOLUTION_V2_MAX_CATEGORY_BYTES = 16 * 1024 * 1024;
+// V1 tables remain a mutable latest-value compatibility projection, but their transport into
+// PostgreSQL must still be bounded. Canonical SessionMembership/Relation history is written via
+// the versioned append-only paths below; rejecting an oversized compatibility batch is safer than
+// allocating an unbounded JSON document inside the API or database connection.
+const CONVERSATION_RESOLUTION_V1_MAX_THREADS = 20_000;
+const CONVERSATION_RESOLUTION_V1_MAX_SEGMENTS = 50_000;
+const CONVERSATION_RESOLUTION_V1_MAX_BINDINGS = 100_000;
+const CONVERSATION_RESOLUTION_V1_MAX_BYTES = 32 * 1024 * 1024;
+const CONVERSATION_RESOLUTION_V1_MAX_CATEGORY_BYTES = 16 * 1024 * 1024;
+const SEMANTIC_KERNEL_RELATION_MAX_ROWS = 100_000;
+const SEMANTIC_KERNEL_RELATION_MAX_BYTES = 32 * 1024 * 1024;
+const CANONICAL_WRITE_MAX_BYTES = 64 * 1024 * 1024;
+
+function validatedRawRecord(value: unknown): RawObservation | undefined {
+  const checked = validateRawObservation(value);
+  if (!checked.ok) return undefined;
+  const payload = { ...checked.value.payload };
+  delete payload.body;
+  if (payload.redactionState === 'none' || payload.redactionState === 'partial') {
+    payload.redactionState = 'hash_only';
+  }
+  return { ...checked.value, payload };
+}
+
+function stableRecordJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(stableRecordJson).join(',')}]`;
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, item]) => `${JSON.stringify(key)}:${stableRecordJson(item)}`)
+    .join(',')}}`;
+}
+
+function batchHasConflictingRecords<T>(rows: readonly T[], keyOf: (row: T) => string): boolean {
+  const fingerprints = new Map<string, string>();
+  for (const row of rows) {
+    const key = keyOf(row);
+    const fingerprint = stableRecordJson(row);
+    const previous = fingerprints.get(key);
+    if (previous !== undefined && previous !== fingerprint) return true;
+    fingerprints.set(key, fingerprint);
+  }
+  return false;
+}
+
+function boundedJsonRows<T>(rows: readonly T[], maxRows: number, maxBytes: number): string | undefined {
+  if (rows.length > maxRows) return undefined;
+  const json = JSON.stringify(rows);
+  return typeof json === 'string' && Buffer.byteLength(json, 'utf8') <= maxBytes ? json : undefined;
+}
 
 export type BusinessEffectLease =
   | { status: 'acquired' }
@@ -95,6 +176,11 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   private readonly effectOwnerId = `api:${process.pid}:${randomUUID()}`;
   private readonly writerOwnershipCache = new Map<string, number>();
   private readonly writerOwnershipInFlight = new Map<string, Promise<WriterOwnership>>();
+  private writerOwnershipCacheBytes = 0;
+  private writerOwnershipCacheExpired = 0;
+  private writerOwnershipCacheEvicted = 0;
+  private writerOwnershipInFlightRejected = 0;
+  private writerOwnershipInFlightTimeouts = 0;
 
   configured(): boolean {
     return Boolean(this.databaseUrl);
@@ -112,6 +198,9 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     const pool = this.pool;
     this.pool = undefined;
     this.ready = false;
+    this.writerOwnershipCache.clear();
+    this.writerOwnershipCacheBytes = 0;
+    this.writerOwnershipInFlight.clear();
     if (pool) await pool.end().catch(() => undefined);
   }
 
@@ -678,6 +767,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
 
   async loadAgentConversationMembershipsByAnchors(
     anchors: AgentConversationAnchor[],
+    logicalScopeKeys: readonly string[] = [],
   ): Promise<AgentConversationAnchorMembershipMatch[]> {
     if (anchors.length === 0 || !(await this.initialize()) || !this.pool) return [];
     const lookup = [...new Map(anchors
@@ -687,6 +777,12 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         valueHash: anchor.valueHash,
       }])).values()].slice(0, 4_096);
     if (lookup.length === 0) return [];
+    // Scope filtering is deliberately optional for legacy/synthetic CLI anchors.  Callers that
+    // have a concrete definition scope pass it here so the database cannot fan a shared provider
+    // anchor out across unrelated LogicalAgent definitions before the in-memory fence runs.
+    const scopedKeys = [...new Set(logicalScopeKeys
+      .map((value) => value.trim())
+      .filter(Boolean))].slice(0, 4_096);
     try {
       const result = await this.pool.query<{
         anchor_record: (AgentConversationAnchorPersistence & AgentConversationAnchor) | string;
@@ -700,20 +796,29 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
          SELECT anchor.record AS anchor_record,
                 membership.record AS membership_record
            FROM incoming
-           JOIN anysentry_agent_conversation_anchors_v1 AS anchor
+         JOIN anysentry_agent_conversation_anchors_v1 AS anchor
              ON anchor.anchor_namespace = incoming.namespace
             AND anchor.value_hash = incoming.value_hash
+            AND (
+              cardinality($3::text[]) = 0
+              OR anchor.logical_scope_key = ANY($3::text[])
+            )
            JOIN LATERAL (
              SELECT candidate.record
                FROM anysentry_agent_conversation_memberships_v2 AS candidate
               WHERE candidate.interaction_id = anchor.interaction_id
                 AND candidate.canonical_conversation_id IS NOT NULL
+                AND (
+                  candidate.logical_scope_key = anchor.logical_scope_key
+                  OR split_part(anchor.logical_scope_key, '|deployment:', 1)
+                     = candidate.logical_scope_key
+                )
               ORDER BY candidate.resolution_revision DESC
               LIMIT 1
            ) AS membership ON TRUE
           ORDER BY anchor.observed_at DESC
           LIMIT $2`,
-        [JSON.stringify(lookup), AGENT_CONVERSATION_BINDING_LIMIT],
+        [JSON.stringify(lookup), AGENT_CONVERSATION_BINDING_LIMIT, scopedKeys],
       );
       return result.rows.flatMap((row) => {
         const stored = this.parseRecord<AgentConversationAnchorPersistence & AgentConversationAnchor>(
@@ -799,12 +904,669 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * Append immutable canonical raw observations.  The JSON record is retained as a metadata-first
+   * envelope (the caller strips any body before this method); retries with the same
+   * observation/revision are idempotent, while a conflicting idempotency key is rejected by the
+   * unique constraint and surfaced as `false` to the hot-store caller.
+   */
+  async saveRawObservations(observations: readonly RawObservation[]): Promise<boolean> {
+    if (observations.length === 0) return true;
+    if (observations.length > RAW_OBSERVATION_LIMIT) return false;
+    const bounded = observations.slice(0, RAW_OBSERVATION_LIMIT);
+    if (batchHasConflictingRecords(
+      bounded,
+      (record) => `${record.observationId}\0${record.revision}`,
+    )) return false;
+    const boundedJson = boundedJsonRows(bounded, RAW_OBSERVATION_LIMIT, CANONICAL_WRITE_MAX_BYTES);
+    if (!boundedJson) return false;
+    if (!(await this.initialize()) || !this.pool) return false;
+    try {
+      const conflict = await this.pool.query<{ conflict: boolean }>(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         SELECT EXISTS (
+           SELECT 1
+             FROM anysentry_raw_observations_v1 existing
+             JOIN incoming
+               ON existing.observation_id = incoming.record->>'observationId'
+              AND existing.revision = (incoming.record->>'revision')::bigint
+            WHERE existing.payload_sha256 <> incoming.record->'payload'->>'sha256'
+               OR existing.record <> incoming.record
+         ) AS conflict`,
+        [boundedJson],
+      );
+      if (conflict.rows?.[0]?.conflict === true) return false;
+      await this.pool.query(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         INSERT INTO anysentry_raw_observations_v1 (
+           observation_id, revision, idempotency_key, event_at, received_at,
+           source_type, source_id, collector_id, payload_sha256,
+           original_bytes, captured_bytes, record
+         )
+         SELECT
+           record->>'observationId',
+           (record->>'revision')::bigint,
+           record->>'idempotencyKey',
+           (record->>'eventAtUnixNs')::numeric,
+           (record->>'receivedAtUnixNs')::numeric,
+           record->'source'->>'sourceType',
+           NULLIF(record->'source'->>'sourceId', ''),
+           NULLIF(record->'source'->>'collectorId', ''),
+           record->'payload'->>'sha256',
+           (record->'payload'->>'originalBytes')::bigint,
+           (record->'payload'->>'capturedBytes')::bigint,
+           record
+         FROM incoming
+         ON CONFLICT (observation_id, revision) DO NOTHING`,
+        [boundedJson],
+      );
+      return true;
+    } catch (error) {
+      this.markUnavailable('save canonical raw observations', error);
+      return false;
+    }
+  }
+
+  async loadRawObservations(
+    input: { observationIds?: readonly string[]; revision?: number; limit?: number } = {},
+  ): Promise<RawObservation[]> {
+    if (!(await this.initialize()) || !this.pool) return [];
+    const limit = Math.max(1, Math.min(RAW_OBSERVATION_LIMIT, Math.trunc(input.limit ?? 1_000)));
+    try {
+      const ids = [...new Set((input.observationIds ?? [])
+        .map((value) => String(value).trim())
+        .filter(Boolean))].slice(0, RAW_OBSERVATION_LIMIT);
+      const requestedRevision = input.revision !== undefined
+        && Number.isSafeInteger(input.revision) && input.revision > 0
+        ? input.revision : undefined;
+      const result = await this.pool.query<{ record: RawObservation | string }>(
+        ids.length && requestedRevision !== undefined
+          ? `SELECT record
+               FROM anysentry_raw_observations_v1
+              WHERE observation_id = ANY($1::text[]) AND revision = $2
+              ORDER BY observation_id
+              LIMIT $3`
+          : ids.length
+            ? `SELECT record
+                 FROM anysentry_raw_observations_v1
+                WHERE observation_id = ANY($1::text[])
+                ORDER BY observation_id, revision DESC
+                LIMIT $2`
+            : requestedRevision !== undefined
+              ? `SELECT record
+                   FROM anysentry_raw_observations_v1
+                  WHERE revision = $1
+                  ORDER BY event_at DESC, observation_id
+                  LIMIT $2`
+              : `SELECT record
+                   FROM anysentry_raw_observations_v1
+                  ORDER BY event_at DESC, observation_id, revision DESC
+                  LIMIT $1`,
+        ids.length && requestedRevision !== undefined
+          ? [ids, requestedRevision, limit]
+          : ids.length ? [ids, limit]
+            : requestedRevision !== undefined ? [requestedRevision, limit] : [limit],
+      );
+      return result.rows
+        .flatMap(({ record }) => {
+          const parsed = this.parseRecord<RawObservation>(record);
+          const safe = validatedRawRecord(parsed);
+          return safe ? [safe] : [];
+        });
+    } catch (error) {
+      this.markUnavailable('load canonical raw observations', error);
+      return [];
+    }
+  }
+
+  /**
+   * Append machine-side KernelFact records without ever updating an existing fact.
+   *
+   * Kernel facts are deliberately stored in their own append-only table.  A fact ID is a
+   * deterministic identity for one observed event, so retries use `ON CONFLICT DO NOTHING` and
+   * cannot rewrite the original JSONB payload.  The in-memory KernelFactStore remains the hot
+   * fallback when PostgreSQL is not configured or temporarily unavailable.
+   */
+  async saveKernelFacts(facts: readonly KernelFact[]): Promise<boolean> {
+    if (facts.length === 0) return true;
+    if (facts.length > KERNEL_FACT_LIMIT) return false;
+    const bounded = facts.slice(0, KERNEL_FACT_LIMIT);
+    if (batchHasConflictingRecords(bounded, (record) => record.factId)) return false;
+    const boundedJson = boundedJsonRows(bounded, KERNEL_FACT_LIMIT, CANONICAL_WRITE_MAX_BYTES);
+    if (!boundedJson) return false;
+    if (!(await this.initialize()) || !this.pool) return false;
+    try {
+      const conflict = await this.pool.query<{ conflict: boolean }>(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         SELECT EXISTS (
+           SELECT 1
+             FROM anysentry_kernel_facts_v1 existing
+             JOIN incoming ON existing.fact_id = incoming.record->>'factId'
+            WHERE existing.record <> incoming.record
+         ) AS conflict`,
+        [boundedJson],
+      );
+      if (conflict.rows?.[0]?.conflict === true) return false;
+      await this.pool.query(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         INSERT INTO anysentry_kernel_facts_v1 (
+           fact_id, kind, authority, observed_at,
+           process_generation_key, parent_process_generation_key,
+           connection_id, payload_ref, event_id, scope, status, record
+         )
+         SELECT
+           record->>'factId',
+           record->>'kind',
+           record->>'authority',
+           (record->>'observedAtUnixNs')::numeric,
+           NULLIF(record->>'processGenerationKey', ''),
+           NULLIF(record->>'parentProcessGenerationKey', ''),
+           NULLIF(record->>'connectionId', ''),
+           NULLIF(record->>'payloadRef', ''),
+           NULLIF(record->>'eventId', ''),
+           NULLIF(record->>'scope', ''),
+           record->>'status',
+           record
+         FROM incoming
+         ON CONFLICT (fact_id) DO NOTHING`,
+        [boundedJson],
+      );
+      return true;
+    } catch (error) {
+      this.markUnavailable('save canonical KernelFacts', error);
+      return false;
+    }
+  }
+
+  async loadKernelFacts(
+    input: { factIds?: readonly string[]; limit?: number } = {},
+  ): Promise<KernelFact[]> {
+    if (!(await this.initialize()) || !this.pool) return [];
+    const requestedLimit = Number(input.limit ?? 1_000);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.max(1, Math.min(KERNEL_FACT_LIMIT, Math.trunc(requestedLimit)))
+      : 1_000;
+    try {
+      const ids = [...new Set((input.factIds ?? [])
+        .map((value) => String(value).trim())
+        .filter(Boolean))].slice(0, KERNEL_FACT_LIMIT);
+      const result = await this.pool.query<{ record: KernelFact | string }>(
+        ids.length
+          ? `SELECT record
+               FROM anysentry_kernel_facts_v1
+              WHERE fact_id = ANY($1::text[])
+              ORDER BY observed_at DESC, fact_id
+              LIMIT $2`
+          : `SELECT record
+               FROM anysentry_kernel_facts_v1
+              ORDER BY observed_at DESC, fact_id
+              LIMIT $1`,
+        ids.length ? [ids, limit] : [limit],
+      );
+      return result.rows.flatMap(({ record }) => {
+        const parsed = this.parseRecord<KernelFact>(record);
+        const checked = validateKernelFact(parsed);
+        return checked.ok ? [checked.value] : [];
+      });
+    } catch (error) {
+      this.markUnavailable('load canonical KernelFacts', error);
+      return [];
+    }
+  }
+
+  async saveSemanticRecords(records: readonly SemanticRecord[]): Promise<boolean> {
+    if (records.length === 0) return true;
+    if (records.length > SEMANTIC_RECORD_LIMIT) return false;
+    const bounded = records.slice(0, SEMANTIC_RECORD_LIMIT);
+    if (batchHasConflictingRecords(
+      bounded,
+      (record) => `${record.semanticRecordId}\0${record.revision ?? 1}`,
+    )) return false;
+    const boundedJson = boundedJsonRows(bounded, SEMANTIC_RECORD_LIMIT, CANONICAL_WRITE_MAX_BYTES);
+    if (!boundedJson) return false;
+    if (!(await this.initialize()) || !this.pool) return false;
+    try {
+      const conflict = await this.pool.query<{ conflict: boolean }>(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         SELECT EXISTS (
+           SELECT 1
+             FROM anysentry_semantic_records_v1 existing
+             JOIN incoming
+               ON existing.semantic_record_id = incoming.record->>'semanticRecordId'
+              AND existing.revision = COALESCE((incoming.record->>'revision')::bigint, 1)
+            WHERE existing.record <> incoming.record
+         ) AS conflict`,
+        [boundedJson],
+      );
+      if (conflict.rows?.[0]?.conflict === true) return false;
+      await this.pool.query(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         INSERT INTO anysentry_semantic_records_v1 (
+           semantic_record_id, revision, kind, authority, observed_at,
+           logical_agent_id, agent_instance_id, session_id, turn_id, run_id,
+           tool_call_id, record
+         )
+         SELECT
+           record->>'semanticRecordId',
+           COALESCE((record->>'revision')::bigint, 1),
+           record->>'kind',
+           record->>'authority',
+           (record->>'observedAtUnixNs')::numeric,
+           NULLIF(record->>'logicalAgentId', ''),
+           NULLIF(record->>'agentInstanceId', ''),
+           NULLIF(record->>'sessionId', ''),
+           NULLIF(record->>'turnId', ''),
+           NULLIF(record->>'runId', ''),
+           NULLIF(record->>'toolCallId', ''),
+           record
+         FROM incoming
+         ON CONFLICT (semantic_record_id, revision) DO NOTHING`,
+        [boundedJson],
+      );
+      return true;
+    } catch (error) {
+      this.markUnavailable('save canonical semantic records', error);
+      return false;
+    }
+  }
+
+  async loadSemanticRecords(input: { semanticRecordIds?: readonly string[]; revision?: number; limit?: number } = {}): Promise<SemanticRecord[]> {
+    if (!(await this.initialize()) || !this.pool) return [];
+    const requested = Number(input.limit ?? 1_000);
+    const limit = Number.isFinite(requested)
+      ? Math.max(1, Math.min(SEMANTIC_RECORD_LIMIT, Math.trunc(requested)))
+      : 1_000;
+    try {
+      const ids = [...new Set((input.semanticRecordIds ?? []).map((value) => String(value).trim()).filter(Boolean))].slice(0, SEMANTIC_RECORD_LIMIT);
+      const requestedRevision = input.revision !== undefined
+        && Number.isSafeInteger(input.revision) && input.revision > 0
+        ? input.revision : undefined;
+      const result = await this.pool.query<{ record: SemanticRecord | string }>(
+        ids.length && requestedRevision !== undefined
+          ? `SELECT record
+               FROM anysentry_semantic_records_v1
+              WHERE semantic_record_id = ANY($1::text[]) AND revision = $2
+              ORDER BY semantic_record_id
+              LIMIT $3`
+          : ids.length
+            ? `SELECT record
+                 FROM anysentry_semantic_records_v1
+                WHERE semantic_record_id = ANY($1::text[])
+                ORDER BY semantic_record_id, revision DESC
+                LIMIT $2`
+            : requestedRevision !== undefined
+              ? `SELECT record
+                   FROM anysentry_semantic_records_v1
+                  WHERE revision = $1
+                  ORDER BY observed_at DESC, semantic_record_id
+                  LIMIT $2`
+              : `SELECT record
+                   FROM anysentry_semantic_records_v1
+                  ORDER BY observed_at DESC, semantic_record_id, revision DESC
+                  LIMIT $1`,
+        ids.length && requestedRevision !== undefined
+          ? [ids, requestedRevision, limit]
+          : ids.length ? [ids, limit]
+            : requestedRevision !== undefined ? [requestedRevision, limit] : [limit],
+      );
+      return result.rows
+        .flatMap(({ record }) => {
+          const parsed = this.parseRecord<SemanticRecord>(record);
+          const checked = validateSemanticRecord(parsed);
+          return checked.ok ? [checked.value] : [];
+        });
+    } catch (error) {
+      this.markUnavailable('load canonical semantic records', error);
+      return [];
+    }
+  }
+
+  async saveSessionMemberships(memberships: readonly SessionMembership[]): Promise<boolean> {
+    if (memberships.length === 0) return true;
+    if (memberships.length > SESSION_MEMBERSHIP_LIMIT) return false;
+    const bounded = memberships.slice(0, SESSION_MEMBERSHIP_LIMIT);
+    if (batchHasConflictingRecords(
+      bounded,
+      (record) => `${record.membershipId}\0${record.resolutionRevision}`,
+    )) return false;
+    const boundedJson = boundedJsonRows(bounded, SESSION_MEMBERSHIP_LIMIT, CANONICAL_WRITE_MAX_BYTES);
+    if (!boundedJson) return false;
+    if (!(await this.initialize()) || !this.pool) return false;
+    try {
+      const conflict = await this.pool.query<{ conflict: boolean }>(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         SELECT EXISTS (
+           SELECT 1
+             FROM anysentry_session_memberships_v1 existing
+             JOIN incoming
+               ON existing.membership_id = incoming.record->>'membershipId'
+              AND existing.resolution_revision = (incoming.record->>'resolutionRevision')::bigint
+            WHERE existing.record <> incoming.record
+         ) AS conflict`,
+        [boundedJson],
+      );
+      if (conflict.rows?.[0]?.conflict === true) return false;
+      await this.pool.query(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         INSERT INTO anysentry_session_memberships_v1 (
+           membership_id, resolution_revision, session_id, session_key,
+           provider_session_id_hash, role, confidence, valid_from, record
+         )
+         SELECT
+           record->>'membershipId',
+           (record->>'resolutionRevision')::bigint,
+           record->>'sessionId',
+           NULLIF(record->>'sessionKey', ''),
+           NULLIF(record->>'providerSessionIdHash', ''),
+           record->>'role',
+           record->>'confidence',
+           (record->>'validFromUnixNs')::numeric,
+           record
+         FROM incoming
+         ON CONFLICT (membership_id, resolution_revision) DO NOTHING`,
+        [boundedJson],
+      );
+      return true;
+    } catch (error) {
+      this.markUnavailable('save canonical SessionMemberships', error);
+      return false;
+    }
+  }
+
+  async loadSessionMemberships(input: { membershipIds?: readonly string[]; resolutionRevision?: number; limit?: number } = {}): Promise<SessionMembership[]> {
+    if (!(await this.initialize()) || !this.pool) return [];
+    const requested = Number(input.limit ?? 1_000);
+    const limit = Number.isFinite(requested)
+      ? Math.max(1, Math.min(SESSION_MEMBERSHIP_LIMIT, Math.trunc(requested))) : 1_000;
+    try {
+      const ids = [...new Set((input.membershipIds ?? []).map((value) => String(value).trim()).filter(Boolean))].slice(0, SESSION_MEMBERSHIP_LIMIT);
+      const requestedRevision = input.resolutionRevision !== undefined
+        && Number.isSafeInteger(input.resolutionRevision) && input.resolutionRevision > 0
+        ? input.resolutionRevision : undefined;
+      const result = await this.pool.query<{ record: SessionMembership | string }>(
+        ids.length && requestedRevision !== undefined
+          ? `SELECT record
+               FROM anysentry_session_memberships_v1
+              WHERE membership_id = ANY($1::text[]) AND resolution_revision = $2
+              ORDER BY membership_id
+              LIMIT $3`
+          : ids.length
+            ? `SELECT record
+                 FROM anysentry_session_memberships_v1
+                WHERE membership_id = ANY($1::text[])
+                ORDER BY membership_id, resolution_revision DESC
+                LIMIT $2`
+            : requestedRevision !== undefined
+              ? `SELECT record
+                   FROM anysentry_session_memberships_v1
+                  WHERE resolution_revision = $1
+                  ORDER BY valid_from DESC, membership_id
+                  LIMIT $2`
+              : `SELECT record
+                   FROM anysentry_session_memberships_v1
+                  ORDER BY valid_from DESC, membership_id, resolution_revision DESC
+                  LIMIT $1`,
+        ids.length && requestedRevision !== undefined
+          ? [ids, requestedRevision, limit]
+          : ids.length ? [ids, limit]
+            : requestedRevision !== undefined ? [requestedRevision, limit] : [limit],
+      );
+      return result.rows
+        .flatMap(({ record }) => {
+          const parsed = this.parseRecord<SessionMembership>(record);
+          const checked = validateSessionMembership(parsed);
+          return checked.ok ? [checked.value] : [];
+        });
+    } catch (error) {
+      this.markUnavailable('load canonical SessionMemberships', error);
+      return [];
+    }
+  }
+
+  async saveCoverageGaps(gaps: readonly CoverageGap[]): Promise<boolean> {
+    if (gaps.length === 0) return true;
+    if (gaps.length > SEMANTIC_RECORD_LIMIT) return false;
+    const bounded = gaps.slice(0, SEMANTIC_RECORD_LIMIT);
+    if (batchHasConflictingRecords(
+      bounded,
+      (record) => `${record.gapId}\0${record.revision}`,
+    )) return false;
+    const boundedJson = boundedJsonRows(bounded, SEMANTIC_RECORD_LIMIT, CANONICAL_WRITE_MAX_BYTES);
+    if (!boundedJson) return false;
+    if (!(await this.initialize()) || !this.pool) return false;
+    try {
+      const conflict = await this.pool.query<{ conflict: boolean }>(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         SELECT EXISTS (
+           SELECT 1
+             FROM anysentry_coverage_gaps_v1 existing
+             JOIN incoming
+               ON existing.gap_id = incoming.record->>'gapId'
+              AND existing.revision = (incoming.record->>'revision')::bigint
+            WHERE existing.record <> incoming.record
+         ) AS conflict`,
+        [boundedJson],
+      );
+      if (conflict.rows?.[0]?.conflict === true) return false;
+      await this.pool.query(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         INSERT INTO anysentry_coverage_gaps_v1 (
+           gap_id, revision, stage, reason, scope, first_seen_at, last_seen_at,
+           dropped_count, orphaned_count, record
+         )
+         SELECT
+           record->>'gapId',
+           (record->>'revision')::bigint,
+           record->>'stage',
+           record->>'reason',
+           record->>'scope',
+           (record->>'firstSeenAtUnixNs')::numeric,
+           (record->>'lastSeenAtUnixNs')::numeric,
+           (record->>'droppedCount')::bigint,
+           (record->>'orphanedCount')::bigint,
+           record
+         FROM incoming
+         ON CONFLICT (gap_id, revision) DO NOTHING`,
+        [boundedJson],
+      );
+      return true;
+    } catch (error) {
+      this.markUnavailable('save canonical coverage gaps', error);
+      return false;
+    }
+  }
+
+  async loadCoverageGaps(input: { limit?: number } = {}): Promise<CoverageGap[]> {
+    if (!(await this.initialize()) || !this.pool) return [];
+    const requested = Number(input.limit ?? 1_000);
+    const limit = Number.isFinite(requested)
+      ? Math.max(1, Math.min(SEMANTIC_RECORD_LIMIT, Math.trunc(requested)))
+      : 1_000;
+    try {
+      const result = await this.pool.query<{ record: CoverageGap | string }>(
+        `SELECT record
+           FROM anysentry_coverage_gaps_v1
+          ORDER BY last_seen_at DESC, gap_id, revision DESC
+          LIMIT $1`,
+        [limit],
+      );
+      return result.rows
+        .flatMap(({ record }) => {
+          const parsed = this.parseRecord<CoverageGap>(record);
+          const checked = validateCoverageGap(parsed);
+          return checked.ok ? [checked.value] : [];
+        });
+    } catch (error) {
+      this.markUnavailable('load canonical coverage gaps', error);
+      return [];
+    }
+  }
+
+  async saveEvidenceLinks(links: readonly EvidenceLink[]): Promise<boolean> {
+    if (links.length === 0) return true;
+    if (links.length > SEMANTIC_RECORD_LIMIT) return false;
+    const bounded = links.slice(0, SEMANTIC_RECORD_LIMIT);
+    if (batchHasConflictingRecords(
+      bounded,
+      (record) => `${record.linkId}\0${record.resolutionRevision}`,
+    )) return false;
+    const boundedJson = boundedJsonRows(bounded, SEMANTIC_RECORD_LIMIT, CANONICAL_WRITE_MAX_BYTES);
+    if (!boundedJson) return false;
+    if (!(await this.initialize()) || !this.pool) return false;
+    try {
+      const conflict = await this.pool.query<{ conflict: boolean }>(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         SELECT EXISTS (
+           SELECT 1
+             FROM anysentry_evidence_links_v1 existing
+             JOIN incoming
+               ON existing.link_id = incoming.record->>'linkId'
+              AND existing.resolution_revision = (incoming.record->>'resolutionRevision')::bigint
+            WHERE existing.record <> incoming.record
+         ) AS conflict`,
+        [boundedJson],
+      );
+      if (conflict.rows?.[0]?.conflict === true) return false;
+      await this.pool.query(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         INSERT INTO anysentry_evidence_links_v1 (
+           link_id, resolution_revision, from_type, from_id, to_type, to_id,
+           relation, method, confidence, status, authority, valid_from, record
+         )
+         SELECT
+           record->>'linkId',
+           (record->>'resolutionRevision')::bigint,
+           record->>'fromType', record->>'fromId', record->>'toType', record->>'toId',
+           record->>'relation', record->>'method', (record->>'confidence')::double precision,
+           record->>'status', record->>'authority', (record->>'validFromUnixNs')::numeric, record
+         FROM incoming
+         ON CONFLICT (link_id, resolution_revision) DO NOTHING`,
+        [boundedJson],
+      );
+      return true;
+    } catch (error) {
+      this.markUnavailable('save canonical EvidenceLinks', error);
+      return false;
+    }
+  }
+
+  async loadEvidenceLinks(input: { linkIds?: readonly string[]; resolutionRevision?: number; limit?: number } = {}): Promise<EvidenceLink[]> {
+    if (!(await this.initialize()) || !this.pool) return [];
+    const requested = Number(input.limit ?? 1_000);
+    const limit = Number.isFinite(requested)
+      ? Math.max(1, Math.min(SEMANTIC_RECORD_LIMIT, Math.trunc(requested))) : 1_000;
+    try {
+      const ids = [...new Set((input.linkIds ?? []).map((value) => String(value).trim()).filter(Boolean))].slice(0, SEMANTIC_RECORD_LIMIT);
+      const requestedRevision = input.resolutionRevision !== undefined
+        && Number.isSafeInteger(input.resolutionRevision) && input.resolutionRevision > 0
+        ? input.resolutionRevision : undefined;
+      const result = await this.pool.query<{ record: EvidenceLink | string }>(
+        ids.length && requestedRevision !== undefined
+          ? `SELECT record
+               FROM anysentry_evidence_links_v1
+              WHERE link_id = ANY($1::text[]) AND resolution_revision = $2
+              ORDER BY link_id
+              LIMIT $3`
+          : ids.length
+            ? `SELECT record
+                 FROM anysentry_evidence_links_v1
+                WHERE link_id = ANY($1::text[])
+                ORDER BY link_id, resolution_revision DESC
+                LIMIT $2`
+            : requestedRevision !== undefined
+              ? `SELECT record
+                   FROM anysentry_evidence_links_v1
+                  WHERE resolution_revision = $1
+                  ORDER BY valid_from DESC, link_id
+                  LIMIT $2`
+              : `SELECT record
+                   FROM anysentry_evidence_links_v1
+                  ORDER BY valid_from DESC, link_id, resolution_revision DESC
+                  LIMIT $1`,
+        ids.length && requestedRevision !== undefined
+          ? [ids, requestedRevision, limit]
+          : ids.length ? [ids, limit]
+            : requestedRevision !== undefined ? [requestedRevision, limit] : [limit],
+      );
+      return result.rows
+        .flatMap(({ record }) => {
+          const parsed = this.parseRecord<EvidenceLink>(record);
+          const checked = validateEvidenceLink(parsed);
+          return checked.ok ? [checked.value] : [];
+        });
+    } catch (error) {
+      this.markUnavailable('load canonical EvidenceLinks', error);
+      return [];
+    }
+  }
+
   async saveAgentConversationResolution(
     threads: AgentConversationThreadRecord[],
     segments: ConversationInstanceSegment[],
     bindings: AgentConversationBindingRecord[],
   ): Promise<boolean> {
     if (threads.length === 0 && segments.length === 0 && bindings.length === 0) return true;
+    const threadJson = boundedJsonRows(
+      threads,
+      CONVERSATION_RESOLUTION_V1_MAX_THREADS,
+      CONVERSATION_RESOLUTION_V1_MAX_CATEGORY_BYTES,
+    );
+    const segmentJson = boundedJsonRows(
+      segments,
+      CONVERSATION_RESOLUTION_V1_MAX_SEGMENTS,
+      CONVERSATION_RESOLUTION_V1_MAX_CATEGORY_BYTES,
+    );
+    const bindingJson = boundedJsonRows(
+      bindings,
+      CONVERSATION_RESOLUTION_V1_MAX_BINDINGS,
+      CONVERSATION_RESOLUTION_V1_MAX_CATEGORY_BYTES,
+    );
+    const totalBytes = [threadJson, segmentJson, bindingJson]
+      .filter((json): json is string => Boolean(json))
+      .reduce((sum, json) => sum + Buffer.byteLength(json, 'utf8'), 0);
+    if ((threads.length > 0 && !threadJson)
+      || (segments.length > 0 && !segmentJson)
+      || (bindings.length > 0 && !bindingJson)
+      || totalBytes > CONVERSATION_RESOLUTION_V1_MAX_BYTES) {
+      this.logger.warn('Agent Conversation V1 compatibility persistence batch exceeded its bounded payload budget');
+      return false;
+    }
     if (!(await this.initialize()) || !this.pool) return false;
     let client: PoolClient | undefined;
     try {
@@ -837,7 +1599,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
              record = EXCLUDED.record,
              updated_at = EXCLUDED.updated_at
            WHERE EXCLUDED.updated_at >= anysentry_agent_conversation_threads_v1.updated_at`,
-          [JSON.stringify(threads)],
+          [threadJson],
         );
       }
       if (segments.length) {
@@ -865,7 +1627,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
              record = EXCLUDED.record,
              updated_at = EXCLUDED.updated_at
            WHERE EXCLUDED.updated_at >= anysentry_agent_conversation_segments_v1.updated_at`,
-          [JSON.stringify(segments)],
+          [segmentJson],
         );
       }
       if (bindings.length) {
@@ -895,7 +1657,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
            WHERE (EXCLUDED.record->>'resolverVersion')::integer >= (
              anysentry_agent_conversation_bindings_v1.record->>'resolverVersion'
            )::integer`,
-          [JSON.stringify(bindings)],
+          [bindingJson],
         );
       }
       await client.query('COMMIT');
@@ -918,18 +1680,92 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     if (!anchors.length && !memberships.length && !aliases.length && !technicalActivities.length) {
       return true;
     }
+    const anchorRows = anchors.map((item) => ({
+      interactionId: item.interactionId,
+      logicalScopeKey: item.logicalScopeKey,
+      observedAt: item.observedAt,
+      ...item.anchor,
+    }));
+    let technicalRowsValid = true;
+    const technicalRows = technicalActivities.map((item) => {
+      try {
+        const endedAt = BigInt(item.endedAtUnixNs);
+        if (endedAt < 0n) technicalRowsValid = false;
+        return { ...item, updatedAt: Number(endedAt / 1_000_000n) };
+      } catch {
+        technicalRowsValid = false;
+        return { ...item, updatedAt: 0 };
+      }
+    });
+    const anchorJson = boundedJsonRows(
+      anchorRows,
+      CONVERSATION_RESOLUTION_V2_MAX_ANCHORS,
+      CONVERSATION_RESOLUTION_V2_MAX_CATEGORY_BYTES,
+    );
+    const membershipJson = boundedJsonRows(
+      memberships,
+      CONVERSATION_RESOLUTION_V2_MAX_MEMBERSHIPS,
+      CONVERSATION_RESOLUTION_V2_MAX_CATEGORY_BYTES,
+    );
+    const aliasJson = boundedJsonRows(
+      aliases,
+      CONVERSATION_RESOLUTION_V2_MAX_ALIASES,
+      CONVERSATION_RESOLUTION_V2_MAX_CATEGORY_BYTES,
+    );
+    const technicalJson = boundedJsonRows(
+      technicalRows,
+      CONVERSATION_RESOLUTION_V2_MAX_TECHNICAL,
+      CONVERSATION_RESOLUTION_V2_MAX_CATEGORY_BYTES,
+    );
+    const totalBytes = [anchorJson, membershipJson, aliasJson, technicalJson]
+      .filter((json): json is string => Boolean(json))
+      .reduce((sum, json) => sum + Buffer.byteLength(json, 'utf8'), 0);
+    if ((anchors.length > 0 && !anchorJson)
+      || (memberships.length > 0 && !membershipJson)
+      || (aliases.length > 0 && !aliasJson)
+      || (technicalActivities.length > 0 && !technicalJson)
+      || !technicalRowsValid
+      || batchHasConflictingRecords(aliases, (alias) => alias.aliasConversationId)
+      || batchHasConflictingRecords(technicalActivities, (activity) => activity.technicalActivityId)
+      || totalBytes > CONVERSATION_RESOLUTION_V2_MAX_BYTES) {
+      this.logger.warn('Agent Conversation V2 persistence batch exceeded its bounded payload budget');
+      return false;
+    }
     if (!(await this.initialize()) || !this.pool) return false;
     let client: PoolClient | undefined;
     try {
       client = await this.pool.connect();
       await client.query('BEGIN');
       if (anchors.length) {
-        const rows = anchors.map((item) => ({
-          interactionId: item.interactionId,
-          logicalScopeKey: item.logicalScopeKey,
-          observedAt: item.observedAt,
-          ...item.anchor,
-        }));
+        const conflict = await client.query<{ conflict: boolean }>(
+          `WITH incoming AS (
+             SELECT item AS record
+               FROM jsonb_array_elements($1::jsonb) AS source(item)
+           )
+           SELECT (
+             EXISTS (
+               SELECT 1
+                 FROM incoming
+                GROUP BY record->>'interactionId', record->>'kind',
+                         record->>'namespace', record->>'valueHash'
+               HAVING COUNT(DISTINCT record) > 1
+             ) OR EXISTS (
+               SELECT 1
+                 FROM anysentry_agent_conversation_anchors_v1 AS existing
+                 JOIN incoming
+                   ON existing.interaction_id = incoming.record->>'interactionId'
+                  AND existing.anchor_kind = incoming.record->>'kind'
+                  AND existing.anchor_namespace = incoming.record->>'namespace'
+                  AND existing.value_hash = incoming.record->>'valueHash'
+                WHERE existing.record <> incoming.record
+             )
+           ) AS conflict`,
+          [anchorJson],
+        );
+        if (conflict.rows?.[0]?.conflict === true) {
+          await client.query('ROLLBACK');
+          return false;
+        }
         await client.query(
           `WITH incoming AS (
              SELECT item AS record
@@ -950,16 +1786,41 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
              (record->>'observedAt')::bigint,
              record
            FROM incoming
+           -- Anchor facts are immutable.  A late/stronger observation gets a distinct anchor
+           -- value (or a future relation revision); it must never rewrite the source path or
+           -- strength of an already persisted fact.
            ON CONFLICT (interaction_id, anchor_kind, anchor_namespace, value_hash)
-           DO UPDATE SET
-             strength = EXCLUDED.strength,
-             source_path = EXCLUDED.source_path,
-             observed_at = EXCLUDED.observed_at,
-             record = EXCLUDED.record`,
-          [JSON.stringify(rows)],
+           DO NOTHING`,
+          [anchorJson],
         );
       }
       if (memberships.length) {
+        const conflict = await client.query<{ conflict: boolean }>(
+          `WITH incoming AS (
+             SELECT item AS record
+               FROM jsonb_array_elements($1::jsonb) AS source(item)
+           )
+           SELECT (
+             EXISTS (
+               SELECT 1
+                 FROM incoming
+                GROUP BY record->>'interactionId', (record->>'resolutionRevision')::bigint
+               HAVING COUNT(DISTINCT record) > 1
+             ) OR EXISTS (
+               SELECT 1
+                 FROM anysentry_agent_conversation_memberships_v2 AS existing
+                 JOIN incoming
+                   ON existing.interaction_id = incoming.record->>'interactionId'
+                  AND existing.resolution_revision = (incoming.record->>'resolutionRevision')::bigint
+                WHERE existing.record <> incoming.record
+             )
+           ) AS conflict`,
+          [membershipJson],
+        );
+        if (conflict.rows?.[0]?.conflict === true) {
+          await client.query('ROLLBACK');
+          return false;
+        }
         await client.query(
           `WITH incoming AS (
              SELECT item AS record
@@ -979,14 +1840,12 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
              record,
              (record->>'decidedAt')::bigint
            FROM incoming
-           ON CONFLICT (interaction_id, resolution_revision) DO UPDATE SET
-             logical_scope_key = EXCLUDED.logical_scope_key,
-             role = EXCLUDED.role,
-             canonical_conversation_id = EXCLUDED.canonical_conversation_id,
-             technical_activity_id = EXCLUDED.technical_activity_id,
-             record = EXCLUDED.record,
-             decided_at = EXCLUDED.decided_at`,
-          [JSON.stringify(memberships)],
+           -- Memberships are versioned decisions.  The same interaction/revision is immutable;
+           -- a changed decision must be emitted under a new resolution revision rather than
+           -- silently overwriting the historical row.
+           ON CONFLICT (interaction_id, resolution_revision)
+           DO NOTHING`,
+          [membershipJson],
         );
       }
       if (aliases.length) {
@@ -1015,14 +1874,10 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
              updated_at = EXCLUDED.updated_at
            WHERE EXCLUDED.resolution_revision >=
              anysentry_agent_conversation_route_aliases_v1.resolution_revision`,
-          [JSON.stringify(aliases)],
+          [aliasJson],
         );
       }
       if (technicalActivities.length) {
-        const rows = technicalActivities.map((item) => ({
-          ...item,
-          updatedAt: Number(BigInt(item.endedAtUnixNs) / 1_000_000n),
-        }));
         await client.query(
           `WITH incoming AS (
              SELECT item AS record
@@ -1052,7 +1907,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
              updated_at = EXCLUDED.updated_at
            WHERE EXCLUDED.updated_at >=
              anysentry_agent_run_technical_activities_v1.updated_at`,
-          [JSON.stringify(rows)],
+          [technicalJson],
         );
       }
       await client.query('COMMIT');
@@ -1072,11 +1927,29 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     if (!semanticEventId || !(await this.initialize()) || !this.pool) return [];
     try {
       const result = await this.pool.query<{ record: AgentSemanticKernelRelation | string }>(
-        `SELECT record
-           FROM anysentry_agent_semantic_kernel_relations_v1
-          WHERE stable_semantic_event_id = $1
-          ORDER BY resolution_revision DESC, relation_id
-          LIMIT 1_000`,
+        `WITH history_latest AS (
+           SELECT DISTINCT ON (relation_id) relation_id, record, resolution_revision
+             FROM anysentry_agent_semantic_kernel_relation_history_v1
+            WHERE stable_semantic_event_id = $1
+            ORDER BY relation_id, resolution_revision DESC
+         ), legacy_only AS (
+           SELECT current.relation_id, current.record, current.resolution_revision
+             FROM anysentry_agent_semantic_kernel_relations_v1 AS current
+            WHERE current.stable_semantic_event_id = $1
+              AND NOT EXISTS (
+                SELECT 1
+                  FROM history_latest AS historical
+                 WHERE historical.relation_id = current.relation_id
+              )
+         )
+         SELECT record
+           FROM (
+             SELECT record, resolution_revision, relation_id FROM history_latest
+             UNION ALL
+             SELECT record, resolution_revision, relation_id FROM legacy_only
+           ) AS combined
+         ORDER BY resolution_revision DESC, relation_id
+         LIMIT 1_000`,
         [semanticEventId],
       );
       return result.rows
@@ -1085,8 +1958,26 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
           record?.relationId && record.stableSemanticEventId === semanticEventId,
         ));
     } catch (error) {
+      // Older installations may not have run the additive history migration yet.  Preserve the
+      // compatibility read path while surfacing the migration failure through normal health state.
       this.markUnavailable('load Agent Semantic Kernel relations', error);
-      return [];
+      try {
+        const legacy = await this.pool.query<{ record: AgentSemanticKernelRelation | string }>(
+          `SELECT record
+             FROM anysentry_agent_semantic_kernel_relations_v1
+            WHERE stable_semantic_event_id = $1
+            ORDER BY resolution_revision DESC, relation_id
+            LIMIT 1_000`,
+          [semanticEventId],
+        );
+        return legacy.rows
+          .map(({ record }) => this.parseRecord<AgentSemanticKernelRelation>(record))
+          .filter((record): record is AgentSemanticKernelRelation => Boolean(
+            record?.relationId && record.stableSemanticEventId === semanticEventId,
+          ));
+      } catch {
+        return [];
+      }
     }
   }
 
@@ -1096,11 +1987,29 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     if (!kernelEventId || !(await this.initialize()) || !this.pool) return [];
     try {
       const result = await this.pool.query<{ record: AgentSemanticKernelRelation | string }>(
-        `SELECT record
-           FROM anysentry_agent_semantic_kernel_relations_v1
-          WHERE kernel_event_id = $1
-          ORDER BY resolution_revision DESC, relation_id
-          LIMIT 1_000`,
+        `WITH history_latest AS (
+           SELECT DISTINCT ON (relation_id) relation_id, record, resolution_revision
+             FROM anysentry_agent_semantic_kernel_relation_history_v1
+            WHERE kernel_event_id = $1
+            ORDER BY relation_id, resolution_revision DESC
+         ), legacy_only AS (
+           SELECT current.relation_id, current.record, current.resolution_revision
+             FROM anysentry_agent_semantic_kernel_relations_v1 AS current
+            WHERE current.kernel_event_id = $1
+              AND NOT EXISTS (
+                SELECT 1
+                  FROM history_latest AS historical
+                 WHERE historical.relation_id = current.relation_id
+              )
+         )
+         SELECT record
+           FROM (
+             SELECT record, resolution_revision, relation_id FROM history_latest
+             UNION ALL
+             SELECT record, resolution_revision, relation_id FROM legacy_only
+           ) AS combined
+         ORDER BY resolution_revision DESC, relation_id
+         LIMIT 1_000`,
         [kernelEventId],
       );
       return result.rows
@@ -1110,7 +2019,23 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         ));
     } catch (error) {
       this.markUnavailable('load semantic context for Kernel event', error);
-      return [];
+      try {
+        const legacy = await this.pool.query<{ record: AgentSemanticKernelRelation | string }>(
+          `SELECT record
+             FROM anysentry_agent_semantic_kernel_relations_v1
+            WHERE kernel_event_id = $1
+            ORDER BY resolution_revision DESC, relation_id
+            LIMIT 1_000`,
+          [kernelEventId],
+        );
+        return legacy.rows
+          .map(({ record }) => this.parseRecord<AgentSemanticKernelRelation>(record))
+          .filter((record): record is AgentSemanticKernelRelation => Boolean(
+            record?.kernelEventId === kernelEventId && record.stableSemanticEventId,
+          ));
+      } catch {
+        return [];
+      }
     }
   }
 
@@ -1118,31 +2043,94 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     relations: AgentSemanticKernelRelation[],
   ): Promise<boolean> {
     if (!relations.length) return true;
-    if (!(await this.initialize()) || !this.pool) return false;
+    if (relations.length > SEMANTIC_KERNEL_RELATION_MAX_ROWS
+      || batchHasConflictingRecords(
+        relations,
+        (relation) => `${relation.relationId}\u0000${relation.resolutionRevision}`,
+      )) {
+      this.logger.warn('Agent Semantic Kernel relation batch exceeded row bounds or contained conflicting revisions');
+      return false;
+    }
+    let client: PoolClient | undefined;
     try {
       const updatedAt = Date.now();
       const rows = relations.map((relation) => ({ ...relation, updatedAt }));
-      await this.pool.query(
+      const rowsJson = boundedJsonRows(
+        rows,
+        SEMANTIC_KERNEL_RELATION_MAX_ROWS,
+        SEMANTIC_KERNEL_RELATION_MAX_BYTES,
+      );
+      if (!rowsJson) {
+        this.logger.warn('Agent Semantic Kernel relation batch exceeded its bounded payload budget');
+        return false;
+      }
+      if (!(await this.initialize()) || !this.pool) return false;
+      client = await this.pool.connect();
+      await client.query('BEGIN');
+      // Check both the history table and the legacy latest-row projection before inserting.  A
+      // retry with the same relation/revision is idempotent; a changed payload is a conflict and
+      // must never overwrite an already-audited decision.
+      const conflict = await client.query<{ conflict: boolean }>(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         SELECT EXISTS (
+           SELECT 1
+             FROM anysentry_agent_semantic_kernel_relation_history_v1 AS historical
+             JOIN incoming
+               ON historical.relation_id = incoming.record->>'relationId'
+              AND historical.resolution_revision = (incoming.record->>'resolutionRevision')::bigint
+            -- updatedAt is a mutable storage timestamp, not part of the relation identity.
+            -- Exclude it from the conflict comparison so a retry of the same relation/revision is
+            -- idempotent even when it arrives in a later millisecond.
+            WHERE (historical.record - 'updatedAt') <> (incoming.record - 'updatedAt')
+           UNION ALL
+           SELECT 1
+             FROM anysentry_agent_semantic_kernel_relations_v1 AS current
+             JOIN incoming
+               ON current.relation_id = incoming.record->>'relationId'
+              AND current.resolution_revision = (incoming.record->>'resolutionRevision')::bigint
+            WHERE (current.record - 'updatedAt') <> (incoming.record - 'updatedAt')
+         ) AS conflict`,
+        [rowsJson],
+      );
+      if (conflict.rows?.[0]?.conflict === true) {
+        await client.query('ROLLBACK');
+        return false;
+      }
+      await client.query(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         INSERT INTO anysentry_agent_semantic_kernel_relation_history_v1 (
+           relation_id, stable_semantic_event_id, tool_invocation_id,
+           kernel_event_id, relation_status, resolution_revision, record, updated_at
+         )
+         SELECT
+           record->>'relationId',
+           record->>'stableSemanticEventId',
+           record->>'toolInvocationId',
+           NULLIF(record->>'kernelEventId', ''),
+           record->>'status',
+           (record->>'resolutionRevision')::bigint,
+           record,
+           (record->>'updatedAt')::bigint
+         FROM incoming
+         ON CONFLICT (relation_id, resolution_revision) DO NOTHING`,
+        [rowsJson],
+      );
+      // Keep the existing table as a latest-row compatibility projection only.  It may be
+      // updated, but the immutable history row above is never deleted or rewritten.
+      await client.query(
         `WITH incoming AS (
            SELECT item AS record
              FROM jsonb_array_elements($1::jsonb) AS source(item)
          ), latest_incoming AS (
-           SELECT
-             record->>'stableSemanticEventId' AS stable_semantic_event_id,
-             MAX((record->>'resolutionRevision')::bigint) AS resolution_revision
-           FROM incoming
-           GROUP BY record->>'stableSemanticEventId'
-         ), pruned AS (
-           DELETE FROM anysentry_agent_semantic_kernel_relations_v1 AS existing
-           USING latest_incoming
-           WHERE existing.stable_semantic_event_id = latest_incoming.stable_semantic_event_id
-             AND existing.resolution_revision <= latest_incoming.resolution_revision
-             AND NOT EXISTS (
-               SELECT 1
-               FROM incoming
-               WHERE incoming.record->>'relationId' = existing.relation_id
-             )
-           RETURNING existing.relation_id
+           SELECT DISTINCT ON (record->>'relationId') record
+             FROM incoming
+            ORDER BY record->>'relationId', (record->>'resolutionRevision')::bigint DESC
          )
          INSERT INTO anysentry_agent_semantic_kernel_relations_v1 (
            relation_id, stable_semantic_event_id, tool_invocation_id,
@@ -1157,12 +2145,12 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
            (record->>'resolutionRevision')::bigint,
            record,
            (record->>'updatedAt')::bigint
-         FROM incoming
+         FROM latest_incoming AS incoming
          WHERE NOT EXISTS (
            SELECT 1
-           FROM anysentry_agent_semantic_kernel_relations_v1 AS newer
-           WHERE newer.stable_semantic_event_id = incoming.record->>'stableSemanticEventId'
-             AND newer.resolution_revision > (incoming.record->>'resolutionRevision')::bigint
+             FROM anysentry_agent_semantic_kernel_relation_history_v1 AS newer
+            WHERE newer.relation_id = incoming.record->>'relationId'
+              AND newer.resolution_revision > (incoming.record->>'resolutionRevision')::bigint
          )
          ON CONFLICT (relation_id) DO UPDATE SET
            kernel_event_id = EXCLUDED.kernel_event_id,
@@ -1172,12 +2160,16 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
            updated_at = EXCLUDED.updated_at
          WHERE EXCLUDED.resolution_revision >=
            anysentry_agent_semantic_kernel_relations_v1.resolution_revision`,
-        [JSON.stringify(rows)],
+        [rowsJson],
       );
+      await client.query('COMMIT');
       return true;
     } catch (error) {
+      await client?.query('ROLLBACK').catch(() => undefined);
       this.markUnavailable('save Agent Semantic Kernel relations', error);
       return false;
+    } finally {
+      client?.release();
     }
   }
 
@@ -1395,11 +2387,31 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   ): Promise<WriterOwnership> {
     if (!(await this.initialize()) || !this.pool) return { status: 'unavailable' };
     const cacheKey = `${sourceScope}\0${writerId}`;
+    for (const [key, expiresAt] of this.writerOwnershipCache) {
+      if (expiresAt > at + 15_000) continue;
+      this.writerOwnershipCache.delete(key);
+      this.writerOwnershipCacheBytes = Math.max(0, this.writerOwnershipCacheBytes - Buffer.byteLength(key, 'utf8') - 16);
+      this.writerOwnershipCacheExpired += 1;
+    }
+    while (
+      this.writerOwnershipCache.size > WRITER_OWNERSHIP_CACHE_MAX_ENTRIES
+      || this.writerOwnershipCacheBytes > WRITER_OWNERSHIP_CACHE_MAX_BYTES
+    ) {
+      const oldest = this.writerOwnershipCache.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.writerOwnershipCache.delete(oldest);
+      this.writerOwnershipCacheBytes = Math.max(0, this.writerOwnershipCacheBytes - Buffer.byteLength(oldest, 'utf8') - 16);
+      this.writerOwnershipCacheEvicted += 1;
+    }
     if ((this.writerOwnershipCache.get(cacheKey) ?? 0) > at + 15_000) {
       return { status: 'owned' };
     }
     const current = this.writerOwnershipInFlight.get(cacheKey);
     if (current) return current;
+    if (this.writerOwnershipInFlight.size >= WRITER_OWNERSHIP_IN_FLIGHT_MAX_ENTRIES) {
+      this.writerOwnershipInFlightRejected += 1;
+      return { status: 'unavailable' };
+    }
     const acquisition = this.acquireWriterOwnershipUncached(
       sourceScope,
       writerId,
@@ -1408,14 +2420,52 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       cacheKey,
       at,
     );
-    this.writerOwnershipInFlight.set(cacheKey, acquisition);
+    let boundedAcquisition: Promise<WriterOwnership>;
+    boundedAcquisition = new Promise<WriterOwnership>((resolve) => {
+      let settled = false;
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        this.writerOwnershipInFlightTimeouts += 1;
+        if (this.writerOwnershipInFlight.get(cacheKey) === boundedAcquisition) {
+          this.writerOwnershipInFlight.delete(cacheKey);
+        }
+        resolve({ status: 'unavailable' });
+      }, WRITER_OWNERSHIP_IN_FLIGHT_TIMEOUT_MS);
+      timeout.unref();
+      acquisition.then((value) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      }).catch(() => {
+        if (settled) return;
+        settled = true;
+        resolve({ status: 'unavailable' });
+      }).finally(() => clearTimeout(timeout));
+    });
+    this.writerOwnershipInFlight.set(cacheKey, boundedAcquisition);
     try {
-      return await acquisition;
+      return await boundedAcquisition;
     } finally {
-      if (this.writerOwnershipInFlight.get(cacheKey) === acquisition) {
+      if (this.writerOwnershipInFlight.get(cacheKey) === boundedAcquisition) {
         this.writerOwnershipInFlight.delete(cacheKey);
       }
     }
+  }
+
+  writerOwnershipStats() {
+    return {
+      entries: this.writerOwnershipCache.size,
+      bytes: this.writerOwnershipCacheBytes,
+      maxEntries: WRITER_OWNERSHIP_CACHE_MAX_ENTRIES,
+      maxBytes: WRITER_OWNERSHIP_CACHE_MAX_BYTES,
+      inFlight: this.writerOwnershipInFlight.size,
+      inFlightMaxEntries: WRITER_OWNERSHIP_IN_FLIGHT_MAX_ENTRIES,
+      expired: this.writerOwnershipCacheExpired,
+      evicted: this.writerOwnershipCacheEvicted,
+      rejected: this.writerOwnershipInFlightRejected,
+      timeouts: this.writerOwnershipInFlightTimeouts,
+    };
   }
 
   private async acquireWriterOwnershipUncached(
@@ -1456,7 +2506,29 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       );
       const row = result.rows[0];
       if (row?.writer_id === writerId) {
+        const previous = this.writerOwnershipCache.get(cacheKey);
+        if (previous !== undefined) {
+          this.writerOwnershipCache.delete(cacheKey);
+          this.writerOwnershipCacheBytes = Math.max(
+            0,
+            this.writerOwnershipCacheBytes - Buffer.byteLength(cacheKey, 'utf8') - 16,
+          );
+        }
         this.writerOwnershipCache.set(cacheKey, Number(row.lease_expires_at));
+        this.writerOwnershipCacheBytes += Buffer.byteLength(cacheKey, 'utf8') + 16;
+        while (
+          this.writerOwnershipCache.size > WRITER_OWNERSHIP_CACHE_MAX_ENTRIES
+          || this.writerOwnershipCacheBytes > WRITER_OWNERSHIP_CACHE_MAX_BYTES
+        ) {
+          const oldest = this.writerOwnershipCache.keys().next().value as string | undefined;
+          if (oldest === undefined) break;
+          this.writerOwnershipCache.delete(oldest);
+          this.writerOwnershipCacheBytes = Math.max(
+            0,
+            this.writerOwnershipCacheBytes - Buffer.byteLength(oldest, 'utf8') - 16,
+          );
+          this.writerOwnershipCacheEvicted += 1;
+        }
         return { status: 'owned' };
       }
       const existing = await pool.query<{
@@ -1941,6 +3013,180 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         )
       `);
       await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_raw_observations_v1 (
+          observation_id TEXT NOT NULL,
+          revision BIGINT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          event_at NUMERIC(40, 0) NOT NULL,
+          received_at NUMERIC(40, 0) NOT NULL,
+          source_type TEXT NOT NULL,
+          source_id TEXT,
+          collector_id TEXT,
+          payload_sha256 TEXT NOT NULL,
+          original_bytes BIGINT NOT NULL,
+          captured_bytes BIGINT NOT NULL,
+          record JSONB NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (observation_id, revision)
+        )
+      `);
+      // Idempotency is scoped to an observation revision.  A late relation/projection revision
+      // must append beside revision 1 rather than colliding with a transport retry key.
+      await pool.query(`
+        ALTER TABLE anysentry_raw_observations_v1
+          DROP CONSTRAINT IF EXISTS anysentry_raw_observations_v1_idempotency_key_key
+      `);
+      await pool.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS anysentry_raw_observations_v1_idempotency_revision_idx
+          ON anysentry_raw_observations_v1 (idempotency_key, revision)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_raw_observations_v1_event_idx
+          ON anysentry_raw_observations_v1 (event_at DESC)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_raw_observations_v1_source_idx
+          ON anysentry_raw_observations_v1 (source_id, collector_id, event_at DESC)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_kernel_facts_v1 (
+          fact_id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL,
+          authority TEXT NOT NULL,
+          observed_at NUMERIC(40, 0) NOT NULL,
+          process_generation_key TEXT,
+          parent_process_generation_key TEXT,
+          connection_id TEXT,
+          payload_ref TEXT,
+          event_id TEXT,
+          scope TEXT,
+          status TEXT NOT NULL,
+          record JSONB NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_kernel_facts_v1_observed_idx
+          ON anysentry_kernel_facts_v1 (observed_at DESC, fact_id)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_kernel_facts_v1_process_idx
+          ON anysentry_kernel_facts_v1 (process_generation_key, observed_at DESC)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_kernel_facts_v1_connection_idx
+          ON anysentry_kernel_facts_v1 (connection_id, observed_at DESC)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_kernel_facts_v1_event_idx
+          ON anysentry_kernel_facts_v1 (event_id)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_semantic_records_v1 (
+          semantic_record_id TEXT NOT NULL,
+          revision BIGINT NOT NULL DEFAULT 1,
+          kind TEXT NOT NULL,
+          authority TEXT NOT NULL,
+          observed_at NUMERIC(40, 0) NOT NULL,
+          logical_agent_id TEXT,
+          agent_instance_id TEXT,
+          session_id TEXT,
+          turn_id TEXT,
+          run_id TEXT,
+          tool_call_id TEXT,
+          record JSONB NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (semantic_record_id, revision)
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_semantic_records_v1_observed_idx
+          ON anysentry_semantic_records_v1 (observed_at DESC, semantic_record_id, revision DESC)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_semantic_records_v1_session_idx
+          ON anysentry_semantic_records_v1 (session_id, observed_at DESC)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_session_memberships_v1 (
+          membership_id TEXT NOT NULL,
+          resolution_revision BIGINT NOT NULL,
+          session_id TEXT NOT NULL,
+          session_key TEXT,
+          provider_session_id_hash TEXT,
+          role TEXT NOT NULL,
+          confidence TEXT NOT NULL,
+          valid_from NUMERIC(40, 0) NOT NULL,
+          record JSONB NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (membership_id, resolution_revision)
+        )
+      `);
+      await pool.query(`
+        ALTER TABLE anysentry_session_memberships_v1
+          ADD COLUMN IF NOT EXISTS session_key TEXT,
+          ADD COLUMN IF NOT EXISTS provider_session_id_hash TEXT
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_session_memberships_v1_session_idx
+          ON anysentry_session_memberships_v1 (session_id, valid_from DESC, resolution_revision DESC)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_session_memberships_v1_session_key_idx
+          ON anysentry_session_memberships_v1 (session_key, valid_from DESC, resolution_revision DESC)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_session_memberships_v1_interaction_idx
+          ON anysentry_session_memberships_v1 ((record->>'interactionId'), valid_from DESC)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_coverage_gaps_v1 (
+          gap_id TEXT NOT NULL,
+          revision BIGINT NOT NULL,
+          stage TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          scope TEXT NOT NULL,
+          first_seen_at NUMERIC(40, 0) NOT NULL,
+          last_seen_at NUMERIC(40, 0) NOT NULL,
+          dropped_count BIGINT NOT NULL,
+          orphaned_count BIGINT NOT NULL,
+          record JSONB NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (gap_id, revision)
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_coverage_gaps_v1_last_seen_idx
+          ON anysentry_coverage_gaps_v1 (last_seen_at DESC, gap_id, revision DESC)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_evidence_links_v1 (
+          link_id TEXT NOT NULL,
+          resolution_revision BIGINT NOT NULL,
+          from_type TEXT NOT NULL,
+          from_id TEXT NOT NULL,
+          to_type TEXT NOT NULL,
+          to_id TEXT NOT NULL,
+          relation TEXT NOT NULL,
+          method TEXT NOT NULL,
+          confidence DOUBLE PRECISION NOT NULL,
+          status TEXT NOT NULL,
+          authority TEXT NOT NULL,
+          valid_from NUMERIC(40, 0) NOT NULL,
+          record JSONB NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (link_id, resolution_revision)
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_evidence_links_v1_from_idx
+          ON anysentry_evidence_links_v1 (from_type, from_id, valid_from DESC)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_evidence_links_v1_to_idx
+          ON anysentry_evidence_links_v1 (to_type, to_id, valid_from DESC)
+      `);
+      await pool.query(`
         CREATE INDEX IF NOT EXISTS anysentry_agent_conversation_threads_v1_scope_time_idx
           ON anysentry_agent_conversation_threads_v1 (logical_scope_key, last_activity_at DESC)
       `);
@@ -2078,6 +3324,33 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
           updated_at BIGINT NOT NULL,
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
+      `);
+      // The *_v1 table above is retained as a latest-row compatibility projection for existing
+      // readers.  Correlation decisions themselves are append-only: every resolution revision is
+      // preserved in this history table so a late Kernel event cannot erase the prior decision.
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_agent_semantic_kernel_relation_history_v1 (
+          relation_id TEXT NOT NULL,
+          stable_semantic_event_id TEXT NOT NULL,
+          tool_invocation_id TEXT NOT NULL,
+          kernel_event_id TEXT,
+          relation_status TEXT NOT NULL,
+          resolution_revision BIGINT NOT NULL,
+          record JSONB NOT NULL,
+          updated_at BIGINT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (relation_id, resolution_revision)
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_agent_semantic_kernel_relation_history_v1_semantic_idx
+          ON anysentry_agent_semantic_kernel_relation_history_v1 (
+            stable_semantic_event_id, resolution_revision DESC, relation_id
+          )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_agent_semantic_kernel_relation_history_v1_kernel_idx
+          ON anysentry_agent_semantic_kernel_relation_history_v1 (kernel_event_id, resolution_revision DESC)
       `);
       await pool.query(`
         CREATE INDEX IF NOT EXISTS anysentry_agent_semantic_kernel_relations_v1_semantic_idx

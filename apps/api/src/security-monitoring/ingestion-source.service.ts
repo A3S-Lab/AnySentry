@@ -528,11 +528,15 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
         return finish({ accepted: false, source, reason: 'source id does not match token' }, true);
       }
     }
-
     if (!source && sourceId) source = this.sources.get(sourceId);
     if (!source) source = this.findExistingIdentity(input);
     if (!source && (collectorId || sourceName)) source = this.discover({ ...input, collectorId, sourceName });
     if (!source) return finish({ accepted: true });
+
+    const requestedWorkspace = clean(input.workspacePath, 500);
+    if (source.workspacePath && requestedWorkspace && source.workspacePath !== requestedWorkspace) {
+      return finish({ accepted: false, source, reason: 'source workspace does not match token binding' });
+    }
 
     if (!source.enabled) {
       return finish({ accepted: false, source, reason: 'source disabled' });

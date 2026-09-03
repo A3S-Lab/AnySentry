@@ -1,4 +1,4 @@
-import { Injectable, Optional, ServiceUnavailableException } from '@nestjs/common';
+import { Injectable, OnModuleDestroy, Optional, ServiceUnavailableException } from '@nestjs/common';
 import { Sentry } from '@a3s-lab/sentry';
 import { createHash } from 'node:crypto';
 import {
@@ -34,7 +34,7 @@ import { IngestionSourceService } from './ingestion-source.service';
 import { MaintenanceWindowService } from './maintenance-window.service';
 import { buildAcl, policyConfigError, sanitizePolicy } from './policy-config';
 import { SentryJudgeService } from './sentry-judge.service';
-import { planDashboardRead, pruneSnapshotCache } from './dashboard-query-plan';
+import { planDashboardRead } from './dashboard-query-plan';
 import { DashboardHistoryBucketCache } from './dashboard-history-cache';
 import {
   observedDurableThrough,
@@ -67,11 +67,13 @@ import {
 import { AgentConversationBindingService } from './agent-conversation-binding.service';
 import { trafficRoleForInteraction } from './agent-conversation-resolution-v2';
 import { RelationalBusinessStore } from './relational-business-store.service';
+import { CanonicalObservabilityService } from './canonical-observability.service';
 import {
   AGENT_SEMANTIC_KERNEL_RELATION_VERSION,
   buildSemanticKernelRelationBatch,
   buildSemanticKernelRelations,
   semanticKernelRelationBatchWindow,
+  canonicalEvidenceLinksForRelations,
   toolInvocationId,
   type SemanticKernelRelationInput,
 } from './agent-semantic-kernel-relation';
@@ -85,6 +87,25 @@ import * as T from './types';
 
 const SEV_RANK: Record<T.Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 const MAX_HISTORY_CACHE_ENTRIES = 64;
+const MAX_HISTORY_CACHE_BYTES = 8 * 1024 * 1024;
+const WIN_CACHE_TTL_MS = 1_500;
+const MAX_WIN_CACHE_ENTRIES = 64;
+const MAX_WIN_CACHE_BYTES = 16 * 1024 * 1024;
+const MAX_AGENT_INSTANCE_METRICS_CACHE_ENTRIES = 256;
+const MAX_AGENT_INSTANCE_METRICS_CACHE_BYTES = 16 * 1024 * 1024;
+const AGENT_INSTANCE_METRICS_CACHE_TTL_MS = 15_000;
+const MAX_AGENT_INVENTORY_IN_FLIGHT = 128;
+const MAX_AGENT_OBSERVABILITY_IN_FLIGHT = 128;
+const MAX_CONVERSATION_PROJECTION_IN_FLIGHT = 128;
+const IN_FLIGHT_OPERATION_TIMEOUT_MS = 30_000;
+const MAX_RECENT_OBSERVABILITY_ENTRIES = 64;
+const MAX_RECENT_OBSERVABILITY_BYTES = 8 * 1024 * 1024;
+const RECENT_OBSERVABILITY_TTL_MS = 15_000;
+const MAX_LAST_GOOD_INVENTORY_ENTRIES = 32;
+const MAX_LAST_GOOD_INVENTORY_BYTES = 8 * 1024 * 1024;
+const LAST_GOOD_INVENTORY_TTL_MS = 15 * 60_000;
+const INTERACTION_HOT_TTL_MS = 30 * 60_000;
+const RELATION_PROJECTION_TIMEOUT_MS = 60_000;
 const LEVEL_BY_RANK = ['safe', 'low', 'medium', 'high', 'critical'];
 const LEVEL_TEXT: Record<string, string> = { safe: '安全', low: '低危', medium: '中危', high: '高危', critical: '严重', unknown: '未知' };
 const TOOL_EVIDENCE_RELATION_SETTLE_MS = 10_000;
@@ -778,7 +799,7 @@ function simulationChange(current: T.PolicySimulationDecision, simulated: T.Poli
 }
 
 @Injectable()
-export class AggregationService {
+export class AggregationService implements OnModuleDestroy {
   constructor(
     private readonly judge: SentryJudgeService,
     private readonly agentMetadata: AgentMetadataService,
@@ -788,25 +809,342 @@ export class AggregationService {
     @Optional() private readonly assetReviews?: ObservedAssetReviewService,
     @Optional() private readonly conversationBindings?: AgentConversationBindingService,
     @Optional() private readonly relationalStore?: RelationalBusinessStore,
+    @Optional() private readonly canonicalObservability?: CanonicalObservabilityService,
   ) {}
+
+  private estimateCacheBytes(value: unknown): number {
+    try {
+      return Math.max(1, Buffer.byteLength(JSON.stringify(value), 'utf8'));
+    } catch {
+      return 1_024;
+    }
+  }
+
+  private pruneWinCache(at = now()): void {
+    for (const [key, entry] of this.winCache) {
+      if (at - entry.at < WIN_CACHE_TTL_MS) continue;
+      this.winCache.delete(key);
+      this.winCacheBytes = Math.max(0, this.winCacheBytes - entry.bytes);
+      this.winCacheExpired += 1;
+    }
+  }
+
+  private rememberWinCache(
+    key: string,
+    val: ReturnType<AggregationService['computeWin']>,
+    at: number,
+  ): void {
+    const bytes = Buffer.byteLength(key, 'utf8') + this.estimateCacheBytes(val);
+    if (bytes > MAX_WIN_CACHE_BYTES) {
+      this.winCacheDropped += 1;
+      return;
+    }
+    const previous = this.winCache.get(key);
+    if (previous) {
+      this.winCache.delete(key);
+      this.winCacheBytes = Math.max(0, this.winCacheBytes - previous.bytes);
+    }
+    this.winCache.set(key, { at, val, bytes });
+    this.winCacheBytes += bytes;
+    this.pruneWinCache(at);
+    while (this.winCache.size > MAX_WIN_CACHE_ENTRIES || this.winCacheBytes > MAX_WIN_CACHE_BYTES) {
+      const oldest = this.winCache.entries().next().value as
+        | [string, { at: number; val: ReturnType<AggregationService['computeWin']>; bytes: number }]
+        | undefined;
+      if (!oldest) break;
+      this.winCache.delete(oldest[0]);
+      this.winCacheBytes = Math.max(0, this.winCacheBytes - oldest[1].bytes);
+      this.winCacheEvictions += 1;
+    }
+  }
+
+  private pruneHistoryCache(at = now()): void {
+    for (const [key, entry] of this.historyCache) {
+      if (entry.completedAt === undefined) {
+        if (at - entry.startedAt <= IN_FLIGHT_OPERATION_TIMEOUT_MS) continue;
+        this.historyCache.delete(key);
+        this.historyCacheBytes = Math.max(0, this.historyCacheBytes - entry.bytes);
+        const timeout = this.historyCacheTimeoutsByKey.get(key);
+        if (timeout) clearTimeout(timeout);
+        this.historyCacheTimeoutsByKey.delete(key);
+        this.historyCacheTimeouts += 1;
+        continue;
+      }
+      const ttl = entry.failedAt === undefined ? entry.ttlMs : 30_000;
+      if (at - entry.completedAt < ttl) continue;
+      this.historyCache.delete(key);
+      this.historyCacheBytes = Math.max(0, this.historyCacheBytes - entry.bytes);
+      const timeout = this.historyCacheTimeoutsByKey.get(key);
+      if (timeout) clearTimeout(timeout);
+      this.historyCacheTimeoutsByKey.delete(key);
+      this.historyCacheExpired += 1;
+    }
+    while (this.historyCache.size > MAX_HISTORY_CACHE_ENTRIES || this.historyCacheBytes > MAX_HISTORY_CACHE_BYTES) {
+      const oldest = [...this.historyCache.entries()]
+        .filter(([, entry]) => entry.completedAt !== undefined)
+        .sort((left, right) =>
+          (left[1].completedAt ?? left[1].startedAt) - (right[1].completedAt ?? right[1].startedAt),
+        )[0];
+      if (!oldest) break;
+      this.historyCache.delete(oldest[0]);
+      this.historyCacheBytes = Math.max(0, this.historyCacheBytes - oldest[1].bytes);
+      this.historyCacheEvictions += 1;
+    }
+  }
+
+  private pruneAgentInstanceMetricsCache(at = now()): void {
+    for (const [key, entry] of this.agentInstanceMetricsCache) {
+      if (at - entry.at < AGENT_INSTANCE_METRICS_CACHE_TTL_MS) continue;
+      this.agentInstanceMetricsCache.delete(key);
+      this.agentInstanceMetricsCacheBytes = Math.max(0, this.agentInstanceMetricsCacheBytes - entry.bytes);
+      this.agentInstanceMetricsCacheExpired += 1;
+    }
+  }
+
+  private rememberAgentInstanceMetrics(key: string, value: T.AgentInstanceMetrics, at = now()): void {
+    const bytes = Buffer.byteLength(key, 'utf8') + this.estimateCacheBytes(value);
+    if (bytes > MAX_AGENT_INSTANCE_METRICS_CACHE_BYTES) {
+      this.agentInstanceMetricsCacheDropped += 1;
+      return;
+    }
+    const previous = this.agentInstanceMetricsCache.get(key);
+    if (previous) {
+      this.agentInstanceMetricsCache.delete(key);
+      this.agentInstanceMetricsCacheBytes = Math.max(0, this.agentInstanceMetricsCacheBytes - previous.bytes);
+    }
+    this.agentInstanceMetricsCache.set(key, { at, value, bytes });
+    this.agentInstanceMetricsCacheBytes += bytes;
+    this.pruneAgentInstanceMetricsCache(at);
+    while (
+      this.agentInstanceMetricsCache.size > MAX_AGENT_INSTANCE_METRICS_CACHE_ENTRIES
+      || this.agentInstanceMetricsCacheBytes > MAX_AGENT_INSTANCE_METRICS_CACHE_BYTES
+    ) {
+      const oldest = [...this.agentInstanceMetricsCache.entries()]
+        .sort((left, right) => left[1].at - right[1].at)[0];
+      if (!oldest) break;
+      this.agentInstanceMetricsCache.delete(oldest[0]);
+      this.agentInstanceMetricsCacheBytes = Math.max(0, this.agentInstanceMetricsCacheBytes - oldest[1].bytes);
+      this.agentInstanceMetricsCacheEvictions += 1;
+    }
+  }
+
+  private pruneAgentObservabilityRecent(at = now()): void {
+    for (const [key, entry] of this.agentObservabilityRecent) {
+      if (at - entry.at < RECENT_OBSERVABILITY_TTL_MS) continue;
+      this.agentObservabilityRecent.delete(key);
+      this.agentObservabilityRecentBytes = Math.max(0, this.agentObservabilityRecentBytes - entry.bytes);
+      this.agentObservabilityRecentExpired += 1;
+    }
+  }
+
+  private rememberAgentObservabilityRecent(key: string, value: T.AgentObservability, at = now()): void {
+    const bytes = Buffer.byteLength(key, 'utf8') + this.estimateCacheBytes(value);
+    if (bytes > MAX_RECENT_OBSERVABILITY_BYTES) {
+      this.agentObservabilityRecentDropped += 1;
+      return;
+    }
+    const previous = this.agentObservabilityRecent.get(key);
+    if (previous) {
+      this.agentObservabilityRecent.delete(key);
+      this.agentObservabilityRecentBytes = Math.max(0, this.agentObservabilityRecentBytes - previous.bytes);
+    }
+    this.agentObservabilityRecent.set(key, { at, value, bytes });
+    this.agentObservabilityRecentBytes += bytes;
+    this.pruneAgentObservabilityRecent(at);
+    while (
+      this.agentObservabilityRecent.size > MAX_RECENT_OBSERVABILITY_ENTRIES
+      || this.agentObservabilityRecentBytes > MAX_RECENT_OBSERVABILITY_BYTES
+    ) {
+      const oldest = this.agentObservabilityRecent.entries().next().value as
+        | [string, { at: number; value: T.AgentObservability; bytes: number }]
+        | undefined;
+      if (!oldest) break;
+      this.agentObservabilityRecent.delete(oldest[0]);
+      this.agentObservabilityRecentBytes = Math.max(0, this.agentObservabilityRecentBytes - oldest[1].bytes);
+      this.agentObservabilityRecentEvictions += 1;
+    }
+  }
+
+  private pruneAgentInventoryLastGood(at = now()): void {
+    for (const [key, entry] of this.agentInventoryLastGood) {
+      if (at - entry.at < LAST_GOOD_INVENTORY_TTL_MS) continue;
+      this.agentInventoryLastGood.delete(key);
+      this.agentInventoryLastGoodBytes = Math.max(0, this.agentInventoryLastGoodBytes - entry.bytes);
+      this.agentInventoryLastGoodExpired += 1;
+    }
+  }
+
+  private rememberAgentInventoryLastGood(key: string, value: T.AgentInventory, at = now()): void {
+    const bytes = Buffer.byteLength(key, 'utf8') + this.estimateCacheBytes(value);
+    if (bytes > MAX_LAST_GOOD_INVENTORY_BYTES) {
+      this.agentInventoryLastGoodDropped += 1;
+      return;
+    }
+    const previous = this.agentInventoryLastGood.get(key);
+    if (previous) {
+      this.agentInventoryLastGood.delete(key);
+      this.agentInventoryLastGoodBytes = Math.max(0, this.agentInventoryLastGoodBytes - previous.bytes);
+    }
+    this.agentInventoryLastGood.set(key, { at, value: structuredClone(value), bytes });
+    this.agentInventoryLastGoodBytes += bytes;
+    this.pruneAgentInventoryLastGood(at);
+    while (
+      this.agentInventoryLastGood.size > MAX_LAST_GOOD_INVENTORY_ENTRIES
+      || this.agentInventoryLastGoodBytes > MAX_LAST_GOOD_INVENTORY_BYTES
+    ) {
+      const oldest = this.agentInventoryLastGood.entries().next().value as
+        | [string, { at: number; value: T.AgentInventory; bytes: number }]
+        | undefined;
+      if (!oldest) break;
+      this.agentInventoryLastGood.delete(oldest[0]);
+      this.agentInventoryLastGoodBytes = Math.max(0, this.agentInventoryLastGoodBytes - oldest[1].bytes);
+      this.agentInventoryLastGoodEvictions += 1;
+    }
+  }
+
+  private reserveInFlight(
+    map: Map<string, unknown>,
+    key: string,
+    currentBytes: number,
+    maxEntries: number,
+  ): { accepted: boolean; bytes: number } {
+    if (map.has(key)) return { accepted: true, bytes: 0 };
+    const bytes = Buffer.byteLength(key, 'utf8') + 64;
+    const maxBytes = 2 * 1024 * 1024;
+    if (map.size >= maxEntries || currentBytes + bytes > maxBytes) return { accepted: false, bytes };
+    return { accepted: true, bytes };
+  }
+
+  /**
+   * Bound a downstream query/projection Promise independently of its transport implementation.
+   * The timeout callback removes the single-flight key immediately; the original Promise is still
+   * observed so a late result cannot become an unhandled rejection, but it is treated as an orphan
+   * and cannot hold the bounded map indefinitely.
+   */
+  private withInFlightTimeout<T>(
+    request: Promise<T>,
+    onTimeout: () => void,
+    message: string,
+  ): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    let settled = false;
+    const bounded = new Promise<T>((resolve, reject) => {
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try { onTimeout(); } catch { /* cleanup must not mask the timeout */ }
+        reject(new ServiceUnavailableException(message));
+      }, IN_FLIGHT_OPERATION_TIMEOUT_MS);
+      timer.unref();
+      request.then((value) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      }).catch((error: unknown) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      }).finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+    });
+    return bounded;
+  }
+
+  private pruneConversationProjectionRecent(at = now()): void {
+    for (const [key, entry] of this.conversationProjectionRecent) {
+      if (at - entry.at < RECENT_OBSERVABILITY_TTL_MS) continue;
+      this.conversationProjectionRecent.delete(key);
+      this.conversationProjectionRecentBytes = Math.max(0, this.conversationProjectionRecentBytes - entry.bytes);
+      this.conversationProjectionRecentExpired += 1;
+    }
+  }
+
+  private pruneInteractionHot(at = now()): void {
+    for (const [key, entry] of this.interactionHot) {
+      if (at - entry.insertedAt < INTERACTION_HOT_TTL_MS) continue;
+      this.interactionHot.delete(key);
+      this.interactionHotBytes = Math.max(0, this.interactionHotBytes - entry.bytes);
+      this.interactionHotExpired += 1;
+    }
+  }
+
+  onModuleDestroy(): void {
+    for (const entry of this.semanticRelationProjectionTimers.values()) clearTimeout(entry.timer);
+    for (const timer of this.semanticRelationProjectionDeadlines.values()) clearTimeout(timer);
+    this.semanticRelationProjectionTimers.clear();
+    this.semanticRelationProjectionActive.clear();
+    this.semanticRelationProjectionDeadlines.clear();
+    for (const timer of this.historyCacheTimeoutsByKey.values()) clearTimeout(timer);
+    this.historyCacheTimeoutsByKey.clear();
+    this.winCache.clear();
+    this.winCacheBytes = 0;
+    this.historyCache.clear();
+    this.historyCacheBytes = 0;
+    this.agentInstanceMetricsCache.clear();
+    this.agentInstanceMetricsCacheBytes = 0;
+    this.agentInventoryInFlight.clear();
+    this.agentInventoryInFlightBytes = 0;
+    this.agentObservabilityInFlight.clear();
+    this.agentObservabilityInFlightBytes = 0;
+    this.agentObservabilityRecent.clear();
+    this.agentObservabilityRecentBytes = 0;
+    this.conversationProjectionInFlight.clear();
+    this.conversationProjectionInFlightBytes = 0;
+    this.conversationProjectionRecent.clear();
+    this.conversationProjectionRecentBytes = 0;
+    this.durableEventSearchInFlight = undefined;
+    this.interactionHot.clear();
+    this.interactionHotBytes = 0;
+    this.agentHistoryBuckets.clear();
+    this.topologyHistoryBuckets.clear();
+    this.workspaceHistoryBuckets.clear();
+  }
 
   // The dashboard polls 9 endpoints with the same filter near-simultaneously; cache the windowed
   // scan for a beat so they share one pass over the 100k ring instead of nine (keeps latency flat).
-  private readonly winCache = new Map<string, { at: number; val: ReturnType<AggregationService['computeWin']> }>();
+  private readonly winCache = new Map<string, { at: number; val: ReturnType<AggregationService['computeWin']>; bytes: number }>();
+  private winCacheBytes = 0;
+  private winCacheEvictions = 0;
+  private winCacheExpired = 0;
+  private winCacheDropped = 0;
   private readonly historyCache = new Map<string, {
     startedAt: number;
     completedAt?: number;
     failedAt?: number;
     ttlMs: number;
+    bytes: number;
     value: Promise<DashboardWindowHistory | null>;
   }>();
+  private historyCacheBytes = 0;
+  private historyCacheEvictions = 0;
+  private historyCacheExpired = 0;
+  private historyCacheDropped = 0;
+  private historyCacheRejected = 0;
+  private historyCacheTimeouts = 0;
+  private readonly historyCacheTimeoutsByKey = new Map<string, NodeJS.Timeout>();
   private readonly agentInstanceMetricsCache = new Map<string, {
     at: number;
     value: T.AgentInstanceMetrics;
+    bytes: number;
   }>();
+  private agentInstanceMetricsCacheBytes = 0;
+  private agentInstanceMetricsCacheEvictions = 0;
+  private agentInstanceMetricsCacheExpired = 0;
+  private agentInstanceMetricsCacheDropped = 0;
   private readonly agentInventoryInFlight = new Map<string, Promise<T.AgentInventory>>();
   private readonly agentObservabilityInFlight = new Map<string, Promise<T.AgentObservability>>();
-  private readonly agentObservabilityRecent = new Map<string, T.AgentObservability>();
+  private agentInventoryInFlightBytes = 0;
+  private agentObservabilityInFlightBytes = 0;
+  private agentInventoryInFlightRejected = 0;
+  private agentObservabilityInFlightRejected = 0;
+  private agentInventoryInFlightTimeouts = 0;
+  private agentObservabilityInFlightTimeouts = 0;
+  private readonly agentObservabilityRecent = new Map<string, { at: number; value: T.AgentObservability; bytes: number }>();
+  private agentObservabilityRecentBytes = 0;
+  private agentObservabilityRecentEvictions = 0;
+  private agentObservabilityRecentExpired = 0;
+  private agentObservabilityRecentDropped = 0;
   private dashboardHistoryBuckets?: DashboardHistoryBucketCache;
   private readonly agentHistoryBuckets = new Map<
     'agent' | 'all',
@@ -825,7 +1163,11 @@ export class AggregationService {
   // One exact window may need stable/head/tail reads concurrently. Four slots let one request
   // complete without self-rejection while still bounding cross-page ClickHouse pressure.
   private readonly historyQueryGate = new BoundedHistoryQueryGate(4);
-  private readonly agentInventoryLastGood = new Map<string, { at: number; value: T.AgentInventory }>();
+  private readonly agentInventoryLastGood = new Map<string, { at: number; value: T.AgentInventory; bytes: number }>();
+  private agentInventoryLastGoodBytes = 0;
+  private agentInventoryLastGoodEvictions = 0;
+  private agentInventoryLastGoodExpired = 0;
+  private agentInventoryLastGoodDropped = 0;
   // Two identical HTTP requests otherwise resolve a preset window at slightly different
   // milliseconds and miss the ClickHouse store's exact-query single-flight key. Coalesce the
   // complete durable response by request semantics before either request samples Date.now().
@@ -833,10 +1175,14 @@ export class AggregationService {
     key: string;
     value: Promise<T.AgentEventList>;
   };
-  private readonly interactionHot = new Map<string, { record: T.AgentInteractionRecord; bytes: number }>();
+  private durableEventSearchTimeouts = 0;
+  private readonly interactionHot = new Map<string, { record: T.AgentInteractionRecord; bytes: number; insertedAt: number }>();
   private interactionHotBytes = 0;
   private readonly interactionHotMaxRecords = 2_000;
   private readonly interactionHotMaxBytes = 64 * 1024 * 1024;
+  private interactionHotEvictions = 0;
+  private interactionHotExpired = 0;
+  private interactionHotDropped = 0;
   private readonly conversationProjectionGate = new BoundedHistoryQueryGate(
     CONVERSATION_PROJECTION_CONCURRENCY,
   );
@@ -846,8 +1192,15 @@ export class AggregationService {
   >();
   private readonly conversationProjectionRecent = new Map<
     string,
-    AgentConversationProjectionResult
+    { at: number; value: AgentConversationProjectionResult; bytes: number }
   >();
+  private conversationProjectionInFlightBytes = 0;
+  private conversationProjectionInFlightRejected = 0;
+  private conversationProjectionInFlightTimeouts = 0;
+  private conversationProjectionRecentBytes = 0;
+  private conversationProjectionRecentEvictions = 0;
+  private conversationProjectionRecentExpired = 0;
+  private conversationProjectionRecentDropped = 0;
   private conversationInteractionRevision = 0;
   private readonly semanticRelationProjectionTimers = new Map<string, {
     timer: NodeJS.Timeout;
@@ -855,7 +1208,14 @@ export class AggregationService {
     record: T.AgentInteractionRecord;
   }>();
   private readonly semanticRelationProjectionActive = new Set<string>();
+  private readonly semanticRelationProjectionDeadlines = new Map<string, NodeJS.Timeout>();
   private readonly semanticRelationProjectionMaxKeys = 512;
+  private semanticRelationProjectionScheduled = 0;
+  private semanticRelationProjectionCompleted = 0;
+  private semanticRelationProjectionEvictions = 0;
+  private semanticRelationProjectionDropped = 0;
+  private semanticRelationProjectionTimeouts = 0;
+  private semanticRelationProjectionOrphans = 0;
 
   historyFactCacheStatus() {
     const agents = [...this.agentHistoryBuckets.entries()].map(([scope, cache]) => ({
@@ -902,8 +1262,138 @@ export class AggregationService {
     };
   }
 
+  /**
+   * Operational view of every process-local projection cache. These counters make bounded
+   * degradation auditable without exposing cached prompt/body content.
+   */
+  cacheStateStats() {
+    this.pruneWinCache();
+    this.pruneHistoryCache();
+    this.pruneAgentInstanceMetricsCache();
+    this.pruneAgentObservabilityRecent();
+    this.pruneAgentInventoryLastGood();
+    this.pruneInteractionHot();
+    this.pruneConversationProjectionRecent();
+    return {
+      schemaVersion: 'anysentry.aggregation-cache-state.v1',
+      win: {
+        entries: this.winCache.size,
+        bytes: this.winCacheBytes,
+        maxEntries: MAX_WIN_CACHE_ENTRIES,
+        maxBytes: MAX_WIN_CACHE_BYTES,
+        ttlMs: WIN_CACHE_TTL_MS,
+        evicted: this.winCacheEvictions,
+        expired: this.winCacheExpired,
+        dropped: this.winCacheDropped,
+      },
+      history: {
+        entries: this.historyCache.size,
+        bytes: this.historyCacheBytes,
+        maxEntries: MAX_HISTORY_CACHE_ENTRIES,
+        maxBytes: MAX_HISTORY_CACHE_BYTES,
+        evicted: this.historyCacheEvictions,
+        expired: this.historyCacheExpired,
+        dropped: this.historyCacheDropped,
+        rejected: this.historyCacheRejected,
+        timeouts: this.historyCacheTimeouts,
+      },
+      agentInstanceMetrics: {
+        entries: this.agentInstanceMetricsCache.size,
+        bytes: this.agentInstanceMetricsCacheBytes,
+        maxEntries: MAX_AGENT_INSTANCE_METRICS_CACHE_ENTRIES,
+        maxBytes: MAX_AGENT_INSTANCE_METRICS_CACHE_BYTES,
+        ttlMs: AGENT_INSTANCE_METRICS_CACHE_TTL_MS,
+        evicted: this.agentInstanceMetricsCacheEvictions,
+        expired: this.agentInstanceMetricsCacheExpired,
+        dropped: this.agentInstanceMetricsCacheDropped,
+      },
+      agentInventoryInFlight: {
+        entries: this.agentInventoryInFlight.size,
+        bytes: this.agentInventoryInFlightBytes,
+        maxEntries: MAX_AGENT_INVENTORY_IN_FLIGHT,
+        maxBytes: 2 * 1024 * 1024,
+        rejected: this.agentInventoryInFlightRejected,
+        timeouts: this.agentInventoryInFlightTimeouts,
+      },
+      agentObservabilityInFlight: {
+        entries: this.agentObservabilityInFlight.size,
+        bytes: this.agentObservabilityInFlightBytes,
+        maxEntries: MAX_AGENT_OBSERVABILITY_IN_FLIGHT,
+        maxBytes: 2 * 1024 * 1024,
+        rejected: this.agentObservabilityInFlightRejected,
+        timeouts: this.agentObservabilityInFlightTimeouts,
+      },
+      agentObservabilityRecent: {
+        entries: this.agentObservabilityRecent.size,
+        bytes: this.agentObservabilityRecentBytes,
+        maxEntries: MAX_RECENT_OBSERVABILITY_ENTRIES,
+        maxBytes: MAX_RECENT_OBSERVABILITY_BYTES,
+        ttlMs: RECENT_OBSERVABILITY_TTL_MS,
+        evicted: this.agentObservabilityRecentEvictions,
+        expired: this.agentObservabilityRecentExpired,
+        dropped: this.agentObservabilityRecentDropped,
+      },
+      agentInventoryLastGood: {
+        entries: this.agentInventoryLastGood.size,
+        bytes: this.agentInventoryLastGoodBytes,
+        maxEntries: MAX_LAST_GOOD_INVENTORY_ENTRIES,
+        maxBytes: MAX_LAST_GOOD_INVENTORY_BYTES,
+        ttlMs: LAST_GOOD_INVENTORY_TTL_MS,
+        evicted: this.agentInventoryLastGoodEvictions,
+        expired: this.agentInventoryLastGoodExpired,
+        dropped: this.agentInventoryLastGoodDropped,
+      },
+      interactionHot: {
+        entries: this.interactionHot.size,
+        bytes: this.interactionHotBytes,
+        maxEntries: this.interactionHotMaxRecords,
+        maxBytes: this.interactionHotMaxBytes,
+        ttlMs: INTERACTION_HOT_TTL_MS,
+        evicted: this.interactionHotEvictions,
+        expired: this.interactionHotExpired,
+        dropped: this.interactionHotDropped,
+      },
+      conversationProjection: {
+        recentEntries: this.conversationProjectionRecent.size,
+        recentBytes: this.conversationProjectionRecentBytes,
+        recentMaxEntries: MAX_RECENT_OBSERVABILITY_ENTRIES,
+        recentMaxBytes: MAX_RECENT_OBSERVABILITY_BYTES,
+        recentTtlMs: RECENT_OBSERVABILITY_TTL_MS,
+        recentEvicted: this.conversationProjectionRecentEvictions,
+        recentExpired: this.conversationProjectionRecentExpired,
+        recentDropped: this.conversationProjectionRecentDropped,
+        inFlightEntries: this.conversationProjectionInFlight.size,
+        inFlightBytes: this.conversationProjectionInFlightBytes,
+        inFlightMaxEntries: MAX_CONVERSATION_PROJECTION_IN_FLIGHT,
+        inFlightMaxBytes: 2 * 1024 * 1024,
+        inFlightRejected: this.conversationProjectionInFlightRejected,
+        inFlightTimeouts: this.conversationProjectionInFlightTimeouts,
+      },
+      relationProjection: {
+        queued: this.semanticRelationProjectionTimers.size,
+        active: this.semanticRelationProjectionActive.size,
+        maxKeys: this.semanticRelationProjectionMaxKeys,
+        scheduled: this.semanticRelationProjectionScheduled,
+        completed: this.semanticRelationProjectionCompleted,
+        evicted: this.semanticRelationProjectionEvictions,
+        dropped: this.semanticRelationProjectionDropped,
+        timeouts: this.semanticRelationProjectionTimeouts,
+        orphaned: this.semanticRelationProjectionOrphans,
+      },
+      durableEventSearch: {
+        inFlight: this.durableEventSearchInFlight ? 1 : 0,
+        maxEntries: 1,
+        timeoutMs: IN_FLIGHT_OPERATION_TIMEOUT_MS,
+        timeouts: this.durableEventSearchTimeouts,
+      },
+      historyQueryGate: this.historyQueryGate.status(),
+      conversationProjectionGate: this.conversationProjectionGate.status(),
+    };
+  }
+
   invalidateWindowCache(): void {
     this.winCache.clear();
+    this.winCacheBytes = 0;
     // Ingestion invalidates the millisecond-scale hot-ring cache, but must not cancel or discard a
     // multi-second ClickHouse history query. Historical snapshots intentionally refresh on their
     // own short TTL; clearing them for every event creates a query storm at observer throughput.
@@ -919,7 +1409,7 @@ export class AggregationService {
         : window.spanMs >= 24 * 60 * 60_000
           ? 60_000
           : 30_000;
-    pruneSnapshotCache(this.historyCache, t, (entry) => entry.failedAt ? 30_000 : entry.ttlMs);
+    this.pruneHistoryCache(t);
     const cached = this.historyCache.get(window.cacheKey);
     const cachedTtlMs = cached?.failedAt ? 30_000 : ttlMs;
     if (cached && (cached.completedAt === undefined || t - cached.completedAt < cachedTtlMs)) {
@@ -928,25 +1418,92 @@ export class AggregationService {
       this.historyCache.set(window.cacheKey, cached);
       return cached.value;
     }
-    if (cached) this.historyCache.delete(window.cacheKey);
+    if (cached) {
+      this.historyCache.delete(window.cacheKey);
+      this.historyCacheBytes = Math.max(0, this.historyCacheBytes - cached.bytes);
+      const timeout = this.historyCacheTimeoutsByKey.get(window.cacheKey);
+      if (timeout) clearTimeout(timeout);
+      this.historyCacheTimeoutsByKey.delete(window.cacheKey);
+    }
     while (this.historyCache.size >= MAX_HISTORY_CACHE_ENTRIES) {
       const completedKey = [...this.historyCache].find(([, entry]) => entry.completedAt !== undefined)?.[0];
-      if (!completedKey) return Promise.resolve(null);
+      if (!completedKey) {
+        this.historyCacheRejected += 1;
+        return Promise.resolve(null);
+      }
+      const completed = this.historyCache.get(completedKey);
       this.historyCache.delete(completedKey);
+      this.historyCacheBytes = Math.max(0, this.historyCacheBytes - (completed?.bytes ?? 0));
+      const timeout = this.historyCacheTimeoutsByKey.get(completedKey);
+      if (timeout) clearTimeout(timeout);
+      this.historyCacheTimeoutsByKey.delete(completedKey);
+      this.historyCacheEvictions += 1;
     }
-    const value = this.loadDashboardHistory(window);
+    const entryBytes = Buffer.byteLength(window.cacheKey, 'utf8') + 256;
+    if (entryBytes > MAX_HISTORY_CACHE_BYTES) {
+      this.historyCacheDropped += 1;
+      return Promise.resolve(null);
+    }
+    while (this.historyCacheBytes + entryBytes > MAX_HISTORY_CACHE_BYTES) {
+      const completedKey = [...this.historyCache]
+        .filter(([, entry]) => entry.completedAt !== undefined)
+        .sort((left, right) =>
+          (left[1].completedAt ?? left[1].startedAt) - (right[1].completedAt ?? right[1].startedAt),
+        )[0]?.[0];
+      if (!completedKey) {
+        this.historyCacheRejected += 1;
+        return Promise.resolve(null);
+      }
+      const completed = this.historyCache.get(completedKey);
+      this.historyCache.delete(completedKey);
+      this.historyCacheBytes = Math.max(0, this.historyCacheBytes - (completed?.bytes ?? 0));
+      this.historyCacheEvictions += 1;
+    }
+    const source = this.loadDashboardHistory(window);
+    let value: Promise<DashboardWindowHistory | null>;
+    value = new Promise<DashboardWindowHistory | null>((resolve) => {
+      const timeout = setTimeout(() => {
+        const current = this.historyCache.get(window.cacheKey);
+        if (current?.value !== value) return;
+        this.historyCache.delete(window.cacheKey);
+        this.historyCacheBytes = Math.max(0, this.historyCacheBytes - current.bytes);
+        this.historyCacheTimeoutsByKey.delete(window.cacheKey);
+        this.historyCacheTimeouts += 1;
+        resolve(null);
+      }, IN_FLIGHT_OPERATION_TIMEOUT_MS);
+      timeout.unref();
+      this.historyCacheTimeoutsByKey.set(window.cacheKey, timeout);
+      source.then(resolve).catch(() => resolve(null)).finally(() => clearTimeout(timeout));
+    });
     const entry = {
       startedAt: t,
       completedAt: undefined as number | undefined,
       failedAt: undefined as number | undefined,
       ttlMs,
+      bytes: entryBytes,
       value,
     };
     this.historyCache.set(window.cacheKey, entry);
+    this.historyCacheBytes += entryBytes;
     void value.then((result) => {
       if (this.historyCache.get(window.cacheKey)?.value !== value) return;
+      const timeout = this.historyCacheTimeoutsByKey.get(window.cacheKey);
+      if (timeout) clearTimeout(timeout);
+      this.historyCacheTimeoutsByKey.delete(window.cacheKey);
       entry.completedAt = now();
       if (!result) entry.failedAt = entry.completedAt;
+      if (result) {
+        const actualBytes = entryBytes + this.estimateCacheBytes(result);
+        if (actualBytes > MAX_HISTORY_CACHE_BYTES) {
+          this.historyCache.delete(window.cacheKey);
+          this.historyCacheBytes = Math.max(0, this.historyCacheBytes - entry.bytes);
+          this.historyCacheDropped += 1;
+          return;
+        }
+        this.historyCacheBytes = Math.max(0, this.historyCacheBytes - entry.bytes) + actualBytes;
+        entry.bytes = actualBytes;
+        this.pruneHistoryCache();
+      }
     });
     return value;
   }
@@ -1065,11 +1622,22 @@ export class AggregationService {
   private win(filter: T.SecurityTimeFilter): { events: T.JudgedEvent[]; sinceMs: number; spanMs: number; dataSinceMs: number; dataSpanMs: number } {
     const window = resolveTimeWindow(filter);
     const key = window.cacheKey;
-    const cached = this.winCache.get(key);
     const t = now();
-    if (cached && t - cached.at < 1500) return cached.val;
+    this.pruneWinCache(t);
+    const cached = this.winCache.get(key);
+    if (cached && t - cached.at < WIN_CACHE_TTL_MS) {
+      // Refresh insertion order so moving window keys are evicted least-recently-used.
+      this.winCache.delete(key);
+      this.winCache.set(key, cached);
+      return cached.val;
+    }
+    if (cached) {
+      this.winCache.delete(key);
+      this.winCacheBytes = Math.max(0, this.winCacheBytes - cached.bytes);
+      this.winCacheExpired += 1;
+    }
     const val = this.computeWin(window.startMs, window.endMs);
-    this.winCache.set(key, { at: t, val });
+    this.rememberWinCache(key, val, t);
     return val;
   }
 
@@ -1325,7 +1893,31 @@ export class AggregationService {
       locationLabel: detected.locationLabel,
       collectorId: eventCollectorId(e) || undefined,
       sourceId: eventSourceId(e) || undefined,
+      rawObservationId: e.rawObservationId,
+      rawObservationRevision: e.rawObservationRevision,
+      kernelFactId: e.kernelFactId,
+      logicalIdentityAuthority: e.logicalIdentityAuthority,
+      logicalAgentId: e.logicalAgentId,
+      logicalDefinitionId: e.logicalDefinitionId,
+      logicalScopeMode: e.logicalScopeMode,
+      logicalDefinitionFingerprint: e.logicalDefinitionFingerprint,
+      canonicalAgentInstanceId: e.canonicalAgentInstanceId,
+      runtimeInstanceId: e.runtimeInstanceId,
+      deploymentId: e.deploymentId,
+      deploymentRevision: e.deploymentRevision,
       sessionId: e.sessionId,
+      sessionIdentityQuality: e.sessionIdentityQuality,
+      sessionIdSource: e.sessionIdSource,
+      legacySessionId: e.legacySessionId,
+      canonicalSessionId: e.canonicalSessionId,
+      sessionKey: e.sessionKey,
+      sessionNamespaceKey: e.sessionNamespaceKey,
+      providerSessionIdHash: e.providerSessionIdHash,
+      parentSessionId: e.parentSessionId,
+      canonicalParentSessionId: e.canonicalParentSessionId,
+      sessionMode: e.sessionMode,
+      sessionLifecycle: e.sessionLifecycle,
+      sessionResolutionRevision: e.sessionResolutionRevision,
       userId: e.userId,
       traceId: e.traceId,
       ...(correlation?.invocationId ? { invocationId: correlation.invocationId } : {}),
@@ -1334,6 +1926,7 @@ export class AggregationService {
       spanId: e.spanId,
       parentSpanId: e.parentSpanId,
       runId: e.runId,
+      runIdSource: e.runIdSource,
       taskId: e.taskId,
       decisionStatus: e.decisionStatus,
       evaluationId: e.evaluationId,
@@ -1693,12 +2286,23 @@ export class AggregationService {
     if (current) return this.computeStoredAgentEvents(snapshot);
 
     const value = Promise.resolve().then(() => this.computeStoredAgentEvents(snapshot));
-    this.durableEventSearchInFlight = { key, value };
+    let boundedValue!: Promise<T.AgentEventList>;
+    boundedValue = this.withInFlightTimeout(
+      value,
+      () => {
+        if (this.durableEventSearchInFlight?.value === boundedValue) {
+          this.durableEventSearchInFlight = undefined;
+        }
+        this.durableEventSearchTimeouts += 1;
+      },
+      'stored Agent event query timed out',
+    );
+    this.durableEventSearchInFlight = { key, value: boundedValue };
     try {
-      const result = await value;
+      const result = await boundedValue;
       return structuredClone(result);
     } finally {
-      if (this.durableEventSearchInFlight?.value === value) this.durableEventSearchInFlight = undefined;
+      if (this.durableEventSearchInFlight?.value === boundedValue) this.durableEventSearchInFlight = undefined;
     }
   }
 
@@ -1939,7 +2543,11 @@ export class AggregationService {
   }
 
   async storeAgentInteraction(record: T.AgentInteractionRecord): Promise<{ durable: boolean }> {
+    this.pruneInteractionHot();
     const bytes = Buffer.byteLength(JSON.stringify(record));
+    if (bytes > this.interactionHotMaxBytes) {
+      this.interactionHotDropped += 1;
+    }
     const previous = this.interactionHot.get(record.interactionId);
     const projectionChanged = !previous
       || previous.record.request.sha256 !== record.request.sha256
@@ -1950,74 +2558,138 @@ export class AggregationService {
       this.interactionHotBytes = Math.max(0, this.interactionHotBytes - previous.bytes);
       this.interactionHot.delete(record.interactionId);
     }
-    this.interactionHot.set(record.interactionId, { record, bytes });
-    this.interactionHotBytes += bytes;
+    if (bytes <= this.interactionHotMaxBytes) {
+      this.interactionHot.set(record.interactionId, { record, bytes, insertedAt: now() });
+      this.interactionHotBytes += bytes;
+    }
     while (
       this.interactionHot.size > this.interactionHotMaxRecords
       || this.interactionHotBytes > this.interactionHotMaxBytes
     ) {
       const oldest = this.interactionHot.entries().next().value as
-        | [string, { record: T.AgentInteractionRecord; bytes: number }]
+        | [string, { record: T.AgentInteractionRecord; bytes: number; insertedAt: number }]
         | undefined;
       if (!oldest) break;
       this.interactionHot.delete(oldest[0]);
       this.interactionHotBytes = Math.max(0, this.interactionHotBytes - oldest[1].bytes);
+      this.interactionHotEvictions += 1;
     }
     if (projectionChanged) {
       this.conversationInteractionRevision += 1;
       this.conversationProjectionRecent.clear();
+      this.conversationProjectionRecentBytes = 0;
     }
     const durable = await this.judge.persistAgentInteraction(record);
-    if (durable) this.scheduleSemanticRelationProjection(record);
+    // SessionMembership is a canonical ingest-time projection, not a side effect of a later
+    // conversation page read. Keep it available in the memory-only profile as well as PostgreSQL;
+    // failures are recorded by the binding service as a bounded projection gap.
+    await this.conversationBindings?.commitInteractionMembership(record);
+    if (durable || this.canonicalObservability) this.scheduleSemanticRelationProjection(record);
     return { durable };
   }
 
   private scheduleSemanticRelationProjection(record: T.AgentInteractionRecord): void {
     if (
-      !this.relationalStore?.configured?.()
+      (!this.relationalStore?.configured?.() && !this.canonicalObservability)
       || trafficRoleForInteraction(record) === 'unclassified'
     ) return;
     const key = record.agentInstanceId?.trim() || record.agentAssetId;
     const now = Date.now();
     const current = this.semanticRelationProjectionTimers.get(key);
     if (current) clearTimeout(current.timer);
-    if (!current && this.semanticRelationProjectionTimers.size >= this.semanticRelationProjectionMaxKeys) {
+    if (
+      !current
+      && !this.semanticRelationProjectionActive.has(key)
+      && this.semanticRelationProjectionTimers.size + this.semanticRelationProjectionActive.size
+        >= this.semanticRelationProjectionMaxKeys
+    ) {
       const oldest = this.semanticRelationProjectionTimers.entries().next().value as
         | [string, { timer: NodeJS.Timeout }]
         | undefined;
       if (oldest) {
         clearTimeout(oldest[1].timer);
         this.semanticRelationProjectionTimers.delete(oldest[0]);
+        this.semanticRelationProjectionEvictions += 1;
+      } else {
+        this.semanticRelationProjectionDropped += 1;
+        this.canonicalObservability?.recordGap(
+          'correlation',
+          'dropped',
+          record.rawObservationId ?? record.interactionId,
+          { projection: 'semantic_kernel_relation', reason: 'active_capacity' },
+        );
+        return;
       }
     }
     const firstQueuedAt = current?.firstQueuedAt ?? now;
     // Debounce a normal Tool loop until Kernel/ToolResult facts settle, but force progress for an
     // Agent that continuously emits calls so one active session cannot postpone projection forever.
-    const delayMs = Math.max(0, Math.min(
-      TOOL_EVIDENCE_RELATION_SETTLE_MS,
-      60_000 - (now - firstQueuedAt),
-    ));
+    const delayMs = this.canonicalObservability && !this.relationalStore?.configured?.()
+      ? 0
+      : Math.max(0, Math.min(
+          TOOL_EVIDENCE_RELATION_SETTLE_MS,
+          60_000 - (now - firstQueuedAt),
+        ));
     const timer = setTimeout(() => {
       this.semanticRelationProjectionTimers.delete(key);
       if (this.semanticRelationProjectionActive.has(key)) {
         this.scheduleSemanticRelationProjection(record);
         return;
       }
+      if (this.semanticRelationProjectionActive.size >= this.semanticRelationProjectionMaxKeys) {
+        this.semanticRelationProjectionDropped += 1;
+        this.canonicalObservability?.recordGap(
+          'correlation',
+          'dropped',
+          record.rawObservationId ?? record.interactionId,
+          { projection: 'semantic_kernel_relation', reason: 'active_capacity' },
+        );
+        return;
+      }
       this.semanticRelationProjectionActive.add(key);
+      const deadline = setTimeout(() => {
+        if (!this.semanticRelationProjectionActive.has(key)) return;
+        this.semanticRelationProjectionTimeouts += 1;
+        // Release the bounded active slot at the deadline. The underlying store operation is
+        // still observed by its `finally` handler, but it is now an orphan and must not prevent a
+        // later event for the same AgentInstance from making progress.
+        this.semanticRelationProjectionActive.delete(key);
+        if (this.semanticRelationProjectionDeadlines.get(key) === deadline) {
+          this.semanticRelationProjectionDeadlines.delete(key);
+        }
+        this.semanticRelationProjectionOrphans += 1;
+        this.canonicalObservability?.recordGap(
+          'correlation',
+          'timeout',
+          record.rawObservationId ?? record.interactionId,
+          { projection: 'semantic_kernel_relation' },
+        );
+      }, RELATION_PROJECTION_TIMEOUT_MS);
+      deadline.unref();
+      this.semanticRelationProjectionDeadlines.set(key, deadline);
       void this.projectSemanticKernelRelationsFor(record)
         .catch((error) => {
           console.error('[agent-relation] incremental projection failed:', (error as Error).message);
         })
-        .finally(() => this.semanticRelationProjectionActive.delete(key));
+        .finally(() => {
+          const activeDeadline = this.semanticRelationProjectionDeadlines.get(key);
+          if (activeDeadline === deadline) {
+            clearTimeout(activeDeadline);
+            this.semanticRelationProjectionDeadlines.delete(key);
+            this.semanticRelationProjectionActive.delete(key);
+          }
+          this.semanticRelationProjectionCompleted += 1;
+        });
     }, delayMs);
     timer.unref();
     this.semanticRelationProjectionTimers.set(key, { timer, firstQueuedAt, record });
+    this.semanticRelationProjectionScheduled += 1;
   }
 
   private async projectSemanticKernelRelationsFor(
     trigger: T.AgentInteractionRecord,
   ): Promise<void> {
-    if (!this.conversationBindings || !this.relationalStore?.configured?.()) return;
+    if (!this.conversationBindings || (!this.relationalStore?.configured?.() && !this.canonicalObservability)) return;
     const now = Date.now();
     const startMs = Math.max(0, trigger.at - 30 * 60_000);
     const endMs = Math.max(now, trigger.at + TOOL_EVIDENCE_RELATION_SETTLE_MS);
@@ -2124,13 +2796,26 @@ export class AggregationService {
         batch = ancestryBatch;
       }
     }
-    if (kernel.coverage.partial) return;
+    if (kernel.coverage.partial && !this.canonicalObservability) return;
     const everyCallClosed = relationInputs.every((input) => Boolean(input.result));
     const persistable = everyCallClosed
       ? batch.allRelations
       : batch.allRelations.filter((relation) => Boolean(relation.kernelEventId));
-    if (persistable.length > 0) {
+    if (persistable.length > 0 && this.relationalStore?.configured?.() && !kernel.coverage.partial) {
       await this.relationalStore.saveAgentSemanticKernelRelations(persistable);
+    }
+    if (this.canonicalObservability && batch.allRelations.length > 0) {
+      const commit = await this.canonicalObservability.commitEvidenceLinks(
+        canonicalEvidenceLinksForRelations(batch.allRelations),
+      );
+      if (commit.rejected > 0) {
+        this.canonicalObservability.recordGap(
+          'projection',
+          'dropped',
+          trigger.interactionId,
+          { projection: 'evidence_link', rejected: commit.rejected },
+        );
+      }
     }
   }
 
@@ -2148,6 +2833,7 @@ export class AggregationService {
       membershipDurable?: boolean;
     } = {},
   ): Promise<T.AgentInteractionList> {
+    this.pruneInteractionHot();
     const window = resolveTimeWindow(filter);
     const exactInteractionIds = new Set((options.interactionIds ?? [])
       .map((value) => value.trim())
@@ -2315,35 +3001,81 @@ export class AggregationService {
     filter: T.AgentConversationQuery,
   ): Promise<AgentConversationProjectionResult> {
     const key = this.conversationProjectionKey(filter);
+    this.pruneConversationProjectionRecent();
     const recent = this.conversationProjectionRecent.get(key);
-    if (recent) return recent;
+    if (recent) {
+      this.conversationProjectionRecent.delete(key);
+      this.conversationProjectionRecent.set(key, recent);
+      return recent.value;
+    }
     const existing = this.conversationProjectionInFlight.get(key);
     if (existing) return existing;
-    const operation = this.conversationProjectionGate
+    const reservation = this.reserveInFlight(
+      this.conversationProjectionInFlight,
+      key,
+      this.conversationProjectionInFlightBytes,
+      MAX_CONVERSATION_PROJECTION_IN_FLIGHT,
+    );
+    if (!reservation.accepted) {
+      this.conversationProjectionInFlightRejected += 1;
+      throw new ServiceUnavailableException('Agent conversation projection is busy; retry the latest selection');
+    }
+    const baseOperation = this.conversationProjectionGate
       .run(() => this.computeAgentConversationProjection(filter))
       .then((result) => {
         if (result) {
-          if (this.conversationProjectionRecent.has(key)) {
-            this.conversationProjectionRecent.delete(key);
-          }
-          this.conversationProjectionRecent.set(key, result);
-          while (this.conversationProjectionRecent.size > 64) {
-            const oldest = this.conversationProjectionRecent.keys().next().value as string | undefined;
-            if (!oldest) break;
-            this.conversationProjectionRecent.delete(oldest);
+          const bytes = Buffer.byteLength(key, 'utf8') + this.estimateCacheBytes(result);
+          if (bytes <= MAX_RECENT_OBSERVABILITY_BYTES) {
+            const previous = this.conversationProjectionRecent.get(key);
+            if (previous) {
+              this.conversationProjectionRecent.delete(key);
+              this.conversationProjectionRecentBytes = Math.max(0, this.conversationProjectionRecentBytes - previous.bytes);
+            }
+            this.conversationProjectionRecent.set(key, { at: now(), value: result, bytes });
+            this.conversationProjectionRecentBytes += bytes;
+            this.pruneConversationProjectionRecent();
+            while (
+              this.conversationProjectionRecent.size > MAX_RECENT_OBSERVABILITY_ENTRIES
+              || this.conversationProjectionRecentBytes > MAX_RECENT_OBSERVABILITY_BYTES
+            ) {
+              const oldest = this.conversationProjectionRecent.entries().next().value as
+                | [string, { at: number; value: AgentConversationProjectionResult; bytes: number }]
+                | undefined;
+              if (!oldest) break;
+              this.conversationProjectionRecent.delete(oldest[0]);
+              this.conversationProjectionRecentBytes = Math.max(0, this.conversationProjectionRecentBytes - oldest[1].bytes);
+              this.conversationProjectionRecentEvictions += 1;
+            }
+          } else {
+            this.conversationProjectionRecentDropped += 1;
           }
           return result;
         }
         throw new ServiceUnavailableException(
           'Agent conversation projection is busy; retry the latest selection',
         );
-      })
-      .finally(() => {
+      });
+    let operation: Promise<AgentConversationProjectionResult>;
+    operation = this.withInFlightTimeout(
+      baseOperation,
+      () => {
+        if (this.conversationProjectionInFlight.get(key) !== operation) return;
+        this.conversationProjectionInFlight.delete(key);
+        this.conversationProjectionInFlightBytes = Math.max(
+          0,
+          this.conversationProjectionInFlightBytes - reservation.bytes,
+        );
+        this.conversationProjectionInFlightTimeouts += 1;
+      },
+      'Agent conversation projection timed out; retry the latest selection',
+    ).finally(() => {
         if (this.conversationProjectionInFlight.get(key) === operation) {
           this.conversationProjectionInFlight.delete(key);
+          this.conversationProjectionInFlightBytes = Math.max(0, this.conversationProjectionInFlightBytes - reservation.bytes);
         }
       });
     this.conversationProjectionInFlight.set(key, operation);
+    this.conversationProjectionInFlightBytes += reservation.bytes;
     return operation;
   }
 
@@ -2825,8 +3557,6 @@ export class AggregationService {
       && !relations.some((relation) => relation.kernelEventId)
       && persistedRelations.some((relation) => relation.kernelEventId)) {
       relations = persistedRelations;
-    } else if (this.relationalStore?.configured() && !kernel.coverage.partial) {
-      await this.relationalStore.saveAgentSemanticKernelRelations(relationBatch.allRelations);
     }
     const linkedEventIds = new Set(relations
       .map((relation) => relation.kernelEventId)
@@ -3240,41 +3970,9 @@ export class AggregationService {
     const items = toolCallId
       ? bundle.items.filter((item) => item.invocationId === invocationId && item.toolCallId === toolCallId)
       : bundle.items.filter((item) => item.invocationId === invocationId);
-    if (
-      storageReady &&
-      !bundle.truncated &&
-      partialReasons.size === 0 &&
-      items.length > 0 &&
-      items.every((item) => item.endedAt && now() - item.endedAt >= TOOL_EVIDENCE_RELATION_SETTLE_MS)
-    ) {
-      const scopes = new Map<string, {
-        workspacePath: string;
-        sourceId: string;
-        agentInstanceId: string;
-      }>();
-      for (const event of semanticEvents) {
-        const sourceId = event.sourceId?.trim();
-        if (!sourceId) continue;
-        const scope = {
-          workspacePath: event.workspacePath,
-          sourceId,
-          agentInstanceId: agentRuntimeInstanceIdForEvent(event),
-        };
-        scopes.set([scope.workspacePath, scope.sourceId, scope.agentInstanceId].join('\0'), scope);
-      }
-      if (scopes.size === 1) {
-        const evidenceVersion = createHash('sha256')
-          .update(JSON.stringify(evidenceEvents
-            .map((event) => [event.eventId, event.decisionRevision ?? 1, event.decisionUpdatedAt ?? event.at])
-            .sort((left, right) => String(left[0]).localeCompare(String(right[0])))))
-          .digest('hex');
-        await this.judge.writeStoredToolEvidenceRelations(
-          items,
-          evidenceVersion,
-          [...scopes.values()][0],
-        );
-      }
-    }
+    // Query paths are read-only. Relation materialization is owned by the bounded ingest projector
+    // (`scheduleSemanticRelationProjection`) so opening an Inspector or polling this endpoint can
+    // never create a new fact/revision or generate unbounded write amplification.
     return {
       ...bundle,
       items,
@@ -3511,13 +4209,36 @@ export class AggregationService {
     ]);
     const current = this.agentInventoryInFlight.get(key);
     if (current) return current;
-    const request = this.computeStoredAgentInventory(filter);
+    const reservation = this.reserveInFlight(
+      this.agentInventoryInFlight,
+      key,
+      this.agentInventoryInFlightBytes,
+      MAX_AGENT_INVENTORY_IN_FLIGHT,
+    );
+    if (!reservation.accepted) {
+      this.agentInventoryInFlightRejected += 1;
+      throw new ServiceUnavailableException('Agent inventory query is busy; retry the latest selection');
+    }
+    const baseRequest = this.computeStoredAgentInventory(filter);
+    let request: Promise<T.AgentInventory>;
+    request = this.withInFlightTimeout(
+      baseRequest,
+      () => {
+        if (this.agentInventoryInFlight.get(key) !== request) return;
+        this.agentInventoryInFlight.delete(key);
+        this.agentInventoryInFlightBytes = Math.max(0, this.agentInventoryInFlightBytes - reservation.bytes);
+        this.agentInventoryInFlightTimeouts += 1;
+      },
+      'Agent inventory query timed out; retry the latest selection',
+    );
     this.agentInventoryInFlight.set(key, request);
+    this.agentInventoryInFlightBytes += reservation.bytes;
     try {
       return await request;
     } finally {
       if (this.agentInventoryInFlight.get(key) === request) {
         this.agentInventoryInFlight.delete(key);
+        this.agentInventoryInFlightBytes = Math.max(0, this.agentInventoryInFlightBytes - reservation.bytes);
       }
     }
   }
@@ -3543,8 +4264,9 @@ export class AggregationService {
       limit: filter.limit,
     });
     const fallback = (): T.AgentInventory => {
+      this.pruneAgentInventoryLastGood();
       const lkg = this.agentInventoryLastGood.get(lkgKey);
-      if (lkg && now() - lkg.at <= 15 * 60_000) {
+      if (lkg && now() - lkg.at <= LAST_GOOD_INVENTORY_TTL_MS) {
         const value = structuredClone(lkg.value);
         value.coverage = {
           ...value.coverage,
@@ -3675,13 +4397,7 @@ export class AggregationService {
       dataFromMs: allFacts.length ? Math.min(...allFacts.map((fact) => fact.firstSeenAt)) : undefined,
       dataToMs: allFacts.length ? Math.max(...allFacts.map((fact) => fact.lastSeenAt)) : undefined,
     });
-    this.agentInventoryLastGood.delete(lkgKey);
-    this.agentInventoryLastGood.set(lkgKey, { at: now(), value: structuredClone(result) });
-    while (this.agentInventoryLastGood.size > 32) {
-      const oldest = this.agentInventoryLastGood.keys().next().value;
-      if (oldest === undefined) break;
-      this.agentInventoryLastGood.delete(oldest);
-    }
+    this.rememberAgentInventoryLastGood(lkgKey, result);
     return result;
   }
 
@@ -3856,6 +4572,21 @@ export class AggregationService {
         agentAssetId: assetId,
         agentAssetAliases: resolved.agentAssetAliases,
         agentProduct: resolved.agentProduct,
+        logicalAgentId: resolved.logicalAgentId ?? metadata?.logicalAgentId,
+        logicalAgentCandidateId: resolved.logicalAgentCandidateId,
+        logicalDefinitionId: resolved.logicalDefinitionId ?? metadata?.logicalDefinitionId,
+        logicalDefinitionType: metadata?.logicalDefinitionType,
+        logicalScopeMode: resolved.logicalScopeMode ?? metadata?.logicalScopeMode,
+        logicalIdentityAuthority: resolved.logicalIdentityAuthority
+          ?? (metadata?.logicalAgentId || metadata?.logicalDefinitionId ? 'management_registration' : undefined),
+        tenantId: metadata?.tenantId ?? (typeof identityEvent.attributes?.tenantId === 'string' ? identityEvent.attributes.tenantId : undefined),
+        ownerId: metadata?.ownerId ?? metadata?.owner
+          ?? (typeof identityEvent.attributes?.ownerId === 'string' ? identityEvent.attributes.ownerId : undefined),
+        profile: metadata?.profile ?? (typeof identityEvent.attributes?.profile === 'string' ? identityEvent.attributes.profile : undefined),
+        profileVersion: metadata?.profileVersion ?? (typeof identityEvent.attributes?.profileVersion === 'string' ? identityEvent.attributes.profileVersion : undefined),
+        deploymentId: identityEvent.deploymentId,
+        deploymentRevision: identityEvent.deploymentRevision,
+        terminalContextId: resolved.terminalContextId ?? metadata?.terminalContextId,
         workspacePath: itemWorkspacePath,
         userId: last.userId,
         displayName: resolved.displayName,
@@ -3952,6 +4683,21 @@ export class AggregationService {
           agentId: metadata.agentId,
           agentAssetId: metadata.agentAssetId,
           agentAssetAliases: metadata.agentAssetAliases,
+          logicalAgentId: metadata.logicalAgentId,
+          logicalAgentCandidateId: metadata.logicalAgentId ? undefined : metadata.logicalDefinitionType === 'candidate'
+            ? metadata.logicalDefinitionId : undefined,
+          logicalDefinitionId: metadata.logicalDefinitionId,
+          logicalDefinitionType: metadata.logicalDefinitionType,
+          logicalScopeMode: metadata.logicalScopeMode,
+          logicalIdentityAuthority: metadata.logicalAgentId || metadata.logicalDefinitionId
+            ? 'management_registration' : undefined,
+          tenantId: metadata.tenantId,
+          ownerId: metadata.ownerId,
+          profile: metadata.profile,
+          profileVersion: metadata.profileVersion,
+          deploymentId: undefined,
+          deploymentRevision: undefined,
+          terminalContextId: metadata.terminalContextId,
           workspacePath: metadata.workspacePath,
           userId: '-',
           displayName: metadata.displayName,
@@ -4137,8 +4883,9 @@ export class AggregationService {
       filter.seriesPoints ?? 36,
       this.agentMetadata.identitySnapshotVersion(),
     ].join('\0');
+    this.pruneAgentInstanceMetricsCache();
     const cached = this.agentInstanceMetricsCache.get(cacheKey);
-    if (cached && now() - cached.at < 15_000) return cached.value;
+    if (cached && now() - cached.at < AGENT_INSTANCE_METRICS_CACHE_TTL_MS) return cached.value;
     const window = this.win(filter);
     const events = agentAssetId
       ? window.events.filter((event) =>
@@ -4190,12 +4937,7 @@ export class AggregationService {
       timeoutCount: events.filter((event) => event.decisionStatus === 'timeout').length,
       updateTime: iso(),
     };
-    this.agentInstanceMetricsCache.set(cacheKey, { at: now(), value });
-    if (this.agentInstanceMetricsCache.size > 256) {
-      const oldestKey = [...this.agentInstanceMetricsCache.entries()]
-        .sort((a, b) => a[1].at - b[1].at)[0]?.[0];
-      if (oldestKey) this.agentInstanceMetricsCache.delete(oldestKey);
-    }
+    this.rememberAgentInstanceMetrics(cacheKey, value);
     return value;
   }
 
@@ -4381,8 +5123,9 @@ export class AggregationService {
       pointCount,
       this.agentMetadata.identitySnapshotVersion(),
     ].join('\0');
+    this.pruneAgentInstanceMetricsCache();
     const cached = this.agentInstanceMetricsCache.get(cacheKey);
-    if (cached && now() - cached.at < 15_000) return cached.value;
+    if (cached && now() - cached.at < AGENT_INSTANCE_METRICS_CACHE_TTL_MS) return cached.value;
     const durable = await this.storedAgentMetricFacts({ ...filter, scope: 'agent' }, pointCount);
     if (!durable) return this.agentInstanceMetrics(filter);
     const window = resolveTimeWindow(filter);
@@ -4435,7 +5178,7 @@ export class AggregationService {
       coverage: durable.coverage,
       updateTime: iso(window.endMs),
     };
-    this.agentInstanceMetricsCache.set(cacheKey, { at: now(), value });
+    this.rememberAgentInstanceMetrics(cacheKey, value);
     return value;
   }
 
@@ -6698,24 +7441,47 @@ export class AggregationService {
       resolveTimeWindow(effectiveFilter).cacheKey,
       effectiveFilter.scope ?? 'all',
     ]);
+    this.pruneAgentObservabilityRecent();
     const recent = this.agentObservabilityRecent.get(completedKey);
-    if (recent) return recent;
+    if (recent) {
+      this.agentObservabilityRecent.delete(completedKey);
+      this.agentObservabilityRecent.set(completedKey, recent);
+      return recent.value;
+    }
     const current = this.agentObservabilityInFlight.get(key);
     if (current) return current;
-    const request = this.agentObservabilityForWindow(effectiveFilter);
+    const reservation = this.reserveInFlight(
+      this.agentObservabilityInFlight,
+      key,
+      this.agentObservabilityInFlightBytes,
+      MAX_AGENT_OBSERVABILITY_IN_FLIGHT,
+    );
+    if (!reservation.accepted) {
+      this.agentObservabilityInFlightRejected += 1;
+      throw new ServiceUnavailableException('Agent observability query is busy; retry the latest selection');
+    }
+    const baseRequest = this.agentObservabilityForWindow(effectiveFilter);
+    let request: Promise<T.AgentObservability>;
+    request = this.withInFlightTimeout(
+      baseRequest,
+      () => {
+        if (this.agentObservabilityInFlight.get(key) !== request) return;
+        this.agentObservabilityInFlight.delete(key);
+        this.agentObservabilityInFlightBytes = Math.max(0, this.agentObservabilityInFlightBytes - reservation.bytes);
+        this.agentObservabilityInFlightTimeouts += 1;
+      },
+      'Agent observability query timed out; retry the latest selection',
+    );
     this.agentObservabilityInFlight.set(key, request);
+    this.agentObservabilityInFlightBytes += reservation.bytes;
     try {
       const value = await request;
-      this.agentObservabilityRecent.set(completedKey, value);
-      while (this.agentObservabilityRecent.size > 64) {
-        const oldestKey = this.agentObservabilityRecent.keys().next().value as string | undefined;
-        if (!oldestKey) break;
-        this.agentObservabilityRecent.delete(oldestKey);
-      }
+      this.rememberAgentObservabilityRecent(completedKey, value);
       return value;
     } finally {
       if (this.agentObservabilityInFlight.get(key) === request) {
         this.agentObservabilityInFlight.delete(key);
+        this.agentObservabilityInFlightBytes = Math.max(0, this.agentObservabilityInFlightBytes - reservation.bytes);
       }
     }
   }

@@ -2,6 +2,8 @@ import { Inject, Injectable, OnModuleDestroy, OnModuleInit, Optional } from '@ne
 import { createHash } from 'node:crypto';
 import { hostRootInstanceIdFromAtoms } from './agent-semantic-identity';
 import { RelationalBusinessStore } from './relational-business-store.service';
+import { AgentMetadataService } from './agent-metadata.service';
+import { resolveLogicalAgentDefinition, type LogicalAgentDefinition } from './canonical-observability';
 import {
   AgentActivityState,
   AgentLaunchContext,
@@ -458,6 +460,8 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
     options: AgentRuntimeStateServiceOptions = {},
     @Optional()
     private readonly relationalStore?: RelationalBusinessStore,
+    @Optional()
+    private readonly metadataService?: AgentMetadataService,
   ) {
     this.clock = options.now ?? Date.now;
     this.maxForwarders = boundedInteger(options.maxForwarders, DEFAULT_MAX_FORWARDERS, 1, 100_000);
@@ -1067,12 +1071,69 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
     if (value.launchContext !== undefined && !launchContext) {
       return { reason: `${prefix}.launchContext is invalid` };
     }
+    const logicalAgentId = value.logicalAgentId === undefined ? undefined : cleanString(value.logicalAgentId, 240);
+    const logicalAgentCandidateId = value.logicalAgentCandidateId === undefined ? undefined : cleanString(value.logicalAgentCandidateId, 240);
+    const logicalDefinitionId = value.logicalDefinitionId === undefined ? undefined : cleanString(value.logicalDefinitionId, 240);
+    const deploymentId = value.deploymentId === undefined ? undefined : cleanString(value.deploymentId, 240);
+    const deploymentRevision = value.deploymentRevision === undefined ? undefined : cleanString(value.deploymentRevision, 120);
+    const environmentId = value.environmentId === undefined ? undefined : cleanString(value.environmentId, 240);
+    const logicalScopeMode = value.logicalScopeMode === undefined
+      ? undefined
+      : ['registered_definition', 'workflow_definition', 'service_definition', 'terminal', 'unresolved'].includes(String(value.logicalScopeMode))
+        ? value.logicalScopeMode as AgentRuntimeSnapshotEntry['logicalScopeMode']
+        : undefined;
+    for (const [field, parsed] of [
+      ['logicalAgentId', logicalAgentId], ['logicalAgentCandidateId', logicalAgentCandidateId],
+      ['logicalDefinitionId', logicalDefinitionId], ['tenantId', value.tenantId === undefined ? undefined : cleanString(value.tenantId, 240)],
+      ['ownerId', value.ownerId === undefined ? undefined : cleanString(value.ownerId, 240)],
+      ['profile', value.profile === undefined ? undefined : cleanString(value.profile, 240)],
+      ['profileVersion', value.profileVersion === undefined ? undefined : cleanString(value.profileVersion, 120)],
+      ['deploymentId', deploymentId], ['deploymentRevision', deploymentRevision],
+      ['environmentId', environmentId],
+      ['terminalContextId', value.terminalContextId === undefined ? undefined : cleanString(value.terminalContextId, 240)],
+      ['sshConnectionId', value.sshConnectionId === undefined ? undefined : cleanString(value.sshConnectionId, 240)],
+    ] as const) {
+      if (value[field] !== undefined && !parsed) return { reason: `${prefix}.${field} is invalid` };
+    }
+    if (value.logicalScopeMode !== undefined && !logicalScopeMode) {
+      return { reason: `${prefix}.logicalScopeMode is invalid` };
+    }
+
+    const registeredDefinition = this.registeredDefinitionForEntry(value);
+    const suppliedLogicalHint = Boolean(
+      logicalAgentId || logicalDefinitionId || logicalAgentCandidateId || logicalScopeMode,
+    );
+    const candidateLogicalAgentId = !registeredDefinition && suppliedLogicalHint
+      ? this.candidateDefinitionId(value)
+      : undefined;
+    const effectiveLogicalScopeMode = registeredDefinition?.logicalScopeMode
+      ?? (candidateLogicalAgentId ? 'unresolved' as const : undefined);
 
     return {
       entry: {
         agentScopeId: scope.value!,
         agentDisplayName: cleanString(value.agentDisplayName, 240),
         agentInstanceId: instance.value!,
+        ...(registeredDefinition?.logicalAgentId ? { logicalAgentId: registeredDefinition.logicalAgentId } : {}),
+        ...(candidateLogicalAgentId ? { logicalAgentCandidateId: candidateLogicalAgentId } : {}),
+        ...(registeredDefinition?.definitionId ? { logicalDefinitionId: registeredDefinition.definitionId } : {}),
+        ...(effectiveLogicalScopeMode ? { logicalScopeMode: effectiveLogicalScopeMode } : {}),
+        ...(registeredDefinition?.logicalAgentId || registeredDefinition?.definitionId
+          ? { logicalIdentityAuthority: 'management_registration' as const }
+          : candidateLogicalAgentId ? { logicalIdentityAuthority: 'candidate' as const } : {}),
+        ...(registeredDefinition?.tenantId ? { tenantId: registeredDefinition.tenantId } : {}),
+        ...(registeredDefinition?.ownerId ? { ownerId: registeredDefinition.ownerId } : {}),
+        ...(registeredDefinition?.profile ? { profile: registeredDefinition.profile } : {}),
+        ...(registeredDefinition?.profileVersion ? { profileVersion: registeredDefinition.profileVersion } : {}),
+        ...(registeredDefinition?.deploymentId ? { deploymentId: registeredDefinition.deploymentId } : {}),
+        ...(registeredDefinition?.deploymentRevision ? { deploymentRevision: registeredDefinition.deploymentRevision } : {}),
+        ...(registeredDefinition?.deploymentId ? {} : deploymentId ? { deploymentId } : {}),
+        ...(registeredDefinition?.deploymentRevision ? {} : deploymentRevision ? { deploymentRevision } : {}),
+        ...(environmentId ? { environmentId } : {}),
+        ...(registeredDefinition?.terminalContextId
+          ? { terminalContextId: registeredDefinition.terminalContextId }
+          : (cleanString(value.terminalContextId, 240) ? { terminalContextId: cleanString(value.terminalContextId, 240) } : {})),
+        sshConnectionId: value.sshConnectionId === undefined ? undefined : cleanString(value.sshConnectionId, 240),
         physicalWorkloadId: cleanString(value.physicalWorkloadId, 500),
         classification,
         runtimeState,
@@ -1144,6 +1205,44 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
       }
     }
     return undefined;
+  }
+
+  /**
+   * Runtime snapshots are transport-authenticated, not management-authoritative.  Resolve a
+   * LogicalAgent only when the snapshot's concrete scope/workspace (or an explicitly registered
+   * physical instance) matches a management record.  A producer-supplied logical ID by itself is
+   * never enough to promote an instance.
+   */
+  private registeredDefinitionForEntry(value: Record<string, unknown>): LogicalAgentDefinition | undefined {
+    if (!this.metadataService) return undefined;
+    const workspacePath = cleanString(value.workspacePath, 1_000);
+    const agentScopeId = cleanString(value.agentScopeId, 240);
+    const physicalWorkloadId = cleanString(value.physicalWorkloadId, 500);
+    const agentInstanceId = cleanString(value.agentInstanceId, 500);
+    if (!workspacePath) return undefined;
+    const record = this.metadataService.list().find((candidate) => {
+      if (!candidate.logicalAgentId && !candidate.logicalDefinitionId) return false;
+      if (candidate.workspacePath !== workspacePath) return false;
+      return (agentScopeId && candidate.agentId === agentScopeId)
+        || (physicalWorkloadId && candidate.physicalWorkloadId === physicalWorkloadId)
+        || (agentInstanceId && candidate.agentInstanceId === agentInstanceId);
+    });
+    return record
+      ? this.metadataService.resolveRegisteredDefinition(
+          record.workspacePath,
+          record.agentId,
+          record.agentAssetId,
+        )
+      : undefined;
+  }
+
+  private candidateDefinitionId(value: Record<string, unknown>): string {
+    const input = [
+      cleanString(value.agentScopeId, 240) ?? 'unknown',
+      cleanString(value.workspacePath, 1_000) ?? 'unknown',
+      cleanString(value.agentInstanceId, 500) ?? 'unknown',
+    ].join('\0');
+    return `lac_${createHash('sha256').update(input).digest('hex').slice(0, 24)}`;
   }
 
   private applyReadySnapshot(

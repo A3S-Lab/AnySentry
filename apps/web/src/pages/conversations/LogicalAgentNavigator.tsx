@@ -63,6 +63,7 @@ export function LogicalAgentNavigator({
   selectedLogicalAgentId,
   selectedInstanceId,
   selectedConversationId,
+  allowHistoricalSelectionExpansion,
   loading,
   error,
   onSelectAgent,
@@ -74,6 +75,7 @@ export function LogicalAgentNavigator({
   selectedLogicalAgentId?: string;
   selectedInstanceId?: string;
   selectedConversationId?: string;
+  allowHistoricalSelectionExpansion?: boolean;
   loading: boolean;
   error?: Error;
   onSelectAgent: (item: LogicalAgentConversationDirectoryItemV4) => void;
@@ -96,11 +98,12 @@ export function LogicalAgentNavigator({
     ...(historicalAgentsExpanded ? historicalAgents : []),
   ], [currentAgents, historicalAgents, historicalAgentsExpanded]);
   useEffect(() => {
+    if (!allowHistoricalSelectionExpansion) return;
     if (selectedLogicalAgentId && historicalAgents.some((item) =>
       item.logicalAgentId === selectedLogicalAgentId)) {
       setHistoricalAgentsExpanded(true);
     }
-  }, [historicalAgents, selectedLogicalAgentId]);
+  }, [allowHistoricalSelectionExpansion, historicalAgents, selectedLogicalAgentId]);
   useEffect(() => {
     if (!selectedLogicalAgentId) return;
     const frame = window.requestAnimationFrame(() => {

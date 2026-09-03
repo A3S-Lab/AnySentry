@@ -1,6 +1,14 @@
 import { createHash } from 'node:crypto';
 import type * as T from './types';
 import { detectedAgentIdentity } from './agent-identity';
+import {
+  deriveAgentInstanceIdentity,
+  deriveProcessGenerationKey,
+  canonicalSessionIdForMembership,
+  resolveLogicalAgentDefinition,
+  resolveSessionIdentity,
+} from './canonical-observability';
+import { serverTrustedCorrelationContext } from './trusted-correlation';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_LINE_BYTES = 14 * 1024 * 1024;
@@ -68,6 +76,13 @@ function string(value: unknown, max: number): string | undefined {
   return normalized;
 }
 
+function strictRunIdentity(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  return normalized && normalized.length <= 512 && !/[\u0000-\u001f\u007f]/u.test(normalized)
+    ? normalized : undefined;
+}
+
 function exactString(value: unknown, maxBytes: number): string | undefined {
   if (typeof value !== 'string' || Buffer.byteLength(value) > maxBytes) return undefined;
   return value;
@@ -92,6 +107,19 @@ function completeness(value: unknown): T.AgentInteractionCompleteness {
 
 function closedValue<TValue extends string>(value: unknown, allowed: Set<TValue>): TValue | undefined {
   return typeof value === 'string' && allowed.has(value as TValue) ? value as TValue : undefined;
+}
+
+function interactionSessionQuality(
+  value: ReturnType<typeof resolveSessionIdentity>['quality'],
+): T.SessionIdentityQuality {
+  switch (value) {
+    case 'confirmed': return 'confirmed';
+    case 'strong': return 'strong';
+    case 'ephemeral': return 'ephemeral';
+    case 'conflict': return 'conflict';
+    case 'inferred': return 'inferred';
+    default: return 'unknown';
+  }
 }
 
 function interactionAgentAssetId(
@@ -137,7 +165,7 @@ function providerConversationFromStructured(
     const direct = providerConversationFromStructured(metadata, depth + 1);
     if (direct) return direct;
   }
-  for (const key of ['user_id', 'x-codex-turn-metadata', 'turn_metadata']) {
+  for (const key of ['user_id', 'turn_metadata']) {
     const nested = object[key];
     if (nested && typeof nested === 'object') {
       const candidate = providerConversationFromStructured(nested, depth + 1);
@@ -153,6 +181,54 @@ function providerConversationFromStructured(
     }
   }
   return undefined;
+}
+
+function providerRunFromStructured(value: unknown, depth = 0): string | undefined {
+  if (depth > 3) return undefined;
+  const object = record(value);
+  if (!object) return undefined;
+  for (const key of ['workflow_run_id', 'run_id', 'invocation_id']) {
+    const direct = string(object[key], 512);
+    if (direct) return direct;
+  }
+  for (const key of ['data', 'workflow_run', 'metadata', 'result']) {
+    const nested = providerRunFromStructured(object[key], depth + 1);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+function runtimeOnlySessionId(
+  sessionId: string | undefined,
+  runtimeSessionId: string | undefined,
+  meta: T.EventMeta,
+): boolean {
+  if (!sessionId) return false;
+  if (runtimeSessionId && sessionId === runtimeSessionId) return true;
+  if (meta.sessionIdentityQuality === 'ephemeral'
+    && meta.sessionIdSource !== 'provider'
+    && sessionId === meta.sessionId) return true;
+  // Common legacy container/runtime IDs are intentionally not promoted to provider anchors when
+  // no explicit provider conversation field was emitted.
+  return new Set(['', '-', 'none', 'null', 'unknown', 'legacy', 'default', 'main', 'mainthread', 'runtime']).has(sessionId.trim().toLowerCase())
+    || /^(?:docker|container|k8s|pod|runtime|agent-runtime)[:_-]/iu.test(sessionId);
+}
+
+function providerSessionUsable(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return !new Set(['', '-', 'none', 'null', 'unknown', 'legacy', 'default', 'main', 'mainthread', 'runtime']).has(normalized)
+    && !/^(?:docker|container|k8s|pod|runtime|agent-runtime)[:_-]/iu.test(value);
+}
+
+function interactionRawObservationId(envelope: Record<string, unknown>): string | undefined {
+  const raw = record(envelope.rawObservation ?? envelope.raw_observation);
+  return string(raw?.observationId, 240);
+}
+
+function interactionRawObservationRevision(envelope: Record<string, unknown>): number | undefined {
+  const raw = record(envelope.rawObservation ?? envelope.raw_observation);
+  const value = Number(raw?.revision);
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
 function decodedBody(body: string, encoding: 'utf8' | 'base64'): Buffer | undefined {
@@ -417,6 +493,12 @@ function parsePlaintextEvidence(
     attributes: meta.attributes ?? {},
     process: meta.process,
     attribution: meta.attribution,
+    logicalAgentId: meta.logicalAgentId,
+    logicalAgentCandidateId: meta.logicalAgentCandidateId,
+    logicalDefinitionId: meta.logicalDefinitionId,
+    logicalScopeMode: meta.logicalScopeMode,
+    logicalIdentityAuthority: meta.logicalIdentityAuthority,
+    terminalContextId: meta.terminalContextId,
   });
   const body = redactedSample ?? '';
   const bodyBytes = Buffer.from(body, 'utf8');
@@ -445,6 +527,50 @@ function parsePlaintextEvidence(
     ? 'network_runtime'
     : 'agent_root';
   const runtimeSessionId = string(meta.sessionId, 512);
+  const logical = resolveLogicalAgentDefinition({
+    logicalAgentId: meta.logicalAgentId,
+    family: semanticIdentity.agentProduct ?? meta.attribution?.agentDisplayName ?? meta.agentId,
+    tenantId: typeof meta.attributes?.tenantId === 'string' ? meta.attributes.tenantId : undefined,
+    ownerId: typeof meta.attributes?.ownerId === 'string' ? meta.attributes.ownerId : undefined,
+    workspacePath: meta.workspacePath,
+    profile: typeof meta.attributes?.profile === 'string' ? meta.attributes.profile : undefined,
+    logicalScopeMode: meta.logicalScopeMode,
+    terminalContextId: meta.terminalContextId ?? meta.process?.terminalContextId,
+    sourceRefs: [
+      meta.rawObservationId,
+      meta.sourceEventId,
+      typeof meta.attributes?.sourceId === 'string' ? meta.attributes.sourceId : undefined,
+    ].filter((value): value is string => Boolean(value)),
+    authority: meta.logicalIdentityAuthority === 'management_registration'
+      ? 'management_registration' : 'inferred',
+  });
+  const runtimeInstanceId = semanticIdentity.agentRuntimeInstanceId;
+  const processGenerationKey = meta.process?.processGenerationKey
+    ?? deriveProcessGenerationKey({
+      hostId: meta.process?.hostId,
+      bootId: meta.process?.bootId,
+      pid: meta.process?.pid ?? 0,
+      startTimeTicks: meta.process?.startTimeTicks,
+      startTimeNs: meta.process?.startTimeNs,
+    });
+  const canonicalInstance = deriveAgentInstanceIdentity({
+    logicalAgentId: logical.definition.logicalAgentId,
+    logicalDefinitionId: logical.definition.definitionId,
+    logicalScopeMode: logical.definition.logicalScopeMode,
+    deploymentId: meta.deploymentId,
+    deploymentRevision: meta.deploymentRevision,
+    environmentId: meta.environmentId,
+    profile: typeof meta.attributes?.profile === 'string' ? meta.attributes.profile : undefined,
+    profileVersion: typeof meta.attributes?.profileVersion === 'string' ? meta.attributes.profileVersion : undefined,
+    processGenerationKey,
+  });
+  const sessionNamespaceKey = [
+    meta.logicalAgentId,
+    typeof meta.attributes?.tenantId === 'string' ? meta.attributes.tenantId : undefined,
+    typeof meta.attributes?.ownerId === 'string' ? meta.attributes.ownerId : undefined,
+    typeof meta.attributes?.sourceId === 'string' ? meta.attributes.sourceId : undefined,
+    meta.workspacePath,
+  ].filter(Boolean).join('\0');
   return {
     schemaVersion: 'anysentry.agent_interaction.v1',
     interactionId: 'mi_' + evidenceId.slice(3),
@@ -454,10 +580,33 @@ function parsePlaintextEvidence(
     sourceId: typeof meta.attributes?.sourceId === 'string' ? meta.attributes.sourceId : undefined,
     collectorId: typeof meta.attributes?.collectorId === 'string' ? meta.attributes.collectorId : undefined,
     agentAssetId: interactionAgentAssetId(meta, semanticIdentity),
-    agentInstanceId: semanticIdentity.agentRuntimeInstanceId,
+    agentInstanceId: runtimeInstanceId,
+    ...(canonicalInstance.agentInstanceId ? { canonicalAgentInstanceId: canonicalInstance.agentInstanceId } : {}),
+    runtimeInstanceId,
     agentProduct: semanticIdentity.agentProduct ?? meta.attribution?.agentDisplayName ?? meta.agentId,
     environment: interactionEnvironment(meta),
     ...(runtimeSessionId ? { runtimeSessionId } : {}),
+    ...(meta.rawObservationId ? { rawObservationId: meta.rawObservationId } : {}),
+    ...(logical.definition.logicalAgentId ? { logicalAgentId: logical.definition.logicalAgentId } : {}),
+    logicalIdentityAuthority: logical.definition.logicalIdentityAuthority,
+    ...(!logical.stable && logical.candidateId ? { logicalAgentCandidateId: logical.candidateId } : {}),
+    ...(logical.definition.logicalScopeMode ? { logicalScopeMode: logical.definition.logicalScopeMode } : {}),
+    ...(logical.definition.definitionFingerprint ? { logicalDefinitionFingerprint: logical.definition.definitionFingerprint } : {}),
+    ...(meta.terminalContextId || meta.process?.terminalContextId
+      ? { terminalContextId: meta.terminalContextId ?? meta.process?.terminalContextId } : {}),
+    sessionIdentityQuality: meta.sessionIdentityQuality ?? 'unknown',
+    canonicalSessionId: canonicalSessionIdForMembership(
+      runtimeSessionId || evidenceId,
+      sessionNamespaceKey ? `scope_${createHash('sha256').update(sessionNamespaceKey).digest('hex')}` : undefined,
+      evidenceId,
+    ),
+    ...(sessionNamespaceKey
+      ? { sessionNamespaceKey: `scope_${createHash('sha256').update(sessionNamespaceKey).digest('hex')}` }
+      : {}),
+    sessionResolutionRevision: 1,
+    ...(meta.sessionIdSource ? { sessionIdSource: meta.sessionIdSource } : {}),
+    sessionMode: 'unknown',
+    sessionLifecycle: 'new',
     runtimeRole,
     correlationQuality: meta.subjectAssetId && semanticIdentity.agentRuntimeInstanceId
       ? 'exact'
@@ -552,6 +701,12 @@ export function parseObserverAgentInteraction(
     attributes: meta.attributes ?? {},
     process,
     attribution: meta.attribution,
+    logicalAgentId: meta.logicalAgentId,
+    logicalAgentCandidateId: meta.logicalAgentCandidateId,
+    logicalDefinitionId: meta.logicalDefinitionId,
+    logicalScopeMode: meta.logicalScopeMode,
+    logicalIdentityAuthority: meta.logicalIdentityAuthority,
+    terminalContextId: meta.terminalContextId,
   });
   const agentAssetId = interactionAgentAssetId(meta, semanticIdentity);
   const partialReasons = Array.isArray(input.partialReasons)
@@ -564,12 +719,60 @@ export function parseObserverAgentInteraction(
   const receivedAt = meta.receivedAt ?? Date.now();
   const runtimeSessionId = string(meta.sessionId, 512);
   const traceId = string(input.traceId, 64);
-  const runId = string(input.runId, 512);
+  const trustedContext = serverTrustedCorrelationContext(meta);
+  const trustedRunClaim = trustedContext?.sourceTrust?.authenticated
+    && trustedContext.sourceTrust.allowedClaims.length > 0
+    ? trustedContext.sourceTrust.authority === 'agent_adapter'
+      ? trustedContext.claims?.agentAdapter?.runId
+      : trustedContext.claims?.application?.runId
+    : undefined;
+  // The wire interaction may contain a producer `runId`, but a collector token alone only
+  // authenticates transport.  Keep that value out of the canonical/compatibility record unless
+  // the source's server-side application/Adapter claim policy explicitly authorized it.
+  const wireRunId = string(input.runId, 512) ?? providerRunFromStructured(response.structured);
+  const runId = strictRunIdentity(trustedRunClaim) ?? wireRunId;
+  const runIdSource = runId
+    ? strictRunIdentity(trustedRunClaim) ? 'producer' as const : 'legacy' as const
+    : undefined;
   const sessionId = string(input.sessionId, 512);
   const invocationId = string(input.invocationId, 512);
-  const providerConversationId = string(input.providerConversationId, 512)
-    ?? providerConversationFromStructured(request.structured)
-    ?? sessionId;
+  const explicitProviderConversationId = string(input.providerConversationId, 512);
+  const structuredProviderConversationId = providerConversationFromStructured(request.structured);
+  const responseProviderConversationId = providerConversationFromStructured(response.structured);
+  const declaredSessionSource = input.sessionIdSource === 'provider'
+    || input.sessionIdSource === 'authenticated_adapter'
+    ? input.sessionIdSource
+    : undefined;
+  const explicitlyNonProviderSession = [
+    'per_request',
+    'legacy_observer_session',
+    'legacy_agent_fallback',
+    'legacy_task_fallback',
+    'unresolved',
+  ].includes(String(input.sessionIdSource))
+    || input.sessionMode === 'per_request'
+    || input.sessionMode === 'ephemeral'
+    || input.serviceStateful === false;
+  const providerCandidate = explicitProviderConversationId
+    ?? structuredProviderConversationId
+    ?? responseProviderConversationId
+    ?? (declaredSessionSource ? sessionId : undefined)
+    // A plaintext session_id is a provider anchor only when it is not the runtime/container
+    // session copied by a legacy producer. Keep the raw field below for compatibility.
+    ?? (!explicitlyNonProviderSession && !runtimeOnlySessionId(sessionId, runtimeSessionId, meta)
+      ? sessionId : undefined);
+  // Generic placeholders (`default`, `unknown`, etc.) are not continuity evidence. Treat them as
+  // missing even when a service claims to be stateful; the resolver will create an explicit
+  // ephemeral/per-request Session instead of merging unrelated POSTs.
+  let providerConversationId = providerCandidate
+    && providerSessionUsable(providerCandidate)
+    ? providerCandidate : undefined;
+  if (input.fork === true && providerConversationId
+    && string(input.parentSessionId, 512) === providerConversationId) {
+    // A fork request may echo the parent provider ID while the new ID is assigned server-side.
+    // Keep the parent only in provenance, never as the child Thread's primary anchor.
+    providerConversationId = undefined;
+  }
   const providerResponseId = string(input.providerResponseId, 512);
   const providerPreviousResponseId = string(input.providerPreviousResponseId, 512);
   const trafficRole = closedValue(input.trafficRole, TRAFFIC_ROLES);
@@ -596,6 +799,191 @@ export function parseObserverAgentInteraction(
   const runtimeRole = process?.pid && rootPid && process.pid !== rootPid
     ? 'network_runtime'
     : 'agent_root';
+  // `meta` is assembled by the authenticated ingest boundary.  A management registration is
+  // authoritative there, so producer fields from the decoded line must not override it.  The
+  // fallback to the line remains for direct/unit callers that intentionally operate outside the
+  // Controller; production ingest always supplies the server-resolved value first.
+  const serverDefinitionAuthority = meta.logicalIdentityAuthority === 'management_registration'
+    || meta.logicalIdentityAuthority === 'authenticated_adapter';
+  // The Controller marks an authenticated-but-unregistered (and tokenless) line as
+  // `logicalScopeMode=unresolved`.  Lock that boundary too: a producer must not re-introduce its
+  // own tenant/profile/definition fields merely because the semantic parser sees the original
+  // line. Direct library callers that omit the marker retain the legacy hint parsing behavior.
+  const identityBoundaryLocked = serverDefinitionAuthority
+    || (meta.logicalScopeMode === 'unresolved' && !meta.logicalAgentId && !meta.logicalDefinitionId);
+  const logicalAgentId = meta.logicalAgentId
+    ?? (identityBoundaryLocked ? undefined : string(input.logicalAgentId, 240));
+  const logicalDefinitionId = identityBoundaryLocked
+    ? meta.logicalDefinitionId
+    : string(input.logicalDefinitionId, 240) ?? string(input.definitionId, 240);
+  const logicalScopeMode = identityBoundaryLocked
+    ? meta.logicalScopeMode
+    : (
+    input.logicalScopeMode === 'terminal'
+      || input.logicalScopeMode === 'workflow_definition'
+      || input.logicalScopeMode === 'service_definition'
+      || input.logicalScopeMode === 'registered_definition'
+      || input.logicalScopeMode === 'unresolved'
+      ? input.logicalScopeMode
+      : undefined
+  );
+  const terminalContextId = meta.terminalContextId
+    ?? (identityBoundaryLocked ? undefined : string(input.terminalContextId, 240))
+    ?? process?.terminalContextId;
+  const tenantId = (typeof meta.attributes?.tenantId === 'string'
+    ? meta.attributes.tenantId : undefined)
+    ?? (identityBoundaryLocked ? undefined : string(input.tenantId, 240));
+  const ownerId = (typeof meta.attributes?.ownerId === 'string'
+    ? meta.attributes.ownerId : undefined)
+    ?? (identityBoundaryLocked ? undefined : string(input.ownerId, 240));
+  const profile = (typeof meta.attributes?.profile === 'string'
+    ? meta.attributes.profile : undefined)
+    ?? (identityBoundaryLocked ? undefined : string(input.profile, 240));
+  const profileVersion = (typeof meta.attributes?.profileVersion === 'string'
+    ? meta.attributes.profileVersion : undefined)
+    ?? (identityBoundaryLocked ? undefined : string(input.profileVersion, 120));
+  const deploymentId = (typeof meta.attributes?.deploymentId === 'string'
+    ? meta.attributes.deploymentId : undefined)
+    ?? (identityBoundaryLocked ? undefined : string(input.deploymentId ?? input.deployment_id, 240));
+  const deploymentRevision = (typeof meta.attributes?.deploymentRevision === 'string'
+    ? meta.attributes.deploymentRevision : undefined)
+    ?? (identityBoundaryLocked ? undefined : string(input.deploymentRevision ?? input.deployment_revision ?? input.revision, 120));
+  const environmentId = meta.environmentId
+    ?? (identityBoundaryLocked ? undefined : string(input.environmentId ?? input.environment_id, 240));
+  const logical = resolveLogicalAgentDefinition({
+    logicalAgentId,
+    family: string(input.agentProduct, 160)
+      ?? semanticIdentity.agentProduct
+      ?? meta.attribution?.agentDisplayName
+      ?? meta.agentId,
+    tenantId,
+    ownerId,
+    workspacePath: meta.workspacePath,
+    repositoryId: string(input.repositoryId, 240),
+    profile,
+    profileVersion,
+    definitionId: logicalDefinitionId,
+    definitionType: identityBoundaryLocked && meta.logicalDefinitionId
+      ? (meta.logicalScopeMode === 'workflow_definition' ? 'workflow'
+        : meta.logicalScopeMode === 'service_definition' ? 'service'
+          : 'registered')
+      : identityBoundaryLocked ? undefined
+        : input.definitionType as ReturnType<typeof resolveLogicalAgentDefinition>['definition']['definitionType']
+        ?? (logicalDefinitionId ? 'registered' : undefined),
+    logicalScopeMode,
+    terminalContextId,
+    sourceRefs: [
+      meta.rawObservationId,
+      meta.sourceEventId,
+      typeof meta.attributes?.sourceId === 'string' ? meta.attributes.sourceId : undefined,
+    ].filter((value): value is string => Boolean(value)),
+    authority: meta.logicalIdentityAuthority === 'management_registration'
+      ? 'management_registration' : 'inferred',
+  });
+  const runtimeInstanceId = semanticIdentity.agentRuntimeInstanceId;
+  const processGenerationKey = process?.processGenerationKey
+    ?? deriveProcessGenerationKey({
+      hostId: process?.hostId,
+      bootId: process?.bootId,
+      pid: process?.pid ?? 0,
+      startTimeTicks: process?.startTimeTicks,
+      startTimeNs: process?.startTimeNs,
+    });
+  const canonicalInstance = deriveAgentInstanceIdentity({
+    logicalAgentId: logical.definition.logicalAgentId,
+    logicalDefinitionId: logical.definition.definitionId,
+    logicalScopeMode: logical.definition.logicalScopeMode,
+    deploymentId,
+    deploymentRevision,
+    environmentId,
+    profile,
+    profileVersion,
+    processGenerationKey,
+  });
+  const serviceStateful = input.sessionMode === 'per_request'
+    || input.sessionMode === 'ephemeral'
+    || input.serviceStateful === true
+    || input.serviceStateful === false;
+  const serviceStatefulHint: boolean | undefined = input.serviceStateful === true
+    ? true
+    : input.serviceStateful === false || input.sessionMode === 'per_request'
+      ? false
+      : undefined;
+  const secureSessionScope = (
+    (meta.logicalIdentityAuthority === 'management_registration'
+      || meta.logicalIdentityAuthority === 'authenticated_adapter')
+    && Boolean(logical.definition.logicalAgentId)
+    && Boolean(tenantId || ownerId)
+  )
+    ? `scope_${createHash('sha256').update([
+        logical.logicalScopeKey, tenantId, ownerId, environmentId, profile,
+        profileVersion, deploymentId, deploymentRevision,
+      ].map((value) => value ?? '').join('\0')).digest('hex')}`
+    : undefined;
+  // A namespace assembled only from producer-controlled product/workspace labels is not a
+  // trustworthy cross-event boundary. Keep it for direct callers that explicitly provide
+  // tenant/owner material, and for the authenticated management/adapter path; otherwise an
+  // unscoped provider Session is deliberately event-local and reported as ephemeral.
+  const sourceScopedNamespace = Boolean(
+    typeof meta.attributes?.sourceId === 'string'
+      && meta.attributes.sourceId.trim()
+      && meta.workspacePath,
+  );
+  const namespaceEligible = (
+    Boolean(tenantId || ownerId)
+      && Boolean(logical.definition.logicalAgentId || logical.definition.definitionId)
+      && (serverDefinitionAuthority || !identityBoundaryLocked)
+  ) || sourceScopedNamespace;
+  const sessionNamespaceHint = namespaceEligible ? [
+    tenantId,
+    ownerId,
+    logical.definition.logicalAgentId,
+    logical.definition.definitionId,
+    semanticIdentity.agentProduct ?? meta.agentId,
+    typeof meta.attributes?.sourceId === 'string' ? meta.attributes.sourceId : undefined,
+    meta.workspacePath,
+  ].filter(Boolean).join('\0') : '';
+  const sessionNamespaceKey = secureSessionScope
+    ?? (sessionNamespaceHint
+      ? `scope_${createHash('sha256').update(sessionNamespaceHint).digest('hex')}`
+      : undefined);
+  const sessionResolution = resolveSessionIdentity({
+    providerSessionId: providerConversationId,
+    sessionId,
+    runtimeSessionId,
+    serviceStateful: serviceStateful ? serviceStatefulHint : undefined,
+    requestId: interactionId,
+    interactionId,
+    agentInstanceId: runtimeInstanceId,
+    resume: input.resume === true,
+    fork: input.fork === true,
+    parentSessionId: string(input.parentSessionId, 512),
+    scopeKey: secureSessionScope,
+    namespaceHint: sessionNamespaceHint,
+  });
+  const runtimeOnlySession = explicitlyNonProviderSession
+    || runtimeOnlySessionId(sessionId, runtimeSessionId, meta);
+  const canonicalSessionId = input.fork === true
+    ? sessionResolution.sessionId
+    : runtimeOnlySession
+    ? sessionResolution.sessionId
+    : sessionResolution.quality === 'ephemeral' && serviceStateful
+      ? sessionResolution.sessionId
+      // `providerConversationId` is a transport/continuity anchor and may legitimately differ
+      // from an application Session (for example a workflow's session_id alongside an upstream
+      // provider conversation). Preserve the explicit non-runtime Session as the compatibility
+      // identity; the provider anchor remains available for resolver graph edges.
+      : sessionId && !runtimeOnlySessionId(sessionId, runtimeSessionId, meta)
+        ? sessionId
+        : providerConversationId ?? sessionResolution.sessionId;
+  const rawObservationId = interactionRawObservationId(envelope) ?? meta.rawObservationId;
+  const rawObservationRevision = interactionRawObservationRevision(envelope) ?? meta.rawObservationRevision;
+  // A provider/session anchor extracted from the authenticated wire body outranks a legacy
+  // Observer envelope fallback (which may have copied the Agent name into meta.sessionId).
+  const sessionIdentityQuality: T.SessionIdentityQuality = providerConversationId
+    ? interactionSessionQuality(sessionResolution.quality)
+    : meta.sessionIdentityQuality
+      ?? (runtimeOnlySession ? 'ephemeral' : sessionId ? 'inferred' : sessionResolution.quality === 'ephemeral' ? 'ephemeral' : 'unknown');
   return {
     schemaVersion: 'anysentry.agent_interaction.v1',
     interactionId,
@@ -604,16 +992,61 @@ export function parseObserverAgentInteraction(
       : input.interactionType === 'unparsed' ? 'unparsed' : 'model',
     at: unixNsToMs(startedAtUnixNs),
     workspacePath: meta.workspacePath,
+    ...(tenantId ? { tenantId } : {}),
+    ...(ownerId ? { ownerId } : {}),
+    ...(profile ? { profile } : {}),
+    ...(profileVersion ? { profileVersion } : {}),
+    ...(deploymentId ? { deploymentId } : {}),
+    ...(deploymentRevision ? { deploymentRevision } : {}),
+    ...(environmentId ? { environmentId } : {}),
     sourceId: typeof meta.attributes?.sourceId === 'string' ? meta.attributes.sourceId : undefined,
     collectorId: typeof meta.attributes?.collectorId === 'string' ? meta.attributes.collectorId : undefined,
     agentAssetId,
     agentInstanceId: semanticIdentity.agentRuntimeInstanceId,
+    ...(canonicalInstance.agentInstanceId ? { canonicalAgentInstanceId: canonicalInstance.agentInstanceId } : {}),
+    runtimeInstanceId,
     agentProduct: semanticIdentity.agentProduct ?? meta.attribution?.agentDisplayName ?? meta.agentId,
     environment: interactionEnvironment(meta),
     ...(runtimeSessionId ? { runtimeSessionId } : {}),
+    ...(rawObservationId ? { rawObservationId, sourceObservationIds: [rawObservationId] } : {}),
+    ...(rawObservationRevision ? { rawObservationRevision } : {}),
+    ...(logical.definition.logicalAgentId ? { logicalAgentId: logical.definition.logicalAgentId } : {}),
+    logicalIdentityAuthority: logical.definition.logicalIdentityAuthority,
+    ...(!logical.stable && logical.candidateId ? { logicalAgentCandidateId: logical.candidateId } : {}),
+    ...(logical.definition.definitionId ? { logicalDefinitionId: logical.definition.definitionId } : {}),
+    ...(logical.definition.logicalScopeMode ? { logicalScopeMode: logical.definition.logicalScopeMode } : {}),
+    ...(logical.definition.definitionFingerprint ? { logicalDefinitionFingerprint: logical.definition.definitionFingerprint } : {}),
+    ...(logical.definition.terminalContextId ? { terminalContextId: logical.definition.terminalContextId } : {}),
     ...(traceId ? { traceId } : {}),
     ...(runId ? { runId } : {}),
-    ...(sessionId ? { sessionId } : {}),
+    ...(runIdSource ? { runIdSource } : {}),
+    ...(canonicalSessionId ? { sessionId: canonicalSessionId } : {}),
+    canonicalSessionId: sessionResolution.canonicalSessionId,
+    ...(sessionNamespaceKey ? { sessionNamespaceKey } : {}),
+    ...(sessionResolution.canonicalSessionKey ? { sessionKey: sessionResolution.canonicalSessionKey } : {}),
+    ...(sessionResolution.providerSessionIdHash ? { providerSessionIdHash: sessionResolution.providerSessionIdHash } : {}),
+    sessionIdentityQuality,
+    ...(providerConversationId
+      ? { sessionIdSource: 'provider' as const }
+      : meta.sessionIdSource
+        ? { sessionIdSource: meta.sessionIdSource }
+        : { sessionIdSource: sessionResolution.quality === 'ephemeral' || runtimeOnlySession ? 'per_request' as const : 'unresolved' as const }),
+    sessionMode: input.sessionMode === 'per_request' || serviceStatefulHint === false
+      ? 'per_request'
+      : sessionResolution.quality === 'ephemeral'
+        ? 'ephemeral'
+      : runtimeOnlySession
+      ? 'per_request'
+      : input.sessionMode === 'resumable' || input.sessionMode === 'conversation'
+      || input.sessionMode === 'per_request' || input.sessionMode === 'ephemeral'
+      ? input.sessionMode
+      : sessionResolution.mode,
+    sessionLifecycle: sessionResolution.lifecycle,
+    sessionResolutionRevision: 1,
+    ...(sessionResolution.canonicalParentSessionId
+      ? { canonicalParentSessionId: sessionResolution.canonicalParentSessionId }
+      : {}),
+    ...(sessionResolution.parentSessionId ? { parentSessionId: sessionResolution.parentSessionId } : string(input.parentSessionId, 512) ? { parentSessionId: string(input.parentSessionId, 512) } : {}),
     ...(invocationId ? { invocationId } : {}),
     ...(providerConversationId ? { providerConversationId } : {}),
     ...(providerResponseId ? { providerResponseId } : {}),

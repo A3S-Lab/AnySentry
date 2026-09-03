@@ -15,6 +15,13 @@ export interface DetectedAgentIdentity {
   agentRuntimeInstanceId: string;
   agentRuntimeInstanceAliases: string[];
   agentProduct?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  logicalDefinitionFingerprint?: string;
+  terminalContextId?: string;
   bindingQuality: 'exact' | 'weak';
   identityReasonCode: string;
   identityResolutionRank: number;
@@ -231,7 +238,9 @@ export function locationLabelFor(
 }
 
 export function detectedAgentIdentity(
-  event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'process' | 'attribution'> & Partial<Pick<JudgedEvent, 'sessionId' | 'attributes'>>,
+  event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'process' | 'attribution'> & Partial<Pick<JudgedEvent,
+    'sessionId' | 'attributes' | 'logicalAgentId' | 'logicalAgentCandidateId' | 'logicalDefinitionId'
+    | 'logicalScopeMode' | 'logicalIdentityAuthority' | 'terminalContextId'>>,
 ): DetectedAgentIdentity {
   const runtime = runtimeFor(event);
   const semantic = projectAgentSemanticIdentity({
@@ -245,6 +254,14 @@ export function detectedAgentIdentity(
     agentRuntimeInstanceId: semantic.canonicalRuntimeInstanceId,
     agentRuntimeInstanceAliases: semantic.runtimeInstanceAliases,
     agentProduct: semantic.agentProduct,
+    ...(semantic.logicalAgentId ? { logicalAgentId: semantic.logicalAgentId } : {}),
+    ...(semantic.logicalAgentCandidateId ? { logicalAgentCandidateId: semantic.logicalAgentCandidateId } : {}),
+    ...(semantic.logicalDefinitionId ? { logicalDefinitionId: semantic.logicalDefinitionId } : {}),
+    ...(semantic.logicalScopeMode ? { logicalScopeMode: semantic.logicalScopeMode } : {}),
+    ...(semantic.logicalIdentityAuthority ? { logicalIdentityAuthority: semantic.logicalIdentityAuthority } : {}),
+    ...(semantic.logicalDefinitionFingerprint
+      ? { logicalDefinitionFingerprint: semantic.logicalDefinitionFingerprint } : {}),
+    ...(semantic.terminalContextId ? { terminalContextId: semantic.terminalContextId } : {}),
     bindingQuality: semantic.bindingQuality,
     identityReasonCode: semantic.reasonCode,
     identityResolutionRank: semantic.canonicalIdentityKey.startsWith('k8s-agent-logical:v1:')

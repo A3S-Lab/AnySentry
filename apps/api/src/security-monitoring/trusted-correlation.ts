@@ -163,6 +163,7 @@ export interface TrustedApplicationClaim {
   /** Raw producer values. The resolver is the first component allowed to validate them. */
   invocationId?: unknown;
   traceId?: unknown;
+  runId?: unknown;
   /** Server comparison against the immutable legacy field after legacy normalization. */
   traceConsistent?: boolean;
   scope?: TrustedCorrelationBindingScope;
@@ -174,6 +175,7 @@ export interface TrustedAgentAdapterClaim {
   toolCallId?: unknown;
   sessionId?: unknown;
   traceId?: unknown;
+  runId?: unknown;
   /** Server comparisons against the immutable legacy fields after legacy normalization. */
   sessionConsistent?: boolean;
   traceConsistent?: boolean;

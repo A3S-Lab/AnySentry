@@ -2,6 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
 
 const require = createRequire(import.meta.url);
 const {
@@ -128,10 +129,17 @@ const equalCommandCandidates = buildSemanticKernelRelations(
   12,
   false,
 );
-assert.equal(equalCommandCandidates.length, 1);
-assert.equal(equalCommandCandidates[0].status, 'semantic_only');
-assert.equal(equalCommandCandidates[0].kernelEventId, undefined,
-  'equal-strength competing Kernel generations must remain explicit instead of producing two owners');
+assert.equal(equalCommandCandidates.length, 2,
+  'equal-strength competing Kernel generations must remain as explicit candidate relations');
+assert(equalCommandCandidates.every((relation) => relation.status === 'ambiguous'));
+assert.deepEqual(
+  equalCommandCandidates.map((relation) => relation.kernelEventId).sort(),
+  ['evt_equal_command_generation', 'evt_kernel_exec'].sort(),
+);
+assert(equalCommandCandidates.every((relation) => relation.competingKernelEventIds?.length === 2));
+assert.match(equalCommandCandidates[0].evidenceLinkId ?? '', /^el_[a-f0-9]{24}$/u);
+assert.equal(equalCommandCandidates[0].confidence, 0,
+  'an unresolved competing candidate must not retain a positive EvidenceLink confidence');
 
 const codexCustomToolCall = {
   ...toolCall,
@@ -302,8 +310,9 @@ const ambiguousServiceEndpoint = buildSemanticKernelRelations(
   13,
   false,
 );
-assert.equal(ambiguousServiceEndpoint[0].status, 'semantic_only');
-assert.equal(ambiguousServiceEndpoint[0].kernelEventId, undefined);
+assert.equal(ambiguousServiceEndpoint.length, 2);
+assert(ambiguousServiceEndpoint.every((relation) => relation.status === 'ambiguous'));
+assert(ambiguousServiceEndpoint.every((relation) => relation.competingKernelEventIds?.length === 2));
 
 const shellBootstrapEvent = {
   ...kernelEvent,
@@ -345,9 +354,10 @@ const ambiguousShellBootstrap = buildSemanticKernelRelations(
   13,
   false,
 );
-assert.equal(ambiguousShellBootstrap[0].status, 'semantic_only');
-assert.equal(ambiguousShellBootstrap[0].kernelEventId, undefined,
-  'multiple direct-child shells must not be guessed from time and Runtime alone');
+assert.equal(ambiguousShellBootstrap.length, 2);
+assert(ambiguousShellBootstrap.every((relation) => relation.status === 'ambiguous'));
+assert(ambiguousShellBootstrap.every((relation) => relation.competingKernelEventIds?.length === 2),
+  'multiple direct-child shells must retain all candidates without choosing one');
 
 const timeOnly = buildSemanticKernelRelations(
   toolCall,
@@ -525,25 +535,32 @@ assert.deepEqual(
 );
 assert.equal(duplicateRelationsA?.[0].competingToolInvocationIds?.length, 2);
 
-let replacementQuery;
+const replacementQueries = [];
 let replacementParameters;
 const relationStore = Object.create(RelationalBusinessStore.prototype);
 relationStore.initialize = async () => true;
-relationStore.pool = {
+const replacementClient = {
   query: async (sql, parameters) => {
-    replacementQuery = sql;
-    replacementParameters = parameters;
+    replacementQueries.push(String(sql));
+    if (parameters) replacementParameters = parameters;
     return { rows: [] };
   },
+  release: () => undefined,
+};
+relationStore.pool = {
+  connect: async () => replacementClient,
 };
 relationStore.markUnavailable = () => undefined;
 assert.equal(await relationStore.saveAgentSemanticKernelRelations(duplicateBatch.allRelations), true);
-assert.match(replacementQuery, /DELETE FROM anysentry_agent_semantic_kernel_relations_v1 AS existing/u);
-assert.match(replacementQuery, /existing\.resolution_revision <= latest_incoming\.resolution_revision/u);
-assert.match(replacementQuery, /NOT EXISTS/u);
-assert.match(replacementQuery, /newer\.resolution_revision > \(incoming\.record->>'resolutionRevision'\)::bigint/u);
+assert(replacementQueries.some((query) => /relation_history_v1/u.test(query)),
+  'relation revisions must be appended to the immutable history table');
+assert(replacementQueries.some((query) => /ON CONFLICT \(relation_id, resolution_revision\) DO NOTHING/u.test(query)));
+assert(replacementQueries.some((query) => /ON CONFLICT \(relation_id\) DO UPDATE/u.test(query)),
+  'the legacy relation table is only a latest-row compatibility projection');
+assert(!replacementQueries.some((query) => /DELETE FROM anysentry_agent_semantic_kernel_relations_v1/u.test(query)),
+  'relation history must never be pruned in place');
 assert.equal(JSON.parse(replacementParameters[0]).length, 2,
-  'one persistence call must atomically replace both competing semantic relation sets');
+  'one transaction must atomically append both competing semantic relation sets');
 
 const captured = (structured, messages = [], text) => {
   const body = JSON.stringify(structured);
@@ -769,5 +786,37 @@ assert.equal(incrementalKernelQueries.length, 1,
 assert.equal(incrementalKernelQueries[0].eventCategory, 'tool');
 assert.ok(Date.parse(incrementalKernelQueries[0].startTime) >= callAt - 5_000,
   'a stale Tool call in the hydration window must not widen incremental Kernel evidence work');
+
+// Read/query paths must remain pure. Relation materialization is ingest-owned; a selected Tool
+// evidence read may not write a compatibility relation as a hidden side effect.
+const controllerSource = readFileSync(
+  new URL('../apps/api/src/security-monitoring/security-monitoring.controller.ts', import.meta.url),
+  'utf8',
+);
+const toolEvidenceStart = controllerSource.indexOf("@Post('events/tool-evidence')");
+const toolEvidenceEnd = controllerSource.indexOf("@Post('context/system')", toolEvidenceStart);
+assert(toolEvidenceStart >= 0 && toolEvidenceEnd > toolEvidenceStart,
+  'tool evidence controller region is present');
+assert.doesNotMatch(
+  controllerSource.slice(toolEvidenceStart, toolEvidenceEnd),
+  /writeStoredToolEvidenceRelations/iu,
+  'tool evidence reads must not materialize relations',
+);
+
+const relationalSource = readFileSync(
+  new URL('../apps/api/src/security-monitoring/relational-business-store.service.ts', import.meta.url),
+  'utf8',
+);
+const relationWriterStart = relationalSource.indexOf('async saveAgentSemanticKernelRelations(');
+const relationWriterEnd = relationalSource.indexOf('async loadIncidents(', relationWriterStart);
+assert(relationWriterStart >= 0 && relationWriterEnd > relationWriterStart,
+  'semantic-kernel relation writer source region is present');
+const relationWriter = relationalSource.slice(relationWriterStart, relationWriterEnd);
+assert.match(relationWriter, /SEMANTIC_KERNEL_RELATION_MAX_ROWS/iu,
+  'relation persistence has an explicit row bound');
+assert.match(relationWriter, /SEMANTIC_KERNEL_RELATION_MAX_BYTES/iu,
+  'relation persistence has an explicit byte bound');
+assert.match(relationWriter, /batchHasConflictingRecords/iu,
+  'one incoming batch cannot contain two payloads for the same relation revision');
 
 console.log('Agent Semantic Tool to Kernel relation verification passed');

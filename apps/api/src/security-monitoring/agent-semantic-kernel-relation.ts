@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import type * as T from './types';
+import { createEvidenceLink, type EvidenceLink } from './canonical-observability';
 
 export const AGENT_SEMANTIC_KERNEL_RELATION_VERSION = 3;
 const CLOCK_SKEW_MS = 2_000;
@@ -502,6 +503,40 @@ function potentialRelation(
   if (!runtimeLink) return undefined;
   if (runtimeLink === 'generation_parent') confidence = Math.min(confidence, 0.99);
   if (runtimeLink === 'legacy_pid_parent') confidence = Math.min(confidence, 0.75);
+  const canonicalLink = createEvidenceLink({
+    fromType: 'tool_call',
+    fromId: invocationId,
+    toType: candidate.eventKind === 'FileAccess' || candidate.eventKind === 'FileDelete'
+      ? 'file'
+      : candidate.eventKind === 'Egress' || candidate.eventKind === 'Dns' || candidate.eventKind === 'Tls'
+        ? 'network'
+        : 'kernel_fact',
+    toId: candidate.kernelFactId ?? candidate.eventId,
+    relation: candidate.eventKind === 'ToolExec' ? 'executes_as'
+      : candidate.eventKind === 'FileAccess' || candidate.eventKind === 'FileDelete' ? 'file_effect'
+        : 'network_effect',
+    method: linkMethod === 'network_endpoint'
+      ? 'network'
+      : linkMethod === 'shell_bootstrap' ? 'process_generation' : linkMethod,
+    confidence,
+    // The Observer attests the underlying event, but this edge is still a server-side content /
+    // lineage match. Keep the canonical EvidenceLink authority inferred; the legacy relation's
+    // `attested_tls_plaintext` field separately records that the semantic ToolCall came from
+    // captured plaintext.
+    authority: 'inferred',
+    evidenceRefs: [
+      interaction.rawObservationId,
+      ...(interaction.sourceObservationIds ?? []),
+      candidate.rawObservationId,
+      candidate.eventId,
+    ].filter((value): value is string => Boolean(value)),
+    algorithmVersion: `semantic-kernel-relation.v${AGENT_SEMANTIC_KERNEL_RELATION_VERSION}`,
+    status: confidence === 1 ? 'confirmed' : 'strong',
+    // Kernel event timestamps are ISO strings in the legacy read model; use the semantic event
+    // timestamp as the canonical Unix-ns validity anchor and retain the legacy value separately.
+    validFromUnixNs: event.atUnixNs,
+    resolutionRevision,
+  });
   return {
     schemaVersion: 'anysentry.agent_semantic_kernel_relation.v1',
     relationId: stableId('skr', event.semanticEventId + '\u0000' + candidate.eventId),
@@ -510,6 +545,7 @@ function potentialRelation(
     turnId: event.turnId,
     toolInvocationId: invocationId,
     kernelEventId: candidate.eventId,
+    ...(candidate.kernelFactId ? { kernelFactId: candidate.kernelFactId } : {}),
     kernelEventAt: candidate.at,
     kernelEventKind: candidate.eventKind,
     ...(candidate.decisionRevision !== undefined
@@ -523,6 +559,11 @@ function potentialRelation(
     authority: 'attested_tls_plaintext',
     relationVersion: AGENT_SEMANTIC_KERNEL_RELATION_VERSION,
     resolutionRevision,
+    evidenceLinkId: canonicalLink.linkId,
+    algorithmVersion: canonicalLink.algorithmVersion,
+    sourceRefs: canonicalLink.evidenceRefs,
+    validFromUnixNs: canonicalLink.validFromUnixNs,
+    relationRevision: resolutionRevision,
     risk: risk(candidate),
   };
 }
@@ -533,6 +574,21 @@ function unlinkedRelation(
   coveragePartial: boolean,
 ): T.AgentSemanticKernelRelation {
   const invocationId = toolInvocationId(input.event, input.interaction);
+  const canonicalLink = createEvidenceLink({
+    fromType: 'tool_call',
+    fromId: invocationId,
+    toType: 'kernel_fact',
+    toId: `unmatched:${input.event.semanticEventId}`,
+    relation: 'supports',
+    method: 'none',
+    confidence: 0,
+    authority: 'inferred',
+    evidenceRefs: input.interaction.sourceObservationIds ?? [],
+    algorithmVersion: `semantic-kernel-relation.v${AGENT_SEMANTIC_KERNEL_RELATION_VERSION}`,
+    status: coveragePartial ? 'coverage_gap' : 'unmatched',
+    validFromUnixNs: input.interaction.startedAtUnixNs,
+    resolutionRevision,
+  });
   return {
     schemaVersion: 'anysentry.agent_semantic_kernel_relation.v1',
     relationId: stableId('skr', input.event.semanticEventId + '\u0000unlinked'),
@@ -545,6 +601,11 @@ function unlinkedRelation(
     authority: 'attested_tls_plaintext',
     relationVersion: AGENT_SEMANTIC_KERNEL_RELATION_VERSION,
     resolutionRevision,
+    evidenceLinkId: canonicalLink.linkId,
+    algorithmVersion: canonicalLink.algorithmVersion,
+    sourceRefs: canonicalLink.evidenceRefs,
+    validFromUnixNs: canonicalLink.validFromUnixNs,
+    relationRevision: resolutionRevision,
   };
 }
 
@@ -555,6 +616,85 @@ function sortRelations(relations: T.AgentSemanticKernelRelation[]): T.AgentSeman
     || (left.kernelEventId ?? '').localeCompare(right.kernelEventId ?? ''));
 }
 
+function canonicalLinkForRelation(
+  relation: T.AgentSemanticKernelRelation,
+  status: 'ambiguous' | 'unmatched' | 'coverage_gap',
+  competingRefs: string[] = [],
+) {
+  const toType: 'kernel_fact' | 'file' | 'network' =
+    relation.kernelEventKind === 'FileAccess' || relation.kernelEventKind === 'FileDelete'
+      ? 'file'
+      : relation.kernelEventKind === 'Egress' || relation.kernelEventKind === 'Dns' || relation.kernelEventKind === 'Tls'
+        ? 'network'
+        : 'kernel_fact';
+  const method = relation.linkMethod === 'network_endpoint'
+    ? 'network' as const
+    : relation.linkMethod === 'shell_bootstrap'
+      ? 'process_generation' as const
+      : relation.linkMethod === 'command' || relation.linkMethod === 'resource'
+        ? relation.linkMethod
+        : 'none' as const;
+  return createEvidenceLink({
+    fromType: 'tool_call',
+    fromId: relation.toolInvocationId,
+    toType,
+    toId: relation.kernelFactId ?? relation.kernelEventId ?? `unmatched:${relation.stableSemanticEventId}`,
+    relation: toType === 'file' ? 'file_effect' : toType === 'network' ? 'network_effect' : 'supports',
+    method,
+    confidence: 0,
+    authority: 'inferred',
+    evidenceRefs: [...(relation.sourceRefs ?? []), ...competingRefs],
+    algorithmVersion: relation.algorithmVersion ?? `semantic-kernel-relation.v${AGENT_SEMANTIC_KERNEL_RELATION_VERSION}`,
+    status,
+    validFromUnixNs: relation.validFromUnixNs ?? '1',
+    resolutionRevision: relation.relationRevision ?? relation.resolutionRevision,
+  });
+}
+
+/** Public projection helper shared by ingest-time and API readers.  It is intentionally
+ * product-neutral: the relation already carries the normalized Kernel event kind/method. */
+export function canonicalEvidenceLinkForRelation(
+  relation: T.AgentSemanticKernelRelation,
+): EvidenceLink {
+  const toType: EvidenceLink['toType'] = relation.kernelEventKind === 'FileAccess'
+    || relation.kernelEventKind === 'FileDelete'
+    ? 'file'
+    : relation.kernelEventKind === 'Egress' || relation.kernelEventKind === 'Dns' || relation.kernelEventKind === 'Tls'
+      ? 'network' : 'kernel_fact';
+  const method: EvidenceLink['method'] = relation.linkMethod === 'network_endpoint'
+    ? 'network'
+    : relation.linkMethod === 'shell_bootstrap'
+      ? 'process_generation'
+      : relation.linkMethod === 'command' || relation.linkMethod === 'resource'
+        ? relation.linkMethod : 'none';
+  const status: EvidenceLink['status'] = relation.status === 'linked_exact'
+    ? 'confirmed'
+    : relation.status === 'linked_strong' ? 'strong'
+      : relation.status === 'ambiguous' ? 'ambiguous'
+        : relation.status === 'coverage_gap' ? 'coverage_gap' : 'unmatched';
+  return createEvidenceLink({
+    fromType: 'tool_call',
+    fromId: relation.toolInvocationId,
+    toType,
+    toId: relation.kernelFactId ?? relation.kernelEventId ?? `unmatched:${relation.stableSemanticEventId}`,
+    relation: toType === 'file' ? 'file_effect' : toType === 'network' ? 'network_effect' : 'executes_as',
+    method,
+    confidence: status === 'confirmed' ? 1 : status === 'strong' ? relation.confidence : 0,
+    authority: 'inferred',
+    evidenceRefs: [...(relation.sourceRefs ?? []), relation.stableSemanticEventId],
+    algorithmVersion: relation.algorithmVersion ?? `semantic-kernel-relation.v${relation.relationVersion}`,
+    status,
+    validFromUnixNs: relation.validFromUnixNs ?? '1',
+    resolutionRevision: relation.relationRevision ?? relation.resolutionRevision,
+  });
+}
+
+export function canonicalEvidenceLinksForRelations(
+  relations: readonly T.AgentSemanticKernelRelation[],
+): EvidenceLink[] {
+  return relations.map(canonicalEvidenceLinkForRelation);
+}
+
 export function buildSemanticKernelRelationBatch(
   inputs: SemanticKernelRelationInput[],
   candidates: T.AgentEventListItem[],
@@ -563,6 +703,10 @@ export function buildSemanticKernelRelationBatch(
 ): SemanticKernelRelationBatchResult {
   const boundedInputs = inputs.slice(0, 1_000);
   const index = buildCandidateIndex(candidates);
+  // Keep every highest-scoring candidate for a semantic ToolCall.  Older code discarded ties and
+  // returned a synthetic `semantic_only` row, which hid the very Kernel facts an operator needs to
+  // review.  The canonical contract requires competing candidates to remain explicit and
+  // ambiguous; ownership arbitration below only marks them, never deletes them.
   const potentialBySemantic = new Map<string, T.AgentSemanticKernelRelation[]>();
   const ownersByKernel = new Map<string, Set<string>>();
   const invocationBySemantic = new Map<string, string>();
@@ -583,14 +727,18 @@ export function buildSemanticKernelRelationBatch(
     );
     const strongestContent = contentRelations.filter((relation) =>
       relation.confidence === strongestContentConfidence);
+    const strongestFallbackConfidence = boundedFallbacks.reduce(
+      (highest, relation) => Math.max(highest, relation.confidence),
+      0,
+    );
+    const strongestFallbacks = boundedFallbacks.filter((relation) =>
+      relation.confidence === strongestFallbackConfidence);
     const relations = contentRelations.length > 0
       // One semantic Tool action has one primary Kernel owner. A complete command match outranks
-      // descendant subcommands; equal-strength competing process generations remain unlinked
-      // instead of presenting several events as if each were the same invocation.
-      ? strongestContent.length === 1 ? strongestContent : []
-      : boundedFallbacks.length === 1
-        ? boundedFallbacks
-        : [];
+      // descendant subcommands; equal-strength candidates are retained and marked ambiguous in
+      // the result projection rather than being silently replaced by a no-kernel row.
+      ? strongestContent
+      : strongestFallbacks;
     potentialBySemantic.set(semanticId, relations);
     for (const relation of relations) {
       if (!relation.kernelEventId) continue;
@@ -603,11 +751,18 @@ export function buildSemanticKernelRelationBatch(
   const relationsBySemanticEventId = new Map<string, T.AgentSemanticKernelRelation[]>();
   for (const input of boundedInputs) {
     const semanticId = input.event.semanticEventId;
-    const resolved = (potentialBySemantic.get(semanticId) ?? []).map((relation) => {
+    const candidatesForSemantic = potentialBySemantic.get(semanticId) ?? [];
+    const resolved = candidatesForSemantic.map((relation) => {
       const owners = relation.kernelEventId
         ? ownersByKernel.get(relation.kernelEventId) ?? new Set<string>()
         : new Set<string>();
-      if (owners.size <= 1) return relation;
+      const localCompetition = candidatesForSemantic.length > 1;
+      if (owners.size <= 1 && !localCompetition) return relation;
+      const competingKernelEventIds = [
+        ...new Set(candidatesForSemantic
+          .map((candidate) => candidate.kernelEventId)
+          .filter((value): value is string => Boolean(value))),
+      ].sort();
       return {
         ...relation,
         status: 'ambiguous' as const,
@@ -617,6 +772,25 @@ export function buildSemanticKernelRelationBatch(
           .map((owner) => invocationBySemantic.get(owner))
           .filter((value): value is string => Boolean(value))
           .sort(),
+        ...(competingKernelEventIds.length > 0 ? { competingKernelEventIds } : {}),
+        ...(() => {
+          const link = canonicalLinkForRelation(
+            relation,
+            'ambiguous',
+            [
+              ...[...owners]
+                .map((owner) => invocationBySemantic.get(owner))
+                .filter((value): value is string => Boolean(value)),
+              ...competingKernelEventIds,
+            ],
+          );
+          return {
+            evidenceLinkId: link.linkId,
+            algorithmVersion: link.algorithmVersion,
+            sourceRefs: link.evidenceRefs,
+            validFromUnixNs: link.validFromUnixNs,
+          };
+        })(),
       };
     });
     relationsBySemanticEventId.set(

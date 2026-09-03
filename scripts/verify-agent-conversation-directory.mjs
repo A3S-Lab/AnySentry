@@ -26,6 +26,17 @@ const conversation = ({
   environment = 'docker',
   at,
   status = 'complete',
+  logicalAgentId,
+  logicalDefinitionId,
+  logicalScopeMode,
+  logicalIdentityAuthority,
+  tenantId,
+  ownerId,
+  profile,
+  profileVersion,
+  deploymentId,
+  deploymentRevision,
+  logicalDefinitionFingerprint,
 }) => {
   const modelCallCount = status === 'complete' ? 1 : 0;
   const usage = {
@@ -50,6 +61,17 @@ const conversation = ({
   agentAssetId,
   agentInstanceIds,
   agentProduct: product,
+  ...(logicalAgentId ? { logicalAgentId } : {}),
+  ...(logicalDefinitionId ? { logicalDefinitionId } : {}),
+  ...(logicalScopeMode ? { logicalScopeMode } : {}),
+  ...(logicalIdentityAuthority ? { logicalIdentityAuthority } : {}),
+  ...(tenantId ? { tenantId } : {}),
+  ...(ownerId ? { ownerId } : {}),
+  ...(profile ? { profile } : {}),
+  ...(profileVersion ? { profileVersion } : {}),
+  ...(deploymentId ? { deploymentId } : {}),
+  ...(deploymentRevision ? { deploymentRevision } : {}),
+  ...(logicalDefinitionFingerprint ? { logicalDefinitionFingerprint } : {}),
   displayName: product,
   environment,
   classification: 'confirmed_agent',
@@ -105,6 +127,12 @@ const items = projectAgentConversationDirectory([
     agentInstanceIds: ['instance-a'],
     environment: 'host',
     at: '1788000000000000001',
+    logicalAgentId: 'la-codex-registered',
+    logicalDefinitionId: 'codex-definition',
+    logicalScopeMode: 'registered_definition',
+    tenantId: 'tenant-fixture',
+    ownerId: 'owner-fixture',
+    profile: 'default',
   }),
   conversation({
     conversationId: 'cv-codex-b',
@@ -112,6 +140,12 @@ const items = projectAgentConversationDirectory([
     agentInstanceIds: ['instance-b'],
     environment: 'unknown',
     at: '1788000000000000002',
+    logicalAgentId: 'la-codex-registered',
+    logicalDefinitionId: 'codex-definition',
+    logicalScopeMode: 'registered_definition',
+    tenantId: 'tenant-fixture',
+    ownerId: 'owner-fixture',
+    profile: 'default',
   }),
   conversation({
     conversationId: 'cv-claude',
@@ -152,6 +186,88 @@ assert.equal(codex.conversations[0].conversationId, 'cv-codex-b');
 assert.equal(claude.lifecycleState, 'historical');
 assert.equal(langchain.lifecycleState, 'running');
 assert.equal(langchain.conversationCount, 0);
+
+// A workflow/service definition stays one LogicalAgent across deployment/environment revisions;
+// those fields belong to AgentInstance/Session fences and must remain visible on child summaries.
+const workflowDefinitionFingerprint = 'b'.repeat(64);
+const workflowDirectory = projectAgentConversationDirectory([
+  conversation({
+    conversationId: 'cv-workflow-test',
+    agentAssetId: 'asset-workflow-test',
+    agentInstanceIds: ['workflow-instance-test'],
+    product: 'Dify',
+    workspacePath: '/srv/workflow',
+    environment: 'docker',
+    at: '1788000000000000011',
+    logicalAgentId: 'la-workflow-registered',
+    logicalDefinitionId: 'workflow-definition',
+    logicalScopeMode: 'workflow_definition',
+    logicalIdentityAuthority: 'management_registration',
+    tenantId: 'tenant-fixture',
+    ownerId: 'owner-fixture',
+    profile: 'default',
+    profileVersion: 'v1',
+    deploymentId: 'deployment-test',
+    deploymentRevision: 'r1',
+    logicalDefinitionFingerprint: workflowDefinitionFingerprint,
+  }),
+  conversation({
+    conversationId: 'cv-workflow-prod',
+    agentAssetId: 'asset-workflow-prod',
+    agentInstanceIds: ['workflow-instance-prod'],
+    product: 'Dify',
+    workspacePath: '/srv/workflow',
+    environment: 'kubernetes',
+    at: '1788000000000000012',
+    logicalAgentId: 'la-workflow-registered',
+    logicalDefinitionId: 'workflow-definition',
+    logicalScopeMode: 'workflow_definition',
+    logicalIdentityAuthority: 'management_registration',
+    tenantId: 'tenant-fixture',
+    ownerId: 'owner-fixture',
+    profile: 'production',
+    profileVersion: 'v1',
+    deploymentId: 'deployment-prod',
+    deploymentRevision: 'r2',
+    logicalDefinitionFingerprint: workflowDefinitionFingerprint,
+  }),
+], [], 'all');
+assert.equal(workflowDirectory.length, 1,
+  'workflow test/prod deployments must share one LogicalAgent directory item');
+assert.equal(workflowDirectory[0].conversationCount, 2);
+assert.deepEqual(
+  workflowDirectory[0].conversations.map((item) => item.deploymentId).sort(),
+  ['deployment-prod', 'deployment-test'],
+);
+const workflowRuntimeDirectory = projectAgentConversationDirectory([], [
+  {
+    ...runtime('workflow-runtime-test', 'running', 'Dify', '/srv/workflow', 'dify-test-pod'),
+    logicalAgentId: 'la-workflow-registered',
+    logicalDefinitionId: 'workflow-definition',
+    logicalScopeMode: 'workflow_definition',
+    logicalIdentityAuthority: 'management_registration',
+    tenantId: 'tenant-fixture',
+    ownerId: 'owner-fixture',
+    profile: 'default',
+    deploymentId: 'deployment-test',
+    deploymentRevision: 'r1',
+  },
+  {
+    ...runtime('workflow-runtime-prod', 'running', 'Dify', '/srv/workflow', 'dify-prod-pod'),
+    logicalAgentId: 'la-workflow-registered',
+    logicalDefinitionId: 'workflow-definition',
+    logicalScopeMode: 'workflow_definition',
+    logicalIdentityAuthority: 'management_registration',
+    tenantId: 'tenant-fixture',
+    ownerId: 'owner-fixture',
+    profile: 'production',
+    deploymentId: 'deployment-prod',
+    deploymentRevision: 'r2',
+  },
+], 'all');
+assert.equal(workflowRuntimeDirectory.length, 1,
+  'workflow/service runtime-only records must fan out under one LogicalAgent across deployments');
+assert.equal(workflowRuntimeDirectory[0].totalInstanceCount, 2);
 assert.equal(langchain.conversations.length, 0);
 
 const runningOnly = projectAgentConversationDirectory(
@@ -241,6 +357,32 @@ assert.deepEqual(
   realWorkspaceIsolation.map((item) => item.workspacePath).sort(),
   ['/srv/project-a', '/srv/project-b'],
 );
+
+const unresolvedSameWorkspace = projectAgentConversationDirectory([
+  conversation({
+    conversationId: 'cv-unresolved-a',
+    agentAssetId: 'asset-unresolved-a',
+    agentInstanceIds: ['unresolved-a'],
+    product: 'generic-runtime',
+    workspacePath: '/srv/shared-workspace',
+    environment: 'host',
+    at: '1788000000000000009',
+  }),
+  conversation({
+    conversationId: 'cv-unresolved-b',
+    agentAssetId: 'asset-unresolved-b',
+    agentInstanceIds: ['unresolved-b'],
+    product: 'generic-runtime',
+    workspacePath: '/srv/shared-workspace',
+    environment: 'host',
+    at: '1788000000000000010',
+  }),
+], [], 'all');
+assert.equal(unresolvedSameWorkspace.length, 2,
+  'same workspace without a registered definition must remain unresolved candidates');
+assert(unresolvedSameWorkspace.every((item) =>
+  item.logicalScopeMode === 'unresolved' && item.groupingQuality === 'unresolved'));
+assert.notEqual(unresolvedSameWorkspace[0].logicalAgentId, unresolvedSameWorkspace[1].logicalAgentId);
 
 const content = (body, messages = []) => ({
   body,

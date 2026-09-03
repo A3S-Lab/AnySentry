@@ -5,6 +5,8 @@
 > 适用项目：`data-center/AnySentry`、`data-center/Observer`
 > 本文目标：统一智能体、实例、Session、LLM 明文、工具调用和内核事件的建模与关联方式，并形成后续新增智能体、新功能和性能优化时必须遵循的开发手册。
 
+> 维护提示：本文保留为历史基线。当前关于“稳定注册定义优先、终端默认属于 Runtime/Segment、可显式 terminal scope”、两条证据 lane、RawObservation 主链和本次仓库快照的评审结论，以[通用智能体全链路可观测架构 v2](./anysentry-agent-observability-architecture-v2.md)为准。
+
 ---
 
 ## 1. 结论

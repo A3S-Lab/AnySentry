@@ -11,8 +11,47 @@ const baseUrl = (
   `http://127.0.0.1:${process.env.PORT ?? '29653'}/security-center`
 ).replace(/\/$/, '');
 const expectedMode = process.env.ANYSENTRY_S2_EXPECT_MODE ?? process.env.ANYSENTRY_TRUSTED_CORRELATION_MODE;
+// `canonicalizeEvent` is also exercised locally in this verifier. Keep its process-local rollout
+// view aligned with the API mode being asserted; the API `/stats` assertion below still verifies
+// the actual server configuration, so this does not turn a mode mismatch into a pass.
+if (expectedMode && !process.env.ANYSENTRY_TRUSTED_CORRELATION_MODE) {
+  process.env.ANYSENTRY_TRUSTED_CORRELATION_MODE = expectedMode;
+}
 const runId = safeProbeId(`s2-${expectedMode ?? 'unset'}`);
 const schemaVersion = 'anysentry.trusted_correlation.v1';
+const createdSourceIds = new Set();
+let sourceCleanupFinished = false;
+
+async function disableCreatedSources() {
+  if (sourceCleanupFinished) return;
+  sourceCleanupFinished = true;
+  // Some negative-path cases intentionally send tokenless/forged events. The API creates a
+  // discovered compatibility Source for those events, so it is not returned by the explicit
+  // create helper. Resolve only this run's unique prefix before disabling; never sweep unrelated
+  // operator Sources.
+  const discovered = await request('/sources/list', 'POST', {
+    q: runId,
+    includeVerification: true,
+    limit: 500,
+  }).catch(() => undefined);
+  for (const item of discovered?.items ?? []) {
+    if (item?.sourceId && String(item.name ?? '').includes(runId)) createdSourceIds.add(item.sourceId);
+  }
+  for (const sourceId of createdSourceIds) {
+    await request(`/sources/${encodeURIComponent(sourceId)}`, 'PUT', { enabled: false }).catch(() => undefined);
+  }
+}
+
+// Top-level assertions reject the module before the normal epilogue can run.  Keep the temporary
+// managed Sources disabled even on a failed verifier, without ever logging their token values.
+const cleanupOnFailure = (error) => {
+  void disableCreatedSources().finally(() => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+};
+process.once('uncaughtException', cleanupOnFailure);
+process.once('unhandledRejection', cleanupOnFailure);
 
 assert.ok(
   expectedMode === 'off' || expectedMode === 'shadow',
@@ -56,6 +95,12 @@ async function request(path, method = 'GET', body, headers = {}) {
   return payload?.data ?? payload;
 }
 
+async function createTrackedSource(body) {
+  const result = await request('/sources', 'POST', body);
+  if (result?.source?.sourceId) createdSourceIds.add(result.source.sourceId);
+  return result;
+}
+
 function sourceHeaders(sourceId, token) {
   return {
     'x-anysentry-source-id': sourceId,
@@ -67,7 +112,7 @@ async function createSemanticSource(authority, suffix, type) {
   const tenantId = `${runId}-tenant`;
   const environmentId = `${runId}-environment`;
   const workspacePath = `/workspace/${runId}/${suffix}`;
-  const source = await request('/sources', 'POST', {
+  const source = await createTrackedSource({
     name: `${runId} ${suffix}`,
     type,
     enabled: true,
@@ -98,7 +143,7 @@ async function createSemanticSource(authority, suffix, type) {
 async function createObserverSource() {
   const collectorId = `${runId}-attested-collector`;
   const workspacePath = `/workspace/${runId}/observer`;
-  const source = await request('/sources', 'POST', {
+  const source = await createTrackedSource({
     name: `${runId} attested observer`,
     type: 'observer',
     enabled: true,
@@ -469,11 +514,33 @@ async function verifyRejectedClaims(application, trustedInvocationId) {
     forgedStored,
   );
 
+  // Install a management definition for the same agent/workspace before exercising a rejected
+  // tenant claim.  The event must not inherit this registration after the Source fence fails.
+  const registeredAgentId = `${runId}-agent`;
+  await request(`/agents/${encodeURIComponent(registeredAgentId)}/metadata`, 'PUT', {
+    workspacePath: application.workspacePath,
+    logicalAgentId: `${runId}-registered-logical-agent`,
+    logicalDefinitionId: `${runId}-registered-definition`,
+    logicalDefinitionType: 'registered',
+    logicalScopeMode: 'registered_definition',
+    tenantId: application.tenantId,
+    ownerId: `${runId}-owner`,
+    profile: 'test',
+    ingestionSourceId: application.source.sourceId,
+  });
+
   const mismatchInput = semanticEvent(application, {
     suffix: 'binding-mismatch',
-    workspacePath: `/workspace/${runId}/wrong-binding`,
+    // Keep the transport Source binding valid so the test reaches the per-event correlation
+    // fence; the tenant claim itself is intentionally wrong.
+    workspacePath: application.workspacePath,
     invocationId: trustedInvocationId,
     toolCallId: undefined,
+    attributes: {
+      tenantId: `${runId}-wrong-tenant`,
+      environmentId: application.environmentId,
+      marker: `${runId}-binding-mismatch`,
+    },
   });
   const mismatchAccepted = await ingestSemantic(application, mismatchInput, 'otel');
   const { event: mismatchStored } = await waitForEvent(mismatchAccepted.eventId, (event) => Boolean(correlationOf(event)));
@@ -482,6 +549,10 @@ async function verifyRejectedClaims(application, trustedInvocationId) {
     'binding mismatch rejects only the claim and keeps the event',
     mismatchStored.invocationId === undefined &&
       !['application_trace', 'agent_adapter'].includes(correlationOf(mismatchStored)?.method) &&
+      mismatchStored.logicalIdentityAuthority !== 'management_registration' &&
+      mismatchStored.sessionIdentityQuality !== 'confirmed' &&
+      mismatchStored.sessionIdSource !== 'provider' &&
+      mismatchStored.runIdSource === 'derived_ephemeral' &&
       Boolean(mismatchReceipt) &&
       mismatchReceipt.reason !== 'authorized',
     mismatchStored,
@@ -646,7 +717,7 @@ async function verifyOtlpRawClaimBoundary(application) {
 
   const workspacePrefix = `/workspace/${'w'.repeat(489)}`;
   const workspaceRaw = `${workspacePrefix}different-after-the-legacy-limit`;
-  const workspaceSourceResult = await request('/sources', 'POST', {
+  const workspaceSourceResult = await createTrackedSource({
     name: `${runId} OTLP item workspace boundary`,
     type: 'otel',
     enabled: true,
@@ -710,7 +781,7 @@ async function verifyOtlpRawClaimBoundary(application) {
 async function verifyGenericCwdRawClaimBoundary(application) {
   const workspacePrefix = `/workspace/${'g'.repeat(489)}`;
   const workspaceRaw = `${workspacePrefix}different-after-the-legacy-limit`;
-  const sourceResult = await request('/sources', 'POST', {
+  const sourceResult = await createTrackedSource({
     name: `${runId} generic cwd workspace boundary`,
     type: 'otel',
     enabled: true,
@@ -766,7 +837,7 @@ async function verifyGenericCwdRawClaimBoundary(application) {
 
   const collectorPrefix = `collector-${'c'.repeat(170)}`;
   const collectorRaw = `${collectorPrefix}different-after-the-legacy-limit`;
-  const collectorSourceResult = await request('/sources', 'POST', {
+  const collectorSourceResult = await createTrackedSource({
     name: `${runId} generic late collector boundary`,
     type: 'otel',
     enabled: true,
@@ -878,7 +949,7 @@ async function verifyNormalizedAttributeKeyRawBoundary(application) {
   const canonicalTenantId = 'sk-[redacted]';
   const rawTenantId = `sk-${'z'.repeat(32)}-${runId}`;
   const workspacePath = `/workspace/${runId}/normalized-attribute-key`;
-  const sourceResult = await request('/sources', 'POST', {
+  const sourceResult = await createTrackedSource({
     name: `${runId} normalized attribute key boundary`,
     type: 'otel',
     enabled: true,
@@ -964,7 +1035,7 @@ async function verifyNormalizedAttributeKeyRawBoundary(application) {
   );
   assertApplicationClaimRejected('raw OTLP value behind a normalized attribute key', otlpEvent);
 
-  const lateSourceResult = await request('/sources', 'POST', {
+  const lateSourceResult = await createTrackedSource({
     name: `${runId} late OTLP attribute boundary`,
     type: 'otel',
     enabled: true,
@@ -1016,7 +1087,7 @@ async function verifyNormalizedAttributeKeyRawBoundary(application) {
   );
   assertApplicationClaimRejected('late raw OTLP claim behind a normalized attribute key', lateEvent);
 
-  const typedSourceResult = await request('/sources', 'POST', {
+  const typedSourceResult = await createTrackedSource({
     name: `${runId} typed OTLP identity boundary`,
     type: 'otel',
     enabled: true,
@@ -1179,7 +1250,7 @@ async function verifyObserverCwdRawClaimBoundary(application) {
   const workspacePrefix = `/workspace/${'o'.repeat(489)}`;
   const workspaceRaw = `${workspacePrefix}different-after-the-legacy-limit`;
   const collectorId = `${runId}-cwd-bound-observer`;
-  const sourceResult = await request('/sources', 'POST', {
+  const sourceResult = await createTrackedSource({
     name: `${runId} observer cwd workspace boundary`,
     type: 'observer',
     enabled: true,
@@ -1549,4 +1620,5 @@ async function verifyShadowMode() {
 if (expectedMode === 'off') await verifyOffMode();
 else await verifyShadowMode();
 
+await disableCreatedSources();
 console.log(`S2 trusted-correlation API contract verification passed (mode=${expectedMode})`);

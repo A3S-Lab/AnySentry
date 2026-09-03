@@ -11,6 +11,27 @@ const baseUrl = (
 ).replace(/\/$/u, '');
 const runId = safeProbeId('s6-tool');
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
+const createdSourceIds = new Set();
+let sourceCleanupFinished = false;
+
+async function disableCreatedSources() {
+  if (sourceCleanupFinished) return;
+  sourceCleanupFinished = true;
+  for (const sourceId of createdSourceIds) {
+    await request(`/sources/${encodeURIComponent(sourceId)}`, 'PUT', { enabled: false }).catch(() => undefined);
+  }
+}
+
+// Keep verifier-created managed Sources disabled even when an assertion or request fails. The
+// cleanup path deliberately never prints source tokens or response bodies.
+const cleanupOnFailure = (error) => {
+  void disableCreatedSources().finally(() => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+};
+process.once('uncaughtException', cleanupOnFailure);
+process.once('unhandledRejection', cleanupOnFailure);
 
 async function request(path, method = 'GET', body, headers = {}) {
   const response = await fetch(`${baseUrl}${path}`, {
@@ -41,6 +62,7 @@ async function createSource({ name, type, collectorId, workspacePath, authority,
     tags: [runId, 's6', 'tool-evidence'],
     correlationClaims: { enabled: true, authority, bindings },
   });
+  if (result.source?.sourceId) createdSourceIds.add(result.source.sourceId);
   assert(result.source?.sourceId && result.token, 'managed Source returns id and token');
   return result;
 }
@@ -57,6 +79,7 @@ const workspacePath = `/workspace/${runId}`;
 const tenantId = `${runId}-tenant`;
 const environmentId = `${runId}-environment`;
 const invocationId = `${runId}-invocation`;
+const metadataOnlyInvocationId = `${runId}-metadata-only-invocation`;
 const adapterTraceId = sha256(invocationId).slice(0, 32);
 const piProcess = {
   hostId: `${runId}-host`,
@@ -142,7 +165,7 @@ function adapterToolEvent({ toolCallId, toolName, phase, at, resourcePath, comma
 
 const writePath = `${workspacePath}/output.txt`;
 const readPath = `${workspacePath}/input.txt`;
-const command = `OPENAI_API_KEY=sk-s6-secret-value printf safe >> ${writePath}`;
+const command = `OPENAI_API_KEY=fixture-placeholder printf safe >> ${writePath}`;
 const tools = [
   { toolCallId: `${runId}-read`, toolName: 'read', resourcePath: readPath, start: now + 10, end: now + 20 },
   { toolCallId: `${runId}-write`, toolName: 'write', resourcePath: writePath, start: now + 30, end: now + 60 },
@@ -193,6 +216,51 @@ assert(adapterIngest.items.every((item) => item.traceId === adapterTraceId), 'le
 assert(adapterIngest.items.every((item) => item.invocationId === invocationId),
   'authenticated Pi Invocation and read/write/bash/custom spans preserve one invocationId');
 
+// Metadata-only AgentTool lifecycle records are valid: the semantic IDs may be present entirely in
+// the envelope/attributes while content/data/raw are absent.  This guards the controller's digest
+// boundary against JSON.stringify(undefined) turning a legitimate event into HTTP 500.
+const metadataOnlyTool = {
+  id: `${runId}-metadata-only-tool`,
+  at: now + 150,
+  eventKind: 'AgentTool',
+  eventCategory: 'tool',
+  activityContext: 'agent_action',
+  workspacePath,
+  agentId: 'pi-coding-agent',
+  sessionId: `${runId}-session`,
+  sessionIdSource: 'provider',
+  providerSessionId: `${runId}-provider-session`,
+  invocationId: metadataOnlyInvocationId,
+  toolCallId: `${runId}-metadata-only-call`,
+  traceId: adapterTraceId,
+  runId: metadataOnlyInvocationId,
+  pid: piProcess.pid,
+  cwd: workspacePath,
+  attributes: {
+    'anysentry.adapter.schema': 'anysentry.agent_adapter_event.v1',
+    'anysentry.adapter.runtime': 'pi',
+    'anysentry.lifecycle.phase': 'start',
+    'gen_ai.operation.name': 'execute_tool',
+    'gen_ai.tool.name': 'metadata_only',
+    tenantId,
+    environmentId,
+    pid: piProcess.pid,
+    startTimeTicks: piProcess.startTimeTicks,
+    hostId: piProcess.hostId,
+    bootId: piProcess.bootId,
+    cgroup: piProcess.cgroup,
+  },
+};
+const metadataOnlyIngest = await request('/ingest/events', 'POST', {
+  sourceId: adapterSource.source.sourceId,
+  sourceType: 'custom',
+  workspacePath,
+  events: [metadataOnlyTool],
+}, sourceHeaders(adapterSource));
+assert.equal(metadataOnlyIngest.acceptedEvents, 1, 'metadata-only AgentTool remains accepted');
+assert.equal(metadataOnlyIngest.items[0].invocationId, metadataOnlyInvocationId,
+  'metadata-only AgentTool preserves its authenticated invocation identity');
+
 const adapterReplay = await request('/ingest/events', 'POST', {
   sourceId: adapterSource.source.sourceId,
   sourceType: 'custom',
@@ -238,7 +306,7 @@ function observerAttribution() {
   };
 }
 
-async function ingestObserverEvent({ id, at, kind, process, inner }) {
+async function ingestObserverEvent({ id, at, kind, process, inner, workspace = workspacePath }) {
   const line = JSON.stringify({
     identity: { agent: 'pi', session: `${runId}-runtime`, task: process.pid },
     process,
@@ -250,7 +318,7 @@ async function ingestObserverEvent({ id, at, kind, process, inner }) {
     collectorId,
     nodeName: `${runId}-node`,
     sourceType: 'observer',
-    workspacePath,
+    workspacePath: workspace,
     process,
     attribution: observerAttribution(),
   }, sourceHeaders(observerSource));
@@ -263,7 +331,7 @@ await ingestObserverEvent({
   at: now + 45,
   kind: 'FileAccess',
   process: piProcess,
-  inner: { pid: piProcess.pid, uid: 1000, cwd: workspacePath, path: writePath },
+  inner: { pid: piProcess.pid, uid: 1000, cwd: workspacePath, path: writePath, write: true },
 });
 const childProcess = {
   ...piProcess,
@@ -431,12 +499,19 @@ const otlpIngest = await request('/ingest/otlp/v1/traces', 'POST', {
 assert.equal(otlpIngest.acceptedEvents, 2, 'standard invoke_agent and execute_tool spans are accepted');
 assert(otlpIngest.items.every((item) => item.traceId === otlpTraceId), 'OTLP traceId remains independent and unchanged');
 
+// The Observer Source is workspace-bound by design. Rebind this synthetic source before the
+// second workspace fixture so the test exercises an explicit deployment transition rather than a
+// token/workspace mismatch rejection.
+await request(`/sources/${encodeURIComponent(observerSource.source.sourceId)}`, 'PUT', {
+  workspacePath: otlpWorkspace,
+});
 await ingestObserverEvent({
   id: `${runId}-kernel-otlp-write`,
   at: otlpStart + 50,
   kind: 'FileAccess',
   process: piProcess,
-  inner: { pid: piProcess.pid, uid: 1000, cwd: otlpWorkspace, path: otlpPath },
+  workspace: otlpWorkspace,
+  inner: { pid: piProcess.pid, uid: 1000, cwd: otlpWorkspace, path: otlpPath, write: true },
 });
 const otlpEvidence = await request('/events/tool-evidence', 'POST', {
   timeType: 'last_30d',
@@ -460,4 +535,5 @@ assert.equal(otlpToolEvent.items[0].eventCategory, 'tool');
 assert.equal(otlpToolEvent.items[0].traceId, otlpTraceId);
 assert.equal(otlpToolEvent.items[0].attributes['gen_ai.tool.call.arguments'], '[redacted]');
 
+await disableCreatedSources();
 console.log('S6 trusted Tool evidence API E2E passed');

@@ -82,6 +82,18 @@ function interaction({
   completeness = 'complete',
   partialReasons = [],
   conversationCompleteness,
+  logicalAgentId,
+  logicalDefinitionId,
+  logicalScopeMode,
+  logicalIdentityAuthority,
+  tenantId,
+  ownerId,
+  profile,
+  profileVersion,
+  deploymentId,
+  deploymentRevision,
+  environmentId,
+  sessionLifecycle,
 }) {
   const messages = (request.input ?? request.messages ?? []).map((item) => ({
     role: item.role ?? item.type ?? 'input',
@@ -99,6 +111,18 @@ function interaction({
     agentInstanceId: instance,
     agentProduct,
     providerConversationId,
+    ...(logicalAgentId ? { logicalAgentId } : {}),
+    ...(logicalDefinitionId ? { logicalDefinitionId } : {}),
+    ...(logicalScopeMode ? { logicalScopeMode } : {}),
+    ...(logicalIdentityAuthority ? { logicalIdentityAuthority } : {}),
+    ...(tenantId ? { tenantId } : {}),
+    ...(ownerId ? { ownerId } : {}),
+    ...(profile ? { profile } : {}),
+    ...(profileVersion ? { profileVersion } : {}),
+    ...(deploymentId ? { deploymentId } : {}),
+    ...(deploymentRevision ? { deploymentRevision } : {}),
+    ...(environmentId ? { environmentId } : {}),
+    ...(sessionLifecycle ? { sessionLifecycle } : {}),
     providerResponseId: responseId,
     providerPreviousResponseId: previousResponseId,
     trafficRole,
@@ -354,6 +378,39 @@ assert.equal(projection.summaries[0].toolResultCount, 1);
 assert.equal(projection.summaries[0].errorCount, 0);
 assert.equal(projection.summaries[0].coverage.status, 'complete',
   'a later matching tool result must complete a tool_pending model Interaction');
+
+// A native provider Conversation ID is only unique inside its logical definition/tenant scope.
+// The projection must split a reused raw ID instead of silently merging the two applications.
+const collisionA = {
+  ...interaction({
+    id: 'mi_v2_collision_a', at: base + 5_000, instance: 'host-root:collision:a',
+    conversationId: 'cv_reused_provider_id', providerConversationId: 'provider-reused',
+    responseId: 'resp-collision-a', workspacePath: '/workspace/collision-a',
+    request: { messages: [human('collision-a', 'turn-a', 'collision A')] },
+  }),
+  logicalAgentId: 'la-collision-a', logicalDefinitionId: 'definition-a',
+  logicalScopeMode: 'registered_definition', tenantId: 'tenant-a',
+};
+const collisionB = {
+  ...interaction({
+    id: 'mi_v2_collision_b', at: base + 5_001, instance: 'host-root:collision:b',
+    conversationId: 'cv_reused_provider_id', providerConversationId: 'provider-reused',
+    responseId: 'resp-collision-b', workspacePath: '/workspace/collision-b',
+    request: { messages: [human('collision-b', 'turn-b', 'collision B')] },
+  }),
+  logicalAgentId: 'la-collision-b', logicalDefinitionId: 'definition-b',
+  logicalScopeMode: 'registered_definition', tenantId: 'tenant-b',
+};
+const collisionProjection = projectAgentConversations(
+  [collisionA, collisionB], [], { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(collisionProjection.summaries.length, 2,
+  'reused provider IDs across definitions must produce separate conversations');
+assert.equal(new Set(collisionProjection.summaries.map((item) => item.conversationId)).size, 2);
+assert.deepEqual(
+  collisionProjection.summaries.map((item) => item.logicalAgentId).sort(),
+  ['la-collision-a', 'la-collision-b'],
+);
 
 const timeline = projectSemanticConversationTimeline(
   projection.summaries[0],
@@ -1015,5 +1072,108 @@ for (const [product, workspace, conversationId] of [
     }),
   ], product + ' conversation/thread identity must remain distinct from execution Run identity');
 }
+
+const serviceResumeRecords = [
+  interaction({
+    id: 'mi_v2_service_resume_old', at: base + 8_000, instance: 'service-generation-one',
+    agentProduct: 'LangGraph', workspacePath: '/workspace/service-resume',
+    providerConversationId: 'service-thread-resume', responseId: 'service-response-one',
+    request: { model: 'service-model', messages: [{ role: 'user', content: 'first service turn' }] },
+    logicalAgentId: 'la-service-resume', logicalDefinitionId: 'graph-definition',
+    logicalScopeMode: 'service_definition', logicalIdentityAuthority: 'management_registration',
+    tenantId: 'tenant-service', ownerId: 'owner-service', profile: 'test', profileVersion: 'v1',
+    deploymentId: 'deployment-one', deploymentRevision: 'r1', environmentId: 'env-test',
+    sessionLifecycle: 'new',
+  }),
+  interaction({
+    id: 'mi_v2_service_resume_new', at: base + 8_100, instance: 'service-generation-two',
+    agentProduct: 'LangGraph', workspacePath: '/workspace/service-resume',
+    providerConversationId: 'service-thread-resume', previousResponseId: 'service-response-one',
+    responseId: 'service-response-two',
+    request: { model: 'service-model', messages: [{ role: 'user', content: 'second service turn' }] },
+    logicalAgentId: 'la-service-resume', logicalDefinitionId: 'graph-definition',
+    logicalScopeMode: 'service_definition', logicalIdentityAuthority: 'management_registration',
+    tenantId: 'tenant-service', ownerId: 'owner-service', profile: 'production', profileVersion: 'v2',
+    deploymentId: 'deployment-two', deploymentRevision: 'r2', environmentId: 'env-prod',
+    sessionLifecycle: 'resume',
+  }),
+];
+const serviceResumeResolution = resolveAgentConversationsV2(serviceResumeRecords);
+assert.equal(new Set(serviceResumeResolution.conversationRecords.map((item) => item.conversationId)).size, 1,
+  'an explicit service resume may bridge deployment generations for one provider Session');
+
+const workflowDeploymentRecords = serviceResumeRecords.map((record, index) => ({
+  ...record,
+  interactionId: `mi_v2_workflow_deployment_${index}`,
+  logicalAgentId: 'la-workflow-fence',
+  logicalDefinitionId: 'workflow-definition',
+  logicalScopeMode: 'workflow_definition',
+  providerConversationId: 'workflow-thread-same-native-id',
+  sessionLifecycle: index === 0 ? 'new' : undefined,
+  deploymentId: index === 0 ? 'workflow-test' : 'workflow-prod',
+  deploymentRevision: index === 0 ? 'r1' : 'r2',
+  profile: index === 0 ? 'test' : 'production',
+}));
+const workflowDeploymentResolution = resolveAgentConversationsV2(workflowDeploymentRecords);
+assert.equal(new Set(workflowDeploymentResolution.conversationRecords.map((item) => item.conversationId)).size, 2,
+  'workflow test/prod deployment fences do not merge by a reused native Session ID');
+
+// A stateless service may repeat a provider/native conversation label (or a stale legacy
+// conversationId) on every POST. Each request remains a separate canonical Session/Conversation
+// unless an explicit producer Run/canonical Session proves that several exchanges belong together.
+const perRequestRecords = [
+  {
+    ...interaction({
+      id: 'mi_v2_per_request_a', at: base + 9_000, instance: 'service-request-a',
+      agentProduct: 'LangChain', workspacePath: '/workspace/stateless-service',
+      providerConversationId: 'native-same-provider-label', conversationId: 'legacy-reused-conversation',
+      request: { model: 'service-model', messages: [{ role: 'user', content: 'request a' }] },
+      responseId: 'per-request-a',
+    }),
+    sessionMode: 'per_request',
+    sessionIdentityQuality: 'ephemeral',
+    sessionIdSource: 'per_request',
+  },
+  {
+    ...interaction({
+      id: 'mi_v2_per_request_b', at: base + 9_100, instance: 'service-request-b',
+      agentProduct: 'LangChain', workspacePath: '/workspace/stateless-service',
+      providerConversationId: 'native-same-provider-label', conversationId: 'legacy-reused-conversation',
+      request: { model: 'service-model', messages: [{ role: 'user', content: 'request b' }] },
+      responseId: 'per-request-b',
+    }),
+    sessionMode: 'per_request',
+    sessionIdentityQuality: 'ephemeral',
+    sessionIdSource: 'per_request',
+  },
+];
+const perRequestResolution = resolveAgentConversationsV2(perRequestRecords);
+assert.equal(new Set(perRequestResolution.conversationRecords.map((item) => item.conversationId)).size, 2,
+  'stateless POSTs with a reused provider/legacy conversation label must remain separate');
+assert.equal(new Set(perRequestResolution.memberships.map((item) => item.canonicalConversationId)).size, 2);
+assert.equal(
+  perRequestResolution.aliases.filter((item) => item.aliasConversationId === 'legacy-reused-conversation').length,
+  0,
+  'a reused legacy route with competing per-request targets must not redirect to an arbitrary Conversation',
+);
+assert.deepEqual(perRequestResolution.aliasConflicts, ['legacy-reused-conversation']);
+const perRequestLegacyProjection = projectAgentConversations(
+  perRequestResolution.records,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(perRequestLegacyProjection.summaries.length, 2,
+  'legacy conversation projection must preserve per-request isolation too');
+const unknownProviderRecords = perRequestRecords.map((record, index) => ({
+  ...record,
+  interactionId: `mi_v2_unknown_provider_${index}`,
+  sessionMode: 'conversation',
+  sessionIdentityQuality: 'unknown',
+  sessionIdSource: 'unresolved',
+  canonicalSessionId: undefined,
+}));
+const unknownProviderResolution = resolveAgentConversationsV2(unknownProviderRecords);
+assert.equal(new Set(unknownProviderResolution.conversationRecords.map((item) => item.conversationId)).size, 2,
+  'an unknown provider anchor without a session key must not merge stateless requests');
 
 console.log('Agent Conversation Resolver V2 verification passed');

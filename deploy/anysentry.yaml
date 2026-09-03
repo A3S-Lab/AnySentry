@@ -358,6 +358,15 @@ spec:
             # same generated secret so an optional legacy envFrom Secret cannot shadow bootstrap.
             - name: ANYSENTRY_ADMIN_TOKEN
               valueFrom: { secretKeyRef: { name: anysentry-control-auth, key: management-token } }
+            # Dedicated HMAC material for canonical Session IDs. It is intentionally a different
+            # Secret key from management-token; when absent, the API uses an ephemeral local key
+            # and reports that cross-restart Session continuity is unavailable.
+            - name: ANYSENTRY_SESSION_HASH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: anysentry-control-auth
+                  key: session-hash-secret
+                  optional: true
             # Bundled ClickHouse (namespace-local Service DNS). Point this at an external server to
             # use your own ClickHouse instead — then delete the ClickHouse objects above.
             - { name: CLICKHOUSE_URL, value: "http://clickhouse:8123" }

@@ -312,9 +312,11 @@ function resourceOperationCompatible(claim: ToolClaim, candidate: EvidenceCandid
   if (isDelete) return false;
   if (!isRead && !isWrite) return true;
   const mode = candidate.fileAccessMode;
-  if (isRead) return mode === 'read_only' || (mode === undefined && candidate.event.attributes.write === false);
-  return mode === 'write_only' || mode === 'read_write'
-    || (mode === undefined && candidate.event.attributes.write === true);
+  // An older Observer ABI may omit the read/write bit. Same process + exact resource is still a
+  // useful Kernel match in that case; the emitted confidence is lowered below rather than dropping
+  // the machine fact and falsely reporting a coverage hole.
+  if (isRead) return mode === 'read_only' || mode === undefined;
+  return mode === 'write_only' || mode === 'read_write' || mode === undefined;
 }
 
 function matchMethod(claim: ToolClaim, candidate: EvidenceCandidate): ToolEvidenceLinkMethod | undefined {
@@ -446,7 +448,9 @@ export function buildToolEvidenceBundle(events: JudgedEvent[]): ToolEvidenceBund
           eventKind: candidate.event.eventKind,
           at: candidate.event.at,
           linkMethod: owner.method,
-          confidence: owner.method === 'same_process_resource' ? 1 : 0.98,
+          confidence: owner.method === 'same_process_resource'
+            ? candidate.fileAccessMode ? 1 : 0.85
+            : 0.98,
         });
         linked.set(owner.claim.key, refs);
       }

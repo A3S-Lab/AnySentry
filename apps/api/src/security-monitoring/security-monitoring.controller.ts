@@ -1,4 +1,4 @@
-import { BadRequestException, Body, ConflictException, Controller, Get, Header, Headers, HttpCode, NotFoundException, Param, PayloadTooLargeException, Post, Put, Query, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, Get, Header, Headers, HttpCode, NotFoundException, OnModuleDestroy, Optional, Param, PayloadTooLargeException, Post, Put, Query, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { Observable, exhaustMap, map, mergeMap, timer } from 'rxjs';
@@ -52,6 +52,12 @@ import type { UnknownLearnedAction, UnknownPolicyStage } from './unknown-learnin
 import { InfrastructureRuleError, InfrastructureRuleService } from './infrastructure-rule.service';
 import { ObservedAssetLifecycleService } from './observed-asset-lifecycle.read.service';
 import { parseObserverAgentInteraction } from './agent-interaction';
+import { AgentConversationBindingService } from './agent-conversation-binding.service';
+import { CanonicalObservabilityService } from './canonical-observability.service';
+import { CANONICAL_SESSION_ID_ALGORITHM_V1, SESSION_KEY_ALGORITHM_V1, SESSION_HASH_SECRET_MODE, canonicalParentSessionIdForMembership, canonicalSessionIdForMembership, createEvidenceLink, deriveAgentInstanceIdentity, deriveProcessGenerationKey, resolveSessionIdentity } from './canonical-observability';
+import { agentRuntimeInstanceIdForEvent } from './agent-identity';
+import type { EvidenceLink, SemanticRecord } from './canonical-observability';
+import { canonicalEvidenceLinksForRelations as buildCanonicalEvidenceLinks } from './agent-semantic-kernel-relation';
 import type { UnknownInfrastructureDraftRequest } from './infrastructure-rule.types';
 import {
   bindServerTrustedCorrelationContext,
@@ -97,15 +103,31 @@ const OBSERVER_BATCH_CONTROL_YIELD_EVERY = 32;
 const OBSERVER_BATCH_ID_MAX_LENGTH = 200;
 const OBSERVER_BATCH_DIGEST = /^[a-f0-9]{64}$/u;
 const OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE = 'anysentry.observer.source_payload_sha256';
+const CANONICAL_REVISION_MAX = 1_000_000;
+
+function boundedCanonicalRevision(value: unknown, fallback = 1): number {
+  const numeric = typeof value === 'number' ? value : Number(value);
+  return Number.isSafeInteger(numeric) && numeric >= 1
+    ? Math.min(CANONICAL_REVISION_MAX, numeric)
+    : fallback;
+}
 const OBSERVER_BATCH_ID_DIGEST_CACHE_SIZE = 10_000;
-const observerBatchIdDigests = new Map<string, string>();
+const OBSERVER_BATCH_ID_DIGEST_CACHE_BYTES = 2 * 1024 * 1024;
+const OBSERVER_INGRESS_CACHE_TTL_MS = 15 * 60_000;
+const observerBatchIdDigests = new Map<string, { digest: string; expiresAt: number; bytes: number }>();
+let observerBatchIdDigestBytes = 0;
+let observerBatchIdDigestEvicted = 0;
+let observerBatchIdDigestExpired = 0;
 const OBSERVER_BATCH_RESULT_CACHE_SIZE = 512;
 const OBSERVER_BATCH_RESULT_CACHE_BYTES = 16 * 1024 * 1024;
 const observerBatchResults = new Map<string, {
   digest: string;
   result: T.ObserverBatchIngestResult;
   bytes: number;
+  expiresAt: number;
 }>();
+let observerBatchResultEvicted = 0;
+let observerBatchResultExpired = 0;
 
 function yieldObserverBatchControl(index: number): Promise<void> | undefined {
   if (index === 0 || index % OBSERVER_BATCH_CONTROL_YIELD_EVERY !== 0) return undefined;
@@ -116,7 +138,17 @@ const UNIVERSAL_EVENT_IDEMPOTENCY_CACHE_SIZE = 20_000;
 const universalEventIdempotency = new Map<string, {
   digest: string;
   item: T.UniversalIngestResultItem;
+  bytes: number;
+  expiresAt: number;
 }>();
+let universalEventIdempotencyBytes = 0;
+let universalEventIdempotencyEvicted = 0;
+let universalEventIdempotencyExpired = 0;
+// A compatibility EventMeta still requires a sessionId even when an Observer line has no
+// provider/session anchor.  Keep that fallback unique per request boundary; hashing only the line
+// would incorrectly merge two stateless POSTs carrying the same payload.  Producer event IDs and
+// interaction IDs remain deterministic when present, so retries can still replay the same identity.
+let ephemeralMetaSequence = 0;
 
 function isClickHouseEventBufferFull(error: unknown): boolean {
   return Boolean(
@@ -138,30 +170,141 @@ function isEventRevisionConflict(error: unknown): boolean {
   );
 }
 
-function observerBatchPayload(events: readonly IngestBody[]): { json: string; bytes: number; digest: string } {
+const DIGEST_SECRET_KEY = /(?:token|authorization|cookie|password|secret|credential|api[_-]?key|access[_-]?key|refresh[_-]?token|private[_-]?key)/iu;
+const DIGEST_CONTENT_KEY = /(?:^|[_-])(?:body|prompt|content|messages?|input|output|response|result|data)(?:$|[_-])/iu;
+
+function digestSafeText(value: string): string {
+  return value
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/giu, '$1[REDACTED]')
+    .replace(/((?:token|authorization|cookie|password|secret|api[_-]?key|credential)\s*[:=]\s*)[^\s,;}]+/giu, '$1[REDACTED]')
+    .replace(/\b(?:sk|pk|key|token)-[A-Za-z0-9_-]{8,}\b/gu, '[REDACTED]');
+}
+
+/**
+ * Build a deterministic idempotency projection without hashing credentials or transcript bodies.
+ * The wire payload itself is still validated/forwarded through the existing bounded path; this
+ * projection is used only for cache keys and persisted provenance digests.  Raw `line` values are
+ * parsed when possible so nested token/header fields cannot sneak into the digest.
+ */
+function digestSafeValue(value: unknown, key = '', depth = 0, redactContent = true): unknown {
+  if (depth > 8) return { type: 'depth_limited' };
+  if (DIGEST_SECRET_KEY.test(key)) {
+    return { type: 'redacted_secret', valueType: Array.isArray(value) ? 'array' : typeof value };
+  }
+  const normalizedKey = key.replace(/[A-Z]/gu, (letter) => `_${letter.toLowerCase()}`);
+  if (redactContent && DIGEST_CONTENT_KEY.test(normalizedKey)) {
+    const safeContent = digestSafeValue(value, 'value', depth + 1, false);
+    const serialized = JSON.stringify(safeContent);
+    return {
+      type: 'redacted_content',
+      valueType: Array.isArray(value) ? 'array' : typeof value,
+      bytes: typeof value === 'string' ? Buffer.byteLength(value, 'utf8') : undefined,
+      // Hash only the recursively secret-stripped representation. This preserves idempotency
+      // conflict detection for equal-length prompt/body changes without persisting plaintext or a
+      // credential-derived hash.
+      digest: createHash('sha256').update(serialized).digest('hex'),
+    };
+  }
+  if (typeof value === 'string' && key === 'line') {
+    try {
+      return digestSafeValue(JSON.parse(value), 'line_json', depth + 1, redactContent);
+    } catch {
+      const safeLine = digestSafeText(value);
+      return {
+        type: 'opaque_line',
+        bytes: Buffer.byteLength(value, 'utf8'),
+        digest: createHash('sha256').update(safeLine).digest('hex'),
+      };
+    }
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 512).map((item) => digestSafeValue(item, key, depth + 1, redactContent));
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .slice(0, 512)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([childKey, childValue]) => [childKey, digestSafeValue(childValue, childKey, depth + 1, redactContent)]));
+  }
+  if (typeof value === 'string' && value.length > 64 * 1024) {
+    return { type: 'bounded_string', bytes: Buffer.byteLength(value, 'utf8') };
+  }
+  if (typeof value === 'string') return digestSafeText(value);
+  return value;
+}
+
+function safePayloadDigest(value: unknown): string {
+  // JSON.stringify(undefined) returns undefined, which crypto.Hash.update rejects.  Empty
+  // semantic events are valid metadata-only observations (for example an AgentTool lifecycle
+  // marker with IDs in attributes); hash the same empty representation used by eventInner instead
+  // of turning a boundary omission into HTTP 500.
+  const serialized = JSON.stringify(digestSafeValue(value)) ?? '';
+  return createHash('sha256').update(serialized).digest('hex');
+}
+
+function observerBatchPayload(events: readonly IngestBody[]): { json: string; bytes: number; digest: string; safeDigest: string } {
   const json = JSON.stringify(events);
   return {
     json,
     bytes: Buffer.byteLength(json, 'utf8'),
     digest: createHash('sha256').update(json).digest('hex'),
+    safeDigest: safePayloadDigest(events),
   };
 }
 
+function purgeIngressCaches(now = Date.now()): void {
+  for (const [key, entry] of observerBatchIdDigests) {
+    if (entry.expiresAt > now) continue;
+    observerBatchIdDigests.delete(key);
+    observerBatchIdDigestBytes = Math.max(0, observerBatchIdDigestBytes - entry.bytes);
+    observerBatchIdDigestExpired += 1;
+  }
+  for (const [key, entry] of observerBatchResults) {
+    if (entry.expiresAt > now) continue;
+    observerBatchResults.delete(key);
+    observerBatchResultBytes = Math.max(0, observerBatchResultBytes - entry.bytes);
+    observerBatchResultExpired += 1;
+  }
+  for (const [key, entry] of universalEventIdempotency) {
+    if (entry.expiresAt > now) continue;
+    universalEventIdempotency.delete(key);
+    universalEventIdempotencyBytes = Math.max(0, universalEventIdempotencyBytes - entry.bytes);
+    universalEventIdempotencyExpired += 1;
+  }
+}
+
 function rememberObserverBatchDigest(batchId: string, digest: string): void {
+  purgeIngressCaches();
   const existing = observerBatchIdDigests.get(batchId);
-  if (existing && existing !== digest) {
+  if (existing && existing.digest !== digest) {
     throw new BadRequestException('observer batchId conflicts with a different payloadDigest');
   }
-  if (existing) observerBatchIdDigests.delete(batchId);
-  observerBatchIdDigests.set(batchId, digest);
-  while (observerBatchIdDigests.size > OBSERVER_BATCH_ID_DIGEST_CACHE_SIZE) {
+  if (existing) {
+    observerBatchIdDigests.delete(batchId);
+    observerBatchIdDigestBytes = Math.max(0, observerBatchIdDigestBytes - existing.bytes);
+  }
+  const bytes = Buffer.byteLength(batchId, 'utf8') + Buffer.byteLength(digest, 'utf8') + 64;
+  observerBatchIdDigests.set(batchId, {
+    digest,
+    bytes,
+    expiresAt: Date.now() + OBSERVER_INGRESS_CACHE_TTL_MS,
+  });
+  observerBatchIdDigestBytes += bytes;
+  while (
+    observerBatchIdDigests.size > OBSERVER_BATCH_ID_DIGEST_CACHE_SIZE
+    || observerBatchIdDigestBytes > OBSERVER_BATCH_ID_DIGEST_CACHE_BYTES
+  ) {
     const oldest = observerBatchIdDigests.keys().next().value as string | undefined;
     if (oldest === undefined) break;
+    const entry = observerBatchIdDigests.get(oldest);
     observerBatchIdDigests.delete(oldest);
+    observerBatchIdDigestBytes = Math.max(0, observerBatchIdDigestBytes - (entry?.bytes ?? 0));
+    observerBatchIdDigestEvicted += 1;
   }
 }
 
 function cachedObserverBatchResult(batchKey: string, digest: string): T.ObserverBatchIngestResult | undefined {
+  purgeIngressCaches();
   const cached = observerBatchResults.get(batchKey);
   if (!cached || cached.digest !== digest) return undefined;
   observerBatchResults.delete(batchKey);
@@ -174,6 +317,7 @@ function rememberObserverBatchResult(
   digest: string,
   result: T.ObserverBatchIngestResult,
 ): void {
+  purgeIngressCaches();
   const copy = structuredClone(result);
   const bytes = Buffer.byteLength(JSON.stringify(copy), 'utf8');
   if (bytes > OBSERVER_BATCH_RESULT_CACHE_BYTES) return;
@@ -182,7 +326,12 @@ function rememberObserverBatchResult(
     observerBatchResultBytes = Math.max(0, observerBatchResultBytes - previous.bytes);
     observerBatchResults.delete(batchKey);
   }
-  observerBatchResults.set(batchKey, { digest, result: copy, bytes });
+  observerBatchResults.set(batchKey, {
+    digest,
+    result: copy,
+    bytes,
+    expiresAt: Date.now() + OBSERVER_INGRESS_CACHE_TTL_MS,
+  });
   observerBatchResultBytes += bytes;
   while (
     observerBatchResults.size > OBSERVER_BATCH_RESULT_CACHE_SIZE
@@ -193,6 +342,7 @@ function rememberObserverBatchResult(
     const oldest = observerBatchResults.get(oldestKey);
     if (oldest) observerBatchResultBytes = Math.max(0, observerBatchResultBytes - oldest.bytes);
     observerBatchResults.delete(oldestKey);
+    observerBatchResultEvicted += 1;
   }
 }
 
@@ -200,6 +350,7 @@ function universalEventReplay(
   key: string,
   digest: string,
 ): { item?: T.UniversalIngestResultItem; conflict: boolean } | undefined {
+  purgeIngressCaches();
   const existing = universalEventIdempotency.get(key);
   if (!existing) return undefined;
   universalEventIdempotency.delete(key);
@@ -214,12 +365,37 @@ function rememberUniversalEvent(
   digest: string,
   item: T.UniversalIngestResultItem,
 ): void {
-  if (universalEventIdempotency.has(key)) universalEventIdempotency.delete(key);
-  universalEventIdempotency.set(key, { digest, item: structuredClone(item) });
+  purgeIngressCaches();
+  const previous = universalEventIdempotency.get(key);
+  if (previous) {
+    universalEventIdempotency.delete(key);
+    universalEventIdempotencyBytes = Math.max(0, universalEventIdempotencyBytes - previous.bytes);
+  }
+  const copy = structuredClone(item);
+  const bytes = Buffer.byteLength(key, 'utf8') + Buffer.byteLength(digest, 'utf8')
+    + Buffer.byteLength(JSON.stringify(copy), 'utf8') + 64;
+  universalEventIdempotency.set(key, {
+    digest,
+    item: copy,
+    bytes,
+    expiresAt: Date.now() + OBSERVER_INGRESS_CACHE_TTL_MS,
+  });
+  universalEventIdempotencyBytes += bytes;
   while (universalEventIdempotency.size > UNIVERSAL_EVENT_IDEMPOTENCY_CACHE_SIZE) {
     const oldest = universalEventIdempotency.keys().next().value as string | undefined;
     if (oldest === undefined) break;
+    const entry = universalEventIdempotency.get(oldest);
     universalEventIdempotency.delete(oldest);
+    universalEventIdempotencyBytes = Math.max(0, universalEventIdempotencyBytes - (entry?.bytes ?? 0));
+    universalEventIdempotencyEvicted += 1;
+  }
+  while (universalEventIdempotencyBytes > 8 * 1024 * 1024 && universalEventIdempotency.size > 0) {
+    const oldest = universalEventIdempotency.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    const entry = universalEventIdempotency.get(oldest);
+    universalEventIdempotency.delete(oldest);
+    universalEventIdempotencyBytes = Math.max(0, universalEventIdempotencyBytes - (entry?.bytes ?? 0));
+    universalEventIdempotencyEvicted += 1;
   }
 }
 
@@ -239,7 +415,50 @@ function forgetUniversalEventReservation(key: string, digest: string): void {
     current?.digest === digest
     && current.item.accepted === false
     && current.item.reasonCode === 'producer_event_in_flight'
-  ) universalEventIdempotency.delete(key);
+  ) {
+    universalEventIdempotency.delete(key);
+    universalEventIdempotencyBytes = Math.max(0, universalEventIdempotencyBytes - current.bytes);
+  }
+}
+
+function clearIngressCaches(): void {
+  observerBatchIdDigests.clear();
+  observerBatchResults.clear();
+  universalEventIdempotency.clear();
+  observerBatchIdDigestBytes = 0;
+  observerBatchResultBytes = 0;
+  universalEventIdempotencyBytes = 0;
+}
+
+function ingressCacheStats(): Record<string, unknown> {
+  purgeIngressCaches();
+  return {
+    ttlMs: OBSERVER_INGRESS_CACHE_TTL_MS,
+    observerBatchIdDigests: {
+      entries: observerBatchIdDigests.size,
+      bytes: observerBatchIdDigestBytes,
+      maxEntries: OBSERVER_BATCH_ID_DIGEST_CACHE_SIZE,
+      maxBytes: OBSERVER_BATCH_ID_DIGEST_CACHE_BYTES,
+      evicted: observerBatchIdDigestEvicted,
+      expired: observerBatchIdDigestExpired,
+    },
+    observerBatchResults: {
+      entries: observerBatchResults.size,
+      bytes: observerBatchResultBytes,
+      maxEntries: OBSERVER_BATCH_RESULT_CACHE_SIZE,
+      maxBytes: OBSERVER_BATCH_RESULT_CACHE_BYTES,
+      evicted: observerBatchResultEvicted,
+      expired: observerBatchResultExpired,
+    },
+    universalEventIdempotency: {
+      entries: universalEventIdempotency.size,
+      bytes: universalEventIdempotencyBytes,
+      maxEntries: UNIVERSAL_EVENT_IDEMPOTENCY_CACHE_SIZE,
+      maxBytes: 8 * 1024 * 1024,
+      evicted: universalEventIdempotencyEvicted,
+      expired: universalEventIdempotencyExpired,
+    },
+  };
 }
 
 function universalAcceptedResultItem(
@@ -307,6 +526,7 @@ const OBSERVER_BATCH_CONCURRENCY = Math.max(
   1,
   Math.min(64, Number.parseInt(process.env.ANYSENTRY_OBSERVER_BATCH_CONCURRENCY ?? '24', 10) || 24),
 );
+let universalCanonicalSequence = 0;
 
 async function mapWithConcurrency<T, R>(
   items: readonly T[],
@@ -329,6 +549,564 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
+function canonicalSemanticRecordsForInteraction(
+  interaction: T.AgentInteractionRecord,
+  authority: SemanticRecord['authority'] = 'inferred',
+): SemanticRecord[] {
+  const sourceRefs = [...new Set([
+    interaction.rawObservationId,
+    ...(interaction.sourceObservationIds ?? []),
+    interaction.interactionId,
+  ].filter((value): value is string => Boolean(value)))].slice(0, 128);
+  const derivedFrom = [...new Set([
+    interaction.rawObservationId,
+    interaction.interactionId,
+  ].filter((value): value is string => Boolean(value)))];
+  const completeness: SemanticRecord['completeness'] = interaction.completeness === 'complete'
+    ? 'complete'
+    : interaction.completeness === 'unsupported' ? 'unsupported'
+      : interaction.interactionType === 'unparsed' ? 'unparsed' : 'partial';
+  const records: SemanticRecord[] = [];
+  const semanticRevision = boundedCanonicalRevision(
+    interaction.semanticParserVersion ?? interaction.sessionResolutionRevision,
+  );
+  const id = (kind: string, suffix: string) => `sr_${createHash('sha256').update([
+    kind, interaction.interactionId, suffix,
+  ].join('\0')).digest('hex').slice(0, 24)}`;
+  const common = {
+    revision: semanticRevision,
+    resolutionRevision: boundedCanonicalRevision(interaction.sessionResolutionRevision),
+    authority,
+    sourceRefs,
+    derivedFrom,
+    parserId: interaction.semanticParserId ?? 'anysentry.agent-interaction',
+    parserVersion: String(interaction.semanticParserVersion ?? 1),
+    ...(interaction.logicalAgentId ? { logicalAgentId: interaction.logicalAgentId } : {}),
+    ...(interaction.canonicalAgentInstanceId
+      ? { agentInstanceId: interaction.canonicalAgentInstanceId }
+      : {}),
+    ...(interaction.runtimeInstanceId ?? interaction.agentInstanceId
+      ? { runtimeInstanceId: interaction.runtimeInstanceId ?? interaction.agentInstanceId }
+      : {}),
+    ...(interaction.sessionId ? { sessionId: interaction.sessionId } : {}),
+    ...(interaction.canonicalSessionId ? { canonicalSessionId: interaction.canonicalSessionId } : {}),
+    ...(interaction.sessionNamespaceKey ? { sessionNamespaceKey: interaction.sessionNamespaceKey } : {}),
+    ...(interaction.sessionKey ? { sessionKey: interaction.sessionKey } : {}),
+    ...(interaction.providerSessionIdHash ? { providerSessionIdHash: interaction.providerSessionIdHash } : {}),
+    ...(interaction.turnId ? { turnId: interaction.turnId } : {}),
+    ...(interaction.runId ? { runId: interaction.runId } : {}),
+    ...(interaction.sessionMode ? { sessionMode: interaction.sessionMode } : {}),
+    ...(interaction.sessionLifecycle ? { sessionLifecycle: interaction.sessionLifecycle } : {}),
+    ...(interaction.parentSessionId || interaction.canonicalParentSessionId
+      ? {
+          parentSessionId: interaction.canonicalParentSessionId
+            ?? canonicalParentSessionIdForMembership(
+              interaction.parentSessionId,
+              interaction.sessionNamespaceKey,
+            ),
+          canonicalParentSessionId: interaction.canonicalParentSessionId
+            ?? canonicalParentSessionIdForMembership(
+              interaction.parentSessionId,
+              interaction.sessionNamespaceKey,
+            ),
+        }
+      : {}),
+    ...(interaction.tenantId ? { tenantId: interaction.tenantId } : {}),
+    ...(interaction.ownerId ? { ownerId: interaction.ownerId } : {}),
+    ...(interaction.logicalDefinitionFingerprint ? { logicalDefinitionFingerprint: interaction.logicalDefinitionFingerprint } : {}),
+    ...(interaction.logicalScopeMode ? { logicalScopeMode: interaction.logicalScopeMode } : {}),
+    ...(interaction.logicalIdentityAuthority ? { logicalIdentityAuthority: interaction.logicalIdentityAuthority } : {}),
+    ...(interaction.profile ? { profile: interaction.profile } : {}),
+    ...(interaction.profileVersion ? { profileVersion: interaction.profileVersion } : {}),
+    ...(interaction.deploymentId ? { deploymentId: interaction.deploymentId } : {}),
+    ...(interaction.deploymentRevision ? { deploymentRevision: interaction.deploymentRevision } : {}),
+    ...(interaction.environmentId ? { environmentId: interaction.environmentId } : {}),
+    ...(interaction.terminalContextId ? { terminalContextId: interaction.terminalContextId } : {}),
+    completeness,
+    partialReasons: interaction.partialReasons.slice(0, 64),
+  };
+  if (interaction.interactionType === 'model') {
+    records.push({
+      schemaVersion: 'anysentry.semantic_record.v1',
+      semanticRecordId: id('llm_call', 'call'),
+      kind: 'llm_call',
+      observedAtUnixNs: interaction.startedAtUnixNs,
+      payloadRef: `sha256:${interaction.request.sha256}:${interaction.response.sha256}`,
+      ...common,
+    });
+  } else if (interaction.interactionType === 'unparsed') {
+    records.push({
+      schemaVersion: 'anysentry.semantic_record.v1',
+      semanticRecordId: id('runtime_activity', 'unparsed'),
+      kind: 'runtime_activity',
+      observedAtUnixNs: interaction.startedAtUnixNs,
+      payloadRef: `sha256:${interaction.request.sha256}:${interaction.response.sha256}`,
+      ...common,
+    });
+  }
+  const messages = [
+    ...(interaction.request.messages ?? []),
+    ...(interaction.response.messages ?? []),
+  ].slice(0, 512);
+  messages.forEach((message, index) => {
+    const role = message.role.toLowerCase();
+    const canonicalRole: SemanticRecord['role'] = role === 'assistant' || role === 'model'
+      ? 'model' : role === 'tool' || role === 'function' ? 'tool'
+        : role === 'system' || role === 'developer' ? 'system' : 'user';
+    records.push({
+      schemaVersion: 'anysentry.semantic_record.v1',
+      semanticRecordId: id('message', String(index)),
+      kind: 'message',
+      role: canonicalRole,
+      observedAtUnixNs: interaction.startedAtUnixNs,
+      payloadRef: `sha256:${createHash('sha256').update(JSON.stringify(message.content)).digest('hex')}`,
+      ...common,
+    });
+  });
+  interaction.toolCalls.slice(0, 256).forEach((call, index) => {
+    records.push({
+      schemaVersion: 'anysentry.semantic_record.v1',
+      semanticRecordId: id('tool_call', `${call.toolCallId}:${index}`),
+      kind: 'tool_call',
+      role: 'model',
+      toolCallId: call.toolCallId,
+      observedAtUnixNs: call.issuedAtUnixNs ?? interaction.startedAtUnixNs,
+      payloadRef: `sha256:${createHash('sha256').update(JSON.stringify(call.arguments)).digest('hex')}`,
+      ...common,
+    });
+  });
+  interaction.toolResults.slice(0, 256).forEach((result, index) => {
+    records.push({
+      schemaVersion: 'anysentry.semantic_record.v1',
+      semanticRecordId: id('tool_result', `${result.toolCallId}:${index}`),
+      kind: 'tool_result',
+      role: 'tool',
+      toolCallId: result.toolCallId,
+      observedAtUnixNs: result.observedAtUnixNs ?? interaction.endedAtUnixNs,
+      payloadRef: `sha256:${createHash('sha256').update(JSON.stringify(result.content)).digest('hex')}`,
+      ...common,
+    });
+  });
+  return records;
+}
+
+function canonicalSemanticRecordForEvent(
+  event: T.JudgedEvent,
+  authority: SemanticRecord['authority'],
+): SemanticRecord[] {
+  const sourceRefs = [...new Set([
+    event.rawObservationId,
+    event.eventId,
+    event.sourceEventId,
+  ].filter((value): value is string => Boolean(value)))].slice(0, 128);
+  const derivedFrom = [...new Set([
+    event.rawObservationId,
+    event.eventId,
+  ].filter((value): value is string => Boolean(value)))];
+  const normalizedKind = event.eventKind.trim().toLowerCase().replace(/[\s.-]+/gu, '_');
+  const kind: SemanticRecord['kind'] = event.eventKind === 'AgentTool'
+    || ['tool', 'tool_call', 'toolcall', 'function_call', 'functioncall'].includes(normalizedKind)
+    ? 'tool_call'
+    : event.eventKind === 'AgentInvocation'
+      || ['node', 'node_run', 'noderun', 'workflow_run', 'workflowrun', 'agent_run', 'agentrun'].includes(normalizedKind)
+      ? 'node_run'
+      : event.eventKind === 'LlmCall' || event.eventKind === 'LlmApi' || event.eventKind === 'LlmInteraction'
+        || ['llm', 'llm_call', 'llmcall', 'llm_response', 'llmresponse', 'model_response', 'modelresponse'].includes(normalizedKind)
+        ? 'llm_call'
+    : ['tool_result', 'toolresult', 'function_result', 'functionresult', 'agent_tool_result', 'agenttoolresult', 'node_result', 'noderesult'].includes(normalizedKind)
+      ? 'tool_result'
+      : ['user_message', 'usermessage', 'user_input', 'human_message', 'input_message'].includes(normalizedKind)
+        ? 'message'
+        : ['model_message', 'modelmessage', 'assistant_message', 'assistantmessage', 'assistant_output', 'final_response'].includes(normalizedKind)
+              ? 'message'
+              : 'runtime_activity';
+  const role: SemanticRecord['role'] = kind === 'tool_call' || kind === 'node_run'
+    ? 'model'
+    : kind === 'tool_result' ? 'tool'
+      : ['user_message', 'usermessage', 'user_input', 'human_message', 'input_message'].includes(normalizedKind)
+        ? 'user'
+        : ['model_message', 'modelmessage', 'assistant_message', 'assistantmessage', 'assistant_output', 'final_response'].includes(normalizedKind)
+          ? 'model' : undefined;
+  const observedAtUnixNs = event.eventAtUnixNs ?? String(BigInt(Math.max(1, event.at)) * 1_000_000n);
+  const adapterRevision = Number(event.attributes?.semanticParserVersion
+    ?? event.attributes?.['semantic.parser.version']);
+  const semanticRevision = boundedCanonicalRevision(
+    Number.isFinite(adapterRevision)
+      ? adapterRevision
+      : event.sessionResolutionRevision ?? event.identityRevision,
+  );
+  const payloadHash = createHash('sha256').update(JSON.stringify({
+    kind: event.eventKind,
+    subject: event.subject,
+    attributes: event.attributes,
+  })).digest('hex');
+  return [{
+    schemaVersion: 'anysentry.semantic_record.v1',
+    semanticRecordId: `sr_${createHash('sha256').update(`${event.eventId}\0${kind}`).digest('hex').slice(0, 24)}`,
+    revision: semanticRevision,
+    resolutionRevision: boundedCanonicalRevision(event.sessionResolutionRevision),
+    kind,
+    authority,
+    sourceRefs,
+    derivedFrom,
+    observedAtUnixNs,
+    ...(event.logicalAgentId ? { logicalAgentId: event.logicalAgentId } : {}),
+    ...(event.canonicalAgentInstanceId ? { agentInstanceId: event.canonicalAgentInstanceId } : {}),
+    ...(event.runtimeInstanceId ?? event.attribution?.agentInstanceId
+      ? { runtimeInstanceId: event.runtimeInstanceId ?? event.attribution?.agentInstanceId }
+      : {}),
+    ...(event.sessionId ? { sessionId: event.sessionId } : {}),
+    ...(event.canonicalSessionId ? { canonicalSessionId: event.canonicalSessionId } : {}),
+    ...(event.sessionNamespaceKey ? { sessionNamespaceKey: event.sessionNamespaceKey } : {}),
+    ...(event.sessionKey ? { sessionKey: event.sessionKey } : {}),
+    ...(event.providerSessionIdHash ? { providerSessionIdHash: event.providerSessionIdHash } : {}),
+    ...(event.runId ? { runId: event.runId } : {}),
+    ...(event.turnId ? { turnId: event.turnId } : {}),
+    ...(event.sessionMode ? { sessionMode: event.sessionMode } : {}),
+    ...(event.sessionLifecycle ? { sessionLifecycle: event.sessionLifecycle } : {}),
+    ...(event.parentSessionId || event.canonicalParentSessionId
+      ? {
+          parentSessionId: event.canonicalParentSessionId
+            ?? canonicalParentSessionIdForMembership(
+              event.parentSessionId,
+              event.sessionNamespaceKey,
+            ),
+          canonicalParentSessionId: event.canonicalParentSessionId
+            ?? canonicalParentSessionIdForMembership(
+              event.parentSessionId,
+              event.sessionNamespaceKey,
+            ),
+        }
+      : {}),
+    ...(event.toolCallId ? { toolCallId: event.toolCallId } : {}),
+    ...(event.tenantId ? { tenantId: event.tenantId } : {}),
+    ...(event.ownerId ? { ownerId: event.ownerId } : {}),
+    ...(event.logicalDefinitionFingerprint ? { logicalDefinitionFingerprint: event.logicalDefinitionFingerprint } : {}),
+    ...(event.logicalScopeMode ? { logicalScopeMode: event.logicalScopeMode } : {}),
+    ...(event.logicalIdentityAuthority ? { logicalIdentityAuthority: event.logicalIdentityAuthority } : {}),
+    ...(event.profile ? { profile: event.profile } : {}),
+    ...(event.profileVersion ? { profileVersion: event.profileVersion } : {}),
+    ...(event.deploymentId ? { deploymentId: event.deploymentId } : {}),
+    ...(event.deploymentRevision ? { deploymentRevision: event.deploymentRevision } : {}),
+    ...(event.environmentId ? { environmentId: event.environmentId } : {}),
+    ...(event.terminalContextId ? { terminalContextId: event.terminalContextId } : {}),
+    ...(role ? { role } : {}),
+    completeness: event.rawObservationId ? 'complete' : 'partial',
+    partialReasons: event.rawObservationId ? [] : ['raw_observation_missing'],
+    payloadRef: `sha256:${payloadHash}`,
+  }];
+}
+
+/**
+ * Compatibility projection for authenticated application/OTLP semantic events.  It carries only
+ * hash/reference content (never a copied prompt/body) so the existing Conversation/Turn/Run read
+ * model can consume the canonical semantic lane while the immutable JudgedEvent remains the fact
+ * of record.
+ */
+function canonicalInteractionForSemanticEvent(event: T.JudgedEvent): T.AgentInteractionRecord {
+  const normalizedKind = event.eventKind.trim().toLowerCase().replace(/[\s.-]+/gu, '_');
+  const atUnixNs = event.eventAtUnixNs
+    ?? (BigInt(Math.max(1, Math.trunc(event.at))) * 1_000_000n).toString();
+  const payloadDigest = createHash('sha256').update(JSON.stringify({
+    eventId: event.eventId,
+    eventKind: event.eventKind,
+    subject: event.subject,
+    attributes: event.attributes,
+  })).digest('hex');
+  const payloadRef = `sha256:${payloadDigest}`;
+  const contentMarker = {
+    schemaVersion: 'anysentry.semantic_reference.v1',
+    payloadRef,
+    contentState: 'reference_only',
+  };
+  const userMessage = normalizedKind === 'usermessage' || normalizedKind === 'user_message';
+  const modelMessage = ['modelmessage', 'model_message', 'llmresponse', 'llm_response', 'llmcall', 'llm_call']
+    .includes(normalizedKind);
+  const toolCallEvent = normalizedKind === 'agenttool' || normalizedKind === 'agent_tool'
+    || normalizedKind === 'toolcall' || normalizedKind === 'tool_call';
+  const toolResultEvent = normalizedKind === 'toolresult' || normalizedKind === 'tool_result';
+  const toolCallId = event.toolCallId
+    ?? (toolCallEvent || toolResultEvent
+      ? `tc_${createHash('sha256').update(event.eventId).digest('hex').slice(0, 24)}`
+      : undefined);
+  const toolName = typeof event.attributes.toolName === 'string'
+    ? event.attributes.toolName
+    : typeof event.attributes.name === 'string' ? event.attributes.name : 'application_tool';
+  const turnId = event.turnId ?? event.runId;
+  const message: T.AgentInteractionMessage | undefined = userMessage
+    ? {
+        role: 'user',
+        content: contentMarker,
+        sourceItemId: event.eventId,
+        turnId,
+        messageOrigin: 'human_input',
+      }
+    : modelMessage
+      ? {
+          role: 'assistant',
+          content: contentMarker,
+          sourceItemId: event.eventId,
+          turnId,
+        }
+      : toolResultEvent && toolCallId
+        ? {
+            role: 'tool',
+            content: contentMarker,
+            toolCallId,
+            sourceItemId: event.eventId,
+            turnId,
+            messageOrigin: 'tool_history',
+          }
+        : undefined;
+  const emptySha = createHash('sha256').update('').digest('hex');
+  const interactionContent = (messages: T.AgentInteractionMessage[]): T.AgentInteractionContent => ({
+    body: '',
+    encoding: 'utf8',
+    contentType: 'application/vnd.anysentry.semantic-reference+json',
+    capturedBytes: 0,
+    decodedBytes: 0,
+    sha256: emptySha,
+    completeness: 'reference_only',
+    ...(messages.length ? { messages } : {}),
+    structured: contentMarker,
+  });
+  const requestMessages = userMessage && message ? [message] : [];
+  const responseMessages = !userMessage && message ? [message] : [];
+  const canonicalSessionId = event.canonicalSessionId
+    ?? canonicalSessionIdForMembership(
+      event.sessionId ?? event.sessionKey ?? event.eventId,
+      event.sessionNamespaceKey,
+      event.eventId,
+    );
+  const conversationId = `cv_${createHash('sha256')
+    .update(`application-semantic\0${canonicalSessionId}`)
+    .digest('hex')
+    .slice(0, 24)}`;
+  const runtimeInstanceId = event.runtimeInstanceId ?? event.attribution?.agentInstanceId;
+  const agentAssetId = event.subjectAssetId
+    ?? `agent_${createHash('sha256').update([
+      event.logicalAgentId,
+      event.agentId,
+      event.workspacePath,
+    ].map((value) => value ?? '').join('\0')).digest('hex').slice(0, 24)}`;
+  const environment = event.attribution?.workloadRef?.environment;
+  const detectedClassification = event.attribution?.classification === 'confirmed_agent'
+    || event.attribution?.classification === 'probable_agent'
+    ? event.attribution.classification
+    : event.logicalAgentId && event.logicalIdentityAuthority === 'management_registration'
+      ? 'probable_agent'
+      : 'unknown';
+  const semanticActor: T.AgentInteractionSemanticActor = userMessage
+    ? 'user' : toolCallEvent || toolResultEvent ? 'tool' : 'model';
+  const semanticKind: T.AgentInteractionSemanticKind = userMessage
+    ? 'user_message'
+    : toolCallEvent ? 'tool_call'
+      : toolResultEvent ? 'tool_result'
+        : modelMessage ? 'model_final' : 'model_progress';
+  return {
+    schemaVersion: 'anysentry.agent_interaction.v1',
+    interactionId: `mi_${createHash('sha256').update(`application-semantic\0${event.eventId}`).digest('hex').slice(0, 24)}`,
+    interactionType: 'model',
+    semanticOnly: true,
+    at: event.at,
+    tenantId: event.tenantId,
+    ownerId: event.ownerId,
+    environmentId: event.environmentId,
+    profile: event.profile,
+    profileVersion: event.profileVersion,
+    deploymentId: event.deploymentId,
+    deploymentRevision: event.deploymentRevision,
+    workspacePath: event.workspacePath,
+    sourceId: event.sourceId,
+    collectorId: event.collectorId,
+    agentAssetId,
+    agentInstanceId: runtimeInstanceId,
+    canonicalAgentInstanceId: event.canonicalAgentInstanceId,
+    runtimeInstanceId,
+    agentProduct: event.agentId,
+    environment: environment === 'host' || environment === 'docker' || environment === 'kubernetes'
+      ? environment : 'unknown',
+    rawObservationId: event.rawObservationId,
+    sourceObservationIds: [event.rawObservationId, event.eventId]
+      .filter((value): value is string => Boolean(value)),
+    kernelFactId: event.kernelFactId,
+    logicalAgentId: event.logicalAgentId,
+    logicalAgentCandidateId: event.logicalAgentCandidateId,
+    logicalDefinitionId: event.logicalDefinitionId,
+    logicalScopeMode: event.logicalScopeMode,
+    logicalIdentityAuthority: event.logicalIdentityAuthority,
+    logicalDefinitionFingerprint: event.logicalDefinitionFingerprint,
+    terminalContextId: event.terminalContextId,
+    sessionIdentityQuality: event.sessionIdentityQuality,
+    sessionIdSource: event.sessionIdSource,
+    sessionMode: event.sessionMode,
+    sessionLifecycle: event.sessionLifecycle,
+    parentSessionId: event.parentSessionId,
+    canonicalParentSessionId: event.canonicalParentSessionId,
+    sessionResolutionRevision: event.sessionResolutionRevision,
+    traceId: event.traceId,
+    runId: event.runId,
+    runIdSource: event.runIdSource,
+    sessionId: event.sessionId,
+    sessionKey: event.sessionKey,
+    canonicalSessionId,
+    sessionNamespaceKey: event.sessionNamespaceKey,
+    providerSessionIdHash: event.providerSessionIdHash,
+    invocationId: event.invocationId,
+    providerConversationId: event.sessionIdSource === 'provider' ? event.sessionId : undefined,
+    trafficRole: 'conversation',
+    evidenceEventIds: [event.eventId],
+    conversationId,
+    conversationIdSource: event.sessionIdSource === 'provider' ? 'provider' : 'inferred',
+    conversationBindingVersion: 1,
+    turnId,
+    runtimeRole: 'agent_root',
+    correlationQuality: runtimeInstanceId ? 'strong' : 'inferred',
+    detectedClassification,
+    currentEffectiveClassification: detectedClassification,
+    process: event.process,
+    connectionId: typeof event.attributes.connectionId === 'string'
+      ? event.attributes.connectionId : `application:${event.eventId}`,
+    transport: 'http',
+    protocol: 'application-semantic',
+    transportProtocol: 'application-semantic',
+    wireTemplateId: 'canonical-semantic-record',
+    parseState: 'parsed',
+    llmLikelihood: modelMessage ? 'likely' : 'unknown',
+    transportCompleteness: 'partial',
+    wireCompleteness: 'unknown',
+    conversationCompleteness: 'partial',
+    endpoint: 'application://semantic-event',
+    method: 'EVENT',
+    path: `/${event.eventKind}`,
+    statusCode: 200,
+    model: typeof event.attributes.model === 'string' ? event.attributes.model : undefined,
+    startedAtUnixNs: atUnixNs,
+    requestCompleteAtUnixNs: atUnixNs,
+    firstResponseAtUnixNs: atUnixNs,
+    endedAtUnixNs: atUnixNs,
+    durationNs: '0',
+    timeQuality: event.eventTimeQuality ?? 'api_received',
+    request: interactionContent(requestMessages),
+    response: interactionContent(responseMessages),
+    toolCalls: toolCallEvent && toolCallId
+      ? [{ toolCallId, name: toolName, arguments: contentMarker, issuedAtUnixNs: atUnixNs }]
+      : [],
+    toolResults: toolResultEvent && toolCallId
+      ? [{ toolCallId, name: toolName, content: contentMarker, isError: false, observedAtUnixNs: atUnixNs }]
+      : [],
+    semanticParserId: 'universal-semantic-projection',
+    semanticParserVersion: boundedCanonicalRevision(event.sessionResolutionRevision),
+    semanticItems: [{
+      semanticItemId: `si_${createHash('sha256').update(event.eventId).digest('hex').slice(0, 24)}`,
+      actor: semanticActor,
+      kind: semanticKind,
+      ...(semanticKind === 'model_final' ? { phase: 'final' as const } : {}),
+      origin: userMessage ? 'request' : 'response',
+      atUnixNs,
+      content: contentMarker,
+      ...(toolCallId ? { toolCallId } : {}),
+      ...(toolCallEvent || toolResultEvent ? { toolName } : {}),
+      sourceItemId: event.eventId,
+      turnId,
+      completeness: 'partial',
+      partialReasons: ['application_semantic_reference_only'],
+    }],
+    completeness: 'reference_only',
+    partialReasons: ['application_semantic_reference_only'],
+    captureSource: 'authenticated_application_event',
+    receivedAt: event.receivedAt ?? event.at,
+  };
+}
+
+function isSemanticUniversalEventKind(kind: string): boolean {
+  const normalizedKind = kind.trim().toLowerCase().replace(/[\s.-]+/gu, '_');
+  return [
+    'agenttool', 'agentinvocation', 'llmcall', 'llmapi', 'llminteraction', 'usermessage', 'modelmessage', 'toolresult', 'noderun', 'llmresponse',
+    'tool', 'tool_call', 'toolcall', 'function_call', 'functioncall', 'tool_result', 'function_result',
+    'agent_tool_result', 'node_result', 'node', 'node_run', 'workflow_run', 'agent_run',
+    'llm', 'llm_call', 'llm_response', 'model_response',
+    'user_message', 'user_input', 'human_message', 'input_message',
+    'model_message', 'assistant_message', 'assistant_output', 'final_response',
+  ].includes(normalizedKind);
+}
+
+function canonicalEvidenceLinksForRelations(
+  relations: readonly T.AgentSemanticKernelRelation[],
+): EvidenceLink[] {
+  return relations.map((relation) => {
+    const kind = relation.kernelEventKind ?? '';
+    const toType: EvidenceLink['toType'] = kind === 'FileAccess' || kind === 'FileDelete'
+      ? 'file' : kind === 'Egress' || kind === 'Dns' || kind === 'Tls' ? 'network' : 'kernel_fact';
+    const method: EvidenceLink['method'] = relation.linkMethod === 'command'
+      ? 'command' : relation.linkMethod === 'resource' ? 'resource'
+        : relation.linkMethod === 'network' || relation.linkMethod === 'network_endpoint' ? 'network'
+          : relation.linkMethod === 'shell_bootstrap' ? 'process_generation' : 'none';
+    const status: EvidenceLink['status'] = relation.status === 'linked_exact'
+      ? 'confirmed' : relation.status === 'linked_strong' ? 'strong'
+        : relation.status === 'ambiguous' ? 'ambiguous'
+          : relation.status === 'coverage_gap' ? 'coverage_gap' : 'unmatched';
+    return createEvidenceLink({
+      fromType: 'tool_call',
+      fromId: relation.toolInvocationId,
+      toType,
+      toId: relation.kernelFactId ?? relation.kernelEventId ?? `unmatched:${relation.stableSemanticEventId}`,
+      relation: toType === 'file' ? 'file_effect' : toType === 'network' ? 'network_effect' : 'executes_as',
+      method,
+      confidence: status === 'confirmed' ? 1 : status === 'strong' ? relation.confidence : 0,
+      authority: 'inferred',
+      evidenceRefs: [...(relation.sourceRefs ?? []), relation.stableSemanticEventId],
+      algorithmVersion: relation.algorithmVersion ?? `semantic-kernel-relation.v${relation.relationVersion}`,
+      status,
+      validFromUnixNs: relation.validFromUnixNs ?? '1',
+      resolutionRevision: relation.relationRevision ?? relation.resolutionRevision,
+    });
+  });
+}
+
+function canonicalSemanticAuthority(
+  resolution: IngestionSourceResolution,
+  collectorId: string | undefined,
+  adapterEvent: boolean,
+  meta?: T.EventMeta,
+): SemanticRecord['authority'] {
+  if (isTrustedCollectorProducer(resolution, collectorId)) return 'attested_observer';
+  // `bindTrustedCorrelationForIngest` stores the result of the exact Source-policy check in a
+  // server-only WeakMap.  The public IngestionSourceResolution is intentionally computed before
+  // each event's raw scope is known (and therefore may report `claimAuthorization=false` for a
+  // mixed batch).  Prefer the per-event capability when it is present; never infer authority from
+  // a producer-supplied field alone.
+  const trusted = meta ? serverTrustedCorrelationContext(meta)?.sourceTrust : undefined;
+  if (trusted?.authenticated && trusted.allowedClaims.includes(adapterEvent ? 'agent_adapter' : 'application_trace')) {
+    return adapterEvent ? 'authenticated_adapter' : 'server_graph';
+  }
+  // A present server capability with an empty/denied claim list is an authoritative rejection for
+  // this event. Do not fall back to the batch-level `resolution.claimAuthorization`, which could
+  // otherwise label a mismatched event as an authenticated Adapter.
+  if (trusted) return 'inferred';
+  if (resolution.authenticated && resolution.claimAuthorization) {
+    if (adapterEvent && resolution.claimAuthority === 'agent_adapter') return 'authenticated_adapter';
+    if (resolution.claimAuthority === 'application') return 'server_graph';
+  }
+  return 'inferred';
+}
+
+function hasAuthorizedSemanticClaim(
+  meta: T.EventMeta,
+  resolution: IngestionSourceResolution,
+  authority: 'application' | 'agent_adapter',
+): boolean {
+  const trusted = serverTrustedCorrelationContext(meta)?.sourceTrust;
+  if (trusted) {
+    return trusted.authenticated === true && trusted.allowedClaims.includes(
+      authority === 'agent_adapter' ? 'agent_adapter' : 'application_trace',
+    );
+  }
+  return resolution.authenticated
+    && resolution.claimAuthorization
+    && resolution.claimAuthority === authority;
+}
+
 function isLlmEndpoint(inner: Record<string, unknown>): boolean {
   const a = inner as { peer?: string; sni?: string; query?: string };
   const peer = a.peer ?? '';
@@ -339,6 +1117,9 @@ function isLlmEndpoint(inner: Record<string, unknown>): boolean {
 
 function eventCategory(kind: string): T.EventCategory {
   if (kind === 'ToolExec' || kind === 'AgentTool') return 'tool';
+  if (['ToolResult', 'UserMessage', 'ModelMessage', 'LlmResponse', 'NodeRun'].includes(kind)) {
+    return kind === 'ToolResult' ? 'tool' : kind === 'NodeRun' ? 'runtime' : 'llm';
+  }
   if (kind === 'Egress' || kind === 'Dns' || kind === 'SslContent') return 'network';
   if (kind === 'FileAccess' || kind === 'FileDelete') return 'file';
   if (kind === 'LlmCall' || kind === 'LlmApi' || kind === 'LlmInteraction' || kind === 'AgentPlaintextEvidence') return 'llm';
@@ -533,7 +1314,11 @@ function processFromObserverLine(process: unknown): T.ProcessContext | undefined
     eventTimeNs: stringLikeField('eventTimeNs', 'event_time_ns'),
     startTimeNs: stringLikeField('startTimeNs', 'start_time_ns'),
     startTimeTicks: stringLikeField('startTimeTicks', 'start_time_ticks'),
+    processGenerationKey: stringLikeField('processGenerationKey', 'process_generation_key'),
+    parentProcessGenerationKey: stringLikeField('parentProcessGenerationKey', 'parent_process_generation_key'),
     mountNamespace: numberField('mountNamespace') ?? numberField('mount_namespace'),
+    terminalContextId: stringLikeField('terminalContextId', 'terminal_context_id'),
+    sshConnectionId: stringLikeField('sshConnectionId', 'ssh_connection_id'),
     lifecycleSource: parseProcessLifecycleSource(stringLikeField('lifecycleSource', 'lifecycle_source')),
     lifecycleReason: parseUnknownReason(stringLikeField('lifecycleReason', 'lifecycle_reason')),
   };
@@ -593,6 +1378,22 @@ function trustedCollectorEventTime(meta: T.EventMeta, trusted: boolean): number 
   return eventAt;
 }
 
+/**
+ * A producer Run ID is a semantic claim, not a transport identity.  Only the out-of-band
+ * server trust context created by source authentication/claim authorization may promote it to a
+ * durable Run field.  This keeps an arbitrary webhook/collector payload from choosing the Run
+ * namespace used by correlation and conversation projections.
+ */
+function trustedProducerRunId(meta: T.EventMeta): string | undefined {
+  const context = serverTrustedCorrelationContext(meta);
+  const sourceTrust = context?.sourceTrust;
+  if (!context || !sourceTrust?.authenticated || sourceTrust.allowedClaims.length === 0) return undefined;
+  const raw = sourceTrust.authority === 'agent_adapter'
+    ? context.claims?.agentAdapter?.runId
+    : context.claims?.application?.runId;
+  return strictIdentityText(raw, 512);
+}
+
 function summarize(kind: string, inner: Record<string, unknown>): string {
   const a = inner as { argv?: string[]; peer?: string; port?: number; query?: string; path?: string; sni?: string; kind?: string; model?: string; endpoint?: string };
   if (kind === 'ToolExec') return redact((a.argv ?? []).join(' ')).slice(0, 80) || 'exec';
@@ -604,6 +1405,14 @@ function summarize(kind: string, inner: Record<string, unknown>): string {
   if (kind === 'LlmCall') return `llm ${a.sni ?? ''}`;
   if (kind === 'LlmInteraction') return `llm interaction ${a.model ?? ''} ${a.endpoint ?? ''}`.trim();
   return kind;
+}
+
+function safeIdentityHint(value: unknown, max = 240): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed && trimmed.length <= max && !/[\u0000-\u001f\u007f-\u009f]/u.test(trimmed)
+    ? trimmed
+    : undefined;
 }
 
 /** Fill EventMeta from an a3s-observer line's identity + event, honoring any explicitly-given fields. */
@@ -621,10 +1430,30 @@ function deriveMeta(line: string, given: Partial<T.EventMeta>): T.EventMeta {
   let captureDispositionCode: number | undefined;
   let captureSelected: boolean | undefined;
   let captureFlags: number | undefined;
+  let rawObservationId: string | undefined;
+  let rawObservationRevision: number | undefined;
+  let lineLogicalAgentId: string | undefined;
+  let lineLogicalDefinitionId: string | undefined;
+  let lineLogicalScopeMode: T.EventMeta['logicalScopeMode'];
+  let lineTerminalContextId: string | undefined;
+  let lineOwnerId: string | undefined;
+  let lineTenantId: string | undefined;
+  let lineProfile: string | undefined;
+  let lineProfileVersion: string | undefined;
   try {
     const o = JSON.parse(line) as {
       identity?: typeof id;
       process?: unknown;
+      rawObservation?: Record<string, unknown>;
+      raw_observation?: Record<string, unknown>;
+      logicalAgentId?: unknown;
+      logicalDefinitionId?: unknown;
+      logicalScopeMode?: unknown;
+      terminalContextId?: unknown;
+      tenantId?: unknown;
+      ownerId?: unknown;
+      profile?: unknown;
+      profileVersion?: unknown;
       event?: Record<string, Record<string, unknown>>;
       eventAtUnixNs?: unknown;
       receivedAtUnixNs?: unknown;
@@ -638,6 +1467,31 @@ function deriveMeta(line: string, given: Partial<T.EventMeta>): T.EventMeta {
     };
     id = o.identity ?? {};
     process = processFromObserverLine(o.process);
+    const raw = o.rawObservation ?? o.raw_observation;
+    rawObservationId = typeof raw?.observationId === 'string' ? raw.observationId.trim() : undefined;
+    rawObservationRevision = Number.isSafeInteger(raw?.revision) && Number(raw?.revision) > 0
+      ? Number(raw?.revision) : undefined;
+    const runtime = raw?.runtime && typeof raw.runtime === 'object' && !Array.isArray(raw.runtime)
+      ? raw.runtime as Record<string, unknown> : undefined;
+    const rawLogical = raw?.logicalAgentId ?? raw?.logical_agent_id;
+    lineLogicalAgentId = typeof o.logicalAgentId === 'string' ? o.logicalAgentId.trim()
+      : typeof rawLogical === 'string' ? rawLogical.trim() : undefined;
+    const rawDefinition = raw?.logicalDefinitionId ?? raw?.logical_definition_id;
+    lineLogicalDefinitionId = typeof o.logicalDefinitionId === 'string' ? o.logicalDefinitionId.trim()
+      : typeof rawDefinition === 'string' ? rawDefinition.trim() : undefined;
+    const scope = o.logicalScopeMode ?? raw?.logicalScopeMode ?? raw?.logical_scope_mode;
+    lineLogicalScopeMode = ['registered_definition', 'workflow_definition', 'service_definition', 'terminal', 'unresolved']
+      .includes(String(scope)) ? scope as T.EventMeta['logicalScopeMode'] : undefined;
+    const terminal = o.terminalContextId ?? runtime?.terminalContextId ?? runtime?.terminal_context_id;
+    lineTerminalContextId = typeof terminal === 'string' ? terminal.trim() : undefined;
+    const tenant = o.tenantId ?? raw?.tenantId ?? raw?.tenant_id;
+    lineTenantId = typeof tenant === 'string' ? tenant.trim() : undefined;
+    const owner = o.ownerId ?? raw?.ownerId ?? raw?.owner_id;
+    lineOwnerId = typeof owner === 'string' ? owner.trim() : undefined;
+    const profile = o.profile ?? raw?.profile;
+    lineProfile = typeof profile === 'string' ? profile.trim() : undefined;
+    const profileVersion = o.profileVersion ?? raw?.profileVersion ?? raw?.profile_version;
+    lineProfileVersion = typeof profileVersion === 'string' ? profileVersion.trim() : undefined;
     eventAtUnixNs = exactUnixNs(o.eventAtUnixNs);
     receivedAtUnixNs = exactUnixNs(o.receivedAtUnixNs);
     captureEpoch = exactU64(o.captureEpoch);
@@ -656,17 +1510,98 @@ function deriveMeta(line: string, given: Partial<T.EventMeta>): T.EventMeta {
   const agentId = given.agentId ?? id.agent ?? 'unknown';
   const cwd = typeof inner.cwd === 'string' ? inner.cwd : undefined;
   const uid = inner.uid;
+  const explicitSession = typeof given.sessionId === 'string' && given.sessionId.trim()
+    ? given.sessionId.trim()
+    : typeof id.session === 'string' && id.session.trim() ? id.session.trim() : undefined;
+  const fallbackBoundary = given.sourceEventId
+    ?? given.rawObservationId
+    ?? given.invocationId
+    ?? (given.receivedAt !== undefined ? String(given.receivedAt) : undefined)
+    // No producer boundary is available for an old/tokenless line.  A monotonic process-local
+    // nonce keeps identical stateless POSTs separate without writing a secret or trusting a PID.
+    ?? `request-${Date.now()}-${ephemeralMetaSequence += 1}`;
+  const legacySessionAnchor = typeof id.agent === 'string' && id.agent.trim()
+    ? id.agent.trim()
+    : id.task != null ? `task-${id.task}` : undefined;
+  const sessionFallback = explicitSession
+    ?? `ephemeral-${createHash('sha256').update(`${line}\u0000${fallbackBoundary}`).digest('hex').slice(0, 24)}`;
+  const sessionIdSource: T.SessionIdSource = explicitSession
+    ? (given.sessionIdSource === 'provider' || given.sessionIdSource === 'authenticated_adapter'
+      ? given.sessionIdSource
+      : 'legacy_observer_session')
+    : id.agent ? 'legacy_agent_fallback'
+      : id.task != null ? 'legacy_task_fallback' : 'per_request';
+  const sessionIdentityQuality: T.SessionIdentityQuality = sessionIdSource === 'authenticated_adapter'
+    || sessionIdSource === 'provider' ? 'confirmed'
+    : sessionIdSource === 'legacy_observer_session' ? 'inferred' : 'ephemeral';
+  const rawAttributes = given.attributes ?? {};
+  const logicalAgentId = safeIdentityHint(given.logicalAgentId)
+    ?? safeIdentityHint(lineLogicalAgentId)
+    ?? safeIdentityHint(rawAttributes['anysentry.logical_agent_id']);
+  const logicalDefinitionId = safeIdentityHint(given.logicalDefinitionId)
+    ?? safeIdentityHint(lineLogicalDefinitionId)
+    ?? safeIdentityHint(rawAttributes['anysentry.logical_definition_id']);
+  const logicalScopeMode = given.logicalScopeMode ?? lineLogicalScopeMode;
+  const terminalContextId = safeIdentityHint(given.terminalContextId)
+    ?? safeIdentityHint(lineTerminalContextId)
+    ?? safeIdentityHint(rawAttributes['anysentry.terminal_context_id']);
+  const tenantId = safeIdentityHint(given.tenantId)
+    ?? safeIdentityHint(rawAttributes.tenantId)
+    ?? safeIdentityHint(lineTenantId);
+  const ownerId = safeIdentityHint(given.ownerId)
+    ?? safeIdentityHint(rawAttributes.ownerId)
+    ?? safeIdentityHint(lineOwnerId);
+  const profile = safeIdentityHint(given.profile)
+    ?? safeIdentityHint(rawAttributes.profile)
+    ?? safeIdentityHint(lineProfile);
+  const profileVersion = safeIdentityHint(given.profileVersion, 120)
+    ?? safeIdentityHint(rawAttributes.profileVersion)
+    ?? safeIdentityHint(lineProfileVersion, 120);
   // Surface an agent→LLM-endpoint connection as an LlmCall even when it isn't an SNI-classified
   // public provider (internal/self-hosted endpoints, plain HTTP).
   const isLlm = (eventKey === 'Egress' || eventKey === 'Dns') && isLlmEndpoint(inner);
   const peer = (inner as { peer?: string; query?: string }).peer ?? (inner as { query?: string }).query ?? '';
   const usage = interactionUsageCounters(eventKey, inner);
+  const canonicalAttributes: Record<string, T.EventAttributeValue> = {
+    ...sanitizeEventAttributes(given.attributes),
+    ...compactAttributes(eventKey, inner, id),
+    ...usage.attributes,
+    'anysentry.session.identity_quality': sessionIdentityQuality,
+    'anysentry.session.id_source': sessionIdSource,
+    ...(tenantId ? { tenantId } : {}),
+    ...(ownerId ? { ownerId } : {}),
+    ...(profile ? { profile } : {}),
+    ...(profileVersion ? { profileVersion } : {}),
+    ...(logicalAgentId ? { 'anysentry.logical_agent_id': logicalAgentId } : {}),
+    ...(logicalDefinitionId ? { 'anysentry.logical_definition_id': logicalDefinitionId } : {}),
+    ...(logicalScopeMode ? { 'anysentry.logical_scope_mode': logicalScopeMode } : {}),
+    ...(terminalContextId ? { 'anysentry.terminal_context_id': terminalContextId } : {}),
+  };
   return {
     agentId,
     workspacePath: given.workspacePath ?? cwd ?? `agent://${agentId}`,
-    // A session is a logical work unit. The kernel rarely knows an app-level session id, so fall
-    // back to the AGENT (workload), NOT the pid — else every short-lived process counts as a session.
-    sessionId: given.sessionId ?? id.session ?? id.agent ?? (id.task != null ? `task-${id.task}` : 'session'),
+    ...(tenantId ? { tenantId } : {}),
+    ...(ownerId ? { ownerId } : {}),
+    ...(profile ? { profile } : {}),
+    ...(profileVersion ? { profileVersion } : {}),
+    ...(given.deploymentId ? { deploymentId: given.deploymentId } : {}),
+    ...(given.deploymentRevision ? { deploymentRevision: given.deploymentRevision } : {}),
+    ...(given.environmentId ? { environmentId: given.environmentId } : {}),
+    // Keep the required legacy field populated for old Judge consumers, but expose the provenance
+    // explicitly. Legacy agent/task fallbacks are ephemeral/inferred and are never used as a
+    // confirmed provider Session by the canonical resolver.
+    sessionId: sessionFallback,
+    sessionIdentityQuality,
+    sessionIdSource,
+    ...(legacySessionAnchor && !explicitSession
+      ? { legacySessionId: legacySessionAnchor } : {}),
+    sessionMode: sessionIdentityQuality === 'ephemeral' ? 'ephemeral' : 'conversation',
+    rawObservationId,
+    rawObservationRevision,
+    logicalAgentId,
+    logicalDefinitionId,
+    logicalScopeMode,
+    terminalContextId,
     userId: given.userId ?? (uid != null ? `uid:${uid}` : 'system'),
     eventKind: given.eventKind ?? (isLlm ? 'LlmCall' : eventKey),
     eventCategory: given.eventCategory ?? eventCategory(isLlm ? 'LlmCall' : eventKey),
@@ -678,7 +1613,12 @@ function deriveMeta(line: string, given: Partial<T.EventMeta>): T.EventMeta {
     toolCallId: given.toolCallId,
     spanId: given.spanId,
     parentSpanId: given.parentSpanId,
-    runId: given.runId ?? id.session ?? id.agent ?? (id.task != null ? `task-${id.task}` : undefined),
+    // A provider Session is not a Run.  Keep the optional Run empty unless an Adapter/producer
+    // supplied one explicitly; the Judge adds a separate event-local compatibility ID and marks
+    // its provenance when the legacy required field must be populated.
+    runId: given.runId,
+    runIdSource: given.runId ? (given.runIdSource ?? 'producer') : undefined,
+    turnId: given.turnId,
     taskId: given.taskId ?? (id.task != null ? String(id.task) : undefined),
     sourceEventId: given.sourceEventId,
     // Timing and Ring-before decisions are evidence emitted inside the Collector-authenticated raw
@@ -695,11 +1635,7 @@ function deriveMeta(line: string, given: Partial<T.EventMeta>): T.EventMeta {
     captureFlags,
     // Envelope attributes may add producer context, but cannot replace fields decoded from the raw
     // record (notably ProcessExit status/signal and command hashes).
-    attributes: {
-      ...sanitizeEventAttributes(given.attributes),
-      ...compactAttributes(eventKey, inner, id),
-      ...usage.attributes,
-    },
+    attributes: canonicalAttributes,
     classificationSemantics: given.classificationSemantics,
     // Process generation is structural evidence and therefore shares the raw-record trust boundary
     // with event time and capture decisions.
@@ -1535,10 +2471,34 @@ function canonicalEventKind(input: T.UniversalIngestEvent): string {
     toolexec: 'ToolExec',
     agent_tool: 'AgentTool',
     agenttool: 'AgentTool',
+    tool_call: 'AgentTool',
+    toolcall: 'AgentTool',
+    function_call: 'AgentTool',
+    functioncall: 'AgentTool',
     execute_tool: 'AgentTool',
     agent_invocation: 'AgentInvocation',
     agentinvocation: 'AgentInvocation',
     invoke_agent: 'AgentInvocation',
+    user_message: 'UserMessage',
+    usermessage: 'UserMessage',
+    user_input: 'UserMessage',
+    human_message: 'UserMessage',
+    assistant_message: 'ModelMessage',
+    model_message: 'ModelMessage',
+    assistant_output: 'ModelMessage',
+    final_response: 'ModelMessage',
+    tool_result: 'ToolResult',
+    toolresult: 'ToolResult',
+    function_result: 'ToolResult',
+    agent_tool_result: 'ToolResult',
+    node: 'NodeRun',
+    node_run: 'NodeRun',
+    noderun: 'NodeRun',
+    workflowrun: 'AgentInvocation',
+    workflow_run: 'AgentInvocation',
+    agent_run: 'AgentInvocation',
+    llm_response: 'LlmResponse',
+    model_response: 'LlmResponse',
     egress: 'Egress',
     network: 'Egress',
     network_egress: 'Egress',
@@ -1644,6 +2604,26 @@ function eventInner(kind: string, input: T.UniversalIngestEvent): Record<string,
       kind: cleanString(input.runtimeKind ?? input.status ?? eventAttr(input, 'runtimeKind') ?? eventAttr(input, 'progressive.warning'), 240) ?? 'runtime',
     };
   }
+  if (isSemanticUniversalEventKind(kind)) {
+    const semanticValue = input.content ?? input.data ?? input.raw
+      ?? input.subject ?? eventAttr(input, 'content') ?? eventAttr(input, 'data');
+    const serialized = typeof semanticValue === 'string'
+      ? semanticValue
+      : semanticValue === undefined ? '' : JSON.stringify(semanticValue) ?? '';
+    const payload = Buffer.from(serialized, 'utf8');
+    return {
+      ...base,
+      payload_sha256: safePayloadDigest(semanticValue),
+      payload_bytes: payload.length,
+      ...(cleanString(input.toolCallId ?? eventAttr(input, 'toolCallId') ?? eventAttr(input, 'tool_call_id'), 512)
+        ? { tool_call_id: cleanString(input.toolCallId ?? eventAttr(input, 'toolCallId') ?? eventAttr(input, 'tool_call_id'), 512) }
+        : {}),
+      ...(cleanString(input.runId ?? eventAttr(input, 'runId') ?? eventAttr(input, 'run_id'), 512)
+        ? { run_id: cleanString(input.runId ?? eventAttr(input, 'runId') ?? eventAttr(input, 'run_id'), 512) }
+        : {}),
+      ...(cleanString(input.status, 120) ? { status: cleanString(input.status, 120) } : {}),
+    };
+  }
   if (kind === 'ProcessExit') {
     const exitCode = finiteNumber(
       input.exitCode
@@ -1660,7 +2640,16 @@ function eventInner(kind: string, input: T.UniversalIngestEvent): Record<string,
       ...(signal !== undefined ? { signal } : {}),
     };
   }
-  return { ...base, ...sanitizeEventAttributes(input.attributes) };
+  const safeAttributes = sanitizeEventAttributes(input.attributes);
+  const semanticSensitive = /^(?:body|content|prompt|input|output|messages?|arguments?|result|response)$/iu;
+  for (const key of Object.keys(safeAttributes)) {
+    if (!semanticSensitive.test(key)) continue;
+    const raw = safeAttributes[key];
+    const value = String(raw);
+    safeAttributes[`${key}_sha256`] = createHash('sha256').update(value).digest('hex');
+    delete safeAttributes[key];
+  }
+  return { ...base, ...safeAttributes };
 }
 
 function universalEventLine(kind: string, input: T.UniversalIngestEvent, defaults: T.UniversalIngestRequest): string {
@@ -1668,7 +2657,46 @@ function universalEventLine(kind: string, input: T.UniversalIngestEvent, default
   const session = cleanString(input.sessionId ?? defaults.sessionId, 240);
   const task = cleanString(input.taskId ?? defaults.taskId, 240);
   const identity = { agent, ...(session ? { session } : {}), ...(task ? { task } : {}) };
-  return JSON.stringify({ identity, event: { [kind]: eventInner(kind, input) } });
+  const suppliedProcess = input.process;
+  const pid = integerField(input, 'pid')
+    ?? finiteNumber(eventAttr(input, 'pid'))
+    ?? suppliedProcess?.pid;
+  const ppid = finiteNumber((input as Record<string, unknown>).ppid ?? eventAttr(input, 'ppid'))
+    ?? suppliedProcess?.ppid;
+  const process = pid !== undefined
+    ? {
+        pid,
+        ...(ppid !== undefined ? { ppid } : {}),
+        ...(cleanString(input.cwd ?? suppliedProcess?.cwd ?? eventAttr(input, 'cwd'), 500) ? { cwd: cleanString(input.cwd ?? suppliedProcess?.cwd ?? eventAttr(input, 'cwd'), 500) } : {}),
+        ...(cleanString(suppliedProcess?.hostId ?? eventAttr(input, 'hostId') ?? eventAttr(input, 'host_id'), 240) ? { hostId: cleanString(suppliedProcess?.hostId ?? eventAttr(input, 'hostId') ?? eventAttr(input, 'host_id'), 240) } : {}),
+        ...(cleanString(suppliedProcess?.bootId ?? eventAttr(input, 'bootId') ?? eventAttr(input, 'boot_id'), 240) ? { bootId: cleanString(suppliedProcess?.bootId ?? eventAttr(input, 'bootId') ?? eventAttr(input, 'boot_id'), 240) } : {}),
+        ...(cleanString(suppliedProcess?.startTimeTicks ?? eventAttr(input, 'startTimeTicks') ?? eventAttr(input, 'start_time_ticks'), 64) ? { startTimeTicks: cleanString(suppliedProcess?.startTimeTicks ?? eventAttr(input, 'startTimeTicks') ?? eventAttr(input, 'start_time_ticks'), 64) } : {}),
+        ...(cleanString(suppliedProcess?.startTimeNs ?? eventAttr(input, 'startTimeNs') ?? eventAttr(input, 'start_time_ns'), 64) ? { startTimeNs: cleanString(suppliedProcess?.startTimeNs ?? eventAttr(input, 'startTimeNs') ?? eventAttr(input, 'start_time_ns'), 64) } : {}),
+      }
+    : undefined;
+  const eventAt = eventTime(input);
+  const eventAtUnixNs = Number.isFinite(eventAt) && eventAt > 0
+    ? (BigInt(Math.trunc(eventAt)) * 1_000_000n).toString()
+    : undefined;
+  const receivedAtUnixNs = (BigInt(Date.now()) * 1_000_000n).toString();
+  // Keep the line replayable without copying arbitrary producer bodies into the canonical raw
+  // lane. IDs and a digest provide provenance; semantic payloads remain in the existing bounded
+  // compatibility fields/attributes and are subject to their normal redaction policy.
+  const provenance = {
+    ...(eventAtUnixNs ? { eventAtUnixNs } : {}),
+    receivedAtUnixNs,
+    ...(cleanString(input.sourceEventId ?? input.id, 240) ? { sourceEventId: cleanString(input.sourceEventId ?? input.id, 240) } : {}),
+    ...(cleanString(input.traceId ?? defaults.traceId, 240) ? { traceId: cleanString(input.traceId ?? defaults.traceId, 240) } : {}),
+    ...(cleanString(input.invocationId ?? defaults.invocationId, 240) ? { invocationId: cleanString(input.invocationId ?? defaults.invocationId, 240) } : {}),
+    ...(cleanString(input.toolCallId ?? defaults.toolCallId, 240) ? { toolCallId: cleanString(input.toolCallId ?? defaults.toolCallId, 240) } : {}),
+    ...(cleanString(input.runId ?? defaults.runId, 240) ? { runId: cleanString(input.runId ?? defaults.runId, 240) } : {}),
+  };
+  return JSON.stringify({
+    identity,
+    ...(process ? { process } : {}),
+    ...provenance,
+    event: { [kind]: eventInner(kind, input) },
+  });
 }
 
 function hasTopLevelEventShape(body: T.UniversalIngestRequest): boolean {
@@ -1996,6 +3024,19 @@ function universalMeta(input: T.UniversalIngestEvent, defaults: T.UniversalInges
     spanId: cleanString(input.spanId ?? defaults.spanId, 240),
     parentSpanId: cleanString(input.parentSpanId ?? defaults.parentSpanId, 240),
     runId: cleanString(input.runId ?? defaults.runId, 240),
+    turnId: cleanString(input.turnId ?? defaults.turnId ?? eventAttr(input, 'turnId') ?? eventAttr(input, 'turn_id'), 240),
+    runIdSource: input.runId !== undefined || defaults.runId !== undefined ? 'producer' : undefined,
+    logicalAgentId: cleanString(input.logicalAgentId ?? defaults.logicalAgentId, 240),
+    logicalDefinitionId: cleanString(input.logicalDefinitionId ?? defaults.logicalDefinitionId, 240),
+    logicalScopeMode: input.logicalScopeMode ?? defaults.logicalScopeMode,
+    tenantId: cleanString(input.tenantId ?? defaults.tenantId, 240),
+    ownerId: cleanString(input.ownerId ?? defaults.ownerId, 240),
+    profile: cleanString(input.profile ?? defaults.profile, 240),
+    profileVersion: cleanString(input.profileVersion ?? defaults.profileVersion, 120),
+    deploymentId: cleanString(input.deploymentId ?? defaults.deploymentId, 240),
+    deploymentRevision: cleanString(input.deploymentRevision ?? defaults.deploymentRevision, 120),
+    environmentId: cleanString(input.environmentId ?? defaults.environmentId, 240),
+    terminalContextId: cleanString(input.terminalContextId ?? defaults.terminalContextId, 240),
     taskId: cleanString(input.taskId ?? defaults.taskId, 240),
     subject: cleanString(input.subject ?? defaults.subject, 500),
     tokenCount: finiteNumber(input.tokenCount ?? defaults.tokenCount),
@@ -2012,11 +3053,249 @@ function universalMeta(input: T.UniversalIngestEvent, defaults: T.UniversalInges
   };
 }
 
+/**
+ * Resolve a universal/OTLP event's Session at the authenticated server boundary.  Generic
+ * producers may report a provider conversation/thread identifier, but they never get to provide
+ * the canonical HMAC key or promote a runtime/container id.  This keeps application events on the
+ * same Session contract as parsed Observer interactions without adding product branches.
+ */
+function bindUniversalSessionIdentity(
+  meta: T.EventMeta,
+  input: T.UniversalIngestEvent,
+  defaults: T.UniversalIngestRequest,
+  options: { ignoreMetaSessionFallback?: boolean; allowProviderAnchor?: boolean } = {},
+): T.EventMeta {
+  const attr = (...keys: string[]): unknown => {
+    for (const key of keys) {
+      const direct = input.attributes?.[key] ?? defaults.attributes?.[key];
+      if (direct !== undefined) return direct;
+    }
+    return undefined;
+  };
+  const rawSessionId = strictIdentityText(
+    input.sessionId ?? defaults.sessionId
+      ?? (options.ignoreMetaSessionFallback ? undefined : meta.sessionId),
+    512,
+  );
+  const providerClaimPresent = Boolean(
+    input.providerSessionId
+      ?? input.conversationId
+      ?? input.threadId
+      ?? ((input.sessionIdSource === 'provider' || input.sessionIdSource === 'authenticated_adapter')
+        ? rawSessionId : undefined)
+      ?? ((defaults.sessionIdSource === 'provider' || defaults.sessionIdSource === 'authenticated_adapter')
+        ? rawSessionId : undefined)
+      ?? attr('providerSessionId', 'provider_session_id', 'conversationId', 'conversation_id', 'threadId', 'thread_id'),
+  );
+  const untrustedProviderClaim = options.allowProviderAnchor === false && providerClaimPresent;
+  const providerSessionId = options.allowProviderAnchor === false ? undefined : strictIdentityText(
+    input.providerSessionId
+      ?? input.conversationId
+      ?? input.threadId
+      ?? ((input.sessionIdSource === 'provider' || input.sessionIdSource === 'authenticated_adapter')
+        ? input.sessionId : undefined)
+      ?? ((defaults.sessionIdSource === 'provider' || defaults.sessionIdSource === 'authenticated_adapter')
+        ? defaults.sessionId : undefined)
+      ?? attr('providerSessionId', 'provider_session_id', 'conversationId', 'conversation_id', 'threadId', 'thread_id'),
+    512,
+  );
+  const sessionId = strictIdentityText(
+    untrustedProviderClaim ? undefined : rawSessionId,
+    512,
+  );
+  const runtimeSessionId = strictIdentityText(
+    attr('runtimeSessionId', 'runtime_session_id')
+      ?? meta.attribution?.agentInstanceId,
+    512,
+  );
+  const logicalAuthority = meta.logicalIdentityAuthority;
+  const stableScope = logicalAuthority === 'management_registration'
+    || logicalAuthority === 'authenticated_adapter';
+  const logicalId = stableScope ? meta.logicalAgentId : undefined;
+  const tenantId = stableScope ? meta.tenantId ?? meta.attributes?.tenantId : undefined;
+  const ownerId = stableScope ? meta.ownerId ?? meta.attributes?.ownerId : undefined;
+  const scopeKey = logicalId && (typeof tenantId === 'string' || typeof ownerId === 'string')
+    ? `scope_${createHash('sha256').update([
+        logicalId,
+        tenantId,
+        ownerId,
+        meta.environmentId,
+        meta.profile,
+        meta.profileVersion,
+        meta.deploymentId,
+        meta.deploymentRevision,
+      ].map((value) => value ?? '').join('\0')).digest('hex')}`
+    : undefined;
+  const serviceStateful = input.serviceStateful ?? defaults.serviceStateful
+    ?? (meta.logicalScopeMode === 'workflow_definition' || meta.logicalScopeMode === 'service_definition'
+      ? Boolean(providerSessionId)
+      : undefined);
+  const serviceStatefulHint = serviceStateful !== undefined
+    ? serviceStateful
+    : (meta.logicalScopeMode === 'workflow_definition' || meta.logicalScopeMode === 'service_definition')
+      && !providerSessionId ? false : undefined;
+  const sourceScopedNamespace = Boolean(
+    typeof meta.attributes?.sourceId === 'string'
+      && meta.attributes.sourceId.trim()
+      && meta.workspacePath,
+  );
+  const namespaceEligible = (
+    Boolean(tenantId || ownerId)
+      && Boolean(logicalId || meta.logicalDefinitionId)
+      && stableScope
+  ) || sourceScopedNamespace;
+  const sessionNamespaceHint = namespaceEligible
+    ? [...new Set([
+        tenantId,
+        ownerId,
+        logicalId,
+        meta.logicalDefinitionId,
+        meta.agentId,
+        typeof meta.attributes?.sourceId === 'string' ? meta.attributes.sourceId : undefined,
+        meta.workspacePath,
+      ].filter((value): value is string => Boolean(value)))].join('\0')
+    : '';
+  const resolution = resolveSessionIdentity({
+    providerSessionId,
+    sessionId,
+    runtimeSessionId,
+    serviceStateful: serviceStatefulHint,
+    requestId: meta.sourceEventId,
+    interactionId: meta.sourceEventId,
+    agentInstanceId: meta.attribution?.agentInstanceId,
+    resume: input.resume ?? defaults.resume,
+    fork: input.fork ?? defaults.fork,
+    parentSessionId: strictIdentityText(input.parentSessionId ?? defaults.parentSessionId ?? meta.parentSessionId, 512),
+    scopeKey,
+    namespaceHint: sessionNamespaceHint,
+  });
+  const processGenerationKey = meta.process?.processGenerationKey
+    ?? deriveProcessGenerationKey({
+      hostId: meta.process?.hostId,
+      bootId: meta.process?.bootId,
+      pid: meta.process?.pid ?? 0,
+      startTimeTicks: meta.process?.startTimeTicks,
+      startTimeNs: meta.process?.startTimeNs,
+    });
+  const canonicalInstance = deriveAgentInstanceIdentity({
+    logicalAgentId: meta.logicalAgentId,
+    logicalDefinitionId: meta.logicalDefinitionId,
+    logicalScopeMode: meta.logicalScopeMode,
+    deploymentId: meta.deploymentId,
+    deploymentRevision: meta.deploymentRevision,
+    environmentId: meta.environmentId,
+    profile: meta.profile,
+    profileVersion: meta.profileVersion,
+    processGenerationKey,
+  });
+  const runtimeInstanceId = meta.runtimeInstanceId
+    ?? (meta.process || meta.attribution?.agentInstanceId
+      ? agentRuntimeInstanceIdForEvent({
+          agentId: meta.agentId,
+          workspacePath: meta.workspacePath,
+          sessionId: resolution.sessionId,
+          attributes: meta.attributes ?? {},
+          process: meta.process,
+          attribution: meta.attribution,
+        })
+      : undefined);
+  const quality: T.SessionIdentityQuality = stableScope
+    ? resolution.quality === 'candidate' || resolution.quality === 'unresolved'
+      ? 'unknown'
+      : resolution.quality
+    : resolution.quality === 'confirmed' ? 'strong'
+      : resolution.quality === 'candidate' || resolution.quality === 'unresolved'
+        ? 'unknown'
+        : resolution.quality;
+  const legacySessionId = untrustedProviderClaim
+    ? rawSessionId ?? meta.legacySessionId
+    : sessionId && sessionId !== resolution.sessionId ? sessionId : meta.legacySessionId;
+  const resolvedMeta: T.EventMeta = {
+    ...meta,
+    sessionId: resolution.sessionId,
+    canonicalSessionId: resolution.canonicalSessionId,
+    ...(resolution.canonicalSessionKey ? { sessionKey: resolution.canonicalSessionKey } : { sessionKey: undefined }),
+    ...(resolution.providerSessionIdHash ? { providerSessionIdHash: resolution.providerSessionIdHash } : { providerSessionIdHash: undefined }),
+    sessionIdentityQuality: quality,
+    sessionIdSource: untrustedProviderClaim
+      ? (rawSessionId ? 'legacy_observer_session' : 'per_request')
+      : providerSessionId
+        ? 'provider'
+      : resolution.source === 'ephemeral' ? 'per_request' : 'unresolved',
+    sessionMode: resolution.mode,
+    sessionLifecycle: resolution.lifecycle,
+    sessionResolutionRevision: boundedCanonicalRevision(meta.sessionResolutionRevision),
+    ...(resolution.canonicalParentSessionId
+      ? { canonicalParentSessionId: resolution.canonicalParentSessionId }
+      : { canonicalParentSessionId: undefined }),
+    ...(scopeKey || sessionNamespaceHint
+      ? {
+          sessionNamespaceKey: scopeKey
+            ?? `scope_${createHash('sha256').update(sessionNamespaceHint).digest('hex')}`,
+        }
+      : {}),
+    ...(canonicalInstance.agentInstanceId
+      ? { canonicalAgentInstanceId: canonicalInstance.agentInstanceId }
+      : {}),
+    ...(runtimeInstanceId ? { runtimeInstanceId } : {}),
+    ...(resolution.parentSessionId
+      ? { parentSessionId: resolution.parentSessionId }
+      : { parentSessionId: undefined }),
+    ...(legacySessionId ? { legacySessionId } : {}),
+  };
+  // Session binding is another public clone. Carry the server-only trust capability forward so
+  // subsequent Run/semantic authority checks still see the exact Source-policy decision.
+  const trustedContext = serverTrustedCorrelationContext(meta);
+  if (trustedContext) bindServerTrustedCorrelationContext(resolvedMeta, trustedContext);
+  return resolvedMeta;
+}
+
+/** Apply the same canonical Session resolver to legacy line/batch ingress when the producer has
+ * explicitly marked its Session anchor as provider/adapter-owned (or the event is a service
+ * scope).  Raw sessionKey values are never accepted from the wire. */
+function bindCanonicalSessionFromMeta(
+  meta: T.EventMeta,
+  allowProviderAnchor = true,
+): T.EventMeta {
+  const serviceScope = meta.logicalScopeMode === 'workflow_definition'
+    || meta.logicalScopeMode === 'service_definition';
+  const providerSessionId = allowProviderAnchor && (meta.sessionIdSource === 'provider'
+    || meta.sessionIdSource === 'authenticated_adapter'
+    ) ? strictIdentityText(meta.sessionId, 512)
+    : undefined;
+  const providerClaimMarked = meta.sessionIdSource === 'provider'
+    || meta.sessionIdSource === 'authenticated_adapter';
+  if (!providerSessionId && !serviceScope && !(providerClaimMarked && !allowProviderAnchor)) return meta;
+  return bindUniversalSessionIdentity(
+    meta,
+    {
+      // A service/workflow POST without a provider conversation is intentionally stateless; do
+      // not feed deriveMeta's compatibility fallback back into the resolver as an explicit ID.
+      ...(providerSessionId || providerClaimMarked ? { sessionId: meta.sessionId } : {}),
+      ...(providerClaimMarked ? { sessionIdSource: meta.sessionIdSource } : {}),
+      providerSessionId,
+      serviceStateful: providerSessionId ? true : false,
+      resume: meta.sessionLifecycle === 'resume',
+      fork: meta.sessionLifecycle === 'fork',
+      parentSessionId: meta.parentSessionId,
+      attributes: meta.attributes,
+    },
+    {
+      ...(providerSessionId || providerClaimMarked ? { sessionId: meta.sessionId } : {}),
+      ...(providerClaimMarked ? { sessionIdSource: meta.sessionIdSource } : {}),
+      serviceStateful: providerSessionId ? true : false,
+      attributes: meta.attributes,
+    },
+    { ignoreMetaSessionFallback: !providerSessionId, allowProviderAnchor: allowProviderAnchor && Boolean(providerSessionId) },
+  );
+}
+
 type RawProducerCorrelationClaims = {
   invocationId?: unknown;
   toolCallId?: unknown;
   traceId?: unknown;
   sessionId?: unknown;
+  runId?: unknown;
   workspacePath?: unknown;
   cwd?: unknown;
   agentId?: unknown;
@@ -2143,6 +3422,7 @@ function rawUniversalCorrelationClaims(
     toolCallId: direct.toolCallId !== undefined ? direct.toolCallId : fallback.toolCallId,
     traceId: direct.traceId !== undefined ? direct.traceId : fallback.traceId,
     sessionId: direct.sessionId !== undefined ? direct.sessionId : fallback.sessionId,
+    runId: direct.runId !== undefined ? direct.runId : fallback.runId,
     workspacePath: rawUniversalWorkspace(direct, fallback),
     collectorId: direct.collectorId
       ?? obj(direct.attributes)?.collectorId
@@ -2153,6 +3433,45 @@ function rawUniversalCorrelationClaims(
     },
     attribution: direct.attribution !== undefined ? direct.attribution : fallback.attribution,
   };
+}
+
+/** Build a preliminary, bounded Source-policy claim for the batch envelope. The exact per-event
+ * check still runs in `bindTrustedCorrelationForIngest`; this early hint only lets a homogeneous
+ * universal request retain its server capability instead of being downgraded by a missing batch
+ * claim. No producer value is trusted until `authorizeCorrelationClaims` validates it. */
+function universalCorrelationClaimForResolve(
+  input: T.UniversalIngestEvent | undefined,
+  defaults: T.UniversalIngestRequest,
+): import('./ingestion-source.service').IngestionSourceCorrelationClaimRequest | undefined {
+  if (!input) return undefined;
+  const attrs = {
+    ...(defaults.attributes ?? {}),
+    ...(input.attributes ?? {}),
+  };
+  const value = (...keys: string[]): unknown => {
+    for (const key of keys) {
+      if (attrs[key] !== undefined) return attrs[key];
+    }
+    return undefined;
+  };
+  const kind = canonicalEventKind(input);
+  const authority = kind === 'AgentTool' || kind === 'AgentInvocation'
+    || input.toolCallId !== undefined || value('tool_call.id', 'gen_ai.tool.call.id') !== undefined
+    ? 'agent_adapter' as const
+    : 'application' as const;
+  const claim = {
+    authority,
+    tenantId: input.tenantId ?? defaults.tenantId ?? value('tenantId', 'tenant.id', 'anysentry.tenant.id'),
+    environmentId: input.environmentId ?? defaults.environmentId ?? value('environmentId', 'environment.id', 'deployment.environment.name'),
+    workspaceId: value('workspaceId', 'workspace.id', 'anysentry.workspace.id'),
+    workspacePath: input.workspacePath ?? defaults.workspacePath,
+    collectorId: input.collectorId ?? defaults.collectorId,
+    physicalWorkloadId: input.attribution?.physicalWorkloadId ?? defaults.attribution?.physicalWorkloadId
+      ?? value('physicalWorkloadId', 'physical_workload_id'),
+    agentScopeId: input.attribution?.agentScopeId ?? defaults.attribution?.agentScopeId
+      ?? value('agentScopeId', 'agent_scope_id'),
+  } satisfies import('./ingestion-source.service').IngestionSourceCorrelationClaimRequest;
+  return claim;
 }
 
 function metaAttributeText(meta: Partial<T.EventMeta>, ...keys: string[]): string | undefined {
@@ -2167,10 +3486,12 @@ function metaAttributeText(meta: Partial<T.EventMeta>, ...keys: string[]): strin
 
 function trustedEventScope(meta: T.EventMeta): TrustedCorrelationBindingScope {
   return {
-    tenantId: metaAttributeText(meta, 'tenantId', 'tenant.id', 'anysentry.tenant.id')
+    tenantId: meta.tenantId
+      ?? metaAttributeText(meta, 'tenantId', 'tenant.id', 'anysentry.tenant.id')
       ?? process.env.ANYSENTRY_TENANT_ID?.trim()
       ?? 'default',
-    environmentId: metaAttributeText(
+    environmentId: meta.environmentId
+      ?? metaAttributeText(
       meta,
       'environmentId',
       'environment.id',
@@ -2180,7 +3501,8 @@ function trustedEventScope(meta: T.EventMeta): TrustedCorrelationBindingScope {
     workspaceId: metaAttributeText(meta, 'workspaceId', 'workspace.id', 'anysentry.workspace.id'),
     workspacePath: cleanString(meta.workspacePath, 500),
     physicalWorkloadId: cleanString(meta.attribution?.physicalWorkloadId, 240),
-    agentScopeId: cleanString(meta.attribution?.agentScopeId, 160),
+    agentScopeId: cleanString(meta.attribution?.agentScopeId, 160)
+      ?? metaAttributeText(meta, 'agentScopeId', 'agent_scope_id'),
   };
 }
 
@@ -2253,6 +3575,15 @@ function bindTrustedCorrelationForIngest(
     );
   const traceId = producerClaims.traceId;
   const sessionId = producerClaims.sessionId;
+  const runId = producerClaims.runId
+    ?? rawMetaAttribute(
+      producerClaims,
+      'runId',
+      'run.id',
+      'gen_ai.run.id',
+      'workflow_run_id',
+      'langgraph.run_id',
+    );
   const claimSupplied = (value: unknown): boolean => value !== undefined && value !== null;
   const traceConsistent = claimSupplied(traceId)
     ? strictIdentityText(traceId, 512) === boundMeta.traceId
@@ -2266,8 +3597,8 @@ function bindTrustedCorrelationForIngest(
       ? 'agent_adapter'
       : 'application';
   const hasSemanticClaim = semanticAuthority === 'agent_adapter'
-    ? [invocationId, toolCallId, sessionId, traceId].some(claimSupplied)
-    : [invocationId, traceId].some(claimSupplied);
+    ? [invocationId, toolCallId, sessionId, traceId, runId].some(claimSupplied)
+    : [invocationId, traceId, runId].some(claimSupplied);
   const policyBindings = policy?.bindings;
   const finalCollectorId = metaAttributeText(boundMeta, 'collectorId');
   const rawTenantId = rawMetaAttribute(producerClaims, 'tenantId', 'tenant.id', 'anysentry.tenant.id');
@@ -2356,27 +3687,41 @@ function bindTrustedCorrelationForIngest(
     };
     claims = semanticAuthority === 'agent_adapter'
       ? {
-          agentAdapter: {
-            invocationId,
-            toolCallId,
-            sessionId,
-            traceId,
-            sessionConsistent,
-            traceConsistent,
-            scope,
+              agentAdapter: {
+                invocationId,
+                toolCallId,
+                sessionId,
+                traceId,
+                runId,
+                sessionConsistent,
+                traceConsistent,
+                scope,
           },
         }
       : {
           application: {
             invocationId,
             traceId,
+            runId,
             traceConsistent,
             scope,
           },
-        };
+      };
   }
-
-  return bindServerTrustedCorrelationContext(boundMeta, {
+  // A scope mismatch is security-relevant even when the event did not carry a semantic claim.
+  // Materialize a rejected server context so the identity quarantine below cannot be bypassed by
+  // a metadata-only event that happened to inherit a management registration.
+  if (!sourceTrust && scopeIntegrityFailure) {
+    sourceTrust = {
+      verification: 'server_verified',
+      authenticated: resolution.authenticated,
+      authority: semanticAuthority,
+      allowedClaims: [],
+      bindings: scope,
+      rejectionReason: trustedClaimRejectionReason(scopeIntegrityFailure),
+    };
+  }
+  const trustedMeta = bindServerTrustedCorrelationContext(boundMeta, {
     sourceTrust,
     claims,
     observerAttested,
@@ -2396,6 +3741,36 @@ function bindTrustedCorrelationForIngest(
         )
       ),
   });
+  return quarantineRejectedScope(trustedMeta);
+}
+
+/**
+ * Never let a producer claim that failed the Source binding fence inherit a management logical
+ * definition.  The raw/process/kernel lane remains intact; only the functional identity and
+ * namespaced Session material are cleared and retained as an unresolved candidate.
+ */
+function quarantineRejectedScope(meta: T.EventMeta): T.EventMeta {
+  const context = serverTrustedCorrelationContext(meta);
+  if (!context?.sourceTrust?.rejectionReason) return meta;
+  const candidate = meta.logicalAgentCandidateId
+    ?? (meta.logicalAgentId
+      ? `lac_${createHash('sha256').update(`scope-mismatch\0${meta.logicalAgentId}`).digest('hex').slice(0, 24)}`
+      : undefined);
+  const quarantined: T.EventMeta = {
+    ...meta,
+    logicalAgentId: undefined,
+    logicalDefinitionId: undefined,
+    logicalDefinitionFingerprint: undefined,
+    logicalScopeMode: 'unresolved',
+    logicalIdentityAuthority: 'unknown',
+    ...(candidate ? { logicalAgentCandidateId: candidate } : {}),
+    canonicalAgentInstanceId: undefined,
+    sessionKey: undefined,
+    sessionNamespaceKey: undefined,
+    providerSessionIdHash: undefined,
+  };
+  bindServerTrustedCorrelationContext(quarantined, context);
+  return quarantined;
 }
 
 const SECURITY_CAPABILITY_ACTIONS: T.SecurityCapabilityAction[] = ['list', 'search', 'describe', 'execute'];
@@ -3853,6 +5228,31 @@ function universalFromOtelAttrs(
   const tokenCount =
     attrNumber(combined, 'anysentry.token_count', 'llm.usage.total_tokens', 'gen_ai.usage.input_tokens', 'gen_ai.usage.output_tokens') ??
     undefined;
+  // Normalize standard OTLP resource/process identity into the aliases consumed by the common
+  // EventMeta/process builder. Without this bridge an Adapter span carried only `pid`, so a later
+  // Observer FileAccess/ToolExec fact could not pass the generation-safe same-process check.
+  const processPid = attrNumber(combined, 'process.pid', 'pid');
+  const processPpid = attrNumber(combined, 'process.ppid', 'ppid');
+  const processHostId = attrText(combined, 'host.id', 'hostId', 'host.name');
+  const processBootId = attrText(combined, 'host.boot_id', 'bootId', 'boot.id');
+  const processStartTicks = attrText(combined, 'process.start_time_ticks', 'startTimeTicks', 'process.start_time');
+  const processStartNs = attrText(combined, 'process.start_time_unix_nano', 'startTimeNs');
+  const processCwd = attrText(combined, 'process.working_directory', 'cwd');
+  const processComm = attrText(combined, 'process.executable.name', 'process.command_name', 'comm');
+  const processCgroup = attrText(combined, 'container.id', 'process.cgroup', 'cgroup');
+  const process = processPid !== undefined
+    ? {
+        pid: processPid,
+        ...(processPpid !== undefined ? { ppid: processPpid } : {}),
+        ...(processHostId ? { hostId: processHostId } : {}),
+        ...(processBootId ? { bootId: processBootId } : {}),
+        ...(processStartTicks ? { startTimeTicks: processStartTicks } : {}),
+        ...(processStartNs ? { startTimeNs: processStartNs } : {}),
+        ...(processCwd ? { cwd: processCwd } : {}),
+        ...(processComm ? { comm: processComm } : {}),
+        ...(processCgroup ? { cgroup: processCgroup } : {}),
+      } satisfies T.ProcessContext
+    : undefined;
   return {
     ...item,
     kind: inferredKind,
@@ -3874,6 +5274,7 @@ function universalFromOtelAttrs(
     promptTokens: attrNumber(combined, 'llm.usage.prompt_tokens', 'gen_ai.usage.input_tokens'),
     completionTokens: attrNumber(combined, 'llm.usage.completion_tokens', 'gen_ai.usage.output_tokens'),
     tokenCount,
+    ...(process ? { process } : {}),
     attributes: combined,
   };
 }
@@ -4148,7 +5549,7 @@ function otlpMetricsToUniversal(
 
 @UseGuards(ManagementAuthGuard)
 @Controller('security-center')
-export class SecurityMonitoringController {
+export class SecurityMonitoringController implements OnModuleDestroy {
   constructor(
     private readonly agg: AggregationService,
     private readonly agentMetadata: AgentMetadataService,
@@ -4176,7 +5577,16 @@ export class SecurityMonitoringController {
     private readonly observedAssets: ObservedAssetLifecycleService,
     private readonly users: UserDirectoryService,
     private readonly platformMetrics: PlatformMetricsService,
+    private readonly canonicalObservability: CanonicalObservabilityService,
+    @Optional() private readonly conversationBindings?: AgentConversationBindingService,
   ) {}
+
+  onModuleDestroy(): void {
+    // These process-level replay fences are compatibility caches, not durable facts.  Explicitly
+    // clear them on a graceful shutdown so a hot-reload/test process cannot retain source payload
+    // digests or result envelopes beyond its lifecycle.
+    clearIngressCaches();
+  }
 
   private bindObservedAssetMeta(meta: T.EventMeta, eventAt?: number): T.EventMeta {
     const trustedCorrelation = serverTrustedCorrelationContext(meta);
@@ -4193,6 +5603,235 @@ export class SecurityMonitoringController {
 
   private materializeCommittedObservedAsset(meta: T.EventMeta, eventAt?: number): void {
     this.observedAssets?.materializeCommittedIngest?.(meta, eventAt);
+  }
+
+  /**
+   * Commit immutable Observer provenance before the Judge/Projection path.  This is deliberately a
+   * best-effort side lane: a raw-store or PostgreSQL outage records a CoverageGap but never drops
+   * the compatibility JudgedEvent or blocks the observed workload.
+   */
+  private async commitCanonicalObservation(
+    line: string,
+    meta: T.EventMeta,
+    sourceResolution: IngestionSourceResolution,
+    context: {
+      sourceId?: string;
+      collectorId?: string;
+      sourceType?: T.IngestionSourceType;
+      sourceEventId?: string;
+    } = {},
+  ): Promise<T.EventMeta> {
+    // Producer-supplied logical/terminal fields are hints until an authenticated Source or
+    // server-side registration validates them.  Legacy/tokenless traffic must remain a candidate
+    // and cannot mint a stable LogicalAgent from a forged line.
+    const sourceWorkspaceMatches = !sourceResolution.source?.workspacePath
+      || sourceResolution.source.workspacePath === meta.workspacePath;
+    const rejectedScope = Boolean(serverTrustedCorrelationContext(meta)?.sourceTrust?.rejectionReason);
+    const registeredDefinition = sourceResolution.authenticated && sourceWorkspaceMatches && !rejectedScope
+      ? this.agentMetadata.resolveRegisteredDefinition(
+          meta.workspacePath,
+          meta.agentId,
+          meta.subjectAssetId
+            ?? (typeof meta.attributes?.agentAssetId === 'string' ? meta.attributes.agentAssetId : undefined),
+          {
+            sourceId: context.sourceId ?? sourceResolution.source?.sourceId,
+            logicalAgentId: meta.logicalAgentId,
+            logicalDefinitionId: meta.logicalDefinitionId,
+            tenantId: meta.tenantId,
+            ownerId: meta.ownerId,
+            profile: meta.profile,
+            terminalContextId: meta.terminalContextId,
+            deploymentId: meta.deploymentId,
+            deploymentRevision: meta.deploymentRevision,
+            environmentId: meta.environmentId,
+          },
+        )
+      : undefined;
+    const registeredMeta = registeredDefinition
+      ? {
+          ...meta,
+          // Management-plane registration is the authoritative definition boundary; producer
+          // hints cannot silently move an observation to another LogicalAgent.
+          logicalAgentId: registeredDefinition.logicalAgentId,
+          logicalDefinitionId: registeredDefinition.definitionId,
+          logicalScopeMode: registeredDefinition.logicalScopeMode,
+          logicalIdentityAuthority: 'management_registration' as const,
+          logicalDefinitionFingerprint: registeredDefinition.definitionFingerprint,
+          // Registration owns the definition-scoped tuple. Do not let stale producer values alter
+          // the Session namespace or AgentInstance key after the logical ID has been authenticated.
+          tenantId: registeredDefinition.tenantId,
+          ownerId: registeredDefinition.ownerId,
+          profile: registeredDefinition.profile,
+          profileVersion: registeredDefinition.profileVersion,
+          deploymentId: registeredDefinition.deploymentId ?? meta.deploymentId,
+          deploymentRevision: registeredDefinition.deploymentRevision ?? meta.deploymentRevision,
+          // Environment is part of an AgentInstance/deployment fence.  When the management
+          // registration declares it, it wins over a stale producer hint just like the other
+          // definition-scoped fields; otherwise retain the transport-normalized environment.
+          environmentId: registeredDefinition.environmentId ?? meta.environmentId,
+          terminalContextId: registeredDefinition.terminalContextId ?? meta.terminalContextId,
+          attributes: {
+            ...(meta.attributes ?? {}),
+            ...(registeredDefinition.tenantId ? { tenantId: registeredDefinition.tenantId } : {}),
+            ...(registeredDefinition.ownerId ? { ownerId: registeredDefinition.ownerId } : {}),
+            ...(registeredDefinition.profile ? { profile: registeredDefinition.profile } : {}),
+            ...(registeredDefinition.profileVersion ? { profileVersion: registeredDefinition.profileVersion } : {}),
+            ...(registeredDefinition.deploymentId ? { deploymentId: registeredDefinition.deploymentId } : {}),
+            ...(registeredDefinition.deploymentRevision ? { deploymentRevision: registeredDefinition.deploymentRevision } : {}),
+            ...((registeredDefinition.environmentId ?? meta.environmentId)
+              ? { environmentId: registeredDefinition.environmentId ?? meta.environmentId } : {}),
+            'anysentry.logical_definition_fingerprint': registeredDefinition.definitionFingerprint,
+            ...(registeredDefinition.logicalAgentId
+              ? { 'anysentry.logical_agent_id': registeredDefinition.logicalAgentId } : {}),
+            ...(registeredDefinition.definitionId
+              ? { 'anysentry.logical_definition_id': registeredDefinition.definitionId } : {}),
+            'anysentry.logical_scope_mode': registeredDefinition.logicalScopeMode,
+          },
+        }
+      : meta;
+    // A Source token authenticates the transport, not the business identity.  Only a management
+    // registration (or a future explicit Adapter authority) may promote producer hints to a
+    // stable LogicalAgent.  This applies to authenticated-but-unregistered Sources as well as
+    // tokenless traffic; otherwise any holder of a collector token could mint a confirmed
+    // definition by putting logicalAgentId/tenant/profile in an NDJSON line.
+    const trustedMeta = registeredDefinition
+      ? registeredMeta
+      : {
+          ...meta,
+          logicalAgentId: undefined,
+          logicalAgentCandidateId: undefined,
+          logicalDefinitionId: undefined,
+          logicalScopeMode: 'unresolved' as const,
+          logicalIdentityAuthority: 'inferred' as const,
+          terminalContextId: undefined,
+          // Keep ordinary event attributes for compatibility, but do not let a producer smuggle
+          // a tenant/profile/definition tuple into the identity resolver and mint a stable
+          // LogicalAgent. Such lines remain candidate/unresolved until registration.
+          attributes: Object.fromEntries(Object.entries(meta.attributes ?? {})
+            .filter(([key]) => !/^(?:anysentry\.(?:logical|terminal)|logical[_-]|(?:workflow|service|definition|repository)[_.-](?:id|definition(?:[_-]?id)?|scope(?:[_-]?mode)?|revision)|(?:tenant|owner)[_.-]?id|(?:config|agent)[_.-]?profile(?:version)?|profile(?:version)?$)/iu.test(key))),
+        };
+    // `trustedMeta` is a public compatibility clone. Preserve the server-only capability created
+    // by `bindTrustedCorrelationForIngest` across this clone so the subsequent raw commit and
+    // Session/semantic resolvers can still distinguish an authenticated Adapter from a payload
+    // hint. The capability itself is never serialized or returned to the producer.
+    const preCommitTrustedContext = serverTrustedCorrelationContext(meta);
+    if (preCommitTrustedContext) bindServerTrustedCorrelationContext(trustedMeta, preCommitTrustedContext);
+    const process = trustedMeta.process;
+    const processGenerationKey = process?.processGenerationKey
+      ?? (process
+        ? deriveProcessGenerationKey({
+            hostId: process.hostId,
+            bootId: process.bootId,
+            pid: process.pid ?? 0,
+            startTimeNs: process.startTimeNs,
+            startTimeTicks: process.startTimeTicks,
+          })
+        : undefined);
+    const observedKind = observerLineEventKind(line) ?? trustedMeta.eventKind;
+    const trustedCollector = isTrustedCollectorProducer(
+      sourceResolution,
+      context.collectorId ?? sourceResolution.source?.collectorId,
+    );
+    const canonicalInstance = deriveAgentInstanceIdentity({
+      logicalAgentId: trustedMeta.logicalAgentId,
+      logicalDefinitionId: trustedMeta.logicalDefinitionId,
+      logicalScopeMode: trustedMeta.logicalScopeMode,
+      deploymentId: trustedMeta.deploymentId,
+      deploymentRevision: trustedMeta.deploymentRevision,
+      environmentId: trustedMeta.environmentId,
+      profile: trustedMeta.profile,
+      profileVersion: trustedMeta.profileVersion,
+      processGenerationKey,
+    });
+    const runtimeInstanceId = (trustedCollector || Boolean(registeredDefinition))
+      && (trustedMeta.process || trustedMeta.attribution?.agentInstanceId)
+      ? agentRuntimeInstanceIdForEvent({
+          agentId: trustedMeta.agentId,
+          workspacePath: trustedMeta.workspacePath,
+          sessionId: trustedMeta.sessionId,
+          attributes: trustedMeta.attributes ?? {},
+          process: trustedMeta.process,
+          attribution: trustedMeta.attribution,
+        })
+      : undefined;
+    const sourceType: import('./canonical-observability').RawObservationSourceType =
+      context.sourceType === 'observer' && !trustedCollector
+        ? 'api'
+        : context.sourceType === 'forwarder' && !trustedCollector
+          ? 'api'
+          : context.sourceType === 'observer'
+        ? ['LlmInteraction', 'AgentPlaintextEvidence', 'SslContent', 'LlmApi'].includes(observedKind ?? '')
+          ? 'socket_payload'
+          : 'kernel'
+        : context.sourceType === 'forwarder' ? 'forwarder'
+          : context.sourceType === 'otel' ? 'otel'
+            : context.sourceType === 'webhook' ? 'api'
+              : 'api';
+    const trustedProcess = trustedCollector
+      && ['kernel', 'uprobe', 'socket_payload', 'forwarder'].includes(sourceType);
+    const committed = await this.canonicalObservability.commitObserverLine(line, {
+      sourceId: context.sourceId ?? sourceResolution.source?.sourceId,
+      collectorId: context.collectorId ?? sourceResolution.source?.collectorId,
+      sourceType,
+      sourceSequence: context.sourceEventId,
+      eventKind: observerLineEventKind(line) ?? trustedMeta.eventKind,
+      eventAtUnixNs: trustedMeta.eventAtUnixNs,
+      receivedAtUnixNs: trustedMeta.receivedAtUnixNs,
+      observationId: trustedMeta.rawObservationId,
+      revision: trustedMeta.rawObservationRevision,
+      processGenerationKey: trustedProcess ? processGenerationKey : undefined,
+      pid: trustedProcess ? process?.pid : undefined,
+      ppid: trustedProcess ? process?.ppid : undefined,
+      hostId: trustedProcess ? process?.hostId : undefined,
+      bootId: trustedProcess ? process?.bootId : undefined,
+      startTimeTicks: trustedProcess ? process?.startTimeTicks : undefined,
+      startTimeNs: trustedProcess ? process?.startTimeNs : undefined,
+      idempotencyKey: context.sourceEventId
+        ? `${context.sourceId ?? sourceResolution.source?.sourceId ?? 'observer'}:${context.sourceEventId}:r${trustedMeta.rawObservationRevision ?? 1}`
+        : undefined,
+    });
+    if (!committed.observation) {
+      return {
+        ...trustedMeta,
+        attributes: {
+          ...(trustedMeta.attributes ?? {}),
+          'anysentry.raw_commit_status': 'coverage_gap',
+        },
+      };
+    }
+    const attached = this.canonicalObservability.attachMeta(trustedMeta, committed.observation);
+    // `attachMeta` is an additive public projection and therefore returns a fresh object.  Carry
+    // the server-only capability across that clone; otherwise the Judge would silently downgrade
+    // an already-authorized application/adapter claim after the canonical raw commit.
+    const trustedContext = serverTrustedCorrelationContext(trustedMeta);
+    if (trustedContext) bindServerTrustedCorrelationContext(attached, trustedContext);
+    const commitStatus = committed.durable ? 'durable' : 'hot_only';
+    const attachedWithStatus = {
+      ...attached,
+      ...(canonicalInstance.agentInstanceId
+        ? { canonicalAgentInstanceId: canonicalInstance.agentInstanceId }
+        : {}),
+      ...(runtimeInstanceId ? { runtimeInstanceId } : {}),
+      attributes: {
+        ...(attached.attributes ?? {}),
+        'anysentry.raw_commit_status': commitStatus,
+      },
+    };
+    const finalMeta = committed.kernelFact
+      ? {
+          ...attachedWithStatus,
+          kernelFactId: committed.kernelFact.factId,
+          attributes: {
+            ...(attachedWithStatus.attributes ?? {}),
+            'anysentry.kernel_fact_id': committed.kernelFact.factId,
+          },
+        }
+      : attachedWithStatus;
+    // The status/kernel-fact enrichment above creates another public clone. Re-bind the
+    // capability to the exact object returned to the caller; otherwise a later resolver would
+    // silently treat an authenticated claim as untrusted after the raw commit.
+    if (trustedContext) bindServerTrustedCorrelationContext(finalMeta, trustedContext);
+    return finalMeta;
   }
 
   private modelProfile(value: string): RuntimeModelProfile {
@@ -4766,6 +6405,24 @@ export class SecurityMonitoringController {
       semanticEventId,
     });
     if (!result) throw new NotFoundException('semantic tool event was not found');
+    const canonicalLinks = canonicalEvidenceLinksForRelations(result.relations);
+    const canonicalRelations = result.relations.map((relation, index) => {
+      const link = canonicalLinks[index];
+      return link
+        ? {
+            ...relation,
+            evidenceLinkId: link.linkId,
+            algorithmVersion: link.algorithmVersion,
+            sourceRefs: link.evidenceRefs,
+            validFromUnixNs: link.validFromUnixNs,
+            relationRevision: link.resolutionRevision,
+          }
+        : relation;
+    });
+    const response = { ...result, relations: canonicalRelations };
+    // Read paths are side-effect free. EvidenceLinks are materialized by the ingest-triggered
+    // correlation projector; this endpoint only returns the latest computed relation (or its
+    // durable revision) and never creates a new revision because an inspector was opened.
     this.audit.record({
       actor: auditActor(headers),
       action: 'agent.semantic_evidence.read',
@@ -4776,11 +6433,11 @@ export class SecurityMonitoringController {
         conversationId: result.conversationId,
         semanticEventId,
         toolInvocationId: result.toolInvocationId,
-        relationStatus: result.relationStatus,
-        kernelEventCount: result.kernelEvents.length,
+        relationStatus: response.relationStatus,
+        kernelEventCount: response.kernelEvents.length,
       },
     });
-    return result;
+    return response;
   }
 
   @Post('agents/kernel-events/semantic-context')
@@ -4792,6 +6449,25 @@ export class SecurityMonitoringController {
     const eventId = strictIdentityText(body?.eventId, 512);
     if (!eventId) throw new BadRequestException('a valid eventId is required');
     const result = await this.agg.agentKernelSemanticContext(eventId);
+    const canonicalLinks = canonicalEvidenceLinksForRelations(result.relations);
+    const response = {
+      ...result,
+      relations: result.relations.map((relation, index) => {
+        const link = canonicalLinks[index];
+        return link
+          ? {
+              ...relation,
+              evidenceLinkId: link.linkId,
+              algorithmVersion: link.algorithmVersion,
+              sourceRefs: link.evidenceRefs,
+              validFromUnixNs: link.validFromUnixNs,
+              relationRevision: link.resolutionRevision,
+            }
+          : relation;
+      }),
+    };
+    // Evidence relation persistence belongs to the ingest/correlation projector. Keep this query
+    // endpoint read-only so repeated inspector refreshes cannot mutate relation history.
     this.audit.record({
       actor: auditActor(headers),
       action: 'agent.semantic_evidence.read',
@@ -4800,11 +6476,11 @@ export class SecurityMonitoringController {
       summary: `Read Kernel event semantic context with ${result.relations.length} relation(s)`,
       details: {
         eventId,
-        relationCount: result.relations.length,
-        conversationCount: result.conversationLinks.length,
+        relationCount: response.relations.length,
+        conversationCount: response.conversationLinks.length,
       },
     });
-    return result;
+    return response;
   }
 
   @Post('agents/conversation-directory')
@@ -4938,6 +6614,11 @@ export class SecurityMonitoringController {
               : {}),
             ...(instance.workspacePath ? { workspacePath: instance.workspacePath } : {}),
             ...(instance.workloadRef ? { workloadRef: { ...instance.workloadRef } } : {}),
+            ...(instance.logicalAgentId ? { logicalAgentId: instance.logicalAgentId } : {}),
+            ...(instance.logicalDefinitionId ? { logicalDefinitionId: instance.logicalDefinitionId } : {}),
+            ...(instance.logicalScopeMode ? { logicalScopeMode: instance.logicalScopeMode } : {}),
+            ...(instance.terminalContextId ? { terminalContextId: instance.terminalContextId } : {}),
+            ...(instance.sshConnectionId ? { sshConnectionId: instance.sshConnectionId } : {}),
           }));
         const visibleInstanceIds = [...new Set([
           ...thin.userThreads.flatMap((thread) => thread.agentInstanceIds),
@@ -7209,6 +8890,193 @@ export class SecurityMonitoringController {
     return this.judge.stats();
   }
 
+  /**
+   * Canonical raw-fact metadata endpoint.  It never returns captured body bytes; callers receive
+   * hash/ref/length and provenance only.  The endpoint is management-authenticated because even
+   * opaque source and process identifiers can reveal tenant/runtime topology.
+   */
+  @Get('v1/raw-observations')
+  @RequireManagementAuth()
+  async canonicalRawObservations(@Query('limit') limit?: string) {
+    const bounded = Number.isFinite(Number(limit)) ? Number(limit) : 500;
+    const items = await this.canonicalObservability.listDurable(bounded);
+    return {
+      schemaVersion: 'anysentry.raw_observation.list.v1',
+      items,
+      total: items.length,
+      store: this.canonicalObservability.stats(),
+      updateTime: new Date().toISOString(),
+    };
+  }
+
+  @Get('v1/raw-observations/:observationId')
+  @RequireManagementAuth()
+  async canonicalRawObservation(@Param('observationId') observationId: string, @Query('revision') revisionText?: string) {
+    const id = strictIdentityText(observationId, 240);
+    if (!id) throw new BadRequestException('observationId is invalid');
+    const revision = revisionText === undefined ? undefined : Number(revisionText);
+    if (revisionText !== undefined && (revision === undefined || !Number.isSafeInteger(revision) || revision < 1)) {
+      throw new BadRequestException('revision is invalid');
+    }
+    const item = await this.canonicalObservability.getDurableRawObservation(id, revision);
+    if (!item) throw new NotFoundException('raw observation not found');
+    return { schemaVersion: 'anysentry.raw_observation.v1', item };
+  }
+
+  /** Coverage is a first-class projection: parser/adapter/TLS gaps never erase Kernel facts. */
+  @Get('v1/coverage-gaps')
+  @RequireManagementAuth()
+  canonicalCoverageGaps(@Query('limit') limit?: string) {
+    const bounded = Number.isFinite(Number(limit)) ? Number(limit) : 500;
+    const items = this.canonicalObservability.listGaps(bounded);
+    return {
+      schemaVersion: 'anysentry.coverage_gap.list.v1',
+      items,
+      total: items.length,
+      gapStore: this.canonicalObservability.gapStats(),
+      updateTime: new Date().toISOString(),
+    };
+  }
+
+  /** Machine-side canonical facts remain queryable even when no semantic Adapter is available. */
+  @Get('v1/kernel-facts')
+  @RequireManagementAuth()
+  async canonicalKernelFacts(@Query('limit') limit?: string) {
+    const bounded = Number.isFinite(Number(limit)) ? Number(limit) : 500;
+    const items = await this.canonicalObservability.listDurableKernelFacts(bounded);
+    return {
+      schemaVersion: 'anysentry.kernel_fact.list.v1',
+      items,
+      total: items.length,
+      store: this.canonicalObservability.kernelStats(),
+      updateTime: new Date().toISOString(),
+    };
+  }
+
+  @Get('v1/kernel-facts/:factId')
+  @RequireManagementAuth()
+  async canonicalKernelFact(@Param('factId') factId: string) {
+    const id = strictIdentityText(factId, 240);
+    if (!id) throw new BadRequestException('factId is invalid');
+    const item = await this.canonicalObservability.getDurableKernelFact(id);
+    if (!item) throw new NotFoundException('kernel fact not found');
+    return { schemaVersion: 'anysentry.kernel_fact.v1', item };
+  }
+
+  /** Rebuildable human-side semantic projection; bodies remain hash/ref-only in this lane. */
+  @Get('v1/semantic-records')
+  @RequireManagementAuth()
+  async canonicalSemanticRecords(@Query('limit') limit?: string) {
+    const bounded = Number.isFinite(Number(limit)) ? Number(limit) : 500;
+    const items = await this.canonicalObservability.listDurableSemanticRecords(bounded);
+    return {
+      schemaVersion: 'anysentry.semantic_record.list.v1',
+      items,
+      total: items.length,
+      store: this.canonicalObservability.semanticStats(),
+      updateTime: new Date().toISOString(),
+    };
+  }
+
+  @Get('v1/semantic-records/:semanticRecordId')
+  @RequireManagementAuth()
+  async canonicalSemanticRecord(@Param('semanticRecordId') semanticRecordId: string, @Query('revision') revisionText?: string) {
+    const id = strictIdentityText(semanticRecordId, 240);
+    if (!id) throw new BadRequestException('semanticRecordId is invalid');
+    const revision = revisionText === undefined ? undefined : Number(revisionText);
+    if (revisionText !== undefined && (revision === undefined || !Number.isSafeInteger(revision) || revision < 1)) {
+      throw new BadRequestException('revision is invalid');
+    }
+    const item = await this.canonicalObservability.getDurableSemanticRecord(id, revision);
+    if (!item) throw new NotFoundException('semantic record not found');
+    return { schemaVersion: 'anysentry.semantic_record.v1', item };
+  }
+
+  @Get('v1/evidence-links')
+  @RequireManagementAuth()
+  async canonicalEvidenceLinks(@Query('limit') limit?: string) {
+    const bounded = Number.isFinite(Number(limit)) ? Number(limit) : 500;
+    const items = await this.canonicalObservability.listDurableEvidenceLinks(bounded);
+    return {
+      schemaVersion: 'anysentry.evidence_link.list.v1',
+      items,
+      total: items.length,
+      store: this.canonicalObservability.evidence.stats(),
+      updateTime: new Date().toISOString(),
+    };
+  }
+
+  @Get('v1/evidence-links/:linkId')
+  @RequireManagementAuth()
+  async canonicalEvidenceLink(@Param('linkId') linkId: string, @Query('resolutionRevision') revisionText?: string) {
+    const id = strictIdentityText(linkId, 240);
+    if (!id) throw new BadRequestException('linkId is invalid');
+    const revision = revisionText === undefined ? undefined : Number(revisionText);
+    if (revisionText !== undefined && (revision === undefined || !Number.isSafeInteger(revision) || revision < 1)) {
+      throw new BadRequestException('resolutionRevision is invalid');
+    }
+    const item = await this.canonicalObservability.getDurableEvidenceLink(id, revision);
+    if (!item) throw new NotFoundException('evidence link not found');
+    return { schemaVersion: 'anysentry.evidence_link.v1', item };
+  }
+
+  @Get('v1/session-memberships')
+  @RequireManagementAuth()
+  async canonicalSessionMemberships(@Query('limit') limit?: string) {
+    const bounded = Number.isFinite(Number(limit)) ? Number(limit) : 500;
+    const items = await this.canonicalObservability.listDurableSessionMemberships(bounded);
+    return {
+      schemaVersion: 'anysentry.session_membership.list.v1',
+      items,
+      total: items.length,
+      store: this.canonicalObservability.sessionMembershipStats(),
+      updateTime: new Date().toISOString(),
+    };
+  }
+
+  @Get('v1/session-memberships/:membershipId')
+  @RequireManagementAuth()
+  async canonicalSessionMembership(@Param('membershipId') membershipId: string, @Query('resolutionRevision') revisionText?: string) {
+    const id = strictIdentityText(membershipId, 240);
+    if (!id) throw new BadRequestException('membershipId is invalid');
+    const revision = revisionText === undefined ? undefined : Number(revisionText);
+    if (revisionText !== undefined && (revision === undefined || !Number.isSafeInteger(revision) || revision < 1)) {
+      throw new BadRequestException('resolutionRevision is invalid');
+    }
+    const item = await this.canonicalObservability.getDurableSessionMembership(id, revision);
+    if (!item) throw new NotFoundException('session membership not found');
+    return { schemaVersion: 'anysentry.session_membership.v1', item };
+  }
+
+  @Get('v1/observability/contracts')
+  observabilityContracts() {
+    return {
+      schemaVersion: 'anysentry.observability_contract_catalog.v1',
+      rawObservation: 'anysentry.raw_observation.v1',
+      kernelFact: 'anysentry.kernel_fact.v1',
+      semanticRecord: 'anysentry.semantic_record.v1',
+      logicalAgentDefinition: 'anysentry.logical_agent_definition.v1',
+      agentInstance: 'anysentry.agent_instance.v1',
+      runtimeInstance: 'anysentry.runtime_instance.v1',
+      connectionIdentity: 'anysentry.connection_identity.v1',
+      sessionMembership: 'anysentry.session_membership.v1',
+      evidenceLink: 'anysentry.evidence_link.v1',
+      coverageGap: 'anysentry.coverage_gap.v1',
+      relationRevision: 'anysentry.relation_revision.v1',
+      registries: this.canonicalObservability.registryCatalog(),
+      retention: {
+        rawHotTtlMs: this.canonicalObservability.stats().ttlMs,
+        bodies: 'hash_only_in_canonical_lane',
+        sessionKey: SESSION_KEY_ALGORITHM_V1,
+        canonicalSessionId: CANONICAL_SESSION_ID_ALGORITHM_V1,
+        sessionHashSecretMode: SESSION_HASH_SECRET_MODE,
+        // Deprecated compatibility label retained for older readers; the new field above makes
+        // the dedicated-vs-ephemeral distinction explicit without exposing any secret material.
+        unconfiguredSecret: 'process_ephemeral',
+      },
+    };
+  }
+
   @Get('healthz')
   healthz() {
     const stats = this.judge.healthStats();
@@ -7223,6 +9091,8 @@ export class SecurityMonitoringController {
         mode: this.relational.configured() ? 'postgresql' : 'clickhouse-migration-fallback',
         postgresqlConfigured: this.relational.configured(),
         postgresqlReady: this.relational.isReady(),
+        writerOwnership: this.relational.writerOwnershipStats(),
+        agentMetadataHotState: this.agentMetadata.hotStateStats(),
         workspaceDirectory: this.workspaceDirectory.status(),
         incidents: this.judge.incidentStateStatus(),
         alerts: this.alerting.stateStatus(),
@@ -7252,6 +9122,17 @@ export class SecurityMonitoringController {
       },
       supplyChain: {
         enabled: this.supplyChain.enabled,
+      },
+      canonicalObservability: {
+        raw: this.canonicalObservability.stats(),
+        kernel: this.canonicalObservability.kernelStats(),
+        semantic: this.canonicalObservability.semanticStats(),
+        evidence: this.canonicalObservability.evidence.stats(),
+        sessionMembership: this.canonicalObservability.sessionMembershipStats(),
+        gaps: this.canonicalObservability.gapStats(),
+        bindingHotState: this.conversationBindings?.hotStateStats(),
+        aggregationCaches: this.agg.cacheStateStats(),
+        ingressCaches: ingressCacheStats(),
       },
     };
   }
@@ -7592,6 +9473,7 @@ export class SecurityMonitoringController {
       workspacePath: body.workspacePath,
       sourceName: body.sourceName,
       type: requestSourceType,
+      correlationClaim: universalCorrelationClaimForResolve(events[0], body),
     });
     if (!sourceResolution.accepted) {
       const reason = sourceResolution.reason ?? 'source rejected';
@@ -7666,7 +9548,7 @@ export class SecurityMonitoringController {
         ? `${idempotencySource}\0${producerEventId}`
         : '';
       const producerEventDigest = producerEventKey
-        ? createHash('sha256').update(JSON.stringify({ defaults: idempotencyDefaults, input })).digest('hex')
+        ? safePayloadDigest({ defaults: idempotencyDefaults, event: input })
         : '';
       const replay = producerEventKey
         ? universalEventReplay(producerEventKey, producerEventDigest)
@@ -7767,16 +9649,33 @@ export class SecurityMonitoringController {
       }
       const line = universalEventLine(kind, input, defaults);
       const partial = universalMeta(input, defaults, sourceResolution.source?.sourceId);
+      const canonicalSourceEventId = partial.sourceEventId
+        ?? `universal-${Date.now()}-${process.pid}-${universalCanonicalSequence += 1}-${index}`;
       const derived = deriveMeta(line, {
         ...partial,
         eventKind: kind,
         eventCategory: partial.eventCategory ?? eventCategory(kind),
       });
       const hasProducerTime = input.at !== undefined || input.timestamp !== undefined || eventAttr(input, 'timestamp') !== undefined;
-      const observedAt = sourceResolution.authenticated ? eventTime(input) : undefined;
+      const candidateObservedAt = hasProducerTime ? eventTime(input) : undefined;
+      const observedAt = sourceResolution.authenticated
+        && candidateObservedAt !== undefined
+        && Number.isFinite(candidateObservedAt)
+        && candidateObservedAt >= Date.UTC(2000, 0, 1)
+        && candidateObservedAt <= Date.now() + 5 * 60_000
+        ? candidateObservedAt : undefined;
       const judgedAt = observedAt ?? Date.now();
       const timedDerived: T.EventMeta = {
         ...derived,
+        ...(observedAt === undefined ? {
+          eventAtUnixNs: undefined,
+          receivedAtUnixNs: undefined,
+          eventTimeQuality: 'api_received' as const,
+        } : {
+          eventAtUnixNs: String(BigInt(Math.trunc(observedAt)) * 1_000_000n),
+          receivedAtUnixNs: String(BigInt(Math.max(Math.trunc(observedAt), Date.now())) * 1_000_000n),
+          eventTimeQuality: 'producer_supplied' as const,
+        }),
         ...(producerEventKey && authenticatedSemanticAdapter ? {
           attributes: {
             ...(derived.attributes ?? {}),
@@ -7833,7 +9732,7 @@ export class SecurityMonitoringController {
       const serverReviewed = serverEnrichment.inventoryObserved
         ? this.agentMetadata.applyReview(semanticResolved, observedAt)
         : semanticResolved;
-      const meta = this.bindObservedAssetMeta(bindTrustedCorrelationForIngest(
+      let meta = this.bindObservedAssetMeta(bindTrustedCorrelationForIngest(
         serverReviewed,
         rawUniversalCorrelationClaims(input, defaults),
         sourceResolution,
@@ -7841,9 +9740,47 @@ export class SecurityMonitoringController {
         authenticatedSemanticAdapterForEvent,
         serverEnrichment.inventoryObserved,
       ), observedAt);
+      // All ingress modes share the same append-only RawObservation fence. Universal/OTel events
+      // used to bypass it, which made semantic API claims impossible to trace back to a source
+      // fact and allowed parser failures to erase coverage context. Commit before the Judge just as
+      // the Observer batch path does; the compatibility event remains fail-open on storage loss.
+      meta = await this.commitCanonicalObservation(line, meta, sourceResolution, {
+        sourceId: requestSourceId,
+        collectorId: inputCollectorId,
+        sourceType: body.sourceType
+          ?? (sourceResolution.authenticated ? sourceResolution.source?.type : fallbackType),
+        sourceEventId: canonicalSourceEventId,
+      });
+      // Source authorization is evaluated against this event's immutable scope. The batch-level
+      // resolution may be intentionally false for a mixed batch, so consult the server-only
+      // capability carried by `meta` before accepting provider/session anchors.
+      const eventAdapterClaimAuthorized = semanticAgentEvent
+        && hasAuthorizedSemanticClaim(meta, sourceResolution, 'agent_adapter');
+      const rejectedScope = Boolean(serverTrustedCorrelationContext(meta)?.sourceTrust?.rejectionReason);
+      meta = bindUniversalSessionIdentity(meta, input, defaults, {
+        allowProviderAnchor: sourceResolution.authenticated
+          && !rejectedScope
+          && (meta.logicalIdentityAuthority === 'management_registration'
+            || eventAdapterClaimAuthorized
+            || hasAuthorizedSemanticClaim(meta, sourceResolution, 'application')),
+      });
+      // In the additive `off` rollout, preserve the legacy producer Run field exactly as the old
+      // API did, while emitting no new trusted-correlation fields. Shadow/enabled modes require a
+      // server-authorized application/Adapter claim and otherwise derive an event-local ID.
+      const legacyRunId = correlationCaptureRollout().trustedCorrelation === 'off'
+        ? validCorrelationClaimText(input.runId ?? defaults.runId)
+        : undefined;
+      const producerRunId = trustedProducerRunId(meta) ?? legacyRunId;
+      const runContext = serverTrustedCorrelationContext(meta);
+      meta = producerRunId
+        ? { ...meta, runId: producerRunId, runIdSource: 'producer' as const }
+        : { ...meta, runId: undefined, runIdSource: undefined };
+      if (runContext) bindServerTrustedCorrelationContext(meta, runContext);
       let rec: T.JudgedEvent | null;
       let durableRetained = false;
-      const reserveProducerEvent = Boolean(producerEventKey && authenticatedSemanticAdapterForEvent);
+      // Only the per-event server capability can authorize an Adapter idempotency reservation;
+      // the batch-level policy/type hint is not sufficient when scopes are mixed or mismatched.
+      const reserveProducerEvent = Boolean(producerEventKey && eventAdapterClaimAuthorized);
       if (reserveProducerEvent) reserveUniversalEvent(producerEventKey, producerEventDigest, index);
       try {
         if (judgeMode === 'sync') {
@@ -7853,7 +9790,7 @@ export class SecurityMonitoringController {
             line,
             meta,
             judgedAt,
-            producerEventKey && authenticatedSemanticAdapterForEvent
+            producerEventKey && eventAdapterClaimAuthorized
               ? `adapter-event:${producerEventKey}:${producerEventDigest}`
               : undefined,
           );
@@ -7906,6 +9843,10 @@ export class SecurityMonitoringController {
       if (!rec) {
         if (reserveProducerEvent) forgetUniversalEventReservation(producerEventKey, producerEventDigest);
         const reason = `unsupported event kind: ${kind}`;
+        this.canonicalObservability.recordGap(
+          'agent_adapter', 'unsupported_protocol', canonicalSourceEventId,
+          { eventKind: kind },
+        );
         this.recordRejectedIngest(sourceResolution, reason, {
           sourceId: requestSourceId,
           sourceName: body.sourceName,
@@ -7921,6 +9862,48 @@ export class SecurityMonitoringController {
       const resultItem = universalAcceptedResultItem(index, rec);
       if (producerEventKey) rememberUniversalEvent(producerEventKey, producerEventDigest, resultItem);
       if (kind !== 'SystemContext') {
+        let semanticInteractionProjected = false;
+        if (isSemanticUniversalEventKind(kind)) {
+          const semanticCommit = await this.canonicalObservability.commitSemanticRecords(
+            canonicalSemanticRecordForEvent(
+              rec,
+              canonicalSemanticAuthority(
+                sourceResolution,
+                inputCollectorId,
+                eventAdapterClaimAuthorized,
+                meta,
+              ),
+            ),
+          );
+          if (semanticCommit.rejected > 0) {
+            this.canonicalObservability.recordGap(
+              'projection', 'dropped', rec.eventId,
+              { rejected: semanticCommit.rejected, eventKind: kind },
+            );
+          }
+          // Application/OTLP semantic records need a compatibility Conversation projection so
+          // Dify/LangGraph runs are visible through the same timeline API as passive LLM captures.
+          // The projection is reference-only and therefore never copies producer prompt/body data.
+          if (sourceResolution.authenticated) {
+            try {
+              await this.agg.storeAgentInteraction(canonicalInteractionForSemanticEvent(rec));
+              semanticInteractionProjected = true;
+            } catch (error) {
+              this.canonicalObservability.recordGap(
+                'projection',
+                'storage_unavailable',
+                rec.eventId,
+                { projection: 'semantic_conversation', error: 'write_failed' },
+              );
+            }
+          }
+        }
+        // Universal/OTLP semantic events do not pass through the legacy Interaction parser. Keep
+        // their explicit Session/Run identity in the canonical membership lane as an additive
+        // projection; raw facts and JudgedEvent durability remain independent of this write.
+        if (!semanticInteractionProjected) {
+          await this.conversationBindings?.commitEventMembership(rec);
+        }
         if (durableRetained) this.materializeCommittedObservedAsset(rec, observedAt);
         await this.enqueueCanonicalShadow(rec, line);
         await this.observeSupplyChainInstall(rec, line);
@@ -7974,7 +9957,7 @@ export class SecurityMonitoringController {
     if (body.payloadDigest !== undefined && !OBSERVER_BATCH_DIGEST.test(claimedDigest)) {
       throw new BadRequestException('observer payloadDigest must be a lowercase SHA-256 digest');
     }
-    if (claimedDigest && claimedDigest !== payload.digest) {
+    if (claimedDigest && claimedDigest !== payload.digest && claimedDigest !== payload.safeDigest) {
       throw new BadRequestException('observer payloadDigest does not match events');
     }
     const batchScope = headerValue(headers, 'x-anysentry-source-id')
@@ -7982,7 +9965,17 @@ export class SecurityMonitoringController {
       ?? events[0]?.collectorId
       ?? 'anonymous';
     const batchCacheKey = batchId ? `${batchScope}\0${batchId}` : '';
-    if (batchCacheKey) rememberObserverBatchDigest(batchCacheKey, payload.digest);
+    // Cache/idempotency state uses the secret-stripped digest; the legacy wire digest remains
+    // available for protocol compatibility in the transient ACK only.
+    if (batchCacheKey) rememberObserverBatchDigest(batchCacheKey, payload.safeDigest);
+
+    // A terminal ACK is safe to return once Source authentication and the global size/digest
+    // checks above have succeeded.  Resolve this before per-event enrichment/raw commits so an
+    // exact Forwarder retry is genuinely side-effect free (apart from the bounded cache touch).
+    if (batchCacheKey) {
+      const cached = cachedObserverBatchResult(batchCacheKey, payload.safeDigest);
+      if (cached) return cached;
+    }
 
     const immediate = new Map<number, T.ObserverBatchIngestResultItem>();
     const rejectedSources = new Map<number, {
@@ -8066,6 +10059,11 @@ export class SecurityMonitoringController {
         });
         continue;
       }
+      // A managed Forwarder commonly omits the per-item sourceType because the Source record is
+      // already the authenticated transport authority.  Reuse that server-owned type for the
+      // canonical raw lane; otherwise an Observer batch would be downgraded to an API fact and
+      // lose its independent KernelFact projection.
+      const effectiveSourceType = sourceType ?? sourceResolution.source?.type;
       if (
         observerLineEventKind(line) === 'CaptureAggregate' &&
         !isTrustedCollectorProducer(sourceResolution, collectorId)
@@ -8128,7 +10126,7 @@ export class SecurityMonitoringController {
           ...(nodeName ? { collectorNode: nodeName } : {}),
           ...(sourceResolution.source?.sourceId ? { sourceId: sourceResolution.source.sourceId } : {}),
           [OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE]: createHash('sha256')
-            .update(JSON.stringify(event))
+            .update(JSON.stringify(digestSafeValue(event)))
             .digest('hex'),
         },
       };
@@ -8158,14 +10156,38 @@ export class SecurityMonitoringController {
             receivedAt: unixNsMillis(enriched.receivedAtUnixNs) ?? Date.now(),
             eventTimeQuality: 'collector_calibrated',
           };
-      const meta = this.bindObservedAssetMeta(bindTrustedCorrelationForIngest(
+      let meta = this.bindObservedAssetMeta(bindTrustedCorrelationForIngest(
         this.agentMetadata.applyReview(timedMeta, collectorEventAt),
         rawObserverCorrelationClaims(line, given),
         sourceResolution,
         Boolean(requestToken),
       ), collectorEventAt);
+      // RawObservation is the append-only provenance fence.  Commit it after source
+      // authentication but before semantic/Judge preparation; a later parser or storage failure
+      // must leave the raw fact and an explicit gap rather than silently deleting the observation.
+      meta = await this.commitCanonicalObservation(line, meta, sourceResolution, {
+        sourceId: requestSourceId,
+        collectorId,
+        sourceType: sourceType ?? sourceResolution.source?.type,
+        sourceEventId,
+      });
+      meta = bindCanonicalSessionFromMeta(
+        meta,
+        sourceResolution.authenticated
+          && (meta.logicalIdentityAuthority === 'management_registration'
+            || hasAuthorizedSemanticClaim(meta, sourceResolution, 'agent_adapter')
+            || hasAuthorizedSemanticClaim(meta, sourceResolution, 'application')),
+      );
       const prepared = this.judge.prepareAcceptWithDisposition(line, meta, collectorEventAt ?? Date.now());
       const interaction = parseObserverAgentInteraction(line, meta);
+      if (!interaction && observerLineEventKind(line) === 'LlmInteraction') {
+        this.canonicalObservability.recordGap(
+          'llm_format',
+          'parser_failed',
+          meta.rawObservationId ?? meta.attributes?.collectorId?.toString() ?? 'observer',
+          { eventKind: 'LlmInteraction' },
+        );
+      }
       const context: PreparedObserverBatchEvent = {
         index,
         body: event,
@@ -8173,7 +10195,7 @@ export class SecurityMonitoringController {
         collectorId,
         requestSourceId,
         sourceName,
-        sourceType,
+        sourceType: effectiveSourceType,
         nodeName,
         sourceResolution,
         meta,
@@ -8189,11 +10211,6 @@ export class SecurityMonitoringController {
     // still run on every request, but a previously terminal ACK is the authoritative idempotency
     // result: do not re-enrich the same immutable source events into a different revision 1 after
     // a response timeout. Heartbeat/mixed legacy batches keep their existing live control path.
-    if (batchCacheKey && rejectedSources.size === 0 && legacyIndexes.size === 0) {
-      const cached = cachedObserverBatchResult(batchCacheKey, payload.digest);
-      if (cached) return cached;
-    }
-
     let retainedForPersistence = retained;
     let durableReplayConflict = false;
     if (
@@ -8295,7 +10312,7 @@ export class SecurityMonitoringController {
       try {
         retainedDurability = await this.judge.persistPreparedBatch(
           retainedPrepared,
-          `observer-batch:${batchScope}:${batchId || 'digest'}:${payload.digest}`,
+          `observer-batch:${batchScope}:${batchId || 'digest'}:${payload.safeDigest}`,
         );
       } catch (error) {
         if (isClickHouseEventBufferFull(error)) {
@@ -8455,13 +10472,37 @@ export class SecurityMonitoringController {
 
       try {
         if (context.interaction) {
-          await this.agg.storeAgentInteraction({
+          const interaction = {
             ...context.interaction,
             evidenceEventIds: [...new Set([
               ...(context.interaction.evidenceEventIds ?? []),
               prepared.event.eventId,
             ])],
-          });
+          };
+          await this.agg.storeAgentInteraction(interaction);
+          const semanticCommit = await this.canonicalObservability.commitSemanticRecords(
+            canonicalSemanticRecordsForInteraction(
+              interaction,
+              canonicalSemanticAuthority(
+                context.sourceResolution,
+                context.collectorId,
+                context.sourceResolution.claimAuthority === 'agent_adapter',
+                context.meta,
+              ),
+            ),
+          );
+          if (semanticCommit.rejected > 0) {
+            this.canonicalObservability.recordGap(
+              'projection', 'dropped', interaction.interactionId,
+              { rejected: semanticCommit.rejected },
+            );
+          }
+        } else {
+          // Generic/application events have no AgentInteraction projection, but their explicit
+          // Session/Run claims still belong in the canonical identity lane.  Observer
+          // LlmInteraction records are materialized by AggregationService above so they do not
+          // create a duplicate membership under the compatibility event id.
+          await this.conversationBindings?.commitEventMembership(prepared.event);
         }
         await this.observeSupplyChainInstall(prepared.event, context.line);
         this.observeWorkspaceAssociation(prepared.event);
@@ -8543,7 +10584,7 @@ export class SecurityMonitoringController {
       && rejectedSources.size === 0
       && legacyIndexes.size === 0
     ) {
-      rememberObserverBatchResult(batchCacheKey, payload.digest, result);
+      rememberObserverBatchResult(batchCacheKey, payload.safeDigest, result);
     }
     return result;
   }
@@ -8674,7 +10715,7 @@ export class SecurityMonitoringController {
       }
       return { accepted: true, sourceId: sourceResolution.source?.sourceId, collectorId: rec.collectorId, receivedAt: new Date(rec.at).toISOString(), kind: 'collector-heartbeat' };
     }
-    const metaGiven: Partial<T.EventMeta> = {
+      const metaGiven: Partial<T.EventMeta> = {
       ...given,
       sourceEventId,
       attributes: {
@@ -8712,12 +10753,25 @@ export class SecurityMonitoringController {
           receivedAt: unixNsMillis(enriched.receivedAtUnixNs) ?? Date.now(),
           eventTimeQuality: 'collector_calibrated',
         };
-    const meta = this.bindObservedAssetMeta(bindTrustedCorrelationForIngest(
+    let meta = this.bindObservedAssetMeta(bindTrustedCorrelationForIngest(
       this.agentMetadata.applyReview(timedMeta, collectorEventAt),
       rawObserverCorrelationClaims(line, given),
       sourceResolution,
       Boolean(requestToken),
     ), collectorEventAt);
+    meta = await this.commitCanonicalObservation(line, meta, sourceResolution, {
+      sourceId: requestSourceId,
+      collectorId,
+      sourceType: sourceType ?? sourceResolution.source?.type,
+      sourceEventId,
+    });
+    meta = bindCanonicalSessionFromMeta(
+      meta,
+      sourceResolution.authenticated
+        && (meta.logicalIdentityAuthority === 'management_registration'
+          || hasAuthorizedSemanticClaim(meta, sourceResolution, 'agent_adapter')
+          || hasAuthorizedSemanticClaim(meta, sourceResolution, 'application')),
+    );
     const outcome = await this.judge.acceptWithDisposition(line, meta, collectorEventAt ?? Date.now());
     if (outcome.disposition === 'structural_consumed') {
       this.materializeCommittedObservedAsset(meta, collectorEventAt);
@@ -8768,11 +10822,42 @@ export class SecurityMonitoringController {
       this.materializeCommittedObservedAsset(rec, collectorEventAt);
     }
     const interaction = parseObserverAgentInteraction(line, meta);
+    if (!interaction && observerLineEventKind(line) === 'LlmInteraction') {
+      this.canonicalObservability.recordGap(
+        'llm_format',
+        'parser_failed',
+        meta.rawObservationId ?? meta.attributes?.collectorId?.toString() ?? 'observer',
+        { eventKind: 'LlmInteraction' },
+      );
+    }
     if (interaction) {
-      await this.agg.storeAgentInteraction({
+      const enrichedInteraction = {
         ...interaction,
         evidenceEventIds: [...new Set([...(interaction.evidenceEventIds ?? []), rec.eventId])],
-      });
+      };
+      await this.agg.storeAgentInteraction(enrichedInteraction);
+      const semanticCommit = await this.canonicalObservability.commitSemanticRecords(
+        canonicalSemanticRecordsForInteraction(
+          enrichedInteraction,
+          canonicalSemanticAuthority(
+            sourceResolution,
+            collectorId,
+            sourceResolution.claimAuthority === 'agent_adapter',
+            meta,
+          ),
+        ),
+      );
+      if (semanticCommit.rejected > 0) {
+        this.canonicalObservability.recordGap(
+          'projection', 'dropped', enrichedInteraction.interactionId,
+          { rejected: semanticCommit.rejected },
+        );
+      }
+    } else {
+      // Keep semantic/application event sessions queryable even when no legacy interaction
+      // parser recognizes the line.  The canonical membership is additive and does not alter
+      // the JudgedEvent or its existing compatibility projection.
+      await this.conversationBindings?.commitEventMembership(rec);
     }
     await this.enqueueCanonicalShadow(rec, line);
     await this.observeSupplyChainInstall(rec, line);

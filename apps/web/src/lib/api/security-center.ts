@@ -1110,6 +1110,13 @@ export interface AgentInteractionRecord {
   interactionType: "model" | "tool" | "unparsed";
   at: number;
   workspacePath: string;
+  tenantId?: string;
+  ownerId?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
   sourceId?: string;
   collectorId?: string;
   agentAssetId: string;
@@ -1119,6 +1126,24 @@ export interface AgentInteractionRecord {
   traceId?: string;
   runId?: string;
   sessionId?: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  sessionIdentityQuality?: "confirmed" | "strong" | "inferred" | "ephemeral" | "unknown" | "conflict";
+  sessionIdSource?: "provider" | "authenticated_adapter" | "legacy_observer_session" | "legacy_agent_fallback" | "legacy_task_fallback" | "per_request" | "unresolved";
+  sessionMode?: "resumable" | "conversation" | "per_request" | "ephemeral" | "unknown";
+  sessionLifecycle?: "new" | "resume" | "fork";
+  parentSessionId?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: "registered_definition" | "workflow_definition" | "service_definition" | "terminal" | "unresolved";
+  logicalIdentityAuthority?: "management_registration" | "authenticated_adapter" | "inferred" | "unknown";
+  logicalDefinitionFingerprint?: string;
+  rawObservationId?: string;
+  rawObservationRevision?: number;
+  kernelFactId?: string;
+  sourceObservationIds?: string[];
+  runIdSource?: "producer" | "derived_ephemeral" | "legacy";
   invocationId?: string;
   providerConversationId?: string;
   providerResponseId?: string;
@@ -1217,6 +1242,26 @@ export interface AgentConversationQuery extends SecurityTimeFilter {
 export interface AgentConversationSummary {
   conversationId: string;
   idSource: "provider" | "runtime" | "inferred";
+  tenantId?: string;
+  ownerId?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: "registered_definition" | "workflow_definition" | "service_definition" | "terminal" | "unresolved";
+  logicalIdentityAuthority?: "management_registration" | "authenticated_adapter" | "inferred" | "unknown";
+  logicalDefinitionFingerprint?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  terminalContextIds?: string[];
+  sessionIdentityQuality?: "confirmed" | "strong" | "inferred" | "ephemeral" | "unknown" | "conflict";
+  sessionMode?: "resumable" | "conversation" | "per_request" | "ephemeral" | "unknown";
+  parentSessionId?: string;
+  sessionId?: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  sessionLifecycle?: "new" | "resume" | "fork";
   hasContent: boolean;
   agentAssetId: string;
   agentInstanceIds: string[];
@@ -1270,6 +1315,11 @@ export interface AgentConversationDirectoryQuery extends AgentConversationQuery 
 export interface LogicalAgentConversationDirectoryItem {
   logicalAgentId: string;
   groupingQuality: "exact" | "strong" | "inferred" | "unresolved";
+  logicalDefinitionId?: string;
+  logicalScopeMode?: "registered_definition" | "workflow_definition" | "service_definition" | "terminal" | "unresolved";
+  definitionFingerprint?: string;
+  candidateId?: string;
+  terminalContextIds?: string[];
   product: string;
   displayName: string;
   environment: "kubernetes" | "docker" | "host" | "unknown";
@@ -1383,7 +1433,7 @@ export interface AgentConversationEvent {
   statusCode?: number;
   durationNs?: string;
   completeness: AgentInteractionCompleteness;
-  correlationQuality: "exact" | "strong" | "inferred" | "unlinked";
+  correlationQuality: "exact" | "strong" | "inferred" | "ambiguous" | "coverage_gap" | "unlinked";
   evidenceEventIds: string[];
 }
 export interface AgentConversationTimeline extends ClassifiedResponseMeta {
@@ -1420,7 +1470,7 @@ export interface AgentSemanticEvent {
   evidenceEventIds: string[];
   parserId: string;
   parserVersion: number;
-  correlationQuality: "exact" | "strong" | "inferred" | "unlinked";
+  correlationQuality: "exact" | "strong" | "inferred" | "ambiguous" | "coverage_gap" | "unlinked";
   completeness: "complete" | "partial" | "missing";
   partialReasons: string[];
 }
@@ -1443,7 +1493,7 @@ export interface ConversationInstanceSegment {
   firstInteractionId: string;
   lastInteractionId: string;
   interactionCount: number;
-  correlationQuality: "exact" | "strong" | "inferred" | "unlinked";
+  correlationQuality: "exact" | "strong" | "inferred" | "ambiguous" | "coverage_gap" | "unlinked";
   resolverVersion: number;
   updatedAt: number;
 }
@@ -1497,6 +1547,7 @@ export interface AgentSemanticKernelRelation {
   turnId: string;
   toolInvocationId: string;
   kernelEventId?: string;
+  kernelFactId?: string;
   kernelEventAt?: string;
   kernelEventKind?: string;
   kernelEventDecisionRevision?: number;
@@ -1504,11 +1555,17 @@ export interface AgentSemanticKernelRelation {
   linkMethod?: "command" | "resource" | "network" | "network_endpoint" | "shell_bootstrap";
   lineageMethod?: "direct_runtime" | "generation_parent" | "legacy_pid_parent";
   competingToolInvocationIds?: string[];
+  competingKernelEventIds?: string[];
   timeQuality?: "exact" | "bounded";
   confidence: number;
   authority: "attested_tls_plaintext";
   relationVersion: 1 | 2 | 3;
   resolutionRevision: number;
+  evidenceLinkId?: string;
+  algorithmVersion?: string;
+  sourceRefs?: string[];
+  validFromUnixNs?: string;
+  relationRevision?: number;
   risk?: {
     verdict: SecurityVerdict;
     tier: "Rules" | "Llm" | "Agent";
@@ -1543,6 +1600,52 @@ export interface AgentKernelSemanticContextResponse {
     semanticEventId: string;
   }>;
   updateTime: string;
+}
+
+export interface CanonicalEvidenceLink {
+  schemaVersion: "anysentry.evidence_link.v1";
+  linkId: string;
+  fromType: string;
+  fromId: string;
+  toType: string;
+  toId: string;
+  relation: string;
+  method: string;
+  confidence: number;
+  authority: string;
+  evidenceRefs: string[];
+  algorithmVersion: string;
+  status: string;
+  validFromUnixNs: string;
+  validToUnixNs?: string;
+  resolutionRevision: number;
+}
+
+export interface CanonicalSessionMembership {
+  schemaVersion: "anysentry.session_membership.v1";
+  membershipId: string;
+  sessionId: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  interactionId?: string;
+  semanticRecordId?: string;
+  logicalAgentId?: string;
+  agentInstanceId?: string;
+  runtimeInstanceId?: string;
+  segmentId?: string;
+  role: string;
+  confidence: string;
+  evidence: string[];
+  resolverVersion: string;
+  resolutionRevision: number;
+  validFromUnixNs: string;
+  validToUnixNs?: string;
+  sourceRefs: string[];
+}
+
+export interface CanonicalResourceEnvelope<T> {
+  schemaVersion: string;
+  item: T;
 }
 export interface ToolEvidenceItem {
   invocationId: string;
@@ -4105,6 +4208,26 @@ export const securityCenterApi = {
     apiClient.postLong<AgentConversationTimelineV3>("/security-center/agents/conversations/timeline-v3", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
   agentSemanticEvidence: (filter: AgentConversationQuery & { conversationId: string; semanticEventId: string }) =>
     apiClient.postLong<AgentSemanticEvidenceResponse>("/security-center/agents/semantic-events/evidence", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
+  canonicalEvidenceLink: (linkId: string, resolutionRevision?: number) =>
+    apiClient.get<CanonicalResourceEnvelope<CanonicalEvidenceLink>>(
+      `/security-center/v1/evidence-links/${encodeURIComponent(linkId)}${resolutionRevision === undefined ? "" : `?resolutionRevision=${resolutionRevision}`}`,
+    ),
+  canonicalRawObservation: (observationId: string, revision?: number) =>
+    apiClient.get<CanonicalResourceEnvelope<Record<string, unknown>>>(
+      `/security-center/v1/raw-observations/${encodeURIComponent(observationId)}${revision === undefined ? "" : `?revision=${revision}`}`,
+    ),
+  canonicalKernelFact: (factId: string) =>
+    apiClient.get<CanonicalResourceEnvelope<Record<string, unknown>>>(
+      `/security-center/v1/kernel-facts/${encodeURIComponent(factId)}`,
+    ),
+  canonicalSemanticRecord: (semanticRecordId: string, revision?: number) =>
+    apiClient.get<CanonicalResourceEnvelope<Record<string, unknown>>>(
+      `/security-center/v1/semantic-records/${encodeURIComponent(semanticRecordId)}${revision === undefined ? "" : `?revision=${revision}`}`,
+    ),
+  canonicalSessionMembership: (membershipId: string, resolutionRevision?: number) =>
+    apiClient.get<CanonicalResourceEnvelope<CanonicalSessionMembership>>(
+      `/security-center/v1/session-memberships/${encodeURIComponent(membershipId)}${resolutionRevision === undefined ? "" : `?resolutionRevision=${resolutionRevision}`}`,
+    ),
   agentKernelSemanticContext: (eventId: string) =>
     apiClient.post<AgentKernelSemanticContextResponse>("/security-center/agents/kernel-events/semantic-context", { eventId }),
   agentToolEvidence: (filter: AgentEventQuery & { invocationId: string }) =>

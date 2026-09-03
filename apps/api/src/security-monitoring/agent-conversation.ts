@@ -8,7 +8,14 @@ import {
 import {
   interactionHumanMessages,
   trafficRoleForInteraction,
+  conversationLogicalScopeKeyV2,
+  conversationDeploymentScopeKey,
+  canonicalPerRequestConversationId,
 } from './agent-conversation-resolution-v2';
+
+function deploymentSessionScopeKeyForRecord(record: T.AgentInteractionRecord): string {
+  return conversationDeploymentScopeKey(record);
+}
 
 const PREVIEW_CHARACTERS = 320;
 const GENERIC_SESSION_IDS = new Set([
@@ -73,6 +80,16 @@ function stableRuntimeSession(value: string | undefined): string | undefined {
 }
 
 function conversationRuntimeSession(record: T.AgentInteractionRecord): string | undefined {
+  // Runtime/container IDs are machine evidence, not provider Conversation IDs.  Only an explicit
+  // application-level session contract may reach this helper (legacy rows without quality are
+  // handled by the inferred clustering path below).
+  if (record.sessionIdentityQuality === 'ephemeral'
+    || record.sessionIdSource === 'legacy_agent_fallback'
+    || record.sessionIdSource === 'legacy_task_fallback'
+    || record.sessionIdSource === 'per_request'
+    || record.sessionIdSource === 'unresolved') return undefined;
+  if (!['confirmed', 'strong'].includes(record.sessionIdentityQuality ?? '')
+    || !['conversation', 'resumable'].includes(record.sessionMode ?? '')) return undefined;
   const session = stableRuntimeSession(record.runtimeSessionId);
   if (!session) return undefined;
   // Observer uses a short container id as the transport/runtime session when no application-level
@@ -111,32 +128,72 @@ function explicitConversation(
 ): {
   conversationId: string;
   source: 'provider' | 'runtime' | 'inferred';
+  /** Scope is part of the grouping key even when a legacy/provider ID is reused. */
+  scopeKey: string;
 } | undefined {
+  const logicalScopeKey = conversationLogicalScopeKeyV2(record);
+  const deploymentScopeKey = conversationDeploymentScopeKey(record);
+  const scopeKey = deploymentScopeKey
+    ? `${logicalScopeKey}|deployment:${deploymentScopeKey}`
+    : logicalScopeKey;
+  const perRequestBoundary = record.sessionMode === 'per_request'
+    || record.sessionIdentityQuality === 'ephemeral'
+    || record.sessionIdSource === 'per_request'
+    || Boolean(
+      record.providerConversationId
+      && (record.sessionIdentityQuality === 'unknown'
+        || record.sessionIdentityQuality === 'unresolved')
+      && !record.sessionKey,
+    );
+  if (perRequestBoundary) {
+    // A stateless service may repeat a native provider/session label on every POST. Prefer the
+    // server-derived canonical Session; if it is unavailable, retain the interaction as an
+    // event-local projection key rather than merging unrelated requests by provider text.
+    return {
+      conversationId: canonicalPerRequestConversationId([record]),
+      source: 'inferred',
+      scopeKey,
+    };
+  }
   if (record.conversationId
     && (record.conversationIdSource !== 'inferred' || record.conversationBindingVersion)) {
     return {
       conversationId: record.conversationId,
       source: record.conversationIdSource ?? 'inferred',
+      scopeKey,
+    };
+  }
+  const explicitSession = stableRuntimeSession(record.sessionKey)
+    ?? (['confirmed', 'strong'].includes(record.sessionIdentityQuality ?? '')
+      && ['conversation', 'resumable'].includes(record.sessionMode ?? '')
+      ? stableRuntimeSession(record.sessionId) : undefined);
+  if (explicitSession) {
+    return {
+      conversationId: stableId('cv', `session-key\0${scopeKey}\0${explicitSession}`),
+      source: record.sessionIdSource === 'provider' ? 'provider' : 'runtime',
+      scopeKey,
     };
   }
   if (record.providerConversationId) {
     return {
       conversationId: stableId(
         'cv',
-        `provider\u0000${record.agentAssetId}\u0000${record.providerConversationId}`,
+        `provider\u0000${scopeKey}\u0000${record.providerConversationId}`,
       ),
       source: 'provider',
+      scopeKey,
     };
   }
   const providerChain = providerChains.get(record.interactionId);
   if (providerChain) {
-    return { conversationId: providerChain, source: 'provider' };
+    return { conversationId: providerChain, source: 'provider', scopeKey };
   }
   const session = conversationRuntimeSession(record);
   if (session) {
     return {
       conversationId: stableId('cv', `runtime\u0000${record.agentAssetId}\u0000${session}`),
       source: 'runtime',
+      scopeKey,
     };
   }
   return undefined;
@@ -161,14 +218,15 @@ function providerResponseChains(records: T.AgentInteractionRecord[]): Map<string
       seen.add(cursor.providerPreviousResponseId);
       rootId = cursor.providerPreviousResponseId;
       const prior = byResponseId.get(cursor.providerPreviousResponseId);
-      if (!prior || prior.agentAssetId !== record.agentAssetId) break;
+      if (!prior || conversationLogicalScopeKeyV2(prior) !== conversationLogicalScopeKeyV2(record)
+        || deploymentSessionScopeKeyForRecord(prior) !== deploymentSessionScopeKeyForRecord(record)) break;
       rootId = prior.providerResponseId;
       cursor = prior;
     }
     if (!rootId) continue;
     projected.set(
       record.interactionId,
-      stableId('cv', `provider-response-chain\u0000${record.agentAssetId}\u0000${rootId}`),
+      stableId('cv', `provider-response-chain\u0000${conversationLogicalScopeKeyV2(record)}\u0000${rootId}`),
     );
   }
   return projected;
@@ -272,18 +330,8 @@ function isProperPrefix(left: string[], right: string[]): boolean {
   return left.length > 0 && left.length < right.length && isPrefix(left, right);
 }
 
-function isCliAgent(record: T.AgentInteractionRecord): boolean {
-  const product = normalized(record.agentProduct);
-  return ['codex', 'codex-cli', 'claude', 'claude-code', 'pi', 'kimi', 'kimi-cli', 'kimi-code']
-    .some((candidate) => product === candidate || product.includes(candidate));
-}
-
 function inferredThreadScope(record: T.AgentInteractionRecord): string {
-  return [
-    normalized(displayProduct(record.agentProduct) ?? record.agentProduct),
-    normalized(record.workspacePath),
-    normalized(record.process?.hostId),
-  ].join('\u0000');
+  return conversationLogicalScopeKeyV2(record);
 }
 
 function clusterContinuesPriorThread(
@@ -294,7 +342,10 @@ function clusterContinuesPriorThread(
     record.toolCalls.map((call) => call.toolCallId)));
   if (current.some((record) =>
     record.toolResults.some((result) => issuedCalls.has(result.toolCallId)))) return true;
-  if (!isCliAgent(current[0])) return false;
+  if (current.some((record) => record.sessionMode === 'per_request'
+    || record.sessionIdentityQuality === 'ephemeral')) return false;
+  // Cumulative request lineage is product-neutral.  Provider/adapter anchors are preferred; a
+  // bounded human-message prefix is only a fallback for legacy rows without explicit IDs.
   const priorLineage = userMessageLineage(prior.at(-1)!);
   const currentLineage = userMessageLineage(current.at(-1)!);
   return isProperPrefix(priorLineage, currentLineage);
@@ -306,6 +357,13 @@ function continuesInferredConversation(
 ): boolean {
   const previous = cluster.at(-1);
   if (!previous) return false;
+  if (perRequestBoundary(previous) || perRequestBoundary(current)) {
+    // A stateless service creates one Session per POST.  Keep a Tool loop together only when an
+    // explicit Run/Invocation continuity key proves that the two exchanges belong to one call.
+    return Boolean(previous.runIdSource === 'producer'
+      && current.runIdSource === 'producer'
+      && previous.runId && current.runId && previous.runId === current.runId);
+  }
   if (current.providerPreviousResponseId && cluster.some((record) =>
     record.providerResponseId === current.providerPreviousResponseId)) return true;
 
@@ -319,6 +377,12 @@ function continuesInferredConversation(
   return firstUsers.length > 0
     && currentUsers.length > 0
     && (isPrefix(firstUsers, currentUsers) || isPrefix(currentUsers, firstUsers));
+}
+
+function perRequestBoundary(record: T.AgentInteractionRecord): boolean {
+  return record.sessionMode === 'per_request'
+    || record.sessionIdentityQuality === 'ephemeral'
+    || record.sessionIdSource === 'per_request';
 }
 
 function annotateTurns(
@@ -593,7 +657,9 @@ function durationMs(record: T.AgentInteractionRecord): number {
 export function summarizeAgentUsage(
   records: readonly T.AgentInteractionRecord[],
 ): T.AgentUsageSummary {
-  const modelCalls = records.filter((record) => record.interactionType === 'model');
+  const modelCalls = records.filter((record) =>
+    record.interactionType === 'model' && record.semanticOnly !== true,
+  );
   if (modelCalls.length === 0) return emptyAgentUsageSummary();
   const reported = modelCalls.filter((record) => Boolean(record.usage));
   const totalDurationMs = modelCalls.reduce((sum, record) => sum + durationMs(record), 0);
@@ -692,9 +758,56 @@ function summaryForConversation(
   ) ?? 'Agent';
   const resolvedResults = resolvedToolResultIds(interactions);
   const usage = summarizeAgentUsage(interactions);
+  const firstLogical = interactions.find((item) => item.logicalAgentId)?.logicalAgentId;
+  const firstCandidate = interactions.find((item) => item.logicalAgentCandidateId)?.logicalAgentCandidateId;
+  const terminalContextIds = [...new Set(interactions
+    .map((item) => item.terminalContextId)
+    .filter((value): value is string => Boolean(value)))];
+  const quality = interactions.some((item) => item.sessionIdentityQuality === 'confirmed')
+    ? 'confirmed' as const
+    : interactions.some((item) => item.sessionIdentityQuality === 'strong')
+      ? 'strong' as const
+      : interactions.some((item) => item.sessionIdentityQuality === 'ephemeral')
+        ? 'ephemeral' as const
+        : interactions.some((item) => item.sessionIdentityQuality === 'inferred')
+          ? 'inferred' as const
+          : undefined;
+  const sessionId = interactions.find((item) => Boolean(item.sessionId))?.sessionId;
+  const parentRecord = interactions.find((item) => Boolean(item.canonicalParentSessionId || item.parentSessionId));
+  const sessionLifecycle = interactions.some((item) => item.sessionLifecycle === 'fork')
+    ? 'fork' as const
+    : interactions.some((item) => item.sessionLifecycle === 'resume')
+      ? 'resume' as const
+      : interactions.some((item) => item.sessionLifecycle === 'new')
+        ? 'new' as const
+        : undefined;
   return {
     conversationId,
     idSource: source,
+    ...(first.tenantId ? { tenantId: first.tenantId } : {}),
+    ...(first.ownerId ? { ownerId: first.ownerId } : {}),
+    ...(firstLogical ? { logicalAgentId: firstLogical } : {}),
+    ...(firstCandidate ? { logicalAgentCandidateId: firstCandidate } : {}),
+    ...(first.logicalDefinitionId ? { logicalDefinitionId: first.logicalDefinitionId } : {}),
+    ...(first.logicalScopeMode ? { logicalScopeMode: first.logicalScopeMode } : {}),
+    ...(first.logicalIdentityAuthority ? { logicalIdentityAuthority: first.logicalIdentityAuthority } : {}),
+    ...(first.logicalDefinitionFingerprint ? { logicalDefinitionFingerprint: first.logicalDefinitionFingerprint } : {}),
+    ...(first.profile ? { profile: first.profile } : {}),
+    ...(first.profileVersion ? { profileVersion: first.profileVersion } : {}),
+    ...(first.deploymentId ? { deploymentId: first.deploymentId } : {}),
+    ...(first.deploymentRevision ? { deploymentRevision: first.deploymentRevision } : {}),
+    ...(first.environmentId ? { environmentId: first.environmentId } : {}),
+    ...(terminalContextIds.length ? { terminalContextIds } : {}),
+    ...(quality ? { sessionIdentityQuality: quality } : {}),
+    ...(first.sessionMode ? { sessionMode: first.sessionMode } : {}),
+    ...(sessionId ? { sessionId } : {}),
+    ...(first.sessionKey ? { sessionKey: first.sessionKey } : {}),
+    ...(first.providerSessionIdHash ? { providerSessionIdHash: first.providerSessionIdHash } : {}),
+    ...(sessionLifecycle ? { sessionLifecycle } : {}),
+    ...(parentRecord?.parentSessionId ? { parentSessionId: parentRecord.parentSessionId } : {}),
+    ...(parentRecord?.canonicalParentSessionId
+      ? { canonicalParentSessionId: parentRecord.canonicalParentSessionId }
+      : {}),
     hasContent: true,
     agentAssetId: first.agentAssetId,
     agentInstanceIds: instanceIds,
@@ -729,6 +842,17 @@ function assetOnlySummary(
   return {
     conversationId: stableId('asset', `asset-only\u0000${asset.agentAssetId}`),
     idSource: 'inferred',
+    ...(asset.tenantId ? { tenantId: asset.tenantId } : {}),
+    ...(asset.ownerId ? { ownerId: asset.ownerId } : {}),
+    ...(asset.logicalAgentId ? { logicalAgentId: asset.logicalAgentId } : {}),
+    ...(asset.logicalDefinitionId ? { logicalDefinitionId: asset.logicalDefinitionId } : {}),
+    ...(asset.logicalScopeMode ? { logicalScopeMode: asset.logicalScopeMode } : {}),
+    ...(asset.logicalIdentityAuthority ? { logicalIdentityAuthority: asset.logicalIdentityAuthority } : {}),
+    ...(asset.profile ? { profile: asset.profile } : {}),
+    ...(asset.profileVersion ? { profileVersion: asset.profileVersion } : {}),
+    ...(asset.deploymentId ? { deploymentId: asset.deploymentId } : {}),
+    ...(asset.deploymentRevision ? { deploymentRevision: asset.deploymentRevision } : {}),
+    ...(asset.terminalContextId ? { terminalContextIds: [asset.terminalContextId] } : {}),
     hasContent: false,
     agentAssetId: asset.agentAssetId,
     agentInstanceIds: asset.agentInstanceId ? [asset.agentInstanceId] : [],
@@ -797,7 +921,21 @@ export function projectAgentConversations(
   const grouped = new Map<string, {
     source: 'provider' | 'runtime' | 'inferred';
     records: T.AgentInteractionRecord[];
+    conversationId: string;
+    scopeKey: string;
   }>();
+  // A provider/legacy conversation ID is not globally unique.  Keep the historical ID when it
+  // occurs in one logical scope (compatibility), but derive a deterministic scoped projection for
+  // collisions so two tenants/definitions can never be rendered as one conversation.  The raw ID
+  // remains in each Interaction as an alias/provenance field.
+  const explicitScopes = new Map<string, Set<string>>();
+  const explicitGroups: Array<{
+    key: string;
+    conversationId: string;
+    source: 'provider' | 'runtime' | 'inferred';
+    scopeKey: string;
+    record: T.AgentInteractionRecord;
+  }> = [];
   const inferredByRoot = new Map<string, T.AgentInteractionRecord[]>();
   const inferredClusters: Array<{ root: string; records: T.AgentInteractionRecord[] }> = [];
   const providerChains = providerResponseChains(semanticInteractions);
@@ -805,18 +943,42 @@ export function projectAgentConversations(
   for (const record of [...semanticInteractions].sort(compareInteraction)) {
     const explicit = explicitConversation(record, providerChains);
     if (explicit) {
-      const group = grouped.get(explicit.conversationId) ?? {
+      const key = `${explicit.conversationId}\u0000${explicit.scopeKey}`;
+      const scopes = explicitScopes.get(explicit.conversationId) ?? new Set<string>();
+      scopes.add(explicit.scopeKey);
+      explicitScopes.set(explicit.conversationId, scopes);
+      explicitGroups.push({
+        key,
+        conversationId: explicit.conversationId,
         source: explicit.source,
-        records: [],
-      };
-      group.records.push(record);
-      grouped.set(explicit.conversationId, group);
+        scopeKey: explicit.scopeKey,
+        record,
+      });
       continue;
     }
     const key = rootIdentity(record);
     const records = inferredByRoot.get(key) ?? [];
     records.push(record);
     inferredByRoot.set(key, records);
+  }
+
+  for (const group of explicitGroups) {
+    const collision = (explicitScopes.get(group.conversationId)?.size ?? 0) > 1;
+    const projectedConversationId = collision
+      ? stableId('cv', `scoped-explicit\u0000${group.scopeKey}\u0000${group.conversationId}`)
+      : group.conversationId;
+    const current = grouped.get(group.key) ?? {
+      source: group.source,
+      records: [],
+      conversationId: projectedConversationId,
+      scopeKey: group.scopeKey,
+    };
+    current.records.push(group.record);
+    // A single scoped group can receive provider-chain and legacy records with different source
+    // labels; retain the strongest source for the summary without changing the scope fence.
+    if (group.source === 'provider') current.source = 'provider';
+    else if (group.source === 'runtime' && current.source === 'inferred') current.source = 'runtime';
+    grouped.set(group.key, current);
   }
 
   for (const [root, records] of inferredByRoot) {
@@ -858,14 +1020,20 @@ export function projectAgentConversations(
       'cv',
       `inferred\u0000${thread.root}\u0000${thread.records[0].interactionId}`,
     );
-    grouped.set(conversationId, { source: 'inferred', records: thread.records });
+    grouped.set(conversationId, {
+      source: 'inferred',
+      records: thread.records,
+      conversationId,
+      scopeKey: thread.scope,
+    });
   }
 
   const interactionsByConversation = new Map<string, T.AgentInteractionRecord[]>();
   const sourceInteractionsByConversation = new Map<string, T.AgentInteractionRecord[]>();
   const summaries: T.AgentConversationSummary[] = [];
   const assetsWithContent = new Set<string>();
-  for (const [conversationId, group] of grouped) {
+  for (const [, group] of grouped) {
+    const conversationId = group.conversationId;
     sourceInteractionsByConversation.set(
       conversationId,
       annotateTurns(conversationId, group.records),

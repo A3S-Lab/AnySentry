@@ -111,11 +111,11 @@ export function ConversationOverview({
 }) {
   if (!agent) {
     return (
-      <section className="flex h-full items-center justify-center bg-[#0b0f0c] px-6 text-center" aria-label="Agent 运行概览">
+      <section className="flex h-full items-center justify-center bg-[#0b0f0c] px-6 text-center" aria-label="Agent 整体概览">
         <div>
           <Boxes className="mx-auto size-8 text-zinc-700" aria-hidden="true" />
-          <p className="mt-3 text-sm text-zinc-300">选择一个逻辑 Agent 查看整体运行状态</p>
-          <p className="mt-2 text-xs leading-5 text-zinc-500">进入具体 Thread 后再查看完整用户、模型和工具时间线。</p>
+          <p className="mt-3 text-sm text-zinc-300">Agent 整体概览</p>
+          <p className="mt-2 text-xs leading-5 text-zinc-500">当前没有可自动跟随的运行 Agent；选择左侧逻辑 Agent 查看整体状态，进入具体 Thread 后再查看完整用户、模型和工具时间线。</p>
         </div>
       </section>
     );

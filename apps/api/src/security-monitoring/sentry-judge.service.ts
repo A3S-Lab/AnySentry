@@ -367,10 +367,12 @@ function trustedEventScope(
 ): TrustedCorrelationBindingScope {
   const attributes = meta.attributes ?? {};
   return {
-    tenantId: attributeText(attributes, 'tenantId', 'tenant.id', 'anysentry.tenant.id')
+    tenantId: meta.tenantId
+      ?? attributeText(attributes, 'tenantId', 'tenant.id', 'anysentry.tenant.id')
       ?? process.env.ANYSENTRY_TENANT_ID?.trim()
       ?? 'default',
-    environmentId: attributeText(
+    environmentId: meta.environmentId
+      ?? attributeText(
       attributes,
       'environmentId',
       'environment.id',
@@ -380,7 +382,8 @@ function trustedEventScope(
     workspaceId: attributeText(attributes, 'workspaceId', 'workspace.id', 'anysentry.workspace.id'),
     workspacePath: meta.workspacePath,
     physicalWorkloadId: attribution?.physicalWorkloadId,
-    agentScopeId: attribution?.agentScopeId,
+    agentScopeId: attribution?.agentScopeId
+      ?? attributeText(attributes, 'agentScopeId', 'agent_scope_id'),
   };
 }
 
@@ -1020,6 +1023,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const classificationSemantics = parsedClassificationSemantics?.identityClassification === legacyAttribution.classification
       ? parsedClassificationSemantics
       : undefined;
+    const runId = meta.runId ?? hashId('run', [at, eventKind, ids.agentId, line]);
+    const runIdSource = meta.runId ? (meta.runIdSource ?? 'producer') : 'derived_ephemeral';
     return {
       schemaVersion: SCHEMA_VERSION,
       eventId: meta.sourceEventId
@@ -1048,6 +1053,43 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       ...ids,
       subjectAssetId: meta.subjectAssetId,
       subjectAssetType: meta.subjectAssetType,
+      ...(meta.sessionIdentityQuality ? { sessionIdentityQuality: meta.sessionIdentityQuality } : {}),
+      ...(meta.sessionIdSource ? { sessionIdSource: meta.sessionIdSource } : {}),
+      ...(meta.legacySessionId ? { legacySessionId: meta.legacySessionId } : {}),
+      ...(meta.parentSessionId ? { parentSessionId: meta.parentSessionId } : {}),
+      ...(meta.canonicalParentSessionId
+        ? { canonicalParentSessionId: meta.canonicalParentSessionId }
+        : {}),
+      ...(meta.sessionMode ? { sessionMode: meta.sessionMode } : {}),
+      ...(meta.sessionLifecycle ? { sessionLifecycle: meta.sessionLifecycle } : {}),
+      ...(meta.sessionResolutionRevision !== undefined
+        ? { sessionResolutionRevision: Math.max(1, Math.trunc(meta.sessionResolutionRevision)) }
+        : {}),
+      ...(meta.rawObservationId ? { rawObservationId: meta.rawObservationId } : {}),
+      ...(meta.rawObservationRevision !== undefined
+        ? { rawObservationRevision: meta.rawObservationRevision }
+        : {}),
+      ...(meta.kernelFactId ? { kernelFactId: meta.kernelFactId } : {}),
+      ...(meta.canonicalAgentInstanceId ? { canonicalAgentInstanceId: meta.canonicalAgentInstanceId } : {}),
+      ...(meta.runtimeInstanceId ? { runtimeInstanceId: meta.runtimeInstanceId } : {}),
+      ...(meta.logicalAgentId ? { logicalAgentId: meta.logicalAgentId } : {}),
+      ...(meta.logicalAgentCandidateId ? { logicalAgentCandidateId: meta.logicalAgentCandidateId } : {}),
+      ...(meta.logicalDefinitionId ? { logicalDefinitionId: meta.logicalDefinitionId } : {}),
+      ...(meta.logicalScopeMode ? { logicalScopeMode: meta.logicalScopeMode } : {}),
+      ...(meta.logicalIdentityAuthority ? { logicalIdentityAuthority: meta.logicalIdentityAuthority } : {}),
+      ...(meta.sessionKey ? { sessionKey: meta.sessionKey } : {}),
+      ...(meta.canonicalSessionId ? { canonicalSessionId: meta.canonicalSessionId } : {}),
+      ...(meta.sessionNamespaceKey ? { sessionNamespaceKey: meta.sessionNamespaceKey } : {}),
+      ...(meta.providerSessionIdHash ? { providerSessionIdHash: meta.providerSessionIdHash } : {}),
+      ...(meta.logicalDefinitionFingerprint ? { logicalDefinitionFingerprint: meta.logicalDefinitionFingerprint } : {}),
+      ...(meta.tenantId ? { tenantId: meta.tenantId } : {}),
+      ...(meta.ownerId ? { ownerId: meta.ownerId } : {}),
+      ...(meta.profile ? { profile: meta.profile } : {}),
+      ...(meta.profileVersion ? { profileVersion: meta.profileVersion } : {}),
+      ...(meta.deploymentId ? { deploymentId: meta.deploymentId } : {}),
+      ...(meta.deploymentRevision ? { deploymentRevision: meta.deploymentRevision } : {}),
+      ...(meta.environmentId ? { environmentId: meta.environmentId } : {}),
+      ...(meta.terminalContextId ? { terminalContextId: meta.terminalContextId } : {}),
       assetBindingQuality: meta.assetBindingQuality,
       assetBindingRevision: meta.assetBindingRevision,
       assetBindingReason: meta.assetBindingReason,
@@ -1059,7 +1101,12 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       ...(correlation?.toolCallId ? { toolCallId: correlation.toolCallId } : {}),
       spanId: meta.spanId ?? hashId('sp', [at, eventKind, ids.agentId, ids.sessionId, line]),
       parentSpanId: meta.parentSpanId,
-      runId: meta.runId ?? ids.sessionId,
+      // `runId` is a compatibility-required field on JudgedEvent, but it is a distinct
+      // execution identity. Never copy Session into it; an event-local opaque ID is used only
+      // when the producer/Adapter did not supply a Run, and its provenance is explicit.
+      runId,
+      ...(meta.turnId ? { turnId: meta.turnId } : {}),
+      runIdSource,
       taskId: meta.taskId,
       tokenCount: meta.tokenCount ?? extractTokens(line, eventKind),
       latencyMs: meta.latencyMs ?? 1,

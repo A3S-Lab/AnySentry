@@ -1292,6 +1292,14 @@ function verifyInstaller() {
   assert('Integrated installer supports kubernetes mode', /install_kubernetes\(\)/u.test(installer) && /kubernetes\|k8s/u.test(installer), installer);
   assert('Integrated installer creates namespace and ClickHouse Secret', /kubectl create namespace/u.test(installer) && /create secret generic anysentry-clickhouse/u.test(installer), installer);
   assert(
+    'Integrated installer keeps credential values out of kubectl argv',
+    /secret_material_dir/u.test(installer)
+      && /--from-file=management-token=/u.test(installer)
+      && /--from-file=session-hash-secret=/u.test(installer)
+      && !/--from-literal=(?:management-token|session-hash-secret|CLICKHOUSE_PASSWORD)=/u.test(installer),
+    installer,
+  );
+  assert(
     'Integrated installer bootstraps managed per-node Observer Sources without repository credentials',
     /create secret generic anysentry-control-auth/u.test(installer) &&
       /openssl rand -hex 32/u.test(installer) &&

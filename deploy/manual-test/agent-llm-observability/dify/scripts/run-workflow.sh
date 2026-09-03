@@ -20,6 +20,9 @@ esac
 
 auth_header="$DIFY_LAB_RUNTIME/secrets/$workflow-app-authorization-header"
 [[ -s "$auth_header" ]] || die "workflow is not initialized; run initialize.sh"
+results_dir="${DIFY_LAB_RESULTS_DIR:-$DIFY_LAB_RUNTIME/results}"
+mkdir -p "$results_dir"
+chmod 0700 "$results_dir"
 
 reset_fixture() {
   local port="$1"
@@ -33,8 +36,8 @@ reset_fixture() {
 reset_fixture "${DIFY_LAB_LLM_HTTPS_PORT:-18444}"
 reset_fixture "${DIFY_LAB_TOOL_HTTPS_PORT:-18445}"
 
-request_file="$(mktemp "$DIFY_LAB_RUNTIME/results/.workflow-request.XXXXXX.json")"
-result_file="$DIFY_LAB_RUNTIME/results/$workflow-$(date -u +%Y%m%dT%H%M%SZ).sse"
+request_file="$(mktemp "$results_dir/.workflow-request.XXXXXX.json")"
+result_file="$results_dir/$workflow-$(date -u +%Y%m%dT%H%M%SZ).sse"
 sentinel="ANYSENTRY_INTERNAL_RAG_MUST_NOT_EGRESS_$(openssl rand -hex 8)"
 
 if [[ "$workflow" == "llm" ]]; then
@@ -64,8 +67,8 @@ else
     }' >"$request_file"
 fi
 
-printf '%s\n' "$sentinel" >"$DIFY_LAB_RUNTIME/results/$workflow-last-internal-rag-sentinel"
-chmod 0600 "$DIFY_LAB_RUNTIME/results/$workflow-last-internal-rag-sentinel"
+printf '%s\n' "$sentinel" >"$results_dir/$workflow-last-internal-rag-sentinel"
+chmod 0600 "$results_dir/$workflow-last-internal-rag-sentinel"
 
 http_code="$(curl \
   --silent \
@@ -90,7 +93,7 @@ printf 'Service request SHA-256: %s\n' "$(sha256sum "$request_file" | awk '{prin
 show_records() {
   local role="$1"
   local port="$2"
-  local records_file="$DIFY_LAB_RUNTIME/results/$workflow-last-$role-records.json"
+  local records_file="$results_dir/$workflow-last-$role-records.json"
   if curl --fail --silent --show-error --http1.1 \
     --cacert "$DIFY_LAB_RUNTIME/tls/ca.crt" \
     --output "$records_file" "https://localhost:$port/debug/records"; then
