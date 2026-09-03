@@ -26,8 +26,8 @@ rc=0，但 debug reconciliation 因测试 CA 校验失败，hash 对账仍为 pa
 manifest GET 200（digest 前缀 `043180…`）；namespace `anysentry-goal-oci-web-20260904` 以
 Secret/no-hostPath 完成 health、`/v1/observability/contracts`、representative replay 13/4
 families/0 gap、S6、S2 shadow 后已清理。基座仍是旧 runtime + current dist overlay，非原始
-Dockerfile 全链；Observer scripts overlay 仍缺（仅 binary overlay `70a097…` 在本机 registry
-成功），existing formal deployment 未切换。
+Dockerfile 全链；Observer scripts overlay 也已生成并推入本机 registry（digest 前缀 `7d3b…`），
+但 existing formal deployment 未切换。
 Observer BPF 对象还在特权本地
 k3s Pod 中以 Aya `Program::load` 逐项加载了
 `tls_write`、`tls_sendto`、`http_writev` 和 `exec`，验证此前的 1,000,001-instruction verifier
@@ -54,8 +54,9 @@ k3s Pod 中以 Aya `Program::load` 逐项加载了
 | 当前 checkpoint 测试 | identity scope tests 6/6；Observer full tests 159 + common 8 + root 32 + workload 7 = 206；fmt/check/build/clippy 均通过 | 证明局部合同与仓库门禁，不替代部署/真实链路验收 |
 | mixed-cgroup identity fence | AnySentry publisher 输出 `rootPid`、`rootStartTimeTicks`、`agentInstanceId` 并保留同 cgroup distinct entries；Observer 按 process generation/cgroup/祖先链 fail-closed，mixed scope 不 broad admit | 旧 Observer/Forwarder rollout 必须和 publisher 原子升级；只替换单侧会保留旧误合并/准入风险 |
 | 临时 k3s current-dist 验证 | namespace `anysentry-goal-dist-20260904` 的 current-dist hostPath fallback health ok；canonical contracts v1、representative replay 13 synthetic events/4 families/0 gap、S6 Tool Evidence、S2 shadow 均通过；namespace/容器已清理 | 仅为旧镜像底座 + 只读 `/app/dist`，不是 current-head OCI image，不能替代正式部署 |
-| 临时 k3s API/Web OCI overlay 验证 | AnySentry `anysentry:goal-current-oci-20260904` 从本机缓存基座覆盖 current `api/dist` 构建成功并推入本机 registry，registry manifest GET 200（digest 前缀 `043180…`）；namespace `anysentry-goal-oci-web-20260904` 以 Secret 引用 token、无 hostPath，health、`/v1/observability/contracts`、representative replay 13/4 families/0 gap、S6、S2 shadow 均通过后清理 | API/Web overlay 已生成并局部验收；基座仍是旧 runtime + current dist overlay，非原始 Dockerfile 全链；Observer scripts/full official build 仍缺，仅 binary overlay `70a097…` 在本机 registry 成功；existing formal deployment 未切换，不能标 DoD 完成 |
+| 临时 k3s API/Web OCI overlay 验证 | AnySentry API/Web overlay `anysentry:goal-current-oci-20260904` 从本机缓存基座覆盖 current `api/dist` 与 `web/dist` 构建成功并推入本机 registry，registry manifest GET 200（digest 前缀 `043180…`）；namespace `anysentry-goal-oci-web-20260904` 以 Secret 引用 token、无 hostPath，health、`/v1/observability/contracts`、representative replay 13/4 families/0 gap、S6、S2 shadow 均通过后清理 | overlay 基座仍是旧 runtime + current dist overlay，非原始 Dockerfile 全链；existing formal deployment 未切换，不能标 DoD 完成 |
 | Observer OCI image smoke | Collector binary + Forwarder/Publisher script overlay 已推入本机 registry（digest 前缀 `7d3b…`）；临时 privileged/hostPID Pod 只执行 `a3s-observer-collector --version`，返回 `0.11.0` 后清理 | 仅证明镜像可拉取/二进制可启动，不等同于 tracepoint attach、Forwarder ingest 或正式 DaemonSet rollout |
+| Observer OCI 组合 smoke | Observer scripts+current collector overlay `7d3b…` 在临时 privileged/hostPID Pod 附着 25 probes，scope 文件 5 fenced roots/2 cgroups，精确 batch probe 201 accepted；长跑因共享节点负载出现拒绝/spool 增长 | 只证明部署接缝与 fence 文件/局部 ingest，不能标持续可靠性或正式 DaemonSet 通过 |
 | `tender_jang` | `node:24-bookworm` 容器内有 Codex CLI 0.149.1、Claude Code 2.1.251；Python 运行库为 LangChain 1.3.17/LangGraph 1.2.11 | 容器无 published port、Docker socket、Docker CLI；这是运行时盘点，不是 Docker 编排或 Observer 接入证明 |
 | `tender_jang` LangChain 服务 | 容器内 `service.py` 监听 18082，`/health=200`；宿主 loopback 由既有本地转发进程接入 | 证明当前容器有可达服务，不证明当前头 AnySentry/Observer 已接入 |
 | 旧 k3s 身份反例 | 旧 k3s API image digest/revision 下，同一 Docker cgroup 的历史 LangChain 与 Claude Code 均有 `LlmInteraction`，却被合并到同一旧 agentAsset/session/run；Observer source/profile 可见但 cgroup map 仍把 Codex/Claude/LangChain 标为同一 `langchain` scope | 这是旧部署的真实混合身份/误合并反例；current-head 尚未部署，必须用 ProcessGeneration + Adapter/definition fence 拆分，不能把旧 asset 当 confirmed LogicalAgent |
@@ -394,7 +395,7 @@ Session、原文完整读取、容器被动捕获、LangGraph 逐事件唯一 Ev
 | Host | partial | API health 200，当前使用 memory fallback；CLI loopback fixture 已在 Host 执行；UID 1001、`unprivileged_bpf_disabled=2`，无直接 eBPF attach 能力 |
 | SSH | partial（协议解析、身份/正文/统一证据 partial） | VSCode SSH `notty` 链 native PID 1101287 在 2026-09-03 16:14–16:22Z durable custom window 初始有 60 条 parsed/confirmed/complete `LlmInteraction`（model56/tool4），后续异步 `agents/interactions` 约 63 records（model57/tool4 + 2 unsupported/unparsed）；另有 2 条 `tls_uprobe_rustls` metadata-only/unparsed。identity/session/run 仍 runtime/probable 提示，非 authenticated AgentAdapter/confirmed Session |
 | Docker | partial | Docker daemon、Compose config 和既有 Dify 栈健康；`tender_jang` 有 CLI/库但无 Docker CLI/socket；当前头 AnySentry API 容器仍未部署 |
-| Kubernetes | partial | k3s LangGraph `/healthz` 与 `/runs` 真实调用、durable 查询可用；临时 API/Web OCI overlay 的 contracts GET 已局部验证后清理，但 existing AnySentry 仍旧 digest、canonical GET 未切换正式部署，`critical_inbox_dropped` 约 1.89M（最近观测且继续上涨）等可靠性缺口仍在。overlay/hostPath fallback 都不是已切换的正式 current-head 部署 |
+| Kubernetes | partial | k3s LangGraph `/healthz` 与 `/runs` 真实调用、durable 查询可用；临时 API/Web OCI 与 Observer 组合 smoke 已验证后清理，但 existing AnySentry/Observer 仍旧 digest、canonical GET 未切换正式部署，`critical_inbox_dropped` 约 1.89M（最近观测且继续上涨）等可靠性缺口仍在。overlay/hostPath fallback 不是已切换的正式部署 |
 
 Kafka/Flink 只在已有可选 profile 中保留，未成为 Canonical 主链前置依赖；本阶段不新增时间窗
 功能。Kubernetes/ Docker 的旧服务健康不被用来冒充当前工作树部署通过。
@@ -416,7 +417,7 @@ Kafka/Flink 只在已有可选 profile 中保留，未成为 Canonical 主链前
 11. existing formal AnySentry 仍为旧 image digest、canonical GET 未切换正式部署，`critical_inbox_dropped` 约 1.89M（最近观测且继续上涨），且 static signature warnings 仍存在；这些运行可靠性缺口和风险尚未消除；
 12. AnySentry `477f897` 与 Observer `030b910` 已加入 mixed-cgroup fence，但旧 Observer/Forwarder rollout 仍有误合并/broad-admit 风险；publisher、Forwarder、Observer 必须原子升级并回放验证；
 13. 临时 namespace `anysentry-goal-dist-20260904` 的旧镜像 + 只读 `/app/dist` hostPath fallback 已清理；它不能替代 current-head OCI 镜像部署；
-14. `anysentry-goal-oci-web-20260904` 的 API/Web OCI overlay 已通过局部健康/合同/回放门禁并清理，registry manifest GET 200、digest 前缀 `043180…`；基座仍是旧 runtime + current dist overlay，非原始 Dockerfile 全链；Observer scripts/full official build 仍缺，仅 binary overlay `70a097…` 成功，existing formal deployment 未切换；
+14. `anysentry-goal-oci-web-20260904` 的 API/Web OCI overlay 已通过局部健康/合同/回放门禁并清理，registry manifest GET 200、digest 前缀 `043180…`；基座仍是旧 runtime + current dist overlay，非原始 Dockerfile 全链；Observer scripts overlay `7d3b…` 也已完成 25-probe/5-fence 组合 smoke，但长跑批量拒绝与 existing formal deployment 未切换仍是缺口；
 15. URL/hash、正文权限、30 天保留和生产容量/成本仍需安全负责人和部署环境单独批准。
 
 ### 6.2 回滚点
