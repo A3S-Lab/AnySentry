@@ -44,6 +44,10 @@ k3s Pod 中以 Aya `Program::load` 逐项加载了
 
 | 范围 | 事实 | 解释边界 |
 | --- | --- | --- |
+| 当前本地代码 checkpoint | AnySentry `477f897`；Observer `030b910` | 两个仓库均为本地 checkpoint，未 push；旧部署尚未切换到这组代码 |
+| 当前 checkpoint 测试 | identity scope tests 6/6；Observer full tests 159 + common 8 + root 32 + workload 7 = 206；fmt/check/build/clippy 均通过 | 证明局部合同与仓库门禁，不替代部署/真实链路验收 |
+| mixed-cgroup identity fence | AnySentry publisher 输出 `rootPid`、`rootStartTimeTicks`、`agentInstanceId` 并保留同 cgroup distinct entries；Observer 按 process generation/cgroup/祖先链 fail-closed，mixed scope 不 broad admit | 旧 Observer/Forwarder rollout 必须和 publisher 原子升级；只替换单侧会保留旧误合并/准入风险 |
+| 临时 k3s current-dist 验证 | namespace `anysentry-goal-dist-20260904` 的 current-dist hostPath fallback health ok；canonical contracts v1、representative replay 13 synthetic events/4 families/0 gap、S6 Tool Evidence、S2 shadow 均通过；namespace/容器已清理 | 仅为旧镜像底座 + 只读 `/app/dist`，不是 current-head OCI image，不能替代正式部署 |
 | `tender_jang` | `node:24-bookworm` 容器内有 Codex CLI 0.149.1、Claude Code 2.1.251；Python 运行库为 LangChain 1.3.17/LangGraph 1.2.11 | 容器无 published port、Docker socket、Docker CLI；这是运行时盘点，不是 Docker 编排或 Observer 接入证明 |
 | `tender_jang` LangChain 服务 | 容器内 `service.py` 监听 18082，`/health=200`；宿主 loopback 由既有本地转发进程接入 | 证明当前容器有可达服务，不证明当前头 AnySentry/Observer 已接入 |
 | 旧 k3s 身份反例 | 旧 k3s API image digest/revision 下，同一 Docker cgroup 的历史 LangChain 与 Claude Code 均有 `LlmInteraction`，却被合并到同一旧 agentAsset/session/run；Observer source/profile 可见但 cgroup map 仍把 Codex/Claude/LangChain 标为同一 `langchain` scope | 这是旧部署的真实混合身份/误合并反例；current-head 尚未部署，必须用 ProcessGeneration + Adapter/definition fence 拆分，不能把旧 asset 当 confirmed LogicalAgent |
@@ -289,17 +293,23 @@ cargo clippy --locked --offline --workspace --exclude a3s-observer-ebpf \
   --all-targets --all-features --release -- -D warnings
 ```
 
-结果为 202 项测试通过（root 32、workload contract 7、collector 155、common 8），fmt、
-release build 和 clippy 通过。`a3s-observer-ebpf` 是 no_std/no_main 的专用 BPF target；在
+当前 Observer `030b910` 结果为 206 项测试通过（root 32、workload contract 7、collector
+159、common 8），identity scope tests 另为 6/6；fmt、workspace check/release build 和 clippy
+通过。`a3s-observer-ebpf` 是 no_std/no_main 的专用 BPF target；在
 普通 host 上直接以 `--features build-ebpf` 做宿主链接会触发 unwinding 限制，正确门禁是
 Collector 的 `aya_build`（本次 workspace build/test 已生成 BPF object），不能把该宿主链接
 命令写成 eBPF attach 通过。
 
+AnySentry `477f897` 的 publisher 已输出 `rootPid`、`rootStartTimeTicks` 和 `agentInstanceId`
+fence，并在同一 cgroup 中保留 distinct entries；它与 Observer `030b910` 的 generation/cgroup/
+ancestor fail-closed 规则共同解决旧 mixed-scope broad-admit。两侧合同必须一起 rollout。
+
 额外的本地特权 load smoke 使用当前 Collector 构建产出的 BPF object，通过 Aya `Program::load`
 逐项加载 `tls_write`、`tls_sendto`、`http_writev` 和 `exec`，结果全部成功；旧实现曾在
 `http_request_route_kind` 的内联路径扫描/hash 上报 `BPF program is too large. Processed 1000001
-insn`。修复提交为 Observer `20a8aa4`，只把有界路径 hash 移到 `bpf_loop` callback，未改变固定
-ABI 或产品识别。该 smoke 不执行 tracepoint attach；现有节点已有 Observer，实际完整 attach/目标
+insn`。前序 verifier 修复提交为 Observer `20a8aa4`，只把有界路径 hash 移到 `bpf_loop`
+callback；当前 checkpoint `030b910` 进一步按 process generation/cgroup/祖先链 fail-closed，
+mixed scope 不 broad admit，未改变固定 ABI。该 smoke 不执行 tracepoint attach；现有节点已有 Observer，实际完整 attach/目标
 workload 转发仍按环境矩阵标记为未验证。
 
 ### 5.2 AnySentry API 和回放
@@ -396,7 +406,9 @@ Kafka/Flink 只在已有可选 profile 中保留，未成为 Canonical 主链前
 9. k3s LangGraph 已有真实 `/runs` 和耐久事件，但 `correlation unassigned=13`、`agent_adapter=6`，两条证据 lane 尚未统一；
 10. 当前 SSH Codex durable custom-window 初始快照为 60 条 parsed/confirmed/complete `LlmInteraction`（model 56、tool 4），后续异步 `agents/interactions` 可到约 63 records（model57/tool4 + 2 unsupported/unparsed；complete6/partial55/unsupported2）；identity/session/run 仍为 runtime/probable 提示，2 条 Rustls plaintext evidence 是 metadata-only/unparsed，且 conversation complete2/tool_pending55、选定 Tool inspector 404；普通 SSH `CapEff=0` 且 `unprivileged_bpf_disabled=2`，不能据此声称正文原文完整可见；
 11. 当前 AnySentry 仍为旧 image digest，canonical GET 尚未部署，`critical_inbox_dropped` 约 1.89M（最近观测且继续上涨），且 static signature warnings 仍存在；这些运行可靠性缺口和风险尚未消除；
-12. URL/hash、正文权限、30 天保留和生产容量/成本仍需安全负责人和部署环境单独批准。
+12. AnySentry `477f897` 与 Observer `030b910` 已加入 mixed-cgroup fence，但旧 Observer/Forwarder rollout 仍有误合并/broad-admit 风险；publisher、Forwarder、Observer 必须原子升级并回放验证；
+13. 临时 namespace `anysentry-goal-dist-20260904` 的旧镜像 + 只读 `/app/dist` hostPath fallback 已清理；它不能替代 current-head OCI 镜像部署；
+14. URL/hash、正文权限、30 天保留和生产容量/成本仍需安全负责人和部署环境单独批准。
 
 ### 6.2 回滚点
 
@@ -405,6 +417,7 @@ Kafka/Flink 只在已有可选 profile 中保留，未成为 Canonical 主链前
 - 解析回滚：停用某个 Adapter/Transport registry 版本，保留 RawObservation 和旧兼容投影；
 - 身份回滚：Canonical Directory/Timeline 与旧 V1/V2 binding 并行，关闭新 feature flag；
 - 存储回滚：恢复旧 API/镜像时不删除新表；停止新事件后再切换读模型，历史事实保留按 TTL 治理；
+- rollout：publisher、Forwarder 和 Observer 的 identity fence 是同一兼容单元；升级/回滚都必须原子执行，避免新旧 mixed-cgroup 语义并存；
 - 本地代码回滚：使用本地 checkpoint commit 的父提交或按文件反向恢复，经 `git diff`、build
   和回放复验后再操作；本 Goal 不执行 reset/checkout 或远程推送。
 

@@ -23,6 +23,10 @@
 
 | 范围 | 结果 | 证据边界 |
 | --- | --- | --- |
+| 当前本地代码 checkpoint | AnySentry `477f897`；Observer `030b910` | 两个仓库均为本地分支 checkpoint，未 push；本轮 publisher/Observer 身份 fence 变更已进入该快照 |
+| 当前 checkpoint 测试 | scope tests 6/6；Observer full tests 159 + common 8 + root 32 + workload 7 = 206；fmt/check/build/clippy 均通过 | 这是代码/合同门禁结果，不等于旧部署已原子升级或所有 workload 已完成被动采集 |
+| 身份 fence 修正 | AnySentry publisher 输出 `rootPid`、`rootStartTimeTicks`、`agentInstanceId` 并保留同 cgroup 的 distinct entries；Observer 按 process generation/cgroup/祖先链 fail-closed，mixed scope 不 broad admit | current-head 可避免旧 mixed-cgroup 广泛准入；旧 Observer/Forwarder rollout 必须原子升级 |
+| 临时 k3s current-dist 验证 | namespace `anysentry-goal-dist-20260904` 的 current-dist hostPath fallback health ok；canonical contracts v1、representative replay 13 synthetic events/4 families/0 gap、S6 Tool Evidence、S2 shadow 均通过；namespace/容器已清理 | 仅为旧镜像底座 + 只读 `/app/dist`，不是 current-head OCI image，不能替代正式部署 |
 | `tender_jang` | 容器镜像为 `node:24-bookworm`；已安装 Codex CLI 0.149.1、Claude Code 2.1.251；容器内存在 LangChain/LangGraph Python 运行库 | 容器没有 published port、Docker socket 或 Docker CLI，因此这些版本是容器内可调用运行时，不等于可以从容器内编排 Docker 或已接入 Observer |
 | `tender_jang` LangChain 服务 | 容器内 `service.py` 进程监听 18082，`/health=200`；运行库为 LangChain 1.3.17、LangGraph 1.2.11；宿主 loopback 由既有本地转发进程接入 | 证明当前容器确有可用服务，不证明它已由 AnySentry 当前头镜像或 Observer 被动观测 |
 | 旧 k3s 身份反例 | 旧 k3s API image digest/revision 下，同一 Docker cgroup 的历史 LangChain 与 Claude Code 均有 `LlmInteraction`，却被合并到同一旧 agentAsset/session/run；Observer source/profile 可见但 cgroup map 仍把 Codex/Claude/LangChain 标为同一 `langchain` scope | 这是旧部署的真实混合身份/误合并反例；current-head 尚未部署，必须用 ProcessGeneration + Adapter/definition fence 拆分，不能把旧 asset 当 confirmed LogicalAgent |
@@ -42,7 +46,7 @@
 | 当前 SSH Codex timeline-v3（旧 API 兼容投影） | 固定窗口只读返回 336 个 semantic events，全部 `completeness=complete`，每条带 `evidenceEventIds/sourceInteractionIds`；`user_message=1`、`model_progress=1`、`tool_call=105`（exact103/strong2）、`tool_result=229`（exact229）；唯一 Turn 仍 incomplete，旧 resolver 的 logical/session/terminal 字段为空 | 证明语义事件与 source evidence 可追溯；不等于 current-head Canonical EvidenceLink/UI 或 confirmed LogicalAgent |
 | SSH 早期窄窗口（历史快照） | 曾只看到 17 条 Egress、无 `LlmInteraction` | 该结果属于旧时间窗，不能继续作为当前 SSH 状态；只保留作 attach/时间窗对比 |
 | 权限边界 | Observer 特权 `hostPID` Pod 能看到宿主进程；普通 SSH 用户 `CapEff=0`，且 `unprivileged_bpf_disabled=2` | Pod 的宿主可见性不授予普通 SSH shell eBPF attach 权限，也不证明该 Pod 已独占捕获当前 Codex |
-| 当前部署缺口 | 现有 AnySentry 使用旧 image digest；canonical GET 尚未部署；`critical_inbox_dropped` 约 1.89M（最近观测且继续上涨）；static signature warnings 仍存在 | 这些是运行/可靠性 DoD 缺口和风险，不因健康探针或 fixture 通过而消失 |
+| 当前部署缺口 | 现有 AnySentry/Observer/Forwarder 仍有旧 image digest 或旧 rollout；canonical GET 尚未部署；`critical_inbox_dropped` 约 1.89M（最近观测且继续上涨）；static signature warnings 仍存在 | 这些是运行/可靠性 DoD 缺口和风险；旧 mixed-cgroup 身份风险要求 Observer/Forwarder 原子升级，不因健康探针或 fixture 通过而消失 |
 
 ### 推断（不作为通过条件）
 
@@ -68,7 +72,7 @@
 | Dify Workflow/Chatflow | LLM/tool 两个 workflow 本回合均 HTTP 200、脚本 rc=0；debug reconciliation curl 因测试 CA 校验失败 | durable snapshot `detectedName=dify-observation-lab` 共 55 事件（Egress44/ToolExec8/LlmInteraction3，captureSelected55，identity exact54/weak1）；correlation method 全 unassigned；hash 对账 partial | partial |
 | LangChain/LangGraph | LangChain HTTP 临时副本 200；常驻 HTTPS 502；k3s LangGraph 两次同 Session 成功 + 一次 RuntimeError 仍上报 3 事件 | durable LangGraph 19 事件，但 `unassigned=13`、`agent_adapter=6`，两 lane 未统一 | partial |
 
-## 最新冻结 QA 回合（2026-09-03，当前 dirty 工作树）
+## 上一轮冻结 QA 回合（2026-09-03，历史 dirty 工作树快照）
 
 当前 API 进程曾由源码构建后在 `127.0.0.1:29653` 运行并完成短验收，随后已停止（仅作为
 本地验证入口，memory fallback；管理/session 值为临时专用环境变量）。以下结果均不包含
@@ -181,8 +185,8 @@ Round6 记录：14 项本地测试全部 `pass`；`fail=0`，tracked diff 前后
 
 | 仓库 | 分支 | HEAD | 工作树 |
 | --- | --- | --- | --- |
-| AnySentry | `goal/canonical-observability-20260903` | `HEAD`（当前本地 checkpoint；以 `git rev-parse HEAD` 为准） | tracked/index clean；保留用户已有未跟踪报告/资产 |
-| Observer | `goal/canonical-observability-20260903` | `20a8aa4…` | 本地 checkpoint（含 eBPF verifier 修复），工作树 clean；未 push |
+| AnySentry | `goal/canonical-observability-20260903` | `477f897` | 当前本地 checkpoint；tracked/index clean；保留用户已有未跟踪报告/资产 |
+| Observer | `goal/canonical-observability-20260903` | `030b910` | 当前本地 checkpoint（process-generation/cgroup/ancestor fail-closed），工作树 clean；未 push |
 
 远程地址仅作只读基线记录；本轮未执行 `git push`、远程分支/PR 操作或镜像远程发布。脚本在运行前后比较 tracked worktree，并以不输出凭据的方式报告 remote host、ahead/behind 和变更路径。
 
@@ -222,6 +226,10 @@ cargo test --locked --offline -p a3s-observer -p a3s-observer-common -p a3s-obse
 cargo test -p a3s-observer --release
 cargo build --release
 ```
+
+当前 checkpoint 的增量门禁为：identity scope tests 6/6；Observer full tests 206（root 32、
+workload 7、collector 159、common 8）；`cargo fmt --check`、workspace `cargo check`/build 和
+clippy `-D warnings` 均通过。下方 202 项计数属于 2026-09-03 旧 checkpoint，不覆盖本节。
 
 Observer release collector build通过 `a3s-observer-collector/build.rs` 生成并嵌入 eBPF `out/probes`。直接执行 `cargo build -p a3s-observer-ebpf --release` 会因为把 no_std eBPF crate 当作 host binary（unwinding panics）失败；该命令不是正确的 Collector/eBPF 构建入口，不能据此判定 Collector 构建失败。
 
@@ -276,6 +284,10 @@ EvidenceLink/Correlation → Sentry → Conversation/Evidence/Coverage projectio
 | Docker | partial | daemon 与 Compose config 通过；Dify 容器健康；`tender_jang` 可调用 CLI/库但无 Docker CLI/socket；未发现本分支 AnySentry API 容器 |
 | Kubernetes | partial | `kubectl` API、LangGraph `/healthz` 与 `/runs` 真实调用可用；既有 AnySentry 仍旧 digest，canonical GET 未部署，workspace-scanner/critical inbox 缺口未消除 |
 
+本轮 identity fence 代码已进入 AnySentry `477f897` / Observer `030b910`，但线上旧 Observer/Forwarder
+仍可能把同 cgroup 的混合进程 broad-admit；升级必须以 Observer、Forwarder 和对应 publisher 的
+兼容版本原子切换，不能只替换单个组件。
+
 ## QA 门禁脚本
 
 运行：
@@ -316,6 +328,8 @@ node scripts/verify-canonical-goal.mjs --json-out /tmp/anysentry-canonical-goal.
 - k3s LangGraph `/runs` 已有同 Session 的两次成功 Run、失败 Run 的 3 事件保留和 19 条耐久记录，但 `correlation unassigned=13`、`agent_adapter=6` 表明两条 lane 尚未统一，需补 Adapter/Relation revision 与双向查询验证。
 - 当前 SSH Codex（native PID 1101287）的初始 custom-window 快照有 60 条 parsed/confirmed/complete `LlmInteraction`（model 56、tool 4），后续异步 `agents/interactions` 可到约 63 records（model57/tool4 + 2 unsupported/unparsed）；request roles 已证明 semantic lane 进入，但 2 条 Rustls plaintext evidence 为 metadata-only/unparsed，identity/session/run 未达到 authenticated AgentAdapter/confirmed Session，且选定 Tool 的 EvidenceLink inspector 404。没有证据表明本助手对话正文已按 Canonical contract 完整落盘或可按业务会话确认归属。
 - 旧 AnySentry digest、未部署的 canonical GET、约 1.89M 且继续上涨的 `critical_inbox_dropped` 和 static signature warnings 仍需在本地部署/运行窗口中处理并复验；特权 `hostPID` Pod 的可见性不能替代普通 SSH 用户的 eBPF 权限。
+- AnySentry `477f897` 与 Observer `030b910` 已修正 mixed-cgroup identity fence，但旧 Observer/Forwarder rollout 仍有误合并风险；必须原子升级 publisher、Forwarder 和 Observer 后重放验证，不能只替换一侧。
+- 临时 namespace `anysentry-goal-dist-20260904` 的 hostPath fallback 验证已清理；其旧镜像底座和只读 `/app/dist` 只能证明当前 dist 的局部 API/回放门禁，不能算 current-head OCI 部署通过。
 - Semantic Inspector 已能显示部分 canonical EvidenceLink/Raw/Kernel/Session 标识，但完整 UI 深链接和多竞争 EvidenceLink 展示仍需浏览器验收；管理认证缺失时必须显示明确的 coverage/权限状态。
 - 将当前 Host 的 memory-fallback API 替换/补充为带明确源码 revision 的本地 durable Docker/Kubernetes 部署，保持 API、ClickHouse、PostgreSQL、Redis 和 Web 健康后重跑 ingest/interaction/coverage/forwarder checks；
 - 为每个代表对象继续生成 run-id 隔离、脱敏的 runtime evidence envelope，补齐启动、新 Session、第二轮、ToolCall/ToolResult、KernelFact、EvidenceLink、Coverage 和失败降级状态；当前 LangGraph 已有部分真实 envelope，但关系统一仍待完成；
