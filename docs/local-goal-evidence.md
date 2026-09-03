@@ -50,7 +50,8 @@ bounded-state guard 均为 pass；credential scan 仍为 blocked（10 个既有 
 
 验证脚本创建的 Source（包括 negative-path 自动发现的 Source）在最终固定 API 上均已设为
 `enabled=false`；Source 记录保留用于审计，没有删除业务数据。最终临时 API 进程已停止，
-监听端口与临时测试目录已清理。
+监听端口与临时测试目录已清理。另识别并停止了本 Goal 早期遗留的本地临时 API（PID
+1133482、端口 29660）；既有 k3s API/Observer 与 InternOS 进程未停止。
 
 额外受控运行：
 
