@@ -126,7 +126,7 @@ Round6 记录：14 项本地测试全部 `pass`；`fail=0`，tracked diff 前后
 
 | 仓库 | 分支 | HEAD | 工作树 |
 | --- | --- | --- | --- |
-| AnySentry | `goal/canonical-observability-20260903` | `7c49afd…`（当前本地 checkpoint，父提交含 Canonical 实现） | tracked/index clean；保留用户已有未跟踪报告/资产 |
+| AnySentry | `goal/canonical-observability-20260903` | `095a603…`（当前本地 checkpoint，父提交含 Canonical 实现） | tracked/index clean；保留用户已有未跟踪报告/资产 |
 | Observer | `goal/canonical-observability-20260903` | `20a8aa4…` | 本地 checkpoint（含 eBPF verifier 修复），工作树 clean；未 push |
 
 远程地址仅作只读基线记录；本轮未执行 `git push`、远程分支/PR 操作或镜像远程发布。脚本在运行前后比较 tracked worktree，并以不输出凭据的方式报告 remote host、ahead/behind 和变更路径。
