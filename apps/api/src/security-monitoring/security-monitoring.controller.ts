@@ -468,6 +468,9 @@ function canonicalScopeMatches(
     runtimeInstanceId?: string;
     sessionId?: string;
     agentAssetIds?: readonly string[];
+    agentInstanceIds?: readonly string[];
+    runtimeInstanceIds?: readonly string[];
+    sessionIds?: readonly string[];
     product?: string;
     classification?: T.AgentClassification;
     coverageStatus?: string;
@@ -496,9 +499,15 @@ function canonicalScopeMatches(
     && (query.agentAssetId === undefined
       || equals(value.agentAssetId, query.agentAssetId)
       || Boolean(value.agentAssetIds?.some((candidate) => equals(candidate, query.agentAssetId))))
-    && equals(value.agentInstanceId, query.agentInstanceId)
-    && equals(value.runtimeInstanceId, query.runtimeInstanceId)
-    && equals(value.sessionId, query.sessionId)
+    && (query.agentInstanceId === undefined
+      || equals(value.agentInstanceId, query.agentInstanceId)
+      || Boolean(value.agentInstanceIds?.some((candidate) => equals(candidate, query.agentInstanceId))))
+    && (query.runtimeInstanceId === undefined
+      || equals(value.runtimeInstanceId, query.runtimeInstanceId)
+      || Boolean(value.runtimeInstanceIds?.some((candidate) => equals(candidate, query.runtimeInstanceId))))
+    && (query.sessionId === undefined
+      || equals(value.sessionId, query.sessionId)
+      || Boolean(value.sessionIds?.some((candidate) => equals(candidate, query.sessionId))))
     && contains(value.product, query.product)
     && equals(value.classification, query.classification)
     && equals(value.coverageStatus, query.coverageStatus)
@@ -10772,7 +10781,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         existing.segmentIds = [...new Set([...existing.segmentIds, ...segmentIds])].slice(0, 512);
         existing.agentAssetIds = [...new Set([
           ...(existing.agentAssetIds ?? []),
-          summary.agentAssetId,
+          ...(summary.agentAssetIds ?? [summary.agentAssetId]),
         ].filter((value): value is string => Boolean(value)))].slice(0, 256);
         continue;
       }
@@ -10793,7 +10802,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         ...(summary.agentProduct ? { agentProduct: summary.agentProduct } : {}),
         ...(summary.environment ? { environment: summary.environment } : {}),
         ...(summary.workspacePath ? { workspacePath: summary.workspacePath } : {}),
-        agentAssetIds: summary.agentAssetId ? [summary.agentAssetId] : [],
+        agentAssetIds: [...new Set(summary.agentAssetIds ?? [summary.agentAssetId])]
+          .filter((value): value is string => Boolean(value))
+          .slice(0, 256),
         agentInstanceIds: [...summary.agentInstanceIds].slice(0, 512),
         segmentIds,
         interactionIds,
@@ -10884,8 +10895,12 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       environmentId: undefined,
       agentAssetId: undefined,
       agentInstanceId: resource.agentInstanceIds[0],
+      agentInstanceIds: resource.agentInstanceIds,
       runtimeInstanceId: resource.agentInstanceIds[0],
+      runtimeInstanceIds: resource.agentInstanceIds,
       sessionId: resource.sessionId,
+      sessionIds: [resource.sessionId, resource.canonicalSessionId, resource.conversationId]
+        .filter((value): value is string => Boolean(value)),
       product: resource.agentProduct,
       classification: undefined,
       coverageStatus: resource.coverage.status,
@@ -11002,7 +11017,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     semanticRecord: SemanticRecord | undefined,
     query: CanonicalEntityQuery,
   ): Promise<CanonicalSemanticTimelineSearch> {
-    const conversations = await this.agg.agentConversations({
+    const candidates: CanonicalSemanticTimelineCandidate[] = [];
+    let failed = 0;
+    const conversationQueries: T.AgentConversationQuery[] = [{
       timeType: query.timeType,
       startTime: query.startTime,
       endTime: query.endTime,
@@ -11014,13 +11031,40 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       product: query.product,
       q: query.q,
       limit: 64,
-    });
-    const candidates: CanonicalSemanticTimelineCandidate[] = [];
-    let failed = 0;
-    for (const summary of conversations.items.slice(0, 64)) {
-      if (!summary.hasContent || !summary.conversationId) continue;
+    }];
+    // A conversation may contain several physical assets. If the requested semantic event was
+    // emitted by a sandbox/worker asset but the caller selected the LLM asset (or vice versa), a
+    // filtered projection can hide the group before the timeline is built. Retry once without the
+    // physical asset predicates; the resulting summary still carries all aliases and is checked
+    // by the canonical scope matcher before it is returned.
+    if (query.agentAssetId || query.agentInstanceId) {
+      conversationQueries.push({
+        timeType: query.timeType,
+        startTime: query.startTime,
+        endTime: query.endTime,
+        snapshotAsOf: query.snapshotAsOf,
+        scope: 'raw',
+        classificationView: query.classificationView,
+        product: query.product,
+        q: query.q,
+        limit: 64,
+      });
+    }
+    let scanned = 0;
+    for (const conversationQuery of conversationQueries) {
+      let conversations: T.AgentConversationList;
       try {
-        const timeline = await this.agg.agentConversationTimelineV3({
+        conversations = await this.agg.agentConversations(conversationQuery);
+      } catch (error) {
+        if (!isCanonicalProjectionDegradation(error)) throw error;
+        failed += 1;
+        continue;
+      }
+      scanned += conversations.items.length;
+      for (const summary of conversations.items.slice(0, 64)) {
+        if (!summary.hasContent || !summary.conversationId) continue;
+        try {
+          const timeline = await this.agg.agentConversationTimelineV3({
           timeType: query.timeType,
           startTime: query.startTime,
           endTime: query.endTime,
@@ -11029,13 +11073,13 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           classificationView: query.classificationView,
           conversationId: summary.conversationId,
           limit: 500,
-        });
-        for (const turn of timeline.turns) {
-          for (const event of turn.events) {
-            if (semanticRecord
-              ? !canonicalSemanticRecordTouchesEvent(semanticRecord, event)
-              : event.semanticEventId !== requestedId) continue;
-            const session: T.CanonicalSessionResource = {
+          });
+          for (const turn of timeline.turns) {
+            for (const event of turn.events) {
+              if (semanticRecord
+                ? !canonicalSemanticRecordTouchesEvent(semanticRecord, event)
+                : event.semanticEventId !== requestedId) continue;
+              const session: T.CanonicalSessionResource = {
               schemaVersion: 'anysentry.session.v1',
               sessionId: summary.sessionId ?? summary.conversationId,
               ...(summary.sessionId && summary.sessionId !== summary.conversationId
@@ -11053,7 +11097,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
               ...(summary.agentProduct ? { agentProduct: summary.agentProduct } : {}),
               ...(summary.environment ? { environment: summary.environment } : {}),
               ...(summary.workspacePath ? { workspacePath: summary.workspacePath } : {}),
-              agentAssetIds: summary.agentAssetId ? [summary.agentAssetId] : [],
+              agentAssetIds: [...new Set(summary.agentAssetIds ?? [summary.agentAssetId])]
+                .filter((value): value is string => Boolean(value))
+                .slice(0, 256),
               agentInstanceIds: [...summary.agentInstanceIds].slice(0, 512),
               segmentIds: [],
               interactionIds: [],
@@ -11074,19 +11120,37 @@ export class SecurityMonitoringController implements OnModuleDestroy {
               sourceRefs: canonicalConversationSourceRefs(summary).slice(0, 64),
               resolutionRevision: this.canonicalCurrentRevision(),
             };
-            candidates.push({ session, event });
+              // Do not widen an explicitly scoped request to an unrelated conversation merely
+              // because the unscoped retry found a matching semantic hash.
+              if (!canonicalScopeMatches({
+                agentAssetIds: session.agentAssetIds,
+                agentInstanceId: session.agentInstanceIds[0],
+                agentInstanceIds: session.agentInstanceIds,
+                runtimeInstanceId: session.agentInstanceIds[0],
+                runtimeInstanceIds: session.agentInstanceIds,
+                sessionId: session.sessionId,
+                sessionIds: [session.sessionId, session.canonicalSessionId, session.conversationId]
+                  .filter((value): value is string => Boolean(value)),
+                logicalAgentId: session.logicalAgentId,
+                logicalDefinitionId: session.logicalDefinitionId,
+                workspacePath: session.workspacePath,
+                product: session.agentProduct,
+              }, query)) continue;
+              candidates.push({ session, event });
+            }
           }
+        } catch (error) {
+          if (!isCanonicalProjectionDegradation(error)) throw error;
+          failed += 1;
         }
-      } catch (error) {
-        if (!isCanonicalProjectionDegradation(error)) throw error;
-        failed += 1;
+        if (candidates.length >= 2) break;
       }
       if (candidates.length >= 2) break;
     }
     return {
       candidates,
-      scanned: Math.min(conversations.items.length, 64),
-      truncated: conversations.items.length > 64,
+      scanned: Math.min(scanned, 128),
+      truncated: scanned > 128,
       failed,
     };
   }
@@ -11300,7 +11364,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       throw new NotFoundException('semantic record not found');
     }
 
-    const sessions = await this.canonicalSessionResources({ ...query, offset: 0, limit: 500 }, headers);
+    let sessions: CanonicalSessionProjection;
     let timelineSearch: CanonicalSemanticTimelineSearch | undefined;
     // A scoped deep link can be resolved directly from the bounded compatibility interaction
     // projection. This avoids scanning hundreds of canonical Session rows when PostgreSQL's
@@ -11321,6 +11385,27 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           failed: 1,
         };
       }
+    }
+    // The direct compatibility path carries a complete bounded Session summary for the matched
+    // interaction. Reuse it as the read scope instead of waiting on the broad canonical session
+    // projector; this keeps a valid deep link responsive while PostgreSQL catches up.
+    if (timelineSearch?.candidates.length) {
+      const directSessions = [...new Map(timelineSearch.candidates.map((candidate) => [
+        candidate.session.sessionId,
+        candidate.session,
+      ])).values()];
+      sessions = {
+        items: directSessions,
+        coverage: canonicalCoverage(
+          directSessions.some((session) => session.coverage.status !== 'complete'),
+          directSessions.flatMap((session) => session.coverage.reasons),
+          'compatibility_interaction_projection',
+        ),
+        dataSource: 'compatibility_interaction_projection',
+        revision: this.canonicalCurrentRevision(),
+      };
+    } else {
+      sessions = await this.canonicalSessionResources({ ...query, offset: 0, limit: 500 }, headers);
     }
     if (!timelineSearch || timelineSearch.candidates.length === 0) {
       try {

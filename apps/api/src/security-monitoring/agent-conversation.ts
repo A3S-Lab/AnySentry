@@ -810,6 +810,9 @@ function summaryForConversation(
       : {}),
     hasContent: true,
     agentAssetId: first.agentAssetId,
+    agentAssetIds: [...new Set(interactions
+      .map((item) => item.agentAssetId)
+      .filter((value): value is string => Boolean(value)))].slice(0, 256),
     agentInstanceIds: instanceIds,
     agentProduct,
     displayName: asset?.displayName ?? agentProduct,
@@ -855,6 +858,7 @@ function assetOnlySummary(
     ...(asset.terminalContextId ? { terminalContextIds: [asset.terminalContextId] } : {}),
     hasContent: false,
     agentAssetId: asset.agentAssetId,
+    agentAssetIds: [asset.agentAssetId],
     agentInstanceIds: asset.agentInstanceId ? [asset.agentInstanceId] : [],
     agentProduct: asset.agentProduct ?? asset.detectedName ?? asset.agentId,
     displayName: asset.displayName ?? asset.agentProduct ?? asset.detectedName ?? asset.agentId,
@@ -881,7 +885,9 @@ function summaryMatches(
   summary: T.AgentConversationSummary,
   query: T.AgentConversationQuery,
 ): boolean {
-  if (query.agentAssetId && summary.agentAssetId !== query.agentAssetId) return false;
+  if (query.agentAssetId
+    && summary.agentAssetId !== query.agentAssetId
+    && !summary.agentAssetIds?.includes(query.agentAssetId)) return false;
   if (query.agentInstanceId && !summary.agentInstanceIds.includes(query.agentInstanceId)) return false;
   if (query.conversationId && summary.conversationId !== query.conversationId) return false;
   if (query.product && !normalized(summary.agentProduct).includes(normalized(query.product))) return false;

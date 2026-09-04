@@ -1983,6 +1983,8 @@ export interface AgentConversationSummary {
   sessionLifecycle?: 'new' | 'resume' | 'fork';
   hasContent: boolean;
   agentAssetId: string;
+  /** All compatibility asset aliases participating in this conversation group. */
+  agentAssetIds?: string[];
   agentInstanceIds: string[];
   agentProduct: string;
   displayName: string;
