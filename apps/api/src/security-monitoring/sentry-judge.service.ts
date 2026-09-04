@@ -88,6 +88,9 @@ const boundedEnvInt = (name: string, fallback: number, min: number, max: number)
   const value = Number(raw);
   return Number.isFinite(value) ? Math.min(max, Math.max(min, Math.trunc(value))) : fallback;
 };
+
+type PreparedProjectionItem = Extract<PreparedJudgeAcceptOutcome, { disposition: 'retained' }>;
+type PreparedProjectionFailureHandler = (event: JudgedEvent, error: unknown) => void;
 const RISK_NAME_BY_CATEGORY: Record<string, string> = {
   systemic_risk: '云元数据 SSRF',
   privilege_escalation: '提权 / 进程注入',
@@ -584,6 +587,16 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     25,
     10_000,
   );
+  private readonly POST_COMMIT_PROJECTION_MAX_PENDING = boundedEnvInt(
+    'ANYSENTRY_POST_COMMIT_PROJECTION_MAX_PENDING',
+    1_024,
+    64,
+    4_096,
+  );
+  private readonly postCommitProjectionPending: Array<{
+    item: PreparedProjectionItem;
+    onProjectionFailure?: PreparedProjectionFailureHandler;
+  }> = [];
   private postCommitProjectionInFlight = 0;
   private postCommitProjectionScheduled = 0;
   private postCommitProjectionCompleted = 0;
@@ -680,6 +693,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   }
   async onModuleDestroy(): Promise<void> {
     this.postCommitProjectionClosing = true;
+    if (this.postCommitProjectionPending) {
+      this.postCommitProjectionDropped += this.postCommitProjectionPending.length;
+      this.postCommitProjectionPending.length = 0;
+    }
     this.decisionRevisionWriterClosing = true;
     if (this.decisionRevisionWriteTimer) clearTimeout(this.decisionRevisionWriteTimer);
     this.decisionRevisionWriteTimer = undefined;
@@ -747,6 +764,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     postCommitProjection: {
       inFlight: number;
       maxInFlight: number;
+      pending: number;
+      maxPending: number;
       timeoutMs: number;
       scheduled: number;
       completed: number;
@@ -768,6 +787,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       postCommitProjection: {
         inFlight: this.postCommitProjectionInFlight,
         maxInFlight: this.POST_COMMIT_PROJECTION_MAX_IN_FLIGHT,
+        pending: this.postCommitProjectionPending.length,
+        maxPending: this.POST_COMMIT_PROJECTION_MAX_PENDING,
         timeoutMs: this.POST_COMMIT_PROJECTION_TIMEOUT_MS,
         scheduled: this.postCommitProjectionScheduled,
         completed: this.postCommitProjectionCompleted,
@@ -1675,7 +1696,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
    * after its timeout, so a database outage cannot create an unhandled rejection.
    */
   schedulePreparedBatchProjection(
-    prepared: readonly Extract<PreparedJudgeAcceptOutcome, { disposition: 'retained' }>[],
+    prepared: readonly PreparedProjectionItem[],
     options: {
       onProjectionFailure?: (event: JudgedEvent, error: unknown) => void;
     } = {},
@@ -1687,7 +1708,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       if (current && currentRevision === incomingRevision) continue;
       if (
         this.postCommitProjectionClosing
-        || this.postCommitProjectionInFlight >= this.POST_COMMIT_PROJECTION_MAX_IN_FLIGHT
+        || this.postCommitProjectionPending.length + this.postCommitProjectionInFlight
+          >= this.POST_COMMIT_PROJECTION_MAX_PENDING
       ) {
         this.postCommitProjectionDropped += 1;
         try {
@@ -1702,60 +1724,80 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         }
         continue;
       }
-
-      this.postCommitProjectionInFlight += 1;
-      this.postCommitProjectionScheduled += 1;
-      let settled = false;
-      let reported = false;
-      let timeout: NodeJS.Timeout | undefined;
-      const release = () => {
-        if (timeout) clearTimeout(timeout);
-        this.postCommitProjectionInFlight = Math.max(0, this.postCommitProjectionInFlight - 1);
-      };
-      const report = (error: unknown) => {
-        if (reported) return;
-        reported = true;
-        this.postCommitProjectionFailed += 1;
-        try { options.onProjectionFailure?.(item.event, error); } catch { /* non-blocking */ }
-      };
-      let task: Promise<unknown>;
-      try {
-        task = this.upsertDurableMemory(item.event, item.notify);
-      } catch (error) {
-        settled = true;
-        report(error);
-        release();
-        continue;
-      }
-      timeout = setTimeout(() => {
-        if (settled) return;
-        this.postCommitProjectionTimedOut += 1;
-        report(Object.assign(new Error('post-commit projection timed out'), {
-          code: 'ANYSENTRY_POST_COMMIT_PROJECTION_TIMEOUT',
-        }));
-        // Keep the in-flight slot until the underlying Promise settles.  This prevents a fleet of
-        // timed-out PostgreSQL calls from quietly exceeding the configured concurrency bound.
-      }, this.POST_COMMIT_PROJECTION_TIMEOUT_MS);
-      timeout.unref();
-      void task
-        .then(() => {
-          if (settled) return;
-          settled = true;
-          this.postCommitProjectionCompleted += 1;
-          release();
-        })
-        .catch((error: unknown) => {
-          if (!settled) {
-            settled = true;
-            report(error);
-            release();
-          } else {
-            // A timeout already reported the failure; this catch still consumes the late
-            // rejection and releases the slot without emitting a duplicate gap.
-            release();
-          }
-        });
+      this.postCommitProjectionPending.push({ item, onProjectionFailure: options.onProjectionFailure });
     }
+    this.drainPreparedBatchProjection();
+  }
+
+  private drainPreparedBatchProjection(): void {
+    if (this.postCommitProjectionClosing) return;
+    while (
+      this.postCommitProjectionInFlight < this.POST_COMMIT_PROJECTION_MAX_IN_FLIGHT
+      && this.postCommitProjectionPending.length > 0
+    ) {
+      const pending = this.postCommitProjectionPending.shift();
+      if (!pending) break;
+      this.startPreparedProjection(pending.item, pending.onProjectionFailure);
+    }
+  }
+
+  private startPreparedProjection(
+    item: PreparedProjectionItem,
+    onProjectionFailure?: PreparedProjectionFailureHandler,
+  ): void {
+    this.postCommitProjectionInFlight += 1;
+    this.postCommitProjectionScheduled += 1;
+    let settled = false;
+    let reported = false;
+    let timeout: NodeJS.Timeout | undefined;
+    const release = () => {
+      if (timeout) clearTimeout(timeout);
+      this.postCommitProjectionInFlight = Math.max(0, this.postCommitProjectionInFlight - 1);
+      this.drainPreparedBatchProjection();
+    };
+    const report = (error: unknown) => {
+      if (reported) return;
+      reported = true;
+      this.postCommitProjectionFailed += 1;
+      try { onProjectionFailure?.(item.event, error); } catch { /* non-blocking */ }
+    };
+    let task: Promise<unknown>;
+    try {
+      task = this.upsertDurableMemory(item.event, item.notify);
+    } catch (error) {
+      settled = true;
+      report(error);
+      release();
+      return;
+    }
+    timeout = setTimeout(() => {
+      if (settled) return;
+      this.postCommitProjectionTimedOut += 1;
+      report(Object.assign(new Error('post-commit projection timed out'), {
+        code: 'ANYSENTRY_POST_COMMIT_PROJECTION_TIMEOUT',
+      }));
+      // Keep the in-flight slot until the underlying Promise settles.  This prevents a fleet of
+      // timed-out PostgreSQL calls from quietly exceeding the configured concurrency bound.
+    }, this.POST_COMMIT_PROJECTION_TIMEOUT_MS);
+    timeout.unref();
+    void task
+      .then(() => {
+        if (settled) return;
+        settled = true;
+        this.postCommitProjectionCompleted += 1;
+        release();
+      })
+      .catch((error: unknown) => {
+        if (!settled) {
+          settled = true;
+          report(error);
+          release();
+        } else {
+          // A timeout already reported the failure; this catch still consumes the late
+          // rejection and releases the slot without emitting a duplicate gap.
+          release();
+        }
+      });
   }
 
   async enqueuePreparedFastJob(
