@@ -1712,6 +1712,18 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       const currentRevision = Math.max(1, Math.trunc(current?.decisionRevision ?? 1));
       const incomingRevision = Math.max(1, Math.trunc(item.event.decisionRevision ?? 1));
       if (current && currentRevision === incomingRevision) continue;
+      // Most Observer rows are allow/pending telemetry and do not require the durable Incident /
+      // Alert business-effect transaction.  Apply those rows directly to the bounded hot index;
+      // putting them through the PostgreSQL projection gate would consume capacity needed by the
+      // comparatively rare risk-bearing rows and create avoidable coverage drops under load.
+      if (!item.notify || !this.requiresBusinessEffects(item.event)) {
+        try {
+          this.upsertMemory(item.event, false);
+        } catch (error) {
+          try { options.onProjectionFailure?.(item.event, error); } catch { /* non-blocking */ }
+        }
+        continue;
+      }
       if (
         this.postCommitProjectionClosing
         || this.postCommitProjectionPending.length + this.postCommitProjectionInFlight
