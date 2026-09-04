@@ -52,16 +52,18 @@ assert.match(incidents, /incidentStateStatus/);
 
 assert.match(alerts, /private readonly relational: RelationalBusinessStore/);
 assert.match(alerts, /this\.relational\.loadAlerts\(\)/);
-assert.match(alerts, /this\.relational\.saveAlerts\(alerts\)/);
-assert.match(alerts, /this\.ch\.saveAlertState\(alerts\)/);
+assert.match(alerts, /this\.relational\.saveAlerts\(relationalRecords\)/);
+assert.match(alerts, /this\.ch\.saveAlertState\(snapshot\)/);
+assert.match(alerts, /dirtyAlertIds/);
 assert.match(alerts, /refreshRelational/);
 assert.match(alerts, /if \(!cur \|\| rec\.updatedAt >= cur\.updatedAt\)/);
 assert.match(alerts, /stateStatus/);
 
 assert.match(remediations, /private readonly relational: RelationalBusinessStore/);
 assert.match(remediations, /this\.relational\.loadRemediations\(\)/);
-assert.match(remediations, /this\.relational\.saveRemediations\(tasks\)/);
-assert.match(remediations, /this\.ch\.saveRemediationState\(tasks\)/);
+assert.match(remediations, /this\.relational\.saveRemediations\(relationalRecords\)/);
+assert.match(remediations, /this\.ch\.saveRemediationState\(snapshot\)/);
+assert.match(remediations, /dirtyTaskIds/);
 assert.match(remediations, /record\.updatedAt >= current\.updatedAt/);
 assert.match(remediations, /refreshRelational/);
 assert.match(remediations, /stateStatus/);

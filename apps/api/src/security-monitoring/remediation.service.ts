@@ -25,8 +25,14 @@ const HOUR = 3_600_000;
 const WINDOW: Record<string, number> = { last_3h: 3 * HOUR, last_1d: 24 * HOUR, last_7d: 7 * 24 * HOUR, last_30d: 30 * 24 * HOUR };
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 const RETAIN_LIMIT = 2_000;
+// Pending relational writes are coalesced by task ID and kept within the compatibility snapshot
+// bound. ClickHouse continues to receive the complete snapshot for restart compatibility.
+const REMEDIATION_DIRTY_MAX_ENTRIES = RETAIN_LIMIT;
+const REMEDIATION_OVERDUE_SYNC_MAX_ENTRIES = 10_000;
 const OVERDUE_SCAN_BUFFER_MS = 250;
 const RELATIONAL_REFRESH_MS = 15_000;
+const PERSIST_RETRY_INITIAL_MS = 5_000;
+const PERSIST_RETRY_MAX_MS = 60_000;
 
 function envInt(name: string, fallback: number, min: number, max: number): number {
   const n = Number(process.env[name]);
@@ -68,6 +74,15 @@ function active(status: RemediationStatus): boolean {
 function clean(value: string | undefined, limit: number): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed.slice(0, limit) : undefined;
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+    .join(',')}}`;
 }
 
 function dueFor(severity: Severity, at: number): number {
@@ -137,6 +152,17 @@ function actionKindForText(text: string): RemediationActionKind {
 @Injectable()
 export class RemediationService implements OnModuleInit, OnModuleDestroy {
   private readonly state = new Map<string, RemediationRecord>();
+  /** Task IDs and mutation generations awaiting the relational durability fence. */
+  private readonly dirtyTaskIds = new Map<string, number>();
+  private dirtyTaskGeneration = 0;
+  private dirtyTaskDropped = 0;
+  private persistenceFailures = 0;
+  private persistenceRetryDelayMs = PERSIST_RETRY_INITIAL_MS;
+  private persistenceRetryTimer?: NodeJS.Timeout;
+  private persistenceForceSnapshot = false;
+  private closing = false;
+  /** Last state delivered to AlertingService's overdue projection, bounded by task count. */
+  private readonly overdueAlertSync = new Map<string, string>();
   private readonly overdueScanIntervalMs = envInt('ANYSENTRY_REMEDIATION_OVERDUE_SCAN_SECS', 60, 5, 86_400) * 1000;
   private readonly minimumSeverity = envSeverity('ANYSENTRY_REMEDIATION_MIN_SEVERITY', 'medium');
   private readonly dueMinimumSeverity = envSeverity('ANYSENTRY_REMEDIATION_DUE_MIN_SEVERITY', 'high');
@@ -154,6 +180,66 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
     private readonly relational: RelationalBusinessStore,
   ) {}
 
+  private markTaskDirty(taskId: string): void {
+    const id = taskId.trim();
+    if (!id) return;
+    const generation = ++this.dirtyTaskGeneration;
+    if (this.dirtyTaskIds.has(id)) {
+      this.dirtyTaskIds.set(id, generation);
+      return;
+    }
+    if (this.dirtyTaskIds.size >= REMEDIATION_DIRTY_MAX_ENTRIES) {
+      const oldest = this.dirtyTaskIds.keys().next().value as string | undefined;
+      if (oldest !== undefined) {
+        this.dirtyTaskIds.delete(oldest);
+        this.dirtyTaskDropped += 1;
+      }
+    }
+    this.dirtyTaskIds.set(id, generation);
+  }
+
+  private relationalPersistenceEnabled(): boolean {
+    const configured = (this.relational as unknown as { configured?: () => boolean }).configured;
+    return typeof configured !== 'function' || configured.call(this.relational);
+  }
+
+  private schedulePersistenceRetry(): void {
+    if (this.closing || !this.initialized || this.persistenceRetryTimer || this.dirtyTaskIds.size === 0) return;
+    const delay = this.persistenceRetryDelayMs;
+    this.persistenceRetryDelayMs = Math.min(PERSIST_RETRY_MAX_MS, delay * 2);
+    this.persistenceRetryTimer = setTimeout(() => {
+      this.persistenceRetryTimer = undefined;
+      void this.persist();
+    }, delay);
+    this.persistenceRetryTimer.unref?.();
+  }
+
+  private markPersistenceSuccess(): void {
+    this.persistenceRetryDelayMs = PERSIST_RETRY_INITIAL_MS;
+    if (this.persistenceRetryTimer) {
+      clearTimeout(this.persistenceRetryTimer);
+      this.persistenceRetryTimer = undefined;
+    }
+  }
+
+  private remediationPersistenceStatus(): {
+    dirty: number;
+    maxDirty: number;
+    dropped: number;
+    failures: number;
+    inFlight: boolean;
+    retryScheduled: boolean;
+  } {
+    return {
+      dirty: this.dirtyTaskIds.size,
+      maxDirty: REMEDIATION_DIRTY_MAX_ENTRIES,
+      dropped: this.dirtyTaskDropped,
+      failures: this.persistenceFailures,
+      inFlight: Boolean(this.persistInFlight),
+      retryScheduled: Boolean(this.persistenceRetryTimer),
+    };
+  }
+
   async onModuleInit(): Promise<void> {
     if (await this.ch.init()) {
       for (const record of await this.ch.loadRemediationState()) this.mergePersisted(record);
@@ -161,22 +247,30 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
     for (const record of await this.relational.loadRemediations()) this.mergePersisted(record);
     this.retireDuplicateAlertTasks();
     this.initialized = true;
-    await this.persist();
+    await this.persist(true);
     this.scheduleOverdueScan(0);
     this.relationalRefreshTimer = setInterval(() => void this.refreshRelational(), RELATIONAL_REFRESH_MS);
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.closing = true;
     if (this.persistTimer) clearTimeout(this.persistTimer);
     if (this.overdueTimer) clearTimeout(this.overdueTimer);
     if (this.relationalRefreshTimer) clearInterval(this.relationalRefreshTimer);
-    await this.persist();
+    if (this.persistenceRetryTimer) clearTimeout(this.persistenceRetryTimer);
+    this.persistenceRetryTimer = undefined;
+    await this.persist(true);
   }
 
-  stateStatus(): { recordCount: number; postgresqlBacked: boolean } {
+  stateStatus(): {
+    recordCount: number;
+    postgresqlBacked: boolean;
+    persistence: ReturnType<RemediationService['remediationPersistenceStatus']>;
+  } {
     return {
       recordCount: this.state.size,
       postgresqlBacked: this.relational.isReady(),
+      persistence: this.remediationPersistenceStatus(),
     };
   }
 
@@ -288,6 +382,7 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
       steps: cur.steps.map((s) => ({ ...s, done: completed.has(s.stepId) })),
     };
     this.state.set(taskId, next);
+    this.markTaskDirty(taskId);
     this.persistSoon();
     this.alerting.observeRemediation(this.item(next), at);
     this.scheduleOverdueScan();
@@ -445,11 +540,12 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
     const cur = this.state.get(generated.taskId);
     if (!cur) {
       this.state.set(generated.taskId, generated);
+      this.markTaskDirty(generated.taskId);
       this.persistSoon();
       return;
     }
     if (cur.status === 'done' || cur.status === 'dismissed') return;
-    this.state.set(generated.taskId, {
+    const next: RemediationRecord = {
       ...generated,
       status: cur.status,
       owner: cur.owner ?? generated.owner,
@@ -458,7 +554,10 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
       completedAt: cur.completedAt,
       updatedAt: Math.max(cur.updatedAt, generated.updatedAt),
       steps: generated.steps.map((step) => ({ ...step, done: cur.steps.find((s) => s.stepId === step.stepId)?.done ?? step.done })),
-    });
+    };
+    if (canonicalJson(next) === canonicalJson(cur)) return;
+    this.state.set(generated.taskId, next);
+    this.markTaskDirty(generated.taskId);
     this.persistSoon();
   }
 
@@ -488,6 +587,8 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
           updatedAt: at,
           note: task.note ?? '低于强制处置时限门槛，保留治理任务但不再产生逾期告警。',
         });
+        this.markTaskDirty(taskId);
+        this.overdueAlertSync.delete(taskId);
       }
       if (
         !active(task.status) ||
@@ -509,6 +610,8 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
         updatedAt: at,
         note: task.note ?? '已由对应 Incident 处置任务覆盖，自动关闭重复任务。',
       });
+      this.markTaskDirty(taskId);
+      this.overdueAlertSync.delete(taskId);
     }
   }
 
@@ -522,9 +625,35 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
+  private overdueAlertFingerprint(task: RemediationListItem, at: number): string {
+    return canonicalJson({
+      task,
+      overdue: active(task.status) && Boolean(task.dueAt) && (parseTime(task.dueAt) ?? Number.MAX_SAFE_INTEGER) < at,
+    });
+  }
+
   private syncOverdueAlerts(at = Date.now()): void {
     const tasks = [...this.state.values()].map((task) => this.item(task));
-    for (const task of tasks) this.alerting.observeRemediation(task, at);
+    const currentTaskIds = new Set(tasks.map((task) => task.taskId));
+    const changed: Array<{ task: RemediationListItem; fingerprint: string }> = [];
+    for (const task of tasks) {
+      const fingerprint = this.overdueAlertFingerprint(task, at);
+      if (this.overdueAlertSync.get(task.taskId) !== fingerprint) {
+        changed.push({ task, fingerprint });
+      }
+    }
+    for (const taskId of this.overdueAlertSync.keys()) {
+      if (!currentTaskIds.has(taskId)) this.overdueAlertSync.delete(taskId);
+    }
+    for (const { task, fingerprint } of changed) {
+      this.alerting.observeRemediation(task, at);
+      this.overdueAlertSync.set(task.taskId, fingerprint);
+    }
+    while (this.overdueAlertSync.size > REMEDIATION_OVERDUE_SYNC_MAX_ENTRIES) {
+      const oldest = this.overdueAlertSync.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.overdueAlertSync.delete(oldest);
+    }
     this.alerting.reconcileRemediationOverdue(tasks, at);
   }
 
@@ -597,12 +726,13 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
     }, 500);
   }
 
-  private persist(): Promise<void> {
+  private persist(forceSnapshot = false): Promise<void> {
+    if (forceSnapshot) this.persistenceForceSnapshot = true;
     this.persistRequested = true;
     if (!this.persistInFlight) {
       this.persistInFlight = this.drainPersistence().finally(() => {
         this.persistInFlight = undefined;
-        if (this.persistRequested) void this.persist();
+        if (this.persistRequested && !this.persistenceRetryTimer) void this.persist();
       });
     }
     return this.persistInFlight;
@@ -611,13 +741,54 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
   private async drainPersistence(): Promise<void> {
     do {
       this.persistRequested = false;
-      const tasks = [...this.state.values()]
+      const snapshot = [...this.state.values()]
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .slice(0, RETAIN_LIMIT);
-      await Promise.all([
-        this.relational.saveRemediations(tasks),
-        this.ch.saveRemediationState(tasks),
-      ]);
+      const dirtyEntries = [...this.dirtyTaskIds.entries()]
+        .map(([taskId, generation]) => ({
+          taskId,
+          generation,
+          record: this.state.get(taskId),
+        }))
+        .filter((entry): entry is { taskId: string; generation: number; record: RemediationRecord } => Boolean(entry.record))
+        .sort((a, b) => b.record.updatedAt - a.record.updatedAt)
+        .slice(0, RETAIN_LIMIT);
+      const dirtyRecords = dirtyEntries.map((entry) => entry.record);
+      const forceSnapshot = this.persistenceForceSnapshot;
+      this.persistenceForceSnapshot = false;
+      const relationalRecords = forceSnapshot ? snapshot : dirtyRecords;
+      if (relationalRecords.length === 0 && !forceSnapshot) {
+        if (!this.persistRequested) break;
+        continue;
+      }
+
+      let relationalOk = true;
+      if (this.relationalPersistenceEnabled() && relationalRecords.length > 0) {
+        try {
+          relationalOk = await this.relational.saveRemediations(relationalRecords);
+        } catch {
+          relationalOk = false;
+        }
+      }
+      // ClickHouse stores one complete remediation snapshot; keep it current even when the
+      // relational mirror is unavailable, while dirty keys remain queued for bounded retry.
+      await this.ch.saveRemediationState(snapshot);
+      if (!relationalOk) {
+        this.persistenceFailures += 1;
+        this.persistRequested = false;
+        this.schedulePersistenceRetry();
+        break;
+      }
+      const persistedIds = new Set(relationalRecords.map((record) => record.taskId));
+      for (const entry of dirtyEntries) {
+        if (persistedIds.has(entry.taskId)
+          && this.state.get(entry.taskId) === entry.record
+          && this.dirtyTaskIds.get(entry.taskId) === entry.generation) {
+          this.dirtyTaskIds.delete(entry.taskId);
+        }
+      }
+      this.markPersistenceSuccess();
+      if (!this.persistRequested) break;
     } while (this.persistRequested);
   }
 

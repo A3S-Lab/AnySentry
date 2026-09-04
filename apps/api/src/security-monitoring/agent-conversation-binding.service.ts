@@ -118,6 +118,50 @@ const EXECUTION_BACKGROUND_EVENT_KINDS = new Set([
   'agentinvocation', 'invokeagent', 'workflowrun', 'agentrun',
   'noderun', 'node', 'workflownode',
 ]);
+
+// Kernel facts are supporting evidence, not human Conversation objects.  In particular, a
+// ToolExec/ProcessExit/File/Egress row must not mint an event-scoped Session merely because the
+// legacy Judge populated a fallback sessionId.  Keep this list product-neutral and conservative;
+// semantic/application records can still opt in through the explicit sets or stable anchors below.
+const KERNEL_ONLY_EVENT_KINDS = new Set([
+  'exec', 'processexec', 'process_exec', 'fork', 'processfork', 'process_fork',
+  'exit', 'processexit', 'process_exit', 'toolexec', 'tool_exec', 'tool',
+  'file', 'fileaccess', 'file_access', 'filedelete', 'file_delete',
+  'egress', 'dns', 'tls', 'sslcontent', 'ssl_content', 'securityaction', 'security_action',
+  'connection', 'network', 'runtimeevent', 'runtime_event', 'systemcontext', 'system_context',
+  'collectorheartbeat', 'collector_heartbeat', 'heartbeat',
+]);
+
+export function eventMembershipEligible(event: Pick<T.JudgedEvent,
+  'eventKind' | 'sessionId' | 'sessionKey' | 'canonicalSessionId' | 'sessionIdSource'
+  | 'turnId' | 'runId' | 'toolCallId' | 'eventCategory' | 'attributes'>): boolean {
+  const normalizedKind = event.eventKind.trim().toLowerCase().replace(/[\s.-]+/gu, '_');
+  const compactKind = normalizedKind.replace(/[_:/]+/gu, '');
+  const semanticToolHint = event.eventCategory?.toLowerCase() === 'tool'
+    || Boolean(event.toolCallId)
+    || Boolean(event.attributes && [
+      'gen_ai.tool.name', 'gen_ai.tool.call.id', 'tool_call.id', 'tool.name',
+    ].some((key) => event.attributes?.[key] !== undefined));
+  if ((KERNEL_ONLY_EVENT_KINDS.has(normalizedKind) || KERNEL_ONLY_EVENT_KINDS.has(compactKind))
+    && !(semanticToolHint && (compactKind === 'tool' || compactKind === 'exec'))) return false;
+  if (SEMANTIC_TOOL_EVENT_KINDS.has(compactKind)
+    || EXECUTION_BACKGROUND_EVENT_KINDS.has(compactKind)
+    || LLM_EVENT_KINDS.has(compactKind)
+    || MESSAGE_EVENT_KINDS.has(compactKind)) return true;
+  // Preserve unknown/pre-canonical events when they carry the legacy Session or another explicit
+  // anchor. This is the compatibility fallback: we cannot safely infer that an unknown kind is a
+  // kernel fact, so only the explicit product-neutral kernel allow-list above is blocked. Events
+  // with no identity/anchor stay out of the canonical Session lane and remain KernelFact/Coverage
+  // evidence at ingest.
+  return Boolean(
+    event.canonicalSessionId
+    || event.sessionKey
+    || event.turnId
+    || event.toolCallId
+    || event.runId
+    || (event.sessionId && event.sessionIdSource !== 'per_request'),
+  );
+}
 const LLM_EVENT_KINDS = new Set([
   'llmapi', 'llm_api', 'llmcall', 'llm_call', 'llminteraction', 'llm_interaction',
   'llmresponse', 'llm_response', 'llm', 'modelresponse', 'model_response',
@@ -164,6 +208,8 @@ export function trafficRoleForEvent(event: Pick<
   | 'sessionIdentityQuality'
   | 'sessionIdSource'
   | 'canonicalSessionId'
+  | 'eventCategory'
+  | 'toolCallId'
 >): ConversationMembershipRole {
   const attributes = event.attributes ?? {};
   const attributeText = (...keys: string[]): string => {
@@ -203,7 +249,12 @@ export function trafficRoleForEvent(event: Pick<
   // above was supplied), even if a producer attaches a generic operation name.
   if (event.activityContext === 'collector_heartbeat'
     || event.activityContext === 'platform_healthcheck') return 'background';
-  if (TOOL_EXEC_EVENT_KINDS.has(compactKind)) return 'tool_backend';
+  const semanticToolHint = event.eventCategory?.toLowerCase() === 'tool'
+    || Boolean(event.toolCallId)
+    || Boolean(attributes && [
+      'gen_ai.tool.name', 'gen_ai.tool.call.id', 'tool_call.id', 'tool.name',
+    ].some((key) => attributes[key] !== undefined));
+  if (TOOL_EXEC_EVENT_KINDS.has(compactKind) && !semanticToolHint) return 'tool_backend';
 
   // Explicit control/bootstrap operation metadata is useful even when a producer sends a generic
   // LlmApi kind.
@@ -1089,10 +1140,14 @@ export class AgentConversationBindingService implements OnModuleDestroy {
     );
     const resolutionRevision = Number.isSafeInteger(rawResolutionRevision) && rawResolutionRevision >= 1
       ? Math.min(CANONICAL_SESSION_REVISION_MAX, rawResolutionRevision) : 1;
-    const role = record.trafficRole === 'bootstrap' ? 'bootstrap'
-      : record.trafficRole === 'control' ? 'control'
-        : record.trafficRole === 'background' ? 'background'
-          : record.trafficRole === 'tool_backend' ? 'tool_backend' : 'conversation';
+    // Preserve every generic traffic role on the canonical membership.  In particular,
+    // context_replay, derived_metadata, retry, and unclassified are technical/coverage states,
+    // not newly observed human turns.  The shared resolver remains the authority; an unknown or
+    // malformed value keeps the legacy conversation fallback so evidence is never dropped.
+    const resolvedRole = record.trafficRole ?? trafficRoleForInteraction(record);
+    const role = SESSION_MEMBERSHIP_TRAFFIC_ROLES.has(resolvedRole as ConversationMembershipRole)
+      ? resolvedRole as ConversationMembershipRole
+      : 'conversation' as const;
     const sourceRefs = [...new Set([
       record.interactionId,
       record.rawObservationId,
@@ -1156,6 +1211,10 @@ export class AgentConversationBindingService implements OnModuleDestroy {
 
   async commitEventMembership(event: T.JudgedEvent): Promise<void> {
     if (!this.canonicalObservability) return;
+    // Kernel-only facts remain on the machine evidence lane.  They can later support a
+    // ToolCall/Session relation, but creating an event-scoped Session here would inflate the human
+    // conversation directory and incorrectly turn PID/Pod activity into a per-request dialog.
+    if (!eventMembershipEligible(event)) return;
     const sessionKey = event.sessionKey;
     const rawSession = event.sessionId;
     // A parser/storage failure must not discard a Kernel/semantic event merely because no native

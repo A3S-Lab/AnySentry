@@ -26,8 +26,14 @@ import { cleanText } from './redaction';
 import { correlationCaptureRollout } from './correlation-rollout';
 
 const RETAIN_LIMIT = 2_000;
+// Keep the pending durability queue bounded by the same compatibility retention window used by
+// the source snapshot. Dropping a dirty key never drops the in-memory/ClickHouse source fact; the
+// counter is exposed through stateStatus for an explicit degraded read/write signal.
+const SOURCE_DIRTY_MAX_ENTRIES = RETAIN_LIMIT;
 const STALE_AFTER_MS = 10 * 60_000;
 const DAY_MS = 24 * 60 * 60_000;
+const PERSIST_RETRY_INITIAL_MS = 5_000;
+const PERSIST_RETRY_MAX_MS = 60_000;
 
 export interface IngestionSourceResolution {
   accepted: boolean;
@@ -361,6 +367,15 @@ function defaultTokenRotationDays(): number {
 @Injectable()
 export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
   private readonly sources = new Map<string, IngestionSourceRecord>();
+  /** Source IDs and mutation generations that have not crossed the relational durability fence. */
+  private readonly dirtySourceIds = new Map<string, number>();
+  private dirtySourceGeneration = 0;
+  private dirtySourceDropped = 0;
+  private persistenceFailures = 0;
+  private persistenceRetryDelayMs = PERSIST_RETRY_INITIAL_MS;
+  private persistenceRetryTimer?: NodeJS.Timeout;
+  private persistenceForceSnapshot = false;
+  private closing = false;
   private persistTimer?: NodeJS.Timeout;
   private currentStateTimer?: NodeJS.Timeout;
   private persistInFlight?: Promise<void>;
@@ -373,6 +388,66 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     private readonly relational: RelationalBusinessStore,
   ) {}
 
+  private markSourceDirty(sourceId: string): void {
+    const id = sourceId.trim();
+    if (!id) return;
+    const generation = ++this.dirtySourceGeneration;
+    if (this.dirtySourceIds.has(id)) {
+      this.dirtySourceIds.set(id, generation);
+      return;
+    }
+    if (this.dirtySourceIds.size >= SOURCE_DIRTY_MAX_ENTRIES) {
+      const oldest = this.dirtySourceIds.keys().next().value as string | undefined;
+      if (oldest !== undefined) {
+        this.dirtySourceIds.delete(oldest);
+        this.dirtySourceDropped += 1;
+      }
+    }
+    this.dirtySourceIds.set(id, generation);
+  }
+
+  private relationalPersistenceEnabled(): boolean {
+    const configured = (this.relational as unknown as { configured?: () => boolean }).configured;
+    return typeof configured !== 'function' || configured.call(this.relational);
+  }
+
+  private schedulePersistenceRetry(): void {
+    if (this.closing || !this.initialized || this.persistenceRetryTimer || this.dirtySourceIds.size === 0) return;
+    const delay = this.persistenceRetryDelayMs;
+    this.persistenceRetryDelayMs = Math.min(PERSIST_RETRY_MAX_MS, delay * 2);
+    this.persistenceRetryTimer = setTimeout(() => {
+      this.persistenceRetryTimer = undefined;
+      void this.persist();
+    }, delay);
+    this.persistenceRetryTimer.unref?.();
+  }
+
+  private markPersistenceSuccess(): void {
+    this.persistenceRetryDelayMs = PERSIST_RETRY_INITIAL_MS;
+    if (this.persistenceRetryTimer) {
+      clearTimeout(this.persistenceRetryTimer);
+      this.persistenceRetryTimer = undefined;
+    }
+  }
+
+  private sourcePersistenceStatus(): {
+    dirty: number;
+    maxDirty: number;
+    dropped: number;
+    failures: number;
+    inFlight: boolean;
+    retryScheduled: boolean;
+  } {
+    return {
+      dirty: this.dirtySourceIds.size,
+      maxDirty: SOURCE_DIRTY_MAX_ENTRIES,
+      dropped: this.dirtySourceDropped,
+      failures: this.persistenceFailures,
+      inFlight: Boolean(this.persistInFlight),
+      retryScheduled: Boolean(this.persistenceRetryTimer),
+    };
+  }
+
   async onModuleInit(): Promise<void> {
     if (await this.ch.init()) {
       for (const record of await this.ch.loadIngestionSources()) {
@@ -383,7 +458,7 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       this.mergePersisted(record);
     }
     this.initialized = true;
-    await this.persist();
+    await this.persist(true);
     await this.refreshDistributedCurrentState();
     this.currentStateTimer = setInterval(() => {
       void this.refreshRelationalState();
@@ -393,9 +468,12 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.closing = true;
     if (this.persistTimer) clearTimeout(this.persistTimer);
     if (this.currentStateTimer) clearInterval(this.currentStateTimer);
-    await this.persist();
+    if (this.persistenceRetryTimer) clearTimeout(this.persistenceRetryTimer);
+    this.persistenceRetryTimer = undefined;
+    await this.persist(true);
   }
 
   stateStatus() {
@@ -403,6 +481,7 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       sourceCount: this.sources.size,
       postgresqlBacked: this.relational.isReady(),
       clickhouseMigrationCopy: this.ch.enabled,
+      persistence: this.sourcePersistenceStatus(),
     };
   }
 
@@ -610,6 +689,7 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       record.lastEventAt = at;
       record.acceptedEvents += 1;
     }
+    this.markSourceDirty(record.sourceId);
     void this.currentState.recordSourceActivity({
       sourceId: record.sourceId,
       lastSeenAt: at,
@@ -689,6 +769,7 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       lastError: cur?.lastError,
     };
     this.sources.set(id, next);
+    this.markSourceDirty(id);
     this.trim();
     this.persistSoon();
     return this.item(next);
@@ -722,6 +803,7 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       rejectedEvents: 0,
     };
     this.sources.set(id, record);
+    this.markSourceDirty(id);
     this.trim();
     this.persistSoon();
     return record;
@@ -736,6 +818,7 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     record.rejectedEvents += 1;
     record.lastResult = 'rejected';
     record.lastError = cleanText(reason, 300);
+    this.markSourceDirty(sourceId);
     this.persistSoon();
   }
 
@@ -780,6 +863,16 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     if (!record) return;
     const existingAt = lastSignalAt(record) ?? 0;
     if (existingAt > activity.lastSeenAt) return;
+    const before = {
+      lastSeenAt: record.lastSeenAt,
+      updatedAt: record.updatedAt,
+      lastResult: record.lastResult,
+      lastError: record.lastError,
+      collectorId: record.collectorId,
+      workspacePath: record.workspacePath,
+      lastHeartbeatAt: record.lastHeartbeatAt,
+      lastEventAt: record.lastEventAt,
+    };
     record.lastSeenAt = Math.max(record.lastSeenAt ?? 0, activity.lastSeenAt);
     record.updatedAt = Math.max(record.updatedAt, activity.lastSeenAt);
     record.lastResult = 'accepted';
@@ -788,6 +881,17 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     if (activity.workspacePath) record.workspacePath = clean(activity.workspacePath, 500);
     if (activity.lastHeartbeatAt) record.lastHeartbeatAt = Math.max(record.lastHeartbeatAt ?? 0, activity.lastHeartbeatAt);
     if (activity.lastEventAt) record.lastEventAt = Math.max(record.lastEventAt ?? 0, activity.lastEventAt);
+    const changed = record.lastSeenAt !== before.lastSeenAt
+      || record.updatedAt !== before.updatedAt
+      || record.lastResult !== before.lastResult
+      || record.lastError !== before.lastError
+      || record.collectorId !== before.collectorId
+      || record.workspacePath !== before.workspacePath
+      || record.lastHeartbeatAt !== before.lastHeartbeatAt
+      || record.lastEventAt !== before.lastEventAt;
+    if (!changed) return;
+    this.markSourceDirty(record.sourceId);
+    this.persistSoon();
   }
 
   private item(record: IngestionSourceRecord): IngestionSourceItem {
@@ -838,8 +942,12 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
   private trim(): void {
     if (this.sources.size <= RETAIN_LIMIT) return;
     const keep = [...this.sources.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, RETAIN_LIMIT);
+    const keepIds = new Set(keep.map((record) => record.sourceId));
     this.sources.clear();
     for (const record of keep) this.sources.set(record.sourceId, record);
+    for (const sourceId of this.dirtySourceIds.keys()) {
+      if (!keepIds.has(sourceId)) this.dirtySourceIds.delete(sourceId);
+    }
   }
 
   private persistSoon(): void {
@@ -851,12 +959,13 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     }, 500);
   }
 
-  private persist(): Promise<void> {
+  private persist(forceSnapshot = false): Promise<void> {
+    if (forceSnapshot) this.persistenceForceSnapshot = true;
     this.persistRequested = true;
     if (!this.persistInFlight) {
       this.persistInFlight = this.drainPersistence().finally(() => {
         this.persistInFlight = undefined;
-        if (this.persistRequested) void this.persist();
+        if (this.persistRequested && !this.persistenceRetryTimer) void this.persist();
       });
     }
     return this.persistInFlight;
@@ -865,13 +974,54 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
   private async drainPersistence(): Promise<void> {
     do {
       this.persistRequested = false;
-      const records = [...this.sources.values()]
+      const snapshot = [...this.sources.values()]
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .slice(0, RETAIN_LIMIT);
-      await Promise.all([
-        this.ch.saveIngestionSources(records),
-        this.relational.saveIngestionSources(records),
-      ]);
+      const dirtyEntries = [...this.dirtySourceIds.entries()]
+        .map(([sourceId, generation]) => ({
+          sourceId,
+          generation,
+          record: this.sources.get(sourceId),
+        }))
+        .filter((entry): entry is { sourceId: string; generation: number; record: IngestionSourceRecord } => Boolean(entry.record))
+        .sort((a, b) => b.record.updatedAt - a.record.updatedAt)
+        .slice(0, RETAIN_LIMIT);
+      const dirtyRecords = dirtyEntries.map((entry) => entry.record);
+      const forceSnapshot = this.persistenceForceSnapshot;
+      this.persistenceForceSnapshot = false;
+      const relationalRecords = forceSnapshot ? snapshot : dirtyRecords;
+      if (relationalRecords.length === 0 && !forceSnapshot) {
+        if (!this.persistRequested) break;
+        continue;
+      }
+
+      let relationalOk = true;
+      if (this.relationalPersistenceEnabled() && relationalRecords.length > 0) {
+        try {
+          relationalOk = await this.relational.saveIngestionSources(relationalRecords);
+        } catch {
+          relationalOk = false;
+        }
+      }
+      // ClickHouse stores one complete source snapshot. Keep it current even when PostgreSQL is
+      // unavailable; dirty relational IDs stay queued for a bounded retry.
+      await this.ch.saveIngestionSources(snapshot);
+      if (!relationalOk) {
+        this.persistenceFailures += 1;
+        this.persistRequested = false;
+        this.schedulePersistenceRetry();
+        break;
+      }
+      const persistedIds = new Set(relationalRecords.map((record) => record.sourceId));
+      for (const entry of dirtyEntries) {
+        if (persistedIds.has(entry.sourceId)
+          && this.sources.get(entry.sourceId) === entry.record
+          && this.dirtySourceIds.get(entry.sourceId) === entry.generation) {
+          this.dirtySourceIds.delete(entry.sourceId);
+        }
+      }
+      this.markPersistenceSuccess();
+      if (!this.persistRequested) break;
     } while (this.persistRequested);
   }
 

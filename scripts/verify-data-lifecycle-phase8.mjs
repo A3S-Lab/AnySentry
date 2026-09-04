@@ -41,10 +41,11 @@ for (const [source, load, save] of [
   [objectives, 'loadObjectives', 'saveObjectives'],
 ]) {
   assert.match(source, new RegExp(`this\\.relational\\.${load}\\(\\)`));
-  assert.match(source, new RegExp(`this\\.relational\\.${save}\\(records\\)`));
+  assert.match(source, new RegExp(`this\\.relational\\.${save}\\(${source === sources ? 'relationalRecords' : 'records'}\\)`));
   assert.match(source, /refreshRelationalState/);
   assert.match(source, /postgresqlBacked: this\.relational\.isReady\(\)/);
 }
+assert.match(sources, /dirtySourceIds/);
 
 assert.match(notifications, /this\.relational\.loadNotificationChannels\(\)/);
 assert.match(notifications, /this\.relational\.loadNotificationRoutes\(\)/);

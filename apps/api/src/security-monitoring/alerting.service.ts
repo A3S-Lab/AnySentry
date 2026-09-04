@@ -34,9 +34,15 @@ const HOUR = 3_600_000;
 const WINDOW: Record<string, number> = { last_3h: 3 * HOUR, last_1d: 24 * HOUR, last_7d: 7 * 24 * HOUR, last_30d: 30 * 24 * HOUR };
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 const ALERT_HISTORY_LIMIT = 2_000;
+// A dirty queue is intentionally no larger than the compatibility retention window.  Alert
+// history beyond this bound is already omitted from the legacy snapshot, so retaining more keys
+// would only create an unbounded retry backlog under a database outage.
+const ALERT_DIRTY_MAX_ENTRIES = ALERT_HISTORY_LIMIT;
 const RELATIONAL_REFRESH_MS = 15_000;
 const SILENCE_DEFAULT_MINUTES = 60;
 const SILENCE_MAX_MINUTES = 7 * 24 * 60;
+const PERSIST_RETRY_INITIAL_MS = 5_000;
+const PERSIST_RETRY_MAX_MS = 60_000;
 
 type AlertInput = Omit<
   AlertRecord,
@@ -161,6 +167,15 @@ function cleanAlertLabels(labels: Record<string, string>): Record<string, string
   return out;
 }
 
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+    .join(',')}}`;
+}
+
 function attrText(event: JudgedEvent, key: string, limit: number): string | undefined {
   const promoted = key === 'collectorId' ? event.collectorId : key === 'sourceId' ? event.sourceId : undefined;
   const value = promoted?.trim() || event.attributes[key];
@@ -256,6 +271,17 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
   /** Cumulative quality counters belong to one producer channel, not merely one collector ID. */
   private readonly latestCollectorQualityHeartbeat = new Map<string, CollectorHeartbeatRecord>();
   private readonly collectorQualityStreak = new Map<string, { bad: number; clean: number }>();
+  /** IDs and mutation generations that have not crossed the relational durability fence. */
+  private readonly dirtyAlertIds = new Map<string, number>();
+  private dirtyAlertGeneration = 0;
+  private dirtyAlertDropped = 0;
+  private persistenceFailures = 0;
+  private persistenceRetryDelayMs = PERSIST_RETRY_INITIAL_MS;
+  private persistenceRetryTimer?: NodeJS.Timeout;
+  private persistenceForceSnapshot = false;
+  private closing = false;
+  /** Captures dirty-state transitions while one durable business mutation is being prepared. */
+  private durableMutationDirtyBefore?: Map<string, number | undefined>;
   private persistTimer?: NodeJS.Timeout;
   private collectorTimer?: NodeJS.Timeout;
   private sourceTimer?: NodeJS.Timeout;
@@ -290,6 +316,69 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     private readonly relational: RelationalBusinessStore,
   ) {}
 
+  private markAlertDirty(alertId: string): void {
+    const id = alertId.trim();
+    if (!id) return;
+    if (this.durableMutationDirtyBefore && !this.durableMutationDirtyBefore.has(id)) {
+      this.durableMutationDirtyBefore.set(id, this.dirtyAlertIds.get(id));
+    }
+    const generation = ++this.dirtyAlertGeneration;
+    if (this.dirtyAlertIds.has(id)) {
+      this.dirtyAlertIds.set(id, generation);
+      return;
+    }
+    if (this.dirtyAlertIds.size >= ALERT_DIRTY_MAX_ENTRIES) {
+      const oldest = this.dirtyAlertIds.keys().next().value as string | undefined;
+      if (oldest !== undefined) {
+        this.dirtyAlertIds.delete(oldest);
+        this.dirtyAlertDropped += 1;
+      }
+    }
+    this.dirtyAlertIds.set(id, generation);
+  }
+
+  private relationalPersistenceEnabled(): boolean {
+    const configured = (this.relational as unknown as { configured?: () => boolean }).configured;
+    return typeof configured !== 'function' || configured.call(this.relational);
+  }
+
+  private schedulePersistenceRetry(): void {
+    if (this.closing || !this.initialized || this.persistenceRetryTimer || this.dirtyAlertIds.size === 0) return;
+    const delay = this.persistenceRetryDelayMs;
+    this.persistenceRetryDelayMs = Math.min(PERSIST_RETRY_MAX_MS, delay * 2);
+    this.persistenceRetryTimer = setTimeout(() => {
+      this.persistenceRetryTimer = undefined;
+      void this.persist();
+    }, delay);
+    this.persistenceRetryTimer.unref?.();
+  }
+
+  private markPersistenceSuccess(): void {
+    this.persistenceRetryDelayMs = PERSIST_RETRY_INITIAL_MS;
+    if (this.persistenceRetryTimer) {
+      clearTimeout(this.persistenceRetryTimer);
+      this.persistenceRetryTimer = undefined;
+    }
+  }
+
+  private alertPersistenceStatus(): {
+    dirty: number;
+    maxDirty: number;
+    dropped: number;
+    failures: number;
+    inFlight: boolean;
+    retryScheduled: boolean;
+  } {
+    return {
+      dirty: this.dirtyAlertIds.size,
+      maxDirty: ALERT_DIRTY_MAX_ENTRIES,
+      dropped: this.dirtyAlertDropped,
+      failures: this.persistenceFailures,
+      inFlight: Boolean(this.persistInFlight),
+      retryScheduled: Boolean(this.persistenceRetryTimer),
+    };
+  }
+
   async onModuleInit(): Promise<void> {
     if (await this.ch.init()) {
       const persisted = await this.ch.loadAlertState();
@@ -309,28 +398,36 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       false,
     );
     this.initialized = true;
-    await this.persist();
+    await this.persist(true);
     this.collectorTimer = setInterval(() => this.checkCollectorAvailability(), 30_000);
     this.sourceTimer = setInterval(() => this.checkSourceAvailability(), 30_000);
     this.relationalRefreshTimer = setInterval(() => void this.refreshRelational(), RELATIONAL_REFRESH_MS);
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.closing = true;
     if (this.persistTimer) clearTimeout(this.persistTimer);
     if (this.collectorTimer) clearInterval(this.collectorTimer);
     if (this.sourceTimer) clearInterval(this.sourceTimer);
     if (this.relationalRefreshTimer) clearInterval(this.relationalRefreshTimer);
-    await this.persist();
+    if (this.persistenceRetryTimer) clearTimeout(this.persistenceRetryTimer);
+    this.persistenceRetryTimer = undefined;
+    await this.persist(true);
   }
 
   getConfig(): AlertConfig {
     return { ...this.config, webhookConfigured: this.notifications.config().summary.enabledChannels > 0 };
   }
 
-  stateStatus(): { recordCount: number; postgresqlBacked: boolean } {
+  stateStatus(): {
+    recordCount: number;
+    postgresqlBacked: boolean;
+    persistence: ReturnType<AlertingService['alertPersistenceStatus']>;
+  } {
     return {
       recordCount: this.alerts.size,
       postgresqlBacked: this.relational.isReady(),
+      persistence: this.alertPersistenceStatus(),
     };
   }
 
@@ -535,6 +632,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
           : undefined);
       if (!scope) continue;
       this.alerts.set(alertId, { ...alert, ...scope });
+      this.markAlertDirty(alertId);
       changed = true;
     }
     if (changed) this.persistSoon();
@@ -613,6 +711,8 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     if (this.effectCapture) throw new Error('nested durable alert mutation is not supported');
     const beforeAlerts = new Map(this.alerts);
     const beforeIncident = incident ? this.incidents.get(incident.incidentId) : undefined;
+    const dirtyBefore = new Map<string, number | undefined>();
+    this.durableMutationDirtyBefore = dirtyBefore;
     if (this.durableMutationHolds === 0 && this.persistTimer) {
       clearTimeout(this.persistTimer);
       this.persistTimer = undefined;
@@ -626,10 +726,15 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       if (incident) this.observeIncident(incident);
     } catch (error) {
       this.effectCapture = undefined;
+      this.durableMutationDirtyBefore = undefined;
       for (const alertId of this.alerts.keys()) {
         if (!beforeAlerts.has(alertId)) this.alerts.delete(alertId);
       }
       for (const [alertId, alert] of beforeAlerts) this.alerts.set(alertId, alert);
+      for (const [alertId, previousGeneration] of dirtyBefore) {
+        if (previousGeneration !== undefined) this.dirtyAlertIds.set(alertId, previousGeneration);
+        else this.dirtyAlertIds.delete(alertId);
+      }
       if (incident) {
         if (beforeIncident) this.incidents.set(incident.incidentId, beforeIncident);
         else this.incidents.delete(incident.incidentId);
@@ -639,10 +744,16 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       throw error;
     }
     this.effectCapture = undefined;
+    this.durableMutationDirtyBefore = undefined;
 
     const changes = [...this.alerts.entries()]
       .filter(([alertId, alert]) => beforeAlerts.get(alertId) !== alert)
-      .map(([alertId, after]) => ({ alertId, before: beforeAlerts.get(alertId), after }));
+      .map(([alertId, after]) => ({
+        alertId,
+        before: beforeAlerts.get(alertId),
+        after,
+        dirtyGeneration: this.dirtyAlertIds.get(alertId),
+      }));
     let settled = false;
     const release = (): void => {
       this.durableMutationHolds = Math.max(0, this.durableMutationHolds - 1);
@@ -653,6 +764,12 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       commit: () => {
         if (settled) return;
         settled = true;
+        for (const { alertId, after, dirtyGeneration } of changes) {
+          if (this.alerts.get(alertId) === after
+            && this.dirtyAlertIds.get(alertId) === dirtyGeneration) {
+            this.dirtyAlertIds.delete(alertId);
+          }
+        }
         release();
         for (const notification of capture.notifications) {
           if (this.alerts.get(notification.alert.alertId) === notification.alert) {
@@ -663,10 +780,14 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       rollback: () => {
         if (settled) return;
         settled = true;
-        for (const { alertId, before, after } of changes) {
-          if (this.alerts.get(alertId) !== after) continue;
+        for (const { alertId, before, after, dirtyGeneration } of changes) {
+          if (this.alerts.get(alertId) !== after
+            || this.dirtyAlertIds.get(alertId) !== dirtyGeneration) continue;
           if (before) this.alerts.set(alertId, before);
           else this.alerts.delete(alertId);
+          const previousGeneration = dirtyBefore.get(alertId);
+          if (previousGeneration !== undefined) this.dirtyAlertIds.set(alertId, previousGeneration);
+          else this.dirtyAlertIds.delete(alertId);
         }
         if (incident && this.incidents.get(incident.incidentId) === incident) {
           if (beforeIncident) this.incidents.set(incident.incidentId, beforeIncident);
@@ -1319,6 +1440,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       silencedUntil: status === 'silenced' ? (statusProvided || body.silenceMinutes !== undefined ? at + this.silenceMinutes(body.silenceMinutes) * 60_000 : cur.silencedUntil) : status === 'open' || status === 'resolved' ? undefined : cur.silencedUntil,
     };
     this.alerts.set(alertId, next);
+    this.markAlertDirty(alertId);
     this.persistSoon();
     if (shouldNotifyResolved) this.scheduleNotification(next, 'resolved');
     if (shouldNotifyReopened) this.scheduleNotification(next, 'reopened');
@@ -1404,7 +1526,19 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       evidenceEventIds,
       lastNotificationAt: prev?.lastNotificationAt,
     };
+    if (prev && input.increment === false) {
+      // Periodic availability/remediation reconciliation often observes the same logical state
+      // with a newer wall-clock `at`. Do not turn that timestamp-only observation into another
+      // relational UPDATE; semantic fields (including labels/evidence/scope/description) remain
+      // in the comparison so a real transition still persists.
+      const comparable = (record: AlertRecord): Record<string, unknown> => {
+        const { updatedAt: _updatedAt, lastSeenAt: _lastSeenAt, ...stable } = record;
+        return stable;
+      };
+      if (canonicalJson(comparable(prev)) === canonicalJson(comparable(next))) return prev;
+    }
     this.alerts.set(alertId, next);
+    this.markAlertDirty(alertId);
     this.persistSoon();
     if (status === 'open' && (reopened || !prev || SEVERITY_RANK[next.severity] > SEVERITY_RANK[prev.severity])) {
       this.scheduleNotification(next, prev ? 'reopened' : 'opened');
@@ -1572,6 +1706,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
         note: alert.note ?? reason,
       };
       this.alerts.set(alert.alertId, resolved);
+      this.markAlertDirty(alert.alertId);
       if (notify) this.scheduleNotification(resolved, 'resolved');
       changed = true;
     }
@@ -1583,6 +1718,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     for (const alert of this.alerts.values()) {
       if (alert.status !== 'open' || !match(alert)) continue;
       this.alerts.set(alert.alertId, { ...alert, status: 'acknowledged', acknowledgedAt: at, updatedAt: at });
+      this.markAlertDirty(alert.alertId);
       changed = true;
     }
     if (changed) this.persistSoon();
@@ -1593,6 +1729,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     for (const alert of this.alerts.values()) {
       if (alert.status !== 'silenced' || !alert.silencedUntil || alert.silencedUntil > at) continue;
       this.alerts.set(alert.alertId, { ...alert, status: 'open', silencedUntil: undefined, updatedAt: at });
+      this.markAlertDirty(alert.alertId);
       changed = true;
     }
     if (changed) this.persistSoon();
@@ -1671,7 +1808,10 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     const sent = await this.notifications.dispatch(this.item(alert), action, at);
     if (sent > 0) {
       const cur = this.alerts.get(alert.alertId);
-      if (cur) this.alerts.set(alert.alertId, { ...cur, lastNotificationAt: at });
+      if (cur) {
+        this.alerts.set(alert.alertId, { ...cur, lastNotificationAt: at });
+        this.markAlertDirty(alert.alertId);
+      }
       this.persistSoon();
     }
   }
@@ -1706,12 +1846,13 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     }, 500);
   }
 
-  private persist(): Promise<void> {
+  private persist(forceSnapshot = false): Promise<void> {
+    if (forceSnapshot) this.persistenceForceSnapshot = true;
     this.persistRequested = true;
     if (!this.persistInFlight) {
       this.persistInFlight = this.drainPersistence().finally(() => {
         this.persistInFlight = undefined;
-        if (this.persistRequested) void this.persist();
+        if (this.persistRequested && !this.persistenceRetryTimer) void this.persist();
       });
     }
     return this.persistInFlight;
@@ -1720,13 +1861,59 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
   private async drainPersistence(): Promise<void> {
     do {
       this.persistRequested = false;
-      const alerts = [...this.alerts.values()]
+      const forceSnapshot = this.persistenceForceSnapshot;
+      this.persistenceForceSnapshot = false;
+      const snapshot = [...this.alerts.values()]
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .slice(0, ALERT_HISTORY_LIMIT);
-      await Promise.all([
-        this.relational.saveAlerts(alerts),
-        this.ch.saveAlertState(alerts),
-      ]);
+      const dirtyEntries = [...this.dirtyAlertIds.entries()]
+        .map(([alertId, generation]) => ({
+          alertId,
+          generation,
+          record: this.alerts.get(alertId),
+        }))
+        .filter((entry): entry is { alertId: string; generation: number; record: AlertRecord } => Boolean(entry.record))
+        .sort((a, b) => b.record.updatedAt - a.record.updatedAt)
+        .slice(0, ALERT_HISTORY_LIMIT);
+      const dirtyRecords = dirtyEntries.map((entry) => entry.record);
+      const relationalRecords = forceSnapshot ? snapshot : dirtyRecords;
+      if (relationalRecords.length === 0 && !forceSnapshot) {
+        if (!this.persistRequested) break;
+        continue;
+      }
+
+      let relationalOk = true;
+      if (this.relationalPersistenceEnabled() && relationalRecords.length > 0) {
+        try {
+          relationalOk = await this.relational.saveAlerts(relationalRecords);
+        } catch {
+          relationalOk = false;
+        }
+      }
+      // ClickHouse stores one compatibility snapshot rather than per-alert rows. Keep that full
+      // snapshot even when PostgreSQL is temporarily unavailable; the dirty relational keys below
+      // remain queued for a later bounded retry.
+      await this.ch.saveAlertState(snapshot);
+      if (!relationalOk) {
+        this.persistenceFailures += 1;
+        // Keep every dirty key for a bounded retry. A failed write must not be mistaken for a
+        // successful projection, and clearing the request flag avoids a tight retry loop while the
+        // database is unavailable.
+        this.persistRequested = false;
+        this.schedulePersistenceRetry();
+        break;
+      }
+
+      const persistedIds = new Set(relationalRecords.map((record) => record.alertId));
+      for (const entry of dirtyEntries) {
+        if (persistedIds.has(entry.alertId)
+          && this.alerts.get(entry.alertId) === entry.record
+          && this.dirtyAlertIds.get(entry.alertId) === entry.generation) {
+          this.dirtyAlertIds.delete(entry.alertId);
+        }
+      }
+      this.markPersistenceSuccess();
+      if (!this.persistRequested) break;
     } while (this.persistRequested);
   }
 

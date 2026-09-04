@@ -588,6 +588,7 @@ const eventRoleFixture = {
 const eventRoleCases = [
   ['ToolExec', 'tool_backend', {}],
   ['tool', 'tool_backend', {}], // legacy universal-ingest alias
+  ['tool', 'conversation', { eventCategory: 'tool', toolCallId: 'semantic-tool-alias' }],
   ['AgentTool', 'conversation', { eventCategory: 'tool', attributes: { 'gen_ai.operation.name': 'execute_tool' } }],
   ['ToolResult', 'conversation', { eventCategory: 'tool' }],
   ['AgentInvocation', 'background', { eventCategory: 'runtime', runId: 'derived-run', runIdSource: 'derived_ephemeral' }],
@@ -613,6 +614,8 @@ const bindingSource = readFileSync(
 );
 assert.match(bindingSource, /const role = trafficRoleForEvent\(event\)/u,
   'event membership uses the generic traffic-role resolver');
+assert.match(bindingSource, /eventMembershipEligible\(event\)/u,
+  'kernel-only events must not mint event-scoped Sessions');
 assert.doesNotMatch(bindingSource, /normalizedKind\.includes\(['"]tool['"]\)/u,
   'event membership must not classify semantic Tool kinds by substring');
 for (const [eventKind, expectedRole, overrides] of eventRoleCases) {
@@ -633,6 +636,11 @@ const eventMembershipSink = {
 };
 const eventMembershipService = new AgentConversationBindingService(undefined, eventMembershipSink);
 for (const [index, [eventKind, expectedRole, overrides]] of eventRoleCases.entries()) {
+  const kernelOnly = new Set([
+    'ToolExec', 'tool', 'ProcessExit', 'FileAccess', 'Egress', 'SystemContext',
+  ]).has(eventKind)
+    && !(overrides.eventCategory === 'tool' || overrides.toolCallId);
+  const before = persistedEventMemberships.length;
   await eventMembershipService.commitEventMembership({
     schemaVersion: 'anysentry.agent_event.v1',
     eventId: `event-role-${index}`,
@@ -660,8 +668,60 @@ for (const [index, [eventKind, expectedRole, overrides]] of eventRoleCases.entri
     latencyMs: 0,
     ...overrides,
   });
-  assert.equal(persistedEventMemberships.at(-1).role, expectedRole,
-    `${eventKind} commitEventMembership role`);
+  if (kernelOnly) {
+    assert.equal(persistedEventMemberships.length, before,
+      `${eventKind} kernel fact must not create a SessionMembership`);
+  } else {
+    assert.equal(persistedEventMemberships.at(-1).role, expectedRole,
+      `${eventKind} commitEventMembership role`);
+  }
+}
+
+// The ingest-time Interaction path must retain every resolver role.  A previous compatibility
+// mapper only copied bootstrap/control/background/tool_backend and silently folded replay,
+// derived-metadata, retry, and unclassified records into the human conversation lane.
+const persistedInteractionMemberships = [];
+const interactionMembershipSink = {
+  commitSessionMemberships: async (memberships) => {
+    persistedInteractionMemberships.push(...memberships);
+    return { accepted: memberships.length, rejected: 0, durable: false };
+  },
+  recordGap: () => {},
+};
+const interactionMembershipService = new AgentConversationBindingService(undefined, interactionMembershipSink);
+const interactionRoleCases = [
+  ['conversation', { interactionType: 'model', trafficRole: 'conversation' }],
+  ['bootstrap', { interactionType: 'model', trafficRole: 'bootstrap' }],
+  ['control', { interactionType: 'tool', trafficRole: 'control' }],
+  ['context_replay', { interactionType: 'model', trafficRole: 'context_replay' }],
+  ['tool_backend', { interactionType: 'model', trafficRole: 'tool_backend' }],
+  ['derived_metadata', { interactionType: 'model', trafficRole: 'derived_metadata' }],
+  ['retry', { interactionType: 'model', trafficRole: 'retry' }],
+  ['background', { interactionType: 'model', trafficRole: 'background' }],
+  ['unclassified', { interactionType: 'unknown', trafficRole: 'unclassified' }],
+  ['conversation', { interactionType: 'model', trafficRole: 'future_role' }],
+];
+for (const [index, [expectedRole, overrides]] of interactionRoleCases.entries()) {
+  await interactionMembershipService.commitInteractionMembership({
+    schemaVersion: 'anysentry.agent_interaction.v1',
+    interactionId: `interaction-role-${index}`,
+    interactionType: 'model',
+    at: fixtureNow + 100 + index,
+    agentAssetId: 'interaction-role-fixture',
+    sessionId: 'fixture-session',
+    sessionKey: 'fixture:session',
+    sessionIdentityQuality: 'strong',
+    sessionNamespaceKey: 'fixture',
+    startedAtUnixNs: String(BigInt(fixtureNow + 100 + index) * 1_000_000n),
+    request: content('{}'),
+    response: content('{}'),
+    toolCalls: [],
+    toolResults: [],
+    receivedAt: fixtureNow + 100 + index,
+    ...overrides,
+  });
+  assert.equal(persistedInteractionMemberships.at(-1).role, expectedRole,
+    `${overrides.trafficRole} commitInteractionMembership role`);
 }
 
 console.log('Agent Conversation durable Thread/Segment binding verification passed');
