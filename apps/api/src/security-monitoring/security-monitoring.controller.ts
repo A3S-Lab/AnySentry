@@ -10327,7 +10327,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       sourceIds: resource.sourceIds,
       q: [resource.displayName, resource.agentProduct, resource.agentInstanceId, ...resource.runtimeInstanceIds].join(' '),
     }, query));
-    const partial = runtime.items.length === 0 && directory.coverage.partial;
+    // Runtime state is a useful bounded fallback, but it cannot make the missing conversation
+    // projection complete. Preserve the directory timeout as partial even when runtime rows exist.
+    const partial = directory.coverage.partial;
     const coverage = this.canonicalRevisionCoverage(
       query,
       directory.resolutionRevision,
