@@ -271,6 +271,11 @@ function verifyAnySentryManifest() {
     anySentryDeployment?.source,
   );
   assert(
+    'AnySentry canonical directory reads have a bounded degradation timeout',
+    /name:\s*ANYSENTRY_CANONICAL_DIRECTORY_PROJECTION_TIMEOUT_MS,\s*value:\s*"2000"/u.test(anySentryDeployment?.source ?? ''),
+    anySentryDeployment?.source,
+  );
+  assert(
     'AnySentry livez implementation is a public O(1) marker independent of storage services',
     /@SkipWrap\(\)[\s\S]*?livez\(\):[\s\S]*?schemaVersion:\s*'anysentry\.livez\.v1'[\s\S]*?status:\s*'ok'/u.test(livezBlock) &&
       !/(?:judge|clickhouse|postgres|healthz|aggregation|cacheStateStats)/iu.test(livezBlock),

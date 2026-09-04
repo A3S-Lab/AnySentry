@@ -323,8 +323,8 @@ spec:
       labels: { app: anysentry, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
       annotations:
         # Local immutable overlay provenance; update only when this service's image changes.
-        anysentry.io/local-overlay-manifest: "sha256:f331fcfd45fee26c73624e856d855f404de67a7cdf44bb1a04746bae513b950a"
-        anysentry.io/local-source-revision: "AnySentry@5f0134c+canonical-async"
+        anysentry.io/local-overlay-manifest: "sha256:4276e26ecb7fdf4a168cfa4830a6d63ef950e8e1cce51ee2f05c6d38445f45f3"
+        anysentry.io/local-source-revision: "AnySentry@b766f5e+canonical-directory-timeout"
     spec:
       terminationGracePeriodSeconds: 30
       serviceAccountName: anysentry
@@ -367,6 +367,7 @@ spec:
             - { name: ANYSENTRY_POST_COMMIT_PROJECTION_TIMEOUT_MS, value: "250" }
             - { name: ANYSENTRY_OBSERVER_POST_COMMIT_PROJECTION_MAX_IN_FLIGHT, value: "32" }
             - { name: ANYSENTRY_OBSERVER_POST_COMMIT_PROJECTION_TIMEOUT_MS, value: "250" }
+            - { name: ANYSENTRY_CANONICAL_DIRECTORY_PROJECTION_TIMEOUT_MS, value: "2000" }
             # The installer creates this independently from image/manifests. It protects Source
             # bootstrap and Capture Profile policy/materialization endpoints without committing a
             # credential to Git.

@@ -198,6 +198,12 @@ const CANONICAL_SESSION_CACHE_MAX_BYTES = 8 * 1024 * 1024;
 const CANONICAL_DIRECTORY_INFLIGHT_MAX = 16;
 const CANONICAL_SESSION_INFLIGHT_MAX = 16;
 const CANONICAL_EVIDENCE_PROJECTION_TIMEOUT_MS = 10_000;
+const CANONICAL_DIRECTORY_PROJECTION_TIMEOUT_MS = boundedControllerEnvInt(
+  'ANYSENTRY_CANONICAL_DIRECTORY_PROJECTION_TIMEOUT_MS',
+  2_000,
+  250,
+  10_000,
+);
 
 function boundedControllerEnvInt(name: string, fallback: number, min: number, max: number): number {
   const parsed = Number(process.env[name]);
@@ -10004,7 +10010,50 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         }
       });
     this.canonicalDirectoryInFlight.set(key, operation);
-    return operation;
+    // The full directory projection may need a broad ClickHouse/relational read.  A deep link
+    // must still return a bounded, explicit partial result when that secondary read is stalled;
+    // runtime/entity builders can continue from their own bounded in-memory state.  Promise.race
+    // attaches rejection handlers to the underlying operation, so a late database failure cannot
+    // become an unhandled rejection; the normal finally above still removes the in-flight entry.
+    return withCanonicalProjectionTimeout(operation, CANONICAL_DIRECTORY_PROJECTION_TIMEOUT_MS)
+      .catch((error) => {
+        if (!isCanonicalProjectionDegradation(error)) throw error;
+        this.canonicalDirectoryCacheDropped += 1;
+        return this.degradedCanonicalDirectorySnapshot(query, 'directory_projection_timeout');
+      });
+  }
+
+  private degradedCanonicalDirectorySnapshot(
+    query: CanonicalEntityQuery,
+    reason: string,
+  ): T.AgentConversationDirectoryListV4 {
+    const now = new Date().toISOString();
+    const coverage: T.QueryCoverage = {
+      requestedFrom: now,
+      requestedTo: now,
+      snapshotAsOf: now,
+      asOf: now,
+      partial: true,
+      partialReason: reason === 'directory_projection_timeout' ? 'projection_timeout' : 'storage_unavailable',
+      source: 'memory_hot_ring',
+      totalMode: 'omitted',
+    };
+    return {
+      apiVersion: 4,
+      resolutionRevision: this.canonicalCurrentRevision(),
+      items: [],
+      runningCount: 0,
+      historicalCount: 0,
+      total: 0,
+      totalMode: 'omitted',
+      classificationView: query.classificationView ?? 'current_effective',
+      reviewRevision: this.agentMetadata.identitySnapshotVersion(),
+      coverage,
+      dataSource: 'hot_ring',
+      updateTime: now,
+      // Keep the timeout reason in the bounded data-source label without copying backend error
+      // text or credentials into the response.
+    };
   }
 
   private canonicalRevisionCoverage(

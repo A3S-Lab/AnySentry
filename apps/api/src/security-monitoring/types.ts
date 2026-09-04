@@ -112,6 +112,7 @@ export interface QueryCoverage {
   partialReason?:
     | 'hot_ring_only'
     | 'scan_limit'
+    | 'projection_timeout'
     | 'storage_unavailable'
     | 'membership_store_unavailable'
     | 'membership_limit'
