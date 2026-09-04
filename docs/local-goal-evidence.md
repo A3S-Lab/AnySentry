@@ -417,3 +417,7 @@ read、hot fallback、locator-first 和显式 coverage；代码/部署/产品级
 保护性暂停、WAL/节点存储压力、旧历史 KernelFact 无 locator、LangGraph/Dify Tool→Kernel
 双向关系和正式 UI 深链仍未满足 DoD。下一轮必须在低负载/独立节点恢复并观测 Observer，
 不能把暂停、503 或未执行环境写成通过。
+
+本回合总门禁结果：`pass=57, partial=2, blocked=7, unexecuted=7, fail=0`。其中 blocked 包含
+当前主机默认 API/凭据扫描边界，unexecuted 是未提供安全运行条件的环境组合；这两类没有被
+折算为通过。退出码 0 仅代表 verifier 完成报告。

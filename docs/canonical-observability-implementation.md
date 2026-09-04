@@ -562,3 +562,8 @@ WebSocket/Rustls 明文仍是 metadata-only/unsupported 边界；LangGraph/Dify 
 Canonical EvidenceLink、正式 UI 双向深链和所有环境持续 p95 尚未通过。后续应在低负载或
 独立节点恢复 Observer，排空/分段回收 WAL 后再做一轮真实连续对话；不得删除 WAL 或以
 提高采样丢弃来制造“稳定”。
+
+总门禁 `node scripts/verify-canonical-goal.mjs --run-tests --json-out /tmp/canonical-goal-20260905-r27.json`
+本回合为 `pass=57, partial=2, blocked=7, unexecuted=7, fail=0`；退出码为 0 只表示报告生成，
+不改变上述 partial 结论。Observer 暂停后的 heartbeat 已 stale，WAL 与历史 drop 计数仍保留，
+未被清零或覆盖。
