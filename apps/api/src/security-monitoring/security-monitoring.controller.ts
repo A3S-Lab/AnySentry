@@ -231,6 +231,15 @@ const CANONICAL_SEMANTIC_ALIAS_TIMEOUT_MS = boundedControllerEnvInt(
   100,
   2_000,
 );
+// Canonical fact/relationship point and list reads are secondary projections. Keep their
+// database wait bounded so a slow PostgreSQL side lane cannot turn a detail request into a
+// 10-second socket timeout; the controller falls back to the process-local immutable hot stores.
+const CANONICAL_STORE_READ_TIMEOUT_MS = boundedControllerEnvInt(
+  'ANYSENTRY_CANONICAL_STORE_READ_TIMEOUT_MS',
+  1_000,
+  100,
+  5_000,
+);
 const CANONICAL_KERNEL_FALLBACK_LOOKBACK_MS = boundedControllerEnvInt(
   'ANYSENTRY_CANONICAL_KERNEL_FALLBACK_LOOKBACK_MS',
   2 * 60 * 60_000,
@@ -242,6 +251,13 @@ function boundedControllerEnvInt(name: string, fallback: number, min: number, ma
   const parsed = Number(process.env[name]);
   return Number.isFinite(parsed)
     ? Math.min(max, Math.max(min, Math.trunc(parsed)))
+    : fallback;
+}
+
+function boundedCanonicalStoreLimit(value: string | undefined, fallback = 500): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed)
+    ? Math.min(10_000, Math.max(1, Math.trunc(parsed)))
     : fallback;
 }
 
@@ -425,6 +441,101 @@ function canonicalCoverage(
     status: partial ? 'partial' : 'complete',
     reasons: [...new Set(reasons.filter(Boolean))].slice(0, 64),
     source,
+  };
+}
+
+function degradedCanonicalTimeline(
+  conversationId: string,
+  query: CanonicalEntityQuery,
+  revision: number,
+): T.AgentConversationTimelineV3 {
+  const now = new Date().toISOString();
+  const requestKey = createHash('sha256').update([
+    'canonical-session-timeline-fallback',
+    conversationId,
+    query.timeType ?? '',
+    query.startTime ?? '',
+    query.endTime ?? '',
+    query.snapshotAsOf ?? '',
+    String(revision),
+  ].join('\u0000')).digest('hex').slice(0, 32);
+  return {
+    apiVersion: 3,
+    requestKey,
+    requestedConversationId: conversationId,
+    canonicalConversationId: conversationId,
+    resolutionRevision: revision,
+    timelineVersion: 3,
+    segments: [],
+    turns: [],
+    interactionIds: [],
+    parserId: 'anysentry.canonical-session-timeline-fallback',
+    parserVersion: 1,
+    contextReplaySummaries: [],
+    technicalActivitySummaries: [],
+    dataSource: 'hot_ring',
+    classificationView: query.classificationView ?? 'as_observed',
+    reviewRevision: 0,
+    coverage: {
+      requestedFrom: query.startTime ?? now,
+      requestedTo: query.endTime ?? now,
+      snapshotAsOf: query.snapshotAsOf ?? now,
+      asOf: query.snapshotAsOf ?? now,
+      completeness: 'partial',
+      partial: true,
+      partialReason: 'projection_timeout',
+      source: 'memory_hot_ring',
+      totalMode: 'omitted',
+    },
+    updateTime: now,
+  };
+}
+
+function canonicalSessionResourceFromSummary(
+  summary: T.AgentConversationSummary,
+  revision: number,
+): T.CanonicalSessionResource {
+  const sessionId = summary.sessionId ?? summary.conversationId;
+  return {
+    schemaVersion: 'anysentry.session.v1',
+    sessionId,
+    ...(summary.sessionId && summary.sessionId !== summary.conversationId
+      ? { canonicalSessionId: summary.conversationId } : {}),
+    ...(summary.sessionKey ? { sessionKey: summary.sessionKey } : {}),
+    ...(summary.providerSessionIdHash ? { providerSessionIdHash: summary.providerSessionIdHash } : {}),
+    conversationId: summary.conversationId,
+    ...(summary.logicalAgentId ? { logicalAgentId: summary.logicalAgentId } : {}),
+    ...(summary.logicalAgentCandidateId ? { logicalAgentCandidateId: summary.logicalAgentCandidateId } : {}),
+    ...(summary.logicalDefinitionId ? { logicalDefinitionId: summary.logicalDefinitionId } : {}),
+    ...(summary.logicalScopeMode ? { logicalScopeMode: summary.logicalScopeMode } : {}),
+    ...(summary.logicalIdentityAuthority ? { logicalIdentityAuthority: summary.logicalIdentityAuthority } : {}),
+    ...(summary.tenantId ? { tenantId: summary.tenantId } : {}),
+    ...(summary.ownerId ? { ownerId: summary.ownerId } : {}),
+    ...(summary.agentProduct ? { agentProduct: summary.agentProduct } : {}),
+    ...(summary.environment ? { environment: summary.environment } : {}),
+    ...(summary.workspacePath ? { workspacePath: summary.workspacePath } : {}),
+    agentAssetIds: [...new Set(summary.agentAssetIds ?? [summary.agentAssetId])]
+      .filter((value): value is string => Boolean(value))
+      .slice(0, 256),
+    agentInstanceIds: [...summary.agentInstanceIds].slice(0, 512),
+    segmentIds: [],
+    interactionIds: [],
+    ...(summary.parentSessionId ? { parentSessionId: summary.parentSessionId } : {}),
+    ...(summary.canonicalParentSessionId ? { canonicalParentSessionId: summary.canonicalParentSessionId } : {}),
+    ...(summary.sessionIdentityQuality ? { sessionIdentityQuality: summary.sessionIdentityQuality } : {}),
+    ...(summary.sessionMode ? { sessionMode: summary.sessionMode } : {}),
+    ...(summary.sessionLifecycle ? { sessionLifecycle: summary.sessionLifecycle } : {}),
+    ...(summary.startedAtUnixNs ? { startedAtUnixNs: summary.startedAtUnixNs } : {}),
+    ...(summary.lastActivityAtUnixNs ? { lastActivityAtUnixNs: summary.lastActivityAtUnixNs } : {}),
+    turnCount: summary.turnCount,
+    modelCallCount: summary.modelCallCount,
+    toolCallCount: summary.toolCallCount,
+    toolResultCount: summary.toolResultCount,
+    errorCount: summary.errorCount,
+    usage: structuredClone(summary.usage),
+    coverage: structuredClone(summary.coverage),
+    sourceRefs: canonicalConversationSourceRefs(summary).slice(0, 64),
+    resolutionRevision: revision,
   };
 }
 
@@ -9896,13 +10007,20 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   @Get('v1/raw-observations')
   @RequireManagementAuth()
   async canonicalRawObservations(@Query('limit') limit?: string) {
-    const bounded = Number.isFinite(Number(limit)) ? Number(limit) : 500;
-    const items = await this.canonicalObservability.listDurable(bounded);
+    const bounded = boundedCanonicalStoreLimit(limit);
+    const result = await this.boundedCanonicalList(
+      this.canonicalObservability.listDurable(bounded),
+      () => this.canonicalObservability.raw.list(bounded),
+    );
+    const reasons = result.degraded ? ['canonical_raw_observation_projection_unavailable'] : [];
+    const dataSource = result.degraded ? 'memory_hot_ring' : 'canonical_raw_observation_store';
     return {
       schemaVersion: 'anysentry.raw_observation.list.v1',
-      items,
-      total: items.length,
+      items: result.items,
+      total: result.items.length,
       store: this.canonicalObservability.stats(),
+      coverage: canonicalCoverage(result.degraded, reasons, dataSource),
+      dataSource,
       updateTime: new Date().toISOString(),
     };
   }
@@ -9916,16 +10034,31 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     if (revisionText !== undefined && (revision === undefined || !Number.isSafeInteger(revision) || revision < 1)) {
       throw new BadRequestException('revision is invalid');
     }
-    const item = await this.canonicalObservability.getDurableRawObservation(id, revision);
-    if (!item) throw new NotFoundException('raw observation not found');
-    return { schemaVersion: 'anysentry.raw_observation.v1', item };
+    const result = await this.boundedCanonicalPoint(
+      this.canonicalObservability.getDurableRawObservation(id, revision),
+      () => this.canonicalObservability.raw.get(id, revision),
+    );
+    if (!result.value) {
+      if (result.degraded) throw new ServiceUnavailableException('Canonical raw observation projection is unavailable');
+      throw new NotFoundException('raw observation not found');
+    }
+    return {
+      schemaVersion: 'anysentry.raw_observation.v1',
+      item: result.value,
+      coverage: canonicalCoverage(
+        result.degraded,
+        result.degraded ? ['canonical_raw_observation_projection_unavailable'] : [],
+        result.degraded ? 'memory_hot_ring' : 'canonical_raw_observation_store',
+      ),
+      dataSource: result.degraded ? 'memory_hot_ring' : 'canonical_raw_observation_store',
+    };
   }
 
   /** Coverage is a first-class projection: parser/adapter/TLS gaps never erase Kernel facts. */
   @Get('v1/coverage-gaps')
   @RequireManagementAuth()
   canonicalCoverageGaps(@Query('limit') limit?: string) {
-    const bounded = Number.isFinite(Number(limit)) ? Number(limit) : 500;
+    const bounded = boundedCanonicalStoreLimit(limit);
     const items = this.canonicalObservability.listGaps(bounded);
     return {
       schemaVersion: 'anysentry.coverage_gap.list.v1',
@@ -9937,6 +10070,54 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   }
 
   /**
+   * Read a canonical side-lane collection without allowing a slow durable sink to block the
+   * request.  The hot store is append-only and bounded, so it is a safe compatibility fallback;
+   * callers must expose `degraded` as partial coverage instead of presenting it as a complete
+   * historical read.
+   */
+  private async boundedCanonicalList<T>(
+    operation: Promise<T[]>,
+    hot: () => T[],
+  ): Promise<{ items: T[]; degraded: boolean }> {
+    let degraded = this.relational.configured() && !this.relational.isReady();
+    try {
+      const items = await withCanonicalProjectionTimeout(
+        operation,
+        CANONICAL_STORE_READ_TIMEOUT_MS,
+      );
+      return { items, degraded };
+    } catch (error) {
+      if (!isCanonicalProjectionDegradation(error)) throw error;
+      degraded = true;
+      return { items: hot(), degraded };
+    }
+  }
+
+  /**
+   * Point reads use the same durable-first ordering as list reads, but consult the hot immutable
+   * store immediately when the durable side lane times out.  `degraded` remains distinct from
+   * a genuine missing ID so callers can return 503 rather than a misleading 404.
+   */
+  private async boundedCanonicalPoint<T>(
+    operation: Promise<T | undefined>,
+    hot: () => T | undefined,
+  ): Promise<{ value?: T; degraded: boolean }> {
+    let degraded = this.relational.configured() && !this.relational.isReady();
+    try {
+      const value = await withCanonicalProjectionTimeout(
+        operation,
+        CANONICAL_STORE_READ_TIMEOUT_MS,
+      );
+      if (value !== undefined) return { value, degraded };
+    } catch (error) {
+      if (!isCanonicalProjectionDegradation(error)) throw error;
+      degraded = true;
+    }
+    const value = hot();
+    return { value, degraded: degraded || value !== undefined };
+  }
+
+  /**
    * Resolve a KernelFact from the canonical side lane first, then from its immutable compatibility
    * event. The fallback is metadata-only and explicitly marked partial; it exists for the period
    * in which PostgreSQL persistence is degraded, so a ToolExec event never exposes a dead 404
@@ -9945,26 +10126,43 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   private async canonicalKernelFactWithFallback(
     factId: string,
   ): Promise<{ fact: KernelFact; fallback: boolean }> {
-    const canonical = await this.canonicalObservability.getDurableKernelFact(factId);
-    if (canonical) return { fact: canonical, fallback: false };
+    const canonical = await this.boundedCanonicalPoint(
+      this.canonicalObservability.getDurableKernelFact(factId),
+      () => this.canonicalObservability.kernel.get(factId),
+    );
+    if (canonical.value) return { fact: canonical.value, fallback: canonical.degraded };
+    let unavailable = canonical.degraded;
     try {
-      const page = await this.judge.searchStoredEventsPage({
-        // Compatibility events are retained longer than the canonical hot KernelFact lane, but
-        // this recovery query must stay narrow so a degraded deep link cannot scan the whole
-        // 90-day MergeTree. Operators can widen the bounded window explicitly when auditing an
-        // older fact.
-        sinceMs: Math.max(0, Date.now() - CANONICAL_KERNEL_FALLBACK_LOOKBACK_MS),
-        untilMs: Date.now(),
-        kernelFactId: factId,
-        candidateLimit: 8,
-        limit: 1,
-      });
-      const event = page.events.find((candidate) => candidate.kernelFactId === factId);
-      const reconstructed = event ? kernelFactFromCompatibilityEvent(event, factId) : undefined;
-      if (reconstructed) return { fact: reconstructed, fallback: true };
-    } catch {
-      // A failed fallback query is still a normal coverage gap; preserve the original 404
-      // contract when no immutable compatibility row can be located.
+      const page = await withCanonicalProjectionTimeout(
+        this.judge.searchStoredEventsPage({
+          // Compatibility events are retained longer than the canonical hot KernelFact lane, but
+          // this recovery query must stay narrow so a degraded deep link cannot scan the whole
+          // 90-day MergeTree. Operators can widen the bounded window explicitly when auditing an
+          // older fact.
+          sinceMs: Math.max(0, Date.now() - CANONICAL_KERNEL_FALLBACK_LOOKBACK_MS),
+          untilMs: Date.now(),
+          kernelFactId: factId,
+          candidateLimit: 8,
+          limit: 1,
+        }),
+        CANONICAL_STORE_READ_TIMEOUT_MS,
+      );
+      if (page.unavailable) {
+        // In the intentional memory-only profile there is no durable compatibility backend to
+        // consult, so an absent hot fact is a real 404. Treat an unavailable page as transient
+        // only when a configured durable backend exists.
+        unavailable = this.relational.configured() || this.judge.storageStatus().clickhouseConfigured;
+      } else {
+        const event = page.events.find((candidate) => candidate.kernelFactId === factId);
+        const reconstructed = event ? kernelFactFromCompatibilityEvent(event, factId) : undefined;
+        if (reconstructed) return { fact: reconstructed, fallback: true };
+      }
+    } catch (error) {
+      if (!isCanonicalProjectionDegradation(error)) throw error;
+      unavailable = true;
+    }
+    if (unavailable) {
+      throw new ServiceUnavailableException('Canonical kernel fact projection is unavailable');
     }
     throw new NotFoundException('kernel fact not found');
   }
@@ -9973,13 +10171,20 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   @Get('v1/kernel-facts')
   @RequireManagementAuth()
   async canonicalKernelFacts(@Query('limit') limit?: string) {
-    const bounded = Number.isFinite(Number(limit)) ? Number(limit) : 500;
-    const items = await this.canonicalObservability.listDurableKernelFacts(bounded);
+    const bounded = boundedCanonicalStoreLimit(limit);
+    const result = await this.boundedCanonicalList(
+      this.canonicalObservability.listDurableKernelFacts(bounded),
+      () => this.canonicalObservability.kernelFacts(bounded),
+    );
+    const reasons = result.degraded ? ['canonical_kernel_fact_projection_unavailable'] : [];
+    const dataSource = result.degraded ? 'memory_hot_ring' : 'canonical_kernel_fact_store';
     return {
       schemaVersion: 'anysentry.kernel_fact.list.v1',
-      items,
-      total: items.length,
+      items: result.items,
+      total: result.items.length,
       store: this.canonicalObservability.kernelStats(),
+      coverage: canonicalCoverage(result.degraded, reasons, dataSource),
+      dataSource,
       updateTime: new Date().toISOString(),
     };
   }
@@ -9993,12 +10198,12 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     return {
       schemaVersion: 'anysentry.kernel_fact.v1',
       item: resolved.fact,
-      ...(resolved.fallback
-        ? {
-            coverage: canonicalCoverage(true, ['canonical_kernel_fact_projection_unavailable'], 'compatibility_event_projection'),
-            dataSource: 'compatibility_event_projection',
-          }
-        : {}),
+      coverage: canonicalCoverage(
+        resolved.fallback,
+        resolved.fallback ? ['canonical_kernel_fact_projection_unavailable'] : [],
+        resolved.fallback ? 'compatibility_event_projection' : 'canonical_kernel_fact_store',
+      ),
+      dataSource: resolved.fallback ? 'compatibility_event_projection' : 'canonical_kernel_fact_store',
     };
   }
 
@@ -10006,13 +10211,20 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   @Get('v1/semantic-records')
   @RequireManagementAuth()
   async canonicalSemanticRecords(@Query('limit') limit?: string) {
-    const bounded = Number.isFinite(Number(limit)) ? Number(limit) : 500;
-    const items = await this.canonicalObservability.listDurableSemanticRecords(bounded);
+    const bounded = boundedCanonicalStoreLimit(limit);
+    const result = await this.boundedCanonicalList(
+      this.canonicalObservability.listDurableSemanticRecords(bounded),
+      () => this.canonicalObservability.semantic.list(bounded),
+    );
+    const reasons = result.degraded ? ['canonical_semantic_record_projection_unavailable'] : [];
+    const dataSource = result.degraded ? 'memory_hot_ring' : 'canonical_semantic_record_store';
     return {
       schemaVersion: 'anysentry.semantic_record.list.v1',
-      items,
-      total: items.length,
+      items: result.items,
+      total: result.items.length,
       store: this.canonicalObservability.semanticStats(),
+      coverage: canonicalCoverage(result.degraded, reasons, dataSource),
+      dataSource,
       updateTime: new Date().toISOString(),
     };
   }
@@ -10026,21 +10238,43 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     if (revisionText !== undefined && (revision === undefined || !Number.isSafeInteger(revision) || revision < 1)) {
       throw new BadRequestException('revision is invalid');
     }
-    const item = await this.canonicalObservability.getDurableSemanticRecord(id, revision);
-    if (!item) throw new NotFoundException('semantic record not found');
-    return { schemaVersion: 'anysentry.semantic_record.v1', item };
+    const result = await this.boundedCanonicalPoint(
+      this.canonicalObservability.getDurableSemanticRecord(id, revision),
+      () => this.canonicalObservability.semantic.get(id, revision),
+    );
+    if (!result.value) {
+      if (result.degraded) throw new ServiceUnavailableException('Canonical semantic record projection is unavailable');
+      throw new NotFoundException('semantic record not found');
+    }
+    return {
+      schemaVersion: 'anysentry.semantic_record.v1',
+      item: result.value,
+      coverage: canonicalCoverage(
+        result.degraded,
+        result.degraded ? ['canonical_semantic_record_projection_unavailable'] : [],
+        result.degraded ? 'memory_hot_ring' : 'canonical_semantic_record_store',
+      ),
+      dataSource: result.degraded ? 'memory_hot_ring' : 'canonical_semantic_record_store',
+    };
   }
 
   @Get('v1/evidence-links')
   @RequireManagementAuth()
   async canonicalEvidenceLinks(@Query('limit') limit?: string) {
-    const bounded = Number.isFinite(Number(limit)) ? Number(limit) : 500;
-    const items = await this.canonicalObservability.listDurableEvidenceLinks(bounded);
+    const bounded = boundedCanonicalStoreLimit(limit);
+    const result = await this.boundedCanonicalList(
+      this.canonicalObservability.listDurableEvidenceLinks(bounded),
+      () => this.canonicalObservability.evidence.list(bounded),
+    );
+    const reasons = result.degraded ? ['canonical_evidence_link_projection_unavailable'] : [];
+    const dataSource = result.degraded ? 'memory_hot_ring' : 'canonical_evidence_link_store';
     return {
       schemaVersion: 'anysentry.evidence_link.list.v1',
-      items,
-      total: items.length,
+      items: result.items,
+      total: result.items.length,
       store: this.canonicalObservability.evidence.stats(),
+      coverage: canonicalCoverage(result.degraded, reasons, dataSource),
+      dataSource,
       updateTime: new Date().toISOString(),
     };
   }
@@ -10054,21 +10288,43 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     if (revisionText !== undefined && (revision === undefined || !Number.isSafeInteger(revision) || revision < 1)) {
       throw new BadRequestException('resolutionRevision is invalid');
     }
-    const item = await this.canonicalObservability.getDurableEvidenceLink(id, revision);
-    if (!item) throw new NotFoundException('evidence link not found');
-    return { schemaVersion: 'anysentry.evidence_link.v1', item };
+    const result = await this.boundedCanonicalPoint(
+      this.canonicalObservability.getDurableEvidenceLink(id, revision),
+      () => this.canonicalObservability.evidence.get(id, revision),
+    );
+    if (!result.value) {
+      if (result.degraded) throw new ServiceUnavailableException('Canonical evidence link projection is unavailable');
+      throw new NotFoundException('evidence link not found');
+    }
+    return {
+      schemaVersion: 'anysentry.evidence_link.v1',
+      item: result.value,
+      coverage: canonicalCoverage(
+        result.degraded,
+        result.degraded ? ['canonical_evidence_link_projection_unavailable'] : [],
+        result.degraded ? 'memory_hot_ring' : 'canonical_evidence_link_store',
+      ),
+      dataSource: result.degraded ? 'memory_hot_ring' : 'canonical_evidence_link_store',
+    };
   }
 
   @Get('v1/session-memberships')
   @RequireManagementAuth()
   async canonicalSessionMemberships(@Query('limit') limit?: string) {
-    const bounded = Number.isFinite(Number(limit)) ? Number(limit) : 500;
-    const items = await this.canonicalObservability.listDurableSessionMemberships(bounded);
+    const bounded = boundedCanonicalStoreLimit(limit);
+    const result = await this.boundedCanonicalList(
+      this.canonicalObservability.listDurableSessionMemberships(bounded),
+      () => this.canonicalObservability.sessionMemberships.list(bounded),
+    );
+    const reasons = result.degraded ? ['canonical_session_membership_projection_unavailable'] : [];
+    const dataSource = result.degraded ? 'memory_hot_ring' : 'canonical_session_membership_store';
     return {
       schemaVersion: 'anysentry.session_membership.list.v1',
-      items,
-      total: items.length,
+      items: result.items,
+      total: result.items.length,
       store: this.canonicalObservability.sessionMembershipStats(),
+      coverage: canonicalCoverage(result.degraded, reasons, dataSource),
+      dataSource,
       updateTime: new Date().toISOString(),
     };
   }
@@ -10082,9 +10338,24 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     if (revisionText !== undefined && (revision === undefined || !Number.isSafeInteger(revision) || revision < 1)) {
       throw new BadRequestException('resolutionRevision is invalid');
     }
-    const item = await this.canonicalObservability.getDurableSessionMembership(id, revision);
-    if (!item) throw new NotFoundException('session membership not found');
-    return { schemaVersion: 'anysentry.session_membership.v1', item };
+    const result = await this.boundedCanonicalPoint(
+      this.canonicalObservability.getDurableSessionMembership(id, revision),
+      () => this.canonicalObservability.sessionMemberships.get(id, revision),
+    );
+    if (!result.value) {
+      if (result.degraded) throw new ServiceUnavailableException('Canonical session membership projection is unavailable');
+      throw new NotFoundException('session membership not found');
+    }
+    return {
+      schemaVersion: 'anysentry.session_membership.v1',
+      item: result.value,
+      coverage: canonicalCoverage(
+        result.degraded,
+        result.degraded ? ['canonical_session_membership_projection_unavailable'] : [],
+        result.degraded ? 'memory_hot_ring' : 'canonical_session_membership_store',
+      ),
+      dataSource: result.degraded ? 'memory_hot_ring' : 'canonical_session_membership_store',
+    };
   }
 
   /**
@@ -11346,20 +11617,75 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   async canonicalSessionTimeline(@Param('sessionId') sessionId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag) {
     const query = parseCanonicalEntityQuery({ ...rawQuery, sessionId });
     const sessions = await this.canonicalSessionResources({ ...query, offset: 0, limit: 500 }, headers);
-    const session = sessions.items.find((candidate) => [candidate.sessionId, candidate.canonicalSessionId, candidate.conversationId].includes(sessionId));
-    if (!session) throw new NotFoundException('session not found');
-    const conversationId = session.conversationId ?? session.sessionId;
-    const timeline = await this.agentConversationTimelineV3({
-      timeType: query.timeType,
-      startTime: query.startTime,
-      endTime: query.endTime,
-      snapshotAsOf: query.snapshotAsOf,
-      scope: 'raw',
-      classificationView: query.classificationView,
-      conversationId,
-      limit: query.limit,
-    }, headers);
-    return { schemaVersion: 'anysentry.session.timeline.v1', session, timeline, revision: sessions.revision, coverage: sessions.coverage, dataSource: sessions.dataSource, updateTime: new Date().toISOString() };
+    let session = sessions.items.find((candidate) => [candidate.sessionId, candidate.canonicalSessionId, candidate.conversationId].includes(sessionId));
+    let conversationId = session?.conversationId ?? session?.sessionId ?? sessionId;
+    let timeline: T.AgentConversationTimelineV3 | undefined;
+    let timelineDegraded = false;
+    let sessionDegraded = false;
+    // If the canonical Session projector timed out before materializing a row, use the bounded
+    // compatibility conversation projection once. This can recover a valid session/thread from
+    // ClickHouse/hot interactions without scanning the whole history; a missing result under a
+    // partial projection is reported as unavailable rather than a misleading 404.
+    if (!session && sessions.coverage.status !== 'complete') {
+      try {
+        timeline = await withCanonicalProjectionTimeout(this.agg.agentConversationTimelineV3({
+          timeType: query.timeType,
+          startTime: query.startTime,
+          endTime: query.endTime,
+          snapshotAsOf: query.snapshotAsOf,
+          scope: 'raw',
+          classificationView: query.classificationView,
+          conversationId: sessionId,
+          limit: query.limit,
+        }), CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS);
+        if (timeline.thread) {
+          session = canonicalSessionResourceFromSummary(
+            timeline.thread,
+            sessions.revision,
+          );
+          conversationId = session.conversationId ?? session.sessionId;
+          sessionDegraded = true;
+        }
+      } catch (error) {
+        if (!isCanonicalProjectionDegradation(error)) throw error;
+        sessionDegraded = true;
+      }
+    }
+    if (!session) {
+      if (sessions.coverage.status !== 'complete' || sessionDegraded) {
+        throw new ServiceUnavailableException('Canonical session projection is unavailable');
+      }
+      throw new NotFoundException('session not found');
+    }
+    conversationId = session.conversationId ?? session.sessionId;
+    try {
+      timeline ??= await withCanonicalProjectionTimeout(this.agg.agentConversationTimelineV3({
+        timeType: query.timeType,
+        startTime: query.startTime,
+        endTime: query.endTime,
+        snapshotAsOf: query.snapshotAsOf,
+        scope: 'raw',
+        classificationView: query.classificationView,
+        conversationId,
+        limit: query.limit,
+      }), CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS);
+    } catch (error) {
+      if (!isCanonicalProjectionDegradation(error)) throw error;
+      timelineDegraded = true;
+      timeline = degradedCanonicalTimeline(conversationId, query, sessions.revision);
+    }
+    const coverage = timelineDegraded
+      ? canonicalCoverage(true, [
+          ...sessions.coverage.reasons,
+          'session_timeline_projection_timeout',
+        ], `${sessions.dataSource}+session_timeline`)
+      : sessionDegraded
+        ? canonicalCoverage(true, [
+            ...sessions.coverage.reasons,
+            'canonical_session_projection_unavailable',
+          ], `${sessions.dataSource}+session_timeline`)
+        : sessions.coverage;
+    return { schemaVersion: 'anysentry.session.timeline.v1', session, timeline, revision: sessions.revision, coverage, dataSource: sessions.dataSource, updateTime: new Date().toISOString() };
   }
 
   @Get('v1/sessions/:sessionId/coverage')
@@ -11389,9 +11715,16 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     // query can consume the entire projection timeout before the compatibility timeline path has
     // a chance to resolve the deep link. Durable `sr_…` identifiers still use the authoritative
     // revision-aware lookup below.
-    const semanticRecord = durableId
-      ? await this.canonicalObservability.getDurableSemanticRecord(id, query.revision)
-      : undefined;
+    let semanticRecord: SemanticRecord | undefined;
+    let semanticRecordUnavailable = false;
+    if (durableId) {
+      const resolved = await this.boundedCanonicalPoint(
+        this.canonicalObservability.getDurableSemanticRecord(id, query.revision),
+        () => this.canonicalObservability.semantic.get(id, query.revision),
+      );
+      semanticRecord = resolved.value;
+      semanticRecordUnavailable = resolved.degraded && !semanticRecord;
+    }
     // Keep the old 404 behavior for a syntactically unrelated identifier, but do not report a
     // false 404 for a valid canonical id whose projection has expired or is still ambiguous.
     if (!semanticRecord && !timelineId && !durableId) {
@@ -11543,6 +11876,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     if (timelineSearch.failed > 0) reasons.push('semantic_timeline_projection_failed');
     if (aliasAmbiguous) reasons.push('durable_semantic_identifier_ambiguous');
     if (aliasLookupUnavailable) reasons.push('durable_semantic_alias_unavailable');
+    if (semanticRecordUnavailable) reasons.push('durable_semantic_record_projection_unavailable');
     if (selected && selected.event.actor !== 'tool') reasons.push('semantic_event_not_tool');
     if (selected && selected.event.actor === 'tool' && !evidence) reasons.push('semantic_evidence_projection_unavailable');
     if (evidenceFailureReason) reasons.push(evidenceFailureReason);
@@ -11593,7 +11927,10 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     let context: T.AgentKernelSemanticContextResponse;
     let coverage: T.CanonicalEntityCoverage;
     try {
-      context = await this.agg.agentKernelSemanticContext(fact.eventId ?? id);
+      context = await withCanonicalProjectionTimeout(
+        this.agg.agentKernelSemanticContext(fact.eventId ?? id),
+        CANONICAL_STORE_READ_TIMEOUT_MS,
+      );
       coverage = canonicalCoverage(false, [], 'relational_semantic_relation_projection');
     } catch (error) {
       if (!isCanonicalProjectionDegradation(error)) throw error;
