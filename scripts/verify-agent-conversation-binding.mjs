@@ -599,6 +599,11 @@ const eventRoleCases = [
   ['LlmApi', 'conversation', { eventCategory: 'llm', sessionIdSource: 'provider' }],
   ['LlmApi', 'background', { eventCategory: 'llm', sessionIdSource: 'per_request', runId: 'derived-run', runIdSource: 'derived_ephemeral' }],
   ['AgentTool', 'background', { eventCategory: 'tool', attributes: { 'anysentry.traffic.role': 'background' } }],
+  ['RuntimeEvent', 'background', { eventCategory: 'runtime' }],
+  ['ProcessExit', 'background', { eventCategory: 'process' }],
+  ['FileAccess', 'background', { eventCategory: 'file' }],
+  ['Egress', 'background', { eventCategory: 'network' }],
+  ['SystemContext', 'background', { eventCategory: 'runtime' }],
   ['LegacyTool', 'conversation', { eventCategory: 'unknown' }], // unknown/legacy fallback is retained
   ['ToolExec', 'background', { activityContext: 'platform_healthcheck', eventCategory: 'runtime' }],
 ];
