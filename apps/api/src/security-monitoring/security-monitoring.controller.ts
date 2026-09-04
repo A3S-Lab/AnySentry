@@ -197,6 +197,7 @@ const CANONICAL_SESSION_CACHE_MAX_ENTRIES = 4;
 const CANONICAL_SESSION_CACHE_MAX_BYTES = 8 * 1024 * 1024;
 const CANONICAL_DIRECTORY_INFLIGHT_MAX = 16;
 const CANONICAL_SESSION_INFLIGHT_MAX = 16;
+const CANONICAL_EVIDENCE_PROJECTION_TIMEOUT_MS = 10_000;
 
 function canonicalQueryScalar(
   query: Record<string, unknown> | undefined,
@@ -578,6 +579,20 @@ function isCanonicalProjectionDegradation(error: unknown): boolean {
   if (error instanceof ServiceUnavailableException || error instanceof NotFoundException) return true;
   if (!(error instanceof Error)) return false;
   return /(?:timeout|timed out|memory limit|clickhouse|postgres(?:ql)?|projection.+busy|temporarily unavailable)/iu.test(error.message);
+}
+
+function withCanonicalProjectionTimeout<T>(
+  operation: Promise<T>,
+  timeoutMs = CANONICAL_EVIDENCE_PROJECTION_TIMEOUT_MS,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<T>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new ServiceUnavailableException('Canonical evidence projection timed out')), timeoutMs);
+    timer.unref();
+  });
+  return Promise.race([operation, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 const OBSERVER_BATCH_ID_DIGEST_CACHE_SIZE = 10_000;
 const OBSERVER_BATCH_ID_DIGEST_CACHE_BYTES = 2 * 1024 * 1024;
@@ -10751,7 +10766,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       try {
         // The legacy evidence projector is authoritative for relation revisions and canonical
         // EvidenceLink decoration; always pass the resolved timeline (`se_`) id to it.
-        evidence = await this.agentSemanticEvidence({
+        evidence = await withCanonicalProjectionTimeout(this.agentSemanticEvidence({
           timeType: query.timeType,
           startTime: query.startTime,
           endTime: query.endTime,
@@ -10760,7 +10775,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           classificationView: query.classificationView,
           conversationId: selected.session.conversationId ?? selected.session.sessionId,
           semanticEventId: selected.event.semanticEventId,
-        }, headers);
+        }, headers));
       } catch (error) {
         if (!isCanonicalProjectionDegradation(error)) throw error;
         evidenceFailureReason = error instanceof NotFoundException
