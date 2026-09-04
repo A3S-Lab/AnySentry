@@ -11906,7 +11906,8 @@ export class SecurityMonitoringController implements OnModuleDestroy {
    * namespaces.  During a membership/ClickHouse timeout the narrow query can therefore return no
    * row even though a bounded global conversation projection still contains the exact alias.  Do
    * one explicitly bounded broad read, filter the returned rows locally, and mark the result
-   * partial.  The broad read is never used for a complete exact miss and is not recursive.
+   * partial.  This also protects against a compatibility projection that reports `complete` for
+   * its scanned page while omitting the requested alias; the retry is not recursive.
    */
   private async canonicalSessionResourcesForExact(
     query: CanonicalEntityQuery,
@@ -11915,8 +11916,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     const result = await this.canonicalSessionResources(query, headers);
     const requestedSessionId = query.sessionId;
     if (!requestedSessionId
-      || result.items.some((item) => [item.sessionId, item.canonicalSessionId, item.conversationId].includes(requestedSessionId))
-      || result.coverage.status === 'complete') {
+      || result.items.some((item) => [item.sessionId, item.canonicalSessionId, item.conversationId].includes(requestedSessionId))) {
       return result;
     }
     try {
