@@ -158,6 +158,8 @@ interface CanonicalSemanticTimelineSearch {
   scanned: number;
   truncated: boolean;
   failed: number;
+  /** A scoped stable `se_…` match is exact even when the bounded candidate list was capped. */
+  exactUnique?: boolean;
 }
 
 interface CanonicalDirectoryCacheEntry {
@@ -11152,6 +11154,11 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       scanned: Math.min(scanned, 128),
       truncated: scanned > 128,
       failed,
+      exactUnique: Boolean(
+        candidates.length === 1
+        && requestedId.startsWith('se_')
+        && (query.agentAssetId || query.agentInstanceId),
+      ),
     };
   }
 
@@ -11443,8 +11450,10 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     ])).values()];
     // If the bounded search was truncated, do not force a single candidate: an unseen session
     // may contain the same stable event id. The response remains queryable with coverage metadata.
-    const timelineAmbiguous = uniqueTimelineCandidates.length > 1 || timelineSearch.truncated;
-    const selected = uniqueTimelineCandidates.length === 1 && !timelineSearch.truncated
+    const timelineAmbiguous = uniqueTimelineCandidates.length > 1
+      || (timelineSearch.truncated && timelineSearch.exactUnique !== true);
+    const selected = uniqueTimelineCandidates.length === 1
+      && (!timelineSearch.truncated || timelineSearch.exactUnique === true)
       ? uniqueTimelineCandidates[0]
       : undefined;
 
