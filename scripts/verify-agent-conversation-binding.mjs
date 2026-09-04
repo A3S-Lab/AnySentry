@@ -626,6 +626,18 @@ for (const [eventKind, expectedRole, overrides] of eventRoleCases) {
   };
   assert.equal(trafficRoleForEvent(event), expectedRole, `${eventKind} traffic role`);
 }
+// Controller-normalized ToolExec events use eventCategory=tool as well; the canonical kind must
+// still stay on the machine lane even when a tool call id is attached by the producer.
+assert.equal(
+  trafficRoleForEvent({
+    ...eventRoleFixture,
+    eventKind: 'ToolExec',
+    eventCategory: 'tool',
+    toolCallId: 'kernel-tool-call',
+  }),
+  'tool_backend',
+  'canonical ToolExec remains tool_backend with universal tool category',
+);
 const persistedEventMemberships = [];
 const eventMembershipSink = {
   commitSessionMemberships: async (memberships) => {

@@ -143,7 +143,7 @@ export function eventMembershipEligible(event: Pick<T.JudgedEvent,
       'gen_ai.tool.name', 'gen_ai.tool.call.id', 'tool_call.id', 'tool.name',
     ].some((key) => event.attributes?.[key] !== undefined));
   if ((KERNEL_ONLY_EVENT_KINDS.has(normalizedKind) || KERNEL_ONLY_EVENT_KINDS.has(compactKind))
-    && !(semanticToolHint && (compactKind === 'tool' || compactKind === 'exec'))) return false;
+    && !(semanticToolHint && ['tool', 'exec', 'command'].includes(compactKind))) return false;
   if (SEMANTIC_TOOL_EVENT_KINDS.has(compactKind)
     || EXECUTION_BACKGROUND_EVENT_KINDS.has(compactKind)
     || LLM_EVENT_KINDS.has(compactKind)
@@ -254,7 +254,11 @@ export function trafficRoleForEvent(event: Pick<
     || Boolean(attributes && [
       'gen_ai.tool.name', 'gen_ai.tool.call.id', 'tool_call.id', 'tool.name',
     ].some((key) => attributes[key] !== undefined));
-  if (TOOL_EXEC_EVENT_KINDS.has(compactKind) && !semanticToolHint) return 'tool_backend';
+  // `ToolExec` is the canonical machine-side fact and remains tool_backend even though the
+  // universal event category is commonly `tool`.  Only bare legacy aliases (`tool`/`exec`/
+  // `command`) may opt into the semantic lane when an explicit ToolCall hint is present.
+  if (TOOL_EXEC_EVENT_KINDS.has(compactKind)
+    && !(semanticToolHint && ['tool', 'exec', 'command'].includes(compactKind))) return 'tool_backend';
 
   // Explicit control/bootstrap operation metadata is useful even when a producer sends a generic
   // LlmApi kind.
