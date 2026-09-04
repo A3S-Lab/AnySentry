@@ -505,6 +505,55 @@ assert.deepEqual(
   ).map((item) => item.kind),
   ['model_request', 'model_response', 'tool_call', 'tool_result', 'model_request', 'model_response'],
 );
+
+// One logical conversation may legitimately cross runtime assets (for example an application
+// process emits the LLM spans while a Kubernetes sandbox emits the Tool span).  The summary must
+// retain every asset alias so Canonical GET filters do not hide the session when the caller follows
+// the tool-side asset deep link.
+const multiAssetConversation = projectAgentConversations([
+  {
+    ...projectionInteraction({
+      interactionId: 'mi-multi-asset-root',
+      at: 1_788_060_200_000,
+      requestBody: 'MULTI_ASSET_ROOT',
+      responseText: 'MULTI_ASSET_TOOL',
+      providerResponseId: 'resp-multi-asset-root',
+    }),
+    agentAssetId: 'asset-multi-llm',
+  },
+  {
+    ...projectionInteraction({
+      interactionId: 'mi-multi-asset-tool',
+      at: 1_788_060_200_010,
+      requestBody: 'MULTI_ASSET_TOOL_RESULT',
+      responseText: 'MULTI_ASSET_FINAL',
+      providerResponseId: 'resp-multi-asset-final',
+      providerPreviousResponseId: 'resp-multi-asset-root',
+      toolResults: [{
+        toolCallId: 'call-multi-asset',
+        content: 'MULTI_ASSET_RESULT',
+        isError: false,
+        observedAtUnixNs: '1788060200010000000',
+      }],
+    }),
+    agentAssetId: 'asset-multi-sandbox',
+  },
+], [], { timeType: 'last_30d', scope: 'agent', limit: 20 });
+assert.equal(multiAssetConversation.summaries.length, 1);
+assert.deepEqual(multiAssetConversation.summaries[0].agentAssetIds?.sort(), [
+  'asset-multi-llm',
+  'asset-multi-sandbox',
+]);
+assert.equal(
+  projectAgentConversations(
+    multiAssetConversation.interactionsByConversation
+      .get(multiAssetConversation.summaries[0].conversationId),
+    [],
+    { timeType: 'last_30d', scope: 'agent', agentAssetId: 'asset-multi-sandbox', limit: 20 },
+  ).summaries.length,
+  1,
+  'asset-scoped directory queries must accept a non-primary conversation asset alias',
+);
 const semanticToolLoop = projectSemanticConversationTimeline(
   resolvedToolLoop,
   projectedToolLoop.interactionsByConversation.get(resolvedToolLoop.conversationId),
