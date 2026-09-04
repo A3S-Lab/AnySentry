@@ -166,6 +166,9 @@ spec:
             # Physical PUT/ACK journal bytes have their own ceiling while large-live-set
             # compaction is deferred; this is intentionally above logical live bytes but finite.
             - { name: FORWARD_SPOOL_MAX_WAL_BYTES, value: "4294967296" }
+            # Reserve bounded journal space for ACKs so a full PUT history can still make
+            # forward progress without deleting live records.
+            - { name: FORWARD_SPOOL_ACK_HEADROOM_BYTES, value: "67108864" }
             # A retry deadline parks evidence in the WAL; the same process continuously redrives
             # bounded priority batches, so recovery never depends on a container restart.
             - { name: FORWARD_SPOOL_REPLAY_INTERVAL_MS, value: "500" }

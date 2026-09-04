@@ -229,6 +229,49 @@ try {
   assert.equal(walRecovered.status().lazyRecords, 1);
   walRecovered.close();
 
+  const headroomPath = path.join(temporary, 'ack-headroom.wal');
+  const headroomSpool = new DurableSpool({
+    writerId: 'ack-headroom-test',
+    filePath: headroomPath,
+    maxBytes: 16 * 1024 * 1024,
+    maxWalBytes: 16 * 1024 * 1024,
+    ackHeadroomBytes: 64 * 1024,
+    fsyncMode: 'periodic',
+    fsyncMs: 60_000,
+  });
+  headroomSpool.put({
+    id: 'headroom-live',
+    body: { sourceEventId: 'headroom-live', line: 'x'.repeat(1024) },
+    priority: 4,
+    queuedAt: 1,
+  });
+  const headroomBefore = headroomSpool.status().walBytes;
+  // Leave room for an ACK but less than ACK headroom plus another PUT. PUT admission must stop
+  // before the hard ceiling; ACK admission must still consume the reserved bytes and remove the
+  // delivered record without requiring an operator-side WAL deletion.
+  headroomSpool.maxWalBytes = headroomBefore + headroomSpool.status().ackHeadroomBytes;
+  assert.equal(headroomSpool.status().atPutCapacity, true);
+  assert.equal(headroomSpool.status().atWalCapacity, false);
+  await assert.rejects(
+    new Promise((resolve, reject) => headroomSpool.putAsync({
+      id: 'headroom-overflow',
+      body: { line: 'overflow' },
+      priority: 4,
+      queuedAt: 2,
+    }, (error, inserted) => error ? reject(error) : resolve(inserted))),
+    (error) => error?.code === 'ANYSENTRY_SPOOL_WAL_CAPACITY',
+  );
+  const acknowledgedWithHeadroom = await new Promise((resolve, reject) => {
+    headroomSpool.ackAsync(['headroom-live'], (error, acknowledged) => {
+      if (error) reject(error);
+      else resolve(acknowledged);
+    });
+  });
+  assert.equal(acknowledgedWithHeadroom, 1);
+  assert.equal(headroomSpool.status().records, 0, 'ACK headroom permits durable progress');
+  assert.ok(headroomSpool.status().walBytes <= headroomSpool.maxWalBytes);
+  headroomSpool.close();
+
   const streamingPath = path.join(temporary, 'streaming-load.wal');
   const unicodeLine = `prefix-${'界'.repeat(80)}-suffix`;
   writeFileSync(streamingPath, [

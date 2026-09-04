@@ -693,6 +693,7 @@ function verifyObserverManifest() {
       /\{\s*name:\s*FORWARD_SPOOL_COMPACT_MAX_LIVE_RECORDS,\s*value:\s*"16384"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_SPOOL_MAX_RECORDS,\s*value:\s*"1000000"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_SPOOL_MAX_WAL_BYTES,\s*value:\s*"4294967296"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_SPOOL_ACK_HEADROOM_BYTES,\s*value:\s*"67108864"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_SPOOL_LIVE_RESERVE_EVENTS,\s*value:\s*"4096"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_SPOOL_LIVE_RESERVE_BYTES,\s*value:\s*"16777216"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_DEFERRED_CRITICAL_MAX_EVENTS,\s*value:\s*"4096"\s*\}/u.test(daemonSet?.source ?? '') &&

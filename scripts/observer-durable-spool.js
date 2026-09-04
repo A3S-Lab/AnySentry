@@ -40,6 +40,19 @@ class DurableSpool {
       this.maxBytes,
       64 * 1024 * 1024 * 1024,
     );
+    // Keep a small physical headroom for ACK journal entries. Without it, PUT history can fill
+    // the journal and leave no bytes to acknowledge already-delivered records. PUTs reserve this
+    // space, while ACKs are allowed to consume it so the live set can make progress again.
+    const defaultAckHeadroomBytes = Math.min(
+      this.maxWalBytes,
+      Math.max(1 * 1024 * 1024, Math.min(64 * 1024 * 1024, Math.floor(this.maxWalBytes / 100))),
+    );
+    this.ackHeadroomBytes = boundedNumber(
+      options.ackHeadroomBytes,
+      defaultAckHeadroomBytes,
+      64 * 1024,
+      this.maxWalBytes,
+    );
     this.fsyncMode = options.fsyncMode === 'always' ? 'always' : 'periodic';
     this.fsyncMs = boundedNumber(options.fsyncMs, 250, 10, 60_000);
     this.compactMinBytes = boundedNumber(options.compactMinBytes, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024 * 1024);
@@ -260,10 +273,11 @@ class DurableSpool {
     return Buffer.byteLength(`${JSON.stringify(operation)}\n`);
   }
 
-  canAppend(bytes) {
+  canAppend(bytes, operationType = 'put') {
     const size = Number(bytes);
+    const reserve = operationType === 'ack' ? 0 : this.ackHeadroomBytes;
     return Number.isSafeInteger(size) && size >= 0
-      && this.walBytes + this.pendingWriteBytes + size <= this.maxWalBytes;
+      && this.walBytes + this.pendingWriteBytes + size + reserve <= this.maxWalBytes;
   }
 
   walCapacityError(bytes) {
@@ -281,10 +295,17 @@ class DurableSpool {
     return this.walBytes + this.pendingWriteBytes >= this.maxWalBytes;
   }
 
+  // PUT admission stops at the ACK reserve, before the physical hard ceiling. This is the signal
+  // the input-flow controller should use; `atWalCapacity` remains the stricter journal-full
+  // diagnostic for operators and ACK admission.
+  atPutCapacity() {
+    return this.walBytes + this.pendingWriteBytes + this.ackHeadroomBytes >= this.maxWalBytes;
+  }
+
   append(operation, forceSync = false) {
     if (this.closed) throw new Error('Observer spool is closed');
     const line = `${JSON.stringify(operation)}\n`;
-    if (!this.canAppend(Buffer.byteLength(line))) {
+    if (!this.canAppend(Buffer.byteLength(line), operation?.op)) {
       throw this.walCapacityError(Buffer.byteLength(line));
     }
     fs.writeSync(this.fd, line);
@@ -299,7 +320,7 @@ class DurableSpool {
       return;
     }
     const buffer = Buffer.from(`${JSON.stringify(operation)}\n`);
-    if (!this.canAppend(buffer.length)) {
+    if (!this.canAppend(buffer.length, operation?.op)) {
       queueMicrotask(() => done(this.walCapacityError(buffer.length)));
       return;
     }
@@ -417,10 +438,10 @@ class DurableSpool {
     if (
       this.records.size + this.pendingPutIds.size + 1 > recordLimit
       || this.logicalBytes + this.pendingPutBytes + bytes > byteLimit
-      || !this.canAppend(operationBytes)
+      || !this.canAppend(operationBytes, operation.op)
     ) {
       queueMicrotask(() => done(
-        this.canAppend(operationBytes)
+        this.canAppend(operationBytes, operation.op)
           ? Object.assign(new Error('Observer spool capacity reached'), {
               code: 'ANYSENTRY_SPOOL_CAPACITY',
             })
@@ -475,7 +496,7 @@ class DurableSpool {
     }
     const operation = { op: 'ack', ids: acknowledged };
     const operationBytes = this.operationBytes(operation);
-    if (!this.canAppend(operationBytes)) {
+    if (!this.canAppend(operationBytes, operation.op)) {
       queueMicrotask(() => done(this.walCapacityError(operationBytes), 0));
       return 0;
     }
@@ -573,7 +594,7 @@ class DurableSpool {
   }
 
   atCapacity(priority = 0) {
-    if (this.atWalCapacity()) return true;
+    if (this.atPutCapacity()) return true;
     const protectedPriority = Number(priority) >= 3;
     const recordLimit = this.maxRecords + (protectedPriority ? this.protectedReserveRecords : 0);
     const byteLimit = this.maxBytes + (protectedPriority ? this.protectedReserveBytes : 0);
@@ -663,7 +684,9 @@ class DurableSpool {
       oldestMs: Number.isFinite(oldest) ? Math.max(0, Date.now() - oldest) : 0,
       atCapacity: this.atCapacity(),
       atWalCapacity: this.atWalCapacity(),
+      atPutCapacity: this.atPutCapacity(),
       maxWalBytes: this.maxWalBytes,
+      ackHeadroomBytes: this.ackHeadroomBytes,
       pendingWriteBytes: this.pendingWriteBytes,
       walCapacityRejects: this.walCapacityRejects,
       fsyncMode: this.fsyncMode,
