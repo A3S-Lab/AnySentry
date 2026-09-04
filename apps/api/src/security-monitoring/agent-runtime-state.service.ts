@@ -825,7 +825,12 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
     }
     if (this.durableHistoryEnabled) {
       for (const [canonical, record] of this.history) {
-        if (!byCanonical.has(canonical)) byCanonical.set(canonical, this.clonePublicRecord(record));
+        // History entries are already immutable public snapshots (they are cloned when they
+        // enter the history map).  Do not clone every historical record while assembling a
+        // bounded read: canonical entity GETs often ask for one page but the runtime history can
+        // contain thousands of entries.  Clone only the page returned below so filtering and
+        // sorting remain cheap and callers still cannot mutate the stored snapshot.
+        if (!byCanonical.has(canonical)) byCanonical.set(canonical, record);
       }
     }
     const all = [...byCanonical.values()]
@@ -850,7 +855,7 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
     const summary = this.summary(all);
     const limit = boundedInteger(input.limit, this.maxInstances, 1, this.maxInstances);
     return {
-      items: all.slice(0, limit),
+      items: all.slice(0, limit).map((record) => this.clonePublicRecord(record)),
       total: all.length,
       summary,
       updateTime: iso(at),
