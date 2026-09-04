@@ -77,6 +77,43 @@ function string(value: unknown, max: number): string | undefined {
   return normalized;
 }
 
+/** Keep endpoint metadata useful for correlation without persisting URL authority credentials or
+ * query/fragment parameters.  This boundary is shared by Observer-decoded interactions, so a
+ * legacy LlmInteraction line cannot bypass the OTLP/controller sanitizer. */
+function sanitizeEndpoint(value: string): string {
+  const input = value.trim().replace(/[\u0000-\u001f\u007f"'`,;]/gu, '').slice(0, 1_000);
+  const withoutQuery = input.split(/[?#]/u)[0];
+  const explicitScheme = /^[a-z][a-z0-9+.-]*:\/\//iu.test(withoutQuery);
+  try {
+    const parsed = new URL(explicitScheme ? withoutQuery : `http://${withoutQuery}`);
+    const host = parsed.hostname.trim();
+    if (!host) return withoutQuery.slice(0, 1_000);
+    const authority = withoutQuery.match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/iu)?.[1] ?? '';
+    const authorityWithoutUser = authority.slice(authority.lastIndexOf('@') + 1);
+    const explicitPort = authorityWithoutUser.match(/:(\d{1,5})$/u)?.[1];
+    const portNumber = Number(parsed.port || explicitPort || '');
+    const port = Number.isInteger(portNumber) && portNumber > 0 && portNumber <= 65_535
+      ? String(portNumber) : '';
+    const pathname = parsed.pathname && parsed.pathname !== '/'
+      ? parsed.pathname.slice(0, 240)
+      : parsed.pathname === '/' ? '/' : '';
+    const protocol = explicitScheme ? parsed.protocol.replace(/:$/u, '') : '';
+    return `${protocol ? `${protocol}://` : ''}${host}${port ? `:${port}` : ''}${pathname}`.slice(0, 1_000);
+  } catch {
+    const scheme = withoutQuery.match(/^([a-z][a-z0-9+.-]*:\/\/)(.*)$/iu);
+    const prefix = scheme?.[1] ?? '';
+    const rest = scheme?.[2] ?? withoutQuery;
+    const slash = rest.indexOf('/');
+    const authority = slash >= 0 ? rest.slice(0, slash) : rest;
+    const path = slash >= 0 ? rest.slice(slash) : '';
+    return `${prefix}${authority.slice(authority.lastIndexOf('@') + 1)}${path}`.slice(0, 1_000);
+  }
+}
+
+function sanitizePath(value: string): string {
+  return value.replace(/[?#].*$/u, '').slice(0, 2_000);
+}
+
 function strictRunIdentity(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const normalized = value.trim();
@@ -331,7 +368,7 @@ function toolResults(value: unknown): T.AgentInteractionToolResult[] {
       toolCallId,
       ...(string(input.name, 240) ? { name: string(input.name, 240) } : {}),
       content: result,
-      isError: input.isError === true,
+      ...(typeof input.isError === 'boolean' ? { isError: input.isError } : {}),
       ...(unixNs(input.observedAtUnixNs)
         ? { observedAtUnixNs: unixNs(input.observedAtUnixNs) }
         : {}),
@@ -674,9 +711,11 @@ export function parseObserverAgentInteraction(
 
   const interactionId = string(input.interactionId, 160);
   const connectionId = string(input.connectionId, 240);
-  const endpoint = string(input.endpoint, 1_000);
+  const endpointValue = string(input.endpoint, 1_000);
+  const endpoint = endpointValue ? sanitizeEndpoint(endpointValue) : undefined;
   const method = string(input.method, 24);
-  const path = string(input.path, 2_000);
+  const pathValue = string(input.path, 2_000);
+  const path = pathValue ? sanitizePath(pathValue) : undefined;
   const startedAtUnixNs = unixNs(input.startedAtUnixNs);
   const requestCompleteAtUnixNs = unixNs(input.requestCompleteAtUnixNs);
   const firstResponseAtUnixNs = unixNs(input.firstResponseAtUnixNs);

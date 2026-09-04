@@ -777,6 +777,86 @@ type AgentConversationProjectionResult = {
   canonicalConversationId?: string;
 };
 
+function relationStatusFromCanonicalLink(
+  status: T.EvidenceLink['status'],
+): T.AgentSemanticKernelRelationStatus {
+  if (status === 'confirmed') return 'linked_exact';
+  if (status === 'strong') return 'linked_strong';
+  if (status === 'ambiguous') return 'ambiguous';
+  if (status === 'coverage_gap') return 'coverage_gap';
+  return 'semantic_only';
+}
+
+function relationMethodFromCanonicalLink(
+  method: T.EvidenceLink['method'],
+): T.AgentSemanticKernelRelation['linkMethod'] | undefined {
+  if (method === 'command' || method === 'resource' || method === 'network') return method;
+  // The legacy relation enum has no generic process-generation member. Do not relabel a
+  // non-shell process edge as `shell_bootstrap`; the canonical link remains authoritative.
+  return undefined;
+}
+
+/** Rehydrate the additive canonical link into the legacy relation shape used by existing UI/API
+ * clients.  No semantic status is invented: missing Kernel row details remain absent and the
+ * canonical EvidenceLink itself stays available in the response. */
+function relationFromCanonicalLink(
+  link: T.EvidenceLink,
+  event: T.AgentSemanticEvent,
+  interaction: T.AgentInteractionRecord,
+  kernelItems: readonly T.AgentEventListItem[],
+): T.AgentSemanticKernelRelation {
+  const targetId = link.toId.startsWith('unmatched:') ? undefined : link.toId;
+  const kernel = targetId
+    ? kernelItems.find((item) => item.eventId === targetId || item.kernelFactId === targetId)
+    : undefined;
+  const targetLooksLikeFact = Boolean(targetId && /^kf_[a-f0-9]{24}$/u.test(targetId));
+  const kernelEventId = kernel?.eventId ?? (!targetLooksLikeFact ? targetId : undefined);
+  const kernelFactId = targetLooksLikeFact ? targetId : kernel?.kernelFactId;
+  const relationId = `skr_${createHash('sha256')
+    .update(`${event.semanticEventId}\0canonical\0${link.linkId}\0${link.resolutionRevision}`)
+    .digest('hex').slice(0, 24)}`;
+  const authority: T.AgentSemanticKernelRelation['authority'] = interaction.semanticOnly === true
+    || interaction.captureSource === 'authenticated_application_event'
+    ? 'authenticated_adapter'
+    : link.authority === 'authenticated_adapter' ? 'authenticated_adapter'
+      : link.authority === 'inferred' ? 'attested_tls_plaintext' : 'inferred';
+  return {
+    schemaVersion: 'anysentry.agent_semantic_kernel_relation.v1',
+    relationId,
+    stableSemanticEventId: event.semanticEventId,
+    conversationId: event.conversationId,
+    turnId: event.turnId,
+    toolInvocationId: link.fromId,
+    ...(kernelEventId ? { kernelEventId } : {}),
+    ...(kernelFactId ? { kernelFactId } : {}),
+    ...(kernel?.at ? { kernelEventAt: kernel.at } : {}),
+    ...(kernel?.eventKind ? { kernelEventKind: kernel.eventKind } : {}),
+    status: relationStatusFromCanonicalLink(link.status),
+    ...(relationMethodFromCanonicalLink(link.method) ? { linkMethod: relationMethodFromCanonicalLink(link.method) } : {}),
+    timeQuality: kernel ? 'exact' : 'bounded',
+    confidence: link.confidence,
+    authority,
+    relationVersion: AGENT_SEMANTIC_KERNEL_RELATION_VERSION,
+    resolutionRevision: link.resolutionRevision,
+    evidenceLinkId: link.linkId,
+    algorithmVersion: link.algorithmVersion,
+    sourceRefs: link.evidenceRefs,
+    validFromUnixNs: link.validFromUnixNs,
+    relationRevision: link.resolutionRevision,
+    ...(kernel ? {
+      risk: {
+        verdict: kernel.verdict,
+        tier: kernel.tier,
+        severity: kernel.severity,
+        riskScore: kernel.riskScore,
+        riskName: kernel.riskName,
+        riskCategory: kernel.riskCategory,
+        reason: kernel.reason,
+      },
+    } : {}),
+  };
+}
+
 function normalizeSimulationDecision(decision: SimulatedDecision | null): T.PolicySimulationDecision {
   if (!decision) return { verdict: 'allow', tier: 'Rules', severity: 'info', reason: 'observed' };
   let verdict = decision.verdict as T.Verdict;
@@ -3459,6 +3539,12 @@ export class AggregationService implements OnModuleDestroy {
       .map((interactionId) => records.find((record) => record.interactionId === interactionId))
       .find((record): record is T.AgentInteractionRecord => Boolean(record));
     if (!interaction) return undefined;
+    // Read the append-only canonical side lane by its semantic evidence reference before relying
+    // on the legacy PostgreSQL relation projection.  This keeps a valid ToolCall→Kernel link
+    // navigable while the compatibility relation projector is delayed or temporarily empty.
+    const canonicalEvidenceLinks = this.canonicalObservability
+      ? await this.canonicalObservability.listDurableEvidenceLinksByEvidenceRef(call.semanticEventId, 256)
+      : [];
     const loadedPersistedRelations = this.relationalStore?.configured()
       ? await this.relationalStore.loadAgentSemanticKernelRelations(call.semanticEventId)
       : [];
@@ -3473,7 +3559,16 @@ export class AggregationService implements OnModuleDestroy {
       && persistedRelations.every((relation) =>
         Boolean(relation.kernelEventId)
         && ['linked_exact', 'linked_strong'].includes(relation.status));
-    if (persistedLinked) {
+    const persistedByLink = new Map(persistedRelations
+      .map((relation) => relation.evidenceLinkId ? [relation.evidenceLinkId, relation] as const : undefined)
+      .filter((entry): entry is readonly [string, T.AgentSemanticKernelRelation] => Boolean(entry)));
+    const canonicalSupersedesPersisted = canonicalEvidenceLinks.some((link) => {
+      const previous = persistedByLink.get(link.linkId);
+      return previous !== undefined
+        && (link.resolutionRevision > (previous.resolutionRevision ?? previous.relationRevision ?? 0)
+          || !['confirmed', 'strong'].includes(link.status));
+    });
+    if (persistedLinked && !canonicalSupersedesPersisted) {
       const linkedEventIds = [...new Set(persistedRelations
         .map((relation) => relation.kernelEventId)
         .filter((eventId): eventId is string => Boolean(eventId)))];
@@ -3501,6 +3596,8 @@ export class AggregationService implements OnModuleDestroy {
           ? 'linked_exact'
           : 'linked_strong',
         evidenceBundleEventIds: linkedEventIds,
+        ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinks } : {}),
+        ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinksSource: 'canonical_store' as const } : {}),
         coverage: { ...interactions.coverage },
         ...this.classificationResponseMeta(query),
         updateTime: iso(),
@@ -3592,6 +3689,37 @@ export class AggregationService implements OnModuleDestroy {
       && persistedRelations.some((relation) => relation.kernelEventId)) {
       relations = persistedRelations;
     }
+    if (canonicalEvidenceLinks.length > 0) {
+      const canonicalRelations = canonicalEvidenceLinks.map((link) =>
+        relationFromCanonicalLink(link, call, interaction, kernel.items));
+      const byLink = new Map(relations
+        .map((relation, index) => relation.evidenceLinkId ? [relation.evidenceLinkId, index] as const : undefined)
+        .filter((entry): entry is readonly [string, number] => Boolean(entry)));
+      for (const canonicalRelation of canonicalRelations) {
+        const existingIndex = canonicalRelation.evidenceLinkId
+          ? byLink.get(canonicalRelation.evidenceLinkId)
+          : undefined;
+        if (existingIndex === undefined) {
+          byLink.set(canonicalRelation.evidenceLinkId ?? canonicalRelation.relationId, relations.length);
+          relations.push(canonicalRelation);
+          continue;
+        }
+        const existing = relations[existingIndex];
+        // Preserve rich legacy risk/kernel fields when present, but let the durable canonical
+        // link decide status/revision and retain its immutable source references.
+        relations[existingIndex] = {
+          ...canonicalRelation,
+          ...existing,
+          evidenceLinkId: canonicalRelation.evidenceLinkId,
+          resolutionRevision: canonicalRelation.resolutionRevision,
+          relationRevision: canonicalRelation.relationRevision,
+          sourceRefs: canonicalRelation.sourceRefs,
+          validFromUnixNs: canonicalRelation.validFromUnixNs,
+          status: canonicalRelation.status,
+          confidence: canonicalRelation.confidence,
+        };
+      }
+    }
     const linkedEventIds = new Set(relations
       .map((relation) => relation.kernelEventId)
       .filter((eventId): eventId is string => Boolean(eventId)));
@@ -3621,6 +3749,8 @@ export class AggregationService implements OnModuleDestroy {
       kernelEvents: kernel.items.filter((event) => linkedEventIds.has(event.eventId)),
       relationStatus,
       evidenceBundleEventIds: [...linkedEventIds],
+      ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinks } : {}),
+      ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinksSource: 'canonical_store' as const } : {}),
       coverage: {
         ...kernel.coverage,
         partial,
@@ -3634,9 +3764,22 @@ export class AggregationService implements OnModuleDestroy {
 
   async agentKernelSemanticContext(
     eventId: string,
+    relatedEventIds: readonly string[] = [],
   ): Promise<T.AgentKernelSemanticContextResponse> {
+    const lookupIds = [...new Set([eventId, ...relatedEventIds]
+      .map((value) => value.trim())
+      .filter(Boolean))].slice(0, 4);
     const relations = this.relationalStore?.configured()
-      ? await this.relationalStore.loadAgentSemanticRelationsForKernelEvent(eventId)
+      ? (await Promise.all(lookupIds.map((id) =>
+          this.relationalStore!.loadAgentSemanticRelationsForKernelEvent(id))))
+        .flat()
+      : [];
+    const canonicalEvidenceLinks = this.canonicalObservability
+      ? (await Promise.all(lookupIds.map((id) =>
+          this.canonicalObservability!.listDurableEvidenceLinksForTargetId(id, 256))))
+        .flat()
+        .filter((link, index, all) => all.findIndex((candidate) =>
+          candidate.linkId === link.linkId && candidate.resolutionRevision === link.resolutionRevision) === index)
       : [];
     return {
       schemaVersion: 'anysentry.agent_kernel_semantic_context.v1',
@@ -3650,6 +3793,8 @@ export class AggregationService implements OnModuleDestroy {
           semanticEventId: relation.stableSemanticEventId,
         },
       ])).values()],
+      ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinks } : {}),
+      ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinksSource: 'canonical_store' as const } : {}),
       updateTime: iso(),
     };
   }

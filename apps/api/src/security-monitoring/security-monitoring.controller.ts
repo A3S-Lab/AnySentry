@@ -59,7 +59,6 @@ import { CanonicalObservabilityService } from './canonical-observability.service
 import { CANONICAL_SESSION_ID_ALGORITHM_V1, SESSION_KEY_ALGORITHM_V1, SESSION_HASH_SECRET_MODE, canonicalParentSessionIdForMembership, canonicalSessionIdForMembership, createEvidenceLink, deriveAgentInstanceIdentity, deriveProcessGenerationKey, resolveSessionIdentity, validateKernelFact } from './canonical-observability';
 import { agentRuntimeInstanceIdForEvent } from './agent-identity';
 import type { EvidenceLink, KernelFact, SemanticRecord } from './canonical-observability';
-import { canonicalEvidenceLinksForRelations as buildCanonicalEvidenceLinks } from './agent-semantic-kernel-relation';
 import type { UnknownInfrastructureDraftRequest } from './infrastructure-rule.types';
 import {
   bindServerTrustedCorrelationContext,
@@ -1593,6 +1592,9 @@ function semanticTrafficRole(
     'http.route',
     'operation.name',
   )?.toLowerCase() ?? '';
+  if (/(?:^|[/:._-])(?:heartbeat|healthcheck|telemetry|metrics?|poll)(?:$|[/:._-])/iu.test(operation)) {
+    return 'background';
+  }
   if (/(?:^|[/:.])initialize$|tools?\/list|list_tools|bootstrap|capabilit(?:y|ies)/iu.test(operation)) {
     return /bootstrap/iu.test(operation) ? 'bootstrap' : 'control';
   }
@@ -7988,8 +7990,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       semanticEventId,
     });
     if (!result) throw new NotFoundException('semantic tool event was not found');
-    const canonicalLinks = result.canonicalEvidenceLinks?.length
-      ? result.canonicalEvidenceLinks
+    const durableCanonicalLinks = Boolean(result.canonicalEvidenceLinks?.length);
+    const canonicalLinks = durableCanonicalLinks
+      ? (result.canonicalEvidenceLinks ?? [])
       : canonicalEvidenceLinksForRelations(result.relations);
     const durableLinkIds = new Set(canonicalLinks.map((link) => link.linkId));
     const canonicalRelations = result.relations.map((relation, index) => {
@@ -8012,6 +8015,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       ...result,
       relations: canonicalRelations,
       ...(canonicalLinks.length ? { canonicalEvidenceLinks: canonicalLinks } : {}),
+      ...(canonicalLinks.length
+        ? { canonicalEvidenceLinksSource: durableCanonicalLinks ? 'canonical_store' as const : 'computed_compatibility' as const }
+        : {}),
     };
     // Read paths are side-effect free. EvidenceLinks are materialized by the ingest-triggered
     // correlation projector; this endpoint only returns the latest computed relation (or its
@@ -8042,8 +8048,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     const eventId = strictIdentityText(body?.eventId, 512);
     if (!eventId) throw new BadRequestException('a valid eventId is required');
     const result = await this.agg.agentKernelSemanticContext(eventId);
-    const canonicalLinks = result.canonicalEvidenceLinks?.length
-      ? result.canonicalEvidenceLinks
+    const durableCanonicalLinks = Boolean(result.canonicalEvidenceLinks?.length);
+    const canonicalLinks = durableCanonicalLinks
+      ? (result.canonicalEvidenceLinks ?? [])
       : canonicalEvidenceLinksForRelations(result.relations);
     const durableLinkIds = new Set(canonicalLinks.map((link) => link.linkId));
     const response = {
@@ -8065,6 +8072,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           : relation;
       }),
       ...(canonicalLinks.length ? { canonicalEvidenceLinks: canonicalLinks } : {}),
+      ...(canonicalLinks.length
+        ? { canonicalEvidenceLinksSource: durableCanonicalLinks ? 'canonical_store' as const : 'computed_compatibility' as const }
+        : {}),
     };
     // Evidence relation persistence belongs to the ingest/correlation projector. Keep this query
     // endpoint read-only so repeated inspector refreshes cannot mutate relation history.

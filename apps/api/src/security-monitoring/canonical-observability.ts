@@ -1529,7 +1529,7 @@ export function normalizeKernelFact(input: {
       ? sourceRefs
       : [derivedFrom[0] ?? 'normalizer:kernel_fact.v1'],
     derivedFrom,
-    observedAtUnixNs: unixNs(input.observedAtUnixNs) ?? '1',
+    observedAtUnixNs: unixNs(input.observedAtUnixNs) ?? '1000000000',
     ...(text(input.processGenerationKey, 128) ? { processGenerationKey: text(input.processGenerationKey, 128) } : {}),
     ...(text(input.parentProcessGenerationKey, 128) ? { parentProcessGenerationKey: text(input.parentProcessGenerationKey, 128) } : {}),
     ...(text(input.connectionId, 240) ? { connectionId: text(input.connectionId, 240) } : {}),
@@ -2740,9 +2740,11 @@ export function resolveSessionIdentity(input: SessionResolutionInput): SessionRe
   // turn otherwise independent requests into one inferred Conversation.  A stateful service may
   // still use `providerSessionId`/`sessionId` below; the universal ingest binder only sets this flag
   // false when no native conversation/thread continuity is available.
-  const explicit = input.serviceStateful === false
-    ? undefined
-    : provider ?? (runtimeOnly ? undefined : suppliedSession);
+  // An explicit provider conversation/thread remains authoritative even when the surrounding
+  // service is stateless by default.  `serviceStateful=false` suppresses only legacy/session
+  // fallbacks; it must not discard a real provider anchor that enables a scoped resume.
+  const explicit = provider
+    ?? (input.serviceStateful === false ? undefined : (runtimeOnly ? undefined : suppliedSession));
   if (explicit) {
     const forked = input.fork === true;
     if (forked) {
@@ -2996,7 +2998,7 @@ export interface EvidenceLinkInput {
 export function createEvidenceLink(input: EvidenceLinkInput): EvidenceLink {
   const fromId = text(input.fromId, 512) ?? 'unknown';
   const toId = text(input.toId, 512) ?? 'unknown';
-  const validFrom = unixNs(input.validFromUnixNs) ?? '1';
+  const validFrom = unixNs(input.validFromUnixNs) ?? '1000000000';
   const validTo = input.validToUnixNs === undefined ? undefined : unixNs(input.validToUnixNs);
   const requestedRefs = [...new Set((input.evidenceRefs ?? [])
     .map((ref) => text(ref, 512))
@@ -3055,7 +3057,7 @@ export function createRelationRevision(input: {
   sourceRefs?: string[];
 }): RelationRevision {
   const revision = positiveInteger(input.revision, Number.MAX_SAFE_INTEGER) ?? 1;
-  const decidedAtUnixNs = unixNs(input.decidedAtUnixNs) ?? '1';
+  const decidedAtUnixNs = unixNs(input.decidedAtUnixNs) ?? '1000000000';
   const relationId = stableId(
     'rr',
     `${input.relation.linkId}\0${revision}\0${decidedAtUnixNs}`,

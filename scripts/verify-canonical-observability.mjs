@@ -29,6 +29,7 @@ const {
   validateLogicalAgentDefinition,
   resolveSessionIdentity,
   deriveAgentInstanceIdentity,
+  createEvidenceLink,
   validateRawObservation,
 } = canonical;
 const digest = (value) => createHash('sha256').update(value).digest('hex');
@@ -98,10 +99,18 @@ const statelessProvider = resolveSessionIdentity({
   providerSessionId: 'provider-label-reused-by-stateless-service',
   requestId: 'post-provider-1',
 });
-assert.equal(statelessProvider.mode, 'per_request');
+assert.equal(statelessProvider.mode, 'ephemeral');
 assert.equal(statelessProvider.quality, 'ephemeral');
-assert.equal(statelessProvider.providerSessionId, undefined,
-  'a stateless boundary must not promote a repeated provider label to a Session anchor');
+assert.equal(statelessProvider.providerSessionId, 'provider-label-reused-by-stateless-service',
+  'an explicit provider anchor remains visible even when the service default is stateless');
+const scopedStatelessProvider = resolveSessionIdentity({
+  serviceStateful: false,
+  providerSessionId: 'provider-thread',
+  requestId: 'post-provider-scoped',
+  scopeKey: 'tenant-a|service-a',
+});
+assert.equal(scopedStatelessProvider.mode, 'resumable',
+  'an explicit scoped provider thread can resume even when POSTs default to stateless');
 const pidLike = resolveSessionIdentity({ sessionId: '4242' });
 const podLike = resolveSessionIdentity({ sessionId: 'pod-abc' });
 assert.equal(pidLike.quality, 'ephemeral', 'PID-looking session IDs must not become provider sessions');
@@ -241,7 +250,7 @@ const providerSessionLine = JSON.stringify({
   event: { LlmInteraction: {
     schemaVersion: 'anysentry.agent_interaction.v1', interactionId: 'mi_' + digest('provider-session').slice(0, 24),
     interactionType: 'model', connectionId: 'conn_provider-session', transport: 'http', protocol: 'http/1.1',
-    endpoint: 'fixture.invalid', method: 'POST', path: '/v1/chat/completions', statusCode: 200,
+    endpoint: 'https://fixture-user:fixture-secret@fixture.invalid/v1/chat?token=fixture-secret#frag', method: 'POST', path: '/v1/chat/completions?token=fixture-secret', statusCode: 200,
     startedAtUnixNs: raw.eventAtUnixNs, requestCompleteAtUnixNs: raw.eventAtUnixNs,
     firstResponseAtUnixNs: raw.eventAtUnixNs, endedAtUnixNs: raw.eventAtUnixNs, durationNs: '1',
     timeQuality: 'collector_calibrated', request: providerSessionBody, response: body(response),
@@ -257,6 +266,10 @@ const providerSessionParsed = interactionParser.parseObserverAgentInteraction(pr
 assert.equal(providerSessionParsed?.providerConversationId, 'provider-session-fixture');
 assert.equal(providerSessionParsed?.sessionId, 'provider-session-fixture',
   'provider conversation ID must populate the canonical Session when legacy meta has no session');
+assert.equal(providerSessionParsed?.endpoint, 'https://fixture.invalid/v1/chat',
+  'Observer-decoded endpoint metadata must drop URL userinfo/query/fragment');
+assert.equal(providerSessionParsed?.path, '/v1/chat/completions',
+  'Observer-decoded request paths must not retain query parameters');
 
 const candidateDecision = captureClassificationDecision('probable_agent');
 assert.equal(candidateDecision.observed, 'probable_agent');
@@ -306,5 +319,34 @@ assert.equal(String(sensitiveGap.details?.endpoint).includes('fixture-value'), f
 assert.equal(sensitiveGap.details?.peer, 'api.example.invalid',
   'ordinary bounded diagnostic values remain readable');
 gapService.close();
+
+// Forward/reverse canonical EvidenceLink lookups must work from the bounded hot store even when
+// the compatibility PostgreSQL relation projector is absent.  Newer revisions supersede older
+// rows for the same logical edge in forward reads; explicit link GETs can still request history.
+const linkService = new CanonicalObservabilityService();
+const linkBase = createEvidenceLink({
+  fromType: 'tool_call',
+  fromId: 'ti_canonical-fixture',
+  toType: 'kernel_fact',
+  toId: 'kf_canonical-fixture',
+  relation: 'executes_as',
+  method: 'process_generation',
+  authority: 'inferred',
+  evidenceRefs: ['se_canonicalfixture0000000000000000', 'evt_canonical-fixture'],
+  status: 'strong',
+  confidence: 0.8,
+  validFromUnixNs: '1788000000000000000',
+  resolutionRevision: 1,
+});
+const linkRevision = { ...linkBase, resolutionRevision: 2, status: 'ambiguous', confidence: 0 };
+assert.equal((await linkService.commitEvidenceLinks([linkBase, linkRevision])).accepted, 2);
+const byRef = await linkService.listDurableEvidenceLinksByEvidenceRef('se_canonicalfixture0000000000000000', 10);
+assert.equal(byRef.length, 1, 'forward EvidenceLink lookup must collapse to the latest revision');
+assert.equal(byRef[0].resolutionRevision, 2);
+assert.equal(byRef[0].status, 'ambiguous');
+const byTarget = await linkService.listDurableEvidenceLinksForTargetId('kf_canonical-fixture', 10);
+assert.equal(byTarget.length, 1, 'reverse KernelFact lookup must retain the canonical link');
+assert.equal(byTarget[0].linkId, linkBase.linkId);
+linkService.close();
 
 console.log('canonical observability identity/session verification passed');

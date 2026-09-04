@@ -489,10 +489,43 @@ export function projectSemanticConversationTimeline(
       const tool = item.actor === 'tool'
         ? toolIdentity(item.toolName, item.content)
         : undefined;
-      const pairedResult = item.kind === 'tool_call' && item.toolCallId
-        ? ordered.some((record) => record.toolResults.some((result) =>
-            result.toolCallId === item.toolCallId))
-        : false;
+      const itemAt = (() => {
+        try { return BigInt(item.atUnixNs); } catch { return 0n; }
+      })();
+      const pairedToolResult = item.toolCallId
+        ? ordered
+          .flatMap((record) => record.toolResults)
+          .filter((result) => {
+            if (result.toolCallId !== item.toolCallId) return false;
+            if (!result.observedAtUnixNs) return true;
+            try {
+              // A late/out-of-order result is retained as raw evidence but cannot close an earlier
+              // ToolCall in the human lane. Equal timestamps are accepted for legacy one-record
+              // projections whose request/result boundary is intentionally coarse.
+              return BigInt(result.observedAtUnixNs) >= itemAt;
+            } catch {
+              return false;
+            }
+          })
+          .sort((left, right) => {
+            try { return Number(BigInt(left.observedAtUnixNs ?? '0') - BigInt(right.observedAtUnixNs ?? '0')); }
+            catch { return 0; }
+          })
+          .at(0)
+        : undefined;
+      const pairedResult = item.kind === 'tool_call' && Boolean(pairedToolResult);
+      // A result ID alone proves that a result-shaped record arrived; it does not prove success.
+      // Keep unknown status explicit when an adapter omitted the error bit instead of silently
+      // turning a partial/unsupported tool observation into a successful execution.
+      const resultStatus: T.AgentSemanticEvent['status'] = pairedToolResult
+        ? pairedToolResult.isError === true ? 'failed'
+          : pairedToolResult.isError === false ? 'succeeded' : 'unknown'
+        : undefined;
+      const itemPartialReasons = [...item.partialReasons];
+      if (item.kind === 'tool_result' && resultStatus === 'unknown'
+        && !itemPartialReasons.includes('tool_result_status_unobserved')) {
+        itemPartialReasons.push('tool_result_status_unobserved');
+      }
       const event: T.AgentSemanticEvent = {
         semanticEventId: semanticEventId(interaction.interactionId, item),
         conversationId: conversation.conversationId,
@@ -507,11 +540,10 @@ export function projectSemanticConversationTimeline(
         ...(item.toolCallId ? { toolCallId: item.toolCallId } : {}),
         ...(tool ? { toolName: tool.toolName, toolKind: tool.toolKind } : {}),
         ...(item.kind === 'tool_call'
-          ? { status: pairedResult ? 'succeeded' as const : 'pending' as const }
-          : item.kind === 'tool_result'
-            ? { status: interaction.toolResults.find((result) =>
-                result.toolCallId === item.toolCallId)?.isError ? 'failed' as const : 'succeeded' as const }
-            : {}),
+          ? { status: pairedResult ? (resultStatus ?? 'unknown') : 'pending' as const }
+          : item.kind === 'tool_result' && resultStatus
+            ? { status: resultStatus }
+            : item.kind === 'tool_result' ? { status: 'unknown' as const } : {}),
         sourceInteractionIds: [interaction.interactionId],
         sourceItemIds: [item.sourceItemId ?? item.semanticItemId],
         ...(item.sequenceNumber !== undefined ? { sequenceNumber: item.sequenceNumber } : {}),
@@ -520,7 +552,7 @@ export function projectSemanticConversationTimeline(
         parserVersion: interaction.semanticParserVersion ?? SEMANTIC_PROJECTION_PARSER_VERSION,
         correlationQuality: interaction.correlationQuality ?? 'inferred',
         completeness: item.completeness,
-        partialReasons: [...item.partialReasons],
+        partialReasons: itemPartialReasons,
       };
       turn.events.push(event);
       if (item.kind === 'tool_call' && item.toolCallId) calls.set(item.toolCallId, event);

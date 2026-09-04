@@ -17,6 +17,7 @@ const {
 } = require('../apps/api/dist/security-monitoring/agent-semantic-timeline.js');
 
 const digest = (value) => createHash('sha256').update(value).digest('hex');
+const unixNs = (ms) => String(BigInt(ms) * 1_000_000n);
 const content = (structured, messages = [], text) => {
   const body = JSON.stringify(structured);
   return {
@@ -433,6 +434,85 @@ assert.equal(replay.length, 1);
 assert.equal(replay[0].replayedUserMessages, 3);
 assert.equal(replay[0].replayedToolResults, 1);
 assert.equal(replay[0].newUserMessages, 1);
+
+// Tool lifecycle status is evidence-driven: an explicit error fails the call, an omitted error
+// bit remains unknown, and an out-of-order result cannot close a later call.  The raw result is
+// still retained for audit/replay.
+const failedToolId = 'call-status-failed';
+const failedStatusCall = interaction({
+  id: 'mi_v2_status_failed_call',
+  at: base + 20_000,
+  instance: 'host-root:v2:status',
+  conversationId: 'cv_status_contract',
+  request: { model: 'fixture-model', input: [human('status-user', 'status-turn', 'run failing tool')] },
+  toolCalls: [{ toolCallId: failedToolId, name: 'exec', arguments: { cmd: 'false' }, issuedAtUnixNs: unixNs(base + 20_000) }],
+  completeness: 'partial',
+  conversationCompleteness: 'tool_pending',
+});
+const failedStatusResult = interaction({
+  id: 'mi_v2_status_failed_result',
+  at: base + 20_010,
+  instance: 'host-root:v2:status',
+  conversationId: 'cv_status_contract',
+  request: { input: [toolOutput('status-result', 'status-turn', failedToolId, 'failed')] },
+  toolResults: [{ toolCallId: failedToolId, name: 'exec', content: 'failed', isError: true, observedAtUnixNs: unixNs(base + 20_010) }],
+});
+const unknownToolId = 'call-status-unknown';
+const unknownStatusCall = interaction({
+  id: 'mi_v2_status_unknown_call',
+  at: base + 20_100,
+  instance: 'host-root:v2:status',
+  conversationId: 'cv_status_contract',
+  request: { model: 'fixture-model', input: [human('status-user-2', 'status-turn-2', 'run unknown tool')] },
+  toolCalls: [{ toolCallId: unknownToolId, name: 'exec', arguments: { cmd: 'maybe' }, issuedAtUnixNs: unixNs(base + 20_100) }],
+  completeness: 'partial',
+  conversationCompleteness: 'tool_pending',
+});
+const unknownResult = { toolCallId: unknownToolId, name: 'exec', content: 'opaque', observedAtUnixNs: unixNs(base + 20_110) };
+const unknownStatusResult = interaction({
+  id: 'mi_v2_status_unknown_result',
+  at: base + 20_110,
+  instance: 'host-root:v2:status',
+  conversationId: 'cv_status_contract',
+  request: { input: [toolOutput('status-result-2', 'status-turn-2', unknownToolId, 'opaque')] },
+  toolResults: [unknownResult],
+});
+delete unknownStatusResult.toolResults[0].isError;
+const outOfOrderToolId = 'call-status-out-of-order';
+const outOfOrderResult = interaction({
+  id: 'mi_v2_status_early_result',
+  at: base + 20_190,
+  instance: 'host-root:v2:status',
+  conversationId: 'cv_status_contract',
+  request: { input: [toolOutput('status-result-3', 'status-turn-3', outOfOrderToolId, 'early')] },
+  toolResults: [{ toolCallId: outOfOrderToolId, name: 'exec', content: 'early', isError: false, observedAtUnixNs: unixNs(base + 20_190) }],
+});
+const outOfOrderCall = interaction({
+  id: 'mi_v2_status_late_call',
+  at: base + 20_200,
+  instance: 'host-root:v2:status',
+  conversationId: 'cv_status_contract',
+  request: { model: 'fixture-model', input: [human('status-user-3', 'status-turn-3', 'run late tool')] },
+  toolCalls: [{ toolCallId: outOfOrderToolId, name: 'exec', arguments: { cmd: 'late' }, issuedAtUnixNs: unixNs(base + 20_200) }],
+  completeness: 'partial',
+  conversationCompleteness: 'tool_pending',
+});
+const statusProjection = projectAgentConversations(
+  [failedStatusCall, failedStatusResult, unknownStatusCall, unknownStatusResult, outOfOrderResult, outOfOrderCall],
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+const statusSummary = statusProjection.summaries.find((item) => item.conversationId === 'cv_status_contract');
+assert.ok(statusSummary);
+const statusEvents = projectSemanticConversationTimeline(
+  statusSummary,
+  statusProjection.interactionsByConversation.get('cv_status_contract'),
+  [],
+).flatMap((turn) => turn.events);
+assert.equal(statusEvents.find((event) => event.toolCallId === failedToolId && event.kind === 'tool_call')?.status, 'failed');
+assert.equal(statusEvents.find((event) => event.toolCallId === unknownToolId && event.kind === 'tool_call')?.status, 'unknown');
+assert.equal(statusEvents.find((event) => event.toolCallId === outOfOrderToolId && event.kind === 'tool_call')?.status, 'pending',
+  'a result observed before its ToolCall must not close the later call');
 
 const boundaryProjection = projectAgentConversations(
   [resumed],

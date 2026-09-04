@@ -282,6 +282,24 @@ assert.equal(httpToolRelations[0].status, 'linked_strong');
 assert.equal(toolEvidenceHotPathTesting.semanticKernelEventCategory(httpToolCall), 'network');
 assert.equal(httpToolRelations[0].linkMethod, 'network');
 assert.equal(httpToolRelations[0].kernelEventId, sandboxEgress.eventId);
+const dnsCandidate = {
+  ...sandboxEgress,
+  eventId: 'evt_sandbox_dns',
+  eventKind: 'Dns',
+  subject: 'DNS python-sandbox',
+  attributes: { query: 'python-sandbox.' },
+};
+const dnsRelations = buildSemanticKernelRelations(
+  httpToolCall,
+  toolResult,
+  httpToolInteraction,
+  [dnsCandidate],
+  13,
+  false,
+);
+assert.equal(dnsRelations[0].status, 'linked_strong',
+  'a DNS query name is a valid normalized network candidate for an endpoint ToolCall');
+assert.equal(dnsRelations[0].kernelEventId, dnsCandidate.eventId);
 
 const resolvedServiceEgress = {
   ...sandboxEgress,
@@ -321,6 +339,46 @@ const semanticOnlyHttpRelations = buildSemanticKernelRelations(
 assert.equal(semanticOnlyHttpRelations[0].status, 'linked_strong');
 assert.equal(semanticOnlyHttpRelations[0].linkMethod, 'network_endpoint');
 assert.equal(semanticOnlyHttpRelations[0].kernelEventId, resolvedServiceEgress.eventId);
+assert.equal(semanticOnlyHttpRelations[0].authority, 'authenticated_adapter',
+  'OTLP/application semantic evidence must not be mislabeled as TLS plaintext');
+const placeholderEndpointInteraction = {
+  ...semanticOnlyHttpInteraction,
+  endpoint: 'application://semantic-event',
+};
+const placeholderEndpointCandidate = {
+  ...resolvedServiceEgress,
+  eventId: 'evt_semantic_event_placeholder_host',
+  subject: 'egress → semantic-event:8080',
+  attributes: { host: 'semantic-event', port: 8080 },
+};
+const placeholderEndpointRelations = buildSemanticKernelRelations(
+  httpToolCall,
+  toolResult,
+  placeholderEndpointInteraction,
+  [placeholderEndpointCandidate],
+  13,
+  false,
+);
+assert.equal(placeholderEndpointRelations[0].status, 'semantic_only',
+  'the application:// placeholder must not be treated as a network endpoint');
+assert.equal(placeholderEndpointRelations[0].kernelEventId, undefined,
+  'a same-named Egress cannot satisfy a missing semantic endpoint');
+const sameHostWrongPort = {
+  ...resolvedServiceEgress,
+  eventId: 'evt_same_host_wrong_port',
+  subject: 'egress → python-sandbox:9090',
+  attributes: { host: 'python-sandbox', port: 9090 },
+};
+const sameHostWrongPortRelations = buildSemanticKernelRelations(
+  httpToolCall,
+  toolResult,
+  httpToolInteraction,
+  [sameHostWrongPort],
+  13,
+  false,
+);
+assert.equal(sameHostWrongPortRelations[0].status, 'semantic_only',
+  'an explicit endpoint port must reject a same-host Egress on a different port');
 const ambiguousServiceEndpoint = buildSemanticKernelRelations(
   httpToolCall,
   toolResult,

@@ -1486,43 +1486,49 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  async loadEvidenceLinks(input: { linkIds?: readonly string[]; resolutionRevision?: number; limit?: number } = {}): Promise<EvidenceLink[]> {
+  async loadEvidenceLinks(input: {
+    linkIds?: readonly string[];
+    fromType?: EvidenceLink['fromType'];
+    fromIds?: readonly string[];
+    toType?: EvidenceLink['toType'];
+    toIds?: readonly string[];
+    evidenceRef?: string;
+    resolutionRevision?: number;
+    limit?: number;
+  } = {}): Promise<EvidenceLink[]> {
     if (!(await this.initialize()) || !this.pool) return [];
     const requested = Number(input.limit ?? 1_000);
     const limit = Number.isFinite(requested)
       ? Math.max(1, Math.min(SEMANTIC_RECORD_LIMIT, Math.trunc(requested))) : 1_000;
     try {
       const ids = [...new Set((input.linkIds ?? []).map((value) => String(value).trim()).filter(Boolean))].slice(0, SEMANTIC_RECORD_LIMIT);
+      const fromIds = [...new Set((input.fromIds ?? []).map((value) => String(value).trim()).filter(Boolean))].slice(0, SEMANTIC_RECORD_LIMIT);
+      const toIds = [...new Set((input.toIds ?? []).map((value) => String(value).trim()).filter(Boolean))].slice(0, SEMANTIC_RECORD_LIMIT);
       const requestedRevision = input.resolutionRevision !== undefined
         && Number.isSafeInteger(input.resolutionRevision) && input.resolutionRevision > 0
         ? input.resolutionRevision : undefined;
+      const params: unknown[] = [];
+      const clauses: string[] = [];
+      const bind = (value: unknown): string => {
+        params.push(value);
+        return `$${params.length}`;
+      };
+      if (ids.length) clauses.push(`link_id = ANY(${bind(ids)}::text[])`);
+      if (input.fromType) clauses.push(`from_type = ${bind(input.fromType)}`);
+      if (fromIds.length) clauses.push(`from_id = ANY(${bind(fromIds)}::text[])`);
+      if (input.toType) clauses.push(`to_type = ${bind(input.toType)}`);
+      if (toIds.length) clauses.push(`to_id = ANY(${bind(toIds)}::text[])`);
+      const evidenceRef = typeof input.evidenceRef === 'string' ? input.evidenceRef.trim().slice(0, 512) : '';
+      if (evidenceRef) clauses.push(`record->'evidenceRefs' ? ${bind(evidenceRef)}`);
+      if (requestedRevision !== undefined) clauses.push(`resolution_revision = ${bind(requestedRevision)}`);
+      const limitBind = bind(limit);
       const result = await this.pool.query<{ record: EvidenceLink | string }>(
-        ids.length && requestedRevision !== undefined
-          ? `SELECT record
-               FROM anysentry_evidence_links_v1
-              WHERE link_id = ANY($1::text[]) AND resolution_revision = $2
-              ORDER BY link_id
-              LIMIT $3`
-          : ids.length
-            ? `SELECT record
-                 FROM anysentry_evidence_links_v1
-                WHERE link_id = ANY($1::text[])
-                ORDER BY link_id, resolution_revision DESC
-                LIMIT $2`
-            : requestedRevision !== undefined
-              ? `SELECT record
-                   FROM anysentry_evidence_links_v1
-                  WHERE resolution_revision = $1
-                  ORDER BY valid_from DESC, link_id
-                  LIMIT $2`
-              : `SELECT record
-                   FROM anysentry_evidence_links_v1
-                  ORDER BY valid_from DESC, link_id, resolution_revision DESC
-                  LIMIT $1`,
-        ids.length && requestedRevision !== undefined
-          ? [ids, requestedRevision, limit]
-          : ids.length ? [ids, limit]
-            : requestedRevision !== undefined ? [requestedRevision, limit] : [limit],
+        `SELECT record
+           FROM anysentry_evidence_links_v1
+          ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
+          ORDER BY valid_from DESC, link_id, resolution_revision DESC
+          LIMIT ${limitBind}`,
+        params,
       );
       return result.rows
         .flatMap(({ record }) => {

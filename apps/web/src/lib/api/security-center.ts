@@ -1056,7 +1056,7 @@ export interface AgentInteractionToolResult {
   toolCallId: string;
   name?: string;
   content: unknown;
-  isError: boolean;
+  isError?: boolean;
   observedAtUnixNs?: string;
 }
 export type AgentInteractionSemanticActor = "user" | "model" | "tool";
@@ -1558,7 +1558,7 @@ export interface AgentSemanticKernelRelation {
   competingKernelEventIds?: string[];
   timeQuality?: "exact" | "bounded";
   confidence: number;
-  authority: "attested_tls_plaintext";
+  authority: "attested_tls_plaintext" | "authenticated_adapter" | "inferred";
   relationVersion: 1 | 2 | 3;
   resolutionRevision: number;
   evidenceLinkId?: string;
@@ -1587,6 +1587,8 @@ export interface AgentSemanticEvidenceResponse extends ClassifiedResponseMeta {
   kernelEvents: AgentEventListItem[];
   relationStatus: AgentSemanticKernelRelationStatus;
   evidenceBundleEventIds: string[];
+  canonicalEvidenceLinks?: CanonicalEvidenceLink[];
+  canonicalEvidenceLinksSource?: "canonical_store" | "computed_compatibility";
   coverage: QueryCoverage;
   updateTime: string;
 }
@@ -1599,6 +1601,8 @@ export interface AgentKernelSemanticContextResponse {
     turnId: string;
     semanticEventId: string;
   }>;
+  canonicalEvidenceLinks?: CanonicalEvidenceLink[];
+  canonicalEvidenceLinksSource?: "canonical_store" | "computed_compatibility";
   updateTime: string;
 }
 

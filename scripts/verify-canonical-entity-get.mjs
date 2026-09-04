@@ -126,6 +126,21 @@ const line = JSON.stringify({
     },
   },
 });
+const kernelLine = JSON.stringify({
+  eventAtUnixNs: unixNs(at + 5),
+  receivedAtUnixNs: unixNs(at + 6),
+  identity: { agent: 'codex', task: runId },
+  process: processInfo,
+  event: {
+    ToolExec: {
+      pid: processInfo.pid,
+      ppid: processInfo.ppid,
+      uid: 1000,
+      cwd: workspacePath,
+      argv: ['bash', '-lc', 'printf synthetic'],
+    },
+  },
+});
 
 let source;
 try {
@@ -234,10 +249,36 @@ try {
         rootStartTime: processInfo.startTimeTicks,
         evidence: [`fixture:${runId}`],
       },
+    }, {
+      line: kernelLine,
+      sourceId: source.source.sourceId,
+      token: source.token,
+      collectorId,
+      sourceType: 'observer',
+      sourceEventId: `${runId}-kernel-event`,
+      workspacePath,
+      classificationSemantics: {
+        schemaVersion: 'anysentry.classification_semantics.v1',
+        identityClassification: 'probable_agent',
+        workloadRole: 'agent',
+        captureProfile: 'probable_investigation',
+      },
+      attribution: {
+        monitored: true,
+        classification: 'probable_agent',
+        confidence: 0.85,
+        reason: 'hint_only',
+        source: 'process_signature',
+        agentScopeId: 'codex',
+        agentInstanceId: runtimeId,
+        rootPid: processInfo.pid,
+        rootStartTime: processInfo.startTimeTicks,
+        evidence: [`fixture:${runId}`],
+      },
     }],
   }, source.token, { auth: 'source' });
   assert.equal(ingest.response.status, 201, `ingest -> ${ingest.response.status}`);
-  assert.equal(ingest.payload?.acceptedEvents, 1, JSON.stringify(ingest.payload));
+  assert.equal(ingest.payload?.acceptedEvents, 2, JSON.stringify(ingest.payload));
 
   const get = async (path) => {
     const result = await request(path);
@@ -314,17 +355,35 @@ try {
     assert.equal(timelineEvidence.coverage.status, 'partial');
   }
   assert(timelineEvidence.evidence || timelineEvidence.coverage.status !== 'complete', 'timeline semantic evidence missing');
+  // The ingest-triggered relation projector is intentionally settled asynchronously. Poll the
+  // bounded canonical side lane so this fixture proves a real semantic→Kernel EvidenceLink, not
+  // merely a read-time compatibility decoration.
+  let linkedCanonical = undefined;
+  for (let attempt = 0; attempt < 30 && !linkedCanonical; attempt += 1) {
+    const links = await get('/v1/evidence-links?limit=500');
+    linkedCanonical = links.items.find((link) =>
+      link.evidenceRefs?.includes(toolEvent.semanticEventId)
+      && !String(link.toId).startsWith('unmatched:')
+      && ['confirmed', 'strong'].includes(link.status));
+    if (!linkedCanonical) await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  assert(linkedCanonical, 'canonical EvidenceLink for the linked ToolCall was not materialized');
+  assert.equal(timelineEvidence.evidence?.canonicalEvidenceLinksSource ?? 'computed_compatibility', 'canonical_store');
+  assert(timelineEvidence.evidence?.canonicalEvidenceLinks?.some((link) => link.linkId === linkedCanonical.linkId),
+    'semantic evidence response must expose the materialized canonical link');
   const durableEvidence = await get(`/v1/semantic-events/${encodeURIComponent(durableToolRecord.semanticRecordId)}/evidence`);
   assert.equal(durableEvidence.requestedSemanticEventId, durableToolRecord.semanticRecordId);
   assert.equal(durableEvidence.resolvedSemanticEventId, toolEvent.semanticEventId);
   assert.equal(durableEvidence.aliasOf, durableToolRecord.semanticRecordId);
-  const kernelFacts = await get('/v1/kernel-facts?limit=1');
-  const kernelFact = kernelFacts.items?.[0];
-  if (kernelFact?.factId) {
-    const kernelContext = await get(`/v1/kernel-facts/${encodeURIComponent(kernelFact.factId)}/context`);
-    assert(kernelContext.coverage, 'KernelFact context must expose coverage metadata');
-    assert(kernelContext.context?.eventId, 'KernelFact context must retain the fact event identity');
-  }
+  const kernelFacts = await get('/v1/kernel-facts?limit=500');
+  const kernelFact = kernelFacts.items?.find((item) =>
+    item.factId === linkedCanonical.toId || item.eventId === linkedCanonical.toId);
+  assert(kernelFact?.factId, 'linked canonical EvidenceLink target KernelFact was not readable');
+  const kernelContext = await get(`/v1/kernel-facts/${encodeURIComponent(kernelFact.factId)}/context`);
+  assert(kernelContext.coverage, 'KernelFact context must expose coverage metadata');
+  assert(kernelContext.context?.eventId, 'KernelFact context must retain the fact event identity');
+  assert(kernelContext.context.canonicalEvidenceLinks?.some((link) => link.linkId === linkedCanonical.linkId),
+    'KernelFact context must expose the reverse canonical EvidenceLink');
   const expiredTimelineEvidence = await get('/v1/semantic-events/se_000000000000000000000000/evidence');
   assert.equal(expiredTimelineEvidence.relationStatus, 'coverage_gap');
   assert.equal(expiredTimelineEvidence.coverage.status, 'partial');

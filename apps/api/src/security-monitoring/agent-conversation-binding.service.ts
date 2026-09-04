@@ -125,6 +125,11 @@ const MESSAGE_EVENT_KINDS = new Set([
   'usermessage', 'userinput', 'humanmessage', 'inputmessage',
   'modelmessage', 'assistantmessage', 'assistantoutput', 'finalresponse',
 ]);
+const TECHNICAL_EVENT_KINDS = new Set([
+  'runtimeevent', 'runtime_event', 'processexit', 'process_exit', 'processfork', 'process_fork',
+  'fileaccess', 'file_access', 'filedelete', 'file_delete', 'egress', 'dns', 'tls', 'sslcontent',
+  'securityaction', 'security_action', 'systemcontext', 'system_context', 'connection', 'network',
+]);
 const SEMANTIC_CONTENT_ATTRIBUTE_KEYS = [
   'anysentry.content',
   'gen_ai.prompt',
@@ -156,6 +161,7 @@ export function trafficRoleForEvent(event: Pick<
   | 'turnId'
   | 'sessionKey'
   | 'sessionIdentityQuality'
+  | 'sessionIdSource'
   | 'canonicalSessionId'
 >): ConversationMembershipRole {
   const attributes = event.attributes ?? {};
@@ -189,6 +195,7 @@ export function trafficRoleForEvent(event: Pick<
   const bootstrapPattern = /bootstrap|system[_ -]?context|developer[_ -]?context/u;
   const metadataPattern = /title|summar(?:y|ize)|derived[_ -]?metadata/u;
   const retryPattern = /(?:^|[/:._-])retry(?:$|[/:._-])/u;
+  const backgroundPattern = /(?:^|[/:._-])(?:heartbeat|healthcheck|telemetry|metrics?|poll)(?:$|[/:._-])/u;
 
   // Healthcheck/heartbeat events stay technical and never enter the human lane.  A genuine
   // ToolExec remains the sole automatic `tool_backend` mapping (unless an explicit role override
@@ -201,6 +208,7 @@ export function trafficRoleForEvent(event: Pick<
   // LlmApi kind.
   if (bootstrapPattern.test(operation)) return 'bootstrap';
   if (controlPattern.test(operation)) return 'control';
+  if (backgroundPattern.test(operation)) return 'background';
   if (metadataPattern.test(operation)) return 'derived_metadata';
   if (retryPattern.test(operation)) return 'retry';
 
@@ -234,8 +242,8 @@ export function trafficRoleForEvent(event: Pick<
       && (event.runIdSource === 'producer' || event.runIdSource === undefined);
     const hasCanonicalAnchor = hasProducerRun
       || event.turnId
-      || event.canonicalSessionId
       || event.sessionKey
+      || ['provider', 'authenticated_adapter'].includes(event.sessionIdSource ?? '')
       || ['confirmed', 'strong'].includes(event.sessionIdentityQuality ?? '');
     return hasSemanticContent || hasCanonicalAnchor
       ? 'conversation' : 'background';
@@ -246,6 +254,8 @@ export function trafficRoleForEvent(event: Pick<
   if (MESSAGE_EVENT_KINDS.has(compactKind)) {
     return 'conversation';
   }
+
+  if (TECHNICAL_EVENT_KINDS.has(compactKind)) return 'background';
 
   // Unknown event kinds and pre-canonical rows retain the historical conversation fallback.  They
   // remain queryable until a producer declares a more precise role; no evidence is dropped.

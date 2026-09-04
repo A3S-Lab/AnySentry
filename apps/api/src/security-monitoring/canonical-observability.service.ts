@@ -54,7 +54,16 @@ export interface CanonicalRawObservationSink {
   saveCoverageGaps?(gaps: readonly CoverageGap[]): Promise<boolean>;
   loadCoverageGaps?(input?: { limit?: number }): Promise<CoverageGap[]>;
   saveEvidenceLinks?(links: readonly EvidenceLink[]): Promise<boolean>;
-  loadEvidenceLinks?(input?: { linkIds?: readonly string[]; resolutionRevision?: number; limit?: number }): Promise<EvidenceLink[]>;
+  loadEvidenceLinks?(input?: {
+    linkIds?: readonly string[];
+    fromType?: EvidenceLink['fromType'];
+    fromIds?: readonly string[];
+    toType?: EvidenceLink['toType'];
+    toIds?: readonly string[];
+    evidenceRef?: string;
+    resolutionRevision?: number;
+    limit?: number;
+  }): Promise<EvidenceLink[]>;
   saveSessionMemberships?(memberships: readonly SessionMembership[]): Promise<boolean>;
   loadSessionMemberships?(input?: { membershipIds?: readonly string[]; resolutionRevision?: number; limit?: number }): Promise<SessionMembership[]>;
 }
@@ -827,6 +836,102 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
         : left.validFromUnixNs > right.validFromUnixNs ? -1 : 1)
       .slice(0, bounded)
       .map((link) => structuredClone(link));
+  }
+
+  /**
+   * Bounded reverse/forward EvidenceLink lookup used by deep-link readers.  The canonical link
+   * store is append-only; callers must never scan an unbounded relational table or silently turn a
+   * sink outage into an empty successful result.  The hot ring is retained as a compatibility
+   * fallback and the returned rows are still contract-validated before exposure.
+   */
+  private async listDurableEvidenceLinksMatching(
+    input: Parameters<NonNullable<CanonicalRawObservationSink['loadEvidenceLinks']>>[0],
+    matches: (link: EvidenceLink) => boolean,
+    limit = 128,
+  ): Promise<EvidenceLink[]> {
+    const requested = Number(limit);
+    const bounded = Number.isFinite(requested) ? Math.max(1, Math.min(2_000, Math.trunc(requested))) : 128;
+    const durable = this.sink?.loadEvidenceLinks
+      ? (await this.sink.loadEvidenceLinks({ ...input, limit: bounded }).catch(() => []))
+          .flatMap((candidate) => {
+            const safe = safeDurableEvidenceLink(candidate);
+            return safe && matches(safe) ? [safe] : [];
+          })
+      : [];
+    const hot = this.evidence.list(Math.min(10_000, Math.max(bounded * 4, bounded)))
+      .filter(matches);
+    const merged = this.mergeDurableFirst(
+      durable,
+      hot,
+      (link) => `${link.linkId}\0${link.resolutionRevision}`,
+    );
+    // Forward readers use the current effective revision for each logical edge. Historical
+    // revisions remain available through the explicit link endpoint with `resolutionRevision`.
+    const latestByLink = new Map<string, EvidenceLink>();
+    for (const link of merged) {
+      const previous = latestByLink.get(link.linkId);
+      if (!previous || link.resolutionRevision > previous.resolutionRevision) latestByLink.set(link.linkId, link);
+    }
+    return [...latestByLink.values()]
+      .sort((left, right) => left.validFromUnixNs === right.validFromUnixNs
+        ? right.resolutionRevision - left.resolutionRevision || left.linkId.localeCompare(right.linkId)
+        : left.validFromUnixNs > right.validFromUnixNs ? -1 : 1)
+      .slice(0, bounded)
+      .map((link) => structuredClone(link));
+  }
+
+  async listDurableEvidenceLinksByEvidenceRef(
+    evidenceRef: string,
+    limit = 128,
+  ): Promise<EvidenceLink[]> {
+    const ref = boundedText(evidenceRef, 512);
+    if (!ref) return [];
+    return this.listDurableEvidenceLinksMatching(
+      { evidenceRef: ref },
+      (link) => link.evidenceRefs.includes(ref),
+      limit,
+    );
+  }
+
+  async listDurableEvidenceLinksForTarget(
+    toType: EvidenceLink['toType'],
+    toId: string,
+    limit = 128,
+  ): Promise<EvidenceLink[]> {
+    const id = boundedText(toId, 512);
+    if (!id) return [];
+    return this.listDurableEvidenceLinksMatching(
+      { toType, toIds: [id] },
+      (link) => link.toType === toType && link.toId === id,
+      limit,
+    );
+  }
+
+  async listDurableEvidenceLinksForTargetId(
+    toId: string,
+    limit = 128,
+  ): Promise<EvidenceLink[]> {
+    const id = boundedText(toId, 512);
+    if (!id) return [];
+    return this.listDurableEvidenceLinksMatching(
+      { toIds: [id] },
+      (link) => link.toId === id,
+      limit,
+    );
+  }
+
+  async listDurableEvidenceLinksForSource(
+    fromType: EvidenceLink['fromType'],
+    fromId: string,
+    limit = 128,
+  ): Promise<EvidenceLink[]> {
+    const id = boundedText(fromId, 512);
+    if (!id) return [];
+    return this.listDurableEvidenceLinksMatching(
+      { fromType, fromIds: [id] },
+      (link) => link.fromType === fromType && link.fromId === id,
+      limit,
+    );
   }
 
   async getDurableEvidenceLink(linkId: string, resolutionRevision?: number): Promise<EvidenceLink | undefined> {

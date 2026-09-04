@@ -553,18 +553,82 @@ function firstPromptPreview(record: T.AgentInteractionRecord): string | undefine
 function resolvedToolResultIds(
   interactions: T.AgentInteractionRecord[],
 ): Set<string> {
-  return new Set(interactions.flatMap((item) =>
-    item.toolResults.map((result) => result.toolCallId)));
+  const callAt = new Map<string, bigint>();
+  for (const interaction of interactions) {
+    let interactionAt: bigint | undefined;
+    try { interactionAt = BigInt(interaction.startedAtUnixNs); } catch { /* keep unknown */ }
+    for (const call of interaction.toolCalls) {
+      let at = interactionAt;
+      try {
+        if (call.issuedAtUnixNs) at = BigInt(call.issuedAtUnixNs);
+      } catch { /* use interaction boundary */ }
+      if (at !== undefined && (!callAt.has(call.toolCallId) || at < callAt.get(call.toolCallId)!)) {
+        callAt.set(call.toolCallId, at);
+      }
+    }
+  }
+  const resolved = new Set<string>();
+  for (const interaction of interactions) {
+    for (const result of interaction.toolResults) {
+      const started = callAt.get(result.toolCallId);
+      if (started !== undefined && result.observedAtUnixNs) {
+        try {
+          if (BigInt(result.observedAtUnixNs) < started) continue;
+        } catch {
+          continue;
+        }
+      }
+      resolved.add(result.toolCallId);
+    }
+  }
+  return resolved;
+}
+
+function unknownToolResultIds(
+  interactions: readonly T.AgentInteractionRecord[],
+): Set<string> {
+  return new Set(interactions.flatMap((interaction) =>
+    interaction.toolResults
+      .filter((result) => typeof result.isError !== 'boolean')
+      .map((result) => result.toolCallId)));
+}
+
+function uniqueToolItemCount(
+  interactions: readonly T.AgentInteractionRecord[],
+  kind: 'call' | 'result',
+): number {
+  const ids = new Set<string>();
+  let anonymous = 0;
+  for (const interaction of interactions) {
+    const items = kind === 'call' ? interaction.toolCalls : interaction.toolResults;
+    items.forEach((item, index) => {
+      const id = typeof item.toolCallId === 'string' && item.toolCallId.trim()
+        ? item.toolCallId.trim()
+        : `${interaction.interactionId}:${kind}:${index}`;
+      if (id.startsWith(`${interaction.interactionId}:${kind}:`)) anonymous += 1;
+      else ids.add(id);
+    });
+  }
+  // A lifecycle start/end or context-replay interaction may repeat the same native tool ID.  The
+  // timeline already exposes one semantic ToolCall per ID; summary counters must use that same
+  // identity while retaining anonymous malformed items as separate bounded observations.
+  return ids.size + anonymous;
 }
 
 function effectiveInteractionState(
   interaction: T.AgentInteractionRecord,
   resolvedResults: Set<string>,
+  unknownResults: Set<string> = new Set(),
 ): { complete: boolean; reasons: string[] } {
   const unresolvedToolCall = interaction.toolCalls.some((call) =>
     !resolvedResults.has(call.toolCallId));
   const reasons = interaction.partialReasons.filter((reason) =>
     reason !== 'tool_result_pending' || unresolvedToolCall);
+  const unknownToolResult = interaction.toolCalls.some((call) =>
+    unknownResults.has(call.toolCallId));
+  if (unknownToolResult && !reasons.includes('tool_result_status_unobserved')) {
+    reasons.push('tool_result_status_unobserved');
+  }
   if (unresolvedToolCall && !reasons.includes('tool_result_pending')) {
     reasons.push('tool_result_pending');
   }
@@ -579,8 +643,8 @@ function effectiveInteractionState(
     && interaction.transportCompleteness !== 'partial'
     && (interaction.wireCompleteness === undefined || interaction.wireCompleteness === 'complete');
   return {
-    complete: (interaction.completeness === 'complete' && !unresolvedToolCall)
-      || pendingResolved,
+    complete: !unknownToolResult && ((interaction.completeness === 'complete' && !unresolvedToolCall)
+      || pendingResolved),
     reasons,
   };
 }
@@ -597,7 +661,8 @@ function conversationCoverage(
     };
   }
   const resolvedResults = resolvedToolResultIds(interactions);
-  const states = interactions.map((item) => effectiveInteractionState(item, resolvedResults));
+  const unknownResults = unknownToolResultIds(interactions);
+  const states = interactions.map((item) => effectiveInteractionState(item, resolvedResults, unknownResults));
   const completeInteractions = states.filter((state) => state.complete).length;
   const partialInteractions = interactions.length - completeInteractions;
   const reasons = [...new Set(states.flatMap((state) => state.reasons))];
@@ -757,6 +822,7 @@ function summaryForConversation(
     first.agentProduct ?? asset?.agentProduct ?? asset?.detectedName,
   ) ?? 'Agent';
   const resolvedResults = resolvedToolResultIds(interactions);
+  const unknownResults = unknownToolResultIds(interactions);
   const usage = summarizeAgentUsage(interactions);
   const firstLogical = interactions.find((item) => item.logicalAgentId)?.logicalAgentId;
   const firstCandidate = interactions.find((item) => item.logicalAgentCandidateId)?.logicalAgentCandidateId;
@@ -824,11 +890,11 @@ function summaryForConversation(
     firstPromptPreview: firstPromptPreview(first),
     turnCount: turnIds.size,
     modelCallCount: usage.modelCallCount,
-    toolCallCount: interactions.reduce((sum, item) => sum + item.toolCalls.length, 0),
-    toolResultCount: interactions.reduce((sum, item) => sum + item.toolResults.length, 0),
+    toolCallCount: uniqueToolItemCount(interactions, 'call'),
+    toolResultCount: uniqueToolItemCount(interactions, 'result'),
     errorCount: interactions.filter((item) =>
       item.statusCode >= 400
-      || !effectiveInteractionState(item, resolvedResults).complete).length,
+      || !effectiveInteractionState(item, resolvedResults, unknownResults).complete).length,
     models: [...new Set(interactions
       .map((item) => item.model)
       .filter((value): value is string => Boolean(value)))],
@@ -1087,6 +1153,7 @@ export function projectConversationTimeline(
 ): T.AgentConversationEvent[] {
   const ordered = [...interactions].sort(compareInteraction);
   const resolvedResults = resolvedToolResultIds(ordered);
+  const unknownResults = unknownToolResultIds(ordered);
   const callEventIds = new Map<string, string>();
   for (const interaction of ordered) {
     for (const call of interaction.toolCalls) {
@@ -1098,7 +1165,7 @@ export function projectConversationTimeline(
   const pending: Array<T.AgentConversationEvent & { sortOrder: number }> = [];
   let previous: T.AgentInteractionRecord | undefined;
   for (const interaction of ordered) {
-    const effectiveState = effectiveInteractionState(interaction, resolvedResults);
+    const effectiveState = effectiveInteractionState(interaction, resolvedResults, unknownResults);
     const turnId = interaction.turnId ?? `${conversation.conversationId}:turn:1`;
     const modelCallId = interaction.modelCallId ?? stableId('mc', interaction.interactionId);
     const attemptNumber = (attempts.get(modelCallId) ?? 0) + 1;

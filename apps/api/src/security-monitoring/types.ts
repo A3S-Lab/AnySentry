@@ -3,6 +3,7 @@
 // @a3s-lab/sentry judgments.
 
 import type { TrustedCorrelationV1 } from './trusted-correlation';
+import type { EvidenceLink } from './canonical-observability';
 
 export type {
   AgentInstance,
@@ -1612,7 +1613,9 @@ export interface AgentInteractionToolResult {
   toolCallId: string;
   name?: string;
   content: unknown;
-  isError: boolean;
+  /** Optional because older adapters may emit a result without an error bit; absence is
+   * `unknown`, never an implicit success. */
+  isError?: boolean;
   observedAtUnixNs?: string;
 }
 
@@ -2564,7 +2567,10 @@ export interface AgentSemanticKernelRelation {
   competingToolInvocationIds?: string[];
   timeQuality?: 'exact' | 'bounded';
   confidence: number;
-  authority: 'attested_tls_plaintext';
+  /** Provenance of the semantic lane that selected the relation.  Application/OTLP spans are
+   * authenticated adapter evidence, not TLS plaintext, even when they are correlated with an
+   * Observer KernelFact. */
+  authority: 'attested_tls_plaintext' | 'authenticated_adapter' | 'inferred';
   relationVersion: 1 | 2 | 3;
   /** All equally strong Kernel candidates retained when ownership is ambiguous. */
   competingKernelEventIds?: string[];
@@ -2598,6 +2604,11 @@ export interface AgentSemanticEvidenceResponse extends ClassifiedResponseMeta {
   kernelEvents: AgentEventListItem[];
   relationStatus: AgentSemanticKernelRelationStatus;
   evidenceBundleEventIds: string[];
+  /** Canonical append-only links read directly from the EvidenceLink side lane.  This additive
+   * field keeps semantic→Kernel navigation available when the legacy relation projector is
+   * delayed or unavailable. */
+  canonicalEvidenceLinks?: EvidenceLink[];
+  canonicalEvidenceLinksSource?: 'canonical_store' | 'computed_compatibility';
   coverage: QueryCoverage;
   updateTime: string;
 }
@@ -2616,6 +2627,11 @@ export interface AgentKernelSemanticContextResponse {
     turnId: string;
     semanticEventId: string;
   }>;
+  /** Reverse lookup result from the canonical EvidenceLink store.  Legacy `relations` remains
+   * authoritative when available; links are retained even when that compatibility projection is
+   * missing. */
+  canonicalEvidenceLinks?: EvidenceLink[];
+  canonicalEvidenceLinksSource?: 'canonical_store' | 'computed_compatibility';
   updateTime: string;
 }
 

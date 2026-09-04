@@ -9,6 +9,11 @@ const OPEN_TOOL_WINDOW_MS = 30 * 60_000;
 const SHELL_TOOL_PATTERN = /(?:^|[\s._-])(?:bash|exec|shell)(?:$|[\s._-])/u;
 const FILE_TOOL_PATTERN = /(?:^|[\s._-])(?:read|write|edit|file)(?:$|[\s._-])/u;
 const NETWORK_TOOL_PATTERN = /(?:^|[\s._-])(?:search|http|fetch|network)(?:$|[\s._-])/u;
+// Only an explicitly network-shaped endpoint may correlate a semantic ToolCall with an
+// Observer Egress/DNS/TLS fact.  Compatibility projections use `application://semantic-event`
+// when a span has no endpoint; treating that placeholder as a host would allow an unrelated
+// connection whose name happens to be `semantic-event` to become a false positive.
+const NETWORK_ENDPOINT_PROTOCOLS = new Set(['http:', 'https:', 'ws:', 'wss:', 'grpc:', 'grpcs:', 'tcp:', 'tls:']);
 
 function stableId(prefix: string, value: string): string {
   return prefix + '_' + createHash('sha256').update(value).digest('hex').slice(0, 24);
@@ -141,7 +146,7 @@ function toolHost(event: T.AgentSemanticEvent): string | undefined {
   }
 }
 
-function interactionEndpointHost(interaction: T.AgentInteractionRecord): string | undefined {
+function parsedInteractionEndpoint(interaction: T.AgentInteractionRecord): URL | undefined {
   // Application/OTLP semantic Tool spans are kept in the legacy model lane so the existing
   // conversation timeline remains compatible.  Their explicit `semanticOnly` + ToolCall shape
   // is still a trusted endpoint hint for correlation; ordinary model calls must not enter this
@@ -151,24 +156,22 @@ function interactionEndpointHost(interaction: T.AgentInteractionRecord): string 
   const endpoint = text(interaction.endpoint, 1_000);
   if (!endpoint || endpoint === 'unknown') return undefined;
   try {
-    return new URL(endpoint.includes('://') ? endpoint : `http://${endpoint}`).hostname.toLowerCase();
+    const parsed = new URL(endpoint.includes('://') ? endpoint : `http://${endpoint}`);
+    return NETWORK_ENDPOINT_PROTOCOLS.has(parsed.protocol) ? parsed : undefined;
   } catch {
     return undefined;
   }
 }
 
+function interactionEndpointHost(interaction: T.AgentInteractionRecord): string | undefined {
+  return parsedInteractionEndpoint(interaction)?.hostname.toLowerCase();
+}
+
 function interactionEndpointPort(interaction: T.AgentInteractionRecord): number | undefined {
-  if (interaction.interactionType !== 'tool'
-    && !(interaction.semanticOnly === true && interaction.toolCalls.length > 0)) return undefined;
-  const endpoint = text(interaction.endpoint, 1_000);
-  if (!endpoint || endpoint === 'unknown') return undefined;
-  try {
-    const parsed = new URL(endpoint.includes('://') ? endpoint : `http://${endpoint}`);
-    const port = Number(parsed.port);
-    return Number.isSafeInteger(port) && port > 0 && port <= 65_535 ? port : undefined;
-  } catch {
-    return undefined;
-  }
+  const parsed = parsedInteractionEndpoint(interaction);
+  if (!parsed) return undefined;
+  const port = Number(parsed.port);
+  return Number.isSafeInteger(port) && port > 0 && port <= 65_535 ? port : undefined;
 }
 
 function candidatePort(event: T.AgentEventListItem): number | undefined {
@@ -192,11 +195,15 @@ function candidatePath(event: T.AgentEventListItem): string | undefined {
 }
 
 function candidateHost(event: T.AgentEventListItem): string | undefined {
-  return text(event.attributes.host, 512)?.toLowerCase()
+  const dnsQuery = event.eventKind === 'Dns'
+    ? text(event.attributes.query, 512) ?? text(event.attributes['dns.question.name'], 512)
+    : undefined;
+  return (dnsQuery ?? text(event.attributes.host, 512))?.replace(/\.$/u, '').toLowerCase()
     ?? text(event.attributes.serverAddress, 512)?.toLowerCase()
     ?? text(event.attributes['server.address'], 512)?.toLowerCase()
     ?? text(event.attributes.peer, 512)?.toLowerCase()
     ?? text(event.attributes['network.peer.address'], 512)?.toLowerCase()
+    ?? text(event.attributes.sni, 512)?.replace(/\.$/u, '').toLowerCase()
     ?? text(event.attributes.hostname, 512)?.toLowerCase();
 }
 
@@ -417,6 +424,17 @@ function risk(event: T.AgentEventListItem): NonNullable<T.AgentSemanticKernelRel
   };
 }
 
+function semanticRelationAuthority(
+  interaction: T.AgentInteractionRecord,
+): T.AgentSemanticKernelRelation['authority'] {
+  if (interaction.semanticOnly === true
+    || interaction.captureSource === 'authenticated_application_event'
+    || interaction.protocol === 'application-semantic') {
+    return 'authenticated_adapter';
+  }
+  return 'attested_tls_plaintext';
+}
+
 export function toolInvocationId(
   event: T.AgentSemanticEvent,
   interaction: T.AgentInteractionRecord,
@@ -484,7 +502,14 @@ function potentialRelation(
   }
   if (!linkMethod && host && ['Egress', 'Dns', 'Tls'].includes(candidate.eventKind)) {
     const observed = candidateHost(candidate);
-    if (observed && (observed === host || observed.endsWith('.' + host) || host.endsWith('.' + observed))) {
+    const hostMatches = Boolean(observed && (observed === host || observed.endsWith('.' + host) || host.endsWith('.' + observed)));
+    // A logical endpoint with an explicit port must not claim a same-host connection on a
+    // different port.  ClusterIP/service-name differences may still use the bounded
+    // endpoint-port fallback below when the host itself is not equal.
+    const portMatches = endpointPort === undefined
+      || candidate.eventKind !== 'Egress'
+      || candidatePort(candidate) === endpointPort;
+    if (hostMatches && portMatches) {
       linkMethod = 'network';
       confidence = 0.98;
     }
@@ -564,7 +589,7 @@ function potentialRelation(
     lineageMethod: runtimeLink,
     timeQuality: result ? 'exact' : 'bounded',
     confidence,
-    authority: 'attested_tls_plaintext',
+    authority: semanticRelationAuthority(input.interaction),
     relationVersion: AGENT_SEMANTIC_KERNEL_RELATION_VERSION,
     resolutionRevision,
     evidenceLinkId: canonicalLink.linkId,
@@ -606,7 +631,7 @@ function unlinkedRelation(
     toolInvocationId: invocationId,
     status: coveragePartial ? 'coverage_gap' : 'semantic_only',
     confidence: 0,
-    authority: 'attested_tls_plaintext',
+    authority: semanticRelationAuthority(input.interaction),
     relationVersion: AGENT_SEMANTIC_KERNEL_RELATION_VERSION,
     resolutionRevision,
     evidenceLinkId: canonicalLink.linkId,
@@ -654,7 +679,9 @@ function canonicalLinkForRelation(
     evidenceRefs: [...(relation.sourceRefs ?? []), ...competingRefs],
     algorithmVersion: relation.algorithmVersion ?? `semantic-kernel-relation.v${AGENT_SEMANTIC_KERNEL_RELATION_VERSION}`,
     status,
-    validFromUnixNs: relation.validFromUnixNs ?? '1',
+    // Keep the canonical timestamp contract valid even for old relation rows that predate
+    // `validFromUnixNs`; the epoch fallback is explicit coverage metadata, not event time.
+    validFromUnixNs: relation.validFromUnixNs ?? '1000000000',
     resolutionRevision: relation.relationRevision ?? relation.resolutionRevision,
   });
 }
@@ -692,7 +719,7 @@ export function canonicalEvidenceLinkForRelation(
     evidenceRefs: [...(relation.sourceRefs ?? []), relation.stableSemanticEventId],
     algorithmVersion: relation.algorithmVersion ?? `semantic-kernel-relation.v${relation.relationVersion}`,
     status,
-    validFromUnixNs: relation.validFromUnixNs ?? '1',
+    validFromUnixNs: relation.validFromUnixNs ?? '1000000000',
     resolutionRevision: relation.relationRevision ?? relation.resolutionRevision,
   });
 }

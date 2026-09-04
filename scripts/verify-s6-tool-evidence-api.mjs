@@ -597,12 +597,14 @@ for (const item of otlpIngest.items) {
         timeType: 'custom',
         startTime: new Date(otlpStart - 2_000).toISOString(),
         endTime: new Date(otlpEnd + 2_000).toISOString(),
+        scope: 'raw',
         eventId: item.eventId,
         durable: false,
         includeUnknown: true,
         limit: 1,
       });
-  if (event.items?.[0]) otlpEventRecords.push(event.items[0]);
+  const eventRecord = item.eventId === otlpIngest.items[1].eventId ? event : event.items?.[0];
+  if (eventRecord) otlpEventRecords.push(eventRecord);
 }
 assert.equal(otlpEventRecords.length, otlpIngest.items.length, 'every OTLP span must be readable by its event id');
 assert(otlpEventRecords.every((item) => typeof item.sessionId === 'string' && item.sessionId.length > 0),

@@ -938,6 +938,28 @@ export default function AgentEventsPage() {
                       ))}
                     </div>
                   </div>
+                ) : semanticContext?.canonicalEvidenceLinks?.length ? (
+                  <div className="rounded border border-amber-400/15 bg-amber-500/[0.04] p-3">
+                    <p className="text-[10px] uppercase tracking-[0.08em] text-zinc-600">Canonical EvidenceLink（兼容关系投影尚未就绪）</p>
+                    <div className="mt-2 space-y-2">
+                      {semanticContext.canonicalEvidenceLinks.map((link) => {
+                        const eventRef = link.evidenceRefs.find((ref) => /^evt_[a-z0-9_-]+$/u.test(ref));
+                        const semanticRef = link.evidenceRefs.find((ref) => /^se_[a-f0-9]{24}$/u.test(ref));
+                        const href = eventRef
+                          ? `/events?${new URLSearchParams({ timeType, eventId: eventRef }).toString()}`
+                          : semanticRef
+                            ? `/conversations?${new URLSearchParams({ timeType, semanticEventId: semanticRef }).toString()}`
+                            : undefined;
+                        return (
+                          <div key={`${link.linkId}:${link.resolutionRevision}`} className="flex flex-wrap items-center gap-2 text-xs">
+                            <span className="font-mono text-amber-100/80">{link.status} · {link.method}</span>
+                            {href ? <Link to={href} className="font-medium text-violet-200 hover:text-violet-100">打开证据目标</Link> : null}
+                            <span className="min-w-0 break-all font-mono text-[10px] text-zinc-600">{link.linkId} → {link.toId}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
                 ) : null}
               </div>
             </section>
