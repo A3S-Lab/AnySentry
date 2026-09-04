@@ -3132,11 +3132,16 @@ export class AggregationService implements OnModuleDestroy {
     const exactMembershipIds = membershipSelection?.interactionIds.length
       ? membershipSelection.interactionIds
       : undefined;
+    // Canonical/deep-link reads may explicitly request the raw compatibility lane so that an
+    // unknown/candidate physical asset can still be resolved and shown with a CoverageGap. The
+    // ordinary Agent dashboard keeps its historical `agent` scope and therefore does not widen
+    // visibility to unrelated traffic.
+    const projectionScope: T.AgentConversationQuery['scope'] = filter.scope === 'raw' ? 'raw' : 'agent';
     const interactionQuery: T.AgentInteractionQuery = {
       timeType: filter.timeType,
       startTime: filter.startTime,
       endTime: filter.endTime,
-      scope: 'agent',
+      scope: projectionScope,
       classificationView: filter.classificationView,
       agentAssetId: resolveConversationId ? undefined : filter.agentAssetId,
       agentInstanceId: resolveConversationId ? undefined : filter.agentInstanceId,
@@ -3147,7 +3152,7 @@ export class AggregationService implements OnModuleDestroy {
       timeType: filter.timeType,
       startTime: filter.startTime,
       endTime: filter.endTime,
-      scope: 'agent',
+      scope: projectionScope,
       classificationView: filter.classificationView,
       agentAssetId: resolveConversationId ? undefined : filter.agentAssetId,
       agentInstanceId: resolveConversationId ? undefined : filter.agentInstanceId,
