@@ -17,6 +17,12 @@
 > 发布状态：完成新基线回归后重新构建带源码 revision 的正式镜像；旧分叉工作树构建的
 > 本地镜像不属于本设计的发布产物
 
+> **现场复核增补（2026-09-05）**：Canonical KernelFact point read 先查 PostgreSQL，再查
+> `kernel_fact_locators_v1`（仅由未来事件的 Materialized View 写入），最后才做有界兼容
+> 扫描；启动期不对历史 `events` 表执行 `MATERIALIZE`。耐久侧不可用时必须返回 partial/
+> coverage gap，不能把 404 或空列表当作事实不存在。候选采样默认等同 confirmed，TLS
+> Attach 仍按实现族/ABI capability 选择；下文较早的版本专用示例仅是运行验证样本。
+
 > **当前决策增补（2026-09-04）**：`probable_agent` 是发现状态，不是低保真采集等级。
 > 默认 capture/judgment 使用与 `confirmed_agent` 相同的完整矩阵，并保留 observed
 > classification/provenance；不需要人工调用“候选升级”才能采集。只有显式设置

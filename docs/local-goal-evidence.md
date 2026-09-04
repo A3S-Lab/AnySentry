@@ -1,11 +1,11 @@
 # 本地 Canonical Observability Goal QA 证据
 
-记录日期：2026-09-04（Asia/Shanghai）
+记录日期：2026-09-05（Asia/Shanghai）
 记录性质：本地只读基线与 QA 门禁，不是发布说明，也不把历史设计文档中的运行声明重新计为本轮实测。
 
 ## 结论
 
-截至 2026-09-04 的复核，Goal 仍是 **部分完成，不能报告完成**。本地代码、合同、回放和若干受控运行已经通过；新一轮补充了 `tender_jang` 中的产品运行时、LangGraph k3s `/runs` 真实调用以及耐久 API 查询证据。当前 SSH Codex 在 2026-09-03 16:14–16:22Z durable custom window 的初始快照有 60 条可解析 `LlmInteraction`（model 56、tool 4），后续异步 durable 重查可到 model 57、tool 4；身份/Session 未达到 authenticated/confirmed，且两条 Rustls plaintext evidence 只有 metadata-only。`agents/interactions` 还显示 4 个 tool 均 parsed/complete，但 conversation complete 仅 2、tool_pending 55，选定 Tool 的 EvidenceLink inspector 返回 404；两条证据 lane 尚未全部统一。既有旧镜像、未部署的 canonical GET、权限/采集和丢失计数缺口仍直接阻止 Definition of Done。
+截至 2026-09-05 的复核，Goal 仍是 **部分完成，不能报告完成**。当前 API/Web r27 已用本地 immutable digest 部署，Canonical GET 已补齐有界超时、hot fallback 和 forward-only KernelFact locator；Host/tender CLI、LangChain 服务和 k3s LangGraph sandbox 均有脱敏运行证据。Observer 为保护约 4.23 GB WAL 和接近 2 GiB cgroup 上限被可逆暂停，当前 SSH Codex 的 Rustls/WebSocket 正文、LangGraph/Dify Tool→Kernel 双向 EvidenceLink、正式 UI 深链和持续零丢失仍未通过。下文历史快照保留用于追溯，不能覆盖最新附录。
 
 - AnySentry/Observer 构建、类型、单元/回放和 BPF object load smoke 仍通过；这不等于当前头 Observer 已在目标 workload 上完成独占 attach、转发和持久部署。
 - 临时 k3s API/Web OCI overlay `anysentry:goal-current-oci-20260904` 已构建成功并通过本机 registry manifest GET 200（digest 前缀 `043180…`）；namespace `anysentry-goal-oci-web-20260904` 以 Secret/no-hostPath 完成 health、`/v1/observability/contracts`、representative replay 13/4 families/0 gap、S6、S2 shadow 后已清理。基座仍是旧 runtime + current dist overlay，非原始 Dockerfile 全链；Observer scripts overlay 也已构建并推入本机 registry（digest 前缀 `7d3b…`），但 existing formal deployment 未切换。
@@ -17,7 +17,7 @@
 - 旧快照中的 formal digest/Canonical GET 缺口已在本轮 post-rollout 节更新；Forwarder WAL/数据库
   timeout、static signature warnings、普通 SSH 用户无 eBPF 能力和统一 EvidenceLink 仍是 DoD/运行风险缺口。
 
-## 2026-09-04 本轮代码交付与正式本地 rollout（优先于下方历史快照）
+## 2026-09-04 前一轮代码交付与正式本地 rollout（历史快照）
 
 ### 已确认事实
 
@@ -377,3 +377,43 @@ node scripts/verify-canonical-goal.mjs --json-out /tmp/anysentry-canonical-goal.
 - 在无并发构建/编辑窗口持续重跑 `verify-agent-asset-model`，并保留 canonical identity 与 legacy alias 的回放差异；
 - 在无磁盘饱和环境重跑 `verify:filter-pipeline` 与 `verify:forwarder-durability`；
 - Kimi/Z.ai/Pi 与 Kafka/Flink 时间窗支路仍是后续扩展，不构成本阶段四类代表对象通过条件，也不作为当前主链前置依赖。
+
+## 2026-09-05 续回合现场记录（优先于历史段落）
+
+本节记录日期切换后的实际本地状态。所有版本/地址/计数均为脱敏元数据；没有把凭据、
+Authorization、Cookie、完整 Prompt 或生产正文写入仓库。
+
+### 已确认事实
+
+| 范围 | 结果 | 结论边界 |
+| --- | --- | --- |
+| 当前代码与镜像 | AnySentry `e96160c`（Canonical bounded GET + forward-only KernelFact locator）；Observer `40556f5`；API/Web `sha256:8c8d407a7a585eb5100629223d3664cb8eb238093dd1f8fcb027df586d9ca20a`；Observer r7 `sha256:45af6fa26c2c9e71aeec744edf1b3069362cef60f5fba33428429187a1fddbda` | 均为本地 checkpoint/loopback registry；未 push 或远程发布 |
+| 正式 API/NodePort | API Pod `anysentry-bc77d7f4f-nkxcc` Ready 1/1、restart0；同一镜像提供 Web；NodePort patch `selector.app=anysentry` 后 `/security-center/livez` 连续 200 | 不存在独立 current-head Web Deployment是设计边界；直接 apply 核心 ClusterIP 清单会暂时移除 NodePort，必须叠加 local-path patch |
+| Canonical GET 修复 | Raw/Kernel/Semantic/Evidence/SessionMembership list/detail 都有限制与 timeout；降级回 hot store 时返回 partial/dataSource；Session timeline/Kernel context 有空投影 fallback | 低负载隔离 entity/deep-link/query-bound verifiers 全通过；高负载现场仍可能返回 503/partial，不能写成 complete |
+| KernelFact locator | ClickHouse 正式表/MV 已创建，没有历史 mutation；一条合成 ToolExec 生成 `kf_9cfa…` locator，PG 与 MV 各有 1 行，detail 200 | 新数据 point read 不扫描 events；旧 LangGraph `kf_022…` 无历史 locator/PG row，在大表扫描超时则保留 503/coverage gap |
+| 清单/服务回归 | API 主 Deployment 固化本地 digest；fast-judge/l3-worker 恢复原本 `sha256:2a7e0c6c…`；NodePort patch 补 selector；deployment verifier 通过 | 只滚动有代码变更的 API；无代码服务保持旧镜像与 Ready 状态 |
+| a3s-test 宿主与 tender | Host Codex `a3s-test-1875658-1`、Host Claude `a3s-test-1878354-1`、tender Codex `a3s-test-1605080-1`、tender Claude `a3s-test-1606611-1` 均 PASS；host fixture 改为绝对仓库路径 | 证明 CLI 请求—ToolCall—ToolResult—final 产品级闭环；浏览器 driver 仍因 `a3s use` 不存在而未执行 |
+| tender LangChain | `/health=200`；bounded `/invoke=200`、一次 `lookup_fixture` 工具闭环、结果 marker 存在 | 常驻服务修复/证书轮换后的功能通过；Observer 暂停期间不计作最新被动采集 |
+| k3s LangGraph sandbox | 既有真实 Run completed、telemetry15/15、sandbox 两次 exit0；Observer 同窗捕获 ToolExec2/ProcessExit2 | sandbox 内核采集通过；语义 Tool→Kernel EvidenceLink 仍 semantic_only/partial |
+| Observer/WAL | collector/forwarder 精确 PID 可逆 SIGSTOP；WAL约4.23GB，cgroup约2.138/2.147GiB，OOM kill=0但 critical drop 存在 | 保护性暂停不是稳定性通过；未清理或删除 WAL |
+| k3s 稳定性 | k3s node Ready、压力条件 false、API readyz ok；共享磁盘、ClickHouse大表、旧 `a3s-registry` CrashLoop/迁移缺失是外部放大因素 | 已修复 AnySentry 清单 image pin/NodePort selector/查询放大；无关旧 namespace 未擅自变更 |
+
+### 权限与运行时解释
+
+普通 SSH/Codex `CapEff=0`、`unprivileged_bpf_disabled=2` 表示它不能自行加载 eBPF；特权
+`hostPID` Observer Pod 才能看到宿主 PID、加载 probe 并按 cgroup/process generation
+隔离。即使 Observer 有权限，TLS implementation/route/sequence 不满足也只保留 Kernel
+candidate 和 CoverageGap。所谓“本地 Kubernetes runtime”就是本机 k3s/containerd 的
+Pod/Service/Deployment/hostPath/NodePort 运行环境，和远程云集群或发布仓库无关。
+
+分类管理在当前 observe-only 阶段只分离 observed identity、workload role、capture profile
+和 authority/provenance；Candidate 默认与 Confirmed 使用同一完整采样，不需要 token 升级，
+但仍不能凭产品名/PID 伪造稳定 LogicalAgent/Session。当前没有阻断或干扰动作。
+
+### 本回合结论
+
+Goal 仍为 **partial**。Canonical GET 的“无界等待/false 404”根因已定位并修复为 bounded
+read、hot fallback、locator-first 和显式 coverage；代码/部署/产品级测试通过。但 Observer
+保护性暂停、WAL/节点存储压力、旧历史 KernelFact 无 locator、LangGraph/Dify Tool→Kernel
+双向关系和正式 UI 深链仍未满足 DoD。下一轮必须在低负载/独立节点恢复并观测 Observer，
+不能把暂停、503 或未执行环境写成通过。

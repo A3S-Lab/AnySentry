@@ -16,6 +16,12 @@
 > 发布状态：集成分支完成测试后重新构建带源码 revision 的正式镜像；旧分叉工作树生成的
 > 本地镜像不得作为本分支发布产物
 
+> **现场复核增补（2026-09-05）**：候选 Agent 默认使用与 confirmed Agent 相同的完整采集
+> 档位；Codex/Claude 的 TLS 选择按 implementation family/ABI，而不是产品版本字符串。
+> Canonical GET 的 side-lane 读取采用有界 timeout、hot fallback 和 forward-only KernelFact
+> locator。本文的固定版本矩阵仍只描述测试样本，不能外推为所有版本或当前现场的完整被动
+> eBPF 覆盖；实际 r27 部署与未通过项见 `canonical-observability-implementation.md`。
+
 ## 0. 评审结论
 
 本期已经按用户审核后的范围实现：不安装 Agent Hook，不引入 LLM Gateway，不伪造证书或数字身份；Observer 在受支持进程真实使用的 TLS 函数边界，或明文 HTTP 系统调用边界，异步复制请求与响应字节。Collector 再把片段重组成一次 Agent 交互，AnySentry 展示最终发给 LLM 的请求、LLM 返回给 Agent 的内容、工具指令顺序、工具结果和边界时间。[E001][E002][E003][E004]
