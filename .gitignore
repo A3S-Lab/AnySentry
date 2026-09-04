@@ -9,3 +9,4 @@ config/workspace-scanner.local.json
 config/workspace-scanner.token
 .a3s/
 perf-results/
+.a3s-test/

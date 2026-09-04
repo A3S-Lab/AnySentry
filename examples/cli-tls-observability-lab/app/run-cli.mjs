@@ -85,7 +85,7 @@ if (product === 'codex') {
   args = [
     '--print', '--bare', '--no-session-persistence', '--disable-slash-commands',
     '--allowedTools', 'Bash', '--permission-mode', 'dontAsk',
-    '--model', 'fixture-claude-model', '--output-format', 'stream-json',
+    '--model', process.env.CLI_LAB_CLAUDE_MODEL || 'fixture-claude-model', '--output-format', 'stream-json',
     '--include-partial-messages', '--verbose',
   ];
   prompt = 'Run the model-requested Bash fixture, then finish. CLAUDE_FINAL_PROMPT_SENTINEL_20260827';

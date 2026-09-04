@@ -1,0 +1,20 @@
+suite "a3s-cli-codex-smoke" {
+    version = 1
+
+    scenario "codex-http-fixture" {
+        surface = "tui"
+        timeout_ms = 180000
+
+        wait "fixture-complete" {
+            text = "A3S_TUI_CLI_PASS codex"
+        }
+
+        expect "tool-result-visible" {
+            text = "A3S_TUI_CLI_PASS codex"
+        }
+
+        terminal_recording "evidence" {
+            path = "terminal/codex-fixture.vt"
+        }
+    }
+}

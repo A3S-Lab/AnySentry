@@ -2184,6 +2184,9 @@ export interface CanonicalAgentInstanceResource {
   agentProduct?: string;
   displayName?: string;
   environment?: LogicalAgentConversationDirectoryItem['environment'];
+  tenantId?: string;
+  ownerId?: string;
+  workspacePath?: string;
   profile?: string;
   profileVersion?: string;
   deploymentId?: string;
@@ -2217,6 +2220,13 @@ export interface CanonicalRuntimeInstanceResource {
   agentProduct?: string;
   displayName?: string;
   environment: LogicalAgentConversationDirectoryItem['environment'];
+  tenantId?: string;
+  ownerId?: string;
+  environmentId?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
   hostId: string;
   bootId: string;
   rootPid: number;

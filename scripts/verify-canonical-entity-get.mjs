@@ -251,6 +251,7 @@ try {
   assert.equal(logical.schemaVersion, 'anysentry.logical_agent.list.v1');
   assert.equal(logical.items.length, 1);
   assert.equal(logical.items[0].logicalAgentId, logicalAgentId);
+  assert.equal(logical.items[0].tenantId, `${runId}-tenant`);
   assert.equal(typeof logical.pagination.hasMore, 'boolean');
   assert(logical.coverage && logical.revision >= 1, 'LogicalAgent coverage/revision missing');
 
@@ -258,12 +259,16 @@ try {
   assert.equal(instances.schemaVersion, 'anysentry.agent_instance.list.v1');
   assert(instances.items.some((item) => item.logicalAgentId === logicalAgentId), 'AgentInstance projection missing');
   const instance = instances.items.find((item) => item.logicalAgentId === logicalAgentId);
+  const scopedInstances = await get(`/v1/agent-instances?tenantId=${encodeURIComponent(`${runId}-tenant`)}&limit=10`);
+  assert(scopedInstances.items.some((item) => item.agentInstanceId === instance.agentInstanceId), 'AgentInstance tenant scope missing');
   const instanceDetail = await get(`/v1/agent-instances/${encodeURIComponent(instance.agentInstanceId)}`);
   assert.equal(instanceDetail.item.agentInstanceId, instance.agentInstanceId);
 
   const runtimes = await get(`/v1/runtime-instances?limit=10`);
   assert.equal(runtimes.schemaVersion, 'anysentry.runtime_instance.list.v1');
   assert(runtimes.items.some((item) => item.runtimeInstanceId === runtimeId), 'RuntimeInstance projection missing');
+  const scopedRuntimes = await get(`/v1/runtime-instances?tenantId=${encodeURIComponent(`${runId}-tenant`)}&limit=10`);
+  assert(scopedRuntimes.items.some((item) => item.runtimeInstanceId === runtimeId), 'RuntimeInstance tenant scope missing');
   const runtimeDetail = await get(`/v1/runtime-instances/${encodeURIComponent(runtimeId)}`);
   assert.equal(runtimeDetail.item.runtimeInstanceId, runtimeId);
 
