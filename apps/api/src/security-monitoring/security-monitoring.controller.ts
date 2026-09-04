@@ -10337,15 +10337,17 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           resolutionRevision: directory.resolutionRevision,
         };
       });
+    const resourceCoverageReasons = resources.flatMap((item) => item.coverage.reasons);
     const partial = directory.coverage.partial
       || Boolean(directory.coverage.partialReason)
-      || resources.some((item) => item.coverage.status !== 'complete');
+      || resources.some((item) => item.coverage.status !== 'complete')
+      || resourceCoverageReasons.length > 0;
     const coverage = this.canonicalRevisionCoverage(
       query,
       directory.resolutionRevision,
       canonicalScopeCoverage(query, canonicalCoverage(
         partial,
-        [directory.coverage.partialReason ?? '', ...resources.flatMap((item) => item.coverage.reasons)],
+        [directory.coverage.partialReason ?? '', ...resourceCoverageReasons],
         directory.dataSource,
       ), {
         sourceId: resources.every((resource) => resource.sourceIds !== undefined),
@@ -10480,11 +10482,15 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     }, query));
     // Runtime state is a useful bounded fallback, but it cannot make the missing conversation
     // projection complete. Preserve the directory timeout as partial even when runtime rows exist.
-    const partial = directory.coverage.partial || Boolean(directory.coverage.partialReason);
+    const resourceCoverageReasons = resources.flatMap((item) => item.coverage.reasons);
+    const partial = directory.coverage.partial
+      || Boolean(directory.coverage.partialReason)
+      || resources.some((item) => item.coverage.status !== 'complete')
+      || resourceCoverageReasons.length > 0;
     const coverage = this.canonicalRevisionCoverage(
       query,
       directory.resolutionRevision,
-      canonicalScopeCoverage(query, canonicalCoverage(partial, [directory.coverage.partialReason ?? '', ...resources.flatMap((item) => item.coverage.reasons)], 'runtime_state+conversation_projection'), {
+      canonicalScopeCoverage(query, canonicalCoverage(partial, [directory.coverage.partialReason ?? '', ...resourceCoverageReasons], 'runtime_state+conversation_projection'), {
         sourceId: resources.every((resource) => resource.sourceIds !== undefined),
         collectorId: resources.every((resource) => resource.collectorIds !== undefined),
       }),
@@ -10597,7 +10603,8 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       query,
       directory.resolutionRevision,
       canonicalScopeCoverage(query, canonicalCoverage(
-        runtime.total === 0 && directory.coverage.partial,
+        directory.coverage.partial || Boolean(directory.coverage.partialReason)
+          || resources.some((item) => item.coverage.status !== 'complete'),
         [directory.coverage.partialReason ?? '', ...resources.flatMap((item) => item.coverage.reasons)],
         'runtime_state+conversation_projection',
       ), { sourceId: resources.every((resource) => resource.sourceId !== undefined), collectorId: true }),
@@ -10913,12 +10920,16 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       q: [resource.sessionId, resource.conversationId, resource.agentProduct, resource.workspacePath].join(' '),
     }, query));
     const revision = Math.max(this.canonicalCurrentRevision(), ...resources.map((resource) => resource.resolutionRevision));
+    const resourceCoverageReasons = resources.flatMap((resource) => resource.coverage.reasons);
     const coverage = this.canonicalRevisionCoverage(
       query,
       revision,
       canonicalScopeCoverage(query, canonicalCoverage(
-        conversations.coverage.partial,
-        [conversations.coverage.partialReason ?? '', ...resources.flatMap((resource) => resource.coverage.reasons)],
+        conversations.coverage.partial
+          || Boolean(conversations.coverage.partialReason)
+          || resources.some((resource) => resource.coverage.status !== 'complete')
+          || resourceCoverageReasons.length > 0,
+        [conversations.coverage.partialReason ?? '', ...resourceCoverageReasons],
         conversations.dataSource,
       ), false),
     );
@@ -10961,7 +10972,10 @@ export class SecurityMonitoringController implements OnModuleDestroy {
             startTime: query.startTime,
             endTime: query.endTime,
             snapshotAsOf: query.snapshotAsOf,
-            scope: 'agent',
+            // Canonical reads are evidence/audit views. Keep unknown/candidate interactions in
+            // the projection and expose their lower semantic coverage instead of filtering them
+            // out as the ordinary Agent dashboard does.
+            scope: 'raw',
             classificationView: query.classificationView,
             conversationId,
             limit: 500,
@@ -11071,7 +11085,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           startTime: query.startTime,
           endTime: query.endTime,
           snapshotAsOf: query.snapshotAsOf,
-          scope: 'agent',
+          scope: 'raw',
           classificationView: query.classificationView,
           conversationId: summary.conversationId,
           limit: 500,
@@ -11334,7 +11348,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       startTime: query.startTime,
       endTime: query.endTime,
       snapshotAsOf: query.snapshotAsOf,
-      scope: 'agent',
+      scope: 'raw',
       classificationView: query.classificationView,
       conversationId,
       limit: query.limit,
@@ -11362,9 +11376,16 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     const id = strictIdentityText(semanticEventId, 512);
     if (!id) throw new BadRequestException('semanticEventId is invalid');
     const query = parseCanonicalEntityQuery(rawQuery);
-    const semanticRecord = await this.canonicalObservability.getDurableSemanticRecord(id, query.revision);
     const timelineId = id.startsWith('se_');
     const durableId = id.startsWith('sr_');
+    // `se_…` is a deterministic read-time timeline identifier, not a durable SemanticRecord key.
+    // Do not issue a PostgreSQL side-lane lookup for it: under storage pressure that pointless
+    // query can consume the entire projection timeout before the compatibility timeline path has
+    // a chance to resolve the deep link. Durable `sr_…` identifiers still use the authoritative
+    // revision-aware lookup below.
+    const semanticRecord = durableId
+      ? await this.canonicalObservability.getDurableSemanticRecord(id, query.revision)
+      : undefined;
     // Keep the old 404 behavior for a syntactically unrelated identifier, but do not report a
     // false 404 for a valid canonical id whose projection has expired or is still ambiguous.
     if (!semanticRecord && !timelineId && !durableId) {
@@ -11482,7 +11503,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           startTime: query.startTime,
           endTime: query.endTime,
           snapshotAsOf: query.snapshotAsOf,
-          scope: 'agent',
+          scope: 'raw',
           classificationView: query.classificationView,
           conversationId: selected.session.conversationId ?? selected.session.sessionId,
           semanticEventId: selected.event.semanticEventId,
