@@ -2223,6 +2223,7 @@ export interface CanonicalRuntimeInstanceResource {
   rootStartTimeTicks: string;
   processGenerationKeys: string[];
   workspacePath?: string;
+  physicalWorkloadId?: string;
   workloadRef?: AgentWorkloadRef;
   terminalContextId?: string;
   sshConnectionId?: string;

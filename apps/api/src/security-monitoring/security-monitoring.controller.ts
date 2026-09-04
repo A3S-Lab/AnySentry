@@ -426,6 +426,15 @@ function canonicalCoverageFromSummaries(
     fallbackSource,
   );
 }
+
+function canonicalLifecycleMatches(
+  state: T.AgentRuntimeState,
+  scope: CanonicalEntityQuery['lifecycleScope'],
+): boolean {
+  if (scope === 'running') return state === 'running' || state === 'unobserved';
+  if (scope === 'history') return state === 'exited' || state === 'lost';
+  return true;
+}
 const OBSERVER_BATCH_ID_DIGEST_CACHE_SIZE = 10_000;
 const OBSERVER_BATCH_ID_DIGEST_CACHE_BYTES = 2 * 1024 * 1024;
 const OBSERVER_INGRESS_CACHE_TTL_MS = 15 * 60_000;
@@ -9621,7 +9630,8 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         ...(classificationDecision.candidateAutoPromoted ? { candidateAutoPromoted: true } : {}),
         resolutionRevision: directory.resolutionRevision,
       };
-    }).filter((resource) => canonicalScopeMatches({
+    }).filter((resource) => canonicalLifecycleMatches(resource.state, query.lifecycleScope)
+      && canonicalScopeMatches({
       logicalAgentId: resource.logicalAgentId,
       logicalAgentCandidateId: resource.logicalAgentCandidateId,
       logicalDefinitionId: resource.logicalDefinitionId,
@@ -9697,6 +9707,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         rootStartTimeTicks: record.rootStartTimeTicks,
         processGenerationKeys: processKey ? [processKey] : [],
         ...(record.workspacePath ? { workspacePath: record.workspacePath } : {}),
+        ...(record.physicalWorkloadId ? { physicalWorkloadId: record.physicalWorkloadId } : {}),
         ...(record.workloadRef ? { workloadRef: structuredClone(record.workloadRef) } : {}),
         ...(record.terminalContextId ? { terminalContextId: record.terminalContextId } : {}),
         ...(record.sshConnectionId ? { sshConnectionId: record.sshConnectionId } : {}),
@@ -9718,7 +9729,8 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         ...(classificationDecision.candidateAutoPromoted ? { candidateAutoPromoted: true } : {}),
         resolutionRevision: directory.resolutionRevision,
       };
-    }).filter((resource) => canonicalScopeMatches({
+    }).filter((resource) => canonicalLifecycleMatches(resource.state, query.lifecycleScope)
+      && canonicalScopeMatches({
       logicalAgentId: resource.logicalAgentId,
       logicalAgentCandidateId: resource.logicalAgentCandidateId,
       logicalDefinitionId: resource.logicalDefinitionId,
@@ -9727,7 +9739,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       workspacePath: resource.workspacePath,
       environment: resource.environment,
       environmentId: undefined,
-      agentAssetId: undefined,
+      agentAssetId: resource.physicalWorkloadId,
       agentInstanceId: resource.agentInstanceId,
       runtimeInstanceId: resource.runtimeInstanceId,
       sessionId: undefined,
