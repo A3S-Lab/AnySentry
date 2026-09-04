@@ -7595,8 +7595,16 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     @Body() f: T.AgentConversationDirectoryQuery,
     @Headers() headers: HeaderBag,
   ): Promise<T.AgentConversationDirectoryList> {
+    // Preserve the historical default page size, but honor an explicit bounded limit.  Canonical
+    // entity GETs request a small page; forcing every request through the legacy 200-thread page
+    // expanded multi-megabyte summaries and made the read path spend most of its time cloning and
+    // serializing data that the caller did not ask for.
+    const requestedLimit = Number(f?.limit);
+    const conversationLimit = Number.isFinite(requestedLimit)
+      ? Math.min(200, Math.max(1, Math.trunc(requestedLimit)))
+      : 200;
     const conversations = await this.agentConversations(
-      { ...f, limit: 200 },
+      { ...f, limit: conversationLimit },
       headers,
     );
     const runtime = this.agentRuntimeState.list({ includeShadow: true, limit: 100_000 });
