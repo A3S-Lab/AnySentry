@@ -694,8 +694,14 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   async onModuleDestroy(): Promise<void> {
     this.postCommitProjectionClosing = true;
     if (this.postCommitProjectionPending) {
-      this.postCommitProjectionDropped += this.postCommitProjectionPending.length;
-      this.postCommitProjectionPending.length = 0;
+      const pending = this.postCommitProjectionPending.splice(0);
+      this.postCommitProjectionDropped += pending.length;
+      const shutdownError = Object.assign(new Error('post-commit projection scheduler is closing'), {
+        code: 'ANYSENTRY_POST_COMMIT_PROJECTION_CLOSING',
+      });
+      for (const entry of pending) {
+        try { entry.onProjectionFailure?.(entry.item.event, shutdownError); } catch { /* best effort */ }
+      }
     }
     this.decisionRevisionWriterClosing = true;
     if (this.decisionRevisionWriteTimer) clearTimeout(this.decisionRevisionWriteTimer);
