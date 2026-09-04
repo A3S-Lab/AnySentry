@@ -15,6 +15,7 @@ import {
   DEFAULT_TRANSPORT_REGISTRY,
   DEFAULT_LLM_FORMAT_REGISTRY,
   DEFAULT_RUNTIME_REGISTRY,
+  mergeServerSourceRefs,
   normalizeKernelFact,
   rawObservationFromLine,
   validateCoverageGap,
@@ -95,6 +96,9 @@ export interface CanonicalObservationCommitContext {
   sourceType?: RawObservationSourceType;
   probeId?: string;
   sourceSequence?: string;
+  /** Server-derived compatibility IDs; never copied from an untrusted producer envelope. */
+  sourceRefs?: readonly string[];
+  compatibilitySourceRefs?: readonly string[];
   eventKind?: string;
   processGenerationKey?: string;
   pid?: number;
@@ -622,7 +626,16 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
             ? { eventAtUnixNs: context.eventAtUnixNs } : {}),
           ...(context.receivedAtUnixNs && /^\d{9,41}$/u.test(context.receivedAtUnixNs)
             ? { receivedAtUnixNs: context.receivedAtUnixNs } : {}),
-          sourceRefs: [...new Set([checked.value.observationId, ...checked.value.sourceRefs])].slice(0, 128),
+          sourceRefs: (() => {
+            const trustedRefs = ['kernel', 'uprobe', 'socket_payload', 'forwarder'].includes(reboundSourceType)
+              ? mergeServerSourceRefs(
+                  checked.value.observationId,
+                  context.sourceRefs,
+                  context.compatibilitySourceRefs,
+                )
+              : [checked.value.observationId];
+            return [...new Set([...trustedRefs, ...checked.value.sourceRefs])].slice(0, 128);
+          })(),
           idempotencyKey: context.idempotencyKey ?? checked.value.idempotencyKey,
         };
         return this.commit(rebound);

@@ -901,6 +901,33 @@ function boundedRefs(value: unknown, max = 128): string[] | undefined {
   return refs.every((item): item is string => Boolean(item)) ? [...new Set(refs)] : undefined;
 }
 
+/**
+ * Server-derived compatibility references are intentionally narrower than producer sourceRefs.
+ * They are accepted only through an internal commit context, capped by count/bytes, and merged
+ * behind the immutable observationId.  This lets a legacy event/raw ID locate a fact without
+ * allowing an unbounded or body-bearing value into the canonical row.
+ */
+function boundedServerSourceRefs(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const refs: string[] = [];
+  let bytes = 0;
+  for (const item of value) {
+    const ref = text(item, 240);
+    if (!ref || refs.includes(ref)) continue;
+    const refBytes = Buffer.byteLength(ref, 'utf8');
+    if (refs.length >= 32 || bytes + refBytes > 8 * 1024) break;
+    refs.push(ref);
+    bytes += refBytes;
+  }
+  return refs;
+}
+
+export function mergeServerSourceRefs(observationId: string, ...groups: unknown[]): string[] {
+  const merged = [observationId];
+  for (const group of groups) merged.push(...boundedServerSourceRefs(group));
+  return [...new Set(merged)].slice(0, 128);
+}
+
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
@@ -2271,6 +2298,10 @@ export function rawObservationFromLine(
     sourceType?: RawObservationSourceType | 'observer' | 'webhook' | 'custom';
     probeId?: string;
     sourceSequence?: string;
+    /** Server-derived compatibility IDs; producer payloads must not populate this field. */
+    sourceRefs?: readonly string[];
+    /** Explicit spelling for callers that want to distinguish compatibility aliases. */
+    compatibilitySourceRefs?: readonly string[];
     eventKind?: string;
     processGenerationKey?: string;
     pid?: number;
@@ -2329,6 +2360,7 @@ export function rawObservationFromLine(
             : context.sourceType === 'api'
               ? 'api'
               : 'unknown';
+  const acceptsServerRefs = ['kernel', 'uprobe', 'socket_payload', 'forwarder'].includes(normalizedSourceType);
   const observation: RawObservation = {
     schemaVersion: CANONICAL_SCHEMA_VERSIONS.rawObservation,
     observationId,
@@ -2363,7 +2395,11 @@ export function rawObservationFromLine(
       capturedBytes: Buffer.byteLength(body, 'utf8'),
       redactionState: 'hash_only',
     },
-    sourceRefs: [observationId],
+    sourceRefs: mergeServerSourceRefs(
+      observationId,
+      acceptsServerRefs ? context.sourceRefs : undefined,
+      acceptsServerRefs ? context.compatibilitySourceRefs : undefined,
+    ),
     derivedFrom: [],
     idempotencyKey: context.idempotencyKey ?? `${context.sourceId ?? context.collectorId ?? 'local'}:${observationId}:${context.revision ?? 1}`,
   };

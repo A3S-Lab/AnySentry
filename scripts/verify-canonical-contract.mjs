@@ -272,6 +272,21 @@ const raw = rawObservationFromLine('{"event":{"ToolExec":{"pid":42}}}', {
 assert.equal(raw.schemaVersion, CANONICAL_SCHEMA_VERSIONS.rawObservation);
 assert.equal(raw.source.sourceType, 'kernel');
 assert.equal(validateRawObservation(raw).ok, true);
+const compatibilityRaw = rawObservationFromLine('{"event":{"Exec":{"pid":42}}}', {
+  sourceId: 'source-a', sourceType: 'kernel', eventKind: 'Exec', sourceSequence: 'source-seq-compat',
+  sourceRefs: ['evt-compat-locator', 'ob-compat-locator'],
+  eventAtUnixNs: '1788000000000000004', receivedAtUnixNs: '1788000000000001004',
+});
+assert.equal(compatibilityRaw.sourceRefs[0], compatibilityRaw.observationId,
+  'server compatibility refs must never replace the immutable observationId');
+assert(compatibilityRaw.sourceRefs.includes('evt-compat-locator'));
+assert(compatibilityRaw.sourceRefs.includes('ob-compat-locator'));
+const untrustedCompatibilityRaw = rawObservationFromLine('{"event":{"Exec":{"pid":42}}}', {
+  sourceId: 'untrusted-api', sourceType: 'api', eventKind: 'Exec',
+  sourceRefs: ['evt-forged-by-producer'],
+});
+assert(!untrustedCompatibilityRaw.sourceRefs.includes('evt-forged-by-producer'),
+  'API/OTel producer context must not inject server compatibility aliases');
 const nsProcessKey = deriveProcessGenerationKey({
   hostId: 'host-ns', bootId: 'boot-ns', pid: 43, startTimeNs: '1788000000000000123',
 });
@@ -514,6 +529,7 @@ const durableCommit = await durableService.commitObserverLine(
     sourceId: 'source-a',
     collectorId: 'collector-a',
     sourceType: 'kernel',
+    sourceRefs: ['evt-durable-compat'],
     eventKind: 'ToolExec',
     eventAtUnixNs: '1788000000000000500',
     receivedAtUnixNs: '1788000000000000600',
@@ -526,6 +542,8 @@ const durableCommit = await durableService.commitObserverLine(
 assert.equal(durableCommit.durable, true);
 assert.equal(durableRaw.length, 1);
 assert.equal(durableFacts.length, 1);
+assert(durableCommit.observation.sourceRefs.includes('evt-durable-compat'));
+assert(durableCommit.kernelFact.sourceRefs.includes('evt-durable-compat'));
 assert.equal((await durableService.listDurableKernelFacts()).length, 1);
 assert(durableCommit.kernelFact?.eventId);
 const durableAlias = await durableService.getDurableKernelFact(durableCommit.kernelFact.eventId);
