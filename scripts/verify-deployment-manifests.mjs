@@ -675,6 +675,12 @@ function verifyObserverManifest() {
       /\{\s*name:\s*A3S_OBSERVER_JSON_CRITICAL_BACKPRESSURE_MS,\s*value:\s*"100"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_CONTROL_HTTP_TIMEOUT_MS,\s*value:\s*"15000"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_SPOOL_COMPACT_MAX_LIVE_RECORDS,\s*value:\s*"16384"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_SPOOL_MAX_RECORDS,\s*value:\s*"1000000"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_SPOOL_LIVE_RESERVE_EVENTS,\s*value:\s*"4096"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_SPOOL_LIVE_RESERVE_BYTES,\s*value:\s*"16777216"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_DEFERRED_CRITICAL_MAX_EVENTS,\s*value:\s*"4096"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_DEFERRED_CRITICAL_MAX_BYTES,\s*value:\s*"16777216"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_DEFERRED_CRITICAL_TTL_MS,\s*value:\s*"60000"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_WAL_PENDING_MAX_EVENTS,\s*value:\s*"65536"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_WAL_PENDING_MAX_BYTES,\s*value:\s*"268435456"\s*\}/u.test(daemonSet?.source ?? '') &&
       /requests:\s*\{\s*cpu:\s*50m,\s*memory:\s*256Mi\s*\}/u.test(daemonSet?.source ?? '') &&

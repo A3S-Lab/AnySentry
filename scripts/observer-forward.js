@@ -255,6 +255,28 @@ const SPOOL_LIVE_RESERVE_BYTES = boundedNumber(
 );
 const MAX_SPOOL_READ_BLOCKED = 4_096;
 const SPOOL_READ_RETRY_MS = 10_000;
+// Lines already buffered by Node's readline interface can still arrive after `pause()`. Keep a
+// small in-memory protected tail for those lifecycle/security facts so a full durable backlog
+// turns into explicit backpressure instead of immediate critical drops. The tail is neither a
+// second WAL nor an unbounded queue; expiry/overflow are reported as coverage loss.
+const DEFERRED_CRITICAL_MAX_EVENTS = boundedNumber(
+  process.env.FORWARD_DEFERRED_CRITICAL_MAX_EVENTS,
+  Math.min(4_096, Math.max(64, SPOOL_LIVE_RESERVE_EVENTS)),
+  64,
+  65_536,
+);
+const DEFERRED_CRITICAL_MAX_BYTES = boundedNumber(
+  process.env.FORWARD_DEFERRED_CRITICAL_MAX_BYTES,
+  Math.min(16 * 1024 * 1024, Math.max(1 * 1024 * 1024, SPOOL_LIVE_RESERVE_BYTES)),
+  64 * 1024,
+  256 * 1024 * 1024,
+);
+const DEFERRED_CRITICAL_TTL_MS = boundedNumber(
+  process.env.FORWARD_DEFERRED_CRITICAL_TTL_MS,
+  60_000,
+  1_000,
+  3_600_000,
+);
 const HTTP_TIMEOUT_MS = boundedNumber(process.env.FORWARD_HTTP_TIMEOUT_MS, 10_000, 1_000, 120_000);
 const CONTROL_HTTP_TIMEOUT_MS = boundedNumber(
   process.env.FORWARD_CONTROL_HTTP_TIMEOUT_MS,
@@ -714,6 +736,12 @@ let spoolReplayTimer;
 let spoolReplayNotBefore = 0;
 const spoolReadBlocked = new Map();
 let spoolReplayReadErrors = 0;
+const deferredCriticalLines = [];
+let deferredCriticalBytes = 0;
+let deferredCriticalParked = 0;
+let deferredCriticalDropped = 0;
+let deferredCriticalExpired = 0;
+let drainingDeferredCritical = false;
 let shutdownForceTimer;
 let shutdownDeadline = 0;
 let eventDrainDeadline = 0;
@@ -2247,6 +2275,10 @@ function eventQueueMetrics(now = Date.now()) {
     spoolReplayReserveBytes: SPOOL_REPLAY_RESERVE_BYTES,
     spoolLiveReserveEvents: SPOOL_LIVE_RESERVE_EVENTS,
     spoolLiveReserveBytes: SPOOL_LIVE_RESERVE_BYTES,
+    deferredCriticalDepth: deferredCriticalLines.length,
+    deferredCriticalBytes,
+    deferredCriticalMaxEvents: DEFERRED_CRITICAL_MAX_EVENTS,
+    deferredCriticalMaxBytes: DEFERRED_CRITICAL_MAX_BYTES,
   };
 }
 
@@ -2580,6 +2612,13 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         spoolReplayReserveBytes: eventQueues.spoolReplayReserveBytes,
         spoolLiveReserveEvents: eventQueues.spoolLiveReserveEvents,
         spoolLiveReserveBytes: eventQueues.spoolLiveReserveBytes,
+        deferredCriticalDepth: eventQueues.deferredCriticalDepth,
+        deferredCriticalBytes: eventQueues.deferredCriticalBytes,
+        deferredCriticalMaxEvents: eventQueues.deferredCriticalMaxEvents,
+        deferredCriticalMaxBytes: eventQueues.deferredCriticalMaxBytes,
+        deferredCriticalParked,
+        deferredCriticalDropped,
+        deferredCriticalExpired,
         identitySnapshotReady: workload.ready,
         identitySnapshotVersion: workload.version,
         identityKubernetesVersion: workload.sources?.kubernetes?.version,
@@ -3031,10 +3070,107 @@ function inputAtCapacity() {
   );
 }
 
+function protectedInputKind(kind) {
+  return kind === 'ToolExec' || kind === 'ProcessExit' || kind === 'SecurityAction';
+}
+
+function deferCriticalInput(line, kind) {
+  const bytes = Buffer.byteLength(line);
+  while (
+    deferredCriticalLines.length >= DEFERRED_CRITICAL_MAX_EVENTS
+    || deferredCriticalBytes + bytes > DEFERRED_CRITICAL_MAX_BYTES
+  ) {
+    const evicted = deferredCriticalLines.shift();
+    if (!evicted) break;
+    deferredCriticalBytes = Math.max(0, deferredCriticalBytes - evicted.bytes);
+    deferredCriticalDropped += 1;
+    outputDropped += 1;
+    attributionCounts.protectedQueueDropped += 1;
+    attributionCounts.queueDropped += 1;
+    const dropClass = queueDropClass(evicted.kind, PROTECTED_PRIORITY);
+    attributionCounts.queueDroppedByClass[dropClass] =
+      (attributionCounts.queueDroppedByClass[dropClass] || 0) + 1;
+    pipelineAccounting.record('queue_dropped', 'protected_reserve');
+  }
+  if (
+    deferredCriticalLines.length >= DEFERRED_CRITICAL_MAX_EVENTS
+    || deferredCriticalBytes + bytes > DEFERRED_CRITICAL_MAX_BYTES
+  ) {
+    deferredCriticalDropped += 1;
+    outputDropped += 1;
+    attributionCounts.protectedQueueDropped += 1;
+    attributionCounts.queueDropped += 1;
+    const dropClass = queueDropClass(kind, PROTECTED_PRIORITY);
+    attributionCounts.queueDroppedByClass[dropClass] =
+      (attributionCounts.queueDroppedByClass[dropClass] || 0) + 1;
+    pipelineAccounting.record('queue_dropped', 'protected_reserve');
+    return false;
+  }
+  deferredCriticalLines.push({ line, kind, bytes, queuedAt: Date.now() });
+  deferredCriticalBytes += bytes;
+  deferredCriticalParked += 1;
+  return true;
+}
+
+function expireDeferredCritical(now = Date.now()) {
+  while (deferredCriticalLines.length > 0) {
+    const first = deferredCriticalLines[0];
+    if (now - first.queuedAt <= DEFERRED_CRITICAL_TTL_MS) break;
+    deferredCriticalLines.shift();
+    deferredCriticalBytes = Math.max(0, deferredCriticalBytes - first.bytes);
+    deferredCriticalExpired += 1;
+    deferredCriticalDropped += 1;
+    outputDropped += 1;
+    attributionCounts.protectedQueueDropped += 1;
+    attributionCounts.queueDropped += 1;
+    const dropClass = queueDropClass(first.kind, PROTECTED_PRIORITY);
+    attributionCounts.queueDroppedByClass[dropClass] =
+      (attributionCounts.queueDroppedByClass[dropClass] || 0) + 1;
+    pipelineAccounting.record('queue_dropped', 'protected_reserve');
+  }
+}
+
+function drainDeferredCritical() {
+  if (drainingDeferredCritical || closing || inputAtCapacity()) return;
+  if (deferredCriticalLines.length === 0) return;
+  drainingDeferredCritical = true;
+  try {
+    expireDeferredCritical();
+    let processed = 0;
+    while (deferredCriticalLines.length > 0 && processed < BATCH_SIZE && !inputAtCapacity()) {
+      const item = deferredCriticalLines.shift();
+      deferredCriticalBytes = Math.max(0, deferredCriticalBytes - item.bytes);
+      handleLine(item.line, true);
+      processed += 1;
+    }
+  } finally {
+    drainingDeferredCritical = false;
+  }
+}
+
+function abandonDeferredCritical(reason = 'shutdown') {
+  while (deferredCriticalLines.length > 0) {
+    const item = deferredCriticalLines.shift();
+    deferredCriticalBytes = Math.max(0, deferredCriticalBytes - item.bytes);
+    deferredCriticalDropped += 1;
+    outputDropped += 1;
+    attributionCounts.protectedQueueDropped += 1;
+    attributionCounts.queueDropped += 1;
+    const dropClass = queueDropClass(item.kind, PROTECTED_PRIORITY);
+    attributionCounts.queueDroppedByClass[dropClass] =
+      (attributionCounts.queueDroppedByClass[dropClass] || 0) + 1;
+    pipelineAccounting.record('queue_dropped', reason === 'shutdown' ? 'shutdown' : 'protected_reserve');
+  }
+}
+
 function updateInputFlow() {
   if (!rl || closing) return;
+  expireDeferredCritical();
   if (inputAtCapacity()) rl.pause();
-  else rl.resume();
+  else {
+    rl.resume();
+    drainDeferredCritical();
+  }
 }
 
 function admitDurableEvent(
@@ -3332,6 +3468,7 @@ function flushAndClose() {
   captureProfileReporter.close();
   fileAccessAggregator.flushAll();
   filterRulePublisher.close();
+  abandonDeferredCritical();
   shutdownDeadline = Date.now() + SHUTDOWN_TIMEOUT_MS;
   shutdownForceTimer = setTimeout(forceShutdown, SHUTDOWN_TIMEOUT_MS);
   // Event evidence is already durable in the WAL, while the final runtime snapshot and heartbeat
@@ -3432,10 +3569,10 @@ function enqueueClassifiedRecord(record) {
   );
 }
 
-function handleLine(raw) {
+function handleLine(raw, fromDeferred = false) {
   const line = raw.trim();
   if (!line) return;
-  pipelineAccounting.record('received', 'input');
+  if (!fromDeferred) pipelineAccounting.record('received', 'input');
   let o;
   try {
     o = JSON.parse(line);
@@ -3446,6 +3583,14 @@ function handleLine(raw) {
     return;
   }
   const kind = eventKind(o);
+  // readline may deliver a few already-buffered lines after pause(). Preserve protected kernel
+  // lifecycle facts in the bounded deferred tail while the durable WAL/HTTP queue is saturated;
+  // they are re-run only after capacity returns, so no source event ID or classification is lost.
+  if (!fromDeferred && inputAtCapacity() && protectedInputKind(kind)) {
+    deferCriticalInput(line, kind);
+    updateInputFlow();
+    return;
+  }
   if (kind === 'CollectorHeartbeat') {
     // Collector health is control-plane telemetry, not Agent activity. It must reach the raw
     // heartbeat ingest seam even when Enforce suppresses unknown workloads, and it must not

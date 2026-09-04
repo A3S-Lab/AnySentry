@@ -155,11 +155,13 @@ spec:
             # an overdue timer aborts it after a synchronous data-plane burst.
             - { name: FORWARD_CONTROL_HTTP_TIMEOUT_MS, value: "15000" }
             # Events are removed only after an item-level durable ack. The hostPath survives
-            # container/Pod restarts; when full, stdin is paused instead of dropping evidence.
+            # container/Pod restarts. Keep the record cap high enough to use the existing 2 GiB
+            # byte bound (the previous 250k cap filled while the API was temporarily degraded),
+            # while the protected tail and explicit pause/coverage metrics remain hard limits.
             - { name: FORWARD_SPOOL_PATH, value: "/var/lib/anysentry-forwarder/spool.wal" }
             - { name: FORWARD_SPOOL_FSYNC, value: "periodic" }
             - { name: FORWARD_SPOOL_FSYNC_MS, value: "250" }
-            - { name: FORWARD_SPOOL_MAX_RECORDS, value: "250000" }
+            - { name: FORWARD_SPOOL_MAX_RECORDS, value: "1000000" }
             - { name: FORWARD_SPOOL_MAX_BYTES, value: "2147483648" }
             # A retry deadline parks evidence in the WAL; the same process continuously redrives
             # bounded priority batches, so recovery never depends on a container restart.
@@ -167,6 +169,11 @@ spec:
             - { name: FORWARD_SPOOL_REPLAY_BATCH_SIZE, value: "256" }
             - { name: FORWARD_SPOOL_DEGRADED_AGE_MS, value: "60000" }
             - { name: FORWARD_SPOOL_COMPACT_MAX_LIVE_RECORDS, value: "16384" }
+            - { name: FORWARD_SPOOL_LIVE_RESERVE_EVENTS, value: "4096" }
+            - { name: FORWARD_SPOOL_LIVE_RESERVE_BYTES, value: "16777216" }
+            - { name: FORWARD_DEFERRED_CRITICAL_MAX_EVENTS, value: "4096" }
+            - { name: FORWARD_DEFERRED_CRITICAL_MAX_BYTES, value: "16777216" }
+            - { name: FORWARD_DEFERRED_CRITICAL_TTL_MS, value: "60000" }
             - { name: FORWARD_WAL_PENDING_MAX_EVENTS, value: "65536" }
             - { name: FORWARD_WAL_PENDING_MAX_BYTES, value: "268435456" }
             - { name: FORWARD_BATCH_MAX_BYTES, value: "524288" }
