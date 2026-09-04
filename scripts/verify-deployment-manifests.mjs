@@ -276,6 +276,11 @@ function verifyAnySentryManifest() {
     anySentryDeployment?.source,
   );
   assert(
+    'AnySentry canonical session reads have a bounded degradation timeout',
+    /name:\s*ANYSENTRY_CANONICAL_SESSION_PROJECTION_TIMEOUT_MS,\s*value:\s*"2000"/u.test(anySentryDeployment?.source ?? ''),
+    anySentryDeployment?.source,
+  );
+  assert(
     'AnySentry livez implementation is a public O(1) marker independent of storage services',
     /@SkipWrap\(\)[\s\S]*?livez\(\):[\s\S]*?schemaVersion:\s*'anysentry\.livez\.v1'[\s\S]*?status:\s*'ok'/u.test(livezBlock) &&
       !/(?:judge|clickhouse|postgres|healthz|aggregation|cacheStateStats)/iu.test(livezBlock),
@@ -687,6 +692,7 @@ function verifyObserverManifest() {
       /\{\s*name:\s*FORWARD_CONTROL_HTTP_TIMEOUT_MS,\s*value:\s*"15000"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_SPOOL_COMPACT_MAX_LIVE_RECORDS,\s*value:\s*"16384"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_SPOOL_MAX_RECORDS,\s*value:\s*"1000000"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_SPOOL_MAX_WAL_BYTES,\s*value:\s*"4294967296"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_SPOOL_LIVE_RESERVE_EVENTS,\s*value:\s*"4096"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_SPOOL_LIVE_RESERVE_BYTES,\s*value:\s*"16777216"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_DEFERRED_CRITICAL_MAX_EVENTS,\s*value:\s*"4096"\s*\}/u.test(daemonSet?.source ?? '') &&

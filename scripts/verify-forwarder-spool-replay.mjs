@@ -172,6 +172,63 @@ try {
   assert.equal(reserveSpool.atCapacity(4), true, 'protected tail is bounded too');
   reserveSpool.close();
 
+  const walBoundPath = path.join(temporary, 'physical-bound.wal');
+  const walBound = new DurableSpool({
+    writerId: 'physical-bound-test',
+    filePath: walBoundPath,
+    maxBytes: 16 * 1024 * 1024,
+    maxWalBytes: 16 * 1024 * 1024,
+    fsyncMode: 'periodic',
+    fsyncMs: 60_000,
+  });
+  // Occupy a small durable record, then pin the test ceiling at its exact file size. A subsequent
+  // PUT and ACK must both fail closed, retaining the live record instead of growing the journal;
+  // this avoids creating a 16 MiB fixture just to reach the constructor's production minimum.
+  walBound.put({
+    id: 'wal-bound-live',
+    body: { sourceEventId: 'wal-bound-live', line: 'x'.repeat(1024) },
+    priority: 4,
+    queuedAt: 1,
+  });
+  const walBefore = walBound.status().walBytes;
+  assert.ok(walBefore < 16 * 1024 * 1024);
+  // Pin the test ceiling at the exact occupied size so both a tiny PUT and the ACK exercise the
+  // physical-capacity branch without allocating another near-16 MiB fixture.
+  walBound.maxWalBytes = walBefore;
+  const walPutAsync = (record) => new Promise((resolve, reject) => {
+    walBound.putAsync(record, (error, inserted) => {
+      if (error) reject(error);
+      else resolve(inserted);
+    });
+  });
+  await assert.rejects(
+    walPutAsync({ id: 'wal-bound-overflow', body: { line: 'overflow' }, priority: 4, queuedAt: 2 }),
+    (error) => error?.code === 'ANYSENTRY_SPOOL_WAL_CAPACITY',
+  );
+  let ackError;
+  const walAckResult = walBound.ackAsync(['wal-bound-live'], (error, acknowledged) => {
+    ackError = error;
+    assert.equal(acknowledged, 0);
+  });
+  assert.equal(walAckResult, 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(ackError?.code, 'ANYSENTRY_SPOOL_WAL_CAPACITY');
+  assert.equal(walBound.status().records, 1, 'physical WAL rejection retains the live record');
+  assert.equal(walBound.status().walBytes, walBefore, 'physical WAL rejection writes no partial operation');
+  assert.ok(walBound.status().walCapacityRejects >= 2);
+  walBound.close();
+  const walRecovered = new DurableSpool({
+    writerId: 'physical-bound-recovery-test',
+    filePath: walBoundPath,
+    maxBytes: 16 * 1024 * 1024,
+    maxWalBytes: 16 * 1024 * 1024,
+    fsyncMode: 'periodic',
+    fsyncMs: 60_000,
+  });
+  assert.equal(walRecovered.status().records, 1);
+  assert.equal(walRecovered.status().lazyRecords, 1);
+  walRecovered.close();
+
   const streamingPath = path.join(temporary, 'streaming-load.wal');
   const unicodeLine = `prefix-${'界'.repeat(80)}-suffix`;
   writeFileSync(streamingPath, [

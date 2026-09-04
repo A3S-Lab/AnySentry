@@ -163,6 +163,9 @@ spec:
             - { name: FORWARD_SPOOL_FSYNC_MS, value: "250" }
             - { name: FORWARD_SPOOL_MAX_RECORDS, value: "1000000" }
             - { name: FORWARD_SPOOL_MAX_BYTES, value: "2147483648" }
+            # Physical PUT/ACK journal bytes have their own ceiling while large-live-set
+            # compaction is deferred; this is intentionally above logical live bytes but finite.
+            - { name: FORWARD_SPOOL_MAX_WAL_BYTES, value: "4294967296" }
             # A retry deadline parks evidence in the WAL; the same process continuously redrives
             # bounded priority batches, so recovery never depends on a container restart.
             - { name: FORWARD_SPOOL_REPLAY_INTERVAL_MS, value: "500" }

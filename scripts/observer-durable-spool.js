@@ -27,6 +27,19 @@ class DurableSpool {
     this.writerId = options.writerId || stableWriterId(['observer-forwarder']);
     this.maxRecords = boundedNumber(options.maxRecords, 250_000, 1_000, 5_000_000);
     this.maxBytes = boundedNumber(options.maxBytes, 2 * 1024 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024 * 1024);
+    // `maxBytes` bounds the live logical set; ACK/PUT journal history can temporarily make the
+    // physical file larger while compaction is deferred for a large live set. Keep a separate,
+    // explicit physical ceiling so a prolonged outage cannot grow the hostPath without bound.
+    const defaultMaxWalBytes = Math.min(
+      64 * 1024 * 1024 * 1024,
+      Math.max(this.maxBytes, this.maxBytes * 2),
+    );
+    this.maxWalBytes = boundedNumber(
+      options.maxWalBytes,
+      defaultMaxWalBytes,
+      this.maxBytes,
+      64 * 1024 * 1024 * 1024,
+    );
     this.fsyncMode = options.fsyncMode === 'always' ? 'always' : 'periodic';
     this.fsyncMs = boundedNumber(options.fsyncMs, 250, 10, 60_000);
     this.compactMinBytes = boundedNumber(options.compactMinBytes, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024 * 1024);
@@ -74,6 +87,8 @@ class DurableSpool {
     this.lazyReadErrors = 0;
     this.residentBodies = 0;
     this.asyncOperations = [];
+    this.pendingWriteBytes = 0;
+    this.walCapacityRejects = 0;
     this.asyncWriteActive = false;
     this.pendingPutIds = new Set();
     this.pendingPutBytes = 0;
@@ -241,9 +256,37 @@ class DurableSpool {
     }
   }
 
+  operationBytes(operation) {
+    return Buffer.byteLength(`${JSON.stringify(operation)}\n`);
+  }
+
+  canAppend(bytes) {
+    const size = Number(bytes);
+    return Number.isSafeInteger(size) && size >= 0
+      && this.walBytes + this.pendingWriteBytes + size <= this.maxWalBytes;
+  }
+
+  walCapacityError(bytes) {
+    this.walCapacityRejects += 1;
+    return Object.assign(new Error('Observer spool physical WAL capacity reached'), {
+      code: 'ANYSENTRY_SPOOL_WAL_CAPACITY',
+      maxWalBytes: this.maxWalBytes,
+      requestedBytes: Number(bytes) || 0,
+      walBytes: this.walBytes,
+      pendingWriteBytes: this.pendingWriteBytes,
+    });
+  }
+
+  atWalCapacity() {
+    return this.walBytes + this.pendingWriteBytes >= this.maxWalBytes;
+  }
+
   append(operation, forceSync = false) {
     if (this.closed) throw new Error('Observer spool is closed');
     const line = `${JSON.stringify(operation)}\n`;
+    if (!this.canAppend(Buffer.byteLength(line))) {
+      throw this.walCapacityError(Buffer.byteLength(line));
+    }
     fs.writeSync(this.fd, line);
     this.walBytes += Buffer.byteLength(line);
     this.appendedOperations += 1;
@@ -256,6 +299,11 @@ class DurableSpool {
       return;
     }
     const buffer = Buffer.from(`${JSON.stringify(operation)}\n`);
+    if (!this.canAppend(buffer.length)) {
+      queueMicrotask(() => done(this.walCapacityError(buffer.length)));
+      return;
+    }
+    this.pendingWriteBytes += buffer.length;
     this.asyncOperations.push({ buffer, offset: 0, forceSync, done });
     this.pumpAsyncWrites();
   }
@@ -268,6 +316,7 @@ class DurableSpool {
     const finish = (error) => {
       this.asyncWriteActive = false;
       this.asyncOperations.shift();
+      this.pendingWriteBytes = Math.max(0, this.pendingWriteBytes - entry.buffer.length);
       if (!error) {
         this.walBytes += entry.buffer.length;
         this.appendedOperations += 1;
@@ -275,7 +324,7 @@ class DurableSpool {
       try {
         entry.done(error);
       } finally {
-        if (error) this.onAsyncError(error);
+        if (error && error.code !== 'ANYSENTRY_SPOOL_WAL_CAPACITY') this.onAsyncError(error);
         this.pumpAsyncWrites();
       }
     };
@@ -363,18 +412,25 @@ class DurableSpool {
     const protectedPriority = normalized.priority >= 3;
     const recordLimit = this.maxRecords + (protectedPriority ? this.protectedReserveRecords : 0);
     const byteLimit = this.maxBytes + (protectedPriority ? this.protectedReserveBytes : 0);
+    const operation = { op: 'put', record: normalized };
+    const operationBytes = this.operationBytes(operation);
     if (
       this.records.size + this.pendingPutIds.size + 1 > recordLimit
       || this.logicalBytes + this.pendingPutBytes + bytes > byteLimit
+      || !this.canAppend(operationBytes)
     ) {
-      queueMicrotask(() => done(Object.assign(new Error('Observer spool capacity reached'), {
-        code: 'ANYSENTRY_SPOOL_CAPACITY',
-      })));
+      queueMicrotask(() => done(
+        this.canAppend(operationBytes)
+          ? Object.assign(new Error('Observer spool capacity reached'), {
+              code: 'ANYSENTRY_SPOOL_CAPACITY',
+            })
+          : this.walCapacityError(operationBytes),
+      ));
       return;
     }
     this.pendingPutIds.add(id);
     this.pendingPutBytes += bytes;
-    this.appendAsync({ op: 'put', record: normalized }, false, (error) => {
+    this.appendAsync(operation, false, (error) => {
       this.pendingPutIds.delete(id);
       this.pendingPutBytes = Math.max(0, this.pendingPutBytes - bytes);
       if (error) {
@@ -417,6 +473,12 @@ class DurableSpool {
       queueMicrotask(() => done(undefined, 0));
       return 0;
     }
+    const operation = { op: 'ack', ids: acknowledged };
+    const operationBytes = this.operationBytes(operation);
+    if (!this.canAppend(operationBytes)) {
+      queueMicrotask(() => done(this.walCapacityError(operationBytes), 0));
+      return 0;
+    }
     const removed = [];
     for (const id of acknowledged) {
       const previous = this.records.get(id);
@@ -431,7 +493,7 @@ class DurableSpool {
         this.residentBodies = Math.max(0, this.residentBodies - 1);
       }
     }
-    this.appendAsync({ op: 'ack', ids: acknowledged }, false, (error) => {
+    this.appendAsync(operation, false, (error) => {
       if (error) {
         // The durable put still exists. Restore the in-memory live view so later replay is safe.
         for (const record of removed) {
@@ -473,7 +535,14 @@ class DurableSpool {
       fs.closeSync(fd);
     }
     this.deadLetterRecords += records.length;
-    return this.ack(records.map((record) => record.id));
+    try {
+      return this.ack(records.map((record) => record.id));
+    } catch (error) {
+      // The DLQ write is durable even when the ACK journal has reached its physical ceiling. Keep
+      // the live WAL records for a later retry instead of crashing or silently deleting them.
+      if (error?.code === 'ANYSENTRY_SPOOL_WAL_CAPACITY') return 0;
+      throw error;
+    }
   }
 
   available(excludedIds, limit) {
@@ -504,6 +573,7 @@ class DurableSpool {
   }
 
   atCapacity(priority = 0) {
+    if (this.atWalCapacity()) return true;
     const protectedPriority = Number(priority) >= 3;
     const recordLimit = this.maxRecords + (protectedPriority ? this.protectedReserveRecords : 0);
     const byteLimit = this.maxBytes + (protectedPriority ? this.protectedReserveBytes : 0);
@@ -592,6 +662,10 @@ class DurableSpool {
       walBytes: this.walBytes,
       oldestMs: Number.isFinite(oldest) ? Math.max(0, Date.now() - oldest) : 0,
       atCapacity: this.atCapacity(),
+      atWalCapacity: this.atWalCapacity(),
+      maxWalBytes: this.maxWalBytes,
+      pendingWriteBytes: this.pendingWriteBytes,
+      walCapacityRejects: this.walCapacityRejects,
       fsyncMode: this.fsyncMode,
       ackedRecords: this.ackedRecords,
       deadLetterRecords: this.deadLetterRecords,

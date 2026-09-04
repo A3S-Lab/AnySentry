@@ -448,6 +448,7 @@ const spool = new DurableSpool({
   dlqPath: process.env.FORWARD_DLQ_PATH,
   maxRecords: process.env.FORWARD_SPOOL_MAX_RECORDS,
   maxBytes: process.env.FORWARD_SPOOL_MAX_BYTES,
+  maxWalBytes: process.env.FORWARD_SPOOL_MAX_WAL_BYTES,
   compactMaxLiveRecords: process.env.FORWARD_SPOOL_COMPACT_MAX_LIVE_RECORDS,
   protectedReserveRecords: SPOOL_LIVE_RESERVE_EVENTS,
   protectedReserveBytes: SPOOL_LIVE_RESERVE_BYTES,
@@ -712,6 +713,7 @@ const activeControlRequests = new Set();
 let eventRequestsAborted = false;
 let outputDropped = 0;
 let errorCount = 0;
+let walAckErrors = 0;
 const MAX_BATCH_OUTCOME_KEYS = 32;
 let batchOutcomeCounts = Object.create(null);
 let eventKindCounts = Object.create(null);
@@ -2310,6 +2312,10 @@ function durableSpoolMetrics() {
     pendingPutBytes: status.pendingPutBytes,
     pendingOperations: status.pendingOperations,
     asyncSyncActive: status.asyncSyncActive,
+    walAtCapacity: status.atWalCapacity,
+    maxWalBytes: status.maxWalBytes,
+    pendingWriteBytes: status.pendingWriteBytes,
+    walCapacityRejects: status.walCapacityRejects,
     maxRecordBytes: status.maxRecordBytes,
     lazyRecords: status.lazyRecords,
     lazyReads: status.lazyReads,
@@ -2581,6 +2587,11 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         spoolParkedRecords: spoolMetrics.parkedRecords,
         spoolBytes: spoolMetrics.logicalBytes,
         spoolWalBytes: spoolMetrics.walBytes,
+        spoolWalAtCapacity: spoolMetrics.walAtCapacity,
+        spoolMaxWalBytes: spoolMetrics.maxWalBytes,
+        spoolPendingWriteBytes: spoolMetrics.pendingWriteBytes,
+        spoolWalCapacityRejects: spoolMetrics.walCapacityRejects,
+        spoolWalAckErrors: walAckErrors,
         spoolOldestAgeMs: spoolMetrics.oldestAgeMs,
         spoolAtCapacity: spoolMetrics.atCapacity,
         spoolAtProtectedCapacity: spoolMetrics.atProtectedCapacity,
@@ -2968,7 +2979,17 @@ function finishBatch(batch, outcome, retryDelivery) {
     else attributionCounts.queueParked += parkedDropped;
   }
   if (acceptedItems.length) {
-    spool.ackAsync(acceptedItems.map((item) => item.spoolId).filter(Boolean));
+    spool.ackAsync(
+      acceptedItems.map((item) => item.spoolId).filter(Boolean),
+      (error) => {
+        if (!error) return;
+        walAckErrors += 1;
+        errorCount += 1;
+        // An ACK journal write failing at the physical ceiling restores the in-memory live set;
+        // leave the records for a later retry/compaction rather than treating them as delivered.
+        scheduleSpoolReplay();
+      },
+    );
   }
   if (rejectedItems.length) {
     spool.deadLetter(
@@ -3338,7 +3359,13 @@ function enqueue(body, priority, countForwarded = true, kind = '', recovered = f
     walPendingEvents = Math.max(0, walPendingEvents - 1);
     walPendingBytes = Math.max(0, walPendingBytes - bytes);
     if (error) {
-      recordQueueDrop(kind, priority, 'durable_spool_error');
+      recordQueueDrop(
+        kind,
+        priority,
+        error.code === 'ANYSENTRY_SPOOL_WAL_CAPACITY'
+          ? 'wal_pending_capacity'
+          : 'durable_spool_error',
+      );
       updateInputFlow();
       return;
     }
