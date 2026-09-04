@@ -1,4 +1,4 @@
-import { BadRequestException, Body, ConflictException, Controller, Get, Header, Headers, HttpCode, NotFoundException, OnModuleDestroy, Optional, Param, PayloadTooLargeException, Post, Put, Query, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, Get, Header, Headers, HttpCode, NotFoundException, OnModuleDestroy, Optional, Param, PayloadTooLargeException, Post, Put, Query, ServiceUnavailableException, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { Observable, exhaustMap, map, mergeMap, timer } from 'rxjs';
@@ -195,6 +195,8 @@ const CANONICAL_SEMANTIC_SCAN_CONCURRENCY = 4;
 const CANONICAL_SESSION_CACHE_TTL_MS = 2_000;
 const CANONICAL_SESSION_CACHE_MAX_ENTRIES = 4;
 const CANONICAL_SESSION_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+const CANONICAL_DIRECTORY_INFLIGHT_MAX = 16;
+const CANONICAL_SESSION_INFLIGHT_MAX = 16;
 
 function canonicalQueryScalar(
   query: Record<string, unknown> | undefined,
@@ -6157,6 +6159,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       maxBytes: CANONICAL_DIRECTORY_CACHE_MAX_BYTES,
       ttlMs: CANONICAL_DIRECTORY_CACHE_TTL_MS,
       inFlight: this.canonicalDirectoryInFlight.size,
+      maxInFlight: CANONICAL_DIRECTORY_INFLIGHT_MAX,
       evicted: this.canonicalDirectoryCacheEvicted,
       expired: this.canonicalDirectoryCacheExpired,
       dropped: this.canonicalDirectoryCacheDropped,
@@ -6249,6 +6252,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       maxBytes: CANONICAL_SESSION_CACHE_MAX_BYTES,
       ttlMs: CANONICAL_SESSION_CACHE_TTL_MS,
       inFlight: this.canonicalSessionInFlight.size,
+      maxInFlight: CANONICAL_SESSION_INFLIGHT_MAX,
       evicted: this.canonicalSessionCacheEvicted,
       expired: this.canonicalSessionCacheExpired,
       dropped: this.canonicalSessionCacheDropped,
@@ -9771,6 +9775,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     }
     const inFlight = this.canonicalDirectoryInFlight.get(key);
     if (inFlight) return inFlight;
+    if (this.canonicalDirectoryInFlight.size >= CANONICAL_DIRECTORY_INFLIGHT_MAX) {
+      throw new ServiceUnavailableException('Canonical directory projection is busy; retry the latest selection');
+    }
     const operation = this.agentConversationDirectoryV4(
       this.canonicalConversationDirectoryQuery(query),
       headers,
@@ -10198,6 +10205,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     }
     const inFlight = this.canonicalSessionInFlight.get(key);
     if (inFlight) return inFlight;
+    if (this.canonicalSessionInFlight.size >= CANONICAL_SESSION_INFLIGHT_MAX) {
+      throw new ServiceUnavailableException('Canonical session projection is busy; retry the latest selection');
+    }
     const operation = this.computeCanonicalSessionResources(query, headers)
       .then((value) => {
         this.rememberCanonicalSessionProjection(key, value);
