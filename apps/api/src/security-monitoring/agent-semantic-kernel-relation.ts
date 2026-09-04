@@ -612,16 +612,25 @@ function unlinkedRelation(
   coveragePartial: boolean,
 ): T.AgentSemanticKernelRelation {
   const invocationId = toolInvocationId(input.event, input.interaction);
+  // Keep the unresolved relation on the exact same canonical-link identity path as linked and
+  // ambiguous relations.  The previous `supports`/source-only link differed from
+  // `canonicalEvidenceLinkForRelation`'s `executes_as`/semantic-id link, so a late re-projection
+  // could leave an older unmatched EvidenceLink as the only durable row even though the latest
+  // relation revision had been computed.  The unresolved edge is still explicit and has zero
+  // confidence; this only makes its revision and bidirectional locator stable.
   const canonicalLink = createEvidenceLink({
     fromType: 'tool_call',
     fromId: invocationId,
     toType: 'kernel_fact',
     toId: `unmatched:${input.event.semanticEventId}`,
-    relation: 'supports',
+    relation: 'executes_as',
     method: 'none',
     confidence: 0,
     authority: 'inferred',
-    evidenceRefs: input.interaction.sourceObservationIds ?? [],
+    evidenceRefs: [
+      ...(input.interaction.sourceObservationIds ?? []),
+      input.event.semanticEventId,
+    ],
     algorithmVersion: `semantic-kernel-relation.v${AGENT_SEMANTIC_KERNEL_RELATION_VERSION}`,
     status: coveragePartial ? 'coverage_gap' : 'unmatched',
     validFromUnixNs: input.interaction.startedAtUnixNs,

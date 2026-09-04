@@ -8,6 +8,7 @@ const require = createRequire(import.meta.url);
 const {
   buildSemanticKernelRelationBatch,
   buildSemanticKernelRelations,
+  canonicalEvidenceLinksForRelations,
   semanticKernelRelationBatchWindow,
   toolInvocationId,
 } = require('../apps/api/dist/security-monitoring/agent-semantic-kernel-relation.js');
@@ -488,6 +489,11 @@ const coverageGap = buildSemanticKernelRelations(
   true,
 );
 assert.equal(coverageGap[0].status, 'coverage_gap');
+assert.equal(
+  canonicalEvidenceLinksForRelations(coverageGap)[0].linkId,
+  coverageGap[0].evidenceLinkId,
+  'unmatched/coverage-gap relation and canonical EvidenceLink must share one stable edge identity',
+);
 
 const earlierCompetingCall = {
   ...toolCall,
