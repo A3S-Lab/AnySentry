@@ -159,7 +159,11 @@ try {
     fsyncMs: 60_000,
   });
   assert.equal(streamingSpool.status().records, 1);
+  assert.equal(streamingSpool.status().lazyRecords, 1, 'recovered bodies stay on disk until replay');
+  assert.equal(streamingSpool.status().residentBodies, 0, 'lazy recovery does not retain body objects');
   assert.equal(streamingSpool.available(new Set(), 1)[0].body.line, unicodeLine);
+  assert.equal(streamingSpool.status().lazyReads, 1);
+  assert.equal(streamingSpool.status().residentBodies, 1);
   streamingSpool.close();
 
   const asyncPath = path.join(temporary, 'async-put.wal');

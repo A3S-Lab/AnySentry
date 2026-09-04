@@ -224,6 +224,23 @@ const WAL_PENDING_MAX_BYTES = boundedNumber(
   16 * 1024 * 1024,
   2 * 1024 * 1024 * 1024,
 );
+// Replayed WAL records are old evidence and must not consume the entire live delivery budget.
+// These reservations are inside the existing hard caps (not extra memory); when the API is slow,
+// new observations can still enter the queue once their own bounded WAL admission succeeds.
+const SPOOL_REPLAY_RESERVE_EVENTS = boundedNumber(
+  process.env.FORWARD_SPOOL_REPLAY_RESERVE_EVENTS,
+  Math.min(4_096, Math.floor(MAX_OUTSTANDING_EVENTS / 4)),
+  0,
+  MAX_OUTSTANDING_EVENTS,
+);
+const SPOOL_REPLAY_RESERVE_BYTES = boundedNumber(
+  process.env.FORWARD_SPOOL_REPLAY_RESERVE_BYTES,
+  Math.min(16 * 1024 * 1024, Math.floor(MAX_OUTSTANDING_BYTES / 4)),
+  0,
+  MAX_OUTSTANDING_BYTES,
+);
+const MAX_SPOOL_READ_BLOCKED = 4_096;
+const SPOOL_READ_RETRY_MS = 10_000;
 const HTTP_TIMEOUT_MS = boundedNumber(process.env.FORWARD_HTTP_TIMEOUT_MS, 10_000, 1_000, 120_000);
 const CONTROL_HTTP_TIMEOUT_MS = boundedNumber(
   process.env.FORWARD_CONTROL_HTTP_TIMEOUT_MS,
@@ -678,6 +695,9 @@ let rootLivenessTimer;
 let batchTimer;
 let retryTimer;
 let spoolReplayTimer;
+let spoolReplayNotBefore = 0;
+const spoolReadBlocked = new Map();
+let spoolReplayReadErrors = 0;
 let shutdownForceTimer;
 let shutdownDeadline = 0;
 let eventDrainDeadline = 0;
@@ -2058,6 +2078,8 @@ function eventQueueMetrics(now = Date.now()) {
     walPendingBytes,
     walPendingEventLimit: WAL_PENDING_MAX_EVENTS,
     walPendingByteLimit: WAL_PENDING_MAX_BYTES,
+    spoolReplayReserveEvents: SPOOL_REPLAY_RESERVE_EVENTS,
+    spoolReplayReserveBytes: SPOOL_REPLAY_RESERVE_BYTES,
   };
 }
 
@@ -2079,6 +2101,13 @@ function durableSpoolMetrics() {
     pendingPutBytes: status.pendingPutBytes,
     pendingOperations: status.pendingOperations,
     asyncSyncActive: status.asyncSyncActive,
+    maxRecordBytes: status.maxRecordBytes,
+    lazyRecords: status.lazyRecords,
+    lazyReads: status.lazyReads,
+    lazyReadErrors: status.lazyReadErrors,
+    residentBodies: status.residentBodies,
+    readBlockedRecords: spoolReadBlocked.size,
+    replayReadErrors: spoolReplayReadErrors,
   };
 }
 
@@ -2347,6 +2376,13 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         spoolPendingPutRecords: spoolMetrics.pendingPutRecords,
         spoolPendingPutBytes: spoolMetrics.pendingPutBytes,
         spoolPendingOperations: spoolMetrics.pendingOperations,
+        spoolMaxRecordBytes: spoolMetrics.maxRecordBytes,
+        spoolLazyRecords: spoolMetrics.lazyRecords,
+        spoolLazyReads: spoolMetrics.lazyReads,
+        spoolLazyReadErrors: spoolMetrics.lazyReadErrors,
+        spoolResidentBodies: spoolMetrics.residentBodies,
+        spoolReadBlockedRecords: spoolMetrics.readBlockedRecords,
+        spoolReplayReadErrors: spoolMetrics.replayReadErrors,
         queueBytes: eventQueues.queueBytes,
         inflightEvents: eventQueues.inflightEvents,
         inflightBytes: eventQueues.inflightBytes,
@@ -2367,6 +2403,8 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         walPendingBytes: eventQueues.walPendingBytes,
         walPendingEventLimit: eventQueues.walPendingEventLimit,
         walPendingByteLimit: eventQueues.walPendingByteLimit,
+        spoolReplayReserveEvents: eventQueues.spoolReplayReserveEvents,
+        spoolReplayReserveBytes: eventQueues.spoolReplayReserveBytes,
         identitySnapshotReady: workload.ready,
         identitySnapshotVersion: workload.version,
         identityKubernetesVersion: workload.sources?.kubernetes?.version,
@@ -2827,7 +2865,11 @@ function admitDurableEvent(
   kind,
   recovered,
 ) {
-  if (!makeQueueRoom(bytes, priority)) {
+  // Keep replayed records in a lower queue bucket than newly observed records of the same source
+  // priority. This is only a scheduler hint: the durable record's original priority remains on
+  // `item.priority` for DLQ/accounting, while live observations can bypass an old replay burst.
+  const queuePriority = recovered ? Math.max(0, priority - 1) : priority;
+  if (!makeQueueRoom(bytes, queuePriority)) {
     if (recovered) attributionCounts.spoolReplayDeferred++;
     else recordQueueDrop(
       kind,
@@ -2843,6 +2885,7 @@ function admitDurableEvent(
     spoolId,
     kind,
     priority,
+    queuePriority,
     bytes,
     createdAt: Date.now(),
     retryAttempt: 0,
@@ -2853,7 +2896,7 @@ function admitDurableEvent(
     recovered,
     settled: false,
   };
-  const result = pending.push(item, priority);
+  const result = pending.push(item, queuePriority);
   if (!result.accepted) {
     if (recovered) attributionCounts.spoolReplayDeferred++;
     else recordQueueDrop(kind, priority, 'queue_rejected', Boolean(spoolId));
@@ -2948,11 +2991,40 @@ function enqueue(body, priority, countForwarded = true, kind = '', recovered = f
 
 function scheduleSpoolReplay(delayMs = SPOOL_REPLAY_INTERVAL_MS) {
   if (closing || transportsClosed || spoolReplayTimer) return;
+  const requestedAt = Date.now() + Math.max(0, delayMs);
+  const dueAt = Math.max(requestedAt, spoolReplayNotBefore);
   spoolReplayTimer = setTimeout(() => {
     spoolReplayTimer = undefined;
     pumpDurableSpool();
-  }, Math.max(0, delayMs));
+  }, Math.max(0, dueAt - Date.now()));
   spoolReplayTimer.unref();
+}
+
+function blockedSpoolRecordIds(now = Date.now()) {
+  const excluded = new Set(activeSpoolIds);
+  for (const [id, retryAt] of spoolReadBlocked) {
+    if (retryAt <= now) {
+      spoolReadBlocked.delete(id);
+      continue;
+    }
+    excluded.add(id);
+  }
+  return excluded;
+}
+
+function rememberSpoolReadFailure(record, error) {
+  const id = String(record?.id || '');
+  if (!id) return;
+  spoolReplayReadErrors += 1;
+  if (!spoolReadBlocked.has(id) && spoolReadBlocked.size >= MAX_SPOOL_READ_BLOCKED) {
+    const oldest = spoolReadBlocked.keys().next().value;
+    if (oldest) spoolReadBlocked.delete(oldest);
+  }
+  spoolReadBlocked.set(id, Date.now() + SPOOL_READ_RETRY_MS);
+  console.error(
+    `[observer-forward] durable spool record read deferred: id=${id}; `
+      + `${String(error?.message || error).slice(0, 500)}`,
+  );
 }
 
 function pumpDurableSpool() {
@@ -2962,30 +3034,45 @@ function pumpDurableSpool() {
     scheduleSpoolReplay();
     return;
   }
-  const availableSlots = Math.max(0, MAX_OUTSTANDING_EVENTS - outstandingEvents);
-  if (availableSlots <= 0 || outstandingBytes >= MAX_OUTSTANDING_BYTES) {
+  // Leave a bounded slice of the unified queue for live stdin traffic. Without this reserve a
+  // large recovery can occupy every slot with retrying historical records and make the collector
+  // pipe back up even after the API starts accepting new observations.
+  const availableSlots = Math.max(
+    0,
+    MAX_OUTSTANDING_EVENTS - SPOOL_REPLAY_RESERVE_EVENTS - outstandingEvents,
+  );
+  const availableBytes = Math.max(
+    0,
+    MAX_OUTSTANDING_BYTES - SPOOL_REPLAY_RESERVE_BYTES - outstandingBytes,
+  );
+  if (availableSlots <= 0 || availableBytes <= 0) {
     scheduleSpoolReplay();
     return;
   }
   const records = spool.available(
-    activeSpoolIds,
+    blockedSpoolRecordIds(),
     Math.min(SPOOL_REPLAY_BATCH_SIZE, availableSlots),
   );
   let admitted = 0;
   for (const record of records) {
     attributionCounts.spoolReplayAttempts++;
-    if (!enqueue(
-      record.body,
-      record.priority,
-      false,
-      durableRecordKind(record.body),
-      true,
-    )) break;
+    let body;
+    try {
+      body = record.body;
+    } catch (error) {
+      rememberSpoolReadFailure(record, error);
+      continue;
+    }
+    if (!enqueue(body, record.priority, false, durableRecordKind(body), true)) break;
     admitted++;
     attributionCounts.spoolReplayAdmitted++;
+    if (outstandingBytes >= MAX_OUTSTANDING_BYTES - SPOOL_REPLAY_RESERVE_BYTES) break;
   }
   if (admitted > 0) pumpEventWork();
-  scheduleSpoolReplay(admitted > 0 ? 0 : SPOOL_REPLAY_INTERVAL_MS);
+  // Never recursively drain the whole WAL in one turn. A fixed interval gives the API a chance
+  // to recover and lets stdin/heartbeat/control work run between replay batches.
+  spoolReplayNotBefore = Date.now() + SPOOL_REPLAY_INTERVAL_MS;
+  scheduleSpoolReplay(SPOOL_REPLAY_INTERVAL_MS);
 }
 
 function abandonPendingEvents() {
@@ -3471,7 +3558,6 @@ async function start() {
     + `recovered=${spoolStatus.records}; bytes=${spoolStatus.logicalBytes}; `
     + `fsync=${spoolStatus.fsyncMode}`,
   );
-  pumpDurableSpool();
 
   // The central catalog is the authoritative definition source. ConfigMap signatures and
   // deployment environment values above remain a bounded bootstrap/LKG path only; wait for one
@@ -3578,6 +3664,10 @@ async function start() {
   rootLivenessTimer.unref();
 
   rl.resume();
+  // Start historical replay only after the control-plane bootstrap and stdin admission are ready.
+  // This prevents synchronous recovery work from monopolizing the event loop while the collector
+  // is still establishing its pipe, and the replay pump itself remains interval-throttled.
+  pumpDurableSpool();
 }
 
 process.once('SIGINT', () => handleShutdownSignal('SIGINT'));

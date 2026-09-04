@@ -32,6 +32,12 @@ class DurableSpool {
     this.compactMinBytes = boundedNumber(options.compactMinBytes, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024 * 1024);
     this.compactMaxLiveRecords = boundedNumber(options.compactMaxLiveRecords, 16_384, 1, 250_000);
     this.loadChunkBytes = boundedNumber(options.loadChunkBytes, 1024 * 1024, 64, 4 * 1024 * 1024);
+    this.maxRecordBytes = boundedNumber(
+      options.maxRecordBytes,
+      16 * 1024 * 1024,
+      64 * 1024,
+      64 * 1024 * 1024,
+    );
     this.writeAsync = options.writeAsync || fs.write.bind(fs);
     this.onAsyncError = typeof options.onAsyncError === 'function' ? options.onAsyncError : () => {};
     this.filePath = path.resolve(options.filePath);
@@ -45,6 +51,13 @@ class DurableSpool {
     this.deadLetterRecords = 0;
     this.compactionDeferred = 0;
     this.compactions = 0;
+    // Recovered records are represented by a bounded metadata index. Their (potentially very
+    // large) JSON bodies stay on disk until replay/compaction actually needs one. This avoids
+    // retaining a second ~1 GiB object graph when a node restarts with a full WAL.
+    this.lazyRecords = 0;
+    this.lazyReads = 0;
+    this.lazyReadErrors = 0;
+    this.residentBodies = 0;
     this.asyncOperations = [];
     this.asyncWriteActive = false;
     this.pendingPutIds = new Set();
@@ -54,6 +67,9 @@ class DurableSpool {
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
     this.load();
     this.fd = fs.openSync(this.filePath, 'a', 0o600);
+    // Keep a separate read-only descriptor: the append descriptor is intentionally write-only on
+    // POSIX, and lazy replay must not reopen the WAL for every record.
+    this.readFd = fs.openSync(this.filePath, 'r');
     this.walBytes = fs.fstatSync(this.fd).size;
     if (this.fsyncMode === 'periodic') {
       this.fsyncTimer = setInterval(() => this.syncAsync(), this.fsyncMs);
@@ -61,20 +77,32 @@ class DurableSpool {
     }
   }
 
-  applyLoadedOperation(operation) {
+  applyLoadedOperation(operation, walOffset, walLineBytes) {
     if (operation.op === 'put' && operation.record?.id && operation.record?.body) {
       const previous = this.records.get(operation.record.id);
       if (previous) {
         this.logicalBytes -= previous.bytes;
         this.prioritySets[previous.priority].delete(previous.id);
+        if (previous._lazyBody === true && previous._bodyLoaded !== true) {
+          this.lazyRecords = Math.max(0, this.lazyRecords - 1);
+        } else {
+          this.residentBodies = Math.max(0, this.residentBodies - 1);
+        }
       }
       const record = {
         id: String(operation.record.id),
-        body: operation.record.body,
         priority: boundedNumber(operation.record.priority, 0, 0, 5),
         queuedAt: boundedNumber(operation.record.queuedAt, Date.now(), 0, Number.MAX_SAFE_INTEGER),
         bytes: Buffer.byteLength(JSON.stringify(operation.record.body)),
       };
+      if (Number.isSafeInteger(walOffset) && walOffset >= 0 && Number.isSafeInteger(walLineBytes) && walLineBytes > 0) {
+        this.attachLazyBody(record, walOffset, walLineBytes);
+        this.lazyRecords += 1;
+      } else {
+        record.body = operation.record.body;
+        record._bodyLoaded = true;
+        this.residentBodies += 1;
+      }
       this.records.set(record.id, record);
       this.prioritySets[record.priority].add(record.id);
       this.logicalBytes += record.bytes;
@@ -85,7 +113,65 @@ class DurableSpool {
         this.logicalBytes -= previous.bytes;
         this.records.delete(id);
         this.prioritySets[previous.priority].delete(id);
+        if (previous._lazyBody === true && previous._bodyLoaded !== true) {
+          this.lazyRecords = Math.max(0, this.lazyRecords - 1);
+        } else {
+          this.residentBodies = Math.max(0, this.residentBodies - 1);
+        }
       }
+    }
+  }
+
+  attachLazyBody(record, walOffset, walLineBytes) {
+    const owner = this;
+    Object.defineProperties(record, {
+      _lazyBody: { value: true, writable: true, enumerable: false, configurable: true },
+      _bodyLoaded: { value: false, writable: true, enumerable: false, configurable: true },
+      _bodyValue: { value: undefined, writable: true, enumerable: false, configurable: true },
+      _walOffset: { value: walOffset, writable: true, enumerable: false, configurable: true },
+      _walLineBytes: { value: walLineBytes, writable: true, enumerable: false, configurable: true },
+    });
+    Object.defineProperty(record, 'body', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        if (!record._bodyLoaded) {
+          record._bodyValue = owner.readLazyBody(record);
+          record._bodyLoaded = true;
+          owner.lazyRecords = Math.max(0, owner.lazyRecords - 1);
+          owner.residentBodies += 1;
+        }
+        return record._bodyValue;
+      },
+      set(value) {
+        if (!record._bodyLoaded) {
+          owner.lazyRecords = Math.max(0, owner.lazyRecords - 1);
+          owner.residentBodies += 1;
+        }
+        record._bodyValue = value;
+        record._bodyLoaded = true;
+      },
+    });
+  }
+
+  readLazyBody(record) {
+    this.lazyReads += 1;
+    try {
+      const lineBytes = Number(record._walLineBytes);
+      if (!Number.isSafeInteger(lineBytes) || lineBytes <= 0 || lineBytes > this.maxRecordBytes) {
+        throw new Error(`Observer spool record exceeds bounded read size (${lineBytes} bytes)`);
+      }
+      const buffer = Buffer.allocUnsafe(lineBytes);
+      const bytesRead = fs.readSync(this.readFd, buffer, 0, lineBytes, record._walOffset);
+      const line = buffer.subarray(0, bytesRead).toString('utf8').replace(/\n$/u, '');
+      const operation = JSON.parse(line);
+      if (operation.op !== 'put' || String(operation.record?.id || '') !== record.id || !operation.record?.body) {
+        throw new Error(`Observer spool record ${record.id} changed at WAL offset ${record._walOffset}`);
+      }
+      return operation.record.body;
+    } catch (error) {
+      this.lazyReadErrors += 1;
+      throw new Error(`Observer spool record ${record.id} could not be read: ${error.message}`);
     }
   }
 
@@ -95,12 +181,15 @@ class DurableSpool {
     const buffer = Buffer.allocUnsafe(this.loadChunkBytes);
     const decoder = new StringDecoder('utf8');
     let pending = '';
+    // `pendingOffset` is the byte offset of the first decoded character currently in `pending`.
+    // Buffer.byteLength(line) keeps the index correct for UTF-8 records split across chunks.
+    let pendingOffset = 0;
     let lineNumber = 0;
-    const applyLine = (line) => {
+    const applyLine = (line, offset, lineBytes) => {
       lineNumber += 1;
       if (!line) return;
       try {
-        this.applyLoadedOperation(JSON.parse(line));
+        this.applyLoadedOperation(JSON.parse(line), offset, lineBytes);
       } catch (error) {
         throw new Error(`Observer spool is corrupt at line ${lineNumber}: ${error.message}`);
       }
@@ -114,7 +203,10 @@ class DurableSpool {
         while (true) {
           const newline = pending.indexOf('\n', start);
           if (newline < 0) break;
-          applyLine(pending.slice(start, newline));
+          const line = pending.slice(start, newline);
+          const lineBytes = Buffer.byteLength(line) + 1;
+          applyLine(line, pendingOffset, lineBytes);
+          pendingOffset += lineBytes;
           start = newline + 1;
         }
         pending = pending.slice(start);
@@ -124,7 +216,7 @@ class DurableSpool {
         // A process or host crash can leave only the final, non-newline-terminated append torn.
         // A complete final operation is still applied; malformed trailing bytes are ignored.
         try {
-          this.applyLoadedOperation(JSON.parse(pending));
+          this.applyLoadedOperation(JSON.parse(pending), pendingOffset, Buffer.byteLength(pending));
         } catch {
           // Safe replay boundary: every preceding newline-terminated operation was validated.
         }
@@ -232,6 +324,7 @@ class DurableSpool {
     this.records.set(normalized.id, { ...normalized, bytes });
     this.prioritySets[normalized.priority].add(normalized.id);
     this.logicalBytes += bytes;
+    this.residentBodies += 1;
     return true;
   }
 
@@ -273,6 +366,7 @@ class DurableSpool {
       this.records.set(id, { ...normalized, bytes });
       this.prioritySets[normalized.priority].add(id);
       this.logicalBytes += bytes;
+      this.residentBodies += 1;
       done(undefined, true);
     });
   }
@@ -288,6 +382,11 @@ class DurableSpool {
       this.logicalBytes -= previous.bytes;
       this.records.delete(id);
       this.prioritySets[previous.priority].delete(id);
+      if (previous._lazyBody === true && previous._bodyLoaded !== true) {
+        this.lazyRecords = Math.max(0, this.lazyRecords - 1);
+      } else {
+        this.residentBodies = Math.max(0, this.residentBodies - 1);
+      }
     }
     this.ackedRecords += acknowledged.length;
     this.compactIfNeeded();
@@ -308,6 +407,11 @@ class DurableSpool {
       this.logicalBytes -= previous.bytes;
       this.records.delete(id);
       this.prioritySets[previous.priority].delete(id);
+      if (previous._lazyBody === true && previous._bodyLoaded !== true) {
+        this.lazyRecords = Math.max(0, this.lazyRecords - 1);
+      } else {
+        this.residentBodies = Math.max(0, this.residentBodies - 1);
+      }
     }
     this.appendAsync({ op: 'ack', ids: acknowledged }, false, (error) => {
       if (error) {
@@ -317,6 +421,11 @@ class DurableSpool {
           this.records.set(record.id, record);
           this.prioritySets[record.priority].add(record.id);
           this.logicalBytes += record.bytes;
+          if (record._lazyBody === true && record._bodyLoaded !== true) {
+            this.lazyRecords += 1;
+          } else {
+            this.residentBodies += 1;
+          }
         }
         done(error, 0);
         return;
@@ -400,11 +509,15 @@ class DurableSpool {
     const fd = fs.openSync(temporary, 'wx', 0o600);
     try {
       for (const record of this.records.values()) {
+        // Materialize at most the bounded live set allowed by compactMaxLiveRecords. The normal
+        // full-WAL recovery path is therefore lazy; compaction is the explicit point where bodies
+        // are read, rewritten and (necessarily) resident for the short write window.
+        const body = record.body;
         fs.writeSync(fd, `${JSON.stringify({
           op: 'put',
           record: {
             id: record.id,
-            body: record.body,
+            body,
             priority: record.priority,
             queuedAt: record.queuedAt,
           },
@@ -417,7 +530,25 @@ class DurableSpool {
     fs.renameSync(temporary, this.filePath);
     if (this.fd !== undefined) fs.closeSync(this.fd);
     this.fd = fs.openSync(this.filePath, 'a', 0o600);
+    if (this.readFd !== undefined) fs.closeSync(this.readFd);
+    this.readFd = fs.openSync(this.filePath, 'r');
     this.walBytes = fs.fstatSync(this.fd).size;
+    // Existing records have already been materialized while writing the compacted snapshot. Drop
+    // stale offsets and keep the bounded body cache as the new source of truth.
+    for (const record of this.records.values()) {
+      if (record._lazyBody === true && record._bodyLoaded !== true) {
+        // This branch is defensive: a read failure above throws before the rename. It keeps the
+        // index counters coherent if a future writer implementation changes that ordering.
+        this.lazyRecords = Math.max(0, this.lazyRecords - 1);
+        this.residentBodies += 1;
+        record._bodyLoaded = true;
+      }
+      if (record._lazyBody === true) {
+        record._lazyBody = false;
+        record._walOffset = undefined;
+        record._walLineBytes = undefined;
+      }
+    }
     this.compactions += 1;
     return true;
   }
@@ -446,6 +577,11 @@ class DurableSpool {
       compactionDeferred: this.compactionDeferred,
       compactions: this.compactions,
       compactMaxLiveRecords: this.compactMaxLiveRecords,
+      maxRecordBytes: this.maxRecordBytes,
+      lazyRecords: this.lazyRecords,
+      lazyReads: this.lazyReads,
+      lazyReadErrors: this.lazyReadErrors,
+      residentBodies: this.residentBodies,
     };
   }
 
@@ -464,6 +600,8 @@ class DurableSpool {
     this.closed = true;
     if (this.fd !== undefined) fs.closeSync(this.fd);
     this.fd = undefined;
+    if (this.readFd !== undefined) fs.closeSync(this.readFd);
+    this.readFd = undefined;
   }
 }
 

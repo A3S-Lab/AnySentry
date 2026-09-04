@@ -272,15 +272,21 @@ function main() {
   process.on('SIGTERM', () => handleExternalSignal('SIGTERM'));
   process.on('SIGINT', () => handleExternalSignal('SIGINT'));
 
-  collector = spawn(collectorConfig.command, collectorConfig.args, {
-    env: process.env,
-    shell: false,
-    stdio: ['ignore', 'pipe', 'inherit'],
-  });
+  // Start the forwarder first. Its DurableSpool recovery is deliberately synchronous so the
+  // on-disk WAL is indexed before replay; starting the collector first lets a recovered multi-
+  // hundred-thousand-record spool block the pipe while the collector's bounded critical queue
+  // fills and begins reporting output drops. The forwarder still pauses stdin until its control
+  // plane is ready, so this ordering creates a real bounded backpressure boundary before the
+  // collector can emit its first burst.
   forwarder = spawn(forwarderConfig.command, forwarderConfig.args, {
     env: process.env,
     shell: false,
     stdio: ['pipe', 'inherit', 'inherit'],
+  });
+  collector = spawn(collectorConfig.command, collectorConfig.args, {
+    env: process.env,
+    shell: false,
+    stdio: ['ignore', 'pipe', 'inherit'],
   });
   states = {
     collector: {
