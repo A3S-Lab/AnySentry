@@ -19,7 +19,7 @@ images:
     digest: sha256:c7c78c92399cad11868ee3c022bdd3cafd17da1c8a8ff1ea501f02957b3c580a
   - name: ghcr.io/a3s-lab/anysentry-workspace-scanner
     newName: 127.0.0.1:5000/anysentry-workspace-scanner
-    digest: sha256:6d70223604cad8ee030a1e7eec90385b7c854f0829977dd4565d0a91fb223799
+    digest: sha256:7a20f1bda72b141a97b89ddf4ecfaf398a0f695a8a9ca49bf42db19edc8a0e3c
   - name: 127.0.0.1:5000/anysentry-context-probe
     newName: 127.0.0.1:5000/anysentry-context-probe
     digest: sha256:362c26fc8c2bc50a711815ef5111db48edbd349829b2fc1776c280e5667a2c58
