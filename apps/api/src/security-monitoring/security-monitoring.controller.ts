@@ -12961,6 +12961,28 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       throw new NotFoundException('semantic record not found');
     }
 
+    // EvidenceLinks are an append-only side lane and can outlive the Session/Timeline projection.
+    // Read the requested semantic reference directly once, with the same bounded timeout as the
+    // other deep-link reads.  If the expensive timeline projection later times out, this gives the
+    // caller a truthful evidence-only response instead of an empty 200/ambiguous result.
+    let directEvidenceRead: Awaited<ReturnType<CanonicalObservabilityService['readDurableEvidenceLinksByEvidenceRef']>> | undefined;
+    if (this.canonicalObservability) {
+      try {
+        directEvidenceRead = await withCanonicalProjectionTimeout(
+          this.canonicalObservability.readDurableEvidenceLinksByEvidenceRef(id, 256),
+          CANONICAL_SEMANTIC_EVIDENCE_TIMEOUT_MS,
+        );
+      } catch (error) {
+        if (!isCanonicalProjectionDegradation(error)) throw error;
+        directEvidenceRead = {
+          items: [],
+          source: 'memory_hot_ring',
+          degraded: true,
+          reasons: ['canonical_evidence_link_projection_unavailable'],
+        };
+      }
+    }
+
     let sessions: CanonicalSessionProjection;
     let timelineSearch: CanonicalSemanticTimelineSearch | undefined;
     // A durable SemanticRecord already carries the server-derived Session identity.  Resolve that
@@ -13254,6 +13276,75 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         // A valid timeline event without a materialized relation is a coverage gap, not a bad
         // identifier.  Keep the requested/alias ids in the response for later replay.
       }
+    }
+
+    // The canonical EvidenceLink lane is independently durable.  If Session/Timeline or the
+    // legacy relation projection is unavailable, return the direct link rows as an evidence-only
+    // response.  This is intentionally partial (Kernel rows and semantic payloads are not
+    // invented) but keeps a valid API/UI deep link useful during a storage stall.
+    if (!evidence && directEvidenceRead?.items.length) {
+      const directLinks = directEvidenceRead.items;
+      const directRelationStatus: T.AgentSemanticKernelRelationStatus = directLinks.some((link) => link.status === 'confirmed')
+        ? 'linked_exact'
+        : directLinks.some((link) => link.status === 'strong')
+          ? 'linked_strong'
+          : directLinks.some((link) => link.status === 'ambiguous')
+            ? 'ambiguous'
+            : 'coverage_gap';
+      const directInteractionIds = [...new Set([
+        ...(selected?.event.sourceInteractionIds ?? []),
+        ...(resolvedSemanticRecord?.sourceRefs ?? []).filter((value) => /^mi_[a-f0-9]{24}$/u.test(value)),
+      ])].slice(0, 64);
+      const directEvidenceRefs = [...new Set(directLinks.flatMap((link) => link.evidenceRefs))].slice(0, 128);
+      const directBundleIds = [...new Set(directLinks
+        .filter((link) => !link.toId.startsWith('unmatched:'))
+        .map((link) => link.toId))].slice(0, 128);
+      const now = new Date().toISOString();
+      const directSource: T.QueryCoverage['source'] = directEvidenceRead.source === 'memory_hot_ring'
+        ? 'memory_hot_ring'
+        : directEvidenceRead.source === 'canonical_store+hot_delta'
+          ? 'clickhouse+hot_delta'
+          : 'clickhouse';
+      evidence = {
+        schemaVersion: 'anysentry.agent_semantic_evidence.v1',
+        semanticEventId: selected?.event.semanticEventId ?? id,
+        conversationId: selected?.session.conversationId
+          ?? resolvedSemanticRecord?.canonicalSessionId
+          ?? resolvedSemanticRecord?.sessionId
+          ?? query.sessionId
+          ?? id,
+        ...(directLinks[0]?.fromId ? { toolInvocationId: directLinks[0].fromId } : {}),
+        interactionIds: directInteractionIds,
+        interactionEvidenceEventIds: directEvidenceRefs,
+        relations: [],
+        kernelEvents: [],
+        relationStatus: directRelationStatus,
+        evidenceBundleEventIds: directBundleIds,
+        canonicalEvidenceLinks: directLinks,
+        canonicalEvidenceLinksSource: directEvidenceRead.source,
+        canonicalEvidenceLinksCoverage: {
+          partial: true,
+          reasons: [...new Set([
+            ...directEvidenceRead.reasons,
+            'semantic_timeline_projection_unavailable',
+            'canonical_evidence_link_direct_fallback',
+          ])],
+        },
+        classificationView: query.classificationView ?? 'as_observed',
+        reviewRevision: 0,
+        coverage: {
+          requestedFrom: query.startTime ?? now,
+          requestedTo: query.endTime ?? now,
+          snapshotAsOf: query.snapshotAsOf ?? now,
+          asOf: query.snapshotAsOf ?? now,
+          completeness: 'partial',
+          partial: true,
+          partialReason: 'projection_timeout',
+          source: directSource,
+          totalMode: 'omitted',
+        },
+        updateTime: now,
+      };
     }
 
     const reasons = [...sessions.coverage.reasons];
