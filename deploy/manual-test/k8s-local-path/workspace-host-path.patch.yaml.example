@@ -1,0 +1,23 @@
+# Copy or generate this strategic patch outside the repository before rendering the local
+# profile. Replace the placeholder only with a path that passed
+# `node scripts/verify-k8s-workspace-path.mjs --path <path>`.
+#
+# `type: Directory` is deliberate: Kubernetes must refuse a missing path. Do not change it to
+# DirectoryOrCreate, which would silently mount an empty directory and report a false healthy
+# scanner.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workspace-scanner
+  namespace: anysentry
+spec:
+  template:
+    metadata:
+      annotations:
+        anysentry.io/manual-host-workspace: "__ANYSENTRY_K8S_WORKSPACE_PATH__"
+    spec:
+      volumes:
+        - name: workspace
+          hostPath:
+            path: "__ANYSENTRY_K8S_WORKSPACE_PATH__"
+            type: Directory

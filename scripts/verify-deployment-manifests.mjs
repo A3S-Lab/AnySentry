@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -833,6 +835,7 @@ function verifyManualKubernetesLocalPathOverlay() {
   const postgresStatefulSet = docFor(supportDocs, 'StatefulSet', 'postgres');
   const scannerConfig = docFor(supportDocs, 'ConfigMap', 'anysentry-workspace-scanner');
   const scannerDeployment = docFor(supportDocs, 'Deployment', 'workspace-scanner');
+  const workspacePathPatchExample = readText('deploy/manual-test/k8s-local-path/workspace-host-path.patch.yaml.example');
   const manualGuide = readText('deploy/manual-test/README.md');
 
   assert(
@@ -904,8 +907,34 @@ function verifyManualKubernetesLocalPathOverlay() {
       /drop:\s*\["ALL"\]/u.test(scannerDeployment?.source ?? '') &&
       /name:\s*ANYSENTRY_WORKSPACE_SCANNER_TOKEN[\s\S]*name:\s*anysentry-supply-chain[\s\S]*key:\s*ANYSENTRY_WORKSPACE_SCANNER_TOKEN/u.test(scannerDeployment?.source ?? '') &&
       /mountPath:\s*\/workspace\/AnySentry[\s\S]*readOnly:\s*true/u.test(scannerDeployment?.source ?? '') &&
-      /hostPath:\s*\{\s*path:\s*\/srv\/anysentry\/AnySentry,\s*type:\s*Directory\s*\}/u.test(scannerDeployment?.source ?? ''),
+      /hostPath:\s*\{\s*path:\s*\/srv\/anysentry\/AnySentry,\s*type:\s*Directory\s*\}/u.test(scannerDeployment?.source ?? '') &&
+      !/DirectoryOrCreate/u.test(scannerDeployment?.source ?? ''),
     { scannerConfig: scannerConfig?.source, scannerDeployment: scannerDeployment?.source },
+  );
+  assert(
+    'Manual Kubernetes Workspace Scanner hostPath requires a validated local preflight and fail-closed patch',
+    /verify-k8s-workspace-path\.mjs\s+--path\s+"\$ANYSENTRY_K8S_WORKSPACE_PATH"/u.test(manualGuide) &&
+      /render-k8s-local-path\.mjs/u.test(manualGuide) &&
+      /fails when the path is missing/u.test(manualGuide) &&
+      /DirectoryOrCreate/u.test(manualGuide) &&
+      /__ANYSENTRY_K8S_WORKSPACE_PATH__/u.test(workspacePathPatchExample) &&
+      /type:\s*Directory/u.test(workspacePathPatchExample) &&
+      !/^\s*type:\s*DirectoryOrCreate/mu.test(workspacePathPatchExample),
+    { workspacePathPatchExample, manualGuide },
+  );
+  const missingWorkspacePath = path.join(
+    os.tmpdir(),
+    `anysentry-k8s-workspace-path-missing-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+  );
+  const preflight = spawnSync(
+    process.execPath,
+    ['scripts/verify-k8s-workspace-path.mjs', '--path', missingWorkspacePath],
+    { cwd: repoRoot, encoding: 'utf8', timeout: 10_000 },
+  );
+  assert(
+    'Workspace path preflight rejects a nonexistent hostPath without creating it',
+    preflight.status !== 0 && /does not exist/u.test(preflight.stderr ?? '') && !fs.existsSync(missingWorkspacePath),
+    { status: preflight.status, stderr: preflight.stderr, missingWorkspacePath },
   );
   assert(
     'Manual Kubernetes Context probe continuously publishes authenticated real service measurements without cluster credentials',

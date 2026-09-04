@@ -63,9 +63,17 @@ const SKIP_DIRECTORIES = new Set([
   'coverage',
   'dist',
   'node_modules',
+  // Runtime evidence and temporary TLS material are not source dependencies.  Apart from
+  // avoiding needless work, excluding this directory keeps a read-only scanner from walking
+  // 0700 test-owned subdirectories and turning an otherwise healthy poll into a fatal EACCES.
+  '.runtime',
   'target',
   'vendor',
 ]);
+
+const NON_FATAL_DIRECTORY_ERRORS = new Set(['EACCES', 'EPERM', 'ENOENT', 'ENOTDIR']);
+const MAX_UNREADABLE_DIRECTORY_WARNINGS = 256;
+const reportedUnreadableDirectories = new Set();
 
 export function sourceScanArguments(workspacePath) {
   const exclusions = [...SKIP_DIRECTORIES]
@@ -179,6 +187,37 @@ function withinRoot(path, root) {
   return path === root || path.startsWith(`${root}${sep}`);
 }
 
+function relativeDirectoryPath(directory, root) {
+  const value = relative(root, directory).replaceAll('\\', '/');
+  return value || '.';
+}
+
+function reportUnreadableDirectory(directory, root, error, onSkipped) {
+  const code = typeof error?.code === 'string' ? error.code : 'unknown';
+  const relativePath = relativeDirectoryPath(directory, root);
+  onSkipped?.({ code, relativePath });
+  const warningKey = `${code}:${relativePath}`;
+  if (reportedUnreadableDirectories.has(warningKey)
+    || reportedUnreadableDirectories.size >= MAX_UNREADABLE_DIRECTORY_WARNINGS) return;
+  reportedUnreadableDirectories.add(warningKey);
+  // Keep diagnostics bounded and workspace-relative; never print the scanner token or file body.
+  console.warn('[workspace-scanner] skipped unreadable directory', {
+    code,
+    path: relativePath.slice(0, 512),
+  });
+}
+
+async function openDirectoryBestEffort(directory, options = {}) {
+  try {
+    return await opendir(directory);
+  } catch (error) {
+    if (!NON_FATAL_DIRECTORY_ERRORS.has(error?.code)) throw error;
+    const root = options.root || directory;
+    reportUnreadableDirectory(directory, root, error, options.onSkipped);
+    return undefined;
+  }
+}
+
 async function loadConfig() {
   if (!configPath) throw new Error('ANYSENTRY_WORKSPACE_SCANNER_CONFIG is required');
   const parsed = JSON.parse(await readFile(configPath, 'utf8'));
@@ -260,8 +299,18 @@ async function imageIdentity(reference) {
 async function dependencyDescriptorDigest(workspace) {
   const workspacePath = workspace.localPath;
   const entries = [];
+  const unreadableDirectories = new Set();
   const visit = async (directory) => {
-    const handle = await opendir(directory);
+    const handle = await openDirectoryBestEffort(directory, {
+      root: workspacePath,
+      onSkipped: ({ code, relativePath }) => unreadableDirectories.add(`${code}:${relativePath}`),
+    });
+    if (!handle) {
+      if (directory === workspacePath) {
+        throw new Error('registered workspace root became unreadable');
+      }
+      return;
+    }
     for await (const entry of handle) {
       if (entry.isDirectory()) {
         if (!SKIP_DIRECTORIES.has(entry.name)) await visit(resolve(directory, entry.name));
@@ -285,6 +334,12 @@ async function dependencyDescriptorDigest(workspace) {
   await visit(workspacePath);
   for (const image of workspace.deploymentImages) {
     entries.push(`deployment-image:${image.reference}\u0000${await imageIdentity(image.reference)}`);
+  }
+  // Include a stable, non-sensitive marker in the descriptor digest.  A permissions change will
+  // therefore trigger a fresh scan, while a persistently unreadable generated directory will not
+  // enqueue a new task on every poll.
+  for (const marker of [...unreadableDirectories].sort()) {
+    entries.push(`unreadable-directory\u0000${digest(marker)}`);
   }
   return digest(entries.sort().join('\n'));
 }
@@ -393,7 +448,8 @@ async function scanNodeModules(nodeModulesPath, workspacePath, components, visit
   }
   if (!withinRoot(actual, workspacePath) || visited.has(actual)) return;
   visited.add(actual);
-  const handle = await opendir(nodeModulesPath);
+  const handle = await openDirectoryBestEffort(nodeModulesPath, { root: workspacePath });
+  if (!handle) return;
   for await (const entry of handle) {
     if (components.length >= maxInstalledPackages) {
       throw new Error(`installed package count exceeds ${maxInstalledPackages}`);
@@ -401,7 +457,7 @@ async function scanNodeModules(nodeModulesPath, workspacePath, components, visit
     if (entry.name === '.bin') continue;
     const entryPath = resolve(nodeModulesPath, entry.name);
     if (entry.name === '.pnpm') {
-      const stores = await opendir(entryPath).catch(() => undefined);
+      const stores = await openDirectoryBestEffort(entryPath, { root: workspacePath });
       if (!stores) continue;
       for await (const store of stores) {
         if (!store.isDirectory()) continue;
@@ -410,7 +466,7 @@ async function scanNodeModules(nodeModulesPath, workspacePath, components, visit
       continue;
     }
     if (entry.name.startsWith('@')) {
-      const scope = await opendir(entryPath).catch(() => undefined);
+      const scope = await openDirectoryBestEffort(entryPath, { root: workspacePath });
       if (!scope) continue;
       for await (const packageEntry of scope) {
         const packageRoot = resolve(entryPath, packageEntry.name);
@@ -443,7 +499,7 @@ async function scanPythonEnvironment(environmentPath, workspacePath, components,
   visited.add(actual);
   const visit = async (directory, depth) => {
     if (depth > 8) return;
-    const handle = await opendir(directory).catch(() => undefined);
+    const handle = await openDirectoryBestEffort(directory, { root: workspacePath });
     if (!handle) return;
     for await (const entry of handle) {
       const path = resolve(directory, entry.name);
@@ -481,7 +537,8 @@ export async function scanInstalledEnvironments(workspacePath) {
   const visitedNodeModules = new Set();
   const visitedPython = new Set();
   const visit = async (directory) => {
-    const handle = await opendir(directory);
+    const handle = await openDirectoryBestEffort(directory, { root: workspacePath });
+    if (!handle) return;
     for await (const entry of handle) {
       if (!entry.isDirectory()) continue;
       const path = resolve(directory, entry.name);

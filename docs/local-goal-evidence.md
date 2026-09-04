@@ -10,7 +10,7 @@
 - AnySentry/Observer 构建、类型、单元/回放和 BPF object load smoke 仍通过；这不等于当前头 Observer 已在目标 workload 上完成独占 attach、转发和持久部署。
 - 临时 k3s API/Web OCI overlay `anysentry:goal-current-oci-20260904` 已构建成功并通过本机 registry manifest GET 200（digest 前缀 `043180…`）；namespace `anysentry-goal-oci-web-20260904` 以 Secret/no-hostPath 完成 health、`/v1/observability/contracts`、representative replay 13/4 families/0 gap、S6、S2 shadow 后已清理。基座仍是旧 runtime + current dist overlay，非原始 Dockerfile 全链；Observer scripts overlay 也已构建并推入本机 registry（digest 前缀 `7d3b…`），但 existing formal deployment 未切换。
 - `tender_jang` 已确认安装 Codex CLI 0.149.1、Claude Code 2.1.251，并包含 LangChain/LangGraph 库；产品级 fixture 闭环不自动等同于被动 eBPF 观测。
-- `tender_jang` 内新 CA 的临时 HTTPS fixture + LangChain 副本已 `/invoke=200`，`lookup_fixture` 一次调用/结果匹配；现有常驻服务仍因过期测试证书 502，临时目录/进程已清理。
+- `tender_jang` 内 LangChain 常驻 fixture 已轮换测试 CA/server cert（有效期 2026-09-04–2026-09-06），重启后 `/health=200`、HTTPS `/invoke=200`，`lookup_fixture` 一次调用/结果匹配；旧证书备份已在确认后精确清理，未写入仓库或日志。
 - Dify LLM/tool 两个 workflow 本回合均 HTTP 200、脚本 rc=0；durable `dify-observation-lab` 快照有 55 条事件，但测试 CA 校验失败使 debug hash 对账为 partial，correlation method 全部 unassigned。
 - LangGraph 在本地 k3s 的真实 `/runs` 调用与 durable API 查询已经产生可审计事件；但语义 lane 与 Kernel lane 当前仍有 `correlation unassigned`/`agent_adapter` 缺口，不能写成全链路统一通过。
 - 当前 SSH Codex 初始 durable 快照有 60 条 `LlmInteraction`（model 56、tool 4），后续异步 `agents/interactions` 重查可到 model 57、tool 4；4 个 tool 均 parsed/complete（toolCall4/toolResult4），model57 parsed 且 request/response wire complete，但 conversation complete 仅 2、tool_pending 55，选定 Tool 的 EvidenceLink inspector 返回 404。另有 2 条 metadata-only/unparsed Rustls plaintext evidence，identity/session/run 仍是 runtime/probable 提示；不能声称当前对话正文原文已完整落盘或已确认归属。
@@ -34,14 +34,17 @@
 | Observer OCI 组合 smoke | 同一 `7d3b…` 镜像在临时 privileged/hostPID Pod 实际附着 25 个 probe；生成的 scope 文件含 5 个 generation-fenced roots/2 个 cgroup；一个精确 batch probe 返回 201/accepted | 共享节点长跑出现批量拒绝和 spool 增长（API memory ring 7104/25000），故不标完整持续 ingest；namespace/Secret 已清理，existing DaemonSet 未切换 |
 | `tender_jang` | 容器镜像为 `node:24-bookworm`；已安装 Codex CLI 0.149.1、Claude Code 2.1.251；容器内存在 LangChain/LangGraph Python 运行库 | 容器没有 published port、Docker socket 或 Docker CLI，因此这些版本是容器内可调用运行时，不等于可以从容器内编排 Docker 或已接入 Observer |
 | `tender_jang` LangChain 服务 | 容器内 `service.py` 进程监听 18082，`/health=200`；运行库为 LangChain 1.3.17、LangGraph 1.2.11；宿主 loopback 由既有本地转发进程接入 | 证明当前容器确有可用服务，不证明它已由 AnySentry 当前头镜像或 Observer 被动观测 |
+| `tender_jang` LangChain 证书轮换 | 旧过期测试 CA/server cert 已精确备份后轮换；HTTPS `/invoke` 两次 HTTP200、1×`lookup_fixture`，确认后旧备份已清理 | 仅修复本地测试服务生命周期；常驻服务流量进入 current-head Observer/Canonical 投影仍未验证 |
+| k3s Workspace Scanner 稳定性 | 旧 ReplicaSet 反复重启（约 1688 次）直接源于 scanner 对生成 `.runtime/.../tls` 目录 `opendir` 未捕获 EACCES；另一 ReplicaSet 使用不存在 `/srv/anysentry/AnySentry` hostPath，kubelet 报 FailedMount | scanner 已加入 `.runtime` 排除和嵌套不可读目录 best-effort；新增只读 preflight/临时 Kustomize renderer，禁止 DirectoryOrCreate；正式 namespace 尚未切换新 scanner image |
 | 旧 k3s 身份反例 | 旧 k3s API image digest/revision 下，同一 Docker cgroup 的历史 LangChain 与 Claude Code 均有 `LlmInteraction`，却被合并到同一旧 agentAsset/session/run；Observer source/profile 可见但 cgroup map 仍把 Codex/Claude/LangChain 标为同一 `langchain` scope | 这是旧部署的真实混合身份/误合并反例；current-head 尚未部署，必须用 ProcessGeneration + Adapter/definition fence 拆分，不能把旧 asset 当 confirmed LogicalAgent |
 | Codex/Claude 本地 fixture | 本回合各完成两阶段请求—ToolCall—ToolResult—最终回复闭环 | 证明产品级协议/适配器闭环；不是当前 Observer 被动 eBPF 捕获证明 |
 | LangChain 临时 HTTP 副本 | 本地 HTTP 服务的工具闭环返回 HTTP 200 | 证明 HTTP transport、工具路由和结果回传可验证；不外推到常驻 HTTPS |
 | LangChain 临时 HTTPS 重试 | 新 CA 的临时 HTTPS fixture + LangChain 副本 `/invoke=200`，`lookup_fixture` tool/result 成功，临时资源已清理 | HTTPS transport/Parser/工具闭环通过；不外推到常驻服务 |
-| LangChain 常驻 HTTPS 服务 | 请求返回 HTTP 502；服务使用的本地测试证书已过期且为自签名 CA | 这是既有服务的证书生命周期问题；需要轮换常驻 fixture 证书后再做该服务的被动观测验收 |
+| LangChain 常驻 HTTPS 服务 | 已轮换本地测试 CA/server cert 并仅重启 fixture/service；`/health=200`、HTTPS `/invoke=200`、1×`lookup_fixture`，旧证书备份已清理 | 服务级 HTTPS/工具闭环已恢复；其流量是否进入 current-head Observer/Canonical 投影仍未验证 |
 | Dify 实际重跑 | LLM 与 tool 两个 workflow 均 HTTP 200，脚本 rc=0；仅用于诊断的本地 CA-bypass 读取看到 llm-mock 3 条 `/v1/chat/completions`、tool-mock 2 条 `/tool/execute`，均 status200/HTTP1.1 且有 hash 字段，RAG selected marker=1、internal sentinel=0；官方 debug reconciliation curl 因测试 CA 校验失败 | workflow 调用与边界 marker 通过；hash 对账仍 partial，CA-bypass 不作为安全通过 |
 | Dify Durable API | `detectedName=dify-observation-lab` 当前快照 55 事件：`Egress=44`、`ToolExec=8`、`LlmInteraction=3`；`captureSelected=55`，`identity exact=54/weak=1` | correlation method 全部 `unassigned`，两条 lane 尚未统一 |
-| k3s LangGraph `/runs` | 本地 namespace `anysentry-observability-lab` 的 LangGraph workflow Pod（本地镜像、服务端口 8000）`/healthz=200`，OpenAPI 暴露 `/runs` POST 和 `/runs/{run_id}` GET；同一 Session 连续两次 Run 均 `completed`；阶段包含 `planner`、`code_generator`、`verifier`、`finalizer`；sandbox exit code=0，verification=pass；每次 `telemetry accepted=10` | 真实本地 k3s 服务调用，不等同于所有 KernelFact 已和语义事件唯一关联 |
+| k3s LangGraph `/runs` | 本地 namespace `anysentry-observability-lab` 的 LangGraph workflow Pod（本地镜像、服务端口 8000）`/healthz=200`；本回合 POST/GET 均 200，`completed`；节点 `planner → code_generator → verifier → code_generator → verifier → finalizer`；sandbox exit0、未超时/未截断、verification pass；telemetry accepted15 | 真实本地 k3s 服务调用；对应 sandbox runner 的 KernelFact 已捕获，但仍以 physical_workload 关联，尚未形成 root-generation/LogicalAgent 唯一 EvidenceLink |
+| k3s LangGraph sandbox KernelFact | 同一 Run 的两个 sandbox runner generation 各产生 `ToolExec=1` + `ProcessExit=1`，合计 Exec2/Exit2；`captureSelected=1`、`agentHasPhysicalIdentity=1`，`correlationMethod=physical_workload`、confidence0.70 | 证明 sandbox 内部受限 Python 执行没有绕过 Observer Kernel lane；当前正式旧链仍无 Tool→Kernel Canonical 双向深链，`agentHasRootIdentity=0`，状态 partial |
 | LangGraph 失败路径 | 一次复杂目标返回 `RuntimeError`，但仍上报 3 个事件 | 证明失败不会静默吞掉事件；该次 Run 不是成功闭环 |
 | Durable API 查询 | 上述 Session 查询到 `detectedName=langgraph-workflow-sandbox-agent`，共 19 个事件：`LlmInteraction=10`、`AgentTool=3`、`AgentInvocation=3`、`ToolExec=3` | 证明耐久读模型保留了语义/工具/执行记录；当前两条 lane 尚未统一：`correlation unassigned=13`、`agent_adapter=6` |
 | 历史真实 Interaction | 既有本地审计证据中 Codex、Claude Code、LangChain 均曾产生真实 `LlmInteraction` | 历史记录与当前窗口分开统计，不覆盖下方 durable 查询 |
@@ -57,7 +60,7 @@
 ### 推断（不作为通过条件）
 
 - `tender_jang` 中的二进制和库足以支撑受控产品级调用，但没有 Docker CLI/socket，不能把它写成“Docker 编排或当前头 AnySentry 容器已运行”。
-- LangChain 临时 HTTP/新 CA HTTPS 均能完成工具闭环；常驻 HTTPS 的 502 已定位到过期自签名测试证书，不能推断 Parser、Observer 或业务 Run 已失败/成功。
+- LangChain 临时 HTTP/新 CA HTTPS 与常驻 fixture 轮换后的 HTTPS `/invoke=200` 均能完成工具闭环；证书生命周期问题已修复，但不能推断 current-head Observer/Canonical 被动投影已成功。
 - LangGraph 的 19 条耐久事件和每次 telemetry 10 条说明 API/存储链确实接收了记录；`correlation unassigned` 与 `agent_adapter` 计数说明语义 lane 与 Kernel lane 仍未完成统一 EvidenceLink，不能把事件数当作全链路闭环数。
 - 当前 SSH durable 查询已经证明 Observer 协议层可解析 Interaction，且 request roles 证明本次 SSH 对话进入 semantic lane；初始窗口 60 条与后续约 63 条是异步耐久写入的不同时点快照，不应把任一计数当成不可变总数。2 条 Rustls plaintext evidence 仍为 metadata-only/unparsed，identity/session/run 只是 runtime/probable 提示，EvidenceLink inspector 仍 404；早期 Egress-only 是旧时间窗快照，不能覆盖当前结果。
 
@@ -65,8 +68,8 @@
 
 - 当前 SSH Codex 的正文原文按 Canonical 合同完整持久化、authenticated AgentAdapter/confirmed Session、Tool/Kernel EvidenceLink 唯一归属和 inspector 404 修复；timeline-v3 的 336 条旧兼容投影虽可追溯 source evidence，但不替代 current-head Canonical/UI；虽然旧部署读模型有非零 request/response body，本轮不把正文复制进新证据。
 - `tender_jang` 中 Codex/Claude 进程经当前头 Observer 的独占 attach、Forwarder/WAL 投递和 AnySentry canonical 投影。
-- 常驻 LangChain HTTPS 服务在安装受信测试 CA 后的重试结果，以及其 HTTPS 流量是否进入当前 Observer。
-- k3s LangGraph 两次成功 Run 的每条语义事件与具体 KernelFact 的唯一所有权、双向深链和 UI 展示；当前 durable API 只显示未统一计数。
+- 常驻 LangChain HTTPS 服务轮换证书后的服务级重试已通过；其 HTTPS 流量是否进入 current-head Observer/Canonical 仍未验证。
+- k3s LangGraph 本回合成功 Run 的每条语义事件与具体 KernelFact 的唯一所有权、双向深链和 UI 展示；当前已确认 sandbox KernelFact 为 ToolExec2/ProcessExit2、physical_workload confidence0.70，但 Canonical EvidenceLink 仍未统一。
 - existing formal 旧 digest 替换为 current-head 镜像、canonical GET 正式切换和 `critical_inbox_dropped` 的根因/清零前后对照仍未验证；临时 OCI overlay 的 contracts GET 仅作局部验收。
 
 ### 本回合对代表对象的状态更新
@@ -76,7 +79,7 @@
 | Codex CLI | `tender_jang` 0.149.1；本地 fixture 两阶段 ToolCall/Result 闭环；SSH durable custom-window 初始快照 60（model 56/tool 4），后续异步 `agents/interactions` 约 63 records（model 57/tool 4 + 2 unsupported/unparsed） | Observer 解析通过；tool4 parsed/complete、toolCall4/toolResult4；conversation complete2/tool_pending55；2 条 Rustls plaintext evidence metadata-only/unparsed，identity/session/run 非 authenticated/confirmed，选定 Tool inspector 404 | partial |
 | Claude Code | `tender_jang` 2.1.251；本地 fixture 两阶段 ToolCall/Result 闭环 | 本回合未取得该容器进程的被动 LLM Interaction | partial |
 | Dify Workflow/Chatflow | LLM/tool 两个 workflow 本回合均 HTTP 200、脚本 rc=0；debug reconciliation curl 因测试 CA 校验失败 | durable snapshot `detectedName=dify-observation-lab` 共 55 事件（Egress44/ToolExec8/LlmInteraction3，captureSelected55，identity exact54/weak1）；correlation method 全 unassigned；hash 对账 partial | partial |
-| LangChain/LangGraph | LangChain HTTP 临时副本 200；新 CA HTTPS 临时副本 200/tool loop；常驻 HTTPS 502（过期证书）；k3s LangGraph 两次同 Session 成功 + 一次 RuntimeError 仍上报 3 事件 | durable LangGraph 19 事件，但 `unassigned=13`、`agent_adapter=6`，两 lane 未统一 | partial |
+| LangChain/LangGraph | LangChain 常驻 fixture 轮换证书后 `/invoke=200`；k3s LangGraph 本回合 Run completed、sandbox exit0/verification pass、telemetry accepted15；另有历史 RuntimeError 仍上报 3 事件 | 本回合 sandbox KernelFact 为 ToolExec2/ProcessExit2、physical_workload confidence0.70；既有 durable LangGraph 19 事件仍有 `unassigned=13`、`agent_adapter=6`，两 lane 未统一 | partial |
 
 ## 上一轮冻结 QA 回合（2026-09-03，历史 dirty 工作树快照）
 
@@ -162,7 +165,7 @@ node scripts/verify-canonical-goal.mjs --json-out /tmp/canonical-goal-round2-pro
 
 - Host `healthz` 返回 2xx，服务状态为 `ok`，但 `storageMode=memory`、ClickHouse/PostgreSQL 未就绪；脚本将 Host 环境标为 `partial`，这只能证明 API 进程可响应，不能证明耐久部署；
 - Docker daemon 与基础/模块 Compose 解析通过，Dify 容器仍健康；未发现本分支 AnySentry API 容器，localhost 2xx 被标为 Docker `partial`，避免误把 Host 进程当 Docker 部署；
-- k3s `default` context 的 AnySentry NodePort 返回 2xx，存储为 ClickHouse/PostgreSQL，核心 workload ready；workspace-scanner CrashLoop/ContainerCreating 与残留 kind API reset 使整体保持 `partial`；
+- k3s `default` context 的 AnySentry NodePort 返回 2xx，存储为 ClickHouse/PostgreSQL，核心 workload ready；workspace-scanner 历史 CrashLoop/ContainerCreating 已定位为代码 EACCES 与错误 hostPath 两类问题，代码/preflight 修复已完成但正式 Deployment/image 尚未切换，故整体仍为 `partial`；
 - SSH 在该历史回合仅检查本地 `ssh`/`ssh -G` 和 22/2222 TCP 可达性，没有执行独立远端命令；当前会话的实际观测以 2026-09-04 durable 结果为准；
 - `deploy/anysentry.yaml`、`deploy/observer.yaml`、`deploy/streaming.yaml` 均通过 `kubectl apply --dry-run=client --validate=false`；Dify Compose 直接解析缺少已准备的上游 Compose/UID 变量，未运行 `prepare.sh`（避免下载或改动）；
 - fixture shell `bash -n` 和四个非生成 Python 源文件的内存 compile 通过；CLI fixture 没有 Compose 文件，使用 Host 启动脚本；LangChain Compose 可解析；
@@ -279,7 +282,7 @@ EvidenceLink/Correlation → Sentry → Conversation/Evidence/Coverage projectio
 | Codex | partial（Host API memory fallback；SSH durable custom window 初始 60、异步重查约 63） | partial（当前 VSCode SSH `notty` 会话，未执行独立远端登录） | partial（`tender_jang` 产品级 fixture，两阶段闭环；无本分支 API 容器） | partial（当前 SSH 进程有协议观测，未形成 k3s Codex workload evidence） | SSH semantic lane pass/partial（model57/tool4；tool/evidence 与正文/身份仍 partial） |
 | Claude Code | partial（Host API memory fallback） | partial（当前 VSCode SSH `notty` 会话，未执行独立远端登录） | partial（`tender_jang` 产品级 fixture，两阶段闭环；无本分支 API/被动捕获证据） | partial（当前会话环境可见，未形成 k3s Claude workload evidence） | 产品级 fixture pass；当前容器进程被动 LLM Interaction 未验证 |
 | Dify Workflow/Chatflow | partial（Host API memory fallback） | partial（当前 VSCode SSH `notty` 会话，未执行独立远端登录） | partial（Dify 两个 workflow 本回合 HTTP200/rc0；durable 55 事件但 hash/correlation partial） | partial（当前 k3s/本机服务证据存在，Dify workload 全链路仍 partial） | `detectedName=dify-observation-lab`；Egress44/ToolExec8/LlmInteraction3；correlation 全 unassigned |
-| LangChain/LangGraph | partial（Host API memory fallback） | partial（当前 VSCode SSH `notty` 会话，未执行独立远端登录） | partial（临时本地 HTTP 工具闭环 200；常驻 HTTPS 502/自签名证书） | partial（LangGraph `/runs` 同 Session 两次 completed；另有 RuntimeError 仍上报 3 事件） | durable LangGraph 19 事件；`correlation unassigned=13`、`agent_adapter=6`，两 lane 未统一 |
+| LangChain/LangGraph | partial（Host API memory fallback） | partial（当前 VSCode SSH `notty` 会话，未执行独立远端登录） | partial（LangChain 常驻 fixture 轮换证书后 `/invoke=200`；LangGraph `/runs` 本回合 completed、sandbox exit0/verification pass） | partial（LangGraph 本回合 telemetry accepted15；另有 RuntimeError 仍上报 3 事件） | 本回合 sandbox KernelFact 为 ToolExec2/ProcessExit2、physical_workload confidence0.70；durable LangGraph 仍有 `correlation unassigned=13`、`agent_adapter=6` |
 
 当前环境探针摘要：
 
@@ -288,7 +291,7 @@ EvidenceLink/Correlation → Sentry → Conversation/Evidence/Coverage projectio
 | Host | partial | API health 200 但 memory fallback；特权本地 k3s Pod 的 Observer BPF load smoke 通过；当前 shell/SSH 用户 `CapEff=0` 且 `unprivileged_bpf_disabled=2`，未把当前 workload 的完整 attach/转发链写成通过 |
 | SSH | partial（协议解析通过，身份/原文/统一证据 partial） | VSCode SSH `notty` 链 native Codex PID 1101287 在 2026-09-03 16:14–16:22Z durable custom window 初始有 60 条 parsed/confirmed/complete `LlmInteraction`（model 56、tool 4）；后续异步 `agents/interactions` 快照约 63 records（model57/tool4 + 2 unsupported/unparsed）。request roles 证明 semantic lane 已进入，identity/session/run 与 EvidenceLink 仍 partial |
 | Docker | partial | daemon 与 Compose config 通过；Dify 容器健康；`tender_jang` 可调用 CLI/库但无 Docker CLI/socket；未发现本分支 AnySentry API 容器 |
-| Kubernetes | partial | `kubectl` API、LangGraph `/healthz` 与 `/runs` 真实调用可用；临时 API/Web OCI overlay 与 Observer 组合 smoke 已局部验证后清理，但 existing AnySentry/Observer 仍旧 digest、canonical GET 未切换正式部署，workspace-scanner/critical inbox 缺口未消除 |
+| Kubernetes | partial | `kubectl` API、LangGraph `/healthz` 与 `/runs` 真实调用可用；本回合 sandbox KernelFact 为 ToolExec2/ProcessExit2（physical_workload confidence0.70）；临时 API/Web OCI overlay 与 Observer 组合 smoke 已局部验证后清理，但 existing AnySentry/Observer 仍旧 digest、canonical GET 未切换正式部署，workspace-scanner 路径/镜像尚未正式切换且 critical inbox 缺口未消除 |
 
 本轮 identity fence 代码已进入 AnySentry `477f897` / Observer `030b910`，但线上旧 Observer/Forwarder
 仍可能把同 cgroup 的混合进程 broad-admit；升级必须以 Observer、Forwarder 和对应 publisher 的
@@ -329,9 +332,9 @@ node scripts/verify-canonical-goal.mjs --json-out /tmp/anysentry-canonical-goal.
 ## 真正未决项与下一步
 
 - 当前文档与 v2/V4 历史设计仍有少量旧现场数字/镜像/入口声明；这些声明不作为本轮通过证据，后续应继续以最新脱敏 gate JSON 和本地 checkpoint 替换或明确标注历史。
-- `tender_jang` 的 Codex/Claude 产品级 fixture 与 LangChain HTTP/新 CA HTTPS 临时副本已通过，但尚未证明这些进程经过当前头 Observer 被动捕获并进入 canonical API；常驻 HTTPS 仍需轮换过期自签名测试证书后重试。
+- `tender_jang` 的 Codex/Claude 产品级 fixture 与 LangChain HTTP/新 CA HTTPS/常驻证书轮换后的服务级 `/invoke=200` 已通过，但尚未证明这些进程经过当前头 Observer 被动捕获并进入 canonical API。
 - Dify 两个 workflow 已重跑成功，durable `dify-observation-lab` 也有 55 条事件；但 debug hash reconciliation 因测试 CA 校验失败，且全部 correlation method 为 `unassigned`，所以 hash 对账和两 lane 关联仍是 partial。
-- k3s LangGraph `/runs` 已有同 Session 的两次成功 Run、失败 Run 的 3 事件保留和 19 条耐久记录，但 `correlation unassigned=13`、`agent_adapter=6` 表明两条 lane 尚未统一，需补 Adapter/Relation revision 与双向查询验证。
+- k3s LangGraph `/runs` 已有同 Session 的成功 Run、失败 Run 的 3 事件保留和 19 条耐久记录；本回合 sandbox KernelFact 进一步核验到 ToolExec2/ProcessExit2（physical_workload confidence0.70），但 `correlation unassigned=13`、`agent_adapter=6` 和 `agentHasRootIdentity=0` 仍表明两条 lane 尚未统一，需补 Adapter/Relation revision 与双向查询验证。
 - 当前 SSH Codex（native PID 1101287）的初始 custom-window 快照有 60 条 parsed/confirmed/complete `LlmInteraction`（model 56、tool 4），后续异步 `agents/interactions` 可到约 63 records（model57/tool4 + 2 unsupported/unparsed）；request roles 已证明 semantic lane 进入，但 2 条 Rustls plaintext evidence 为 metadata-only/unparsed，identity/session/run 未达到 authenticated AgentAdapter/confirmed Session，且选定 Tool 的 EvidenceLink inspector 404。没有证据表明本助手对话正文已按 Canonical contract 完整落盘或可按业务会话确认归属。
 - existing formal AnySentry 旧 digest/未切换的 canonical GET、约 1.89M 且继续上涨的 `critical_inbox_dropped` 和 static signature warnings 仍需在本地部署/运行窗口中处理并复验；临时 OCI overlay 只做局部验证，特权 `hostPID` Pod 的可见性不能替代普通 SSH 用户的 eBPF 权限。
 - AnySentry `477f897` 与 Observer `030b910` 已修正 mixed-cgroup identity fence，但旧 Observer/Forwarder rollout 仍有误合并风险；必须原子升级 publisher、Forwarder 和 Observer 后重放验证，不能只替换一侧。

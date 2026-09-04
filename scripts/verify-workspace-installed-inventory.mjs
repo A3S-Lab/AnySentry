@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -19,7 +19,7 @@ assert.deepEqual(sourceArgs.slice(0, 5), [
   '--format=json',
 ]);
 assert.equal(sourceArgs.at(-1), '/workspace/AnySentry');
-for (const directory of ['artifacts', '.local', '.agents', 'node_modules', 'target']) {
+for (const directory of ['artifacts', '.local', '.agents', '.runtime', 'node_modules', 'target']) {
   assert.ok(
     sourceArgs.includes(`--experimental-exclude=g:**/${directory}/**`),
     `OSV source scan must exclude ${directory}`,
@@ -76,6 +76,29 @@ try {
   assert.equal(python?.installedEnvironments?.[0]?.kind, 'python_environment');
   assert.equal(extractionStatusFromWarnings(['Scanning source']), 'complete');
   assert.equal(extractionStatusFromWarnings(['Error during extraction: failed resolution']), 'partial');
+
+  // Workspace mounts can contain private runtime/test directories owned by another UID.  A
+  // single unreadable nested directory must be represented as a bounded skip, not crash the
+  // scanner process and trigger a Kubernetes restart loop.
+  const unreadable = join(root, 'private-runtime');
+  await mkdir(unreadable, { recursive: true, mode: 0o700 });
+  await writeFile(join(unreadable, 'package.json'), JSON.stringify({ name: 'hidden', version: '0.0.1' }));
+  await chmod(unreadable, 0o000);
+  try {
+    const afterPermissionChange = await scanInstalledEnvironments(root);
+    assert.equal(
+      afterPermissionChange.some((component) => component.packageName === 'example-package'),
+      true,
+      'unreadable sibling must not prevent readable inventory entries',
+    );
+    assert.equal(
+      afterPermissionChange.some((component) => component.packageName === 'hidden'),
+      false,
+      'unreadable directory contents must not be guessed or surfaced',
+    );
+  } finally {
+    await chmod(unreadable, 0o700);
+  }
   console.log('Workspace installed environment inventory verification passed');
 } finally {
   await rm(root, { recursive: true, force: true });

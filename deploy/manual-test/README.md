@@ -82,11 +82,27 @@ kubectl -n anysentry create secret generic anysentry-system-context-source \
 unset db_password db_url scanner_token context_source_id context_source_token
 ```
 
-The tracked Scanner is digest-pinned and mounts
-`/srv/anysentry/AnySentry` read-only. Place the checkout there or update the explicit hostPath before
-applying this manual one-node profile. Build/push the `workspace-scanner` target and update its exact digest
-in `k8s-local-path/kustomization.yaml` whenever the Scanner script or base image changes; do not
-replace it with a mutable tag.
+The tracked Scanner is digest-pinned and mounts an explicit `hostPath` with
+`type: Directory` (never `DirectoryOrCreate`). The generic overlay keeps `/srv/anysentry/AnySentry`
+as a review-time placeholder; it must not be applied unchanged on a node where that path is absent.
+Validate the actual checkout and render a private strategic patch before applying the profile:
+
+```bash
+set +x
+export ANYSENTRY_K8S_WORKSPACE_PATH=/home/chensicheng/a3s/security/AnySentry
+node scripts/verify-k8s-workspace-path.mjs --path "$ANYSENTRY_K8S_WORKSPACE_PATH"
+node scripts/render-k8s-local-path.mjs \
+  --workspace-path "$ANYSENTRY_K8S_WORKSPACE_PATH" \
+  | kubectl apply -f -
+```
+
+The preflight is read-only and fails when the path is missing, a file, or a symlink; it never
+creates an empty checkout. The renderer creates and removes a private Kustomize directory and
+only emits YAML, so a missing path is rejected before a Scanner Pod is scheduled. The equivalent
+review template is `workspace-host-path.patch.yaml.example`; copy it outside the repository if a
+manual render workflow is preferred. Build/push the `workspace-scanner` target and update its exact
+digest in `k8s-local-path/kustomization.yaml` whenever the Scanner script or base image changes;
+do not replace it with a mutable tag.
 
 This repository includes six manual-test overlays. They leave the canonical manifests unchanged:
 
