@@ -115,6 +115,7 @@ export interface QueryCoverage {
     | 'scan_limit'
     | 'projection_timeout'
     | 'storage_unavailable'
+    | 'canonical_evidence_link_hot_delta_pending'
     | 'membership_store_unavailable'
     | 'membership_limit'
     | 'membership_records_missing';

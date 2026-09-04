@@ -11899,6 +11899,57 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       });
   }
 
+  /**
+   * Resolve an exact Session deep link without treating a partial empty projection as a 404.
+   *
+   * The canonical Session ID and the legacy conversation ID are intentionally different
+   * namespaces.  During a membership/ClickHouse timeout the narrow query can therefore return no
+   * row even though a bounded global conversation projection still contains the exact alias.  Do
+   * one explicitly bounded broad read, filter the returned rows locally, and mark the result
+   * partial.  The broad read is never used for a complete exact miss and is not recursive.
+   */
+  private async canonicalSessionResourcesForExact(
+    query: CanonicalEntityQuery,
+    headers: HeaderBag,
+  ): Promise<CanonicalSessionProjection> {
+    const result = await this.canonicalSessionResources(query, headers);
+    const requestedSessionId = query.sessionId;
+    if (!requestedSessionId
+      || result.items.some((item) => [item.sessionId, item.canonicalSessionId, item.conversationId].includes(requestedSessionId))
+      || result.coverage.status === 'complete') {
+      return result;
+    }
+    try {
+      const broad = await this.canonicalSessionResources({
+        ...query,
+        sessionId: undefined,
+        offset: 0,
+        limit: CANONICAL_ENTITY_LIMIT_MAX,
+      }, headers);
+      const exact = broad.items.filter((item) => [
+        item.sessionId,
+        item.canonicalSessionId,
+        item.conversationId,
+      ].includes(requestedSessionId));
+      if (exact.length === 0) return result;
+      return {
+        ...broad,
+        items: exact,
+        coverage: {
+          ...broad.coverage,
+          status: 'partial',
+          reasons: [...new Set([
+            ...broad.coverage.reasons,
+            'canonical_session_bounded_alias_fallback',
+          ])].slice(0, 64),
+        },
+      };
+    } catch (error) {
+      if (!isCanonicalProjectionDegradation(error)) throw error;
+      return result;
+    }
+  }
+
   private degradedCanonicalSessionProjection(
     query: CanonicalEntityQuery,
     reason: string,
@@ -12646,7 +12697,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   @RequireManagementAuth()
   async canonicalSession(@Param('sessionId') sessionId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag) {
     const query = parseCanonicalEntityQuery({ ...rawQuery, sessionId });
-    const result = await this.canonicalSessionResources(query, headers);
+    const result = await this.canonicalSessionResourcesForExact(query, headers);
     const item = result.items.find((candidate) => [candidate.sessionId, candidate.canonicalSessionId, candidate.conversationId].includes(sessionId));
     if (!item) throw new NotFoundException('session not found');
     return { schemaVersion: 'anysentry.session.v1', item, revision: result.revision, coverage: result.coverage, dataSource: result.dataSource, updateTime: new Date().toISOString() };
@@ -12656,7 +12707,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   @RequireManagementAuth()
   async canonicalSessionTimeline(@Param('sessionId') sessionId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag) {
     const query = parseCanonicalEntityQuery({ ...rawQuery, sessionId });
-    const sessions = await this.canonicalSessionResources({ ...query, offset: 0, limit: 500 }, headers);
+    const sessions = await this.canonicalSessionResourcesForExact({ ...query, offset: 0, limit: 500 }, headers);
     let session = sessions.items.find((candidate) => [candidate.sessionId, candidate.canonicalSessionId, candidate.conversationId].includes(sessionId));
     let conversationId = session?.conversationId ?? session?.sessionId ?? sessionId;
     // A membership-only Session can legitimately outlive its compatibility Thread projection and
@@ -12871,7 +12922,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   @RequireManagementAuth()
   async canonicalSessionCoverage(@Param('sessionId') sessionId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag) {
     const query = parseCanonicalEntityQuery({ ...rawQuery, sessionId });
-    const result = await this.canonicalSessionResources({ ...query, offset: 0, limit: 500 }, headers);
+    const result = await this.canonicalSessionResourcesForExact({ ...query, offset: 0, limit: 500 }, headers);
     const session = result.items.find((candidate) => [candidate.sessionId, candidate.canonicalSessionId, candidate.conversationId].includes(sessionId));
     if (!session) throw new NotFoundException('session not found');
     return { schemaVersion: 'anysentry.session.coverage.v1', sessionId: session.sessionId, coverage: session.coverage, revision: result.revision, dataSource: result.dataSource, updateTime: new Date().toISOString() };

@@ -3681,6 +3681,22 @@ export class AggregationService implements OnModuleDestroy {
     const persistedByLink = new Map(persistedRelations
       .map((relation) => relation.evidenceLinkId ? [relation.evidenceLinkId, relation] as const : undefined)
       .filter((entry): entry is readonly [string, T.AgentSemanticKernelRelation] => Boolean(entry)));
+    // A relation can be available from the compatibility projector before the append-only
+    // EvidenceLink side lane has caught up (or while its durable read is timing out).  Keep that
+    // relation navigable, but label the derived links as a hot delta and expose a partial reason;
+    // this is deliberately a read-only projection and must never write the canonical store.
+    const persistedCanonicalHotDeltaLinks = canonicalEvidenceLinks.length === 0
+      ? canonicalEvidenceLinksForRelations(persistedRelations)
+      : [];
+    const persistedEffectiveCanonicalLinks = canonicalEvidenceLinks.length > 0
+      ? canonicalEvidenceLinks
+      : persistedCanonicalHotDeltaLinks;
+    const persistedEffectiveCanonicalSource = canonicalEvidenceLinks.length > 0
+      ? canonicalEvidenceRead.source
+      : persistedCanonicalHotDeltaLinks.length > 0
+        ? 'canonical_store+hot_delta' as const
+        : undefined;
+    const persistedCanonicalHotDelta = persistedCanonicalHotDeltaLinks.length > 0;
     const canonicalSupersedesPersisted = canonicalEvidenceLinks.some((link) => {
       const previous = persistedByLink.get(link.linkId);
       return previous !== undefined
@@ -3715,13 +3731,18 @@ export class AggregationService implements OnModuleDestroy {
           ? 'linked_exact'
           : 'linked_strong',
         evidenceBundleEventIds: linkedEventIds,
-        ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinks } : {}),
-        ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinksSource: canonicalEvidenceRead.source } : {}),
-        ...(canonicalEvidenceLinks.length || canonicalEvidenceRead.degraded || persistedRelationRead.failed
+        ...(persistedEffectiveCanonicalLinks.length
+          ? { canonicalEvidenceLinks: persistedEffectiveCanonicalLinks }
+          : {}),
+        ...(persistedEffectiveCanonicalSource
+          ? { canonicalEvidenceLinksSource: persistedEffectiveCanonicalSource }
+          : {}),
+        ...(persistedEffectiveCanonicalLinks.length || canonicalEvidenceRead.degraded || persistedRelationRead.failed
           ? { canonicalEvidenceLinksCoverage: {
-              partial: canonicalEvidenceRead.degraded || persistedRelationRead.failed,
+              partial: persistedCanonicalHotDelta || canonicalEvidenceRead.degraded || persistedRelationRead.failed,
               reasons: [...new Set([
                 ...canonicalEvidenceRead.reasons,
+                ...(persistedCanonicalHotDelta ? ['canonical_evidence_link_hot_delta_pending'] : []),
                 ...(persistedRelationRead.failed ? ['semantic_relation_projection_unavailable'] : []),
               ])],
             } }
@@ -3816,8 +3837,23 @@ export class AggregationService implements OnModuleDestroy {
       && persistedRelations.some((relation) => relation.kernelEventId)) {
       relations = persistedRelations;
     }
-    if (canonicalEvidenceLinks.length > 0) {
-      const canonicalRelations = canonicalEvidenceLinks.map((link) =>
+    // Prefer durable links.  If the canonical side lane is temporarily empty, derive a bounded
+    // hot-delta view from the already computed relations so the API remains bidirectionally
+    // navigable without pretending those links are durable yet.
+    const computedCanonicalHotDeltaLinks = canonicalEvidenceLinks.length === 0
+      ? canonicalEvidenceLinksForRelations(relations)
+      : [];
+    const effectiveCanonicalEvidenceLinks = canonicalEvidenceLinks.length > 0
+      ? canonicalEvidenceLinks
+      : computedCanonicalHotDeltaLinks;
+    const effectiveCanonicalEvidenceSource = canonicalEvidenceLinks.length > 0
+      ? canonicalEvidenceRead.source
+      : computedCanonicalHotDeltaLinks.length > 0
+        ? 'canonical_store+hot_delta' as const
+        : undefined;
+    const canonicalEvidenceHotDelta = computedCanonicalHotDeltaLinks.length > 0;
+    if (effectiveCanonicalEvidenceLinks.length > 0) {
+      const canonicalRelations = effectiveCanonicalEvidenceLinks.map((link) =>
         relationFromCanonicalLink(link, call, interaction, kernel.items));
       const byLink = new Map(relations
         .map((relation, index) => relation.evidenceLinkId ? [relation.evidenceLinkId, index] as const : undefined)
@@ -3876,23 +3912,30 @@ export class AggregationService implements OnModuleDestroy {
       kernelEvents: kernel.items.filter((event) => linkedEventIds.has(event.eventId)),
       relationStatus,
       evidenceBundleEventIds: [...linkedEventIds],
-      ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinks } : {}),
-      ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinksSource: canonicalEvidenceRead.source } : {}),
-      ...(canonicalEvidenceLinks.length || canonicalEvidenceRead.degraded || persistedRelationRead.failed
+      ...(effectiveCanonicalEvidenceLinks.length
+        ? { canonicalEvidenceLinks: effectiveCanonicalEvidenceLinks }
+        : {}),
+      ...(effectiveCanonicalEvidenceSource
+        ? { canonicalEvidenceLinksSource: effectiveCanonicalEvidenceSource }
+        : {}),
+      ...(effectiveCanonicalEvidenceLinks.length || canonicalEvidenceRead.degraded || persistedRelationRead.failed
         ? { canonicalEvidenceLinksCoverage: {
-            partial: canonicalEvidenceRead.degraded || persistedRelationRead.failed,
+            partial: canonicalEvidenceHotDelta || canonicalEvidenceRead.degraded || persistedRelationRead.failed,
             reasons: [...new Set([
               ...canonicalEvidenceRead.reasons,
+              ...(canonicalEvidenceHotDelta ? ['canonical_evidence_link_hot_delta_pending'] : []),
               ...(persistedRelationRead.failed ? ['semantic_relation_projection_unavailable'] : []),
             ])],
           } }
         : {}),
       coverage: {
         ...kernel.coverage,
-        partial: partial || canonicalEvidenceRead.degraded,
+        partial: partial || canonicalEvidenceRead.degraded || canonicalEvidenceHotDelta,
         partialReason: kernel.coverage.partialReason
           ?? interactions.coverage.partialReason
-          ?? (canonicalEvidenceRead.degraded || persistedRelationRead.failed ? 'storage_unavailable' : undefined),
+          ?? (canonicalEvidenceHotDelta
+            ? 'canonical_evidence_link_hot_delta_pending'
+            : canonicalEvidenceRead.degraded || persistedRelationRead.failed ? 'storage_unavailable' : undefined),
       },
       ...this.classificationResponseMeta(query),
       updateTime: iso(),
@@ -3924,6 +3967,24 @@ export class AggregationService implements OnModuleDestroy {
         candidate.linkId === link.linkId && candidate.resolutionRevision === link.resolutionRevision) === index);
     const canonicalEvidenceReadDegraded = canonicalEvidenceReads.some((read) => read.degraded);
     const canonicalEvidenceReadReasons = [...new Set(canonicalEvidenceReads.flatMap((read) => read.reasons))];
+    // If the reverse durable lookup races the relation projector, expose the already persisted
+    // compatibility relations as a bounded hot delta.  This preserves the bidirectional deep
+    // link while making the non-durable state explicit; it never mutates either store.
+    const computedCanonicalHotDeltaLinks = canonicalEvidenceLinks.length === 0
+      ? canonicalEvidenceLinksForRelations(relations)
+      : [];
+    const effectiveCanonicalEvidenceLinks = canonicalEvidenceLinks.length > 0
+      ? canonicalEvidenceLinks
+      : computedCanonicalHotDeltaLinks;
+    const effectiveCanonicalEvidenceSource = canonicalEvidenceLinks.length > 0
+      ? canonicalEvidenceReads.some((read) => read.source === 'canonical_store+hot_delta')
+        ? 'canonical_store+hot_delta' as const
+        : canonicalEvidenceReads.some((read) => read.source === 'canonical_store')
+          ? 'canonical_store' as const : 'memory_hot_ring' as const
+      : computedCanonicalHotDeltaLinks.length > 0
+        ? 'canonical_store+hot_delta' as const
+        : undefined;
+    const canonicalEvidenceHotDelta = computedCanonicalHotDeltaLinks.length > 0;
     return {
       schemaVersion: 'anysentry.agent_kernel_semantic_context.v1',
       eventId,
@@ -3936,18 +3997,18 @@ export class AggregationService implements OnModuleDestroy {
           semanticEventId: relation.stableSemanticEventId,
         },
       ])).values()],
-      ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinks } : {}),
-      ...(canonicalEvidenceLinks.length
-        ? { canonicalEvidenceLinksSource: canonicalEvidenceReads.some((read) => read.source === 'canonical_store+hot_delta')
-          ? 'canonical_store+hot_delta' as const
-          : canonicalEvidenceReads.some((read) => read.source === 'canonical_store')
-            ? 'canonical_store' as const : 'memory_hot_ring' as const }
+      ...(effectiveCanonicalEvidenceLinks.length
+        ? { canonicalEvidenceLinks: effectiveCanonicalEvidenceLinks }
         : {}),
-      ...(canonicalEvidenceLinks.length || canonicalEvidenceReadDegraded || relationRead.failed
+      ...(effectiveCanonicalEvidenceSource
+        ? { canonicalEvidenceLinksSource: effectiveCanonicalEvidenceSource }
+        : {}),
+      ...(effectiveCanonicalEvidenceLinks.length || canonicalEvidenceReadDegraded || relationRead.failed
         ? { canonicalEvidenceLinksCoverage: {
-            partial: canonicalEvidenceReadDegraded || relationRead.failed,
+            partial: canonicalEvidenceHotDelta || canonicalEvidenceReadDegraded || relationRead.failed,
             reasons: [...new Set([
               ...canonicalEvidenceReadReasons,
+              ...(canonicalEvidenceHotDelta ? ['canonical_evidence_link_hot_delta_pending'] : []),
               ...(relationRead.failed ? ['semantic_relation_projection_unavailable'] : []),
             ])],
           } }
