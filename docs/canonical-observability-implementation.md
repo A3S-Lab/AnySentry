@@ -716,10 +716,12 @@ Canonical 合同仍是 `RawObservation` → `KernelFact`/`SemanticRecord` → `E
 - 当前 SSH 对话是这个终端中的 Codex 会话。它可产生进程/网络/部分语义线索，但由于 Observer
   窗口暂停、Rustls/WebSocket 与会话身份缺口，不能把“我和你的当前聊天”写成已经完成的
   User→LLM→Tool→Kernel→Evidence 全链路。
-- A3S standalone browser driver（agent-browser 0.26.0）已通过 NodePort health smoke：桌面
-  1440×900、移动 390×844、console/page errors 均为空；`/security-center` 是 API 前缀，SPA
-  页面在根路径 `/`。默认 `a3s-test capabilities --json` 仍因安装的 a3s 0.3.0 缺少 `a3s use`
-  而不可用；因此 health smoke 与完整浏览器业务深链必须分开报告。
+- A3S standalone browser driver（agent-browser 0.26.0）已通过 NodePort 根路径 UI smoke（session
+  `nodeport-ui-smoke-final`）：桌面 1440×900、移动 390×844 均加载 SPA，并导航到 Agent 列表和
+  `/conversations`，console/page errors 均为空；`/security-center` 是 API 前缀，SPA 页面在根路径
+  `/`。本次没有抓 HAR/network body，以免把管理 Authorization 写入 artifact；证据 Inspector 的
+  HAR 级双向网络审计仍未完成。默认 `a3s-test capabilities --json` 仍因安装的 a3s 0.3.0 缺少
+  `a3s use` 不可用，但 standalone 能力已按要求实际执行。
 
 ### 本地测试与回滚
 

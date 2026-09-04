@@ -528,6 +528,7 @@ YAML、数据库或本报告；Dify/Agent 运行正文和临时输出已按精�
 
 Goal 仍为 **partial**。Canonical 合同、兼容迁移、代码和本地 API/Web 部署已达到可复核状态，
 但 Definition of Done 还缺正式 Observer 稳定转发、四类代表对象在 Host/SSH/Docker/Kubernetes
-的连续被动矩阵、LangChain/Claude/Dify/LangGraph 的可追溯 Kernel EvidenceLink、完整 UI 业务
-深链和容量/p95 证据。Kimi/Z.ai/Pi 的 Adapter 扩展以及 Kafka/Flink 时间窗支路属于后续扩展，
+的连续被动矩阵、LangChain/Claude/Dify/LangGraph 的可追溯 Kernel EvidenceLink、Evidence
+Inspector 的 HAR 级双向网络审计和容量/p95 证据；基础 Agent/Conversation UI 导航已由
+standalone A3S smoke 通过。Kimi/Z.ai/Pi 的 Adapter 扩展以及 Kafka/Flink 时间窗支路属于后续扩展，
 不作为本阶段额外失败项。
