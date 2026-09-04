@@ -13,6 +13,7 @@ const forwarder = fileURLToPath(new URL('./observer-forward.js', import.meta.url
 const require = createRequire(import.meta.url);
 const {
   dedupeRuntimeSnapshotEntries,
+  queueAdmissionLimits,
   runtimeSnapshotEntryKey,
 } = require('./observer-forward.js');
 
@@ -453,5 +454,10 @@ assert.equal(
   'strict runtime snapshot keys remain unique',
 );
 assert.equal(dedupedSnapshot.coverageGaps.length, 2);
+
+const replayLimits = queueAdmissionLimits(4, true);
+const liveLimits = queueAdmissionLimits(4, false);
+assert.ok(replayLimits.eventLimit < liveLimits.eventLimit, 'replay cannot consume the live event reserve');
+assert.ok(replayLimits.byteLimit < liveLimits.byteLimit, 'replay cannot consume the live byte reserve');
 
 console.log('Forwarder runtime lease, business ACK, API restart, and fencing verification passed');

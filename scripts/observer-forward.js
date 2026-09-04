@@ -712,6 +712,8 @@ const activeControlRequests = new Set();
 let eventRequestsAborted = false;
 let outputDropped = 0;
 let errorCount = 0;
+const MAX_BATCH_OUTCOME_KEYS = 32;
+let batchOutcomeCounts = Object.create(null);
 let eventKindCounts = Object.create(null);
 const forwarderInstanceId = crypto.randomUUID();
 const pipelineAccounting = new ForwarderPipelineAccounting({
@@ -1278,6 +1280,7 @@ function combineBatchOutcomes(left, right, extraErrors = 0) {
     rejectedItems: [...(left.rejectedItems ?? []), ...(right.rejectedItems ?? [])],
     retryItems: [...(left.retryItems ?? []), ...(right.retryItems ?? [])],
     retryAfterMs: Math.max(left.retryAfterMs ?? 0, right.retryAfterMs ?? 0),
+    statusCode: left.statusCode ?? right.statusCode,
     pipelineCounts: [...(left.pipelineCounts ?? []), ...(right.pipelineCounts ?? [])],
   };
 }
@@ -1311,6 +1314,7 @@ function deliverEventBatch(batch, done, absoluteDeadline = 0) {
         done({
           dropped: 1,
           errors: 1,
+          statusCode: result.statusCode,
           acceptedItems: [],
           rejectedItems: batch,
           retryItems: [],
@@ -1332,6 +1336,7 @@ function deliverEventBatch(batch, done, absoluteDeadline = 0) {
       done({
         dropped: 0,
         errors: 0,
+        statusCode: result.statusCode,
         retryItems: batch,
         pipelineCounts: pipelineCount('api_retryable', 'transport_error', batch.length),
       });
@@ -1342,6 +1347,7 @@ function deliverEventBatch(batch, done, absoluteDeadline = 0) {
         done({
           dropped: 0,
           errors: 0,
+          statusCode: result.statusCode,
           retryItems: batch,
           pipelineCounts: pipelineCount('api_retryable', 'http_retryable', batch.length),
         });
@@ -1349,6 +1355,7 @@ function deliverEventBatch(batch, done, absoluteDeadline = 0) {
         done({
           dropped: batch.length,
           errors: 1,
+          statusCode: result.statusCode,
           acceptedItems: [],
           rejectedItems: batch,
           retryItems: [],
@@ -1364,12 +1371,14 @@ function deliverEventBatch(batch, done, absoluteDeadline = 0) {
       done({
         dropped: batch.length,
         errors: 1,
+        statusCode: result.statusCode,
         retryItems: [],
         pipelineCounts: pipelineCount('api_rejected', 'invalid_ack', batch.length),
       });
       return;
     }
     const outcome = validateBatchAck(parsed, batch, result.envelope);
+    outcome.statusCode = result.statusCode;
     if (outcome.reason) console.error(`[observer-forward] ${outcome.reason}`);
     done(outcome);
   });
@@ -2391,6 +2400,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
   const dropped = outputDropped;
   const errors = errorCount;
   const classifications = attributionCounts;
+  const batchOutcomes = batchOutcomeCounts;
   const filterReceipts = e2eFilterReceipts;
   const workload = workloadCache.metrics();
   const docker = dockerDiscovery.metrics();
@@ -2407,6 +2417,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
   const reloader = signatureReloader?.metrics() || {};
   eventKindCounts = Object.create(null);
   attributionCounts = emptyAttributionCounts();
+  batchOutcomeCounts = Object.create(null);
   e2eFilterReceipts = [];
   outputDropped = 0;
   errorCount = 0;
@@ -2551,6 +2562,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         queueParked: classifications.queueParked,
         batches: classifications.batches,
         batchEvents: classifications.batchEvents,
+        batchDeliveryOutcomes: batchOutcomes,
         retryQueued: classifications.retryQueued,
         retryAttempts: classifications.retryAttempts,
         retryRecovered: classifications.retryRecovered,
@@ -2785,6 +2797,30 @@ function recordPipelineCounts(counts) {
   }
 }
 
+function recordBatchOutcome(outcome) {
+  const counts = outcome?.pipelineCounts ?? [];
+  for (const item of counts) {
+    const count = Number(item?.count);
+    if (!Number.isSafeInteger(count) || count <= 0) continue;
+    const key = `${String(item.stage || 'unknown').slice(0, 40)}:${String(item.reason || 'unknown').slice(0, 80)}`;
+    if (!Object.hasOwn(batchOutcomeCounts, key) && Object.keys(batchOutcomeCounts).length >= MAX_BATCH_OUTCOME_KEYS) {
+      const overflow = '__other__';
+      batchOutcomeCounts[overflow] = (batchOutcomeCounts[overflow] || 0) + count;
+      continue;
+    }
+    batchOutcomeCounts[key] = (batchOutcomeCounts[key] || 0) + count;
+  }
+  const statusCode = Number(outcome?.statusCode);
+  if (Number.isSafeInteger(statusCode) && statusCode > 0) {
+    const key = `http_status:${Math.min(999, statusCode)}`;
+    if (!Object.hasOwn(batchOutcomeCounts, key) && Object.keys(batchOutcomeCounts).length >= MAX_BATCH_OUTCOME_KEYS) {
+      batchOutcomeCounts.__other__ = (batchOutcomeCounts.__other__ || 0) + 1;
+    } else {
+      batchOutcomeCounts[key] = (batchOutcomeCounts[key] || 0) + 1;
+    }
+  }
+}
+
 function trackOutstanding(item) {
   item.settled = false;
   outstandingItems.add(item);
@@ -2906,6 +2942,7 @@ function takeReadyRetryBatch(now = Date.now()) {
 
 function finishBatch(batch, outcome, retryDelivery) {
   errorCount += outcome.errors;
+  recordBatchOutcome(outcome);
   recordPipelineCounts(outcome.pipelineCounts);
   inflight = Math.max(0, inflight - 1);
   inflightEvents = Math.max(0, inflightEvents - batch.length);
@@ -3038,21 +3075,37 @@ function dropQueuedItem(item, reason = 'priority_evicted') {
   scheduleSpoolReplay();
 }
 
-function makeQueueRoom(bytes, priority) {
+function queueAdmissionLimits(priority, recovered = false) {
+  if (recovered) {
+    // Replayed records may be high priority themselves, but they are historical work. Keep them
+    // below the live reserve regardless of their source priority; live protected traffic can then
+    // evict pending replay items without deleting their WAL records.
+    return {
+      eventLimit: Math.max(0, MAX_OUTSTANDING_EVENTS - SPOOL_REPLAY_RESERVE_EVENTS),
+      byteLimit: Math.max(0, MAX_OUTSTANDING_BYTES - SPOOL_REPLAY_RESERVE_BYTES),
+    };
+  }
   const protectedTraffic = priority >= PROTECTED_PRIORITY;
-  const eventLimit = protectedTraffic
-    ? MAX_OUTSTANDING_EVENTS
-    : Math.max(0, MAX_OUTSTANDING_EVENTS - PROTECTED_RESERVE_EVENTS);
-  const byteLimit = protectedTraffic
-    ? MAX_OUTSTANDING_BYTES
-    : Math.max(0, MAX_OUTSTANDING_BYTES - PROTECTED_RESERVE_BYTES);
+  return {
+    eventLimit: protectedTraffic
+      ? MAX_OUTSTANDING_EVENTS
+      : Math.max(0, MAX_OUTSTANDING_EVENTS - PROTECTED_RESERVE_EVENTS),
+    byteLimit: protectedTraffic
+      ? MAX_OUTSTANDING_BYTES
+      : Math.max(0, MAX_OUTSTANDING_BYTES - PROTECTED_RESERVE_BYTES),
+  };
+}
+
+function makeQueueRoom(bytes, priority, recovered = false) {
+  const { eventLimit, byteLimit } = queueAdmissionLimits(priority, recovered);
   const exceedsOutstanding = () => (
     outstandingEvents + 1 > eventLimit
     || outstandingBytes + bytes > byteLimit
   );
   while (exceedsOutstanding()) {
     const lowest = pending.lowestPriority();
-    if (lowest < 0 || priority <= lowest) return false;
+    const queuePriority = recovered ? Math.max(0, priority - 1) : priority;
+    if (lowest < 0 || queuePriority <= lowest) return false;
     dropQueuedItem(pending.dropLowest(), 'priority_evicted');
   }
   return true;
@@ -3186,7 +3239,7 @@ function admitDurableEvent(
   // priority. This is only a scheduler hint: the durable record's original priority remains on
   // `item.priority` for DLQ/accounting, while live observations can bypass an old replay burst.
   const queuePriority = recovered ? Math.max(0, priority - 1) : priority;
-  if (!makeQueueRoom(bytes, queuePriority)) {
+  if (!makeQueueRoom(bytes, priority, recovered)) {
     if (recovered) attributionCounts.spoolReplayDeferred++;
     else recordQueueDrop(
       kind,
@@ -4013,6 +4066,7 @@ if (require.main === module) {
 // never starts a Forwarder process; the production entrypoint above remains unchanged.
 module.exports = {
   dedupeRuntimeSnapshotEntries,
+  queueAdmissionLimits,
   runtimeSnapshotEntryKey,
   runtimeSnapshotRootKey,
 };
