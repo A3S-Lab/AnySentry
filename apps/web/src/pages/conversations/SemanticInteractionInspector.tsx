@@ -8,6 +8,7 @@ import type {
   AgentSemanticEvent,
   AgentSemanticEvidenceResponse,
   CanonicalEvidenceLink,
+  CanonicalEntityCoverage,
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
 import { formatTokenCount } from "./agentUsage";
@@ -104,6 +105,8 @@ function KernelEvidenceView({
   loading,
   canonicalEvidenceLink,
   canonicalEvidenceLinkLoading,
+  canonicalEvidenceCoverage,
+  canonicalEvidenceAlias,
 }: {
   event: AgentSemanticEvent;
   interaction?: AgentInteractionRecord;
@@ -111,6 +114,8 @@ function KernelEvidenceView({
   loading: boolean;
   canonicalEvidenceLink?: CanonicalEvidenceLink;
   canonicalEvidenceLinkLoading: boolean;
+  canonicalEvidenceCoverage?: CanonicalEntityCoverage;
+  canonicalEvidenceAlias?: string;
 }) {
   if (loading && !evidence) {
     return <div className="flex min-h-40 items-center justify-center gap-2 text-xs text-zinc-500"><LoaderCircle className="size-4 animate-spin" />正在关联内核事实</div>;
@@ -126,6 +131,8 @@ function KernelEvidenceView({
         <EvidenceField label="Canonical EvidenceLink" value={canonicalEvidenceLink?.linkId} />
         <EvidenceField label="Link Revision / Authority" value={canonicalEvidenceLink ? `${canonicalEvidenceLink.resolutionRevision} · ${canonicalEvidenceLink.authority}` : undefined} />
         <EvidenceField label="Link Source Refs" value={canonicalEvidenceLink?.evidenceRefs.join(", ")} />
+        <EvidenceField label="Canonical Coverage" value={canonicalEvidenceCoverage ? `${canonicalEvidenceCoverage.status}${canonicalEvidenceCoverage.reasons.length ? ` · ${canonicalEvidenceCoverage.reasons.join(", ")}` : ""}` : undefined} />
+        <EvidenceField label="Semantic Alias" value={canonicalEvidenceAlias} />
         {canonicalEvidenceLinkLoading ? <EvidenceField label="Canonical Link" value="loading" /> : null}
       </dl>
       {evidence?.relations.some((relation) => relation.kernelEventId) ? (
@@ -214,6 +221,8 @@ export function SemanticInteractionInspector({
   evidenceLoading,
   canonicalEvidenceLink,
   canonicalEvidenceLinkLoading,
+  canonicalEvidenceCoverage,
+  canonicalEvidenceAlias,
   onClose,
 }: {
   event?: AgentSemanticEvent;
@@ -223,6 +232,8 @@ export function SemanticInteractionInspector({
   evidenceLoading: boolean;
   canonicalEvidenceLink?: CanonicalEvidenceLink;
   canonicalEvidenceLinkLoading: boolean;
+  canonicalEvidenceCoverage?: CanonicalEntityCoverage;
+  canonicalEvidenceAlias?: string;
   onClose: () => void;
 }) {
   const [tab, setTab] = useState<"content" | "kernel" | "risk" | "raw">("content");
@@ -330,7 +341,7 @@ export function SemanticInteractionInspector({
               {event.kind === "tool_result" ? <p className="mt-3 text-[11px] leading-5 text-zinc-500">工具结果时间表示该结果重新进入模型请求的明文边界；框架内部精确结束时间仅在有独立工具传输证据时展示。</p> : null}
             </div>
           ) : tab === "kernel" ? (
-            <KernelEvidenceView event={event} interaction={interaction} evidence={semanticEvidence} loading={evidenceLoading} canonicalEvidenceLink={canonicalEvidenceLink} canonicalEvidenceLinkLoading={canonicalEvidenceLinkLoading} />
+            <KernelEvidenceView event={event} interaction={interaction} evidence={semanticEvidence} loading={evidenceLoading} canonicalEvidenceLink={canonicalEvidenceLink} canonicalEvidenceLinkLoading={canonicalEvidenceLinkLoading} canonicalEvidenceCoverage={canonicalEvidenceCoverage} canonicalEvidenceAlias={canonicalEvidenceAlias} />
           ) : tab === "risk" ? (
             <RiskEvidenceView interaction={interaction} evidence={semanticEvidence} loading={evidenceLoading} />
           ) : tab === "raw" ? (

@@ -64,12 +64,12 @@ function clean(value: string) {
   return value.trim() || undefined;
 }
 
-function Pill({ children, className }: { children: ReactNode; className?: string }) {
+function Pill({ children, className, title }: { children: ReactNode; className?: string; title?: string }) {
   return (
     <span className={cn(
       "inline-flex min-h-5 items-center rounded border px-1.5 py-0.5 text-[10px] font-medium leading-none",
       className,
-    )}>
+    )} title={title}>
       {children}
     </span>
   );
@@ -263,14 +263,36 @@ export default function ConversationTrackingPage() {
     loading: timelineLoading,
     error: timelineError,
     refresh: refreshTimeline,
-  } = useRequest(async () => ({
-    clientKey: timelineClientKey,
-    timeline: await securityCenterApi.agentConversationTimelineV3({
+  } = useRequest(async () => {
+    const request = {
       ...conversationQuery,
       conversationId: selectedConversationId,
       agentAssetId: selectedConversation?.agentAssetId ?? clean(scopedAgentAssetId),
-    }),
-  }), {
+    };
+    try {
+      return {
+        clientKey: timelineClientKey,
+        timeline: await securityCenterApi.agentConversationTimelineV3(request),
+      };
+    } catch (legacyError) {
+      // Canonical GET is a metadata-preserving fallback.  It may still return an empty/partial
+      // timeline, but its identity alias and coverage explain why content is unavailable instead
+      // of turning a valid Session deep link into a generic error state.
+      const canonicalSessionId = selectedConversation?.sessionId ?? selectedConversationId;
+      if (!canonicalSessionId) throw legacyError;
+      try {
+        const canonical = await securityCenterApi.canonicalSessionTimeline(canonicalSessionId, request);
+        return {
+          clientKey: timelineClientKey,
+          timeline: canonical.timeline,
+          canonicalCoverage: canonical.coverage,
+          canonicalSession: canonical.session,
+        };
+      } catch {
+        throw legacyError;
+      }
+    }
+  }, {
     ready: Boolean(selectedConversationId),
     // Selection and URL state change immediately, while the client-key guard below removes the
     // prior Thread body. Debounce only the expensive server projection so rapid keyboard/mouse
@@ -290,8 +312,16 @@ export default function ConversationTrackingPage() {
     && (
       timelineEnvelope.timeline.requestedConversationId === selectedConversationId
       || timelineEnvelope.timeline.canonicalConversationId === selectedConversationId
+      || [
+        timelineEnvelope.canonicalSession?.sessionId,
+        timelineEnvelope.canonicalSession?.canonicalSessionId,
+        timelineEnvelope.canonicalSession?.conversationId,
+      ].includes(selectedConversationId)
     )
     ? timelineEnvelope.timeline
+    : undefined;
+  const canonicalTimelineCoverage = timelineEnvelope?.clientKey === timelineClientKey
+    ? timelineEnvelope.canonicalCoverage
     : undefined;
   const timelinePending = Boolean(selectedConversationId && !timeline) || timelineLoading;
   useEffect(() => {
@@ -371,15 +401,35 @@ export default function ConversationTrackingPage() {
     loading: evidenceLoading,
   } = useRequest(async () => ({
     clientKey: evidenceClientKey,
-    evidence: await securityCenterApi.agentSemanticEvidence({
-      timeType,
-      startTime: timeType === "custom" ? consoleTimeFilter.startTime : undefined,
-      endTime: timeType === "custom" ? consoleTimeFilter.endTime : undefined,
-      scope: "agent",
-      classificationView: "current_effective",
-      conversationId: timeline?.canonicalConversationId ?? selectedConversationId,
-      semanticEventId: selectedEvent!.semanticEventId,
-    }),
+    ...await (async () => {
+      const evidenceQuery = {
+        timeType,
+        startTime: timeType === "custom" ? consoleTimeFilter.startTime : undefined,
+        endTime: timeType === "custom" ? consoleTimeFilter.endTime : undefined,
+        scope: "agent" as const,
+        classificationView: "current_effective" as const,
+        conversationId: timeline?.canonicalConversationId ?? selectedConversationId,
+        semanticEventId: selectedEvent!.semanticEventId,
+      };
+      try {
+        return { evidence: await securityCenterApi.agentSemanticEvidence(evidenceQuery) };
+      } catch (legacyError) {
+        try {
+          const canonical = await securityCenterApi.canonicalSemanticEventEvidence(
+            selectedEvent!.semanticEventId,
+            evidenceQuery,
+          );
+          return {
+            evidence: canonical.evidence,
+            canonicalCoverage: canonical.coverage,
+            canonicalAlias: canonical.aliasOf,
+            canonicalRelationStatus: canonical.relationStatus,
+          };
+        } catch {
+          throw legacyError;
+        }
+      }
+    })(),
   }), {
     ready: Boolean(
       selectedEvent?.actor === "tool"
@@ -390,6 +440,12 @@ export default function ConversationTrackingPage() {
   });
   const semanticEvidence = evidenceEnvelope?.clientKey === evidenceClientKey
     ? evidenceEnvelope.evidence
+    : undefined;
+  const canonicalEvidenceCoverage = evidenceEnvelope?.clientKey === evidenceClientKey
+    ? evidenceEnvelope.canonicalCoverage
+    : undefined;
+  const canonicalEvidenceAlias = evidenceEnvelope?.clientKey === evidenceClientKey
+    ? evidenceEnvelope.canonicalAlias
     : undefined;
   const canonicalLinkId = semanticEvidence?.relations.find((relation) => relation.evidenceLinkId)?.evidenceLinkId;
   const canonicalLinkRevision = semanticEvidence?.relations.find((relation) => relation.evidenceLinkId)?.relationRevision;
@@ -451,6 +507,14 @@ export default function ConversationTrackingPage() {
               <MessageSquareText className="size-5 shrink-0 text-violet-300" aria-hidden="true" />
               <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">{t("对话追踪")}</h1>
               <Pill className="border-white/10 bg-white/[0.035] text-zinc-400">semantic v{timeline?.parserVersion ?? 2}</Pill>
+              {canonicalTimelineCoverage?.status === "partial" && (
+                <Pill className="border-amber-400/25 bg-amber-500/10 text-amber-200" title={canonicalTimelineCoverage.reasons.join(", ") || "Canonical coverage partial"}>
+                  Canonical partial
+                </Pill>
+              )}
+              {canonicalTimelineCoverage?.status === "unknown" && (
+                <Pill className="border-zinc-500/30 bg-zinc-500/10 text-zinc-300">Canonical coverage unknown</Pill>
+              )}
             </div>
             <p className="mt-1 truncate text-xs text-zinc-500">按逻辑 Agent、运行实例和 Thread 还原用户、模型、工具三类完整链路</p>
           </div>
@@ -566,6 +630,8 @@ export default function ConversationTrackingPage() {
               evidenceLoading={evidenceLoading}
               canonicalEvidenceLink={canonicalLink}
               canonicalEvidenceLinkLoading={canonicalLinkLoading}
+              canonicalEvidenceCoverage={canonicalEvidenceCoverage}
+              canonicalEvidenceAlias={canonicalEvidenceAlias}
               onClose={closeInspector}
             />
           </div>

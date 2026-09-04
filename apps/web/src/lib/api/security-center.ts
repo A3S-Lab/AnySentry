@@ -1646,6 +1646,250 @@ export interface CanonicalSessionMembership {
 export interface CanonicalResourceEnvelope<T> {
   schemaVersion: string;
   item: T;
+  revision?: number;
+  coverage?: CanonicalEntityCoverage;
+  dataSource?: string;
+  updateTime?: string;
+}
+
+/** Additive Canonical entity GET contracts.  These metadata-only resources deliberately omit
+ * message bodies; callers must follow the legacy bounded timeline/evidence projection for
+ * human-readable content and retain its coverage metadata when unavailable. */
+export interface CanonicalEntityCoverage {
+  status: "complete" | "partial" | "unknown";
+  reasons: string[];
+  source: string;
+}
+export interface CanonicalEntityPagination {
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+  nextCursor?: string;
+}
+export interface CanonicalEntityList<T> {
+  schemaVersion: string;
+  items: T[];
+  total: number;
+  pagination: CanonicalEntityPagination;
+  revision: number;
+  coverage: CanonicalEntityCoverage;
+  dataSource: string;
+  updateTime: string;
+}
+export interface CanonicalLogicalAgentResource {
+  schemaVersion: "anysentry.logical_agent.v1";
+  logicalAgentId: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: "registered_definition" | "workflow_definition" | "service_definition" | "terminal" | "unresolved";
+  logicalIdentityAuthority?: "management_registration" | "authenticated_adapter" | "inferred" | "unknown";
+  definitionFingerprint?: string;
+  identityQuality: "confirmed" | "strong" | "inferred" | "candidate" | "unresolved";
+  family: string;
+  product: string;
+  displayName: string;
+  tenantId?: string;
+  ownerId?: string;
+  workspacePath: string;
+  environment: "kubernetes" | "docker" | "host" | "unknown";
+  lifecycleState: "running" | "unobserved" | "historical";
+  terminalContextIds: string[];
+  agentAssetIds: string[];
+  agentInstanceIds: string[];
+  sessionIds: string[];
+  activeInstanceCount: number;
+  totalInstanceCount: number;
+  conversationCount: number;
+  usage: AgentUsageSummary;
+  coverage: AgentConversationCoverage;
+  sourceRefs: string[];
+  resolutionRevision: number;
+}
+export interface CanonicalAgentInstanceResource {
+  schemaVersion: "anysentry.agent_instance.v1";
+  agentInstanceId: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: CanonicalLogicalAgentResource["logicalScopeMode"];
+  logicalIdentityAuthority?: CanonicalLogicalAgentResource["logicalIdentityAuthority"];
+  agentProduct?: string;
+  displayName?: string;
+  environment?: CanonicalLogicalAgentResource["environment"];
+  tenantId?: string;
+  ownerId?: string;
+  workspacePath?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  collectorId?: string;
+  sourceId?: string;
+  collectorIds?: string[];
+  sourceIds?: string[];
+  terminalContextIds: string[];
+  runtimeInstanceIds: string[];
+  sessionIds: string[];
+  state: string;
+  startedAtUnixNs: string;
+  endedAtUnixNs?: string;
+  lastSeenAtUnixNs: string;
+  sourceRefs: string[];
+  coverage: CanonicalEntityCoverage;
+  detectedClassification?: AgentClassification;
+  effectiveClassification?: AgentClassification;
+  candidateAutoPromoted?: boolean;
+  resolutionRevision: number;
+}
+export interface CanonicalRuntimeInstanceResource {
+  schemaVersion: "anysentry.runtime_instance.v1";
+  runtimeInstanceId: string;
+  agentInstanceId?: string;
+  legacyAgentInstanceId: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: CanonicalLogicalAgentResource["logicalScopeMode"];
+  logicalIdentityAuthority?: CanonicalLogicalAgentResource["logicalIdentityAuthority"];
+  agentProduct?: string;
+  displayName?: string;
+  environment: CanonicalLogicalAgentResource["environment"];
+  tenantId?: string;
+  ownerId?: string;
+  environmentId?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  collectorId: string;
+  sourceId?: string;
+  hostId: string;
+  bootId: string;
+  rootPid: number;
+  rootStartTimeTicks: string;
+  processGenerationKeys: string[];
+  workspacePath?: string;
+  physicalWorkloadId?: string;
+  terminalContextId?: string;
+  sshConnectionId?: string;
+  state: string;
+  activityState?: string;
+  startedAtUnixNs: string;
+  endedAtUnixNs?: string;
+  lastSeenAtUnixNs: string;
+  sourceRefs: string[];
+  coverage: CanonicalEntityCoverage;
+  detectedClassification?: AgentClassification;
+  effectiveClassification?: AgentClassification;
+  candidateAutoPromoted?: boolean;
+  resolutionRevision: number;
+}
+export interface CanonicalSessionResource {
+  schemaVersion: "anysentry.session.v1";
+  sessionId: string;
+  canonicalSessionId?: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  conversationId?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: CanonicalLogicalAgentResource["logicalScopeMode"];
+  logicalIdentityAuthority?: CanonicalLogicalAgentResource["logicalIdentityAuthority"];
+  tenantId?: string;
+  ownerId?: string;
+  agentProduct?: string;
+  environment?: CanonicalLogicalAgentResource["environment"];
+  workspacePath?: string;
+  collectorIds?: string[];
+  sourceIds?: string[];
+  agentInstanceIds: string[];
+  segmentIds: string[];
+  interactionIds: string[];
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  sessionIdentityQuality?: string;
+  sessionMode?: string;
+  sessionLifecycle?: string;
+  startedAtUnixNs?: string;
+  lastActivityAtUnixNs?: string;
+  turnCount: number;
+  modelCallCount: number;
+  toolCallCount: number;
+  toolResultCount: number;
+  errorCount: number;
+  usage: AgentUsageSummary;
+  coverage: AgentConversationCoverage;
+  sourceRefs: string[];
+  resolutionRevision: number;
+}
+export interface CanonicalLogicalAgentList extends CanonicalEntityList<CanonicalLogicalAgentResource> {
+  schemaVersion: "anysentry.logical_agent.list.v1";
+}
+export interface CanonicalAgentInstanceList extends CanonicalEntityList<CanonicalAgentInstanceResource> {
+  schemaVersion: "anysentry.agent_instance.list.v1";
+}
+export interface CanonicalRuntimeInstanceList extends CanonicalEntityList<CanonicalRuntimeInstanceResource> {
+  schemaVersion: "anysentry.runtime_instance.list.v1";
+}
+export interface CanonicalSessionList extends CanonicalEntityList<CanonicalSessionResource> {
+  schemaVersion: "anysentry.session.list.v1";
+}
+export interface CanonicalEntityQuery extends SecurityTimeFilter {
+  limit?: number;
+  offset?: number;
+  cursor?: string;
+  revision?: number;
+  includeShadow?: boolean;
+  includeCoverage?: boolean;
+  logicalAgentId?: string;
+  tenantId?: string;
+  ownerId?: string;
+  workspacePath?: string;
+  product?: string;
+  environment?: string;
+  environmentId?: string;
+  agentAssetId?: string;
+  agentInstanceId?: string;
+  runtimeInstanceId?: string;
+  sessionId?: string;
+  sourceId?: string;
+  collectorId?: string;
+  coverageStatus?: string;
+  lifecycleScope?: "running" | "history" | "all";
+  q?: string;
+}
+export interface CanonicalSessionTimelineResponse {
+  schemaVersion: "anysentry.session.timeline.v1";
+  session: CanonicalSessionResource;
+  timeline: AgentConversationTimelineV3;
+  revision: number;
+  coverage: CanonicalEntityCoverage;
+  dataSource: string;
+  updateTime: string;
+}
+export interface CanonicalSessionCoverageResponse {
+  schemaVersion: "anysentry.session.coverage.v1";
+  sessionId: string;
+  coverage: AgentConversationCoverage;
+  revision: number;
+  dataSource: string;
+  updateTime: string;
+}
+export interface CanonicalSemanticEventEvidenceResponse {
+  schemaVersion: "anysentry.evidence_link.semantic_event.v1";
+  requestedSemanticEventId: string;
+  resolvedSemanticEventId?: string;
+  aliasOf?: string;
+  aliasCandidates?: string[];
+  semanticRecord?: Record<string, unknown>;
+  evidence?: AgentSemanticEvidenceResponse;
+  relationStatus: AgentSemanticKernelRelationStatus | "coverage_gap" | "ambiguous";
+  coverage: CanonicalEntityCoverage;
+  revision: number;
+  dataSource: string;
+  updateTime: string;
 }
 export interface ToolEvidenceItem {
   invocationId: string;
@@ -4208,6 +4452,56 @@ export const securityCenterApi = {
     apiClient.postLong<AgentConversationTimelineV3>("/security-center/agents/conversations/timeline-v3", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
   agentSemanticEvidence: (filter: AgentConversationQuery & { conversationId: string; semanticEventId: string }) =>
     apiClient.postLong<AgentSemanticEvidenceResponse>("/security-center/agents/semantic-events/evidence", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
+  /** Canonical metadata/entity reads.  Keep these additive to the legacy POST projections so a
+   * temporarily unavailable timeline does not erase identity or coverage from the UI. */
+  canonicalLogicalAgents: (query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalLogicalAgentList>(`/security-center/v1/logical-agents${querySuffix(query)}`),
+  canonicalLogicalAgent: (logicalAgentId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalResourceEnvelope<CanonicalLogicalAgentResource>>(
+      `/security-center/v1/logical-agents/${encodeURIComponent(logicalAgentId)}${querySuffix(query)}`,
+    ),
+  canonicalLogicalAgentInstances: (logicalAgentId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalAgentInstanceList>(
+      `/security-center/v1/logical-agents/${encodeURIComponent(logicalAgentId)}/instances${querySuffix(query)}`,
+    ),
+  canonicalAgentInstances: (query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalAgentInstanceList>(`/security-center/v1/agent-instances${querySuffix(query)}`),
+  canonicalAgentInstance: (agentInstanceId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalResourceEnvelope<CanonicalAgentInstanceResource>>(
+      `/security-center/v1/agent-instances/${encodeURIComponent(agentInstanceId)}${querySuffix(query)}`,
+    ),
+  canonicalAgentInstanceRuntimes: (agentInstanceId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalRuntimeInstanceList>(
+      `/security-center/v1/agent-instances/${encodeURIComponent(agentInstanceId)}/runtimes${querySuffix(query)}`,
+    ),
+  canonicalAgentInstanceSessions: (agentInstanceId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalSessionList>(
+      `/security-center/v1/agent-instances/${encodeURIComponent(agentInstanceId)}/sessions${querySuffix(query)}`,
+    ),
+  canonicalRuntimeInstances: (query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalRuntimeInstanceList>(`/security-center/v1/runtime-instances${querySuffix(query)}`),
+  canonicalRuntimeInstance: (runtimeInstanceId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalResourceEnvelope<CanonicalRuntimeInstanceResource>>(
+      `/security-center/v1/runtime-instances/${encodeURIComponent(runtimeInstanceId)}${querySuffix(query)}`,
+    ),
+  canonicalSessions: (query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalSessionList>(`/security-center/v1/sessions${querySuffix(query)}`),
+  canonicalSession: (sessionId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalResourceEnvelope<CanonicalSessionResource>>(
+      `/security-center/v1/sessions/${encodeURIComponent(sessionId)}${querySuffix(query)}`,
+    ),
+  canonicalSessionTimeline: (sessionId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalSessionTimelineResponse>(
+      `/security-center/v1/sessions/${encodeURIComponent(sessionId)}/timeline${querySuffix(query)}`,
+    ),
+  canonicalSessionCoverage: (sessionId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalSessionCoverageResponse>(
+      `/security-center/v1/sessions/${encodeURIComponent(sessionId)}/coverage${querySuffix(query)}`,
+    ),
+  canonicalSemanticEventEvidence: (semanticEventId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalSemanticEventEvidenceResponse>(
+      `/security-center/v1/semantic-events/${encodeURIComponent(semanticEventId)}/evidence${querySuffix(query)}`,
+    ),
   canonicalEvidenceLink: (linkId: string, resolutionRevision?: number) =>
     apiClient.get<CanonicalResourceEnvelope<CanonicalEvidenceLink>>(
       `/security-center/v1/evidence-links/${encodeURIComponent(linkId)}${resolutionRevision === undefined ? "" : `?resolutionRevision=${resolutionRevision}`}`,
