@@ -12963,6 +12963,78 @@ export class SecurityMonitoringController implements OnModuleDestroy {
 
     let sessions: CanonicalSessionProjection;
     let timelineSearch: CanonicalSemanticTimelineSearch | undefined;
+    // A durable SemanticRecord already carries the server-derived Session identity.  Resolve that
+    // identity directly before scanning the bounded directory: the canonical Session ID and the
+    // compatibility conversation ID are different namespaces, so a broad/slow directory read can
+    // otherwise return an ambiguous set and hide a perfectly valid semantic deep link.  The
+    // helper performs at most one bounded alias read per candidate and remains read-only.
+    if (!timelineSearch && semanticRecord) {
+      const directSessionIds = [...new Set([
+        query.sessionId,
+        semanticRecord.canonicalSessionId,
+        semanticRecord.sessionId,
+      ].filter((value): value is string => Boolean(value)))].slice(0, 3);
+      const directCandidates: CanonicalSemanticTimelineCandidate[] = [];
+      let directFailed = 0;
+      for (const directSessionId of directSessionIds) {
+        let directSessions: CanonicalSessionProjection;
+        try {
+          directSessions = await withCanonicalProjectionTimeout(
+            this.canonicalSessionResourcesForExact({
+              ...query,
+              sessionId: directSessionId,
+              offset: 0,
+              limit: CANONICAL_ENTITY_LIMIT_MAX,
+            }, headers),
+            CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS,
+          );
+        } catch (error) {
+          if (!isCanonicalProjectionDegradation(error)) throw error;
+          directFailed += 1;
+          continue;
+        }
+        for (const directSession of directSessions.items.slice(0, 2)) {
+          const directConversationId = directSession.conversationId ?? directSession.sessionId;
+          try {
+            const directTimeline = await withCanonicalProjectionTimeout(
+              this.agg.agentConversationTimelineV3({
+                timeType: query.timeType,
+                startTime: query.startTime,
+                endTime: query.endTime,
+                snapshotAsOf: query.snapshotAsOf,
+                scope: 'raw',
+                classificationView: query.classificationView,
+                conversationId: directConversationId,
+                limit: 500,
+              }),
+              CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS,
+            );
+            for (const turn of directTimeline.turns) {
+              for (const event of turn.events) {
+                const matches = timelineId
+                  ? event.semanticEventId === id
+                  : canonicalSemanticRecordTouchesEvent(semanticRecord, event);
+                if (matches) directCandidates.push({ session: directSession, event });
+              }
+            }
+          } catch (error) {
+            if (!isCanonicalProjectionDegradation(error)) throw error;
+            directFailed += 1;
+          }
+          if (directCandidates.length >= 2) break;
+        }
+        if (directCandidates.length >= 2) break;
+      }
+      if (directCandidates.length > 0) {
+        timelineSearch = {
+          candidates: directCandidates.slice(0, 2),
+          scanned: directSessionIds.length,
+          truncated: false,
+          failed: directFailed,
+          exactUnique: directCandidates.length === 1,
+        };
+      }
+    }
     // A scoped deep link can be resolved directly from the bounded compatibility interaction
     // projection. This avoids scanning hundreds of canonical Session rows when PostgreSQL's
     // membership projector is behind, while retaining the session-scan fallback for unscoped or

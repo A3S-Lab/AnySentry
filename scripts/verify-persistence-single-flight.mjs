@@ -296,17 +296,41 @@ function clearScheduledPersistence(service) {
   assert.equal(relationalCalls.length, 1);
   assert.equal(relationalCalls[0].length, 1, 'remediation flush sends only the dirty task');
 
+  // Coverage projections rebuild detectedAt on every read. A timestamp-only refresh must retain
+  // the original task creation boundary and avoid another relational UPDATE.
+  const coverageTask = {
+    ...task,
+    taskId: 'remediation-coverage-refresh',
+    sourceType: 'coverage',
+    sourceId: 'coverage-refresh',
+    createdAt: 1_000,
+    updatedAt: 1_000,
+    labels: { issueId: 'coverage-refresh', type: 'agent_uncovered' },
+  };
+  remediation.mergeGenerated(coverageTask);
+  clearScheduledPersistence(remediation);
+  await remediation.persist();
+  const coverageCalls = relationalCalls.length;
+  remediation.mergeGenerated({ ...coverageTask, createdAt: 9_000, updatedAt: 9_000 });
+  clearScheduledPersistence(remediation);
+  await remediation.persist();
+  assert.equal(relationalCalls.length, coverageCalls,
+    'coverage timestamp-only refresh must not rewrite the relational task');
+  assert.equal(remediation.state.get(coverageTask.taskId).createdAt, coverageTask.createdAt,
+    'coverage refresh must retain the original task creation timestamp');
+
   // A second unchanged task must not be included in a later write.
   const untouched = { ...task, taskId: 'remediation-untouched' };
   remediation.state.set(untouched.taskId, structuredClone(untouched));
   remediation.state.set(task.taskId, { ...firstUpdate, note: 'second update', updatedAt: 2_000 });
   remediation.markTaskDirty(task.taskId);
   clearScheduledPersistence(remediation);
+  const callsBeforeSecondUpdate = relationalCalls.length;
   await remediation.persist();
-  assert.equal(relationalCalls.length, 2);
-  assert.equal(relationalCalls[1].length, 1);
-  assert.equal(relationalCalls[1][0].taskId, task.taskId);
-  assert.equal(clickhouseCalls.at(-1).length, 2, 'ClickHouse keeps the complete remediation snapshot');
+  assert.equal(relationalCalls.length, callsBeforeSecondUpdate + 1);
+  assert.equal(relationalCalls.at(-1).length, 1);
+  assert.equal(relationalCalls.at(-1)[0].taskId, task.taskId);
+  assert.equal(clickhouseCalls.at(-1).length, 3, 'ClickHouse keeps the complete remediation snapshot');
 
   // Overdue alert reconciliation is idempotent until a task fingerprint (or overdue boundary)
   // changes, so a GET/periodic scan cannot rewrite the same Alert repeatedly.

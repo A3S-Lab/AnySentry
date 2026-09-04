@@ -433,7 +433,7 @@ try {
   }
   assert(['canonical_store', 'canonical_store+hot_delta', 'memory_hot_ring'].includes(
     timelineEvidence.evidence?.canonicalEvidenceLinksSource ?? 'computed_compatibility',
-  ), 'semantic evidence must expose a canonical-lane link source');
+  ), `semantic evidence must expose a canonical-lane link source (source=${timelineEvidence.evidence?.canonicalEvidenceLinksSource ?? 'none'}, relationStatus=${timelineEvidence.evidence?.relationStatus ?? 'none'}, relations=${timelineEvidence.evidence?.relations?.length ?? 0}, outerStatus=${timelineEvidence.relationStatus ?? 'none'}, outerCoverage=${timelineEvidence.coverage?.status ?? 'none'}, outerReasons=${(timelineEvidence.coverage?.reasons ?? []).join('|')})`);
   if (timelineEvidence.evidence?.canonicalEvidenceLinksSource === 'canonical_store+hot_delta') {
     assert.equal(timelineEvidence.evidence.canonicalEvidenceLinksCoverage?.partial, true);
     assert(timelineEvidence.evidence.canonicalEvidenceLinksCoverage?.reasons.includes('canonical_evidence_link_hot_delta_pending'));

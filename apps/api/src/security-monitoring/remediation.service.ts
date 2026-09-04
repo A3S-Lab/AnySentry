@@ -80,6 +80,7 @@ function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
   return `{${Object.entries(value as Record<string, unknown>)
+    .filter(([, item]) => item !== undefined)
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
     .join(',')}}`;
@@ -550,12 +551,26 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
       status: cur.status,
       owner: cur.owner ?? generated.owner,
       note: cur.note ?? generated.note,
+      // Coverage issues are rebuilt from a read-time snapshot whose detectedAt is the current
+      // observation time. Keep the task's original creation boundary instead of turning every
+      // refresh into a semantic mutation (and a relational UPDATE).
+      createdAt: cur.createdAt,
       dueAt: cur.dueAt ?? generated.dueAt,
       completedAt: cur.completedAt,
       updatedAt: Math.max(cur.updatedAt, generated.updatedAt),
       steps: generated.steps.map((step) => ({ ...step, done: cur.steps.find((s) => s.stepId === step.stepId)?.done ?? step.done })),
     };
     if (canonicalJson(next) === canonicalJson(cur)) return;
+    if (generated.sourceType === 'coverage') {
+      const withoutObservationTime = (record: RemediationRecord): Record<string, unknown> => {
+        const { updatedAt: _updatedAt, ...stable } = record;
+        return stable;
+      };
+      // `detectedAt`/`lastSeenAt` are observation timestamps for a coverage issue. They do not
+      // alter the actionable task unless another field (status, labels, evidence, etc.) changes.
+      // Keep the prior record and dirty set untouched for a timestamp-only refresh.
+      if (canonicalJson(withoutObservationTime(next)) === canonicalJson(withoutObservationTime(cur))) return;
+    }
     this.state.set(generated.taskId, next);
     this.markTaskDirty(generated.taskId);
     this.persistSoon();
