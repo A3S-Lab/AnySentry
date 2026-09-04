@@ -461,7 +461,7 @@ node scripts/verify-deployment-manifests.mjs
 
 ### 已确认事实
 
-- 当前 AnySentry HEAD 为 `02b745a`，Observer HEAD 为 `40556f5`。只因 API/Canonical 代码变化
+- 当前 AnySentry HEAD 为 `32672a5`（运行时代码 checkpoint `02b745a`），Observer HEAD 为 `40556f5`。只因 API/Canonical 代码变化
   构建并部署 AnySentry/Web；Observer 未改镜像，仍为本地 digest `sha256:45af6fa2…`。
 - 最终 API/Web 本地镜像为 `127.0.0.1:5000/anysentry:goal-head-20260905-r51-canonical-final`，
   digest `sha256:bf625fe8bee8019bd7121c0045cc1f8b9e00e4ee6933aaa6d65962fd6c9dfc5c`。Pod
