@@ -323,8 +323,8 @@ spec:
       labels: { app: anysentry, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
       annotations:
         # Local immutable overlay provenance; update only when this service's image changes.
-        anysentry.io/local-overlay-manifest: "sha256:4276e26ecb7fdf4a168cfa4830a6d63ef950e8e1cce51ee2f05c6d38445f45f3"
-        anysentry.io/local-source-revision: "AnySentry@b766f5e+canonical-directory-timeout"
+        anysentry.io/local-overlay-manifest: "sha256:ff64ccad5029f29668801c8c003cecd46bef416eb701c76c0a8de892aba70417"
+        anysentry.io/local-source-revision: "AnySentry@9ff3683+canonical-directory-timeout"
     spec:
       terminationGracePeriodSeconds: 30
       serviceAccountName: anysentry
