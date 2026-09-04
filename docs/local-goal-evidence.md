@@ -14,9 +14,39 @@
 - Dify LLM/tool 两个 workflow 本回合均 HTTP 200、脚本 rc=0；durable `dify-observation-lab` 快照有 55 条事件，但测试 CA 校验失败使 debug hash 对账为 partial，correlation method 全部 unassigned。
 - LangGraph 在本地 k3s 的真实 `/runs` 调用与 durable API 查询已经产生可审计事件；但语义 lane 与 Kernel lane 当前仍有 `correlation unassigned`/`agent_adapter` 缺口，不能写成全链路统一通过。
 - 当前 SSH Codex 初始 durable 快照有 60 条 `LlmInteraction`（model 56、tool 4），后续异步 `agents/interactions` 重查可到 model 57、tool 4；4 个 tool 均 parsed/complete（toolCall4/toolResult4），model57 parsed 且 request/response wire complete，但 conversation complete 仅 2、tool_pending 55，选定 Tool 的 EvidenceLink inspector 返回 404。另有 2 条 metadata-only/unparsed Rustls plaintext evidence，identity/session/run 仍是 runtime/probable 提示；不能声称当前对话正文原文已完整落盘或已确认归属。
-- existing formal 旧 digest 尚未切换 canonical GET，`critical_inbox_dropped` 约 1.89M（最近观测且继续上涨）、static signature warnings，以及普通 SSH 用户无 eBPF 能力，仍是 DoD/运行风险缺口；临时 OCI overlay 的 contracts GET 仅作局部验收。
+- 旧快照中的 formal digest/Canonical GET 缺口已在本轮 post-rollout 节更新；Forwarder WAL/数据库
+  timeout、static signature warnings、普通 SSH 用户无 eBPF 能力和统一 EvidenceLink 仍是 DoD/运行风险缺口。
 
-## 2026-09-04 新一轮运行复核
+## 2026-09-04 本轮代码交付与正式本地 rollout（优先于下方历史快照）
+
+### 已确认事实
+
+- AnySentry 当前本地 checkpoint 为 `b069df3`（API/Canonical GET、source provenance、Web fallback
+  已提交），Observer 为 `3a827bf`（implementation-family TLS、candidate full capture、mixed
+  generation fence）；两边均未向远程推送。
+- 原始 Dockerfile/BuildKit 在共享节点的 daemon/磁盘压力下无法完成，因此使用 loopback-only
+  `scripts/publish-local-oci-overlay.mjs` 生成最小增量层。API/Web manifest 为
+  `sha256:b382…`，Observer binary/scripts manifest 为 `sha256:fd31…`；层只包含编译产物/脚本，
+  依赖基座和 Secret 未复制。
+- k3s formal `anysentry` Deployment 已切换 API/Web `b382…`，新 Pod Ready=1/restart=0；NodePort
+  health、同源 Web、`/v1/observability/contracts` 和 Canonical LogicalAgent GET 均 HTTP 200。
+  `a3s-observer` DaemonSet 已切换 `fd31…`，Ready=1/restart=0，启动日志显示 73 probes attached；
+  不改动未涉及代码的 streaming/worker 镜像。
+- `tender_jang` 内真实 Codex 0.149.1、Claude Code 2.1.251 均用 A3S Test TUI suite 通过（各有
+  ToolCall/ToolResult/final marker 和非敏感 terminal recording）；这证明容器内产品级协议闭环，
+  不自动等同于每个字节均已形成唯一 EvidenceLink。
+- 新 Observer 运行期间 API Canonical hot state 已出现 Raw/Kernel/Semantic/Evidence/Session
+  记录；Forwarder WAL 仍有约 170 MiB backlog，曾因 API 启动、ClickHouse/PostgreSQL timeout 和
+  节点 I/O 抖动收到批次拒绝，故持续零丢失、四对象唯一 Tool→Kernel 深链仍为 partial。
+
+### 推断与未验证
+
+- 当前 SSH 对话可在旧兼容 semantic lane 中看到模型/工具记录，但普通 SSH 无 BPF attach 权限，
+  正文完整持久化、独占捕获和 Canonical 双向深链仍未验证。
+- k3s 节点高 iowait/swap、etcd/dockerd/EDR 并发和 DNS/探针超时是独立外部稳定性问题；Scanner
+  的 EACCES/hostPath 缺口已修复并稳定运行，不能把节点抖动归因于 Scanner 代码。
+
+## 2026-09-04 新一轮运行复核（部署前历史快照，post-rollout 结果以上节为准）
 
 本节是当前回合的事实快照，优先级高于下方 2026-09-03 的历史审计段落。运行结果只记录
 脱敏后的版本、状态、计数和原因；没有保存 URL 全文、凭据、Cookie 或 Prompt 正文。

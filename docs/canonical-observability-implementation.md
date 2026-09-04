@@ -22,12 +22,11 @@ semantic lane，但身份/Session 仍是运行时提示，原文只留有 metada
 Tool 的 EvidenceLink inspector 仍为 404，不能写成 Observer eBPF 被动 attach 的四环境端到端完成。LangGraph
 的耐久记录也显示两条 lane 尚未统一。Dify LLM/tool 两个 workflow 本回合均 HTTP 200、脚本
 rc=0，但 debug reconciliation 因测试 CA 校验失败，hash 对账仍为 partial；因此 Goal 仍为部分完成。
-临时 k3s API/Web OCI overlay `anysentry:goal-current-oci-20260904` 已构建并通过本机 registry
-manifest GET 200（digest 前缀 `043180…`）；namespace `anysentry-goal-oci-web-20260904` 以
-Secret/no-hostPath 完成 health、`/v1/observability/contracts`、representative replay 13/4
-families/0 gap、S6、S2 shadow 后已清理。基座仍是旧 runtime + current dist overlay，非原始
-Dockerfile 全链；Observer scripts overlay 也已生成并推入本机 registry（digest 前缀 `7d3b…`），
-但 existing formal deployment 未切换。
+本轮通过本地 registry 的 OCI 增量层交付了 API/Web `sha256:b382…` 和 Observer
+`sha256:fd31…`（原始 Dockerfile/BuildKit 在共享节点上仍不可用）；API Deployment 与 Observer
+DaemonSet 已切换并 Ready，NodePort health、同源 Web、Canonical contracts/entity GET 均已复验。
+该交付保留旧依赖基座，完整构建链仍记录为未通过；Forwarder/WAL 受节点 I/O/ClickHouse/轮询
+抖动影响，不能把当前部署写成零丢失或生产容量通过。
 Observer BPF 对象还在特权本地
 k3s Pod 中以 Aya `Program::load` 逐项加载了
 `tls_write`、`tls_sendto`、`http_writev` 和 `exec`，验证此前的 1,000,001-instruction verifier
@@ -51,15 +50,16 @@ k3s Pod 中以 Aya `Program::load` 逐项加载了
 
 | 项目 | 当前事实 | 边界 |
 | --- | --- | --- |
-| 本地 checkpoint | AnySentry `b5bb92b`（含 `6644d5c`/`d54ebba`）；Observer `3a827bf`（含 `66e27eb`/`49f183e`） | 仅本地分支和本地 checkpoint，未执行任何远程推送 |
-| 构建/合同 | `pnpm build`、Canonical/identity/S5/unified/workspace/deployment 定向门禁通过；Observer release workspace test 212 项、fmt/check/build/clippy 通过 | 代码门禁不等价于正式集群已切换 |
-| Canonical GET | `/v1/logical-agents`、`agent-instances`、`runtime-instances`、`sessions` 及详情、nested sessions/runtimes、timeline、coverage、`sr_`/`se_` semantic evidence alias、kernel context 均有版本化响应、bounded pagination/cursor、revision/coverage 和管理鉴权；隔离 harness 通过 | 当前正式 API Pod 仍是旧 digest，尚未把 GET 结果写成正式部署通过 |
+| 本地 checkpoint | AnySentry `b069df3`（含 `4fbd077`/`855bff9`/`adf0b91`）；Observer `3a827bf`（含 `66e27eb`/`49f183e`） | 仅本地分支和本地 checkpoint，未执行任何远程推送 |
+| 构建/合同 | `pnpm build`、Canonical/identity/S5/unified/workspace/deployment 定向门禁通过；Observer release workspace test 212 项、fmt/check/build/clippy 通过；本地 OCI overlay manifest 已校验 | 原始 Dockerfile/BuildKit 受宿主 daemon/IO 阻塞，overlay 复用已验证依赖基座 |
+| Canonical GET | `/v1/logical-agents`、`agent-instances`、`runtime-instances`、`sessions` 及详情、nested sessions/runtimes、timeline、coverage、`sr_`/`se_` semantic evidence alias、kernel context 均有版本化响应、bounded pagination/cursor、revision/coverage 和管理鉴权；隔离 harness 与当前 NodePort 均通过 | 当前 API/Observer 已切换到本地不可变 overlay；四环境的唯一 Tool→Kernel 深链仍非全部通过 |
 | 候选身份 | `probable_agent` 保留 observed/detected provenance；默认 `effective capture/judgment=confirmed_agent`，与确认 Agent 使用同一完整 probe 矩阵，仍受 ring/payload/TTL/队列预算约束 | 不创建虚假 LogicalAgent/Session；`ANYSENTRY_CANDIDATE_EFFECTIVE_MODE=probable` 仅是显式成本降级开关，不是默认路径；管理面 token 仍只保护变更/控制操作，不再要求人工升级候选才能采样 |
 | TLS 设计 | Codex/Claude 只通过实现族/ABI capability manifest 选择通用 TLS 边界；产品名仅作发现提示，版本号/二进制指纹不能作为隐藏授权条件 | 极端新 ABI 通过新增明确 capability extension 接入，复用同一 Parser/Correlation 主链 |
 | CLI 与 a3s-test | 宿主 Codex/Claude TUI suite 通过；`tender_jang` 内真实 Codex `0.149.1`、Claude Code `2.1.251` 的 TUI suite 也通过（非敏感 terminal recording）；浏览器 capability 因本机 `a3s` 驱动缺少 `use` 未执行 | TUI 结果是产品级请求—工具—结果—最终回复证据，不等价于 eBPF 被动 attach |
 | Runtime Source provenance | 运行时 snapshot 在 API 鉴权边界绑定 server-only `sourceId`，并在 AgentInstance/RuntimeInstance Canonical GET 中可查询；producer 伪造字段不会覆盖它 | 旧历史记录没有 sourceId 时仍按 Coverage 标 partial，不回填猜测值 |
-| k3s Scanner | 代码已捕获不可读目录并跳过 `.runtime`；live `workspace-scanner` 使用本地不可变 digest、显式 `Directory` hostPath，Ready/restart=0，完成 1385 component scan | 仅 Scanner 已切换；API/Observer/Worker 尚未整体切换 |
-| API/Web 交付形态 | API OCI 镜像内同时提供 `/app/dist` 和 `/app/web`，通过同源服务承载页面；因此没有独立 current-head Web Deployment 是有意的单镜像边界，不是遗漏组件 | 页面验收前提是更新 API 镜像；当前正式 Pod 仍旧镜像，所以旧页面无新 GET 不是“Web 缺部署”而是 API 未滚动 |
+| k3s Scanner | 代码已捕获不可读目录并跳过 `.runtime`；live `workspace-scanner` 使用本地不可变 digest、显式 `Directory` hostPath，Ready/restart=0，完成 1385 component scan | Scanner、API、Observer 已切换；未改动的 worker/streaming 镜像按“只有代码变更才滚动”原则保留旧 digest |
+| Formal API/Observer rollout | API `sha256:b382…` 与 Observer `sha256:fd31…` 均已被本地 k3s 节点拉取并 Ready=1/restart=0；API NodePort health/contracts 200；Observer attached 73 probes、WAL 保留 backlog | Forwarder 曾因 API/数据库启动和节点 I/O 返回批次拒绝，后续仍保留 WAL；ClickHouse/PostgreSQL timeout、cgroup scope conflicts 和高 iowait 使“持续零丢失”未通过 |
+| API/Web 交付形态 | API OCI 镜像内同时提供 `/app/dist` 和 `/app/web`，通过同源服务承载页面；因此没有独立 current-head Web Deployment 是有意的单镜像边界，不是遗漏组件 | API 已滚动到 `b382…`，NodePort 页面和 canonical client 字符串可见；可选 modules profile 的独立 Web 不属于 formal namespace |
 
 ### 目标设计
 
@@ -364,7 +364,10 @@ cargo clippy --locked --offline --workspace --exclude a3s-observer-ebpf \
 
 当前 Observer `3a827bf` 结果为 212 项测试通过（root 32、workload contract 7、collector
 165、common 8）；identity scope tests 与 TLS capability boundary 另行通过；fmt、workspace check/release build 和 clippy
-通过。`a3s-observer-ebpf` 是 no_std/no_main 的专用 BPF target；在
+通过。为绕开共享节点 BuildKit 阻塞，本地交付使用受 loopback 限制的
+`scripts/publish-local-oci-overlay.mjs` 生成增量层：API/Web manifest `sha256:b382…`、Observer
+binary/scripts manifest `sha256:fd31…`；上传前只校验本地 registry，未向远程 registry 写入。
+`a3s-observer-ebpf` 是 no_std/no_main 的专用 BPF target；在
 普通 host 上直接以 `--features build-ebpf` 做宿主链接会触发 unwinding 限制，正确门禁是
 Collector 的 `aya_build`（本次 workspace build/test 已生成 BPF object），不能把该宿主链接
 命令写成 eBPF attach 通过。
@@ -400,8 +403,10 @@ workload 转发仍按环境矩阵标记为未验证。
   reduced-motion、User/Model/Tool、历史 Agent 折叠、selection/revision 防旧响应覆盖；
   Agent/Event inspection 与外部 Tool interaction 也分别通过 responsive/overflow/runtime
   检查。外部 Tool 场景使用合成 `interactionType=tool` 记录，不能替代真实 Observer attach；
-- 最新总门禁 `verify-canonical-goal.mjs --run-tests` 的失败数为 0。环境状态和 hygiene
-  缺口仍按下节报告，不能把总门禁的 `status=partial` 改写成完成。
+- 总门禁 `verify-canonical-goal.mjs --run-tests` 已在修复日期依赖后重跑；代码局部检查为绿，
+  但环境矩阵仍会因 Host/SSH 未提供目标、凭据扫描发现既有 protected runtime 文件而报告
+  `partial/blocked`。这类状态不能改写成完成；正式 API/Observer 当前已切换的 digest 与
+  Forwarder WAL/节点 I/O 降级另见本节运行补充。
 
 ### 5.2.1 2026-09-04 运行补充
 
@@ -412,6 +417,7 @@ workload 转发仍按环境矩阵标记为未验证。
 | --- | --- | --- |
 | `tender_jang` 运行时盘点 | `node:24-bookworm`；Codex 0.149.1、Claude Code 2.1.251；LangChain 1.3.17、LangGraph 1.2.11 | 容器无 published port、Docker socket、Docker CLI；可运行库不等于容器编排或 Observer 接入 |
 | Codex/Claude 本地 fixture | 各两阶段请求—ToolCall—ToolResult—final 成功 | 协议/适配器闭环；非被动 eBPF 证据 |
+| `tender_jang` A3S Test TUI | 容器内 Codex 0.149.1、Claude Code 2.1.251 均通过对应 TUI suite；各有 ToolCall/ToolResult/final marker 和非敏感 terminal recording | 真实容器 CLI 版本通过产品级 fixture；Observer 当前可见 Kernel/SSL 计数，但没有把该次调用宣称为唯一 Canonical EvidenceLink |
 | LangChain 临时 HTTP 副本 | 工具闭环 HTTP 200 | HTTP transport 与工具结果回传可验证 |
 | LangChain 常驻 HTTPS | 已轮换本地测试 CA/server cert，仅重启 fixture/service；`/health=200`、HTTPS `/invoke=200`、1×`lookup_fixture`，旧证书备份已清理 | 服务级 HTTPS/工具闭环已恢复；其流量是否进入 current-head Observer/Canonical 投影仍未验证 |
 | Dify 实际重跑 | LLM/tool 两个 workflow 均 HTTP200、脚本 rc0；debug reconciliation curl 因测试 CA 校验失败 | workflow 运行通过，hash reconciliation partial |
@@ -426,7 +432,8 @@ workload 转发仍按环境矩阵标记为未验证。
 | 当前 SSH Codex 明文证据 | 2 条 `AgentPlaintextEvidence`，`captureSource=tls_uprobe_rustls`、`encoding=metadata_only`、`parseState=unparsed` | 不能据此写成正文原文完整落盘；原文可见性仍 partial |
 | 当前 SSH Codex Tool/Evidence | tool4 parsed/complete，toolCall4/toolResult4；model57 parsed 且 request/response wire complete；conversation complete2/tool_pending55；选定 Tool inspector 404 | Tool 协议闭环有事实，统一 EvidenceLink partial |
 | SSH 早期窄窗口（历史快照） | 曾为 17 Egress、0 LlmInteraction | 仅作旧时间窗对比，不代表当前 durable custom-window 状态 |
-| 权限/部署 | 特权 `hostPID` Observer Pod 可见宿主；普通 SSH `CapEff=0`、`unprivileged_bpf_disabled=2`；existing formal 旧 digest/未切换 canonical GET，`critical_inbox_dropped` 约 1.89M（最近观测且继续上涨），且 static signature warnings 仍存在 | 临时 API/Web OCI overlay 的局部 contracts GET 已通过但不改变正式部署状态；这些仍是当前 DoD 缺口和风险，特权 Pod load/可见性不能代替完整 attach/投递 |
+| 权限/部署 | 特权 `hostPID` Observer Pod 可见宿主；普通 SSH `CapEff=0`、`unprivileged_bpf_disabled=2`；API/Observer 已切换本地 overlay，仍有 static signature warnings 和 Forwarder backlog | 特权 Pod 的 attach/可见性不能代替四环境唯一深链；节点 I/O、数据库 timeout 与 batch reject 仍按 Coverage/WAL 保留，不伪造为零丢失 |
+| 当前正式本地交付 | API/Web `sha256:b382…`、Observer `sha256:fd31…` 已在本地 k3s Ready=1/restart=0；API NodePort `/healthz`、Contracts GET 和 Web bundle 200；Observer attached=73 probes | OCI overlay 复用旧依赖基座；Forwarder WAL 约 170 MiB 且曾出现 API batch reject/数据库 timeout，持续零丢失和四环境统一深链仍 partial |
 
 上述结果的证据等级为：版本/状态/计数、初始 60 条与后续约 63 条 Interaction 的解析字段和
 2 条 metadata-only 证据是**已确认事实**；“协议已解析不等于正文已完整保留”、早期
@@ -453,10 +460,10 @@ Session、原文完整读取、容器被动捕获、LangGraph 逐事件唯一 Ev
 
 | 环境 | 当前状态 | 证据与限制 |
 | --- | --- | --- |
-| Host | partial | API health 200，当前使用 memory fallback；CLI loopback fixture 已在 Host 执行；UID 1001、`unprivileged_bpf_disabled=2`，无直接 eBPF attach 能力 |
+| Host | partial | 本地 API/Web 构建和 CLI loopback fixture 已通过；普通 UID/SSH shell 的 `CapEff=0`、`unprivileged_bpf_disabled=2` 无直接 eBPF attach 能力，不能把 Host 结果当 Observer 被动闭环 |
 | SSH | partial（协议解析、身份/正文/统一证据 partial） | VSCode SSH `notty` 链 native PID 1101287 在 2026-09-03 16:14–16:22Z durable custom window 初始有 60 条 parsed/confirmed/complete `LlmInteraction`（model56/tool4），后续异步 `agents/interactions` 约 63 records（model57/tool4 + 2 unsupported/unparsed）；另有 2 条 `tls_uprobe_rustls` metadata-only/unparsed。identity/session/run 仍 runtime/probable 提示，非 authenticated AgentAdapter/confirmed Session |
-| Docker | partial | Docker daemon、Compose config 和既有 Dify 栈健康；`tender_jang` 内 Codex/Claude/LangChain/LangGraph 运行库及 CLI TUI 已验证，但无 Docker CLI/socket；当前头 AnySentry API/Observer 容器仍未整体部署 |
-| Kubernetes | partial | k3s LangGraph `/healthz` 与 `/runs` 真实调用、durable 查询可用；workspace-scanner 已切换本地 digest/path，新 Pod restart0 并完成一次 1385-component scan；临时 API/Web OCI 与 Observer 组合 smoke 已验证后清理，但 formal AnySentry/Observer 仍旧 digest、canonical GET 未切换正式部署，`critical_inbox_dropped` 与共享节点 I/O/etcd 抖动仍是可靠性缺口 |
+| Docker | partial | Docker daemon、Compose config 和既有 Dify 栈健康；`tender_jang` 内 Codex/Claude/LangChain/LangGraph 运行库及 CLI TUI 已验证，但无 Docker CLI/socket；当前容器产品级结果不等于 Observer/WAL/Canonical 独占闭环 |
+| Kubernetes | partial | k3s LangGraph `/healthz` 与 `/runs` 真实调用、durable 查询可用；workspace-scanner、API 和 Observer 已切换本地 digest/path，Ready/restart=0；Observer attached=73 probes，但 WAL backlog、数据库 timeout、scope conflicts 和共享节点 I/O/etcd 抖动使四对象唯一深链仍 partial |
 
 Kafka/Flink 只在已有可选 profile 中保留，未成为 Canonical 主链前置依赖；本阶段不新增时间窗
 功能。Kubernetes/ Docker 的旧服务健康不被用来冒充当前工作树部署通过。
@@ -472,13 +479,13 @@ Kafka/Flink 只在已有可选 profile 中保留，未成为 Canonical 主链前
 5. Host 当前没有 durable ClickHouse/PostgreSQL，Canonical hot state 可查但重启后不等价于持久化验证；
 6. Relational sink 的兼容 bool 返回值尚未细分 conflict 与 unavailable；
 7. `tender_jang` 虽有 CLI/框架运行库，但无 Docker CLI/socket；容器内产品级 fixture 不能替代当前头镜像和 Observer 端到端部署；
-8. LangChain 常驻 HTTPS 测试证书已轮换，服务级 `/invoke=200`；其被动观测进入 current-head Observer/Canonical 的结果仍未完成；
+8. LangChain 常驻 HTTPS 测试证书已轮换，服务级 `/invoke=200`；current-head Observer 已运行并看见同窗 Kernel/LLM 计数，但该服务调用尚未取得唯一 Canonical Tool→Kernel EvidenceLink；
 9. k3s LangGraph 已有真实 `/runs` 和耐久事件，但 `correlation unassigned=13`、`agent_adapter=6`，两条证据 lane 尚未统一；
 10. 当前 SSH Codex durable custom-window 初始快照为 60 条 parsed/confirmed/complete `LlmInteraction`（model 56、tool 4），后续异步 `agents/interactions` 可到约 63 records（model57/tool4 + 2 unsupported/unparsed；complete6/partial55/unsupported2）；identity/session/run 仍为 runtime/probable 提示，2 条 Rustls plaintext evidence 是 metadata-only/unparsed，且 conversation complete2/tool_pending55、选定 Tool inspector 404；普通 SSH `CapEff=0` 且 `unprivileged_bpf_disabled=2`，不能据此声称正文原文完整可见；
-11. existing formal AnySentry 仍为旧 image digest、canonical GET 未切换正式部署，`critical_inbox_dropped` 约 1.89M（最近观测且继续上涨），且 static signature warnings 仍存在；这些运行可靠性缺口和风险尚未消除；
-12. AnySentry `4fbd077` 与 Observer `3a827bf` 已加入 mixed-cgroup fence，但正式 Observer/Forwarder rollout 仍需原子升级并回放验证；
+11. API/Observer 已切换本地 overlay digest，Canonical GET 在 NodePort 已复验；Forwarder WAL backlog、ClickHouse/PostgreSQL timeout、静态 signature warnings 和节点高 I/O 仍未消除，持续可靠性/零丢失尚未通过；
+12. AnySentry `4fbd077` 与 Observer `3a827bf` 已加入 mixed-cgroup fence，并已在本地 DaemonSet rollout；仍需在低负载窗口完成 WAL 清空/回放和四对象唯一关联验证；
 13. 临时 namespace `anysentry-goal-dist-20260904` 的旧镜像 + 只读 `/app/dist` hostPath fallback 已清理；它不能替代 current-head OCI 镜像部署；
-14. `anysentry-goal-oci-web-20260904` 的 API/Web OCI overlay 已通过局部健康/合同/回放门禁并清理，registry manifest GET 200、digest 前缀 `043180…`；基座仍是旧 runtime + current dist overlay，非原始 Dockerfile 全链；Observer scripts overlay `7d3b…` 也已完成 25-probe/5-fence 组合 smoke，但长跑批量拒绝与 existing formal deployment 未切换仍是缺口；
+14. API/Web overlay `sha256:b382…` 与 Observer binary/scripts overlay `sha256:fd31…` 已在本地 registry 发布并切换 formal workloads；它们复用旧 runtime 依赖基座，原始 Dockerfile 全链仍受 daemon/IO 阻塞，Forwarder 长跑 backlog/批次拒绝和 EvidenceLink 唯一归属仍是缺口；
 15. URL/hash、正文权限、30 天保留和生产容量/成本仍需安全负责人和部署环境单独批准。
 
 ### 6.2 回滚点
@@ -489,6 +496,11 @@ Kafka/Flink 只在已有可选 profile 中保留，未成为 Canonical 主链前
 - 身份回滚：Canonical Directory/Timeline 与旧 V1/V2 binding 并行，关闭新 feature flag；
 - 存储回滚：恢复旧 API/镜像时不删除新表；停止新事件后再切换读模型，历史事实保留按 TTL 治理；
 - rollout：publisher、Forwarder 和 Observer 的 identity fence 是同一兼容单元；升级/回滚都必须原子执行，避免新旧 mixed-cgroup 语义并存；
+- 本轮本地镜像回滚：API/Worker 原基线为 `127.0.0.1:5000/anysentry@sha256:2a7e…`，当前 API 为
+  `sha256:b382…`；Observer 原基线为 `sha256:644ed…`，当前为 `sha256:fd31…`。回滚只针对
+  精确 Deployment/DaemonSet image 字段，先保存 revision，再执行 rollout status；不删除数据卷。
+- Workspace Scanner 当前 digest 为 `sha256:7a20…`，旧 `/srv/...` hostPath 不存在，不能盲目回滚
+  到该路径；先通过 `verify-k8s-workspace-path.mjs` 验证节点目录，再决定回滚。
 - 本地代码回滚：使用本地 checkpoint commit 的父提交或按文件反向恢复，经 `git diff`、build
   和回放复验后再操作；本 Goal 不执行 reset/checkout 或远程推送。
 
@@ -503,6 +515,8 @@ Candidate → Confirmed 接入；Kafka/Flink 只作为未来的时间窗派生�
 
 本地验证使用的管理/session 值只在进程环境或受保护临时目录中短时存在；本回合的请求使用
 本地受控 fixture/服务，未把真实 API key、URL 中的密钥、Cookie、Authorization、完整真实
-Prompt、生产 transcript 写入仓库、日志、Trace、Docker layer、Kubernetes YAML、数据库或
-本文。测试结束后临时 fixture 目录已清理；既有用户保护文件保持原状。最终交付不包含任何
-秘密值，也没有执行远程 push、PR、远程分支或公共镜像发布。
+Prompt、生产 transcript 写入仓库、日志、Trace、OCI layer、Kubernetes YAML、数据库或
+本文。OCI 增量层只来自编译产物和 Observer 二进制/脚本，发布器强制 loopback registry；
+临时 fixture/runner 目录已按精确路径清理，`.a3s-test/` 只保留非敏感终端记录并被忽略。
+既有用户保护文件保持原状。最终交付不包含任何秘密值，也没有执行远程 push、PR、远程分支或
+公共镜像发布。
