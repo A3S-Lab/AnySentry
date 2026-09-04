@@ -161,6 +161,10 @@ const fakeStore = {
 };
 
 const query = { timeType: 'last_30d', scope: 'agent', limit: 100 };
+// Keep the synthetic timeline inside the binding hot-state TTL even when this verifier is run
+// days after it was authored. The 25-hour gap below is intentional; a stale absolute timestamp
+// would be pruned before the continuation assertion and make the test depend on the calendar.
+const fixtureNow = Date.now();
 const resolveAndPersist = async (service, records) => {
   const bound = await service.applyPersistedBindings(records);
   const projection = projectAgentConversations(bound, [], query);
@@ -178,7 +182,7 @@ const continuityAnchor = {
 };
 const first = interaction({
   id: 'mi_binding_first',
-  at: 1_788_400_000_000,
+  at: fixtureNow - 2 * 60 * 60 * 1_000,
   instance: 'host-root:thread:one',
   users: ['first'],
   conversationAnchors: [continuityAnchor],

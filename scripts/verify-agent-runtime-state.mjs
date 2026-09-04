@@ -894,8 +894,22 @@ for (const field of [
   'processRootsRecovered',
 ]) {
   assert.match(typesSource, new RegExp(`\\b${field}\\??:`, 'u'), `${field} is part of the heartbeat type`);
-  assert.match(judgeSource, new RegExp(`\\b${field}:`, 'u'), `${field} is sanitized into heartbeat state`);
+assert.match(judgeSource, new RegExp(`\\b${field}:`, 'u'), `${field} is sanitized into heartbeat state`);
 }
+
+// The authenticated Source is server-only runtime provenance. It is retained across the public
+// projection and can scope a read, while a producer-supplied entry field cannot forge it.
+const sourceScoped = new AgentRuntimeStateService({ now: () => now, pruneIntervalMs: 0 });
+const sourceLease = issueLease(sourceScoped, 'source-forwarder');
+const sourceEntry = { ...runtimeEntry('901'), sourceId: 'forged-by-producer' };
+const sourceSnapshot = snapshot('source-forwarder', 1, [sourceEntry], { leaseEpoch: sourceLease.leaseEpoch });
+const sourceAck = sourceScoped.recordSnapshot(sourceSnapshot, undefined, 'source-trusted');
+assert.equal(sourceAck.accepted, true, sourceAck.reason);
+const sourceRecord = sourceScoped.list({ sourceId: 'source-trusted' }).items[0];
+assert.equal(sourceRecord?.sourceId, 'source-trusted');
+assert.equal(sourceScoped.list({ sourceId: 'forged-by-producer' }).total, 0);
+sourceScoped.close();
+
 endpointService.close();
 
 bounded.close();

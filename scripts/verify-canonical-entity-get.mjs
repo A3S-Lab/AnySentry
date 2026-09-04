@@ -262,20 +262,21 @@ try {
   const instance = instances.items.find((item) => item.logicalAgentId === logicalAgentId);
   const scopedInstances = await get(`/v1/agent-instances?tenantId=${encodeURIComponent(`${runId}-tenant`)}&limit=10`);
   assert(scopedInstances.items.some((item) => item.agentInstanceId === instance.agentInstanceId), 'AgentInstance tenant scope missing');
+  const sourceScopedInstances = await get(`/v1/agent-instances?sourceId=${encodeURIComponent(source.source.sourceId)}&limit=10`);
+  assert(sourceScopedInstances.items.some((item) => item.agentInstanceId === instance.agentInstanceId), 'AgentInstance source scope missing');
   const instanceDetail = await get(`/v1/agent-instances/${encodeURIComponent(instance.agentInstanceId)}`);
   assert.equal(instanceDetail.item.agentInstanceId, instance.agentInstanceId);
 
   const runtimes = await get(`/v1/runtime-instances?limit=10`);
   assert.equal(runtimes.schemaVersion, 'anysentry.runtime_instance.list.v1');
   assert(runtimes.items.some((item) => item.runtimeInstanceId === runtimeId), 'RuntimeInstance projection missing');
+  assert.equal(runtimes.items.find((item) => item.runtimeInstanceId === runtimeId)?.sourceId, source.source.sourceId);
   const scopedRuntimes = await get(`/v1/runtime-instances?tenantId=${encodeURIComponent(`${runId}-tenant`)}&limit=10`);
   assert(scopedRuntimes.items.some((item) => item.runtimeInstanceId === runtimeId), 'RuntimeInstance tenant scope missing');
   const collectorScopedRuntimes = await get(`/v1/runtime-instances?collectorId=${encodeURIComponent(collectorId)}&limit=10`);
   assert(collectorScopedRuntimes.items.some((item) => item.runtimeInstanceId === runtimeId), 'RuntimeInstance collector scope missing');
-  const unavailableSourceScope = await get(`/v1/runtime-instances?sourceId=${encodeURIComponent(source.source.sourceId)}&limit=10`);
-  assert.equal(unavailableSourceScope.items.length, 0, 'Runtime source scope must not widen to wildcard');
-  assert.equal(unavailableSourceScope.coverage.status, 'partial');
-  assert(unavailableSourceScope.coverage.reasons.includes('source_scope_provenance_unavailable'));
+  const sourceScopedRuntimes = await get(`/v1/runtime-instances?sourceId=${encodeURIComponent(source.source.sourceId)}&limit=10`);
+  assert(sourceScopedRuntimes.items.some((item) => item.runtimeInstanceId === runtimeId), 'RuntimeInstance source scope missing');
   const runtimeDetail = await get(`/v1/runtime-instances/${encodeURIComponent(runtimeId)}`);
   assert.equal(runtimeDetail.item.runtimeInstanceId, runtimeId);
 

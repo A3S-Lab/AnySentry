@@ -9591,6 +9591,22 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           `logical-agent-directory:${item.logicalAgentId}`,
           ...item.agentInstanceIds.slice(0, 32).map((id) => `agent-instance:${id}`),
         ];
+        // Runtime state is the authoritative source/collector provenance for an AgentInstance;
+        // the legacy directory itself intentionally has no producer-controlled source fields.
+        const runtimeRecords = this.agentRuntimeState.list({
+          agentInstanceId: undefined,
+          sourceId: query.sourceId,
+          includeShadow: true,
+          limit: 100_000,
+        }).items.filter((record) => item.agentInstanceIds.some((id) => [
+          record.agentInstanceId,
+          record.canonicalAgentInstanceId,
+          ...(record.agentInstanceAliases ?? []),
+        ].includes(id)));
+        const collectorIds = [...new Set(runtimeRecords.map((record) => record.collectorId))].slice(0, 64);
+        const sourceIds = [...new Set(runtimeRecords
+          .map((record) => record.sourceId)
+          .filter((value): value is string => Boolean(value)))].slice(0, 64);
         return {
           schemaVersion: 'anysentry.logical_agent.v1',
           logicalAgentId: item.logicalAgentId,
@@ -9607,6 +9623,8 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           ...(item.ownerId ? { ownerId: item.ownerId } : {}),
           workspacePath: item.workspacePath,
           environment: item.environment,
+          ...(collectorIds.length ? { collectorIds } : {}),
+          ...(sourceIds.length ? { sourceIds } : {}),
           lifecycleState: item.lifecycleState,
           terminalContextIds: [...(item.terminalContextIds ?? [])].slice(0, 256),
           agentAssetIds: [...item.agentAssetIds].slice(0, 256),
@@ -9629,7 +9647,10 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         partial,
         [directory.coverage.partialReason ?? '', ...resources.flatMap((item) => item.coverage.reasons)],
         directory.dataSource,
-      ), false),
+      ), {
+        sourceId: resources.every((resource) => resource.sourceIds !== undefined),
+        collectorId: resources.every((resource) => resource.collectorIds !== undefined),
+      }),
     );
     return { items: resources, coverage, dataSource: directory.dataSource, revision: directory.resolutionRevision };
   }
@@ -9645,6 +9666,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   }> {
     const runtime = this.agentRuntimeState.list({
       collectorId: query.collectorId,
+      sourceId: query.sourceId,
       agentInstanceId: query.agentInstanceId,
       physicalWorkloadId: undefined,
       includeShadow: query.includeShadow,
@@ -9711,6 +9733,10 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         ...(first.environmentId ? { environmentId: first.environmentId } : {}),
         collectorId: first.collectorId,
         collectorIds: [...new Set(records.map((record) => record.collectorId))].slice(0, 64),
+        ...(first.sourceId ? { sourceId: first.sourceId } : {}),
+        sourceIds: [...new Set(records
+          .map((record) => record.sourceId)
+          .filter((value): value is string => Boolean(value)))].slice(0, 64),
         terminalContextIds: [...new Set(records
           .map((record) => record.terminalContextId)
           .filter((value): value is string => Boolean(value)))].slice(0, 256),
@@ -9756,7 +9782,10 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     const coverage = this.canonicalRevisionCoverage(
       query,
       directory.resolutionRevision,
-      canonicalScopeCoverage(query, canonicalCoverage(partial, [directory.coverage.partialReason ?? '', ...resources.flatMap((item) => item.coverage.reasons)], 'runtime_state+conversation_projection'), { sourceId: false, collectorId: true }),
+      canonicalScopeCoverage(query, canonicalCoverage(partial, [directory.coverage.partialReason ?? '', ...resources.flatMap((item) => item.coverage.reasons)], 'runtime_state+conversation_projection'), {
+        sourceId: resources.every((resource) => resource.sourceIds !== undefined),
+        collectorId: resources.every((resource) => resource.collectorIds !== undefined),
+      }),
     );
     return { items: resources, coverage, dataSource: 'runtime_state+conversation_projection', revision: directory.resolutionRevision };
   }
@@ -9772,6 +9801,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   }> {
     const runtime = this.agentRuntimeState.list({
       collectorId: query.collectorId,
+      sourceId: query.sourceId,
       agentInstanceId: query.agentInstanceId ?? query.runtimeInstanceId,
       physicalWorkloadId: query.agentAssetId,
       runtimeState: query.lifecycleScope === 'running' ? 'running' : 'all',
@@ -9811,6 +9841,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         ...(record.deploymentId ? { deploymentId: record.deploymentId } : {}),
         ...(record.deploymentRevision ? { deploymentRevision: record.deploymentRevision } : {}),
         collectorId: record.collectorId,
+        ...(record.sourceId ? { sourceId: record.sourceId } : {}),
         hostId: record.hostId,
         bootId: record.bootId,
         rootPid: record.rootPid,
@@ -9867,7 +9898,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         runtime.total === 0 && directory.coverage.partial,
         [directory.coverage.partialReason ?? '', ...resources.flatMap((item) => item.coverage.reasons)],
         'runtime_state+conversation_projection',
-      ), { sourceId: false, collectorId: true }),
+      ), { sourceId: resources.every((resource) => resource.sourceId !== undefined), collectorId: true }),
     );
     return { items: resources, coverage, dataSource: 'runtime_state+conversation_projection', revision: directory.resolutionRevision };
   }

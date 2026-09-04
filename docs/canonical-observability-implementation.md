@@ -41,6 +41,47 @@ k3s Pod 中以 Aya `Program::load` 逐项加载了
 - **推断**：由代码结构或负向测试支持，但尚未有生产规模统计；
 - **未验证**：本机没有安全、可复现或当前头部署条件，不能写成通过。
 
+## 0.2 当前决策增补（2026-09-04，优先于历史段落）
+
+本节是本轮 Goal 的实现优先级和验收口径。后文保留的旧回合数字、旧镜像和旧策略是
+历史证据，不得覆盖本节；当历史设计文档仍写 `probable_agent` 低采样时，以本节和当前
+代码为准。
+
+### 已确认事实
+
+| 项目 | 当前事实 | 边界 |
+| --- | --- | --- |
+| 本地 checkpoint | AnySentry `b5bb92b`（含 `6644d5c`/`d54ebba`）；Observer `3a827bf`（含 `66e27eb`/`49f183e`） | 仅本地分支和本地 checkpoint，未执行任何远程推送 |
+| 构建/合同 | `pnpm build`、Canonical/identity/S5/unified/workspace/deployment 定向门禁通过；Observer release workspace test 212 项、fmt/check/build/clippy 通过 | 代码门禁不等价于正式集群已切换 |
+| Canonical GET | `/v1/logical-agents`、`agent-instances`、`runtime-instances`、`sessions` 及详情、timeline、coverage、semantic evidence、kernel context 均有版本化响应、bounded pagination/cursor、revision/coverage 和管理鉴权；隔离 harness 通过 | 当前正式 API Pod 仍是旧 digest，尚未把 GET 结果写成正式部署通过 |
+| 候选身份 | `probable_agent` 保留 observed/detected provenance；默认 `effective capture/judgment=confirmed_agent`，与确认 Agent 使用同一完整 probe 矩阵，仍受 ring/payload/TTL/队列预算约束 | 不创建虚假 LogicalAgent/Session；`ANYSENTRY_CANDIDATE_EFFECTIVE_MODE=probable` 仅是显式成本降级开关，不是默认路径；管理面 token 仍只保护变更/控制操作，不再要求人工升级候选才能采样 |
+| TLS 设计 | Codex/Claude 只通过实现族/ABI capability manifest 选择通用 TLS 边界；产品名仅作发现提示，版本号/二进制指纹不能作为隐藏授权条件 | 极端新 ABI 通过新增明确 capability extension 接入，复用同一 Parser/Correlation 主链 |
+| CLI 与 a3s-test | Codex、Claude Code 的可重复 TUI suite 均通过（分别保存非敏感 terminal recording）；浏览器 capability 因本机 `a3s` 驱动缺少 `use` 未执行 | TUI 结果是产品级请求—工具—结果—最终回复证据，不等价于 eBPF 被动 attach |
+| k3s Scanner | 代码已捕获不可读目录并跳过 `.runtime`；live `workspace-scanner` 使用本地不可变 digest、显式 `Directory` hostPath，Ready/restart=0，完成 1385 component scan | 仅 Scanner 已切换；API/Observer/Worker 尚未整体切换 |
+| API/Web 交付形态 | API OCI 镜像内同时提供 `/app/dist` 和 `/app/web`，通过同源服务承载页面；因此没有独立 current-head Web Deployment 是有意的单镜像边界，不是遗漏组件 | 页面验收前提是更新 API 镜像；当前正式 Pod 仍旧镜像，所以旧页面无新 GET 不是“Web 缺部署”而是 API 未滚动 |
+
+### 目标设计
+
+新的产品或版本只需声明 `Manifest → Transport/LLM Format capability → Adapter → Runtime`
+扩展，并复用 RawObservation、Process/Connection、Session、Correlation、EvidenceLink 和
+Coverage 算法。Unknown/Candidate 仍保留完整 Kernel lane；明文 Adapter 不可用只降低语义
+覆盖，不删除 KernelFact、候选身份或 CoverageGap。分类管理同时区分四个维度：
+`identityClassification`（观察到的身份）、`workloadRole`（工作负载角色）、`captureProfile`
+（采集档位）和 `authority/provenance`（证据权威）。这样“候选按确认档位采集”不会伪造
+“管理面已确认定义”。本阶段只做 observe，不引入阻断/干扰策略；Kafka/Flink 仍是可选派生支路。
+
+### 推断与未验证
+
+- `tender_jang` 当前确有 Codex、Claude Code、LangChain/LangGraph 运行库；其容器无 Docker
+  CLI/socket，因此不能把它写成可管理嵌套 Docker 的运行环境。
+- 常驻 LangChain HTTPS 和 k3s LangGraph sandbox 的服务级闭环已通过；现有旧 API 查询显示
+  semantic/Kernel 记录，但尚未证明 current-head Observer → WAL → Canonical 的正式唯一深链。
+- SSH 中的本次 Codex 对话已有协议/语义记录，但普通 SSH `CapEff=0` 且宿主
+  `unprivileged_bpf_disabled=2`；正文完整持久化、独占 attach、Canonical Tool→Kernel 双向
+  EvidenceLink 仍是未验证项。
+- k3s 节点的长期抖动由共享节点高 iowait/swap、etcd/dockerd/EDR 并发和 DNS/探针超时共同
+  放大；Scanner 的 EACCES 是已修复的代码缺口，不能把整个节点问题归咎于 AnySentry 代码。
+
 ## 0.1 2026-09-04 运行事实补充（优先于旧回合数字）
 
 本节只记录当前回合直接取得的脱敏事实；旧版本、旧镜像和旧入口在后文保留为历史追溯，

@@ -59,6 +59,8 @@ export interface AgentRuntimeStateServiceOptions {
 
 interface SanitizedRuntimeEntry
   extends Omit<AgentRuntimeSnapshotEntry, 'discoveredAt' | 'lastSeenAt' | 'lastActivityAt' | 'endedAt'> {
+  /** Server-only provenance copied from the authenticated ingest boundary. */
+  sourceId?: string;
   discoveredAt: number;
   lastSeenAt: number;
   lastActivityAt?: number;
@@ -806,6 +808,7 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
     this.prune(at);
     const input = query && typeof query === 'object' ? query : {};
     const collectorId = cleanString(input.collectorId, 180);
+    const sourceId = cleanString(input.sourceId, 240);
     const forwarderInstanceId = cleanString(input.forwarderInstanceId, 180);
     const agentScopeId = cleanString(input.agentScopeId, 240)?.toLowerCase();
     const agentInstanceId = cleanString(input.agentInstanceId, 500);
@@ -828,6 +831,7 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
     const all = [...byCanonical.values()]
       .filter((record) =>
         (!collectorId || record.collectorId === collectorId) &&
+        (!sourceId || record.sourceId === sourceId) &&
         (!forwarderInstanceId || record.forwarderInstanceId === forwarderInstanceId) &&
         (!agentScopeId || record.agentScopeId.toLowerCase() === agentScopeId) &&
         (!agentInstanceId || this.recordMatchesInstance(record, agentInstanceId)) &&
@@ -998,6 +1002,7 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
     if (!input || typeof input !== 'object' || Array.isArray(input)) return { reason: `entries[${index}] must be an object` };
     const value = input as Record<string, unknown>;
     const prefix = `entries[${index}]`;
+    const authenticatedSourceId = cleanString(sourceId, 240);
     const scope = requiredString(value.agentScopeId, 240, `${prefix}.agentScopeId`);
     if (scope.reason) return { reason: scope.reason };
     const instance = requiredString(value.agentInstanceId, 500, `${prefix}.agentInstanceId`);
@@ -1115,6 +1120,7 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
         agentScopeId: scope.value!,
         agentDisplayName: cleanString(value.agentDisplayName, 240),
         agentInstanceId: instance.value!,
+        ...(authenticatedSourceId ? { sourceId: authenticatedSourceId } : {}),
         ...(registeredDefinition?.logicalAgentId ? { logicalAgentId: registeredDefinition.logicalAgentId } : {}),
         ...(candidateLogicalAgentId ? { logicalAgentCandidateId: candidateLogicalAgentId } : {}),
         ...(registeredDefinition?.definitionId ? { logicalDefinitionId: registeredDefinition.definitionId } : {}),
@@ -1274,6 +1280,9 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
         : previous?.terminalAt ?? Math.max(0, receivedAt - Math.max(0, snapshot.generatedAt - (entry.endedAt ?? entry.lastSeenAt)));
       const record: StoredRuntimeInstance = {
         collectorId: snapshot.collectorId,
+        ...(entry.sourceId ?? previous?.sourceId
+          ? { sourceId: entry.sourceId ?? previous?.sourceId }
+          : {}),
         forwarderInstanceId: snapshot.forwarderInstanceId,
         leaseEpoch: snapshot.leaseEpoch,
         snapshotVersion: snapshot.snapshotVersion,

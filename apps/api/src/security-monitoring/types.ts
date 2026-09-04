@@ -593,6 +593,8 @@ export interface AgentRuntimeInstanceRecord
   extends Omit<AgentRuntimeSnapshotEntry, 'runtimeState' | 'discoveredAt' | 'lastSeenAt' | 'lastActivityAt' | 'endedAt'> {
   /** Canonical exact root-process generation; V1 keeps `agentInstanceId` for wire compatibility. */
   canonicalAgentInstanceId?: string;
+  /** Authenticated Source provenance attached by the API; never accepted from the snapshot body. */
+  sourceId?: string;
   /** Strong equivalent producer identifiers only; physical workload IDs are not runtime aliases. */
   agentInstanceAliases?: string[];
   collectorId: string;
@@ -615,6 +617,8 @@ export interface AgentRuntimeInstanceRecord
 
 export interface AgentRuntimeStateQuery {
   collectorId?: string;
+  /** Optional authenticated Source scope for canonical reads; not part of the legacy wire snapshot. */
+  sourceId?: string;
   forwarderInstanceId?: string;
   agentScopeId?: string;
   agentInstanceId?: string;
@@ -2159,6 +2163,9 @@ export interface CanonicalLogicalAgentResource {
   ownerId?: string;
   workspacePath: string;
   environment: LogicalAgentConversationDirectoryItem['environment'];
+  /** Source/collector provenance aggregated from the observed runtime instances. */
+  collectorIds?: string[];
+  sourceIds?: string[];
   lifecycleState: LogicalAgentConversationDirectoryItem['lifecycleState'];
   terminalContextIds: string[];
   agentAssetIds: string[];
