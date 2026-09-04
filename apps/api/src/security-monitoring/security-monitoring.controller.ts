@@ -222,6 +222,12 @@ const CANONICAL_SEMANTIC_EVIDENCE_TIMEOUT_MS = boundedControllerEnvInt(
   250,
   10_000,
 );
+const CANONICAL_KERNEL_FALLBACK_LOOKBACK_MS = boundedControllerEnvInt(
+  'ANYSENTRY_CANONICAL_KERNEL_FALLBACK_LOOKBACK_MS',
+  2 * 60 * 60_000,
+  60_000,
+  7 * 24 * 60 * 60_000,
+);
 
 function boundedControllerEnvInt(name: string, fallback: number, min: number, max: number): number {
   const parsed = Number(process.env[name]);
@@ -9922,7 +9928,11 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     if (canonical) return { fact: canonical, fallback: false };
     try {
       const page = await this.judge.searchStoredEventsPage({
-        sinceMs: Math.max(0, Date.now() - 30 * 24 * 60 * 60 * 1_000),
+        // Compatibility events are retained longer than the canonical hot KernelFact lane, but
+        // this recovery query must stay narrow so a degraded deep link cannot scan the whole
+        // 90-day MergeTree. Operators can widen the bounded window explicitly when auditing an
+        // older fact.
+        sinceMs: Math.max(0, Date.now() - CANONICAL_KERNEL_FALLBACK_LOOKBACK_MS),
         untilMs: Date.now(),
         kernelFactId: factId,
         candidateLimit: 8,

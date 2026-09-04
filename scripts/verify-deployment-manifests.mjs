@@ -283,7 +283,12 @@ function verifyAnySentryManifest() {
   assert(
     'AnySentry semantic deep links have bounded timeline/evidence timeouts',
     /name:\s*ANYSENTRY_CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS,\s*value:\s*"2000"/u.test(anySentryDeployment?.source ?? '') &&
-      /name:\s*ANYSENTRY_CANONICAL_SEMANTIC_EVIDENCE_TIMEOUT_MS,\s*value:\s*"2000"/u.test(anySentryDeployment?.source ?? ''),
+    /name:\s*ANYSENTRY_CANONICAL_SEMANTIC_EVIDENCE_TIMEOUT_MS,\s*value:\s*"2000"/u.test(anySentryDeployment?.source ?? ''),
+    anySentryDeployment?.source,
+  );
+  assert(
+    'AnySentry KernelFact compatibility fallback keeps a bounded lookback window',
+    /name:\s*ANYSENTRY_CANONICAL_KERNEL_FALLBACK_LOOKBACK_MS,\s*value:\s*"7200000"/u.test(anySentryDeployment?.source ?? ''),
     anySentryDeployment?.source,
   );
   assert(
