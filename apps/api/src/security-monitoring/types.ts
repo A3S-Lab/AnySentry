@@ -2192,6 +2192,11 @@ export interface CanonicalAgentInstanceResource {
   deploymentId?: string;
   deploymentRevision?: string;
   environmentId?: string;
+  /** Collector provenance is a runtime fact; sourceId is optional until source binding is durable. */
+  collectorId?: string;
+  sourceId?: string;
+  collectorIds?: string[];
+  sourceIds?: string[];
   terminalContextIds: string[];
   runtimeInstanceIds: string[];
   sessionIds: string[];
@@ -2227,6 +2232,8 @@ export interface CanonicalRuntimeInstanceResource {
   profileVersion?: string;
   deploymentId?: string;
   deploymentRevision?: string;
+  collectorId: string;
+  sourceId?: string;
   hostId: string;
   bootId: string;
   rootPid: number;
@@ -2267,6 +2274,8 @@ export interface CanonicalSessionResource {
   agentProduct?: string;
   environment?: LogicalAgentConversationDirectoryItem['environment'];
   workspacePath?: string;
+  collectorIds?: string[];
+  sourceIds?: string[];
   agentInstanceIds: string[];
   segmentIds: string[];
   interactionIds: string[];
@@ -2328,6 +2337,28 @@ export interface CanonicalSessionList {
   pagination: CanonicalEntityPagination;
   revision: number;
   coverage: CanonicalEntityCoverage;
+  dataSource: string;
+  updateTime: string;
+}
+
+/**
+ * Additive response envelope for the semantic-event evidence deep link.  The legacy evidence
+ * response remains unchanged inside `evidence`; the envelope records which identifier the caller
+ * supplied and, when a timeline (`se_`) and durable semantic (`sr_`) identifier are bridged,
+ * preserves both sides of that alias.  A missing/ambiguous projection is represented by coverage
+ * metadata instead of a misleading 404.
+ */
+export interface CanonicalSemanticEventEvidenceResponse {
+  schemaVersion: 'anysentry.evidence_link.semantic_event.v1';
+  requestedSemanticEventId: string;
+  resolvedSemanticEventId?: string;
+  aliasOf?: string;
+  aliasCandidates?: string[];
+  semanticRecord?: unknown;
+  evidence?: AgentSemanticEvidenceResponse;
+  relationStatus: AgentSemanticKernelRelationStatus | 'coverage_gap' | 'ambiguous';
+  coverage: CanonicalEntityCoverage;
+  revision: number;
   dataSource: string;
   updateTime: string;
 }

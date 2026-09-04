@@ -73,6 +73,7 @@ const processInfo = {
 const requestBody = { model: 'entity-fixture-model', messages: [{ role: 'user', content: 'synthetic entity check' }] };
 const responseBody = { id: `${runId}-response`, choices: [{ message: { role: 'assistant', content: 'synthetic final' } }] };
 const interactionId = `mi_${digest(`${runId}-interaction`).slice(0, 24)}`;
+const toolCallId = `${runId}-tool`;
 const line = JSON.stringify({
   eventAtUnixNs: unixNs(at),
   receivedAtUnixNs: unixNs(at + 1),
@@ -115,8 +116,8 @@ const line = JSON.stringify({
       request: content(requestBody),
       response: content(responseBody),
       usage: { source: 'provider_reported', completeness: 'complete', inputTokens: 4, outputTokens: 2, totalTokens: 6, totalTokensDerived: false },
-      toolCalls: [],
-      toolResults: [],
+      toolCalls: [{ toolCallId, name: 'shell', arguments: { command: 'printf synthetic' }, issuedAtUnixNs: unixNs(at + 2) }],
+      toolResults: [{ toolCallId, name: 'shell', content: { stdout: 'synthetic' }, isError: false, observedAtUnixNs: unixNs(at + 3) }],
       semanticParserId: 'entity-fixture',
       semanticParserVersion: 1,
       completeness: 'complete',
@@ -269,6 +270,12 @@ try {
   assert(runtimes.items.some((item) => item.runtimeInstanceId === runtimeId), 'RuntimeInstance projection missing');
   const scopedRuntimes = await get(`/v1/runtime-instances?tenantId=${encodeURIComponent(`${runId}-tenant`)}&limit=10`);
   assert(scopedRuntimes.items.some((item) => item.runtimeInstanceId === runtimeId), 'RuntimeInstance tenant scope missing');
+  const collectorScopedRuntimes = await get(`/v1/runtime-instances?collectorId=${encodeURIComponent(collectorId)}&limit=10`);
+  assert(collectorScopedRuntimes.items.some((item) => item.runtimeInstanceId === runtimeId), 'RuntimeInstance collector scope missing');
+  const unavailableSourceScope = await get(`/v1/runtime-instances?sourceId=${encodeURIComponent(source.source.sourceId)}&limit=10`);
+  assert.equal(unavailableSourceScope.items.length, 0, 'Runtime source scope must not widen to wildcard');
+  assert.equal(unavailableSourceScope.coverage.status, 'partial');
+  assert(unavailableSourceScope.coverage.reasons.includes('source_scope_provenance_unavailable'));
   const runtimeDetail = await get(`/v1/runtime-instances/${encodeURIComponent(runtimeId)}`);
   assert.equal(runtimeDetail.item.runtimeInstanceId, runtimeId);
 
@@ -282,6 +289,32 @@ try {
   assert(sessionCoverage.coverage, 'Session coverage endpoint missing coverage');
   const sessionTimeline = await get(`/v1/sessions/${encodeURIComponent(session.sessionId)}/timeline?limit=20`);
   assert(sessionTimeline.timeline, 'Session timeline endpoint missing timeline');
+  const toolEvent = sessionTimeline.timeline.turns
+    .flatMap((turn) => turn.events)
+    .find((event) => event.kind === 'tool_call' && event.toolCallId === toolCallId);
+  assert(toolEvent?.semanticEventId?.startsWith('se_'), 'timeline tool semantic event missing');
+  const semanticRecords = await get('/v1/semantic-records?limit=500');
+  const durableToolRecord = semanticRecords.items.find((item) => item.kind === 'tool_call' && item.toolCallId === toolCallId);
+  assert(durableToolRecord?.semanticRecordId?.startsWith('sr_'), 'durable tool semantic record missing');
+  const timelineEvidence = await get(`/v1/semantic-events/${encodeURIComponent(toolEvent.semanticEventId)}/evidence`);
+  assert.equal(timelineEvidence.requestedSemanticEventId, toolEvent.semanticEventId);
+  assert.equal(timelineEvidence.resolvedSemanticEventId, toolEvent.semanticEventId);
+  assert(timelineEvidence.aliasCandidates?.includes(durableToolRecord.semanticRecordId)
+    || timelineEvidence.aliasOf === durableToolRecord.semanticRecordId,
+  'timeline durable semantic alias missing');
+  if (timelineEvidence.relationStatus === 'ambiguous') {
+    assert.equal(timelineEvidence.coverage.status, 'partial');
+  }
+  assert(timelineEvidence.evidence || timelineEvidence.coverage.status !== 'complete', 'timeline semantic evidence missing');
+  const durableEvidence = await get(`/v1/semantic-events/${encodeURIComponent(durableToolRecord.semanticRecordId)}/evidence`);
+  assert.equal(durableEvidence.requestedSemanticEventId, durableToolRecord.semanticRecordId);
+  assert.equal(durableEvidence.resolvedSemanticEventId, toolEvent.semanticEventId);
+  assert.equal(durableEvidence.aliasOf, durableToolRecord.semanticRecordId);
+  const expiredTimelineEvidence = await get('/v1/semantic-events/se_000000000000000000000000/evidence');
+  assert.equal(expiredTimelineEvidence.relationStatus, 'coverage_gap');
+  assert.equal(expiredTimelineEvidence.coverage.status, 'partial');
+  const instanceSessions = await get(`/v1/agent-instances/${encodeURIComponent(instance.agentInstanceId)}/sessions?limit=10`);
+  assert(instanceSessions.items.some((item) => item.sessionId === session.sessionId), 'AgentInstance session projection missing');
 
   // Cursor pagination is opaque and must not duplicate the first page.
   const firstPage = await get('/v1/runtime-instances?limit=1');

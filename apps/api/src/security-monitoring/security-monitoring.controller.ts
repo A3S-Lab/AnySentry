@@ -147,6 +147,11 @@ interface CanonicalEntityQuery {
   classificationView?: T.ClassificationView;
 }
 
+interface CanonicalSemanticTimelineCandidate {
+  session: T.CanonicalSessionResource;
+  event: T.AgentSemanticEvent;
+}
+
 const CANONICAL_ENTITY_LIMIT_MAX = 500;
 const CANONICAL_ENTITY_OFFSET_MAX = 1_000_000;
 const CANONICAL_ENTITY_CURSOR_PREFIX = 'ce1:';
@@ -334,6 +339,39 @@ function canonicalCoverage(
   };
 }
 
+/**
+ * Source/collector filters are security scopes, not display hints.  Some projections (notably a
+ * logical/session row assembled from conversation data) do not yet carry the authenticated
+ * source identity.  Mark those reads partial instead of treating an unavailable dimension as a
+ * wildcard or claiming complete coverage.
+ */
+function canonicalScopeCoverage(
+  query: CanonicalEntityQuery,
+  coverage: T.CanonicalEntityCoverage,
+  provenanceAvailable: boolean | { sourceId?: boolean; collectorId?: boolean },
+): T.CanonicalEntityCoverage {
+  const sourceAvailable = typeof provenanceAvailable === 'boolean'
+    ? provenanceAvailable
+    : provenanceAvailable.sourceId === true;
+  const collectorAvailable = typeof provenanceAvailable === 'boolean'
+    ? provenanceAvailable
+    : provenanceAvailable.collectorId === true;
+  const sourceGap = query.sourceId !== undefined && !sourceAvailable;
+  const collectorGap = query.collectorId !== undefined && !collectorAvailable;
+  if (!sourceGap && !collectorGap) {
+    return coverage;
+  }
+  return {
+    ...coverage,
+    status: 'partial',
+    reasons: [...new Set([
+      ...coverage.reasons,
+      sourceGap ? 'source_scope_provenance_unavailable' : '',
+      collectorGap ? 'collector_scope_provenance_unavailable' : '',
+    ].filter(Boolean))].slice(0, 64),
+  };
+}
+
 function canonicalScopeMatches(
   value: {
     logicalAgentId?: string;
@@ -351,6 +389,10 @@ function canonicalScopeMatches(
     product?: string;
     classification?: T.AgentClassification;
     coverageStatus?: string;
+    sourceId?: string;
+    collectorId?: string;
+    sourceIds?: readonly string[];
+    collectorIds?: readonly string[];
     q?: string;
   },
   query: CanonicalEntityQuery,
@@ -359,6 +401,8 @@ function canonicalScopeMatches(
     expected === undefined || String(actual ?? '').toLowerCase() === expected.toLowerCase();
   const contains = (actual: unknown, expected: string | undefined) =>
     expected === undefined || String(actual ?? '').toLowerCase().includes(expected.toLowerCase());
+  const includes = (actual: readonly string[] | undefined, expected: string | undefined) =>
+    expected === undefined || Boolean(actual?.some((item) => item.toLowerCase() === expected.toLowerCase()));
   return equals(value.logicalAgentId, query.logicalAgentId)
     && equals(value.logicalAgentCandidateId, query.logicalAgentCandidateId)
     && equals(value.logicalDefinitionId, query.logicalDefinitionId)
@@ -374,6 +418,15 @@ function canonicalScopeMatches(
     && contains(value.product, query.product)
     && equals(value.classification, query.classification)
     && equals(value.coverageStatus, query.coverageStatus)
+    // A source/collector scope must never degrade to an unbounded wildcard when the read model
+    // lacks provenance.  `includes(undefined, requested)` is false, so the caller gets an empty
+    // result (and a coverage reason) until that provenance is materialized.
+    && (query.sourceId === undefined
+      ? true
+      : equals(value.sourceId, query.sourceId) || includes(value.sourceIds, query.sourceId))
+    && (query.collectorId === undefined
+      ? true
+      : equals(value.collectorId, query.collectorId) || includes(value.collectorIds, query.collectorId))
     && contains(JSON.stringify(value), query.q);
 }
 
@@ -403,6 +456,44 @@ function canonicalRuntimeProcessKey(record: T.AgentRuntimeInstanceRecord): strin
 
 function canonicalSessionIdentity(summary: T.AgentConversationSummary): string {
   return summary.sessionId ?? summary.conversationId;
+}
+
+function canonicalSemanticKindForTimeline(kind: SemanticRecord['kind']): T.AgentSemanticEventKind | undefined {
+  if (kind === 'tool_call') return 'tool_call';
+  if (kind === 'tool_result') return 'tool_result';
+  if (kind === 'message') return undefined;
+  return undefined;
+}
+
+function canonicalSemanticRecordTouchesEvent(record: SemanticRecord, event: T.AgentSemanticEvent): boolean {
+  const kind = canonicalSemanticKindForTimeline(record.kind);
+  // Tool intent/result records are separate immutable rows.  An interaction can also contain
+  // message rows, so an interaction-id match alone must not make a message (or the paired result)
+  // an alias for a ToolCall.
+  if ((event.kind === 'tool_call' || event.kind === 'tool_result') && kind !== event.kind) {
+    return false;
+  }
+  if (kind && kind !== event.kind) return false;
+  if (record.toolCallId && record.toolCallId !== event.toolCallId) return false;
+  const interactionRefs = new Set([...record.sourceRefs, ...record.derivedFrom]);
+  const interactionMatch = event.sourceInteractionIds.some((id) => interactionRefs.has(id));
+  const toolMatch = Boolean(record.toolCallId && event.toolCallId === record.toolCallId);
+  return interactionMatch || toolMatch;
+}
+
+function canonicalSemanticRecordTouchesSession(
+  record: SemanticRecord,
+  session: T.CanonicalSessionResource,
+): boolean {
+  const sessionIds = new Set([
+    session.sessionId,
+    session.canonicalSessionId,
+    session.conversationId,
+  ].filter((value): value is string => Boolean(value)));
+  if (record.sessionId && sessionIds.has(record.sessionId)) return true;
+  if (record.canonicalSessionId && sessionIds.has(record.canonicalSessionId)) return true;
+  return session.interactionIds.some((interactionId) =>
+    record.sourceRefs.includes(interactionId) || record.derivedFrom.includes(interactionId));
 }
 
 function canonicalConversationSourceRefs(summary: T.AgentConversationSummary): string[] {
@@ -9534,11 +9625,11 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     const coverage = this.canonicalRevisionCoverage(
       query,
       directory.resolutionRevision,
-      canonicalCoverage(
+      canonicalScopeCoverage(query, canonicalCoverage(
         partial,
         [directory.coverage.partialReason ?? '', ...resources.flatMap((item) => item.coverage.reasons)],
         directory.dataSource,
-      ),
+      ), false),
     );
     return { items: resources, coverage, dataSource: directory.dataSource, revision: directory.resolutionRevision };
   }
@@ -9618,6 +9709,8 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         ...(first.deploymentId ? { deploymentId: first.deploymentId } : {}),
         ...(first.deploymentRevision ? { deploymentRevision: first.deploymentRevision } : {}),
         ...(first.environmentId ? { environmentId: first.environmentId } : {}),
+        collectorId: first.collectorId,
+        collectorIds: [...new Set(records.map((record) => record.collectorId))].slice(0, 64),
         terminalContextIds: [...new Set(records
           .map((record) => record.terminalContextId)
           .filter((value): value is string => Boolean(value)))].slice(0, 256),
@@ -9653,13 +9746,17 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       product: resource.agentProduct,
       classification: resource.detectedClassification,
       coverageStatus: resource.coverage.status,
+      collectorId: resource.collectorId,
+      collectorIds: resource.collectorIds,
+      sourceId: resource.sourceId,
+      sourceIds: resource.sourceIds,
       q: [resource.displayName, resource.agentProduct, resource.agentInstanceId, ...resource.runtimeInstanceIds].join(' '),
     }, query));
     const partial = runtime.items.length === 0 && directory.coverage.partial;
     const coverage = this.canonicalRevisionCoverage(
       query,
       directory.resolutionRevision,
-      canonicalCoverage(partial, [directory.coverage.partialReason ?? '', ...resources.flatMap((item) => item.coverage.reasons)], 'runtime_state+conversation_projection'),
+      canonicalScopeCoverage(query, canonicalCoverage(partial, [directory.coverage.partialReason ?? '', ...resources.flatMap((item) => item.coverage.reasons)], 'runtime_state+conversation_projection'), { sourceId: false, collectorId: true }),
     );
     return { items: resources, coverage, dataSource: 'runtime_state+conversation_projection', revision: directory.resolutionRevision };
   }
@@ -9713,6 +9810,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         ...(record.profileVersion ? { profileVersion: record.profileVersion } : {}),
         ...(record.deploymentId ? { deploymentId: record.deploymentId } : {}),
         ...(record.deploymentRevision ? { deploymentRevision: record.deploymentRevision } : {}),
+        collectorId: record.collectorId,
         hostId: record.hostId,
         bootId: record.bootId,
         rootPid: record.rootPid,
@@ -9758,16 +9856,18 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       product: resource.agentProduct,
       classification: resource.detectedClassification,
       coverageStatus: resource.coverage.status,
+      collectorId: resource.collectorId,
+      sourceId: resource.sourceId,
       q: [resource.displayName, resource.agentProduct, resource.runtimeInstanceId, resource.workspacePath].join(' '),
     }, query));
     const coverage = this.canonicalRevisionCoverage(
       query,
       directory.resolutionRevision,
-      canonicalCoverage(
+      canonicalScopeCoverage(query, canonicalCoverage(
         runtime.total === 0 && directory.coverage.partial,
         [directory.coverage.partialReason ?? '', ...resources.flatMap((item) => item.coverage.reasons)],
         'runtime_state+conversation_projection',
-      ),
+      ), { sourceId: false, collectorId: true }),
     );
     return { items: resources, coverage, dataSource: 'runtime_state+conversation_projection', revision: directory.resolutionRevision };
   }
@@ -9947,19 +10047,73 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       product: resource.agentProduct,
       classification: undefined,
       coverageStatus: resource.coverage.status,
+      sourceId: resource.sourceIds?.[0],
+      sourceIds: resource.sourceIds,
+      collectorId: resource.collectorIds?.[0],
+      collectorIds: resource.collectorIds,
       q: [resource.sessionId, resource.conversationId, resource.agentProduct, resource.workspacePath].join(' '),
     }, query));
     const revision = Math.max(this.canonicalCurrentRevision(), ...resources.map((resource) => resource.resolutionRevision));
     const coverage = this.canonicalRevisionCoverage(
       query,
       revision,
-      canonicalCoverage(
+      canonicalScopeCoverage(query, canonicalCoverage(
         conversations.coverage.partial,
         [conversations.coverage.partialReason ?? '', ...resources.flatMap((resource) => resource.coverage.reasons)],
         conversations.dataSource,
-      ),
+      ), false),
     );
     return { items: resources, coverage, dataSource: conversations.dataSource, revision };
+  }
+
+  /**
+   * Resolve the two canonical semantic identifier families used by the read models.  Durable
+   * parser records use `sr_…`; the conversation timeline deliberately derives a separate stable
+   * `se_…` event id.  The bridge is computed from immutable session/interaction references and is
+   * bounded to the same 500-session/500-event read limits as the public projections.
+   */
+  private async canonicalSemanticTimelineCandidates(
+    requestedId: string,
+    semanticRecord: SemanticRecord | undefined,
+    query: CanonicalEntityQuery,
+    sessions: readonly T.CanonicalSessionResource[],
+  ): Promise<CanonicalSemanticTimelineCandidate[]> {
+    const scopedSessions = semanticRecord
+      ? sessions.filter((session) => canonicalSemanticRecordTouchesSession(semanticRecord, session))
+      : sessions;
+    // A durable record can outlive the summary's session alias.  If no direct scope matched, a
+    // bounded fallback scan still permits sourceInteractionIds to establish the relationship.
+    const candidates = (scopedSessions.length > 0 ? scopedSessions : sessions).slice(0, 500);
+    const result: CanonicalSemanticTimelineCandidate[] = [];
+    const seen = new Set<string>();
+    for (const session of candidates) {
+      const conversationId = session.conversationId ?? session.sessionId;
+      if (!conversationId) continue;
+      const timeline = await this.agg.agentConversationTimelineV3({
+        timeType: query.timeType,
+        startTime: query.startTime,
+        endTime: query.endTime,
+        snapshotAsOf: query.snapshotAsOf,
+        scope: 'agent',
+        classificationView: query.classificationView,
+        conversationId,
+        limit: 500,
+      });
+      for (const turn of timeline.turns) {
+        for (const event of turn.events) {
+          if (semanticRecord
+            ? !canonicalSemanticRecordTouchesEvent(semanticRecord, event)
+            : event.semanticEventId !== requestedId) {
+            continue;
+          }
+          const key = `${session.sessionId}\u0000${event.semanticEventId}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          result.push({ session, event });
+        }
+      }
+    }
+    return result;
   }
 
   @Get('v1/logical-agents')
@@ -10008,7 +10162,8 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   async canonicalLogicalAgentInstances(@Param('logicalAgentId') logicalAgentId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag): Promise<T.CanonicalAgentInstanceList> {
     const query = parseCanonicalEntityQuery({ ...rawQuery, logicalAgentId });
     const result = await this.canonicalAgentInstanceResources(query, headers);
-    const filtered = result.items.filter((item) => item.logicalAgentId === logicalAgentId);
+    const filtered = result.items.filter((item) => item.logicalAgentId === logicalAgentId
+      || item.logicalAgentCandidateId === logicalAgentId);
     const page = canonicalPage(filtered, query);
     return {
       schemaVersion: 'anysentry.agent_instance.list.v1',
@@ -10048,6 +10203,36 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     const filtered = result.items.filter((item) => item.agentInstanceId === agentInstanceId);
     const page = canonicalPage(filtered, query);
     return { schemaVersion: 'anysentry.runtime_instance.list.v1', ...page, revision: result.revision, coverage: result.coverage, dataSource: result.dataSource, updateTime: new Date().toISOString() };
+  }
+
+  @Get('v1/agent-instances/:agentInstanceId/sessions')
+  @RequireManagementAuth()
+  async canonicalAgentInstanceSessions(@Param('agentInstanceId') agentInstanceId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag): Promise<T.CanonicalSessionList> {
+    const query = parseCanonicalEntityQuery({ ...rawQuery, agentInstanceId });
+    // The conversation store may expose the legacy runtime alias while the caller follows the
+    // canonical functional AgentInstance ID.  Try the narrow query first, then use the same
+    // bounded read model without the ID predicate and filter aliases locally.  Both paths are
+    // read-only and preserve the source coverage/revision metadata.
+    let result = await this.canonicalSessionResources(query, headers);
+    let filtered = result.items.filter((item) => item.agentInstanceIds.includes(agentInstanceId));
+    if (filtered.length === 0) {
+      const broadQuery = { ...query, agentInstanceId: undefined, offset: 0, limit: 500 };
+      const broad = await this.canonicalSessionResources(broadQuery, headers);
+      const broadFiltered = broad.items.filter((item) => item.agentInstanceIds.includes(agentInstanceId));
+      if (broadFiltered.length > 0 || result.items.length === 0) {
+        result = broad;
+        filtered = broadFiltered;
+      }
+    }
+    const page = canonicalPage(filtered, query);
+    return {
+      schemaVersion: 'anysentry.session.list.v1',
+      ...page,
+      revision: result.revision,
+      coverage: result.coverage,
+      dataSource: result.dataSource,
+      updateTime: new Date().toISOString(),
+    };
   }
 
   @Get('v1/runtime-instances')
@@ -10123,34 +10308,116 @@ export class SecurityMonitoringController implements OnModuleDestroy {
 
   @Get('v1/semantic-events/:semanticEventId/evidence')
   @RequireManagementAuth()
-  async canonicalSemanticEventEvidence(@Param('semanticEventId') semanticEventId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag) {
+  async canonicalSemanticEventEvidence(
+    @Param('semanticEventId') semanticEventId: string,
+    @Query() rawQuery: Record<string, unknown>,
+    @Headers() headers: HeaderBag,
+  ): Promise<T.CanonicalSemanticEventEvidenceResponse> {
     const id = strictIdentityText(semanticEventId, 512);
     if (!id) throw new BadRequestException('semanticEventId is invalid');
     const query = parseCanonicalEntityQuery(rawQuery);
-    const semantic = await this.canonicalObservability.getDurableSemanticRecord(id, query.revision);
-    if (!semantic) throw new NotFoundException('semantic record not found');
+    const semanticRecord = await this.canonicalObservability.getDurableSemanticRecord(id, query.revision);
+    const timelineId = id.startsWith('se_');
+    const durableId = id.startsWith('sr_');
+    // Keep the old 404 behavior for a syntactically unrelated identifier, but do not report a
+    // false 404 for a valid canonical id whose projection has expired or is still ambiguous.
+    if (!semanticRecord && !timelineId && !durableId) {
+      throw new NotFoundException('semantic record not found');
+    }
+
     const sessions = await this.canonicalSessionResources({ ...query, offset: 0, limit: 500 }, headers);
-    const semanticSessionKeys = [
-      semantic.sessionId,
-      semantic.canonicalSessionId,
-    ].filter((value): value is string => Boolean(value));
-    const session = sessions.items.find((candidate) => semanticSessionKeys.some((key) => [
-      candidate.sessionId,
-      candidate.canonicalSessionId,
-      candidate.conversationId,
-    ].includes(key)));
-    if (!session) throw new NotFoundException('semantic event session not found');
-    const evidence = await this.agentSemanticEvidence({
-      timeType: query.timeType,
-      startTime: query.startTime,
-      endTime: query.endTime,
-      snapshotAsOf: query.snapshotAsOf,
-      scope: 'agent',
-      classificationView: query.classificationView,
-      conversationId: session.conversationId ?? session.sessionId,
-      semanticEventId: id,
-    }, headers);
-    return { schemaVersion: 'anysentry.evidence_link.semantic_event.v1', semanticRecord: semantic, evidence, revision: sessions.revision, coverage: sessions.coverage, dataSource: sessions.dataSource, updateTime: new Date().toISOString() };
+    const timelineCandidates = await this.canonicalSemanticTimelineCandidates(
+      id,
+      semanticRecord,
+      query,
+      sessions.items,
+    );
+    const uniqueTimelineCandidates = [...new Map(timelineCandidates.map((candidate) => [
+      `${candidate.session.sessionId}\u0000${candidate.event.semanticEventId}`,
+      candidate,
+    ])).values()];
+    const timelineAmbiguous = uniqueTimelineCandidates.length > 1;
+    const selected = uniqueTimelineCandidates.length === 1
+      ? uniqueTimelineCandidates[0]
+      : undefined;
+
+    // A timeline event can be retained after the durable semantic row expires.  Conversely, a
+    // durable `sr_` row can outlive the conversation projection.  Search the bounded durable lane
+    // only when an event was found so we never mistake a product/session id for an alias.
+    let aliasRecords: SemanticRecord[] = semanticRecord ? [semanticRecord] : [];
+    if (!semanticRecord && selected) {
+      aliasRecords = (await this.canonicalObservability.listDurableSemanticRecords(10_000))
+        // The timeline event is already selected inside a canonical Session.  Its immutable
+        // sourceInteractionIds are a stronger bridge than a provider-session alias (which may be
+        // absent after expiry), so do not discard a valid durable row merely because that alias
+        // is no longer present on the Session projection.
+        .filter((candidate) => canonicalSemanticRecordTouchesEvent(candidate, selected.event));
+    }
+    const aliasAmbiguous = aliasRecords.length > 1;
+    const resolvedSemanticRecord = aliasRecords.length === 1 ? aliasRecords[0] : semanticRecord;
+    let evidence: T.AgentSemanticEvidenceResponse | undefined;
+    if (selected && !timelineAmbiguous && selected.event.actor === 'tool') {
+      try {
+        // The legacy evidence projector is authoritative for relation revisions and canonical
+        // EvidenceLink decoration; always pass the resolved timeline (`se_`) id to it.
+        evidence = await this.agentSemanticEvidence({
+          timeType: query.timeType,
+          startTime: query.startTime,
+          endTime: query.endTime,
+          snapshotAsOf: query.snapshotAsOf,
+          scope: 'agent',
+          classificationView: query.classificationView,
+          conversationId: selected.session.conversationId ?? selected.session.sessionId,
+          semanticEventId: selected.event.semanticEventId,
+        }, headers);
+      } catch (error) {
+        if (!(error instanceof NotFoundException)) throw error;
+        // A valid timeline event without a materialized relation is a coverage gap, not a bad
+        // identifier.  Keep the requested/alias ids in the response for later replay.
+      }
+    }
+
+    const reasons = [...sessions.coverage.reasons];
+    if (!selected) reasons.push('semantic_timeline_projection_unavailable');
+    if (timelineAmbiguous) reasons.push('semantic_timeline_identifier_ambiguous');
+    if (aliasAmbiguous) reasons.push('durable_semantic_identifier_ambiguous');
+    if (selected && selected.event.actor !== 'tool') reasons.push('semantic_event_not_tool');
+    if (selected && selected.event.actor === 'tool' && !evidence) reasons.push('semantic_evidence_projection_unavailable');
+    if (!resolvedSemanticRecord && durableId) reasons.push('durable_semantic_record_unavailable');
+    const coverage = canonicalScopeCoverage(query, canonicalCoverage(
+      sessions.coverage.status !== 'complete' || reasons.length > 0,
+      reasons,
+      `${sessions.dataSource}+semantic_timeline`,
+    ), false);
+    const aliasCandidates = [
+      ...uniqueTimelineCandidates.map((candidate) => candidate.event.semanticEventId),
+      ...aliasRecords.map((candidate) => candidate.semanticRecordId),
+    ].filter((candidate, index, all) => all.indexOf(candidate) === index).slice(0, 64);
+    const relationStatus: T.CanonicalSemanticEventEvidenceResponse['relationStatus'] = timelineAmbiguous || aliasAmbiguous
+      ? 'ambiguous'
+      : evidence?.relationStatus ?? 'coverage_gap';
+    return {
+      schemaVersion: 'anysentry.evidence_link.semantic_event.v1',
+      requestedSemanticEventId: id,
+      ...(selected ? { resolvedSemanticEventId: selected.event.semanticEventId } : {}),
+      ...((id.startsWith('sr_') && selected)
+        ? { aliasOf: id }
+        : (id.startsWith('se_') && resolvedSemanticRecord)
+          ? { aliasOf: resolvedSemanticRecord.semanticRecordId }
+          : {}),
+      ...((timelineAmbiguous || aliasAmbiguous) && aliasCandidates.length > 0 ? { aliasCandidates } : {}),
+      ...(resolvedSemanticRecord ? { semanticRecord: resolvedSemanticRecord } : {}),
+      ...(evidence ? { evidence } : {}),
+      relationStatus,
+      coverage,
+      revision: Math.max(
+        sessions.revision,
+        resolvedSemanticRecord?.resolutionRevision ?? 0,
+        this.canonicalCurrentRevision(),
+      ),
+      dataSource: `${sessions.dataSource}+semantic_timeline`,
+      updateTime: new Date().toISOString(),
+    };
   }
 
   @Get('v1/kernel-facts/:factId/context')
