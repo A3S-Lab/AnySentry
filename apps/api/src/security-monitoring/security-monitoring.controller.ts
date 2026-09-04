@@ -2057,7 +2057,18 @@ function canonicalInteractionForSemanticEvent(event: T.JudgedEvent): T.AgentInte
     method: 'EVENT',
     path: `/${event.eventKind}`,
     statusCode: 200,
-    model: typeof event.attributes.model === 'string' ? event.attributes.model : undefined,
+    // OTLP/OpenInference producers normally use the standard GenAI request/response model
+    // attributes rather than a flat `model` key.  Normalize those aliases here so application
+    // semantic interactions remain queryable by model without making the core product-specific.
+    model: attrText(
+      event.attributes ?? {},
+      'model',
+      'gen_ai.request.model',
+      'gen_ai.response.model',
+      'gen_ai.model',
+      'llm.request.model',
+      'llm.response.model',
+    ),
     startedAtUnixNs: atUnixNs,
     requestCompleteAtUnixNs: atUnixNs,
     firstResponseAtUnixNs: atUnixNs,
@@ -11784,13 +11795,19 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         ...(membershipBySession.get(sessionId) ?? []),
         ...(membershipBySession.get(summary.conversationId) ?? []),
         ...memberships.filter((membership) =>
-          membership.logicalAgentId
-          && summary.logicalAgentId
-          && membership.logicalAgentId === summary.logicalAgentId
-          && ((summary.providerSessionIdHash
+          // A provider/session hash is already tenant-scoped by the canonical contract and is
+          // the safe bridge when an application semantic projection has no logicalAgentId yet
+          // (the common LangGraph/LangChain startup state).  Do not broaden the fallback to a
+          // shared RuntimeInstance alone: concurrent service Sessions must remain separate.
+          (summary.providerSessionIdHash
             && membership.providerSessionIdHash === summary.providerSessionIdHash)
-            || (membership.agentInstanceId
-              && summary.agentInstanceIds.includes(membership.agentInstanceId)))),
+          || (summary.sessionKey
+            && membership.sessionKey === summary.sessionKey)
+          || (membership.logicalAgentId
+            && summary.logicalAgentId
+            && membership.logicalAgentId === summary.logicalAgentId
+            && membership.agentInstanceId
+            && summary.agentInstanceIds.includes(membership.agentInstanceId))),
       ];
       const interactionIds = [...new Set(related
         .map((membership) => membership.interactionId)

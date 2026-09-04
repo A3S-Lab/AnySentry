@@ -82,6 +82,11 @@ for (const [kind, expected] of [
   if (expected === 'tool_result') assert.equal(interaction.toolResults.length, 1, `${kind} ToolResult projection`);
   if (expected === 'llm_call' || expected === 'model_message') assert(interaction.semanticItems.some((item) => item.actor === 'model'), `${kind} model projection`);
 }
+const standardModelAliasInteraction = semanticProjectionTesting.canonicalInteractionForSemanticEvent(
+  semanticFixture('LlmApi', { 'gen_ai.request.model': 'fixture-model' }),
+);
+assert.equal(standardModelAliasInteraction.model, 'fixture-model',
+  'standard GenAI model attributes must survive application semantic projection');
 const unknownResultInteraction = semanticProjectionTesting.canonicalInteractionForSemanticEvent(
   semanticFixture('ToolResult', { 'anysentry.tool.call.id': 'tool-unknown', 'anysentry.tool.status': 'UNSET' }),
 );
