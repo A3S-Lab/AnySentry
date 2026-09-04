@@ -5,7 +5,7 @@
 
 ## 结论
 
-截至 2026-09-05 的复核，Goal 仍是 **部分完成，不能报告完成**。当前 API/Web r27 已用本地 immutable digest 部署，Canonical GET 已补齐有界超时、hot fallback 和 forward-only KernelFact locator；Host/tender CLI、LangChain 服务和 k3s LangGraph sandbox 均有脱敏运行证据。Observer 为保护约 4.23 GB WAL 和接近 2 GiB cgroup 上限被可逆暂停，当前 SSH Codex 的 Rustls/WebSocket 正文、LangGraph/Dify Tool→Kernel 双向 EvidenceLink、正式 UI 深链和持续零丢失仍未通过。下文历史快照保留用于追溯，不能覆盖最新附录。
+截至 2026-09-05 的复核，Goal 仍是 **部分完成，不能报告完成**。当前 API/Web r33 已用本地 immutable digest 部署，Canonical side-lane 和实体 GET 已补齐有界读取、hot fallback、locator-first、runtime-only 分离和页级 clone；Host/tender CLI、LangChain 服务和 k3s LangGraph sandbox 均有脱敏运行证据。Observer 为保护约 4.23 GB WAL 和接近 2 GiB cgroup 上限被可逆暂停，当前 SSH Codex 的 Rustls/WebSocket 正文、LangGraph/Dify Tool→Kernel 双向 EvidenceLink、正式 UI 深链和持续零丢失仍未通过。下文历史快照保留用于追溯，不能覆盖最新附录。
 
 - AnySentry/Observer 构建、类型、单元/回放和 BPF object load smoke 仍通过；这不等于当前头 Observer 已在目标 workload 上完成独占 attach、转发和持久部署。
 - 临时 k3s API/Web OCI overlay `anysentry:goal-current-oci-20260904` 已构建成功并通过本机 registry manifest GET 200（digest 前缀 `043180…`）；namespace `anysentry-goal-oci-web-20260904` 以 Secret/no-hostPath 完成 health、`/v1/observability/contracts`、representative replay 13/4 families/0 gap、S6、S2 shadow 后已清理。基座仍是旧 runtime + current dist overlay，非原始 Dockerfile 全链；Observer scripts overlay 也已构建并推入本机 registry（digest 前缀 `7d3b…`），但 existing formal deployment 未切换。
@@ -421,3 +421,113 @@ read、hot fallback、locator-first 和显式 coverage；代码/部署/产品级
 本回合总门禁结果：`pass=57, partial=2, blocked=7, unexecuted=7, fail=0`。其中 blocked 包含
 当前主机默认 API/凭据扫描边界，unexecuted 是未提供安全运行条件的环境组合；这两类没有被
 折算为通过。退出码 0 仅代表 verifier 完成报告。
+
+## 2026-09-05 续回合增量验收（r33）
+
+### 已确认事实
+
+- AnySentry 当前本地 checkpoint 为 `47e1e06`，Observer 为 `40556f5`。API/Web 通过 loopback
+  registry 的本地 OCI digest `sha256:e7e229e27b24875b22ea271313b9c59e94cdc4c2453f1e5b6f40383caa11847a`（r33）部署；Pod template annotation、Deployment image、NodePort EndpointSlice 均指向同一 revision。未执行远程 push。
+- Canonical entity GET 的现场根因是兼容目录在末端剥离前仍构造 body-rich 200-thread projection，并把约 5,000 个 runtime-only 历史实例重复 fan-out；`limit=1` 也会触发该放大。修复包括显式目录 limit、`includeRuntimeOnly=false`、一次 RuntimeState snapshot/identity map 和只 clone 返回页。r33 正式 NodePort 四类 GET 均 HTTP 200（约 0.08–1.73s），20 个并发小页无 API restart；精确正文/usage 仍保留兼容投影并标记 partial。
+- 通用 OTLP 语义现在识别 `WorkflowNode/workflownode→NodeRun`，保留 `anysentry.run.id`/标准 run aliases，受信 Adapter 对 LlmApi/Node/Tool/Result 使用同一身份门；`gen_ai.tool.name`、ToolCall ID、脱敏 endpoint 进入 Interaction；完成的单-span AgentTool 产生 hash/ref-only ToolResult。纯单元和隔离 S6 HTTP E2E 通过。
+- 正式 Pod 上用临时三-span trace（NodeRun、LlmApi、AgentTool）验证：3 个事件 HTTP 201，顶层 `runIdSource=producer`，Interaction 工具名/endpoint/ToolResult 均可读；临时 Source 已禁用。该测试不证明 Observer 被动捕获。
+- `tender_jang` 当前有 LangChain 常驻服务 `/health=200`、bounded `/invoke=200`；容器没有常驻 LangGraph Uvicorn，只安装 LangGraph 库。目标 LangGraph 服务在本地 k3s sibling namespace，sandbox runner 的 ToolExec/ProcessExit 已有历史 kernel 证据。
+- Observer Pod 仍 Ready，但 collector/forwarder 被精确 PID 可逆 `SIGSTOP` 保护约 4.23GB WAL；drop/背压和 OOM=0 已保留。暂停窗口不是稳定性通过。
+
+### 目标设计 / 推断 / 未验证
+
+- 长期应把 Canonical entity GET 改为 `RuntimeState + SessionMembership + SemanticRecord` metadata-only index；r33 已消除无响应和错误 404，但兼容投影仍是精确正文/usage 的潜在成本源。
+- Agent 版本不进入 TLS/Transport 核心分支；版本特异性只能作为独立实现族 capability/manifest 扩展。
+- Agent→sandbox Service 的 Egress 可在 endpoint/port、Runtime、时间和唯一候选满足时 `linked_strong`；sandbox 容器内独立 runner 没有父进程时不能强连，保持 `semantic_only/coverage_gap`。
+- 当前 SSH Codex 进程链和历史 semantic lane 已见，但 Observer 暂停、Rustls/WebSocket metadata-only、正式 UI 双向深链、Dify/LangGraph durable EvidenceLink 和 Host/SSH/Docker/Kubernetes 全组合持续 p95 仍未验证。
+
+### 本增量复核命令
+
+```text
+pnpm build
+pnpm --filter @anysentry/api exec tsc --noEmit
+node scripts/verify-agent-runtime-state.mjs
+node scripts/verify-agent-semantic-kernel-relation.mjs
+node scripts/verify-s6-tool-evidence-linker.mjs
+node scripts/verify-s6-tool-evidence-relation.mjs
+ANYSENTRY_ADMIN_TOKEN=<temporary-fixture> ANYSENTRY_TRUSTED_CORRELATION_MODE=shadow \
+  node scripts/verify-deep-links-local.mjs scripts/verify-s6-tool-evidence-api.mjs
+node scripts/verify-deployment-manifests.mjs
+```
+
+以上均为本地、脱敏、可回放的通过项；没有把未执行环境、Observer 暂停或 partial coverage 折算为通过。
+
+## 2026-09-05 最终续回合（r51，必须与历史快照区分）
+
+### 已确认事实
+
+- 当前 AnySentry HEAD 为 `02b745a`，Observer HEAD 为 `40556f5`。只因 API/Canonical 代码变化
+  构建并部署 AnySentry/Web；Observer 未改镜像，仍为本地 digest `sha256:45af6fa2…`。
+- 最终 API/Web 本地镜像为 `127.0.0.1:5000/anysentry:goal-head-20260905-r51-canonical-final`，
+  digest `sha256:bf625fe8bee8019bd7121c0045cc1f8b9e00e4ee6933aaa6d65962fd6c9dfc5c`。Pod
+  `anysentry-694fbdd8cd-pbj8j` Ready 1/1、restart 0；模板注解、镜像和源码 revision 一致。
+  `anysentry` Service 为 NodePort 32653。SPA 在 `/`，`/security-center` 是 API 前缀；没有独立
+  current-head Web Deployment，因为 API 镜像同时挂载 `/app/web`。
+- Canonical GET 已有三层降级：有界 Session alias retry（最多 500 行并精确过滤）、hot
+  interaction/timeline fallback、EvidenceLink evidence-only fallback。耐久 EvidenceLink
+  缺失时返回 `canonical_store+hot_delta`/`memory_hot_ring` 与 partial reason，不把空结果写成
+  事实不存在；新 KernelFact 的 `kf_*`、兼容 `evt_*`、`ob_*` point read 可跨 API 重启归一到同一 fact。
+- Alert/Source/Remediation 已改为 dirty-key changed-only persistence；coverage refresh 保留
+  原 `createdAt` 并忽略 observation-only timestamp 漂移。单测观察到 remediation 更新计数不再
+  持续增长；剩余 alert/source 失败均以 dirty/failure/retry 指标保留，未清空历史。
+- `probable_agent` 仍保存 observed/detected provenance，但默认与 confirmed 同档完整采集/判断；
+  没有手工 token promotion。Codex/Claude TLS 只由 implementation family/ABI capability
+  选择，测试版本号仅是证据标签。
+
+### 代表对象与环境矩阵
+
+| 对象 | Host | SSH | Docker/tender | Kubernetes | 结果 |
+| --- | --- | --- | --- | --- | --- |
+| Codex CLI | TUI fixture PASS；当前 SSH 会话未形成完整 canonical 语义链 | 未连接远程目标；仅确认本机 SSH 客户端/权限 | tender 进程可运行，历史 HTTP fixture 有 ToolExec | 本回合未启动独立 Codex Pod | 产品级工具闭环有证据；被动 HTTPS/Rustls 和全环境持续观测未通过 |
+| Claude Code | TUI fixture PASS；当前 SSH 会话未形成完整 canonical 语义链 | 未执行远程登录 | tender 2 次最小真实 CLI 调用 rc=0（2.1.251）；AnySentry 最近窗口事件 0 | 未启动独立 Claude Pod | CLI 功能通过；Observer/Canonical 被动事件缺失，不能标全链路通过 |
+| Dify Workflow/Chatflow | 不适用（应用部署） | 不适用 | Compose 1.14.2 console/HTTP+HTTPS mock/tool mock ready；llm/tool workflow 均 HTTP 200 | 当前正式 k3s API/Observer 可查询，但本回合 Observer 暂停 | 应用层通过；Kernel/跨 runtime EvidenceLink partial |
+| LangChain service | 本机端口服务可达 | 未执行远程登录 | tender 常驻 LangChain 1.3.17 + LangGraph 1.2.11；`/health=200`、`/invoke=200`、`lookup_fixture` 一次闭环 | 无独立 LangChain daemon | 服务功能通过；Observer 因 cgroup 冲突/route candidates=0 未形成事件 |
+| LangGraph + sandbox | 不适用 | 不适用 | tender 仅安装库，无 daemon | agent/sandbox Pod Ready/restart0；真实 Run 多轮、sandbox `/execute` 200/exit0 | sandbox ToolExec/ProcessExit 历史上可被 Observer 捕获；跨 Pod Tool→Kernel 保持 `semantic_only`/`coverage_gap`，不强配 |
+
+### Observer 与 k3s 现场证据
+
+- 我曾将 Observer 的 collector/forwarder 精确 PID 恢复约一分钟：TLS/profile diagnostics 有
+  write/read 命中，sandbox/工作负载事件可进入 Collector，但既有主机噪声令 Critical inbox
+  达到 16384，`output_critical_dropped` 和 `batch endpoint rejected` 持续增加，同时出现
+  mixed-cgroup conflict。随后只对同一 PID 发 `SIGSTOP`，supervisor 保持运行；WAL（约 4.23 GB）
+  和 drop/orphan 计数未删除或清零。这证明“有权限可采集”和“当前节点能稳定承载”是两件事。
+- k3s 节点本身 Ready，Memory/Disk/PIDPressure false；真正瓶颈是共享盘高 I/O/swap、ClickHouse
+  `events` 大表和旧 `a3s-registry` 缺失 migration/Lightpanda 的旁路故障。AnySentry 代码侧已
+  修复查询 fan-out 与重复写放大，但容量/历史扫描仍会导致 ClickHouse 5 秒 timeout，healthz
+  的 `status=ok` 不足以证明完整性。
+- `a3s-test capabilities --json` 默认 driver 失败原因是本机 a3s 0.3.0 没有 `a3s use`；使用
+  standalone `agent-browser 0.26.0` 的 NodePort smoke 已通过，桌面 1440×900、移动 390×844、
+  page/console errors 均为空。该 smoke 检查了 API health JSON，不等于完整业务 UI 深链通过。
+
+### 最终测试记录
+
+通过：API TypeScript/build；Observer `cargo test -p a3s-observer-common -p a3s-observer-collector --release`
+（165 collector + 8 common）；Canonical contract/identity/conversation/relation/persistence/
+lifecycle/S6 定向 verifier；隔离 Canonical entity GET（含最新 evidence fallback）；deployment
+manifest verifier；Dify llm/tool 应用回放；LangChain service canary；LangGraph sandbox 历史
+真实 run 与 Kernel 捕获证据。失败或未完成：正式 Observer 恢复窗口产生 critical drops；LangChain
+和 Claude 当前被动事件为 0；Dify/LangGraph 跨 runtime 关系未闭合；SSH 远程、Docker AnySentry
+容器独立部署、无磁盘饱和容量/p95、完整业务浏览器深链未执行/未通过。最新只读总门禁（NodePort
+探测、不运行 tests）为 `pass=45, partial=2, blocked=4, unexecuted=7, fail=0`；带本地 tests 的
+回合为 `pass=61, partial=2, blocked=4, unexecuted=7, fail=0`。这些统计明确保留 partial，不能
+解释为 Goal 完成。
+
+### 回滚与保密
+
+回滚只需把 AnySentry Deployment 镜像恢复到上一条本地已验证 digest（r50 `sha256:0a4c61d7…`），
+保留 additive schema/表和 WAL；Observer 可独立关闭 SSL/capture 或恢复原镜像。管理 token、模型
+配置和 Cookie 只在受保护环境/临时文件中使用，未写入仓库、日志、Trace、OCI layer、Kubernetes
+YAML、数据库或本报告；Dify/Agent 运行正文和临时输出已按精确路径清理，用户已有保护文件未改动。
+
+### 当前判定
+
+Goal 仍为 **partial**。Canonical 合同、兼容迁移、代码和本地 API/Web 部署已达到可复核状态，
+但 Definition of Done 还缺正式 Observer 稳定转发、四类代表对象在 Host/SSH/Docker/Kubernetes
+的连续被动矩阵、LangChain/Claude/Dify/LangGraph 的可追溯 Kernel EvidenceLink、完整 UI 业务
+深链和容量/p95 证据。Kimi/Z.ai/Pi 的 Adapter 扩展以及 Kafka/Flink 时间窗支路属于后续扩展，
+不作为本阶段额外失败项。

@@ -1,6 +1,6 @@
 # AnySentry Agent—LLM 与外部工具明文观测技术设计
 
-> 状态：实现完成，等待代码与发布复审
+> 状态：实现完成，等待代码与发布复审；2026-09-05 本地复核为 partial（见文末 r51）
 >
 > 文档版本：v1.0-implementation-review
 >
@@ -746,3 +746,50 @@ P5：Go TLS/Rustls 专项；需要稳定 hook 点、版本兼容清单和 fail-c
 
 本文描述集成分支的设计与受控验证结论。最终发布前仍须记录干净 commit、新镜像 digest、
 部署日期与性能验证链接；在此之前不要把该文档当作公开发行版兼容声明。
+
+## 2026-09-05 实现对齐增补（r33）
+
+当前本地实现已把 OTLP/Agent semantic projection 接入同一条通用主链：`WorkflowNode` 归一
+为 `NodeRun`，`anysentry.run.id` 与标准 aliases 作为受信 Producer Run，`gen_ai.tool.name`、
+ToolCall ID、经 userinfo/query/fragment 清洗的 endpoint 进入 `AgentInteractionRecord`。单个
+带明确 end/exit/result hash 的 `AgentTool` span 生成 hash/ref-only `ToolResult`；不复制参数或
+结果正文，也不把语义结果当 KernelFact。关系 matcher 对 `semanticOnly` ToolCall 复用同一
+network endpoint/Runtime/唯一候选算法，竞争时保留 `ambiguous`，无 Kernel 事实时保留
+`semantic_only/coverage_gap`。
+
+Canonical entity GET 的当前兼容实现已增加显式页限制、runtime-only 分离、单次 RuntimeState
+快照和页级 clone；r33 正式 NodePort 的四类实体 GET 均返回 200。该增补不宣称已经完成长期
+metadata-only EntityIndex；精确正文、usage、历史 as-of 仍可进入有界兼容 projection，并在
+响应中标明 partial。TLS/Transport 核心不按 Codex/Claude 具体版本分支，未来版本差异只能
+通过实现族 capability/Manifest 扩展。
+
+## 2026-09-05 最终实现对齐（r51）
+
+本节覆盖当前本地 HEAD `02b745a` 和 API/Web 镜像 `sha256:bf625fe8…`；文档前文出现的
+Claude `2.1.170`、Codex `0.150.1` 等值是受控 fixture 的观察标签，不是 TLS/Transport
+核心的产品版本过滤条件。实际选择顺序固定为：
+
+```text
+Agent Adapter hint（可选）
+  → TlsImplementationRegistry implementation family/ABI capability
+  → AttachManager 对真实 ELF/动态库和进程代次校验
+  → Transport framing + LLM Format detection
+  → Agent-specific Session/Turn/Tool fields
+```
+
+如果未来某个大版本改变 TLS ABI，只新增独立 capability/profile、指纹和 fixture；通用
+Transport、OpenAI/Anthropic/Gemini Format、Identity、Correlation、Coverage 不复制。未知
+版本或实现族只生成 `unsupported_tls_profile`/`attach_pending` CoverageGap，同时保留
+KernelFact、CandidateAgent 和有界元数据。
+
+本回合还完成了 Canonical GET 的两项兼容性收口：
+
+- 精确 Session 查询在窄页为空时最多进行一次 500 行的别名范围读取并本地精确过滤；不把
+  compatibility page 的遗漏直接当作 404。
+- 语义 evidence 端点在 Timeline/旧 relation projector 超时时直接返回 append-only
+  EvidenceLink 的 evidence-only 投影，来源和 partial reason 明示，不虚构 KernelEvent、
+  ToolResult 或跨 Pod 因果。
+
+这两项是有界 read-side fallback，不改变 RawObservation append-only 合同，也不在页面刷新
+时写 Membership/Relation。持久化侧的 dirty-key、generation、TTL、失败退避和 coverage
+timestamp fingerprint guard 同样保持与主链解耦。

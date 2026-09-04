@@ -1,6 +1,6 @@
 # AnySentry Agent—LLM 与外部工具明文观测 PRD
 
-> 状态：已按审核结论实现，提交发布前复审
+> 状态：已按审核结论实现，提交发布前复审；2026-09-05 本地代表性链路验收仍为 partial
 >
 > 文档版本：v1.0-implementation-review
 >
@@ -398,3 +398,17 @@ FR-043：每条记录显示 `captureSource`，例如 `tls_uprobe`、`tcp_plainte
 
 完整逐项结果和临时镜像 artifact 保存在本地审计目录，不进入 Git。最终发布记录必须引用
 干净集成分支的 commit 与新构建 digest，不能复用旧分叉工作树的镜像。
+
+## 2026-09-05 当前验收说明
+
+Candidate/Confirmed 的默认采集行为已统一为完整档位，`probable_agent` 只保留发现来源和
+observed provenance，不再要求管理 token 才能取得同等证据。Codex/Claude 的 TLS 选择属于
+实现族/ABI Registry；本文件中的具体版本只用于描述测试样本，不能成为核心过滤分支。
+
+本地 r51 API/Web 镜像和 Canonical GET 已在低负载 NodePort 窗口通过；Session alias retry、
+evidence-only fallback 和 KernelFact locator 会把存储超时显式标为 partial。Dify workflow、
+tender_jang LangChain/Claude 的应用调用均可运行，但正式 Observer 在共享节点压力与 mixed-cgroup
+冲突下被保护性暂停，因此本阶段不能把这些应用结果写成稳定的被动 eBPF 全链路通过。LangGraph
+sandbox 的进程事件可独立采集，跨 Pod Tool→Kernel 关系仍按安全规则保留 `semantic_only`/
+`coverage_gap`。完整状态、命令和回滚点见 `docs/canonical-observability-implementation.md`
+及 `docs/local-goal-evidence.md` 的 r51 增补。
