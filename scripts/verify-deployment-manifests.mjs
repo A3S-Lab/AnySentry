@@ -109,6 +109,8 @@ function hasCanonicalSelfInventory(doc) {
 
 function verifyAnySentryManifest() {
   const anySentryManifest = readText('deploy/anysentry.yaml');
+  const anySentryController = readText('apps/api/src/security-monitoring/security-monitoring.controller.ts');
+  const livezBlock = /@Get\('livez'\)([\s\S]*?)@Get\('healthz'\)/u.exec(anySentryController)?.[1] ?? '';
   const docs = documentsFromYaml(anySentryManifest);
   const compose = stripYamlComments(readText('docker-compose.yml'));
   const manualCompose = stripYamlComments(readText('deploy/docker-compose.manual-test.yml'));
@@ -241,14 +243,32 @@ function verifyAnySentryManifest() {
     anySentryDeployment?.source,
   );
   assert(
-    'AnySentry startup, readiness, and liveness probes use /security-center/healthz',
-    countMatches(anySentryDeployment?.source ?? '', /httpGet:\s*\{\s*path:\s*\/security-center\/healthz,\s*port:\s*29653\s*\}/gu) === 3,
+    'AnySentry startup/liveness use O(1) /security-center/livez and readiness uses /security-center/healthz',
+    countMatches(anySentryDeployment?.source ?? '', /httpGet:\s*\{\s*path:\s*\/security-center\/livez,\s*port:\s*29653\s*\}/gu) === 2 &&
+      countMatches(anySentryDeployment?.source ?? '', /httpGet:\s*\{\s*path:\s*\/security-center\/healthz,\s*port:\s*29653\s*\}/gu) === 1,
     anySentryDeployment?.source,
   );
   assert(
-    'AnySentry startup probe protects at least three minutes of initialization',
-    /startupProbe:[\s\S]*?periodSeconds:\s*5[\s\S]*?failureThreshold:\s*36/u.test(anySentryDeployment?.source ?? ''),
+    'AnySentry startup probe protects bounded initialization without coupling liveness to storage',
+    /startupProbe:[\s\S]*?periodSeconds:\s*5[\s\S]*?timeoutSeconds:\s*10[\s\S]*?failureThreshold:\s*60/u.test(anySentryDeployment?.source ?? ''),
     anySentryDeployment?.source,
+  );
+  assert(
+    'AnySentry readiness and liveness probe tolerances are explicit',
+    /readinessProbe:[\s\S]*?periodSeconds:\s*10[\s\S]*?timeoutSeconds:\s*15[\s\S]*?failureThreshold:\s*6/u.test(anySentryDeployment?.source ?? '') &&
+      /livenessProbe:[\s\S]*?periodSeconds:\s*30[\s\S]*?timeoutSeconds:\s*10[\s\S]*?failureThreshold:\s*6/u.test(anySentryDeployment?.source ?? ''),
+    anySentryDeployment?.source,
+  );
+  assert(
+    'AnySentry process-lifecycle hydration is explicitly disabled for the hot startup path',
+    /name:\s*ANYSENTRY_PROCESS_LIFECYCLE_HYDRATE,\s*value:\s*"off"/u.test(anySentryDeployment?.source ?? ''),
+    anySentryDeployment?.source,
+  );
+  assert(
+    'AnySentry livez implementation is a public O(1) marker independent of storage services',
+    /@SkipWrap\(\)[\s\S]*?livez\(\):[\s\S]*?schemaVersion:\s*'anysentry\.livez\.v1'[\s\S]*?status:\s*'ok'/u.test(livezBlock) &&
+      !/(?:judge|clickhouse|postgres|healthz|aggregation|cacheStateStats)/iu.test(livezBlock),
+    livezBlock,
   );
   assert(
     'AnySentry readiness and liveness checks start only after the startup probe',
