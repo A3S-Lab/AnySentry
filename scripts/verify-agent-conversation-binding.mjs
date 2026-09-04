@@ -6,7 +6,7 @@ import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 
 const require = createRequire(import.meta.url);
-const { AgentConversationBindingService, conversationLogicalScopeKey } = require(
+const { AgentConversationBindingService, conversationLogicalScopeKey, trafficRoleForEvent } = require(
   '../apps/api/dist/security-monitoring/agent-conversation-binding.service.js',
 );
 const { conversationLogicalScopeKeyV2 } = require(
@@ -569,5 +569,92 @@ assert.match(
   /correlationQuality\s*===\s*'coverage_gap'[\s\S]{0,320}'unresolved'/u,
   'a coverage-gap correlation remains a queryable unresolved Session membership instead of being dropped as an invalid unknown quality',
 );
+
+// Generic event fallback must keep semantic intent/result records in the human lane while
+// reserving tool_backend for the machine-side ToolExec fact.  Invocation/node bookkeeping and
+// unanchored LlmApi/control events stay technical even though they carry the legacy Session id.
+const eventRoleFixture = {
+  attributes: {},
+  activityContext: undefined,
+  sessionId: 'fixture-session',
+  eventCategory: 'runtime',
+  runId: undefined,
+  runIdSource: undefined,
+  turnId: undefined,
+  sessionKey: undefined,
+  sessionIdentityQuality: undefined,
+  canonicalSessionId: undefined,
+};
+const eventRoleCases = [
+  ['ToolExec', 'tool_backend', {}],
+  ['tool', 'tool_backend', {}], // legacy universal-ingest alias
+  ['AgentTool', 'conversation', { eventCategory: 'tool', attributes: { 'gen_ai.operation.name': 'execute_tool' } }],
+  ['ToolResult', 'conversation', { eventCategory: 'tool' }],
+  ['AgentInvocation', 'background', { eventCategory: 'runtime', runId: 'derived-run', runIdSource: 'derived_ephemeral' }],
+  ['NodeRun', 'background', { eventCategory: 'runtime', runId: 'producer-run', runIdSource: 'producer' }],
+  ['WorkflowNode', 'background', { eventCategory: 'runtime' }],
+  ['LlmApi', 'background', { eventCategory: 'llm', runId: 'derived-run', runIdSource: 'derived_ephemeral' }],
+  ['LlmApi', 'control', { eventCategory: 'llm', attributes: { 'gen_ai.operation.name': 'initialize' } }],
+  ['LlmApi', 'conversation', { eventCategory: 'llm', runId: 'producer-run', runIdSource: 'producer' }],
+  ['AgentTool', 'background', { eventCategory: 'tool', attributes: { 'anysentry.traffic.role': 'background' } }],
+  ['LegacyTool', 'conversation', { eventCategory: 'unknown' }], // unknown/legacy fallback is retained
+  ['ToolExec', 'background', { activityContext: 'platform_healthcheck', eventCategory: 'runtime' }],
+];
+const bindingSource = readFileSync(
+  new URL('../apps/api/src/security-monitoring/agent-conversation-binding.service.ts', import.meta.url),
+  'utf8',
+);
+assert.match(bindingSource, /const role = trafficRoleForEvent\(event\)/u,
+  'event membership uses the generic traffic-role resolver');
+assert.doesNotMatch(bindingSource, /normalizedKind\.includes\(['"]tool['"]\)/u,
+  'event membership must not classify semantic Tool kinds by substring');
+for (const [eventKind, expectedRole, overrides] of eventRoleCases) {
+  const event = {
+    ...eventRoleFixture,
+    ...overrides,
+    eventKind,
+  };
+  assert.equal(trafficRoleForEvent(event), expectedRole, `${eventKind} traffic role`);
+}
+const persistedEventMemberships = [];
+const eventMembershipSink = {
+  commitSessionMemberships: async (memberships) => {
+    persistedEventMemberships.push(...memberships);
+    return { accepted: memberships.length, rejected: 0, durable: false };
+  },
+  recordGap: () => {},
+};
+const eventMembershipService = new AgentConversationBindingService(undefined, eventMembershipSink);
+for (const [index, [eventKind, expectedRole, overrides]] of eventRoleCases.entries()) {
+  await eventMembershipService.commitEventMembership({
+    schemaVersion: 'anysentry.agent_event.v1',
+    eventId: `event-role-${index}`,
+    at: fixtureNow + index,
+    eventKind,
+    eventCategory: 'runtime',
+    source: 'api',
+    subject: eventKind,
+    workspacePath: '/workspace/event-role-fixture',
+    agentId: 'event-role-fixture',
+    sessionId: 'fixture-session',
+    userId: 'fixture-user',
+    traceId: `trace-${index}`,
+    spanId: `span-${index}`,
+    runId: undefined,
+    verdict: 'allow',
+    tier: 'Rules',
+    severity: 'info',
+    reason: 'fixture',
+    riskCategory: 'system',
+    riskName: 'fixture',
+    riskType: 'system',
+    riskScore: 0,
+    tokenCount: 0,
+    latencyMs: 0,
+    ...overrides,
+  });
+  assert.equal(persistedEventMemberships.at(-1).role, expectedRole,
+    `${eventKind} commitEventMembership role`);
+}
 
 console.log('Agent Conversation durable Thread/Segment binding verification passed');

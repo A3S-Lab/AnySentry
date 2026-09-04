@@ -7,6 +7,7 @@ import { humanVisibleUserContent } from './agent-semantic-timeline';
 import {
   AGENT_CONVERSATION_RESOLVER_V2,
   type ConversationMembershipV2,
+  type ConversationMembershipRole,
   type ConversationResolutionV2,
   type ConversationRouteAliasV1,
   type TechnicalActivityProjection,
@@ -102,6 +103,153 @@ function applicationScopeMode(value?: string): boolean {
 
 function canonicalScopeMode(value?: string): boolean {
   return Boolean(value) && value !== 'unresolved';
+}
+
+const SESSION_MEMBERSHIP_TRAFFIC_ROLES = new Set<ConversationMembershipRole>([
+  'conversation', 'bootstrap', 'control', 'context_replay', 'tool_backend',
+  'derived_metadata', 'retry', 'background', 'unclassified',
+]);
+const TOOL_EXEC_EVENT_KINDS = new Set(['toolexec', 'exec', 'command', 'tool']);
+const SEMANTIC_TOOL_EVENT_KINDS = new Set([
+  'agenttool', 'toolcall', 'functioncall', 'executetool', 'toolresult',
+  'functionresult', 'agenttoolresult',
+]);
+const EXECUTION_BACKGROUND_EVENT_KINDS = new Set([
+  'agentinvocation', 'invokeagent', 'workflowrun', 'agentrun',
+  'noderun', 'node', 'workflownode',
+]);
+const LLM_EVENT_KINDS = new Set([
+  'llmapi', 'llmcall', 'llminteraction', 'llmresponse', 'llm', 'modelresponse',
+]);
+const MESSAGE_EVENT_KINDS = new Set([
+  'usermessage', 'userinput', 'humanmessage', 'inputmessage',
+  'modelmessage', 'assistantmessage', 'assistantoutput', 'finalresponse',
+]);
+const SEMANTIC_CONTENT_ATTRIBUTE_KEYS = [
+  'anysentry.content',
+  'gen_ai.prompt',
+  'gen_ai.completion',
+  'gen_ai.input.messages',
+  'gen_ai.output.messages',
+  'user.message',
+  'tool_call.id',
+  'gen_ai.tool.call.id',
+];
+
+/**
+ * Resolve the traffic lane for a durable JudgedEvent membership.
+ *
+ * Generic/application events reach this service when no legacy AgentInteraction parser was able
+ * to claim them.  The old fallback used `kind.includes('tool')`, which made semantic
+ * `AgentTool`/`ToolResult` records look like kernel ToolExec activity and also treated model/run
+ * bookkeeping as human conversation.  Keep the compatibility aliases (`tool`, `exec`, etc.) but
+ * classify canonical semantic kinds by exact normalized identity.  Adapter-provided role metadata
+ * remains the highest-authority override; no product or version names are involved here.
+ */
+export function trafficRoleForEvent(event: Pick<
+  T.JudgedEvent,
+  | 'eventKind'
+  | 'attributes'
+  | 'activityContext'
+  | 'runId'
+  | 'runIdSource'
+  | 'turnId'
+  | 'sessionKey'
+  | 'sessionIdentityQuality'
+  | 'canonicalSessionId'
+>): ConversationMembershipRole {
+  const attributes = event.attributes ?? {};
+  const attributeText = (...keys: string[]): string => {
+    for (const key of keys) {
+      const value = attributes[key];
+      if (typeof value !== 'string') continue;
+      const normalized = value.trim().toLowerCase();
+      if (normalized) return normalized;
+    }
+    return '';
+  };
+  const explicitRole = attributeText(
+    'anysentry.traffic.role',
+    'traffic.role',
+    'agent.traffic.role',
+  );
+  if (SESSION_MEMBERSHIP_TRAFFIC_ROLES.has(explicitRole as ConversationMembershipRole)) {
+    return explicitRole as ConversationMembershipRole;
+  }
+
+  const normalizedKind = event.eventKind.trim().toLowerCase().replace(/[\s.-]+/gu, '_');
+  const compactKind = normalizedKind.replace(/[_:/]+/gu, '');
+  const operation = attributeText(
+    'gen_ai.operation.name',
+    'rpc.method',
+    'http.route',
+    'operation.name',
+  );
+  const controlPattern = /(?:^|[/:.])(?:initialize|initialized|ping|tools?\/list|list_tools|resources?(?:\/templates)?\/list|prompts\/list|completion\/complete|logging\/setlevel|capabilit(?:y|ies))(?:$|[/:.?])/u;
+  const bootstrapPattern = /bootstrap|system[_ -]?context|developer[_ -]?context/u;
+  const metadataPattern = /title|summar(?:y|ize)|derived[_ -]?metadata/u;
+  const retryPattern = /(?:^|[/:._-])retry(?:$|[/:._-])/u;
+
+  // Healthcheck/heartbeat events stay technical and never enter the human lane.  A genuine
+  // ToolExec remains the sole automatic `tool_backend` mapping (unless an explicit role override
+  // above was supplied), even if a producer attaches a generic operation name.
+  if (event.activityContext === 'collector_heartbeat'
+    || event.activityContext === 'platform_healthcheck') return 'background';
+  if (TOOL_EXEC_EVENT_KINDS.has(compactKind)) return 'tool_backend';
+
+  // Explicit control/bootstrap operation metadata is useful even when a producer sends a generic
+  // LlmApi kind.
+  if (bootstrapPattern.test(operation)) return 'bootstrap';
+  if (controlPattern.test(operation)) return 'control';
+  if (metadataPattern.test(operation)) return 'derived_metadata';
+  if (retryPattern.test(operation)) return 'retry';
+
+  // Preserve the old compatibility convention for explicitly named role suffixes, while keeping
+  // semantic names exact below.  An arbitrary unknown `SomethingTool` therefore remains on the
+  // legacy conversation fallback instead of being silently promoted to kernel tool_backend.
+  if (normalizedKind.includes('bootstrap')) return 'bootstrap';
+  if (normalizedKind.includes('control')) return 'control';
+  if (normalizedKind.includes('background')) return 'background';
+
+  // AgentTool and ToolResult are semantic intent/result records.  They belong to the human-facing
+  // turn lane; only a separately observed ToolExec can become tool_backend.
+  if (SEMANTIC_TOOL_EVENT_KINDS.has(compactKind)) {
+    return 'conversation';
+  }
+
+  // Invocation and graph/workflow node spans describe execution bookkeeping.  Keep them in the
+  // technical/background lane even when a compatibility session id is present.
+  if (EXECUTION_BACKGROUND_EVENT_KINDS.has(compactKind)) {
+    return 'background';
+  }
+
+  // LLM request/response records can represent a real turn or infrastructure bookkeeping.  A
+  // producer Run (not Judge's derived compatibility Run), Turn, or namespaced/strong Session is
+  // the minimum generic evidence for conversation; otherwise retain the event as technical
+  // background.  (Legacy callers without a semantic kind still use the final conversation
+  // fallback below.)
+  if (LLM_EVENT_KINDS.has(compactKind)) {
+    const hasSemanticContent = SEMANTIC_CONTENT_ATTRIBUTE_KEYS.some((key) => attributes[key] !== undefined);
+    const hasProducerRun = Boolean(event.runId)
+      && (event.runIdSource === 'producer' || event.runIdSource === undefined);
+    const hasCanonicalAnchor = hasProducerRun
+      || event.turnId
+      || event.canonicalSessionId
+      || event.sessionKey
+      || ['confirmed', 'strong'].includes(event.sessionIdentityQuality ?? '');
+    return hasSemanticContent || hasCanonicalAnchor
+      ? 'conversation' : 'background';
+  }
+
+  // Known user/model message aliases are semantic conversation records.  This is intentionally
+  // exact so a future product-specific kind can remain visible without inventing a lane.
+  if (MESSAGE_EVENT_KINDS.has(compactKind)) {
+    return 'conversation';
+  }
+
+  // Unknown event kinds and pre-canonical rows retain the historical conversation fallback.  They
+  // remain queryable until a producer declares a more precise role; no evidence is dropped.
+  return 'conversation';
 }
 
 function threadDeploymentScopeKey(thread: T.AgentConversationThreadRecord): string {
@@ -1010,11 +1158,7 @@ export class AgentConversationBindingService implements OnModuleDestroy {
     const rawResolutionRevision = Number(event.sessionResolutionRevision ?? 1);
     const resolutionRevision = Number.isSafeInteger(rawResolutionRevision) && rawResolutionRevision >= 1
       ? Math.min(CANONICAL_SESSION_REVISION_MAX, rawResolutionRevision) : 1;
-    const normalizedKind = event.eventKind.trim().toLowerCase();
-    const role = normalizedKind.includes('tool') ? 'tool_backend'
-      : normalizedKind.includes('bootstrap') ? 'bootstrap'
-        : normalizedKind.includes('control') ? 'control'
-          : normalizedKind.includes('background') ? 'background' : 'conversation';
+    const role = trafficRoleForEvent(event);
     const sourceRefs = [...new Set([
       event.eventId,
       event.rawObservationId,
