@@ -26,6 +26,9 @@ AnySentry/Observer 已经具备四项可以复用的基础：Agent Candidate/Con
 
 本报告建议先批准“统一交互契约 + 受保护内容存储 + Codex/Claude/Dify 语义适配”的第一阶段，再决定是否投入高维护成本扩展静态 TLS 二进制的版本偏移表。需要产品与安全共同确认的三个决策是：原始正文的保留周期和查看角色、Candidate 内容是否允许短期预采集、Codex 的目标认证模式是否允许经过显式网关。
 
+> **当前决策增补（2026-09-04）**：Candidate 默认与 Confirmed 使用相同完整采集矩阵，
+> observed/provenance 仍保留；下文较早的 Candidate SAMPLE 表述是历史方案，不是当前验收口径。
+
 ## 1. 目标、术语与成功标准
 
 ### 1.1 当前语境中的 Candidate 与 Confirmed
@@ -116,7 +119,7 @@ Agent 资产详情已经有“Agent 行为追踪”：语义 ToolCall 是顶层�
 | 每次 LLM 响应正文 | 单次 OpenSSL read 快照 | SSE/stream 结束条件、响应合并、请求配对 |
 | 模型调用时间 | 有每片 capture time；`LlmCall` 有 close latency/TTFT | 缺 request start/response complete 的统一逻辑调用 |
 | 工具开始/结束 | AgentTool adapter 已支持，内核有 exec/exit | 覆盖 Codex/Claude/Dify，保存完整参数与结果 |
-| Candidate 每次都可见 | `probable_investigation` 在 S5 enforce 时对 SSL 采用 SAMPLE [E010] | 第一调用竞争、采样缺口；legacy/shadow 也仍受 1024 字节和 attach 限制 |
+| Candidate 每次都可见 | `probable_investigation` 默认在 S5 enforce 时对全部 probe（含 SSL）采用 FULL；仍受有界预算和 attach 限制 | 只有显式成本降级开关才恢复 SAMPLE；正文完整性仍由重组/存储 Coverage 决定 |
 | Confirmed 每次都可见 | `agent_full` 对 SSL 选择 FULL | FULL 只表示“每个 probe 事件不采样”，不代表协议和正文完整 |
 | 页面按调用展示 | 已有 Event Raw Preview 和 Agent ActionTrace [E016][E036] | 缺 Turn/ModelCall/ToolCall 分层、正文与完整性状态 |
 

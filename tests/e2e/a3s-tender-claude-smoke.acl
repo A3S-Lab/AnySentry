@@ -1,0 +1,20 @@
+suite "a3s-tender-claude-smoke" {
+    version = 1
+
+    scenario "tender-claude-https-fixture" {
+        surface = "tui"
+        timeout_ms = 180000
+
+        wait "fixture-complete" {
+            text = "A3S_TENDER_TUI_PASS claude"
+        }
+
+        expect "tool-result-visible" {
+            text = "A3S_TENDER_TUI_PASS claude"
+        }
+
+        terminal_recording "evidence" {
+            path = "terminal/tender-claude-fixture.vt"
+        }
+    }
+}

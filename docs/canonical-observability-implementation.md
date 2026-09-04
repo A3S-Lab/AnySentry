@@ -53,10 +53,11 @@ k3s Pod 中以 Aya `Program::load` 逐项加载了
 | --- | --- | --- |
 | 本地 checkpoint | AnySentry `b5bb92b`（含 `6644d5c`/`d54ebba`）；Observer `3a827bf`（含 `66e27eb`/`49f183e`） | 仅本地分支和本地 checkpoint，未执行任何远程推送 |
 | 构建/合同 | `pnpm build`、Canonical/identity/S5/unified/workspace/deployment 定向门禁通过；Observer release workspace test 212 项、fmt/check/build/clippy 通过 | 代码门禁不等价于正式集群已切换 |
-| Canonical GET | `/v1/logical-agents`、`agent-instances`、`runtime-instances`、`sessions` 及详情、timeline、coverage、semantic evidence、kernel context 均有版本化响应、bounded pagination/cursor、revision/coverage 和管理鉴权；隔离 harness 通过 | 当前正式 API Pod 仍是旧 digest，尚未把 GET 结果写成正式部署通过 |
+| Canonical GET | `/v1/logical-agents`、`agent-instances`、`runtime-instances`、`sessions` 及详情、nested sessions/runtimes、timeline、coverage、`sr_`/`se_` semantic evidence alias、kernel context 均有版本化响应、bounded pagination/cursor、revision/coverage 和管理鉴权；隔离 harness 通过 | 当前正式 API Pod 仍是旧 digest，尚未把 GET 结果写成正式部署通过 |
 | 候选身份 | `probable_agent` 保留 observed/detected provenance；默认 `effective capture/judgment=confirmed_agent`，与确认 Agent 使用同一完整 probe 矩阵，仍受 ring/payload/TTL/队列预算约束 | 不创建虚假 LogicalAgent/Session；`ANYSENTRY_CANDIDATE_EFFECTIVE_MODE=probable` 仅是显式成本降级开关，不是默认路径；管理面 token 仍只保护变更/控制操作，不再要求人工升级候选才能采样 |
 | TLS 设计 | Codex/Claude 只通过实现族/ABI capability manifest 选择通用 TLS 边界；产品名仅作发现提示，版本号/二进制指纹不能作为隐藏授权条件 | 极端新 ABI 通过新增明确 capability extension 接入，复用同一 Parser/Correlation 主链 |
-| CLI 与 a3s-test | Codex、Claude Code 的可重复 TUI suite 均通过（分别保存非敏感 terminal recording）；浏览器 capability 因本机 `a3s` 驱动缺少 `use` 未执行 | TUI 结果是产品级请求—工具—结果—最终回复证据，不等价于 eBPF 被动 attach |
+| CLI 与 a3s-test | 宿主 Codex/Claude TUI suite 通过；`tender_jang` 内真实 Codex `0.149.1`、Claude Code `2.1.251` 的 TUI suite 也通过（非敏感 terminal recording）；浏览器 capability 因本机 `a3s` 驱动缺少 `use` 未执行 | TUI 结果是产品级请求—工具—结果—最终回复证据，不等价于 eBPF 被动 attach |
+| Runtime Source provenance | 运行时 snapshot 在 API 鉴权边界绑定 server-only `sourceId`，并在 AgentInstance/RuntimeInstance Canonical GET 中可查询；producer 伪造字段不会覆盖它 | 旧历史记录没有 sourceId 时仍按 Coverage 标 partial，不回填猜测值 |
 | k3s Scanner | 代码已捕获不可读目录并跳过 `.runtime`；live `workspace-scanner` 使用本地不可变 digest、显式 `Directory` hostPath，Ready/restart=0，完成 1385 component scan | 仅 Scanner 已切换；API/Observer/Worker 尚未整体切换 |
 | API/Web 交付形态 | API OCI 镜像内同时提供 `/app/dist` 和 `/app/web`，通过同源服务承载页面；因此没有独立 current-head Web Deployment 是有意的单镜像边界，不是遗漏组件 | 页面验收前提是更新 API 镜像；当前正式 Pod 仍旧镜像，所以旧页面无新 GET 不是“Web 缺部署”而是 API 未滚动 |
 
@@ -91,8 +92,8 @@ Coverage 算法。Unknown/Candidate 仍保留完整 Kernel lane；明文 Adapter
 
 | 范围 | 事实 | 解释边界 |
 | --- | --- | --- |
-| 当前本地代码 checkpoint | AnySentry `477f897`；Observer `030b910` | 两个仓库均为本地 checkpoint，未 push；旧部署尚未切换到这组代码 |
-| 当前 checkpoint 测试 | identity scope tests 6/6；Observer full tests 159 + common 8 + root 32 + workload 7 = 206；fmt/check/build/clippy 均通过 | 证明局部合同与仓库门禁，不替代部署/真实链路验收 |
+| 当前本地代码 checkpoint | AnySentry `4fbd077`（前序 `855bff9`/`adf0b91` 等）；Observer `3a827bf`（含 `66e27eb`/`49f183e`） | 两个仓库均为本地 checkpoint，未 push；正式 API/Observer 尚未切换到这组代码 |
+| 当前 checkpoint 测试 | identity/canonical/entity/source-scope 定向门禁通过；Observer full tests 165 collector + 8 common + 32 root + 7 workload = 212；fmt/check/build/clippy 均通过 | 证明局部合同与仓库门禁，不替代部署/真实链路验收 |
 | mixed-cgroup identity fence | AnySentry publisher 输出 `rootPid`、`rootStartTimeTicks`、`agentInstanceId` 并保留同 cgroup distinct entries；Observer 按 process generation/cgroup/祖先链 fail-closed，mixed scope 不 broad admit | 旧 Observer/Forwarder rollout 必须和 publisher 原子升级；只替换单侧会保留旧误合并/准入风险 |
 | 临时 k3s current-dist 验证 | namespace `anysentry-goal-dist-20260904` 的 current-dist hostPath fallback health ok；canonical contracts v1、representative replay 13 synthetic events/4 families/0 gap、S6 Tool Evidence、S2 shadow 均通过；namespace/容器已清理 | 仅为旧镜像底座 + 只读 `/app/dist`，不是 current-head OCI image，不能替代正式部署 |
 | 临时 k3s API/Web OCI overlay 验证 | AnySentry API/Web overlay `anysentry:goal-current-oci-20260904` 从本机缓存基座覆盖 current `api/dist` 与 `web/dist` 构建成功并推入本机 registry，registry manifest GET 200（digest 前缀 `043180…`）；namespace `anysentry-goal-oci-web-20260904` 以 Secret 引用 token、无 hostPath，health、`/v1/observability/contracts`、representative replay 13/4 families/0 gap、S6、S2 shadow 均通过后清理 | overlay 基座仍是旧 runtime + current dist overlay，非原始 Dockerfile 全链；existing formal deployment 未切换，不能标 DoD 完成 |
@@ -282,8 +283,9 @@ UI/查询应据此显示 reference-only，而不能把 metadata complete 渲染�
   ClickHouse、management 和 session-hash Secret，避免 Secret 值出现在 kubectl argv；
 - Docker Compose/Kubernetes 只引用 Secret 或受控环境变量；仓库不保存真实 URL、Token、
   Cookie、完整 prompt 或 transcript；
-- 当前扫描仍发现若干既有 untracked/protected credential-like 文件。它们的 tracked
-  finding 为 0，本地测试期间不删除、不覆盖；因此 hygiene gate 如实为 blocked；
+- 当前 tracked repository hygiene 为通过；credential scan 仍发现若干既有
+  untracked/protected credential-like runtime 文件。它们的 tracked finding 为 0，本地测试期间
+  不删除、不覆盖；因此凭据清理项仍单独标为 blocked，不能把它们提交或写入报告；
 - 远程地址只读记录，整个 Goal 没有 `git push`、远程 PR、远程 registry 或公共镜像写入。
 
 ## 4. API、投影和 UI
@@ -299,6 +301,12 @@ GET  /security-center/v1/evidence-links
 GET  /security-center/v1/session-memberships
 GET  /security-center/v1/coverage-gaps
 GET  /security-center/v1/observability/contracts
+GET  /security-center/v1/logical-agents[/:logicalAgentId[/instances]]
+GET  /security-center/v1/agent-instances[/:agentInstanceId[/runtimes|/sessions]]
+GET  /security-center/v1/runtime-instances[/:runtimeInstanceId]
+GET  /security-center/v1/sessions[/:sessionId[/timeline|/coverage]]
+GET  /security-center/v1/semantic-events/:semanticEventId/evidence
+GET  /security-center/v1/kernel-facts/:factId/context
 POST /security-center/agents/conversation-directory-v3
 POST /security-center/agents/conversations/timeline-v3
 POST /security-center/agents/semantic-events/evidence
@@ -325,6 +333,7 @@ pnpm --filter @anysentry/web exec tsc -p tsconfig.json --noEmit
 node scripts/verify-deployment-manifests.mjs
 node scripts/verify-canonical-contract.mjs
 node scripts/verify-canonical-observability.mjs
+ANYSENTRY_ADMIN_TOKEN=verify-canonical-entity-admin node scripts/verify-deep-links-local.mjs scripts/verify-canonical-entity-get.mjs
 node scripts/verify-agent-conversation-resolution-v2.mjs
 node scripts/verify-agent-conversation-directory.mjs
 node scripts/verify-agent-conversation-binding.mjs
@@ -335,6 +344,12 @@ node scripts/verify-agent-runtime-state.mjs
 node scripts/verify-agent-semantic-identity.mjs
 node scripts/verify-agent-templates.mjs
 node scripts/verify-s2-persistence-canonical.mjs
+node scripts/verify-repository-hygiene.mjs
+# A3S Test TUI (host CLI and tender_jang CLI variants)
+a3s-test check tests/e2e/a3s-cli-codex-smoke.acl --json
+a3s-test check tests/e2e/a3s-cli-claude-smoke.acl --json
+a3s-test check tests/e2e/a3s-tender-codex-smoke.acl --json
+a3s-test check tests/e2e/a3s-tender-claude-smoke.acl --json
 ```
 
 Observer 当前本地验证结果：
@@ -347,22 +362,22 @@ cargo clippy --locked --offline --workspace --exclude a3s-observer-ebpf \
   --all-targets --all-features --release -- -D warnings
 ```
 
-当前 Observer `030b910` 结果为 206 项测试通过（root 32、workload contract 7、collector
-159、common 8），identity scope tests 另为 6/6；fmt、workspace check/release build 和 clippy
+当前 Observer `3a827bf` 结果为 212 项测试通过（root 32、workload contract 7、collector
+165、common 8）；identity scope tests 与 TLS capability boundary 另行通过；fmt、workspace check/release build 和 clippy
 通过。`a3s-observer-ebpf` 是 no_std/no_main 的专用 BPF target；在
 普通 host 上直接以 `--features build-ebpf` 做宿主链接会触发 unwinding 限制，正确门禁是
 Collector 的 `aya_build`（本次 workspace build/test 已生成 BPF object），不能把该宿主链接
 命令写成 eBPF attach 通过。
 
-AnySentry `477f897` 的 publisher 已输出 `rootPid`、`rootStartTimeTicks` 和 `agentInstanceId`
-fence，并在同一 cgroup 中保留 distinct entries；它与 Observer `030b910` 的 generation/cgroup/
+AnySentry `4fbd077` 的 publisher 已输出 `rootPid`、`rootStartTimeTicks` 和 `agentInstanceId`
+fence，并在同一 cgroup 中保留 distinct entries；它与 Observer `3a827bf` 的 generation/cgroup/
 ancestor fail-closed 规则共同解决旧 mixed-scope broad-admit。两侧合同必须一起 rollout。
 
 额外的本地特权 load smoke 使用当前 Collector 构建产出的 BPF object，通过 Aya `Program::load`
 逐项加载 `tls_write`、`tls_sendto`、`http_writev` 和 `exec`，结果全部成功；旧实现曾在
 `http_request_route_kind` 的内联路径扫描/hash 上报 `BPF program is too large. Processed 1000001
 insn`。前序 verifier 修复提交为 Observer `20a8aa4`，只把有界路径 hash 移到 `bpf_loop`
-callback；当前 checkpoint `030b910` 进一步按 process generation/cgroup/祖先链 fail-closed，
+callback；当前 checkpoint `3a827bf` 进一步按 process generation/cgroup/祖先链 fail-closed，
 mixed scope 不 broad admit，未改变固定 ABI。该 smoke 不执行 tracepoint attach；现有节点已有 Observer，实际完整 attach/目标
 workload 转发仍按环境矩阵标记为未验证。
 
@@ -425,8 +440,8 @@ Session、原文完整读取、容器被动捕获、LangGraph 逐事件唯一 Ev
 
 | 代表对象 | 当前本地实际验证 | Kernel/Evidence | Session/连续轮次 | 结论 |
 | --- | --- | --- | --- | --- |
-| Codex CLI | `tender_jang` 安装 0.149.1；本回合 fixture 两阶段请求/ToolCall/Result/final；SSH durable 初始快照 60（model56/tool4），后续异步 `agents/interactions` 约 63 records（model57/tool4 + 2 unsupported/unparsed） | tool4 parsed/complete、toolCall4/toolResult4；model57 parsed 且 request/response wire complete；2 条 Rustls plaintext evidence metadata-only/unparsed；选定 Tool inspector 404 | request roles 证明 semantic lane 已进入；identity/session/run 仍 runtime/probable，conversation complete2/tool_pending55 | Observer 协议层 pass；身份/正文/统一证据 partial |
-| Claude Code | `tender_jang` 安装 2.1.251；本回合 fixture 两阶段请求/ToolCall/Result/final | 产品级 fixture 闭环；当前 SSH 环境可见但本回合未取得该容器进程被动 LLM Interaction | 两阶段产品调用通过 | 产品级 pass；SSH/Observer/canonical partial |
+| Codex CLI | `tender_jang` 真实二进制 0.149.1；A3S Test TUI 两阶段 ToolCall/Result/final 通过；SSH durable 历史窗口仍为约 60–63 条 | 产品级 fixture 通过；SSH 旧 Observer 有 tool4 parsed/complete，但 Rustls plaintext 为 metadata-only/unparsed、正式 current-head 被动投影未验证 | TUI 运行边界明确；SSH identity/session/run 仍非 authenticated/confirmed | tender 产品级 pass；正式 Observer/Canonical partial |
+| Claude Code | `tender_jang` 真实二进制 2.1.251；A3S Test TUI HTTPS 两阶段 ToolCall/Result/final 通过 | 产品级 fixture 通过；未把宿主版本失败/成功外推到 tender 之外 | 两阶段产品调用通过 | tender 产品级 pass；正式 Observer/Canonical partial |
 | Dify Workflow/Chatflow | 既有本地 Docker Dify 1.14.2；本回合 LLM/tool 两个 workflow 均 HTTP200、脚本 rc0；debug reconciliation curl 因测试 CA 校验失败 | durable `dify-observation-lab` 55 事件：Egress44/ToolExec8/LlmInteraction3、captureSelected55、identity exact54/weak1；correlation 全 unassigned；hash 对账 partial | 无 conversation 的 POST 仍按 per-request；本回合未证明内部 node 与 Kernel 唯一关联 | workflow pass；hash/统一证据 partial |
 | LangChain/LangGraph | LangChain 常驻 fixture 轮换证书后 `/invoke=200`；k3s LangGraph 本回合 Run completed、sandbox exit0/verification pass、telemetry accepted15；另有历史 RuntimeError 仍上报 3 事件 | 本回合 sandbox KernelFact 为 ToolExec2/ProcessExit2、physical_workload confidence0.70；既有 Durable Session 19 事件（LlmInteraction10/AgentTool3/AgentInvocation3/ToolExec3）仍有 `correlation unassigned=13`、`agent_adapter=6` | 服务/沙箱运行通过；root generation、Canonical Tool→Kernel EvidenceLink 和正式 UI 未完成 | 运行与统一证据 partial |
 
@@ -440,8 +455,8 @@ Session、原文完整读取、容器被动捕获、LangGraph 逐事件唯一 Ev
 | --- | --- | --- |
 | Host | partial | API health 200，当前使用 memory fallback；CLI loopback fixture 已在 Host 执行；UID 1001、`unprivileged_bpf_disabled=2`，无直接 eBPF attach 能力 |
 | SSH | partial（协议解析、身份/正文/统一证据 partial） | VSCode SSH `notty` 链 native PID 1101287 在 2026-09-03 16:14–16:22Z durable custom window 初始有 60 条 parsed/confirmed/complete `LlmInteraction`（model56/tool4），后续异步 `agents/interactions` 约 63 records（model57/tool4 + 2 unsupported/unparsed）；另有 2 条 `tls_uprobe_rustls` metadata-only/unparsed。identity/session/run 仍 runtime/probable 提示，非 authenticated AgentAdapter/confirmed Session |
-| Docker | partial | Docker daemon、Compose config 和既有 Dify 栈健康；`tender_jang` 有 CLI/库但无 Docker CLI/socket；当前头 AnySentry API 容器仍未部署 |
-| Kubernetes | partial | k3s LangGraph `/healthz` 与 `/runs` 真实调用、durable 查询可用；workspace-scanner 已切换本地 digest/path，新 Pod restart0 并完成一次 1385-component scan；临时 API/Web OCI 与 Observer 组合 smoke 已验证后清理，但 existing AnySentry/Observer 仍旧 digest、canonical GET 未切换正式部署，`critical_inbox_dropped` 约 1.89M（最近观测且继续上涨）等可靠性缺口仍在 |
+| Docker | partial | Docker daemon、Compose config 和既有 Dify 栈健康；`tender_jang` 内 Codex/Claude/LangChain/LangGraph 运行库及 CLI TUI 已验证，但无 Docker CLI/socket；当前头 AnySentry API/Observer 容器仍未整体部署 |
+| Kubernetes | partial | k3s LangGraph `/healthz` 与 `/runs` 真实调用、durable 查询可用；workspace-scanner 已切换本地 digest/path，新 Pod restart0 并完成一次 1385-component scan；临时 API/Web OCI 与 Observer 组合 smoke 已验证后清理，但 formal AnySentry/Observer 仍旧 digest、canonical GET 未切换正式部署，`critical_inbox_dropped` 与共享节点 I/O/etcd 抖动仍是可靠性缺口 |
 
 Kafka/Flink 只在已有可选 profile 中保留，未成为 Canonical 主链前置依赖；本阶段不新增时间窗
 功能。Kubernetes/ Docker 的旧服务健康不被用来冒充当前工作树部署通过。
@@ -461,7 +476,7 @@ Kafka/Flink 只在已有可选 profile 中保留，未成为 Canonical 主链前
 9. k3s LangGraph 已有真实 `/runs` 和耐久事件，但 `correlation unassigned=13`、`agent_adapter=6`，两条证据 lane 尚未统一；
 10. 当前 SSH Codex durable custom-window 初始快照为 60 条 parsed/confirmed/complete `LlmInteraction`（model 56、tool 4），后续异步 `agents/interactions` 可到约 63 records（model57/tool4 + 2 unsupported/unparsed；complete6/partial55/unsupported2）；identity/session/run 仍为 runtime/probable 提示，2 条 Rustls plaintext evidence 是 metadata-only/unparsed，且 conversation complete2/tool_pending55、选定 Tool inspector 404；普通 SSH `CapEff=0` 且 `unprivileged_bpf_disabled=2`，不能据此声称正文原文完整可见；
 11. existing formal AnySentry 仍为旧 image digest、canonical GET 未切换正式部署，`critical_inbox_dropped` 约 1.89M（最近观测且继续上涨），且 static signature warnings 仍存在；这些运行可靠性缺口和风险尚未消除；
-12. AnySentry `477f897` 与 Observer `030b910` 已加入 mixed-cgroup fence，但旧 Observer/Forwarder rollout 仍有误合并/broad-admit 风险；publisher、Forwarder、Observer 必须原子升级并回放验证；
+12. AnySentry `4fbd077` 与 Observer `3a827bf` 已加入 mixed-cgroup fence，但正式 Observer/Forwarder rollout 仍需原子升级并回放验证；
 13. 临时 namespace `anysentry-goal-dist-20260904` 的旧镜像 + 只读 `/app/dist` hostPath fallback 已清理；它不能替代 current-head OCI 镜像部署；
 14. `anysentry-goal-oci-web-20260904` 的 API/Web OCI overlay 已通过局部健康/合同/回放门禁并清理，registry manifest GET 200、digest 前缀 `043180…`；基座仍是旧 runtime + current dist overlay，非原始 Dockerfile 全链；Observer scripts overlay `7d3b…` 也已完成 25-probe/5-fence 组合 smoke，但长跑批量拒绝与 existing formal deployment 未切换仍是缺口；
 15. URL/hash、正文权限、30 天保留和生产容量/成本仍需安全负责人和部署环境单独批准。

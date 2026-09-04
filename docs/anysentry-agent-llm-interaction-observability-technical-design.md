@@ -17,6 +17,13 @@
 > 发布状态：完成新基线回归后重新构建带源码 revision 的正式镜像；旧分叉工作树构建的
 > 本地镜像不属于本设计的发布产物
 
+> **当前决策增补（2026-09-04）**：`probable_agent` 是发现状态，不是低保真采集等级。
+> 默认 capture/judgment 使用与 `confirmed_agent` 相同的完整矩阵，并保留 observed
+> classification/provenance；不需要人工调用“候选升级”才能采集。只有显式设置
+> `ANYSENTRY_CANDIDATE_EFFECTIVE_MODE=probable` 才启用历史成本降级，且必须在 Coverage 中
+> 标明。本文较早章节若仍写 Candidate 普通 File/Network SAMPLE，均为历史策略；TLS 选择只
+> 按 implementation family/ABI capability，不按具体产品版本硬编码。
+
 ## 0. 设计摘要
 
 本实现新增独立的 `anysentry.agent_interaction.v1` 数据链，不再尝试把旧 `SslContent` 的 1,024-byte 快照拼成完整调用。数据链由三个连续、互不替代的准入层组成：[E002][E003][E004]
@@ -496,7 +503,7 @@ Codex 0.150.1 使用 custom Responses provider、`supports_websockets=false`。�
 `CAPTURE_PROFILE_ACTIONS` 当前行为：
 
 - `agent_full`、`investigation_full`：SSL full；
-- `probable_investigation`：SSL full，使 Candidate 在识别后逐次采集；进程代际和本地 TLS scope 维持资格，避免短期租约/空闲导致后续轮次缺失；
+- `probable_investigation`：默认复用 `agent_full` 的完整 probe/SSL 矩阵；进程代际和本地 TLS scope 维持资格，避免短期租约/空闲导致后续轮次缺失。历史 SAMPLE 仅在显式成本降级开关下启用；
 - `security_full`、`business_context`、`infrastructure_aggregate`、`unknown_discovery`、`self_health`：SSL `not_enabled`。
 
 即使 profile 选择 full，内核仍需 process map 和 route Gate。Unknown profile 的 `llm` 元数据可以 full，但不等于允许 SSL body。

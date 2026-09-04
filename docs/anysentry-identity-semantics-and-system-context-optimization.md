@@ -2,6 +2,10 @@
 
 状态：已审核实施方案
 
+> **当前决策增补（2026-09-04）**：候选智能体的 observed classification/provenance 必须
+> 保留，但默认采集和判断档位与 Confirmed Agent 相同（完整 Kernel/TLS/语义矩阵）。旧章节中
+> 的普通 File/Network SAMPLE 和“等待人工升级”是历史策略；仅显式成本降级开关可恢复它们。
+
 依据：2026-08-21 本地真实运行调研
 
 关联文档：[可信关联身份、采集过滤与开发阶段设计](./anysentry-trusted-correlation-and-capture-roadmap.md)
@@ -520,7 +524,7 @@ probable_agent 代表候选身份，但当前等同于 agent_full，容易让误
 | 身份和状态 | 默认档位 | 保留行为 |
 |---|---|---|
 | confirmed_agent | agent_full | Tool、关键 File/Network、Exec/Exit、安全证据高保真 |
-| probable_agent | probable_investigation | root Exec/Exit、安全事件 FULL；普通 File/Network 有界 SAMPLE；TLS 明文交互 FULL；短 TTL |
+| probable_agent | probable_investigation（默认等同 agent_full） | Exec/Exit、File/Network、TLS、LLM 和安全事件均按完整矩阵采集；仍受有界预算/TTL；历史 SAMPLE 需显式成本降级 |
 | unknown | unknown_discovery | 关键生命周期、首批样本、周期样本、精确计数 |
 | business_service | business_context | 指标、依赖、变化；syscall 聚合 |
 | platform / infrastructure | infrastructure_aggregate | 重复信号聚合；安全和生命周期保留 |

@@ -1692,6 +1692,8 @@ export interface CanonicalLogicalAgentResource {
   ownerId?: string;
   workspacePath: string;
   environment: "kubernetes" | "docker" | "host" | "unknown";
+  collectorIds?: string[];
+  sourceIds?: string[];
   lifecycleState: "running" | "unobserved" | "historical";
   terminalContextIds: string[];
   agentAssetIds: string[];
@@ -1844,6 +1846,7 @@ export interface CanonicalEntityQuery extends SecurityTimeFilter {
   includeShadow?: boolean;
   includeCoverage?: boolean;
   logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
   tenantId?: string;
   ownerId?: string;
   workspacePath?: string;

@@ -1,5 +1,9 @@
 # Agent Discovery and Observation Filter
 
+> **当前决策增补（2026-09-04）**：`probable_agent` 默认复用 Confirmed Agent 的完整
+> capture profile；候选身份和管理权威仍分开记录。本文较早的 SAMPLE 矩阵属于历史成本策略，
+> 只有显式 `ANYSENTRY_CANDIDATE_EFFECTIVE_MODE=probable` 才可启用。
+
 Status: implemented and development-environment verified on `feat/agent-discovery-filter`
 
 The final acceptance target is the complete
@@ -284,7 +288,7 @@ Routing policy:
 | Classification | Lifecycle | Security signal | Normal Agent-relevant event | Routine noise |
 |---|---:|---:|---:|---:|
 | confirmed_agent | keep | keep | keep | aggregate/deduplicate |
-| probable_agent | keep | keep | keep within budget（TLS 明文交互 FULL） | sample |
+| probable_agent | keep | keep | keep within bounded full matrix（TLS 明文交互 FULL） | aggregate/deduplicate |
 | unknown | keep | keep | keep within discovery budget | sample |
 | non_agent | cleanup only | keep | filter in `agent` mode | aggregate/filter |
 
