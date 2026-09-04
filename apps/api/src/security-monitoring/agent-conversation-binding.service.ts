@@ -1157,9 +1157,14 @@ export class AgentConversationBindingService implements OnModuleDestroy {
     if (!this.canonicalObservability) return;
     const sessionKey = event.sessionKey;
     const rawSession = event.sessionId;
-    const sessionId = sessionKey ?? rawSession;
-    if (!sessionId) return;
-    const baseQuality: T.SessionIdentityQuality = event.sessionIdentityQuality === 'confirmed'
+    // A parser/storage failure must not discard a Kernel/semantic event merely because no native
+    // Session header was present. Derive one event-scoped ephemeral key, matching the universal
+    // ingest per-request rule, and retain its unresolved provenance.
+    const sessionSeed = sessionKey ?? rawSession ?? `event:${event.eventId}`;
+    const sessionId = sessionKey ?? rawSession ?? `ephemeral:${event.eventId}`;
+    const baseQuality: T.SessionIdentityQuality = !sessionKey && !rawSession
+      ? 'ephemeral'
+      : event.sessionIdentityQuality === 'confirmed'
       ? 'confirmed'
       : event.sessionIdentityQuality === 'strong' ? 'strong'
         : event.sessionIdentityQuality === 'ephemeral' ? 'ephemeral' : 'inferred';
@@ -1177,11 +1182,11 @@ export class AgentConversationBindingService implements OnModuleDestroy {
     const membership = {
       schemaVersion: 'anysentry.session_membership.v1' as const,
       membershipId: `sm_${createHash('sha256').update([
-        event.eventId, sessionKey ?? rawSession, String(resolutionRevision),
+        event.eventId, sessionSeed, String(resolutionRevision),
       ].join('\0')).digest('hex').slice(0, 24)}`,
       sessionId: event.canonicalSessionId
         ?? canonicalSessionIdForMembership(
-          rawSession ?? sessionId,
+          sessionSeed,
           event.sessionNamespaceKey,
           event.eventId,
         ),

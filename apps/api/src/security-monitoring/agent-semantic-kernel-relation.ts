@@ -140,7 +140,10 @@ function toolHost(event: T.AgentSemanticEvent): string | undefined {
     : nestedString(event.content, ['url', 'uri', 'endpoint', 'host']);
   if (!raw) return undefined;
   try {
-    return new URL(raw).hostname.toLowerCase();
+    const explicitScheme = raw.includes('://');
+    const parsed = new URL(explicitScheme ? raw : `http://${raw}`);
+    if (explicitScheme && !NETWORK_ENDPOINT_PROTOCOLS.has(parsed.protocol)) return undefined;
+    return parsed.hostname.toLowerCase();
   } catch {
     return text(raw, 512)?.toLowerCase();
   }
@@ -539,11 +542,10 @@ function potentialRelation(
   const canonicalLink = createEvidenceLink({
     fromType: 'tool_call',
     fromId: invocationId,
-    toType: candidate.eventKind === 'FileAccess' || candidate.eventKind === 'FileDelete'
-      ? 'file'
-      : candidate.eventKind === 'Egress' || candidate.eventKind === 'Dns' || candidate.eventKind === 'Tls'
-        ? 'network'
-        : 'kernel_fact',
+    // KernelFact is the only durable target identity available here.  Event kind still selects
+    // the relation (`file_effect`/`network_effect`), but an `evt_*` or `kf_*` value must not be
+    // mislabeled as a File/Network entity until those entity IDs have their own contracts.
+    toType: 'kernel_fact',
     toId: candidate.kernelFactId ?? candidate.eventId,
     relation: candidate.eventKind === 'ToolExec' ? 'executes_as'
       : candidate.eventKind === 'FileAccess' || candidate.eventKind === 'FileDelete' ? 'file_effect'
@@ -654,12 +656,7 @@ function canonicalLinkForRelation(
   status: 'ambiguous' | 'unmatched' | 'coverage_gap',
   competingRefs: string[] = [],
 ) {
-  const toType: 'kernel_fact' | 'file' | 'network' =
-    relation.kernelEventKind === 'FileAccess' || relation.kernelEventKind === 'FileDelete'
-      ? 'file'
-      : relation.kernelEventKind === 'Egress' || relation.kernelEventKind === 'Dns' || relation.kernelEventKind === 'Tls'
-        ? 'network'
-        : 'kernel_fact';
+  const toType: 'kernel_fact' = 'kernel_fact';
   const method = relation.linkMethod === 'network_endpoint'
     ? 'network' as const
     : relation.linkMethod === 'shell_bootstrap'
@@ -672,7 +669,10 @@ function canonicalLinkForRelation(
     fromId: relation.toolInvocationId,
     toType,
     toId: relation.kernelFactId ?? relation.kernelEventId ?? `unmatched:${relation.stableSemanticEventId}`,
-    relation: toType === 'file' ? 'file_effect' : toType === 'network' ? 'network_effect' : 'supports',
+    relation: relation.kernelEventKind === 'FileAccess' || relation.kernelEventKind === 'FileDelete'
+      ? 'file_effect'
+      : relation.kernelEventKind === 'Egress' || relation.kernelEventKind === 'Dns' || relation.kernelEventKind === 'Tls'
+        ? 'network_effect' : 'supports',
     method,
     confidence: 0,
     authority: 'inferred',
@@ -691,11 +691,7 @@ function canonicalLinkForRelation(
 export function canonicalEvidenceLinkForRelation(
   relation: T.AgentSemanticKernelRelation,
 ): EvidenceLink {
-  const toType: EvidenceLink['toType'] = relation.kernelEventKind === 'FileAccess'
-    || relation.kernelEventKind === 'FileDelete'
-    ? 'file'
-    : relation.kernelEventKind === 'Egress' || relation.kernelEventKind === 'Dns' || relation.kernelEventKind === 'Tls'
-      ? 'network' : 'kernel_fact';
+  const toType: EvidenceLink['toType'] = 'kernel_fact';
   const method: EvidenceLink['method'] = relation.linkMethod === 'network_endpoint'
     ? 'network'
     : relation.linkMethod === 'shell_bootstrap'
@@ -712,7 +708,10 @@ export function canonicalEvidenceLinkForRelation(
     fromId: relation.toolInvocationId,
     toType,
     toId: relation.kernelFactId ?? relation.kernelEventId ?? `unmatched:${relation.stableSemanticEventId}`,
-    relation: toType === 'file' ? 'file_effect' : toType === 'network' ? 'network_effect' : 'executes_as',
+    relation: relation.kernelEventKind === 'FileAccess' || relation.kernelEventKind === 'FileDelete'
+      ? 'file_effect'
+      : relation.kernelEventKind === 'Egress' || relation.kernelEventKind === 'Dns' || relation.kernelEventKind === 'Tls'
+        ? 'network_effect' : 'executes_as',
     method,
     confidence: status === 'confirmed' ? 1 : status === 'strong' ? relation.confidence : 0,
     authority: 'inferred',

@@ -409,6 +409,36 @@ function compareSemanticEvent(left: T.AgentSemanticEvent, right: T.AgentSemantic
     || left.semanticEventId.localeCompare(right.semanticEventId);
 }
 
+function resolvedToolCallIdsForTimeline(
+  interactions: readonly T.AgentInteractionRecord[],
+): Set<string> {
+  const callAt = new Map<string, bigint>();
+  for (const interaction of interactions) {
+    let boundary: bigint | undefined;
+    try { boundary = BigInt(interaction.startedAtUnixNs); } catch { /* keep unknown */ }
+    for (const call of interaction.toolCalls) {
+      let at = boundary;
+      try { if (call.issuedAtUnixNs) at = BigInt(call.issuedAtUnixNs); } catch { /* boundary */ }
+      if (at !== undefined && (!callAt.has(call.toolCallId) || at < callAt.get(call.toolCallId)!)) {
+        callAt.set(call.toolCallId, at);
+      }
+    }
+  }
+  const resolved = new Set<string>();
+  for (const interaction of interactions) {
+    for (const result of interaction.toolResults) {
+      const started = callAt.get(result.toolCallId);
+      if (started !== undefined && result.observedAtUnixNs) {
+        try {
+          if (BigInt(result.observedAtUnixNs) < started) continue;
+        } catch { continue; }
+      }
+      resolved.add(result.toolCallId);
+    }
+  }
+  return resolved;
+}
+
 export function projectSemanticConversationTimeline(
   conversation: T.AgentConversationSummary,
   interactions: T.AgentInteractionRecord[],
@@ -433,8 +463,11 @@ export function projectSemanticConversationTimeline(
   const resultKeys = new Set<string>();
   const observedResultIds = new Set<string>();
   const observedUserItemIds = new Set<string>();
-  const resolvedToolCallIds = new Set(ordered.flatMap((interaction) =>
-    interaction.toolResults.map((result) => result.toolCallId)));
+  const resolvedToolCallIds = resolvedToolCallIdsForTimeline(ordered);
+  const unknownToolCallIds = new Set(ordered.flatMap((interaction) =>
+    interaction.toolResults
+      .filter((result) => typeof result.isError !== 'boolean')
+      .map((result) => result.toolCallId)));
   let previousUserLineage: string[] = [];
   const turns = new Map<string, {
     ordinal: number;
@@ -570,9 +603,10 @@ export function projectSemanticConversationTimeline(
     }
     const unresolvedToolCall = interaction.toolCalls.some((call) =>
       !resolvedToolCallIds.has(call.toolCallId));
-    const resolvedToolPending = interaction.statusCode < 400
-      && interaction.toolCalls.length > 0
-      && !unresolvedToolCall
+      const resolvedToolPending = interaction.statusCode < 400
+        && interaction.toolCalls.length > 0
+        && !unresolvedToolCall
+        && !interaction.toolCalls.some((call) => unknownToolCallIds.has(call.toolCallId))
       && (
         interaction.conversationCompleteness === 'tool_pending'
         || interaction.partialReasons.includes('tool_result_pending')

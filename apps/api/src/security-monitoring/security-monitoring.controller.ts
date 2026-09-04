@@ -1437,11 +1437,12 @@ function semanticToolHints(event: T.JudgedEvent): {
   toolName?: string;
   endpoint?: string;
   completed: boolean;
-  isError: boolean;
+  isError?: boolean;
   resultHash?: string;
   exitCode?: number;
   endedAtUnixNs?: string;
 } {
+  const networkEndpointProtocols = new Set(['http:', 'https:', 'ws:', 'wss:', 'grpc:', 'grpcs:', 'tcp:', 'tls:']);
   const attributes = event.attributes ?? {};
   const toolCallId = event.toolCallId
     ?? attrText(attributes, 'anysentry.tool.call.id', 'gen_ai.tool.call.id', 'tool_call.id', 'tool.id');
@@ -1487,6 +1488,9 @@ function semanticToolHints(event: T.JudgedEvent): {
         ? rawEndpoint.includes('://') ? rawEndpoint : `http://${rawEndpoint}`
         : `http://unknown${boundedPort ? `:${boundedPort}` : ''}`;
       const parsed = new URL(candidate);
+      if (rawEndpoint?.includes('://') && !networkEndpointProtocols.has(parsed.protocol)) {
+        throw new Error('non-network endpoint scheme');
+      }
       const host = parsed.hostname.trim();
       if (host) {
         const port = parsed.port || boundedPort;
@@ -1499,13 +1503,16 @@ function semanticToolHints(event: T.JudgedEvent): {
     } catch {
       // Keep an opaque service/host hint only; never carry userinfo, query or fragment into the
       // canonical interaction where it could expose a token or unbounded producer payload.
-      const opaque = rawEndpoint
-        ?.replace(/^[a-z][a-z0-9+.-]*:\/\//iu, '')
-        .split(/[?#]/u)[0]
-        .replace(/^[^/@]+@/u, '')
-        .replace(/[\s"'`,;]/gu, '')
-        .slice(0, 240);
-      if (opaque) endpoint = `http://${opaque}${boundedPort && !/:\d{1,5}$/u.test(opaque) ? `:${boundedPort}` : ''}`;
+      const explicitProtocol = rawEndpoint?.match(/^([a-z][a-z0-9+.-]*):\/\//iu)?.[1]?.toLowerCase();
+      if (!explicitProtocol || networkEndpointProtocols.has(`${explicitProtocol}:`)) {
+        const opaque = rawEndpoint
+          ?.replace(/^[a-z][a-z0-9+.-]*:\/\//iu, '')
+          .split(/[?#]/u)[0]
+          .replace(/^[^/@]+@/u, '')
+          .replace(/[\s"'`,;]/gu, '')
+          .slice(0, 240);
+        if (opaque) endpoint = `http://${opaque}${boundedPort && !/:\d{1,5}$/u.test(opaque) ? `:${boundedPort}` : ''}`;
+      }
     }
   }
   const exitCode = attrNumber(attributes, 'anysentry.tool.exit_code', 'tool.exit_code', 'process.exit_code', 'exit_code');
@@ -1526,6 +1533,12 @@ function semanticToolHints(event: T.JudgedEvent): {
   const endedAtMs = spanEnd
     ?? (event.latencyMs > 0 && event.latencyMs <= 24 * 60 * 60_000
       ? event.at + event.latencyMs : undefined);
+  const hasErrorSignal = Object.prototype.hasOwnProperty.call(attributes, 'anysentry.tool.is_error')
+    || Object.prototype.hasOwnProperty.call(attributes, 'tool.is_error')
+    || Object.prototype.hasOwnProperty.call(attributes, 'error.type')
+    || Object.prototype.hasOwnProperty.call(attributes, 'error.message')
+    || exitCode !== undefined
+    || Boolean(status);
   const explicitError = attributes['anysentry.tool.is_error'] === true
     || attributes['tool.is_error'] === true
     || (typeof attributes['error.type'] === 'string' && Boolean(attributes['error.type']))
@@ -1539,12 +1552,20 @@ function semanticToolHints(event: T.JudgedEvent): {
     || resultHash !== undefined
     || spanEnd !== undefined
     || terminalLifecycle;
+  const normalizedEventKind = event.eventKind.trim().toLowerCase().replace(/[\s.-]+/gu, '_');
+  const isError = hasErrorSignal
+    ? explicitError || (exitCode !== undefined && exitCode !== 0)
+    // A completed AgentTool span with an explicit end is a successful completion only when no
+    // error signal was supplied. A standalone ToolResult without a status/exit/error bit remains
+    // unknown so the timeline cannot silently display success.
+    : completed && ['agenttool', 'agent_tool', 'toolcall', 'tool_call'].includes(normalizedEventKind)
+      ? false : undefined;
   return {
     ...(toolCallId ? { toolCallId } : {}),
     ...(toolName ? { toolName } : {}),
     ...(endpoint ? { endpoint } : {}),
     completed,
-    isError: explicitError || (exitCode !== undefined && exitCode !== 0),
+    ...(isError !== undefined ? { isError } : {}),
     ...(resultHash ? { resultHash } : {}),
     ...(exitCode !== undefined ? { exitCode } : {}),
     ...(endedAtMs !== undefined && Number.isFinite(endedAtMs) && endedAtMs >= 0
@@ -1779,12 +1800,25 @@ function canonicalInteractionForSemanticEvent(event: T.JudgedEvent): T.AgentInte
     payloadRef,
     contentState: 'reference_only',
   };
-  const userMessage = normalizedKind === 'usermessage' || normalizedKind === 'user_message';
-  const modelMessage = ['modelmessage', 'model_message', 'llmresponse', 'llm_response', 'llmcall', 'llm_call']
+  const userMessage = [
+    'usermessage', 'user_message', 'userinput', 'user_input', 'humanmessage', 'human_message',
+    'inputmessage', 'input_message',
+  ].includes(normalizedKind);
+  const modelMessage = [
+    'modelmessage', 'model_message', 'llmresponse', 'llm_response', 'llmcall', 'llm_call',
+    'llmapi', 'llm_api', 'llminteraction', 'llm_interaction', 'modelresponse', 'model_response',
+    'assistantmessage', 'assistant_message', 'assistantoutput', 'assistant_output', 'finalresponse',
+    'final_response',
+  ]
     .includes(normalizedKind);
-  const toolCallEvent = normalizedKind === 'agenttool' || normalizedKind === 'agent_tool'
-    || normalizedKind === 'toolcall' || normalizedKind === 'tool_call';
-  const toolResultEvent = normalizedKind === 'toolresult' || normalizedKind === 'tool_result';
+  const toolCallEvent = [
+    'agenttool', 'agent_tool', 'toolcall', 'tool_call', 'functioncall', 'function_call',
+    'executetool', 'execute_tool', 'tool',
+  ].includes(normalizedKind);
+  const toolResultEvent = [
+    'toolresult', 'tool_result', 'functionresult', 'function_result', 'agenttoolresult',
+    'agent_tool_result', 'noderesult', 'node_result',
+  ].includes(normalizedKind);
   const toolHints = semanticToolHints(event);
   const toolCallId = toolHints.toolCallId
     ?? (toolCallEvent || toolResultEvent
@@ -1982,7 +2016,7 @@ function canonicalInteractionForSemanticEvent(event: T.JudgedEvent): T.AgentInte
                 toolHints,
               )
             : contentMarker,
-          isError: toolHints.isError,
+          ...(toolHints.isError !== undefined ? { isError: toolHints.isError } : {}),
           observedAtUnixNs: toolResultAtUnixNs,
         }]
       : [],
@@ -12228,6 +12262,30 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         if (matched?.conversationId) {
           session = { ...session, conversationId: matched.conversationId };
           conversationId = matched.conversationId;
+        } else {
+          // `agentInteractions` is intentionally a raw read and may not yet carry the V2 binding
+          // fields. A bounded summary read applies that resolver and can bridge a membership-only
+          // Session through its canonical/session/provider/runtime aliases.
+          const summaries = await this.agg.agentConversations({
+            timeType: query.timeType,
+            startTime: query.startTime,
+            endTime: query.endTime,
+            snapshotAsOf: query.snapshotAsOf,
+            scope: 'raw',
+            classificationView: query.classificationView,
+            agentInstanceId: session.agentInstanceIds[0],
+            limit: 500,
+          });
+          const summary = summaries.items.find((candidate) =>
+            [candidate.sessionId, candidate.conversationId].includes(session!.sessionId)
+            || Boolean(session!.sessionKey && candidate.sessionKey === session!.sessionKey)
+            || Boolean(session!.providerSessionIdHash
+              && candidate.providerSessionIdHash === session!.providerSessionIdHash)
+            || candidate.agentInstanceIds.some((id) => session!.agentInstanceIds.includes(id)));
+          if (summary?.conversationId) {
+            session = { ...session, conversationId: summary.conversationId };
+            conversationId = summary.conversationId;
+          }
         }
       } catch (error) {
         if (!isCanonicalProjectionDegradation(error)) throw error;
@@ -12287,6 +12345,45 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       if (!isCanonicalProjectionDegradation(error)) throw error;
       timelineDegraded = true;
       timeline = degradedCanonicalTimeline(conversationId, query, sessions.revision);
+    }
+    // A freshly committed membership may become visible before the compatibility interaction
+    // projection. Retry the exact interaction reference briefly instead of caching an empty
+    // timeline as a successful Session read. The loop is bounded and remains read-only.
+    if (timeline && timeline.turns.length === 0 && session.interactionIds.length > 0) {
+      for (let attempt = 0; attempt < 8 && timeline.turns.length === 0; attempt += 1) {
+        try {
+          const exactInteraction = await withCanonicalProjectionTimeout(this.agg.agentInteractions({
+            timeType: query.timeType,
+            startTime: query.startTime,
+            endTime: query.endTime,
+            snapshotAsOf: query.snapshotAsOf,
+            scope: 'raw',
+            classificationView: query.classificationView,
+            interactionId: session.interactionIds[0],
+            limit: 2,
+          }), 1_000);
+          const matched = exactInteraction.items.find((item) => item.conversationId);
+          if (matched?.conversationId && matched.conversationId !== conversationId) {
+            conversationId = matched.conversationId;
+            session = { ...session, conversationId };
+          }
+          if (matched?.conversationId) {
+            timeline = await withCanonicalProjectionTimeout(this.agg.agentConversationTimelineV3({
+              timeType: query.timeType,
+              startTime: query.startTime,
+              endTime: query.endTime,
+              snapshotAsOf: query.snapshotAsOf,
+              scope: 'raw',
+              classificationView: query.classificationView,
+              conversationId,
+              limit: query.limit,
+            }), CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS);
+          }
+        } catch (error) {
+          if (!isCanonicalProjectionDegradation(error)) throw error;
+        }
+        if (timeline.turns.length === 0) await new Promise((resolve) => setTimeout(resolve, 250));
+      }
     }
     const coverage = timelineDegraded
       ? canonicalCoverage(true, [

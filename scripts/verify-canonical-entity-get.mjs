@@ -380,6 +380,16 @@ try {
   }).toString();
   const timelineEvidence = await get(`/v1/semantic-events/${encodeURIComponent(toolEvent.semanticEventId)}/evidence${evidenceScope ? `?${evidenceScope}` : ''}`);
   assert.equal(timelineEvidence.requestedSemanticEventId, toolEvent.semanticEventId);
+  if (timelineEvidence.resolvedSemanticEventId !== toolEvent.semanticEventId) {
+    console.log(JSON.stringify({
+      requested: toolEvent.semanticEventId,
+      resolved: timelineEvidence.resolvedSemanticEventId,
+      relationStatus: timelineEvidence.relationStatus,
+      coverage: timelineEvidence.coverage,
+      dataSource: timelineEvidence.dataSource,
+      aliasCandidates: timelineEvidence.aliasCandidates,
+    }));
+  }
   assert.equal(timelineEvidence.resolvedSemanticEventId, toolEvent.semanticEventId);
   assert(timelineEvidence.aliasCandidates?.includes(durableToolRecord.semanticRecordId)
     || timelineEvidence.aliasOf === durableToolRecord.semanticRecordId,

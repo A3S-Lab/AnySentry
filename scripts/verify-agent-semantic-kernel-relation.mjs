@@ -363,6 +363,22 @@ assert.equal(placeholderEndpointRelations[0].status, 'semantic_only',
   'the application:// placeholder must not be treated as a network endpoint');
 assert.equal(placeholderEndpointRelations[0].kernelEventId, undefined,
   'a same-named Egress cannot satisfy a missing semantic endpoint');
+const placeholderContentCall = {
+  ...httpToolCall,
+  semanticEventId: 'se_semantic_placeholder_content',
+  content: { url: 'application://semantic-event' },
+};
+const placeholderContentRelations = buildSemanticKernelRelations(
+  placeholderContentCall,
+  toolResult,
+  { ...semanticOnlyHttpInteraction, endpoint: 'unknown' },
+  [placeholderEndpointCandidate],
+  13,
+  false,
+);
+assert.equal(placeholderContentRelations[0].status, 'semantic_only',
+  'non-network tool URL schemes must not become endpoint correlation hints');
+assert.equal(placeholderContentRelations[0].kernelEventId, undefined);
 const sameHostWrongPort = {
   ...resolvedServiceEgress,
   eventId: 'evt_same_host_wrong_port',
