@@ -1938,6 +1938,17 @@ function dedupeRuntimeSnapshotEntries(processEntries, workloadEntries) {
       rememberCandidate(entry, source, 'runtime_snapshot_duplicate_entry', key);
       return;
     }
+    if (source === 'process') {
+      const sameId = id && processById.get(id);
+      if (sameId && runtimeSnapshotEntryKey(sameId) !== key) {
+        // The API's transition validator treats a repeated reported ID as an identity alias when
+        // roots differ. Do not send an entry that would poison the whole snapshot; retain the
+        // second generation as an explicit conflict candidate for a later resolver revision.
+        conflicts += 1;
+        rememberCandidate(entry, source, 'runtime_snapshot_generation_collision', key);
+        return;
+      }
+    }
     if (source === 'workload') {
       const sameId = id && processById.get(id);
       const samePhysical = physical && processPhysical.get(physical);
@@ -1959,11 +1970,13 @@ function dedupeRuntimeSnapshotEntries(processEntries, workloadEntries) {
         return;
       }
       // Same reported ID or physical workload with a different complete root is a possible
-      // restart/generation boundary. Keep it as a separate valid entry and surface the collision;
-      // never silently merge generations just to satisfy the uniqueness check.
+      // restart/generation boundary. The strict API transition contract cannot accept two records
+      // carrying the same reported ID in one snapshot, so retain the candidate/coverage evidence
+      // and defer the second generation until a resolver revision can represent aliases safely.
       if (sameId || samePhysical) {
         conflicts += 1;
         rememberCandidate(entry, source, 'runtime_snapshot_generation_collision', key);
+        return;
       }
     }
     seenKeys.set(key, entry);

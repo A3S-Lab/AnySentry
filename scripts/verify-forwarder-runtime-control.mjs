@@ -421,7 +421,12 @@ const processRoot = {
   rootPid: 101,
   rootStartTimeTicks: '1001',
 };
-const processRestart = { ...processRoot, rootPid: 102, rootStartTimeTicks: '1002' };
+const processRestart = {
+  ...processRoot,
+  agentInstanceId: 'ari-restart',
+  rootPid: 102,
+  rootStartTimeTicks: '1002',
+};
 const duplicateWorkload = {
   agentInstanceId: 'ari-shared',
   hostId: 'node-a',
@@ -430,7 +435,7 @@ const duplicateWorkload = {
   rootStartTimeTicks: '1001',
 };
 const generationWorkload = {
-  ...processRestart,
+  ...processRoot,
   physicalWorkloadId: 'k8s:cluster:pod-a:container-a',
   rootPid: 103,
   rootStartTimeTicks: '1003',
@@ -439,12 +444,12 @@ const dedupedSnapshot = dedupeRuntimeSnapshotEntries(
   [processRoot, processRestart],
   [duplicateWorkload, generationWorkload],
 );
-assert.equal(dedupedSnapshot.entries.length, 3, 'same-root workload aliases are removed without merging generations');
+assert.equal(dedupedSnapshot.entries.length, 2, 'same-root workload aliases are removed without poisoning the snapshot');
 assert.equal(dedupedSnapshot.duplicates, 1);
-assert.equal(dedupedSnapshot.conflicts, 1, 'different root generations remain separate');
+assert.equal(dedupedSnapshot.conflicts, 1, 'different root generations remain explicit candidates');
 assert.equal(
   new Set(dedupedSnapshot.entries.map((entry) => runtimeSnapshotEntryKey(entry))).size,
-  3,
+  2,
   'strict runtime snapshot keys remain unique',
 );
 assert.equal(dedupedSnapshot.coverageGaps.length, 2);
