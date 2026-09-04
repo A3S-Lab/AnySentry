@@ -1920,6 +1920,13 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       spoolWalBytes: 8192,
       spoolOldestAgeMs: 65_000,
       spoolAtCapacity: false,
+      spoolWalAtCapacity: false,
+      spoolWalPutAtCapacity: true,
+      spoolMaxWalBytes: 4 * 1024 * 1024 * 1024,
+      spoolAckHeadroomBytes: 64 * 1024 * 1024,
+      spoolPendingWriteBytes: 1024,
+      spoolWalCapacityRejects: 3,
+      spoolWalAckErrors: 1,
       spoolFsyncMode: 'always',
       controlPlaneState: 'degraded',
       controlPlaneFailedLanes: ['runtime_snapshot', 'untrusted_lane'],
@@ -2068,6 +2075,13 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       health.items?.[0]?.filterMetrics?.spoolRecords === 11 &&
       health.items?.[0]?.filterMetrics?.spoolParkedRecords === 4 &&
       health.items?.[0]?.filterMetrics?.spoolOldestAgeMs === 65_000 &&
+      health.items?.[0]?.filterMetrics?.spoolWalAtCapacity === false &&
+      health.items?.[0]?.filterMetrics?.spoolWalPutAtCapacity === true &&
+      health.items?.[0]?.filterMetrics?.spoolMaxWalBytes === 4 * 1024 * 1024 * 1024 &&
+      health.items?.[0]?.filterMetrics?.spoolAckHeadroomBytes === 64 * 1024 * 1024 &&
+      health.items?.[0]?.filterMetrics?.spoolPendingWriteBytes === 1024 &&
+      health.items?.[0]?.filterMetrics?.spoolWalCapacityRejects === 3 &&
+      health.items?.[0]?.filterMetrics?.spoolWalAckErrors === 1 &&
       health.items?.[0]?.filterMetrics?.spoolFsyncMode === 'always' &&
       health.items?.[0]?.filterMetrics?.controlPlaneState === 'degraded' &&
       health.items?.[0]?.filterMetrics?.controlPlaneFailedLanes?.[0] === 'runtime_snapshot' &&

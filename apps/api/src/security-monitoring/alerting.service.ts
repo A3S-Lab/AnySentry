@@ -717,6 +717,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       : droppedDelta > 0 ||
         (metrics?.protectedQueueDropped ?? 0) > 0 ||
         metrics?.spoolAtCapacity === true ||
+        metrics?.spoolWalAtCapacity === true ||
         ((metrics?.spoolRecords ?? 0) > 0 && (metrics?.spoolOldestAgeMs ?? 0) >= 60_000);
     const softFailure = !hardFailure && qualityOrigin === 'forwarder' && (
       heartbeat.status !== 'ok' ||
@@ -725,7 +726,8 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       (metrics?.queueParked ?? 0) > 0 ||
       (metrics?.retryParked ?? 0) > 0 ||
       (metrics?.heartbeatDeliveryFailures ?? 0) > 0 ||
-      (metrics?.spoolParkedRecords ?? 0) > 0
+      (metrics?.spoolParkedRecords ?? 0) > 0 ||
+      metrics?.spoolWalPutAtCapacity === true
     );
     const streak = this.collectorQualityStreak.get(qualityKey) ?? { bad: 0, clean: 0 };
     if (hardFailure) {

@@ -3626,6 +3626,15 @@ export interface CollectorFilterMetrics {
   spoolWalBytes?: number;
   spoolOldestAgeMs?: number;
   spoolAtCapacity?: boolean;
+  /** Physical journal hard ceiling; ACK admission remains available until this is true. */
+  spoolWalAtCapacity?: boolean;
+  /** PUT admission has reached the reserved ACK headroom (preemptive backpressure). */
+  spoolWalPutAtCapacity?: boolean;
+  spoolMaxWalBytes?: number;
+  spoolAckHeadroomBytes?: number;
+  spoolPendingWriteBytes?: number;
+  spoolWalCapacityRejects?: number;
+  spoolWalAckErrors?: number;
   spoolFsyncMode?: 'always' | 'periodic';
   /** Serialized bytes currently waiting in the ordinary priority queue. */
   queueBytes?: number;

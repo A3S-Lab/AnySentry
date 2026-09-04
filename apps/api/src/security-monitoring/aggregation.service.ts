@@ -261,7 +261,7 @@ function deliveryEvaluation(heartbeat: T.CollectorHeartbeatRecord): CollectorCha
   const soft: string[] = [];
   if (heartbeat.outputDropped > 0) hard.push('permanent_output_loss');
   if ((metrics.protectedQueueDropped ?? 0) > 0) hard.push('protected_queue_pressure');
-  if (metrics.spoolAtCapacity) hard.push('spool_at_capacity');
+  if (metrics.spoolAtCapacity || metrics.spoolWalAtCapacity) hard.push('spool_at_capacity');
   if ((metrics.spoolRecords ?? 0) > 0 && (metrics.spoolOldestAgeMs ?? 0) >= 60_000) {
     hard.push('spool_backlog_over_slo');
   }
@@ -269,6 +269,7 @@ function deliveryEvaluation(heartbeat: T.CollectorHeartbeatRecord): CollectorCha
   if ((metrics.retryParked ?? 0) > 0) soft.push('retry_parked');
   if ((metrics.heartbeatDeliveryFailures ?? 0) > 0) soft.push('heartbeat_delivery_failed');
   if ((metrics.spoolParkedRecords ?? 0) > 0) soft.push('spool_backlog');
+  if (metrics.spoolWalPutAtCapacity) soft.push('spool_wal_ack_headroom');
   if ((metrics.outstandingOldestAgeMs ?? 0) >= 30_000) soft.push('delivery_backlog_aged');
   return hard.length
     ? { severity: 2, reasons: hard }
