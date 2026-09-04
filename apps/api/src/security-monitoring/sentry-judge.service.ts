@@ -551,9 +551,23 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     64 * 1024 * 1024,
   );
   private readonly processLifecycleById = new Map<string, ProcessLifecycleFact>();
-  private readonly MAX_PROCESS_LIFECYCLE_FACTS = 10_000;
+  private readonly MAX_PROCESS_LIFECYCLE_FACTS = boundedEnvInt(
+    'ANYSENTRY_HOT_PROCESS_LIFECYCLE_LIMIT',
+    10_000,
+    1_000,
+    100_000,
+  );
+  // `process_lifecycle_facts` is ordered by process identity, not event time.  A cold startup
+  // scan over a busy table can therefore read millions of rows and starve the API even when the
+  // requested window is only a few minutes.  Hydration is an optional cache warm-up; durable
+  // point lookups and the append-only KernelFact lane remain available when it is disabled.
+  private readonly PROCESS_LIFECYCLE_HYDRATE = ['1', 'true', 'yes', 'on'].includes(
+    process.env.ANYSENTRY_PROCESS_LIFECYCLE_HYDRATE?.trim().toLowerCase() ?? '',
+  );
   private processLifecycleTruncated = false;
   private processLifecycleHydratedFromStorage = false;
+  private processLifecycleHydrationSkipped = false;
+  private processLifecycleEvictions = 0;
   private timer?: NodeJS.Timeout;
   private readonly ch = new ClickHouseStore();
   private readonly incidents = new Map<string, Incident>();
@@ -591,15 +605,19 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         historicalScopes.push({ event: rec, incidentId: this.incidentId(rec) });
       }
       this.alerting.backfillEventScopes(historicalScopes);
-      const lifecycleFacts = await this.ch.readRecentProcessLifecycleFacts(
-        Date.now() - 30 * 60_000,
-        Date.now(),
-        this.MAX_PROCESS_LIFECYCLE_FACTS,
-      );
-      if (lifecycleFacts) {
-        this.processLifecycleHydratedFromStorage = true;
-        this.processLifecycleTruncated ||= lifecycleFacts.length >= this.MAX_PROCESS_LIFECYCLE_FACTS;
-        this.rememberProcessLifecycleFacts(lifecycleFacts);
+      if (this.PROCESS_LIFECYCLE_HYDRATE) {
+        const lifecycleFacts = await this.ch.readRecentProcessLifecycleFacts(
+          Date.now() - 30 * 60_000,
+          Date.now(),
+          this.MAX_PROCESS_LIFECYCLE_FACTS,
+        );
+        if (lifecycleFacts) {
+          this.processLifecycleHydratedFromStorage = true;
+          this.processLifecycleTruncated ||= lifecycleFacts.length >= this.MAX_PROCESS_LIFECYCLE_FACTS;
+          this.rememberProcessLifecycleFacts(lifecycleFacts);
+        }
+      } else {
+        this.processLifecycleHydrationSkipped = true;
       }
       this.applyIncidentState(await this.ch.loadIncidentState());
       const heartbeats = await this.ch.loadCollectorHeartbeats();
@@ -1522,6 +1540,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     total: number;
     truncated: boolean;
     hydratedFromStorage: boolean;
+    hydrationMode?: 'enabled' | 'skipped_pressure_guard';
+    evictions?: number;
   } {
     const matching = [...this.processLifecycleById.values()]
       .filter((fact) => fact.at >= sinceMs && fact.at <= untilMs)
@@ -1532,6 +1552,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       total: matching.length,
       truncated: this.processLifecycleTruncated || matching.length > boundedLimit,
       hydratedFromStorage: this.processLifecycleHydratedFromStorage,
+      hydrationMode: this.processLifecycleHydrationSkipped ? 'skipped_pressure_guard' : 'enabled',
+      evictions: this.processLifecycleEvictions,
     };
   }
 
@@ -1548,11 +1570,16 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     for (const fact of facts) this.processLifecycleById.set(fact.factId, structuredClone(fact));
     if (this.processLifecycleById.size <= this.MAX_PROCESS_LIFECYCLE_FACTS) return;
     this.processLifecycleTruncated = true;
-    const keep = [...this.processLifecycleById.values()]
-      .sort((left, right) => right.at - left.at || right.factId.localeCompare(left.factId))
-      .slice(0, this.MAX_PROCESS_LIFECYCLE_FACTS);
-    this.processLifecycleById.clear();
-    for (const fact of keep) this.processLifecycleById.set(fact.factId, fact);
+    const overflow = this.processLifecycleById.size - this.MAX_PROCESS_LIFECYCLE_FACTS;
+    // Evict individual oldest entries.  Do not call Map.clear(): a global clear would discard
+    // unrelated recent generations in one pressure event and would make the loss invisible to
+    // callers that rely on the append-only durable lane for later replay.
+    const oldest = [...this.processLifecycleById.entries()]
+      .sort(([, left], [, right]) => left.at - right.at || left.factId.localeCompare(right.factId))
+      .slice(0, overflow);
+    for (const [factId] of oldest) {
+      if (this.processLifecycleById.delete(factId)) this.processLifecycleEvictions += 1;
+    }
   }
 
   async commitPreparedBatch(

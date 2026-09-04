@@ -868,17 +868,24 @@ function inspectBoundedStateGuard() {
   const rememberStart = attribution.indexOf('private remember(');
   const remember = rememberStart >= 0 ? attribution.slice(rememberStart, rememberStart + 2_400) : '';
   const observerMain = readText('a3s-observer-collector/src/main.rs', observerRoot);
+  const judge = readText('apps/api/src/security-monitoring/sentry-judge.service.ts');
+  const lifecycleStart = judge.indexOf('private rememberProcessLifecycleFacts');
+  const lifecycle = lifecycleStart >= 0 ? judge.slice(lifecycleStart, lifecycleStart + 3_500) : '';
   const attributionSafe = remember.length > 0
     && !/this\.procs\.clear\(\)/u.test(remember)
     && /evicted/u.test(attribution)
     && /expired/u.test(attribution);
   const observerSafe = !/(?:peers|llm_meta)[\s\S]{0,500}\.clear\(\)/u.test(observerMain);
-  if (attributionSafe && observerSafe) {
+  const lifecycleSafe = lifecycle.length > 0
+    && !/processLifecycleById\.clear\(\)/u.test(lifecycle)
+    && /processLifecycleEvictions/u.test(lifecycle);
+  if (attributionSafe && observerSafe && lifecycleSafe) {
     return result(STATUS.PASS, 'pressure paths use bounded eviction/TTL counters instead of global clear');
   }
   return result(STATUS.FAIL, 'a pressure path may globally clear state or lacks eviction accounting', {
     attributionRememberSafe: attributionSafe,
     observerSocketStateSafe: observerSafe,
+    lifecycleRememberSafe: lifecycleSafe,
   });
 }
 

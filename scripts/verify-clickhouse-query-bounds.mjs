@@ -536,12 +536,26 @@ const clickhouseSource = await readFile(
   new URL('../apps/api/src/security-monitoring/clickhouse-store.ts', import.meta.url),
   'utf8',
 );
+const judgeSource = await readFile(
+  new URL('../apps/api/src/security-monitoring/sentry-judge.service.ts', import.meta.url),
+  'utf8',
+);
 assert.match(clickhouseSource, /BOUNDED_PROCESS_LIFECYCLE_READ_SETTINGS/);
 assert.match(clickhouseSource, /max_memory_usage: String\(96 \* 1024 \* 1024\)/);
 assert.match(
   clickhouseSource,
   /async readRecentProcessLifecycleFacts[\s\S]*?clickhouse_settings: BOUNDED_PROCESS_LIFECYCLE_READ_SETTINGS/u,
 );
+assert.match(judgeSource, /ANYSENTRY_PROCESS_LIFECYCLE_HYDRATE/u,
+  'process-lifecycle cold hydration must be an explicit opt-in under a time-unindexed table');
+const lifecycleRemember = judgeSource.slice(
+  judgeSource.indexOf('private rememberProcessLifecycleFacts'),
+  judgeSource.indexOf('async commitPreparedBatch'),
+);
+assert.doesNotMatch(lifecycleRemember, /processLifecycleById\.clear\(\)/u,
+  'process lifecycle pressure must evict individual entries instead of globally clearing history');
+assert.match(lifecycleRemember, /processLifecycleEvictions/u,
+  'process lifecycle evictions must remain observable');
 const eventWindowMethod = aggregationSource.slice(
   aggregationSource.indexOf('async agentEventsForWindow'),
   aggregationSource.indexOf('async storedAgentEvents'),

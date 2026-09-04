@@ -349,6 +349,11 @@ spec:
             # Keep the synchronous dashboard hot set bounded; durable history remains in ClickHouse.
             - { name: ANYSENTRY_HOT_EVENT_LIMIT, value: "5000" }
             - { name: ANYSENTRY_OBSERVER_BODY_LIMIT, value: "16mb" }
+            # A process-lifecycle table is ordered by process identity rather than event time.
+            # Hydrating a recent wall-clock window can scan millions of rows on a long-lived
+            # single-node store and is therefore an opt-in cache warm-up. Durable KernelFacts and
+            # point context reads remain enabled when this guard is off.
+            - { name: ANYSENTRY_PROCESS_LIFECYCLE_HYDRATE, value: "off" }
             # The installer creates this independently from image/manifests. It protects Source
             # bootstrap and Capture Profile policy/materialization endpoints without committing a
             # credential to Git.
@@ -394,23 +399,24 @@ spec:
             # Optional: drive the dashboard with a synthetic event mix for a demo (sentry still
             # really judges it). Leave unset to show only real ingested events.
             # - { name: ANYSENTRY_SYNTHETIC_FEED, value: "on" }
-          # Startup can include ClickHouse schema initialization and event hydration. Kubernetes
-          # suppresses readiness/liveness checks until this succeeds (up to three minutes).
+          # Startup only proves that the HTTP process can bind. Readiness may report a degraded
+          # durable store, while liveness must not kill a healthy process merely because a wide
+          # dashboard/ClickHouse request temporarily delays the event loop.
           startupProbe:
-            httpGet: { path: /security-center/healthz, port: 29653 }
+            httpGet: { path: /security-center/livez, port: 29653 }
             periodSeconds: 5
-            timeoutSeconds: 5
-            failureThreshold: 36
+            timeoutSeconds: 10
+            failureThreshold: 60
           readinessProbe:
             httpGet: { path: /security-center/healthz, port: 29653 }
             periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 3
+            timeoutSeconds: 15
+            failureThreshold: 6
           livenessProbe:
-            httpGet: { path: /security-center/healthz, port: 29653 }
-            periodSeconds: 20
-            timeoutSeconds: 5
-            failureThreshold: 3
+            httpGet: { path: /security-center/livez, port: 29653 }
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
           resources:
             requests: { cpu: 500m, memory: 512Mi }
             limits: { cpu: "2", memory: 2Gi }
