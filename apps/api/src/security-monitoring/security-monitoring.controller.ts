@@ -10824,8 +10824,33 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     if (!id) throw new BadRequestException('factId is invalid');
     const fact = await this.canonicalObservability.getDurableKernelFact(id);
     if (!fact) throw new NotFoundException('kernel fact not found');
-    const context = await this.agg.agentKernelSemanticContext(fact.eventId ?? id);
-    return { schemaVersion: 'anysentry.kernel_fact.context.v1', fact, context, revision: this.canonicalCurrentRevision(), updateTime: new Date().toISOString() };
+    let context: T.AgentKernelSemanticContextResponse;
+    let coverage: T.CanonicalEntityCoverage;
+    try {
+      context = await this.agg.agentKernelSemanticContext(fact.eventId ?? id);
+      coverage = canonicalCoverage(false, [], 'relational_semantic_relation_projection');
+    } catch (error) {
+      if (!isCanonicalProjectionDegradation(error)) throw error;
+      // The immutable KernelFact remains authoritative even if the optional relation projector
+      // is unavailable. Return an explicit empty context/coverage gap instead of masking the fact
+      // behind an HTTP 500 or making the UI retry an unbounded query.
+      context = {
+        schemaVersion: 'anysentry.agent_kernel_semantic_context.v1',
+        eventId: fact.eventId ?? id,
+        relations: [],
+        conversationLinks: [],
+        updateTime: new Date().toISOString(),
+      };
+      coverage = canonicalCoverage(true, ['kernel_semantic_context_unavailable'], 'relational_semantic_relation_projection');
+    }
+    return {
+      schemaVersion: 'anysentry.kernel_fact.context.v1',
+      fact,
+      context,
+      coverage,
+      revision: this.canonicalCurrentRevision(),
+      updateTime: new Date().toISOString(),
+    };
   }
 
   @Get('v1/observability/contracts')

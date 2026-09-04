@@ -318,6 +318,13 @@ try {
   assert.equal(durableEvidence.requestedSemanticEventId, durableToolRecord.semanticRecordId);
   assert.equal(durableEvidence.resolvedSemanticEventId, toolEvent.semanticEventId);
   assert.equal(durableEvidence.aliasOf, durableToolRecord.semanticRecordId);
+  const kernelFacts = await get('/v1/kernel-facts?limit=1');
+  const kernelFact = kernelFacts.items?.[0];
+  if (kernelFact?.factId) {
+    const kernelContext = await get(`/v1/kernel-facts/${encodeURIComponent(kernelFact.factId)}/context`);
+    assert(kernelContext.coverage, 'KernelFact context must expose coverage metadata');
+    assert(kernelContext.context?.eventId, 'KernelFact context must retain the fact event identity');
+  }
   const expiredTimelineEvidence = await get('/v1/semantic-events/se_000000000000000000000000/evidence');
   assert.equal(expiredTimelineEvidence.relationStatus, 'coverage_gap');
   assert.equal(expiredTimelineEvidence.coverage.status, 'partial');
