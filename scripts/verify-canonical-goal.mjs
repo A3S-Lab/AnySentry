@@ -370,7 +370,7 @@ function processCount(patterns) {
   return counts;
 }
 
-function inspectHost() {
+function inspectHost(apiBase = 'http://127.0.0.1:29653/security-center') {
   const binaries = {
     node: binaryProbe('node'),
     pnpm: binaryProbe('pnpm', ['--version']),
@@ -388,7 +388,7 @@ function inspectHost() {
   const bpfDisabled = readText('/proc/sys/kernel/unprivileged_bpf_disabled', '/').trim();
   const collectorBinary = exists('dist/a3s-observer-collector', observerRoot) || exists('target/release/a3s-observer-collector', observerRoot);
   const collectorProcess = processCount(['a3s-observer-collector', 'observer-supervisor.js']);
-  const apiHealthPromise = probeHttp(process.env.ANYSENTRY_API_BASE || 'http://127.0.0.1:29653/security-center');
+  const apiHealthPromise = probeHttp(process.env.ANYSENTRY_API_BASE || apiBase);
   return apiHealthPromise.then((apiHealth) => ({
     status: apiHealth.status !== STATUS.PASS
       ? apiHealth.status
@@ -454,7 +454,7 @@ function parseDockerPs(text) {
   return rows;
 }
 
-function inspectDocker() {
+function inspectDocker(apiBase = 'http://127.0.0.1:29653/security-center') {
   const info = command('docker', ['info', '--format', '{{.ServerVersion}}'], { timeout: 12_000 });
   if (info.code !== 0) {
     return {
@@ -479,7 +479,7 @@ function inspectDocker() {
   const anysentry = containers.filter((row) =>
     !/dify|langgenius/iu.test(`${row.name} ${row.image}`) &&
     /(?:ghcr\.io\/[^\s/]+\/anysentry(?::|@)|127\.0\.0\.1:\d+\/anysentry(?::|@)|(?:^|[-_])anysentry-api(?:[-_:]|$)|(?:^|[-_])anysentry-anysentry(?:[-_:]|$))/iu.test(`${row.name} ${row.image}`));
-  const apiHealthPromise = probeHttp(process.env.ANYSENTRY_DOCKER_API_BASE || 'http://127.0.0.1:29653/security-center');
+  const apiHealthPromise = probeHttp(process.env.ANYSENTRY_DOCKER_API_BASE || apiBase);
   return apiHealthPromise.then((apiHealth) => ({
     status: anysentry.length > 0 && apiHealth.status === STATUS.PASS
       ? STATUS.PASS
@@ -983,6 +983,7 @@ async function runLocalTests() {
     { id: 'api-typescript', cwd: repoRoot, command: 'pnpm', args: ['--filter', '@anysentry/api', 'exec', 'tsc', '--noEmit'], timeout: TEST_TIMEOUT_MS },
     { id: 'web-typescript', cwd: repoRoot, command: 'pnpm', args: ['--filter', '@anysentry/web', 'exec', 'tsc', '--noEmit'], timeout: TEST_TIMEOUT_MS },
     { id: 'deployment-manifests', cwd: repoRoot, command: 'node', args: ['scripts/verify-deployment-manifests.mjs'], timeout: TEST_TIMEOUT_MS },
+    { id: 'canonical-goal-options', cwd: repoRoot, command: 'node', args: ['scripts/verify-canonical-goal-options.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'canonical-contract', cwd: repoRoot, command: 'node', args: ['scripts/verify-canonical-contract.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'canonical-observability', cwd: repoRoot, command: 'node', args: ['scripts/verify-canonical-observability.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'conversation-resolution', cwd: repoRoot, command: 'node', args: ['scripts/verify-agent-conversation-resolution-v2.mjs'], timeout: TEST_TIMEOUT_MS },
@@ -1059,8 +1060,8 @@ async function main() {
   const options = parseOptions(process.argv.slice(2));
   const beforeGit = snapshotGitStates();
   const [host, docker, kubernetes] = await Promise.all([
-    inspectHost(),
-    inspectDocker(),
+    inspectHost(options.apiBase),
+    inspectDocker(options.apiBase),
     inspectKubernetes(),
   ]);
   const ssh = inspectSsh();
