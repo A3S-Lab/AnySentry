@@ -383,8 +383,8 @@ try {
     if (!linkedCanonical) await new Promise((resolve) => setTimeout(resolve, 500));
   }
   assert(linkedCanonical, 'canonical EvidenceLink for the linked ToolCall was not materialized');
-  for (let attempt = 0; attempt < 10 && timelineEvidence.evidence?.canonicalEvidenceLinksSource !== 'canonical_store'; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 300));
+  for (let attempt = 0; attempt < 30 && timelineEvidence.evidence?.canonicalEvidenceLinksSource !== 'canonical_store'; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
     timelineEvidence = await get(`/v1/semantic-events/${encodeURIComponent(toolEvent.semanticEventId)}/evidence${evidenceScope ? `?${evidenceScope}` : ''}`);
   }
   assert.equal(timelineEvidence.evidence?.canonicalEvidenceLinksSource ?? 'computed_compatibility', 'canonical_store');

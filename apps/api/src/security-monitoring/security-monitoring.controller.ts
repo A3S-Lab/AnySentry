@@ -54,7 +54,7 @@ import { ObservedAssetLifecycleService } from './observed-asset-lifecycle.read.s
 import { parseObserverAgentInteraction } from './agent-interaction';
 import { OBSERVER_LEGACY_SOURCE_PAYLOAD_SHA256_ATTRIBUTE } from './clickhouse-store';
 import { captureClassificationDecision } from './identity-judgment-routing';
-import { AgentConversationBindingService } from './agent-conversation-binding.service';
+import { AgentConversationBindingService, trafficRoleForEvent } from './agent-conversation-binding.service';
 import { CanonicalObservabilityService } from './canonical-observability.service';
 import { CANONICAL_SESSION_ID_ALGORITHM_V1, SESSION_KEY_ALGORITHM_V1, SESSION_HASH_SECRET_MODE, canonicalParentSessionIdForMembership, canonicalSessionIdForMembership, createEvidenceLink, deriveAgentInstanceIdentity, deriveProcessGenerationKey, resolveSessionIdentity, validateKernelFact } from './canonical-observability';
 import { agentRuntimeInstanceIdForEvent } from './agent-identity';
@@ -1612,7 +1612,7 @@ function semanticToolResultMarker(
   };
 }
 
-function semanticTrafficRole(
+function semanticTrafficRoleLegacy(
   event: T.JudgedEvent,
   normalizedKind: string,
   hasHumanOrToolContent: boolean,
@@ -1674,6 +1674,16 @@ function semanticTrafficRole(
   return 'background';
 }
 
+function semanticTrafficRole(
+  event: T.JudgedEvent,
+  _normalizedKind: string,
+  _hasHumanOrToolContent: boolean,
+): NonNullable<T.AgentInteractionRecord['trafficRole']> {
+  // Both the canonical semantic projection and the storage-degradation fallback use the same
+  // generic resolver. Keep the legacy implementation above only for source-level rollback/debug.
+  return trafficRoleForEvent(event);
+}
+
 type UniversalSemanticKindClass = 'tool_call' | 'tool_result' | 'node_run' | 'llm_call' | 'user_message' | 'model_message';
 
 const UNIVERSAL_SEMANTIC_KIND_CLASSES: Readonly<Record<UniversalSemanticKindClass, ReadonlySet<string>>> = {
@@ -1727,7 +1737,10 @@ function canonicalSemanticRecordForEvent(
   ].filter((value): value is string => Boolean(value)))];
   const semanticClass = universalSemanticKindClass(event.eventKind);
   const toolHints = semanticToolHints(event);
-  const semanticToolCallId = toolHints.toolCallId;
+  const semanticToolCallId = toolHints.toolCallId
+    ?? (semanticClass === 'tool_call' || semanticClass === 'tool_result'
+      ? `tc_${createHash('sha256').update(event.eventId).digest('hex').slice(0, 24)}`
+      : undefined);
   const kind: SemanticRecord['kind'] = semanticClass === 'tool_call'
     ? 'tool_call'
     : semanticClass === 'node_run'
@@ -1817,6 +1830,7 @@ function canonicalSemanticRecordForEvent(
     completeness: 'partial',
     partialReasons: [
       'application_semantic_reference_only',
+      ...(toolHints.toolCallId || !semanticToolCallId ? [] : ['tool_call_id_inferred']),
       ...(event.rawObservationId ? [] : ['raw_observation_missing']),
     ],
     payloadRef: `sha256:${payloadHash}`,

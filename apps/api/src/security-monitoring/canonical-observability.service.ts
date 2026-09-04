@@ -877,7 +877,6 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
               sinkReadFailed = true;
               resolve([]);
             }, EVIDENCE_LINK_READ_TIMEOUT_MS);
-            timer.unref();
           }),
         ]))
           .flatMap((candidate) => {

@@ -136,7 +136,42 @@ export function semanticItemsForInteraction(
       const content = humanVisibleUserContent(item.content);
       return content === undefined ? [] : [{ ...item, content }];
     });
-    if ((interaction.semanticParserVersion ?? 1) >= 2) return retained;
+    if ((interaction.semanticParserVersion ?? 1) >= 2) {
+      const callIds = new Set(retained
+        .filter((item) => item.kind === 'tool_call' && item.toolCallId)
+        .map((item) => item.toolCallId));
+      const resultIds = new Set(retained
+        .filter((item) => item.kind === 'tool_result' && item.toolCallId)
+        .map((item) => item.toolCallId));
+      const reconciled: T.AgentInteractionSemanticItem[] = [...retained];
+      const completeness = interaction.completeness === 'complete' ? 'complete' as const : 'partial' as const;
+      for (const [index, call] of interaction.toolCalls.entries()) {
+        if (callIds.has(call.toolCallId)) continue;
+        reconciled.push({
+          semanticItemId: semanticItemId(interaction.interactionId, 'tool_call_reconciled', index),
+          actor: 'tool', kind: 'tool_call', phase: 'final', origin: 'response',
+          atUnixNs: call.issuedAtUnixNs ?? interaction.startedAtUnixNs,
+          content: call.arguments, toolCallId: call.toolCallId, toolName: call.name,
+          turnId: interaction.turnId, completeness,
+          partialReasons: [...new Set([...interaction.partialReasons, 'semantic_items_reconciled'])],
+        });
+      }
+      for (const [index, result] of interaction.toolResults.entries()) {
+        if (resultIds.has(result.toolCallId)) continue;
+        reconciled.push({
+          semanticItemId: semanticItemId(interaction.interactionId, 'tool_result_reconciled', index),
+          actor: 'tool', kind: 'tool_result', phase: 'final', origin: 'request',
+          atUnixNs: result.observedAtUnixNs ?? interaction.startedAtUnixNs,
+          content: result.content, toolCallId: result.toolCallId, toolName: result.name,
+          turnId: interaction.turnId, completeness,
+          partialReasons: [...new Set([...interaction.partialReasons, 'semantic_items_reconciled'])],
+        });
+      }
+      return reconciled.sort((left, right) => {
+        try { return BigInt(left.atUnixNs) === BigInt(right.atUnixNs) ? (left.sequenceNumber ?? 0) - (right.sequenceNumber ?? 0) : BigInt(left.atUnixNs) < BigInt(right.atUnixNs) ? -1 : 1; }
+        catch { return 0; }
+      });
+    }
     const users = interactionHumanMessages(interaction).map((message, index) => ({
       semanticItemId: semanticItemId(interaction.interactionId, 'user_message', index),
       actor: 'user' as const,

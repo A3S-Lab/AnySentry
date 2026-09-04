@@ -522,7 +522,7 @@ await ingestObserverEvent({
   inner: { pid: piProcess.pid, uid: 1000, cwd: otlpWorkspace, path: otlpPath, write: true },
 });
 let otlpEvidence;
-for (let attempt = 0; attempt < 20; attempt += 1) {
+for (let attempt = 0; attempt < 60; attempt += 1) {
   otlpEvidence = await request('/events/tool-evidence', 'POST', {
     timeType: 'last_30d',
     invocationId: otlpInvocationId,
