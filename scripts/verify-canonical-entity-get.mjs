@@ -280,6 +280,22 @@ try {
   assert.equal(ingest.response.status, 201, `ingest -> ${ingest.response.status}`);
   assert.equal(ingest.payload?.acceptedEvents, 2, JSON.stringify(ingest.payload));
 
+  // Post-commit projections are intentionally asynchronous in the formal deployment. Resolve
+  // the immutable interaction first so a delayed SessionMembership cannot make this verifier pick
+  // an unrelated first-page Session and accidentally turn a missing canonical link into a pass.
+  let observedInteraction;
+  for (let attempt = 0; attempt < 20 && !observedInteraction; attempt += 1) {
+    const interactionResult = await request('/agents/interactions', 'POST', {
+      timeType: 'last_30m',
+      scope: 'raw',
+      interactionId,
+      limit: 2,
+    });
+    observedInteraction = interactionResult.payload?.items?.find((item) => item.interactionId === interactionId);
+    if (!observedInteraction) await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  assert(observedInteraction, 'ingested interaction did not reach the bounded interaction projection');
+
   const get = async (path) => {
     const result = await request(path);
     assert.equal(result.response.status, 200, `${path} -> ${result.response.status}`);
@@ -330,19 +346,38 @@ try {
 
   let sessions;
   let selectedSession;
+  const expectedSessionIds = [...new Set([
+    observedInteraction.canonicalSessionId,
+    observedInteraction.sessionId,
+    observedInteraction.sessionKey,
+  ].filter((value) => typeof value === 'string' && value.length > 0))];
   for (let attempt = 0; attempt < 20; attempt += 1) {
     sessions = await get(`/v1/sessions?logicalAgentId=${encodeURIComponent(logicalAgentId)}&limit=50`);
     selectedSession = sessions.items.find((candidate) =>
       candidate.interactionIds?.includes(interactionId)
       || candidate.agentInstanceIds?.includes(runtimeId));
+    if (!selectedSession) {
+      for (const expectedSessionId of expectedSessionIds) {
+        const exact = await get(`/v1/sessions?sessionId=${encodeURIComponent(expectedSessionId)}&limit=10`);
+        selectedSession = exact.items.find((candidate) =>
+          candidate.interactionIds?.includes(interactionId)
+          || [candidate.sessionId, candidate.canonicalSessionId, candidate.conversationId].includes(expectedSessionId));
+        if (selectedSession) {
+          sessions = exact;
+          break;
+        }
+      }
+    }
     if (selectedSession) break;
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   assert.equal(sessions.schemaVersion, 'anysentry.session.list.v1');
-  assert(sessions.items.length > 0, 'Session projection missing');
-  const session = selectedSession ?? sessions.items[0];
+  assert(selectedSession, 'Canonical Session projection did not retain the exact interaction membership');
+  const session = selectedSession;
   assert(session.agentInstanceIds?.includes(runtimeId) || session.interactionIds?.includes(interactionId),
     'Session projection did not retain the fixture runtime/interaction membership');
+  assert(session.interactionIds?.includes(interactionId),
+    'Session projection must expose the canonical interaction membership, not only a runtime fallback');
   const sessionDetail = await get(`/v1/sessions/${encodeURIComponent(session.sessionId)}`);
   assert.equal(sessionDetail.item.sessionId, session.sessionId);
   const sessionCoverage = await get(`/v1/sessions/${encodeURIComponent(session.sessionId)}/coverage`);

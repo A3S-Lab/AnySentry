@@ -10,6 +10,7 @@ import {
   enrichAgentConversationDirectoryV2,
   projectAgentConversationDirectory,
 } from './agent-conversation-directory';
+import { projectSemanticConversationTimeline } from './agent-semantic-timeline';
 import { AggregationService } from './aggregation.service';
 import { AlertingService } from './alerting.service';
 import { AuditService } from './audit.service';
@@ -535,6 +536,205 @@ function canonicalSessionResourceFromSummary(
     coverage: structuredClone(summary.coverage),
     sourceRefs: canonicalConversationSourceRefs(summary).slice(0, 64),
     resolutionRevision: revision,
+  };
+}
+
+/**
+ * Build a bounded Session resource directly from the interaction hot projection.  This is the
+ * last-resort read path used while the PostgreSQL-backed conversation projector is stalled.  It
+ * deliberately carries one immutable interaction reference and partial coverage; it never
+ * promotes a PID, Pod, or provider string to a durable Session identity.
+ */
+function canonicalSessionResourceFromHotInteraction(
+  interaction: T.AgentInteractionRecord,
+  revision: number,
+  reason: string,
+): T.CanonicalSessionResource | undefined {
+  const nativeSession = interaction.sessionId
+    ?? interaction.runtimeSessionId
+    ?? interaction.interactionId;
+  const canonicalSessionId = interaction.canonicalSessionId && /^sess_[a-f0-9]{24}$/u.test(interaction.canonicalSessionId)
+    ? interaction.canonicalSessionId
+    : canonicalSessionIdForMembership(
+      nativeSession,
+      interaction.sessionNamespaceKey,
+      interaction.interactionId,
+    );
+  const agentInstanceIds = [...new Set([
+    interaction.canonicalAgentInstanceId,
+    interaction.agentInstanceId,
+  ].filter((value): value is string => Boolean(value)))].slice(0, 16);
+  const sourceRefs = [...new Set([
+    interaction.interactionId,
+    interaction.rawObservationId,
+    ...(interaction.sourceObservationIds ?? []),
+    ...(interaction.evidenceEventIds ?? []),
+  ].filter((value): value is string => Boolean(value)))].slice(0, 64);
+  const model = interaction.interactionType === 'model';
+  const succeeded = model && interaction.statusCode >= 200 && interaction.statusCode < 400;
+  const durationMs = (() => {
+    try {
+      const value = Number(BigInt(interaction.durationNs) / 1_000_000n);
+      return Number.isFinite(value) && value >= 0 ? value : 0;
+    } catch {
+      return 0;
+    }
+  })();
+  const usage: T.AgentUsageSummary = {
+    modelCallCount: model ? 1 : 0,
+    successfulModelCallCount: succeeded ? 1 : 0,
+    failedModelCallCount: model && !succeeded ? 1 : 0,
+    tokenReportedModelCallCount: model && interaction.usage?.completeness === 'complete' ? 1 : 0,
+    tokenCoverage: model && interaction.usage
+      ? interaction.usage.completeness
+      : 'unavailable',
+    inputTokens: interaction.usage?.inputTokens ?? 0,
+    outputTokens: interaction.usage?.outputTokens ?? 0,
+    totalTokens: interaction.usage?.totalTokens ?? 0,
+    cachedInputTokens: interaction.usage?.cachedInputTokens ?? 0,
+    cacheCreationInputTokens: interaction.usage?.cacheCreationInputTokens ?? 0,
+    reasoningOutputTokens: interaction.usage?.reasoningOutputTokens ?? 0,
+    totalDurationMs: durationMs,
+    ...(model ? { averageDurationMs: durationMs } : {}),
+  };
+  const complete = interaction.completeness === 'complete';
+  return {
+    schemaVersion: 'anysentry.session.v1',
+    sessionId: canonicalSessionId,
+    ...(interaction.sessionId && interaction.sessionId !== canonicalSessionId
+      ? { canonicalSessionId } : {}),
+    ...(interaction.sessionKey ? { sessionKey: interaction.sessionKey } : {}),
+    ...(interaction.providerSessionIdHash ? { providerSessionIdHash: interaction.providerSessionIdHash } : {}),
+    ...(interaction.conversationId ? { conversationId: interaction.conversationId } : {}),
+    ...(interaction.logicalAgentId ? { logicalAgentId: interaction.logicalAgentId } : {}),
+    ...(interaction.logicalAgentCandidateId ? { logicalAgentCandidateId: interaction.logicalAgentCandidateId } : {}),
+    ...(interaction.logicalDefinitionId ? { logicalDefinitionId: interaction.logicalDefinitionId } : {}),
+    ...(interaction.logicalScopeMode ? { logicalScopeMode: interaction.logicalScopeMode } : {}),
+    ...(interaction.logicalIdentityAuthority ? { logicalIdentityAuthority: interaction.logicalIdentityAuthority } : {}),
+    ...(interaction.tenantId ? { tenantId: interaction.tenantId } : {}),
+    ...(interaction.ownerId ? { ownerId: interaction.ownerId } : {}),
+    ...(interaction.agentProduct ? { agentProduct: interaction.agentProduct } : {}),
+    ...(interaction.environment ? { environment: interaction.environment } : {}),
+    ...(interaction.workspacePath ? { workspacePath: interaction.workspacePath } : {}),
+    agentAssetIds: [interaction.agentAssetId].slice(0, 1),
+    ...(interaction.collectorId ? { collectorIds: [interaction.collectorId] } : {}),
+    ...(interaction.sourceId ? { sourceIds: [interaction.sourceId] } : {}),
+    agentInstanceIds,
+    segmentIds: [],
+    interactionIds: [interaction.interactionId],
+    ...(interaction.parentSessionId ? { parentSessionId: interaction.parentSessionId } : {}),
+    ...(interaction.canonicalParentSessionId ? { canonicalParentSessionId: interaction.canonicalParentSessionId } : {}),
+    ...(interaction.sessionIdentityQuality ? { sessionIdentityQuality: interaction.sessionIdentityQuality } : {}),
+    ...(interaction.sessionMode ? { sessionMode: interaction.sessionMode } : {}),
+    ...(interaction.sessionLifecycle ? { sessionLifecycle: interaction.sessionLifecycle } : {}),
+    startedAtUnixNs: interaction.startedAtUnixNs,
+    lastActivityAtUnixNs: interaction.endedAtUnixNs,
+    turnCount: interaction.turnId ? 1 : 0,
+    modelCallCount: usage.modelCallCount,
+    toolCallCount: interaction.toolCalls.length,
+    toolResultCount: interaction.toolResults.length,
+    errorCount: interaction.statusCode >= 400
+      || interaction.toolResults.some((result) => result.isError === true) ? 1 : 0,
+    usage,
+    coverage: {
+      status: 'partial',
+      reasons: [...new Set([reason, ...interaction.partialReasons])].slice(0, 32),
+      completeInteractions: complete ? 1 : 0,
+      partialInteractions: complete ? 0 : 1,
+      lastEvidenceAt: interaction.endedAtUnixNs,
+    },
+    sourceRefs,
+    resolutionRevision: revision,
+  };
+}
+
+function canonicalHotSessionTimeline(
+  session: T.CanonicalSessionResource,
+  interaction: T.AgentInteractionRecord,
+  query: CanonicalEntityQuery,
+  revision: number,
+): T.AgentConversationTimelineV3 {
+  const conversationId = session.sessionId;
+  const summary: T.AgentConversationSummary = {
+    conversationId,
+    idSource: interaction.sessionIdentityQuality === 'confirmed' ? 'provider' : 'inferred',
+    ...(interaction.tenantId ? { tenantId: interaction.tenantId } : {}),
+    ...(interaction.ownerId ? { ownerId: interaction.ownerId } : {}),
+    ...(interaction.logicalAgentId ? { logicalAgentId: interaction.logicalAgentId } : {}),
+    ...(interaction.logicalAgentCandidateId ? { logicalAgentCandidateId: interaction.logicalAgentCandidateId } : {}),
+    ...(interaction.logicalDefinitionId ? { logicalDefinitionId: interaction.logicalDefinitionId } : {}),
+    ...(interaction.logicalScopeMode ? { logicalScopeMode: interaction.logicalScopeMode } : {}),
+    ...(interaction.logicalIdentityAuthority ? { logicalIdentityAuthority: interaction.logicalIdentityAuthority } : {}),
+    ...(interaction.environmentId ? { environmentId: interaction.environmentId } : {}),
+    ...(interaction.sessionIdentityQuality ? { sessionIdentityQuality: interaction.sessionIdentityQuality } : {}),
+    ...(interaction.sessionMode ? { sessionMode: interaction.sessionMode } : {}),
+    ...(interaction.sessionId ? { sessionId: interaction.sessionId } : {}),
+    ...(interaction.sessionKey ? { sessionKey: interaction.sessionKey } : {}),
+    ...(interaction.providerSessionIdHash ? { providerSessionIdHash: interaction.providerSessionIdHash } : {}),
+    ...(interaction.sessionLifecycle ? { sessionLifecycle: interaction.sessionLifecycle } : {}),
+    ...(interaction.parentSessionId ? { parentSessionId: interaction.parentSessionId } : {}),
+    ...(interaction.canonicalParentSessionId ? { canonicalParentSessionId: interaction.canonicalParentSessionId } : {}),
+    hasContent: true,
+    agentAssetId: interaction.agentAssetId,
+    agentAssetIds: [interaction.agentAssetId],
+    agentInstanceIds: session.agentInstanceIds,
+    agentProduct: interaction.agentProduct ?? 'Agent',
+    displayName: interaction.agentProduct ?? 'Agent',
+    environment: interaction.environment ?? 'unknown',
+    classification: interaction.currentEffectiveClassification ?? interaction.detectedClassification,
+    workspacePath: interaction.workspacePath,
+    startedAtUnixNs: interaction.startedAtUnixNs,
+    lastActivityAtUnixNs: interaction.endedAtUnixNs,
+    turnCount: interaction.turnId ? 1 : 0,
+    modelCallCount: interaction.interactionType === 'model' ? 1 : 0,
+    toolCallCount: interaction.toolCalls.length,
+    toolResultCount: interaction.toolResults.length,
+    errorCount: interaction.statusCode >= 400 ? 1 : 0,
+    models: interaction.model ? [interaction.model] : [],
+    usage: session.usage,
+    instanceUsage: [],
+    coverage: session.coverage,
+  };
+  const turns = projectSemanticConversationTimeline(summary, [interaction], []);
+  const requestKey = createHash('sha256').update([
+    conversationId,
+    query.timeType ?? '',
+    query.startTime ?? '',
+    query.endTime ?? '',
+    query.snapshotAsOf ?? '',
+    String(revision),
+  ].join('\u0000')).digest('hex').slice(0, 32);
+  const now = new Date().toISOString();
+  return {
+    apiVersion: 3,
+    requestKey,
+    requestedConversationId: conversationId,
+    canonicalConversationId: conversationId,
+    resolutionRevision: revision,
+    timelineVersion: 3,
+    thread: summary,
+    segments: [],
+    turns,
+    interactionIds: [interaction.interactionId],
+    parserId: 'anysentry.canonical-hot-session-fallback',
+    parserVersion: 1,
+    contextReplaySummaries: [],
+    technicalActivitySummaries: [],
+    dataSource: 'hot_ring',
+    classificationView: query.classificationView ?? 'as_observed',
+    reviewRevision: 0,
+    coverage: {
+      requestedFrom: query.startTime ?? now,
+      requestedTo: query.endTime ?? now,
+      snapshotAsOf: query.snapshotAsOf ?? now,
+      asOf: query.snapshotAsOf ?? now,
+      completeness: 'partial',
+      partial: true,
+      partialReason: 'projection_timeout',
+      source: 'memory_hot_ring',
+      totalMode: 'omitted',
+    },
+    updateTime: now,
   };
 }
 
@@ -7366,11 +7566,20 @@ export class SecurityMonitoringController implements OnModuleDestroy {
               : 'api';
     const trustedProcess = trustedCollector
       && ['kernel', 'uprobe', 'socket_payload', 'forwarder'].includes(sourceType);
+    const compatibilitySourceId = context.sourceId ?? sourceResolution.source?.sourceId;
+    const compatibilityEventId = compatibilitySourceId && context.sourceEventId
+      ? this.judge.eventIdForSource(compatibilitySourceId, context.sourceEventId)
+      : undefined;
+    const compatibilitySourceRefs = [
+      compatibilityEventId,
+      meta.rawObservationId,
+    ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
     const committed = await this.canonicalObservability.commitObserverLine(line, {
       sourceId: context.sourceId ?? sourceResolution.source?.sourceId,
       collectorId: context.collectorId ?? sourceResolution.source?.collectorId,
       sourceType,
       sourceSequence: context.sourceEventId,
+      sourceRefs: compatibilitySourceRefs,
       eventKind: observerLineEventKind(line) ?? trustedMeta.eventKind,
       eventAtUnixNs: trustedMeta.eventAtUnixNs,
       receivedAtUnixNs: trustedMeta.receivedAtUnixNs,
@@ -7428,6 +7637,15 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     // capability to the exact object returned to the caller; otherwise a later resolver would
     // silently treat an authenticated claim as untrusted after the raw commit.
     if (trustedContext) bindServerTrustedCorrelationContext(finalMeta, trustedContext);
+    if (committed.kernelFact) {
+      // The compatibility JudgedEvent ID is assigned after this raw commit.  It is nevertheless
+      // deterministic for an authenticated source/event pair, so register it as a bounded alias
+      // now.  The canonical `kf_…` remains the only primary identity; this bridge lets old Event
+      // deep links resolve the same fact without mutating or duplicating the raw row.
+      this.canonicalObservability.kernel.registerAliases(committed.kernelFact.factId, [
+        ...compatibilitySourceRefs,
+      ]);
+    }
     return finalMeta;
   }
 
@@ -11752,6 +11970,70 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         resolutionRevision: membership.resolutionRevision,
       });
     }
+    // A post-commit projection can be waiting on a slow relational write while the interaction
+    // itself is already visible in AggregationService's bounded hot ring.  Include that exact
+    // immutable row in the degraded read so a freshly created deep link is not replaced by an
+    // unrelated first page (or a 503).  The row is explicitly partial and never claimed durable.
+    const hotInteractions = query.sessionId
+      ? [this.agg.getAgentInteractionHot(query.sessionId), ...this.agg.listAgentInteractionsHot(256)]
+      : this.agg.listAgentInteractionsHot(256);
+    const seenHotInteractions = new Set<string>();
+    for (const interaction of hotInteractions) {
+      if (!interaction || seenHotInteractions.has(interaction.interactionId)) continue;
+      seenHotInteractions.add(interaction.interactionId);
+      const resource = canonicalSessionResourceFromHotInteraction(interaction, this.canonicalCurrentRevision(), reason);
+      if (!resource) continue;
+      const sessionIds = [
+        resource.sessionId,
+        resource.canonicalSessionId,
+        resource.conversationId,
+        interaction.sessionId,
+        interaction.sessionKey,
+      ].filter((value): value is string => Boolean(value));
+      if (query.sessionId && !sessionIds.includes(query.sessionId)) continue;
+      if (!canonicalScopeMatches({
+        logicalAgentId: resource.logicalAgentId,
+        logicalAgentCandidateId: resource.logicalAgentCandidateId,
+        logicalDefinitionId: resource.logicalDefinitionId,
+        tenantId: resource.tenantId,
+        ownerId: resource.ownerId,
+        workspacePath: resource.workspacePath,
+        environment: resource.environment,
+        environmentId: undefined,
+        agentAssetId: resource.agentAssetIds?.[0],
+        agentAssetIds: resource.agentAssetIds,
+        agentInstanceId: resource.agentInstanceIds[0],
+        agentInstanceIds: resource.agentInstanceIds,
+        runtimeInstanceId: interaction.runtimeInstanceId,
+        runtimeInstanceIds: interaction.runtimeInstanceId ? [interaction.runtimeInstanceId] : [],
+        sessionId: resource.sessionId,
+        sessionIds,
+        product: resource.agentProduct,
+        sourceId: resource.sourceIds?.[0],
+        sourceIds: resource.sourceIds,
+        collectorId: resource.collectorIds?.[0],
+        collectorIds: resource.collectorIds,
+        q: [resource.sessionId, resource.agentProduct, resource.workspacePath].join(' '),
+      }, query)) continue;
+      const existing = resources.get(resource.sessionId);
+      if (!existing) {
+        resources.set(resource.sessionId, resource);
+        continue;
+      }
+      existing.agentAssetIds = [...new Set([
+        ...(existing.agentAssetIds ?? []),
+        ...(resource.agentAssetIds ?? []),
+      ])].slice(0, 256);
+      existing.agentInstanceIds = [...new Set([
+        ...existing.agentInstanceIds,
+        ...resource.agentInstanceIds,
+      ])].slice(0, 512);
+      existing.interactionIds = [...new Set([
+        ...existing.interactionIds,
+        ...resource.interactionIds,
+      ])].slice(0, 2_048);
+      existing.sourceRefs = [...new Set([...existing.sourceRefs, ...resource.sourceRefs])].slice(0, 128);
+    }
     return {
       items: [...resources.values()],
       coverage: canonicalCoverage(true, [reason], 'memory_hot_ring'),
@@ -12443,6 +12725,30 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     let timeline: T.AgentConversationTimelineV3 | undefined;
     let timelineDegraded = false;
     let sessionDegraded = false;
+    // If the canonical Session list timed out before its membership row became visible, resolve
+    // the requested alias directly from the bounded interaction ring.  This keeps an exact deep
+    // link usable during a WAL stall without widening the lookup to an arbitrary first page.
+    if (!session && sessions.coverage.status !== 'complete') {
+      const hotCandidates = [
+        this.agg.getAgentInteractionHot(sessionId),
+        ...this.agg.listAgentInteractionsHot(256),
+      ].filter((candidate): candidate is T.AgentInteractionRecord => Boolean(candidate));
+      const hot = hotCandidates.find((candidate) => [
+        candidate.interactionId,
+        candidate.sessionId,
+        candidate.canonicalSessionId,
+        candidate.sessionKey,
+        candidate.conversationId,
+      ].includes(sessionId));
+      if (hot) {
+        session = canonicalSessionResourceFromHotInteraction(hot, sessions.revision, 'session_projection_timeout');
+        if (session) {
+          timeline = canonicalHotSessionTimeline(session, hot, query, sessions.revision);
+          conversationId = session.sessionId;
+          sessionDegraded = true;
+        }
+      }
+    }
     // If the canonical Session projector timed out before materializing a row, use the bounded
     // compatibility conversation projection once. This can recover a valid session/thread from
     // ClickHouse/hot interactions without scanning the whole history; a missing result under a
@@ -12479,6 +12785,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       throw new NotFoundException('session not found');
     }
     conversationId = session.conversationId ?? session.sessionId;
+    const hotInteraction = session.interactionIds
+      .map((interactionId) => this.agg.getAgentInteractionHot(interactionId))
+      .find((interaction): interaction is T.AgentInteractionRecord => Boolean(interaction));
     try {
       timeline ??= await withCanonicalProjectionTimeout(this.agg.agentConversationTimelineV3({
         timeType: query.timeType,
@@ -12493,7 +12802,17 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     } catch (error) {
       if (!isCanonicalProjectionDegradation(error)) throw error;
       timelineDegraded = true;
-      timeline = degradedCanonicalTimeline(conversationId, query, sessions.revision);
+      timeline = hotInteraction
+        ? canonicalHotSessionTimeline(session, hotInteraction, query, sessions.revision)
+        : degradedCanonicalTimeline(conversationId, query, sessions.revision);
+    }
+    // A compatibility projector can return an empty thread while the hot interaction is already
+    // complete (for example, its PostgreSQL membership write is still waiting on WAL). Prefer the
+    // bounded hot semantic timeline in that case; retain the partial coverage marker so callers
+    // know the result is not yet a durable historical projection.
+    if (timeline && timeline.turns.length === 0 && hotInteraction) {
+      timelineDegraded = true;
+      timeline = canonicalHotSessionTimeline(session, hotInteraction, query, sessions.revision);
     }
     // A freshly committed membership may become visible before the compatibility interaction
     // projection. Retry the exact interaction reference briefly instead of caching an empty
@@ -12610,6 +12929,52 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           scanned: 0,
           truncated: true,
           failed: 1,
+        };
+      }
+    }
+    // The compatibility projection can be behind even when the exact interaction is already in
+    // the bounded hot ring.  Resolve a semantic deep link from that immutable row before doing a
+    // broad Session scan; this makes the API/UI link usable during a relational WAL stall while
+    // preserving an explicit partial coverage result.
+    if (!timelineSearch?.candidates.length) {
+      const hotCandidates = this.agg.listAgentInteractionsHot(512);
+      const hotMatches: CanonicalSemanticTimelineCandidate[] = [];
+      for (const interaction of hotCandidates) {
+        if (query.agentAssetId && interaction.agentAssetId !== query.agentAssetId) continue;
+        if (query.agentInstanceId
+          && interaction.agentInstanceId !== query.agentInstanceId
+          && interaction.canonicalAgentInstanceId !== query.agentInstanceId) continue;
+        const session = canonicalSessionResourceFromHotInteraction(
+          interaction,
+          this.canonicalCurrentRevision(),
+          'session_projection_timeout',
+        );
+        if (!session) continue;
+        const timeline = canonicalHotSessionTimeline(
+          session,
+          interaction,
+          query,
+          this.canonicalCurrentRevision(),
+        );
+        for (const turn of timeline.turns) {
+          for (const event of turn.events) {
+            const matches = timelineId
+              ? event.semanticEventId === id
+              : semanticRecord
+                ? canonicalSemanticRecordTouchesEvent(semanticRecord, event)
+                : false;
+            if (matches) hotMatches.push({ session, event });
+          }
+        }
+        if (hotMatches.length >= 2) break;
+      }
+      if (hotMatches.length) {
+        timelineSearch = {
+          candidates: hotMatches,
+          scanned: hotCandidates.length,
+          truncated: false,
+          failed: 1,
+          exactUnique: hotMatches.length === 1,
         };
       }
     }

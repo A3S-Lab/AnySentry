@@ -3011,6 +3011,36 @@ export class AggregationService implements OnModuleDestroy {
     return this.readAgentInteractions(filter);
   }
 
+  /**
+   * Read one interaction from the bounded process-local projection without touching ClickHouse
+   * or PostgreSQL.  Canonical entity GETs use this only after their durable/compatibility read
+   * has timed out.  It is deliberately a metadata bridge: callers must still apply their own
+   * scope checks and must never treat a hot row as durable history.
+   */
+  getAgentInteractionHot(interactionId: string): T.AgentInteractionRecord | undefined {
+    const id = typeof interactionId === 'string' ? interactionId.trim() : '';
+    if (!id) return undefined;
+    this.pruneInteractionHot();
+    const entry = this.interactionHot.get(id);
+    return entry ? structuredClone(entry.record) : undefined;
+  }
+
+  /**
+   * Return a bounded newest-first snapshot of hot interactions for degraded canonical reads.
+   * The snapshot is cloned so a response builder cannot mutate the live projection while a late
+   * ClickHouse/relational operation is still settling.
+   */
+  listAgentInteractionsHot(limit = 256): T.AgentInteractionRecord[] {
+    this.pruneInteractionHot();
+    const bounded = Number.isFinite(limit)
+      ? Math.max(1, Math.min(this.interactionHotMaxRecords, Math.trunc(limit)))
+      : 256;
+    return [...this.interactionHot.values()]
+      .slice(-bounded)
+      .reverse()
+      .map(({ record }) => structuredClone(record));
+  }
+
   private async readAgentInteractions(
     filter: T.AgentInteractionQuery,
     options: {
