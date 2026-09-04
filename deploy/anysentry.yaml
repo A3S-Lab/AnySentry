@@ -323,8 +323,8 @@ spec:
       labels: { app: anysentry, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
       annotations:
         # Local immutable overlay provenance; update only when this service's image changes.
-        anysentry.io/local-overlay-manifest: "sha256:345ee47c1a0296a91c18964dc3ce21f89fae643a6dec376de11908441bd3c0d1"
-        anysentry.io/local-source-revision: "AnySentry@a9f4593+cross-runtime-deep-link"
+        anysentry.io/local-overlay-manifest: "sha256:3f921a33d5380f52663a2b87a743a6fe2c84877a2138045860096e00704d7706"
+        anysentry.io/local-source-revision: "AnySentry@80c3f61+semantic-alias-bound"
     spec:
       terminationGracePeriodSeconds: 30
       serviceAccountName: anysentry
@@ -371,6 +371,7 @@ spec:
             - { name: ANYSENTRY_CANONICAL_SESSION_PROJECTION_TIMEOUT_MS, value: "2000" }
             - { name: ANYSENTRY_CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS, value: "2000" }
             - { name: ANYSENTRY_CANONICAL_SEMANTIC_EVIDENCE_TIMEOUT_MS, value: "2000" }
+            - { name: ANYSENTRY_CANONICAL_SEMANTIC_ALIAS_TIMEOUT_MS, value: "500" }
             - { name: ANYSENTRY_CANONICAL_KERNEL_FALLBACK_LOOKBACK_MS, value: "7200000" }
             # The installer creates this independently from image/manifests. It protects Source
             # bootstrap and Capture Profile policy/materialization endpoints without committing a

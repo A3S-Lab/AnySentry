@@ -225,6 +225,12 @@ const CANONICAL_SEMANTIC_EVIDENCE_TIMEOUT_MS = boundedControllerEnvInt(
   250,
   10_000,
 );
+const CANONICAL_SEMANTIC_ALIAS_TIMEOUT_MS = boundedControllerEnvInt(
+  'ANYSENTRY_CANONICAL_SEMANTIC_ALIAS_TIMEOUT_MS',
+  500,
+  100,
+  2_000,
+);
 const CANONICAL_KERNEL_FALLBACK_LOOKBACK_MS = boundedControllerEnvInt(
   'ANYSENTRY_CANONICAL_KERNEL_FALLBACK_LOOKBACK_MS',
   2 * 60 * 60_000,
@@ -11483,13 +11489,24 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     // for the latter case only; `se_` already has a stable interaction-derived identity and a
     // full 10k-row alias scan would make a working deep link depend on a slow side store.
     let aliasRecords: SemanticRecord[] = semanticRecord ? [semanticRecord] : [];
-    if (!semanticRecord && selected && !timelineId) {
-      aliasRecords = (await this.canonicalObservability.listDurableSemanticRecords(10_000))
-        // The timeline event is already selected inside a canonical Session.  Its immutable
-        // sourceInteractionIds are a stronger bridge than a provider-session alias (which may be
-        // absent after expiry), so do not discard a valid durable row merely because that alias
-        // is no longer present on the Session projection.
-        .filter((candidate) => canonicalSemanticRecordTouchesEvent(candidate, selected.event));
+    let aliasLookupUnavailable = false;
+    if (!semanticRecord && selected) {
+      // A timeline event can be retained after the durable semantic row expires.  Keep the alias
+      // contract, but bound the optional lookup sharply: `se_…` already identifies the selected
+      // interaction and must not wait for a 10k-row PostgreSQL scan under storage pressure.  The
+      // durable `sr_…`-outlives-timeline case keeps the wider compatibility budget.
+      try {
+        const aliasLimit = timelineId ? 128 : 10_000;
+        aliasRecords = await withCanonicalProjectionTimeout(
+          this.canonicalObservability.listDurableSemanticRecords(aliasLimit),
+          timelineId ? CANONICAL_SEMANTIC_ALIAS_TIMEOUT_MS : CANONICAL_SEMANTIC_EVIDENCE_TIMEOUT_MS,
+        ).then((records) => records.filter((candidate) =>
+          canonicalSemanticRecordTouchesEvent(candidate, selected.event)));
+      } catch (error) {
+        if (!isCanonicalProjectionDegradation(error)) throw error;
+        aliasLookupUnavailable = true;
+        aliasRecords = [];
+      }
     }
     const aliasAmbiguous = aliasRecords.length > 1;
     const resolvedSemanticRecord = aliasRecords.length === 1 ? aliasRecords[0] : semanticRecord;
@@ -11525,6 +11542,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     if (timelineSearch.truncated) reasons.push('semantic_timeline_scan_bound');
     if (timelineSearch.failed > 0) reasons.push('semantic_timeline_projection_failed');
     if (aliasAmbiguous) reasons.push('durable_semantic_identifier_ambiguous');
+    if (aliasLookupUnavailable) reasons.push('durable_semantic_alias_unavailable');
     if (selected && selected.event.actor !== 'tool') reasons.push('semantic_event_not_tool');
     if (selected && selected.event.actor === 'tool' && !evidence) reasons.push('semantic_evidence_projection_unavailable');
     if (evidenceFailureReason) reasons.push(evidenceFailureReason);
