@@ -672,6 +672,7 @@ function verifyObserverManifest() {
       /\{\s*name:\s*FORWARD_MAX_INFLIGHT,\s*value:\s*"4"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*A3S_OBSERVER_JSON_BULK_QUEUE_CAPACITY,\s*value:\s*"262144"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*A3S_OBSERVER_BULK_INBOX_CAPACITY,\s*value:\s*"65536"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*A3S_OBSERVER_JSON_CRITICAL_BACKPRESSURE_MS,\s*value:\s*"100"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_CONTROL_HTTP_TIMEOUT_MS,\s*value:\s*"15000"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_SPOOL_COMPACT_MAX_LIVE_RECORDS,\s*value:\s*"16384"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_WAL_PENDING_MAX_EVENTS,\s*value:\s*"65536"\s*\}/u.test(daemonSet?.source ?? '') &&

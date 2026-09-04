@@ -67,6 +67,10 @@ spec:
             # Critical or Semantic capacity. The Collector hard-caps the value at 262144.
             - { name: A3S_OBSERVER_JSON_BULK_QUEUE_CAPACITY, value: "262144" }
             - { name: A3S_OBSERVER_BULK_INBOX_CAPACITY, value: "65536" }
+            # Critical lifecycle/security records receive a finite 100 ms admission retry when
+            # the Forwarder pipe is transiently full; an exhausted wait remains an explicit drop
+            # metric and never becomes an unbounded Collector stall.
+            - { name: A3S_OBSERVER_JSON_CRITICAL_BACKPRESSURE_MS, value: "100" }
             # Full signal set: file writes/deletes (FileAccess/FileDelete) + OpenSSL plaintext
             # (SslContent → prompt-injection / secret-exfil rules + LlmApi model/token usage).
             # Set to "0" to reduce footprint on a busy node.
