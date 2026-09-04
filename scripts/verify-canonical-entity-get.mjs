@@ -248,6 +248,13 @@ try {
   assert.equal(contracts.rawObservation, 'anysentry.raw_observation.v1');
   assert.equal(contracts.agentInstance, 'anysentry.agent_instance.v1');
 
+  // Liveness is deliberately independent of storage/projection work. Keep this assertion next
+  // to the Canonical GET contract so a deployment cannot switch probes to an unimplemented path.
+  const livez = await request('/livez', 'GET', undefined, '');
+  assert.equal(livez.response.status, 200, 'livez must be public and O(1)');
+  assert.equal(livez.payload?.schemaVersion, 'anysentry.livez.v1');
+  assert.equal(livez.payload?.status, 'ok');
+
   const logical = await get(`/v1/logical-agents?logicalAgentId=${encodeURIComponent(logicalAgentId)}&limit=1&revision=1`);
   assert.equal(logical.schemaVersion, 'anysentry.logical_agent.list.v1');
   assert.equal(logical.items.length, 1);

@@ -152,9 +152,33 @@ interface CanonicalSemanticTimelineCandidate {
   event: T.AgentSemanticEvent;
 }
 
+interface CanonicalSemanticTimelineSearch {
+  candidates: CanonicalSemanticTimelineCandidate[];
+  scanned: number;
+  truncated: boolean;
+  failed: number;
+}
+
+interface CanonicalDirectoryCacheEntry {
+  value: T.AgentConversationDirectoryListV4;
+  expiresAt: number;
+  bytes: number;
+}
+
 const CANONICAL_ENTITY_LIMIT_MAX = 500;
 const CANONICAL_ENTITY_OFFSET_MAX = 1_000_000;
 const CANONICAL_ENTITY_CURSOR_PREFIX = 'ce1:';
+// Canonical entity reads are metadata projections, not a reason to repeatedly fan out to the
+// ClickHouse-backed conversation projector.  Keep a very short, bounded cache so the UI's
+// concurrent list/detail requests share one immutable snapshot while still observing new ingest
+// revisions promptly.  The key includes the operator identity and every canonical filter; no
+// credential value is ever retained in the cache.
+const CANONICAL_DIRECTORY_CACHE_TTL_MS = 2_000;
+const CANONICAL_DIRECTORY_CACHE_MAX_ENTRIES = 8;
+const CANONICAL_DIRECTORY_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+const CANONICAL_RUNTIME_STATE_READ_LIMIT = 20_000;
+const CANONICAL_SEMANTIC_SESSION_SCAN_MAX = 64;
+const CANONICAL_SEMANTIC_SCAN_CONCURRENCY = 4;
 
 function canonicalQueryScalar(
   query: Record<string, unknown> | undefined,
@@ -5965,6 +5989,16 @@ function otlpMetricsToUniversal(
 @UseGuards(ManagementAuthGuard)
 @Controller('security-center')
 export class SecurityMonitoringController implements OnModuleDestroy {
+  private readonly canonicalDirectoryCache = new Map<string, CanonicalDirectoryCacheEntry>();
+  private readonly canonicalDirectoryInFlight = new Map<
+    string,
+    Promise<T.AgentConversationDirectoryListV4>
+  >();
+  private canonicalDirectoryCacheBytes = 0;
+  private canonicalDirectoryCacheEvicted = 0;
+  private canonicalDirectoryCacheExpired = 0;
+  private canonicalDirectoryCacheDropped = 0;
+
   constructor(
     private readonly agg: AggregationService,
     private readonly agentMetadata: AgentMetadataService,
@@ -6001,6 +6035,88 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     // clear them on a graceful shutdown so a hot-reload/test process cannot retain source payload
     // digests or result envelopes beyond its lifecycle.
     clearIngressCaches();
+    this.canonicalDirectoryCache.clear();
+    this.canonicalDirectoryInFlight.clear();
+    this.canonicalDirectoryCacheBytes = 0;
+  }
+
+  private canonicalDirectoryCacheKey(
+    query: CanonicalEntityQuery,
+    headers: HeaderBag,
+  ): string {
+    const actor = auditActor(headers);
+    return JSON.stringify({
+      query,
+      actor: {
+        type: actor.type,
+        id: actor.id,
+      },
+    });
+  }
+
+  private pruneCanonicalDirectoryCache(now = Date.now()): void {
+    for (const [key, entry] of this.canonicalDirectoryCache) {
+      if (entry.expiresAt > now) continue;
+      this.canonicalDirectoryCache.delete(key);
+      this.canonicalDirectoryCacheBytes = Math.max(0, this.canonicalDirectoryCacheBytes - entry.bytes);
+      this.canonicalDirectoryCacheExpired += 1;
+    }
+  }
+
+  private rememberCanonicalDirectorySnapshot(
+    key: string,
+    value: T.AgentConversationDirectoryListV4,
+  ): void {
+    let bytes: number;
+    try {
+      bytes = Buffer.byteLength(JSON.stringify(value), 'utf8');
+    } catch {
+      this.canonicalDirectoryCacheDropped += 1;
+      return;
+    }
+    if (bytes > CANONICAL_DIRECTORY_CACHE_MAX_BYTES) {
+      this.canonicalDirectoryCacheDropped += 1;
+      return;
+    }
+    const previous = this.canonicalDirectoryCache.get(key);
+    if (previous) {
+      this.canonicalDirectoryCache.delete(key);
+      this.canonicalDirectoryCacheBytes = Math.max(0, this.canonicalDirectoryCacheBytes - previous.bytes);
+    }
+    this.canonicalDirectoryCache.set(key, {
+      value,
+      bytes,
+      expiresAt: Date.now() + CANONICAL_DIRECTORY_CACHE_TTL_MS,
+    });
+    this.canonicalDirectoryCacheBytes += bytes;
+    this.pruneCanonicalDirectoryCache();
+    while (
+      this.canonicalDirectoryCache.size > CANONICAL_DIRECTORY_CACHE_MAX_ENTRIES
+      || this.canonicalDirectoryCacheBytes > CANONICAL_DIRECTORY_CACHE_MAX_BYTES
+    ) {
+      const oldest = this.canonicalDirectoryCache.entries().next().value as
+        | [string, CanonicalDirectoryCacheEntry]
+        | undefined;
+      if (!oldest) break;
+      this.canonicalDirectoryCache.delete(oldest[0]);
+      this.canonicalDirectoryCacheBytes = Math.max(0, this.canonicalDirectoryCacheBytes - oldest[1].bytes);
+      this.canonicalDirectoryCacheEvicted += 1;
+    }
+  }
+
+  private canonicalDirectoryCacheStats(): Record<string, number> {
+    this.pruneCanonicalDirectoryCache();
+    return {
+      entries: this.canonicalDirectoryCache.size,
+      bytes: this.canonicalDirectoryCacheBytes,
+      maxEntries: CANONICAL_DIRECTORY_CACHE_MAX_ENTRIES,
+      maxBytes: CANONICAL_DIRECTORY_CACHE_MAX_BYTES,
+      ttlMs: CANONICAL_DIRECTORY_CACHE_TTL_MS,
+      inFlight: this.canonicalDirectoryInFlight.size,
+      evicted: this.canonicalDirectoryCacheEvicted,
+      expired: this.canonicalDirectoryCacheExpired,
+      dropped: this.canonicalDirectoryCacheDropped,
+    };
   }
 
   private bindObservedAssetMeta(meta: T.EventMeta, eventAt?: number): T.EventMeta {
@@ -9504,7 +9620,34 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   ): Promise<T.AgentConversationDirectoryListV4> {
     // The V4 compatibility projection is already read-only and carries userThreads, recent
     // runtime records, and coverage.  Reuse it rather than introducing a second aggregation path.
-    return this.agentConversationDirectoryV4(this.canonicalConversationDirectoryQuery(query), headers);
+    this.pruneCanonicalDirectoryCache();
+    const key = this.canonicalDirectoryCacheKey(query, headers);
+    const cached = this.canonicalDirectoryCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) {
+      // The projection is treated as immutable by all canonical resource builders. Returning the
+      // cached object avoids another large structured clone on every nested read; JSON response
+      // serialization itself does not mutate it.
+      this.canonicalDirectoryCache.delete(key);
+      this.canonicalDirectoryCache.set(key, cached);
+      return cached.value;
+    }
+    const inFlight = this.canonicalDirectoryInFlight.get(key);
+    if (inFlight) return inFlight;
+    const operation = this.agentConversationDirectoryV4(
+      this.canonicalConversationDirectoryQuery(query),
+      headers,
+    )
+      .then((value) => {
+        this.rememberCanonicalDirectorySnapshot(key, value);
+        return value;
+      })
+      .finally(() => {
+        if (this.canonicalDirectoryInFlight.get(key) === operation) {
+          this.canonicalDirectoryInFlight.delete(key);
+        }
+      });
+    this.canonicalDirectoryInFlight.set(key, operation);
+    return operation;
   }
 
   private canonicalRevisionCoverage(
@@ -9597,7 +9740,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           agentInstanceId: undefined,
           sourceId: query.sourceId,
           includeShadow: true,
-          limit: 100_000,
+          limit: CANONICAL_RUNTIME_STATE_READ_LIMIT,
         }).items.filter((record) => item.agentInstanceIds.some((id) => [
           record.agentInstanceId,
           record.canonicalAgentInstanceId,
@@ -9670,7 +9813,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       agentInstanceId: query.agentInstanceId,
       physicalWorkloadId: undefined,
       includeShadow: query.includeShadow,
-      limit: 100_000,
+      limit: CANONICAL_RUNTIME_STATE_READ_LIMIT,
     });
     const directory = await this.canonicalDirectorySnapshot({ ...query, offset: 0, limit: 500 }, headers);
     const grouped = new Map<string, T.AgentRuntimeInstanceRecord[]>();
@@ -9806,7 +9949,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       physicalWorkloadId: query.agentAssetId,
       runtimeState: query.lifecycleScope === 'running' ? 'running' : 'all',
       includeShadow: query.includeShadow,
-      limit: 100_000,
+      limit: CANONICAL_RUNTIME_STATE_READ_LIMIT,
     });
     const directory = await this.canonicalDirectorySnapshot({ ...query, offset: 0, limit: 500 }, headers);
     const conversations = directory.items.flatMap((item) => item.userThreads ?? []);
@@ -10108,43 +10251,75 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     semanticRecord: SemanticRecord | undefined,
     query: CanonicalEntityQuery,
     sessions: readonly T.CanonicalSessionResource[],
-  ): Promise<CanonicalSemanticTimelineCandidate[]> {
+  ): Promise<CanonicalSemanticTimelineSearch> {
     const scopedSessions = semanticRecord
       ? sessions.filter((session) => canonicalSemanticRecordTouchesSession(semanticRecord, session))
       : sessions;
     // A durable record can outlive the summary's session alias.  If no direct scope matched, a
     // bounded fallback scan still permits sourceInteractionIds to establish the relationship.
-    const candidates = (scopedSessions.length > 0 ? scopedSessions : sessions).slice(0, 500);
+    const allCandidates = scopedSessions.length > 0 ? scopedSessions : sessions;
+    const candidates = allCandidates.slice(0, CANONICAL_SEMANTIC_SESSION_SCAN_MAX);
     const result: CanonicalSemanticTimelineCandidate[] = [];
     const seen = new Set<string>();
-    for (const session of candidates) {
-      const conversationId = session.conversationId ?? session.sessionId;
-      if (!conversationId) continue;
-      const timeline = await this.agg.agentConversationTimelineV3({
-        timeType: query.timeType,
-        startTime: query.startTime,
-        endTime: query.endTime,
-        snapshotAsOf: query.snapshotAsOf,
-        scope: 'agent',
-        classificationView: query.classificationView,
-        conversationId,
-        limit: 500,
-      });
-      for (const turn of timeline.turns) {
-        for (const event of turn.events) {
-          if (semanticRecord
-            ? !canonicalSemanticRecordTouchesEvent(semanticRecord, event)
-            : event.semanticEventId !== requestedId) {
-            continue;
+    let failed = 0;
+    // Timeline projection can perform a ClickHouse read. Keep a small worker width and stop once
+    // two distinct matches are found: the caller must preserve ambiguity and has no reason to
+    // scan the remaining sessions. A stale/failed projection is a coverage gap, not a 500.
+    for (let offset = 0; offset < candidates.length && result.length < 2; offset += CANONICAL_SEMANTIC_SCAN_CONCURRENCY) {
+      const batch = candidates.slice(offset, offset + CANONICAL_SEMANTIC_SCAN_CONCURRENCY);
+      const scanned = await Promise.all(batch.map(async (session) => {
+        const conversationId = session.conversationId ?? session.sessionId;
+        if (!conversationId) return [] as CanonicalSemanticTimelineCandidate[];
+        try {
+          const timeline = await this.agg.agentConversationTimelineV3({
+            timeType: query.timeType,
+            startTime: query.startTime,
+            endTime: query.endTime,
+            snapshotAsOf: query.snapshotAsOf,
+            scope: 'agent',
+            classificationView: query.classificationView,
+            conversationId,
+            limit: 500,
+          });
+          const matches: CanonicalSemanticTimelineCandidate[] = [];
+          for (const turn of timeline.turns) {
+            for (const event of turn.events) {
+              if (semanticRecord
+                ? !canonicalSemanticRecordTouchesEvent(semanticRecord, event)
+                : event.semanticEventId !== requestedId) {
+                continue;
+              }
+              matches.push({ session, event });
+            }
           }
-          const key = `${session.sessionId}\u0000${event.semanticEventId}`;
+          return matches;
+        } catch (error) {
+          // Internal session IDs were already validated by canonicalSessionResources. A backend
+          // timeout, expired projection, or stale membership therefore degrades coverage; retain
+          // the durable row/Kernel lane instead of converting it into an HTTP 500. Do not swallow
+          // a programmer-visible parameter error if one somehow escapes the internal call.
+          if (error instanceof BadRequestException) throw error;
+          failed += 1;
+          return [] as CanonicalSemanticTimelineCandidate[];
+        }
+      }));
+      for (const matches of scanned) {
+        for (const candidate of matches) {
+          const key = `${candidate.session.sessionId}\u0000${candidate.event.semanticEventId}`;
           if (seen.has(key)) continue;
           seen.add(key);
-          result.push({ session, event });
+          result.push(candidate);
+          if (result.length >= 2) break;
         }
+        if (result.length >= 2) break;
       }
     }
-    return result;
+    return {
+      candidates: result,
+      scanned: candidates.length,
+      truncated: allCandidates.length > candidates.length,
+      failed,
+    };
   }
 
   @Get('v1/logical-agents')
@@ -10357,18 +10532,20 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     }
 
     const sessions = await this.canonicalSessionResources({ ...query, offset: 0, limit: 500 }, headers);
-    const timelineCandidates = await this.canonicalSemanticTimelineCandidates(
+    const timelineSearch = await this.canonicalSemanticTimelineCandidates(
       id,
       semanticRecord,
       query,
       sessions.items,
     );
-    const uniqueTimelineCandidates = [...new Map(timelineCandidates.map((candidate) => [
+    const uniqueTimelineCandidates = [...new Map(timelineSearch.candidates.map((candidate) => [
       `${candidate.session.sessionId}\u0000${candidate.event.semanticEventId}`,
       candidate,
     ])).values()];
-    const timelineAmbiguous = uniqueTimelineCandidates.length > 1;
-    const selected = uniqueTimelineCandidates.length === 1
+    // If the bounded search was truncated, do not force a single candidate: an unseen session
+    // may contain the same stable event id. The response remains queryable with coverage metadata.
+    const timelineAmbiguous = uniqueTimelineCandidates.length > 1 || timelineSearch.truncated;
+    const selected = uniqueTimelineCandidates.length === 1 && !timelineSearch.truncated
       ? uniqueTimelineCandidates[0]
       : undefined;
 
@@ -10411,6 +10588,8 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     const reasons = [...sessions.coverage.reasons];
     if (!selected) reasons.push('semantic_timeline_projection_unavailable');
     if (timelineAmbiguous) reasons.push('semantic_timeline_identifier_ambiguous');
+    if (timelineSearch.truncated) reasons.push('semantic_timeline_scan_bound');
+    if (timelineSearch.failed > 0) reasons.push('semantic_timeline_projection_failed');
     if (aliasAmbiguous) reasons.push('durable_semantic_identifier_ambiguous');
     if (selected && selected.event.actor !== 'tool') reasons.push('semantic_event_not_tool');
     if (selected && selected.event.actor === 'tool' && !evidence) reasons.push('semantic_evidence_projection_unavailable');
@@ -10492,6 +10671,17 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     };
   }
 
+  /**
+   * Process liveness probe. This endpoint must stay O(1) and independent of ClickHouse,
+   * PostgreSQL, queues, and projection caches so a storage incident cannot make kubelet restart
+   * a healthy process. Readiness may continue to use the richer healthz contract.
+   */
+  @Get('livez')
+  @SkipWrap()
+  livez(): { schemaVersion: 'anysentry.livez.v1'; status: 'ok'; service: 'anysentry-api' } {
+    return { schemaVersion: 'anysentry.livez.v1', status: 'ok', service: 'anysentry-api' };
+  }
+
   @Get('healthz')
   healthz() {
     const stats = this.judge.healthStats();
@@ -10547,6 +10737,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         gaps: this.canonicalObservability.gapStats(),
         bindingHotState: this.conversationBindings?.hotStateStats(),
         aggregationCaches: this.agg.cacheStateStats(),
+        canonicalDirectoryCache: this.canonicalDirectoryCacheStats(),
         ingressCaches: ingressCacheStats(),
       },
     };
