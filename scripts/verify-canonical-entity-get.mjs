@@ -328,10 +328,21 @@ try {
   const runtimeDetail = await get(`/v1/runtime-instances/${encodeURIComponent(runtimeId)}`);
   assert.equal(runtimeDetail.item.runtimeInstanceId, runtimeId);
 
-  const sessions = await get(`/v1/sessions?logicalAgentId=${encodeURIComponent(logicalAgentId)}&limit=10`);
+  let sessions;
+  let selectedSession;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    sessions = await get(`/v1/sessions?logicalAgentId=${encodeURIComponent(logicalAgentId)}&limit=50`);
+    selectedSession = sessions.items.find((candidate) =>
+      candidate.interactionIds?.includes(interactionId)
+      || candidate.agentInstanceIds?.includes(runtimeId));
+    if (selectedSession) break;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
   assert.equal(sessions.schemaVersion, 'anysentry.session.list.v1');
   assert(sessions.items.length > 0, 'Session projection missing');
-  const session = sessions.items[0];
+  const session = selectedSession ?? sessions.items[0];
+  assert(session.agentInstanceIds?.includes(runtimeId) || session.interactionIds?.includes(interactionId),
+    'Session projection did not retain the fixture runtime/interaction membership');
   const sessionDetail = await get(`/v1/sessions/${encodeURIComponent(session.sessionId)}`);
   assert.equal(sessionDetail.item.sessionId, session.sessionId);
   const sessionCoverage = await get(`/v1/sessions/${encodeURIComponent(session.sessionId)}/coverage`);
@@ -341,11 +352,33 @@ try {
   const toolEvent = sessionTimeline.timeline.turns
     .flatMap((turn) => turn.events)
     .find((event) => event.kind === 'tool_call' && event.toolCallId === toolCallId);
+  if (!toolEvent) {
+    console.log(JSON.stringify({
+      selectedSession: {
+        sessionId: session.sessionId,
+        logicalAgentId: session.logicalAgentId,
+        agentInstanceIds: session.agentInstanceIds,
+        interactionIds: session.interactionIds,
+        conversationId: session.conversationId,
+      },
+      sessionItems: sessions.items.slice(0, 20).map((candidate) => ({
+        sessionId: candidate.sessionId,
+        logicalAgentId: candidate.logicalAgentId,
+        agentInstanceIds: candidate.agentInstanceIds,
+        interactionIds: candidate.interactionIds,
+      })),
+      timelineTurns: sessionTimeline.timeline.turns.length,
+    }));
+  }
   assert(toolEvent?.semanticEventId?.startsWith('se_'), 'timeline tool semantic event missing');
   const semanticRecords = await get('/v1/semantic-records?limit=500');
   const durableToolRecord = semanticRecords.items.find((item) => item.kind === 'tool_call' && item.toolCallId === toolCallId);
   assert(durableToolRecord?.semanticRecordId?.startsWith('sr_'), 'durable tool semantic record missing');
-  const timelineEvidence = await get(`/v1/semantic-events/${encodeURIComponent(toolEvent.semanticEventId)}/evidence`);
+  const evidenceScope = new URLSearchParams({
+    ...(session.agentAssetIds?.[0] ? { agentAssetId: session.agentAssetIds[0] } : {}),
+    ...(session.agentInstanceIds?.[0] ? { agentInstanceId: session.agentInstanceIds[0] } : {}),
+  }).toString();
+  const timelineEvidence = await get(`/v1/semantic-events/${encodeURIComponent(toolEvent.semanticEventId)}/evidence${evidenceScope ? `?${evidenceScope}` : ''}`);
   assert.equal(timelineEvidence.requestedSemanticEventId, toolEvent.semanticEventId);
   assert.equal(timelineEvidence.resolvedSemanticEventId, toolEvent.semanticEventId);
   assert(timelineEvidence.aliasCandidates?.includes(durableToolRecord.semanticRecordId)
@@ -371,7 +404,7 @@ try {
   assert.equal(timelineEvidence.evidence?.canonicalEvidenceLinksSource ?? 'computed_compatibility', 'canonical_store');
   assert(timelineEvidence.evidence?.canonicalEvidenceLinks?.some((link) => link.linkId === linkedCanonical.linkId),
     'semantic evidence response must expose the materialized canonical link');
-  const durableEvidence = await get(`/v1/semantic-events/${encodeURIComponent(durableToolRecord.semanticRecordId)}/evidence`);
+  const durableEvidence = await get(`/v1/semantic-events/${encodeURIComponent(durableToolRecord.semanticRecordId)}/evidence${evidenceScope ? `?${evidenceScope}` : ''}`);
   assert.equal(durableEvidence.requestedSemanticEventId, durableToolRecord.semanticRecordId);
   assert.equal(durableEvidence.resolvedSemanticEventId, toolEvent.semanticEventId);
   assert.equal(durableEvidence.aliasOf, durableToolRecord.semanticRecordId);

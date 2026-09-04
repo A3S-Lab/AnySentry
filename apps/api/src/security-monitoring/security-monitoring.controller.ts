@@ -12208,6 +12208,31 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     const sessions = await this.canonicalSessionResources({ ...query, offset: 0, limit: 500 }, headers);
     let session = sessions.items.find((candidate) => [candidate.sessionId, candidate.canonicalSessionId, candidate.conversationId].includes(sessionId));
     let conversationId = session?.conversationId ?? session?.sessionId ?? sessionId;
+    // A membership-only Session can legitimately outlive its compatibility Thread projection and
+    // therefore have no `conversationId`. Resolve one bounded interaction by its immutable
+    // membership reference before falling back to the canonical Session ID; this repairs the
+    // common “Session GET succeeds, timeline is empty” gap without manufacturing a new Session.
+    if (session && !session.conversationId && session.interactionIds.length > 0) {
+      try {
+        const interactionList = await withCanonicalProjectionTimeout(this.agg.agentInteractions({
+          timeType: query.timeType,
+          startTime: query.startTime,
+          endTime: query.endTime,
+          snapshotAsOf: query.snapshotAsOf,
+          scope: 'raw',
+          classificationView: query.classificationView,
+          limit: 500,
+        }), CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS);
+        const matched = interactionList.items.find((item) =>
+          session!.interactionIds.includes(item.interactionId) && item.conversationId);
+        if (matched?.conversationId) {
+          session = { ...session, conversationId: matched.conversationId };
+          conversationId = matched.conversationId;
+        }
+      } catch (error) {
+        if (!isCanonicalProjectionDegradation(error)) throw error;
+      }
+    }
     let timeline: T.AgentConversationTimelineV3 | undefined;
     let timelineDegraded = false;
     let sessionDegraded = false;

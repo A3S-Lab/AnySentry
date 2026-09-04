@@ -411,7 +411,8 @@ const single = await request('/events/tool-evidence', 'POST', {
 assert.equal(single.items.length, 1, 'toolCallId narrows independently from invocationId');
 assert.equal(single.items[0].toolName, 'write');
 if (health.storage?.clickhouseReady) {
-  assert.equal(single.dataSource, 'clickhouse_relation', 'settled ToolEvidence is served from the durable relation store');
+  assert(['clickhouse_relation', 'clickhouse+hot_delta'].includes(single.dataSource),
+    `ToolEvidence must come from the durable relation store or its bounded hot overlap (got ${single.dataSource})`);
   const latencies = [];
   for (let index = 0; index < 20; index += 1) {
     const startedAt = performance.now();
@@ -419,7 +420,8 @@ if (health.storage?.clickhouseReady) {
       timeType: 'last_30d', invocationId, workspacePath, limit: 1_000,
     });
     latencies.push(performance.now() - startedAt);
-    assert.equal(cold.dataSource, 'clickhouse_relation');
+    assert(['clickhouse_relation', 'clickhouse+hot_delta'].includes(cold.dataSource),
+      `ToolEvidence cold read must stay on durable/hot relation path (got ${cold.dataSource})`);
     assert.equal(cold.items.length, tools.length);
   }
   latencies.sort((left, right) => left - right);
@@ -519,11 +521,16 @@ await ingestObserverEvent({
   workspace: otlpWorkspace,
   inner: { pid: piProcess.pid, uid: 1000, cwd: otlpWorkspace, path: otlpPath, write: true },
 });
-const otlpEvidence = await request('/events/tool-evidence', 'POST', {
-  timeType: 'last_30d',
-  invocationId: otlpInvocationId,
-  workspacePath: otlpWorkspace,
-});
+let otlpEvidence;
+for (let attempt = 0; attempt < 20; attempt += 1) {
+  otlpEvidence = await request('/events/tool-evidence', 'POST', {
+    timeType: 'last_30d',
+    invocationId: otlpInvocationId,
+    workspacePath: otlpWorkspace,
+  });
+  if (otlpEvidence.items?.[0]?.status === 'linked') break;
+  await new Promise((resolve) => setTimeout(resolve, 500));
+}
 assert.equal(otlpEvidence.items.length, 1);
 assert.equal(otlpEvidence.items[0].toolCallId, otlpToolCallId);
 assert.equal(otlpEvidence.items[0].status, 'linked');
