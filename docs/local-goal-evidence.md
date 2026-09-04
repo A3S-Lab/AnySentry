@@ -35,7 +35,7 @@
 | `tender_jang` | 容器镜像为 `node:24-bookworm`；已安装 Codex CLI 0.149.1、Claude Code 2.1.251；容器内存在 LangChain/LangGraph Python 运行库 | 容器没有 published port、Docker socket 或 Docker CLI，因此这些版本是容器内可调用运行时，不等于可以从容器内编排 Docker 或已接入 Observer |
 | `tender_jang` LangChain 服务 | 容器内 `service.py` 进程监听 18082，`/health=200`；运行库为 LangChain 1.3.17、LangGraph 1.2.11；宿主 loopback 由既有本地转发进程接入 | 证明当前容器确有可用服务，不证明它已由 AnySentry 当前头镜像或 Observer 被动观测 |
 | `tender_jang` LangChain 证书轮换 | 旧过期测试 CA/server cert 已精确备份后轮换；HTTPS `/invoke` 两次 HTTP200、1×`lookup_fixture`，确认后旧备份已清理 | 仅修复本地测试服务生命周期；常驻服务流量进入 current-head Observer/Canonical 投影仍未验证 |
-| k3s Workspace Scanner 稳定性 | 旧 ReplicaSet 反复重启（约 1688 次）直接源于 scanner 对生成 `.runtime/.../tls` 目录 `opendir` 未捕获 EACCES；另一 ReplicaSet 使用不存在 `/srv/anysentry/AnySentry` hostPath，kubelet 报 FailedMount | scanner 已加入 `.runtime` 排除和嵌套不可读目录 best-effort；新增只读 preflight/临时 Kustomize renderer，禁止 DirectoryOrCreate；正式 namespace 尚未切换新 scanner image |
+| k3s Workspace Scanner 稳定性 | 旧 ReplicaSet 反复重启（约 1698 次）直接源于 scanner 对生成 `.runtime/.../tls` 目录 `opendir` 未捕获 EACCES；另一 ReplicaSet 使用不存在 `/srv/anysentry/AnySentry` hostPath，kubelet 报 FailedMount | 已部署本地 scanner manifest `sha256:7a20…` 并将 live hostPath 切换到经 preflight 验证的 `/home/chensicheng/a3s/security/AnySentry`；新 Pod `restartCount=0`，日志 `started`/`scan completed`（1385 components）；仍保留 `type: Directory`，禁止 DirectoryOrCreate |
 | 旧 k3s 身份反例 | 旧 k3s API image digest/revision 下，同一 Docker cgroup 的历史 LangChain 与 Claude Code 均有 `LlmInteraction`，却被合并到同一旧 agentAsset/session/run；Observer source/profile 可见但 cgroup map 仍把 Codex/Claude/LangChain 标为同一 `langchain` scope | 这是旧部署的真实混合身份/误合并反例；current-head 尚未部署，必须用 ProcessGeneration + Adapter/definition fence 拆分，不能把旧 asset 当 confirmed LogicalAgent |
 | Codex/Claude 本地 fixture | 本回合各完成两阶段请求—ToolCall—ToolResult—最终回复闭环 | 证明产品级协议/适配器闭环；不是当前 Observer 被动 eBPF 捕获证明 |
 | LangChain 临时 HTTP 副本 | 本地 HTTP 服务的工具闭环返回 HTTP 200 | 证明 HTTP transport、工具路由和结果回传可验证；不外推到常驻 HTTPS |
@@ -165,7 +165,7 @@ node scripts/verify-canonical-goal.mjs --json-out /tmp/canonical-goal-round2-pro
 
 - Host `healthz` 返回 2xx，服务状态为 `ok`，但 `storageMode=memory`、ClickHouse/PostgreSQL 未就绪；脚本将 Host 环境标为 `partial`，这只能证明 API 进程可响应，不能证明耐久部署；
 - Docker daemon 与基础/模块 Compose 解析通过，Dify 容器仍健康；未发现本分支 AnySentry API 容器，localhost 2xx 被标为 Docker `partial`，避免误把 Host 进程当 Docker 部署；
-- k3s `default` context 的 AnySentry NodePort 返回 2xx，存储为 ClickHouse/PostgreSQL，核心 workload ready；workspace-scanner 历史 CrashLoop/ContainerCreating 已定位为代码 EACCES 与错误 hostPath 两类问题，代码/preflight 修复已完成但正式 Deployment/image 尚未切换，故整体仍为 `partial`；
+- k3s `default` context 的 AnySentry NodePort 返回 2xx，存储为 ClickHouse/PostgreSQL，核心 workload ready；workspace-scanner 历史 CrashLoop/ContainerCreating 已定位为代码 EACCES 与错误 hostPath 两类问题，现已切换本地 scanner digest/path 且新 Pod restart0、scan completed，但 AnySentry/Observer 正式 current-head 仍未整体切换，故整体仍为 `partial`；
 - SSH 在该历史回合仅检查本地 `ssh`/`ssh -G` 和 22/2222 TCP 可达性，没有执行独立远端命令；当前会话的实际观测以 2026-09-04 durable 结果为准；
 - `deploy/anysentry.yaml`、`deploy/observer.yaml`、`deploy/streaming.yaml` 均通过 `kubectl apply --dry-run=client --validate=false`；Dify Compose 直接解析缺少已准备的上游 Compose/UID 变量，未运行 `prepare.sh`（避免下载或改动）；
 - fixture shell `bash -n` 和四个非生成 Python 源文件的内存 compile 通过；CLI fixture 没有 Compose 文件，使用 Host 启动脚本；LangChain Compose 可解析；
@@ -291,7 +291,7 @@ EvidenceLink/Correlation → Sentry → Conversation/Evidence/Coverage projectio
 | Host | partial | API health 200 但 memory fallback；特权本地 k3s Pod 的 Observer BPF load smoke 通过；当前 shell/SSH 用户 `CapEff=0` 且 `unprivileged_bpf_disabled=2`，未把当前 workload 的完整 attach/转发链写成通过 |
 | SSH | partial（协议解析通过，身份/原文/统一证据 partial） | VSCode SSH `notty` 链 native Codex PID 1101287 在 2026-09-03 16:14–16:22Z durable custom window 初始有 60 条 parsed/confirmed/complete `LlmInteraction`（model 56、tool 4）；后续异步 `agents/interactions` 快照约 63 records（model57/tool4 + 2 unsupported/unparsed）。request roles 证明 semantic lane 已进入，identity/session/run 与 EvidenceLink 仍 partial |
 | Docker | partial | daemon 与 Compose config 通过；Dify 容器健康；`tender_jang` 可调用 CLI/库但无 Docker CLI/socket；未发现本分支 AnySentry API 容器 |
-| Kubernetes | partial | `kubectl` API、LangGraph `/healthz` 与 `/runs` 真实调用可用；本回合 sandbox KernelFact 为 ToolExec2/ProcessExit2（physical_workload confidence0.70）；临时 API/Web OCI overlay 与 Observer 组合 smoke 已局部验证后清理，但 existing AnySentry/Observer 仍旧 digest、canonical GET 未切换正式部署，workspace-scanner 路径/镜像尚未正式切换且 critical inbox 缺口未消除 |
+| Kubernetes | partial | `kubectl` API、LangGraph `/healthz` 与 `/runs` 真实调用可用；本回合 sandbox KernelFact 为 ToolExec2/ProcessExit2（physical_workload confidence0.70）；workspace-scanner 已切换本地 scanner digest/path，新 Pod restart0 并完成一次 1385-component scan；existing AnySentry/Observer 仍旧 digest、canonical GET 未切换正式部署，critical inbox 缺口未消除 |
 
 本轮 identity fence 代码已进入 AnySentry `477f897` / Observer `030b910`，但线上旧 Observer/Forwarder
 仍可能把同 cgroup 的混合进程 broad-admit；升级必须以 Observer、Forwarder 和对应 publisher 的

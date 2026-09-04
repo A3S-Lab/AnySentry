@@ -60,7 +60,7 @@ k3s Pod 中以 Aya `Program::load` 逐项加载了
 | `tender_jang` | `node:24-bookworm` 容器内有 Codex CLI 0.149.1、Claude Code 2.1.251；Python 运行库为 LangChain 1.3.17/LangGraph 1.2.11 | 容器无 published port、Docker socket、Docker CLI；这是运行时盘点，不是 Docker 编排或 Observer 接入证明 |
 | `tender_jang` LangChain 服务 | 容器内 `service.py` 监听 18082，`/health=200`；宿主 loopback 由既有本地转发进程接入 | 证明当前容器有可达服务，不证明当前头 AnySentry/Observer 已接入 |
 | `tender_jang` LangChain 证书轮换 | 旧过期测试 CA/server cert 已在容器内精确备份后轮换；HTTPS `/invoke` 两次 HTTP200、1×`lookup_fixture`，确认后旧备份已清理 | 仅修复本地测试服务生命周期；常驻服务流量进入 current-head Observer/Canonical 投影仍未验证 |
-| k3s Workspace Scanner 稳定性 | 旧 ReplicaSet 反复重启的直接原因是 `workspace-scanner.mjs` 对生成的 `.runtime/.../tls` 目录 `opendir` 未捕获 EACCES；另一 ReplicaSet 使用不存在的 `/srv/anysentry/AnySentry` hostPath，kubelet 明确 `FailedMount` | 前者为 scanner 代码健壮性缺口，已加入 `.runtime` 排除与嵌套不可读目录 best-effort；后者为节点路径配置问题，新增只读 preflight/临时 Kustomize patch renderer，禁止 `DirectoryOrCreate`；正式 namespace 尚未切换新 scanner image |
+| k3s Workspace Scanner 稳定性 | 旧 ReplicaSet 反复重启（约 1698 次）的直接原因是 `workspace-scanner.mjs` 对生成的 `.runtime/.../tls` 目录 `opendir` 未捕获 EACCES；另一 ReplicaSet 使用不存在的 `/srv/anysentry/AnySentry` hostPath，kubelet 明确 `FailedMount` | 已加入 `.runtime` 排除与嵌套不可读目录 best-effort；只读 preflight/临时 Kustomize renderer 拒绝缺失路径与 `DirectoryOrCreate`。live `workspace-scanner` 已切换本地 manifest `sha256:7a20…` 和实际 checkout path，新 Pod `restartCount=0`，完成一次 1385-component scan；AnySentry/Observer 仍未整体切换 current-head |
 | 旧 k3s 身份反例 | 旧 k3s API image digest/revision 下，同一 Docker cgroup 的历史 LangChain 与 Claude Code 均有 `LlmInteraction`，却被合并到同一旧 agentAsset/session/run；Observer source/profile 可见但 cgroup map 仍把 Codex/Claude/LangChain 标为同一 `langchain` scope | 这是旧部署的真实混合身份/误合并反例；current-head 尚未部署，必须用 ProcessGeneration + Adapter/definition fence 拆分，不能把旧 asset 当 confirmed LogicalAgent |
 | Codex/Claude fixture | 本回合各完成两阶段请求、ToolCall、ToolResult、最终回复 | 产品级协议/适配闭环通过；不等于被动 eBPF 捕获或 durable API 投影通过 |
 | LangChain 临时 HTTP 副本 | 工具闭环返回 HTTP 200 | 证明本地 HTTP transport/工具路由可运行；不外推到 HTTPS 或生产服务 |
@@ -400,7 +400,7 @@ Session、原文完整读取、容器被动捕获、LangGraph 逐事件唯一 Ev
 | Host | partial | API health 200，当前使用 memory fallback；CLI loopback fixture 已在 Host 执行；UID 1001、`unprivileged_bpf_disabled=2`，无直接 eBPF attach 能力 |
 | SSH | partial（协议解析、身份/正文/统一证据 partial） | VSCode SSH `notty` 链 native PID 1101287 在 2026-09-03 16:14–16:22Z durable custom window 初始有 60 条 parsed/confirmed/complete `LlmInteraction`（model56/tool4），后续异步 `agents/interactions` 约 63 records（model57/tool4 + 2 unsupported/unparsed）；另有 2 条 `tls_uprobe_rustls` metadata-only/unparsed。identity/session/run 仍 runtime/probable 提示，非 authenticated AgentAdapter/confirmed Session |
 | Docker | partial | Docker daemon、Compose config 和既有 Dify 栈健康；`tender_jang` 有 CLI/库但无 Docker CLI/socket；当前头 AnySentry API 容器仍未部署 |
-| Kubernetes | partial | k3s LangGraph `/healthz` 与 `/runs` 真实调用、durable 查询可用；临时 API/Web OCI 与 Observer 组合 smoke 已验证后清理，但 existing AnySentry/Observer 仍旧 digest、canonical GET 未切换正式部署，`critical_inbox_dropped` 约 1.89M（最近观测且继续上涨）等可靠性缺口仍在。overlay/hostPath fallback 不是已切换的正式部署 |
+| Kubernetes | partial | k3s LangGraph `/healthz` 与 `/runs` 真实调用、durable 查询可用；workspace-scanner 已切换本地 digest/path，新 Pod restart0 并完成一次 1385-component scan；临时 API/Web OCI 与 Observer 组合 smoke 已验证后清理，但 existing AnySentry/Observer 仍旧 digest、canonical GET 未切换正式部署，`critical_inbox_dropped` 约 1.89M（最近观测且继续上涨）等可靠性缺口仍在 |
 
 Kafka/Flink 只在已有可选 profile 中保留，未成为 Canonical 主链前置依赖；本阶段不新增时间窗
 功能。Kubernetes/ Docker 的旧服务健康不被用来冒充当前工作树部署通过。
