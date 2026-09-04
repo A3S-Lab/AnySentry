@@ -629,7 +629,7 @@ node scripts/verify-deployment-manifests.mjs
 
 | 项目 | 当前事实 | 说明 |
 | --- | --- | --- |
-| AnySentry checkpoint | repository `32672a5`（运行时代码 `02b745a`） | 包含 Canonical hot/evidence fallback、Session alias retry、dirty-key persistence 和覆盖刷新去重；`32672a5` 只补本地验收文档 |
+| AnySentry checkpoint | repository `7ad5c41`（运行时代码 `02b745a`） | 包含 Canonical hot/evidence fallback、Session alias retry、dirty-key persistence 和覆盖刷新去重；`7ad5c41` 只补本地验收文档 |
 | Observer checkpoint | `40556f5` | 本回合没有修改 Observer 源码或镜像 |
 | API/Web 镜像 | `127.0.0.1:5000/anysentry:goal-head-20260905-r51-canonical-final`，digest `sha256:bf625fe8bee8019bd7121c0045cc1f8b9e00e4ee6933aaa6d65962fd6c9dfc5c` | amd64、`--provenance=false --sbom=false`，仅 loopback registry |
 | Kubernetes API Pod | `anysentry-694fbdd8cd-pbj8j`，1/1 Ready，restart 0 | PodTemplate image、source annotation 与 digest 一致 |
