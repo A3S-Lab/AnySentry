@@ -1532,11 +1532,14 @@ function semanticToolHints(event: T.JudgedEvent): {
     || (typeof attributes['error.type'] === 'string' && Boolean(attributes['error.type']))
     || (typeof attributes['error.message'] === 'string' && Boolean(attributes['error.message']))
     || (typeof status === 'string' && /(?:error|fail)/iu.test(status));
+  const terminalLifecycle = /^(?:end|complete|completed|finished)$/iu.test(lifecyclePhase ?? '');
+  // A generic OTLP status=OK can be attached to a span at start time.  It is useful for error
+  // classification, but without an explicit end timestamp/lifecycle, exit code, or result hash it
+  // must not manufacture a completed ToolResult.
   const completed = exitCode !== undefined
     || resultHash !== undefined
     || spanEnd !== undefined
-    || /^(?:end|complete|completed|finished)$/iu.test(lifecyclePhase ?? '')
-    || (typeof status === 'string' && /^(?:ok|success|completed?|finished?|error|failed?)$/iu.test(status));
+    || terminalLifecycle;
   return {
     ...(toolCallId ? { toolCallId } : {}),
     ...(toolName ? { toolName } : {}),
@@ -1602,10 +1605,21 @@ function semanticTrafficRole(
   }
   // A model/API span with a trusted run/session anchor can still be part of the human-visible
   // turn; an anchor-free infrastructure span is safer as technical activity than as a new thread.
+  const producerRunAnchor = Boolean(event.runId)
+    && !['derived_ephemeral', 'legacy'].includes(event.runIdSource ?? '');
+  const providerSessionAnchor = Boolean(event.sessionKey)
+    || ['provider', 'authenticated_adapter'].includes(event.sessionIdSource ?? '')
+    || ['confirmed', 'strong'].includes(event.sessionIdentityQuality ?? '');
   if (['llmapi', 'llmcall', 'llminteraction', 'llm_response', 'llmresponse'].includes(normalizedKind)
-    && (event.runId || event.turnId || event.sessionId || event.canonicalSessionId)) {
+    && (producerRunAnchor || event.turnId || providerSessionAnchor)) {
     return 'conversation';
   }
+  const technicalKinds = new Set([
+    'runtimeevent', 'runtime_event', 'processexit', 'process_exit', 'processfork', 'process_fork',
+    'fileaccess', 'file_access', 'filedelete', 'file_delete', 'egress', 'dns', 'tls', 'sslcontent',
+    'securityaction', 'security_action', 'systemcontext', 'system_context', 'connection', 'network',
+  ]);
+  if (technicalKinds.has(normalizedKind)) return 'background';
   return 'background';
 }
 
@@ -2234,7 +2248,10 @@ function sanitizeInlineEndpointLiterals(value: string): string {
 }
 
 function sanitizeRawPreview(value: unknown, limit = 1_800): string | undefined {
-  const source = typeof value === 'string' ? value : JSON.stringify(value);
+  // Keep preview parsing bounded even when a caller supplies a body-sized string/object. The
+  // resulting persisted preview is still capped at `limit`; this guard prevents a privacy scrub
+  // from becoming an unbounded JSON parse on an ingress request.
+  const source = typeof value === 'string' ? value.slice(0, 64 * 1024) : JSON.stringify(value)?.slice(0, 64 * 1024);
   if (!source) return undefined;
   try {
     const serialized = JSON.stringify(sanitizePreviewValue(JSON.parse(source)));
