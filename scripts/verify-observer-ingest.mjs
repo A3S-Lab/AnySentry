@@ -176,7 +176,9 @@ async function createProtectedObserverSource(suffix = '') {
     enabled: true,
     requireToken: true,
     collectorId: `${sourcePrefix}-collector`,
-    workspacePath: `repo://${sourcePrefix}/observer`,
+    // This source is intentionally reused by fixtures that exercise several workspace scopes.
+    // Leave workspace unbound here; the dedicated source-scope tests below still prove that a
+    // bound Source rejects a mismatched workspace without weakening production validation.
     owner: 'verify-observer-ingest',
     tags: [sourcePrefix, 'observer-verifier'],
   });
@@ -1902,6 +1904,12 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
         other: 1,
         unbounded_untrusted_key: 99,
       },
+      batchDeliveryOutcomes: {
+        'projection:timeout': 2,
+        'http_status:503': 1,
+        '__other__': 4,
+        'unsafe key with spaces': 99,
+      },
       batches: 1,
       batchEvents: 9,
       retryQueued: 5,
@@ -1928,6 +1936,22 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       spoolWalCapacityRejects: 3,
       spoolWalAckErrors: 1,
       spoolFsyncMode: 'always',
+      spoolCompactionDeferred: 5,
+      spoolCompactions: 2,
+      spoolCompactMaxLiveRecords: 16_384,
+      spoolPendingPutRecords: 3,
+      spoolPendingPutBytes: 456,
+      spoolPendingOperations: 1,
+      spoolMaxRecordBytes: 16 * 1024 * 1024,
+      spoolLazyRecords: 8,
+      spoolLazyReads: 9,
+      spoolLazyReadErrors: 1,
+      spoolLazyBodyReleases: 7,
+      spoolResidentBodies: 1,
+      spoolReadBlockedRecords: 2,
+      spoolReplayReadErrors: 1,
+      spoolProtectedReserveRecords: 4_096,
+      spoolProtectedReserveBytes: 16 * 1024 * 1024,
       controlPlaneState: 'degraded',
       controlPlaneFailedLanes: ['runtime_snapshot', 'untrusted_lane'],
       controlPlaneStartingLanes: [],
@@ -2083,6 +2107,22 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       health.items?.[0]?.filterMetrics?.spoolWalCapacityRejects === 3 &&
       health.items?.[0]?.filterMetrics?.spoolWalAckErrors === 1 &&
       health.items?.[0]?.filterMetrics?.spoolFsyncMode === 'always' &&
+      health.items?.[0]?.filterMetrics?.spoolCompactionDeferred === 5 &&
+      health.items?.[0]?.filterMetrics?.spoolCompactions === 2 &&
+      health.items?.[0]?.filterMetrics?.spoolCompactMaxLiveRecords === 16_384 &&
+      health.items?.[0]?.filterMetrics?.spoolPendingPutRecords === 3 &&
+      health.items?.[0]?.filterMetrics?.spoolPendingPutBytes === 456 &&
+      health.items?.[0]?.filterMetrics?.spoolPendingOperations === 1 &&
+      health.items?.[0]?.filterMetrics?.spoolMaxRecordBytes === 16 * 1024 * 1024 &&
+      health.items?.[0]?.filterMetrics?.spoolLazyRecords === 8 &&
+      health.items?.[0]?.filterMetrics?.spoolLazyReads === 9 &&
+      health.items?.[0]?.filterMetrics?.spoolLazyReadErrors === 1 &&
+      health.items?.[0]?.filterMetrics?.spoolLazyBodyReleases === 7 &&
+      health.items?.[0]?.filterMetrics?.spoolResidentBodies === 1 &&
+      health.items?.[0]?.filterMetrics?.spoolReadBlockedRecords === 2 &&
+      health.items?.[0]?.filterMetrics?.spoolReplayReadErrors === 1 &&
+      health.items?.[0]?.filterMetrics?.spoolProtectedReserveRecords === 4_096 &&
+      health.items?.[0]?.filterMetrics?.spoolProtectedReserveBytes === 16 * 1024 * 1024 &&
       health.items?.[0]?.filterMetrics?.controlPlaneState === 'degraded' &&
       health.items?.[0]?.filterMetrics?.controlPlaneFailedLanes?.[0] === 'runtime_snapshot' &&
       health.items?.[0]?.filterMetrics?.controlPlaneFailedLanes?.length === 1 &&
@@ -2109,6 +2149,10 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       health.items?.[0]?.filterMetrics?.queueDroppedByClass?.process_exit === 1 &&
       health.items?.[0]?.filterMetrics?.queueDroppedByClass?.capture_aggregate === 2 &&
       health.items?.[0]?.filterMetrics?.queueDroppedByClass?.other === 1 &&
+      health.items?.[0]?.filterMetrics?.batchDeliveryOutcomes?.['projection:timeout'] === 2 &&
+      health.items?.[0]?.filterMetrics?.batchDeliveryOutcomes?.['http_status:503'] === 1 &&
+      health.items?.[0]?.filterMetrics?.batchDeliveryOutcomes?.__other__ === 4 &&
+      !Object.prototype.hasOwnProperty.call(health.items?.[0]?.filterMetrics?.batchDeliveryOutcomes ?? {}, 'unsafe key with spaces') &&
       !Object.prototype.hasOwnProperty.call(
         health.items?.[0]?.filterMetrics?.queueDroppedByClass ?? {},
         'unbounded_untrusted_key',

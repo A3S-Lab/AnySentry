@@ -2500,6 +2500,15 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       key,
       clamp(rawQueueDroppedByClass[key]),
     ])) as NonNullable<import('./types').CollectorFilterMetrics['queueDroppedByClass']>;
+    const batchDeliveryOutcomes = rawFilter.batchDeliveryOutcomes && typeof rawFilter.batchDeliveryOutcomes === 'object'
+      ? Object.fromEntries(Object.entries(rawFilter.batchDeliveryOutcomes)
+        .slice(0, 32)
+        .flatMap(([key, value]) => {
+          const normalizedKey = cleanText(key, 128);
+          if (!normalizedKey || !/^[a-z0-9_.:-]+$/iu.test(normalizedKey)) return [];
+          return [[normalizedKey, clamp(value)]];
+        }))
+      : undefined;
     const captureProfileFilterMetrics: Partial<import('./types').CollectorFilterMetrics> = {};
     const controlPlaneLaneNames = [
       'identity', 'filter_rules', 'infrastructure_policy', 'runtime_snapshot',
@@ -2683,6 +2692,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       queueParked: clamp(rawFilter.queueParked),
       protectedQueueDropped: clamp(rawFilter.protectedQueueDropped),
       queueDroppedByClass,
+      ...(batchDeliveryOutcomes && Object.keys(batchDeliveryOutcomes).length
+        ? { batchDeliveryOutcomes } : {}),
       batches: clamp(rawFilter.batches),
       batchEvents: clamp(rawFilter.batchEvents),
       retryQueued: clamp(rawFilter.retryQueued),
@@ -2715,6 +2726,22 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       spoolWalCapacityRejects: clamp(rawFilter.spoolWalCapacityRejects),
       spoolWalAckErrors: clamp(rawFilter.spoolWalAckErrors),
       spoolFsyncMode: rawFilter.spoolFsyncMode === 'always' ? 'always' : 'periodic',
+      spoolCompactionDeferred: clamp(rawFilter.spoolCompactionDeferred),
+      spoolCompactions: clamp(rawFilter.spoolCompactions),
+      spoolCompactMaxLiveRecords: clamp(rawFilter.spoolCompactMaxLiveRecords),
+      spoolPendingPutRecords: clamp(rawFilter.spoolPendingPutRecords),
+      spoolPendingPutBytes: clamp(rawFilter.spoolPendingPutBytes),
+      spoolPendingOperations: clamp(rawFilter.spoolPendingOperations),
+      spoolMaxRecordBytes: clamp(rawFilter.spoolMaxRecordBytes),
+      spoolLazyRecords: clamp(rawFilter.spoolLazyRecords),
+      spoolLazyReads: clamp(rawFilter.spoolLazyReads),
+      spoolLazyReadErrors: clamp(rawFilter.spoolLazyReadErrors),
+      spoolLazyBodyReleases: clamp(rawFilter.spoolLazyBodyReleases),
+      spoolResidentBodies: clamp(rawFilter.spoolResidentBodies),
+      spoolReadBlockedRecords: clamp(rawFilter.spoolReadBlockedRecords),
+      spoolReplayReadErrors: clamp(rawFilter.spoolReplayReadErrors),
+      spoolProtectedReserveRecords: clamp(rawFilter.spoolProtectedReserveRecords),
+      spoolProtectedReserveBytes: clamp(rawFilter.spoolProtectedReserveBytes),
       queueBytes: clamp(rawFilter.queueBytes),
       inflightEvents: clamp(rawFilter.inflightEvents),
       inflightBytes: clamp(rawFilter.inflightBytes),

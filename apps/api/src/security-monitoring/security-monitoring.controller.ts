@@ -55,9 +55,9 @@ import { parseObserverAgentInteraction } from './agent-interaction';
 import { captureClassificationDecision } from './identity-judgment-routing';
 import { AgentConversationBindingService } from './agent-conversation-binding.service';
 import { CanonicalObservabilityService } from './canonical-observability.service';
-import { CANONICAL_SESSION_ID_ALGORITHM_V1, SESSION_KEY_ALGORITHM_V1, SESSION_HASH_SECRET_MODE, canonicalParentSessionIdForMembership, canonicalSessionIdForMembership, createEvidenceLink, deriveAgentInstanceIdentity, deriveProcessGenerationKey, resolveSessionIdentity } from './canonical-observability';
+import { CANONICAL_SESSION_ID_ALGORITHM_V1, SESSION_KEY_ALGORITHM_V1, SESSION_HASH_SECRET_MODE, canonicalParentSessionIdForMembership, canonicalSessionIdForMembership, createEvidenceLink, deriveAgentInstanceIdentity, deriveProcessGenerationKey, resolveSessionIdentity, validateKernelFact } from './canonical-observability';
 import { agentRuntimeInstanceIdForEvent } from './agent-identity';
-import type { EvidenceLink, SemanticRecord } from './canonical-observability';
+import type { EvidenceLink, KernelFact, SemanticRecord } from './canonical-observability';
 import { canonicalEvidenceLinksForRelations as buildCanonicalEvidenceLinks } from './agent-semantic-kernel-relation';
 import type { UnknownInfrastructureDraftRequest } from './infrastructure-rule.types';
 import {
@@ -206,6 +206,18 @@ const CANONICAL_DIRECTORY_PROJECTION_TIMEOUT_MS = boundedControllerEnvInt(
 );
 const CANONICAL_SESSION_PROJECTION_TIMEOUT_MS = boundedControllerEnvInt(
   'ANYSENTRY_CANONICAL_SESSION_PROJECTION_TIMEOUT_MS',
+  2_000,
+  250,
+  10_000,
+);
+const CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS = boundedControllerEnvInt(
+  'ANYSENTRY_CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS',
+  2_000,
+  250,
+  10_000,
+);
+const CANONICAL_SEMANTIC_EVIDENCE_TIMEOUT_MS = boundedControllerEnvInt(
+  'ANYSENTRY_CANONICAL_SEMANTIC_EVIDENCE_TIMEOUT_MS',
   2_000,
   250,
   10_000,
@@ -556,6 +568,67 @@ function canonicalSemanticRecordTouchesSession(
   if (record.canonicalSessionId && sessionIds.has(record.canonicalSessionId)) return true;
   return session.interactionIds.some((interactionId) =>
     record.sourceRefs.includes(interactionId) || record.derivedFrom.includes(interactionId));
+}
+
+/**
+ * Reconstruct a metadata-only KernelFact from the immutable compatibility event when the
+ * relational canonical side lane is temporarily unavailable.  The event already carries the
+ * server-assigned fact ID and raw/source references; this helper never copies command text,
+ * prompt content, or producer claims into the canonical response.
+ */
+function kernelFactFromCompatibilityEvent(
+  event: T.JudgedEvent,
+  requestedFactId: string,
+): KernelFact | undefined {
+  if (!/^kf_[a-f0-9]{24}$/u.test(requestedFactId) || event.kernelFactId !== requestedFactId) return undefined;
+  const observedAtUnixNs = /^\d{9,41}$/u.test(event.eventAtUnixNs ?? '')
+    ? event.eventAtUnixNs!
+    : Number.isSafeInteger(event.at) && event.at >= 0
+      ? (BigInt(event.at) * 1_000_000n).toString()
+      : undefined;
+  if (!observedAtUnixNs) return undefined;
+  const sourceRefs = [...new Set([
+    event.rawObservationId,
+    event.sourceEventId,
+    event.eventId,
+  ].filter((value): value is string => Boolean(value)))].slice(0, 8);
+  if (sourceRefs.length === 0) return undefined;
+  const processGenerationKey = event.process?.processGenerationKey
+    ?? event.attribution?.processGenerationKey;
+  const parentProcessGenerationKey = event.process?.parentProcessGenerationKey
+    ?? event.attribution?.parentProcessGenerationKey;
+  const fact = {
+    schemaVersion: 'anysentry.kernel_fact.v1' as const,
+    factId: requestedFactId,
+    kind: event.eventKind === 'ProcessExit'
+      ? 'exit'
+      : event.eventKind === 'ToolExec'
+        ? 'exec'
+        : event.eventKind.toLowerCase().includes('network') || event.eventKind === 'Egress'
+          ? 'network'
+          : event.eventKind.toLowerCase().includes('dns')
+            ? 'dns'
+            : event.eventKind.toLowerCase().includes('security')
+              ? 'security'
+              : event.eventKind.toLowerCase().includes('file')
+                ? 'file'
+                : 'unknown',
+    authority: event.source === 'observer' ? 'attested_observer' as const : 'server_process_graph' as const,
+    sourceRefs,
+    derivedFrom: [event.rawObservationId ?? event.eventId],
+    observedAtUnixNs,
+    ...(processGenerationKey && /^pgk_[a-f0-9]{24}$/u.test(processGenerationKey)
+      ? { processGenerationKey } : {}),
+    ...(parentProcessGenerationKey && /^pgk_[a-f0-9]{24}$/u.test(parentProcessGenerationKey)
+      ? { parentProcessGenerationKey } : {}),
+    ...(event.runtimeInstanceId ? { scope: event.runtimeInstanceId } : {}),
+    eventId: event.eventId,
+    status: event.eventKind === 'ProcessExit'
+      ? 'completed' as const
+      : event.decisionStatus === 'failed' ? 'failed' as const : 'observed' as const,
+  } satisfies KernelFact;
+  const checked = validateKernelFact(fact);
+  return checked.ok ? checked.value : undefined;
 }
 
 function canonicalConversationSourceRefs(summary: T.AgentConversationSummary): string[] {
@@ -9836,6 +9909,35 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     };
   }
 
+  /**
+   * Resolve a KernelFact from the canonical side lane first, then from its immutable compatibility
+   * event. The fallback is metadata-only and explicitly marked partial; it exists for the period
+   * in which PostgreSQL persistence is degraded, so a ToolExec event never exposes a dead 404
+   * deep link merely because its derived side row arrived late.
+   */
+  private async canonicalKernelFactWithFallback(
+    factId: string,
+  ): Promise<{ fact: KernelFact; fallback: boolean }> {
+    const canonical = await this.canonicalObservability.getDurableKernelFact(factId);
+    if (canonical) return { fact: canonical, fallback: false };
+    try {
+      const page = await this.judge.searchStoredEventsPage({
+        sinceMs: Math.max(0, Date.now() - 30 * 24 * 60 * 60 * 1_000),
+        untilMs: Date.now(),
+        kernelFactId: factId,
+        candidateLimit: 8,
+        limit: 1,
+      });
+      const event = page.events.find((candidate) => candidate.kernelFactId === factId);
+      const reconstructed = event ? kernelFactFromCompatibilityEvent(event, factId) : undefined;
+      if (reconstructed) return { fact: reconstructed, fallback: true };
+    } catch {
+      // A failed fallback query is still a normal coverage gap; preserve the original 404
+      // contract when no immutable compatibility row can be located.
+    }
+    throw new NotFoundException('kernel fact not found');
+  }
+
   /** Machine-side canonical facts remain queryable even when no semantic Adapter is available. */
   @Get('v1/kernel-facts')
   @RequireManagementAuth()
@@ -9856,9 +9958,17 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   async canonicalKernelFact(@Param('factId') factId: string) {
     const id = strictIdentityText(factId, 240);
     if (!id) throw new BadRequestException('factId is invalid');
-    const item = await this.canonicalObservability.getDurableKernelFact(id);
-    if (!item) throw new NotFoundException('kernel fact not found');
-    return { schemaVersion: 'anysentry.kernel_fact.v1', item };
+    const resolved = await this.canonicalKernelFactWithFallback(id);
+    return {
+      schemaVersion: 'anysentry.kernel_fact.v1',
+      item: resolved.fact,
+      ...(resolved.fallback
+        ? {
+            coverage: canonicalCoverage(true, ['canonical_kernel_fact_projection_unavailable'], 'compatibility_event_projection'),
+            dataSource: 'compatibility_event_projection',
+          }
+        : {}),
+    };
   }
 
   /** Rebuildable human-side semantic projection; bodies remain hash/ref-only in this lane. */
@@ -11070,12 +11180,29 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     }
 
     const sessions = await this.canonicalSessionResources({ ...query, offset: 0, limit: 500 }, headers);
-    const timelineSearch = await this.canonicalSemanticTimelineCandidates(
-      id,
-      semanticRecord,
-      query,
-      sessions.items,
-    );
+    let timelineSearch: CanonicalSemanticTimelineSearch;
+    try {
+      timelineSearch = await withCanonicalProjectionTimeout(
+        this.canonicalSemanticTimelineCandidates(
+          id,
+          semanticRecord,
+          query,
+          sessions.items,
+        ),
+        CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS,
+      );
+    } catch (error) {
+      if (!isCanonicalProjectionDegradation(error)) throw error;
+      // A slow per-session timeline must not make a canonical inspector hang for every candidate.
+      // Keep the durable semantic row (when present) and return an explicit bounded gap; a later
+      // request can retry after the projection catches up.
+      timelineSearch = {
+        candidates: [],
+        scanned: Math.min(sessions.items.length, CANONICAL_SEMANTIC_SESSION_SCAN_MAX),
+        truncated: true,
+        failed: 1,
+      };
+    }
     const uniqueTimelineCandidates = [...new Map(timelineSearch.candidates.map((candidate) => [
       `${candidate.session.sessionId}\u0000${candidate.event.semanticEventId}`,
       candidate,
@@ -11116,7 +11243,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           classificationView: query.classificationView,
           conversationId: selected.session.conversationId ?? selected.session.sessionId,
           semanticEventId: selected.event.semanticEventId,
-        }, headers));
+        }, headers), CANONICAL_SEMANTIC_EVIDENCE_TIMEOUT_MS);
       } catch (error) {
         if (!isCanonicalProjectionDegradation(error)) throw error;
         evidenceFailureReason = error instanceof NotFoundException
@@ -11178,8 +11305,8 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   async canonicalKernelFactContext(@Param('factId') factId: string, @Headers() headers: HeaderBag) {
     const id = strictIdentityText(factId, 240);
     if (!id) throw new BadRequestException('factId is invalid');
-    const fact = await this.canonicalObservability.getDurableKernelFact(id);
-    if (!fact) throw new NotFoundException('kernel fact not found');
+    const resolved = await this.canonicalKernelFactWithFallback(id);
+    const fact = resolved.fact;
     let context: T.AgentKernelSemanticContextResponse;
     let coverage: T.CanonicalEntityCoverage;
     try {
@@ -11203,7 +11330,13 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       schemaVersion: 'anysentry.kernel_fact.context.v1',
       fact,
       context,
-      coverage,
+      coverage: resolved.fallback
+        ? canonicalCoverage(true, [
+            'canonical_kernel_fact_projection_unavailable',
+            ...coverage.reasons,
+          ], coverage.source)
+        : coverage,
+      ...(resolved.fallback ? { dataSource: 'compatibility_event_projection' } : {}),
       revision: this.canonicalCurrentRevision(),
       updateTime: new Date().toISOString(),
     };

@@ -3592,6 +3592,8 @@ export interface CollectorFilterMetrics {
     'tool_exec' | 'process_exit' | 'security' | 'collector_heartbeat' | 'capture_aggregate' | 'agent' | 'other',
     number
   >>;
+  /** Bounded delivery outcome counters keyed only by stage/reason or HTTP status. */
+  batchDeliveryOutcomes?: Record<string, number>;
   batches: number;
   batchEvents: number;
   /** Events first queued for an API-authorized backpressure retry in this heartbeat interval. */
@@ -3636,6 +3638,22 @@ export interface CollectorFilterMetrics {
   spoolWalCapacityRejects?: number;
   spoolWalAckErrors?: number;
   spoolFsyncMode?: 'always' | 'periodic';
+  spoolCompactionDeferred?: number;
+  spoolCompactions?: number;
+  spoolCompactMaxLiveRecords?: number;
+  spoolPendingPutRecords?: number;
+  spoolPendingPutBytes?: number;
+  spoolPendingOperations?: number;
+  spoolMaxRecordBytes?: number;
+  spoolLazyRecords?: number;
+  spoolLazyReads?: number;
+  spoolLazyReadErrors?: number;
+  spoolLazyBodyReleases?: number;
+  spoolResidentBodies?: number;
+  spoolReadBlockedRecords?: number;
+  spoolReplayReadErrors?: number;
+  spoolProtectedReserveRecords?: number;
+  spoolProtectedReserveBytes?: number;
   /** Serialized bytes currently waiting in the ordinary priority queue. */
   queueBytes?: number;
   /** Events currently owned by active event-delivery requests. */

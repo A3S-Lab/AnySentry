@@ -923,6 +923,8 @@ export interface StoredEventQuery {
   invocationId?: string;
   /** Authenticated Agent adapter ToolCall identity. */
   toolCallId?: string;
+  /** Server-derived canonical KernelFact identity carried in event attributes. */
+  kernelFactId?: string;
   /** Bounded S6 evidence lookup predicates over server-derived scalar columns. */
   processHostId?: string;
   processBootId?: string;
@@ -4382,6 +4384,14 @@ export class ClickHouseStore {
       if (typeof value !== 'string' || !value.trim()) continue;
       sampleConditions.push(`${column} = {${String(key)}:String}`);
       queryParams[String(key)] = value.trim();
+    }
+    const kernelFactId = input.kernelFactId?.trim();
+    if (kernelFactId && /^kf_[a-f0-9]{24}$/u.test(kernelFactId)) {
+      // KernelFact is an additive canonical projection while the compatibility events table is
+      // the durable fallback on older deployments. Keep this predicate bounded and hash-only;
+      // no product or payload parsing belongs in the ClickHouse query layer.
+      sampleConditions.push("JSONExtractString(attributes, 'anysentry.kernel_fact_id') = {kernelFactId:String}");
+      queryParams.kernelFactId = kernelFactId;
     }
     const processStringPredicates: Array<[
       'processHostId' | 'processBootId' | 'processPidNamespace' | 'processStartTimeTicks' | 'processStartTimeNs',

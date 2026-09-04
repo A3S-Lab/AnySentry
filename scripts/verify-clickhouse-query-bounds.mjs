@@ -258,6 +258,21 @@ assert.ok(searchResultLimit > searchSelectedLimit,
   'the same bound must be re-applied after complete rows are materialized');
 assert.equal(searchCall.query.match(/LIMIT \{limit:UInt32\}/gu)?.length, 2,
   'durable search must bound both the locator set and the final complete-row result');
+
+fake.state.calls.length = 0;
+const kernelFactSearch = await store.searchEvents({
+  sinceMs: 100,
+  untilMs: 200,
+  kernelFactId: `kf_${'a'.repeat(24)}`,
+  candidateLimit: 8,
+  limit: 1,
+});
+assert.deepEqual(kernelFactSearch, []);
+assert.equal(fake.state.calls.length, 1);
+const kernelFactCall = fake.state.calls[0];
+assert.match(kernelFactCall.query, /JSONExtractString\(attributes, 'anysentry\.kernel_fact_id'\) = \{kernelFactId:String\}/u);
+assert.equal(kernelFactCall.query_params.kernelFactId, `kf_${'a'.repeat(24)}`);
+assert.equal(kernelFactCall.query_params.scanLimit, 8);
 assert.equal(fake.state.active, 0);
 
 fake.state.calls.length = 0;
