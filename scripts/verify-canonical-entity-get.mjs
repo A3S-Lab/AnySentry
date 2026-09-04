@@ -347,11 +347,20 @@ try {
   assert.equal(sessionDetail.item.sessionId, session.sessionId);
   const sessionCoverage = await get(`/v1/sessions/${encodeURIComponent(session.sessionId)}/coverage`);
   assert(sessionCoverage.coverage, 'Session coverage endpoint missing coverage');
-  const sessionTimeline = await get(`/v1/sessions/${encodeURIComponent(session.sessionId)}/timeline?limit=20`);
-  assert(sessionTimeline.timeline, 'Session timeline endpoint missing timeline');
-  const toolEvent = sessionTimeline.timeline.turns
-    .flatMap((turn) => turn.events)
-    .find((event) => event.kind === 'tool_call' && event.toolCallId === toolCallId);
+  let sessionTimeline;
+  let toolEvent;
+  // SessionMembership can become visible before the compatibility Thread/Segment projection.
+  // Poll the bounded timeline briefly so a transient empty projection is not mistaken for a lost
+  // semantic event; the API remains read-only and each attempt has its own projection timeout.
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    sessionTimeline = await get(`/v1/sessions/${encodeURIComponent(session.sessionId)}/timeline?limit=20`);
+    assert(sessionTimeline.timeline, 'Session timeline endpoint missing timeline');
+    toolEvent = sessionTimeline.timeline.turns
+      .flatMap((turn) => turn.events)
+      .find((event) => event.kind === 'tool_call' && event.toolCallId === toolCallId);
+    if (toolEvent) break;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
   assert(toolEvent?.semanticEventId?.startsWith('se_'), 'timeline tool semantic event missing');
   const semanticRecords = await get('/v1/semantic-records?limit=500');
   const durableToolRecord = semanticRecords.items.find((item) => item.kind === 'tool_call' && item.toolCallId === toolCallId);

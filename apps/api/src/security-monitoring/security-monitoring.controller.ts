@@ -7150,6 +7150,30 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     };
   }
 
+  /**
+   * An incomplete exact-session projection is a transient view while an ingest-side membership
+   * or semantic row is settling.  Caching that view makes a valid deep link look permanently
+   * empty for the cache TTL and is the source of the intermittent "Session GET succeeds but
+   * timeline has no turns" result.  Broad directory reads may still cache a bounded partial
+   * snapshot to prevent a thundering herd; exact entity reads must wait for a fresh projection.
+   */
+  private canonicalSessionProjectionCacheable(
+    query: CanonicalEntityQuery,
+    value: CanonicalSessionProjection,
+  ): boolean {
+    const exactEntity = Boolean(
+      query.sessionId
+      || query.agentInstanceId
+      || query.runtimeInstanceId
+      || query.logicalAgentId
+      || query.logicalAgentCandidateId
+      || query.agentAssetId,
+    );
+    if (!exactEntity) return true;
+    if (value.coverage.status !== 'complete' || value.coverage.reasons.length > 0) return false;
+    return !value.items.some((item) => item.coverage.status === 'asset_only');
+  }
+
   private bindObservedAssetMeta(meta: T.EventMeta, eventAt?: number): T.EventMeta {
     const trustedCorrelation = serverTrustedCorrelationContext(meta);
     const bound = this.observedAssets?.bindIngestMeta
@@ -11619,7 +11643,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     }
     const operation = this.computeCanonicalSessionResources(query, headers)
       .then((value) => {
-        this.rememberCanonicalSessionProjection(key, value);
+        if (this.canonicalSessionProjectionCacheable(query, value)) {
+          this.rememberCanonicalSessionProjection(key, value);
+        }
         return value;
       })
       .finally(() => {
@@ -11635,7 +11661,11 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           this.canonicalSessionInFlight.delete(key);
         }
         const fallback = this.degradedCanonicalSessionProjection(query, 'session_projection_timeout');
-        this.rememberCanonicalSessionProjection(key, fallback);
+        // An exact deep link must not cache the timeout/asset-only fallback: a membership or
+        // semantic projection can become visible immediately after the bounded read returns.
+        if (this.canonicalSessionProjectionCacheable(query, fallback)) {
+          this.rememberCanonicalSessionProjection(key, fallback);
+        }
         return fallback;
       });
   }

@@ -349,7 +349,7 @@ await ingestObserverEvent({
   inner: { pid: childProcess.pid, ppid: childProcess.ppid, uid: 1000, cwd: workspacePath, argv: ['/bin/bash', '-c', command] },
 });
 
-const deadline = Date.now() + 10_000;
+const deadline = Date.now() + 30_000;
 let evidence;
 do {
   evidence = await request('/events/tool-evidence', 'POST', {
@@ -358,7 +358,13 @@ do {
     workspacePath,
     limit: 1_000,
   });
-  if (evidence.items?.length === tools.length) break;
+  const initialEvidenceByName = new Map((evidence.items ?? []).map((item) => [item.toolName, item]));
+  const initialKernelLinksSettled = ['write', 'bash'].every((name) =>
+    initialEvidenceByName.get(name)?.status === 'linked');
+  // The relation projector is deliberately debounced so late Kernel facts can close an earlier
+  // semantic ToolCall. Do not stop merely because all four semantic rows exist: write/bash may
+  // still be `semantic_only` while their FileAccess/ToolExec facts are settling.
+  if (evidence.items?.length === tools.length && initialKernelLinksSettled) break;
   await new Promise((resolve) => setTimeout(resolve, 100));
 } while (Date.now() < deadline);
 
