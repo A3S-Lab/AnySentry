@@ -11479,10 +11479,11 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       : undefined;
 
     // A timeline event can be retained after the durable semantic row expires.  Conversely, a
-    // durable `sr_` row can outlive the conversation projection.  Search the bounded durable lane
-    // only when an event was found so we never mistake a product/session id for an alias.
+    // durable `sr_` row can outlive the conversation projection. Search the bounded durable lane
+    // for the latter case only; `se_` already has a stable interaction-derived identity and a
+    // full 10k-row alias scan would make a working deep link depend on a slow side store.
     let aliasRecords: SemanticRecord[] = semanticRecord ? [semanticRecord] : [];
-    if (!semanticRecord && selected) {
+    if (!semanticRecord && selected && !timelineId) {
       aliasRecords = (await this.canonicalObservability.listDurableSemanticRecords(10_000))
         // The timeline event is already selected inside a canonical Session.  Its immutable
         // sourceInteractionIds are a stronger bridge than a provider-session alias (which may be
