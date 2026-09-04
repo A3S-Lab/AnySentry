@@ -2148,7 +2148,11 @@ function redact(s: string): string {
 // and intentionally contains no product/version names.
 function endpointAttributeKey(key?: string): boolean {
   if (!key) return false;
-  const normalized = key.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  const normalized = key
+    .replace(/([a-z0-9])([A-Z])/gu, '$1_$2')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
   if (['endpoint', 'url', 'uri', 'peer', 'sni', 'target', 'host', 'hostname', 'address', 'destination'].includes(normalized)) {
     return true;
   }
