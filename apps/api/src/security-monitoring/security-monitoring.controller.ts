@@ -2226,7 +2226,7 @@ function sanitizePreviewValue(value: unknown, key = '', depth = 0): unknown {
 }
 
 function sanitizeInlineEndpointLiterals(value: string): string {
-  return value.replace(/\b(?:[a-z][a-z0-9+.-]*:\/\/|\/\/)[^\s"'<>]+/giu, (match) => {
+  return value.replace(/\b(?:[a-z][a-z0-9+.-]*:\/\/|\/\/|[a-z0-9.-]+:\d{1,5}\/)[^\s"'<>]*/giu, (match) => {
     const trailing = match.match(/[)},.;]+$/u)?.[0] ?? '';
     const core = trailing ? match.slice(0, -trailing.length) : match;
     return `${sanitizeEndpointAttributeValue(core, 'endpoint')}${trailing}`;
@@ -7967,10 +7967,16 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       semanticEventId,
     });
     if (!result) throw new NotFoundException('semantic tool event was not found');
-    const canonicalLinks = canonicalEvidenceLinksForRelations(result.relations);
+    const canonicalLinks = result.canonicalEvidenceLinks?.length
+      ? result.canonicalEvidenceLinks
+      : canonicalEvidenceLinksForRelations(result.relations);
+    const durableLinkIds = new Set(canonicalLinks.map((link) => link.linkId));
     const canonicalRelations = result.relations.map((relation, index) => {
-      const link = canonicalLinks[index];
+      const link = relation.evidenceLinkId && durableLinkIds.has(relation.evidenceLinkId)
+        ? canonicalLinks.find((candidate) => candidate.linkId === relation.evidenceLinkId)
+        : canonicalLinks[index];
       return link
+        && (!result.canonicalEvidenceLinks?.length || !relation.evidenceLinkId || durableLinkIds.has(relation.evidenceLinkId))
         ? {
             ...relation,
             evidenceLinkId: link.linkId,
@@ -7981,7 +7987,11 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           }
         : relation;
     });
-    const response = { ...result, relations: canonicalRelations };
+    const response = {
+      ...result,
+      relations: canonicalRelations,
+      ...(canonicalLinks.length ? { canonicalEvidenceLinks: canonicalLinks } : {}),
+    };
     // Read paths are side-effect free. EvidenceLinks are materialized by the ingest-triggered
     // correlation projector; this endpoint only returns the latest computed relation (or its
     // durable revision) and never creates a new revision because an inspector was opened.
@@ -8011,12 +8021,18 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     const eventId = strictIdentityText(body?.eventId, 512);
     if (!eventId) throw new BadRequestException('a valid eventId is required');
     const result = await this.agg.agentKernelSemanticContext(eventId);
-    const canonicalLinks = canonicalEvidenceLinksForRelations(result.relations);
+    const canonicalLinks = result.canonicalEvidenceLinks?.length
+      ? result.canonicalEvidenceLinks
+      : canonicalEvidenceLinksForRelations(result.relations);
+    const durableLinkIds = new Set(canonicalLinks.map((link) => link.linkId));
     const response = {
       ...result,
       relations: result.relations.map((relation, index) => {
-        const link = canonicalLinks[index];
+        const link = relation.evidenceLinkId && durableLinkIds.has(relation.evidenceLinkId)
+          ? canonicalLinks.find((candidate) => candidate.linkId === relation.evidenceLinkId)
+          : canonicalLinks[index];
         return link
+          && (!result.canonicalEvidenceLinks?.length || !relation.evidenceLinkId || durableLinkIds.has(relation.evidenceLinkId))
           ? {
               ...relation,
               evidenceLinkId: link.linkId,
@@ -8027,6 +8043,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
             }
           : relation;
       }),
+      ...(canonicalLinks.length ? { canonicalEvidenceLinks: canonicalLinks } : {}),
     };
     // Evidence relation persistence belongs to the ingest/correlation projector. Keep this query
     // endpoint read-only so repeated inspector refreshes cannot mutate relation history.
@@ -12469,7 +12486,10 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     let coverage: T.CanonicalEntityCoverage;
     try {
       context = await withCanonicalProjectionTimeout(
-        this.agg.agentKernelSemanticContext(fact.eventId ?? id),
+        this.agg.agentKernelSemanticContext(
+          fact.eventId ?? id,
+          fact.eventId && fact.eventId !== id ? [id] : [],
+        ),
         CANONICAL_STORE_READ_TIMEOUT_MS,
       );
       coverage = canonicalCoverage(false, [], 'relational_semantic_relation_projection');
