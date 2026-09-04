@@ -71,7 +71,14 @@ TTL ts + INTERVAL 90 DAY DELETE`;
 const EVENT_LOCATOR_MV_DDL = `CREATE MATERIALIZED VIEW IF NOT EXISTS ${EVENT_LOCATOR_MV}
 TO ${EVENT_LOCATOR_TABLE}
 AS SELECT eventId, at, decisionRevision, decisionUpdatedAt, ingestedAt FROM ${TABLE}`;
-const OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE = 'anysentry.observer.source_payload_sha256';
+/**
+ * The current source payload digest is a secret-stripped migration fingerprint.  Older
+ * Observer batches used the raw JSON digest under the same attribute.  Keep the compatibility
+ * marker separate and transient: it is accepted only while classifying a durable replay and is
+ * removed before a row is serialized to ClickHouse.
+ */
+export const OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE = 'anysentry.observer.source_payload_sha256';
+export const OBSERVER_LEGACY_SOURCE_PAYLOAD_SHA256_ATTRIBUTE = 'anysentry.observer.legacy_source_payload_sha256';
 const SHA256_HEX = /^[a-f0-9]{64}$/u;
 const AGENT_INTERACTION_TABLE = 'agent_interactions_v1';
 const AGENT_INTERACTION_DDL = `CREATE TABLE IF NOT EXISTS ${AGENT_INTERACTION_TABLE} (
@@ -824,6 +831,8 @@ type Row = Omit<JudgedEvent, 'activityContext' | 'activitySubtype' | 'actionKind
   assetBindingQuality: string;
   invocationId: string;
   toolCallId: string;
+  /** Non-enumerable replay-only compatibility digest; never serialized to ClickHouse. */
+  __legacyObserverSourcePayloadDigest?: string;
   processInstanceKey: string;
   processHostId: string;
   processBootId: string;
@@ -1561,7 +1570,11 @@ function toRow(e: JudgedEvent): Row {
     ...(e.environmentId ? { 'anysentry.environment_id': e.environmentId } : {}),
     ...(e.terminalContextId ? { 'anysentry.terminal_context_id': e.terminalContextId } : {}),
   } as JudgedEvent['attributes'];
-  return clickHouseWellFormedRow({
+  // The legacy replay digest is an in-memory migration aid only.  Keep it on a non-enumerable
+  // Row property so durable serialization never copies it (it may be derived from a body that
+  // the current privacy contract intentionally excludes from fingerprints).
+  delete canonicalAttributes[OBSERVER_LEGACY_SOURCE_PAYLOAD_SHA256_ATTRIBUTE];
+  const row = clickHouseWellFormedRow({
     schemaVersion: e.schemaVersion,
     eventId: e.eventId,
     sourceEventId: e.sourceEventId ?? '',
@@ -1667,6 +1680,18 @@ function toRow(e: JudgedEvent): Row {
     judgment: JSON.stringify(e.judgment ?? {}),
     rawPreview: e.rawPreview ?? '',
   });
+  const legacyDigest = String(
+    e.attributes?.[OBSERVER_LEGACY_SOURCE_PAYLOAD_SHA256_ATTRIBUTE] ?? '',
+  ).trim().toLowerCase();
+  if (SHA256_HEX.test(legacyDigest)) {
+    Object.defineProperty(row, '__legacyObserverSourcePayloadDigest', {
+      value: legacyDigest,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+  }
+  return row;
 }
 
 function prepareCommitBatch(rows: Row[], requestedBatchId?: string): Row[] {
@@ -2608,7 +2633,16 @@ export class ClickHouseStore {
       // Old rows predate that field; their durable logical key plus the hot-cache comparison in
       // SentryJudge is the bounded migration proof. Never run a wide events-table scan in ingest.
       if (existingFingerprint.startsWith('observer-source:')) {
-        return existingFingerprint === row.payloadFingerprint ? 'duplicate' : 'conflict';
+        if (existingFingerprint === row.payloadFingerprint) return 'duplicate';
+        // Before the privacy-safe digest migration, Observer rows stored the raw JSON digest in
+        // the same source-payload attribute.  A replay of such a row carries a transient legacy
+        // digest computed from the exact WAL body.  Compare it here, without persisting the
+        // legacy value, so an unchanged fact is acknowledged instead of being dead-lettered while
+        // a genuinely changed payload still fails closed as a revision conflict.
+        const legacyDigest = String(row.__legacyObserverSourcePayloadDigest ?? '').trim().toLowerCase();
+        if (SHA256_HEX.test(legacyDigest)
+          && existingFingerprint === `observer-source:${legacyDigest}`) return 'duplicate';
+        return 'conflict';
       }
       return 'duplicate';
     });

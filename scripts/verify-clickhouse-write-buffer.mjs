@@ -1131,6 +1131,31 @@ await withoutExpectedErrorLogs(async () => {
   );
   assert.equal(fake.state.queries.length, 1);
   await store.close();
+
+  // Rows written before the privacy-safe source digest migration carry the raw JSON digest in
+  // the same durable fingerprint slot.  A replay supplies that digest only transiently; it must
+  // acknowledge an unchanged row while still using the new safe digest for all fresh rows.
+  const legacyFake = fakeClickHouse({
+    onQuery(options) {
+      return [{
+        eventLogicalKey: options.query_params.logicalKeys[0],
+        acceptedFingerprint: `observer-source:${digestA}`,
+      }];
+    },
+  });
+  const legacyStore = storeFor(legacyFake);
+  assert.deepEqual(
+    await legacyStore.classifyDurableReplayEvents([event(2_464, {
+      attributes: {
+        sequence: 2_464,
+        'anysentry.observer.source_payload_sha256': digestB,
+        'anysentry.observer.legacy_source_payload_sha256': digestA,
+      },
+    })]),
+    ['duplicate'],
+    'legacy raw source digest should acknowledge an unchanged replay without persisting the marker',
+  );
+  await legacyStore.close();
 });
 
 const [storeSource, judgeSource, mainSource, manifestSource] = await Promise.all([

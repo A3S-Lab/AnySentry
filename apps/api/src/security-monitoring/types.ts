@@ -2292,6 +2292,8 @@ export interface CanonicalSessionResource {
   agentProduct?: string;
   environment?: LogicalAgentConversationDirectoryItem['environment'];
   workspacePath?: string;
+  /** Compatibility asset aliases observed for the session's semantic interactions. */
+  agentAssetIds?: string[];
   collectorIds?: string[];
   sourceIds?: string[];
   agentInstanceIds: string[];

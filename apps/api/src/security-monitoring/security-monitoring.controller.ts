@@ -52,6 +52,7 @@ import type { UnknownLearnedAction, UnknownPolicyStage } from './unknown-learnin
 import { InfrastructureRuleError, InfrastructureRuleService } from './infrastructure-rule.service';
 import { ObservedAssetLifecycleService } from './observed-asset-lifecycle.read.service';
 import { parseObserverAgentInteraction } from './agent-interaction';
+import { OBSERVER_LEGACY_SOURCE_PAYLOAD_SHA256_ATTRIBUTE } from './clickhouse-store';
 import { captureClassificationDecision } from './identity-judgment-routing';
 import { AgentConversationBindingService } from './agent-conversation-binding.service';
 import { CanonicalObservabilityService } from './canonical-observability.service';
@@ -466,6 +467,7 @@ function canonicalScopeMatches(
     agentInstanceId?: string;
     runtimeInstanceId?: string;
     sessionId?: string;
+    agentAssetIds?: readonly string[];
     product?: string;
     classification?: T.AgentClassification;
     coverageStatus?: string;
@@ -491,7 +493,9 @@ function canonicalScopeMatches(
     && equals(value.workspacePath, query.workspacePath)
     && equals(value.environment, query.environment)
     && equals(value.environmentId, query.environmentId)
-    && equals(value.agentAssetId, query.agentAssetId)
+    && (query.agentAssetId === undefined
+      || equals(value.agentAssetId, query.agentAssetId)
+      || Boolean(value.agentAssetIds?.some((candidate) => equals(candidate, query.agentAssetId))))
     && equals(value.agentInstanceId, query.agentInstanceId)
     && equals(value.runtimeInstanceId, query.runtimeInstanceId)
     && equals(value.sessionId, query.sessionId)
@@ -10766,6 +10770,10 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         existing.agentInstanceIds = [...new Set([...existing.agentInstanceIds, ...summary.agentInstanceIds])].slice(0, 512);
         existing.interactionIds = [...new Set([...existing.interactionIds, ...interactionIds])].slice(0, 2_048);
         existing.segmentIds = [...new Set([...existing.segmentIds, ...segmentIds])].slice(0, 512);
+        existing.agentAssetIds = [...new Set([
+          ...(existing.agentAssetIds ?? []),
+          summary.agentAssetId,
+        ].filter((value): value is string => Boolean(value)))].slice(0, 256);
         continue;
       }
       resourcesByKey.set(key, {
@@ -10785,6 +10793,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         ...(summary.agentProduct ? { agentProduct: summary.agentProduct } : {}),
         ...(summary.environment ? { environment: summary.environment } : {}),
         ...(summary.workspacePath ? { workspacePath: summary.workspacePath } : {}),
+        agentAssetIds: summary.agentAssetId ? [summary.agentAssetId] : [],
         agentInstanceIds: [...summary.agentInstanceIds].slice(0, 512),
         segmentIds,
         interactionIds,
@@ -10870,6 +10879,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       tenantId: resource.tenantId,
       ownerId: resource.ownerId,
       workspacePath: resource.workspacePath,
+      agentAssetIds: resource.agentAssetIds,
       environment: resource.environment,
       environmentId: undefined,
       agentAssetId: undefined,
@@ -10976,6 +10986,107 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       candidates: result,
       scanned: candidates.length,
       truncated: allCandidates.length > candidates.length,
+      failed,
+    };
+  }
+
+  /**
+   * Resolve a semantic deep link directly from the bounded compatibility interaction projection.
+   * Canonical Session rows can legitimately lag (for example while PostgreSQL is under I/O
+   * pressure), but the ClickHouse interaction row still contains the immutable semantic items.
+   * Asset/instance-scoped requests use this path before the more expensive session scan so a
+   * valid `se_…` identifier does not become a false 404/ambiguous result.
+   */
+  private async legacySemanticTimelineCandidates(
+    requestedId: string,
+    semanticRecord: SemanticRecord | undefined,
+    query: CanonicalEntityQuery,
+  ): Promise<CanonicalSemanticTimelineSearch> {
+    const conversations = await this.agg.agentConversations({
+      timeType: query.timeType,
+      startTime: query.startTime,
+      endTime: query.endTime,
+      snapshotAsOf: query.snapshotAsOf,
+      scope: 'raw',
+      classificationView: query.classificationView,
+      agentAssetId: query.agentAssetId,
+      agentInstanceId: query.agentInstanceId,
+      product: query.product,
+      q: query.q,
+      limit: 64,
+    });
+    const candidates: CanonicalSemanticTimelineCandidate[] = [];
+    let failed = 0;
+    for (const summary of conversations.items.slice(0, 64)) {
+      if (!summary.hasContent || !summary.conversationId) continue;
+      try {
+        const timeline = await this.agg.agentConversationTimelineV3({
+          timeType: query.timeType,
+          startTime: query.startTime,
+          endTime: query.endTime,
+          snapshotAsOf: query.snapshotAsOf,
+          scope: 'agent',
+          classificationView: query.classificationView,
+          conversationId: summary.conversationId,
+          limit: 500,
+        });
+        for (const turn of timeline.turns) {
+          for (const event of turn.events) {
+            if (semanticRecord
+              ? !canonicalSemanticRecordTouchesEvent(semanticRecord, event)
+              : event.semanticEventId !== requestedId) continue;
+            const session: T.CanonicalSessionResource = {
+              schemaVersion: 'anysentry.session.v1',
+              sessionId: summary.sessionId ?? summary.conversationId,
+              ...(summary.sessionId && summary.sessionId !== summary.conversationId
+                ? { canonicalSessionId: summary.conversationId } : {}),
+              ...(summary.sessionKey ? { sessionKey: summary.sessionKey } : {}),
+              ...(summary.providerSessionIdHash ? { providerSessionIdHash: summary.providerSessionIdHash } : {}),
+              conversationId: summary.conversationId,
+              ...(summary.logicalAgentId ? { logicalAgentId: summary.logicalAgentId } : {}),
+              ...(summary.logicalAgentCandidateId ? { logicalAgentCandidateId: summary.logicalAgentCandidateId } : {}),
+              ...(summary.logicalDefinitionId ? { logicalDefinitionId: summary.logicalDefinitionId } : {}),
+              ...(summary.logicalScopeMode ? { logicalScopeMode: summary.logicalScopeMode } : {}),
+              ...(summary.logicalIdentityAuthority ? { logicalIdentityAuthority: summary.logicalIdentityAuthority } : {}),
+              ...(summary.tenantId ? { tenantId: summary.tenantId } : {}),
+              ...(summary.ownerId ? { ownerId: summary.ownerId } : {}),
+              ...(summary.agentProduct ? { agentProduct: summary.agentProduct } : {}),
+              ...(summary.environment ? { environment: summary.environment } : {}),
+              ...(summary.workspacePath ? { workspacePath: summary.workspacePath } : {}),
+              agentAssetIds: summary.agentAssetId ? [summary.agentAssetId] : [],
+              agentInstanceIds: [...summary.agentInstanceIds].slice(0, 512),
+              segmentIds: [],
+              interactionIds: [],
+              ...(summary.parentSessionId ? { parentSessionId: summary.parentSessionId } : {}),
+              ...(summary.canonicalParentSessionId ? { canonicalParentSessionId: summary.canonicalParentSessionId } : {}),
+              ...(summary.sessionIdentityQuality ? { sessionIdentityQuality: summary.sessionIdentityQuality } : {}),
+              ...(summary.sessionMode ? { sessionMode: summary.sessionMode } : {}),
+              ...(summary.sessionLifecycle ? { sessionLifecycle: summary.sessionLifecycle } : {}),
+              ...(summary.startedAtUnixNs ? { startedAtUnixNs: summary.startedAtUnixNs } : {}),
+              ...(summary.lastActivityAtUnixNs ? { lastActivityAtUnixNs: summary.lastActivityAtUnixNs } : {}),
+              turnCount: summary.turnCount,
+              modelCallCount: summary.modelCallCount,
+              toolCallCount: summary.toolCallCount,
+              toolResultCount: summary.toolResultCount,
+              errorCount: summary.errorCount,
+              usage: structuredClone(summary.usage),
+              coverage: structuredClone(summary.coverage),
+              sourceRefs: canonicalConversationSourceRefs(summary).slice(0, 64),
+              resolutionRevision: this.canonicalCurrentRevision(),
+            };
+            candidates.push({ session, event });
+          }
+        }
+      } catch (error) {
+        if (!isCanonicalProjectionDegradation(error)) throw error;
+        failed += 1;
+      }
+      if (candidates.length >= 2) break;
+    }
+    return {
+      candidates,
+      scanned: Math.min(conversations.items.length, 64),
+      truncated: conversations.items.length > 64,
       failed,
     };
   }
@@ -11190,29 +11301,57 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     }
 
     const sessions = await this.canonicalSessionResources({ ...query, offset: 0, limit: 500 }, headers);
-    let timelineSearch: CanonicalSemanticTimelineSearch;
-    try {
-      timelineSearch = await withCanonicalProjectionTimeout(
-        this.canonicalSemanticTimelineCandidates(
-          id,
-          semanticRecord,
-          query,
-          sessions.items,
-        ),
-        CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS,
-      );
-    } catch (error) {
-      if (!isCanonicalProjectionDegradation(error)) throw error;
-      // A slow per-session timeline must not make a canonical inspector hang for every candidate.
-      // Keep the durable semantic row (when present) and return an explicit bounded gap; a later
-      // request can retry after the projection catches up.
-      timelineSearch = {
-        candidates: [],
-        scanned: Math.min(sessions.items.length, CANONICAL_SEMANTIC_SESSION_SCAN_MAX),
-        truncated: true,
-        failed: 1,
-      };
+    let timelineSearch: CanonicalSemanticTimelineSearch | undefined;
+    // A scoped deep link can be resolved directly from the bounded compatibility interaction
+    // projection. This avoids scanning hundreds of canonical Session rows when PostgreSQL's
+    // membership projector is behind, while retaining the session-scan fallback for unscoped or
+    // older identifiers.
+    if (query.agentAssetId || query.agentInstanceId) {
+      try {
+        timelineSearch = await withCanonicalProjectionTimeout(
+          this.legacySemanticTimelineCandidates(id, semanticRecord, query),
+          CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS,
+        );
+      } catch (error) {
+        if (!isCanonicalProjectionDegradation(error)) throw error;
+        timelineSearch = {
+          candidates: [],
+          scanned: 0,
+          truncated: true,
+          failed: 1,
+        };
+      }
     }
+    if (!timelineSearch || timelineSearch.candidates.length === 0) {
+      try {
+        timelineSearch = await withCanonicalProjectionTimeout(
+          this.canonicalSemanticTimelineCandidates(
+            id,
+            semanticRecord,
+            query,
+            sessions.items,
+          ),
+          CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS,
+        );
+      } catch (error) {
+        if (!isCanonicalProjectionDegradation(error)) throw error;
+        // A slow per-session timeline must not make a canonical inspector hang for every candidate.
+        // Keep the durable semantic row (when present) and return an explicit bounded gap; a later
+        // request can retry after the projection catches up.
+        timelineSearch = {
+          candidates: [],
+          scanned: Math.min(sessions.items.length, CANONICAL_SEMANTIC_SESSION_SCAN_MAX),
+          truncated: true,
+          failed: 1,
+        };
+      }
+    }
+    timelineSearch ??= {
+      candidates: [],
+      scanned: 0,
+      truncated: true,
+      failed: 1,
+    };
     const uniqueTimelineCandidates = [...new Map(timelineSearch.candidates.map((candidate) => [
       `${candidate.session.sessionId}\u0000${candidate.event.semanticEventId}`,
       candidate,
@@ -12446,6 +12585,14 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           [OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE]: createHash('sha256')
             .update(JSON.stringify(digestSafeValue(event)))
             .digest('hex'),
+          // A replay of a pre-privacy-migration WAL needs the old raw digest only for the
+          // in-memory duplicate check.  clickhouse-store strips this marker before persistence;
+          // it must never become a second durable payload fingerprint.
+          ...(body.durableReplay === true ? {
+            [OBSERVER_LEGACY_SOURCE_PAYLOAD_SHA256_ATTRIBUTE]: createHash('sha256')
+              .update(JSON.stringify(event))
+              .digest('hex'),
+          } : {}),
         },
       };
       const enriched = this.kube.enrich(deriveMeta(line, metaGiven));
