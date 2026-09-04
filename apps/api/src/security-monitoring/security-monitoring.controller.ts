@@ -12337,13 +12337,17 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       onResult: (value: T) => void = () => undefined,
     ): Promise<void> => {
       if (isolatePostCommitProjection) {
-        this.scheduleObserverProjection(
-          eventId,
-          projection,
-          operation,
-          onResult,
-          (error) => handleProjectionFailure(index, eventId, projection, error),
-        );
+        try {
+          this.scheduleObserverProjection(
+            eventId,
+            projection,
+            operation,
+            onResult,
+            (error) => handleProjectionFailure(index, eventId, projection, error),
+          );
+        } catch (error) {
+          handleProjectionFailure(index, eventId, projection, error);
+        }
         return;
       }
       onResult(await operation());
@@ -12414,14 +12418,27 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       // business effects and the hot identity projection run afterwards; isolate their failures
       // so a timeout cannot make the Forwarder replay the already durable Observer batch.
       if (isolatePostCommitProjection) {
-        this.judge.schedulePreparedBatchProjection(retainedPrepared, {
-          onProjectionFailure: (event: T.JudgedEvent, error: unknown) => {
-            const index = retainedForPersistence.find(({ prepared }) =>
-              (prepared as PreparedRetainedJudgeAccept).event.eventId === event.eventId)?.index;
-            if (index === undefined) return;
-            markProjectionFailure(index, event.eventId, 'judgment_business_effects', error);
-          },
-        });
+        try {
+          this.judge.schedulePreparedBatchProjection(retainedPrepared, {
+            onProjectionFailure: (event: T.JudgedEvent, error: unknown) => {
+              const index = retainedForPersistence.find(({ prepared }) =>
+                (prepared as PreparedRetainedJudgeAccept).event.eventId === event.eventId)?.index;
+              if (index === undefined) return;
+              markProjectionFailure(index, event.eventId, 'judgment_business_effects', error);
+            },
+          });
+        } catch (error) {
+          // A scheduler construction failure is itself post-commit projection degradation.  Keep
+          // the durable event and record one bounded gap per affected item.
+          for (const context of retainedForPersistence) {
+            markProjectionFailure(
+              context.index,
+              (context.prepared as PreparedRetainedJudgeAccept).event.eventId,
+              'judgment_business_effects',
+              error,
+            );
+          }
+        }
       } else {
         // A memory-only profile has no central durability fence; preserve the historical fail-fast
         // behavior so callers can retry the complete event batch safely.
