@@ -10132,6 +10132,29 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     );
     if (canonical.value) return { fact: canonical.value, fallback: canonical.degraded };
     let unavailable = canonical.degraded;
+    // New events are indexed by a forward-only ClickHouse MV. Resolve the stable KernelFact ID to
+    // its compatibility event first, then perform an eventId point read; this avoids a wide
+    // time-window JSON scan for facts written after the locator table was introduced. A missing
+    // locator is expected for pre-migration rows and falls through to the bounded legacy query.
+    try {
+      const locator = await withCanonicalProjectionTimeout(
+        this.judge.loadKernelFactLocator(factId),
+        CANONICAL_STORE_READ_TIMEOUT_MS,
+      );
+      if (locator) {
+        const event = await withCanonicalProjectionTimeout(
+          this.judge.storedEventById(locator.eventId, locator.at),
+          CANONICAL_STORE_READ_TIMEOUT_MS,
+        );
+        if (event?.kernelFactId === factId) {
+          const reconstructed = kernelFactFromCompatibilityEvent(event, factId);
+          if (reconstructed) return { fact: reconstructed, fallback: true };
+        }
+      }
+    } catch (error) {
+      if (!isCanonicalProjectionDegradation(error)) throw error;
+      unavailable = true;
+    }
     try {
       const page = await withCanonicalProjectionTimeout(
         this.judge.searchStoredEventsPage({

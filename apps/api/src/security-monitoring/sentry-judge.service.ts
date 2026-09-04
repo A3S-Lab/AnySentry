@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { Sentry, dns, egress, fileAccess, securityAction, sslContent, toolExec } from '@a3s-lab/sentry';
 import { AgentAttributionService } from './agent-attribution.service';
 import { AlertingService, type DurableAlertMutation } from './alerting.service';
-import { ClickHouseStore, DashboardWindowHistory, DurableReplayEventStatus, IncidentState, StoredAgentBucketFact, StoredAgentMetricBucketFact, StoredAgentObservabilityFact, StoredAgentWindowFact, StoredEventQuery, StoredEventSearchResult, StoredToolEvidenceRelations, ToolEvidenceRelationScope, StoredTopologyBucketFact, StoredTopologyWindowFact, StoredWorkspaceBucketFact, StoredWorkspaceWindowFact, eventRevisionIdentity } from './clickhouse-store';
+import { ClickHouseStore, DashboardWindowHistory, DurableReplayEventStatus, IncidentState, KernelFactLocator, StoredAgentBucketFact, StoredAgentMetricBucketFact, StoredAgentObservabilityFact, StoredAgentWindowFact, StoredEventQuery, StoredEventSearchResult, StoredToolEvidenceRelations, ToolEvidenceRelationScope, StoredTopologyBucketFact, StoredTopologyWindowFact, StoredWorkspaceBucketFact, StoredWorkspaceWindowFact, eventRevisionIdentity } from './clickhouse-store';
 import type { ToolEvidenceItem } from './tool-evidence-linker';
 import { DEFAULT_POLICY, PolicyConfig, buildFastAcl, policyConfigError, sanitizePolicy, tierStatus } from './policy-config';
 import { cleanText } from './redaction';
@@ -827,6 +827,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
 
   async storedEventById(eventId: string, eventAt?: number): Promise<JudgedEvent | undefined> {
     return this.ch.eventById(eventId, eventAt);
+  }
+
+  async loadKernelFactLocator(kernelFactId: string): Promise<KernelFactLocator | null> {
+    return this.ch.loadKernelFactLocator(kernelFactId);
   }
 
   async classifyDurableReplayEvents(

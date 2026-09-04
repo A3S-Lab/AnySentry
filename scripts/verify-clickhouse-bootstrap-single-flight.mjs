@@ -181,6 +181,21 @@ concurrentGate.resolve();
 assert.deepEqual(await Promise.all(initializations), Array(11).fill(true));
 
 assert.equal(commandCount(concurrentConfig, /CREATE TABLE IF NOT EXISTS events/u), 1);
+assert.equal(
+  commandCount(concurrentConfig, /CREATE TABLE IF NOT EXISTS kernel_fact_locators_v1/u),
+  1,
+  'kernel fact locator table must be created exactly once',
+);
+assert.equal(
+  commandCount(concurrentConfig, /CREATE MATERIALIZED VIEW IF NOT EXISTS kernel_fact_locators_v1_mv/u),
+  1,
+  'kernel fact locator MV must be created exactly once',
+);
+assert.equal(
+  commandCount(concurrentConfig, /(?:MATERIALIZE|INSERT INTO)\s+kernel_fact_locators_v1/iu),
+  0,
+  'bootstrap must not backfill or materialize historical KernelFact locators',
+);
 assert.equal(queryCount(concurrentConfig), 1,
   'eleven concurrent stores must share one progress hydration');
 const hydrationQuery = state.queries.find((call) =>

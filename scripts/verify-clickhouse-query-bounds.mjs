@@ -184,6 +184,46 @@ assert.equal(fake.state.active, 0);
   assert.equal(calls[1].query_params.eventId, 'event-by-locator');
 }
 
+// KernelFact compatibility lookups use a forward-only locator table rather than scanning the
+// wide events JSON attributes. The point query is deliberately capped at one ClickHouse second;
+// a missing/old locator falls through to the controller's bounded event compatibility path.
+{
+  const calls = [];
+  const locatorStore = new ClickHouseStore();
+  locatorStore.ready = true;
+  locatorStore.client = {
+    async query(options) {
+      calls.push(options);
+      return {
+        async json() {
+          return [{
+            kernelFactId: `kf_${'b'.repeat(24)}`,
+            eventId: 'event-kernel-fact-locator',
+            at: 150_000,
+            decisionRevision: 7,
+          }];
+        },
+      };
+    },
+  };
+  const kernelFactId = `kf_${'b'.repeat(24)}`;
+  assert.deepEqual(await locatorStore.loadKernelFactLocator(kernelFactId), {
+    kernelFactId,
+    eventId: 'event-kernel-fact-locator',
+    at: 150_000,
+    decisionRevision: 7,
+  });
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].query, /FROM kernel_fact_locators_v1/u);
+  assert.match(calls[0].query, /kernelFactId = \{kernelFactId:String\}/u);
+  assert.equal(calls[0].query_params.kernelFactId, kernelFactId);
+  assert.equal(calls[0].clickhouse_settings.max_threads, 1);
+  assert.equal(calls[0].clickhouse_settings.max_execution_time, 1);
+  assert.equal(calls[0].clickhouse_settings.max_result_rows, '1');
+  assert.equal(await locatorStore.loadKernelFactLocator('not-a-kernel-fact-id'), null);
+  assert.equal(calls.length, 1, 'invalid KernelFact IDs must fail closed before querying ClickHouse');
+}
+
 fake.state.calls.length = 0;
 const recent = await store.recentWindowEvents(100, 200, 1_000, { monitoredOnly: true, tier: 'Llm' });
 assert.deepEqual(recent, []);
