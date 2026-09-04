@@ -2016,6 +2016,12 @@ export interface AgentConversationList extends ClassifiedResponseMeta {
 
 export interface AgentConversationDirectoryQuery extends AgentConversationQuery {
   lifecycleScope?: 'running' | 'history' | 'all';
+  /**
+   * Internal read-model hint.  Canonical entity pages hydrate RuntimeInstance separately and can
+   * omit thousands of runtime-only directory rows from the compatibility projection.  Legacy
+   * callers keep the historical default (`true`).
+   */
+  includeRuntimeOnly?: boolean;
 }
 
 export interface LogicalAgentConversationDirectoryItem {

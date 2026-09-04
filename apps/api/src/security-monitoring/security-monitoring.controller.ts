@@ -7607,7 +7607,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       { ...f, limit: conversationLimit },
       headers,
     );
-    const runtime = this.agentRuntimeState.list({ includeShadow: true, limit: 100_000 });
+    const runtime = f?.includeRuntimeOnly === false
+      ? { items: [] as T.AgentRuntimeInstanceRecord[] }
+      : this.agentRuntimeState.list({ includeShadow: true, limit: 100_000 });
     const items = projectAgentConversationDirectory(
       conversations.items,
       runtime.items,
@@ -7651,7 +7653,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     @Headers() headers: HeaderBag,
   ): Promise<T.AgentConversationDirectoryListV2> {
     const legacy = await this.agentConversationDirectory(f, headers);
-    const runtime = this.agentRuntimeState.list({ includeShadow: true, limit: 100_000 });
+    const runtime = f?.includeRuntimeOnly === false
+      ? { items: [] as T.AgentRuntimeInstanceRecord[] }
+      : this.agentRuntimeState.list({ includeShadow: true, limit: 100_000 });
     return {
       ...legacy,
       apiVersion: 2,
@@ -10419,7 +10423,14 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       product: query.product,
       q: query.q,
       lifecycleScope: query.lifecycleScope,
-      limit: 500,
+      // Entity resources hydrate RuntimeInstance independently.  Keeping runtime-only rows out of
+      // this compatibility projection prevents a 5k-instance history from becoming thousands of
+      // repeated LogicalAgent records before the canonical page filter is applied.
+      includeRuntimeOnly: false,
+      // The compatibility projector still needs a bounded semantic sample for conversation
+      // counts/coverage.  It is deliberately smaller than the legacy 200-row dashboard page;
+      // RuntimeState and SessionMembership remain the authoritative fallback lanes.
+      limit: Math.min(64, Math.max(1, query.limit + query.offset + 16)),
     };
   }
 
@@ -10546,7 +10557,42 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       includeShadow: true,
       limit: CANONICAL_RUNTIME_STATE_READ_LIMIT,
     }).items;
-    const resources = directory.items
+    const runtimeByIdentity = new Map<string, T.AgentRuntimeInstanceRecord>();
+    for (const record of runtimeSnapshot) {
+      for (const identity of [
+        record.agentInstanceId,
+        record.canonicalAgentInstanceId,
+        ...(record.agentInstanceAliases ?? []),
+      ].filter((value): value is string => Boolean(value))) {
+        runtimeByIdentity.set(identity, record);
+      }
+    }
+    // The canonical compatibility snapshot intentionally omits runtime-only rows.  Rebuild those
+    // rows locally from the same RuntimeState snapshot so an unknown/candidate agent remains
+    // discoverable without reintroducing the expensive broad conversation projection.
+    const conversationLogicalIds = new Set(directory.items.map((item) => item.logicalAgentId));
+    const runtimeOnlyDirectory = projectAgentConversationDirectory([], runtimeSnapshot, query.lifecycleScope)
+      .filter((item) => !conversationLogicalIds.has(item.logicalAgentId));
+    const directoryItems: T.LogicalAgentConversationDirectoryItemV4[] = [
+      ...directory.items,
+      ...runtimeOnlyDirectory.map((item) => ({
+        ...item,
+        userThreads: [] as T.AgentConversationSummary[],
+        recentInstances: [] as T.AgentRuntimeDirectoryInstance[],
+        technicalActivities: [] as T.AgentRunTechnicalActivitySummary[],
+        technicalActivityCount: 0,
+        instanceCounts: {
+          active: item.lifecycleState === 'running' ? item.activeInstanceCount : 0,
+          idle: 0,
+          unobserved: item.lifecycleState === 'unobserved' ? item.activeInstanceCount : 0,
+          exited: item.lifecycleState === 'historical' ? item.totalInstanceCount : 0,
+          lost: 0,
+          total: item.totalInstanceCount,
+        },
+        conversationCounts: { active: 0, dormant: 0, incomplete: 0, total: 0 },
+      })),
+    ];
+    const resources = directoryItems
       .filter((item) => {
         const conversations = item.userThreads ?? [];
         const runtimeIds = item.recentInstances.flatMap((instance) => [
@@ -10609,11 +10655,11 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         ];
         // Runtime state is the authoritative source/collector provenance for an AgentInstance;
         // the legacy directory itself intentionally has no producer-controlled source fields.
-        const runtimeRecords = runtimeSnapshot.filter((record) => item.agentInstanceIds.some((id) => [
-          record.agentInstanceId,
-          record.canonicalAgentInstanceId,
-          ...(record.agentInstanceAliases ?? []),
-        ].includes(id)));
+        const runtimeRecords = [...new Set(item.agentInstanceIds
+          .flatMap((id) => {
+            const record = runtimeByIdentity.get(id);
+            return record ? [record] : [];
+          }))];
         const collectorIds = [...new Set(runtimeRecords.map((record) => record.collectorId))].slice(0, 64);
         const sourceIds = [...new Set(runtimeRecords
           .map((record) => record.sourceId)
