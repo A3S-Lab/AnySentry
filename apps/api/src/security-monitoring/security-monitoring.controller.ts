@@ -6168,21 +6168,17 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     headers: HeaderBag,
   ): string {
     const actor = auditActor(headers);
-    // Session detail/timeline/coverage calls all use the same bounded conversation projection;
-    // entity IDs and pagination are applied after this snapshot is assembled. Keep the
-    // AgentInstance predicate because it is still an upstream aggregation filter, while the
-    // remaining canonical IDs are local scope checks.
+    // Session detail/timeline/coverage calls for the same entity use the same bounded conversation
+    // projection. Pagination and requested revision are response concerns, but retain every
+    // identity/filter field here: computeCanonicalSessionResources applies those predicates while
+    // assembling the resource list, so dropping one would let a cached session leak into a sibling
+    // request or make it appear missing.
     const {
       limit: _limit,
       offset: _offset,
       cursor: _cursor,
       revision: _revision,
       includeCoverage: _includeCoverage,
-      logicalAgentId: _logicalAgentId,
-      logicalAgentCandidateId: _logicalAgentCandidateId,
-      logicalDefinitionId: _logicalDefinitionId,
-      runtimeInstanceId: _runtimeInstanceId,
-      sessionId: _sessionId,
       ...projectionQuery
     } = query;
     return JSON.stringify({
