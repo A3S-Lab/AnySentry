@@ -145,13 +145,28 @@ export function semanticItemsForInteraction(
         .map((item) => item.toolCallId));
       const reconciled: T.AgentInteractionSemanticItem[] = [...retained];
       const completeness = interaction.completeness === 'complete' ? 'complete' as const : 'partial' as const;
+      const rawSemanticContentAllowed = ![
+        'reference_only', 'redacted', 'unsupported', 'unavailable', 'missing',
+      ].includes(interaction.completeness)
+        && !['reference_only', 'redacted', 'unsupported', 'unavailable', 'missing']
+          .includes(interaction.request.completeness)
+        && !['reference_only', 'redacted', 'unsupported', 'unavailable', 'missing']
+          .includes(interaction.response.completeness);
+      const reconciledContent = (value: unknown): unknown => {
+        if (rawSemanticContentAllowed) return value;
+        return {
+          schemaVersion: 'anysentry.semantic_reference.v1',
+          payloadRef: `sha256:${semanticHash(value)}`,
+          contentState: 'reference_only',
+        };
+      };
       for (const [index, call] of interaction.toolCalls.entries()) {
         if (callIds.has(call.toolCallId)) continue;
         reconciled.push({
           semanticItemId: semanticItemId(interaction.interactionId, 'tool_call_reconciled', index),
           actor: 'tool', kind: 'tool_call', phase: 'final', origin: 'response',
           atUnixNs: call.issuedAtUnixNs ?? interaction.startedAtUnixNs,
-          content: call.arguments, toolCallId: call.toolCallId, toolName: call.name,
+          content: reconciledContent(call.arguments), toolCallId: call.toolCallId, toolName: call.name,
           turnId: interaction.turnId, completeness,
           partialReasons: [...new Set([...interaction.partialReasons, 'semantic_items_reconciled'])],
         });
@@ -162,7 +177,7 @@ export function semanticItemsForInteraction(
           semanticItemId: semanticItemId(interaction.interactionId, 'tool_result_reconciled', index),
           actor: 'tool', kind: 'tool_result', phase: 'final', origin: 'request',
           atUnixNs: result.observedAtUnixNs ?? interaction.startedAtUnixNs,
-          content: result.content, toolCallId: result.toolCallId, toolName: result.name,
+          content: reconciledContent(result.content), toolCallId: result.toolCallId, toolName: result.name,
           turnId: interaction.turnId, completeness,
           partialReasons: [...new Set([...interaction.partialReasons, 'semantic_items_reconciled'])],
         });

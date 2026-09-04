@@ -95,6 +95,8 @@ function interaction({
   deploymentRevision,
   environmentId,
   sessionLifecycle,
+  semanticItems,
+  semanticParserVersion = 1,
 }) {
   const messages = (request.input ?? request.messages ?? []).map((item) => ({
     role: item.role ?? item.type ?? 'input',
@@ -170,7 +172,8 @@ function interaction({
     toolCalls,
     toolResults,
     semanticParserId: 'observer.agent-interaction',
-    semanticParserVersion: 1,
+    semanticParserVersion,
+    ...(semanticItems ? { semanticItems } : {}),
     completeness,
     partialReasons,
     captureSource: 'tls_uprobe_rustls',
@@ -513,6 +516,34 @@ assert.equal(statusEvents.find((event) => event.toolCallId === failedToolId && e
 assert.equal(statusEvents.find((event) => event.toolCallId === unknownToolId && event.kind === 'tool_call')?.status, 'unknown');
 assert.equal(statusEvents.find((event) => event.toolCallId === outOfOrderToolId && event.kind === 'tool_call')?.status, 'pending',
   'a result observed before its ToolCall must not close the later call');
+
+const referenceOnlyInteraction = interaction({
+  id: 'mi_v2_reference_only_reconcile',
+  at: base + 21_000,
+  instance: 'host-root:v2:reference',
+  conversationId: 'cv_reference_only',
+  request: { model: 'fixture-model', input: [human('reference-user', 'reference-turn', 'reference tool')] },
+  toolCalls: [{ toolCallId: 'call-reference-only', name: 'exec', arguments: { secret: 'must-stay-out-of-reconciled-timeline' } }],
+  semanticItems: [{
+    semanticItemId: 'si_reference_user', actor: 'user', kind: 'user_message', origin: 'request',
+    atUnixNs: unixNs(base + 21_000), content: 'reference tool', completeness: 'partial', partialReasons: [],
+  }],
+  semanticParserVersion: 2,
+  completeness: 'reference_only',
+});
+const referenceProjection = projectAgentConversations(
+  [referenceOnlyInteraction], [], { timeType: 'last_30d', scope: 'agent', limit: 20 },
+);
+const referenceSummary = referenceProjection.summaries[0];
+const referenceEvents = projectSemanticConversationTimeline(
+  referenceSummary,
+  referenceProjection.interactionsByConversation.get(referenceSummary.conversationId),
+  [],
+).flatMap((turn) => turn.events);
+const reconciledReferenceCall = referenceEvents.find((event) => event.toolCallId === 'call-reference-only');
+assert(reconciledReferenceCall, 'partial semanticItems must retain a missing ToolCall reference');
+assert.equal(JSON.stringify(reconciledReferenceCall.content).includes('must-stay-out-of-reconciled-timeline'), false,
+  'reference-only interactions must not reinsert raw tool arguments during reconciliation');
 
 const boundaryProjection = projectAgentConversations(
   [resumed],

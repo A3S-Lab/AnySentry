@@ -1202,6 +1202,7 @@ export class AggregationService implements OnModuleDestroy {
     this.semanticRelationProjectionTimers.clear();
     this.semanticRelationProjectionActive.clear();
     this.semanticRelationProjectionDeadlines.clear();
+    this.semanticRelationRevisionOverrides.clear();
     for (const timer of this.historyCacheTimeoutsByKey.values()) clearTimeout(timer);
     this.historyCacheTimeoutsByKey.clear();
     this.winCache.clear();
@@ -1336,6 +1337,7 @@ export class AggregationService implements OnModuleDestroy {
   }>();
   private readonly semanticRelationProjectionActive = new Set<string>();
   private readonly semanticRelationProjectionDeadlines = new Map<string, NodeJS.Timeout>();
+  private readonly semanticRelationRevisionOverrides = new Map<string, number>();
   private readonly semanticRelationProjectionMaxKeys = 512;
   private semanticRelationProjectionScheduled = 0;
   private semanticRelationProjectionCompleted = 0;
@@ -1499,6 +1501,7 @@ export class AggregationService implements OnModuleDestroy {
       relationProjection: {
         queued: this.semanticRelationProjectionTimers.size,
         active: this.semanticRelationProjectionActive.size,
+        revisionOverrides: this.semanticRelationRevisionOverrides.size,
         maxKeys: this.semanticRelationProjectionMaxKeys,
         scheduled: this.semanticRelationProjectionScheduled,
         completed: this.semanticRelationProjectionCompleted,
@@ -2757,6 +2760,17 @@ export class AggregationService implements OnModuleDestroy {
       if (!sameRuntime && !sameAsset) continue;
       if (Math.abs(record.at - eventAt) > 30 * 60_000) continue;
       considered += 1;
+      const key = record.agentInstanceId?.trim() || record.agentAssetId;
+      const nextRevision = Math.max(
+        this.semanticRelationRevisionOverrides.get(key) ?? 0,
+        (this.conversationBindings.currentResolutionRevision() || 1) + 1,
+      );
+      this.semanticRelationRevisionOverrides.set(key, nextRevision);
+      while (this.semanticRelationRevisionOverrides.size > 2_048) {
+        const oldest = this.semanticRelationRevisionOverrides.keys().next().value as string | undefined;
+        if (!oldest) break;
+        this.semanticRelationRevisionOverrides.delete(oldest);
+      }
       this.scheduleSemanticRelationProjection(record);
     }
   }
@@ -2937,7 +2951,11 @@ export class AggregationService implements OnModuleDestroy {
       durable: true,
       limit: 1_000,
     });
-    const resolutionRevision = this.conversationBindings.currentResolutionRevision();
+    const relationRevisionKey = trigger.agentInstanceId?.trim() || trigger.agentAssetId;
+    const resolutionRevision = Math.max(
+      this.conversationBindings.currentResolutionRevision(),
+      this.semanticRelationRevisionOverrides.get(relationRevisionKey) ?? 0,
+    );
     let batch = buildSemanticKernelRelationBatch(
       relationInputs,
       kernel.items,

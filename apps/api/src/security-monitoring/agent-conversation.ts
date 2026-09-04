@@ -823,6 +823,8 @@ function summaryForConversation(
   ) ?? 'Agent';
   const resolvedResults = resolvedToolResultIds(interactions);
   const unknownResults = unknownToolResultIds(interactions);
+  const failedToolResults = interactions.reduce((count, item) =>
+    count + item.toolResults.filter((result) => result.isError === true).length, 0);
   const usage = summarizeAgentUsage(interactions);
   const firstLogical = interactions.find((item) => item.logicalAgentId)?.logicalAgentId;
   const firstCandidate = interactions.find((item) => item.logicalAgentCandidateId)?.logicalAgentCandidateId;
@@ -894,7 +896,8 @@ function summaryForConversation(
     toolResultCount: uniqueToolItemCount(interactions, 'result'),
     errorCount: interactions.filter((item) =>
       item.statusCode >= 400
-      || !effectiveInteractionState(item, resolvedResults, unknownResults).complete).length,
+      || !effectiveInteractionState(item, resolvedResults, unknownResults).complete).length
+      + failedToolResults,
     models: [...new Set(interactions
       .map((item) => item.model)
       .filter((value): value is string => Boolean(value)))],

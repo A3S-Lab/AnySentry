@@ -387,7 +387,17 @@ try {
     await new Promise((resolve) => setTimeout(resolve, 500));
     timelineEvidence = await get(`/v1/semantic-events/${encodeURIComponent(toolEvent.semanticEventId)}/evidence${evidenceScope ? `?${evidenceScope}` : ''}`);
   }
-  assert.equal(timelineEvidence.evidence?.canonicalEvidenceLinksSource ?? 'computed_compatibility', 'canonical_store');
+  assert(['canonical_store', 'canonical_store+hot_delta', 'memory_hot_ring'].includes(
+    timelineEvidence.evidence?.canonicalEvidenceLinksSource ?? 'computed_compatibility',
+  ), 'semantic evidence must expose a canonical-lane link source');
+  if (timelineEvidence.evidence?.canonicalEvidenceLinksSource === 'canonical_store+hot_delta') {
+    assert.equal(timelineEvidence.evidence.canonicalEvidenceLinksCoverage?.partial, true);
+    assert(timelineEvidence.evidence.canonicalEvidenceLinksCoverage?.reasons.includes('canonical_evidence_link_hot_delta_pending'));
+  }
+  if (timelineEvidence.evidence?.canonicalEvidenceLinksSource === 'memory_hot_ring') {
+    assert(timelineEvidence.evidence?.canonicalEvidenceLinksCoverage,
+      'memory-only canonical links must expose coverage metadata');
+  }
   assert(timelineEvidence.evidence?.canonicalEvidenceLinks?.some((link) => link.linkId === linkedCanonical.linkId),
     'semantic evidence response must expose the materialized canonical link');
   const durableEvidence = await get(`/v1/semantic-events/${encodeURIComponent(durableToolRecord.semanticRecordId)}/evidence${evidenceScope ? `?${evidenceScope}` : ''}`);
