@@ -568,6 +568,29 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   private processLifecycleHydratedFromStorage = false;
   private processLifecycleHydrationSkipped = false;
   private processLifecycleEvictions = 0;
+  // Post-commit business effects (incident/alert/session projections) are derived from an event
+  // that has already crossed the ClickHouse durability fence.  Keep their asynchronous work
+  // bounded and independent from the Observer request ACK; a slow PostgreSQL statement must not
+  // make the Forwarder replay an immutable fact.
+  private readonly POST_COMMIT_PROJECTION_MAX_IN_FLIGHT = boundedEnvInt(
+    'ANYSENTRY_POST_COMMIT_PROJECTION_MAX_IN_FLIGHT',
+    32,
+    1,
+    256,
+  );
+  private readonly POST_COMMIT_PROJECTION_TIMEOUT_MS = boundedEnvInt(
+    'ANYSENTRY_POST_COMMIT_PROJECTION_TIMEOUT_MS',
+    250,
+    25,
+    10_000,
+  );
+  private postCommitProjectionInFlight = 0;
+  private postCommitProjectionScheduled = 0;
+  private postCommitProjectionCompleted = 0;
+  private postCommitProjectionFailed = 0;
+  private postCommitProjectionTimedOut = 0;
+  private postCommitProjectionDropped = 0;
+  private postCommitProjectionClosing = false;
   private timer?: NodeJS.Timeout;
   private readonly ch = new ClickHouseStore();
   private readonly incidents = new Map<string, Incident>();
@@ -656,6 +679,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     }
   }
   async onModuleDestroy(): Promise<void> {
+    this.postCommitProjectionClosing = true;
     this.decisionRevisionWriterClosing = true;
     if (this.decisionRevisionWriteTimer) clearTimeout(this.decisionRevisionWriteTimer);
     this.decisionRevisionWriteTimer = undefined;
@@ -720,6 +744,16 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     hotRingCapacity: number;
     hotProtectedSize: number;
     hotProtectedReserve: number;
+    postCommitProjection: {
+      inFlight: number;
+      maxInFlight: number;
+      timeoutMs: number;
+      scheduled: number;
+      completed: number;
+      failed: number;
+      timedOut: number;
+      dropped: number;
+    };
   } {
     const clickhouseConfigured = Boolean(process.env.CLICKHOUSE_URL);
     const clickhouseReady = this.ch.enabled;
@@ -731,6 +765,16 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       hotRingCapacity: this.MAX,
       hotProtectedSize: this.hotProtectedCount,
       hotProtectedReserve: this.HOT_PROTECTED_RESERVE,
+      postCommitProjection: {
+        inFlight: this.postCommitProjectionInFlight,
+        maxInFlight: this.POST_COMMIT_PROJECTION_MAX_IN_FLIGHT,
+        timeoutMs: this.POST_COMMIT_PROJECTION_TIMEOUT_MS,
+        scheduled: this.postCommitProjectionScheduled,
+        completed: this.postCommitProjectionCompleted,
+        failed: this.postCommitProjectionFailed,
+        timedOut: this.postCommitProjectionTimedOut,
+        dropped: this.postCommitProjectionDropped,
+      },
     };
   }
 
@@ -1584,6 +1628,16 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
 
   async commitPreparedBatch(
     prepared: readonly Extract<PreparedJudgeAcceptOutcome, { disposition: 'retained' }>[],
+    options: {
+      /**
+       * Called when a post-durability memory/business-effect projection cannot be applied.
+       * The ClickHouse fence has already accepted the immutable event at this point, so a batch
+       * caller may choose to retain the event and record a CoverageGap instead of making the
+       * Forwarder replay an already durable fact.  Omitting the callback preserves the historical
+       * fail-fast behaviour for callers that still require the projection synchronously.
+       */
+      onProjectionFailure?: (event: JudgedEvent, error: unknown) => void;
+    } = {},
   ): Promise<void> {
     for (const item of prepared) {
       const current = this.storeById.get(item.event.eventId);
@@ -1593,7 +1647,114 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       // duplicate pending revision's receipt timestamp: doing so can make a valid result look older
       // than the replay even though that result belongs to the same evaluation.
       if (current && currentRevision === incomingRevision) continue;
-      await this.upsertDurableMemory(item.event, item.notify);
+      try {
+        await this.upsertDurableMemory(item.event, item.notify);
+      } catch (error) {
+        // `upsertDurableMemory` inserts the event into the bounded hot index before applying the
+        // optional PostgreSQL business-effect ledger.  Once the caller has crossed the durable
+        // ClickHouse fence, retrying the whole Observer batch is unsafe: it amplifies WAL/backlog
+        // pressure and can duplicate an immutable fact.  Batch ingest supplies the callback to
+        // retain that fact and expose a projection gap; legacy direct callers may omit it and
+        // keep the old rejection contract.
+        if (!options.onProjectionFailure) throw error;
+        try {
+          options.onProjectionFailure(item.event, error);
+        } catch {
+          // Coverage reporting is itself a best-effort side lane.  Never replace the original
+          // post-commit failure with a callback/diagnostic failure.
+        }
+      }
+    }
+  }
+
+  /**
+   * Schedule post-durability projections without holding an Observer request open.  The caller
+   * must invoke this only after `persistPreparedBatch` has returned `durable`; events are still
+   * inserted into the bounded hot index by `upsertDurableMemory`, while slow PostgreSQL effects
+   * run behind a small gate.  Every detached Promise is observed, including work that settles
+   * after its timeout, so a database outage cannot create an unhandled rejection.
+   */
+  schedulePreparedBatchProjection(
+    prepared: readonly Extract<PreparedJudgeAcceptOutcome, { disposition: 'retained' }>[],
+    options: {
+      onProjectionFailure?: (event: JudgedEvent, error: unknown) => void;
+    } = {},
+  ): void {
+    for (const item of prepared) {
+      const current = this.storeById.get(item.event.eventId);
+      const currentRevision = Math.max(1, Math.trunc(current?.decisionRevision ?? 1));
+      const incomingRevision = Math.max(1, Math.trunc(item.event.decisionRevision ?? 1));
+      if (current && currentRevision === incomingRevision) continue;
+      if (
+        this.postCommitProjectionClosing
+        || this.postCommitProjectionInFlight >= this.POST_COMMIT_PROJECTION_MAX_IN_FLIGHT
+      ) {
+        this.postCommitProjectionDropped += 1;
+        try {
+          options.onProjectionFailure?.(
+            item.event,
+            Object.assign(new Error('post-commit projection gate is at capacity'), {
+              code: 'ANYSENTRY_POST_COMMIT_PROJECTION_CAPACITY',
+            }),
+          );
+        } catch {
+          // A coverage callback is best effort and must never escape the ACK path.
+        }
+        continue;
+      }
+
+      this.postCommitProjectionInFlight += 1;
+      this.postCommitProjectionScheduled += 1;
+      let settled = false;
+      let reported = false;
+      let timeout: NodeJS.Timeout | undefined;
+      const release = () => {
+        if (timeout) clearTimeout(timeout);
+        this.postCommitProjectionInFlight = Math.max(0, this.postCommitProjectionInFlight - 1);
+      };
+      const report = (error: unknown) => {
+        if (reported) return;
+        reported = true;
+        this.postCommitProjectionFailed += 1;
+        try { options.onProjectionFailure?.(item.event, error); } catch { /* non-blocking */ }
+      };
+      let task: Promise<unknown>;
+      try {
+        task = this.upsertDurableMemory(item.event, item.notify);
+      } catch (error) {
+        settled = true;
+        report(error);
+        release();
+        continue;
+      }
+      timeout = setTimeout(() => {
+        if (settled) return;
+        this.postCommitProjectionTimedOut += 1;
+        report(Object.assign(new Error('post-commit projection timed out'), {
+          code: 'ANYSENTRY_POST_COMMIT_PROJECTION_TIMEOUT',
+        }));
+        // Keep the in-flight slot until the underlying Promise settles.  This prevents a fleet of
+        // timed-out PostgreSQL calls from quietly exceeding the configured concurrency bound.
+      }, this.POST_COMMIT_PROJECTION_TIMEOUT_MS);
+      timeout.unref();
+      void task
+        .then(() => {
+          if (settled) return;
+          settled = true;
+          this.postCommitProjectionCompleted += 1;
+          release();
+        })
+        .catch((error: unknown) => {
+          if (!settled) {
+            settled = true;
+            report(error);
+            release();
+          } else {
+            // A timeout already reported the failure; this catch still consumes the late
+            // rejection and releases the slot without emitting a duplicate gap.
+            release();
+          }
+        });
     }
   }
 

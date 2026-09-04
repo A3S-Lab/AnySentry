@@ -199,6 +199,13 @@ const CANONICAL_DIRECTORY_INFLIGHT_MAX = 16;
 const CANONICAL_SESSION_INFLIGHT_MAX = 16;
 const CANONICAL_EVIDENCE_PROJECTION_TIMEOUT_MS = 10_000;
 
+function boundedControllerEnvInt(name: string, fallback: number, min: number, max: number): number {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed)
+    ? Math.min(max, Math.max(min, Math.trunc(parsed)))
+    : fallback;
+}
+
 function canonicalQueryScalar(
   query: Record<string, unknown> | undefined,
   keys: readonly string[],
@@ -651,6 +658,36 @@ function isEventRevisionConflict(error: unknown): boolean {
     'code' in error &&
     (error as { code?: unknown }).code === EVENT_REVISION_CONFLICT
   );
+}
+
+/**
+ * A post-commit projection failure is an observability degradation, not a reason to replay the
+ * immutable Observer fact.  Keep the classification deliberately narrow and metadata-only: error
+ * messages from database clients may contain SQL, endpoint, or credential-bearing fragments and
+ * must never be copied into a CoverageGap or an ingest response.
+ */
+function observerProjectionFailureReason(error: unknown): 'timeout' | 'storage_unavailable' {
+  const value = error && typeof error === 'object' ? error as { code?: unknown; name?: unknown } : {};
+  const code = typeof value.code === 'string' ? value.code : '';
+  const name = typeof value.name === 'string' ? value.name : '';
+  // PostgreSQL uses SQLSTATE 57014 for a cancelled statement and often puts the literal
+  // "statement timeout" only in the message.  Inspect it for classification, but never persist
+  // the message itself (it may contain a query or endpoint fragment).
+  const message = error instanceof Error ? error.message : '';
+  return code === '57014'
+    || /(?:timeout|timed[_ -]?out|etimedout|deadline|statement[_ -]?cancel)/iu.test(`${code} ${name} ${message}`)
+    ? 'timeout'
+    : 'storage_unavailable';
+}
+
+function observerProjectionFailureCode(error: unknown): string {
+  if (error && typeof error === 'object') {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === 'string' && /^[A-Za-z0-9_.:-]{1,120}$/u.test(code)) return code;
+    const name = (error as { name?: unknown }).name;
+    if (typeof name === 'string' && /^[A-Za-z0-9_.:-]{1,120}$/u.test(name)) return name;
+  }
+  return 'projection_error';
 }
 
 const DIGEST_SECRET_KEY = /(?:token|authorization|cookie|password|secret|credential|api[_-]?key|access[_-]?key|refresh[_-]?token|private[_-]?key)/iu;
@@ -6048,6 +6085,28 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   private canonicalSessionCacheEvicted = 0;
   private canonicalSessionCacheExpired = 0;
   private canonicalSessionCacheDropped = 0;
+  // Secondary projections are scheduled only after the primary event block is durable.  Keep a
+  // controller-local gate for interaction/session writes that may still touch PostgreSQL; this is
+  // separate from the Judge's business-effect gate because the two lanes have different owners.
+  private readonly observerProjectionMaxInFlight = boundedControllerEnvInt(
+    'ANYSENTRY_OBSERVER_POST_COMMIT_PROJECTION_MAX_IN_FLIGHT',
+    32,
+    1,
+    256,
+  );
+  private readonly observerProjectionTimeoutMs = boundedControllerEnvInt(
+    'ANYSENTRY_OBSERVER_POST_COMMIT_PROJECTION_TIMEOUT_MS',
+    250,
+    25,
+    10_000,
+  );
+  private observerProjectionInFlight = 0;
+  private observerProjectionScheduled = 0;
+  private observerProjectionCompleted = 0;
+  private observerProjectionFailed = 0;
+  private observerProjectionTimedOut = 0;
+  private observerProjectionDropped = 0;
+  private observerProjectionClosing = false;
 
   constructor(
     private readonly agg: AggregationService,
@@ -6081,6 +6140,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   ) {}
 
   onModuleDestroy(): void {
+    this.observerProjectionClosing = true;
     // These process-level replay fences are compatibility caches, not durable facts.  Explicitly
     // clear them on a graceful shutdown so a hot-reload/test process cannot retain source payload
     // digests or result envelopes beyond its lifecycle.
@@ -6735,6 +6795,132 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       endpoint: context.endpoint,
       rejectedEvents: context.rejectedEvents,
     });
+  }
+
+  /**
+   * Record a bounded, metadata-only gap for work that runs after the immutable event durability
+   * fence.  This helper is intentionally non-throwing: coverage reporting cannot be allowed to
+   * turn a successfully committed Raw/Kernel fact back into a retryable ingest response.
+   */
+  private recordObserverProjectionFailure(
+    eventId: string,
+    projection: string,
+    error: unknown,
+  ): string | undefined {
+    try {
+      return this.canonicalObservability.recordGap(
+        'projection',
+        observerProjectionFailureReason(error),
+        eventId,
+        {
+          projection: projection.slice(0, 120),
+          errorCode: observerProjectionFailureCode(error),
+        },
+      ).gapId;
+    } catch {
+      // The canonical gap store is a best-effort side lane.  The caller has already crossed the
+      // durable fact fence, so a gap-store failure must not make the event retryable.
+      return undefined;
+    }
+  }
+
+  /**
+   * Run one post-durability projection behind a bounded, non-blocking gate.  The caller supplies
+   * callbacks for result/failure so this helper stays agnostic of ClickHouse, PostgreSQL, Redis,
+   * or the particular read model.  A timeout reports a gap immediately but holds the slot until
+   * the underlying Promise settles; this keeps a fleet of stuck database calls from exceeding the
+   * configured concurrency bound, while the late rejection is still consumed.
+   */
+  private scheduleObserverProjection<T>(
+    eventId: string,
+    projection: string,
+    operation: () => Promise<T>,
+    onResult: (value: T) => void,
+    onFailure: (error: unknown) => void,
+  ): boolean {
+    const report = (error: unknown) => {
+      this.observerProjectionFailed += 1;
+      try {
+        onFailure(error);
+      } catch {
+        // If a caller's diagnostic callback itself fails, retain a direct canonical gap using the
+        // stable event/projection scope supplied to this gate.
+        this.recordObserverProjectionFailure(eventId, projection, error);
+      }
+    };
+    if (
+      this.observerProjectionClosing
+      || this.observerProjectionInFlight >= this.observerProjectionMaxInFlight
+    ) {
+      this.observerProjectionDropped += 1;
+      report(Object.assign(new Error('observer projection gate is at capacity'), {
+        code: 'ANYSENTRY_OBSERVER_PROJECTION_CAPACITY',
+      }));
+      return false;
+    }
+    this.observerProjectionInFlight += 1;
+    this.observerProjectionScheduled += 1;
+    let settled = false;
+    let reported = false;
+    let timeout: NodeJS.Timeout | undefined;
+    const release = () => {
+      if (timeout) clearTimeout(timeout);
+      this.observerProjectionInFlight = Math.max(0, this.observerProjectionInFlight - 1);
+    };
+    const reportOnce = (error: unknown) => {
+      if (reported) return;
+      reported = true;
+      report(error);
+    };
+    let task: Promise<T>;
+    try {
+      task = operation();
+    } catch (error) {
+      settled = true;
+      reportOnce(error);
+      release();
+      return true;
+    }
+    timeout = setTimeout(() => {
+      if (settled) return;
+      this.observerProjectionTimedOut += 1;
+      reportOnce(Object.assign(new Error('observer projection timed out'), {
+        code: 'ANYSENTRY_OBSERVER_PROJECTION_TIMEOUT',
+      }));
+    }, this.observerProjectionTimeoutMs);
+    timeout.unref();
+    void task
+      .then((value) => {
+        try { onResult(value); } catch (error) { reportOnce(error); }
+        if (settled) return;
+        settled = true;
+        this.observerProjectionCompleted += 1;
+        release();
+      })
+      .catch((error: unknown) => {
+        if (!settled) {
+          settled = true;
+          reportOnce(error);
+          release();
+        } else {
+          // A timeout already reported the failure; consume the late rejection and release slot.
+          release();
+        }
+      });
+    return true;
+  }
+
+  private observerProjectionStats(): Record<string, number> {
+    return {
+      inFlight: this.observerProjectionInFlight,
+      maxInFlight: this.observerProjectionMaxInFlight,
+      timeoutMs: this.observerProjectionTimeoutMs,
+      scheduled: this.observerProjectionScheduled,
+      completed: this.observerProjectionCompleted,
+      failed: this.observerProjectionFailed,
+      timedOut: this.observerProjectionTimedOut,
+      dropped: this.observerProjectionDropped,
+    };
   }
 
   private async enqueueCanonicalShadow(event: T.JudgedEvent, observerLine: string): Promise<void> {
@@ -12013,14 +12199,24 @@ export class SecurityMonitoringController implements OnModuleDestroy {
             || hasAuthorizedSemanticClaim(meta, sourceResolution, 'application')),
       );
       const prepared = this.judge.prepareAcceptWithDisposition(line, meta, collectorEventAt ?? Date.now());
-      const interaction = parseObserverAgentInteraction(line, meta);
+      let interaction: T.AgentInteractionRecord | undefined;
+      try {
+        interaction = parseObserverAgentInteraction(line, meta);
+      } catch {
+        // A parser/adapter exception is a semantic coverage gap, not a reason to discard the
+        // already committed RawObservation/KernelFact. Keep the compatibility event on its
+        // machine-side path and let a later parser revision replay it.
+        interaction = undefined;
+      }
       if (!interaction && observerLineEventKind(line) === 'LlmInteraction') {
-        this.canonicalObservability.recordGap(
-          'llm_format',
-          'parser_failed',
-          meta.rawObservationId ?? meta.attributes?.collectorId?.toString() ?? 'observer',
-          { eventKind: 'LlmInteraction' },
-        );
+        try {
+          this.canonicalObservability.recordGap(
+            'llm_format',
+            'parser_failed',
+            meta.rawObservationId ?? meta.attributes?.collectorId?.toString() ?? 'observer',
+            { eventKind: 'LlmInteraction' },
+          );
+        } catch { /* coverage reporting must not block the durable event path */ }
       }
       const context: PreparedObserverBatchEvent = {
         index,
@@ -12115,6 +12311,43 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       ({ prepared }) => prepared as PreparedRetainedJudgeAccept,
     );
     const structuralPrepared = structural.map(({ prepared }) => prepared as PreparedStructuralJudgeAccept);
+    // These markers describe accepted facts whose rebuildable projections could not be updated.
+    // They are deliberately kept separate from `deliveryRetryFrom`: a projection gap must not
+    // ask the Forwarder to replay an event that already crossed the immutable durability fence.
+    const projectionIncompleteIndexes = new Set<number>();
+    const projectionGapIdsByIndex = new Map<number, string[]>();
+    const markProjectionFailure = (index: number, eventId: string, projection: string, error: unknown): void => {
+      projectionIncompleteIndexes.add(index);
+      const gapId = this.recordObserverProjectionFailure(eventId, projection, error);
+      if (gapId) {
+        const current = projectionGapIdsByIndex.get(index) ?? [];
+        if (current.length < 8 && !current.includes(gapId)) current.push(gapId);
+        projectionGapIdsByIndex.set(index, current);
+      }
+    };
+    const handleProjectionFailure = (index: number, eventId: string, projection: string, error: unknown): void => {
+      if (!isolatePostCommitProjection) throw error;
+      markProjectionFailure(index, eventId, projection, error);
+    };
+    const runProjection = async <T>(
+      index: number,
+      eventId: string,
+      projection: string,
+      operation: () => Promise<T>,
+      onResult: (value: T) => void = () => undefined,
+    ): Promise<void> => {
+      if (isolatePostCommitProjection) {
+        this.scheduleObserverProjection(
+          eventId,
+          projection,
+          operation,
+          onResult,
+          (error) => handleProjectionFailure(index, eventId, projection, error),
+        );
+        return;
+      }
+      onResult(await operation());
+    };
     let revisionConflict = false;
     let retainedDurability: 'durable' | 'memory_only' = 'memory_only';
     if (structuralPrepared.length > 0) {
@@ -12172,23 +12405,56 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         revisionConflict = true;
       }
     }
+    // Only a successful ClickHouse block gives this batch a central immutable durability fence.
+    // The explicit memory-only profile remains fail-fast for downstream errors; otherwise a
+    // projection failure would be misclassified as safely acknowledged without a durable fact.
+    const isolatePostCommitProjection = retainedDurability === 'durable' && !revisionConflict;
     if (!revisionConflict && retainedPrepared.length > 0) {
-      await this.judge.commitPreparedBatch(retainedPrepared);
+      // The ClickHouse write above is the immutable event durability fence.  PostgreSQL-backed
+      // business effects and the hot identity projection run afterwards; isolate their failures
+      // so a timeout cannot make the Forwarder replay the already durable Observer batch.
+      if (isolatePostCommitProjection) {
+        this.judge.schedulePreparedBatchProjection(retainedPrepared, {
+          onProjectionFailure: (event: T.JudgedEvent, error: unknown) => {
+            const index = retainedForPersistence.find(({ prepared }) =>
+              (prepared as PreparedRetainedJudgeAccept).event.eventId === event.eventId)?.index;
+            if (index === undefined) return;
+            markProjectionFailure(index, event.eventId, 'judgment_business_effects', error);
+          },
+        });
+      } else {
+        // A memory-only profile has no central durability fence; preserve the historical fail-fast
+        // behavior so callers can retry the complete event batch safely.
+        await this.judge.commitPreparedBatch(retainedPrepared);
+      }
     }
     // The binding pass above is side-effect free. Publish only facts/events that crossed their
     // ClickHouse durability fence; a failed block therefore cannot create a ghost Asset/Runtime.
     for (const context of structural) {
-      this.materializeCommittedObservedAsset(context.meta, trustedCollectorEventTime(
-        context.meta,
-        isTrustedCollectorProducer(context.sourceResolution, context.collectorId),
-      ));
-    }
-    if (!revisionConflict && retainedDurability === 'durable') {
-      for (const context of retainedForPersistence) {
+      try {
         this.materializeCommittedObservedAsset(context.meta, trustedCollectorEventTime(
           context.meta,
           isTrustedCollectorProducer(context.sourceResolution, context.collectorId),
         ));
+      } catch (error) {
+        markProjectionFailure(context.index, context.meta.rawObservationId ?? `structural-${context.index}`, 'observed_asset', error);
+      }
+    }
+    if (isolatePostCommitProjection) {
+      for (const context of retainedForPersistence) {
+        try {
+          this.materializeCommittedObservedAsset(context.meta, trustedCollectorEventTime(
+            context.meta,
+            isTrustedCollectorProducer(context.sourceResolution, context.collectorId),
+          ));
+        } catch (error) {
+          handleProjectionFailure(
+            context.index,
+            (context.prepared as PreparedRetainedJudgeAccept).event.eventId,
+            'observed_asset',
+            error,
+          );
+        }
       }
     }
 
@@ -12199,10 +12465,36 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     if (!revisionConflict && retainedPrepared.length > 0) {
       try {
         await this.judge.enqueuePreparedFastJobs(retainedPrepared);
-        await this.enqueueCanonicalBatchMany(retainedForPersistence);
       } catch (error) {
         deliveryRetryFrom = Math.min(...retainedForPersistence.map(({ index }) => index));
-        deliveryError = error instanceof Error ? error.message : String(error);
+        // Fast-judgment enqueue is intentionally kept retryable: without a queue reservation the
+        // pending decision has no worker hand-off.  This is distinct from the rebuildable
+        // canonical projection below, which must never hold the Observer ACK hostage.
+        deliveryError = observerProjectionFailureCode(error);
+      }
+      if (deliveryRetryFrom < 0) {
+        try {
+          await this.enqueueCanonicalBatchMany(retainedForPersistence);
+        } catch (error) {
+          if (!isolatePostCommitProjection) {
+            deliveryRetryFrom = Math.min(...retainedForPersistence.map(({ index }) => index));
+            deliveryError = observerProjectionFailureCode(error);
+            // Keep the legacy retry path for memory-only mode, where the primary durability fence
+            // has not been crossed and replay is still the safe recovery mechanism.
+          } else {
+            // Kafka/Redis canonical publishing is an optional derived lane.  The immutable event,
+            // KernelFact, and L1/pending judgment are already durable; retain them and expose the
+            // missing projection through Coverage instead of replaying the whole batch.
+            for (const context of retainedForPersistence) {
+              markProjectionFailure(
+                context.index,
+                (context.prepared as PreparedRetainedJudgeAccept).event.eventId,
+                'canonical_stream',
+                error,
+              );
+            }
+          }
+        }
       }
     }
     let retainedCommitted = 0;
@@ -12275,6 +12567,14 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           structuralConsumed: true,
           reasonCode: prepared.reasonCode,
           reason: prepared.reasonCode,
+          ...(projectionIncompleteIndexes.has(index)
+            ? {
+                projectionIncomplete: true,
+                ...(projectionGapIdsByIndex.get(index)?.length
+                  ? { projectionGapIds: projectionGapIdsByIndex.get(index) }
+                  : {}),
+              }
+            : {}),
         };
         continue;
       }
@@ -12304,17 +12604,41 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         continue;
       }
 
-      try {
-        if (context.interaction) {
-          const interaction = {
-            ...context.interaction,
-            evidenceEventIds: [...new Set([
-              ...(context.interaction.evidenceEventIds ?? []),
-              prepared.event.eventId,
-            ])],
-          };
-          await this.agg.storeAgentInteraction(interaction);
-          const semanticCommit = await this.canonicalObservability.commitSemanticRecords(
+      if (context.interaction) {
+        const interaction = {
+          ...context.interaction,
+          evidenceEventIds: [...new Set([
+            ...(context.interaction.evidenceEventIds ?? []),
+            prepared.event.eventId,
+          ])],
+        };
+        await runProjection(
+          index,
+          prepared.event.eventId,
+          'agent_interaction',
+          () => this.agg.storeAgentInteraction(interaction),
+          (stored) => {
+            // `storeAgentInteraction` keeps a hot copy even when its dedicated ClickHouse
+            // interaction projection is unavailable.  The event itself crossed the primary event
+            // durability fence above, so expose the secondary failure without asking for replay.
+            const storage = typeof this.judge.storageStatus === 'function'
+              ? this.judge.storageStatus()
+              : undefined;
+            if (stored?.durable === false && storage?.clickhouseConfigured) {
+              markProjectionFailure(
+                index,
+                prepared.event.eventId,
+                'agent_interaction',
+                { code: 'ANYSENTRY_INTERACTION_PROJECTION_UNAVAILABLE' },
+              );
+            }
+          },
+        );
+        await runProjection(
+          index,
+          prepared.event.eventId,
+          'semantic_record',
+          () => this.canonicalObservability.commitSemanticRecords(
             canonicalSemanticRecordsForInteraction(
               interaction,
               canonicalSemanticAuthority(
@@ -12324,55 +12648,86 @@ export class SecurityMonitoringController implements OnModuleDestroy {
                 context.meta,
               ),
             ),
-          );
-          if (semanticCommit.rejected > 0) {
-            this.canonicalObservability.recordGap(
-              'projection', 'dropped', interaction.interactionId,
-              { rejected: semanticCommit.rejected },
-            );
-          }
-        } else {
-          // Generic/application events have no AgentInteraction projection, but their explicit
-          // Session/Run claims still belong in the canonical identity lane.  Observer
-          // LlmInteraction records are materialized by AggregationService above so they do not
-          // create a duplicate membership under the compatibility event id.
-          await this.conversationBindings?.commitEventMembership(prepared.event);
-        }
-        await this.observeSupplyChainInstall(prepared.event, context.line);
-        this.observeWorkspaceAssociation(prepared.event);
+          ),
+          (semanticCommit) => {
+            if (semanticCommit.rejected > 0) {
+              this.canonicalObservability.recordGap(
+                'projection', 'dropped', interaction.interactionId,
+                { rejected: semanticCommit.rejected },
+              );
+            }
+          },
+        );
+      } else {
+        // Generic/application events have no AgentInteraction projection, but their explicit
+        // Session/Run claims still belong in the canonical identity lane.  Observer
+        // LlmInteraction records are materialized by AggregationService above so they do not
+        // create a duplicate membership under the compatibility event id.
+        await runProjection(
+          index,
+          prepared.event.eventId,
+          'session_membership',
+          async () => this.conversationBindings?.commitEventMembership(prepared.event),
+        );
+      }
+      await this.observeSupplyChainInstall(prepared.event, context.line);
+      this.observeWorkspaceAssociation(prepared.event);
+      try {
         this.identityReview.considerCandidate(prepared.event, () => this.agg.invalidateWindowCache());
-        unknownLearningEvents.push(prepared.event);
+      } catch (error) {
+        handleProjectionFailure(index, prepared.event.eventId, 'identity_review', error);
+      }
+      unknownLearningEvents.push(prepared.event);
+      try {
         this.sources.recordAccepted(context.sourceResolution, 'event', {
           collectorId: context.collectorId,
           workspacePath: prepared.event.workspacePath,
         });
-        retainedCommitted += 1;
-        items[index] = {
-          index,
-          accepted: true,
-          disposition: 'retained',
-          eventId: prepared.event.eventId,
-          traceId: prepared.event.traceId,
-          invocationId: prepared.event.invocationId,
-          toolCallId: prepared.event.toolCallId,
-          spanId: prepared.event.spanId,
-          runId: prepared.event.runId,
-          verdict: prepared.event.verdict,
-          tier: prepared.event.tier,
-          severity: prepared.event.severity,
-          riskCategory: prepared.event.riskCategory,
-          decisionStatus: prepared.event.decisionStatus,
-          evaluationId: prepared.event.evaluationId,
-        };
       } catch (error) {
-        deliveryRetryFrom = index;
-        deliveryError = error instanceof Error ? error.message : String(error);
+        handleProjectionFailure(index, prepared.event.eventId, 'source_accounting', error);
       }
+      retainedCommitted += 1;
+      items[index] = {
+        index,
+        accepted: true,
+        disposition: 'retained',
+        eventId: prepared.event.eventId,
+        traceId: prepared.event.traceId,
+        invocationId: prepared.event.invocationId,
+        toolCallId: prepared.event.toolCallId,
+        spanId: prepared.event.spanId,
+        runId: prepared.event.runId,
+        verdict: prepared.event.verdict,
+        tier: prepared.event.tier,
+        severity: prepared.event.severity,
+        riskCategory: prepared.event.riskCategory,
+        decisionStatus: prepared.event.decisionStatus,
+        evaluationId: prepared.event.evaluationId,
+        ...(projectionIncompleteIndexes.has(index)
+          ? {
+              projectionIncomplete: true,
+              ...(projectionGapIdsByIndex.get(index)?.length
+                ? { projectionGapIds: projectionGapIdsByIndex.get(index) }
+                : {}),
+            }
+          : {}),
+      };
     }
 
     // Learning is a bounded recommendation plane, not part of the event durability ACK. Evaluate
     // the committed prefix once so high-rate batches do not rebuild all family state per event.
-    if (unknownLearningEvents.length > 0) this.unknownLearning.observeMany(unknownLearningEvents);
+    if (unknownLearningEvents.length > 0) {
+      try {
+        this.unknownLearning.observeMany(unknownLearningEvents);
+      } catch (error) {
+        // Unknown-learning is a derived recommendation projection.  A failure here must not turn
+        // a durable event prefix into a retryable suffix; retain one bounded batch-level gap.
+        const firstEventId = unknownLearningEvents[0]?.eventId;
+        if (firstEventId) {
+          this.recordObserverProjectionFailure(firstEventId, 'unknown_learning', error);
+        }
+      }
+    }
 
     if (deliveryRetryFrom >= 0) {
       for (let index = deliveryRetryFrom; index < events.length; index += 1) {
@@ -12395,6 +12750,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     const discardedEvents = items.filter((item) => item.disposition === 'discarded').length;
     const rejectedEvents = items.filter((item) => item.disposition === 'rejected').length;
     const retryableEvents = items.filter((item) => item.disposition === 'retryable').length;
+    const projectionIncompleteEvents = items.filter((item) => item.projectionIncomplete === true).length;
     if (retainedCommitted > 0) this.agg.invalidateWindowCache();
     const result: T.ObserverBatchIngestResult = {
       accepted: acceptedEvents > 0,
@@ -12407,6 +12763,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       rejectedEvents,
       retryableEvents,
       ...(deliveryRetryFrom >= 0 ? { deliveryIncompleteEvents: events.length - deliveryRetryFrom } : {}),
+      ...(projectionIncompleteEvents > 0 ? { projectionIncompleteEvents } : {}),
       ...(retryableEvents > 0 ? { retryAfterMs: OBSERVER_BATCH_RETRY_AFTER_MS } : {}),
       items,
     };
@@ -12655,14 +13012,23 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     if (outcome.durability === 'durable') {
       this.materializeCommittedObservedAsset(rec, collectorEventAt);
     }
-    const interaction = parseObserverAgentInteraction(line, meta);
+    let interaction: T.AgentInteractionRecord | undefined;
+    try {
+      interaction = parseObserverAgentInteraction(line, meta);
+    } catch {
+      // Keep the durable compatibility event and emit a semantic coverage gap when a parser
+      // revision throws on malformed/unsupported plaintext.
+      interaction = undefined;
+    }
     if (!interaction && observerLineEventKind(line) === 'LlmInteraction') {
-      this.canonicalObservability.recordGap(
-        'llm_format',
-        'parser_failed',
-        meta.rawObservationId ?? meta.attributes?.collectorId?.toString() ?? 'observer',
-        { eventKind: 'LlmInteraction' },
-      );
+      try {
+        this.canonicalObservability.recordGap(
+          'llm_format',
+          'parser_failed',
+          meta.rawObservationId ?? meta.attributes?.collectorId?.toString() ?? 'observer',
+          { eventKind: 'LlmInteraction' },
+        );
+      } catch { /* coverage reporting must not block the durable event path */ }
     }
     if (interaction) {
       const enrichedInteraction = {

@@ -960,6 +960,14 @@ export interface ObserverBatchIngestResultItem extends UniversalIngestResultItem
   reasonCode?: string;
   /** The event is durable, but at least one idempotent post-commit delivery still needs retry. */
   deliveryIncomplete?: boolean;
+  /**
+   * The immutable event was accepted, but one or more rebuildable projections were unavailable.
+   * This is an additive degradation marker; unlike `disposition=retryable` it never asks the
+  * Forwarder to replay an already durable fact.
+  */
+  projectionIncomplete?: boolean;
+  /** Bounded opaque CoverageGap identifiers for the failed projections. */
+  projectionGapIds?: string[];
 }
 export interface ObserverBatchIngestResult {
   accepted: boolean;
@@ -972,6 +980,8 @@ export interface ObserverBatchIngestResult {
   rejectedEvents: number;
   retryableEvents: number;
   deliveryIncompleteEvents?: number;
+  /** Number of accepted events whose post-commit projections recorded a CoverageGap. */
+  projectionIncompleteEvents?: number;
   retryAfterMs?: number;
   items: ObserverBatchIngestResultItem[];
 }

@@ -207,6 +207,7 @@ function batchToken(call) {
 function batchController(options = {}) {
   const controller = Object.create(SecurityMonitoringController.prototype);
   const acceptedSource = { accepted: true };
+  const projectionGaps = [];
   Object.assign(controller, {
     sources: {
       resolve: () => acceptedSource,
@@ -214,7 +215,10 @@ function batchController(options = {}) {
       recordRejected() {},
     },
     alerting: { observeSourceRejection() {} },
-    agentMetadata: { applyReview: (value) => value },
+    agentMetadata: {
+      applyReview: (value) => value,
+      resolveRegisteredDefinition: () => undefined,
+    },
     kube: { enrich: (value) => value },
     judge: {
       prepareAcceptWithDisposition(line, meta) {
@@ -231,8 +235,25 @@ function batchController(options = {}) {
         await options.persist?.(prepared, token);
         return options.durability ?? 'durable';
       },
-      commitPreparedBatch(prepared) {
-        options.commit?.(prepared);
+      async commitPreparedBatch(prepared, commitOptions = {}) {
+        try {
+          await options.commit?.(prepared);
+        } catch (error) {
+          if (typeof commitOptions.onProjectionFailure !== 'function') throw error;
+          for (const item of prepared) commitOptions.onProjectionFailure(item.event, error);
+        }
+      },
+      schedulePreparedBatchProjection(prepared, projectionOptions = {}) {
+        try {
+          const result = options.commit?.(prepared);
+          if (result && typeof result.then === 'function') {
+            void result.catch((error) => {
+              for (const item of prepared) projectionOptions.onProjectionFailure?.(item.event, error);
+            });
+          }
+        } catch (error) {
+          for (const item of prepared) projectionOptions.onProjectionFailure?.(item.event, error);
+        }
       },
       async enqueuePreparedFastJob(prepared) {
         await options.deliver?.(prepared);
@@ -254,8 +275,29 @@ function batchController(options = {}) {
       bindIngestMeta: (meta) => meta,
       materializeCommittedIngest: (meta) => options.materialize?.(meta),
     },
+    canonicalObservability: {
+      async commitObserverLine(_line, context = {}) {
+        return {
+          observation: {
+            observationId: `ro-fixture-${context.sourceSequence ?? projectionGaps.length}`,
+            revision: 1,
+          },
+          durable: true,
+        };
+      },
+      attachMeta(meta, observation) {
+        return { ...meta, rawObservationId: observation.observationId, rawObservationRevision: observation.revision };
+      },
+      recordGap(stage, reason, scope, details) {
+        const gap = { gapId: `gap-fixture-${projectionGaps.length + 1}`, stage, reason, scope, details };
+        projectionGaps.push(gap);
+        return gap;
+      },
+      async commitSemanticRecords() { return { accepted: 0, rejected: 0, durable: true }; },
+    },
     ingest: options.ingest ?? (async () => ({ accepted: true })),
   });
+  controller.__projectionGaps = projectionGaps;
   return controller;
 }
 
@@ -1466,6 +1508,47 @@ await withoutExpectedErrorLogs(async () => {
 }
 
 {
+  // Once the immutable event block is durable, a PostgreSQL/business-effect projection timeout
+  // must not turn the Observer ACK into a retryable suffix.  The event remains accepted and the
+  // bounded CoverageGap is exposed as an additive projection marker.
+  const controller = batchController({
+    async persist() {},
+    async commit() { throw Object.assign(new Error('synthetic PG statement timeout'), { code: 'ETIMEDOUT' }); },
+  });
+  const ack = await controller.ingestBatch({
+    batchId: 'batch-projection-timeout',
+    events: [{ line: 'projection-timeout', sourceEventId: 'projection-timeout-event' }],
+  }, {});
+  assert.equal(ack.accepted, true);
+  assert.equal(ack.acceptedEvents, 1);
+  assert.equal(ack.retryableEvents, 0);
+  assert.equal(ack.projectionIncompleteEvents, 1);
+  assert.equal(ack.items[0].disposition, 'retained');
+  assert.equal(ack.items[0].projectionIncomplete, true);
+  assert.equal(controller.__projectionGaps.length, 1);
+  assert.equal(controller.__projectionGaps[0].reason, 'timeout');
+  assert.equal(controller.__projectionGaps[0].stage, 'projection');
+}
+
+{
+  // The optional canonical stream is another derived projection.  A Redis/Kafka outage is
+  // reported as coverage degradation while the durable Observer fact is acknowledged once.
+  const controller = batchController({ async persist() {} });
+  controller.streaming.enqueueCanonicalBatch = async () => {
+    throw Object.assign(new Error('synthetic canonical projection timeout'), { code: 'ETIMEDOUT' });
+  };
+  const ack = await controller.ingestBatch({
+    batchId: 'batch-canonical-projection-timeout',
+    events: [{ line: 'canonical-projection-timeout', sourceEventId: 'canonical-projection-timeout-event' }],
+  }, {});
+  assert.equal(ack.acceptedEvents, 1);
+  assert.equal(ack.retryableEvents, 0);
+  assert.equal(ack.projectionIncompleteEvents, 1);
+  assert.equal(ack.items[0].projectionIncomplete, true);
+  assert.equal(controller.__projectionGaps[0].reason, 'timeout');
+}
+
+{
   let prepared = 0;
   let persisted = 0;
   let delivered = 0;
@@ -1501,7 +1584,7 @@ await withoutExpectedErrorLogs(async () => {
   }, {});
   assert.deepEqual(replay, ack,
     'an exact immutable batch replay returns the original terminal acknowledgement');
-  assert.equal(prepared, 4, 'replay still crosses current Source validation and side-effect-free preparation');
+  assert.equal(prepared, 2, 'an exact cached replay returns before preparation after Source-independent digest validation');
   assert.equal(persisted, 1, 'replay cannot create another ClickHouse event revision');
   assert.equal(delivered, 2, 'replay cannot duplicate canonical or judgment delivery');
 
@@ -1514,7 +1597,7 @@ await withoutExpectedErrorLogs(async () => {
     (error) => error?.getStatus?.() === 400,
     'a mismatched payload digest must fail before event preparation',
   );
-  assert.equal(prepared, 4);
+  assert.equal(prepared, 2);
   await assert.rejects(
     controller.ingestBatch({
       batchId: 'batch-digest-contract',
@@ -1523,7 +1606,7 @@ await withoutExpectedErrorLogs(async () => {
     (error) => error?.getStatus?.() === 400,
     'one batchId must not be reused for a different payload',
   );
-  assert.equal(prepared, 4);
+  assert.equal(prepared, 2);
 }
 
 {
