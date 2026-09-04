@@ -596,6 +596,8 @@ const eventRoleCases = [
   ['LlmApi', 'background', { eventCategory: 'llm', runId: 'derived-run', runIdSource: 'derived_ephemeral' }],
   ['LlmApi', 'control', { eventCategory: 'llm', attributes: { 'gen_ai.operation.name': 'initialize' } }],
   ['LlmApi', 'conversation', { eventCategory: 'llm', runId: 'producer-run', runIdSource: 'producer' }],
+  ['LlmApi', 'conversation', { eventCategory: 'llm', sessionIdSource: 'provider' }],
+  ['LlmApi', 'background', { eventCategory: 'llm', sessionIdSource: 'per_request', runId: 'derived-run', runIdSource: 'derived_ephemeral' }],
   ['AgentTool', 'background', { eventCategory: 'tool', attributes: { 'anysentry.traffic.role': 'background' } }],
   ['LegacyTool', 'conversation', { eventCategory: 'unknown' }], // unknown/legacy fallback is retained
   ['ToolExec', 'background', { activityContext: 'platform_healthcheck', eventCategory: 'runtime' }],
