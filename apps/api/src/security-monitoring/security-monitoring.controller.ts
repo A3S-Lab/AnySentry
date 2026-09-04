@@ -6045,8 +6045,27 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     headers: HeaderBag,
   ): string {
     const actor = auditActor(headers);
+    // Directory data is a broad projection. Entity IDs and pagination are applied by each
+    // canonical resource after the snapshot is read, so retaining them here would defeat
+    // coalescing when a page opens its LogicalAgent, AgentInstance, RuntimeInstance, and Session
+    // details concurrently. Keep all other filters (including source/tenant) in the key; local
+    // scope matching still performs the final security check and never treats a missing field as
+    // a wildcard.
+    const {
+      limit: _limit,
+      offset: _offset,
+      cursor: _cursor,
+      revision: _revision,
+      includeCoverage: _includeCoverage,
+      logicalAgentId: _logicalAgentId,
+      logicalAgentCandidateId: _logicalAgentCandidateId,
+      agentInstanceId: _agentInstanceId,
+      runtimeInstanceId: _runtimeInstanceId,
+      sessionId: _sessionId,
+      ...projectionQuery
+    } = query;
     return JSON.stringify({
-      query,
+      query: projectionQuery,
       actor: {
         type: actor.type,
         id: actor.id,
@@ -9606,7 +9625,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       scope: 'agent',
       classificationView: query.classificationView,
       agentAssetId: query.agentAssetId,
-      agentInstanceId: query.agentInstanceId,
+      // Canonical entity IDs are post-projection filters. Keeping an AgentInstance predicate here
+      // would make a cache entry for one detail page unusable for sibling resources.
+      agentInstanceId: undefined,
       product: query.product,
       q: query.q,
       lifecycleScope: query.lifecycleScope,
