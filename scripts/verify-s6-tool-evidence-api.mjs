@@ -502,6 +502,7 @@ const otlpIngest = await request('/ingest/otlp/v1/traces', 'POST', {
 }, sourceHeaders(otlpSource));
 assert.equal(otlpIngest.acceptedEvents, 2, 'standard invoke_agent and execute_tool spans are accepted');
 assert(otlpIngest.items.every((item) => item.traceId === otlpTraceId), 'OTLP traceId remains independent and unchanged');
+assert(otlpIngest.items.every((item) => item.runId === otlpRunId), 'all OTLP spans retain one producer run id');
 
 // The Observer Source is workspace-bound by design. Rebind this synthetic source before the
 // second workspace fixture so the test exercises an explicit deployment transition rather than a

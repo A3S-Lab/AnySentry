@@ -1960,7 +1960,7 @@ function isSemanticUniversalEventKind(kind: string): boolean {
   return [
     'agenttool', 'agentinvocation', 'llmcall', 'llmapi', 'llminteraction', 'usermessage', 'modelmessage', 'toolresult', 'noderun', 'llmresponse',
     'tool', 'tool_call', 'toolcall', 'function_call', 'functioncall', 'tool_result', 'function_result',
-    'agent_tool_result', 'node_result', 'node', 'node_run', 'workflow_run', 'agent_run',
+    'agent_tool_result', 'node_result', 'node', 'node_run', 'workflow_node', 'workflownode', 'workflow_run', 'agent_run',
     'llm', 'llm_call', 'llm_response', 'model_response',
     'user_message', 'user_input', 'human_message', 'input_message',
     'model_message', 'assistant_message', 'assistant_output', 'final_response',
@@ -3430,6 +3430,8 @@ function canonicalEventKind(input: T.UniversalIngestEvent): string {
     node: 'NodeRun',
     node_run: 'NodeRun',
     noderun: 'NodeRun',
+    workflow_node: 'NodeRun',
+    workflownode: 'NodeRun',
     workflowrun: 'AgentInvocation',
     workflow_run: 'AgentInvocation',
     agent_run: 'AgentInvocation',
