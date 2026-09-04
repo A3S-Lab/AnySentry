@@ -37,6 +37,26 @@
       ]
     },
     {
+      "id": "langchain-service",
+      "agentScopeId": "langchain",
+      "displayName": "LangChain",
+      "variants": [
+        { "argvPrefix": ["python /opt/anysentry-langchain-service/service.py"] },
+        { "argvPrefix": ["python3 /opt/anysentry-langchain-service/service.py"] },
+        { "argvPrefix": ["/opt/anysentry-langchain-service/.venv/bin/python /opt/anysentry-langchain-service/service.py"] }
+      ]
+    },
+    {
+      "id": "langgraph-service",
+      "agentScopeId": "langgraph",
+      "displayName": "LangGraph",
+      "variants": [
+        { "argvPrefix": ["python -m uvicorn agent.langchain_langgraph_service:app"] },
+        { "argvPrefix": ["python3 -m uvicorn agent.langchain_langgraph_service:app"] },
+        { "argvPrefix": ["/opt/venv/bin/python -m uvicorn agent.langchain_langgraph_service:app"] }
+      ]
+    },
+    {
       "id": "gemini-cli",
       "displayName": "Gemini CLI",
       "variants": [

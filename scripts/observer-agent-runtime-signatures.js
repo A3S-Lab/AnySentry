@@ -112,6 +112,16 @@ const BUILTIN_RUNTIMES = [
     ],
   },
   {
+    id: 'langgraph-service',
+    agentScopeId: 'langgraph',
+    displayName: 'LangGraph',
+    variants: [
+      { argvPrefix: ['python -m uvicorn agent.langchain_langgraph_service:app'] },
+      { argvPrefix: ['python3 -m uvicorn agent.langchain_langgraph_service:app'] },
+      { argvPrefix: ['/opt/venv/bin/python -m uvicorn agent.langchain_langgraph_service:app'] },
+    ],
+  },
+  {
     id: 'kimi-cli',
     displayName: 'Kimi Code CLI',
     variants: [

@@ -828,7 +828,7 @@ function verifyManualKubernetesObserverOverlay() {
     runtimeDocument?.schemaVersion === 'anysentry.agent_runtime_signatures.v1' &&
       Number.isInteger(runtimeDocument?.version) &&
       runtimeDocument.version > 1 &&
-      ['codex', 'pi', 'a3s-code', 'claude-code', 'gemini-cli', 'kimi-cli'].every((id) => runtimeIds.has(id)) &&
+      ['codex', 'pi', 'a3s-code', 'claude-code', 'langchain-service', 'langgraph-service', 'gemini-cli', 'kimi-cli'].every((id) => runtimeIds.has(id)) &&
       runtimeDocument.runtimes.every((runtime) => Array.isArray(runtime.variants) && runtime.variants.length > 0) &&
       runtimeDocument.runtimes.find((runtime) => runtime.id === 'a3s-code')?.agentScopeId === 'a3s code' &&
       runtimeDocument.runtimes.find((runtime) => runtime.id === 'claude-code')?.agentScopeId === 'Claude Code' &&

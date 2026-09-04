@@ -33,6 +33,16 @@ for (const [comm, expected] of [
   assert.match(match?.registryDocumentHash ?? '', /^[a-f0-9]{64}$/);
   assert.match(match?.registryMatcherHash ?? '', /^[a-f0-9]{64}$/);
 }
+assert.equal(
+  registry.match({ comm: 'python', argv: 'python /opt/anysentry-langchain-service/service.py' })?.agentId,
+  'langchain',
+  'the generic Python LangChain service signature is version-neutral',
+);
+assert.equal(
+  registry.match({ comm: 'python', argv: 'python -m uvicorn agent.langchain_langgraph_service:app --host 0.0.0.0 --port 8000' })?.agentId,
+  'langgraph',
+  'the generic LangGraph service signature is version-neutral',
+);
 assert.equal(registry.match({ comm: 'node', exe: '/usr/bin/node', argv: 'node server.js' }), undefined);
 assert.equal(
   registry.match({ comm: 'node', exe: '/usr/bin/node', argv: 'node prompt mentioning codex' }),
