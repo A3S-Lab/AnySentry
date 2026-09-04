@@ -1098,7 +1098,13 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   }
 
   async loadKernelFacts(
-    input: { factIds?: readonly string[]; limit?: number } = {},
+    input: {
+      factIds?: readonly string[];
+      eventIds?: readonly string[];
+      sourceRefs?: readonly string[];
+      derivedFrom?: readonly string[];
+      limit?: number;
+    } = {},
   ): Promise<KernelFact[]> {
     if (!(await this.initialize()) || !this.pool) return [];
     const requestedLimit = Number(input.limit ?? 1_000);
@@ -1106,21 +1112,45 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       ? Math.max(1, Math.min(KERNEL_FACT_LIMIT, Math.trunc(requestedLimit)))
       : 1_000;
     try {
-      const ids = [...new Set((input.factIds ?? [])
+      const boundedIds = (values: readonly string[] | undefined): string[] => [...new Set((values ?? [])
         .map((value) => String(value).trim())
-        .filter(Boolean))].slice(0, KERNEL_FACT_LIMIT);
+        .filter((value) => value.length > 0 && value.length <= 512))]
+        .slice(0, KERNEL_FACT_LIMIT);
+      const ids = boundedIds(input.factIds);
+      const eventIds = boundedIds(input.eventIds);
+      const sourceRefs = boundedIds(input.sourceRefs);
+      const derivedFrom = boundedIds(input.derivedFrom);
+      const predicates: string[] = [];
+      const params: unknown[] = [];
+      if (ids.length > 0) {
+        params.push(ids);
+        predicates.push(`fact_id = ANY($${params.length}::text[])`);
+      }
+      if (eventIds.length > 0) {
+        params.push(eventIds);
+        predicates.push(`event_id = ANY($${params.length}::text[])`);
+      }
+      if (sourceRefs.length > 0) {
+        params.push(sourceRefs);
+        predicates.push(`(record->'sourceRefs') ?| $${params.length}::text[]`);
+      }
+      if (derivedFrom.length > 0) {
+        params.push(derivedFrom);
+        predicates.push(`(record->'derivedFrom') ?| $${params.length}::text[]`);
+      }
+      params.push(limit);
       const result = await this.pool.query<{ record: KernelFact | string }>(
-        ids.length
+        predicates.length
           ? `SELECT record
                FROM anysentry_kernel_facts_v1
-              WHERE fact_id = ANY($1::text[])
+              WHERE ${predicates.join(' OR ')}
               ORDER BY observed_at DESC, fact_id
-              LIMIT $2`
+              LIMIT $${params.length}`
           : `SELECT record
                FROM anysentry_kernel_facts_v1
               ORDER BY observed_at DESC, fact_id
-              LIMIT $1`,
-        ids.length ? [ids, limit] : [limit],
+              LIMIT $${params.length}`,
+        params,
       );
       return result.rows.flatMap(({ record }) => {
         const parsed = this.parseRecord<KernelFact>(record);

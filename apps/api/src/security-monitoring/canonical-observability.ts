@@ -437,6 +437,10 @@ export interface KernelFactStoreOptions {
   maxEntries?: number;
   maxBytes?: number;
   ttlMs?: number;
+  /** Maximum number of distinct legacy/source aliases retained in the hot locator. */
+  maxAliasEntries?: number;
+  /** Maximum UTF-8 bytes retained by the hot alias locator. */
+  maxAliasBytes?: number;
   now?: () => number;
 }
 
@@ -451,6 +455,18 @@ export interface KernelFactStoreStats {
   dropped: number;
   duplicates: number;
   conflicts: number;
+  /** Distinct event/source aliases currently retained by the bounded hot locator. */
+  aliasEntries: number;
+  /** Number of alias → canonical fact bindings (an ambiguous alias has >1 binding). */
+  aliasBindings: number;
+  aliasBytes: number;
+  aliasMaxEntries: number;
+  aliasMaxBytes: number;
+  aliasEvicted: number;
+  aliasExpired: number;
+  aliasDropped: number;
+  aliasConflicts: number;
+  aliasOrphans: number;
   closed: boolean;
 }
 
@@ -1546,25 +1562,159 @@ export type KernelFactStoreResult =
   | { status: 'conflict' | 'rejected' | 'evicted'; reason: string };
 
 export class KernelFactStore {
+  private static readonly MAX_ALIASES_PER_FACT = 128;
   private readonly maxEntries: number;
   private readonly maxBytes: number;
   private readonly ttlMs: number;
+  private readonly maxAliasEntries: number;
+  private readonly maxAliasBytes: number;
   private readonly now: () => number;
   private readonly entries = new Map<string, { fact: KernelFact; bytes: number; insertedAt: number }>();
   private readonly fingerprints = new Map<string, string>();
+  /**
+   * A locator is deliberately separate from the canonical fact map.  `factId` remains the sole
+   * immutable primary identity; event/source IDs are compatibility aliases and may resolve to
+   * more than one fact while a producer is retrying or a revision is late.  Such an alias is
+   * treated as ambiguous rather than selecting an arbitrary fact.
+   */
+  private readonly aliasBindings = new Map<string, Set<string>>();
+  private readonly aliasesByFact = new Map<string, string[]>();
   private bytes = 0;
+  private aliasBytes = 0;
+  private aliasBindingCount = 0;
   private closed = false;
   private evicted = 0;
   private expired = 0;
   private dropped = 0;
   private duplicates = 0;
   private conflicts = 0;
+  private aliasEvicted = 0;
+  private aliasExpired = 0;
+  private aliasDropped = 0;
+  private aliasConflicts = 0;
+  private aliasOrphans = 0;
 
   constructor(options: KernelFactStoreOptions = {}) {
     this.maxEntries = Math.max(1, Math.min(1_000_000, Math.trunc(options.maxEntries ?? 50_000)));
     this.maxBytes = Math.max(1, Math.min(512 * 1024 * 1024, Math.trunc(options.maxBytes ?? 64 * 1024 * 1024)));
     this.ttlMs = Math.max(1, Math.min(30 * 24 * 60 * 60_000, Math.trunc(options.ttlMs ?? 30 * 60_000)));
+    this.maxAliasEntries = Math.max(
+      1,
+      Math.min(
+        1_000_000,
+        Math.trunc(options.maxAliasEntries ?? Math.max(8, Math.min(1_000_000, this.maxEntries * 8))),
+      ),
+    );
+    this.maxAliasBytes = Math.max(
+      1,
+      Math.min(
+        512 * 1024 * 1024,
+        Math.trunc(options.maxAliasBytes ?? Math.max(1_024, Math.min(64 * 1024 * 1024, Math.floor(this.maxBytes / 2)))),
+      ),
+    );
     this.now = options.now ?? Date.now;
+  }
+
+  private static aliasBytesFor(alias: string, factId: string): number {
+    // This is an accounting bound, not a serialization promise. Include a small fixed overhead
+    // for the Map/Set entry so the configured cap remains conservative under V8 object overhead.
+    return Buffer.byteLength(alias, 'utf8') + Buffer.byteLength(factId, 'utf8') + 64;
+  }
+
+  private static aliasCandidate(value: unknown): string | undefined {
+    if (typeof value !== 'string') return undefined;
+    const alias = value.trim();
+    if (!alias || alias.length > 512 || /[\u0000-\u001f\u007f]/u.test(alias)) return undefined;
+    // The fallback marker is intentionally not an addressable identity. Indexing it would make
+    // every fact without a producer reference collide under one useless alias.
+    if (alias === 'normalizer:kernel_fact.v1') return undefined;
+    return alias;
+  }
+
+  private removeAliasBinding(alias: string, factId: string, reason: 'expired' | 'evicted' | 'orphan' = 'orphan'): void {
+    const members = this.aliasBindings.get(alias);
+    if (!members || !members.delete(factId)) return;
+    this.aliasBindingCount = Math.max(0, this.aliasBindingCount - 1);
+    this.aliasBytes = Math.max(0, this.aliasBytes - KernelFactStore.aliasBytesFor(alias, factId));
+    if (members.size === 0) {
+      this.aliasBindings.delete(alias);
+      if (reason === 'expired') this.aliasExpired += 1;
+      else if (reason === 'evicted') this.aliasEvicted += 1;
+    }
+    const aliases = this.aliasesByFact.get(factId);
+    if (aliases) {
+      const index = aliases.indexOf(alias);
+      if (index >= 0) aliases.splice(index, 1);
+      if (aliases.length === 0) this.aliasesByFact.delete(factId);
+    }
+  }
+
+  private removeFactAliases(factId: string, reason: 'expired' | 'evicted' | 'orphan' = 'orphan'): void {
+    const aliases = this.aliasesByFact.get(factId);
+    if (!aliases) return;
+    // Copy because removeAliasBinding mutates aliasesByFact and the backing array.
+    for (const alias of [...aliases]) this.removeAliasBinding(alias, factId, reason);
+    this.aliasesByFact.delete(factId);
+  }
+
+  private pruneAliasBudget(): void {
+    while (
+      this.aliasBindings.size > this.maxAliasEntries
+      || this.aliasBytes > this.maxAliasBytes
+    ) {
+      const oldest = this.aliasBindings.entries().next().value as [string, Set<string>] | undefined;
+      if (!oldest) break;
+      for (const factId of [...oldest[1]]) this.removeAliasBinding(oldest[0], factId, 'evicted');
+    }
+  }
+
+  /**
+   * Register non-primary IDs for an already committed fact. This method never creates a fact and
+   * silently drops an alias when the independent locator budget is exhausted.
+   */
+  registerAliases(factId: string, aliases: readonly unknown[]): boolean {
+    if (this.closed) return false;
+    const canonical = this.entries.get(factId);
+    if (!canonical) {
+      this.aliasOrphans += 1;
+      return false;
+    }
+    const candidates = [...new Set(aliases
+      .map((value) => KernelFactStore.aliasCandidate(value))
+      .filter((value): value is string => Boolean(value)))]
+      .filter((alias) => alias !== factId)
+      .slice(0, KernelFactStore.MAX_ALIASES_PER_FACT);
+    let registered = false;
+    for (const alias of candidates) {
+      const members = this.aliasBindings.get(alias);
+      if (members?.has(factId)) {
+        registered = true;
+        continue;
+      }
+      const byFact = this.aliasesByFact.get(factId) ?? [];
+      if (byFact.length >= KernelFactStore.MAX_ALIASES_PER_FACT) {
+        this.aliasDropped += 1;
+        continue;
+      }
+      const bytes = KernelFactStore.aliasBytesFor(alias, factId);
+      if (!Number.isSafeInteger(bytes)
+        || bytes > this.maxAliasBytes
+        || this.aliasBindings.size >= this.maxAliasEntries && !members
+        || this.aliasBytes + bytes > this.maxAliasBytes) {
+        this.aliasDropped += 1;
+        continue;
+      }
+      const target = members ?? new Set<string>();
+      target.add(factId);
+      this.aliasBindings.set(alias, target);
+      this.aliasBindingCount += 1;
+      this.aliasBytes += bytes;
+      if (!byFact.includes(alias)) byFact.push(alias);
+      this.aliasesByFact.set(factId, byFact);
+      registered = true;
+    }
+    this.pruneAliasBudget();
+    return registered;
   }
 
   private purge(at = this.now()): void {
@@ -1576,6 +1726,7 @@ export class KernelFactStore {
       this.entries.delete(key);
       this.bytes = Math.max(0, this.bytes - entry.bytes);
       this.fingerprints.delete(key);
+      this.removeFactAliases(key, 'expired');
       this.expired += 1;
     }
   }
@@ -1594,6 +1745,7 @@ export class KernelFactStore {
     const existing = this.entries.get(key);
     if (existing) {
       if (this.fingerprints.get(key) === fingerprint) {
+        this.registerAliases(key, [existing.fact.eventId, ...existing.fact.sourceRefs, ...existing.fact.derivedFrom]);
         this.duplicates += 1;
         return { status: 'duplicate', fact: structuredClone(existing.fact) };
       }
@@ -1608,12 +1760,14 @@ export class KernelFactStore {
     this.entries.set(key, { fact, bytes, insertedAt: this.now() });
     this.fingerprints.set(key, fingerprint);
     this.bytes += bytes;
+    this.registerAliases(key, [fact.eventId, ...fact.sourceRefs, ...fact.derivedFrom]);
     while (this.entries.size > this.maxEntries || this.bytes > this.maxBytes) {
       const oldest = this.entries.entries().next().value as [string, { fact: KernelFact; bytes: number; insertedAt: number }] | undefined;
       if (!oldest) break;
       this.entries.delete(oldest[0]);
       this.fingerprints.delete(oldest[0]);
       this.bytes = Math.max(0, this.bytes - oldest[1].bytes);
+      this.removeFactAliases(oldest[0], 'evicted');
       this.evicted += 1;
     }
     if (!this.entries.has(key)) {
@@ -1638,9 +1792,40 @@ export class KernelFactStore {
   }
 
   get(factId: string): KernelFact | undefined {
+    const canonical = this.getCanonical(factId);
+    if (canonical) return canonical;
+    return this.getByAlias(factId);
+  }
+
+  /** Exact primary lookup. Unlike get(), this never interprets a compatibility alias. */
+  getCanonical(factId: string): KernelFact | undefined {
     this.purge();
     const entry = this.entries.get(factId);
     return entry ? structuredClone(entry.fact) : undefined;
+  }
+
+  /** Resolve an event/source alias to its sole live canonical fact ID. */
+  resolveFactId(alias: string): string | undefined {
+    this.purge();
+    const normalized = KernelFactStore.aliasCandidate(alias);
+    if (!normalized) return undefined;
+    if (this.entries.has(normalized)) return normalized;
+    const members = this.aliasBindings.get(normalized);
+    if (!members) return undefined;
+    const live = [...members].filter((factId) => this.entries.has(factId));
+    // Defensive cleanup covers rows restored by an older process that did not have reverse alias
+    // cleanup. It also keeps an orphaned alias from pinning a stale fact ID indefinitely.
+    for (const factId of [...members]) {
+      if (!this.entries.has(factId)) this.removeAliasBinding(normalized, factId, 'orphan');
+    }
+    if (live.length === 1) return live[0];
+    if (live.length > 1) this.aliasConflicts += 1;
+    return undefined;
+  }
+
+  getByAlias(alias: string): KernelFact | undefined {
+    const factId = this.resolveFactId(alias);
+    return factId ? this.getCanonical(factId) : undefined;
   }
 
   list(limit = this.maxEntries): KernelFact[] {
@@ -1654,14 +1839,40 @@ export class KernelFactStore {
 
   stats(): KernelFactStoreStats {
     this.purge();
-    return { entries: this.entries.size, bytes: this.bytes, maxEntries: this.maxEntries, maxBytes: this.maxBytes, ttlMs: this.ttlMs, evicted: this.evicted, expired: this.expired, dropped: this.dropped, duplicates: this.duplicates, conflicts: this.conflicts, closed: this.closed };
+    return {
+      entries: this.entries.size,
+      bytes: this.bytes,
+      maxEntries: this.maxEntries,
+      maxBytes: this.maxBytes,
+      ttlMs: this.ttlMs,
+      evicted: this.evicted,
+      expired: this.expired,
+      dropped: this.dropped,
+      duplicates: this.duplicates,
+      conflicts: this.conflicts,
+      aliasEntries: this.aliasBindings.size,
+      aliasBindings: this.aliasBindingCount,
+      aliasBytes: this.aliasBytes,
+      aliasMaxEntries: this.maxAliasEntries,
+      aliasMaxBytes: this.maxAliasBytes,
+      aliasEvicted: this.aliasEvicted,
+      aliasExpired: this.aliasExpired,
+      aliasDropped: this.aliasDropped,
+      aliasConflicts: this.aliasConflicts,
+      aliasOrphans: this.aliasOrphans,
+      closed: this.closed,
+    };
   }
 
   close(): void {
     this.closed = true;
     this.entries.clear();
     this.fingerprints.clear();
+    this.aliasBindings.clear();
+    this.aliasesByFact.clear();
     this.bytes = 0;
+    this.aliasBytes = 0;
+    this.aliasBindingCount = 0;
   }
 }
 

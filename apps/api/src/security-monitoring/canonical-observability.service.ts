@@ -48,7 +48,16 @@ export interface CanonicalRawObservationSink {
     limit?: number;
   }): Promise<RawObservation[]>;
   saveKernelFacts?(facts: readonly KernelFact[]): Promise<boolean>;
-  loadKernelFacts?(input?: { factIds?: readonly string[]; limit?: number }): Promise<KernelFact[]>;
+  loadKernelFacts?(input?: {
+    factIds?: readonly string[];
+    /** Compatibility event IDs retained as aliases of the canonical factId. */
+    eventIds?: readonly string[];
+    /** Raw/source references retained as aliases of the canonical factId. */
+    sourceRefs?: readonly string[];
+    /** Derived source references accepted for late relation/replay lookups. */
+    derivedFrom?: readonly string[];
+    limit?: number;
+  }): Promise<KernelFact[]>;
   saveSemanticRecords?(records: readonly SemanticRecord[]): Promise<boolean>;
   loadSemanticRecords?(input?: { semanticRecordIds?: readonly string[]; revision?: number; limit?: number }): Promise<SemanticRecord[]>;
   saveCoverageGaps?(gaps: readonly CoverageGap[]): Promise<boolean>;
@@ -1194,15 +1203,51 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
             return safe ? [safe] : [];
           })
       : [];
-    const hot = this.kernel.get(id);
+    // A canonical factId is authoritative when it is present.  Do not let a compatibility alias
+    // shadow an exact durable row (an alias may legitimately have collided across revisions).
+    const exactDurable = durable.filter((candidate) => candidate.factId === id);
+    const hot = this.kernel.getCanonical(id);
     // Point reads follow the same durable-first rule as list reads. A process-local hot copy may
     // be stale or tampered with after a late projection; never let it overwrite an immutable
     // durable KernelFact at read time. Keep a bounded diagnostic counter for reconciliation.
-    if (durable[0] && hot
-      && canonicalValueFingerprint(durable[0]) !== canonicalValueFingerprint(hot)) {
+    if (exactDurable[0] && hot
+      && canonicalValueFingerprint(exactDurable[0]) !== canonicalValueFingerprint(hot)) {
       this.durableReadConflicts += 1;
     }
-    return durable[0] ? structuredClone(durable[0]) : hot ? structuredClone(hot) : undefined;
+    if (exactDurable[0]) return structuredClone(exactDurable[0]);
+    if (hot) return structuredClone(hot);
+
+    // Older compatibility rows can address the same immutable fact with an event ID or a raw
+    // source reference. Ask the durable sink for those scalar/JSON predicates without changing
+    // the canonical record or copying a payload. The service deliberately refuses an ambiguous
+    // alias: selecting whichever row happened to arrive first would fabricate ownership.
+    const durableAliases = this.sink?.loadKernelFacts
+      ? (await this.sink.loadKernelFacts({
+          eventIds: [id],
+          sourceRefs: [id],
+          derivedFrom: [id],
+          limit: 16,
+        }).catch(() => []))
+          .flatMap((candidate) => {
+            const safe = safeDurableKernelFact(candidate);
+            return safe ? [safe] : [];
+          })
+      : [];
+    const matchingAliases = [...new Map(durableAliases
+      .filter((candidate) => candidate.eventId === id
+        || candidate.sourceRefs.includes(id)
+        || candidate.derivedFrom.includes(id))
+      .map((candidate) => [candidate.factId, candidate] as const)).values()];
+    if (matchingAliases.length > 1) {
+      this.durableReadConflicts += 1;
+      return undefined;
+    }
+    if (matchingAliases[0]) return structuredClone(matchingAliases[0]);
+
+    // The bounded hot locator is the final fallback for a just-committed fact whose durable side
+    // lane is still catching up. `getByAlias` returns a fact only for a unique live binding.
+    const hotAlias = this.kernel.getByAlias(id);
+    return hotAlias ? structuredClone(hotAlias) : undefined;
   }
 
   private enforceGapBudget(): void {

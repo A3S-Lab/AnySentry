@@ -21,10 +21,12 @@ const { CanonicalObservabilityService } = require(
 const {
   CANONICAL_SCHEMA_VERSIONS,
   RawObservationStore,
+  KernelFactStore,
   SessionMembershipStore,
   deriveConnectionIdentity,
   validateConnectionIdentity,
   deriveProcessGenerationKey,
+  normalizeKernelFact,
   rawObservationFromLine,
   resolveLogicalAgentDefinition,
   resolveSessionIdentity,
@@ -339,6 +341,73 @@ assert.equal(store.list().length, 0, 'TTL must expire bounded raw facts');
 store.close();
 assert.equal(store.stats().closed, true);
 
+// KernelFact keeps one immutable factId while indexing legacy event/source IDs as bounded aliases.
+// Alias lookups must never manufacture a fact or choose a winner when two facts claim one ID.
+let kernelClock = 10_000;
+const aliasFact = normalizeKernelFact({
+  kind: 'exec',
+  observedAtUnixNs: '1788000000000000100',
+  eventId: 'evt-legacy-kernel',
+  sourceRefs: ['ob-legacy-kernel', 'source-legacy-kernel'],
+  derivedFrom: ['derived-legacy-kernel'],
+  status: 'observed',
+});
+const aliasStore = new KernelFactStore({
+  maxEntries: 4,
+  maxBytes: 100_000,
+  ttlMs: 100,
+  maxAliasEntries: 16,
+  maxAliasBytes: 100_000,
+  now: () => kernelClock,
+});
+assert.equal(aliasStore.append(aliasFact).status, 'inserted');
+assert.equal(aliasStore.get(aliasFact.factId)?.factId, aliasFact.factId,
+  'canonical factId remains the primary lookup');
+assert.equal(aliasStore.get('evt-legacy-kernel')?.factId, aliasFact.factId,
+  'compatibility eventId resolves to the canonical fact');
+assert.equal(aliasStore.get('ob-legacy-kernel')?.factId, aliasFact.factId,
+  'raw observation sourceRef resolves to the canonical fact');
+assert.equal(aliasStore.get('derived-legacy-kernel')?.factId, aliasFact.factId,
+  'derived sourceRef resolves to the canonical fact');
+assert(aliasStore.stats().aliasBindings >= 3);
+
+const ambiguousStore = new KernelFactStore({ maxEntries: 4, maxBytes: 100_000, ttlMs: 1_000, now: () => kernelClock });
+const ambiguousA = normalizeKernelFact({
+  kind: 'exec', observedAtUnixNs: '1788000000000000200', eventId: 'evt-shared-legacy',
+  sourceRefs: ['ob-shared-a'], status: 'observed',
+});
+const ambiguousB = normalizeKernelFact({
+  kind: 'exec', observedAtUnixNs: '1788000000000000201', eventId: 'evt-shared-legacy',
+  sourceRefs: ['ob-shared-b'], status: 'observed',
+});
+assert.equal(ambiguousStore.append(ambiguousA).status, 'inserted');
+assert.equal(ambiguousStore.append(ambiguousB).status, 'inserted');
+assert.equal(ambiguousStore.get('evt-shared-legacy'), undefined,
+  'a colliding alias must remain unresolved instead of selecting a fact');
+assert(ambiguousStore.stats().aliasConflicts >= 1);
+
+const evictionStore = new KernelFactStore({ maxEntries: 1, maxBytes: 100_000, ttlMs: 1_000, now: () => kernelClock });
+const evictedFact = normalizeKernelFact({
+  kind: 'file', observedAtUnixNs: '1788000000000000300', eventId: 'evt-evicted-legacy',
+  sourceRefs: ['ob-evicted-legacy'], status: 'observed',
+});
+const retainedFact = normalizeKernelFact({
+  kind: 'file', observedAtUnixNs: '1788000000000000301', eventId: 'evt-retained-legacy',
+  sourceRefs: ['ob-retained-legacy'], status: 'observed',
+});
+assert.equal(evictionStore.append(evictedFact).status, 'inserted');
+assert.equal(evictionStore.append(retainedFact).status, 'inserted');
+assert.equal(evictionStore.get('evt-evicted-legacy'), undefined,
+  'evicting a fact must remove its aliases');
+assert(evictionStore.stats().aliasEvicted >= 1);
+kernelClock += 101;
+assert.equal(aliasStore.get('evt-legacy-kernel'), undefined,
+  'fact TTL must expire aliases with the fact');
+assert.equal(aliasStore.stats().aliasEntries, 0);
+aliasStore.close();
+ambiguousStore.close();
+evictionStore.close();
+
 const service = new CanonicalObservabilityService();
 const committed = await service.commitObserverLine(
   '{"event":{"SecurityAction":{"pid":42,"kind":"ptrace"}}}',
@@ -431,12 +500,13 @@ assert.equal(validateCoverageGap(reversedGap).ok, false,
   'coverage windows must be monotonic');
 const durableRaw = [];
 const durableFacts = [];
+const durableKernelQueries = [];
 const durableService = new CanonicalObservabilityService();
 durableService.setSink({
   async saveRawObservations(items) { durableRaw.push(...items); return true; },
   async loadRawObservations() { return durableRaw; },
   async saveKernelFacts(items) { durableFacts.push(...items); return true; },
-  async loadKernelFacts() { return durableFacts; },
+  async loadKernelFacts(input = {}) { durableKernelQueries.push(input); return durableFacts; },
 });
 const durableCommit = await durableService.commitObserverLine(
   '{"event":{"ToolExec":{"pid":42,"argv":["printf","fixture"]}}}',
@@ -457,6 +527,17 @@ assert.equal(durableCommit.durable, true);
 assert.equal(durableRaw.length, 1);
 assert.equal(durableFacts.length, 1);
 assert.equal((await durableService.listDurableKernelFacts()).length, 1);
+assert(durableCommit.kernelFact?.eventId);
+const durableAlias = await durableService.getDurableKernelFact(durableCommit.kernelFact.eventId);
+assert.equal(durableAlias?.factId, durableCommit.kernelFact.factId,
+  'durable eventId aliases must resolve without rewriting the canonical fact');
+assert(durableKernelQueries.some((query) => query.eventIds?.includes(durableCommit.kernelFact.eventId)),
+  'durable alias lookup must use the eventIds locator predicate');
+const durableSourceAlias = await durableService.getDurableKernelFact(durableCommit.kernelFact.sourceRefs[0]);
+assert.equal(durableSourceAlias?.factId, durableCommit.kernelFact.factId,
+  'durable sourceRefs aliases must resolve without copying payload data');
+assert(durableKernelQueries.some((query) => query.sourceRefs?.includes(durableCommit.kernelFact.sourceRefs[0])),
+  'durable alias lookup must use the sourceRefs locator predicate');
 durableService.close();
 
 console.log('canonical observability contract verification passed');
