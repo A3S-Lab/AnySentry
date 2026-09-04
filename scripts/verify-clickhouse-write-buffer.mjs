@@ -1530,6 +1530,60 @@ await withoutExpectedErrorLogs(async () => {
   assert.equal(controller.__projectionGaps[0].stage, 'projection');
 }
 
+await (async () => {
+  // The detached Judge gate must return synchronously, preserve FIFO work behind its bounded
+  // pending queue, and consume a late rejection after the timeout without an unhandled Promise.
+  let resolve;
+  let reject;
+  const pending = new Promise((resolveValue, rejectValue) => {
+    resolve = resolveValue;
+    reject = rejectValue;
+  });
+  const failures = [];
+  const judge = Object.create(SentryJudgeService.prototype);
+  Object.assign(judge, {
+    storeById: new Map(),
+    postCommitProjectionClosing: false,
+    postCommitProjectionPending: [],
+    postCommitProjectionInFlight: 0,
+    postCommitProjectionScheduled: 0,
+    postCommitProjectionCompleted: 0,
+    postCommitProjectionFailed: 0,
+    postCommitProjectionTimedOut: 0,
+    postCommitProjectionDropped: 0,
+    POST_COMMIT_PROJECTION_MAX_PENDING: 4,
+    POST_COMMIT_PROJECTION_MAX_IN_FLIGHT: 1,
+    POST_COMMIT_PROJECTION_TIMEOUT_MS: 25,
+    upsertDurableMemory: () => pending,
+  });
+  const prepared = Array.from({ length: 4 }, (_, index) => ({
+    disposition: 'retained',
+    notify: true,
+    event: event(45_000 + index, {
+      eventId: `projection-gate-${index}`,
+      verdict: 'escalate',
+      attributes: { idempotencyProtocolVersion: 'anysentry.idempotency.v1' },
+    }),
+  }));
+  const startedAt = Date.now();
+  judge.schedulePreparedBatchProjection(prepared, {
+    onProjectionFailure: (_event, error) => failures.push(error.code),
+  });
+  assert(Date.now() - startedAt < 50, 'detached post-commit projection scheduling must not await the sink');
+  assert.equal(judge.postCommitProjectionInFlight, 1);
+  assert.equal(judge.postCommitProjectionPending.length, 3);
+  await new Promise((done) => setTimeout(done, 40));
+  assert.ok(failures.includes('ANYSENTRY_POST_COMMIT_PROJECTION_TIMEOUT'));
+  reject(new Error('late projection rejection'));
+  await new Promise((done) => setImmediate(done));
+  assert.equal(judge.postCommitProjectionInFlight, 0);
+  assert.equal(judge.postCommitProjectionPending.length, 0);
+  assert.equal(judge.postCommitProjectionScheduled, 4);
+  assert.equal(judge.postCommitProjectionDropped, 0);
+  // Keep the resolver referenced so lint/runtime does not optimise the deferred fixture away.
+  void resolve;
+})();
+
 {
   // The optional canonical stream is another derived projection.  A Redis/Kafka outage is
   // reported as coverage degradation while the durable Observer fact is acknowledged once.
