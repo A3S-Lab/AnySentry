@@ -13,9 +13,10 @@ import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 import { validateWorkspacePath } from './verify-k8s-workspace-path.mjs';
 
-const repoRoot = resolve(dirname(new URL(import.meta.url).pathname), '..');
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const sourceOverlay = join(repoRoot, 'deploy/manual-test/k8s-local-path');
 const MAX_RENDER_BYTES = 64 * 1024 * 1024;
 
