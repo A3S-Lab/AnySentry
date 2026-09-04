@@ -12994,21 +12994,60 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           continue;
         }
         for (const directSession of directSessions.items.slice(0, 2)) {
-          const directConversationId = directSession.conversationId ?? directSession.sessionId;
+          let directConversationId = directSession.conversationId ?? directSession.sessionId;
           try {
-            const directTimeline = await withCanonicalProjectionTimeout(
-              this.agg.agentConversationTimelineV3({
-                timeType: query.timeType,
-                startTime: query.startTime,
-                endTime: query.endTime,
-                snapshotAsOf: query.snapshotAsOf,
-                scope: 'raw',
-                classificationView: query.classificationView,
-                conversationId: directConversationId,
-                limit: 500,
-              }),
-              CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS,
-            );
+            let directTimeline = await withCanonicalProjectionTimeout(this.agg.agentConversationTimelineV3({
+              timeType: query.timeType,
+              startTime: query.startTime,
+              endTime: query.endTime,
+              snapshotAsOf: query.snapshotAsOf,
+              scope: 'raw',
+              classificationView: query.classificationView,
+              conversationId: directConversationId,
+              limit: 500,
+            }), CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS);
+            // A degraded Session resource can retain only immutable interaction membership, or its
+            // first alias can be the canonical ID rather than the compatibility conversation ID.
+            // On an empty bounded timeline, resolve at most eight exact interaction rows and retry
+            // once with the returned conversation alias.  Never widen this to an unbounded history
+            // scan or infer it from a Pod/runtime name.
+            if (directTimeline.turns.length === 0 && directSession.interactionIds.length > 0) {
+              const interactionCandidates = await Promise.all(directSession.interactionIds
+                .slice(0, 8)
+                .map(async (interactionId) => {
+                  try {
+                    const list = await withCanonicalProjectionTimeout(this.agg.agentInteractions({
+                      timeType: query.timeType,
+                      startTime: query.startTime,
+                      endTime: query.endTime,
+                      snapshotAsOf: query.snapshotAsOf,
+                      scope: 'raw',
+                      classificationView: query.classificationView,
+                      interactionId,
+                      limit: 2,
+                    }), 1_000);
+                    return list.items.find((item) => item.conversationId);
+                  } catch (error) {
+                    if (!isCanonicalProjectionDegradation(error)) throw error;
+                    return undefined;
+                  }
+                }));
+              const interactionWithConversation = interactionCandidates.find((item) => item?.conversationId);
+              if (interactionWithConversation?.conversationId
+                && interactionWithConversation.conversationId !== directConversationId) {
+                directConversationId = interactionWithConversation.conversationId;
+                directTimeline = await withCanonicalProjectionTimeout(this.agg.agentConversationTimelineV3({
+                  timeType: query.timeType,
+                  startTime: query.startTime,
+                  endTime: query.endTime,
+                  snapshotAsOf: query.snapshotAsOf,
+                  scope: 'raw',
+                  classificationView: query.classificationView,
+                  conversationId: directConversationId,
+                  limit: 500,
+                }), CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS);
+              }
+            }
             for (const turn of directTimeline.turns) {
               for (const event of turn.events) {
                 const matches = timelineId
