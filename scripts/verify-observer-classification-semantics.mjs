@@ -3,7 +3,10 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
+import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
@@ -144,13 +147,15 @@ const agentConflict = semantic(classification('agent', 'probable_agent', {
 assert.deepEqual(agentConflict, {
   schemaVersion: CLASSIFICATION_SEMANTICS_SCHEMA,
   identityClassification: 'probable_agent',
+  effectiveIdentityClassification: 'confirmed_agent',
+  classificationSource: 'candidate_auto_promoted',
   workloadRole: 'platform_infrastructure',
-  captureProfile: 'probable_investigation',
+  captureProfile: 'agent_full',
 });
 const inconsistentAgent = classification('agent', 'non_agent', { conflict: true });
 assert.equal(semantic(inconsistentAgent).identityClassification, 'probable_agent');
 assert.equal(semantic(inconsistentAgent).workloadRole, 'agent');
-assert.equal(semantic(inconsistentAgent).captureProfile, 'probable_investigation');
+assert.equal(semantic(inconsistentAgent).captureProfile, 'agent_full');
 
 const embeddedConfirmedAgent = semantic(classification('agent', 'confirmed_agent', {
   workloadRole: 'business_service',
@@ -416,7 +421,7 @@ const allResolved = [
 for (const resolved of allResolved) {
   assert.deepEqual(
     Object.keys(resolved).sort(),
-    ['captureProfile', 'identityClassification', 'schemaVersion', 'unknownReason', 'workloadRole']
+    ['captureProfile', 'classificationSource', 'effectiveIdentityClassification', 'identityClassification', 'schemaVersion', 'unknownReason', 'workloadRole']
       .filter((key) => resolved[key] !== undefined)
       .sort(),
   );
@@ -492,6 +497,11 @@ async function within(promise, timeoutMs, label) {
 async function runForwarder(mode, options = {}) {
   const batches = [];
   const snapshotRequested = deferred();
+  // Keep this short-lived WAL on tmpfs when available. The verifier must exercise the shutdown
+  // protocol, but a host-wide block-device fsync stall should not turn a classification contract
+  // check into a flaky timeout.
+  const spoolBase = fs.existsSync('/dev/shm') ? '/dev/shm' : os.tmpdir();
+  const spoolRoot = fs.mkdtempSync(path.join(spoolBase, 'anysentry-classification-forwarder-'));
   const server = http.createServer((request, response) => {
     if (request.method === 'GET' && request.url.startsWith('/security-center/identity/snapshot')) {
       snapshotRequested.resolve();
@@ -569,6 +579,7 @@ async function runForwarder(mode, options = {}) {
       FORWARD_BATCH_SIZE: '1',
       FORWARD_BATCH_FLUSH_MS: '1',
       A3S_OBSERVER_COLLECTOR_ID: 'classification-semantics-contract',
+      FORWARD_SPOOL_PATH: path.join(spoolRoot, 'spool.wal'),
     },
     stdio: ['pipe', 'ignore', 'pipe'],
   });
@@ -590,6 +601,7 @@ async function runForwarder(mode, options = {}) {
   } finally {
     if (child.exitCode === null) child.kill('SIGKILL');
     await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(spoolRoot, { recursive: true, force: true });
   }
 }
 

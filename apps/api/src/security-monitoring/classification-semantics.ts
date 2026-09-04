@@ -1,4 +1,5 @@
 import { correlationCaptureRollout } from './correlation-rollout';
+import { captureClassificationDecision } from './identity-judgment-routing';
 import {
   AgentClassification,
   CaptureProfile,
@@ -55,6 +56,8 @@ const UNKNOWN_REASONS = new Set<UnknownReason>([
 const ALLOWED_FIELDS = new Set([
   'schemaVersion',
   'identityClassification',
+  'effectiveIdentityClassification',
+  'classificationSource',
   'workloadRole',
   'captureProfile',
   'unknownReason',
@@ -88,6 +91,24 @@ export function parseClassificationSemantics(value: unknown): ClassificationSema
     || !CAPTURE_PROFILES.has(input.captureProfile as CaptureProfile)) return undefined;
 
   const identityClassification = input.identityClassification as AgentClassification;
+  const effectiveIdentityClassification = input.effectiveIdentityClassification === undefined
+    ? undefined
+    : typeof input.effectiveIdentityClassification === 'string'
+      && IDENTITY_CLASSIFICATIONS.has(input.effectiveIdentityClassification as AgentClassification)
+      ? input.effectiveIdentityClassification as AgentClassification
+      : undefined;
+  if (input.effectiveIdentityClassification !== undefined && !effectiveIdentityClassification) return undefined;
+  const classificationSource = input.classificationSource === undefined
+    ? undefined
+    : input.classificationSource === 'observed'
+      || input.classificationSource === 'candidate_auto_promoted'
+      || input.classificationSource === 'policy'
+      ? input.classificationSource
+      : undefined;
+  if (input.classificationSource !== undefined && !classificationSource) return undefined;
+  if (classificationSource === 'candidate_auto_promoted' && identityClassification !== 'probable_agent') return undefined;
+  if (effectiveIdentityClassification === 'confirmed_agent' && identityClassification !== 'confirmed_agent'
+    && classificationSource !== 'candidate_auto_promoted' && classificationSource !== 'policy') return undefined;
   const unknownReason = input.unknownReason;
   if (unknownReason !== undefined && (
     identityClassification !== 'unknown'
@@ -100,9 +121,26 @@ export function parseClassificationSemantics(value: unknown): ClassificationSema
   return {
     schemaVersion: 'anysentry.classification_semantics.v1',
     identityClassification,
+    ...(effectiveIdentityClassification ? { effectiveIdentityClassification } : {}),
+    ...(classificationSource ? { classificationSource } : {}),
     workloadRole: input.workloadRole as WorkloadRole,
     captureProfile: input.captureProfile as CaptureProfile,
     ...(unknownReason ? { unknownReason: unknownReason as UnknownReason } : {}),
+  };
+}
+
+/**
+ * Server-side capture view for an already validated classification.  The detector's value is
+ * retained as `identityClassification`; callers may attach the returned effective value to a
+ * projection or audit record without changing the business-identity contract.
+ */
+export function effectiveClassificationSemantics(
+  classification: AgentClassification | undefined,
+): Pick<ClassificationSemanticsV1, 'effectiveIdentityClassification' | 'classificationSource'> {
+  const decision = captureClassificationDecision(classification);
+  return {
+    effectiveIdentityClassification: decision.effective,
+    classificationSource: decision.source,
   };
 }
 

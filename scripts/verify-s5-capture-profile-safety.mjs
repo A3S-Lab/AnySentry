@@ -26,8 +26,8 @@ const expectedProfiles = {
   agent_full: allFull,
   investigation_full: allFull,
   probable_investigation: {
-    exec: 'full', exit: 'full', tls: 'sample', connect: 'sample', dns: 'sample',
-    file_access: 'sample', file_delete: 'sample', llm: 'full', ssl: 'full', security: 'full', file_read: 'full',
+    exec: 'full', exit: 'full', tls: 'full', connect: 'full', dns: 'full',
+    file_access: 'full', file_delete: 'full', llm: 'full', ssl: 'full', security: 'full', file_read: 'full',
   },
   security_full: {
     exec: 'full', exit: 'full', tls: 'sample', connect: 'full', dns: 'sample',

@@ -6,6 +6,7 @@ const {
   canonicalJson,
   digest,
   legacyActionForProbeActions,
+  candidateAutoPromotionEnabled,
 } = require('./observer-capture-profile-control');
 const { resolveClassificationSemantics } = require('./observer-classification-semantics');
 
@@ -610,16 +611,25 @@ class UnifiedFilterPolicyRegistry {
     const rule = selectRule(this.captureRuleIndex, context, this.now());
     if (!rule) return undefined;
     const effect = rule.effect;
-    const profile = effect.type === 'assign_capture_profile'
+    const observedClassification = context.identityClassification;
+    const declaredProfile = effect.type === 'assign_capture_profile'
       ? effect.captureProfile
       : effect.type === 'investigation' ? effect.captureProfile : '';
+    const candidateAutoPromoted = context.identityClassification === 'probable_agent'
+      && candidateAutoPromotionEnabled()
+      && declaredProfile === 'probable_investigation';
+    const profile = candidateAutoPromoted ? 'agent_full' : declaredProfile;
     const probeActions = effect.type === 'assign_capture_profile'
-      ? effect.probeActions
+      ? (candidateAutoPromoted ? this.captureProfiles.agent_full : effect.probeActions)
       : this.captureProfiles[profile];
     if (!profile || !probeActions) return undefined;
     this.stats.captureMatches++;
     return {
-      classification: context.identityClassification,
+      classification: observedClassification,
+      ...(candidateAutoPromoted ? {
+        effectiveClassification: 'confirmed_agent',
+        classificationSource: 'candidate_auto_promoted',
+      } : {}),
       authority: rule.authority === 'immutable' || rule.authority === 'authoritative' ? 'authoritative' : 'candidate',
       action: legacyActionForProbeActions(probeActions),
       reasonCode: `filter_rule:${rule.ruleId}:r${rule.revision}`,

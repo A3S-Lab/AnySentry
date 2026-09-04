@@ -201,13 +201,15 @@ const probable = compileCaptureDecision(
   },
   { captureProfileMode: 'enforce', activationMode: 'preview', now: () => fixedNow },
 );
-assert.equal(probable.captureProfile, 'probable_investigation');
+assert.equal(probable.captureProfile, 'agent_full');
+assert.equal(probable.effectiveClassification, 'confirmed_agent');
+assert.equal(probable.classificationSource, 'candidate_auto_promoted');
 assert.equal(probable.ttlMs, 120_000);
-assert.equal(probable.expiresAt, new Date(fixedNow + 120_000).toISOString(),
-  'probable investigation cannot inherit an unbounded or ordinary long-lived profile TTL');
+assert.equal(probable.expiresAt, expiresAt,
+  'default candidate promotion uses the normal bounded Agent lease');
 assert.deepEqual(probable.desiredProbeActions, {
-  exec: 'full', exit: 'full', tls: 'sample', connect: 'sample', dns: 'sample',
-  file_access: 'sample', file_delete: 'sample', llm: 'full', ssl: 'full', security: 'full', file_read: 'not_enabled',
+  exec: 'full', exit: 'full', tls: 'full', connect: 'full', dns: 'full',
+  file_access: 'full', file_delete: 'full', llm: 'full', ssl: 'full', security: 'full', file_read: 'not_enabled',
 });
 
 const implicitDiscovery = publisher('implicit-discovery-default', 'enforce');
@@ -221,9 +223,11 @@ const probableDefault = implicitDiscovery.observe(
   { process: { cgroupId: '80' }, event: { FileAccess: { pid: 80 } } },
   { state: 'agent', attribution: { classification: 'probable_agent', source: 'behavior' } },
 );
-assert.equal(probableDefault.captureProfile, 'probable_investigation');
-assert.equal(probableDefault.implicitDefault, true);
-assert.equal(implicitDiscovery.entries.size, 0, 'probable investigation shares the bounded kernel default without epoch churn');
+assert.equal(probableDefault.captureProfile, 'agent_full');
+assert.equal(probableDefault.effectiveClassification, 'confirmed_agent');
+assert.equal(probableDefault.classificationSource, 'candidate_auto_promoted');
+assert.equal(probableDefault.implicitDefault, undefined);
+assert.equal(implicitDiscovery.entries.size, 1, 'default candidate promotion keeps a dedicated full-fidelity entry');
 const stablePublisher = publisher('stable-probable-root', 'enforce');
 const stableProbable = stablePublisher.observe(
   { process: { pid: 81, cgroupId: '81' }, event: { Egress: { pid: 81 } } },
@@ -250,7 +254,7 @@ const probableSecurityDefault = implicitDiscovery.observe(
 assert.equal(probableSecurityDefault.captureProfile, 'security_full');
 assert.equal(probableSecurityDefault.desiredProbeActions.security, 'full');
 assert.equal(probableSecurityDefault.implicitDefault, true);
-assert.equal(implicitDiscovery.entries.size, 0,
+assert.equal(implicitDiscovery.entries.has('cgroup:82'), false,
   'a raw SecurityAction is retained as FULL evidence without installing a cgroup-wide profile');
 const businessCandidate = centralDecision('81', {
   classification: 'non_agent', authority: 'candidate', action: 'sample',
@@ -261,7 +265,7 @@ delete businessCandidate.ruleRevision;
 delete businessCandidate.materializationId;
 const businessDefault = implicitDiscovery.observeDecision(businessCandidate);
 assert.equal(businessDefault.implicitDefault, true);
-assert.equal(implicitDiscovery.entries.size, 0,
+assert.equal(implicitDiscovery.entries.has('cgroup:81'), false,
   'unapproved business candidates retain the safe node default instead of churning global grants');
 const unruledInfrastructure = centralDecision('82', {
   captureProfile: 'infrastructure_aggregate', source: 'kubernetes',
@@ -271,7 +275,7 @@ delete unruledInfrastructure.ruleRevision;
 delete unruledInfrastructure.materializationId;
 const infrastructureDefault = implicitDiscovery.observeDecision(unruledInfrastructure);
 assert.equal(infrastructureDefault.implicitDefault, true);
-assert.equal(implicitDiscovery.entries.size, 0,
+assert.equal(implicitDiscovery.entries.has('cgroup:82'), false,
   'local infrastructure observations require a Central rule before entering the global grant intent');
 
 let enforceNow = fixedNow;
@@ -567,6 +571,8 @@ for (let index = 0; index < 100; index++) {
 assert.equal(maxEntryBounded.entries.size, 100);
 assert.ok(maxEntryBounded.entries.has('cgroup:20000'));
 
+const previousCandidateMode = process.env.ANYSENTRY_CANDIDATE_EFFECTIVE_MODE;
+process.env.ANYSENTRY_CANDIDATE_EFFECTIVE_MODE = 'probable';
 const probableBounded = publisher('probable-bounded', 'enforce', {
   maxEntries: 100,
   maxProbableEntries: 16,
@@ -586,6 +592,8 @@ assert.equal(
 );
 assert.equal(probableBounded.metrics().probableCapacityEvicted, 4);
 assert([...probableBounded.entries.values()].every((entry) => Date.parse(entry.expiresAt) <= fixedNow + 60_000));
+if (previousCandidateMode === undefined) delete process.env.ANYSENTRY_CANDIDATE_EFFECTIVE_MODE;
+else process.env.ANYSENTRY_CANDIDATE_EFFECTIVE_MODE = previousCandidateMode;
 
 const envelopeBounded = publisher('envelope-expiry-bounded', 'enforce', { ttlMs: 120_000, lkgTtlMs: 600_000 });
 envelopeBounded.observeDecision(centralDecision('23000', { expiresAt }));

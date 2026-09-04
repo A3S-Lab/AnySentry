@@ -640,11 +640,11 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
-  recordSnapshot(input: unknown, receivedAt = this.clock()): AgentRuntimeSnapshotAck {
+  recordSnapshot(input: unknown, receivedAt = this.clock(), sourceId?: string): AgentRuntimeSnapshotAck {
     if (this.closed) {
       return this.rejectedAck(input, receivedAt, 'runtime state service is closed', 'service_unavailable');
     }
-    const validation = this.sanitizeSnapshot(input);
+    const validation = this.sanitizeSnapshot(input, sourceId);
     if ('reason' in validation) {
       return this.rejectedAck(input, receivedAt, validation.reason, 'validation_error');
     }
@@ -914,7 +914,7 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
     this.trimCollectorLeases(at);
   }
 
-  private sanitizeSnapshot(input: unknown): ValidationResult {
+  private sanitizeSnapshot(input: unknown, sourceId?: string): ValidationResult {
     if (!input || typeof input !== 'object' || Array.isArray(input)) return { reason: 'snapshot body must be an object' };
     const value = input as Record<string, unknown>;
     if (value.schemaVersion !== SNAPSHOT_SCHEMA) return { reason: `schemaVersion must be ${SNAPSHOT_SCHEMA}` };
@@ -944,7 +944,7 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
     const entries: SanitizedRuntimeEntry[] = [];
     const seenInstances = new Set<string>();
     for (let index = 0; index < value.entries.length; index += 1) {
-      const result = this.sanitizeEntry(value.entries[index], index);
+      const result = this.sanitizeEntry(value.entries[index], index, sourceId);
       if ('reason' in result) return result;
       const canonical = canonicalRuntimeInstanceId(result.entry);
       if (seenInstances.has(canonical)) {
@@ -993,6 +993,7 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
   private sanitizeEntry(
     input: unknown,
     index: number,
+    sourceId?: string,
   ): { entry: SanitizedRuntimeEntry } | { reason: string } {
     if (!input || typeof input !== 'object' || Array.isArray(input)) return { reason: `entries[${index}] must be an object` };
     const value = input as Record<string, unknown>;
@@ -1099,7 +1100,7 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
       return { reason: `${prefix}.logicalScopeMode is invalid` };
     }
 
-    const registeredDefinition = this.registeredDefinitionForEntry(value);
+    const registeredDefinition = this.registeredDefinitionForEntry(value, sourceId);
     const suppliedLogicalHint = Boolean(
       logicalAgentId || logicalDefinitionId || logicalAgentCandidateId || logicalScopeMode,
     );
@@ -1213,7 +1214,7 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
    * physical instance) matches a management record.  A producer-supplied logical ID by itself is
    * never enough to promote an instance.
    */
-  private registeredDefinitionForEntry(value: Record<string, unknown>): LogicalAgentDefinition | undefined {
+  private registeredDefinitionForEntry(value: Record<string, unknown>, sourceId?: string): LogicalAgentDefinition | undefined {
     if (!this.metadataService) return undefined;
     const workspacePath = cleanString(value.workspacePath, 1_000);
     const agentScopeId = cleanString(value.agentScopeId, 240);
@@ -1227,13 +1228,15 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
         || (physicalWorkloadId && candidate.physicalWorkloadId === physicalWorkloadId)
         || (agentInstanceId && candidate.agentInstanceId === agentInstanceId);
     });
-    return record
+    const resolved = record
       ? this.metadataService.resolveRegisteredDefinition(
           record.workspacePath,
           record.agentId,
           record.agentAssetId,
+          { sourceId },
         )
       : undefined;
+    return resolved;
   }
 
   private candidateDefinitionId(value: Record<string, unknown>): string {
@@ -1284,6 +1287,20 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
         agentInstanceId: entry.agentInstanceId,
         canonicalAgentInstanceId,
         agentInstanceAliases: strongRuntimeAliases(entry),
+        logicalAgentId: entry.logicalAgentId,
+        logicalAgentCandidateId: entry.logicalAgentCandidateId,
+        logicalDefinitionId: entry.logicalDefinitionId,
+        logicalScopeMode: entry.logicalScopeMode,
+        logicalIdentityAuthority: entry.logicalIdentityAuthority,
+        tenantId: entry.tenantId,
+        ownerId: entry.ownerId,
+        profile: entry.profile,
+        profileVersion: entry.profileVersion,
+        deploymentId: entry.deploymentId,
+        deploymentRevision: entry.deploymentRevision,
+        environmentId: entry.environmentId,
+        terminalContextId: entry.terminalContextId,
+        sshConnectionId: entry.sshConnectionId,
         physicalWorkloadId: entry.physicalWorkloadId,
         classification: entry.classification,
         rootPid: entry.rootPid,

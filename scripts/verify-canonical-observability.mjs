@@ -15,6 +15,7 @@ const resolver = require('../apps/api/dist/security-monitoring/agent-conversatio
 const interactionParser = require('../apps/api/dist/security-monitoring/agent-interaction.js');
 const { AgentMetadataService } = require('../apps/api/dist/security-monitoring/agent-metadata.service.js');
 const { CanonicalObservabilityService } = require('../apps/api/dist/security-monitoring/canonical-observability.service.js');
+const { captureClassificationDecision } = require('../apps/api/dist/security-monitoring/identity-judgment-routing.js');
 
 const {
   RawObservationStore,
@@ -256,6 +257,37 @@ const providerSessionParsed = interactionParser.parseObserverAgentInteraction(pr
 assert.equal(providerSessionParsed?.providerConversationId, 'provider-session-fixture');
 assert.equal(providerSessionParsed?.sessionId, 'provider-session-fixture',
   'provider conversation ID must populate the canonical Session when legacy meta has no session');
+
+const candidateDecision = captureClassificationDecision('probable_agent');
+assert.equal(candidateDecision.observed, 'probable_agent');
+assert.equal(candidateDecision.effective, 'confirmed_agent');
+assert.equal(candidateDecision.candidateAutoPromoted, true,
+  'candidate capture defaults to confirmed fidelity without changing observed provenance');
+
+// Parser/Adapter failure must not erase the machine lane. A malformed semantic extension still
+// yields an immutable RawObservation, an independent KernelFact, and a visible CoverageGap.
+const degradedService = new CanonicalObservabilityService();
+const degraded = await degradedService.commitObserverLine(
+  JSON.stringify({ rawObservation: { schemaVersion: 'invalid', payload: {} }, event: { ToolExec: { pid: 42 } } }),
+  {
+    sourceId: 'source-degraded',
+    collectorId: 'collector-degraded',
+    sourceType: 'kernel',
+    eventKind: 'ToolExec',
+    processGenerationKey: processA,
+    pid: 42,
+    ppid: 1,
+    hostId: 'host-a',
+    bootId: 'boot-a',
+    startTimeTicks: '100',
+  },
+);
+assert.equal(degraded.result.status, 'inserted');
+assert(degraded.kernelFact, 'KernelFact must survive a parser failure');
+assert(degradedService.kernelStats().entries >= 1);
+assert(degradedService.gapStats().entries >= 1);
+assert(degradedService.listGaps(20).some((gap) => gap.reason === 'parser_failed'));
+degradedService.close();
 
 // Coverage diagnostics are intentionally metadata-only.  A producer can place a credential in an
 // innocuous key (`endpoint`, `peer`, `target`), so value-level URL/query/userinfo detection must

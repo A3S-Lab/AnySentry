@@ -12,10 +12,10 @@
     "ttlMs": 120000
   },
   "projection": {
-    "contentHash": "a2dccd1e6a8f164ff3c2fadb68e75167a012281afc0822eb71148c5b9f408812",
-    "intentHash": "369b997ebb739e027e9d26aad29f12403c357ae594e2b32b22094b5ff691da2d",
+    "contentHash": "2577b6aca1d24cc3bfc89fb106788f98d86f1c4fb11c32090d94f4dd977e5b77",
+    "intentHash": "a534ce1ed3e4b98e3da86dc84d0ae1d670816bc659316ee97c151d4a4d05297c",
     "counts": {
-      "runtimeSignatures": 6,
+      "runtimeSignatures": 7,
       "agentTemplates": 0,
       "identityRules": 11,
       "captureProfileRules": 8,
@@ -30,7 +30,7 @@
     "agentLabelClassification": "confirmed_agent",
     "agentLabelRole": "agent",
     "vscodeSamplerClassification": "non_agent",
-    "probableCaptureProfile": "probable_investigation",
+    "probableCaptureProfile": "agent_full",
     "infrastructureCaptureProfile": "infrastructure_aggregate",
     "securityF2RuleId": "fr_guardrail_security_full",
     "nonAgentF2RuleId": "fr_builtin_f2_non_agent_suppress",

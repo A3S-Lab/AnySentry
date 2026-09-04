@@ -9,6 +9,7 @@ import {
   resolveSessionIdentity,
 } from './canonical-observability';
 import { serverTrustedCorrelationContext } from './trusted-correlation';
+import { captureClassificationDecision } from './identity-judgment-routing';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_LINE_BYTES = 14 * 1024 * 1024;
@@ -486,6 +487,7 @@ function parsePlaintextEvidence(
     ?? meta.attribution?.classification
     ?? 'unknown';
   if (detected !== 'confirmed_agent' && detected !== 'probable_agent') return undefined;
+  const classificationDecision = captureClassificationDecision(detected);
   const semanticIdentity = detectedAgentIdentity({
     agentId: meta.agentId,
     workspacePath: meta.workspacePath,
@@ -612,7 +614,8 @@ function parsePlaintextEvidence(
       ? 'exact'
       : meta.subjectAssetId ? 'strong' : 'inferred',
     detectedClassification: detected,
-    currentEffectiveClassification: detected,
+    currentEffectiveClassification: classificationDecision.effective,
+    ...(classificationDecision.candidateAutoPromoted ? { candidateAutoPromoted: true } : {}),
     process: meta.process,
     connectionId,
     transport: input.captureSource === 'tcp_plaintext' ? 'http' : 'tls',
@@ -694,6 +697,7 @@ export function parseObserverAgentInteraction(
     ?? meta.attribution?.classification
     ?? 'unknown';
   if (detected !== 'confirmed_agent' && detected !== 'probable_agent') return undefined;
+  const classificationDecision = captureClassificationDecision(detected);
   const semanticIdentity = detectedAgentIdentity({
     agentId: meta.agentId,
     workspacePath: meta.workspacePath,
@@ -1060,7 +1064,8 @@ export function parseObserverAgentInteraction(
       ? 'exact'
       : meta.subjectAssetId ? 'strong' : 'inferred',
     detectedClassification: detected,
-    currentEffectiveClassification: detected,
+    currentEffectiveClassification: classificationDecision.effective,
+    ...(classificationDecision.candidateAutoPromoted ? { candidateAutoPromoted: true } : {}),
     process,
     connectionId,
     transport: input.transport === 'tls' ? 'tls' : 'http',

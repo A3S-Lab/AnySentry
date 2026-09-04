@@ -50,6 +50,14 @@ function text(value) {
   return typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
 }
 
+// Keep candidate capture at confirmed fidelity unless an operator explicitly opts into the
+// historical lower-cost route. This is a capture policy only; the original candidate label stays
+// on every decision for audit and later identity review.
+function candidateAutoPromotionEnabled(env = process.env) {
+  const mode = text(env?.ANYSENTRY_CANDIDATE_EFFECTIVE_MODE).toLowerCase();
+  return !['probable', 'candidate', 'off', 'legacy'].includes(mode);
+}
+
 function boundedNumber(value, fallback, min, max) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? Math.max(min, Math.min(max, Math.round(parsed))) : fallback;
@@ -147,10 +155,10 @@ function sameDecisionCore(left, right) {
 }
 
 function effectiveAgentKeepDecision(entry, captureProfileMode) {
-  // S5 gives probable_agent its own bounded discovery profile, so it must not reserve an
-  // agent_full member in shadow/enforce. Legacy snapshots have no profile matrix, however, and
-  // historically treated probable Agent KEEP as stronger than a conflicting non-Agent DROP.
+  // Candidate decisions reserve the same full member as confirmed Agent by default. An explicit
+  // candidate-effective-mode=probable opt-out restores the old bounded discovery behavior.
   return isAgentKeepDecision(entry)
+    || (candidateAutoPromotionEnabled() && entry?.classification === 'probable_agent')
     || (captureProfileMode === 'legacy' && entry?.classification === 'probable_agent');
 }
 
@@ -338,18 +346,23 @@ class FilterRulePublisher {
           const profile = CAPTURE_PROFILES.has(entry.captureProfile)
             ? entry.captureProfile
             : entry.action === 'keep' ? 'agent_full' : 'unknown_discovery';
+          const effectiveProfile = candidateAutoPromotionEnabled()
+            && entry.classification === 'probable_agent'
+            && profile === 'probable_investigation'
+            ? 'agent_full'
+            : profile;
           const desired = normalizedProbeActions(
             entry.desiredProbeActions ?? entry.probeActions,
-            captureProfileActions(profile),
+            captureProfileActions(effectiveProfile),
           );
           restored = {
             ...restored,
-            captureProfile: profile,
+            captureProfile: effectiveProfile,
             desiredProbeActions: desired,
             policyAction: FILTER_ACTIONS.has(entry.policyAction) ? entry.policyAction : entry.action,
             ttlMs: boundedNumber(entry.ttlMs, this.ttlMs, 1_000, 24 * 60 * 60_000),
           };
-          if (profile === 'probable_investigation') {
+          if (effectiveProfile === 'probable_investigation' && !candidateAutoPromotionEnabled()) {
             restored.ttlMs = Math.min(restored.ttlMs, this.probableTtlMs);
             restored.expiresAt = new Date(Math.min(expiresAt, now + this.probableTtlMs)).toISOString();
           }
@@ -377,6 +390,17 @@ class FilterRulePublisher {
       : derived;
     if (derived?.action === 'keep') next = derived;
     if (!next) return undefined;
+    if (candidateAutoPromotionEnabled()
+      && next.classification === 'probable_agent'
+      && next.captureProfile === 'probable_investigation') {
+      next = {
+        ...next,
+        captureProfile: 'agent_full',
+        effectiveClassification: 'confirmed_agent',
+        classificationSource: 'candidate_auto_promoted',
+        observedClassification: 'probable_agent',
+      };
+    }
     const cgroupId = eventCgroupId(observerEvent) || normalizedCgroupId(next.cgroupId);
     if (this.captureProfileMode !== 'legacy') {
       // SecurityAction is already FULL and unfilterable in every closed profile matrix. A raw
@@ -442,7 +466,7 @@ class FilterRulePublisher {
     if (this.captureProfileMode !== 'legacy') {
       next.policyAction = FILTER_ACTIONS.has(next.policyAction) ? next.policyAction : input.action;
       next.ttlMs = boundedNumber(next.ttlMs, this.ttlMs, 1_000, 24 * 60 * 60_000);
-      if (next.captureProfile === 'probable_investigation') {
+      if (next.captureProfile === 'probable_investigation' && !candidateAutoPromotionEnabled()) {
         next.ttlMs = Math.min(next.ttlMs, this.probableTtlMs);
         const expiresAtMs = Date.parse(next.expiresAt);
         next.expiresAt = new Date(Math.min(
@@ -753,7 +777,8 @@ class FilterRulePublisher {
         removed++;
       }
     }
-    while ([...this.entries.values()].filter((entry) => entry.captureProfile === 'probable_investigation').length > this.maxProbableEntries) {
+    while (!candidateAutoPromotionEnabled()
+      && [...this.entries.values()].filter((entry) => entry.captureProfile === 'probable_investigation').length > this.maxProbableEntries) {
       const candidate = [...this.entries.entries()].find(([, entry]) => entry.captureProfile === 'probable_investigation');
       if (!candidate) break;
       this.entries.delete(candidate[0]);

@@ -165,7 +165,7 @@ assert.equal(resolved.agentAssetId, detected.agentAssetId);
 assert.equal(resolved.displayName, '安全研发 Codex');
 assert.equal(resolved.detectedName, 'codex');
 assert.equal(resolved.detectedClassification, 'probable_agent');
-assert.equal(resolved.effectiveClassification, 'probable_agent');
+assert.equal(resolved.effectiveClassification, 'confirmed_agent');
 assert.deepEqual(
   rootOneShell.attribution,
   originalAttribution,
@@ -239,9 +239,12 @@ assert.equal(
   2,
   'unreviewed short helper processes without root evidence stay in audit events but not Agent assets',
 );
-assert.equal(inventory.items[0].classification, 'confirmed_agent', 'confirmed assets sort before higher-risk candidates');
-assert.equal(inventory.items[1].classification, 'probable_agent');
-assert.equal(inventory.items[1].eventCount, 2, 'one Agent asset aggregates events with different raw process names');
+const candidateInventory = inventory.items.find((item) => item.agentId === 'candidate-agent')
+  ?? inventory.items.find((item) => item.detectedClassification === 'probable_agent');
+assert(candidateInventory, 'candidate Agent remains visible in the inventory');
+assert.equal(candidateInventory.classification, 'confirmed_agent');
+assert.equal(candidateInventory.detectedClassification, 'probable_agent');
+assert.equal(candidateInventory.eventCount, 2, 'one Agent asset aggregates events with different raw process names');
 
 {
   const fallbackAttribution = new AgentAttributionService();
@@ -487,7 +490,7 @@ const focusedRuntime = multiWindowAggregation.agentInventory({
 assert.equal(focusedRuntime.items.length, 1, 'runtime deep links resolve exactly one window');
 assert.equal(focusedRuntime.items[0].eventCount, 1);
 
-const candidateAsset = inventory.items[1];
+const candidateAsset = candidateInventory;
 service.review(candidateAsset.agentId, {
   workspacePath: candidateAsset.workspacePath,
   decision: 'unknown',

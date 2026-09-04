@@ -129,8 +129,12 @@ export const CAPTURE_PROFILE_ACTIONS: Record<CaptureProfile, CaptureProbeActions
     file_access: 'full', file_delete: 'full', llm: 'full', ssl: 'full', security: 'full', file_read: 'full',
   },
   probable_investigation: {
-    exec: 'full', exit: 'full', tls: 'sample', connect: 'sample', dns: 'sample',
-    file_access: 'sample', file_delete: 'sample', llm: 'full', ssl: 'full', security: 'full', file_read: 'full',
+    // A candidate is a discovery state, not a lower-fidelity identity.  Keep every probe at the
+    // same full level as `agent_full` so operators can decide whether it is a real Agent from the
+    // evidence it produced.  The observed classification remains `probable_agent`; this profile
+    // change only removes the information gap and does not mint a LogicalAgent/Session identity.
+    exec: 'full', exit: 'full', tls: 'full', connect: 'full', dns: 'full',
+    file_access: 'full', file_delete: 'full', llm: 'full', ssl: 'full', security: 'full', file_read: 'full',
   },
   security_full: {
     exec: 'full', exit: 'full', tls: 'sample', connect: 'full', dns: 'sample',
@@ -198,7 +202,7 @@ export function builtinFilterRules(): FilterRuleRecord[] {
   const runtimeRules = BUILTIN_RUNTIME_SIGNATURES.map((signature) => builtin({
     ruleId: `fr_builtin_agent_runtime_${signature.id}`,
     name: `${signature.displayName} Runtime Signature`,
-    description: '使用精确进程签名发现 Agent Root；单独命中最高只产生 probable_agent。',
+    description: '使用精确进程签名发现 Agent Root；命中产生 probable_agent，并按默认候选策略进行完整采集。',
     category: 'agent_identity',
     ruleKind: 'runtime_signature',
     priority: 700,
@@ -298,7 +302,7 @@ export function builtinFilterRules(): FilterRuleRecord[] {
     builtin({
       ruleId: 'fr_builtin_behavior_candidate',
       name: 'Behavior Discovery Candidate',
-      description: '有界行为发现只能产生临时候选，不得直接成为 authoritative 规则。',
+      description: '有界行为发现产生带 provenance 的临时候选；候选默认与确认 Agent 使用同一完整采集档位。',
       category: 'agent_identity', ruleKind: 'behavior_candidate', priority: 620,
       matcher: { all: [{ field: 'runtime.id', operator: 'equals', value: '__behavior_candidate__' }], description: '稳定工作负载内出现闭集 Agent 行为特征且未被 Inventory 排除' },
       effect: { type: 'emit_identity', classification: 'probable_agent', confidence: 0.7, captureProfile: 'probable_investigation' },
@@ -428,7 +432,7 @@ export function builtinFilterRules(): FilterRuleRecord[] {
     }),
     builtin({
       ruleId: 'fr_builtin_f3_probable_agent_full', name: 'F3 Probable Agent Full',
-      description: '当前批准策略下 probable Agent 完整入库；采集精度仍由 probable profile 有界控制。',
+    description: 'probable Agent 完整入库；默认与 confirmed Agent 使用同一完整采集档位，原始候选 provenance 保留。',
       category: 'api_retention', ruleKind: 'persistence_retention', priority: 800,
       matcher: { all: [identityCondition('probable_agent')], description: '身份为 probable_agent' },
       effect: { type: 'persistence_retention', action: 'retain_full', reasonCode: 'candidate_agent_full' }, stages: ['f3'],

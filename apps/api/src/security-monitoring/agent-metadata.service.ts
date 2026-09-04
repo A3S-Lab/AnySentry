@@ -33,6 +33,7 @@ import {
   resolveLogicalAgentDefinition,
   type LogicalAgentDefinition,
 } from './canonical-observability';
+import { captureClassificationDecision } from './identity-judgment-routing';
 
 const RETAIN_LIMIT = 10_000;
 const RELATIONAL_REFRESH_MS = 15_000;
@@ -1040,7 +1041,9 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
       detectedName: detected.detectedName,
       detectedClassification: detected.detectedClassification,
       effectiveClassification:
-        reviewDecision && reviewDecision !== 'clear' ? reviewDecision : detected.detectedClassification,
+        reviewDecision && reviewDecision !== 'clear'
+          ? reviewDecision
+          : captureClassificationDecision(detected.detectedClassification).effective,
       metadata,
       reviewConflict: resolvedReview.conflict,
       reviewRevision: resolvedReview.review?.revision,

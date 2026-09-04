@@ -68,6 +68,14 @@ function normalizedEnum(value, values) {
   return values.has(normalized) ? normalized : undefined;
 }
 
+/** Candidates are captured at confirmed fidelity by default so review has the evidence it needs.
+ * Set ANYSENTRY_CANDIDATE_EFFECTIVE_MODE=probable (or candidate/off) only for an explicit,
+ * bounded production cost downgrade. This changes capture semantics, never business identity. */
+function candidateAutoPromotionEnabled(env = process.env) {
+  const mode = text(env?.ANYSENTRY_CANDIDATE_EFFECTIVE_MODE, 32).toLowerCase();
+  return !['probable', 'candidate', 'off', 'legacy'].includes(mode);
+}
+
 function identityClassification(classification) {
   const attribution = object(classification?.attribution) ?? {};
   const explicit = normalizedEnum(attribution.classification, identityClassifications);
@@ -147,11 +155,12 @@ function eventKind(observerEvent) {
   return Object.keys(event)[0] || '';
 }
 
-function captureProfile(classification, identity, role, observerEvent) {
+function captureProfile(classification, identity, role, observerEvent, env = process.env) {
   if (eventKind(observerEvent) === 'SecurityAction') return 'security_full';
   const declared = text(classification?.captureProfile, 80);
   if (declared === 'investigation_full' || declared === 'security_full') return declared;
   if (identity === 'confirmed_agent') return 'agent_full';
+  if (identity === 'probable_agent' && candidateAutoPromotionEnabled(env)) return 'agent_full';
   if (identity === 'probable_agent' || role === 'agent') return 'probable_investigation';
   if (role === 'anysentry_internal') return 'self_health';
   if (role === 'platform_infrastructure') return 'infrastructure_aggregate';
@@ -236,18 +245,25 @@ function derivedUnknownReason(classification, observerEvent, evidence) {
   return undefined;
 }
 
-function resolveClassificationSemantics(classification, observerEvent) {
+function resolveClassificationSemantics(classification, observerEvent, env = process.env) {
   const normalized = object(classification) ?? {};
   const evidence = evidenceValues(normalized);
   const identity = identityClassification(normalized);
   const role = workloadRole(normalized, identity, evidence);
-  const capture = captureProfile(normalized, identity, role, observerEvent);
+  const capture = captureProfile(normalized, identity, role, observerEvent, env);
+  const candidateAutoPromoted = identity === 'probable_agent'
+    && candidateAutoPromotionEnabled(env)
+    && capture === 'agent_full';
   const unknownReason = identity === 'unknown'
     ? derivedUnknownReason(normalized, observerEvent, evidence)
     : undefined;
   return {
     schemaVersion: CLASSIFICATION_SEMANTICS_SCHEMA,
     identityClassification: identity,
+    ...(candidateAutoPromoted ? {
+      effectiveIdentityClassification: 'confirmed_agent',
+      classificationSource: 'candidate_auto_promoted',
+    } : {}),
     workloadRole: role,
     captureProfile: capture,
     ...(unknownReason ? { unknownReason } : {}),
@@ -263,7 +279,7 @@ function classificationSemanticsEnabled(env = process.env) {
 function classificationSemanticsEnvelope(classification, observerEvent, env = process.env) {
   if (!classificationSemanticsEnabled(env)) return {};
   return {
-    classificationSemantics: resolveClassificationSemantics(classification, observerEvent),
+    classificationSemantics: resolveClassificationSemantics(classification, observerEvent, env),
   };
 }
 
@@ -275,5 +291,6 @@ module.exports = {
   WORKLOAD_ROLES,
   classificationSemanticsEnvelope,
   classificationSemanticsEnabled,
+  candidateAutoPromotionEnabled,
   resolveClassificationSemantics,
 };

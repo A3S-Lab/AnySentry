@@ -328,6 +328,9 @@ export function projectAgentConversationDirectory(
       ? { id: first.logicalAgentId, quality: 'strong' as const, mode: canonicalDefinition.definition.logicalScopeMode, definitionFingerprint: canonicalDefinition.definition.definitionFingerprint }
       : fallbackLogicalAgentId(product, workspacePath, first.agentAssetId);
     const id = trustedFirstLogical && first.logicalAgentId ? first.logicalAgentId : idInfo.id;
+    const logicalIdentityAuthority = first.logicalIdentityAuthority === 'management_registration'
+      ? first.logicalIdentityAuthority
+      : first.logicalIdentityAuthority ? 'inferred' as const : undefined;
     return {
       logicalAgentId: id,
       // Keep the legacy synthetic-workspace label readable during migration while exposing the
@@ -336,9 +339,15 @@ export function projectAgentConversationDirectory(
         ? 'inferred'
         : idInfo.quality,
       ...(canonicalDefinition.definition.definitionId ? { logicalDefinitionId: canonicalDefinition.definition.definitionId } : {}),
+      ...(logicalIdentityAuthority ? { logicalIdentityAuthority } : {}),
       logicalScopeMode: idInfo.mode,
       ...(idInfo.definitionFingerprint ? { definitionFingerprint: idInfo.definitionFingerprint } : {}),
       ...(idInfo.candidateId ? { candidateId: idInfo.candidateId } : {}),
+      ...(first.tenantId ? { tenantId: first.tenantId } : {}),
+      ...(first.ownerId ? { ownerId: first.ownerId } : {}),
+      ...(first.environmentId ? { environmentId: first.environmentId } : {}),
+      ...(first.profile ? { profile: first.profile } : {}),
+      ...(first.profileVersion ? { profileVersion: first.profileVersion } : {}),
       product,
       displayName: first.displayName || product + ' · ' + workspacePath,
       environment,
@@ -431,6 +440,9 @@ export function projectAgentConversationDirectory(
       ? { id: first.logicalAgentId, quality: 'strong' as const, mode: definition.definition.logicalScopeMode, definitionFingerprint: definition.definition.definitionFingerprint }
       : fallbackLogicalAgentId(product, workspacePath, first.agentInstanceId);
     const id = trustedFirstRuntimeLogical && first.logicalAgentId ? first.logicalAgentId : idInfo.id;
+    const logicalIdentityAuthority = first.logicalIdentityAuthority === 'management_registration'
+      ? first.logicalIdentityAuthority
+      : first.logicalIdentityAuthority ? 'inferred' as const : undefined;
     const running = instances.filter((instance) => instance.runtimeState === 'running');
     const unobserved = instances.filter((instance) => instance.runtimeState === 'unobserved');
     const lifecycleState: T.LogicalAgentConversationDirectoryItem['lifecycleState'] = running.length
@@ -446,8 +458,14 @@ export function projectAgentConversationDirectory(
         : idInfo.quality,
       logicalScopeMode: idInfo.mode,
       ...(first.logicalDefinitionId ? { logicalDefinitionId: first.logicalDefinitionId } : {}),
+      ...(logicalIdentityAuthority ? { logicalIdentityAuthority } : {}),
       ...(idInfo.definitionFingerprint ? { definitionFingerprint: idInfo.definitionFingerprint } : {}),
       ...(idInfo.candidateId ? { candidateId: idInfo.candidateId } : {}),
+      ...(first.tenantId ? { tenantId: first.tenantId } : {}),
+      ...(first.ownerId ? { ownerId: first.ownerId } : {}),
+      ...(first.environmentId ? { environmentId: first.environmentId } : {}),
+      ...(first.profile ? { profile: first.profile } : {}),
+      ...(first.profileVersion ? { profileVersion: first.profileVersion } : {}),
       product,
       displayName: first.agentDisplayName || product + ' · ' + workspacePath,
       environment,

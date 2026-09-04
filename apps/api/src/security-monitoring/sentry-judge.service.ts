@@ -12,7 +12,7 @@ import { JudgmentQueueService } from './judgment-queue.service';
 import { RuntimeModelConfigService } from './runtime-model-config';
 import { DistributedCurrentStateService } from './distributed-current-state.service';
 import { RelationalBusinessStore } from './relational-business-store.service';
-import { resolveJudgmentRoute } from './identity-judgment-routing';
+import { captureClassificationDecision, resolveJudgmentRoute } from './identity-judgment-routing';
 import { processLifecycleFact, type ProcessLifecycleFact } from './process-lifecycle';
 import { resolveProtectedEventRoute, type ProtectedEventRoute } from './protected-event-routing';
 import { isNewerEventRevision } from './event-revision';
@@ -1018,11 +1018,24 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       ? { ...legacyAttribution, correlation }
       : legacyAttribution;
     const parsedClassificationSemantics = visibleClassificationSemantics(meta.classificationSemantics);
+    const classificationDecision = captureClassificationDecision(legacyAttribution.classification);
     // Review and server inventory enrichment may legitimately replace the Forwarder's shadow
     // identity decision. Never publish a stale or producer-inconsistent three-axis view.
-    const classificationSemantics = parsedClassificationSemantics?.identityClassification === legacyAttribution.classification
-      ? parsedClassificationSemantics
-      : undefined;
+    let classificationSemantics: import('./types').ClassificationSemanticsV1 | undefined;
+    if (parsedClassificationSemantics
+      && parsedClassificationSemantics.identityClassification === legacyAttribution.classification) {
+      classificationSemantics = {
+        schemaVersion: parsedClassificationSemantics.schemaVersion,
+        identityClassification: parsedClassificationSemantics.identityClassification,
+        workloadRole: parsedClassificationSemantics.workloadRole,
+        captureProfile: parsedClassificationSemantics.captureProfile,
+        ...(parsedClassificationSemantics.unknownReason
+          ? { unknownReason: parsedClassificationSemantics.unknownReason }
+          : {}),
+        effectiveIdentityClassification: classificationDecision.effective,
+        classificationSource: classificationDecision.source,
+      };
+    }
     const runId = meta.runId ?? hashId('run', [at, eventKind, ids.agentId, line]);
     const runIdSource = meta.runId ? (meta.runIdSource ?? 'producer') : 'derived_ephemeral';
     return {

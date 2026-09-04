@@ -52,6 +52,7 @@ import type { UnknownLearnedAction, UnknownPolicyStage } from './unknown-learnin
 import { InfrastructureRuleError, InfrastructureRuleService } from './infrastructure-rule.service';
 import { ObservedAssetLifecycleService } from './observed-asset-lifecycle.read.service';
 import { parseObserverAgentInteraction } from './agent-interaction';
+import { captureClassificationDecision } from './identity-judgment-routing';
 import { AgentConversationBindingService } from './agent-conversation-binding.service';
 import { CanonicalObservabilityService } from './canonical-observability.service';
 import { CANONICAL_SESSION_ID_ALGORITHM_V1, SESSION_KEY_ALGORITHM_V1, SESSION_HASH_SECRET_MODE, canonicalParentSessionIdForMembership, canonicalSessionIdForMembership, createEvidenceLink, deriveAgentInstanceIdentity, deriveProcessGenerationKey, resolveSessionIdentity } from './canonical-observability';
@@ -110,6 +111,320 @@ function boundedCanonicalRevision(value: unknown, fallback = 1): number {
   return Number.isSafeInteger(numeric) && numeric >= 1
     ? Math.min(CANONICAL_REVISION_MAX, numeric)
     : fallback;
+}
+
+/** Query contract shared by all additive Canonical entity GET resources. */
+interface CanonicalEntityQuery {
+  limit: number;
+  offset: number;
+  cursor?: string;
+  revision?: number;
+  includeShadow: boolean;
+  includeCoverage: boolean;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  tenantId?: string;
+  ownerId?: string;
+  workspacePath?: string;
+  product?: string;
+  environment?: string;
+  environmentId?: string;
+  agentAssetId?: string;
+  agentInstanceId?: string;
+  runtimeInstanceId?: string;
+  sessionId?: string;
+  sourceId?: string;
+  collectorId?: string;
+  classification?: T.AgentClassification;
+  coverageStatus?: string;
+  lifecycleScope?: 'running' | 'history' | 'all';
+  q?: string;
+  timeType?: T.SecurityTimeFilter['timeType'];
+  startTime?: string;
+  endTime?: string;
+  snapshotAsOf?: string;
+  classificationView?: T.ClassificationView;
+}
+
+const CANONICAL_ENTITY_LIMIT_MAX = 500;
+const CANONICAL_ENTITY_OFFSET_MAX = 1_000_000;
+const CANONICAL_ENTITY_CURSOR_PREFIX = 'ce1:';
+
+function canonicalQueryScalar(
+  query: Record<string, unknown> | undefined,
+  keys: readonly string[],
+  max = 512,
+): string | undefined {
+  const input = query ?? {};
+  let supplied: unknown;
+  let suppliedKey: string | undefined;
+  for (const key of keys) {
+    if (input[key] !== undefined) {
+      supplied = input[key];
+      suppliedKey = key;
+      break;
+    }
+  }
+  if (supplied === undefined) return undefined;
+  if (Array.isArray(supplied)) {
+    throw new BadRequestException(`${suppliedKey ?? keys[0]} must be a scalar`);
+  }
+  const value = strictIdentityText(supplied, max);
+  if (!value) throw new BadRequestException(`${suppliedKey ?? keys[0]} is invalid`);
+  return value;
+}
+
+function canonicalQueryBoolean(
+  query: Record<string, unknown> | undefined,
+  keys: readonly string[],
+  fallback: boolean,
+): boolean {
+  const value = canonicalQueryScalar(query, keys, 16);
+  if (value === undefined) return fallback;
+  if (['1', 'true', 'yes', 'on'].includes(value.toLowerCase())) return true;
+  if (['0', 'false', 'no', 'off'].includes(value.toLowerCase())) return false;
+  throw new BadRequestException(`${keys[0]} must be true or false`);
+}
+
+function canonicalQueryInteger(
+  query: Record<string, unknown> | undefined,
+  keys: readonly string[],
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const value = canonicalQueryScalar(query, keys, 32);
+  if (value === undefined) return fallback;
+  if (!/^\d+$/u.test(value)) throw new BadRequestException(`${keys[0]} must be an integer`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+    throw new BadRequestException(`${keys[0]} must be between ${min} and ${max}`);
+  }
+  return parsed;
+}
+
+function encodeCanonicalCursor(offset: number): string {
+  return Buffer.from(`${CANONICAL_ENTITY_CURSOR_PREFIX}${offset}`, 'utf8').toString('base64url');
+}
+
+function decodeCanonicalCursor(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  let decoded: string;
+  try {
+    decoded = Buffer.from(value, 'base64url').toString('utf8');
+  } catch {
+    throw new BadRequestException('cursor is invalid');
+  }
+  if (!new RegExp(`^${CANONICAL_ENTITY_CURSOR_PREFIX}\\d+$`, 'u').test(decoded)) {
+    throw new BadRequestException('cursor is invalid');
+  }
+  const offset = Number(decoded.slice(CANONICAL_ENTITY_CURSOR_PREFIX.length));
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > CANONICAL_ENTITY_OFFSET_MAX) {
+    throw new BadRequestException('cursor is invalid');
+  }
+  return offset;
+}
+
+function parseCanonicalEntityQuery(input?: Record<string, unknown>): CanonicalEntityQuery {
+  const query = input ?? {};
+  const cursor = canonicalQueryScalar(query, ['cursor'], 128);
+  const offset = decodeCanonicalCursor(cursor)
+    ?? canonicalQueryInteger(query, ['offset'], 0, 0, CANONICAL_ENTITY_OFFSET_MAX);
+  if (cursor && query.offset !== undefined) throw new BadRequestException('cursor and offset are mutually exclusive');
+  const revisionText = canonicalQueryScalar(query, ['revision', 'resolutionRevision'], 32);
+  const revision = revisionText === undefined
+    ? undefined
+    : (() => {
+        if (!/^\d+$/u.test(revisionText)) throw new BadRequestException('revision is invalid');
+        const value = Number(revisionText);
+        if (!Number.isSafeInteger(value) || value < 1 || value > CANONICAL_REVISION_MAX) {
+          throw new BadRequestException('revision is invalid');
+        }
+        return value;
+      })();
+  const classificationText = canonicalQueryScalar(query, ['classification'], 32);
+  const classification = classificationText === undefined
+    ? undefined
+    : ['confirmed_agent', 'probable_agent', 'unknown', 'non_agent'].includes(classificationText)
+      ? classificationText as T.AgentClassification
+      : (() => { throw new BadRequestException('classification is invalid'); })();
+  const lifecycleText = canonicalQueryScalar(query, ['lifecycleScope', 'lifecycle'], 32);
+  const lifecycleScope = lifecycleText === undefined
+    ? 'all' as const
+    : ['running', 'history', 'all'].includes(lifecycleText)
+      ? lifecycleText as 'running' | 'history' | 'all'
+      : (() => { throw new BadRequestException('lifecycleScope is invalid'); })();
+  const timeTypeText = canonicalQueryScalar(query, ['timeType'], 32);
+  const timeTypes = ['last_30m', 'last_1h', 'last_2h', 'last_3h', 'last_1d', 'last_7d', 'last_30d', 'custom'];
+  const timeType = timeTypeText === undefined
+    ? undefined
+    : timeTypes.includes(timeTypeText)
+      ? timeTypeText as T.SecurityTimeFilter['timeType']
+      : (() => { throw new BadRequestException('timeType is invalid'); })();
+  const classificationViewText = canonicalQueryScalar(query, ['classificationView'], 32);
+  const classificationView = classificationViewText === undefined
+    ? undefined
+    : ['as_observed', 'current_effective'].includes(classificationViewText)
+      ? classificationViewText as T.ClassificationView
+      : (() => { throw new BadRequestException('classificationView is invalid'); })();
+  const scalar = (keys: readonly string[], max = 512) => canonicalQueryScalar(query, keys, max);
+  return {
+    limit: canonicalQueryInteger(query, ['limit'], 100, 1, CANONICAL_ENTITY_LIMIT_MAX),
+    offset,
+    ...(cursor ? { cursor } : {}),
+    ...(revision !== undefined ? { revision } : {}),
+    includeShadow: canonicalQueryBoolean(query, ['includeShadow', 'shadow'], true),
+    includeCoverage: canonicalQueryBoolean(query, ['includeCoverage', 'coverage'], true),
+    logicalAgentId: scalar(['logicalAgentId', 'logical-agent-id']),
+    logicalAgentCandidateId: scalar(['logicalAgentCandidateId', 'candidateId']),
+    logicalDefinitionId: scalar(['logicalDefinitionId', 'definitionId']),
+    tenantId: scalar(['tenantId', 'tenant']),
+    ownerId: scalar(['ownerId', 'owner']),
+    workspacePath: scalar(['workspacePath', 'workspace']),
+    product: scalar(['product', 'agentProduct']),
+    environment: scalar(['environment']),
+    environmentId: scalar(['environmentId']),
+    agentAssetId: scalar(['agentAssetId']),
+    agentInstanceId: scalar(['agentInstanceId']),
+    runtimeInstanceId: scalar(['runtimeInstanceId']),
+    sessionId: scalar(['sessionId']),
+    sourceId: scalar(['sourceId']),
+    collectorId: scalar(['collectorId']),
+    classification,
+    coverageStatus: scalar(['coverageStatus'], 64),
+    lifecycleScope,
+    q: scalar(['q', 'query'], 240),
+    timeType,
+    startTime: scalar(['startTime'], 80),
+    endTime: scalar(['endTime'], 80),
+    snapshotAsOf: scalar(['snapshotAsOf', 'asOf'], 80),
+    classificationView,
+  };
+}
+
+function canonicalPage<Item>(
+  items: Item[],
+  query: CanonicalEntityQuery,
+): { items: Item[]; total: number; pagination: T.CanonicalEntityPagination } {
+  const total = items.length;
+  const pageItems = items.slice(query.offset, query.offset + query.limit);
+  const nextOffset = query.offset + pageItems.length;
+  return {
+    items: pageItems,
+    total,
+    pagination: {
+      limit: query.limit,
+      offset: query.offset,
+      hasMore: nextOffset < total,
+      ...(nextOffset < total ? { nextCursor: encodeCanonicalCursor(nextOffset) } : {}),
+    },
+  };
+}
+
+function canonicalCoverage(
+  partial: boolean,
+  reasons: string[],
+  source: string,
+): T.CanonicalEntityCoverage {
+  return {
+    status: partial ? 'partial' : 'complete',
+    reasons: [...new Set(reasons.filter(Boolean))].slice(0, 64),
+    source,
+  };
+}
+
+function canonicalScopeMatches(
+  value: {
+    logicalAgentId?: string;
+    logicalAgentCandidateId?: string;
+    logicalDefinitionId?: string;
+    tenantId?: string;
+    ownerId?: string;
+    workspacePath?: string;
+    environment?: string;
+    environmentId?: string;
+    agentAssetId?: string;
+    agentInstanceId?: string;
+    runtimeInstanceId?: string;
+    sessionId?: string;
+    product?: string;
+    classification?: T.AgentClassification;
+    coverageStatus?: string;
+    q?: string;
+  },
+  query: CanonicalEntityQuery,
+): boolean {
+  const equals = (actual: unknown, expected: string | undefined) =>
+    expected === undefined || String(actual ?? '').toLowerCase() === expected.toLowerCase();
+  const contains = (actual: unknown, expected: string | undefined) =>
+    expected === undefined || String(actual ?? '').toLowerCase().includes(expected.toLowerCase());
+  return equals(value.logicalAgentId, query.logicalAgentId)
+    && equals(value.logicalAgentCandidateId, query.logicalAgentCandidateId)
+    && equals(value.logicalDefinitionId, query.logicalDefinitionId)
+    && equals(value.tenantId, query.tenantId)
+    && equals(value.ownerId, query.ownerId)
+    && equals(value.workspacePath, query.workspacePath)
+    && equals(value.environment, query.environment)
+    && equals(value.environmentId, query.environmentId)
+    && equals(value.agentAssetId, query.agentAssetId)
+    && equals(value.agentInstanceId, query.agentInstanceId)
+    && equals(value.runtimeInstanceId, query.runtimeInstanceId)
+    && equals(value.sessionId, query.sessionId)
+    && contains(value.product, query.product)
+    && equals(value.classification, query.classification)
+    && equals(value.coverageStatus, query.coverageStatus)
+    && contains(JSON.stringify(value), query.q);
+}
+
+function canonicalMillisToUnixNs(value: number | undefined): string | undefined {
+  if (value === undefined || !Number.isFinite(value) || value < 0) return undefined;
+  return (BigInt(Math.trunc(value)) * 1_000_000n).toString();
+}
+
+function canonicalRuntimeEnvironment(
+  record: T.AgentRuntimeInstanceRecord,
+): T.LogicalAgentConversationDirectoryItem['environment'] {
+  if (record.workloadRef?.environment) return record.workloadRef.environment;
+  const physical = String(record.physicalWorkloadId ?? '').toLowerCase();
+  if (physical.includes('kubernetes') || physical.includes('pod')) return 'kubernetes';
+  if (physical.includes('docker') || physical.includes('container')) return 'docker';
+  return 'host';
+}
+
+function canonicalRuntimeProcessKey(record: T.AgentRuntimeInstanceRecord): string | undefined {
+  return deriveProcessGenerationKey({
+    hostId: record.hostId,
+    bootId: record.bootId,
+    pid: record.rootPid,
+    startTimeTicks: record.rootStartTimeTicks,
+  });
+}
+
+function canonicalSessionIdentity(summary: T.AgentConversationSummary): string {
+  return summary.sessionId ?? summary.conversationId;
+}
+
+function canonicalConversationSourceRefs(summary: T.AgentConversationSummary): string[] {
+  return [...new Set([
+    `conversation:${summary.conversationId}`,
+    ...summary.agentInstanceIds.slice(0, 16).map((id) => `agent-instance:${id}`),
+  ])].slice(0, 32);
+}
+
+function canonicalCoverageFromSummaries(
+  summaries: readonly T.AgentConversationSummary[],
+  fallbackSource: string,
+): T.CanonicalEntityCoverage {
+  if (summaries.length === 0) {
+    return canonicalCoverage(true, ['no_conversation_projection'], fallbackSource);
+  }
+  const partial = summaries.some((summary) => summary.coverage.status !== 'complete');
+  return canonicalCoverage(
+    partial,
+    summaries.flatMap((summary) => summary.coverage.reasons),
+    fallbackSource,
+  );
 }
 const OBSERVER_BATCH_ID_DIGEST_CACHE_SIZE = 10_000;
 const OBSERVER_BATCH_ID_DIGEST_CACHE_BYTES = 2 * 1024 * 1024;
@@ -7165,7 +7480,10 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       });
       return this.agentRuntimeState.rejectSnapshot(body, reason, 'collector_conflict');
     }
-    return this.agentRuntimeState.recordSnapshot(body);
+    // The source identity is authenticated at this boundary. Pass it as server-only context so a
+    // Source-bound management registration can be resolved without trusting producer fields; the
+    // runtime snapshot wire contract itself remains unchanged.
+    return this.agentRuntimeState.recordSnapshot(body, undefined, resolution.source?.sourceId ?? sourceId);
   }
 
   @Post('runtime/instances')
@@ -9048,7 +9366,782 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     return { schemaVersion: 'anysentry.session_membership.v1', item };
   }
 
+  /**
+   * The fact endpoints above intentionally expose only append-only records.  These four resource
+   * endpoints are the missing entity/read-model seam: they project the existing directory/runtime
+   * stores without reparsing payloads or writing a binding as a side effect of a GET.
+   */
+  private canonicalCurrentRevision(): number {
+    return Math.max(
+      1,
+      this.agg.agentConversationResolutionRevision(),
+      this.agentMetadata.identitySnapshotVersion(),
+    );
+  }
+
+  private canonicalConversationDirectoryQuery(
+    query: CanonicalEntityQuery,
+  ): T.AgentConversationDirectoryQuery {
+    return {
+      timeType: query.timeType,
+      startTime: query.startTime,
+      endTime: query.endTime,
+      snapshotAsOf: query.snapshotAsOf,
+      scope: 'agent',
+      classificationView: query.classificationView,
+      agentAssetId: query.agentAssetId,
+      agentInstanceId: query.agentInstanceId,
+      product: query.product,
+      q: query.q,
+      lifecycleScope: query.lifecycleScope,
+      limit: 500,
+    };
+  }
+
+  private async canonicalDirectorySnapshot(
+    query: CanonicalEntityQuery,
+    headers: HeaderBag,
+  ): Promise<T.AgentConversationDirectoryListV4> {
+    // The V4 compatibility projection is already read-only and carries userThreads, recent
+    // runtime records, and coverage.  Reuse it rather than introducing a second aggregation path.
+    return this.agentConversationDirectoryV4(this.canonicalConversationDirectoryQuery(query), headers);
+  }
+
+  private canonicalRevisionCoverage(
+    query: CanonicalEntityQuery,
+    revision: number,
+    base: T.CanonicalEntityCoverage,
+  ): T.CanonicalEntityCoverage {
+    if (query.revision === undefined || query.revision === revision) return base;
+    return {
+      ...base,
+      status: 'partial',
+      reasons: [...new Set([...base.reasons, 'requested_revision_not_available'])].slice(0, 64),
+    };
+  }
+
+  private async canonicalLogicalAgentResources(
+    query: CanonicalEntityQuery,
+    headers: HeaderBag,
+  ): Promise<{
+    items: T.CanonicalLogicalAgentResource[];
+    coverage: T.CanonicalEntityCoverage;
+    dataSource: string;
+    revision: number;
+  }> {
+    const directory = await this.canonicalDirectorySnapshot(query, headers);
+    const resources = directory.items
+      .filter((item) => {
+        const conversations = item.userThreads ?? [];
+        const runtimeIds = item.recentInstances.flatMap((instance) => [
+          instance.agentInstanceId,
+          instance.canonicalAgentInstanceId,
+          ...(instance.agentInstanceAliases ?? []),
+        ]);
+        const sessionIds = conversations.flatMap((conversation) => [
+          conversation.conversationId,
+          conversation.sessionId,
+          conversation.canonicalParentSessionId,
+        ].filter((value): value is string => Boolean(value)));
+        const classifications = conversations.map((conversation) => conversation.classification);
+        const classification = classifications.includes('confirmed_agent')
+          ? 'confirmed_agent'
+          : classifications.includes('probable_agent') ? 'probable_agent' : undefined;
+        return canonicalScopeMatches({
+          logicalAgentId: item.logicalAgentId,
+          logicalAgentCandidateId: item.candidateId,
+          logicalDefinitionId: item.logicalDefinitionId,
+          tenantId: item.tenantId,
+          ownerId: item.ownerId,
+          workspacePath: item.workspacePath,
+          environment: item.environment,
+          environmentId: item.environmentId,
+          agentAssetId: item.agentAssetIds[0],
+          agentInstanceId: query.agentInstanceId && runtimeIds.includes(query.agentInstanceId)
+            ? query.agentInstanceId : undefined,
+          runtimeInstanceId: query.runtimeInstanceId && runtimeIds.includes(query.runtimeInstanceId)
+            ? query.runtimeInstanceId : undefined,
+          sessionId: query.sessionId && sessionIds.includes(query.sessionId) ? query.sessionId : undefined,
+          product: item.product,
+          classification,
+          coverageStatus: item.coverage.status,
+          q: [item.displayName, item.product, item.workspacePath, ...sessionIds].join(' '),
+        }, {
+          ...query,
+          // The helper performs equality on optional fields; a requested ID which is not present
+          // must reject this item instead of turning into an undefined wildcard.
+          ...(query.agentInstanceId && !runtimeIds.includes(query.agentInstanceId)
+            ? { agentInstanceId: '__missing__' } : {}),
+          ...(query.runtimeInstanceId && !runtimeIds.includes(query.runtimeInstanceId)
+            ? { runtimeInstanceId: '__missing__' } : {}),
+          ...(query.sessionId && !sessionIds.includes(query.sessionId)
+            ? { sessionId: '__missing__' } : {}),
+        });
+      })
+      .map((item): T.CanonicalLogicalAgentResource => {
+        const conversations = item.userThreads ?? [];
+        const sessionIds = [...new Set(conversations.flatMap((conversation) => [
+          conversation.sessionId,
+          conversation.conversationId,
+        ].filter((value): value is string => Boolean(value))))].slice(0, 512);
+        const identityQuality = item.groupingQuality === 'exact'
+          ? 'confirmed'
+          : item.groupingQuality;
+        const sourceRefs = [
+          `logical-agent-directory:${item.logicalAgentId}`,
+          ...item.agentInstanceIds.slice(0, 32).map((id) => `agent-instance:${id}`),
+        ];
+        return {
+          schemaVersion: 'anysentry.logical_agent.v1',
+          logicalAgentId: item.logicalAgentId,
+          ...(item.candidateId ? { logicalAgentCandidateId: item.candidateId } : {}),
+          ...(item.logicalDefinitionId ? { logicalDefinitionId: item.logicalDefinitionId } : {}),
+          ...(item.logicalScopeMode ? { logicalScopeMode: item.logicalScopeMode } : {}),
+          ...(item.logicalIdentityAuthority ? { logicalIdentityAuthority: item.logicalIdentityAuthority } : {}),
+          ...(item.definitionFingerprint ? { definitionFingerprint: item.definitionFingerprint } : {}),
+          identityQuality,
+          family: item.product,
+          product: item.product,
+          displayName: item.displayName,
+          workspacePath: item.workspacePath,
+          environment: item.environment,
+          lifecycleState: item.lifecycleState,
+          terminalContextIds: [...(item.terminalContextIds ?? [])].slice(0, 256),
+          agentAssetIds: [...item.agentAssetIds].slice(0, 256),
+          agentInstanceIds: [...item.agentInstanceIds].slice(0, 512),
+          sessionIds,
+          activeInstanceCount: item.activeInstanceCount,
+          totalInstanceCount: item.totalInstanceCount,
+          conversationCount: item.conversationCount,
+          usage: structuredClone(item.usage),
+          coverage: structuredClone(item.coverage),
+          sourceRefs: [...new Set(sourceRefs)].slice(0, 64),
+          resolutionRevision: directory.resolutionRevision,
+        };
+      });
+    const partial = directory.coverage.partial || resources.some((item) => item.coverage.status !== 'complete');
+    const coverage = this.canonicalRevisionCoverage(
+      query,
+      directory.resolutionRevision,
+      canonicalCoverage(
+        partial,
+        [directory.coverage.partialReason ?? '', ...resources.flatMap((item) => item.coverage.reasons)],
+        directory.dataSource,
+      ),
+    );
+    return { items: resources, coverage, dataSource: directory.dataSource, revision: directory.resolutionRevision };
+  }
+
+  private async canonicalAgentInstanceResources(
+    query: CanonicalEntityQuery,
+    headers: HeaderBag,
+  ): Promise<{
+    items: T.CanonicalAgentInstanceResource[];
+    coverage: T.CanonicalEntityCoverage;
+    dataSource: string;
+    revision: number;
+  }> {
+    const runtime = this.agentRuntimeState.list({
+      collectorId: query.collectorId,
+      agentInstanceId: query.agentInstanceId,
+      physicalWorkloadId: undefined,
+      includeShadow: query.includeShadow,
+      limit: 100_000,
+    });
+    const directory = await this.canonicalDirectorySnapshot({ ...query, offset: 0, limit: 500 }, headers);
+    const grouped = new Map<string, T.AgentRuntimeInstanceRecord[]>();
+    for (const record of runtime.items) {
+      const key = record.canonicalAgentInstanceId ?? record.agentInstanceId;
+      const values = grouped.get(key) ?? [];
+      values.push(record);
+      grouped.set(key, values);
+    }
+    const resources = [...grouped.entries()].map(([instanceId, records]): T.CanonicalAgentInstanceResource => {
+      const first = [...records].sort((left, right) => right.lastSeenAt - left.lastSeenAt)[0];
+      const matchingConversations = directory.items
+        .flatMap((item) => item.userThreads ?? [])
+        .filter((conversation) => conversation.agentInstanceIds.some((id) => records.some((record) => [
+          record.agentInstanceId,
+          record.canonicalAgentInstanceId,
+          ...(record.agentInstanceAliases ?? []),
+        ].includes(id))));
+      const runtimeIds = [...new Set(records.flatMap((record) => [
+        record.agentInstanceId,
+        record.canonicalAgentInstanceId,
+        ...(record.agentInstanceAliases ?? []),
+      ].filter((value): value is string => Boolean(value))))];
+      const sessionIds = [...new Set(matchingConversations.flatMap((conversation) => [
+        conversation.sessionId,
+        conversation.conversationId,
+      ].filter((value): value is string => Boolean(value))))].slice(0, 512);
+      const states = new Set(records.map((record) => record.runtimeState));
+      const state: T.AgentRuntimeState = states.has('running')
+        ? 'running'
+        : states.has('unobserved') ? 'unobserved'
+          : states.has('lost') ? 'lost' : 'exited';
+      const classification = records.find((record) => record.classification)?.classification;
+      const classificationDecision = captureClassificationDecision(classification);
+      const coverage = matchingConversations.length
+        ? canonicalCoverageFromSummaries(matchingConversations, 'runtime+conversation_projection')
+        : { status: 'unknown' as const, reasons: ['runtime_without_conversation_projection'], source: 'runtime_state' };
+      const sourceRefs = [...new Set(records.flatMap((record) => [
+        `runtime-snapshot:${record.collectorId}:${record.snapshotVersion}`,
+        ...runtimeIds.slice(0, 8).map((id) => `runtime:${id}`),
+      ]))].slice(0, 64);
+      return {
+        schemaVersion: 'anysentry.agent_instance.v1',
+        agentInstanceId: instanceId,
+        ...(first.logicalAgentId ? { logicalAgentId: first.logicalAgentId } : {}),
+        ...(first.logicalAgentCandidateId ? { logicalAgentCandidateId: first.logicalAgentCandidateId } : {}),
+        ...(first.logicalDefinitionId ? { logicalDefinitionId: first.logicalDefinitionId } : {}),
+        ...(first.logicalScopeMode ? { logicalScopeMode: first.logicalScopeMode } : {}),
+        ...(first.logicalIdentityAuthority === 'management_registration'
+          ? { logicalIdentityAuthority: first.logicalIdentityAuthority } : {}),
+        ...(first.agentDisplayName ? { agentProduct: first.agentDisplayName, displayName: first.agentDisplayName } : {}),
+        environment: canonicalRuntimeEnvironment(first),
+        ...(first.profile ? { profile: first.profile } : {}),
+        ...(first.profileVersion ? { profileVersion: first.profileVersion } : {}),
+        ...(first.deploymentId ? { deploymentId: first.deploymentId } : {}),
+        ...(first.deploymentRevision ? { deploymentRevision: first.deploymentRevision } : {}),
+        ...(first.environmentId ? { environmentId: first.environmentId } : {}),
+        terminalContextIds: [...new Set(records
+          .map((record) => record.terminalContextId)
+          .filter((value): value is string => Boolean(value)))].slice(0, 256),
+        runtimeInstanceIds: runtimeIds.slice(0, 512),
+        sessionIds,
+        state,
+        startedAtUnixNs: canonicalMillisToUnixNs(Math.min(...records.map((record) => record.discoveredAt))) ?? '0',
+        ...(records.some((record) => record.endedAt !== undefined)
+          ? { endedAtUnixNs: canonicalMillisToUnixNs(Math.max(...records.map((record) => record.endedAt ?? 0))) } : {}),
+        lastSeenAtUnixNs: canonicalMillisToUnixNs(Math.max(...records.map((record) => record.lastSeenAt))) ?? '0',
+        sourceRefs,
+        coverage,
+        ...(classification ? { detectedClassification: classification } : {}),
+        ...(classification ? { effectiveClassification: classificationDecision.effective } : {}),
+        ...(classificationDecision.candidateAutoPromoted ? { candidateAutoPromoted: true } : {}),
+        resolutionRevision: directory.resolutionRevision,
+      };
+    }).filter((resource) => canonicalScopeMatches({
+      logicalAgentId: resource.logicalAgentId,
+      logicalAgentCandidateId: resource.logicalAgentCandidateId,
+      logicalDefinitionId: resource.logicalDefinitionId,
+      tenantId: undefined,
+      ownerId: undefined,
+      workspacePath: undefined,
+      environment: resource.environment,
+      environmentId: resource.environmentId,
+      agentAssetId: undefined,
+      agentInstanceId: query.agentInstanceId && resource.runtimeInstanceIds.includes(query.agentInstanceId)
+        ? query.agentInstanceId : resource.agentInstanceId,
+      runtimeInstanceId: resource.runtimeInstanceIds[0],
+      sessionId: resource.sessionIds[0],
+      product: resource.agentProduct,
+      classification: resource.detectedClassification,
+      coverageStatus: resource.coverage.status,
+      q: [resource.displayName, resource.agentProduct, resource.agentInstanceId, ...resource.runtimeInstanceIds].join(' '),
+    }, query));
+    const partial = runtime.items.length === 0 && directory.coverage.partial;
+    const coverage = this.canonicalRevisionCoverage(
+      query,
+      directory.resolutionRevision,
+      canonicalCoverage(partial, [directory.coverage.partialReason ?? '', ...resources.flatMap((item) => item.coverage.reasons)], 'runtime_state+conversation_projection'),
+    );
+    return { items: resources, coverage, dataSource: 'runtime_state+conversation_projection', revision: directory.resolutionRevision };
+  }
+
+  private async canonicalRuntimeInstanceResources(
+    query: CanonicalEntityQuery,
+    headers: HeaderBag,
+  ): Promise<{
+    items: T.CanonicalRuntimeInstanceResource[];
+    coverage: T.CanonicalEntityCoverage;
+    dataSource: string;
+    revision: number;
+  }> {
+    const runtime = this.agentRuntimeState.list({
+      collectorId: query.collectorId,
+      agentInstanceId: query.agentInstanceId ?? query.runtimeInstanceId,
+      physicalWorkloadId: query.agentAssetId,
+      runtimeState: query.lifecycleScope === 'running' ? 'running' : 'all',
+      includeShadow: query.includeShadow,
+      limit: 100_000,
+    });
+    const directory = await this.canonicalDirectorySnapshot({ ...query, offset: 0, limit: 500 }, headers);
+    const conversations = directory.items.flatMap((item) => item.userThreads ?? []);
+    const resources = runtime.items.map((record): T.CanonicalRuntimeInstanceResource => {
+      const runtimeInstanceId = record.agentInstanceId;
+      const canonicalAgentInstanceId = record.canonicalAgentInstanceId;
+      const processKey = canonicalRuntimeProcessKey(record);
+      const matchingConversations = conversations.filter((conversation) => conversation.agentInstanceIds.some((id) => [
+        record.agentInstanceId,
+        canonicalAgentInstanceId,
+        ...(record.agentInstanceAliases ?? []),
+      ].includes(id)));
+      const classificationDecision = captureClassificationDecision(record.classification);
+      return {
+        schemaVersion: 'anysentry.runtime_instance.v1',
+        runtimeInstanceId,
+        ...(canonicalAgentInstanceId ? { agentInstanceId: canonicalAgentInstanceId } : {}),
+        legacyAgentInstanceId: runtimeInstanceId,
+        ...(record.logicalAgentId ? { logicalAgentId: record.logicalAgentId } : {}),
+        ...(record.logicalAgentCandidateId ? { logicalAgentCandidateId: record.logicalAgentCandidateId } : {}),
+        ...(record.logicalDefinitionId ? { logicalDefinitionId: record.logicalDefinitionId } : {}),
+        ...(record.logicalScopeMode ? { logicalScopeMode: record.logicalScopeMode } : {}),
+        ...(record.logicalIdentityAuthority === 'management_registration'
+          ? { logicalIdentityAuthority: record.logicalIdentityAuthority } : {}),
+        ...(record.agentDisplayName ? { agentProduct: record.agentDisplayName, displayName: record.agentDisplayName } : {}),
+        environment: canonicalRuntimeEnvironment(record),
+        hostId: record.hostId,
+        bootId: record.bootId,
+        rootPid: record.rootPid,
+        rootStartTimeTicks: record.rootStartTimeTicks,
+        processGenerationKeys: processKey ? [processKey] : [],
+        ...(record.workspacePath ? { workspacePath: record.workspacePath } : {}),
+        ...(record.workloadRef ? { workloadRef: structuredClone(record.workloadRef) } : {}),
+        ...(record.terminalContextId ? { terminalContextId: record.terminalContextId } : {}),
+        ...(record.sshConnectionId ? { sshConnectionId: record.sshConnectionId } : {}),
+        state: record.runtimeState,
+        ...(record.activityState ? { activityState: record.activityState } : {}),
+        startedAtUnixNs: canonicalMillisToUnixNs(record.discoveredAt) ?? '0',
+        ...(record.endedAt !== undefined ? { endedAtUnixNs: canonicalMillisToUnixNs(record.endedAt) } : {}),
+        lastSeenAtUnixNs: canonicalMillisToUnixNs(record.lastSeenAt) ?? '0',
+        sourceRefs: [
+          `runtime-snapshot:${record.collectorId}:${record.snapshotVersion}`,
+          `runtime:${runtimeInstanceId}`,
+          ...(processKey ? [`process-generation:${processKey}`] : []),
+        ].slice(0, 64),
+        coverage: matchingConversations.length
+          ? canonicalCoverageFromSummaries(matchingConversations, 'runtime+conversation_projection')
+          : { status: 'unknown', reasons: ['runtime_without_conversation_projection'], source: 'runtime_state' },
+        ...(record.classification ? { detectedClassification: record.classification } : {}),
+        ...(record.classification ? { effectiveClassification: classificationDecision.effective } : {}),
+        ...(classificationDecision.candidateAutoPromoted ? { candidateAutoPromoted: true } : {}),
+        resolutionRevision: directory.resolutionRevision,
+      };
+    }).filter((resource) => canonicalScopeMatches({
+      logicalAgentId: resource.logicalAgentId,
+      logicalAgentCandidateId: resource.logicalAgentCandidateId,
+      logicalDefinitionId: resource.logicalDefinitionId,
+      tenantId: undefined,
+      ownerId: undefined,
+      workspacePath: resource.workspacePath,
+      environment: resource.environment,
+      environmentId: undefined,
+      agentAssetId: undefined,
+      agentInstanceId: resource.agentInstanceId,
+      runtimeInstanceId: resource.runtimeInstanceId,
+      sessionId: undefined,
+      product: resource.agentProduct,
+      classification: resource.detectedClassification,
+      coverageStatus: resource.coverage.status,
+      q: [resource.displayName, resource.agentProduct, resource.runtimeInstanceId, resource.workspacePath].join(' '),
+    }, query));
+    const coverage = this.canonicalRevisionCoverage(
+      query,
+      directory.resolutionRevision,
+      canonicalCoverage(
+        runtime.total === 0 && directory.coverage.partial,
+        [directory.coverage.partialReason ?? '', ...resources.flatMap((item) => item.coverage.reasons)],
+        'runtime_state+conversation_projection',
+      ),
+    );
+    return { items: resources, coverage, dataSource: 'runtime_state+conversation_projection', revision: directory.resolutionRevision };
+  }
+
+  private async canonicalSessionResources(
+    query: CanonicalEntityQuery,
+    headers: HeaderBag,
+  ): Promise<{
+    items: T.CanonicalSessionResource[];
+    coverage: T.CanonicalEntityCoverage;
+    dataSource: string;
+    revision: number;
+  }> {
+    const conversations = await this.agg.agentConversations({
+      timeType: query.timeType,
+      startTime: query.startTime,
+      endTime: query.endTime,
+      snapshotAsOf: query.snapshotAsOf,
+      scope: 'raw',
+      classificationView: query.classificationView,
+      agentAssetId: query.agentAssetId,
+      agentInstanceId: query.agentInstanceId,
+      product: query.product,
+      q: query.q,
+      limit: 500,
+    });
+    const memberships = await this.canonicalObservability.listDurableSessionMemberships(10_000);
+    const membershipBySession = new Map<string, T.SessionMembership[]>();
+    for (const membership of memberships) {
+      const values = membershipBySession.get(membership.sessionId) ?? [];
+      values.push(membership);
+      membershipBySession.set(membership.sessionId, values);
+    }
+    const resourcesByKey = new Map<string, T.CanonicalSessionResource>();
+    for (const summary of conversations.items) {
+      // An asset-only compatibility summary is an Agent/runtime placeholder, not a Session. It is
+      // exposed by the legacy directory for discovery but must not manufacture a Canonical Session
+      // without a semantic interaction or a persisted SessionMembership.
+      if (!summary.hasContent) continue;
+      const sessionId = canonicalSessionIdentity(summary);
+      const related = [
+        ...(membershipBySession.get(sessionId) ?? []),
+        ...(membershipBySession.get(summary.conversationId) ?? []),
+        ...memberships.filter((membership) =>
+          membership.logicalAgentId
+          && summary.logicalAgentId
+          && membership.logicalAgentId === summary.logicalAgentId
+          && ((summary.providerSessionIdHash
+            && membership.providerSessionIdHash === summary.providerSessionIdHash)
+            || (membership.agentInstanceId
+              && summary.agentInstanceIds.includes(membership.agentInstanceId)))),
+      ];
+      const interactionIds = [...new Set(related
+        .map((membership) => membership.interactionId)
+        .filter((value): value is string => Boolean(value)))].slice(0, 2_048);
+      const segmentIds = [...new Set(related
+        .map((membership) => membership.segmentId)
+        .filter((value): value is string => Boolean(value)))].slice(0, 512);
+      const canonicalMembership = related.find((membership) => Boolean(membership.sessionKey));
+      const canonicalSessionId = canonicalMembership?.sessionId;
+      const key = canonicalSessionId ?? sessionId;
+      const existing = resourcesByKey.get(key);
+      if (existing) {
+        existing.agentInstanceIds = [...new Set([...existing.agentInstanceIds, ...summary.agentInstanceIds])].slice(0, 512);
+        existing.interactionIds = [...new Set([...existing.interactionIds, ...interactionIds])].slice(0, 2_048);
+        existing.segmentIds = [...new Set([...existing.segmentIds, ...segmentIds])].slice(0, 512);
+        continue;
+      }
+      resourcesByKey.set(key, {
+        schemaVersion: 'anysentry.session.v1',
+        sessionId: key,
+        ...(summary.sessionId && summary.sessionId !== key ? { canonicalSessionId: key } : {}),
+        ...(summary.sessionKey ? { sessionKey: summary.sessionKey } : {}),
+        ...(summary.providerSessionIdHash ? { providerSessionIdHash: summary.providerSessionIdHash } : {}),
+        conversationId: summary.conversationId,
+        ...(summary.logicalAgentId ? { logicalAgentId: summary.logicalAgentId } : {}),
+        ...(summary.logicalAgentCandidateId ? { logicalAgentCandidateId: summary.logicalAgentCandidateId } : {}),
+        ...(summary.logicalDefinitionId ? { logicalDefinitionId: summary.logicalDefinitionId } : {}),
+        ...(summary.logicalScopeMode ? { logicalScopeMode: summary.logicalScopeMode } : {}),
+        ...(summary.logicalIdentityAuthority ? { logicalIdentityAuthority: summary.logicalIdentityAuthority } : {}),
+        ...(summary.tenantId ? { tenantId: summary.tenantId } : {}),
+        ...(summary.ownerId ? { ownerId: summary.ownerId } : {}),
+        ...(summary.agentProduct ? { agentProduct: summary.agentProduct } : {}),
+        ...(summary.environment ? { environment: summary.environment } : {}),
+        ...(summary.workspacePath ? { workspacePath: summary.workspacePath } : {}),
+        agentInstanceIds: [...summary.agentInstanceIds].slice(0, 512),
+        segmentIds,
+        interactionIds,
+        ...(summary.parentSessionId ? { parentSessionId: summary.parentSessionId } : {}),
+        ...(summary.canonicalParentSessionId ? { canonicalParentSessionId: summary.canonicalParentSessionId } : {}),
+        ...(summary.sessionIdentityQuality ? { sessionIdentityQuality: summary.sessionIdentityQuality } : {}),
+        ...(summary.sessionMode ? { sessionMode: summary.sessionMode } : {}),
+        ...(summary.sessionLifecycle ? { sessionLifecycle: summary.sessionLifecycle } : {}),
+        ...(summary.startedAtUnixNs ? { startedAtUnixNs: summary.startedAtUnixNs } : {}),
+        ...(summary.lastActivityAtUnixNs ? { lastActivityAtUnixNs: summary.lastActivityAtUnixNs } : {}),
+        turnCount: summary.turnCount,
+        modelCallCount: summary.modelCallCount,
+        toolCallCount: summary.toolCallCount,
+        toolResultCount: summary.toolResultCount,
+        errorCount: summary.errorCount,
+        usage: structuredClone(summary.usage),
+        coverage: structuredClone(summary.coverage),
+        sourceRefs: [...new Set([
+          ...canonicalConversationSourceRefs(summary),
+          ...related.flatMap((membership) => membership.sourceRefs),
+        ])].slice(0, 128),
+        resolutionRevision: Math.max(
+          this.canonicalCurrentRevision(),
+          ...related.map((membership) => membership.resolutionRevision),
+        ),
+      });
+    }
+    // Memberships are the canonical session lane even when a semantic projection has expired.
+    for (const membership of memberships) {
+      if ([...resourcesByKey.values()].some((resource) => [
+        resource.sessionId,
+        resource.canonicalSessionId,
+        resource.conversationId,
+      ].includes(membership.sessionId))) continue;
+      resourcesByKey.set(membership.sessionId, {
+        schemaVersion: 'anysentry.session.v1',
+        sessionId: membership.sessionId,
+        ...(membership.sessionKey ? { sessionKey: membership.sessionKey } : {}),
+        ...(membership.providerSessionIdHash ? { providerSessionIdHash: membership.providerSessionIdHash } : {}),
+        ...(membership.logicalAgentId ? { logicalAgentId: membership.logicalAgentId } : {}),
+        ...(membership.agentInstanceId ? { agentInstanceIds: [membership.agentInstanceId] } : { agentInstanceIds: [] }),
+        segmentIds: membership.segmentId ? [membership.segmentId] : [],
+        interactionIds: membership.interactionId ? [membership.interactionId] : [],
+        ...(membership.parentSessionId ? { parentSessionId: membership.parentSessionId } : {}),
+        ...(membership.canonicalParentSessionId ? { canonicalParentSessionId: membership.canonicalParentSessionId } : {}),
+        ...(membership.confidence && ['confirmed', 'strong', 'inferred', 'unresolved', 'ephemeral', 'unknown', 'conflict'].includes(membership.confidence)
+          ? { sessionIdentityQuality: membership.confidence as T.SessionIdentityQuality } : {}),
+        ...(membership.sessionMode ? { sessionMode: membership.sessionMode } : {}),
+        ...(membership.sessionLifecycle ? { sessionLifecycle: membership.sessionLifecycle } : {}),
+        turnCount: 0,
+        modelCallCount: 0,
+        toolCallCount: 0,
+        toolResultCount: 0,
+        errorCount: 0,
+        usage: {
+          modelCallCount: 0,
+          successfulModelCallCount: 0,
+          failedModelCallCount: 0,
+          tokenReportedModelCallCount: 0,
+          tokenCoverage: 'unavailable',
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          cachedInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          reasoningOutputTokens: 0,
+          totalDurationMs: 0,
+        },
+        coverage: {
+          status: 'asset_only',
+          reasons: ['semantic_projection_expired_or_missing'],
+          completeInteractions: 0,
+          partialInteractions: 0,
+        },
+        sourceRefs: [...new Set([`session-membership:${membership.membershipId}`, ...membership.sourceRefs])].slice(0, 64),
+        resolutionRevision: membership.resolutionRevision,
+      });
+    }
+    const resources = [...resourcesByKey.values()].filter((resource) => canonicalScopeMatches({
+      logicalAgentId: resource.logicalAgentId,
+      logicalAgentCandidateId: resource.logicalAgentCandidateId,
+      logicalDefinitionId: resource.logicalDefinitionId,
+      tenantId: resource.tenantId,
+      ownerId: resource.ownerId,
+      workspacePath: resource.workspacePath,
+      environment: resource.environment,
+      environmentId: undefined,
+      agentAssetId: undefined,
+      agentInstanceId: resource.agentInstanceIds[0],
+      runtimeInstanceId: resource.agentInstanceIds[0],
+      sessionId: resource.sessionId,
+      product: resource.agentProduct,
+      classification: undefined,
+      coverageStatus: resource.coverage.status,
+      q: [resource.sessionId, resource.conversationId, resource.agentProduct, resource.workspacePath].join(' '),
+    }, query));
+    const revision = Math.max(this.canonicalCurrentRevision(), ...resources.map((resource) => resource.resolutionRevision));
+    const coverage = this.canonicalRevisionCoverage(
+      query,
+      revision,
+      canonicalCoverage(
+        conversations.coverage.partial,
+        [conversations.coverage.partialReason ?? '', ...resources.flatMap((resource) => resource.coverage.reasons)],
+        conversations.dataSource,
+      ),
+    );
+    return { items: resources, coverage, dataSource: conversations.dataSource, revision };
+  }
+
+  @Get('v1/logical-agents')
+  @RequireManagementAuth()
+  async canonicalLogicalAgents(@Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag): Promise<T.CanonicalLogicalAgentList> {
+    const query = parseCanonicalEntityQuery(rawQuery);
+    const result = await this.canonicalLogicalAgentResources(query, headers);
+    const page = canonicalPage(result.items, query);
+    this.audit.record({
+      actor: auditActor(headers),
+      action: 'agent.conversation.content.list',
+      resourceType: 'agent',
+      resourceId: query.logicalAgentId ?? 'collection',
+      summary: `Read ${page.items.length} canonical LogicalAgent resource(s)`,
+      details: { total: page.total, limit: query.limit, offset: query.offset, revision: result.revision },
+    });
+    return {
+      schemaVersion: 'anysentry.logical_agent.list.v1',
+      ...page,
+      revision: result.revision,
+      coverage: query.includeCoverage ? result.coverage : canonicalCoverage(false, [], result.dataSource),
+      dataSource: result.dataSource,
+      updateTime: new Date().toISOString(),
+    };
+  }
+
+  @Get('v1/logical-agents/:logicalAgentId')
+  @RequireManagementAuth()
+  async canonicalLogicalAgent(@Param('logicalAgentId') logicalAgentId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag) {
+    const query = parseCanonicalEntityQuery({ ...rawQuery, logicalAgentId });
+    const result = await this.canonicalLogicalAgentResources(query, headers);
+    const item = result.items.find((candidate) => candidate.logicalAgentId === logicalAgentId || candidate.logicalAgentCandidateId === logicalAgentId);
+    if (!item) throw new NotFoundException('logical agent not found');
+    return {
+      schemaVersion: 'anysentry.logical_agent.v1',
+      item,
+      revision: result.revision,
+      coverage: result.coverage,
+      dataSource: result.dataSource,
+      updateTime: new Date().toISOString(),
+    };
+  }
+
+  @Get('v1/logical-agents/:logicalAgentId/instances')
+  @RequireManagementAuth()
+  async canonicalLogicalAgentInstances(@Param('logicalAgentId') logicalAgentId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag): Promise<T.CanonicalAgentInstanceList> {
+    const query = parseCanonicalEntityQuery({ ...rawQuery, logicalAgentId });
+    const result = await this.canonicalAgentInstanceResources(query, headers);
+    const filtered = result.items.filter((item) => item.logicalAgentId === logicalAgentId);
+    const page = canonicalPage(filtered, query);
+    return {
+      schemaVersion: 'anysentry.agent_instance.list.v1',
+      ...page,
+      revision: result.revision,
+      coverage: result.coverage,
+      dataSource: result.dataSource,
+      updateTime: new Date().toISOString(),
+    };
+  }
+
+  @Get('v1/agent-instances')
+  @RequireManagementAuth()
+  async canonicalAgentInstances(@Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag): Promise<T.CanonicalAgentInstanceList> {
+    const query = parseCanonicalEntityQuery(rawQuery);
+    const result = await this.canonicalAgentInstanceResources(query, headers);
+    const page = canonicalPage(result.items, query);
+    this.audit.record({ actor: auditActor(headers), action: 'agent.conversation.content.list', resourceType: 'agent', resourceId: 'agent-instance-collection', summary: `Read ${page.items.length} canonical AgentInstance resource(s)`, details: { total: page.total, revision: result.revision } });
+    return { schemaVersion: 'anysentry.agent_instance.list.v1', ...page, revision: result.revision, coverage: query.includeCoverage ? result.coverage : canonicalCoverage(false, [], result.dataSource), dataSource: result.dataSource, updateTime: new Date().toISOString() };
+  }
+
+  @Get('v1/agent-instances/:agentInstanceId')
+  @RequireManagementAuth()
+  async canonicalAgentInstance(@Param('agentInstanceId') agentInstanceId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag) {
+    const query = parseCanonicalEntityQuery({ ...rawQuery, agentInstanceId });
+    const result = await this.canonicalAgentInstanceResources(query, headers);
+    const item = result.items.find((candidate) => candidate.agentInstanceId === agentInstanceId || candidate.runtimeInstanceIds.includes(agentInstanceId));
+    if (!item) throw new NotFoundException('agent instance not found');
+    return { schemaVersion: 'anysentry.agent_instance.v1', item, revision: result.revision, coverage: result.coverage, dataSource: result.dataSource, updateTime: new Date().toISOString() };
+  }
+
+  @Get('v1/agent-instances/:agentInstanceId/runtimes')
+  @RequireManagementAuth()
+  async canonicalAgentInstanceRuntimes(@Param('agentInstanceId') agentInstanceId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag): Promise<T.CanonicalRuntimeInstanceList> {
+    const query = parseCanonicalEntityQuery({ ...rawQuery, agentInstanceId });
+    const result = await this.canonicalRuntimeInstanceResources(query, headers);
+    const filtered = result.items.filter((item) => item.agentInstanceId === agentInstanceId);
+    const page = canonicalPage(filtered, query);
+    return { schemaVersion: 'anysentry.runtime_instance.list.v1', ...page, revision: result.revision, coverage: result.coverage, dataSource: result.dataSource, updateTime: new Date().toISOString() };
+  }
+
+  @Get('v1/runtime-instances')
+  @RequireManagementAuth()
+  async canonicalRuntimeInstances(@Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag): Promise<T.CanonicalRuntimeInstanceList> {
+    const query = parseCanonicalEntityQuery(rawQuery);
+    const result = await this.canonicalRuntimeInstanceResources(query, headers);
+    const page = canonicalPage(result.items, query);
+    this.audit.record({ actor: auditActor(headers), action: 'agent.conversation.content.list', resourceType: 'agent', resourceId: 'runtime-instance-collection', summary: `Read ${page.items.length} canonical RuntimeInstance resource(s)`, details: { total: page.total, revision: result.revision } });
+    return { schemaVersion: 'anysentry.runtime_instance.list.v1', ...page, revision: result.revision, coverage: query.includeCoverage ? result.coverage : canonicalCoverage(false, [], result.dataSource), dataSource: result.dataSource, updateTime: new Date().toISOString() };
+  }
+
+  @Get('v1/runtime-instances/:runtimeInstanceId')
+  @RequireManagementAuth()
+  async canonicalRuntimeInstance(@Param('runtimeInstanceId') runtimeInstanceId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag) {
+    const query = parseCanonicalEntityQuery({ ...rawQuery, runtimeInstanceId });
+    const result = await this.canonicalRuntimeInstanceResources(query, headers);
+    const item = result.items.find((candidate) => candidate.runtimeInstanceId === runtimeInstanceId || candidate.legacyAgentInstanceId === runtimeInstanceId);
+    if (!item) throw new NotFoundException('runtime instance not found');
+    return { schemaVersion: 'anysentry.runtime_instance.v1', item, revision: result.revision, coverage: result.coverage, dataSource: result.dataSource, updateTime: new Date().toISOString() };
+  }
+
+  @Get('v1/sessions')
+  @RequireManagementAuth()
+  async canonicalSessions(@Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag): Promise<T.CanonicalSessionList> {
+    const query = parseCanonicalEntityQuery(rawQuery);
+    const result = await this.canonicalSessionResources(query, headers);
+    const page = canonicalPage(result.items, query);
+    this.audit.record({ actor: auditActor(headers), action: 'agent.conversation.content.list', resourceType: 'agent', resourceId: 'session-collection', summary: `Read ${page.items.length} canonical Session resource(s)`, details: { total: page.total, revision: result.revision } });
+    return { schemaVersion: 'anysentry.session.list.v1', ...page, revision: result.revision, coverage: query.includeCoverage ? result.coverage : canonicalCoverage(false, [], result.dataSource), dataSource: result.dataSource, updateTime: new Date().toISOString() };
+  }
+
+  @Get('v1/sessions/:sessionId')
+  @RequireManagementAuth()
+  async canonicalSession(@Param('sessionId') sessionId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag) {
+    const query = parseCanonicalEntityQuery({ ...rawQuery, sessionId });
+    const result = await this.canonicalSessionResources(query, headers);
+    const item = result.items.find((candidate) => [candidate.sessionId, candidate.canonicalSessionId, candidate.conversationId].includes(sessionId));
+    if (!item) throw new NotFoundException('session not found');
+    return { schemaVersion: 'anysentry.session.v1', item, revision: result.revision, coverage: result.coverage, dataSource: result.dataSource, updateTime: new Date().toISOString() };
+  }
+
+  @Get('v1/sessions/:sessionId/timeline')
+  @RequireManagementAuth()
+  async canonicalSessionTimeline(@Param('sessionId') sessionId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag) {
+    const query = parseCanonicalEntityQuery({ ...rawQuery, sessionId });
+    const sessions = await this.canonicalSessionResources({ ...query, offset: 0, limit: 500 }, headers);
+    const session = sessions.items.find((candidate) => [candidate.sessionId, candidate.canonicalSessionId, candidate.conversationId].includes(sessionId));
+    if (!session) throw new NotFoundException('session not found');
+    const conversationId = session.conversationId ?? session.sessionId;
+    const timeline = await this.agentConversationTimelineV3({
+      timeType: query.timeType,
+      startTime: query.startTime,
+      endTime: query.endTime,
+      snapshotAsOf: query.snapshotAsOf,
+      scope: 'agent',
+      classificationView: query.classificationView,
+      conversationId,
+      limit: query.limit,
+    }, headers);
+    return { schemaVersion: 'anysentry.session.timeline.v1', session, timeline, revision: sessions.revision, coverage: sessions.coverage, dataSource: sessions.dataSource, updateTime: new Date().toISOString() };
+  }
+
+  @Get('v1/sessions/:sessionId/coverage')
+  @RequireManagementAuth()
+  async canonicalSessionCoverage(@Param('sessionId') sessionId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag) {
+    const query = parseCanonicalEntityQuery({ ...rawQuery, sessionId });
+    const result = await this.canonicalSessionResources({ ...query, offset: 0, limit: 500 }, headers);
+    const session = result.items.find((candidate) => [candidate.sessionId, candidate.canonicalSessionId, candidate.conversationId].includes(sessionId));
+    if (!session) throw new NotFoundException('session not found');
+    return { schemaVersion: 'anysentry.session.coverage.v1', sessionId: session.sessionId, coverage: session.coverage, revision: result.revision, dataSource: result.dataSource, updateTime: new Date().toISOString() };
+  }
+
+  @Get('v1/semantic-events/:semanticEventId/evidence')
+  @RequireManagementAuth()
+  async canonicalSemanticEventEvidence(@Param('semanticEventId') semanticEventId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag) {
+    const id = strictIdentityText(semanticEventId, 512);
+    if (!id) throw new BadRequestException('semanticEventId is invalid');
+    const query = parseCanonicalEntityQuery(rawQuery);
+    const semantic = await this.canonicalObservability.getDurableSemanticRecord(id, query.revision);
+    if (!semantic) throw new NotFoundException('semantic record not found');
+    const sessions = await this.canonicalSessionResources({ ...query, offset: 0, limit: 500 }, headers);
+    const semanticSessionKeys = [
+      semantic.sessionId,
+      semantic.canonicalSessionId,
+    ].filter((value): value is string => Boolean(value));
+    const session = sessions.items.find((candidate) => semanticSessionKeys.some((key) => [
+      candidate.sessionId,
+      candidate.canonicalSessionId,
+      candidate.conversationId,
+    ].includes(key)));
+    if (!session) throw new NotFoundException('semantic event session not found');
+    const evidence = await this.agentSemanticEvidence({
+      timeType: query.timeType,
+      startTime: query.startTime,
+      endTime: query.endTime,
+      snapshotAsOf: query.snapshotAsOf,
+      scope: 'agent',
+      classificationView: query.classificationView,
+      conversationId: session.conversationId ?? session.sessionId,
+      semanticEventId: id,
+    }, headers);
+    return { schemaVersion: 'anysentry.evidence_link.semantic_event.v1', semanticRecord: semantic, evidence, revision: sessions.revision, coverage: sessions.coverage, dataSource: sessions.dataSource, updateTime: new Date().toISOString() };
+  }
+
+  @Get('v1/kernel-facts/:factId/context')
+  @RequireManagementAuth()
+  async canonicalKernelFactContext(@Param('factId') factId: string, @Headers() headers: HeaderBag) {
+    const id = strictIdentityText(factId, 240);
+    if (!id) throw new BadRequestException('factId is invalid');
+    const fact = await this.canonicalObservability.getDurableKernelFact(id);
+    if (!fact) throw new NotFoundException('kernel fact not found');
+    const context = await this.agg.agentKernelSemanticContext(fact.eventId ?? id);
+    return { schemaVersion: 'anysentry.kernel_fact.context.v1', fact, context, revision: this.canonicalCurrentRevision(), updateTime: new Date().toISOString() };
+  }
+
   @Get('v1/observability/contracts')
+  @RequireManagementAuth()
   observabilityContracts() {
     return {
       schemaVersion: 'anysentry.observability_contract_catalog.v1',

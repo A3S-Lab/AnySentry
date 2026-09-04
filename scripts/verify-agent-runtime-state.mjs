@@ -879,7 +879,7 @@ assert.equal(runtimeControlStart >= 0 && runtimeQueryStart > runtimeControlStart
 const runtimeControlHandlers = controllerSource.slice(runtimeControlStart, runtimeQueryStart);
 assert.match(runtimeControlHandlers, /this\.sources\.resolve\(/u);
 assert.match(runtimeControlHandlers, /this\.agentRuntimeState\.issueLease\(body\)/u);
-assert.match(runtimeControlHandlers, /this\.agentRuntimeState\.recordSnapshot\(body\)/u);
+assert.match(runtimeControlHandlers, /this\.agentRuntimeState\.recordSnapshot\(body(?:,|\))/u);
 assert.doesNotMatch(runtimeControlHandlers, /this\.(?:judge|agg)\b|\.accept\(|sources\.recordAccepted/u);
 
 const judgeSource = readFileSync(`${root}/apps/api/src/security-monitoring/sentry-judge.service.ts`, 'utf8');

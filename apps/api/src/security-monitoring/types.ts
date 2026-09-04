@@ -249,6 +249,13 @@ export type UnknownReason =
 export interface ClassificationSemanticsV1 {
   schemaVersion: 'anysentry.classification_semantics.v1';
   identityClassification: AgentClassification;
+  /**
+   * Effective capture/judgment classification.  A probable candidate may use the same full
+   * capture path as a confirmed Agent without changing the observed identity fact above.
+   */
+  effectiveIdentityClassification?: AgentClassification;
+  /** Why the effective classification differs from the observed classification, if it does. */
+  classificationSource?: 'observed' | 'candidate_auto_promoted' | 'policy';
   workloadRole: WorkloadRole;
   captureProfile: CaptureProfile;
   unknownReason?: UnknownReason;
@@ -282,6 +289,10 @@ export type JudgmentRouteReason =
   | 'non_agent_structural_fallback';
 export interface JudgmentRoutingSnapshot {
   classification: AgentClassification;
+  /** Effective route class; `classification` remains the observed/provenance value. */
+  effectiveClassification?: AgentClassification;
+  /** True when a probable candidate intentionally receives the confirmed full route. */
+  candidateAutoPromoted?: boolean;
   profile: JudgmentProfile;
   maxTier: 'L1' | 'L2' | 'L3';
   reason: JudgmentRouteReason;
@@ -1417,6 +1428,8 @@ export interface AgentEventListItem {
   asObservedClassification: AgentClassification;
   /** Latest asset/review overlay; it never changes verdict/tier/reason. */
   currentEffectiveClassification: AgentClassification;
+  /** Candidate capture policy provenance; does not assert a confirmed business identity. */
+  candidateAutoPromoted?: boolean;
   effectiveClassification: AgentClassification;
   currentReviewRevision?: number;
   currentReviewEffectiveAt?: string;
@@ -1733,6 +1746,8 @@ export interface AgentInteractionRecord {
   correlationQuality?: 'exact' | 'strong' | 'inferred' | 'ambiguous' | 'coverage_gap' | 'unlinked';
   detectedClassification: AgentClassification;
   currentEffectiveClassification: AgentClassification;
+  /** Candidate provenance is retained even when capture uses the confirmed full path. */
+  candidateAutoPromoted?: boolean;
   process?: ProcessContext;
   connectionId: string;
   transport: 'http' | 'tls';
@@ -1931,6 +1946,7 @@ export interface AgentConversationSummary {
   idSource: 'provider' | 'runtime' | 'inferred';
   tenantId?: string;
   ownerId?: string;
+  environmentId?: string;
   logicalAgentId?: string;
   logicalAgentCandidateId?: string;
   logicalDefinitionId?: string;
@@ -1990,8 +2006,14 @@ export interface LogicalAgentConversationDirectoryItem {
   groupingQuality: 'exact' | 'strong' | 'inferred' | 'unresolved';
   logicalDefinitionId?: string;
   logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
   definitionFingerprint?: string;
   candidateId?: string;
+  tenantId?: string;
+  ownerId?: string;
+  environmentId?: string;
+  profile?: string;
+  profileVersion?: string;
   terminalContextIds?: string[];
   product: string;
   displayName: string;
@@ -2100,6 +2122,203 @@ export interface AgentConversationDirectoryListV4
   extends Omit<AgentConversationDirectoryListV3, 'apiVersion' | 'items'> {
   apiVersion: 4;
   items: LogicalAgentConversationDirectoryItemV4[];
+}
+
+/**
+ * Versioned, metadata-only resources exposed by the additive Canonical GET API.  These are
+ * deliberately separate from the legacy dashboard records above: the latter may contain
+ * compatibility aliases and read-time aggregates, while Canonical resources always carry an
+ * explicit resolution revision, bounded pagination and coverage information.
+ */
+export interface CanonicalEntityCoverage {
+  status: 'complete' | 'partial' | 'unknown';
+  reasons: string[];
+  source: string;
+}
+
+export interface CanonicalEntityPagination {
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+  nextCursor?: string;
+}
+
+export interface CanonicalLogicalAgentResource {
+  schemaVersion: 'anysentry.logical_agent.v1';
+  logicalAgentId: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: LogicalAgentConversationDirectoryItem['logicalScopeMode'];
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  definitionFingerprint?: string;
+  identityQuality: 'confirmed' | 'strong' | 'inferred' | 'candidate' | 'unresolved';
+  family: string;
+  product: string;
+  displayName: string;
+  tenantId?: string;
+  ownerId?: string;
+  workspacePath: string;
+  environment: LogicalAgentConversationDirectoryItem['environment'];
+  lifecycleState: LogicalAgentConversationDirectoryItem['lifecycleState'];
+  terminalContextIds: string[];
+  agentAssetIds: string[];
+  agentInstanceIds: string[];
+  sessionIds: string[];
+  activeInstanceCount: number;
+  totalInstanceCount: number;
+  conversationCount: number;
+  usage: AgentUsageSummary;
+  coverage: AgentConversationCoverage;
+  sourceRefs: string[];
+  resolutionRevision: number;
+}
+
+export interface CanonicalAgentInstanceResource {
+  schemaVersion: 'anysentry.agent_instance.v1';
+  agentInstanceId: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: LogicalAgentConversationDirectoryItem['logicalScopeMode'];
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  agentProduct?: string;
+  displayName?: string;
+  environment?: LogicalAgentConversationDirectoryItem['environment'];
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  terminalContextIds: string[];
+  runtimeInstanceIds: string[];
+  sessionIds: string[];
+  state: AgentRuntimeState;
+  startedAtUnixNs: string;
+  endedAtUnixNs?: string;
+  lastSeenAtUnixNs: string;
+  sourceRefs: string[];
+  coverage: CanonicalEntityCoverage;
+  detectedClassification?: AgentClassification;
+  effectiveClassification?: AgentClassification;
+  candidateAutoPromoted?: boolean;
+  resolutionRevision: number;
+}
+
+export interface CanonicalRuntimeInstanceResource {
+  schemaVersion: 'anysentry.runtime_instance.v1';
+  runtimeInstanceId: string;
+  agentInstanceId?: string;
+  legacyAgentInstanceId: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: LogicalAgentConversationDirectoryItem['logicalScopeMode'];
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  agentProduct?: string;
+  displayName?: string;
+  environment: LogicalAgentConversationDirectoryItem['environment'];
+  hostId: string;
+  bootId: string;
+  rootPid: number;
+  rootStartTimeTicks: string;
+  processGenerationKeys: string[];
+  workspacePath?: string;
+  workloadRef?: AgentWorkloadRef;
+  terminalContextId?: string;
+  sshConnectionId?: string;
+  state: AgentRuntimeState;
+  activityState?: AgentActivityState;
+  startedAtUnixNs: string;
+  endedAtUnixNs?: string;
+  lastSeenAtUnixNs: string;
+  sourceRefs: string[];
+  coverage: CanonicalEntityCoverage;
+  detectedClassification?: AgentClassification;
+  effectiveClassification?: AgentClassification;
+  candidateAutoPromoted?: boolean;
+  resolutionRevision: number;
+}
+
+export interface CanonicalSessionResource {
+  schemaVersion: 'anysentry.session.v1';
+  sessionId: string;
+  canonicalSessionId?: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  conversationId?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: LogicalAgentConversationDirectoryItem['logicalScopeMode'];
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  tenantId?: string;
+  ownerId?: string;
+  agentProduct?: string;
+  environment?: LogicalAgentConversationDirectoryItem['environment'];
+  workspacePath?: string;
+  agentInstanceIds: string[];
+  segmentIds: string[];
+  interactionIds: string[];
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  sessionIdentityQuality?: SessionIdentityQuality;
+  sessionMode?: AgentConversationSummary['sessionMode'];
+  sessionLifecycle?: AgentConversationSummary['sessionLifecycle'];
+  startedAtUnixNs?: string;
+  lastActivityAtUnixNs?: string;
+  turnCount: number;
+  modelCallCount: number;
+  toolCallCount: number;
+  toolResultCount: number;
+  errorCount: number;
+  usage: AgentUsageSummary;
+  coverage: AgentConversationCoverage;
+  sourceRefs: string[];
+  resolutionRevision: number;
+}
+
+export interface CanonicalLogicalAgentList {
+  schemaVersion: 'anysentry.logical_agent.list.v1';
+  items: CanonicalLogicalAgentResource[];
+  total: number;
+  pagination: CanonicalEntityPagination;
+  revision: number;
+  coverage: CanonicalEntityCoverage;
+  dataSource: string;
+  updateTime: string;
+}
+
+export interface CanonicalAgentInstanceList {
+  schemaVersion: 'anysentry.agent_instance.list.v1';
+  items: CanonicalAgentInstanceResource[];
+  total: number;
+  pagination: CanonicalEntityPagination;
+  revision: number;
+  coverage: CanonicalEntityCoverage;
+  dataSource: string;
+  updateTime: string;
+}
+
+export interface CanonicalRuntimeInstanceList {
+  schemaVersion: 'anysentry.runtime_instance.list.v1';
+  items: CanonicalRuntimeInstanceResource[];
+  total: number;
+  pagination: CanonicalEntityPagination;
+  revision: number;
+  coverage: CanonicalEntityCoverage;
+  dataSource: string;
+  updateTime: string;
+}
+
+export interface CanonicalSessionList {
+  schemaVersion: 'anysentry.session.list.v1';
+  items: CanonicalSessionResource[];
+  total: number;
+  pagination: CanonicalEntityPagination;
+  revision: number;
+  coverage: CanonicalEntityCoverage;
+  dataSource: string;
+  updateTime: string;
 }
 
 export type AgentConversationEventKind =

@@ -29,7 +29,11 @@ for (const category of [
 ]) {
   assert(builtins.some((rule) => rule.category === category), `missing builtin category ${category}`);
 }
-assert.equal(builtins.filter((rule) => rule.ruleKind === 'runtime_signature').length, 6);
+assert.equal(
+  builtins.filter((rule) => rule.ruleKind === 'runtime_signature').length,
+  7,
+  'runtime signature count follows the current versioned builtin registry',
+);
 assert.equal(Object.keys(CAPTURE_PROFILE_ACTIONS).length, 8);
 for (const actions of Object.values(CAPTURE_PROFILE_ACTIONS)) {
   assert.equal(actions.exec, 'full');
@@ -137,7 +141,7 @@ assert.equal(expiredReceipt.winner, undefined);
 assert.equal(expiredReceipt.failOpen, true);
 
 const projection = compileFilterRuleProjection({ rules: builtins, catalogVersion: 7, domainVersions: versions, now: 1_787_630_000_000 });
-assert.equal(projection.runtimeSignatures.runtimes.length, 6);
+assert.equal(projection.runtimeSignatures.runtimes.length, 7);
 assert.equal(projection.runtimeSignatures.runtimes.find((runtime) => runtime.id === 'codex')?.ruleId, codex.ruleId);
 assert.equal(projection.captureProfiles.agent_full.file_access, 'full');
 assert.equal(projection.captureProfiles.infrastructure_aggregate.file_access, 'aggregate');

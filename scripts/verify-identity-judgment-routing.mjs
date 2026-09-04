@@ -3,7 +3,11 @@ import { createRequire } from 'node:module';
 import { readFile } from 'node:fs/promises';
 
 const require = createRequire(import.meta.url);
-const { resolveJudgmentRoute } = require('../apps/api/dist/security-monitoring/identity-judgment-routing.js');
+const {
+  resolveJudgmentRoute,
+  candidateAutoPromotionEnabled,
+  captureClassificationDecision,
+} = require('../apps/api/dist/security-monitoring/identity-judgment-routing.js');
 const { buildFastAcl, sanitizePolicy } = require('../apps/api/dist/security-monitoring/policy-config.js');
 const { Sentry, fileAccess } = require('../apps/api/node_modules/@a3s-lab/sentry');
 
@@ -22,7 +26,30 @@ assert.equal(resolveJudgmentRoute(undefined, policy).reason, 'unknown_l1_only');
 assert.equal(resolveJudgmentRoute('non_agent', policy).profile, 'discard');
 
 const candidateL1 = sanitizePolicy({ identity: { candidatePipeline: 'l1_only' } });
-assert.equal(resolveJudgmentRoute('probable_agent', candidateL1).reason, 'candidate_agent_l1_only');
+const candidateDefaultRoute = resolveJudgmentRoute('probable_agent', candidateL1);
+assert.equal(candidateDefaultRoute.profile, 'full',
+  'candidate defaults to the same full capture/judgment route as confirmed Agent');
+assert.equal(candidateDefaultRoute.effectiveClassification, 'confirmed_agent');
+assert.equal(candidateDefaultRoute.candidateAutoPromoted, true);
+assert.equal(candidateAutoPromotionEnabled(), true);
+assert.deepEqual(captureClassificationDecision('probable_agent'), {
+  observed: 'probable_agent', effective: 'confirmed_agent', candidateAutoPromoted: true,
+  source: 'candidate_auto_promoted',
+});
+
+// The historical lower-cost route remains an explicit production opt-out, never an implicit
+// consequence of merely being a candidate.  Restore the caller's environment after the check.
+const previousCandidateMode = process.env.ANYSENTRY_CANDIDATE_EFFECTIVE_MODE;
+process.env.ANYSENTRY_CANDIDATE_EFFECTIVE_MODE = 'probable';
+try {
+  const legacyCandidateRoute = resolveJudgmentRoute('probable_agent', candidateL1);
+  assert.equal(legacyCandidateRoute.profile, 'l1_only');
+  assert.equal(legacyCandidateRoute.reason, 'candidate_agent_l1_only');
+  assert.equal(legacyCandidateRoute.effectiveClassification, undefined);
+} finally {
+  if (previousCandidateMode === undefined) delete process.env.ANYSENTRY_CANDIDATE_EFFECTIVE_MODE;
+  else process.env.ANYSENTRY_CANDIDATE_EFFECTIVE_MODE = previousCandidateMode;
+}
 
 const full = sanitizePolicy({
   identity: { candidatePipeline: 'full' },

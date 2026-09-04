@@ -54,6 +54,7 @@ import {
   visibleProcessContext,
   visibleUnknownReasonCounts,
 } from './classification-semantics';
+import { captureClassificationDecision } from './identity-judgment-routing';
 import { parseTrustedCorrelation } from './trusted-correlation';
 import {
   buildToolEvidenceBundle,
@@ -1746,7 +1747,10 @@ export class AggregationService implements OnModuleDestroy {
       // never reuse a historical manual non-Agent attribution as the current automatic result.
       return 'unknown';
     }
-    return agentResolved.effectiveClassification;
+    // A probable candidate receives the same effective capture/read route as a confirmed Agent by
+    // default.  Keep `detectedClassification` on the event and interaction so this projection is
+    // auditable; this mapping never creates a LogicalAgent or Session identity.
+    return captureClassificationDecision(agentResolved.effectiveClassification).effective;
   }
 
   private eventIsAgentForView(event: T.JudgedEvent, filter: T.SecurityTimeFilter): boolean {
@@ -1829,11 +1833,26 @@ export class AggregationService implements OnModuleDestroy {
     const resolved = this.agentMetadata.resolveEvent(e);
     const asObservedClassification = detected.detectedClassification;
     const currentEffectiveClassification = this.currentEffectiveClassification(e, resolved);
+    const candidateAutoPromoted = asObservedClassification === 'probable_agent'
+      && currentEffectiveClassification === 'confirmed_agent'
+      && resolved.reviewRevision === undefined;
     const correlationVisible = correlationCaptureRollout().trustedCorrelation !== 'off';
     const correlation = correlationVisible
       ? parseTrustedCorrelation(e.attribution?.correlation)
       : undefined;
-    const classificationSemantics = visibleClassificationSemantics(e.classificationSemantics);
+    const rawClassificationSemantics = visibleClassificationSemantics(e.classificationSemantics);
+    // Producer S3 fields are observational hints. Recompute the effective capture view at the
+    // server boundary so a producer cannot forge promotion, while preserving the original
+    // probable classification and an auditable reason.
+    const classificationSemantics = rawClassificationSemantics
+      ? {
+          ...rawClassificationSemantics,
+          effectiveIdentityClassification: currentEffectiveClassification,
+          classificationSource: candidateAutoPromoted
+            ? 'candidate_auto_promoted' as const
+            : 'observed' as const,
+        }
+      : undefined;
     const attribution = !e.attribution
       ? undefined
       : correlation
@@ -1882,6 +1901,7 @@ export class AggregationService implements OnModuleDestroy {
       detectedClassification: resolved.detectedClassification,
       asObservedClassification,
       currentEffectiveClassification,
+      ...(candidateAutoPromoted ? { candidateAutoPromoted: true } : {}),
       effectiveClassification: classificationView === 'current_effective'
         ? currentEffectiveClassification
         : asObservedClassification,
@@ -2872,7 +2892,15 @@ export class AggregationService implements OnModuleDestroy {
     const items = [...merged.values()]
       .map((item): T.AgentInteractionRecord => {
         const review = currentView ? this.assetReviews?.current(item.agentAssetId) : undefined;
-        return review ? { ...item, currentEffectiveClassification: review.decision } : item;
+        const automatic = captureClassificationDecision(item.detectedClassification);
+        const currentEffectiveClassification = review?.decision ?? automatic.effective;
+        const candidateAutoPromoted = !review
+          && automatic.candidateAutoPromoted;
+        return {
+          ...item,
+          currentEffectiveClassification,
+          ...(candidateAutoPromoted ? { candidateAutoPromoted: true } : {}),
+        };
       })
       .filter((item) =>
         // `interactionId` is the globally unique immutable fact key. Asset and Runtime instance

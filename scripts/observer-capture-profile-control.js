@@ -29,12 +29,10 @@ const PROFILE_PROBE_ACTIONS = Object.freeze({
   agent_full: ALL_FULL_PROBE_ACTIONS,
   investigation_full: ALL_FULL_PROBE_ACTIONS,
   probable_investigation: Object.freeze({
-    exec: 'full', exit: 'full', tls: 'sample', connect: 'sample', dns: 'sample',
-    // Once a process signature identifies an Agent, TLS plaintext is the primary observable. A
-    // streamed Rustls conversation can consume the shared sample budget on its first response;
-    // sampling here therefore makes later turns disappear even though the process remains alive.
-    // Keep this one content channel lossless for the bounded candidate profile.
-    file_access: 'sample', file_delete: 'sample', llm: 'full', ssl: 'full', security: 'full', file_read: 'full',
+    // Candidate is a discovery label, not a lower-fidelity capture class. Keep the complete
+    // bounded matrix so later review has the same Kernel/TLS evidence as a confirmed Agent.
+    exec: 'full', exit: 'full', tls: 'full', connect: 'full', dns: 'full',
+    file_access: 'full', file_delete: 'full', llm: 'full', ssl: 'full', security: 'full', file_read: 'full',
   }),
   security_full: Object.freeze({
     exec: 'full', exit: 'full', tls: 'sample', connect: 'full', dns: 'sample',
@@ -57,6 +55,17 @@ const PROFILE_PROBE_ACTIONS = Object.freeze({
     file_access: 'aggregate', file_delete: 'sample', llm: 'aggregate', ssl: 'aggregate', security: 'full', file_read: 'not_enabled',
   }),
 });
+const LEGACY_PROBABLE_PROBE_ACTIONS = Object.freeze({
+  exec: 'full', exit: 'full', tls: 'sample', connect: 'sample', dns: 'sample',
+  file_access: 'sample', file_delete: 'sample', llm: 'full', ssl: 'full', security: 'full', file_read: 'full',
+});
+
+function candidateAutoPromotionEnabled(env = process.env) {
+  const mode = typeof env?.ANYSENTRY_CANDIDATE_EFFECTIVE_MODE === 'string'
+    ? env.ANYSENTRY_CANDIDATE_EFFECTIVE_MODE.trim().toLowerCase()
+    : '';
+  return !['probable', 'candidate', 'off', 'legacy'].includes(mode);
+}
 
 function text(value) {
   return typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
@@ -101,7 +110,10 @@ function eventKind(observerEvent) {
   return Object.keys(events)[0] || '';
 }
 
-function captureProfileActions(profile) {
+function captureProfileActions(profile, options = {}) {
+  if (profile === 'probable_investigation' && !candidateAutoPromotionEnabled(options.env ?? process.env)) {
+    return { ...LEGACY_PROBABLE_PROBE_ACTIONS };
+  }
   return { ...(PROFILE_PROBE_ACTIONS[profile] ?? PROFILE_PROBE_ACTIONS.unknown_discovery) };
 }
 
@@ -180,6 +192,9 @@ function rootProcessFields(classification, observerEvent) {
 function compileCaptureDecision(observerEvent, classification, input, options = {}) {
   if (!input) return undefined;
   const semantics = resolveClassificationSemantics(classification, observerEvent);
+  const candidateAutoPromoted = semantics.identityClassification === 'probable_agent'
+    && candidateAutoPromotionEnabled()
+    && semantics.captureProfile === 'agent_full';
   const processRoot = rootProcessFields(classification, observerEvent);
   const attribution = classification?.attribution && typeof classification.attribution === 'object'
     ? classification.attribution
@@ -196,6 +211,7 @@ function compileCaptureDecision(observerEvent, classification, input, options = 
     ? options.promotionExpiresAt
     : now + boundedNumber(options.riskPromotionTtlMs, 300_000, 1_000, 24 * 60 * 60_000);
   let captureProfile = CAPTURE_PROFILES.has(input.captureProfile) ? input.captureProfile : semantics.captureProfile;
+  if (candidateAutoPromoted && captureProfile === 'probable_investigation') captureProfile = 'agent_full';
   if (conflict || semantics.identityClassification === 'confirmed_agent') {
     captureProfile = 'agent_full';
   }
@@ -270,6 +286,11 @@ function compileCaptureDecision(observerEvent, classification, input, options = 
     ...(riskPromotion ? {
       promotionReason: 'risk_signal',
       promotionExpiresAt: new Date(promotionExpiresAt).toISOString(),
+    } : {}),
+    ...(candidateAutoPromoted ? {
+      observedClassification: 'probable_agent',
+      effectiveClassification: 'confirmed_agent',
+      classificationSource: 'candidate_auto_promoted',
     } : {}),
     expiresAt,
   };
@@ -399,6 +420,7 @@ function supportsCaptureProfileCapabilities(value) {
 
 module.exports = {
   ALL_FULL_PROBE_ACTIONS,
+  LEGACY_PROBABLE_PROBE_ACTIONS,
   SHADOW_SAFE_PROBE_ACTIONS,
   CAPTURE_PROFILE_ACK_SCHEMA,
   CAPTURE_PROFILE_CAPABILITIES,
@@ -415,6 +437,7 @@ module.exports = {
   captureIntentProjection,
   captureProfileActions,
   captureSnapshotContentHash,
+  candidateAutoPromotionEnabled,
   compileCaptureDecision,
   completeMaterializationIdentity,
   digest,
