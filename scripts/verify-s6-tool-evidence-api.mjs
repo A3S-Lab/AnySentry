@@ -490,7 +490,8 @@ const otlpIngest = await request('/ingest/otlp/v1/traces', 'POST', {
           stringAttr('gen_ai.operation.name', 'execute_tool'),
           stringAttr('gen_ai.tool.name', 'write'),
           stringAttr('gen_ai.tool.call.id', otlpToolCallId),
-          stringAttr('anysentry.endpoint', 'python-sandbox:8080/execute?token=should-not-persist'),
+          stringAttr('anysentry.endpoint', 'python-sandbox:8080/execute?token=should-not-persist#fragment-must-not-persist'),
+          stringAttr('server.address', 'user:password@private-sandbox:9443/private?opaque=must-not-persist#fragment'),
           stringAttr('anysentry.run.id', otlpRunId),
           stringAttr('gen_ai.tool.call.arguments', '{"path":"/secret","content":"never-persist-this"}'),
           stringAttr('anysentry.invocation.id', otlpInvocationId),
@@ -540,6 +541,76 @@ assert.equal(otlpToolEvent.items[0].eventCategory, 'tool');
 assert.equal(otlpToolEvent.items[0].traceId, otlpTraceId);
 assert.equal(otlpToolEvent.items[0].attributes['gen_ai.tool.call.arguments'], '[redacted]');
 assert.equal(otlpToolEvent.items[0].runId, otlpRunId, 'namespaced run id must remain a producer run across OTLP spans');
+assert.equal(otlpToolEvent.items[0].attributes['anysentry.endpoint'], 'python-sandbox:8080/execute',
+  'endpoint attributes retain host/port/path while dropping URL query and fragment');
+assert.equal(otlpToolEvent.items[0].attributes['server.address'], 'private-sandbox:9443/private',
+  'URL userinfo/query/fragment are removed from generic address attributes');
+const persistedToolText = JSON.stringify({
+  attributes: otlpToolEvent.items[0].attributes,
+  rawPreview: otlpToolEvent.items[0].rawPreview,
+});
+assert(!persistedToolText.includes('should-not-persist'), 'endpoint query token must not reach JudgedEvent attributes/rawPreview');
+assert(!persistedToolText.includes('fragment-must-not-persist'), 'endpoint fragment must not reach JudgedEvent attributes/rawPreview');
+assert(!persistedToolText.includes('password@'), 'endpoint userinfo must not reach JudgedEvent attributes/rawPreview');
+
+// Exercise the direct EventMeta rawPreview path as well as OTLP attribute normalization. This
+// endpoint contains a non-standard query key and authority credentials deliberately; both must be
+// removed before the compatibility JudgedEvent is persisted.
+const privacyProbeId = `${runId}-endpoint-privacy-probe`;
+const privacyProbeEndpoint = 'https://probe-user:probe-password@private-sandbox:9443/private?opaque=must-not-persist#fragment';
+const privacyProbeIngest = await request('/ingest/events', 'POST', {
+  sourceId: otlpSource.source.sourceId,
+  sourceType: 'otel',
+  workspacePath: otlpWorkspace,
+  events: [{
+    id: privacyProbeId,
+    eventKind: 'Egress',
+    eventCategory: 'network',
+    workspacePath: otlpWorkspace,
+    agentId: 'pi-otel',
+    peer: privacyProbeEndpoint,
+    rawPreview: JSON.stringify({ endpoint: privacyProbeEndpoint }),
+    attributes: { 'anysentry.endpoint': privacyProbeEndpoint },
+  }],
+}, sourceHeaders(otlpSource));
+assert.equal(privacyProbeIngest.acceptedEvents, 1, 'endpoint privacy probe is accepted');
+const privacyProbeEvent = await request('/events/list', 'POST', {
+  timeType: 'last_30d',
+  eventId: privacyProbeIngest.items[0].eventId,
+  durable: false,
+  includeUnknown: true,
+  limit: 1,
+});
+const privacyProbeRecord = privacyProbeEvent.items?.[0];
+assert(privacyProbeRecord, 'endpoint privacy probe is readable by event id');
+assert.equal(privacyProbeRecord.attributes['anysentry.endpoint'], 'https://private-sandbox:9443/private',
+  'direct endpoint attributes retain scheme/host/port/path only');
+const privacyProbeText = JSON.stringify(privacyProbeRecord.rawPreview ?? '');
+assert(!privacyProbeText.includes('must-not-persist'), 'direct rawPreview must not retain endpoint query/fragment');
+assert(!privacyProbeText.includes('probe-password@'), 'direct rawPreview must not retain endpoint userinfo');
+
+const otlpEventRecords = [];
+for (const item of otlpIngest.items) {
+  const event = item.eventId === otlpIngest.items[1].eventId
+    ? otlpToolEvent.items[0]
+    : await request('/events/list', 'POST', {
+        timeType: 'custom',
+        startTime: new Date(otlpStart - 2_000).toISOString(),
+        endTime: new Date(otlpEnd + 2_000).toISOString(),
+        eventId: item.eventId,
+        durable: false,
+        includeUnknown: true,
+        limit: 1,
+      });
+  if (event.items?.[0]) otlpEventRecords.push(event.items[0]);
+}
+assert.equal(otlpEventRecords.length, otlpIngest.items.length, 'every OTLP span must be readable by its event id');
+assert(otlpEventRecords.every((item) => typeof item.sessionId === 'string' && item.sessionId.length > 0),
+  'every OTLP span must retain a canonical Session id');
+assert.equal(new Set(otlpEventRecords.map((item) => item.sessionId)).size, 1,
+  'spans from one stateless request/run share one bounded Session');
+assert(otlpEventRecords.every((item) => item.sessionMode === 'per_request'),
+  'service spans without a provider thread use per-request Session mode');
 
 // The compatibility Conversation projection must retain generic GenAI tool hints and close a
 // completed single-span execute_tool without copying its arguments/result body.
@@ -559,6 +630,10 @@ assert.equal(projected.endpoint, 'http://python-sandbox:8080/execute', 'endpoint
 assert.equal(projected.toolResults.length, 1, 'a completed execute_tool span must emit one reference-only ToolResult');
 assert.equal(projected.toolResults[0].isError, false);
 assert.equal(projected.runId, otlpRunId, 'run identity must not fall back to an event-local derived id');
+const projectedInvocation = semanticInteractions.items.find((item) =>
+  item.runId === otlpRunId && item.toolCalls?.length === 0);
+assert.equal(projectedInvocation?.trafficRole, 'background',
+  'adapter invocation/control metadata must not inflate the human Conversation count');
 
 await disableCreatedSources();
 console.log('S6 trusted Tool evidence API E2E passed');

@@ -1503,6 +1503,7 @@ function semanticToolHints(event: T.JudgedEvent): {
       const opaque = rawEndpoint
         ?.replace(/^[a-z][a-z0-9+.-]*:\/\//iu, '')
         .split(/[?#]/u)[0]
+        .replace(/^[^/@]+@/u, '')
         .replace(/[\s"'`,;]/gu, '')
         .slice(0, 240);
       if (opaque) endpoint = `http://${opaque}${boundedPort && !/:\d{1,5}$/u.test(opaque) ? `:${boundedPort}` : ''}`;
@@ -1562,6 +1563,50 @@ function semanticToolResultMarker(
     ...(hints.exitCode !== undefined ? { exitCode: hints.exitCode } : {}),
     ...(hints.isError ? { isError: true } : {}),
   };
+}
+
+function semanticTrafficRole(
+  event: T.JudgedEvent,
+  normalizedKind: string,
+  hasHumanOrToolContent: boolean,
+): NonNullable<T.AgentInteractionRecord['trafficRole']> {
+  const explicit = attrText(
+    event.attributes ?? {},
+    'anysentry.traffic.role',
+    'traffic.role',
+    'agent.traffic.role',
+  )?.toLowerCase();
+  const roles = new Set<NonNullable<T.AgentInteractionRecord['trafficRole']>>([
+    'conversation', 'bootstrap', 'control', 'context_replay', 'tool_backend',
+    'derived_metadata', 'retry', 'background', 'unclassified',
+  ]);
+  if (explicit && roles.has(explicit as NonNullable<T.AgentInteractionRecord['trafficRole']>)) {
+    return explicit as NonNullable<T.AgentInteractionRecord['trafficRole']>;
+  }
+  const operation = attrText(
+    event.attributes ?? {},
+    'gen_ai.operation.name',
+    'rpc.method',
+    'http.route',
+    'operation.name',
+  )?.toLowerCase() ?? '';
+  if (/(?:^|[/:.])initialize$|tools?\/list|list_tools|bootstrap|capabilit(?:y|ies)/iu.test(operation)) {
+    return /bootstrap/iu.test(operation) ? 'bootstrap' : 'control';
+  }
+  if (/(?:initialize|tools?\/list|list_tools|bootstrap|capabilit(?:y|ies))/iu.test(normalizedKind)) {
+    return /bootstrap/iu.test(normalizedKind) ? 'bootstrap' : 'control';
+  }
+  if (hasHumanOrToolContent) return 'conversation';
+  if (['agentinvocation', 'noderun', 'workflow_node', 'workflownode', 'node_run'].includes(normalizedKind)) {
+    return 'background';
+  }
+  // A model/API span with a trusted run/session anchor can still be part of the human-visible
+  // turn; an anchor-free infrastructure span is safer as technical activity than as a new thread.
+  if (['llmapi', 'llmcall', 'llminteraction', 'llm_response', 'llmresponse'].includes(normalizedKind)
+    && (event.runId || event.turnId || event.sessionId || event.canonicalSessionId)) {
+    return 'conversation';
+  }
+  return 'background';
 }
 
 function canonicalSemanticRecordForEvent(
@@ -1667,8 +1712,13 @@ function canonicalSemanticRecordForEvent(
     ...(event.environmentId ? { environmentId: event.environmentId } : {}),
     ...(event.terminalContextId ? { terminalContextId: event.terminalContextId } : {}),
     ...(role ? { role } : {}),
-    completeness: event.rawObservationId ? 'complete' : 'partial',
-    partialReasons: event.rawObservationId ? [] : ['raw_observation_missing'],
+    // The RawObservation may be complete while this compatibility record intentionally carries
+    // only reference markers. Keep semantic completeness independent from raw commit status.
+    completeness: 'partial',
+    partialReasons: [
+      'application_semantic_reference_only',
+      ...(event.rawObservationId ? [] : ['raw_observation_missing']),
+    ],
     payloadRef: `sha256:${payloadHash}`,
   };
   if (kind !== 'tool_call' || !semanticToolCallId || !toolHints.completed) return [baseRecord];
@@ -1810,6 +1860,11 @@ function canonicalInteractionForSemanticEvent(event: T.JudgedEvent): T.AgentInte
     : toolCallEvent ? 'tool_call'
       : toolResultEvent ? 'tool_result'
         : modelMessage ? 'model_final' : 'model_progress';
+  const trafficRole = semanticTrafficRole(
+    event,
+    normalizedKind,
+    userMessage || toolCallEvent || toolResultEvent,
+  );
   return {
     schemaVersion: 'anysentry.agent_interaction.v1',
     interactionId: `mi_${createHash('sha256').update(`application-semantic\0${event.eventId}`).digest('hex').slice(0, 24)}`,
@@ -1863,7 +1918,7 @@ function canonicalInteractionForSemanticEvent(event: T.JudgedEvent): T.AgentInte
     providerSessionIdHash: event.providerSessionIdHash,
     invocationId: event.invocationId,
     providerConversationId: event.sessionIdSource === 'provider' ? event.sessionId : undefined,
-    trafficRole: 'conversation',
+    trafficRole,
     evidenceEventIds: [event.eventId],
     conversationId,
     conversationIdSource: event.sessionIdSource === 'provider' ? 'provider' : 'inferred',
@@ -1994,7 +2049,10 @@ function canonicalEvidenceLinksForRelations(
       evidenceRefs: [...(relation.sourceRefs ?? []), relation.stableSemanticEventId],
       algorithmVersion: relation.algorithmVersion ?? `semantic-kernel-relation.v${relation.relationVersion}`,
       status,
-      validFromUnixNs: relation.validFromUnixNs ?? '1',
+      // Legacy relation rows may not carry a canonical timestamp. Keep the EvidenceLink valid
+      // under the Unix-ns contract while exposing the relation's source refs/revision; this
+      // synthetic epoch is never presented as measured event time.
+      validFromUnixNs: relation.validFromUnixNs ?? '1000000000',
       resolutionRevision: relation.relationRevision ?? relation.resolutionRevision,
     });
   });
@@ -2083,9 +2141,116 @@ function redact(s: string): string {
     .replace(/sk-[A-Za-z0-9_-]{12,}/g, 'sk-[redacted]');
 }
 
+// Endpoint-bearing attributes are a separate privacy boundary from ordinary text.  A producer
+// may put a bearer/API token in URL userinfo or in an arbitrary query parameter name, so key-name
+// redaction alone is insufficient.  Keep only the transport scheme (when present), host, explicit
+// port and path; never persist URL query, fragment or authority userinfo.  The key set is generic
+// and intentionally contains no product/version names.
+function endpointAttributeKey(key?: string): boolean {
+  if (!key) return false;
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  if (['endpoint', 'url', 'uri', 'peer', 'sni', 'target', 'host', 'hostname', 'address', 'destination'].includes(normalized)) {
+    return true;
+  }
+  return /(?:^|_)(?:endpoint|url|uri|server_address|net_peer_name|net_peer_address|network_peer_address|peer_service|tool_endpoint|rpc_service|destination_address)(?:_|$)/u.test(normalized);
+}
+
+function endpointLooksStructured(value: string): boolean {
+  // Plain service names (for example `peer.service=worker`) should remain readable.  Parse only
+  // values that carry URL structure or an authority/path delimiter; this also catches malformed
+  // endpoint strings so the fallback can still remove userinfo/query safely.
+  return /(?:^[a-z][a-z0-9+.-]*:\/\/|^[^/?#\s]+:\d{1,5}(?:[/?#]|$)|[/?#@])/iu.test(value);
+}
+
+function stripEndpointDecorations(value: string): string {
+  const cleaned = value
+    .replace(/[\u0000-\u001f\u007f"'`,;]/gu, '')
+    .split(/[?#]/u)[0]
+    .trim();
+  const scheme = cleaned.match(/^([a-z][a-z0-9+.-]*:\/\/)(.*)$/iu);
+  const prefix = scheme?.[1] ?? '';
+  let rest = scheme?.[2] ?? cleaned;
+  const authorityEnd = rest.search(/[\/]/u);
+  const authority = authorityEnd >= 0 ? rest.slice(0, authorityEnd) : rest;
+  const path = authorityEnd >= 0 ? rest.slice(authorityEnd) : '';
+  const userInfoAt = authority.lastIndexOf('@');
+  if (userInfoAt >= 0) rest = `${authority.slice(userInfoAt + 1)}${path}`;
+  return `${prefix}${rest}`.slice(0, 240);
+}
+
+function sanitizeEndpointAttributeValue(value: string, key?: string): string {
+  const text = value.trim().replace(/[\u0000-\u001f\u007f]/gu, '').slice(0, 1_000);
+  if (!endpointAttributeKey(key) || !endpointLooksStructured(text)) return text.slice(0, 240);
+  const explicitScheme = /^[a-z][a-z0-9+.-]*:\/\//iu.test(text);
+  const candidate = explicitScheme ? text : `http://${text}`;
+  try {
+    const parsed = new URL(candidate);
+    const host = parsed.hostname.trim();
+    if (!host) return stripEndpointDecorations(text);
+    const protocol = explicitScheme ? parsed.protocol.replace(/:$/u, '') : '';
+    // WHATWG URL omits default ports. Recover an explicitly supplied port so the endpoint's
+    // network identity remains useful for correlation while still validating its range.
+    const authority = candidate.match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/iu)?.[1] ?? '';
+    const authorityWithoutUser = authority.slice(authority.lastIndexOf('@') + 1);
+    const explicitPort = authorityWithoutUser.match(/:(\d{1,5})$/u)?.[1];
+    const portNumber = Number(parsed.port || explicitPort || '');
+    const port = Number.isInteger(portNumber) && portNumber > 0 && portNumber <= 65_535
+      ? String(portNumber) : '';
+    const pathname = parsed.pathname && parsed.pathname !== '/'
+      ? parsed.pathname.slice(0, 240)
+      : parsed.pathname === '/' ? '/' : '';
+    return `${protocol ? `${protocol}://` : ''}${host}${port ? `:${port}` : ''}${pathname}`.slice(0, 240);
+  } catch {
+    return stripEndpointDecorations(text);
+  }
+}
+
+function sanitizePreviewValue(value: unknown, key = '', depth = 0): unknown {
+  if (depth > 6) return '[depth-limited]';
+  if (typeof value === 'string') {
+    if (sensitiveAttributeKey(key)) return '[redacted]';
+    const redacted = redact(value);
+    return endpointAttributeKey(key) ? sanitizeEndpointAttributeValue(redacted, key) : sanitizeInlineEndpointLiterals(redacted).slice(0, 1_800);
+  }
+  if (Array.isArray(value)) return value.slice(0, 64).map((item) => sanitizePreviewValue(item, key, depth + 1));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .slice(0, 120)
+      .map(([childKey, childValue]) => [childKey, sanitizePreviewValue(childValue, childKey, depth + 1)]));
+  }
+  return value;
+}
+
+function sanitizeInlineEndpointLiterals(value: string): string {
+  return value.replace(/\b(?:[a-z][a-z0-9+.-]*:\/\/|\/\/)[^\s"'<>]+/giu, (match) => {
+    const trailing = match.match(/[)},.;]+$/u)?.[0] ?? '';
+    const core = trailing ? match.slice(0, -trailing.length) : match;
+    return `${sanitizeEndpointAttributeValue(core, 'endpoint')}${trailing}`;
+  });
+}
+
+function sanitizeRawPreview(value: unknown, limit = 1_800): string | undefined {
+  const source = typeof value === 'string' ? value : JSON.stringify(value);
+  if (!source) return undefined;
+  try {
+    const serialized = JSON.stringify(sanitizePreviewValue(JSON.parse(source)));
+    return serialized ? serialized.slice(0, limit) : undefined;
+  } catch {
+    // Most previews are JSON lines. For an opaque producer string, scrub obvious URL literals as
+    // a final bounded fallback; endpoint fields in parsed JSON take the key-aware path above.
+    const safe = sanitizeInlineEndpointLiterals(redact(source));
+    return safe.slice(0, limit);
+  }
+}
+
 function attrValue(v: unknown, key?: string): T.EventAttributeValue | undefined {
   if (key && sensitiveAttributeKey(key)) return '[redacted]';
-  if (typeof v === 'string') return redact(v).slice(0, 240);
+  if (typeof v === 'string') {
+    const redacted = redact(v);
+    return endpointAttributeKey(key)
+      ? sanitizeEndpointAttributeValue(redacted, key)
+      : redacted.slice(0, 240);
+  }
   if (typeof v === 'number' && Number.isFinite(v)) return v;
   if (typeof v === 'boolean') return v;
   return undefined;
@@ -2577,7 +2742,7 @@ function deriveMeta(line: string, given: Partial<T.EventMeta>): T.EventMeta {
     // with event time and capture decisions.
     process,
     attribution: given.attribution,
-    rawPreview: given.rawPreview ?? redact(line).slice(0, 1800),
+    rawPreview: sanitizeRawPreview(given.rawPreview ?? line),
     subject: given.subject ?? (isLlm ? `LLM 调用 → ${peer}` : summarize(eventKey, inner)),
     tokenCount: given.tokenCount ?? usage.total,
     latencyMs: given.latencyMs,
@@ -3514,18 +3679,27 @@ function eventInner(kind: string, input: T.UniversalIngestEvent): Record<string,
     };
   }
   if (kind === 'Egress') {
-    const peer = cleanString(input.peer ?? input.endpoint ?? eventAttr(input, 'peer') ?? eventAttr(input, 'endpoint'), 500) ?? 'unknown';
+    const peer = sanitizeEndpointAttributeValue(
+      cleanString(input.peer ?? input.endpoint ?? eventAttr(input, 'peer') ?? eventAttr(input, 'endpoint'), 500) ?? 'unknown',
+      'peer',
+    );
     const port = finiteNumber(input.port ?? eventAttr(input, 'port'));
     return { ...base, peer, ...(port !== undefined ? { port } : {}) };
   }
   if (kind === 'Dns') return { ...base, query: cleanString(input.query ?? input.peer ?? input.endpoint ?? eventAttr(input, 'query'), 500) ?? 'unknown' };
   if (kind === 'FileAccess' || kind === 'FileDelete') return { ...base, path: cleanString(input.path ?? eventAttr(input, 'path'), 800) ?? 'unknown' };
   if (kind === 'LlmCall') {
-    const endpoint = cleanString(input.sni ?? input.endpoint ?? input.peer ?? eventAttr(input, 'sni') ?? eventAttr(input, 'endpoint'), 500) ?? 'llm';
+    const endpoint = sanitizeEndpointAttributeValue(
+      cleanString(input.sni ?? input.endpoint ?? input.peer ?? eventAttr(input, 'sni') ?? eventAttr(input, 'endpoint'), 500) ?? 'llm',
+      'endpoint',
+    );
     return { ...base, sni: endpoint, peer: endpoint };
   }
   if (kind === 'LlmApi') {
-    const endpoint = cleanString(input.sni ?? input.endpoint ?? input.peer ?? eventAttr(input, 'sni') ?? eventAttr(input, 'endpoint'), 500) ?? 'llm';
+    const endpoint = sanitizeEndpointAttributeValue(
+      cleanString(input.sni ?? input.endpoint ?? input.peer ?? eventAttr(input, 'sni') ?? eventAttr(input, 'endpoint'), 500) ?? 'llm',
+      'endpoint',
+    );
     return {
       ...base,
       sni: endpoint,
@@ -3868,7 +4042,7 @@ function normalizeCloudEvent(body: T.UniversalIngestRequest & Record<string, unk
     runId: cleanString(data.runId ?? body.runId ?? envelope.id, 240),
     taskId: cleanString(data.taskId ?? body.taskId, 240),
     subject: cleanString(data.subject ?? envelope.subject ?? type, 500),
-    rawPreview: cleanString(redact(JSON.stringify({ ...envelope, token: undefined })), 1800),
+    rawPreview: sanitizeRawPreview({ ...envelope, token: undefined }),
     attributes: cloudEventAttributes(envelope, data, headers),
   };
   bindRawUniversalCorrelationClaims(event, {
@@ -3979,7 +4153,7 @@ function universalMeta(input: T.UniversalIngestEvent, defaults: T.UniversalInges
     subject: cleanString(input.subject ?? defaults.subject, 500),
     tokenCount: finiteNumber(input.tokenCount ?? defaults.tokenCount),
     latencyMs: finiteNumber(input.latencyMs ?? defaults.latencyMs),
-    rawPreview: cleanString(input.rawPreview ?? defaults.rawPreview, 1800),
+    rawPreview: sanitizeRawPreview(input.rawPreview ?? defaults.rawPreview),
     sourceEventId: cleanString(
       input.sourceEventId
         ?? input.id
@@ -4010,9 +4184,24 @@ function bindUniversalSessionIdentity(
     }
     return undefined;
   };
+  const explicitSessionId = input.sessionId
+    ?? defaults.sessionId
+    ?? attr(
+      'anysentry.session.id',
+      'gen_ai.conversation.id',
+      'conversation.id',
+      'conversation_id',
+      'thread.id',
+      'thread_id',
+      'session.id',
+    );
   const rawSessionId = strictIdentityText(
-    input.sessionId ?? defaults.sessionId
-      ?? (options.ignoreMetaSessionFallback ? undefined : meta.sessionId),
+    explicitSessionId
+      // A derived EventMeta session is only safe to reuse when an upstream provider explicitly
+      // marked it as such. Service/Pod/runtime IDs are intentionally never a Session fallback.
+      ?? (!options.ignoreMetaSessionFallback
+        && (meta.sessionIdSource === 'provider' || meta.sessionIdSource === 'authenticated_adapter')
+        ? meta.sessionId : undefined),
     512,
   );
   const providerClaimPresent = Boolean(
@@ -4023,7 +4212,11 @@ function bindUniversalSessionIdentity(
         ? rawSessionId : undefined)
       ?? ((defaults.sessionIdSource === 'provider' || defaults.sessionIdSource === 'authenticated_adapter')
         ? rawSessionId : undefined)
-      ?? attr('providerSessionId', 'provider_session_id', 'conversationId', 'conversation_id', 'threadId', 'thread_id'),
+      ?? attr(
+        'providerSessionId', 'provider_session_id', 'conversationId', 'conversation_id',
+        'threadId', 'thread_id', 'anysentry.session.id', 'gen_ai.conversation.id',
+        'conversation.id', 'session.id',
+      ),
   );
   const untrustedProviderClaim = options.allowProviderAnchor === false && providerClaimPresent;
   const providerSessionId = options.allowProviderAnchor === false ? undefined : strictIdentityText(
@@ -4034,7 +4227,11 @@ function bindUniversalSessionIdentity(
         ? input.sessionId : undefined)
       ?? ((defaults.sessionIdSource === 'provider' || defaults.sessionIdSource === 'authenticated_adapter')
         ? defaults.sessionId : undefined)
-      ?? attr('providerSessionId', 'provider_session_id', 'conversationId', 'conversation_id', 'threadId', 'thread_id'),
+      ?? attr(
+        'providerSessionId', 'provider_session_id', 'conversationId', 'conversation_id',
+        'threadId', 'thread_id', 'anysentry.session.id', 'gen_ai.conversation.id',
+        'conversation.id', 'session.id',
+      ),
     512,
   );
   const sessionId = strictIdentityText(
@@ -4070,8 +4267,17 @@ function bindUniversalSessionIdentity(
       : undefined);
   const serviceStatefulHint = serviceStateful !== undefined
     ? serviceStateful
-    : (meta.logicalScopeMode === 'workflow_definition' || meta.logicalScopeMode === 'service_definition')
-      && !providerSessionId ? false : undefined;
+    : false;
+  // A stateless service still needs one bounded Session per request/run. Prefer an authenticated
+  // invocation/run identity when no provider conversation/thread exists so all spans from one POST
+  // share a Session, while different requests (or events without either identity) remain separate.
+  const requestIdentity = strictIdentityText(
+    (providerSessionId ? explicitSessionId : undefined)
+      ?? meta.invocationId
+      ?? meta.runId
+      ?? meta.sourceEventId,
+    512,
+  );
   const sourceScopedNamespace = Boolean(
     typeof meta.attributes?.sourceId === 'string'
       && meta.attributes.sourceId.trim()
@@ -4098,8 +4304,8 @@ function bindUniversalSessionIdentity(
     sessionId,
     runtimeSessionId,
     serviceStateful: serviceStatefulHint,
-    requestId: meta.sourceEventId,
-    interactionId: meta.sourceEventId,
+    requestId: requestIdentity,
+    interactionId: requestIdentity ?? meta.sourceEventId,
     agentInstanceId: meta.attribution?.agentInstanceId,
     resume: input.resume ?? defaults.resume,
     fork: input.fork ?? defaults.fork,
@@ -5556,7 +5762,7 @@ function securityRuntimeGuardEvent(
     collectorId: cleanString(body.collectorId, 180),
     source: 'api',
     attributes: securityCapabilityAttributes(body, autonomy, stage),
-    rawPreview: cleanString(JSON.stringify({ ...body, token: undefined }), 1800),
+    rawPreview: sanitizeRawPreview({ ...body, token: undefined }),
   };
   if (stage === 'tool') {
     return {
@@ -5758,7 +5964,7 @@ function securityRuntimeGuardFallbackEvent(
       'progressive.guard.policyAction': risk.policyAction,
       ...(actionEventId ? { 'progressive.guard.actionEventId': actionEventId } : {}),
     },
-    rawPreview: cleanString(JSON.stringify({ ...body, token: undefined, event }), 1800),
+    rawPreview: sanitizeRawPreview({ ...body, token: undefined, event }),
   };
 }
 
@@ -6010,14 +6216,16 @@ function otlpRawCorrelationClaims(
     'k8s.pod.name',
     'process.executable.name',
   );
-  const resourceSession = body.sessionId ?? selectedRawAttribute(
+  const resourceSession = body.sessionId ?? body.conversationId ?? body.threadId ?? selectedRawAttribute(
     resourceAttrs,
     normalizedResourceAttrs,
     'anysentry.session.id',
     'gen_ai.conversation.id',
+    'conversation.id',
+    'conversation_id',
+    'thread.id',
+    'thread_id',
     'session.id',
-    'service.instance.id',
-    'k8s.pod.uid',
   );
   return {
     invocationId: firstRawAttribute(
@@ -6048,9 +6256,12 @@ function otlpRawCorrelationClaims(
       combined,
       'anysentry.session.id',
       'gen_ai.conversation.id',
+      'conversation.id',
+      'conversation_id',
+      'thread.id',
+      'thread_id',
       'session.id',
-      'service.instance.id',
-    ) ?? resourceService,
+    ),
     workspacePath: rawDerivedOtlpWorkspace(
       body,
       resourceAttrs,
@@ -6077,16 +6288,22 @@ function otlpRawCorrelationClaims(
 
 function otlpAnyValue(value: unknown, key?: string): T.EventAttributeValue | undefined {
   if (key && sensitiveAttributeKey(key)) return '[redacted]';
-  if (typeof value === 'string') return cleanString(value, 500);
+  if (typeof value === 'string') {
+    const normalized = attrValue(value, key);
+    return typeof normalized === 'string' ? normalized.slice(0, 500) : normalized;
+  }
   if (typeof value === 'boolean') return value;
   if (typeof value === 'number' && Number.isFinite(value)) return value;
   const wrapped = obj(value);
   if (!wrapped) return undefined;
-  for (const key of ['stringValue', 'intValue', 'doubleValue', 'boolValue']) {
-    if (!(key in wrapped)) continue;
-    const raw = wrapped[key];
-    if (key === 'boolValue') return Boolean(raw);
-    if (key === 'stringValue') return cleanString(raw, 500);
+  for (const valueKind of ['stringValue', 'intValue', 'doubleValue', 'boolValue']) {
+    if (!(valueKind in wrapped)) continue;
+    const raw = wrapped[valueKind];
+    if (valueKind === 'boolValue') return Boolean(raw);
+    if (valueKind === 'stringValue') {
+      const normalized = attrValue(raw, key);
+      return typeof normalized === 'string' ? normalized.slice(0, 500) : normalized;
+    }
     const n = Number(raw);
     return Number.isFinite(n) ? n : undefined;
   }
@@ -6146,6 +6363,22 @@ function otlpBodyText(body: unknown): string | undefined {
   return cleanString(body, 1_000);
 }
 
+/** Only explicit conversation/thread/session attributes may define an OTLP Session. Runtime
+ * service.instance/pod identifiers describe deployment/runtime scope and must never merge
+ * otherwise stateless POST requests into one conversation. */
+function otlpExplicitSessionId(attrs: Record<string, T.EventAttributeValue>): string | undefined {
+  return attrText(
+    attrs,
+    'anysentry.session.id',
+    'gen_ai.conversation.id',
+    'conversation.id',
+    'conversation_id',
+    'thread.id',
+    'thread_id',
+    'session.id',
+  );
+}
+
 function otlpDefaults(resourceAttrs: Record<string, T.EventAttributeValue>, body: T.UniversalIngestRequest): Partial<T.UniversalIngestRequest> {
   const service = attrText(resourceAttrs, 'anysentry.agent.id', 'agent.id', 'service.name', 'k8s.pod.name', 'process.executable.name');
   const namespace = attrText(resourceAttrs, 'anysentry.workspace', 'service.namespace', 'k8s.namespace.name', 'deployment.environment.name');
@@ -6153,7 +6386,7 @@ function otlpDefaults(resourceAttrs: Record<string, T.EventAttributeValue>, body
   return {
     workspacePath: body.workspacePath ?? workspacePath,
     agentId: body.agentId ?? service,
-    sessionId: body.sessionId ?? attrText(resourceAttrs, 'anysentry.session.id', 'gen_ai.conversation.id', 'session.id', 'service.instance.id', 'k8s.pod.uid') ?? service,
+    sessionId: body.sessionId ?? body.conversationId ?? body.threadId ?? otlpExplicitSessionId(resourceAttrs),
     userId: body.userId ?? attrText(resourceAttrs, 'enduser.id', 'user.id', 'user.name'),
     collectorId: body.collectorId ?? attrText(resourceAttrs, 'anysentry.collector.id', 'collector.id', 'host.name'),
     sourceName: body.sourceName ?? attrText(resourceAttrs, 'service.name'),
@@ -6218,7 +6451,7 @@ function universalFromOtelAttrs(
     eventKind: item.eventKind ?? inferredKind,
     agentId: item.agentId ?? attrText(combined, 'anysentry.agent.id', 'agent.id', 'service.name', 'k8s.pod.name'),
     workspacePath: item.workspacePath ?? attrText(combined, 'anysentry.workspace'),
-    sessionId: item.sessionId ?? attrText(combined, 'anysentry.session.id', 'gen_ai.conversation.id', 'session.id', 'service.instance.id'),
+    sessionId: item.sessionId ?? otlpExplicitSessionId(combined),
     invocationId: item.invocationId ?? attrText(combined, 'anysentry.invocation.id', 'gen_ai.invocation.id', 'gen_ai.request.id'),
     toolCallId: item.toolCallId ?? attrText(combined, 'anysentry.tool.call.id', 'anysentry.tool_call.id', 'gen_ai.tool.call.id', 'tool_call.id', 'tool.id'),
     runId: item.runId ?? attrText(combined, 'anysentry.run.id', 'anysentry.run_id', 'runId', 'run.id', 'gen_ai.run.id', 'workflow_run_id', 'langgraph.run_id'),
