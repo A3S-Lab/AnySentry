@@ -133,6 +133,45 @@ try {
   assert.ok(compacted.walBytes < deferred.walBytes, 'small live set should compact the deferred WAL');
   compactSpool.close();
 
+  const reservePath = path.join(temporary, 'protected-reserve.wal');
+  const reserveSpool = new DurableSpool({
+    writerId: 'protected-reserve-test',
+    filePath: reservePath,
+    maxRecords: 2,
+    maxBytes: 1024 * 1024,
+    protectedReserveRecords: 1,
+    protectedReserveBytes: 256 * 1024,
+    fsyncMode: 'periodic',
+    fsyncMs: 60_000,
+  });
+  const putAsync = (record) => new Promise((resolve, reject) => {
+    reserveSpool.putAsync(record, (error, inserted) => {
+      if (error) reject(error);
+      else resolve(inserted);
+    });
+  });
+  // DurableSpool keeps a production minimum of 1,000 ordinary records. Fill that bounded base
+  // budget with the synchronous test helper, then exercise asynchronous protected admission.
+  for (let index = 0; index < 1_000; index += 1) {
+    reserveSpool.put({
+      id: `reserve-low-${index}`,
+      body: { line: String(index) },
+      priority: 0,
+      queuedAt: index,
+    });
+  }
+  assert.equal(reserveSpool.atCapacity(), true, 'ordinary WAL budget is full');
+  assert.equal(reserveSpool.atCapacity(3), false, 'protected tail remains available');
+  await assert.rejects(
+    putAsync({ id: 'reserve-low-overflow', body: { line: 'overflow' }, priority: 0, queuedAt: 1_001 }),
+    (error) => error?.code === 'ANYSENTRY_SPOOL_CAPACITY',
+  );
+  await putAsync({ id: 'reserve-critical', body: { line: 'critical' }, priority: 4, queuedAt: 4 });
+  assert.equal(reserveSpool.status().records, 1_001);
+  assert.equal(reserveSpool.status().protectedReserveRecords, 1);
+  assert.equal(reserveSpool.atCapacity(4), true, 'protected tail is bounded too');
+  reserveSpool.close();
+
   const streamingPath = path.join(temporary, 'streaming-load.wal');
   const unicodeLine = `prefix-${'界'.repeat(80)}-suffix`;
   writeFileSync(streamingPath, [

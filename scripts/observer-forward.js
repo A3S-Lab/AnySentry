@@ -239,6 +239,20 @@ const SPOOL_REPLAY_RESERVE_BYTES = boundedNumber(
   0,
   MAX_OUTSTANDING_BYTES,
 );
+// Keep a separate, bounded WAL tail for fresh protected observations while an older replay is at
+// the normal spool limit. The reserve is not available to routine/semantic records.
+const SPOOL_LIVE_RESERVE_EVENTS = boundedNumber(
+  process.env.FORWARD_SPOOL_LIVE_RESERVE_EVENTS,
+  SPOOL_REPLAY_RESERVE_EVENTS,
+  0,
+  65_536,
+);
+const SPOOL_LIVE_RESERVE_BYTES = boundedNumber(
+  process.env.FORWARD_SPOOL_LIVE_RESERVE_BYTES,
+  SPOOL_REPLAY_RESERVE_BYTES,
+  0,
+  256 * 1024 * 1024,
+);
 const MAX_SPOOL_READ_BLOCKED = 4_096;
 const SPOOL_READ_RETRY_MS = 10_000;
 const HTTP_TIMEOUT_MS = boundedNumber(process.env.FORWARD_HTTP_TIMEOUT_MS, 10_000, 1_000, 120_000);
@@ -413,6 +427,8 @@ const spool = new DurableSpool({
   maxRecords: process.env.FORWARD_SPOOL_MAX_RECORDS,
   maxBytes: process.env.FORWARD_SPOOL_MAX_BYTES,
   compactMaxLiveRecords: process.env.FORWARD_SPOOL_COMPACT_MAX_LIVE_RECORDS,
+  protectedReserveRecords: SPOOL_LIVE_RESERVE_EVENTS,
+  protectedReserveBytes: SPOOL_LIVE_RESERVE_BYTES,
   fsyncMode: process.env.FORWARD_SPOOL_FSYNC,
   fsyncMs: process.env.FORWARD_SPOOL_FSYNC_MS,
   onAsyncError(error) {
@@ -2229,6 +2245,8 @@ function eventQueueMetrics(now = Date.now()) {
     walPendingByteLimit: WAL_PENDING_MAX_BYTES,
     spoolReplayReserveEvents: SPOOL_REPLAY_RESERVE_EVENTS,
     spoolReplayReserveBytes: SPOOL_REPLAY_RESERVE_BYTES,
+    spoolLiveReserveEvents: SPOOL_LIVE_RESERVE_EVENTS,
+    spoolLiveReserveBytes: SPOOL_LIVE_RESERVE_BYTES,
   };
 }
 
@@ -2242,6 +2260,7 @@ function durableSpoolMetrics() {
     walBytes: status.walBytes,
     oldestAgeMs: status.oldestMs,
     atCapacity: status.atCapacity,
+    atProtectedCapacity: spool.atCapacity(PROTECTED_PRIORITY),
     fsyncMode: status.fsyncMode,
     compactionDeferred: status.compactionDeferred,
     compactions: status.compactions,
@@ -2257,6 +2276,8 @@ function durableSpoolMetrics() {
     residentBodies: status.residentBodies,
     readBlockedRecords: spoolReadBlocked.size,
     replayReadErrors: spoolReplayReadErrors,
+    protectedReserveRecords: status.protectedReserveRecords,
+    protectedReserveBytes: status.protectedReserveBytes,
   };
 }
 
@@ -2362,7 +2383,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
     || errors > 0
     || spoolMetrics.parkedRecords > 0
     || spoolMetrics.oldestAgeMs > SPOOL_DEGRADED_AGE_MS
-    || spoolMetrics.atCapacity
+    || spoolMetrics.atProtectedCapacity
   ) ? 'degraded' : 'ok';
   const e2eMarkerScopeMessage = E2E_INGEST_MARKER_PREFIX
     ? `e2e_marker_scope=enabled; e2e_marker_scoped_out=${classifications.e2eMarkerScopedOut}; `
@@ -2518,6 +2539,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         spoolWalBytes: spoolMetrics.walBytes,
         spoolOldestAgeMs: spoolMetrics.oldestAgeMs,
         spoolAtCapacity: spoolMetrics.atCapacity,
+        spoolAtProtectedCapacity: spoolMetrics.atProtectedCapacity,
         spoolFsyncMode: spoolMetrics.fsyncMode,
         spoolCompactionDeferred: spoolMetrics.compactionDeferred,
         spoolCompactions: spoolMetrics.compactions,
@@ -2532,6 +2554,8 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         spoolResidentBodies: spoolMetrics.residentBodies,
         spoolReadBlockedRecords: spoolMetrics.readBlockedRecords,
         spoolReplayReadErrors: spoolMetrics.replayReadErrors,
+        spoolProtectedReserveRecords: spoolMetrics.protectedReserveRecords,
+        spoolProtectedReserveBytes: spoolMetrics.protectedReserveBytes,
         queueBytes: eventQueues.queueBytes,
         inflightEvents: eventQueues.inflightEvents,
         inflightBytes: eventQueues.inflightBytes,
@@ -2554,6 +2578,8 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         walPendingByteLimit: eventQueues.walPendingByteLimit,
         spoolReplayReserveEvents: eventQueues.spoolReplayReserveEvents,
         spoolReplayReserveBytes: eventQueues.spoolReplayReserveBytes,
+        spoolLiveReserveEvents: eventQueues.spoolLiveReserveEvents,
+        spoolLiveReserveBytes: eventQueues.spoolLiveReserveBytes,
         identitySnapshotReady: workload.ready,
         identitySnapshotVersion: workload.version,
         identityKubernetesVersion: workload.sources?.kubernetes?.version,
@@ -2997,7 +3023,11 @@ function inputAtCapacity() {
   return (
     walPendingEvents >= WAL_PENDING_MAX_EVENTS
     || walPendingBytes >= WAL_PENDING_MAX_BYTES
-    || spool.atCapacity()
+    // Keep stdin open through the ordinary WAL ceiling while the bounded protected tail is
+    // available. `enqueue` still rejects routine records at the base ceiling, but lifecycle and
+    // security records can consume the reserved tail and remain durable instead of causing the
+    // Collector's stdout queue to overflow.
+    || spool.atCapacity(PROTECTED_PRIORITY)
   );
 }
 
@@ -3102,7 +3132,7 @@ function enqueue(body, priority, countForwarded = true, kind = '', recovered = f
   if (
     walPendingEvents + 1 > WAL_PENDING_MAX_EVENTS
     || walPendingBytes + bytes > WAL_PENDING_MAX_BYTES
-    || spool.atCapacity()
+    || spool.atCapacity(priority)
   ) {
     recordQueueDrop(kind, priority, 'wal_pending_capacity');
     updateInputFlow();

@@ -38,6 +38,21 @@ class DurableSpool {
       64 * 1024,
       64 * 1024 * 1024,
     );
+    // A small protected tail lets newly observed lifecycle/security records enter while an old
+    // replay backlog is at the ordinary WAL limit. It is still part of the hard bounded budget;
+    // low-priority puts cannot consume it.
+    this.protectedReserveRecords = boundedNumber(
+      options.protectedReserveRecords,
+      0,
+      0,
+      1_000_000,
+    );
+    this.protectedReserveBytes = boundedNumber(
+      options.protectedReserveBytes,
+      0,
+      0,
+      1024 * 1024 * 1024,
+    );
     this.writeAsync = options.writeAsync || fs.write.bind(fs);
     this.onAsyncError = typeof options.onAsyncError === 'function' ? options.onAsyncError : () => {};
     this.filePath = path.resolve(options.filePath);
@@ -345,9 +360,12 @@ class DurableSpool {
       queuedAt: boundedNumber(record.queuedAt, Date.now(), 0, Number.MAX_SAFE_INTEGER),
     };
     const bytes = Buffer.byteLength(JSON.stringify(normalized.body));
+    const protectedPriority = normalized.priority >= 3;
+    const recordLimit = this.maxRecords + (protectedPriority ? this.protectedReserveRecords : 0);
+    const byteLimit = this.maxBytes + (protectedPriority ? this.protectedReserveBytes : 0);
     if (
-      this.records.size + this.pendingPutIds.size + 1 > this.maxRecords
-      || this.logicalBytes + this.pendingPutBytes + bytes > this.maxBytes
+      this.records.size + this.pendingPutIds.size + 1 > recordLimit
+      || this.logicalBytes + this.pendingPutBytes + bytes > byteLimit
     ) {
       queueMicrotask(() => done(Object.assign(new Error('Observer spool capacity reached'), {
         code: 'ANYSENTRY_SPOOL_CAPACITY',
@@ -485,9 +503,12 @@ class DurableSpool {
     return deferred;
   }
 
-  atCapacity() {
-    return this.records.size + this.pendingPutIds.size >= this.maxRecords
-      || this.logicalBytes + this.pendingPutBytes >= this.maxBytes;
+  atCapacity(priority = 0) {
+    const protectedPriority = Number(priority) >= 3;
+    const recordLimit = this.maxRecords + (protectedPriority ? this.protectedReserveRecords : 0);
+    const byteLimit = this.maxBytes + (protectedPriority ? this.protectedReserveBytes : 0);
+    return this.records.size + this.pendingPutIds.size >= recordLimit
+      || this.logicalBytes + this.pendingPutBytes >= byteLimit;
   }
 
   compactIfNeeded() {
@@ -578,6 +599,10 @@ class DurableSpool {
       compactions: this.compactions,
       compactMaxLiveRecords: this.compactMaxLiveRecords,
       maxRecordBytes: this.maxRecordBytes,
+      maxRecords: this.maxRecords,
+      maxBytes: this.maxBytes,
+      protectedReserveRecords: this.protectedReserveRecords,
+      protectedReserveBytes: this.protectedReserveBytes,
       lazyRecords: this.lazyRecords,
       lazyReads: this.lazyReads,
       lazyReadErrors: this.lazyReadErrors,
