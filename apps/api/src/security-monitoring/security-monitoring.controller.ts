@@ -165,6 +165,19 @@ interface CanonicalDirectoryCacheEntry {
   bytes: number;
 }
 
+interface CanonicalSessionProjection {
+  items: T.CanonicalSessionResource[];
+  coverage: T.CanonicalEntityCoverage;
+  dataSource: string;
+  revision: number;
+}
+
+interface CanonicalSessionCacheEntry {
+  value: CanonicalSessionProjection;
+  expiresAt: number;
+  bytes: number;
+}
+
 const CANONICAL_ENTITY_LIMIT_MAX = 500;
 const CANONICAL_ENTITY_OFFSET_MAX = 1_000_000;
 const CANONICAL_ENTITY_CURSOR_PREFIX = 'ce1:';
@@ -179,6 +192,9 @@ const CANONICAL_DIRECTORY_CACHE_MAX_BYTES = 8 * 1024 * 1024;
 const CANONICAL_RUNTIME_STATE_READ_LIMIT = 20_000;
 const CANONICAL_SEMANTIC_SESSION_SCAN_MAX = 64;
 const CANONICAL_SEMANTIC_SCAN_CONCURRENCY = 4;
+const CANONICAL_SESSION_CACHE_TTL_MS = 2_000;
+const CANONICAL_SESSION_CACHE_MAX_ENTRIES = 4;
+const CANONICAL_SESSION_CACHE_MAX_BYTES = 8 * 1024 * 1024;
 
 function canonicalQueryScalar(
   query: Record<string, unknown> | undefined,
@@ -5998,6 +6014,12 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   private canonicalDirectoryCacheEvicted = 0;
   private canonicalDirectoryCacheExpired = 0;
   private canonicalDirectoryCacheDropped = 0;
+  private readonly canonicalSessionCache = new Map<string, CanonicalSessionCacheEntry>();
+  private readonly canonicalSessionInFlight = new Map<string, Promise<CanonicalSessionProjection>>();
+  private canonicalSessionCacheBytes = 0;
+  private canonicalSessionCacheEvicted = 0;
+  private canonicalSessionCacheExpired = 0;
+  private canonicalSessionCacheDropped = 0;
 
   constructor(
     private readonly agg: AggregationService,
@@ -6038,6 +6060,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     this.canonicalDirectoryCache.clear();
     this.canonicalDirectoryInFlight.clear();
     this.canonicalDirectoryCacheBytes = 0;
+    this.canonicalSessionCache.clear();
+    this.canonicalSessionInFlight.clear();
+    this.canonicalSessionCacheBytes = 0;
   }
 
   private canonicalDirectoryCacheKey(
@@ -6135,6 +6160,102 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       evicted: this.canonicalDirectoryCacheEvicted,
       expired: this.canonicalDirectoryCacheExpired,
       dropped: this.canonicalDirectoryCacheDropped,
+    };
+  }
+
+  private canonicalSessionCacheKey(
+    query: CanonicalEntityQuery,
+    headers: HeaderBag,
+  ): string {
+    const actor = auditActor(headers);
+    // Session detail/timeline/coverage calls all use the same bounded conversation projection;
+    // entity IDs and pagination are applied after this snapshot is assembled. Keep the
+    // AgentInstance predicate because it is still an upstream aggregation filter, while the
+    // remaining canonical IDs are local scope checks.
+    const {
+      limit: _limit,
+      offset: _offset,
+      cursor: _cursor,
+      revision: _revision,
+      includeCoverage: _includeCoverage,
+      logicalAgentId: _logicalAgentId,
+      logicalAgentCandidateId: _logicalAgentCandidateId,
+      logicalDefinitionId: _logicalDefinitionId,
+      runtimeInstanceId: _runtimeInstanceId,
+      sessionId: _sessionId,
+      ...projectionQuery
+    } = query;
+    return JSON.stringify({
+      query: projectionQuery,
+      actor: {
+        type: actor.type,
+        id: actor.id,
+      },
+    });
+  }
+
+  private pruneCanonicalSessionCache(now = Date.now()): void {
+    for (const [key, entry] of this.canonicalSessionCache) {
+      if (entry.expiresAt > now) continue;
+      this.canonicalSessionCache.delete(key);
+      this.canonicalSessionCacheBytes = Math.max(0, this.canonicalSessionCacheBytes - entry.bytes);
+      this.canonicalSessionCacheExpired += 1;
+    }
+  }
+
+  private rememberCanonicalSessionProjection(
+    key: string,
+    value: CanonicalSessionProjection,
+  ): void {
+    let bytes: number;
+    try {
+      bytes = Buffer.byteLength(JSON.stringify(value), 'utf8');
+    } catch {
+      this.canonicalSessionCacheDropped += 1;
+      return;
+    }
+    if (bytes > CANONICAL_SESSION_CACHE_MAX_BYTES) {
+      this.canonicalSessionCacheDropped += 1;
+      return;
+    }
+    const previous = this.canonicalSessionCache.get(key);
+    if (previous) {
+      this.canonicalSessionCache.delete(key);
+      this.canonicalSessionCacheBytes = Math.max(0, this.canonicalSessionCacheBytes - previous.bytes);
+    }
+    this.canonicalSessionCache.set(key, {
+      value,
+      bytes,
+      expiresAt: Date.now() + CANONICAL_SESSION_CACHE_TTL_MS,
+    });
+    this.canonicalSessionCacheBytes += bytes;
+    this.pruneCanonicalSessionCache();
+    while (
+      this.canonicalSessionCache.size > CANONICAL_SESSION_CACHE_MAX_ENTRIES
+      || this.canonicalSessionCacheBytes > CANONICAL_SESSION_CACHE_MAX_BYTES
+    ) {
+      const oldest = this.canonicalSessionCache.entries().next().value as
+        | [string, CanonicalSessionCacheEntry]
+        | undefined;
+      if (!oldest) break;
+      this.canonicalSessionCache.delete(oldest[0]);
+      this.canonicalSessionCacheBytes = Math.max(0, this.canonicalSessionCacheBytes - oldest[1].bytes);
+      this.canonicalSessionCacheEvicted += 1;
+    }
+  }
+
+  private canonicalSessionCacheStats(): Record<string, number> {
+    this.pruneCanonicalSessionCache();
+    return {
+      entries: this.canonicalSessionCache.size,
+      bytes: this.canonicalSessionCacheBytes,
+      maxEntries: CANONICAL_SESSION_CACHE_MAX_ENTRIES,
+      maxBytes: CANONICAL_SESSION_CACHE_MAX_BYTES,
+      ttlMs: CANONICAL_SESSION_CACHE_TTL_MS,
+      inFlight: this.canonicalSessionInFlight.size,
+      evicted: this.canonicalSessionCacheEvicted,
+      expired: this.canonicalSessionCacheExpired,
+      dropped: this.canonicalSessionCacheDropped,
     };
   }
 
@@ -10070,12 +10191,35 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   private async canonicalSessionResources(
     query: CanonicalEntityQuery,
     headers: HeaderBag,
-  ): Promise<{
-    items: T.CanonicalSessionResource[];
-    coverage: T.CanonicalEntityCoverage;
-    dataSource: string;
-    revision: number;
-  }> {
+  ): Promise<CanonicalSessionProjection> {
+    this.pruneCanonicalSessionCache();
+    const key = this.canonicalSessionCacheKey(query, headers);
+    const cached = this.canonicalSessionCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) {
+      this.canonicalSessionCache.delete(key);
+      this.canonicalSessionCache.set(key, cached);
+      return cached.value;
+    }
+    const inFlight = this.canonicalSessionInFlight.get(key);
+    if (inFlight) return inFlight;
+    const operation = this.computeCanonicalSessionResources(query, headers)
+      .then((value) => {
+        this.rememberCanonicalSessionProjection(key, value);
+        return value;
+      })
+      .finally(() => {
+        if (this.canonicalSessionInFlight.get(key) === operation) {
+          this.canonicalSessionInFlight.delete(key);
+        }
+      });
+    this.canonicalSessionInFlight.set(key, operation);
+    return operation;
+  }
+
+  private async computeCanonicalSessionResources(
+    query: CanonicalEntityQuery,
+    headers: HeaderBag,
+  ): Promise<CanonicalSessionProjection> {
     const conversations = await this.agg.agentConversations({
       timeType: query.timeType,
       startTime: query.startTime,
@@ -10759,6 +10903,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         bindingHotState: this.conversationBindings?.hotStateStats(),
         aggregationCaches: this.agg.cacheStateStats(),
         canonicalDirectoryCache: this.canonicalDirectoryCacheStats(),
+        canonicalSessionCache: this.canonicalSessionCacheStats(),
         ingressCaches: ingressCacheStats(),
       },
     };
