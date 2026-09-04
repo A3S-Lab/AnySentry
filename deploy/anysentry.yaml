@@ -323,14 +323,14 @@ spec:
       labels: { app: anysentry, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
       annotations:
         # Local immutable overlay provenance; update only when this service's image changes.
-        anysentry.io/local-overlay-manifest: "sha256:3f921a33d5380f52663a2b87a743a6fe2c84877a2138045860096e00704d7706"
-        anysentry.io/local-source-revision: "AnySentry@80c3f61+semantic-alias-bound"
+        anysentry.io/local-overlay-manifest: "sha256:8c8d407a7a585eb5100629223d3664cb8eb238093dd1f8fcb027df586d9ca20a"
+        anysentry.io/local-source-revision: "AnySentry@73bb804+kernel-locator"
     spec:
       terminationGracePeriodSeconds: 30
       serviceAccountName: anysentry
       containers:
         - name: anysentry
-          image: ghcr.io/a3s-lab/anysentry:latest
+          image: 127.0.0.1:5000/anysentry@sha256:8c8d407a7a585eb5100629223d3664cb8eb238093dd1f8fcb027df586d9ca20a
           ports:
             - { containerPort: 29653 }
           envFrom:
@@ -372,7 +372,10 @@ spec:
             - { name: ANYSENTRY_CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS, value: "2000" }
             - { name: ANYSENTRY_CANONICAL_SEMANTIC_EVIDENCE_TIMEOUT_MS, value: "2000" }
             - { name: ANYSENTRY_CANONICAL_SEMANTIC_ALIAS_TIMEOUT_MS, value: "500" }
-            - { name: ANYSENTRY_CANONICAL_KERNEL_FALLBACK_LOOKBACK_MS, value: "7200000" }
+            - { name: ANYSENTRY_CANONICAL_STORE_READ_TIMEOUT_MS, value: "1000" }
+            # Keep deep links useful across a normal test/workday while retaining a hard seven-day
+            # query bound; the predicate is still an exact server-assigned KernelFact ID.
+            - { name: ANYSENTRY_CANONICAL_KERNEL_FALLBACK_LOOKBACK_MS, value: "604800000" }
             # The installer creates this independently from image/manifests. It protects Source
             # bootstrap and Capture Profile policy/materialization endpoints without committing a
             # credential to Git.
@@ -471,7 +474,7 @@ spec:
     spec:
       containers:
         - name: fast-judge
-          image: ghcr.io/a3s-lab/anysentry:latest
+          image: 127.0.0.1:5000/anysentry@sha256:2a7e0c6c4447dfda95bff2b305c4b4ad3e0bbb0ca07b535e8545223bef5b5349
           command: ["node", "dist/security-monitoring/worker-main.js"]
           envFrom:
             - configMapRef:
@@ -504,7 +507,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: l3-worker
-          image: ghcr.io/a3s-lab/anysentry:latest
+          image: 127.0.0.1:5000/anysentry@sha256:2a7e0c6c4447dfda95bff2b305c4b4ad3e0bbb0ca07b535e8545223bef5b5349
           command: ["node", "dist/security-monitoring/worker-main.js"]
           envFrom:
             - configMapRef:

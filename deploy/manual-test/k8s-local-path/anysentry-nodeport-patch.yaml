@@ -5,6 +5,8 @@ metadata:
   namespace: anysentry
 spec:
   type: NodePort
+  selector:
+    app: anysentry
   ports:
     - port: 29653
       targetPort: 29653

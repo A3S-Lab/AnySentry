@@ -9,6 +9,7 @@ case "$product" in
   codex|claude) ;;
   *) echo "usage: $0 [codex|claude]" >&2; exit 2 ;;
 esac
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 run_dir="$(mktemp -d /tmp/anysentry-a3s-tui.XXXXXX)"
 results_dir="$run_dir/results"
 tls_dir="$run_dir/tls"
@@ -33,7 +34,7 @@ export CLI_LAB_CODEX_PROTOCOL="${CLI_LAB_CODEX_PROTOCOL:-http}"
 export CLI_LAB_CLAUDE_MODEL="${CLI_LAB_CLAUDE_MODEL:-claude-3-5-sonnet-20241022}"
 export CLI_LAB_API_KEY=fixture-key-not-secret
 
-node examples/cli-tls-observability-lab/app/server.mjs \
+node "$repo_root/examples/cli-tls-observability-lab/app/server.mjs" \
   >"$run_dir/provider-stdout.log" 2>"$run_dir/provider-stderr.log" &
 server_pid="$!"
 
@@ -47,5 +48,5 @@ done
 curl --noproxy '*' --silent --fail \
   "http://127.0.0.1:${CLI_LAB_HTTP_PORT}/healthz" >/dev/null
 
-node examples/cli-tls-observability-lab/app/run-cli.mjs "$product"
+node "$repo_root/examples/cli-tls-observability-lab/app/run-cli.mjs" "$product"
 printf 'A3S_TUI_CLI_PASS %s\n' "$product"

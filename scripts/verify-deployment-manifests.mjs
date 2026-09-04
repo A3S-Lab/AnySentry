@@ -165,7 +165,7 @@ function verifyAnySentryManifest() {
   );
   assert(
     'AnySentry Deployment uses the published service image',
-    /\bimage:\s*ghcr\.io\/a3s-lab\/anysentry:latest\b/u.test(anySentryDeployment?.source ?? ''),
+    /\bimage:\s*(?:ghcr\.io\/a3s-lab\/anysentry:latest|127\.0\.0\.1:5000\/anysentry@sha256:[0-9a-f]{64})\b/u.test(anySentryDeployment?.source ?? ''),
     anySentryDeployment?.source,
   );
   assert(
@@ -288,7 +288,12 @@ function verifyAnySentryManifest() {
   );
   assert(
     'AnySentry KernelFact compatibility fallback keeps a bounded lookback window',
-    /name:\s*ANYSENTRY_CANONICAL_KERNEL_FALLBACK_LOOKBACK_MS,\s*value:\s*"7200000"/u.test(anySentryDeployment?.source ?? ''),
+    /name:\s*ANYSENTRY_CANONICAL_KERNEL_FALLBACK_LOOKBACK_MS,\s*value:\s*"604800000"/u.test(anySentryDeployment?.source ?? ''),
+    anySentryDeployment?.source,
+  );
+  assert(
+    'AnySentry canonical side-lane reads have an explicit bounded timeout',
+    /name:\s*ANYSENTRY_CANONICAL_STORE_READ_TIMEOUT_MS,\s*value:\s*"(?:[1-9][0-9]{2,3})"/u.test(anySentryDeployment?.source ?? ''),
     anySentryDeployment?.source,
   );
   assert(
@@ -1014,6 +1019,7 @@ function verifyManualKubernetesLocalPathOverlay() {
     /^kind:\s*Service$/mu.test(nodePortPatch) &&
       /^  name:\s*anysentry$/mu.test(nodePortPatch) &&
       /type:\s*NodePort/u.test(nodePortPatch) &&
+      /selector:\s*\n\s*app:\s*anysentry/u.test(nodePortPatch) &&
       /port:\s*29653/u.test(nodePortPatch) &&
       /targetPort:\s*29653/u.test(nodePortPatch) &&
       /nodePort:\s*32653/u.test(nodePortPatch) &&
