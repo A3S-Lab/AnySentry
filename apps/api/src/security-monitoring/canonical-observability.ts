@@ -1636,11 +1636,9 @@ export class KernelFactStore {
     if (!members || !members.delete(factId)) return;
     this.aliasBindingCount = Math.max(0, this.aliasBindingCount - 1);
     this.aliasBytes = Math.max(0, this.aliasBytes - KernelFactStore.aliasBytesFor(alias, factId));
-    if (members.size === 0) {
-      this.aliasBindings.delete(alias);
-      if (reason === 'expired') this.aliasExpired += 1;
-      else if (reason === 'evicted') this.aliasEvicted += 1;
-    }
+    if (reason === 'expired') this.aliasExpired += 1;
+    else if (reason === 'evicted') this.aliasEvicted += 1;
+    if (members.size === 0) this.aliasBindings.delete(alias);
     const aliases = this.aliasesByFact.get(factId);
     if (aliases) {
       const index = aliases.indexOf(alias);
@@ -1674,6 +1672,7 @@ export class KernelFactStore {
    */
   registerAliases(factId: string, aliases: readonly unknown[]): boolean {
     if (this.closed) return false;
+    this.purge();
     const canonical = this.entries.get(factId);
     if (!canonical) {
       this.aliasOrphans += 1;
