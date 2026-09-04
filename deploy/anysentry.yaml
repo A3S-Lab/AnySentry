@@ -368,6 +368,7 @@ spec:
             - { name: ANYSENTRY_OBSERVER_POST_COMMIT_PROJECTION_MAX_IN_FLIGHT, value: "32" }
             - { name: ANYSENTRY_OBSERVER_POST_COMMIT_PROJECTION_TIMEOUT_MS, value: "250" }
             - { name: ANYSENTRY_CANONICAL_DIRECTORY_PROJECTION_TIMEOUT_MS, value: "2000" }
+            - { name: ANYSENTRY_CANONICAL_SESSION_PROJECTION_TIMEOUT_MS, value: "2000" }
             # The installer creates this independently from image/manifests. It protects Source
             # bootstrap and Capture Profile policy/materialization endpoints without committing a
             # credential to Git.

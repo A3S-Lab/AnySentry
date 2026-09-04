@@ -204,6 +204,12 @@ const CANONICAL_DIRECTORY_PROJECTION_TIMEOUT_MS = boundedControllerEnvInt(
   250,
   10_000,
 );
+const CANONICAL_SESSION_PROJECTION_TIMEOUT_MS = boundedControllerEnvInt(
+  'ANYSENTRY_CANONICAL_SESSION_PROJECTION_TIMEOUT_MS',
+  2_000,
+  250,
+  10_000,
+);
 
 function boundedControllerEnvInt(name: string, fallback: number, min: number, max: number): number {
   const parsed = Number(process.env[name]);
@@ -10019,7 +10025,15 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       .catch((error) => {
         if (!isCanonicalProjectionDegradation(error)) throw error;
         this.canonicalDirectoryCacheDropped += 1;
-        return this.degradedCanonicalDirectorySnapshot(query, 'directory_projection_timeout');
+        const fallback = this.degradedCanonicalDirectorySnapshot(query, 'directory_projection_timeout');
+        // Do not leave a timed-out Promise as the next caller's in-flight value.  Cache the
+        // bounded fallback for the same short TTL so rapid UI navigation does not fan out more
+        // stalled database reads while the original operation finishes in the background.
+        if (this.canonicalDirectoryInFlight.get(key) === operation) {
+          this.canonicalDirectoryInFlight.delete(key);
+        }
+        this.rememberCanonicalDirectorySnapshot(key, fallback);
+        return fallback;
       });
   }
 
@@ -10188,7 +10202,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           resolutionRevision: directory.resolutionRevision,
         };
       });
-    const partial = directory.coverage.partial || resources.some((item) => item.coverage.status !== 'complete');
+    const partial = directory.coverage.partial
+      || Boolean(directory.coverage.partialReason)
+      || resources.some((item) => item.coverage.status !== 'complete');
     const coverage = this.canonicalRevisionCoverage(
       query,
       directory.resolutionRevision,
@@ -10329,7 +10345,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     }, query));
     // Runtime state is a useful bounded fallback, but it cannot make the missing conversation
     // projection complete. Preserve the directory timeout as partial even when runtime rows exist.
-    const partial = directory.coverage.partial;
+    const partial = directory.coverage.partial || Boolean(directory.coverage.partialReason);
     const coverage = this.canonicalRevisionCoverage(
       query,
       directory.resolutionRevision,
@@ -10482,7 +10498,95 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         }
       });
     this.canonicalSessionInFlight.set(key, operation);
-    return operation;
+    return withCanonicalProjectionTimeout(operation, CANONICAL_SESSION_PROJECTION_TIMEOUT_MS)
+      .catch((error) => {
+        if (!isCanonicalProjectionDegradation(error)) throw error;
+        if (this.canonicalSessionInFlight.get(key) === operation) {
+          this.canonicalSessionInFlight.delete(key);
+        }
+        const fallback = this.degradedCanonicalSessionProjection(query, 'session_projection_timeout');
+        this.rememberCanonicalSessionProjection(key, fallback);
+        return fallback;
+      });
+  }
+
+  private degradedCanonicalSessionProjection(
+    query: CanonicalEntityQuery,
+    reason: string,
+  ): CanonicalSessionProjection {
+    const memberships = this.canonicalObservability.sessionMemberships
+      .list(Math.min(10_000, Math.max(1, query.limit + query.offset)));
+    const resources = new Map<string, T.CanonicalSessionResource>();
+    for (const membership of memberships) {
+      // SessionMembership.sessionId is already the server-derived canonical ID.  Unlike a
+      // SemanticRecord/compatibility summary, a membership row has no separate canonicalSessionId
+      // alias; treating a missing field as a second identity would both fail type checking and
+      // risk manufacturing a new session during degraded reads.
+      const candidateIds = [membership.sessionId];
+      if (query.sessionId && !candidateIds.includes(query.sessionId)) continue;
+      if (query.agentInstanceId && membership.agentInstanceId !== query.agentInstanceId) continue;
+      if (query.logicalAgentId && membership.logicalAgentId !== query.logicalAgentId) continue;
+      const sessionId = membership.sessionId;
+      if (resources.has(sessionId)) continue;
+      // `candidate` is a discovery classification, not a valid canonical Session quality. Keep
+      // the degraded projection honest by exposing it as unresolved rather than widening the
+      // public Session contract or claiming confirmation.
+      const sessionIdentityQuality: T.SessionIdentityQuality = membership.confidence === 'candidate'
+        ? 'unresolved'
+        : membership.confidence;
+      const zeroUsage: T.AgentUsageSummary = {
+        modelCallCount: 0,
+        successfulModelCallCount: 0,
+        failedModelCallCount: 0,
+        tokenReportedModelCallCount: 0,
+        tokenCoverage: 'unavailable',
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        cachedInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        reasoningOutputTokens: 0,
+        totalDurationMs: 0,
+      };
+      resources.set(sessionId, {
+        schemaVersion: 'anysentry.session.v1',
+        sessionId,
+        ...(membership.sessionKey ? { sessionKey: membership.sessionKey } : {}),
+        ...(membership.providerSessionIdHash ? { providerSessionIdHash: membership.providerSessionIdHash } : {}),
+        ...(membership.logicalAgentId ? { logicalAgentId: membership.logicalAgentId } : {}),
+        ...(membership.agentInstanceId ? { agentInstanceIds: [membership.agentInstanceId] } : { agentInstanceIds: [] }),
+        ...(membership.segmentId ? { segmentIds: [membership.segmentId] } : { segmentIds: [] }),
+        ...(membership.interactionId ? { interactionIds: [membership.interactionId] } : { interactionIds: [] }),
+        ...(membership.parentSessionId ? { parentSessionId: membership.parentSessionId } : {}),
+        ...(membership.canonicalParentSessionId ? { canonicalParentSessionId: membership.canonicalParentSessionId } : {}),
+        sessionIdentityQuality,
+        ...(membership.sessionMode ? { sessionMode: membership.sessionMode } : {}),
+        ...(membership.sessionLifecycle ? { sessionLifecycle: membership.sessionLifecycle } : {}),
+        turnCount: 0,
+        modelCallCount: 0,
+        toolCallCount: 0,
+        toolResultCount: 0,
+        errorCount: 0,
+        usage: zeroUsage,
+        coverage: {
+          status: 'asset_only',
+          reasons: [reason],
+          completeInteractions: 0,
+          partialInteractions: 0,
+        },
+        sourceRefs: [...new Set([
+          `session-membership:${membership.membershipId}`,
+          ...membership.sourceRefs,
+        ])].slice(0, 64),
+        resolutionRevision: membership.resolutionRevision,
+      });
+    }
+    return {
+      items: [...resources.values()],
+      coverage: canonicalCoverage(true, [reason], 'memory_hot_ring'),
+      dataSource: 'memory_hot_ring',
+      revision: this.canonicalCurrentRevision(),
+    };
   }
 
   private async computeCanonicalSessionResources(
