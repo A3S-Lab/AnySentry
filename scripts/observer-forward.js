@@ -710,6 +710,8 @@ let runtimeSnapshotPosts = 0;
 let runtimeSnapshotErrors = 0;
 let runtimeSnapshotRejected = 0;
 let runtimeSnapshotDuplicates = 0;
+let runtimeSnapshotEntryDuplicates = 0;
+let runtimeSnapshotEntryConflicts = 0;
 let runtimeSnapshotRetries = 0;
 let runtimeSnapshotRecovered = 0;
 let lastRuntimeSnapshotAt = '';
@@ -1823,15 +1825,25 @@ async function runtimeSnapshotBody(ready = true) {
   const processSnapshot = attributor.runtimeSnapshot();
   publishTlsAgentRuntimeScope(processSnapshot);
   const enrichedProcessEntries = await systemdLaunchEnricher.enrichEntries(processSnapshot.entries);
-  const rootedWorkloads = new Set(
-    enrichedProcessEntries.map((entry) => entry.physicalWorkloadId).filter(Boolean),
-  );
   const workloadRuntimes = workloadCache
     .agentRuntimeInventory()
-    .filter((entry) => !rootedWorkloads.has(entry.physicalWorkloadId));
+    .filter((entry) => !entry.runtimeSnapshotExcluded);
+  const runtimeEntries = dedupeRuntimeSnapshotEntries(
+    enrichedProcessEntries,
+    workloadRuntimes,
+  );
+  runtimeSnapshotEntryDuplicates += runtimeEntries.duplicates;
+  runtimeSnapshotEntryConflicts += runtimeEntries.conflicts;
   return {
     ...processSnapshot,
-    entries: [...enrichedProcessEntries, ...workloadRuntimes],
+    entries: runtimeEntries.entries,
+    // These additive fields are intentionally outside the strict entry contract. The API can
+    // accept the valid unique entries while operators still see which duplicate/collision
+    // candidates were withheld instead of mistaking a validation rejection for a healthy snapshot.
+    runtimeSnapshotDuplicateEntries: runtimeEntries.duplicates,
+    runtimeSnapshotConflictingEntries: runtimeEntries.conflicts,
+    runtimeSnapshotDuplicateCandidates: runtimeEntries.candidates,
+    runtimeSnapshotCoverageGaps: runtimeEntries.coverageGaps,
     collectorId: COLLECTOR_ID || NODE_NAME || 'observer-forwarder',
     forwarderInstanceId,
     leaseEpoch: runtimeLeaseEpoch,
@@ -1840,6 +1852,130 @@ async function runtimeSnapshotBody(ready = true) {
     intervalSecs: RUNTIME_SNAPSHOT_SECS,
     filterMode: FILTER_MODE,
   };
+}
+
+function runtimeSnapshotRootKey(entry) {
+  const rootPid = positiveInteger(entry?.rootPid);
+  const rootStart = text(entry?.rootStartTimeTicks);
+  if (!rootPid || !rootStart) return '';
+  return [
+    'host-root',
+    text(entry?.hostId) || 'host',
+    text(entry?.bootId) || 'boot',
+    rootPid,
+    rootStart,
+  ].join(':');
+}
+
+function runtimeSnapshotEntryKey(entry) {
+  // Match AgentRuntimeStateService's canonicalRuntimeInstanceId rule: a complete host/boot/root
+  // tuple is stronger than a producer-reported agentInstanceId and keeps distinct generations
+  // separate. Entries without a complete root fall back to their reported ID for safe duplicate
+  // rejection; an unkeyed entry is never sent to the strict snapshot endpoint.
+  return runtimeSnapshotRootKey(entry) || (text(entry?.agentInstanceId) ? `reported:${text(entry.agentInstanceId)}` : '');
+}
+
+function runtimeSnapshotCandidate(entry, source, reason, key) {
+  return {
+    source,
+    reason,
+    key,
+    ...(text(entry?.agentInstanceId) ? { agentInstanceId: text(entry.agentInstanceId) } : {}),
+    ...(text(entry?.physicalWorkloadId) ? { physicalWorkloadId: text(entry.physicalWorkloadId) } : {}),
+    ...(positiveInteger(entry?.rootPid) ? { rootPid: positiveInteger(entry.rootPid) } : {}),
+    ...(text(entry?.rootStartTimeTicks) ? { rootStartTimeTicks: text(entry.rootStartTimeTicks) } : {}),
+  };
+}
+
+function runtimeSnapshotCoverageGap(candidate, ordinal) {
+  const digest = crypto.createHash('sha256')
+    .update(JSON.stringify(candidate))
+    .digest('hex')
+    .slice(0, 24);
+  return {
+    schemaVersion: 'anysentry.coverage_gap.v1',
+    gapId: `gap_runtime_snapshot_duplicate_${digest}_${ordinal}`,
+    stage: 'runtime',
+    reason: candidate.reason,
+    scope: candidate.key || 'runtime_snapshot/unkeyed',
+    firstSeenAtUnixNs: String(Date.now()) + '000000',
+    lastSeenAtUnixNs: String(Date.now()) + '000000',
+    droppedCount: 1,
+    orphanedCount: 0,
+    revision: 1,
+    sourceRefs: [],
+  };
+}
+
+function dedupeRuntimeSnapshotEntries(processEntries, workloadEntries) {
+  const entries = [];
+  const seenKeys = new Map();
+  const processById = new Map();
+  const processPhysical = new Map();
+  const candidates = [];
+  const coverageGaps = [];
+  let duplicates = 0;
+  let conflicts = 0;
+  const rememberCandidate = (entry, source, reason, key) => {
+    const candidate = runtimeSnapshotCandidate(entry, source, reason, key);
+    if (candidates.length < 256) {
+      candidates.push(candidate);
+      coverageGaps.push(runtimeSnapshotCoverageGap(candidate, candidates.length));
+    }
+  };
+  const add = (entry, source) => {
+    const key = runtimeSnapshotEntryKey(entry);
+    const id = text(entry?.agentInstanceId);
+    const physical = text(entry?.physicalWorkloadId);
+    if (!key) {
+      duplicates += 1;
+      rememberCandidate(entry, source, 'runtime_snapshot_unkeyed_entry', key);
+      return;
+    }
+    const existing = seenKeys.get(key);
+    if (existing) {
+      duplicates += 1;
+      rememberCandidate(entry, source, 'runtime_snapshot_duplicate_entry', key);
+      return;
+    }
+    if (source === 'workload') {
+      const sameId = id && processById.get(id);
+      const samePhysical = physical && processPhysical.get(physical);
+      const entryRoot = runtimeSnapshotRootKey(entry);
+      const sameIdRoot = sameId && runtimeSnapshotRootKey(sameId);
+      const samePhysicalRoot = samePhysical && runtimeSnapshotRootKey(samePhysical);
+      const sameStrongRoot = (entryRoot && sameIdRoot && sameIdRoot === entryRoot)
+        || (entryRoot && samePhysicalRoot && samePhysicalRoot === entryRoot);
+      // If either side lacks a complete host/boot/root tuple, a matching reported ID or physical
+      // workload is only an alias—not evidence of a distinct generation. Drop that duplicate and
+      // retain the candidate/coverage record below instead of sending an API-invalid collision.
+      const incompleteAlias = Boolean(
+        (sameId && (!entryRoot || !sameIdRoot))
+        || (samePhysical && (!entryRoot || !samePhysicalRoot)),
+      );
+      if (sameStrongRoot || incompleteAlias) {
+        duplicates += 1;
+        rememberCandidate(entry, source, 'runtime_snapshot_workload_alias', key);
+        return;
+      }
+      // Same reported ID or physical workload with a different complete root is a possible
+      // restart/generation boundary. Keep it as a separate valid entry and surface the collision;
+      // never silently merge generations just to satisfy the uniqueness check.
+      if (sameId || samePhysical) {
+        conflicts += 1;
+        rememberCandidate(entry, source, 'runtime_snapshot_generation_collision', key);
+      }
+    }
+    seenKeys.set(key, entry);
+    entries.push(entry);
+    if (source === 'process') {
+      if (id && !processById.has(id)) processById.set(id, entry);
+      if (physical && !processPhysical.has(physical)) processPhysical.set(physical, entry);
+    }
+  };
+  for (const entry of Array.isArray(processEntries) ? processEntries : []) add(entry, 'process');
+  for (const entry of Array.isArray(workloadEntries) ? workloadEntries : []) add(entry, 'workload');
+  return { entries, duplicates, conflicts, candidates, coverageGaps };
 }
 
 function publishTlsAgentRuntimeScope(processSnapshot = attributor.runtimeSnapshot()) {
@@ -2476,6 +2612,8 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         runtimeSnapshotErrors,
         runtimeSnapshotRejected,
         runtimeSnapshotDuplicates,
+        runtimeSnapshotEntryDuplicates,
+        runtimeSnapshotEntryConflicts,
         runtimeSnapshotRetries,
         runtimeSnapshotRecovered,
         lastRuntimeSnapshotAt: lastRuntimeSnapshotAt || undefined,
@@ -3670,14 +3808,23 @@ async function start() {
   pumpDurableSpool();
 }
 
-process.once('SIGINT', () => handleShutdownSignal('SIGINT'));
-process.once('SIGTERM', () => handleShutdownSignal('SIGTERM'));
+if (require.main === module) {
+  process.once('SIGINT', () => handleShutdownSignal('SIGINT'));
+  process.once('SIGTERM', () => handleShutdownSignal('SIGTERM'));
+  void start().catch((error) => {
+    console.error('[observer-forward] startup failed:', error instanceof Error ? error.message : String(error));
+    process.stdin.pause();
+    if (typeof process.stdin.unref === 'function') process.stdin.unref();
+    rl?.close();
+    closeTransports();
+    process.exitCode = 1;
+  });
+}
 
-void start().catch((error) => {
-  console.error('[observer-forward] startup failed:', error instanceof Error ? error.message : String(error));
-  process.stdin.pause();
-  if (typeof process.stdin.unref === 'function') process.stdin.unref();
-  rl?.close();
-  closeTransports();
-  process.exitCode = 1;
-});
+// Pure runtime-snapshot helpers are exported for bounded unit verification. Requiring this file
+// never starts a Forwarder process; the production entrypoint above remains unchanged.
+module.exports = {
+  dedupeRuntimeSnapshotEntries,
+  runtimeSnapshotEntryKey,
+  runtimeSnapshotRootKey,
+};

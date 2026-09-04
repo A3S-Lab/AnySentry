@@ -7,8 +7,14 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 const forwarder = fileURLToPath(new URL('./observer-forward.js', import.meta.url));
+const require = createRequire(import.meta.url);
+const {
+  dedupeRuntimeSnapshotEntries,
+  runtimeSnapshotEntryKey,
+} = require('./observer-forward.js');
 
 function waitFor(label, predicate, timeoutMs = 5_000) {
   const startedAt = Date.now();
@@ -402,5 +408,45 @@ await withForwarder(
     );
   },
 );
+
+// Runtime snapshot assembly gives process-root entries precedence over workload inventory and
+// keeps distinct host/boot/root generations separate. This pure check also covers the case where
+// a workload entry has no physicalWorkloadId: its reported agentInstanceId still cannot duplicate
+// the process root in the strict API contract.
+const processRoot = {
+  agentInstanceId: 'ari-shared',
+  physicalWorkloadId: 'k8s:cluster:pod-a:container-a',
+  hostId: 'node-a',
+  bootId: 'boot-a',
+  rootPid: 101,
+  rootStartTimeTicks: '1001',
+};
+const processRestart = { ...processRoot, rootPid: 102, rootStartTimeTicks: '1002' };
+const duplicateWorkload = {
+  agentInstanceId: 'ari-shared',
+  hostId: 'node-a',
+  bootId: 'boot-a',
+  rootPid: 101,
+  rootStartTimeTicks: '1001',
+};
+const generationWorkload = {
+  ...processRestart,
+  physicalWorkloadId: 'k8s:cluster:pod-a:container-a',
+  rootPid: 103,
+  rootStartTimeTicks: '1003',
+};
+const dedupedSnapshot = dedupeRuntimeSnapshotEntries(
+  [processRoot, processRestart],
+  [duplicateWorkload, generationWorkload],
+);
+assert.equal(dedupedSnapshot.entries.length, 3, 'same-root workload aliases are removed without merging generations');
+assert.equal(dedupedSnapshot.duplicates, 1);
+assert.equal(dedupedSnapshot.conflicts, 1, 'different root generations remain separate');
+assert.equal(
+  new Set(dedupedSnapshot.entries.map((entry) => runtimeSnapshotEntryKey(entry))).size,
+  3,
+  'strict runtime snapshot keys remain unique',
+);
+assert.equal(dedupedSnapshot.coverageGaps.length, 2);
 
 console.log('Forwarder runtime lease, business ACK, API restart, and fencing verification passed');
