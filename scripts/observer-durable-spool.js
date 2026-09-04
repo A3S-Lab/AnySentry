@@ -99,6 +99,10 @@ class DurableSpool {
     this.lazyReads = 0;
     this.lazyReadErrors = 0;
     this.residentBodies = 0;
+    // Recovered records keep only bounded metadata until replay needs their body. Count explicit
+    // releases so a heartbeat can prove that materialized replay payloads were returned to the
+    // lazy on-disk representation instead of accumulating with the live WAL backlog.
+    this.lazyBodyReleases = 0;
     this.asyncOperations = [];
     this.pendingWriteBytes = 0;
     this.walCapacityRejects = 0;
@@ -216,6 +220,25 @@ class DurableSpool {
       this.lazyReadErrors += 1;
       throw new Error(`Observer spool record ${record.id} could not be read: ${error.message}`);
     }
+  }
+
+  releaseBody(record) {
+    // Only recovered records have a durable offset they can be re-read from. Fresh PUTs retain
+    // their body because their offset is not tracked separately, and callers may still need the
+    // object for delivery/retry. The Forwarder calls this after enqueueing a replay item; that item
+    // owns its body reference until ACK/retry settles while the spool map returns to metadata-only.
+    if (
+      !record
+      || record._lazyBody !== true
+      || record._bodyLoaded !== true
+      || this.records.get(record.id) !== record
+    ) return false;
+    record._bodyValue = undefined;
+    record._bodyLoaded = false;
+    this.residentBodies = Math.max(0, this.residentBodies - 1);
+    this.lazyRecords += 1;
+    this.lazyBodyReleases += 1;
+    return true;
   }
 
   load() {
@@ -703,6 +726,7 @@ class DurableSpool {
       lazyRecords: this.lazyRecords,
       lazyReads: this.lazyReads,
       lazyReadErrors: this.lazyReadErrors,
+      lazyBodyReleases: this.lazyBodyReleases,
       residentBodies: this.residentBodies,
     };
   }

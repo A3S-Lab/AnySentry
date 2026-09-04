@@ -2323,6 +2323,7 @@ function durableSpoolMetrics() {
     lazyRecords: status.lazyRecords,
     lazyReads: status.lazyReads,
     lazyReadErrors: status.lazyReadErrors,
+    lazyBodyReleases: status.lazyBodyReleases,
     residentBodies: status.residentBodies,
     readBlockedRecords: spoolReadBlocked.size,
     replayReadErrors: spoolReplayReadErrors,
@@ -2611,6 +2612,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         spoolLazyRecords: spoolMetrics.lazyRecords,
         spoolLazyReads: spoolMetrics.lazyReads,
         spoolLazyReadErrors: spoolMetrics.lazyReadErrors,
+        spoolLazyBodyReleases: spoolMetrics.lazyBodyReleases,
         spoolResidentBodies: spoolMetrics.residentBodies,
         spoolReadBlockedRecords: spoolMetrics.readBlockedRecords,
         spoolReplayReadErrors: spoolMetrics.replayReadErrors,
@@ -3465,7 +3467,16 @@ function pumpDurableSpool() {
       rememberSpoolReadFailure(record, error);
       continue;
     }
-    if (!enqueue(body, record.priority, false, durableRecordKind(body), true)) break;
+    let admittedRecord = false;
+    try {
+      admittedRecord = enqueue(body, record.priority, false, durableRecordKind(body), true);
+    } finally {
+      // A recovered record's body is a temporary replay object. Keep the queue/retry item alive
+      // through its own reference, but return the spool index to metadata-only immediately so a
+      // large WAL cannot pin every replayed payload until ACK/compaction.
+      spool.releaseBody(record);
+    }
+    if (!admittedRecord) break;
     admitted++;
     attributionCounts.spoolReplayAdmitted++;
     if (outstandingBytes >= MAX_OUTSTANDING_BYTES - SPOOL_REPLAY_RESERVE_BYTES) break;

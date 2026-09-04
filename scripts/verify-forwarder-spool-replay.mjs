@@ -300,10 +300,60 @@ try {
   assert.equal(streamingSpool.status().records, 1);
   assert.equal(streamingSpool.status().lazyRecords, 1, 'recovered bodies stay on disk until replay');
   assert.equal(streamingSpool.status().residentBodies, 0, 'lazy recovery does not retain body objects');
-  assert.equal(streamingSpool.available(new Set(), 1)[0].body.line, unicodeLine);
+  const streamingRecord = streamingSpool.available(new Set(), 1)[0];
+  assert.equal(streamingRecord.body.line, unicodeLine);
   assert.equal(streamingSpool.status().lazyReads, 1);
   assert.equal(streamingSpool.status().residentBodies, 1);
+  assert.equal(streamingSpool.releaseBody(streamingRecord), true, 'replay release returns the recovered record to metadata-only');
+  assert.equal(streamingSpool.status().lazyRecords, 1);
+  assert.equal(streamingSpool.status().residentBodies, 0);
+  assert.equal(streamingSpool.status().lazyBodyReleases, 1);
+  assert.equal(streamingRecord.body.line, unicodeLine, 'released lazy body can be read again from its WAL offset');
+  assert.equal(streamingSpool.status().lazyReads, 2);
+  assert.equal(streamingSpool.status().residentBodies, 1);
+  assert.equal(streamingSpool.releaseBody(streamingRecord), true);
+  assert.equal(streamingSpool.ack(['stream-unicode']), 1, 'ACK after body release still removes the metadata record');
+  assert.equal(streamingSpool.status().records, 0);
+  assert.equal(streamingSpool.status().lazyRecords, 0);
+  assert.equal(streamingSpool.status().residentBodies, 0);
   streamingSpool.close();
+
+  const releaseBoundPath = path.join(temporary, 'release-bound.wal');
+  const releaseBoundRecords = 512;
+  writeFileSync(releaseBoundPath, Array.from({ length: releaseBoundRecords }, (_, index) => JSON.stringify({
+    op: 'put',
+    record: {
+      id: `release-bound-${index}`,
+      body: { sourceEventId: `release-bound-${index}`, line: 'x'.repeat(4 * 1024) },
+      priority: 2,
+      queuedAt: index,
+    },
+  })).join('\n') + '\n', { mode: 0o600 });
+  const releaseBoundSpool = new DurableSpool({
+    writerId: 'release-bound-test',
+    filePath: releaseBoundPath,
+    loadChunkBytes: 257,
+    fsyncMode: 'periodic',
+    fsyncMs: 60_000,
+  });
+  assert.equal(releaseBoundSpool.status().lazyRecords, releaseBoundRecords);
+  assert.equal(releaseBoundSpool.status().residentBodies, 0);
+  let maxResidentBodies = 0;
+  for (const record of releaseBoundSpool.available(new Set(), releaseBoundRecords)) {
+    assert.equal(record.body.sourceEventId, record.id);
+    maxResidentBodies = Math.max(maxResidentBodies, releaseBoundSpool.status().residentBodies);
+    assert.equal(releaseBoundSpool.releaseBody(record), true);
+    assert.equal(releaseBoundSpool.status().residentBodies, 0);
+  }
+  assert.ok(maxResidentBodies <= 1, `replay body residency must stay bounded (max=${maxResidentBodies})`);
+  assert.equal(releaseBoundSpool.status().lazyRecords, releaseBoundRecords);
+  assert.equal(releaseBoundSpool.status().lazyBodyReleases, releaseBoundRecords);
+  // A second read after release exercises the original byte offset, not a retained body object.
+  const reread = releaseBoundSpool.available(new Set(), 1)[0];
+  assert.equal(reread.body.sourceEventId, reread.id);
+  assert.equal(releaseBoundSpool.status().lazyReads, releaseBoundRecords + 1);
+  assert.equal(releaseBoundSpool.releaseBody(reread), true);
+  releaseBoundSpool.close();
 
   const asyncPath = path.join(temporary, 'async-put.wal');
   const heldWrites = [];
@@ -339,6 +389,9 @@ try {
   putWrite.callback(undefined, putWrite.length);
   assert.equal(await putResult, true);
   assert.equal(asyncSpool.status().records, 1);
+  const residentRecord = asyncSpool.available(new Set(), 1)[0];
+  assert.equal(asyncSpool.releaseBody(residentRecord), false, 'fresh PUT bodies are not released without a durable lazy offset');
+  assert.equal(asyncSpool.status().residentBodies, 1);
 
   const ackResult = new Promise((resolve, reject) => {
     asyncSpool.ackAsync(['async-record'], (error, acknowledged) => {
