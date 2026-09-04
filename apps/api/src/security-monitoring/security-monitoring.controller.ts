@@ -1510,15 +1510,22 @@ function semanticToolHints(event: T.JudgedEvent): {
   }
   const exitCode = attrNumber(attributes, 'anysentry.tool.exit_code', 'tool.exit_code', 'process.exit_code', 'exit_code');
   const resultHashValue = attrText(attributes, 'anysentry.tool.result_hash', 'tool.result_hash', 'gen_ai.tool.result_hash');
-  const resultHash = resultHashValue && /^[a-f0-9]{16,128}$/iu.test(resultHashValue)
+  const resultHash = resultHashValue && /^[a-f0-9]{64}$/iu.test(resultHashValue)
     ? resultHashValue.toLowerCase()
     : undefined;
   const status = attrText(attributes, 'anysentry.tool.status', 'tool.status', 'status', 'otel.status_code', 'status.code');
   const lifecyclePhase = attrText(attributes, 'anysentry.lifecycle.phase', 'lifecycle.phase', 'span.lifecycle.phase');
-  const spanEnd = attrNumber(attributes, 'anysentry.span.end_at_ms', 'span.end_at_ms');
-  const endedAtMs = spanEnd !== undefined
-    ? spanEnd
-    : event.latencyMs > 0 ? event.at + event.latencyMs : undefined;
+  const rawSpanEnd = attrNumber(attributes, 'anysentry.span.end_at_ms', 'span.end_at_ms');
+  // Adapter timestamps are hints, not an authority to create an unbounded open interval.  Accept
+  // an end only when it follows the observed start and remains inside the same bounded day.
+  const spanEnd = rawSpanEnd !== undefined
+    && rawSpanEnd >= event.at
+    && rawSpanEnd <= event.at + 24 * 60 * 60_000
+    ? rawSpanEnd
+    : undefined;
+  const endedAtMs = spanEnd
+    ?? (event.latencyMs > 0 && event.latencyMs <= 24 * 60 * 60_000
+      ? event.at + event.latencyMs : undefined);
   const explicitError = attributes['anysentry.tool.is_error'] === true
     || attributes['tool.is_error'] === true
     || (typeof attributes['error.type'] === 'string' && Boolean(attributes['error.type']))
