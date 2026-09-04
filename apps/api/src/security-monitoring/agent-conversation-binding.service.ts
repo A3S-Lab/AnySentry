@@ -140,9 +140,9 @@ const SEMANTIC_CONTENT_ATTRIBUTE_KEYS = [
  * Resolve the traffic lane for a durable JudgedEvent membership.
  *
  * Generic/application events reach this service when no legacy AgentInteraction parser was able
- * to claim them.  The old fallback used `kind.includes('tool')`, which made semantic
- * `AgentTool`/`ToolResult` records look like kernel ToolExec activity and also treated model/run
- * bookkeeping as human conversation.  Keep the compatibility aliases (`tool`, `exec`, etc.) but
+ * to claim them.  The old fallback used an unbounded tool-name substring match, which made
+ * semantic `AgentTool`/`ToolResult` records look like kernel ToolExec activity and also treated
+ * model/run bookkeeping as human conversation.  Keep the compatibility aliases (`tool`, `exec`, etc.) but
  * classify canonical semantic kinds by exact normalized identity.  Adapter-provided role metadata
  * remains the highest-authority override; no product or version names are involved here.
  */
