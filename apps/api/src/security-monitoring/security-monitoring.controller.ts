@@ -1433,6 +1433,130 @@ function canonicalSemanticRecordsForInteraction(
   return records;
 }
 
+function semanticToolHints(event: T.JudgedEvent): {
+  toolCallId?: string;
+  toolName?: string;
+  endpoint?: string;
+  completed: boolean;
+  isError: boolean;
+  resultHash?: string;
+  exitCode?: number;
+  endedAtUnixNs?: string;
+} {
+  const attributes = event.attributes ?? {};
+  const toolCallId = event.toolCallId
+    ?? attrText(attributes, 'anysentry.tool.call.id', 'gen_ai.tool.call.id', 'tool_call.id', 'tool.id');
+  const toolName = cleanString(attrText(
+    attributes,
+    'anysentry.tool.name',
+    'gen_ai.tool.name',
+    'tool.name',
+    'toolName',
+    'name',
+  ), 120);
+  const rawEndpoint = attrText(
+    attributes,
+    'anysentry.endpoint',
+    'gen_ai.tool.endpoint',
+    'tool.endpoint',
+    'server.address',
+    'net.peer.name',
+    'network.peer.address',
+    'peer.service',
+    'url.full',
+    'http.url',
+    'rpc.service',
+  );
+  const explicitPort = attrNumber(
+    attributes,
+    'anysentry.tool.port',
+    'server.port',
+    'net.peer.port',
+    'network.peer.port',
+    'destination.port',
+  );
+  let endpoint: string | undefined;
+  if (rawEndpoint || explicitPort !== undefined) {
+    const boundedPort = explicitPort !== undefined
+      && Number.isSafeInteger(explicitPort)
+      && explicitPort > 0
+      && explicitPort <= 65_535
+      ? String(Math.trunc(explicitPort))
+      : '';
+    try {
+      const candidate = rawEndpoint
+        ? rawEndpoint.includes('://') ? rawEndpoint : `http://${rawEndpoint}`
+        : `http://unknown${boundedPort ? `:${boundedPort}` : ''}`;
+      const parsed = new URL(candidate);
+      const host = parsed.hostname.trim();
+      if (host) {
+        const port = parsed.port || boundedPort;
+        const pathname = parsed.pathname && parsed.pathname !== '/'
+          ? parsed.pathname.slice(0, 240)
+          : '';
+        const protocol = parsed.protocol === 'https:' ? 'https' : 'http';
+        endpoint = `${protocol}://${host}${port ? `:${port}` : ''}${pathname}`;
+      }
+    } catch {
+      // Keep an opaque service/host hint only; never carry userinfo, query or fragment into the
+      // canonical interaction where it could expose a token or unbounded producer payload.
+      const opaque = rawEndpoint
+        ?.replace(/^[a-z][a-z0-9+.-]*:\/\//iu, '')
+        .split(/[?#]/u)[0]
+        .replace(/[\s"'`,;]/gu, '')
+        .slice(0, 240);
+      if (opaque) endpoint = `http://${opaque}${boundedPort && !/:\d{1,5}$/u.test(opaque) ? `:${boundedPort}` : ''}`;
+    }
+  }
+  const exitCode = attrNumber(attributes, 'anysentry.tool.exit_code', 'tool.exit_code', 'process.exit_code', 'exit_code');
+  const resultHashValue = attrText(attributes, 'anysentry.tool.result_hash', 'tool.result_hash', 'gen_ai.tool.result_hash');
+  const resultHash = resultHashValue && /^[a-f0-9]{16,128}$/iu.test(resultHashValue)
+    ? resultHashValue.toLowerCase()
+    : undefined;
+  const status = attrText(attributes, 'anysentry.tool.status', 'tool.status', 'status', 'otel.status_code', 'status.code');
+  const lifecyclePhase = attrText(attributes, 'anysentry.lifecycle.phase', 'lifecycle.phase', 'span.lifecycle.phase');
+  const spanEnd = attrNumber(attributes, 'anysentry.span.end_at_ms', 'span.end_at_ms');
+  const endedAtMs = spanEnd !== undefined
+    ? spanEnd
+    : event.latencyMs > 0 ? event.at + event.latencyMs : undefined;
+  const explicitError = attributes['anysentry.tool.is_error'] === true
+    || attributes['tool.is_error'] === true
+    || (typeof attributes['error.type'] === 'string' && Boolean(attributes['error.type']))
+    || (typeof attributes['error.message'] === 'string' && Boolean(attributes['error.message']))
+    || (typeof status === 'string' && /(?:error|fail)/iu.test(status));
+  const completed = exitCode !== undefined
+    || resultHash !== undefined
+    || spanEnd !== undefined
+    || /^(?:end|complete|completed|finished)$/iu.test(lifecyclePhase ?? '')
+    || (typeof status === 'string' && /^(?:ok|success|completed?|finished?|error|failed?)$/iu.test(status));
+  return {
+    ...(toolCallId ? { toolCallId } : {}),
+    ...(toolName ? { toolName } : {}),
+    ...(endpoint ? { endpoint } : {}),
+    completed,
+    isError: explicitError || (exitCode !== undefined && exitCode !== 0),
+    ...(resultHash ? { resultHash } : {}),
+    ...(exitCode !== undefined ? { exitCode } : {}),
+    ...(endedAtMs !== undefined && Number.isFinite(endedAtMs) && endedAtMs >= 0
+      ? { endedAtUnixNs: String(BigInt(Math.trunc(endedAtMs)) * 1_000_000n) }
+      : {}),
+  };
+}
+
+function semanticToolResultMarker(
+  payloadRef: string,
+  hints: ReturnType<typeof semanticToolHints>,
+): Record<string, unknown> {
+  return {
+    schemaVersion: 'anysentry.semantic_reference.v1',
+    payloadRef,
+    contentState: 'reference_only',
+    ...(hints.resultHash ? { resultHash: hints.resultHash } : {}),
+    ...(hints.exitCode !== undefined ? { exitCode: hints.exitCode } : {}),
+    ...(hints.isError ? { isError: true } : {}),
+  };
+}
+
 function canonicalSemanticRecordForEvent(
   event: T.JudgedEvent,
   authority: SemanticRecord['authority'],
@@ -1447,6 +1571,8 @@ function canonicalSemanticRecordForEvent(
     event.eventId,
   ].filter((value): value is string => Boolean(value)))];
   const normalizedKind = event.eventKind.trim().toLowerCase().replace(/[\s.-]+/gu, '_');
+  const toolHints = semanticToolHints(event);
+  const semanticToolCallId = toolHints.toolCallId;
   const kind: SemanticRecord['kind'] = event.eventKind === 'AgentTool'
     || ['tool', 'tool_call', 'toolcall', 'function_call', 'functioncall'].includes(normalizedKind)
     ? 'tool_call'
@@ -1483,7 +1609,7 @@ function canonicalSemanticRecordForEvent(
     subject: event.subject,
     attributes: event.attributes,
   })).digest('hex');
-  return [{
+  const baseRecord: SemanticRecord = {
     schemaVersion: 'anysentry.semantic_record.v1',
     semanticRecordId: `sr_${createHash('sha256').update(`${event.eventId}\0${kind}`).digest('hex').slice(0, 24)}`,
     revision: semanticRevision,
@@ -1521,7 +1647,7 @@ function canonicalSemanticRecordForEvent(
             ),
         }
       : {}),
-    ...(event.toolCallId ? { toolCallId: event.toolCallId } : {}),
+    ...(semanticToolCallId ? { toolCallId: semanticToolCallId } : {}),
     ...(event.tenantId ? { tenantId: event.tenantId } : {}),
     ...(event.ownerId ? { ownerId: event.ownerId } : {}),
     ...(event.logicalDefinitionFingerprint ? { logicalDefinitionFingerprint: event.logicalDefinitionFingerprint } : {}),
@@ -1537,7 +1663,23 @@ function canonicalSemanticRecordForEvent(
     completeness: event.rawObservationId ? 'complete' : 'partial',
     partialReasons: event.rawObservationId ? [] : ['raw_observation_missing'],
     payloadRef: `sha256:${payloadHash}`,
-  }];
+  };
+  if (kind !== 'tool_call' || !semanticToolCallId || !toolHints.completed) return [baseRecord];
+  // A completed OTLP execute_tool span carries no second log record.  Add a reference-only
+  // ToolResult projection from its explicit result hash/exit status so the human lane can close
+  // the call without copying tool output or claiming that a KernelFact was observed.
+  const resultPayloadRef = toolHints.resultHash
+    ? `sha256:${toolHints.resultHash}`
+    : baseRecord.payloadRef;
+  const resultRecord: SemanticRecord = {
+    ...baseRecord,
+    semanticRecordId: `sr_${createHash('sha256').update(`${event.eventId}\0tool_result`).digest('hex').slice(0, 24)}`,
+    kind: 'tool_result',
+    role: 'tool',
+    observedAtUnixNs: toolHints.endedAtUnixNs ?? baseRecord.observedAtUnixNs,
+    payloadRef: resultPayloadRef,
+  };
+  return [baseRecord, resultRecord];
 }
 
 /**
@@ -1568,13 +1710,26 @@ function canonicalInteractionForSemanticEvent(event: T.JudgedEvent): T.AgentInte
   const toolCallEvent = normalizedKind === 'agenttool' || normalizedKind === 'agent_tool'
     || normalizedKind === 'toolcall' || normalizedKind === 'tool_call';
   const toolResultEvent = normalizedKind === 'toolresult' || normalizedKind === 'tool_result';
-  const toolCallId = event.toolCallId
+  const toolHints = semanticToolHints(event);
+  const toolCallId = toolHints.toolCallId
     ?? (toolCallEvent || toolResultEvent
       ? `tc_${createHash('sha256').update(event.eventId).digest('hex').slice(0, 24)}`
       : undefined);
-  const toolName = typeof event.attributes.toolName === 'string'
-    ? event.attributes.toolName
-    : typeof event.attributes.name === 'string' ? event.attributes.name : 'application_tool';
+  const toolName = toolHints.toolName ?? 'application_tool';
+  const semanticEndpoint = toolHints.endpoint;
+  const completedToolEvent = toolCallEvent && toolHints.completed;
+  const projectedToolResult = toolResultEvent || completedToolEvent;
+  const toolResultAtUnixNs = toolHints.endedAtUnixNs ?? atUnixNs;
+  const semanticDurationNs = completedToolEvent
+    ? (() => {
+        try {
+          const duration = BigInt(toolResultAtUnixNs) - BigInt(atUnixNs);
+          return duration > 0n ? duration.toString() : '0';
+        } catch {
+          return '0';
+        }
+      })()
+    : '0';
   const turnId = event.turnId ?? event.runId;
   const message: T.AgentInteractionMessage | undefined = userMessage
     ? {
@@ -1649,6 +1804,8 @@ function canonicalInteractionForSemanticEvent(event: T.JudgedEvent): T.AgentInte
   return {
     schemaVersion: 'anysentry.agent_interaction.v1',
     interactionId: `mi_${createHash('sha256').update(`application-semantic\0${event.eventId}`).digest('hex').slice(0, 24)}`,
+    // Keep semantic tool spans in the model interaction lane for legacy timeline compatibility;
+    // the relation matcher separately recognizes `semanticOnly` records carrying ToolCall data.
     interactionType: 'model',
     semanticOnly: true,
     at: event.at,
@@ -1719,7 +1876,7 @@ function canonicalInteractionForSemanticEvent(event: T.JudgedEvent): T.AgentInte
     transportCompleteness: 'partial',
     wireCompleteness: 'unknown',
     conversationCompleteness: 'partial',
-    endpoint: 'application://semantic-event',
+    endpoint: semanticEndpoint ?? 'application://semantic-event',
     method: 'EVENT',
     path: `/${event.eventKind}`,
     statusCode: 200,
@@ -1727,16 +1884,27 @@ function canonicalInteractionForSemanticEvent(event: T.JudgedEvent): T.AgentInte
     startedAtUnixNs: atUnixNs,
     requestCompleteAtUnixNs: atUnixNs,
     firstResponseAtUnixNs: atUnixNs,
-    endedAtUnixNs: atUnixNs,
-    durationNs: '0',
+    endedAtUnixNs: completedToolEvent ? toolResultAtUnixNs : atUnixNs,
+    durationNs: semanticDurationNs,
     timeQuality: event.eventTimeQuality ?? 'api_received',
     request: interactionContent(requestMessages),
     response: interactionContent(responseMessages),
     toolCalls: toolCallEvent && toolCallId
       ? [{ toolCallId, name: toolName, arguments: contentMarker, issuedAtUnixNs: atUnixNs }]
       : [],
-    toolResults: toolResultEvent && toolCallId
-      ? [{ toolCallId, name: toolName, content: contentMarker, isError: false, observedAtUnixNs: atUnixNs }]
+    toolResults: projectedToolResult && toolCallId
+      ? [{
+          toolCallId,
+          name: toolName,
+          content: completedToolEvent
+            ? semanticToolResultMarker(
+                toolHints.resultHash ? `sha256:${toolHints.resultHash}` : payloadRef,
+                toolHints,
+              )
+            : contentMarker,
+          isError: toolHints.isError,
+          observedAtUnixNs: toolResultAtUnixNs,
+        }]
       : [],
     semanticParserId: 'universal-semantic-projection',
     semanticParserVersion: boundedCanonicalRevision(event.sessionResolutionRevision),
@@ -1754,7 +1922,23 @@ function canonicalInteractionForSemanticEvent(event: T.JudgedEvent): T.AgentInte
       turnId,
       completeness: 'partial',
       partialReasons: ['application_semantic_reference_only'],
-    }],
+    }, ...(completedToolEvent && toolCallId ? [{
+      semanticItemId: `si_${createHash('sha256').update(`${event.eventId}\0tool_result`).digest('hex').slice(0, 24)}`,
+      actor: 'tool' as const,
+      kind: 'tool_result' as const,
+      origin: 'response' as const,
+      atUnixNs: toolResultAtUnixNs,
+      content: semanticToolResultMarker(
+        toolHints.resultHash ? `sha256:${toolHints.resultHash}` : payloadRef,
+        toolHints,
+      ),
+      toolCallId,
+      toolName,
+      sourceItemId: event.eventId,
+      turnId,
+      completeness: 'partial' as const,
+      partialReasons: ['application_semantic_reference_only'],
+    }] : [])],
     completeness: 'reference_only',
     partialReasons: ['application_semantic_reference_only'],
     captureSource: 'authenticated_application_event',
@@ -4198,8 +4382,15 @@ function universalCorrelationClaimForResolve(
     return undefined;
   };
   const kind = canonicalEventKind(input);
-  const authority = kind === 'AgentTool' || kind === 'AgentInvocation'
-    || input.toolCallId !== undefined || value('tool_call.id', 'gen_ai.tool.call.id') !== undefined
+  const explicitAdapterClaim = kind === 'AgentTool' || kind === 'AgentInvocation'
+    || input.toolCallId !== undefined
+    || value(
+      'anysentry.adapter.schema',
+      'anysentry.adapter.runtime',
+      'tool_call.id',
+      'gen_ai.tool.call.id',
+    ) !== undefined;
+  const authority = explicitAdapterClaim
     ? 'agent_adapter' as const
     : 'application' as const;
   const claim = {
@@ -4313,6 +4504,7 @@ function bindTrustedCorrelationForIngest(
     ?? rawMetaAttribute(
       producerClaims,
       'anysentry.tool_call.id',
+      'anysentry.tool.call.id',
       'gen_ai.tool.call.id',
       'tool_call.id',
     );
@@ -4322,6 +4514,8 @@ function bindTrustedCorrelationForIngest(
     ?? rawMetaAttribute(
       producerClaims,
       'runId',
+      'anysentry.run.id',
+      'anysentry.run_id',
       'run.id',
       'gen_ai.run.id',
       'workflow_run_id',
@@ -5824,9 +6018,20 @@ function otlpRawCorrelationClaims(
     toolCallId: firstRawAttribute(
       combined,
       'anysentry.tool_call.id',
+      'anysentry.tool.call.id',
       'gen_ai.tool.call.id',
       'tool_call.id',
     ) ?? body.toolCallId,
+    runId: firstRawAttribute(
+      combined,
+      'anysentry.run.id',
+      'anysentry.run_id',
+      'runId',
+      'run.id',
+      'gen_ai.run.id',
+      'workflow_run_id',
+      'langgraph.run_id',
+    ) ?? body.runId,
     traceId: record.traceId ?? body.traceId ?? body.traceparent,
     sessionId: resourceSession ?? firstRawAttribute(
       combined,
@@ -6003,6 +6208,9 @@ function universalFromOtelAttrs(
     agentId: item.agentId ?? attrText(combined, 'anysentry.agent.id', 'agent.id', 'service.name', 'k8s.pod.name'),
     workspacePath: item.workspacePath ?? attrText(combined, 'anysentry.workspace'),
     sessionId: item.sessionId ?? attrText(combined, 'anysentry.session.id', 'gen_ai.conversation.id', 'session.id', 'service.instance.id'),
+    invocationId: item.invocationId ?? attrText(combined, 'anysentry.invocation.id', 'gen_ai.invocation.id', 'gen_ai.request.id'),
+    toolCallId: item.toolCallId ?? attrText(combined, 'anysentry.tool.call.id', 'anysentry.tool_call.id', 'gen_ai.tool.call.id', 'tool_call.id', 'tool.id'),
+    runId: item.runId ?? attrText(combined, 'anysentry.run.id', 'anysentry.run_id', 'runId', 'run.id', 'gen_ai.run.id', 'workflow_run_id', 'langgraph.run_id'),
     userId: item.userId ?? attrText(combined, 'enduser.id', 'user.id', 'user.name'),
     command,
     peer: endpoint,
@@ -10595,11 +10803,14 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     const resources = directoryItems
       .filter((item) => {
         const conversations = item.userThreads ?? [];
-        const runtimeIds = item.recentInstances.flatMap((instance) => [
+        const runtimeIds = [...new Set([
+          ...item.agentInstanceIds,
+          ...item.recentInstances.flatMap((instance) => [
           instance.agentInstanceId,
           instance.canonicalAgentInstanceId,
           ...(instance.agentInstanceAliases ?? []),
-        ]);
+          ]),
+        ])];
         const sessionIds = conversations.flatMap((conversation) => [
           conversation.conversationId,
           conversation.sessionId,
@@ -12591,9 +12802,14 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       }
       const kind = canonicalEventKind(input);
       const adapterPolicy = sourceResolution.source?.correlationClaims;
-      const authenticatedSemanticAdapter = (
-        kind === 'AgentTool' || kind === 'AgentInvocation'
-      ) && sourceResolution.authenticated
+      // A trusted Adapter owns the complete semantic trace, not only the two span kinds that
+      // happen to carry an explicit tool.  Apply the same server-side identity/correlation gate
+      // to LlmApi, WorkflowNode, User/Model messages and ToolResult so one run cannot fragment
+      // into a confirmed Tool span plus unassigned model/node spans.  The policy remains the
+      // authority boundary; generic OTLP sources without it are not promoted.
+      const semanticAgentEvent = isSemanticUniversalEventKind(kind);
+      const authenticatedSemanticAdapter = semanticAgentEvent
+        && sourceResolution.authenticated
         && adapterPolicy?.enabled === true
         && adapterPolicy.authority === 'agent_adapter';
       if (producerEventKey && authenticatedSemanticAdapter) {
@@ -12708,7 +12924,6 @@ export class SecurityMonitoringController implements OnModuleDestroy {
             },
           }
         : this.agentMetadata.applyReview(timedDerived, observedAt);
-      const semanticAgentEvent = kind === 'AgentTool' || kind === 'AgentInvocation';
       const authenticatedSemanticAdapterForEvent = semanticAgentEvent && authenticatedSemanticAdapter;
       const serverEnrichment = authenticatedSemanticAdapter
         ? this.kube.enrichAuthenticatedAgentSemantic(

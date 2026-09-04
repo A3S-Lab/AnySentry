@@ -282,6 +282,7 @@ assert.equal(httpToolRelations[0].status, 'linked_strong');
 assert.equal(toolEvidenceHotPathTesting.semanticKernelEventCategory(httpToolCall), 'network');
 assert.equal(httpToolRelations[0].linkMethod, 'network');
 assert.equal(httpToolRelations[0].kernelEventId, sandboxEgress.eventId);
+
 const resolvedServiceEgress = {
   ...sandboxEgress,
   eventId: 'evt_sandbox_cluster_ip_egress',
@@ -299,6 +300,27 @@ const resolvedServiceRelations = buildSemanticKernelRelations(
 assert.equal(resolvedServiceRelations[0].status, 'linked_strong');
 assert.equal(resolvedServiceRelations[0].linkMethod, 'network_endpoint');
 assert.equal(resolvedServiceRelations[0].kernelEventId, resolvedServiceEgress.eventId);
+
+// Authenticated OTLP semantic Tool spans stay in the legacy model interaction lane for timeline
+// compatibility, but their explicit semanticOnly ToolCall must still provide a network endpoint
+// hint to the shared correlation algorithm.
+const semanticOnlyHttpInteraction = {
+  ...httpToolInteraction,
+  interactionType: 'model',
+  semanticOnly: true,
+  toolCalls: [httpToolCall],
+};
+const semanticOnlyHttpRelations = buildSemanticKernelRelations(
+  httpToolCall,
+  toolResult,
+  semanticOnlyHttpInteraction,
+  [resolvedServiceEgress],
+  13,
+  false,
+);
+assert.equal(semanticOnlyHttpRelations[0].status, 'linked_strong');
+assert.equal(semanticOnlyHttpRelations[0].linkMethod, 'network_endpoint');
+assert.equal(semanticOnlyHttpRelations[0].kernelEventId, resolvedServiceEgress.eventId);
 const ambiguousServiceEndpoint = buildSemanticKernelRelations(
   httpToolCall,
   toolResult,

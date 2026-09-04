@@ -142,7 +142,12 @@ function toolHost(event: T.AgentSemanticEvent): string | undefined {
 }
 
 function interactionEndpointHost(interaction: T.AgentInteractionRecord): string | undefined {
-  if (interaction.interactionType !== 'tool') return undefined;
+  // Application/OTLP semantic Tool spans are kept in the legacy model lane so the existing
+  // conversation timeline remains compatible.  Their explicit `semanticOnly` + ToolCall shape
+  // is still a trusted endpoint hint for correlation; ordinary model calls must not enter this
+  // path merely because they carry a provider URL.
+  if (interaction.interactionType !== 'tool'
+    && !(interaction.semanticOnly === true && interaction.toolCalls.length > 0)) return undefined;
   const endpoint = text(interaction.endpoint, 1_000);
   if (!endpoint || endpoint === 'unknown') return undefined;
   try {
@@ -153,7 +158,8 @@ function interactionEndpointHost(interaction: T.AgentInteractionRecord): string 
 }
 
 function interactionEndpointPort(interaction: T.AgentInteractionRecord): number | undefined {
-  if (interaction.interactionType !== 'tool') return undefined;
+  if (interaction.interactionType !== 'tool'
+    && !(interaction.semanticOnly === true && interaction.toolCalls.length > 0)) return undefined;
   const endpoint = text(interaction.endpoint, 1_000);
   if (!endpoint || endpoint === 'unknown') return undefined;
   try {
@@ -189,6 +195,8 @@ function candidateHost(event: T.AgentEventListItem): string | undefined {
   return text(event.attributes.host, 512)?.toLowerCase()
     ?? text(event.attributes.serverAddress, 512)?.toLowerCase()
     ?? text(event.attributes['server.address'], 512)?.toLowerCase()
+    ?? text(event.attributes.peer, 512)?.toLowerCase()
+    ?? text(event.attributes['network.peer.address'], 512)?.toLowerCase()
     ?? text(event.attributes.hostname, 512)?.toLowerCase();
 }
 

@@ -433,6 +433,7 @@ if (health.storage?.clickhouseReady) {
 const otlpWorkspace = `${workspacePath}/otel`;
 const otlpInvocationId = `${runId}-otlp-invocation`;
 const otlpToolCallId = `${runId}-otlp-write`;
+const otlpRunId = `${runId}-otlp-run`;
 const otlpTraceId = sha256(`${runId}-otlp-trace`).slice(0, 32);
 const otlpPath = `${otlpWorkspace}/output.txt`;
 const otlpSource = await createSource({
@@ -475,6 +476,7 @@ const otlpIngest = await request('/ingest/otlp/v1/traces', 'POST', {
           stringAttr('gen_ai.operation.name', 'invoke_agent'),
           stringAttr('gen_ai.agent.name', 'pi-otel'),
           stringAttr('anysentry.invocation.id', otlpInvocationId),
+          stringAttr('anysentry.run.id', otlpRunId),
         ],
       },
       {
@@ -488,6 +490,8 @@ const otlpIngest = await request('/ingest/otlp/v1/traces', 'POST', {
           stringAttr('gen_ai.operation.name', 'execute_tool'),
           stringAttr('gen_ai.tool.name', 'write'),
           stringAttr('gen_ai.tool.call.id', otlpToolCallId),
+          stringAttr('anysentry.endpoint', 'python-sandbox:8080/execute?token=should-not-persist'),
+          stringAttr('anysentry.run.id', otlpRunId),
           stringAttr('gen_ai.tool.call.arguments', '{"path":"/secret","content":"never-persist-this"}'),
           stringAttr('anysentry.invocation.id', otlpInvocationId),
           stringAttr('anysentry.tool.resource_hash', sha256(otlpPath)),
@@ -534,6 +538,26 @@ assert.equal(otlpToolEvent.items[0].eventKind, 'AgentTool');
 assert.equal(otlpToolEvent.items[0].eventCategory, 'tool');
 assert.equal(otlpToolEvent.items[0].traceId, otlpTraceId);
 assert.equal(otlpToolEvent.items[0].attributes['gen_ai.tool.call.arguments'], '[redacted]');
+assert.equal(otlpToolEvent.items[0].runId, otlpRunId, 'namespaced run id must remain a producer run across OTLP spans');
+
+// The compatibility Conversation projection must retain generic GenAI tool hints and close a
+// completed single-span execute_tool without copying its arguments/result body.
+const semanticInteractions = await request('/agents/interactions', 'POST', {
+  timeType: 'custom',
+  startTime: new Date(otlpStart - 2_000).toISOString(),
+  endTime: new Date(otlpEnd + 2_000).toISOString(),
+  scope: 'raw',
+  limit: 500,
+});
+const projected = semanticInteractions.items.find((item) =>
+  item.toolCalls?.some((call) => call.toolCallId === otlpToolCallId));
+assert(projected, 'OTLP AgentTool must enter the common interaction projection');
+const projectedCall = projected.toolCalls.find((call) => call.toolCallId === otlpToolCallId);
+assert.equal(projectedCall.name, 'write', 'standard gen_ai.tool.name must survive projection');
+assert.equal(projected.endpoint, 'http://python-sandbox:8080/execute', 'endpoint must be normalized without query/userinfo');
+assert.equal(projected.toolResults.length, 1, 'a completed execute_tool span must emit one reference-only ToolResult');
+assert.equal(projected.toolResults[0].isError, false);
+assert.equal(projected.runId, otlpRunId, 'run identity must not fall back to an event-local derived id');
 
 await disableCreatedSources();
 console.log('S6 trusted Tool evidence API E2E passed');
