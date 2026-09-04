@@ -265,6 +265,12 @@ function verifyAnySentryManifest() {
     anySentryDeployment?.source,
   );
   assert(
+    'AnySentry canonical raw/kernel persistence is bounded and asynchronous in the formal ingest path',
+    /name:\s*ANYSENTRY_CANONICAL_ASYNC_PERSIST,\s*value:\s*"on"/u.test(anySentryDeployment?.source ?? '') &&
+      /name:\s*ANYSENTRY_CANONICAL_ASYNC_PERSIST_MAX_INFLIGHT,\s*value:\s*"8"/u.test(anySentryDeployment?.source ?? ''),
+    anySentryDeployment?.source,
+  );
+  assert(
     'AnySentry livez implementation is a public O(1) marker independent of storage services',
     /@SkipWrap\(\)[\s\S]*?livez\(\):[\s\S]*?schemaVersion:\s*'anysentry\.livez\.v1'[\s\S]*?status:\s*'ok'/u.test(livezBlock) &&
       !/(?:judge|clickhouse|postgres|healthz|aggregation|cacheStateStats)/iu.test(livezBlock),

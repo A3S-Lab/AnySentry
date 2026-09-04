@@ -8,6 +8,10 @@ spec:
     metadata:
       annotations:
         anysentry.io/manual-observer-profile: "agent-enforce-docker-no-files-v2"
+        # Keep the locally delivered immutable overlay and source checkpoints auditable in the
+        # rendered PodTemplate; this is not a remote publication identifier.
+        anysentry.io/local-overlay-manifest: "sha256:e3882614a0e828c765ca907ae8fcd21e8f11b997e17b6287e738bbf15378862e"
+        anysentry.io/local-source-revision: "Observer@40556f5+AnySentry@2133a64+d961545"
     spec:
       containers:
         - name: a3s-observer

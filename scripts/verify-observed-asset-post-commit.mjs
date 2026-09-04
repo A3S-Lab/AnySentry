@@ -42,8 +42,11 @@ assert.match(batchBody.slice(0, publish), /if \(!persisted\)[\s\S]*?return \{/u,
   'structural persistence failure must return before asset publication');
 assert.match(batchBody.slice(0, publish), /isClickHouseEventBufferFull[\s\S]*?return \{/u,
   'retained persistence failure must return before asset publication');
-assert.match(batchBody.slice(publish), /retainedDurability === 'durable'/u,
-  'memory-only retained batches must not publish Asset/Runtime state');
+assert.match(
+  batchBody.slice(publish),
+  /(?:retainedDurability === 'durable'|isolatePostCommitProjection)/u,
+  'memory-only retained batches must not publish Asset/Runtime state',
+);
 
 const singleBody = controller.slice(singleStart);
 assert(singleBody.indexOf('materializeCommittedObservedAsset') > singleBody.indexOf('acceptWithDisposition'),

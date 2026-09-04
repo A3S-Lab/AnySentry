@@ -36,6 +36,7 @@ import {
   SubjectAssetScope,
   SubjectAssetType,
 } from './observed-asset-lifecycle.types';
+import { captureClassificationDecision } from './identity-judgment-routing';
 
 const SUBJECT_TYPES: SubjectAssetType[] = ['agent', 'service', 'infrastructure', 'workload', 'ephemeral_process'];
 const EXISTENCE_STATES: AssetExistenceState[] = ['discovered', 'active', 'inactive', 'retired'];
@@ -153,7 +154,12 @@ function defaultObservation(type: SubjectAssetType): ObservationState {
 }
 
 function captureProfileFor(type: SubjectAssetType, identity: ObservedAgentIdentity, role: ObservedWorkloadRole): string {
-  if (identity === 'confirmed_agent') return 'agent_full';
+  // Candidate identity is an observational label, not a lower-fidelity capture tier.  Resolve the
+  // effective policy once so the asset/lifecycle projection agrees with Observer and Judge: the
+  // default candidate mode uses the same full profile, while an explicit legacy override remains
+  // visible as probable_investigation for controlled rollback tests.
+  const effective = captureClassificationDecision(identity).effective;
+  if (effective === 'confirmed_agent') return 'agent_full';
   if (identity === 'probable_agent') return 'probable_investigation';
   if (role === 'anysentry_internal') return 'self_health';
   if (role === 'platform_infrastructure') return 'infrastructure_aggregate';

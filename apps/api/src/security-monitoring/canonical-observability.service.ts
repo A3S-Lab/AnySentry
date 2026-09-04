@@ -307,6 +307,23 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   private gapPersistenceInFlight = 0;
   private gapPersistenceDropped = 0;
   private readonly gapPersistenceMaxInFlight = 32;
+  // Canonical raw/derived rows are a rebuildable side lane.  A slow relational store must not
+  // hold the compatibility Observer ingest request (and therefore the Collector pipe) open for
+  // its full database timeout.  The opt-in switch keeps direct/unit callers' historical
+  // synchronous contract while formal deployments can use bounded eventual persistence.
+  private readonly asyncPersistence = process.env.ANYSENTRY_CANONICAL_ASYNC_PERSIST === 'on';
+  private readonly asyncPersistenceMaxInFlight = boundedEnvInt(
+    'ANYSENTRY_CANONICAL_ASYNC_PERSIST_MAX_INFLIGHT',
+    8,
+    1,
+    64,
+  );
+  private asyncPersistenceInFlight = 0;
+  private asyncPersistenceScheduled = 0;
+  private asyncPersistenceCompleted = 0;
+  private asyncPersistenceFailed = 0;
+  private asyncPersistenceDropped = 0;
+  private readonly asyncPersistenceTasks = new Set<Promise<void>>();
 
   constructor(@Optional() relationalStore?: RelationalBusinessStore) {
     for (const descriptor of DEFAULT_TRANSPORT_REGISTRY) this.transports.register(descriptor);
@@ -320,6 +337,62 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
 
   setSink(sink: CanonicalRawObservationSink | undefined): void {
     this.sink = sink;
+  }
+
+  /**
+   * Persist one canonical side-lane batch without making the Observer request wait for a slow
+   * database.  The operation is intentionally converted to a non-rejecting Promise before it is
+   * placed in the bounded task set; a late sink failure becomes a metadata-only CoverageGap.
+   * Returns `true` when a task was admitted (or when the synchronous write durably completed).
+   * Synchronous mode is retained for compatibility; asynchronous callers must treat an admitted
+   * task as pending rather than as an already durable read-model row.
+   */
+  private async writeCanonicalSideLane(
+    operation: () => Promise<boolean>,
+    onFailure: () => void,
+  ): Promise<boolean> {
+    if (!this.sink || this.closed) return false;
+    const reportFailure = () => {
+      if (this.closed) return;
+      try { onFailure(); } catch { /* coverage is best effort */ }
+    };
+    if (!this.asyncPersistence) {
+      try {
+        const durable = await operation();
+        if (!durable) reportFailure();
+        return durable;
+      } catch {
+        reportFailure();
+        return false;
+      }
+    }
+    if (this.asyncPersistenceInFlight >= this.asyncPersistenceMaxInFlight) {
+      this.asyncPersistenceDropped += 1;
+      reportFailure();
+      return false;
+    }
+    this.asyncPersistenceInFlight += 1;
+    this.asyncPersistenceScheduled += 1;
+    let task!: Promise<void>;
+    task = Promise.resolve()
+      .then(operation)
+      .then((durable) => {
+        if (durable) this.asyncPersistenceCompleted += 1;
+        else {
+          this.asyncPersistenceFailed += 1;
+          reportFailure();
+        }
+      })
+      .catch(() => {
+        this.asyncPersistenceFailed += 1;
+        reportFailure();
+      })
+      .finally(() => {
+        this.asyncPersistenceInFlight = Math.max(0, this.asyncPersistenceInFlight - 1);
+        this.asyncPersistenceTasks.delete(task);
+      });
+    this.asyncPersistenceTasks.add(task);
+    return true;
   }
 
   registryCatalog(): {
@@ -392,15 +465,26 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     let durable = false;
     let commitGap: CoverageGap | undefined;
     if (this.sink) {
-      try {
-        durable = await this.sink.saveRawObservations([sanitized]);
-      } catch {
-        durable = false;
-      }
-      if (!durable) {
+      let sideLaneGap: CoverageGap | undefined;
+      const failure = () => {
         // Keep processing the machine lane even when the durable raw sink is unavailable. The hot
         // RawObservation and derived KernelFact must remain available for degradation analysis.
-        commitGap = this.recordGap('raw_commit', 'storage_unavailable', sanitized.observationId);
+        sideLaneGap = this.recordGap('raw_commit', 'storage_unavailable', sanitized.observationId);
+      };
+      if (this.asyncPersistence) {
+        const admitted = await this.writeCanonicalSideLane(
+          () => this.sink!.saveRawObservations!([sanitized]),
+          failure,
+        );
+        // In async mode a task admitted to the bounded side lane is intentionally hot-only from
+        // the request's perspective; its eventual durable result is reflected by metrics/gaps.
+        if (!admitted) commitGap = sideLaneGap ?? this.recordGap('raw_commit', 'storage_unavailable', sanitized.observationId);
+      } else {
+        durable = await this.writeCanonicalSideLane(
+          () => this.sink!.saveRawObservations!([sanitized]),
+          failure,
+        );
+        if (!durable) commitGap = sideLaneGap ?? this.recordGap('raw_commit', 'storage_unavailable', sanitized.observationId);
       }
     }
     if (!sanitized.process && ['kernel', 'uprobe', 'socket_payload', 'forwarder'].includes(sanitized.source.sourceType)) {
@@ -435,13 +519,16 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       if (kernelResult.status === 'inserted' || kernelResult.status === 'duplicate') {
         kernelFact = kernelResult.fact;
         if (this.sink?.saveKernelFacts) {
-          try {
-            if (!await this.sink.saveKernelFacts([kernelFact])) {
-              this.recordGap('raw_commit', 'storage_unavailable', sanitized.observationId, { kernelFact: 'durability_unavailable' });
-            }
-          } catch {
-            this.recordGap('raw_commit', 'storage_unavailable', sanitized.observationId, { kernelFact: 'durability_unavailable' });
-          }
+          const kernelFailure = () => this.recordGap(
+            'raw_commit',
+            'storage_unavailable',
+            sanitized.observationId,
+            { kernelFact: 'durability_unavailable' },
+          );
+          await this.writeCanonicalSideLane(
+            () => this.sink!.saveKernelFacts!([kernelFact!]),
+            kernelFailure,
+          );
         }
       }
       if (kernelResult.status === 'rejected' || kernelResult.status === 'conflict') {
@@ -634,12 +721,14 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       .map((result) => result.record);
     let durable = false;
     if (acceptedRecords.length > 0 && this.sink?.saveSemanticRecords) {
-      try {
-        durable = await this.sink.saveSemanticRecords(acceptedRecords);
-      } catch {
-        durable = false;
-      }
-      if (!durable) this.recordGap('projection', 'storage_unavailable', 'semantic_record', { count: acceptedRecords.length });
+      durable = await this.writeCanonicalSideLane(
+        () => this.sink!.saveSemanticRecords!(acceptedRecords),
+        () => this.recordGap('projection', 'storage_unavailable', 'semantic_record', { count: acceptedRecords.length }),
+      );
+      // A scheduled asynchronous write is pending, not yet durable from the caller's point of
+      // view.  The hot SemanticRecord remains queryable while the completion updates the durable
+      // sink or records a bounded gap.
+      if (this.asyncPersistence) durable = false;
     }
     return {
       accepted: results.filter((result) => result.status === 'inserted' || result.status === 'duplicate').length,
@@ -705,8 +794,11 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       .map((result) => result.link);
     let durable = false;
     if (acceptedLinks.length > 0 && this.sink?.saveEvidenceLinks) {
-      try { durable = await this.sink.saveEvidenceLinks(acceptedLinks); } catch { durable = false; }
-      if (!durable) this.recordGap('projection', 'storage_unavailable', 'evidence_link', { count: acceptedLinks.length });
+      durable = await this.writeCanonicalSideLane(
+        () => this.sink!.saveEvidenceLinks!(acceptedLinks),
+        () => this.recordGap('projection', 'storage_unavailable', 'evidence_link', { count: acceptedLinks.length }),
+      );
+      if (this.asyncPersistence) durable = false;
     }
     return {
       accepted: results.filter((result) => result.status === 'inserted' || result.status === 'duplicate').length,
@@ -771,8 +863,11 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       .map((result) => result.membership);
     let durable = false;
     if (acceptedMemberships.length > 0 && this.sink?.saveSessionMemberships) {
-      try { durable = await this.sink.saveSessionMemberships(acceptedMemberships); } catch { durable = false; }
-      if (!durable) this.recordGap('projection', 'storage_unavailable', 'session_membership', { count: acceptedMemberships.length });
+      durable = await this.writeCanonicalSideLane(
+        () => this.sink!.saveSessionMemberships!(acceptedMemberships),
+        () => this.recordGap('projection', 'storage_unavailable', 'session_membership', { count: acceptedMemberships.length }),
+      );
+      if (this.asyncPersistence) durable = false;
     }
     return {
       accepted: results.filter((result) => result.status === 'inserted' || result.status === 'duplicate').length,
@@ -842,6 +937,13 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     persistenceMaxInFlight: number;
     persistenceDropped: number;
     durableReadConflicts: number;
+    asyncPersistence: boolean;
+    asyncPersistenceInFlight: number;
+    asyncPersistenceMaxInFlight: number;
+    asyncPersistenceScheduled: number;
+    asyncPersistenceCompleted: number;
+    asyncPersistenceFailed: number;
+    asyncPersistenceDropped: number;
   } {
     return {
       entries: this.gaps.size,
@@ -857,6 +959,13 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       persistenceMaxInFlight: this.gapPersistenceMaxInFlight,
       persistenceDropped: this.gapPersistenceDropped,
       durableReadConflicts: this.durableReadConflicts,
+      asyncPersistence: this.asyncPersistence,
+      asyncPersistenceInFlight: this.asyncPersistenceInFlight,
+      asyncPersistenceMaxInFlight: this.asyncPersistenceMaxInFlight,
+      asyncPersistenceScheduled: this.asyncPersistenceScheduled,
+      asyncPersistenceCompleted: this.asyncPersistenceCompleted,
+      asyncPersistenceFailed: this.asyncPersistenceFailed,
+      asyncPersistenceDropped: this.asyncPersistenceDropped,
     };
   }
 

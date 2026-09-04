@@ -1268,7 +1268,7 @@ function AgentDetail({
                 ) : null}
               </div>
               <p className="mt-2 text-xs leading-5 text-zinc-400">
-                显示名和身份裁决相互独立，原始事件始终保留。候选可确认或降为未知；只有尚未识别的稳定身份才能标记为非 Agent。
+                显示名和身份裁决相互独立，原始事件始终保留。候选身份默认按已确认 Agent 的完整采集与判断档位处理，不需要人工 token 升级；只有尚未识别的稳定身份才能标记为非 Agent。
               </p>
               {agent.workloadRef?.systemdUnit?.startsWith("session-") ? (
                 <p className="mt-1 text-xs leading-5 text-amber-200/80">
@@ -1292,16 +1292,9 @@ function AgentDetail({
             </div>
             <div className="flex shrink-0 flex-wrap items-center gap-2">
               {(agent.classification === "probable_agent" || agent.classification === "unknown") ? (
-                <Button
-                  type="button"
-                  size="sm"
-                  disabled={reviewing || Boolean(pendingReview)}
-                  onClick={() => onRequestReview("confirmed_agent")}
-                  className="h-8 bg-emerald-500 text-[#07100c] hover:bg-emerald-400"
-                >
-                  {reviewing ? <LoaderCircle className="size-3.5 animate-spin" /> : <BadgeCheck className="size-3.5" />}
-                  确认是 Agent
-                </Button>
+                <Pill className="border-teal-400/30 bg-teal-500/10 text-teal-100">
+                  候选已按完整档位采集 · 无需手动升级
+                </Pill>
               ) : null}
               {agent.classification === "unknown" ? (
                 <Button
