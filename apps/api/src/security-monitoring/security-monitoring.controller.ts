@@ -12473,26 +12473,37 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         deliveryError = observerProjectionFailureCode(error);
       }
       if (deliveryRetryFrom < 0) {
-        try {
-          await this.enqueueCanonicalBatchMany(retainedForPersistence);
-        } catch (error) {
-          if (!isolatePostCommitProjection) {
+        if (isolatePostCommitProjection) {
+          const firstContext = retainedForPersistence[0];
+          if (firstContext) {
+            this.scheduleObserverProjection(
+              (firstContext.prepared as PreparedRetainedJudgeAccept).event.eventId,
+              'canonical_stream',
+              () => this.enqueueCanonicalBatchMany(retainedForPersistence),
+              () => undefined,
+              (error) => {
+                // Kafka/Redis canonical publishing is an optional derived lane.  The immutable
+                // event, KernelFact, and L1/pending judgment are already durable; retain them and
+                // expose the missing projection through Coverage instead of replaying the batch.
+                for (const context of retainedForPersistence) {
+                  markProjectionFailure(
+                    context.index,
+                    (context.prepared as PreparedRetainedJudgeAccept).event.eventId,
+                    'canonical_stream',
+                    error,
+                  );
+                }
+              },
+            );
+          }
+        } else {
+          try {
+            await this.enqueueCanonicalBatchMany(retainedForPersistence);
+          } catch (error) {
             deliveryRetryFrom = Math.min(...retainedForPersistence.map(({ index }) => index));
             deliveryError = observerProjectionFailureCode(error);
             // Keep the legacy retry path for memory-only mode, where the primary durability fence
             // has not been crossed and replay is still the safe recovery mechanism.
-          } else {
-            // Kafka/Redis canonical publishing is an optional derived lane.  The immutable event,
-            // KernelFact, and L1/pending judgment are already durable; retain them and expose the
-            // missing projection through Coverage instead of replaying the whole batch.
-            for (const context of retainedForPersistence) {
-              markProjectionFailure(
-                context.index,
-                (context.prepared as PreparedRetainedJudgeAccept).event.eventId,
-                'canonical_stream',
-                error,
-              );
-            }
           }
         }
       }
