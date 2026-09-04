@@ -1685,6 +1685,8 @@ function canonicalSemanticRecordForEvent(
     role: 'tool',
     observedAtUnixNs: toolHints.endedAtUnixNs ?? baseRecord.observedAtUnixNs,
     payloadRef: resultPayloadRef,
+    completeness: 'partial',
+    partialReasons: ['application_semantic_reference_only'],
   };
   return [baseRecord, resultRecord];
 }
