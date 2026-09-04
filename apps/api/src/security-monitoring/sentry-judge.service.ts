@@ -2580,6 +2580,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       runtimeLeaseFenced: rawFilter.runtimeLeaseFenced === true,
       runtimeSnapshotRejected: clamp(rawFilter.runtimeSnapshotRejected),
       runtimeSnapshotDuplicates: clamp(rawFilter.runtimeSnapshotDuplicates),
+      runtimeSnapshotEntryDuplicates: clamp(rawFilter.runtimeSnapshotEntryDuplicates),
+      runtimeSnapshotEntryConflicts: clamp(rawFilter.runtimeSnapshotEntryConflicts),
       lastRuntimeSnapshotAt: cleanText(rawFilter.lastRuntimeSnapshotAt, 80),
       lastRuntimeSnapshotError: cleanText(rawFilter.lastRuntimeSnapshotError, 500),
       lastRuntimeSnapshotFailureAt: cleanText(rawFilter.lastRuntimeSnapshotFailureAt, 80),

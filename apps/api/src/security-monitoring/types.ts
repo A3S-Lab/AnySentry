@@ -3719,6 +3719,10 @@ export interface CollectorFilterMetrics {
   runtimeLeaseFenced?: boolean;
   runtimeSnapshotRejected?: number;
   runtimeSnapshotDuplicates?: number;
+  /** Runtime entries withheld because a process/workload alias would violate snapshot identity. */
+  runtimeSnapshotEntryDuplicates?: number;
+  /** Runtime entries retained as distinct generations while a duplicate identity candidate was observed. */
+  runtimeSnapshotEntryConflicts?: number;
   lastRuntimeSnapshotAt?: string;
   lastRuntimeSnapshotError?: string;
   /** Sticky timestamp for the most recent terminal or exhausted snapshot failure. */
