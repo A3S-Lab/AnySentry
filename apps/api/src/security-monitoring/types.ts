@@ -2608,7 +2608,8 @@ export interface AgentSemanticEvidenceResponse extends ClassifiedResponseMeta {
    * field keeps semantic→Kernel navigation available when the legacy relation projector is
    * delayed or unavailable. */
   canonicalEvidenceLinks?: EvidenceLink[];
-  canonicalEvidenceLinksSource?: 'canonical_store' | 'computed_compatibility';
+  canonicalEvidenceLinksSource?: 'canonical_store' | 'canonical_store+hot_delta' | 'memory_hot_ring' | 'computed_compatibility';
+  canonicalEvidenceLinksCoverage?: { partial: boolean; reasons: string[] };
   coverage: QueryCoverage;
   updateTime: string;
 }
@@ -2631,7 +2632,8 @@ export interface AgentKernelSemanticContextResponse {
    * authoritative when available; links are retained even when that compatibility projection is
    * missing. */
   canonicalEvidenceLinks?: EvidenceLink[];
-  canonicalEvidenceLinksSource?: 'canonical_store' | 'computed_compatibility';
+  canonicalEvidenceLinksSource?: 'canonical_store' | 'canonical_store+hot_delta' | 'memory_hot_ring' | 'computed_compatibility';
+  canonicalEvidenceLinksCoverage?: { partial: boolean; reasons: string[] };
   updateTime: string;
 }
 

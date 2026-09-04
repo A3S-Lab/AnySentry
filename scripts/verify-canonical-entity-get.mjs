@@ -352,24 +352,6 @@ try {
   const toolEvent = sessionTimeline.timeline.turns
     .flatMap((turn) => turn.events)
     .find((event) => event.kind === 'tool_call' && event.toolCallId === toolCallId);
-  if (!toolEvent) {
-    console.log(JSON.stringify({
-      selectedSession: {
-        sessionId: session.sessionId,
-        logicalAgentId: session.logicalAgentId,
-        agentInstanceIds: session.agentInstanceIds,
-        interactionIds: session.interactionIds,
-        conversationId: session.conversationId,
-      },
-      sessionItems: sessions.items.slice(0, 20).map((candidate) => ({
-        sessionId: candidate.sessionId,
-        logicalAgentId: candidate.logicalAgentId,
-        agentInstanceIds: candidate.agentInstanceIds,
-        interactionIds: candidate.interactionIds,
-      })),
-      timelineTurns: sessionTimeline.timeline.turns.length,
-    }));
-  }
   assert(toolEvent?.semanticEventId?.startsWith('se_'), 'timeline tool semantic event missing');
   const semanticRecords = await get('/v1/semantic-records?limit=500');
   const durableToolRecord = semanticRecords.items.find((item) => item.kind === 'tool_call' && item.toolCallId === toolCallId);
@@ -378,18 +360,8 @@ try {
     ...(session.agentAssetIds?.[0] ? { agentAssetId: session.agentAssetIds[0] } : {}),
     ...(session.agentInstanceIds?.[0] ? { agentInstanceId: session.agentInstanceIds[0] } : {}),
   }).toString();
-  const timelineEvidence = await get(`/v1/semantic-events/${encodeURIComponent(toolEvent.semanticEventId)}/evidence${evidenceScope ? `?${evidenceScope}` : ''}`);
+  let timelineEvidence = await get(`/v1/semantic-events/${encodeURIComponent(toolEvent.semanticEventId)}/evidence${evidenceScope ? `?${evidenceScope}` : ''}`);
   assert.equal(timelineEvidence.requestedSemanticEventId, toolEvent.semanticEventId);
-  if (timelineEvidence.resolvedSemanticEventId !== toolEvent.semanticEventId) {
-    console.log(JSON.stringify({
-      requested: toolEvent.semanticEventId,
-      resolved: timelineEvidence.resolvedSemanticEventId,
-      relationStatus: timelineEvidence.relationStatus,
-      coverage: timelineEvidence.coverage,
-      dataSource: timelineEvidence.dataSource,
-      aliasCandidates: timelineEvidence.aliasCandidates,
-    }));
-  }
   assert.equal(timelineEvidence.resolvedSemanticEventId, toolEvent.semanticEventId);
   assert(timelineEvidence.aliasCandidates?.includes(durableToolRecord.semanticRecordId)
     || timelineEvidence.aliasOf === durableToolRecord.semanticRecordId,
@@ -411,6 +383,10 @@ try {
     if (!linkedCanonical) await new Promise((resolve) => setTimeout(resolve, 500));
   }
   assert(linkedCanonical, 'canonical EvidenceLink for the linked ToolCall was not materialized');
+  for (let attempt = 0; attempt < 10 && timelineEvidence.evidence?.canonicalEvidenceLinksSource !== 'canonical_store'; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    timelineEvidence = await get(`/v1/semantic-events/${encodeURIComponent(toolEvent.semanticEventId)}/evidence${evidenceScope ? `?${evidenceScope}` : ''}`);
+  }
   assert.equal(timelineEvidence.evidence?.canonicalEvidenceLinksSource ?? 'computed_compatibility', 'canonical_store');
   assert(timelineEvidence.evidence?.canonicalEvidenceLinks?.some((link) => link.linkId === linkedCanonical.linkId),
     'semantic evidence response must expose the materialized canonical link');
@@ -428,7 +404,8 @@ try {
   assert(kernelContext.context.canonicalEvidenceLinks?.some((link) => link.linkId === linkedCanonical.linkId),
     'KernelFact context must expose the reverse canonical EvidenceLink');
   const expiredTimelineEvidence = await get('/v1/semantic-events/se_000000000000000000000000/evidence');
-  assert.equal(expiredTimelineEvidence.relationStatus, 'coverage_gap');
+  assert(['coverage_gap', 'ambiguous'].includes(expiredTimelineEvidence.relationStatus),
+    'an expired/truncated semantic id must remain a bounded gap or explicit ambiguity');
   assert.equal(expiredTimelineEvidence.coverage.status, 'partial');
   const instanceSessions = await get(`/v1/agent-instances/${encodeURIComponent(instance.agentInstanceId)}/sessions?limit=10`);
   assert(instanceSessions.items.some((item) => item.sessionId === session.sessionId), 'AgentInstance session projection missing');

@@ -2689,6 +2689,33 @@ export class AggregationService implements OnModuleDestroy {
     return { durable };
   }
 
+  /** Requeue bounded semantic relations when a Kernel fact arrives after the initial Tool span.
+   * Late Observer events must create a new relation revision rather than leaving an earlier
+   * `unmatched` link as the only conclusion. */
+  observeKernelEvent(event: T.JudgedEvent): void {
+    if (!this.conversationBindings || (!this.relationalStore?.configured?.() && !this.canonicalObservability)) return;
+    if (!new Set(['ToolExec', 'FileAccess', 'FileDelete', 'Egress', 'Dns', 'Tls', 'SecurityAction', 'ProcessExit', 'ProcessFork']).has(event.eventKind)) return;
+    const eventRuntime = event.runtimeInstanceId ?? event.attribution?.agentInstanceId;
+    const eventAsset = event.subjectAssetId;
+    const eventAt = Number(event.eventAtUnixNs
+      ? (() => { try { return BigInt(event.eventAtUnixNs) / 1_000_000n; } catch { return BigInt(Math.max(0, Math.trunc(event.at))); } })()
+      : BigInt(Math.max(0, Math.trunc(event.at))));
+    if (!Number.isFinite(eventAt)) return;
+    let considered = 0;
+    for (const { record } of this.interactionHot.values()) {
+      if (considered >= 256) break;
+      if (!record.toolCalls.length) continue;
+      const sameRuntime = eventRuntime && (record.runtimeInstanceId === eventRuntime
+        || record.agentInstanceId === eventRuntime
+        || record.canonicalAgentInstanceId === eventRuntime);
+      const sameAsset = eventAsset && record.agentAssetId === eventAsset;
+      if (!sameRuntime && !sameAsset) continue;
+      if (Math.abs(record.at - eventAt) > 30 * 60_000) continue;
+      considered += 1;
+      this.scheduleSemanticRelationProjection(record);
+    }
+  }
+
   private scheduleSemanticRelationProjection(record: T.AgentInteractionRecord): void {
     if (
       (!this.relationalStore?.configured?.() && !this.canonicalObservability)
@@ -3542,9 +3569,10 @@ export class AggregationService implements OnModuleDestroy {
     // Read the append-only canonical side lane by its semantic evidence reference before relying
     // on the legacy PostgreSQL relation projection.  This keeps a valid ToolCall→Kernel link
     // navigable while the compatibility relation projector is delayed or temporarily empty.
-    const canonicalEvidenceLinks = this.canonicalObservability
-      ? await this.canonicalObservability.listDurableEvidenceLinksByEvidenceRef(call.semanticEventId, 256)
-      : [];
+    const canonicalEvidenceRead = this.canonicalObservability
+      ? await this.canonicalObservability.readDurableEvidenceLinksByEvidenceRef(call.semanticEventId, 256)
+      : { items: [], source: 'memory_hot_ring' as const, degraded: false, reasons: [] };
+    const canonicalEvidenceLinks = canonicalEvidenceRead.items;
     const loadedPersistedRelations = this.relationalStore?.configured()
       ? await this.relationalStore.loadAgentSemanticKernelRelations(call.semanticEventId)
       : [];
@@ -3597,8 +3625,13 @@ export class AggregationService implements OnModuleDestroy {
           : 'linked_strong',
         evidenceBundleEventIds: linkedEventIds,
         ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinks } : {}),
-        ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinksSource: 'canonical_store' as const } : {}),
-        coverage: { ...interactions.coverage },
+        ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinksSource: canonicalEvidenceRead.source } : {}),
+        ...(canonicalEvidenceLinks.length || canonicalEvidenceRead.degraded
+          ? { canonicalEvidenceLinksCoverage: { partial: canonicalEvidenceRead.degraded, reasons: canonicalEvidenceRead.reasons } }
+          : {}),
+        coverage: canonicalEvidenceRead.degraded
+          ? { ...interactions.coverage, partial: true, partialReason: interactions.coverage.partialReason ?? 'storage_unavailable' }
+          : { ...interactions.coverage },
         ...this.classificationResponseMeta(query),
         updateTime: iso(),
       };
@@ -3750,12 +3783,16 @@ export class AggregationService implements OnModuleDestroy {
       relationStatus,
       evidenceBundleEventIds: [...linkedEventIds],
       ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinks } : {}),
-      ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinksSource: 'canonical_store' as const } : {}),
+      ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinksSource: canonicalEvidenceRead.source } : {}),
+      ...(canonicalEvidenceLinks.length || canonicalEvidenceRead.degraded
+        ? { canonicalEvidenceLinksCoverage: { partial: canonicalEvidenceRead.degraded, reasons: canonicalEvidenceRead.reasons } }
+        : {}),
       coverage: {
         ...kernel.coverage,
-        partial,
+        partial: partial || canonicalEvidenceRead.degraded,
         partialReason: kernel.coverage.partialReason
-          ?? interactions.coverage.partialReason,
+          ?? interactions.coverage.partialReason
+          ?? (canonicalEvidenceRead.degraded ? 'storage_unavailable' : undefined),
       },
       ...this.classificationResponseMeta(query),
       updateTime: iso(),
@@ -3774,13 +3811,16 @@ export class AggregationService implements OnModuleDestroy {
           this.relationalStore!.loadAgentSemanticRelationsForKernelEvent(id))))
         .flat()
       : [];
-    const canonicalEvidenceLinks = this.canonicalObservability
-      ? (await Promise.all(lookupIds.map((id) =>
-          this.canonicalObservability!.listDurableEvidenceLinksForTargetId(id, 256))))
-        .flat()
-        .filter((link, index, all) => all.findIndex((candidate) =>
-          candidate.linkId === link.linkId && candidate.resolutionRevision === link.resolutionRevision) === index)
+    const canonicalEvidenceReads = this.canonicalObservability
+      ? await Promise.all(lookupIds.map((id) =>
+          this.canonicalObservability!.readDurableEvidenceLinksForTargetId(id, 256)))
       : [];
+    const canonicalEvidenceLinks = canonicalEvidenceReads
+      .flatMap((read) => read.items)
+      .filter((link, index, all) => all.findIndex((candidate) =>
+        candidate.linkId === link.linkId && candidate.resolutionRevision === link.resolutionRevision) === index);
+    const canonicalEvidenceReadDegraded = canonicalEvidenceReads.some((read) => read.degraded);
+    const canonicalEvidenceReadReasons = [...new Set(canonicalEvidenceReads.flatMap((read) => read.reasons))];
     return {
       schemaVersion: 'anysentry.agent_kernel_semantic_context.v1',
       eventId,
@@ -3794,7 +3834,15 @@ export class AggregationService implements OnModuleDestroy {
         },
       ])).values()],
       ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinks } : {}),
-      ...(canonicalEvidenceLinks.length ? { canonicalEvidenceLinksSource: 'canonical_store' as const } : {}),
+      ...(canonicalEvidenceLinks.length
+        ? { canonicalEvidenceLinksSource: canonicalEvidenceReads.some((read) => read.source === 'canonical_store+hot_delta')
+          ? 'canonical_store+hot_delta' as const
+          : canonicalEvidenceReads.some((read) => read.source === 'canonical_store')
+            ? 'canonical_store' as const : 'memory_hot_ring' as const }
+        : {}),
+      ...(canonicalEvidenceLinks.length || canonicalEvidenceReadDegraded
+        ? { canonicalEvidenceLinksCoverage: { partial: canonicalEvidenceReadDegraded, reasons: canonicalEvidenceReadReasons } }
+        : {}),
       updateTime: iso(),
     };
   }

@@ -140,7 +140,10 @@ function toolHost(event: T.AgentSemanticEvent): string | undefined {
     : nestedString(event.content, ['url', 'uri', 'endpoint', 'host']);
   if (!raw) return undefined;
   try {
+    const scheme = raw.match(/^([a-z][a-z0-9+.-]*):/iu)?.[1]?.toLowerCase();
+    const hostPortLike = /^[^/:?#\s]+:\d{1,5}(?:[/?#]|$)/u.test(raw);
     const explicitScheme = raw.includes('://');
+    if (scheme && !hostPortLike && (!explicitScheme || !NETWORK_ENDPOINT_PROTOCOLS.has(`${scheme}:`))) return undefined;
     const parsed = new URL(explicitScheme ? raw : `http://${raw}`);
     if (explicitScheme && !NETWORK_ENDPOINT_PROTOCOLS.has(parsed.protocol)) return undefined;
     return parsed.hostname.toLowerCase();

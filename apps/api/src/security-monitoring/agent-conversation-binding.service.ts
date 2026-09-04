@@ -119,7 +119,8 @@ const EXECUTION_BACKGROUND_EVENT_KINDS = new Set([
   'noderun', 'node', 'workflownode',
 ]);
 const LLM_EVENT_KINDS = new Set([
-  'llmapi', 'llmcall', 'llminteraction', 'llmresponse', 'llm', 'modelresponse',
+  'llmapi', 'llm_api', 'llmcall', 'llm_call', 'llminteraction', 'llm_interaction',
+  'llmresponse', 'llm_response', 'llm', 'modelresponse', 'model_response',
 ]);
 const MESSAGE_EVENT_KINDS = new Set([
   'usermessage', 'userinput', 'humanmessage', 'inputmessage',
@@ -1193,8 +1194,12 @@ export class AgentConversationBindingService implements OnModuleDestroy {
       ...(sessionKey ? { sessionKey } : {}),
       ...(event.providerSessionIdHash ? { providerSessionIdHash: event.providerSessionIdHash } : {}),
       ...(event.sessionNamespaceKey ? { sessionNamespaceKey: event.sessionNamespaceKey } : {}),
-      ...(event.sessionMode ? { sessionMode: event.sessionMode } : {}),
-      ...(event.sessionLifecycle ? { sessionLifecycle: event.sessionLifecycle } : {}),
+      ...(event.sessionMode
+        ? { sessionMode: event.sessionMode }
+        : !sessionKey && !rawSession ? { sessionMode: 'per_request' as const } : {}),
+      ...(event.sessionLifecycle
+        ? { sessionLifecycle: event.sessionLifecycle }
+        : !sessionKey && !rawSession ? { sessionLifecycle: 'new' as const } : {}),
       ...(() => {
         const canonicalParentSessionId = event.canonicalParentSessionId
           ?? canonicalParentSessionIdForMembership(

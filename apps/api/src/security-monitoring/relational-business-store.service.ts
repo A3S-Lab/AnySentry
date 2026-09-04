@@ -173,6 +173,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   private pool?: Pool;
   private initializePromise?: Promise<boolean>;
   private ready = false;
+  private evidenceLinksReadFailureAt = 0;
   private readonly effectOwnerId = `api:${process.pid}:${randomUUID()}`;
   private readonly writerOwnershipCache = new Map<string, number>();
   private readonly writerOwnershipInFlight = new Map<string, Promise<WriterOwnership>>();
@@ -188,6 +189,12 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
 
   isReady(): boolean {
     return this.ready;
+  }
+
+  /** Read-side availability for the canonical EvidenceLink index. A successful empty query is
+   * healthy; callers use this distinction to label hot-ring fallback as partial during outages. */
+  isEvidenceLinksReadAvailable(): boolean {
+    return this.evidenceLinksReadFailureAt === 0;
   }
 
   async onModuleInit(): Promise<void> {
@@ -1496,7 +1503,10 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     resolutionRevision?: number;
     limit?: number;
   } = {}): Promise<EvidenceLink[]> {
-    if (!(await this.initialize()) || !this.pool) return [];
+    if (!(await this.initialize()) || !this.pool) {
+      this.evidenceLinksReadFailureAt = Date.now();
+      return [];
+    }
     const requested = Number(input.limit ?? 1_000);
     const limit = Number.isFinite(requested)
       ? Math.max(1, Math.min(SEMANTIC_RECORD_LIMIT, Math.trunc(requested))) : 1_000;
@@ -1530,6 +1540,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
           LIMIT ${limitBind}`,
         params,
       );
+      this.evidenceLinksReadFailureAt = 0;
       return result.rows
         .flatMap(({ record }) => {
           const parsed = this.parseRecord<EvidenceLink>(record);
@@ -1537,6 +1548,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
           return checked.ok ? [checked.value] : [];
         });
     } catch (error) {
+      this.evidenceLinksReadFailureAt = Date.now();
       this.markUnavailable('load canonical EvidenceLinks', error);
       return [];
     }

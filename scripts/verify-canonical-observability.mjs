@@ -16,6 +16,7 @@ const interactionParser = require('../apps/api/dist/security-monitoring/agent-in
 const { AgentMetadataService } = require('../apps/api/dist/security-monitoring/agent-metadata.service.js');
 const { CanonicalObservabilityService } = require('../apps/api/dist/security-monitoring/canonical-observability.service.js');
 const { captureClassificationDecision } = require('../apps/api/dist/security-monitoring/identity-judgment-routing.js');
+const { semanticProjectionTesting } = require('../apps/api/dist/security-monitoring/security-monitoring.controller.js');
 
 const {
   RawObservationStore,
@@ -33,6 +34,67 @@ const {
   validateRawObservation,
 } = canonical;
 const digest = (value) => createHash('sha256').update(value).digest('hex');
+
+const semanticFixture = (eventKind, attributes = {}) => ({
+  eventId: `evt-semantic-${eventKind}`,
+  eventKind,
+  at: 1_788_000_000_000,
+  eventAtUnixNs: '1788000000000000000000',
+  receivedAt: 1_788_000_000_001,
+  subject: eventKind,
+  agentId: 'fixture-adapter',
+  workspacePath: '/workspace/semantic-fixture',
+  sessionId: 'sess-fixture',
+  canonicalSessionId: 'sess_fixture_canonical',
+  sessionIdSource: 'per_request',
+  sessionIdentityQuality: 'ephemeral',
+  sessionMode: 'per_request',
+  runId: 'producer-run-fixture',
+  runIdSource: 'producer',
+  turnId: 'turn-fixture',
+  invocationId: 'invocation-fixture',
+  toolCallId: 'tool-fixture',
+  attributes,
+  process: { pid: 42, hostId: 'fixture-host', bootId: 'fixture-boot', startTimeTicks: '100' },
+  attribution: { agentInstanceId: 'runtime-fixture', workloadRef: { environment: 'host' } },
+  rawObservationId: 'ro_fixture',
+  sessionResolutionRevision: 1,
+  identityRevision: 1,
+  latencyMs: 10,
+});
+
+// The universal semantic classifier is shared by the ingest gate, canonical SemanticRecord and
+// compatibility Interaction projection. Exercise aliases that commonly arrive from OTLP/adapter
+// producers so a new spelling cannot populate only one evidence lane.
+for (const [kind, expected] of [
+  ['function_call', 'tool_call'], ['execute_tool', 'tool_call'],
+  ['function_result', 'tool_result'], ['node_result', 'tool_result'],
+  ['LlmApi', 'llm_call'], ['LlmInteraction', 'llm_call'],
+  ['user_input', 'user_message'], ['assistant_message', 'model_message'],
+]) {
+  assert.equal(semanticProjectionTesting.universalSemanticKindClass(kind), expected, `${kind} semantic alias`);
+  const event = semanticFixture(kind, { 'gen_ai.tool.call.id': 'tool-fixture' });
+  const records = semanticProjectionTesting.canonicalSemanticRecordForEvent(event, 'authenticated_adapter');
+  assert(records.some((record) => record.kind === (expected === 'tool_call' ? 'tool_call' : expected === 'tool_result' ? 'tool_result' : expected === 'llm_call' ? 'llm_call' : 'message')),
+    `${kind} must create a canonical SemanticRecord`);
+  const interaction = semanticProjectionTesting.canonicalInteractionForSemanticEvent(event);
+  if (expected === 'tool_call') assert.equal(interaction.toolCalls.length, 1, `${kind} ToolCall projection`);
+  if (expected === 'tool_result') assert.equal(interaction.toolResults.length, 1, `${kind} ToolResult projection`);
+  if (expected === 'llm_call' || expected === 'model_message') assert(interaction.semanticItems.some((item) => item.actor === 'model'), `${kind} model projection`);
+}
+const unknownResultInteraction = semanticProjectionTesting.canonicalInteractionForSemanticEvent(
+  semanticFixture('ToolResult', { 'anysentry.tool.call.id': 'tool-unknown', 'anysentry.tool.status': 'UNSET' }),
+);
+assert.equal(unknownResultInteraction.toolResults[0]?.isError, undefined,
+  'UNSET ToolResult status must remain unknown rather than implicit success');
+const placeholderHints = semanticProjectionTesting.semanticToolHints(
+  semanticFixture('AgentTool', { 'anysentry.tool.call.id': 'tool-placeholder', 'anysentry.endpoint': 'application://semantic-event' }),
+);
+assert.equal(placeholderHints.endpoint, undefined, 'non-network endpoint schemes must not become relation hints');
+const singleSlashPlaceholderHints = semanticProjectionTesting.semanticToolHints(
+  semanticFixture('AgentTool', { 'anysentry.tool.call.id': 'tool-placeholder-single', 'anysentry.endpoint': 'application:/semantic-event' }),
+);
+assert.equal(singleSlashPlaceholderHints.endpoint, undefined, 'single-slash non-network URI schemes must not become relation hints');
 
 const registeredA = resolveLogicalAgentDefinition({
   logicalAgentId: 'definition-alpha', family: 'generic-agent', tenantId: 'tenant-a', ownerId: 'owner-a',
@@ -348,5 +410,27 @@ const byTarget = await linkService.listDurableEvidenceLinksForTargetId('kf_canon
 assert.equal(byTarget.length, 1, 'reverse KernelFact lookup must retain the canonical link');
 assert.equal(byTarget[0].linkId, linkBase.linkId);
 linkService.close();
+
+const degradedLinkService = new CanonicalObservabilityService();
+await degradedLinkService.commitEvidenceLinks([linkBase]);
+degradedLinkService.setSink({
+  loadEvidenceLinks: async () => { throw new Error('synthetic store outage'); },
+});
+const degradedLinkRead = await degradedLinkService.readDurableEvidenceLinksForTargetId('kf_canonical-fixture', 10);
+assert.equal(degradedLinkRead.degraded, true, 'canonical link sink failure must be surfaced as degraded');
+assert.equal(degradedLinkRead.source, 'memory_hot_ring');
+assert(degradedLinkRead.reasons.includes('canonical_evidence_link_projection_unavailable'));
+degradedLinkService.close();
+
+const unavailableLinkService = new CanonicalObservabilityService();
+await unavailableLinkService.commitEvidenceLinks([linkBase]);
+unavailableLinkService.setSink({
+  loadEvidenceLinks: async () => [],
+  isEvidenceLinksReadAvailable: () => false,
+});
+const unavailableLinkRead = await unavailableLinkService.readDurableEvidenceLinksForTargetId('kf_canonical-fixture', 10);
+assert.equal(unavailableLinkRead.degraded, true, 'a sink that reports unavailable must degrade canonical reads');
+assert(unavailableLinkRead.reasons.includes('canonical_evidence_link_projection_unavailable'));
+unavailableLinkService.close();
 
 console.log('canonical observability identity/session verification passed');

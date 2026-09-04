@@ -379,6 +379,17 @@ const placeholderContentRelations = buildSemanticKernelRelations(
 assert.equal(placeholderContentRelations[0].status, 'semantic_only',
   'non-network tool URL schemes must not become endpoint correlation hints');
 assert.equal(placeholderContentRelations[0].kernelEventId, undefined);
+const singleSlashPlaceholderRelations = buildSemanticKernelRelations(
+  { ...placeholderContentCall, semanticEventId: 'se_semantic_single_slash', content: { url: 'application:/semantic-event' } },
+  toolResult,
+  { ...semanticOnlyHttpInteraction, endpoint: 'unknown' },
+  [{ ...placeholderEndpointCandidate, eventId: 'evt_application_host', attributes: { host: 'application', port: 80 } }],
+  13,
+  false,
+);
+assert.equal(singleSlashPlaceholderRelations[0].status, 'semantic_only',
+  'single-slash non-network URI schemes must not become endpoint correlation hints');
+assert.equal(singleSlashPlaceholderRelations[0].kernelEventId, undefined);
 const sameHostWrongPort = {
   ...resolvedServiceEgress,
   eventId: 'evt_same_host_wrong_port',

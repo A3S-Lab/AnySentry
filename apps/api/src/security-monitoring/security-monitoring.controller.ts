@@ -1483,7 +1483,15 @@ function semanticToolHints(event: T.JudgedEvent): {
       && explicitPort <= 65_535
       ? String(Math.trunc(explicitPort))
       : '';
+    const endpointScheme = rawEndpoint?.match(/^([a-z][a-z0-9+.-]*):/iu)?.[1]?.toLowerCase();
+    const endpointHostPortLike = Boolean(rawEndpoint && /^[^/:?#\s]+:\d{1,5}(?:[/?#]|$)/u.test(rawEndpoint));
+    const unsupportedEndpointScheme = Boolean(
+      endpointScheme
+      && !endpointHostPortLike
+      && (!rawEndpoint?.includes('://') || !networkEndpointProtocols.has(`${endpointScheme}:`)),
+    );
     try {
+      if (unsupportedEndpointScheme) throw new Error('non-network endpoint scheme');
       const candidate = rawEndpoint
         ? rawEndpoint.includes('://') ? rawEndpoint : `http://${rawEndpoint}`
         : `http://unknown${boundedPort ? `:${boundedPort}` : ''}`;
@@ -1497,14 +1505,13 @@ function semanticToolHints(event: T.JudgedEvent): {
         const pathname = parsed.pathname && parsed.pathname !== '/'
           ? parsed.pathname.slice(0, 240)
           : '';
-        const protocol = parsed.protocol === 'https:' ? 'https' : 'http';
+        const protocol = parsed.protocol.replace(/:$/u, '').toLowerCase();
         endpoint = `${protocol}://${host}${port ? `:${port}` : ''}${pathname}`;
       }
     } catch {
       // Keep an opaque service/host hint only; never carry userinfo, query or fragment into the
       // canonical interaction where it could expose a token or unbounded producer payload.
-      const explicitProtocol = rawEndpoint?.match(/^([a-z][a-z0-9+.-]*):\/\//iu)?.[1]?.toLowerCase();
-      if (!explicitProtocol || networkEndpointProtocols.has(`${explicitProtocol}:`)) {
+      if (!unsupportedEndpointScheme) {
         const opaque = rawEndpoint
           ?.replace(/^[a-z][a-z0-9+.-]*:\/\//iu, '')
           .split(/[?#]/u)[0]
@@ -1533,17 +1540,34 @@ function semanticToolHints(event: T.JudgedEvent): {
   const endedAtMs = spanEnd
     ?? (event.latencyMs > 0 && event.latencyMs <= 24 * 60 * 60_000
       ? event.at + event.latencyMs : undefined);
-  const hasErrorSignal = Object.prototype.hasOwnProperty.call(attributes, 'anysentry.tool.is_error')
-    || Object.prototype.hasOwnProperty.call(attributes, 'tool.is_error')
-    || Object.prototype.hasOwnProperty.call(attributes, 'error.type')
-    || Object.prototype.hasOwnProperty.call(attributes, 'error.message')
-    || exitCode !== undefined
-    || Boolean(status);
-  const explicitError = attributes['anysentry.tool.is_error'] === true
-    || attributes['tool.is_error'] === true
-    || (typeof attributes['error.type'] === 'string' && Boolean(attributes['error.type']))
-    || (typeof attributes['error.message'] === 'string' && Boolean(attributes['error.message']))
-    || (typeof status === 'string' && /(?:error|fail)/iu.test(status));
+  const boolSignal = (value: unknown): boolean | undefined => {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string' && /^(?:true|false)$/iu.test(value.trim())) return value.trim().toLowerCase() === 'true';
+    if (typeof value === 'number' && (value === 0 || value === 1)) return value === 1;
+    return undefined;
+  };
+  const primaryToolError = boolSignal(attributes['anysentry.tool.is_error']);
+  const aliasToolError = boolSignal(attributes['tool.is_error']);
+  const explicitToolError = primaryToolError === true || aliasToolError === true
+    ? true : primaryToolError ?? aliasToolError;
+  const errorType = typeof attributes['error.type'] === 'string' ? attributes['error.type'].trim() : '';
+  const errorMessage = typeof attributes['error.message'] === 'string' ? attributes['error.message'].trim() : '';
+  const meaningfulErrorType = Boolean(errorType && !/^(?:none|ok|unset|unknown)$/iu.test(errorType));
+  const meaningfulErrorMessage = Boolean(errorMessage && !/^(?:none|ok|unset|unknown)$/iu.test(errorMessage));
+  const normalizedStatus = status?.trim().toLowerCase();
+  const statusError = Boolean(normalizedStatus && /^(?:error|fail(?:ed|ure)?|cancel(?:led)?|unset_error)$/iu.test(normalizedStatus));
+  const statusSuccess = Boolean(normalizedStatus && /^(?:ok|success(?:ful)?|succeed(?:ed)?|complete(?:d)?|finish(?:ed)?)$/iu.test(normalizedStatus));
+  const explicitError = explicitToolError === true
+    || meaningfulErrorType
+    || meaningfulErrorMessage
+    || statusError
+    || (exitCode !== undefined && exitCode !== 0);
+  const hasErrorSignal = explicitToolError !== undefined
+    || meaningfulErrorType
+    || meaningfulErrorMessage
+    || statusError
+    || statusSuccess
+    || exitCode !== undefined;
   const terminalLifecycle = /^(?:end|complete|completed|finished)$/iu.test(lifecyclePhase ?? '');
   // A generic OTLP status=OK can be attached to a span at start time.  It is useful for error
   // classification, but without an explicit end timestamp/lifecycle, exit code, or result hash it
@@ -1623,7 +1647,8 @@ function semanticTrafficRole(
     return /bootstrap/iu.test(normalizedKind) ? 'bootstrap' : 'control';
   }
   if (hasHumanOrToolContent) return 'conversation';
-  if (['agentinvocation', 'noderun', 'workflow_node', 'workflownode', 'node_run'].includes(normalizedKind)) {
+  const semanticClass = universalSemanticKindClass(normalizedKind);
+  if (semanticClass === 'node_run') {
     return 'background';
   }
   // A model/API span with a trusted run/session anchor can still be part of the human-visible
@@ -1633,8 +1658,11 @@ function semanticTrafficRole(
   const providerSessionAnchor = Boolean(event.sessionKey)
     || ['provider', 'authenticated_adapter'].includes(event.sessionIdSource ?? '')
     || ['confirmed', 'strong'].includes(event.sessionIdentityQuality ?? '');
-  if (['llmapi', 'llmcall', 'llminteraction', 'llm_response', 'llmresponse'].includes(normalizedKind)
-    && (producerRunAnchor || event.turnId || providerSessionAnchor)) {
+  const semanticContent = ['anysentry.content', 'gen_ai.prompt', 'gen_ai.completion', 'gen_ai.input.messages',
+    'gen_ai.output.messages', 'user.message', 'tool_call.id', 'gen_ai.tool.call.id']
+    .some((key) => event.attributes?.[key] !== undefined);
+  if (semanticClass === 'llm_call'
+    && (semanticContent || producerRunAnchor || event.turnId || providerSessionAnchor)) {
     return 'conversation';
   }
   const technicalKinds = new Set([
@@ -1644,6 +1672,44 @@ function semanticTrafficRole(
   ]);
   if (technicalKinds.has(normalizedKind)) return 'background';
   return 'background';
+}
+
+type UniversalSemanticKindClass = 'tool_call' | 'tool_result' | 'node_run' | 'llm_call' | 'user_message' | 'model_message';
+
+const UNIVERSAL_SEMANTIC_KIND_CLASSES: Readonly<Record<UniversalSemanticKindClass, ReadonlySet<string>>> = {
+  tool_call: new Set([
+    'agenttool', 'agent_tool', 'tool', 'toolcall', 'tool_call', 'functioncall', 'function_call',
+    'executetool', 'execute_tool',
+  ]),
+  tool_result: new Set([
+    'toolresult', 'tool_result', 'functionresult', 'function_result', 'agenttoolresult',
+    'agent_tool_result', 'noderesult', 'node_result',
+  ]),
+  node_run: new Set([
+    'agentinvocation', 'agent_invocation', 'invokeagent', 'invoke_agent', 'workflowrun',
+    'workflow_run', 'agentrun', 'agent_run', 'noderun', 'node_run', 'node', 'workflownode',
+    'workflow_node',
+  ]),
+  llm_call: new Set([
+    'llm', 'llmcall', 'llm_call', 'llmapi', 'llm_api', 'llminteraction', 'llm_interaction',
+    'llmresponse', 'llm_response', 'modelresponse', 'model_response',
+  ]),
+  user_message: new Set([
+    'usermessage', 'user_message', 'userinput', 'user_input', 'humanmessage', 'human_message',
+    'inputmessage', 'input_message',
+  ]),
+  model_message: new Set([
+    'modelmessage', 'model_message', 'assistantmessage', 'assistant_message', 'assistantoutput',
+    'assistant_output', 'finalresponse', 'final_response',
+  ]),
+};
+
+function universalSemanticKindClass(kind: string): UniversalSemanticKindClass | undefined {
+  const normalized = kind.trim().toLowerCase().replace(/[\s.-]+/gu, '_');
+  for (const [className, values] of Object.entries(UNIVERSAL_SEMANTIC_KIND_CLASSES) as Array<[UniversalSemanticKindClass, ReadonlySet<string>]>) {
+    if (values.has(normalized)) return className;
+  }
+  return undefined;
 }
 
 function canonicalSemanticRecordForEvent(
@@ -1659,31 +1725,28 @@ function canonicalSemanticRecordForEvent(
     event.rawObservationId,
     event.eventId,
   ].filter((value): value is string => Boolean(value)))];
-  const normalizedKind = event.eventKind.trim().toLowerCase().replace(/[\s.-]+/gu, '_');
+  const semanticClass = universalSemanticKindClass(event.eventKind);
   const toolHints = semanticToolHints(event);
   const semanticToolCallId = toolHints.toolCallId;
-  const kind: SemanticRecord['kind'] = event.eventKind === 'AgentTool'
-    || ['tool', 'tool_call', 'toolcall', 'function_call', 'functioncall'].includes(normalizedKind)
+  const kind: SemanticRecord['kind'] = semanticClass === 'tool_call'
     ? 'tool_call'
-    : event.eventKind === 'AgentInvocation'
-      || ['node', 'node_run', 'noderun', 'workflow_run', 'workflowrun', 'agent_run', 'agentrun'].includes(normalizedKind)
+    : semanticClass === 'node_run'
       ? 'node_run'
-      : event.eventKind === 'LlmCall' || event.eventKind === 'LlmApi' || event.eventKind === 'LlmInteraction'
-        || ['llm', 'llm_call', 'llmcall', 'llm_response', 'llmresponse', 'model_response', 'modelresponse'].includes(normalizedKind)
+      : semanticClass === 'llm_call'
         ? 'llm_call'
-    : ['tool_result', 'toolresult', 'function_result', 'functionresult', 'agent_tool_result', 'agenttoolresult', 'node_result', 'noderesult'].includes(normalizedKind)
+    : semanticClass === 'tool_result'
       ? 'tool_result'
-      : ['user_message', 'usermessage', 'user_input', 'human_message', 'input_message'].includes(normalizedKind)
+      : semanticClass === 'user_message'
         ? 'message'
-        : ['model_message', 'modelmessage', 'assistant_message', 'assistantmessage', 'assistant_output', 'final_response'].includes(normalizedKind)
+        : semanticClass === 'model_message'
               ? 'message'
               : 'runtime_activity';
   const role: SemanticRecord['role'] = kind === 'tool_call' || kind === 'node_run'
     ? 'model'
     : kind === 'tool_result' ? 'tool'
-      : ['user_message', 'usermessage', 'user_input', 'human_message', 'input_message'].includes(normalizedKind)
+      : semanticClass === 'user_message'
         ? 'user'
-        : ['model_message', 'modelmessage', 'assistant_message', 'assistantmessage', 'assistant_output', 'final_response'].includes(normalizedKind)
+        : semanticClass === 'model_message'
           ? 'model' : undefined;
   const observedAtUnixNs = event.eventAtUnixNs ?? String(BigInt(Math.max(1, event.at)) * 1_000_000n);
   const adapterRevision = Number(event.attributes?.semanticParserVersion
@@ -1786,6 +1849,7 @@ function canonicalSemanticRecordForEvent(
  */
 function canonicalInteractionForSemanticEvent(event: T.JudgedEvent): T.AgentInteractionRecord {
   const normalizedKind = event.eventKind.trim().toLowerCase().replace(/[\s.-]+/gu, '_');
+  const semanticClass = universalSemanticKindClass(event.eventKind);
   const atUnixNs = event.eventAtUnixNs
     ?? (BigInt(Math.max(1, Math.trunc(event.at))) * 1_000_000n).toString();
   const payloadDigest = createHash('sha256').update(JSON.stringify({
@@ -1800,25 +1864,10 @@ function canonicalInteractionForSemanticEvent(event: T.JudgedEvent): T.AgentInte
     payloadRef,
     contentState: 'reference_only',
   };
-  const userMessage = [
-    'usermessage', 'user_message', 'userinput', 'user_input', 'humanmessage', 'human_message',
-    'inputmessage', 'input_message',
-  ].includes(normalizedKind);
-  const modelMessage = [
-    'modelmessage', 'model_message', 'llmresponse', 'llm_response', 'llmcall', 'llm_call',
-    'llmapi', 'llm_api', 'llminteraction', 'llm_interaction', 'modelresponse', 'model_response',
-    'assistantmessage', 'assistant_message', 'assistantoutput', 'assistant_output', 'finalresponse',
-    'final_response',
-  ]
-    .includes(normalizedKind);
-  const toolCallEvent = [
-    'agenttool', 'agent_tool', 'toolcall', 'tool_call', 'functioncall', 'function_call',
-    'executetool', 'execute_tool', 'tool',
-  ].includes(normalizedKind);
-  const toolResultEvent = [
-    'toolresult', 'tool_result', 'functionresult', 'function_result', 'agenttoolresult',
-    'agent_tool_result', 'noderesult', 'node_result',
-  ].includes(normalizedKind);
+  const userMessage = semanticClass === 'user_message';
+  const modelMessage = semanticClass === 'model_message' || semanticClass === 'llm_call';
+  const toolCallEvent = semanticClass === 'tool_call';
+  const toolResultEvent = semanticClass === 'tool_result';
   const toolHints = semanticToolHints(event);
   const toolCallId = toolHints.toolCallId
     ?? (toolCallEvent || toolResultEvent
@@ -2061,15 +2110,7 @@ function canonicalInteractionForSemanticEvent(event: T.JudgedEvent): T.AgentInte
 }
 
 function isSemanticUniversalEventKind(kind: string): boolean {
-  const normalizedKind = kind.trim().toLowerCase().replace(/[\s.-]+/gu, '_');
-  return [
-    'agenttool', 'agentinvocation', 'llmcall', 'llmapi', 'llminteraction', 'usermessage', 'modelmessage', 'toolresult', 'noderun', 'llmresponse',
-    'tool', 'tool_call', 'toolcall', 'function_call', 'functioncall', 'tool_result', 'function_result',
-    'agent_tool_result', 'node_result', 'node', 'node_run', 'workflow_node', 'workflownode', 'workflow_run', 'agent_run',
-    'llm', 'llm_call', 'llm_response', 'model_response',
-    'user_message', 'user_input', 'human_message', 'input_message',
-    'model_message', 'assistant_message', 'assistant_output', 'final_response',
-  ].includes(normalizedKind);
+  return universalSemanticKindClass(kind) !== undefined;
 }
 
 function canonicalEvidenceLinksForRelations(
@@ -2077,8 +2118,9 @@ function canonicalEvidenceLinksForRelations(
 ): EvidenceLink[] {
   return relations.map((relation) => {
     const kind = relation.kernelEventKind ?? '';
-    const toType: EvidenceLink['toType'] = kind === 'FileAccess' || kind === 'FileDelete'
-      ? 'file' : kind === 'Egress' || kind === 'Dns' || kind === 'Tls' ? 'network' : 'kernel_fact';
+    // KernelFact is the durable target ID. The event kind still determines the relation label;
+    // stable File/Network entity IDs are not yet a separate canonical contract.
+    const toType: EvidenceLink['toType'] = 'kernel_fact';
     const method: EvidenceLink['method'] = relation.linkMethod === 'command'
       ? 'command' : relation.linkMethod === 'resource' ? 'resource'
         : relation.linkMethod === 'network' || relation.linkMethod === 'network_endpoint' ? 'network'
@@ -2092,7 +2134,9 @@ function canonicalEvidenceLinksForRelations(
       fromId: relation.toolInvocationId,
       toType,
       toId: relation.kernelFactId ?? relation.kernelEventId ?? `unmatched:${relation.stableSemanticEventId}`,
-      relation: toType === 'file' ? 'file_effect' : toType === 'network' ? 'network_effect' : 'executes_as',
+      relation: kind === 'FileAccess' || kind === 'FileDelete'
+        ? 'file_effect' : kind === 'Egress' || kind === 'Dns' || kind === 'Tls'
+          ? 'network_effect' : 'executes_as',
       method,
       confidence: status === 'confirmed' ? 1 : status === 'strong' ? relation.confidence : 0,
       authority: 'inferred',
@@ -3634,21 +3678,31 @@ function canonicalEventKind(input: T.UniversalIngestEvent): string {
     function_call: 'AgentTool',
     functioncall: 'AgentTool',
     execute_tool: 'AgentTool',
+    executetool: 'AgentTool',
     agent_invocation: 'AgentInvocation',
     agentinvocation: 'AgentInvocation',
     invoke_agent: 'AgentInvocation',
     user_message: 'UserMessage',
     usermessage: 'UserMessage',
     user_input: 'UserMessage',
+    userinput: 'UserMessage',
     human_message: 'UserMessage',
+    humanmessage: 'UserMessage',
+    input_message: 'UserMessage',
+    inputmessage: 'UserMessage',
     assistant_message: 'ModelMessage',
+    assistantmessage: 'ModelMessage',
     model_message: 'ModelMessage',
     assistant_output: 'ModelMessage',
+    assistantoutput: 'ModelMessage',
     final_response: 'ModelMessage',
+    finalresponse: 'ModelMessage',
     tool_result: 'ToolResult',
     toolresult: 'ToolResult',
     function_result: 'ToolResult',
+    functionresult: 'ToolResult',
     agent_tool_result: 'ToolResult',
+    agenttoolresult: 'ToolResult',
     node: 'NodeRun',
     node_run: 'NodeRun',
     noderun: 'NodeRun',
@@ -3684,6 +3738,7 @@ function canonicalEventKind(input: T.UniversalIngestEvent): string {
     llmapi: 'LlmApi',
     llm_interaction: 'LlmInteraction',
     llminteraction: 'LlmInteraction',
+    modelresponse: 'LlmResponse',
     agent_plaintext_evidence: 'AgentPlaintextEvidence',
     agentplaintextevidence: 'AgentPlaintextEvidence',
     ssl: 'SslContent',
@@ -8024,8 +8079,8 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       semanticEventId,
     });
     if (!result) throw new NotFoundException('semantic tool event was not found');
-    const durableCanonicalLinks = Boolean(result.canonicalEvidenceLinks?.length);
-    const canonicalLinks = durableCanonicalLinks
+    const canonicalLaneLinks = Boolean(result.canonicalEvidenceLinks?.length);
+    const canonicalLinks = canonicalLaneLinks
       ? (result.canonicalEvidenceLinks ?? [])
       : canonicalEvidenceLinksForRelations(result.relations);
     const durableLinkIds = new Set(canonicalLinks.map((link) => link.linkId));
@@ -8050,8 +8105,15 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       relations: canonicalRelations,
       ...(canonicalLinks.length ? { canonicalEvidenceLinks: canonicalLinks } : {}),
       ...(canonicalLinks.length
-        ? { canonicalEvidenceLinksSource: durableCanonicalLinks ? 'canonical_store' as const : 'computed_compatibility' as const }
+        ? { canonicalEvidenceLinksSource: canonicalLaneLinks
+          ? (result.canonicalEvidenceLinksSource ?? 'memory_hot_ring')
+          : 'computed_compatibility' as const }
         : {}),
+      ...(result.canonicalEvidenceLinksCoverage
+        ? { canonicalEvidenceLinksCoverage: result.canonicalEvidenceLinksCoverage }
+        : !canonicalLaneLinks && canonicalLinks.length
+          ? { canonicalEvidenceLinksCoverage: { partial: true, reasons: ['computed_compatibility_relation'] } }
+          : {}),
     };
     // Read paths are side-effect free. EvidenceLinks are materialized by the ingest-triggered
     // correlation projector; this endpoint only returns the latest computed relation (or its
@@ -8076,14 +8138,19 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   @Post('agents/kernel-events/semantic-context')
   @HttpCode(200)
   async agentKernelSemanticContext(
-    @Body() body: { eventId?: string },
+    @Body() body: { eventId?: string; factId?: string },
     @Headers() headers: HeaderBag,
   ): Promise<T.AgentKernelSemanticContextResponse> {
     const eventId = strictIdentityText(body?.eventId, 512);
-    if (!eventId) throw new BadRequestException('a valid eventId is required');
-    const result = await this.agg.agentKernelSemanticContext(eventId);
-    const durableCanonicalLinks = Boolean(result.canonicalEvidenceLinks?.length);
-    const canonicalLinks = durableCanonicalLinks
+    const factId = strictIdentityText(body?.factId, 512);
+    const primaryId = eventId ?? factId;
+    if (!primaryId) throw new BadRequestException('a valid eventId or factId is required');
+    const result = await this.agg.agentKernelSemanticContext(
+      primaryId,
+      eventId && factId && eventId !== factId ? [factId] : [],
+    );
+    const canonicalLaneLinks = Boolean(result.canonicalEvidenceLinks?.length);
+    const canonicalLinks = canonicalLaneLinks
       ? (result.canonicalEvidenceLinks ?? [])
       : canonicalEvidenceLinksForRelations(result.relations);
     const durableLinkIds = new Set(canonicalLinks.map((link) => link.linkId));
@@ -8107,8 +8174,15 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       }),
       ...(canonicalLinks.length ? { canonicalEvidenceLinks: canonicalLinks } : {}),
       ...(canonicalLinks.length
-        ? { canonicalEvidenceLinksSource: durableCanonicalLinks ? 'canonical_store' as const : 'computed_compatibility' as const }
+        ? { canonicalEvidenceLinksSource: canonicalLaneLinks
+          ? (result.canonicalEvidenceLinksSource ?? 'memory_hot_ring')
+          : 'computed_compatibility' as const }
         : {}),
+      ...(result.canonicalEvidenceLinksCoverage
+        ? { canonicalEvidenceLinksCoverage: result.canonicalEvidenceLinksCoverage }
+        : !canonicalLaneLinks && canonicalLinks.length
+          ? { canonicalEvidenceLinksCoverage: { partial: true, reasons: ['computed_compatibility_relation'] } }
+          : {}),
     };
     // Evidence relation persistence belongs to the ingest/correlation projector. Keep this query
     // endpoint read-only so repeated inspector refreshes cannot mutate relation history.
@@ -8116,10 +8190,10 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       actor: auditActor(headers),
       action: 'agent.semantic_evidence.read',
       resourceType: 'event',
-      resourceId: eventId,
+      resourceId: primaryId,
       summary: `Read Kernel event semantic context with ${result.relations.length} relation(s)`,
       details: {
-        eventId,
+        eventId: primaryId,
         relationCount: response.relations.length,
         conversationCount: response.conversationLinks.length,
       },
@@ -12266,7 +12340,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           // `agentInteractions` is intentionally a raw read and may not yet carry the V2 binding
           // fields. A bounded summary read applies that resolver and can bridge a membership-only
           // Session through its canonical/session/provider/runtime aliases.
-          const summaries = await this.agg.agentConversations({
+          let summaries = await this.agg.agentConversations({
             timeType: query.timeType,
             startTime: query.startTime,
             endTime: query.endTime,
@@ -12276,12 +12350,26 @@ export class SecurityMonitoringController implements OnModuleDestroy {
             agentInstanceId: session.agentInstanceIds[0],
             limit: 500,
           });
-          const summary = summaries.items.find((candidate) =>
+          if (summaries.items.length === 0) {
+            summaries = await this.agg.agentConversations({
+              timeType: query.timeType,
+              startTime: query.startTime,
+              endTime: query.endTime,
+              snapshotAsOf: query.snapshotAsOf,
+              scope: 'raw',
+              classificationView: query.classificationView,
+              limit: 500,
+            });
+          }
+          const exactSummaries = summaries.items.filter((candidate) =>
             [candidate.sessionId, candidate.conversationId].includes(session!.sessionId)
             || Boolean(session!.sessionKey && candidate.sessionKey === session!.sessionKey)
             || Boolean(session!.providerSessionIdHash
-              && candidate.providerSessionIdHash === session!.providerSessionIdHash)
-            || candidate.agentInstanceIds.some((id) => session!.agentInstanceIds.includes(id)));
+              && candidate.providerSessionIdHash === session!.providerSessionIdHash));
+          const instanceSummaries = summaries.items.filter((candidate) =>
+            candidate.agentInstanceIds.some((id) => session!.agentInstanceIds.includes(id)));
+          const summary = exactSummaries[0]
+            ?? (instanceSummaries.length === 1 ? instanceSummaries[0] : undefined);
           if (summary?.conversationId) {
             session = { ...session, conversationId: summary.conversationId };
             conversationId = summary.conversationId;
@@ -14267,6 +14355,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       }
 
       if (context.interaction) {
+        this.agg.observeKernelEvent(prepared.event);
         const interaction = {
           ...context.interaction,
           evidenceEventIds: [...new Set([
@@ -14671,6 +14760,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       };
     }
     const rec = outcome.event;
+    this.agg.observeKernelEvent(rec);
     if (outcome.durability === 'durable') {
       this.materializeCommittedObservedAsset(rec, collectorEventAt);
     }
@@ -14731,3 +14821,12 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     return { accepted: true, disposition: 'retained', retained: true, sourceId: sourceResolution.source?.sourceId, eventId: rec.eventId, traceId: rec.traceId, invocationId: rec.invocationId, toolCallId: rec.toolCallId, spanId: rec.spanId, runId: rec.runId, verdict: rec.verdict, tier: rec.tier, severity: rec.severity, reason: rec.reason, riskCategory: rec.riskCategory, decisionStatus: rec.decisionStatus, evaluationId: rec.evaluationId };
   }
 }
+
+/** Narrow pure helpers exposed only for deterministic repository-level contract tests. They do
+ * not form a runtime API and contain no product/version-specific branching. */
+export const semanticProjectionTesting = {
+  semanticToolHints,
+  canonicalInteractionForSemanticEvent,
+  canonicalSemanticRecordForEvent,
+  universalSemanticKindClass,
+};

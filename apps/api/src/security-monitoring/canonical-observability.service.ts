@@ -54,6 +54,7 @@ export interface CanonicalRawObservationSink {
   saveCoverageGaps?(gaps: readonly CoverageGap[]): Promise<boolean>;
   loadCoverageGaps?(input?: { limit?: number }): Promise<CoverageGap[]>;
   saveEvidenceLinks?(links: readonly EvidenceLink[]): Promise<boolean>;
+  isEvidenceLinksReadAvailable?(): boolean;
   loadEvidenceLinks?(input?: {
     linkIds?: readonly string[];
     fromType?: EvidenceLink['fromType'];
@@ -66,6 +67,13 @@ export interface CanonicalRawObservationSink {
   }): Promise<EvidenceLink[]>;
   saveSessionMemberships?(memberships: readonly SessionMembership[]): Promise<boolean>;
   loadSessionMemberships?(input?: { membershipIds?: readonly string[]; resolutionRevision?: number; limit?: number }): Promise<SessionMembership[]>;
+}
+
+export interface CanonicalEvidenceLinkReadResult {
+  items: EvidenceLink[];
+  source: 'canonical_store' | 'canonical_store+hot_delta' | 'memory_hot_ring';
+  degraded: boolean;
+  reasons: string[];
 }
 
 export interface CanonicalObservationCommitContext {
@@ -99,6 +107,7 @@ export interface CanonicalObservationCommitResult {
 
 const DEFAULT_GAP_LIMIT = 20_000;
 const DEFAULT_GAP_TTL_MS = 24 * 60 * 60_000;
+const EVIDENCE_LINK_READ_TIMEOUT_MS = 1_000;
 
 function boundedEnvInt(name: string, fallback: number, min: number, max: number): number {
   const parsed = Number(process.env[name]);
@@ -844,22 +853,50 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
    * sink outage into an empty successful result.  The hot ring is retained as a compatibility
    * fallback and the returned rows are still contract-validated before exposure.
    */
-  private async listDurableEvidenceLinksMatching(
+  private async readDurableEvidenceLinksMatching(
     input: Parameters<NonNullable<CanonicalRawObservationSink['loadEvidenceLinks']>>[0],
     matches: (link: EvidenceLink) => boolean,
     limit = 128,
-  ): Promise<EvidenceLink[]> {
+  ): Promise<CanonicalEvidenceLinkReadResult> {
     const requested = Number(limit);
     const bounded = Number.isFinite(requested) ? Math.max(1, Math.min(2_000, Math.trunc(requested))) : 128;
-    const durable = this.sink?.loadEvidenceLinks
-      ? (await this.sink.loadEvidenceLinks({ ...input, limit: bounded }).catch(() => []))
+    let degraded = false;
+    let sinkReadFailed = false;
+    const sink = this.sink;
+    const sinkQueried = Boolean(sink?.loadEvidenceLinks);
+    const durable = sinkQueried
+      ? (await Promise.race([
+          sink!.loadEvidenceLinks!({ ...input, limit: bounded }).catch(() => {
+            degraded = true;
+            sinkReadFailed = true;
+            return [];
+          }),
+          new Promise<EvidenceLink[]>((resolve) => {
+            const timer = setTimeout(() => {
+              degraded = true;
+              sinkReadFailed = true;
+              resolve([]);
+            }, EVIDENCE_LINK_READ_TIMEOUT_MS);
+            timer.unref();
+          }),
+        ]))
           .flatMap((candidate) => {
             const safe = safeDurableEvidenceLink(candidate);
             return safe && matches(safe) ? [safe] : [];
           })
       : [];
+    const sinkAvailability = typeof sink?.isEvidenceLinksReadAvailable === 'function'
+      ? sink.isEvidenceLinksReadAvailable()
+      : undefined;
+    if (sinkAvailability === false) {
+      degraded = true;
+      sinkReadFailed = true;
+    }
     const hot = this.evidence.list(Math.min(10_000, Math.max(bounded * 4, bounded)))
       .filter(matches);
+    const durableKeys = new Set(durable.map((link) => `${link.linkId}\0${link.resolutionRevision}`));
+    const hotOnly = sinkQueried && hot.some((link) => !durableKeys.has(`${link.linkId}\0${link.resolutionRevision}`));
+    if (hotOnly) degraded = true;
     const merged = this.mergeDurableFirst(
       durable,
       hot,
@@ -872,12 +909,26 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       const previous = latestByLink.get(link.linkId);
       if (!previous || link.resolutionRevision > previous.resolutionRevision) latestByLink.set(link.linkId, link);
     }
-    return [...latestByLink.values()]
+    const items = [...latestByLink.values()]
       .sort((left, right) => left.validFromUnixNs === right.validFromUnixNs
         ? right.resolutionRevision - left.resolutionRevision || left.linkId.localeCompare(right.linkId)
         : left.validFromUnixNs > right.validFromUnixNs ? -1 : 1)
       .slice(0, bounded)
       .map((link) => structuredClone(link));
+    const source: CanonicalEvidenceLinkReadResult['source'] = durable.length > 0
+      ? hotOnly ? 'canonical_store+hot_delta' : 'canonical_store'
+      : sinkQueried && !degraded ? 'canonical_store' : 'memory_hot_ring';
+    return {
+      items,
+      source,
+      degraded,
+      reasons: degraded
+        ? [
+            ...(sinkReadFailed ? ['canonical_evidence_link_projection_unavailable'] : []),
+            ...(hotOnly ? ['canonical_evidence_link_hot_delta_pending'] : []),
+          ]
+        : [],
+    };
   }
 
   async listDurableEvidenceLinksByEvidenceRef(
@@ -886,7 +937,20 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   ): Promise<EvidenceLink[]> {
     const ref = boundedText(evidenceRef, 512);
     if (!ref) return [];
-    return this.listDurableEvidenceLinksMatching(
+    return (await this.readDurableEvidenceLinksMatching(
+      { evidenceRef: ref },
+      (link) => link.evidenceRefs.includes(ref),
+      limit,
+    )).items;
+  }
+
+  async readDurableEvidenceLinksByEvidenceRef(
+    evidenceRef: string,
+    limit = 128,
+  ): Promise<CanonicalEvidenceLinkReadResult> {
+    const ref = boundedText(evidenceRef, 512);
+    if (!ref) return { items: [], source: 'memory_hot_ring', degraded: false, reasons: [] };
+    return this.readDurableEvidenceLinksMatching(
       { evidenceRef: ref },
       (link) => link.evidenceRefs.includes(ref),
       limit,
@@ -900,11 +964,11 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   ): Promise<EvidenceLink[]> {
     const id = boundedText(toId, 512);
     if (!id) return [];
-    return this.listDurableEvidenceLinksMatching(
+    return (await this.readDurableEvidenceLinksMatching(
       { toType, toIds: [id] },
       (link) => link.toType === toType && link.toId === id,
       limit,
-    );
+    )).items;
   }
 
   async listDurableEvidenceLinksForTargetId(
@@ -913,7 +977,20 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   ): Promise<EvidenceLink[]> {
     const id = boundedText(toId, 512);
     if (!id) return [];
-    return this.listDurableEvidenceLinksMatching(
+    return (await this.readDurableEvidenceLinksMatching(
+      { toIds: [id] },
+      (link) => link.toId === id,
+      limit,
+    )).items;
+  }
+
+  async readDurableEvidenceLinksForTargetId(
+    toId: string,
+    limit = 128,
+  ): Promise<CanonicalEvidenceLinkReadResult> {
+    const id = boundedText(toId, 512);
+    if (!id) return { items: [], source: 'memory_hot_ring', degraded: false, reasons: [] };
+    return this.readDurableEvidenceLinksMatching(
       { toIds: [id] },
       (link) => link.toId === id,
       limit,
@@ -927,11 +1004,11 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   ): Promise<EvidenceLink[]> {
     const id = boundedText(fromId, 512);
     if (!id) return [];
-    return this.listDurableEvidenceLinksMatching(
+    return (await this.readDurableEvidenceLinksMatching(
       { fromType, fromIds: [id] },
       (link) => link.fromType === fromType && link.fromId === id,
       limit,
-    );
+    )).items;
   }
 
   async getDurableEvidenceLink(linkId: string, resolutionRevision?: number): Promise<EvidenceLink | undefined> {

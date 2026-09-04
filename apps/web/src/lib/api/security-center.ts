@@ -643,6 +643,7 @@ export interface AgentEventListItem {
   collectorId?: string;
   sourceId?: string;
   sessionId: string;
+  kernelFactId?: string;
   userId: string;
   traceId: string;
   invocationId?: string;
@@ -1588,7 +1589,8 @@ export interface AgentSemanticEvidenceResponse extends ClassifiedResponseMeta {
   relationStatus: AgentSemanticKernelRelationStatus;
   evidenceBundleEventIds: string[];
   canonicalEvidenceLinks?: CanonicalEvidenceLink[];
-  canonicalEvidenceLinksSource?: "canonical_store" | "computed_compatibility";
+  canonicalEvidenceLinksSource?: "canonical_store" | "canonical_store+hot_delta" | "memory_hot_ring" | "computed_compatibility";
+  canonicalEvidenceLinksCoverage?: { partial: boolean; reasons: string[] };
   coverage: QueryCoverage;
   updateTime: string;
 }
@@ -1602,7 +1604,8 @@ export interface AgentKernelSemanticContextResponse {
     semanticEventId: string;
   }>;
   canonicalEvidenceLinks?: CanonicalEvidenceLink[];
-  canonicalEvidenceLinksSource?: "canonical_store" | "computed_compatibility";
+  canonicalEvidenceLinksSource?: "canonical_store" | "canonical_store+hot_delta" | "memory_hot_ring" | "computed_compatibility";
+  canonicalEvidenceLinksCoverage?: { partial: boolean; reasons: string[] };
   updateTime: string;
 }
 
@@ -4529,8 +4532,11 @@ export const securityCenterApi = {
     apiClient.get<CanonicalResourceEnvelope<CanonicalSessionMembership>>(
       `/security-center/v1/session-memberships/${encodeURIComponent(membershipId)}${resolutionRevision === undefined ? "" : `?resolutionRevision=${resolutionRevision}`}`,
     ),
-  agentKernelSemanticContext: (eventId: string) =>
-    apiClient.post<AgentKernelSemanticContextResponse>("/security-center/agents/kernel-events/semantic-context", { eventId }),
+  agentKernelSemanticContext: (eventId: string, factId?: string) =>
+    apiClient.post<AgentKernelSemanticContextResponse>("/security-center/agents/kernel-events/semantic-context", {
+      eventId,
+      ...(factId ? { factId } : {}),
+    }),
   agentToolEvidence: (filter: AgentEventQuery & { invocationId: string }) =>
     apiClient.post<ToolEvidenceResponse>("/security-center/events/tool-evidence", filter),
   observedAssets: (query: ObservedAssetListQuery) =>

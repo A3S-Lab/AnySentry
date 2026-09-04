@@ -668,10 +668,10 @@ export default function AgentEventsPage() {
     },
   );
   const { data: semanticContext, loading: semanticContextLoading } = useRequest(
-    () => securityCenterApi.agentKernelSemanticContext(selectedEvent!.eventId),
+    () => securityCenterApi.agentKernelSemanticContext(selectedEvent!.eventId, selectedEvent!.kernelFactId),
     {
       ready: Boolean(selectedEvent?.eventId),
-      refreshDeps: [selectedEvent?.eventId],
+      refreshDeps: [selectedEvent?.eventId, selectedEvent?.kernelFactId],
     },
   );
 

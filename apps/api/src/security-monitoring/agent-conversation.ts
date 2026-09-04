@@ -1154,12 +1154,32 @@ export function projectConversationTimeline(
   const ordered = [...interactions].sort(compareInteraction);
   const resolvedResults = resolvedToolResultIds(ordered);
   const unknownResults = unknownToolResultIds(ordered);
-  const callEventIds = new Map<string, string>();
+  const callEventIds = new Map<string, Array<{ eventId: string; at: bigint; interactionId: string }>>();
   for (const interaction of ordered) {
     for (const call of interaction.toolCalls) {
-      callEventIds.set(call.toolCallId, eventId('tool_call', interaction.interactionId, call.toolCallId));
+      let at: bigint;
+      try { at = BigInt(call.issuedAtUnixNs ?? interaction.startedAtUnixNs); }
+      catch { at = 0n; }
+      const entries = callEventIds.get(call.toolCallId) ?? [];
+      entries.push({
+        eventId: eventId('tool_call', interaction.interactionId, call.toolCallId),
+        at,
+        interactionId: interaction.interactionId,
+      });
+      callEventIds.set(call.toolCallId, entries);
     }
   }
+  const callEventIdFor = (toolCallId: string, resultAt?: string, interactionId?: string): string | undefined => {
+    const entries = callEventIds.get(toolCallId) ?? [];
+    const sameInteraction = interactionId ? entries.filter((entry) => entry.interactionId === interactionId) : entries;
+    const pool = sameInteraction.length ? sameInteraction : entries;
+    let at: bigint | undefined;
+    try { if (resultAt) at = BigInt(resultAt); } catch { /* use latest available */ }
+    return [...pool]
+      .filter((entry) => at === undefined || entry.at <= at)
+      .sort((left, right) => left.at === right.at ? left.eventId.localeCompare(right.eventId) : left.at > right.at ? -1 : 1)
+      .at(0)?.eventId;
+  };
 
   const attempts = new Map<string, number>();
   const pending: Array<T.AgentConversationEvent & { sortOrder: number }> = [];
@@ -1226,7 +1246,7 @@ export function projectConversationTimeline(
         // use request start for the Agent-facing semantic order while preserving the raw timestamp
         // on the underlying Interaction evidence.
         atUnixNs: interaction.startedAtUnixNs,
-        parentEventId: callEventIds.get(result.toolCallId),
+        parentEventId: callEventIdFor(result.toolCallId, result.observedAtUnixNs, interaction.interactionId),
         toolCallId: result.toolCallId,
         title: result.name ? `${result.name} 返回结果` : '工具返回结果',
         contentPreview: jsonPreview(result.content),
@@ -1277,7 +1297,7 @@ export function projectConversationTimeline(
     for (const call of interaction.toolCalls) {
       pending.push({
         ...common,
-        eventId: callEventIds.get(call.toolCallId)
+        eventId: callEventIdFor(call.toolCallId, call.issuedAtUnixNs, interaction.interactionId)
           ?? eventId('tool_call', interaction.interactionId, call.toolCallId),
         kind: 'tool_call',
         sequence: 0,

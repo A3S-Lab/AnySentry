@@ -102,6 +102,22 @@ export default function ConversationTrackingPage() {
   const selectedEventId = searchParams.get("semanticEventId") ?? searchParams.get("eventId") ?? "";
   const selectedInteractionId = searchParams.get("interactionId") ?? "";
   const previousTopAgent = useRef<string>();
+  // A reverse Kernel→semantic link may only have a semantic event reference. Resolve its bounded
+  // canonical envelope first so a deep link does not land on a page that waits forever for a
+  // missing conversationId.
+  const semanticLocatorId = /^s[re]_[a-f0-9]{24}$/u.test(selectedEventId) ? selectedEventId : "";
+  const { data: semanticLocator } = useRequest(
+    () => securityCenterApi.canonicalSemanticEventEvidence(semanticLocatorId, {
+      timeType,
+      agentAssetId: clean(scopedAgentAssetId),
+    }),
+    {
+      ready: Boolean(semanticLocatorId && !selectedConversationId),
+      refreshDeps: [semanticLocatorId, scopedAgentAssetId, timeType],
+      pollingInterval: 5_000,
+      pollingWhenHidden: false,
+    },
+  );
   const {
     containerRef: panelContainerRef,
     panelStyle,
@@ -163,6 +179,12 @@ export default function ConversationTrackingPage() {
     mutate(next);
     setSearchParams(next, { replace });
   };
+  useEffect(() => {
+    if (selectedConversationId) return;
+    const conversationId = semanticLocator?.evidence?.conversationId;
+    if (!conversationId) return;
+    updateRoute((next) => next.set("conversationId", conversationId), true);
+  }, [selectedConversationId, semanticLocator?.evidence?.conversationId]);
   const clearEventSelection = (next: URLSearchParams) => {
     next.delete("semanticEventId");
     next.delete("eventId");
