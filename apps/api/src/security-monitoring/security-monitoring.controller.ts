@@ -10536,6 +10536,16 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     revision: number;
   }> {
     const directory = await this.canonicalDirectorySnapshot(query, headers);
+    // RuntimeState.list() performs lifecycle pruning, canonical de-duplication and a bounded
+    // clone of the selected page.  Calling it once per directory item turns a page read into
+    // O(directoryItems × history) work (and repeatedly clones thousands of historical records).
+    // Take one immutable snapshot for this request and only filter that snapshot below.
+    const runtimeSnapshot = this.agentRuntimeState.list({
+      agentInstanceId: undefined,
+      sourceId: query.sourceId,
+      includeShadow: true,
+      limit: CANONICAL_RUNTIME_STATE_READ_LIMIT,
+    }).items;
     const resources = directory.items
       .filter((item) => {
         const conversations = item.userThreads ?? [];
@@ -10599,12 +10609,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         ];
         // Runtime state is the authoritative source/collector provenance for an AgentInstance;
         // the legacy directory itself intentionally has no producer-controlled source fields.
-        const runtimeRecords = this.agentRuntimeState.list({
-          agentInstanceId: undefined,
-          sourceId: query.sourceId,
-          includeShadow: true,
-          limit: CANONICAL_RUNTIME_STATE_READ_LIMIT,
-        }).items.filter((record) => item.agentInstanceIds.some((id) => [
+        const runtimeRecords = runtimeSnapshot.filter((record) => item.agentInstanceIds.some((id) => [
           record.agentInstanceId,
           record.canonicalAgentInstanceId,
           ...(record.agentInstanceAliases ?? []),
