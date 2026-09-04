@@ -6311,7 +6311,11 @@ function otlpAnyValue(value: unknown, key?: string): T.EventAttributeValue | und
     const n = Number(raw);
     return Number.isFinite(n) ? n : undefined;
   }
-  if (wrapped.arrayValue || wrapped.kvlistValue) return cleanString(JSON.stringify(wrapped), 500);
+  if (wrapped.arrayValue || wrapped.kvlistValue) {
+    const serialized = JSON.stringify(wrapped);
+    const normalized = attrValue(serialized, key);
+    return typeof normalized === 'string' ? normalized.slice(0, 500) : normalized;
+  }
   return undefined;
 }
 
