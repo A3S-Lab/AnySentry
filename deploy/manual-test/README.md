@@ -89,7 +89,8 @@ Validate the actual checkout and render a private strategic patch before applyin
 
 ```bash
 set +x
-export ANYSENTRY_K8S_WORKSPACE_PATH=/home/chensicheng/a3s/security/AnySentry
+# Replace this placeholder with the existing checkout path on the selected node.
+export ANYSENTRY_K8S_WORKSPACE_PATH=/absolute/path/to/AnySentry
 node scripts/verify-k8s-workspace-path.mjs --path "$ANYSENTRY_K8S_WORKSPACE_PATH"
 node scripts/render-k8s-local-path.mjs \
   --workspace-path "$ANYSENTRY_K8S_WORKSPACE_PATH" \
