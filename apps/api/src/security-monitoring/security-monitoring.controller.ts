@@ -568,6 +568,17 @@ function canonicalLifecycleMatches(
   if (scope === 'history') return state === 'exited' || state === 'lost';
   return true;
 }
+
+/**
+ * Errors from the read-only projection lane are degradable. Keep validation/programmer errors
+ * visible, but turn backend timeout, memory, and temporary-unavailable failures into explicit
+ * CoverageGap metadata rather than an opaque HTTP 500 from a deep-link inspector.
+ */
+function isCanonicalProjectionDegradation(error: unknown): boolean {
+  if (error instanceof ServiceUnavailableException || error instanceof NotFoundException) return true;
+  if (!(error instanceof Error)) return false;
+  return /(?:timeout|timed out|memory limit|clickhouse|postgres(?:ql)?|projection.+busy|temporarily unavailable)/iu.test(error.message);
+}
 const OBSERVER_BATCH_ID_DIGEST_CACHE_SIZE = 10_000;
 const OBSERVER_BATCH_ID_DIGEST_CACHE_BYTES = 2 * 1024 * 1024;
 const OBSERVER_INGRESS_CACHE_TTL_MS = 15 * 60_000;
@@ -10469,7 +10480,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           // timeout, expired projection, or stale membership therefore degrades coverage; retain
           // the durable row/Kernel lane instead of converting it into an HTTP 500. Do not swallow
           // a programmer-visible parameter error if one somehow escapes the internal call.
-          if (error instanceof BadRequestException) throw error;
+          if (!isCanonicalProjectionDegradation(error)) throw error;
           failed += 1;
           return [] as CanonicalSemanticTimelineCandidate[];
         }
@@ -10735,6 +10746,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     const aliasAmbiguous = aliasRecords.length > 1;
     const resolvedSemanticRecord = aliasRecords.length === 1 ? aliasRecords[0] : semanticRecord;
     let evidence: T.AgentSemanticEvidenceResponse | undefined;
+    let evidenceFailureReason: 'semantic_evidence_projection_unavailable' | 'semantic_evidence_projection_failed' | undefined;
     if (selected && !timelineAmbiguous && selected.event.actor === 'tool') {
       try {
         // The legacy evidence projector is authoritative for relation revisions and canonical
@@ -10750,7 +10762,10 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           semanticEventId: selected.event.semanticEventId,
         }, headers);
       } catch (error) {
-        if (!(error instanceof NotFoundException)) throw error;
+        if (!isCanonicalProjectionDegradation(error)) throw error;
+        evidenceFailureReason = error instanceof NotFoundException
+          ? 'semantic_evidence_projection_unavailable'
+          : 'semantic_evidence_projection_failed';
         // A valid timeline event without a materialized relation is a coverage gap, not a bad
         // identifier.  Keep the requested/alias ids in the response for later replay.
       }
@@ -10764,6 +10779,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     if (aliasAmbiguous) reasons.push('durable_semantic_identifier_ambiguous');
     if (selected && selected.event.actor !== 'tool') reasons.push('semantic_event_not_tool');
     if (selected && selected.event.actor === 'tool' && !evidence) reasons.push('semantic_evidence_projection_unavailable');
+    if (evidenceFailureReason) reasons.push(evidenceFailureReason);
     if (!resolvedSemanticRecord && durableId) reasons.push('durable_semantic_record_unavailable');
     const coverage = canonicalScopeCoverage(query, canonicalCoverage(
       sessions.coverage.status !== 'complete' || reasons.length > 0,
