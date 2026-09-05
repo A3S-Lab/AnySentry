@@ -826,6 +826,24 @@ cargo test -p a3s-observer-common -p a3s-observer-collector --release
 恢复到上一条已验证的本地 digest（例如 r50 `sha256:0a4c61d7…`），保留 additive schema/表，
 不删除 WAL；Observer 可单独关闭 SSL/capture 或恢复原镜像。
 
+### 2026-09-05 SSH 新终端 Codex 复核
+
+本次复核把用户新开的 SSH 终端作为独立 RuntimeContext 检查，而不是把当前 ChatGPT
+对话正文当作已采集事实。Observer 的 cgroup/runtime 快照能够识别新的 Codex 根进程，
+并生成新的 `AgentInstance`；Canonical GET 返回 `agentProduct=Codex`、
+`workspacePath=/home/chensicheng`、`state=running`，且 Runtime 与原始 `KernelFact`
+可按 `runtime_root` 精确关联。该实例的窄时间窗事件查询返回 67 条
+`LlmCall`/`Egress`/`ToolExec`，均带 `identityBindingQuality=exact`、`rawObservationId`
+与 `kernelFactId`，候选分类按当前策略自动提升为 observed/probable agent，未降低采样。
+
+但是，同一 canonical instance 的 `agents/interactions` 查询为 0；事件中的会话仍是
+`sessionIdentityQuality=ephemeral`、`sessionIdSource=legacy_agent_fallback`，
+`logicalScopeMode=unresolved`。因此本次 SSH 对话已证明“SSH→进程→Observer→KernelFact→
+Canonical Runtime/Event”的机器证据链存在，但没有证明用户消息、模型回复、工具参数/结果
+正文已进入 `AgentInteraction` 或完成 User→LLM→Tool→Result→EvidenceLink 的双 lane 深链。
+不能从进程命令行、Codex session 提示或事件计数反推出明文内容；需要 Rustls/流式正文捕获
+和可验证的 provider/session anchor 后才能升级为 confirmed Session/完整交互投影。
+
 ### 当前交付判定
 
 本 Goal 仍是 **partial**。代码合同、兼容迁移、API/Web 镜像、Canonical point/deep-link 在低负载
