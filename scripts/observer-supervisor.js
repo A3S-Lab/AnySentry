@@ -3,11 +3,24 @@
 // shell, preserves stream backpressure, and owns both child lifecycles.
 const { spawn } = require('node:child_process');
 const os = require('node:os');
+const fs = require('node:fs');
 
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 20_000;
 const MAX_SHUTDOWN_TIMEOUT_MS = 25_000;
 const DEFAULT_COLLECTOR_TIMEOUT_MS = 3_000;
 const DEFAULT_ESCAPE_TIMEOUT_MS = 1_000;
+const OBSERVER_ALIVE_FILE = '/run/a3s-observer.alive';
+const ALIVE_INTERVAL_MS = 10_000;
+
+function touchAliveFile() {
+  try {
+    fs.writeFileSync(OBSERVER_ALIVE_FILE, `${process.pid}\n`, { mode: 0o640 });
+    return true;
+  } catch (error) {
+    console.error(`[observer-supervisor] heartbeat update failed: ${error.message}`);
+    return false;
+  }
+}
 
 function boundedMilliseconds(value, fallback, min, max) {
   const parsed = Number(value);
@@ -100,6 +113,11 @@ function main() {
   let forcedKill = false;
   let forcing = false;
   let pipelineFailed = false;
+  let aliveTimer;
+
+  touchAliveFile();
+  aliveTimer = setInterval(touchAliveFile, ALIVE_INTERVAL_MS);
+  aliveTimer.unref();
 
   function latchOutcome(code, kind) {
     if (primaryOutcome) return false;
@@ -174,6 +192,9 @@ function main() {
     if (shutdownTimer) clearTimeout(shutdownTimer);
     if (collectorTimer) clearTimeout(collectorTimer);
     if (escapeTimer) clearTimeout(escapeTimer);
+    if (aliveTimer) clearInterval(aliveTimer);
+    aliveTimer = undefined;
+    try { fs.unlinkSync(OBSERVER_ALIVE_FILE); } catch {}
     collector.stdout?.unpipe(forwarder.stdin);
     if (forwarder.stdin && !forwarder.stdin.destroyed) forwarder.stdin.destroy();
     process.exitCode = resolvedExitCode();
