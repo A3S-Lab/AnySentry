@@ -35,6 +35,55 @@
 - **推断**：基于证据的解释，不能冒充事实。
 - **未验证**：尚未取得当前运行证据的要求。
 
+## 4.1 相关既有设计与验收文档
+
+下一位智能体必须把以下文件作为已有上下文一起阅读；这些文件是历史架构优化、产品观测设计、身份/生命周期设计、过滤治理和当前实现证据的来源。本交接文件只做索引，不复制或替代它们：
+
+### 核心架构合同（优先级最高）
+
+- [Agent Observability Architecture v2](anysentry-agent-observability-architecture-v2.md)
+- [LLM Interaction Observability PRD](anysentry-agent-llm-interaction-observability-prd.md)
+- [LLM Interaction Observability Technical Design](anysentry-agent-llm-interaction-observability-technical-design.md)
+- [Conversation Resolution and Unified Evidence v4 Design](anysentry-agent-conversation-resolution-and-unified-evidence-v4-design.md)
+
+### 身份、生命周期与跨环境设计
+
+- [Agent Lifecycle, Conversation Attribution and Tracking v3](anysentry-agent-lifecycle-conversation-attribution-and-tracking-v3-design.md)
+- [Discovery-first Agent TLS Observability v2](anysentry-discovery-first-agent-tls-observability-v2-design.md)
+- [Conversation Tracking Codex/Claude TLS Stage Design](anysentry-conversation-tracking-codex-claude-tls-stage-design.md)
+- [Trusted Correlation Compatibility Contract](trusted-correlation-compatibility-contract.md)
+- [Identity Semantics and System Context Optimization](anysentry-identity-semantics-and-system-context-optimization.md)
+- [Trusted Correlation and Capture Roadmap](anysentry-trusted-correlation-and-capture-roadmap.md)
+
+### 明文、工具、KernelFact 与规则治理
+
+- [Agent LLM Tool Plaintext Observability Design](agent-llm-tool-plaintext-observability-design.md)
+- [General Agent Semantic Aggregation and Selective Read Capture PRD](anysentry-general-agent-semantic-aggregation-and-selective-read-capture-prd.md)
+- [Unified Asset Lifecycle and Capture Rule Governance](anysentry-unified-asset-lifecycle-and-capture-rule-governance.md)
+- [Unified Filter Rule System PRD](anysentry-unified-filter-rule-system-prd.md)
+- [Unified Filter Rule System Acceptance](anysentry-unified-filter-rule-system-acceptance.md)
+- [Agent Discovery Filter](agent-discovery-filter.md)
+- [File Filter Pipeline v1](file-filter-pipeline-v1.md)
+- [Infrastructure Rules v1](infrastructure-rules-v1.md)
+
+### 当前实现、测试与交付证据
+
+- [Canonical Observability Implementation](canonical-observability-implementation.md)
+- [AnySentry Multi-agent Refactor Execution Prompt](anysentry-multiagent-refactor-execution-prompt.md)
+- [Local Goal Evidence](local-goal-evidence.md)
+- [Performance Testing](performance-testing.md)
+- [Data Lifecycle Phase 1–16](data-lifecycle-phase1.md) 至 [data-lifecycle-phase16.md](data-lifecycle-phase16.md)
+- [Data Lifecycle Window Audit](data-lifecycle-win-audit.md)
+- [Technical Report](technical-report.md)
+- [Weekly Report: Agent Observability Architecture](weekly-report-agent-observability-architecture.md)
+
+### Observer 相关文档
+
+- [Observer Agent Discovery Filter](../../Observer/docs/agent-discovery-filter.md)
+- [Observer Enforcement](../../Observer/docs/enforcement.md)
+
+阅读顺序建议为：核心架构合同 → 身份/生命周期与 TLS 设计 → 明文/工具/规则治理 → 当前实现与测试证据。若文档与当前源码或运行状态冲突，以当前源码和可复核运行证据为实现事实，并在交接报告中记录差异。
+
 ## 4. 架构合同重点
 
 主链必须保持：
