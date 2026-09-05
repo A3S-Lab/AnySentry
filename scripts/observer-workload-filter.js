@@ -522,7 +522,12 @@ class WorkloadIdentityCache {
     const seen = new Set();
     const result = [];
     for (const entry of [...this.sources.values()].flat()) {
-      if (entry.classification !== 'confirmed_agent') continue;
+      // Candidate Agent workloads use the same effective capture/runtime fidelity as confirmed
+      // Agents.  Keep the original classification in evidence (so review can still distinguish
+      // discovery provenance), but do not omit a running candidate from the lifecycle snapshot;
+      // otherwise a perfectly observable service appears only after its first semantic event.
+      const candidateEffective = entry.classification === 'probable_agent';
+      if (entry.classification !== 'confirmed_agent' && !candidateEffective) continue;
       const environment = text(entry.environment).toLowerCase()
         || (entry.source === 'kubernetes' ? 'kubernetes' : entry.source === 'docker' ? 'docker' : '');
       if (!['docker', 'kubernetes'].includes(environment)) continue;
@@ -572,7 +577,10 @@ class WorkloadIdentityCache {
         lastSeenAt: observedAt,
         confidence: 1,
         source: environment,
-        evidence: Array.isArray(entry.evidence) ? entry.evidence.slice(0, 16) : [],
+        evidence: [
+          ...(Array.isArray(entry.evidence) ? entry.evidence : []),
+          ...(candidateEffective ? ['candidate_auto_promoted'] : []),
+        ].slice(0, 16),
         workloadRef: {
           environment,
           kind: 'container',

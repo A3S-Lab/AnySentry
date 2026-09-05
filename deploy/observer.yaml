@@ -50,6 +50,11 @@ spec:
   template:
     metadata:
       labels: { app: a3s-observer, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
+      annotations:
+        # This is an observation-only privilege envelope, not a product/version selector.  The
+        # explicit marker lets local admission/acceptance checks distinguish a capable Observer
+        # from an unprivileged compatibility Pod without treating Pod names as Agent identity.
+        anysentry.io/privilege-profile: "hostpid-bpf-perfmon-observe-only-v1"
     spec:
       hostPID: true # resolve /proc/<pid> for host-process identity
       priorityClassName: system-node-critical
@@ -60,6 +65,55 @@ spec:
           image: ghcr.io/a3s-lab/anysentry-observer:latest
           securityContext:
             privileged: true # eBPF load + tracepoint attach. OBSERVE path only — cannot block.
+            # Keep the privilege contract explicit instead of relying only on the shorthand above.
+            # The collector is observation-only; these capabilities allow attachment on hosts
+            # with unprivileged_bpf_disabled/perf_event_paranoid enabled, while no deny/enforce
+            # program is shipped in this image.
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: true
+            capabilities:
+              add: [BPF, PERFMON, SYS_ADMIN, SYS_PTRACE]
+          startupProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  test -s /run/a3s-observer.alive
+                  now="$(date +%s)"
+                  seen="$(stat -c %Y /run/a3s-observer.alive)"
+                  test "$((now - seen))" -le 120
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  test -s /run/a3s-observer.alive
+                  now="$(date +%s)"
+                  seen="$(stat -c %Y /run/a3s-observer.alive)"
+                  test "$((now - seen))" -le 90
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  test -s /run/a3s-observer.alive
+                  now="$(date +%s)"
+                  seen="$(stat -c %Y /run/a3s-observer.alive)"
+                  test "$((now - seen))" -le 120
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
           env:
             - { name: A3S_OBSERVER_JSON, value: "1" }
             # F0 reduces steady-state bulk traffic before Ring reservation; this bounded lane
@@ -198,6 +252,8 @@ spec:
           args: ["/opt/observer-supervisor.js"]
           volumeMounts:
             - { name: sys, mountPath: /sys, readOnly: true } # tracepoint ids under /sys
+            - { name: bpf, mountPath: /sys/fs/bpf, readOnly: true }
+            - { name: debugfs, mountPath: /sys/kernel/debug, readOnly: true }
             - { name: agent-templates, mountPath: /etc/anysentry, readOnly: true }
             - { name: observer-auth, mountPath: /etc/anysentry-auth, readOnly: true }
             - { name: filter-rules, mountPath: /run/anysentry-filter }
@@ -209,6 +265,8 @@ spec:
             limits: { memory: 2Gi }
       volumes:
         - { name: sys, hostPath: { path: /sys } }
+        - { name: bpf, hostPath: { path: /sys/fs/bpf, type: Directory } }
+        - { name: debugfs, hostPath: { path: /sys/kernel/debug, type: Directory } }
         - { name: agent-templates, configMap: { name: anysentry-agent-templates } }
         - { name: forwarder-spool, hostPath: { path: /var/lib/anysentry-forwarder, type: DirectoryOrCreate } }
         - name: observer-auth

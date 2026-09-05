@@ -168,6 +168,23 @@ function verifyAnySentryManifest() {
     /\bimage:\s*(?:ghcr\.io\/a3s-lab\/anysentry:latest|127\.0\.0\.1:5000\/anysentry@sha256:[0-9a-f]{64})\b/u.test(anySentryDeployment?.source ?? ''),
     anySentryDeployment?.source,
   );
+  const deploymentSource = anySentryDeployment?.source ?? '';
+  const apiDigest = deploymentSource.match(/\bimage:\s*127\.0\.0\.1:5000\/anysentry@(?<digest>sha256:[0-9a-f]{64})\b/u)?.groups?.digest;
+  const apiProvenanceDigests = [...deploymentSource.matchAll(
+    /anysentry\.io\/local-overlay-manifest:\s*["']?(?<digest>sha256:[0-9a-f]{64})/gu,
+  )].map((match) => match.groups?.digest).filter(Boolean);
+  const apiProvenanceSources = [...deploymentSource.matchAll(
+    /anysentry\.io\/local-source-revision:\s*["']?(?<source>[^"'\s]+)/gu,
+  )].map((match) => match.groups?.source).filter(Boolean);
+  assert(
+    'AnySentry Deployment keeps API image and rollout provenance in one digest/source pair',
+    Boolean(apiDigest)
+      && apiProvenanceDigests.length >= 2
+      && apiProvenanceDigests.every((digest) => digest === apiDigest)
+      && apiProvenanceSources.length >= 2
+      && apiProvenanceSources.every((source) => source === apiProvenanceSources[0]),
+    { apiDigest, apiProvenanceDigests, apiProvenanceSources },
+  );
   assert(
     'AnySentry Deployment binds container port 29653',
     /\bcontainerPort:\s*29653\b/u.test(anySentryDeployment?.source ?? ''),
@@ -639,6 +656,25 @@ function verifyObserverManifest() {
   );
   assert('Observer DaemonSet runs with hostPID for host process identity', /\bhostPID:\s*true\b/u.test(daemonSet?.source ?? ''), daemonSet?.source);
   assert('Observer DaemonSet grants privileged eBPF access', /\bprivileged:\s*true\b/u.test(daemonSet?.source ?? ''), daemonSet?.source);
+  assert(
+    'Observer DaemonSet declares the auditable root/capability privilege envelope',
+    /anysentry\.io\/privilege-profile:\s*"hostpid-bpf-perfmon-observe-only-v1"/u.test(daemonSet?.source ?? '') &&
+      /runAsUser:\s*0/u.test(daemonSet?.source ?? '') &&
+      /runAsGroup:\s*0/u.test(daemonSet?.source ?? '') &&
+      /runAsNonRoot:\s*false/u.test(daemonSet?.source ?? '') &&
+      /allowPrivilegeEscalation:\s*true/u.test(daemonSet?.source ?? '') &&
+      /capabilities:[\s\S]*add:\s*\[BPF, PERFMON, SYS_ADMIN, SYS_PTRACE\]/u.test(daemonSet?.source ?? '') &&
+      /mountPath:\s*\/sys\/fs\/bpf/u.test(daemonSet?.source ?? '') &&
+      /mountPath:\s*\/sys\/kernel\/debug/u.test(daemonSet?.source ?? ''),
+    daemonSet?.source,
+  );
+  assert(
+    'Observer DaemonSet probes the collector heartbeat instead of only the supervisor process',
+    /startupProbe:[\s\S]*a3s-observer\.alive/u.test(daemonSet?.source ?? '') &&
+      /readinessProbe:[\s\S]*a3s-observer\.alive/u.test(daemonSet?.source ?? '') &&
+      /livenessProbe:[\s\S]*a3s-observer\.alive/u.test(daemonSet?.source ?? ''),
+    daemonSet?.source,
+  );
   assert(
     'Observer DaemonSet gives the PID1 supervisor a 30-second termination window',
     /\bterminationGracePeriodSeconds:\s*30\b/u.test(daemonSet?.source ?? ''),

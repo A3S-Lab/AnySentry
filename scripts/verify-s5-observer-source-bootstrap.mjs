@@ -37,7 +37,7 @@ const server = http.createServer(async (request, response) => {
   if (request.url === '/security-center/sources' && request.method === 'POST') {
     createCount++;
     const sourceId = `src-${body.collectorId}`;
-    const source = { sourceId, name: body.name, type: body.type, collectorId: body.collectorId, discovered: false };
+    const source = { ...body, sourceId, discovered: false };
     records.set(sourceId, source);
     send(response, 200, { source, token: `token-create-${body.collectorId}` });
     return;
@@ -102,6 +102,14 @@ try {
   assert.deepEqual(first.credentials.map((entry) => entry.collectorId), ['node-a', 'node-b']);
   assert.equal(fs.statSync(jsonFile).mode & 0o777, 0o600);
   assert.equal(createCount, 2);
+  for (const record of records.values()) {
+    assert.equal(record.workspacePath, null, 'managed source bootstrap clears ephemeral workspace binding');
+    assert.deepEqual(record.correlationClaims, {
+      enabled: true,
+      authority: 'observer_runtime',
+      bindings: { collectorIds: [record.collectorId] },
+    });
+  }
 
   await bootstrap(jsonFile, ['node-a', 'node-b'], 'json');
   const second = JSON.parse(fs.readFileSync(jsonFile, 'utf8'));

@@ -3120,6 +3120,31 @@ function strArrayField(o: Record<string, unknown>, ...keys: string[]): string[] 
   return undefined;
 }
 
+function parseCollectorInteractionReassembly(value: unknown): T.CollectorInteractionReassemblyMetrics | undefined {
+  const raw = obj(value);
+  if (!raw || strField(raw, 'temporality') !== 'cumulative') return undefined;
+  const field = (camel: string, snake: string): number | undefined =>
+    nonNegativeSafeIntegerField(raw, camel, snake);
+  const parsed = {
+    temporality: 'cumulative' as const,
+    connectionEvictions: field('connectionEvictions', 'connection_evictions'),
+    connectionExpirations: field('connectionExpirations', 'connection_expirations'),
+    aliasEvictions: field('aliasEvictions', 'alias_evictions'),
+    evidenceEvictions: field('evidenceEvictions', 'evidence_evictions'),
+    fragmentTrackerEvictions: field('fragmentTrackerEvictions', 'fragment_tracker_evictions'),
+    orphanChunks: field('orphanChunks', 'orphan_chunks'),
+    sequenceGaps: field('sequenceGaps', 'sequence_gaps'),
+    parserFailures: field('parserFailures', 'parser_failures'),
+    bodyLimitDrops: field('bodyLimitDrops', 'body_limit_drops'),
+    truncatedChunks: field('truncatedChunks', 'truncated_chunks'),
+    ambiguousStreamBindings: field('ambiguousStreamBindings', 'ambiguous_stream_bindings'),
+    streamBindingGaps: field('streamBindingGaps', 'stream_binding_gaps'),
+  };
+  return Object.values(parsed).every((entry) => entry !== undefined)
+    ? parsed as T.CollectorInteractionReassemblyMetrics
+    : undefined;
+}
+
 function parseCollectorHeartbeatLine(line: string): T.CollectorRawHeartbeatRequest | null {
   try {
     const parsed = JSON.parse(line) as { event?: Record<string, unknown> };
@@ -3189,6 +3214,9 @@ function parseCollectorHeartbeatLine(line: string): T.CollectorRawHeartbeatReque
     const captureProfileMetrics = parseCollectorCaptureProfileMetrics(
       hb.captureProfile ?? hb.capture_profile,
     );
+    const interactionReassembly = parseCollectorInteractionReassembly(
+      hb.interactionReassembly ?? hb.interaction_reassembly,
+    );
     return {
       collectorId: canonicalCollectorId(strField(hb, 'collectorId', 'collector_id')),
       nodeName: strField(hb, 'nodeName', 'node_name'),
@@ -3210,6 +3238,7 @@ function parseCollectorHeartbeatLine(line: string): T.CollectorRawHeartbeatReque
         : undefined,
       pipelineAccounting: normalizePipelineAccounting(hb.pipelineAccounting ?? hb.pipeline_accounting),
       captureProfileMetrics,
+      interactionReassembly,
       execEvidence: reportsExecEvidence ? {
         exec: exec as number,
         execTruncated: execTruncated as number,

@@ -129,6 +129,26 @@ const CORRELATION_AUTHORITY_SOURCE_TYPES: Readonly<Record<CorrelationClaimAuthor
   observer_runtime: ['observer', 'forwarder'],
 };
 
+/**
+ * A managed Observer running with hostPID in Kubernetes reports the containerd rootfs path of
+ * the process it enriched.  That path contains a per-Pod/container ID and therefore changes on
+ * every DaemonSet rollout.  It is useful runtime evidence, but it is not a stable Source trust
+ * binding.  Only the explicit managed-observer tag plus a token-protected observer_runtime policy
+ * with an exact collector allow-list enables this descriptive/ephemeral treatment; ordinary
+ * workspace-bound Observer or Forwarder Sources retain exact path matching below.
+ */
+function isEphemeralManagedObserverSource(record: IngestionSourceRecord | undefined): boolean {
+  if (!record || record.discovered || !record.requireToken) return false;
+  if (record.type !== 'observer' || !record.tags.includes('managed-observer')) return false;
+  const policy = record.correlationClaims;
+  return policy?.enabled === true
+    && policy.authority === 'observer_runtime'
+    && Boolean(record.collectorId)
+    && policy.bindings.collectorIds.length > 0
+    && policy.bindings.workspaceIds.length === 0
+    && policy.bindings.workspacePaths.length === 0;
+}
+
 function cleanClaimAuthority(value: unknown): CorrelationClaimAuthority | undefined {
   return value === 'application' || value === 'agent_adapter' || value === 'observer_runtime' ? value : undefined;
 }
@@ -613,7 +633,12 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     if (!source) return finish({ accepted: true });
 
     const requestedWorkspace = clean(input.workspacePath, 500);
-    if (source.workspacePath && requestedWorkspace && source.workspacePath !== requestedWorkspace) {
+    if (
+      source.workspacePath
+      && requestedWorkspace
+      && source.workspacePath !== requestedWorkspace
+      && !isEphemeralManagedObserverSource(source)
+    ) {
       return finish({ accepted: false, source, reason: 'source workspace does not match token binding' });
     }
 
@@ -681,7 +706,13 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     record.lastResult = 'accepted';
     record.lastError = undefined;
     if (context.collectorId) record.collectorId = clean(context.collectorId, 180);
-    if (context.workspacePath) record.workspacePath = clean(context.workspacePath, 500);
+    // For a managed hostPID Observer the enriched rootfs path is per-Pod ephemeral evidence, not
+    // a trust binding.  Do not learn it into the Source record, otherwise the next rollout would
+    // reject every event before the new path can be observed. Explicitly workspace-bound sources
+    // keep the historical exact-learning behavior.
+    if (context.workspacePath && !isEphemeralManagedObserverSource(record)) {
+      record.workspacePath = clean(context.workspacePath, 500);
+    }
     if (kind === 'heartbeat') {
       record.lastHeartbeatAt = at;
       record.acceptedHeartbeats += 1;
@@ -878,7 +909,9 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     record.lastResult = 'accepted';
     record.lastError = undefined;
     if (activity.collectorId) record.collectorId = clean(activity.collectorId, 180);
-    if (activity.workspacePath) record.workspacePath = clean(activity.workspacePath, 500);
+    if (activity.workspacePath && !isEphemeralManagedObserverSource(record)) {
+      record.workspacePath = clean(activity.workspacePath, 500);
+    }
     if (activity.lastHeartbeatAt) record.lastHeartbeatAt = Math.max(record.lastHeartbeatAt ?? 0, activity.lastHeartbeatAt);
     if (activity.lastEventAt) record.lastEventAt = Math.max(record.lastEventAt ?? 0, activity.lastEventAt);
     const changed = record.lastSeenAt !== before.lastSeenAt

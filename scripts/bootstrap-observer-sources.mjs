@@ -71,11 +71,20 @@ for (const collectorId of collectorIds) {
     type: 'observer',
     enabled: true,
     requireToken: true,
+    // The managed observer's hostPID/containerd rootfs is a per-Pod runtime fact. Keep Source
+    // authorization collector-bound and clear any legacy learned path instead of pinning a path
+    // that will become invalid on the next DaemonSet rollout.
+    workspacePath: null,
     collectorId,
     owner: 'observer-source-bootstrap',
     environment: 'infrastructure',
     tags: ['managed-observer', 'capture-profile'],
     note: 'Managed exact Collector binding for authenticated Observer ingestion.',
+    correlationClaims: {
+      enabled: true,
+      authority: 'observer_runtime',
+      bindings: { collectorIds: [collectorId] },
+    },
   };
   if (current?.sourceId) {
     const updated = await request(`/sources/${encodeURIComponent(current.sourceId)}`, 'PUT', body);

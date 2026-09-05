@@ -45,9 +45,22 @@ for fixture in sorted((root / "fixtures").glob("*.yml")):
     fixture_text = fixture.read_text(encoding="utf-8")
     value = yaml.safe_load(fixture_text)
     assert value["kind"] == "app", fixture
-    assert value["app"]["mode"] == "workflow", fixture
+    assert value["app"]["mode"] in {"workflow", "advanced-chat"}, fixture
     assert value["workflow"]["graph"]["nodes"], fixture
     assert versions["DIFY_OPENAI_COMPATIBLE_PLUGIN_ID"] in fixture_text, fixture
+
+    if value["app"]["mode"] == "advanced-chat":
+        # Chatflow must use Dify's native sys.query and an enabled memory window;
+        # this is what makes conversation_id a Session boundary instead of a
+        # stateless workflow POST.  Keep this assertion provider/version-neutral.
+        nodes = value["workflow"]["graph"]["nodes"]
+        node_types = {node.get("data", {}).get("type") for node in nodes}
+        assert {"start", "llm", "answer"}.issubset(node_types), fixture
+        llm_nodes = [node for node in nodes if node.get("data", {}).get("type") == "llm"]
+        assert llm_nodes, fixture
+        memory = llm_nodes[0]["data"].get("memory", {})
+        assert memory.get("window", {}).get("enabled") is True, fixture
+        assert "{{#sys.query#}}" in fixture_text, fixture
 
 llm_fixture = (root / "fixtures" / "llm-observation-workflow.yml").read_text(encoding="utf-8")
 assert "internal_rag_sentinel" in llm_fixture

@@ -314,6 +314,11 @@ metadata:
   name: anysentry
   namespace: anysentry
   labels: { app: anysentry, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
+  annotations:
+    # Keep deployment and PodTemplate provenance identical. The PodTemplate value is the
+    # rollout-authoritative copy; the top-level copy makes read-only audits unambiguous.
+    anysentry.io/local-overlay-manifest: "sha256:53908928f04eb07de7e78b98fcf173e76337513d8fa1068701db860338d71daf"
+    anysentry.io/local-source-revision: "AnySentry@worktree-source-binding-heartbeat-v2"
 spec:
   replicas: 1
   selector:
@@ -323,14 +328,14 @@ spec:
       labels: { app: anysentry, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
       annotations:
         # Local immutable overlay provenance; update only when this service's image changes.
-        anysentry.io/local-overlay-manifest: "sha256:bf625fe8bee8019bd7121c0045cc1f8b9e00e4ee6933aaa6d65962fd6c9dfc5c"
-        anysentry.io/local-source-revision: "AnySentry@02b745a+canonical-final"
+        anysentry.io/local-overlay-manifest: "sha256:53908928f04eb07de7e78b98fcf173e76337513d8fa1068701db860338d71daf"
+        anysentry.io/local-source-revision: "AnySentry@worktree-source-binding-heartbeat-v2"
     spec:
       terminationGracePeriodSeconds: 30
       serviceAccountName: anysentry
       containers:
         - name: anysentry
-          image: 127.0.0.1:5000/anysentry@sha256:bf625fe8bee8019bd7121c0045cc1f8b9e00e4ee6933aaa6d65962fd6c9dfc5c
+          image: 127.0.0.1:5000/anysentry@sha256:53908928f04eb07de7e78b98fcf173e76337513d8fa1068701db860338d71daf
           ports:
             - { containerPort: 29653 }
           envFrom:

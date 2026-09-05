@@ -737,6 +737,21 @@ class FilterRulePublisher {
     this.lkgExpiresAt = 0;
   }
 
+  /**
+   * Publish an empty, non-destructive S5 envelope before the Collector starts. The Forwarder
+   * normally learns cgroup entries from the first event, but an emptyDir-mounted Collector cannot
+   * load the capture-profile contract during that initial burst unless the control-plane envelope
+   * exists first. An empty snapshot is an explicit discovery-safe state (not an implicit allow)
+   * and is replaced atomically as runtime identities arrive.
+   */
+  ensureInitialSnapshot() {
+    if (this.captureProfileMode === 'legacy' || !this.file || this.dirty || this.lastPublishedSnapshot) {
+      return false;
+    }
+    this.dirty = true;
+    return this.flush();
+  }
+
   revokeActivation(reason, advanceVersion = true) {
     if (this.captureProfileMode !== 'enforce') return false;
     const changed = this.activationMode === 'enforce' || Boolean(this.activationGrant);

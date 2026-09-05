@@ -3438,6 +3438,8 @@ export interface CollectorHeartbeatRequest {
   queueDepth?: number;
   droppedEvents?: number;
   outputDropped?: number;
+  /** Process-lifetime userspace interaction reassembly counters from the raw Collector. */
+  interactionReassembly?: CollectorInteractionReassemblyMetrics;
   errorCount?: number;
   /** Optional explicit semantics for the three legacy operational counters. */
   legacyCounterTemporality?: CollectorPipelineTemporality;
@@ -3446,6 +3448,22 @@ export interface CollectorHeartbeatRequest {
   filterMetrics?: CollectorFilterMetrics;
   fileFilterMetrics?: CollectorFileFilterMetrics;
   message?: string;
+}
+
+export interface CollectorInteractionReassemblyMetrics {
+  temporality: 'cumulative';
+  connectionEvictions: number;
+  connectionExpirations: number;
+  aliasEvictions: number;
+  evidenceEvictions: number;
+  fragmentTrackerEvictions: number;
+  orphanChunks: number;
+  sequenceGaps: number;
+  parserFailures: number;
+  bodyLimitDrops: number;
+  truncatedChunks: number;
+  ambiguousStreamBindings: number;
+  streamBindingGaps: number;
 }
 export interface CollectorRawHeartbeatRequest extends CollectorHeartbeatRequest {
   /** Raw collector-only argv/reassembly evidence quality; never an operational error counter. */
@@ -3916,6 +3934,7 @@ export interface CollectorHeartbeatRecord extends Required<Pick<CollectorRawHear
   queueDepth: number;
   droppedEvents: number;
   outputDropped: number;
+  interactionReassembly?: CollectorInteractionReassemblyMetrics;
   errorCount: number;
   legacyCounterTemporality?: CollectorPipelineTemporality;
   observedAgents: number;
@@ -3970,6 +3989,7 @@ export interface CollectorHealthItem {
   queueDepth: number;
   droppedEvents: number;
   outputDropped: number;
+  interactionReassembly?: CollectorInteractionReassemblyMetrics;
   errorCount: number;
   /** Maximum counter readings reported by heartbeat records in the requested health window. */
   windowErrorMaxima: {

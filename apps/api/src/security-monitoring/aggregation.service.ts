@@ -6891,6 +6891,9 @@ export class AggregationService implements OnModuleDestroy {
           window: windowExecEvidence,
         },
         ...(pipelineAccounting ? { pipelineAccounting } : {}),
+        ...(latestRawHeartbeat?.interactionReassembly
+          ? { interactionReassembly: latestRawHeartbeat.interactionReassembly }
+          : {}),
         filterMetricsReported: freshMetricsHeartbeat !== undefined,
         filterMetrics: visibleCollectorFilterMetrics(freshMetricsHeartbeat?.filterMetrics ?? {
           scope: 'decoupled',

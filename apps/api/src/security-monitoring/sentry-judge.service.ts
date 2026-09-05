@@ -2907,6 +2907,27 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       ? parseCollectorCaptureProfileMetrics(input.captureProfileMetrics)
       : undefined;
     const captureProfileMetricsReportedAt = captureProfileMetrics ? at : undefined;
+    const rawInteractionReassembly = origin === 'raw_collector' && input.interactionReassembly
+      && input.interactionReassembly.temporality === 'cumulative'
+      ? input.interactionReassembly
+      : undefined;
+    const interactionReassembly: import('./types').CollectorInteractionReassemblyMetrics | undefined = rawInteractionReassembly
+      ? {
+          temporality: 'cumulative',
+          connectionEvictions: clamp(rawInteractionReassembly.connectionEvictions),
+          connectionExpirations: clamp(rawInteractionReassembly.connectionExpirations),
+          aliasEvictions: clamp(rawInteractionReassembly.aliasEvictions),
+          evidenceEvictions: clamp(rawInteractionReassembly.evidenceEvictions),
+          fragmentTrackerEvictions: clamp(rawInteractionReassembly.fragmentTrackerEvictions),
+          orphanChunks: clamp(rawInteractionReassembly.orphanChunks),
+          sequenceGaps: clamp(rawInteractionReassembly.sequenceGaps),
+          parserFailures: clamp(rawInteractionReassembly.parserFailures),
+          bodyLimitDrops: clamp(rawInteractionReassembly.bodyLimitDrops),
+          truncatedChunks: clamp(rawInteractionReassembly.truncatedChunks),
+          ambiguousStreamBindings: clamp(rawInteractionReassembly.ambiguousStreamBindings),
+          streamBindingGaps: clamp(rawInteractionReassembly.streamBindingGaps),
+        }
+      : undefined;
     const pipelineAccounting = normalizePipelineAccounting(input.pipelineAccounting);
     const legacyCounterTemporality = input.legacyCounterTemporality === 'delta' || input.legacyCounterTemporality === 'cumulative'
       ? input.legacyCounterTemporality
@@ -2933,6 +2954,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       queueDepth: clamp(input.queueDepth),
       droppedEvents: clamp(input.droppedEvents),
       outputDropped: clamp(input.outputDropped),
+      ...(interactionReassembly ? { interactionReassembly } : {}),
       // The Rust CollectorHeartbeat schema has no operational error counter. argv/reassembly
       // quality lives in execEvidence and must never degrade collector transport health.
       errorCount: origin === 'raw_collector' ? 0 : clamp(input.errorCount),

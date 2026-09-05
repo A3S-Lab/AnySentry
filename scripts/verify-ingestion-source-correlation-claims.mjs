@@ -390,6 +390,65 @@ const claim = {
 
 {
   const sources = service();
+  const managed = sources.create({
+    name: 'managed observer with ephemeral rootfs',
+    type: 'observer',
+    enabled: true,
+    requireToken: true,
+    // This path is intentionally stale: a DaemonSet rollout changes the containerd ID.
+    workspacePath: '/run/k3s/containerd/io.containerd.runtime.v2.task/k8s.io/old/rootfs',
+    collectorId: 'collector-ephemeral',
+    tags: ['managed-observer', 'capture-profile'],
+    correlationClaims: {
+      enabled: true,
+      authority: 'observer_runtime',
+      bindings: { collectorIds: ['collector-ephemeral'] },
+    },
+  });
+  const nextGeneration = sources.resolve({
+    sourceId: managed.source.sourceId,
+    token: managed.token,
+    type: 'observer',
+    collectorId: 'collector-ephemeral',
+    workspacePath: '/run/k3s/containerd/io.containerd.runtime.v2.task/k8s.io/new/rootfs',
+  });
+  assert.equal(nextGeneration.accepted, true, 'managed Observer rootfs changes must not reject a token-authenticated collector');
+  assert.equal(nextGeneration.authenticated, true);
+  sources.recordAccepted(nextGeneration, 'event', {
+    collectorId: 'collector-ephemeral',
+    workspacePath: '/run/k3s/containerd/io.containerd.runtime.v2.task/k8s.io/new/rootfs',
+  });
+  assert.equal(
+    sources.snapshot().find((item) => item.sourceId === managed.source.sourceId)?.workspacePath,
+    '/run/k3s/containerd/io.containerd.runtime.v2.task/k8s.io/old/rootfs',
+    'ephemeral runtime paths remain evidence and are not learned as a trust binding',
+  );
+
+  const exact = sources.create({
+    name: 'ordinary workspace-bound observer',
+    type: 'observer',
+    enabled: true,
+    requireToken: true,
+    workspacePath: '/srv/exact',
+    correlationClaims: {
+      enabled: true,
+      authority: 'observer_runtime',
+      bindings: { collectorIds: ['collector-exact'] },
+    },
+  });
+  const exactMismatch = sources.resolve({
+    sourceId: exact.source.sourceId,
+    token: exact.token,
+    type: 'observer',
+    collectorId: 'collector-exact',
+    workspacePath: '/srv/other',
+  });
+  assert.equal(exactMismatch.accepted, false, 'ordinary workspace-bound Observer must keep exact path rejection');
+  assert.equal(exactMismatch.reason, 'source workspace does not match token binding');
+}
+
+{
+  const sources = service();
   const discovered = sources.resolve({
     collectorId: 'unmanaged-collector',
     sourceName: 'unmanaged observer',

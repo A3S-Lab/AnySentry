@@ -7,11 +7,11 @@ spec:
   template:
     metadata:
       annotations:
-        anysentry.io/manual-observer-profile: "agent-enforce-docker-no-files-v2"
+        anysentry.io/manual-observer-profile: "agent-enforce-docker-no-files-v3-isolated-spool"
         # Keep the locally delivered immutable overlay and source checkpoints auditable in the
         # rendered PodTemplate; this is not a remote publication identifier.
-        anysentry.io/local-overlay-manifest: "sha256:45af6fa26c2c9e71aeec744edf1b3069362cef60f5fba33428429187a1fddbda"
-        anysentry.io/local-source-revision: "Observer@40556f5+AnySentry@1129ccd"
+        anysentry.io/local-overlay-manifest: "sha256:f08047cc98bdfb9e7aece279c46c0406bbec1089c9b4832b1cc8662abb4579a5"
+        anysentry.io/local-source-revision: "Observer@4b02e42+AnySentry@worktree-source-binding-heartbeat-v2"
     spec:
       containers:
         - name: a3s-observer
@@ -48,6 +48,17 @@ spec:
             - { name: FORWARD_BATCH_SIZE, value: "32" }
             - { name: FORWARD_HTTP_TIMEOUT_MS, value: "30000" }
             - { name: ANYSENTRY_BATCH_INGEST_URL, value: "http://anysentry:29653/security-center/ingest/batch" }
+            # Keep the historical WAL files intact, but do not replay a multi-GB backlog into the
+            # already busy single-node ClickHouse during this controlled observation window. A
+            # fresh bounded journal is created by the Forwarder; old journals remain recoverable
+            # artifacts and are never deleted or truncated by deployment.
+            - { name: FORWARD_MAX_INFLIGHT, value: "2" }
+            - { name: FORWARD_SPOOL_PATH, value: "/var/lib/anysentry-forwarder/spool-manual-observe.wal" }
+            - { name: FORWARD_SPOOL_MAX_RECORDS, value: "250000" }
+            - { name: FORWARD_SPOOL_MAX_BYTES, value: "536870912" }
+            - { name: FORWARD_SPOOL_MAX_WAL_BYTES, value: "1073741824" }
+            - { name: FORWARD_SPOOL_REPLAY_BATCH_SIZE, value: "32" }
+            - { name: FORWARD_SPOOL_REPLAY_INTERVAL_MS, value: "1000" }
           volumeMounts:
             - { name: docker-sock, mountPath: /var/run/docker.sock, readOnly: true }
       volumes:

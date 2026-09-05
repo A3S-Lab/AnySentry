@@ -1778,6 +1778,12 @@ function refreshUnifiedFilterProjection(done = () => {}) {
         signatureReloader?.close();
         if (signatureResult.matcherChanged) requestReconciliation();
       }
+      // The Collector's S5 file is mounted on an emptyDir and starts before the first event can
+      // create a cgroup entry. Publish a discovery-safe envelope now so startup does not run with
+      // an untracked active epoch; later observations atomically replace it with scoped entries.
+      if (typeof filterRulePublisher.ensureInitialSnapshot === 'function') {
+        filterRulePublisher.ensureInitialSnapshot();
+      }
       if (loaded.catalogVersion !== lastUnifiedFilterProjectionVersion) {
         const metrics = unifiedFilterPolicy.metrics();
         console.error(

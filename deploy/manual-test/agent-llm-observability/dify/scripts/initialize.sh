@@ -320,11 +320,14 @@ publish_and_create_key() {
 
 llm_app_id="$(import_app llm-observation-workflow.yml llm)"
 tool_app_id="$(import_app llm-http-tool-workflow.yml tool)"
+chatflow_app_id="$(import_app chatflow-conversation-observation.yml chatflow)"
 publish_and_create_key "$llm_app_id" llm
 publish_and_create_key "$tool_app_id" tool
+publish_and_create_key "$chatflow_app_id" chatflow
 
 printf 'Dify observation fixtures are initialized.\n'
 printf '  LLM workflow app ID:  %s\n' "$llm_app_id"
 printf '  Tool workflow app ID: %s\n' "$tool_app_id"
+printf '  Chatflow app ID:      %s\n' "$chatflow_app_id"
 printf '  API keys are stored only as mode-0600 files under %s/secrets.\n' "$DIFY_LAB_RUNTIME"
-printf 'Run %s/run-workflow.sh llm or %s/run-workflow.sh tool.\n' "$SCRIPT_DIR" "$SCRIPT_DIR"
+printf 'Run %s/run-workflow.sh llm|tool or %s/run-chatflow.sh.\n' "$SCRIPT_DIR" "$SCRIPT_DIR"

@@ -8,6 +8,9 @@ fixtures:
   chunked SSE, `/v1/models`, Chat Completions, and Responses fixtures;
 - `tool-mock`: a separate HTTPS SNI that accepts a Dify HTTP Request tool instruction and returns
   an execution result with start/end nanosecond timestamps.
+- `chatflow-conversation-observation.yml`: a Dify `advanced-chat` application with a bounded
+  memory window, used to verify that two Chatflow turns reuse one `conversation_id` while each
+  message/run remains distinct.
 
 The default path makes no external model request. A real OpenAI-compatible endpoint can be selected
 later through a protected file or process environment; no provider API key is stored in this
@@ -53,6 +56,11 @@ Two Dify DSL fixtures are installed:
   HTTPS tool instruction, and returns the tool result. `llm-mock` and `tool-mock` use separate SNI
   names so endpoint attribution and independent reconciliation ledgers can be checked; the current
   plaintext gate itself uses PID/cgroup, exact POST path, and userspace semantics.
+- `AnySentry Dify Chatflow Conversation Observation` is an `advanced-chat` app. Dify's
+  `/v1/chat-messages` API creates the first conversation when `conversation_id` is omitted; the
+  verification harness sends a second message with the returned ID and checks that the ID is
+  reused while message IDs and workflow run IDs remain distinct. This is the application-level
+  Session contract; it does not infer a Session from a Pod, PID, or model endpoint.
 
 ## 2. Reproducible inputs
 
@@ -102,6 +110,9 @@ LAB=deploy/manual-test/agent-llm-observability/dify
 # Generate one model-only exchange and one LLM -> HTTPS-tool exchange.
 "$LAB/scripts/run-workflow.sh" llm
 "$LAB/scripts/run-workflow.sh" tool
+
+# Verify two Chatflow turns plus Workflow/per-request isolation with the local mock.
+"$LAB/scripts/run-chatflow.sh"
 
 # Show the actual OpenSSL version, mapped libssl objects, resolvable symbols,
 # provider-process host PIDs, and content-free HTTP/1.1/hash evidence.
@@ -277,3 +288,47 @@ not recursively delete it automatically because it can contain captured test con
   names. The production SSRF policy must remain unchanged.
 - Raw provider content is not written by the mock. Full plaintext appears only in the dedicated
   AnySentry Interaction record, whose raw query requires management authentication and audit.
+
+## 10. Chatflow conversation verification
+
+`run-chatflow.sh` is a deterministic, local-only harness for the distinction between a Dify
+Workflow run and a Dify Chatflow Session:
+
+```text
+Chatflow app (advanced-chat)
+  turn 1: POST /v1/chat-messages, no conversation_id
+  turn 2: POST /v1/chat-messages, returned conversation_id
+  expected: same conversation_id, different message IDs and workflow run IDs
+
+Workflow app (workflow)
+  request 1/2: POST /v1/workflows/run, no conversation_id
+  expected: different workflow_run_id values, no conversation_id
+```
+
+The script writes only mode-0600 synthetic request/response files and a sanitized summary under
+`.runtime/results`; stdout contains hash prefixes and booleans, never API keys, headers, answers,
+or raw IDs. It bypasses the host HTTP proxy for loopback requests.
+
+Use `--streaming` to exercise Dify's SSE response mode, or `--blocking` (the default) when a
+stable JSON response is preferred. `--no-workflow-isolation` runs only the two Chatflow turns.
+`DIFY_LAB_CHATFLOW_QUERY_1`, `DIFY_LAB_CHATFLOW_QUERY_2`, and
+`DIFY_LAB_CHATFLOW_REQUIRE_MARKERS=0` allow a controlled provider-specific fixture without
+changing the identity assertions.
+
+If the current Dify administrator password is not the one in the protected lab runtime, import
+the fixture manually from the console (Import DSL), configure the already-installed local
+OpenAI-compatible model, publish the app, and create a Service API key. Store the app UUID and
+the complete `Authorization: Bearer …` line in mode-0600 files outside the repository, then
+point the harness at them:
+
+```bash
+set +x
+export DIFY_LAB_CHATFLOW_APP_ID_FILE=/secure/path/chatflow-app-id
+export DIFY_LAB_CHATFLOW_AUTH_HEADER_FILE=/secure/path/chatflow-app-authorization-header
+deploy/manual-test/agent-llm-observability/dify/scripts/run-chatflow.sh
+unset DIFY_LAB_CHATFLOW_APP_ID_FILE DIFY_LAB_CHATFLOW_AUTH_HEADER_FILE
+```
+
+The app must remain `advanced-chat`; do not reuse a Workflow app key for this command. The
+manual step is only needed to create the Chatflow definition/key; the harness itself makes two
+bounded local-mock calls and does not contact an external provider.
