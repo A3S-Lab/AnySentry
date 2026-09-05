@@ -850,7 +850,12 @@ Observer Pod `a3s-observer-ss7qh` 为 Ready、restart 0，容器内 Collector �
 一致（摘要值不在文档中展开）。Canonical GET 实体验证在 NodePort 低负载窗口返回 `status=pass`；
 未设置管理令牌的默认端口调用会得到 401，使用 Kubernetes 受保护 Secret 临时注入后通过，令牌
 未写入命令、仓库或测试产物。健康快照仍显示历史 persistence/drop 计数和高负载风险，所以这些
-状态不能替代四类产品的正式被动明文验收。
+状态不能替代四类产品的正式被动明文验收。进一步复核发现 Observer 的
+`filter-rules.json` 曾停留在 `activation.mode=preview`、`reason=scope_expired`、
+`expectedEntries=0`，而 forwarder 日志同时出现控制端点 timeout/ECONNRESET；这解释了
+为什么 TLS Agent cgroup 快照虽包含 SSH Codex 根进程，采集 profile 却没有形成稳定激活。
+后续验收必须同时检查规则快照版本/expiry、ack 状态和 forwarder 控制面可达性，不能只看
+Pod Ready 或 TLS cgroup 文件。
 
 ### 当前交付判定
 
