@@ -669,6 +669,21 @@ AnySentry:
 
 当前 Goal 仍为 **partial**：代码合同、构建、镜像 provenance、S5 启动快照、Kernel 基础采集和解析回归已完成；Rustls/SSH 正文、Dify/LangGraph 跨 lane 深链、共享节点长期稳定性和完整四对象被动 E2E 仍未满足 Definition of Done。
 
+### 2026-09-05 10:56 本地运行快照
+
+最新只读检查显示 API Pod `anysentry-67c8bb676b-67xcq` 与 Observer Pod `a3s-observer-ss7qh`
+均 `Ready=1/restart=0`；活动 Observer 镜像为 `sha256:9b8af95d…`，容器内 Collector 摘要为
+`0f3dbb70…`，supervisor heartbeat 文件持续存在。Collector 最新心跳为 `attached=24/25`、
+`queueDepth=0`、`outputDropped=0`，但累计 `droppedEvents=43140`，健康状态仍为
+`degraded`；同时保留 4 个历史 down collector 和共享节点的 I/O/数据库压力。因此该快照只能
+证明当前进程未重启、基础 Kernel 管道在工作，不能证明长期零丢失或四类产品的被动明文完整性。
+
+同一窗口内，tender/LangChain 服务 `/health=200`、一次 bounded `/invoke=200` 并返回一个
+`lookup_fixture` 工具调用；它是应用服务级证据。Dify Chatflow harness 在 console setup
+入口得到 HTTP 502，未生成 Chatflow 两轮结果。Canonical entity GET（NodePort）和合成
+representative replay 仍通过；后者明确标记为 synthetic authenticated replay，不替代真实
+vendor binary attach。所有这些结果均未记录凭据、完整 Prompt 或回答正文。
+
 ## 2026-09-05 最终本地复核：r51（当前事实优先，结论仍为 partial）
 
 本节覆盖本 Goal 回合实际构建、部署和验收的最高版本。前面 r27/r33/r46 的镜像、Pod 名称、
