@@ -844,6 +844,14 @@ Canonical Runtime/Event”的机器证据链存在，但没有证明用户消息
 不能从进程命令行、Codex session 提示或事件计数反推出明文内容；需要 Rustls/流式正文捕获
 和可验证的 provider/session anchor 后才能升级为 confirmed Session/完整交互投影。
 
+复核时的当前本地部署状态已重新读取：AnySentry Deployment、PodTemplate 与 active ReplicaSet
+均指向 API digest `sha256:58d24f…`，Pod `anysentry-67c8bb676b-67xcq` 为 Ready、restart 0；
+Observer Pod `a3s-observer-ss7qh` 为 Ready、restart 0，容器内 Collector 二进制摘要与工作树
+一致（摘要值不在文档中展开）。Canonical GET 实体验证在 NodePort 低负载窗口返回 `status=pass`；
+未设置管理令牌的默认端口调用会得到 401，使用 Kubernetes 受保护 Secret 临时注入后通过，令牌
+未写入命令、仓库或测试产物。健康快照仍显示历史 persistence/drop 计数和高负载风险，所以这些
+状态不能替代四类产品的正式被动明文验收。
+
 ### 当前交付判定
 
 本 Goal 仍是 **partial**。代码合同、兼容迁移、API/Web 镜像、Canonical point/deep-link 在低负载
