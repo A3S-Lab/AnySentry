@@ -684,6 +684,15 @@ AnySentry:
 representative replay 仍通过；后者明确标记为 synthetic authenticated replay，不替代真实
 vendor binary attach。所有这些结果均未记录凭据、完整 Prompt 或回答正文。
 
+随后通过本地 Web/console API 复核定位并修复了该 502：Dify 前端从回环地址打开时，其
+`CONSOLE_API_URL` 指向本机局域网地址，浏览器代理/跨域 Cookie 使 setup/login 请求表现为
+失败；Dify harness 的所有 console 请求现显式使用 loopback no-proxy。使用受保护的本地
+管理员配置完成插件检查、模型配置检查、LLM Workflow、HTTP Tool Workflow 和 Chatflow
+应用导入/发布。`run-chatflow.sh --blocking` 与 `--streaming` 均通过：两轮复用同一
+`conversation_id`、message ID 不重复、每轮 execution ID 不重复；Workflow 隔离检查确认
+两个 app definition 不同、每次 POST 产生不同 run ID 且没有 conversation ID。脚本只在 Dify
+运行时的 0600 文件中保存 app key/结果摘要，未把任何 token、Cookie 或正文写入仓库。
+
 ## 2026-09-05 最终本地复核：r51（当前事实优先，结论仍为 partial）
 
 本节覆盖本 Goal 回合实际构建、部署和验收的最高版本。前面 r27/r33/r46 的镜像、Pod 名称、

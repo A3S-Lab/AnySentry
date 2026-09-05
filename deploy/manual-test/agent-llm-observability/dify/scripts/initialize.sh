@@ -47,6 +47,7 @@ http_json() {
   local output="$3"
   local input="${4:-}"
   local -a args=(
+    --noproxy '*'
     --silent
     --show-error
     --location
@@ -84,7 +85,7 @@ tmp_json() {
 }
 
 setup_response="$(mktemp "$DIFY_LAB_RUNTIME/session/.setup-status.XXXXXX.json")"
-setup_code="$(curl --silent --show-error --output "$setup_response" --write-out '%{http_code}' \
+setup_code="$(curl --noproxy '*' --silent --show-error --output "$setup_response" --write-out '%{http_code}' \
   "$console_api/setup")"
 expect_status "$setup_code" '^200$' "$setup_response" "Dify setup status"
 setup_step="$(jq -r '.step // empty' "$setup_response")"
