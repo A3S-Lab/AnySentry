@@ -619,6 +619,56 @@ node scripts/verify-deployment-manifests.mjs
 
 以上命令在本回合通过；正式 Observer 未恢复，故没有把新的被动 Kernel/LLM 捕获写成通过。
 
+## 2026-09-05 续回合增量：当前 head 镜像、探针合同与运行门禁
+
+### 已确认事实
+
+| 项目 | 当前结果 | 证据边界 |
+| --- | --- | --- |
+| Observer 本地 checkpoint | `2eeb562`、`f3899a2`、`fb531aa`；AnySentry `d50a873`、`cf918e1` | 均为本地 commit，未执行远程 push；用户既有未跟踪文件未改动 |
+| Observer 镜像 | loopback digest `sha256:9b8af95d4c44658a2e7dabe48a2cbadfaf399a279de87de4fe72366f0195bccf`；Collector 文件 SHA-256 `0f3dbb705368a1a49e5baed3d178d93b91c320188eccedc50f61c7065afe5a6f` | 镜像由 scripts overlay + 当前 release Collector binary 组成；Kubernetes Pod imageID 与 digest 一致 |
+| Observer supervisor | 新增 `/run/a3s-observer.alive`，启动立即写入、每 10 秒更新时间、退出清理；Pod `a3s-observer-zlqxv` 曾以 restart=0 Ready 运行 | 探针与实现合同已对齐；当前稳定窗口仍受节点 I/O 影响 |
+| eBPF method 边界 | shared `classify_http_method_prefix` 按 RFC token 识别扩展 method；eBPF/Collector 复用同一 classifier；额外 TLS process patterns 有数量/长度/控制字符限制 | 未引入产品名/版本号核心分支；225/176 项 Observer 定向测试通过 |
+| 压缩 SSE | 无 `Content-Length` 时用有界解压结果进行 framing，原始 compressed bytes 仍保留为 canonical body/hash；超 2048 个事件产生 `sse_event_limit` 并降级 partial | gzip SSE、SSE event limit、已有 Collector 全测试通过 |
+| AnySentry API 镜像 | loopback digest `sha256:58d24f523381551cbd03bb8202e9d453d5fa011e5144a801e1b2656e808e3dec`；活动 ReplicaSet `anysentry-67c8bb676b` Ready | Deployment 顶层、PodTemplate、活动 ReplicaSet image/provenance 均通过 `verify-live-image-provenance.mjs` |
+| Source trust binding | managed Observer Source 使用 `observer_runtime` + collector allow-list；workspacePath 清空且不再从容器 rootfs 路径学习；当前 source lastResult=accepted | 旧约 90k workspace mismatch 不再新增；历史 rejected 计数保留 |
+| Collector heartbeat | API 已解析并展示 cumulative `interactionReassembly` counters；当前活动 Collector 最近快照 counters 为 0，S5 snapshot/ACK 文件存在 | health 仍可能显示 degraded，因为历史 drop/WAL 和旧 down collector 仍在时间窗内 |
+| 运行时 attach | 当前 Pod `attached=24/25`，基础 exec/network/dns/security/ssl tracepoint 正常；Rustls/静态 TLS attach 仍产生 `unsupported_tls_profile` 或 verifier/ABI coverage gap | 没有伪造 Rustls HTTPS 明文；Codex/Claude 当前 SSH Rustls/WebSocket 仍不算完整被动明文通过 |
+
+### 目标设计与推断
+
+- eBPF 热路径只保留固定事件和低复杂度 gate；未知 HTTP method 的通用识别与扩展解析在共享 contract/用户态完成。这样可以维护 fail-closed 边界，同时避免一个可选 route 分支阻塞 TLS metadata probe。
+- verifier 长日志属于诊断路径故障，已通过 2 KiB 截断避免 Collector 因 stderr 管道耗尽而退出；这不会把 attach 失败改写成成功，仍会保留 `unsupported_tls_profile`/coverage gap。
+- Candidate/Confirmed 采集档位继续相同；Unknown 或未匹配 TLS 只保留 KernelFact、候选和 CoverageGap，不升级为明文成功。
+
+### 本增量验证命令
+
+```text
+Observer:
+  cargo fmt --all -- --check
+  cargo test --locked --offline -p a3s-observer -p a3s-observer-common -p a3s-observer-collector --lib --tests
+  cargo clippy --locked --offline -p a3s-observer-collector -p a3s-observer-common --all-targets -- -D warnings
+  cargo build --locked --offline -p a3s-observer-ebpf --release
+
+AnySentry:
+  pnpm --filter @anysentry/api exec tsc --noEmit
+  pnpm build:api
+  node scripts/verify-ingestion-source-correlation-claims.mjs
+  node scripts/verify-s5-observer-source-bootstrap.mjs
+  node scripts/verify-deployment-manifests.mjs
+  deploy/manual-test/agent-llm-observability/dify/scripts/validate.sh --static
+  node scripts/verify-live-image-provenance.mjs --expected-digest sha256:58d24f523381551cbd03bb8202e9d453d5fa011e5144a801e1b2656e808e3dec --expected-source AnySentry@a1c2ddb
+```
+
+### 未验证和运行限制
+
+1. 当前共享 k3s 节点仍有持续的磁盘高利用率、PostgreSQL checkpoint/ClickHouse 写入压力和 Observer 历史 WAL；最新健康窗口虽无新 output drop，但不能据此宣称长时间零丢失。
+2. Dify Chatflow harness 已加入并通过静态检查，但真实 Chatflow 两轮请求仍需要一次本地管理员导入/发布和受保护的 App API header 文件；该文件不能提交到仓库。
+3. 当前没有可确认的常驻独立 LangChain/LangGraph 服务都通过 Observer→WAL→Canonical 的唯一 EvidenceLink；k3s LangGraph sandbox 的 Kernel Exec/Exit 已可见，跨 Pod 关系仍按 `semantic_only`/`coverage_gap`。
+4. 当前 SSH 终端内的真实对话不能由本进程自动注入；需要用户在该终端执行短的 canary 对话并报告脱敏 marker，才能把 SSH runtime 的新窗口结果列入实测矩阵。
+
+当前 Goal 仍为 **partial**：代码合同、构建、镜像 provenance、S5 启动快照、Kernel 基础采集和解析回归已完成；Rustls/SSH 正文、Dify/LangGraph 跨 lane 深链、共享节点长期稳定性和完整四对象被动 E2E 仍未满足 Definition of Done。
+
 ## 2026-09-05 最终本地复核：r51（当前事实优先，结论仍为 partial）
 
 本节覆盖本 Goal 回合实际构建、部署和验收的最高版本。前面 r27/r33/r46 的镜像、Pod 名称、
