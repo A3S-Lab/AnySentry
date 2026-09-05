@@ -280,6 +280,11 @@ const parsed = interactionParser.parseObserverAgentInteraction(line, {
 assert.ok(parsed);
 assert.equal(parsed.providerConversationId, undefined, 'runtime fallback must not become provider Conversation');
 assert.equal(parsed.rawObservationId, raw.observationId);
+assert.equal(parsed.sessionIdentityQuality, 'ephemeral',
+  'exact runtime evidence without a provider anchor must remain ephemeral');
+assert.equal(parsed.sessionIdSource, 'per_request',
+  'runtime-only evidence must not retain legacy_agent_fallback as a durable Session source');
+assert.equal(parsed.sessionMode, 'ephemeral');
 
 const metadata = new AgentMetadataService(
   { loadAgentMetadata: async () => [], saveAgentMetadata: async () => true },
@@ -337,6 +342,23 @@ assert.equal(providerSessionParsed?.endpoint, 'https://fixture.invalid/v1/chat',
   'Observer-decoded endpoint metadata must drop URL userinfo/query/fragment');
 assert.equal(providerSessionParsed?.path, '/v1/chat/completions',
   'Observer-decoded request paths must not retain query parameters');
+
+// A real Observer-decoded provider anchor may upgrade the compatibility fallback only when the
+// authenticated source supplies a stable namespace.  The source/workspace tuple is sufficient
+// for a bounded local namespace, but the provider/native ID alone must remain event-ephemeral.
+const scopedProviderSessionParsed = interactionParser.parseObserverAgentInteraction(providerSessionLine, {
+  workspacePath: '/workspace/a', agentId: 'generic-agent', sessionId: 'container-abc', userId: 'synthetic',
+  sessionIdentityQuality: 'ephemeral', sessionIdSource: 'legacy_agent_fallback',
+  attributes: { sourceId: 'source-a' },
+  classificationSemantics: { schemaVersion: 'anysentry.classification_semantics.v1', identityClassification: 'confirmed_agent', workloadRole: 'agent', captureProfile: 'agent_full' },
+  process: { hostId: 'host-a', bootId: 'boot-a', pid: 42, startTimeTicks: '100', comm: 'agent', exe: '/bin/agent' },
+  attribution: { monitored: true, classification: 'confirmed_agent', confidence: 1, reason: 'authoritative_anchor', source: 'self_register', agentScopeId: 'generic-agent', agentInstanceId: 'runtime-a' },
+});
+assert.equal(scopedProviderSessionParsed?.providerConversationId, 'provider-session-fixture');
+assert.equal(scopedProviderSessionParsed?.sessionIdentityQuality, 'strong',
+  'an authenticated source/workspace namespace must upgrade a real provider anchor to strong');
+assert.equal(scopedProviderSessionParsed?.sessionMode, 'resumable');
+assert.equal(scopedProviderSessionParsed?.sessionIdSource, 'provider');
 
 const candidateDecision = captureClassificationDecision('probable_agent');
 assert.equal(candidateDecision.observed, 'probable_agent');

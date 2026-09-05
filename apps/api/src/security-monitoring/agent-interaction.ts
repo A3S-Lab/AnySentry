@@ -1071,9 +1071,15 @@ export function parseObserverAgentInteraction(
     sessionIdentityQuality,
     ...(providerConversationId
       ? { sessionIdSource: 'provider' as const }
-      : meta.sessionIdSource
-        ? { sessionIdSource: meta.sessionIdSource }
-        : { sessionIdSource: sessionResolution.quality === 'ephemeral' || runtimeOnlySession ? 'per_request' as const : 'unresolved' as const }),
+      // `legacy_agent_fallback` is retained on the compatibility EventMeta envelope so old
+      // readers can diagnose its origin, but it must not leak into a parsed interaction as the
+      // apparent Session source.  An exact runtime/process binding without a provider anchor is
+      // still a valid machine-side observation; its human Session boundary is per-request.
+      : (runtimeOnlySession || meta.sessionIdSource === 'legacy_agent_fallback')
+        ? { sessionIdSource: 'per_request' as const }
+        : meta.sessionIdSource
+          ? { sessionIdSource: meta.sessionIdSource }
+          : { sessionIdSource: sessionResolution.quality === 'ephemeral' ? 'per_request' as const : 'unresolved' as const }),
     sessionMode: input.sessionMode === 'per_request' || serviceStatefulHint === false
       ? 'per_request'
       : sessionResolution.quality === 'ephemeral'
