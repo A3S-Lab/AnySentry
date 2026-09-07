@@ -7,11 +7,11 @@ spec:
   template:
     metadata:
       annotations:
-        anysentry.io/manual-observer-profile: "agent-enforce-docker-files-v4-bounded-lifecycle-20260907"
+        anysentry.io/manual-observer-profile: "agent-enforce-docker-files-v5-file-read-20260907"
         # Keep the locally delivered immutable overlay and source checkpoints auditable in the
         # rendered PodTemplate; this is not a remote publication identifier.
-        anysentry.io/local-overlay-manifest: "sha256:c9eb1f88f15465fc88d68c4392a36f3ea513f3f0968dbce99e2dc92fc05c8b23"
-        anysentry.io/local-source-revision: "Observer@705e9c1+bounded-unknown-lifecycle+AnySentry@141e244"
+        anysentry.io/local-overlay-manifest: "sha256:377e64609688e2d3012c0ae7fc05d5cd3ececc6b169399c7daf854f9789f7f8c"
+        anysentry.io/local-source-revision: "Observer@e4128b6+file-read-agent-only"
     spec:
       containers:
         - name: a3s-observer
@@ -38,9 +38,10 @@ spec:
             - { name: A3S_OBSERVER_FILES, value: "1" }
             - { name: A3S_OBSERVER_FILE_ACCESS, value: "1" }
             - { name: A3S_OBSERVER_FILE_DELETE, value: "1" }
-            # FileRead is an explicit high-volume probe. Keep it off for the
-            # default/access canary; enable it only via k8s-observer-files-full.
-            - { name: A3S_OBSERVER_FILE_READ, value: "0" }
+            # FileRead is explicit and Agent/Candidate-only before path copy/Ring reserve.
+            # Unknown/infrastructure reads stay NOT_ENABLED/DROP; admitted Agents use the shared
+            # SAMPLE budget so Dify/Codex open(O_RDONLY) cannot reopen an unbounded flood.
+            - { name: A3S_OBSERVER_FILE_READ, value: "1" }
             - { name: A3S_OBSERVER_FILE_UNKNOWN_POLICY, value: "drop" }
             # Discovery budget for unknown Exec/LLM after bounded-lifecycle remap. Keep this far
             # below the historical unprotected FULL flood while still allowing first-seen Agent
