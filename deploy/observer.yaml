@@ -128,7 +128,8 @@ spec:
             # Full signal set: file writes/deletes (FileAccess/FileDelete) + OpenSSL plaintext
             # (SslContent → prompt-injection / secret-exfil rules + LlmApi model/token usage).
             # Set to "0" to reduce footprint on a busy node.
-            - { name: A3S_OBSERVER_FILES, value: "1" }
+            - { name: A3S_OBSERVER_FILES, value: "0" }
+            - { name: A3S_OBSERVER_FILE_READ, value: "0" }
             - { name: A3S_OBSERVER_SSL, value: "1" }
             # Optional comma-separated host-visible CLI/libssl paths. Exact profiles or standard
             # exported TLS symbols are attached once per inode; verified PID + LLM route gates
@@ -171,6 +172,9 @@ spec:
             # desired intent/ACK telemetry while keeping every probe FULL.
             - { name: ANYSENTRY_CAPTURE_PROFILE_MODE, value: "shadow" }
             - { name: ANYSENTRY_CAPTURE_PROFILE_ACK_POLL_MS, value: "250" }
+            # Default-on Ring-before bounded unknown lifecycle. Manual enforce overlays keep this
+            # explicit; set to 0 only when comparing against the legacy protected=FULL matrix.
+            - { name: A3S_OBSERVER_BOUNDED_UNKNOWN_LIFECYCLE, value: "1" }
             - { name: ANYSENTRY_INFRASTRUCTURE_POLICY_URL, value: "http://anysentry:29653/security-center/infrastructure-rules/policy" }
             - { name: ANYSENTRY_INFRASTRUCTURE_MATERIALIZATION_URL, value: "http://anysentry:29653/security-center/infrastructure-rules/materializations/report" }
             - { name: ANYSENTRY_INFRASTRUCTURE_POLICY_SECS, value: "5" }
