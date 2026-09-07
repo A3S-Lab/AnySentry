@@ -42,8 +42,13 @@ spec:
             # default/access canary; enable it only via k8s-observer-files-full.
             - { name: A3S_OBSERVER_FILE_READ, value: "0" }
             - { name: A3S_OBSERVER_FILE_UNKNOWN_POLICY, value: "drop" }
-            - { name: ANYSENTRY_CAPTURE_SAMPLE_PER_SCOPE, value: "5" }
-            - { name: ANYSENTRY_CAPTURE_SAMPLE_PER_NODE, value: "100" }
+            # Discovery budget for unknown Exec/LLM after bounded-lifecycle remap. Keep this far
+            # below the historical unprotected FULL flood while still allowing first-seen Agent
+            # promotion evidence. Shared across non-protected probes per sample window.
+            - { name: ANYSENTRY_CAPTURE_SAMPLE_PER_SCOPE, value: "3" }
+            - { name: ANYSENTRY_CAPTURE_SAMPLE_PER_NODE, value: "30" }
+            - { name: ANYSENTRY_CAPTURE_FIRST_SAMPLES, value: "2" }
+            - { name: ANYSENTRY_CAPTURE_SAMPLE_WINDOW_MS, value: "1000" }
             # Exec/Exit are correctness-critical and share one bounded lane. The host can emit
             # short process bursts while CLI agents fan out helpers; size this lane for bursts so
             # a slow downstream write cannot turn ordinary lifecycle evidence into an inbox drop.
