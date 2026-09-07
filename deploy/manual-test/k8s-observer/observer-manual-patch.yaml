@@ -7,11 +7,11 @@ spec:
   template:
     metadata:
       annotations:
-        anysentry.io/manual-observer-profile: "agent-enforce-docker-files-v4-bounded-sample-isolated-spool"
+        anysentry.io/manual-observer-profile: "agent-enforce-docker-files-v4-bounded-lifecycle-20260907"
         # Keep the locally delivered immutable overlay and source checkpoints auditable in the
         # rendered PodTemplate; this is not a remote publication identifier.
-        anysentry.io/local-overlay-manifest: "sha256:5459ba4e4143728d3f0448f4490f3cffe9a9106591231e1520ed6e2163654ee4"
-        anysentry.io/local-source-revision: "Observer@139e86b+verifier-budget+AnySentry@deec804"
+        anysentry.io/local-overlay-manifest: "sha256:c9eb1f88f15465fc88d68c4392a36f3ea513f3f0968dbce99e2dc92fc05c8b23"
+        anysentry.io/local-source-revision: "Observer@705e9c1+bounded-unknown-lifecycle+AnySentry@141e244"
     spec:
       containers:
         - name: a3s-observer
