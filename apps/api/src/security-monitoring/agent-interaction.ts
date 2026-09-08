@@ -3,6 +3,7 @@ import type * as T from './types';
 import { detectedAgentIdentity } from './agent-identity';
 import {
   deriveAgentInstanceIdentity,
+  deriveConnectionIdentity,
   deriveProcessGenerationKey,
   canonicalSessionIdForMembership,
   resolveLogicalAgentDefinition,
@@ -268,6 +269,56 @@ function interactionRawObservationRevision(envelope: Record<string, unknown>): n
   const raw = record(envelope.rawObservation ?? envelope.raw_observation);
   const value = Number(raw?.revision);
   return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function interactionConnectionFromEnvelope(
+  envelope: Record<string, unknown>,
+  input: Record<string, unknown>,
+  process: T.ProcessContext | undefined,
+  interactionId: string,
+  connectionId: string,
+  transport: 'http' | 'tls',
+  transportProtocol: string | undefined,
+): {
+  bindQuality?: 'cookie' | 'fd' | 'unbound';
+  socketFd?: number;
+  socketCookie?: string;
+  fdGeneration?: string;
+  connectionIdentity?: T.ConnectionIdentity;
+} {
+  const raw = record(envelope.rawObservation ?? envelope.raw_observation);
+  const fromRaw = record(raw?.connection ?? raw?.connectionIdentity);
+  const bindQualityRaw = string(input.bindQuality, 32)?.toLowerCase();
+  const bindQuality = bindQualityRaw === 'cookie' || bindQualityRaw === 'fd' || bindQualityRaw === 'unbound'
+    ? bindQualityRaw
+    : undefined;
+  const socketFd = integer(input.socketFd ?? fromRaw?.fd, 0, 4_194_304);
+  const socketCookie = string(input.socketCookie ?? fromRaw?.socketCookie, 240);
+  const fdGeneration = string(input.fdGeneration ?? fromRaw?.fdGeneration, 240);
+  const processGenerationKey = string(process?.processGenerationKey, 128)
+    ?? string(fromRaw?.processGenerationKey, 128);
+  const derived = processGenerationKey
+    ? deriveConnectionIdentity({
+      processGenerationKey,
+      ...(socketCookie ? { socketCookie } : {}),
+      ...(socketFd !== undefined && socketFd > 0 ? { fd: socketFd } : {}),
+      ...(fdGeneration ? { fdGeneration } : {}),
+      tlsContextId: connectionId.startsWith('tls:')
+        ? `tlsctx_${connectionId.slice(4)}`
+        : `tlsctx_${connectionId}`,
+      transport: transportProtocol?.includes('websocket')
+        ? 'websocket'
+        : transport === 'tls' ? 'tls' : transport === 'http' ? 'http' : 'unknown',
+      sourceRefs: [interactionId],
+    })
+    : undefined;
+  return {
+    ...(bindQuality ? { bindQuality } : {}),
+    ...(socketFd !== undefined && socketFd > 0 ? { socketFd } : {}),
+    ...(socketCookie ? { socketCookie } : {}),
+    ...(fdGeneration ? { fdGeneration } : {}),
+    ...(derived ? { connectionIdentity: derived } : {}),
+  };
 }
 
 function decodedBody(body: string, encoding: 'utf8' | 'base64'): Buffer | undefined {
@@ -1114,6 +1165,15 @@ export function parseObserverAgentInteraction(
     ...(classificationDecision.candidateAutoPromoted ? { candidateAutoPromoted: true } : {}),
     process,
     connectionId,
+    ...interactionConnectionFromEnvelope(
+      envelope,
+      input,
+      process,
+      interactionId,
+      connectionId,
+      input.transport === 'tls' ? 'tls' : 'http',
+      string(input.transportProtocol, 80),
+    ),
     transport: input.transport === 'tls' ? 'tls' : 'http',
     protocol: string(input.protocol, 80) ?? 'unknown',
     ...(tlsAdapterId ? { tlsAdapterId } : {}),

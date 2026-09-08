@@ -3,7 +3,7 @@
 // @a3s-lab/sentry judgments.
 
 import type { TrustedCorrelationV1 } from './trusted-correlation';
-import type { EvidenceLink } from './canonical-observability';
+import type { ConnectionIdentity, EvidenceLink } from './canonical-observability';
 
 export type {
   AgentInstance,
@@ -1774,6 +1774,13 @@ export interface AgentInteractionRecord {
   candidateAutoPromoted?: boolean;
   process?: ProcessContext;
   connectionId: string;
+  /** Observer tls_ctx↔socket bind quality when present (`cookie` / `fd`). */
+  bindQuality?: 'cookie' | 'fd' | 'unbound';
+  socketFd?: number;
+  socketCookie?: string;
+  fdGeneration?: string;
+  /** Canonical connection identity derived at ingest from Observer bind + process generation. */
+  connectionIdentity?: ConnectionIdentity;
   transport: 'http' | 'tls';
   protocol: string;
   tlsAdapterId?: string;

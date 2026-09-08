@@ -4050,7 +4050,16 @@ function eventInner(kind: string, input: T.UniversalIngestEvent): Record<string,
       'peer',
     );
     const port = finiteNumber(input.port ?? eventAttr(input, 'port'));
-    return { ...base, peer, ...(port !== undefined ? { port } : {}) };
+    const fd = finiteNumber(eventAttr(input, 'fd') ?? eventAttr(input, 'socketFd') ?? (input as { fd?: unknown }).fd);
+    const sniRaw = cleanString(input.sni ?? eventAttr(input, 'sni'), 500);
+    const sni = sniRaw ? sanitizeEndpointAttributeValue(sniRaw, 'sni') : undefined;
+    return {
+      ...base,
+      peer,
+      ...(port !== undefined ? { port } : {}),
+      ...(fd !== undefined ? { fd } : {}),
+      ...(sni ? { sni } : {}),
+    };
   }
   if (kind === 'Dns') return { ...base, query: cleanString(input.query ?? input.peer ?? input.endpoint ?? eventAttr(input, 'query'), 500) ?? 'unknown' };
   if (kind === 'FileAccess' || kind === 'FileDelete') return { ...base, path: cleanString(input.path ?? eventAttr(input, 'path'), 800) ?? 'unknown' };
