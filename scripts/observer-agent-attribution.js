@@ -1327,7 +1327,11 @@ class AgentAttributor {
     if (existing?.state === 'infrastructure') {
       return this.finish(pid, this.infrastructureResult(existing), exiting, current);
     }
-    const tombstone = exiting ? this.tombstoneFor(current) : undefined;
+    // Late ToolExec / LlmInteraction for a short-lived Agent root often arrives after
+    // ProcessExit removed the live record. Reuse the same-process tombstone so host CLI
+    // sessions stay `probable_agent` without FORWARD_RETAIN_NON_AGENT / RETAIN_UNKNOWN.
+    // Only the exact ProcessKey may revive; a different startTime (PID reuse) must not.
+    const tombstone = this.tombstoneFor(current);
     if (tombstone?.state === 'agent') {
       return this.finish(pid, this.agentResult(tombstone, true), exiting, current);
     }

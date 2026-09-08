@@ -826,11 +826,21 @@ function attributor(procEntries = []) {
   exitEvent.event = { ProcessExit: { pid: 600, exit_code: 0, signal: 0 } };
   assert.equal(judge.classify(exitEvent).state, 'agent');
   assert.equal(judge.metrics().tombstones, 1);
-  const late = observerEvent({ pid: 600, ppid: 999, comm: 'bash', exe: '/usr/bin/bash', startTimeNs: '60', argv: ['bash', '-c', 'echo late'] });
-  assert.notEqual(
-    judge.classify(late).state,
+  const lateSameProcess = observerEvent({
+    pid: 600, ppid: 1, comm: 'codex', exe: '/usr/bin/codex', startTimeNs: '60', argv: ['codex', 'exec'],
+  });
+  assert.equal(
+    judge.classify(lateSameProcess).state,
     'agent',
-    'a root tombstone may deduplicate ProcessExit but must not revive the exited subtree',
+    'late ToolExec/LlmInteraction for an exited short-lived CLI root must reuse the ProcessKey tombstone',
+  );
+  const lateForeign = observerEvent({
+    pid: 600, ppid: 999, comm: 'bash', exe: '/usr/bin/bash', startTimeNs: '61', argv: ['bash', '-c', 'echo late'],
+  });
+  assert.notEqual(
+    judge.classify(lateForeign).state,
+    'agent',
+    'a different startTime (PID reuse) must not inherit the exited root tombstone',
   );
   const reused = judge.classify(observerEvent({ pid: 600, ppid: 999, comm: 'short-task', exe: '/usr/bin/short-task', startTimeNs: '', argv: ['short-task'] }));
   assert.equal(reused.state, 'unknown');

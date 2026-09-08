@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 import type * as T from './types';
 import { interactionHumanMessages } from './agent-conversation-resolution-v2';
+import { closeToolCallsAcrossInteractions } from './agent-tool-closure';
 
 export const SEMANTIC_PROJECTION_PARSER_ID = 'anysentry.agent-semantic-timeline';
 export const SEMANTIC_PROJECTION_PARSER_VERSION = 2;
@@ -485,6 +486,9 @@ function resolvedToolCallIdsForTimeline(
       }
       resolved.add(result.toolCallId);
     }
+  }
+  for (const match of closeToolCallsAcrossInteractions(interactions).matches) {
+    if (match.firstSeen) resolved.add(match.toolCallId);
   }
   return resolved;
 }

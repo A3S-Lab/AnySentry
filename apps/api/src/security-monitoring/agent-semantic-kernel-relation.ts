@@ -7,7 +7,9 @@ import { agentRuntimeInstanceIdsEquivalent } from './agent-identity';
 
 export const AGENT_SEMANTIC_KERNEL_RELATION_VERSION = 4;
 const CLOCK_SKEW_MS = 2_000;
-const OPEN_TOOL_WINDOW_MS = 30 * 60_000;
+/** Open-call fallback when ToolResult is still missing. Keep far shorter than a wall-clock
+ *  session so late unrelated ToolExec/File/Egress cannot attach to a sticky pending ToolCall. */
+const OPEN_TOOL_WINDOW_MS = 5 * 60_000;
 const SHELL_TOOL_PATTERN = /(?:^|[\s._-])(?:bash|exec|shell)(?:$|[\s._-])/u;
 const FILE_TOOL_PATTERN = /(?:^|[\s._-])(?:read|write|edit|file)(?:$|[\s._-])/u;
 const NETWORK_TOOL_PATTERN = /(?:^|[\s._-])(?:search|http|fetch|network)(?:$|[\s._-])/u;

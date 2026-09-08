@@ -102,7 +102,7 @@ const MAX_TOOL_CLAIMS = 1_000;
 const MAX_KERNEL_EVIDENCE = 10_000;
 const MAX_LINKS_PER_TOOL = 256;
 const LINK_CLOCK_SKEW_MS = 2_000;
-const OPEN_TOOL_WINDOW_MS = 30 * 60_000;
+const OPEN_TOOL_WINDOW_MS = 5 * 60_000;
 
 function text(value: unknown, limit = 1_024): string | undefined {
   if (typeof value !== 'string') return undefined;

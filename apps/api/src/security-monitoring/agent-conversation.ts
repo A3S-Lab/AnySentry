@@ -12,6 +12,7 @@ import {
   conversationDeploymentScopeKey,
   canonicalPerRequestConversationId,
 } from './agent-conversation-resolution-v2';
+import { closeToolCallsAcrossInteractions } from './agent-tool-closure';
 
 function deploymentSessionScopeKeyForRecord(record: T.AgentInteractionRecord): string {
   return conversationDeploymentScopeKey(record);
@@ -580,6 +581,11 @@ function resolvedToolResultIds(
       }
       resolved.add(result.toolCallId);
     }
+  }
+  // Cross-interaction ToolResult pairing (P2) closes Observer's single-row tool_result_pending
+  // without mutating stored completeness. Merge those IDs so coverage/timeline stop warning.
+  for (const match of closeToolCallsAcrossInteractions(interactions).matches) {
+    if (match.firstSeen) resolved.add(match.toolCallId);
   }
   return resolved;
 }
