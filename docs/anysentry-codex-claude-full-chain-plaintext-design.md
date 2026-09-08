@@ -1,6 +1,6 @@
 # AnySentry Codex / Claude Code 全链路明文观测与内核事件关联设计
 
-> 状态：P0–P2 已落地（Adapter Manifest、ConnectionIdentity、ToolResult 闭合 + argv 归一化）；P3–P4 待实施
+> 状态：P0–P2 已落地；P4 Kimi Manifest 扩展性回归已落地；P3 HTTP/2 HEADERS 进行中
 >
 > 记录日期：2026-09-08（Asia/Shanghai）；P0–P2：2026-09-08
 >
