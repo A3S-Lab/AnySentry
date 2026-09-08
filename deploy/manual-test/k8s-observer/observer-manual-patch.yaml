@@ -10,8 +10,8 @@ spec:
         anysentry.io/manual-observer-profile: "agent-enforce-docker-files-v6-python-tcp-plaintext-20260907"
         # Keep the locally delivered immutable overlay and source checkpoints auditable in the
         # rendered PodTemplate; this is not a remote publication identifier.
-        anysentry.io/local-overlay-manifest: "sha256:4b58d37b136ac3e1d377cd031ee26fe44584e72727d794511994ac2ff2fb43fa"
-        anysentry.io/local-source-revision: "Observer@goal/canonical-observability-20260903+7e8d90b+cli-admit"
+        anysentry.io/local-overlay-manifest: "sha256:f74ddad83697c86855ab0e00986013272d41eb2d87ff74c4cc3546525219c373"
+        anysentry.io/local-source-revision: "Observer@goal/canonical-observability-20260903+7e8d90b+cli-admit+ebpf-readfd"
     spec:
       containers:
         - name: a3s-observer
