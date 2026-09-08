@@ -7,11 +7,11 @@ spec:
   template:
     metadata:
       annotations:
-        anysentry.io/manual-observer-profile: "agent-enforce-docker-files-v5-file-read-20260907"
+        anysentry.io/manual-observer-profile: "agent-enforce-docker-files-v6-python-tcp-plaintext-20260907"
         # Keep the locally delivered immutable overlay and source checkpoints auditable in the
         # rendered PodTemplate; this is not a remote publication identifier.
-        anysentry.io/local-overlay-manifest: "sha256:377e64609688e2d3012c0ae7fc05d5cd3ececc6b169399c7daf854f9789f7f8c"
-        anysentry.io/local-source-revision: "Observer@e4128b6+file-read-agent-only"
+        anysentry.io/local-overlay-manifest: "sha256:6dc4ffd5c86f58b07f3d27da19ac788b485eef88e3873670efbc78225e3086b8"
+        anysentry.io/local-source-revision: "Observer@goal/canonical-observability-20260903+7e8d90b"
     spec:
       containers:
         - name: a3s-observer
@@ -56,6 +56,16 @@ spec:
             - { name: A3S_OBSERVER_CRITICAL_INBOX_CAPACITY, value: "131072" }
             - { name: A3S_OBSERVER_SEMANTIC_INBOX_CAPACITY, value: "65536" }
             - { name: A3S_OBSERVER_SSL, value: "1" }
+            # Dify lab: capture HTTPS HTTP-Request tool nodes on the explicit tool path. Without
+            # this, /tool/execute plaintext never enters the interaction lane even when TLS
+            # uprobes fire on the Agent cgroup.
+            # /bash/execute + /mcp: customer-langgraph-sim-lab Design B tool-mocks.
+            # Observer wire template recognizes command+timeout_ms (bash) and mcp-jsonrpc.
+            - { name: A3S_OBSERVER_TOOL_HTTP_ROUTES, value: "/tool/execute,/execute,/bash/execute,/mcp" }
+            # Test-only process name fragments so plugin_daemon OpenAI-compatible provider workers
+            # and Celery HTTP Request tool workers are selected for TLS attach. Do not broaden.
+            # uvicorn/python cover customer-langgraph-sim-lab Design B containers.
+            - { name: A3S_OBSERVER_TLS_PROCESS_PATTERNS, value: "openai_api_compatible,celery,uvicorn" }
             # This single host also runs the retained Docker Pi workload. Reuse the same Observer
             # and enrich its eBPF events from the Docker lifecycle/inspect stream.
             - { name: ANYSENTRY_DOCKER_DISCOVERY, value: "on" }
@@ -79,5 +89,31 @@ spec:
             - { name: FORWARD_SPOOL_REPLAY_INTERVAL_MS, value: "1000" }
           volumeMounts:
             - { name: docker-sock, mountPath: /var/run/docker.sock, readOnly: true }
+            # Local-only hot path: mount patched Forwarder capture-profile scripts from the
+            # development tree so FileRead dedicated-docker scope fixes survive pod restarts
+            # without republishing the Observer image.
+            - { name: forwarder-scripts, mountPath: /opt/observer-capture-profile-control.js, subPath: observer-capture-profile-control.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-filter-rule-publisher.js, subPath: observer-filter-rule-publisher.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-filter-rules.js, subPath: observer-filter-rules.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-forward.js, subPath: observer-forward.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-tls-agent-cgroups.js, subPath: observer-tls-agent-cgroups.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-workload-filter.js, subPath: observer-workload-filter.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-docker-discovery.js, subPath: observer-docker-discovery.js, readOnly: true }
+            # Local-only: rebuilt collector with plain-HTTP write/sendto probes (Python urllib/httpx).
+            - { name: local-collector, mountPath: /usr/local/bin/a3s-observer-collector, readOnly: true }
       volumes:
         - { name: docker-sock, hostPath: { path: /var/run/docker.sock, type: Socket } }
+        - {
+            name: forwarder-scripts,
+            hostPath: {
+              path: /home/chensicheng/a3s/security/AnySentry/scripts,
+              type: Directory
+            }
+          }
+        - {
+            name: local-collector,
+            hostPath: {
+              path: /home/chensicheng/a3s/security/AnySentry/scripts/.local-bin/a3s-observer-collector,
+              type: File
+            }
+          }
