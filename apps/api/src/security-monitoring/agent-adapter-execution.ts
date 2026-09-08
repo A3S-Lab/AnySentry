@@ -9,6 +9,7 @@ import type * as T from './types';
 import {
   DEFAULT_AGENT_ADAPTER_MANIFESTS,
   type AgentAdapterCanonicalToolKind,
+  type AgentAdapterExecArgvNormalizer,
   type AgentAdapterIdentityPath,
   type AgentAdapterManifest,
   type AgentAdapterTrafficRole,
@@ -301,6 +302,67 @@ export function extractToolNameViews(
       return { rawName, canonicalKind };
     })
     .filter((item): item is AgentAdapterToolNameView => Boolean(item));
+}
+
+function argvAsText(argv: string | string[] | undefined): string {
+  if (Array.isArray(argv)) {
+    return argv.map((part) => String(part ?? '').trim()).filter(Boolean).join(' ');
+  }
+  return typeof argv === 'string' ? argv : '';
+}
+
+function stripLeadingTokens(command: string, tokens: string[] | undefined): string {
+  if (!tokens?.length) return command;
+  const parts = command.trim().split(/\s+/u);
+  let offset = 0;
+  for (const token of tokens) {
+    const expected = token.trim();
+    if (!expected) continue;
+    const observed = parts[offset];
+    if (!observed) return command.trim();
+    const base = path.posix.basename(observed.replace(/\\/gu, '/'));
+    if (observed !== expected && base !== expected) return command.trim();
+    offset += 1;
+  }
+  return parts.slice(offset).join(' ').trim() || command.trim();
+}
+
+function extractEvalQuoted(command: string): string {
+  const match = command.match(/\beval\s+(['"])([\s\S]*?)\1/u)
+    ?? command.match(/\beval\s+\$?(['"])([\s\S]*?)\1/u);
+  if (!match?.[2]) return command;
+  return match[2].replace(/\\(["'\\])/gu, '$1').trim() || command;
+}
+
+function stripTrailingRedirect(command: string): string {
+  return command
+    .replace(/\s*(?:&&|;)\s*pwd\s+-P\s*(?:>\|?|>)\s*\/tmp\/\S+\s*$/u, '')
+    .replace(/\s*(?:>\|?|>)\s*\/tmp\/\S+\s*$/u, '')
+    .trim();
+}
+
+/**
+ * Apply Manifest `execArgvNormalizer` declarations to a KernelFact argv or tool command string.
+ * Product-specific wrapping (bash -lc, sandbox helper, Claude eval/shell-snapshot) stays in
+ * declarations; this helper is generic.
+ */
+export function normalizeExecArgv(
+  manifest: AgentAdapterManifest | undefined,
+  argv: string | string[] | undefined,
+): string {
+  let command = argvAsText(argv).replace(/\s+/gu, ' ').trim();
+  if (!command) return '';
+  const rules: readonly AgentAdapterExecArgvNormalizer[] = manifest?.execArgvNormalizer ?? [];
+  for (const rule of rules) {
+    if (rule.kind === 'strip_leading_tokens') {
+      command = stripLeadingTokens(command, rule.tokens);
+    } else if (rule.kind === 'extract_eval_quoted') {
+      command = extractEvalQuoted(command);
+    } else if (rule.kind === 'strip_trailing_redirect') {
+      command = stripTrailingRedirect(command);
+    }
+  }
+  return command.replace(/\s+/gu, ' ').trim();
 }
 
 function mergeAnchors(

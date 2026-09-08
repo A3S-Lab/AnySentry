@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 import type * as T from './types';
 import { createEvidenceLink, type EvidenceLink } from './canonical-observability';
+import { matchAgentAdapterManifest, normalizeExecArgv } from './agent-adapter-execution';
 
 export const AGENT_SEMANTIC_KERNEL_RELATION_VERSION = 3;
 const CLOCK_SKEW_MS = 2_000;
@@ -54,8 +55,22 @@ function candidateEventAtMs(event: T.AgentEventListItem): number {
   return Date.parse(normalized);
 }
 
-function normalizedCommand(value: string): string {
-  return value
+function adapterManifestFor(interaction: T.AgentInteractionRecord | undefined) {
+  if (!interaction) return undefined;
+  return matchAgentAdapterManifest({
+    product: interaction.agentProduct,
+    displayName: interaction.agentProduct,
+    comm: interaction.process?.comm,
+    exe: interaction.process?.exe,
+  });
+}
+
+function normalizedCommand(
+  value: string,
+  interaction?: T.AgentInteractionRecord,
+): string {
+  const adapted = normalizeExecArgv(adapterManifestFor(interaction), value);
+  return adapted
     .trim()
     .replace(/^\/(?:usr\/)?bin\/(?:ba)?sh\s+-(?:l)?c\s+/u, '')
     .replace(/^['"]|['"]$/gu, '')
@@ -484,9 +499,9 @@ function potentialRelation(
   let linkMethod: T.AgentSemanticKernelRelation['linkMethod'];
   let confidence = 0;
   if (command && candidate.eventKind === 'ToolExec') {
-    const expected = normalizedCommand(command);
+    const expected = normalizedCommand(command, interaction);
     const observedCommand = candidateCommand(candidate);
-    const observed = observedCommand ? normalizedCommand(observedCommand) : '';
+    const observed = observedCommand ? normalizedCommand(observedCommand, interaction) : '';
     if (expected && observed && (
       expected === observed || observed.includes(expected) || expected.includes(observed)
     )) {

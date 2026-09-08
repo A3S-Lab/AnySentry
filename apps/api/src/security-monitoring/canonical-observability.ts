@@ -341,7 +341,7 @@ export interface EvidenceLink {
   linkId: string;
   fromType: 'semantic_record' | 'llm_call' | 'tool_call' | 'session' | 'runtime' | 'agent_instance';
   fromId: string;
-  toType: 'raw_observation' | 'kernel_fact' | 'process_generation' | 'connection' | 'file' | 'network' | 'security';
+  toType: 'raw_observation' | 'kernel_fact' | 'process_generation' | 'connection' | 'file' | 'network' | 'security' | 'semantic_record';
   toId: string;
   relation: 'emitted_by' | 'executes_as' | 'file_effect' | 'network_effect' | 'supports' | 'contains';
   method: EvidenceLinkMethod;
@@ -668,7 +668,7 @@ export interface AgentAdapterManifest {
   identityPaths?: AgentAdapterIdentityPath[];
   /** Declarative tool name view consumed by applyAgentAdapter. */
   toolNameView?: AgentAdapterToolNameRule[];
-  /** Declared for P2 correlator; not executed in P0. */
+  /** Declared and executed by correlation (P2) via normalizeExecArgv. */
   execArgvNormalizer?: AgentAdapterExecArgvNormalizer[];
   /** Declared for Observer attach; not executed in P0. */
   executableResolution?: AgentAdapterExecutableResolution;
@@ -863,9 +863,9 @@ export const DEFAULT_AGENT_ADAPTER_MANIFESTS: readonly AgentAdapterManifest[] = 
       { canonicalKind: 'unknown', rawNames: ['update_plan'] },
     ],
     execArgvNormalizer: [
+      { id: 'strip-codex-sandbox', kind: 'strip_leading_tokens', tokens: ['codex-linux-sandbox'] },
       { id: 'strip-bash-lc', kind: 'strip_leading_tokens', tokens: ['bash', '-lc'] },
       { id: 'strip-bash-c', kind: 'strip_leading_tokens', tokens: ['bash', '-c'] },
-      { id: 'strip-codex-sandbox', kind: 'strip_leading_tokens', tokens: ['codex-linux-sandbox'] },
     ],
     executableResolution: {
       shebangDepth: 5,
@@ -1637,7 +1637,7 @@ export function validateEvidenceLink(input: unknown): CanonicalValidationResult<
   const status = ['confirmed', 'strong', 'inferred', 'ambiguous', 'unmatched', 'coverage_gap'].includes(String(value.status)) ? value.status as EvidenceLinkStatus : undefined;
   const authority = ['attested_observer', 'authenticated_adapter', 'server_graph', 'inferred'].includes(String(value.authority)) ? value.authority as EvidenceLink['authority'] : undefined;
   const fromType = ['semantic_record', 'llm_call', 'tool_call', 'session', 'runtime', 'agent_instance'].includes(String(value.fromType)) ? value.fromType as EvidenceLink['fromType'] : undefined;
-  const toType = ['raw_observation', 'kernel_fact', 'process_generation', 'connection', 'file', 'network', 'security'].includes(String(value.toType)) ? value.toType as EvidenceLink['toType'] : undefined;
+  const toType = ['raw_observation', 'kernel_fact', 'process_generation', 'connection', 'file', 'network', 'security', 'semantic_record'].includes(String(value.toType)) ? value.toType as EvidenceLink['toType'] : undefined;
   const relation = ['emitted_by', 'executes_as', 'file_effect', 'network_effect', 'supports', 'contains'].includes(String(value.relation)) ? value.relation as EvidenceLink['relation'] : undefined;
   const evidenceRefs = boundedRefs(value.evidenceRefs);
   const validFromUnixNs = unixNs(value.validFromUnixNs);

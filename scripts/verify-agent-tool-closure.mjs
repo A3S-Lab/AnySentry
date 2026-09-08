@@ -1,0 +1,207 @@
+#!/usr/bin/env node
+
+/**
+ * Deterministic P2 checks: cross-Interaction ToolCall↔ToolResult closure and
+ * Manifest execArgvNormalizer. Synthetic fixtures only.
+ * Run `pnpm build:api` first.
+ */
+
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const {
+  DEFAULT_AGENT_ADAPTER_MANIFESTS,
+} = require('../apps/api/dist/security-monitoring/canonical-observability.js');
+const {
+  matchAgentAdapterManifest,
+  normalizeExecArgv,
+} = require('../apps/api/dist/security-monitoring/agent-adapter-execution.js');
+const {
+  closeToolCallsAcrossInteractions,
+  projectedConversationCompleteness,
+} = require('../apps/api/dist/security-monitoring/agent-tool-closure.js');
+const {
+  buildSemanticKernelRelations,
+} = require('../apps/api/dist/security-monitoring/agent-semantic-kernel-relation.js');
+
+const digest = (value) => createHash('sha256').update(value).digest('hex');
+const now = Date.now();
+const ns = (ms) => String(BigInt(ms) * 1_000_000n);
+
+const codex = matchAgentAdapterManifest({ product: 'Codex' });
+const claude = matchAgentAdapterManifest({ product: 'Claude Code' });
+assert.ok(codex && claude);
+
+assert.equal(
+  normalizeExecArgv(codex, ['bash', '-lc', 'ls -la /tmp']),
+  'ls -la /tmp',
+);
+assert.equal(
+  normalizeExecArgv(codex, 'codex-linux-sandbox bash -lc echo hi'),
+  'echo hi',
+);
+assert.equal(
+  normalizeExecArgv(claude, `bash -c 'eval "npm test" && pwd -P >| /tmp/claude-snap-123'`),
+  'npm test',
+);
+assert.equal(
+  normalizeExecArgv(claude, `eval 'cat README.md'; pwd -P > /tmp/out`),
+  'cat README.md',
+);
+
+const sessionId = 'sess_p2_tool_closure_fixture';
+const callId = 'toolu_bash_001';
+const baseInteraction = {
+  schemaVersion: 'anysentry.agent_interaction.v1',
+  interactionType: 'model',
+  workspacePath: '/workspace',
+  agentAssetId: 'aa_p2',
+  agentProduct: 'Claude Code',
+  agentInstanceId: 'ari_p2',
+  canonicalSessionId: sessionId,
+  sessionId,
+  detectedClassification: 'confirmed_agent',
+  currentEffectiveClassification: 'confirmed_agent',
+  connectionId: 'tls:1',
+  transport: 'tls',
+  protocol: 'http/1.1',
+  endpoint: 'api.anthropic.com',
+  method: 'POST',
+  path: '/v1/messages',
+  statusCode: 200,
+  timeQuality: 'collector_calibrated',
+  request: { body: '', encoding: 'utf8', contentType: 'application/json', capturedBytes: 0, decodedBytes: 0, sha256: digest('') },
+  response: { body: '', encoding: 'utf8', contentType: 'application/json', capturedBytes: 0, decodedBytes: 0, sha256: digest('') },
+  completeness: 'partial',
+  partialReasons: ['tool_result_pending'],
+  captureSource: 'tls',
+  trafficRole: 'conversation',
+};
+
+const callInteraction = {
+  ...baseInteraction,
+  interactionId: `mi_${digest('p2-call').slice(0, 24)}`,
+  at: now,
+  startedAtUnixNs: ns(now),
+  requestCompleteAtUnixNs: ns(now + 1),
+  firstResponseAtUnixNs: ns(now + 2),
+  endedAtUnixNs: ns(now + 3),
+  durationNs: '3000000',
+  receivedAt: now,
+  conversationCompleteness: 'tool_pending',
+  toolCalls: [{ toolCallId: callId, name: 'Bash', arguments: { command: 'npm test' } }],
+  toolResults: [],
+};
+
+const resultInteraction = {
+  ...baseInteraction,
+  interactionId: `mi_${digest('p2-result').slice(0, 24)}`,
+  at: now + 10_000,
+  startedAtUnixNs: ns(now + 10_000),
+  requestCompleteAtUnixNs: ns(now + 10_001),
+  firstResponseAtUnixNs: ns(now + 10_002),
+  endedAtUnixNs: ns(now + 10_003),
+  durationNs: '3000000',
+  receivedAt: now + 10_000,
+  conversationCompleteness: 'complete',
+  completeness: 'complete',
+  partialReasons: [],
+  toolCalls: [],
+  toolResults: [{
+    toolCallId: callId,
+    name: 'Bash',
+    content: { stdout: 'ok' },
+    isError: false,
+    observedAtUnixNs: ns(now + 10_001),
+  }],
+};
+
+const replay = {
+  ...resultInteraction,
+  interactionId: `mi_${digest('p2-replay').slice(0, 24)}`,
+  at: now + 20_000,
+  trafficRole: 'context_replay',
+  receivedAt: now + 20_000,
+};
+
+const closure = closeToolCallsAcrossInteractions([callInteraction, resultInteraction, replay]);
+assert.equal(closure.matches.length, 1);
+assert.equal(closure.matches[0].toolCallId, callId);
+assert.equal(closure.matches[0].callInteractionId, callInteraction.interactionId);
+assert.equal(closure.matches[0].resultInteractionId, resultInteraction.interactionId);
+assert.equal(closure.evidenceLinks.length, 1);
+assert.equal(closure.evidenceLinks[0].method, 'explicit_id');
+assert.equal(closure.evidenceLinks[0].status, 'confirmed');
+assert.equal(closure.evidenceLinks[0].toType, 'semantic_record');
+assert.equal(closure.relationRevisions.length, 1);
+assert.equal(
+  projectedConversationCompleteness(closure, callInteraction.interactionId),
+  'complete',
+);
+
+const orphan = closeToolCallsAcrossInteractions([callInteraction]);
+assert.equal(orphan.matches.length, 0);
+assert.equal(
+  projectedConversationCompleteness(orphan, callInteraction.interactionId),
+  'tool_pending',
+);
+
+// Adapter-normalized argv must let Claude Bash match a shell-snapshot-wrapped ToolExec.
+const semanticEvent = {
+  schemaVersion: 'anysentry.agent_semantic_event.v1',
+  semanticEventId: `se_${digest('p2-se').slice(0, 24)}`,
+  kind: 'tool_call',
+  atUnixNs: ns(now + 2),
+  toolCallId: callId,
+  toolName: 'Bash',
+  toolKind: 'shell',
+  content: JSON.stringify({ command: 'npm test' }),
+};
+const toolExec = {
+  eventId: 'ev_exec_1',
+  kernelFactId: 'kf_exec_1',
+  eventKind: 'ToolExec',
+  at: new Date(now + 3_000).toISOString(),
+  eventAtUnixNs: ns(now + 3_000),
+  agentRuntimeInstanceId: 'ari_p2',
+  agentRuntimeInstanceAliases: [],
+  attributes: {
+    argv: `bash -c 'eval "npm test"; pwd -P >| /tmp/claude-snap-xyz'`,
+    argv_truncated: false,
+    argv_incomplete: false,
+  },
+  subject: 'bash -c eval…',
+  verdict: 'allow',
+  tier: 'L1',
+  severity: 'low',
+  riskScore: 1,
+  riskName: 'fixture',
+  riskCategory: 'command',
+  reason: 'fixture',
+};
+const relations = buildSemanticKernelRelations(
+  semanticEvent,
+  {
+    schemaVersion: 'anysentry.agent_semantic_event.v1',
+    semanticEventId: `se_${digest('p2-result-se').slice(0, 24)}`,
+    kind: 'tool_result',
+    atUnixNs: ns(now + 10_001),
+    toolCallId: callId,
+    toolName: 'Bash',
+  },
+  {
+    ...callInteraction,
+    agentInstanceId: 'ari_p2',
+  },
+  [toolExec],
+  1,
+);
+assert.ok(
+  relations.some((relation) =>
+    relation.kernelEventId === 'ev_exec_1' && relation.linkMethod === 'command'),
+  'normalized Claude argv must link Bash ToolCall to ToolExec',
+);
+
+console.log('verify-agent-tool-closure: ok');
