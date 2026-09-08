@@ -1,8 +1,8 @@
 # AnySentry Codex / Claude Code 全链路明文观测与内核事件关联设计
 
-> 状态：设计稿（Engineering Design，待评审后进入实现）
+> 状态：P0 已落地（Manifest 在 ingest 执行）；P1–P4 待实施
 >
-> 记录日期：2026-09-08（Asia/Shanghai）
+> 记录日期：2026-09-08（Asia/Shanghai）；P0 实现：2026-09-08
 >
 > 负责范围：Codex CLI、Claude Code 两个 Agentic CLI 的明文全链路解析，以及明文链路事件与底层内核事件的关联。LangChain/LangGraph/Dify 的应用服务型解析、Observer 采集性能与写入速度优化由另两位工程师负责，本文只定义与它们的接口边界。
 >
@@ -299,7 +299,7 @@ ABI 变更（Observer common，additive）：`TlsPlaintextEventHeader` 增加 `s
 
 | 阶段 | 内容 | 主要文件 | 完成判据 |
 | --- | --- | --- | --- |
-| P0 Adapter 执行 | `applyAgentAdapter`；Manifest 增字段；Codex/Claude 声明；`trafficRole` 进 AgentInteractionRecord 与 Timeline V3 折叠；`toolNameView` | `agent-interaction.ts`、`canonical-observability.ts`、`agent-semantic-timeline.ts`、`types.ts`、新 `scripts/verify-agent-adapter-execution.mjs` | 3h 窗口重放：Codex backend-api 55 条 → `control/background`；Claude `count_tokens` → `control`；对话目录只剩 `conversation`；旧 verify 全绿 |
+| P0 Adapter 执行 | `applyAgentAdapter`；Manifest 增字段；Codex/Claude 声明；`trafficRole` 进 AgentInteractionRecord 与 Timeline V3 折叠；`toolNameView` | `agent-adapter-execution.ts`、`agent-interaction.ts`、`canonical-observability.ts`、`types.ts`、`scripts/verify-agent-adapter-execution.mjs` | **已完成（2026-09-08）**：ingest 调用 `applyAgentAdapter`；Codex backend-api / Claude `count_tokens` → `control/background` 并折叠进 technical activity；`toolCalls[].canonicalKind`；`node scripts/verify-agent-adapter-execution.mjs` 绿 |
 | P1 连接身份桥接 | §5.2 map/tracepoint/ABI；Collector bind 优先合并；`connection.*` 进 `LlmInteraction`；Ingest 写 `ConnectionIdentity`；`emitted_by` 边；SNI 降级 endpoint；rustls vectored；G9 定位 | Observer common/ebpf/collector；AnySentry `canonical-observability.ts`、correlation | Codex 一次 WS 会话：`ambiguous_stream_binding`=0（或有 `bind_missing` 明确计数）、metadata-only 证据 ≤1/连接、`endpoint` 非 unknown、每条 LlmCall 有 Egress 边；Claude 每条 `/v1/messages` 有 Egress 边；`cargo test/clippy/fmt`、eBPF release build、verifier 通过 |
 | P2 Tool 双向闭合 | ToolResult 跨 Interaction 配对；argv/路径归一化；Codex/Claude 真实工具回合验收；Inspector 小节 | correlation、projection、web | Claude `Bash`/`Edit` 各 ≥1 条 `observed/completed` 唯一 EvidenceLink，`tool_result_pending` 在下一轮后闭合；Codex `shell`/`apply_patch` 同理；ambiguous 场景（并发两条相同命令）保持 ambiguous |
 | P3 HTTP/2 HEADERS | 有界 HPACK；Codex REST provider fixture | `interaction.rs` | `supports_websockets=false` provider 下 Responses REST 能得到 method/path/status 与 complete exchange，或明确 `h2_hpack_desync` gap |

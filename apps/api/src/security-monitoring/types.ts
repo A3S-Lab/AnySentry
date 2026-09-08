@@ -1606,6 +1606,9 @@ export interface AgentConversationAnchor {
 export interface AgentInteractionToolCall {
   toolCallId: string;
   name: string;
+  /** Adapter-declared canonical tool kind; `name` remains the wire raw name. */
+  canonicalKind?: 'shell' | 'file_read' | 'file_write' | 'file_edit' | 'search'
+    | 'browser' | 'mcp' | 'subagent' | 'unknown';
   arguments: unknown;
   issuedAtUnixNs?: string;
 }
@@ -1719,6 +1722,8 @@ export interface AgentInteractionRecord {
   /** Canonical physical RuntimeInstance used for Kernel correlation. */
   runtimeInstanceId?: string;
   agentProduct?: string;
+  /** Matched AgentAdapterManifest id when applyAgentAdapter ran at ingest. */
+  agentAdapterId?: string;
   environment?: 'kubernetes' | 'docker' | 'host' | 'unknown';
   runtimeSessionId?: string;
   rawObservationId?: string;

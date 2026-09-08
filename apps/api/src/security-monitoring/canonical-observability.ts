@@ -548,6 +548,90 @@ export type EvidenceLinkStoreResult =
   | { status: 'duplicate'; link: EvidenceLink }
   | { status: 'conflict' | 'rejected' | 'evicted'; reason: string };
 
+/** Closed traffic-role vocabulary shared with AgentInteractionRecord / ConversationMembership. */
+export type AgentAdapterTrafficRole =
+  | 'conversation'
+  | 'bootstrap'
+  | 'control'
+  | 'context_replay'
+  | 'tool_backend'
+  | 'derived_metadata'
+  | 'retry'
+  | 'background'
+  | 'unclassified';
+
+/** Path/template rule for classifyTraffic. Prefix and exact only — no regex execution. */
+export interface AgentAdapterTrafficRule {
+  role: Exclude<AgentAdapterTrafficRole, 'unclassified'>;
+  match: 'exact' | 'prefix';
+  /** HTTP path (no host). Prefix match is longest-wins among declared rules. */
+  path?: string;
+  /** Observer wire-template id (e.g. openai-responses). Exact match only. */
+  wireTemplateId?: string;
+}
+
+export type AgentAdapterCanonicalToolKind =
+  | 'shell'
+  | 'file_read'
+  | 'file_write'
+  | 'file_edit'
+  | 'search'
+  | 'browser'
+  | 'mcp'
+  | 'subagent'
+  | 'unknown';
+
+/** Declarative raw tool name → canonical kind mapping (extractTool / toolNameView). */
+export interface AgentAdapterToolNameRule {
+  canonicalKind: AgentAdapterCanonicalToolKind;
+  /** Exact raw names (case-sensitive as emitted on the wire). */
+  rawNames?: string[];
+  /** Prefix match (e.g. `mcp__`). Longest prefix wins. */
+  rawNamePrefix?: string;
+}
+
+export type AgentAdapterIdentityEntity =
+  | 'session'
+  | 'thread'
+  | 'turn'
+  | 'parent'
+  | 'continuity'
+  | 'response';
+
+/** Bounded dotted path into request/response structured bodies for IdentityHint extraction. */
+export interface AgentAdapterIdentityPath {
+  entityType: AgentAdapterIdentityEntity;
+  /** e.g. `request.client_metadata.session_id` or `request.metadata.user_id`. */
+  path: string;
+  strength: 'exact' | 'strong' | 'supporting';
+  /** Optional ConversationAnchor kind; defaults from entityType. */
+  anchorKind?:
+    | 'provider_conversation'
+    | 'response_id'
+    | 'previous_response_id'
+    | 'continuity_key'
+    | 'turn_id'
+    | 'tool_call_id'
+    | 'message_item_id';
+}
+
+/** Forward-compatible argv normalizer declaration (executed by correlation in P2). */
+export interface AgentAdapterExecArgvNormalizer {
+  id: string;
+  kind: 'strip_leading_tokens' | 'extract_eval_quoted' | 'strip_trailing_redirect';
+  tokens?: string[];
+}
+
+/** Forward-compatible executable resolution declaration (Observer attach path). */
+export interface AgentAdapterExecutableResolution {
+  /** Follow `#!` shebang up to this many levels (bounded). */
+  shebangDepth?: number;
+  /** Relative vendor layouts under an npm package root. */
+  vendorGlobs?: string[];
+  /** Basename tokens that identify the TLS-bearing ELF. */
+  tlsBinaryBasenames?: string[];
+}
+
 /** Declarative extension contract; product-specific code belongs behind this manifest boundary. */
 export interface AgentAdapterManifest {
   schemaVersion: 'anysentry.agent_manifest.v1';
@@ -558,6 +642,8 @@ export interface AgentAdapterManifest {
     commands?: string[];
     executableHints?: string[];
     parentHints?: string[];
+    /** Alternate product labels (normalized) that should select this manifest. */
+    productAliases?: string[];
   };
   logicalAgent: {
     keySources: string[];
@@ -576,6 +662,16 @@ export interface AgentAdapterManifest {
   };
   turn?: { idPaths: string[] };
   tool?: { namePaths: string[]; idPaths?: string[]; argumentPaths?: string[]; resultPaths?: string[]; statusPaths?: string[] };
+  /** Declarative trafficRole classification consumed by applyAgentAdapter. */
+  trafficRoles?: AgentAdapterTrafficRule[];
+  /** Declarative identity path extraction consumed by applyAgentAdapter. */
+  identityPaths?: AgentAdapterIdentityPath[];
+  /** Declarative tool name view consumed by applyAgentAdapter. */
+  toolNameView?: AgentAdapterToolNameRule[];
+  /** Declared for P2 correlator; not executed in P0. */
+  execArgvNormalizer?: AgentAdapterExecArgvNormalizer[];
+  /** Declared for Observer attach; not executed in P0. */
+  executableResolution?: AgentAdapterExecutableResolution;
   capture?: { tlsImplementationHints?: string[]; transportHints?: string[]; contentPolicy?: 'opt_in' | 'disabled' | 'metadata_only' };
   fixtures?: string[];
   limitations?: string[];
@@ -723,24 +819,122 @@ export const DEFAULT_AGENT_ADAPTER_MANIFESTS: readonly AgentAdapterManifest[] = 
   {
     schemaVersion: 'anysentry.agent_manifest.v1',
     id: 'codex-cli', family: 'cli-agent', versionPolicy: 'manifest-versioned',
-    detection: { commands: ['codex'], executableHints: ['codex'] },
+    detection: {
+      commands: ['codex'],
+      executableHints: ['codex'],
+      productAliases: ['codex', 'codex-cli', 'openai-codex'],
+    },
     logicalAgent: { keySources: ['registered_definition', 'workspace', 'profile'] },
     instance: { boundary: 'root_process_generation' },
-    session: { idPaths: ['request.thread_id', 'request.session_id'], resumeArgs: ['--resume', '--continue'], forkSignals: ['thread/fork'], mode: 'resumable' },
-    turn: { idPaths: ['request.turn_id', 'response.turn_id'] },
-    tool: { namePaths: ['response.output[].name'], idPaths: ['response.output[].call_id'], argumentPaths: ['response.output[].arguments'], resultPaths: ['request.input[].output'] },
+    session: {
+      idPaths: ['request.client_metadata.session_id', 'request.thread_id', 'request.session_id'],
+      resumeArgs: ['--resume', '--continue'],
+      forkSignals: ['thread/fork'],
+      mode: 'resumable',
+    },
+    turn: { idPaths: ['request.client_metadata.turn_id', 'request.turn_id', 'response.turn_id'] },
+    tool: {
+      namePaths: ['response.output[].name'],
+      idPaths: ['response.output[].call_id'],
+      argumentPaths: ['response.output[].arguments'],
+      resultPaths: ['request.input[].output'],
+    },
+    trafficRoles: [
+      { role: 'conversation', match: 'exact', wireTemplateId: 'openai-responses' },
+      { role: 'control', match: 'prefix', path: '/backend-api/ps/' },
+      { role: 'control', match: 'prefix', path: '/backend-api/wham/' },
+      { role: 'control', match: 'prefix', path: '/backend-api/plugins/' },
+      { role: 'background', match: 'prefix', path: '/backend-api/codex/analytics-events/' },
+      { role: 'background', match: 'prefix', path: '/otlp/v1/' },
+      { role: 'background', match: 'exact', path: '/otlp/v1/metrics' },
+    ],
+    identityPaths: [
+      { entityType: 'session', path: 'request.client_metadata.session_id', strength: 'exact', anchorKind: 'provider_conversation' },
+      { entityType: 'thread', path: 'request.client_metadata.thread_id', strength: 'exact', anchorKind: 'provider_conversation' },
+      { entityType: 'turn', path: 'request.client_metadata.turn_id', strength: 'strong', anchorKind: 'turn_id' },
+      { entityType: 'continuity', path: 'request.prompt_cache_key', strength: 'strong', anchorKind: 'continuity_key' },
+      { entityType: 'parent', path: 'request.client_metadata.parent_thread_id', strength: 'strong', anchorKind: 'provider_conversation' },
+    ],
+    toolNameView: [
+      { canonicalKind: 'shell', rawNames: ['shell', 'exec_command', 'local_shell_call', 'write_stdin'] },
+      { canonicalKind: 'file_edit', rawNames: ['apply_patch', 'custom_tool_call'] },
+      { canonicalKind: 'browser', rawNames: ['web_search_call'] },
+      { canonicalKind: 'mcp', rawNamePrefix: 'mcp__' },
+      { canonicalKind: 'unknown', rawNames: ['update_plan'] },
+    ],
+    execArgvNormalizer: [
+      { id: 'strip-bash-lc', kind: 'strip_leading_tokens', tokens: ['bash', '-lc'] },
+      { id: 'strip-bash-c', kind: 'strip_leading_tokens', tokens: ['bash', '-c'] },
+      { id: 'strip-codex-sandbox', kind: 'strip_leading_tokens', tokens: ['codex-linux-sandbox'] },
+    ],
+    executableResolution: {
+      shebangDepth: 5,
+      vendorGlobs: [
+        'node_modules/@openai/codex-linux-*/vendor/*-unknown-linux-musl/bin/codex',
+      ],
+      tlsBinaryBasenames: ['codex'],
+    },
     capture: { tlsImplementationHints: ['implementation-registry'], transportHints: ['http1', 'sse', 'websocket'], contentPolicy: 'opt_in' },
     limitations: ['product fields are hints; KernelFact remains independent'], status: 'current',
   },
   {
     schemaVersion: 'anysentry.agent_manifest.v1',
     id: 'claude-code', family: 'cli-agent', versionPolicy: 'manifest-versioned',
-    detection: { commands: ['claude'], executableHints: ['claude', 'claude-code'] },
+    detection: {
+      commands: ['claude'],
+      executableHints: ['claude', 'claude-code', 'claude.exe'],
+      productAliases: ['claude', 'claude-code', 'claude-code-cli'],
+    },
     logicalAgent: { keySources: ['registered_definition', 'workspace', 'profile'] },
     instance: { boundary: 'root_process_generation' },
-    session: { idPaths: ['request.session_id', 'request.metadata.session_id'], resumeArgs: ['--resume', '--continue'], forkSignals: ['--fork-session'], mode: 'resumable' },
-    turn: { idPaths: ['request.turn_id', 'response.turn_id'] },
-    tool: { namePaths: ['response.content[].name'], idPaths: ['response.content[].id'], argumentPaths: ['response.content[].input'], resultPaths: ['request.content[].tool_use_id'] },
+    session: {
+      idPaths: ['request.metadata.user_id', 'request.session_id', 'request.metadata.session_id'],
+      resumeArgs: ['--resume', '--continue'],
+      forkSignals: ['--fork-session'],
+      mode: 'resumable',
+    },
+    turn: { idPaths: ['request.turn_id', 'response.turn_id', 'response.message.id'] },
+    tool: {
+      namePaths: ['response.content[].name'],
+      idPaths: ['response.content[].id'],
+      argumentPaths: ['response.content[].input'],
+      resultPaths: ['request.content[].tool_use_id'],
+    },
+    trafficRoles: [
+      { role: 'conversation', match: 'exact', wireTemplateId: 'anthropic-messages' },
+      { role: 'control', match: 'exact', path: '/v1/messages/count_tokens' },
+      { role: 'control', match: 'prefix', path: '/v1/messages/count_tokens' },
+      { role: 'background', match: 'prefix', path: '/api/event_logging' },
+      { role: 'background', match: 'prefix', path: '/api/telemetry' },
+      { role: 'background', match: 'prefix', path: '/otlp/v1/' },
+    ],
+    identityPaths: [
+      { entityType: 'session', path: 'request.metadata.user_id', strength: 'exact', anchorKind: 'provider_conversation' },
+      { entityType: 'response', path: 'response.message.id', strength: 'strong', anchorKind: 'response_id' },
+      { entityType: 'turn', path: 'response.id', strength: 'strong', anchorKind: 'response_id' },
+    ],
+    toolNameView: [
+      { canonicalKind: 'shell', rawNames: ['Bash'] },
+      { canonicalKind: 'file_read', rawNames: ['Read'] },
+      { canonicalKind: 'file_write', rawNames: ['Write'] },
+      { canonicalKind: 'file_edit', rawNames: ['Edit'] },
+      { canonicalKind: 'search', rawNames: ['Glob', 'Grep'] },
+      { canonicalKind: 'subagent', rawNames: ['Task'] },
+      { canonicalKind: 'browser', rawNames: ['WebFetch', 'WebSearch'] },
+      { canonicalKind: 'mcp', rawNamePrefix: 'mcp__' },
+    ],
+    execArgvNormalizer: [
+      { id: 'extract-claude-eval', kind: 'extract_eval_quoted' },
+      { id: 'strip-trailing-pwd-redirect', kind: 'strip_trailing_redirect' },
+    ],
+    executableResolution: {
+      shebangDepth: 5,
+      vendorGlobs: [
+        '.local/share/claude/versions/*',
+        'node_modules/@anthropic-ai/claude-code/bin/claude.exe',
+      ],
+      tlsBinaryBasenames: ['claude', 'claude.exe'],
+    },
     capture: { tlsImplementationHints: ['implementation-registry'], transportHints: ['http1', 'sse'], contentPolicy: 'opt_in' },
     limitations: ['binary profile and TLS attach are versioned separately'], status: 'current',
   },
@@ -771,7 +965,7 @@ export const DEFAULT_AGENT_ADAPTER_MANIFESTS: readonly AgentAdapterManifest[] = 
   {
     schemaVersion: 'anysentry.agent_manifest.v1',
     id: 'pi-cli', family: 'cli-agent', versionPolicy: 'future-fixture',
-    detection: { commands: ['pi'], executableHints: ['pi'] },
+    detection: { commands: ['pi'], executableHints: ['pi'], productAliases: ['pi', 'pi-coding-agent'] },
     logicalAgent: { keySources: ['registered_definition', 'workspace', 'profile'] },
     instance: { boundary: 'root_process_generation' },
     session: { idPaths: ['session.id', 'session.file'], resumeArgs: ['--continue'], forkSignals: ['/fork'], mode: 'resumable' },

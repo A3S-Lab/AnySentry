@@ -8,6 +8,7 @@ import {
   resolveLogicalAgentDefinition,
   resolveSessionIdentity,
 } from './canonical-observability';
+import { applyAgentAdapter } from './agent-adapter-execution';
 import { serverTrustedCorrelationContext } from './trusted-correlation';
 import { captureClassificationDecision } from './identity-judgment-routing';
 
@@ -610,7 +611,7 @@ function parsePlaintextEvidence(
     typeof meta.attributes?.sourceId === 'string' ? meta.attributes.sourceId : undefined,
     meta.workspacePath,
   ].filter(Boolean).join('\0');
-  return {
+  return applyAgentAdapter({
     schemaVersion: 'anysentry.agent_interaction.v1',
     interactionId: 'mi_' + evidenceId.slice(3),
     interactionType: 'unparsed',
@@ -687,7 +688,7 @@ function parsePlaintextEvidence(
     partialReasons: [...new Set(['unparsed_plaintext_evidence', ...reasons])],
     captureSource: string(input.captureSource, 120) ?? 'unknown',
     receivedAt: meta.receivedAt ?? Date.now(),
-  };
+  });
 }
 
 export function parseObserverAgentInteraction(
@@ -1027,7 +1028,7 @@ export function parseObserverAgentInteraction(
     ? interactionSessionQuality(sessionResolution.quality)
     : meta.sessionIdentityQuality
       ?? (runtimeOnlySession ? 'ephemeral' : sessionId ? 'inferred' : sessionResolution.quality === 'ephemeral' ? 'ephemeral' : 'unknown');
-  return {
+  const parsed: T.AgentInteractionRecord = {
     schemaVersion: 'anysentry.agent_interaction.v1',
     interactionId,
     interactionType: input.interactionType === 'tool'
@@ -1152,4 +1153,6 @@ export function parseObserverAgentInteraction(
     captureSource: string(input.captureSource, 120) ?? 'unknown',
     receivedAt,
   };
+  // Manifest-driven trafficRole / identity / toolNameView. Product logic stays in declarations.
+  return applyAgentAdapter(parsed);
 }
