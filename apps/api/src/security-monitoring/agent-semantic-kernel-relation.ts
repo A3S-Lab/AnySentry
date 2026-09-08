@@ -3,13 +3,17 @@ import { createHash } from 'node:crypto';
 import type * as T from './types';
 import { createEvidenceLink, type EvidenceLink } from './canonical-observability';
 import { matchAgentAdapterManifest, normalizeExecArgv } from './agent-adapter-execution';
+import { agentRuntimeInstanceIdsEquivalent } from './agent-identity';
 
-export const AGENT_SEMANTIC_KERNEL_RELATION_VERSION = 3;
+export const AGENT_SEMANTIC_KERNEL_RELATION_VERSION = 4;
 const CLOCK_SKEW_MS = 2_000;
 const OPEN_TOOL_WINDOW_MS = 30 * 60_000;
 const SHELL_TOOL_PATTERN = /(?:^|[\s._-])(?:bash|exec|shell)(?:$|[\s._-])/u;
 const FILE_TOOL_PATTERN = /(?:^|[\s._-])(?:read|write|edit|file)(?:$|[\s._-])/u;
 const NETWORK_TOOL_PATTERN = /(?:^|[\s._-])(?:search|http|fetch|network)(?:$|[\s._-])/u;
+/** Remote code-block sandboxes exec a fixed runner; semantic tools carry code/endpoint, not argv. */
+const SANDBOX_TOOL_PATTERN = /sandbox/u;
+const SANDBOX_RUNNER_PATTERN = /(?:^|[\s/])runner\.py(?:\s|$)/u;
 // Only an explicitly network-shaped endpoint may correlate a semantic ToolCall with an
 // Observer Egress/DNS/TLS fact.  Compatibility projections use `application://semantic-event`
 // when a span has no endpoint; treating that placeholder as a host would allow an unrelated
@@ -149,6 +153,20 @@ function toolResource(event: T.AgentSemanticEvent): string | undefined {
   return nestedString(event.content, ['path', 'file', 'filePath', 'resource']);
 }
 
+function toolMarker(event: T.AgentSemanticEvent): string | undefined {
+  if (typeof event.content === 'string') {
+    try {
+      const parsed = JSON.parse(event.content);
+      const nested = nestedString(parsed, ['marker']);
+      if (nested) return nested;
+    } catch {
+      // Fall through.
+    }
+    return quotedField(event.content, 'marker');
+  }
+  return nestedString(event.content, ['marker']);
+}
+
 function toolHost(event: T.AgentSemanticEvent): string | undefined {
   const raw = typeof event.content === 'string'
     ? text(event.content)
@@ -191,8 +209,86 @@ function interactionEndpointHost(interaction: T.AgentInteractionRecord): string 
 function interactionEndpointPort(interaction: T.AgentInteractionRecord): number | undefined {
   const parsed = parsedInteractionEndpoint(interaction);
   if (!parsed) return undefined;
-  const port = Number(parsed.port);
-  return Number.isSafeInteger(port) && port > 0 && port <= 65_535 ? port : undefined;
+  const explicit = Number(parsed.port);
+  if (Number.isSafeInteger(explicit) && explicit > 0 && explicit <= 65_535) return explicit;
+  // Host headers commonly omit :443/:80. TLS plaintext / uprobe captures still need the
+  // transport port so a logical service name (tool-mock) can fall back to a unique same-runtime
+  // Egress fact when DNS/SNI did not preserve the hostname on the Kernel row.
+  const capture = String(interaction.captureSource ?? '').toLowerCase();
+  const transport = String(interaction.transport ?? interaction.protocol ?? '').toLowerCase();
+  if (
+    parsed.protocol === 'https:'
+    || parsed.protocol === 'wss:'
+    || parsed.protocol === 'tls:'
+    || capture.includes('tls')
+    || transport === 'tls'
+    || transport.includes('tls')
+  ) {
+    return 443;
+  }
+  if (parsed.protocol === 'http:' || parsed.protocol === 'ws:') return 80;
+  return undefined;
+}
+
+function kernelEventAtMs(relation: T.AgentSemanticKernelRelation): number {
+  const at = text(relation.kernelEventAt, 128);
+  if (!at) return Number.NaN;
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/u.test(at)
+    ? `${at.replace(' ', 'T')}Z`
+    : at;
+  return Date.parse(normalized);
+}
+
+/** When several same-port ClusterIP Egress facts compete for a Host-only Tool endpoint, keep the
+ * uniquely nearest Kernel event instead of marking every competitor ambiguous. */
+function preferUniqueNearestNetworkEndpoint(
+  callAtMs: number,
+  relations: T.AgentSemanticKernelRelation[],
+): T.AgentSemanticKernelRelation[] {
+  if (relations.length <= 1) return relations;
+  if (!relations.every((relation) => relation.linkMethod === 'network_endpoint')) return relations;
+  if (!Number.isFinite(callAtMs)) return relations;
+  const ranked = relations
+    .map((relation) => {
+      const at = kernelEventAtMs(relation);
+      return {
+        relation,
+        distance: Number.isFinite(at) ? Math.abs(at - callAtMs) : Number.POSITIVE_INFINITY,
+      };
+    })
+    .sort((left, right) => left.distance - right.distance
+      || (left.relation.kernelEventId ?? '').localeCompare(right.relation.kernelEventId ?? ''));
+  const best = ranked[0];
+  const second = ranked[1];
+  if (!best || best.distance === Number.POSITIVE_INFINITY) return relations;
+  if (second && second.distance === best.distance) return relations;
+  return [best.relation];
+}
+
+/** Custom-tool lineage fallbacks can see many same-runtime helper execs (healthchecks). Keep the
+ * uniquely nearest ToolExec to the ToolCall instant when every candidate is process_lineage. */
+function preferUniqueNearestProcessLineage(
+  callAtMs: number,
+  relations: T.AgentSemanticKernelRelation[],
+): T.AgentSemanticKernelRelation[] {
+  if (relations.length <= 1) return relations;
+  if (!relations.every((relation) => relation.linkMethod === 'process_lineage')) return relations;
+  if (!Number.isFinite(callAtMs)) return relations;
+  const ranked = relations
+    .map((relation) => {
+      const at = kernelEventAtMs(relation);
+      return {
+        relation,
+        distance: Number.isFinite(at) ? Math.abs(at - callAtMs) : Number.POSITIVE_INFINITY,
+      };
+    })
+    .sort((left, right) => left.distance - right.distance
+      || (left.relation.kernelEventId ?? '').localeCompare(right.relation.kernelEventId ?? ''));
+  const best = ranked[0];
+  const second = ranked[1];
+  if (!best || best.distance === Number.POSITIVE_INFINITY) return relations;
+  if (second && second.distance === best.distance) return relations;
+  return [best.relation];
 }
 
 function candidatePort(event: T.AgentEventListItem): number | undefined {
@@ -233,11 +329,19 @@ function sameRuntime(
   candidate: T.AgentEventListItem,
 ): boolean {
   if (!interaction.agentInstanceId || !candidate.agentRuntimeInstanceId) return false;
-  if (candidate.agentRuntimeInstanceId === interaction.agentInstanceId) return true;
-  return candidate.agentRuntimeInstanceAliases?.includes(interaction.agentInstanceId) === true;
+  const requested = interaction.agentInstanceId;
+  const candidates = [
+    candidate.agentRuntimeInstanceId,
+    ...(candidate.agentRuntimeInstanceAliases ?? []),
+  ];
+  return candidates.some((value) => agentRuntimeInstanceIdsEquivalent(requested, value));
 }
 
-type RuntimeLink = 'direct_runtime' | 'generation_parent' | 'legacy_pid_parent';
+type RuntimeLink =
+  | 'direct_runtime'
+  | 'generation_parent'
+  | 'legacy_pid_parent'
+  | 'delegated_runtime';
 
 interface CandidateIndex {
   byGeneration: Map<string, T.AgentEventListItem[]>;
@@ -382,6 +486,62 @@ function legacyPidRuntimeMatch(
   return undefined;
 }
 
+function sandboxTool(event: T.AgentSemanticEvent): boolean {
+  const normalized = [event.toolKind, event.toolName]
+    .filter((value): value is string => Boolean(value))
+    .join(' ')
+    .toLowerCase();
+  if (SANDBOX_TOOL_PATTERN.test(normalized)) return true;
+  const endpoint = toolHost(event)
+    ?? (typeof event.content === 'string' ? text(event.content, 512) : nestedString(event.content, ['endpoint', 'url']));
+  return Boolean(endpoint && /sandbox/iu.test(endpoint));
+}
+
+function sandboxRunnerExec(candidate: T.AgentEventListItem): boolean {
+  if (candidate.eventKind !== 'ToolExec') return false;
+  const command = candidateCommand(candidate) ?? '';
+  return SANDBOX_RUNNER_PATTERN.test(command);
+}
+
+/**
+ * Cross-Pod HTTP sandboxes do not share process generation with the calling Agent. Require a
+ * same-runtime network witness for the tool endpoint plus a uniquely nearest runner.py ToolExec
+ * in-window before accepting ownership without direct runtime equivalence.
+ */
+function delegatedSandboxRuntime(
+  input: SemanticKernelRelationInput,
+  candidate: T.AgentEventListItem,
+  allCandidates: readonly T.AgentEventListItem[],
+): boolean {
+  if (!sandboxTool(input.event) || !sandboxRunnerExec(candidate)) return false;
+  const host = toolHost(input.event) ?? interactionEndpointHost(input.interaction);
+  const endpointPort = interactionEndpointPort(input.interaction);
+  const hasNetworkWitness = allCandidates.some((event) => {
+    if (!['Egress', 'Dns', 'Tls'].includes(event.eventKind)) return false;
+    if (!sameRuntime(input.interaction, event)) return false;
+    if (!withinWindow(input.event, input.result, event)) return false;
+    const observed = candidateHost(event);
+    const hostMatches = Boolean(
+      host && observed && (observed === host || observed.endsWith('.' + host) || host.endsWith('.' + observed)),
+    );
+    const portMatches = endpointPort !== undefined
+      && event.eventKind === 'Egress'
+      && candidatePort(event) === endpointPort;
+    return hostMatches || portMatches;
+  });
+  if (!hasNetworkWitness) return false;
+  const callAt = unixNsToMs(input.event.atUnixNs);
+  if (!Number.isFinite(callAt)) return false;
+  const runners = allCandidates
+    .filter((event) => sandboxRunnerExec(event) && withinWindow(input.event, input.result, event))
+    .map((event) => ({ event, distance: Math.abs(candidateEventAtMs(event) - callAt) }))
+    .filter((entry) => Number.isFinite(entry.distance))
+    .sort((left, right) => left.distance - right.distance || left.event.eventId.localeCompare(right.event.eventId));
+  if (runners.length === 0) return false;
+  if (runners.length > 1 && runners[0]!.distance === runners[1]!.distance) return false;
+  return runners[0]!.event.eventId === candidate.eventId;
+}
+
 function runtimeMatch(
   interaction: T.AgentInteractionRecord,
   candidate: T.AgentEventListItem,
@@ -410,6 +570,40 @@ function withinWindow(
   return Number.isFinite(start) && Number.isFinite(at)
     && at >= start - CLOCK_SKEW_MS
     && at <= end + CLOCK_SKEW_MS;
+}
+
+/**
+ * Generic custom / undeclared tools often lack HTTP routes and argv-shaped arguments. Attribute a
+ * ToolExec that is a direct child of the Agent root (or any same-runtime ToolExec when rootPid is
+ * unavailable) inside the ToolCall→ToolResult window. Batch arbitration keeps this as a unique
+ * fallback only — never when a stronger content match exists.
+ */
+function processLineageCandidate(
+  input: SemanticKernelRelationInput,
+  candidate: T.AgentEventListItem,
+): boolean {
+  if (!input.result || candidate.eventKind !== 'ToolExec') return false;
+  const normalizedTool = [input.event.toolKind, input.event.toolName]
+    .filter((value): value is string => Boolean(value))
+    .join(' ')
+    .toLowerCase() || 'other';
+  if (SHELL_TOOL_PATTERN.test(normalizedTool) && toolCommand(input.event)) return false;
+  if (FILE_TOOL_PATTERN.test(normalizedTool) && toolResource(input.event)) return false;
+  if (NETWORK_TOOL_PATTERN.test(normalizedTool)) return false;
+  if (sandboxTool(input.event)) return false;
+  const rootPid = candidate.attribution?.rootPid;
+  const ppid = candidate.process?.ppid;
+  if (Number.isSafeInteger(rootPid) && Number.isSafeInteger(ppid) && ppid !== rootPid) {
+    return false;
+  }
+  const callAt = unixNsToMs(input.event.atUnixNs);
+  const resultAt = unixNsToMs(input.result.atUnixNs);
+  const candidateAt = candidateEventAtMs(candidate);
+  return Number.isFinite(callAt)
+    && Number.isFinite(resultAt)
+    && Number.isFinite(candidateAt)
+    && candidateAt >= callAt - CLOCK_SKEW_MS
+    && candidateAt <= resultAt + CLOCK_SKEW_MS;
 }
 
 function shellBootstrapCandidate(
@@ -472,11 +666,13 @@ function potentialRelation(
   candidate: T.AgentEventListItem,
   index: CandidateIndex,
   resolutionRevision: number,
+  allCandidates: readonly T.AgentEventListItem[] = [],
 ): T.AgentSemanticKernelRelation | undefined {
   const { event, result, interaction } = input;
   const invocationId = toolInvocationId(event, interaction);
   const command = toolCommand(event);
   const resource = toolResource(event);
+  const marker = toolMarker(event);
   const host = toolHost(event) ?? interactionEndpointHost(interaction);
   const endpointPort = interactionEndpointPort(interaction);
   const normalizedTool = [event.toolKind, event.toolName]
@@ -513,12 +709,33 @@ function potentialRelation(
           : 0.85;
     }
   }
+  // Undeclared custom tools often only publish an opaque marker; treat argv/subject containment as
+  // a content match so healthcheck noise cannot win process_lineage uniqueness.
+  if (!linkMethod && marker && candidate.eventKind === 'ToolExec') {
+    const observed = candidateCommand(candidate) ?? '';
+    if (observed.includes(marker)) {
+      linkMethod = 'command';
+      confidence = 0.96;
+    }
+  }
+  if (!linkMethod && sandboxTool(event) && sandboxRunnerExec(candidate)) {
+    // Semantic sandbox tools publish code/endpoint, not the remote runner argv. Bind the fixed
+    // runner.py exec when delegated runtime evidence is available below.
+    linkMethod = 'command';
+    confidence = 0.92;
+  }
   if (!linkMethod && resource && ['FileAccess', 'FileDelete'].includes(candidate.eventKind)) {
-    const expected = resource.replace(/\/+/gu, '/');
-    const observed = candidatePath(candidate)?.replace(/\/+/gu, '/');
-    if (observed && observed === expected) {
-      linkMethod = 'resource';
-      confidence = 1;
+    const expected = resource.replace(/\/+/gu, '/').replace(/\/$/u, '') || resource;
+    const observed = candidatePath(candidate)?.replace(/\/+/gu, '/').replace(/\/$/u, '');
+    if (observed) {
+      if (observed === expected) {
+        linkMethod = 'resource';
+        confidence = 1;
+      } else if (!expected.startsWith('/') && observed.endsWith('/' + expected)) {
+        // Agents often pass workspace-relative paths while Observer records the absolute path.
+        linkMethod = 'resource';
+        confidence = 0.98;
+      }
     }
   }
   if (!linkMethod && host && ['Egress', 'Dns', 'Tls'].includes(candidate.eventKind)) {
@@ -551,12 +768,22 @@ function potentialRelation(
     linkMethod = 'shell_bootstrap';
     confidence = 0.95;
   }
+  if (!linkMethod && processLineageCandidate(input, candidate)) {
+    // Undeclared / custom tools: no HTTP route and no cmd/path/url argument to match. Attribute
+    // the unique same-runtime ToolExec that is a direct Agent-root child in the call→result window.
+    linkMethod = 'process_lineage';
+    confidence = 0.9;
+  }
   if (!linkMethod) return undefined;
 
-  const runtimeLink = runtimeMatch(interaction, candidate, index);
+  let runtimeLink = runtimeMatch(interaction, candidate, index);
+  if (!runtimeLink && delegatedSandboxRuntime(input, candidate, allCandidates)) {
+    runtimeLink = 'delegated_runtime';
+  }
   if (!runtimeLink) return undefined;
   if (runtimeLink === 'generation_parent') confidence = Math.min(confidence, 0.99);
   if (runtimeLink === 'legacy_pid_parent') confidence = Math.min(confidence, 0.75);
+  if (runtimeLink === 'delegated_runtime') confidence = Math.min(confidence, 0.9);
   const canonicalLink = createEvidenceLink({
     fromType: 'tool_call',
     fromId: invocationId,
@@ -570,7 +797,9 @@ function potentialRelation(
         : 'network_effect',
     method: linkMethod === 'network_endpoint'
       ? 'network'
-      : linkMethod === 'shell_bootstrap' ? 'process_generation' : linkMethod,
+      : linkMethod === 'shell_bootstrap' || linkMethod === 'process_lineage'
+        ? 'process_generation'
+        : linkMethod,
     confidence,
     // The Observer attests the underlying event, but this edge is still a server-side content /
     // lineage match. Keep the canonical EvidenceLink authority inferred; the legacy relation's
@@ -686,7 +915,7 @@ function canonicalLinkForRelation(
   const toType: 'kernel_fact' = 'kernel_fact';
   const method = relation.linkMethod === 'network_endpoint'
     ? 'network' as const
-    : relation.linkMethod === 'shell_bootstrap'
+    : relation.linkMethod === 'shell_bootstrap' || relation.linkMethod === 'process_lineage'
       ? 'process_generation' as const
       : relation.linkMethod === 'command' || relation.linkMethod === 'resource'
         ? relation.linkMethod
@@ -721,7 +950,7 @@ export function canonicalEvidenceLinkForRelation(
   const toType: EvidenceLink['toType'] = 'kernel_fact';
   const method: EvidenceLink['method'] = relation.linkMethod === 'network_endpoint'
     ? 'network'
-    : relation.linkMethod === 'shell_bootstrap'
+    : relation.linkMethod === 'shell_bootstrap' || relation.linkMethod === 'process_lineage'
       ? 'process_generation'
       : relation.linkMethod === 'command' || relation.linkMethod === 'resource'
         ? relation.linkMethod : 'none';
@@ -776,12 +1005,12 @@ export function buildSemanticKernelRelationBatch(
     const semanticId = input.event.semanticEventId;
     invocationBySemantic.set(semanticId, toolInvocationId(input.event, input.interaction));
     const potential = candidates
-      .map((candidate) => potentialRelation(input, candidate, index, resolutionRevision))
+      .map((candidate) => potentialRelation(input, candidate, index, resolutionRevision, candidates))
       .filter((relation): relation is T.AgentSemanticKernelRelation => Boolean(relation));
     const contentRelations = potential.filter((relation) =>
-      !['shell_bootstrap', 'network_endpoint'].includes(relation.linkMethod ?? ''));
+      !['shell_bootstrap', 'network_endpoint', 'process_lineage'].includes(relation.linkMethod ?? ''));
     const boundedFallbacks = potential.filter((relation) =>
-      ['shell_bootstrap', 'network_endpoint'].includes(relation.linkMethod ?? ''));
+      ['shell_bootstrap', 'network_endpoint', 'process_lineage'].includes(relation.linkMethod ?? ''));
     const strongestContentConfidence = contentRelations.reduce(
       (highest, relation) => Math.max(highest, relation.confidence),
       0,
@@ -799,7 +1028,10 @@ export function buildSemanticKernelRelationBatch(
       // descendant subcommands; equal-strength candidates are retained and marked ambiguous in
       // the result projection rather than being silently replaced by a no-kernel row.
       ? strongestContent
-      : strongestFallbacks;
+      : preferUniqueNearestProcessLineage(
+        semanticEventAtMs(input.event),
+        preferUniqueNearestNetworkEndpoint(semanticEventAtMs(input.event), strongestFallbacks),
+      );
     potentialBySemantic.set(semanticId, relations);
     for (const relation of relations) {
       if (!relation.kernelEventId) continue;

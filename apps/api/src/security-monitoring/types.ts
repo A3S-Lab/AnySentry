@@ -2575,8 +2575,8 @@ export interface AgentSemanticKernelRelation {
   kernelEventKind?: string;
   kernelEventDecisionRevision?: number;
   status: AgentSemanticKernelRelationStatus;
-  linkMethod?: 'command' | 'resource' | 'network' | 'network_endpoint' | 'shell_bootstrap';
-  lineageMethod?: 'direct_runtime' | 'generation_parent' | 'legacy_pid_parent';
+  linkMethod?: 'command' | 'resource' | 'network' | 'network_endpoint' | 'shell_bootstrap' | 'process_lineage';
+  lineageMethod?: 'direct_runtime' | 'generation_parent' | 'legacy_pid_parent' | 'delegated_runtime';
   competingToolInvocationIds?: string[];
   timeQuality?: 'exact' | 'bounded';
   confidence: number;
@@ -2584,7 +2584,7 @@ export interface AgentSemanticKernelRelation {
    * authenticated adapter evidence, not TLS plaintext, even when they are correlated with an
    * Observer KernelFact. */
   authority: 'attested_tls_plaintext' | 'authenticated_adapter' | 'inferred';
-  relationVersion: 1 | 2 | 3;
+  relationVersion: 1 | 2 | 3 | 4;
   /** All equally strong Kernel candidates retained when ownership is ambiguous. */
   competingKernelEventIds?: string[];
   resolutionRevision: number;

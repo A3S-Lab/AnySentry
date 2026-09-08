@@ -251,6 +251,79 @@ assert.equal(resourceRelations[0].kernelEventId, fileEvent.eventId);
 assert.equal(resourceRelations[0].timeQuality, 'bounded');
 assert.equal(toolEvidenceHotPathTesting.semanticKernelEventCategory(resourceCall), 'file');
 
+const relativeResourceCall = {
+  ...resourceCall,
+  semanticEventId: 'se_semantic_relative_resource',
+  toolCallId: 'call-relative-resource',
+  toolName: 'read',
+  toolKind: 'read',
+  content: { path: 'canary.txt' },
+};
+const absoluteFileEvent = {
+  ...fileEvent,
+  eventId: 'evt_file_relative_abs',
+  subject: 'file /workspace/canary.txt',
+  attributes: { path: '/workspace/canary.txt', accessMode: 'read_only' },
+};
+const relativeResourceRelations = buildSemanticKernelRelations(
+  relativeResourceCall,
+  undefined,
+  interaction,
+  [absoluteFileEvent],
+  13,
+  false,
+);
+assert.equal(relativeResourceRelations[0].status, 'linked_strong');
+assert.equal(relativeResourceRelations[0].linkMethod, 'resource');
+assert.equal(relativeResourceRelations[0].kernelEventId, absoluteFileEvent.eventId);
+assert.equal(relativeResourceRelations[0].confidence, 0.98);
+
+const dockerInteraction = {
+  ...interaction,
+  agentInstanceId: 'docker:pjnl261070032:f62f42c3a830aa82edd9a1684922d941b616cec97cca4260c08d0c31f9567559',
+};
+const dockerBashCall = {
+  ...toolCall,
+  semanticEventId: 'se_docker_bash_call',
+  toolCallId: 'call_bash_fixture',
+  toolName: 'bash',
+  toolKind: 'bash',
+  content: {
+    command: "printf '%s\\n' 'PI_BASH_RESULT_SENTINEL_20260827' | tee -a tool-events.log",
+  },
+};
+const dockerBashResult = {
+  ...dockerBashCall,
+  semanticEventId: 'se_docker_bash_result',
+  kind: 'tool_result',
+  atUnixNs: String(BigInt(callAt + 500) * 1_000_000n),
+  content: 'PI_BASH_RESULT_SENTINEL_20260827\n',
+};
+const dockerBareChildExec = {
+  ...kernelEvent,
+  eventId: 'evt_docker_bare_bash',
+  subject: "/bin/bash -lc printf '%s\\n' 'PI_BASH_RESULT_SENTINEL_20260827' | tee -a tool-events.log",
+  // Child ToolExec sometimes loses the docker:host: qualifier while keeping the container id.
+  agentRuntimeInstanceId: 'f62f42c3a830aa82edd9a1684922d941b616cec97cca4260c08d0c31f9567559',
+  agentRuntimeInstanceAliases: [],
+  attributes: {
+    argv: "/bin/bash -lc printf '%s\\n' 'PI_BASH_RESULT_SENTINEL_20260827' | tee -a tool-events.log",
+  },
+};
+const dockerBashRelations = buildSemanticKernelRelations(
+  dockerBashCall,
+  dockerBashResult,
+  dockerInteraction,
+  [dockerBareChildExec],
+  13,
+  false,
+);
+assert.equal(dockerBashRelations[0].status, 'linked_exact');
+assert.equal(dockerBashRelations[0].linkMethod, 'command');
+assert.equal(dockerBashRelations[0].kernelEventId, dockerBareChildExec.eventId);
+assert.equal(dockerBashRelations[0].lineageMethod, 'direct_runtime');
+assert.equal(dockerBashRelations[0].confidence, 1);
+
 const httpToolInteraction = {
   ...interaction,
   interactionType: 'tool',
@@ -302,6 +375,69 @@ assert.equal(dnsRelations[0].status, 'linked_strong',
   'a DNS query name is a valid normalized network candidate for an endpoint ToolCall');
 assert.equal(dnsRelations[0].kernelEventId, dnsCandidate.eventId);
 
+const sandboxCodeInteraction = {
+  ...interaction,
+  agentInstanceId: '3ad2de90-274a-4065-8219-675fbd3d81d9/3e6d88bdfd7e0e36f73bea1b4a1f11adf4dfbbc0e8af25598fa739cc9bf5e013',
+  interactionType: 'tool',
+  endpoint: 'http://python-sandbox:8080/execute',
+};
+const sandboxCodeCall = {
+  ...toolCall,
+  semanticEventId: 'se_sandbox_code_call',
+  toolCallId: 'sandbox-langgraph-1',
+  toolName: 'python_code_block_sandbox',
+  toolKind: 'code',
+  content: { code: 'print(42)', endpoint: 'http://python-sandbox:8080/execute' },
+};
+const sandboxCodeResult = {
+  ...sandboxCodeCall,
+  semanticEventId: 'se_sandbox_code_result',
+  kind: 'tool_result',
+  atUnixNs: String(BigInt(callAt + 400) * 1_000_000n),
+  content: { exit_code: 0, stdout: '42\n' },
+};
+const sandboxCodeEgress = {
+  ...kernelEvent,
+  eventId: 'evt_sandbox_code_egress',
+  eventKind: 'Egress',
+  subject: 'egress → 10.43.62.211:8080',
+  agentRuntimeInstanceId: sandboxCodeInteraction.agentInstanceId,
+  agentRuntimeInstanceAliases: [sandboxCodeInteraction.agentInstanceId],
+  attributes: { peer: '10.43.62.211', port: 8080 },
+  at: new Date(callAt + 50).toISOString().replace('T', ' ').replace(/\.\d+Z$/, ''),
+};
+const sandboxRunnerExecEvent = {
+  ...kernelEvent,
+  eventId: 'evt_sandbox_runner_exec',
+  eventKind: 'ToolExec',
+  subject: '/usr/local/bin/python -I -S /app/sandbox/runner.py',
+  agentRuntimeInstanceId: 'c3f4c93e-7991-4bc7-93e5-216d7fe0b396/4a60aad1e2f7dd87c8b74f87162b7b233ad93ba1a4fad563acf5c4272155b6ef',
+  agentRuntimeInstanceAliases: [],
+  attributes: { argv: '/usr/local/bin/python -I -S /app/sandbox/runner.py' },
+  at: new Date(callAt + 80).toISOString().replace('T', ' ').replace(/\.\d+Z$/, ''),
+  attribution: {
+    ...(kernelEvent.attribution || {}),
+    processGenerationKey: 'pgk_sandbox_runner_child',
+    parentProcessGenerationKey: 'pgk_sandbox_runner_parent',
+    parentLinkAuthority: 'forwarder_process_graph',
+    agentScopeId: 'langgraph-python-sandbox',
+  },
+};
+const sandboxDelegatedRelations = buildSemanticKernelRelations(
+  sandboxCodeCall,
+  sandboxCodeResult,
+  sandboxCodeInteraction,
+  [sandboxCodeEgress, sandboxRunnerExecEvent],
+  17,
+  false,
+);
+assert.equal(sandboxDelegatedRelations[0].status, 'linked_strong',
+  'sandbox ToolExec ownership should win via delegated runtime when a network witness exists');
+assert.equal(sandboxDelegatedRelations[0].linkMethod, 'command');
+assert.equal(sandboxDelegatedRelations[0].lineageMethod, 'delegated_runtime');
+assert.equal(sandboxDelegatedRelations[0].kernelEventId, sandboxRunnerExecEvent.eventId);
+assert.equal(sandboxDelegatedRelations[0].kernelEventKind, 'ToolExec');
+
 const resolvedServiceEgress = {
   ...sandboxEgress,
   eventId: 'evt_sandbox_cluster_ip_egress',
@@ -319,6 +455,62 @@ const resolvedServiceRelations = buildSemanticKernelRelations(
 assert.equal(resolvedServiceRelations[0].status, 'linked_strong');
 assert.equal(resolvedServiceRelations[0].linkMethod, 'network_endpoint');
 assert.equal(resolvedServiceRelations[0].kernelEventId, resolvedServiceEgress.eventId);
+
+// Dify-style Host-only TLS tool endpoints omit :443. A sibling LLM Egress on the same port must
+// not steal the Tool→Kernel edge when the Tool call is uniquely nearer the tool mock peer.
+const hostOnlyTlsToolInteraction = {
+  ...interaction,
+  interactionType: 'tool',
+  endpoint: 'tool-mock/',
+  captureSource: 'tls_uprobe',
+  transport: 'tls',
+};
+const hostOnlyTlsToolCall = {
+  ...toolCall,
+  semanticEventId: 'se_dify_http_tool_call',
+  toolCallId: 'tool_dify_http_1',
+  toolName: 'http.request',
+  toolKind: 'other',
+  content: { instruction: 'ping', requested_by: 'dify-observation-lab' },
+  atUnixNs: String(BigInt(callAt + 1_000) * 1_000_000n),
+};
+const hostOnlyTlsToolResult = {
+  ...hostOnlyTlsToolCall,
+  semanticEventId: 'se_dify_http_tool_result',
+  kind: 'tool_result',
+  atUnixNs: String(BigInt(callAt + 1_200) * 1_000_000n),
+};
+const llmMockEgress = {
+  ...kernelEvent,
+  eventId: 'evt_llm_mock_egress',
+  eventKind: 'Egress',
+  at: new Date(callAt + 100).toISOString(),
+  subject: 'egress → 172.27.0.12:443',
+  attributes: { peer: '172.27.0.12', port: 443, sni: 'llm-mock' },
+  kernelFactId: 'kf_llm_mock',
+};
+const toolMockEgress = {
+  ...kernelEvent,
+  eventId: 'evt_tool_mock_egress',
+  eventKind: 'Egress',
+  at: new Date(callAt + 1_050).toISOString(),
+  subject: 'egress → 172.27.0.13:443',
+  attributes: { peer: '172.27.0.13', port: 443 },
+  kernelFactId: 'kf_tool_mock',
+};
+const hostOnlyTlsRelations = buildSemanticKernelRelations(
+  hostOnlyTlsToolCall,
+  hostOnlyTlsToolResult,
+  hostOnlyTlsToolInteraction,
+  [llmMockEgress, toolMockEgress],
+  13,
+  false,
+);
+assert.equal(hostOnlyTlsRelations[0].status, 'linked_strong',
+  'Host-only TLS tool endpoints must still link to the nearest same-port Egress');
+assert.equal(hostOnlyTlsRelations[0].linkMethod, 'network_endpoint');
+assert.equal(hostOnlyTlsRelations[0].kernelEventId, toolMockEgress.eventId);
+assert.equal(hostOnlyTlsRelations[0].kernelFactId, toolMockEgress.kernelFactId);
 
 // Authenticated OTLP semantic Tool spans stay in the legacy model interaction lane for timeline
 // compatibility, but their explicit semanticOnly ToolCall must still provide a network endpoint
@@ -450,6 +642,122 @@ assert.equal(shellBootstrapRelations[0].linkMethod, 'shell_bootstrap');
 assert.equal(shellBootstrapRelations[0].lineageMethod, 'direct_runtime');
 assert.equal(shellBootstrapRelations[0].confidence, 0.95);
 assert.equal(shellBootstrapRelations[0].kernelEventId, shellBootstrapEvent.eventId);
+
+const customLocalToolCall = {
+  ...toolCall,
+  semanticEventId: 'se_custom_local_probe',
+  toolCallId: 'call-inventory-fingerprint',
+  toolName: 'inventory_fingerprint',
+  toolKind: 'custom',
+  // Intentionally no cmd/command/path/url/marker — pure undeclared custom tool shape.
+  content: { task: 'undeclared-custom-fingerprint' },
+};
+const customLocalToolResult = {
+  ...customLocalToolCall,
+  semanticEventId: 'se_custom_local_probe_result',
+  kind: 'tool_result',
+  atUnixNs: String(BigInt(callAt + 500) * 1_000_000n),
+  content: { ok: true, task: 'undeclared-custom-fingerprint', stdout: 'lab-local-probe-v1\n' },
+};
+const customLocalExec = {
+  ...kernelEvent,
+  eventId: 'evt_custom_local_echo',
+  at: new Date(callAt + 120).toISOString(),
+  subject: '/bin/echo lab-local-probe-v1',
+  process: {
+    pid: 220,
+    ppid: 100,
+    comm: 'echo',
+    hostId: 'host-semantic',
+    bootId: 'boot-semantic',
+  },
+  attribution: { rootPid: 100 },
+  attributes: {
+    argv: '/bin/echo lab-local-probe-v1',
+    argv_truncated: false,
+    argv_incomplete: false,
+  },
+};
+const processLineageRelations = buildSemanticKernelRelations(
+  customLocalToolCall,
+  customLocalToolResult,
+  interaction,
+  [customLocalExec],
+  14,
+  false,
+);
+assert.equal(processLineageRelations[0].status, 'linked_strong',
+  'undeclared custom tools must link the unique Agent-root child ToolExec by process lineage');
+assert.equal(processLineageRelations[0].linkMethod, 'process_lineage');
+assert.equal(processLineageRelations[0].lineageMethod, 'direct_runtime');
+assert.equal(processLineageRelations[0].kernelEventId, customLocalExec.eventId);
+assert.equal(
+  canonicalEvidenceLinksForRelations(processLineageRelations)[0].method,
+  'process_generation',
+);
+
+const markerToolCall = {
+  ...customLocalToolCall,
+  semanticEventId: 'se_custom_local_marker',
+  toolCallId: 'call-inventory-fingerprint-marker',
+  content: { marker: 'lab-local-probe-v1' },
+};
+const markerToolResult = {
+  ...markerToolCall,
+  semanticEventId: 'se_custom_local_marker_result',
+  kind: 'tool_result',
+  atUnixNs: String(BigInt(callAt + 500) * 1_000_000n),
+  content: { ok: true, marker: 'lab-local-probe-v1', stdout: 'lab-local-probe-v1\n' },
+};
+const markerBoosted = buildSemanticKernelRelations(
+  markerToolCall,
+  markerToolResult,
+  interaction,
+  [
+    {
+      ...customLocalExec,
+      eventId: 'evt_healthcheck_noise',
+      subject: "python -c import urllib.request; urllib.request.urlopen('http://127.0.0.1:18091/healthz')",
+      attributes: {
+        argv: "python -c import urllib.request; urllib.request.urlopen('http://127.0.0.1:18091/healthz')",
+        argv_truncated: false,
+        argv_incomplete: false,
+      },
+    },
+    customLocalExec,
+  ],
+  14,
+  false,
+);
+assert.equal(markerBoosted.length, 1);
+assert.equal(markerBoosted[0].linkMethod, 'command',
+  'opaque marker containment must outrank unrelated same-runtime helper execs');
+assert.equal(markerBoosted[0].kernelEventId, customLocalExec.eventId);
+
+const ambiguousProcessLineage = buildSemanticKernelRelations(
+  customLocalToolCall,
+  customLocalToolResult,
+  interaction,
+  [
+    customLocalExec,
+    { ...customLocalExec, eventId: 'evt_second_custom_local_echo', process: { ...customLocalExec.process, pid: 221 } },
+  ],
+  14,
+  false,
+);
+assert.equal(ambiguousProcessLineage.length, 2);
+assert(ambiguousProcessLineage.every((relation) => relation.status === 'ambiguous'));
+
+const wrongRuntimeProcessLineage = buildSemanticKernelRelations(
+  customLocalToolCall,
+  customLocalToolResult,
+  interaction,
+  [{ ...customLocalExec, eventId: 'evt_wrong_runtime_echo', agentRuntimeInstanceId: 'host-root:other:9:9' }],
+  14,
+  false,
+);
+assert.equal(wrongRuntimeProcessLineage[0].status, 'semantic_only',
+  'process_lineage must still require same Agent runtime');
 
 const ambiguousShellBootstrap = buildSemanticKernelRelations(
   toolCall,
