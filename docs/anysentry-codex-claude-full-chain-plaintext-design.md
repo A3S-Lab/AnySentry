@@ -1,8 +1,8 @@
 # AnySentry Codex / Claude Code 全链路明文观测与内核事件关联设计
 
-> 状态：P0–P2 已落地；P4 Kimi Manifest 扩展性回归已落地；P3 HTTP/2 HEADERS 进行中
+> 状态：P0–P4 已落地（Adapter Manifest、ConnectionIdentity、Tool 闭合/归一化、H2 HEADERS、Kimi Manifest）
 >
-> 记录日期：2026-09-08（Asia/Shanghai）；P0–P2：2026-09-08
+> 记录日期：2026-09-08（Asia/Shanghai）；P0–P4：2026-09-08
 >
 > 负责范围：Codex CLI、Claude Code 两个 Agentic CLI 的明文全链路解析，以及明文链路事件与底层内核事件的关联。LangChain/LangGraph/Dify 的应用服务型解析、Observer 采集性能与写入速度优化由另两位工程师负责，本文只定义与它们的接口边界。
 >
