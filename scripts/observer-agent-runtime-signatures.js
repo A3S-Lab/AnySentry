@@ -119,6 +119,10 @@ const BUILTIN_RUNTIMES = [
       { argvPrefix: ['python -m uvicorn agent.langchain_langgraph_service:app'] },
       { argvPrefix: ['python3 -m uvicorn agent.langchain_langgraph_service:app'] },
       { argvPrefix: ['/opt/venv/bin/python -m uvicorn agent.langchain_langgraph_service:app'] },
+      { argvPrefix: ['python -m uvicorn app.langgraph_orchestrator_service:app'] },
+      { argvPrefix: ['python3 -m uvicorn app.langgraph_orchestrator_service:app'] },
+      { argvPrefix: ['python -m uvicorn app.langgraph_worker_service:app'] },
+      { argvPrefix: ['python3 -m uvicorn app.langgraph_worker_service:app'] },
     ],
   },
   {
