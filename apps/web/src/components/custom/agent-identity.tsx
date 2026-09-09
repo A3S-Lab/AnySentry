@@ -307,7 +307,7 @@ export function AgentAssetIdentityInline({
         <span className={cn("size-1.5 shrink-0 rounded-full", classification.dotClassName)} />
         <span className={cn("min-w-0 truncate font-semibold", classification.nameClassName)}>
           {name}
-          <span className="ml-1 font-mono text-[10px] font-normal text-zinc-500">· {observedAt}</span>
+          <span className="ml-1 hidden font-mono text-[10px] font-normal text-zinc-500 sm:inline">· {observedAt}</span>
         </span>
         <span className={cn("shrink-0 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold", lifecycle.className)}>
           {lifecycle.label}

@@ -93,7 +93,10 @@ if [[ -n "$plugin_container" ]]; then
   for pid in "${plugin_pids[@]}"; do
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     [[ -r "/proc/$pid/maps" ]] || continue
-    mapped_ssl="$(awk '/\/libssl[^/]*\.so|\/_ssl[^/]*\.so/ {print $NF}' "/proc/$pid/maps" | sort -u)"
+    # hidepid or a container PID namespace can make a peer map unreadable.  Keep
+    # the diagnostic best-effort so one permission-denied process cannot suppress
+    # the fixture hash ledger printed below.
+    mapped_ssl="$(awk '/\/libssl[^/]*\.so|\/_ssl[^/]*\.so/ {print $NF}' "/proc/$pid/maps" 2>/dev/null | sort -u || true)"
     if [[ -n "$mapped_ssl" ]]; then
       found=1
       comm="$(tr -d '\r\n' <"/proc/$pid/comm")"
@@ -116,8 +119,8 @@ for pair in \
   "tool:${DIFY_LAB_TOOL_HTTPS_PORT:-18445}"; do
   role="${pair%%:*}"
   port="${pair##*:}"
-  if response="$(curl --fail --silent --show-error --http1.1 \
-    --cacert "$DIFY_LAB_RUNTIME/tls/ca.crt" \
+  if response="$(curl --noproxy '*' --fail --silent --show-error --http1.1 \
+    --cacert "$DIFY_LAB_TLS_DIR/ca.crt" \
     "https://localhost:$port/debug/records" 2>/dev/null)"; then
     jq -c --arg role "$role" \
       '{role: $role, records: [.data[]? | {path, http_version, stream, status, request_bytes, request_sha256, response_bytes, response_sha256}]}' \

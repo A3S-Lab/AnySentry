@@ -7,6 +7,7 @@ import {
   type IdentityAiReviewRequest,
   securityCenterApi,
 } from "@/lib/api/security-center";
+import { hasAdminToken } from "@/lib/api/client";
 import { cn } from "@/lib/utils";
 
 function errorText(error: unknown) {
@@ -24,14 +25,37 @@ export function IdentityAiReview({
 }: IdentityAiReviewRequest & { compact?: boolean }) {
   const [result, setResult] = useState<IdentityAiReviewRecord>();
   const [error, setError] = useState("");
+  const [adminTokenReady, setAdminTokenReady] = useState(() => hasAdminToken());
   const queryKey = `${targetType}:${eventId ?? ""}:${agentAssetId ?? ""}`;
+  const { data: platformHealth } = useRequest(() => securityCenterApi.healthz(), {
+    pollingInterval: 30_000,
+    pollingWhenHidden: false,
+  });
+  useEffect(() => {
+    const sync = () => setAdminTokenReady(hasAdminToken());
+    sync();
+    window.addEventListener("storage", sync);
+    window.addEventListener("anysentry-admin-token-change", sync);
+    return () => {
+      window.removeEventListener("storage", sync);
+      window.removeEventListener("anysentry-admin-token-change", sync);
+    };
+  }, []);
+  // The review endpoints are explicitly management protected.  Avoid an expected 401 request
+  // when the browser has no token, while retaining compatibility with older API images that do
+  // not expose managementAuth in healthz (those images are treated as unauthenticated here).
+  const protectedReviewReady = platformHealth === undefined
+    ? false
+    : platformHealth.managementAuth?.enabled === true
+      ? adminTokenReady
+      : true;
   const { runAsync, loading } = useRequest(
     () => securityCenterApi.runIdentityAiReview({ targetType, eventId, agentAssetId, timeType, startTime, endTime }),
     { manual: true },
   );
   const { data: history } = useRequest(
     () => securityCenterApi.identityAiReviews({ targetType, eventId, agentAssetId }),
-    { refreshDeps: [queryKey], ready: Boolean(eventId || agentAssetId) },
+    { refreshDeps: [queryKey, protectedReviewReady], ready: Boolean(eventId || agentAssetId) && protectedReviewReady },
   );
 
   useEffect(() => {
@@ -65,7 +89,8 @@ export function IdentityAiReview({
         <Button
           type="button"
           size="sm"
-          disabled={loading || !agentAssetId}
+          disabled={loading || !agentAssetId || !protectedReviewReady}
+          title={!protectedReviewReady ? "请先设置管理密钥" : undefined}
           onClick={run}
           className="h-8 shrink-0 bg-sky-400 text-slate-950 hover:bg-sky-300"
         >
@@ -73,6 +98,10 @@ export function IdentityAiReview({
           {loading ? "正在单次研判..." : result ? "重新辅助审核" : "开始辅助审核"}
         </Button>
       </div>
+
+      {!protectedReviewReady && platformHealth?.managementAuth?.enabled ? (
+        <p className="mt-2 text-xs text-amber-200/85">服务端已启用管理鉴权，请先在页面右上角设置管理密钥后查看历史或运行审核。</p>
+      ) : null}
 
       {result?.status === "succeeded" ? (
         <div className="mt-3 rounded-md border border-white/10 bg-black/15 p-3">

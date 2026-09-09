@@ -21,6 +21,17 @@ const adminToken = (process.env.ANYSENTRY_ADMIN_TOKEN
 if (!adminToken) throw new Error('ANYSENTRY_ADMIN_TOKEN or ANYSENTRY_MANAGEMENT_TOKEN is required');
 
 const runId = `canonical-replay-${Date.now()}-${process.pid}`;
+// Keep every read in the same short custom window as the synthetic batch.  A broad historical
+// window (for example last_30d) forces the compatibility conversation projector to compete with
+// unrelated production history and can turn an otherwise bounded replay into a storage timeout.
+// The API still reports partial coverage when the durable store is unavailable; this test is about
+// the authenticated replay seam and must not manufacture a pass by widening the query.
+const replayWindowStartMs = Date.now() - 60_000;
+const replayWindow = () => ({
+  timeType: 'custom',
+  startTime: new Date(replayWindowStartMs).toISOString(),
+  endTime: new Date(Date.now() + 60_000).toISOString(),
+});
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 const ns = (millis) => String(BigInt(millis) * 1_000_000n);
 
@@ -316,7 +327,7 @@ assert(kernel.items?.length >= definitions.length, 'KernelFacts were not retaine
 assert(raw.items.every((item) => item.payload?.body === undefined), 'canonical raw lane leaked a body');
 assert(gaps.items?.every((gap) => gap.schemaVersion === 'anysentry.coverage_gap.v1'), 'invalid coverage gap projection');
 
-const interactions = await request('/agents/interactions', 'POST', { timeType: 'last_30d', scope: 'raw', limit: 200 });
+const interactions = await request('/agents/interactions', 'POST', { ...replayWindow(), scope: 'raw', limit: 200 });
 const byProduct = new Map();
 for (const item of interactions.items ?? []) {
   const key = item.agentProduct?.toLowerCase();
@@ -357,7 +368,7 @@ for (const definition of definitions) {
     `${definition.id} canonical logical semantic record missing`);
 }
 
-const conversations = await request('/agents/conversations', 'POST', { timeType: 'last_30d', scope: 'agent', limit: 500 });
+const conversations = await request('/agents/conversations', 'POST', { ...replayWindow(), scope: 'agent', limit: 200 });
 const evidenceLinkIds = new Set();
 for (const definition of definitions) {
   const summaries = (conversations.items ?? []).filter((item) => item.logicalAgentId === definition.logical);
@@ -367,7 +378,7 @@ for (const definition of definitions) {
   let toolEvent;
   for (const candidate of summaries) {
     const candidateTimeline = await request('/agents/conversations/timeline-v3', 'POST', {
-      timeType: 'last_30d', scope: 'agent', conversationId: candidate.conversationId,
+      ...replayWindow(), scope: 'agent', conversationId: candidate.conversationId,
     });
     const candidateToolEvent = (candidateTimeline.turns ?? []).flatMap((turn) => turn.events ?? [])
       .find((event) => event.kind === 'tool_call');
@@ -380,7 +391,7 @@ for (const definition of definitions) {
   }
   assert(toolEvent, `${definition.id} timeline ToolCall missing`);
   const evidence = await request('/agents/semantic-events/evidence', 'POST', {
-    timeType: 'last_30d', scope: 'agent', conversationId: summary.conversationId,
+    ...replayWindow(), scope: 'agent', conversationId: summary.conversationId,
     semanticEventId: toolEvent.semanticEventId,
   });
   assert(evidence.relations?.length > 0, `${definition.id} semantic evidence relation missing`);

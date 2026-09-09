@@ -16,6 +16,7 @@ function canonicalProduct(value?: string): string {
   if (/(?:^|[^a-z])codex(?:[^a-z]|$)/u.test(product)) return 'Codex';
   if (product.includes('claude')) return 'Claude Code';
   if (product.includes('kimi')) return 'Kimi Code';
+  if (product.includes('langgraph')) return 'LangGraph';
   if (product.includes('langchain')) return 'LangChain';
   if (product.includes('dify')) return 'Dify';
   if (/(?:^|[^a-z])pi(?:[^a-z]|$)/u.test(product)) return 'Pi';

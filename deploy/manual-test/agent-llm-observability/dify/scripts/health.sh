@@ -16,7 +16,7 @@ check_json_url() {
   local name="$1"
   local url="$2"
   shift 2
-  if response="$(curl --fail --silent --show-error --max-time 5 "$@" "$url")"; then
+  if response="$(curl --noproxy '*' --fail --silent --show-error --max-time 5 "$@" "$url")"; then
     printf '%-18s ready  %s\n' "$name" "$(jq -c . <<<"$response")"
   else
     printf '%-18s not-ready\n' "$name" >&2
@@ -33,11 +33,11 @@ check_json_url \
 check_json_url \
   "LLM mock HTTPS" \
   "https://localhost:${DIFY_LAB_LLM_HTTPS_PORT:-18444}/health" \
-  --cacert "$DIFY_LAB_RUNTIME/tls/ca.crt" --http1.1
+  --cacert "$DIFY_LAB_TLS_DIR/ca.crt" --http1.1
 check_json_url \
   "Tool mock HTTPS" \
   "https://localhost:${DIFY_LAB_TOOL_HTTPS_PORT:-18445}/health" \
-  --cacert "$DIFY_LAB_RUNTIME/tls/ca.crt" --http1.1
+  --cacert "$DIFY_LAB_TLS_DIR/ca.crt" --http1.1
 
 printf '\nCompose services:\n'
 dify_compose ps --format 'table {{.Service}}\t{{.State}}\t{{.Health}}' || failed=1

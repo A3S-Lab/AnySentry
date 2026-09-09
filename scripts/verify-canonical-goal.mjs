@@ -985,6 +985,7 @@ async function runLocalTests() {
     { id: 'deployment-manifests', cwd: repoRoot, command: 'node', args: ['scripts/verify-deployment-manifests.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'canonical-goal-options', cwd: repoRoot, command: 'node', args: ['scripts/verify-canonical-goal-options.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'canonical-contract', cwd: repoRoot, command: 'node', args: ['scripts/verify-canonical-contract.mjs'], timeout: TEST_TIMEOUT_MS },
+    { id: 'canonical-lifecycle-api-contract', cwd: repoRoot, command: 'node', args: ['--check', 'scripts/verify-canonical-lifecycle-api.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'canonical-observability', cwd: repoRoot, command: 'node', args: ['scripts/verify-canonical-observability.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'conversation-resolution', cwd: repoRoot, command: 'node', args: ['scripts/verify-agent-conversation-resolution-v2.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'conversation-directory', cwd: repoRoot, command: 'node', args: ['scripts/verify-agent-conversation-directory.mjs'], timeout: TEST_TIMEOUT_MS },

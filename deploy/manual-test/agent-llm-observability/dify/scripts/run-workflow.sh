@@ -26,8 +26,8 @@ chmod 0700 "$results_dir"
 
 reset_fixture() {
   local port="$1"
-  curl --fail --silent --show-error --http1.1 \
-    --cacert "$DIFY_LAB_RUNTIME/tls/ca.crt" \
+  curl --noproxy '*' --fail --silent --show-error --http1.1 \
+    --cacert "$DIFY_LAB_TLS_DIR/ca.crt" \
     --header "@$DIFY_LAB_RUNTIME/secrets/mock-authorization-header" \
     --request POST \
     "https://localhost:$port/debug/reset" >/dev/null 2>&1 || true
@@ -70,7 +70,7 @@ fi
 printf '%s\n' "$sentinel" >"$results_dir/$workflow-last-internal-rag-sentinel"
 chmod 0600 "$results_dir/$workflow-last-internal-rag-sentinel"
 
-http_code="$(curl \
+http_code="$(curl --noproxy '*' \
   --silent \
   --show-error \
   --no-buffer \
@@ -94,8 +94,8 @@ show_records() {
   local role="$1"
   local port="$2"
   local records_file="$results_dir/$workflow-last-$role-records.json"
-  if curl --fail --silent --show-error --http1.1 \
-    --cacert "$DIFY_LAB_RUNTIME/tls/ca.crt" \
+  if curl --noproxy '*' --fail --silent --show-error --http1.1 \
+    --cacert "$DIFY_LAB_TLS_DIR/ca.crt" \
     --output "$records_file" "https://localhost:$port/debug/records"; then
     printf 'Latest %s fixture reconciliation record:\n' "$role"
     jq -c '.data[-1] // {}' "$records_file"

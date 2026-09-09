@@ -115,8 +115,8 @@ docker run --detach --rm \
   --env MOCK_TLS_CERT_FILE=/run/tls/server.crt \
   --env MOCK_TLS_KEY_FILE=/run/tls/server.key \
   --env MOCK_API_KEY_FILE=/run/secrets/mock-api-key \
-  --mount "type=bind,src=$DIFY_LAB_RUNTIME/tls/server.crt,dst=/run/tls/server.crt,readonly" \
-  --mount "type=bind,src=$DIFY_LAB_RUNTIME/tls/server.key,dst=/run/tls/server.key,readonly" \
+  --mount "type=bind,src=$DIFY_LAB_TLS_DIR/server.crt,dst=/run/tls/server.crt,readonly" \
+  --mount "type=bind,src=$DIFY_LAB_TLS_DIR/server.key,dst=/run/tls/server.key,readonly" \
   --mount "type=bind,src=$DIFY_LAB_RUNTIME/secrets/mock-api-key,dst=/run/secrets/mock-api-key,readonly" \
   "$validation_image" >/dev/null
 
@@ -125,17 +125,17 @@ https_port="$(docker port "$validation_container" 443/tcp | awk -F: 'NR == 1 {pr
 [[ -n "$http_port" && -n "$https_port" ]] || die "failed to resolve validation container ports"
 
 for _attempt in $(seq 1 40); do
-  if curl --fail --silent --max-time 2 "http://127.0.0.1:$http_port/health" >/dev/null 2>&1; then
+  if curl --noproxy '*' --fail --silent --max-time 2 "http://127.0.0.1:$http_port/health" >/dev/null 2>&1; then
     break
   fi
   sleep 0.25
 done
-curl --fail --silent --show-error "http://127.0.0.1:$http_port/health" >/dev/null
-curl --fail --silent --show-error --http1.1 \
-  --cacert "$DIFY_LAB_RUNTIME/tls/ca.crt" \
+curl --noproxy '*' --fail --silent --show-error "http://127.0.0.1:$http_port/health" >/dev/null
+curl --noproxy '*' --fail --silent --show-error --http1.1 \
+  --cacert "$DIFY_LAB_TLS_DIR/ca.crt" \
   "https://localhost:$https_port/health" >/dev/null
 
-unauthorized_code="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+unauthorized_code="$(curl --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' \
   --header 'Content-Type: application/json' \
   --data-binary '{"model":"anysentry-observation-model","messages":[],"stream":false}' \
   "http://127.0.0.1:$http_port/v1/chat/completions")"
@@ -146,7 +146,7 @@ printf '%s\n' \
   '{"model":"anysentry-observation-model","messages":[{"role":"user","content":"plain HTTP validation"}],"stream":false}' \
   >"$nonstream_request"
 nonstream_response="$(mktemp "$DIFY_LAB_RUNTIME/results/.mock-nonstream-response.XXXXXX.json")"
-curl --fail --silent --show-error --http1.1 \
+curl --noproxy '*' --fail --silent --show-error --http1.1 \
   --header "@$DIFY_LAB_RUNTIME/secrets/mock-authorization-header" \
   --header 'Content-Type: application/json' \
   --data-binary "@$nonstream_request" \
@@ -160,8 +160,8 @@ printf '%s\n' \
   '{"model":"anysentry-observation-model","input":"Responses API validation","stream":false}' \
   >"$responses_request"
 responses_response="$(mktemp "$DIFY_LAB_RUNTIME/results/.mock-responses-response.XXXXXX.json")"
-curl --fail --silent --show-error --http1.1 \
-  --cacert "$DIFY_LAB_RUNTIME/tls/ca.crt" \
+curl --noproxy '*' --fail --silent --show-error --http1.1 \
+  --cacert "$DIFY_LAB_TLS_DIR/ca.crt" \
   --header "@$DIFY_LAB_RUNTIME/secrets/mock-authorization-header" \
   --header 'Content-Type: application/json' \
   --data-binary "@$responses_request" \
@@ -172,8 +172,8 @@ jq -e '.object == "response" and .status == "completed"' "$responses_response" >
 tool_request="$(mktemp "$DIFY_LAB_RUNTIME/results/.mock-tool.XXXXXX.json")"
 printf '%s\n' '{"instruction":"ANYSENTRY_TOOL_INSTRUCTION: validation"}' >"$tool_request"
 tool_response="$(mktemp "$DIFY_LAB_RUNTIME/results/.mock-tool-response.XXXXXX.json")"
-curl --fail --silent --show-error --http1.1 \
-  --cacert "$DIFY_LAB_RUNTIME/tls/ca.crt" \
+curl --noproxy '*' --fail --silent --show-error --http1.1 \
+  --cacert "$DIFY_LAB_TLS_DIR/ca.crt" \
   --header 'Content-Type: application/json' \
   --data-binary "@$tool_request" \
   --output "$tool_response" \
@@ -189,8 +189,8 @@ printf '%s\n' \
   '{"model":"anysentry-observation-model","messages":[{"role":"system","content":"ANYSENTRY_DIFY_SYSTEM_V1"},{"role":"user","content":"ANYSENTRY_FINAL_SELECTED_RAG: container validation"}],"stream":true,"stream_options":{"include_usage":true}}' \
   >"$request_file"
 response_file="$(mktemp "$DIFY_LAB_RUNTIME/results/.mock-response.XXXXXX.sse")"
-curl --fail --silent --show-error --http1.1 \
-  --cacert "$DIFY_LAB_RUNTIME/tls/ca.crt" \
+curl --noproxy '*' --fail --silent --show-error --http1.1 \
+  --cacert "$DIFY_LAB_TLS_DIR/ca.crt" \
   --header "@$DIFY_LAB_RUNTIME/secrets/mock-authorization-header" \
   --header 'Content-Type: application/json' \
   --data-binary "@$request_file" \
@@ -199,8 +199,8 @@ curl --fail --silent --show-error --http1.1 \
 
 rg -q 'ANYSENTRY' "$response_file"
 rg -q '^data: \[DONE\]$' "$response_file"
-records="$(curl --fail --silent --show-error --http1.1 \
-  --cacert "$DIFY_LAB_RUNTIME/tls/ca.crt" \
+records="$(curl --noproxy '*' --fail --silent --show-error --http1.1 \
+  --cacert "$DIFY_LAB_TLS_DIR/ca.crt" \
   "https://localhost:$https_port/debug/records")"
 jq -e '
   (.data | length) == 4

@@ -1182,17 +1182,18 @@ export class AgentRuntimeStateService implements OnModuleInit, OnModuleDestroy {
         candidate.collectorId === snapshot.collectorId
         && this.recordMatchesInstance(candidate, entry.agentInstanceId));
       if (!existing) continue;
-      if (
-        existing.rootPid !== entry.rootPid ||
-        existing.rootStartTimeTicks !== entry.rootStartTimeTicks ||
-        existing.hostId !== entry.hostId ||
-        existing.bootId !== entry.bootId
-      ) {
+      if (existing.hostId !== entry.hostId || existing.bootId !== entry.bootId) {
         return {
           reasonCode: 'identity_conflict',
           reason: `agentInstanceId identity conflict: ${entry.agentInstanceId}`,
         };
       }
+      // A reported agentInstanceId (for example a Docker workload id) can remain stable while
+      // its root process is replaced.  The host/boot/root tuple is the generation-safe identity;
+      // a changed PID or start tick therefore creates a new canonical runtime record and lets the
+      // complete snapshot retire the previous generation.  Treating this as an identity conflict
+      // made every normal container restart reject the whole runtime snapshot and left the
+      // forwarder control lane degraded even though kernel attribution remained valid.
       if (existing.reportedRuntimeState === 'exited' && entry.runtimeState !== 'exited') {
         return {
           reasonCode: 'terminal_state_conflict',

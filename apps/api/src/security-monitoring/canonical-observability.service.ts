@@ -343,6 +343,10 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   // its full database timeout.  The opt-in switch keeps direct/unit callers' historical
   // synchronous contract while formal deployments can use bounded eventual persistence.
   private readonly asyncPersistence = process.env.ANYSENTRY_CANONICAL_ASYNC_PERSIST === 'on';
+  // The canonical lane is rebuildable evidence.  During Observer soak tests it can be disabled
+  // explicitly so PostgreSQL latency cannot back up the primary ingest path.  The hot stores and
+  // their CoverageGap counters remain active and are still available for later reconciliation.
+  private readonly canonicalPersistenceEnabled = process.env.ANYSENTRY_CANONICAL_PERSIST !== 'off';
   private readonly asyncPersistenceMaxInFlight = boundedEnvInt(
     'ANYSENTRY_CANONICAL_ASYNC_PERSIST_MAX_INFLIGHT',
     8,
@@ -495,7 +499,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
 
     let durable = false;
     let commitGap: CoverageGap | undefined;
-    if (this.sink) {
+    if (this.sink && this.canonicalPersistenceEnabled) {
       let sideLaneGap: CoverageGap | undefined;
       const failure = () => {
         // Keep processing the machine lane even when the durable raw sink is unavailable. The hot
@@ -549,7 +553,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       }));
       if (kernelResult.status === 'inserted' || kernelResult.status === 'duplicate') {
         kernelFact = kernelResult.fact;
-        if (this.sink?.saveKernelFacts) {
+        if (this.canonicalPersistenceEnabled && this.sink?.saveKernelFacts) {
           const kernelFailure = () => this.recordGap(
             'raw_commit',
             'storage_unavailable',
@@ -760,7 +764,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
         result.status === 'inserted' || result.status === 'duplicate')
       .map((result) => result.record);
     let durable = false;
-    if (acceptedRecords.length > 0 && this.sink?.saveSemanticRecords) {
+    if (acceptedRecords.length > 0 && this.canonicalPersistenceEnabled && this.sink?.saveSemanticRecords) {
       durable = await this.writeCanonicalSideLane(
         () => this.sink!.saveSemanticRecords!(acceptedRecords),
         () => this.recordGap('projection', 'storage_unavailable', 'semantic_record', { count: acceptedRecords.length }),
@@ -833,7 +837,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
         result.status === 'inserted' || result.status === 'duplicate')
       .map((result) => result.link);
     let durable = false;
-    if (acceptedLinks.length > 0 && this.sink?.saveEvidenceLinks) {
+    if (acceptedLinks.length > 0 && this.canonicalPersistenceEnabled && this.sink?.saveEvidenceLinks) {
       durable = await this.writeCanonicalSideLane(
         () => this.sink!.saveEvidenceLinks!(acceptedLinks),
         () => this.recordGap('projection', 'storage_unavailable', 'evidence_link', { count: acceptedLinks.length }),
@@ -1065,7 +1069,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
         result.status === 'inserted' || result.status === 'duplicate')
       .map((result) => result.membership);
     let durable = false;
-    if (acceptedMemberships.length > 0 && this.sink?.saveSessionMemberships) {
+    if (acceptedMemberships.length > 0 && this.canonicalPersistenceEnabled && this.sink?.saveSessionMemberships) {
       durable = await this.writeCanonicalSideLane(
         () => this.sink!.saveSessionMemberships!(acceptedMemberships),
         () => this.recordGap('projection', 'storage_unavailable', 'session_membership', { count: acceptedMemberships.length }),
@@ -1338,7 +1342,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     this.gapHistory.set(key, history);
     this.gapBytes += gapBytes(gap);
     this.gapHistoryBytes += gapBytes(gap);
-    if (this.sink?.saveCoverageGaps) {
+    if (this.canonicalPersistenceEnabled && this.sink?.saveCoverageGaps) {
       if (this.gapPersistenceInFlight >= this.gapPersistenceMaxInFlight) {
         // Hot gap history remains available; bound durable side effects under a gap storm instead
         // of accumulating one Promise/DB request per failed event.

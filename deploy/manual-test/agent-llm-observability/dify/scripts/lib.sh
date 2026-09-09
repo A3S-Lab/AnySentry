@@ -7,6 +7,15 @@ DIFY_LAB_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 source "$DIFY_LAB_ROOT/versions.env"
 
 DIFY_LAB_RUNTIME="${DIFY_LAB_RUNTIME:-$DIFY_LAB_ROOT/.runtime}"
+# The long-lived manual stack may keep its generated upstream state below
+# .runtime/manual while the helper scripts continue to use the stable .runtime
+# control directory. Prefer the CA that matches the mounted mock certificates;
+# fall back to the standard runtime directory for a freshly prepared lab.
+if [[ -f "$DIFY_LAB_RUNTIME/manual/tls/ca.crt" ]]; then
+  DIFY_LAB_TLS_DIR="$DIFY_LAB_RUNTIME/manual/tls"
+else
+  DIFY_LAB_TLS_DIR="$DIFY_LAB_RUNTIME/tls"
+fi
 DIFY_LAB_DOCKER_DIR="$DIFY_LAB_RUNTIME/upstream/dify-$DIFY_VERSION/docker"
 DIFY_LAB_PROJECT_NAME="${DIFY_LAB_PROJECT_NAME:-anysentry-dify-observation}"
 DIFY_LAB_UID="${DIFY_LAB_UID:-$(id -u)}"
@@ -18,6 +27,7 @@ EXPOSE_PLUGIN_DEBUGGING_PORT="${DIFY_LAB_PLUGIN_DEBUGGING_PORT:-15003}"
 
 export DIFY_LAB_ROOT
 export DIFY_LAB_RUNTIME
+export DIFY_LAB_TLS_DIR
 export DIFY_LAB_UID
 export DIFY_LAB_GID
 export DIFY_LAB_MODEL

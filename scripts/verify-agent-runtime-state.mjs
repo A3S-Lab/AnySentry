@@ -577,21 +577,28 @@ const identityConflict = transitions.recordSnapshot(snapshot('transition-forward
   ...transitionRoot,
   rootPid: transitionRoot.rootPid + 1,
 }], { leaseEpoch: transitionLease.leaseEpoch }));
-assert.equal(identityConflict.accepted, false);
-assert.equal(identityConflict.reasonCode, 'identity_conflict');
-const readyRegression = transitions.recordSnapshot(snapshot('transition-forwarder', 2, [transitionRoot], {
+// A changed root PID/start-ticks for the same reported agentInstanceId is a
+// legitimate container generation rollover. Host/boot identity conflicts are
+// still rejected below; this case must advance the stored generation instead
+// of fencing a restarted Docker workload.
+assert.equal(identityConflict.accepted, true);
+assert.equal(identityConflict.applied, true);
+assert.equal(identityConflict.reasonCode, undefined);
+// identityConflict already applied snapshotVersion=2; later probes must use a newer version
+// so rejection reasons are not masked by snapshot_version_conflict.
+const readyRegression = transitions.recordSnapshot(snapshot('transition-forwarder', 3, [transitionRoot], {
   leaseEpoch: transitionLease.leaseEpoch,
   ready: false,
 }));
 assert.equal(readyRegression.accepted, false);
 assert.equal(readyRegression.reasonCode, 'ready_regression');
-const invalidHash = transitions.recordSnapshot(snapshot('transition-forwarder', 2, [transitionRoot], {
+const invalidHash = transitions.recordSnapshot(snapshot('transition-forwarder', 3, [transitionRoot], {
   leaseEpoch: transitionLease.leaseEpoch,
   registryMatcherHash: 'not-a-sha256',
 }));
 assert.equal(invalidHash.accepted, false);
 assert.equal(invalidHash.reasonCode, 'validation_error');
-const numericStringPid = transitions.recordSnapshot(snapshot('transition-forwarder', 2, [{
+const numericStringPid = transitions.recordSnapshot(snapshot('transition-forwarder', 3, [{
   ...transitionRoot,
   rootPid: String(transitionRoot.rootPid),
 }], { leaseEpoch: transitionLease.leaseEpoch }));
@@ -615,7 +622,7 @@ const mismatchedLaunchRoot = {
 };
 const mismatchedLaunchContext = transitions.recordSnapshot(snapshot(
   'transition-forwarder',
-  2,
+  3,
   [mismatchedLaunchRoot],
   { leaseEpoch: transitionLease.leaseEpoch },
 ));

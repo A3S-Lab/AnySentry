@@ -184,6 +184,28 @@ export function agentRuntimeInstanceIdsForEvent(
   return projectAgentSemanticIdentity(event).runtimeInstanceAliases;
 }
 
+/**
+ * Compare runtime instance IDs across Observer emission variants.
+ *
+ * Docker/K8s events sometimes carry the bare container/pod id while interactions and
+ * inventory rows keep the orchestrator-qualified form (`docker:host:id` / `k8s:...`).
+ * Treat a long shared trailing segment as the same runtime so Tool→Kernel lineage does not
+ * miss child ToolExec/FileAccess that lost the qualifier.
+ */
+export function agentRuntimeInstanceIdsEquivalent(
+  left?: string | null,
+  right?: string | null,
+): boolean {
+  const a = typeof left === 'string' ? left.trim() : '';
+  const b = typeof right === 'string' ? right.trim() : '';
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const aTail = a.includes(':') ? a.slice(a.lastIndexOf(':') + 1) : a;
+  const bTail = b.includes(':') ? b.slice(b.lastIndexOf(':') + 1) : b;
+  // Docker container ids are 64 hex; short 12-char prefixes are also commonly emitted.
+  return aTail.length >= 12 && aTail === bTail;
+}
+
 export function agentAssetIdForEvent(
   event: Pick<JudgedEvent, 'agentId' | 'workspacePath' | 'process' | 'attribution'>,
 ): string {

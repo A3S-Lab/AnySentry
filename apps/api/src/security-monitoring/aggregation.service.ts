@@ -19,6 +19,7 @@ import {
 } from './clickhouse-store';
 import {
   agentRuntimeInstanceIdForEvent,
+  agentRuntimeInstanceIdsEquivalent,
   agentRuntimeInstanceIdsForEvent,
   detectedAgentIdentity,
   hasAgentRuntimeLineageEvidence,
@@ -169,7 +170,9 @@ const COLLECTOR_ARCHIVE_MS = 24 * 60 * 60_000;
 const COMPACT_WINDOW_MS = 3_000;
 
 function matchesAgentRuntimeInstance(event: T.JudgedEvent, requested?: string): boolean {
-  return !requested || agentRuntimeInstanceIdsForEvent(event).includes(requested);
+  if (!requested) return true;
+  return agentRuntimeInstanceIdsForEvent(event).some((value) =>
+    agentRuntimeInstanceIdsEquivalent(value, requested));
 }
 const HOUR = 3_600_000;
 const REUSABLE_BUCKET_MS = 10_000;
@@ -2757,7 +2760,12 @@ export class AggregationService implements OnModuleDestroy {
         || record.agentInstanceId === eventRuntime
         || record.canonicalAgentInstanceId === eventRuntime);
       const sameAsset = eventAsset && record.agentAssetId === eventAsset;
-      if (!sameRuntime && !sameAsset) continue;
+      const sandboxRunnerLate = event.eventKind === 'ToolExec'
+        && /(?:^|[\s/])runner\.py(?:\s|$)/u.test(
+          `${event.subject ?? ''} ${typeof event.attributes?.argv === 'string' ? event.attributes.argv : ''}`,
+        )
+        && record.toolCalls.some((call) => /sandbox/iu.test(call.name ?? ''));
+      if (!sameRuntime && !sameAsset && !sandboxRunnerLate) continue;
       if (Math.abs(record.at - eventAt) > 30 * 60_000) continue;
       considered += 1;
       const key = record.agentInstanceId?.trim() || record.agentAssetId;

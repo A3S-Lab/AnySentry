@@ -170,6 +170,13 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     process.env.ANYSENTRY_DATABASE_URL?.trim() ??
     process.env.ANYSENTRY_POSTGRES_URL?.trim() ??
     '';
+  // PostgreSQL contains mutable business projections.  During an Observer soak on a shared
+  // node these projections are intentionally switchable: ClickHouse remains the authoritative
+  // event/fact store while a disabled relational lane avoids turning every alert/incident update
+  // into a competing transaction and records its availability as false.  The default stays on so
+  // ordinary deployments preserve the existing migration behaviour.
+  private readonly persistenceEnabled =
+    process.env.ANYSENTRY_RELATIONAL_PERSIST !== 'off';
   private pool?: Pool;
   private initializePromise?: Promise<boolean>;
   private ready = false;
@@ -184,7 +191,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   private writerOwnershipInFlightTimeouts = 0;
 
   configured(): boolean {
-    return Boolean(this.databaseUrl);
+    return this.persistenceEnabled && Boolean(this.databaseUrl);
   }
 
   isReady(): boolean {

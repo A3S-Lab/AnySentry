@@ -144,6 +144,10 @@ assert.match(agents, /<IdentityAiReview[\s\S]*targetType="agent"/u);
 assert.match(aiReview, /结果不会自动改变身份分类/u);
 assert.match(aiReview, /建议：是 Agent/u);
 assert.match(aiReview, /建议：不是 Agent/u);
+assert.match(aiReview, /hasAdminToken/u);
+assert.match(aiReview, /protectedReviewReady/u);
+assert.match(aiReview, /managementAuth\?\.enabled/u);
+assert.match(aiReview, /ready: Boolean\(eventId \|\| agentAssetId\) && protectedReviewReady/u);
 assert.match(apiTypes, /runIdentityAiReview/u);
 assert.match(apiTypes, /identityAiReviews/u);
 

@@ -1553,8 +1553,8 @@ export interface AgentSemanticKernelRelation {
   kernelEventKind?: string;
   kernelEventDecisionRevision?: number;
   status: AgentSemanticKernelRelationStatus;
-  linkMethod?: "command" | "resource" | "network" | "network_endpoint" | "shell_bootstrap";
-  lineageMethod?: "direct_runtime" | "generation_parent" | "legacy_pid_parent";
+  linkMethod?: "command" | "resource" | "network" | "network_endpoint" | "shell_bootstrap" | "process_lineage";
+  lineageMethod?: "direct_runtime" | "generation_parent" | "legacy_pid_parent" | "delegated_runtime";
   competingToolInvocationIds?: string[];
   competingKernelEventIds?: string[];
   timeQuality?: "exact" | "bounded";
