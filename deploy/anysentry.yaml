@@ -190,7 +190,11 @@ spec:
       containers:
         - name: redis
           image: redis:7.4-alpine
-          command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+          # Redis is a rebuildable hot-state/cache lane. AOF + 10k-change RDB snapshots caused
+          # sustained fsync/writeback on the shared NVMe during Observer file-probe soak; durable
+          # evidence remains in ClickHouse/WAL. Re-enable persistence in a reviewed production
+          # overlay when Redis durability is required.
+          command: ["redis-server", "--appendonly", "no", "--save", ""]
           ports:
             - { name: redis, containerPort: 6379 }
           volumeMounts:

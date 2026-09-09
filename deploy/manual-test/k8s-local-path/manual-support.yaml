@@ -68,12 +68,12 @@ spec:
           livenessProbe:
             exec:
               command: ["/bin/sh", "-ec", "pg_isready -h 127.0.0.1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
-            periodSeconds: 20
-            timeoutSeconds: 3
-            failureThreshold: 3
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 20
           resources:
-            requests: { cpu: 100m, memory: 256Mi }
-            limits: { cpu: "1", memory: 1Gi }
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { cpu: "2", memory: 2Gi }
       volumes:
         - name: postgres-data
           persistentVolumeClaim:

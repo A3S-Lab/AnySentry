@@ -17,7 +17,8 @@ spec:
             - { name: A3S_OBSERVER_FILES, value: "0" }
             - { name: A3S_OBSERVER_FILE_ACCESS, value: "1" }
             - { name: A3S_OBSERVER_FILE_DELETE, value: "1" }
-            - { name: A3S_OBSERVER_FILE_UNKNOWN_POLICY, value: "keep" }
+            - { name: A3S_OBSERVER_FILE_READ, value: "1" }
+            - { name: A3S_OBSERVER_FILE_UNKNOWN_POLICY, value: "drop" }
             - { name: FORWARD_FILTER_MODE, value: "enforce" }
             - { name: ANYSENTRY_UNKNOWN_RETENTION_MODE, value: "enforce" }
             - { name: ANYSENTRY_CAPTURE_PROFILE_MODE, value: "enforce" }

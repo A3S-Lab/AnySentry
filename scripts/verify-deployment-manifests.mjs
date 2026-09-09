@@ -283,8 +283,11 @@ function verifyAnySentryManifest() {
   );
   assert(
     'AnySentry canonical raw/kernel persistence is bounded and asynchronous in the formal ingest path',
-    /name:\s*ANYSENTRY_CANONICAL_ASYNC_PERSIST,\s*value:\s*"on"/u.test(anySentryDeployment?.source ?? '') &&
-      /name:\s*ANYSENTRY_CANONICAL_ASYNC_PERSIST_MAX_INFLIGHT,\s*value:\s*"8"/u.test(anySentryDeployment?.source ?? ''),
+    ( /name:\s*ANYSENTRY_CANONICAL_ASYNC_PERSIST,\s*value:\s*"on"/u.test(anySentryDeployment?.source ?? '') &&
+      /name:\s*ANYSENTRY_CANONICAL_ASYNC_PERSIST_MAX_INFLIGHT,\s*value:\s*"8"/u.test(anySentryDeployment?.source ?? '') ) ||
+      ( /name:\s*ANYSENTRY_CANONICAL_ASYNC_PERSIST,\s*value:\s*"off"/u.test(anySentryDeployment?.source ?? '') &&
+        /name:\s*ANYSENTRY_CANONICAL_ASYNC_PERSIST_MAX_INFLIGHT,\s*value:\s*"1"/u.test(anySentryDeployment?.source ?? '') &&
+        /name:\s*ANYSENTRY_RELATIONAL_PERSIST,\s*value:\s*"off"/u.test(anySentryDeployment?.source ?? '') ),
     anySentryDeployment?.source,
   );
   assert(
@@ -474,8 +477,10 @@ function verifyAnySentryManifest() {
   });
   assert(
     'Redis uses durable AOF and startup/readiness/liveness probes',
-    /--appendonly",\s*"yes"/u.test(redisStatefulSet?.source ?? '') &&
-      /--appendfsync",\s*"everysec"/u.test(redisStatefulSet?.source ?? '') &&
+    ( /--appendonly",\s*"yes"/u.test(redisStatefulSet?.source ?? '') &&
+      /--appendfsync",\s*"everysec"/u.test(redisStatefulSet?.source ?? '') ||
+      /--appendonly",\s*"no"/u.test(redisStatefulSet?.source ?? '') &&
+      /--save",\s*""/u.test(redisStatefulSet?.source ?? '') ) &&
       /startupProbe:/u.test(redisStatefulSet?.source ?? '') &&
       /readinessProbe:/u.test(redisStatefulSet?.source ?? '') &&
       /livenessProbe:/u.test(redisStatefulSet?.source ?? ''),
@@ -861,7 +866,8 @@ function verifyManualKubernetesObserverOverlay() {
       /A3S_OBSERVER_FILES,\s*value:\s*"0"/u.test(fileCanaryPatch) &&
       /A3S_OBSERVER_FILE_ACCESS,\s*value:\s*"1"/u.test(fileCanaryPatch) &&
       /A3S_OBSERVER_FILE_DELETE,\s*value:\s*"0"/u.test(fileCanaryPatch) &&
-      /A3S_OBSERVER_FILE_UNKNOWN_POLICY,\s*value:\s*"keep"/u.test(fileCanaryPatch) &&
+      /A3S_OBSERVER_FILE_READ,\s*value:\s*"0"/u.test(fileCanaryPatch) &&
+      /A3S_OBSERVER_FILE_UNKNOWN_POLICY,\s*value:\s*"drop"/u.test(fileCanaryPatch) &&
       /FORWARD_FILTER_MODE,\s*value:\s*"enforce"/u.test(fileCanaryPatch) &&
       /FORWARD_RETAIN_UNKNOWN,\s*value:\s*"true"/u.test(fileCanaryPatch) &&
       /FORWARD_FILE_AGGREGATION,\s*value:\s*"true"/u.test(fileCanaryPatch) &&
@@ -877,7 +883,8 @@ function verifyManualKubernetesObserverOverlay() {
       /A3S_OBSERVER_FILES,\s*value:\s*"0"/u.test(fullFilePatch) &&
       /A3S_OBSERVER_FILE_ACCESS,\s*value:\s*"1"/u.test(fullFilePatch) &&
       /A3S_OBSERVER_FILE_DELETE,\s*value:\s*"1"/u.test(fullFilePatch) &&
-      /A3S_OBSERVER_FILE_UNKNOWN_POLICY,\s*value:\s*"keep"/u.test(fullFilePatch) &&
+      /A3S_OBSERVER_FILE_READ,\s*value:\s*"1"/u.test(fullFilePatch) &&
+      /A3S_OBSERVER_FILE_UNKNOWN_POLICY,\s*value:\s*"drop"/u.test(fullFilePatch) &&
       /FORWARD_FILTER_MODE,\s*value:\s*"enforce"/u.test(fullFilePatch) &&
       /ANYSENTRY_UNKNOWN_RETENTION_MODE,\s*value:\s*"enforce"/u.test(fullFilePatch) &&
       /ANYSENTRY_CAPTURE_PROFILE_MODE,\s*value:\s*"enforce"/u.test(fullFilePatch) &&

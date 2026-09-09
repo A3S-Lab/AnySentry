@@ -29,3 +29,4 @@ patches:
   - path: flink-checkpoints-rwo.yaml
   - path: anysentry-nodeport-patch.yaml
   - path: full-load-capacity-patch.yaml
+  - path: anysentry-pressure-capacity-patch.yaml
