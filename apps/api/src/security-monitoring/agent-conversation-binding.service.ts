@@ -35,6 +35,8 @@ const V2_PERSIST_MAX_CATEGORY_BYTES = 16 * 1024 * 1024;
 export interface AgentConversationInteractionSelection
   extends AgentConversationInteractionMembershipSlice {
   durable: boolean;
+  /** True when Postgres membership was expected but only hot maps were used. */
+  storeUnavailable?: boolean;
 }
 
 function normalized(value?: string): string {
@@ -1787,8 +1789,9 @@ export class AgentConversationBindingService implements OnModuleDestroy {
   ): Promise<AgentConversationInteractionSelection> {
     const boundedLimit = Math.max(1, Math.min(10_000, Math.trunc(limit)));
     const canonical = this.canonicalConversationId(conversationId);
-    if (this.relationalStore?.configured()) {
-      const stored = await this.relationalStore.loadAgentConversationInteractionIds(
+    const storeConfigured = Boolean(this.relationalStore?.configured());
+    if (storeConfigured) {
+      const stored = await this.relationalStore!.loadAgentConversationInteractionIds(
         canonical,
         boundedLimit,
       );
@@ -1807,6 +1810,7 @@ export class AgentConversationBindingService implements OnModuleDestroy {
       interactionIds: interactionIds.slice(0, boundedLimit),
       truncated: interactionIds.length > boundedLimit,
       durable: false,
+      storeUnavailable: storeConfigured,
     };
   }
 

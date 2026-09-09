@@ -72,6 +72,16 @@ function interactionEnvironment(
   // container identity is Docker evidence; a generation-stable host root remains Host evidence.
   if (/^agent:\/\/[a-f0-9]{12,64}$/iu.test(record.workspacePath)) return 'docker';
   if (record.agentInstanceId?.startsWith('host-root:')) return 'host';
+  const workspace = record.workspacePath?.trim() ?? '';
+  const product = (record.agentProduct ?? asset?.agentProduct ?? '').toLowerCase();
+  // Container app roots (/app, /) must not fall through to host merely because a process exists.
+  if (workspace === '/' || workspace === '/app' || workspace.startsWith('/app/')
+    || ((product.includes('langgraph') || product.includes('langchain') || product.includes('dify'))
+      && workspace.startsWith('/'))) {
+    return product.includes('langgraph') || product.includes('langchain') || product.includes('dify')
+      ? 'docker'
+      : 'unknown';
+  }
   return record.process ? 'host' : asset?.runtime ?? 'unknown';
 }
 

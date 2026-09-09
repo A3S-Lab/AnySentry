@@ -348,4 +348,99 @@ const orphanMcpCall = histEvents.find((event) =>
   event.kind === 'tool_call' && event.toolCallId === orphanMcpId);
 assert.equal(orphanMcpCall?.status, 'succeeded');
 
+// ---------------------------------------------------------------------------
+// HTTP tool capture evidence: semantic tool_call inherits HTTP evidenceEventIds
+// when Observer stamped the same toolCallId on /bash or /mcp.
+// ---------------------------------------------------------------------------
+const {
+  linkHttpToolCaptureEvidence,
+} = require('../apps/api/dist/security-monitoring/agent-tool-closure.js');
+
+const sharedCallId = 'call_http_linked_001';
+const modelWithCall = {
+  ...baseInteraction,
+  interactionId: `mi_${digest('http-model').slice(0, 24)}`,
+  at: now + 40_000,
+  startedAtUnixNs: ns(now + 40_000),
+  requestCompleteAtUnixNs: ns(now + 40_001),
+  responseCompleteAtUnixNs: ns(now + 40_002),
+  endedAtUnixNs: ns(now + 40_003),
+  evidenceEventIds: ['ev_model_plain'],
+  request: {
+    ...baseInteraction.request,
+    bodyPreview: JSON.stringify({
+      messages: [{
+        role: 'assistant',
+        tool_calls: [{
+          id: sharedCallId,
+          type: 'function',
+          function: { name: 'run_bash', arguments: '{"command":"uname"}' },
+        }],
+      }],
+    }),
+  },
+  response: { ...baseInteraction.response, bodyPreview: '{}' },
+  toolCalls: [{
+    toolCallId: sharedCallId,
+    name: 'run_bash',
+    arguments: { command: 'uname' },
+    issuedAtUnixNs: ns(now + 40_000),
+  }],
+  toolResults: [],
+};
+const httpToolCapture = {
+  ...baseInteraction,
+  interactionId: `mi_${digest('http-tool').slice(0, 24)}`,
+  interactionType: 'tool',
+  at: now + 40_100,
+  startedAtUnixNs: ns(now + 40_100),
+  requestCompleteAtUnixNs: ns(now + 40_101),
+  responseCompleteAtUnixNs: ns(now + 40_102),
+  endedAtUnixNs: ns(now + 40_103),
+  evidenceEventIds: ['ev_http_bash_req', 'ev_http_bash_rsp'],
+  toolName: 'http.bash.execute',
+  toolCalls: [{
+    toolCallId: sharedCallId,
+    name: 'http.bash.execute',
+    arguments: { command: 'uname' },
+    issuedAtUnixNs: ns(now + 40_100),
+  }],
+  toolResults: [],
+  request: { ...baseInteraction.request, bodyPreview: '{"command":"uname"}' },
+  response: { ...baseInteraction.response, bodyPreview: '{"ok":true}' },
+};
+
+const httpLinks = linkHttpToolCaptureEvidence([modelWithCall, httpToolCapture]);
+assert.equal(httpLinks.byToolCallId.get(sharedCallId)?.httpInteractionId, httpToolCapture.interactionId);
+assert.deepEqual(
+  httpLinks.byToolCallId.get(sharedCallId)?.evidenceEventIds,
+  ['ev_http_bash_req', 'ev_http_bash_rsp'],
+);
+
+const httpSummary = {
+  ...histSummary,
+  conversationId: 'cv_http_evidence',
+  interactionCount: 2,
+  modelInteractionCount: 1,
+  toolCallCount: 1,
+  toolResultCount: 0,
+};
+const httpTimeline = projectSemanticConversationTimeline(
+  httpSummary,
+  [modelWithCall, httpToolCapture],
+  [],
+);
+const linkedCall = httpTimeline.flatMap((turn) => turn.events)
+  .find((event) => event.kind === 'tool_call' && event.toolCallId === sharedCallId);
+assert.ok(linkedCall, 'timeline must keep model tool_call');
+assert.ok(
+  linkedCall.evidenceEventIds.includes('ev_http_bash_req')
+  && linkedCall.evidenceEventIds.includes('ev_model_plain'),
+  'tool_call must union HTTP capture evidence with model evidence',
+);
+assert.ok(
+  linkedCall.sourceInteractionIds.includes(httpToolCapture.interactionId),
+  'tool_call must cite HTTP interaction as source',
+);
+
 console.log('verify-agent-tool-closure: ok');

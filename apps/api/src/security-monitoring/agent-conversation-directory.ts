@@ -40,10 +40,22 @@ function canonicalWorkspace(value: string | undefined, product: string): string 
   return 'agent-scope:' + productScope;
 }
 
+function looksLikeContainerWorkspace(workspacePath: string, product = ''): boolean {
+  const path = workspacePath.trim();
+  if (!path) return false;
+  if (/^agent:\/\/[a-f0-9]{12,64}$/iu.test(path)) return true;
+  // Bare container app roots are common for LangGraph workers; path-alone must not imply host.
+  if (path === '/' || path === '/app' || path.startsWith('/app/')) return true;
+  const family = product.toLowerCase();
+  return (family.includes('langgraph') || family.includes('langchain') || family.includes('dify'))
+    && path.startsWith('/');
+}
+
 function canonicalEnvironment(
   environment: T.AgentConversationSummary['environment'],
   workspacePath: string,
   agentInstanceIds: string[] = [],
+  product = '',
 ): T.AgentConversationSummary['environment'] {
   const instanceIdentities = agentInstanceIds.map(normalized);
   if (instanceIdentities.some((value) => /^(?:docker|container):/u.test(value))) {
@@ -55,6 +67,13 @@ function canonicalEnvironment(
   if (environment !== 'unknown') return environment;
   if (instanceIdentities.some((value) => value.startsWith('host-root:'))) return 'host';
   if (/^agent:\/\/[a-f0-9]{12,64}$/iu.test(workspacePath)) return 'docker';
+  if (looksLikeContainerWorkspace(workspacePath, product)) {
+    return product.toLowerCase().includes('langgraph')
+      || product.toLowerCase().includes('langchain')
+      || product.toLowerCase().includes('dify')
+      ? 'docker'
+      : 'unknown';
+  }
   if (workspacePath.startsWith('/')) return 'host';
   return 'unknown';
 }
@@ -221,6 +240,7 @@ export function projectAgentConversationDirectory(
       conversation.environment,
       rawWorkspacePath,
       conversation.agentInstanceIds,
+      product,
     );
     const workspacePath = canonicalWorkspace(rawWorkspacePath, product);
     const definition = resolveLogicalAgentDefinition({
@@ -286,6 +306,7 @@ export function projectAgentConversationDirectory(
       first.environment,
       rawWorkspacePath,
       first.agentInstanceIds,
+      product,
     );
     const workspacePath = canonicalWorkspace(rawWorkspacePath, product);
     const agentInstanceIds = [...new Set(conversations.flatMap((item) => item.agentInstanceIds))];

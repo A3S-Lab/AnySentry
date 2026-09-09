@@ -4,6 +4,7 @@ import type * as T from './types';
 import { interactionHumanMessages } from './agent-conversation-resolution-v2';
 import {
   closeToolCallsAcrossInteractions,
+  linkHttpToolCaptureEvidence,
   projectInteractionsWithReconstructedHistoryToolCalls,
 } from './agent-tool-closure';
 
@@ -502,6 +503,7 @@ export function projectSemanticConversationTimeline(
   segments: T.ConversationInstanceSegment[],
 ): T.AgentConversationTurnV2[] {
   const ordered = projectInteractionsWithReconstructedHistoryToolCalls(interactions);
+  const httpToolEvidence = linkHttpToolCaptureEvidence(ordered);
   const segmentByInteraction = new Map<string, string>();
   for (const interaction of ordered) {
     const interactionAt = BigInt(interaction.startedAtUnixNs);
@@ -615,6 +617,17 @@ export function projectSemanticConversationTimeline(
         && !itemPartialReasons.includes('tool_result_status_unobserved')) {
         itemPartialReasons.push('tool_result_status_unobserved');
       }
+      const httpLink = item.kind === 'tool_call' && item.toolCallId
+        ? httpToolEvidence.byToolCallId.get(item.toolCallId)
+        : undefined;
+      const evidenceEventIds = [...new Set([
+        ...(interaction.evidenceEventIds ?? []),
+        ...(httpLink?.evidenceEventIds ?? []),
+      ])];
+      const sourceInteractionIds = [...new Set([
+        interaction.interactionId,
+        ...(httpLink ? [httpLink.httpInteractionId] : []),
+      ])];
       const event: T.AgentSemanticEvent = {
         semanticEventId: semanticEventId(interaction.interactionId, item),
         conversationId: conversation.conversationId,
@@ -633,10 +646,10 @@ export function projectSemanticConversationTimeline(
           : item.kind === 'tool_result' && resultStatus
             ? { status: resultStatus }
             : item.kind === 'tool_result' ? { status: 'unknown' as const } : {}),
-        sourceInteractionIds: [interaction.interactionId],
+        sourceInteractionIds,
         sourceItemIds: [item.sourceItemId ?? item.semanticItemId],
         ...(item.sequenceNumber !== undefined ? { sequenceNumber: item.sequenceNumber } : {}),
-        evidenceEventIds: [...(interaction.evidenceEventIds ?? [])],
+        evidenceEventIds,
         parserId: interaction.semanticParserId ?? SEMANTIC_PROJECTION_PARSER_ID,
         parserVersion: interaction.semanticParserVersion ?? SEMANTIC_PROJECTION_PARSER_VERSION,
         correlationQuality: interaction.correlationQuality ?? 'inferred',

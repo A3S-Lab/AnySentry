@@ -3057,6 +3057,7 @@ export class AggregationService implements OnModuleDestroy {
       interactionIds?: readonly string[];
       membershipTruncated?: boolean;
       membershipDurable?: boolean;
+      membershipStoreUnavailable?: boolean;
     } = {},
   ): Promise<T.AgentInteractionList> {
     this.pruneInteractionHot();
@@ -3170,7 +3171,9 @@ export class AggregationService implements OnModuleDestroy {
     const partialReason = !durable
       ? 'hot_ring_only'
       : options.membershipDurable === false
-        ? 'membership_store_unavailable'
+        ? (options.membershipStoreUnavailable
+          ? 'membership_store_unavailable'
+          : 'membership_ephemeral')
         : options.membershipTruncated
           ? 'membership_limit'
           : missingMembershipRecords > 0
@@ -3392,6 +3395,7 @@ export class AggregationService implements OnModuleDestroy {
           interactionIds: exactMembershipIds,
           membershipTruncated: membershipSelection!.truncated,
           membershipDurable: membershipSelection!.durable,
+          membershipStoreUnavailable: membershipSelection!.storeUnavailable === true,
           totalLimit: exactMembershipIds.length,
         }
       : fairHistoryRead

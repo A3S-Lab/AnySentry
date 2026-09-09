@@ -327,6 +327,21 @@ assert.equal(syntheticDify[0].product, 'Dify');
 assert.equal(syntheticDify[0].workspacePath, 'agent-scope:dify');
 assert.equal(syntheticDify[0].environment, 'docker');
 assert.equal(syntheticDify[0].groupingQuality, 'inferred');
+
+// LangGraph /app (or bare /) must not be labeled host by path-alone heuristics.
+const langgraphApp = projectAgentConversationDirectory([
+  conversation({
+    conversationId: 'cv-langgraph-app',
+    agentAssetId: 'asset-langgraph-app',
+    agentInstanceIds: ['lg-instance-1'],
+    product: 'LangGraph',
+    workspacePath: '/app',
+    environment: 'unknown',
+    at: '1788000000000000099',
+  }),
+], [], 'all');
+assert.equal(langgraphApp.length, 1);
+assert.equal(langgraphApp[0].environment, 'docker');
 assert.equal(syntheticDify[0].lifecycleState, 'running');
 assert.equal(syntheticDify[0].activeInstanceCount, 4);
 assert.equal(syntheticDify[0].totalInstanceCount, 4);

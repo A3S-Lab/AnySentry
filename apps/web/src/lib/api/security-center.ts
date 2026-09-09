@@ -141,6 +141,7 @@ export interface QueryCoverage {
     | "scan_limit"
     | "storage_unavailable"
     | "membership_store_unavailable"
+    | "membership_ephemeral"
     | "membership_limit"
     | "membership_records_missing";
   source: QueryDataSource;

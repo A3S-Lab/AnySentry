@@ -421,3 +421,108 @@ export function projectInteractionsWithReconstructedHistoryToolCalls(
       };
     });
 }
+
+export const AGENT_HTTP_TOOL_EVIDENCE_VERSION = 1;
+
+export interface HttpToolCaptureLink {
+  toolCallId: string;
+  modelInteractionId: string;
+  httpInteractionId: string;
+  evidenceEventIds: string[];
+}
+
+/**
+ * Projection-only: attach HTTP tool-route capture evidence (/bash/execute, /mcp, …)
+ * onto semantic tool_calls that share the same toolCallId (Observer x-anysentry-tool-call-id).
+ */
+export function linkHttpToolCaptureEvidence(
+  interactions: readonly AgentInteractionRecord[],
+): {
+  byToolCallId: Map<string, HttpToolCaptureLink>;
+  evidenceLinks: EvidenceLink[];
+  relationRevisions: RelationRevision[];
+} {
+  const ordered = [...interactions].sort((left, right) =>
+    left.at - right.at
+    || left.interactionId.localeCompare(right.interactionId));
+
+  type HttpHit = {
+    interactionId: string;
+    evidenceEventIds: string[];
+    scope: string;
+    at: number;
+  };
+  const httpByCall = new Map<string, HttpHit>();
+  for (const interaction of ordered) {
+    if (interaction.interactionType !== 'tool') continue;
+    const scope = sessionScopeKey(interaction);
+    const evidenceEventIds = [...(interaction.evidenceEventIds ?? [])]
+      .map((id) => text(id, 128))
+      .filter((id): id is string => Boolean(id));
+    for (const call of interaction.toolCalls) {
+      const toolCallId = text(call.toolCallId, 512);
+      if (!toolCallId) continue;
+      const key = `${scope}\0${toolCallId}`;
+      const prior = httpByCall.get(key);
+      if (!prior || interaction.at < prior.at) {
+        httpByCall.set(key, {
+          interactionId: interaction.interactionId,
+          evidenceEventIds,
+          scope,
+          at: interaction.at,
+        });
+      }
+    }
+  }
+
+  const byToolCallId = new Map<string, HttpToolCaptureLink>();
+  const evidenceLinks: EvidenceLink[] = [];
+  const relationRevisions: RelationRevision[] = [];
+  for (const interaction of ordered) {
+    if (interaction.interactionType === 'tool') continue;
+    const scope = sessionScopeKey(interaction);
+    for (const call of interaction.toolCalls) {
+      const toolCallId = text(call.toolCallId, 512);
+      if (!toolCallId || byToolCallId.has(toolCallId)) continue;
+      const hit = httpByCall.get(`${scope}\0${toolCallId}`);
+      if (!hit) continue;
+      const link: HttpToolCaptureLink = {
+        toolCallId,
+        modelInteractionId: interaction.interactionId,
+        httpInteractionId: hit.interactionId,
+        evidenceEventIds: hit.evidenceEventIds,
+      };
+      byToolCallId.set(toolCallId, link);
+      if (!hit.evidenceEventIds.length) continue;
+      const evidence = createEvidenceLink({
+        fromType: 'tool_call',
+        fromId: toolCallId,
+        toType: 'semantic_record',
+        toId: `sr_http_tool_${hit.interactionId}_${toolCallId}`,
+        relation: 'supports',
+        method: 'explicit_id',
+        confidence: 1,
+        authority: 'attested_observer',
+        evidenceRefs: [
+          interaction.interactionId,
+          hit.interactionId,
+          toolCallId,
+          ...hit.evidenceEventIds.slice(0, 8),
+        ],
+        algorithmVersion: `agent-http-tool-evidence.v${AGENT_HTTP_TOOL_EVIDENCE_VERSION}`,
+        status: 'confirmed',
+        validFromUnixNs: callIssuedAt(interaction, toolCallId),
+        resolutionRevision: 1,
+      });
+      evidenceLinks.push(evidence);
+      relationRevisions.push(createRelationRevision({
+        relation: evidence,
+        revision: 1,
+        decidedAtUnixNs: callIssuedAt(interaction, toolCallId),
+        sourceRefs: evidence.evidenceRefs,
+      }));
+    }
+  }
+
+  return { byToolCallId, evidenceLinks, relationRevisions };
+}
