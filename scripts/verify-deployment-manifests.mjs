@@ -837,24 +837,26 @@ function verifyManualKubernetesObserverOverlay() {
     kustomization,
   );
   assert(
-    'Manual Kubernetes Observer overlay keeps one Docker-aware lossless collector while disabling fixed-ring file capture and behavior promotion',
+    'Manual Kubernetes Observer overlay keeps one Docker-aware Agent FileRead collector while disabling behavior promotion',
     /\{\s*name:\s*ANYSENTRY_BEHAVIOR_DISCOVERY,\s*value:\s*"off"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*FORWARD_FILTER_MODE,\s*value:\s*"enforce"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*ANYSENTRY_UNKNOWN_RETENTION_MODE,\s*value:\s*"enforce"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*ANYSENTRY_CAPTURE_PROFILE_MODE,\s*value:\s*"enforce"\s*\}/u.test(observerPatch) &&
-      /\{\s*name:\s*FORWARD_RETAIN_UNKNOWN,\s*value:\s*"true"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*FORWARD_RETAIN_UNKNOWN,\s*value:\s*"false"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*FORWARD_RETAIN_NON_AGENT,\s*value:\s*"false"\s*\}/u.test(observerPatch) &&
-      /\{\s*name:\s*A3S_OBSERVER_FILES,\s*value:\s*"0"\s*\}/u.test(observerPatch) &&
-      /\{\s*name:\s*A3S_OBSERVER_FILE_ACCESS,\s*value:\s*"0"\s*\}/u.test(observerPatch) &&
-      /\{\s*name:\s*A3S_OBSERVER_FILE_DELETE,\s*value:\s*"0"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*A3S_OBSERVER_FILES,\s*value:\s*"1"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*A3S_OBSERVER_FILE_ACCESS,\s*value:\s*"1"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*A3S_OBSERVER_FILE_DELETE,\s*value:\s*"1"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*A3S_OBSERVER_FILE_READ,\s*value:\s*"1"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*A3S_OBSERVER_FILE_UNKNOWN_POLICY,\s*value:\s*"drop"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*A3S_OBSERVER_SSL,\s*value:\s*"1"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*ANYSENTRY_DOCKER_DISCOVERY,\s*value:\s*"on"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*ANYSENTRY_DOCKER_SOCKET,\s*value:\s*"\/var\/run\/docker\.sock"\s*\}/u.test(observerPatch) &&
-      /\{\s*name:\s*FORWARD_BATCH_SIZE,\s*value:\s*"32"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*FORWARD_BATCH_SIZE,\s*value:\s*"128"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*FORWARD_HTTP_TIMEOUT_MS,\s*value:\s*"30000"\s*\}/u.test(observerPatch) &&
       /name:\s*docker-sock[\s\S]*mountPath:\s*\/var\/run\/docker\.sock[\s\S]*readOnly:\s*true/u.test(observerPatch) &&
       /name:\s*docker-sock[\s\S]*hostPath:\s*\{\s*path:\s*\/var\/run\/docker\.sock,\s*type:\s*Socket\s*\}/u.test(observerPatch) &&
-      /fixed FILE_EVENTS ring/u.test(observerPatchText) &&
+      /FileRead must remain explicit/u.test(observerPatchText) &&
       /security-center\/ingest\/batch/u.test(observerPatch),
     observerPatch,
   );

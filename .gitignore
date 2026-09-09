@@ -18,3 +18,13 @@ api-dist-overlay/
 web-dist/
 .Dockerfile.anysentry-overlay
 pelican-bicycle.html
+
+# Personal/local evidence & draft reports (do not commit on goal branch)
+codex*.png
+docs/agent-llm-observability-validation-*.json
+docs/agent-observability-architecture-assets/
+docs/anysentry-agent-observability-architecture-v2.md
+docs/anysentry-multiagent-refactor-execution-prompt.md
+docs/technical-report-assets/
+docs/technical-report.md
+docs/weekly-report-agent-observability-architecture.md
