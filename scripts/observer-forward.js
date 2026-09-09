@@ -44,7 +44,7 @@ const { CaptureProfileReporter } = require('./observer-capture-profile-reporter'
 const { FileAccessAggregator } = require('./observer-file-aggregation');
 const { ForwarderPipelineAccounting } = require('./observer-pipeline-accounting');
 const { UnifiedFilterPolicyRegistry } = require('./observer-unified-filter-policy');
-const { TlsAgentCgroupPublisher } = require('./observer-tls-agent-cgroups');
+const { TlsAgentCgroupPublisher, promoteConfirmedDockerTlsEntries } = require('./observer-tls-agent-cgroups');
 
 // Only immutable, software-versioned rules may override the generic lifecycle discovery
 // guardrail. User-created SUPPRESS rules can never add an ID to this closed set.
@@ -357,10 +357,10 @@ const LEGACY_FORWARD_SCOPE = ['agent', 'all', 'shadow'].includes(process.env.FOR
 let FILTER_MODE = ['enforce', 'shadow'].includes(process.env.FORWARD_FILTER_MODE)
   ? process.env.FORWARD_FILTER_MODE
   : LEGACY_FORWARD_SCOPE === 'agent' ? 'enforce' : 'shadow';
-// Unknown is evidence, not a negative identity decision. It is always retained; only exact
-// lossless aggregation may reduce repeated records. The legacy env remains accepted by manifests
-// but cannot authorize silent Unknown loss.
-const RETAIN_UNKNOWN = true;
+// Unknown evidence is retained by default, but shared-node soak deployments may explicitly drop
+// it after the file pre-filter has already removed unowned file traffic. Keep lifecycle/security
+// events protected by `alwaysKeepEventKind` below even when the deployment opts into the drop.
+const RETAIN_UNKNOWN = envBoolean(process.env.FORWARD_RETAIN_UNKNOWN, true);
 const OBSERVER_FILE_UNKNOWN_POLICY = text(process.env.A3S_OBSERVER_FILE_UNKNOWN_POLICY).toLowerCase() === 'sample'
   ? 'sample'
   : 'keep';
@@ -1623,6 +1623,10 @@ function refreshIdentitySnapshot() {
     }
     markControlPlaneSuccess('identity');
     synchronizeInfrastructurePolicyRules();
+    // Operator confirmations often land here without cgroupIds; re-join with live Docker inventory
+    // so TLS admission picks up newly reviewed containers.
+    lastTlsScopeFingerprint = '';
+    publishTlsAgentRuntimeScope();
   }, {}, false);
 }
 
@@ -2058,7 +2062,18 @@ function publishTlsAgentRuntimeScope(processSnapshot = attributor.runtimeSnapsho
   const dockerEntries = Array.isArray(latestDockerIdentitySnapshot?.entries)
     ? latestDockerIdentitySnapshot.entries
     : [];
-  const entries = [...dockerEntries, ...processEntries];
+  const promoted = promoteConfirmedDockerTlsEntries(
+    dockerEntries,
+    workloadCache.confirmedPhysicalWorkloadIds(),
+  );
+  const promotedCgroups = promoted.promotedCgroupIds;
+  // Drop process-generation fences that share a promoted Docker cgroup. Otherwise Codex/Claude
+  // short-lived roots turn a lab container into a mixed-product conflict and revoke admission.
+  const scopedProcessEntries = processEntries.filter((entry) => {
+    const id = text(entry?.cgroupId);
+    return !id || !promotedCgroups.has(id);
+  });
+  const entries = [...promoted.entries, ...scopedProcessEntries];
   // Compare only the local admission facts. generatedAt/snapshotVersion are deliberately omitted
   // from the fingerprint so the 5-second liveness timer does not rewrite an unchanged scope and
   // make the Collector churn its TLS allowlist.
@@ -3891,7 +3906,13 @@ function handleLine(raw, fromDeferred = false) {
     && PROTECTED_LIFECYCLE_SUPPRESSION_RULES.has(semanticDecision.ruleId)
   );
   const alwaysKeep = alwaysKeepEventKind(kind) && !trustedLifecycleSuppression;
-  if (!alwaysKeep && semanticDecision) {
+  if (!alwaysKeep && classification.state === 'unknown' && !RETAIN_UNKNOWN) {
+    // Unknown events are useful during discovery, but an unbounded host-wide unknown stream can
+    // overwhelm the forwarder/WAL before attribution catches up. The setting is deliberately
+    // explicit and hot-reloadable through the deployment environment; defaults preserve the
+    // historical evidence-retention behavior.
+    filterReason = 'unknown';
+  } else if (!alwaysKeep && semanticDecision) {
     if (semanticDecision.action === 'suppress') {
       filterReason = semanticDecision.reasonCode || 'non_agent';
     } else if (
@@ -4061,7 +4082,7 @@ async function start() {
     // Include already-discovered host/SSH roots whenever Docker inventory changes, while keeping
     // the local projection idempotent when neither side's admission facts changed.
     lastTlsScopeFingerprint = '';
-    tlsAgentCgroupPublisher.publish(snapshot);
+    publishTlsAgentRuntimeScope();
     if (workloadCache.replace(snapshot, 'docker')) synchronizeInfrastructurePolicyRules();
   });
   if (closing) return;

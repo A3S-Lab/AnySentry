@@ -516,6 +516,21 @@ class WorkloadIdentityCache {
     return result;
   }
 
+  confirmedPhysicalWorkloadIds() {
+    const ids = new Set();
+    for (const entry of this.byId.values()) {
+      if (text(entry?.classification).toLowerCase() !== 'confirmed_agent') continue;
+      const physicalWorkloadId = text(entry?.physicalWorkloadId);
+      if (physicalWorkloadId) ids.add(physicalWorkloadId);
+    }
+    for (const entry of [...this.sources.values()].flat()) {
+      if (text(entry?.classification).toLowerCase() !== 'confirmed_agent') continue;
+      const physicalWorkloadId = text(entry?.physicalWorkloadId);
+      if (physicalWorkloadId) ids.add(physicalWorkloadId);
+    }
+    return ids;
+  }
+
   agentRuntimeInventory() {
     const now = this.now();
     const observedAt = new Date(now).toISOString();

@@ -35,6 +35,7 @@ const STAGE_REASONS = Object.freeze({
     'priority_evicted',
     'queue_rejected',
     'retry_exhausted',
+    'durable_spool_error',
     'shutdown',
   ]),
   api_retained: Object.freeze(['ack']),

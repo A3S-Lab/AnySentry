@@ -10,6 +10,7 @@ const require = createRequire(import.meta.url);
 const {
   TLS_AGENT_CGROUPS_SCHEMA,
   TlsAgentCgroupPublisher,
+  promoteConfirmedDockerTlsEntries,
   tlsAgentCgroupDocument,
 } = require('./observer-tls-agent-cgroups.js');
 
@@ -106,6 +107,38 @@ const invalidHalfFence = tlsAgentCgroupDocument({
 assert.equal(invalidHalfFence.entries.length, 1);
 assert.equal('rootPid' in invalidHalfFence.entries[0], false);
 assert.equal('rootStartTimeTicks' in invalidHalfFence.entries[0], false);
+
+const promoted = promoteConfirmedDockerTlsEntries(
+  [
+    {
+      classification: 'unknown',
+      cgroupId: '124832',
+      physicalWorkloadId: 'docker:node:tender',
+      containerState: 'running',
+      hostPid: 2734235,
+      rootStartTimeTicks: '100',
+      agentInstanceId: 'should-be-stripped',
+    },
+    {
+      classification: 'unknown',
+      cgroupId: '999',
+      physicalWorkloadId: 'docker:node:other',
+      containerState: 'running',
+    },
+  ],
+  new Set(['docker:node:tender']),
+);
+assert.equal(promoted.entries[0].classification, 'confirmed_agent');
+assert.equal(promoted.entries[0].cgroupId, '124832');
+assert.equal('hostPid' in promoted.entries[0], false);
+assert.equal('agentInstanceId' in promoted.entries[0], false);
+assert.equal(promoted.entries[1].classification, 'unknown');
+assert.deepEqual([...promoted.promotedCgroupIds], ['124832']);
+const promotedDocument = tlsAgentCgroupDocument({
+  version: 19,
+  entries: promoted.entries,
+});
+assert.deepEqual(promotedDocument.entries.map((entry) => entry.cgroupId), ['124832']);
 
 const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'anysentry-tls-cgroups-'));
 const file = path.join(directory, 'tls-agent-cgroups.json');

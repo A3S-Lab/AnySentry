@@ -51,6 +51,51 @@ function processFence(entry) {
   };
 }
 
+/**
+ * Join live Docker inventory (cgroup inode + running state) with control-plane /
+ * identity-snapshot confirmations that often omit kernel cgroupIds. Promoted rows are
+ * intentionally fence-free so multi-product CLI labs (Codex + Claude in one container) keep
+ * whole-cgroup TLS admission instead of becoming mixed-product conflicts.
+ */
+function promoteConfirmedDockerTlsEntries(dockerEntries, confirmedPhysicalWorkloadIds) {
+  const confirmed = confirmedPhysicalWorkloadIds instanceof Set
+    ? confirmedPhysicalWorkloadIds
+    : new Set(
+      [...(Array.isArray(confirmedPhysicalWorkloadIds) ? confirmedPhysicalWorkloadIds : [])]
+        .map((value) => text(value))
+        .filter(Boolean),
+    );
+  const promotedCgroupIds = new Set();
+  const entries = (Array.isArray(dockerEntries) ? dockerEntries : []).map((entry) => {
+    const physicalWorkloadId = text(entry?.physicalWorkloadId);
+    const id = cgroupId(entry?.cgroupId);
+    const running = text(entry?.containerState).toLowerCase() === 'running';
+    if (
+      !physicalWorkloadId
+      || !id
+      || !running
+      || entry?.classification === 'confirmed_agent'
+      || !confirmed.has(physicalWorkloadId)
+    ) {
+      return entry;
+    }
+    promotedCgroupIds.add(id);
+    return {
+      classification: 'confirmed_agent',
+      cgroupId: id,
+      physicalWorkloadId,
+      source: text(entry?.source) || 'docker',
+      containerState: 'running',
+      // Leave agentScopeId / rootPid / agentInstanceId unset: anonymous legacy admission.
+      evidence: [
+        ...(Array.isArray(entry?.evidence) ? entry.evidence : []),
+        'tls_admission:identity_confirmed_docker_cgroup',
+      ].slice(0, 16),
+    };
+  });
+  return { entries, promotedCgroupIds };
+}
+
 function tlsAgentCgroupDocument(snapshot) {
   const byCgroup = new Map();
   for (const entry of Array.isArray(snapshot?.entries) ? snapshot.entries.slice(0, MAX_ENTRIES) : []) {
@@ -143,5 +188,6 @@ class TlsAgentCgroupPublisher {
 module.exports = {
   TLS_AGENT_CGROUPS_SCHEMA,
   TlsAgentCgroupPublisher,
+  promoteConfirmedDockerTlsEntries,
   tlsAgentCgroupDocument,
 };

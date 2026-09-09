@@ -237,8 +237,14 @@ function compileCaptureDecision(observerEvent, classification, input, options = 
     desiredProbeActions.file_delete = 'sample';
   }
   const workload = input.workloadRef ?? attribution.workloadRef ?? observerEvent?.workload ?? {};
-  const workloadEnvironment = text(workload.environment ?? workload.placement).toLowerCase();
   const physicalWorkloadId = text(input.physicalWorkloadId ?? attribution.physicalWorkloadId);
+  // Placement may arrive only as a physicalWorkloadId (docker:/kubernetes:) when a template
+  // identity wins the merge; still treat that as a dedicated runtime for selective FileRead.
+  const workloadEnvironment = text(workload.environment ?? workload.placement).toLowerCase()
+    || (physicalWorkloadId.startsWith('docker:') ? 'docker' : '')
+    || (physicalWorkloadId.startsWith('kubernetes:') || physicalWorkloadId.startsWith('k8s:')
+      ? 'kubernetes'
+      : '');
   const dedicatedRuntimeReadScope = ['kubernetes', 'docker'].includes(workloadEnvironment)
     && Boolean(physicalWorkloadId)
     && Boolean(text(input.agentInstanceId ?? attribution.agentInstanceId));
@@ -320,6 +326,18 @@ function exactRootReadScope(entry) {
     && Boolean(text(entry?.rootExecIdExact));
 }
 
+function dedicatedRuntimeReadScope(entry) {
+  const physicalWorkloadId = text(entry?.physicalWorkloadId);
+  const workloadEnvironment = text(entry?.workloadRef?.environment ?? entry?.workloadRef?.placement).toLowerCase()
+    || (physicalWorkloadId.startsWith('docker:') ? 'docker' : '')
+    || (physicalWorkloadId.startsWith('kubernetes:') || physicalWorkloadId.startsWith('k8s:')
+      ? 'kubernetes'
+      : '');
+  return ['kubernetes', 'docker'].includes(workloadEnvironment)
+    && Boolean(physicalWorkloadId)
+    && Boolean(text(entry?.agentInstanceId));
+}
+
 function safeDesiredProbeActions(entry) {
   const profile = CAPTURE_PROFILES.has(entry?.captureProfile) ? entry.captureProfile : 'unknown_discovery';
   const contextualProfile = ['business_context', 'infrastructure_aggregate', 'self_health'].includes(profile);
@@ -332,7 +350,15 @@ function safeDesiredProbeActions(entry) {
   );
   if (isAgentKeepDecision(entry) || entry?.conflict === true || profile === 'investigation_full') {
     const agent = { ...ALL_FULL_PROBE_ACTIONS };
-    if (exactRootReadScope(entry) || entry?.desiredProbeActions?.file_read === 'not_enabled') {
+    // Generation-fenced roots keep cgroup FileRead off (promotion map owns the signal).
+    // Dedicated Docker/K8s Agent runtimes keep FileRead full. A stale desired not_enabled must
+    // not permanently suppress FileRead after physicalWorkloadId is later attached.
+    if (exactRootReadScope(entry)) {
+      agent.file_read = 'not_enabled';
+    } else if (
+      !dedicatedRuntimeReadScope(entry)
+      && entry?.desiredProbeActions?.file_read === 'not_enabled'
+    ) {
       agent.file_read = 'not_enabled';
     }
     return agent;
