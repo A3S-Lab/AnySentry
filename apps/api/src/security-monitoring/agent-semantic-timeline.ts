@@ -2,7 +2,10 @@ import { createHash } from 'node:crypto';
 
 import type * as T from './types';
 import { interactionHumanMessages } from './agent-conversation-resolution-v2';
-import { closeToolCallsAcrossInteractions } from './agent-tool-closure';
+import {
+  closeToolCallsAcrossInteractions,
+  projectInteractionsWithReconstructedHistoryToolCalls,
+} from './agent-tool-closure';
 
 export const SEMANTIC_PROJECTION_PARSER_ID = 'anysentry.agent-semantic-timeline';
 export const SEMANTIC_PROJECTION_PARSER_VERSION = 2;
@@ -498,8 +501,7 @@ export function projectSemanticConversationTimeline(
   interactions: T.AgentInteractionRecord[],
   segments: T.ConversationInstanceSegment[],
 ): T.AgentConversationTurnV2[] {
-  const ordered = [...interactions].sort((left, right) =>
-    left.at - right.at || left.interactionId.localeCompare(right.interactionId));
+  const ordered = projectInteractionsWithReconstructedHistoryToolCalls(interactions);
   const segmentByInteraction = new Map<string, string>();
   for (const interaction of ordered) {
     const interactionAt = BigInt(interaction.startedAtUnixNs);

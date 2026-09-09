@@ -211,3 +211,213 @@ export function projectedConversationCompleteness(
   return result.projections.find((item) => item.interactionId === interactionId)
     ?.currentEffectiveCompleteness;
 }
+
+export const TOOL_CALL_RECONSTRUCTED_FROM_REQUEST_HISTORY =
+  'tool_call_reconstructed_from_request_history';
+
+export interface HistoryToolCallReconstruction {
+  toolCallId: string;
+  name: string;
+  arguments: unknown;
+  sourceInteractionId: string;
+  issuedAtUnixNs: string;
+}
+
+function parseJsonValue(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function requestPayload(interaction: AgentInteractionRecord): Record<string, unknown> | undefined {
+  const structured = asRecord(interaction.request.structured);
+  if (structured) return structured;
+  return asRecord(parseJsonValue(interaction.request.body));
+}
+
+function parseToolArguments(value: unknown): unknown {
+  if (typeof value !== 'string') return value ?? {};
+  const parsed = parseJsonValue(value);
+  return parsed === undefined ? value : parsed;
+}
+
+/**
+ * Lift assistant/tool_use/function_call entries from a later model request's message history.
+ * Observer only extracts toolCalls from response bodies, so a missed prior model round leaves
+ * orphan toolResults whose originating assistant tool_calls still appear in subsequent requests.
+ */
+export function extractAssistantToolCallsFromRequestPayload(
+  payload: unknown,
+): Array<{ toolCallId: string; name: string; arguments: unknown }> {
+  const root = asRecord(payload);
+  if (!root) return [];
+  const buckets: unknown[] = [];
+  if (Array.isArray(root.messages)) buckets.push(...root.messages);
+  if (Array.isArray(root.input)) buckets.push(...root.input);
+
+  const out: Array<{ toolCallId: string; name: string; arguments: unknown }> = [];
+  const seen = new Set<string>();
+  const push = (toolCallId: string | undefined, name: string | undefined, args: unknown) => {
+    const id = text(toolCallId, 512);
+    const toolName = text(name, 256) ?? 'unknown';
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    out.push({ toolCallId: id, name: toolName, arguments: parseToolArguments(args) });
+  };
+
+  for (const entry of buckets) {
+    const message = asRecord(entry);
+    if (!message) continue;
+
+    // OpenAI chat-completions / compatible assistants.
+    if (message.role === 'assistant' && Array.isArray(message.tool_calls)) {
+      for (const raw of message.tool_calls) {
+        const call = asRecord(raw);
+        if (!call) continue;
+        const fn = asRecord(call.function);
+        push(
+          text(call.id, 512) ?? text(call.tool_call_id, 512),
+          text(fn?.name, 256) ?? text(call.name, 256),
+          fn?.arguments ?? call.arguments ?? call.input,
+        );
+      }
+    }
+
+    // Anthropic message content blocks (and OpenAI content-part variants).
+    const content = message.content;
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        const block = asRecord(part);
+        if (!block) continue;
+        if (block.type === 'tool_use' || block.type === 'tool_call' || block.type === 'function') {
+          push(
+            text(block.id, 512) ?? text(block.tool_call_id, 512),
+            text(block.name, 256) ?? text(asRecord(block.function)?.name, 256),
+            block.input ?? block.arguments ?? asRecord(block.function)?.arguments,
+          );
+        }
+      }
+    }
+
+    // OpenAI Responses-style input items.
+    if (message.type === 'function_call' || message.type === 'custom_tool_call') {
+      push(
+        text(message.call_id, 512) ?? text(message.id, 512),
+        text(message.name, 256),
+        message.arguments ?? message.input,
+      );
+    }
+  }
+  return out;
+}
+
+/**
+ * Projection-only: for toolResults whose toolCallId was never observed as a response-issued
+ * toolCall, reconstruct the missing assistant tool_calls from later request history and attach
+ * them to the earliest interaction that still carries those calls in its request payload.
+ */
+export function reconstructMissingToolCallsFromRequestHistory(
+  interactions: readonly AgentInteractionRecord[],
+): HistoryToolCallReconstruction[] {
+  const ordered = [...interactions].sort((left, right) =>
+    left.at - right.at
+    || left.interactionId.localeCompare(right.interactionId));
+  const observedCallIds = new Set<string>();
+  for (const interaction of ordered) {
+    for (const call of interaction.toolCalls) {
+      const id = text(call.toolCallId, 512);
+      if (id) observedCallIds.add(id);
+    }
+  }
+  const orphanResultIds = new Set<string>();
+  for (const interaction of ordered) {
+    for (const result of interaction.toolResults) {
+      const id = text(result.toolCallId, 512);
+      if (id && !observedCallIds.has(id)) orphanResultIds.add(id);
+    }
+  }
+  if (!orphanResultIds.size) return [];
+
+  const reconstructions: HistoryToolCallReconstruction[] = [];
+  const claimed = new Set<string>();
+  for (const interaction of ordered) {
+    const payload = requestPayload(interaction);
+    if (!payload) continue;
+    for (const call of extractAssistantToolCallsFromRequestPayload(payload)) {
+      if (!orphanResultIds.has(call.toolCallId) || claimed.has(call.toolCallId)) continue;
+      claimed.add(call.toolCallId);
+      let issuedAtUnixNs = interaction.startedAtUnixNs;
+      try {
+        // Keep reconstructed calls strictly before the request that replayed them so timeline
+        // ordering places tool_call ahead of the paired tool_result (same-ns rank favors results).
+        issuedAtUnixNs = String(BigInt(interaction.startedAtUnixNs) - 1_000_000n);
+      } catch {
+        /* keep interaction boundary */
+      }
+      reconstructions.push({
+        toolCallId: call.toolCallId,
+        name: call.name,
+        arguments: call.arguments,
+        sourceInteractionId: interaction.interactionId,
+        issuedAtUnixNs,
+      });
+    }
+  }
+  return reconstructions;
+}
+
+/**
+ * Return shallow-cloned interactions with reconstructed history toolCalls attached.
+ * Never mutates the stored Observer rows.
+ */
+export function projectInteractionsWithReconstructedHistoryToolCalls(
+  interactions: readonly AgentInteractionRecord[],
+): AgentInteractionRecord[] {
+  const reconstructions = reconstructMissingToolCallsFromRequestHistory(interactions);
+  if (!reconstructions.length) {
+    return [...interactions].sort((left, right) =>
+      left.at - right.at
+      || left.interactionId.localeCompare(right.interactionId));
+  }
+  const byInteraction = new Map<string, HistoryToolCallReconstruction[]>();
+  for (const item of reconstructions) {
+    const list = byInteraction.get(item.sourceInteractionId) ?? [];
+    list.push(item);
+    byInteraction.set(item.sourceInteractionId, list);
+  }
+  return [...interactions]
+    .sort((left, right) =>
+      left.at - right.at
+      || left.interactionId.localeCompare(right.interactionId))
+    .map((interaction) => {
+      const extra = byInteraction.get(interaction.interactionId);
+      if (!extra?.length) return interaction;
+      return {
+        ...interaction,
+        toolCalls: [
+          ...extra.map((item) => ({
+            toolCallId: item.toolCallId,
+            name: item.name,
+            arguments: item.arguments,
+            issuedAtUnixNs: item.issuedAtUnixNs,
+          })),
+          ...interaction.toolCalls,
+        ],
+        partialReasons: [...new Set([
+          ...interaction.partialReasons,
+          TOOL_CALL_RECONSTRUCTED_FROM_REQUEST_HISTORY,
+        ])],
+      };
+    });
+}

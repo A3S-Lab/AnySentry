@@ -12,7 +12,10 @@ import {
   conversationDeploymentScopeKey,
   canonicalPerRequestConversationId,
 } from './agent-conversation-resolution-v2';
-import { closeToolCallsAcrossInteractions } from './agent-tool-closure';
+import {
+  closeToolCallsAcrossInteractions,
+  projectInteractionsWithReconstructedHistoryToolCalls,
+} from './agent-tool-closure';
 
 function deploymentSessionScopeKeyForRecord(record: T.AgentInteractionRecord): string {
   return conversationDeploymentScopeKey(record);
@@ -1121,7 +1124,9 @@ export function projectAgentConversations(
     );
     const projected = annotateTurns(
       conversationId,
-      deduplicateToolEvidence(group.records),
+      deduplicateToolEvidence(
+        projectInteractionsWithReconstructedHistoryToolCalls(group.records),
+      ),
     );
     interactionsByConversation.set(conversationId, projected);
     const summary = summaryForConversation(
@@ -1160,7 +1165,8 @@ export function projectConversationTimeline(
   conversation: T.AgentConversationSummary,
   interactions: T.AgentInteractionRecord[],
 ): T.AgentConversationEvent[] {
-  const ordered = [...interactions].sort(compareInteraction);
+  const ordered = projectInteractionsWithReconstructedHistoryToolCalls(interactions)
+    .sort(compareInteraction);
   const resolvedResults = resolvedToolResultIds(ordered);
   const unknownResults = unknownToolResultIds(ordered);
   const callEventIds = new Map<string, Array<{ eventId: string; at: bigint; interactionId: string }>>();

@@ -204,4 +204,148 @@ assert.ok(
   'normalized Claude argv must link Bash ToolCall to ToolExec',
 );
 
+// ---------------------------------------------------------------------------
+// History replay: orphan toolResults whose assistant tool_calls only appear in
+// a later request.messages history (missed prior model LlmInteraction).
+// ---------------------------------------------------------------------------
+const {
+  reconstructMissingToolCallsFromRequestHistory,
+  projectInteractionsWithReconstructedHistoryToolCalls,
+  TOOL_CALL_RECONSTRUCTED_FROM_REQUEST_HISTORY,
+} = require('../apps/api/dist/security-monitoring/agent-tool-closure.js');
+const {
+  projectSemanticConversationTimeline,
+} = require('../apps/api/dist/security-monitoring/agent-semantic-timeline.js');
+
+const orphanBashId = 'call_orphan_bash_001';
+const orphanMcpId = 'call_orphan_mcp_001';
+const laterCallId = 'call_later_bash_002';
+
+const orphanResultOnly = {
+  ...baseInteraction,
+  interactionId: `mi_${digest('hist-orphan-result').slice(0, 24)}`,
+  at: now + 30_000,
+  startedAtUnixNs: ns(now + 30_000),
+  requestCompleteAtUnixNs: ns(now + 30_001),
+  firstResponseAtUnixNs: ns(now + 30_002),
+  endedAtUnixNs: ns(now + 30_003),
+  durationNs: '3000000',
+  receivedAt: now + 30_000,
+  conversationCompleteness: 'complete',
+  completeness: 'complete',
+  partialReasons: [],
+  path: '/v1/chat/completions',
+  toolCalls: [{
+    toolCallId: laterCallId,
+    name: 'run_bash',
+    arguments: { command: 'date' },
+    issuedAtUnixNs: ns(now + 30_002),
+  }],
+  toolResults: [
+    {
+      toolCallId: orphanBashId,
+      name: 'run_bash',
+      content: { ok: false, exit_code: 126 },
+      isError: true,
+      observedAtUnixNs: ns(now + 30_001),
+    },
+    {
+      toolCallId: orphanMcpId,
+      name: 'call_mcp_tool',
+      content: { ok: true, tool_name: 'get_lab_fact' },
+      isError: false,
+      observedAtUnixNs: ns(now + 30_001),
+    },
+  ],
+  request: {
+    body: '',
+    encoding: 'utf8',
+    contentType: 'application/json',
+    capturedBytes: 0,
+    decodedBytes: 0,
+    sha256: digest('hist-req'),
+    completeness: 'complete',
+    structured: {
+      model: 'deepseek',
+      messages: [
+        {
+          role: 'assistant',
+          tool_calls: [
+            {
+              type: 'function',
+              id: orphanBashId,
+              function: {
+                name: 'run_bash',
+                arguments: '{"command":"echo hi; uname -a"}',
+              },
+            },
+            {
+              type: 'function',
+              id: orphanMcpId,
+              function: {
+                name: 'call_mcp_tool',
+                arguments: '{"tool_name":"get_lab_fact"}',
+              },
+            },
+          ],
+        },
+        { role: 'tool', tool_call_id: orphanBashId, content: '{"ok":false}' },
+        { role: 'tool', tool_call_id: orphanMcpId, content: '{"ok":true}' },
+        { role: 'user', content: 'continue' },
+      ],
+    },
+  },
+};
+
+const before = reconstructMissingToolCallsFromRequestHistory([orphanResultOnly]);
+assert.equal(before.length, 2);
+assert.deepEqual(
+  before.map((item) => item.toolCallId).sort(),
+  [orphanBashId, orphanMcpId].sort(),
+);
+assert.equal(before[0].sourceInteractionId, orphanResultOnly.interactionId);
+assert.ok(BigInt(before[0].issuedAtUnixNs) < BigInt(orphanResultOnly.startedAtUnixNs));
+
+const projected = projectInteractionsWithReconstructedHistoryToolCalls([orphanResultOnly]);
+assert.equal(projected.length, 1);
+assert.equal(projected[0].toolCalls.length, 3);
+assert.ok(projected[0].partialReasons.includes(TOOL_CALL_RECONSTRUCTED_FROM_REQUEST_HISTORY));
+assert.ok(projected[0].toolCalls.some((call) => call.toolCallId === orphanBashId && call.name === 'run_bash'));
+
+const histClosure = closeToolCallsAcrossInteractions(projected);
+assert.equal(
+  histClosure.matches.filter((match) =>
+    match.toolCallId === orphanBashId || match.toolCallId === orphanMcpId).length,
+  2,
+);
+
+const histSummary = {
+  schemaVersion: 'anysentry.agent_conversation.v1',
+  conversationId: 'cv_hist_replay',
+  agentAssetId: 'aa_p2',
+  agentProduct: 'LangGraph',
+  title: 'history replay',
+  groupingQuality: 'exact',
+  hasContent: true,
+  status: 'active',
+  interactionCount: 1,
+  modelInteractionCount: 1,
+  toolCallCount: 3,
+  toolResultCount: 2,
+  coverage: { completeness: 'partial', partial: true, reasons: [] },
+};
+const histTimeline = projectSemanticConversationTimeline(histSummary, [orphanResultOnly], []);
+const histEvents = histTimeline.flatMap((turn) => turn.events);
+const histCallIds = histEvents
+  .filter((event) => event.kind === 'tool_call')
+  .map((event) => event.toolCallId);
+assert.ok(histCallIds.includes(orphanBashId), 'timeline must surface reconstructed bash tool_call');
+assert.ok(histCallIds.includes(orphanMcpId), 'timeline must surface reconstructed mcp tool_call');
+const orphanBashCall = histEvents.find((event) =>
+  event.kind === 'tool_call' && event.toolCallId === orphanBashId);
+assert.equal(orphanBashCall?.status, 'failed');
+const orphanMcpCall = histEvents.find((event) =>
+  event.kind === 'tool_call' && event.toolCallId === orphanMcpId);
+assert.equal(orphanMcpCall?.status, 'succeeded');
+
 console.log('verify-agent-tool-closure: ok');
