@@ -56,6 +56,11 @@ function processFence(entry) {
  * identity-snapshot confirmations that often omit kernel cgroupIds. Promoted rows are
  * intentionally fence-free so multi-product CLI labs (Codex + Claude in one container) keep
  * whole-cgroup TLS admission instead of becoming mixed-product conflicts.
+ *
+ * Label-confirmed Docker agents (`classification=confirmed_agent`, e.g. Design B LangGraph
+ * compose labels) already own their cgroup for admission. Track those cgroupIds in
+ * `ownedCgroupIds` so the forwarder can drop argv-signature fences (`langgraph`) that would
+ * otherwise dual-claim the same inode and disable Collector blanket plaintext admission.
  */
 function promoteConfirmedDockerTlsEntries(dockerEntries, confirmedPhysicalWorkloadIds) {
   const confirmed = confirmedPhysicalWorkloadIds instanceof Set
@@ -66,20 +71,25 @@ function promoteConfirmedDockerTlsEntries(dockerEntries, confirmedPhysicalWorklo
         .filter(Boolean),
     );
   const promotedCgroupIds = new Set();
+  const ownedCgroupIds = new Set();
   const entries = (Array.isArray(dockerEntries) ? dockerEntries : []).map((entry) => {
     const physicalWorkloadId = text(entry?.physicalWorkloadId);
     const id = cgroupId(entry?.cgroupId);
     const running = text(entry?.containerState).toLowerCase() === 'running';
-    if (
-      !physicalWorkloadId
-      || !id
-      || !running
-      || entry?.classification === 'confirmed_agent'
-      || !confirmed.has(physicalWorkloadId)
-    ) {
+    if (!physicalWorkloadId || !id || !running) {
+      return entry;
+    }
+    if (entry?.classification === 'confirmed_agent') {
+      // Docker label / discovery already confirmed this workload. Prefer its agentScopeId and
+      // keep fence-free whole-cgroup admission; callers must not also publish signature fences.
+      ownedCgroupIds.add(id);
+      return entry;
+    }
+    if (!confirmed.has(physicalWorkloadId)) {
       return entry;
     }
     promotedCgroupIds.add(id);
+    ownedCgroupIds.add(id);
     return {
       classification: 'confirmed_agent',
       cgroupId: id,
@@ -93,7 +103,7 @@ function promoteConfirmedDockerTlsEntries(dockerEntries, confirmedPhysicalWorklo
       ].slice(0, 16),
     };
   });
-  return { entries, promotedCgroupIds };
+  return { entries, promotedCgroupIds, ownedCgroupIds };
 }
 
 function tlsAgentCgroupDocument(snapshot) {

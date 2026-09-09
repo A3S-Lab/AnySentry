@@ -2066,12 +2066,16 @@ function publishTlsAgentRuntimeScope(processSnapshot = attributor.runtimeSnapsho
     dockerEntries,
     workloadCache.confirmedPhysicalWorkloadIds(),
   );
-  const promotedCgroups = promoted.promotedCgroupIds;
-  // Drop process-generation fences that share a promoted Docker cgroup. Otherwise Codex/Claude
-  // short-lived roots turn a lab container into a mixed-product conflict and revoke admission.
+  // Prefer Docker-owned cgroups (label-confirmed Design B agents + identity-promoted CLI labs)
+  // over argv-signature fences. Dual-claiming the same cgroup as both
+  // `customer-langgraph-sim-*` and generic `langgraph` marks Collector conflicts and disables
+  // blanket tcp_plaintext admission — which empties conversation tracking for HTTP LLM traffic.
+  const ownedCgroups = promoted.ownedCgroupIds instanceof Set && promoted.ownedCgroupIds.size > 0
+    ? promoted.ownedCgroupIds
+    : promoted.promotedCgroupIds;
   const scopedProcessEntries = processEntries.filter((entry) => {
     const id = text(entry?.cgroupId);
-    return !id || !promotedCgroups.has(id);
+    return !id || !ownedCgroups.has(id);
   });
   const entries = [...promoted.entries, ...scopedProcessEntries];
   // Compare only the local admission facts. generatedAt/snapshotVersion are deliberately omitted

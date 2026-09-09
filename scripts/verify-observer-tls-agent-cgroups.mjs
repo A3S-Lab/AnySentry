@@ -134,6 +134,47 @@ assert.equal('hostPid' in promoted.entries[0], false);
 assert.equal('agentInstanceId' in promoted.entries[0], false);
 assert.equal(promoted.entries[1].classification, 'unknown');
 assert.deepEqual([...promoted.promotedCgroupIds], ['124832']);
+assert.deepEqual([...promoted.ownedCgroupIds], ['124832']);
+
+// Label-confirmed Design B LangGraph containers already own their cgroup. Signature fences for
+// the same inode must be treated as owned so publishTlsAgentRuntimeScope can drop them.
+const labeledLanggraph = promoteConfirmedDockerTlsEntries(
+  [
+    {
+      classification: 'confirmed_agent',
+      cgroupId: '35440',
+      physicalWorkloadId: 'docker:node:customer-langgraph-sim-worker',
+      containerState: 'running',
+      agentScopeId: 'customer-langgraph-sim-worker',
+      agentInstanceId: 'a111c04b1880dbceaae2e7c8d7a6a13f279a3f17e2a3d5b944725e129184a9ce',
+    },
+  ],
+  new Set(),
+);
+assert.deepEqual([...labeledLanggraph.ownedCgroupIds], ['35440']);
+assert.deepEqual([...labeledLanggraph.promotedCgroupIds], []);
+assert.equal(labeledLanggraph.entries[0].agentScopeId, 'customer-langgraph-sim-worker');
+const labeledPlusSignature = tlsAgentCgroupDocument({
+  version: 20,
+  entries: [
+    ...labeledLanggraph.entries,
+    // Simulate what publishTlsAgentRuntimeScope must filter out before publication.
+    ...(labeledLanggraph.ownedCgroupIds.has('35440') ? [] : [{
+      classification: 'probable_agent',
+      runtimeState: 'running',
+      cgroupId: '35440',
+      agentScopeId: 'langgraph',
+      agentInstanceId: 'ari_abaf937eb659ba363b8611f6',
+      rootPid: 3304443,
+      rootStartTimeTicks: '2390118',
+    }]),
+  ],
+});
+assert.deepEqual(
+  labeledPlusSignature.entries.map((entry) => entry.agentScopeId),
+  ['customer-langgraph-sim-worker'],
+);
+
 const promotedDocument = tlsAgentCgroupDocument({
   version: 19,
   entries: promoted.entries,
