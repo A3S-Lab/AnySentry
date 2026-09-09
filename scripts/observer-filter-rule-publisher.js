@@ -122,6 +122,29 @@ function filterDecision(observerEvent, classification, options = {}) {
     authority = 'candidate';
     reasonCode = 'non_agent_unconfirmed';
   }
+  let physicalWorkloadId = text(attribution.physicalWorkloadId);
+  const agentInstanceId = text(attribution.agentInstanceId);
+  let workloadRef = attribution.workloadRef && typeof attribution.workloadRef === 'object'
+    ? { ...attribution.workloadRef }
+    : undefined;
+  // Docker self-register Agents often surface the container id as agentInstanceId while a
+  // template-winning merge drops physicalWorkloadId. Reconstruct the dedicated runtime id so
+  // selective FileRead can enable within the Docker cgroup fence.
+  if (
+    !physicalWorkloadId
+    && /^[a-f0-9]{64}$/iu.test(agentInstanceId)
+    && (identityClassification === 'confirmed_agent' || identityClassification === 'probable_agent')
+  ) {
+    const hostId = text(workloadRef?.nodeName)
+      || text(options.hostId)
+      || 'local';
+    physicalWorkloadId = `docker:${hostId}:${agentInstanceId}`;
+    workloadRef = {
+      environment: 'docker',
+      kind: 'container',
+      ...(workloadRef || {}),
+    };
+  }
   return {
     scopeType: 'cgroup',
     scopeKey: `cgroup:${cgroupId}`,
@@ -131,8 +154,9 @@ function filterDecision(observerEvent, classification, options = {}) {
     action,
     reasonCode,
     source: text(attribution.source) || (classification?.state === 'infrastructure' ? 'configured_root' : 'none'),
-    ...(text(attribution.physicalWorkloadId) ? { physicalWorkloadId: text(attribution.physicalWorkloadId) } : {}),
-    ...(text(attribution.agentInstanceId) ? { agentInstanceId: text(attribution.agentInstanceId) } : {}),
+    ...(physicalWorkloadId ? { physicalWorkloadId } : {}),
+    ...(agentInstanceId ? { agentInstanceId } : {}),
+    ...(workloadRef ? { workloadRef } : {}),
     expiresAt: new Date(now + ttlMs).toISOString(),
   };
 }
@@ -384,11 +408,29 @@ class FilterRulePublisher {
 
   observe(observerEvent, classification, resolvedDecision) {
     if (!this.file) return undefined;
-    const derived = filterDecision(observerEvent, classification, { now: this.now, ttlMs: this.ttlMs });
+    const derived = filterDecision(observerEvent, classification, {
+      now: this.now,
+      ttlMs: this.ttlMs,
+      hostId: this.nodeId || this.collectorId,
+    });
     let next = resolvedDecision && typeof resolvedDecision === 'object'
       ? { ...resolvedDecision }
       : derived;
-    if (derived?.action === 'keep') next = derived;
+    if (derived?.action === 'keep') {
+      next = {
+        ...(resolvedDecision && typeof resolvedDecision === 'object' ? resolvedDecision : {}),
+        ...derived,
+        physicalWorkloadId: derived.physicalWorkloadId
+          || (resolvedDecision && resolvedDecision.physicalWorkloadId)
+          || undefined,
+        agentInstanceId: derived.agentInstanceId
+          || (resolvedDecision && resolvedDecision.agentInstanceId)
+          || undefined,
+        workloadRef: derived.workloadRef
+          || (resolvedDecision && resolvedDecision.workloadRef)
+          || undefined,
+      };
+    }
     if (!next) return undefined;
     if (candidateAutoPromotionEnabled()
       && next.classification === 'probable_agent'
@@ -1274,5 +1316,6 @@ module.exports = {
   eventCgroupId,
   filterDecision,
   previewProbeActions,
+  safeDesiredProbeActions,
   supportsCaptureProfileCapabilities,
 };

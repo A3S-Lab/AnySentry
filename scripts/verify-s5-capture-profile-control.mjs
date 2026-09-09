@@ -18,6 +18,7 @@ const {
   captureSnapshotContentHash,
   compileCaptureDecision,
   digest,
+  safeDesiredProbeActions,
 } = require('./observer-filter-rules.js');
 
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'anysentry-s5-control-'));
@@ -211,6 +212,38 @@ assert.deepEqual(probable.desiredProbeActions, {
   exec: 'full', exit: 'full', tls: 'full', connect: 'full', dns: 'full',
   file_access: 'full', file_delete: 'full', llm: 'full', ssl: 'full', security: 'full', file_read: 'not_enabled',
 });
+
+const dockerDedicated = compileCaptureDecision(
+  { process: { cgroupId: '122553' }, event: { FileAccess: {} } },
+  {
+    state: 'agent',
+    attribution: {
+      classification: 'confirmed_agent',
+      source: 'self_register',
+      agentInstanceId: 'c'.repeat(64),
+      physicalWorkloadId: `docker:node-a:${'c'.repeat(64)}`,
+    },
+  },
+  {
+    scopeType: 'cgroup', scopeKey: 'cgroup:122553', cgroupId: '122553',
+    classification: 'confirmed_agent', authority: 'authoritative', action: 'keep',
+    captureProfile: 'agent_full',
+    agentInstanceId: 'c'.repeat(64),
+    physicalWorkloadId: `docker:node-a:${'c'.repeat(64)}`,
+    expiresAt,
+  },
+  { captureProfileMode: 'enforce', activationMode: 'preview', now: () => fixedNow },
+);
+assert.equal(dockerDedicated.desiredProbeActions.file_read, 'full',
+  'dedicated Docker Agent cgroups enable selective FileRead without a root fence');
+assert.equal(
+  safeDesiredProbeActions({
+    ...dockerDedicated,
+    desiredProbeActions: { ...dockerDedicated.desiredProbeActions, file_read: 'not_enabled' },
+  }).file_read,
+  'full',
+  'attaching physicalWorkloadId must recover FileRead from a stale not_enabled desired matrix',
+);
 
 const implicitDiscovery = publisher('implicit-discovery-default', 'enforce');
 const unknownDefault = implicitDiscovery.observe(
